@@ -261,3 +261,60 @@ func TestReclaimRefundsRouteMissingDeferAttemptLeak(t *testing.T) {
 		}
 	})
 }
+
+// TestClearRouteMissingRestoresDeliveryReclaimBound pins the fix for the marker-discriminator gap:
+// the route_missing_since marker is cleared only on Ack/Nack/replay, so a once-route-missing event
+// whose route RETURNS still carries the marker while it delivers. Without clearing it on route
+// resolution, a hard crash during that delivery (no Ack/Nack) would have ReclaimExpired refund the
+// attempt — asymmetrically exempting the event from the MaxAttempts bound. ClearRouteMissing drops
+// the marker (token-protected) the moment the route resolves, so a delivery-phase crash reclaims as
+// a real attempt (the attempt advances) like any delivery lease.
+func TestClearRouteMissingRestoresDeliveryReclaimBound(t *testing.T) {
+	queue, client := newRedisTestQueue(t, "card_action_clear_marker")
+	event := testDispatchEvent()
+	event.EventID = 6230003
+	field := strconv.FormatInt(event.EventID, 10)
+	now := time.Now().Truncate(time.Millisecond)
+
+	if err := queue.Enqueue(event, now); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+	lease, err := queue.Claim(now, time.Second)
+	if err != nil || lease == nil || lease.Attempt != 1 {
+		t.Fatalf("Claim() = (%+v, %v), want attempt 1", lease, err)
+	}
+	// The event was route-missing (marker set); then its route returned.
+	if _, err := queue.RouteMissingSeenAt(event.EventID, now); err != nil {
+		t.Fatalf("RouteMissingSeenAt() error = %v", err)
+	}
+
+	// A stale worker (wrong token) must NOT be able to clear the marker.
+	if cleared, err := queue.ClearRouteMissing(event.EventID, "wrong-token"); err != nil || cleared {
+		t.Fatalf("ClearRouteMissing(wrong token) = (%v, %v), want (false, nil)", cleared, err)
+	}
+	if exists, _ := client.HExists(queue.keys.routeMissingSince, field).Result(); !exists {
+		t.Fatal("marker cleared by a non-owner; the clear must be token-protected")
+	}
+
+	// The lease owner clears it on route resolution.
+	if cleared, err := queue.ClearRouteMissing(event.EventID, lease.Token); err != nil || !cleared {
+		t.Fatalf("ClearRouteMissing(owner) = (%v, %v), want (true, nil)", cleared, err)
+	}
+	if exists, _ := client.HExists(queue.keys.routeMissingSince, field).Result(); exists {
+		t.Fatal("marker still present after ClearRouteMissing by the lease owner")
+	}
+
+	// Simulate a hard crash during delivery: the lease (1s) expires and is reclaimed. With the marker
+	// gone the event is treated as a real delivery attempt, so the attempt ADVANCES to 2 (bound
+	// preserved) instead of being refunded to 1.
+	if reclaimed, err := queue.ReclaimExpired(now.Add(2*time.Second), 10); err != nil || reclaimed != 1 {
+		t.Fatalf("ReclaimExpired() = (%d, %v), want (1, nil)", reclaimed, err)
+	}
+	lease, err = queue.Claim(now.Add(2*time.Second), time.Second)
+	if err != nil || lease == nil {
+		t.Fatalf("re-Claim() = (%+v, %v)", lease, err)
+	}
+	if lease.Attempt != 2 {
+		t.Fatalf("attempt after reclaiming a delivery lease whose route-missing marker was cleared = %d, want 2 (the MaxAttempts bound must be preserved once the route returns)", lease.Attempt)
+	}
+}

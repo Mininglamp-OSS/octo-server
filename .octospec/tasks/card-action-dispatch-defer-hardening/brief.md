@@ -83,6 +83,12 @@ Both are follow-ups from the PR #621 review at head `d0b0a879`:
   retries stay bounded). Both pinned by
   `TestReclaimRefundsRouteMissingDeferAttemptLeak` (two subtests) and the unchanged
   `TestRedisQueueLeaseTokenRetryDLQAndReplay` (markerless reclaim still → attempt 2).
+- #623 (review-driven, #662): once the route RESOLVES at dispatch, the marker is dropped
+  (token-protected `ClearRouteMissing`) BEFORE delivery, so a hard crash during the ensuing
+  delivery is reclaimed as a real attempt (bound preserved), not refunded as a defer. Pinned by
+  `TestClearRouteMissingRestoresDeliveryReclaimBound` (Redis: token-mismatch cannot clear;
+  cleared marker → reclaim advances to attempt 2) and
+  `TestRoutePresentClearsRouteMissingMarkerBeforeDelivery` (dispatcher wiring).
 - #624: `NewRedisQueue` rejects `LiveTTL` at/below the floor with a descriptive error and
   accepts values at/above it. Pinned by `TestNewRedisQueueRejectsLiveTTLBelowDeferFloor`
   (rejects `routeMissingDeferInterval` and `minLiveTTL-1ns`; accepts `minLiveTTL` and `1h`).

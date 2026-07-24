@@ -232,6 +232,17 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return v
 `)
 
+// clearRouteMissingScript removes an event's route-missing first-seen marker once its route has
+// resolved at dispatch, so a lease that proceeds to delivery no longer looks like a deferred lease
+// to reclaimScript. It is token-protected (KEYS[5] = tokens): only the current lease owner may clear
+// the marker, so a stale worker whose lease was already reclaimed and re-leased cannot strip a marker
+// the newer owner still needs. KEYS[9] = route_missing_since. ARGV[1] = event_id, ARGV[2] = token.
+var clearRouteMissingScript = rd.NewScript(`
+if redis.call('HGET', KEYS[5], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[9], ARGV[1])
+return 1
+`)
+
 // minLiveTTL is the smallest LiveTTL NewRedisQueue accepts. A deferred event (a route-missing
 // re-check, or capacity backpressure) is re-scheduled up to routeMissingDeferInterval into the
 // future, and every queue operation PEXPIREs the event's ready/payload keys to LiveTTL. If LiveTTL
@@ -466,6 +477,23 @@ func (q *RedisQueue) RouteMissingSeenAt(eventID int64, now time.Time) (time.Time
 		return time.Time{}, fmt.Errorf("cardactiondispatch: record route-missing first-seen: %w", err)
 	}
 	return time.UnixMilli(ms), nil
+}
+
+// ClearRouteMissing removes the durable route-missing first-seen marker for an event whose route has
+// resolved at dispatch. Once the route is present the event is no longer route-missing, so its lease
+// must be treated as a delivery lease by ReclaimExpired: without this, a once-route-missing event that
+// reaches delivery still carries the marker, and a hard crash during delivery (no Ack/Nack runs) would
+// have reclaimScript refund its attempt as though it were still a defer cycle — asymmetrically exempting
+// it from the MaxAttempts bound. Clearing the marker here makes a delivery-phase crash advance the
+// attempt like any delivery lease. Token-protected so only the current lease owner clears it; returns
+// true when this worker owned the lease.
+func (q *RedisQueue) ClearRouteMissing(eventID int64, token string) (bool, error) {
+	value, err := clearRouteMissingScript.Run(q.client, q.scriptKeys(),
+		strconv.FormatInt(eventID, 10), token).Int()
+	if err != nil {
+		return false, fmt.Errorf("cardactiondispatch: clear route-missing marker: %w", err)
+	}
+	return value == 1, nil
 }
 
 func newLeaseToken() (string, error) {
