@@ -188,6 +188,20 @@ func TestCheckSendPermissionObservesContextAndBotKindFailures(t *testing.T) {
 			wantReason: sendPermissionReasonMissingContext,
 		},
 		{
+			name: "space app membership query error",
+			prepare: func(c *wkhttp.Context, ba *BotAPI) {
+				c.Set(CtxKeyAppBotScope, "space")
+				c.Set(CtxKeyAppBotSpaceID, "sensitive-space")
+				ba.friendCheckOverride = func(string, string) (bool, error) { return true, nil }
+				ba.spaceMemberQueryOverride = func(string, string) (bool, error) {
+					return false, errors.New("space membership store unavailable")
+				}
+			},
+			botKind:    BotKindApp,
+			wantStage:  sendPermissionStageSpaceMember,
+			wantReason: sendPermissionReasonQueryError,
+		},
+		{
 			name:       "unknown bot kind",
 			prepare:    func(*wkhttp.Context, *BotAPI) {},
 			botKind:    "sensitive-unknown-kind",
