@@ -303,6 +303,60 @@ func TestCheckSendPermissionClassifiesDMRelationshipResults(t *testing.T) {
 	}
 }
 
+func TestCheckSendPermissionClassifiesGroupMembershipResults(t *testing.T) {
+	tests := []struct {
+		name       string
+		count      int
+		queryErr   error
+		wantErr    error
+		wantMetric bool
+	}{
+		{
+			name:    "zero active memberships remains not_group_member",
+			wantErr: errBotSendPermNotGroupMember,
+		},
+		{
+			name:       "membership query error remains internal",
+			queryErr:   errors.New("group membership store unavailable"),
+			wantErr:    errBotSendPermCheckFailed,
+			wantMetric: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			metrics := newBotSendPermissionMetrics(registry)
+			logger := &permissionRecordingLog{}
+			ba := &BotAPI{
+				groupStatusQueryOverride: func(string) (int, error) { return 0, nil },
+				groupMemberCountOverride: func(string, string) (int, error) {
+					return tt.count, tt.queryErr
+				},
+				sendPermissionMetrics: metrics,
+				Log:                   logger,
+			}
+			ctx := newPermissionTestContext(t, "trace-safe")
+
+			err := ba.checkSendPermission(ctx, BotKindUser, "sensitive-bot", "sensitive-group", common.ChannelTypeGroup.Uint8(), false)
+			require.ErrorIs(t, err, tt.wantErr)
+			gotMetric := testutil.ToFloat64(metrics.failures.WithLabelValues(
+				string(sendPermissionStageGroupMember), string(sendPermissionReasonQueryError),
+			))
+			if tt.wantMetric {
+				assert.Equal(t, float64(1), gotMetric)
+				require.Len(t, logger.entries, 1)
+				entry := logger.entries[0]
+				assert.Equal(t, string(sendPermissionStageGroupMember), entry.fields["permission_stage"])
+				assert.NotContains(t, fmt.Sprint(entry.fields), "sensitive-")
+				return
+			}
+			assert.Zero(t, gotMetric)
+			assert.Empty(t, logger.entries)
+		})
+	}
+}
+
 func TestSendPermissionMetricsHaveOnlyBoundedLabels(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := newBotSendPermissionMetrics(registry)
