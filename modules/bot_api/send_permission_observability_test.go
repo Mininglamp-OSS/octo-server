@@ -319,6 +319,31 @@ dmwork_bot_send_permission_failure_total{reason="not_found",stage="group_status"
 	require.NoError(t, err)
 }
 
+func TestSendPermissionObservationBoundsUnexpectedValues(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics := newBotSendPermissionMetrics(registry)
+	logger := &permissionRecordingLog{}
+	ba := &BotAPI{sendPermissionMetrics: metrics, Log: logger}
+	ctx := newPermissionTestContext(t, "trace-safe")
+
+	ba.observeSendPermissionFailure(
+		ctx,
+		"sensitive-kind",
+		common.ChannelTypePerson.Uint8(),
+		sendPermissionFailureStage("sensitive-stage-id"),
+		sendPermissionFailureReason("sensitive-error-text"),
+		nil,
+	)
+
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.failures.WithLabelValues("unknown", "unknown")))
+	require.Len(t, logger.entries, 1)
+	entry := logger.entries[0]
+	assert.Equal(t, "unknown", entry.fields["permission_stage"])
+	assert.Equal(t, "unknown", entry.fields["failure_reason"])
+	assert.Equal(t, "unknown", entry.fields["bot_kind"])
+	assert.NotContains(t, fmt.Sprint(entry.fields), "sensitive-")
+}
+
 func TestCheckSendPermissionDisbandedGroupDoesNotEmitInternalFailureMetric(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := newBotSendPermissionMetrics(registry)

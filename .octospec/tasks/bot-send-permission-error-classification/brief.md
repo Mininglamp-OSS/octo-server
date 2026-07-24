@@ -92,7 +92,7 @@ error code is required.
   closed enums; IDs, UIDs, channel IDs, group IDs, error strings, and trace IDs
   are forbidden labels. Required values:
   - `stage`: `friend`, `space_context`, `space_member`, `group_status`,
-    `group_member`, `bot_kind`;
+    `group_member`, `bot_kind`, `unknown`;
   - `reason`: `query_error`, `not_found`, `missing_context`, `unknown`.
 - **Testing** (`touches: testing`): error identity, HTTP envelope semantics,
   fail-closed behavior, trace correlation, and metric cardinality require
@@ -153,7 +153,8 @@ error code is required.
   `trace_id` for the same request.
 - `dmwork_bot_send_permission_failure_total{stage,reason}` increments exactly
   once for each terminal permission-check failure covered by the enum. Tests
-  prove the allowed label sets and reject accidental ID/error-string labels.
+  prove the allowed label sets; an unrecognized internal stage/reason collapses
+  to `unknown` instead of creating an ID/error-string label value.
 - No new `pkg/errcode` registration or locale block is added; reuse
   `ErrBotAPIGroupNotFound` and the existing zh-CN translation.
 - Focused tests cover group missing, parent group missing, real DB failure,
