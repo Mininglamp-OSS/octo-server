@@ -1,13 +1,18 @@
 package notify
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -29,6 +34,8 @@ const docsCardMutateSeqKey = common.MessageExtraSeqKey + ":docs-card-mutate"
 // docs-domain discriminator; only cards in this family may be touched.
 const docsAccessVariantPrefix = "docs.access_"
 
+var errDocsSiblingContextInvalid = errors.New("notify: invalid stored docs sibling context")
+
 // docsAccessCardVariant reports the target card's variant and whether it belongs
 // to the docs access family, from the effective card envelope. Pure so the
 // capability gate is unit-testable without a live card store.
@@ -38,6 +45,21 @@ func docsAccessCardVariant(envelope []byte) (variant string, isDocsAccess bool) 
 		return "", false
 	}
 	return variant, strings.HasPrefix(variant, docsAccessVariantPrefix)
+}
+
+// docsAccessMutationDisposition protects retry idempotency after the first
+// successful mutation has removed the pending Submit actions. A repeated
+// decision for the same terminal state is already applied; the opposite state
+// is a conflict and must never overwrite a committed decision.
+func docsAccessMutationDisposition(variant, kind string) (alreadyApplied, conflict bool) {
+	switch variant {
+	case docsaccessrequest.VariantApproved:
+		return kind == DocsCardKindAccessGranted, kind == DocsCardKindAccessDenied
+	case docsaccessrequest.VariantRejected:
+		return kind == DocsCardKindAccessDenied, kind == DocsCardKindAccessGranted
+	default:
+		return false, false
+	}
 }
 
 // CardMutateReq is the access-decision card-sync request (task
@@ -60,6 +82,11 @@ type CardMutateReq struct {
 	DocID       string `json:"doc_id"`
 	Title       string `json:"title"`
 	DenyReason  string `json:"deny_reason"` // surfaced on the denied terminal card; empty on approve
+	// OperatorName / DecidedAtDisplay are optional additive display fields.
+	// Older callers omit them and receive localized generic operator copy; raw
+	// UIDs are never derived as display copy by this endpoint.
+	OperatorName     string `json:"operator_name"`
+	DecidedAtDisplay string `json:"decided_at_display"`
 }
 
 // CardMutateResp reports whether the card is now terminal.
@@ -69,8 +96,8 @@ type CardMutateResp struct {
 
 // mutateCard handles POST /v1/internal/cards/mutate. It drives one already-
 // delivered docs access card to its terminal (approved/denied) state in place,
-// reusing the exact terminal-card builder the click-driven finalizer uses so a
-// clicker's card and the sibling cards stay byte-identical. Docs capability only.
+// reusing the same V3 Registry field mapping as the click-driven finalizer.
+// Docs capability only.
 func (n *Notify) mutateCard(c *wkhttp.Context) {
 	capability, _ := c.Get(notifyCapabilityContextKey)
 	typedCapability, _ := capability.(notifyCapability)
@@ -89,8 +116,6 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
 		return
 	}
-	denied := req.Kind == DocsCardKindAccessDenied
-
 	ctx := c.Request.Context()
 	channelType := req.ChannelType
 	if channelType == 0 {
@@ -136,14 +161,14 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateForbidden, nil, nil)
 		return
 	}
-
-	lang := i18n.OutboundLanguage(ctx)
-	document, err := buildDocsDecisionTerminalDocument(
-		ctx, n.ctx.GetConfig().External.WebLoginURL, lang, req.DocID, req.SpaceID, req.Title, req.DenyReason, denied)
-	if err != nil {
-		n.Warn("build terminal card for mutate failed",
-			zap.Error(err), zap.String("doc_id", req.DocID), zap.String("space_id", req.SpaceID))
-		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+	if alreadyApplied, conflict := docsAccessMutationDisposition(variant, req.Kind); alreadyApplied {
+		c.Response(CardMutateResp{Mutated: true})
+		return
+	} else if conflict {
+		n.Warn("card mutate rejected: target already has opposite terminal state",
+			zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID),
+			zap.String("variant", variant), zap.String("kind", req.Kind))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
 		return
 	}
 
@@ -153,29 +178,26 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
 		return
 	}
-	contentEdit, err := buildTerminalEnvelope(document, req.SpaceID, cardSeq)
+	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultRegistry(), mutator)
 	if err != nil {
-		n.Warn("build terminal envelope for mutate failed",
-			zap.Error(err), zap.String("doc_id", req.DocID))
-		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+		n.Error("create card updater for mutate failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
 		return
 	}
-
-	// SenderUID = docs producer bot, resolved server-side (see type doc). Never
-	// caller-supplied. Snapshot above already confirmed this is that bot's card.
-	if _, err = mutator.Mutate(ctx, carddispatch.CardMutationRequest{
-		SenderUID:   NotifyBotUIDValue,
-		MessageID:   req.MessageID,
-		ChannelID:   req.ChannelID,
-		ChannelType: channelType,
-		ContentEdit: contentEdit,
-	}); err != nil {
+	req.ChannelType = channelType
+	if err = replaceSiblingWithRegistryResult(
+		ctx, updater, req, snap, cardSeq, cardtmpl.BuildEnv{
+			WebLoginURL: n.ctx.GetConfig().External.WebLoginURL,
+			Lang:        i18n.OutboundLanguage(ctx),
+			SpaceID:     req.SpaceID,
+		}); err != nil {
 		// A malformed edit is the caller's bug (400). Not-found / sender-mismatch
 		// / stale / backend errors are transient-or-benign from the caller's view
 		// (409): it retries or falls back to re-notify. The decision itself is
 		// already committed and protected by the docs-backend pending guard, so a
 		// mutate miss never corrupts state — it only leaves one stale card.
-		if errors.Is(err, carddispatch.ErrCardMutationInvalid) {
+		if errors.Is(err, errDocsSiblingContextInvalid) || errors.Is(err, carddispatch.ErrCardMutationInvalid) ||
+			errors.Is(err, cardtmpl.ErrFieldsInvalid) || errors.Is(err, cardtmpl.ErrUpdateInvalid) {
 			n.Warn("card mutate invalid",
 				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
@@ -188,4 +210,52 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		return
 	}
 	c.Response(CardMutateResp{Mutated: true})
+}
+
+// replaceSiblingWithRegistryResult recovers the original request display
+// context from the stored server-authored pending card, then renders the same
+// docs.access-request@0.3.0/result view used by the click-driven finalizer.
+// Caller-supplied Space/document identity must match the stored frame.
+func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.CardUpdater, req CardMutateReq,
+	snapshot carddispatch.CardMutationSnapshot, cardSeq int64, env cardtmpl.BuildEnv,
+) error {
+	if ctx == nil || updater == nil || cardSeq <= 0 || env.SpaceID != req.SpaceID {
+		return errDocsSiblingContextInvalid
+	}
+	var envelope struct {
+		SpaceID string `json:"space_id"`
+	}
+	if err := json.Unmarshal(snapshot.Envelope, &envelope); err != nil ||
+		strings.TrimSpace(envelope.SpaceID) == "" || envelope.SpaceID != req.SpaceID {
+		return fmt.Errorf("%w: space mismatch", errDocsSiblingContextInvalid)
+	}
+	data, found := cardmsg.SubmitAction(snapshot.Envelope, cardtmpl.DocsApproveActionID)
+	if !found {
+		data, found = cardmsg.SubmitAction(snapshot.Envelope, cardtmpl.DocsDenyActionID)
+	}
+	if !found || data == nil {
+		return fmt.Errorf("%w: pending action data not found", errDocsSiblingContextInvalid)
+	}
+	storedDocID := strings.TrimSpace(stringEventData(data, "doc_id"))
+	if storedDocID == "" || storedDocID != strings.TrimSpace(req.DocID) {
+		return fmt.Errorf("%w: document mismatch", errDocsSiblingContextInvalid)
+	}
+	denied := req.Kind == DocsCardKindAccessDenied
+	fields, state, err := buildDocsAccessResultFields(env.Lang, docsResultRenderInput{
+		Data:             data,
+		Title:            req.Title,
+		OperatorName:     req.OperatorName,
+		DecidedAtDisplay: req.DecidedAtDisplay,
+		DenyReason:       req.DenyReason,
+		Denied:           denied,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDocsSiblingContextInvalid, err)
+	}
+	return updater.ReplaceView(ctx, cardtmpl.UpdateTarget{
+		Target: carddispatch.Target{
+			SpaceID: req.SpaceID, ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+		},
+		SenderUID: NotifyBotUIDValue, MessageID: req.MessageID, CardSeq: cardSeq,
+	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields, env)
 }

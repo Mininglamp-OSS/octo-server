@@ -77,8 +77,11 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 		t.Fatalf("result fields = %+v", fields)
 	}
 	decision := fields["decision"].(map[string]any)
-	if decision["operatorName"] != event.OperatorUID || decision["rejectionReason"] != "scope mismatch" {
+	if decision["operatorName"] != "审批人" || decision["rejectionReason"] != "scope mismatch" {
 		t.Fatalf("decision fields = %+v", decision)
+	}
+	if strings.Contains(string(updater.fields), event.OperatorUID) {
+		t.Fatalf("result fields exposed raw operator uid: %s", updater.fields)
 	}
 	document := fields["document"].(map[string]any)
 	requester := fields["requester"].(map[string]any)

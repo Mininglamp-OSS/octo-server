@@ -141,9 +141,9 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 // ReplaceView 确定性失败,审批卡永远停在 pending 且申请人漏通知(PR#641 review P1)。
 // 截断而非编造,与 denyReason 既有做法一致。
 const (
-	capResultTitle      = 200                     // document.title / document.sourceName
-	capResultName       = 120                     // requester.name / decision.operatorName
-	capResultShortLabel = 80                      // decidedAt/requestedAt/messageTime/permission.*
+	capResultTitle      = 200                      // document.title / document.sourceName
+	capResultName       = 120                      // requester.name / decision.operatorName
+	capResultShortLabel = 80                       // decidedAt/requestedAt/messageTime/permission.*
 	capResultReason     = cardtmpl.MaxExcerptRunes // requestReason / rejectionReason (= 300)
 )
 
@@ -160,41 +160,94 @@ func truncRunes(s string, max int) string {
 
 func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, event cardactiondispatch.Event,
 	result cardactiondispatch.DecisionResult, channelID, lang, title, denyReason string) error {
-	state := docsaccessrequest.StateApproved
-	wireState := "approved"
-	if result.State == cardactiondispatch.StateDenied {
-		state = docsaccessrequest.StateRejected
-		wireState = "rejected"
+	fields, state, err := buildDocsAccessResultFields(lang, docsResultRenderInput{
+		Data:             event.Data,
+		Title:            title,
+		OperatorName:     result.Display["operator_name"],
+		DecidedAtDisplay: result.Display["decided_at"],
+		DenyReason:       denyReason,
+		Denied:           result.State == cardactiondispatch.StateDenied,
+	})
+	if err != nil {
+		return err
 	}
+	return f.updater.ReplaceView(ctx, cardtmpl.UpdateTarget{
+		Target: carddispatch.Target{
+			SpaceID: event.SpaceID, ChannelID: channelID, ChannelType: event.ChannelType,
+		},
+		// card_seq 单调性来源:event.EventID 是全局单调递增的 snowflake,直接用作
+		// card_seq 满足 CardMutator CAS 的严格递增要求(见
+		// .octospec/learnings/pending/cardtmpl-interaction-closure.md)。若未来 event
+		// ID 生成器改为非单调,CAS 会静默丢弃合法更新——务必同步复核。
+		SenderUID: event.SenderUID, MessageID: event.MessageID, CardSeq: event.EventID,
+	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields, cardtmpl.BuildEnv{
+		WebLoginURL: f.ctx.GetConfig().External.WebLoginURL, Lang: lang, SpaceID: event.SpaceID,
+	})
+}
+
+// docsResultRenderInput is the single bounded mapping input used by both the
+// click-driven finalizer and the sibling-card mutation endpoint. Data must come
+// from the stored server-authored Action.Submit payload, never caller display
+// JSON, so request/document identity cannot be rewritten during a mutation.
+type docsResultRenderInput struct {
+	Data             map[string]interface{}
+	Title            string
+	OperatorName     string
+	DecidedAtDisplay string
+	DenyReason       string
+	Denied           bool
+}
+
+func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
+	requestID := strings.TrimSpace(stringEventData(input.Data, "request_id"))
+	docID := strings.TrimSpace(stringEventData(input.Data, "doc_id"))
+	if requestID == "" || docID == "" {
+		return nil, "", errors.New("notify: docs result is missing stored request identity")
+	}
+	title := strings.TrimSpace(input.Title)
+	if title == "" {
+		title = strings.TrimSpace(stringEventData(input.Data, "doc_title"))
+	}
+	if title == "" {
+		title = docID
+	}
+	operatorName := strings.TrimSpace(input.OperatorName)
+	if operatorName == "" {
+		// A UID is an internal identifier, not display copy. Use stable localized
+		// generic text when the callback does not provide an operator name.
+		operatorName = docsLabelsFor(lang).decisionActor
+	}
+	denyReason := strings.TrimSpace(input.DenyReason)
 	if runes := []rune(denyReason); len(runes) > capResultReason {
 		denyReason = string(runes[:capResultReason])
 	}
-	requestID, _ := event.Data["request_id"].(string)
-	actor, _ := event.Data["actor"].(string)
-	operatorName := strings.TrimSpace(result.Display["operator_name"])
-	if operatorName == "" {
-		operatorName = event.OperatorUID
+	state := docsaccessrequest.StateApproved
+	wireState := "approved"
+	if input.Denied {
+		state = docsaccessrequest.StateRejected
+		wireState = "rejected"
 	}
+	actor := stringEventData(input.Data, "actor")
 	document := map[string]any{
-		"docId": strings.TrimSpace(stringEventData(event.Data, "doc_id")),
+		"docId": docID,
 		"title": truncRunes(strings.TrimSpace(title), capResultTitle),
 	}
 	requester := map[string]any{"name": truncRunes(strings.TrimSpace(actor), capResultName)}
-	if value := strings.TrimSpace(stringEventData(event.Data, "source_name")); value != "" {
+	if value := strings.TrimSpace(stringEventData(input.Data, "source_name")); value != "" {
 		document["sourceName"] = truncRunes(value, capResultTitle)
 	}
-	if value := strings.TrimSpace(stringEventData(event.Data, "actor_avatar_url")); value != "" {
+	if value := strings.TrimSpace(stringEventData(input.Data, "actor_avatar_url")); value != "" {
 		// URL 不截断:schema 无 maxLength(https 由渲染层校验),截断会破坏链接。
 		requester["avatarUrl"] = value
 	}
 	fields := map[string]any{
-		"requestId": strings.TrimSpace(requestID),
+		"requestId": requestID,
 		"state":     wireState,
 		"document":  document,
 		"requester": requester,
 		"decision": map[string]any{
 			"operatorName":     truncRunes(operatorName, capResultName),
-			"decidedAtDisplay": truncRunes(strings.TrimSpace(result.Display["decided_at"]), capResultShortLabel),
+			"decidedAtDisplay": truncRunes(strings.TrimSpace(input.DecidedAtDisplay), capResultShortLabel),
 		},
 	}
 	dataCaps := map[string]int{
@@ -206,15 +259,15 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		"requestReason": "request_reason", "requestedAtDisplay": "requested_at_display",
 		"messageTimeDisplay": "message_time_display",
 	} {
-		if value := strings.TrimSpace(stringEventData(event.Data, source)); value != "" {
+		if value := strings.TrimSpace(stringEventData(input.Data, source)); value != "" {
 			fields[destination] = truncRunes(value, dataCaps[destination])
 		}
 	}
 	permission := make(map[string]any, 2)
-	if value := strings.TrimSpace(stringEventData(event.Data, "permission_label")); value != "" {
+	if value := strings.TrimSpace(stringEventData(input.Data, "permission_label")); value != "" {
 		permission["label"] = truncRunes(value, capResultShortLabel)
 	}
-	if value := strings.TrimSpace(stringEventData(event.Data, "permission_role_label")); value != "" {
+	if value := strings.TrimSpace(stringEventData(input.Data, "permission_role_label")); value != "" {
 		permission["roleLabel"] = truncRunes(value, capResultShortLabel)
 	}
 	if len(permission) > 0 {
@@ -225,20 +278,9 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 	}
 	raw, err := json.Marshal(fields)
 	if err != nil {
-		return fmt.Errorf("notify: marshal registry result fields: %w", err)
+		return nil, "", fmt.Errorf("notify: marshal registry result fields: %w", err)
 	}
-	return f.updater.ReplaceView(ctx, cardtmpl.UpdateTarget{
-		Target: carddispatch.Target{
-			SpaceID: event.SpaceID, ChannelID: channelID, ChannelType: event.ChannelType,
-		},
-		// card_seq 单调性来源:event.EventID 是全局单调递增的 snowflake,直接用作
-		// card_seq 满足 CardMutator CAS 的严格递增要求(见
-		// .octospec/learnings/pending/cardtmpl-interaction-closure.md)。若未来 event
-		// ID 生成器改为非单调,CAS 会静默丢弃合法更新——务必同步复核。
-		SenderUID: event.SenderUID, MessageID: event.MessageID, CardSeq: event.EventID,
-	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, raw, cardtmpl.BuildEnv{
-		WebLoginURL: f.ctx.GetConfig().External.WebLoginURL, Lang: lang, SpaceID: event.SpaceID,
-	})
+	return raw, state, nil
 }
 
 func stringEventData(data map[string]interface{}, key string) string {
@@ -249,10 +291,8 @@ func stringEventData(data map[string]interface{}, key string) string {
 func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	webLoginURL := f.ctx.GetConfig().External.WebLoginURL
-	// Approved / denied get the enriched outcome card (header + title + result
-	// box); the denied box surfaces the reviewer reason. Rendered through the
-	// shared builder so the click-driven terminal card and the sibling cards the
-	// access-decision card-sync endpoint mutates are byte-identical.
+	// The legacy/no-updater fallback still emits the enriched outcome card; the
+	// normal finalizer and sibling mutation paths render V3 through the Registry.
 	switch result.State {
 	case cardactiondispatch.StateApproved:
 		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, false)
@@ -270,10 +310,8 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	})
 }
 
-// buildDocsDecisionTerminalDocument renders the enriched approved/denied outcome
-// card. Shared by the click-driven finalizer (buildTerminalDocument) and the
-// access-decision card-sync endpoint (mutateDocsCard) so the terminal card a
-// clicker sees and the sibling cards other approvers see are byte-identical.
+// buildDocsDecisionTerminalDocument renders the legacy/no-updater fallback for
+// approved/denied outcomes. Production V3 result updates use CardUpdater.
 func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	if denied {

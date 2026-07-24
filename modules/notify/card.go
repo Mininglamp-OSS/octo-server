@@ -775,6 +775,7 @@ type docsLabels struct {
 	denyReasonLabel     string // "拒绝原因" / "Reason for denial"
 	approvedResult      string // result-box copy on approval
 	deniedResult        string // result-box copy on denial
+	decisionActor       string // safe generic when callback omits operator display name
 }
 
 func docsLabelsFor(lang string) docsLabels {
@@ -808,6 +809,7 @@ func docsLabelsFor(lang string) docsLabels {
 			denyReasonLabel:           "拒绝原因",
 			approvedResult:            "申请人已获得所申请的文档权限。",
 			deniedResult:              "申请已被拒绝。",
+			decisionActor:             "审批人",
 		}
 	}
 	return docsLabels{
@@ -839,6 +841,7 @@ func docsLabelsFor(lang string) docsLabels {
 		denyReasonLabel:           "Reason for denial",
 		approvedResult:            "The requester now has the requested document access.",
 		deniedResult:              "The access request was denied.",
+		decisionActor:             "Reviewer",
 	}
 }
 
