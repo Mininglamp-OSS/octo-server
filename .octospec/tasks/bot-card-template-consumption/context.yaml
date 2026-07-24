@@ -1,0 +1,20 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: Bot send/edit 是多租户写入口；必须复用 bot-token 身份、属主校验、权威 Space 注入、群/子区生命周期门禁，禁止调用方提供的 Space 或 sender 成为权威值。
+  - id: trust-boundary
+    source: repo
+    why: template_ref/data 是外部 Bot 输入；显式 catalog、raw/Registry total XOR、server-owned view/profile/metadata、Registry 渲染后 cardmsg.Validate 与最终尺寸复检共同构成不可绕过边界。
+  - id: error-handling
+    source: repo
+    why: 新的 catalog/schema/双模式拒绝均复用 httperr.ResponseErrorL 与既有 errcode；模板/schema 内部细节只写日志，不向调用方泄露。
+  - id: rate-limit
+    source: repo
+    why: 复用既有 /v1/bot 路由及其限流链，不新增路由或手写限流器；能力发现仍是原只读端点的增量字段。
+  - id: testing
+    source: repo
+    why: 以契约、catalog fail-close、send/edit、属主/生命周期/CAS、provenance、零副作用失败和 race 测试覆盖承重路径。
+  - id: commit-style
+    source: repo
+    why: 分支提交使用英文 Conventional Commits；PR 使用英文模板、Linked Spec 与 COMPREHENSION。
+brief: .octospec/tasks/bot-card-template-consumption/brief.md

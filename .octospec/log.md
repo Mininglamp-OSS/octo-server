@@ -4,6 +4,30 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
+
+- **Protocol** — Added the explicit Bot Registry template catalog to
+  `/v1/bot/card/profile` and Registry-backed `template_ref + state + data`
+  modes to Bot send/edit. Server owns view/profile/render metadata/Space/plain;
+  raw Model B remains supported under a total XOR. See
+  [journal](journal/shared/bot-card-template-consumption.md) and
+  [brief](tasks/bot-card-template-consumption/brief.md).
+- **Mutation safety** — Registry edits retain immutable template id/version and
+  reuse `CardMutator` ownership, lifecycle, positive `card_seq` CAS, revision,
+  and CMD paths. Transient frames skip revision history. Server-authored
+  `template_ref` provenance plus metadata equality prevents raw cards from
+  entering the Registry edit path.
+- **Fail-close** — Only explicitly catalogued templates are advertised/accepted;
+  JSON-template interaction reports are checked against rendered v2 samples at
+  registration; invalid or forged requests have zero dispatch/mutation effects.
+- **Learning (pending)** — JSON mutual exclusion must use raw key presence, not
+  decoded zero values; otherwise empty string/null can bypass the both-present
+  guard. See
+  [learning](learnings/pending/bot-card-template-consumption.md).
+- **Rollout boundary** — frozen `ai.reasoning-process@0.1.0` remains registered,
+  but a bounded successor + Bot catalog cutover (or an explicitly disabled Bot
+  card sub-gate) is required before Model A production enablement.
+
 ## 2026-07-24 (bot-send-permission-error-classification)
 
 - **Error classification** — Bot API sends to a missing group or missing thread
