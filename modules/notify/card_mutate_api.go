@@ -96,8 +96,8 @@ type CardMutateResp struct {
 
 // mutateCard handles POST /v1/internal/cards/mutate. It drives one already-
 // delivered docs access card to its terminal (approved/denied) state in place,
-// reusing the exact terminal-card builder the click-driven finalizer uses so a
-// clicker's card and the sibling cards stay byte-identical. Docs capability only.
+// reusing the same V3 Registry field mapping as the click-driven finalizer.
+// Docs capability only.
 func (n *Notify) mutateCard(c *wkhttp.Context) {
 	capability, _ := c.Get(notifyCapabilityContextKey)
 	typedCapability, _ := capability.(notifyCapability)

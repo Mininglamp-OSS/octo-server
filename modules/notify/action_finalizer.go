@@ -291,10 +291,8 @@ func stringEventData(data map[string]interface{}, key string) string {
 func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	webLoginURL := f.ctx.GetConfig().External.WebLoginURL
-	// Approved / denied get the enriched outcome card (header + title + result
-	// box); the denied box surfaces the reviewer reason. Rendered through the
-	// shared builder so the click-driven terminal card and the sibling cards the
-	// access-decision card-sync endpoint mutates are byte-identical.
+	// The legacy/no-updater fallback still emits the enriched outcome card; the
+	// normal finalizer and sibling mutation paths render V3 through the Registry.
 	switch result.State {
 	case cardactiondispatch.StateApproved:
 		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, false)
@@ -312,10 +310,8 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	})
 }
 
-// buildDocsDecisionTerminalDocument renders the enriched approved/denied outcome
-// card. Shared by the click-driven finalizer (buildTerminalDocument) and the
-// access-decision card-sync endpoint (mutateDocsCard) so the terminal card a
-// clicker sees and the sibling cards other approvers see are byte-identical.
+// buildDocsDecisionTerminalDocument renders the legacy/no-updater fallback for
+// approved/denied outcomes. Production V3 result updates use CardUpdater.
 func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	if denied {
