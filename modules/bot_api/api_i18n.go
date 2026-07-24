@@ -115,6 +115,7 @@ var (
 	errBotSendPermAppBotDMOnly   = errors.New("app bot only supports direct messages")
 	errBotSendPermNotFriend      = errors.New("bot is not a friend of this user")
 	errBotSendPermConvNotStarted = errors.New("user has not started conversation with this bot")
+	errBotSendPermGroupNotFound  = errors.New("target group was not found")
 	errBotSendPermNotGroupMember = errors.New("bot is not a member of this group")
 	errBotSendPermGroupDisbanded = errors.New("the group has been disbanded")
 	errBotSendPermNotSpaceMember = errors.New("user is no longer a member of bot's space")
@@ -133,6 +134,8 @@ func respondSendPermissionError(c *wkhttp.Context, err error) {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPINotFriend, nil, nil)
 	case errors.Is(err, errBotSendPermConvNotStarted):
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
+	case errors.Is(err, errBotSendPermGroupNotFound):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIGroupNotFound, nil, nil)
 	case errors.Is(err, errBotSendPermNotGroupMember):
 		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 	case errors.Is(err, errBotSendPermGroupDisbanded):

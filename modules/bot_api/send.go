@@ -345,9 +345,9 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			return errBotSendPermAppBotDMOnly
 		}
 		// Rule 2: Must have friend relationship (user opt-in via /v1/robot/apply)
-		isFriend, err := ba.userService.IsFriend(robotID, channelID)
+		isFriend, err := ba.isFriend(robotID, channelID)
 		if err != nil {
-			ba.Error("failed to verify relationship", zap.Error(err), zap.String("robotID", robotID))
+			ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError, err)
 			return errBotSendPermCheckFailed
 		}
 		if !isFriend {
@@ -358,12 +358,12 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			spaceIDStr, _ := c.Get(CtxKeyAppBotSpaceID)
 			sid, _ := spaceIDStr.(string)
 			if sid == "" {
-				ba.Error("space bot missing space_id in context", zap.String("robotID", robotID))
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceContext, sendPermissionReasonMissingContext, nil)
 				return errBotSendPermCheckFailed
 			}
 			isMember, memberErr := ba.isSpaceMember(channelID, sid)
 			if memberErr != nil {
-				ba.Error("failed to verify space membership", zap.Error(memberErr), zap.String("robotID", robotID))
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceMember, sendPermissionReasonQueryError, memberErr)
 				return errBotSendPermCheckFailed
 			}
 			if !isMember {
@@ -383,7 +383,12 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			// Placed BEFORE the OBO/membership branch so it applies regardless
 			// of OBO context.
 			if disbanded, err := ba.isGroupDisbanded(channelID); err != nil {
-				return err
+				if errors.Is(err, dbr.ErrNotFound) {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound, err)
+					return errBotSendPermGroupNotFound
+				}
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError, err)
+				return errBotSendPermCheckFailed
 			} else if disbanded {
 				return errBotSendPermGroupDisbanded
 			}
@@ -393,13 +398,9 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			// (or implicit scope via global_enabled) for this channel.
 			if !hasOBOContext {
 				// Group: check bot is a group member
-				var count int
-				err := ba.db.session.SelectBySql(
-					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-					channelID, robotID,
-				).LoadOne(&count)
+				count, err := ba.queryBotGroupMemberCount(channelID, robotID)
 				if err != nil {
-					ba.Error("查询群成员失败", zap.Error(err))
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError, err)
 					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
@@ -418,7 +419,12 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				return errBotSendPermBadThreadChan
 			}
 			if disbanded, err := ba.isGroupDisbanded(topicParts[0]); err != nil {
-				return err
+				if errors.Is(err, dbr.ErrNotFound) {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound, err)
+					return errBotSendPermGroupNotFound
+				}
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError, err)
+				return errBotSendPermCheckFailed
 			} else if disbanded {
 				return errBotSendPermGroupDisbanded
 			}
@@ -442,13 +448,9 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				if len(parts) != 2 {
 					return errBotSendPermBadThreadChan
 				}
-				var count int
-				err := ba.db.session.SelectBySql(
-					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-					parts[0], robotID,
-				).LoadOne(&count)
+				count, err := ba.queryBotGroupMemberCount(parts[0], robotID)
 				if err != nil {
-					ba.Error("查询群成员失败", zap.Error(err))
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError, err)
 					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
@@ -478,7 +480,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				// rationale and the regression that motivated R7.
 				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
-					ba.Error("查询好友关系失败", zap.Error(err))
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError, err)
 					return errBotSendPermCheckFailed
 				}
 				if !allowed {
@@ -489,21 +491,38 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 		return nil
 
 	default:
-		ba.Error("unknown bot kind", zap.String("botKind", botKind), zap.String("robotID", robotID))
+		ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageBotKind, sendPermissionReasonUnknown, nil)
 		return errBotSendPermCheckFailed
 	}
 }
 
+func (ba *BotAPI) queryBotGroupMemberCount(groupNo, robotID string) (int, error) {
+	if ba.groupMemberCountOverride != nil {
+		return ba.groupMemberCountOverride(groupNo, robotID)
+	}
+	var count int
+	err := ba.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+		groupNo, robotID,
+	).LoadOne(&count)
+	if err != nil {
+		return 0, fmt.Errorf("query bot group membership: %w", err)
+	}
+	return count, nil
+}
+
 // isSpaceMember checks if a user is a member of the given space.
 func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
+	if ba.spaceMemberQueryOverride != nil {
+		return ba.spaceMemberQueryOverride(uid, spaceID)
+	}
 	var count int
 	err := ba.db.session.SelectBySql(
 		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
 		spaceID, uid,
 	).LoadOne(&count)
 	if err != nil {
-		ba.Error("isSpaceMember query failed", zap.String("uid", uid), zap.String("spaceID", spaceID), zap.Error(err))
-		return false, err
+		return false, fmt.Errorf("query space membership: %w", err)
 	}
 	return count > 0, nil
 }
@@ -512,9 +531,17 @@ func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
 // disbanded (read-only) state. Used by checkSendPermission to block bot sends
 // to disbanded groups/threads — the deployed WuKongIM /message/send gives no
 // failure signal on a disband rejection, so octo-server must self-check.
-// Infra failures are logged and surfaced as errBotSendPermCheckFailed (fail
-// closed) rather than letting a DB hiccup silently allow the send.
+// The raw lookup error is preserved for errors.Is classification. Callers stay
+// fail-closed and decide whether dbr.ErrNotFound is a business not-found result
+// or whether another error is an internal query failure.
 func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
+	if ba.groupStatusQueryOverride != nil {
+		status, err := ba.groupStatusQueryOverride(groupNo)
+		if err != nil {
+			return false, fmt.Errorf("query group status: %w", err)
+		}
+		return status == group.GroupStatusDisband, nil
+	}
 	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。
 	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
 	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
@@ -527,8 +554,7 @@ func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
 		groupNo,
 	).LoadOne(&status)
 	if err != nil {
-		ba.Error("isGroupDisbanded query failed", zap.String("groupNo", groupNo), zap.Error(err))
-		return false, errBotSendPermCheckFailed
+		return false, fmt.Errorf("query group status: %w", err)
 	}
 	return status == group.GroupStatusDisband, nil
 }

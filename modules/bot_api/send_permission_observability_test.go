@@ -418,3 +418,95 @@ func TestCheckSendPermissionDisbandedGroupDoesNotEmitInternalFailureMetric(t *te
 		string(sendPermissionStageGroupStatus), string(sendPermissionReasonQueryError),
 	)))
 }
+
+func TestCheckSendPermissionKeepsSuccessfulAndBusinessDenialPaths(t *testing.T) {
+	tests := []struct {
+		name        string
+		botKind     string
+		channelID   string
+		channelType uint8
+		prepare     func(*wkhttp.Context, *BotAPI)
+		wantErr     error
+	}{
+		{
+			name:        "platform app friend succeeds",
+			botKind:     BotKindApp,
+			channelID:   "target",
+			channelType: common.ChannelTypePerson.Uint8(),
+			prepare: func(_ *wkhttp.Context, ba *BotAPI) {
+				ba.friendCheckOverride = func(string, string) (bool, error) { return true, nil }
+			},
+		},
+		{
+			name:        "space app inactive member remains not_space_member",
+			botKind:     BotKindApp,
+			channelID:   "target",
+			channelType: common.ChannelTypePerson.Uint8(),
+			prepare: func(c *wkhttp.Context, ba *BotAPI) {
+				c.Set(CtxKeyAppBotScope, "space")
+				c.Set(CtxKeyAppBotSpaceID, "space")
+				ba.friendCheckOverride = func(string, string) (bool, error) { return true, nil }
+				ba.spaceMemberQueryOverride = func(string, string) (bool, error) { return false, nil }
+			},
+			wantErr: errBotSendPermNotSpaceMember,
+		},
+		{
+			name:        "group member succeeds",
+			botKind:     BotKindUser,
+			channelID:   "group",
+			channelType: common.ChannelTypeGroup.Uint8(),
+			prepare: func(_ *wkhttp.Context, ba *BotAPI) {
+				ba.groupStatusQueryOverride = func(string) (int, error) { return 0, nil }
+				ba.groupMemberCountOverride = func(string, string) (int, error) { return 1, nil }
+			},
+		},
+		{
+			name:        "thread parent group member succeeds",
+			botKind:     BotKindUser,
+			channelID:   "group____thread",
+			channelType: common.ChannelTypeCommunityTopic.Uint8(),
+			prepare: func(_ *wkhttp.Context, ba *BotAPI) {
+				ba.groupStatusQueryOverride = func(string) (int, error) { return 0, nil }
+				ba.groupMemberCountOverride = func(string, string) (int, error) { return 1, nil }
+			},
+		},
+		{
+			name:        "user bot friend succeeds",
+			botKind:     BotKindUser,
+			channelID:   "target",
+			channelType: common.ChannelTypePerson.Uint8(),
+			prepare: func(_ *wkhttp.Context, ba *BotAPI) {
+				ba.friendCheckOverride = func(string, string) (bool, error) { return true, nil }
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			metrics := newBotSendPermissionMetrics(registry)
+			logger := &permissionRecordingLog{}
+			ba := &BotAPI{sendPermissionMetrics: metrics, Log: logger}
+			ctx := newPermissionTestContext(t, "trace-safe")
+			tt.prepare(ctx, ba)
+
+			err := ba.checkSendPermission(ctx, tt.botKind, "bot", tt.channelID, tt.channelType, false)
+			if tt.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.wantErr)
+			}
+			assert.Empty(t, logger.entries)
+			families, gatherErr := registry.Gather()
+			require.NoError(t, gatherErr)
+			assert.Empty(t, families)
+		})
+	}
+}
+
+func TestSendPermissionObservabilityNilSafety(t *testing.T) {
+	assert.Nil(t, newBotSendPermissionMetrics(nil))
+	(*botSendPermissionMetrics)(nil).observe(sendPermissionStageFriend, sendPermissionReasonQueryError)
+	assert.Empty(t, traceIDFromWKContext(nil))
+	assert.Empty(t, traceIDFromWKContext(&wkhttp.Context{}))
+}
