@@ -144,12 +144,30 @@ for i = 1, 5 do redis.call('PEXPIRE', KEYS[i], ARGV[6]) end
 return 1
 `)
 
+// reclaimScript requeues leases whose expiry passed without an Ack/Nack/Defer (a crashed,
+// hung, or errored worker), so a dropped lease can never wedge an event in the leased set.
+// KEYS[9] is the route_missing_since marker. When the reclaimed lease belonged to an event
+// still in the route-missing defer loop, refund the claim's speculative attempt +1: claimScript
+// increments on every claim and only a completed Defer restores it (a claim->Defer re-check cycle
+// is net-zero), so a crash / Redis error / lease expiry in the window BETWEEN claim and Defer
+// would otherwise leak that +1. Across many self-heal cycles the counter creeps up until the
+// event reads attempt > MaxAttempts and dead-letters as attempts_exhausted on a route it never
+// got to try. The refund (floored at 0) makes a reclaimed defer cycle net-zero too. It is gated
+// on the marker so DELIVERY leases — which carry no marker and whose attempt legitimately counts a
+// real delivery try that bounds retries — are untouched (see TestRedisQueueLeaseTokenRetryDLQAndReplay,
+// where a markerless reclaim still advances to attempt 2). A single miss window before the first
+// marker is written (claim -> first RouteMissingSeenAt) can still leak at most one increment per
+// route-missing episode, which never approaches MaxAttempts over a minutes-long episode.
 var reclaimScript = rd.NewScript(`
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[2], id) == 1 then
     redis.call('HDEL', KEYS[5], id)
     if redis.call('HEXISTS', KEYS[3], id) == 1 then
+      if redis.call('HEXISTS', KEYS[9], id) == 1 then
+        local attempt = tonumber(redis.call('HGET', KEYS[4], id) or '0')
+        if attempt > 0 then redis.call('HINCRBY', KEYS[4], id, -1) end
+      end
       redis.call('ZADD', KEYS[1], ARGV[1], id)
     end
   end
