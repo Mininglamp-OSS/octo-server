@@ -116,6 +116,21 @@ func (m *messageExtraDB) sync(version int64, channelID string, channelType uint8
 	return models, err
 }
 
+// maxVersion returns the greatest version the server has actually persisted for
+// one storage channel. channel_version_idx serves this equality-prefix MAX query.
+// It is the authoritative upper bound for an untrusted client sync cursor.
+func (m *messageExtraDB) maxVersion(channelID string, channelType uint8) (int64, error) {
+	var version int64
+	err := m.session.SelectBySql(
+		"SELECT COALESCE(MAX(`version`),0) FROM `message_extra` WHERE `channel_id`=? AND `channel_type`=?",
+		channelID, channelType,
+	).LoadOne(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
 type messageExtraDetailModelSlice []*messageExtraDetailModel
 
 func (m messageExtraDetailModelSlice) Len() int {

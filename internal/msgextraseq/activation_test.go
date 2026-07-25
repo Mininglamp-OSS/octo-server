@@ -127,17 +127,26 @@ func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *test
 	// A historical poisoned cursor above that ceiling cannot have been returned
 	// by the server and must not force activation to an impossible floor.
 	const (
-		key          = "messageExtraVersion:msgextraseq-preflight-test"
-		validField   = "valid-channel-2"
-		poisonField  = "poison-channel-2"
-		validCursor  = int64(900)
-		poisonCursor = msgextraseq.MaxCutoverFloor
+		key             = "messageExtraVersion:msgextraseq-preflight-test"
+		validField      = "valid-channel-2"
+		ceilingField    = "ceiling-channel-2"
+		poisonField     = "poison-channel-2"
+		malformedField  = "malformed-channel-2"
+		negativeField   = "negative-channel-2"
+		validCursor     = int64(900)
+		ceilingCursor   = int64(1000)
+		poisonCursor    = msgextraseq.MaxCutoverFloor
+		malformedCursor = "not-an-integer"
+		negativeCursor  = "-1"
 	)
 	redis := ctx.GetRedisConn()
 	if err := redis.Hmset(
 		key,
 		validField, fmt.Sprintf("%d", validCursor),
+		ceilingField, fmt.Sprintf("%d", ceilingCursor),
 		poisonField, fmt.Sprintf("%d", poisonCursor),
+		malformedField, malformedCursor,
+		negativeField, negativeCursor,
 	); err != nil {
 		t.Fatalf("seed Redis cursors: %v", err)
 	}
@@ -147,14 +156,14 @@ func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *test
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
-	if res.MaxRedisCursor < validCursor || res.MaxRedisCursor > 1000 {
-		t.Fatalf("MaxRedisCursor=%d want valid evidence within [%d,1000]", res.MaxRedisCursor, validCursor)
+	if res.MaxRedisCursor != ceilingCursor {
+		t.Fatalf("MaxRedisCursor=%d want issued ceiling %d", res.MaxRedisCursor, ceilingCursor)
 	}
-	if res.InvalidRedisCursorFieldCount < 1 {
-		t.Fatalf("InvalidRedisCursorFieldCount=%d want at least 1", res.InvalidRedisCursorFieldCount)
+	if res.InvalidRedisCursorFieldCount < 3 {
+		t.Fatalf("InvalidRedisCursorFieldCount=%d want at least 3", res.InvalidRedisCursorFieldCount)
 	}
-	if res.RedisCursorKeyCount < 1 || res.RedisCursorFieldCount < 2 {
-		t.Fatalf("Redis scan counts=(keys=%d fields=%d), want at least one key/two fields", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
+	if res.RedisCursorKeyCount < 1 || res.RedisCursorFieldCount < 5 {
+		t.Fatalf("Redis scan counts=(keys=%d fields=%d), want at least one key/five fields", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
 	}
 	if res.RecommendedFloor != 1000 {
 		t.Fatalf("RecommendedFloor=%d want authoritative issued max 1000", res.RecommendedFloor)

@@ -1,6 +1,26 @@
 package message
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestSyncMessageExtraRejectsEmptyChannelBeforeStorageAccess(t *testing.T) {
+	// A nil-backed Message is deliberate: if validation ever moves behind the DB
+	// or Redis path again, this test panics instead of silently allowing storage
+	// access for an invalid channel.
+	m := &Message{}
+	r := helperHarness(m.syncMessageExtra)
+	req := httptest.NewRequest(http.MethodGet, "/probe", strings.NewReader(`{"channel_id":" ","extra_version":1152921504606846976}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
 
 func TestParseCachedMessageExtraSyncCursorMarksMalformedValueInvalid(t *testing.T) {
 	tests := []struct {
@@ -60,6 +80,22 @@ func TestResolveMessageExtraSyncCursor(t *testing.T) {
 			wantStore:  false,
 		},
 		{
+			name:       "negative issued max normalizes to empty range",
+			requested:  20,
+			cached:     0,
+			issuedMax:  -1,
+			wantCursor: 0,
+			wantStore:  false,
+		},
+		{
+			name:       "negative cache heals from valid request",
+			requested:  20,
+			cached:     -5,
+			issuedMax:  100,
+			wantCursor: 20,
+			wantStore:  true,
+		},
+		{
 			name:       "poisoned cache heals from valid request",
 			requested:  20,
 			cached:     1 << 60,
@@ -84,8 +120,12 @@ func TestResolveMessageExtraSyncCursor(t *testing.T) {
 				t.Fatalf("resolveMessageExtraSyncCursor(%d,%d,%d)=(%d,%v), want (%d,%v)",
 					tt.requested, tt.cached, tt.issuedMax, gotCursor, gotStore, tt.wantCursor, tt.wantStore)
 			}
-			if gotCursor < 0 || gotCursor > tt.issuedMax {
-				t.Fatalf("resolved cursor %d escaped issued range [0,%d]", gotCursor, tt.issuedMax)
+			upperBound := tt.issuedMax
+			if upperBound < 0 {
+				upperBound = 0
+			}
+			if gotCursor < 0 || gotCursor > upperBound {
+				t.Fatalf("resolved cursor %d escaped issued range [0,%d]", gotCursor, upperBound)
 			}
 		})
 	}
@@ -134,5 +174,64 @@ func TestMessageExtraMaxVersionIsChannelScoped(t *testing.T) {
 	}
 	if empty != 0 {
 		t.Fatalf("empty maxVersion=%d want 0", empty)
+	}
+}
+
+func TestMessageExtraPoisonedCursorSelfHealsInRedis(t *testing.T) {
+	m, ctx := newSeqTestMessage(t, 0, 0)
+	const (
+		messageID   = "cursor-heal-message"
+		channelID   = "cursor-heal-channel"
+		channelType = uint8(2)
+		uid         = "cursor-heal-user"
+		source      = "-cursor-heal-source"
+		requested   = int64(20)
+		issued      = int64(100)
+		poisoned    = int64(1 << 60)
+	)
+	redisKey := "messageExtraVersion:" + uid + source
+
+	if _, err := ctx.DB().UpdateBySql("DELETE FROM `message_extra` WHERE `message_id`=?", messageID).Exec(); err != nil {
+		t.Fatalf("clean cursor fixture: %v", err)
+	}
+	if _, err := ctx.DB().UpdateBySql(
+		"INSERT INTO `message_extra` (`message_id`,`channel_id`,`channel_type`,`version`) VALUES (?,?,?,?)",
+		messageID, channelID, channelType, issued,
+	).Exec(); err != nil {
+		t.Fatalf("seed cursor fixture: %v", err)
+	}
+	redis := ctx.GetRedisConn()
+	if err := m.setMessageExtraVersion(uid, channelID, channelType, source, poisoned); err != nil {
+		t.Fatalf("seed poisoned Redis cursor: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = ctx.DB().UpdateBySql("DELETE FROM `message_extra` WHERE `message_id`=?", messageID).Exec()
+		_ = redis.Del(redisKey)
+	})
+
+	cached, err := m.getMessageExtraVersion(uid, source, channelID, channelType)
+	if err != nil {
+		t.Fatalf("get poisoned cursor: %v", err)
+	}
+	if cached != poisoned {
+		t.Fatalf("cached cursor=%d want poisoned value %d", cached, poisoned)
+	}
+	issuedMax, err := m.messageExtraDB.maxVersion(channelID, channelType)
+	if err != nil {
+		t.Fatalf("maxVersion: %v", err)
+	}
+	normalized, persist := resolveMessageExtraSyncCursor(requested, cached, issuedMax)
+	if normalized != requested || !persist {
+		t.Fatalf("resolved cursor=(%d,%v), want (%d,true)", normalized, persist, requested)
+	}
+	if err := m.setMessageExtraVersion(uid, channelID, channelType, source, normalized); err != nil {
+		t.Fatalf("heal Redis cursor: %v", err)
+	}
+	healed, err := m.getMessageExtraVersion(uid, source, channelID, channelType)
+	if err != nil {
+		t.Fatalf("get healed cursor: %v", err)
+	}
+	if healed != requested {
+		t.Fatalf("healed cursor=%d want %d", healed, requested)
 	}
 }

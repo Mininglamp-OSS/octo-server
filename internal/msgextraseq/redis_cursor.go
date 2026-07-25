@@ -14,28 +14,31 @@ const (
 )
 
 type redisCursorEvidence struct {
-	maxCursor  int64
-	keyCount   int64
-	fieldCount int64
+	maxCursor         int64
+	keyCount          int64
+	fieldCount        int64
+	invalidFieldCount int64
 }
 
 // observeRedisCursorEvidence scans the persisted sync cursors without using
-// KEYS or HGETALL. SCAN/HSCAN keep each Redis command bounded while still
-// visiting the complete keyspace required for a safe cutover floor.
+// KEYS or HGETALL. SCAN/HSCAN visit the keyspace incrementally without retaining
+// keyspace-sized state between batches.
 //
 // The scan is intentionally operator-only (Preflight/Activate), never on a
-// request path. It reports only aggregate counts and the maximum value; Redis
-// keys and hash fields contain user/source/channel identifiers and must not be
-// logged or printed.
-func (s *Store) observeRedisCursorEvidence() (redisCursorEvidence, error) {
+// request path. It reports only aggregate visit counts, invalid-field count, and
+// the maximum valid value; Redis keys and hash fields contain user/source/channel
+// identifiers and must not be logged or printed.
+func (s *Store) observeRedisCursorEvidence(maxIssued int64) (redisCursorEvidence, error) {
 	client, err := s.newRedisScanClient()
 	if err != nil {
 		return redisCursorEvidence{}, err
 	}
 	defer client.Close()
+	if maxIssued < 0 {
+		maxIssued = 0
+	}
 
 	var evidence redisCursorEvidence
-	seenKeys := make(map[string]struct{})
 	var keyCursor uint64
 	for {
 		keys, next, err := client.Scan(keyCursor, messageExtraCursorKeyPattern, redisCursorScanBatchSize).Result()
@@ -43,12 +46,9 @@ func (s *Store) observeRedisCursorEvidence() (redisCursorEvidence, error) {
 			return redisCursorEvidence{}, fmt.Errorf("msgextraseq: scan Redis cursor keys: %w", err)
 		}
 		for _, key := range keys {
-			// Redis SCAN may return a key more than once while the keyspace changes.
-			// Avoid rescanning it and inflating the aggregate key/field counts.
-			if _, ok := seenKeys[key]; ok {
-				continue
-			}
-			seenKeys[key] = struct{}{}
+			// SCAN may return a key more than once while the keyspace changes. Do
+			// not retain an unbounded dedupe map: duplicate visits can only inflate
+			// aggregate counts; they cannot change the observed maximum.
 			evidence.keyCount++
 
 			var hashCursor uint64
@@ -61,11 +61,20 @@ func (s *Store) observeRedisCursorEvidence() (redisCursorEvidence, error) {
 					return redisCursorEvidence{}, fmt.Errorf("msgextraseq: scan Redis cursor hash returned an odd entry count")
 				}
 				for i := 1; i < len(entries); i += 2 {
+					evidence.fieldCount++
 					cursor, err := strconv.ParseInt(entries[i], 10, 64)
 					if err != nil {
-						return redisCursorEvidence{}, fmt.Errorf("msgextraseq: parse Redis cursor value: %w", err)
+						evidence.invalidFieldCount++
+						continue
 					}
-					evidence.fieldCount++
+					// A client cursor above the DB/legacy issued ceiling (or below
+					// zero) cannot have originated from the server. New binaries heal
+					// such per-channel cache entries on the next sync request, so they
+					// are diagnostics rather than cutover-floor evidence.
+					if cursor < 0 || cursor > maxIssued {
+						evidence.invalidFieldCount++
+						continue
+					}
 					if cursor > evidence.maxCursor {
 						evidence.maxCursor = cursor
 					}

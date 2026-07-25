@@ -1263,8 +1263,7 @@ func (m *Message) getMessageExtraVersion(uid, source, channelID string, channelT
 	if versionStr == "" {
 		return 0, nil
 	}
-	version, _ := strconv.ParseInt(versionStr, 10, 64)
-	return version, nil
+	return parseCachedMessageExtraSyncCursor(versionStr), nil
 
 }
 
@@ -1289,6 +1288,12 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "")
 		return
 	}
+	// Validate before membership checks or Redis access. Previously an empty
+	// channel could still create a messageExtraVersion hash field.
+	if strings.TrimSpace(req.ChannelID) == "" {
+		respondMessageRequestInvalid(c, "channel_id")
+		return
+	}
 
 	// 群组成员校验：非成员不允许同步消息扩展数据
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
@@ -1308,23 +1313,26 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(c.GetLoginUID(), req.ChannelID)
 	}
+	issuedMax, err := m.messageExtraDB.maxVersion(fakeChannelID, req.ChannelType)
+	if err != nil {
+		m.Error("查询消息扩展最大版本失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
 	cacheExtraVersion, err := m.getMessageExtraVersion(c.GetLoginUID(), req.Source, fakeChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("从缓存中获取消息扩展版本失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
-	extraVersion := req.ExtraVersion
-	if cacheExtraVersion >= extraVersion {
-		extraVersion = cacheExtraVersion
-	} else {
+	extraVersion, persistCursor := resolveMessageExtraSyncCursor(req.ExtraVersion, cacheExtraVersion, issuedMax)
+	if persistCursor {
 		err = m.setMessageExtraVersion(c.GetLoginUID(), fakeChannelID, req.ChannelType, req.Source, extraVersion)
 		if err != nil {
 			m.Error("缓存最大的消息扩展版本失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
-
 	}
 	limit := req.Limit
 	if limit <= 0 {
@@ -1332,10 +1340,6 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 	}
 	if limit > 10000 {
 		limit = 10000
-	}
-	if strings.TrimSpace(req.ChannelID) == "" {
-		respondMessageRequestInvalid(c, "channel_id")
-		return
 	}
 	extraModels, err := m.messageExtraDB.sync(extraVersion, fakeChannelID, req.ChannelType, uint64(limit), c.GetLoginUID())
 	if err != nil {

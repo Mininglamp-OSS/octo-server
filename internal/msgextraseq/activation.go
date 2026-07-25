@@ -16,14 +16,16 @@ package msgextraseq
 // legacy seq boundaries above the transactional max → restart every replica →
 // flip mode); see tools/msgextra-version/README.md §6.
 //
-// The cutover floor must be at least every version already handed out or cached
-// as a client sync cursor (otherwise post-cutover writes could remain below a
-// cursor and invisible), and at most MaxCutoverFloor (or every reservation would
-// fail ErrOverflow). The floor evidence is the max persisted
-// message_extra.version, the max legacy GenSeq block boundary (seq.min_seq for
-// the messageExtra keys), and every Redis messageExtraVersion:* hash value.
-// Activate recomputes and enforces all three under the operational drain so a
-// stale/out-of-range floor is rejected rather than trusted.
+// The cutover floor must be at least every version already handed out or validly
+// cached as a client sync cursor (otherwise post-cutover writes could remain
+// below a cursor and invisible), and at most MaxCutoverFloor (or every
+// reservation would fail ErrOverflow). The issued ceiling is the max persisted
+// message_extra.version / legacy GenSeq block boundary. Redis
+// messageExtraVersion:* values within that ceiling are evidence; malformed,
+// negative, or above-issued values cannot be trusted as server-issued cursors,
+// are counted as poisoned, and are excluded. Upgraded sync handlers repair those
+// per-channel cache entries on read. Activate recomputes and enforces the evidence
+// under the operational drain so stale/out-of-range input is never trusted.
 
 import (
 	"context"
@@ -69,13 +71,17 @@ type PreflightResult struct {
 	// MaxLegacySeqBoundary is MAX(seq.min_seq) across the messageExtra GenSeq
 	// keys — the upper bound on versions the legacy HiLo allocator has handed out.
 	MaxLegacySeqBoundary int64
-	// MaxRedisCursor is the largest cached messageExtraVersion:* hash value.
-	// RedisCursorKeyCount/RedisCursorFieldCount are aggregate scan counts; key and
-	// field names are deliberately never surfaced because they contain user,
+	// MaxRedisCursor is the largest valid cached messageExtraVersion:* hash value.
+	// RedisCursorKeyCount/RedisCursorFieldCount are aggregate visit counts; key
+	// and field names are deliberately never surfaced because they contain user,
 	// source, and channel identifiers.
 	MaxRedisCursor        int64
 	RedisCursorKeyCount   int64
 	RedisCursorFieldCount int64
+	// InvalidRedisCursorFieldCount counts malformed, negative, or above-issued
+	// cursors. They cannot be trusted as server-issued and are excluded from floor
+	// evidence; upgraded sync handlers repair the per-channel cache when next read.
+	InvalidRedisCursorFieldCount int64
 	// RecommendedFloor is the max of the three maxima: the smallest floor that
 	// cannot reissue an already-used version or sit below a cached sync cursor.
 	RecommendedFloor int64
@@ -112,13 +118,18 @@ func (s *Store) Preflight() (PreflightResult, error) {
 	}
 	res.MaxMessageExtraVersion = maxVersion
 	res.MaxLegacySeqBoundary = maxSeq
-	redisEvidence, err := s.observeRedisCursorEvidence()
+	issuedCeiling := maxVersion
+	if maxSeq > issuedCeiling {
+		issuedCeiling = maxSeq
+	}
+	redisEvidence, err := s.observeRedisCursorEvidence(issuedCeiling)
 	if err != nil {
 		return PreflightResult{}, err
 	}
 	res.MaxRedisCursor = redisEvidence.maxCursor
 	res.RedisCursorKeyCount = redisEvidence.keyCount
 	res.RedisCursorFieldCount = redisEvidence.fieldCount
+	res.InvalidRedisCursorFieldCount = redisEvidence.invalidFieldCount
 	res.RecommendedFloor = maxVersion
 	if maxSeq > res.RecommendedFloor {
 		res.RecommendedFloor = maxSeq
@@ -169,13 +180,13 @@ func (s *Store) Activate(floor int64) (flipped bool, retErr error) {
 	if err != nil {
 		return false, err
 	}
-	redisEvidence, err := s.observeRedisCursorEvidence()
-	if err != nil {
-		return false, err
-	}
 	observed := maxVersion
 	if maxSeq > observed {
 		observed = maxSeq
+	}
+	redisEvidence, err := s.observeRedisCursorEvidence(observed)
+	if err != nil {
+		return false, err
 	}
 	if redisEvidence.maxCursor > observed {
 		observed = redisEvidence.maxCursor

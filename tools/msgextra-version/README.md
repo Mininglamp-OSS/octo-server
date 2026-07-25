@@ -25,11 +25,19 @@ go build -o /tmp/msgextra-version ./tools/msgextra-version
 Reports the current mode/epoch/floor and the recommended `cutover_floor` — the
 max of `MAX(message_extra.version)`, the max legacy `seq.min_seq` for the
 `messageExtra` keys (the upper bound on versions already handed out), and every
-cached `messageExtraVersion:*` Redis hash value. Redis is scanned incrementally
-with bounded `SCAN`/`HSCAN` batches (never `KEYS`/`HGETALL`); output includes only
-aggregate key/field counts and the maximum, never user/source/channel identifiers.
-The floor must be at least this maximum, or post-cutover versions could be
-reissued or remain below a cached client cursor and therefore invisible.
+valid cached `messageExtraVersion:*` Redis hash value. Redis is scanned
+incrementally with `SCAN`/`HSCAN` (never `KEYS`/`HGETALL`) without retaining a
+keyspace-sized dedupe set; output includes only aggregate visit counts, the
+valid maximum, and an `invalid_or_poisoned` count, never user/source/channel
+identifiers.
+
+A Redis cursor is valid evidence only when it is non-negative and no greater
+than the global DB/legacy issued ceiling. Anything else cannot have been returned
+by this server, is excluded from the floor, and is reported as poisoned. The
+upgraded `/message/extra/sync` handler independently constrains every request and
+cached cursor to that storage channel's persisted `MAX(message_extra.version)`,
+so old poisoned fields self-heal when their client/source next syncs. This avoids
+both an activation DoS and unsafe manual Redis deletion.
 
 ## 2. Prepare
 
@@ -55,9 +63,9 @@ reissued or remain below a cached client cursor and therefore invisible.
 
 1. Drain or pause both writes to `message_extra` (edits, revokes, pins, read
    receipts, bot/card edits) **and `/message/extra/sync` requests**, then wait for
-   in-flight requests to finish. The sync endpoint can advance
-   `messageExtraVersion:*` directly from a client cursor and does not take the
-   MySQL state-row lock, so it must remain drained through activation.
+   in-flight requests to finish. The upgraded sync endpoint normalizes client
+   cursors, but valid cache updates still do not take the MySQL state-row lock,
+   so it must remain drained through activation to make the final scan stable.
 2. Rerun `preflight` after the drain and review the final recommended floor.
 3. Activate while the write drain remains in place:
 
