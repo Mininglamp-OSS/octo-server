@@ -16,12 +16,13 @@ package msgextraseq
 // legacy seq boundaries above the transactional max → restart every replica →
 // flip mode); see tools/msgextra-version/README.md §6.
 //
-// The cutover floor must be at least every version already handed out (or the
-// transactional sequence could reissue a value ≤ an existing one and re-open the
-// skip window) and at most MaxCutoverFloor (or every reservation would fail
-// ErrOverflow). The floor evidence is the max persisted message_extra.version and
-// the max legacy GenSeq block boundary (seq.min_seq for the messageExtra keys);
-// Activate recomputes and enforces both bounds under the drain barrier so a
+// The cutover floor must be at least every version already handed out or cached
+// as a client sync cursor (otherwise post-cutover writes could remain below a
+// cursor and invisible), and at most MaxCutoverFloor (or every reservation would
+// fail ErrOverflow). The floor evidence is the max persisted
+// message_extra.version, the max legacy GenSeq block boundary (seq.min_seq for
+// the messageExtra keys), and every Redis messageExtraVersion:* hash value.
+// Activate recomputes and enforces all three under the operational drain so a
 // stale/out-of-range floor is rejected rather than trusted.
 
 import (
@@ -68,8 +69,15 @@ type PreflightResult struct {
 	// MaxLegacySeqBoundary is MAX(seq.min_seq) across the messageExtra GenSeq
 	// keys — the upper bound on versions the legacy HiLo allocator has handed out.
 	MaxLegacySeqBoundary int64
-	// RecommendedFloor is the max of the two maxima: the smallest floor that
-	// cannot reissue an already-used version.
+	// MaxRedisCursor is the largest cached messageExtraVersion:* hash value.
+	// RedisCursorKeyCount/RedisCursorFieldCount are aggregate scan counts; key and
+	// field names are deliberately never surfaced because they contain user,
+	// source, and channel identifiers.
+	MaxRedisCursor        int64
+	RedisCursorKeyCount   int64
+	RedisCursorFieldCount int64
+	// RecommendedFloor is the max of the three maxima: the smallest floor that
+	// cannot reissue an already-used version or sit below a cached sync cursor.
 	RecommendedFloor int64
 }
 
@@ -104,9 +112,19 @@ func (s *Store) Preflight() (PreflightResult, error) {
 	}
 	res.MaxMessageExtraVersion = maxVersion
 	res.MaxLegacySeqBoundary = maxSeq
+	redisEvidence, err := s.observeRedisCursorEvidence()
+	if err != nil {
+		return PreflightResult{}, err
+	}
+	res.MaxRedisCursor = redisEvidence.maxCursor
+	res.RedisCursorKeyCount = redisEvidence.keyCount
+	res.RedisCursorFieldCount = redisEvidence.fieldCount
 	res.RecommendedFloor = maxVersion
 	if maxSeq > res.RecommendedFloor {
 		res.RecommendedFloor = maxSeq
+	}
+	if redisEvidence.maxCursor > res.RecommendedFloor {
+		res.RecommendedFloor = redisEvidence.maxCursor
 	}
 	return res, nil
 }
@@ -143,15 +161,24 @@ func (s *Store) Activate(floor int64) (flipped bool, retErr error) {
 		return false, fmt.Errorf("%w: %d", ErrUnknownMode, mode)
 	}
 
-	// Recompute the maxima under the drain barrier so a concurrently-committing
-	// legacy writer cannot have raised them after the caller's Preflight.
+	// Recompute every source under the drain barrier so a concurrently-committing
+	// legacy writer cannot have raised the DB maxima after the caller's Preflight.
+	// The runbook also drains /message/extra/sync while this Redis scan runs;
+	// unlike writers, cursor updates do not take the MySQL state-row lock.
 	maxVersion, maxSeq, err := s.observedMaxima(tx)
+	if err != nil {
+		return false, err
+	}
+	redisEvidence, err := s.observeRedisCursorEvidence()
 	if err != nil {
 		return false, err
 	}
 	observed := maxVersion
 	if maxSeq > observed {
 		observed = maxSeq
+	}
+	if redisEvidence.maxCursor > observed {
+		observed = redisEvidence.maxCursor
 	}
 	if floor < observed {
 		return false, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floor, observed)

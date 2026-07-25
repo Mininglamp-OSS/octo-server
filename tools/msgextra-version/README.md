@@ -23,10 +23,13 @@ go build -o /tmp/msgextra-version ./tools/msgextra-version
 ```
 
 Reports the current mode/epoch/floor and the recommended `cutover_floor` — the
-max of `MAX(message_extra.version)` and the max legacy `seq.min_seq` for the
-`messageExtra` keys (the upper bound on versions already handed out). The floor
-must be at least this, or the new sequence could reissue a version ≤ an existing
-one and re-open the exact skip window #627 closes.
+max of `MAX(message_extra.version)`, the max legacy `seq.min_seq` for the
+`messageExtra` keys (the upper bound on versions already handed out), and every
+cached `messageExtraVersion:*` Redis hash value. Redis is scanned incrementally
+with bounded `SCAN`/`HSCAN` batches (never `KEYS`/`HGETALL`); output includes only
+aggregate key/field counts and the maximum, never user/source/channel identifiers.
+The floor must be at least this maximum, or post-cutover versions could be
+reissued or remain below a cached client cursor and therefore invisible.
 
 ## 2. Prepare
 
@@ -50,8 +53,11 @@ one and re-open the exact skip window #627 closes.
 
 ## 3. Drain and activate
 
-1. Drain or pause writes to `message_extra` (edits, revokes, pins, read receipts,
-   bot/card edits) and wait for in-flight requests to finish.
+1. Drain or pause both writes to `message_extra` (edits, revokes, pins, read
+   receipts, bot/card edits) **and `/message/extra/sync` requests**, then wait for
+   in-flight requests to finish. The sync endpoint can advance
+   `messageExtraVersion:*` directly from a client cursor and does not take the
+   MySQL state-row lock, so it must remain drained through activation.
 2. Rerun `preflight` after the drain and review the final recommended floor.
 3. Activate while the write drain remains in place:
 
@@ -61,10 +67,14 @@ one and re-open the exact skip window #627 closes.
 /tmp/msgextra-version -config configs/tsdd.yaml -action activate -floor <N> -yes
 ```
 
-`activate` takes the state row `FOR UPDATE` — the **drain barrier**: it waits for
-every in-flight writer (each holds the row `FOR SHARE` until it commits) to finish
-under legacy, then flips while no writer can proceed. It recomputes the maxima
-under that lock and refuses a floor below them (`ErrFloorTooLow`). It is
+`activate` takes the state row `FOR UPDATE` — the **writer drain barrier**: it
+waits for every in-flight writer (each holds the row `FOR SHARE` until it commits)
+to finish under legacy, then flips while no writer can proceed. It recomputes the
+DB maxima and performs a final bounded Redis cursor scan under that lock, and
+refuses a floor below any source (`ErrFloorTooLow`). The external drain of
+`/message/extra/sync` is what makes the Redis scan authoritative; the MySQL lock
+cannot block Redis-only cursor updates. Activation fails closed if Redis cannot
+be scanned. It is
 idempotent (a second run is a no-op). `epoch` is bumped for observability. The
 activation session uses a 3-second `innodb_lock_wait_timeout` as a fail-fast
 backstop: if the drain is incomplete, activation fails instead of queueing behind
@@ -124,20 +134,26 @@ is exactly the #627 skip window. A DB change cannot invalidate that in-memory
 cache; only a process restart can. So rollback requires a coordinated,
 maintenance-window procedure, run in this order:
 
-1. **Drain / pause writes** to `message_extra` (edits, revokes, pins, read
-   receipts, bot/card edits) so the transactional high-water stops moving.
-2. **Raise the legacy `seq` boundaries above the transactional high-water** so a
-   restarted replica's first legacy `GenSeq` block starts above every version
-   already issued transactionally:
+1. **Drain / pause writes and `/message/extra/sync` requests** so both the
+   transactional high-water and cached Redis cursors stop moving.
+2. Run `preflight` and record its `recommended cutover_floor`, which already
+   includes DB, legacy-seq, and Redis cursor maxima. **Raise the legacy `seq`
+   boundaries above that complete watermark** so a restarted replica's first
+   legacy `GenSeq` block starts above every issued version and cached cursor:
 
    ```sql
-   SET @maxtx := (SELECT COALESCE(MAX(`last_version`),0) FROM `octo_message_extra_channel_seq`);
+   -- Replace <PREFLIGHT_FLOOR> with the drained preflight recommendation.
+   SET @watermark := GREATEST(
+     <PREFLIGHT_FLOOR>,
+     (SELECT COALESCE(MAX(`last_version`),0) FROM `octo_message_extra_channel_seq`),
+     (SELECT `cutover_floor` FROM `octo_message_extra_version_state` WHERE `singleton_id`=1)
+   );
    -- bump existing legacy seq rows
-   UPDATE `seq` SET `min_seq` = GREATEST(`min_seq`, @maxtx)
+   UPDATE `seq` SET `min_seq` = GREATEST(`min_seq`, @watermark)
      WHERE `key` LIKE 'seq:messageExtra:%';
    -- create legacy seq rows for channels that only ran transactional
    INSERT INTO `seq` (`key`,`min_seq`,`step`)
-     SELECT CONCAT('seq:messageExtra:', `channel_id`), @maxtx, 1000
+     SELECT CONCAT('seq:messageExtra:', `channel_id`), @watermark, 1000
        FROM (SELECT DISTINCT `channel_id` FROM `octo_message_extra_channel_seq`) c
      ON DUPLICATE KEY UPDATE `min_seq` = GREATEST(`seq`.`min_seq`, VALUES(`min_seq`));
    ```
@@ -165,8 +181,8 @@ above them.
 
 ## Notes
 
-- The tool connects only to MySQL (via the config's `DB.MySQLAddr`); it does not
-  need Redis or WuKongIM.
+- The tool connects to MySQL and Redis via the normal DB config. Redis is required
+  for cursor evidence; WuKongIM is not used.
 - All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`) and is
   covered by `activation_test.go` against live MySQL; the command here is a thin
   wrapper.

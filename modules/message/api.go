@@ -3280,20 +3280,32 @@ func (m *Message) revoke(c *wkhttp.Context) {
 			return
 		}
 	}
-	err = m.deletePinnedMessage(channelID, uint8(channelTypeI), msgIds, loginUID, tx)
+	needsPinnedSync, err := m.deletePinnedMessage(fakeChannelID, uint8(channelTypeI), msgIds, tx)
 	if err != nil {
 		m.Error("删除置顶消息失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitThenRun(tx, func() {
+		if eventID > 0 {
+			m.ctx.EventCommit(eventID)
+		}
+		if needsPinnedSync {
+			if sendErr := m.ctx.SendCMD(config.MsgCMDReq{
+				NoPersist:   true,
+				ChannelID:   channelID,
+				ChannelType: uint8(channelTypeI),
+				FromUID:     loginUID,
+				CMD:         common.CMDSyncPinnedMessage,
+			}); sendErr != nil {
+				m.Warn("发送cmd失败！", zap.Error(sendErr))
+			}
+		}
+	}); err != nil {
 		tx.Rollback()
 		m.Error("事务提交失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
-	}
-	if eventID > 0 {
-		m.ctx.EventCommit(eventID)
 	}
 	// P2 D10.7：撤回提交后立即删除卡片修订历史（best-effort）—— 必须在 SendRevoke
 	// 通知**之前**，否则通知失败提前返回会漏删，DB 已标撤回却留下可查询内容历史。

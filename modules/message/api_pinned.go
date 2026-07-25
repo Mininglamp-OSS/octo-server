@@ -723,18 +723,14 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	})
 }
 
-func (m *Message) deletePinnedMessage(channelID string, channelType uint8, messageIds []string, loginUID string, tx *dbr.Tx) error {
-	fakeChannelID := channelID
-	if channelType == common.ChannelTypePerson.Uint8() {
-		fakeChannelID = common.GetFakeChannelIDWith(channelID, loginUID)
-	}
-	pinnedMessages, err := m.pinnedDB.queryWithMessageIds(fakeChannelID, channelType, messageIds)
+func (m *Message) deletePinnedMessage(storageChannelID string, channelType uint8, messageIds []string, tx *dbr.Tx) (bool, error) {
+	pinnedMessages, err := m.pinnedDB.queryWithMessageIds(storageChannelID, channelType, messageIds)
 	if err != nil {
 		m.Error("查询置顶消息错误", zap.Error(err))
-		return errors.New("查询置顶消息错误")
+		return false, errors.New("查询置顶消息错误")
 	}
 	if len(pinnedMessages) == 0 {
-		return nil
+		return false, nil
 	}
 	for _, pinnedMessage := range pinnedMessages {
 		pinnedMessage.IsDeleted = 1
@@ -743,22 +739,10 @@ func (m *Message) deletePinnedMessage(channelID string, channelType uint8, messa
 		if err != nil {
 			tx.Rollback()
 			m.Error("取消置顶消息错误", zap.Error(err))
-			return errors.New("取消置顶消息错误")
+			return false, errors.New("取消置顶消息错误")
 		}
 	}
-
-	err = m.ctx.SendCMD(config.MsgCMDReq{
-		NoPersist:   true,
-		ChannelID:   channelID,
-		ChannelType: channelType,
-		FromUID:     loginUID,
-		CMD:         common.CMDSyncPinnedMessage,
-	})
-
-	if err != nil {
-		m.Warn("发送cmd失败！", zap.Error(err))
-	}
-	return nil
+	return true, nil
 }
 
 type pinnedMessageResp struct {

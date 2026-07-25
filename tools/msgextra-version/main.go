@@ -101,7 +101,8 @@ func runActivate(store *msgextraseq.Store, floor int64, yes bool) {
 
 func printPreflight(res msgextraseq.PreflightResult) {
 	fmt.Printf("current: mode=%s epoch=%d cutover_floor=%d\n", modeName(res.CurrentMode), res.CurrentEpoch, res.CurrentFloor)
-	fmt.Printf("evidence: max(message_extra.version)=%d max(legacy seq boundary)=%d\n", res.MaxMessageExtraVersion, res.MaxLegacySeqBoundary)
+	fmt.Printf("evidence: max(message_extra.version)=%d max(legacy seq boundary)=%d max(Redis cursor)=%d\n", res.MaxMessageExtraVersion, res.MaxLegacySeqBoundary, res.MaxRedisCursor)
+	fmt.Printf("redis scan: keys=%d fields=%d (identifiers omitted)\n", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
 	fmt.Printf("recommended cutover_floor=%d\n", res.RecommendedFloor)
 }
 

@@ -196,9 +196,9 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
+	defer tx.RollbackUnlessCommitted()
 	defer func() {
 		if err := recover(); err != nil {
-			tx.RollbackUnlessCommitted()
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -254,19 +254,6 @@ func (m *Manager) delete(c *wkhttp.Context) {
 			}
 		}
 	}
-	if isSendSyncPinnedMsgCMD {
-		err = m.ctx.SendCMD(config.MsgCMDReq{
-			NoPersist:   true,
-			ChannelID:   req.ChannelID,
-			ChannelType: req.ChannelType,
-			FromUID:     loginUID,
-			CMD:         common.CMDSyncPinnedMessage,
-		})
-
-		if err != nil {
-			m.Warn("发送cmd失败！", zap.Error(err))
-		}
-	}
 	var eventID int64 = 0
 	if m.ctx.GetConfig().ZincSearch.SearchOn {
 		eventID, err = m.ctx.EventBegin(&wkevent.Data{
@@ -284,14 +271,26 @@ func (m *Manager) delete(c *wkhttp.Context) {
 			return
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitThenRun(tx, func() {
+		if eventID > 0 {
+			m.ctx.EventCommit(eventID)
+		}
+		if isSendSyncPinnedMsgCMD {
+			if sendErr := m.ctx.SendCMD(config.MsgCMDReq{
+				NoPersist:   true,
+				ChannelID:   req.ChannelID,
+				ChannelType: req.ChannelType,
+				FromUID:     loginUID,
+				CMD:         common.CMDSyncPinnedMessage,
+			}); sendErr != nil {
+				m.Warn("发送cmd失败！", zap.Error(sendErr))
+			}
+		}
+	}); err != nil {
 		tx.Rollback()
 		m.Error("提交事务失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
-	}
-	if eventID > 0 {
-		m.ctx.EventCommit(eventID)
 	}
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		err = m.ctx.SendCMD(config.MsgCMDReq{

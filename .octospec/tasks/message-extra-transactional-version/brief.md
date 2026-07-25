@@ -382,11 +382,13 @@ Deployment is two-phase:
    and therefore continues through the one centralized legacy adapter. Confirm
    image digests/versions, readiness, migrations, and focused tests on every
    replica.
-2. **Cut over** — drain message-extra write traffic, wait for in-flight requests,
-   and confirm no pre-task binary remains. Run the final preflight, then use the
-   operator tool to take an exclusive lock on the state row, assert its expected
-   mode/epoch, and atomically set `cutover_floor=<verified floor>`, increment
-   `epoch`, and set `mode=transactional`. The activation transition runs with a
+2. **Cut over** — drain message-extra write traffic **and the
+   `/message/extra/sync` requests that can advance Redis cursors**, wait for
+   in-flight requests, and confirm no pre-task binary remains. Run the final
+   preflight, then use the operator tool to take an exclusive lock on the state
+   row, assert its expected mode/epoch, and atomically set
+   `cutover_floor=<verified floor>`, increment `epoch`, and set
+   `mode=transactional`. The activation transition runs with a
    short `innodb_lock_wait_timeout` on its own session: if it is issued before
    the write drain completes, the exclusive state-row lock fails fast and reports
    the in-flight writers instead of stalling live message-extra writes. Because
@@ -407,9 +409,10 @@ by the operator tool's compare-and-set during a transition. The transactional
 JavaScript clients can continue to represent JSON integer cursors exactly.
 
 An operator first runs the preflight before draining to estimate the floor and
-validate scan cost. After write traffic and in-flight requests are drained, the
-operator reruns it authoritatively; no message-extra writer may resume between
-that final scan and transactional activation. The tool uses Redis
+validate scan cost. After write traffic, `/message/extra/sync`, and their
+in-flight requests are drained, the operator reruns it authoritatively; no
+message-extra writer or Redis cursor updater may resume between that final scan
+and transactional activation. The tool uses Redis
 `SCAN`/`HSCAN` (never `KEYS`) and bounded DB queries to find the observed
 maximum across:
 
