@@ -112,21 +112,34 @@ func TestPreflightRecommendsMaxOfEvidence(t *testing.T) {
 	}
 }
 
-func TestPreflightAndActivateIncludeRedisCursorEvidence(t *testing.T) {
+func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *testing.T) {
 	ctx := setup(t, msgextraseq.ModeLegacy, 0)
 	s := msgextraseq.New(ctx)
 
-	// The sync endpoint accepts a client-provided extra_version and persists it
-	// in this Redis hash. It can therefore exceed both persisted message_extra
-	// rows and the legacy GenSeq block boundary; activation must include it.
+	if _, err := ctx.DB().UpdateBySql(
+		"INSERT INTO `message_extra` (`message_id`,`channel_id`,`channel_type`,`version`) VALUES (?,?,?,?)",
+		"cursor-evidence-message", "cursor-evidence-channel", uint8(2), int64(1000),
+	).Exec(); err != nil {
+		t.Fatalf("seed message_extra: %v", err)
+	}
+
+	// A legitimate cursor is at or below the globally issued DB/legacy ceiling.
+	// A historical poisoned cursor above that ceiling cannot have been returned
+	// by the server and must not force activation to an impossible floor.
 	const (
-		key    = "messageExtraVersion:msgextraseq-preflight-test"
-		field  = "channel-test-2"
-		cursor = msgextraseq.MaxCutoverFloor
+		key          = "messageExtraVersion:msgextraseq-preflight-test"
+		validField   = "valid-channel-2"
+		poisonField  = "poison-channel-2"
+		validCursor  = int64(900)
+		poisonCursor = msgextraseq.MaxCutoverFloor
 	)
 	redis := ctx.GetRedisConn()
-	if err := redis.Hset(key, field, fmt.Sprintf("%d", cursor)); err != nil {
-		t.Fatalf("seed Redis cursor: %v", err)
+	if err := redis.Hmset(
+		key,
+		validField, fmt.Sprintf("%d", validCursor),
+		poisonField, fmt.Sprintf("%d", poisonCursor),
+	); err != nil {
+		t.Fatalf("seed Redis cursors: %v", err)
 	}
 	t.Cleanup(func() { _ = redis.Del(key) })
 
@@ -134,25 +147,29 @@ func TestPreflightAndActivateIncludeRedisCursorEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
-	if res.MaxRedisCursor < cursor {
-		t.Fatalf("MaxRedisCursor=%d want at least %d", res.MaxRedisCursor, cursor)
+	if res.MaxRedisCursor < validCursor || res.MaxRedisCursor > 1000 {
+		t.Fatalf("MaxRedisCursor=%d want valid evidence within [%d,1000]", res.MaxRedisCursor, validCursor)
 	}
-	if res.RedisCursorKeyCount < 1 || res.RedisCursorFieldCount < 1 {
-		t.Fatalf("Redis scan counts=(keys=%d fields=%d), want at least one each", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
+	if res.InvalidRedisCursorFieldCount < 1 {
+		t.Fatalf("InvalidRedisCursorFieldCount=%d want at least 1", res.InvalidRedisCursorFieldCount)
 	}
-	if res.RecommendedFloor < cursor {
-		t.Fatalf("RecommendedFloor=%d want at least Redis cursor %d", res.RecommendedFloor, cursor)
+	if res.RedisCursorKeyCount < 1 || res.RedisCursorFieldCount < 2 {
+		t.Fatalf("Redis scan counts=(keys=%d fields=%d), want at least one key/two fields", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
+	}
+	if res.RecommendedFloor != 1000 {
+		t.Fatalf("RecommendedFloor=%d want authoritative issued max 1000", res.RecommendedFloor)
 	}
 
-	if _, err := s.Activate(cursor - 1); !errors.Is(err, msgextraseq.ErrFloorTooLow) {
-		t.Fatalf("Activate below Redis cursor error=%v want ErrFloorTooLow", err)
+	flipped, err := s.Activate(res.RecommendedFloor)
+	if err != nil || !flipped {
+		t.Fatalf("Activate with poisoned Redis cursor=(%v,%v), want (true,nil)", flipped, err)
 	}
 	state, err := s.Preflight()
 	if err != nil {
-		t.Fatalf("Preflight after refused activation: %v", err)
+		t.Fatalf("Preflight after activation: %v", err)
 	}
-	if state.CurrentMode != msgextraseq.ModeLegacy {
-		t.Fatalf("state changed despite Redis floor rejection: %+v", state)
+	if state.CurrentMode != msgextraseq.ModeTransactional {
+		t.Fatalf("unexpected state after activation: %+v", state)
 	}
 }
 
