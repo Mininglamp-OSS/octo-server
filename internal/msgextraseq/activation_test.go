@@ -112,6 +112,50 @@ func TestPreflightRecommendsMaxOfEvidence(t *testing.T) {
 	}
 }
 
+func TestPreflightAndActivateIncludeRedisCursorEvidence(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	s := msgextraseq.New(ctx)
+
+	// The sync endpoint accepts a client-provided extra_version and persists it
+	// in this Redis hash. It can therefore exceed both persisted message_extra
+	// rows and the legacy GenSeq block boundary; activation must include it.
+	const (
+		key    = "messageExtraVersion:msgextraseq-preflight-test"
+		field  = "channel-test-2"
+		cursor = msgextraseq.MaxCutoverFloor
+	)
+	redis := ctx.GetRedisConn()
+	if err := redis.Hset(key, field, fmt.Sprintf("%d", cursor)); err != nil {
+		t.Fatalf("seed Redis cursor: %v", err)
+	}
+	t.Cleanup(func() { _ = redis.Del(key) })
+
+	res, err := s.Preflight()
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if res.MaxRedisCursor < cursor {
+		t.Fatalf("MaxRedisCursor=%d want at least %d", res.MaxRedisCursor, cursor)
+	}
+	if res.RedisCursorKeyCount < 1 || res.RedisCursorFieldCount < 1 {
+		t.Fatalf("Redis scan counts=(keys=%d fields=%d), want at least one each", res.RedisCursorKeyCount, res.RedisCursorFieldCount)
+	}
+	if res.RecommendedFloor < cursor {
+		t.Fatalf("RecommendedFloor=%d want at least Redis cursor %d", res.RecommendedFloor, cursor)
+	}
+
+	if _, err := s.Activate(cursor - 1); !errors.Is(err, msgextraseq.ErrFloorTooLow) {
+		t.Fatalf("Activate below Redis cursor error=%v want ErrFloorTooLow", err)
+	}
+	state, err := s.Preflight()
+	if err != nil {
+		t.Fatalf("Preflight after refused activation: %v", err)
+	}
+	if state.CurrentMode != msgextraseq.ModeLegacy {
+		t.Fatalf("state changed despite Redis floor rejection: %+v", state)
+	}
+}
+
 func TestActivateFlipsAndIsIdempotent(t *testing.T) {
 	ctx := setup(t, msgextraseq.ModeLegacy, 0)
 	s := msgextraseq.New(ctx)
