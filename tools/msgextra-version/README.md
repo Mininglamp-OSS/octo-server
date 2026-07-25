@@ -83,6 +83,7 @@ Run these steps in order:
 3. Resume message-extra writes after the DB flip and verification succeed.
    Existing upgraded processes have no expected-mode assertion, but immediately
    use the transactional allocator because every transaction rereads the DB row.
+
 ## 5. Enable the durable expected-mode guard (only after §4 confirms transactional)
 
 Once `preflight` reports `mode=transactional` (§4), set
