@@ -10,6 +10,13 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
+func TestDocsCardMutateSeqKeyCompatibility(t *testing.T) {
+	const want = "messageExtra:docs-card-mutate"
+	if docsCardMutateSeqKey != want {
+		t.Fatalf("docsCardMutateSeqKey=%q want persisted compatibility key %q", docsCardMutateSeqKey, want)
+	}
+}
+
 // TestDocsAccessCardVariant is the capability-containment guard for the docs
 // card-mutate endpoint (PR review P0): the shared `notification` bot sends docs,
 // summary, and action-outcome cards, so the mutate endpoint must gate on the
