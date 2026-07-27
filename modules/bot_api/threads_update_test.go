@@ -139,7 +139,9 @@ func TestBotUpdateThread_ThreadNotFound(t *testing.T) {
 	path := "/v1/bot/groups/" + utGroupNo + "/threads/" + utShortID
 
 	w := doBotPut(t, handler, path, map[string]string{"name": "new-name"})
-	assert.Equal(t, http.StatusInternalServerError, w.Code, "non-existent thread must return 500, body=%s", w.Body.String())
+	// ResponseErrorL legacy wire pins every code to 400 (see the NotGroupMember case above);
+	// ErrBotAPIStoreFailed's canonical 500 appears in the envelope, not on the wire.
+	assert.Equal(t, http.StatusBadRequest, w.Code, "non-existent thread must be rejected, body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), utStoreFailedMsg)
 }
 
