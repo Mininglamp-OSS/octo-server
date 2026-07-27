@@ -39,6 +39,8 @@ type IService interface {
 	CreateThread(req *CreateThreadReq) (*ThreadResp, error)
 	// UpdateName 修改子区名称
 	UpdateName(groupNo, shortID, operatorUID, name string) error
+	// UpdateNameAsBot Bot API 专用：修改子区名称（Bot 权限已在 handler 层校验，此处不做成员/机器人权限检查）
+	UpdateNameAsBot(groupNo, shortID, name string) error
 	// GetThreads 分页获取群下的子区，同时返回总数。
 	// statuses 决定包含的 status 集合（active / archived / 二者）；nil 或空一律按 active。
 	GetThreads(groupNo string, statuses []int, pageIndex, pageSize int64) ([]*ThreadResp, int64, error)
@@ -542,6 +544,42 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 
 	// 子区改名后失效离线推送标题缓存（推送标题含子区名），否则手机推送会沿用旧子区名直到
 	// TTL 过期。best-effort：失败仅告警，TTL 兜底。
+	channelID := BuildChannelID(groupNo, shortID)
+	if err := pushcache.InvalidateThreadName(s.ctx.GetRedisConn(), channelID); err != nil {
+		s.Warn("失效子区名推送缓存失败", zap.String("channel_id", channelID), zap.Error(err))
+	}
+	return nil
+}
+
+// UpdateNameAsBot Bot API 专用：修改子区名称。
+// Bot 权限已在 handler 层通过 validateBotThreadAccess 保证（bot 是群活跃成员），
+// 此处不做成员/机器人权限检查，仅做 name 校验、子区存在性检查和缓存失效。
+func (s *Service) UpdateNameAsBot(groupNo, shortID, name string) error {
+	if name == "" || len([]rune(name)) > 100 {
+		return errors.New("name is required and must not exceed 100 characters")
+	}
+
+	thread, err := s.db.QueryByGroupNoAndShortID(groupNo, shortID)
+	if err != nil {
+		return fmt.Errorf("query thread: %w", err)
+	}
+	if thread == nil {
+		return errors.New("thread not found")
+	}
+	if thread.Status == ThreadStatusDeleted {
+		return errors.New("thread has been deleted")
+	}
+
+	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {
+		switch {
+		case errors.Is(err, ErrThreadNotFound):
+			return errors.New("thread not found")
+		case errors.Is(err, ErrThreadDeleted):
+			return errors.New("thread has been deleted")
+		}
+		return fmt.Errorf("update thread name: %w", err)
+	}
+
 	channelID := BuildChannelID(groupNo, shortID)
 	if err := pushcache.InvalidateThreadName(s.ctx.GetRedisConn(), channelID); err != nil {
 		s.Warn("失效子区名推送缓存失败", zap.String("channel_id", channelID), zap.Error(err))

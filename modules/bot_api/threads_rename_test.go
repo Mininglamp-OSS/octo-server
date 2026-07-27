@@ -111,11 +111,20 @@ func (f *fakeGroupServiceForRename) UpdateGroupAvatarCustom(req *group.UpdateGro
 }
 
 type fakeThreadServiceForRename struct {
-	updateNameErr error
+	updateNameAsBotErr error
+	calledGroupNo      string
+	calledShortID      string
+	calledName         string
 }
 
 func (f *fakeThreadServiceForRename) UpdateName(groupNo, shortID, operatorUID, name string) error {
-	return f.updateNameErr
+	return nil
+}
+func (f *fakeThreadServiceForRename) UpdateNameAsBot(groupNo, shortID, name string) error {
+	f.calledGroupNo = groupNo
+	f.calledShortID = shortID
+	f.calledName = name
+	return f.updateNameAsBotErr
 }
 func (f *fakeThreadServiceForRename) CreateThread(req *thread.CreateThreadReq) (*thread.ThreadResp, error) {
 	return nil, nil
@@ -222,6 +231,9 @@ func TestBotRenameThread_HappyPath(t *testing.T) {
 
 	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "new thread name"})
 	assert.Equal(t, http.StatusOK, w.Code, "happy path should return 200, body=%s", w.Body.String())
+	assert.Equal(t, trGroupNo, threadSvc.calledGroupNo)
+	assert.Equal(t, trShortID, threadSvc.calledShortID)
+	assert.Equal(t, "new thread name", threadSvc.calledName)
 }
 
 // Error path: empty/missing name → 400 (bind error)
@@ -257,10 +269,10 @@ func TestBotRenameThread_InvalidGroupNo(t *testing.T) {
 	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
-// Error path: service UpdateName returns error → 500 (ErrBotAPIStoreFailed)
+// Error path: service UpdateNameAsBot returns error → 500 (ErrBotAPIStoreFailed)
 func TestBotRenameThread_ServiceError(t *testing.T) {
 	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
-	threadSvc := &fakeThreadServiceForRename{updateNameErr: errors.New("db error")}
+	threadSvc := &fakeThreadServiceForRename{updateNameAsBotErr: errors.New("db error")}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
 	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "new name"})
