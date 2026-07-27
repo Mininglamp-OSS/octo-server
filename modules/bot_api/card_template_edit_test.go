@@ -243,6 +243,14 @@ func TestBotMessageEditRegistryTemplateFailsClosed(t *testing.T) {
 			},
 		},
 		{
+			name: "aggregate action overflow",
+			body: func(t *testing.T) map[string]any {
+				body := registryEditBody(t, "reasoning", testReasoningData(t, "reasoning"), 2, false)
+				body["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(4, 2, 2, 2, 2, 2)
+				return body
+			},
+		},
+		{
 			name: "cross version target",
 			body: func(t *testing.T) map[string]any {
 				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)

@@ -729,12 +729,12 @@ func installCardTmplRegistry() {
 	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
 	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
 	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
-	// roadmap E1:首张 JSON 模板卡 —— ai.reasoning-process 走 RegisterJSON,由基座
-	// 编译 .template.json,无手写 Go Build()。active/error 为 octo/v2(带 Submit,
-	// owner=ai),result 为 octo/v1(仅折叠)。按钮的 handler + RouteSpec + bot 流式
-	// 下发是下游任务,本卡先注册可渲染。
-	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRoot)
-	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersion)
+	// roadmap E1/E1c:保留冻结的 0.1.0 供历史消息按原契约编辑，同时注册有界的
+	// 0.2.0 successor 并设为新默认。Bot 新发/legacy edit 的授权集合由 bot_api
+	// catalog 独立收口；Registry 多版本只提供渲染能力，不隐式开放 Bot 权限。
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)

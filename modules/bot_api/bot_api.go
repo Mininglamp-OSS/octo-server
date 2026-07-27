@@ -223,7 +223,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 	var cardTemplates *botCardTemplateCatalog
 	if registry := cardtmpl.DefaultRegistry(); registry != nil {
 		var err error
-		cardTemplates, err = newBotCardTemplateCatalog(registry, defaultBotTemplateRefs())
+		cardTemplates, err = newBotCardTemplateCatalogWithPolicy(registry, defaultBotTemplatePolicy())
 		if err != nil {
 			panic(fmt.Errorf("install Bot card template catalog: %w", err))
 		}

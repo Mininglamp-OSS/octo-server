@@ -184,7 +184,7 @@ func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
 	}
 }
 
-func TestRegisterJSON_FallbackTextEnforcesAggregateLimit(t *testing.T) {
+func TestRegisterJSON_FallbackTextEnforcesInputConstraints(t *testing.T) {
 	reg := NewRegistry()
 	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
 	reg.Freeze()
@@ -193,9 +193,26 @@ func TestRegisterJSON_FallbackTextEnforcesAggregateLimit(t *testing.T) {
 		t.Fatalf("lookup: %v", err)
 	}
 
-	fields := json.RawMessage(`{"title":"bounded","expanded":true,"rows":[],"groups":[{"items":["a","b"]},{"items":["c"]}]}`)
-	if _, err := tmpl.FallbackText("shown", fields, "zh-CN"); !errors.Is(err, ErrFieldsInvalid) {
-		t.Fatalf("FallbackText aggregate overflow error = %v, want ErrFieldsInvalid", err)
+	tests := []struct {
+		name   string
+		fields json.RawMessage
+	}{
+		{name: "empty", fields: nil},
+		{name: "malformed JSON", fields: json.RawMessage(`{`)},
+		{name: "schema invalid", fields: json.RawMessage(`{"title":"missing expanded"}`)},
+		{
+			name: "aggregate overflow",
+			fields: json.RawMessage(
+				`{"title":"bounded","expanded":true,"rows":[],"groups":[{"items":["a","b"]},{"items":["c"]}]}`,
+			),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tmpl.FallbackText("shown", tt.fields, "zh-CN"); !errors.Is(err, ErrFieldsInvalid) {
+				t.Fatalf("FallbackText error = %v, want ErrFieldsInvalid", err)
+			}
+		})
 	}
 }
 

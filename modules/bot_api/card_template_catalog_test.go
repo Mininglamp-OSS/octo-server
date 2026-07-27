@@ -89,6 +89,55 @@ func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T)
 	}
 }
 
+func TestBotCardTemplatePolicyFailsClosed(t *testing.T) {
+	registry := testBotTemplateRegistry(t)
+	successor := botTemplateRef{
+		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+	}
+	missing := botTemplateRef{ID: "ai.missing", Version: "1.0.0"}
+	tests := []struct {
+		name   string
+		policy botTemplatePolicy
+	}{
+		{
+			name:   "empty advertised send",
+			policy: botTemplatePolicy{EditCompatible: []botTemplateRef{successor}},
+		},
+		{
+			name:   "empty edit compatible",
+			policy: botTemplatePolicy{AdvertisedSend: []botTemplateRef{successor}},
+		},
+		{
+			name: "duplicate edit compatible",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, successor},
+			},
+		},
+		{
+			name: "missing edit registry entry",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, missing},
+			},
+		},
+		{
+			name: "blank edit ref",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, {}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newBotCardTemplateCatalogWithPolicy(registry, tt.policy); err == nil {
+				t.Fatal("catalog accepted invalid policy")
+			}
+		})
+	}
+}
+
 func TestBotCardTemplateCatalogCapability(t *testing.T) {
 	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
 	if err != nil {
@@ -251,7 +300,7 @@ func TestBotCardTemplateCatalogInvalidAndInternalRenderClassification(t *testing
 
 	// Schema-valid markdown reaches cardmsg.Validate and is a post-build render
 	// failure, not a caller-schema error. It remains zero-write and maps to the
-	// generic internal facade until the bounded successor schema lands.
+	// generic internal facade.
 	malicious := base()
 	malicious["data"].(map[string]any)["progressText"] = "[tap](javascript:alert(1))"
 	_, err = catalog.RenderPayload(context.Background(), malicious, cardtmpl.BuildEnv{})
