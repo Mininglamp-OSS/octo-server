@@ -184,6 +184,21 @@ func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
 	}
 }
 
+func TestRegisterJSON_FallbackTextEnforcesAggregateLimit(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
+	reg.Freeze()
+	tmpl, err := reg.Lookup("test.jsoncard", "0.1.0")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+
+	fields := json.RawMessage(`{"title":"bounded","expanded":true,"rows":[],"groups":[{"items":["a","b"]},{"items":["c"]}]}`)
+	if _, err := tmpl.FallbackText("shown", fields, "zh-CN"); !errors.Is(err, ErrFieldsInvalid) {
+		t.Fatalf("FallbackText aggregate overflow error = %v, want ErrFieldsInvalid", err)
+	}
+}
+
 // TestRegisterJSON_MarkdownLinkInjection_RejectedByValidate proves decision D6's
 // security model: the engine binds data literally (no markdown escaping), and a
 // caller-injected dangerous markdown link in a text field is caught by the L0

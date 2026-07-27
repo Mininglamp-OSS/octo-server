@@ -148,7 +148,7 @@ func TestSendMessageRegistryTemplateRejectsInvalidWithoutDispatch(t *testing.T) 
 		{name: "raw and registry both present", mutate: func(payload map[string]any) { payload["card"] = map[string]any{} }},
 		{name: "render owned field", mutate: func(payload map[string]any) { payload["plain"] = "forged" }},
 		{name: "aggregate action overflow", mutate: func(payload map[string]any) {
-			payload["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(3, 2, 2, 2, 2, 2)
+			payload["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(4, 2, 2, 2, 2, 2)
 		}},
 	}
 	for _, tc := range tests {
