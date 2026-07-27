@@ -169,6 +169,30 @@ func (ba *BotAPI) botDeleteThread(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// botRenameThread handles PUT /v1/bot/groups/:group_no/threads/:short_id.
+func (ba *BotAPI) botRenameThread(c *wkhttp.Context) {
+	robotID, groupNo, shortID, ok := ba.validateBotThreadAccess(c)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name" binding:"required,max=100"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		respondBotAPIRequestInvalid(c, "name")
+		return
+	}
+
+	err := ba.threadService.UpdateName(groupNo, shortID, robotID, req.Name)
+	if err != nil {
+		ba.Error("修改子区名称失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+		return
+	}
+	c.ResponseOK()
+}
+
 // botListThreadMembers handles GET /v1/bot/groups/:group_no/threads/:short_id/members.
 func (ba *BotAPI) botListThreadMembers(c *wkhttp.Context) {
 	_, groupNo, shortID, ok := ba.validateBotThreadAccess(c)
