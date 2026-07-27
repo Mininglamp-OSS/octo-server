@@ -23,7 +23,7 @@ source: self
 
 1. 为所有非枚举自由字符串补 `maxLength`，为 `phases`、每个 phase 的 `actions`
    补 `maxItems`，并在进入 JSON 模板展开前强制“所有 phase 的 actions 合计不超过
-   12”这一聚合约束；
+   13”这一聚合约束；
 2. 在 Registry 中同时注册冻结的 `0.1.0` 和 successor，并把该模板的 Registry
    default 切到 successor；
 3. Bot capability 与新 send 只广告/接受 successor，同时保留对已存在
@@ -88,6 +88,12 @@ cap 依据来自本机 OpenClaw Octo consumer checkout
 - `errorMessage` 走同一 120+省略号清洗，上限为 121；
 - `reasoningId = sessionKey + ":" + runId` 当前没有 producer 本地 cap。
 
+冻结的 `0.1.0` 五态 fixture 还提供了一个必须优先满足的兼容证据：
+`completed` sample 的三个 phase 分别有 `3 + 7 + 3 = 13` 个 actions。successor 又要求
+samples/goldens 与 `0.1.0` 字节一致，因此 aggregate 不能设为 12，否则 successor 会在
+注册期 self-check 直接失败。successor 的平台兼容上限据此取 13；当前 producer 的
+`MAX_RENDERED_ACTIONS=12` 仍是更严格的 producer 侧上限，无需放宽。
+
 JSON Schema `maxLength` 按 Unicode 字符/rune 计数；JavaScript 当前按 UTF-16 code
 unit 截断。由于 code point 数不会大于 code unit 数，下表给
 `thought/tool/errorMessage` 预留追加省略号后的值，可兼容当前 producer。producer
@@ -105,8 +111,8 @@ unit 截断。由于 code point 数不会大于 code unit 数，下表给
 | `progressText` | 160 | 活动态单行进度文案产品上限建议 |
 | `phases` | 6 items | 当前 producer `MAX_RENDERED_PHASES` |
 | `phases[].thought` | 281 | 当前 producer 280 + `…` |
-| `phases[].actions` | 12 items/phase | 嵌套数组必须自身有界；另有全卡 aggregate 12 |
-| 所有 `phases[].actions` 合计 | 12 items | 当前 producer `MAX_RENDERED_ACTIONS`；draft-07 不能仅靠普通 `maxItems` 表达 |
+| `phases[].actions` | 12 items/phase | 嵌套数组必须自身有界；另有全卡 aggregate 13 |
+| 所有 `phases[].actions` 合计 | 13 items | 冻结 `completed` fixture 为 13；当前 producer 的 12 仍天然满足；draft-07 不能仅靠普通 `maxItems` 表达 |
 | `phases[].actions[].tool` | 81 | 当前 producer 80 + `…` |
 | `phases[].actions[].detail` | 192 | 当前最大 189（65 + 3 + 121），向上取整留 3 字符余量 |
 | `errorTitle` | 64 | 单行错误标题产品上限建议；当前 producer 为固定短文案 |
@@ -118,7 +124,7 @@ brief 的平台建议值，不伪装成既有产品契约。D2 未确认前不�
 ### 聚合 action 上限不能只写 schema `maxItems`
 
 draft-07 可以表达 `phases.maxItems=6` 和每个 `actions.maxItems=12`，但不能直接表达
-“所有 phase 的 actions 总数不超过 12”。只写两个 `maxItems` 会允许最多 72 个
+“所有 phase 的 actions 总数不超过 13”。只写两个 `maxItems` 会允许最多 72 个
 action；该输入虽有界，仍可能通过 schema 后撞上 `cardmsg.MaxNodes=200`，把调用方错误
 误归类成 render failure。
 
@@ -126,7 +132,7 @@ action；该输入虽有界，仍可能通过 schema 后撞上 `cardmsg.MaxNodes
 
 1. 先完成现有 JSON decode + draft-07 schema 校验；
 2. successor schema 以 namespaced 机读扩展声明聚合约束，建议形状如下；该扩展是
-   aggregate limit 的单一真源，不能只把 `12` 写在 Go 常量或 Markdown：
+   aggregate limit 的单一真源，不能只把 `13` 写在 Go 常量或 Markdown：
 
    ```json
    "x-octo-constraints": {
@@ -134,7 +140,7 @@ action；该输入虽有界，仍可能通过 schema 后撞上 `cardmsg.MaxNodes
        {
          "parentArray": "phases",
          "childArray": "actions",
-         "maxTotalItems": 12
+         "maxTotalItems": 13
        }
      ]
    }
@@ -177,7 +183,7 @@ Registry 注册，但不再广告，也不再接受新 Bot send。
   明确上限；聚合 action 约束由 schema namespaced extension 机读声明，在 JSON 模板
   展开前执行并映射为 `ErrFieldsInvalid`。
 - **JSON 模板资源预算（`cardtmpl`, `trust-boundary`）** — 合法最大 fixture（6 phases、
-  12 actions 合计、字符串均到 cap）必须仍低于 `cardmsg` 节点/深度/payload 上限；不能
+  13 actions 合计、字符串均到 cap）必须仍低于 `cardmsg` 节点/深度/payload 上限；不能
   用一个必然 render 失败的 schema 上限冒充可用契约。
 - **Registry 多版本（`cardtmpl`, `wire-contract`）** — `0.1.0` 与 successor 同时注册，
   默认版本切 successor；历史消息继续按 stored version 运行。
@@ -232,15 +238,16 @@ Registry 注册，但不再广告，也不再接受新 Bot send。
 - 11 个自由字符串均有上表确认后的 `maxLength`；enum 字符串继续由 enum 有界，
   `statusGlyph.maxLength=2` 不变；所有对象继续 `additionalProperties:false`。
 - successor schema 含确认后的 `x-octo-constraints.aggregateArrayLimits`；注册期从该扩展
-  读取 aggregate 12，malformed/unknown target fail closed。运行期不得另抄一个可能漂移
+  读取 aggregate 13，malformed/unknown target fail closed。运行期不得另抄一个可能漂移
   的 magic number。
 - 每个字段用 table-driven test 证明：恰好 cap 个 Unicode 字符通过，cap+1 返回
   `ErrFieldsInvalid`；至少包含 ASCII、CJK 和 astral emoji 用例，避免误判 rune/byte/
   UTF-16 语义。
 - `phases=6` 通过、`7` 拒绝；单 phase `actions=12` 通过、`13` 拒绝。
-- actions 合计 12 在单 phase 与跨 6 phases 两种分布都通过；合计 13 即使每个 phase
-  均未超过 12，也必须在 Build/Expand 前以 `ErrFieldsInvalid` 拒绝。
-- 合法最坏 fixture（6 phases、12 actions 合计、所有自由字符串恰到 cap）在 active、
+- actions 合计 12 在单 phase 与跨 6 phases 两种分布都通过；合计 13 在跨 6 phases
+  分布时也通过；合计 14 即使每个 phase 均未超过 12，也必须在 Build/Expand 前以
+  `ErrFieldsInvalid` 拒绝。
+- 合法最坏 fixture（6 phases、13 actions 合计、所有自由字符串恰到 cap）在 active、
   result、error view 均能完成 Registry render 并通过 `cardmsg.Validate`，不超过 node、
   depth 或 payload budget。
 - 聚合 validator 的失败计入既有 `fields_invalid`，不计 `render_error`，且日志/响应不
@@ -307,7 +314,8 @@ Registry 注册，但不再广告，也不再接受新 Bot send。
   `0.1.0` 永久冻结并继续注册。
 - **D2 — exact caps：**确认“建议 cap 表”的全部数值，尤其是目前没有上游产品约束的
   `reasoningId=512` 和短文案上限。未确认前不实现。
-- **D3 — aggregate actions：**总 action 上限为 12；由 schema 的
+- **D3 — aggregate actions：**总 action 上限为 13（兼容冻结 `completed` fixture；当前
+  producer 仍最多输出 12）；由 schema 的
   `x-octo-constraints.aggregateArrayLimits` 作为单一真源，Registry/JSON-template 在
   pre-Build 执行，拒绝 handler 特判、Go/JSON 双写和 post-render budget 兜底方案。
 - **D4 — catalog policy：**capability + new send 只允许 successor；edit-compatible 集合

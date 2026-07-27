@@ -175,7 +175,8 @@ func TestSuccessorArrayAndAggregateBounds(t *testing.T) {
 		{name: "twelve actions in one phase", actionCounts: []int{12}},
 		{name: "thirteen actions in one phase", actionCounts: []int{13}, wantErr: true},
 		{name: "twelve actions across six phases", actionCounts: []int{2, 2, 2, 2, 2, 2}},
-		{name: "aggregate thirteen with each phase under per-phase max", actionCounts: []int{3, 2, 2, 2, 2, 2}, wantErr: true},
+		{name: "aggregate thirteen with each phase under per-phase max", actionCounts: []int{3, 2, 2, 2, 2, 2}},
+		{name: "aggregate fourteen with each phase under per-phase max", actionCounts: []int{4, 2, 2, 2, 2, 2}, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -274,7 +275,7 @@ func phasesWithActionCounts(counts ...int) []any {
 }
 
 func worstCasePhases() []any {
-	phases := phasesWithActionCounts(2, 2, 2, 2, 2, 2)
+	phases := phasesWithActionCounts(3, 2, 2, 2, 2, 2)
 	for _, rawPhase := range phases {
 		phase := rawPhase.(map[string]any)
 		phase["thought"] = strings.Repeat("思", 281)
