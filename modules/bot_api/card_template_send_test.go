@@ -72,6 +72,35 @@ func TestSendMessageRegistryTemplateRendersAndDispatches(t *testing.T) {
 	}
 }
 
+func TestSendMessageRegistryTemplateRejectsLegacyVersionWithoutDispatch(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	gin.SetMode(gin.TestMode)
+
+	dispatch := &dispatchCapture{}
+	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-template-send-legacy"),
+		cardTemplates:    catalog,
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		dispatchOverride: dispatch.hook,
+	}
+	body := registrySendBodyVersion(t, aireasoningprocess.TemplateVersionV1,
+		"reasoning", testReasoningDataVersion(t, aireasoningprocess.HandoffRootV1, "reasoning"))
+
+	recorder := invokeTemplateSend(t, ba, body, "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	dispatch.mu.Lock()
+	defer dispatch.mu.Unlock()
+	if dispatch.captured != nil {
+		t.Fatal("legacy template ref dispatched a new message")
+	}
+}
+
 func TestRawContentEditCannotForgeRegistryProvenance(t *testing.T) {
 	raw := imCardEnvelope("raw", 1)
 	raw["template_ref"] = map[string]any{
@@ -118,6 +147,9 @@ func TestSendMessageRegistryTemplateRejectsInvalidWithoutDispatch(t *testing.T) 
 		}},
 		{name: "raw and registry both present", mutate: func(payload map[string]any) { payload["card"] = map[string]any{} }},
 		{name: "render owned field", mutate: func(payload map[string]any) { payload["plain"] = "forged" }},
+		{name: "aggregate action overflow", mutate: func(payload map[string]any) {
+			payload["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(3, 2, 2, 2, 2, 2)
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,6 +202,10 @@ func TestSendMessageRegistryTemplateKeepsOBOCardExclusion(t *testing.T) {
 }
 
 func registrySendBody(t *testing.T, state string, data json.RawMessage) map[string]any {
+	return registrySendBodyVersion(t, aireasoningprocess.TemplateVersion, state, data)
+}
+
+func registrySendBodyVersion(t *testing.T, version, state string, data json.RawMessage) map[string]any {
 	t.Helper()
 	return map[string]any{
 		"channel_id":   "user_creator",
@@ -177,12 +213,29 @@ func registrySendBody(t *testing.T, state string, data json.RawMessage) map[stri
 		"payload": map[string]any{
 			"type": cardmsg.InteractiveCard.Int(),
 			"template_ref": map[string]any{
-				"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersion,
+				"id": string(aireasoningprocess.TemplateID), "version": version,
 			},
 			"state": state,
 			"data":  rawJSONToMap(t, data),
 		},
 	}
+}
+
+func reasoningPhasesForBotTest(actionCounts ...int) []any {
+	phases := make([]any, 0, len(actionCounts))
+	for _, actionCount := range actionCounts {
+		actions := make([]any, 0, actionCount)
+		for i := 0; i < actionCount; i++ {
+			actions = append(actions, map[string]any{
+				"tool":        "tool",
+				"detail":      "detail",
+				"statusGlyph": "●",
+				"statusTone":  "Good",
+			})
+		}
+		phases = append(phases, map[string]any{"thought": "thought", "actions": actions})
+	}
+	return phases
 }
 
 func invokeTemplateSend(t *testing.T, ba *BotAPI, body map[string]any, onBehalfOf string) *httptest.ResponseRecorder {

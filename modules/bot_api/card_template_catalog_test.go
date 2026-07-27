@@ -15,8 +15,9 @@ import (
 func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	r := cardtmpl.NewRegistry()
-	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRoot)
-	r.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersion)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+	r.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
@@ -24,14 +25,68 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 }
 
 func testReasoningData(t *testing.T, state string) json.RawMessage {
+	return testReasoningDataVersion(t, aireasoningprocess.HandoffRootV2, state)
+}
+
+func testReasoningDataVersion(t *testing.T, root, state string) json.RawMessage {
 	t.Helper()
 	b, err := aireasoningprocess.Assets.ReadFile(
-		aireasoningprocess.HandoffRoot + "/samples/" + state + ".json",
+		root + "/samples/" + state + ".json",
 	)
 	if err != nil {
 		t.Fatalf("read reasoning sample %q: %v", state, err)
 	}
 	return json.RawMessage(b)
+}
+
+func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
+	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatalf("newBotCardTemplateCatalogWithPolicy: %v", err)
+	}
+
+	capability := catalog.Capability()
+	if len(capability.Templates) != 1 || capability.Templates[0].Version != aireasoningprocess.TemplateVersionV2 {
+		t.Fatalf("advertised templates = %+v, want successor only", capability.Templates)
+	}
+
+	legacyRef := map[string]any{
+		"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV1,
+	}
+	legacyPayload := map[string]any{
+		"type":         17,
+		"template_ref": legacyRef,
+		"state":        "reasoning",
+		"data": rawJSONToMap(t, testReasoningDataVersion(t,
+			aireasoningprocess.HandoffRootV1, "reasoning")),
+	}
+	if _, err := catalog.RenderPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{}); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("legacy send error = %v, want request invalid", err)
+	}
+	if ref, err := catalog.requireEditableRef(legacyRef); err != nil || ref.Version != aireasoningprocess.TemplateVersionV1 {
+		t.Fatalf("legacy edit ref = %+v, error = %v", ref, err)
+	}
+	rendered, err := catalog.RenderEditPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{})
+	if err != nil {
+		t.Fatalf("RenderEditPayload(legacy): %v", err)
+	}
+	if got := rendered["template_ref"].(map[string]any)["version"]; got != aireasoningprocess.TemplateVersionV1 {
+		t.Fatalf("legacy edit rendered version = %v", got)
+	}
+}
+
+func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T) {
+	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
+		AdvertisedSend: []botTemplateRef{{
+			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+		}},
+		EditCompatible: []botTemplateRef{{
+			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
+		}},
+	})
+	if err == nil {
+		t.Fatal("catalog accepted an advertised send ref that cannot be edited")
+	}
 }
 
 func TestBotCardTemplateCatalogCapability(t *testing.T) {

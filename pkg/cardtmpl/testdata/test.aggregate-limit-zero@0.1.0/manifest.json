@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 2,
+  "id": "test.aggregate-limit-zero",
+  "name": "Invalid aggregate limit fixture",
+  "version": "0.1.0",
+  "adaptiveCardVersion": "1.5",
+  "defaultLocale": "zh-CN",
+  "dataSchema": "contract/data.schema.json",
+  "views": {
+    "main": {
+      "wireProfile": "octo/v1",
+      "states": ["shown"],
+      "template": "templates/main.template.json",
+      "samples": ["samples/basic.json"]
+    }
+  }
+}

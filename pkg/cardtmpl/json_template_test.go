@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -98,6 +99,68 @@ func TestRegisterJSON_C1_RejectsBadFields(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), ErrFieldsInvalid.Error()) {
 		t.Fatalf("want ErrFieldsInvalid, got %v", err)
+	}
+}
+
+func TestRegisterJSONAggregateArrayLimit(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
+	reg.SetDefault("test.jsoncard", "0.1.0")
+	reg.Freeze()
+
+	tests := []struct {
+		name    string
+		groups  string
+		wantErr bool
+	}{
+		{name: "exact aggregate limit", groups: `[{"items":["a"]},{"items":["b"]}]`},
+		{name: "aggregate overflow", groups: `[{"items":["a","b"]},{"items":["c"]}]`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := json.RawMessage(`{"title":"bounded","expanded":true,"rows":[],"groups":` + tt.groups + `}`)
+			_, err := reg.Render(context.Background(), "test.jsoncard", "0.1.0", "shown", fields,
+				BuildEnv{Lang: "zh-CN", SpaceID: "s1"})
+			if tt.wantErr {
+				if !errors.Is(err, ErrFieldsInvalid) {
+					t.Fatalf("Render error = %v, want ErrFieldsInvalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Render exact aggregate limit: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegisterJSONAggregateArrayLimitMisconfigurationFailsRegistration(t *testing.T) {
+	tests := []struct {
+		name string
+		root string
+		want string
+	}{
+		{
+			name: "non-positive limit",
+			root: "testdata/test.aggregate-limit-zero@0.1.0",
+			want: "maxTotalItems",
+		},
+		{
+			name: "unknown parent array",
+			root: "testdata/test.aggregate-target-missing@0.1.0",
+			want: "parentArray",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := tryRegisterJSON(tt.root)
+			if rec == nil {
+				t.Fatal("expected register-time panic for invalid aggregate constraint")
+			}
+			if got := toStr(rec); !strings.Contains(got, tt.want) {
+				t.Fatalf("panic = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
