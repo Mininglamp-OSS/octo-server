@@ -229,6 +229,7 @@ func validJSONArtifactBundle() Bundle {
 			"version":"1.0.0",
 			"contractVersion":"1.0.0",
 			"protocol":"octo-card@1.0",
+			"adaptiveCardVersion":"1.5",
 			"owner":"ai",
 			"dataSchema":"contract/data.schema.json",
 			"views":{"main":{"wireProfile":"octo/v1","states":["shown"],"template":"templates/main.template.json","samples":["samples/shown.json"]}}

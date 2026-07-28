@@ -46,6 +46,7 @@ var (
 	artifactDocumentKeyRE  = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
 	artifactTemplateIDRE   = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[.-][a-z0-9][a-z0-9-]*)+$`)
 	artifactVersionRE      = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
+	artifactActionTypeRE   = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 
 	artifactCompileQueue = make(chan struct{}, 16)
 	artifactCompileSlots = make(chan struct{}, max(2, runtime.GOMAXPROCS(0)/2))
@@ -425,6 +426,11 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err != nil {
 		return nil, err
 	}
+	if limits.RequireOwner {
+		if err := validateRuntimeActionContract(mf, interactions); err != nil {
+			return nil, artifactValidationError("manifest", "manifest", err)
+		}
+	}
 	parsedSamples, sampleAssignments, err := compileBundleSamples(mf, schema, bundle.Samples, budget, limits)
 	if err != nil {
 		return nil, err
@@ -605,6 +611,18 @@ func validateRuntimeManifest(mf manifestFile, limits CompileLimits) error {
 	if limits.RequireProtocol && strings.TrimSpace(mf.Protocol) == "" {
 		return errors.New("protocol is required")
 	}
+	if mf.DataSchema != "" && mf.DataSchema != "contract/data.schema.json" {
+		return fmt.Errorf("dataSchema %q must reference contract/data.schema.json", mf.DataSchema)
+	}
+	if limits.RequireProtocol && mf.DataSchema == "" {
+		return errors.New("dataSchema must reference contract/data.schema.json")
+	}
+	if mf.AdaptiveCardVersion != "" && mf.AdaptiveCardVersion != cardmsg.CardVersion {
+		return fmt.Errorf("adaptiveCardVersion %q must be %q", mf.AdaptiveCardVersion, cardmsg.CardVersion)
+	}
+	if limits.RequireProtocol && mf.AdaptiveCardVersion == "" {
+		return errors.New("adaptiveCardVersion is required")
+	}
 	if len(mf.Views) > limits.MaxViews {
 		return fmt.Errorf("views exceed %d", limits.MaxViews)
 	}
@@ -625,6 +643,25 @@ func validateRuntimeManifest(mf manifestFile, limits CompileLimits) error {
 				return fmt.Errorf("state %q is not a safe token", state)
 			}
 		}
+	}
+	return nil
+}
+
+func validateRuntimeActionContract(mf manifestFile, interactions map[ViewKey]InteractionReport) error {
+	hasSubmit := false
+	for _, report := range interactions {
+		for _, action := range report.Actions {
+			if action.Type == "Action.Submit" {
+				hasSubmit = true
+				break
+			}
+		}
+	}
+	if !hasSubmit {
+		return nil
+	}
+	if !artifactActionTypeRE.MatchString(mf.ActionType) {
+		return errors.New("actionType is required and must be canonical for an interactive template")
 	}
 	return nil
 }
@@ -712,14 +749,19 @@ func compileBundleSamples(
 			if err != nil {
 				return nil, nil, artifactValidationError("manifest", "samples", err)
 			}
+			expectedPath := path.Join("samples", key+".json")
+			if samplePath != expectedPath {
+				return nil, nil, artifactValidationError("manifest", "samples."+key,
+					fmt.Errorf("sample path %q, want %q", samplePath, expectedPath))
+			}
 			if _, duplicate := expected[key]; duplicate {
 				return nil, nil, artifactValidationError("manifest", "samples."+key, errors.New("sample is referenced more than once"))
 			}
 			expected[key] = struct{}{}
 			keys = append(keys, key)
 		}
-		if limits.RequireStateSamples && len(keys) < len(spec.States) {
-			return nil, nil, artifactValidationError("manifest", "samples", fmt.Errorf("view %q has %d states but %d samples", view, len(spec.States), len(keys)))
+		if limits.RequireStateSamples && len(keys) != len(spec.States) {
+			return nil, nil, artifactValidationError("manifest", "samples", fmt.Errorf("view %q has %d states but %d samples; each sample must have one state assignment", view, len(spec.States), len(keys)))
 		}
 		used := make(map[string]struct{}, len(spec.States))
 		for index, state := range spec.States {
@@ -1346,7 +1388,3 @@ func utf16Less(left, right string) bool {
 	}
 	return len(a) < len(b)
 }
-
-// Keep the package-level reference explicit: compile-time validation and final
-// render both terminate at cardmsg validation, never at a runtime uploader.
-var _ = cardmsg.CardVersion

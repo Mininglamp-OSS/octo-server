@@ -216,7 +216,7 @@ func validControlRequestJSON(t *testing.T, publish bool) []byte {
 		Catalog: cardtmpl.CatalogDescriptor{Engine: cardtmpl.JSONTemplateEngineV1, Visibility: cardtmpl.CatalogVisibilityPrivate},
 		Manifest: json.RawMessage(`{
 			"schemaVersion":2,"id":"test.runtime-card","name":"Runtime card","version":"1.0.0",
-			"contractVersion":"1.0.0","protocol":"octo-card@1.0","owner":"ai",
+			"contractVersion":"1.0.0","protocol":"octo-card@1.0","adaptiveCardVersion":"1.5","owner":"ai",
 			"dataSchema":"contract/data.schema.json",
 			"views":{"main":{"wireProfile":"octo/v1","states":["shown"],"template":"templates/main.template.json","samples":["samples/shown.json"]}}
 		}`),
