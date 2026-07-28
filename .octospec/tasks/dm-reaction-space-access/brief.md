@@ -158,10 +158,19 @@ that is inert.
   it — worth its own task.)
 - `fakeChannelID` computation (`common.GetFakeChannelIDWith`) and the
   `reaction_users` storage layout.
-- The pre-existing `-tags integration` import cycle in `modules/message`
-  (`api_card_action_test.go` → `app_bot` → `bot_api` → `messages_search` →
-  `message`), which currently prevents this package's integration tests from
-  compiling at all. Reproduced on clean `origin/main`; needs its own task.
+- The two reasons `modules/message` integration tests run in no CI lane, both
+  pre-existing and each needing its own task: (a) `ci.yml:236-253` deliberately
+  runs the **default** build with no `-tags integration`, because
+  `modules/conversation_ext/*` expects a separate pre-baked `conv_ext_test`
+  database that the job never provisions — the comment flags flipping the flag
+  as a maintainer decision; (b) even with the flag flipped this package's
+  integration build does not compile — `api_card_action_test.go` → `app_bot` →
+  `bot_api` → `messages_search` → `message` is an import cycle in test
+  (reproduced on clean `origin/main`).
+- The unreachable pre-built-fake-channel branch in `syncReaction`
+  (`api.go:1799`, `strings.Contains(req.ChannelID, "@")`): no such string can
+  pass the DM gate before or after this change, and the write path never
+  supported that shape. Cleanup belongs in its own task.
 - Any octo-web change (none required).
 
 ## Acceptance

@@ -4,6 +4,29 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-28 (dm-reaction-space-access)
+
+- **Access control** — DM (`channel_type=1`) authorization on `POST /v1/reactions`
+  and `POST /v1/reaction/sync` moved off friend-only to the canonical peer
+  predicate (self → friend → own bot → same active Space), extracted into one
+  helper shared by the write and sync paths. In the Space deployment the
+  `friend` table is near-empty, so the previous gate 403'd every colleague DM
+  reaction on both sides. No new error code, no wire change. See
+  [journal](journal/shared/dm-reaction-space-access.md) and
+  [brief](tasks/dm-reaction-space-access/brief.md).
+- **Decisions** — Space comes only from the middleware-verified `space_id` (no
+  default-Space fallback); bot classification must precede the Space branch
+  (bots have no `space_member` row); legacy `s{spaceID}_{uid}` DM channel ids
+  deliberately not handled after confirming the system no longer produces them.
+- **Learning (pending)** — a "is friend?" peer gate is not deployment-portable;
+  ordering bot-before-Space is load-bearing. See
+  [learning](learnings/pending/relationship-gate-deployment-mode.md).
+- **Known gaps recorded, not fixed** — the same friend-only gate remains on
+  `message/api_pinned.go`, `message/api_channel_files.go`, `channel/api.go`;
+  the bidirectional blacklist is still not consulted on the DM reaction path;
+  `modules/message` integration tests run in neither CI lane (deliberate
+  no-`-tags integration` policy plus a test-only import cycle).
+
 ## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
 
 - **Protocol** — Added the explicit Bot Registry template catalog to
