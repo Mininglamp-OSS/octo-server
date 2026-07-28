@@ -704,3 +704,76 @@ func TestReactionRejectsDMWithoutFriendshipOrSpace(t *testing.T) {
 	assert.GreaterOrEqual(t, w.Code, 400, "陌生人 DM reaction sync 必须被拒绝: %d %s", w.Code, w.Body.String())
 	assert.Less(t, w.Code, 500, "拒绝不能是 5xx: %d %s", w.Code, w.Body.String())
 }
+
+// ---------- P1 复现（review #671）：syncReaction 的 @ 形态 channel_id ----------
+
+// TestSyncReactionRejectsCompositeChannelIDLeak 复现 review 指出的越权读：
+//
+// syncReaction 对 Person 允许把「已拼好的物理频道 id」(a@b) 原样当 channel_id 用
+// （api.go 的 strings.Contains(req.ChannelID,"@") 分支）——这是唯一一条 storage
+// channel id 不由 loginUID 推导的路径。原来的好友门挡得住它（friend 行的写入方
+// 都先校验 user 存在，IsFriend("a@b") 永假），但同 Space 门查的是 space_member，
+// 而 space_member.uid 是攻击者可写的任意字符串（addMembers 原样插入、不校验 user
+// 是否存在；建 Space 默认对所有登录用户开放）。于是：
+//
+//	攻击者建一个 Space S（自己是 owner，且 S 是其最早加入的 Space → 默认 Space）
+//	→ 把受害者 DM 的物理频道串 "V@W" 作为「成员」加进 S
+//	→ POST /v1/reaction/sync {space_id:S, channel_id:"V@W", channel_type:1}
+//	→ 同 Space 门放行 → 拉到 V 与 W 私聊里的 reaction 元数据
+//	  （message_id / uid / name / emoji / seq / created_at）。
+//
+// 受害者消息不带 space_id 标签时，personSpaceAllows 的兼容分支（无标签 +
+// spaceID==默认 Space）也拦不住，因为 IsSystemBot("V@W") 对复合串恒为 false。
+func TestSyncReactionRejectsCompositeChannelIDLeak(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	resetReactionUIDRateLimit(t, ctx)
+
+	// 受害者双方与他们的 DM 物理频道，攻击者(testutil.UID)与他们毫无关系。
+	const victimA, victimB = "victim_a_uid", "victim_b_uid"
+	victimChannel := common.GetFakeChannelIDWith(victimA, victimB)
+
+	// 受害者 DM 里一条无 space 标签的文本消息 + 一条 reaction。
+	const mid int64 = 940001
+	payload, err := json.Marshal(map[string]interface{}{"type": 1, "content": "secret dm"})
+	require.NoError(t, err)
+	require.NoError(t, NewDB(ctx).insertMessage(&messageModel{
+		MessageID: mid, MessageSeq: uint32(mid), ClientMsgNo: "cli-victim-940001",
+		FromUID: victimA, ChannelID: victimChannel,
+		ChannelType: common.ChannelTypePerson.Uint8(), Payload: payload,
+	}))
+	seq, err := ctx.GenSeq("messageReactionSeq:" + victimChannel)
+	require.NoError(t, err)
+	_, err = New(ctx).messageReactionDB.toggleReaction(&reactionModel{
+		ChannelID: victimChannel, ChannelType: common.ChannelTypePerson.Uint8(),
+		UID: victimA, Name: "victim-a", MessageID: strconv.FormatInt(mid, 10),
+		Emoji: "🤫", Seq: seq,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, countReactionRows(t, ctx, mid), "sanity: 受害者 reaction 已落库")
+
+	// 攻击者自建 Space（其唯一 Space，故也是默认 Space），并把受害者的物理频道串
+	// 当成「成员 uid」塞进 space_member —— addMembers 就是这么原样插入的。
+	attackerSpace := "spcATK" + strconv.FormatInt(nextShortID.Add(1), 10)
+	seedReactionSpaceMember(t, ctx, attackerSpace, testutil.UID, "2020-01-01 00:00:00")
+	seedReactionSpaceMemberRow(t, ctx, attackerSpace, victimChannel, "2020-01-02 00:00:00")
+
+	w := postReactionWithSpace(t, s, "/v1/reaction/sync", attackerSpace, map[string]interface{}{
+		"channel_id":   victimChannel,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"seq":          0,
+	})
+
+	// 必须拒（4xx，且不能是 5xx 伪通过）；即便将来改成 200 空集，也绝不能出现
+	// 受害者的 reaction 行。
+	assert.Less(t, w.Code, 500, "拒绝不能是 5xx: %d %s", w.Code, w.Body.String())
+	if w.Code == http.StatusOK {
+		var got []reactionResp
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got), w.Body.String())
+		for _, r := range got {
+			assert.NotEqual(t, strconv.FormatInt(mid, 10), r.MessageID,
+				"越权读：攻击者不得拿到受害者 DM 的 reaction 元数据")
+		}
+	}
+	assert.GreaterOrEqual(t, w.Code, 400, "复合 channel_id 必须在入口被拒: %d %s", w.Code, w.Body.String())
+}

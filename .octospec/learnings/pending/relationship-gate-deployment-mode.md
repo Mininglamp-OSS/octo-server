@@ -44,10 +44,21 @@ Use the same four steps as `modules/user/api_pinned.go::validateChannelAccess`
 4. `AreSpaceMembers(spaceID, caller, peer)` — the Space signal, using only the
    `space_id` the Space middleware already verified.
 
-**Ordering is load-bearing, not stylistic: step 3 must precede step 4.** A bot
-has no `space_member` row, so a Space-first gate returns false for every bot and
-denies a user access to their *own* bot's DM. This is the one ordering mistake
-that reads as correct and fails in production.
+**Ordering is load-bearing, not stylistic: step 3 must precede step 4.** The two
+bot flavours each supply an independent reason, and the security-relevant one is
+easy to get backwards:
+
+- robot-module bots **do** carry a `space_member` row — that row is the mechanism
+  that makes a bot visible in a Space (`modules/robot/api.go:1497` lists them via
+  `space_member INNER JOIN user … u.robot = 1`). A Space-first gate would let
+  *someone else's* bot through on Space membership alone, silently dropping the
+  friendship requirement that `modules/robot/event.go` enforces.
+- App Bots **do not** (`modules/app_bot/app_bot.go createBot` deliberately skips
+  it), so a Space-first gate would deny a user their *own* bot's DM.
+
+Do not simplify this to "bots have no `space_member` row" — that half is only
+true for App Bots, and a future author who discovers the other half may drop the
+ordering constraint as obsolete.
 
 Two more details that keep the gate honest:
 

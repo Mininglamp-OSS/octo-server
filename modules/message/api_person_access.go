@@ -20,8 +20,11 @@ type personAccessDeps interface {
 //  2. 双方是好友 —— 个人空间（非 Space）部署下 friend 表是权威口径；
 //  3. 对方是 bot —— 本人创建的 bot 放行；他人创建的 bot 必须先加好友，与 robot
 //     模块的转发规则一致（modules/robot/event.go："用户与Bot非好友关系，拒绝转发消息"）。
-//     bot 判定必须在 Space 判定之前收口：bot 没有 space_member 行，落到第 4 步恒为 false，
-//     会把「自己的 bot」误拒；
+//     bot 判定必须在 Space 判定之前收口，两类 bot 各有一个理由，缺一不可：
+//     robot 模块的 bot **有** space_member 行（modules/robot/api.go:1497 的 Space bot
+//     列表正是靠它 INNER JOIN 出来的），Space 优先会让「他人的 bot」凭同 Space 直接
+//     放行，绕过上面那条好友要求；App Bot 则**没有** space_member 行
+//     （modules/app_bot/app_bot.go createBot 明确不写），Space 优先会把「自己的 bot」误拒；
 //  4. 对方是真人且与调用者同属 spaceID 这个在籍 Space —— 企业通讯录部署下 friend 表
 //     近乎为空（只有系统 bot），私聊可达性由 Space 在籍关系决定，与写消息路径
 //     （api.go sendMsg 的 Person/Space 分支 CheckBothMembers）同语义。

@@ -1736,6 +1736,8 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "")
 		return
 	}
+	// 与写路径对齐：channel_id 先 TrimSpace，避免 padding 造成的口径差异。
+	req.ChannelID = strings.TrimSpace(req.ChannelID)
 	// 同步鉴权必须与写路径（addOrCancelReaction）对齐：Group/子区用 ExistMemberActive
 	// 排除黑名单，子区解析父群并校验未删除，未知类型一律拒绝。否则读/同步路径会成为
 	// 绕过写路径加固的短板（任意登录用户凭 channel_id 拉取 reaction 元数据）。
@@ -1751,12 +1753,28 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		// 复合（已拼好的物理频道）channel_id 一律在入口拒绝。DM 的 channel_id 契约是
+		// 「对端 UID」，"a@b" 这种形态历史上被下面的 fakeChannelID 分支原样透传，是唯一
+		// 一条 storage channel id 不由 loginUID 推导的路径。
+		//
+		// 旧的好友门恰好挡住了它（friend 行的写入方都先校验 user 存在，IsFriend("a@b")
+		// 永假），但同 Space 门查的是 space_member —— 那张表的 uid 是任意字符串：
+		// space/api.go addMembers 原样插入 req.UIDs、不校验 user 是否存在，而建 Space
+		// 默认对所有登录用户开放。于是攻击者可自建 Space、把受害者 DM 的物理频道串当
+		// 「成员」插进去，再用它 sync，越权读到别人私聊的 reaction 元数据（PR#671 review）。
+		// 拒绝这一形态后，下面的 fakeChannelID 必然由 loginUID 推导，
+		// 「物理频道 id 必然含调用者」成为结构性不变量，而不是对 uid 字符集的假设。
+		if strings.Contains(req.ChannelID, "@") {
+			respondMessageRequestInvalid(c, "channel_id")
+			return
+		}
 		// 与写路径（addOrCancelReaction）共用同一个 DM 门：好友 ∪ 本人创建的 bot
 		// ∪ 同 Space 同事。读/同步路径必须与写路径同口径，否则任一侧成为短板。
-		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, spacepkg.GetSpaceID(c))
+		reqSpaceID := spacepkg.GetSpaceID(c)
+		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, reqSpaceID)
 		if err != nil {
 			m.Error("校验私聊频道权限失败（reaction sync）", zap.Error(err),
-				zap.String("peer", req.ChannelID), zap.String("space_id", spacepkg.GetSpaceID(c)))
+				zap.String("peer", req.ChannelID), zap.String("space_id", reqSpaceID))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
@@ -1798,9 +1816,9 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		if !strings.Contains(req.ChannelID, "@") {
-			fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
-		}
+		// 一律由 loginUID 推导：复合形态已在鉴权前拒掉，这里不再有「原样透传」分支，
+		// 调用者不可能把物理频道 id 指向一条自己不在其中的 DM。
+		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
 	}
 	limit := req.Limit
 	if limit <= 0 {

@@ -51,10 +51,21 @@ reachability signal and said so in comments
   middleware-verified `space_id`; a request without `space_id` / `X-Space-ID`
   degrades to friend-only (unchanged behavior, and one less query on that path).
   Keeps the predicate byte-identical to `validateChannelAccess`.
-- **Bot classification runs before the Space branch.** A bot has no
-  `space_member` row, so a Space-first ordering would deny a user reacting in
-  their own bot's DM. Disabled bots (`user.robot=1`, `robot.status!=1`) surface
-  `creatorUID=""` and therefore stay friendship-gated.
+- **Bot classification runs before the Space branch**, for two independent
+  reasons — the security-relevant one is the reverse of the intuitive one:
+  robot-module bots **do** have a `space_member` row (that row is what makes a
+  bot visible in a Space, `modules/robot/api.go:1497`), so a Space-first gate
+  would admit *someone else's* bot on Space membership alone and drop the
+  friendship requirement `modules/robot/event.go` enforces; App Bots **do not**
+  have one (`app_bot.go createBot` skips it), so a Space-first gate would deny a
+  user their *own* bot's DM. Disabled bots (`user.robot=1`, `robot.status!=1`)
+  surface `creatorUID=""` and therefore stay friendship-gated.
+
+- **`syncReaction` rejects composite (`a@b`) `channel_id` at the boundary, and
+  the storage channel id is now always derived from `loginUID`.** This is the
+  security fix that came out of review (see below); it turns "the physical
+  channel id always contains the caller" from an assumption about uid charsets
+  into a structural invariant.
 - **Prefixed DM channel ids (`s{spaceID}_{uid}`) deliberately not handled.**
   Investigated: the current system does not produce them for DMs — this repo's
   own record states conversation-level `SpaceID` for a DM is intentionally
@@ -77,6 +88,38 @@ reachability signal and said so in comments
 - 13-case unit decision table + 3 query-count assertions, all DB-free.
 - `go build ./...`, `go vet`, `golangci-lint` (0 issues),
   `make i18n-extract-check`, `make i18n-lint` green.
+
+## The defect review caught (and the general lesson)
+
+The first version of this change made a genuinely exploitable path reachable.
+`syncReaction` historically accepted an already-composed physical channel id
+(`strings.Contains(req.ChannelID, "@")`) and passed it to storage verbatim — the
+only path where the storage channel id was not derived from `loginUID`. The
+friend gate had kept that branch dead by accident: every `friend` insert path
+resolves the peer through a `user` existence check first, so `IsFriend(u, "a@b")`
+could never be true. The Space gate has no such discipline —
+`AreSpaceMembers` → `CheckBothMembers` joins `space` and `space_member` but
+**never `user`**, and `space_member.uid` is an attacker-writable arbitrary
+string (`space/api.go addMembers` inserts `req.UIDs` verbatim with no existence
+or charset check, and creating a Space is open to any authenticated user by
+default). So: create a Space, add the string `"<victimA>@<victimB>"` as a
+"member", then `POST /v1/reaction/sync` with that as `channel_id` — the gate
+passes and the victim DM's reaction metadata (message_id, reactor uid + display
+name, emoji, seq, timestamps) comes back.
+
+Confirmed empirically, not just by reading: `TestSyncReactionRejectsCompositeChannelIDLeak`
+returned `200` with the victim's row before the fix and is denied after.
+
+**Lesson:** when you swap the predicate behind a gate, the question is not "what
+values does the *identity* table allow" but "what does each *newly consulted*
+table allow, and who can write it". A predicate whose backing table has no
+referential discipline can revive input shapes that a stricter predicate had
+been keeping dead.
+
+Two follow-ups this exposes, both worth their own task and both wider than this
+endpoint: `space/api.go addMembers` should validate that each uid resolves to a
+real user, and `CheckBothMembers` should join `user` so "is a Space member"
+implies "is a user" for every caller at once.
 
 ## Gotcha worth remembering (test infrastructure)
 
