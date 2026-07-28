@@ -22,6 +22,8 @@ const (
 	controlBodyMaxBytes = 2 << 20
 	compileTimeout      = 10 * time.Second
 	reconcileTimeout    = 30 * time.Second
+	reconcileAttempts   = 3
+	reconcileRetryDelay = 250 * time.Millisecond
 )
 
 type catalogStore interface {
@@ -69,7 +71,34 @@ func reconcileStaticInventory(ctx context.Context, store catalogStore, registry 
 	if store == nil || registry == nil {
 		return fmt.Errorf("%w: store and Registry are required", ErrCatalogIntegrity)
 	}
-	return store.ReconcileStatic(ctx, registry.List())
+	inventory := registry.List()
+	var lastErr error
+	for attempt := 1; attempt <= reconcileAttempts; attempt++ {
+		lastErr = store.ReconcileStatic(ctx, inventory)
+		if lastErr == nil {
+			return nil
+		}
+		if errors.Is(lastErr, ErrCatalogIntegrity) || errors.Is(lastErr, ErrVersionClaimConflict) {
+			return lastErr
+		}
+		if attempt == reconcileAttempts {
+			break
+		}
+		delay := reconcileRetryDelay * time.Duration(1<<(attempt-1))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("reconcile static inventory failed after %d attempts: %w", reconcileAttempts, lastErr)
 }
 
 // Route installs a global super-admin control plane. It intentionally does not

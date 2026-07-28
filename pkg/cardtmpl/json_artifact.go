@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net/url"
 	"path"
 	"regexp"
 	"runtime"
@@ -762,6 +763,7 @@ func compileBundleSamples(
 	assignments := make([]sampleAssignment, 0)
 	for view, spec := range mf.Views {
 		keys := make([]string, 0, len(spec.Samples))
+		viewSamples := make(map[string]struct{}, len(spec.Samples))
 		for _, samplePath := range spec.Samples {
 			key, err := logicalDocumentKey(samplePath, ".json")
 			if err != nil {
@@ -776,6 +778,7 @@ func compileBundleSamples(
 				return nil, nil, artifactValidationError("manifest", "samples."+key, errors.New("sample is referenced more than once"))
 			}
 			expected[key] = struct{}{}
+			viewSamples[key] = struct{}{}
 			keys = append(keys, key)
 		}
 		if limits.RequireStateSamples && len(keys) != len(spec.States) {
@@ -784,7 +787,7 @@ func compileBundleSamples(
 		used := make(map[string]struct{}, len(spec.States))
 		for index, state := range spec.States {
 			key := string(state)
-			if _, exists := expected[key]; !exists {
+			if _, exists := viewSamples[key]; !exists {
 				if index >= len(keys) {
 					continue
 				}
@@ -1122,14 +1125,23 @@ func validateBoundedInputSchema(root map[string]any) error {
 	if additional, ok := root["additionalProperties"].(bool); !ok || additional {
 		return errors.New("root schema additionalProperties must be false")
 	}
-	return validateBoundedSchemaNode(root, "$")
+	validator := boundedSchemaValidator{
+		root:      root,
+		resolving: make(map[string]struct{}),
+	}
+	return validator.validateNode(root, "$")
 }
 
-func validateBoundedSchemaNode(value any, location string) error {
+type boundedSchemaValidator struct {
+	root      map[string]any
+	resolving map[string]struct{}
+}
+
+func (v *boundedSchemaValidator) validateNode(value any, location string) error {
 	switch node := value.(type) {
 	case []any:
 		for index, child := range node {
-			if err := validateBoundedSchemaNode(child, fmt.Sprintf("%s[%d]", location, index)); err != nil {
+			if err := v.validateNode(child, fmt.Sprintf("%s[%d]", location, index)); err != nil {
 				return err
 			}
 		}
@@ -1162,7 +1174,7 @@ func validateBoundedSchemaNode(value any, location string) error {
 		}
 		if properties, ok := node["properties"].(map[string]any); ok {
 			for name, property := range properties {
-				if err := validateBoundedPropertySchema(property, location+".properties."+name); err != nil {
+				if err := v.validatePropertySchema(property, location+".properties."+name); err != nil {
 					return err
 				}
 			}
@@ -1171,7 +1183,7 @@ func validateBoundedSchemaNode(value any, location string) error {
 			if key == "examples" || key == "default" || key == "enum" || key == "const" {
 				continue
 			}
-			if err := validateBoundedSchemaNode(child, location+"."+key); err != nil {
+			if err := v.validateNode(child, location+"."+key); err != nil {
 				return err
 			}
 		}
@@ -1208,7 +1220,7 @@ func schemaTypeNames(raw any, location string) ([]string, error) {
 	}
 }
 
-func validateBoundedPropertySchema(value any, location string) error {
+func (v *boundedSchemaValidator) validatePropertySchema(value any, location string) error {
 	if allowed, ok := value.(bool); ok {
 		if !allowed {
 			return nil
@@ -1220,7 +1232,7 @@ func validateBoundedPropertySchema(value any, location string) error {
 		return fmt.Errorf("%s must be a schema object", location)
 	}
 	if _, hasType := node["type"]; hasType {
-		return nil
+		return v.validateNode(node, location)
 	}
 	if _, hasConst := node["const"]; hasConst {
 		return nil
@@ -1229,12 +1241,21 @@ func validateBoundedPropertySchema(value any, location string) error {
 		return nil
 	}
 	if ref, hasRef := node["$ref"].(string); hasRef && strings.HasPrefix(ref, "#") {
-		return nil
+		if _, cycle := v.resolving[ref]; cycle {
+			return fmt.Errorf("%s local $ref %q is cyclic", location, ref)
+		}
+		target, err := resolveLocalSchemaRef(v.root, ref)
+		if err != nil {
+			return fmt.Errorf("%s local $ref %q: %w", location, ref, err)
+		}
+		v.resolving[ref] = struct{}{}
+		defer delete(v.resolving, ref)
+		return v.validatePropertySchema(target, location+".$ref")
 	}
 	for _, keyword := range []string{"anyOf", "oneOf"} {
 		if alternatives, exists := node[keyword].([]any); exists && len(alternatives) > 0 {
 			for index, alternative := range alternatives {
-				if err := validateBoundedPropertySchema(alternative, fmt.Sprintf("%s.%s[%d]", location, keyword, index)); err != nil {
+				if err := v.validatePropertySchema(alternative, fmt.Sprintf("%s.%s[%d]", location, keyword, index)); err != nil {
 					return err
 				}
 			}
@@ -1243,12 +1264,72 @@ func validateBoundedPropertySchema(value any, location string) error {
 	}
 	if constraints, exists := node["allOf"].([]any); exists && len(constraints) > 0 {
 		for index, constraint := range constraints {
-			if validateBoundedPropertySchema(constraint, fmt.Sprintf("%s.allOf[%d]", location, index)) == nil {
+			if v.validatePropertySchema(constraint, fmt.Sprintf("%s.allOf[%d]", location, index)) == nil {
 				return nil
 			}
 		}
 	}
 	return fmt.Errorf("%s must declare a bounded type, enum, const, or local $ref", location)
+}
+
+func resolveLocalSchemaRef(root map[string]any, ref string) (any, error) {
+	if ref == "#" {
+		return root, nil
+	}
+	if !strings.HasPrefix(ref, "#/") {
+		return nil, errors.New("only local JSON Pointer references are supported")
+	}
+	pointer, err := url.PathUnescape(strings.TrimPrefix(ref, "#"))
+	if err != nil {
+		return nil, fmt.Errorf("decode JSON Pointer: %w", err)
+	}
+	var current any = root
+	for _, encodedToken := range strings.Split(strings.TrimPrefix(pointer, "/"), "/") {
+		token, err := decodeJSONPointerToken(encodedToken)
+		if err != nil {
+			return nil, err
+		}
+		switch node := current.(type) {
+		case map[string]any:
+			child, exists := node[token]
+			if !exists {
+				return nil, fmt.Errorf("JSON Pointer token %q does not exist", token)
+			}
+			current = child
+		case []any:
+			index, err := strconv.Atoi(token)
+			if err != nil || index < 0 || index >= len(node) {
+				return nil, fmt.Errorf("JSON Pointer array index %q is invalid", token)
+			}
+			current = node[index]
+		default:
+			return nil, fmt.Errorf("JSON Pointer token %q traverses a non-container", token)
+		}
+	}
+	return current, nil
+}
+
+func decodeJSONPointerToken(token string) (string, error) {
+	var decoded strings.Builder
+	for index := 0; index < len(token); index++ {
+		if token[index] != '~' {
+			decoded.WriteByte(token[index])
+			continue
+		}
+		if index+1 >= len(token) {
+			return "", errors.New("invalid trailing '~' in JSON Pointer token")
+		}
+		index++
+		switch token[index] {
+		case '0':
+			decoded.WriteByte('~')
+		case '1':
+			decoded.WriteByte('/')
+		default:
+			return "", fmt.Errorf("invalid JSON Pointer escape ~%c", token[index])
+		}
+	}
+	return decoded.String(), nil
 }
 
 func rejectUnknownKeys(object map[string]any, allowed ...string) error {

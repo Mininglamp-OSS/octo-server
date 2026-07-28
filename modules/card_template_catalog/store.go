@@ -34,6 +34,9 @@ var (
 const (
 	insertClaimSQL = `INSERT INTO card_template_version_claim
         (template_id, version, source) VALUES (?, ?, ?)`
+	upsertStaticClaimSQL = `INSERT INTO card_template_version_claim
+        (template_id, version, source) VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE source = source`
 	selectPublishedClaimSQL = `SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL
         FROM card_template_version_claim c
         LEFT JOIN card_template_artifact a
@@ -179,18 +182,14 @@ func (s *store) ReconcileStatic(ctx context.Context, inventory []cardtmpl.Templa
 			return fmt.Errorf("%w: invalid or duplicate static identity %q", ErrCatalogIntegrity, identity)
 		}
 		previous = identity
-		_, err := tx.ExecContext(ctx, insertClaimSQL, string(meta.ID), meta.Version, claimSourceStatic)
-		if err == nil {
-			continue
-		}
-		if !isDuplicateKey(err) {
+		if _, err := tx.ExecContext(ctx, upsertStaticClaimSQL, string(meta.ID), meta.Version, claimSourceStatic); err != nil {
 			return fmt.Errorf("card template catalog: claim static %s: %w", identity, err)
 		}
 		var source string
 		var hasArtifact bool
 		if err := tx.QueryRowContext(ctx, selectStaticClaimSQL, string(meta.ID), meta.Version).
 			Scan(&source, &hasArtifact); err != nil {
-			return fmt.Errorf("%w: load static claim %s: %v", ErrCatalogIntegrity, identity, err)
+			return fmt.Errorf("card template catalog: load static claim %s: %w", identity, err)
 		}
 		if source != claimSourceStatic {
 			return fmt.Errorf("%w: static %s is claimed by %s", ErrVersionClaimConflict, identity, source)
