@@ -448,7 +448,11 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 		return nil, err
 	}
 
-	meta, err := assembleTemplateMeta(mf, schema, interactions, bundle.Manifest)
+	canonicalManifest, err := marshalCanonicalJSON(manifestDoc)
+	if err != nil {
+		return nil, artifactValidationError("canonical", "manifest", err)
+	}
+	meta, err := assembleTemplateMeta(mf, schema, interactions, canonicalManifest)
 	if err != nil {
 		return nil, artifactValidationError("manifest", "manifest", err)
 	}
