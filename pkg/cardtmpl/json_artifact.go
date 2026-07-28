@@ -1147,6 +1147,13 @@ func (v *boundedSchemaValidator) validateNode(value any, location string) error 
 		}
 		return nil
 	case map[string]any:
+		if rawRef, exists := node["$ref"]; exists {
+			ref, ok := rawRef.(string)
+			if !ok {
+				return fmt.Errorf("%s $ref must be a string", location)
+			}
+			return v.validateReference(ref, location)
+		}
 		kinds, err := schemaTypeNames(node["type"], location)
 		if err != nil {
 			return err
@@ -1241,16 +1248,7 @@ func (v *boundedSchemaValidator) validatePropertySchema(value any, location stri
 		return nil
 	}
 	if ref, hasRef := node["$ref"].(string); hasRef && strings.HasPrefix(ref, "#") {
-		if _, cycle := v.resolving[ref]; cycle {
-			return fmt.Errorf("%s local $ref %q is cyclic", location, ref)
-		}
-		target, err := resolveLocalSchemaRef(v.root, ref)
-		if err != nil {
-			return fmt.Errorf("%s local $ref %q: %w", location, ref, err)
-		}
-		v.resolving[ref] = struct{}{}
-		defer delete(v.resolving, ref)
-		return v.validatePropertySchema(target, location+".$ref")
+		return v.validateReference(ref, location)
 	}
 	for _, keyword := range []string{"anyOf", "oneOf"} {
 		if alternatives, exists := node[keyword].([]any); exists && len(alternatives) > 0 {
@@ -1270,6 +1268,22 @@ func (v *boundedSchemaValidator) validatePropertySchema(value any, location stri
 		}
 	}
 	return fmt.Errorf("%s must declare a bounded type, enum, const, or local $ref", location)
+}
+
+func (v *boundedSchemaValidator) validateReference(ref, location string) error {
+	if !strings.HasPrefix(ref, "#") {
+		return fmt.Errorf("%s external $ref %q is forbidden", location, ref)
+	}
+	if _, cycle := v.resolving[ref]; cycle {
+		return fmt.Errorf("%s local $ref %q is cyclic", location, ref)
+	}
+	target, err := resolveLocalSchemaRef(v.root, ref)
+	if err != nil {
+		return fmt.Errorf("%s local $ref %q: %w", location, ref, err)
+	}
+	v.resolving[ref] = struct{}{}
+	defer delete(v.resolving, ref)
+	return v.validatePropertySchema(target, location+".$ref")
 }
 
 func resolveLocalSchemaRef(root map[string]any, ref string) (any, error) {
