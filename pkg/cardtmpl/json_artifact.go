@@ -216,6 +216,32 @@ func DecodeBundleJSON(raw []byte) (Bundle, error) {
 	return bundle, nil
 }
 
+// DecodeStrictJSON applies the artifact request JSON rules to an enclosing
+// control-plane object before decoding it into out. Unknown struct fields are
+// rejected in addition to duplicate keys and trailing tokens.
+func DecodeStrictJSON(raw []byte, out any) error {
+	if out == nil {
+		return artifactValidationError("shape", "request", errors.New("decode target is nil"))
+	}
+	if len(raw) > maxArtifactBundleBytes {
+		return artifactValidationError("limit", "request", fmt.Errorf("body exceeds %d bytes", maxArtifactBundleBytes))
+	}
+	parsed, err := decodeStrictJSON(raw, jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes})
+	if err != nil {
+		return artifactValidationError("json", "request", err)
+	}
+	canonical, err := marshalCanonicalJSON(parsed)
+	if err != nil {
+		return artifactValidationError("canonical", "request", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		return artifactValidationError("shape", "request", err)
+	}
+	return nil
+}
+
 // LoadJSONBundle converts a reviewed embedded handoff into the same structured
 // bundle accepted by the runtime compiler. The schema is read exactly once.
 func LoadJSONBundle(assets fs.FS, root string, catalog CatalogDescriptor) (Bundle, error) {
