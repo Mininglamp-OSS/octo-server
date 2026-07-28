@@ -173,6 +173,7 @@ func TestPublishMapsConflictAndInternalErrors(t *testing.T) {
 		{name: "immutable conflict", err: ErrImmutableVersionConflict, wantCode: "err.server.card_template_catalog.conflict", wantStatus: http.StatusConflict, wantDB: "conflict"},
 		{name: "version claim conflict", err: ErrVersionClaimConflict, wantCode: "err.server.card_template_catalog.conflict", wantStatus: http.StatusConflict, wantDB: "conflict"},
 		{name: "catalog integrity failure", err: ErrCatalogIntegrity, wantCode: "err.shared.internal", wantStatus: http.StatusInternalServerError, wantDB: "integrity_error"},
+		{name: "store timeout", err: context.DeadlineExceeded, wantCode: "err.server.card_template_catalog.unavailable", wantStatus: http.StatusServiceUnavailable, wantDB: "timeout"},
 		{name: "store unavailable", err: errors.New("db unavailable"), wantCode: "err.server.card_template_catalog.unavailable", wantStatus: http.StatusServiceUnavailable, wantDB: "error"},
 	}
 	for _, tt := range tests {
