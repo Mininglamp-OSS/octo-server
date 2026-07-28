@@ -347,6 +347,97 @@ func TestValidateBoundedInputSchemaRejectsUnboundedShapes(t *testing.T) {
 	}
 }
 
+func TestValidateBoundedInputSchemaAcceptsFinitePropertyShapes(t *testing.T) {
+	tests := []struct {
+		name     string
+		property any
+		decorate func(map[string]any)
+	}{
+		{
+			name:     "bounded nullable string",
+			property: map[string]any{"type": []any{"string", "null"}, "maxLength": json.Number("8")},
+		},
+		{name: "enum", property: map[string]any{"enum": []any{"ready", "done"}}},
+		{name: "const", property: map[string]any{"const": "ready"}},
+		{
+			name:     "local ref",
+			property: map[string]any{"$ref": "#/$defs/title"},
+			decorate: func(schema map[string]any) {
+				schema["$defs"] = map[string]any{
+					"title": map[string]any{"type": "string", "maxLength": json.Number("8")},
+				}
+			},
+		},
+		{
+			name: "any of bounded alternatives",
+			property: map[string]any{"anyOf": []any{
+				map[string]any{"type": "string", "maxLength": json.Number("8")},
+				map[string]any{"type": "integer"},
+			}},
+		},
+		{
+			name: "one of bounded alternatives",
+			property: map[string]any{"oneOf": []any{
+				map[string]any{"type": "string", "maxLength": json.Number("8")},
+				map[string]any{"type": "boolean"},
+			}},
+		},
+		{
+			name: "all of includes bounded shape",
+			property: map[string]any{"allOf": []any{
+				map[string]any{"type": "string", "maxLength": json.Number("8")},
+				map[string]any{"minLength": json.Number("1")},
+			}},
+		},
+		{name: "false schema", property: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema := boundedRootWithProperty(tt.property)
+			if tt.decorate != nil {
+				tt.decorate(schema)
+			}
+			if err := validateBoundedInputSchema(schema); err != nil {
+				t.Fatalf("validateBoundedInputSchema: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBoundedInputSchemaRejectsAmbiguousPropertyShapes(t *testing.T) {
+	tests := []struct {
+		name     string
+		property any
+	}{
+		{name: "true schema", property: true},
+		{name: "non-schema value", property: "string"},
+		{name: "empty type list", property: map[string]any{"type": []any{}}},
+		{name: "non-string type", property: map[string]any{"type": json.Number("7")}},
+		{name: "non-string type list item", property: map[string]any{"type": []any{"string", json.Number("7")}}},
+		{name: "duplicate type", property: map[string]any{"type": []any{"string", "string"}, "maxLength": json.Number("8")}},
+		{name: "unbounded any of", property: map[string]any{"anyOf": []any{map[string]any{"type": "integer"}, map[string]any{}}}},
+		{name: "unbounded one of", property: map[string]any{"oneOf": []any{map[string]any{"type": "boolean"}, map[string]any{}}}},
+		{name: "unbounded all of", property: map[string]any{"allOf": []any{map[string]any{"minLength": json.Number("1")}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateBoundedInputSchema(boundedRootWithProperty(tt.property)); err == nil {
+				t.Fatal("ambiguous property schema unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func boundedRootWithProperty(property any) map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"value": property,
+		},
+	}
+}
+
 func replaceManifestField(t *testing.T, raw json.RawMessage, field string, value any) json.RawMessage {
 	t.Helper()
 	return mutateManifest(t, raw, func(manifest map[string]any) {
