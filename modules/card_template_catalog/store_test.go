@@ -2,6 +2,7 @@ package card_template_catalog
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"regexp"
 	"strings"
@@ -64,6 +65,72 @@ func TestStorePublishSameHashIsIdempotentAndAudited(t *testing.T) {
 	}
 	if result.Created || !result.Idempotent || result.Blocked {
 		t.Fatalf("result = %+v, want unblocked idempotent", result)
+	}
+	assertMockExpectations(t, mock)
+}
+
+func TestStorePublishClassifiesExistingClaimLookupErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		lookupErr     error
+		wantIntegrity bool
+	}{
+		{name: "claim disappeared", lookupErr: sql.ErrNoRows, wantIntegrity: true},
+		{name: "request deadline", lookupErr: context.DeadlineExceeded, wantIntegrity: false},
+		{name: "connection dropped", lookupErr: errors.New("connection dropped"), wantIntegrity: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, mock, closeDB := newMockStore(t)
+			defer closeDB()
+
+			mock.ExpectBegin()
+			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+				WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL")).
+				WillReturnError(tt.lookupErr)
+			mock.ExpectRollback()
+
+			_, err := store.Publish(context.Background(), publishRequestFixture())
+			if got := errors.Is(err, ErrCatalogIntegrity); got != tt.wantIntegrity {
+				t.Fatalf("errors.Is(ErrCatalogIntegrity) = %v, want %v; err=%v", got, tt.wantIntegrity, err)
+			}
+			if !tt.wantIntegrity && !errors.Is(err, tt.lookupErr) {
+				t.Fatalf("lookup cause was not preserved: %v", err)
+			}
+			assertMockExpectations(t, mock)
+		})
+	}
+}
+
+func TestStorePublishRetriesTransientDuplicateResolutionFailure(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+	deadlock := &mysql.MySQLError{Number: 1213, Message: "deadlock"}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL")).
+		WillReturnError(deadlock)
+	mock.ExpectRollback()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL")).
+		WillReturnRows(sqlmock.NewRows([]string{"source", "content_sha256", "blocked"}).
+			AddRow(claimSourceDynamic, strings.Repeat("a", 64), false))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_audit")).
+		WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectCommit()
+
+	result, err := store.Publish(context.Background(), publishRequestFixture())
+	if err != nil {
+		t.Fatalf("Publish after transient deadlock: %v", err)
+	}
+	if !result.Idempotent {
+		t.Fatalf("result = %+v, want idempotent", result)
 	}
 	assertMockExpectations(t, mock)
 }

@@ -12,6 +12,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestNewInTestModeAllowsUninstalledStaticRegistry(t *testing.T) {
@@ -58,25 +60,42 @@ func TestRouteRequiresAuthenticationBeforeControlHandlers(t *testing.T) {
 
 func TestCompileRequestMapsValidationAndCapacityErrors(t *testing.T) {
 	tests := []struct {
-		name     string
-		err      error
-		wantCode string
+		name          string
+		err           error
+		wantCode      string
+		wantOperation string
 	}{
 		{
-			name:     "validation",
-			err:      &cardtmpl.ArtifactValidationError{Category: "schema", Document: "schema"},
-			wantCode: "err.server.card_template_catalog.request_invalid",
+			name:          "validation",
+			err:           &cardtmpl.ArtifactValidationError{Category: "schema", Document: "schema"},
+			wantCode:      "err.server.card_template_catalog.request_invalid",
+			wantOperation: "rejected",
 		},
 		{
-			name:     "capacity",
-			err:      cardtmpl.ErrArtifactCompileBusy,
-			wantCode: "err.server.card_template_catalog.unavailable",
+			name:          "capacity",
+			err:           cardtmpl.ErrArtifactCompileBusy,
+			wantCode:      "err.server.card_template_catalog.unavailable",
+			wantOperation: "busy",
+		},
+		{
+			name:          "timeout",
+			err:           context.DeadlineExceeded,
+			wantCode:      "err.server.card_template_catalog.unavailable",
+			wantOperation: "timeout",
+		},
+		{
+			name:          "internal",
+			err:           errors.New("compiler failed"),
+			wantCode:      "err.server.card_template_catalog.unavailable",
+			wantOperation: "error",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
 			api := &API{
-				store: &fakeCatalogStore{},
+				store:   &fakeCatalogStore{},
+				metrics: newCatalogMetrics(registry),
 				compile: func(context.Context, cardtmpl.Bundle, cardtmpl.CompileLimits) (*cardtmpl.CompiledArtifact, error) {
 					return nil, tt.err
 				},
@@ -88,6 +107,9 @@ func TestCompileRequestMapsValidationAndCapacityErrors(t *testing.T) {
 			}
 			if envelope.Error.Code != tt.wantCode {
 				t.Fatalf("code = %q, want %q", envelope.Error.Code, tt.wantCode)
+			}
+			if got := testutil.ToFloat64(api.metrics.operations.WithLabelValues("validate", tt.wantOperation)); got != 1 {
+				t.Fatalf("validate operation result %q = %v, want 1", tt.wantOperation, got)
 			}
 		})
 	}

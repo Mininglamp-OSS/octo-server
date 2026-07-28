@@ -77,6 +77,27 @@ func TestPublishUsesAuthenticatedActorAndKeepsArtifactInactive(t *testing.T) {
 	}
 }
 
+func TestPublishBoundsStoreContext(t *testing.T) {
+	store := &fakeCatalogStore{publishResult: PublishResult{Created: true}}
+	api := &API{
+		store: store,
+		compile: func(context.Context, cardtmpl.Bundle, cardtmpl.CompileLimits) (*cardtmpl.CompiledArtifact, error) {
+			return compiledArtifactFixture(), nil
+		},
+	}
+
+	response := doCatalogRequest(t, api, wkhttp.SuperAdmin, "/publish", validControlRequestJSON(t, true))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if store.publishContext == nil {
+		t.Fatal("store did not receive a publish context")
+	}
+	if _, ok := store.publishContext.Deadline(); !ok {
+		t.Fatal("store publish context has no server-side deadline")
+	}
+}
+
 func TestControlEndpointsRejectNonSuperAdminBeforeCompile(t *testing.T) {
 	compilerCalls := 0
 	api := &API{
@@ -267,6 +288,7 @@ type fakeCatalogStore struct {
 	publishResult  PublishResult
 	publishErr     error
 	publishCalls   int
+	publishContext context.Context
 	lastPublish    PublishRequest
 	reconciled     []cardtmpl.TemplateMeta
 	reconcileErr   error
@@ -274,8 +296,9 @@ type fakeCatalogStore struct {
 	reconcileCalls int
 }
 
-func (s *fakeCatalogStore) Publish(_ context.Context, request PublishRequest) (PublishResult, error) {
+func (s *fakeCatalogStore) Publish(ctx context.Context, request PublishRequest) (PublishResult, error) {
 	s.publishCalls++
+	s.publishContext = ctx
 	s.lastPublish = request
 	return s.publishResult, s.publishErr
 }
