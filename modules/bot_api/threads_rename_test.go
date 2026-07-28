@@ -261,7 +261,7 @@ func TestBotRenameThread_EmptyName(t *testing.T) {
 	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
-// Error path: whitespace-only name → treated as empty after TrimSpace, service returns error → 400
+// Error path: whitespace-only name → treated as empty after TrimSpace, handler rejects before service → 400
 func TestBotRenameThread_WhitespaceName(t *testing.T) {
 	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{}
