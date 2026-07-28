@@ -1170,8 +1170,12 @@ func (v *boundedSchemaValidator) validateNode(value any, location string) error 
 				if _, err := positiveJSONInt(node["maxItems"]); err != nil {
 					return fmt.Errorf("%s array is unbounded", location)
 				}
-				if _, ok := node["items"].(map[string]any); !ok {
+				items, exists := node["items"]
+				if !exists {
 					return fmt.Errorf("%s array items schema missing", location)
+				}
+				if err := v.validatePropertySchema(items, location+".items"); err != nil {
+					return err
 				}
 			case "object":
 				if additional, ok := node["additionalProperties"].(bool); !ok || additional {
