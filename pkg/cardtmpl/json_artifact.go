@@ -45,8 +45,12 @@ var (
 	ErrArtifactCompileBusy = errors.New("cardtmpl: artifact compiler busy")
 	artifactDocumentKeyRE  = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
 	artifactTemplateIDRE   = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[.-][a-z0-9][a-z0-9-]*)+$`)
-	artifactVersionRE      = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
-	artifactActionTypeRE   = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
+	artifactVersionRE      = regexp.MustCompile(
+		`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
+			`(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?` +
+			`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
+	)
+	artifactActionTypeRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 
 	artifactCompileQueue = make(chan struct{}, 16)
 	artifactCompileSlots = make(chan struct{}, max(2, runtime.GOMAXPROCS(0)/2))
@@ -1172,6 +1176,9 @@ func decodeStrictJSON(raw []byte, budget jsonBudget) (any, error) {
 	if !utf8.Valid(raw) {
 		return nil, errors.New("invalid UTF-8")
 	}
+	if err := validateJSONUnicodeEscapes(raw); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	value, err := decodeStrictJSONValue(decoder, &budget, 1)
@@ -1183,6 +1190,59 @@ func decodeStrictJSON(raw []byte, budget jsonBudget) (any, error) {
 			return nil, errors.New("trailing JSON token")
 		}
 		return nil, fmt.Errorf("trailing JSON token: %w", err)
+	}
+	return value, nil
+}
+
+func validateJSONUnicodeEscapes(raw []byte) error {
+	inString := false
+	for index := 0; index < len(raw); index++ {
+		switch raw[index] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString || index+1 >= len(raw) {
+				continue
+			}
+			if raw[index+1] != 'u' {
+				index++
+				continue
+			}
+			codepoint, err := parseJSONUnicodeEscape(raw, index)
+			if err != nil {
+				return err
+			}
+			switch {
+			case codepoint >= 0xD800 && codepoint <= 0xDBFF:
+				next := index + 6
+				if next+5 >= len(raw) || raw[next] != '\\' || raw[next+1] != 'u' {
+					return fmt.Errorf("high surrogate \\u%04x is not followed by a low surrogate", codepoint)
+				}
+				low, err := parseJSONUnicodeEscape(raw, next)
+				if err != nil {
+					return err
+				}
+				if low < 0xDC00 || low > 0xDFFF {
+					return fmt.Errorf("high surrogate \\u%04x is followed by non-low surrogate \\u%04x", codepoint, low)
+				}
+				index = next + 5
+			case codepoint >= 0xDC00 && codepoint <= 0xDFFF:
+				return fmt.Errorf("unpaired low surrogate \\u%04x", codepoint)
+			default:
+				index += 5
+			}
+		}
+	}
+	return nil
+}
+
+func parseJSONUnicodeEscape(raw []byte, slashIndex int) (uint64, error) {
+	if slashIndex+5 >= len(raw) || raw[slashIndex] != '\\' || raw[slashIndex+1] != 'u' {
+		return 0, errors.New("truncated Unicode escape")
+	}
+	value, err := strconv.ParseUint(string(raw[slashIndex+2:slashIndex+6]), 16, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid Unicode escape: %w", err)
 	}
 	return value, nil
 }
