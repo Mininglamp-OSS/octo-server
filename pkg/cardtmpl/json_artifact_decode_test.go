@@ -449,6 +449,18 @@ func TestValidateBoundedInputSchemaRejectsUnboundedLocalRefs(t *testing.T) {
 	}
 }
 
+func TestValidateBoundedInputSchemaRejectsUnboundedArrayItemRef(t *testing.T) {
+	schema := boundedRootWithProperty(map[string]any{
+		"type":     "array",
+		"maxItems": json.Number("1"),
+		"items":    map[string]any{"$ref": "#/$defs/value"},
+	})
+	schema["$defs"] = map[string]any{"value": true}
+	if err := validateBoundedInputSchema(schema); err == nil {
+		t.Fatal("array item reference to an unbounded schema unexpectedly accepted")
+	}
+}
+
 func boundedRootWithProperty(property any) map[string]any {
 	return map[string]any{
 		"type":                 "object",
