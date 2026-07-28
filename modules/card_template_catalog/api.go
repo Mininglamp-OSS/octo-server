@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -35,14 +36,17 @@ type API struct {
 	store   catalogStore
 	compile compileArtifactFunc
 	logger  log.Log
+	metrics *catalogMetrics
 }
 
 func New(ctx *config.Context) *API {
+	metrics := newCatalogMetrics(prometheus.DefaultRegisterer)
 	api := &API{
 		ctx:     ctx,
 		store:   newStore(ctx.DB().DB),
 		compile: cardtmpl.CompileJSONArtifact,
 		logger:  log.NewTLog("CardTemplateCatalog"),
+		metrics: metrics,
 	}
 	registry := cardtmpl.DefaultRegistry()
 	if registry == nil {
@@ -54,8 +58,10 @@ func New(ctx *config.Context) *API {
 	reconcileCtx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
 	defer cancel()
 	if err := reconcileStaticInventory(reconcileCtx, api.store, registry); err != nil {
+		api.metrics.observeDB("reconcile_static", "error")
 		panic(fmt.Sprintf("card template catalog: reconcile static inventory: %v", err))
 	}
+	api.metrics.observeDB("reconcile_static", "ok")
 	return api
 }
 
@@ -99,6 +105,8 @@ type controlResponse struct {
 }
 
 func (a *API) validate(c *wkhttp.Context) {
+	operationResult := "rejected"
+	defer func() { a.metrics.observeOperation("validate", operationResult) }()
 	if !a.requireSuperAdmin(c) {
 		return
 	}
@@ -110,10 +118,13 @@ func (a *API) validate(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
+	operationResult = "ok"
 	c.Response(responseForArtifact(artifact, false, PublishResult{}))
 }
 
 func (a *API) publish(c *wkhttp.Context) {
+	operationResult := "rejected"
+	defer func() { a.metrics.observeOperation("publish", operationResult) }()
 	if !a.requireSuperAdmin(c) {
 		return
 	}
@@ -144,15 +155,22 @@ func (a *API) publish(c *wkhttp.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrImmutableVersionConflict), errors.Is(err, ErrVersionClaimConflict):
+			operationResult = "conflict"
+			a.metrics.observeDB("publish", "conflict")
 			respondCatalogConflict(c)
 		case errors.Is(err, ErrPublishRequestInvalid):
+			a.metrics.observeDB("publish", "rejected")
 			respondCatalogRequestInvalid(c, err)
 		default:
+			operationResult = "error"
+			a.metrics.observeDB("publish", "error")
 			a.logError("publish card template failed", err, artifact)
 			respondCatalogUnavailable(c)
 		}
 		return
 	}
+	a.metrics.observeDB("publish", "ok")
+	operationResult = "ok"
 	c.Response(responseForArtifact(artifact, true, result))
 }
 
@@ -194,14 +212,19 @@ func readControlRequest(c *wkhttp.Context) (controlRequest, cardtmpl.Bundle, boo
 }
 
 func (a *API) compileRequest(c *wkhttp.Context, bundle cardtmpl.Bundle) (*cardtmpl.CompiledArtifact, bool) {
+	started := time.Now()
+	compileResult := "error"
+	defer func() { a.metrics.observeCompile(compileResult, time.Since(started)) }()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), compileTimeout)
 	defer cancel()
 	artifact, err := a.compile(ctx, bundle, cardtmpl.DefaultCompileLimits())
 	if err == nil {
+		compileResult = "ok"
 		return artifact, true
 	}
 	var validationErr *cardtmpl.ArtifactValidationError
 	if errors.As(err, &validationErr) {
+		compileResult = "validation_error"
 		respondCatalogRequestInvalid(c, err)
 		return nil, false
 	}

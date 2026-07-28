@@ -1104,16 +1104,14 @@ func validateBoundedInputSchema(root map[string]any) error {
 	if additional, ok := root["additionalProperties"].(bool); !ok || additional {
 		return errors.New("root schema additionalProperties must be false")
 	}
-	return validateBoundedSchemaNode(root, "$", make(map[any]struct{}))
+	return validateBoundedSchemaNode(root, "$")
 }
 
-func validateBoundedSchemaNode(value any, location string, seen map[any]struct{}) error {
-	// Parsed JSON is acyclic; seen only prevents accidental future cyclic input
-	// when this helper is reused with a caller-constructed map.
+func validateBoundedSchemaNode(value any, location string) error {
 	switch node := value.(type) {
 	case []any:
 		for index, child := range node {
-			if err := validateBoundedSchemaNode(child, fmt.Sprintf("%s[%d]", location, index), seen); err != nil {
+			if err := validateBoundedSchemaNode(child, fmt.Sprintf("%s[%d]", location, index)); err != nil {
 				return err
 			}
 		}
@@ -1143,7 +1141,7 @@ func validateBoundedSchemaNode(value any, location string, seen map[any]struct{}
 			if key == "examples" || key == "default" || key == "enum" || key == "const" {
 				continue
 			}
-			if err := validateBoundedSchemaNode(child, location+"."+key, seen); err != nil {
+			if err := validateBoundedSchemaNode(child, location+"."+key); err != nil {
 				return err
 			}
 		}

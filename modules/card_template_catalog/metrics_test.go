@@ -11,6 +11,10 @@ import (
 func TestCatalogMetricsExposeOnlyBoundedLabels(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := newCatalogMetrics(registry)
+	again := newCatalogMetrics(registry)
+	if again.operations != metrics.operations || again.compile != metrics.compile || again.db != metrics.db {
+		t.Fatal("duplicate registration must reuse the existing collectors")
+	}
 	metrics.observeOperation("validate", "ok")
 	metrics.observeCompile("validation_error", 25*time.Millisecond)
 	metrics.observeDB("publish", "conflict")
