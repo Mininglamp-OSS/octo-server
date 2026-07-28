@@ -184,7 +184,13 @@ func (ba *BotAPI) botRenameThread(c *wkhttp.Context) {
 		return
 	}
 
-	err := ba.threadService.UpdateNameAsBot(groupNo, shortID, robotID, strings.TrimSpace(req.Name))
+	trimmedName := strings.TrimSpace(req.Name)
+	if trimmedName == "" {
+		respondBotAPIRequestInvalid(c, "name")
+		return
+	}
+
+	err := ba.threadService.UpdateNameAsBot(groupNo, shortID, robotID, trimmedName)
 	if err != nil {
 		ba.Error("修改子区名称失败", zap.Error(err), zap.String("robotID", robotID), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)

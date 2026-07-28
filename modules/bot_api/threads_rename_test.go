@@ -264,13 +264,13 @@ func TestBotRenameThread_EmptyName(t *testing.T) {
 // Error path: whitespace-only name → treated as empty after TrimSpace, service returns error → 400
 func TestBotRenameThread_WhitespaceName(t *testing.T) {
 	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
-	threadSvc := &fakeThreadServiceForRename{updateNameAsBotErr: errors.New("name is required")}
+	threadSvc := &fakeThreadServiceForRename{}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
 	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "   "})
-	// binding:"required" passes for "   "; TrimSpace → ""; service rejects → ErrBotAPIStoreFailed
+	// binding:"required" passes for "   "; TrimSpace → ""; handler rejects → request_invalid
 	assert.Equal(t, http.StatusBadRequest, w.Code, "whitespace name should return 400, body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIStoreFailed.DefaultMessage)
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
 // Error path: invalid short_id (non-numeric) → 400
