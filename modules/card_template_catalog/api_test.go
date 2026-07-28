@@ -15,6 +15,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestValidateCompilesWithoutPersisting(t *testing.T) {
@@ -145,20 +147,28 @@ func TestPublishMapsConflictAndInternalErrors(t *testing.T) {
 		err        error
 		wantCode   string
 		wantStatus int
+		wantDB     string
 	}{
-		{name: "immutable conflict", err: ErrImmutableVersionConflict, wantCode: "err.server.card_template_catalog.conflict", wantStatus: http.StatusConflict},
-		{name: "store unavailable", err: errors.New("db unavailable"), wantCode: "err.server.card_template_catalog.unavailable", wantStatus: http.StatusServiceUnavailable},
+		{name: "immutable conflict", err: ErrImmutableVersionConflict, wantCode: "err.server.card_template_catalog.conflict", wantStatus: http.StatusConflict, wantDB: "conflict"},
+		{name: "version claim conflict", err: ErrVersionClaimConflict, wantCode: "err.server.card_template_catalog.conflict", wantStatus: http.StatusConflict, wantDB: "conflict"},
+		{name: "catalog integrity failure", err: ErrCatalogIntegrity, wantCode: "err.shared.internal", wantStatus: http.StatusInternalServerError, wantDB: "integrity_error"},
+		{name: "store unavailable", err: errors.New("db unavailable"), wantCode: "err.server.card_template_catalog.unavailable", wantStatus: http.StatusServiceUnavailable, wantDB: "error"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
 			api := &API{
-				store: &fakeCatalogStore{publishErr: tt.err},
+				store:   &fakeCatalogStore{publishErr: tt.err},
+				metrics: newCatalogMetrics(registry),
 				compile: func(context.Context, cardtmpl.Bundle, cardtmpl.CompileLimits) (*cardtmpl.CompiledArtifact, error) {
 					return compiledArtifactFixture(), nil
 				},
 			}
 			response := doCatalogRequest(t, api, wkhttp.SuperAdmin, "/publish", validControlRequestJSON(t, true))
 			assertCatalogError(t, response, tt.wantCode, tt.wantStatus)
+			if got := testutil.ToFloat64(api.metrics.db.WithLabelValues("publish", tt.wantDB)); got != 1 {
+				t.Fatalf("publish DB metric result %q = %v, want 1", tt.wantDB, got)
+			}
 		})
 	}
 }
