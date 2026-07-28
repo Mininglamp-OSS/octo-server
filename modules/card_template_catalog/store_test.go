@@ -162,6 +162,87 @@ func TestStoreReconcileStaticRejectsDynamicClaim(t *testing.T) {
 	assertMockExpectations(t, mock)
 }
 
+func TestStoreReconcileStaticAcceptsExistingStaticClaim(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+		WithArgs("ai.reasoning-process", "0.2.0", claimSourceStatic).
+		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, EXISTS(SELECT 1 FROM card_template_artifact")).
+		WithArgs("ai.reasoning-process", "0.2.0").
+		WillReturnRows(sqlmock.NewRows([]string{"source", "has_artifact"}).AddRow(claimSourceStatic, false))
+	mock.ExpectCommit()
+
+	err := store.ReconcileStatic(context.Background(), []cardtmpl.TemplateMeta{{
+		ID: "ai.reasoning-process", Version: "0.2.0",
+	}})
+	if err != nil {
+		t.Fatalf("ReconcileStatic existing claim: %v", err)
+	}
+	assertMockExpectations(t, mock)
+}
+
+func TestValidatePublishRequestRejectsMalformedInputs(t *testing.T) {
+	valid := publishRequestFixture()
+	if err := validatePublishRequest(valid); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*PublishRequest)
+	}{
+		{name: "nil artifact", mutate: func(request *PublishRequest) { request.Artifact = nil }},
+		{name: "unknown engine", mutate: func(request *PublishRequest) { request.Artifact.Engine = "unknown/v1" }},
+		{name: "bad hash", mutate: func(request *PublishRequest) { request.Artifact.Hash = "not-sha256" }},
+		{name: "uppercase hash", mutate: func(request *PublishRequest) { request.Artifact.Hash = strings.Repeat("A", 64) }},
+		{name: "empty bundle", mutate: func(request *PublishRequest) { request.Artifact.Bundle = nil }},
+		{name: "missing actor", mutate: func(request *PublishRequest) { request.ActorUID = "" }},
+		{name: "untrimmed reason", mutate: func(request *PublishRequest) { request.Reason = " reviewed " }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := publishRequestFixture()
+			artifactCopy := *request.Artifact
+			request.Artifact = &artifactCopy
+			tt.mutate(&request)
+			if err := validatePublishRequest(request); !errors.Is(err, ErrPublishRequestInvalid) {
+				t.Fatalf("error = %v, want ErrPublishRequestInvalid", err)
+			}
+		})
+	}
+}
+
+func TestStorePublishReturnsTransactionErrors(t *testing.T) {
+	t.Run("begin", func(t *testing.T) {
+		store, mock, closeDB := newMockStore(t)
+		defer closeDB()
+		mock.ExpectBegin().WillReturnError(errors.New("begin unavailable"))
+		if _, err := store.Publish(context.Background(), publishRequestFixture()); err == nil || !strings.Contains(err.Error(), "begin") {
+			t.Fatalf("error = %v", err)
+		}
+		assertMockExpectations(t, mock)
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		store, mock, closeDB := newMockStore(t)
+		defer closeDB()
+		mock.ExpectBegin()
+		mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_artifact")).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_audit")).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectCommit().WillReturnError(errors.New("commit unavailable"))
+		if _, err := store.Publish(context.Background(), publishRequestFixture()); err == nil || !strings.Contains(err.Error(), "commit") {
+			t.Fatalf("error = %v", err)
+		}
+		assertMockExpectations(t, mock)
+	})
+}
+
 func TestCatalogMigrationDefinesImmutableCaseSensitiveTables(t *testing.T) {
 	raw, err := sqlFS.ReadFile("sql/20260728000001_card_template_catalog.sql")
 	if err != nil {
