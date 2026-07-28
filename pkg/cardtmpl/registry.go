@@ -42,11 +42,15 @@ var (
 // manifestFile 是 Registry 从 assets FS 解析的 manifest.json 形状。
 // 与 docs/platform-card-base.md §4.1 对齐;未在 §4.1 声明的字段被忽略。
 type manifestFile struct {
-	ID              ID     `json:"id"`
-	Name            string `json:"name"`
-	Version         string `json:"version"`
-	ContractVersion string `json:"contractVersion"`
-	Protocol        string `json:"protocol"`
+	SchemaVersion       int    `json:"schemaVersion"`
+	ID                  ID     `json:"id"`
+	Name                string `json:"name"`
+	Version             string `json:"version"`
+	ContractVersion     string `json:"contractVersion"`
+	Protocol            string `json:"protocol"`
+	AdaptiveCardVersion string `json:"adaptiveCardVersion"`
+	DefaultLocale       string `json:"defaultLocale"`
+	DataSchema          string `json:"dataSchema"`
 	// RenderProfile is provenance-only metadata for the exact Forge artifact.
 	// RenderProfileCompatibility is the stable value written to the type-17
 	// envelope and is the only render-profile value retained at runtime.
@@ -155,68 +159,17 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	}
 
 	mf := loadManifest(assets, root)
-	schema := loadSchema(assets, root)
+	loadedSchema := loadSchema(assets, root)
+	if _, hasJSONOnlyConstraints := loadedSchema.document["x-octo-constraints"]; hasJSONOnlyConstraints {
+		panic(fmt.Errorf("cardtmpl: Go-authored template %s@%s cannot declare x-octo-constraints; use RegisterJSON", mf.ID, mf.Version))
+	}
+	schema := loadedSchema.schema
 	interactions := loadInteractionReports(assets, root, mf.Views)
 	samples := loadSamples(assets, root, schema)
 
-	// state 索引 + 唯一性校验
-	stateIndex := make(map[State]ViewKey, 8)
-	views := make(map[ViewKey]ViewSpec, len(mf.Views))
-	for vk, vs := range mf.Views {
-		views[vk] = ViewSpec{WireProfile: vs.WireProfile, States: append([]State(nil), vs.States...)}
-		for _, st := range vs.States {
-			if prev, dup := stateIndex[st]; dup {
-				panic(fmt.Errorf("cardtmpl: state %q declared in multiple views (%q and %q) in %s/manifest.json", st, prev, vk, root))
-			}
-			stateIndex[st] = vk
-		}
-	}
-
-	// owner 校验 (§2.2-1)
-	if mf.Owner != "" {
-		if strings.HasPrefix(mf.Owner, l2bOwnerPrefix) {
-			// L2b 分支保留代码路径,生产阶段不开放
-			panic(fmt.Errorf("cardtmpl: L2b owner %q rejected: ext.* channel not enabled (see docs/platform-card-base.md §2.2-5)", mf.Owner))
-		}
-		if _, ok := l2aOwnerAllowlist[mf.Owner]; !ok {
-			panic(fmt.Errorf("cardtmpl: owner %q not in L2a allowlist", mf.Owner))
-		}
-	}
-
-	// Protocol 校验
-	protocol := mf.Protocol
-	if protocol == "" {
-		protocol = Protocol
-	}
-	if protocol != Protocol {
-		panic(fmt.Errorf("cardtmpl: manifest protocol %q != base protocol %q", protocol, Protocol))
-	}
-	renderProfileCompatibility := strings.TrimSpace(mf.RenderProfileCompatibility)
-	if !cardmsg.IsAcceptedRenderProfile(renderProfileCompatibility) {
-		panic(fmt.Errorf("cardtmpl: unsupported render profile compatibility %q", renderProfileCompatibility))
-	}
-	if renderProfileCompatibility != "" && strings.TrimSpace(mf.RenderProfile) == "" {
-		panic(errors.New("cardtmpl: renderProfile is required when renderProfileCompatibility is set"))
-	}
-
-	// ActionContract 派生
-	var contract *TemplateActionContract
-	if mf.Owner != "" && mf.ActionType != "" {
-		contract = &TemplateActionContract{Owner: mf.Owner, ActionType: mf.ActionType}
-	}
-
-	meta := TemplateMeta{
-		ID:                         mf.ID,
-		Version:                    mf.Version,
-		Protocol:                   protocol,
-		RenderProfileCompatibility: renderProfileCompatibility,
-		Views:                      views,
-		ActionContract:             contract,
-		Manifest:                   manifestBytes(assets, root),
-		InputSchema:                schema,
-		Source:                     Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
-		stateIndex:                 stateIndex,
-		interactions:               interactions,
+	meta, err := assembleTemplateMeta(mf, schema, interactions, manifestBytes(assets, root))
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: register %s: %w", root, err))
 	}
 
 	// 注入 Meta 到 Template
@@ -243,6 +196,88 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	if err := r.selfCheckSamples(t, meta, samples); err != nil {
 		panic(fmt.Errorf("cardtmpl: register self-check %s@%s: %w", meta.ID, meta.Version, err))
 	}
+}
+
+func (r *Registry) registerCompiledJSON(artifact *CompiledArtifact) {
+	if artifact == nil || artifact.Template == nil {
+		panic(errors.New("cardtmpl: RegisterJSON received nil compiled artifact"))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		panic(fmt.Errorf("%w: cannot RegisterJSON after Freeze", ErrRegistryFrozen))
+	}
+	meta := artifact.Meta.Clone()
+	key := registryKey{id: meta.ID, version: meta.Version}
+	if _, duplicate := r.entries[key]; duplicate {
+		panic(fmt.Errorf("cardtmpl: duplicate registration %s@%s", meta.ID, meta.Version))
+	}
+	r.entries[key] = &entry{
+		tmpl:    artifact.Template,
+		meta:    meta,
+		samples: cloneRawMessageMap(artifact.samples),
+	}
+}
+
+func assembleTemplateMeta(
+	mf manifestFile,
+	schema *jsonschema.Schema,
+	interactions map[ViewKey]InteractionReport,
+	manifest json.RawMessage,
+) (TemplateMeta, error) {
+	stateIndex := make(map[State]ViewKey, 8)
+	views := make(map[ViewKey]ViewSpec, len(mf.Views))
+	for view, spec := range mf.Views {
+		views[view] = ViewSpec{WireProfile: spec.WireProfile, States: append([]State(nil), spec.States...)}
+		for _, state := range spec.States {
+			if previous, duplicate := stateIndex[state]; duplicate {
+				return TemplateMeta{}, fmt.Errorf("state %q declared in multiple views (%q and %q)", state, previous, view)
+			}
+			stateIndex[state] = view
+		}
+	}
+
+	if mf.Owner != "" {
+		if strings.HasPrefix(mf.Owner, l2bOwnerPrefix) {
+			return TemplateMeta{}, fmt.Errorf("L2b owner %q rejected: ext.* channel not enabled (see docs/platform-card-base.md §2.2-5)", mf.Owner)
+		}
+		if _, ok := l2aOwnerAllowlist[mf.Owner]; !ok {
+			return TemplateMeta{}, fmt.Errorf("owner %q not in L2a allowlist", mf.Owner)
+		}
+	}
+
+	protocol := mf.Protocol
+	if protocol == "" {
+		protocol = Protocol
+	}
+	if protocol != Protocol {
+		return TemplateMeta{}, fmt.Errorf("manifest protocol %q != base protocol %q", protocol, Protocol)
+	}
+	renderProfileCompatibility := strings.TrimSpace(mf.RenderProfileCompatibility)
+	if !cardmsg.IsAcceptedRenderProfile(renderProfileCompatibility) {
+		return TemplateMeta{}, fmt.Errorf("unsupported render profile compatibility %q", renderProfileCompatibility)
+	}
+	if renderProfileCompatibility != "" && strings.TrimSpace(mf.RenderProfile) == "" {
+		return TemplateMeta{}, errors.New("renderProfile is required when renderProfileCompatibility is set")
+	}
+
+	var contract *TemplateActionContract
+	if mf.Owner != "" && mf.ActionType != "" {
+		contract = &TemplateActionContract{Owner: mf.Owner, ActionType: mf.ActionType}
+	}
+	return TemplateMeta{
+		ID:                         mf.ID,
+		Version:                    mf.Version,
+		Protocol:                   protocol,
+		RenderProfileCompatibility: renderProfileCompatibility,
+		Views:                      views,
+		ActionContract:             contract,
+		Manifest:                   append(json.RawMessage(nil), manifest...),
+		InputSchema:                schema,
+		Source:                     Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
+		stateIndex:                 stateIndex,
+		interactions:               interactions,
+	}, nil
 }
 
 // SetDefault 显式设置某 id 的默认版本。Freeze 之后调用 → panic。
@@ -373,22 +408,30 @@ func manifestBytes(fs embed.FS, root string) json.RawMessage {
 	return append(json.RawMessage(nil), b...)
 }
 
-func loadSchema(fs embed.FS, root string) *jsonschema.Schema {
+type loadedSchema struct {
+	schema   *jsonschema.Schema
+	document map[string]any
+}
+
+func loadSchema(fs embed.FS, root string) loadedSchema {
 	p := path.Join(root, "contract", "data.schema.json")
 	b, err := fs.ReadFile(p)
 	if err != nil {
 		panic(fmt.Errorf("cardtmpl: read %s: %w", p, err))
 	}
-	c := jsonschema.NewCompiler()
-	// 用 URL 形式挂载 in-memory 资源,便于错误定位。
-	if err := c.AddResource(p, mustParseJSON(b)); err != nil {
-		panic(fmt.Errorf("cardtmpl: add schema resource %s: %w", p, err))
+	parsed, err := decodeStrictJSON(b, jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes})
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: parse schema %s: %w", p, err))
 	}
-	sch, err := c.Compile(p)
+	document, ok := parsed.(map[string]any)
+	if !ok {
+		panic(fmt.Errorf("cardtmpl: schema %s root must be an object", p))
+	}
+	sch, err := compileJSONSchema(document)
 	if err != nil {
 		panic(fmt.Errorf("cardtmpl: compile schema %s: %w", p, err))
 	}
-	return sch
+	return loadedSchema{schema: sch, document: document}
 }
 
 func loadInteractionReports(fs embed.FS, root string, views map[ViewKey]manifestView) map[ViewKey]InteractionReport {

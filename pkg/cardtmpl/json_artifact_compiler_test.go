@@ -1,6 +1,7 @@
 package cardtmpl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,7 +28,11 @@ func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
 
 	// Formatting and map insertion order are not part of the immutable identity.
 	secondBundle := validJSONArtifactBundle()
-	secondBundle.Schema = json.RawMessage(strings.ReplaceAll(string(secondBundle.Schema), ":", " : "))
+	var formattedSchema bytes.Buffer
+	if err := json.Indent(&formattedSchema, secondBundle.Schema, "", "  "); err != nil {
+		t.Fatalf("format schema fixture: %v", err)
+	}
+	secondBundle.Schema = append(json.RawMessage(nil), formattedSchema.Bytes()...)
 	secondBundle.Templates = map[string]json.RawMessage{
 		"main": secondBundle.Templates["main"],
 	}

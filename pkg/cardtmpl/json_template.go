@@ -1,13 +1,10 @@
 package cardtmpl
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
-	"path"
-	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/jsontmpl"
@@ -33,15 +30,6 @@ type jsonTemplateAggregateArrayLimit struct {
 	ParentArray   string `json:"parentArray"`
 	ChildArray    string `json:"childArray"`
 	MaxTotalItems int    `json:"maxTotalItems"`
-}
-
-type jsonTemplateConstraintSet struct {
-	AggregateArrayLimits []jsonTemplateAggregateArrayLimit `json:"aggregateArrayLimits"`
-}
-
-type jsonTemplateSchemaEnvelope struct {
-	Properties  map[string]json.RawMessage `json:"properties"`
-	Constraints json.RawMessage            `json:"x-octo-constraints"`
 }
 
 // SetMeta satisfies metaSetter; Registry injects the assembled meta at Register.
@@ -190,120 +178,16 @@ func (t *jsonTemplate) FallbackText(state State, fields json.RawMessage, lang st
 // registration guarantees as Go cards (missing template / schema / bad sample /
 // whitelist violation all panic at boot, never at first render).
 func (r *Registry) RegisterJSON(assets embed.FS, root string) {
-	mf := loadManifest(assets, root)
-	aggregateArrayLimits := loadJSONTemplateAggregateArrayLimits(assets, root)
-	viewAST := make(map[ViewKey]any, len(mf.Views))
-	for vk, vs := range mf.Views {
-		if strings.TrimSpace(vs.Template) == "" {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: view %q in %s/manifest.json declares no template path", vk, root))
-		}
-		p := path.Join(root, vs.Template)
-		b, err := assets.ReadFile(p)
-		if err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: read template %s: %w", p, err))
-		}
-		var ast any
-		if err := json.Unmarshal(b, &ast); err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: parse template %s: %w", p, err))
-		}
-		// Fail-close: every Action.ToggleVisibility target must resolve to an
-		// element id in the same template (a dangling target is an authoring bug
-		// — a button that toggles nothing — caught here, not at first render).
-		if err := jsontmpl.ValidateToggleTargets(ast); err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: template %s: %w", p, err))
-		}
-		viewAST[vk] = ast
-	}
-	r.Register(&jsonTemplate{
-		viewAST:              viewAST,
-		aggregateArrayLimits: aggregateArrayLimits,
-	}, assets, root)
-}
-
-func loadJSONTemplateAggregateArrayLimits(assets embed.FS, root string) []jsonTemplateAggregateArrayLimit {
-	p := path.Join(root, "contract", "data.schema.json")
-	b, err := assets.ReadFile(p)
+	bundle, err := LoadJSONBundle(assets, root, CatalogDescriptor{
+		Engine:     JSONTemplateEngineV1,
+		Visibility: CatalogVisibilityPrivate,
+	})
 	if err != nil {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: read schema constraints %s: %w", p, err))
+		panic(fmt.Errorf("cardtmpl: RegisterJSON %s: %w", root, err))
 	}
-	var schema jsonTemplateSchemaEnvelope
-	if err := json.Unmarshal(b, &schema); err != nil {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: parse schema constraints %s: %w", p, err))
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, staticCompileLimits())
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: RegisterJSON %s: %w", root, err))
 	}
-	if len(schema.Constraints) == 0 {
-		return nil
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(schema.Constraints))
-	decoder.DisallowUnknownFields()
-	var constraints jsonTemplateConstraintSet
-	if err := decoder.Decode(&constraints); err != nil {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: parse x-octo-constraints in %s: %w", p, err))
-	}
-	if len(constraints.AggregateArrayLimits) == 0 {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: x-octo-constraints in %s has no aggregateArrayLimits", p))
-	}
-
-	seen := make(map[string]struct{}, len(constraints.AggregateArrayLimits))
-	for index, limit := range constraints.AggregateArrayLimits {
-		if limit.ParentArray == "" || limit.ParentArray != strings.TrimSpace(limit.ParentArray) {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregateArrayLimits[%d].parentArray is required in %s", index, p))
-		}
-		if limit.ChildArray == "" || limit.ChildArray != strings.TrimSpace(limit.ChildArray) {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregateArrayLimits[%d].childArray is required in %s", index, p))
-		}
-		if limit.MaxTotalItems <= 0 {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregateArrayLimits[%d].maxTotalItems must be positive in %s", index, p))
-		}
-		key := limit.ParentArray + "\x00" + limit.ChildArray
-		if _, duplicate := seen[key]; duplicate {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: duplicate aggregateArrayLimits target %s[].%s in %s",
-				limit.ParentArray, limit.ChildArray, p))
-		}
-		seen[key] = struct{}{}
-		validateJSONTemplateAggregateTarget(schema.Properties, limit, p)
-	}
-	return constraints.AggregateArrayLimits
-}
-
-func validateJSONTemplateAggregateTarget(
-	properties map[string]json.RawMessage,
-	limit jsonTemplateAggregateArrayLimit,
-	schemaPath string,
-) {
-	parentRaw, exists := properties[limit.ParentArray]
-	if !exists {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregate parentArray %q not found in %s", limit.ParentArray, schemaPath))
-	}
-	var parent struct {
-		Type  string `json:"type"`
-		Items struct {
-			Type       string                     `json:"type"`
-			Properties map[string]json.RawMessage `json:"properties"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(parentRaw, &parent); err != nil {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: parse aggregate parentArray %q in %s: %w",
-			limit.ParentArray, schemaPath, err))
-	}
-	if parent.Type != "array" || parent.Items.Type != "object" {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregate parentArray %q must be an array of objects in %s",
-			limit.ParentArray, schemaPath))
-	}
-	childRaw, exists := parent.Items.Properties[limit.ChildArray]
-	if !exists {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregate childArray %q not found under %q in %s",
-			limit.ChildArray, limit.ParentArray, schemaPath))
-	}
-	var child struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(childRaw, &child); err != nil {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: parse aggregate childArray %q under %q in %s: %w",
-			limit.ChildArray, limit.ParentArray, schemaPath, err))
-	}
-	if child.Type != "array" {
-		panic(fmt.Errorf("cardtmpl: RegisterJSON: aggregate childArray %q under %q must be an array in %s",
-			limit.ChildArray, limit.ParentArray, schemaPath))
-	}
+	r.registerCompiledJSON(artifact)
 }
