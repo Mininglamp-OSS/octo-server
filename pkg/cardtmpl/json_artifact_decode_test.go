@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -109,6 +110,48 @@ func TestCompileJSONArtifactRejectsGovernanceAndDocumentDrift(t *testing.T) {
 				bundle.Schema = json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"title":{"type":"string"}}}`)
 			},
 			want: "unbounded",
+		},
+		{
+			name: "unbounded unconstrained property",
+			mutate: func(bundle *Bundle) {
+				bundle.Schema = artifactSchemaWithProperties(`{"title":{},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}}}`)
+			},
+			want: "bounded type",
+		},
+		{
+			name: "unbounded nullable string",
+			mutate: func(bundle *Bundle) {
+				bundle.Schema = artifactSchemaWithProperties(`{"title":{"type":["string","null"]},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}}}`)
+			},
+			want: "unbounded",
+		},
+		{
+			name: "unsupported manifest schema version",
+			mutate: func(bundle *Bundle) {
+				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "schemaVersion", 3)
+			},
+			want: "schemaVersion",
+		},
+		{
+			name: "template id exceeds storage",
+			mutate: func(bundle *Bundle) {
+				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "id", "a."+strings.Repeat("b", 127))
+			},
+			want: "id",
+		},
+		{
+			name: "version exceeds storage",
+			mutate: func(bundle *Bundle) {
+				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "version", "1.0.0+"+strings.Repeat("a", 59))
+			},
+			want: "version",
+		},
+		{
+			name: "contract version exceeds storage",
+			mutate: func(bundle *Bundle) {
+				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "contractVersion", "1.0.0+"+strings.Repeat("a", 59))
+			},
+			want: "contractVersion",
 		},
 		{
 			name: "invalid semver",
@@ -323,4 +366,12 @@ func mutateManifest(t *testing.T, raw json.RawMessage, mutate func(map[string]an
 		t.Fatal(err)
 	}
 	return out
+}
+
+func artifactSchemaWithProperties(properties string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(
+		`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+		properties,
+		validAggregateConstraint,
+	))
 }
