@@ -26,6 +26,11 @@ type botTemplateRef struct {
 	Version string      `json:"version"`
 }
 
+type botTemplatePolicy struct {
+	AdvertisedSend []botTemplateRef
+	EditCompatible []botTemplateRef
+}
+
 type botTemplateViewCapability struct {
 	Name          string   `json:"name"`
 	States        []string `json:"states"`
@@ -46,40 +51,65 @@ type botTemplatingCapability struct {
 }
 
 type botCardTemplateCatalog struct {
-	registry   *cardtmpl.Registry
-	allowed    map[botTemplateRef]struct{}
-	capability botTemplatingCapability
+	registry    *cardtmpl.Registry
+	sendAllowed map[botTemplateRef]struct{}
+	editAllowed map[botTemplateRef]struct{}
+	capability  botTemplatingCapability
 }
 
 func defaultBotTemplateRefs() []botTemplateRef {
 	return []botTemplateRef{{
 		ID:      aireasoningprocess.TemplateID,
-		Version: aireasoningprocess.TemplateVersion,
+		Version: aireasoningprocess.TemplateVersionV2,
 	}}
 }
 
+func defaultBotTemplatePolicy() botTemplatePolicy {
+	return botTemplatePolicy{
+		AdvertisedSend: defaultBotTemplateRefs(),
+		EditCompatible: []botTemplateRef{
+			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1},
+			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
+		},
+	}
+}
+
 func newBotCardTemplateCatalog(registry *cardtmpl.Registry, refs []botTemplateRef) (*botCardTemplateCatalog, error) {
+	return newBotCardTemplateCatalogWithPolicy(registry, botTemplatePolicy{
+		AdvertisedSend: refs,
+		EditCompatible: refs,
+	})
+}
+
+func newBotCardTemplateCatalogWithPolicy(
+	registry *cardtmpl.Registry,
+	policy botTemplatePolicy,
+) (*botCardTemplateCatalog, error) {
 	if registry == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	if len(refs) == 0 {
-		return nil, fmt.Errorf("bot template catalog: empty allowlist")
+	if len(policy.AdvertisedSend) == 0 {
+		return nil, fmt.Errorf("bot template catalog: empty advertised/send allowlist")
+	}
+	if len(policy.EditCompatible) == 0 {
+		return nil, fmt.Errorf("bot template catalog: empty edit-compatible allowlist")
 	}
 	catalog := &botCardTemplateCatalog{
-		registry: registry,
-		allowed:  make(map[botTemplateRef]struct{}, len(refs)),
+		registry:    registry,
+		sendAllowed: make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
+		editAllowed: make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
 		capability: botTemplatingCapability{
 			Supported: true,
 			Wire:      botTemplateWireV1,
-			Templates: make([]botTemplateCapability, 0, len(refs)),
+			Templates: make([]botTemplateCapability, 0, len(policy.AdvertisedSend)),
 		},
 	}
-	for _, ref := range refs {
+	for _, ref := range policy.AdvertisedSend {
 		if strings.TrimSpace(string(ref.ID)) == "" || strings.TrimSpace(ref.Version) == "" {
 			return nil, fmt.Errorf("bot template catalog: id and explicit version are required")
 		}
-		if _, duplicate := catalog.allowed[ref]; duplicate {
-			return nil, fmt.Errorf("bot template catalog: duplicate %s@%s", ref.ID, ref.Version)
+		if _, duplicate := catalog.sendAllowed[ref]; duplicate {
+			return nil, fmt.Errorf("bot template catalog: duplicate advertised/send %s@%s", ref.ID, ref.Version)
 		}
 		tmpl, err := registry.Lookup(ref.ID, ref.Version)
 		if err != nil {
@@ -138,8 +168,30 @@ func newBotCardTemplateCatalog(registry *cardtmpl.Registry, refs []botTemplateRe
 		sort.Slice(capability.Views, func(i, j int) bool {
 			return capability.Views[i].Name < capability.Views[j].Name
 		})
-		catalog.allowed[ref] = struct{}{}
+		catalog.sendAllowed[ref] = struct{}{}
 		catalog.capability.Templates = append(catalog.capability.Templates, capability)
+	}
+	for _, ref := range policy.EditCompatible {
+		if strings.TrimSpace(string(ref.ID)) == "" || strings.TrimSpace(ref.Version) == "" {
+			return nil, fmt.Errorf("bot template catalog: edit-compatible id and explicit version are required")
+		}
+		if _, duplicate := catalog.editAllowed[ref]; duplicate {
+			return nil, fmt.Errorf("bot template catalog: duplicate edit-compatible %s@%s", ref.ID, ref.Version)
+		}
+		tmpl, err := registry.Lookup(ref.ID, ref.Version)
+		if err != nil {
+			return nil, fmt.Errorf("bot template catalog: edit-compatible lookup %s@%s: %w", ref.ID, ref.Version, err)
+		}
+		meta := tmpl.Meta()
+		if meta.ID != ref.ID || meta.Version != ref.Version || len(meta.Views) == 0 {
+			return nil, fmt.Errorf("bot template catalog: incomplete edit-compatible metadata for %s@%s", ref.ID, ref.Version)
+		}
+		catalog.editAllowed[ref] = struct{}{}
+	}
+	for ref := range catalog.sendAllowed {
+		if _, editable := catalog.editAllowed[ref]; !editable {
+			return nil, fmt.Errorf("bot template catalog: advertised/send %s@%s is not edit-compatible", ref.ID, ref.Version)
+		}
 	}
 	sort.Slice(catalog.capability.Templates, func(i, j int) bool {
 		left, right := catalog.capability.Templates[i], catalog.capability.Templates[j]
@@ -178,6 +230,30 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 ) (map[string]any, error) {
+	if c == nil {
+		return nil, errBotTemplateCatalogUnavailable
+	}
+	return c.renderPayload(ctx, inbound, env, c.sendAllowed, "not Bot-callable for new send")
+}
+
+func (c *botCardTemplateCatalog) RenderEditPayload(
+	ctx context.Context,
+	inbound map[string]any,
+	env cardtmpl.BuildEnv,
+) (map[string]any, error) {
+	if c == nil {
+		return nil, errBotTemplateCatalogUnavailable
+	}
+	return c.renderPayload(ctx, inbound, env, c.editAllowed, "not edit-compatible")
+}
+
+func (c *botCardTemplateCatalog) renderPayload(
+	ctx context.Context,
+	inbound map[string]any,
+	env cardtmpl.BuildEnv,
+	allowed map[botTemplateRef]struct{},
+	denialReason string,
+) (map[string]any, error) {
 	if c == nil || c.registry == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
@@ -196,7 +272,7 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if _, hasCard := inbound["card"]; hasCard {
 		return nil, fmt.Errorf("%w: raw card and template_ref are mutually exclusive", errBotTemplateRequestInvalid)
 	}
-	ref, err := c.requireAllowedRef(inbound["template_ref"])
+	ref, err := c.requireRef(inbound["template_ref"], allowed, denialReason)
 	if err != nil {
 		return nil, err
 	}
@@ -239,10 +315,21 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	return rendered, nil
 }
 
-// requireAllowedRef is the single Bot catalog authorization boundary for a
+// requireEditableRef is the edit catalog authorization boundary for a
 // caller-supplied template_ref. Call it before any target lookup so an unlisted
 // ref cannot use edit responses as a message existence or ownership oracle.
-func (c *botCardTemplateCatalog) requireAllowedRef(value any) (botTemplateRef, error) {
+func (c *botCardTemplateCatalog) requireEditableRef(value any) (botTemplateRef, error) {
+	if c == nil {
+		return botTemplateRef{}, errBotTemplateCatalogUnavailable
+	}
+	return c.requireRef(value, c.editAllowed, "template is not edit-compatible")
+}
+
+func (c *botCardTemplateCatalog) requireRef(
+	value any,
+	allowed map[botTemplateRef]struct{},
+	denialReason string,
+) (botTemplateRef, error) {
 	if c == nil || c.registry == nil {
 		return botTemplateRef{}, errBotTemplateCatalogUnavailable
 	}
@@ -250,8 +337,8 @@ func (c *botCardTemplateCatalog) requireAllowedRef(value any) (botTemplateRef, e
 	if err != nil {
 		return botTemplateRef{}, err
 	}
-	if _, ok := c.allowed[ref]; !ok {
-		return botTemplateRef{}, fmt.Errorf("%w: template is not Bot-callable", errBotTemplateRequestInvalid)
+	if _, ok := allowed[ref]; !ok {
+		return botTemplateRef{}, fmt.Errorf("%w: %s", errBotTemplateRequestInvalid, denialReason)
 	}
 	return ref, nil
 }

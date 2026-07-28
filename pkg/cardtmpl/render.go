@@ -23,7 +23,8 @@ const (
 //
 // 流水线 (与 docs/platform-card-base.md §5 对齐):
 //  1. Lookup(id, version) 命中 Template + Meta;
-//  2. Meta.InputSchema.Validate(fields) → 失败返 ErrFieldsInvalid;
+//  2. Meta.InputSchema.Validate(fields) + optional JSON-template semantic
+//     constraints → 失败返 ErrFieldsInvalid;
 //  3. Meta.ViewFor(state) 决定 view/profile → 未注册 state 返 ErrStateUnknown;
 //  4. Template.Build(ctx, state, fields, env) 拿 BuildResult;
 //  5. BuildResult.DeepLink 可选:非空则校验为绝对 https,空则跳过(无 metadata.webUrl);
@@ -73,6 +74,12 @@ func renderCore(
 	if err := meta.InputSchema.Validate(parsed); err != nil {
 		metricBuildResult(meta.ID, meta.Version, "", "fields_invalid")
 		return nil, fmt.Errorf("%w: %v", ErrFieldsInvalid, err)
+	}
+	if validator, ok := t.(jsonTemplateFieldValidator); ok {
+		if err := validator.validateFields(parsed); err != nil {
+			metricBuildResult(meta.ID, meta.Version, "", "fields_invalid")
+			return nil, fmt.Errorf("%w: %v", ErrFieldsInvalid, err)
+		}
 	}
 
 	// step 3: state → view

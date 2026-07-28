@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -101,6 +102,68 @@ func TestRegisterJSON_C1_RejectsBadFields(t *testing.T) {
 	}
 }
 
+func TestRegisterJSONAggregateArrayLimit(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
+	reg.SetDefault("test.jsoncard", "0.1.0")
+	reg.Freeze()
+
+	tests := []struct {
+		name    string
+		groups  string
+		wantErr bool
+	}{
+		{name: "exact aggregate limit", groups: `[{"items":["a"]},{"items":["b"]}]`},
+		{name: "aggregate overflow", groups: `[{"items":["a","b"]},{"items":["c"]}]`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := json.RawMessage(`{"title":"bounded","expanded":true,"rows":[],"groups":` + tt.groups + `}`)
+			_, err := reg.Render(context.Background(), "test.jsoncard", "0.1.0", "shown", fields,
+				BuildEnv{Lang: "zh-CN", SpaceID: "s1"})
+			if tt.wantErr {
+				if !errors.Is(err, ErrFieldsInvalid) {
+					t.Fatalf("Render error = %v, want ErrFieldsInvalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Render exact aggregate limit: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegisterJSONAggregateArrayLimitMisconfigurationFailsRegistration(t *testing.T) {
+	tests := []struct {
+		name string
+		root string
+		want string
+	}{
+		{
+			name: "non-positive limit",
+			root: "testdata/test.aggregate-limit-zero@0.1.0",
+			want: "maxTotalItems",
+		},
+		{
+			name: "unknown parent array",
+			root: "testdata/test.aggregate-target-missing@0.1.0",
+			want: "parentArray",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := tryRegisterJSON(tt.root)
+			if rec == nil {
+				t.Fatal("expected register-time panic for invalid aggregate constraint")
+			}
+			if got := toStr(rec); !strings.Contains(got, tt.want) {
+				t.Fatalf("panic = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRegisterJSON_FallbackText_DerivesPlain asserts FallbackText compiles the
 // view and reduces it to plain text carrying the card's title.
 func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
@@ -118,6 +181,38 @@ func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
 	}
 	if !strings.Contains(txt, "冒烟") {
 		t.Fatalf("fallback text %q should contain the title", txt)
+	}
+}
+
+func TestRegisterJSON_FallbackTextEnforcesInputConstraints(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
+	reg.Freeze()
+	tmpl, err := reg.Lookup("test.jsoncard", "0.1.0")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		fields json.RawMessage
+	}{
+		{name: "empty", fields: nil},
+		{name: "malformed JSON", fields: json.RawMessage(`{`)},
+		{name: "schema invalid", fields: json.RawMessage(`{"title":"missing expanded"}`)},
+		{
+			name: "aggregate overflow",
+			fields: json.RawMessage(
+				`{"title":"bounded","expanded":true,"rows":[],"groups":[{"items":["a","b"]},{"items":["c"]}]}`,
+			),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tmpl.FallbackText("shown", tt.fields, "zh-CN"); !errors.Is(err, ErrFieldsInvalid) {
+				t.Fatalf("FallbackText error = %v, want ErrFieldsInvalid", err)
+			}
+		})
 	}
 }
 

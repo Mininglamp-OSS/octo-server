@@ -2,6 +2,15 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
+  "x-octo-constraints": {
+    "aggregateArrayLimits": [
+      {
+        "parentArray": "groups",
+        "childArray": "items",
+        "maxTotalItems": 2
+      }
+    ]
+  },
   "required": ["title", "expanded"],
   "properties": {
     "title": { "type": "string", "minLength": 1, "maxLength": 200 },
@@ -13,6 +22,20 @@
         "additionalProperties": false,
         "required": ["label"],
         "properties": { "label": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
       }
     }
   }
