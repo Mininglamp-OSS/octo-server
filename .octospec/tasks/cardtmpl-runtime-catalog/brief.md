@@ -17,16 +17,18 @@ source: self
 > human confirms the decisions in the final section before implementation.
 > D1–D9 were accepted on 2026-07-28 when implementation was authorized; delivery
 > remains split into PR-A/PR-B/PR-C, and the current branch starts with PR-A only.
-> PR-A implementation is tracked by Issue #669 and Draft PR #670.
+> PR-A implementation is tracked by Issue #669 and PR #670.
 
 ## Implementation status (2026-07-28)
 
-- **PR-A is implemented in PR #670 and code review is approved.** It includes the shared strict
-  compiler, canonical artifact identity, immutable version claim/artifact/audit store, startup static
-  inventory reconciliation, super-admin validate/publish APIs, localized errors, body/rate limits, and
-  bounded control-plane metrics.
+- **PR-A is implemented in PR #670.** It includes the shared strict compiler, canonical artifact
+  identity, immutable version claim/artifact/audit store, startup static inventory reconciliation,
+  super-admin validate/publish APIs, localized errors, body/rate limits, and bounded control-plane
+  metrics. Review hardening resolves local refs at every schema-bearing position, binds samples within
+  their declaring view, verifies static/runtime parity, makes static reconciliation contention-safe,
+  and distinguishes persistent catalog-integrity failures from retryable unavailability.
 - Focused unit, coverage, race, build, vet, lint, and i18n checks pass locally. `pkg/cardtmpl` coverage is
-  80.8% and `modules/card_template_catalog` coverage is 82.5%.
+  80.4% and `modules/card_template_catalog` coverage is 81.9%.
 - The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
   before assertions by a stale shared test-database migration record
   (`20191106000001_event_legacy01.sql`); Ready-state clean CI remains required before merge.

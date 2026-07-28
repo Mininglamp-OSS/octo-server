@@ -31,8 +31,8 @@ not only a convenient decoded representation:
 
 - `{}` allows strings, arrays, and objects and is therefore not bounded;
 - `type: ["string", "null"]` still requires a string bound;
-- finite `enum`/`const`, internal refs, and compositions need explicit,
-  conservative handling;
+- finite `enum`/`const`, internal refs, array items, and compositions need
+  explicit, conservative handling; refs must be resolved with cycle detection;
 - open-keyspace object constructs such as `patternProperties` need a key-count
   bound or rejection before runtime activation.
 

@@ -17,8 +17,12 @@ change-log convention (§7). Newest first.
   bounded operation/compile/DB metrics. Published artifacts remain inactive and
   are not read by production render/send/edit paths in PR-A.
 - **Fail-close hardening** — Runtime manifests now align identity lengths with
-  persistence columns, reject ambiguous SemVer/Unicode identities, conservatively
-  validate bounded schema shapes, and expose canonical manifest metadata.
+  persistence columns, reject ambiguous SemVer/Unicode identities, resolve local
+  schema refs (including array items) with cycle detection, bind samples within
+  their declaring view, and expose canonical manifest metadata.
+- **Review hardening** — Added full static/runtime canonical parity coverage,
+  contention-safe static-claim upsert plus bounded retry, and a distinct internal
+  error/metric classification for persistent catalog-integrity failures.
 - **Learning (pending)** — Artifact validation must prove both persistence
   compatibility and worst-case schema resource bounds; unknown or union schema
   forms cannot be treated as bounded by omission. See
