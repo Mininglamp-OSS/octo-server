@@ -607,7 +607,7 @@ func decodeManifest(parsed any) (manifestFile, error) {
 }
 
 func validateRuntimeManifest(mf manifestFile, limits CompileLimits) error {
-	if mf.SchemaVersion != artifactSchemaVersion {
+	if limits.RequireProtocol && mf.SchemaVersion != artifactSchemaVersion {
 		return fmt.Errorf("schemaVersion %d is unsupported; want %d", mf.SchemaVersion, artifactSchemaVersion)
 	}
 	if len(mf.ID) > maxArtifactTemplateIDLen || !artifactTemplateIDRE.MatchString(string(mf.ID)) {
