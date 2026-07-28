@@ -22,7 +22,15 @@ change-log convention (§7). Newest first.
   their declaring view, and expose canonical manifest metadata.
 - **Review hardening** — Added full static/runtime canonical parity coverage,
   contention-safe static-claim upsert plus bounded retry, and a distinct internal
-  error/metric classification for persistent catalog-integrity failures.
+  error/metric classification for persistent catalog-integrity failures. The
+  bounded-schema proof is now a context-aware, visit-budgeted single traversal;
+  publish DB work has a 10-second deadline, bounded whole-transaction retry for
+  MySQL 1205/1213, and separate low-cardinality failure outcomes.
+- **Startup recovery** — Kept exact-key reconciliation fail-closed and documented
+  the safe PR-A break-glass path in the
+  [runbook](../docs/card-template-runtime-catalog-runbook.md): roll back or
+  correct the conflicting image and assign a new built-in version; never delete,
+  rewrite, or bypass permanent claim/artifact state.
 - **Learning (pending)** — Artifact validation must prove both persistence
   compatibility and worst-case schema resource bounds; unknown or union schema
   forms cannot be treated as bounded by omission. See

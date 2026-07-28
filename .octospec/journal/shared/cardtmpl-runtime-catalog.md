@@ -23,9 +23,13 @@ source: self
   and derives a deterministic canonical SHA-256 identity.
 - Bounded-schema analysis now resolves bundle-local JSON Pointers at every
   schema-bearing position, including array `items`; boolean/empty/unbounded
-  targets and reference cycles fail closed. Sample assignment is view-local,
-  and a parity fixture compares static and runtime compilation for identity,
-  metadata, interactions, samples, and rendered output.
+  targets and reference cycles fail closed. The validator performs one
+  deterministic traversal, checks cancellation throughout, enforces a total
+  visit budget, and caches successfully validated local refs; context failures
+  remain server failures rather than being relabeled as invalid artifacts.
+  Sample assignment is view-local, and a parity fixture compares static and
+  runtime compilation for identity, metadata, interactions, samples, and
+  rendered output.
 - Kept Go-authored templates fail-closed: a Go template that declares the
   JSON-only `x-octo-constraints` extension now panics during registration instead
   of silently ignoring the constraint. Legacy static JSON fixtures retain their
@@ -49,7 +53,15 @@ source: self
   reads the dynamic artifact table in PR-A.
 - Persistent catalog-integrity violations are logged and reported as the shared
   internal error with a dedicated `integrity_error` metric result; transient or
-  unknown store failures retain the retryable unavailable response.
+  unknown store failures retain the retryable unavailable response. Publish DB
+  work has its own 10-second deadline, retries the complete transaction up to
+  three times for MySQL 1205/1213, and exposes separate bounded timeout,
+  cancellation, busy, integrity, conflict, and generic-error outcomes.
+- Kept startup reconciliation fail-closed without an ignore-conflict switch.
+  The [startup recovery runbook](../../../docs/card-template-runtime-catalog-runbook.md)
+  defines rollback/corrective-image recovery for a future built-in exact-key
+  collision and reserves direct row repair for a separately audited integrity
+  incident.
 
 ## Load-bearing decisions
 
@@ -59,6 +71,10 @@ source: self
 - MySQL is authoritative for version claims and artifacts. Static reconciliation
   happens transactionally before the module serves routes; correctness never
   relies on process-local registration order or eventual cache invalidation.
+- Permanent exact-key claims are a safety boundary, not data to rewrite during
+  rollout recovery. A conflicting built-in must move to a new version; binary
+  rollback is the PR-A break-glass action because no dynamic runtime reader is
+  enabled yet.
 - Canonical identity is server-computed from parsed content. Equivalent JSON
   formatting produces the same bundle hash and the same canonical manifest
   metadata; caller-supplied hashes are not accepted.
@@ -69,7 +85,7 @@ source: self
 ## Verification
 
 - Final focused suites passed for `pkg/cardtmpl/...` and
-  `modules/card_template_catalog`; coverage is 80.4% and 81.9% respectively.
+  `modules/card_template_catalog`; coverage is 80.4% and 81.6% respectively.
 - Final race suites passed for cardtmpl/catalog, `pkg/cardmsg`,
   `internal/carddispatch`, `internal/cardactiondispatch`, and the database-free
   Bot template catalog/policy lane.
@@ -102,6 +118,14 @@ source: self
   by verification, which can create an InnoDB S-to-X lock upgrade cycle. A no-op
   upsert plus post-write verification removes that shape; bounded retry is still
   required for transient deadlock/lock-timeout errors.
+- Schema walkers must not combine a structural pass with an unrestricted
+  catch-all pass over the same keywords. That turns ordinary nesting into
+  exponential CPU work, and a deadline checked only after the walker cannot
+  bound it. Single traversal, in-walker context checks, and a total visit budget
+  are one invariant and must be tested together.
+- A duplicate-key fallback can still deadlock under concurrent idempotent
+  publishes. Retry the whole transaction, never a statement inside the failed
+  transaction, and restrict retries to known transient MySQL codes.
 - Canonical hash equality is insufficient if metadata retains raw formatting.
   Hash input and exposed compiled metadata must derive from the same parsed,
   canonical representation so an idempotent same-hash publish cannot expose
@@ -124,9 +148,19 @@ source: self
   `octo-json-template/v1`; add formal JCS conformance vectors before claiming
   cross-system RFC 8785 reproducibility or changing the identity algorithm.
 - Before activation, acquire compile admission before repeated strict-decode and
-  canonicalization work, and give publish DB work an explicit request-scoped
-  timeout so overload, timeout, transient DB failure, and integrity failure stay
-  independently observable.
+  canonicalization work. Publish deadline, overload/context classification, and
+  transient 1205/1213 transaction retry are complete in PR-A.
+- Decide in PR-B governance work whether rejected publish conflicts need a
+  durable audit written outside the rolled-back state transaction, and whether
+  database triggers or restricted grants must enforce artifact/audit
+  immutability against direct SQL. Do not weaken the existing atomic success
+  audit while adding rejected-attempt evidence.
+- Split the compiler's owner-required policy from action-contract validation,
+  and make the JSON node budget bundle-wide if document limits are ever raised.
+  The existing byte/document caps keep the current per-document budget bounded.
+- The `blocked` publish response remains an omitted `false` in PR-A and mirrors
+  the forward-compatible persistence column; PR-B owns the first state
+  transition and must add behavior tests before clients may rely on it.
 - Activate/rollback/block, runtime overlay/cache, grants, B1/B2, Bot capability
   merge, multi-replica runtime recovery, and production go-live remain PR-B/PR-C
   and separate rollout work.

@@ -41,7 +41,18 @@ supports them. Finally, canonical hash input and exposed compiled metadata must
 come from the same parsed representation; otherwise equivalent same-hash
 artifacts can still expose formatting-dependent metadata.
 
+The proof must also be computationally bounded. A walker that handles
+`properties` structurally and then revisits it through a generic map traversal
+does exponential work as object depth increases, even when the schema is only a
+few kilobytes. A request deadline is ineffective if the walker does not inspect
+the context. Treat these as one load-bearing invariant: each structural edge is
+visited once, traversal checks cancellation, successful local-ref proofs may be
+memoized only after cycle-safe validation, and a total visit budget stops future
+schema keywords from creating unbounded work. Keep a depth-cost regression and
+a context-classification regression, not only correctness fixtures.
+
 **Candidate rule:** an untrusted artifact validator must prove both downstream
-persistence compatibility and worst-case runtime resource bounds. Test every
-schema form that can widen the accepted value space, and reject unsupported
-forms rather than interpreting them as harmless.
+persistence compatibility and worst-case runtime resource bounds, including the
+cost of the proof itself. Test every schema form that can widen the accepted
+value space, and reject unsupported forms rather than interpreting them as
+harmless.

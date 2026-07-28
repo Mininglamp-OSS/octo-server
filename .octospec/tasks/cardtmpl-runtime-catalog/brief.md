@@ -25,15 +25,22 @@ source: self
   identity, immutable version claim/artifact/audit store, startup static inventory reconciliation,
   super-admin validate/publish APIs, localized errors, body/rate limits, and bounded control-plane
   metrics. Review hardening resolves local refs at every schema-bearing position, binds samples within
-  their declaring view, verifies static/runtime parity, makes static reconciliation contention-safe,
-  and distinguishes persistent catalog-integrity failures from retryable unavailability.
+  their declaring view, verifies static/runtime parity, makes bounded-schema validation a
+  context-aware single traversal with a total visit budget, makes static reconciliation
+  contention-safe, and distinguishes persistent catalog-integrity failures from timeout,
+  cancellation, overload, and retryable database unavailability. Publish database work has an
+  independent 10-second deadline and retries whole transactions for MySQL 1205/1213 only.
 - Focused unit, coverage, race, build, vet, lint, and i18n checks pass locally. `pkg/cardtmpl` coverage is
-  80.4% and `modules/card_template_catalog` coverage is 81.9%.
+  80.4% and `modules/card_template_catalog` coverage is 81.6%.
 - The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
   before assertions by a stale shared test-database migration record
   (`20191106000001_event_legacy01.sql`); Ready-state clean CI remains required before merge.
 - PR-A artifacts are always inactive. Runtime overlay, activate/rollback/block, grants, B1/B2, and any
   production dynamic send remain PR-B/PR-C work and are not advertised as available.
+- Startup exact-key conflicts keep the required fail-close behavior. The reviewed PR-A recovery path
+  is binary rollback/correction plus a never-before-claimed built-in version; deleting or rewriting
+  immutable catalog rows and adding an ignore-conflict switch are forbidden. See the
+  [startup recovery runbook](../../../docs/card-template-runtime-catalog-runbook.md).
 
 ## Goal
 
@@ -601,6 +608,13 @@ token、完整 bundle、完整 schema/sample、卡片 data 或业务敏感文本
   `go build ./...`、`go vet` 和 `git diff --check` 通过。
 
 ## Rollout / rollback
+
+PR-A startup reconciliation recovery is defined in the
+[runtime catalog startup runbook](../../../docs/card-template-runtime-catalog-runbook.md). A future
+image that introduces a built-in exact key already claimed by a dynamic artifact must fail startup.
+Break glass by rolling back that image (or deploying a corrective image with a new version), not by
+bypassing reconciliation or mutating/deleting the permanent claim/artifact rows. Genuine persisted
+integrity damage requires a separate, snapshotted, two-person-reviewed SRE/DBA repair plan.
 
 1. PR-A 部署时 runtime activation 完全不可用；只在测试环境 validate/publish inactive bundle。
 2. PR-B 以 `OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED=false` 和
