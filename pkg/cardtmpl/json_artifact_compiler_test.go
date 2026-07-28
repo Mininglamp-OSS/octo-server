@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,100 @@ func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
 	}
 	if len(card.Body) != 1 {
 		t.Fatalf("compiled card body len = %d, want 1", len(card.Body))
+	}
+}
+
+func TestStaticRegistrationAndRuntimeCompilerHaveCanonicalParity(t *testing.T) {
+	const root = "testdata/test.runtime-parity@1.0.0"
+	bundle, err := LoadJSONBundle(jsonCardTestData, root, CatalogDescriptor{
+		Engine: JSONTemplateEngineV1, Visibility: CatalogVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("LoadJSONBundle: %v", err)
+	}
+	runtimeArtifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("runtime CompileJSONArtifact: %v", err)
+	}
+	staticArtifact, err := CompileJSONArtifact(context.Background(), bundle, staticCompileLimits())
+	if err != nil {
+		t.Fatalf("static CompileJSONArtifact: %v", err)
+	}
+	if runtimeArtifact.Hash != staticArtifact.Hash || !bytes.Equal(runtimeArtifact.Bundle, staticArtifact.Bundle) {
+		t.Fatalf("static/runtime identity drift: runtime=%s static=%s", runtimeArtifact.Hash, staticArtifact.Hash)
+	}
+
+	registry := NewRegistry()
+	registry.RegisterJSON(jsonCardTestData, root)
+	registry.Freeze()
+	staticTemplate, err := registry.Lookup("test.runtime-parity", "1.0.0")
+	if err != nil {
+		t.Fatalf("Lookup static template: %v", err)
+	}
+	staticMeta := staticTemplate.Meta()
+	runtimeMeta := runtimeArtifact.Meta.Clone()
+	staticMeta.InputSchema = nil
+	runtimeMeta.InputSchema = nil
+	if !reflect.DeepEqual(staticMeta, runtimeMeta) {
+		t.Fatalf("static/runtime metadata drift:\nstatic=%+v\nruntime=%+v", staticMeta, runtimeMeta)
+	}
+
+	fields := bundle.Samples["shown"]
+	env := BuildEnv{Lang: "en-US", SpaceID: "parity", WebLoginURL: "https://selfcheck.internal"}
+	staticPayload, err := renderCore(context.Background(), staticTemplate, staticTemplate.Meta(), "shown", fields, env)
+	if err != nil {
+		t.Fatalf("render static template: %v", err)
+	}
+	runtimePayload, err := renderCore(context.Background(), runtimeArtifact.Template, runtimeArtifact.Meta, "shown", fields, env)
+	if err != nil {
+		t.Fatalf("render runtime template: %v", err)
+	}
+	staticCanonical, err := marshalCanonicalJSON(staticPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCanonical, err := marshalCanonicalJSON(runtimePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(staticCanonical, runtimeCanonical) {
+		t.Fatalf("static/runtime render drift:\nstatic=%s\nruntime=%s", staticCanonical, runtimeCanonical)
+	}
+}
+
+func TestCompileBundleSamplesScopesStateLookupToEachView(t *testing.T) {
+	schema, err := compileJSONSchema(map[string]any{
+		"type": "object", "additionalProperties": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := manifestFile{Views: map[ViewKey]manifestView{
+		"one": {States: []State{"alpha"}, Samples: []string{"samples/beta.json"}},
+		"two": {States: []State{"gamma"}, Samples: []string{"samples/alpha.json"}},
+	}}
+	documents := map[string]json.RawMessage{
+		"alpha": json.RawMessage(`{}`),
+		"beta":  json.RawMessage(`{}`),
+	}
+	for iteration := 0; iteration < 1000; iteration++ {
+		_, assignments, err := compileBundleSamples(
+			manifest,
+			schema,
+			documents,
+			jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes},
+			DefaultCompileLimits(),
+		)
+		if err != nil {
+			t.Fatalf("compileBundleSamples iteration %d: %v", iteration, err)
+		}
+		got := make(map[string]string, len(assignments))
+		for _, assignment := range assignments {
+			got[string(assignment.view)+"/"+string(assignment.state)] = assignment.key
+		}
+		if got["one/alpha"] != "beta" || got["two/gamma"] != "alpha" {
+			t.Fatalf("iteration %d assignments = %v, want view-local samples", iteration, got)
+		}
 	}
 }
 

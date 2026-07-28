@@ -1,0 +1,11 @@
+{
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "${title}",
+      "wrap": true
+    }
+  ]
+}

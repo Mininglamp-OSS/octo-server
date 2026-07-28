@@ -254,12 +254,14 @@ func compiledArtifactFixture() *cardtmpl.CompiledArtifact {
 }
 
 type fakeCatalogStore struct {
-	publishResult PublishResult
-	publishErr    error
-	publishCalls  int
-	lastPublish   PublishRequest
-	reconciled    []cardtmpl.TemplateMeta
-	reconcileErr  error
+	publishResult  PublishResult
+	publishErr     error
+	publishCalls   int
+	lastPublish    PublishRequest
+	reconciled     []cardtmpl.TemplateMeta
+	reconcileErr   error
+	reconcileErrs  []error
+	reconcileCalls int
 }
 
 func (s *fakeCatalogStore) Publish(_ context.Context, request PublishRequest) (PublishResult, error) {
@@ -269,7 +271,13 @@ func (s *fakeCatalogStore) Publish(_ context.Context, request PublishRequest) (P
 }
 
 func (s *fakeCatalogStore) ReconcileStatic(_ context.Context, inventory []cardtmpl.TemplateMeta) error {
+	s.reconcileCalls++
 	s.reconciled = append([]cardtmpl.TemplateMeta(nil), inventory...)
+	if len(s.reconcileErrs) > 0 {
+		err := s.reconcileErrs[0]
+		s.reconcileErrs = s.reconcileErrs[1:]
+		return err
+	}
 	return s.reconcileErr
 }
 

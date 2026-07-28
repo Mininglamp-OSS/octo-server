@@ -428,6 +428,27 @@ func TestValidateBoundedInputSchemaRejectsAmbiguousPropertyShapes(t *testing.T) 
 	}
 }
 
+func TestValidateBoundedInputSchemaRejectsUnboundedLocalRefs(t *testing.T) {
+	tests := []struct {
+		name   string
+		target any
+	}{
+		{name: "true schema", target: true},
+		{name: "empty schema", target: map[string]any{}},
+		{name: "unbounded string", target: map[string]any{"type": "string"}},
+		{name: "reference cycle", target: map[string]any{"$ref": "#/$defs/value"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema := boundedRootWithProperty(map[string]any{"$ref": "#/$defs/value"})
+			schema["$defs"] = map[string]any{"value": tt.target}
+			if err := validateBoundedInputSchema(schema); err == nil {
+				t.Fatal("unbounded local reference unexpectedly accepted")
+			}
+		})
+	}
+}
+
 func boundedRootWithProperty(property any) map[string]any {
 	return map[string]any{
 		"type":                 "object",

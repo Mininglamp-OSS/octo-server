@@ -126,9 +126,12 @@ func TestStoreReconcileStaticInventoryClaimsExactVersions(t *testing.T) {
 	defer closeDB()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+	mock.ExpectExec(staticClaimUpsertPattern).
 		WithArgs("ai.reasoning-process", "0.2.0", claimSourceStatic).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, EXISTS(SELECT 1 FROM card_template_artifact")).
+		WithArgs("ai.reasoning-process", "0.2.0").
+		WillReturnRows(sqlmock.NewRows([]string{"source", "has_artifact"}).AddRow(claimSourceStatic, false))
 	mock.ExpectCommit()
 
 	err := store.ReconcileStatic(context.Background(), []cardtmpl.TemplateMeta{{
@@ -145,9 +148,9 @@ func TestStoreReconcileStaticRejectsDynamicClaim(t *testing.T) {
 	defer closeDB()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+	mock.ExpectExec(staticClaimUpsertPattern).
 		WithArgs("ai.reasoning-process", "0.2.0", claimSourceStatic).
-		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, EXISTS(SELECT 1 FROM card_template_artifact")).
 		WithArgs("ai.reasoning-process", "0.2.0").
 		WillReturnRows(sqlmock.NewRows([]string{"source", "has_artifact"}).AddRow(claimSourceDynamic, true))
@@ -167,9 +170,9 @@ func TestStoreReconcileStaticAcceptsExistingStaticClaim(t *testing.T) {
 	defer closeDB()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+	mock.ExpectExec(staticClaimUpsertPattern).
 		WithArgs("ai.reasoning-process", "0.2.0", claimSourceStatic).
-		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, EXISTS(SELECT 1 FROM card_template_artifact")).
 		WithArgs("ai.reasoning-process", "0.2.0").
 		WillReturnRows(sqlmock.NewRows([]string{"source", "has_artifact"}).AddRow(claimSourceStatic, false))
@@ -300,3 +303,5 @@ func assertMockExpectations(t *testing.T, mock sqlmock.Sqlmock) {
 		t.Fatal(err)
 	}
 }
+
+const staticClaimUpsertPattern = `INSERT INTO card_template_version_claim[\s\S]+ON DUPLICATE KEY UPDATE source = source`

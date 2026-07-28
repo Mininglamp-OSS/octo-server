@@ -114,3 +114,27 @@ func TestReconcileStaticInventoryRejectsMissingDependencies(t *testing.T) {
 		t.Fatalf("error = %v, want ErrCatalogIntegrity", err)
 	}
 }
+
+func TestReconcileStaticInventoryRetriesTransientFailure(t *testing.T) {
+	registry := cardtmpl.NewRegistry()
+	registry.Freeze()
+	store := &fakeCatalogStore{reconcileErrs: []error{errors.New("deadlock"), nil}}
+	if err := reconcileStaticInventory(context.Background(), store, registry); err != nil {
+		t.Fatalf("reconcileStaticInventory: %v", err)
+	}
+	if store.reconcileCalls != 2 {
+		t.Fatalf("reconcile calls = %d, want 2", store.reconcileCalls)
+	}
+}
+
+func TestReconcileStaticInventoryDoesNotRetryIntegrityFailure(t *testing.T) {
+	registry := cardtmpl.NewRegistry()
+	registry.Freeze()
+	store := &fakeCatalogStore{reconcileErrs: []error{ErrCatalogIntegrity}}
+	if err := reconcileStaticInventory(context.Background(), store, registry); !errors.Is(err, ErrCatalogIntegrity) {
+		t.Fatalf("reconcileStaticInventory error = %v, want ErrCatalogIntegrity", err)
+	}
+	if store.reconcileCalls != 1 {
+		t.Fatalf("reconcile calls = %d, want 1", store.reconcileCalls)
+	}
+}

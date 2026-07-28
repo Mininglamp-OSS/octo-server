@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "test.runtime-parity",
+  "name": "Runtime parity fixture",
+  "version": "1.0.0",
+  "contractVersion": "1.0.0",
+  "protocol": "octo-card@1.0",
+  "adaptiveCardVersion": "1.5",
+  "defaultLocale": "en-US",
+  "owner": "ai",
+  "dataSchema": "contract/data.schema.json",
+  "views": {
+    "main": {
+      "wireProfile": "octo/v1",
+      "states": ["shown"],
+      "template": "templates/main.template.json",
+      "samples": ["samples/shown.json"]
+    }
+  }
+}
