@@ -19,8 +19,10 @@ import (
 )
 
 type fakeGroupServiceForRename struct {
-	existMemberActive bool
-	existMemberErr    error
+	existMemberActive         bool
+	existMemberErr            error
+	existMemberActiveInternal bool
+	existMemberActiveInternalErr error
 }
 
 func (f *fakeGroupServiceForRename) GetAllGroupCount() (int64, error) { return 0, nil }
@@ -52,9 +54,7 @@ func (f *fakeGroupServiceForRename) GetMemberExternalFields(groupNo, uid string)
 }
 func (f *fakeGroupServiceForRename) GetMember(groupNo, uid string) (*group.MemberResp, error) { return nil, nil }
 func (f *fakeGroupServiceForRename) GetBlacklistMemberUIDs(groupNo string) ([]string, error) { return nil, nil }
-func (f *fakeGroupServiceForRename) GetSubscribableMemberUIDs(groupNo string) ([]string, error) {
-	return nil, nil
-}
+func (f *fakeGroupServiceForRename) GetSubscribableMemberUIDs(groupNo string) ([]string, error) { return nil, nil }
 func (f *fakeGroupServiceForRename) GetMemberUIDsOfManager(groupNo string) ([]string, error) { return nil, nil }
 func (f *fakeGroupServiceForRename) IsCreatorOrManager(groupNo, uid string) (bool, error)    { return false, nil }
 func (f *fakeGroupServiceForRename) IsRobot(uid string) (bool, error)                        { return false, nil }
@@ -67,7 +67,9 @@ func (f *fakeGroupServiceForRename) ExistMember(groupNo, uid string) (bool, erro
 func (f *fakeGroupServiceForRename) ExistMemberActive(groupNo, uid string) (bool, error) {
 	return f.existMemberActive, f.existMemberErr
 }
-func (f *fakeGroupServiceForRename) ExistMemberActiveInternal(groupNo, uid string) (bool, error) { return false, nil }
+func (f *fakeGroupServiceForRename) ExistMemberActiveInternal(groupNo, uid string) (bool, error) {
+	return f.existMemberActiveInternal, f.existMemberActiveInternalErr
+}
 func (f *fakeGroupServiceForRename) ExistMembers(groupNos []string, uid string) ([]string, error) {
 	return nil, nil
 }
@@ -114,15 +116,17 @@ type fakeThreadServiceForRename struct {
 	updateNameAsBotErr error
 	calledGroupNo      string
 	calledShortID      string
+	calledRobotID      string
 	calledName         string
 }
 
 func (f *fakeThreadServiceForRename) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	return nil
 }
-func (f *fakeThreadServiceForRename) UpdateNameAsBot(groupNo, shortID, name string) error {
+func (f *fakeThreadServiceForRename) UpdateNameAsBot(groupNo, shortID, robotID, name string) error {
 	f.calledGroupNo = groupNo
 	f.calledShortID = shortID
+	f.calledRobotID = robotID
 	f.calledName = name
 	return f.updateNameAsBotErr
 }
@@ -175,9 +179,18 @@ const (
 	trShortID = "148910429168271360"
 )
 
-func newRenameTestEngine(t *testing.T, groupSvc *fakeGroupServiceForRename, threadSvc *fakeThreadServiceForRename) *gin.Engine {
+type renameTestOpts struct {
+	botKind           string
+	existMemberActive bool
+}
+
+func newRenameTestEngine(t *testing.T, groupSvc *fakeGroupServiceForRename, threadSvc *fakeThreadServiceForRename, opts ...renameTestOpts) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	botKind := BotKindUser
+	if len(opts) > 0 && opts[0].botKind != "" {
+		botKind = opts[0].botKind
+	}
 	ba := &BotAPI{
 		Log:           log.NewTLog("BotAPI-rename-test"),
 		groupService:  groupSvc,
@@ -189,7 +202,7 @@ func newRenameTestEngine(t *testing.T, groupSvc *fakeGroupServiceForRename, thre
 		auth := c.GetHeader("Authorization")
 		if strings.HasPrefix(auth, "Bearer ") {
 			c.Set(CtxKeyRobotID, trRobotID)
-			c.Set(CtxKeyBotKind, BotKindUser)
+			c.Set(CtxKeyBotKind, botKind)
 		}
 		c.Next()
 	})
@@ -223,9 +236,9 @@ func doRenamePUT(t *testing.T, r *gin.Engine, groupNo, shortID string, body inte
 	return w
 }
 
-// Happy path: valid params, service returns nil → 200 OK
+// Happy path: valid params, internal active member, service returns nil → 200 OK
 func TestBotRenameThread_HappyPath(t *testing.T) {
-	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
@@ -233,12 +246,13 @@ func TestBotRenameThread_HappyPath(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, "happy path should return 200, body=%s", w.Body.String())
 	assert.Equal(t, trGroupNo, threadSvc.calledGroupNo)
 	assert.Equal(t, trShortID, threadSvc.calledShortID)
+	assert.Equal(t, trRobotID, threadSvc.calledRobotID)
 	assert.Equal(t, "new thread name", threadSvc.calledName)
 }
 
 // Error path: empty/missing name → 400 (bind error)
 func TestBotRenameThread_EmptyName(t *testing.T) {
-	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
@@ -247,9 +261,21 @@ func TestBotRenameThread_EmptyName(t *testing.T) {
 	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
+// Error path: whitespace-only name → treated as empty after TrimSpace, service returns error → 400
+func TestBotRenameThread_WhitespaceName(t *testing.T) {
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
+	threadSvc := &fakeThreadServiceForRename{updateNameAsBotErr: errors.New("name is required")}
+	r := newRenameTestEngine(t, groupSvc, threadSvc)
+
+	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "   "})
+	// binding:"required" passes for "   "; TrimSpace → ""; service rejects → ErrBotAPIStoreFailed
+	assert.Equal(t, http.StatusBadRequest, w.Code, "whitespace name should return 400, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIStoreFailed.DefaultMessage)
+}
+
 // Error path: invalid short_id (non-numeric) → 400
 func TestBotRenameThread_InvalidShortID(t *testing.T) {
-	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
@@ -260,7 +286,7 @@ func TestBotRenameThread_InvalidShortID(t *testing.T) {
 
 // Error path: invalid group_no (wrong length) → 400
 func TestBotRenameThread_InvalidGroupNo(t *testing.T) {
-	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
@@ -269,14 +295,47 @@ func TestBotRenameThread_InvalidGroupNo(t *testing.T) {
 	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
-// Error path: service UpdateNameAsBot returns error → 500 (ErrBotAPIStoreFailed)
+// Error path: service UpdateNameAsBot returns error → 400 (ErrBotAPIStoreFailed, D14 legacy wire code)
 func TestBotRenameThread_ServiceError(t *testing.T) {
-	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
 	threadSvc := &fakeThreadServiceForRename{updateNameAsBotErr: errors.New("db error")}
 	r := newRenameTestEngine(t, groupSvc, threadSvc)
 
 	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "new name"})
-	// ErrBotAPIStoreFailed via ResponseErrorL returns legacy 400 (D14 compatibility)
 	assert.Equal(t, http.StatusBadRequest, w.Code, "service error should return 400 (D14 legacy), body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIStoreFailed.DefaultMessage)
+}
+
+// Error path: name exceeding 100 runes → 400 (bind max=100)
+func TestBotRenameThread_NameTooLong(t *testing.T) {
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true, existMemberActiveInternal: true}
+	threadSvc := &fakeThreadServiceForRename{}
+	r := newRenameTestEngine(t, groupSvc, threadSvc)
+
+	longName := strings.Repeat("世", 101) // 101 CJK runes
+	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": longName})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "name >100 runes should return 400, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
+}
+
+// Error path: bot is not an active group member (e.g. not in group or removed) → not_group_member
+func TestBotRenameThread_NotGroupMember(t *testing.T) {
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: false}
+	threadSvc := &fakeThreadServiceForRename{}
+	r := newRenameTestEngine(t, groupSvc, threadSvc)
+
+	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "new name"})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "non-member bot should return 400, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPINotGroupMember.DefaultMessage)
+}
+
+// Error path: App Bot (DM-only) is denied all group/thread operations → app_bot_unsupported
+func TestBotRenameThread_AppBotDenied(t *testing.T) {
+	groupSvc := &fakeGroupServiceForRename{existMemberActive: true}
+	threadSvc := &fakeThreadServiceForRename{}
+	r := newRenameTestEngine(t, groupSvc, threadSvc, renameTestOpts{botKind: BotKindApp})
+
+	w := doRenamePUT(t, r, trGroupNo, trShortID, map[string]string{"name": "new name"})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "App Bot should return 400, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIAppBotUnsupported.DefaultMessage)
 }

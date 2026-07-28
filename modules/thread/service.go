@@ -39,8 +39,12 @@ type IService interface {
 	CreateThread(req *CreateThreadReq) (*ThreadResp, error)
 	// UpdateName 修改子区名称
 	UpdateName(groupNo, shortID, operatorUID, name string) error
-	// UpdateNameAsBot Bot API 专用：修改子区名称（Bot 权限已在 handler 层校验，此处不做成员/机器人权限检查）
-	UpdateNameAsBot(groupNo, shortID, name string) error
+	// UpdateNameAsBot Bot API 专用：修改子区名称。
+	// Handler 层 validateBotThreadAccess 已保证 bot 是父群活跃成员且非 App Bot；
+	// 此处额外用 ExistMemberActiveInternal 校验 is_external=0，与人类端改名保持一致，
+	// 防止跨 Space 外部成员（is_external=1）越权改名（YUJ-231 / GH#1289，P1）。
+	// IsRobot 检查有意省略——bot 身份正是该方法的调用场景。
+	UpdateNameAsBot(groupNo, shortID, robotID, name string) error
 	// GetThreads 分页获取群下的子区，同时返回总数。
 	// statuses 决定包含的 status 集合（active / archived / 二者）；nil 或空一律按 active。
 	GetThreads(groupNo string, statuses []int, pageIndex, pageSize int64) ([]*ThreadResp, int64, error)
@@ -552,9 +556,11 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 }
 
 // UpdateNameAsBot Bot API 专用：修改子区名称。
-// Bot 权限已在 handler 层通过 validateBotThreadAccess 保证（bot 是群活跃成员），
-// 此处不做成员/机器人权限检查，仅做 name 校验、子区存在性检查和缓存失效。
-func (s *Service) UpdateNameAsBot(groupNo, shortID, name string) error {
+// Bot 权限在 handler 层通过 validateBotThreadAccess 保证（bot 是父群活跃成员，非 App Bot）；
+// 此处额外校验 is_external=0（ExistMemberActiveInternal），与人类端改名保持一致，
+// 防止跨 Space 外部 bot（is_external=1）越权改名（YUJ-231 / GH#1289，P1）。
+// IsRobot 检查有意省略——bot 身份正是该方法的调用场景。
+func (s *Service) UpdateNameAsBot(groupNo, shortID, robotID, name string) error {
 	if name == "" || len([]rune(name)) > 100 {
 		return errors.New("name is required and must not exceed 100 characters")
 	}
@@ -568,6 +574,14 @@ func (s *Service) UpdateNameAsBot(groupNo, shortID, name string) error {
 	}
 	if thread.Status == ThreadStatusDeleted {
 		return errors.New("thread has been deleted")
+	}
+
+	isInternal, err := s.groupService.ExistMemberActiveInternal(thread.GroupNo, robotID)
+	if err != nil {
+		return fmt.Errorf("check active membership: %w", err)
+	}
+	if !isInternal {
+		return errors.New("no permission to update")
 	}
 
 	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {

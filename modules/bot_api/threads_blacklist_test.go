@@ -4,7 +4,7 @@ package bot_api
 // Issue #352（PR #345 mandatory follow-up）— validateBotGroupAccess 黑名单门禁。
 //
 // 所有 bot 子区端点（botCreateThread/botListThreads/botGetThread/botDeleteThread/
-// botListThreadMembers/botJoinThread/botLeaveThread/botGetThreadMd/
+// botRenameThread/botListThreadMembers/botJoinThread/botLeaveThread/botGetThreadMd/
 // botUpdateThreadMd）共享 validateBotGroupAccess。该门禁必须用 ExistMemberActive
 // （is_deleted=0 AND status=Normal）：被拉黑（status=Blacklist）的 bot 不得再通过
 // bot API 读写子区。GROUP 级端点（groups.go）保持 permissive ExistMember 不动。

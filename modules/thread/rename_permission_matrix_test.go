@@ -126,3 +126,46 @@ func TestThreadUpdateName_ExternalMember_Denied(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "原始子区名", got.Name, "外部成员被拒后子区名不变")
 }
+
+// TestThreadUpdateNameAsBot_NormalInternalBot_Allowed 覆盖 bot 改名正常路径：
+// bot 为父群内部活跃成员（is_external=0）→ 可改子区名。
+func TestThreadUpdateNameAsBot_NormalInternalBot_Allowed(t *testing.T) {
+	svc, groupNo, shortID, robotID := seedRenameThreadExternal(t, int(common.GroupMemberStatusNormal), 1, 0)
+
+	err := svc.UpdateNameAsBot(groupNo, shortID, robotID, "bot改的新名")
+	require.NoError(t, err, "内部活跃 bot 应能改子区名")
+
+	got, err := svc.GetThread(groupNo, shortID, robotID)
+	require.NoError(t, err)
+	require.Equal(t, "bot改的新名", got.Name)
+}
+
+// TestThreadUpdateNameAsBot_ExternalBot_Denied 覆盖安全边界（YUJ-231 / GH#1289）：
+// 跨 Space 外部 bot（is_external=1, robot=1）即便活跃，也禁止改子区名——
+// bot 路径必须与人类路径保持一致的 is_external=0 门禁。
+func TestThreadUpdateNameAsBot_ExternalBot_Denied(t *testing.T) {
+	svc, groupNo, shortID, robotID := seedRenameThreadExternal(t, int(common.GroupMemberStatusNormal), 1, 1)
+
+	err := svc.UpdateNameAsBot(groupNo, shortID, robotID, "外部bot改名")
+	require.Error(t, err, "外部 bot 应被拒绝改子区名")
+	require.Contains(t, err.Error(), "no permission")
+
+	got, err := svc.GetThread(groupNo, shortID, robotID)
+	require.NoError(t, err)
+	require.Equal(t, "原始子区名", got.Name, "外部 bot 被拒后子区名不变")
+}
+
+// TestThreadUpdateNameAsBot_BlacklistedBot_Denied 覆盖：
+// 被拉黑 bot（status=Blacklist）在 handler 层已被 ExistMemberActive 拦截，
+// 但若绕过 handler 直接调 service，ExistMemberActiveInternal 也应拒绝（fail-closed）。
+func TestThreadUpdateNameAsBot_BlacklistedBot_Denied(t *testing.T) {
+	svc, groupNo, shortID, robotID := seedRenameThreadExternal(t, int(common.GroupMemberStatusBlacklist), 1, 0)
+
+	err := svc.UpdateNameAsBot(groupNo, shortID, robotID, "黑名单bot改名")
+	require.Error(t, err, "被拉黑 bot 应被拒绝改子区名")
+	require.Contains(t, err.Error(), "no permission")
+
+	got, err := svc.GetThread(groupNo, shortID, robotID)
+	require.NoError(t, err)
+	require.Equal(t, "原始子区名", got.Name, "被拉黑 bot 被拒后子区名不变")
+}
