@@ -1755,7 +1755,8 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		// ∪ 同 Space 同事。读/同步路径必须与写路径同口径，否则任一侧成为短板。
 		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, spacepkg.GetSpaceID(c))
 		if err != nil {
-			m.Error("校验私聊频道权限失败（reaction sync）", zap.Error(err), zap.String("peer", req.ChannelID))
+			m.Error("校验私聊频道权限失败（reaction sync）", zap.Error(err),
+				zap.String("peer", req.ChannelID), zap.String("space_id", spacepkg.GetSpaceID(c)))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
@@ -2037,7 +2038,8 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		// 同事之间的 DM 一律 403 —— friend 表在该模式下近乎为空。
 		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, spacepkg.GetSpaceID(c))
 		if err != nil {
-			m.Error("校验私聊频道权限失败（reaction）", zap.Error(err), zap.String("peer", req.ChannelID))
+			m.Error("校验私聊频道权限失败（reaction）", zap.Error(err),
+				zap.String("peer", req.ChannelID), zap.String("space_id", spacepkg.GetSpaceID(c)))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}

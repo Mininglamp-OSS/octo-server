@@ -13,7 +13,7 @@ type personAccessDeps interface {
 
 // personChannelAccessAllowed 判定 loginUID 是否有权操作与 peerUID 的私聊(DM)频道。
 //
-// 口径与 modules/user/api_pinned.go::validateChannelAccess 逐字对齐（另见
+// 与 modules/user/api_pinned.go::validateChannelAccess 同一 predicate（另见
 // modules/messages_search/authz.go::checkP2PAccess），按序判定，满足其一即放行：
 //
 //  1. peerUID == loginUID —— 给自己的「备忘」频道，好友/bot/Space 判定都无意义；
@@ -28,6 +28,13 @@ type personAccessDeps interface {
 //
 // 只有好友口径会让企业部署下同事之间的 DM 一律 403（channel_access_denied）——
 // 这正是本函数存在的原因。
+//
+// 有意与 validateChannelAccess 不同的两处，都是收紧或等价，不要为了「对齐两处实现」
+// 把它们删掉：第 1 步的 self 短路是 validateChannelAccess 没有的，缺了它，给自己的
+// 备忘频道会一路落到 AreSpaceMembers(spaceID, u, u)，而其 COUNT(DISTINCT sm.uid)
+// … uid IN (u,u) 只会等于 1、永不等于 2（那是 api_pinned 自己的既有缺陷，
+// messages_search/authz.go:93 有这个分支所以没踩到）；spaceID 为空时直接返回、不查
+// Space，是决策 D1，见下。
 //
 // spaceID 只取请求上 SpaceMiddleware 已校验的 space_id（spacepkg.GetSpaceID）。
 // 请求没带 space_id 时不去解析调用者的默认 Space（决策 D1），判定退回好友口径 ——

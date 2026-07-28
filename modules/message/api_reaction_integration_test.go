@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -631,6 +632,12 @@ func setupSpaceDM(t *testing.T, peerInSpace bool) (*server.Server, *config.Conte
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	resetReactionUIDRateLimit(t, ctx)
+
+	// peer 落一行真实 user：让 QueryPeerRobotInfo 打到真人行（robot=0）而不是空结果，
+	// 与生产一致 —— 空行与真人行都走「非 bot」分支，但只有前者才是测试假象。
+	require.NoError(t, user.NewDB(ctx).Insert(&user.Model{
+		UID: reactionPeerUID, Name: "dm-peer", ShortNo: "2" + strconv.FormatInt(nextShortID.Add(1), 10),
+	}))
 
 	spaceID := "spcDM" + strconv.FormatInt(nextShortID.Add(1), 10)
 	seedReactionSpaceMember(t, ctx, spaceID, testutil.UID, "2020-01-01 00:00:00")
