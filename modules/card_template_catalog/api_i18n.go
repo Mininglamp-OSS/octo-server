@@ -42,3 +42,7 @@ func respondCatalogConflict(c *wkhttp.Context) {
 func respondCatalogUnavailable(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogUnavailable, nil, nil)
 }
+
+func respondCatalogIntegrityFailure(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+}

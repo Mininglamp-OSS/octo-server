@@ -190,6 +190,11 @@ func (a *API) publish(c *wkhttp.Context) {
 		case errors.Is(err, ErrPublishRequestInvalid):
 			a.metrics.observeDB("publish", "rejected")
 			respondCatalogRequestInvalid(c, err)
+		case errors.Is(err, ErrCatalogIntegrity):
+			operationResult = "integrity_error"
+			a.metrics.observeDB("publish", "integrity_error")
+			a.logError("card template catalog integrity failure", err, artifact)
+			respondCatalogIntegrityFailure(c)
 		default:
 			operationResult = "error"
 			a.metrics.observeDB("publish", "error")
