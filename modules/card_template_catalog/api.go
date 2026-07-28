@@ -21,6 +21,7 @@ import (
 const (
 	controlBodyMaxBytes = 2 << 20
 	compileTimeout      = 10 * time.Second
+	publishTimeout      = 10 * time.Second
 	reconcileTimeout    = 30 * time.Second
 	reconcileAttempts   = 3
 	reconcileRetryDelay = 250 * time.Millisecond
@@ -143,8 +144,9 @@ func (a *API) validate(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
-	artifact, ok := a.compileRequest(c, bundle)
+	artifact, compileOutcome, ok := a.compileRequest(c, bundle)
 	if !ok {
+		operationResult = compileOutcome
 		return
 	}
 	operationResult = "ok"
@@ -171,11 +173,14 @@ func (a *API) publish(c *wkhttp.Context) {
 		respondCatalogForbidden(c)
 		return
 	}
-	artifact, ok := a.compileRequest(c, bundle)
+	artifact, compileOutcome, ok := a.compileRequest(c, bundle)
 	if !ok {
+		operationResult = compileOutcome
 		return
 	}
-	result, err := a.store.Publish(c.Request.Context(), PublishRequest{
+	publishCtx, cancel := context.WithTimeout(c.Request.Context(), publishTimeout)
+	defer cancel()
+	result, err := a.store.Publish(publishCtx, PublishRequest{
 		Artifact:     artifact,
 		ActorUID:     actorUID,
 		Reason:       request.Reason,
@@ -183,6 +188,15 @@ func (a *API) publish(c *wkhttp.Context) {
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			operationResult = "timeout"
+			a.metrics.observeDB("publish", "timeout")
+			a.logError("publish card template timed out", err, artifact)
+			respondCatalogUnavailable(c)
+		case errors.Is(err, context.Canceled):
+			operationResult = "canceled"
+			a.metrics.observeDB("publish", "canceled")
+			respondCatalogUnavailable(c)
 		case errors.Is(err, ErrImmutableVersionConflict), errors.Is(err, ErrVersionClaimConflict):
 			operationResult = "conflict"
 			a.metrics.observeDB("publish", "conflict")
@@ -245,7 +259,7 @@ func readControlRequest(c *wkhttp.Context) (controlRequest, cardtmpl.Bundle, boo
 	return request, bundle, true
 }
 
-func (a *API) compileRequest(c *wkhttp.Context, bundle cardtmpl.Bundle) (*cardtmpl.CompiledArtifact, bool) {
+func (a *API) compileRequest(c *wkhttp.Context, bundle cardtmpl.Bundle) (*cardtmpl.CompiledArtifact, string, bool) {
 	started := time.Now()
 	compileResult := "error"
 	defer func() { a.metrics.observeCompile(compileResult, time.Since(started)) }()
@@ -254,17 +268,33 @@ func (a *API) compileRequest(c *wkhttp.Context, bundle cardtmpl.Bundle) (*cardtm
 	artifact, err := a.compile(ctx, bundle, cardtmpl.DefaultCompileLimits())
 	if err == nil {
 		compileResult = "ok"
-		return artifact, true
+		return artifact, "ok", true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		compileResult = "timeout"
+		a.logError("compile card template timed out", err, nil)
+		respondCatalogUnavailable(c)
+		return nil, "timeout", false
+	}
+	if errors.Is(err, context.Canceled) {
+		compileResult = "canceled"
+		respondCatalogUnavailable(c)
+		return nil, "canceled", false
+	}
+	if errors.Is(err, cardtmpl.ErrArtifactCompileBusy) {
+		compileResult = "busy"
+		respondCatalogUnavailable(c)
+		return nil, "busy", false
 	}
 	var validationErr *cardtmpl.ArtifactValidationError
 	if errors.As(err, &validationErr) {
 		compileResult = "validation_error"
 		respondCatalogRequestInvalid(c, err)
-		return nil, false
+		return nil, "rejected", false
 	}
 	a.logError("compile card template failed", err, nil)
 	respondCatalogUnavailable(c)
-	return nil, false
+	return nil, "error", false
 }
 
 func responseForArtifact(artifact *cardtmpl.CompiledArtifact, published bool, result PublishResult) controlResponse {

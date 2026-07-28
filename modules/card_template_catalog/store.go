@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/go-sql-driver/mysql"
@@ -22,6 +23,9 @@ const (
 	maxActorUIDRunes     = 128
 	maxReasonRunes       = 512
 	maxChangeTicketRunes = 128
+
+	publishAttempts   = 3
+	publishRetryDelay = 50 * time.Millisecond
 )
 
 var (
@@ -81,6 +85,24 @@ func (s *store) Publish(ctx context.Context, request PublishRequest) (PublishRes
 	if err := validatePublishRequest(request); err != nil {
 		return PublishResult{}, err
 	}
+	var lastErr error
+	for attempt := 1; attempt <= publishAttempts; attempt++ {
+		result, err := s.publishOnce(ctx, request)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isTransientPublishError(err) || attempt == publishAttempts {
+			return PublishResult{}, err
+		}
+		if err := waitForPublishRetry(ctx, publishRetryDelay*time.Duration(1<<(attempt-1))); err != nil {
+			return PublishResult{}, err
+		}
+	}
+	return PublishResult{}, lastErr
+}
+
+func (s *store) publishOnce(ctx context.Context, request PublishRequest) (PublishResult, error) {
 	artifact := request.Artifact
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -119,6 +141,25 @@ func (s *store) Publish(ctx context.Context, request PublishRequest) (PublishRes
 	return PublishResult{Created: true}, nil
 }
 
+func isTransientPublishError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1205 || mysqlErr.Number == 1213
+}
+
+func waitForPublishRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (s *store) resolveExistingPublish(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -131,7 +172,10 @@ func (s *store) resolveExistingPublish(
 	err := tx.QueryRowContext(ctx, selectPublishedClaimSQL, string(artifact.Meta.ID), artifact.Meta.Version).
 		Scan(&source, &storedHash, &blocked)
 	if err != nil {
-		return PublishResult{}, fmt.Errorf("%w: load existing claim: %v", ErrCatalogIntegrity, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return PublishResult{}, fmt.Errorf("%w: load existing claim: %w", ErrCatalogIntegrity, err)
+		}
+		return PublishResult{}, fmt.Errorf("card template catalog: load existing claim: %w", err)
 	}
 	if source != claimSourceDynamic {
 		return PublishResult{}, fmt.Errorf("%w: %s@%s is claimed by %s",
