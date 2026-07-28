@@ -21,6 +21,11 @@ source: self
   references, applies document/depth/node/concurrency budgets, compiles schemas
   and templates, renders state samples, checks interaction reports and goldens,
   and derives a deterministic canonical SHA-256 identity.
+- Golden expansion now gives strict-decoder `json.Number` values the same
+  comparison and interpolation semantics as production `float64` rendering.
+  Positive integer schema/aggregate limits accept equivalent JSON exponent
+  notation, so canonical bundles containing `1e+6` round-trip through storage
+  and recompilation without being mislabeled as unbounded.
 - Bounded-schema analysis now resolves bundle-local JSON Pointers at every
   schema-bearing position, including array `items`; boolean/empty/unbounded
   targets and reference cycles fail closed. The validator performs one
@@ -37,8 +42,10 @@ source: self
 - Added case-sensitive, immutable `card_template_version_claim`,
   `card_template_artifact`, and append-only `card_template_audit` storage.
   Publish atomically inserts claim + artifact + success audit; same-hash retry is
-  idempotent, different-hash or static-source reuse is a conflict, and audit
-  failure rolls the transaction back.
+  idempotent, while different-hash or static-source reuse commits an audit-only
+  conflict row without changing claim/artifact state. Any success or rejected
+  audit failure rolls its transaction back; an audit commit failure is surfaced
+  as unavailable instead of claiming an unaudited conflict response.
 - Reconciled the frozen built-in Registry into persistent static claims during
   startup. A dynamic/static exact-key collision or incomplete catalog state
   fails startup rather than allowing replicas to resolve different content.
@@ -49,8 +56,10 @@ source: self
   the shared UID rate limiter, and an explicit super-admin guard. Requests have
   a 2 MiB pre-decode cap, strict envelopes, bounded reason/change-ticket/actor
   fields, localized safe errors, and low-cardinality operation/compile/DB
-  metrics. Every response reports `active=false`; no production render path
-  reads the dynamic artifact table in PR-A.
+  metrics. The envelope is strictly parsed once and its validated bundle value
+  is decoded directly, avoiding the earlier full-envelope canonicalize plus
+  nested-bundle reparse. Every response reports `active=false`; no production
+  render path reads the dynamic artifact table in PR-A.
 - Persistent catalog-integrity violations are logged and reported as the shared
   internal error with a dedicated `integrity_error` metric result; transient or
   unknown store failures retain the retryable unavailable response. Publish DB
@@ -85,7 +94,7 @@ source: self
 ## Verification
 
 - Final focused suites passed for `pkg/cardtmpl/...` and
-  `modules/card_template_catalog`; coverage is 80.4% and 81.6% respectively.
+  `modules/card_template_catalog`; coverage is 80.6% and 83.0% respectively.
 - Final race suites passed for cardtmpl/catalog, `pkg/cardmsg`,
   `internal/carddispatch`, `internal/cardactiondispatch`, and the database-free
   Bot template catalog/policy lane.
@@ -130,6 +139,14 @@ source: self
   Hash input and exposed compiled metadata must derive from the same parsed,
   canonical representation so an idempotent same-hash publish cannot expose
   replica-dependent metadata.
+- Validation and production rendering must normalize numeric values at the
+  evaluator boundary: strict compilation intentionally preserves `json.Number`
+  for canonical identity, while production field decoding yields `float64`.
+  Conditions and interpolation must therefore share one value-semantic format.
+- Sample assignment with both exact-name and positional fallback is a two-phase
+  allocation problem. Reserve every exact match first, then assign only the
+  remaining samples in manifest order; a one-pass fallback can steal a later
+  state's exact sample.
 
 ## Review follow-ups / out of scope
 
@@ -147,14 +164,14 @@ source: self
 - Freeze and document the exact canonical-number representation for
   `octo-json-template/v1`; add formal JCS conformance vectors before claiming
   cross-system RFC 8785 reproducibility or changing the identity algorithm.
-- Before activation, acquire compile admission before repeated strict-decode and
-  canonicalization work. Publish deadline, overload/context classification, and
-  transient 1205/1213 transaction retry are complete in PR-A.
-- Decide in PR-B governance work whether rejected publish conflicts need a
-  durable audit written outside the rolled-back state transaction, and whether
-  database triggers or restricted grants must enforce artifact/audit
-  immutability against direct SQL. Do not weaken the existing atomic success
-  audit while adding rejected-attempt evidence.
+- Before activation or wider control-plane delegation, decide whether the
+  remaining single strict envelope parse needs separate admission ahead of the
+  compiler semaphore. The redundant nested-bundle parse, canonical sort
+  allocations, publish deadline, overload/context classification, and transient
+  1205/1213 transaction retry are complete in PR-A.
+- Decide in PR-B governance work whether database triggers or restricted grants
+  must enforce artifact/audit immutability against direct SQL. Atomic success
+  audits and audit-only immutable/source-conflict records are complete in PR-A.
 - Split the compiler's owner-required policy from action-contract validation,
   and make the JSON node budget bundle-wide if document limits are ever raised.
   The existing byte/document caps keep the current per-document budget bounded.

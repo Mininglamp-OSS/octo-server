@@ -30,8 +30,13 @@ source: self
   contention-safe, and distinguishes persistent catalog-integrity failures from timeout,
   cancellation, overload, and retryable database unavailability. Publish database work has an
   independent 10-second deadline and retries whole transactions for MySQL 1205/1213 only.
+- Final review hardening unifies strict-decoder `json.Number` behavior with production rendering,
+  preserves integer limits through canonical exponent notation and storage recompilation, reserves
+  exact sample/state matches before positional fallback, makes multi-document errors deterministic,
+  records immutable/source-conflict publish attempts in audit-only transactions, and removes one
+  redundant full-bundle decode/canonicalization pass from the control request path.
 - Focused unit, coverage, race, build, vet, lint, and i18n checks pass locally. `pkg/cardtmpl` coverage is
-  80.4% and `modules/card_template_catalog` coverage is 81.6%.
+  80.6% and `modules/card_template_catalog` coverage is 83.0%.
 - The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
   before assertions by a stale shared test-database migration record
   (`20191106000001_event_legacy01.sql`); Ready-state clean CI remains required before merge.
@@ -336,6 +341,8 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 append-only 记录：validate（可只打日志/指标）、publish、activate、rollback、grant、revoke、block。
 至少包含 actor UID、operation、template ID/version、hash、old/new revision、reason/change ticket、
 result、timestamp；不保存 token、完整 bundle 或业务 sample 内容。
+已编译完成但因 immutable hash 或 static source claim 冲突而拒绝的 publish 也必须写 audit-only
+记录；该事务不得修改 claim/artifact，audit 写入或提交失败时不得伪装成已审计的 409。
 
 ## Authorization and visibility
 

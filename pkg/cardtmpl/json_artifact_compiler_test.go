@@ -157,6 +157,103 @@ func TestCompileBundleSamplesScopesStateLookupToEachView(t *testing.T) {
 	}
 }
 
+func TestCompileBundleSamplesReservesExactMatchesBeforePositionalFallback(t *testing.T) {
+	schema, err := compileJSONSchema(map[string]any{
+		"type": "object", "additionalProperties": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := manifestFile{Views: map[ViewKey]manifestView{
+		"main": {
+			States:  []State{"foo", "bar"},
+			Samples: []string{"samples/bar.json", "samples/baz.json"},
+		},
+	}}
+	documents := map[string]json.RawMessage{
+		"bar": json.RawMessage(`{}`),
+		"baz": json.RawMessage(`{}`),
+	}
+
+	_, assignments, err := compileBundleSamples(
+		manifest,
+		schema,
+		documents,
+		jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes},
+		DefaultCompileLimits(),
+	)
+	if err != nil {
+		t.Fatalf("compileBundleSamples: %v", err)
+	}
+	got := make(map[State]string, len(assignments))
+	for _, assignment := range assignments {
+		got[assignment.state] = assignment.key
+	}
+	if got["foo"] != "baz" || got["bar"] != "bar" {
+		t.Fatalf("assignments = %v, want foo=baz and bar=bar", got)
+	}
+}
+
+func TestCompileJSONArtifactUsesProductionNumberSemanticsForGoldens(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Schema = json.RawMessage(`{
+		"$schema":"http://json-schema.org/draft-07/schema#",
+		"type":"object",
+		"additionalProperties":false,
+		"required":["count"],
+		"properties":{"count":{"type":"integer"}}
+	}`)
+	bundle.Templates["main"] = json.RawMessage(`{
+		"type":"AdaptiveCard",
+		"version":"1.5",
+		"body":[{"type":"TextBlock","text":"${if(count == 1000000, 'equal', 'different')} ${count}"}]
+	}`)
+	bundle.Samples["shown"] = json.RawMessage(`{"count":1000000}`)
+	bundle.Goldens["shown"] = json.RawMessage(`{
+		"type":"AdaptiveCard",
+		"version":"1.5",
+		"body":[{"type":"TextBlock","text":"equal 1e+06"}]
+	}`)
+
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact: %v", err)
+	}
+	built, err := artifact.Template.Build(context.Background(), "shown", bundle.Samples["shown"], BuildEnv{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	text, _ := built.Body[0].(map[string]any)["text"].(string)
+	if text != "equal 1e+06" {
+		t.Fatalf("production text = %q, want golden text", text)
+	}
+}
+
+func TestCompileJSONArtifactCanonicalBundleRecompilesIntegerLimits(t *testing.T) {
+	for _, literal := range []string{"1000000", "1e6"} {
+		t.Run(literal, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = artifactSchemaWithIntegerLimits(literal)
+
+			first, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err != nil {
+				t.Fatalf("first CompileJSONArtifact: %v", err)
+			}
+			stored, err := DecodeBundleJSON(first.Bundle)
+			if err != nil {
+				t.Fatalf("DecodeBundleJSON(canonical): %v", err)
+			}
+			second, err := CompileJSONArtifact(context.Background(), stored, DefaultCompileLimits())
+			if err != nil {
+				t.Fatalf("recompile canonical bundle: %v", err)
+			}
+			if first.Hash != second.Hash || !bytes.Equal(first.Bundle, second.Bundle) {
+				t.Fatalf("canonical round trip drift: first=%s second=%s", first.Hash, second.Hash)
+			}
+		})
+	}
+}
+
 func TestCompileJSONArtifactReturnsTypedErrorsWithoutPanicking(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -352,6 +449,25 @@ func validJSONArtifactBundle() Bundle {
 			"shown": json.RawMessage(`{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"hello","wrap":true}]}`),
 		},
 	}
+}
+
+func artifactSchemaWithIntegerLimits(literal string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{
+		"$schema":"http://json-schema.org/draft-07/schema#",
+		"type":"object",
+		"additionalProperties":false,
+		"required":["title"],
+		"properties":{
+			"title":{"type":"string","maxLength":%[1]s},
+			"groups":{"type":"array","maxItems":%[1]s,"items":{
+				"type":"object","additionalProperties":false,
+				"properties":{"items":{"type":"array","maxItems":%[1]s,"items":{"type":"string","maxLength":8}}}
+			}}
+		},
+		"x-octo-constraints":{"aggregateArrayLimits":[{
+			"parentArray":"groups","childArray":"items","maxTotalItems":%[1]s
+		}]}
+	}`, literal))
 }
 
 type goConstraintTemplate struct {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 func TestDecodeBundleJSONStrictRoundTrip(t *testing.T) {
@@ -327,6 +328,104 @@ func TestCanonicalJSONNumberRejectsUnstableRanges(t *testing.T) {
 	}
 }
 
+func TestCompileJSONArtifactReportsDeterministicInvalidDocument(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Templates = map[string]json.RawMessage{
+		"a": json.RawMessage{},
+		"b": json.RawMessage{},
+	}
+	for iteration := 0; iteration < 100; iteration++ {
+		_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+		var validationErr *ArtifactValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("iteration %d error = %v, want ArtifactValidationError", iteration, err)
+		}
+		if validationErr.Document != "templates.a" {
+			t.Fatalf("iteration %d document = %q, want templates.a", iteration, validationErr.Document)
+		}
+	}
+}
+
+func TestUTF16LessMatchesUTF16OrderingWithoutAllocations(t *testing.T) {
+	tests := []struct {
+		left  string
+		right string
+	}{
+		{left: "a", right: "b"},
+		{left: "a", right: "aa"},
+		{left: "\U0001f600", right: "\ue000"},
+		{left: "\U0001f600a", right: "\U0001f600b"},
+	}
+	for _, tt := range tests {
+		want := referenceUTF16Less(tt.left, tt.right)
+		if got := utf16Less(tt.left, tt.right); got != want {
+			t.Fatalf("utf16Less(%q, %q) = %v, want %v", tt.left, tt.right, got, want)
+		}
+	}
+
+	var result bool
+	allocations := testing.AllocsPerRun(1000, func() {
+		result = utf16Less("\U0001f600a", "\U0001f600b")
+	})
+	if !result {
+		t.Fatal("utf16Less allocation probe returned the wrong result")
+	}
+	if allocations != 0 {
+		t.Fatalf("utf16Less allocations = %v, want 0", allocations)
+	}
+}
+
+func FuzzUTF16LessMatchesUTF16Ordering(f *testing.F) {
+	f.Add("ascii", "astral \U0001f600")
+	f.Add("\ue000", "\U0001f600")
+	f.Add("same", "same")
+	f.Fuzz(func(t *testing.T, left, right string) {
+		if got, want := utf16Less(left, right), referenceUTF16Less(left, right); got != want {
+			t.Fatalf("utf16Less(%q, %q) = %v, want %v", left, right, got, want)
+		}
+	})
+}
+
+func referenceUTF16Less(left, right string) bool {
+	a := utf16.Encode([]rune(left))
+	b := utf16.Encode([]rune(right))
+	for index := 0; index < len(a) && index < len(b); index++ {
+		if a[index] != b[index] {
+			return a[index] < b[index]
+		}
+	}
+	return len(a) < len(b)
+}
+
+func TestPositiveJSONIntAcceptsEquivalentIntegerSyntax(t *testing.T) {
+	tests := []struct {
+		input   json.Number
+		want    int
+		wantErr bool
+	}{
+		{input: "1", want: 1},
+		{input: "1.0", want: 1},
+		{input: "1e6", want: 1_000_000},
+		{input: "1000000", want: 1_000_000},
+		{input: "0", wantErr: true},
+		{input: "-1", wantErr: true},
+		{input: "1.5", wantErr: true},
+		{input: "2147483648", wantErr: true},
+	}
+	for _, tt := range tests {
+		got, err := positiveJSONInt(tt.input)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("positiveJSONInt(%q) = %d, want error", tt.input, got)
+			}
+			continue
+		}
+		if err != nil || got != tt.want {
+			t.Errorf("positiveJSONInt(%q) = %d, %v; want %d", tt.input, got, err, tt.want)
+		}
+	}
+}
+
 func TestValidateBoundedInputSchemaRejectsUnboundedShapes(t *testing.T) {
 	tests := []map[string]any{
 		{"type": "array", "additionalProperties": false},
@@ -342,7 +441,7 @@ func TestValidateBoundedInputSchemaRejectsUnboundedShapes(t *testing.T) {
 		}},
 	}
 	for index, schema := range tests {
-		if err := validateBoundedInputSchema(schema); err == nil {
+		if err := validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes); err == nil {
 			t.Errorf("schema %d unexpectedly accepted", index)
 		}
 	}
@@ -398,7 +497,7 @@ func TestValidateBoundedInputSchemaAcceptsFinitePropertyShapes(t *testing.T) {
 			if tt.decorate != nil {
 				tt.decorate(schema)
 			}
-			if err := validateBoundedInputSchema(schema); err != nil {
+			if err := validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes); err != nil {
 				t.Fatalf("validateBoundedInputSchema: %v", err)
 			}
 		})
@@ -422,7 +521,7 @@ func TestValidateBoundedInputSchemaRejectsAmbiguousPropertyShapes(t *testing.T) 
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := validateBoundedInputSchema(boundedRootWithProperty(tt.property)); err == nil {
+			if err := validateBoundedInputSchemaContext(context.Background(), boundedRootWithProperty(tt.property), maxArtifactJSONNodes); err == nil {
 				t.Fatal("ambiguous property schema unexpectedly accepted")
 			}
 		})
@@ -443,7 +542,7 @@ func TestValidateBoundedInputSchemaRejectsUnboundedLocalRefs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			schema := boundedRootWithProperty(map[string]any{"$ref": "#/$defs/value"})
 			schema["$defs"] = map[string]any{"value": tt.target}
-			if err := validateBoundedInputSchema(schema); err == nil {
+			if err := validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes); err == nil {
 				t.Fatal("unbounded local reference unexpectedly accepted")
 			}
 		})
@@ -457,7 +556,7 @@ func TestValidateBoundedInputSchemaRejectsUnboundedArrayItemRef(t *testing.T) {
 		"items":    map[string]any{"$ref": "#/$defs/value"},
 	})
 	schema["$defs"] = map[string]any{"value": true}
-	if err := validateBoundedInputSchema(schema); err == nil {
+	if err := validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes); err == nil {
 		t.Fatal("array item reference to an unbounded schema unexpectedly accepted")
 	}
 }
@@ -468,7 +567,7 @@ func TestValidateBoundedInputSchemaRejectsUnboundedArrayItems(t *testing.T) {
 		"maxItems": json.Number("1"),
 		"items":    map[string]any{},
 	})
-	if err := validateBoundedInputSchema(schema); err == nil {
+	if err := validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes); err == nil {
 		t.Fatal("unbounded array item schema unexpectedly accepted")
 	}
 }
@@ -477,7 +576,7 @@ func TestValidateBoundedInputSchemaDoesNotRevisitNestedPropertiesExponentially(t
 	schema := boundedRootWithProperty(nestedBoundedObjectSchema(24))
 	done := make(chan error, 1)
 	go func() {
-		done <- validateBoundedInputSchema(schema)
+		done <- validateBoundedInputSchemaContext(context.Background(), schema, maxArtifactJSONNodes)
 	}()
 
 	select {

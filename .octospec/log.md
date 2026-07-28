@@ -26,6 +26,11 @@ change-log convention (§7). Newest first.
   bounded-schema proof is now a context-aware, visit-budgeted single traversal;
   publish DB work has a 10-second deadline, bounded whole-transaction retry for
   MySQL 1205/1213, and separate low-cardinality failure outcomes.
+- **Final review closure** — Unified golden/runtime number semantics, made
+  canonical integer limits recompile-safe, fixed mixed exact/positional sample
+  assignment, made validation-document selection deterministic, removed UTF-16
+  sort allocations and a redundant envelope/bundle decode pass, and durably
+  audited immutable/static-source publish conflicts without mutating artifacts.
 - **Startup recovery** — Kept exact-key reconciliation fail-closed and documented
   the safe PR-A break-glass path in the
   [runbook](../docs/card-template-runtime-catalog-runbook.md): roll back or

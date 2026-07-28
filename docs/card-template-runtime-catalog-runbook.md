@@ -52,6 +52,12 @@ ORDER BY id DESC
 LIMIT 50;
 ```
 
+Rejected overwrite attempts are retained with `result='immutable_conflict'`;
+attempts to reuse a static claim are retained with `result='source_conflict'`.
+These are audit-only commits: they do not change claim or artifact state. If the
+audit insert or commit fails, the API returns unavailable rather than an
+unaudited conflict response.
+
 ## Exact-key collision
 
 This is the expected recovery path when a new image introduces a built-in

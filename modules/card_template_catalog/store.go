@@ -117,6 +117,16 @@ func (s *store) publishOnce(ctx context.Context, request PublishRequest) (Publis
 		}
 		result, resolveErr := s.resolveExistingPublish(ctx, tx, request)
 		if resolveErr != nil {
+			auditResult, auditable := rejectedPublishAuditResult(resolveErr)
+			if !auditable {
+				return PublishResult{}, resolveErr
+			}
+			if err := insertPublishAudit(ctx, tx, request, auditResult); err != nil {
+				return PublishResult{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return PublishResult{}, fmt.Errorf("card template catalog: commit rejected publish audit: %w", err)
+			}
 			return PublishResult{}, resolveErr
 		}
 		if err := tx.Commit(); err != nil {
@@ -139,6 +149,17 @@ func (s *store) publishOnce(ctx context.Context, request PublishRequest) (Publis
 		return PublishResult{}, fmt.Errorf("card template catalog: commit publish: %w", err)
 	}
 	return PublishResult{Created: true}, nil
+}
+
+func rejectedPublishAuditResult(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrImmutableVersionConflict):
+		return "immutable_conflict", true
+	case errors.Is(err, ErrVersionClaimConflict):
+		return "source_conflict", true
+	default:
+		return "", false
+	}
 }
 
 func isTransientPublishError(err error) bool {

@@ -2,11 +2,11 @@ package card_template_catalog
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -115,9 +115,8 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 }
 
 type controlRequest struct {
-	Bundle       json.RawMessage `json:"bundle"`
-	Reason       string          `json:"reason,omitempty"`
-	ChangeTicket string          `json:"change_ticket,omitempty"`
+	Reason       string
+	ChangeTicket string
 }
 
 type controlResponse struct {
@@ -242,21 +241,65 @@ func readControlRequest(c *wkhttp.Context) (controlRequest, cardtmpl.Bundle, boo
 		respondCatalogRequestInvalid(c, err)
 		return controlRequest{}, cardtmpl.Bundle{}, false
 	}
-	var request controlRequest
-	if err := cardtmpl.DecodeStrictJSON(raw, &request); err != nil {
+	root, err := cardtmpl.DecodeStrictJSONObject(raw)
+	if err != nil {
 		respondCatalogRequestInvalid(c, err)
 		return controlRequest{}, cardtmpl.Bundle{}, false
 	}
-	if len(request.Bundle) == 0 || string(request.Bundle) == "null" {
-		respondCatalogRequestInvalid(c, errors.New("bundle is required"))
+	request, bundleValue, err := decodeControlRequest(root)
+	if err != nil {
+		respondCatalogRequestInvalid(c, err)
 		return controlRequest{}, cardtmpl.Bundle{}, false
 	}
-	bundle, err := cardtmpl.DecodeBundleJSON(request.Bundle)
+	bundle, err := cardtmpl.DecodeBundleValue(bundleValue)
 	if err != nil {
 		respondCatalogRequestInvalid(c, err)
 		return controlRequest{}, cardtmpl.Bundle{}, false
 	}
 	return request, bundle, true
+}
+
+func decodeControlRequest(root map[string]any) (controlRequest, any, error) {
+	allowed := map[string]struct{}{
+		"bundle":        {},
+		"reason":        {},
+		"change_ticket": {},
+	}
+	unknown := make([]string, 0)
+	for key := range root {
+		if _, ok := allowed[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return controlRequest{}, nil, fmt.Errorf("unknown request field %q", unknown[0])
+	}
+	bundle, exists := root["bundle"]
+	if !exists || bundle == nil {
+		return controlRequest{}, nil, errors.New("bundle is required")
+	}
+	reason, err := optionalControlString(root, "reason")
+	if err != nil {
+		return controlRequest{}, nil, err
+	}
+	changeTicket, err := optionalControlString(root, "change_ticket")
+	if err != nil {
+		return controlRequest{}, nil, err
+	}
+	return controlRequest{Reason: reason, ChangeTicket: changeTicket}, bundle, nil
+}
+
+func optionalControlString(root map[string]any, key string) (string, error) {
+	value, exists := root[key]
+	if !exists || value == nil {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("request field %q must be a string", key)
+	}
+	return text, nil
 }
 
 func (a *API) compileRequest(c *wkhttp.Context, bundle cardtmpl.Bundle) (*cardtmpl.CompiledArtifact, string, bool) {

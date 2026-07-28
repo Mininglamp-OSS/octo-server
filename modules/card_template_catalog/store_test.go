@@ -137,13 +137,14 @@ func TestStorePublishRetriesTransientDuplicateResolutionFailure(t *testing.T) {
 
 func TestStorePublishRejectsImmutableAndStaticConflicts(t *testing.T) {
 	tests := []struct {
-		name       string
-		source     string
-		storedHash any
-		want       error
+		name        string
+		source      string
+		storedHash  any
+		want        error
+		auditResult string
 	}{
-		{name: "different dynamic hash", source: claimSourceDynamic, storedHash: strings.Repeat("b", 64), want: ErrImmutableVersionConflict},
-		{name: "static claim", source: claimSourceStatic, storedHash: nil, want: ErrVersionClaimConflict},
+		{name: "different dynamic hash", source: claimSourceDynamic, storedHash: strings.Repeat("b", 64), want: ErrImmutableVersionConflict, auditResult: "immutable_conflict"},
+		{name: "static claim", source: claimSourceStatic, storedHash: nil, want: ErrVersionClaimConflict, auditResult: "source_conflict"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -158,7 +159,10 @@ func TestStorePublishRejectsImmutableAndStaticConflicts(t *testing.T) {
 				WithArgs("test.runtime-card", "1.0.0").
 				WillReturnRows(sqlmock.NewRows([]string{"source", "content_sha256", "blocked"}).
 					AddRow(tt.source, tt.storedHash, false))
-			mock.ExpectRollback()
+			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_audit")).
+				WithArgs("admin-1", auditOperationPublish, "test.runtime-card", "1.0.0", strings.Repeat("a", 64), tt.auditResult, "reviewed", "CHG-1").
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectCommit()
 
 			_, err := store.Publish(context.Background(), publishRequestFixture())
 			if !errors.Is(err, tt.want) {
@@ -184,6 +188,51 @@ func TestStorePublishRollsBackWhenAuditFails(t *testing.T) {
 
 	if _, err := store.Publish(context.Background(), publishRequestFixture()); err == nil || !strings.Contains(err.Error(), "audit") {
 		t.Fatalf("Publish error = %v, want audit failure", err)
+	}
+	assertMockExpectations(t, mock)
+}
+
+func TestStorePublishRejectedConflictRollsBackWhenAuditFails(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL")).
+		WillReturnRows(sqlmock.NewRows([]string{"source", "content_sha256", "blocked"}).
+			AddRow(claimSourceDynamic, strings.Repeat("b", 64), false))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_audit")).
+		WillReturnError(errors.New("audit unavailable"))
+	mock.ExpectRollback()
+
+	_, err := store.Publish(context.Background(), publishRequestFixture())
+	if err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Fatalf("Publish error = %v, want audit failure", err)
+	}
+	if errors.Is(err, ErrImmutableVersionConflict) {
+		t.Fatalf("audit failure was hidden by immutable conflict: %v", err)
+	}
+	assertMockExpectations(t, mock)
+}
+
+func TestStorePublishRejectedConflictReportsAuditCommitFailure(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_version_claim")).
+		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "duplicate"})
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT c.source, a.content_sha256, a.blocked_at IS NOT NULL")).
+		WillReturnRows(sqlmock.NewRows([]string{"source", "content_sha256", "blocked"}).
+			AddRow(claimSourceDynamic, strings.Repeat("b", 64), false))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO card_template_audit")).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("commit unavailable"))
+
+	_, err := store.Publish(context.Background(), publishRequestFixture())
+	if err == nil || !strings.Contains(err.Error(), "commit rejected publish audit") {
+		t.Fatalf("Publish error = %v, want rejected-audit commit failure", err)
 	}
 	assertMockExpectations(t, mock)
 }

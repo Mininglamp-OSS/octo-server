@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/big"
 	"net/url"
 	"path"
 	"regexp"
@@ -18,7 +19,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -140,7 +140,6 @@ type CompileLimits struct {
 	RequireBoundedSchema bool
 	RequireOwner         bool
 	RequireProtocol      bool
-	RequireStateSamples  bool
 }
 
 func DefaultCompileLimits() CompileLimits {
@@ -157,7 +156,6 @@ func DefaultCompileLimits() CompileLimits {
 		RequireBoundedSchema: true,
 		RequireOwner:         true,
 		RequireProtocol:      true,
-		RequireStateSamples:  true,
 	}
 }
 
@@ -203,6 +201,14 @@ func DecodeBundleJSON(raw []byte) (Bundle, error) {
 	if err != nil {
 		return Bundle{}, artifactValidationError("json", "bundle", err)
 	}
+	return DecodeBundleValue(parsed)
+}
+
+// DecodeBundleValue validates and decodes a bundle from an already strictly
+// parsed JSON value. Control-plane envelopes use it to avoid reparsing the
+// nested bundle after duplicate-key, Unicode, depth, and node checks have
+// already covered the complete request tree.
+func DecodeBundleValue(parsed any) (Bundle, error) {
 	root, ok := parsed.(map[string]any)
 	if !ok {
 		return Bundle{}, artifactValidationError("shape", "bundle", errors.New("root must be an object"))
@@ -224,6 +230,25 @@ func DecodeBundleJSON(raw []byte) (Bundle, error) {
 		return Bundle{}, artifactValidationError("shape", "bundle", err)
 	}
 	return bundle, nil
+}
+
+// DecodeStrictJSONObject parses one bounded request object while preserving its
+// already-validated value tree for downstream decoders. It is the single-parse
+// handoff used by the card-template control plane; callers must still reject
+// endpoint-specific unknown fields.
+func DecodeStrictJSONObject(raw []byte) (map[string]any, error) {
+	if len(raw) > maxArtifactBundleBytes {
+		return nil, artifactValidationError("limit", "request", fmt.Errorf("body exceeds %d bytes", maxArtifactBundleBytes))
+	}
+	parsed, err := decodeStrictJSON(raw, jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes})
+	if err != nil {
+		return nil, artifactValidationError("json", "request", err)
+	}
+	root, ok := parsed.(map[string]any)
+	if !ok {
+		return nil, artifactValidationError("shape", "request", errors.New("root must be an object"))
+	}
+	return root, nil
 }
 
 // DecodeStrictJSON applies the artifact request JSON rules to an enclosing
@@ -287,7 +312,9 @@ func LoadJSONBundle(assets fs.FS, root string, catalog CatalogDescriptor) (Bundl
 		Samples:   make(map[string]json.RawMessage),
 		Goldens:   make(map[string]json.RawMessage),
 	}
-	for view, spec := range mf.Views {
+	for _, viewName := range sortedMapKeys(viewKeys(mf.Views)) {
+		view := ViewKey(viewName)
+		spec := mf.Views[view]
 		if strings.TrimSpace(spec.Template) == "" {
 			return Bundle{}, artifactValidationError("manifest", "templates."+string(view), fmt.Errorf("view %q declares no template path", view))
 		}
@@ -447,7 +474,7 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err != nil {
 		return nil, err
 	}
-	parsedGoldens, err := compileBundleGoldens(bundle.Goldens, parsedSamples, budget, limits)
+	parsedGoldens, err := compileBundleGoldens(bundle.Goldens, parsedSamples, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -532,20 +559,25 @@ func validateBundleDocumentLimits(bundle Bundle, limits CompileLimits) error {
 		{name: "manifest", raw: bundle.Manifest},
 		{name: "schema", raw: bundle.Schema},
 	}
-	for prefix, docs := range map[string]map[string]json.RawMessage{
-		"templates": bundle.Templates,
-		"reports":   bundle.Reports,
-		"samples":   bundle.Samples,
-		"goldens":   bundle.Goldens,
-	} {
-		for key, raw := range docs {
+	groups := []struct {
+		prefix string
+		docs   map[string]json.RawMessage
+	}{
+		{prefix: "templates", docs: bundle.Templates},
+		{prefix: "reports", docs: bundle.Reports},
+		{prefix: "samples", docs: bundle.Samples},
+		{prefix: "goldens", docs: bundle.Goldens},
+	}
+	for _, group := range groups {
+		for _, key := range sortedMapKeys(group.docs) {
+			raw := group.docs[key]
 			if !artifactDocumentKeyRE.MatchString(key) {
-				return artifactValidationError("key", prefix, fmt.Errorf("invalid document key %q", key))
+				return artifactValidationError("key", group.prefix, fmt.Errorf("invalid document key %q", key))
 			}
 			documents = append(documents, struct {
 				name string
 				raw  json.RawMessage
-			}{name: prefix + "." + key, raw: raw})
+			}{name: group.prefix + "." + key, raw: raw})
 		}
 	}
 	total := 0
@@ -588,7 +620,8 @@ func decodeManifest(parsed any) (manifestFile, error) {
 	if !ok {
 		return manifestFile{}, errors.New("views must be an object")
 	}
-	for view, raw := range views {
+	for _, view := range sortedMapKeys(views) {
+		raw := views[view]
 		viewMap, ok := raw.(map[string]any)
 		if !ok {
 			return manifestFile{}, fmt.Errorf("view %q must be an object", view)
@@ -649,7 +682,9 @@ func validateRuntimeManifest(mf manifestFile, limits CompileLimits) error {
 		return fmt.Errorf("views exceed %d", limits.MaxViews)
 	}
 	stateCount := 0
-	for view, spec := range mf.Views {
+	for _, viewName := range sortedMapKeys(viewKeys(mf.Views)) {
+		view := ViewKey(viewName)
+		spec := mf.Views[view]
 		if !artifactDocumentKeyRE.MatchString(string(view)) {
 			return fmt.Errorf("view %q is not a safe token", view)
 		}
@@ -693,7 +728,9 @@ func compileBundleTemplates(ctx context.Context, mf manifestFile, documents map[
 		return nil, err
 	}
 	out := make(map[ViewKey]any, len(mf.Views))
-	for view, spec := range mf.Views {
+	for _, viewName := range sortedMapKeys(viewKeys(mf.Views)) {
+		view := ViewKey(viewName)
+		spec := mf.Views[view]
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -718,7 +755,9 @@ func compileBundleTemplates(ctx context.Context, mf manifestFile, documents map[
 
 func compileBundleReports(mf manifestFile, documents map[string]json.RawMessage, budget jsonBudget) (map[ViewKey]InteractionReport, map[string]any, error) {
 	expected := make(map[string]struct{})
-	for view, spec := range mf.Views {
+	for _, viewName := range sortedMapKeys(viewKeys(mf.Views)) {
+		view := ViewKey(viewName)
+		spec := mf.Views[view]
 		if spec.WireProfile == profileV2 {
 			expected[string(view)] = struct{}{}
 		}
@@ -728,7 +767,7 @@ func compileBundleReports(mf manifestFile, documents map[string]json.RawMessage,
 	}
 	interactions := make(map[ViewKey]InteractionReport, len(expected))
 	parsedReports := make(map[string]any, len(expected))
-	for key := range expected {
+	for _, key := range sortedMapKeys(expected) {
 		parsed, err := decodeArtifactDocument("reports."+key, documents[key], budget)
 		if err != nil {
 			return nil, nil, err
@@ -764,7 +803,9 @@ func compileBundleSamples(
 ) (map[string]any, []sampleAssignment, error) {
 	expected := make(map[string]struct{})
 	assignments := make([]sampleAssignment, 0)
-	for view, spec := range mf.Views {
+	for _, viewName := range sortedMapKeys(viewKeys(mf.Views)) {
+		view := ViewKey(viewName)
+		spec := mf.Views[view]
 		keys := make([]string, 0, len(spec.Samples))
 		viewSamples := make(map[string]struct{}, len(spec.Samples))
 		for _, samplePath := range spec.Samples {
@@ -784,30 +825,49 @@ func compileBundleSamples(
 			viewSamples[key] = struct{}{}
 			keys = append(keys, key)
 		}
-		if limits.RequireStateSamples && len(keys) != len(spec.States) {
+		if len(keys) != len(spec.States) {
 			return nil, nil, artifactValidationError("manifest", "samples", fmt.Errorf("view %q has %d states but %d samples; each sample must have one state assignment", view, len(spec.States), len(keys)))
 		}
+		assignedKeys := make([]string, len(spec.States))
 		used := make(map[string]struct{}, len(spec.States))
 		for index, state := range spec.States {
 			key := string(state)
 			if _, exists := viewSamples[key]; !exists {
-				if index >= len(keys) {
-					continue
-				}
-				key = keys[index]
+				continue
 			}
 			if _, duplicate := used[key]; duplicate {
 				return nil, nil, artifactValidationError("manifest", "samples."+key, errors.New("sample cannot cover multiple states in one view"))
 			}
 			used[key] = struct{}{}
-			assignments = append(assignments, sampleAssignment{view: view, state: state, key: key})
+			assignedKeys[index] = key
+		}
+		remaining := make([]string, 0, len(keys)-len(used))
+		for _, key := range keys {
+			if _, exact := used[key]; !exact {
+				remaining = append(remaining, key)
+			}
+		}
+		next := 0
+		for index := range spec.States {
+			if assignedKeys[index] != "" {
+				continue
+			}
+			if next >= len(remaining) {
+				return nil, nil, artifactValidationError("manifest", "samples", fmt.Errorf("view %q has no sample for state %q", view, spec.States[index]))
+			}
+			assignedKeys[index] = remaining[next]
+			next++
+		}
+		for index, state := range spec.States {
+			assignments = append(assignments, sampleAssignment{view: view, state: state, key: assignedKeys[index]})
 		}
 	}
 	if err := requireExactDocumentKeys("samples", documents, expected); err != nil {
 		return nil, nil, err
 	}
 	parsedSamples := make(map[string]any, len(documents))
-	for key, raw := range documents {
+	for _, key := range sortedMapKeys(documents) {
+		raw := documents[key]
 		parsed, err := decodeArtifactDocument("samples."+key, raw, budget)
 		if err != nil {
 			return nil, nil, err
@@ -824,13 +884,10 @@ func compileBundleGoldens(
 	documents map[string]json.RawMessage,
 	parsedSamples map[string]any,
 	budget jsonBudget,
-	limits CompileLimits,
 ) (map[string]any, error) {
-	if len(documents) > limits.MaxGoldens {
-		return nil, artifactValidationError("limit", "goldens", fmt.Errorf("goldens exceed %d", limits.MaxGoldens))
-	}
 	out := make(map[string]any, len(documents))
-	for key, raw := range documents {
+	for _, key := range sortedMapKeys(documents) {
+		raw := documents[key]
 		if _, ok := parsedSamples[key]; !ok {
 			return nil, artifactValidationError("unreferenced", "goldens."+key, errors.New("golden has no matching sample"))
 		}
@@ -844,12 +901,12 @@ func compileBundleGoldens(
 }
 
 func requireExactDocumentKeys(prefix string, documents map[string]json.RawMessage, expected map[string]struct{}) error {
-	for key := range expected {
+	for _, key := range sortedMapKeys(expected) {
 		if _, ok := documents[key]; !ok {
 			return artifactValidationError("missing", prefix+"."+key, errors.New("required document missing"))
 		}
 	}
-	for key := range documents {
+	for _, key := range sortedMapKeys(documents) {
 		if _, ok := expected[key]; !ok {
 			return artifactValidationError("unreferenced", prefix+"."+key, errors.New("document is not referenced by manifest"))
 		}
@@ -921,7 +978,8 @@ func checkArtifactGoldens(
 	for _, assignment := range assignments {
 		assignmentByKey[assignment.key] = assignment
 	}
-	for key, golden := range goldens {
+	for _, key := range sortedMapKeys(goldens) {
+		golden := goldens[key]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1058,11 +1116,15 @@ func positiveJSONInt(value any) (int, error) {
 	if !ok {
 		return 0, errors.New("not a number")
 	}
-	parsed, err := strconv.ParseInt(number.String(), 10, 32)
-	if err != nil || parsed <= 0 {
+	parsed, ok := new(big.Rat).SetString(number.String())
+	if !ok || parsed.Sign() <= 0 || !parsed.IsInt() || !parsed.Num().IsInt64() {
 		return 0, errors.New("not a positive integer")
 	}
-	return int(parsed), nil
+	integer := parsed.Num().Int64()
+	if integer > 1<<31-1 {
+		return 0, errors.New("positive integer exceeds int32")
+	}
+	return int(integer), nil
 }
 
 func validateAggregateTarget(schema map[string]any, limit jsonTemplateAggregateArrayLimit) error {
@@ -1112,17 +1174,14 @@ func rejectExternalSchemaRefs(value any) error {
 				return fmt.Errorf("external $ref %q is forbidden", ref)
 			}
 		}
-		for _, child := range node {
+		for _, key := range sortedMapKeys(node) {
+			child := node[key]
 			if err := rejectExternalSchemaRefs(child); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
-}
-
-func validateBoundedInputSchema(root map[string]any) error {
-	return validateBoundedInputSchemaContext(context.Background(), root, maxArtifactJSONNodes)
 }
 
 func validateBoundedInputSchemaContext(ctx context.Context, root map[string]any, maxVisits int) error {
@@ -1398,7 +1457,7 @@ func rejectUnknownKeys(object map[string]any, allowed ...string) error {
 	for _, key := range allowed {
 		set[key] = struct{}{}
 	}
-	for key := range object {
+	for _, key := range sortedMapKeys(object) {
 		if _, ok := set[key]; !ok {
 			return fmt.Errorf("unknown key %q", key)
 		}
@@ -1677,12 +1736,41 @@ func canonicalJSONNumber(number json.Number) (string, error) {
 }
 
 func utf16Less(left, right string) bool {
-	a := utf16.Encode([]rune(left))
-	b := utf16.Encode([]rune(right))
-	for index := 0; index < len(a) && index < len(b); index++ {
-		if a[index] != b[index] {
-			return a[index] < b[index]
+	a := utf16Iterator{remaining: left}
+	b := utf16Iterator{remaining: right}
+	for {
+		leftUnit, leftOK := a.next()
+		rightUnit, rightOK := b.next()
+		if !leftOK || !rightOK {
+			return !leftOK && rightOK
+		}
+		if leftUnit != rightUnit {
+			return leftUnit < rightUnit
 		}
 	}
-	return len(a) < len(b)
+}
+
+type utf16Iterator struct {
+	remaining  string
+	pending    uint16
+	hasPending bool
+}
+
+func (i *utf16Iterator) next() (uint16, bool) {
+	if i.hasPending {
+		i.hasPending = false
+		return i.pending, true
+	}
+	if i.remaining == "" {
+		return 0, false
+	}
+	r, size := utf8.DecodeRuneInString(i.remaining)
+	i.remaining = i.remaining[size:]
+	if r <= 0xffff {
+		return uint16(r), true
+	}
+	r -= 0x10000
+	i.pending = uint16(0xdc00 + (r & 0x3ff))
+	i.hasPending = true
+	return uint16(0xd800 + (r >> 10)), true
 }
