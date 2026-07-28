@@ -21,7 +21,7 @@ source: self
 
 ## Implementation status (2026-07-28)
 
-- **PR-A is implemented in Draft PR #670; CI and review are pending.** It includes the shared strict
+- **PR-A is implemented in PR #670 and code review is approved.** It includes the shared strict
   compiler, canonical artifact identity, immutable version claim/artifact/audit store, startup static
   inventory reconciliation, super-admin validate/publish APIs, localized errors, body/rate limits, and
   bounded control-plane metrics.
@@ -29,7 +29,7 @@ source: self
   80.8% and `modules/card_template_catalog` coverage is 82.5%.
 - The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
   before assertions by a stale shared test-database migration record
-  (`20191106000001_event_legacy01.sql`); clean CI remains the authoritative integration result.
+  (`20191106000001_event_legacy01.sql`); Ready-state clean CI remains required before merge.
 - PR-A artifacts are always inactive. Runtime overlay, activate/rollback/block, grants, B1/B2, and any
   production dynamic send remain PR-B/PR-C work and are not advertised as available.
 

@@ -4,6 +4,29 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-28 (cardtmpl-runtime-catalog, roadmap E3 PR-A)
+
+- **Dark publishing foundation** — Added the shared strict JSON artifact
+  compiler, deterministic canonical identity, immutable static/dynamic version
+  claims and artifacts, transactional publish audit, and startup static
+  inventory reconciliation. See
+  [journal](journal/shared/cardtmpl-runtime-catalog.md),
+  [brief](tasks/cardtmpl-runtime-catalog/brief.md), and PR #670 / Issue #669.
+- **Control plane** — Added super-admin-only, authenticated and UID-rate-limited
+  validate/publish endpoints with a 2 MiB body cap, localized safe errors, and
+  bounded operation/compile/DB metrics. Published artifacts remain inactive and
+  are not read by production render/send/edit paths in PR-A.
+- **Fail-close hardening** — Runtime manifests now align identity lengths with
+  persistence columns, reject ambiguous SemVer/Unicode identities, conservatively
+  validate bounded schema shapes, and expose canonical manifest metadata.
+- **Learning (pending)** — Artifact validation must prove both persistence
+  compatibility and worst-case schema resource bounds; unknown or union schema
+  forms cannot be treated as bounded by omission. See
+  [learning](learnings/pending/cardtmpl-runtime-catalog.md).
+- **Boundary** — activation/rollback/block/runtime overlay remain PR-B; grants,
+  B1/B2, and Bot capability merge remain PR-C. Object keyspace bounds and strict
+  untrusted render-field decoding must close before dynamic activation.
+
 ## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
 
 - **Protocol** — Added the explicit Bot Registry template catalog to
