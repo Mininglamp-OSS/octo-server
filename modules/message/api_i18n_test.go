@@ -27,6 +27,7 @@ func TestMessageNoLegacyResponseError(t *testing.T) {
 		"api_message_get.go", "api_reminders.go", "api_channel_files.go", "api_sidebar.go",
 		"api_card_action.go",
 		"api_card_revisions.go",
+		"api_person_access.go",
 	}
 	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", "c.Response(\""}
 	for _, f := range files {

@@ -1751,17 +1751,17 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		if req.ChannelID != loginUID {
-			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
-			if err != nil {
-				m.Error("查询好友关系错误", zap.Error(err))
-				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-				return
-			}
-			if !isFriend {
-				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
-				return
-			}
+		// 与写路径（addOrCancelReaction）共用同一个 DM 门：好友 ∪ 本人创建的 bot
+		// ∪ 同 Space 同事。读/同步路径必须与写路径同口径，否则任一侧成为短板。
+		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, spacepkg.GetSpaceID(c))
+		if err != nil {
+			m.Error("校验私聊频道权限失败（reaction sync）", zap.Error(err), zap.String("peer", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !allowed {
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
+			return
 		}
 	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 		parentGroupNo, shortID, perr := thread.ParseChannelID(req.ChannelID)
@@ -2032,17 +2032,18 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, loginUID)
-		if req.ChannelID != loginUID {
-			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
-			if err != nil {
-				m.Error("查询好友关系错误", zap.Error(err))
-				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-				return
-			}
-			if !isFriend {
-				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
-				return
-			}
+		// DM 鉴权：好友 ∪ 本人创建的 bot ∪ 同 Space 同事（详见
+		// personChannelAccessAllowed）。只查 friend 表会让企业通讯录部署下
+		// 同事之间的 DM 一律 403 —— friend 表在该模式下近乎为空。
+		allowed, err := personChannelAccessAllowed(m.userService, loginUID, req.ChannelID, spacepkg.GetSpaceID(c))
+		if err != nil {
+			m.Error("校验私聊频道权限失败（reaction）", zap.Error(err), zap.String("peer", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !allowed {
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
+			return
 		}
 	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 		parentGroupNo, shortID, perr := thread.ParseChannelID(req.ChannelID)

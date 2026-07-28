@@ -1,0 +1,15 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: load-bearing; brief touches space/isolation/auth/acl and the change is a DM access gate
+  - id: error-handling
+    source: repo
+    why: load-bearing; paths modules/**/*.go + brief touches error-response (denials keep httperr.ResponseErrorL + registered errcode)
+  - id: rate-limit
+    source: repo
+    why: paths modules/**/*.go; no change (routes already mount uidLimit) — its testing note applies to the integration cases
+  - id: testing
+    source: repo
+    why: paths **/*_test.go; unit + integration coverage proportional to an auth-gate change
+brief: .octospec/tasks/dm-reaction-space-access/brief.md
+notes: .octospec/_global/ is not synced in this checkout, so only repo-tier rules were resolvable.

@@ -346,6 +346,17 @@ func seedReactionSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid, cr
 	_ = ctx.GetRedisConn().Del("space:member:" + spaceID + ":" + uid)
 }
 
+// seedReactionSpaceMemberRow 只加成员行（Space 已由 seedReactionSpaceMember 建好），
+// 用于让两个 uid 同属一个 Space。
+func seedReactionSpaceMemberRow(t *testing.T, ctx *config.Context, spaceID, uid, createdAt string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `space_member` (space_id, uid, role, status, created_at, updated_at) VALUES (?,?,0,1,?,?)",
+		spaceID, uid, createdAt, createdAt).Exec()
+	require.NoError(t, err)
+	_ = ctx.GetRedisConn().Del("space:member:" + spaceID + ":" + uid)
+}
+
 // insertPersonMessageWithSpace 在 DM 物理频道(fakeChannelID)插入一条带 space_id 的纯文本消息。
 func insertPersonMessageWithSpace(t *testing.T, ctx *config.Context, fakeChannelID string, mid int64, spaceID string) {
 	t.Helper()
@@ -608,4 +619,81 @@ func TestReactionRejectsRevokedMessageWrite(t *testing.T) {
 
 	assert.NotEqual(t, http.StatusOK, w.Code, "revoked messages must not accept reactions")
 	assert.Equal(t, 0, countReactionRows(t, ctx, mid), "revoked-message reaction must not be persisted")
+}
+
+// ---------- 企业通讯录（Space）部署：同事之间的 DM reaction ----------
+
+// setupSpaceDM 建一个 Space（testutil.UID 是成员），按需把 peer 也加进来，并在 DM
+// 物理频道里放一条归属该 Space 的纯文本消息。**不建 friend 行** —— 企业通讯录部署下
+// friend 表近乎为空，这正是线上 403 的现场。
+func setupSpaceDM(t *testing.T, peerInSpace bool) (*server.Server, *config.Context, int64, string) {
+	t.Helper()
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	resetReactionUIDRateLimit(t, ctx)
+
+	spaceID := "spcDM" + strconv.FormatInt(nextShortID.Add(1), 10)
+	seedReactionSpaceMember(t, ctx, spaceID, testutil.UID, "2020-01-01 00:00:00")
+	if peerInSpace {
+		seedReactionSpaceMemberRow(t, ctx, spaceID, reactionPeerUID, "2020-01-02 00:00:00")
+	}
+
+	const mid int64 = 930001
+	insertPersonMessageWithSpace(t, ctx, common.GetFakeChannelIDWith(testutil.UID, reactionPeerUID), mid, spaceID)
+	return s, ctx, mid, spaceID
+}
+
+// 线上回归：同 Space 同事（非好友）必须能对 DM 消息点回应，读侧同口径。
+// 修复前两个端点都只查 friend 表，这里必然 403 channel_access_denied。
+func TestReactionAllowsSameSpaceDMWithoutFriendship(t *testing.T) {
+	s, ctx, mid, spaceID := setupSpaceDM(t, true)
+
+	w := postReactionWithSpace(t, s, "/v1/reactions", spaceID, map[string]interface{}{
+		"message_id":   strconv.FormatInt(mid, 10),
+		"channel_id":   reactionPeerUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"emoji":        "[尚方宝剑]",
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, 1, countReactionRows(t, ctx, mid), "same-Space DM reaction must persist")
+
+	w = postReactionWithSpace(t, s, "/v1/reaction/sync", spaceID, map[string]interface{}{
+		"channel_id":   reactionPeerUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"seq":          0,
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var got []reactionResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got), w.Body.String())
+	found := false
+	for _, r := range got {
+		if r.MessageID == strconv.FormatInt(mid, 10) {
+			found = true
+		}
+	}
+	assert.True(t, found, "same-Space DM reaction must be visible to sync")
+}
+
+// 既非好友也非同 Space 同事 → 读写都拒，且不落库（放宽好友口径不等于不设门）。
+// 断言 4xx 而非 !=200：若鉴权因 DB 抖动 500，NotEqual(200) 会静默通过。
+func TestReactionRejectsDMWithoutFriendshipOrSpace(t *testing.T) {
+	s, ctx, mid, spaceID := setupSpaceDM(t, false)
+
+	w := postReactionWithSpace(t, s, "/v1/reactions", spaceID, map[string]interface{}{
+		"message_id":   strconv.FormatInt(mid, 10),
+		"channel_id":   reactionPeerUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"emoji":        "👍",
+	})
+	assert.GreaterOrEqual(t, w.Code, 400, "陌生人 DM reaction 必须被拒绝: %d %s", w.Code, w.Body.String())
+	assert.Less(t, w.Code, 500, "拒绝不能是 5xx（否则可能是 DB 错误伪通过）: %d %s", w.Code, w.Body.String())
+	assert.Equal(t, 0, countReactionRows(t, ctx, mid), "rejected DM reaction must not persist")
+
+	w = postReactionWithSpace(t, s, "/v1/reaction/sync", spaceID, map[string]interface{}{
+		"channel_id":   reactionPeerUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"seq":          0,
+	})
+	assert.GreaterOrEqual(t, w.Code, 400, "陌生人 DM reaction sync 必须被拒绝: %d %s", w.Code, w.Body.String())
+	assert.Less(t, w.Code, 500, "拒绝不能是 5xx: %d %s", w.Code, w.Body.String())
 }
