@@ -422,7 +422,10 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 		return nil, artifactValidationError("constraint", "schema", err)
 	}
 	if limits.RequireBoundedSchema {
-		if err := validateBoundedInputSchema(schemaMap); err != nil {
+		if err := validateBoundedInputSchemaContext(ctx, schemaMap, limits.MaxJSONNodes); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, artifactValidationError("bounds", "schema", err)
 		}
 	}
@@ -1119,6 +1122,13 @@ func rejectExternalSchemaRefs(value any) error {
 }
 
 func validateBoundedInputSchema(root map[string]any) error {
+	return validateBoundedInputSchemaContext(context.Background(), root, maxArtifactJSONNodes)
+}
+
+func validateBoundedInputSchemaContext(ctx context.Context, root map[string]any, maxVisits int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if root["type"] != "object" {
 		return errors.New("root schema type must be object")
 	}
@@ -1126,18 +1136,39 @@ func validateBoundedInputSchema(root map[string]any) error {
 		return errors.New("root schema additionalProperties must be false")
 	}
 	validator := boundedSchemaValidator{
-		root:      root,
-		resolving: make(map[string]struct{}),
+		ctx:           ctx,
+		root:          root,
+		resolving:     make(map[string]struct{}),
+		validatedRefs: make(map[string]struct{}),
+		maxVisits:     maxVisits,
 	}
 	return validator.validateNode(root, "$")
 }
 
 type boundedSchemaValidator struct {
-	root      map[string]any
-	resolving map[string]struct{}
+	ctx           context.Context
+	root          map[string]any
+	resolving     map[string]struct{}
+	validatedRefs map[string]struct{}
+	maxVisits     int
+	visits        int
+}
+
+func (v *boundedSchemaValidator) enter() error {
+	if err := v.ctx.Err(); err != nil {
+		return err
+	}
+	v.visits++
+	if v.maxVisits > 0 && v.visits > v.maxVisits {
+		return fmt.Errorf("schema validation exceeds %d visits", v.maxVisits)
+	}
+	return nil
 }
 
 func (v *boundedSchemaValidator) validateNode(value any, location string) error {
+	if err := v.enter(); err != nil {
+		return err
+	}
 	switch node := value.(type) {
 	case []any:
 		for index, child := range node {
@@ -1184,16 +1215,18 @@ func (v *boundedSchemaValidator) validateNode(value any, location string) error 
 			}
 		}
 		if properties, ok := node["properties"].(map[string]any); ok {
-			for name, property := range properties {
+			for _, name := range sortedMapKeys(properties) {
+				property := properties[name]
 				if err := v.validatePropertySchema(property, location+".properties."+name); err != nil {
 					return err
 				}
 			}
 		}
-		for key, child := range node {
-			if key == "examples" || key == "default" || key == "enum" || key == "const" {
+		for _, key := range sortedMapKeys(node) {
+			if key == "properties" || key == "items" || key == "examples" || key == "default" || key == "enum" || key == "const" {
 				continue
 			}
+			child := node[key]
 			if err := v.validateNode(child, location+"."+key); err != nil {
 				return err
 			}
@@ -1232,6 +1265,9 @@ func schemaTypeNames(raw any, location string) ([]string, error) {
 }
 
 func (v *boundedSchemaValidator) validatePropertySchema(value any, location string) error {
+	if err := v.enter(); err != nil {
+		return err
+	}
 	if allowed, ok := value.(bool); ok {
 		if !allowed {
 			return nil
@@ -1281,13 +1317,20 @@ func (v *boundedSchemaValidator) validateReference(ref, location string) error {
 	if _, cycle := v.resolving[ref]; cycle {
 		return fmt.Errorf("%s local $ref %q is cyclic", location, ref)
 	}
+	if _, validated := v.validatedRefs[ref]; validated {
+		return nil
+	}
 	target, err := resolveLocalSchemaRef(v.root, ref)
 	if err != nil {
 		return fmt.Errorf("%s local $ref %q: %w", location, ref, err)
 	}
 	v.resolving[ref] = struct{}{}
 	defer delete(v.resolving, ref)
-	return v.validatePropertySchema(target, location+".$ref")
+	if err := v.validatePropertySchema(target, location+".$ref"); err != nil {
+		return err
+	}
+	v.validatedRefs[ref] = struct{}{}
+	return nil
 }
 
 func resolveLocalSchemaRef(root map[string]any, ref string) (any, error) {
