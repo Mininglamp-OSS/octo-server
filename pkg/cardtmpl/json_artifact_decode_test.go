@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDecodeBundleJSONStrictRoundTrip(t *testing.T) {
@@ -470,6 +471,67 @@ func TestValidateBoundedInputSchemaRejectsUnboundedArrayItems(t *testing.T) {
 	if err := validateBoundedInputSchema(schema); err == nil {
 		t.Fatal("unbounded array item schema unexpectedly accepted")
 	}
+}
+
+func TestValidateBoundedInputSchemaDoesNotRevisitNestedPropertiesExponentially(t *testing.T) {
+	schema := boundedRootWithProperty(nestedBoundedObjectSchema(24))
+	done := make(chan error, 1)
+	go func() {
+		done <- validateBoundedInputSchema(schema)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("validateBoundedInputSchema: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded schema validation exceeded 1s; traversal must stay linear in nesting depth")
+	}
+}
+
+func TestCompileJSONArtifactHonorsContextDuringBoundsValidation(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Schema = json.RawMessage(`{
+		"type":"object",
+		"additionalProperties":false,
+		"properties":{"title":{"type":"string"}}
+	}`)
+	ctx := &errorAfterFirstCheckContext{Context: context.Background()}
+
+	_, err := CompileJSONArtifact(ctx, bundle, DefaultCompileLimits())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CompileJSONArtifact error = %v, want context deadline", err)
+	}
+	var validationErr *ArtifactValidationError
+	if errors.As(err, &validationErr) {
+		t.Fatalf("context deadline was misclassified as validation error: %v", err)
+	}
+}
+
+type errorAfterFirstCheckContext struct {
+	context.Context
+	checks int
+}
+
+func (c *errorAfterFirstCheckContext) Err() error {
+	c.checks++
+	if c.checks == 1 {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+func nestedBoundedObjectSchema(depth int) map[string]any {
+	var property any = map[string]any{"type": "string", "maxLength": json.Number("8")}
+	for index := 0; index < depth; index++ {
+		property = map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties":           map[string]any{"next": property},
+		}
+	}
+	return property.(map[string]any)
 }
 
 func boundedRootWithProperty(property any) map[string]any {
