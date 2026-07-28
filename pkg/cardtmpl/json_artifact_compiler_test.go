@@ -28,6 +28,11 @@ func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
 
 	// Formatting and map insertion order are not part of the immutable identity.
 	secondBundle := validJSONArtifactBundle()
+	var compactManifest bytes.Buffer
+	if err := json.Compact(&compactManifest, secondBundle.Manifest); err != nil {
+		t.Fatalf("compact manifest fixture: %v", err)
+	}
+	secondBundle.Manifest = append(json.RawMessage(nil), compactManifest.Bytes()...)
 	var formattedSchema bytes.Buffer
 	if err := json.Indent(&formattedSchema, secondBundle.Schema, "", "  "); err != nil {
 		t.Fatalf("format schema fixture: %v", err)
@@ -42,6 +47,9 @@ func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
 	}
 	if first.Hash != second.Hash || string(first.Bundle) != string(second.Bundle) {
 		t.Fatalf("canonical artifact drifted: first=%s second=%s", first.Hash, second.Hash)
+	}
+	if !bytes.Equal(first.Meta.Manifest, second.Meta.Manifest) {
+		t.Fatal("canonical artifact produced formatting-dependent manifest metadata")
 	}
 
 	fields := json.RawMessage(`{"title":"hello","groups":[{"items":["a"]}]}`)
