@@ -17,7 +17,21 @@ source: self
 > human confirms the decisions in the final section before implementation.
 > D1–D9 were accepted on 2026-07-28 when implementation was authorized; delivery
 > remains split into PR-A/PR-B/PR-C, and the current branch starts with PR-A only.
-> PR-A implementation is tracked by Issue #669.
+> PR-A implementation is tracked by Issue #669 and Draft PR #670.
+
+## Implementation status (2026-07-28)
+
+- **PR-A is implemented in Draft PR #670; CI and review are pending.** It includes the shared strict
+  compiler, canonical artifact identity, immutable version claim/artifact/audit store, startup static
+  inventory reconciliation, super-admin validate/publish APIs, localized errors, body/rate limits, and
+  bounded control-plane metrics.
+- Focused unit, coverage, race, build, vet, lint, and i18n checks pass locally. `pkg/cardtmpl` coverage is
+  80.8% and `modules/card_template_catalog` coverage is 82.5%.
+- The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
+  before assertions by a stale shared test-database migration record
+  (`20191106000001_event_legacy01.sql`); clean CI remains the authoritative integration result.
+- PR-A artifacts are always inactive. Runtime overlay, activate/rollback/block, grants, B1/B2, and any
+  production dynamic send remain PR-B/PR-C work and are not advertised as available.
 
 ## Goal
 
