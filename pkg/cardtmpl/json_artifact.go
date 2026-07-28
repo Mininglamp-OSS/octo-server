@@ -39,6 +39,10 @@ const (
 	maxArtifactGoldens       = 64
 	maxArtifactJSONDepth     = 64
 	maxArtifactJSONNodes     = 50_000
+	artifactSchemaVersion    = 2
+	maxArtifactTemplateIDLen = 128
+	maxArtifactVersionLen    = 64
+	maxArtifactContractLen   = 64
 )
 
 var (
@@ -603,11 +607,17 @@ func decodeManifest(parsed any) (manifestFile, error) {
 }
 
 func validateRuntimeManifest(mf manifestFile, limits CompileLimits) error {
-	if !artifactTemplateIDRE.MatchString(string(mf.ID)) {
+	if mf.SchemaVersion != artifactSchemaVersion {
+		return fmt.Errorf("schemaVersion %d is unsupported; want %d", mf.SchemaVersion, artifactSchemaVersion)
+	}
+	if len(mf.ID) > maxArtifactTemplateIDLen || !artifactTemplateIDRE.MatchString(string(mf.ID)) {
 		return fmt.Errorf("id %q is not canonical", mf.ID)
 	}
-	if !artifactVersionRE.MatchString(mf.Version) {
+	if len(mf.Version) > maxArtifactVersionLen || !artifactVersionRE.MatchString(mf.Version) {
 		return fmt.Errorf("version %q is not canonical semver", mf.Version)
+	}
+	if mf.ContractVersion != "" && (len(mf.ContractVersion) > maxArtifactContractLen || !artifactVersionRE.MatchString(mf.ContractVersion)) {
+		return fmt.Errorf("contractVersion %q is not canonical semver", mf.ContractVersion)
 	}
 	if limits.RequireOwner && strings.TrimSpace(mf.Owner) == "" {
 		return errors.New("owner is required")
@@ -1121,24 +1131,36 @@ func validateBoundedSchemaNode(value any, location string) error {
 		}
 		return nil
 	case map[string]any:
-		kind, _ := node["type"].(string)
-		switch kind {
-		case "string":
-			_, hasConst := node["const"]
-			enum, hasEnum := node["enum"].([]any)
-			if _, err := positiveJSONInt(node["maxLength"]); err != nil && !hasConst && (!hasEnum || len(enum) == 0) {
-				return fmt.Errorf("%s string is unbounded", location)
+		kinds, err := schemaTypeNames(node["type"], location)
+		if err != nil {
+			return err
+		}
+		for _, kind := range kinds {
+			switch kind {
+			case "string":
+				_, hasConst := node["const"]
+				enum, hasEnum := node["enum"].([]any)
+				if _, err := positiveJSONInt(node["maxLength"]); err != nil && !hasConst && (!hasEnum || len(enum) == 0) {
+					return fmt.Errorf("%s string is unbounded", location)
+				}
+			case "array":
+				if _, err := positiveJSONInt(node["maxItems"]); err != nil {
+					return fmt.Errorf("%s array is unbounded", location)
+				}
+				if _, ok := node["items"].(map[string]any); !ok {
+					return fmt.Errorf("%s array items schema missing", location)
+				}
+			case "object":
+				if additional, ok := node["additionalProperties"].(bool); !ok || additional {
+					return fmt.Errorf("%s object additionalProperties must be false", location)
+				}
 			}
-		case "array":
-			if _, err := positiveJSONInt(node["maxItems"]); err != nil {
-				return fmt.Errorf("%s array is unbounded", location)
-			}
-			if _, ok := node["items"].(map[string]any); !ok {
-				return fmt.Errorf("%s array items schema missing", location)
-			}
-		case "object":
-			if additional, ok := node["additionalProperties"].(bool); !ok || additional {
-				return fmt.Errorf("%s object additionalProperties must be false", location)
+		}
+		if properties, ok := node["properties"].(map[string]any); ok {
+			for name, property := range properties {
+				if err := validateBoundedPropertySchema(property, location+".properties."+name); err != nil {
+					return err
+				}
 			}
 		}
 		for key, child := range node {
@@ -1151,6 +1173,78 @@ func validateBoundedSchemaNode(value any, location string) error {
 		}
 	}
 	return nil
+}
+
+func schemaTypeNames(raw any, location string) ([]string, error) {
+	switch value := raw.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return []string{value}, nil
+	case []any:
+		if len(value) == 0 {
+			return nil, fmt.Errorf("%s type list is empty", location)
+		}
+		out := make([]string, 0, len(value))
+		seen := make(map[string]struct{}, len(value))
+		for _, item := range value {
+			kind, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s type list contains a non-string value", location)
+			}
+			if _, duplicate := seen[kind]; duplicate {
+				return nil, fmt.Errorf("%s type list contains duplicate %q", location, kind)
+			}
+			seen[kind] = struct{}{}
+			out = append(out, kind)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%s type must be a string or string array", location)
+	}
+}
+
+func validateBoundedPropertySchema(value any, location string) error {
+	if allowed, ok := value.(bool); ok {
+		if !allowed {
+			return nil
+		}
+		return fmt.Errorf("%s must declare a bounded type", location)
+	}
+	node, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a schema object", location)
+	}
+	if _, hasType := node["type"]; hasType {
+		return nil
+	}
+	if _, hasConst := node["const"]; hasConst {
+		return nil
+	}
+	if enum, hasEnum := node["enum"].([]any); hasEnum && len(enum) > 0 {
+		return nil
+	}
+	if ref, hasRef := node["$ref"].(string); hasRef && strings.HasPrefix(ref, "#") {
+		return nil
+	}
+	for _, keyword := range []string{"anyOf", "oneOf"} {
+		if alternatives, exists := node[keyword].([]any); exists && len(alternatives) > 0 {
+			for index, alternative := range alternatives {
+				if err := validateBoundedPropertySchema(alternative, fmt.Sprintf("%s.%s[%d]", location, keyword, index)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	if constraints, exists := node["allOf"].([]any); exists && len(constraints) > 0 {
+		for index, constraint := range constraints {
+			if validateBoundedPropertySchema(constraint, fmt.Sprintf("%s.allOf[%d]", location, index)) == nil {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%s must declare a bounded type, enum, const, or local $ref", location)
 }
 
 func rejectUnknownKeys(object map[string]any, allowed ...string) error {
