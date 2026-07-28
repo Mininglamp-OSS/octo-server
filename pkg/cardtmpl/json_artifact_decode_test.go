@@ -118,6 +118,13 @@ func TestCompileJSONArtifactRejectsGovernanceAndDocumentDrift(t *testing.T) {
 			want: "semver",
 		},
 		{
+			name: "semver leading zero",
+			mutate: func(bundle *Bundle) {
+				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "version", "01.0.0")
+			},
+			want: "semver",
+		},
+		{
 			name: "missing owner",
 			mutate: func(bundle *Bundle) {
 				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "owner", "")
@@ -198,6 +205,22 @@ func TestCompileJSONArtifactRejectsGovernanceAndDocumentDrift(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestCompileJSONArtifactRejectsUnpairedUnicodeSurrogate(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Samples["shown"] = json.RawMessage(`{"title":"\ud800","groups":[]}`)
+	bundle.Goldens = nil
+	_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	var validationErr *ArtifactValidationError
+	if !errors.As(err, &validationErr) || validationErr.Document != "samples.shown" {
+		t.Fatalf("error = %v, want samples.shown validation error", err)
+	}
+
+	bundle.Samples["shown"] = json.RawMessage(`{"title":"\ud83d\ude80","groups":[]}`)
+	if _, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits()); err != nil {
+		t.Fatalf("valid astral Unicode surrogate pair rejected: %v", err)
 	}
 }
 
