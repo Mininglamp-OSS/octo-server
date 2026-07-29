@@ -4,6 +4,50 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-28 (cardtmpl-runtime-catalog, roadmap E3 PR-A)
+
+- **Dark publishing foundation** — Added the shared strict JSON artifact
+  compiler, deterministic canonical identity, immutable static/dynamic version
+  claims and artifacts, transactional publish audit, and startup static
+  inventory reconciliation. See
+  [journal](journal/shared/cardtmpl-runtime-catalog.md),
+  [brief](tasks/cardtmpl-runtime-catalog/brief.md), and PR #674 / Issue #669.
+- **Control plane** — Added super-admin-only, authenticated and UID-rate-limited
+  validate/publish endpoints with a 2 MiB body cap, localized safe errors, and
+  bounded operation/compile/DB metrics. Published artifacts remain inactive and
+  are not read by production render/send/edit paths in PR-A.
+- **Fail-close hardening** — Runtime manifests now align identity lengths with
+  persistence columns, reject ambiguous SemVer/Unicode identities, resolve local
+  schema refs (including array items) with cycle detection, bind samples within
+  their declaring view, and expose canonical manifest metadata.
+- **Review hardening** — Added full static/runtime canonical parity coverage,
+  contention-safe static-claim upsert plus bounded retry, and a distinct internal
+  error/metric classification for persistent catalog-integrity failures. The
+  bounded-schema proof is now a context-aware, visit-budgeted single traversal;
+  publish DB work has a 10-second deadline, bounded whole-transaction retry for
+  MySQL 1205/1213, and separate low-cardinality failure outcomes.
+- **Final review closure** — Unified golden/runtime number semantics, made
+  canonical integer limits notation-independent and recompile-safe, rejected
+  open-keyspace `patternProperties`, preserved `allOf` traversal-abort signals,
+  fixed mixed exact/positional sample assignment, made validation-document
+  selection deterministic, removed UTF-16 sort allocations and a redundant
+  envelope/bundle decode pass, and durably audited immutable/static-source
+  publish conflicts without mutating artifacts. A real-MySQL concurrency test
+  now verifies same-hash idempotency, different-hash immutability, audit results,
+  and migration Up/Down cleanup.
+- **Startup recovery** — Kept exact-key reconciliation fail-closed and documented
+  the safe PR-A break-glass path in the
+  [runbook](../docs/card-template-runtime-catalog-runbook.md): roll back or
+  correct the conflicting image and assign a new built-in version; never delete,
+  rewrite, or bypass permanent claim/artifact state.
+- **Learning (pending)** — Artifact validation must prove both persistence
+  compatibility and worst-case schema resource bounds; unknown or union schema
+  forms cannot be treated as bounded by omission. See
+  [learning](learnings/pending/cardtmpl-runtime-catalog.md).
+- **Boundary** — activation/rollback/block/runtime overlay remain PR-B; grants,
+  B1/B2, and Bot capability merge remain PR-C. Object keyspace bounds and strict
+  untrusted render-field decoding must close before dynamic activation.
+
 ## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
 
 - **Protocol** — Added the explicit Bot Registry template catalog to

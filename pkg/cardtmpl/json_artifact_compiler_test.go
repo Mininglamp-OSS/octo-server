@@ -1,0 +1,511 @@
+package cardtmpl
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	first, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact: %v", err)
+	}
+	if first.Meta.ID != "test.runtime-card" || first.Meta.Version != "1.0.0" {
+		t.Fatalf("compiled identity = %s@%s", first.Meta.ID, first.Meta.Version)
+	}
+	if len(first.Hash) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(first.Hash))
+	}
+	if len(first.Bundle) == 0 {
+		t.Fatal("canonical bundle is empty")
+	}
+
+	// Formatting and map insertion order are not part of the immutable identity.
+	secondBundle := validJSONArtifactBundle()
+	var compactManifest bytes.Buffer
+	if err := json.Compact(&compactManifest, secondBundle.Manifest); err != nil {
+		t.Fatalf("compact manifest fixture: %v", err)
+	}
+	secondBundle.Manifest = append(json.RawMessage(nil), compactManifest.Bytes()...)
+	var formattedSchema bytes.Buffer
+	if err := json.Indent(&formattedSchema, secondBundle.Schema, "", "  "); err != nil {
+		t.Fatalf("format schema fixture: %v", err)
+	}
+	secondBundle.Schema = append(json.RawMessage(nil), formattedSchema.Bytes()...)
+	secondBundle.Templates = map[string]json.RawMessage{
+		"main": secondBundle.Templates["main"],
+	}
+	second, err := CompileJSONArtifact(context.Background(), secondBundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact reformatted: %v", err)
+	}
+	if first.Hash != second.Hash || string(first.Bundle) != string(second.Bundle) {
+		t.Fatalf("canonical artifact drifted: first=%s second=%s", first.Hash, second.Hash)
+	}
+	if !bytes.Equal(first.Meta.Manifest, second.Meta.Manifest) {
+		t.Fatal("canonical artifact produced formatting-dependent manifest metadata")
+	}
+
+	fields := json.RawMessage(`{"title":"hello","groups":[{"items":["a"]}]}`)
+	card, err := first.Template.Build(context.Background(), "shown", fields, BuildEnv{Lang: "en-US"})
+	if err != nil {
+		t.Fatalf("compiled template Build: %v", err)
+	}
+	if len(card.Body) != 1 {
+		t.Fatalf("compiled card body len = %d, want 1", len(card.Body))
+	}
+}
+
+func TestStaticRegistrationAndRuntimeCompilerHaveCanonicalParity(t *testing.T) {
+	const root = "testdata/test.runtime-parity@1.0.0"
+	bundle, err := LoadJSONBundle(jsonCardTestData, root, CatalogDescriptor{
+		Engine: JSONTemplateEngineV1, Visibility: CatalogVisibilityPrivate,
+	})
+	if err != nil {
+		t.Fatalf("LoadJSONBundle: %v", err)
+	}
+	runtimeArtifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("runtime CompileJSONArtifact: %v", err)
+	}
+	staticArtifact, err := CompileJSONArtifact(context.Background(), bundle, staticCompileLimits())
+	if err != nil {
+		t.Fatalf("static CompileJSONArtifact: %v", err)
+	}
+	if runtimeArtifact.Hash != staticArtifact.Hash || !bytes.Equal(runtimeArtifact.Bundle, staticArtifact.Bundle) {
+		t.Fatalf("static/runtime identity drift: runtime=%s static=%s", runtimeArtifact.Hash, staticArtifact.Hash)
+	}
+
+	registry := NewRegistry()
+	registry.RegisterJSON(jsonCardTestData, root)
+	registry.Freeze()
+	staticTemplate, err := registry.Lookup("test.runtime-parity", "1.0.0")
+	if err != nil {
+		t.Fatalf("Lookup static template: %v", err)
+	}
+	staticMeta := staticTemplate.Meta()
+	runtimeMeta := runtimeArtifact.Meta.Clone()
+	staticMeta.InputSchema = nil
+	runtimeMeta.InputSchema = nil
+	if !reflect.DeepEqual(staticMeta, runtimeMeta) {
+		t.Fatalf("static/runtime metadata drift:\nstatic=%+v\nruntime=%+v", staticMeta, runtimeMeta)
+	}
+
+	fields := bundle.Samples["shown"]
+	env := BuildEnv{Lang: "en-US", SpaceID: "parity", WebLoginURL: "https://selfcheck.internal"}
+	staticPayload, err := renderCore(context.Background(), staticTemplate, staticTemplate.Meta(), "shown", fields, env)
+	if err != nil {
+		t.Fatalf("render static template: %v", err)
+	}
+	runtimePayload, err := renderCore(context.Background(), runtimeArtifact.Template, runtimeArtifact.Meta, "shown", fields, env)
+	if err != nil {
+		t.Fatalf("render runtime template: %v", err)
+	}
+	staticCanonical, err := marshalCanonicalJSON(staticPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCanonical, err := marshalCanonicalJSON(runtimePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(staticCanonical, runtimeCanonical) {
+		t.Fatalf("static/runtime render drift:\nstatic=%s\nruntime=%s", staticCanonical, runtimeCanonical)
+	}
+}
+
+func TestCompileBundleSamplesScopesStateLookupToEachView(t *testing.T) {
+	schema, err := compileJSONSchema(map[string]any{
+		"type": "object", "additionalProperties": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := manifestFile{Views: map[ViewKey]manifestView{
+		"one": {States: []State{"alpha"}, Samples: []string{"samples/beta.json"}},
+		"two": {States: []State{"gamma"}, Samples: []string{"samples/alpha.json"}},
+	}}
+	documents := map[string]json.RawMessage{
+		"alpha": json.RawMessage(`{}`),
+		"beta":  json.RawMessage(`{}`),
+	}
+	for iteration := 0; iteration < 1000; iteration++ {
+		_, assignments, err := compileBundleSamples(
+			manifest,
+			schema,
+			documents,
+			jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes},
+			DefaultCompileLimits(),
+		)
+		if err != nil {
+			t.Fatalf("compileBundleSamples iteration %d: %v", iteration, err)
+		}
+		got := make(map[string]string, len(assignments))
+		for _, assignment := range assignments {
+			got[string(assignment.view)+"/"+string(assignment.state)] = assignment.key
+		}
+		if got["one/alpha"] != "beta" || got["two/gamma"] != "alpha" {
+			t.Fatalf("iteration %d assignments = %v, want view-local samples", iteration, got)
+		}
+	}
+}
+
+func TestCompileBundleSamplesReservesExactMatchesBeforePositionalFallback(t *testing.T) {
+	schema, err := compileJSONSchema(map[string]any{
+		"type": "object", "additionalProperties": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := manifestFile{Views: map[ViewKey]manifestView{
+		"main": {
+			States:  []State{"foo", "bar"},
+			Samples: []string{"samples/bar.json", "samples/baz.json"},
+		},
+	}}
+	documents := map[string]json.RawMessage{
+		"bar": json.RawMessage(`{}`),
+		"baz": json.RawMessage(`{}`),
+	}
+
+	_, assignments, err := compileBundleSamples(
+		manifest,
+		schema,
+		documents,
+		jsonBudget{maxDepth: maxArtifactJSONDepth, maxNodes: maxArtifactJSONNodes},
+		DefaultCompileLimits(),
+	)
+	if err != nil {
+		t.Fatalf("compileBundleSamples: %v", err)
+	}
+	got := make(map[State]string, len(assignments))
+	for _, assignment := range assignments {
+		got[assignment.state] = assignment.key
+	}
+	if got["foo"] != "baz" || got["bar"] != "bar" {
+		t.Fatalf("assignments = %v, want foo=baz and bar=bar", got)
+	}
+}
+
+func TestCompileJSONArtifactUsesProductionNumberSemanticsForGoldens(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Schema = json.RawMessage(`{
+		"$schema":"http://json-schema.org/draft-07/schema#",
+		"type":"object",
+		"additionalProperties":false,
+		"required":["count"],
+		"properties":{"count":{"type":"integer"}}
+	}`)
+	bundle.Templates["main"] = json.RawMessage(`{
+		"type":"AdaptiveCard",
+		"version":"1.5",
+		"body":[{"type":"TextBlock","text":"${if(count == 1000000, 'equal', 'different')} ${count}"}]
+	}`)
+	bundle.Samples["shown"] = json.RawMessage(`{"count":1000000}`)
+	bundle.Goldens["shown"] = json.RawMessage(`{
+		"type":"AdaptiveCard",
+		"version":"1.5",
+		"body":[{"type":"TextBlock","text":"equal 1e+06"}]
+	}`)
+
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact: %v", err)
+	}
+	built, err := artifact.Template.Build(context.Background(), "shown", bundle.Samples["shown"], BuildEnv{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	text, _ := built.Body[0].(map[string]any)["text"].(string)
+	if text != "equal 1e+06" {
+		t.Fatalf("production text = %q, want golden text", text)
+	}
+}
+
+func TestCompileJSONArtifactCanonicalBundleRecompilesIntegerLimits(t *testing.T) {
+	for _, literal := range []string{"1000000", "1e6"} {
+		t.Run(literal, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = artifactSchemaWithIntegerLimits(literal)
+
+			first, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err != nil {
+				t.Fatalf("first CompileJSONArtifact: %v", err)
+			}
+			stored, err := DecodeBundleJSON(first.Bundle)
+			if err != nil {
+				t.Fatalf("DecodeBundleJSON(canonical): %v", err)
+			}
+			second, err := CompileJSONArtifact(context.Background(), stored, DefaultCompileLimits())
+			if err != nil {
+				t.Fatalf("recompile canonical bundle: %v", err)
+			}
+			if first.Hash != second.Hash || !bytes.Equal(first.Bundle, second.Bundle) {
+				t.Fatalf("canonical round trip drift: first=%s second=%s", first.Hash, second.Hash)
+			}
+		})
+	}
+}
+
+func TestCompileJSONArtifactRejectsUnsafeIntegerSpellings(t *testing.T) {
+	for _, literal := range []string{
+		"9007199254740992.0",
+		"9007199254740993e0",
+		"9.007199254740992e+15",
+		"-9007199254740992.0",
+	} {
+		t.Run(literal, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = artifactSchemaWithProperties(`{
+				"title":{"type":"string","maxLength":32},
+				"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}},
+				"value":{"type":"number"}
+			}`)
+			bundle.Samples["shown"] = json.RawMessage(fmt.Sprintf(
+				`{"title":"hello","groups":[{"items":["a"]}],"value":%s}`,
+				literal,
+			))
+
+			_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err == nil || !strings.Contains(err.Error(), "exceeds exact JSON range") {
+				t.Fatalf("CompileJSONArtifact(%s) error = %v, want exact-range rejection", literal, err)
+			}
+		})
+	}
+}
+
+func TestCompileJSONArtifactReturnsTypedErrorsWithoutPanicking(t *testing.T) {
+	tests := []struct {
+		name       string
+		constraint string
+		properties string
+		want       string
+	}{
+		{
+			name:       "unknown constraint key",
+			constraint: `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}],"unknown":true}`,
+			want:       "unknown",
+		},
+		{name: "empty constraint list", constraint: `{"aggregateArrayLimits":[]}`, want: "aggregateArrayLimits"},
+		{
+			name:       "blank parent",
+			constraint: `{"aggregateArrayLimits":[{"parentArray":" ","childArray":"items","maxTotalItems":2}]}`,
+			want:       "parentArray",
+		},
+		{
+			name:       "untrimmed child",
+			constraint: `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":" items","maxTotalItems":2}]}`,
+			want:       "childArray",
+		},
+		{
+			name:       "non-positive limit",
+			constraint: `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":0}]}`,
+			want:       "maxTotalItems",
+		},
+		{
+			name: "duplicate target",
+			constraint: `{"aggregateArrayLimits":[` +
+				`{"parentArray":"groups","childArray":"items","maxTotalItems":2},` +
+				`{"parentArray":"groups","childArray":"items","maxTotalItems":3}]}`,
+			want: "duplicate",
+		},
+		{
+			name:       "missing parent",
+			constraint: validAggregateConstraint,
+			properties: `{"title":{"type":"string","maxLength":32}}`,
+			want:       "parentArray",
+		},
+		{
+			name:       "parent wrong type",
+			constraint: validAggregateConstraint,
+			properties: `{"title":{"type":"string","maxLength":32},"groups":{"type":"object","additionalProperties":false}}`,
+			want:       "array of objects",
+		},
+		{
+			name:       "missing child",
+			constraint: validAggregateConstraint,
+			properties: `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{}}}}`,
+			want:       "childArray",
+		},
+		{
+			name:       "child wrong type",
+			constraint: validAggregateConstraint,
+			properties: `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"string","maxLength":8}}}}}`,
+			want:       "must be an array",
+		},
+		{
+			name:       "invalid child sub-schema",
+			constraint: validAggregateConstraint,
+			properties: `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":7}}}}}`,
+			want:       "schema",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			properties := tt.properties
+			if properties == "" {
+				properties = validArtifactProperties
+			}
+			bundle.Schema = json.RawMessage(fmt.Sprintf(
+				`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+				properties,
+				tt.constraint,
+			))
+
+			var panicValue any
+			var err error
+			func() {
+				defer func() { panicValue = recover() }()
+				_, err = CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			}()
+			if panicValue != nil {
+				t.Fatalf("runtime compiler panicked: %v", panicValue)
+			}
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			var validationErr *ArtifactValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error %T = %v, want ArtifactValidationError", err, err)
+			}
+			if validationErr.Document != "schema" {
+				t.Fatalf("validation document = %q, want schema", validationErr.Document)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %q, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompileJSONArtifactRejectsAmbiguousJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  func(*Bundle) *json.RawMessage
+		bad  json.RawMessage
+	}{
+		{
+			name: "duplicate key",
+			doc:  func(bundle *Bundle) *json.RawMessage { return &bundle.Manifest },
+			bad:  json.RawMessage(`{"id":"test.runtime-card","id":"other","version":"1.0.0"}`),
+		},
+		{
+			name: "trailing token",
+			doc:  func(bundle *Bundle) *json.RawMessage { return &bundle.Schema },
+			bad:  json.RawMessage(`{} {}`),
+		},
+		{
+			name: "non-finite numeric range",
+			doc:  func(bundle *Bundle) *json.RawMessage { return &bundle.Schema },
+			bad:  json.RawMessage(`{"type":"object","additionalProperties":false,"maximum":1e10000}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			*tt.doc(&bundle) = tt.bad
+			_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			var validationErr *ArtifactValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error = %v, want typed validation error", err)
+			}
+		})
+	}
+}
+
+func TestRegisterGoTemplateRejectsJSONOnlyConstraints(t *testing.T) {
+	reg := NewRegistry()
+	var panicValue any
+	func() {
+		defer func() { panicValue = recover() }()
+		reg.Register(&goConstraintTemplate{}, jsonCardTestData, "testdata/test.jsoncard@0.1.0")
+	}()
+	if panicValue == nil {
+		t.Fatal("Go-authored template silently accepted x-octo-constraints")
+	}
+	if !strings.Contains(fmt.Sprint(panicValue), "x-octo-constraints") {
+		t.Fatalf("panic = %v, want x-octo-constraints", panicValue)
+	}
+}
+
+const (
+	validAggregateConstraint = `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}]}`
+	validArtifactProperties  = `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}}}`
+)
+
+func validJSONArtifactBundle() Bundle {
+	return Bundle{
+		Catalog: CatalogDescriptor{
+			Engine:     JSONTemplateEngineV1,
+			Visibility: CatalogVisibilityPrivate,
+		},
+		Manifest: json.RawMessage(`{
+			"schemaVersion":2,
+			"id":"test.runtime-card",
+			"name":"Runtime compiler test",
+			"version":"1.0.0",
+			"contractVersion":"1.0.0",
+			"protocol":"octo-card@1.0",
+			"adaptiveCardVersion":"1.5",
+			"owner":"ai",
+			"dataSchema":"contract/data.schema.json",
+			"views":{"main":{"wireProfile":"octo/v1","states":["shown"],"template":"templates/main.template.json","samples":["samples/shown.json"]}}
+		}`),
+		Schema: json.RawMessage(fmt.Sprintf(
+			`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+			validArtifactProperties,
+			validAggregateConstraint,
+		)),
+		Templates: map[string]json.RawMessage{
+			"main": json.RawMessage(`{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"${title}","wrap":true}]}`),
+		},
+		Samples: map[string]json.RawMessage{
+			"shown": json.RawMessage(`{"title":"hello","groups":[{"items":["a"]}]}`),
+		},
+		Goldens: map[string]json.RawMessage{
+			"shown": json.RawMessage(`{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"hello","wrap":true}]}`),
+		},
+	}
+}
+
+func artifactSchemaWithIntegerLimits(literal string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{
+		"$schema":"http://json-schema.org/draft-07/schema#",
+		"type":"object",
+		"additionalProperties":false,
+		"required":["title"],
+		"properties":{
+			"title":{"type":"string","maxLength":%[1]s},
+			"groups":{"type":"array","maxItems":%[1]s,"items":{
+				"type":"object","additionalProperties":false,
+				"properties":{"items":{"type":"array","maxItems":%[1]s,"items":{"type":"string","maxLength":8}}}
+			}}
+		},
+		"x-octo-constraints":{"aggregateArrayLimits":[{
+			"parentArray":"groups","childArray":"items","maxTotalItems":%[1]s
+		}]}
+	}`, literal))
+}
+
+type goConstraintTemplate struct {
+	meta TemplateMeta
+}
+
+func (t *goConstraintTemplate) SetMeta(meta TemplateMeta) { t.meta = meta }
+func (t *goConstraintTemplate) Meta() TemplateMeta        { return t.meta.Clone() }
+func (t *goConstraintTemplate) Build(context.Context, State, json.RawMessage, BuildEnv) (BuildResult, error) {
+	return BuildResult{Body: []any{map[string]any{"type": "TextBlock", "text": "test"}}}, nil
+}
+func (t *goConstraintTemplate) FallbackText(State, json.RawMessage, string) (string, error) {
+	return "test", nil
+}

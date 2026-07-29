@@ -12,6 +12,7 @@
 package jsontmpl
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -208,6 +209,9 @@ func toFloat(v any) (float64, bool) {
 		return float64(n), true
 	case float64:
 		return n, true
+	case json.Number:
+		parsed, err := strconv.ParseFloat(n.String(), 64)
+		return parsed, err == nil
 	default:
 		return 0, false
 	}
@@ -295,6 +299,12 @@ func stringify(v any) string {
 		return strconv.Itoa(t)
 	case float64:
 		return strconv.FormatFloat(t, 'g', -1, 64)
+	case json.Number:
+		parsed, err := strconv.ParseFloat(t.String(), 64)
+		if err == nil {
+			return strconv.FormatFloat(parsed, 'g', -1, 64)
+		}
+		return t.String()
 	default:
 		return fmt.Sprintf("%v", t)
 	}
