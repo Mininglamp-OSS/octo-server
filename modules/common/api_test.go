@@ -114,6 +114,22 @@ func setDocsEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
 	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 }
 
+// setDocsSearchEnabledSetting upserts system_setting docs.search_enabled and
+// reloads the shared snapshot. This is the appconfig-facing display toggle for
+// cloud-doc full-text search, decoupled from docs.enabled.
+func setDocsSearchEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("docs", "search_enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
 func TestAddVersion(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
@@ -872,7 +888,55 @@ func TestGetAppConfig_DocsOn_OnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"docs_on":true`)
 }
 
-// setModuleEnabledSetting upserts a `<category>.enabled` bool system_setting and
+// appconfig 必须下发 docs_search_on：值来源于 system_setting docs.search_enabled。
+// 默认 false，与 docs_on 解耦，客户端据此隐藏云文档搜索 tab（搜索端点就绪前）。
+func TestGetAppConfig_DocsSearchOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":false`)
+}
+
+// system_setting docs.search_enabled=true → appconfig 下发 true。与 docs.enabled 解耦：
+// 只开 docs.search_enabled 不开 docs.enabled 时，docs_search_on=true 而 docs_on=false。
+func TestGetAppConfig_DocsSearchOn_True_Independent(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
+	assert.Contains(t, w.Body.String(), `"docs_on":false`)
+}
+
+// version 短路分支同样要下发 docs_search_on（展示开关与 app_config.version 解耦）。
+func TestGetAppConfig_DocsSearchOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
+}
 // reloads the shared snapshot. Generic sibling of setDocsEnabledSetting for the
 // dmloop / dmpersonal launch flags. Call AFTER cleanAllTablesAndReloadSettings.
 func setModuleEnabledSetting(t *testing.T, ctx *config.Context, category string, enabled bool) {
