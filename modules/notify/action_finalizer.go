@@ -57,7 +57,7 @@ func NewDocsActionFinalizerFromContext(ctx *config.Context) (*DocsActionFinalize
 		return nil, err
 	}
 	mutator := carddispatch.NewCardMutator(ctx)
-	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultRegistry(), mutator)
+	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultCatalog(), mutator)
 	if err != nil {
 		return nil, err
 	}

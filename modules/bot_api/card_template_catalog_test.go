@@ -75,6 +75,41 @@ func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
 	}
 }
 
+func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing.T) {
+	static, err := cardtmpl.NewStaticCatalog(testBotTemplateRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &botCatalogSpy{Catalog: static}
+	catalog, err := newBotCardTemplateCatalogWithPolicy(spy, defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spy.metaExactCalls == 0 || !spy.metaExactAllBounded {
+		t.Fatalf("constructor MetaExact calls/bounded = %d/%v, want calls > 0 and all bounded",
+			spy.metaExactCalls, spy.metaExactAllBounded)
+	}
+	payload := map[string]any{
+		"type": float64(17),
+		"template_ref": map[string]any{
+			"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV2,
+		},
+		"state": "reasoning",
+		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
+	}
+	if _, err := catalog.RenderPayloadForPrincipal(
+		context.Background(), "bot-42", payload, cardtmpl.BuildEnv{SpaceID: "space-7"},
+	); err != nil {
+		t.Fatalf("RenderPayloadForPrincipal: %v", err)
+	}
+	if spy.lastRender.Access.Purpose != cardtmpl.CatalogPurposeNewSend ||
+		spy.lastRender.Access.Principal.Kind != cardtmpl.CatalogPrincipalBot ||
+		spy.lastRender.Access.Principal.ID != "bot-42" ||
+		spy.lastRender.Access.Principal.SpaceID != "space-7" {
+		t.Fatalf("catalog access = %+v", spy.lastRender.Access)
+	}
+}
+
 func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T) {
 	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
 		AdvertisedSend: []botTemplateRef{{
@@ -394,4 +429,30 @@ func rawJSONToMap(t *testing.T, raw json.RawMessage) map[string]any {
 		t.Fatalf("unmarshal fixture: %v", err)
 	}
 	return out
+}
+
+type botCatalogSpy struct {
+	cardtmpl.Catalog
+	lastRender          cardtmpl.CatalogRenderRequest
+	metaExactCalls      int
+	metaExactAllBounded bool
+}
+
+func (s *botCatalogSpy) MetaExact(
+	ctx context.Context,
+	request cardtmpl.CatalogExactRequest,
+) (cardtmpl.TemplateMeta, error) {
+	_, bounded := ctx.Deadline()
+	if s.metaExactCalls == 0 {
+		s.metaExactAllBounded = bounded
+	} else {
+		s.metaExactAllBounded = s.metaExactAllBounded && bounded
+	}
+	s.metaExactCalls++
+	return s.Catalog.MetaExact(ctx, request)
+}
+
+func (s *botCatalogSpy) Render(ctx context.Context, request cardtmpl.CatalogRenderRequest) (map[string]any, error) {
+	s.lastRender = request
+	return s.Catalog.Render(ctx, request)
 }

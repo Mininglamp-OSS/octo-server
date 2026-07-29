@@ -164,7 +164,11 @@ func TestDocsActionFinalizerV3TruncatesOversizedDisplayFields(t *testing.T) {
 	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	registry.Freeze()
 	mut := &okMutator{}
-	realUpdater, err := cardtmpl.NewCardUpdater(registry, mut)
+	catalog, err := cardtmpl.NewStaticCatalog(registry)
+	if err != nil {
+		t.Fatalf("NewStaticCatalog: %v", err)
+	}
+	realUpdater, err := cardtmpl.NewCardUpdater(catalog, mut)
 	if err != nil {
 		t.Fatalf("NewCardUpdater: %v", err)
 	}

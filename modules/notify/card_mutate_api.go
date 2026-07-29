@@ -178,7 +178,7 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
 		return
 	}
-	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultRegistry(), mutator)
+	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultCatalog(), mutator)
 	if err != nil {
 		n.Error("create card updater for mutate failed", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)

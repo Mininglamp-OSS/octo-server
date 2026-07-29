@@ -1306,3 +1306,12 @@ other = "卡片模板版本与已发布的不可变制品冲突。"
 
 ["err.server.card_template_catalog.unavailable"]
 other = "卡片模板目录暂时不可用。"
+
+["err.server.card_template_catalog.control_disabled"]
+other = "卡片模板激活功能当前未启用。"
+
+["err.server.card_template_catalog.state_conflict"]
+other = "卡片模板状态已变化，请刷新后重试。"
+
+["err.server.card_template_catalog.blocked"]
+other = "该卡片模板版本已被阻断。"

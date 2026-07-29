@@ -37,6 +37,26 @@ type dependencyReadinessChecker struct {
 	redisClient *rd.Client
 }
 
+var cardTemplateCatalogReadinessCheck struct {
+	sync.RWMutex
+	check func() error
+}
+
+// SetCardTemplateCatalogReadinessCheck installs the process-local, IO-free
+// catalog readiness callback. The composition root calls it before module
+// construction; nil is reserved for test cleanup and pre-catalog binaries.
+func SetCardTemplateCatalogReadinessCheck(check func() error) {
+	cardTemplateCatalogReadinessCheck.Lock()
+	defer cardTemplateCatalogReadinessCheck.Unlock()
+	cardTemplateCatalogReadinessCheck.check = check
+}
+
+func currentCardTemplateCatalogReadinessCheck() func() error {
+	cardTemplateCatalogReadinessCheck.RLock()
+	defer cardTemplateCatalogReadinessCheck.RUnlock()
+	return cardTemplateCatalogReadinessCheck.check
+}
+
 func newDependencyReadinessChecker(ctx *config.Context, db *db) readinessChecker {
 	return &dependencyReadinessChecker{
 		db:          db,
@@ -75,6 +95,7 @@ func (cn *Common) ready(c *wkhttp.Context) {
 			Dependencies: map[string]string{"db": healthStatusDown, "redis": healthStatusDown},
 			Errors:       map[string]error{"readiness": errors.New("readiness checker unavailable")},
 		}
+		cn.applyCatalogReadiness(&result)
 		cn.logReadinessErrors(result.Errors)
 		// Readiness is an infra probe contract, not a user-facing business error.
 		// Keep the wire body small and safe instead of returning the i18n envelope.
@@ -100,6 +121,7 @@ func (cn *Common) ready(c *wkhttp.Context) {
 			Errors: map[string]error{"readiness": ctx.Err()},
 		}
 	}
+	cn.applyCatalogReadiness(&result)
 	cn.logReadinessErrors(result.Errors)
 	statusCode := http.StatusOK
 	if result.Status != healthStatusUp {
@@ -108,6 +130,26 @@ func (cn *Common) ready(c *wkhttp.Context) {
 	// Readiness is an infra probe contract, not a user-facing business error.
 	// Keep the wire body small and safe instead of returning the i18n envelope.
 	c.JSON(statusCode, result)
+}
+
+func (cn *Common) applyCatalogReadiness(result *readinessResult) {
+	if cn == nil || result == nil || cn.catalogReadiness == nil {
+		return
+	}
+	if result.Dependencies == nil {
+		result.Dependencies = make(map[string]string, 1)
+	}
+	if result.Errors == nil {
+		result.Errors = make(map[string]error, 1)
+	}
+	const dependency = "card_template_catalog"
+	if err := cn.catalogReadiness(); err != nil {
+		result.Dependencies[dependency] = healthStatusDown
+		result.Errors[dependency] = err
+		result.Status = healthStatusDown
+		return
+	}
+	result.Dependencies[dependency] = healthStatusUp
 }
 
 func (cn *Common) logReadinessErrors(errs map[string]error) {

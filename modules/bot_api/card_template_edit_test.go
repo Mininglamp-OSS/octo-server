@@ -458,8 +458,12 @@ func initialRegistryEnvelopeVersion(
 		root = aireasoningprocess.HandoffRootV1
 	}
 	data := testReasoningDataVersion(t, root, state)
-	payload, err := catalog.registry.Render(context.Background(), aireasoningprocess.TemplateID,
-		version, cardtmpl.State(state), data, cardtmplBuildEnvForTest())
+	env := cardtmplBuildEnvForTest()
+	payload, err := catalog.catalog.Render(context.Background(), cardtmpl.CatalogRenderRequest{
+		Access: botCatalogAccess(cardtmpl.CatalogPurposeHistoricalEdit, "test-bot", env.SpaceID),
+		ID:     aireasoningprocess.TemplateID, Version: version,
+		State: cardtmpl.State(state), Fields: data, Env: env,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

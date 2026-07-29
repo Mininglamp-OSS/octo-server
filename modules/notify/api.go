@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -363,7 +364,7 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		return
 	}
 
-	resp, err := n.dispatchNotify(&req, typedCapability)
+	resp, err := n.dispatchNotify(c.Request.Context(), &req, typedCapability)
 	if err != nil {
 		if errors.Is(err, errNotifyCardNotAllowed) {
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
@@ -382,12 +383,16 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 
 // dispatchNotify routes a single request to the correct producer path (when a
 // structured Card / DocsCard is present) or the legacy text path.
-func (n *Notify) dispatchNotify(req *NotifyReq, capability notifyCapability) (*NotifyResp, error) {
+func (n *Notify) dispatchNotify(
+	ctx context.Context,
+	req *NotifyReq,
+	capability notifyCapability,
+) (*NotifyResp, error) {
 	if req != nil && req.Card != nil {
-		return n.deliverCardNotification(req)
+		return n.deliverCardNotification(ctx, req)
 	}
 	if req != nil && req.DocsCard != nil {
-		return n.deliverDocsCardNotification(req)
+		return n.deliverDocsCardNotification(ctx, req)
 	}
 	if req != nil && req.ApprovalCard != nil {
 		return n.deliverApprovalCardNotification(req, capability.Action)

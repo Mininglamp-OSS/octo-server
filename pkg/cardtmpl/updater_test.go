@@ -34,7 +34,7 @@ func TestCardUpdaterReplaceViewRendersV3AndPreservesMessageIdentity(t *testing.T
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
 	gateway := &captureMutationGateway{result: carddispatch.CardMutationResult{Applied: true}}
-	updater, err := cardtmpl.NewCardUpdater(r, gateway)
+	updater, err := cardtmpl.NewCardUpdater(staticCatalog(t, r), gateway)
 	if err != nil {
 		t.Fatalf("NewCardUpdater: %v", err)
 	}
@@ -80,7 +80,11 @@ func TestCardUpdaterAppendUsesEffectiveFrameAndValidatesWholeCard(t *testing.T) 
 		snapshot: carddispatch.CardMutationSnapshot{Envelope: raw, CardSeq: 4},
 		result:   carddispatch.CardMutationResult{Applied: true},
 	}
-	updater, err := cardtmpl.NewCardUpdater(cardtmpl.NewRegistry(), gateway)
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	updater, err := cardtmpl.NewCardUpdater(staticCatalog(t, r), gateway)
 	if err != nil {
 		t.Fatalf("NewCardUpdater: %v", err)
 	}
@@ -121,7 +125,7 @@ func TestCardUpdaterAppendRejectsNonContiguousCardSequence(t *testing.T) {
 		snapshot: carddispatch.CardMutationSnapshot{Envelope: raw, CardSeq: 4},
 		result:   carddispatch.CardMutationResult{Applied: true},
 	}
-	updater, err := cardtmpl.NewCardUpdater(cardtmpl.NewRegistry(), gateway)
+	updater, err := cardtmpl.NewCardUpdater(staticCatalog(t, cardtmpl.NewRegistry()), gateway)
 	if err != nil {
 		t.Fatalf("NewCardUpdater: %v", err)
 	}
@@ -141,9 +145,9 @@ func TestCardUpdaterAppendRejectsNonContiguousCardSequence(t *testing.T) {
 func TestCardUpdaterFailsClosedOnInvalidInputsAndDependencies(t *testing.T) {
 	gateway := &captureMutationGateway{}
 	if _, err := cardtmpl.NewCardUpdater(nil, gateway); err == nil {
-		t.Fatal("NewCardUpdater(nil registry) error = nil")
+		t.Fatal("NewCardUpdater(nil catalog) error = nil")
 	}
-	if _, err := cardtmpl.NewCardUpdater(cardtmpl.NewRegistry(), nil); err == nil {
+	if _, err := cardtmpl.NewCardUpdater(staticCatalog(t, cardtmpl.NewRegistry()), nil); err == nil {
 		t.Fatal("NewCardUpdater(nil mutator) error = nil")
 	}
 
@@ -151,7 +155,7 @@ func TestCardUpdaterFailsClosedOnInvalidInputsAndDependencies(t *testing.T) {
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
-	updater, err := cardtmpl.NewCardUpdater(r, gateway)
+	updater, err := cardtmpl.NewCardUpdater(staticCatalog(t, r), gateway)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +193,67 @@ func TestCardUpdaterFailsClosedOnInvalidInputsAndDependencies(t *testing.T) {
 	if err := updater.Append(context.Background(), target, json.RawMessage(`{"type":"TextBlock","text":"after"}`)); !errors.Is(err, cardtmpl.ErrUpdateInvalid) {
 		t.Fatalf("Append(invalid effective frame) = %v, want %v", err, cardtmpl.ErrUpdateInvalid)
 	}
+}
+
+func TestCardUpdaterAppendRejectsBlockedStoredTemplate(t *testing.T) {
+	original := map[string]any{
+		"type": 17, "card_version": cardmsg.CardVersion, "profile": cardmsg.ProfileV1,
+		"space_id": "space-1", "card_seq": 4,
+		"card": map[string]any{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []any{map[string]any{"type": "TextBlock", "text": "before"}},
+			"metadata": map[string]any{"octo": map[string]any{
+				"protocol": cardtmpl.Protocol, "template": map[string]any{"id": "test.dynamic", "version": "1.0.0"},
+			}},
+		},
+	}
+	raw, _ := json.Marshal(original)
+	gateway := &captureMutationGateway{
+		snapshot: carddispatch.CardMutationSnapshot{Envelope: raw, CardSeq: 4},
+		result:   carddispatch.CardMutationResult{Applied: true},
+	}
+	updater, err := cardtmpl.NewCardUpdater(blockedCatalog{}, gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := cardtmpl.UpdateTarget{
+		Target:    carddispatch.Target{SpaceID: "space-1", ChannelID: "user-b", ChannelType: 1},
+		SenderUID: "notification", MessageID: "1001", CardSeq: 5,
+	}
+	err = updater.Append(context.Background(), target, json.RawMessage(`{"type":"TextBlock","text":"after"}`))
+	if !errors.Is(err, cardtmpl.ErrRuntimeCatalogBlocked) {
+		t.Fatalf("Append(blocked template) error = %v, want ErrRuntimeCatalogBlocked", err)
+	}
+	if len(gateway.requests) != 0 {
+		t.Fatalf("blocked append wrote mutations: %+v", gateway.requests)
+	}
+}
+
+func staticCatalog(t *testing.T, registry *cardtmpl.Registry) cardtmpl.Catalog {
+	t.Helper()
+	catalog, err := cardtmpl.NewStaticCatalog(registry)
+	if err != nil {
+		t.Fatalf("NewStaticCatalog: %v", err)
+	}
+	return catalog
+}
+
+type blockedCatalog struct{}
+
+func (blockedCatalog) Render(context.Context, cardtmpl.CatalogRenderRequest) (map[string]any, error) {
+	return nil, cardtmpl.ErrRuntimeCatalogBlocked
+}
+func (blockedCatalog) MetaExact(context.Context, cardtmpl.CatalogExactRequest) (cardtmpl.TemplateMeta, error) {
+	return cardtmpl.TemplateMeta{}, cardtmpl.ErrRuntimeCatalogBlocked
+}
+func (blockedCatalog) MetaDefault(context.Context, cardtmpl.CatalogDefaultRequest) (cardtmpl.TemplateMeta, error) {
+	return cardtmpl.TemplateMeta{}, cardtmpl.ErrRuntimeCatalogBlocked
+}
+func (blockedCatalog) FallbackText(context.Context, cardtmpl.CatalogFallbackRequest) (string, error) {
+	return "", cardtmpl.ErrRuntimeCatalogBlocked
+}
+func (blockedCatalog) ActionContext(context.Context, cardtmpl.CatalogActionRequest) (cardtmpl.CatalogActionContext, error) {
+	return cardtmpl.CatalogActionContext{}, cardtmpl.ErrRuntimeCatalogBlocked
 }
 
 func assertUpdateEnvelope(t *testing.T, raw string, seq int64, profile, renderProfile, version string) {

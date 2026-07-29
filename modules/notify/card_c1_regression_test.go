@@ -1,12 +1,49 @@
 package notify
 
 import (
+	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+func TestDeliverDocsAccessRequest_BlockBetweenPreflightAndRenderFailsClosed(t *testing.T) {
+	t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "true")
+	t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "true")
+	static, err := cardtmpl.NewStaticCatalog(freshPilotRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cardtmpl.SetDefaultCatalog(&notifyFailureCatalog{
+		Catalog: static, renderErr: cardtmpl.ErrRuntimeCatalogBlocked,
+	})
+	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
+
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	n.botOK.Store(true)
+	primeMemberCache(n, "space-1", "user-b")
+	capture := &capturingCardSender{}
+	n.docsSender = capture
+
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+		SpaceID: "space-1", Service: "docs", Targets: []string{"user-b"}, ActorUID: "user-a",
+		DocsCard: validAccessRequestDocsCard(),
+	})
+	if !errors.Is(err, cardtmpl.ErrRuntimeCatalogBlocked) {
+		t.Fatalf("delivery error = %v, want ErrRuntimeCatalogBlocked (resp=%v)", err, resp)
+	}
+	if resp != nil || len(capture.cards) != 0 || atomic.LoadInt32(&wk.messageCount) != 0 {
+		t.Fatalf("blocked runtime delivered content: resp=%v cards=%d text=%d",
+			resp, len(capture.cards), atomic.LoadInt32(&wk.messageCount))
+	}
+}
 
 // TestDeliverDocsAccessRequest_UnwiredRegistryFailsClosed 是 R2-2 的 caller 级锁:
 // gate 开 + DefaultRegistry 未注入 (composition bug) → deliverDocsCardNotification
@@ -30,7 +67,7 @@ func TestDeliverDocsAccessRequest_UnwiredRegistryFailsClosed(t *testing.T) {
 	capture := &capturingCardSender{}
 	n.docsSender = capture
 
-	resp, err := n.deliverDocsCardNotification(&NotifyReq{
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "space-1", Service: "docs", Targets: []string{"user-b"}, ActorUID: "user-a",
 		DocsCard: validAccessRequestDocsCard(),
 	})
@@ -70,7 +107,7 @@ func TestDeliverDocsAccessRequest_MalformedAvatarRejected400(t *testing.T) {
 	card := validAccessRequestDocsCard()
 	card.ActorAvatarURL = "https://?x=1" // 空 host,滑过 schema 正则,必须被 preflight parser 拦截
 
-	resp, err := n.deliverDocsCardNotification(&NotifyReq{
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "space-1", Service: "docs", Targets: []string{"user-b"}, ActorUID: "user-a",
 		DocsCard: card,
 	})
@@ -100,7 +137,7 @@ func TestPreflightDocsAccessRequestSchema_AvatarSemantics(t *testing.T) {
 	for _, u := range bad {
 		card := validAccessRequestDocsCard()
 		card.ActorAvatarURL = u
-		if err := preflightDocsAccessRequestSchema(card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+		if err := preflightDocsAccessRequestSchema(context.Background(), card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
 			t.Errorf("avatar %q: want ErrFieldsInvalid, got %v", u, err)
 		}
 	}
@@ -109,7 +146,7 @@ func TestPreflightDocsAccessRequestSchema_AvatarSemantics(t *testing.T) {
 	for _, u := range ok {
 		card := validAccessRequestDocsCard()
 		card.ActorAvatarURL = u
-		if err := preflightDocsAccessRequestSchema(card); err != nil {
+		if err := preflightDocsAccessRequestSchema(context.Background(), card); err != nil {
 			t.Errorf("avatar %q: want pass, got %v", u, err)
 		}
 	}
@@ -126,7 +163,7 @@ func TestPreflight_EmitsFieldsInvalidMetric(t *testing.T) {
 
 	card := validAccessRequestDocsCard()
 	card.Title = "" // schema violation: document.title minLength=1
-	if err := preflightDocsAccessRequestSchema(card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+	if err := preflightDocsAccessRequestSchema(context.Background(), card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
 		t.Fatalf("want ErrFieldsInvalid, got %v", err)
 	}
 

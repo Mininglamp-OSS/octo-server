@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -15,6 +16,36 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+func TestNewDoesNotPerformStartupDatabaseWrites(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	registry := cardtmpl.NewRegistry()
+	registry.Freeze()
+	previousRegistry := cardtmpl.DefaultRegistry()
+	previousStore := installedRuntimeStore()
+	cardtmpl.SetDefaultRegistry(registry)
+	setInstalledRuntimeStore(newStore(db))
+	t.Cleanup(func() {
+		cardtmpl.SetDefaultRegistry(previousRegistry)
+		setInstalledRuntimeStore(previousStore)
+	})
+
+	cfg := config.New()
+	cfg.Test = true
+	ctx := config.NewContext(cfg)
+	api := New(ctx)
+	if api == nil {
+		t.Fatal("New returned nil API")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("New performed a startup DB operation: %v", err)
+	}
+}
 
 func TestNewInTestModeAllowsUninstalledStaticRegistry(t *testing.T) {
 	previous := cardtmpl.DefaultRegistry()
@@ -128,6 +159,23 @@ func TestPublishRejectsMissingAuditFieldsBeforeCompile(t *testing.T) {
 	assertCatalogError(t, response, "err.server.card_template_catalog.request_invalid", http.StatusBadRequest)
 	if compilerCalls != 0 {
 		t.Fatalf("compiler called %d times before audit-field validation", compilerCalls)
+	}
+}
+
+func TestPublishRejectsUnapprovedOwnerBeforeStore(t *testing.T) {
+	store := &fakeCatalogStore{}
+	artifact := compiledArtifactFixture()
+	artifact.Owner = "ext.vendor"
+	api := &API{
+		store: store,
+		compile: func(context.Context, cardtmpl.Bundle, cardtmpl.CompileLimits) (*cardtmpl.CompiledArtifact, error) {
+			return artifact, nil
+		},
+	}
+	response := doCatalogRequest(t, api, wkhttp.SuperAdmin, "/publish", validControlRequestJSON(t, true))
+	assertCatalogError(t, response, "err.server.card_template_catalog.request_invalid", http.StatusBadRequest)
+	if store.publishCalls != 0 {
+		t.Fatalf("publish store calls = %d, want 0", store.publishCalls)
 	}
 }
 
