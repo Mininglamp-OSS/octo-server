@@ -659,18 +659,31 @@ func threadAutoArchiveEnabledFromEnv() bool {
 	return raw == "true" || raw == "1"
 }
 
-// threadAutoArchiveDaysFromEnv mirrors the old parseDays: empty / unparseable /
-// negative fall back to the code default, 0 is a legitimate "disable the
-// threshold" value. Out-of-range positives additionally fall back rather than
-// being served verbatim, so the env layer cannot smuggle in a value the admin
-// write path would have rejected — same defence-in-depth as getIntClamped.
+// threadAutoArchiveDaysFromEnv mirrors the legacy thread parseDays **exactly**:
+// empty / unparseable / negative fall back to the code default, 0 is a
+// legitimate "disable the threshold" value, and any other non-negative integer
+// is honoured verbatim — including values above settingIntMax.
+//
+// The upper bound deliberately does NOT apply here (PR #679 review, Jerry-Xin).
+// An earlier revision clamped the env layer too, on a defence-in-depth
+// argument, but that silently reinterprets an existing deployment's config:
+// DM_THREAD_AUTO_ARCHIVE_DAYS=9999 means "effectively never archive", and
+// folding it to the 3-day default on rollout would mass-archive long-lived
+// threads — the exact opposite of this migration's byte-identical-rollout
+// guarantee. The env layer is a compatibility shim for config that already
+// exists in production, so it must not change meaning.
+//
+// The [settingIntMin, settingIntMax] bound still applies to admin/DB-supplied
+// values, where an operator gets an explicit rejection (the manager write path)
+// or a documented fallback (getIntClamped) rather than a silent
+// reinterpretation.
 func threadAutoArchiveDaysFromEnv() int {
 	raw := strings.TrimSpace(os.Getenv(envThreadAutoArchiveDays))
 	if raw == "" {
 		return defaultThreadAutoArchiveDays
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < settingIntMin || n > settingIntMax {
+	if err != nil || n < 0 {
 		return defaultThreadAutoArchiveDays
 	}
 	return n

@@ -81,15 +81,50 @@ func TestThreadAutoArchive_DBOutOfRangeClampsToDefault(t *testing.T) {
 	assert.Equal(t, 3, s.ThreadAutoArchiveDays())
 }
 
-// env 越界同样回退默认：env 层不得偷渡一个管理写路径本会拒绝的值。
-func TestThreadAutoArchive_EnvOutOfRangeFallsBackToDefault(t *testing.T) {
+// env 层必须逐字保留 legacy parseDays 语义：负值/非法回退默认，0 合法，其余
+// 非负整数**原样生效**（含超过 settingIntMax 的值）。
+//
+// 上界只作用于 DB/管理台来源的值。对 env 加上界等于把现网既有配置**静默改写**：
+// DM_THREAD_AUTO_ARCHIVE_DAYS=9999 的语义是「实质不归档」，上线时折成 3 天会
+// 批量归档长期存活的子区 —— 与本次迁移「上线零行为变化」的承诺正相反
+// （PR #679 review, Jerry-Xin）。
+func TestThreadAutoArchive_EnvPreservesLegacySemantics(t *testing.T) {
 	t.Setenv(envThreadAutoArchiveDays, "-5")
-	s := newTestSystemSettings(t, nil)
-	assert.Equal(t, 3, s.ThreadAutoArchiveDays(), "负值 env 回退默认")
+	assert.Equal(t, 3, newTestSystemSettings(t, nil).ThreadAutoArchiveDays(),
+		"负值 env 回退默认（同 legacy parseDays）")
 
-	t.Setenv(envThreadAutoArchiveDays, "99999")
-	s2 := newTestSystemSettings(t, nil)
-	assert.Equal(t, 3, s2.ThreadAutoArchiveDays(), "超上限 env 回退默认")
+	t.Setenv(envThreadAutoArchiveDays, "abc")
+	assert.Equal(t, 3, newTestSystemSettings(t, nil).ThreadAutoArchiveDays(),
+		"非法 env 回退默认（同 legacy parseDays）")
+
+	t.Setenv(envThreadAutoArchiveDays, "0")
+	assert.Equal(t, 0, newTestSystemSettings(t, nil).ThreadAutoArchiveDays(),
+		"0 是合法的『禁用阈值』，不得回退")
+
+	t.Setenv(envThreadAutoArchiveDays, "9999")
+	assert.Equal(t, 9999, newTestSystemSettings(t, nil).ThreadAutoArchiveDays(),
+		"超 settingIntMax 的 env 值必须原样生效——上线不得改写现网既有配置")
+}
+
+// 对照面：上界仍然作用于 DB 值。绕过管理 API 直接改表写入的越界值不被原样服务，
+// 而是回落到 env 层（此处 env 未设 → 代码默认）。
+func TestThreadAutoArchive_DBValueStillBounded(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("thread", "auto_archive_days", "99999", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+
+	assert.Equal(t, 3, s.ThreadAutoArchiveDays(), "越界 DB 值回落，不被原样服务")
+}
+
+// env 越界 + DB 越界：DB 不可服务 → 回落 env 层，env 的 legacy 语义仍然成立。
+func TestThreadAutoArchive_OutOfRangeDBFallsBackToEnvLayer(t *testing.T) {
+	t.Setenv(envThreadAutoArchiveDays, "9999")
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("thread", "auto_archive_days", "88888", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+
+	assert.Equal(t, 9999, s.ThreadAutoArchiveDays(),
+		"越界 DB 值回落到 env 层，而非代码默认——三级链条的既定语义")
 }
 
 func TestThreadAutoArchive_EnvGarbageStaysDisabled(t *testing.T) {
