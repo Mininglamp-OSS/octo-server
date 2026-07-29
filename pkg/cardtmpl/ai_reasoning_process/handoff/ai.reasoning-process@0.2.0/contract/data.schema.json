@@ -1,0 +1,263 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "推理过程卡数据契约",
+  "description": "AI 推理过程附件的展示型 ViewModel。消息作者、头像、时间与最终 Markdown 回答由消息容器负责，不进入卡片契约。",
+  "type": "object",
+  "additionalProperties": false,
+  "x-octo-constraints": {
+    "aggregateArrayLimits": [
+      {
+        "parentArray": "phases",
+        "childArray": "actions",
+        "maxTotalItems": 13
+      }
+    ]
+  },
+  "required": [
+    "reasoningId",
+    "state",
+    "title",
+    "statusLabel",
+    "statusTone",
+    "timerText",
+    "traceExpanded",
+    "traceCollapsed",
+    "collapsedSummary",
+    "phases"
+  ],
+  "properties": {
+    "reasoningId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "本轮推理的稳定标识，会随停止或重试动作回传。",
+      "examples": [
+        "reasoning-channel-b-001"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "reasoning",
+        "answering",
+        "completed",
+        "stopped",
+        "error"
+      ],
+      "description": "卡片当前状态；宿主据此选择 active、result 或 error View。"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "推理卡标题。",
+      "examples": [
+        "已深度思考"
+      ]
+    },
+    "statusLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "description": "面向用户的状态文案。"
+    },
+    "statusTone": {
+      "type": "string",
+      "enum": [
+        "Accent",
+        "Good",
+        "Warning",
+        "Attention"
+      ],
+      "description": "Adaptive Cards 标准语义色。"
+    },
+    "timerText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "耗时、阶段数和工具调用数的展示文案。"
+    },
+    "traceExpanded": {
+      "type": "boolean",
+      "description": "初始是否展示推理明细。"
+    },
+    "traceCollapsed": {
+      "type": "boolean",
+      "description": "初始是否展示收起摘要；应与 traceExpanded 互斥。"
+    },
+    "collapsedSummary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "推理明细收起时的摘要。"
+    },
+    "progressText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "活动态底部的实时进度提示。"
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "description": "按发生顺序排列的推理阶段。仅包含可向用户展示的过程摘要，不承载隐藏的模型内部思维。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "thought",
+          "actions"
+        ],
+        "properties": {
+          "thought": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 281,
+            "description": "该阶段面向用户的推理摘要。"
+          },
+          "actions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "tool",
+                "detail",
+                "statusGlyph",
+                "statusTone"
+              ],
+              "properties": {
+                "tool": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 81,
+                  "description": "工具或步骤名称。"
+                },
+                "detail": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 192,
+                  "description": "已脱敏的调用摘要。"
+                },
+                "statusGlyph": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2,
+                  "description": "调用状态符号，例如 ●。"
+                },
+                "statusTone": {
+                  "type": "string",
+                  "enum": [
+                    "Accent",
+                    "Good",
+                    "Attention"
+                  ],
+                  "description": "工具调用状态的标准语义色。"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "errorTitle": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "失败态标题。"
+    },
+    "errorMessage": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 121,
+      "description": "失败原因与用户可采取动作。"
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "traceExpanded": {
+              "const": true
+            },
+            "traceCollapsed": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "traceExpanded": {
+              "const": false
+            },
+            "traceCollapsed": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "reasoning",
+              "answering"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "progressText"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "errorTitle",
+          "errorMessage"
+        ]
+      }
+    }
+  ],
+  "examples": [
+    {
+      "reasoningId": "reasoning-channel-b-001",
+      "state": "completed",
+      "title": "已深度思考",
+      "statusLabel": "已完成",
+      "statusTone": "Good",
+      "timerText": "用时 12 秒 · 3 段推理 · 13 次工具调用",
+      "traceExpanded": false,
+      "traceCollapsed": true,
+      "collapsedSummary": "已思考 12 秒 · 推理过程已收起",
+      "phases": [
+        {
+          "thought": "先拆解漏斗并核对近 90 天数据。",
+          "actions": [
+            {
+              "tool": "query_metrics",
+              "detail": "channel=B · range=90d",
+              "statusGlyph": "●",
+              "statusTone": "Good"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

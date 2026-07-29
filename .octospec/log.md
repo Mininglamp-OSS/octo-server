@@ -31,6 +31,87 @@ change-log convention (§7). Newest first.
   a clearing write land in the state the guard exists to reject. See
   [learning](learnings/pending/system-setting-empty-payload-is-reset-not-keep.md).
 
+## 2026-07-29 (cardtmpl-runtime-catalog-overlay, roadmap E3 PR-B server)
+
+- **Runtime overlay** — Added one composition-root RuntimeCatalog over frozen
+  built-ins and the immutable MySQL artifact store, with authoritative
+  exact/default resolution, bounded compiled caching, and fail-closed dynamic
+  authorization. See [journal](journal/shared/cardtmpl-runtime-catalog-overlay.md),
+  [brief](tasks/cardtmpl-runtime-catalog-overlay/brief.md), and Issue #672.
+- **Audited state machine** — Added revision-CAS activate, explicit prior-active
+  rollback, one-way emergency block with fallback/disable, manager detail/audit,
+  and transactional state-plus-audit persistence.
+- **Runtime consumers** — Migrated Bot template send/edit, notify, CardUpdater,
+  and message action-context to the catalog interface with server-authored
+  purpose/principal/Space context. Control and dynamic new-send remain dark and
+  no production grants are installed.
+- **Recovery hardening** — Startup reconciliation is asynchronous and retryable;
+  integrity remains sticky while super-admin detail/audit diagnostics stay
+  readable. Static interactive rollback targets no longer inherit the dynamic
+  RouteSpec precondition, and notify catalog DB calls are deadline-bounded.
+- **Current-head review closure** — Catalog startup state now participates in
+  `/v1/ready`; active-target validation has a 128-target hard cap, independent
+  per-target deadlines, and a bounded gauge. Notify preserves and fail-closes
+  runtime catalog safety errors, Bot construction lookups are deadline-bounded,
+  and audit paging/prior-active lookups have supporting indexes. Trusted
+  producer provenance is explicitly deferred as a PR-C grant prerequisite.
+- **Trust-boundary closure** — Runtime schemas now reject non-empty
+  `patternProperties`; `additionalProperties=false` alone does not bound regex
+  keyspaces.
+- **Verification boundary** — Core cardtmpl/catalog coverage exceeds 80% and all
+  focused, race, clean-DB integration, build, vet, lint, i18n, and diff gates are
+  green locally. Legacy Bot/notify/message whole-package coverage remains below
+  80%, so that literal brief checkbox stays open. PR #674 merge and the PR-B
+  rebase are complete; post-rebase CI/current-head approval, E1d/E1e, PR-C
+  grants, joint E2E, and production enablement remain pending.
+- **Learning (pending)** — A fail-closed runtime must retain an authenticated,
+  bounded diagnostic read path. See
+  [learning](learnings/pending/cardtmpl-runtime-catalog-overlay.md).
+
+## 2026-07-28 (cardtmpl-runtime-catalog, roadmap E3 PR-A)
+
+- **Dark publishing foundation** — Added the shared strict JSON artifact
+  compiler, deterministic canonical identity, immutable static/dynamic version
+  claims and artifacts, transactional publish audit, and startup static
+  inventory reconciliation. See
+  [journal](journal/shared/cardtmpl-runtime-catalog.md),
+  [brief](tasks/cardtmpl-runtime-catalog/brief.md), and PR #674 / Issue #669.
+- **Control plane** — Added super-admin-only, authenticated and UID-rate-limited
+  validate/publish endpoints with a 2 MiB body cap, localized safe errors, and
+  bounded operation/compile/DB metrics. Published artifacts remain inactive and
+  are not read by production render/send/edit paths in PR-A.
+- **Fail-close hardening** — Runtime manifests now align identity lengths with
+  persistence columns, reject ambiguous SemVer/Unicode identities, resolve local
+  schema refs (including array items) with cycle detection, bind samples within
+  their declaring view, and expose canonical manifest metadata.
+- **Review hardening** — Added full static/runtime canonical parity coverage,
+  contention-safe static-claim upsert plus bounded retry, and a distinct internal
+  error/metric classification for persistent catalog-integrity failures. The
+  bounded-schema proof is now a context-aware, visit-budgeted single traversal;
+  publish DB work has a 10-second deadline, bounded whole-transaction retry for
+  MySQL 1205/1213, and separate low-cardinality failure outcomes.
+- **Final review closure** — Unified golden/runtime number semantics, made
+  canonical integer limits notation-independent and recompile-safe, rejected
+  open-keyspace `patternProperties`, preserved `allOf` traversal-abort signals,
+  fixed mixed exact/positional sample assignment, made validation-document
+  selection deterministic, removed UTF-16 sort allocations and a redundant
+  envelope/bundle decode pass, and durably audited immutable/static-source
+  publish conflicts without mutating artifacts. A real-MySQL concurrency test
+  now verifies same-hash idempotency, different-hash immutability, audit results,
+  and migration Up/Down cleanup.
+- **Startup recovery** — Kept exact-key reconciliation fail-closed and documented
+  the safe PR-A break-glass path in the
+  [runbook](../docs/card-template-runtime-catalog-runbook.md): roll back or
+  correct the conflicting image and assign a new built-in version; never delete,
+  rewrite, or bypass permanent claim/artifact state.
+- **Learning (pending)** — Artifact validation must prove both persistence
+  compatibility and worst-case schema resource bounds; unknown or union schema
+  forms cannot be treated as bounded by omission. See
+  [learning](learnings/pending/cardtmpl-runtime-catalog.md).
+- **Boundary** — activation/rollback/block/runtime overlay remain PR-B; grants,
+  B1/B2, and Bot capability merge remain PR-C. Object keyspace bounds and strict
+  untrusted render-field decoding must close before dynamic activation.
+
 ## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
 
 - **Protocol** — Added the explicit Bot Registry template catalog to

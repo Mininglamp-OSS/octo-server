@@ -958,6 +958,57 @@ func TestGetAppConfig_LoopFlags_OnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"dmpersonal_on":true`)
 }
 
+// appconfig 必须下发 drive_on：值来源于 system_setting drive.enabled。默认 false，
+// 客户端据此隐藏网盘(drive)模块入口（独立部署的 octo-drive 上线前）。
+func TestGetAppConfig_DriveOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":false`)
+}
+
+// system_setting drive.enabled=true → appconfig 下发 true，客户端展示网盘入口；
+// docs_on 保持默认关，证明两个模块开关互不派生。
+func TestGetAppConfig_DriveOn_TrueIndependentOfDocs(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "drive", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":true`)
+	assert.Contains(t, w.Body.String(), `"docs_on":false`)
+}
+
+// version 短路分支同样下发 drive_on：展示开关须与 app_config.version 解耦，避免 admin
+// 切换后老客户端命中版本短路而继续用旧值(同 docs_on)。
+func TestGetAppConfig_DriveOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "drive", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":true`)
+}
+
 // setStickerUploadLimitsSettings upserts the three sticker upload knobs
 // (size KB / max dim / allowed formats CSV) and reloads the shared snapshot.
 // Passing "" for any of them skips writing that row so tests can exercise the

@@ -1294,3 +1294,27 @@ other = "只能清除自己发送的卡片的修订历史。"
 
 ["err.server.robot.card_edit_forbidden"]
 other = "卡片消息不支持编辑。"
+
+["err.server.card_template_catalog.forbidden"]
+other = "仅超级管理员可管理卡片模板。"
+
+["err.server.card_template_catalog.request_invalid"]
+other = "卡片模板制品无效。"
+
+["err.server.card_template_catalog.content_too_large"]
+other = "卡片模板请求超过大小上限。"
+
+["err.server.card_template_catalog.conflict"]
+other = "卡片模板版本与已发布的不可变制品冲突。"
+
+["err.server.card_template_catalog.unavailable"]
+other = "卡片模板目录暂时不可用。"
+
+["err.server.card_template_catalog.control_disabled"]
+other = "卡片模板激活功能当前未启用。"
+
+["err.server.card_template_catalog.state_conflict"]
+other = "卡片模板状态已变化，请刷新后重试。"
+
+["err.server.card_template_catalog.blocked"]
+other = "该卡片模板版本已被阻断。"

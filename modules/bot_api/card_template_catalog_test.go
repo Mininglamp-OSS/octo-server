@@ -15,8 +15,9 @@ import (
 func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	r := cardtmpl.NewRegistry()
-	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRoot)
-	r.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersion)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+	r.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
@@ -24,14 +25,152 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 }
 
 func testReasoningData(t *testing.T, state string) json.RawMessage {
+	return testReasoningDataVersion(t, aireasoningprocess.HandoffRootV2, state)
+}
+
+func testReasoningDataVersion(t *testing.T, root, state string) json.RawMessage {
 	t.Helper()
 	b, err := aireasoningprocess.Assets.ReadFile(
-		aireasoningprocess.HandoffRoot + "/samples/" + state + ".json",
+		root + "/samples/" + state + ".json",
 	)
 	if err != nil {
 		t.Fatalf("read reasoning sample %q: %v", state, err)
 	}
 	return json.RawMessage(b)
+}
+
+func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
+	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatalf("newBotCardTemplateCatalogWithPolicy: %v", err)
+	}
+
+	capability := catalog.Capability()
+	if len(capability.Templates) != 1 || capability.Templates[0].Version != aireasoningprocess.TemplateVersionV2 {
+		t.Fatalf("advertised templates = %+v, want successor only", capability.Templates)
+	}
+
+	legacyRef := map[string]any{
+		"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV1,
+	}
+	legacyPayload := map[string]any{
+		"type":         17,
+		"template_ref": legacyRef,
+		"state":        "reasoning",
+		"data": rawJSONToMap(t, testReasoningDataVersion(t,
+			aireasoningprocess.HandoffRootV1, "reasoning")),
+	}
+	if _, err := catalog.RenderPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{}); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("legacy send error = %v, want request invalid", err)
+	}
+	if ref, err := catalog.requireEditableRef(legacyRef); err != nil || ref.Version != aireasoningprocess.TemplateVersionV1 {
+		t.Fatalf("legacy edit ref = %+v, error = %v", ref, err)
+	}
+	rendered, err := catalog.RenderEditPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{})
+	if err != nil {
+		t.Fatalf("RenderEditPayload(legacy): %v", err)
+	}
+	if got := rendered["template_ref"].(map[string]any)["version"]; got != aireasoningprocess.TemplateVersionV1 {
+		t.Fatalf("legacy edit rendered version = %v", got)
+	}
+}
+
+func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing.T) {
+	static, err := cardtmpl.NewStaticCatalog(testBotTemplateRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &botCatalogSpy{Catalog: static}
+	catalog, err := newBotCardTemplateCatalogWithPolicy(spy, defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spy.metaExactCalls == 0 || !spy.metaExactAllBounded {
+		t.Fatalf("constructor MetaExact calls/bounded = %d/%v, want calls > 0 and all bounded",
+			spy.metaExactCalls, spy.metaExactAllBounded)
+	}
+	payload := map[string]any{
+		"type": float64(17),
+		"template_ref": map[string]any{
+			"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV2,
+		},
+		"state": "reasoning",
+		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
+	}
+	if _, err := catalog.RenderPayloadForPrincipal(
+		context.Background(), "bot-42", payload, cardtmpl.BuildEnv{SpaceID: "space-7"},
+	); err != nil {
+		t.Fatalf("RenderPayloadForPrincipal: %v", err)
+	}
+	if spy.lastRender.Access.Purpose != cardtmpl.CatalogPurposeNewSend ||
+		spy.lastRender.Access.Principal.Kind != cardtmpl.CatalogPrincipalBot ||
+		spy.lastRender.Access.Principal.ID != "bot-42" ||
+		spy.lastRender.Access.Principal.SpaceID != "space-7" {
+		t.Fatalf("catalog access = %+v", spy.lastRender.Access)
+	}
+}
+
+func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T) {
+	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
+		AdvertisedSend: []botTemplateRef{{
+			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+		}},
+		EditCompatible: []botTemplateRef{{
+			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
+		}},
+	})
+	if err == nil {
+		t.Fatal("catalog accepted an advertised send ref that cannot be edited")
+	}
+}
+
+func TestBotCardTemplatePolicyFailsClosed(t *testing.T) {
+	registry := testBotTemplateRegistry(t)
+	successor := botTemplateRef{
+		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+	}
+	missing := botTemplateRef{ID: "ai.missing", Version: "1.0.0"}
+	tests := []struct {
+		name   string
+		policy botTemplatePolicy
+	}{
+		{
+			name:   "empty advertised send",
+			policy: botTemplatePolicy{EditCompatible: []botTemplateRef{successor}},
+		},
+		{
+			name:   "empty edit compatible",
+			policy: botTemplatePolicy{AdvertisedSend: []botTemplateRef{successor}},
+		},
+		{
+			name: "duplicate edit compatible",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, successor},
+			},
+		},
+		{
+			name: "missing edit registry entry",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, missing},
+			},
+		},
+		{
+			name: "blank edit ref",
+			policy: botTemplatePolicy{
+				AdvertisedSend: []botTemplateRef{successor},
+				EditCompatible: []botTemplateRef{successor, {}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newBotCardTemplateCatalogWithPolicy(registry, tt.policy); err == nil {
+				t.Fatal("catalog accepted invalid policy")
+			}
+		})
+	}
 }
 
 func TestBotCardTemplateCatalogCapability(t *testing.T) {
@@ -196,7 +335,7 @@ func TestBotCardTemplateCatalogInvalidAndInternalRenderClassification(t *testing
 
 	// Schema-valid markdown reaches cardmsg.Validate and is a post-build render
 	// failure, not a caller-schema error. It remains zero-write and maps to the
-	// generic internal facade until the bounded successor schema lands.
+	// generic internal facade.
 	malicious := base()
 	malicious["data"].(map[string]any)["progressText"] = "[tap](javascript:alert(1))"
 	_, err = catalog.RenderPayload(context.Background(), malicious, cardtmpl.BuildEnv{})
@@ -290,4 +429,30 @@ func rawJSONToMap(t *testing.T, raw json.RawMessage) map[string]any {
 		t.Fatalf("unmarshal fixture: %v", err)
 	}
 	return out
+}
+
+type botCatalogSpy struct {
+	cardtmpl.Catalog
+	lastRender          cardtmpl.CatalogRenderRequest
+	metaExactCalls      int
+	metaExactAllBounded bool
+}
+
+func (s *botCatalogSpy) MetaExact(
+	ctx context.Context,
+	request cardtmpl.CatalogExactRequest,
+) (cardtmpl.TemplateMeta, error) {
+	_, bounded := ctx.Deadline()
+	if s.metaExactCalls == 0 {
+		s.metaExactAllBounded = bounded
+	} else {
+		s.metaExactAllBounded = s.metaExactAllBounded && bounded
+	}
+	s.metaExactCalls++
+	return s.Catalog.MetaExact(ctx, request)
+}
+
+func (s *botCatalogSpy) Render(ctx context.Context, request cardtmpl.CatalogRenderRequest) (map[string]any, error) {
+	s.lastRender = request
+	return s.Catalog.Render(ctx, request)
 }

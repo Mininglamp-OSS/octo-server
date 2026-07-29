@@ -73,6 +73,33 @@ func TestReadyReturnsSafeDependencyStatus(t *testing.T) {
 	require.Equal(t, int32(1), atomic.LoadInt32(&checker.calls))
 }
 
+func TestReadyIncludesRuntimeCatalogReadiness(t *testing.T) {
+	checker := &fakeReadinessChecker{result: readinessResult{
+		Status: healthStatusUp,
+		Dependencies: map[string]string{
+			"db": healthStatusUp, "redis": healthStatusUp,
+		},
+		Errors: map[string]error{},
+	}}
+	cn := &Common{
+		readinessChecker: checker,
+		catalogReadiness: func() error {
+			return errors.New("catalog startup pending")
+		},
+	}
+	r := wkhttp.New()
+	r.GET("/v1/ready", cn.ready)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.JSONEq(t,
+		`{"status":"down","dependencies":{"db":"up","redis":"up","card_template_catalog":"down"}}`,
+		w.Body.String())
+}
+
 func TestReadyBoundsCheckerWithTimeout(t *testing.T) {
 	checker := &fakeReadinessChecker{
 		check: func(ctx context.Context) readinessResult {

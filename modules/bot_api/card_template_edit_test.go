@@ -85,6 +85,41 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	}
 }
 
+func TestBotMessageEditRegistryTemplateKeepsLegacyVersionEditable(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutator := &fakeBotCardMutator{
+		snapshot: carddispatch.CardMutationSnapshot{
+			Envelope: initialRegistryEnvelopeVersion(t, catalog, aireasoningprocess.TemplateVersionV1, "reasoning"),
+			CardSeq:  1,
+		},
+		mutateResult: carddispatch.CardMutationResult{Applied: true},
+	}
+	ba := &BotAPI{
+		Log:           log.NewTLog("BotAPI-template-edit-legacy"),
+		cardTemplates: catalog,
+		cardMutator:   mutator,
+	}
+	body := registryEditBodyVersion(t, aireasoningprocess.TemplateVersionV1, "completed",
+		testReasoningDataVersion(t, aireasoningprocess.HandoffRootV1, "completed"), 2, false)
+
+	recorder := invokeTemplateEdit(t, ba, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if mutator.snapshotCalls != 1 || len(mutator.mutateRequests) != 1 {
+		t.Fatalf("snapshot/mutate calls = %d/%d", mutator.snapshotCalls, len(mutator.mutateRequests))
+	}
+	if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
+		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
+	}); err != nil {
+		t.Fatalf("legacy replacement identity: %v", err)
+	}
+}
+
 func TestBotMessageEditRegistryTemplatePreservesAuthoritativeSpaceAcrossEdits(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
@@ -205,6 +240,14 @@ func TestBotMessageEditRegistryTemplateFailsClosed(t *testing.T) {
 			name: "outer data state mismatch",
 			body: func(t *testing.T) map[string]any {
 				return registryEditBody(t, "error", testReasoningData(t, "completed"), 2, false)
+			},
+		},
+		{
+			name: "aggregate action overflow",
+			body: func(t *testing.T) map[string]any {
+				body := registryEditBody(t, "reasoning", testReasoningData(t, "reasoning"), 2, false)
+				body["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(4, 2, 2, 2, 2, 2)
+				return body
 			},
 		},
 		{
@@ -403,13 +446,60 @@ func initialRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog) []by
 	return raw
 }
 
+func initialRegistryEnvelopeVersion(
+	t *testing.T,
+	catalog *botCardTemplateCatalog,
+	version string,
+	state string,
+) []byte {
+	t.Helper()
+	root := aireasoningprocess.HandoffRootV2
+	if version == aireasoningprocess.TemplateVersionV1 {
+		root = aireasoningprocess.HandoffRootV1
+	}
+	data := testReasoningDataVersion(t, root, state)
+	env := cardtmplBuildEnvForTest()
+	payload, err := catalog.catalog.Render(context.Background(), cardtmpl.CatalogRenderRequest{
+		Access: botCatalogAccess(cardtmpl.CatalogPurposeHistoricalEdit, "test-bot", env.SpaceID),
+		ID:     aireasoningprocess.TemplateID, Version: version,
+		State: cardtmpl.State(state), Fields: data, Env: env,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload["template_ref"] = map[string]any{
+		"id": string(aireasoningprocess.TemplateID), "version": version,
+	}
+	payload["space_id"] = cardtmplBuildEnvForTest().SpaceID
+	payload["card_seq"] = int64(1)
+	if err := cardmsg.Finalize(payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 func registryEditBody(t *testing.T, state string, data json.RawMessage, cardSeq int64, transient bool) map[string]any {
+	return registryEditBodyVersion(t, aireasoningprocess.TemplateVersion, state, data, cardSeq, transient)
+}
+
+func registryEditBodyVersion(
+	t *testing.T,
+	version string,
+	state string,
+	data json.RawMessage,
+	cardSeq int64,
+	transient bool,
+) map[string]any {
 	t.Helper()
 	return map[string]any{
 		"message_id": "1001", "message_seq": uint32(7),
 		"channel_id": "user_creator", "channel_type": common.ChannelTypePerson.Uint8(),
 		"template_ref": map[string]any{
-			"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersion,
+			"id": string(aireasoningprocess.TemplateID), "version": version,
 		},
 		"state": state, "data": rawJSONToMap(t, data), "card_seq": cardSeq, "transient": transient,
 	}

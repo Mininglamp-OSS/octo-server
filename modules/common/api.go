@@ -36,6 +36,7 @@ type Common struct {
 	appConfigDB      *appConfigDB
 	systemSettings   *SystemSettings
 	readinessChecker readinessChecker
+	catalogReadiness func() error
 	threadOn         int // 缓存 DM_THREAD_ON 环境变量
 }
 
@@ -56,6 +57,7 @@ func New(ctx *config.Context) *Common {
 		appConfigDB:      newAppConfigDB(ctx),
 		systemSettings:   EnsureSystemSettings(ctx),
 		readinessChecker: newDependencyReadinessChecker(ctx, database),
+		catalogReadiness: currentCardTemplateCatalogReadinessCheck(),
 		Log:              log.NewTLog("common"),
 		threadOn:         threadOn,
 	}
@@ -394,6 +396,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			DriveOn:                cn.systemSettings.DriveEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 			MessageReaction:        messageReaction,
@@ -443,6 +446,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		DriveOn:                cn.systemSettings.DriveEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 		MessageReaction:        messageReaction,
@@ -822,6 +826,13 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DocsOn bool `json:"docs_on"`
+
+	// DriveOn 告知客户端是否展示网盘(drive)模块入口。值来源于 system_setting
+	// drive.enabled；默认 false —— 独立部署的 octo-drive 服务尚未上线，先隐藏入口，
+	// 上线后由管理台切 drive.enabled 灰度放开。只表达展示策略，服务端鉴权在 octo-drive
+	// 自身，本字段不承担任何鉴权。与 app_config.version 解耦的原因同 DocsOn：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	DriveOn bool `json:"drive_on"`
 
 	// dmloop.enabled / dmpersonal.enabled；默认 false —— loop(回路)与「我的/运行时」入口在
 	// 后端服务就绪前先隐藏,上线后由管理台切对应 system_setting 灰度放开。两者分开:

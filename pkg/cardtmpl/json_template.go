@@ -5,8 +5,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"path"
-	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/jsontmpl"
@@ -19,8 +17,19 @@ import (
 // per-view template trees are parsed once at register time (viewAST) and only
 // re-bound per render — no per-frame JSON parse (progress cards re-render often).
 type jsonTemplate struct {
-	meta    TemplateMeta
-	viewAST map[ViewKey]any
+	meta                 TemplateMeta
+	viewAST              map[ViewKey]any
+	aggregateArrayLimits []jsonTemplateAggregateArrayLimit
+}
+
+type jsonTemplateFieldValidator interface {
+	validateFields(any) error
+}
+
+type jsonTemplateAggregateArrayLimit struct {
+	ParentArray   string `json:"parentArray"`
+	ChildArray    string `json:"childArray"`
+	MaxTotalItems int    `json:"maxTotalItems"`
 }
 
 // SetMeta satisfies metaSetter; Registry injects the assembled meta at Register.
@@ -28,6 +37,64 @@ func (t *jsonTemplate) SetMeta(m TemplateMeta) { t.meta = m }
 
 // Meta returns a defensive deep copy, matching the Template contract.
 func (t *jsonTemplate) Meta() TemplateMeta { return t.meta.Clone() }
+
+func (t *jsonTemplate) validateFields(value any) error {
+	if len(t.aggregateArrayLimits) == 0 {
+		return nil
+	}
+	root, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("JSON template fields are %T, want object", value)
+	}
+	for _, limit := range t.aggregateArrayLimits {
+		parentValue, exists := root[limit.ParentArray]
+		if !exists {
+			continue
+		}
+		parents, ok := parentValue.([]any)
+		if !ok {
+			return fmt.Errorf("aggregate parent %q is %T, want array", limit.ParentArray, parentValue)
+		}
+		total := 0
+		for index, parentValue := range parents {
+			parent, ok := parentValue.(map[string]any)
+			if !ok {
+				return fmt.Errorf("aggregate parent %q item %d is %T, want object", limit.ParentArray, index, parentValue)
+			}
+			childValue, exists := parent[limit.ChildArray]
+			if !exists {
+				continue
+			}
+			children, ok := childValue.([]any)
+			if !ok {
+				return fmt.Errorf("aggregate child %q[].%q is %T, want array", limit.ParentArray, limit.ChildArray, childValue)
+			}
+			total += len(children)
+			if total > limit.MaxTotalItems {
+				return fmt.Errorf("aggregate %s[].%s has %d items, max %d",
+					limit.ParentArray, limit.ChildArray, total, limit.MaxTotalItems)
+			}
+		}
+	}
+	return nil
+}
+
+func (t *jsonTemplate) validateRawFields(fields json.RawMessage) error {
+	if len(fields) == 0 {
+		return fmt.Errorf("%w: fields must not be empty", ErrFieldsInvalid)
+	}
+	var parsed any
+	if err := json.Unmarshal(fields, &parsed); err != nil {
+		return fmt.Errorf("%w: %v", ErrFieldsInvalid, err)
+	}
+	if err := t.meta.InputSchema.Validate(parsed); err != nil {
+		return fmt.Errorf("%w: %v", ErrFieldsInvalid, err)
+	}
+	if err := t.validateFields(parsed); err != nil {
+		return fmt.Errorf("%w: %v", ErrFieldsInvalid, err)
+	}
+	return nil
+}
 
 // jsonTemplateEscaper is the data-escaping policy for JSON templates (decision
 // D6): identity. Goldens bind caller data literally; the trust boundary is
@@ -79,13 +146,15 @@ func (t *jsonTemplate) Build(ctx context.Context, state State, fields json.RawMe
 // clients reduce the card to. Unlike Render this path does not run the full
 // cardmsg.Validate gate (the built card is a body/actions fragment, not a wire
 // payload). Its resource surface is bounded on the input side by jsontmpl.Expand's
-// maxExpandNodes ceiling (so an unbounded $data array can't balloon the fragment);
-// note BuildPlain itself imposes NO payload-size limit (only Finalize /
+// maxExpandNodes ceiling (so an unbounded $data array can't balloon the fragment).
+// It runs the same schema and JSON-template semantic constraints as Render before
+// expansion. BuildPlain itself imposes NO final payload-size limit (only Finalize /
 // RecheckPayloadSize do, neither runs here — PR #654 review yujiawei P2). Injection
 // is not a concern — BuildPlain reduces markdown links to their visible label.
-// When this path is first wired to a send path it should additionally run
-// InputSchema.Validate + a payload-size check (no production caller today).
 func (t *jsonTemplate) FallbackText(state State, fields json.RawMessage, lang string) (string, error) {
+	if err := t.validateRawFields(fields); err != nil {
+		return "", err
+	}
 	br, err := t.Build(context.Background(), state, fields, BuildEnv{Lang: lang})
 	if err != nil {
 		return "", err
@@ -109,28 +178,16 @@ func (t *jsonTemplate) FallbackText(state State, fields json.RawMessage, lang st
 // registration guarantees as Go cards (missing template / schema / bad sample /
 // whitelist violation all panic at boot, never at first render).
 func (r *Registry) RegisterJSON(assets embed.FS, root string) {
-	mf := loadManifest(assets, root)
-	viewAST := make(map[ViewKey]any, len(mf.Views))
-	for vk, vs := range mf.Views {
-		if strings.TrimSpace(vs.Template) == "" {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: view %q in %s/manifest.json declares no template path", vk, root))
-		}
-		p := path.Join(root, vs.Template)
-		b, err := assets.ReadFile(p)
-		if err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: read template %s: %w", p, err))
-		}
-		var ast any
-		if err := json.Unmarshal(b, &ast); err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: parse template %s: %w", p, err))
-		}
-		// Fail-close: every Action.ToggleVisibility target must resolve to an
-		// element id in the same template (a dangling target is an authoring bug
-		// — a button that toggles nothing — caught here, not at first render).
-		if err := jsontmpl.ValidateToggleTargets(ast); err != nil {
-			panic(fmt.Errorf("cardtmpl: RegisterJSON: template %s: %w", p, err))
-		}
-		viewAST[vk] = ast
+	bundle, err := LoadJSONBundle(assets, root, CatalogDescriptor{
+		Engine:     JSONTemplateEngineV1,
+		Visibility: CatalogVisibilityPrivate,
+	})
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: RegisterJSON %s: %w", root, err))
 	}
-	r.Register(&jsonTemplate{viewAST: viewAST}, assets, root)
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, staticCompileLimits())
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: RegisterJSON %s: %w", root, err))
+	}
+	r.registerCompiledJSON(artifact)
 }

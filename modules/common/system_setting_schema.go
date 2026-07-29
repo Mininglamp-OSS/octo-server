@@ -204,6 +204,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// drive(网盘)模块展示开关。独立部署的 octo-drive 服务尚未上线，默认关闭；上线后由管理台
+	// 切 drive.enabled 灰度放量。仅表达展示策略，服务端鉴权在 octo-drive 自身。经 GET
+	// /v1/common/appconfig 的 drive_on 下发给客户端。
+	{Category: "drive", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示网盘(drive)模块入口（octo-drive 上线前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveEnabled()) }},
+
 	// Loop(回路)模块展示开关。loop 依赖后端服务 + fleet 代理 + daemon runtime 一整套,未就绪前
 	// 默认关闭;feature 分支合入 main 也不暴露,上线后由管理台切 dmloop.enabled 灰度放量。仅表达
 	// 展示策略,不承担服务端鉴权(/fleet 鉴权在后端)。经 GET /v1/common/appconfig 的 dmloop_on 下发给客户端。

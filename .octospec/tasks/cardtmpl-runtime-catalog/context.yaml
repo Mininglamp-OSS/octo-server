@@ -1,0 +1,20 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: 控制面是显式 global superAdmin 路由，不使用普通业务 Space middleware；actor 只取认证上下文，未来 Space grant 必须由 PR-C 以 authoritative scope 单独实现。
+  - id: trust-boundary
+    source: repo
+    why: bundle、schema、template、sample 和 golden 均是不可信控制面输入；严格 JSON、资源预算、bundle-local ref、共享 renderCore/cardmsg.Validate 与 inactive-only publish 构成不可绕过边界。
+  - id: error-handling
+    source: repo
+    why: validate/publish 的所有用户可见错误均使用 httperr.ResponseErrorL 和已注册 i18n code；只暴露 bounded category/document，内部 cause 与 bundle 内容不回显。
+  - id: rate-limit
+    source: repo
+    why: manager routes 按 AuthMiddleware → SharedUIDRateLimiter → superAdmin guard 安装；不手写 Redis 请求频率计数器。
+  - id: testing
+    source: repo
+    why: TDD checkpoint 覆盖 compiler trust boundary、canonical identity、immutable transaction、static reconciliation、HTTP auth/body/error、metrics、coverage 与 race；本地脏 DB 限制被显式记录。
+  - id: commit-style
+    source: repo
+    why: 提交使用英文 Conventional Commits 并带 Refs #669；PR #674 使用英文模板、Linked Spec 与实质性 COMPREHENSION。
+brief: .octospec/tasks/cardtmpl-runtime-catalog/brief.md

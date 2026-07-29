@@ -23,6 +23,7 @@ package message
 // 可重试）。防枚举：除成员资格（403 语义）外全部归并到单一 400 invalid，具体原因只进日志。
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -219,7 +220,13 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
-	cardContext, err := resolveRegistryCardContext(effective, req.ActionID, actionData)
+	cardSpaceID := m.resolveCardOriginSpaceID(msgM)
+	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeActionContext,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: msgM.FromUID, SpaceID: cardSpaceID,
+		},
+	}, effective, req.ActionID, actionData)
 	if err != nil {
 		m.releaseCardClaim(idemKey)
 		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
@@ -250,7 +257,7 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	// (操作者同属 A、B 两 Space 时可用 X-Space-ID: B 点 A 的卡)。与 send 出口
 	// "服务端权威、无权威值即 strip"同口径:取不到则省略键(fail-closed),绝不回退到
 	// 客户端可影响的上下文 Space。
-	if cardSpaceID := m.resolveCardOriginSpaceID(msgM); cardSpaceID != "" {
+	if cardSpaceID != "" {
 		eventData["space_id"] = cardSpaceID
 	}
 	if actionData != nil {
@@ -296,7 +303,13 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 // resolveRegistryCardContext binds callback context to metadata and interaction
 // reports from the effective server-authored frame. Cards without octo-card
 // template metadata retain the legacy zero context.
-func resolveRegistryCardContext(effective []byte, actionID string, actionData map[string]interface{}) (cardactiondispatch.CardContext, error) {
+func resolveRegistryCardContext(
+	ctx context.Context,
+	access cardtmpl.CatalogAccess,
+	effective []byte,
+	actionID string,
+	actionData map[string]interface{},
+) (cardactiondispatch.CardContext, error) {
 	ref, ok := cardmsg.CardTemplateContext(effective)
 	if !ok {
 		if cardmsg.HasCardTemplateMetadata(effective) {
@@ -304,11 +317,16 @@ func resolveRegistryCardContext(effective []byte, actionID string, actionData ma
 		}
 		return cardactiondispatch.CardContext{}, nil
 	}
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return cardactiondispatch.CardContext{}, errors.New("message: cardtmpl registry unavailable")
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return cardactiondispatch.CardContext{}, errors.New("message: cardtmpl catalog unavailable")
 	}
-	view, err := registry.ActionView(cardtmpl.ID(ref.ID), ref.Version, actionID)
+	resolved, err := catalog.ActionContext(ctx, cardtmpl.CatalogActionRequest{
+		CatalogExactRequest: cardtmpl.CatalogExactRequest{
+			Access: access, ID: cardtmpl.ID(ref.ID), Version: ref.Version,
+		},
+		ActionID: actionID,
+	})
 	if err != nil {
 		return cardactiondispatch.CardContext{}, err
 	}
@@ -318,18 +336,14 @@ func resolveRegistryCardContext(effective []byte, actionID string, actionData ma
 	// assertActionContract 已强制 data.owner==template owner,故此断言只挡手工构造的
 	// 错配卡:防止一张 metadata 声明 docs 模板、data.owner 却指向别的已注册路由的卡,
 	// 把带 docs 身份的 octo-card-v1 信封投递到错误路由。
-	tmpl, err := registry.Lookup(cardtmpl.ID(ref.ID), ref.Version)
-	if err != nil {
-		return cardactiondispatch.CardContext{}, err
-	}
-	if contract := tmpl.Meta().ActionContract; contract != nil {
+	if contract := resolved.Meta.ActionContract; contract != nil {
 		routeOwner, _ := actionData["owner"].(string)
 		if strings.TrimSpace(routeOwner) != contract.Owner {
 			return cardactiondispatch.CardContext{}, errors.New("message: card template owner does not match action route owner")
 		}
 	}
 	return cardactiondispatch.CardContext{
-		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(view),
+		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(resolved.View),
 	}, nil
 }
 

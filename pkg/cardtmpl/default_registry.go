@@ -6,7 +6,8 @@ import (
 
 // defaultRegistry 是进程内单一 Registry。main.go composition root 通过
 // SetDefaultRegistry 注入构造好的 Registry(注册所有 L2a Template + Freeze)。
-// 业务代码通过 DefaultRegistry() 拿到只读引用后调 Render。
+// 它只供启动期 registration/static reconciliation 和兼容测试使用；生产运行期
+// consumer 统一通过 DefaultCatalog() 读取，避免绕过 dynamic block/active 真相。
 //
 // 采用 pkg-scoped default 而非全局单例是权衡:
 //   - test 环境可以 SetDefaultRegistry(nil) 后自己构造独立 Registry;
@@ -24,7 +25,7 @@ func SetDefaultRegistry(r *Registry) {
 	defaultRegistry = r
 }
 
-// DefaultRegistry 返回当前默认 Registry。未注入 → nil,调用方须自行判空并降级。
+// DefaultRegistry 返回启动期 built-in Registry。未注入 → nil。
 func DefaultRegistry() *Registry {
 	defaultRegistryMu.RLock()
 	defer defaultRegistryMu.RUnlock()

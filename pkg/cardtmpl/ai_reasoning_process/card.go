@@ -1,14 +1,16 @@
 // Package aireasoningprocess wires the AI reasoning-process progress card
-// (ai.reasoning-process@0.1.0) into the cardtmpl base. Unlike the Go-authored
-// L2a cards, this card ships as a pure JSON handoff (roadmap E1): it has no
+// (ai.reasoning-process@0.1.0 and its bounded 0.2.0 successor) into the cardtmpl
+// base. Unlike the Go-authored L2a cards, this card ships as a pure JSON handoff
+// (roadmap E1): it has no
 // hand-written Template — the base compiles its `.template.json` views via
 // Registry.RegisterJSON. This package only embeds the handoff assets and
 // exposes their identity for the composition root.
 //
 // Registration (in the composition root):
 //
-//	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRoot)
-//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersion)
+//	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
+//	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
 //
 // Layering: L1 JSON artifacts live under handoff/. The card carries the
 // producer's own action buttons (reasoning_stop / reasoning_retry Submit +
@@ -31,10 +33,18 @@ import (
 var Assets embed.FS
 
 const (
-	// HandoffRoot is the root path of the embedded handoff assets.
-	HandoffRoot = "handoff/ai.reasoning-process@0.1.0"
 	// TemplateID is the stable card identifier.
 	TemplateID cardtmpl.ID = "ai.reasoning-process"
-	// TemplateVersion is this card's current version.
-	TemplateVersion = "0.1.0"
+
+	// HandoffRootV1 and TemplateVersionV1 identify the frozen first release.
+	HandoffRootV1     = "handoff/ai.reasoning-process@0.1.0"
+	TemplateVersionV1 = "0.1.0"
+	// HandoffRootV2 and TemplateVersionV2 identify the bounded successor.
+	HandoffRootV2     = "handoff/ai.reasoning-process@0.2.0"
+	TemplateVersionV2 = "0.2.0"
+
+	// HandoffRoot and TemplateVersion retain the package's current-version
+	// aliases for callers that do not need an explicit historical version.
+	HandoffRoot     = HandoffRootV2
+	TemplateVersion = TemplateVersionV2
 )
