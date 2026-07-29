@@ -4,6 +4,33 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-29 (inactive-hiding-user-control, Batch 1)
+
+- **Consistency** — Archived 子区 now leave every conversation list, not just
+  `/v1/conversation/sync`: `dropArchivedThreadItems` converges both
+  `/v1/sidebar/sync` tabs on the same `status=active` predicate, fail-open on an
+  unknown status. Extends the direction XIN-1135 set for the self-created
+  exemption to the paths it left open. See
+  [journal](journal/shared/inactive-hiding-user-control.md) and
+  [brief](tasks/inactive-hiding-user-control/brief.md).
+- **Config** — Thread auto-archive policy (`enabled` / `days`) moved from
+  env-only to `system_settings` with DB → env → code-default resolution and no
+  migration-written row, so rollout is behaviour-identical. The worker re-reads
+  policy per tick (no restart to change it) and `effective_value` makes the
+  running window queryable for the first time.
+- **Invariant** — `archive_days >= recent_filter_thread_days` enforced on both
+  keys' write entry points against the post-merge state: the two windows are a
+  two-stage decay, and inverting them makes the recent-tab window silently
+  unobservable.
+- **Safety** — Unread / pinned / system-bot conversations are now exempt from
+  the inactivity window on both endpoints. A window that can swallow unread
+  cannot be handed to users, so this is a precondition for the per-user windows
+  in Batch 2, not a follow-up.
+- **Learning (pending)** — A cross-key `system_setting` merge guard must resolve
+  an empty payload as reset-to-default; carrying the current value forward lets
+  a clearing write land in the state the guard exists to reject. See
+  [learning](learnings/pending/system-setting-empty-payload-is-reset-not-keep.md).
+
 ## 2026-07-24 (bot-card-template-consumption, roadmap E1b)
 
 - **Protocol** — Added the explicit Bot Registry template catalog to
