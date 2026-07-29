@@ -781,22 +781,26 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// 会让客户端反复拉同一批（与 PR-B #1377 / sidebar B1 同一类死循环）。
 	// per-Space 未读仍基于 raw conversations（见下方 fillPersonSpaceUnread），不受影响。
 	//
-	// 系统 Bot 可见性：person 窗口默认 0（不过滤 DM），系统 Bot 默认安全。当
-	// 请求带 space_id 时，EnsureSystemBotsPresent 在 Space 过滤块里、本步之后兜底
-	// 补齐，即便管理员开了 person 窗口也不会丢失系统 Bot —— Web「最近」tab 正是带
-	// space_id 调用，故实际使用安全。仅「不带 space_id + recent_filter=true +
-	// person 窗口>0」这一非常规组合下，安静的系统 Bot DM 可能被本步过滤掉。
+	// 系统 Bot 可见性：keepDespiteRecentWindow 直接豁免系统 Bot 的 DM，与
+	// person 窗口取值无关（task inactive-hiding-user-control / P2）。此前这里记录的
+	// 「不带 space_id + recent_filter=true + person 窗口>0 时安静的系统 Bot DM 可能
+	// 被过滤掉」这一缺口已由该豁免关闭 —— 带 space_id 时 EnsureSystemBotsPresent 的
+	// 事后补齐仍在，两条路径现在都保证系统 Bot 可见。
 	if req.RecentFilter {
-		cutoffs := loadRecentCutoffs(co.ctx, time.Now())
 		// 置顶集合只在 opt-in 时查一次，移动端/桌面端（不传 recent_filter）不付这笔
-		// 成本。失败按 sidebar 同款降级：warn + 空集合，未读豁免不受影响 —— 两个端点
-		// 的失败方向保持一致，避免又长出一处 per-endpoint 差异。
+		// 成本。
+		//
+		// FAIL-OPEN：查询失败时**整步跳过窗口过滤**，而不是拿一个明知不完整的豁免
+		// 集合继续过滤（PR #679 review, yujiawei）。前者只是本次多显示几条陈旧会话，
+		// 后者会因为一次 DB 抖动把用户置顶的安静会话直接从列表里抹掉 —— 与本任务
+		// 在 P0 定下的方向（宁可短暂多显示，绝不因查询抖动藏东西）相反。
 		pinnedSet, perr := loadPinnedChannelSet(co.ctx, loginUID, filterSpaceID)
 		if perr != nil {
-			co.Warn("会话同步：置顶查询失败（非致命，本次不套用置顶豁免）", zap.Error(perr))
-			pinnedSet = map[string]struct{}{}
+			co.Warn("会话同步：置顶查询失败（非致命，本次跳过活跃窗口过滤）", zap.Error(perr))
+		} else {
+			cutoffs := loadRecentCutoffs(co.ctx, time.Now())
+			syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs, pinnedSet)
 		}
-		syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs, pinnedSet)
 	}
 
 	// ---------- 子区 source_message_id ----------

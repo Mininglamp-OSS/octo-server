@@ -59,11 +59,33 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 		now: time.Now,
 		policy: func() (bool, time.Duration) {
 			ss := commonapi.EnsureSystemSettings(ctx)
-			return ss.ThreadAutoArchiveEnabled(),
-				time.Duration(ss.ThreadAutoArchiveDays()) * 24 * time.Hour
+			return ss.ThreadAutoArchiveEnabled(), archiveThresholdFromDays(ss.ThreadAutoArchiveDays())
 		},
 		Log: log.NewTLog("ThreadArchiveWorker"),
 	}
+}
+
+// maxArchiveDays 是 days → time.Duration 转换的安全上限。
+//
+// time.Duration 是 int64 纳秒，约 106,751 天即溢出；再大就会回绕成一个**小的正数**
+// 阈值（例如 ~213,504 天 ≈ 25 分钟），把几乎所有子区都归档掉。env 层现在按 legacy
+// 语义原样接受任意非负整数（见 common.threadAutoArchiveDaysFromEnv），所以这个转换
+// 必须自己设防（PR #679 review, yujiawei）。
+//
+// 上限取 36500 天（100 年）：远超任何真实策略，且离溢出点有两个数量级的余量。超过
+// 即视为「实质不归档」，钳到上限而不是回绕。
+const maxArchiveDays = 36500
+
+// archiveThresholdFromDays 把天数转成 time.Duration，并挡住会让 int64 回绕的取值。
+// days <= 0 原样返回 0，保留「禁用时间阈值」语义。
+func archiveThresholdFromDays(days int) time.Duration {
+	if days <= 0 {
+		return 0
+	}
+	if days > maxArchiveDays {
+		days = maxArchiveDays
+	}
+	return time.Duration(days) * 24 * time.Hour
 }
 
 // resolvePolicy 取当前生效的策略。注入了 policy 就用它（生产：每 tick 读

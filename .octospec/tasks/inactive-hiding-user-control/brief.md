@@ -142,7 +142,18 @@ source: self
 ### P0 — 统一可见性谓词
 
 - [ ] archived 子区不出现在 `/v1/sidebar/sync` **recent tab** items（IM 返回路径）。
-- [ ] archived 子区不出现在 `/v1/sidebar/sync` **follow tab** items，IM-present（`buildFollowItems`）与 DB-only（`mergeThreadEntries`）**两条路径各一例**。
+      **未交付 handler 级用例**：`modules/message` 的 handler 测试受既有
+      `-tags integration` import cycle 阻塞（见下方 §Pre-existing），当前只有
+      `dropArchivedThreadItems` 的纯函数覆盖。保持未勾，作为 follow-up 跟踪。
+- [ ] ~~archived 子区不出现在 `/v1/sidebar/sync` **follow tab** items~~ —— **已撤销**
+      （PR #679 review, yujiawei）。follow tab 的响应不只是「要显示什么」，它是三端
+      唯一的**关注状态真源**（每条带 `is_followed`，Web/iOS/Android 都只从它构建
+      followedKeys）。把 archived 从中移除会让已关注的归档子区 `is_followed` 变
+      false，「取消关注」反转成「关注」—— 取消关注变得不可能，而这恰好发生在
+      「已归档」浏览界面，也就是本 brief 指认为 P0 安全垫的那个入口。
+      产品目标在 follow tab 上已由三端自行满足（Web 与 IM 缓存取交集 + channelInfo
+      优先过滤，iOS 按 thread REST status 排除非 active，Android 构建关注列表时跳过
+      thread 条目）。**归档收口因此只作用于 recent tab。**
 - [ ] 回归：archived 子区仍不出现在 `/v1/conversation/sync`。
 - [ ] **复活闭环**：`RecordMessageAndReactivate` 后，同一子区在三条路径重新可见（P0 后这是唯一回归路径，见 Background §5）。
 - [ ] **cursor 不被影响**：构造「本批最高 version 的会话恰为 archived 子区」，断言 `respVersion` / `lastVersion` 仍前进（形状照 `TestE2E_ConvSync_CursorNotStalledByFilter`）。
@@ -152,7 +163,16 @@ source: self
 ### P1 — 配置迁入 system_settings
 
 - [ ] `thread.auto_archive_enabled` / `thread.auto_archive_days` 三级回落：DB → env → 代码默认（false / 3）。**迁移不写任何 DB 行**，上线瞬间行为与现网一致。
-- [ ] 越界值（负数 / >3650）回退默认。
+- [ ] 越界值回退默认 —— **仅适用于 DB / 管理台来源的值**。env 层**不设上界**：它是
+      现网既有配置的兼容垫，`DM_THREAD_AUTO_ARCHIVE_DAYS=9999` 的语义是「实质不
+      归档」，上线时折成 3 天会批量归档长期存活的子区，与上一行「上线瞬间行为与
+      现网一致」直接冲突。原先本行写成无差别回退，与上一行自相矛盾，且 PR 断言了
+      没实现的那条 —— 已按此调和（PR #679 review, Jerry-Xin / yujiawei）。
+      env 层只保留 legacy `parseDays` 语义：空/非法/负值回退默认，0 合法，其余非负
+      整数原样生效。
+- [ ] days → `time.Duration` 转换设上限（`archiveThresholdFromDays`）。env 层放开上界
+      后，超过约 106,751 天会让 int64 回绕成**小的正数**阈值（如 ~213,504 天 ≈ 25
+      分钟），把几乎所有子区归档掉 —— 与「大值 = 不归档」的意图完全相反。
 - [ ] `auto_archive_days=0` 保留 env 语义：禁用时间阈值但 `enabled` 仍可为 true（`RunOnce` 的 `Threshold<=0` 短路，`archive_worker.go:114`）。
 - [ ] **worker 每 tick 重读配置**：运行中把 `enabled` 由 true 改 false，下一 tick 不再归档；反向亦然。
 - [ ] 偏序约束 `thread.auto_archive_days >= sidebar.recent_filter_thread_days` 在**两个 key 的写入口都**强制（只在一侧校验可从另一侧绕过）；覆盖「同批写两个」与「只写其一、与存量比较」。
@@ -163,7 +183,12 @@ source: self
 
 - [ ] 未读 > 0 的会话**不被时间窗口隐藏**（`buildRecentItems` 与 `filterRecentConversations` 两处）。
 - [ ] 用户置顶的会话**不被时间窗口隐藏**；`buildRecentItems` 当前先过滤后打 `IsPinned`（`api_sidebar.go:1165` vs `:1168`），须调整判定顺序。
-- [ ] sidebar 侧系统 Bot 顺序修正：`EnsureSystemBotsPresentRaw` 当前在过滤**之前**（`api_sidebar.go:282`）且占位 `Timestamp` 为零值，person 窗口 >0 时会被丢弃；须挪到过滤之后，与 `/v1/conversation/sync`（`api_conversation.go:914`）对齐。
+- [ ] sidebar 侧系统 Bot 在 person 窗口 >0 时不得丢失（占位 `Timestamp` 为零值）。
+      **实现方式偏离本条原措辞**（原文要求把 `EnsureSystemBotsPresentRaw` 挪到过滤
+      之后）：改为在 `keepDespiteRecentWindow` 里豁免系统 Bot。结果等价，但不必在
+      Space 过滤块内部调整顺序，风险更低；顺带关闭了 `/v1/conversation/sync` 注释里
+      自陈的「不带 space_id + person 窗口>0」缺口。记录为机制替换而非静默吸收
+      （PR #679 review, yujiawei）。
 
 ### 全局
 
@@ -171,6 +196,44 @@ source: self
 - [ ] `go test ./modules/message/... ./modules/thread/... ./modules/common/...` 通过。
 - [ ] `golangci-lint run ./...` 通过。
 - [ ] P1 在默认配置下无行为变化；P0 的行为收紧与 P2 的豁免在 PR 描述中显式记录。
+
+## 已知边界（评审要求显式记录，非缺陷）
+
+- **P0 与 P2 冲突时 P0 赢。** 一个既 archived 又置顶/有未读的子区仍会被 recent tab
+  丢弃 —— 归档是话题生命周期的客观事实，压过每人视图的豁免。三端本就在客户端隐藏
+  archived，且任何新消息都会复活，故无回归。
+- **静音但有未读的群永远不淡出。** `keepDespiteRecentWindow` 没有 mute 入参，两个
+  调用点也都拿不到（`config.SyncUserConversationResp` 无 mute 字段，`SidebarItem`
+  不暴露；用 `/v1/conversation/sync` 的 `Mute` 会重新制造 per-endpoint 分叉）。后果：
+  用户静音一个吵闹的群并从此不点开，未读常驻，该群永不隐藏。**Batch 2 把窗口交给
+  用户前必须处理**，否则用户会期待「静音且忽略的群应当消失」。
+- **偏序守卫不是不可绕过的。** 它对着进程本地快照（60s TTL）校验且在写事务之外，
+  所以同实例并发写、或 60s 内跨副本的两次写，都可能提交守卫本要禁止的组合。与既有
+  space-welcome 复合校验同形，且结果是可恢复的配置错误 —— 但守卫的价值主张是「运维
+  到不了那个状态」，这一点并不严密。
+- **守卫只覆盖 DB→DB。** `ViolatesThreadArchiveOrdering` 在 `!ArchiveEnabled` 时短路，
+  因此「DB 里写了很宽的 `recent_filter_thread_days`，之后用 env 打开归档」不会被检查；
+  纯 env 来源的 `auto_archive_days` 也从不与 `recent_days` 比较。
+- **`effective_value` 可能超出写路径接受的范围。** env 放开上界后
+  `thread.auto_archive_days` 的 `effective_value` 可能是 9999，而把同一个值 POST 回去
+  会被 `[0, 3650]` 拒绝 —— 管理表单「原样保存」会 400。这是兼容性选择的真实代价，
+  要么放宽该 key 的写入上界，要么在响应里标注「env 提供，超出管理范围」。
+- **`ArchiveConfig.Enabled` / `Threshold` 在生产是死字段。** `resolvePolicy` 只在
+  `policy == nil`（即单测）时回落 cfg，于是同一个 env 变量有两个解析器，而 worker
+  测试套件钉的是没人用的那个。建议后续删除这两个字段，让每个 env 变量只有一个解析者。
+- **跨 Space 未读豁免今天就可达。** `filterRecentConversations` 读的是
+  `fillPersonSpaceUnread` 之前的跨 Space `r.Unread`；管理员把 person 窗口设为非零即可
+  触发（本 PR 自己的 e2e 就这么做）。方向是 fail-open。
+
+## Pre-existing（阻塞验收但非本任务引入，`origin/main` 同样复现）
+
+- **`go test -tags integration ./modules/message/` 无法编译** —— import cycle
+  `api_card_action_test.go → app_bot → bot_api → messages_search → message`，导致该
+  模块 **16 个** integration 文件全部失效，包括本任务验收引用的两个 recent-filter e2e。
+  这是上面两条验收保持未勾的直接原因。
+- **`TestE2E_ConvSync_*` 在 `TestE2E_RecentFilter_*` 之后运行必失败** ——
+  `testutil.NewTestServer` 把 handler ctx 绑到进程内**第一个** server 的 config，
+  fake IM 必须在首次调用前注册。
 
 ## Open questions
 

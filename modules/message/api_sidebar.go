@@ -438,6 +438,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 
 	// 2e. Pinned channels
 	pinnedSet, err := sb.loadPinnedSet(loginUID, spaceID)
+	pinnedLoadFailed := err != nil
 	if err != nil {
 		sb.Warn("sidebar sync: pinned query failed (non-fatal)", zap.Error(err))
 		pinnedSet = map[string]struct{}{}
@@ -574,6 +575,13 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 	case "recent":
 		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
+		if pinnedLoadFailed {
+			// FAIL-OPEN：置顶集合不可信时整体不套用活跃窗口，而不是拿空豁免集合
+			// 继续过滤（否则一次 DB 抖动就会抹掉用户置顶的安静会话）。与
+			// /v1/conversation/sync 的同款降级保持一致（PR #679 review, yujiawei）。
+			cutoffs = recentCutoffs{}
+			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
+		}
 		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
@@ -584,27 +592,36 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		} else {
 			backfillThreadStatus(items, statusMap)
 		}
-	}
 
-	// 3.5 归档子区统一收口（task inactive-hiding-user-control / P0）。
-	//
-	// 收敛到 /v1/conversation/sync 早已在跑的 status=active 语义：archived 子区不
-	// 进任何会话列表。此前只有 XIN-1135 给 follow tab 的「自建豁免」补了 active
-	// 守卫（见 mergeThreadEntries），follow tab 的常规路径与整个 recent tab 仍然
-	// 放行，同一个子区因此在移动端消失、在 Web 侧栏还在。
-	//
-	// 放在这里而不是各 build 函数内部，是因为两个 tab 的 status 来源不同
-	// （follow 走 loadThreadLastMsgAt，recent 走 loadThreadStatuses），但都已在
-	// 上面 backfill 到 SidebarItem.Status，此处是唯一的公共汇合点。
-	//
-	// FAIL-OPEN：只丢 Status 明确等于 archived 的条目。status 查询失败时 recent
-	// tab 把 Status 留空（0），这里据此保留 —— 与该 tab 既有的 fail-open 降级、
-	// 以及 /v1/conversation/sync 查询失败即跳过过滤的方向一致。宁可短暂多显示，
-	// 绝不因为一次查询抖动把用户的子区藏起来。
-	//
-	// 归档非终态：任何人发消息经 RecordMessageAndReactivate 抬回 active，下一次
-	// sync 即重新出现；手动取消归档同理。客户端另有「已归档」分组可浏览。
-	items = dropArchivedThreadItems(items)
+		// 归档子区收口 —— **仅 recent tab**（task inactive-hiding-user-control / P0）。
+		//
+		// 收敛到 /v1/conversation/sync 早已在跑的 status=active 语义：安静到被归档的
+		// 子区不再占据「最近」列表。
+		//
+		// **为什么不对 follow tab 做同样的过滤**（PR #679 review, yujiawei）：
+		// follow tab 的响应不只是「要显示什么」，它是客户端唯一的**关注状态真源** ——
+		// 每个条目带 is_followed=true，三端都只从这里构建 followedKeys：
+		//   - Web  ThreadPanel 用 threadList(status:"all") 列出含归档的子区，再从
+		//          tab=follow 推导 is_followed，handleFollow 据此在 follow/unfollow
+		//          之间分支；
+		//   - iOS  WKFollowedKeysStore / Android FollowedKeysStore 同理。
+		// 一旦把 archived 从 follow tab 拿掉，已关注的归档子区 is_followed 变 false，
+		// 「取消关注」按钮反转成「关注」—— 取消关注变得不可能。而这恰好发生在
+		// 「已归档」浏览界面上，也就是本任务指认为 P0 安全垫的那个入口。
+		//
+		// 产品目标（归档子区不出现在会话列表）在 follow tab 上**已由三端自行满足**：
+		// Web 与 IM 缓存取交集且 channelInfo 优先做归档过滤，iOS 按 thread REST
+		// status 排除非 active，Android 构建关注列表时直接跳过 thread 条目。服务端
+		// 再过滤一遍不增加收益，只会摧毁关注状态。
+		//
+		// FAIL-OPEN：只丢 Status 明确等于 archived 的条目。status 查询失败时上面把
+		// Status 留空（0），这里据此保留 —— 与 /v1/conversation/sync 查询失败即跳过
+		// 过滤的方向一致。宁可短暂多显示，绝不因为一次查询抖动把子区藏起来。
+		//
+		// 归档非终态：任何人发消息经 RecordMessageAndReactivate 抬回 active，下一次
+		// sync 即重新出现；手动取消归档同理。
+		items = dropArchivedThreadItems(items)
+	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
 	for _, item := range items {
@@ -653,10 +670,24 @@ func loadPinnedChannelSet(ctx *config.Context, uid, spaceID string) (map[string]
 		ChannelType uint8  `db:"channel_type"`
 	}
 	var rows []row
-	_, err := ctx.DB().SelectBySql(
-		"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
-		uid, spaceID,
-	).Load(&rows)
+	var err error
+	if spaceID == "" {
+		// 无 Space key 的请求：响应本就跨 Space，置顶集合也取该 uid 的全部。
+		//
+		// 按 space_id='' 查会恒空 —— 写入侧（modules/user/api_pinned.go）拒绝空
+		// Space，表里不存在这样的行，于是置顶豁免在这条路径上是死代码，而
+		// keepDespiteRecentWindow 的文档把置顶描述为绝对豁免（PR #679 review,
+		// yujiawei）。取全部是与该文档一致的 fail-open 读法。
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=?",
+			uid,
+		).Load(&rows)
+	} else {
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
+			uid, spaceID,
+		).Load(&rows)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("loadPinnedSet: %w", err)
 	}

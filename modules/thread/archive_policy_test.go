@@ -10,6 +10,7 @@ package thread
 
 import (
 	"context"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,4 +151,47 @@ func TestResolvePolicy_FallsBackToCfgWhenNoResolver(t *testing.T) {
 	enabled, threshold := w.resolvePolicy()
 	assert.True(t, enabled)
 	assert.Equal(t, 5*24*time.Hour, threshold)
+}
+
+// ---------------------------------------------------------------------------
+// days → time.Duration 的溢出防护（PR #679 review, yujiawei）
+//
+// env 层按 legacy 语义原样接受任意非负整数，所以这个转换必须自己设防：
+// time.Duration 是 int64 纳秒，约 106,751 天即溢出，再大会回绕成一个**小的正数**
+// 阈值，把几乎所有子区都归档掉 —— 与「大值 = 实质不归档」的运维意图完全相反。
+// ---------------------------------------------------------------------------
+
+func TestArchiveThresholdFromDays_NormalValues(t *testing.T) {
+	assert.Equal(t, 3*24*time.Hour, archiveThresholdFromDays(3))
+	assert.Equal(t, 14*24*time.Hour, archiveThresholdFromDays(14))
+	assert.Equal(t, 3650*24*time.Hour, archiveThresholdFromDays(3650))
+}
+
+func TestArchiveThresholdFromDays_ZeroAndNegativeDisable(t *testing.T) {
+	assert.Equal(t, time.Duration(0), archiveThresholdFromDays(0),
+		"0 保留『禁用时间阈值』语义")
+	assert.Equal(t, time.Duration(0), archiveThresholdFromDays(-1))
+}
+
+// 核心回归：会让 int64 回绕的取值必须被钳住，且结果仍是一个**很大**的正阈值。
+func TestArchiveThresholdFromDays_OverflowClamped(t *testing.T) {
+	for _, days := range []int{100000, 213504, 1 << 40, math.MaxInt32} {
+		got := archiveThresholdFromDays(days)
+		assert.Equal(t, time.Duration(maxArchiveDays)*24*time.Hour, got,
+			"days=%d 必须钳到上限", days)
+		assert.Greater(t, got, 365*24*time.Hour,
+			"days=%d 钳制后必须仍是一个远大于一年的阈值，绝不能回绕成小正数", days)
+	}
+}
+
+// 直白地钉住「不设防会发生什么」：未经钳制的换算在 213504 天上回绕成约 25 分钟。
+func TestArchiveThresholdFromDays_UnclampedWouldWrapToMinutes(t *testing.T) {
+	// 必须是变量：常量表达式会在编译期就因溢出而报错，这里要观察的正是**运行期**回绕。
+	wrapDays := 213504
+	naive := time.Duration(wrapDays) * 24 * time.Hour
+	require.Less(t, naive, time.Hour,
+		"前提：朴素换算在此取值上确实回绕成小于一小时的阈值")
+
+	assert.Greater(t, archiveThresholdFromDays(wrapDays), 365*24*time.Hour,
+		"钳制后必须避开这个回绕")
 }
