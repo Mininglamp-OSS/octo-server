@@ -589,6 +589,46 @@ func (s *SystemSettings) ThreadArchiveOrdering() ThreadArchiveOrdering {
 	}
 }
 
+// ApplyThreadArchiveOrderingOverlay merges an incoming admin batch onto the
+// current snapshot, producing the state that will be in effect once the batch
+// commits. Keys absent from `incoming` keep their current value.
+//
+// The subtle part is the empty payload. For settingTypeInt an empty value is
+// the documented "reset to default" (the getter treats an empty snapshot entry
+// as not-configured), and normaliseBool accepts "" for bools with the same
+// meaning. Carrying the CURRENT value forward for those would under-detect:
+// clearing thread.auto_archive_days while it sits above the recent window
+// resets it to env/code default and can land below the window — precisely the
+// state the guard exists to reject. So "" resolves through the same
+// env → code-default chain the getters will use after the write.
+//
+// Exported and pure so the merge can be unit-tested without an HTTP round-trip.
+func ApplyThreadArchiveOrderingOverlay(cur ThreadArchiveOrdering, incoming map[string]string) ThreadArchiveOrdering {
+	if v, ok := incoming["thread.auto_archive_enabled"]; ok {
+		if v == "" {
+			cur.ArchiveEnabled = threadAutoArchiveEnabledFromEnv()
+		} else {
+			cur.ArchiveEnabled = v == "1"
+		}
+	}
+	if v, ok := incoming["thread.auto_archive_days"]; ok {
+		if v == "" {
+			cur.ArchiveDays = threadAutoArchiveDaysFromEnv()
+		} else if n, err := strconv.Atoi(v); err == nil {
+			cur.ArchiveDays = n
+		}
+	}
+	if v, ok := incoming["sidebar.recent_filter_thread_days"]; ok {
+		if v == "" {
+			// 该键无 env 层，重置即回到代码默认。
+			cur.RecentDays = defaultSidebarRecentFilterThreadDays
+		} else if n, err := strconv.Atoi(v); err == nil {
+			cur.RecentDays = n
+		}
+	}
+	return cur
+}
+
 // ViolatesThreadArchiveOrdering reports whether a configuration would make the
 // recent-tab thread window unobservable.
 //

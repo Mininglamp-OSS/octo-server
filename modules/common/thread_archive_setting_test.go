@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -159,8 +160,7 @@ func TestThreadArchiveOrdering_SnapshotUsesEffectiveValues(t *testing.T) {
 // 只在归档侧校验会留下一条绕行路径 —— 运维从 sidebar 侧把隐藏窗口调大，就能达到
 // 约束本要阻止的状态。这几条用例锁死双向覆盖。
 //
-// 依赖 MySQL + Redis + WuKongIM（testutil.NewTestServer），本地无依赖时跳过，
-// 由 CI 执行。
+// 依赖 MySQL + Redis + WuKongIM（testutil.NewTestServer）。
 // ---------------------------------------------------------------------------
 
 func newSuperAdminServer(t *testing.T) (*wkhttp.WKHttp, *config.Context) {
@@ -172,7 +172,19 @@ func newSuperAdminServer(t *testing.T) (*wkhttp.WKHttp, *config.Context) {
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
 	))
-	return s.GetRoute(), ctx
+	// 出口清理：管理 handler 写的是进程级 SystemSettings 单例，本用例留下的
+	// thread.* / sidebar.* 行会泄漏给后续测试。同 sidebar e2e 的处理。
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = EnsureSystemSettings(ctx).Reload()
+	})
+	route := s.GetRoute()
+	// testutil.NewTestServer 不注入 i18n renderer，兜底 renderer 只输出
+	// {msg,status}。生产在 main.go 注入的是 i18n ErrorRenderer，输出带
+	// error.code / error.details 的完整封套。要断言封套形状就必须在这里注入同一个
+	// renderer，否则断的是兜底实现、与线上行为无关。
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer("zh-CN")))
+	return route, ctx
 }
 
 func postSystemSetting(t *testing.T, route *wkhttp.WKHttp, body string) *httptest.ResponseRecorder {
@@ -297,4 +309,91 @@ func TestManagerSystemSetting_OrderingRejectionUsesI18nEnvelope(t *testing.T) {
 	assert.Equal(t, "err.server.common.thread_archive_window_ordering", body.Error.Code)
 	assert.Equal(t, "3", body.Error.Details["archive_days"])
 	assert.Equal(t, "30", body.Error.Details["recent_days"])
+}
+
+// ---------------------------------------------------------------------------
+// 空值（重置为默认）在 merge 时必须按重置后的值判定
+//
+// settingTypeInt 的空值是明文的「重置为默认」，normaliseBool 也接受空字符串。
+// 若 merge 时把空值当作「保持现值」，清空一个高于隐藏窗口的归档天数就会悄悄落到
+// 违规状态而不被拦 —— 正是这条守卫存在的理由。
+// ---------------------------------------------------------------------------
+
+func TestApplyOverlay_AbsentKeysKeepCurrent(t *testing.T) {
+	cur := ThreadArchiveOrdering{ArchiveEnabled: true, ArchiveDays: 30, RecentDays: 7}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{})
+	assert.Equal(t, cur, got)
+}
+
+func TestApplyOverlay_ExplicitValuesWin(t *testing.T) {
+	cur := ThreadArchiveOrdering{ArchiveEnabled: false, ArchiveDays: 30, RecentDays: 7}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{
+		"thread.auto_archive_enabled":       "1",
+		"thread.auto_archive_days":          "14",
+		"sidebar.recent_filter_thread_days": "3",
+	})
+	assert.Equal(t, ThreadArchiveOrdering{ArchiveEnabled: true, ArchiveDays: 14, RecentDays: 3}, got)
+}
+
+// 清空归档天数 → 回落 env/代码默认（3），而不是保留现值 30。
+func TestApplyOverlay_EmptyArchiveDaysResetsToDefault(t *testing.T) {
+	cur := ThreadArchiveOrdering{ArchiveEnabled: true, ArchiveDays: 30, RecentDays: 14}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{
+		"thread.auto_archive_days": "",
+	})
+	assert.Equal(t, 3, got.ArchiveDays, "空值必须解析为重置后的默认值")
+	assert.True(t, ViolatesThreadArchiveOrdering(got),
+		"重置后 3 < 14 构成违规，守卫必须能看见——这正是把空值当『保持现值』会漏掉的场景")
+}
+
+func TestApplyOverlay_EmptyArchiveDaysHonoursEnv(t *testing.T) {
+	t.Setenv(envThreadAutoArchiveDays, "20")
+	cur := ThreadArchiveOrdering{ArchiveEnabled: true, ArchiveDays: 30, RecentDays: 14}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{
+		"thread.auto_archive_days": "",
+	})
+	assert.Equal(t, 20, got.ArchiveDays, "重置回落到 env 层而非代码默认")
+	assert.False(t, ViolatesThreadArchiveOrdering(got))
+}
+
+// 清空开关 → 回落 env。env 为 true 时不得被当成「关闭」而跳过校验。
+func TestApplyOverlay_EmptyEnabledResetsToEnv(t *testing.T) {
+	t.Setenv(envThreadAutoArchiveEnabled, "true")
+	cur := ThreadArchiveOrdering{ArchiveEnabled: false, ArchiveDays: 3, RecentDays: 30}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{
+		"thread.auto_archive_enabled": "",
+	})
+	assert.True(t, got.ArchiveEnabled, "空值必须回落 env，而非被当作 false")
+	assert.True(t, ViolatesThreadArchiveOrdering(got),
+		"回落后归档开启且 3 < 30，必须判违规")
+}
+
+// 清空隐藏窗口 → 回落代码默认（3）；该键无 env 层。
+func TestApplyOverlay_EmptyRecentDaysResetsToDefault(t *testing.T) {
+	cur := ThreadArchiveOrdering{ArchiveEnabled: true, ArchiveDays: 7, RecentDays: 30}
+	got := ApplyThreadArchiveOrderingOverlay(cur, map[string]string{
+		"sidebar.recent_filter_thread_days": "",
+	})
+	assert.Equal(t, 3, got.RecentDays)
+	assert.False(t, ViolatesThreadArchiveOrdering(got), "重置后 7 >= 3，合法")
+}
+
+// 端到端：通过管理 API 清空归档天数落到违规状态，必须被拒。
+func TestManagerSystemSetting_OrderingRejectsResetToDefaultViolation(t *testing.T) {
+	route, _ := newSuperAdminServer(t)
+
+	// 建立合法存量：归档 30 天、隐藏 14 天。
+	w := postSystemSetting(t, route, `{"items":[
+		{"category":"thread","key":"auto_archive_enabled","value":"1"},
+		{"category":"thread","key":"auto_archive_days","value":"30"},
+		{"category":"sidebar","key":"recent_filter_thread_days","value":"14"}
+	]}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// 清空归档天数 → 重置为默认 3 → 3 < 14 违规，必须拒绝。
+	w = postSystemSetting(t, route, `{"items":[
+		{"category":"thread","key":"auto_archive_days","value":""}
+	]}`)
+	assert.NotEqual(t, http.StatusOK, w.Code,
+		"重置为默认后落到违规状态，同样必须被拦")
 }

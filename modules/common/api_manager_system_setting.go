@@ -358,22 +358,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 	if len(orderingIncoming) > 0 {
-		prospective := m.systemSettings.ThreadArchiveOrdering()
-		if v, ok := orderingIncoming["thread.auto_archive_enabled"]; ok {
-			prospective.ArchiveEnabled = v == "1"
-		}
-		// An empty int payload means "reset to default"; the getter then
-		// resolves env → code default, so re-read rather than parsing "".
-		if v, ok := orderingIncoming["thread.auto_archive_days"]; ok && v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				prospective.ArchiveDays = n
-			}
-		}
-		if v, ok := orderingIncoming["sidebar.recent_filter_thread_days"]; ok && v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				prospective.RecentDays = n
-			}
-		}
+		prospective := ApplyThreadArchiveOrderingOverlay(
+			m.systemSettings.ThreadArchiveOrdering(), orderingIncoming,
+		)
 		if ViolatesThreadArchiveOrdering(prospective) {
 			httperr.ResponseErrorL(c, errcode.ErrThreadArchiveWindowOrdering, nil, i18n.Details{
 				"archive_days": strconv.Itoa(prospective.ArchiveDays),

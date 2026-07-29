@@ -953,6 +953,15 @@ func filterRecentConversations(
 		}
 		// 未读 / 置顶 / 系统 Bot 豁免与 sidebar recent tab 共用同一个谓词
 		// （keepDespiteRecentWindow），两个端点的窗口语义因此逐字一致。
+		//
+		// 这里读的是跨 Space 的 r.Unread —— per-Space 未读由 fillPersonSpaceUnread
+		// 在本步之后才算出。于是「在别的 Space 有未读的 DM」会在当前 Space 也被豁免。
+		// 方向是 fail-open（多显示），且 person 窗口默认 0 使其当前不可达；等 Batch 2
+		// 把窗口交给用户后若要收紧，需把豁免判定挪到 per-Space 未读算完之后。
+		//
+		// 置顶只认 user_pinned_channel（与 sidebar 同源）。响应里的 Stick 是另一套
+		// 旧的 userDetail.Top / group.Top 标记，两个端点历史上都未据它豁免，此处
+		// 保持一致而非单侧引入差异。
 		if keepDespiteRecentWindow(r.ChannelID, r.ChannelType, r.Unread, pinned) {
 			filtered = append(filtered, r)
 			continue
