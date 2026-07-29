@@ -184,6 +184,31 @@ func TestArchiveThresholdFromDays_OverflowClamped(t *testing.T) {
 	}
 }
 
+// 钳制发生时必须可观测 —— 管理台报原始天数、worker 按上限执行，不打日志就只能读代码
+// 才知道两者分歧（PR #679 review, yujiawei）。这里钉住去抖语义本身。
+func TestWarnIfClamped_DebouncesByValue(t *testing.T) {
+	w := newTestWorker(defaultCfg(), &stubArchiveDB{}, &stubVersionGen{}, time.Now())
+
+	w.warnIfClamped(3)
+	assert.Equal(t, int64(0), w.clampWarnedDays.Load(), "未越界不记录告警状态")
+
+	w.warnIfClamped(999999)
+	assert.Equal(t, int64(999999), w.clampWarnedDays.Load(), "越界首次必须记录（并告警）")
+	w.warnIfClamped(999999)
+	assert.Equal(t, int64(999999), w.clampWarnedDays.Load(),
+		"同一越界值不得逐 tick 重复告警")
+
+	w.warnIfClamped(888888)
+	assert.Equal(t, int64(888888), w.clampWarnedDays.Load(),
+		"越界值变化必须重新告警——否则改配置后日志仍显示旧值")
+
+	// 边界：恰好等于上限不算越界，且要把告警状态清回去，之后再越界能重新告警。
+	w.warnIfClamped(maxArchiveDays)
+	assert.Equal(t, int64(0), w.clampWarnedDays.Load())
+	w.warnIfClamped(maxArchiveDays + 1)
+	assert.Equal(t, int64(maxArchiveDays+1), w.clampWarnedDays.Load())
+}
+
 // 直白地钉住「不设防会发生什么」：未经钳制的换算在 213504 天上回绕成约 25 分钟。
 func TestArchiveThresholdFromDays_UnclampedWouldWrapToMinutes(t *testing.T) {
 	// 必须是变量：常量表达式会在编译期就因溢出而报错，这里要观察的正是**运行期**回绕。

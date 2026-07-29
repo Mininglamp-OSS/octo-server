@@ -437,6 +437,14 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 
 	// 2e. Pinned channels
+	//
+	// 查询失败的降级方向按 tab 不同，这是有意区分、不是遗漏：
+	//   - recent tab 会因此整体跳过时间窗口（见下方 case "recent"）—— 空置顶集合
+	//     会让「置顶永不被窗口隐藏」失效，宁可这一批不过滤；
+	//   - follow tab 只丢 `is_pinned` 与置顶排序档位，条目本身照常返回。置顶是
+	//     **呈现**，不是关注**成员关系**；fail-closed 只留给 failClosedForFollow
+	//     列举的那五个查询，它们失败会让关注列表本身失真（PR #679 review,
+	//     yujiawei）。该行为与本 PR 之前完全一致。
 	pinnedSet, err := sb.loadPinnedSet(loginUID, spaceID)
 	pinnedLoadFailed := err != nil
 	if err != nil {
@@ -678,6 +686,13 @@ func loadPinnedChannelSet(ctx *config.Context, uid, spaceID string) (map[string]
 		// Space，表里不存在这样的行，于是置顶豁免在这条路径上是死代码，而
 		// keepDespiteRecentWindow 的文档把置顶描述为绝对豁免（PR #679 review,
 		// yujiawei）。取全部是与该文档一致的 fail-open 读法。
+		//
+		// 影响面（有意为之，已写进 swagger/sidebar.yaml）：本函数的结果在
+		// /v1/sidebar/sync 上有三个消费者 —— 窗口豁免、`is_pinned` 线上字段、
+		// 以及两个 tab 排序的置顶档位。此前这条路径恒返回空集，`is_pinned` 因此
+		// 恒为 false；现在会为真，置顶条目也会浮到顶部。跨 Space 的列表配跨 Space
+		// 的置顶是自洽读法，且 SQL 仍限 `uid=?`、集合只给已在响应里的频道打标，
+		// 不存在越权面（PR #679 review, yujiawei）。
 		_, err = ctx.DB().SelectBySql(
 			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=?",
 			uid,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -40,6 +41,9 @@ type ArchiveWorker struct {
 	// 仅在 ticker goroutine 内读写，无并发。
 	lastPolicy   string
 	policyLogged bool
+	// clampWarnedDays 是 warnIfClamped 的去抖状态（上次已告警的越界天数，0=当前未越界）。
+	// policy 闭包可能被 ticker goroutine 之外的 RunOnce 调用，故用 atomic。
+	clampWarnedDays atomic.Int64
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -52,17 +56,43 @@ type ArchiveWorker struct {
 // **策略**项（开关 + 天数）走 system_settings → env → 代码默认的三级回落，由
 // policy 在每个 tick 解析。cfg.Enabled / cfg.Threshold 在生产路径不被使用。
 func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
-	return &ArchiveWorker{
+	w := &ArchiveWorker{
 		cfg: cfg,
 		db:  NewDB(ctx),
 		gen: ctx,
 		now: time.Now,
-		policy: func() (bool, time.Duration) {
-			ss := commonapi.EnsureSystemSettings(ctx)
-			return ss.ThreadAutoArchiveEnabled(), archiveThresholdFromDays(ss.ThreadAutoArchiveDays())
-		},
 		Log: log.NewTLog("ThreadArchiveWorker"),
 	}
+	w.policy = func() (bool, time.Duration) {
+		ss := commonapi.EnsureSystemSettings(ctx)
+		days := ss.ThreadAutoArchiveDays()
+		w.warnIfClamped(days)
+		return ss.ThreadAutoArchiveEnabled(), archiveThresholdFromDays(days)
+	}
+	return w
+}
+
+// warnIfClamped 在生效天数被 maxArchiveDays 钳住时打一条 WARN。
+//
+// 需要它是因为管理台与 worker 会在这一点上分歧：`ThreadAutoArchiveDays()` 有意原样
+// 保留任意大的 env 值（legacy 兼容），`GET /v1/manager/common/system_setting` 的
+// `effective_value` 与跨键顺序守卫用的都是这个原始数字，而 worker 实际按钳制后的
+// 阈值归档。`DM_THREAD_AUTO_ARCHIVE_DAYS=999999` 时管理台显示 999999 天、worker 按
+// 36500 天执行 —— 不打日志就只能靠读代码才知道（PR #679 review, yujiawei）。
+//
+// 按取值去抖：同一个越界值只在首次出现和每次变更时各打一条，不会逐 tick 刷屏。
+func (w *ArchiveWorker) warnIfClamped(days int) {
+	if days <= maxArchiveDays {
+		w.clampWarnedDays.Store(0)
+		return
+	}
+	if w.clampWarnedDays.Swap(int64(days)) == int64(days) {
+		return
+	}
+	w.Warn("thread auto-archive days exceeds the supported maximum; the worker clamps it "+
+		"while the admin API still reports the raw value",
+		zap.Int("configured_days", days),
+		zap.Int("effective_days", maxArchiveDays))
 }
 
 // maxArchiveDays 是 days → time.Duration 转换的安全上限。
@@ -74,6 +104,11 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 //
 // 上限取 36500 天（100 年）：远超任何真实策略，且离溢出点有两个数量级的余量。超过
 // 即视为「实质不归档」，钳到上限而不是回绕。
+//
+// 注意这个钳制**只在 worker 内**：`GET /v1/manager/common/system_setting` 的
+// `effective_value` 和跨键顺序守卫读的都是未钳制的原始天数，所以管理台可能显示一个
+// 大于 worker 实际执行的值。发生时 warnIfClamped 会打 WARN，logPolicyOnChange 打出的
+// 也是钳制后的 Duration。
 const maxArchiveDays = 36500
 
 // archiveThresholdFromDays 把天数转成 time.Duration，并挡住会让 int64 回绕的取值。

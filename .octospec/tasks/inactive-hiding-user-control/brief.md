@@ -157,6 +157,12 @@ source: self
 - [ ] 回归：archived 子区仍不出现在 `/v1/conversation/sync`。
 - [ ] **复活闭环**：`RecordMessageAndReactivate` 后，同一子区在三条路径重新可见（P0 后这是唯一回归路径，见 Background §5）。
 - [ ] **cursor 不被影响**：构造「本批最高 version 的会话恰为 archived 子区」，断言 `respVersion` / `lastVersion` 仍前进（形状照 `TestE2E_ConvSync_CursorNotStalledByFilter`）。
+      **未交付用例**，原因与上面第一条相同：需要 handler 级构造，受既有
+      `-tags integration` import cycle 阻塞（见下方 §Pre-existing）。结构上安全 ——
+      `respVersion` 取自 `rawConversations`（在 `items` 被改写之后），`lastVersion`
+      在 `filterRecentConversations` 之前算出，两个过滤器都返回新切片
+      （`TestDropArchivedThreadItems_DoesNotMutateInput` 钉住）。保持未勾，作为
+      follow-up 跟踪。
 - [ ] thread status 查询失败时 **fail-open**（不过滤、不阻塞整批 sync）。
 - [ ] 不削弱隔离：非父群成员即便子区 active 也拿不到条目。
 
@@ -218,6 +224,21 @@ source: self
   `thread.auto_archive_days` 的 `effective_value` 可能是 9999，而把同一个值 POST 回去
   会被 `[0, 3650]` 拒绝 —— 管理表单「原样保存」会 400。这是兼容性选择的真实代价，
   要么放宽该 key 的写入上界，要么在响应里标注「env 提供，超出管理范围」。
+- **`effective_value` 也可能超出 worker 实际执行的值。** 超过 36500 天时管理台报的是
+  原始数字、worker 按钳制后的阈值归档。现在钳制发生时会打一条 WARN
+  （`warnIfClamped`，按取值去抖），`logPolicyOnChange` 打的也是钳制后的 Duration，
+  但通过 API 仍看不出这个分歧（PR #679 review, yujiawei）。
+- **无 Space key 请求的 `is_pinned` 是跨 Space 的。** `loadPinnedChannelSet` 的
+  `spaceID == ""` 分支修好后，该结果同时喂给窗口豁免、`is_pinned` 线上字段和两个 tab
+  的置顶排序档位；此前这条路径恒空、`is_pinned` 恒 false。有意保留跨 Space 语义
+  （跨 Space 的列表配跨 Space 的置顶），已写进 swagger。无越权面：SQL 仍限 `uid=?`，
+  集合只给已在响应里的频道打标。
+- **follow tab 的置顶降级与 recent tab 不同。** 置顶查询失败时 recent tab 整体跳过窗口，
+  follow tab 只丢 `is_pinned` 与排序档位、条目照常返回。置顶是呈现不是关注成员关系，
+  fail-closed 只留给 `failClosedForFollow` 列举的五个查询。此为既有行为，本 PR 未改，
+  已在代码注释与 swagger 中写明。
+- **用户置顶数无上限。** `modules/user/api_pinned.go` 不限条数，无 Space key 的查询因此
+  是跨该用户全部 Space 的无界读。实践中由用户行为封顶，防御性上限留作后续。
 - **`ArchiveConfig.Enabled` / `Threshold` 在生产是死字段。** `resolvePolicy` 只在
   `policy == nil`（即单测）时回落 cfg，于是同一个 env 变量有两个解析器，而 worker
   测试套件钉的是没人用的那个。建议后续删除这两个字段，让每个 env 变量只有一个解析者。

@@ -44,10 +44,22 @@ paths:
         - **已置顶**：置顶是关于位置的显式声明，时间窗口不得推翻；
         - **系统 Bot 的 DM**：保证其在每个 Space 均可达（占位条目 `timestamp/unread` 均为 0）。
 
-        **已归档子区（`status=2`）不出现在任何 tab 的 items 中**，与
+        **已归档子区（`status=2`）不出现在 recent tab 的 items 中**，与
         `/v1/conversation/sync` 的 `status=active` 语义一致。归档非终态：任何人发消息会
         自动复活为 active、或由管理员取消归档，下一次 sync 即重新出现；客户端另有
         「已归档」分组可浏览。子区状态查询失败时按 fail-open 处理（照常返回，不隐藏）。
+
+        **follow tab 则有意返回已归档子区**：它是客户端唯一的**关注状态真源**（每条带
+        `is_followed`），服务端把 archived 从中移除会让已关注的归档子区 `is_followed`
+        变 false，「取消关注」按钮反转成「关注」。因此 **follow tab 的显示过滤由客户端
+        负责** —— 若要在关注列表里隐藏已归档，请自行按 `status` 过滤展示层，不要指望
+        服务端已经过滤掉了。
+
+        **`is_pinned` 与置顶排序的作用域**：请求带 `space_id` / `X-Space-ID` 时取该 Space
+        的置顶；不带时返回的是跨 Space 列表，`is_pinned` 相应取该用户**全部 Space** 的置顶
+        （两个 tab 一致）。置顶集合查询失败时 recent tab 整体跳过时间窗口过滤（宁可多显示
+        也不误藏）；follow tab 保持既有降级 —— 该批 `is_pinned` 全为 false、置顶不再优先排序，
+        但条目本身不丢（关注**成员关系**才 fail-closed，置顶只是呈现）。
       operationId: "sidebarSync"
       consumes:
         - "application/json"
