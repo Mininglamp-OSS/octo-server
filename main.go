@@ -26,6 +26,8 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
+	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
@@ -241,7 +243,16 @@ func runAPI(ctx *config.Context) {
 	if err := installCardDispatch(ctx); err != nil {
 		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
 	}
-	installCardTmplRegistry() // pkg/cardtmpl L0 registry: pilot Templates + Freeze (fail-close)
+	cardTmplRegistry := installCardTmplRegistry() // built-ins: registration + Freeze
+	runtimeCatalog, err := cardtemplatecatalog.InstallRuntimeCatalog(
+		ctx.DB().DB,
+		cardTmplRegistry,
+		cardtmpl.RuntimeCatalogConfig{},
+	)
+	if err != nil {
+		panic(fmt.Errorf("install card template runtime catalog: %w", err))
+	}
+	commonmodule.SetCardTemplateCatalogReadinessCheck(runtimeCatalog.CheckReady)
 	cardActionRuntime, err := installCardActionDispatch(ctx)
 	if err != nil {
 		panic(fmt.Errorf("install card action callback dispatch: %w", err))
@@ -712,7 +723,7 @@ func replaceWebConfig(cfg *config.Config) {
 // Fail-close 契约:任一 Register/SetDefault 失败 → panic(与 main.go:521 现有的
 // docs approval callback route 校验同源)。init 期 schema/manifest 语法错无
 // runtime env 可挽救,回滚 = 镜像 revert。
-func installCardTmplRegistry() {
+func installCardTmplRegistry() *cardtmpl.Registry {
 	registry := cardtmpl.NewRegistry()
 	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
 	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
@@ -738,4 +749,5 @@ func installCardTmplRegistry() {
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
+	return registry
 }

@@ -18,6 +18,13 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 	registry.Freeze()
 	cardtmpl.SetDefaultRegistry(registry)
 	t.Cleanup(func() { cardtmpl.SetDefaultRegistry(nil) })
+	static, err := cardtmpl.NewStaticCatalog(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &actionContextCatalogSpy{Catalog: static}
+	cardtmpl.SetDefaultCatalog(spy)
+	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
 	sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRoot + "/samples/pending.json")
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +40,13 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 	if !ok {
 		t.Fatal("approve action not found in rendered card")
 	}
-	got, err := resolveRegistryCardContext(raw, cardtmpl.DocsApproveActionID, actionData)
+	access := cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeActionContext,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: "notification", SpaceID: "space-1",
+		},
+	}
+	got, err := resolveRegistryCardContext(context.Background(), access, raw, cardtmpl.DocsApproveActionID, actionData)
 	if err != nil {
 		t.Fatalf("resolveRegistryCardContext: %v", err)
 	}
@@ -41,13 +54,16 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 	if got != want {
 		t.Fatalf("card context = %+v, want %+v", got, want)
 	}
-	if _, err := resolveRegistryCardContext(raw, "missing", nil); err == nil {
+	if spy.lastRequest.Access != access {
+		t.Fatalf("action catalog access = %+v, want %+v", spy.lastRequest.Access, access)
+	}
+	if _, err := resolveRegistryCardContext(context.Background(), access, raw, "missing", nil); err == nil {
 		t.Fatal("undeclared action resolved without error")
 	}
 
 	// P2-b(PR#641 review):route owner(Action.data.owner)与 template owner 不一致
 	// 必须拒绝 —— 防止带 docs 身份的信封投递到别的路由。
-	if _, err := resolveRegistryCardContext(raw, cardtmpl.DocsApproveActionID,
+	if _, err := resolveRegistryCardContext(context.Background(), access, raw, cardtmpl.DocsApproveActionID,
 		map[string]interface{}{"owner": "summary", "action_type": "access_request.decision"}); err == nil {
 		t.Fatal("owner mismatch resolved without error")
 	}
@@ -59,7 +75,7 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 	template := octo["template"].(map[string]any)
 	delete(template, "version")
 	partialRaw, _ := json.Marshal(payload)
-	if _, err := resolveRegistryCardContext(partialRaw, cardtmpl.DocsApproveActionID, actionData); err == nil {
+	if _, err := resolveRegistryCardContext(context.Background(), access, partialRaw, cardtmpl.DocsApproveActionID, actionData); err == nil {
 		t.Fatal("partial registry metadata resolved as a legacy card")
 	}
 
@@ -69,12 +85,25 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 		"metadata": map[string]any{"octo": "corrupt"},
 	}}
 	corruptRaw, _ := json.Marshal(corrupt)
-	if _, err := resolveRegistryCardContext(corruptRaw, "any", nil); err == nil {
+	if _, err := resolveRegistryCardContext(context.Background(), access, corruptRaw, "any", nil); err == nil {
 		t.Fatal("corrupt octo metadata resolved as a legacy card")
 	}
 
-	legacy, err := resolveRegistryCardContext([]byte(`{"type":17,"card":{"body":[]}}`), "legacy", nil)
+	legacy, err := resolveRegistryCardContext(context.Background(), access, []byte(`{"type":17,"card":{"body":[]}}`), "legacy", nil)
 	if err != nil || legacy != (cardactiondispatch.CardContext{}) {
 		t.Fatalf("legacy context = (%+v, %v)", legacy, err)
 	}
+}
+
+type actionContextCatalogSpy struct {
+	cardtmpl.Catalog
+	lastRequest cardtmpl.CatalogActionRequest
+}
+
+func (s *actionContextCatalogSpy) ActionContext(
+	ctx context.Context,
+	request cardtmpl.CatalogActionRequest,
+) (cardtmpl.CatalogActionContext, error) {
+	s.lastRequest = request
+	return s.Catalog.ActionContext(ctx, request)
 }

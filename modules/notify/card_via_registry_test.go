@@ -118,6 +118,95 @@ func TestBuildDocsAccessRequestCardViaRegistry_HappyPath(t *testing.T) {
 	}
 }
 
+func TestBuildDocsAccessRequestUsesRuntimeCatalogPrincipal(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	registry := freshPilotRegistry(t)
+	static, err := cardtmpl.NewStaticCatalog(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &notifyCatalogSpy{Catalog: static}
+	cardtmpl.SetDefaultCatalog(spy)
+	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
+
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	if _, _, err := n.buildDocsAccessRequestCardViaRegistry(
+		context.Background(), "space-1", validAccessRequestDocsCard(), "zh-CN",
+	); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if spy.lastRender.Access.Purpose != cardtmpl.CatalogPurposeNewSend ||
+		spy.lastRender.Access.Principal.Kind != cardtmpl.CatalogPrincipalInternalProducer ||
+		spy.lastRender.Access.Principal.ID != docsNotifyProducerID ||
+		spy.lastRender.Access.Principal.SpaceID != "space-1" {
+		t.Fatalf("catalog access = %+v", spy.lastRender.Access)
+	}
+}
+
+func TestNotifyCatalogOperationsUseBoundedContexts(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	static, err := cardtmpl.NewStaticCatalog(freshPilotRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spy := &notifyDeadlineCatalog{Catalog: static}
+	cardtmpl.SetDefaultCatalog(spy)
+	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
+	card := validAccessRequestDocsCard()
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := preflightDocsAccessRequestSchema(parent, card); err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if _, ok := templateFallbackText(card, "zh-CN"); !ok {
+		t.Fatal("template fallback was unavailable")
+	}
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	if _, _, err := n.buildDocsAccessRequestCardViaRegistry(
+		context.Background(), "space-1", card, "zh-CN",
+	); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !spy.metaDefaultDeadline || !spy.metaDefaultCanceled || !spy.fallbackDeadline || !spy.renderDeadline {
+		t.Fatalf("catalog deadline/cancel meta=%v/%v fallback=%v render=%v, want all true",
+			spy.metaDefaultDeadline, spy.metaDefaultCanceled, spy.fallbackDeadline, spy.renderDeadline)
+	}
+}
+
+func TestPreflightDocsAccessRequestPreservesRuntimeCatalogFailures(t *testing.T) {
+	static, err := cardtmpl.NewStaticCatalog(freshPilotRegistry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cause := range []error{
+		cardtmpl.ErrRuntimeCatalogBlocked,
+		cardtmpl.ErrRuntimeCatalogDisabled,
+		cardtmpl.ErrRuntimeCatalogNotAuthorized,
+		cardtmpl.ErrRuntimeCatalogIntegrity,
+		cardtmpl.ErrRuntimeCatalogUnavailable,
+	} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			cardtmpl.SetDefaultCatalog(&notifyFailureCatalog{Catalog: static, metaErr: cause})
+			t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
+
+			err := preflightDocsAccessRequestSchema(context.Background(), validAccessRequestDocsCard())
+			if !errors.Is(err, cause) {
+				t.Fatalf("preflight error = %v, want cause %v", err, cause)
+			}
+			if errors.Is(err, errCardTmplUnavailable) {
+				t.Fatalf("runtime rejection was flattened to composition error: %v", err)
+			}
+		})
+	}
+}
+
 // TestBuildDocsAccessRequestCardViaRegistry_FieldsInvalid 验证 C1 policy:
 // 传入 schema 违规字段 → 返回 typed cardtmpl.ErrFieldsInvalid,
 // caller (card.go 分支) 会翻成 errNotifyCardInvalid → 400 零投递。
@@ -165,4 +254,73 @@ func installTestCardTmplRegistry(t *testing.T) {
 	prev := cardtmpl.DefaultRegistry()
 	cardtmpl.SetDefaultRegistry(freshPilotRegistry(t))
 	t.Cleanup(func() { cardtmpl.SetDefaultRegistry(prev) })
+}
+
+type notifyCatalogSpy struct {
+	cardtmpl.Catalog
+	lastRender cardtmpl.CatalogRenderRequest
+}
+
+func (s *notifyCatalogSpy) Render(ctx context.Context, request cardtmpl.CatalogRenderRequest) (map[string]any, error) {
+	s.lastRender = request
+	return s.Catalog.Render(ctx, request)
+}
+
+type notifyDeadlineCatalog struct {
+	cardtmpl.Catalog
+	metaDefaultDeadline bool
+	metaDefaultCanceled bool
+	fallbackDeadline    bool
+	renderDeadline      bool
+}
+
+type notifyFailureCatalog struct {
+	cardtmpl.Catalog
+	metaErr   error
+	renderErr error
+}
+
+func (c *notifyFailureCatalog) MetaDefault(
+	ctx context.Context,
+	request cardtmpl.CatalogDefaultRequest,
+) (cardtmpl.TemplateMeta, error) {
+	if c.metaErr != nil {
+		return cardtmpl.TemplateMeta{}, c.metaErr
+	}
+	return c.Catalog.MetaDefault(ctx, request)
+}
+
+func (c *notifyFailureCatalog) Render(
+	ctx context.Context,
+	request cardtmpl.CatalogRenderRequest,
+) (map[string]any, error) {
+	if c.renderErr != nil {
+		return nil, c.renderErr
+	}
+	return c.Catalog.Render(ctx, request)
+}
+
+func (s *notifyDeadlineCatalog) MetaDefault(
+	ctx context.Context,
+	request cardtmpl.CatalogDefaultRequest,
+) (cardtmpl.TemplateMeta, error) {
+	_, s.metaDefaultDeadline = ctx.Deadline()
+	s.metaDefaultCanceled = errors.Is(ctx.Err(), context.Canceled)
+	return s.Catalog.MetaDefault(ctx, request)
+}
+
+func (s *notifyDeadlineCatalog) FallbackText(
+	ctx context.Context,
+	request cardtmpl.CatalogFallbackRequest,
+) (string, error) {
+	_, s.fallbackDeadline = ctx.Deadline()
+	return s.Catalog.FallbackText(ctx, request)
+}
+
+func (s *notifyDeadlineCatalog) Render(
+	ctx context.Context,
+	request cardtmpl.CatalogRenderRequest,
+) (map[string]any, error) {
+	_, s.renderDeadline = ctx.Deadline()
+	return s.Catalog.Render(ctx, request)
 }

@@ -38,15 +38,15 @@ type CardUpdater interface {
 }
 
 type updater struct {
-	registry *Registry
-	mutator  mutationGateway
+	catalog Catalog
+	mutator mutationGateway
 }
 
-func NewCardUpdater(registry *Registry, mutator mutationGateway) (CardUpdater, error) {
-	if registry == nil || mutator == nil {
+func NewCardUpdater(catalog Catalog, mutator mutationGateway) (CardUpdater, error) {
+	if catalog == nil || mutator == nil {
 		return nil, errors.New("cardtmpl: updater dependencies are required")
 	}
-	return &updater{registry: registry, mutator: mutator}, nil
+	return &updater{catalog: catalog, mutator: mutator}, nil
 }
 
 func (u *updater) ReplaceView(ctx context.Context, target UpdateTarget, id ID, version string,
@@ -57,7 +57,10 @@ func (u *updater) ReplaceView(ctx context.Context, target UpdateTarget, id ID, v
 	if id == "" || version == "" || env.SpaceID != target.Target.SpaceID {
 		return ErrUpdateInvalid
 	}
-	if _, err := u.registry.Lookup(id, version); err != nil {
+	meta, err := u.catalog.MetaExact(ctx, CatalogExactRequest{
+		Access: updaterCatalogAccess(target), ID: id, Version: version,
+	})
+	if err != nil {
 		return err
 	}
 	defer func() {
@@ -65,9 +68,12 @@ func (u *updater) ReplaceView(ctx context.Context, target UpdateTarget, id ID, v
 		if err != nil {
 			result = "error"
 		}
-		recordUpdate(id, version, result)
+		recordUpdate(meta.ID, meta.Version, result)
 	}()
-	document, profile, renderProfile, err := u.registry.RenderCardWithProfiles(ctx, id, version, state, fields, env)
+	document, profile, renderProfile, err := RenderCatalogCardWithProfiles(ctx, u.catalog, CatalogRenderRequest{
+		Access: updaterCatalogAccess(target), ID: id, Version: version,
+		State: state, Fields: fields, Env: env,
+	})
 	if err != nil {
 		return err
 	}
@@ -107,8 +113,14 @@ func (u *updater) Append(ctx context.Context, target UpdateTarget, element json.
 		return carddispatch.ErrCardMutationConflict
 	}
 	if template, ok := cardmsg.CardTemplateContext(snapshot.Envelope); ok {
-		if _, lookupErr := u.registry.Lookup(ID(template.ID), template.Version); lookupErr == nil {
-			metricID, metricVersion = ID(template.ID), template.Version
+		meta, lookupErr := u.catalog.MetaExact(ctx, CatalogExactRequest{
+			Access: updaterCatalogAccess(target), ID: ID(template.ID), Version: template.Version,
+		})
+		if lookupErr != nil && !errors.Is(lookupErr, ErrTemplateUnknown) {
+			return lookupErr
+		}
+		if lookupErr == nil {
+			metricID, metricVersion = meta.ID, meta.Version
 		}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(snapshot.Envelope))
@@ -138,6 +150,15 @@ func (u *updater) Append(ctx context.Context, target UpdateTarget, element json.
 	}
 	_, err = u.mutator.Mutate(ctx, mutationRequest(target, normalized))
 	return err
+}
+
+func updaterCatalogAccess(target UpdateTarget) CatalogAccess {
+	return CatalogAccess{
+		Purpose: CatalogPurposeHistoricalEdit,
+		Principal: CatalogPrincipal{
+			Kind: CatalogPrincipalInternalProducer, ID: target.SenderUID, SpaceID: target.Target.SpaceID,
+		},
+	}
 }
 
 func validateUpdateTarget(ctx context.Context, target UpdateTarget) error {

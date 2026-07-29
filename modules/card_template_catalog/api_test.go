@@ -209,7 +209,7 @@ func TestReconcileStaticInventoryUsesFrozenRegistryList(t *testing.T) {
 }
 
 func TestCatalogNoLegacyErrorResponses(t *testing.T) {
-	files := []string{"api.go", "api_i18n.go"}
+	files := []string{"api.go", "api_state.go", "api_i18n.go"}
 	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", ".AbortWithStatusJSON(", ".AbortWithStatus(", `.Response("`}
 	for _, file := range files {
 		data, err := os.ReadFile(file)

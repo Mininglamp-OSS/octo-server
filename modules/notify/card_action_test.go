@@ -108,7 +108,7 @@ func TestDeliverDocsAccessRequestHonorsApprovalFlag(t *testing.T) {
 			capture := &capturingCardSender{}
 			n.docsSender = capture
 
-			response, err := n.deliverDocsCardNotification(&NotifyReq{
+			response, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
 				SpaceID: "space-1", Service: "docs", Targets: []string{"user-b"}, ActorUID: "user-a",
 				DocsCard: validAccessRequestDocsCard(),
 			})

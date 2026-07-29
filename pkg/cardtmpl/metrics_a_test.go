@@ -57,7 +57,11 @@ func TestUpdateMetricsOnlyUseRegisteredTemplateLabels(t *testing.T) {
 		SetGlobalMetrics(metrics)
 		t.Cleanup(func() { SetGlobalMetrics(nil) })
 
-		updater, err := NewCardUpdater(NewRegistry(), &metricMutationGateway{})
+		catalog, catalogErr := NewStaticCatalog(NewRegistry())
+		if catalogErr != nil {
+			t.Fatal(catalogErr)
+		}
+		updater, err := NewCardUpdater(catalog, &metricMutationGateway{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,7 +77,7 @@ func TestUpdateMetricsOnlyUseRegisteredTemplateLabels(t *testing.T) {
 		}
 	})
 
-	t.Run("append unregistered metadata", func(t *testing.T) {
+	t.Run("append unregistered metadata preserves compatibility", func(t *testing.T) {
 		promRegistry := prometheus.NewRegistry()
 		metrics := NewMetrics(promRegistry)
 		SetGlobalMetrics(metrics)
@@ -94,7 +98,11 @@ func TestUpdateMetricsOnlyUseRegisteredTemplateLabels(t *testing.T) {
 			t.Fatal(err)
 		}
 		gateway := &metricMutationGateway{snapshot: carddispatch.CardMutationSnapshot{Envelope: envelope}}
-		updater, err := NewCardUpdater(NewRegistry(), gateway)
+		catalog, catalogErr := NewStaticCatalog(NewRegistry())
+		if catalogErr != nil {
+			t.Fatal(catalogErr)
+		}
+		updater, err := NewCardUpdater(catalog, gateway)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -103,7 +111,7 @@ func TestUpdateMetricsOnlyUseRegisteredTemplateLabels(t *testing.T) {
 			SenderUID: "notification", MessageID: "1001", CardSeq: 1,
 		}, json.RawMessage(`{"type":"TextBlock","text":"after"}`))
 		if err != nil {
-			t.Fatalf("Append(unregistered metadata): %v", err)
+			t.Fatalf("Append(unregistered metadata) error = %v, want nil", err)
 		}
 		if got := testutil.CollectAndCount(metrics.update); got != 0 {
 			t.Fatalf("unregistered metadata created %d update metric series, want 0", got)
