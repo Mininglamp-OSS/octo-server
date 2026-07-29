@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "inactive-hiding-user-control: groundwork for handing inactive-hiding control to users (Batch 1)"
-description: One visibility predicate for archived threads across all three sync read paths, thread auto-archive policy moved from env into system_settings with a two-stage-decay ordering guard, and unread/pinned/system-bot exemptions so a hiding window can never swallow unread.
+description: One visibility predicate for archived threads across the two sync read paths that are conversation lists (the sidebar follow tab is deliberately excluded — it is the clients' follow-state source), thread auto-archive policy moved from env into system_settings with a two-stage-decay ordering guard, and unread/pinned/system-bot exemptions so a hiding window can never swallow unread.
 tags: [thread, message, common, wire-contract, system-setting, space, isolation, error-response, i18n, observability, testing]
 timestamp: 2026-07-29T13:58:15Z
 ---
@@ -20,14 +20,18 @@ Batch 1 ships only the groundwork — no new user-facing config. Per-user window
 
 ## What was done
 
-1. **P0 — one visibility predicate for archived threads.** `/v1/conversation/sync`
-   had dropped archived threads for a long time (`QueryActiveShortIDs`,
-   `status=active`); both tabs of `/v1/sidebar/sync` still returned them, so the
-   same thread vanished on mobile while staying in the web sidebar.
-   `dropArchivedThreadItems` converges the sidebar on the same semantics at the
-   one point where both tabs have `SidebarItem.Status` backfilled. Only an
+1. **P0 — one visibility predicate for archived threads, on the read paths that
+   are conversation lists.** `/v1/conversation/sync` had dropped archived threads
+   for a long time (`QueryActiveShortIDs`, `status=active`); `/v1/sidebar/sync`
+   still returned them, so the same thread vanished on mobile while staying in
+   the web sidebar. `dropArchivedThreadItems` converges the sidebar's **recent
+   tab** on the same semantics, after `SidebarItem.Status` is backfilled. Only an
    explicit `archived` is dropped; `Status == 0` (query failed / row missing) is
    kept — the fail-open direction every thread read path here already takes.
+
+   The **follow tab is deliberately excluded**, and that exclusion is the most
+   important thing in this entry — see the follow-state gotcha below. A first
+   revision dropped archived from both tabs and had to be reversed in review.
 2. **P1 — archive policy env → `system_settings`.** New `thread.auto_archive_enabled`
    / `auto_archive_days` resolve DB → env → code default. **No row is written by
    the migration**, so the resolved value on rollout is byte-identical to what
@@ -92,14 +96,34 @@ encodes.
   from 30 resets it to 3 and can land below the recent window undetected. Found
   by reading the merge against the write path, not by a failing test — the tests
   were green. Promoted to `learnings/pending/`.
-- **The web follow tab is `IM cache ∩ sidebar items`.** `followedKeys` is built
-  from sidebar items (`useFollowSidebar.ts`) and intersected against IM-cached
-  threads before `filterArchivedThreads` runs. That is why server-side filtering
-  is behaviour-preserving on the web rather than the regression it first looked
-  like — the client's three-tier hiding (channelInfo > sidebar status >
-  fail-open) degrades to a redundant second line of defence. An archived-threads
-  browser already exists (`ThreadPanel`, collapsed by default), which is what
-  makes dropping them from the list acceptable at all.
+- **A response that carries a state flag is a state source, not a display list.**
+  This is the lesson of the round-3 reversal, and the one to carry into Batch 2/3.
+
+  The first revision dropped archived threads from **both** sidebar tabs. The
+  audit behind it asked only "does the list still render correctly?", and on that
+  question it was right: the web follow tab is `IM cache ∩ sidebar items` —
+  `followedKeys` is built from sidebar items (`useFollowSidebar.ts`) and
+  intersected against IM-cached threads before `filterArchivedThreads` runs, so
+  removing archived server-side just moves the filtering earlier. An
+  archived-threads browser already exists (`ThreadPanel`, collapsed by default).
+  Every one of those facts is true and none of them is the point.
+
+  The follow tab's response also carries `is_followed`, and it is the **only**
+  place any client can learn it. `ThreadPanel` lists threads with
+  `threadList(status:"all")` — archived included — then marks each one followed
+  from `sidebar/sync?tab=follow`; `handleFollow` branches on that flag. Drop
+  archived from the follow tab and an already-followed archived thread returns
+  `is_followed=false`: its "unfollow" button becomes "follow", and unfollowing
+  becomes impossible — on the archived-browsing screen this task had designated
+  as its safety net. Same shape on iOS and Android.
+
+  So: **before filtering anything out of a response, ask what state the removed
+  entries were carrying, not just what they were displaying.** A display list can
+  be re-filtered by the client; a state flag that is only ever transmitted for
+  present entries cannot be reconstructed from their absence. The visibility
+  filter now applies to the recent tab only; the follow tab's own filtering stays
+  with the clients, and `swagger/sidebar.yaml` says so explicitly so nobody
+  removes it on the assumption the server already did.
 - **Two unrelated "pin" concepts.** `SyncUserConversationResp.Stick` comes from
   `userDetail.Top` / `group.Top`; `user_pinned_channel` is the sidebar pin. The
   exemption uses the latter (same source as the sidebar) so both endpoints agree.

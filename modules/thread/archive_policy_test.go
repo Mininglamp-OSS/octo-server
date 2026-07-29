@@ -189,24 +189,34 @@ func TestArchiveThresholdFromDays_OverflowClamped(t *testing.T) {
 func TestWarnIfClamped_DebouncesByValue(t *testing.T) {
 	w := newTestWorker(defaultCfg(), &stubArchiveDB{}, &stubVersionGen{}, time.Now())
 
-	w.warnIfClamped(3)
+	w.warnIfClamped(true, 3)
 	assert.Equal(t, int64(0), w.clampWarnedDays.Load(), "未越界不记录告警状态")
 
-	w.warnIfClamped(999999)
+	w.warnIfClamped(true, 999999)
 	assert.Equal(t, int64(999999), w.clampWarnedDays.Load(), "越界首次必须记录（并告警）")
-	w.warnIfClamped(999999)
+	w.warnIfClamped(true, 999999)
 	assert.Equal(t, int64(999999), w.clampWarnedDays.Load(),
 		"同一越界值不得逐 tick 重复告警")
 
-	w.warnIfClamped(888888)
+	w.warnIfClamped(true, 888888)
 	assert.Equal(t, int64(888888), w.clampWarnedDays.Load(),
 		"越界值变化必须重新告警——否则改配置后日志仍显示旧值")
 
 	// 边界：恰好等于上限不算越界，且要把告警状态清回去，之后再越界能重新告警。
-	w.warnIfClamped(maxArchiveDays)
+	w.warnIfClamped(true, maxArchiveDays)
 	assert.Equal(t, int64(0), w.clampWarnedDays.Load())
-	w.warnIfClamped(maxArchiveDays + 1)
+	w.warnIfClamped(true, maxArchiveDays+1)
 	assert.Equal(t, int64(maxArchiveDays+1), w.clampWarnedDays.Load())
+}
+
+// 归档关闭时仍要告警：报的是配置读数分歧（管理台 vs worker），不是归档动作本身。
+// 开关打开的那一刻这个分歧就变成实际阈值，届时才发现就晚了。
+func TestWarnIfClamped_WarnsEvenWhenArchivingDisabled(t *testing.T) {
+	w := newTestWorker(defaultCfg(), &stubArchiveDB{}, &stubVersionGen{}, time.Now())
+
+	w.warnIfClamped(false, 999999)
+	assert.Equal(t, int64(999999), w.clampWarnedDays.Load(),
+		"enabled=false 不得跳过越界告警")
 }
 
 // 直白地钉住「不设防会发生什么」：未经钳制的换算在 213504 天上回绕成约 25 分钟。

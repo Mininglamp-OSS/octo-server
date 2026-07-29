@@ -65,9 +65,10 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 	}
 	w.policy = func() (bool, time.Duration) {
 		ss := commonapi.EnsureSystemSettings(ctx)
+		enabled := ss.ThreadAutoArchiveEnabled()
 		days := ss.ThreadAutoArchiveDays()
-		w.warnIfClamped(days)
-		return ss.ThreadAutoArchiveEnabled(), archiveThresholdFromDays(days)
+		w.warnIfClamped(enabled, days)
+		return enabled, archiveThresholdFromDays(days)
 	}
 	return w
 }
@@ -81,7 +82,12 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 // 36500 天执行 —— 不打日志就只能靠读代码才知道（PR #679 review, yujiawei）。
 //
 // 按取值去抖：同一个越界值只在首次出现和每次变更时各打一条，不会逐 tick 刷屏。
-func (w *ArchiveWorker) warnIfClamped(days int) {
+//
+// 归档关闭时仍然告警（只是带上 `archive_enabled=false`）：这条日志报的是**配置读数
+// 分歧**，不是「刚刚归档了什么」。关掉归档不会让管理台上那个数字变得诚实，而它会在
+// 有人把开关打开的那一刻立即变成实际阈值 —— 那时才发现分歧就太晚了
+// （PR #679 review, yujiawei）。
+func (w *ArchiveWorker) warnIfClamped(enabled bool, days int) {
 	if days <= maxArchiveDays {
 		w.clampWarnedDays.Store(0)
 		return
@@ -90,9 +96,11 @@ func (w *ArchiveWorker) warnIfClamped(days int) {
 		return
 	}
 	w.Warn("thread auto-archive days exceeds the supported maximum; the worker clamps it "+
-		"while the admin API still reports the raw value",
+		"while the admin API still reports the raw value (moot while archiving is off, "+
+		"but it takes effect the moment it is switched on)",
 		zap.Int("configured_days", days),
-		zap.Int("effective_days", maxArchiveDays))
+		zap.Int("effective_days", maxArchiveDays),
+		zap.Bool("archive_enabled", enabled))
 }
 
 // maxArchiveDays 是 days → time.Duration 转换的安全上限。

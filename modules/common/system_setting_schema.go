@@ -135,8 +135,10 @@ var systemSettingSchema = []settingDef{
 	// 成为可查询事实，这是迁移的主要动机之一。
 	//
 	// days 与 sidebar.recent_filter_thread_days 之间存在偏序约束
-	// （archive_days >= recent_filter_thread_days），在写路径强制，见
-	// api_manager_system_setting.go 的 validateThreadArchiveOrdering。
+	// （archive_days >= recent_filter_thread_days），在写路径强制：
+	// api_manager_system_setting.go 的 updateSystemSettings 里，per-item 校验之后、
+	// 开启事务之前的那段 orderingIncoming 收集 + ApplyThreadArchiveOrderingOverlay
+	// + ViolatesThreadArchiveOrdering。三个 key 的写入都会经过它。
 	{Category: "thread", Key: "auto_archive_enabled", Type: settingTypeBool, Description: "是否开启子区不活跃自动归档",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ThreadAutoArchiveEnabled()) }},
 	{Category: "thread", Key: "auto_archive_days", Type: settingTypeInt, Description: "子区自动归档的不活跃阈值(天)，0=禁用时间阈值",
