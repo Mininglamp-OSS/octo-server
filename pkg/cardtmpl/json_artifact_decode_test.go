@@ -128,6 +128,45 @@ func TestCompileJSONArtifactRejectsGovernanceAndDocumentDrift(t *testing.T) {
 			want: "unbounded",
 		},
 		{
+			name: "root pattern properties open keyspace",
+			mutate: func(bundle *Bundle) {
+				schema, err := DecodeStrictJSONObject(bundle.Schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+				schema["patternProperties"] = map[string]any{
+					"^label_[a-z]+$": map[string]any{"type": "string", "maxLength": json.Number("8")},
+				}
+				bundle.Schema, err = json.Marshal(schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "patternProperties",
+		},
+		{
+			name: "nested pattern properties open keyspace",
+			mutate: func(bundle *Bundle) {
+				schema, err := DecodeStrictJSONObject(bundle.Schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+				properties := schema["properties"].(map[string]any)
+				properties["labels"] = map[string]any{
+					"type":                 "object",
+					"additionalProperties": false,
+					"patternProperties": map[string]any{
+						"^[a-z]+$": map[string]any{"type": "string", "maxLength": json.Number("8")},
+					},
+				}
+				bundle.Schema, err = json.Marshal(schema)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "patternProperties",
+		},
+		{
 			name: "unsupported manifest schema version",
 			mutate: func(bundle *Bundle) {
 				bundle.Manifest = replaceManifestField(t, bundle.Manifest, "schemaVersion", 3)
@@ -310,8 +349,14 @@ func TestCanonicalJSONNumberRejectsUnstableRanges(t *testing.T) {
 	}{
 		{input: "0", want: "0"},
 		{input: "-0", want: "0"},
+		{input: "0.1000000000000000000001", want: "0.1"},
 		{input: "1e+09", want: "1e+9"},
+		{input: "9007199254740991.0", want: "9.007199254740991e+15"},
 		{input: "9007199254740992", wantErr: true},
+		{input: "9007199254740992.0", wantErr: true},
+		{input: "9007199254740993e0", wantErr: true},
+		{input: "9.007199254740992e+15", wantErr: true},
+		{input: "-9007199254740992.0", wantErr: true},
 		{input: "1e10000", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -589,6 +634,29 @@ func TestValidateBoundedInputSchemaDoesNotRevisitNestedPropertiesExponentially(t
 	}
 }
 
+func TestValidateBoundedInputSchemaPropagatesAllOfTraversalAbort(t *testing.T) {
+	schema := boundedRootWithProperty(map[string]any{
+		"allOf": []any{
+			map[string]any{"type": "string", "maxLength": json.Number("8")},
+		},
+	})
+
+	t.Run("context deadline", func(t *testing.T) {
+		ctx := &errorAfterChecksContext{Context: context.Background(), allowed: 3}
+		err := validateBoundedInputSchemaContext(ctx, schema, maxArtifactJSONNodes)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("validateBoundedInputSchemaContext error = %v, want context deadline", err)
+		}
+	})
+
+	t.Run("visit budget", func(t *testing.T) {
+		err := validateBoundedInputSchemaContext(context.Background(), schema, 3)
+		if err == nil || !strings.Contains(err.Error(), "schema validation exceeds 3 visits") {
+			t.Fatalf("validateBoundedInputSchemaContext error = %v, want visit-budget error", err)
+		}
+	})
+}
+
 func TestCompileJSONArtifactHonorsContextDuringBoundsValidation(t *testing.T) {
 	bundle := validJSONArtifactBundle()
 	bundle.Schema = json.RawMessage(`{
@@ -611,6 +679,20 @@ func TestCompileJSONArtifactHonorsContextDuringBoundsValidation(t *testing.T) {
 type errorAfterFirstCheckContext struct {
 	context.Context
 	checks int
+}
+
+type errorAfterChecksContext struct {
+	context.Context
+	allowed int
+	checks  int
+}
+
+func (c *errorAfterChecksContext) Err() error {
+	c.checks++
+	if c.checks <= c.allowed {
+		return nil
+	}
+	return context.DeadlineExceeded
 }
 
 func (c *errorAfterFirstCheckContext) Err() error {

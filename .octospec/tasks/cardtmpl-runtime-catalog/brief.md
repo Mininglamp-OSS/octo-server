@@ -17,11 +17,11 @@ source: self
 > human confirms the decisions in the final section before implementation.
 > D1–D9 were accepted on 2026-07-28 when implementation was authorized; delivery
 > remains split into PR-A/PR-B/PR-C, and the current branch starts with PR-A only.
-> PR-A implementation is tracked by Issue #669 and PR #670.
+> PR-A implementation is tracked by Issue #669 and PR #674.
 
 ## Implementation status (2026-07-28)
 
-- **PR-A is implemented in PR #670.** It includes the shared strict compiler, canonical artifact
+- **PR-A is implemented in PR #674.** It includes the shared strict compiler, canonical artifact
   identity, immutable version claim/artifact/audit store, startup static inventory reconciliation,
   super-admin validate/publish APIs, localized errors, body/rate limits, and bounded control-plane
   metrics. Review hardening resolves local refs at every schema-bearing position, binds samples within
@@ -31,15 +31,19 @@ source: self
   cancellation, overload, and retryable database unavailability. Publish database work has an
   independent 10-second deadline and retries whole transactions for MySQL 1205/1213 only.
 - Final review hardening unifies strict-decoder `json.Number` behavior with production rendering,
-  preserves integer limits through canonical exponent notation and storage recompilation, reserves
-  exact sample/state matches before positional fallback, makes multi-document errors deterministic,
-  records immutable/source-conflict publish attempts in audit-only transactions, and removes one
-  redundant full-bundle decode/canonicalization pass from the control request path.
+  preserves integer limits through decimal/exponent notation and storage recompilation, rejects
+  `patternProperties` before an open keyspace can be persisted, preserves cancellation/visit-budget
+  errors through `allOf`, reserves exact sample/state matches before positional fallback, makes
+  multi-document errors deterministic, records immutable/source-conflict publish attempts in
+  audit-only transactions, and removes one redundant full-bundle decode/canonicalization pass from
+  the control request path.
 - Focused unit, coverage, race, build, vet, lint, and i18n checks pass locally. `pkg/cardtmpl` coverage is
-  80.6% and `modules/card_template_catalog` coverage is 83.0%.
-- The database-independent Bot catalog race lane passes. The local Bot profile integration lane is blocked
-  before assertions by a stale shared test-database migration record
-  (`20191106000001_event_legacy01.sql`); Ready-state clean CI remains required before merge.
+  81.1% and `modules/card_template_catalog` coverage is 83.0%.
+- A clean MySQL 8.0 migration Up/Down test now proves concurrent same-hash publish converges to exactly
+  one created plus one idempotent result, while a different hash for the same identity is rejected and
+  audited without mutating the artifact. Focused Bot catalog/send/edit/profile tests and their race lane
+  pass. The whole Bot package still has an unrelated case-variant authorization assertion failure;
+  Ready-state clean CI remains required before merge.
 - PR-A artifacts are always inactive. Runtime overlay, activate/rollback/block, grants, B1/B2, and any
   production dynamic send remain PR-B/PR-C work and are not advertised as available.
 - Startup exact-key conflicts keep the required fail-close behavior. The reviewed PR-A recovery path

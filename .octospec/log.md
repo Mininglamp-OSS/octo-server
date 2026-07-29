@@ -11,7 +11,7 @@ change-log convention (§7). Newest first.
   claims and artifacts, transactional publish audit, and startup static
   inventory reconciliation. See
   [journal](journal/shared/cardtmpl-runtime-catalog.md),
-  [brief](tasks/cardtmpl-runtime-catalog/brief.md), and PR #670 / Issue #669.
+  [brief](tasks/cardtmpl-runtime-catalog/brief.md), and PR #674 / Issue #669.
 - **Control plane** — Added super-admin-only, authenticated and UID-rate-limited
   validate/publish endpoints with a 2 MiB body cap, localized safe errors, and
   bounded operation/compile/DB metrics. Published artifacts remain inactive and
@@ -27,10 +27,14 @@ change-log convention (§7). Newest first.
   publish DB work has a 10-second deadline, bounded whole-transaction retry for
   MySQL 1205/1213, and separate low-cardinality failure outcomes.
 - **Final review closure** — Unified golden/runtime number semantics, made
-  canonical integer limits recompile-safe, fixed mixed exact/positional sample
-  assignment, made validation-document selection deterministic, removed UTF-16
-  sort allocations and a redundant envelope/bundle decode pass, and durably
-  audited immutable/static-source publish conflicts without mutating artifacts.
+  canonical integer limits notation-independent and recompile-safe, rejected
+  open-keyspace `patternProperties`, preserved `allOf` traversal-abort signals,
+  fixed mixed exact/positional sample assignment, made validation-document
+  selection deterministic, removed UTF-16 sort allocations and a redundant
+  envelope/bundle decode pass, and durably audited immutable/static-source
+  publish conflicts without mutating artifacts. A real-MySQL concurrency test
+  now verifies same-hash idempotency, different-hash immutability, audit results,
+  and migration Up/Down cleanup.
 - **Startup recovery** — Kept exact-key reconciliation fail-closed and documented
   the safe PR-A break-glass path in the
   [runbook](../docs/card-template-runtime-catalog-runbook.md): roll back or

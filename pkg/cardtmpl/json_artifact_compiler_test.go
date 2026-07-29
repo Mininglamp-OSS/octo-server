@@ -254,6 +254,33 @@ func TestCompileJSONArtifactCanonicalBundleRecompilesIntegerLimits(t *testing.T)
 	}
 }
 
+func TestCompileJSONArtifactRejectsUnsafeIntegerSpellings(t *testing.T) {
+	for _, literal := range []string{
+		"9007199254740992.0",
+		"9007199254740993e0",
+		"9.007199254740992e+15",
+		"-9007199254740992.0",
+	} {
+		t.Run(literal, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = artifactSchemaWithProperties(`{
+				"title":{"type":"string","maxLength":32},
+				"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}},
+				"value":{"type":"number"}
+			}`)
+			bundle.Samples["shown"] = json.RawMessage(fmt.Sprintf(
+				`{"title":"hello","groups":[{"items":["a"]}],"value":%s}`,
+				literal,
+			))
+
+			_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err == nil || !strings.Contains(err.Error(), "exceeds exact JSON range") {
+				t.Fatalf("CompileJSONArtifact(%s) error = %v, want exact-range rejection", literal, err)
+			}
+		})
+	}
+}
+
 func TestCompileJSONArtifactReturnsTypedErrorsWithoutPanicking(t *testing.T) {
 	tests := []struct {
 		name       string

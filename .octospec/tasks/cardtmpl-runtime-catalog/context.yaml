@@ -16,5 +16,5 @@ injected:
     why: TDD checkpoint 覆盖 compiler trust boundary、canonical identity、immutable transaction、static reconciliation、HTTP auth/body/error、metrics、coverage 与 race；本地脏 DB 限制被显式记录。
   - id: commit-style
     source: repo
-    why: 提交使用英文 Conventional Commits 并带 Refs #669；PR #670 使用英文模板、Linked Spec 与实质性 COMPREHENSION。
+    why: 提交使用英文 Conventional Commits 并带 Refs #669；PR #674 使用英文模板、Linked Spec 与实质性 COMPREHENSION。
 brief: .octospec/tasks/cardtmpl-runtime-catalog/brief.md

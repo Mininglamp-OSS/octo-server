@@ -47,10 +47,11 @@ const (
 )
 
 var (
-	ErrArtifactCompileBusy = errors.New("cardtmpl: artifact compiler busy")
-	artifactDocumentKeyRE  = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
-	artifactTemplateIDRE   = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[.-][a-z0-9][a-z0-9-]*)+$`)
-	artifactVersionRE      = regexp.MustCompile(
+	ErrArtifactCompileBusy        = errors.New("cardtmpl: artifact compiler busy")
+	errSchemaValidationVisitLimit = errors.New("cardtmpl: schema validation visit limit exceeded")
+	artifactDocumentKeyRE         = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
+	artifactTemplateIDRE          = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[.-][a-z0-9][a-z0-9-]*)+$`)
+	artifactVersionRE             = regexp.MustCompile(
 		`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
 			`(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?` +
 			`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
@@ -1219,7 +1220,7 @@ func (v *boundedSchemaValidator) enter() error {
 	}
 	v.visits++
 	if v.maxVisits > 0 && v.visits > v.maxVisits {
-		return fmt.Errorf("schema validation exceeds %d visits", v.maxVisits)
+		return fmt.Errorf("schema validation exceeds %d visits: %w", v.maxVisits, errSchemaValidationVisitLimit)
 	}
 	return nil
 }
@@ -1270,6 +1271,12 @@ func (v *boundedSchemaValidator) validateNode(value any, location string) error 
 			case "object":
 				if additional, ok := node["additionalProperties"].(bool); !ok || additional {
 					return fmt.Errorf("%s object additionalProperties must be false", location)
+				}
+				if rawPatterns, exists := node["patternProperties"]; exists {
+					patterns, ok := rawPatterns.(map[string]any)
+					if !ok || len(patterns) > 0 {
+						return fmt.Errorf("%s object patternProperties are unsupported because they open the keyspace", location)
+					}
 				}
 			}
 		}
@@ -1361,8 +1368,13 @@ func (v *boundedSchemaValidator) validatePropertySchema(value any, location stri
 	}
 	if constraints, exists := node["allOf"].([]any); exists && len(constraints) > 0 {
 		for index, constraint := range constraints {
-			if v.validatePropertySchema(constraint, fmt.Sprintf("%s.allOf[%d]", location, index)) == nil {
+			err := v.validatePropertySchema(constraint, fmt.Sprintf("%s.allOf[%d]", location, index))
+			if err == nil {
 				return nil
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, errSchemaValidationVisitLimit) {
+				return err
 			}
 		}
 	}
@@ -1716,7 +1728,7 @@ func canonicalJSONNumber(number json.Number) (string, error) {
 	if value == 0 {
 		return "0", nil
 	}
-	if !strings.ContainsAny(number.String(), ".eE") && math.Abs(value) > 1<<53-1 {
+	if math.Trunc(value) == value && math.Abs(value) > 1<<53-1 {
 		return "", fmt.Errorf("integer %q exceeds exact JSON range", number)
 	}
 	formatted := strconv.FormatFloat(value, 'g', -1, 64)
