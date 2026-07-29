@@ -187,10 +187,20 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	// a refunded defer — asymmetrically exempting it from the MaxAttempts bound. Clearing it here makes
 	// a delivery-phase crash advance the attempt like any delivery lease. A miss (route absent) never
 	// reaches this line, so the marker it needs for the defer loop is untouched.
-	if _, err := d.queue.ClearRouteMissing(lease.Event.EventID, lease.Token); err != nil {
+	cleared, clearErr := d.queue.ClearRouteMissing(lease.Event.EventID, lease.Token)
+	if clearErr != nil {
 		d.metrics.observeError(owner, "queue_error")
 		d.refreshDepthMetrics()
-		return true, err
+		return true, clearErr
+	}
+	if !cleared {
+		// The token no longer matches: this lease expired and was reclaimed + re-leased to another
+		// worker (or already terminated). Bail before doing a wasted Deliver/Finalize whose terminal
+		// Ack would fail as ack_lost anyway; the current owner will process the event. This mirrors the
+		// lease-ownership-lost handling on the Defer paths above.
+		d.metrics.observeError(owner, "ack_lost")
+		d.refreshDepthMetrics()
+		return true, errors.New("cardactiondispatch: lease ownership lost before delivery")
 	}
 	if lease.Attempt > route.MaxAttempts {
 		const category = "attempts_exhausted"

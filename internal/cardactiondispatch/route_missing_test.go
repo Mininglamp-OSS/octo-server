@@ -249,6 +249,51 @@ func TestRoutePresentClearsRouteMissingMarkerBeforeDelivery(t *testing.T) {
 	}
 }
 
+// TestRoutePresentLeaseLostBeforeDeliveryDoesNotDeliver pins the lease-ownership bail on the
+// route-present path (#662 review, non-blocking): if ClearRouteMissing reports the token no longer
+// matches — the lease expired and was reclaimed + re-leased to another worker — ProcessOne must NOT
+// proceed to Deliver/Finalize (wasted work + a duplicate bot callback whose terminal Ack would fail
+// as ack_lost anyway); it bails with a lease-ownership-lost error, mirroring the Defer paths.
+func TestRoutePresentLeaseLostBeforeDeliveryDoesNotDeliver(t *testing.T) {
+	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	neverDeliver := callbackDelivererFunc(func(context.Context, *Route, DecisionRequest) (DecisionResult, error) {
+		t.Fatal("Deliver must not run once the lease is lost before delivery")
+		return DecisionResult{}, nil
+	})
+	neverFinalize := FinalizerFunc(func(context.Context, Event, DecisionResult) error {
+		t.Fatal("Finalize must not run once the lease is lost before delivery")
+		return nil
+	})
+	queue := &concurrentLeaseQueue{
+		leases:                []Lease{{Event: testDispatchEvent(), Token: "lease-lost", Attempt: 1}},
+		acked:                 make(chan int64, 1),
+		clearRouteMissingLost: true, // token mismatch: the lease was reclaimed + re-leased before delivery
+	}
+	dispatcher, err := NewDispatcher(queue, registry, neverDeliver, neverFinalize, DispatcherConfig{
+		LeaseDuration: time.Second,
+		PollInterval:  time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewDispatcher() error = %v", err)
+	}
+
+	processed, procErr := dispatcher.ProcessOne(context.Background(), time.Now())
+	if !processed {
+		t.Fatal("ProcessOne() processed = false, want true (a lost lease is still a handled event)")
+	}
+	if procErr == nil {
+		t.Fatal("ProcessOne() err = nil, want a lease-ownership-lost error before delivery")
+	}
+	select {
+	case <-queue.acked:
+		t.Fatal("a lost-lease event was acked; it must not deliver or ack")
+	default:
+	}
+}
+
 // TestRouteMissingExpired covers the window boundary. The window is anchored on the first
 // observed miss (firstSeen), so it is a pure elapsed-time check with no unset-timestamp edge.
 func TestRouteMissingExpired(t *testing.T) {

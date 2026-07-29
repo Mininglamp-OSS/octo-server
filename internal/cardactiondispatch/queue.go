@@ -155,9 +155,11 @@ return 1
 // got to try. The refund (floored at 0) makes a reclaimed defer cycle net-zero too. It is gated
 // on the marker so DELIVERY leases — which carry no marker and whose attempt legitimately counts a
 // real delivery try that bounds retries — are untouched (see TestRedisQueueLeaseTokenRetryDLQAndReplay,
-// where a markerless reclaim still advances to attempt 2). A single miss window before the first
-// marker is written (claim -> first RouteMissingSeenAt) can still leak at most one increment per
-// route-missing episode, which never approaches MaxAttempts over a minutes-long episode.
+// where a markerless reclaim still advances to attempt 2). A crash before the first marker is written
+// (claim -> first RouteMissingSeenAt) leaks that cycle's +1, since reclaim then finds no marker;
+// normally the marker persists across the rest of the episode so only the first cycle is exposed (one
+// increment), and even a pathological loop that dies before every marker write yields at worst a
+// recoverable DLQ entry (attempts_exhausted, replayable) rather than silent loss.
 var reclaimScript = rd.NewScript(`
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 for _, id in ipairs(ids) do

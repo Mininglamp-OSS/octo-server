@@ -29,6 +29,9 @@ type concurrentLeaseQueue struct {
 	// cleared receives an event id each time ClearRouteMissing is called, so a test can assert the
 	// dispatcher drops the marker on the route-present path before delivery.
 	cleared chan int64
+	// clearRouteMissingLost makes ClearRouteMissing report lease loss (false) so a test can drive the
+	// token-mismatch path in ProcessOne (lease reclaimed + re-leased before delivery).
+	clearRouteMissingLost bool
 }
 
 type nackCall struct {
@@ -105,6 +108,9 @@ func (q *concurrentLeaseQueue) RouteMissingSeenAt(eventID int64, now time.Time) 
 	return now, nil
 }
 func (q *concurrentLeaseQueue) ClearRouteMissing(eventID int64, _ string) (bool, error) {
+	if q.clearRouteMissingLost {
+		return false, nil
+	}
 	q.mu.Lock()
 	delete(q.routeMissingSince, eventID)
 	q.mu.Unlock()

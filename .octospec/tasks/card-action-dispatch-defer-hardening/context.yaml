@@ -91,6 +91,20 @@ notes:
     TestRoutePresentClearsRouteMissingMarkerBeforeDelivery (dispatcher wiring: route-present dispatch
     clears the marker, then delivers + acks). The two other reviewers (lml2468, Octo-Q) APPROVED; the
     lml2468 review ran a negative control (removing the refund block fails the #623 reproducer).
+  - PR #662 re-review at fe386b40: all four reviewers (lml2468, Jerry-Xin, Octo-Q, yujiawei) APPROVED
+    the marker-clear fix. Three non-blocking P2 hardening notes were left; handling:
+    (a) FOLDED IN — ClearRouteMissing's bool return was discarded, so a token-mismatch (lease
+    reclaimed + re-leased before delivery) let a stale worker run a wasted Deliver/Finalize whose
+    terminal Ack fails as ack_lost. ProcessOne now bails on !cleared with a lease-ownership-lost error,
+    mirroring the Defer paths. Test: TestRoutePresentLeaseLostBeforeDeliveryDoesNotDeliver.
+    (b) FOLDED IN — reworded the reclaim comment: the pre-first-marker leak is "that cycle's +1", not
+    strictly "one per episode" (a pathological loop that dies before every marker write leaks per such
+    cycle; worst case still a recoverable DLQ entry, never silent loss).
+    (c) FOLLOW-UP ISSUE — token-guard the RouteMissingSeenAt marker WRITE too (routeMissingSinceScript),
+    symmetric to the token-guarded clear, closing an astronomically narrow re-plant corner (in-flight
+    marker write reordered past a lease expiry + reclaim + re-claim + route recovery + delivery crash).
+    Deferred per the reviewers' own "follow-up issue, not a merge blocker" framing; it is a signature
+    change (RouteMissingSeenAt gains a token param + interface + fakes + Lua).
   - Design choice #624: floor = 4 × routeMissingDeferInterval (20s). The bare-correctness floor is
     1× (survive to the due instant); 4× is a comfort margin so the event can actually be claimed and
     processed after becoming due, not merely survive. Only rejects seconds-scale configs, which are
