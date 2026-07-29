@@ -548,6 +548,94 @@ func (s *SystemSettings) SidebarRecentFilterPersonDays() int {
 	return s.getIntClamped("sidebar", "recent_filter_person_days", defaultSidebarRecentFilterPersonDays)
 }
 
+// ----- thread auto-archive policy (task inactive-hiding-user-control / P1) -----
+
+// ThreadAutoArchiveEnabled reports whether the 子区 auto-archive worker should
+// sweep. Resolution chain: system_setting row → env
+// DM_THREAD_AUTO_ARCHIVE_ENABLED → code default (false).
+//
+// The env layer is what makes this migration a no-op on rollout: no row is
+// written to system_setting, so every deployment keeps resolving to exactly the
+// value its env already produces. An admin write later overrides it, and the
+// worker picks that up within one tick.
+func (s *SystemSettings) ThreadAutoArchiveEnabled() bool {
+	return s.getBool("thread", "auto_archive_enabled", threadAutoArchiveEnabledFromEnv())
+}
+
+// ThreadAutoArchiveDays returns the inactivity threshold, in days, after which
+// a quiet 子区 is archived. 0 disables the time threshold while leaving the
+// worker enabled — the env semantics this key inherits (RunOnce short-circuits
+// on Threshold<=0), preserved deliberately so existing
+// DM_THREAD_AUTO_ARCHIVE_DAYS=0 deployments keep their meaning.
+func (s *SystemSettings) ThreadAutoArchiveDays() int {
+	return s.getIntClamped("thread", "auto_archive_days", threadAutoArchiveDaysFromEnv())
+}
+
+// ThreadArchiveOrdering is the merged view the two-stage-decay guard validates:
+// the global archive window versus the recent-tab thread window.
+type ThreadArchiveOrdering struct {
+	ArchiveEnabled bool
+	ArchiveDays    int
+	RecentDays     int
+}
+
+// ThreadArchiveOrdering snapshots the currently-effective ordering inputs so a
+// partial admin write can be validated against merge(current, incoming).
+func (s *SystemSettings) ThreadArchiveOrdering() ThreadArchiveOrdering {
+	return ThreadArchiveOrdering{
+		ArchiveEnabled: s.ThreadAutoArchiveEnabled(),
+		ArchiveDays:    s.ThreadAutoArchiveDays(),
+		RecentDays:     s.SidebarRecentFilterThreadDays(),
+	}
+}
+
+// ViolatesThreadArchiveOrdering reports whether a configuration would make the
+// recent-tab thread window unobservable.
+//
+// The invariant is ArchiveDays >= RecentDays, but only where both windows
+// actually bite:
+//   - archiving disabled, or ArchiveDays == 0 (threshold disabled): nothing is
+//     ever archived on a timer, so no window can be shadowed — always valid.
+//   - RecentDays == 0: the recent-tab window is off; there is nothing to
+//     shadow — always valid.
+//
+// Exported and pure so the guard can be unit-tested without an HTTP round-trip.
+func ViolatesThreadArchiveOrdering(o ThreadArchiveOrdering) bool {
+	if !o.ArchiveEnabled || o.ArchiveDays <= 0 || o.RecentDays <= 0 {
+		return false
+	}
+	return o.ArchiveDays < o.RecentDays
+}
+
+// threadAutoArchiveEnabledFromEnv mirrors the literal rules the thread module's
+// LoadArchiveConfig used before this key moved into system_setting: only
+// "true"/"1" (case-insensitive, trimmed) enable; empty or unparseable stays
+// disabled.
+func threadAutoArchiveEnabledFromEnv() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(envThreadAutoArchiveEnabled)))
+	if raw == "" {
+		return defaultThreadAutoArchiveEnabled
+	}
+	return raw == "true" || raw == "1"
+}
+
+// threadAutoArchiveDaysFromEnv mirrors the old parseDays: empty / unparseable /
+// negative fall back to the code default, 0 is a legitimate "disable the
+// threshold" value. Out-of-range positives additionally fall back rather than
+// being served verbatim, so the env layer cannot smuggle in a value the admin
+// write path would have rejected — same defence-in-depth as getIntClamped.
+func threadAutoArchiveDaysFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv(envThreadAutoArchiveDays))
+	if raw == "" {
+		return defaultThreadAutoArchiveDays
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < settingIntMin || n > settingIntMax {
+		return defaultThreadAutoArchiveDays
+	}
+	return n
+}
+
 // SupportEmail returns the From address used by the SMTP sender.
 func (s *SystemSettings) SupportEmail() string {
 	return s.getString("support", "email", s.ctx.GetConfig().Support.Email)

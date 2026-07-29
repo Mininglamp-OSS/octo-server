@@ -340,6 +340,49 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
+	// Two-stage-decay ordering guard (task inactive-hiding-user-control / P1).
+	// Same merge-then-validate shape as the onboarding block above: a partial
+	// update must be checked against merge(current snapshot, incoming items),
+	// never against either half alone.
+	//
+	// Deliberately keyed off BOTH categories: validating only when the batch
+	// touches thread.* would let an operator raise
+	// sidebar.recent_filter_thread_days past the archive window from the other
+	// side and reach exactly the state this guard exists to prevent.
+	orderingIncoming := map[string]string{}
+	for _, p := range plans {
+		switch {
+		case p.def.Category == "thread" && (p.def.Key == "auto_archive_enabled" || p.def.Key == "auto_archive_days"),
+			p.def.Category == "sidebar" && p.def.Key == "recent_filter_thread_days":
+			orderingIncoming[p.def.Category+"."+p.def.Key] = p.value
+		}
+	}
+	if len(orderingIncoming) > 0 {
+		prospective := m.systemSettings.ThreadArchiveOrdering()
+		if v, ok := orderingIncoming["thread.auto_archive_enabled"]; ok {
+			prospective.ArchiveEnabled = v == "1"
+		}
+		// An empty int payload means "reset to default"; the getter then
+		// resolves env → code default, so re-read rather than parsing "".
+		if v, ok := orderingIncoming["thread.auto_archive_days"]; ok && v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				prospective.ArchiveDays = n
+			}
+		}
+		if v, ok := orderingIncoming["sidebar.recent_filter_thread_days"]; ok && v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				prospective.RecentDays = n
+			}
+		}
+		if ViolatesThreadArchiveOrdering(prospective) {
+			httperr.ResponseErrorL(c, errcode.ErrThreadArchiveWindowOrdering, nil, i18n.Details{
+				"archive_days": strconv.Itoa(prospective.ArchiveDays),
+				"recent_days":  strconv.Itoa(prospective.RecentDays),
+			})
+			return
+		}
+	}
+
 	// Atomic batch: open one transaction, queue every upsert, commit only
 	// if all rows succeed. A mid-batch DB failure rolls back everything
 	// rather than leaving callers to debug partial state.

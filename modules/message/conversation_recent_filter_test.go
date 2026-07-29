@@ -54,7 +54,7 @@ func TestFilterRecentConversations_StaleGroupDropped(t *testing.T) {
 		makeSyncResp("g-fresh", common.ChannelTypeGroup.Uint8(), nowRecent()),
 		makeSyncResp("g-stale", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 	}
-	got := filterRecentConversations(resps, defaultRecentCutoffs())
+	got := filterRecentConversations(resps, defaultRecentCutoffs(), nil)
 	assert.Equal(t, []string{"g-fresh"}, channelIDs(got))
 }
 
@@ -63,7 +63,7 @@ func TestFilterRecentConversations_StaleThreadDropped(t *testing.T) {
 		makeSyncResp("t-fresh", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 		makeSyncResp("t-stale", common.ChannelTypeCommunityTopic.Uint8(), now3DaysAgo()),
 	}
-	got := filterRecentConversations(resps, defaultRecentCutoffs())
+	got := filterRecentConversations(resps, defaultRecentCutoffs(), nil)
 	assert.Equal(t, []string{"t-fresh"}, channelIDs(got))
 }
 
@@ -73,7 +73,7 @@ func TestFilterRecentConversations_StaleDMKeptWhenPersonZero(t *testing.T) {
 	resps := []*SyncUserConversationResp{
 		makeSyncResp("dm-stale", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 	}
-	got := filterRecentConversations(resps, defaultRecentCutoffs())
+	got := filterRecentConversations(resps, defaultRecentCutoffs(), nil)
 	assert.Equal(t, []string{"dm-stale"}, channelIDs(got))
 }
 
@@ -83,7 +83,7 @@ func TestFilterRecentConversations_GroupCutoffZero_AllKept(t *testing.T) {
 		makeSyncResp("g-stale", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 		makeSyncResp("g-fresh", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
-	got := filterRecentConversations(resps, cutoffs)
+	got := filterRecentConversations(resps, cutoffs, nil)
 	assert.Equal(t, []string{"g-stale", "g-fresh"}, channelIDs(got))
 }
 
@@ -97,7 +97,7 @@ func TestFilterRecentConversations_PersonWindowFiltersDMs(t *testing.T) {
 		makeSyncResp("dm-fresh", common.ChannelTypePerson.Uint8(), nowRecent()),
 		makeSyncResp("dm-stale", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 	}
-	got := filterRecentConversations(resps, cutoffs)
+	got := filterRecentConversations(resps, cutoffs, nil)
 	assert.Equal(t, []string{"dm-fresh"}, channelIDs(got))
 }
 
@@ -112,12 +112,12 @@ func TestFilterRecentConversations_UnknownTypeKept(t *testing.T) {
 	resps := []*SyncUserConversationResp{
 		makeSyncResp("x", 99, now3DaysAgo()),
 	}
-	got := filterRecentConversations(resps, cutoffs)
+	got := filterRecentConversations(resps, cutoffs, nil)
 	assert.Equal(t, []string{"x"}, channelIDs(got))
 }
 
 func TestFilterRecentConversations_Empty(t *testing.T) {
-	got := filterRecentConversations(nil, defaultRecentCutoffs())
+	got := filterRecentConversations(nil, defaultRecentCutoffs(), nil)
 	assert.Empty(t, got)
 }
 
@@ -128,7 +128,7 @@ func TestFilterRecentConversations_DoesNotMutateInput(t *testing.T) {
 		makeSyncResp("g-fresh", common.ChannelTypeGroup.Uint8(), nowRecent()),
 		makeSyncResp("g-stale", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 	}
-	_ = filterRecentConversations(resps, defaultRecentCutoffs())
+	_ = filterRecentConversations(resps, defaultRecentCutoffs(), nil)
 	require.Len(t, resps, 2)
 	assert.Equal(t, "g-fresh", resps[0].ChannelID)
 	assert.Equal(t, "g-stale", resps[1].ChannelID)

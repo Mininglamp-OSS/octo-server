@@ -39,6 +39,28 @@ const (
 	defaultSidebarRecentFilterPersonDays = 0
 )
 
+// Thread auto-archive policy defaults + env fallbacks (task
+// inactive-hiding-user-control, Batch 1 / P1).
+//
+// The archive worker's *policy* knobs (on/off + staleness window) live here
+// rather than in modules/thread because they must resolve through the same
+// DB → env → code-default chain the sidebar windows already use: a per-user
+// override (Batch 2) needs a configuration layer it can sit on top of, and an
+// env var cannot be that layer. The worker's *operational* knobs (tick
+// interval, batch size, batch sleep) stay in modules/thread/archive_config.go —
+// they tune how the sweep runs, not when a thread is considered finished.
+//
+// The env vars keep their original names so an existing deployment keeps
+// working untouched: nothing is written to system_setting by this change, so
+// the resolved value on rollout is byte-identical to today's.
+const (
+	envThreadAutoArchiveEnabled = "DM_THREAD_AUTO_ARCHIVE_ENABLED"
+	envThreadAutoArchiveDays    = "DM_THREAD_AUTO_ARCHIVE_DAYS"
+
+	defaultThreadAutoArchiveEnabled = false
+	defaultThreadAutoArchiveDays    = 3
+)
+
 // settingDef is the canonical definition of a system_setting key.
 // The schema slice below is the single source of truth: admin UI reads it to
 // render the form, the helper consults it for type info, and the manager
@@ -106,6 +128,19 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.SidebarRecentFilterThreadDays()) }},
 	{Category: "sidebar", Key: "recent_filter_person_days", Type: settingTypeInt, Description: "最近会话-单聊(DM)活跃过滤窗口(天)，0=不过滤(默认)",
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.SidebarRecentFilterPersonDays()) }},
+
+	// 子区自动归档策略 — 从 env(DM_THREAD_AUTO_ARCHIVE_*) 迁入，DB 为单一真源、
+	// env 降级为 fallback（task inactive-hiding-user-control / P1）。归档 worker
+	// 每个 tick 重读，改值无需重启；effective_value 让「现网到底开没开、窗口几天」
+	// 成为可查询事实，这是迁移的主要动机之一。
+	//
+	// days 与 sidebar.recent_filter_thread_days 之间存在偏序约束
+	// （archive_days >= recent_filter_thread_days），在写路径强制，见
+	// api_manager_system_setting.go 的 validateThreadArchiveOrdering。
+	{Category: "thread", Key: "auto_archive_enabled", Type: settingTypeBool, Description: "是否开启子区不活跃自动归档",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ThreadAutoArchiveEnabled()) }},
+	{Category: "thread", Key: "auto_archive_days", Type: settingTypeInt, Description: "子区自动归档的不活跃阈值(天)，0=禁用时间阈值",
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.ThreadAutoArchiveDays()) }},
 
 	// Incoming webhook 总开关 + 核心阈值 — 与 env(DM_INCOMINGWEBHOOK_*) 等价，DB 为
 	// 单一真源。enabled 关闭后 push 返回 404、管理写操作被拒、仅保留 list 只读；

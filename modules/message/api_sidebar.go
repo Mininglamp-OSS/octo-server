@@ -586,6 +586,26 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 	}
 
+	// 3.5 归档子区统一收口（task inactive-hiding-user-control / P0）。
+	//
+	// 收敛到 /v1/conversation/sync 早已在跑的 status=active 语义：archived 子区不
+	// 进任何会话列表。此前只有 XIN-1135 给 follow tab 的「自建豁免」补了 active
+	// 守卫（见 mergeThreadEntries），follow tab 的常规路径与整个 recent tab 仍然
+	// 放行，同一个子区因此在移动端消失、在 Web 侧栏还在。
+	//
+	// 放在这里而不是各 build 函数内部，是因为两个 tab 的 status 来源不同
+	// （follow 走 loadThreadLastMsgAt，recent 走 loadThreadStatuses），但都已在
+	// 上面 backfill 到 SidebarItem.Status，此处是唯一的公共汇合点。
+	//
+	// FAIL-OPEN：只丢 Status 明确等于 archived 的条目。status 查询失败时 recent
+	// tab 把 Status 留空（0），这里据此保留 —— 与该 tab 既有的 fail-open 降级、
+	// 以及 /v1/conversation/sync 查询失败即跳过过滤的方向一致。宁可短暂多显示，
+	// 绝不因为一次查询抖动把用户的子区藏起来。
+	//
+	// 归档非终态：任何人发消息经 RecordMessageAndReactivate 抬回 active，下一次
+	// sync 即重新出现；手动取消归档同理。客户端另有「已归档」分组可浏览。
+	items = dropArchivedThreadItems(items)
+
 	// 4. Enrich pinned flag (follow tab items also need it)
 	for _, item := range items {
 		k := channelKey(item.TargetID, uint8(item.TargetType))
@@ -620,12 +640,20 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 // ---------------------------------------------------------------------------
 
 func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, error) {
+	return loadPinnedChannelSet(sb.ctx, uid, spaceID)
+}
+
+// loadPinnedChannelSet is the package-level form, shared with
+// /v1/conversation/sync so the pinned exemption (P2) is resolved identically on
+// both endpoints — divergent pinned lookups would reintroduce exactly the kind
+// of per-endpoint drift this task exists to remove.
+func loadPinnedChannelSet(ctx *config.Context, uid, spaceID string) (map[string]struct{}, error) {
 	type row struct {
 		ChannelID   string `db:"channel_id"`
 		ChannelType uint8  `db:"channel_type"`
 	}
 	var rows []row
-	_, err := sb.ctx.DB().SelectBySql(
+	_, err := ctx.DB().SelectBySql(
 		"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
 		uid, spaceID,
 	).Load(&rows)
@@ -801,6 +829,39 @@ func loadRecentCutoffs(ctx *config.Context, now time.Time) recentCutoffs {
 	}
 }
 
+// keepDespiteRecentWindow reports whether a conversation must survive the
+// inactivity window regardless of how stale it is (task
+// inactive-hiding-user-control / P2).
+//
+// The window is a per-viewer "this went quiet, fade it out" projection. Three
+// things must never be faded out by it:
+//
+//   - **Unread.** Hiding a conversation that still holds unread messages hides
+//     the messages with it, and the user has no way to know. Discord's
+//     equivalent per-user layer (collapsed categories) always lets unread
+//     through for exactly this reason; ours did not, which is the behaviour
+//     this closes. This is also the precondition for ever letting users pick
+//     their own window (Batch 2) — a window that can swallow unread is not
+//     safe to hand out.
+//   - **Pinned.** Pinning is an explicit statement about position ("keep this
+//     in front of me"). A time window silently overriding it inverts the user's
+//     instruction. Note this is why `pinned` is resolved BEFORE the cutoff
+//     check — the previous order filtered first and only tagged IsPinned
+//     afterwards, so a pinned-but-quiet channel was dropped before anything
+//     knew it was pinned.
+//   - **System bots.** They must stay reachable in every Space. The placeholder
+//     entries EnsureSystemBotsPresentRaw appends carry Timestamp 0 and Unread 0,
+//     so any non-zero person window would drop them on the spot. Exempting them
+//     here keeps that guarantee without reordering the placeholder injection,
+//     and closes the same gap /v1/conversation/sync documented but only covered
+//     when a space_id was supplied.
+func keepDespiteRecentWindow(channelID string, channelType uint8, unread int, pinned bool) bool {
+	if pinned || unread > 0 {
+		return true
+	}
+	return channelType == common.ChannelTypePerson.Uint8() && spacepkg.IsSystemBot(channelID)
+}
+
 // cutoffFor returns the activity cutoff for a given channel type. Unknown
 // channel types (anything that is not group / thread / DM) return 0 = no
 // filter; the recent tab only ever carries those three types, but defaulting
@@ -817,6 +878,29 @@ func (c recentCutoffs) cutoffFor(channelType uint8) int64 {
 	default:
 		return 0
 	}
+}
+
+// dropArchivedThreadItems removes thread entries whose lifecycle status is
+// explicitly archived, mirroring /v1/conversation/sync's status=active
+// whitelist (task inactive-hiding-user-control / P0).
+//
+// Only `Status == ThreadStatusArchived` is dropped. Status 0 means "unknown"
+// (the field is omitempty and stays zero when the status query failed or the
+// row was missing) and is KEPT — the fail-open direction every thread read path
+// in this package already takes. Non-thread items are untouched.
+//
+// Returns a new slice; the input is not mutated, so any caller-side view built
+// from the pre-filter list stays intact.
+func dropArchivedThreadItems(items []*SidebarItem) []*SidebarItem {
+	out := make([]*SidebarItem, 0, len(items))
+	for _, it := range items {
+		if it.TargetType == int(common.ChannelTypeCommunityTopic) &&
+			it.Status == thread.ThreadStatusArchived {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // channelKey returns a string key for (channelID, channelType).
@@ -1162,12 +1246,15 @@ func buildRecentItems(
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
-		if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
-			continue
-		}
 		pinned := false
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
+		}
+		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
+		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
+			if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
+				continue
+			}
 		}
 		parentID := ""
 		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取

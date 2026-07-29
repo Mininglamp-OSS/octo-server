@@ -788,7 +788,15 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// person 窗口>0」这一非常规组合下，安静的系统 Bot DM 可能被本步过滤掉。
 	if req.RecentFilter {
 		cutoffs := loadRecentCutoffs(co.ctx, time.Now())
-		syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs)
+		// 置顶集合只在 opt-in 时查一次，移动端/桌面端（不传 recent_filter）不付这笔
+		// 成本。失败按 sidebar 同款降级：warn + 空集合，未读豁免不受影响 —— 两个端点
+		// 的失败方向保持一致，避免又长出一处 per-endpoint 差异。
+		pinnedSet, perr := loadPinnedChannelSet(co.ctx, loginUID, filterSpaceID)
+		if perr != nil {
+			co.Warn("会话同步：置顶查询失败（非致命，本次不套用置顶豁免）", zap.Error(perr))
+			pinnedSet = map[string]struct{}{}
+		}
+		syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs, pinnedSet)
 	}
 
 	// ---------- 子区 source_message_id ----------
@@ -932,9 +940,23 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 //
 // Returns a new slice — the input is not mutated, so the caller's raw-based
 // cursor/unread computations stay intact (issue #294).
-func filterRecentConversations(resps []*SyncUserConversationResp, cutoffs recentCutoffs) []*SyncUserConversationResp {
+func filterRecentConversations(
+	resps []*SyncUserConversationResp,
+	cutoffs recentCutoffs,
+	pinnedSet map[string]struct{},
+) []*SyncUserConversationResp {
 	filtered := make([]*SyncUserConversationResp, 0, len(resps))
 	for _, r := range resps {
+		pinned := false
+		if pinnedSet != nil {
+			_, pinned = pinnedSet[channelKey(r.ChannelID, r.ChannelType)]
+		}
+		// 未读 / 置顶 / 系统 Bot 豁免与 sidebar recent tab 共用同一个谓词
+		// （keepDespiteRecentWindow），两个端点的窗口语义因此逐字一致。
+		if keepDespiteRecentWindow(r.ChannelID, r.ChannelType, r.Unread, pinned) {
+			filtered = append(filtered, r)
+			continue
+		}
 		if cutoff := cutoffs.cutoffFor(r.ChannelType); cutoff != 0 && r.Timestamp <= cutoff {
 			continue
 		}
