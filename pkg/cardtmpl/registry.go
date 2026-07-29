@@ -69,12 +69,20 @@ type manifestFile struct {
 // view's `.template.json`. Go-mode cards (hand-written Template.Build) omit both
 // — the fields are ignored there.
 //
-// Samples is currently informational only: the register-time self-check globs the
-// handoff's `samples/` directory (loadSamples), so a per-view `samples` list is
-// NOT a fail-close allowlist — a listed-but-missing sample is not caught here, and
-// an unlisted sample file is still loaded. It is parsed (not dropped) so a future
-// L0 PR can promote it to an allowlist without a manifest schema change; until
-// then, treat `samples/` on disk as the source of truth (PR #654 review P2).
+// Samples IS the fail-closed allowlist for JSON-mode: LoadJSONBundle reads exactly
+// the listed paths, a listed-but-missing sample is a hard registration error, and an
+// unlisted `samples/*.json` on disk is never read — so it gets neither schema
+// validation nor a render self-check. The manifest, not the directory, is the source
+// of truth here; a sample that is not listed silently contributes no coverage.
+//
+// `goldens/` is asymmetric on purpose: it is still directory-globbed
+// (`goldens/*.card.json`, LoadJSONBundle) and is not declared in the manifest, but
+// compileBundleGoldens requires every golden to have a same-key sample. Adding
+// `goldens/foo.card.json` without also listing the matching sample therefore fails
+// registration rather than being ignored.
+//
+// Go-mode cards keep the older behaviour: Register globs `samples/` via loadSamples
+// and ignores this field entirely (PR #654 review P2, PR #670 review).
 type manifestView struct {
 	WireProfile string   `json:"wireProfile"`
 	States      []State  `json:"states"`
