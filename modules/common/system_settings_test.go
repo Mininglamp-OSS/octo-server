@@ -766,3 +766,17 @@ func TestSystemSettings_DocsEnabled_DBTrueWins(t *testing.T) {
 
 	assert.True(t, s.DocsEnabled(), "DB true -> docs module shown")
 }
+
+func TestSystemSettings_DriveEnabled_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.False(t, s.DriveEnabled(), "DB empty -> drive module hidden by default")
+}
+
+func TestSystemSettings_DriveEnabled_DBTrueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("drive", "enabled", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.True(t, s.DriveEnabled(), "DB true -> drive module shown")
+}
