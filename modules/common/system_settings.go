@@ -880,6 +880,16 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// DriveEnabled reports whether clients should surface the drive (网盘) module
+// entry (backed by the standalone octo-drive service). Display policy only —
+// it neither grants nor enforces any server-side authorization, which lives in
+// octo-drive itself. Default false so the entry stays hidden until octo-drive
+// is deployed and the admin flips drive.enabled for a controlled rollout.
+// Value source: system_setting drive.enabled (DB, hot-reloaded).
+func (s *SystemSettings) DriveEnabled() bool {
+	return s.getBool("drive", "enabled", false)
+}
+
 // DmloopEnabled reports whether the Loop(回路)module entry should be shown to
 // clients. Default false — the loop feature (backend service + fleet proxy +
 // daemon runtimes) stays hidden until ops flips dmloop.enabled after those deps
