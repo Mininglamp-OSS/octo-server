@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -35,22 +36,39 @@ type catalogStore interface {
 type compileArtifactFunc func(context.Context, cardtmpl.Bundle, cardtmpl.CompileLimits) (*cardtmpl.CompiledArtifact, error)
 
 type API struct {
-	ctx     *config.Context
-	store   catalogStore
-	compile compileArtifactFunc
-	logger  log.Log
-	metrics *catalogMetrics
+	ctx                 *config.Context
+	store               catalogStore
+	compile             compileArtifactFunc
+	validateStateTarget func(context.Context, cardtmpl.ID, string) (stateTargetReceipt, error)
+	controlEnabled      bool
+	registry            *cardtmpl.Registry
+	readiness           *runtimeCatalogReadiness
+	startupMu           sync.Mutex
+	startupCancel       context.CancelFunc
+	startupDone         chan struct{}
+	logger              log.Log
+	metrics             *catalogMetrics
 }
 
 func New(ctx *config.Context) *API {
 	metrics := newCatalogMetrics(prometheus.DefaultRegisterer)
-	api := &API{
-		ctx:     ctx,
-		store:   newStore(ctx.DB().DB),
-		compile: cardtmpl.CompileJSONArtifact,
-		logger:  log.NewTLog("CardTemplateCatalog"),
-		metrics: metrics,
+	runtimeStore := installedRuntimeStore()
+	if runtimeStore == nil {
+		if !ctx.GetConfig().Test {
+			panic("card template catalog: RuntimeCatalog is not installed by the composition root")
+		}
+		runtimeStore = newStore(ctx.DB().DB)
 	}
+	api := &API{
+		ctx:            ctx,
+		store:          runtimeStore,
+		compile:        cardtmpl.CompileJSONArtifact,
+		controlEnabled: installedRuntimeGates().controlEnabled,
+		readiness:      installedRuntimeReadiness(),
+		logger:         log.NewTLog("CardTemplateCatalog"),
+		metrics:        metrics,
+	}
+	api.validateStateTarget = api.validateTarget
 	registry := cardtmpl.DefaultRegistry()
 	if registry == nil {
 		if !ctx.GetConfig().Test {
@@ -58,13 +76,10 @@ func New(ctx *config.Context) *API {
 		}
 		return api
 	}
-	reconcileCtx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
-	defer cancel()
-	if err := reconcileStaticInventory(reconcileCtx, api.store, registry); err != nil {
-		api.metrics.observeDB("reconcile_static", "error")
-		panic(fmt.Sprintf("card template catalog: reconcile static inventory: %v", err))
+	api.registry = registry
+	if api.readiness == nil && !ctx.GetConfig().Test {
+		panic("card template catalog: RuntimeCatalog readiness is not installed by the composition root")
 	}
-	api.metrics.observeDB("reconcile_static", "ok")
 	return api
 }
 
@@ -112,6 +127,11 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 	)
 	manager.POST("/validate", a.validate)
 	manager.POST("/publish", a.publish)
+	manager.GET("/:id/audit", a.audit)
+	manager.GET("/:id", a.detail)
+	manager.PUT("/:id/active", a.activate)
+	manager.POST("/:id/rollback", a.rollback)
+	manager.POST("/:id/block", a.block)
 }
 
 type controlRequest struct {
@@ -158,6 +178,10 @@ func (a *API) publish(c *wkhttp.Context) {
 	if !a.requireSuperAdmin(c) {
 		return
 	}
+	if ready, result := a.requireRuntimeReady(c); !ready {
+		operationResult = result
+		return
+	}
 	request, bundle, ok := readControlRequest(c)
 	if !ok {
 		return
@@ -175,6 +199,10 @@ func (a *API) publish(c *wkhttp.Context) {
 	artifact, compileOutcome, ok := a.compileRequest(c, bundle)
 	if !ok {
 		operationResult = compileOutcome
+		return
+	}
+	if !isApprovedRuntimeOwner(artifact.Owner) {
+		respondCatalogRequestInvalid(c, ErrPublishRequestInvalid)
 		return
 	}
 	publishCtx, cancel := context.WithTimeout(c.Request.Context(), publishTimeout)
@@ -227,6 +255,22 @@ func (a *API) requireSuperAdmin(c *wkhttp.Context) bool {
 		return false
 	}
 	return true
+}
+
+func (a *API) requireRuntimeReady(c *wkhttp.Context) (bool, string) {
+	if a == nil || a.readiness == nil {
+		return true, "ok"
+	}
+	err := a.readiness.Check()
+	if err == nil {
+		return true, "ok"
+	}
+	if errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
+		respondCatalogIntegrityFailure(c)
+		return false, "integrity_error"
+	}
+	respondCatalogUnavailable(c)
+	return false, "unavailable"
 }
 
 func readControlRequest(c *wkhttp.Context) (controlRequest, cardtmpl.Bundle, bool) {

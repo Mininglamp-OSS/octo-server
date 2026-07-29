@@ -65,7 +65,7 @@ func TestDeliverCardNotification_ValidationRejectsBadFields(t *testing.T) {
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
 			r := req
-			_, err := n.deliverCardNotification(&r)
+			_, err := n.deliverCardNotification(context.Background(), &r)
 			require.ErrorIs(t, err, errNotifyCardInvalid)
 		})
 	}
@@ -153,7 +153,7 @@ func TestDeliverCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.
 	n.botOK.Store(true) // notification bot already provisioned
 	primeMemberCache(n, "spc_1", "uid_a")
 
-	resp, err := n.deliverCardNotification(&NotifyReq{
+	resp, err := n.deliverCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "spc_1", Service: "summary-service", Targets: []string{"uid_a"}, Card: validCard(),
 	})
 	require.NoError(t, err)
@@ -178,7 +178,7 @@ func TestDeliverCardNotification_NonMemberExcluded(t *testing.T) {
 	n.botOK.Store(true)
 	primeMemberCache(n, "spc_1", "uid_member") // uid_stranger is NOT a member
 
-	resp, err := n.deliverCardNotification(&NotifyReq{
+	resp, err := n.deliverCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "spc_1", Service: "summary-service",
 		Targets: []string{"uid_member", "uid_stranger"}, Card: validCard(),
 	})
@@ -245,7 +245,7 @@ func TestDeliverDocsCardNotification_ValidationRejectsBadFields(t *testing.T) {
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
 			r := req
-			_, err := n.deliverDocsCardNotification(&r)
+			_, err := n.deliverDocsCardNotification(context.Background(), &r)
 			require.ErrorIs(t, err, errNotifyCardInvalid)
 		})
 	}
@@ -349,7 +349,7 @@ func TestDeliverDocsCardNotification_DegradesToTextWhenSenderUnavailable(t *test
 	n.botOK.Store(true)
 	primeMemberCache(n, "spc_1", "uid_a")
 
-	resp, err := n.deliverDocsCardNotification(&NotifyReq{
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "spc_1", Service: "docs-service", Targets: []string{"uid_a"}, DocsCard: validDocsCard(),
 	})
 	require.NoError(t, err)
@@ -368,7 +368,7 @@ func TestDeliverDocsCardNotification_NonMemberExcluded(t *testing.T) {
 	n.botOK.Store(true)
 	primeMemberCache(n, "spc_1", "uid_member") // uid_stranger is NOT a member
 
-	resp, err := n.deliverDocsCardNotification(&NotifyReq{
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
 		SpaceID: "spc_1", Service: "docs-service",
 		Targets: []string{"uid_member", "uid_stranger"}, DocsCard: validDocsCard(),
 	})

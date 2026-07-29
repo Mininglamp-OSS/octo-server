@@ -36,6 +36,7 @@ type Common struct {
 	appConfigDB      *appConfigDB
 	systemSettings   *SystemSettings
 	readinessChecker readinessChecker
+	catalogReadiness func() error
 	threadOn         int // 缓存 DM_THREAD_ON 环境变量
 }
 
@@ -56,6 +57,7 @@ func New(ctx *config.Context) *Common {
 		appConfigDB:      newAppConfigDB(ctx),
 		systemSettings:   EnsureSystemSettings(ctx),
 		readinessChecker: newDependencyReadinessChecker(ctx, database),
+		catalogReadiness: currentCardTemplateCatalogReadinessCheck(),
 		Log:              log.NewTLog("common"),
 		threadOn:         threadOn,
 	}

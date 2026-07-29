@@ -34,4 +34,20 @@ var (
 		DefaultMessage: "The card template catalog is temporarily unavailable.",
 		Internal:       true,
 	})
+	ErrCardTemplateCatalogControlDisabled = register(codes.Code{
+		ID:             "err.server.card_template_catalog.control_disabled",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Card template activation is disabled.",
+		Internal:       true,
+	})
+	ErrCardTemplateCatalogStateConflict = register(codes.Code{
+		ID:             "err.server.card_template_catalog.state_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The card template state changed; refresh and retry.",
+	})
+	ErrCardTemplateCatalogBlocked = register(codes.Code{
+		ID:             "err.server.card_template_catalog.blocked",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The card template version is blocked.",
+	})
 )

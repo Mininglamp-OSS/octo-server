@@ -249,17 +249,26 @@ other = "Failed to update data."
 ["err.server.botfather.username_taken"]
 other = "The username is already taken."
 
+["err.server.card_template_catalog.blocked"]
+other = "The card template version is blocked."
+
 ["err.server.card_template_catalog.conflict"]
 other = "The card template version conflicts with an immutable artifact."
 
 ["err.server.card_template_catalog.content_too_large"]
 other = "The card template request is too large."
 
+["err.server.card_template_catalog.control_disabled"]
+other = "Card template activation is disabled."
+
 ["err.server.card_template_catalog.forbidden"]
 other = "Only a super admin can manage card templates."
 
 ["err.server.card_template_catalog.request_invalid"]
 other = "The card template bundle is invalid."
+
+["err.server.card_template_catalog.state_conflict"]
+other = "The card template state changed; refresh and retry."
 
 ["err.server.card_template_catalog.unavailable"]
 other = "The card template catalog is temporarily unavailable."

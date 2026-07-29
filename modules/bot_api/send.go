@@ -250,7 +250,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 		}
-		rendered, renderErr := ba.cardTemplates.RenderPayload(c.Request.Context(), req.Payload, cardtmpl.BuildEnv{
+		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), robotID, req.Payload, cardtmpl.BuildEnv{
 			WebLoginURL: webLoginURL,
 			Lang:        i18n.OutboundLanguage(c.Request.Context()),
 			SpaceID:     spaceID,
@@ -1216,7 +1216,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
 	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
-	rendered, err := ba.cardTemplates.RenderEditPayload(c.Request.Context(), map[string]any{
+	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), robotID, map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
 		"state":        req.State,

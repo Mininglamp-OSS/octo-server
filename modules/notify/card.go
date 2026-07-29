@@ -31,7 +31,12 @@ import (
 // notification is never silently lost. Per-recipient dispatch errors
 // (busy/dispatch_failed/target_denied) surface in Filtered so the caller's
 // existing retry/dedup state machine handles them, exactly as the text path.
-func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
+// Ordinary card-build failures retain the legacy text fallback; runtime-catalog
+// safety rejections (blocked/disabled/auth/integrity/unavailable) fail closed.
+func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*NotifyResp, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if req == nil || req.Card == nil {
 		return nil, errNotifyCardInvalid
 	}
@@ -61,7 +66,14 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 	} else {
 		summaryTid = summaryfailed.TemplateID
 	}
-	if err := preflightSummarySchema(card, summaryTid); err != nil {
+	if err := preflightSummarySchema(ctx, card, summaryTid); err != nil {
+		if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
+			n.Error("summary card preflight rejected by runtime catalog",
+				zap.String("catalog_result", failure.result), zap.Error(err),
+				zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+				zap.String("kind", card.Kind))
+			return nil, err
+		}
 		if errors.Is(err, errCardTmplUnavailable) {
 			n.Error("summary card preflight: cardtmpl unavailable (composition bug, 500)",
 				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
@@ -124,14 +136,21 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 		)
 		if card.Kind == SummaryCardKindCompleted {
 			doc, renderProfile, buildErr = n.buildSummaryCardViaRegistry(
-				context.Background(), req.SpaceID, card, lang,
+				ctx, req.SpaceID, card, lang,
 				summarycompleted.TemplateID, summarycompleted.StateShown)
 		} else {
 			doc, renderProfile, buildErr = n.buildSummaryCardViaRegistry(
-				context.Background(), req.SpaceID, card, lang,
+				ctx, req.SpaceID, card, lang,
 				summaryfailed.TemplateID, summaryfailed.StateShown)
 		}
 		if buildErr != nil {
+			if failure, ok := classifyNotifyCatalogRuntimeFailure(buildErr); ok {
+				n.Error("summary card rejected by runtime catalog",
+					zap.String("catalog_result", failure.result), zap.Error(buildErr),
+					zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+					zap.String("kind", card.Kind))
+				return nil, buildErr
+			}
 			// C1: schema 违规理论上已被 preflight 拦掉,这里再 typed 断言一次
 			// 兜底(避免 Build 内部新增校验后绕过 preflight)。
 			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
@@ -332,8 +351,13 @@ type summaryLabels struct {
 // verification -> bounded fan-out) but binds to the docs-notify producer and
 // uses BuildDocsResourceCard for the /d/{doc_id}?sp={space_id} deep link. A
 // build failure degrades the whole request to a plain-text DM so a docs
-// notification is never silently lost.
-func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error) {
+// notification is never silently lost. Runtime-catalog safety rejections are
+// excluded from that fallback and fail closed so an emergency block cannot be
+// converted into a successful text delivery.
+func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq) (*NotifyResp, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if req == nil || req.DocsCard == nil {
 		return nil, errNotifyCardInvalid
 	}
@@ -363,7 +387,13 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	// Only the access_requested + gate-on branch flows through Registry.Render;
 	// other kinds keep the historical validate-in-builder behavior.
 	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
-		if err := preflightDocsAccessRequestSchema(card); err != nil {
+		if err := preflightDocsAccessRequestSchema(ctx, card); err != nil {
+			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
+				n.Error("docs access-request card preflight rejected by runtime catalog",
+					zap.String("catalog_result", failure.result), zap.Error(err),
+					zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, err
+			}
 			// R2-2: preflight 现在能返 typed errCardTmplUnavailable (Registry/Template
 			// 未注入,composition bug) —— 与 schema 400 分开处理,让 500 不降级。
 			if errors.Is(err, errCardTmplUnavailable) {
@@ -385,7 +415,14 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		} else {
 			tid = docsshared.TemplateID
 		}
-		if err := preflightDocsDisplaySchema(card, tid); err != nil {
+		if err := preflightDocsDisplaySchema(ctx, card, tid); err != nil {
+			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
+				n.Error("docs display card preflight rejected by runtime catalog",
+					zap.String("catalog_result", failure.result), zap.Error(err),
+					zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
+				return nil, err
+			}
 			if errors.Is(err, errCardTmplUnavailable) {
 				n.Error("docs display card preflight: cardtmpl unavailable (composition bug, 500)",
 					zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
@@ -441,25 +478,33 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
 			profile = cardmsg.ProfileV2
 			// F7: 唯一入口。Registry 未注入 = composition bug,不再 fallback 到 legacy
-			// (那样会遮蔽 wiring 漏洞);buildErr non-nil 分类走 render_error 降级文本。
-			doc, renderProfile, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
+			// (那样会遮蔽 wiring 漏洞);普通 render_error 才降级文本,catalog safety
+			// rejection 由下方分类器直接拒绝。
+			doc, renderProfile, buildErr = n.buildDocsAccessRequestCardViaRegistry(ctx, req.SpaceID, card, lang)
 		} else if card.Kind == DocsCardKindCommented {
 			// roadmap C:docs.commented@0.1.0 走 Registry.Render(v1 展示卡)。
 			// 与 access_requested 同 policy —— preflight 早跑 C1、Registry 未注入
 			// 直接 500 不降级(F7)。字节等价 legacy buildDocsCard 由 body 共享
 			// assembleResourceCardBody 保证。
 			doc, renderProfile, buildErr = n.buildDocsDisplayCardViaRegistry(
-				context.Background(), req.SpaceID, card, lang,
+				ctx, req.SpaceID, card, lang,
 				docscommented.TemplateID, docscommented.StateShown)
 		} else if card.Kind == DocsCardKindShared {
 			// roadmap C:docs.shared@0.1.0 走 Registry.Render(与 commented 对称)。
 			doc, renderProfile, buildErr = n.buildDocsDisplayCardViaRegistry(
-				context.Background(), req.SpaceID, card, lang,
+				ctx, req.SpaceID, card, lang,
 				docsshared.TemplateID, docsshared.StateShown)
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
 		if buildErr != nil {
+			if failure, ok := classifyNotifyCatalogRuntimeFailure(buildErr); ok {
+				n.Error("docs card rejected by runtime catalog",
+					zap.String("catalog_result", failure.result), zap.Error(buildErr),
+					zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
+				return nil, buildErr
+			}
 			// C1 policy (docs/platform-card-base.md §10):
 			// - schema-level field errors (typed cardtmpl.ErrFieldsInvalid) → 400,
 			//   zero delivery. Reject the whole request instead of silently

@@ -43,6 +43,18 @@ func respondCatalogUnavailable(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogUnavailable, nil, nil)
 }
 
+func respondCatalogControlDisabled(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogControlDisabled, nil, nil)
+}
+
+func respondCatalogStateConflict(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogStateConflict, nil, nil)
+}
+
+func respondCatalogBlocked(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogBlocked, nil, nil)
+}
+
 func respondCatalogIntegrityFailure(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 }

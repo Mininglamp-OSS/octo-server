@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
@@ -18,24 +19,86 @@ import (
 // 与 cardtmpl.ErrFieldsInvalid 对齐 typed:前者是 500,后者是 400。
 var errCardTmplUnavailable = errors.New("notify: cardtmpl registry/template unavailable (composition bug)")
 
+type notifyCatalogRuntimeFailure struct {
+	result string
+	cause  error
+}
+
+func (e *notifyCatalogRuntimeFailure) Error() string {
+	if e == nil {
+		return "notify: runtime card template catalog rejected the operation"
+	}
+	return fmt.Sprintf("notify: runtime card template catalog rejected the operation (%s): %v", e.result, e.cause)
+}
+
+func (e *notifyCatalogRuntimeFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func classifyNotifyCatalogRuntimeFailure(err error) (*notifyCatalogRuntimeFailure, bool) {
+	if err == nil {
+		return nil, false
+	}
+	var existing *notifyCatalogRuntimeFailure
+	if errors.As(err, &existing) {
+		return existing, true
+	}
+	result := ""
+	switch {
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogBlocked):
+		result = "blocked"
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled):
+		result = "disabled"
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogNewSendDisabled):
+		result = "new_send_disabled"
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized):
+		result = "not_authorized"
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity):
+		result = "integrity"
+	case errors.Is(err, cardtmpl.ErrRuntimeCatalogUnavailable):
+		result = "unavailable"
+	case errors.Is(err, context.Canceled):
+		result = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		result = "timeout"
+	default:
+		return nil, false
+	}
+	return &notifyCatalogRuntimeFailure{result: result, cause: err}, true
+}
+
+func notifyCatalogLookupError(id cardtmpl.ID, err error) error {
+	if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
+		return fmt.Errorf("notify: lookup %s: %w", id, failure)
+	}
+	return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, id, err)
+}
+
+const notifyCatalogCallTimeout = 10 * time.Second
+
 // templateFallbackText 是 F6 分工:access_requested + gate + Registry-ready 时,
 // buildDocsFallbackText 会先调本函数,让 fallback 文本走 pilot Template 的 L0
 // 定义。Registry 未注入 / Template 未注册 / mapping/unmarshal 失败 → 返 ok=false,
 // caller 兜回 legacy 多行组装。
 func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return "", false
-	}
-	tmpl, err := registry.Lookup(docsaccessrequest.TemplateID, "")
-	if err != nil {
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
 		return "", false
 	}
 	fields, err := mapDocsCardFieldsToJSON(card, lang)
 	if err != nil {
 		return "", false
 	}
-	text, err := tmpl.FallbackText(docsaccessrequest.StatePending, fields, lang)
+	ctx, cancel := boundedNotifyCatalogContext(context.Background())
+	defer cancel()
+	text, err := catalog.FallbackText(ctx, cardtmpl.CatalogFallbackRequest{
+		Access: notifyCatalogAccess(docsNotifyProducerID, ""),
+		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending,
+		Fields: fields, Lang: lang,
+	})
 	if err != nil || strings.TrimSpace(text) == "" {
 		return "", false
 	}
@@ -52,14 +115,18 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 // R2-2 修正:前版当 registry nil 时返 nil 让 caller 继续走 v2 分支,后者最终降级
 // 文本 —— 那样"错请求"仍然会成功送达一条文本,与 §10 / A14 冲突。现在 preflight
 // 阶段就报 500,让 wiring bug 立刻可见。
-func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+func preflightDocsAccessRequestSchema(parent context.Context, card *DocsCardFields) error {
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
-	tmpl, err := registry.Lookup(docsaccessrequest.TemplateID, "")
+	ctx, cancel := boundedNotifyCatalogContext(parent)
+	defer cancel()
+	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
+		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: docsaccessrequest.TemplateID,
+	})
 	if err != nil {
-		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, docsaccessrequest.TemplateID, err)
+		return notifyCatalogLookupError(docsaccessrequest.TemplateID, err)
 	}
 	fields, err := mapDocsCardFieldsToJSON(card, "zh-CN") // preflight 只关心 schema shape,lang 无差异
 	if err != nil {
@@ -69,10 +136,13 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	if err := json.Unmarshal(fields, &parsed); err != nil {
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
-	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
+	if meta.InputSchema == nil {
+		return fmt.Errorf("%w: %s has no input schema", errCardTmplUnavailable, docsaccessrequest.TemplateID)
+	}
+	if err := meta.InputSchema.Validate(parsed); err != nil {
 		// R2-8: preflight schema 失败也打 fields_invalid metric (Render 未被触发,
 		// 否则 metric 永远漏这条最"合法"的 400 路径)。
-		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, tmpl.Meta().Version)
+		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, meta.Version)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	// R3-1: schema 的 avatarUrl pattern 只做粗粒度前缀防护,正则无法可靠判定 host
@@ -88,7 +158,7 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	// 让基座统一前置校验,消除这条硬编码耦合。
 	if avatar := strings.TrimSpace(card.ActorAvatarURL); avatar != "" {
 		if err := cardtmpl.AbsoluteHTTPSURL(avatar); err != nil {
-			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, tmpl.Meta().Version)
+			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, meta.Version)
 			return fmt.Errorf("%w: actor_avatar_url: %v", cardtmpl.ErrFieldsInvalid, err)
 		}
 	}
@@ -107,11 +177,11 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	ctx context.Context, spaceID string, card *DocsCardFields, lang string,
 ) (json.RawMessage, string, error) {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		n.Error("cardtmpl DefaultRegistry unwired — composition bug",
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		n.Error("cardtmpl DefaultCatalog unwired — composition bug",
 			zap.String("space_id", spaceID), zap.String("doc_id", card.DocID))
-		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+		return nil, "", fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
 
 	fields, err := mapDocsCardFieldsToJSON(card, lang)
@@ -124,9 +194,12 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 		Lang:        lang,
 		SpaceID:     spaceID,
 	}
-	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx,
-		docsaccessrequest.TemplateID, "",
-		docsaccessrequest.StatePending, fields, env)
+	catalogCtx, cancel := boundedNotifyCatalogContext(ctx)
+	defer cancel()
+	cardDoc, _, renderProfile, err := cardtmpl.RenderCatalogCardWithProfiles(catalogCtx, catalog, cardtmpl.CatalogRenderRequest{
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
+		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending, Fields: fields, Env: env,
+	})
 	if err != nil {
 		return nil, "", err
 	}
@@ -183,9 +256,9 @@ func (n *Notify) buildDocsDisplayCardViaRegistry(
 	ctx context.Context, spaceID string, card *DocsCardFields, lang string,
 	templateID cardtmpl.ID, state cardtmpl.State,
 ) (json.RawMessage, string, error) {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return nil, "", fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
 	fields, err := mapDocsCardFieldsToDisplayJSON(card)
 	if err != nil {
@@ -196,7 +269,12 @@ func (n *Notify) buildDocsDisplayCardViaRegistry(
 		Lang:        lang,
 		SpaceID:     spaceID,
 	}
-	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx, templateID, "", state, fields, env)
+	catalogCtx, cancel := boundedNotifyCatalogContext(ctx)
+	defer cancel()
+	cardDoc, _, renderProfile, err := cardtmpl.RenderCatalogCardWithProfiles(catalogCtx, catalog, cardtmpl.CatalogRenderRequest{
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
+		ID:     templateID, State: state, Fields: fields, Env: env,
+	})
 	if err != nil {
 		return nil, "", err
 	}
@@ -206,14 +284,18 @@ func (n *Notify) buildDocsDisplayCardViaRegistry(
 // preflightDocsDisplaySchema 与 preflightDocsAccessRequestSchema 同思路:在
 // memberCache/docsSender/gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。
 // docs.commented / docs.shared 无用户可控 URL 字段,不需要 avatar https 前置校验。
-func preflightDocsDisplaySchema(card *DocsCardFields, templateID cardtmpl.ID) error {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+func preflightDocsDisplaySchema(parent context.Context, card *DocsCardFields, templateID cardtmpl.ID) error {
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
-	tmpl, err := registry.Lookup(templateID, "")
+	ctx, cancel := boundedNotifyCatalogContext(parent)
+	defer cancel()
+	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
+		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: templateID,
+	})
 	if err != nil {
-		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, templateID, err)
+		return notifyCatalogLookupError(templateID, err)
 	}
 	fields, err := mapDocsCardFieldsToDisplayJSON(card)
 	if err != nil {
@@ -223,8 +305,11 @@ func preflightDocsDisplaySchema(card *DocsCardFields, templateID cardtmpl.ID) er
 	if err := json.Unmarshal(fields, &parsed); err != nil {
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
-	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
-		cardtmpl.RecordFieldsInvalid(templateID, tmpl.Meta().Version)
+	if meta.InputSchema == nil {
+		return fmt.Errorf("%w: %s has no input schema", errCardTmplUnavailable, templateID)
+	}
+	if err := meta.InputSchema.Validate(parsed); err != nil {
+		cardtmpl.RecordFieldsInvalid(templateID, meta.Version)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	return nil
@@ -360,9 +445,9 @@ func (n *Notify) buildSummaryCardViaRegistry(
 	ctx context.Context, spaceID string, card *SummaryCardFields, lang string,
 	templateID cardtmpl.ID, state cardtmpl.State,
 ) (json.RawMessage, string, error) {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return nil, "", fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
 	fields, err := mapSummaryCardFieldsToJSON(card)
 	if err != nil {
@@ -373,7 +458,12 @@ func (n *Notify) buildSummaryCardViaRegistry(
 		Lang:        lang,
 		SpaceID:     spaceID,
 	}
-	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx, templateID, "", state, fields, env)
+	catalogCtx, cancel := boundedNotifyCatalogContext(ctx)
+	defer cancel()
+	cardDoc, _, renderProfile, err := cardtmpl.RenderCatalogCardWithProfiles(catalogCtx, catalog, cardtmpl.CatalogRenderRequest{
+		Access: notifyCatalogAccess(summaryNotifyProducerID, spaceID),
+		ID:     templateID, State: state, Fields: fields, Env: env,
+	})
 	if err != nil {
 		return nil, "", err
 	}
@@ -383,14 +473,18 @@ func (n *Notify) buildSummaryCardViaRegistry(
 // preflightSummarySchema 与 preflightDocsDisplaySchema 同思路:在 memberCache /
 // docsSender / gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。summary 卡
 // 无用户可控 URL 字段,不需要 https 前置校验。
-func preflightSummarySchema(card *SummaryCardFields, templateID cardtmpl.ID) error {
-	registry := cardtmpl.DefaultRegistry()
-	if registry == nil {
-		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+func preflightSummarySchema(parent context.Context, card *SummaryCardFields, templateID cardtmpl.ID) error {
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
-	tmpl, err := registry.Lookup(templateID, "")
+	ctx, cancel := boundedNotifyCatalogContext(parent)
+	defer cancel()
+	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
+		Access: notifyCatalogAccess(summaryNotifyProducerID, ""), ID: templateID,
+	})
 	if err != nil {
-		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, templateID, err)
+		return notifyCatalogLookupError(templateID, err)
 	}
 	fields, err := mapSummaryCardFieldsToJSON(card)
 	if err != nil {
@@ -400,9 +494,28 @@ func preflightSummarySchema(card *SummaryCardFields, templateID cardtmpl.ID) err
 	if err := json.Unmarshal(fields, &parsed); err != nil {
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
-	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
-		cardtmpl.RecordFieldsInvalid(templateID, tmpl.Meta().Version)
+	if meta.InputSchema == nil {
+		return fmt.Errorf("%w: %s has no input schema", errCardTmplUnavailable, templateID)
+	}
+	if err := meta.InputSchema.Validate(parsed); err != nil {
+		cardtmpl.RecordFieldsInvalid(templateID, meta.Version)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	return nil
+}
+
+func notifyCatalogAccess(producerID, spaceID string) cardtmpl.CatalogAccess {
+	return cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeNewSend,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalInternalProducer, ID: producerID, SpaceID: spaceID,
+		},
+	}
+}
+
+func boundedNotifyCatalogContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, notifyCatalogCallTimeout)
 }

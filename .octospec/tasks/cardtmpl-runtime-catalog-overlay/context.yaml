@@ -1,0 +1,20 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: Runtime catalog consumers include Bot, notify, message action-context, and manager control routes; authoritative principal, ownership, and Space boundaries must not be weakened.
+  - id: trust-boundary
+    source: repo
+    why: Dynamic canonical bundles remain untrusted stored content and must pass strict hash, compiler, structural-budget, URL, and cardmsg validation boundaries on cache miss.
+  - id: error-handling
+    source: repo
+    why: New activate, rollback, block, manager-read, and runtime errors are user-visible wire contracts and must use registered localized envelopes.
+  - id: rate-limit
+    source: repo
+    why: Manager catalog routes remain authenticated and use the shared UID limiter before the super-admin guard.
+  - id: testing
+    source: repo
+    why: The task changes migrations, CAS transactions, cache concurrency, multi-replica behavior, and Bot/message/notify hot paths and therefore requires focused, integration, race, and coverage evidence.
+  - id: commit-style
+    source: repo
+    why: The eventual commits and PR must use English Conventional Commits, an English PR body, Linked Spec, and the dedicated PR-B issue; the Implement phase itself makes no commit.
+brief: .octospec/tasks/cardtmpl-runtime-catalog-overlay/brief.md

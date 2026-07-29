@@ -8,13 +8,17 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 )
 
-const botTemplateWireV1 = "template-ref/v1"
+const (
+	botTemplateWireV1        = "template-ref/v1"
+	botTemplateLookupTimeout = 5 * time.Second
+)
 
 var (
 	errBotTemplateRequestInvalid     = errors.New("bot template request invalid")
@@ -51,7 +55,7 @@ type botTemplatingCapability struct {
 }
 
 type botCardTemplateCatalog struct {
-	registry    *cardtmpl.Registry
+	catalog     cardtmpl.Catalog
 	sendAllowed map[botTemplateRef]struct{}
 	editAllowed map[botTemplateRef]struct{}
 	capability  botTemplatingCapability
@@ -74,19 +78,20 @@ func defaultBotTemplatePolicy() botTemplatePolicy {
 	}
 }
 
-func newBotCardTemplateCatalog(registry *cardtmpl.Registry, refs []botTemplateRef) (*botCardTemplateCatalog, error) {
-	return newBotCardTemplateCatalogWithPolicy(registry, botTemplatePolicy{
+func newBotCardTemplateCatalog(source any, refs []botTemplateRef) (*botCardTemplateCatalog, error) {
+	return newBotCardTemplateCatalogWithPolicy(source, botTemplatePolicy{
 		AdvertisedSend: refs,
 		EditCompatible: refs,
 	})
 }
 
 func newBotCardTemplateCatalogWithPolicy(
-	registry *cardtmpl.Registry,
+	source any,
 	policy botTemplatePolicy,
 ) (*botCardTemplateCatalog, error) {
-	if registry == nil {
-		return nil, errBotTemplateCatalogUnavailable
+	runtimeCatalog, err := botRuntimeCatalog(source)
+	if err != nil {
+		return nil, err
 	}
 	if len(policy.AdvertisedSend) == 0 {
 		return nil, fmt.Errorf("bot template catalog: empty advertised/send allowlist")
@@ -95,7 +100,7 @@ func newBotCardTemplateCatalogWithPolicy(
 		return nil, fmt.Errorf("bot template catalog: empty edit-compatible allowlist")
 	}
 	catalog := &botCardTemplateCatalog{
-		registry:    registry,
+		catalog:     runtimeCatalog,
 		sendAllowed: make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
 		editAllowed: make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
 		capability: botTemplatingCapability{
@@ -111,11 +116,13 @@ func newBotCardTemplateCatalogWithPolicy(
 		if _, duplicate := catalog.sendAllowed[ref]; duplicate {
 			return nil, fmt.Errorf("bot template catalog: duplicate advertised/send %s@%s", ref.ID, ref.Version)
 		}
-		tmpl, err := registry.Lookup(ref.ID, ref.Version)
+		meta, err := lookupBotTemplateMeta(runtimeCatalog, cardtmpl.CatalogExactRequest{
+			Access: botCatalogAccess(cardtmpl.CatalogPurposeNewSend, "bot-api-manifest", ""),
+			ID:     ref.ID, Version: ref.Version,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("bot template catalog: lookup %s@%s: %w", ref.ID, ref.Version, err)
 		}
-		meta := tmpl.Meta()
 		if meta.ID != ref.ID || meta.Version != ref.Version || len(meta.Views) == 0 {
 			return nil, fmt.Errorf("bot template catalog: incomplete metadata for %s@%s", ref.ID, ref.Version)
 		}
@@ -178,11 +185,13 @@ func newBotCardTemplateCatalogWithPolicy(
 		if _, duplicate := catalog.editAllowed[ref]; duplicate {
 			return nil, fmt.Errorf("bot template catalog: duplicate edit-compatible %s@%s", ref.ID, ref.Version)
 		}
-		tmpl, err := registry.Lookup(ref.ID, ref.Version)
+		meta, err := lookupBotTemplateMeta(runtimeCatalog, cardtmpl.CatalogExactRequest{
+			Access: botCatalogAccess(cardtmpl.CatalogPurposeHistoricalEdit, "bot-api-manifest", ""),
+			ID:     ref.ID, Version: ref.Version,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("bot template catalog: edit-compatible lookup %s@%s: %w", ref.ID, ref.Version, err)
 		}
-		meta := tmpl.Meta()
 		if meta.ID != ref.ID || meta.Version != ref.Version || len(meta.Views) == 0 {
 			return nil, fmt.Errorf("bot template catalog: incomplete edit-compatible metadata for %s@%s", ref.ID, ref.Version)
 		}
@@ -233,7 +242,21 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, inbound, env, c.sendAllowed, "not Bot-callable for new send")
+	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend,
+		inbound, env, c.sendAllowed, "not Bot-callable for new send")
+}
+
+func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
+	ctx context.Context,
+	botID string,
+	inbound map[string]any,
+	env cardtmpl.BuildEnv,
+) (map[string]any, error) {
+	if c == nil || strings.TrimSpace(botID) == "" {
+		return nil, errBotTemplateCatalogUnavailable
+	}
+	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeNewSend,
+		inbound, env, c.sendAllowed, "not Bot-callable for new send")
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayload(
@@ -244,17 +267,33 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, inbound, env, c.editAllowed, "not edit-compatible")
+	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit,
+		inbound, env, c.editAllowed, "not edit-compatible")
+}
+
+func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
+	ctx context.Context,
+	botID string,
+	inbound map[string]any,
+	env cardtmpl.BuildEnv,
+) (map[string]any, error) {
+	if c == nil || strings.TrimSpace(botID) == "" {
+		return nil, errBotTemplateCatalogUnavailable
+	}
+	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit,
+		inbound, env, c.editAllowed, "not edit-compatible")
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
 	ctx context.Context,
+	botID string,
+	purpose cardtmpl.CatalogPurpose,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 	allowed map[botTemplateRef]struct{},
 	denialReason string,
 ) (map[string]any, error) {
-	if c == nil || c.registry == nil {
+	if c == nil || c.catalog == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	if !cardmsg.IsCardPayload(inbound) {
@@ -294,7 +333,10 @@ func (c *botCardTemplateCatalog) renderPayload(
 	if err != nil {
 		return nil, fmt.Errorf("%w: marshal data: %v", errBotTemplateRequestInvalid, err)
 	}
-	rendered, err := c.registry.Render(ctx, ref.ID, ref.Version, cardtmpl.State(state), rawData, env)
+	rendered, err := c.catalog.Render(ctx, cardtmpl.CatalogRenderRequest{
+		Access: botCatalogAccess(purpose, botID, env.SpaceID),
+		ID:     ref.ID, Version: ref.Version, State: cardtmpl.State(state), Fields: rawData, Env: env,
+	})
 	if err != nil {
 		if errors.Is(err, cardtmpl.ErrFieldsInvalid) || errors.Is(err, cardtmpl.ErrStateUnknown) || errors.Is(err, cardtmpl.ErrTemplateUnknown) {
 			return nil, fmt.Errorf("%w: %v", errBotTemplateRequestInvalid, err)
@@ -330,7 +372,7 @@ func (c *botCardTemplateCatalog) requireRef(
 	allowed map[botTemplateRef]struct{},
 	denialReason string,
 ) (botTemplateRef, error) {
-	if c == nil || c.registry == nil {
+	if c == nil || c.catalog == nil {
 		return botTemplateRef{}, errBotTemplateCatalogUnavailable
 	}
 	ref, err := parseBotTemplateRef(value)
@@ -341,6 +383,47 @@ func (c *botCardTemplateCatalog) requireRef(
 		return botTemplateRef{}, fmt.Errorf("%w: %s", errBotTemplateRequestInvalid, denialReason)
 	}
 	return ref, nil
+}
+
+func lookupBotTemplateMeta(
+	catalog cardtmpl.Catalog,
+	request cardtmpl.CatalogExactRequest,
+) (cardtmpl.TemplateMeta, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), botTemplateLookupTimeout)
+	defer cancel()
+	return catalog.MetaExact(ctx, request)
+}
+
+func botRuntimeCatalog(source any) (cardtmpl.Catalog, error) {
+	switch typed := source.(type) {
+	case nil:
+		return nil, errBotTemplateCatalogUnavailable
+	case *cardtmpl.Registry:
+		if typed == nil {
+			return nil, errBotTemplateCatalogUnavailable
+		}
+		catalog, err := cardtmpl.NewStaticCatalog(typed)
+		if err != nil {
+			return nil, fmt.Errorf("bot template catalog: static adapter: %w", err)
+		}
+		return catalog, nil
+	case cardtmpl.Catalog:
+		if typed == nil {
+			return nil, errBotTemplateCatalogUnavailable
+		}
+		return typed, nil
+	default:
+		return nil, errBotTemplateCatalogUnavailable
+	}
+}
+
+func botCatalogAccess(purpose cardtmpl.CatalogPurpose, botID, spaceID string) cardtmpl.CatalogAccess {
+	return cardtmpl.CatalogAccess{
+		Purpose: purpose,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: botID, SpaceID: spaceID,
+		},
+	}
 }
 
 func parseBotTemplateRef(value any) (botTemplateRef, error) {
