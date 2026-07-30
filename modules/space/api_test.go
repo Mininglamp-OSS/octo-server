@@ -2023,14 +2023,20 @@ func seedApprovalSpace(t *testing.T, f *Space, spaceId string) {
 	}))
 }
 
-// readApplyCreatedAt 直接读申请时间，绕过业务过滤。
-func readApplyCreatedAt(t *testing.T, applyID int64) time.Time {
+// readApplyCreatedAt 直接读申请时间（epoch 秒），绕过业务过滤。
+//
+// 必须取 UNIX_TIMESTAMP 而不是把 created_at 直接 Load 进 time.Time：dbr 会把
+// time.Time 当结构体做列→字段映射，找不到匹配字段就返回 rows=1, err=nil 却留下
+// 零值——静默失败。零值之间的比较恒等，会让"时间没刷新"的断言假绿。
+// 用 epoch 同时绕开会话时区与 NOW() 写入列之间的偏移。
+func readApplyCreatedAt(t *testing.T, applyID int64) int64 {
 	t.Helper()
-	var createdAt time.Time
+	var epoch int64
 	_, err := testCtx.DB().SelectBySql(
-		"SELECT created_at FROM space_join_apply WHERE id=?", applyID).Load(&createdAt)
+		"SELECT UNIX_TIMESTAMP(created_at) FROM space_join_apply WHERE id=?", applyID).Load(&epoch)
 	assert.NoError(t, err)
-	return createdAt
+	assert.NotZero(t, epoch, "读取申请时间失败：0 会让后续时间断言假绿")
+	return epoch
 }
 
 // A1 —— 待审批状态下改用新邀请码重申：记录应改用新码并刷新申请时间。
@@ -2081,7 +2087,7 @@ func TestJoinSpace_ResubmitWithNewInviteUpdatesPendingApply(t *testing.T) {
 	assert.Equal(t, apply.Id, updated.Id, "uk_space_uid 决定仍是同一行")
 	assert.Equal(t, "code-683-b", updated.InviteCode, "待审批申请应改用本次提交的邀请码")
 	assert.Equal(t, 0, updated.Status, "重申不得自行授予成员资格，仍需审批")
-	assert.True(t, readApplyCreatedAt(t, apply.Id).After(before), "申请时间应刷新为最近一次提交")
+	assert.Greater(t, readApplyCreatedAt(t, apply.Id), before, "申请时间应刷新为最近一次提交")
 }
 
 // A2 —— 重申换码后审批应消耗新码的名额，而不是已失效的旧码。
@@ -2173,7 +2179,7 @@ func TestJoinApplyList_ReappliedApplySortsByLatestTime(t *testing.T) {
 	w := postJoinSpace(t, s, token, "code-683-sort")
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	assert.True(t, readApplyCreatedAt(t, rejectedID).After(firstApplyAt),
+	assert.Greater(t, readApplyCreatedAt(t, rejectedID), firstApplyAt,
 		"重新申请应刷新申请时间，而不是保留首次申请日期")
 
 	list, err := f.db.queryPendingAppliesBySpace(spaceId, 10, 0)
@@ -2351,6 +2357,6 @@ func TestJoinSpace_ResubmitSameInviteIsNoOp(t *testing.T) {
 		"同码重复提交应保持'已提交，等待审批'，该响应分支不会通知管理员")
 	assert.NotContains(t, w.Body.String(), "NEED_APPROVAL")
 
-	assert.Equal(t, before.Unix(), readApplyCreatedAt(t, apply.Id).Unix(),
+	assert.Equal(t, before, readApplyCreatedAt(t, apply.Id),
 		"没有任何变化时不应刷新申请时间")
 }
