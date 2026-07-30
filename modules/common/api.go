@@ -396,6 +396,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 			DriveOn:                cn.systemSettings.DriveEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
@@ -446,6 +447,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 		DriveOn:                cn.systemSettings.DriveEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
@@ -826,6 +828,12 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DocsOn bool `json:"docs_on"`
+
+	// DocsSearchOn 告知客户端是否展示云文档全文搜索。值来源于 system_setting
+	// docs.search_enabled；默认 false —— 与 docs_on 解耦，搜索端点由 octo-docs-backend
+	// 独立提供，可晚于 docs 模块上线，上线+索引就绪后才放量。仅表达展示策略，鉴权
+	// 在 octo-docs-backend 自身，本字段不承担鉴权。与 app_config.version 解耦的原因同 DocsOn。
+	DocsSearchOn bool `json:"docs_search_on"`
 
 	// DriveOn 告知客户端是否展示网盘(drive)模块入口。值来源于 system_setting
 	// drive.enabled；默认 false —— 独立部署的 octo-drive 服务尚未上线，先隐藏入口，
