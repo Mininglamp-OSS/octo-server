@@ -31,6 +31,9 @@ re-submission was short-circuited, and only an admin rejection broke the cycle.
   in-flight approval back to pending and decouple the consumed slot from the code
   on the record. 0 rows affected ⇒ re-read and re-decide (approved ⇒
   `already_member`; rejected/missing ⇒ fall through to the upsert).
+- **`upsertJoinApply` refuses to touch an approved row.** This is the *second*
+  path a re-submission can take into the application row, and the first version
+  of this change left it unguarded — see "Review round 1" below.
 - **`upsertJoinApply` now refreshes `created_at`.** Both list paths order by and
   return `created_at` as the application time, so reject-then-reapply used to
   keep showing the first application's date.
@@ -58,6 +61,51 @@ still fail when the bound code was spent in between — this change makes that
 state **recoverable**, not impossible. Moving consumption to submission time
 changes invite semantics (pending applications hold slots; rejection must refund)
 and deserves its own review. Tracked as a follow-up.
+
+## Review round 1 — the guard was half a guard
+
+Two reviewers (@Jerry-Xin, @yujiawei) independently blocked on the same defect,
+and they were right. A re-submission can reach the application row by **two**
+paths, and only one was guarded:
+
+1. the pending lookup finds a row → `refreshPendingApplyInvite` (guarded);
+2. the pending lookup finds **nothing** → `upsertJoinApply` (was unguarded).
+
+Path 2 is reachable inside the approval window: approval flips `status` to 1
+before `executeJoinSpace` inserts the member row. In that window a re-submission
+sees no member (so the membership check passes) *and* no pending row (because
+`queryPendingApplyBySpaceAndUID` filters `status=0`), so it fell through to an
+unconditional `ON DUPLICATE KEY UPDATE status=0, reviewer_uid=''`. The approver
+never re-asserts `status=1`, leaving an admitted member whose application reads
+pending — and `rejectJoinApply` would then accept that row, mark it rejected, and
+DM "application rejected" **without revoking the membership**.
+
+Reproduced at the DB layer before fixing: `status=0 reviewer="" invite_code="code-B"`.
+
+The race pre-dates this change (the merge-base had the same unconditional upsert),
+but it was in scope: R6 is a stated requirement, and — worse — the doc comment on
+`refreshPendingApplyInvite` and this journal both *asserted the containment was
+complete*. **Overclaiming in the documentation was the more serious error**: a
+reader checking whether the hazard was closed would have believed it was.
+
+Fixed by making `upsertJoinApply`'s duplicate-key branch conditional (`IF(status=1, …)`
+per column, `status` assigned last because MySQL evaluates assignments left to
+right and the other columns must read its original value), plus a re-read so the
+caller answers `already_member` instead of notifying admins about a phantom
+application. Covered by A8 (HTTP-level, constructs the window exactly) and A8b
+(DB-level guard, both approved and rejected rows).
+
+Also from review, non-blocking but fixed here: `queryInvitationByCodeUnfiltered`
+returned "not found" with a nil error on a read failure, which would have polluted
+the one diagnostic this helper exists to produce; and A7 asserted in its message
+that admins are not re-notified without actually asserting it — the `auth_code`
+Redis keys are observable, so it now counts them.
+
+Deferred to follow-ups: approval consumes the invite code from a struct read
+before the status CAS, so a concurrent re-submission can charge the stale code
+(accounting drift, no admission impact); `already_member` can be reported during
+the window before membership actually exists; `created_at` refresh makes offset
+pagination less stable.
 
 ## Learnings
 

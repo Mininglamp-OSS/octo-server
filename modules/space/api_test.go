@@ -22,6 +22,7 @@ import (
 	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -720,11 +721,11 @@ func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
 	spaceId := "test-space-idem"
 	inviteCode := "idem1234"
 	err = f.db.insertSpaceNoTx(&SpaceModel{
-		SpaceId:       spaceId,
-		Name:          "幂等测试空间",
+		SpaceId:        spaceId,
+		Name:           "幂等测试空间",
 		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
-		Creator:       "admin",
-		Status:        1,
+		Creator:        "admin",
+		Status:         1,
 	})
 	assert.NoError(t, err)
 
@@ -785,11 +786,11 @@ func TestJoinSpacePresetGroupDisbanded(t *testing.T) {
 	spaceId := "test-space-disbanded"
 	inviteCode := "disband1"
 	err = f.db.insertSpaceNoTx(&SpaceModel{
-		SpaceId:       spaceId,
-		Name:          "预置群已解散的空间",
+		SpaceId:        spaceId,
+		Name:           "预置群已解散的空间",
 		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
-		Creator:       "admin",
-		Status:        1,
+		Creator:        "admin",
+		Status:         1,
 	})
 	assert.NoError(t, err)
 
@@ -2286,7 +2287,8 @@ func TestJoinSpace_ResubmitDoesNotResetApprovedApply(t *testing.T) {
 
 // A5 —— 过期邀请码在审批时应报"失效"，而不是"次数上限"。
 // （用尽 → exhausted 见 TestApproveJoinApply_InviteExhaustedBlocksApproval，
-//   禁用 → invalid 见 TestApproveJoinApply_InviteDisabledBlocksApproval）
+//
+//	禁用 → invalid 见 TestApproveJoinApply_InviteDisabledBlocksApproval）
 func TestApproveJoinApply_ExpiredInviteReportsInvalid(t *testing.T) {
 	s, f, err := setup(t)
 	assert.NoError(t, err)
@@ -2351,12 +2353,130 @@ func TestJoinSpace_ResubmitSameInviteIsNoOp(t *testing.T) {
 
 	time.Sleep(1100 * time.Millisecond)
 
+	// 通知管理员会给每位管理员在 Redis 里种一个 auth_code（7 天 TTL），因此审批
+	// 授权码的数量就是"是否真的通知了管理员"的可观测代理，不需要在生产代码上开测试口子。
+	codesBefore := countAuthCodeKeys(t, testCtx)
+
 	w = postJoinSpace(t, s, token, "code-683-noop")
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "PENDING",
-		"同码重复提交应保持'已提交，等待审批'，该响应分支不会通知管理员")
+		"同码重复提交应保持'已提交，等待审批'")
 	assert.NotContains(t, w.Body.String(), "NEED_APPROVAL")
 
 	assert.Equal(t, before, readApplyCreatedAt(t, apply.Id),
 		"没有任何变化时不应刷新申请时间")
+
+	// 通知是异步 goroutine，留出落地时间再断言数量没变
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, codesBefore, countAuthCodeKeys(t, testCtx),
+		"同码重复提交不得重新通知管理员")
+}
+
+// countAuthCodeKeys 统计当前存在的审批授权码数量。notifyAdminsNewJoinApply 每通知
+// 一位管理员就写一个 common.AuthCodeCachePrefix 键，因此它是通知扇出的可观测计数。
+func countAuthCodeKeys(t *testing.T, ctx *config.Context) int {
+	t.Helper()
+	rdsClient := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rdsClient.Close()
+	keys, err := rdsClient.Keys(common.AuthCodeCachePrefix + "*").Result()
+	assert.NoError(t, err)
+	return len(keys)
+}
+
+// A8 —— 审批窗口：状态已翻成"已通过"、成员行尚未写入时，申请人重新提交。
+//
+// PR #684 review 指出的阻塞缺陷。此前这条路径完全没有守卫：成员校验查不到成员行、
+// 待审批查询只看 status=0 也查不到这条记录，于是落到 upsertJoinApply 被无条件改写，
+// 把已通过的申请打回待审批并清空 reviewer_uid。留下的矛盾状态更糟——rejectJoinApply
+// 会接受这条 status=0 的记录、标记为已拒绝、给申请人发"申请被拒绝"，却不撤销他已经
+// 持有的成员资格。
+func TestJoinSpace_ResubmitDuringApprovalWindow(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-window"
+	applicantUID := "u-683-window"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-win-a", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-win-b", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-win-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 精确构造窗口：状态已翻成已通过，但成员行还没写入。
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "窗口前提：成员行尚未写入")
+
+	before := readApplyCreatedAt(t, applyID)
+	time.Sleep(1100 * time.Millisecond)
+
+	w := postJoinSpace(t, s, token, "code-683-win-b")
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.already_member")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status, "已通过的申请不得被重新提交打回待审批")
+	assert.Equal(t, testutil.UID, after.ReviewerUID, "审批人不得被清空")
+	assert.Equal(t, "code-683-win-a", after.InviteCode, "已通过申请的邀请码不得被改写")
+	assert.Equal(t, before, readApplyCreatedAt(t, applyID), "已通过申请的申请时间不得被刷新")
+}
+
+// A8b —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
+func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-upsert-guard"
+	uid := "u-683-upsert-guard"
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 已通过：整行不动
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	sameID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-b", Status: 0,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, applyID, sameID, "仍应定位到同一行")
+
+	row, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, row.Status)
+	assert.Equal(t, testutil.UID, row.ReviewerUID)
+	assert.Equal(t, "code-guard-a", row.InviteCode)
+
+	// 已拒绝：允许重置为待审批并改用新码（被拒后重新申请的正常路径）
+	_, err = f.db.updateJoinApplyStatusRaw(applyID, 2, testutil.UID)
+	assert.NoError(t, err)
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-c", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	row, err = f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, row.Status, "被拒后重新申请应重置为待审批")
+	assert.Equal(t, "", row.ReviewerUID, "重置应清空审批人")
+	assert.Equal(t, "code-guard-c", row.InviteCode)
 }

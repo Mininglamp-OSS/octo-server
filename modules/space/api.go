@@ -1018,8 +1018,9 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		}
 		if pendingApply != nil {
 			// 同一个码重复提交：没有任何变化，保持原有的"已提交，等待审批"语义。
-			// 这一分支同时是通知放大的第一道约束——只有申请内容真的变了才会重新惊动
-			// 管理员，刷屏因此需要持续拿到*不同*的有效邀请码，而邀请码只有管理员能发。
+			// 这一分支是通知放大的第一道约束：只有申请内容真的变了才会重新惊动管理员。
+			// 注意它只比对*当前存的那个码*，所以在两个有效码之间来回切换仍然次次算"变了"
+			// ——真正兜底的是路由上的 SharedUIDRateLimiter（PR #684 review P2-4）。
 			if pendingApply.InviteCode == req.InviteCode {
 				c.Response(map[string]interface{}{
 					"status":   "PENDING",
@@ -1072,6 +1073,20 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		})
 		if err != nil {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+			return
+		}
+
+		// upsertJoinApply 拒绝改写已通过的申请。回读确认本次提交是否正好落在那个
+		// 窗口里：审批在上面的成员校验之后、写入成员行之前把状态翻成了 1。落在窗口
+		// 里就按"已是成员"回应，与前面 refresh 分支的并发结论一致，同时避免为一条
+		// 并不存在的待审批申请去打扰管理员。
+		saved, err := s.db.queryJoinApplyByID(applyID)
+		if err != nil {
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+			return
+		}
+		if saved != nil && saved.Status == 1 {
+			httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 			return
 		}
 

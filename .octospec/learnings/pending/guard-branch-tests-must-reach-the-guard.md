@@ -44,8 +44,22 @@ The fix here kept the HTTP test — the user-visible outcome is worth locking �
 and added a direct test of `refreshPendingApplyInvite` against approved and
 rejected rows, asserting 0 rows affected and an unchanged `invite_code`.
 
+## Postscript: the same task then shipped half a guard
+
+Review caught a second, worse instance of the same blind spot. A re-submission
+could reach the application row by **two** paths — the guarded conditional update,
+and an unguarded upsert reached when the pending lookup came up empty. The guard
+was written, tested (correctly, after the fix above), and then *documented as
+closing the hazard* — while the sibling path stayed wide open.
+
+So the check is not only "does my test reach the guard" but **"how many ways are
+there into the state I am guarding?"** Enumerate the writers first. A guard on one
+writer plus a comment claiming the hazard is closed is worse than no guard,
+because the next reader stops looking.
+
 ## Applies to
 
 Any conditional UPDATE guard (`WHERE ... AND status=?`), optimistic-concurrency
 check, or rollback path whose test drives it through a handler that has its own
-earlier validation.
+earlier validation — and any claim, in a comment or a design note, that such a
+guard closes a hazard.
