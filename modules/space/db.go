@@ -113,14 +113,23 @@ func (d *DB) insertMemberNoTx(m *MemberModel) error {
 	return err
 }
 
+// queryMember 查询活跃成员。
+//
+// 读失败先于"未命中"返回。注意破坏性写这条理由并不成立：resetApprovedApplyForRejoin
+// 自己的 WHERE 里带了 NOT EXISTS(活跃成员)，所以一次假的 nil 只会让重置命中 0 行，
+// 不会误改数据。真正的代价是**回错话**——joinSpace 会据此回 already_member 或
+// PENDING，把一次 DB 抖动讲成一个确定的业务结论（推送前审查 D 更正了原本的说法）。
 func (d *DB) queryMember(spaceId string, uid string) (*MemberModel, error) {
 	var m MemberModel
 	_, err := d.session.Select("*").From("space_member").
 		Where("space_id=? and uid=? and status=1", spaceId, uid).Load(&m)
+	if err != nil {
+		return nil, err
+	}
 	if m.UID == "" {
 		return nil, nil
 	}
-	return &m, err
+	return &m, nil
 }
 
 // IsMember 检查用户是否是 Space 成员
@@ -137,10 +146,13 @@ func (d *DB) queryMemberIncludeRemoved(spaceId string, uid string) (*MemberModel
 	var m MemberModel
 	_, err := d.session.Select("*").From("space_member").
 		Where("space_id=? and uid=?", spaceId, uid).Load(&m)
+	if err != nil {
+		return nil, err
+	}
 	if m.UID == "" {
 		return nil, nil
 	}
-	return &m, err
+	return &m, nil
 }
 
 func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit uint64) ([]*MemberDetailModel, error) {
@@ -312,20 +324,29 @@ func (d *DB) queryInvitationByCodeUnfiltered(code string) (*InvitationModel, err
 	return &m, nil
 }
 
+// consumeInviteSQL 消耗一次邀请码名额的唯一写法。参数顺序：invite_code, now。
+//
+// 条件比 queryInvitationByCode 多一条 max_uses——两者本就**不**相同，也不该相同：
+// 查询是"这个码此刻能不能被看到/被提交"，消耗是"这个码此刻还能不能再分出一个名额"。
+// 共享的是 status=1 与未过期这两条，改动其中任意一条时两处都要一起看
+// （原注释声称二者"必须一致"，那是错的——推送前审查 F）。
+//
+// 审批事务 (approveJoinApplyAtomic) 与直接加入路径 (incrementInviteUsedCountAtomic)
+// 共用本常量——此前两处各写了一份逐字节相同的谓词，正是下一次漂移的起点
+// （PR #684 review round 4 P2-3）。
+const consumeInviteSQL = "UPDATE space_invitation SET used_count=used_count+1 " +
+	"WHERE invite_code=? AND status=1 " +
+	"AND (max_uses=0 OR used_count<max_uses) " +
+	"AND (expires_at IS NULL OR expires_at > ?)"
+
 // incrementInviteUsedCountAtomic atomically increments used_count iff the invite is
-// still valid (status=1, not expired, under max_uses). Filter conditions must stay in
-// sync with queryInvitationByCode so the read→write path keeps the same validity view,
-// closing TOCTOU windows where an admin disables the code (PUT status=0) or TTL elapses
-// between SELECT and UPDATE.
+// still valid (status=1, not expired, under max_uses), closing TOCTOU windows where an
+// admin disables the code (PUT status=0) or the TTL elapses between SELECT and UPDATE.
+// The predicate itself lives in consumeInviteSQL — see there for how it relates to
+// queryInvitationByCode's view.
 // Returns true if the increment was applied, false if the row no longer qualifies.
 func (d *DB) incrementInviteUsedCountAtomic(code string) (bool, error) {
-	result, err := d.session.UpdateBySql(
-		"UPDATE space_invitation SET used_count=used_count+1 "+
-			"WHERE invite_code=? AND status=1 "+
-			"AND (max_uses=0 OR used_count<max_uses) "+
-			"AND (expires_at IS NULL OR expires_at > ?)",
-		code, time.Now(),
-	).Exec()
+	result, err := d.session.UpdateBySql(consumeInviteSQL, code, time.Now()).Exec()
 	if err != nil {
 		return false, err
 	}
@@ -648,9 +669,9 @@ func (d *DB) upsertJoinApply(m *spaceJoinApplyModel) (int64, error) {
 // 这只是重申写入申请行的两条路径之一；另一条是待审批查询落空后走的 upsertJoinApply，
 // 它有自己的 status=1 守卫（见该函数注释）。两条都堵上才算完整。
 //
-// 反过来的交错（先读 apply、申请人改码、再翻状态、然后按读到的旧码消耗名额）仍然存在：
-// updateJoinApplyStatus 只对 status 做 CAS，不校验 invite_code，因此可能记账到旧码上。
-// 属于名额记账漂移，不影响准入与权限，跟进见 PR #684 review P2-1。
+// 反过来的交错（先读 apply、申请人改码、再按旧码消耗名额）曾经存在，现已消除：
+// 审批走 approveJoinApplyAtomic，在 CAS 锁住该行之后于事务内重新读取邀请码，
+// 记账对象一定是记录上当时的那个码。updateJoinApplyStatus 现在只用于拒绝路径。
 //
 // 刻意不触碰 used_count：提交申请从来不占用邀请码名额，名额在审批时才消耗。
 func (d *DB) refreshPendingApplyInvite(id int64, inviteCode string) (int64, error) {
@@ -668,11 +689,14 @@ func (d *DB) refreshPendingApplyInvite(id int64, inviteCode string) (int64, erro
 type approveOutcome int
 
 const (
-	approveOK             approveOutcome = iota // 已加入或已重新激活
-	approveAlreadyHandled                       // CAS 落空：已被其他审批者处理
-	approveInviteUnusable                       // 邀请码无法消耗
-	approveSpaceFull                            // 空间已满
-	approveAlreadyMember                        // 申请人本就是活跃成员
+	// approveFailed 是零值，专门留给"返回了 error"的情形。让零值等于成功，会让
+	// 任何一处漏检 err 的调用把失败的审批当成通过（PR #684 review round 4 P2-9）。
+	approveFailed         approveOutcome = iota
+	approveOK                            // 已加入或已重新激活
+	approveAlreadyHandled                // CAS 落空：已被其他审批者处理
+	approveInviteUnusable                // 邀请码无法消耗
+	approveSpaceFull                     // 空间已满
+	approveAlreadyMember                 // 申请人本就是活跃成员
 )
 
 // approveJoinApplyAtomic 在**同一个事务**里完成审批的三件事：把申请 CAS 成已通过、
@@ -692,7 +716,7 @@ const (
 func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, maxUsers int) (approveOutcome, string, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -702,11 +726,11 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		reviewerUID, applyID,
 	).Exec()
 	if err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 	if affected == 0 {
 		return approveAlreadyHandled, "", nil
@@ -720,50 +744,57 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	if _, err = tx.SelectBySql(
 		"SELECT uid, invite_code FROM space_join_apply WHERE id=?", applyID,
 	).Load(&row); err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 
-	// 3. 容量锁：与既有 atomicAddMemberIfNotFull 取同一把锁，避免并发审批超员
+	// 3. 容量锁：与既有 atomicAddMemberIfNotFull 取同一把锁，避免并发审批超员。
+	//
+	// 本事务的加锁顺序是 space_join_apply → space_member → space_invitation。
+	// 目前仓库里只有这一个事务同时锁其中两张表，所以不存在反序。若将来把直接加入
+	// (api.go joinSpace 直接模式) 或邮件邀请接受也合并成单事务，务必沿用同一顺序：
+	// 那两条路径现在是"先消耗邀请码、再写成员、失败退还"，直接融合会得到
+	// space_invitation → space_member，与此处相反，构成死锁（round 4 P2-6）。
 	var count int
 	if _, err = tx.SelectBySql(
 		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1 FOR UPDATE", spaceId,
 	).Load(&count); err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 
+	// 必须是加锁读。本事务在上面读 space_join_apply 时已经钉住了 REPEATABLE READ 的
+	// 一致性读视图，普通读会从那个旧快照取值：并发的 removeMemberLocked 提交后，
+	// FOR UPDATE 的计数是当前值、普通读到的成员状态却仍是陈旧的 1，于是审批会走进
+	// "已是成员"分支、提交 status=1 却一行成员都没写——正是本文件声称不可能出现的
+	// 状态（PR #684 review round 4 P1-A，已实测复现读视图差异）。
+	// 加锁读取当前值，并与 removeMemberLocked 自身的 FOR UPDATE 相互串行。
 	var member struct {
 		UID    string
 		Status int
 	}
-	if _, err = tx.SelectBySql(
-		"SELECT uid, status FROM space_member WHERE space_id=? AND uid=?", spaceId, row.UID,
-	).Load(&member); err != nil {
-		return approveOK, "", err
+	memberRows, err := tx.SelectBySql(
+		"SELECT uid, status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE", spaceId, row.UID,
+	).Load(&member)
+	if err != nil {
+		return approveFailed, "", err
 	}
 
 	// 本就是活跃成员：审批照常落库（status=1 与活跃成员并存，不变量成立），
 	// 但不占用名额——没有新增成员就不该消耗。
-	if member.UID != "" && member.Status == 1 {
+	if memberRows > 0 && member.Status == 1 {
 		if err = tx.Commit(); err != nil {
-			return approveOK, "", err
+			return approveFailed, "", err
 		}
 		return approveAlreadyMember, row.InviteCode, nil
 	}
 
 	// 4. 消耗名额。过滤条件必须与 queryInvitationByCode 的有效性视图一致。
 	if row.InviteCode != "" {
-		result, err = tx.UpdateBySql(
-			"UPDATE space_invitation SET used_count=used_count+1 "+
-				"WHERE invite_code=? AND status=1 "+
-				"AND (max_uses=0 OR used_count<max_uses) "+
-				"AND (expires_at IS NULL OR expires_at > ?)",
-			row.InviteCode, time.Now(),
-		).Exec()
+		result, err = tx.UpdateBySql(consumeInviteSQL, row.InviteCode, time.Now()).Exec()
 		if err != nil {
-			return approveOK, "", err
+			return approveFailed, "", err
 		}
 		if affected, err = result.RowsAffected(); err != nil {
-			return approveOK, "", err
+			return approveFailed, "", err
 		}
 		if affected == 0 {
 			return approveInviteUnusable, row.InviteCode, nil
@@ -776,7 +807,7 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 	}
 
 	// 6. 写入或重新激活成员行
-	if member.UID != "" {
+	if memberRows > 0 {
 		_, err = tx.Update("space_member").
 			Set("status", 1).Set("role", 0).Set("updated_at", time.Now()).
 			Where("space_id=? AND uid=?", spaceId, row.UID).Exec()
@@ -787,11 +818,11 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 		).Exec()
 	}
 	if err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 
 	if err = tx.Commit(); err != nil {
-		return approveOK, "", err
+		return approveFailed, "", err
 	}
 	return approveOK, row.InviteCode, nil
 }
@@ -882,19 +913,6 @@ func (d *DB) updateJoinApplyStatus(id int64, status int, reviewerUID string) (in
 		Set("reviewer_uid", reviewerUID).
 		Set("updated_at", time.Now()).
 		Where("id=? AND status=0", id).Exec()
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-
-// updateJoinApplyStatusRaw 无条件更新状态（用于回滚）
-func (d *DB) updateJoinApplyStatusRaw(id int64, status int, reviewerUID string) (int64, error) {
-	result, err := d.session.Update("space_join_apply").
-		Set("status", status).
-		Set("reviewer_uid", reviewerUID).
-		Set("updated_at", time.Now()).
-		Where("id=?", id).Exec()
 	if err != nil {
 		return 0, err
 	}

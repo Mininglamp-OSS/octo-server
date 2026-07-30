@@ -2234,7 +2234,7 @@ func TestRefreshPendingApplyInvite_OnlyTouchesPendingRows(t *testing.T) {
 	assert.Equal(t, "code-683-guard-b", after.InviteCode, "邀请码应停留在审批时的取值")
 
 	// 已拒绝同样不接受原地改码——重新申请走 upsert 重置整行
-	_, err = f.db.updateJoinApplyStatusRaw(applyID, 2, testutil.UID)
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=2 WHERE id=?", applyID)
 	assert.NoError(t, err)
 	affected, err = f.db.refreshPendingApplyInvite(applyID, "code-683-guard-d")
 	assert.NoError(t, err)
@@ -2390,7 +2390,7 @@ func countAuthCodeKeys(t *testing.T, ctx *config.Context) int {
 	return len(keys)
 }
 
-// A8b —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
+// A4b —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
 func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 	_, f, err := setup(t)
 	assert.NoError(t, err)
@@ -2419,7 +2419,7 @@ func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 	assert.Equal(t, "code-guard-a", row.InviteCode)
 
 	// 已拒绝：允许重置为待审批并改用新码（被拒后重新申请的正常路径）
-	_, err = f.db.updateJoinApplyStatusRaw(applyID, 2, testutil.UID)
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=2 WHERE id=?", applyID)
 	assert.NoError(t, err)
 	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
 		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-c", Status: 0,
@@ -2435,7 +2435,7 @@ func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 
 // A9 —— 三条审批入口的一致性守卫。
 //
-// 邀请码消耗失败的处理曾经在三处逐字节重复，本次合并到 consumeInviteForApproval。
+// 邀请码消耗失败的处理曾经在三处逐字节重复，本次合并到 runAtomicApproval。
 // 但"三处行为一致"此前只由代码审查保证：谁把其中一条重新内联回去，不会有任何测试报警
 // （PR #684 review）。这里对每条入口断言同一组不变量，让这个声明自己守住自己。
 func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T) {
@@ -2726,7 +2726,13 @@ func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 	assert.NotNil(t, rejoined, "应重新成为成员")
 }
 
-// A10b —— 仍是活跃成员时重申，不得被当成陈旧记录重置。
+// A10b —— 活跃成员重申时被拒，且已通过的申请不被改动。
+//
+// 覆盖的是用户可见结果，**不是** api.go 读回点那个 active != nil 分支：joinSpace
+// 更早的成员校验会先短路返回，这个请求根本走不到读回点。删掉那个分支本用例照样通过。
+// 守卫本身由 TestResetApprovedApplyForRejoin_NoOpWhenMemberActive 在 DB 层直接覆盖
+// ——这正是本 PR 附带的 learning「测试必须真的走到它要守的分支」所要求的做法，
+// 而第一版又踩了同一个坑（PR #684 review round 4 P1-B）。
 func TestJoinSpace_ActiveMemberResubmitIsRejected(t *testing.T) {
 	s, f, err := setup(t)
 	assert.NoError(t, err)
@@ -2804,4 +2810,27 @@ func TestResetApprovedApplyForRejoin_NoOpWhenMemberActive(t *testing.T) {
 	// 第一次重置（合法）已把码写成 code-reset-b；这里要断言的是第二次重置什么都没做，
 	// 即码没有被改成 code-reset-c。
 	assert.Equal(t, "code-reset-b", row.InviteCode, "落空的重置不得改写邀请码")
+
+	// 其余状态一律不受影响。成员必须先置回非活跃，否则 NOT EXISTS 子句单独就会让
+	// 每个 status 都返回 0 行，这个循环就变成了空转——删掉 SQL 里的 AND ja.status=1
+	// 它照样会绿（第一版正是如此，由推送前的对抗性审查发现）。
+	assert.NoError(t, f.db.removeMemberLocked(spaceId, uid, 99))
+	inactive, err := f.db.queryMember(spaceId, uid)
+	assert.NoError(t, err)
+	assert.Nil(t, inactive, "前提：成员此刻不活跃，status 谓词才是唯一变量")
+
+	for _, st := range []int{0, 2} {
+		_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=? WHERE id=?", st, applyID)
+		assert.NoError(t, err)
+		affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-x")
+		assert.NoError(t, err)
+		assert.EqualValues(t, 0, affected, "status=%d 的申请不属于本函数的处理范围", st)
+	}
+
+	// 同样前提下 status=1 必须命中，证明上面的 0 行来自 status 谓词而不是别的原因
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=1 WHERE id=?", applyID)
+	assert.NoError(t, err)
+	affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-y")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected, "同等条件下 status=1 必须命中，否则上面的断言不成立")
 }

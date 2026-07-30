@@ -1059,6 +1059,16 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			}
 			if latest != nil && latest.Status == 1 {
 				// 已被通过：申请人此刻已是成员，与本函数前面的成员校验结论一致。
+				//
+				// 与下面 upsert 读回分支的差别在于先验概率，不在于确定性：本分支的
+				// 前提是"刚才还查到 status=0"，所以翻成 1 极大概率是一次刚提交的审批
+				// （事务保证成员行同时落库），而 upsert 分支看到的 status=1 可能已经
+				// 存在很久。
+				//
+				// 但这不是"不可能过时"：从上一条语句到这里是一次独立往返，其间申请人
+				// 可以退出或被移除，那样这句 already_member 就不成立。它是可自愈的
+				// ——重新提交会走 upsert 分支并就地重置——所以这里不再多查一次成员行；
+				// 这是一个权衡，不是一个保证（推送前审查 B）。
 				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 				return
 			}
@@ -1098,8 +1108,32 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 				return
 			}
-			if _, err := s.db.resetApprovedApplyForRejoin(applyID, req.InviteCode); err != nil {
+			resetRows, err := s.db.resetApprovedApplyForRejoin(applyID, req.InviteCode)
+			if err != nil {
 				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+				return
+			}
+			if resetRows == 0 {
+				// 谓词落空只有两种成因，且对外说法必须分开——之前一律回
+				// already_member，而其中一种成因下申请人恰恰不是成员，那句话是假的
+				// （round 4 P2-2 / 推送前审查 C）。
+				latest, err := s.db.queryMember(invitation.SpaceId, loginUID)
+				if err != nil {
+					httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+					return
+				}
+				if latest != nil {
+					// 成员资格在我们读完之后被恢复：此刻确实是成员
+					httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+					return
+				}
+				// 另一个并发重申先重置了这一行：申请已在排队，只是绑定的是那次提交的
+				// 邀请码而不是本次。如实回报待审批，并且不重复通知管理员。
+				c.Response(map[string]interface{}{
+					"status":   "PENDING",
+					"space_id": invitation.SpaceId,
+					"msg":      "申请已提交，请等待审批",
+				})
 				return
 			}
 		}
@@ -1718,8 +1752,10 @@ func (s *Space) respondApprovalOutcome(c *wkhttp.Context, outcome approveOutcome
 func (s *Space) classifyInviteConsumeFailure(code string, applyID int64) codes.Code {
 	invitation, err := s.db.queryInvitationByCodeUnfiltered(code)
 	if err != nil {
+		// 原因未知时不要借用"已达使用次数上限"——那正是本次改动要停止误报的标签
+		// （round 4 P2-8）。回报一个中性的查询失败，真实原因留在日志里。
 		s.Error("查询邀请码失效原因失败", zap.Error(err), zap.Int64("applyID", applyID))
-		return errcode.ErrSpaceInviteCodeExhausted
+		return errcode.ErrSpaceQueryFailed
 	}
 	if invitation == nil {
 		s.Warn("审批失败：邀请码已不存在", zap.Int64("applyID", applyID))
