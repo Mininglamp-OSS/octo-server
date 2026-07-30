@@ -64,7 +64,7 @@ type botCardTemplateCatalog struct {
 func defaultBotTemplateRefs() []botTemplateRef {
 	return []botTemplateRef{{
 		ID:      aireasoningprocess.TemplateID,
-		Version: aireasoningprocess.TemplateVersionV2,
+		Version: aireasoningprocess.TemplateVersionV3,
 	}}
 }
 
@@ -74,6 +74,7 @@ func defaultBotTemplatePolicy() botTemplatePolicy {
 		EditCompatible: []botTemplateRef{
 			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1},
 			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
+			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3},
 		},
 	}
 }

@@ -131,6 +131,11 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 				return
 			}
+			// Raw Bot callers own the card/profile capability payload, but the
+			// deployment owns the visual host compatibility generation. Validate
+			// any explicit inbound value first for backward-compatible fail-close,
+			// then author the stable outbound key so callers do not need to send it.
+			req.Payload["render_profile"] = cardmsg.RenderProfileOctoChatV1
 		}
 	}
 
@@ -1039,6 +1044,12 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
+		normalized, cErr = authorBotRawCardRenderProfile(normalized)
+		if cErr != nil {
+			ba.Warn("InteractiveCard content_edit render_profile 写入失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
 		req.ContentEdit = normalized
 		cardSeq, hasCardSeq = cardmsg.CardSeqFromContentEdit(normalized)
 	} else {
@@ -1320,6 +1331,36 @@ func cardEnvelopeHasTemplateRef(raw []byte) bool {
 	}
 	_, exists := payload["template_ref"]
 	return exists
+}
+
+// authorBotRawCardRenderProfile adds the deployment-owned visual compatibility
+// key after the caller-authored raw frame has passed cardmsg validation. UseNumber
+// preserves card_seq and any other 64-bit JSON integers across the rewrite.
+func authorBotRawCardRenderProfile(contentEdit string) (string, error) {
+	decoder := json.NewDecoder(strings.NewReader(contentEdit))
+	decoder.UseNumber()
+	var payload map[string]interface{}
+	if err := decoder.Decode(&payload); err != nil {
+		return "", err
+	}
+	if decoder.More() {
+		return "", errors.New("bot_api: card content_edit has trailing JSON data")
+	}
+	if !cardmsg.IsCardPayload(payload) {
+		return contentEdit, nil
+	}
+	payload["render_profile"] = cardmsg.RenderProfileOctoChatV1
+	if err := cardmsg.Validate(payload); err != nil {
+		return "", err
+	}
+	if err := cardmsg.Finalize(payload); err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 // cardSeqCASMaxAttempts 是 D9 CAS 遇 InnoDB 死锁/锁等待超时的有界重试次数。

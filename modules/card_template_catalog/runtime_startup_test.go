@@ -120,19 +120,21 @@ func TestInitializeRuntimeCatalogReportsActiveTargetCountOnOverflow(t *testing.T
 	}
 }
 
-func TestInitializeRuntimeCatalogAcceptsStaticInteractiveActiveTargetWithoutRouteSpec(t *testing.T) {
+func TestInitializeRuntimeCatalogAcceptsRegisteredStaticReasoningTargets(t *testing.T) {
 	t.Setenv("OCTO_CARD_ACTION_ROUTES", "")
 	registry := cardtmpl.NewRegistry()
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
 	registry.Freeze()
-	store := &startupStoreStub{targets: []startupActivationTarget{{
-		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
-	}}}
+	store := &startupStoreStub{targets: []startupActivationTarget{
+		{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
+		{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3},
+	}}
 	api := &API{store: store, registry: registry}
 	api.validateStateTarget = api.validateTarget
 
 	if err := api.initializeRuntimeCatalog(context.Background()); err != nil {
-		t.Fatalf("initialize static interactive active target: %v", err)
+		t.Fatalf("initialize registered static reasoning targets: %v", err)
 	}
 }
 

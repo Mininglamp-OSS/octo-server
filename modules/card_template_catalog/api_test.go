@@ -197,14 +197,26 @@ func TestPublishMapsConflictAndInternalErrors(t *testing.T) {
 
 func TestReconcileStaticInventoryUsesFrozenRegistryList(t *testing.T) {
 	registry := cardtmpl.NewRegistry()
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
 	registry.Freeze()
 	store := &fakeCatalogStore{}
 	if err := reconcileStaticInventory(context.Background(), store, registry); err != nil {
 		t.Fatalf("reconcileStaticInventory: %v", err)
 	}
-	if len(store.reconciled) != 1 || store.reconciled[0].ID != aireasoningprocess.TemplateID || store.reconciled[0].Version != aireasoningprocess.TemplateVersionV2 {
+	if len(store.reconciled) != 3 {
 		t.Fatalf("reconciled inventory = %+v", store.reconciled)
+	}
+	for index, version := range []string{
+		aireasoningprocess.TemplateVersionV1,
+		aireasoningprocess.TemplateVersionV2,
+		aireasoningprocess.TemplateVersionV3,
+	} {
+		if store.reconciled[index].ID != aireasoningprocess.TemplateID || store.reconciled[index].Version != version {
+			t.Fatalf("reconciled inventory[%d] = %+v, want %s@%s",
+				index, store.reconciled[index], aireasoningprocess.TemplateID, version)
+		}
 	}
 }
 

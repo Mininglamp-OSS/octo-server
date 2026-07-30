@@ -1,0 +1,9 @@
+{
+  "actions": [
+    {
+      "id": "reasoning_toggle",
+      "type": "Action.ToggleVisibility"
+    }
+  ],
+  "inputs": []
+}

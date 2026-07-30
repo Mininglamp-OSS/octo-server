@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 )
@@ -24,25 +25,34 @@ var reasoningStates = []struct {
 	{"error", "octo/v2"},
 }
 
+const (
+	reasoningVersionV3 = aireasoningprocess.TemplateVersionV3
+	reasoningRootV3    = aireasoningprocess.HandoffRootV3
+)
+
 var reasoningVersions = []struct {
 	version string
 	root    string
 }{
 	{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 	{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+	{reasoningVersionV3, reasoningRootV3},
 }
+
+var boundedReasoningVersions = reasoningVersions[1:]
 
 func newRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	reg := cardtmpl.NewRegistry()
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
-	reg.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
+	reg.RegisterJSON(aireasoningprocess.Assets, reasoningRootV3)
+	reg.SetDefault(aireasoningprocess.TemplateID, reasoningVersionV3)
 	reg.Freeze()
 	return reg
 }
 
-func TestRegistersBothVersionsAndDefaultsToSuccessor(t *testing.T) {
+func TestRegistersAllVersionsAndDefaultsToHiddenControlsSuccessor(t *testing.T) {
 	reg := newRegistry(t)
 	var versions []string
 	for _, meta := range reg.List() {
@@ -50,27 +60,41 @@ func TestRegistersBothVersionsAndDefaultsToSuccessor(t *testing.T) {
 			continue
 		}
 		versions = append(versions, meta.Version)
+		if meta.Version == reasoningVersionV3 {
+			if meta.ActionContract != nil {
+				t.Fatalf("%s ActionContract = %+v, want nil", meta.Version, meta.ActionContract)
+			}
+			continue
+		}
 		if meta.ActionContract == nil || meta.ActionContract.Owner != "ai" ||
 			meta.ActionContract.ActionType != "reasoning.control" {
-			t.Fatalf("%s ActionContract = %+v, want {ai, reasoning.control}", meta.Version, meta.ActionContract)
+			t.Fatalf("historical %s ActionContract = %+v, want {ai, reasoning.control}", meta.Version, meta.ActionContract)
 		}
 	}
 	sort.Strings(versions)
-	wantVersions := []string{aireasoningprocess.TemplateVersionV1, aireasoningprocess.TemplateVersionV2}
+	wantVersions := []string{
+		aireasoningprocess.TemplateVersionV1,
+		aireasoningprocess.TemplateVersionV2,
+		reasoningVersionV3,
+	}
 	if !equalStrings(versions, wantVersions) {
 		t.Fatalf("registered versions = %v, want %v", versions, wantVersions)
+	}
+	if aireasoningprocess.TemplateVersion != reasoningVersionV3 || aireasoningprocess.HandoffRoot != reasoningRootV3 {
+		t.Fatalf("current aliases = %s / %s, want %s / %s",
+			aireasoningprocess.TemplateVersion, aireasoningprocess.HandoffRoot, reasoningVersionV3, reasoningRootV3)
 	}
 
 	tmpl, err := reg.Lookup(aireasoningprocess.TemplateID, "")
 	if err != nil {
 		t.Fatalf("Lookup(default): %v", err)
 	}
-	if got := tmpl.Meta().Version; got != aireasoningprocess.TemplateVersionV2 {
-		t.Fatalf("default version = %q, want %q", got, aireasoningprocess.TemplateVersionV2)
+	if got := tmpl.Meta().Version; got != reasoningVersionV3 {
+		t.Fatalf("default version = %q, want %q", got, reasoningVersionV3)
 	}
 }
 
-func TestRenderAllStatesForBothVersions(t *testing.T) {
+func TestRenderAllStatesForAllVersions(t *testing.T) {
 	reg := newRegistry(t)
 	for _, version := range reasoningVersions {
 		for _, tc := range reasoningStates {
@@ -90,7 +114,7 @@ func TestRenderAllStatesForBothVersions(t *testing.T) {
 	}
 }
 
-func TestConformanceForBothVersions(t *testing.T) {
+func TestConformanceForAllVersions(t *testing.T) {
 	reg := newRegistry(t)
 	for _, version := range reasoningVersions {
 		for _, tc := range reasoningStates {
@@ -122,6 +146,193 @@ func TestConformanceForBothVersions(t *testing.T) {
 	}
 }
 
+func TestHiddenControlsSuccessorArtifactContract(t *testing.T) {
+	manifest := readAssetMap(t, reasoningRootV3+"/manifest.json")
+	for key, want := range map[string]string{
+		"id":                         string(aireasoningprocess.TemplateID),
+		"version":                    reasoningVersionV3,
+		"contractVersion":            "1.1.0",
+		"protocol":                   "octo-card@1.0",
+		"adaptiveCardVersion":        "1.5",
+		"renderProfile":              "octo-chat@1.2.0-rc.1",
+		"renderProfileCompatibility": "octo-chat/v1",
+		"owner":                      "ai",
+	} {
+		if got, _ := manifest[key].(string); got != want {
+			t.Fatalf("manifest.%s = %q, want %q", key, got, want)
+		}
+	}
+	if _, exists := manifest["actionType"]; exists {
+		t.Fatal("0.3.0 manifest must not advertise actionType")
+	}
+
+	if got, want := readAsset(t, reasoningRootV3+"/contract/data.schema.json"),
+		readAsset(t, aireasoningprocess.HandoffRootV2+"/contract/data.schema.json"); !bytes.Equal(got, want) {
+		t.Fatal("0.3.0 schema drifted from bounded 0.2.0 schema")
+	}
+	for _, relative := range []string{
+		"templates/result.template.json",
+		"samples/reasoning.json",
+		"samples/answering.json",
+		"samples/completed.json",
+		"samples/stopped.json",
+		"goldens/completed.card.json",
+		"goldens/stopped.card.json",
+	} {
+		if got, want := readAsset(t, reasoningRootV3+"/"+relative),
+			readAsset(t, aireasoningprocess.HandoffRootV2+"/"+relative); !bytes.Equal(got, want) {
+			t.Fatalf("0.3.0 artifact %s drifted from 0.2.0", relative)
+		}
+	}
+
+	legacyError := readAssetMap(t, aireasoningprocess.HandoffRootV2+"/samples/error.json")
+	successorError := readAssetMap(t, reasoningRootV3+"/samples/error.json")
+	if got, _ := successorError["errorMessage"].(string); got != "推理服务连接超时，已停止本次生成。已完成的过程会保留。" {
+		t.Fatalf("0.3.0 errorMessage = %q", got)
+	}
+	successorError["errorMessage"] = legacyError["errorMessage"]
+	if got, want := canon(t, successorError), canon(t, legacyError); got != want {
+		t.Fatalf("0.3.0 error sample has changes beyond retry invitation\ngot=%s\nwant=%s", got, want)
+	}
+}
+
+func TestHiddenControlsSuccessorHasOnlyLocalToggle(t *testing.T) {
+	reg := newRegistry(t)
+	tmpl, err := reg.Lookup(aireasoningprocess.TemplateID, reasoningVersionV3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := tmpl.Meta()
+	if meta.ActionContract != nil {
+		t.Fatalf("ActionContract = %+v, want nil", meta.ActionContract)
+	}
+	for _, view := range []cardtmpl.ViewKey{"active", "error"} {
+		report, ok := meta.Interaction(view)
+		if !ok {
+			t.Fatalf("interaction report missing for %s", view)
+		}
+		if len(report.Actions) != 1 || report.Actions[0].ID != "reasoning_toggle" ||
+			report.Actions[0].Type != "Action.ToggleVisibility" || len(report.Inputs) != 0 {
+			t.Fatalf("%s interaction report = %+v", view, report)
+		}
+	}
+	if _, ok := meta.Interaction("result"); ok {
+		t.Fatal("octo/v1 result view must not have an interaction report")
+	}
+
+	for _, tc := range reasoningStates {
+		t.Run(string(tc.state), func(t *testing.T) {
+			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+				reasoningVersionV3, tc.state, readSample(t, reasoningRootV3, string(tc.state)),
+				cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{
+				"Action.Submit", "reasoning_stop", "reasoning_retry",
+				"stop_reasoning", "retry_reasoning", "可以重试",
+			} {
+				if bytes.Contains(encoded, []byte(forbidden)) {
+					t.Fatalf("rendered payload contains unsupported control %q", forbidden)
+				}
+			}
+			var actions []map[string]any
+			collectActions(payload, &actions)
+			if len(actions) != 1 {
+				t.Fatalf("rendered actions = %+v, want one local toggle", actions)
+			}
+			action := actions[0]
+			if action["type"] != "Action.ToggleVisibility" || action["id"] != "reasoning_toggle" {
+				t.Fatalf("rendered action = %+v", action)
+			}
+			if got := canon(t, action["targetElements"]); got != canon(t, []any{"trace_panel", "collapsed_panel"}) {
+				t.Fatalf("toggle targets = %s", got)
+			}
+		})
+	}
+}
+
+func TestHiddenControlsSuccessorRejectsLegacySubmitIDs(t *testing.T) {
+	reg := newRegistry(t)
+	catalog, err := cardtmpl.NewStaticCatalog(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		state    cardtmpl.State
+		actionID string
+	}{
+		{state: "reasoning", actionID: "reasoning_stop"},
+		{state: "answering", actionID: "reasoning_stop"},
+		{state: "error", actionID: "reasoning_retry"},
+	} {
+		t.Run(string(tc.state)+"/"+tc.actionID, func(t *testing.T) {
+			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+				reasoningVersionV3, tc.state, readSample(t, reasoningRootV3, string(tc.state)),
+				cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, found := cardmsg.SubmitAction(encoded, tc.actionID); found {
+				t.Fatalf("legacy action %q resolved from V3 %s frame", tc.actionID, tc.state)
+			}
+			_, err = catalog.ActionContext(context.Background(), cardtmpl.CatalogActionRequest{
+				CatalogExactRequest: cardtmpl.CatalogExactRequest{
+					Access: cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeActionContext},
+					ID:     aireasoningprocess.TemplateID, Version: reasoningVersionV3,
+				},
+				ActionID: tc.actionID,
+			})
+			if !errors.Is(err, cardtmpl.ErrActionUnknown) {
+				t.Fatalf("legacy action %q ActionContext error = %v, want ErrActionUnknown", tc.actionID, err)
+			}
+		})
+	}
+}
+
+func TestHiddenControlsSuccessorStaticExactRenderSurvivesRuntimeStoreOutage(t *testing.T) {
+	reg := newRegistry(t)
+	store := &unavailableRuntimeStore{}
+	catalog, err := cardtmpl.NewRuntimeCatalog(reg, store, cardtmpl.RuntimeCatalogConfig{
+		CheckReady: func() error { return cardtmpl.ErrRuntimeCatalogUnavailable },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := catalog.Render(context.Background(), cardtmpl.CatalogRenderRequest{
+		Access: cardtmpl.CatalogAccess{
+			Purpose: cardtmpl.CatalogPurposeHistoricalEdit,
+			Principal: cardtmpl.CatalogPrincipal{
+				Kind: cardtmpl.CatalogPrincipalBot, ID: "bot-test", SpaceID: "space-x",
+			},
+		},
+		ID: aireasoningprocess.TemplateID, Version: reasoningVersionV3,
+		State: "completed", Fields: readSample(t, reasoningRootV3, "completed"),
+		Env: cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"},
+	})
+	if err != nil {
+		t.Fatalf("explicit static render during runtime store outage: %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("explicit static render made %d runtime store calls", store.calls)
+	}
+	card := payload["card"].(map[string]any)
+	metadata := card["metadata"].(map[string]any)
+	octo := metadata["octo"].(map[string]any)
+	template := octo["template"].(map[string]any)
+	if got := template["version"]; got != reasoningVersionV3 {
+		t.Fatalf("rendered template version = %v", got)
+	}
+}
+
 func TestSuccessorFreeStringBounds(t *testing.T) {
 	reg := newRegistry(t)
 	setTop := func(key string) func(map[string]any, string) {
@@ -145,21 +356,23 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		{name: "errorMessage", limit: 121, set: setTop("errorMessage")},
 	}
 	units := []string{"x", "界", "😀"}
-	for i, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			unit := units[i%len(units)]
-			exact := readSampleMap(t, aireasoningprocess.HandoffRootV2, "reasoning")
-			tc.set(exact, strings.Repeat(unit, tc.limit))
-			if err := renderData(reg, "reasoning", exact); err != nil {
-				t.Fatalf("exact %d-rune value rejected: %v", tc.limit, err)
-			}
+	for _, version := range boundedReasoningVersions {
+		for i, tc := range tests {
+			t.Run(version.version+"/"+tc.name, func(t *testing.T) {
+				unit := units[i%len(units)]
+				exact := readSampleMap(t, version.root, "reasoning")
+				tc.set(exact, strings.Repeat(unit, tc.limit))
+				if err := renderData(reg, version.version, "reasoning", exact); err != nil {
+					t.Fatalf("exact %d-rune value rejected: %v", tc.limit, err)
+				}
 
-			over := readSampleMap(t, aireasoningprocess.HandoffRootV2, "reasoning")
-			tc.set(over, strings.Repeat(unit, tc.limit+1))
-			if err := renderData(reg, "reasoning", over); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
-				t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", tc.limit+1, err)
-			}
-		})
+				over := readSampleMap(t, version.root, "reasoning")
+				tc.set(over, strings.Repeat(unit, tc.limit+1))
+				if err := renderData(reg, version.version, "reasoning", over); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+					t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", tc.limit+1, err)
+				}
+			})
+		}
 	}
 }
 
@@ -178,44 +391,48 @@ func TestSuccessorArrayAndAggregateBounds(t *testing.T) {
 		{name: "aggregate thirteen with each phase under per-phase max", actionCounts: []int{3, 2, 2, 2, 2, 2}},
 		{name: "aggregate fourteen with each phase under per-phase max", actionCounts: []int{4, 2, 2, 2, 2, 2}, wantErr: true},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			data := readSampleMap(t, aireasoningprocess.HandoffRootV2, "reasoning")
-			data["phases"] = phasesWithActionCounts(tc.actionCounts...)
-			err := renderData(reg, "reasoning", data)
-			if tc.wantErr {
-				if !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
-					t.Fatalf("Render error = %v, want ErrFieldsInvalid", err)
+	for _, version := range boundedReasoningVersions {
+		for _, tc := range tests {
+			t.Run(version.version+"/"+tc.name, func(t *testing.T) {
+				data := readSampleMap(t, version.root, "reasoning")
+				data["phases"] = phasesWithActionCounts(tc.actionCounts...)
+				err := renderData(reg, version.version, "reasoning", data)
+				if tc.wantErr {
+					if !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+						t.Fatalf("Render error = %v, want ErrFieldsInvalid", err)
+					}
+					return
 				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Render: %v", err)
-			}
-		})
+				if err != nil {
+					t.Fatalf("Render: %v", err)
+				}
+			})
+		}
 	}
 }
 
 func TestSuccessorWorstCaseRendersEveryView(t *testing.T) {
 	reg := newRegistry(t)
-	for _, tc := range reasoningStates {
-		t.Run(string(tc.state), func(t *testing.T) {
-			data := readSampleMap(t, aireasoningprocess.HandoffRootV2, "reasoning")
-			data["state"] = string(tc.state)
-			data["reasoningId"] = strings.Repeat("r", 512)
-			data["title"] = strings.Repeat("题", 64)
-			data["statusLabel"] = strings.Repeat("状", 32)
-			data["timerText"] = strings.Repeat("时", 128)
-			data["collapsedSummary"] = strings.Repeat("摘", 160)
-			data["progressText"] = strings.Repeat("进", 160)
-			data["errorTitle"] = strings.Repeat("错", 64)
-			data["errorMessage"] = strings.Repeat("误", 121)
-			data["phases"] = worstCasePhases()
+	for _, version := range boundedReasoningVersions {
+		for _, tc := range reasoningStates {
+			t.Run(version.version+"/"+string(tc.state), func(t *testing.T) {
+				data := readSampleMap(t, version.root, "reasoning")
+				data["state"] = string(tc.state)
+				data["reasoningId"] = strings.Repeat("r", 512)
+				data["title"] = strings.Repeat("题", 64)
+				data["statusLabel"] = strings.Repeat("状", 32)
+				data["timerText"] = strings.Repeat("时", 128)
+				data["collapsedSummary"] = strings.Repeat("摘", 160)
+				data["progressText"] = strings.Repeat("进", 160)
+				data["errorTitle"] = strings.Repeat("错", 64)
+				data["errorMessage"] = strings.Repeat("误", 121)
+				data["phases"] = worstCasePhases()
 
-			if err := renderData(reg, tc.state, data); err != nil {
-				t.Fatalf("worst-case %s render: %v", tc.state, err)
-			}
-		})
+				if err := renderData(reg, version.version, tc.state, data); err != nil {
+					t.Fatalf("worst-case %s render: %v", tc.state, err)
+				}
+			})
+		}
 	}
 }
 
@@ -288,13 +505,13 @@ func worstCasePhases() []any {
 	return phases
 }
 
-func renderData(reg *cardtmpl.Registry, state cardtmpl.State, data map[string]any) error {
+func renderData(reg *cardtmpl.Registry, version string, state cardtmpl.State, data map[string]any) error {
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
 	_, err = reg.Render(context.Background(), aireasoningprocess.TemplateID,
-		aireasoningprocess.TemplateVersionV2, state, raw,
+		version, state, raw,
 		cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
 	return err
 }
@@ -322,6 +539,15 @@ func readGolden(t *testing.T, root, name string) map[string]any {
 	return golden
 }
 
+func readAssetMap(t *testing.T, name string) map[string]any {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(readAsset(t, name), &value); err != nil {
+		t.Fatalf("unmarshal asset %s: %v", name, err)
+	}
+	return value
+}
+
 func readAsset(t *testing.T, name string) []byte {
 	t.Helper()
 	b, err := aireasoningprocess.Assets.ReadFile(name)
@@ -329,6 +555,41 @@ func readAsset(t *testing.T, name string) []byte {
 		t.Fatalf("read asset %s: %v", name, err)
 	}
 	return b
+}
+
+func collectActions(value any, actions *[]map[string]any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if kind, _ := typed["type"].(string); strings.HasPrefix(kind, "Action.") {
+			*actions = append(*actions, typed)
+		}
+		for _, child := range typed {
+			collectActions(child, actions)
+		}
+	case []any:
+		for _, child := range typed {
+			collectActions(child, actions)
+		}
+	}
+}
+
+type unavailableRuntimeStore struct {
+	calls int
+}
+
+func (s *unavailableRuntimeStore) LoadActivation(context.Context, cardtmpl.ID) (cardtmpl.RuntimeActivation, error) {
+	s.calls++
+	return cardtmpl.RuntimeActivation{}, errors.New("runtime store unavailable")
+}
+
+func (s *unavailableRuntimeStore) LoadArtifactMeta(context.Context, cardtmpl.ID, string) (cardtmpl.RuntimeArtifactMeta, error) {
+	s.calls++
+	return cardtmpl.RuntimeArtifactMeta{}, errors.New("runtime store unavailable")
+}
+
+func (s *unavailableRuntimeStore) LoadArtifactBundle(context.Context, cardtmpl.ID, string, string) (cardtmpl.CanonicalBundle, error) {
+	s.calls++
+	return nil, errors.New("runtime store unavailable")
 }
 
 func mustState(t *testing.T, fields json.RawMessage) string {
