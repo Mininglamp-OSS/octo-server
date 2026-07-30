@@ -837,14 +837,22 @@ func (d *DB) queryJoinApplyByID(id int64) (*spaceJoinApplyModel, error) {
 	return &m, nil
 }
 
+// queryPendingApplyBySpaceAndUID 查询该用户在该 Space 的待审批申请。
+//
+// 读失败先于"未命中"返回：joinSpace 用本函数的结果在"更新已有待审批申请"和
+// "走 upsert 新建"两条分支之间做选择，把 DB 故障吞成"没有待审批申请"会让请求
+// 静默走错分支（PR #684 review round 3）。同 queryJoinApplyByID。
 func (d *DB) queryPendingApplyBySpaceAndUID(spaceId, uid string) (*spaceJoinApplyModel, error) {
 	var m spaceJoinApplyModel
 	_, err := d.session.Select("*").From("space_join_apply").
 		Where("space_id=? AND uid=? AND status=0", spaceId, uid).Load(&m)
+	if err != nil {
+		return nil, err
+	}
 	if m.Id == 0 {
 		return nil, nil
 	}
-	return &m, err
+	return &m, nil
 }
 
 func (d *DB) queryPendingAppliesBySpace(spaceId string, limit, offset int) ([]*spaceJoinApplyDetailModel, error) {

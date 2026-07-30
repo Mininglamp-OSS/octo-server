@@ -1641,6 +1641,10 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 }
 
 // refundInvite 归还一次已消耗的邀请码名额（空码跳过；错误仅记录日志，不影响主流程）。
+//
+// 仅服务于**直接加入**路径：那条路径在准入前就消耗了名额，加入失败必须退还。
+// 审批路径不再使用它——名额消耗与成员写入同处一个事务，失败即整笔回滚，
+// 没有需要补偿的已消耗名额（PR #684 round 3）。
 func (s *Space) refundInvite(code string) {
 	if code == "" {
 		return
