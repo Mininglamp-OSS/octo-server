@@ -107,6 +107,59 @@ before the status CAS, so a concurrent re-submission can charge the stale code
 the window before membership actually exists; `created_at` refresh makes offset
 pagination less stable.
 
+## Review round 2 — the guard created a lockout of its own
+
+@yujiawei blocked on a P1 that the round-1 fix introduced. Reproduced end to end
+over HTTP before touching anything: apply → approve → `/leave` → re-apply gives
+`400 already_member` and no pending application, permanently.
+
+`space_join_apply` has four writers and none of them is in a member-removal path
+(`removeMemberLocked` only sets `space_member.status=0`). So `status=1` means
+"was approved once", not "is currently a member" — and the round-1 readback read
+it as the latter. On `main` this worked only because the unconditional upsert
+reset the stale row; the `IF(status=1, …)` guard is what closed that door.
+
+Same failure class the task exists to fix — an application that can be neither
+approved nor repaired — except reachable by an ordinary user action rather than a
+race.
+
+### The obvious fix does not work, and that is provable
+
+The first instinct was to discriminate at the readback: `existing.Status == 0`
+(a removed-member row) means the approved row is stale, so reset it. Implemented
+it and ran two cases against it:
+
+| case | candidate fix |
+|---|---|
+| ex-member re-applies | PASS |
+| ex-member's *in-flight re-approval* not reverted | **FAIL** — `status=0 reviewer="" code="cB2"` |
+
+Both cases present **identical stored state** at the moment of the request —
+`space_member.status=0` and `space_join_apply.status=1` — because
+`executeJoinSpace` reactivates the member *after* the status flip. The correct
+answer differs between them, so no discriminator over that state can exist. The
+reviewer's own suggestion used a time heuristic for exactly this reason, and said
+so plainly.
+
+### What was done instead
+
+Made the invariant true rather than inferring it. All three paths that end
+membership now delete the approved application in the same transaction —
+`removeMemberLocked` (leave + remove), `removeMembersForce` (admin batch), and
+`forceDisbandSpace`. With the stale state gone, a `status=1` row can only mean an
+approval in flight, and the round-1 readback becomes correct as written.
+
+Delete rather than re-status: `status` has only 0/1/2 and octo-admin renders
+those three, so a new value would need a frontend change; `0` would inject a
+phantom row into the pending queue; `2` would claim a rejection that never
+happened.
+
+A data migration handles rows that already exist — removal-time cleanup only ever
+helps future removals, and every approval-mode Space today may hold rows that
+become lockouts the moment this merges. Its predicate was verified against all
+five states (approved+active kept, approved+removed deleted, approved+no-member
+deleted, pending kept, rejected kept).
+
 ## Learnings
 
 - **A guard test can pass for the wrong reason.** The acceptance test for "a

@@ -2586,3 +2586,139 @@ func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T)
 		})
 	}
 }
+
+// A10 —— 退出后必须能重新申请。
+//
+// PR #684 review round 2 的 P1：upsertJoinApply 的 status=1 守卫要求
+// "status=1 ⇒ 当前持有成员资格" 真正成立。移除路径此前完全不碰申请行，导致老成员
+// 重新申请时被永久挡住——成员校验放行、待审批查询看不到该行、upsert 被守卫拦下、
+// 读回判定"已是成员"，而 uk_space_uid 又不允许另建一行。
+func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-rejoin"
+	applicantUID := "u-683-rejoin"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-rejoin", Creator: testutil.UID,
+		MaxUses: 100, UsedCount: 0, Status: 1,
+	}))
+
+	// 申请 → 审批 → 成为成员
+	w := postJoinSpace(t, s, token, "code-683-rejoin")
+	assert.Equal(t, http.StatusOK, w.Code)
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+
+	w = httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, apply.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr)
+
+	// 主动退出
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST", "/v1/space/"+spaceId+"/leave", nil)
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	gone, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, gone, "已不是活跃成员")
+
+	stale, err := f.db.queryJoinApplyByID(apply.Id)
+	assert.NoError(t, err)
+	assert.Nil(t, stale, "成员资格结束时应清除已通过的申请")
+
+	// 重新申请：必须能重新走审批流程
+	w = postJoinSpace(t, s, token, "code-683-rejoin")
+	assert.Equal(t, http.StatusOK, w.Code, "老成员必须能重新申请")
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	pending, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, pending, "重新申请应产生新的待审批记录")
+}
+
+// A10b —— 老成员被"重新审批"的窗口内并发重申，仍不得推翻审批。
+//
+// 与 A10 是同一批用户的对立要求：A10 要求陈旧的已通过记录不能挡路，本例要求
+// 正在进行中的审批不能被推翻。二者在旧实现下无法同时满足——存储状态完全相同
+// （成员行 status=0 且申请行 status=1）。移除时清除申请行消灭了前一种状态，
+// 剩下的 status=1 才唯一对应"审批进行中"。
+func TestJoinSpace_ExMemberReapprovalNotReverted(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-rejoin-race"
+	applicantUID := "u-683-rejoin-race"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+	for _, code := range []string{"code-683-rr-a", "code-683-rr-b"} {
+		assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+			SpaceId: spaceId, InviteCode: code, Creator: testutil.UID,
+			MaxUses: 100, UsedCount: 0, Status: 1,
+		}))
+	}
+
+	// 曾是成员、已退出，然后重新提交了申请
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: applicantUID, Role: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.removeMemberLocked(spaceId, applicantUID, 99))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-rr-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 审批已翻转状态，reactivateMember 尚未执行
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	notYet, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, notYet, "窗口前提：成员行尚未重新激活")
+
+	// 并发重申落在窗口里
+	w := postJoinSpace(t, s, token, "code-683-rr-b")
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.already_member")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status, "审批中的申请不得被推翻")
+	assert.Equal(t, testutil.UID, after.ReviewerUID, "审批人不得被清空")
+	assert.Equal(t, "code-683-rr-a", after.InviteCode, "邀请码不得被改写")
+}
+
+// A10c —— 后台批量强制移除同样清除已通过申请（三条移除路径的一致性）。
+func TestRemoveMembersForce_ClearsApprovedApply(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-force-rm"
+	uid := "u-683-force-rm"
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: uid, Role: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-force", Status: 0,
+	})
+	assert.NoError(t, err)
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+
+	assert.NoError(t, newManagerDB(testCtx.DB()).removeMembersForce(spaceId, []string{uid}))
+
+	row, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Nil(t, row, "强制移除应同样清除已通过的申请")
+}

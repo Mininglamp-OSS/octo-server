@@ -126,8 +126,16 @@ registered, both have zh-CN translations, and octo-admin renders
 - **octo-admin.** No frontend change follows from decision A.
 - **The email-invite join path** (`api_email_invite*.go`) — it does not write
   `space_join_apply`.
-- **`updated_at` semantics** and any schema migration — `created_at` already
-  exists; no DDL.
+- **`updated_at` semantics** and any DDL — `created_at` already exists, and no
+  table or column is added or altered.
+
+  **Scope change, review round 2:** a *data* migration was added
+  (`sql/20260730000001_space_join_apply_stale_approved.sql`). It is not DDL, but
+  it is an addition to what this brief originally allowed. It became necessary
+  because the `status=1` write guard turns pre-existing "approved application,
+  applicant since removed" rows into permanent lockouts — those rows are
+  harmless on `main` only because the unconditional upsert reset them. Cleaning
+  up at removal time covers future removals; existing rows need the backfill.
 
 ## Acceptance
 
