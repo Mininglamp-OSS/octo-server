@@ -2484,3 +2484,105 @@ func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 	assert.Equal(t, "", row.ReviewerUID, "重置应清空审批人")
 	assert.Equal(t, "code-guard-c", row.InviteCode)
 }
+
+// A9 —— 三条审批入口的一致性守卫。
+//
+// 邀请码消耗失败的处理曾经在三处逐字节重复，本次合并到 consumeInviteForApproval。
+// 但"三处行为一致"此前只由代码审查保证：谁把其中一条重新内联回去，不会有任何测试报警
+// （PR #684 review）。这里对每条入口断言同一组不变量，让这个声明自己守住自己。
+func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T) {
+	// 每条入口：申请绑定一个已被禁用的邀请码 → 同一个错误码、申请回滚待审批、不产生成员。
+	entryPoints := []struct {
+		name   string
+		suffix string
+		// approve 发起一次审批请求；applyID 为待审批申请，adminUID 为审批人。
+		approve func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder
+	}{
+		{
+			name:   "space-scoped",
+			suffix: "sp",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+				req.Header.Set("token", testutil.Token)
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+		{
+			name:   "manager-console",
+			suffix: "mg",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					fmt.Sprintf("/v1/manager/spaces/%s/join-applies/%d/approve", spaceId, applyID), nil)
+				req.Header.Set("token", adminToken(t))
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+		{
+			name:   "h5-auth-code",
+			suffix: "h5",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				authCode := "parity-authcode-" + spaceId
+				payload := util.ToJson(map[string]interface{}{
+					"apply_id":     applyID,
+					"space_id":     spaceId,
+					"reviewer_uid": testutil.UID,
+					"type":         "spaceJoinApprove",
+				})
+				assert.NoError(t, testCtx.GetRedisConn().SetAndExpire(
+					common.AuthCodeCachePrefix+authCode, payload, time.Hour))
+
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+	}
+
+	for _, ep := range entryPoints {
+		t.Run(ep.name, func(t *testing.T) {
+			s, f, err := setup(t)
+			assert.NoError(t, err)
+
+			spaceId := "sp-683-parity-" + ep.suffix
+			applicantUID := "u-683-parity-" + ep.suffix
+			inviteCode := "code-683-parity-" + ep.suffix
+
+			seedApprovalSpace(t, f, spaceId)
+			// 被禁用的邀请码：审批时消耗必然失败
+			assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+				SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+				MaxUses: 10, UsedCount: 0, Status: 0,
+			}))
+
+			applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+				SpaceId: spaceId, UID: applicantUID, InviteCode: inviteCode, Status: 0,
+			})
+			assert.NoError(t, err)
+
+			w := ep.approve(t, s, spaceId, applyID)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, "入口 %s 应拒绝审批", ep.name)
+			assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+			after, err := f.db.queryJoinApplyByID(applyID)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, after.Status, "入口 %s：审批失败应回滚为待审批", ep.name)
+			assert.Equal(t, "", after.ReviewerUID, "入口 %s：回滚应清空审批人", ep.name)
+
+			mbr, err := f.db.queryMember(spaceId, applicantUID)
+			assert.NoError(t, err)
+			assert.Nil(t, mbr, "入口 %s：审批失败不得产生成员", ep.name)
+
+			inv, err := f.db.queryInvitationByCodeUnfiltered(inviteCode)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, inv.UsedCount, "入口 %s：失败的审批不得消耗名额", ep.name)
+		})
+	}
+}
