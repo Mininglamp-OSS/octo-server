@@ -799,12 +799,20 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 // resetApprovedApplyForRejoin 把一条陈旧的已通过申请重置为待审批，让当事人可以
 // 重新走审批流程。
 //
-// 仅在"status=1 且当前没有活跃成员行"时使用。由于 approveJoinApplyAtomic 保证
+// 仅当"status=1 且当前没有活跃成员行"时生效。由于 approveJoinApplyAtomic 保证
 // status=1 与活跃成员一起提交，这个组合唯一对应"审批通过之后成员资格又结束了"，
 // 不存在与"审批进行中"混淆的可能——正因如此这里不需要任何时间阈值。
+//
+// "没有活跃成员"这个条件必须写进 SQL 本身，而不是由调用方先查一次再来调用：
+// 两者之间存在窗口，管理员在此刻把该用户重新拉回空间，就会留下"人已在空间里、
+// 却凭空多出一条待审批申请"的矛盾状态（PR #684 review round 3）。
+// 判定与写入分离、写入不带谓词，正是本 PR 前几轮反复栽跟头的同一类错误。
 func (d *DB) resetApprovedApplyForRejoin(id int64, inviteCode string) (int64, error) {
 	result, err := d.session.UpdateBySql(
-		"UPDATE space_join_apply SET status=0, invite_code=?, reviewer_uid='', created_at=NOW(), updated_at=NOW() WHERE id=? AND status=1",
+		"UPDATE space_join_apply ja SET ja.status=0, ja.invite_code=?, ja.reviewer_uid='', "+
+			"ja.created_at=NOW(), ja.updated_at=NOW() "+
+			"WHERE ja.id=? AND ja.status=1 AND NOT EXISTS ("+
+			"SELECT 1 FROM space_member sm WHERE sm.space_id=ja.space_id AND sm.uid=ja.uid AND sm.status=1)",
 		inviteCode, id,
 	).Exec()
 	if err != nil {

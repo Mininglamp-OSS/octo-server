@@ -2760,3 +2760,48 @@ func TestJoinSpace_ActiveMemberResubmitIsRejected(t *testing.T) {
 	assert.Equal(t, 1, after.Status, "活跃成员的已通过申请不得被重置")
 	assert.Equal(t, testutil.UID, after.ReviewerUID)
 }
+
+// A10c —— 重置必须自带"当前不是活跃成员"这个条件，而不是依赖调用方先查一次。
+//
+// 调用方的判定与写入之间存在窗口：管理员在此刻把该用户重新拉回空间，若写入不带
+// 谓词，就会留下"人已在空间里、却凭空多出一条待审批申请"的矛盾状态
+// （PR #684 review round 3）。判定与写入分离正是本 PR 前几轮反复栽的同一类错误。
+func TestResetApprovedApplyForRejoin_NoOpWhenMemberActive(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-reset-guard"
+	uid := "u-683-reset-guard"
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-reset-a", Status: 0,
+	})
+	assert.NoError(t, err)
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+
+	// 成员已退出：陈旧记录应被重置
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: uid, Role: 0, Status: 0,
+	}))
+	affected, err := f.db.resetApprovedApplyForRejoin(applyID, "code-reset-b")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected, "成员不活跃时应重置为待审批")
+
+	// 恢复已通过状态，并让成员重新活跃：此时重置必须落空
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	assert.NoError(t, f.db.reactivateMember(spaceId, uid, 0))
+
+	affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-c")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已是活跃成员时不得重置")
+
+	row, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, row.Status, "已通过状态必须保留")
+	assert.Equal(t, testutil.UID, row.ReviewerUID, "审批人必须保留")
+	// 第一次重置（合法）已把码写成 code-reset-b；这里要断言的是第二次重置什么都没做，
+	// 即码没有被改成 code-reset-c。
+	assert.Equal(t, "code-reset-b", row.InviteCode, "落空的重置不得改写邀请码")
+}

@@ -1650,15 +1650,6 @@ func (s *Space) refundInvite(code string) {
 	}
 }
 
-// consumeInviteOnApprove 审批通过时尝试消耗邀请码名额。
-// apply.InviteCode 为空时（如旧数据）跳过消耗，返回 (false, nil)，由调用方按未消耗处理。
-func (s *Space) consumeInviteOnApprove(code string) (bool, error) {
-	if code == "" {
-		return false, nil
-	}
-	return s.db.incrementInviteUsedCountAtomic(code)
-}
-
 // runAtomicApproval 是三条审批入口共用的审批执行步骤：Space 内审批
 // (approveJoinApply)、管理后台审批 (Manager.approveJoinApply)、以及管理员通知里的
 // H5 auth_code 审批 (joinApproveSure)。三处必须走同一实现——只改其中两处会留下一条
@@ -1700,10 +1691,14 @@ func (s *Space) respondApprovalOutcome(c *wkhttp.Context, outcome approveOutcome
 		httperr.ResponseErrorL(c, failCode, nil, nil)
 	case approveSpaceFull:
 		httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
-	default:
+	case approveOK:
 		s.afterJoinSpace(apply.UID, apply.SpaceId, space)
 		go s.notifyApplicantJoinResult(apply.UID, apply.SpaceId, space.Name, true)
 		c.ResponseOK()
+	default:
+		// 新增终态若忘了在此处理，绝不能悄悄走成功分支放人进空间。
+		s.Error("未知的审批终态", zap.Int("outcome", int(outcome)), zap.Int64("applyID", apply.Id))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 	}
 }
 
@@ -1739,16 +1734,6 @@ func (s *Space) classifyInviteConsumeFailure(code string, applyID int64) codes.C
 		zap.Int("usedCount", invitation.UsedCount),
 		zap.Int("maxUses", invitation.MaxUses))
 	return errcode.ErrSpaceInviteCodeExhausted
-}
-
-// rollbackApplyAndInvite 审批加入失败时回滚申请状态，并在确实消耗过名额时归还。
-func (s *Space) rollbackApplyAndInvite(applyID int64, code string, consumed bool) {
-	if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-		s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-	}
-	if consumed {
-		s.refundInvite(code)
-	}
 }
 
 // rejectJoinApply 管理员拒绝加入申请
