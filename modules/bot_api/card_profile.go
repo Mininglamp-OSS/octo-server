@@ -53,7 +53,7 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		// ToggleVisibility / CopyToClipboard 等 additive 新增本地动作。Action.Submit 属
 		// octo/v2 交互档，经 profiles 隐式发现、不在此列。
 		"actions": cardmsg.DisplayActions(),
-		// templating is additive to the raw-card Model B manifest. It advertises
+		// templating is additive to the raw-card capability manifest. It advertises
 		// only the explicit Bot catalog, never the broader Registry.List(). A nil
 		// catalog occurs only in focused tests that do not install the production
 		// composition root and reports supported:false rather than inventing refs.

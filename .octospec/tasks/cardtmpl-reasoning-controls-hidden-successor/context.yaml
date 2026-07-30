@@ -1,0 +1,20 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: Bot catalog and send/edit tests must preserve bot ownership and authoritative Space boundaries.
+  - id: trust-boundary
+    source: repo
+    why: The new JSON artifact must retain bounded schema, report/golden self-check, and final card validation.
+  - id: error-handling
+    source: repo
+    why: Bot wire paths are touched; existing localized error behavior must remain unchanged.
+  - id: rate-limit
+    source: repo
+    why: Bot module files are touched; no route or shared UID limiter behavior may regress.
+  - id: testing
+    source: repo
+    why: The version cutover requires unit, race, catalog integration, and historical-edit regression evidence.
+  - id: commit-style
+    source: repo
+    why: Eventual commits and PR must follow English Conventional Commit and PR conventions; Implement makes no commit.
+brief: .octospec/tasks/cardtmpl-reasoning-controls-hidden-successor/brief.md

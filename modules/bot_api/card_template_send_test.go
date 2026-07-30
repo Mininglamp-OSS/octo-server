@@ -70,34 +70,142 @@ func TestSendMessageRegistryTemplateRendersAndDispatches(t *testing.T) {
 	if _, ok := wire["reply"].(map[string]any); !ok {
 		t.Fatalf("reply not preserved: %#v", wire["reply"])
 	}
+	for _, forbidden := range [][]byte{
+		[]byte("Action.Submit"), []byte("reasoning_stop"), []byte("reasoning_retry"),
+		[]byte("stop_reasoning"), []byte("retry_reasoning"), []byte("可以重试"),
+	} {
+		if bytes.Contains(captured.Payload, forbidden) {
+			t.Fatalf("new-send payload contains unsupported control %q", forbidden)
+		}
+	}
 }
 
-func TestSendMessageRegistryTemplateRejectsLegacyVersionWithoutDispatch(t *testing.T) {
+func TestSendMessageRawCardAuthorsRenderProfile(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	gin.SetMode(gin.TestMode)
 
-	dispatch := &dispatchCapture{}
-	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+	for _, tc := range []struct {
+		name          string
+		renderProfile any
+		wantStatus    int
+	}{
+		{name: "omitted by caller", wantStatus: http.StatusOK},
+		{name: "matching legacy input remains compatible", renderProfile: cardmsg.RenderProfileOctoChatV1, wantStatus: http.StatusOK},
+		{name: "invalid legacy input still fails closed", renderProfile: "octo-chat/v2", wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatch := &dispatchCapture{}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-raw-card-render-profile"),
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+				dispatchOverride: dispatch.hook,
+			}
+			payload := map[string]any{
+				"type":         cardmsg.InteractiveCard.Int(),
+				"profile":      cardmsg.ProfileV1,
+				"card_version": cardmsg.CardVersion,
+				"card": map[string]any{
+					"type":    "AdaptiveCard",
+					"version": cardmsg.CardVersion,
+					"body": []any{
+						map[string]any{"type": "TextBlock", "text": "server authored render profile"},
+					},
+				},
+			}
+			if tc.renderProfile != nil {
+				payload["render_profile"] = tc.renderProfile
+			}
+			body := map[string]any{
+				"channel_id":   "user_creator",
+				"channel_type": common.ChannelTypePerson.Uint8(),
+				"payload":      payload,
+			}
+
+			recorder := invokeTemplateSend(t, ba, body, "")
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status=%d, want=%d body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+			dispatch.mu.Lock()
+			captured := dispatch.captured
+			dispatch.mu.Unlock()
+			if tc.wantStatus != http.StatusOK {
+				if captured != nil {
+					t.Fatal("invalid render_profile dispatched a message")
+				}
+				return
+			}
+			if captured == nil {
+				t.Fatal("expected exactly one dispatch")
+			}
+			var wire map[string]any
+			if err := json.Unmarshal(captured.Payload, &wire); err != nil {
+				t.Fatal(err)
+			}
+			if got := wire["render_profile"]; got != cardmsg.RenderProfileOctoChatV1 {
+				t.Fatalf("render_profile = %v, want %q", got, cardmsg.RenderProfileOctoChatV1)
+			}
+		})
+	}
+}
+
+func TestBotRawCardEditRenderProfilePreservesLargeCardSeq(t *testing.T) {
+	const contentEdit = `{"type":17,"profile":"octo/v2","card_version":"1.5","card_seq":9007199254740993,"card":{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"progress"}]}}`
+	normalized, err := cardmsg.NormalizeContentEdit(contentEdit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ba := &BotAPI{
-		Log:              log.NewTLog("BotAPI-template-send-legacy"),
-		cardTemplates:    catalog,
-		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
-		dispatchOverride: dispatch.hook,
+	authored, err := authorBotRawCardRenderProfile(normalized)
+	if err != nil {
+		t.Fatal(err)
 	}
-	body := registrySendBodyVersion(t, aireasoningprocess.TemplateVersionV1,
-		"reasoning", testReasoningDataVersion(t, aireasoningprocess.HandoffRootV1, "reasoning"))
+	if got, ok := cardmsg.CardSeqFromContentEdit(authored); !ok || got != 9007199254740993 {
+		t.Fatalf("card_seq = %d, ok=%v; want 9007199254740993", got, ok)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal([]byte(authored), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := wire["render_profile"]; got != cardmsg.RenderProfileOctoChatV1 {
+		t.Fatalf("render_profile = %v, want %q", got, cardmsg.RenderProfileOctoChatV1)
+	}
+}
 
-	recorder := invokeTemplateSend(t, ba, body, "")
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	dispatch.mu.Lock()
-	defer dispatch.mu.Unlock()
-	if dispatch.captured != nil {
-		t.Fatal("legacy template ref dispatched a new message")
+func TestSendMessageRegistryTemplateRejectsHistoricalVersionsWithoutDispatch(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	gin.SetMode(gin.TestMode)
+
+	for _, historical := range []struct {
+		version string
+		root    string
+	}{
+		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
+		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+	} {
+		t.Run(historical.version, func(t *testing.T) {
+			dispatch := &dispatchCapture{}
+			catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-template-send-historical"),
+				cardTemplates:    catalog,
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+				dispatchOverride: dispatch.hook,
+			}
+			body := registrySendBodyVersion(t, historical.version,
+				"reasoning", testReasoningDataVersion(t, historical.root, "reasoning"))
+
+			recorder := invokeTemplateSend(t, ba, body, "")
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			dispatch.mu.Lock()
+			defer dispatch.mu.Unlock()
+			if dispatch.captured != nil {
+				t.Fatal("historical template ref dispatched a new message")
+			}
+		})
 	}
 }
 
@@ -147,6 +255,7 @@ func TestSendMessageRegistryTemplateRejectsInvalidWithoutDispatch(t *testing.T) 
 		}},
 		{name: "raw and registry both present", mutate: func(payload map[string]any) { payload["card"] = map[string]any{} }},
 		{name: "render owned field", mutate: func(payload map[string]any) { payload["plain"] = "forged" }},
+		{name: "render owned render profile", mutate: func(payload map[string]any) { payload["render_profile"] = "octo-chat/v1" }},
 		{name: "aggregate action overflow", mutate: func(payload map[string]any) {
 			payload["data"].(map[string]any)["phases"] = reasoningPhasesForBotTest(4, 2, 2, 2, 2, 2)
 		}},

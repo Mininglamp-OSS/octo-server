@@ -22,6 +22,37 @@ and the database disagree. Do not add or use a switch that ignores the
 collision: doing so can make replicas resolve different content for the same
 identity.
 
+### Built-in static versions and binary rollback
+
+During the pre-PR-C dark phase, **do not use Activate or Rollback to switch a
+built-in-only template between static versions**. A built-in default is selected
+by the image's frozen Registry `SetDefault`; change it by deploying a reviewed
+image, not by persisting a catalog pointer. In particular, do not Activate or
+Rollback `ai.reasoning-process` to `0.3.0` as a shortcut for the image cutover.
+
+An activation row outlives the image that created it and overrides the
+built-in default. If it points to a static version that a rollback image does
+not contain, that image sees a permanent `source=static` claim outside its
+frozen Registry, classifies the active target as catalog integrity failure,
+marks readiness sticky-down, and rejects all catalog resolution. This can take
+every replica out of readiness even though the artifact bytes themselves are
+valid.
+
+Before any binary rollback, inspect the authoritative activation target and
+prove that it is absent or resolvable by the rollback image. If an operator has
+already persisted an incompatible static target, stop the rollout and use the
+current compatible image under an approved change ticket to Activate, with the
+current revision CAS, a target present in both images. Verify the audit and
+readiness, and only then roll back the binary. Do not repair this condition by
+editing the activation/claim tables directly; Block is irreversible and is not
+a shortcut for clearing an accidental static activation pointer.
+
+A future dynamic-catalog pilot may need a reviewed rollback from a dynamic
+artifact to a known built-in fallback. That exception must name a static
+version present in every allowed rollback image and establishes the same binary
+compatibility floor; it is not permission to use the control plane for routine
+static-to-static version selection.
+
 Before the first dynamic card is sent, a static-key collision is recovered with
 a **binary rollback or corrective binary**, not a catalog bypass or database
 rewrite. After a dynamic card is sent, rollback binaries must retain the PR-B
@@ -101,6 +132,12 @@ unaudited conflict response.
 
 ## Safe control procedure
 
+The procedures below operate the **dynamic** catalog state machine. In the
+current dark phase, a built-in-only template ID is not a control-plane drill
+target. The fact that the API can validate a static target is a recovery
+mechanism for a future dynamic pilot, not an operational recommendation to pin
+ordinary static defaults in MySQL.
+
 Use the manager read endpoints to obtain the authoritative version and
 `revision`; never guess a revision or infer rollback history from deployment
 notes:
@@ -120,6 +157,10 @@ and callback secrets.
 
 1. Keep dynamic new-send disabled. Enable the forward control gate only in the
    approved environment and only after all serving replicas run the PR-B image.
+   For routine forward control, Activate only a reviewed dynamic artifact;
+   never use this endpoint to select a built-in static version already
+   controlled by the image Registry. The approved compatibility repair in
+   "Built-in static versions and binary rollback" is the narrow exception.
 2. Validate/publish the immutable artifact and review its hash, owner, protocol,
    interaction contract, and route configuration. Publish accepts only the
    reviewed runtime-owner allowlist and requires startup catalog readiness;
@@ -138,6 +179,10 @@ and callback secrets.
 - Always name the target version. The server accepts only a version that the
   audit history proves was previously active and that still passes artifact,
   owner, block, compiler, and route validation.
+- Do not use rollback for routine static-to-static version selection. A static
+  target is allowed operationally only as an explicitly reviewed fallback from
+  a dynamic pilot, and only when that exact version exists in every image still
+  eligible for binary rollback.
 - Rollback remains available when the forward control gate is off. It performs
   a revision CAS and writes the state change plus success audit in one
   transaction.
@@ -223,6 +268,9 @@ no artifact during an idempotent publish.
   approved integrity repair was required.
 - Forward control/new-send gates are in the approved posture; successful
   publish, reconciliation, or activation is not treated as a producer grant.
+- No activation row points to a built-in static version absent from any image
+  still eligible for rollback. Built-in-only version changes use image
+  `SetDefault`, not a persistent Activate/Rollback pointer.
 - Multi-replica default resolution, explicit rollback, hot-cache block, process
   restart, and DB-outage behavior have been exercised in the target environment.
 

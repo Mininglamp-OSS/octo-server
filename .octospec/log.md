@@ -4,6 +4,35 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-30 (cardtmpl-reasoning-controls-hidden-successor)
+
+- **Safe reasoning successor** — Added immutable
+  `ai.reasoning-process@0.3.0` from the bounded V2 contract, removing unsupported
+  stop/retry Submit controls while preserving five states, the local reasoning
+  toggle, and active/error=`octo/v2`, result=`octo/v1`.
+- **Version cutover** — Registry default and Bot new sends now select V3;
+  V1/V2/V3 remain available only for same-exact-version historical edits.
+  Runtime static reconciliation claims V3 and dynamic same-key collision stays
+  fail-closed.
+- **Visual-profile contract** — Raw Bot send/edit callers no longer need to
+  provide `render_profile`; the Bot API authors `octo-chat/v1` on effective
+  frames. Registry callers still cannot override the server-authored manifest
+  value. See
+  [journal](journal/shared/cardtmpl-reasoning-controls-hidden-successor.md) and
+  [brief](tasks/cardtmpl-reasoning-controls-hidden-successor/brief.md).
+- **Boundary** — No OpenClaw release, active-run stop/retry, dynamic grant, or
+  production gate enablement is included. V3-capable server rollback support is
+  required after the first V3 message is sent.
+- **Review closure** — The runtime-catalog runbook now forbids routine
+  static-to-static Activate/Rollback and requires active-pointer compatibility
+  before binary rollback, preventing an older image from treating a persisted
+  static V3 target as sticky global integrity failure. Protocol docs now include
+  the Bot templating/empty-submit capability; focused tests reject legacy V3
+  stop/retry IDs through the Submit and ActionContext gates and caller-owned
+  Registry `render_profile`. The reported V1 self-check gap was mutation-tested
+  and is already closed by registration-time `cardmsg.Validate`; a regression
+  now locks it, and the V3 RouteSpec test directly covers its intended branch.
+
 ## 2026-07-29 (cardtmpl-runtime-catalog-overlay, roadmap E3 PR-B server)
 
 - **Runtime overlay** — Added one composition-root RuntimeCatalog over frozen

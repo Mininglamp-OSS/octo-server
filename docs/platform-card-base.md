@@ -165,7 +165,8 @@
 - manifest 的 `renderProfile` 固定 Forge 验证制品的精确不可变版本，例如 `octo-chat@1.2.0-rc.1`；
 - manifest 的 `renderProfileCompatibility` 是客户端稳定兼容键，例如 `octo-chat/v1`；
 - type-17 信封只发送稳定键：`"render_profile": "octo-chat/v1"`，Web 不需要保存每个 Forge 历史包；
-- 未声明 `renderProfileCompatibility` 的历史卡不写 `render_profile`，永久走 Legacy 渲染；
+- Registry 历史模板未声明 `renderProfileCompatibility` 时不写 `render_profile`，永久走 Legacy 渲染；
+- raw Bot send/edit 的调用方不选择该字段，Bot API 在有效帧统一写入 `octo-chat/v1`；
 - 服务端只接受已注册的稳定键，未知值在发送/写入边界 fail-close。
 
 当前 `docs.access-request@0.3.0` 固定 `octo-chat@1.2.0-rc.1` 并发送 `octo-chat/v1`；冻结的 `0.2.0` 不发送视觉兼容键。

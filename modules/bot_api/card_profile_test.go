@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -90,6 +91,7 @@ func TestBotCardProfile_ElementsInputsFromConstants(t *testing.T) {
 	assert.True(t, m.Templating.Supported)
 	assert.Equal(t, botTemplateWireV1, m.Templating.Wire)
 	assert.Len(t, m.Templating.Templates, 1)
+	assertReasoningV3Capability(t, m.Templating)
 }
 
 // TestBotCardProfile_ValuesFromConstants：清单每个值必须等于 pkg/cardmsg 常量
@@ -134,6 +136,7 @@ func TestBotCardProfile_DisabledStillReturnsManifestAndSendRejects(t *testing.T)
 	assert.Equal(t, cardmsg.MaxPayloadBytes, m.Limits.MaxPayloadBytes)
 	assert.True(t, m.Templating.Supported, "关闭时仍返完整模板清单")
 	assert.Len(t, m.Templating.Templates, 1)
+	assertReasoningV3Capability(t, m.Templating)
 
 	// 半 2：send 路径对卡片仍拒绝（同源 bot 门禁 BotEnabled，此处经部署级总开关关闭
 	// 而生效，send.go —— 在 IM 派发前拒绝，无需 WuKongIM）。
@@ -174,6 +177,7 @@ func TestBotCardProfile_BotSubSwitchDisablesProfileAndSend(t *testing.T) {
 	assert.Equal(t, cardmsg.AcceptedProfiles(), m.Profiles)
 	assert.True(t, m.Templating.Supported, "bot 子开关关闭时仍返完整模板清单")
 	assert.Len(t, m.Templating.Templates, 1)
+	assertReasoningV3Capability(t, m.Templating)
 
 	// 半 2：send 路径同源门禁（BotEnabled）→ 拒绝，与 profile 一致。
 	body := map[string]interface{}{
@@ -242,4 +246,18 @@ func newMustTestCatalog(t *testing.T) *botCardTemplateCatalog {
 	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
 	assert.NoError(t, err)
 	return catalog
+}
+
+func assertReasoningV3Capability(t *testing.T, capability botTemplatingCapability) {
+	t.Helper()
+	if !assert.Len(t, capability.Templates, 1) {
+		return
+	}
+	template := capability.Templates[0]
+	assert.Equal(t, string(aireasoningprocess.TemplateID), template.ID)
+	assert.Equal(t, aireasoningprocess.TemplateVersionV3, template.Version)
+	assert.Len(t, template.Views, 3)
+	for _, view := range template.Views {
+		assert.Empty(t, view.SubmitActions, "view %s must not advertise server callbacks", view.Name)
+	}
 }

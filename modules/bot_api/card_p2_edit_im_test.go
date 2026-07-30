@@ -126,6 +126,10 @@ func TestBotCardEditCASIM(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, stored, "done_btn", "message_extra 应存最新帧")
 	assert.NotContains(t, stored, "forged-by-client", "plain 必须被服务端重算覆盖")
+	var storedEnvelope map[string]interface{}
+	assert.NoError(t, json.Unmarshal([]byte(stored), &storedEnvelope))
+	assert.Equal(t, cardmsg.RenderProfileOctoChatV1, storedEnvelope["render_profile"],
+		"raw card edit 必须由服务端写入 render_profile")
 	// P1-2：捕获 advancing 写后的 version,用于验证下方冲突帧不改动它。
 	var vAfterDone int64
 	err = ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&vAfterDone)

@@ -85,38 +85,48 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	}
 }
 
-func TestBotMessageEditRegistryTemplateKeepsLegacyVersionEditable(t *testing.T) {
+func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	catalog, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), defaultBotTemplatePolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutator := &fakeBotCardMutator{
-		snapshot: carddispatch.CardMutationSnapshot{
-			Envelope: initialRegistryEnvelopeVersion(t, catalog, aireasoningprocess.TemplateVersionV1, "reasoning"),
-			CardSeq:  1,
-		},
-		mutateResult: carddispatch.CardMutationResult{Applied: true},
-	}
-	ba := &BotAPI{
-		Log:           log.NewTLog("BotAPI-template-edit-legacy"),
-		cardTemplates: catalog,
-		cardMutator:   mutator,
-	}
-	body := registryEditBodyVersion(t, aireasoningprocess.TemplateVersionV1, "completed",
-		testReasoningDataVersion(t, aireasoningprocess.HandoffRootV1, "completed"), 2, false)
+	for _, historical := range []struct {
+		version string
+		root    string
+	}{
+		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
+		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+	} {
+		t.Run(historical.version, func(t *testing.T) {
+			mutator := &fakeBotCardMutator{
+				snapshot: carddispatch.CardMutationSnapshot{
+					Envelope: initialRegistryEnvelopeVersion(t, catalog, historical.version, "reasoning"),
+					CardSeq:  1,
+				},
+				mutateResult: carddispatch.CardMutationResult{Applied: true},
+			}
+			ba := &BotAPI{
+				Log:           log.NewTLog("BotAPI-template-edit-historical"),
+				cardTemplates: catalog,
+				cardMutator:   mutator,
+			}
+			body := registryEditBodyVersion(t, historical.version, "completed",
+				testReasoningDataVersion(t, historical.root, "completed"), 2, false)
 
-	recorder := invokeTemplateEdit(t, ba, body)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	if mutator.snapshotCalls != 1 || len(mutator.mutateRequests) != 1 {
-		t.Fatalf("snapshot/mutate calls = %d/%d", mutator.snapshotCalls, len(mutator.mutateRequests))
-	}
-	if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
-		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
-	}); err != nil {
-		t.Fatalf("legacy replacement identity: %v", err)
+			recorder := invokeTemplateEdit(t, ba, body)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if mutator.snapshotCalls != 1 || len(mutator.mutateRequests) != 1 {
+				t.Fatalf("snapshot/mutate calls = %d/%d", mutator.snapshotCalls, len(mutator.mutateRequests))
+			}
+			if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
+				ID: aireasoningprocess.TemplateID, Version: historical.version,
+			}); err != nil {
+				t.Fatalf("historical replacement identity: %v", err)
+			}
+		})
 	}
 }
 
@@ -453,9 +463,12 @@ func initialRegistryEnvelopeVersion(
 	state string,
 ) []byte {
 	t.Helper()
-	root := aireasoningprocess.HandoffRootV2
-	if version == aireasoningprocess.TemplateVersionV1 {
+	root := testReasoningRootV3
+	switch version {
+	case aireasoningprocess.TemplateVersionV1:
 		root = aireasoningprocess.HandoffRootV1
+	case aireasoningprocess.TemplateVersionV2:
+		root = aireasoningprocess.HandoffRootV2
 	}
 	data := testReasoningDataVersion(t, root, state)
 	env := cardtmplBuildEnvForTest()
