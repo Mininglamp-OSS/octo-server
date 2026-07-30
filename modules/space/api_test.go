@@ -93,7 +93,11 @@ func newRenderedTestServer() (*server.Server, *config.Context) {
 	srv, ctx := testutil.NewTestServer()
 	srv.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	// POST /v1/space/join 现在挂了 SharedUIDRateLimiter，桶不随 CleanAllTables 清理。
-	clearUIDRateLimitBuckets(ctx)
+	// 这里没有 *testing.T 可用（TestMain 也调用本函数），Redis 不可用时整个包都跑不了，
+	// 因此与 TestMain 处理依赖表失败的方式一致，直接 panic 而不是静默跳过。
+	if err := clearUIDRateLimitBuckets(ctx); err != nil {
+		panic("重置 UID 限流桶失败: " + err.Error())
+	}
 	return srv, ctx
 }
 

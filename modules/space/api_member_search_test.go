@@ -31,24 +31,34 @@ type spaceMembersSearchItemForTest struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// resetSpaceUIDRateLimit 重置 UID 限流桶，失败即让当前用例 t.Fatal。
+//
+// 重置失败必须就地报错：桶跨用例存活，静默跳过会让失败以一个无关用例的 429 出现，
+// 排查时看起来像是那个用例自己的问题（PR #684 review）。
 func resetSpaceUIDRateLimit(t *testing.T, ctx *config.Context) {
 	t.Helper()
-	clearUIDRateLimitBuckets(ctx)
+	if err := clearUIDRateLimitBuckets(ctx); err != nil {
+		t.Fatalf("重置 UID 限流桶失败: %v", err)
+	}
 }
 
 // clearUIDRateLimitBuckets 清空 UID 限流桶。桶存活在 Redis 里，CleanAllTables 不会
 // 清理，跨用例累积会让后续用例意外收到 429。无 *testing.T 版本，便于在没有 t 的
-// 测试服务器构造函数里复用。
-func clearUIDRateLimitBuckets(ctx *config.Context) {
+// 测试服务器构造函数里复用；调用方必须处理返回的错误。
+func clearUIDRateLimitBuckets(ctx *config.Context) error {
 	rdsClient := redis.NewClient(&redis.Options{
 		Addr:     ctx.GetConfig().DB.RedisAddr,
 		Password: ctx.GetConfig().DB.RedisPass,
 	})
 	defer rdsClient.Close()
 	keys, err := rdsClient.Keys("ratelimit:uid:*").Result()
-	if err == nil && len(keys) > 0 {
-		_ = rdsClient.Del(keys...).Err()
+	if err != nil {
+		return err
 	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return rdsClient.Del(keys...).Err()
 }
 
 func getMembersSearch(t *testing.T, srv *server.Server, ctx *config.Context, spaceId string, q url.Values) *httptest.ResponseRecorder {
