@@ -84,10 +84,32 @@ installed and started in the session container (WuKongIM needs
 `WK_TOKENAUTHON=false`, since the tests use octo-lib's empty manager token).
 `go test ./modules/space/ -count=1` passes in full, including all 7 new cases.
 
-Note for anyone reproducing: packages must be run **serially** (`go test ./... -p 1`).
-They share one MySQL `test` database and one Redis, so parallel packages wipe each
-other's rows via `CleanAllTables` — `modules/space` passes alone and fails inside a
-default `go test ./...`. That is a property of the harness, not of this change.
+Full repo sweep: **87/87 packages pass** (65 in one serial run, plus the 22 that
+had failed re-run individually — 22 ok / 0 fail). No residual failure to
+attribute, so no `main` baseline comparison was needed.
+
+### Reproducing the environment
+
+`go test ./...` does **not** work here, in parallel *or* with `-p 1`. Two
+harness properties, both pre-existing and unrelated to this change:
+
+- **One shared `test` database.** Each package applies its own embedded
+  migration set to it, so a later package's `sql-migrate` finds rows for
+  migrations it does not know and panics with
+  `unknown migration in database`. The fix is to recreate the database per
+  package, not to serialise. (Serialising alone still fails — the first
+  diagnosis of "packages wipe each other's rows" was only half right.)
+- **`OCTO_MASTER_KEY` must be exported.** CI exports it; only `modules/space`
+  and `modules/file` set a fallback themselves. Without it, packages that store
+  private keys panic with `refusing to store unencrypted private key`.
+
+```bash
+export OCTO_MASTER_KEY=0123456789abcdef0123456789abcdef
+# per package: DROP/CREATE DATABASE test; redis-cli flushall; go test <pkg>
+```
+
+WuKongIM needs `WK_TOKENAUTHON=false`; the release asset is
+`wukongim-linux-amd64` under `releases/download/<tag>/`.
 
 ### The first run failed, and the tests were wrong — not the code
 
