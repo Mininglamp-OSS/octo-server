@@ -204,12 +204,6 @@ func (d *managerDB) forceDisbandSpace(spaceId string) error {
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return err
 	}
-	// 解散同样终结所有成员资格，因此该 Space 下的已通过申请一并清除，
-	// 使不变量不依赖"空间是否还活着"这个额外前提。
-	if _, err = tx.DeleteFrom("space_join_apply").
-		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
-		return err
-	}
 	return tx.Commit()
 }
 
@@ -434,11 +428,6 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string) error {
 			Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
 			return err
 		}
-		// 与 removeMemberLocked 保持一致：成员资格结束即清掉已通过的申请，
-		// 否则这批用户会被永久挡在重新申请之外。
-		if err := deleteApprovedJoinApplyTx(tx, spaceId, uid); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
@@ -532,27 +521,7 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 		Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
 		return err
 	}
-	if err = deleteApprovedJoinApplyTx(tx, spaceId, uid); err != nil {
-		return err
-	}
 	return tx.Commit()
-}
-
-// deleteApprovedJoinApplyTx 成员资格结束时删除其已通过的加入申请。
-//
-// 维持不变量：space_join_apply.status=1 ⇒ 申请人当前持有成员资格。
-// upsertJoinApply 拒绝改写 status=1 的行（防止审批被并发重申推翻），因此一条留存的
-// 已通过申请会把退出过的用户永久挡在门外——成员校验放行、待审批查询看不到该行、
-// upsert 被守卫拦下、读回判定"已是成员"，而 uk_space_uid 又不允许另建一行
-// （PR #684 review round 2 P1）。
-//
-// 删除而非改状态：status 只有 0/1/2 三个取值，新增取值会让管理后台渲染不出来；
-// 置 0 会在待审批队列里凭空多出一条申请；置 2 是谎称被拒绝。
-// 申请记录在成员资格结束后已无意义，且重新申请本来就会覆盖它。
-func deleteApprovedJoinApplyTx(tx *dbr.Tx, spaceId, uid string) error {
-	_, err := tx.DeleteFrom("space_join_apply").
-		Where("space_id=? AND uid=? AND status=1", spaceId, uid).Exec()
-	return err
 }
 
 // queryInvitesAdmin 分页查询空间所有邀请码（含已禁用）

@@ -2390,58 +2390,6 @@ func countAuthCodeKeys(t *testing.T, ctx *config.Context) int {
 	return len(keys)
 }
 
-// A8 —— 审批窗口：状态已翻成"已通过"、成员行尚未写入时，申请人重新提交。
-//
-// PR #684 review 指出的阻塞缺陷。此前这条路径完全没有守卫：成员校验查不到成员行、
-// 待审批查询只看 status=0 也查不到这条记录，于是落到 upsertJoinApply 被无条件改写，
-// 把已通过的申请打回待审批并清空 reviewer_uid。留下的矛盾状态更糟——rejectJoinApply
-// 会接受这条 status=0 的记录、标记为已拒绝、给申请人发"申请被拒绝"，却不撤销他已经
-// 持有的成员资格。
-func TestJoinSpace_ResubmitDuringApprovalWindow(t *testing.T) {
-	s, f, err := setup(t)
-	assert.NoError(t, err)
-
-	spaceId := "sp-683-window"
-	applicantUID := "u-683-window"
-	token := joinApplicantToken(t, applicantUID)
-	seedApprovalSpace(t, f, spaceId)
-
-	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
-		SpaceId: spaceId, InviteCode: "code-683-win-a", Creator: testutil.UID,
-		MaxUses: 10, UsedCount: 0, Status: 1,
-	}))
-	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
-		SpaceId: spaceId, InviteCode: "code-683-win-b", Creator: testutil.UID,
-		MaxUses: 10, UsedCount: 0, Status: 1,
-	}))
-
-	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
-		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-win-a", Status: 0,
-	})
-	assert.NoError(t, err)
-
-	// 精确构造窗口：状态已翻成已通过，但成员行还没写入。
-	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
-	assert.NoError(t, err)
-	mbr, err := f.db.queryMember(spaceId, applicantUID)
-	assert.NoError(t, err)
-	assert.Nil(t, mbr, "窗口前提：成员行尚未写入")
-
-	before := readApplyCreatedAt(t, applyID)
-	time.Sleep(1100 * time.Millisecond)
-
-	w := postJoinSpace(t, s, token, "code-683-win-b")
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assertSpaceErrorCode(t, w, "err.server.space.already_member")
-
-	after, err := f.db.queryJoinApplyByID(applyID)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, after.Status, "已通过的申请不得被重新提交打回待审批")
-	assert.Equal(t, testutil.UID, after.ReviewerUID, "审批人不得被清空")
-	assert.Equal(t, "code-683-win-a", after.InviteCode, "已通过申请的邀请码不得被改写")
-	assert.Equal(t, before, readApplyCreatedAt(t, applyID), "已通过申请的申请时间不得被刷新")
-}
-
 // A8b —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
 func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 	_, f, err := setup(t)
@@ -2587,12 +2535,139 @@ func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T)
 	}
 }
 
-// A10 —— 退出后必须能重新申请。
+// A8 —— 审批是原子的：任何一步失败都整笔回滚，不留中间态。
 //
-// PR #684 review round 2 的 P1：upsertJoinApply 的 status=1 守卫要求
-// "status=1 ⇒ 当前持有成员资格" 真正成立。移除路径此前完全不碰申请行，导致老成员
-// 重新申请时被永久挡住——成员校验放行、待审批查询看不到该行、upsert 被守卫拦下、
-// 读回判定"已是成员"，而 uk_space_uid 又不允许另建一行。
+// 取代了旧的 TestJoinSpace_ResubmitDuringApprovalWindow。那个用例构造
+// "status=1 且无成员行" 并断言重申应得到 already_member——对"审批进行中"是对的，
+// 但它与"审批中途夭折"逐字节相同，于是把永久锁死也一并断言成了正确行为
+// （PR #684 review round 3）。事务化之后该状态对外不可见，用例失去意义，
+// 改为直接断言原子性。
+func TestApproveJoinApply_IsAtomicOnInviteFailure(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-atomic-inv"
+	applicantUID := "u-683-atomic-inv"
+	seedApprovalSpace(t, f, spaceId)
+	// 被禁用的邀请码：消耗必然失败
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-atomic-inv", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 0,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-atomic-inv", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, after.Status, "失败的审批必须整笔回滚为待审批")
+	assert.Equal(t, "", after.ReviewerUID, "回滚后不得留下审批人")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "失败的审批不得产生成员")
+
+	inv, err := f.db.queryInvitationByCodeUnfiltered("code-atomic-inv")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "失败的审批不得消耗名额")
+
+	// 关键：申请仍在待审批队列里，管理员和申请人都还有后路
+	list, err := f.db.queryPendingAppliesBySpace(spaceId, 10, 0)
+	assert.NoError(t, err)
+	assert.Len(t, list, 1, "失败的审批必须仍然可被看到和处理")
+}
+
+// A8b —— 空间已满导致的审批失败同样整笔回滚，名额不被消耗。
+func TestApproveJoinApply_IsAtomicOnSpaceFull(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-atomic-full"
+	applicantUID := "u-683-atomic-full"
+	// MaxUsers=1，owner 已占满
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "满员", Creator: testutil.UID,
+		JoinMode: JoinModeApproval, MaxUsers: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-atomic-full", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-atomic-full", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.full")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, after.Status, "满员导致的失败必须整笔回滚")
+
+	inv, err := f.db.queryInvitationByCodeUnfiltered("code-atomic-full")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "满员时不得消耗名额（旧实现靠事后退还）")
+}
+
+// A8c —— 成功审批后，申请与成员资格必须同时成立（不变量的正向断言）。
+func TestApproveJoinApply_InvariantHoldsAfterSuccess(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-inv-ok"
+	applicantUID := "u-683-inv-ok"
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-inv-ok", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-inv-ok", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status)
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "status=1 必须与活跃成员行同时成立")
+
+	inv, err := f.db.queryInvitationByCode("code-inv-ok")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, inv.UsedCount, "成功审批消耗一个名额")
+}
+
+// A10 —— 退出后必须能重新申请（round 2 的 P1）。
+//
+// 现在靠读回点的就地重置实现：status=1 且当前没有活跃成员，只可能是
+// "审批通过之后成员资格结束了"，因为事务保证 status=1 不会先于成员行可见。
 func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 	s, f, err := setup(t)
 	assert.NoError(t, err)
@@ -2606,7 +2681,6 @@ func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 		MaxUses: 100, UsedCount: 0, Status: 1,
 	}))
 
-	// 申请 → 审批 → 成为成员
 	w := postJoinSpace(t, s, token, "code-683-rejoin")
 	assert.Equal(t, http.StatusOK, w.Code)
 	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
@@ -2619,9 +2693,6 @@ func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-	mbr, err := f.db.queryMember(spaceId, applicantUID)
-	assert.NoError(t, err)
-	assert.NotNil(t, mbr)
 
 	// 主动退出
 	w = httptest.NewRecorder()
@@ -2629,16 +2700,11 @@ func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 	req.Header.Set("token", token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-
 	gone, err := f.db.queryMember(spaceId, applicantUID)
 	assert.NoError(t, err)
-	assert.Nil(t, gone, "已不是活跃成员")
+	assert.Nil(t, gone)
 
-	stale, err := f.db.queryJoinApplyByID(apply.Id)
-	assert.NoError(t, err)
-	assert.Nil(t, stale, "成员资格结束时应清除已通过的申请")
-
-	// 重新申请：必须能重新走审批流程
+	// 重新申请
 	w = postJoinSpace(t, s, token, "code-683-rejoin")
 	assert.Equal(t, http.StatusOK, w.Code, "老成员必须能重新申请")
 	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
@@ -2646,79 +2712,51 @@ func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
 	pending, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
 	assert.NoError(t, err)
 	assert.NotNil(t, pending, "重新申请应产生新的待审批记录")
+
+	// 并且能被再次审批通过
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, pending.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "重新申请后应能正常审批通过")
+
+	rejoined, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, rejoined, "应重新成为成员")
 }
 
-// A10b —— 老成员被"重新审批"的窗口内并发重申，仍不得推翻审批。
-//
-// 与 A10 是同一批用户的对立要求：A10 要求陈旧的已通过记录不能挡路，本例要求
-// 正在进行中的审批不能被推翻。二者在旧实现下无法同时满足——存储状态完全相同
-// （成员行 status=0 且申请行 status=1）。移除时清除申请行消灭了前一种状态，
-// 剩下的 status=1 才唯一对应"审批进行中"。
-func TestJoinSpace_ExMemberReapprovalNotReverted(t *testing.T) {
+// A10b —— 仍是活跃成员时重申，不得被当成陈旧记录重置。
+func TestJoinSpace_ActiveMemberResubmitIsRejected(t *testing.T) {
 	s, f, err := setup(t)
 	assert.NoError(t, err)
 
-	spaceId := "sp-683-rejoin-race"
-	applicantUID := "u-683-rejoin-race"
+	spaceId := "sp-683-active"
+	applicantUID := "u-683-active"
 	token := joinApplicantToken(t, applicantUID)
 	seedApprovalSpace(t, f, spaceId)
-	for _, code := range []string{"code-683-rr-a", "code-683-rr-b"} {
-		assert.NoError(t, f.db.insertInvitation(&InvitationModel{
-			SpaceId: spaceId, InviteCode: code, Creator: testutil.UID,
-			MaxUses: 100, UsedCount: 0, Status: 1,
-		}))
-	}
-
-	// 曾是成员、已退出，然后重新提交了申请
-	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
-		SpaceId: spaceId, UID: applicantUID, Role: 0, Status: 1,
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-active", Creator: testutil.UID,
+		MaxUses: 100, UsedCount: 0, Status: 1,
 	}))
-	assert.NoError(t, f.db.removeMemberLocked(spaceId, applicantUID, 99))
 	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
-		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-rr-a", Status: 0,
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-active", Status: 0,
 	})
 	assert.NoError(t, err)
 
-	// 审批已翻转状态，reactivateMember 尚未执行
-	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
-	assert.NoError(t, err)
-	notYet, err := f.db.queryMember(spaceId, applicantUID)
-	assert.NoError(t, err)
-	assert.Nil(t, notYet, "窗口前提：成员行尚未重新激活")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 
-	// 并发重申落在窗口里
-	w := postJoinSpace(t, s, token, "code-683-rr-b")
+	w = postJoinSpace(t, s, token, "code-683-active")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assertSpaceErrorCode(t, w, "err.server.space.already_member")
 
 	after, err := f.db.queryJoinApplyByID(applyID)
 	assert.NoError(t, err)
-	assert.Equal(t, 1, after.Status, "审批中的申请不得被推翻")
-	assert.Equal(t, testutil.UID, after.ReviewerUID, "审批人不得被清空")
-	assert.Equal(t, "code-683-rr-a", after.InviteCode, "邀请码不得被改写")
-}
-
-// A10c —— 后台批量强制移除同样清除已通过申请（三条移除路径的一致性）。
-func TestRemoveMembersForce_ClearsApprovedApply(t *testing.T) {
-	_, f, err := setup(t)
-	assert.NoError(t, err)
-
-	spaceId := "sp-683-force-rm"
-	uid := "u-683-force-rm"
-	seedApprovalSpace(t, f, spaceId)
-	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
-		SpaceId: spaceId, UID: uid, Role: 0, Status: 1,
-	}))
-	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
-		SpaceId: spaceId, UID: uid, InviteCode: "code-force", Status: 0,
-	})
-	assert.NoError(t, err)
-	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
-	assert.NoError(t, err)
-
-	assert.NoError(t, newManagerDB(testCtx.DB()).removeMembersForce(spaceId, []string{uid}))
-
-	row, err := f.db.queryJoinApplyByID(applyID)
-	assert.NoError(t, err)
-	assert.Nil(t, row, "强制移除应同样清除已通过的申请")
+	assert.Equal(t, 1, after.Status, "活跃成员的已通过申请不得被重置")
+	assert.Equal(t, testutil.UID, after.ReviewerUID)
 }

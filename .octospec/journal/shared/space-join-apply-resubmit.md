@@ -107,58 +107,67 @@ before the status CAS, so a concurrent re-submission can charge the stale code
 the window before membership actually exists; `created_at` refresh makes offset
 pagination less stable.
 
-## Review round 2 — the guard created a lockout of its own
+## Review round 3 — stop adding guards, make the state unrepresentable
 
-@yujiawei blocked on a P1 that the round-1 fix introduced. Reproduced end to end
-over HTTP before touching anything: apply → approve → `/leave` → re-apply gives
-`400 already_member` and no pending application, permanently.
+@yujiawei blocked again, and the meta-point was the important part: three rounds
+had each closed *one more way* for `status=1` to mean something other than
+"member" — a write guard, then deletes at three removal call sites, then a
+backfill. The set of writers that had to cooperate kept growing, and one of them
+already had a hole (`removeMemberLocked` returns before the cleanup when the
+member row is already inactive).
 
-`space_join_apply` has four writers and none of them is in a member-removal path
-(`removeMemberLocked` only sets `space_member.status=0`). So `status=1` means
-"was approved once", not "is currently a member" — and the round-1 readback read
-it as the latter. On `main` this worked only because the unconditional upsert
-reset the stale row; the `IF(status=1, …)` guard is what closed that door.
+The concrete P1: `status=1` can also mean **an approval that died in flight**.
+Two generators, both real — a swallowed rollback write, and process death between
+the status CAS and the member insert, which were separate transactions with an
+invite-consume UPDATE in between. Reproduced; all four product surfaces refuse
+the resulting row:
 
-Same failure class the task exists to fix — an application that can be neither
-approved nor repaired — except reachable by an ordinary user action rather than a
-race.
+```
+re-apply       -> 400 already_member    (the caller is provably not a member)
+admin approve  -> 400 apply_processed
+admin reject   -> 400 apply_processed
+pending queue  -> 0 rows
+```
 
-### The obvious fix does not work, and that is provable
+They also corrected the round-2 reasoning: "a readback discriminator cannot work"
+was true *before* the removal cleanups existed, but I kept asserting it as a
+general impossibility after those changes had eliminated one of the two ambiguous
+states. Third over-claim in three rounds.
 
-The first instinct was to discriminate at the readback: `existing.Status == 0`
-(a removed-member row) means the approved row is stale, so reset it. Implemented
-it and ran two cases against it:
+And the addendum that settled the approach: **A8 asserted the lockout as expected
+behaviour.** It built `status=1` with the member row absent and asserted
+`already_member` plus an untouched row — correct for a live approval, and
+byte-identical to a dead one. So the suite was not merely missing the defect, it
+was holding it in place; and A8's 1100 ms sleep meant any bounded-staleness rule
+would have had to retune it.
 
-| case | candidate fix |
-|---|---|
-| ex-member re-applies | PASS |
-| ex-member's *in-flight re-approval* not reverted | **FAIL** — `status=0 reviewer="" code="cB2"` |
+### What shipped
 
-Both cases present **identical stored state** at the moment of the request —
-`space_member.status=0` and `space_join_apply.status=1` — because
-`executeJoinSpace` reactivates the member *after* the status flip. The correct
-answer differs between them, so no discriminator over that state can exist. The
-reviewer's own suggestion used a time heuristic for exactly this reason, and said
-so plainly.
+The status flip, the invite consumption, and the member write now happen in **one
+transaction** (`approveJoinApplyAtomic`). `status=1` is therefore only ever
+committed together with an active member row, so "approved but not a member" is
+unrepresentable rather than merely guarded against.
 
-### What was done instead
+That collapses the rest:
 
-Made the invariant true rather than inferring it. All three paths that end
-membership now delete the approved application in the same transaction —
-`removeMemberLocked` (leave + remove), `removeMembersForce` (admin batch), and
-`forceDisbandSpace`. With the stale state gone, a `status=1` row can only mean an
-approval in flight, and the round-1 readback becomes correct as written.
+- **The compensation logic is gone.** No writing status back to 0, no refunding a
+  consumed slot — a failure rolls the whole thing back. Those compensating writes
+  were themselves a P1 generator when they failed.
+- **The round-2 removal cleanups and the data migration were reverted.** With the
+  invariant established at the only place that creates `status=1`, a stale row is
+  unambiguous — `status=1` with no active member can only mean membership ended
+  after approval — so the readback repairs it in place, with no time threshold.
+  That also retires the two items round 3 flagged for human sign-off: approval
+  history is no longer deleted, and there is no migration.
+- **P2-1 folded in.** The invite code is re-read *inside* the transaction after
+  the CAS locks the row, so a concurrent re-submission can no longer make approval
+  charge the code it replaced.
+- **P2-2 fixed.** `queryJoinApplyByID` returns read errors before inferring
+  absence from a zero-value field, since its result now drives a guard.
 
-Delete rather than re-status: `status` has only 0/1/2 and octo-admin renders
-those three, so a new value would need a frontend change; `0` would inject a
-phantom row into the pending queue; `2` would claim a rejection that never
-happened.
-
-A data migration handles rows that already exist — removal-time cleanup only ever
-helps future removals, and every approval-mode Space today may hold rows that
-become lockouts the moment this merges. Its predicate was verified against all
-five states (approved+active kept, approved+removed deleted, approved+no-member
-deleted, pending kept, rejected kept).
+Verified by sweeping every approval failure mode (invite disabled, invite
+exhausted, space full, happy path) and asserting no orphan row is observable in
+any of them.
 
 ## Learnings
 

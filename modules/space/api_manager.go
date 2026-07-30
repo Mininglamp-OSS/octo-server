@@ -1164,46 +1164,17 @@ func (m *Manager) approveJoinApply(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
-	affected, err := m.db.updateJoinApplyStatus(applyID, 1, reviewerUID)
+	// 与 Space 内审批、H5 auth_code 审批共用同一个原子实现，三条审批入口行为保持一致。
+	outcome, failCode, err := m.space.runAtomicApproval(apply, sp, reviewerUID)
 	if err != nil {
-		m.Error("更新申请状态失败", zap.Error(err), zap.Int64("applyID", applyID))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	if affected == 0 {
-		c.ResponseOK() // 已被其他人处理
-		return
+	if outcome == approveOK {
+		m.Info("管理员通过加入申请", zap.String("spaceId", spaceId), zap.Int64("applyID", applyID),
+			zap.String("applicant", apply.UID), zap.String("operator", reviewerUID))
 	}
-
-	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗）。
-	// 与 Space 内审批、H5 auth_code 审批共用同一实现，三条审批入口行为保持一致。
-	inviteConsumed, failCode, ok := m.space.consumeInviteForApproval(apply, sp.Name)
-	if !ok {
-		httperr.ResponseErrorL(c, failCode, nil, nil)
-		return
-	}
-
-	if joinErr := m.space.executeJoinSpace(apply.UID, spaceId, sp); joinErr != nil {
-		// ErrAlreadyMember：用户已在空间里（并发路径），apply 视作审批成功，但未新增成员，归还名额
-		if errors.Is(joinErr, ErrAlreadyMember) {
-			if inviteConsumed {
-				m.space.refundInvite(apply.InviteCode)
-			}
-			c.ResponseOK()
-			return
-		}
-		m.space.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-		if errors.Is(joinErr, ErrSpaceFull) {
-			httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
-			return
-		}
-		m.Error("加入空间失败", zap.Error(joinErr), zap.Int64("applyID", applyID))
-		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-		return
-	}
-	go m.space.notifyApplicantJoinResult(apply.UID, spaceId, sp.Name, true)
-	m.Info("管理员通过加入申请", zap.String("spaceId", spaceId), zap.Int64("applyID", applyID), zap.String("applicant", apply.UID), zap.String("operator", reviewerUID))
-	c.ResponseOK()
+	m.space.respondApprovalOutcome(c, outcome, failCode, apply, sp)
 }
 
 // rejectJoinApply 管理员审批拒绝
