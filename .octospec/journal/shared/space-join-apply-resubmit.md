@@ -77,9 +77,29 @@ and deserves its own review. Tracked as a follow-up.
 ## Verification
 
 `go build ./...`, `go vet ./modules/space/`, `golangci-lint run ./...` (0 issues),
-`make i18n-extract-check`, `make i18n-lint` all pass. The test binary compiles.
+`make i18n-extract-check`, `make i18n-lint` all pass.
 
-**The tests were not executed**: this environment has no MySQL/Redis/WuKongIM and
-no Docker, so `go test ./modules/space/...` cannot run here (`TestMain` panics on
-`dial tcp 127.0.0.1:3306`). The 8 new/updated tests are unrun and CI is the first
-real execution.
+Integration tests **were** run: MySQL 8.0, Redis, and WuKongIM v2.2.4 were
+installed and started in the session container (WuKongIM needs
+`WK_TOKENAUTHON=false`, since the tests use octo-lib's empty manager token).
+`go test ./modules/space/ -count=1` passes in full, including all 7 new cases.
+
+Note for anyone reproducing: packages must be run **serially** (`go test ./... -p 1`).
+They share one MySQL `test` database and one Redis, so parallel packages wipe each
+other's rows via `CleanAllTables` — `modules/space` passes alone and fails inside a
+default `go test ./...`. That is a property of the harness, not of this change.
+
+### The first run failed, and the tests were wrong — not the code
+
+Two of the new timestamp assertions failed on the first run. The cause was the
+test helper, not the implementation: `Load(&time.Time)` on a bare scalar returns
+`rows=1, err=nil` while leaving the zero time, because dbr treats `time.Time` as
+a struct and finds no fields to map. Raw SQL confirmed the production UPSERT
+refreshed `created_at` correctly the whole time.
+
+Worth recording *how* it presented: the third assertion — equality between two
+reads — **passed**, because zero equals zero. That is the exact assertion written
+to catch "the timestamp was not refreshed", and it is permanently green under
+this bug. A mixed pass/fail result pointed at the implementation when the
+instrument was broken. Helper now selects `UNIX_TIMESTAMP` into an `int64` and
+asserts non-zero. Staged as a learning.
