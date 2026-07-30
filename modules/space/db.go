@@ -290,6 +290,22 @@ func (d *DB) queryInvitationByCode(code string) (*InvitationModel, error) {
 	return &m, err
 }
 
+// queryInvitationByCodeUnfiltered 查询邀请码，不过滤 status / 过期时间。
+//
+// 仅用于审批消耗失败后判定失效原因（次数用尽 / 被禁用 / 已过期）并写入日志：
+// incrementInviteUsedCountAtomic 把三种条件合并在一条 WHERE 里，返回 false 时无法
+// 区分是哪一种。绝不可用于准入判定——那必须继续走 queryInvitationByCode 的过滤视图。
+func (d *DB) queryInvitationByCodeUnfiltered(code string) (*InvitationModel, error) {
+	var m InvitationModel
+	_, err := d.session.Select("*").From("space_invitation").
+		Where("invite_code=?", code).
+		Load(&m)
+	if m.InviteCode == "" {
+		return nil, nil
+	}
+	return &m, err
+}
+
 // incrementInviteUsedCountAtomic atomically increments used_count iff the invite is
 // still valid (status=1, not expired, under max_uses). Filter conditions must stay in
 // sync with queryInvitationByCode so the read→write path keeps the same validity view,
@@ -583,10 +599,15 @@ func (d *DB) queryAdminsAndOwner(spaceId string) ([]*MemberModel, error) {
 
 // ---------- Join Apply CRUD ----------
 
+// upsertJoinApply 创建申请，或在同一 (space_id, uid) 已有记录时重置为待审批。
+// created_at 一并刷新：uk_space_uid 决定一个申请人在一个 Space 只有一行，被拒后
+// 重新申请会复用该行，而两条列表链路都把 created_at 当"申请时间"排序与展示
+// （db.go queryPendingAppliesBySpace / db_manager.go queryJoinAppliesAdmin）。
+// 不刷新会让重新申请仍显示首次申请日期（issue #683）。
 func (d *DB) upsertJoinApply(m *spaceJoinApplyModel) (int64, error) {
 	result, err := d.session.InsertBySql(
 		"INSERT INTO space_join_apply (space_id, uid, invite_code, status, reviewer_uid) VALUES (?, ?, ?, 0, '') "+
-			"ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), status=0, invite_code=VALUES(invite_code), reviewer_uid='', updated_at=NOW()",
+			"ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), status=0, invite_code=VALUES(invite_code), reviewer_uid='', created_at=NOW(), updated_at=NOW()",
 		m.SpaceId, m.UID, m.InviteCode,
 	).Exec()
 	if err != nil {
@@ -594,6 +615,25 @@ func (d *DB) upsertJoinApply(m *spaceJoinApplyModel) (int64, error) {
 	}
 	id, err := result.LastInsertId()
 	return id, err
+}
+
+// refreshPendingApplyInvite 让一条仍在待审批的申请改用申请人本次提交的邀请码，
+// 并把申请时间刷新为现在。
+//
+// WHERE 必须保留 status=0：管理员审批与申请人重申可能并发，审批会先把状态改成 1
+// 再消耗名额，此时若无条件更新会把"审批中/已通过"的记录打回待审批，并让审批消耗的
+// 名额与记录上的邀请码脱节。返回 0 行即表示状态已被并发改动，由调用方重新判定。
+//
+// 刻意不触碰 used_count：提交申请从来不占用邀请码名额，名额在审批时才消耗。
+func (d *DB) refreshPendingApplyInvite(id int64, inviteCode string) (int64, error) {
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_join_apply SET invite_code=?, created_at=NOW(), updated_at=NOW() WHERE id=? AND status=0",
+		inviteCode, id,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (d *DB) queryJoinApplyByID(id int64) (*spaceJoinApplyModel, error) {

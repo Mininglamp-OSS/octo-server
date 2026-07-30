@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 )
@@ -90,14 +91,20 @@ func strPtr(s string) *string { return &s }
 func newRenderedTestServer() (*server.Server, *config.Context) {
 	srv, ctx := testutil.NewTestServer()
 	srv.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	// POST /v1/space/join 现在挂了 SharedUIDRateLimiter，桶不随 CleanAllTables 清理。
+	clearUIDRateLimitBuckets(ctx)
 	return srv, ctx
 }
 
-// setup 返回共享的测试服务器和 Space 实例，并清理表数据
+// setup 返回共享的测试服务器和 Space 实例，并清理表数据。
+//
+// 同时重置 UID 限流桶：POST /v1/space/join 现在挂了 SharedUIDRateLimiter，而该桶
+// 存活在 Redis 里，CleanAllTables 不会清理它，跨用例累积会让后续用例收到 429。
 func setup(t *testing.T) (*server.Server, *Space, error) {
 	t.Helper()
 	err := testutil.CleanAllTables(testCtx)
 	assert.NoError(t, err)
+	resetSpaceUIDRateLimit(t, testCtx)
 	return testSrv, New(testCtx), err
 }
 
@@ -1788,7 +1795,9 @@ func TestApproveJoinApply_InviteDisabledBlocksApproval(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
+	// issue #683 R5：被禁用不再冒充"次数上限"。三种失效条件共用一条原子 WHERE，
+	// 消耗失败后按实际原因分流：用尽 → exhausted，禁用/过期/不存在 → invalid。
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
 
 	updated, err := f.db.queryJoinApplyByID(applyID)
 	assert.NoError(t, err)
@@ -1974,4 +1983,374 @@ func TestE2E_DisableUserCreateSpace_FullChain(t *testing.T) {
 		"manager 写回 0 后 appconfig 必须立刻下发 0")
 	assert.Equal(t, http.StatusOK, createSpace("e2e-on"),
 		"开关 OFF 时 createSpace 必须 200")
+}
+
+// === Issue #683: pending 申请重申应改用新邀请码 ===
+//
+// 背景：joinSpace 此前在发现 status=0 记录时直接返回 PENDING，申请因此永远绑定
+// 首次提交的邀请码。旧码一旦用尽/被禁用/过期，审批必然失败并回滚为待审批，而
+// uk_space_uid (space_id, uid) 又使申请人无法另建记录，只能等管理员先拒绝。
+
+// joinApplicantToken 为任意 UID 注入一个普通用户 token，使"申请人"与"审批管理员"
+// 可以是两个不同的账号——A1/A2 需要申请人真的走一遍 HTTP 提交。
+func joinApplicantToken(t *testing.T, uid string) string {
+	t.Helper()
+	token := "space-join-applicant-" + uid
+	cfg := testCtx.GetConfig()
+	assert.NoError(t, testCtx.Cache().Set(cfg.Cache.TokenCachePrefix+token, uid+"@"+uid))
+	return token
+}
+
+// postJoinSpace 以指定 token 提交一次加入申请。
+func postJoinSpace(t *testing.T, s *server.Server, token, inviteCode string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+	return w
+}
+
+// seedApprovalSpace 建一个需审批的 Space，testutil.UID 为 owner（审批方）。
+func seedApprovalSpace(t *testing.T, f *Space, spaceId string) {
+	t.Helper()
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "重申测试", Creator: testutil.UID, JoinMode: JoinModeApproval, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+}
+
+// readApplyCreatedAt 直接读申请时间，绕过业务过滤。
+func readApplyCreatedAt(t *testing.T, applyID int64) time.Time {
+	t.Helper()
+	var createdAt time.Time
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT created_at FROM space_join_apply WHERE id=?", applyID).Load(&createdAt)
+	assert.NoError(t, err)
+	return createdAt
+}
+
+// A1 —— 待审批状态下改用新邀请码重申：记录应改用新码并刷新申请时间。
+// 对应 issue #683 复现步骤 6-7。
+func TestJoinSpace_ResubmitWithNewInviteUpdatesPendingApply(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-resubmit"
+	applicantUID := "u-683-resubmit"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	// 码 A：提交时尚有名额（提交只做只读校验，不占名额）
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-a", Creator: testutil.UID,
+		MaxUses: 1, UsedCount: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-b", Creator: testutil.UID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	w := postJoinSpace(t, s, token, "code-683-a")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+	assert.Equal(t, "code-683-a", apply.InviteCode)
+	before := readApplyCreatedAt(t, apply.Id)
+
+	// created_at 精度为秒，等待一秒才能断言"确实前移"
+	time.Sleep(1100 * time.Millisecond)
+
+	// 旧码此时用尽（其他人用掉了名额），申请人改用仍然有效的码 B 重申
+	_, err = f.db.incrementInviteUsedCountAtomic("code-683-a")
+	assert.NoError(t, err)
+
+	w = postJoinSpace(t, s, token, "code-683-b")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL",
+		"重申成功应回到'申请已提交'语义，而不是被当成重复提交短路")
+
+	updated, err := f.db.queryJoinApplyByID(apply.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, apply.Id, updated.Id, "uk_space_uid 决定仍是同一行")
+	assert.Equal(t, "code-683-b", updated.InviteCode, "待审批申请应改用本次提交的邀请码")
+	assert.Equal(t, 0, updated.Status, "重申不得自行授予成员资格，仍需审批")
+	assert.True(t, readApplyCreatedAt(t, apply.Id).After(before), "申请时间应刷新为最近一次提交")
+}
+
+// A2 —— 重申换码后审批应消耗新码的名额，而不是已失效的旧码。
+func TestApproveJoinApply_ConsumesResubmittedInvite(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-consume"
+	applicantUID := "u-683-consume"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-old", Creator: testutil.UID,
+		MaxUses: 1, UsedCount: 1, Status: 1, // 已用尽
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-new", Creator: testutil.UID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-old", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 申请人改用有效码重申
+	w := postJoinSpace(t, s, token, "code-683-new")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 管理员审批
+	w = httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "换成有效邀请码后审批应当通过")
+
+	newInv, err := f.db.queryInvitationByCode("code-683-new")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, newInv.UsedCount, "应消耗重申所用的新邀请码")
+
+	oldInv, err := f.db.queryInvitationByCodeUnfiltered("code-683-old")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, oldInv.UsedCount, "不得再动已失效的旧邀请码")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "审批通过后申请人应成为成员")
+}
+
+// A3 —— 被拒后重新申请应刷新申请时间，并在列表里排到旧申请前面。
+// 对应 issue #683「后台仍显示 7 月 16 日首次申请时间」。
+func TestJoinApplyList_ReappliedApplySortsByLatestTime(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-sort"
+	applicantUID := "u-683-sort"
+	otherUID := "u-683-sort-other"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-sort", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	// 申请人先申请后被拒
+	rejectedID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-sort", Status: 0,
+	})
+	assert.NoError(t, err)
+	firstApplyAt := readApplyCreatedAt(t, rejectedID)
+	_, err = f.db.updateJoinApplyStatus(rejectedID, 2, testutil.UID)
+	assert.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// 另一位用户在其后提交，成为"较早的待审批申请"
+	otherID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: otherUID, InviteCode: "code-683-sort", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// 被拒的申请人重新提交
+	w := postJoinSpace(t, s, token, "code-683-sort")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	assert.True(t, readApplyCreatedAt(t, rejectedID).After(firstApplyAt),
+		"重新申请应刷新申请时间，而不是保留首次申请日期")
+
+	list, err := f.db.queryPendingAppliesBySpace(spaceId, 10, 0)
+	assert.NoError(t, err)
+	assert.Len(t, list, 2)
+	assert.Equal(t, rejectedID, list[0].Id, "最新一次申请应排在最前")
+	assert.Equal(t, otherID, list[1].Id)
+
+	adminList, err := newManagerDB(testCtx.DB()).queryJoinAppliesAdmin(spaceId, 0, 10, 1)
+	assert.NoError(t, err)
+	assert.Len(t, adminList, 2)
+	assert.Equal(t, rejectedID, adminList[0].Id, "管理后台列表应同样按最新申请时间排序")
+}
+
+// A4a —— refreshPendingApplyInvite 的 status=0 守卫。
+//
+// 这是并发场景里唯一真正会被踩到的分支：管理员审批会先把状态改成 1 再消耗名额，
+// 若此刻申请人重申且更新无条件执行，就会把审批中/已通过的记录打回待审批，并让已
+// 消耗的名额与记录上的邀请码脱节。HTTP 层难以稳定构造这个时序窗口，所以直接在 DB
+// 层断言守卫本身。
+func TestRefreshPendingApplyInvite_OnlyTouchesPendingRows(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-guard"
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-683-guard", InviteCode: "code-683-guard-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 待审批：允许换码
+	affected, err := f.db.refreshPendingApplyInvite(applyID, "code-683-guard-b")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected)
+
+	// 转为已通过后：更新必须落空
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+
+	affected, err = f.db.refreshPendingApplyInvite(applyID, "code-683-guard-c")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已通过的申请不得被重申覆盖")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status)
+	assert.Equal(t, "code-683-guard-b", after.InviteCode, "邀请码应停留在审批时的取值")
+
+	// 已拒绝同样不接受原地改码——重新申请走 upsert 重置整行
+	_, err = f.db.updateJoinApplyStatusRaw(applyID, 2, testutil.UID)
+	assert.NoError(t, err)
+	affected, err = f.db.refreshPendingApplyInvite(applyID, "code-683-guard-d")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已拒绝的申请不得被原地改码")
+}
+
+// A4b —— 已成为成员后再提交：申请不得被打回待审批，成员资格保持。
+// 注意此路径由 joinSpace 的成员校验短路（早于重申分支），A4a 才是守卫本身的用例。
+func TestJoinSpace_ResubmitDoesNotResetApprovedApply(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-race"
+	applicantUID := "u-683-race"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-race-a", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-race-b", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-race-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 管理员先审批通过（申请人因此已是成员）
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 申请人此时又用另一个码提交
+	w = postJoinSpace(t, s, token, "code-683-race-b")
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.already_member")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status, "已通过的申请不得被重申打回待审批")
+	assert.Equal(t, "code-683-race-a", after.InviteCode, "已通过申请的邀请码不得被覆盖")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "成员资格应保持")
+}
+
+// A5 —— 过期邀请码在审批时应报"失效"，而不是"次数上限"。
+// （用尽 → exhausted 见 TestApproveJoinApply_InviteExhaustedBlocksApproval，
+//   禁用 → invalid 见 TestApproveJoinApply_InviteDisabledBlocksApproval）
+func TestApproveJoinApply_ExpiredInviteReportsInvalid(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-expired"
+	applicantUID := "u-683-expired"
+	seedApprovalSpace(t, f, spaceId)
+
+	expired := db.Time(time.Now().Add(-time.Hour))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-expired", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1, ExpiresAt: &expired,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-expired", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+	// A6 —— 审批失败后申请必须留在待审批，申请人才有机会换码自救。
+	updated, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, updated.Status, "审批失败应回滚为待审批")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "审批失败不得加入成员")
+}
+
+// A7 —— 重复提交同一个邀请码是无变化的：既不刷新申请时间，也不重新惊动管理员。
+// 这是通知扇出的第一道约束（第二道是路由上的 SharedUIDRateLimiter）。
+func TestJoinSpace_ResubmitSameInviteIsNoOp(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-noop"
+	applicantUID := "u-683-noop"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-noop", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	w := postJoinSpace(t, s, token, "code-683-noop")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	before := readApplyCreatedAt(t, apply.Id)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	w = postJoinSpace(t, s, token, "code-683-noop")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "PENDING",
+		"同码重复提交应保持'已提交，等待审批'，该响应分支不会通知管理员")
+	assert.NotContains(t, w.Body.String(), "NEED_APPROVAL")
+
+	assert.Equal(t, before.Unix(), readApplyCreatedAt(t, apply.Id).Unix(),
+		"没有任何变化时不应刷新申请时间")
 }

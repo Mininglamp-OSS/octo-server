@@ -33,6 +33,13 @@ type spaceMembersSearchItemForTest struct {
 
 func resetSpaceUIDRateLimit(t *testing.T, ctx *config.Context) {
 	t.Helper()
+	clearUIDRateLimitBuckets(ctx)
+}
+
+// clearUIDRateLimitBuckets 清空 UID 限流桶。桶存活在 Redis 里，CleanAllTables 不会
+// 清理，跨用例累积会让后续用例意外收到 429。无 *testing.T 版本，便于在没有 t 的
+// 测试服务器构造函数里复用。
+func clearUIDRateLimitBuckets(ctx *config.Context) {
 	rdsClient := redis.NewClient(&redis.Options{
 		Addr:     ctx.GetConfig().DB.RedisAddr,
 		Password: ctx.GetConfig().DB.RedisPass,

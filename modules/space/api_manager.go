@@ -1175,21 +1175,11 @@ func (m *Manager) approveJoinApply(c *wkhttp.Context) {
 		return
 	}
 
-	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗）
-	inviteConsumed, consumeErr := m.space.consumeInviteOnApprove(apply.InviteCode)
-	if consumeErr != nil {
-		m.Error("检查邀请码使用次数失败", zap.Error(consumeErr), zap.Int64("applyID", applyID))
-		if _, rbErr := m.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			m.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return
-	}
-	if apply.InviteCode != "" && !inviteConsumed {
-		if _, rbErr := m.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			m.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
+	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗）。
+	// 与 Space 内审批、H5 auth_code 审批共用同一实现，三条审批入口行为保持一致。
+	inviteConsumed, failCode, ok := m.space.consumeInviteForApproval(apply, sp.Name)
+	if !ok {
+		httperr.ResponseErrorL(c, failCode, nil, nil)
 		return
 	}
 

@@ -1,0 +1,70 @@
+# Rules resolved for this task. Injection = inject_when.paths glob match OR
+# inject_when.touches tag present in the brief's load-bearing list (union).
+slug: space-join-apply-resubmit
+resolved_at: 2026-07-30T11:25:47+00:00
+global_tier_synced: false  # .octospec/_global/ absent (octospec-sync not run here)
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    matched_by: "touches: space, isolation, acl + paths: modules/**/*.go"
+    applied: >
+      joinSpace stays on AuthMiddleware; the re-submission branch is scoped by
+      (space_id, uid) from the authenticated login UID and the invite code's own
+      space_id — it can never move an application across Spaces. Re-submission
+      grants no membership on its own; entry still requires admin approval.
+      Approval paths keep their existing role>=1 / requireAdmin checks untouched.
+
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    matched_by: "touches: error-response, i18n, wire-contract + paths: modules/**/*.go"
+    applied: >
+      All new failure responses go through httperr.ResponseErrorL with already
+      registered codes (ErrSpaceInviteCodeExhausted, ErrSpaceInviteCodeInvalid,
+      ErrSpaceAlreadyMember, ErrSpaceQueryFailed, ErrSpaceStoreFailed). No new
+      code registered, so active.zh-CN.toml needs no edit. Precise failure reason
+      (disabled vs expired vs exhausted) goes to zap logs, not the wire.
+
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    matched_by: "touches: rate-limit + paths: modules/**/*.go"
+    applied: >
+      POST /v1/space/join moves onto a group carrying SharedUIDRateLimiter
+      (mounted after AuthMiddleware, per the rule). No hand-rolled Redis counter:
+      re-notification is contained by change-detection in application state, not
+      by a counter key. Tests hitting /join must reset ratelimit:uid:* in setup.
+
+  - id: testing
+    tier: repo
+    load_bearing: false
+    matched_by: "touches: test + paths: **/*_test.go"
+    applied: >
+      Acceptance A1-A7 in modules/space/api_test.go using
+      testutil.NewTestServer + CleanAllTables, plus explicit
+      ratelimit:uid:* reset because CleanAllTables does not clear Redis buckets.
+
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    matched_by: "paths: **"
+    applied: "English Conventional Commits; issue linked in footer and PR."
+
+rules_considered_not_applicable:
+  - id: trust-boundary
+    matched_by: "touches: wire-contract (tag union pulled it in)"
+    reason: >
+      Rule text is scoped to inbound adapters and external attacker-controlled
+      content (webhook/richtext/markdown escaping, URL destinations). This change
+      renders no external content and adds no adapter. Its *parity* principle was
+      still honoured deliberately: the invite-consumption failure path exists in
+      THREE approval entry points (api.go Space route, api.go H5 auth_code flow,
+      api_manager.go admin console) and all three are changed through one shared
+      helper rather than patching a subset.
+
+notes:
+  - "The third approval entry point (H5 auth_code flow, api.go:~1943) was not in
+     the brief's original load-bearing list; found during rule resolution and
+     folded in. Brief updated."

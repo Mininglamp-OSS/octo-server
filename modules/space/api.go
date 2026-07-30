@@ -22,6 +22,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -78,7 +79,6 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	{
 		auth.POST("/create", s.createSpace)
 		auth.GET("/my", s.mySpaces)
-		auth.POST("/join", s.joinSpace)
 
 		auth.GET("/:space_id", s.getSpace)
 		auth.PUT("/:space_id", s.updateSpace)
@@ -102,6 +102,14 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.POST("/:space_id/email-invites", s.createMemberEmailInvite)
 		auth.GET("/:space_id/email-invites", s.listMemberEmailInvites)
 		auth.DELETE("/:space_id/email-invites/:id", s.revokeMemberEmailInvite)
+	}
+
+	// 加入申请提交：一次成功的重申会给该 Space 的每个管理员各发一条私信，是一条
+	// 用户可触发的扇出路径。第一道约束是"内容真的变了才通知"（见 joinSpace），
+	// 这里补上仓库对认证端点的默认限流（挂在 AuthMiddleware 之后才能读到 uid）。
+	joinLimited := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
+	{
+		joinLimited.POST("/join", s.joinSpace)
 	}
 
 	search := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
@@ -1009,12 +1017,51 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			return
 		}
 		if pendingApply != nil {
-			c.Response(map[string]interface{}{
-				"status":   "PENDING",
-				"space_id": invitation.SpaceId,
-				"msg":      "申请已提交，请等待审批",
-			})
-			return
+			// 同一个码重复提交：没有任何变化，保持原有的"已提交，等待审批"语义。
+			// 这一分支同时是通知放大的第一道约束——只有申请内容真的变了才会重新惊动
+			// 管理员，刷屏因此需要持续拿到*不同*的有效邀请码，而邀请码只有管理员能发。
+			if pendingApply.InviteCode == req.InviteCode {
+				c.Response(map[string]interface{}{
+					"status":   "PENDING",
+					"space_id": invitation.SpaceId,
+					"msg":      "申请已提交，请等待审批",
+				})
+				return
+			}
+
+			// 换了一个有效邀请码重申：让待审批记录改用本次凭证并刷新申请时间。
+			// 此前这里直接返回 PENDING，导致申请永远绑定旧邀请码——旧码一旦用尽/被禁用/
+			// 过期，审批必然失败并回滚为待审批，而 uk_space_uid 又使申请人无法另建一条
+			// 记录，只能等管理员先拒绝（issue #683）。
+			affected, err := s.db.refreshPendingApplyInvite(pendingApply.Id, req.InviteCode)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+				return
+			}
+			if affected > 0 {
+				go s.notifyAdminsNewJoinApply(loginUID, invitation.SpaceId, space.Name, pendingApply.Id)
+
+				c.Response(map[string]interface{}{
+					"status":   "NEED_APPROVAL",
+					"space_id": invitation.SpaceId,
+					"msg":      "该空间需要管理员审批，申请已提交",
+				})
+				return
+			}
+
+			// 0 行：状态在本次读取之后被并发改动（管理员正在审批）。重新判定，
+			// 绝不能盲目覆盖——否则会把已通过的申请打回待审批。
+			latest, err := s.db.queryJoinApplyByID(pendingApply.Id)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+				return
+			}
+			if latest != nil && latest.Status == 1 {
+				// 已被通过：申请人此刻已是成员，与本函数前面的成员校验结论一致。
+				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+				return
+			}
+			// 已被拒绝或记录消失：按一次全新申请处理，走下面的 upsert。
 		}
 
 		// 创建或重置申请记录（被拒后重新申请时覆盖更新）
@@ -1560,19 +1607,9 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 	}
 
 	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗，与直接加入模式对称）
-	inviteConsumed, consumeErr := s.consumeInviteOnApprove(apply.InviteCode)
-	if consumeErr != nil {
-		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return
-	}
-	if apply.InviteCode != "" && !inviteConsumed {
-		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
+	inviteConsumed, failCode, ok := s.consumeInviteForApproval(apply, space.Name)
+	if !ok {
+		httperr.ResponseErrorL(c, failCode, nil, nil)
 		return
 	}
 
@@ -1619,6 +1656,76 @@ func (s *Space) consumeInviteOnApprove(code string) (bool, error) {
 		return false, nil
 	}
 	return s.db.incrementInviteUsedCountAtomic(code)
+}
+
+// consumeInviteForApproval 是三条审批入口共用的名额消耗步骤：Space 内审批
+// (approveJoinApply)、管理后台审批 (Manager.approveJoinApply)、以及邮件通知里的
+// H5 auth_code 审批 (joinApproveSubmit)。三处逻辑必须一致——只修其中两处会留下一条
+// 行为不同的审批面。
+//
+// 调用前申请状态应已被置为"已通过"。消耗失败时本函数负责回滚状态、按失效原因写日志、
+// 通知申请人可以换码重申（issue #683 R7），并把调用方应当返回的错误码交回去。
+//
+// 返回 (inviteConsumed, failCode, ok)：ok 为 true 时调用方继续执行加入逻辑，并在
+// 后续失败时按 inviteConsumed 决定是否退还名额；ok 为 false 时调用方只需
+// httperr.ResponseErrorL(c, failCode, nil, nil) 后返回。
+func (s *Space) consumeInviteForApproval(apply *spaceJoinApplyModel, spaceName string) (bool, codes.Code, bool) {
+	inviteConsumed, consumeErr := s.consumeInviteOnApprove(apply.InviteCode)
+	if consumeErr != nil {
+		s.Error("检查邀请码使用次数失败", zap.Error(consumeErr), zap.Int64("applyID", apply.Id))
+		s.rollbackApplyStatus(apply.Id)
+		return false, errcode.ErrSpaceQueryFailed, false
+	}
+	if apply.InviteCode != "" && !inviteConsumed {
+		s.rollbackApplyStatus(apply.Id)
+		failCode := s.classifyInviteConsumeFailure(apply.InviteCode, apply.Id)
+		// 申请人此前完全收不到任何消息，因此不知道自己需要换一个有效邀请码重申，
+		// 申请会一直卡在待审批。
+		go s.notifyApplicantInviteUnusable(apply.UID, apply.SpaceId, spaceName)
+		return false, failCode, false
+	}
+	return inviteConsumed, codes.Code{}, true
+}
+
+// rollbackApplyStatus 把申请无条件打回待审批（审批动作未能完成时使用）。
+func (s *Space) rollbackApplyStatus(applyID int64) {
+	if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+		s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+	}
+}
+
+// classifyInviteConsumeFailure 区分邀请码消耗失败的原因，返回对外错误码。
+//
+// incrementInviteUsedCountAtomic 的 WHERE 同时包含 status=1、未过期、未达 max_uses，
+// 任一不满足都只返回 false。此前三种情况一律回报"已达到使用次数上限"，与实际原因
+// 不符时会把排查引向错误方向（issue #683）。
+//
+// 这里不构成枚举面：调用方是已通过 role>=1 / requireAdmin 校验的管理员，且邀请码就
+// 记录在他正在审批的申请上——他本来就能看到这个码。精确原因（禁用 / 过期 / 用尽）
+// 仍只写日志，对外只分"用尽"与"失效"两类，沿用已注册的错误码。
+func (s *Space) classifyInviteConsumeFailure(code string, applyID int64) codes.Code {
+	invitation, err := s.db.queryInvitationByCodeUnfiltered(code)
+	if err != nil {
+		s.Error("查询邀请码失效原因失败", zap.Error(err), zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceInviteCodeExhausted
+	}
+	if invitation == nil {
+		s.Warn("审批失败：邀请码已不存在", zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	if invitation.Status != 1 {
+		s.Warn("审批失败：邀请码已被禁用", zap.Int64("applyID", applyID), zap.Int("status", invitation.Status))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	if invitation.ExpiresAt != nil && !time.Time(*invitation.ExpiresAt).After(time.Now()) {
+		s.Warn("审批失败：邀请码已过期", zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	s.Warn("审批失败：邀请码使用次数已达上限",
+		zap.Int64("applyID", applyID),
+		zap.Int("usedCount", invitation.UsedCount),
+		zap.Int("maxUses", invitation.MaxUses))
+	return errcode.ErrSpaceInviteCodeExhausted
 }
 
 // rollbackApplyAndInvite 审批加入失败时回滚申请状态，并在确实消耗过名额时归还。
@@ -1773,6 +1880,34 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 		spaceId,
 		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
 	))
+}
+
+// notifyApplicantInviteUnusable 告知申请人：审批因其申请所绑定的邀请码已失效而未能完成，
+// 需要用一个仍然有效的邀请码重新提交。
+//
+// 没有这条通知，申请人无从得知自己卡住了，joinSpace 里新增的"重申即换码"自救路径
+// 也就不会被用到，申请会一直停在待审批（issue #683 R7）。
+// 与同文件其它站内通知一致使用中文文案：IM 私信内容尚未接入 i18n（错误响应与邮件才有），
+// 这里刻意保持一致而不是单独引入一套。
+func (s *Space) notifyApplicantInviteUnusable(applicantUID, spaceId, spaceName string) {
+	content := fmt.Sprintf(
+		"你的 Space 加入申请暂时无法通过\n空间: %s\n原因: 申请使用的邀请码已失效（次数用尽、被禁用或已过期）\n请向管理员索取新的邀请链接后重新提交申请",
+		spaceName)
+
+	payload := map[string]interface{}{
+		"content": content,
+		"type":    common.Text,
+	}
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	if err := s.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applicantUID,
+		s.ctx.GetConfig().Account.SystemUID,
+		payload,
+		spaceId,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	)); err != nil {
+		s.Warn("发送邀请码失效通知失败", zap.Error(err), zap.String("applicantUID", applicantUID), zap.String("spaceId", spaceId))
+	}
 }
 
 // joinApprovePage 返回 H5 审批页面（注入 apiURL）
@@ -1940,19 +2075,9 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 			return
 		}
 
-		inviteConsumed, consumeErr := s.consumeInviteOnApprove(apply.InviteCode)
-		if consumeErr != nil {
-			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-			}
-			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-			return
-		}
-		if apply.InviteCode != "" && !inviteConsumed {
-			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-			}
-			httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
+		inviteConsumed, failCode, ok := s.consumeInviteForApproval(apply, space.Name)
+		if !ok {
+			httperr.ResponseErrorL(c, failCode, nil, nil)
 			return
 		}
 

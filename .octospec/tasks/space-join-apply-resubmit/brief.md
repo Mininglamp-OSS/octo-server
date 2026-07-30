@@ -90,8 +90,13 @@ registered, both have zh-CN translations, and octo-admin renders
 - **`error-response` / `i18n` — approval failure codes.** `approveJoinApply`
   currently collapses exhausted/disabled/expired into
   `ErrSpaceInviteCodeExhausted`. Splitting it changes the code an admin client
-  sees. Both approval paths (`api.go:1505`, `api_manager.go:1126`) must stay
-  consistent — they are two entry points to the same decision.
+  sees. **Three** approval entry points must stay consistent — Space-scoped
+  approval (`api.go:1505`), the admin console (`api_manager.go:1126`), and the
+  H5 `auth_code` flow reached from the admin notification DM
+  (`joinApproveSubmit`, `api.go:~1943`). The third was missed when this brief
+  was first drafted and found during rule resolution; all three carried a
+  byte-identical copy of the consume-fail block, so the fix extracts one shared
+  helper rather than patching a subset.
 - **Invite-slot accounting.** `incrementInviteUsedCountAtomic` /
   `decrementInviteUsedCountAtomic` (`db.go:299-335`) and the rollback helpers
   (`rollbackApplyAndInvite`, `refundInvite`) pair consumption with refunds. A
@@ -153,19 +158,32 @@ Gates: `go test ./modules/space/...`, `golangci-lint run ./...`,
 `active.zh-CN.toml` should need no edit — if the implementation proves otherwise,
 that is a signal to re-check R5's design before adding one.
 
-## Open question (needs a decision before Implement)
+## R2 amplification containment (decided)
 
-**R2 amplification containment.** Each qualifying re-submission DMs every Space
-admin. Two layers are available:
+Each qualifying re-submission DMs every Space admin. Both layers are in scope:
 
-1. **Change-detection (in scope, no decision needed).** Only update and notify
-   when the submitted code actually differs from the stored one. Re-submitting
-   the same code stays a no-op `PENDING` — this is A7. It makes spamming require
-   a supply of *distinct* valid codes, which only admins can mint.
-2. **Mounting `SharedUIDRateLimiter` on `POST /v1/space/join` (needs your
-   call).** It is the repo default for authenticated endpoints and this route
-   lacks it, so this arguably fixes a pre-existing gap. But it adds 429s to a
-   route that has never returned them, and existing tests hitting `/join`
-   repeatedly would need `ratelimit:uid:*` reset in setup. I lean toward
-   including it; say the word if you would rather keep this change surgical and
-   file the limiter separately.
+1. **Change-detection.** Only update and notify when the submitted code actually
+   differs from the stored one. Re-submitting the same code stays a no-op
+   `PENDING` (A7), so spamming requires a supply of *distinct* valid codes,
+   which only admins can mint.
+2. **`SharedUIDRateLimiter` on `POST /v1/space/join`.** Approved by the
+   maintainer. The route sat on the plain auth group with no UID limiter, so
+   this also closes a pre-existing gap against the repo's rate-limit rule. Tests
+   reset `ratelimit:uid:*` in both server constructors (`setup` and
+   `newRenderedTestServer`) since `CleanAllTables` does not clear Redis.
+
+## Deviations from this brief during Implement
+
+- **Third approval entry point** (H5 `auth_code`) folded into the load-bearing
+  list — see above.
+- **A4 split.** The originally specified A4 (re-submit against a non-pending
+  row) turned out to be short-circuited by `joinSpace`'s existing membership
+  check, so it never reached the `status=0` guard it was meant to cover. It is
+  now A4b (outcome-level), plus **A4a**, a deterministic DB-level test of
+  `refreshPendingApplyInvite` against approved and rejected rows.
+- **A6 is partially covered.** The applicant notification's *delivery* is not
+  asserted: the space test harness has no message-capture seam and adding one
+  would mean a production-code seam purely for tests. A6 asserts the state
+  contract the notification is attached to (application stays pending,
+  classified code returned, applicant not made a member). The DM itself is
+  verified by review only.
