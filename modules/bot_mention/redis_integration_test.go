@@ -29,6 +29,8 @@ import (
 
 const botMentionIntegrationExpire = 2 * time.Minute
 
+var expectSystemSettingsLoadOnce sync.Once
+
 func TestNewRejectsInternalTokenCapabilityCollisions(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -81,7 +83,7 @@ func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
 
 	expectActiveUserBot(dbMock, botID)
 	expectNewRobotEventSequence(dbMock)
-	expectSystemSettingsLoad(dbMock)
+	expectSystemSettingsLoadOnce.Do(func() { expectSystemSettingsLoad(dbMock) })
 
 	module := &BotMention{
 		robots:        robot.NewService(ctx),
