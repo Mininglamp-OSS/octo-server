@@ -1984,12 +1984,10 @@ func (g *Group) notifyBotJoinedGroup(botMembers []*user.Model, groupNo, operator
 			g.Error("推送bot_joined_group事件失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 			continue
 		}
-		// 同其它入队点：ZADD 成功后摇铃唤醒 /v1/bot/events long-poll。
-		// bot_joined_group 低频且不敏感于时延，但保持「每个写入队列的站点都摇铃」
-		// 这条不变量，才不会再出现 PR#685 那种「漏掉某个生产者」的漂移。
-		if err := botevent.Ring(botevent.RingClient(g.ctx.GetConfig()), robotID); err != nil {
-			g.Warn("摇铃唤醒 bot event long-poll 失败", zap.Error(err), zap.String("robotID", robotID))
-		}
+		// 同其它入队点：ZADD 成功后通知 /v1/bot/events long-poll。bot_joined_group
+		// 低频且不敏感于时延，但「每个写入队列的站点都通知」这条不变量必须无例外
+		// ——它由 pkg/botevent 的源码守卫强制，不靠本注释。
+		botevent.Notify(g.ctx.GetConfig(), robotID)
 		g.Info("已推送bot_joined_group事件", zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 	}
 }

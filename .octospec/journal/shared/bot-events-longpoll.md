@@ -169,6 +169,61 @@ they advance. Threading the entry page into `waitForEvents` is what closes the
 first iteration too: a backlog that was already in the queue when the request
 arrived will never get a *new* bell, so blocking for one first is pure latency.
 
+## The producer side, and why four rounds missed it
+
+Rounds 1–4 hardened the consumer loop until its termination was an invariant with
+every exit checked against it. Round 5's one blocking finding was on the
+**producer** side, which had received a ring call and a `Warn` in round 1 and no
+tail-latency analysis since. The effort had concentrated where the findings were.
+
+The defect: `botevent.Ring` was a blocking network call inline in
+`saveRobotMessage`, and that function does not run on a goroutine of its own
+budget. `modules/robot`'s listener does `msgSem <- struct{}{}` — a **blocking
+send on the listener goroutine itself** — before spawning the worker, capacity
+100. So ring latency became held slots, and 100 held slots stop bot message
+fan-out **process-wide, for every bot**, including bots that never long-poll.
+
+The ring's tail was bounded by nothing in the change: `ringPoolSize = 10` against
+a path admitting 100 concurrent callers (a 10:1 contention ratio copied from an
+unrelated convention), and go-redis defaults of 5s dial / 3s read / 4s pool
+timeout with one retry — up to ~10s per ring against an unreachable Redis.
+
+Three things made it worth a redesign rather than a timeout patch:
+
+1. **This repo had already rejected the same shape, with the same argument.**
+   `modules/bot_api/auth.go` runs its registry warm-up as `go reg.Warm(...)`
+   because inline "would block every DB-fallback auth on a Redis write — and when
+   Redis is degraded (the exact case driving the fallback), that adds the
+   client's write-timeout to each request."
+2. **The cost was entirely one-sided.** `wait` is opt-in and no shipped client
+   sends it, so every deployment paid the new per-message tail and none collected
+   the latency benefit.
+3. **The justification was a happy-path number.** 69.6µs on a loopback Redis is
+   the right measurement for the Lua rewrite and says nothing about the tail —
+   and the tail is what `msgSem` converts into a stall.
+
+The fix changes the shape: producers call `Notify`, which does no I/O on their
+goroutine. Three properties make that safe rather than merely faster:
+
+- **Coalescing per bot is the natural shape, not an optimisation.** `LTRIM 0 0`
+  keeps the bell at one element, so a second pending ring for a bot would push
+  the same token onto the same list — it is *indistinguishable* from the first.
+  Dedup therefore bounds the queue by distinct bots rather than message rate: a
+  burst of 10k messages to 50 bots produces at most 50 queued rings.
+- **Drop-on-full is the correct degradation.** The bell is a hint, so a lost ring
+  costs a waiter one chunk; blocking a producer costs delivery for every bot. The
+  drop is counted and logged, rate-limited so a Redis incident is not answered
+  with a log flood — the same failure shape this change keeps producing.
+- **The pending mark clears before the ring, not after.** A message enqueued
+  while a ring is in flight must be able to schedule its own: the in-flight ring
+  may have pushed its token before that ZADD landed. One extra ring costs a
+  wasted wake-up; the other direction costs a chunk.
+
+`ringPoolSize` is now `ringWorkers + 2` — derived from the only thing that uses
+the client concurrently, so a worker never queues for a connection and
+`PoolTimeout` cannot enter the ring's latency. Timeouts dropped to 500ms dial /
+200ms read / 100ms pool with no retries.
+
 ## Known bounds (deliberate, recorded rather than hidden)
 
 - `register.Module` has no shutdown hook and `main.go` does not gracefully stop
@@ -317,11 +372,43 @@ stronger than the code**):
   passed for the incidental reason while appearing to test the stated one. Ids
   swapped, so it documents the real boundary.
 
+Round 6 (the producer redesign above, plus the claims around it):
+
+- `MaxRetries = 0` on the wait client. go-redis does not retry a blocking
+  command's *read timeout*, but it does retry `io.EOF`, `ERR max number of
+  clients reached`, `LOADING`, `READONLY` and `CLUSTERDOWN` — so a failover late
+  in a chunk ran a second full BLPOP inside one call, adding roughly a chunk
+  beyond the documented worst case and eating a third of the margin against a
+  60s proxy idle timeout. Removed rather than documented; the chunk-paced
+  re-read already is the retry.
+- The cursor's stated invariant was **equality** (`event_id` == score). The one
+  it actually needs is **uniqueness**, and that is not guaranteed: `GenSeq` is a
+  DB-backed block allocator writing an absolute value from process-local state
+  under a process-local mutex, so two replicas racing on a block can hand out the
+  same id. Two members sharing a score means the second is never delivered.
+  Pre-existing and out of scope, but this is the change that promotes the cursor
+  to a safety property, so the property now names uniqueness and records that it
+  is unverified.
+- The read-error exit answers instantly while a BLPOP error pays out its chunk.
+  Kept, and now justified with evidence rather than left implicit: the companion
+  plugin backs off exponentially on an `error` outcome and not at all on `empty`
+  (`src/events-poll.ts`), which is exactly why an instant empty amplifies load
+  and an instant error does not.
+- `ackFilteredEvent` moved from a rebindable package-level var onto `BotAPI`. The
+  seam is worth keeping — it is the only thing that exercises reads-succeed /
+  writes-fail — but as a global it would become a data race the moment this
+  package uses `t.Parallel()`.
+- `brief.md`'s Out-of-scope line still said "don't self-build an `rd.Client`"
+  while the Goal's decision table and the maintainer's finalised decision both
+  require exactly that. Third occurrence of a written premise outliving the code
+  in this one document.
+
 Left as follow-ups by agreement rather than fixed: a per-bot dimension on the
-hold-off budget, an optional ceiling on consecutive draining re-reads, and the
-pre-existing `GenSeq` block-allocation ordering problem (`event_id` order ≠
-enqueue order, cross-replica and intra-process) — that last one needs a design,
-not a patch to this loop.
+hold-off budget, an optional ceiling on consecutive draining re-reads, batching
+the per-event auto-ACK round trips, and the pre-existing `GenSeq` allocator
+problem — both the ordering half (`event_id` order ≠ enqueue order) and the
+collision half (P2-3 above). That last one needs a design, not a patch to this
+loop, and it is worth a maintainer's attention independently of this change.
 
 ## Out of scope
 

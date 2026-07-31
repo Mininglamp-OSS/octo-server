@@ -254,7 +254,17 @@ func sharedEventWaitRedis(cfg *config.Config) *rd.Client {
 	eventWaitRedisOnce.Do(func() {
 		holds := maxEventHolds()
 		eventWaitRedis = octoredis.NewInstrumentedClient(cfg, func(o *rd.Options) {
-			o.MaxRetries = 1
+			// No retries. go-redis does not retry a *read timeout* on a blocking
+			// command (defaultProcess passes `cmd.readTimeout() == nil` as the
+			// retryTimeout flag), but it does retry io.EOF, non-timeout
+			// net.Errors, `ERR max number of clients reached`, LOADING, READONLY
+			// and CLUSTERDOWN. A failover that closes the connection late in a
+			// chunk would therefore run a second full BLPOP inside the same
+			// call, adding roughly one chunk beyond the documented worst case
+			// and eating a third of the margin against a proxy idle timeout.
+			// The chunk-paced re-read already is the retry, so this one only
+			// costs latency.
+			o.MaxRetries = 0
 			// Sized to the hold cap: a full house of waiters must not have to
 			// queue for a connection, and must not be able to borrow one from
 			// anywhere else.
@@ -474,6 +484,15 @@ func (ba *BotAPI) waitForEvents(
 
 		page, err := ba.readEventPage(robotID, botKind, cursor, limit)
 		if err != nil {
+			// Unlike a BLPOP failure, this exits immediately rather than paying
+			// out the chunk. The asymmetry is deliberate: the sorted set is the
+			// authority, so a read failure is a real error the caller must see,
+			// and — unlike an empty batch — the client does back off on it. The
+			// companion plugin's poller applies exponential backoff capped at
+			// 30s for an `error` outcome and *no* backoff for `empty`
+			// (openclaw-channel-octo `src/events-poll.ts`), which is exactly why
+			// an instant empty answer amplifies load and an instant error does
+			// not. Pacing this exit would delay a real error for no gain.
 			return nil, err
 		}
 		if len(page.visible) > 0 {

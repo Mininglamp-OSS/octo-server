@@ -28,8 +28,24 @@ source: self
 交互卡体感的唯一瓶颈，D5 把它列为显式 P3 open item（P3-2）。
 
 **唤醒机制（本任务的核心设计决策）**：在**每一个**写 `robotEvent:{robotID}` 的入队点
-额外写一条**门铃**——单条 Lua `EVAL` 里做 `LPUSH` + `LTRIM 0 0` + `EXPIRE`（一次往返，
+额外写一条**门铃**——单条 Lua `EVALSHA` 里做 `LPUSH` + `LTRIM 0 0` + `EXPIRE`（一次往返，
 见下文成本说明）；long-poll 侧用 `BLPOP(bellKey, chunk)` 阻塞等待。
+
+**摇铃必须是异步的（第六轮定稿，PR#685 review P1）**：生产者调 `botevent.Notify`，
+它把摇铃交给**有界 worker 池**后立即返回，**不在生产者的 goroutine 上做任何 I/O**。
+理由不是「异步更快」，而是同步会把一个网络调用塞进 `msgSem`：`modules/robot` 的消息
+listener 在 **listener goroutine 自身**上做阻塞的 `msgSem <- struct{}{}`（容量 100），
+所以任何拖慢 `saveRobotMessage` 的东西都会更久占住槽位，**100 个占满后全进程所有 bot 的
+消息扇出停摆**——包括从不 long-poll 的 bot。而摇铃的尾延迟由一个独立的、可能是冷的小
+Redis 池决定，正是把「有界信号量」变成「全面停摆」的那种输入。本仓早已因同样理由否决过
+同一形状：`modules/bot_api/auth.go` 的 registry 预热走 `go reg.Warm(...)`，注释写得很清楚
+——内联执行「会让每个 DB fallback 鉴权都阻塞在一次 Redis 写上，而 Redis 降级时（正是触发
+fallback 的那种情况）等于给每个请求加上客户端写超时」。
+
+配套的三条：**按 robotID 合并**（`LTRIM 0 0` 让同一 bot 的 N 次摇铃等价于 1 次，所以队列由
+**bot 数**而非消息速率定界）；**队列满则丢弃并计数**（丢铃只花 waiter ≤1 个 chunk，阻塞
+生产者却是全进程代价）；**ring client 用亚秒超时 + `MaxRetries = 0`**，且 `ringPoolSize`
+由 `ringWorkers` 推导而非抄别处的约定。
 
 写入点共 **5 个**，不是 2 个（本文最初写错，见 Background）：`enqueueBotEventGeneric`、
 `enqueueBotTypedEventGeneric`（`card_action`）、`saveRobotMessage`（普通 DM/@提及，量最大）、
@@ -194,8 +210,13 @@ source: self
   门铃是**旁路**新增 key，与 `robotEvent:{robotID}` ZSet 解耦。
 - **不做真 push / WebSocket 通道**（D5 里 `(b)` 那条路）。本任务只做 D5 明确点名的
   「long-polling `getEvents`」这一半。
-- **不引入 Redis pub/sub**、不自建 `rd.Client`。若并发 hold 撑不住主池，升级路径已在 Goal
-  的表格里记录，另开任务。
+- **不引入 Redis pub/sub**。若并发 hold 撑不住，升级路径已在 Goal 的表格里记录，另开任务。
+
+  > 本条原文还写着「**不自建 `rd.Client`**」，与 Goal 的决策表（`:44`/`:48`）和「已定稿」
+  > 第 3 条**直接矛盾**——后两者恰恰要求自建：consumer 侧因为 `BLPop` 要独立池，producer 侧
+  > 因为 `redis.Conn` 不暴露 `Eval`。实现建了两个 client，以更晚更具体的 maintainer 决议为准，
+  > **代码在范围内，是这句话过期了**（PR#685 第五轮 review P2-1）。这是同一份文档里第三次
+  > 出现「写下的前提活得比代码久」，而第四轮的存在意义正是修这一类问题。
 - **不动 `modules/robot` 的 `inlineQuery` 长轮询**（进程内 channel 形状保持原样）。
 - **不新增 errcode、不改 i18n locales、不新增/改端点、无 DB/迁移。**
 - **不加 metrics**（G1 ingress 仪表是独立任务；本任务若顺手需要一两个计数器，
@@ -313,12 +334,22 @@ hold > 10s，现存插件会每 10 秒 abort 一次并打一条 error 日志**�
    257 个请求就能占满所有停顿槽位，别的 bot 的被拒 hold 于是退回立即返回——即这条停顿本来
    要防的形状，只是受害者换了人。有界、能正常释放、下界是既有的 `wait=0` 形状，所以是净改进
    上的残留而非回归。修法很便宜（`eventHoldPerBot` 那套照抄一份），留作 follow-up。
-7. **`event_id` 与 ZSet score 相等这条依赖没有任何校验。** 游标读的是 payload 里的
-   `event_id`，而读的边界用的是 **score**；五个生产点都写 `ZAdd(key, float64(seq), {EventID: seq})`
-   所以今天恒等，`GenSeq` 也在 float64 精确整数范围内。但将来若有写入方改成按时间戳打分而
-   另存 `event_id`，游标会**静默跳过**未投递的成员，自动 ACK 的 `ZRemRangeByScore(key, id, id)`
-   也会打错成员。第五轮已把这条不变量写进 `eventPage` 的文档注释；彻底消除需要
-   `ZRangeByScoreWithScores`（octo-lib 未暴露，见第 5 条）。
+7. **游标真正需要的是 score「唯一」，而不只是「与 `event_id` 相等」——后者今天成立，
+   前者不保证**（第五轮写成相等、第六轮更正，PR#685 review P2-3）。
+   - **相等性**：游标读的是 payload 里的 `event_id`，读的边界用的是 **score**；五个生产点
+     都写 `ZAdd(key, float64(seq), {EventID: seq})` 所以今天恒等，`GenSeq` 也在 float64
+     精确整数范围内。将来若有写入方按时间戳打分而另存 `event_id`，游标会**静默跳过**未投递
+     成员，自动 ACK 的 `ZRemRangeByScore(key, id, id)` 也会打错成员。
+   - **唯一性（更强、且今天无保证）**：排他游标 `Min: "(cursor"` 只有在 score **严格唯一**
+     时才无损。`GenSeq`（octo-lib `config/seq.go`）是 DB 支撑的**块分配器**：读 `min_seq`
+     后写回一个由进程本地状态算出的**绝对值**，只有**进程内** mutex 保护。两个副本的取块
+     若发生竞争（并发冷启动、并发扩块）可以发出**相同的 id**。一旦两个成员共享 score 42，
+     停在第一个上的那一页会把游标推到 42，**第二个永远投递不出去**；自动 ACK 与 `eventAck`
+     的 `ZRemRangeByScore(key, 42, 42)` 也会把两个一起删掉。
+   - 这条风险**是 main 上既有的**（排他游标、自动 ACK、`eventAck` 都早于 long-poll），
+     本任务不修；但本任务把游标提升成了一条明示的安全性质，所以性质必须写对：
+     **唯一性是假设，且当前未经校验**。`ZRangeByScoreWithScores` 只能消除相等性假设、
+     消不掉唯一性；真要关掉它需要 Redis 侧分配器或游标之下的重投窗口，属独立设计。
 
 ## 已定稿（2026-07-31，maintainer 拍板）
 

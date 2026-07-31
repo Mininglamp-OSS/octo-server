@@ -130,7 +130,7 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 	if len(filteredIDs) > 0 {
 		key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
 		for _, id := range filteredIDs {
-			if err := ackFilteredEvent(ba, key, id); err != nil {
+			if err := ba.ackEvent(key, id); err != nil {
 				ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
 			}
 		}
@@ -138,17 +138,25 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 	return filtered
 }
 
-// ackFilteredEvent removes one auto-ACK'd event from the queue.
+// ackEvent removes one auto-ACK'd event from the queue.
 //
-// A package-level var purely so a test can inject the state this endpoint's
-// progress guarantee is built to survive: a Redis whose **reads succeed while
-// writes fail** (MISCONF after a failed snapshot, a READONLY replica, a
-// write-denying ACL). That asymmetry cannot be produced against a healthy Redis
-// — re-seeding the events afterwards looks the same to the eye but not to the
-// code, since both ZREMs still succeeded — and PR#685's round-3 blocker was
-// precisely a loop whose progress silently depended on this write. Arguing the
-// property structurally is what let it ship; the seam makes it exercisable.
-var ackFilteredEvent = func(ba *BotAPI, key string, eventID string) error {
+// It routes through the optional ackFilteredEvent field rather than calling
+// Redis directly so a test can inject the state this endpoint's progress
+// guarantee is built to survive: a Redis whose **reads succeed while writes
+// fail** (MISCONF after a failed snapshot, a READONLY replica, a write-denying
+// ACL). That asymmetry cannot be produced against a healthy Redis — re-seeding
+// the events afterwards looks the same to the eye but not to the code, since
+// both ZREMs still succeeded — and PR#685's round-3 blocker was precisely a loop
+// whose progress silently depended on this write.
+//
+// The seam is a struct field, not a package-level var: a rebindable global would
+// become a data race the moment this package uses t.Parallel(). Nil falls back
+// to the real write, matching cardSeqCASWrite's handling of BotAPI literals in
+// existing tests.
+func (ba *BotAPI) ackEvent(key string, eventID string) error {
+	if ba.ackFilteredEvent != nil {
+		return ba.ackFilteredEvent(key, eventID)
+	}
 	return ba.ctx.GetRedisConn().ZRemRangeByScore(key, eventID, eventID)
 }
 
@@ -161,20 +169,35 @@ var ackFilteredEvent = func(ba *BotAPI, key string, eventID string) error {
 // long-poll loop's forward progress structural: it is derived from the read the
 // loop just performed, not from a write whose error is only logged.
 //
-// # The one assumption underneath the cursor
+// # The two assumptions underneath the cursor
 //
-// The cursor is a payload `event_id` (`getEventsResult` decodes it), while the
-// read that consumes it is bounded by the sorted-set **score** (`Min: "(cursor"`).
-// The two are the same number by construction at all five producers — each does
-// `ZAdd(key, float64(seq), payload{EventID: seq})` — and `GenSeq` returns small
-// monotonic integers well inside float64's exact range.
+// **Equality.** The cursor is a payload `event_id` (`getEventsResult` decodes
+// it), while the read that consumes it is bounded by the sorted-set **score**
+// (`Min: "(cursor"`). The two are the same number by construction at all five
+// producers — each does `ZAdd(key, float64(seq), payload{EventID: seq})` — and
+// `GenSeq` returns small integers well inside float64's exact range. A future
+// writer that scored by, say, timestamp while keeping a separate `event_id`
+// would break this silently: the cursor would jump past members the caller never
+// received. The same equality is what makes the auto-ACK's
+// `ZRemRangeByScore(key, id, id)` address the member it means to.
 //
-// A future writer that scored by, say, timestamp while keeping a separate
-// `event_id` would break this silently: the cursor would jump past members the
-// caller never received. The same equality is what makes the auto-ACK's
-// `ZRemRangeByScore(key, id, id)` address the member it means to. Reading with
-// `ZRangeByScoreWithScores` would remove the assumption, but octo-lib's
-// `redis.Conn` does not expose it (see the brief's known-deviations section).
+// **Uniqueness, which is the stronger one and is NOT currently guaranteed.**
+// Exclusive `Min: "(cursor"` pagination is lossless only if scores are strictly
+// unique. `GenSeq` (octo-lib `config/seq.go`) is a DB-backed *block* allocator:
+// it reads `min_seq` and writes back an absolute value computed from
+// process-local state, guarded only by a process-local mutex. Two replicas whose
+// blocks race — a concurrent cold start, or a concurrent extend — can hand out
+// the same id. Two members sharing score 42 means a page ending on the first
+// advances the cursor to 42 and the second is **never delivered**; the auto-ACK
+// and `eventAck` likewise remove both.
+//
+// That risk is pre-existing and unchanged here — the exclusive cursor, the
+// auto-ACK and `eventAck` all predate the long poll — but this is the code that
+// promotes the cursor to a stated safety property, so the property is stated
+// honestly: **uniqueness is assumed and unverified**. Reading with
+// `ZRangeByScoreWithScores` would remove the equality assumption but not this
+// one; closing it needs a Redis-side allocator or a re-delivery window below the
+// cursor, which is its own change (PR#685 review, yujiawei P2-3).
 type eventPage struct {
 	// visible is what may be returned to the caller.
 	visible []*eventResp

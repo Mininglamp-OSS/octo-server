@@ -31,7 +31,12 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	// "robotEvent:%s" literal.
 	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s")`)
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
-	ringCall := regexp.MustCompile(`botevent\.Ring\(`)
+	// Notify is the producer-facing entry point; Ring is the synchronous
+	// primitive it wraps. Both count: a writer that calls Ring directly is
+	// unusual (it puts a Redis round trip on the producer's goroutine — see
+	// pkg/botevent/notify.go) but it does ring the bell, which is what this
+	// guard is about.
+	ringCall := regexp.MustCompile(`botevent\.(Notify|Ring)\(`)
 
 	// How far after the ZADD the ring may appear. Generous enough for an error
 	// branch plus a comment block, tight enough that a ring belonging to an
@@ -119,13 +124,14 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 // a scanner that silently matches nothing would pass forever and protect nothing.
 func TestGuardWouldCatchAnUnrungWriter(t *testing.T) {
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
-	ringCall := regexp.MustCompile(`botevent\.Ring\(`)
+	ringCall := regexp.MustCompile(`botevent\.(Notify|Ring)\(`)
 
 	unrung := []string{
 		`key := fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID)`,
 		`err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), payload)`,
 		`if err != nil { return }`,
 	}
+	notified := append(append([]string{}, unrung...), `botevent.Notify(rb.ctx.GetConfig(), robotID)`)
 	rung := append(append([]string{}, unrung...), `_ = botevent.Ring(rb.ctx.GetRedisConn(), robotID)`)
 
 	if !zaddCall.MatchString(strings.Join(unrung, "\n")) {
@@ -134,8 +140,13 @@ func TestGuardWouldCatchAnUnrungWriter(t *testing.T) {
 	if ringCall.MatchString(strings.Join(unrung, "\n")) {
 		t.Fatal("the ring pattern matched a writer that does not ring")
 	}
+	// Both spellings must match, or renaming the producer entry point would
+	// silently disarm the guard rather than fail it.
+	if !ringCall.MatchString(strings.Join(notified, "\n")) {
+		t.Fatal("the ring pattern does not match a writer that calls Notify")
+	}
 	if !ringCall.MatchString(strings.Join(rung, "\n")) {
-		t.Fatal("the ring pattern does not match a writer that does ring")
+		t.Fatal("the ring pattern does not match a writer that calls Ring")
 	}
 }
 

@@ -52,6 +52,12 @@ type BotAPI struct {
 	// AFTER dispatchFanout succeeds so we only enqueue events that
 	// WuKongIM actually accepted.
 	robotService robot.IService
+	// ackFilteredEvent overrides the auto-ACK write in filterAppBotEvents.
+	// Production leaves it nil (see BotAPI.ackEvent); tests set it to inject a
+	// Redis whose reads succeed while writes fail, which is the state the
+	// long-poll loop's forward-progress guarantee exists to survive and which a
+	// healthy Redis cannot be talked into producing.
+	ackFilteredEvent func(key string, eventID string) error
 	// cardRevisions is the D10 card revision history store (shared table
 	// octo_message_card_revision; written here on bot card edits + clear).
 	cardRevisions *cardrevision.Store

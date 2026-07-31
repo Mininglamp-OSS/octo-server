@@ -268,6 +268,13 @@ func TestBotEventsReleasesHoldOnClientDisconnect(t *testing.T) {
 
 // TestEnqueueChokepointRingsTheDoorbell proves the producer wiring, not just the
 // helper: going through the real robot service must leave a ringable bell.
+//
+// The assertion is "eventually", and that is the contract rather than test
+// slack. Producers call botevent.Notify, which hands the ring to a bounded
+// worker pool and returns without touching Redis — because the highest-volume
+// producer runs inside a msgSem slot whose exhaustion stalls bot fan-out
+// process-wide (see pkg/botevent/notify.go). Asserting synchronously would be
+// asserting the shape this change exists to remove.
 func TestEnqueueChokepointRingsTheDoorbell(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
@@ -278,10 +285,14 @@ func TestEnqueueChokepointRingsTheDoorbell(t *testing.T) {
 	_, err := svc.EnqueueBotTypedEvent(lpBotID, "card_action", map[string]interface{}{"action_id": "approve"})
 	assert.NoError(t, err)
 
-	// A waiter blocked on BLPOP would have been woken; assert the token exists.
-	n, err := ctx.GetRedisConn().Llen(botevent.BellKey(lpBotID))
-	assert.NoError(t, err)
-	assert.Equal(t, int64(1), n, "the typed-event chokepoint must ring the doorbell")
+	// A waiter blocked on BLPOP would have been woken; assert the token appears.
+	// The bound is generous against CI noise but far below the 5s chunk the
+	// consumer falls back to, so a ring that took this long would still be
+	// delivering its latency benefit.
+	assert.Eventually(t, func() bool {
+		n, err := ctx.GetRedisConn().Llen(botevent.BellKey(lpBotID))
+		return err == nil && n == 1
+	}, 2*time.Second, 10*time.Millisecond, "the typed-event chokepoint must ring the doorbell")
 }
 
 // TestDoorbellStaysBoundedWithTTL: nobody may be long-polling for hours, so an
@@ -508,16 +519,14 @@ func TestWaitForEventsDrainsAFilteredBacklogWithoutBlocking(t *testing.T) {
 		"a backlog already in the queue must not wait out a chunk on the doorbell")
 }
 
-// failAutoACK makes every auto-ACK write fail while leaving reads untouched,
-// which is the Redis state the loop's progress guarantee exists to survive and
-// the one a healthy Redis cannot be talked into producing.
-func failAutoACK(t *testing.T) {
-	t.Helper()
-	prev := ackFilteredEvent
-	ackFilteredEvent = func(*BotAPI, string, string) error {
+// failAutoACK makes every auto-ACK write on this BotAPI fail while leaving reads
+// untouched, which is the Redis state the loop's progress guarantee exists to
+// survive and the one a healthy Redis cannot be talked into producing. Scoped to
+// the instance rather than the package, so it cannot leak into another test.
+func failAutoACK(ba *BotAPI) {
+	ba.ackFilteredEvent = func(string, string) error {
 		return errors.New("MISCONF Redis is configured to save RDB snapshots but is currently unable to persist")
 	}
-	t.Cleanup(func() { ackFilteredEvent = prev })
 }
 
 // TestWaitForEventsMakesProgressWhenTheAutoACKFails is the real regression test
@@ -536,8 +545,8 @@ func TestWaitForEventsMakesProgressWhenTheAutoACKFails(t *testing.T) {
 	clearLongPollKeys(t, ctx)
 	defer clearLongPollKeys(t, ctx)
 	resetEventHoldState(t, 4)
-	failAutoACK(t)
 	ba := newWaitTestAPI(ctx)
+	failAutoACK(ba)
 
 	const limit = int64(5)
 	for id := int64(1); id <= limit; id++ {

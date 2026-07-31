@@ -69,6 +69,36 @@ change-log convention (§7). Newest first.
   write-fails state it named. It is now a real one via an `ackFilteredEvent`
   seam, and the anti-spin test's slack tightened from `+3` to `+1` so the entry
   gap fails it (3 reads where 2 suffice).
+- **Review round 6 — the producer side.** Four rounds of hardening had all
+  concentrated on the consumer loop; the one blocking finding this round was on
+  the producer path, which had received a ring call in round 1 and no
+  tail-latency analysis since. `botevent.Ring` was a **synchronous** network call
+  inline in `saveRobotMessage`, which runs inside a `msgSem` slot the message
+  listener acquires with a *blocking* send on its own goroutine (capacity 100) —
+  so ring latency became held slots, and 100 held slots stop bot message fan-out
+  process-wide, for every bot, including bots that never long-poll. The tail was
+  bounded by nothing: a 10-connection pool against a path admitting 100
+  concurrent callers, plus go-redis defaults of 5s dial / 3s read / 4s pool with
+  one retry. Not patched with tighter timeouts — the shape changed. Producers now
+  call `botevent.Notify`, which does **no I/O on their goroutine**: rings are
+  coalesced per bot (`LTRIM 0 0` makes N rings for one bot indistinguishable from
+  one, so the queue is bounded by distinct bots rather than message rate), handed
+  to a bounded worker pool, and dropped-with-a-counter when saturated — losing a
+  hint costs a waiter one chunk, blocking a producer costs delivery for everyone.
+  `ringPoolSize` is now derived from `ringWorkers` rather than copied from an
+  unrelated convention, with sub-second timeouts and no retries. The repo had
+  already rejected the synchronous shape for the same reason in
+  `modules/bot_api/auth.go`'s fire-and-forget registry warm-up.
+  Also this round: `MaxRetries = 0` on the wait client (a retried BLPOP added
+  roughly a chunk beyond the documented worst case); the cursor's stated
+  invariant corrected from score **equality** to score **uniqueness**, which
+  `GenSeq`'s block allocator does not guarantee across replicas and which would
+  silently drop an event — recorded as assumed-and-unverified rather than
+  claimed; the read-error exit's asymmetry justified with the client's actual
+  backoff behaviour instead of left implicit; `ackFilteredEvent` moved off a
+  mutable package global onto `BotAPI`; and `brief.md`'s Out-of-scope line, which
+  still forbade self-building an `rd.Client` while the finalised decision
+  required it.
 - Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared journal
   `.octospec/journal/shared/bot-events-longpoll.md`; learning candidates
   `.octospec/learnings/pending/bot-events-longpoll.md` (lower-bound assertions for

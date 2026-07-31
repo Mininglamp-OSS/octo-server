@@ -40,6 +40,23 @@ doorbell (`robotEventBell:{robotID}`) — one `EVALSHA` doing
 `LPUSH` + `LTRIM 0 0` + `EXPIRE`. The waiter blocks on `BLPOP`, so the blocking
 happens inside Redis and works across replicas.
 
+**The ring is asynchronous.** Producers call `botevent.Notify`, which hands the
+ring to a bounded worker pool and returns without touching Redis. This is not an
+optimisation: the highest-volume producer runs inside a semaphore (capacity 100)
+that the message listener acquires with a *blocking* send on its own goroutine,
+so ring latency would become held slots, and 100 held slots stop bot message
+fan-out **process-wide, for every bot** — including bots that never long-poll.
+
+Two consequences worth knowing operationally:
+
+- Rings are **coalesced per bot**. `LTRIM 0 0` keeps the bell at one element, so
+  N rings for one bot are indistinguishable from one. The pending queue is
+  therefore bounded by the number of *distinct bots* receiving traffic, not by
+  message rate.
+- Rings are **dropped when the queue is full** (1024 pending bots), with a
+  rate-limited `Warn`. A dropped ring costs a waiter at most one chunk of
+  latency, never an event.
+
 The doorbell is a **hint, never the event**. Every wake-up re-reads the
 authoritative sorted set, so a bell that was lost, stolen by a waiter on another
 replica, or left over from an already-consumed event costs at most one wasted
@@ -69,7 +86,12 @@ Each replica opens **three** Redis pools:
 |---|---|---|
 | shared (`ctx.GetRedisConn()`) | go-redis default `10 × NumCPU` | everything else in the process |
 | wait (`modules/bot_api`) | `OCTO_BOT_EVENTS_MAX_HOLDS + 4` (default **68**) | `BLPOP` pins a connection for the whole hold, so holds must not park on the shared pool |
-| ring (`pkg/botevent`) | **10** | a ring is one `EVALSHA` and must never queue behind a parked hold |
+| ring (`pkg/botevent`) | `ringWorkers + 2` (**10**) | derived from the only thing that uses it concurrently, so a worker never waits for a connection and `PoolTimeout` cannot enter the ring's latency |
+
+The ring client runs with deliberately tight timeouts — 500ms dial, 200ms
+read/write, 100ms pool, and **no retries**. A bell is a hint: a Redis that cannot
+answer one `EVALSHA` in 200ms is in trouble, and dropping the bell then costs a
+waiter at most one chunk, which is strictly cheaper than making producers wait.
 
 At the default cap that is **78 connections per replica** before the shared pool.
 Check this against Redis `maxclients` at the planned replica count — a hold cap
@@ -109,6 +131,15 @@ Refusing to hold is never an error. Three degradations, all fail-open:
   60s idle timeout common to reverse proxies — but the margin is 15s, not 29s.
   If your proxy's idle timeout is shorter, lower the cap; there is no contract
   impact.
+
+  A third term used to exist and was removed rather than documented: with
+  `MaxRetries = 1` the wait client could run a *second* full BLPOP inside one
+  call. go-redis does not retry a blocking command's read timeout, but it does
+  retry `io.EOF`, non-timeout `net.Error`s, `ERR max number of clients reached`,
+  `LOADING`, `READONLY` and `CLUSTERDOWN` — so a failover closing the connection
+  late in a chunk added roughly another chunk, eating a third of the margin
+  above. The wait client now sets `MaxRetries = 0`; the chunk-paced re-read
+  already is the retry.
 - `WKHttp.Run` uses a zero-value `http.Server`, so there is no server-side
   `ReadTimeout`/`WriteTimeout` backstop. The handler carries its own deadline.
 - There is no graceful-shutdown hook, so an in-flight hold can extend process
