@@ -4,6 +4,18 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-30 (space-join-apply-resubmit)
+
+- **Recoverable join applications** — A pending Space join application now adopts
+  a freshly submitted invite code (refreshing the application time and
+  re-notifying admins) instead of staying bound to a spent/disabled/expired one,
+  so an applicant can repair their own stuck application without an admin
+  rejecting it first. Approval-time invite failures are classified (exhausted vs
+  invalid), notify the applicant, and share one implementation across all three
+  approval entry points. Invite-slot consumption stays at approval time — a
+  tracked follow-up. Upstream #683. See
+  [journal](journal/shared/space-join-apply-resubmit.md).
+
 ## 2026-07-30 (cardtmpl-reasoning-controls-hidden-successor)
 
 - **Safe reasoning successor** — Added immutable
