@@ -62,10 +62,14 @@ source: self
   的 multi-replica recovery 讨论）。
 - **HTTP 层不会腰斩 hold**：`WKHttp.Run` 走 gin/`http.ListenAndServe` 的零值 `http.Server`
   ——无 `ReadTimeout`/`WriteTimeout`。反过来说**没有服务端兜底**，handler 必须自带 deadline。
-- **`BLPop` 无 context**：octo-lib `redis.Conn.BLPop(key, timeout)` 是 go-redis v6 形状，
-  不接受 `context`，无法被客户端断连取消。故实现必须把 hold **切成若干短 chunk**
-  （每 chunk ≤ 5s），chunk 之间检查 `c.Request.Context().Done()` 与进程关停信号，
-  把「客户端已走但连接仍被占住」的窗口压到一个 chunk 以内。
+- **`BLPop` 无 context**：octo-lib `redis.Conn.BLPop(key, timeout)`（`pkg/redis/redis.go:445`）
+  直通 go-redis v6 `client.BLPop`，不接受 `context`，无法被客户端断连取消。故实现必须把
+  hold **切成若干短 chunk**（每 chunk ≤ 5s），chunk 之间检查 `c.Request.Context().Done()`
+  与进程关停信号，把「客户端已走但连接仍被占住」的窗口压到一个 chunk 以内。
+- **阻塞命令不会被 socket 读超时腰斩（已核实）**：go-redis v6 `commands.go:1009-1020`
+  的 `BLPop` 显式 `cmd.setReadTimeout(timeout)`，而 `redis.go:224-230` 对带 readTimeout 的
+  命令返回 `t + 10*time.Second` 作为连接读 deadline。故 `BLPop(key, 5s)` 的实际 socket
+  deadline 是 15s，**默认 `ReadTimeout` 不会打断它**——门铃方案在这套 client 上成立。
 - **限流现状**：`botAPI := r.Group("/v1/bot", ba.authBot())`（`bot_api.go:262`）——**没有**
   `SharedUIDRateLimiter`（bot 是 token 鉴权，非登录用户维度），只受 `main.go` 全局挂载的
   per-IP `RateLimitMiddleware` 约束。long-poll **降低**请求频率，对限流是净利好；真正的新
@@ -83,13 +87,19 @@ source: self
   - `wait` 上限由服务端 clamp（同 `limit` 的 `<=0→20 / >100→100` 既有纪律），
     非法值不报错、只夹紧。
 - **`rate-limit` / `throttle`** — 新增的是**并发连接**维度，per-IP 令牌桶管不到：
-  - 进程级并发 hold 上限（信号量）。**超限不报错**——降级为立即返回（等价今天的行为），
-    fail-open 语义与既有限流中间件一致。
+  - **long-poll 必须用独立 Redis client，不得占用 `ctx.GetRedisConn()` 主池**（已核实：
+    octo-lib `config.Context.NewRedisCache()` 建主池时只设 `Addr`/`Password`(+TLS)，
+    **没有显式 `PoolSize`** → 取 go-redis v6 默认 `10 × runtime.NumCPU()`，且该池被全进程
+    共享。`BLPop` 每个 hold 独占 1 条连接，若走主池，几十个 bot 同时 long-poll 就能把
+    普通 Redis 调用饿死）。按本仓既有约定用 `redis.NewWithOptions` + 显式 `PoolSize`
+    建专用 client（先例：`modules/user/api.go:198`、`modules/incomingwebhook/api.go:152`、
+    `modules/file/api.go:100`、`modules/usersecret/api.go:53`、`modules/group/api.go:166`
+    均显式 `o.PoolSize = 10`）。**专用池容量 = 并发 hold 上限 + 余量**，使 long-poll
+    的最坏情况被结构性地关在自己的池里。
+  - 进程级并发 hold 上限（信号量），取值 ≤ 专用池容量。**超限不报错**——降级为立即返回
+    （等价今天的行为），fail-open 语义与既有限流中间件一致。
   - **每个 robotID 同时只允许一个 hold**：第二个并发 hold 立即返回，防止一个 bot
-    反复开连接吃光 Redis 池（`BLPop` 每 hold 占用 1 条池连接）。
-  - 必须记录并在 brief/journal 说明：并发 hold 上限与 Redis `PoolSize` 的关系
-    （本仓限流类 client 的既有约定是显式 `PoolSize=10`；bot 事件走的是 `ctx.GetRedisConn()`
-    主连接池，**不是**那些独立 client，需确认主池容量能覆盖设定的并发上限）。
+    反复开连接吃光专用池。
 - **事件不丢（队列语义）** — `ZRangeByScore` 保持唯一权威。门铃只影响「何时醒」，
   不影响「读到什么」。门铃 key 必须有 TTL 且**长度恒定**（`LTRIM 0 0`），
   不能因为无人监听而无界增长。
@@ -113,7 +123,36 @@ source: self
 - **不加 metrics**（G1 ingress 仪表是独立任务；本任务若顺手需要一两个计数器，
   留到 G1 统一按 bounded-label 纪律加）。
 - **不改 bot 侧限流策略**（不新挂 `SharedUIDRateLimiter`——bot 无登录 uid）。
-- **openclaw-channel-octo 侧的 `wait` 接入**：属另一仓库的 follow-up，本任务只交付服务端。
+- **openclaw-channel-octo 侧的 `wait` 接入**：见下方「跨仓依赖」——不在本仓 acceptance 内，
+  但**不是可有可无的 follow-up**：不改插件就拿不到任何收益。
+
+## 跨仓依赖（openclaw-channel-octo — 不在本仓 acceptance 内）
+
+服务端单独上线**不产生任何收益**，也**不造成任何损害**（opt-in 默认保证）。收益要插件侧接入，
+已逐个核实改动面：
+
+**为什么必须 opt-in（硬证据）**：插件 `src/api-fetch.ts:16` 定义
+`EVENTS_POLL_TIMEOUT_MS = 10_000`，并在 `fetchBotEvents`（`api-fetch.ts:787`）对每次
+`/v1/bot/events` 请求挂 `AbortSignal.timeout(...)`。**若服务端把 long-poll 设为默认开启且
+hold > 10s，现存插件会每 10 秒 abort 一次并打一条 error 日志**，空闲请求量反升至今天的 3 倍。
+这独立证明了「默认 `wait=0`」不是保守，是必需。
+
+插件侧改动面（4 处，均已定位）：
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 请求体带 `wait` | `src/api-fetch.ts` `fetchBotEvents` body（一行） |
+| 2 | **客户端超时抬到 hold 之上**（hold 25s → 超时 ≥35s） | `src/api-fetch.ts:16` 常量 + :14-16 的「Cap each request well under any reasonable poll cadence」注释（前提已变） |
+| 3 | long-poll 模式下轮询间隔归零 | `src/events-poll.ts:88` `schedule()` 现无条件等 `intervalMs`（默认 2000ms），不改则每次返回后白等 2 秒，吃掉一半收益 |
+| 4 | 配置开关 + 文案 | `src/config-schema.ts:137/162` + `openclaw.plugin.json:51/119`（`pollIntervalMs` 已在此四处，新开关需同步）；`src/events-poll.ts:78` 的 "short-poll loop" 文档注释 |
+
+**插件侧副作用（需一并处理）**：`api-fetch.ts:14` 注释指出这是**单条顺序循环**，一次挂住的
+请求会推迟该账号的后续处理。今天上限 10s，改为 25s hold 后 `stop()` 的响应性最坏要等 25s
+——插件停止时必须用 `AbortController` 主动打断，不能只靠超时自然到期。
+
+**收益的诚实量化**：插件当前轮询间隔默认 **2s**（`events-poll.ts:10`，可配、下限 500ms），
+所以时延收益约为**平均 1 秒**，并非「秒级 vs 分钟级」。真正的大头是**空闲请求量**：
+每 bot 30 次/分钟 → long-poll 后约 2 次/分钟，bot 越多差距越大。
 
 ## Acceptance
 
@@ -146,15 +185,30 @@ source: self
 - `go build ./...`、`golangci-lint run ./modules/bot_api/... ./modules/robot/...` 干净。
 - `make i18n-extract-check` + `make i18n-lint` **无变化**（预期未触 errcode）。
 
-## 待确认（human confirm）
+## 已知偏差与盲点（实现后 review 记录）
 
-1. **`wait` 默认值与上限** —— 倾向 `默认 0（不等）/ 上限 30s`。默认 0 保证存量 bot
-   零行为变化；上限 30s 是「远小于常见反代 60s 空闲超时」的保守值。若部署侧反代
-   idle timeout 更短，需相应下调。
-2. **「零适配」的准确含义** —— 本设计下存量 bot **完全不受影响但也拿不到收益**，
-   要享受秒级时延必须主动传 `wait`。这与「同端点、同响应形状、SDK 无需改造即可继续工作」
-   一致，但不等于「什么都不改就变快」。若期望后者（默认开启 long-poll），
-   需接受存量 bot 的 HTTP client 超时风险，请明确拍板。
-3. **并发 hold 上限取值** —— 需先确认 `ctx.GetRedisConn()` 主池的 `PoolSize`
-   （本仓限流类独立 client 显式设 10，主池未见显式设置，可能是 go-redis 默认
-   `10 × GOMAXPROCS`）。上限必须显著低于主池容量，避免 long-poll 饿死普通 Redis 调用。
+1. **关停唤醒是近似的，不是精确的。** Load-bearing 里要求「关停中的 hold 必须被唤醒」，
+   实现用 chunk 上界（≤5s）逼近：`register.Module` 没有 Stop 钩子，`main.go` 也没有对
+   API server 做 graceful shutdown，加一个无人调用的 `Stop()` 只会是死代码。净效果是
+   drain 最坏被拖长 **5s**（而非一个完整的 30s hold），满足「不得拖长一个完整 wait 周期」
+   的原意，但不等于零延迟。真要精确，需先给模块引入统一的关停信号，属独立改动。
+2. **门铃失败无信号。** 生产者 `_ = botevent.Ring(...)` 丢弃错误且不记日志（与相邻的
+   best-effort `Expire` 刷新同一约定）。持续失败会让所有 hold 静默退化成等满超时，且**没有
+   任何可观测信号**。这条盲点归 G1（card ingress 仪表）收口，它拥有指标命名空间；
+   在叶子包里临时加 logger 会把第一个计数器放错位置。
+3. **并发预算是进程级，非集群级。** N 个副本下同一 bot 可各占一个 hold，全局上限为
+   `maxEventHolds × N`。有界且符合预期（被保护的资源——本副本的专用 Redis 池——本身就是
+   进程级的），但不要当成分布式不变量。
+4. **hold 时长会超出请求值 <1s。** chunk 向上取整到整秒（BLPOP 参数是整秒，向下取整会
+   退化成 0 = 永久阻塞）。宁可超出不到一秒，也不能像最初实现那样把 `wait=2` 截短成 ~1s。
+
+## 已定稿（2026-07-31，maintainer 拍板）
+
+1. **`wait` 默认 0、上限 30s。** 默认 0 保证存量 bot 零行为变化；30s 远小于常见反代 60s
+   空闲超时。若部署侧反代 idle timeout 更短，下调该上限即可，无契约影响。
+2. **opt-in，不默认开启。** 存量 bot 完全不受影响、但也拿不到收益；要低时延必须主动传
+   `wait`。理由不止「保守」：插件侧 `EVENTS_POLL_TIMEOUT_MS = 10_000` 的硬超时使默认开启
+   会直接制造错误日志风暴（见「跨仓依赖」）。
+3. **专用 Redis client + 显式 `PoolSize`，不占主池。** 主池无显式 `PoolSize`
+   （= `10 × NumCPU` 默认）且全进程共享，`BLPop` 每 hold 独占一条连接，必须隔离。
+   并发 hold 上限 ≤ 专用池容量，两者同处一份配置、不得各自漂移。

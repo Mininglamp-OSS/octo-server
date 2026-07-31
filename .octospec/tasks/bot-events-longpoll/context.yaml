@@ -1,0 +1,31 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: >-
+      brief load-bearing 标签 bot-api + 路径 modules/**/*.go。约束落点：事件队列 key 与
+      门铃 key 一律由 authBot() 认证出的 robotID 派生，绝不取请求体字段——否则一个 bot
+      可以等/读另一个 bot 的队列。
+  - id: error-handling
+    source: repo
+    why: >-
+      brief load-bearing 标签 wire-contract + 路径 modules/**/*.go。约束落点：hold 超时
+      走既有 OK 空响应形状，不新增 errcode、不新增裸错误响应；events.go:61-65 既有的
+      c.Response(status:0) 是存量遗留，本任务不扩大也不新增同类。
+  - id: rate-limit
+    source: repo
+    why: >-
+      brief load-bearing 标签 rate-limit/throttle + 路径 modules/**/*.go。约束落点：
+      门铃是通知原语不是频率计数器，不违反「禁止手写 Redis 计数器做请求频率限流」；
+      并发 hold 上限是进程内资源闸，配专用 Redis 池隔离，不碰主池。
+  - id: trust-boundary
+    source: repo
+    why: >-
+      brief load-bearing 标签 wire-contract。约束落点：「Bound the payload」——wait 必须
+      服务端夹紧（0..30s），不接受调用方任意值。
+  - id: testing
+    source: repo
+    why: 本任务新增 *_test.go；Redis 不可用时按仓内既有 t.Skipf 形状跳过。
+  - id: commit-style
+    source: repo
+    why: 路径 ** 全命中；Implement 阶段不提交，提交时用英文 Conventional Commits。
+brief: .octospec/tasks/bot-events-longpoll/brief.md

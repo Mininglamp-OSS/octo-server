@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -232,6 +233,11 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
 		return err
 	}
+	// Wake any /v1/bot/events long-poll parked on this bot. Rung after the ZADD
+	// so a waiter can never be woken toward an event the queue does not have
+	// yet. Best-effort by contract (see pkg/botevent): a dropped bell costs the
+	// waiter latency, never the event.
+	_ = botevent.Ring(ctx.GetRedisConn(), robotID)
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — do not fail the enqueue. Mirrors
 		// saveRobotMessage which also only logs on Expire failure.
@@ -268,6 +274,9 @@ func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string,
 	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
 		return 0, err
 	}
+	// 同 enqueueBotEventGeneric：ZADD 成功后摇铃唤醒 long-poll。card_action 正是
+	// 走本路径入队，卡片交互的端到端时延收益就落在这一行上。
+	_ = botevent.Ring(ctx.GetRedisConn(), robotID)
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
 		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。

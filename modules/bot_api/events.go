@@ -19,6 +19,18 @@ import (
 type BotEventsReq struct {
 	EventID int64 `json:"event_id"`
 	Limit   int64 `json:"limit"`
+	// Wait is the optional long-poll hold, in seconds.
+	//
+	// Zero (or absent) preserves the historical behavior exactly: read the
+	// queue once and return, empty batch included. That default is not
+	// conservatism for its own sake — the OpenClaw channel plugin caps every
+	// /v1/bot/events request at a hard 10s client timeout, so a server that
+	// held by default would make existing bots abort and log on every poll.
+	// Benefiting from the hold is an explicit opt-in by the caller.
+	//
+	// Clamped server-side to [0, maxEventWaitSeconds]; an out-of-range value is
+	// clamped, never rejected.
+	Wait int64 `json:"wait"`
 }
 
 type eventResp struct {
@@ -46,6 +58,9 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 		return
 	}
 
+	// robotID comes from the authBot() middleware, never from the request body.
+	// Both the event-queue key and the doorbell key are derived from it, so a
+	// bot can only ever read — or wait on — its own queue.
 	robotID := getRobotIDFromContext(c)
 	botKind := getBotKindFromContext(c)
 	limit := req.Limit
@@ -55,8 +70,20 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 	if limit > 100 {
 		limit = 100
 	}
+	wait := clampEventWait(req.Wait)
 
+	// Read before waiting: a caller with a backlog must never pay the hold.
 	results, err := ba.getEventsResult(robotID, req.EventID, limit)
+	if err == nil {
+		results = ba.filterAppBotEvents(botKind, robotID, results)
+		if len(results) == 0 && wait > 0 {
+			results, err = ba.waitForEvents(c, robotID, req.EventID, limit, botKind, wait)
+		}
+	}
+	// Single error exit. The legacy `status:0` shape is kept verbatim for wire
+	// compatibility, but it is deliberately written once: a second copy on the
+	// long-poll branch would be a *new* raw error response, which the repo's
+	// error-handling rule forbids even where the surrounding legacy shape stays.
 	if err != nil {
 		c.Response(gin.H{
 			"status": 0,
@@ -65,37 +92,46 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 		return
 	}
 
-	// App Bot: filter out non-DM events (defense in depth — App Bot is DM-only).
-	// In practice, App Bot queues should never contain group events because:
-	// - App Bot cannot join groups (all group/thread ops are denied)
-	// - Event push upstream only routes DM events to App Bot queues
-	// This filter is purely defensive — if triggered, it indicates an infrastructure bug.
-	// Filtered events are auto-ACK'd (ZREM) to prevent unbounded queue growth.
-	if botKind == BotKindApp && len(results) > 0 {
-		filtered := make([]*eventResp, 0, len(results))
-		var filteredIDs []string
-		for _, r := range results {
-			if r.Message != nil && r.Message.ChannelType != 0 && r.Message.ChannelType != common.ChannelTypePerson.Uint8() {
-				filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
-				continue
-			}
-			filtered = append(filtered, r)
-		}
-		if len(filteredIDs) > 0 {
-			key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
-			for _, id := range filteredIDs {
-				if err := ba.ctx.GetRedisConn().ZRemRangeByScore(key, id, id); err != nil {
-					ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
-				}
-			}
-		}
-		results = filtered
-	}
-
 	c.Response(gin.H{
 		"status":  1,
 		"results": results,
 	})
+}
+
+// filterAppBotEvents applies the App Bot DM-only guard.
+//
+// App Bot: filter out non-DM events (defense in depth — App Bot is DM-only).
+// In practice, App Bot queues should never contain group events because:
+// - App Bot cannot join groups (all group/thread ops are denied)
+// - Event push upstream only routes DM events to App Bot queues
+// This filter is purely defensive — if triggered, it indicates an infrastructure bug.
+// Filtered events are auto-ACK'd (ZREM) to prevent unbounded queue growth.
+//
+// Extracted so the immediate path and the long-poll path share one copy: a
+// filter that applied to only one of them would be a silent hole the moment a
+// caller sets `wait`.
+func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*eventResp) []*eventResp {
+	if botKind != BotKindApp || len(results) == 0 {
+		return results
+	}
+	filtered := make([]*eventResp, 0, len(results))
+	var filteredIDs []string
+	for _, r := range results {
+		if r.Message != nil && r.Message.ChannelType != 0 && r.Message.ChannelType != common.ChannelTypePerson.Uint8() {
+			filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if len(filteredIDs) > 0 {
+		key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
+		for _, id := range filteredIDs {
+			if err := ba.ctx.GetRedisConn().ZRemRangeByScore(key, id, id); err != nil {
+				ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
+			}
+		}
+	}
+	return filtered
 }
 
 func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([]*eventResp, error) {
