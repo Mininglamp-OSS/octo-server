@@ -4,6 +4,34 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-31 (bot-events-longpoll)
+
+- **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):
+  `POST /v1/bot/events` gained an opt-in long poll. Bot delivery was cursor short
+  polling (one `ZRangeByScore`, immediate return), so card interaction latency
+  equalled the bot's poll cadence. Producers now ring a per-bot doorbell at both
+  enqueue chokepoints (`enqueueBotEventGeneric` / `enqueueBotTypedEventGeneric`,
+  the latter carrying `card_action`), and a caller passing `wait` seconds parks
+  on it via BLPOP. New leaf package `pkg/botevent` owns the key format, since
+  `modules/bot_api` already imports `modules/robot` and either module would have
+  meant an import cycle or a drifting copy.
+  **The doorbell is a hint, never the event** — every wake-up re-reads the
+  authoritative sorted set from the caller's cursor, so a lost, stolen or stale
+  bell costs latency only. `wait` defaults to 0, keeping today's behavior
+  field-for-field; the default was decided by the consumer, whose hard 10s client
+  timeout would have made a default-on hold abort and log on every poll. Waiting
+  uses a dedicated Redis client with an explicit `PoolSize` because BLPOP pins its
+  connection and the shared pool has none. No new errcode, i18n entry, endpoint or
+  migration — an expired hold reuses the existing OK empty-batch shape.
+  Known bounds recorded rather than hidden: drain can be extended by one 5s chunk
+  (no module shutdown hook), a failing doorbell degrades holds silently until G1
+  adds metrics, and hold budgets are per process (`maxEventHolds × replicas`
+  fleet-wide). Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared
+  journal `.octospec/journal/shared/bot-events-longpoll.md`; learning candidate
+  `.octospec/learnings/pending/bot-events-longpoll.md` (lower-bound assertions for
+  timing promises → `testing`). Consumer half is a sibling change in
+  openclaw-channel-octo. PR #685.
+
 ## 2026-07-30 (space-join-apply-resubmit)
 
 - **Recoverable join applications** — A pending Space join application now adopts
