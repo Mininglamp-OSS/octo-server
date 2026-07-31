@@ -1987,7 +1987,7 @@ func (g *Group) notifyBotJoinedGroup(botMembers []*user.Model, groupNo, operator
 		// 同其它入队点：ZADD 成功后摇铃唤醒 /v1/bot/events long-poll。
 		// bot_joined_group 低频且不敏感于时延，但保持「每个写入队列的站点都摇铃」
 		// 这条不变量，才不会再出现 PR#685 那种「漏掉某个生产者」的漂移。
-		_ = botevent.Ring(g.ctx.GetRedisConn(), robotID)
+		_ = botevent.Ring(botevent.RingClient(g.ctx.GetConfig()), robotID)
 		g.Info("已推送bot_joined_group事件", zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 	}
 }

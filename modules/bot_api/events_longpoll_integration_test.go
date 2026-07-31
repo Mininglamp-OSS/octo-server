@@ -151,7 +151,7 @@ func TestBotEventsWakesOnDoorbell(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 	enqueueAt := time.Now()
 	enqueueRaw(t, ctx, 202)
-	assert.NoError(t, botevent.Ring(ctx.GetRedisConn(), lpBotID))
+	assert.NoError(t, botevent.Ring(botevent.RingClient(ctx.GetConfig()), lpBotID))
 
 	select {
 	case got := <-done:
@@ -284,7 +284,7 @@ func TestDoorbellStaysBoundedWithTTL(t *testing.T) {
 	defer clearLongPollKeys(t, ctx)
 
 	for i := 0; i < 25; i++ {
-		assert.NoError(t, botevent.Ring(ctx.GetRedisConn(), lpBotID))
+		assert.NoError(t, botevent.Ring(botevent.RingClient(ctx.GetConfig()), lpBotID))
 	}
 	n, err := ctx.GetRedisConn().Llen(botevent.BellKey(lpBotID))
 	assert.NoError(t, err)

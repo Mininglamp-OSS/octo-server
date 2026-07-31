@@ -27,11 +27,14 @@ source: self
 （`message_extra` + CMD `/v1/message/extra/sync`），慢的只有 bot 这一跳。这是审批/表单类
 交互卡体感的唯一瓶颈，D5 把它列为显式 P3 open item（P3-2）。
 
-**唤醒机制（本任务的核心设计决策）**：在 bot 事件入队的两个 chokepoint
-（`modules/robot/api.go` 的 `enqueueBotEventGeneric` 与 `enqueueBotTypedEventGeneric`，
-后者正是 `card_action` 的入队路径，`api.go:247-277`）额外写一条**门铃**——
-`LPUSH robotEventBell:{robotID}` + `LTRIM 0 0` + `Expire`；long-poll 侧用
-`redis.Conn.BLPop(bellKey, chunk)` 阻塞等待。
+**唤醒机制（本任务的核心设计决策）**：在**每一个**写 `robotEvent:{robotID}` 的入队点
+额外写一条**门铃**——单条 Lua `EVAL` 里做 `LPUSH` + `LTRIM 0 0` + `EXPIRE`（一次往返，
+见下文成本说明）；long-poll 侧用 `BLPOP(bellKey, chunk)` 阻塞等待。
+
+写入点共 **5 个**，不是 2 个（本文最初写错，见 Background）：`enqueueBotEventGeneric`、
+`enqueueBotTypedEventGeneric`（`card_action`）、`saveRobotMessage`（普通 DM/@提及，量最大）、
+以及 `modules/group` 的两个 `notifyBotJoinedGroup`。这条「每个写入点都必须摇铃」的不变量
+由 `pkg/botevent` 的 `TestEveryBotEventQueueWriterRingsTheDoorbell` 源码守卫强制。
 
 选它的理由（对比另两条路）：
 

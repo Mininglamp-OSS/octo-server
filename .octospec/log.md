@@ -9,9 +9,11 @@ change-log convention (§7). Newest first.
 - **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):
   `POST /v1/bot/events` gained an opt-in long poll. Bot delivery was cursor short
   polling (one `ZRangeByScore`, immediate return), so card interaction latency
-  equalled the bot's poll cadence. Producers now ring a per-bot doorbell at both
-  enqueue chokepoints (`enqueueBotEventGeneric` / `enqueueBotTypedEventGeneric`,
-  the latter carrying `card_action`), and a caller passing `wait` seconds parks
+  equalled the bot's poll cadence. **Every** producer that ZADDs into
+  `robotEvent:{robotID}` now rings a per-bot doorbell — five sites, including
+  the highest-volume `saveRobotMessage`; review found the first revision had
+  wired only two, so the invariant is now held by a source guard rather than by
+  the docstring that caused the miss — and a caller passing `wait` seconds parks
   on it via BLPOP. New leaf package `pkg/botevent` owns the key format, since
   `modules/bot_api` already imports `modules/robot` and either module would have
   meant an import cycle or a drifting copy.

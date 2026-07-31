@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: bot-events-longpoll (card-message-interaction D5 / P3-2)"
-description: Record of the opt-in long poll on POST /v1/bot/events — a per-bot Redis doorbell rung at both enqueue chokepoints, a BLPOP hold on an isolated connection pool, and a `wait` field that defaults to 0 so existing bots are untouched. The sorted set stays the sole authority for what is returned, so a lost bell can only cost latency. No new errcode, i18n entry, endpoint or migration.
+description: Record of the opt-in long poll on POST /v1/bot/events — a per-bot Redis doorbell rung by every one of the five queue writers (a source guard enforces it, after review found only two wired), a BLPOP hold on an isolated connection pool, and a `wait` field that defaults to 0 so existing bots are untouched. The sorted set stays the sole authority for what is returned, so a lost bell can only cost latency. No new errcode, i18n entry, endpoint or migration.
 tags: ["bot-api", "wire-contract", "rate-limit", "redis", "testing", "card"]
 timestamp: 2026-07-31T04:00:00Z
 # --- octospec extension fields ---
@@ -22,10 +22,14 @@ poll cadence — the open item D5 named explicitly rather than leaving implied.
   (LPUSH → LTRIM 0 0 → EXPIRE). A leaf package because `modules/bot_api` already
   imports `modules/robot`; putting the key format in either module would mean an
   import cycle or a second copy free to drift.
-- **`modules/robot/api.go`** — ring after a successful ZADD in
-  `enqueueBotEventGeneric` and `enqueueBotTypedEventGeneric`. Those two helpers
-  were already the single chokepoint for the queue write, so covering both is
-  sufficient by construction; `card_action` rides the typed one.
+- **Every queue writer rings** — five sites, not the two the first revision
+  assumed: `enqueueBotEventGeneric`, `enqueueBotTypedEventGeneric`
+  (`card_action`), `saveRobotMessage` (ordinary DM / @-mention, the
+  highest-volume producer), and both `notifyBotJoinedGroup` variants in
+  `modules/group`. The first revision trusted a docstring claiming
+  `enqueueBotEventGeneric` was the shared chokepoint; it never was. Review
+  caught it, and the invariant is now held by a source guard rather than a
+  comment — see the Gotchas section.
 - **`modules/bot_api/events.go`** — optional `wait` on `BotEventsReq`,
   read-before-wait, and the App Bot DM-only filter extracted into
   `filterAppBotEvents` so the immediate and long-poll paths share one copy.

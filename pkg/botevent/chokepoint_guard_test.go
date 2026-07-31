@@ -38,7 +38,13 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	// unrelated later site cannot be mistaken for this one's.
 	const window = 24
 
+	// Known writers at the time of writing: enqueueBotEventGeneric,
+	// enqueueBotTypedEventGeneric, saveRobotMessage, and both
+	// notifyBotJoinedGroup variants. Raise this when a writer is added.
+	const minKnownQueueWriters = 5
+
 	var violations []string
+	matched := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -71,6 +77,7 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 			if !queueKey.MatchString(strings.Join(lines[ctxStart:i+1], "\n")) {
 				continue
 			}
+			matched++
 			end := i + window
 			if end > len(lines) {
 				end = len(lines)
@@ -85,6 +92,18 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("walk: %v", err)
+	}
+
+	// A scanner that silently matches nothing would pass forever and protect
+	// nothing — the same vacuity this guard exists to replace. If the key
+	// spelling moves out of the lookback window, a new prefix constant appears,
+	// or a writer switches to a pipeline or Lua, this fires instead of going
+	// quietly green.
+	if matched < minKnownQueueWriters {
+		t.Fatalf("guard matched only %d bot-event queue writers, expected at least %d — "+
+			"the scan has probably gone blind (key spelling, prefix constant, or a writer "+
+			"moved to a pipeline/Lua). Fix the scan, do not lower this number without "+
+			"confirming the writer really went away.", matched, minKnownQueueWriters)
 	}
 
 	if len(violations) > 0 {

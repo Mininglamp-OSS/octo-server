@@ -2,48 +2,32 @@ package botevent
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	rd "github.com/go-redis/redis"
 )
 
+// fakeRinger records the script invocations without needing a Redis.
 type fakeRinger struct {
-	pushes  []string
-	trims   [][3]interface{}
-	expires []time.Duration
-	llen    int
-
-	pushErr   error
-	trimErr   error
-	expireErr error
+	calls   [][]string // keys per Eval
+	ttls    []int64
+	script  string
+	evalErr error
 }
 
-func (f *fakeRinger) LPUSH(key string, values ...interface{}) (int64, error) {
-	if f.pushErr != nil {
-		return 0, f.pushErr
+func (f *fakeRinger) Eval(script string, keys []string, args ...interface{}) *rd.Cmd {
+	f.script = script
+	f.calls = append(f.calls, keys)
+	if len(args) > 0 {
+		if ttl, ok := args[0].(int64); ok {
+			f.ttls = append(f.ttls, ttl)
+		}
 	}
-	f.pushes = append(f.pushes, key)
-	f.llen += len(values)
-	return int64(f.llen), nil
-}
-
-func (f *fakeRinger) Ltrim(key string, start, stop int64) (string, error) {
-	if f.trimErr != nil {
-		return "", f.trimErr
-	}
-	f.trims = append(f.trims, [3]interface{}{key, start, stop})
-	// LTRIM 0 0 keeps exactly one element.
-	if f.llen > int(stop-start+1) {
-		f.llen = int(stop - start + 1)
-	}
-	return "OK", nil
-}
-
-func (f *fakeRinger) Expire(key string, expiration time.Duration) error {
-	if f.expireErr != nil {
-		return f.expireErr
-	}
-	f.expires = append(f.expires, expiration)
-	return nil
+	// NewCmdResult is go-redis's own test constructor — Cmd's error setter is
+	// unexported, so this is the supported way to fake a failing command.
+	return rd.NewCmdResult(int64(1), f.evalErr)
 }
 
 func TestBellKeyIsNamespacedAwayFromTheQueue(t *testing.T) {
@@ -59,25 +43,35 @@ func TestBellKeyIsNamespacedAwayFromTheQueue(t *testing.T) {
 	}
 }
 
-func TestRingKeepsListLengthAtOne(t *testing.T) {
+func TestRingIsOneRoundTripAndTrimsToOne(t *testing.T) {
 	f := &fakeRinger{}
 	for i := 0; i < 5; i++ {
 		if err := Ring(f, "bot1"); err != nil {
 			t.Fatalf("ring %d: %v", i, err)
 		}
 	}
-	// An unattended doorbell must not grow — nobody may be long-polling for
-	// hours, and the list would otherwise accumulate one token per event.
-	if f.llen != 1 {
-		t.Fatalf("doorbell length = %d, want 1", f.llen)
+	// One Eval per ring, not three commands: this sits on the hottest bot
+	// delivery path, where separate LPUSH/LTRIM/EXPIRE doubled the per-message
+	// Redis round trips.
+	if len(f.calls) != 5 {
+		t.Fatalf("Eval calls = %d, want 5 (one round trip per ring)", len(f.calls))
 	}
-	if len(f.trims) != 5 {
-		t.Fatalf("trims = %d, want one per push", len(f.trims))
-	}
-	for _, tr := range f.trims {
-		if tr[1].(int64) != 0 || tr[2].(int64) != 0 {
-			t.Fatalf("trim range = %v, want [0,0]", tr)
+	for _, keys := range f.calls {
+		if len(keys) != 1 || keys[0] != BellKey("bot1") {
+			t.Fatalf("Eval keys = %v, want [%s]", keys, BellKey("bot1"))
 		}
+	}
+	// The script must keep the list at one element and always refresh the TTL —
+	// an unattended doorbell may sit for hours with nobody long-polling.
+	if !strings.Contains(f.script, "LTRIM") || !strings.Contains(f.script, "0, 0") {
+		t.Fatalf("script does not trim to a single element:\n%s", f.script)
+	}
+	if !strings.Contains(f.script, "LPUSH") || !strings.Contains(f.script, "EXPIRE") {
+		t.Fatalf("script missing LPUSH/EXPIRE:\n%s", f.script)
+	}
+	// LTRIM after LPUSH, so a waiter about to block never observes an empty list.
+	if strings.Index(f.script, "LTRIM") < strings.Index(f.script, "LPUSH") {
+		t.Fatalf("LTRIM must run after LPUSH:\n%s", f.script)
 	}
 }
 
@@ -86,8 +80,8 @@ func TestRingAlwaysSetsTTL(t *testing.T) {
 	if err := Ring(f, "bot1"); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.expires) != 1 || f.expires[0] != BellTTL {
-		t.Fatalf("expires = %v, want one entry of %v", f.expires, BellTTL)
+	if len(f.ttls) != 1 || f.ttls[0] != int64(BellTTL/time.Second) {
+		t.Fatalf("ttls = %v, want one entry of %v seconds", f.ttls, BellTTL/time.Second)
 	}
 	// The TTL only has to outlive one hold; assert the invariant rather than
 	// the literal, so lowering the hold ceiling cannot silently invert it.
@@ -104,8 +98,8 @@ func TestRingIsNoOpOnEmptyInput(t *testing.T) {
 	if err := Ring(f, "   "); err != nil {
 		t.Fatalf("blank robotID must be a no-op, got %v", err)
 	}
-	if len(f.pushes) != 0 {
-		t.Fatalf("blank robotID rang the bell: %v", f.pushes)
+	if len(f.calls) != 0 {
+		t.Fatalf("blank robotID rang the bell: %v", f.calls)
 	}
 }
 
@@ -115,13 +109,8 @@ func TestRingSurfacesErrorsForLoggingOnly(t *testing.T) {
 	// *reported* rather than swallowed, which is what makes the producer-side
 	// `_ = Ring(...)` an explicit decision rather than an accident.
 	want := errors.New("redis down")
-	for name, f := range map[string]*fakeRinger{
-		"push":   {pushErr: want},
-		"trim":   {trimErr: want},
-		"expire": {expireErr: want},
-	} {
-		if err := Ring(f, "bot1"); !errors.Is(err, want) {
-			t.Fatalf("%s: got %v, want %v", name, err, want)
-		}
+	f := &fakeRinger{evalErr: want}
+	if err := Ring(f, "bot1"); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
 	}
 }

@@ -377,7 +377,7 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		// yujiawei) caught this missing: without it long-poll only woke promptly
 		// for synthetic and typed events, and ordinary message latency would have
 		// regressed to the chunk boundary once callers zeroed their poll interval.
-		_ = botevent.Ring(rb.ctx.GetRedisConn(), robotID)
+		_ = botevent.Ring(botevent.RingClient(rb.ctx.GetConfig()), robotID)
 	}
 	err = rb.ctx.GetRedisConn().Expire(key, rb.ctx.GetConfig().Robot.MessageExpire)
 	if err != nil {
