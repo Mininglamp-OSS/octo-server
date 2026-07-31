@@ -208,3 +208,59 @@ func TestMentionClaimKeyDoesNotExposeIdentifiers(t *testing.T) {
 		t.Fatal("claim key must be stable")
 	}
 }
+
+func TestClaimStoreDefaultsAndErrorBranches(t *testing.T) {
+	backend := newMemoryClaimBackend()
+	store := newClaimStore(backend, 0, nil)
+	if store.doneTTL != defaultClaimDoneTTL || store.newToken == nil {
+		t.Fatalf("defaults doneTTL=%v tokenConfigured=%v", store.doneTTL, store.newToken != nil)
+	}
+	if token, err := newClaimToken(); err != nil || len(token) != 32 {
+		t.Fatalf("newClaimToken() = %q, %v", token, err)
+	}
+	if ok, err := store.Confirm(nil, 0); err == nil || ok {
+		t.Fatalf("Confirm(nil) = %v, %v", ok, err)
+	}
+	if ok, err := store.Release(nil); err == nil || ok {
+		t.Fatalf("Release(nil) = %v, %v", ok, err)
+	}
+
+	tokenErrStore := newClaimStore(backend, time.Hour, func() (string, error) {
+		return "", errors.New("entropy unavailable")
+	})
+	if _, _, err := tokenErrStore.Begin("new-key", "sha"); err == nil {
+		t.Fatal("expected token generation error")
+	}
+
+	backend.values["unknown"] = `{"state":"future","sha":"sha"}`
+	if _, err := store.Lookup("unknown", "sha"); err == nil {
+		t.Fatal("expected unknown state error")
+	}
+	backend.values["done-without-event"] = `{"state":"done","sha":"sha"}`
+	if _, err := store.Lookup("done-without-event", "sha"); err == nil {
+		t.Fatal("expected missing event id error")
+	}
+}
+
+func TestClaimStorePropagatesCASErrors(t *testing.T) {
+	backend := newMemoryClaimBackend()
+	store := newClaimStore(backend, time.Hour, deterministicTokens("lease-a", "lease-b"))
+	_, lease, err := store.Begin("confirm-key", "sha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.setCASErr = errors.New("cas failed")
+	if ok, err := store.Confirm(lease, 1); err == nil || ok {
+		t.Fatalf("Confirm CAS error = %v, %v", ok, err)
+	}
+	backend.setCASErr = nil
+
+	_, releaseLease, err := store.Begin("release-key", "sha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.delCASErr = errors.New("cas delete failed")
+	if ok, err := store.Release(releaseLease); err == nil || ok {
+		t.Fatalf("Release CAS error = %v, %v", ok, err)
+	}
+}

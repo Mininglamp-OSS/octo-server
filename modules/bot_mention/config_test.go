@@ -1,6 +1,7 @@
 package bot_mention
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,21 @@ func TestFeatureGate(t *testing.T) {
 				t.Fatalf("Allows(%q, %q) = %v, want %v", tt.docID, tt.spaceID, got, tt.wantAllow)
 			}
 		})
+	}
+}
+
+func TestFeatureGateFromEnv(t *testing.T) {
+	t.Setenv(featureEnabledEnv, "true")
+	t.Setenv(spaceAllowlistEnv, "space-env")
+	t.Setenv(documentAllowlistEnv, "doc-env")
+	gate := featureGateFromEnv()
+	if !gate.Allows("doc-env", "") || !gate.Allows("other", "space-env") {
+		t.Fatal("environment allowlists were not loaded")
+	}
+
+	t.Setenv(featureEnabledEnv, "not-a-bool")
+	if featureGateFromEnv().Allows("doc-env", "space-env") {
+		t.Fatal("invalid enabled value must fail closed")
 	}
 }
 
@@ -130,5 +146,15 @@ func TestMentionFingerprintIsStableAndCoversExecutionFields(t *testing.T) {
 	req.Text = "different instruction"
 	if first == mentionFingerprint(req) {
 		t.Fatal("fingerprint must change when execution-relevant content changes")
+	}
+}
+
+func TestRequestValidationError(t *testing.T) {
+	err := &requestValidationError{field: "doc_id"}
+	if got := err.Error(); !strings.Contains(got, "doc_id") {
+		t.Fatalf("Error() = %q", got)
+	}
+	if got := invalidField(errors.New("different error")); got != "" {
+		t.Fatalf("invalidField(non-validation) = %q", got)
 	}
 }
