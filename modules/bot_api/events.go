@@ -130,12 +130,26 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 	if len(filteredIDs) > 0 {
 		key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
 		for _, id := range filteredIDs {
-			if err := ba.ctx.GetRedisConn().ZRemRangeByScore(key, id, id); err != nil {
+			if err := ackFilteredEvent(ba, key, id); err != nil {
 				ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
 			}
 		}
 	}
 	return filtered
+}
+
+// ackFilteredEvent removes one auto-ACK'd event from the queue.
+//
+// A package-level var purely so a test can inject the state this endpoint's
+// progress guarantee is built to survive: a Redis whose **reads succeed while
+// writes fail** (MISCONF after a failed snapshot, a READONLY replica, a
+// write-denying ACL). That asymmetry cannot be produced against a healthy Redis
+// — re-seeding the events afterwards looks the same to the eye but not to the
+// code, since both ZREMs still succeeded — and PR#685's round-3 blocker was
+// precisely a loop whose progress silently depended on this write. Arguing the
+// property structurally is what let it ship; the seam makes it exercisable.
+var ackFilteredEvent = func(ba *BotAPI, key string, eventID string) error {
+	return ba.ctx.GetRedisConn().ZRemRangeByScore(key, eventID, eventID)
 }
 
 // eventPage is one authoritative read of a bot's event queue: what this caller
@@ -146,11 +160,30 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 // ZREM that the filter issues afterwards succeeded. That is what makes the
 // long-poll loop's forward progress structural: it is derived from the read the
 // loop just performed, not from a write whose error is only logged.
+//
+// # The one assumption underneath the cursor
+//
+// The cursor is a payload `event_id` (`getEventsResult` decodes it), while the
+// read that consumes it is bounded by the sorted-set **score** (`Min: "(cursor"`).
+// The two are the same number by construction at all five producers — each does
+// `ZAdd(key, float64(seq), payload{EventID: seq})` — and `GenSeq` returns small
+// monotonic integers well inside float64's exact range.
+//
+// A future writer that scored by, say, timestamp while keeping a separate
+// `event_id` would break this silently: the cursor would jump past members the
+// caller never received. The same equality is what makes the auto-ACK's
+// `ZRemRangeByScore(key, id, id)` address the member it means to. Reading with
+// `ZRangeByScoreWithScores` would remove the assumption, but octo-lib's
+// `redis.Conn` does not expose it (see the brief's known-deviations section).
 type eventPage struct {
 	// visible is what may be returned to the caller.
 	visible []*eventResp
 	// cursor is the exclusive lower bound for the next read.
 	cursor int64
+	// advanced reports that this read moved the cursor. It is what licenses
+	// skipping the next doorbell block: a page that advanced nothing would be
+	// re-read identically, so re-reading it without pacing is a spin.
+	advanced bool
 	// full reports that the read returned a whole page of sorted-set members, so
 	// more may be queued directly behind it. Counted from the *raw* members, not
 	// from the decoded events or from visible: a member that failed to decode
@@ -170,11 +203,18 @@ func (ba *BotAPI) readEventPage(robotID string, botKind string, cursor int64, li
 	page := eventPage{cursor: cursor, full: int64(members) >= limit}
 	// Advance before filtering. ZRangeByScore returns ascending, so the last
 	// event carries the maximum, but scanning does not depend on that ordering.
+	//
+	// Note what this does and does not clear. `raw` is the *decoded* slice, so a
+	// member that failed to decode never appears here: the cursor clears one only
+	// when a decodable member with a higher id shares the page. A page in which
+	// nothing decodes leaves the cursor where it was — see waitForEvents, which
+	// falls back to blocking exactly so that case stays paced.
 	for _, r := range raw {
 		if r.EventID > page.cursor {
 			page.cursor = r.EventID
 		}
 	}
+	page.advanced = page.cursor > cursor
 	page.visible = ba.filterAppBotEvents(botKind, robotID, raw)
 	return page, nil
 }

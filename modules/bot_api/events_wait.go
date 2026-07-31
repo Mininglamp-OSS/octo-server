@@ -48,20 +48,36 @@ import (
 //
 // # How the hold loop guarantees it terminates
 //
-// Every iteration either burns at least one chunk of wall clock or advances the
-// queue cursor, and never neither:
+// Every iteration burns at least one chunk of wall clock, or advances the queue
+// cursor, or consumes a doorbell token — and never none of the three:
 //   - BLPOP timed out (redis.Nil): the chunk was spent.
-//   - BLPOP returned a token: a producer rang, which means a ZADD landed, so the
-//     read that follows advances the cursor.
 //   - BLPOP failed: the error path explicitly pays out the rest of the chunk
 //     (go-redis returns dial/protocol errors in ~8ms, so nothing else would).
 //   - the block was skipped: only permitted when the previous read actually
-//     moved the cursor.
+//     moved the cursor — `eventPage.advanced`, applied to the entry page and to
+//     every in-loop page alike.
+//   - BLPOP returned a token: a producer rang, so a ZADD landed.
 //
-// The cursor is monotonic and bounded by the queue's maximum event id, and the
-// chunk count is bounded by the deadline. Nothing in that argument depends on a
-// write succeeding — in particular not on the filter's auto-ACK ZREM, whose
-// error is only logged.
+// The third disjunct is why that last case is stated as "consumed a token" and
+// not "advances the cursor". A ring whose event lands *below* this caller's
+// cursor wakes the hold and the read finds nothing — reachable when the caller
+// sends an `event_id` above the queue's maximum, and by the cross-replica
+// `GenSeq` id ordering. That costs one unpaced ZRangeByScore per enqueue, which
+// is bounded by that bot's own producer rate and by the one-hold-per-bot rule,
+// so it is not a storm; but it is not cursor progress either, and an invariant
+// that quietly excluded it would be the same shape of false written premise that
+// caused rounds 1 through 3.
+//
+// The cursor is monotonic and bounded by the queue's maximum event id, the token
+// count is bounded by producer rate, and the chunk count is bounded by the
+// deadline. Nothing in that argument depends on a write succeeding — in
+// particular not on the filter's auto-ACK ZREM, whose error is only logged.
+//
+// What the invariant does NOT bound is *rate*: a drain that keeps advancing (a
+// filtered backlog read at a small `limit`) legitimately re-reads without pacing
+// until the backlog is gone or the deadline hits. That loop is bounded by the
+// backlog rather than by the deadline, and it is the drain doing its job — but
+// if a future change needs a ceiling on it, that is where to put one.
 
 const (
 	// maxEventWaitSeconds caps the hold. 30s stays well under the 60s idle
@@ -405,7 +421,11 @@ func (ba *BotAPI) waitForEvents(
 	// re-reads rather than blocking; without it an App Bot whose queue holds a
 	// page of filtered events followed by a deliverable DM waits a whole chunk
 	// for a message that was already there.
-	reread := entry.full
+	//
+	// Gated on `advanced` exactly as the in-loop decision is: a full entry page
+	// that moved nothing would be re-read identically, so skipping the block buys
+	// one wasted round trip and no progress.
+	reread := entry.full && entry.advanced
 	warned := false
 
 	for {
@@ -460,18 +480,22 @@ func (ba *BotAPI) waitForEvents(
 			return page.visible, nil
 		}
 		// Nothing this caller may see — the page was empty, or the App Bot filter
-		// emptied it. Advance past everything the read observed, including events
-		// the filter dropped and members that failed to decode, so the next
-		// iteration cannot be handed the same page again. This does not depend on
-		// the filter's auto-ACK ZREM having succeeded (it only warns on failure),
-		// which is what makes progress here structural rather than circumstantial.
+		// emptied it. Advance past everything the read *decoded*, including the
+		// events the filter dropped, so the next iteration cannot be handed the
+		// same page again. This does not depend on the filter's auto-ACK ZREM
+		// having succeeded (it only warns on failure), which is what makes
+		// progress here structural rather than circumstantial.
 		//
-		// Skipping the block is then safe *only* when the cursor actually moved.
-		// A full page that advanced nothing — every member undecodable — would
-		// otherwise spin unpaced for the rest of the hold; falling back to the
-		// block costs one chunk and keeps the failure bounded.
-		advanced := page.cursor > cursor
+		// A member that failed to decode is cleared only incidentally — when a
+		// decodable member with a higher id shares its page. A page in which
+		// nothing decodes cannot move the cursor at all, and that residual is
+		// pre-existing: the immediate path has it too, and such a queue head
+		// starves that bot until the events expire.
+		//
+		// Skipping the block is therefore gated on the cursor having moved. A full
+		// page that advanced nothing would otherwise spin unpaced for the rest of
+		// the hold; falling back to the block costs one chunk and keeps it bounded.
 		cursor = page.cursor
-		reread = page.full && advanced
+		reread = page.full && page.advanced
 	}
 }

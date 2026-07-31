@@ -49,6 +49,26 @@ change-log convention (§7). Newest first.
   all five producers; `OCTO_BOT_EVENTS_MAX_HOLDS` is validated at boot and
   documented, with the per-replica connection budget (shared + wait 68 + ring 10)
   in the new `docs/bot-events-longpoll.md`.
+- **Review round 5 — the invariant's own counterexamples.** All four reviewers
+  approved round 4; the remaining findings were non-blocking and fixed anyway,
+  because every one of them is the failure mode this task keeps reproducing: a
+  written claim stronger than the code. The stated invariant had two
+  counterexamples (a doorbell token whose event lands *below* the caller's
+  cursor advances nothing; the entry page's skip was ungated while the in-loop
+  one was gated), so it now reads *burns a chunk, **or** advances the cursor,
+  **or** consumes a token* and both skip sites share one `eventPage.advanced`.
+  The claim that the cursor covers undecodable members narrowed to the truth — it
+  clears them only incidentally, when a decodable member with a higher id shares
+  the page. `docs/bot-events-longpoll.md` said a hold overshoots by "less than one
+  second"; go-redis's `timeout + 10s` command deadline makes the real worst case
+  **~45s for a 30s hold**, which is the number an operator sizes a proxy idle
+  timeout from. The `event_id == ZSET score` equality the cursor rests on is now
+  written down. Finally, round 4's commit message claimed every new test was
+  verified by deleting its fix, and that was untrue of one: the failed-ACK test
+  re-seeded events after a *successful* ZREM, which is not the read-succeeds /
+  write-fails state it named. It is now a real one via an `ackFilteredEvent`
+  seam, and the anti-spin test's slack tightened from `+3` to `+1` so the entry
+  gap fails it (3 reads where 2 suffice).
 - Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared journal
   `.octospec/journal/shared/bot-events-longpoll.md`; learning candidates
   `.octospec/learnings/pending/bot-events-longpoll.md` (lower-bound assertions for

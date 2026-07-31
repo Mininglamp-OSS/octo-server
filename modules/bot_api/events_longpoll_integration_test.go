@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -354,15 +355,18 @@ func enqueueUndecodable(t *testing.T, ctx *config.Context, eventID int64) {
 		robotEventPrefix+lpBotID, float64(eventID), fmt.Sprintf("not json at all #%d", eventID)))
 }
 
-// TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK pins the property the
-// whole loop's termination argument rests on: the cursor is derived from what
-// the read observed, before the App Bot filter and independent of the auto-ACK
-// ZREM the filter issues afterwards (events.go only warns when that ZREM fails).
+// TestReadEventPageCursorIsAPureFunctionOfTheRead asserts what it says and no
+// more: reading the same content twice from the same cursor yields the same
+// advance, before the App Bot filter.
 //
-// Re-seeding the same events and reading again from the original cursor is
-// exactly what "the ZREM did nothing" looks like from the loop's point of view;
-// the cursor must still advance.
-func TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK(t *testing.T) {
+// It deliberately does NOT claim to exercise a failed auto-ACK. An earlier
+// version did — it re-seeded the events after a successful ZREM and called that
+// "exactly what a failed ZREM looks like" — but both reads ran against a healthy
+// Redis and both writes succeeded, so an implementation that advanced only on
+// ZREM success would have passed it unchanged (PR#685 review, P2-d). That
+// property has its own test now:
+// TestWaitForEventsMakesProgressWhenTheAutoACKFails.
+func TestReadEventPageCursorIsAPureFunctionOfTheRead(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 	clearLongPollKeys(t, ctx)
@@ -379,16 +383,16 @@ func TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK(t *testing.T) {
 	assert.Equal(t, int64(3), page.cursor, "the cursor must advance past filtered events")
 	assert.False(t, page.full, "3 of a 20-event page is not full")
 
-	// Put them back: the queue now looks exactly as it would if every auto-ACK
-	// ZREM had failed (MISCONF, a READONLY replica, a write-denying ACL).
+	// Same content, same starting cursor, same advance — the cursor depends on
+	// what was read, not on how the queue got that way.
 	for id := int64(1); id <= 3; id++ {
 		enqueueMessageEvent(t, ctx, id, 2)
 	}
 	again, err := ba.readEventPage(lpBotID, BotKindApp, 0, 20)
 	assert.NoError(t, err)
 	assert.Empty(t, again.visible)
-	assert.Equal(t, int64(3), again.cursor,
-		"the cursor must come from the read, so a failed ZREM cannot stall the loop")
+	assert.Equal(t, int64(3), again.cursor, "the same read must produce the same cursor")
+	assert.True(t, again.advanced)
 
 	// Reading from the advanced cursor sees nothing, which is what lets the loop
 	// go back to blocking instead of re-serving the same page forever.
@@ -398,29 +402,45 @@ func TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK(t *testing.T) {
 	assert.Equal(t, again.cursor, beyond.cursor, "an empty read must not move the cursor")
 }
 
-// TestReadEventPageAdvancesPastUndecodableMembers: a member that fails to decode
-// is dropped from the results but still occupied a slot in the page. If the
-// cursor did not clear it, a queue whose head is corrupt would starve every
-// later event — the read would keep returning the same `limit` bad members.
-func TestReadEventPageAdvancesPastUndecodableMembers(t *testing.T) {
+// TestReadEventPageClearsUndecodableMembersOnlyIncidentally pins the exact reach
+// of the cursor, which an earlier comment overstated (PR#685 review, P2-b + Nit).
+//
+// The cursor is derived from the *decoded* slice, so an undecodable member is
+// never seen directly. It is cleared only when a decodable member with a
+// **higher** id shares the page — so the undecodable one is seeded at the higher
+// id here, where clearing it genuinely does not happen. Seeding it lower would
+// pass for the incidental reason while appearing to test the stated one.
+func TestReadEventPageClearsUndecodableMembersOnlyIncidentally(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 	clearLongPollKeys(t, ctx)
 	defer clearLongPollKeys(t, ctx)
 	ba := newWaitTestAPI(ctx)
 
-	enqueueUndecodable(t, ctx, 5)
-	enqueueMessageEvent(t, ctx, 6, 1) // a DM: visible to every bot kind
+	enqueueMessageEvent(t, ctx, 5, 1) // a DM: visible to every bot kind
+	enqueueUndecodable(t, ctx, 6)     // corrupt, and *above* the decodable one
 
 	page, err := ba.readEventPage(lpBotID, BotKindUser, 0, 2)
 	assert.NoError(t, err)
 	assert.Len(t, page.visible, 1, "the decodable event must still be delivered")
-	assert.Equal(t, int64(6), page.visible[0].EventID)
-	assert.Equal(t, int64(6), page.cursor)
+	assert.Equal(t, int64(5), page.visible[0].EventID)
+	// The corrupt member at 6 is NOT cleared: the cursor stops at 5, the highest
+	// id that decoded. That is the honest boundary — the loop is safe because it
+	// paces when the cursor stalls, not because the cursor sweeps corruption away.
+	assert.Equal(t, int64(5), page.cursor, "the cursor cannot see a member it never decoded")
+	assert.True(t, page.advanced)
 	// Fullness is counted from raw members, not decoded events: one of the two
 	// members vanished in decoding, and treating the page as short would stall
 	// the drain of whatever sits behind it.
 	assert.True(t, page.full, "2 raw members at limit=2 is a full page")
+
+	// Reading on from that cursor returns the corrupt member alone: a full page
+	// that advances nothing, which is exactly the state the loop must pace.
+	next, err := ba.readEventPage(lpBotID, BotKindUser, page.cursor, 1)
+	assert.NoError(t, err)
+	assert.Empty(t, next.visible)
+	assert.True(t, next.full)
+	assert.False(t, next.advanced, "a wholly undecodable page must not report progress")
 }
 
 // TestReadEventPageCannotAdvancePastAWhollyUndecodablePage documents the one
@@ -445,9 +465,10 @@ func TestReadEventPageCannotAdvancePastAWhollyUndecodablePage(t *testing.T) {
 	assert.Equal(t, int64(0), page.cursor, "nothing decoded, so nothing can advance the cursor")
 
 	// The guard: a full page that advanced nothing must not license skipping the
-	// block. waitForEvents computes `full && advanced`; assert the conjunction is
-	// false here, which is what keeps the loop paced.
-	assert.False(t, page.full && page.cursor > 0,
+	// block. Both skip sites — the entry page and every in-loop page — compute
+	// `full && advanced`, so assert the conjunction is false here.
+	assert.False(t, page.advanced, "nothing decoded, so the page did not advance")
+	assert.False(t, page.full && page.advanced,
 		"a full page that advanced nothing must not permit an unpaced re-read")
 }
 
@@ -485,6 +506,72 @@ func TestWaitForEventsDrainsAFilteredBacklogWithoutBlocking(t *testing.T) {
 	assert.Equal(t, limit+1, got[0].EventID)
 	assert.Less(t, elapsed, eventWaitChunk,
 		"a backlog already in the queue must not wait out a chunk on the doorbell")
+}
+
+// failAutoACK makes every auto-ACK write fail while leaving reads untouched,
+// which is the Redis state the loop's progress guarantee exists to survive and
+// the one a healthy Redis cannot be talked into producing.
+func failAutoACK(t *testing.T) {
+	t.Helper()
+	prev := ackFilteredEvent
+	ackFilteredEvent = func(*BotAPI, string, string) error {
+		return errors.New("MISCONF Redis is configured to save RDB snapshots but is currently unable to persist")
+	}
+	t.Cleanup(func() { ackFilteredEvent = prev })
+}
+
+// TestWaitForEventsMakesProgressWhenTheAutoACKFails is the real regression test
+// for PR#685 round-3 P1-2. The earlier revision decided whether to skip the
+// doorbell from page fullness alone, reasoning that filtered events "were
+// auto-ACK'd out of the queue, so looping cannot spin on them" — but
+// filterAppBotEvents only *warns* when that ZREM fails, and reads-work /
+// writes-fail is an ordinary Redis state.
+//
+// So fail the write for real rather than simulating its effect: the filtered
+// page stays in the queue for the whole hold, and the loop must still reach the
+// deliverable DM behind it.
+func TestWaitForEventsMakesProgressWhenTheAutoACKFails(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	resetEventHoldState(t, 4)
+	failAutoACK(t)
+	ba := newWaitTestAPI(ctx)
+
+	const limit = int64(5)
+	for id := int64(1); id <= limit; id++ {
+		enqueueMessageEvent(t, ctx, id, 2) // a full page, all filtered, none ACK-able
+	}
+	enqueueMessageEvent(t, ctx, limit+1, 1) // the DM behind it
+
+	entry, err := ba.readEventPage(lpBotID, BotKindApp, 0, limit)
+	assert.NoError(t, err)
+	assert.Empty(t, entry.visible)
+	assert.True(t, entry.full)
+
+	before := zrangeByScoreCalls(t, ctx)
+	start := time.Now()
+	got, err := ba.waitForEvents(newWaitTestContext(context.Background()),
+		lpBotID, BotKindApp, limit, 20*time.Second, entry)
+	elapsed := time.Since(start)
+	reads := zrangeByScoreCalls(t, ctx) - before
+
+	assert.NoError(t, err)
+	assert.Len(t, got, 1, "the DM must be reached even though nothing could be ACK'd")
+	assert.Equal(t, limit+1, got[0].EventID)
+	assert.Less(t, elapsed, eventWaitChunk, "progress must not wait on a doorbell for a backlog already queued")
+	assert.LessOrEqual(t, reads, int64(3),
+		"the loop issued %d reads; a failed ACK must cost pages, not a spin", reads)
+
+	// The injected failure must have been real: the filtered events are still in
+	// the queue. Without this the test could pass against a working ZREM.
+	remaining, err := ctx.GetRedisConn().ZRangeByScore(robotEventPrefix+lpBotID, rd.ZRangeBy{
+		Min: "-inf", Max: "+inf",
+	})
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, len(remaining), int(limit),
+		"the auto-ACK was supposed to fail; the filtered events should still be queued")
 }
 
 // TestWaitForEventsPacesAFailingDoorbell is the regression test for PR#685
@@ -579,7 +666,12 @@ func TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Empty(t, got)
 	assert.GreaterOrEqual(t, elapsed, wait, "the hold must still be served in full")
-	maxReads := int64(wait/eventWaitChunk) + 3
+	// Exactly one read per chunk: a 6s hold is a 5s chunk plus a rounded-up 1s
+	// one, so two reads. The bound is +1 rather than a comfortable +3 because the
+	// slack is what hid the entry-path gap — with `reread := entry.full` alone,
+	// iteration 1 skipped its block and burned a third read, which a +3 bound
+	// absorbed silently (PR#685 review, P2-a).
+	maxReads := int64(wait/eventWaitChunk) + 1
 	assert.LessOrEqual(t, reads, maxReads,
 		"the loop issued %d reads in %v; a page it cannot advance past must not be re-read unpaced", reads, elapsed)
 }

@@ -96,11 +96,19 @@ Refusing to hold is never an error. Three degradations, all fail-open:
 
 ## Deployment notes
 
-- The 30s cap sits under the 60s idle timeout common to reverse proxies. A hold
-  may overshoot its deadline by **less than one second** (the BLPOP timeout is
-  whole seconds and must be rounded up — rounding down degenerates into a 0s
-  argument, which Redis reads as "block forever"). If your proxy's idle timeout
-  is shorter, lower the cap; there is no contract impact.
+- **Size your proxy's idle timeout against ~45s, not 30s.** A hold overshoots its
+  deadline from two independent sources, and only the first is sub-second:
+
+  | Source | Overshoot | When |
+  |---|---|---|
+  | chunk rounding | **< 1s** | always; the BLPOP timeout is whole seconds and must be rounded up — rounding down degenerates into a 0s argument, which Redis reads as "block forever" |
+  | go-redis command deadline | **up to ~10s** on top of the final chunk (15s total for a 5s chunk) | a Redis that accepts the connection but never answers the blocking command: a blackholed connection, a failover mid-BLPOP, a proxy that swallows blocking commands |
+
+  go-redis sets a blocking command's read deadline to `timeout + 10s`, so the
+  worst-case response for a 30s hold is roughly **45s**. That still clears the
+  60s idle timeout common to reverse proxies — but the margin is 15s, not 29s.
+  If your proxy's idle timeout is shorter, lower the cap; there is no contract
+  impact.
 - `WKHttp.Run` uses a zero-value `http.Server`, so there is no server-side
   `ReadTimeout`/`WriteTimeout` backstop. The handler carries its own deadline.
 - There is no graceful-shutdown hook, so an in-flight hold can extend process

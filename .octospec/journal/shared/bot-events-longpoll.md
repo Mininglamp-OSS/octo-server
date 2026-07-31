@@ -60,10 +60,11 @@ poll cadence — the open item D5 named explicitly rather than leaving implied.
   by whichever replica the bot reaches. Blocking had to happen inside Redis.
 
 - **The hold loop's progress is an invariant, not an accident.** Every iteration
-  either burns a chunk of wall clock or advances the queue cursor, never neither.
-  That sentence is the whole design of `waitForEvents`, and it took three review
-  rounds to arrive at because each round answered one branch of it in isolation.
-  See "How this loop terminates" below.
+  burns a chunk of wall clock, or advances the queue cursor, or consumes a
+  doorbell token — never none of the three. That sentence is the whole design of
+  `waitForEvents`, and it took four review rounds to get right, because each
+  round answered one branch of it in isolation and the round-4 wording still had
+  two counterexamples. See "How this loop terminates" below.
 
 ## Gotchas worth remembering
 
@@ -106,22 +107,44 @@ server was asked to do rather than what the test believes the code did.
 
 The fix was to stop answering branches and state the invariant instead:
 
-> **Every iteration either burns at least one chunk of wall clock, or advances
-> the queue cursor. Never neither.**
+> **Every iteration burns at least one chunk of wall clock, or advances the queue
+> cursor, or consumes a doorbell token. Never none of the three.**
 
 - BLPOP timed out (`redis.Nil`) → the chunk was spent.
-- BLPOP returned a token → a producer rang, so a ZADD landed, so the read
-  advances.
 - BLPOP **failed** → go-redis returns dial/protocol errors after
   `MinRetryBackoff` (~8ms), *not* after the chunk, because a read timeout is the
   one error class excluded here. So the error path pays out the chunk remainder
   explicitly, and logs once per hold rather than once per iteration.
 - The block was skipped → only permitted when the previous read actually moved
   the cursor.
+- BLPOP returned a token → a producer rang, so a ZADD landed.
 
-The cursor is monotonic and bounded by the queue's maximum event id; the chunk
-count is bounded by the deadline. Nothing in that argument depends on a write
-succeeding.
+**That third disjunct is what round 4 got wrong**, and it is worth the space.
+Round 4 wrote the last branch as *"a token means a ZADD landed, so the read that
+follows advances the cursor"*. False: when the new event's id is **below** this
+caller's cursor, the hold wakes and reads nothing. Reachable two ways — a caller
+sending an `event_id` above the queue's maximum, and the cross-replica `GenSeq`
+id ordering. The cost is bounded (one unpaced read per enqueue, capped by that
+bot's producer rate and by one hold per bot), but the sentence claimed it could
+not happen at all. Since a false written premise was the root cause of rounds 1,
+2 and 3, *an invariant that is 90% true is the most dangerous line in the diff* —
+it earned a correction round of its own.
+
+Round 4 also left the **entry** page's skip ungated (`reread := entry.full`)
+while the in-loop one was gated (`page.full && advanced`). Cost: one wasted read,
+absorbed silently by a `+3` slack in the very test written to catch spins. Both
+sites now read `full && advanced` off `eventPage.advanced`, and that test's bound
+is `+1`, so the gap fails it.
+
+The cursor is monotonic and bounded by the queue's maximum event id, the token
+count by producer rate, and the chunk count by the deadline. Nothing in that
+argument depends on a write succeeding.
+
+What the invariant does **not** bound is *rate*: a drain that keeps advancing — a
+filtered backlog read at a small `limit` — legitimately re-reads unpaced until
+the backlog is gone. That loop is bounded by the backlog rather than by the
+deadline, and it is the drain doing its job. The file header says so, rather than
+implying a rate guarantee it does not give.
 
 **The cursor comes from the read, never from the ACK.** `readEventPage` advances
 to the highest `event_id` it observed *before* the App Bot filter runs. The
@@ -129,10 +152,16 @@ earlier revision reasoned "the filtered events were auto-ACK'd out of the queue,
 so we cannot see them again" — but `filterAppBotEvents` only *warns* when its
 `ZRemRangeByScore` fails, and "reads work, writes do not" is an ordinary Redis
 state (MISCONF after a failed RDB save, a READONLY replica, a write-denying ACL).
-Deriving progress from the read makes it structural. It also covers members that
-fail to decode, which the ACK never touched at all: without it, a corrupt queue
-head starves every event behind it — the read keeps returning the same `limit`
-bad members forever.
+Deriving progress from the read makes it structural.
+
+Round 4 overstated the reach of that, and the correction is worth keeping: the
+cursor is computed from the **decoded** slice, so a member that fails to decode
+is never seen and is cleared only *incidentally* — when a decodable member with a
+higher id happens to share its page. A page in which nothing decodes advances
+nothing. The loop is safe there because it **paces** when the cursor stalls, not
+because the cursor sweeps corruption away. `brief.md` had this right while the
+code comment and commit message claimed the stronger version; a future reader
+trusts the comment.
 
 `readEventPage` is now the single seam both paths go through, so the immediate
 read and the hold cannot drift in what they read, what they filter, or how far
@@ -205,7 +234,24 @@ Round 4 added five cases and verified each by deleting its fix:
 | `TestRingExpiresTheBellKeyItPushedTo` | EXPIRE on another key → no TTL on the bell |
 
 A mutation that a test does not catch is not covered, so each was run rather
-than argued.
+than argued. **Round 4's commit message said "every new test" was verified this
+way, and that was not true of one of them** — the failed-ACK test re-seeded
+events after a *successful* ZREM and called that "exactly what a failed ZREM
+looks like". It was not: both reads ran against a healthy Redis and both writes
+succeeded, so an implementation that advanced only on ZREM success would have
+passed it unchanged. Review caught the overclaim. Round 5 splits it in two:
+
+| Test | Deleting the fix produces |
+|---|---|
+| `TestWaitForEventsMakesProgressWhenTheAutoACKFails` | the DM is never reached — empty batch after the full hold |
+| `TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast` (bound tightened to `+1`) | 3 reads where 2 suffice — the ungated entry skip |
+
+The first needed a seam: read-succeeds / write-fails cannot be produced against a
+healthy Redis, so `ackFilteredEvent` is a package-level var a test can point at a
+failing write. That is production surface added for a test, and it is justified
+by exactly this: the property is load-bearing, the round-3 blocker was a loop
+that silently depended on it, and arguing it structurally is what let the flaw
+ship in the first place.
 
 One pre-existing environment trap worth recording: creating the test database
 with MySQL 8's default collation (`utf8mb4_0900_ai_ci`) makes
@@ -249,6 +295,33 @@ Round 4 (this one — see "How this loop terminates" for the reasoning):
   semantics, so `LTRIM 0 1` or an EXPIRE on the wrong key fails it. Both
   mutations were run to confirm. The previous revision had traded that for
   `strings.Contains` on the script text, which catches neither.
+
+Round 5 (approval round — every finding non-blocking, fixed anyway because they
+are all the same failure mode this task keeps producing: **a written claim
+stronger than the code**):
+
+- The invariant gained its third disjunct, and the entry skip its `advanced`
+  gate. `eventPage.advanced` now serves both skip sites, so they cannot diverge
+  again.
+- The decode claim narrowed to what it does: incidental clearing, never a sweep.
+- `docs/bot-events-longpoll.md` said a hold overshoots "by less than one second".
+  Wrong by an order of magnitude: go-redis sets a blocking command's read
+  deadline to `timeout + 10s`, so a Redis that accepts the connection but never
+  answers makes the worst case ~45s for a 30s hold. The doc's conclusion survives
+  (still under a 60s proxy idle timeout) but the margin is 15s, not 29s — and
+  that number is what an operator sizes a proxy from.
+- The `event_id == ZSET score` equality the cursor rests on is now written down
+  in `eventPage`'s doc. True by construction at all five producers today; a future
+  writer scoring by timestamp would break the cursor *and* the auto-ACK silently.
+- The undecodable-member test seeded the corrupt member at the *lower* id, so it
+  passed for the incidental reason while appearing to test the stated one. Ids
+  swapped, so it documents the real boundary.
+
+Left as follow-ups by agreement rather than fixed: a per-bot dimension on the
+hold-off budget, an optional ceiling on consecutive draining re-reads, and the
+pre-existing `GenSeq` block-allocation ordering problem (`event_id` order ≠
+enqueue order, cross-replica and intra-process) — that last one needs a design,
+not a patch to this loop.
 
 ## Out of scope
 
