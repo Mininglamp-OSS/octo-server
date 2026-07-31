@@ -50,11 +50,25 @@ source: self
 - **现状核实**：`modules/bot_api/events.go:59` → `getEventsResult` → `events.go:103`
   单次 `ZRangeByScore(Min: "(eventID", Max: "+inf", Count: limit)`，同步返回。全仓无
   long-poll、无 push、无 bot 回调通道。
-- **入队 chokepoint 已经是单一的**：`enqueueBotEventGeneric`（消息事件）与
-  `enqueueBotTypedEventGeneric`（`card_action` 等类型化事件）两个 helper 统一了
-  GenSeq / ZAdd / Expire 形状，注释明写「Centralizing … means the bot event consumer
-  (/v1/bot/events) sees identical records regardless of which path produced them」。
-  门铃写在这两处即可覆盖全部入队来源，不会漏。
+- **入队点有 5 个，不是 2 个（本条最初写错，PR#685 review 更正）**：
+
+  | 生产者 | ZADD 位置 | 投递内容 |
+  |---|---|---|
+  | `enqueueBotEventGeneric` | `modules/robot/api.go:233` | OBO 扇出等合成事件 |
+  | `enqueueBotTypedEventGeneric` | `modules/robot/api.go:274` | `card_action` |
+  | **`saveRobotMessage`** | **`modules/robot/event.go:365`** | **普通 DM / @提及（量最大）** |
+  | `Group.notifyBotJoinedGroup` | `modules/group/api.go:1982` | `bot_joined_group` |
+  | `Service.notifyBotJoinedGroup` | `modules/group/service.go:2082` | `bot_joined_group` |
+
+  本条原文写的是「两个 helper 统一了 GenSeq/ZAdd/Expire 形状，门铃写在这两处即可覆盖
+  全部入队来源，不会漏」。**这是错的**，而错误来源值得记：`enqueueBotEventGeneric` 的
+  docstring 当时声称自己被 `saveRobotMessage` 使用，实际从未被调用过。我信了注释、没有
+  追调用图，实现继承了这个错误前提，结果量最大的那条路径没有摇铃——真上线后，一旦调用方
+  按契约把轮询间隔归零，普通消息时延反而会退化到 chunk 边界（≤5s）。
+
+  **纪律**：门铃必须挂在**每一个** ZADD 成功之后。这条不变量现在由
+  `pkg/botevent` 的 `TestEveryBotEventQueueWriterRingsTheDoorbell` 源码守卫强制，
+  不再依赖任何注释——注释正是这次出错的载体。
 - **本仓已有 long-poll 先例**：`modules/robot/api.go:855` `inlineQuery` 用
   `select { case <-resultChan; case <-time.After(20s) }` + 408
   （`errcode.ErrRobotInlineQueryTimeout`）。**但它是进程内 channel map，只在单副本正确**

@@ -167,10 +167,15 @@ func TestBotEventsWakesOnDoorbell(t *testing.T) {
 }
 
 // TestBotEventsSurvivesLostDoorbell is the safety property that makes the
-// doorbell acceptable at all: losing it may only cost latency. The event is
-// enqueued with no bell, so the hold runs to its deadline and answers empty —
-// and the very next poll still finds the event, because the sorted set, not the
-// bell, is authoritative.
+// doorbell acceptable at all: losing it may only cost latency, never an event.
+//
+// The precise contract is stronger than "you get it on your next request", and
+// the first version of this test asserted the weaker claim while accidentally
+// passing on the stronger one (PR#685 review, yujiawei). Chunking gives an
+// implicit fallback poll: when the bell never rings, the BLPOP simply times out
+// into `redis.Nil`, control falls through to the authoritative re-read, and the
+// event is returned **within one chunk** — inside the same request. Assert that,
+// not the vaguer version.
 func TestBotEventsSurvivesLostDoorbell(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
@@ -178,27 +183,34 @@ func TestBotEventsSurvivesLostDoorbell(t *testing.T) {
 	clearLongPollKeys(t, ctx)
 	defer clearLongPollKeys(t, ctx)
 
-	done := make(chan lpResponse, 1)
+	type outcome struct {
+		resp    lpResponse
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
 	go func() {
-		resp, _ := pollEvents(t, s, `{"event_id":0,"limit":20,"wait":2}`)
-		done <- resp
+		// wait=8 exceeds one 5s chunk, so a pass cannot come from the hold
+		// simply expiring at the same moment.
+		resp, elapsed := pollEvents(t, s, `{"event_id":0,"limit":20,"wait":8}`)
+		done <- outcome{resp, elapsed}
 	}()
 	time.Sleep(500 * time.Millisecond)
 	enqueueRaw(t, ctx, 303) // deliberately no Ring
 
 	select {
-	case resp := <-done:
-		// The hold could not know about the event; an empty batch here is
-		// correct behavior, not a bug.
-		assert.Equal(t, 1, resp.Status)
-	case <-time.After(20 * time.Second):
-		t.Fatal("hold did not expire")
+	case got := <-done:
+		assert.Equal(t, 1, got.resp.Status)
+		// The event is delivered by the same request that missed the bell —
+		// the authoritative re-read after the chunk expires finds it.
+		assert.Len(t, got.resp.Results, 1, "a lost doorbell must never lose the event")
+		assert.Equal(t, int64(303), got.resp.Results[0].EventID)
+		// Delivered at the chunk boundary, not at the hold deadline: that
+		// bounded fallback is what keeps a silent bell failure at ≤5s.
+		assert.Less(t, got.elapsed, 8*time.Second,
+			"a lost bell must cost one chunk, not the whole hold")
+	case <-time.After(30 * time.Second):
+		t.Fatal("hold never returned")
 	}
-
-	// The event was never lost: the authoritative read picks it up.
-	resp, _ := pollEvents(t, s, `{"event_id":0,"limit":20}`)
-	assert.Len(t, resp.Results, 1, "a lost doorbell must never lose the event")
-	assert.Equal(t, int64(303), resp.Results[0].EventID)
 }
 
 // TestBotEventsReleasesHoldOnClientDisconnect: BLPOP takes no context, so a

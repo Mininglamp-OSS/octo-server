@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -1983,6 +1984,10 @@ func (g *Group) notifyBotJoinedGroup(botMembers []*user.Model, groupNo, operator
 			g.Error("推送bot_joined_group事件失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 			continue
 		}
+		// 同其它入队点：ZADD 成功后摇铃唤醒 /v1/bot/events long-poll。
+		// bot_joined_group 低频且不敏感于时延，但保持「每个写入队列的站点都摇铃」
+		// 这条不变量，才不会再出现 PR#685 那种「漏掉某个生产者」的漂移。
+		_ = botevent.Ring(g.ctx.GetRedisConn(), robotID)
 		g.Info("已推送bot_joined_group事件", zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 	}
 }

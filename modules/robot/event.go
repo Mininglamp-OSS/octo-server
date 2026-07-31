@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -364,6 +365,19 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 	err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson)
 	if err != nil {
 		rb.Error("投递消息给机器人失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("message", messageUpdateJson))
+	} else {
+		// Wake any /v1/bot/events long-poll parked on this bot. Rung only on a
+		// successful ZADD, so a waiter is never sent to look at a queue that did
+		// not accept the event.
+		//
+		// This is the listener fast-path — ordinary DMs and @-mentions, the
+		// highest-volume producer by a wide margin. It does NOT go through
+		// enqueueBotEventGeneric; it carries its own GenSeq/ZAdd/Expire copy, so
+		// it needs its own ring. PR#685 review (Jerry-Xin, mochashanyao,
+		// yujiawei) caught this missing: without it long-poll only woke promptly
+		// for synthetic and typed events, and ordinary message latency would have
+		// regressed to the chunk boundary once callers zeroed their poll interval.
+		_ = botevent.Ring(rb.ctx.GetRedisConn(), robotID)
 	}
 	err = rb.ctx.GetRedisConn().Expire(key, rb.ctx.GetConfig().Robot.MessageExpire)
 	if err != nil {
