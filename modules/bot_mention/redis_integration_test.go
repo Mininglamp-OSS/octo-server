@@ -7,15 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
-	"regexp"
 	"strings"
-	"sync"
 	"testing"
 	"time"
-	"unsafe"
 
-	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -23,13 +19,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/go-redis/redis"
-	"github.com/gocraft/dbr/v2"
-	"github.com/gocraft/dbr/v2/dialect"
 )
 
 const botMentionIntegrationExpire = 2 * time.Minute
-
-var expectSystemSettingsLoadOnce sync.Once
 
 func TestNewRejectsInternalTokenCapabilityCollisions(t *testing.T) {
 	tests := []struct {
@@ -51,7 +43,7 @@ func TestNewRejectsInternalTokenCapabilityCollisions(t *testing.T) {
 			t.Setenv("NOTIFY_INTERNAL_TOKEN", tt.notifyToken)
 			t.Setenv("OCTO_DOCS_NOTIFY_TOKEN", tt.docsToken)
 
-			ctx, _, _ := newBotMentionRedisTestContext(t, botMentionIntegrationExpire)
+			ctx, _ := newBotMentionIntegrationContext(t, botMentionIntegrationExpire)
 			module := New(ctx)
 			closeBotMentionClaimClient(t, module.claims)
 
@@ -62,13 +54,15 @@ func TestNewRejectsInternalTokenCapabilityCollisions(t *testing.T) {
 	}
 }
 
-func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
-	ctx, dbMock, cfg := newBotMentionRedisTestContext(t, botMentionIntegrationExpire)
-	botID := fmt.Sprintf("bot-mention-integration-%d", time.Now().UnixNano())
-	botToken := "bf_bot_mention_integration"
+func TestBotMentionMySQLRedisRobotQueueIntegration(t *testing.T) {
+	ctx, cfg := newBotMentionIntegrationContext(t, botMentionIntegrationExpire)
+	nonce := time.Now().UnixNano()
+	botID := fmt.Sprintf("bm-%d", nonce)
+	botToken := fmt.Sprintf("bf_bm_%d", nonce)
 	request := validMentionRequest()
 	request.BotUID = botID
-	request.IdempotencyKey = fmt.Sprintf("idem-%d", time.Now().UnixNano())
+	request.IdempotencyKey = fmt.Sprintf("idem-%d", nonce)
+	prepareActiveUserBot(t, ctx, botID, botToken)
 
 	claims := newRedisClaimStore(ctx)
 	redisClient := claims.backend.(*redisClaimBackend).client
@@ -80,10 +74,6 @@ func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
 	queueKey := "robotEvent:" + botID
 	claimKey := mentionClaimKey(botID, request.IdempotencyKey)
 	t.Cleanup(func() { _ = redisClient.Del(queueKey, claimKey).Err() })
-
-	expectActiveUserBot(dbMock, botID)
-	expectNewRobotEventSequence(dbMock)
-	expectSystemSettingsLoadOnce.Do(func() { expectSystemSettingsLoad(dbMock) })
 
 	module := &BotMention{
 		robots:        robot.NewService(ctx),
@@ -127,7 +117,6 @@ func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
 		t.Fatalf("queue size after replay = %d, want 1", got)
 	}
 
-	expectBotTokenAuth(dbMock, botID, botToken)
 	pulled := doBotAPIRequest(t, router, http.MethodPost, "/v1/bot/events", botToken, []byte("{\"event_id\":0,\"limit\":10}"))
 	if pulled.Code != http.StatusOK {
 		t.Fatalf("pull status = %d, body=%s", pulled.Code, pulled.Body.String())
@@ -154,7 +143,6 @@ func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
 		t.Fatalf("pulled event data = %#v", event.EventData)
 	}
 
-	expectBotTokenAuth(dbMock, botID, botToken)
 	ackPath := fmt.Sprintf("/v1/bot/events/%d/ack", accepted.EventID)
 	acked := doBotAPIRequest(t, router, http.MethodPost, ackPath, botToken, nil)
 	if acked.Code != http.StatusOK {
@@ -176,40 +164,48 @@ func TestBotMentionRedisRobotQueueIntegration(t *testing.T) {
 	}
 
 	assertRealRedisClaimCAS(t, claims, redisClient)
-	if err := dbMock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("database expectations: %v", err)
-	}
 }
 
-func newBotMentionRedisTestContext(t *testing.T, messageExpire time.Duration) (*config.Context, sqlmock.Sqlmock, *config.Config) {
+func newBotMentionIntegrationContext(t *testing.T, messageExpire time.Duration) (*config.Context, *config.Config) {
 	t.Helper()
 	cfg := config.New()
 	cfg.Test = true
 	cfg.Robot.MessageExpire = messageExpire
+	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true"
+	if dsn := os.Getenv("OCTO_TEST_MYSQL_DSN"); dsn != "" {
+		cfg.DB.MySQLAddr = dsn
+	}
 	if addr := os.Getenv("OCTO_TEST_REDIS_ADDR"); addr != "" {
 		cfg.DB.RedisAddr = addr
 	}
 
 	ctx := config.NewContext(cfg)
-	rawDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
+	var one int
+	if err := ctx.DB().SelectBySql("SELECT 1").LoadOne(&one); err != nil || one != 1 {
+		t.Fatalf("real MySQL is required for bot mention integration test: SELECT 1 = %d, %v", one, err)
 	}
-	mock.MatchExpectationsInOrder(false)
-	conn := &dbr.Connection{DB: rawDB, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
-	injectBotMentionMockDB(t, ctx, conn.NewSession(nil))
-	t.Cleanup(func() { _ = rawDB.Close() })
-	return ctx, mock, cfg
+	t.Cleanup(func() { _ = ctx.DB().Close() })
+	return ctx, cfg
 }
 
-func injectBotMentionMockDB(t *testing.T, ctx *config.Context, session *dbr.Session) {
+func prepareActiveUserBot(t *testing.T, ctx *config.Context, botID, botToken string) {
 	t.Helper()
-	ctxValue := reflect.ValueOf(ctx).Elem()
-	onceField := ctxValue.FieldByName("mysqlOnce")
-	once := (*sync.Once)(unsafe.Pointer(onceField.UnsafeAddr()))
-	once.Do(func() {})
-	sessionField := ctxValue.FieldByName("mySQLSession")
-	reflect.NewAt(sessionField.Type(), unsafe.Pointer(sessionField.UnsafeAddr())).Elem().Set(reflect.ValueOf(session))
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid, bot_token) VALUES (?, 1, ?, ?)",
+		botID, "bot-mention-integration-owner", botToken,
+	).Exec(); err != nil {
+		t.Fatalf("insert integration User Bot: %v", err)
+	}
+
+	seqKey := "seq:" + common.RobotEventSeqKey + botID
+	t.Cleanup(func() {
+		if _, err := ctx.DB().DeleteFrom("seq").Where("`key`=?", seqKey).Exec(); err != nil {
+			t.Errorf("cleanup integration sequence: %v", err)
+		}
+		if _, err := ctx.DB().DeleteFrom("robot").Where("robot_id=?", botID).Exec(); err != nil {
+			t.Errorf("cleanup integration User Bot: %v", err)
+		}
+	})
 }
 
 func closeBotMentionClaimClient(t *testing.T, store botMentionClaimStore) {
@@ -222,30 +218,6 @@ func closeBotMentionClaimClient(t *testing.T, store botMentionClaimStore) {
 	if ok {
 		t.Cleanup(func() { _ = backend.client.Close() })
 	}
-}
-
-func expectActiveUserBot(mock sqlmock.Sqlmock, botID string) {
-	mock.ExpectQuery("(?i)SELECT count\\(\\*\\) FROM robot WHERE .*" +
-		regexp.QuoteMeta("robot_id='"+botID+"'") + ".*status=1").
-		WillReturnRows(sqlmock.NewRows([]string{"count(*)"}).AddRow(1))
-}
-
-func expectNewRobotEventSequence(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery("(?i)SELECT \\* FROM seq WHERE").
-		WillReturnRows(sqlmock.NewRows([]string{"key", "min_seq", "step"}))
-	mock.ExpectExec("(?i)insert into `seq`").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-}
-
-func expectBotTokenAuth(mock sqlmock.Sqlmock, botID, token string) {
-	mock.ExpectQuery("(?i)SELECT \\* FROM robot WHERE .*" +
-		regexp.QuoteMeta("bot_token='"+token+"'") + ".*status=1").
-		WillReturnRows(sqlmock.NewRows([]string{"robot_id", "status", "bot_token"}).AddRow(botID, 1, token))
-}
-
-func expectSystemSettingsLoad(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery("(?i)SELECT \\* FROM system_setting").
-		WillReturnRows(sqlmock.NewRows([]string{"category", "key_name", "value", "value_type", "description"}))
 }
 
 func doBotAPIRequest(t *testing.T, router *wkhttp.WKHttp, method, path, token string, body []byte) *httptest.ResponseRecorder {
