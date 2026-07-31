@@ -45,8 +45,15 @@ type mentionIngressResponse struct {
 func New(ctx *config.Context) *BotMention {
 	logger := log.NewTLog("BotMention")
 	token := os.Getenv(internalTokenEnv)
-	if token == "" {
+	switch {
+	case token == "":
 		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN not set; internal bot mention API will reject all requests")
+	case token == os.Getenv("NOTIFY_INTERNAL_TOKEN"):
+		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
+		token = ""
+	case token == os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"):
+		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
+		token = ""
 	}
 	return &BotMention{
 		robots:        robot.NewService(ctx),
