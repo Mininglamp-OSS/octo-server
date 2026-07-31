@@ -73,11 +73,15 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 	wait := clampEventWait(req.Wait)
 
 	// Read before waiting: a caller with a backlog must never pay the hold.
-	results, err := ba.getEventsResult(robotID, req.EventID, limit)
+	var results []*eventResp
+	page, err := ba.readEventPage(robotID, botKind, req.EventID, limit)
 	if err == nil {
-		results = ba.filterAppBotEvents(botKind, robotID, results)
+		results = page.visible
+		// The entry page is handed to the hold rather than discarded: it carries
+		// how far the read advanced and whether it filled, and the loop needs
+		// both to guarantee it makes progress. See waitForEvents.
 		if len(results) == 0 && wait > 0 {
-			results, err = ba.waitForEvents(c, robotID, req.EventID, limit, botKind, wait)
+			results, err = ba.waitForEvents(c, robotID, botKind, limit, wait, page)
 		}
 	}
 	// Single error exit. The legacy `status:0` shape is kept verbatim for wire
@@ -134,7 +138,52 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 	return filtered
 }
 
-func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([]*eventResp, error) {
+// eventPage is one authoritative read of a bot's event queue: what this caller
+// may see, how far the queue cursor moved, and whether the page filled.
+//
+// cursor is the load-bearing field. It advances to the highest event id the read
+// *observed* — before the App Bot filter, and regardless of whether the auto-ACK
+// ZREM that the filter issues afterwards succeeded. That is what makes the
+// long-poll loop's forward progress structural: it is derived from the read the
+// loop just performed, not from a write whose error is only logged.
+type eventPage struct {
+	// visible is what may be returned to the caller.
+	visible []*eventResp
+	// cursor is the exclusive lower bound for the next read.
+	cursor int64
+	// full reports that the read returned a whole page of sorted-set members, so
+	// more may be queued directly behind it. Counted from the *raw* members, not
+	// from the decoded events or from visible: a member that failed to decode
+	// still occupied a slot in the page.
+	full bool
+}
+
+// readEventPage performs one authoritative read at cursor and applies the App
+// Bot filter. Both the immediate path and the long-poll loop go through it, so
+// the two cannot drift in what they read, what they filter, or how far they
+// advance.
+func (ba *BotAPI) readEventPage(robotID string, botKind string, cursor int64, limit int64) (eventPage, error) {
+	raw, members, err := ba.getEventsResult(robotID, cursor, limit)
+	if err != nil {
+		return eventPage{}, err
+	}
+	page := eventPage{cursor: cursor, full: int64(members) >= limit}
+	// Advance before filtering. ZRangeByScore returns ascending, so the last
+	// event carries the maximum, but scanning does not depend on that ordering.
+	for _, r := range raw {
+		if r.EventID > page.cursor {
+			page.cursor = r.EventID
+		}
+	}
+	page.visible = ba.filterAppBotEvents(botKind, robotID, raw)
+	return page, nil
+}
+
+// getEventsResult reads one page of the queue. It returns the decoded events and
+// the number of raw sorted-set members the read returned; the two differ when a
+// member fails to decode, and callers need the raw count to tell a full page
+// from a short one.
+func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([]*eventResp, int, error) {
 	key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
 	robotEventJsons, err := ba.ctx.GetRedisConn().ZRangeByScore(key, redis.ZRangeBy{
 		Max:   "+inf",
@@ -142,7 +191,7 @@ func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([
 		Count: limit,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	results := make([]*eventResp, 0)
@@ -195,7 +244,7 @@ func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([
 			results = append(results, resp)
 		}
 	}
-	return results, nil
+	return results, len(robotEventJsons), nil
 }
 
 // eventAck handles POST /v1/bot/events/:event_id/ack.

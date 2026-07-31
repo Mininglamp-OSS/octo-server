@@ -246,8 +246,12 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 	// Wake any /v1/bot/events long-poll parked on this bot. Rung after the ZADD
 	// so a waiter can never be woken toward an event the queue does not have
 	// yet. Best-effort by contract (see pkg/botevent): a dropped bell costs the
-	// waiter latency, never the event.
-	_ = botevent.Ring(botevent.RingClient(ctx.GetConfig()), robotID)
+	// waiter up to one chunk of latency, never the event — so it must not fail
+	// the enqueue, but it must not be silent either. The ring has its own
+	// connection pool, so it can fail while the ZADD above succeeded.
+	if err := botevent.Ring(botevent.RingClient(ctx.GetConfig()), robotID); err != nil {
+		log.Warn("ring bot event doorbell failed", zap.String("robotID", robotID), zap.Error(err))
+	}
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — do not fail the enqueue. Mirrors
 		// saveRobotMessage which also only logs on Expire failure.
@@ -285,8 +289,11 @@ func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string,
 		return 0, err
 	}
 	// 同 enqueueBotEventGeneric：ZADD 成功后摇铃唤醒 long-poll。card_action 正是
-	// 走本路径入队，卡片交互的端到端时延收益就落在这一行上。
-	_ = botevent.Ring(botevent.RingClient(ctx.GetConfig()), robotID)
+	// 走本路径入队，卡片交互的端到端时延收益就落在这一行上；摇铃走独立连接池，
+	// 可能在 ZADD 成功的情况下单独失败，因此记录而不是静默丢弃。
+	if err := botevent.Ring(botevent.RingClient(ctx.GetConfig()), robotID); err != nil {
+		log.Warn("ring bot event doorbell failed", zap.String("robotID", robotID), zap.Error(err))
+	}
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
 		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。

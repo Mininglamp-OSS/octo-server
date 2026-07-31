@@ -59,6 +59,12 @@ poll cadence — the open item D5 named explicitly rather than leaving implied.
   already exists, but it is single-replica-correct only; this queue is consumed
   by whichever replica the bot reaches. Blocking had to happen inside Redis.
 
+- **The hold loop's progress is an invariant, not an accident.** Every iteration
+  either burns a chunk of wall clock or advances the queue cursor, never neither.
+  That sentence is the whole design of `waitForEvents`, and it took three review
+  rounds to arrive at because each round answered one branch of it in isolation.
+  See "How this loop terminates" below.
+
 ## Gotchas worth remembering
 
 - **`BLPOP 0` means block forever, and go-redis truncates toward zero.**
@@ -78,19 +84,91 @@ poll cadence — the open item D5 named explicitly rather than leaving implied.
   `bot_api` and `robot` carry different migration sets; sharing `test` produces
   "unknown migration in database". Reset between packages.
 
+## How this loop terminates (and why it needed four rounds)
+
+The endpoint's stated purpose is to stop bot delivery latency tracking the poll
+cadence. Its stated *risk* is that a hold, unlike a short poll, keeps running
+while things go wrong — so every branch has to cost something. Four review rounds
+found four branches where it did not, all in the same function:
+
+| Round | Branch that made no progress | What it cost |
+|---|---|---|
+| 1 | three of five producers never rang | ordinary messages waited a chunk |
+| 2 | a refused hold answered instantly | instant re-request, load amplification at capacity |
+| 3 | a failing BLPOP retried unpaced | **924 reads in 8s**, one log line each |
+| 3 | a full page that advanced nothing skipped the block | **38,722 reads in 6s**, completely unpaced |
+
+Both numbers are measured, by deleting the fix and re-running the regression
+test: `TestWaitForEventsPacesAFailingDoorbell` and
+`TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast` count Redis's own
+`INFO commandstats` `zrangebyscore` calls, so the assertion is about what the
+server was asked to do rather than what the test believes the code did.
+
+The fix was to stop answering branches and state the invariant instead:
+
+> **Every iteration either burns at least one chunk of wall clock, or advances
+> the queue cursor. Never neither.**
+
+- BLPOP timed out (`redis.Nil`) → the chunk was spent.
+- BLPOP returned a token → a producer rang, so a ZADD landed, so the read
+  advances.
+- BLPOP **failed** → go-redis returns dial/protocol errors after
+  `MinRetryBackoff` (~8ms), *not* after the chunk, because a read timeout is the
+  one error class excluded here. So the error path pays out the chunk remainder
+  explicitly, and logs once per hold rather than once per iteration.
+- The block was skipped → only permitted when the previous read actually moved
+  the cursor.
+
+The cursor is monotonic and bounded by the queue's maximum event id; the chunk
+count is bounded by the deadline. Nothing in that argument depends on a write
+succeeding.
+
+**The cursor comes from the read, never from the ACK.** `readEventPage` advances
+to the highest `event_id` it observed *before* the App Bot filter runs. The
+earlier revision reasoned "the filtered events were auto-ACK'd out of the queue,
+so we cannot see them again" — but `filterAppBotEvents` only *warns* when its
+`ZRemRangeByScore` fails, and "reads work, writes do not" is an ordinary Redis
+state (MISCONF after a failed RDB save, a READONLY replica, a write-denying ACL).
+Deriving progress from the read makes it structural. It also covers members that
+fail to decode, which the ACK never touched at all: without it, a corrupt queue
+head starves every event behind it — the read keeps returning the same `limit`
+bad members forever.
+
+`readEventPage` is now the single seam both paths go through, so the immediate
+read and the hold cannot drift in what they read, what they filter, or how far
+they advance. Threading the entry page into `waitForEvents` is what closes the
+first iteration too: a backlog that was already in the queue when the request
+arrived will never get a *new* bell, so blocking for one first is pure latency.
+
 ## Known bounds (deliberate, recorded rather than hidden)
 
 - `register.Module` has no shutdown hook and `main.go` does not gracefully stop
   the API server, so an in-flight hold can extend process drain by at most one
   5s chunk. Adding an uncalled `Stop()` would have been dead code; the chunk
   size is the bound.
-- Producers discard `Ring`'s error and do not log it, matching the neighbouring
-  best-effort `Expire` refresh. A persistently failing bell degrades every hold
-  to "wait out the full timeout" **silently**. Closing that belongs to the card
-  ingress observability work (G1), which owns the metric namespace.
+- A persistently failing bell degrades every hold to chunk-paced authoritative
+  re-reads — ≤5s of extra latency, not "wait out the full timeout" as an earlier
+  version of this file claimed. Chunking *is* the fallback poll. Producers now
+  log a Warn when `Ring` fails, which matters because the ring moved onto its own
+  pool: a ZADD can succeed on a warm shared connection while the ring pool cannot
+  get one at all. A counter still belongs to G1, which owns the namespace.
 - Hold budgets are per process. With N replicas one bot can park a hold on each,
   so the fleet ceiling is `maxEventHolds × N` — bounded and intended, but not a
   distributed invariant.
+- Three Redis pools per replica now: shared, wait (`maxEventHolds + 4` = 68),
+  ring (10). 78 connections before the shared pool, `× N` replicas — the number
+  to check against `maxclients`, and the one the brief originally omitted.
+  `docs/bot-events-longpoll.md` carries it for operators.
+- A page in which *every* member fails to decode cannot advance the cursor, so
+  that request is starved for its remaining hold. Bounded and non-spinning (the
+  loop falls back to blocking), and every skipped member logs. Advancing past it
+  would need the ZSet **score** rather than the payload's `event_id`; octo-lib's
+  `redis.Conn` exposes no `ZRangeByScoreWithScores`, so that is a separate change.
+- The refused-hold pause has a budget of `maxEventHolds × 4`, chosen rather than
+  measured: enough that a bot fleet briefly running two pollers during a rolling
+  restart is still paced, bounded so the refusal path cannot out-consume the
+  success path. Past it the answer is the instant empty batch — the same thing
+  every caller that omits `wait` already gets.
 
 ## Verification
 
@@ -111,7 +189,32 @@ server from this branch: no `wait` returned in 105ms, `wait=3` in 3017ms with an
 ordinary empty batch, and an event injected 1.5s into a 20s hold returned at
 1551ms — about 50ms after the event landed, 18s before the deadline.
 
+Multi-replica behaviour was checked with two real replicas contending for one
+doorbell token: A returned at 2014ms, B at 5031ms (its chunk boundary), and
+**both received the event** — the chunked fallback poll doing exactly what the
+safety argument claims.
+
+Round 4 added five cases and verified each by deleting its fix:
+
+| Test | Deleting the fix produces |
+|---|---|
+| `TestWaitForEventsPacesAFailingDoorbell` | 924 `zrangebyscore` in 8s |
+| `TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast` | 38,722 in 6s |
+| `TestWaitForEventsDrainsAFilteredBacklogWithoutBlocking` | the DM waits a full chunk |
+| `TestRingLeavesExactlyOneTokenHoweverOftenItRings` | `LTRIM 0 1` → 2 tokens |
+| `TestRingExpiresTheBellKeyItPushedTo` | EXPIRE on another key → no TTL on the bell |
+
+A mutation that a test does not catch is not covered, so each was run rather
+than argued.
+
+One pre-existing environment trap worth recording: creating the test database
+with MySQL 8's default collation (`utf8mb4_0900_ai_ci`) makes
+`20260308000002_space_legacy01.sql` fail with "Illegal mix of collations", and
+the panic looks like a code failure. Create it `collate utf8mb4_general_ci`.
+
 ## Review follow-ups applied
+
+Round 2:
 
 - Removed a second copy of the legacy raw `status:0` error response that the
   long-poll branch had introduced; there is now a single error exit. The repo
@@ -120,6 +223,32 @@ ordinary empty batch, and an event injected 1.5s into a 20s hold returned at
   logging only" while both callers discarded it without logging.
 - Scoped the "one hold per bot" comment to the process, so it is not read as a
   cluster-wide guarantee.
+
+Round 3:
+
+- A refused hold pauses for up to one chunk instead of answering instantly.
+- `botevent.Ring` became one Lua call through its own small pool, measured
+  256µs → 69.6µs per ring.
+- `maxAllowedEventHolds` clamps the operator override, which previously could
+  ask go-redis for a million-connection pool.
+
+Round 4 (this one — see "How this loop terminates" for the reasoning):
+
+- The BLPOP error path pays out its chunk and logs once per hold.
+- `readEventPage` gives both paths one seam, and the cursor advances from the
+  read rather than from the auto-ACK.
+- The entry read's page is threaded into the hold, so the first iteration drains
+  a pre-existing backlog instead of blocking on a bell that will never ring.
+- The refused-hold pause got a budget of its own, so back-pressure cannot become
+  the resource sink.
+- `Ring` failures are logged at all five producers; `rd.NewScript` replaces raw
+  `EVAL`; `OCTO_BOT_EVENTS_MAX_HOLDS` is validated at boot and documented in
+  `docs/bot-events-longpoll.md`.
+- `pkg/botevent`'s unit test went back to being behavioural: the fake now parses
+  whatever `redis.call` lines the script contains and applies real Redis
+  semantics, so `LTRIM 0 1` or an EXPIRE on the wrong key fails it. Both
+  mutations were run to confirm. The previous revision had traded that for
+  `strings.Contains` on the script text, which catches neither.
 
 ## Out of scope
 

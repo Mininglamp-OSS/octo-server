@@ -1,8 +1,10 @@
 package bot_api
 
 import (
+	"context"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +39,29 @@ import (
 // The waiter therefore gets its own instrumented client sized to the hold cap,
 // following the same explicit-PoolSize convention as the rate-limit clients in
 // modules/user, modules/incomingwebhook, modules/file and modules/group.
-// Producers keep ringing on the shared pool: LPUSH/LTRIM/EXPIRE never block.
+//
+// Producers do not share this pool. They ring through pkg/botevent's own small
+// client (ringPoolSize = 10), because a ring is one EVALSHA that returns
+// immediately and must never queue behind a parked hold. Three pools per replica
+// therefore exist: shared, wait (maxEventHolds + 4), ring (10) — the number an
+// operator sizes Redis `maxclients` from.
+//
+// # How the hold loop guarantees it terminates
+//
+// Every iteration either burns at least one chunk of wall clock or advances the
+// queue cursor, and never neither:
+//   - BLPOP timed out (redis.Nil): the chunk was spent.
+//   - BLPOP returned a token: a producer rang, which means a ZADD landed, so the
+//     read that follows advances the cursor.
+//   - BLPOP failed: the error path explicitly pays out the rest of the chunk
+//     (go-redis returns dial/protocol errors in ~8ms, so nothing else would).
+//   - the block was skipped: only permitted when the previous read actually
+//     moved the cursor.
+//
+// The cursor is monotonic and bounded by the queue's maximum event id, and the
+// chunk count is bounded by the deadline. Nothing in that argument depends on a
+// write succeeding — in particular not on the filter's auto-ACK ZREM, whose
+// error is only logged.
 
 const (
 	// maxEventWaitSeconds caps the hold. 30s stays well under the 60s idle
@@ -69,6 +93,31 @@ const (
 	// unclamped value would ask go-redis for a million-connection pool, and a
 	// value near MaxInt would overflow `holds + eventWaitPoolHeadroom`.
 	maxAllowedEventHolds = 4096
+
+	// eventHoldOffFactor sizes the budget for *refused* holds relative to the
+	// granted-hold cap.
+	//
+	// A refused hold sleeps out a chunk instead of answering instantly, which is
+	// deliberate back-pressure (see holdOffRefusedWait). But that sleeper holds
+	// an HTTP handler, a goroutine and a timer while being counted by neither
+	// the per-bot map nor the global semaphore — so without a budget of its own
+	// the refusal path could occupy more of the process than the success path
+	// it protects, which is the wrong way round. /v1/bot has no per-bot rate
+	// middleware (bots have no login uid), so nothing upstream bounds it either.
+	//
+	// Four times the hold cap, rather than one: a legitimate bot fleet doubles
+	// its pollers briefly during a rolling restart, and capacity refusals are
+	// expected to outnumber granted holds precisely when the cap is doing its
+	// job. Beyond the budget the answer reverts to the instant empty batch,
+	// which is what every caller that does not send `wait` already gets — a safe
+	// floor, not a new failure mode.
+	eventHoldOffFactor = 4
+
+	// maxEventHoldsEnv overrides defaultMaxEventHolds. Documented in
+	// docs/bot-events-longpoll.md; resolved and validated once at boot
+	// (NewBotAPI) so a bad value surfaces at deploy rather than on the first
+	// long-poll request.
+	maxEventHoldsEnv = "OCTO_BOT_EVENTS_MAX_HOLDS"
 )
 
 // clampEventWait converts the caller's `wait` (seconds) into a hold duration.
@@ -112,31 +161,75 @@ func eventWaitChunkFor(remaining time.Duration) time.Duration {
 	return chunks * time.Second
 }
 
-// maxEventHolds resolves the concurrent-hold cap, overridable for deployments
-// with unusual bot counts. A non-positive or unparseable value falls back to
-// the default rather than disabling the cap.
-func maxEventHolds() int {
-	if raw := os.Getenv("OCTO_BOT_EVENTS_MAX_HOLDS"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			if n > maxAllowedEventHolds {
-				return maxAllowedEventHolds
-			}
-			return n
-		}
+// parseMaxEventHolds interprets the OCTO_BOT_EVENTS_MAX_HOLDS override.
+//
+// Pure, so the boot-time resolution and its tests exercise the same code. The
+// second return value is the reason the raw value was not used verbatim, empty
+// when it was (or when none was set); callers log it. A non-positive or
+// unparseable value falls back to the default rather than disabling the cap —
+// an unbounded cap would let holds exhaust the pool they live in.
+func parseMaxEventHolds(raw string) (int, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultMaxEventHolds, ""
 	}
-	return defaultMaxEventHolds
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultMaxEventHolds, "not an integer"
+	}
+	if n <= 0 {
+		return defaultMaxEventHolds, "must be positive"
+	}
+	if n > maxAllowedEventHolds {
+		return maxAllowedEventHolds, "above the maximum"
+	}
+	return n, ""
 }
 
 var (
 	eventWaitRedisOnce sync.Once
 	eventWaitRedis     *rd.Client
 
+	eventHoldsOnce sync.Once
+	eventHoldsN    int
+	eventHoldsNote string
+
 	eventHoldOnce sync.Once
 	eventHoldSem  chan struct{}
+
+	eventHoldOffOnce sync.Once
+	eventHoldOffSem  chan struct{}
 
 	eventHoldPerBotMu sync.Mutex
 	eventHoldPerBot   = map[string]struct{}{}
 )
+
+// maxEventHolds resolves the concurrent-hold cap once per process.
+//
+// Resolved once rather than per call because two independent things are sized
+// from it — the semaphore and the dedicated pool — and an environment that
+// changed between those two reads would leave them disagreeing.
+func maxEventHolds() int {
+	eventHoldsOnce.Do(func() {
+		eventHoldsN, eventHoldsNote = parseMaxEventHolds(os.Getenv(maxEventHoldsEnv))
+	})
+	return eventHoldsN
+}
+
+// resolveEventHoldBudget forces that resolution at boot and reports a rejected
+// or clamped override, so an operator typo shows up in the startup log rather
+// than silently taking effect on the first long-poll request. Modelled on
+// ParseRPSFromEnv's warn-and-fall-back in main.go.
+func (ba *BotAPI) resolveEventHoldBudget() {
+	holds := maxEventHolds()
+	if eventHoldsNote != "" {
+		ba.Warn("bot event hold cap override not used as given",
+			zap.String("env", maxEventHoldsEnv),
+			zap.String("value", os.Getenv(maxEventHoldsEnv)),
+			zap.String("reason", eventHoldsNote),
+			zap.Int("using", holds))
+	}
+}
 
 // sharedEventWaitRedis builds the process-wide dedicated client for BLPOP.
 // Built through octoredis so TLS options are honoured and the redis chokepoint
@@ -159,10 +252,10 @@ func sharedEventWaitRedis(cfg *config.Config) *rd.Client {
 }
 
 // acquireEventHold takes both the global slot and the per-bot slot. It returns
-// false when either is unavailable; callers then answer immediately with an
-// empty batch, which is exactly the pre-long-poll behavior. Refusing to hold is
-// a degradation, never an error — matching the fail-open posture of the shared
-// rate-limit middleware.
+// false when either is unavailable; the caller then hands the request to
+// holdOffRefusedWait, which answers with an empty batch after a bounded pause
+// rather than instantly. Refusing to hold is a degradation, never an error —
+// matching the fail-open posture of the shared rate-limit middleware.
 //
 // Scope: both budgets are **per process**, which is the scope that matters
 // because the resource being protected — this replica's dedicated Redis pool —
@@ -205,49 +298,96 @@ func acquireEventHold(robotID string) (release func(), ok bool) {
 	}, true
 }
 
+// acquireHoldOff takes a slot in the refused-hold budget. It returns false when
+// the budget is exhausted, and the caller then answers instantly — the shape
+// every caller that omits `wait` already gets.
+func acquireHoldOff() (release func(), ok bool) {
+	eventHoldOffOnce.Do(func() {
+		eventHoldOffSem = make(chan struct{}, maxEventHolds()*eventHoldOffFactor)
+	})
+	select {
+	case eventHoldOffSem <- struct{}{}:
+	default:
+		return nil, false
+	}
+	var once sync.Once
+	return func() { once.Do(func() { <-eventHoldOffSem }) }, true
+}
+
+// holdOffRefusedWait answers a refused hold after a bounded pause.
+//
+// A refused hold answered immediately is indistinguishable on the wire from a
+// served one, and a long-poll client has no interval to fall back on, so an
+// instant empty batch invites an instant re-request. Each of those still costs a
+// full ZRangeByScore before it gets here, so the endpoint would answer capacity
+// exhaustion by *amplifying* load on the replica that is already saturated.
+// Making refusal cost the caller one chunk makes it self-limiting and shaped
+// like an idle hold.
+//
+// The pause is itself budgeted (see eventHoldOffFactor): back-pressure that can
+// occupy the process without bound is not back-pressure.
+func (ba *BotAPI) holdOffRefusedWait(ctx context.Context, wait time.Duration) {
+	release, ok := acquireHoldOff()
+	if !ok {
+		return
+	}
+	defer release()
+	holdOff := wait
+	if holdOff > eventWaitChunk {
+		holdOff = eventWaitChunk
+	}
+	_ = sleepOrDone(ctx, holdOff)
+}
+
+// sleepOrDone waits out d unless the request ends first. It reports whether the
+// pause completed; false means the caller went away, which every call site
+// treats as "stop".
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // waitForEvents parks until an event lands for robotID, the hold expires, or the
 // caller goes away. It returns the same shape the immediate path returns; an
 // expired hold yields an empty batch, not an error, because "nothing happened"
 // is a normal outcome and not a failure the caller can act on.
 //
 // The doorbell only decides *when* to look. Every wake-up re-reads the
-// authoritative sorted set from the caller's cursor, so a bell that was lost,
-// stolen by another waiter, or left over from an already-consumed event costs
-// at most one wasted wake-up — never an event.
+// authoritative sorted set, so a bell that was lost, stolen by another waiter,
+// or left over from an already-consumed event costs at most one wasted wake-up
+// — never an event.
+//
+// `entry` is the read getEvents already performed. Threading it in rather than
+// starting over is what lets the loop begin from an advanced cursor and, when
+// that read filled its page, re-read immediately instead of blocking for a
+// backlog no new bell will announce. See the file header for why the loop
+// terminates.
 func (ba *BotAPI) waitForEvents(
 	c *wkhttp.Context,
 	robotID string,
-	sinceEventID int64,
-	limit int64,
 	botKind string,
+	limit int64,
 	wait time.Duration,
+	entry eventPage,
 ) ([]*eventResp, error) {
 	empty := make([]*eventResp, 0)
 
 	reqCtx := c.Request.Context()
+	deadline := time.Now().Add(wait)
 
 	release, ok := acquireEventHold(robotID)
 	if !ok {
-		// At capacity, or this bot is already parked elsewhere. Degrade to an
-		// empty batch rather than erroring — but *not* instantly.
-		//
-		// A refused hold answered immediately is indistinguishable on the wire
-		// from a served one, and a long-poll client has no interval to fall back
-		// on, so an instant empty batch invites an instant re-request. Each of
-		// those still costs a full ZRangeByScore before it gets here, so the
-		// endpoint would answer capacity exhaustion by *amplifying* load on the
-		// replica that is already saturated. Making refusal cost the caller one
-		// chunk makes it self-limiting and shaped like an idle hold.
-		holdOff := wait
-		if holdOff > eventWaitChunk {
-			holdOff = eventWaitChunk
-		}
-		timer := time.NewTimer(holdOff)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-reqCtx.Done():
-		}
+		// At capacity, or this bot is already parked elsewhere.
+		ba.holdOffRefusedWait(reqCtx, wait)
 		return empty, nil
 	}
 	defer release()
@@ -258,13 +398,15 @@ func (ba *BotAPI) waitForEvents(
 	}
 
 	bellKey := botevent.BellKey(robotID)
-	deadline := time.Now().Add(wait)
-	// A full page is itself evidence that more may be queued behind it, so the
-	// next iteration re-reads instead of blocking: no *new* bell will ring for
-	// events that were already enqueued, and the one token that existed was
-	// consumed by the previous iteration. Without this an App Bot draining a
-	// backlog of filtered events advances only one page per chunk.
-	skipBlock := false
+	cursor := entry.cursor
+	// A full page is evidence that more may be queued behind it, and no *new*
+	// bell will ring for events that were already enqueued when this request
+	// arrived. Carrying the entry read's fullness in means the first iteration
+	// re-reads rather than blocking; without it an App Bot whose queue holds a
+	// page of filtered events followed by a deliverable DM waits a whole chunk
+	// for a message that was already there.
+	reread := entry.full
+	warned := false
 
 	for {
 		if reqCtx.Err() != nil {
@@ -275,42 +417,61 @@ func (ba *BotAPI) waitForEvents(
 			return empty, nil
 		}
 
-		if !skipBlock {
+		if !reread {
+			blockStarted := time.Now()
 			if _, err := client.BLPop(chunk, bellKey).Result(); err != nil && err != rd.Nil {
-				// A doorbell failure must not fail the request: the queue is the
-				// authority. But it must not collapse the hold either — returning
-				// here would turn one transient Redis blip into a ~0s answer for a
-				// 30s hold, which is exactly the instant-empty shape described
-				// above. Log once and let the loop fall through to the
-				// authoritative read; the next iteration retries the next chunk,
-				// so a persistent failure degrades to chunk-paced polling rather
-				// than to an immediate empty batch.
-				ba.Warn("bot event doorbell wait failed",
-					zap.String("robotID", robotID), zap.Error(err))
+				// A doorbell failure must not fail the request — the queue is the
+				// authority — and must not collapse the hold either: returning
+				// here would turn one transient blip into a ~0s answer for a 30s
+				// hold. So fall through to the authoritative read and retry.
+				//
+				// But a failing BLPOP provides no pacing of its own. redis.Nil is
+				// excluded above, so every error reaching here is a dial, write,
+				// protocol or server error, and go-redis returns those after
+				// MinRetryBackoff (~8ms), not after `chunk`. Left to itself this
+				// loop would run at ~50-100Hz for the rest of the hold, issuing a
+				// full ZRangeByScore and a log line each time — answering a Redis
+				// capacity incident (`ERR max number of clients reached` is
+				// classified retryable) with read and log amplification. Pay out
+				// the rest of the chunk explicitly, and log once per hold.
+				if !warned {
+					warned = true
+					ba.Warn("bot event doorbell wait failed; falling back to chunk-paced re-reads",
+						zap.String("robotID", robotID), zap.Error(err))
+				}
+				if rest := chunk - time.Since(blockStarted); rest > 0 {
+					if !sleepOrDone(reqCtx, rest) {
+						return empty, nil
+					}
+				}
 			}
 		}
-		skipBlock = false
+		reread = false
 
 		if reqCtx.Err() != nil {
 			return empty, nil
 		}
 
-		results, err := ba.getEventsResult(robotID, sinceEventID, limit)
+		page, err := ba.readEventPage(robotID, botKind, cursor, limit)
 		if err != nil {
 			return nil, err
 		}
-		fullPage := int64(len(results)) >= limit
-		results = ba.filterAppBotEvents(botKind, robotID, results)
-		if len(results) > 0 {
-			return results, nil
+		if len(page.visible) > 0 {
+			return page.visible, nil
 		}
-		// Nothing visible to this caller. That includes the case where the batch
-		// was non-empty but the App Bot filter emptied it: those events were
-		// auto-ACK'd out of the queue, so looping cannot spin on them, and
-		// answering "here is nothing" early would waste the hold the caller
-		// asked for. If that batch filled the page, skip the next block and
-		// re-read straight away — the ZREM changed the state the read was based
-		// on, so blocking would stall a deliverable event behind the backlog.
-		skipBlock = fullPage
+		// Nothing this caller may see — the page was empty, or the App Bot filter
+		// emptied it. Advance past everything the read observed, including events
+		// the filter dropped and members that failed to decode, so the next
+		// iteration cannot be handed the same page again. This does not depend on
+		// the filter's auto-ACK ZREM having succeeded (it only warns on failure),
+		// which is what makes progress here structural rather than circumstantial.
+		//
+		// Skipping the block is then safe *only* when the cursor actually moved.
+		// A full page that advanced nothing — every member undecodable — would
+		// otherwise spin unpaced for the rest of the hold; falling back to the
+		// block costs one chunk and keeps the failure bounded.
+		advanced := page.cursor > cursor
+		cursor = page.cursor
+		reread = page.full && advanced
 	}
 }

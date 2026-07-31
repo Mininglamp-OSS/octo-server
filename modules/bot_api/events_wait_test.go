@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -14,19 +15,20 @@ import (
 // rather than construct their own.
 func resetEventHoldState(t *testing.T, cap int) {
 	t.Helper()
-	eventHoldOnce = sync.Once{}
-	eventHoldSem = nil
-	eventHoldPerBotMu.Lock()
-	eventHoldPerBot = map[string]struct{}{}
-	eventHoldPerBotMu.Unlock()
-	t.Setenv("OCTO_BOT_EVENTS_MAX_HOLDS", itoa(int64(cap)))
-	t.Cleanup(func() {
+	clear := func() {
+		eventHoldsOnce = sync.Once{}
+		eventHoldsN, eventHoldsNote = 0, ""
 		eventHoldOnce = sync.Once{}
 		eventHoldSem = nil
+		eventHoldOffOnce = sync.Once{}
+		eventHoldOffSem = nil
 		eventHoldPerBotMu.Lock()
 		eventHoldPerBot = map[string]struct{}{}
 		eventHoldPerBotMu.Unlock()
-	})
+	}
+	clear()
+	t.Setenv(maxEventHoldsEnv, itoa(int64(cap)))
+	t.Cleanup(clear)
 }
 
 func TestClampEventWaitPreservesLegacyBehaviorByDefault(t *testing.T) {
@@ -111,7 +113,7 @@ func TestEventWaitPoolCoversTheHoldCap(t *testing.T) {
 	// Each hold pins one connection for its whole duration. If the cap could
 	// exceed the pool, waiters would queue for connections inside the pool and
 	// the isolation the dedicated client exists to provide would be defeated.
-	t.Setenv("OCTO_BOT_EVENTS_MAX_HOLDS", "32")
+	resetEventHoldState(t, 32)
 	if got := maxEventHolds(); got != 32 {
 		t.Fatalf("maxEventHolds() = %d, want 32", got)
 	}
@@ -120,13 +122,155 @@ func TestEventWaitPoolCoversTheHoldCap(t *testing.T) {
 	}
 }
 
-func TestMaxEventHoldsRejectsUnusableOverrides(t *testing.T) {
-	for _, raw := range []string{"", "0", "-1", "abc"} {
-		t.Setenv("OCTO_BOT_EVENTS_MAX_HOLDS", raw)
-		// A bad override must fall back to the default, never disable the cap
-		// (an unbounded cap would let holds exhaust the pool).
-		if got := maxEventHolds(); got != defaultMaxEventHolds {
-			t.Fatalf("override %q gave %d, want the default %d", raw, got, defaultMaxEventHolds)
+func TestParseMaxEventHoldsHandlesEveryOverrideShape(t *testing.T) {
+	cases := []struct {
+		raw      string
+		want     int
+		wantNote bool
+	}{
+		// A bad override falls back to the default, never disabling the cap: an
+		// unbounded cap would let holds exhaust the pool they live in.
+		{"", defaultMaxEventHolds, false},
+		{"   ", defaultMaxEventHolds, false},
+		{"0", defaultMaxEventHolds, true},
+		{"-1", defaultMaxEventHolds, true},
+		{"abc", defaultMaxEventHolds, true},
+		{"32", 32, false},
+		{" 32 ", 32, false},
+		// The clamp is the one that *allocates*: it sizes both a channel and a
+		// Redis pool, so an unclamped value would ask go-redis for a
+		// million-connection pool.
+		{"1000000", maxAllowedEventHolds, true},
+		{"4097", maxAllowedEventHolds, true},
+		{"4096", maxAllowedEventHolds, false},
+	}
+	for _, tc := range cases {
+		got, note := parseMaxEventHolds(tc.raw)
+		if got != tc.want {
+			t.Fatalf("parseMaxEventHolds(%q) = %d, want %d", tc.raw, got, tc.want)
+		}
+		// Every value that is not used verbatim must explain itself, so the
+		// boot-time Warn can name the reason instead of silently substituting.
+		if (note != "") != tc.wantNote {
+			t.Fatalf("parseMaxEventHolds(%q) note = %q, wantNote=%v", tc.raw, note, tc.wantNote)
+		}
+	}
+}
+
+func TestMaxEventHoldsResolvesOnceForTheWholeProcess(t *testing.T) {
+	// The cap sizes two independent things — the semaphore and the dedicated
+	// Redis pool — which are built at different moments. Re-reading the
+	// environment for each would let them disagree.
+	resetEventHoldState(t, 12)
+	if got := maxEventHolds(); got != 12 {
+		t.Fatalf("maxEventHolds() = %d, want 12", got)
+	}
+	t.Setenv(maxEventHoldsEnv, "99")
+	if got := maxEventHolds(); got != 12 {
+		t.Fatalf("maxEventHolds() = %d after the environment changed, want the resolved 12", got)
+	}
+}
+
+func TestSleepOrDoneReportsCancellationRatherThanWaitingItOut(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if sleepOrDone(ctx, 5*time.Second) {
+		t.Fatal("a cancelled request must not be reported as a completed pause")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cancellation took %v to notice", elapsed)
+	}
+	// A non-positive pause is a no-op, not an infinite one.
+	if !sleepOrDone(context.Background(), 0) {
+		t.Fatal("a zero pause must complete")
+	}
+}
+
+func TestHoldOffRefusedWaitPausesTheCallerButNotBeyondOneChunk(t *testing.T) {
+	resetEventHoldState(t, 4)
+	ba := &BotAPI{}
+
+	// A refused hold answered instantly is indistinguishable on the wire from a
+	// served one, and a long-poll client has no interval to fall back on — so it
+	// re-requests immediately, amplifying load on the replica already at
+	// capacity. The refusal must cost the caller something.
+	start := time.Now()
+	ba.holdOffRefusedWait(context.Background(), time.Second)
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("a refused hold returned in %v; it must pace the caller", elapsed)
+	}
+
+	// But never more than one chunk, however long a hold the caller asked for:
+	// the request is not being served, so it must not occupy the process for the
+	// full 30s.
+	start = time.Now()
+	ba.holdOffRefusedWait(context.Background(), maxEventWaitSeconds*time.Second)
+	elapsed := time.Since(start)
+	if elapsed > eventWaitChunk+time.Second {
+		t.Fatalf("a refused 30s hold paused for %v, want at most one %v chunk", elapsed, eventWaitChunk)
+	}
+	if elapsed < eventWaitChunk-time.Second {
+		t.Fatalf("a refused 30s hold paused only %v, want about one %v chunk", elapsed, eventWaitChunk)
+	}
+}
+
+func TestHoldOffRefusedWaitReleasesOnClientDisconnect(t *testing.T) {
+	resetEventHoldState(t, 4)
+	ba := &BotAPI{}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	ba.holdOffRefusedWait(ctx, maxEventWaitSeconds*time.Second)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("a disconnected caller was paced for %v; the pause must end with the request", elapsed)
+	}
+}
+
+func TestHoldOffBudgetFallsBackToTheInstantAnswer(t *testing.T) {
+	// The pause is back-pressure, and back-pressure that can occupy the process
+	// without bound is not back-pressure: a refused hold sits in neither the
+	// per-bot map nor the global semaphore while holding a handler, a goroutine
+	// and a timer. Past its own budget the answer reverts to the instant empty
+	// batch — exactly what a caller that omits `wait` already gets.
+	resetEventHoldState(t, 1)
+	budget := maxEventHolds() * eventHoldOffFactor
+
+	held := make([]func(), 0, budget)
+	for i := 0; i < budget; i++ {
+		release, ok := acquireHoldOff()
+		if !ok {
+			t.Fatalf("hold-off %d of %d refused; the budget is smaller than advertised", i, budget)
+		}
+		held = append(held, release)
+	}
+	if _, ok := acquireHoldOff(); ok {
+		t.Fatal("hold-off beyond the budget must be refused")
+	}
+
+	ba := &BotAPI{}
+	start := time.Now()
+	ba.holdOffRefusedWait(context.Background(), maxEventWaitSeconds*time.Second)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("an over-budget refusal paused for %v; it must answer instantly", elapsed)
+	}
+
+	for _, release := range held {
+		release()
+	}
+	// And the budget is reusable, not one-shot.
+	release, ok := acquireHoldOff()
+	if !ok {
+		t.Fatal("hold-off slots must be reusable once released")
+	}
+	release()
+	release() // a double defer must not free a slot twice
+	for i := 0; i < budget; i++ {
+		if _, ok := acquireHoldOff(); !ok {
+			t.Fatalf("double release leaked a slot: only %d of %d available", i, budget)
 		}
 	}
 }
@@ -139,7 +283,7 @@ func TestAcquireEventHoldAllowsOneHoldPerBot(t *testing.T) {
 		t.Fatal("first hold must be granted")
 	}
 	// A bot that opens a second concurrent poll must not pin a second
-	// connection; it degrades to the immediate answer instead.
+	// connection; it is refused here and paced by holdOffRefusedWait instead.
 	if _, ok := acquireEventHold("bot1"); ok {
 		t.Fatal("second concurrent hold for the same bot must be refused")
 	}
@@ -170,7 +314,7 @@ func TestAcquireEventHoldFailsOpenAtCapacity(t *testing.T) {
 		t.Fatal("hold 2 must be granted")
 	}
 	// At capacity the answer is "no hold", not an error: the caller falls back
-	// to the immediate empty response, which is exactly the legacy behavior.
+	// to a paced empty response rather than a failure.
 	if _, ok := acquireEventHold("bot3"); ok {
 		t.Fatal("hold beyond the cap must be refused")
 	}

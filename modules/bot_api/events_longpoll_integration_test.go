@@ -7,14 +7,22 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	"github.com/gin-gonic/gin"
+	rd "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -276,7 +284,9 @@ func TestEnqueueChokepointRingsTheDoorbell(t *testing.T) {
 }
 
 // TestDoorbellStaysBoundedWithTTL: nobody may be long-polling for hours, so an
-// unattended bell must neither grow nor live forever.
+// unattended bell must neither grow nor live forever. This is the only place the
+// Lua script is executed by a real Redis — the unit test in pkg/botevent models
+// the commands rather than running them.
 func TestDoorbellStaysBoundedWithTTL(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
@@ -289,4 +299,327 @@ func TestDoorbellStaysBoundedWithTTL(t *testing.T) {
 	n, err := ctx.GetRedisConn().Llen(botevent.BellKey(lpBotID))
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), n, "doorbell must stay at one token regardless of event volume")
+
+	// And the TTL is real, on the bell key itself. A script that pushed to one
+	// key and expired another would leave an immortal bell while passing every
+	// length assertion above. octo-lib's Conn exposes no TTL read, so go through
+	// the chokepoint client.
+	raw := octoredis.NewInstrumentedClient(ctx.GetConfig())
+	defer func() { _ = raw.Close() }()
+	ttl, err := raw.TTL(botevent.BellKey(lpBotID)).Result()
+	assert.NoError(t, err)
+	assert.Greater(t, ttl, time.Duration(0), "the bell must carry a TTL")
+	assert.LessOrEqual(t, ttl, botevent.BellTTL, "the TTL must not exceed the declared BellTTL")
+	assert.Greater(t, ttl, maxEventWaitSeconds*time.Second,
+		"the TTL must outlive one maximum-length hold")
+}
+
+// --- Round-4 coverage: the loop's forward-progress guarantee (PR#685 review) ---
+
+// newWaitTestAPI builds a BotAPI that can read the queue and log, without the
+// HTTP auth wiring. waitForEvents takes botKind as a parameter, so the App Bot
+// branch is reachable without seeding an app_bot row.
+func newWaitTestAPI(ctx *config.Context) *BotAPI {
+	return &BotAPI{ctx: ctx, Log: log.NewTLog("BotAPITest")}
+}
+
+// newWaitTestContext wraps a cancellable context in the wkhttp.Context shape
+// waitForEvents expects.
+func newWaitTestContext(goCtx context.Context) *wkhttp.Context {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req, _ := http.NewRequest("POST", "/v1/bot/events", nil)
+	c.Request = req.WithContext(goCtx)
+	return &wkhttp.Context{Context: c}
+}
+
+// enqueueMessageEvent writes a message-shaped event with the given channel type.
+// channelType 2 (group) is what the App Bot DM-only filter drops.
+func enqueueMessageEvent(t *testing.T, ctx *config.Context, eventID int64, channelType uint8) {
+	t.Helper()
+	payload := fmt.Sprintf(
+		`{"event_id":%d,"message":{"message_id":%d,"message_seq":%d,"from_uid":"u1","channel_id":"c1","channel_type":%d,"timestamp":1}}`,
+		eventID, eventID, eventID, channelType)
+	assert.NoError(t, ctx.GetRedisConn().ZAdd(robotEventPrefix+lpBotID, float64(eventID), payload))
+}
+
+// enqueueUndecodable writes a member that survives in the sorted set but cannot
+// be decoded — the shape getEventsResult silently skips.
+// The payload must stay distinct per event: a sorted set stores unique members,
+// so two identical values would collapse into one re-scored member and the page
+// would never fill.
+func enqueueUndecodable(t *testing.T, ctx *config.Context, eventID int64) {
+	t.Helper()
+	assert.NoError(t, ctx.GetRedisConn().ZAdd(
+		robotEventPrefix+lpBotID, float64(eventID), fmt.Sprintf("not json at all #%d", eventID)))
+}
+
+// TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK pins the property the
+// whole loop's termination argument rests on: the cursor is derived from what
+// the read observed, before the App Bot filter and independent of the auto-ACK
+// ZREM the filter issues afterwards (events.go only warns when that ZREM fails).
+//
+// Re-seeding the same events and reading again from the original cursor is
+// exactly what "the ZREM did nothing" looks like from the loop's point of view;
+// the cursor must still advance.
+func TestReadEventPageAdvancesTheCursorFromTheReadNotTheACK(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	ba := newWaitTestAPI(ctx)
+
+	for id := int64(1); id <= 3; id++ {
+		enqueueMessageEvent(t, ctx, id, 2) // group events: invisible to an App Bot
+	}
+
+	page, err := ba.readEventPage(lpBotID, BotKindApp, 0, 20)
+	assert.NoError(t, err)
+	assert.Empty(t, page.visible, "group events must not be visible to an App Bot")
+	assert.Equal(t, int64(3), page.cursor, "the cursor must advance past filtered events")
+	assert.False(t, page.full, "3 of a 20-event page is not full")
+
+	// Put them back: the queue now looks exactly as it would if every auto-ACK
+	// ZREM had failed (MISCONF, a READONLY replica, a write-denying ACL).
+	for id := int64(1); id <= 3; id++ {
+		enqueueMessageEvent(t, ctx, id, 2)
+	}
+	again, err := ba.readEventPage(lpBotID, BotKindApp, 0, 20)
+	assert.NoError(t, err)
+	assert.Empty(t, again.visible)
+	assert.Equal(t, int64(3), again.cursor,
+		"the cursor must come from the read, so a failed ZREM cannot stall the loop")
+
+	// Reading from the advanced cursor sees nothing, which is what lets the loop
+	// go back to blocking instead of re-serving the same page forever.
+	beyond, err := ba.readEventPage(lpBotID, BotKindApp, again.cursor, 20)
+	assert.NoError(t, err)
+	assert.Empty(t, beyond.visible)
+	assert.Equal(t, again.cursor, beyond.cursor, "an empty read must not move the cursor")
+}
+
+// TestReadEventPageAdvancesPastUndecodableMembers: a member that fails to decode
+// is dropped from the results but still occupied a slot in the page. If the
+// cursor did not clear it, a queue whose head is corrupt would starve every
+// later event — the read would keep returning the same `limit` bad members.
+func TestReadEventPageAdvancesPastUndecodableMembers(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	ba := newWaitTestAPI(ctx)
+
+	enqueueUndecodable(t, ctx, 5)
+	enqueueMessageEvent(t, ctx, 6, 1) // a DM: visible to every bot kind
+
+	page, err := ba.readEventPage(lpBotID, BotKindUser, 0, 2)
+	assert.NoError(t, err)
+	assert.Len(t, page.visible, 1, "the decodable event must still be delivered")
+	assert.Equal(t, int64(6), page.visible[0].EventID)
+	assert.Equal(t, int64(6), page.cursor)
+	// Fullness is counted from raw members, not decoded events: one of the two
+	// members vanished in decoding, and treating the page as short would stall
+	// the drain of whatever sits behind it.
+	assert.True(t, page.full, "2 raw members at limit=2 is a full page")
+}
+
+// TestReadEventPageCannotAdvancePastAWhollyUndecodablePage documents the one
+// case the cursor cannot rescue, and why the loop guards on it. A full page in
+// which *nothing* decodes leaves the cursor where it was; the wait loop only
+// skips its BLPOP when the cursor actually moved, so this degrades to
+// chunk-paced re-reads rather than an unpaced spin.
+func TestReadEventPageCannotAdvancePastAWhollyUndecodablePage(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	ba := newWaitTestAPI(ctx)
+
+	for id := int64(1); id <= 2; id++ {
+		enqueueUndecodable(t, ctx, id)
+	}
+	page, err := ba.readEventPage(lpBotID, BotKindUser, 0, 2)
+	assert.NoError(t, err)
+	assert.Empty(t, page.visible)
+	assert.True(t, page.full)
+	assert.Equal(t, int64(0), page.cursor, "nothing decoded, so nothing can advance the cursor")
+
+	// The guard: a full page that advanced nothing must not license skipping the
+	// block. waitForEvents computes `full && advanced`; assert the conjunction is
+	// false here, which is what keeps the loop paced.
+	assert.False(t, page.full && page.cursor > 0,
+		"a full page that advanced nothing must not permit an unpaced re-read")
+}
+
+// TestWaitForEventsDrainsAFilteredBacklogWithoutBlocking is the entry-path half
+// of forward progress (PR#685 review P2-a). An App Bot whose queue holds a full
+// page of group events followed by a deliverable DM has everything it needs
+// *before* the request arrives — no new bell will ring for any of it. Blocking
+// on the doorbell first would defer that DM by a whole chunk.
+func TestWaitForEventsDrainsAFilteredBacklogWithoutBlocking(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	resetEventHoldState(t, 4)
+	ba := newWaitTestAPI(ctx)
+
+	const limit = int64(20)
+	for id := int64(1); id <= limit; id++ {
+		enqueueMessageEvent(t, ctx, id, 2) // a full page, all filtered
+	}
+	enqueueMessageEvent(t, ctx, limit+1, 1) // the DM behind it
+
+	// The entry read getEvents performs, threaded in exactly as the handler does.
+	entry, err := ba.readEventPage(lpBotID, BotKindApp, 0, limit)
+	assert.NoError(t, err)
+	assert.Empty(t, entry.visible)
+	assert.True(t, entry.full, "the backlog must fill the entry page for this test to mean anything")
+
+	start := time.Now()
+	got, err := ba.waitForEvents(newWaitTestContext(context.Background()),
+		lpBotID, BotKindApp, limit, 20*time.Second, entry)
+	elapsed := time.Since(start)
+	assert.NoError(t, err)
+	assert.Len(t, got, 1, "the DM behind the filtered backlog must be delivered")
+	assert.Equal(t, limit+1, got[0].EventID)
+	assert.Less(t, elapsed, eventWaitChunk,
+		"a backlog already in the queue must not wait out a chunk on the doorbell")
+}
+
+// TestWaitForEventsPacesAFailingDoorbell is the regression test for PR#685
+// review P1-1. redis.Nil is the *normal* BLPOP timeout and is excluded from the
+// error branch, so every error that reaches it is a dial, write, protocol or
+// server error — which go-redis returns after MinRetryBackoff (~8ms), not after
+// the chunk. `ERR max number of clients reached` is the ordinary trigger, and it
+// hits the dedicated wait pool while the shared pool keeps serving reads.
+//
+// Left unpaced the loop ran at ~50-100Hz for the whole hold, issuing a full
+// ZRangeByScore and a log line each time: a Redis capacity incident answered
+// with read amplification. Assert the pacing by counting the reads Redis
+// actually served.
+func TestWaitForEventsPacesAFailingDoorbell(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	resetEventHoldState(t, 4)
+	ba := newWaitTestAPI(ctx)
+
+	// Point the dedicated wait client at a closed port: BLPOP fails instantly,
+	// while ba.ctx.GetRedisConn() (the shared pool) keeps working. That
+	// asymmetry is exactly what a connection-budget incident looks like.
+	restore := swapEventWaitRedis(t, rd.NewClient(&rd.Options{
+		Addr:       "127.0.0.1:1",
+		MaxRetries: 1,
+	}))
+	defer restore()
+
+	before := zrangeByScoreCalls(t, ctx)
+	const wait = 8 * time.Second
+	start := time.Now()
+	got, err := ba.waitForEvents(newWaitTestContext(context.Background()),
+		lpBotID, BotKindUser, 20, wait, eventPage{})
+	elapsed := time.Since(start)
+	after := zrangeByScoreCalls(t, ctx)
+
+	assert.NoError(t, err, "a broken doorbell must not fail the request; the queue is the authority")
+	assert.Empty(t, got)
+	// The hold is still served in full rather than collapsing to ~0s.
+	assert.GreaterOrEqual(t, elapsed, wait, "a doorbell failure must not collapse the hold")
+	assert.Less(t, elapsed, wait+2*eventWaitChunk, "and must not extend it either")
+
+	// One read per chunk, plus slack. Before the fix this was in the thousands.
+	reads := after - before
+	maxReads := int64(wait/eventWaitChunk) + 3
+	assert.LessOrEqual(t, reads, maxReads,
+		"a failing doorbell issued %d authoritative reads in %v; the error path must pay out its chunk", reads, elapsed)
+	assert.GreaterOrEqual(t, reads, int64(1), "the loop must still re-read the authoritative queue")
+}
+
+// TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast is the regression test
+// for PR#685 review P1-2. The loop skips its BLPOP when the previous read filled
+// its page — that is how a backlog drains. The earlier revision keyed that
+// decision on page fullness alone, so a full page the read could not advance
+// past meant a completely unpaced loop for the rest of the hold: no BLPOP, no
+// backoff, not even go-redis's 8ms.
+//
+// The reviewer's example was an auto-ACK ZREM that failed while reads kept
+// working (MISCONF, a READONLY replica, a write-denying ACL), leaving the same
+// filtered page in place forever. A page of undecodable members reproduces the
+// same shape deterministically: nothing is removed, nothing is visible, and the
+// cursor cannot move — so it is the strictest version of the case. The loop must
+// fall back to chunk pacing.
+func TestWaitForEventsDoesNotSpinOnAPageItCannotAdvancePast(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	clearLongPollKeys(t, ctx)
+	defer clearLongPollKeys(t, ctx)
+	resetEventHoldState(t, 4)
+	ba := newWaitTestAPI(ctx)
+
+	const limit = int64(5)
+	for id := int64(1); id <= limit; id++ {
+		enqueueUndecodable(t, ctx, id)
+	}
+	entry, err := ba.readEventPage(lpBotID, BotKindUser, 0, limit)
+	assert.NoError(t, err)
+	assert.Empty(t, entry.visible)
+	assert.True(t, entry.full, "the page must be full for this test to exercise the skip path")
+	assert.Equal(t, int64(0), entry.cursor, "and it must be unable to advance the cursor")
+
+	before := zrangeByScoreCalls(t, ctx)
+	const wait = 6 * time.Second
+	start := time.Now()
+	got, err := ba.waitForEvents(newWaitTestContext(context.Background()),
+		lpBotID, BotKindUser, limit, wait, entry)
+	elapsed := time.Since(start)
+	reads := zrangeByScoreCalls(t, ctx) - before
+
+	assert.NoError(t, err)
+	assert.Empty(t, got)
+	assert.GreaterOrEqual(t, elapsed, wait, "the hold must still be served in full")
+	maxReads := int64(wait/eventWaitChunk) + 3
+	assert.LessOrEqual(t, reads, maxReads,
+		"the loop issued %d reads in %v; a page it cannot advance past must not be re-read unpaced", reads, elapsed)
+}
+
+// swapEventWaitRedis replaces the process-wide BLPOP client. The singleton is a
+// package-level var for the same reason the hold budgets are: one per process.
+func swapEventWaitRedis(t *testing.T, client *rd.Client) func() {
+	t.Helper()
+	eventWaitRedisOnce.Do(func() {}) // consume the Once so the swap survives
+	prev := eventWaitRedis
+	eventWaitRedis = client
+	return func() {
+		eventWaitRedis = prev
+		eventWaitRedisOnce = sync.Once{}
+		_ = client.Close()
+	}
+}
+
+// zrangeByScoreCalls reads Redis's own command counter, so the assertion is
+// about what the server was asked to do rather than what the test believes the
+// code did.
+func zrangeByScoreCalls(t *testing.T, ctx *config.Context) int64 {
+	t.Helper()
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
+	defer func() { _ = client.Close() }()
+	info, err := client.Info("commandstats").Result()
+	assert.NoError(t, err)
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "cmdstat_zrangebyscore:") {
+			continue
+		}
+		for _, field := range strings.Split(line[strings.Index(line, ":")+1:], ",") {
+			if !strings.HasPrefix(field, "calls=") {
+				continue
+			}
+			n, err := strconv.ParseInt(strings.TrimPrefix(field, "calls="), 10, 64)
+			assert.NoError(t, err)
+			return n
+		}
+	}
+	return 0
 }

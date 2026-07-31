@@ -26,13 +26,36 @@ change-log convention (§7). Newest first.
   connection and the shared pool has none. No new errcode, i18n entry, endpoint or
   migration — an expired hold reuses the existing OK empty-batch shape.
   Known bounds recorded rather than hidden: drain can be extended by one 5s chunk
-  (no module shutdown hook), a failing doorbell degrades holds silently until G1
-  adds metrics, and hold budgets are per process (`maxEventHolds × replicas`
-  fleet-wide). Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared
-  journal `.octospec/journal/shared/bot-events-longpoll.md`; learning candidate
+  (no module shutdown hook), a whole page of undecodable members starves that one
+  request (bounded, never spinning), and hold budgets are per process
+  (`maxEventHolds × replicas` fleet-wide).
+- **Review rounds 3–4 — the hold loop's progress guarantee.** Four review rounds
+  each found a branch of `waitForEvents` that made no progress, so the loop was
+  restated as one invariant rather than patched per finding: **every iteration
+  either burns a chunk of wall clock or advances the queue cursor, never
+  neither.** Concretely: a refused hold now pauses (round 3) under a budget of
+  its own so back-pressure cannot become the resource sink (round 4); a failing
+  BLPOP pays out its chunk and logs once per hold, instead of retrying at
+  go-redis's ~8ms backoff (measured: **924 authoritative reads in 8s**); and the
+  cursor advances from the read itself — before the App Bot filter, covering
+  undecodable members — so progress no longer rests on an auto-ACK `ZREM` that
+  only warns on failure, and the block is skipped only when the cursor actually
+  moved (measured without that guard: **38,722 reads in 6s**). Both figures come
+  from deleting the fix and re-running the regression tests, which count Redis's
+  own `INFO commandstats`. Also: `readEventPage` is now the single seam both the
+  immediate and held paths read through; the entry page is threaded into the hold
+  so a pre-existing backlog drains instead of waiting for a bell that will never
+  ring; `Ring` moved to `rd.NewScript` (EVALSHA) and its failures are logged at
+  all five producers; `OCTO_BOT_EVENTS_MAX_HOLDS` is validated at boot and
+  documented, with the per-replica connection budget (shared + wait 68 + ring 10)
+  in the new `docs/bot-events-longpoll.md`.
+- Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared journal
+  `.octospec/journal/shared/bot-events-longpoll.md`; learning candidates
   `.octospec/learnings/pending/bot-events-longpoll.md` (lower-bound assertions for
-  timing promises → `testing`). Consumer half is a sibling change in
-  openclaw-channel-octo. PR #685.
+  timing promises → `testing`) and
+  `.octospec/learnings/pending/loop-progress-invariant.md` (state the invariant
+  instead of answering findings one at a time → `testing`). Consumer half is a
+  sibling change in openclaw-channel-octo. PR #685.
 
 ## 2026-07-30 (space-join-apply-resubmit)
 

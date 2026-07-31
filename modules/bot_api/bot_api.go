@@ -249,6 +249,10 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
+	// Resolve the /v1/bot/events long-poll hold budget here rather than on the
+	// first long-poll request, so an unusable OCTO_BOT_EVENTS_MAX_HOLDS is
+	// reported in the startup log instead of surfacing in production traffic.
+	ba.resolveEventHoldBudget()
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
 	// Subscribed AFTER the dependency wiring above so oboMessagesListen
 	// can safely consult ba.db (oboStore). Idempotent: the listener

@@ -41,8 +41,21 @@ source: self
 | 方案 | 多副本正确 | 新增依赖 | 连接成本 | 结论 |
 |---|---|---|---|---|
 | 进程内 ticker 反复 `ZRangeByScore` | ✅ | 无 | 低 | ❌ Redis 读放大：30s hold × 300ms tick = 100 次读，比现状更费 |
-| **`BLPop` 门铃** | ✅（阻塞发生在 Redis 侧） | **无**——`redis.Conn` 已暴露 `BLPop`/`LPUSH`/`Ltrim`/`Expire` | 每个 hold 占 1 条池连接 | ✅ **本任务选用** |
+| **`BLPop` 门铃** | ✅（阻塞发生在 Redis 侧） | **消费侧无**（`redis.Conn` 已暴露 `BLPop`）；**生产侧需自建 `rd.Client`**（见下注） | 每副本 3 个池：shared + wait(`maxEventHolds+4`) + ring(10) | ✅ **本任务选用** |
 | Redis pub/sub 单订阅连接扇出 | ✅ | 需自建 `rd.Client`（octo-lib `redis.Conn` **未暴露** `Subscribe`/`Publish`，仅暴露 `Options()`） | 每副本 1 条 | 📌 记为连接数撑不住时的升级路径，不在本任务 |
+
+> **本行原文写的是「新增依赖：无」，这是错的（PR#685 第三轮 review 更正）。** 门铃从
+> 「三条命令」改成「一次 `EVALSHA`」以后，生产侧同样需要自建 `rd.Client`——`redis.Conn`
+> 不暴露 `Eval`——而这正是上一行否掉 pub/sub 方案时给出的成本。两者的区别不再是「要不要自建
+> client」，而是**连接数**（ring 池 10 条 vs pub/sub 每副本 1 条）与**语义**（门铃只是提示，
+> ZSet 仍是唯一权威；pub/sub 丢消息就真丢了）。结论不变，但理由必须写对：
+> 三轮 review 里有两轮的根因都是「按一份过期的书面前提做决定」。
+
+**连接预算（运维需要的那个数）**：每副本 `wait 池 (maxEventHolds + 4 = 68 默认)` +
+`ring 池 (ringPoolSize = 10)` = **78 条**，再加上无显式 `PoolSize` 的主池
+（`10 × NumCPU`）。N 副本即 `78 × N`，需对照 Redis `maxclients` 核；
+`OCTO_BOT_EVENTS_MAX_HOLDS` 上限 4096 意味着单副本 wait 池可达 4100 条。
+详见 `docs/bot-events-longpoll.md`。
 
 **安全性质（贯穿全设计）**：门铃只是**提示**，不是事件本身。醒来（或超时）后一律回到
 `getEventsResult` 按调用方游标做权威 `ZRangeByScore`。因此**门铃丢失/被别的 waiter 抢走
@@ -113,16 +126,41 @@ source: self
     `modules/file/api.go:100`、`modules/usersecret/api.go:53`、`modules/group/api.go:166`
     均显式 `o.PoolSize = 10`）。**专用池容量 = 并发 hold 上限 + 余量**，使 long-poll
     的最坏情况被结构性地关在自己的池里。
-  - 进程级并发 hold 上限（信号量），取值 ≤ 专用池容量。**超限不报错**——降级为立即返回
-    （等价今天的行为），fail-open 语义与既有限流中间件一致。
-  - **每个 robotID 同时只允许一个 hold**：第二个并发 hold 立即返回，防止一个 bot
+  - 进程级并发 hold 上限（信号量），取值 ≤ 专用池容量。**超限不报错**——降级为返回空批次，
+    fail-open 语义与既有限流中间件一致。
+  - **每个 robotID 同时只允许一个 hold**：第二个并发 hold 被拒，防止一个 bot
     反复开连接吃光专用池。
+  - **被拒的 hold 要「有代价地」返回空**（PR#685 第二轮 review 定稿，第三轮实现）：
+    立即返回在线上与「被服务的 hold」不可区分，而 long-poll 客户端没有 interval 兜底，
+    于是立刻重发——每次重发在到达这里之前都已经付过一次完整 `ZRangeByScore`，等于用
+    **放大负载**回应「容量已满」。故被拒时先睡 `min(wait, chunk)`（客户端断连立即释放）。
+  - **这条「有代价」本身必须有预算**（PR#685 第三轮 review P2-c，第四轮实现）：睡眠中的
+    请求占着 handler / goroutine / timer，却不在 per-bot map 也不在全局信号量里，会出现
+    「拒绝路径比成功路径更占进程」的倒挂。单开一个 `maxEventHolds × 4` 的预算，超出后
+    恢复为立即返回——那正是今天所有不传 `wait` 的调用方拿到的形状，是安全下界。
 - **事件不丢（队列语义）** — `ZRangeByScore` 保持唯一权威。门铃只影响「何时醒」，
   不影响「读到什么」。门铃 key 必须有 TTL 且**长度恒定**（`LTRIM 0 0`），
   不能因为无人监听而无界增长。
 - **App Bot 过滤 + 自动 ACK**（`events.go:74-93`）—— DM-only 防御性过滤与 `ZRemRangeByScore`
   自动 ACK 必须同样作用于 long-poll 返回的结果，不得因为走了新路径而绕过。
   注意边界：过滤后可能**由非空变成空**，此时不应假装有事件返回——需明确是继续 hold 还是返回空。
+- **hold 循环必须有「结构性」的推进保证**（PR#685 第三轮 review P1-2 / P2-a，第四轮实现）。
+  这是本任务最容易做错、也确实做错过两次的一条，写成不变量：
+
+  > 每一次迭代，**要么烧掉至少一个 chunk 的墙钟，要么把队列游标向前推**，不允许两者皆无。
+
+  四条出口逐一对齐：BLPOP 超时（`redis.Nil`）已花掉一个 chunk；BLPOP 取到令牌说明有
+  producer 摇过铃、即有 ZADD 落地，随后的读必然推游标；BLPOP **失败**自身不提供任何节奏
+  （go-redis 对 dial/protocol 错误按 `MinRetryBackoff` ≈ 8ms 返回，不是 chunk），故必须
+  显式补齐 chunk 余量；跳过阻塞（`reread`）**只在上一次读真的推动了游标时**才允许。
+
+  游标必须由**读本身**推导——取本次读观察到的最大 `event_id`，在 App Bot 过滤**之前**——
+  而不能依赖过滤里那次只 Warn 不检查的自动 ACK `ZRemRangeByScore`。ZREM 在「读得动、写不动」
+  的 Redis 状态下（MISCONF / READONLY 副本 / 拒写 ACL）会失败，此时若推进依赖它，整个 hold
+  会变成完全无节奏的空转。同理，`getEventsResult` 跳过的**解码失败成员**也必须被游标跨过，
+  否则队头一旦损坏，后面的事件永远读不到。
+  实测：把 `advanced` 守卫去掉后，6s 内发出 **38722 次** `ZRangeByScore`；
+  把 BLPOP 失败路径的补齐去掉后，8s 内 **924 次**。两者都有回归测试钉住。
 - **优雅关停** — `main.go:362` `svc.Run(s)` 退出后会 `cardActionRuntime.Stop()`。
   在关停中的 hold 必须被唤醒并返回空，不能把 drain 拖长到一个完整的 `wait` 周期。
 - **`test`** — 现有 bot events 测试是回归基线，不得破坏。
@@ -192,8 +230,22 @@ hold > 10s，现存插件会每 10 秒 abort 一次并打一条 error 日志**�
 **资源与生命周期**
 - 客户端断连 → hold 在 **≤1 个 chunk**（≤5s）内释放（以 goroutine/连接计数断言，不靠 sleep 猜）。
 - 进程关停信号 → 在途 hold 被唤醒返回空，不阻塞 drain。
-- 同一 robotID 的第二个并发 hold → 立即返回（等价今天的行为），不占第二条 Redis 连接。
-- 并发 hold 达到进程上限 → 后续请求**立即返回而非报错**（fail-open）。
+- 同一 robotID 的第二个并发 hold → **被拒，不占第二条 Redis 连接**；返回空批次前
+  先付一个 ≤1 chunk 的停顿（不是立即返回——见 Load-bearing 里「有代价地返回空」那条），
+  客户端断连则立即释放。
+- 并发 hold 达到进程上限 → 后续请求**返回空而非报错**（fail-open），同样带停顿。
+- 被拒 hold 的停顿预算耗尽 → 退回**立即返回空**（安全下界 = 不传 `wait` 的既有形状）。
+- `OCTO_BOT_EVENTS_MAX_HOLDS` 非法值（`0` / `-1` / `abc`）→ 回落默认且启动日志 Warn；
+  超过 4096 → 夹紧到 4096（该值同时 size 一个 channel 和一个 Redis 池，不夹会向 go-redis
+  要一个百万连接的池）。
+
+**推进保证（第四轮新增）**
+- App Bot 队列里「整页被过滤的事件 + 其后一条可投递 DM」且**请求到达时就已全部在队**
+  → DM 在 **1 个 chunk 之内**返回，而不是等门铃（这些事件不会再有**新**铃可响）。
+- 自动 ACK 未生效（同一页反复被读到）→ 循环仍然推进，且**不空转**：以 Redis
+  `INFO commandstats` 的 `zrangebyscore` 计数断言上界，不靠观察 CPU。
+- 门铃持续失败（专用池连不上、主池正常）→ hold **不塌缩**（仍服务满 `wait`）、
+  **不空转**（每 chunk 一次权威读）、且**每个 hold 只记一条日志**而非每次迭代一条。
 
 **既有行为不回归**
 - App Bot 的非 DM 事件过滤 + 自动 ACK 在 long-poll 路径上同样生效（新增用例覆盖
@@ -209,15 +261,26 @@ hold > 10s，现存插件会每 10 秒 abort 一次并打一条 error 日志**�
    API server 做 graceful shutdown，加一个无人调用的 `Stop()` 只会是死代码。净效果是
    drain 最坏被拖长 **5s**（而非一个完整的 30s hold），满足「不得拖长一个完整 wait 周期」
    的原意，但不等于零延迟。真要精确，需先给模块引入统一的关停信号，属独立改动。
-2. **门铃失败无信号。** 生产者 `_ = botevent.Ring(...)` 丢弃错误且不记日志（与相邻的
-   best-effort `Expire` 刷新同一约定）。持续失败会让所有 hold 静默退化成等满超时，且**没有
-   任何可观测信号**。这条盲点归 G1（card ingress 仪表）收口，它拥有指标命名空间；
-   在叶子包里临时加 logger 会把第一个计数器放错位置。
+2. ~~**门铃失败无信号。**~~ **已收口（第四轮）。** 原文写的是「生产者丢弃错误且不记日志，
+   持续失败会让所有 hold 静默退化成等满超时」。两处都要更正：(a) 退化的形状是
+   **≤1 chunk 的 chunk-paced 权威重读**，不是「等满超时」——分块本身就是兜底轮询；
+   (b) 摇铃搬到独立连接池之后，出现了「ZADD 借主池热连接成功、摇铃拿不到连接」的独立失败态，
+   五个生产点现在都 `Warn`。指标仍归 G1（它拥有命名空间），但一条日志不等于第一个计数器放错位置。
 3. **并发预算是进程级，非集群级。** N 个副本下同一 bot 可各占一个 hold，全局上限为
    `maxEventHolds × N`。有界且符合预期（被保护的资源——本副本的专用 Redis 池——本身就是
    进程级的），但不要当成分布式不变量。
 4. **hold 时长会超出请求值 <1s。** chunk 向上取整到整秒（BLPOP 参数是整秒，向下取整会
    退化成 0 = 永久阻塞）。宁可超出不到一秒，也不能像最初实现那样把 `wait=2` 截短成 ~1s。
+5. **整页解码失败仍会饿死本次请求（有界，已记录）。** 游标取「本次读到的最大 `event_id`」，
+   所以只要一页里还有**任意一条**能解码，游标就跨过了整页（含损坏成员）。但如果一整页
+   `limit` 条**全部**解码失败，游标无处可推——此时循环退回 chunk 阻塞（`advanced` 守卫），
+   即**有界、不空转**，但本次 hold 确实读不到后面的事件。这是数据损坏场景，
+   `getEventsResult` 每条都会 `Error` 记日志。真要跨过去需要拿 ZSet 的 **score** 而非
+   payload 里的 `event_id`（两者按构造相等），而 octo-lib 的 `redis.Conn` 未暴露
+   `ZRangeByScoreWithScores`——属独立改动，不在本任务。
+6. **被拒 hold 的停顿有预算，但预算是拍的。** `maxEventHolds × 4`：让拒绝路径最多占到与
+   成功路径同量级的进程资源，同时给「bot 滚动重启期间短暂双 poller」留余量。没有实测支撑，
+   是一个明确做出的选择而不是副作用——超出后的行为（立即返回空）本身是安全的。
 
 ## 已定稿（2026-07-31，maintainer 拍板）
 
