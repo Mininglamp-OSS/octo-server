@@ -2390,7 +2390,7 @@ func countAuthCodeKeys(t *testing.T, ctx *config.Context) int {
 	return len(keys)
 }
 
-// A4b —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
+// A4c —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
 func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
 	_, f, err := setup(t)
 	assert.NoError(t, err)
@@ -2503,10 +2503,16 @@ func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T)
 			inviteCode := "code-683-parity-" + ep.suffix
 
 			seedApprovalSpace(t, f, spaceId)
-			// 被禁用的邀请码：审批时消耗必然失败
+			// 用尽的邀请码：审批时消耗必然失败，期望 invite_code_exhausted。
+			//
+			// 刻意不用"被禁用"，因为那期望 invite_code_invalid——而 H5 入口在
+			// auth_code 查不到时也返回同一个码，于是"根本没走到审批"和"走到了且分类
+			// 正确"无法区分：把 auth_code 查询打断，这个子用例照样绿（推送前审查已用
+			// 变异法证实）。exhausted 只可能由 classifyInviteConsumeFailure 产生，
+			// 未到达即为不同的码，子用例立刻变红。
 			assert.NoError(t, f.db.insertInvitation(&InvitationModel{
 				SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
-				MaxUses: 10, UsedCount: 0, Status: 0,
+				MaxUses: 1, UsedCount: 1, Status: 1,
 			}))
 
 			applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
@@ -2517,7 +2523,7 @@ func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T)
 			w := ep.approve(t, s, spaceId, applyID)
 
 			assert.Equal(t, http.StatusBadRequest, w.Code, "入口 %s 应拒绝审批", ep.name)
-			assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+			assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
 
 			after, err := f.db.queryJoinApplyByID(applyID)
 			assert.NoError(t, err)
@@ -2530,7 +2536,7 @@ func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T)
 
 			inv, err := f.db.queryInvitationByCodeUnfiltered(inviteCode)
 			assert.NoError(t, err)
-			assert.Equal(t, 0, inv.UsedCount, "入口 %s：失败的审批不得消耗名额", ep.name)
+			assert.Equal(t, 1, inv.UsedCount, "入口 %s：失败的审批不得再消耗名额", ep.name)
 		})
 	}
 }

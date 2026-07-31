@@ -1114,26 +1114,32 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 				return
 			}
 			if resetRows == 0 {
-				// 谓词落空只有两种成因，且对外说法必须分开——之前一律回
-				// already_member，而其中一种成因下申请人恰恰不是成员，那句话是假的
-				// （round 4 P2-2 / 推送前审查 C）。
-				latest, err := s.db.queryMember(invitation.SpaceId, loginUID)
+				// 谓词落空有两种成因，对外说法必须分开——原先一律回 already_member，
+				// 而其中一种成因下申请人恰恰不是成员，那句话是假的（round 4 P2-2）。
+				//
+				// 判据取**申请行自身的状态**，不是再查一次成员行：要回答的问题就是
+				// "这一行现在是什么"，直接问它即可。第一版在这里改查 space_member，
+				// 那是又一次"判定与它所断言的对象不是同一个"——成员资格可以在谓词求值
+				// 与这次补读之间结束，于是对一条仍是 status=1 的行回报"申请已提交"，
+				// 把一个错误的失败讲成了一个错误的成功（推送前审查 C）。
+				latest, err := s.db.queryJoinApplyByID(applyID)
 				if err != nil {
 					httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 					return
 				}
-				if latest != nil {
-					// 成员资格在我们读完之后被恢复：此刻确实是成员
-					httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+				if latest != nil && latest.Status == 0 {
+					// 另一个并发重申先重置了这一行：申请确实在排队，只是绑定的是那次
+					// 提交的邀请码而不是本次。如实回报，且不重复通知管理员。
+					c.Response(map[string]interface{}{
+						"status":   "PENDING",
+						"space_id": invitation.SpaceId,
+						"msg":      "申请已提交，请等待审批",
+					})
 					return
 				}
-				// 另一个并发重申先重置了这一行：申请已在排队，只是绑定的是那次提交的
-				// 邀请码而不是本次。如实回报待审批，并且不重复通知管理员。
-				c.Response(map[string]interface{}{
-					"status":   "PENDING",
-					"space_id": invitation.SpaceId,
-					"msg":      "申请已提交，请等待审批",
-				})
+				// 仍是已通过：成员资格在我们读完之后被恢复。approveJoinApplyAtomic
+				// 保证 status=1 与活跃成员一起提交，所以这是当下最准确的答复。
+				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 				return
 			}
 		}
@@ -1715,7 +1721,7 @@ func (s *Space) runAtomicApproval(apply *spaceJoinApplyModel, space *SpaceModel,
 }
 
 // respondApprovalOutcome 把审批终态映射成 HTTP 响应，并在成功时执行提交后的副作用。
-// 返回 true 表示已经写出响应，调用方直接 return。
+// 本函数负责写出响应，调用方调用后直接返回即可。
 func (s *Space) respondApprovalOutcome(c *wkhttp.Context, outcome approveOutcome, failCode codes.Code,
 	apply *spaceJoinApplyModel, space *SpaceModel) {
 	switch outcome {
@@ -1746,9 +1752,12 @@ func (s *Space) respondApprovalOutcome(c *wkhttp.Context, outcome approveOutcome
 // 任一不满足都只返回 false。此前三种情况一律回报"已达到使用次数上限"，与实际原因
 // 不符时会把排查引向错误方向（issue #683）。
 //
-// 这里不构成枚举面：调用方是已通过 role>=1 / requireAdmin 校验的管理员，且邀请码就
-// 记录在他正在审批的申请上——他本来就能看到这个码。精确原因（禁用 / 过期 / 用尽）
-// 仍只写日志，对外只分"用尽"与"失效"两类，沿用已注册的错误码。
+// 这里不构成枚举面，但理由不是"调用方一定是管理员"——三条审批入口里的 H5
+// joinApproveSure 挂在 open 组，没有 AuthMiddleware，也不复核 reviewer_uid 是否仍是
+// 管理员（推送前审查 3 更正了原本的说法）。真正的约束是：调用方必须先持有一个绑定到
+// **这一条申请**的有效 auth_code，而该申请上记录的就是这个邀请码——他本来就看得到它，
+// 因此这里不会泄露任何他还不知道的信息，也无法用来遍历别的码。
+// 精确原因（禁用 / 过期 / 用尽）仍只写日志，对外只分"用尽"与"失效"两类。
 func (s *Space) classifyInviteConsumeFailure(code string, applyID int64) codes.Code {
 	invitation, err := s.db.queryInvitationByCodeUnfiltered(code)
 	if err != nil {
