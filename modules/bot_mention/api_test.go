@@ -83,7 +83,7 @@ func (m *fakeMetricRecorder) ObserveIngress(result string, _ time.Duration) {
 	m.mu.Unlock()
 }
 
-func (m *fakeMetricRecorder) ObserveEnqueue(result string) {
+func (m *fakeMetricRecorder) ObserveEnqueue(result string, _ time.Duration) {
 	m.mu.Lock()
 	m.enqueues = append(m.enqueues, result)
 	m.mu.Unlock()
@@ -202,7 +202,7 @@ func doMentionRequest(t *testing.T, r *wkhttp.WKHttp, token string, body interfa
 		req.Header.Set(internalTokenHeader, token)
 	}
 	w := httptest.NewRecorder()
-	r.GetRoute().ServeHTTP(w, req)
+	r.ServeHTTP(w, req)
 	return w
 }
 

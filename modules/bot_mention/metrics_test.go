@@ -13,8 +13,8 @@ func TestBotMentionMetricsRegisterLowCardinalityResults(t *testing.T) {
 
 	metrics.ObserveIngress("accepted", 25*time.Millisecond)
 	metrics.ObserveIngress("unexpected-result", 10*time.Millisecond)
-	metrics.ObserveEnqueue("accepted")
-	metrics.ObserveEnqueue("unexpected-result")
+	metrics.ObserveEnqueue("accepted", 15*time.Millisecond)
+	metrics.ObserveEnqueue("unexpected-result", 5*time.Millisecond)
 
 	families, err := registry.Gather()
 	if err != nil {
@@ -37,6 +37,7 @@ func TestBotMentionMetricsRegisterLowCardinalityResults(t *testing.T) {
 		"dmwork_doc_bot_mention_ingress_total",
 		"dmwork_doc_bot_mention_enqueue_total",
 		"dmwork_doc_bot_mention_ingress_duration_seconds",
+		"dmwork_doc_bot_mention_enqueue_duration_seconds",
 	} {
 		if _, ok := got[name]; !ok {
 			t.Fatalf("metric family %q not registered; got=%v", name, got)
