@@ -58,12 +58,15 @@ func TestBotMentionMySQLRedisRobotQueueIntegration(t *testing.T) {
 	ctx, cfg := newBotMentionIntegrationContext(t, botMentionIntegrationExpire)
 	nonce := time.Now().UnixNano()
 	botID := fmt.Sprintf("bm-%d", nonce)
+	inactiveBotID := fmt.Sprintf("bm-inactive-%d", nonce)
+	appBotID := fmt.Sprintf("bm-app-%d", nonce)
 	botToken := fmt.Sprintf("bf_bm_%d", nonce)
 	request := validMentionRequest()
 	request.BotUID = botID
 	request.IdempotencyKey = fmt.Sprintf("idem-%d", nonce)
 	ensureBotMentionIntegrationSchema(t, ctx)
 	prepareActiveUserBot(t, ctx, botID, botToken)
+	prepareIneligibleBots(t, ctx, inactiveBotID, appBotID, nonce)
 
 	claims := newRedisClaimStore(ctx)
 	redisClient := claims.backend.(*redisClaimBackend).client
@@ -89,6 +92,30 @@ func TestBotMentionMySQLRedisRobotQueueIntegration(t *testing.T) {
 	router.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	module.Route(router)
 	bot_api.NewBotAPI(ctx).Route(router)
+
+	for _, tt := range []struct {
+		name  string
+		botID string
+	}{
+		{name: "inactive User Bot", botID: inactiveBotID},
+		{name: "App Bot", botID: appBotID},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ineligible := request
+			ineligible.BotUID = tt.botID
+			ineligible.IdempotencyKey = fmt.Sprintf("idem-%s-%d", tt.botID, nonce)
+			response := doMentionRequest(t, router, module.internalToken, ineligible)
+			if response.Code != http.StatusNotFound || decodeMentionError(t, response).Error.Code != "err.shared.not_found" {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if got := redisClient.ZCard("robotEvent:" + tt.botID).Val(); got != 0 {
+				t.Fatalf("queue size = %d, want 0", got)
+			}
+			if got := redisClient.Exists(mentionClaimKey(tt.botID, ineligible.IdempotencyKey)).Val(); got != 0 {
+				t.Fatalf("claim count = %d, want 0", got)
+			}
+		})
+	}
 
 	first := doMentionRequest(t, router, module.internalToken, request)
 	if first.Code != http.StatusOK {
@@ -217,6 +244,27 @@ func ensureBotMentionIntegrationSchema(t *testing.T, ctx *config.Context) {
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
 		},
 		{
+			name: "app_bot",
+			sql: `CREATE TABLE IF NOT EXISTS app_bot (
+				id VARCHAR(40) NOT NULL,
+				uid VARCHAR(40) NOT NULL,
+				display_name VARCHAR(100) NOT NULL,
+				description VARCHAR(500) NOT NULL DEFAULT '',
+				avatar VARCHAR(200) NOT NULL DEFAULT '',
+				scope VARCHAR(20) NOT NULL DEFAULT 'platform',
+				space_id VARCHAR(40) DEFAULT NULL,
+				status TINYINT NOT NULL DEFAULT 0,
+				token VARCHAR(100) NOT NULL,
+				welcome_msg VARCHAR(500) NOT NULL DEFAULT '',
+				created_by VARCHAR(40) NOT NULL,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				UNIQUE KEY uk_app_bot_uid (uid),
+				UNIQUE KEY uk_app_bot_token (token)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		},
+		{
 			name: "seq",
 			sql: `CREATE TABLE IF NOT EXISTS seq (
 				id INT NOT NULL AUTO_INCREMENT,
@@ -250,6 +298,30 @@ func ensureBotMentionIntegrationSchema(t *testing.T, ctx *config.Context) {
 			t.Fatalf("create integration %s table: %v", statement.name, err)
 		}
 	}
+}
+
+func prepareIneligibleBots(t *testing.T, ctx *config.Context, inactiveBotID, appBotID string, nonce int64) {
+	t.Helper()
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid, bot_token) VALUES (?, 0, ?, ?)",
+		inactiveBotID, "bot-mention-integration-owner", fmt.Sprintf("bf_inactive_%d", nonce),
+	).Exec(); err != nil {
+		t.Fatalf("insert inactive integration User Bot: %v", err)
+	}
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO app_bot (id, uid, display_name, status, token, created_by) VALUES (?, ?, ?, 1, ?, ?)",
+		fmt.Sprintf("app-%d", nonce), appBotID, "Bot Mention App Bot", fmt.Sprintf("app_token_%d", nonce), "bot-mention-integration-owner",
+	).Exec(); err != nil {
+		t.Fatalf("insert integration App Bot: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := ctx.DB().DeleteFrom("app_bot").Where("uid=?", appBotID).Exec(); err != nil {
+			t.Errorf("cleanup integration App Bot: %v", err)
+		}
+		if _, err := ctx.DB().DeleteFrom("robot").Where("robot_id=?", inactiveBotID).Exec(); err != nil {
+			t.Errorf("cleanup inactive integration User Bot: %v", err)
+		}
+	})
 }
 
 func prepareActiveUserBot(t *testing.T, ctx *config.Context, botID, botToken string) {

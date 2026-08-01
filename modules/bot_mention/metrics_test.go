@@ -12,6 +12,7 @@ func TestBotMentionMetricsRegisterLowCardinalityResults(t *testing.T) {
 	metrics := newBotMentionMetrics(registry)
 
 	metrics.ObserveIngress("accepted", 25*time.Millisecond)
+	metrics.ObserveIngress("not_found", 20*time.Millisecond)
 	metrics.ObserveIngress("unexpected-result", 10*time.Millisecond)
 	metrics.ObserveEnqueue("accepted", 15*time.Millisecond)
 	metrics.ObserveEnqueue("unexpected-result", 5*time.Millisecond)
@@ -44,6 +45,14 @@ func TestBotMentionMetricsRegisterLowCardinalityResults(t *testing.T) {
 		}
 		if !got[name]["accepted"] || !got[name]["error"] {
 			t.Fatalf("metric %q results=%v, want accepted and sanitized error", name, got[name])
+		}
+	}
+	for _, name := range []string{
+		"dmwork_doc_bot_mention_ingress_total",
+		"dmwork_doc_bot_mention_ingress_duration_seconds",
+	} {
+		if !got[name]["not_found"] {
+			t.Fatalf("metric %q results=%v, want distinct not_found outcome", name, got[name])
 		}
 	}
 }

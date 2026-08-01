@@ -350,6 +350,17 @@ func TestRegistryRejectsNotifyTokenThatConflictsWithBroaderIngress(t *testing.T)
 	}
 }
 
+func TestRegistryRejectsDuplicateBroaderIngressTokens(t *testing.T) {
+	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	shared := "shared-broader-ingress-token"
+	if err := registry.ValidateNotifyTokenExclusions(shared, shared); err == nil {
+		t.Fatal("ValidateNotifyTokenExclusions() error = nil for duplicate broader ingress tokens")
+	}
+}
+
 func TestHMACSignatureUsesVersionedCanonicalRequest(t *testing.T) {
 	body := []byte(`{"event_id":"42","decision":"approve"}`)
 	timestamp := "1784073600"

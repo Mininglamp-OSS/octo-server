@@ -20,6 +20,24 @@ type memoryClaimBackend struct {
 	delCASErr error
 }
 
+type disappearingSetNXBackend struct{}
+
+func (disappearingSetNXBackend) Get(string) (string, error) {
+	return "", errClaimNotFound
+}
+
+func (disappearingSetNXBackend) SetNX(string, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
+func (disappearingSetNXBackend) CompareAndSet(string, string, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
+func (disappearingSetNXBackend) CompareAndDelete(string, string) (bool, error) {
+	return false, nil
+}
+
 func newMemoryClaimBackend() *memoryClaimBackend {
 	return &memoryClaimBackend{values: make(map[string]string), ttls: make(map[string]time.Duration)}
 }
@@ -138,6 +156,17 @@ func TestClaimStoreLifecycleAndConflict(t *testing.T) {
 	replay, err := store.Lookup(key, "sha-a")
 	if err != nil || replay.State != claimReplay || replay.EventID != 4242 {
 		t.Fatalf("replay = %+v, %v", replay, err)
+	}
+}
+
+func TestClaimStoreTreatsDisappearingSetNXLoserAsInProgress(t *testing.T) {
+	store := newClaimStore(disappearingSetNXBackend{}, time.Hour, deterministicTokens("lease-a"))
+	outcome, lease, err := store.Begin("claim-key", "sha-a")
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	if outcome.State != claimPending || lease != nil {
+		t.Fatalf("Begin() = %+v, lease=%+v; want pending with no lease", outcome, lease)
 	}
 }
 

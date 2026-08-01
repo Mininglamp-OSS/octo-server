@@ -15,6 +15,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 type stubRobotService struct {
@@ -75,6 +77,49 @@ type fakeMetricRecorder struct {
 	mu       sync.Mutex
 	ingress  []string
 	enqueues []string
+}
+
+type capturedLogEntry struct {
+	level  string
+	msg    string
+	fields map[string]interface{}
+}
+
+type capturedLog struct {
+	mu      sync.Mutex
+	entries []capturedLogEntry
+}
+
+func (l *capturedLog) append(level, msg string, fields ...zap.Field) {
+	encoder := zapcore.NewMapObjectEncoder()
+	for _, field := range fields {
+		field.AddTo(encoder)
+	}
+	l.mu.Lock()
+	l.entries = append(l.entries, capturedLogEntry{level: level, msg: msg, fields: encoder.Fields})
+	l.mu.Unlock()
+}
+
+func (l *capturedLog) Info(msg string, fields ...zap.Field) {
+	l.append("info", msg, fields...)
+}
+
+func (l *capturedLog) Debug(msg string, fields ...zap.Field) {
+	l.append("debug", msg, fields...)
+}
+
+func (l *capturedLog) Error(msg string, fields ...zap.Field) {
+	l.append("error", msg, fields...)
+}
+
+func (l *capturedLog) Warn(msg string, fields ...zap.Field) {
+	l.append("warn", msg, fields...)
+}
+
+func (l *capturedLog) snapshot() []capturedLogEntry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]capturedLogEntry(nil), l.entries...)
 }
 
 func (m *fakeMetricRecorder) ObserveIngress(result string, _ time.Duration) {
@@ -299,8 +344,8 @@ func TestBotMentionConcurrentDuplicateHasSingleEnqueue(t *testing.T) {
 		if w.Code != http.StatusConflict {
 			t.Fatalf("in-flight duplicate status = %d, body=%s", w.Code, w.Body.String())
 		}
-		if got := w.Header().Get("Retry-After"); got != "60" {
-			t.Fatalf("Retry-After = %q, want 60", got)
+		if got := w.Header().Get("Retry-After"); got != "2" {
+			t.Fatalf("Retry-After = %q, want 2", got)
 		}
 	}
 	close(robots.enqueueContinue)
@@ -349,6 +394,20 @@ func TestBotMentionRejectsInvalidRequests(t *testing.T) {
 	badURL.URL = "file:///etc/passwd"
 	missingBot := validMentionRequest()
 	missingBot.BotUID = ""
+	unknownField := map[string]interface{}{
+		"idempotency_key": "idem-1",
+		"doc_id":          "doc-1",
+		"comment_id":      "comment-1",
+		"from_uid":        "human-1",
+		"bot_uid":         "bot-1",
+		"text":            "update it",
+		"thread_id":       "caller-controlled-thread",
+	}
+	validRaw, err := json.Marshal(validMentionRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	trailingJSON := append(append([]byte(nil), validRaw...), []byte(`{"extra":true}`)...)
 
 	tests := []struct {
 		name string
@@ -358,6 +417,8 @@ func TestBotMentionRejectsInvalidRequests(t *testing.T) {
 		{name: "oversized body", body: oversized},
 		{name: "unsafe url", body: badURL},
 		{name: "missing required field", body: missingBot},
+		{name: "unknown field", body: unknownField},
+		{name: "trailing json value", body: trailingJSON},
 		{name: "empty body", body: []byte{}},
 	}
 	for _, tc := range tests {
@@ -403,10 +464,15 @@ func TestBotMentionDisabledIsDistinguishableAndDoesNotClaim(t *testing.T) {
 func TestBotMentionRejectsUnavailableUserBotAndDependencyFailure(t *testing.T) {
 	t.Run("non active user bot is opaque not found", func(t *testing.T) {
 		robots := &stubRobotService{exists: false}
-		module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+		metrics := &fakeMetricRecorder{}
+		module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), metrics)
 		w := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
 		if w.Code != http.StatusNotFound || decodeMentionError(t, w).Error.Code != "err.shared.not_found" {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		ingress, _ := metrics.snapshot()
+		if fmt.Sprint(ingress) != "[not_found]" {
+			t.Fatalf("ingress metrics = %v, want [not_found]", ingress)
 		}
 	})
 
@@ -418,6 +484,89 @@ func TestBotMentionRejectsUnavailableUserBotAndDependencyFailure(t *testing.T) {
 			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 		}
 	})
+}
+
+func TestBotMentionStructuredOutcomeLogsDoNotLeakSensitivePayload(t *testing.T) {
+	request := validMentionRequest()
+	request.IdempotencyKey = "secret-idempotency-key"
+	request.Text = "sensitive full comment body"
+	request.URL = "https://docs.example.test/sensitive-location"
+
+	logger := &capturedLog{}
+	backend := newMemoryClaimBackend()
+	claims := newClaimStore(backend, time.Hour, deterministicTokens("lease-1"))
+	module := newTestBotMention(
+		&stubRobotService{exists: true, eventID: 4242},
+		claims,
+		newFeatureGate(true, "", "*"),
+		&fakeMetricRecorder{},
+	)
+	module.Log = logger
+	router := newMentionRouter(module)
+
+	for _, wantReplay := range []bool{false, true} {
+		response := doMentionRequest(t, router, "internal-secret", request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("ingress status = %d, body=%s", response.Code, response.Body.String())
+		}
+		if got := decodeMentionResponse(t, response).Replay; got != wantReplay {
+			t.Fatalf("replay = %v, want %v", got, wantReplay)
+		}
+	}
+
+	disabled := newTestBotMention(
+		&stubRobotService{exists: true, eventID: 1},
+		newClaimStore(newMemoryClaimBackend(), time.Hour, deterministicTokens("unused")),
+		newFeatureGate(false, "", "*"),
+		&fakeMetricRecorder{},
+	)
+	disabled.Log = logger
+	if response := doMentionRequest(t, newMentionRouter(disabled), "internal-secret", request); response.Code != http.StatusOK {
+		t.Fatalf("disabled status = %d, body=%s", response.Code, response.Body.String())
+	}
+
+	failed := newTestBotMention(
+		&stubRobotService{existErr: errors.New("mysql unavailable")},
+		&scriptedClaimStore{},
+		newFeatureGate(true, "", "*"),
+		&fakeMetricRecorder{},
+	)
+	failed.Log = logger
+	if response := doMentionRequest(t, newMentionRouter(failed), "internal-secret", request); response.Code != http.StatusInternalServerError {
+		t.Fatalf("failed status = %d, body=%s", response.Code, response.Body.String())
+	}
+
+	entries := logger.snapshot()
+	wantResults := map[string]bool{"accepted": false, "replay": false, "disabled": false}
+	for _, entry := range entries {
+		result, _ := entry.fields["result"].(string)
+		if _, ok := wantResults[result]; !ok || entry.level != "info" {
+			continue
+		}
+		wantResults[result] = true
+		if entry.fields["bot_uid"] != request.BotUID {
+			t.Fatalf("%s bot_uid = %#v", result, entry.fields["bot_uid"])
+		}
+		if _, ok := entry.fields["event_id"]; !ok {
+			t.Fatalf("%s log missing event_id: %#v", result, entry.fields)
+		}
+		hash, _ := entry.fields["idempotency_hash"].(string)
+		if len(hash) != 12 || strings.Contains(hash, request.IdempotencyKey) {
+			t.Fatalf("%s idempotency_hash = %q", result, hash)
+		}
+	}
+	for result, seen := range wantResults {
+		if !seen {
+			t.Fatalf("missing structured %s outcome log: %#v", result, entries)
+		}
+	}
+
+	serialized := fmt.Sprint(entries)
+	for _, sensitive := range []string{"internal-secret", request.IdempotencyKey, request.Text, request.URL} {
+		if strings.Contains(serialized, sensitive) {
+			t.Fatalf("logs leaked sensitive value %q: %s", sensitive, serialized)
+		}
+	}
 }
 
 func TestBotMentionClaimOutcomes(t *testing.T) {

@@ -233,6 +233,58 @@ func TestCardActionDispatchValidatesRoutesWhenGateOff(t *testing.T) {
 	}
 }
 
+func TestCardActionDispatchRejectsBotMentionTokenCapabilityCollisions(t *testing.T) {
+	const (
+		callbackSecret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		routeToken     = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		notifyToken    = "cccccccccccccccccccccccccccccccc"
+		docsToken      = "dddddddddddddddddddddddddddddddd"
+		mentionToken   = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	)
+
+	tests := []struct {
+		name         string
+		mentionToken string
+		wantErr      bool
+	}{
+		{name: "independent capability", mentionToken: mentionToken},
+		{name: "route notify token collision", mentionToken: routeToken, wantErr: true},
+		{name: "callback secret collision", mentionToken: callbackSecret, wantErr: true},
+		{name: "legacy notify token collision", mentionToken: notifyToken, wantErr: true},
+		{name: "docs notify token collision", mentionToken: docsToken, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "false")
+			t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "false")
+			t.Setenv("OCTO_TASKS_CARD_ACTION_SECRET", callbackSecret)
+			t.Setenv("OCTO_TASKS_NOTIFY_TOKEN", routeToken)
+			t.Setenv("NOTIFY_INTERNAL_TOKEN", notifyToken)
+			t.Setenv("OCTO_DOCS_NOTIFY_TOKEN", docsToken)
+			t.Setenv("OCTO_DOCS_BOT_MENTION_TOKEN", tt.mentionToken)
+			t.Setenv("OCTO_CARD_ACTION_ROUTES", `[{"sender_uid":"notification","owner":"tasks","action_type":"task.execute.decision","url":"https://tasks.internal/v1/card-actions/decide","secret_env":"OCTO_TASKS_CARD_ACTION_SECRET","notify_token_env":"OCTO_TASKS_NOTIFY_TOKEN"}]`)
+
+			runtime, err := installCardActionDispatch(nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("installCardActionDispatch() error = nil; capability collision must fail startup")
+				}
+				if runtime != nil {
+					t.Fatalf("runtime = %+v, want nil on capability collision", runtime)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("installCardActionDispatch() error = %v", err)
+			}
+			if runtime == nil {
+				t.Fatal("installCardActionDispatch() runtime = nil")
+			}
+		})
+	}
+}
+
 func TestConfiguredApprovalRouteRejectsNonNotificationSender(t *testing.T) {
 	_, err := cardActionApprovalProducerSpecs([]cardactiondispatch.RouteSpec{
 		{

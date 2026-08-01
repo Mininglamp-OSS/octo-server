@@ -19,6 +19,8 @@ func TestFeatureGate(t *testing.T) {
 		{name: "doc allowlist hit", gate: newFeatureGate(true, "", "doc-a, doc-b"), docID: "doc-b", wantAllow: true},
 		{name: "space allowlist hit", gate: newFeatureGate(true, "space-a", ""), docID: "doc-z", spaceID: "space-a", wantAllow: true},
 		{name: "missing space cannot hit space allowlist", gate: newFeatureGate(true, "space-a", ""), docID: "doc-z"},
+		{name: "space wildcard requires non-empty space", gate: newFeatureGate(true, "*", ""), docID: "doc-z"},
+		{name: "space wildcard allows any non-empty space", gate: newFeatureGate(true, "*", ""), docID: "doc-z", spaceID: "space-z", wantAllow: true},
 		{name: "explicit wildcard enables all", gate: newFeatureGate(true, "", "*"), docID: "doc-z", wantAllow: true},
 		{name: "whitespace is normalized", gate: newFeatureGate(true, " space-a , space-b ", ""), spaceID: "space-b", wantAllow: true},
 	}
