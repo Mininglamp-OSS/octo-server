@@ -233,7 +233,7 @@ func TestCardActionDispatchValidatesRoutesWhenGateOff(t *testing.T) {
 	}
 }
 
-func TestCardActionDispatchRejectsBotMentionTokenCapabilityCollisions(t *testing.T) {
+func TestCardActionDispatchScopesBotMentionTokenCollisionFailures(t *testing.T) {
 	const (
 		callbackSecret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		routeToken     = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -250,8 +250,8 @@ func TestCardActionDispatchRejectsBotMentionTokenCapabilityCollisions(t *testing
 		{name: "independent capability", mentionToken: mentionToken},
 		{name: "route notify token collision", mentionToken: routeToken, wantErr: true},
 		{name: "callback secret collision", mentionToken: callbackSecret, wantErr: true},
-		{name: "legacy notify token collision", mentionToken: notifyToken, wantErr: true},
-		{name: "docs notify token collision", mentionToken: docsToken, wantErr: true},
+		{name: "legacy notify token collision stays module local", mentionToken: notifyToken},
+		{name: "docs notify token collision stays module local", mentionToken: docsToken},
 	}
 
 	for _, tt := range tests {

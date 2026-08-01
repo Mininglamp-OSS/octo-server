@@ -350,14 +350,14 @@ func TestRegistryRejectsNotifyTokenThatConflictsWithBroaderIngress(t *testing.T)
 	}
 }
 
-func TestRegistryRejectsDuplicateBroaderIngressTokens(t *testing.T) {
+func TestRegistryAllowsDuplicateBroaderIngressTokens(t *testing.T) {
 	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
 	shared := "shared-broader-ingress-token"
-	if err := registry.ValidateNotifyTokenExclusions(shared, shared); err == nil {
-		t.Fatal("ValidateNotifyTokenExclusions() error = nil for duplicate broader ingress tokens")
+	if err := registry.ValidateNotifyTokenExclusions(shared, shared); err != nil {
+		t.Fatalf("ValidateNotifyTokenExclusions() error = %v; broader ingress equality is enforced by each capability", err)
 	}
 }
 
