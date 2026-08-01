@@ -126,6 +126,28 @@ func mentionFingerprint(req normalizedMention) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func mentionClaimLogHash(claimKey string) string {
+	sum := sha256.Sum256([]byte(claimKey))
+	return hex.EncodeToString(sum[:6])
+}
+
+func resolveBotMentionInternalToken(getenv func(string) string) (string, error) {
+	if getenv == nil {
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN lookup unavailable; bot mention capability disabled")
+	}
+	token := getenv(internalTokenEnv)
+	switch {
+	case token == "":
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN not set; internal bot mention API will reject all requests")
+	case token == getenv("NOTIFY_INTERNAL_TOKEN"):
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
+	case token == getenv("OCTO_DOCS_NOTIFY_TOKEN"):
+		return "", errors.New("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
+	default:
+		return token, nil
+	}
+}
+
 type featureGate struct {
 	enabled bool
 	spaces  map[string]struct{}
@@ -165,15 +187,15 @@ func (g featureGate) Allows(docID, spaceID string) bool {
 	if _, ok := g.docs["*"]; ok {
 		return true
 	}
-	if _, ok := g.spaces["*"]; ok {
-		return true
-	}
 	if _, ok := g.docs[docID]; ok {
 		return true
 	}
-	if spaceID != "" {
-		_, ok := g.spaces[spaceID]
-		return ok
+	if spaceID == "" {
+		return false
 	}
-	return false
+	if _, ok := g.spaces["*"]; ok {
+		return true
+	}
+	_, ok := g.spaces[spaceID]
+	return ok
 }

@@ -68,12 +68,17 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 - octo-server 在正常请求和并发重放下保证同一 `(bot_uid, idempotency_key)` 只入队一次。
   幂等流程沿用 card_action 的 `claim(pending) → enqueue → confirm(event_id)` 模式：
   - pending TTL 使用 60 秒；入队失败以 CAS 方式只释放仍为 pending 的 claim；
+  - 入队前必须以 CAS 续租，慢入队期间持续续租；进程退出后续租停止，pending 才按 TTL
+    自然释放，避免正常慢请求跨过 TTL 后被另一请求重新 claim；
   - confirm TTL 与 `Robot.MessageExpire` 使用同一配置；
-  - 同 key、同规范化请求体回放原 `event_id`；同 key、不同请求体返回冲突；
+  - claim 仍存在时，同 key、同规范化请求体回放原 `event_id`，同 key、不同请求体返回冲突；
+    docs-backend 对同一 key 的所有重试必须保持规范化请求体稳定，不能把 key 当作可复用业务 ID；
   - 进程在 enqueue 后、confirm 前崩溃可能产生新的 `event_id` 重投；这是无事务 outbox
     下保留的 at-least-once 窗口，插件必须按 `idempotency_key` 去重最终副作用。
-- bot 事件队列的保留窗口是 `Robot.MessageExpire`。离线恢复承诺只覆盖该窗口内的事件；
-  不承诺无限期保存。
+- bot 事件记录的 `expire` 和队列 key TTL 均由 `Robot.MessageExpire` 生成。现有队列在新事件
+  入队时会刷新整个 key 的 TTL，因此繁忙 bot 的旧成员可能存活更久；离线恢复承诺至少覆盖
+  `Robot.MessageExpire`，但插件的持久去重不能只依赖该 TTL，应保存到明确终态/ACK，避免旧事件
+  与已过期 claim 重叠时重复产生文档副作用。
 - 插件不得在事件仅被解析时立即 ACK：只有事件已进入可恢复的执行/幂等记录，或任务已经
   到达明确终态后才能 ACK。游标只有在 ACK 成功或事件已被持久 claim 后才能越过该事件。
 - 跨 docs-backend、octo-server、OpenClaw 的分布式 exactly-once 事务不在 MVP 范围；
@@ -106,7 +111,8 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   - `OCTO_DOCS_BOT_MENTION_SPACE_ALLOWLIST`；
   - `OCTO_DOCS_BOT_MENTION_DOC_ALLOWLIST`。
   开关为 true 后，doc 或非空 space 命中任一 allowlist 才放行；两份 allowlist 都为空时
-  仍 fail-closed。显式值 `*` 表示全量。配置变更通过重启生效。
+  仍 fail-closed。doc allowlist 的 `*` 表示所有文档；space allowlist 的 `*` 表示任意**非空**
+  space，不能让空 `space_id` 命中。配置变更通过重启生效。
 
 ### openclaw-channel-octo
 
@@ -214,7 +220,7 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 
 - octo-server 至少提供低基数指标：
   - `dmwork_doc_bot_mention_ingress_total{result}`，result 包含 accepted/replay/disabled/
-    invalid/unauthorized/conflict/error；
+    invalid/not_found/unauthorized/conflict/error；
   - `dmwork_doc_bot_mention_enqueue_total{result}`；
   - ingress/enqueue latency。
 - 插件至少提供 poll、claim、dispatch、retry、terminal、ack 指标，并能从

@@ -27,7 +27,7 @@ func respondBotMentionNotFound(c *wkhttp.Context) {
 }
 
 func respondBotMentionInProgress(c *wkhttp.Context) {
-	c.Header("Retry-After", strconv.Itoa(int(claimPendingTTL/time.Second)))
+	c.Header("Retry-After", strconv.Itoa(int(claimRetryAfter/time.Second)))
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotMentionInProgress, nil, nil)
 }
 

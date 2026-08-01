@@ -23,37 +23,6 @@ import (
 
 const botMentionIntegrationExpire = 2 * time.Minute
 
-func TestNewRejectsInternalTokenCapabilityCollisions(t *testing.T) {
-	tests := []struct {
-		name         string
-		mentionToken string
-		notifyToken  string
-		docsToken    string
-		want         string
-	}{
-		{name: "independent token enabled", mentionToken: "mention-secret", notifyToken: "notify-secret", docsToken: "docs-notify-secret", want: "mention-secret"},
-		{name: "empty token disabled", notifyToken: "notify-secret", docsToken: "docs-notify-secret"},
-		{name: "legacy notify collision disabled", mentionToken: "shared-secret", notifyToken: "shared-secret", docsToken: "docs-notify-secret"},
-		{name: "docs notify collision disabled", mentionToken: "shared-secret", notifyToken: "notify-secret", docsToken: "shared-secret"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(internalTokenEnv, tt.mentionToken)
-			t.Setenv("NOTIFY_INTERNAL_TOKEN", tt.notifyToken)
-			t.Setenv("OCTO_DOCS_NOTIFY_TOKEN", tt.docsToken)
-
-			ctx, _ := newBotMentionIntegrationContext(t, botMentionIntegrationExpire)
-			module := New(ctx)
-			closeBotMentionClaimClient(t, module.claims)
-
-			if module.internalToken != tt.want {
-				t.Fatalf("internal token = %q, want %q", module.internalToken, tt.want)
-			}
-		})
-	}
-}
-
 func TestBotMentionMySQLRedisRobotQueueIntegration(t *testing.T) {
 	ctx, cfg := newBotMentionIntegrationContext(t, botMentionIntegrationExpire)
 	nonce := time.Now().UnixNano()
@@ -342,18 +311,6 @@ func prepareActiveUserBot(t *testing.T, ctx *config.Context, botID, botToken str
 			t.Errorf("cleanup integration User Bot: %v", err)
 		}
 	})
-}
-
-func closeBotMentionClaimClient(t *testing.T, store botMentionClaimStore) {
-	t.Helper()
-	claims, ok := store.(*claimStore)
-	if !ok {
-		return
-	}
-	backend, ok := claims.backend.(*redisClaimBackend)
-	if ok {
-		t.Cleanup(func() { _ = backend.client.Close() })
-	}
 }
 
 func doBotAPIRequest(t *testing.T, router *wkhttp.WKHttp, method, path, token string, body []byte) *httptest.ResponseRecorder {

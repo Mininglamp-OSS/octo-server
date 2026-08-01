@@ -17,6 +17,7 @@ import (
 const (
 	mentionClaimPrefix  = "docbotmention:"
 	claimPendingTTL     = 60 * time.Second
+	claimRetryAfter     = 2 * time.Second
 	defaultClaimDoneTTL = 7 * 24 * time.Hour
 
 	claimRecordPending = "pending"
@@ -151,6 +152,12 @@ func (s *claimStore) Begin(key, sha string) (claimOutcome, *claimLease, error) {
 	}
 	if !created {
 		outcome, lookupErr := s.Lookup(key, sha)
+		if lookupErr == nil && outcome.State == claimMissing {
+			// The SetNX loser observed the winner's pending claim disappear
+			// before the fallback lookup. Treat this benign race as retryable
+			// in-progress instead of surfacing an internal error.
+			outcome.State = claimPending
+		}
 		return outcome, nil, lookupErr
 	}
 	return claimOutcome{State: claimAcquired}, &claimLease{
@@ -158,6 +165,17 @@ func (s *claimStore) Begin(key, sha string) (claimOutcome, *claimLease, error) {
 		sha:          sha,
 		pendingValue: string(pending),
 	}, nil
+}
+
+func (s *claimStore) Renew(lease *claimLease) (bool, error) {
+	if lease == nil {
+		return false, errors.New("renew bot mention claim: nil lease")
+	}
+	ok, err := s.backend.CompareAndSet(lease.key, lease.pendingValue, lease.pendingValue, claimPendingTTL)
+	if err != nil {
+		return false, fmt.Errorf("renew bot mention claim: %w", err)
+	}
+	return ok, nil
 }
 
 func (s *claimStore) Confirm(lease *claimLease, eventID int64) (bool, error) {

@@ -156,6 +156,7 @@ type scriptedClaimStore struct {
 	releaseErr    error
 	renewDenied   bool
 	renewErr      error
+	renewSignal   chan struct{}
 
 	lease        *claimLease
 	confirmCalls int
@@ -191,6 +192,9 @@ func (s *scriptedClaimStore) Release(_ *claimLease) (bool, error) {
 
 func (s *scriptedClaimStore) Renew(_ *claimLease) (bool, error) {
 	s.renewCalls++
+	if s.renewSignal != nil {
+		s.renewSignal <- struct{}{}
+	}
 	return !s.renewDenied, s.renewErr
 }
 
@@ -216,6 +220,7 @@ func newTestBotMention(robots botMentionRobotService, claims botMentionClaimStor
 		internalToken: "internal-secret",
 		metrics:       metrics,
 		now:           func() time.Time { return time.Unix(1_785_460_000, 0) },
+		claimRenewal:  claimPendingTTL / 3,
 		Log:           log.NewTLog("BotMentionTest"),
 	}
 }
@@ -665,6 +670,38 @@ func TestBotMentionLostLeaseBeforeEnqueueReturnsInProgress(t *testing.T) {
 	}
 	if _, enqueues := robots.counts(); enqueues != 0 {
 		t.Fatalf("enqueue calls = %d, want 0", enqueues)
+	}
+}
+
+func TestBotMentionRenewsClaimWhileEnqueueIsBlocked(t *testing.T) {
+	renewSignal := make(chan struct{}, 4)
+	store := &scriptedClaimStore{confirmOK: true, renewSignal: renewSignal}
+	robots := &stubRobotService{
+		exists:          true,
+		eventID:         4242,
+		enqueueStarted:  make(chan struct{}),
+		enqueueContinue: make(chan struct{}),
+	}
+	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.claimRenewal = time.Millisecond
+	router := newMentionRouter(module)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- doMentionRequest(t, router, "internal-secret", validMentionRequest())
+	}()
+
+	<-renewSignal // synchronous pre-enqueue renewal
+	<-robots.enqueueStarted
+	select {
+	case <-renewSignal: // periodic renewal while enqueue is still blocked
+	case <-time.After(time.Second):
+		t.Fatal("claim lease was not renewed while enqueue was blocked")
+	}
+	close(robots.enqueueContinue)
+	response := <-result
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

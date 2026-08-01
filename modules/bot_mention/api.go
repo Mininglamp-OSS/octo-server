@@ -2,8 +2,12 @@ package bot_mention
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -21,6 +25,7 @@ type botMentionRobotService interface {
 type botMentionClaimStore interface {
 	Lookup(key, sha string) (claimOutcome, error)
 	Begin(key, sha string) (claimOutcome, *claimLease, error)
+	Renew(lease *claimLease) (bool, error)
 	Confirm(lease *claimLease, eventID int64) (bool, error)
 	Release(lease *claimLease) (bool, error)
 }
@@ -32,6 +37,7 @@ type BotMention struct {
 	internalToken string
 	metrics       botMentionMetricRecorder
 	now           func() time.Time
+	claimRenewal  time.Duration
 	log.Log
 }
 
@@ -44,16 +50,9 @@ type mentionIngressResponse struct {
 
 func New(ctx *config.Context) *BotMention {
 	logger := log.NewTLog("BotMention")
-	token := os.Getenv(internalTokenEnv)
-	switch {
-	case token == "":
-		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN not set; internal bot mention API will reject all requests")
-	case token == os.Getenv("NOTIFY_INTERNAL_TOKEN"):
-		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; bot mention capability disabled")
-		token = ""
-	case token == os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"):
-		logger.Error("OCTO_DOCS_BOT_MENTION_TOKEN must differ from OCTO_DOCS_NOTIFY_TOKEN; bot mention capability disabled")
-		token = ""
+	token, tokenErr := resolveBotMentionInternalToken(os.Getenv)
+	if tokenErr != nil {
+		logger.Error(tokenErr.Error())
 	}
 	return &BotMention{
 		robots:        robot.NewService(ctx),
@@ -62,6 +61,7 @@ func New(ctx *config.Context) *BotMention {
 		internalToken: token,
 		metrics:       defaultBotMentionMetrics,
 		now:           time.Now,
+		claimRenewal:  claimPendingTTL / 3,
 		Log:           logger,
 	}
 }
@@ -96,9 +96,8 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		}
 	}()
 
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
-	var request mentionRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	request, err := decodeMentionRequest(c)
+	if err != nil {
 		result = "invalid"
 		respondBotMentionInvalid(c, "body")
 		return
@@ -114,17 +113,21 @@ func (m *BotMention) create(c *wkhttp.Context) {
 	fingerprint := mentionFingerprint(mention)
 	existing, err := m.claims.Lookup(claimKey, fingerprint)
 	if err != nil {
-		m.Error("bot mention idempotency lookup failed", zap.Error(err), zap.String("claim_key", claimKey))
+		m.Error("bot mention idempotency lookup failed", zap.Error(err), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 		respondBotMentionStoreFailed(c)
 		return
 	}
 	if handled, claimResult := respondBotMentionClaimOutcome(c, existing); handled {
 		result = claimResult
+		if claimResult == "replay" {
+			m.logOutcome(mention, claimResult, existing.EventID, claimKey)
+		}
 		return
 	}
 
 	if !m.gate.Allows(mention.DocID, mention.SpaceID) {
 		result = "disabled"
+		m.logOutcome(mention, result, 0, claimKey)
 		c.Response(mentionIngressResponse{Accepted: false, Replay: false, Reason: "disabled"})
 		return
 	}
@@ -136,39 +139,55 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		return
 	}
 	if !exists {
-		result = "invalid"
+		result = "not_found"
 		respondBotMentionNotFound(c)
 		return
 	}
 
 	outcome, lease, err := m.claims.Begin(claimKey, fingerprint)
 	if err != nil {
-		m.Error("bot mention idempotency claim failed", zap.Error(err), zap.String("claim_key", claimKey))
+		m.Error("bot mention idempotency claim failed", zap.Error(err), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 		respondBotMentionStoreFailed(c)
 		return
 	}
 	if handled, claimResult := respondBotMentionClaimOutcome(c, outcome); handled {
 		result = claimResult
+		if claimResult == "replay" {
+			m.logOutcome(mention, claimResult, outcome.EventID, claimKey)
+		}
 		return
 	}
 	if outcome.State != claimAcquired || lease == nil {
-		m.Error("bot mention idempotency claim returned invalid state", zap.Int("state", int(outcome.State)), zap.String("claim_key", claimKey))
+		m.Error("bot mention idempotency claim returned invalid state", zap.Int("state", int(outcome.State)), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 		respondBotMentionStoreFailed(c)
+		return
+	}
+	renewed, renewErr := m.claims.Renew(lease)
+	if renewErr != nil {
+		m.Error("bot mention idempotency lease renewal failed", zap.Error(renewErr), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
+		respondBotMentionStoreFailed(c)
+		return
+	}
+	if !renewed {
+		result = "conflict"
+		respondBotMentionInProgress(c)
 		return
 	}
 
 	eventData := mentionEventData(mention, m.now().Unix())
 	enqueueStarted := time.Now()
+	stopKeepalive := m.startClaimLeaseKeepalive(lease, claimKey)
 	eventID, err := m.robots.EnqueueBotTypedEvent(mention.BotUID, docCommentMentionEventType, eventData)
+	stopKeepalive()
 	if err != nil {
 		if m.metrics != nil {
 			m.metrics.ObserveEnqueue("error", time.Since(enqueueStarted))
 		}
 		if released, releaseErr := m.claims.Release(lease); releaseErr != nil || !released {
 			m.Warn("bot mention claim release did not apply",
-				zap.Bool("released", released), zap.Error(releaseErr), zap.String("claim_key", claimKey))
+				zap.Bool("released", released), zap.Error(releaseErr), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 		}
-		m.Error("bot mention event enqueue failed", zap.Error(err), zap.String("bot_uid", mention.BotUID), zap.String("claim_key", claimKey))
+		m.Error("bot mention event enqueue failed", zap.Error(err), zap.String("bot_uid", mention.BotUID), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 		respondBotMentionStoreFailed(c)
 		return
 	}
@@ -181,11 +200,78 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		// attempt to roll it back; the consumer deduplicates on idempotency_key.
 		m.Warn("bot mention idempotency confirm did not apply",
 			zap.Bool("confirmed", confirmed), zap.Error(confirmErr),
-			zap.Int64("event_id", eventID), zap.String("claim_key", claimKey))
+			zap.Int64("event_id", eventID), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
 	}
 
 	result = "accepted"
+	m.logOutcome(mention, result, eventID, claimKey)
 	c.Response(mentionIngressResponse{Accepted: true, Replay: false, EventID: eventID})
+}
+
+func decodeMentionRequest(c *wkhttp.Context) (mentionRequest, error) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	var request mentionRequest
+	if err := decoder.Decode(&request); err != nil {
+		return mentionRequest{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return mentionRequest{}, errors.New("bot mention request contains multiple JSON values")
+		}
+		return mentionRequest{}, err
+	}
+	return request, nil
+}
+
+func (m *BotMention) logOutcome(mention normalizedMention, result string, eventID int64, claimKey string) {
+	m.Info("bot mention ingress completed",
+		zap.String("result", result),
+		zap.Int64("event_id", eventID),
+		zap.String("bot_uid", mention.BotUID),
+		zap.String("idempotency_hash", mentionClaimLogHash(claimKey)),
+	)
+}
+
+func (m *BotMention) startClaimLeaseKeepalive(lease *claimLease, claimKey string) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		interval := m.claimRenewal
+		if interval <= 0 {
+			interval = claimPendingTTL / 3
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				renewed, err := m.claims.Renew(lease)
+				if err != nil {
+					m.Warn("bot mention idempotency lease keepalive failed",
+						zap.Error(err), zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
+					continue
+				}
+				if !renewed {
+					m.Warn("bot mention idempotency lease keepalive lost ownership",
+						zap.String("idempotency_hash", mentionClaimLogHash(claimKey)))
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
 }
 
 func respondBotMentionClaimOutcome(c *wkhttp.Context, outcome claimOutcome) (bool, string) {

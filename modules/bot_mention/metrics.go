@@ -73,7 +73,7 @@ func (m *botMentionMetrics) ObserveEnqueue(result string, duration time.Duration
 
 func normalizeIngressMetricResult(result string) string {
 	switch result {
-	case "accepted", "replay", "disabled", "invalid", "unauthorized", "conflict", "error":
+	case "accepted", "replay", "disabled", "invalid", "not_found", "unauthorized", "conflict", "error":
 		return result
 	default:
 		return "error"

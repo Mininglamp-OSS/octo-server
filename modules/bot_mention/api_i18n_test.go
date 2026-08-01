@@ -2,15 +2,19 @@ package bot_mention
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-// TestBotMentionNoLegacyResponseError pins the new internal endpoint to the
-// localized error envelope. Add future handler files to this list.
+// TestBotMentionNoLegacyResponseError pins the module to the localized error
+// envelope and automatically covers future production Go files.
 func TestBotMentionNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go", "api_i18n.go"}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob module files: %v", err)
+	}
 	banned := []string{
 		".ResponseError(",
 		".ResponseErrorf(",
@@ -21,6 +25,9 @@ func TestBotMentionNoLegacyResponseError(t *testing.T) {
 		regexp.MustCompile(`c\.AbortWithStatus(?:JSON)?\(`),
 	}
 	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
 		t.Run(file, func(t *testing.T) {
 			data, err := os.ReadFile(file)
 			if err != nil {

@@ -49,6 +49,50 @@ func TestFeatureGateFromEnv(t *testing.T) {
 	}
 }
 
+func TestResolveBotMentionInternalToken(t *testing.T) {
+	tests := []struct {
+		name         string
+		mentionToken string
+		notifyToken  string
+		docsToken    string
+		want         string
+		wantErr      bool
+	}{
+		{name: "independent token enabled", mentionToken: "mention-secret", notifyToken: "notify-secret", docsToken: "docs-notify-secret", want: "mention-secret"},
+		{name: "empty token disabled", notifyToken: "notify-secret", docsToken: "docs-notify-secret", wantErr: true},
+		{name: "legacy notify collision disabled", mentionToken: "shared-secret", notifyToken: "shared-secret", docsToken: "docs-notify-secret", wantErr: true},
+		{name: "docs notify collision disabled", mentionToken: "shared-secret", notifyToken: "notify-secret", docsToken: "shared-secret", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getenv := func(key string) string {
+				switch key {
+				case internalTokenEnv:
+					return tt.mentionToken
+				case "NOTIFY_INTERNAL_TOKEN":
+					return tt.notifyToken
+				case "OCTO_DOCS_NOTIFY_TOKEN":
+					return tt.docsToken
+				default:
+					return ""
+				}
+			}
+			got, err := resolveBotMentionInternalToken(getenv)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveBotMentionInternalToken() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("token = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	if token, err := resolveBotMentionInternalToken(nil); err == nil || token != "" {
+		t.Fatalf("nil getenv = %q, %v; want disabled error", token, err)
+	}
+}
+
 func TestNormalizeMentionRequest(t *testing.T) {
 	valid := mentionRequest{
 		IdempotencyKey: " idem-1 ",

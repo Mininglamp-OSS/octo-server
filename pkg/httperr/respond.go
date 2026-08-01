@@ -34,6 +34,9 @@ func ResponseErrorL(c *wkhttp.Context, code codes.Code, params i18n.Params, deta
 //   - the Octo-link Bot bind/unbind endpoints (modules/botfather/api_user.go,
 //     POST/DELETE /v1/user/bots/:bot_id/bind) — new endpoints that must return
 //     real REST status (404/409/…) so external Agents branch on the wire code.
+//   - the document-comment Bot mention ingress (modules/bot_mention/api.go,
+//     POST /v1/internal/bot-mentions) — a new service-to-service endpoint whose
+//     docs-backend caller branches on 401/404/409/500 retry semantics.
 //
 // The body envelope is byte-for-byte identical to ResponseErrorL; only the
 // transport status differs — here it equals the code's canonical HTTPStatus, so

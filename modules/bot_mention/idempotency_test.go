@@ -136,6 +136,13 @@ func TestClaimStoreLifecycleAndConflict(t *testing.T) {
 	if backend.ttls[key] != claimPendingTTL {
 		t.Fatalf("pending TTL = %v, want %v", backend.ttls[key], claimPendingTTL)
 	}
+	backend.ttls[key] = time.Second
+	if renewed, err := store.Renew(lease); err != nil || !renewed {
+		t.Fatalf("renew = %v, %v", renewed, err)
+	}
+	if backend.ttls[key] != claimPendingTTL {
+		t.Fatalf("renewed TTL = %v, want %v", backend.ttls[key], claimPendingTTL)
+	}
 
 	pending, _, err := store.Begin(key, "sha-a")
 	if err != nil || pending.State != claimPending {
@@ -188,6 +195,9 @@ func TestClaimStoreStaleLeaseCannotMutateReplacement(t *testing.T) {
 	deleted, err := store.Release(oldLease)
 	if err != nil || deleted {
 		t.Fatalf("stale release = %v, %v; must not delete replacement", deleted, err)
+	}
+	if renewed, err := store.Renew(oldLease); err != nil || renewed {
+		t.Fatalf("stale renew = %v, %v; must not extend replacement", renewed, err)
 	}
 	ok, err := store.Confirm(newLease, 200)
 	if err != nil || !ok {
@@ -250,6 +260,9 @@ func TestClaimStoreDefaultsAndErrorBranches(t *testing.T) {
 	if ok, err := store.Confirm(nil, 0); err == nil || ok {
 		t.Fatalf("Confirm(nil) = %v, %v", ok, err)
 	}
+	if ok, err := store.Renew(nil); err == nil || ok {
+		t.Fatalf("Renew(nil) = %v, %v", ok, err)
+	}
 	if ok, err := store.Release(nil); err == nil || ok {
 		t.Fatalf("Release(nil) = %v, %v", ok, err)
 	}
@@ -279,6 +292,9 @@ func TestClaimStorePropagatesCASErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend.setCASErr = errors.New("cas failed")
+	if ok, err := store.Renew(lease); err == nil || ok {
+		t.Fatalf("Renew CAS error = %v, %v", ok, err)
+	}
 	if ok, err := store.Confirm(lease, 1); err == nil || ok {
 		t.Fatalf("Confirm CAS error = %v, %v", ok, err)
 	}
