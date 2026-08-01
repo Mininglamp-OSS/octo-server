@@ -62,6 +62,7 @@ func TestBotMentionMySQLRedisRobotQueueIntegration(t *testing.T) {
 	request := validMentionRequest()
 	request.BotUID = botID
 	request.IdempotencyKey = fmt.Sprintf("idem-%d", nonce)
+	ensureBotMentionIntegrationSchema(t, ctx)
 	prepareActiveUserBot(t, ctx, botID, botToken)
 
 	claims := newRedisClaimStore(ctx)
@@ -186,6 +187,69 @@ func newBotMentionIntegrationContext(t *testing.T, messageExpire time.Duration) 
 	}
 	t.Cleanup(func() { _ = ctx.DB().Close() })
 	return ctx, cfg
+}
+
+// ensureBotMentionIntegrationSchema keeps this package test self-contained.
+// CI drops and recreates the shared test database before every Go package, so
+// the bot_mention package cannot rely on robot/common migrations run elsewhere.
+// IF NOT EXISTS preserves the production-like local schema when it is present.
+func ensureBotMentionIntegrationSchema(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	statements := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "robot",
+			sql: `CREATE TABLE IF NOT EXISTS robot (
+				id BIGINT NOT NULL AUTO_INCREMENT,
+				robot_id VARCHAR(40) NOT NULL DEFAULT '',
+				token VARCHAR(100) NOT NULL DEFAULT '',
+				version BIGINT NOT NULL DEFAULT 0,
+				status SMALLINT NOT NULL DEFAULT 1,
+				creator_uid VARCHAR(40) NOT NULL DEFAULT '',
+				bot_token VARCHAR(100) NOT NULL DEFAULT '',
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				UNIQUE KEY robot_id_robot_index (robot_id),
+				UNIQUE KEY idx_robot_bot_token (bot_token)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		},
+		{
+			name: "seq",
+			sql: `CREATE TABLE IF NOT EXISTS seq (
+				id INT NOT NULL AUTO_INCREMENT,
+				` + "`key`" + ` VARCHAR(100) NOT NULL DEFAULT '',
+				min_seq BIGINT NOT NULL DEFAULT 1000000,
+				step INT NOT NULL DEFAULT 1000,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				UNIQUE KEY seq_uidx (` + "`key`" + `)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		},
+		{
+			name: "system_setting",
+			sql: `CREATE TABLE IF NOT EXISTS system_setting (
+				id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				category VARCHAR(64) NOT NULL,
+				key_name VARCHAR(128) NOT NULL,
+				value TEXT NOT NULL,
+				value_type VARCHAR(16) NOT NULL DEFAULT 'string',
+				description VARCHAR(255) NOT NULL DEFAULT '',
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				UNIQUE KEY uk_category_key (category, key_name)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+		},
+	}
+	for _, statement := range statements {
+		if _, err := ctx.DB().DB.Exec(statement.sql); err != nil {
+			t.Fatalf("create integration %s table: %v", statement.name, err)
+		}
+	}
 }
 
 func prepareActiveUserBot(t *testing.T, ctx *config.Context, botID, botToken string) {
