@@ -35,6 +35,7 @@ type stubRobotService struct {
 
 	enqueueStarted  chan struct{}
 	enqueueContinue chan struct{}
+	beforeEnqueue   func()
 	startOnce       sync.Once
 }
 
@@ -53,8 +54,12 @@ func (s *stubRobotService) EnqueueBotTypedEvent(robotID, eventType string, event
 	s.eventData = eventData
 	started := s.enqueueStarted
 	continuation := s.enqueueContinue
+	beforeEnqueue := s.beforeEnqueue
 	s.mu.Unlock()
 
+	if beforeEnqueue != nil {
+		beforeEnqueue()
+	}
 	if started != nil {
 		s.startOnce.Do(func() { close(started) })
 	}
@@ -149,10 +154,13 @@ type scriptedClaimStore struct {
 	confirmErr    error
 	releaseOK     bool
 	releaseErr    error
+	renewDenied   bool
+	renewErr      error
 
 	lease        *claimLease
 	confirmCalls int
 	releaseCalls int
+	renewCalls   int
 }
 
 func (s *scriptedClaimStore) Lookup(_, _ string) (claimOutcome, error) {
@@ -179,6 +187,11 @@ func (s *scriptedClaimStore) Confirm(_ *claimLease, _ int64) (bool, error) {
 func (s *scriptedClaimStore) Release(_ *claimLease) (bool, error) {
 	s.releaseCalls++
 	return s.releaseOK, s.releaseErr
+}
+
+func (s *scriptedClaimStore) Renew(_ *claimLease) (bool, error) {
+	s.renewCalls++
+	return !s.renewDenied, s.renewErr
 }
 
 type mentionResponse struct {
@@ -618,6 +631,40 @@ func TestBotMentionEnqueueFailureReleasesClaim(t *testing.T) {
 	}
 	if store.releaseCalls != 1 {
 		t.Fatalf("release calls = %d, want 1", store.releaseCalls)
+	}
+}
+
+func TestBotMentionRenewsClaimBeforeEnqueue(t *testing.T) {
+	store := &scriptedClaimStore{confirmOK: true}
+	robots := &stubRobotService{
+		exists:  true,
+		eventID: 4242,
+		beforeEnqueue: func() {
+			if store.renewCalls == 0 {
+				t.Error("claim lease was not renewed before enqueue")
+			}
+		},
+	}
+	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	response := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if store.renewCalls == 0 {
+		t.Fatal("renew calls = 0, want at least one")
+	}
+}
+
+func TestBotMentionLostLeaseBeforeEnqueueReturnsInProgress(t *testing.T) {
+	store := &scriptedClaimStore{renewDenied: true}
+	robots := &stubRobotService{exists: true, eventID: 4242}
+	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	response := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
+	if response.Code != http.StatusConflict || decodeMentionError(t, response).Error.Code != "err.server.bot_mention.in_progress" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, enqueues := robots.counts(); enqueues != 0 {
+		t.Fatalf("enqueue calls = %d, want 0", enqueues)
 	}
 }
 
