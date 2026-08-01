@@ -243,15 +243,10 @@ func (r *Registry) ValidateNotifyTokenExclusions(tokens ...string) error {
 	if r == nil {
 		return errors.New("cardactiondispatch: registry unavailable")
 	}
-	seen := make(map[string]struct{}, len(tokens))
 	for _, token := range tokens {
 		if token == "" {
 			continue
 		}
-		if _, ok := seen[token]; ok {
-			return errors.New("cardactiondispatch: broader ingress tokens must be distinct")
-		}
-		seen[token] = struct{}{}
 		if _, ok := r.ResolveNotifyToken(token); ok {
 			return errors.New("cardactiondispatch: action notify token conflicts with an existing notify token")
 		}
