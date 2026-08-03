@@ -222,10 +222,10 @@ func TestShouldSkipFriendCheck(t *testing.T) {
 // the new mention.entities field. This mirrors the parsing logic at event.go:135-153.
 func TestRobotMentionParsingWithEntities(t *testing.T) {
 	tests := []struct {
-		name         string
-		payload      string
-		expectUIDs   []string
-		expectPanic  bool
+		name        string
+		payload     string
+		expectUIDs  []string
+		expectPanic bool
 	}{
 		{
 			name: "v2 payload with uids and entities",

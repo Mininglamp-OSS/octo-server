@@ -39,7 +39,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -411,7 +410,7 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 	//
 	// 顺序：AuthMiddleware → 限流 → Space 校验。限流必须在 AuthMiddleware 之后
 	// 才读得到 uid，否则会静默 fail-open。
-	spaceBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), spacepkg.SpaceMiddleware(rb.ctx))
+	spaceBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
 	{
 		spaceBots.GET("/robot/space_bots", rb.spaceBots)
 	}

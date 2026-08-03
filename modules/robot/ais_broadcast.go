@@ -148,12 +148,12 @@ func (rb *Robot) collectGroupRobotIDs(groupNo string) ([]string, error) {
 //     they appeared in the input — see the explicit
 //     TestInjectBotUIDIntoMentionUIDs_DoesNotTouchMentionAllOrHumans
 //     guard. We rely on this in the dispatcher because:
-//       - `mention.all` participates in adapter-side
-//         `ignoreMentionAll` opt-outs (persona clones, OBO targets),
-//         flipping it on every bot would break those opt-outs.
-//       - `mention.ais` is the very signal that brought us into this
-//         branch; rewriting it would mask the source intent in
-//         downstream logs / audits.
+//     - `mention.all` participates in adapter-side
+//     `ignoreMentionAll` opt-outs (persona clones, OBO targets),
+//     flipping it on every bot would break those opt-outs.
+//     - `mention.ais` is the very signal that brought us into this
+//     branch; rewriting it would mask the source intent in
+//     downstream logs / audits.
 //  3. Dedup: if `botUID` is already a member of `mention.uids`, the
 //     original byte slice is returned unchanged (no allocation, no
 //     re-serialization). This matters because the same bot can appear

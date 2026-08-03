@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -56,8 +57,31 @@ func seedIsolationSpace(t *testing.T, ctx *config.Context, spaceID, botUID, memb
 
 // getSpaceBots 发一次请求。每次调用前清成员缓存：中间件把校验结果缓存在 Redis
 // （正向 60s / 否定 30s），不清会让同一 uid 的后续用例读到上一轮的判定。
+// resetUIDRateLimit 清空 UID 令牌桶。桶是进程级共享的（2 rps / burst 60），键存活
+// 在 Redis 且不随 CleanAllTables 清理；`go test ./...` 并行跑包、共用同一个 Redis 和
+// 同一个 testutil.UID，别处的用例可以把桶抽干，让这里的安全断言收到 429 而假失败。
+// 真正的危险不是 flake 本身，而是后来者为「修 flake」把 403 断言放宽成「非 200」。
+func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	client := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer client.Close()
+	keys, err := client.Keys("ratelimit:uid:*").Result()
+	if err != nil {
+		t.Fatalf("读取 UID 限流桶失败: %v", err)
+	}
+	if len(keys) > 0 {
+		if err := client.Del(keys...).Err(); err != nil {
+			t.Fatalf("重置 UID 限流桶失败: %v", err)
+		}
+	}
+}
+
 func getSpaceBots(t *testing.T, s *server.Server, ctx *config.Context, spaceID string) *httptest.ResponseRecorder {
 	t.Helper()
+	resetUIDRateLimit(t, ctx)
 	spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots?space_id="+spaceID, nil)
@@ -138,7 +162,10 @@ func TestSpaceBots_RemovedMemberLosesAccess(t *testing.T) {
 
 	w := getSpaceBots(t, s, ctx, spaceID)
 	assert.Equal(t, http.StatusForbidden, w.Code, "移除后必须被拒: %s", w.Body.String())
-	assert.Empty(t, decodeSpaceBots(w.Body.Bytes()))
+	// decodeSpaceBots 在 body 非数组时返回 nil，assert.Empty(nil) 恒真——
+	// 所以必须同时断言 body 里不出现 bot 标识，否则响应形状一变就静默失守。
+	assert.NotContains(t, w.Body.String(), "sb_iso_bot_rm")
+	assert.NotContains(t, w.Body.String(), "internal roadmap bot")
 }
 
 // TestSpaceBots_MissingSpaceIDKeepsBusinessError 不传 space_id 时必须仍走 handler
@@ -163,4 +190,19 @@ func TestSpaceBots_MissingSpaceIDKeepsBusinessError(t *testing.T) {
 	assert.NotEqual(t, http.StatusForbidden, w.Code, "缺参数不该被中间件拦成 403: %s", w.Body.String())
 	assert.Equal(t, http.StatusBadRequest, w.Code, "仍应是 handler 原有的参数缺失业务错误: %s", w.Body.String())
 	assert.Empty(t, decodeSpaceBots(w.Body.Bytes()), "错误响应不该是 bot 数组")
+
+	// 真实客户端不会发裸请求：octo-web 的 APIClient 拦截器给每个请求注入
+	// X-Space-Id。此时中间件会拿 header 值去校验，成员仍得到 handler 的 400，
+	// 非成员则是 403。补上成员变体，免得这条用例钉的是客户端发不出的形状。
+	const spaceID = "sb_iso_hdr"
+	seedIsolationSpace(t, ctx, spaceID, "sb_iso_bot_hdr", testutil.UID)
+	resetUIDRateLimit(t, ctx)
+	spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
+
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots", nil)
+	req2.Header.Set("token", testutil.Token)
+	req2.Header.Set("X-Space-Id", spaceID)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusBadRequest, w2.Code, "成员带 header 但缺 query 时仍是参数错误: %s", w2.Body.String())
 }

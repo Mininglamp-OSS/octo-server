@@ -106,6 +106,19 @@ no handler signature or response shape changes.
   optional `space_id` narrows that set further and cannot widen it.
 - **Other legacy `/v1/robot/...` routes** flagged in `space_inject.go:100`. They do
   not accept an explicit `space_id` and need separate analysis.
+- **The 60-second revocation window.** `SpaceMiddleware` caches a positive
+  membership verdict in Redis for 60s (`pkg/space/middleware.go:17`), and
+  `InvalidateMembershipCache` has **no production caller anywhere in the repo** —
+  `event.SpaceMemberCacheInvalidator`, which member removal does fire, targets
+  the unrelated in-process cache in `modules/notify`. So a user removed from a
+  Space keeps access to this endpoint for up to 60s if they touched any
+  SpaceMiddleware-mounted route just before removal. That is a pre-existing gap in
+  the shared middleware, not something this task introduces, and wiring the
+  invalidation into `removeMembers` / `leaveSpace` / disband touches every
+  consumer of that middleware. Recorded here so it is not mistaken for covered:
+  `TestSpaceBots_RemovedMemberLosesAccess` calls `InvalidateMembershipCache`
+  by hand, so it verifies that the verdict flips once the cache is cleared, NOT
+  that production clears it.
 - **Un-skipping `TestSpaceBots_ExcludesDeletedSpaceMembers`** (blocked on
   octo-server#17). New tests here must stand on their own rather than depend on
   that fixture being revived.
@@ -120,6 +133,11 @@ no handler signature or response shape changes.
   1. **Non-member is refused.** Viewer A, authenticated, with no `space_member` row
      in Space S, requests `?space_id=S` and receives an error **and zero rows** —
      asserted on the response body, not only the status code.
+  1b. **Disabled Space now refuses members too.** `CheckMembership` additionally
+     requires `space.status = 1`, which the handler never checked, so a member of
+     a disbanded Space goes from 200 + bot list to 403. This is a correct
+     tightening but it IS a behaviour change for a legitimate caller, so it is
+     recorded here rather than left to surface in production.
   2. **Member is unaffected.** Viewer B, a member of S, receives exactly the rows
      they receive today: same field set, same `u.created_at DESC` order, `botfather`
      absent, and `status` still viewer-scoped (`added` / `pending` / `not_added`).
@@ -132,6 +150,11 @@ no handler signature or response shape changes.
      unchanged.
 - The route declaration at `modules/robot/api.go:332` mounts, in order,
   `AuthMiddleware` → `SharedUIDRateLimiter` → `SpaceMiddleware`.
-- `modules/robot/swagger/api.yaml` documents the `403` response for `space_bots`.
+- ~~`modules/robot/swagger/api.yaml` documents the `403` response for
+  `space_bots`.~~ **Not done.** That file has no `/robot/space_bots` entry at all
+  today, so satisfying this would mean authoring the endpoint's full spec — new
+  documentation for a deprecated endpoint, which cuts against freezing it. Left
+  undone deliberately; the deprecation notice on the route points readers at
+  `GET /v1/space/{space_id}/directory`, which IS specified (OpenAPI 3.0.3).
 - Diff to `modules/robot/api.go` `spaceBots` body (lines 1479+) is limited to
   nothing, or to comments; the SQL and response construction are untouched.
