@@ -70,7 +70,8 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   - pending TTL 使用 60 秒；事件序列号分配或序列化失败时，以 CAS 方式只释放仍为 pending
     的 claim；因此这类失败可安全重试；
   - 事件准备阶段不写可见队列；最终通过同一 Redis Lua 原子校验 lease、`ZADD` bot 队列、
-    刷新队列 TTL，并把 claim 更新为 done。旧 lease 即使在慢请求后恢复也不能写入队列；
+    刷新队列 TTL，并把 claim 更新为 done；提交成功后调用 `botevent.Notify` 唤醒 opt-in
+    long-poll。旧 lease 即使在慢请求后恢复也不能写入队列；
   - atomic enqueue+confirm 的 claim TTL 与队列 TTL 均使用 `Robot.MessageExpire`；序列号可因
     lease 失效而出现空洞，bot 消费游标不得假设 event_id 连续；
   - claim 仍存在时，同 key、同规范化请求体回放原 `event_id`，同 key、不同请求体返回冲突；

@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -2083,6 +2084,11 @@ func (s *Service) notifyBotJoinedGroup(memberUsers []*user.Model, addedUIDSet ma
 			s.Error("push bot_joined_group event failed", zap.Error(err), zap.String("robotID", robotID))
 			continue
 		}
+		// Same invariant as every other enqueue site: a successful ZADD notifies
+		// the doorbell. Low volume and latency-insensitive, but keeping the rule
+		// exceptionless is what stops another producer from being missed — and
+		// the source guard, not this comment, is what holds it.
+		botevent.Notify(s.ctx.GetConfig(), robotID)
 		s.Info("pushed bot_joined_group event", zap.String("robotID", robotID), zap.String("groupNo", groupNo))
 	}
 }

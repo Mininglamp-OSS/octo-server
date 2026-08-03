@@ -374,6 +374,13 @@ func TestBotMentionAcceptedAndReplay(t *testing.T) {
 	robots := &stubRobotService{exists: true, eventID: 4242}
 	metrics := &fakeMetricRecorder{}
 	module := newTestBotMention(robots, claims, newFeatureGate(true, "space-1", ""), metrics)
+	notifications := 0
+	module.notifyBotEvent = func(robotID string) {
+		if robotID != "bot-1" {
+			t.Fatalf("notified robot = %q, want bot-1", robotID)
+		}
+		notifications++
+	}
 	router := newMentionRouter(module)
 
 	first := doMentionRequest(t, router, "internal-secret", validMentionRequest())
@@ -410,6 +417,9 @@ func TestBotMentionAcceptedAndReplay(t *testing.T) {
 	ingress, enqueues := metrics.snapshot()
 	if fmt.Sprint(ingress) != "[accepted replay]" || fmt.Sprint(enqueues) != "[accepted]" {
 		t.Fatalf("metrics ingress=%v enqueue=%v", ingress, enqueues)
+	}
+	if notifications != 1 {
+		t.Fatalf("doorbell notifications = %d, want 1 for the committed event", notifications)
 	}
 }
 
@@ -809,6 +819,8 @@ func TestBotMentionRecoversAmbiguousAtomicCommitAsReplay(t *testing.T) {
 	store := &ambiguousCommitClaimStore{}
 	robots := &stubRobotService{exists: true, eventID: 777}
 	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	notifications := 0
+	module.notifyBotEvent = func(string) { notifications++ }
 	w := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
@@ -820,5 +832,8 @@ func TestBotMentionRecoversAmbiguousAtomicCommitAsReplay(t *testing.T) {
 	commits, releases := store.counts()
 	if commits != 1 || releases != 0 {
 		t.Fatalf("commit=%d release=%d, want 1 and 0", commits, releases)
+	}
+	if notifications != 1 {
+		t.Fatalf("doorbell notifications = %d, want 1 after ambiguous commit recovery", notifications)
 	}
 }

@@ -35,7 +35,10 @@ type Target struct {
 }
 
 type Card struct {
-	Profile       string
+	Profile string
+	// RenderProfile selects the client visual compatibility profile. An empty
+	// value asks the trusted platform dispatch boundary to author its stable
+	// default; callers may only provide an explicitly accepted value.
 	RenderProfile string
 	Document      json.RawMessage
 }

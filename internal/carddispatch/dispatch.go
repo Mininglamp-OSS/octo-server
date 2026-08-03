@@ -100,14 +100,16 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		}
 		return nil, categorized(terminal, decodeErr)
 	}
-	payload := map[string]interface{}{
-		"type":         cardmsg.InteractiveCard.Int(),
-		"card_version": cardmsg.CardVersion,
-		"profile":      card.Profile,
-		"card":         cardDocument,
+	renderProfile := card.RenderProfile
+	if renderProfile == "" {
+		renderProfile = cardmsg.RenderProfileOctoChatV1
 	}
-	if card.RenderProfile != "" {
-		payload["render_profile"] = card.RenderProfile
+	payload := map[string]interface{}{
+		"type":           cardmsg.InteractiveCard.Int(),
+		"card_version":   cardmsg.CardVersion,
+		"profile":        card.Profile,
+		"render_profile": renderProfile,
+		"card":           cardDocument,
 	}
 	if validateErr := cardmsg.Validate(payload); validateErr != nil {
 		terminal = cardErrorCategory(validateErr)

@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"go.uber.org/zap"
 )
 
@@ -29,12 +30,13 @@ type botMentionClaimStore interface {
 }
 
 type BotMention struct {
-	robots        botMentionRobotService
-	claims        botMentionClaimStore
-	gate          featureGate
-	internalToken string
-	metrics       botMentionMetricRecorder
-	now           func() time.Time
+	robots         botMentionRobotService
+	claims         botMentionClaimStore
+	gate           featureGate
+	internalToken  string
+	metrics        botMentionMetricRecorder
+	now            func() time.Time
+	notifyBotEvent func(robotID string)
 	log.Log
 }
 
@@ -58,7 +60,10 @@ func New(ctx *config.Context) *BotMention {
 		internalToken: token,
 		metrics:       defaultBotMentionMetrics,
 		now:           time.Now,
-		Log:           logger,
+		notifyBotEvent: func(robotID string) {
+			botevent.Notify(ctx.GetConfig(), robotID)
+		},
+		Log: logger,
 	}
 }
 
@@ -178,6 +183,7 @@ func (m *BotMention) create(c *wkhttp.Context) {
 	if commitErr != nil {
 		current, lookupErr := m.claims.Lookup(claimKey, fingerprint)
 		if lookupErr == nil && current.State == claimReplay {
+			m.notifyQueue(mention.BotUID)
 			if m.metrics != nil {
 				m.metrics.ObserveEnqueue("accepted", time.Since(enqueueStarted))
 			}
@@ -205,6 +211,7 @@ func (m *BotMention) create(c *wkhttp.Context) {
 		if handled, claimResult := respondBotMentionClaimOutcome(c, current); handled {
 			result = claimResult
 			if claimResult == "replay" {
+				m.notifyQueue(mention.BotUID)
 				m.logOutcome(mention, claimResult, current.EventID, claimKey)
 			}
 			return
@@ -216,6 +223,7 @@ func (m *BotMention) create(c *wkhttp.Context) {
 	if m.metrics != nil {
 		m.metrics.ObserveEnqueue("accepted", time.Since(enqueueStarted))
 	}
+	m.notifyQueue(mention.BotUID)
 
 	result = "accepted"
 	m.logOutcome(mention, result, prepared.EventID, claimKey)
@@ -246,6 +254,12 @@ func (m *BotMention) logOutcome(mention normalizedMention, result string, eventI
 		zap.String("bot_uid", mention.BotUID),
 		zap.String("idempotency_hash", mentionClaimLogHash(claimKey)),
 	)
+}
+
+func (m *BotMention) notifyQueue(robotID string) {
+	if m.notifyBotEvent != nil {
+		m.notifyBotEvent(robotID)
+	}
 }
 
 func respondBotMentionClaimOutcome(c *wkhttp.Context, outcome claimOutcome) (bool, string) {
