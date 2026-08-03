@@ -73,6 +73,24 @@ func TestValidateTargetAllowsStaticInteractiveTemplateWithoutRouteSpec(t *testin
 	}
 }
 
+func TestValidateInteractiveTargetAllowsHiddenControlsSuccessorWithoutRouteSpec(t *testing.T) {
+	t.Setenv("OCTO_CARD_ACTION_ROUTES", "")
+	registry := cardtmpl.NewRegistry()
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+	registry.Freeze()
+
+	template, err := registry.Lookup(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract := template.Meta().ActionContract; contract != nil {
+		t.Fatalf("0.3.0 ActionContract = %+v, want nil", contract)
+	}
+	if err := validateInteractiveTarget(template.Meta()); err != nil {
+		t.Fatalf("validate hidden-controls successor interaction contract: %v", err)
+	}
+}
+
 func TestValidateTargetRequiresConfiguredRouteForDynamicInteractiveTemplate(t *testing.T) {
 	t.Setenv("OCTO_CARD_ACTION_ROUTES", "")
 	artifact := integrationArtifactForVersion(t, "1.0.0")

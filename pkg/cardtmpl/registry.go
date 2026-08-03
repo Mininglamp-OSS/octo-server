@@ -22,7 +22,7 @@ var l2aOwnerAllowlist = map[string]struct{}{
 	"summary": {},
 	"notify":  {},
 	"action":  {},
-	"ai":      {}, // AI reasoning-process progress card family (roadmap E1 downstream)
+	"ai":      {}, // AI reasoning-process JSON card family (roadmap E1)
 }
 
 // L2b owner 前缀。前缀合规但清单不在 docs/l2b-owners.md 里 → Register 拒绝。

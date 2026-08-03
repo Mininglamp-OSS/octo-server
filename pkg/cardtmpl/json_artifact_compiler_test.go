@@ -63,6 +63,30 @@ func TestCompileJSONArtifactProducesStableCanonicalArtifact(t *testing.T) {
 	}
 }
 
+func TestCompileJSONArtifactRejectsSubmitInV1WithoutActionContract(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	card := json.RawMessage(`{
+		"type":"AdaptiveCard","version":"1.5",
+		"body":[{"type":"TextBlock","text":"${title}","wrap":true}],
+		"actions":[{"type":"Action.Submit","id":"forged-submit","title":"Submit"}]
+	}`)
+	bundle.Templates["main"] = card
+	bundle.Goldens["shown"] = json.RawMessage(`{
+		"type":"AdaptiveCard","version":"1.5",
+		"body":[{"type":"TextBlock","text":"hello","wrap":true}],
+		"actions":[{"type":"Action.Submit","id":"forged-submit","title":"Submit"}]
+	}`)
+
+	_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err == nil {
+		t.Fatal("octo/v1 artifact without ActionContract accepted Action.Submit")
+	}
+	if got := err.Error(); !strings.Contains(got, "cardmsg.Validate") ||
+		!strings.Contains(got, "Action.Submit") || !strings.Contains(got, "octo/v1") {
+		t.Fatalf("error = %q, want octo/v1 cardmsg profile rejection", got)
+	}
+}
+
 func TestStaticRegistrationAndRuntimeCompilerHaveCanonicalParity(t *testing.T) {
 	const root = "testdata/test.runtime-parity@1.0.0"
 	bundle, err := LoadJSONBundle(jsonCardTestData, root, CatalogDescriptor{

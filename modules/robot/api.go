@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -195,11 +196,21 @@ func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[s
 	return enqueueBotTypedEventGeneric(rb.ctx, robotID, eventType, eventData)
 }
 
-// enqueueBotEventGeneric is the shared write-to-bot-event-queue helper
-// used by saveRobotMessage (listener path) and EnqueueBotEvent (cross-
-// module synthetic path). Centralizing the GenSeq / ZAdd / Expire shape
-// here means the bot event consumer (/v1/bot/events) sees identical
-// records regardless of which path produced them.
+// enqueueBotEventGeneric is the write-to-bot-event-queue helper shared by
+// EnqueueBotEvent (cross-module synthetic path) and, in typed form, by
+// enqueueBotTypedEventGeneric.
+//
+// It is NOT the only writer, and this comment used to claim otherwise.
+// `saveRobotMessage` (modules/robot/event.go) carries its own inline
+// GenSeq / ZAdd / Expire copy for the listener fast-path, and both
+// `notifyBotJoinedGroup` variants in modules/group write the queue directly
+// as well — five ZADD sites in total. PR#685's review caught the doorbell
+// being wired to only two of them because the brief trusted this docstring
+// instead of the call graph.
+//
+// If you add a queue writer, it must also ring the doorbell
+// (pkg/botevent.Ring) after a successful ZADD, or /v1/bot/events long-poll
+// will not wake promptly for it.
 func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config.MessageResp) error {
 	if ctx == nil {
 		return errors.New("robot: nil ctx, cannot enqueue bot event")
@@ -235,8 +246,15 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — do not fail the enqueue. Mirrors
 		// saveRobotMessage which also only logs on Expire failure.
+		botevent.Notify(ctx.GetConfig(), robotID)
 		return nil
 	}
+	// Wake any /v1/bot/events long-poll parked on this bot. After the ZADD, so a
+	// waiter is never woken toward an event the queue does not have yet; and
+	// after the EXPIRE, so a brand-new queue key is never left without a TTL
+	// across the ring. Notify does no I/O on this goroutine — see pkg/botevent,
+	// which explains why the ring must not be synchronous here.
+	botevent.Notify(ctx.GetConfig(), robotID)
 	return nil
 }
 
@@ -271,8 +289,12 @@ func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string,
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
 		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。
+		botevent.Notify(ctx.GetConfig(), robotID)
 		return seq, nil
 	}
+	// 同 enqueueBotEventGeneric：ZADD + EXPIRE 之后再摇铃唤醒 long-poll。
+	// card_action 正是走本路径入队，卡片交互的端到端时延收益就落在这一行上。
+	botevent.Notify(ctx.GetConfig(), robotID)
 	return seq, nil
 }
 

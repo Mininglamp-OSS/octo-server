@@ -113,7 +113,7 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
   2. 不认识 `profile`（更新的服务端/更旧的客户端）→ 渲染 `plain`；
   3. 连 `type:17` 都不认识（存量客户端）→ octo-lib 未知类型兜底文案。
 - P2 产者能力发现：`GET /v1/bot/card/profile`（D12，随 P2 落地）返回部署的
-  `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `actions` / `limits`
+  `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `actions` / `templating` / `limits`
   清单（只增不改）；`elements`/`inputs`/`actions` 是本部署接受的展示元素 / 交互输入 /
   **本地动作**白名单（源自 `pkg/cardmsg` 权威列表；`elements` 只列**顶层可放置**元素——
   `Column` 是 `ColumnSet` 的子列、由 `ColumnSet` 涵盖，不单列；`actions` 只列 octo/v1
@@ -122,6 +122,32 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
   前向兼容协商——即便 `card_version` 停在 `"1.5"`、`profiles` 不变，也能探测是否接受
   `Input.Number/Date/Time`、`ToggleVisibility`/`CopyToClipboard` 等 additive 新增能力。
   P1 期间生产者以发送被 400/`card_disabled` 拒绝为「未启用」信号。
+
+`templating` 是 Bot Registry 模式的服务端新发 allowlist，不是整个
+`Registry.List()`。消费者必须同时校验 `supported`、wire 版本、模板精确版本、
+view/state/wire profile 以及每个 view 的 `submit_actions`；不能从
+`profile="octo/v2"` 推断某张模板一定带 Submit。当前 V3 形状如下，实际选择仍以
+目标环境实时响应为准：
+
+```json
+{
+  "templating": {
+    "supported": true,
+    "wire": "template-ref/v1",
+    "templates": [
+      {
+        "id": "ai.reasoning-process",
+        "version": "0.3.0",
+        "views": [
+          {"name":"active","states":["answering","reasoning"],"wire_profile":"octo/v2","submit_actions":[]},
+          {"name":"error","states":["error"],"wire_profile":"octo/v2","submit_actions":[]},
+          {"name":"result","states":["completed","stopped"],"wire_profile":"octo/v1","submit_actions":[]}
+        ]
+      }
+    ]
+  }
+}
+```
 
 ## 4. 信任模型（谁能发卡、谁能信卡）
 
@@ -181,8 +207,16 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 { "msg_type": "card", "card": { "…": "AC JSON" }, "text": "optional plain seed" }
 ```
 
-robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot ingress
-对称；错误形状是该 API 的单一 content-invalid 400）。
+`render_profile` 是服务端写入最终 type-17 信封的视觉兼容键，不是
+`/v1/bot/sendMessage` 的外层字段，也不需要 Bot 放进 raw `payload`。raw Bot send/edit
+在校验调用方卡片后统一写入 `octo-chat/v1`，再执行最终大小校验和派发/落库；为兼容
+已有调用方，显式传入同一合法值仍可通过，但不是权威来源，未知值仍在写入前
+fail-close。Registry `template_ref` 模式继续禁止调用方携带该字段，由服务端按 manifest
+的 `renderProfileCompatibility` 权威生成。其他 ingress 未选择兼容档时仍按各自既有
+契约走 Legacy 渲染。
+
+robot API（legacy）`/robot/sendMessage` 同样接受 type-17 的共享结构校验，但不继承
+Bot API 的服务端视觉默认值；错误形状仍是该 API 的单一 content-invalid 400。
 
 **P1 卡片不可变**：所有编辑入口（用户 `/v1/message/edit`、bot
 `/v1/bot/message/edit`、robot 编辑）对 type-17（目标消息或编辑体）一律 400。

@@ -4,12 +4,160 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-31 (bot-events-longpoll)
+
+- **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):
+  `POST /v1/bot/events` gained an opt-in long poll. Bot delivery was cursor short
+  polling (one `ZRangeByScore`, immediate return), so card interaction latency
+  equalled the bot's poll cadence. **Every** producer that ZADDs into
+  `robotEvent:{robotID}` now rings a per-bot doorbell — five sites, including
+  the highest-volume `saveRobotMessage`; review found the first revision had
+  wired only two, so the invariant is now held by a source guard rather than by
+  the docstring that caused the miss — and a caller passing `wait` seconds parks
+  on it via BLPOP. New leaf package `pkg/botevent` owns the key format, since
+  `modules/bot_api` already imports `modules/robot` and either module would have
+  meant an import cycle or a drifting copy.
+  **The doorbell is a hint, never the event** — every wake-up re-reads the
+  authoritative sorted set from the caller's cursor, so a lost, stolen or stale
+  bell costs latency only. `wait` defaults to 0, keeping today's behavior
+  field-for-field; the default was decided by the consumer, whose hard 10s client
+  timeout would have made a default-on hold abort and log on every poll. Waiting
+  uses a dedicated Redis client with an explicit `PoolSize` because BLPOP pins its
+  connection and the shared pool has none. No new errcode, i18n entry, endpoint or
+  migration — an expired hold reuses the existing OK empty-batch shape.
+  Known bounds recorded rather than hidden: drain can be extended by one 5s chunk
+  (no module shutdown hook), a whole page of undecodable members starves that one
+  request (bounded, never spinning), and hold budgets are per process
+  (`maxEventHolds × replicas` fleet-wide).
+- **Review rounds 3–4 — the hold loop's progress guarantee.** Four review rounds
+  each found a branch of `waitForEvents` that made no progress, so the loop was
+  restated as one invariant rather than patched per finding: **every iteration
+  either burns a chunk of wall clock or advances the queue cursor, never
+  neither.** Concretely: a refused hold now pauses (round 3) under a budget of
+  its own so back-pressure cannot become the resource sink (round 4); a failing
+  BLPOP pays out its chunk and logs once per hold, instead of retrying at
+  go-redis's ~8ms backoff (measured: **924 authoritative reads in 8s**); and the
+  cursor advances from the read itself — before the App Bot filter, covering
+  undecodable members — so progress no longer rests on an auto-ACK `ZREM` that
+  only warns on failure, and the block is skipped only when the cursor actually
+  moved (measured without that guard: **38,722 reads in 6s**). Both figures come
+  from deleting the fix and re-running the regression tests, which count Redis's
+  own `INFO commandstats`. Also: `readEventPage` is now the single seam both the
+  immediate and held paths read through; the entry page is threaded into the hold
+  so a pre-existing backlog drains instead of waiting for a bell that will never
+  ring; `Ring` moved to `rd.NewScript` (EVALSHA) and its failures are logged at
+  all five producers; `OCTO_BOT_EVENTS_MAX_HOLDS` is validated at boot and
+  documented, with the per-replica connection budget (shared + wait 68 + ring 10)
+  in the new `docs/bot-events-longpoll.md`.
+- **Review round 5 — the invariant's own counterexamples.** All four reviewers
+  approved round 4; the remaining findings were non-blocking and fixed anyway,
+  because every one of them is the failure mode this task keeps reproducing: a
+  written claim stronger than the code. The stated invariant had two
+  counterexamples (a doorbell token whose event lands *below* the caller's
+  cursor advances nothing; the entry page's skip was ungated while the in-loop
+  one was gated), so it now reads *burns a chunk, **or** advances the cursor,
+  **or** consumes a token* and both skip sites share one `eventPage.advanced`.
+  The claim that the cursor covers undecodable members narrowed to the truth — it
+  clears them only incidentally, when a decodable member with a higher id shares
+  the page. `docs/bot-events-longpoll.md` said a hold overshoots by "less than one
+  second"; go-redis's `timeout + 10s` command deadline makes the real worst case
+  **~45s for a 30s hold**, which is the number an operator sizes a proxy idle
+  timeout from. The `event_id == ZSET score` equality the cursor rests on is now
+  written down. Finally, round 4's commit message claimed every new test was
+  verified by deleting its fix, and that was untrue of one: the failed-ACK test
+  re-seeded events after a *successful* ZREM, which is not the read-succeeds /
+  write-fails state it named. It is now a real one via an `ackFilteredEvent`
+  seam, and the anti-spin test's slack tightened from `+3` to `+1` so the entry
+  gap fails it (3 reads where 2 suffice).
+- **Review round 6 — the producer side.** Four rounds of hardening had all
+  concentrated on the consumer loop; the one blocking finding this round was on
+  the producer path, which had received a ring call in round 1 and no
+  tail-latency analysis since. `botevent.Ring` was a **synchronous** network call
+  inline in `saveRobotMessage`, which runs inside a `msgSem` slot the message
+  listener acquires with a *blocking* send on its own goroutine (capacity 100) —
+  so ring latency became held slots, and 100 held slots stop bot message fan-out
+  process-wide, for every bot, including bots that never long-poll. The tail was
+  bounded by nothing: a 10-connection pool against a path admitting 100
+  concurrent callers, plus go-redis defaults of 5s dial / 3s read / 4s pool with
+  one retry. Not patched with tighter timeouts — the shape changed. Producers now
+  call `botevent.Notify`, which does **no I/O on their goroutine**: rings are
+  coalesced per bot (`LTRIM 0 0` makes N rings for one bot indistinguishable from
+  one, so the queue is bounded by distinct bots rather than message rate), handed
+  to a bounded worker pool, and dropped-with-a-counter when saturated — losing a
+  hint costs a waiter one chunk, blocking a producer costs delivery for everyone.
+  `ringPoolSize` is now derived from `ringWorkers` rather than copied from an
+  unrelated convention, with sub-second timeouts and no retries. The repo had
+  already rejected the synchronous shape for the same reason in
+  `modules/bot_api/auth.go`'s fire-and-forget registry warm-up.
+  Also this round: `MaxRetries = 0` on the wait client (a retried BLPOP added
+  roughly a chunk beyond the documented worst case); the cursor's stated
+  invariant corrected from score **equality** to score **uniqueness**, which
+  `GenSeq`'s block allocator does not guarantee across replicas and which would
+  silently drop an event — recorded as assumed-and-unverified rather than
+  claimed; the read-error exit's asymmetry justified with the client's actual
+  backoff behaviour instead of left implicit; `ackFilteredEvent` moved off a
+  mutable package global onto `BotAPI`; and `brief.md`'s Out-of-scope line, which
+  still forbade self-building an `rd.Client` while the finalised decision
+  required it.
+- Brief/context under `.octospec/tasks/bot-events-longpoll/`; shared journal
+  `.octospec/journal/shared/bot-events-longpoll.md`; learning candidates
+  `.octospec/learnings/pending/bot-events-longpoll.md` (lower-bound assertions for
+  timing promises → `testing`) and
+  `.octospec/learnings/pending/loop-progress-invariant.md` (state the invariant
+  instead of answering findings one at a time → `testing`). Consumer half is a
+  sibling change in openclaw-channel-octo. PR #685.
+
+## 2026-07-30 (space-join-apply-resubmit)
+
+- **Recoverable join applications** — A pending Space join application now adopts
+  a freshly submitted invite code (refreshing the application time and
+  re-notifying admins) instead of staying bound to a spent/disabled/expired one,
+  so an applicant can repair their own stuck application without an admin
+  rejecting it first. Approval-time invite failures are classified (exhausted vs
+  invalid), notify the applicant, and share one implementation across all three
+  approval entry points. Invite-slot consumption stays at approval time — a
+  tracked follow-up. Upstream #683. See
+  [journal](journal/shared/space-join-apply-resubmit.md).
+
+## 2026-07-30 (cardtmpl-reasoning-controls-hidden-successor)
+
+- **Safe reasoning successor** — Added immutable
+  `ai.reasoning-process@0.3.0` from the bounded V2 contract, removing unsupported
+  stop/retry Submit controls while preserving five states, the local reasoning
+  toggle, and active/error=`octo/v2`, result=`octo/v1`.
+- **Version cutover** — Registry default and Bot new sends now select V3;
+  V1/V2/V3 remain available only for same-exact-version historical edits.
+  Runtime static reconciliation claims V3 and dynamic same-key collision stays
+  fail-closed.
+- **Visual-profile contract** — Raw Bot send/edit callers no longer need to
+  provide `render_profile`; the Bot API authors `octo-chat/v1` on effective
+  frames. Registry callers still cannot override the server-authored manifest
+  value. See
+  [journal](journal/shared/cardtmpl-reasoning-controls-hidden-successor.md) and
+  [brief](tasks/cardtmpl-reasoning-controls-hidden-successor/brief.md).
+- **Boundary** — No OpenClaw release, active-run stop/retry, dynamic grant, or
+  production gate enablement is included. V3-capable server rollback support is
+  required after the first V3 message is sent.
+- **Review closure** — The runtime-catalog runbook now forbids routine
+  static-to-static Activate/Rollback and requires active-pointer compatibility
+  before binary rollback, preventing an older image from treating a persisted
+  static V3 target as sticky global integrity failure. Protocol docs now include
+  the Bot templating/empty-submit capability; focused tests reject legacy V3
+  stop/retry IDs through the Submit and ActionContext gates and caller-owned
+  Registry `render_profile`. The reported V1 self-check gap was mutation-tested
+  and is already closed by registration-time `cardmsg.Validate`; a regression
+  now locks it, and the V3 RouteSpec test directly covers its intended branch.
+
 ## 2026-07-29 (inactive-hiding-user-control, Batch 1)
 
-- **Consistency** — Archived 子区 now leave every conversation list, not just
-  `/v1/conversation/sync`: `dropArchivedThreadItems` converges both
-  `/v1/sidebar/sync` tabs on the same `status=active` predicate, fail-open on an
-  unknown status. Extends the direction XIN-1135 set for the self-created
+- **Consistency** — Archived 子区 now leave the conversation lists, not just
+  `/v1/conversation/sync`: `dropArchivedThreadItems` converges
+  `/v1/sidebar/sync`'s **recent tab** on the same `status=active` predicate,
+  fail-open on an unknown status. The **follow tab deliberately keeps them** —
+  its response is the clients' only source of `is_followed`, so filtering it
+  server-side would report an already-followed archived thread as unfollowed and
+  make unfollow impossible; that tab's display filtering stays with the clients.
+  Extends the direction XIN-1135 set for the self-created
   exemption to the paths it left open. See
   [journal](journal/shared/inactive-hiding-user-control.md) and
   [brief](tasks/inactive-hiding-user-control/brief.md).

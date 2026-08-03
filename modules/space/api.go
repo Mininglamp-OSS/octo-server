@@ -22,6 +22,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -78,7 +79,6 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	{
 		auth.POST("/create", s.createSpace)
 		auth.GET("/my", s.mySpaces)
-		auth.POST("/join", s.joinSpace)
 
 		auth.GET("/:space_id", s.getSpace)
 		auth.PUT("/:space_id", s.updateSpace)
@@ -102,6 +102,14 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.POST("/:space_id/email-invites", s.createMemberEmailInvite)
 		auth.GET("/:space_id/email-invites", s.listMemberEmailInvites)
 		auth.DELETE("/:space_id/email-invites/:id", s.revokeMemberEmailInvite)
+	}
+
+	// 加入申请提交：一次成功的重申会给该 Space 的每个管理员各发一条私信，是一条
+	// 用户可触发的扇出路径。第一道约束是"内容真的变了才通知"（见 joinSpace），
+	// 这里补上仓库对认证端点的默认限流（挂在 AuthMiddleware 之后才能读到 uid）。
+	joinLimited := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
+	{
+		joinLimited.POST("/join", s.joinSpace)
 	}
 
 	search := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
@@ -1009,12 +1017,62 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			return
 		}
 		if pendingApply != nil {
-			c.Response(map[string]interface{}{
-				"status":   "PENDING",
-				"space_id": invitation.SpaceId,
-				"msg":      "申请已提交，请等待审批",
-			})
-			return
+			// 同一个码重复提交：没有任何变化，保持原有的"已提交，等待审批"语义。
+			// 这一分支是通知放大的第一道约束：只有申请内容真的变了才会重新惊动管理员。
+			// 注意它只比对*当前存的那个码*，所以在两个有效码之间来回切换仍然次次算"变了"
+			// ——真正兜底的是路由上的 SharedUIDRateLimiter（PR #684 review P2-4）。
+			if pendingApply.InviteCode == req.InviteCode {
+				c.Response(map[string]interface{}{
+					"status":   "PENDING",
+					"space_id": invitation.SpaceId,
+					"msg":      "申请已提交，请等待审批",
+				})
+				return
+			}
+
+			// 换了一个有效邀请码重申：让待审批记录改用本次凭证并刷新申请时间。
+			// 此前这里直接返回 PENDING，导致申请永远绑定旧邀请码——旧码一旦用尽/被禁用/
+			// 过期，审批必然失败并回滚为待审批，而 uk_space_uid 又使申请人无法另建一条
+			// 记录，只能等管理员先拒绝（issue #683）。
+			affected, err := s.db.refreshPendingApplyInvite(pendingApply.Id, req.InviteCode)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+				return
+			}
+			if affected > 0 {
+				go s.notifyAdminsNewJoinApply(loginUID, invitation.SpaceId, space.Name, pendingApply.Id)
+
+				c.Response(map[string]interface{}{
+					"status":   "NEED_APPROVAL",
+					"space_id": invitation.SpaceId,
+					"msg":      "该空间需要管理员审批，申请已提交",
+				})
+				return
+			}
+
+			// 0 行：状态在本次读取之后被并发改动（管理员正在审批）。重新判定，
+			// 绝不能盲目覆盖——否则会把已通过的申请打回待审批。
+			latest, err := s.db.queryJoinApplyByID(pendingApply.Id)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+				return
+			}
+			if latest != nil && latest.Status == 1 {
+				// 已被通过：申请人此刻已是成员，与本函数前面的成员校验结论一致。
+				//
+				// 与下面 upsert 读回分支的差别在于先验概率，不在于确定性：本分支的
+				// 前提是"刚才还查到 status=0"，所以翻成 1 极大概率是一次刚提交的审批
+				// （事务保证成员行同时落库），而 upsert 分支看到的 status=1 可能已经
+				// 存在很久。
+				//
+				// 但这不是"不可能过时"：从上一条语句到这里是一次独立往返，其间申请人
+				// 可以退出或被移除，那样这句 already_member 就不成立。它是可自愈的
+				// ——重新提交会走 upsert 分支并就地重置——所以这里不再多查一次成员行；
+				// 这是一个权衡，不是一个保证（推送前审查 B）。
+				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+				return
+			}
+			// 已被拒绝或记录消失：按一次全新申请处理，走下面的 upsert。
 		}
 
 		// 创建或重置申请记录（被拒后重新申请时覆盖更新）
@@ -1026,6 +1084,64 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		if err != nil {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
+		}
+
+		// upsertJoinApply 拒绝改写已通过的申请，因此回读确认这一行现在是什么。
+		//
+		// approveJoinApplyAtomic 保证 status=1 只与活跃成员行一起提交，所以看到
+		// status=1 只有两种可能：申请人此刻确实是成员；或者审批通过之后成员资格又
+		// 结束了（退出/被移除），留下一条陈旧记录。后者必须就地重置，否则守卫会把
+		// 退出过的用户永久挡在门外（PR #684 review round 2/3）。
+		// 正因为事务消灭了"已通过但还不是成员"这个中间态，这里不需要任何时间阈值。
+		saved, err := s.db.queryJoinApplyByID(applyID)
+		if err != nil {
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+			return
+		}
+		if saved != nil && saved.Status == 1 {
+			active, err := s.db.queryMember(invitation.SpaceId, loginUID)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+				return
+			}
+			if active != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+				return
+			}
+			resetRows, err := s.db.resetApprovedApplyForRejoin(applyID, req.InviteCode)
+			if err != nil {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+				return
+			}
+			if resetRows == 0 {
+				// 谓词落空有两种成因，对外说法必须分开——原先一律回 already_member，
+				// 而其中一种成因下申请人恰恰不是成员，那句话是假的（round 4 P2-2）。
+				//
+				// 判据取**申请行自身的状态**，不是再查一次成员行：要回答的问题就是
+				// "这一行现在是什么"，直接问它即可。第一版在这里改查 space_member，
+				// 那是又一次"判定与它所断言的对象不是同一个"——成员资格可以在谓词求值
+				// 与这次补读之间结束，于是对一条仍是 status=1 的行回报"申请已提交"，
+				// 把一个错误的失败讲成了一个错误的成功（推送前审查 C）。
+				latest, err := s.db.queryJoinApplyByID(applyID)
+				if err != nil {
+					httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+					return
+				}
+				if latest != nil && latest.Status == 0 {
+					// 另一个并发重申先重置了这一行：申请确实在排队，只是绑定的是那次
+					// 提交的邀请码而不是本次。如实回报，且不重复通知管理员。
+					c.Response(map[string]interface{}{
+						"status":   "PENDING",
+						"space_id": invitation.SpaceId,
+						"msg":      "申请已提交，请等待审批",
+					})
+					return
+				}
+				// 仍是已通过：成员资格在我们读完之后被恢复。approveJoinApplyAtomic
+				// 保证 status=1 与活跃成员一起提交，所以这是当下最准确的答复。
+				httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
+				return
+			}
 		}
 
 		// 异步通知管理员
@@ -1089,6 +1205,16 @@ func (s *Space) executeJoinSpace(uid, spaceId string, space *SpaceModel) error {
 		return err
 	}
 
+	s.afterJoinSpace(uid, spaceId, space)
+	return nil
+}
+
+// afterJoinSpace 成员行落库之后的副作用：预设群组、默认分类、事件、缓存失效。
+//
+// 与成员写入分开，是因为审批路径把成员写入放进了事务（approveJoinApplyAtomic），
+// 而这些副作用会调用外部服务、起 goroutine，绝不能持在事务里；它们必须在提交
+// 之后执行，否则事务回滚后仍会留下已经外发的副作用。
+func (s *Space) afterJoinSpace(uid, spaceId string, space *SpaceModel) {
 	// 异步加入预设群组
 	if space.PresetGroupIds != nil && *space.PresetGroupIds != "" {
 		go s.joinPresetGroups(uid, spaceId, *space.PresetGroupIds)
@@ -1104,8 +1230,6 @@ func (s *Space) executeJoinSpace(uid, spaceId string, space *SpaceModel) error {
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)
 	}
-
-	return nil
 }
 
 // joinPresetGroups 将用户加入预设群组（通过直接DB操作避免循环依赖）
@@ -1547,62 +1671,20 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 		return
 	}
 
-	// 先更新申请状态（防止并发审批 + 确保加入后状态一致）
-	affected, err := s.db.updateJoinApplyStatus(applyID, 1, loginUID)
+	// 状态翻转 + 名额消耗 + 写成员行，单事务完成（见 approveJoinApplyAtomic）
+	outcome, failCode, err := s.runAtomicApproval(apply, space, loginUID)
 	if err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	if affected == 0 {
-		// 已被其他管理员处理
-		c.ResponseOK()
-		return
-	}
-
-	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗，与直接加入模式对称）
-	inviteConsumed, consumeErr := s.consumeInviteOnApprove(apply.InviteCode)
-	if consumeErr != nil {
-		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return
-	}
-	if apply.InviteCode != "" && !inviteConsumed {
-		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-		}
-		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
-		return
-	}
-
-	// 执行加入逻辑（跳过邀请码校验，管理员审批即授权）
-	joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
-	if joinErr != nil {
-		if errors.Is(joinErr, ErrSpaceFull) {
-			s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-			httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
-			return
-		}
-		if errors.Is(joinErr, ErrAlreadyMember) {
-			// 已是成员：apply 保持已审批状态，但未新增成员，归还本次消耗的名额
-			if inviteConsumed {
-				s.refundInvite(apply.InviteCode)
-			}
-			c.ResponseOK()
-			return
-		}
-		s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-		return
-	}
-
-	go s.notifyApplicantJoinResult(apply.UID, spaceId, space.Name, true)
-
-	c.ResponseOK()
+	s.respondApprovalOutcome(c, outcome, failCode, apply, space)
 }
 
 // refundInvite 归还一次已消耗的邀请码名额（空码跳过；错误仅记录日志，不影响主流程）。
+//
+// 仅服务于**直接加入**路径：那条路径在准入前就消耗了名额，加入失败必须退还。
+// 审批路径不再使用它——名额消耗与成员写入同处一个事务，失败即整笔回滚，
+// 没有需要补偿的已消耗名额（PR #684 round 3）。
 func (s *Space) refundInvite(code string) {
 	if code == "" {
 		return
@@ -1612,23 +1694,95 @@ func (s *Space) refundInvite(code string) {
 	}
 }
 
-// consumeInviteOnApprove 审批通过时尝试消耗邀请码名额。
-// apply.InviteCode 为空时（如旧数据）跳过消耗，返回 (false, nil)，由调用方按未消耗处理。
-func (s *Space) consumeInviteOnApprove(code string) (bool, error) {
-	if code == "" {
-		return false, nil
+// runAtomicApproval 是三条审批入口共用的审批执行步骤：Space 内审批
+// (approveJoinApply)、管理后台审批 (Manager.approveJoinApply)、以及管理员通知里的
+// H5 auth_code 审批 (joinApproveSure)。三处必须走同一实现——只改其中两处会留下一条
+// 行为不同的审批面。
+//
+// 状态翻转、名额消耗、成员写入都在 approveJoinApplyAtomic 的单个事务里完成，
+// 失败即整笔回滚，因此这里不再有任何补偿写（旧实现要手工把状态写回 0 并退还名额，
+// 那些补偿写自身失败时会留下无人能救的孤儿行）。
+//
+// 邀请码失效时负责按实际原因写日志，并通知申请人可以换码重申（issue #683 R7）。
+// 返回的 failCode 仅在失败终态下有意义。
+func (s *Space) runAtomicApproval(apply *spaceJoinApplyModel, space *SpaceModel, reviewerUID string) (approveOutcome, codes.Code, error) {
+	outcome, inviteCode, err := s.db.approveJoinApplyAtomic(apply.Id, reviewerUID, apply.SpaceId, space.MaxUsers)
+	if err != nil {
+		s.Error("原子审批失败", zap.Error(err), zap.Int64("applyID", apply.Id))
+		return outcome, errcode.ErrSpaceStoreFailed, err
 	}
-	return s.db.incrementInviteUsedCountAtomic(code)
+	if outcome == approveInviteUnusable {
+		failCode := s.classifyInviteConsumeFailure(inviteCode, apply.Id)
+		// 申请人此前完全收不到任何消息，因此不知道自己需要换一个有效邀请码重申。
+		go s.notifyApplicantInviteUnusable(apply.UID, apply.SpaceId, space.Name)
+		return outcome, failCode, nil
+	}
+	return outcome, codes.Code{}, nil
 }
 
-// rollbackApplyAndInvite 审批加入失败时回滚申请状态，并在确实消耗过名额时归还。
-func (s *Space) rollbackApplyAndInvite(applyID int64, code string, consumed bool) {
-	if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-		s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+// respondApprovalOutcome 把审批终态映射成 HTTP 响应，并在成功时执行提交后的副作用。
+// 本函数负责写出响应，调用方调用后直接返回即可。
+func (s *Space) respondApprovalOutcome(c *wkhttp.Context, outcome approveOutcome, failCode codes.Code,
+	apply *spaceJoinApplyModel, space *SpaceModel) {
+	switch outcome {
+	case approveAlreadyHandled:
+		// 已被其他管理员处理，保持幂等
+		c.ResponseOK()
+	case approveAlreadyMember:
+		// 申请人本就是成员：审批已落库，未新增成员，也未消耗名额
+		c.ResponseOK()
+	case approveInviteUnusable:
+		httperr.ResponseErrorL(c, failCode, nil, nil)
+	case approveSpaceFull:
+		httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
+	case approveOK:
+		s.afterJoinSpace(apply.UID, apply.SpaceId, space)
+		go s.notifyApplicantJoinResult(apply.UID, apply.SpaceId, space.Name, true)
+		c.ResponseOK()
+	default:
+		// 新增终态若忘了在此处理，绝不能悄悄走成功分支放人进空间。
+		s.Error("未知的审批终态", zap.Int("outcome", int(outcome)), zap.Int64("applyID", apply.Id))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 	}
-	if consumed {
-		s.refundInvite(code)
+}
+
+// classifyInviteConsumeFailure 区分邀请码消耗失败的原因，返回对外错误码。
+//
+// incrementInviteUsedCountAtomic 的 WHERE 同时包含 status=1、未过期、未达 max_uses，
+// 任一不满足都只返回 false。此前三种情况一律回报"已达到使用次数上限"，与实际原因
+// 不符时会把排查引向错误方向（issue #683）。
+//
+// 这里不构成枚举面，但理由不是"调用方一定是管理员"——三条审批入口里的 H5
+// joinApproveSure 挂在 open 组，没有 AuthMiddleware，也不复核 reviewer_uid 是否仍是
+// 管理员（推送前审查 3 更正了原本的说法）。真正的约束是：调用方必须先持有一个绑定到
+// **这一条申请**的有效 auth_code，而该申请上记录的就是这个邀请码——他本来就看得到它，
+// 因此这里不会泄露任何他还不知道的信息，也无法用来遍历别的码。
+// 精确原因（禁用 / 过期 / 用尽）仍只写日志，对外只分"用尽"与"失效"两类。
+func (s *Space) classifyInviteConsumeFailure(code string, applyID int64) codes.Code {
+	invitation, err := s.db.queryInvitationByCodeUnfiltered(code)
+	if err != nil {
+		// 原因未知时不要借用"已达使用次数上限"——那正是本次改动要停止误报的标签
+		// （round 4 P2-8）。回报一个中性的查询失败，真实原因留在日志里。
+		s.Error("查询邀请码失效原因失败", zap.Error(err), zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceQueryFailed
 	}
+	if invitation == nil {
+		s.Warn("审批失败：邀请码已不存在", zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	if invitation.Status != 1 {
+		s.Warn("审批失败：邀请码已被禁用", zap.Int64("applyID", applyID), zap.Int("status", invitation.Status))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	if invitation.ExpiresAt != nil && !time.Time(*invitation.ExpiresAt).After(time.Now()) {
+		s.Warn("审批失败：邀请码已过期", zap.Int64("applyID", applyID))
+		return errcode.ErrSpaceInviteCodeInvalid
+	}
+	s.Warn("审批失败：邀请码使用次数已达上限",
+		zap.Int64("applyID", applyID),
+		zap.Int("usedCount", invitation.UsedCount),
+		zap.Int("maxUses", invitation.MaxUses))
+	return errcode.ErrSpaceInviteCodeExhausted
 }
 
 // rejectJoinApply 管理员拒绝加入申请
@@ -1773,6 +1927,34 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 		spaceId,
 		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
 	))
+}
+
+// notifyApplicantInviteUnusable 告知申请人：审批因其申请所绑定的邀请码已失效而未能完成，
+// 需要用一个仍然有效的邀请码重新提交。
+//
+// 没有这条通知，申请人无从得知自己卡住了，joinSpace 里新增的"重申即换码"自救路径
+// 也就不会被用到，申请会一直停在待审批（issue #683 R7）。
+// 与同文件其它站内通知一致使用中文文案：IM 私信内容尚未接入 i18n（错误响应与邮件才有），
+// 这里刻意保持一致而不是单独引入一套。
+func (s *Space) notifyApplicantInviteUnusable(applicantUID, spaceId, spaceName string) {
+	content := fmt.Sprintf(
+		"你的 Space 加入申请暂时无法通过\n空间: %s\n原因: 申请使用的邀请码已失效（次数用尽、被禁用或已过期）\n请向管理员索取新的邀请链接后重新提交申请",
+		spaceName)
+
+	payload := map[string]interface{}{
+		"content": content,
+		"type":    common.Text,
+	}
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	if err := s.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applicantUID,
+		s.ctx.GetConfig().Account.SystemUID,
+		payload,
+		spaceId,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	)); err != nil {
+		s.Warn("发送邀请码失效通知失败", zap.Error(err), zap.String("applicantUID", applicantUID), zap.String("spaceId", spaceId))
+	}
 }
 
 // joinApprovePage 返回 H5 审批页面（注入 apiURL）
@@ -1930,52 +2112,14 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 	}
 
 	if action == "approve" {
-		affected, err := s.db.updateJoinApplyStatus(applyID, 1, reviewerUID)
+		// 与另外两条审批入口共用同一个原子实现
+		outcome, failCode, err := s.runAtomicApproval(apply, space, reviewerUID)
 		if err != nil {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
-		if affected == 0 {
-			c.ResponseOK()
-			return
-		}
-
-		inviteConsumed, consumeErr := s.consumeInviteOnApprove(apply.InviteCode)
-		if consumeErr != nil {
-			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-			}
-			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-			return
-		}
-		if apply.InviteCode != "" && !inviteConsumed {
-			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
-				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
-			}
-			httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
-			return
-		}
-
-		joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
-		if joinErr != nil {
-			if errors.Is(joinErr, ErrSpaceFull) {
-				s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-				httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
-				return
-			}
-			if errors.Is(joinErr, ErrAlreadyMember) {
-				// apply 保持已审批状态，但未新增成员，归还名额
-				if inviteConsumed {
-					s.refundInvite(apply.InviteCode)
-				}
-			} else {
-				s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-				return
-			}
-		}
-
-		go s.notifyApplicantJoinResult(apply.UID, spaceId, space.Name, true)
+		s.respondApprovalOutcome(c, outcome, failCode, apply, space)
+		return
 	} else {
 		_, err = s.db.updateJoinApplyStatus(applyID, 2, reviewerUID)
 		if err != nil {

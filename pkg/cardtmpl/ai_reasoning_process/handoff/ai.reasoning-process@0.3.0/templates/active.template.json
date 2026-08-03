@@ -1,0 +1,192 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "Container",
+      "id": "octo-surface-accent-header-reasoning-active",
+      "style": "accent",
+      "bleed": true,
+      "spacing": "None",
+      "items": [
+        {
+          "type": "ColumnSet",
+          "spacing": "None",
+          "columns": [
+            {
+              "type": "Column",
+              "width": "stretch",
+              "verticalContentAlignment": "Center",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "text": "✦  ${title}",
+                  "color": "Accent",
+                  "weight": "Bolder",
+                  "wrap": true,
+                  "spacing": "None"
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "${timerText}",
+                  "size": "Small",
+                  "isSubtle": true,
+                  "wrap": true,
+                  "spacing": "Small"
+                }
+              ]
+            },
+            {
+              "type": "Column",
+              "width": "auto",
+              "verticalContentAlignment": "Center",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "id": "octo-badge-reasoning-active-status",
+                  "text": "${statusLabel}",
+                  "color": "${statusTone}",
+                  "weight": "Bolder",
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "trace_panel",
+      "isVisible": "${traceExpanded}",
+      "spacing": "Large",
+      "items": [
+        {
+          "$data": "${phases}",
+          "type": "Container",
+          "spacing": "${if($index == 0, 'None', 'Large')}",
+          "separator": "${if($index == 0, false, true)}",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${thought}",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "None"
+            },
+            {
+              "type": "Container",
+              "style": "emphasis",
+              "spacing": "Small",
+              "items": [
+                {
+                  "$data": "${actions}",
+                  "type": "ColumnSet",
+                  "spacing": "${if($index == 0, 'None', 'Small')}",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "${statusGlyph}",
+                          "color": "${statusTone}",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "${tool}",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "${detail}",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "TextBlock",
+          "text": "◌  ${progressText}",
+          "color": "Accent",
+          "size": "Small",
+          "wrap": true,
+          "spacing": "Large"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "collapsed_panel",
+      "isVisible": "${traceCollapsed}",
+      "spacing": "Medium",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "✓  ${collapsedSummary}",
+          "size": "Small",
+          "isSubtle": true,
+          "wrap": true,
+          "spacing": "None"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "octo-surface-default-footer-reasoning-active",
+      "style": "emphasis",
+      "bleed": true,
+      "separator": true,
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "ActionSet",
+          "horizontalAlignment": "Right",
+          "actions": [
+            {
+              "type": "Action.ToggleVisibility",
+              "id": "reasoning_toggle",
+              "title": "显示 / 隐藏推理",
+              "targetElements": [
+                "trace_panel",
+                "collapsed_panel"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

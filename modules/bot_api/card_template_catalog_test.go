@@ -12,12 +12,18 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
+const (
+	testReasoningVersionV3 = aireasoningprocess.TemplateVersionV3
+	testReasoningRootV3    = aireasoningprocess.HandoffRootV3
+)
+
 func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	r := cardtmpl.NewRegistry()
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
-	r.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
+	r.RegisterJSON(aireasoningprocess.Assets, testReasoningRootV3)
+	r.SetDefault(aireasoningprocess.TemplateID, testReasoningVersionV3)
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
@@ -25,7 +31,7 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 }
 
 func testReasoningData(t *testing.T, state string) json.RawMessage {
-	return testReasoningDataVersion(t, aireasoningprocess.HandoffRootV2, state)
+	return testReasoningDataVersion(t, testReasoningRootV3, state)
 }
 
 func testReasoningDataVersion(t *testing.T, root, state string) json.RawMessage {
@@ -46,32 +52,42 @@ func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
 	}
 
 	capability := catalog.Capability()
-	if len(capability.Templates) != 1 || capability.Templates[0].Version != aireasoningprocess.TemplateVersionV2 {
+	if len(capability.Templates) != 1 || capability.Templates[0].Version != testReasoningVersionV3 {
 		t.Fatalf("advertised templates = %+v, want successor only", capability.Templates)
 	}
 
-	legacyRef := map[string]any{
-		"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV1,
-	}
-	legacyPayload := map[string]any{
-		"type":         17,
-		"template_ref": legacyRef,
-		"state":        "reasoning",
-		"data": rawJSONToMap(t, testReasoningDataVersion(t,
-			aireasoningprocess.HandoffRootV1, "reasoning")),
-	}
-	if _, err := catalog.RenderPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{}); !errors.Is(err, errBotTemplateRequestInvalid) {
-		t.Fatalf("legacy send error = %v, want request invalid", err)
-	}
-	if ref, err := catalog.requireEditableRef(legacyRef); err != nil || ref.Version != aireasoningprocess.TemplateVersionV1 {
-		t.Fatalf("legacy edit ref = %+v, error = %v", ref, err)
-	}
-	rendered, err := catalog.RenderEditPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{})
-	if err != nil {
-		t.Fatalf("RenderEditPayload(legacy): %v", err)
-	}
-	if got := rendered["template_ref"].(map[string]any)["version"]; got != aireasoningprocess.TemplateVersionV1 {
-		t.Fatalf("legacy edit rendered version = %v", got)
+	for _, historical := range []struct {
+		version string
+		root    string
+	}{
+		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
+		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+	} {
+		t.Run(historical.version, func(t *testing.T) {
+			legacyRef := map[string]any{
+				"id": string(aireasoningprocess.TemplateID), "version": historical.version,
+			}
+			legacyPayload := map[string]any{
+				"type":         17,
+				"template_ref": legacyRef,
+				"state":        "reasoning",
+				"data": rawJSONToMap(t, testReasoningDataVersion(t,
+					historical.root, "reasoning")),
+			}
+			if _, err := catalog.RenderPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{}); !errors.Is(err, errBotTemplateRequestInvalid) {
+				t.Fatalf("historical send error = %v, want request invalid", err)
+			}
+			if ref, err := catalog.requireEditableRef(legacyRef); err != nil || ref.Version != historical.version {
+				t.Fatalf("historical edit ref = %+v, error = %v", ref, err)
+			}
+			rendered, err := catalog.RenderEditPayload(context.Background(), legacyPayload, cardtmpl.BuildEnv{})
+			if err != nil {
+				t.Fatalf("RenderEditPayload(historical): %v", err)
+			}
+			if got := rendered["template_ref"].(map[string]any)["version"]; got != historical.version {
+				t.Fatalf("historical edit rendered version = %v", got)
+			}
+		})
 	}
 }
 
@@ -92,7 +108,7 @@ func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing
 	payload := map[string]any{
 		"type": float64(17),
 		"template_ref": map[string]any{
-			"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersionV2,
+			"id": string(aireasoningprocess.TemplateID), "version": testReasoningVersionV3,
 		},
 		"state": "reasoning",
 		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
@@ -113,7 +129,7 @@ func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing
 func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T) {
 	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
 		AdvertisedSend: []botTemplateRef{{
-			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+			ID: aireasoningprocess.TemplateID, Version: testReasoningVersionV3,
 		}},
 		EditCompatible: []botTemplateRef{{
 			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
@@ -127,7 +143,7 @@ func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T)
 func TestBotCardTemplatePolicyFailsClosed(t *testing.T) {
 	registry := testBotTemplateRegistry(t)
 	successor := botTemplateRef{
-		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2,
+		ID: aireasoningprocess.TemplateID, Version: testReasoningVersionV3,
 	}
 	missing := botTemplateRef{ID: "ai.missing", Version: "1.0.0"}
 	tests := []struct {
@@ -191,8 +207,8 @@ func TestBotCardTemplateCatalogCapability(t *testing.T) {
 		t.Fatalf("template = %+v", tpl)
 	}
 	wantViews := []botTemplateViewCapability{
-		{Name: "active", States: []string{"answering", "reasoning"}, WireProfile: "octo/v2", SubmitActions: []string{"reasoning_stop"}},
-		{Name: "error", States: []string{"error"}, WireProfile: "octo/v2", SubmitActions: []string{"reasoning_retry"}},
+		{Name: "active", States: []string{"answering", "reasoning"}, WireProfile: "octo/v2", SubmitActions: []string{}},
+		{Name: "error", States: []string{"error"}, WireProfile: "octo/v2", SubmitActions: []string{}},
 		{Name: "result", States: []string{"completed", "stopped"}, WireProfile: "octo/v1", SubmitActions: []string{}},
 	}
 	if !reflect.DeepEqual(tpl.Views, wantViews) {
@@ -370,6 +386,7 @@ func TestBotCardTemplateCatalogRejectsCallerControlledInvalidModes(t *testing.T)
 		{name: "state mismatch", mutate: func(p map[string]any) { p["state"] = "completed" }},
 		{name: "render owned plain", mutate: func(p map[string]any) { p["plain"] = "forged" }},
 		{name: "render owned profile", mutate: func(p map[string]any) { p["profile"] = "octo/v1" }},
+		{name: "render owned render profile", mutate: func(p map[string]any) { p["render_profile"] = "octo-chat/v1" }},
 		{name: "render owned space", mutate: func(p map[string]any) { p["space_id"] = "forged" }},
 		{name: "unknown envelope field", mutate: func(p map[string]any) { p["content"] = "smuggled" }},
 		{name: "data must be object", mutate: func(p map[string]any) { p["data"] = []any{} }},

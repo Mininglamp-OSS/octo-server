@@ -325,6 +325,26 @@ func TestSendBuildsAuthoritativeEnvelopeAndReturnsTransportResult(t *testing.T) 
 	assert.LessOrEqual(t, len(req.Payload), cardmsg.MaxPayloadBytes)
 }
 
+func TestSendAuthorsDefaultRenderProfile(t *testing.T) {
+	reg, _, _, transport, _ := newHarness(t, validSpec())
+	sender, err := reg.Sender("summary-notify")
+	require.NoError(t, err)
+
+	_, err = sender.Send(context.Background(), validTarget(), Card{
+		Profile:  cardmsg.ProfileV1,
+		Document: validCardDocument(),
+	})
+	require.NoError(t, err)
+
+	calls, req := transport.snapshot()
+	require.Equal(t, 1, calls)
+	require.NotNil(t, req)
+
+	var payload map[string]interface{}
+	require.NoError(t, json.Unmarshal(req.Payload, &payload))
+	assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
+}
+
 func TestSendFailClosedStagesNeverReachTransport(t *testing.T) {
 	tests := []struct {
 		name          string

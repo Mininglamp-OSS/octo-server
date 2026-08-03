@@ -1021,6 +1021,18 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// DocsSearchEnabled reports whether clients should surface cloud-doc full-text
+// search. Decoupled from DocsEnabled: the search endpoint is provided
+// independently by octo-docs-backend and may land later than the docs module
+// itself. Display policy only — it neither grants nor enforces any server-side
+// authorization, which lives in octo-docs-backend. Default false so the tab
+// stays hidden until search is deployed and the index is populated and the
+// admin flips docs.search_enabled for a controlled rollout. Value source:
+// system_setting docs.search_enabled (DB, hot-reloaded).
+func (s *SystemSettings) DocsSearchEnabled() bool {
+	return s.getBool("docs", "search_enabled", false)
+}
+
 // DriveEnabled reports whether clients should surface the drive (网盘) module
 // entry (backed by the standalone octo-drive service). Display policy only —
 // it neither grants nor enforces any server-side authorization, which lives in

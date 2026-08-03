@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	migrate "github.com/rubenv/sql-migrate"
 )
@@ -24,6 +25,50 @@ import (
 const catalogStoreIntegrationDBPrefix = "octo_card_catalog_store_test"
 
 var catalogStoreIntegrationDBSequence atomic.Uint64
+
+func TestStoreReconcileStaticV3ClaimsExactVersionAndRejectsDynamicCollisionRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	registry := cardtmpl.NewRegistry()
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+	registry.Freeze()
+	catalogStore := newStore(db)
+
+	if err := catalogStore.ReconcileStatic(context.Background(), registry.List()); err != nil {
+		t.Fatalf("ReconcileStatic V3: %v", err)
+	}
+	var source string
+	if err := db.QueryRow(`SELECT source FROM card_template_version_claim
+        WHERE template_id = ? AND version = ?`,
+		aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3).Scan(&source); err != nil {
+		t.Fatalf("query V3 static claim: %v", err)
+	}
+	if source != claimSourceStatic {
+		t.Fatalf("V3 claim source = %q, want %q", source, claimSourceStatic)
+	}
+	var artifactCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM card_template_artifact
+        WHERE template_id = ? AND version = ?`,
+		aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3).Scan(&artifactCount); err != nil {
+		t.Fatalf("count V3 dynamic artifacts: %v", err)
+	}
+	if artifactCount != 0 {
+		t.Fatalf("V3 dynamic artifact count = %d, want 0", artifactCount)
+	}
+
+	if _, err := db.Exec(`DELETE FROM card_template_version_claim
+        WHERE template_id = ? AND version = ?`,
+		aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3); err != nil {
+		t.Fatalf("remove V3 static claim fixture: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO card_template_version_claim
+        (template_id, version, source) VALUES (?, ?, 'dynamic')`,
+		aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3); err != nil {
+		t.Fatalf("seed V3 dynamic collision: %v", err)
+	}
+	if err := catalogStore.ReconcileStatic(context.Background(), registry.List()); !errors.Is(err, ErrVersionClaimConflict) {
+		t.Fatalf("ReconcileStatic V3 collision error = %v, want ErrVersionClaimConflict", err)
+	}
+}
 
 func TestStorePublishRealMySQLImmutableConcurrency(t *testing.T) {
 	db := newCatalogStoreIntegrationDB(t)

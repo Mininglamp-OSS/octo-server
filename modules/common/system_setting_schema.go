@@ -206,6 +206,13 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// docs 全文搜索展示开关，与 docs.enabled 解耦：搜索端点由 octo-docs-backend #131
+	// 独立提供，可晚于 docs 模块本体上线。默认关闭；上线且索引灰度完成后由管理台
+	// 切 docs.search_enabled 放量。仅表达展示策略，不承担任何服务端鉴权（搜索鉴权在
+	// octo-docs-backend 自身）。经 GET /v1/common/appconfig 的 docs_search_on 下发给客户端。
+	{Category: "docs", Key: "search_enabled", Type: settingTypeBool, Description: "是否向客户端展示云文档全文搜索（与 docs.enabled 解耦；搜索端点上线+索引就绪前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsSearchEnabled()) }},
+
 	// drive(网盘)模块展示开关。独立部署的 octo-drive 服务尚未上线，默认关闭；上线后由管理台
 	// 切 drive.enabled 灰度放量。仅表达展示策略，服务端鉴权在 octo-drive 自身。经 GET
 	// /v1/common/appconfig 的 drive_on 下发给客户端。

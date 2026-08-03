@@ -52,6 +52,12 @@ type BotAPI struct {
 	// AFTER dispatchFanout succeeds so we only enqueue events that
 	// WuKongIM actually accepted.
 	robotService robot.IService
+	// ackFilteredEvent overrides the auto-ACK write in filterAppBotEvents.
+	// Production leaves it nil (see BotAPI.ackEvent); tests set it to inject a
+	// Redis whose reads succeed while writes fail, which is the state the
+	// long-poll loop's forward-progress guarantee exists to survive and which a
+	// healthy Redis cannot be talked into producing.
+	ackFilteredEvent func(key string, eventID string) error
 	// cardRevisions is the D10 card revision history store (shared table
 	// octo_message_card_revision; written here on bot card edits + clear).
 	cardRevisions *cardrevision.Store
@@ -249,6 +255,10 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
+	// Resolve the /v1/bot/events long-poll hold budget here rather than on the
+	// first long-poll request, so an unusable OCTO_BOT_EVENTS_MAX_HOLDS is
+	// reported in the startup log instead of surfacing in production traffic.
+	ba.resolveEventHoldBudget()
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
 	// Subscribed AFTER the dependency wiring above so oboMessagesListen
 	// can safely consult ba.db (oboStore). Idempotent: the listener

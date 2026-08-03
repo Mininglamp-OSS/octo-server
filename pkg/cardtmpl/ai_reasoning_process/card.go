@@ -1,7 +1,6 @@
-// Package aireasoningprocess wires the AI reasoning-process progress card
-// (ai.reasoning-process@0.1.0 and its bounded 0.2.0 successor) into the cardtmpl
-// base. Unlike the Go-authored L2a cards, this card ships as a pure JSON handoff
-// (roadmap E1): it has no
+// Package aireasoningprocess wires the AI reasoning-process progress card and
+// its immutable successors into the cardtmpl base. Unlike the Go-authored L2a
+// cards, this card ships as a pure JSON handoff (roadmap E1): it has no
 // hand-written Template — the base compiles its `.template.json` views via
 // Registry.RegisterJSON. This package only embeds the handoff assets and
 // exposes their identity for the composition root.
@@ -10,15 +9,13 @@
 //
 //	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 //	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
-//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV2)
+//	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3)
 //
-// Layering: L1 JSON artifacts live under handoff/. The card carries the
-// producer's own action buttons (reasoning_stop / reasoning_retry Submit +
-// reasoning_toggle) under a fixed platform owner "ai" / action_type
-// "reasoning.control"; the active/error views are octo/v2, the display-only
-// result view is octo/v1. The server-side handler + RouteSpec that make the
-// buttons act (stop / retry a reasoning run) and the bot streaming delivery are
-// deliberately downstream — see the task brief cardtmpl-reasoning-progress-card.
+// Layering: L1 JSON artifacts live under handoff/. Frozen V1/V2 retain their
+// historical reasoning_stop/reasoning_retry Submit contracts. V3 removes those
+// unsupported server callbacks and keeps only the client-local reasoning_toggle;
+// active/error remain octo/v2 and result remains octo/v1.
 package aireasoningprocess
 
 import (
@@ -42,9 +39,13 @@ const (
 	// HandoffRootV2 and TemplateVersionV2 identify the bounded successor.
 	HandoffRootV2     = "handoff/ai.reasoning-process@0.2.0"
 	TemplateVersionV2 = "0.2.0"
+	// HandoffRootV3 and TemplateVersionV3 identify the successor that hides
+	// unsupported stop/retry controls while retaining the bounded V2 schema.
+	HandoffRootV3     = "handoff/ai.reasoning-process@0.3.0"
+	TemplateVersionV3 = "0.3.0"
 
 	// HandoffRoot and TemplateVersion retain the package's current-version
 	// aliases for callers that do not need an explicit historical version.
-	HandoffRoot     = HandoffRootV2
-	TemplateVersion = TemplateVersionV2
+	HandoffRoot     = HandoffRootV3
+	TemplateVersion = TemplateVersionV3
 )
