@@ -144,26 +144,13 @@ func timeIt(n int, fn func()) (avg, worst time.Duration) {
 	return avg / time.Duration(n), worst
 }
 
-// directorySelectList 必须与 queryDirectory 的投影列表逐字一致。
-//
-// 这一点是本文件最容易踩的坑：早先这里图省事写成 `SELECT sm.uid`，
-// EXPLAIN 于是报告「命中覆盖索引、using_filesort=false」——因为只取 uid 时
-// space_member 上的索引确实能覆盖。而真实查询取的是 sm.*，索引覆盖不了，
-// 优化器转而选窄索引 + Sort。用错的 select list 去 EXPLAIN，得到的是一份
-// 与线上无关的查询计划。
-const directorySelectList = `SELECT sm.*,
-	IFNULL(u.name, '') as name,
-	IFNULL(uv.real_name, '') as real_name,
-	IFNULL(u.robot, 0) as robot,
-	CASE WHEN r.robot_id IS NOT NULL THEN 1 ELSE 0 END as active_bot`
-
 // explainAnalyze 打印真实执行计划与逐算子实测耗时。
 // 用 EXPLAIN ANALYZE 而不是 FORMAT=JSON：后者只给估算，前者给 actual time，
 // 才能判断时间到底花在扫描、join 还是排序上。
 func explainAnalyze(t *testing.T, label, sql string, args ...interface{}) {
 	t.Helper()
 	var plan string
-	_, err := testCtx.DB().SelectBySql("EXPLAIN ANALYZE "+directorySelectList+sql, args...).Load(&plan)
+	_, err := testCtx.DB().SelectBySql("EXPLAIN ANALYZE "+directorySelectList(label)+sql, args...).Load(&plan)
 	if err != nil {
 		t.Logf("  EXPLAIN ANALYZE %s: %v", label, err)
 		return
@@ -243,8 +230,10 @@ func TestDirectoryPerf(t *testing.T) {
 	})
 
 	t.Run("EXPLAIN", func(t *testing.T) {
-		where, args := directoryWhereClause(spaceID, directoryTypeAll)
-		explainAnalyze(t, "limit=50", directoryFromJoin+" WHERE "+where+directoryOrderBy+" LIMIT 50", args...)
+		for _, listType := range []string{directoryTypeAll, directoryTypeHuman} {
+			where, args := directoryWhereClause(spaceID, listType)
+			explainAnalyze(t, listType, directoryFromJoin(listType)+" WHERE "+where+directoryOrderBy+" LIMIT 50", args...)
+		}
 	})
 
 	t.Run("HTTP端到端", func(t *testing.T) {

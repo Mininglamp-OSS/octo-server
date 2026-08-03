@@ -23,14 +23,24 @@ const (
 // 避免它出现在任何用户可见的目录里。
 const directoryExcludedUID = "botfather"
 
-// directoryFromJoin 是 count 与分页查询共用的 FROM/JOIN 片段。
-// 三个 LEFT JOIN 全部命中唯一键（user.uid、user_verification 的主键 user_id、
+// directoryFromJoin 返回 count 与分页查询共用的 FROM/JOIN 片段。
+// 所有 LEFT JOIN 都命中唯一键（user.uid、user_verification 的主键 user_id、
 // robot.robot_id 唯一索引），因此不会扇出，一个 uid 恒对应一行。
-const directoryFromJoin = `
+//
+// type=human 时省略 robot 表：`u.robot = 0` 已经排除了全部 bot 账号——无论其
+// 启用与否——所以 robot join 对这个切片没有任何判定作用。实测每行都要做一次
+// eq_ref 单行查找，6000 成员的 Space 上这一个 join 就是约 12ms 的纯浪费。
+func directoryFromJoin(listType string) string {
+	join := `
 	FROM space_member sm
 	LEFT JOIN user u ON u.uid = sm.uid
-	LEFT JOIN user_verification uv ON uv.user_id = sm.uid
+	LEFT JOIN user_verification uv ON uv.user_id = sm.uid`
+	if listType == directoryTypeHuman {
+		return join
+	}
+	return join + `
 	LEFT JOIN robot r ON r.robot_id = sm.uid AND r.status = 1`
+}
 
 // directoryWhereClause 生成目录查询的 WHERE 片段与参数。
 //
@@ -40,16 +50,17 @@ func directoryWhereClause(spaceID, listType string) (string, []interface{}) {
 	clause := `sm.space_id = ? AND sm.status = 1 AND sm.uid <> ?`
 	args := []interface{}{spaceID, directoryExcludedUID}
 
-	// 停用 bot（user.robot=1，但 robot 表没有 status=1 的行）整行排除：它既不该
-	// 出现在 bot 里，也不该退化成 human。
-	clause += ` AND (IFNULL(u.robot, 0) = 0 OR r.robot_id IS NOT NULL)`
-
 	switch listType {
 	case directoryTypeHuman:
+		// u.robot = 0 已排除全部 bot 账号（含停用的），无需再引用 robot 表。
 		clause += ` AND IFNULL(u.robot, 0) = 0`
 	case directoryTypeBot:
-		// 上面的排除条件已保证「是 bot 账号」蕴含「已启用」，这里只需筛账号类型。
-		clause += ` AND IFNULL(u.robot, 0) = 1`
+		// 是 bot 账号且已启用。停用 bot 因 r.robot_id IS NULL 自然落选。
+		clause += ` AND IFNULL(u.robot, 0) = 1 AND r.robot_id IS NOT NULL`
+	default:
+		// 停用 bot（user.robot=1，但 robot 表没有 status=1 的行）整行排除：
+		// 它既不该出现在 bot 里，也不该退化成 human。
+		clause += ` AND (IFNULL(u.robot, 0) = 0 OR r.robot_id IS NOT NULL)`
 	}
 	return clause, args
 }
@@ -61,19 +72,30 @@ func directoryWhereClause(spaceID, listType string) (string, []interface{}) {
 // 漏行或重复行。queryMembers 目前就缺这一项（searchMembers 有）。
 const directoryOrderBy = ` ORDER BY sm.role DESC, sm.created_at ASC, sm.uid ASC`
 
+// directorySelectList 返回投影列表。active_bot 的取法随切片而变：type=human 不
+// join robot 表，SQL 里不能引用 r，该列恒为 0——这与语义一致，人类行本就不是 bot。
+func directorySelectList(listType string) string {
+	activeBot := `CASE WHEN r.robot_id IS NOT NULL THEN 1 ELSE 0 END`
+	if listType == directoryTypeHuman {
+		activeBot = `0`
+	}
+	return `
+		SELECT sm.*,
+			IFNULL(u.name, '') as name,
+			IFNULL(uv.real_name, '') as real_name,
+			IFNULL(u.robot, 0) as robot,
+			` + activeBot + ` as active_bot`
+}
+
 // queryDirectory 返回目录的一页。
 func (d *DB) queryDirectory(spaceID, listType string, page, limit uint64) ([]*directoryRowModel, error) {
 	where, args := directoryWhereClause(spaceID, listType)
 	args = append(args, limit, (page-1)*limit)
 
 	var models []*directoryRowModel
-	_, err := d.session.SelectBySql(`
-		SELECT sm.*,
-			IFNULL(u.name, '') as name,
-			IFNULL(uv.real_name, '') as real_name,
-			IFNULL(u.robot, 0) as robot,
-			CASE WHEN r.robot_id IS NOT NULL THEN 1 ELSE 0 END as active_bot`+
-		directoryFromJoin+` WHERE `+where+directoryOrderBy+` LIMIT ? OFFSET ?`,
+	_, err := d.session.SelectBySql(
+		directorySelectList(listType)+
+			directoryFromJoin(listType)+` WHERE `+where+directoryOrderBy+` LIMIT ? OFFSET ?`,
 		args...).Load(&models)
 	return models, err
 }
@@ -83,7 +105,7 @@ func (d *DB) countDirectory(spaceID, listType string) (int64, error) {
 	where, args := directoryWhereClause(spaceID, listType)
 	var count int64
 	_, err := d.session.SelectBySql(
-		`SELECT COUNT(*)`+directoryFromJoin+` WHERE `+where, args...).Load(&count)
+		`SELECT COUNT(*)`+directoryFromJoin(listType)+` WHERE `+where, args...).Load(&count)
 	return count, err
 }
 
