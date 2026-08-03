@@ -14,6 +14,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -45,14 +46,13 @@ type leaseRaceRobotService struct {
 	firstStarted chan struct{}
 	releaseFirst chan struct{}
 	enqueueCalls int
-	eventIDs     []int64
 }
 
 func (s *leaseRaceRobotService) ExistRobot(string) (bool, error) {
 	return true, nil
 }
 
-func (s *leaseRaceRobotService) EnqueueBotTypedEvent(_ string, _ string, _ map[string]interface{}) (int64, error) {
+func (s *leaseRaceRobotService) PrepareBotTypedEvent(robotID string, _ string, _ map[string]interface{}) (robot.PreparedBotTypedEvent, error) {
 	s.mu.Lock()
 	s.enqueueCalls++
 	call := s.enqueueCalls
@@ -64,16 +64,11 @@ func (s *leaseRaceRobotService) EnqueueBotTypedEvent(_ string, _ string, _ map[s
 	}
 
 	eventID := int64(1000 + call)
-	s.mu.Lock()
-	s.eventIDs = append(s.eventIDs, eventID)
-	s.mu.Unlock()
-	return eventID, nil
-}
-
-func (s *leaseRaceRobotService) visibleEventIDs() []int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]int64(nil), s.eventIDs...)
+	return robot.PreparedBotTypedEvent{
+		EventID:  eventID,
+		QueueKey: "robotEvent:" + robotID,
+		Member:   fmt.Sprintf("event-%d", eventID),
+	}, nil
 }
 
 type observingClaimBackend struct {
@@ -82,8 +77,52 @@ type observingClaimBackend struct {
 	once     sync.Once
 }
 
-func (b *observingClaimBackend) CompareAndSet(key, oldValue, newValue string, ttl time.Duration) (bool, error) {
-	ok, err := b.memoryClaimBackend.CompareAndSet(key, oldValue, newValue, ttl)
+type ambiguousCommitClaimStore struct {
+	mu sync.Mutex
+
+	committed    bool
+	eventID      int64
+	commitCalls  int
+	releaseCalls int
+}
+
+func (s *ambiguousCommitClaimStore) Lookup(string, string) (claimOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.committed {
+		return claimOutcome{State: claimReplay, EventID: s.eventID}, nil
+	}
+	return claimOutcome{State: claimMissing}, nil
+}
+
+func (s *ambiguousCommitClaimStore) Begin(string, string) (claimOutcome, *claimLease, error) {
+	return claimOutcome{State: claimAcquired}, &claimLease{}, nil
+}
+
+func (s *ambiguousCommitClaimStore) Commit(_ *claimLease, event robot.PreparedBotTypedEvent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.committed = true
+	s.eventID = event.EventID
+	s.commitCalls++
+	return false, errors.New("redis response lost after atomic commit")
+}
+
+func (s *ambiguousCommitClaimStore) Release(*claimLease) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseCalls++
+	return true, nil
+}
+
+func (s *ambiguousCommitClaimStore) counts() (commits, releases int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitCalls, s.releaseCalls
+}
+
+func (b *observingClaimBackend) CompareAndEnqueue(key, oldValue, newValue string, ttl time.Duration, event robot.PreparedBotTypedEvent) (bool, error) {
+	ok, err := b.memoryClaimBackend.CompareAndEnqueue(key, oldValue, newValue, ttl, event)
 	if err == nil && !ok {
 		b.once.Do(func() { close(b.staleCAS) })
 	}
@@ -97,7 +136,7 @@ func (s *stubRobotService) ExistRobot(uid string) (bool, error) {
 	return s.exists, s.existErr
 }
 
-func (s *stubRobotService) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+func (s *stubRobotService) PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (robot.PreparedBotTypedEvent, error) {
 	s.mu.Lock()
 	s.enqueueCalls++
 	s.robotID = robotID
@@ -118,9 +157,13 @@ func (s *stubRobotService) EnqueueBotTypedEvent(robotID, eventType string, event
 		<-continuation
 	}
 	if s.enqueueErr != nil {
-		return 0, s.enqueueErr
+		return robot.PreparedBotTypedEvent{}, s.enqueueErr
 	}
-	return s.eventID, nil
+	return robot.PreparedBotTypedEvent{
+		EventID:  s.eventID,
+		QueueKey: "robotEvent:" + robotID,
+		Member:   fmt.Sprintf("event-%d", s.eventID),
+	}, nil
 }
 
 func (s *stubRobotService) counts() (exists, enqueues int) {
@@ -201,18 +244,14 @@ type scriptedClaimStore struct {
 	lookupErr     error
 	beginOutcome  claimOutcome
 	beginErr      error
-	confirmOK     bool
-	confirmErr    error
+	commitDenied  bool
+	commitErr     error
 	releaseOK     bool
 	releaseErr    error
-	renewDenied   bool
-	renewErr      error
-	renewSignal   chan struct{}
 
 	lease        *claimLease
-	confirmCalls int
+	commitCalls  int
 	releaseCalls int
-	renewCalls   int
 }
 
 func (s *scriptedClaimStore) Lookup(_, _ string) (claimOutcome, error) {
@@ -231,22 +270,14 @@ func (s *scriptedClaimStore) Begin(_, _ string) (claimOutcome, *claimLease, erro
 	return outcome, lease, s.beginErr
 }
 
-func (s *scriptedClaimStore) Confirm(_ *claimLease, _ int64) (bool, error) {
-	s.confirmCalls++
-	return s.confirmOK, s.confirmErr
+func (s *scriptedClaimStore) Commit(_ *claimLease, _ robot.PreparedBotTypedEvent) (bool, error) {
+	s.commitCalls++
+	return !s.commitDenied, s.commitErr
 }
 
 func (s *scriptedClaimStore) Release(_ *claimLease) (bool, error) {
 	s.releaseCalls++
 	return s.releaseOK, s.releaseErr
-}
-
-func (s *scriptedClaimStore) Renew(_ *claimLease) (bool, error) {
-	s.renewCalls++
-	if s.renewSignal != nil {
-		s.renewSignal <- struct{}{}
-	}
-	return !s.renewDenied, s.renewErr
 }
 
 type mentionResponse struct {
@@ -271,7 +302,6 @@ func newTestBotMention(robots botMentionRobotService, claims botMentionClaimStor
 		internalToken: "internal-secret",
 		metrics:       metrics,
 		now:           func() time.Time { return time.Unix(1_785_460_000, 0) },
-		claimRenewal:  claimPendingTTL / 3,
 		Log:           log.NewTLog("BotMentionTest"),
 	}
 }
@@ -677,9 +707,9 @@ func TestBotMentionClaimOutcomes(t *testing.T) {
 	}
 }
 
-func TestBotMentionEnqueueFailureReleasesClaim(t *testing.T) {
-	store := &scriptedClaimStore{confirmOK: true, releaseOK: true}
-	robots := &stubRobotService{exists: true, enqueueErr: errors.New("redis zadd failed")}
+func TestBotMentionPrepareFailureReleasesClaim(t *testing.T) {
+	store := &scriptedClaimStore{releaseOK: true}
+	robots := &stubRobotService{exists: true, enqueueErr: errors.New("allocate event ID failed")}
 	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
 	w := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
 	if w.Code != http.StatusInternalServerError || decodeMentionError(t, w).Error.Code != "err.server.bot_mention.store_failed" {
@@ -690,69 +720,16 @@ func TestBotMentionEnqueueFailureReleasesClaim(t *testing.T) {
 	}
 }
 
-func TestBotMentionRenewsClaimBeforeEnqueue(t *testing.T) {
-	store := &scriptedClaimStore{confirmOK: true}
-	robots := &stubRobotService{
-		exists:  true,
-		eventID: 4242,
-		beforeEnqueue: func() {
-			if store.renewCalls == 0 {
-				t.Error("claim lease was not renewed before enqueue")
-			}
-		},
-	}
-	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
-	response := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-	}
-	if store.renewCalls == 0 {
-		t.Fatal("renew calls = 0, want at least one")
-	}
-}
-
-func TestBotMentionLostLeaseBeforeEnqueueReturnsInProgress(t *testing.T) {
-	store := &scriptedClaimStore{renewDenied: true}
+func TestBotMentionStaleCommitReturnsInProgress(t *testing.T) {
+	store := &scriptedClaimStore{commitDenied: true}
 	robots := &stubRobotService{exists: true, eventID: 4242}
 	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
 	response := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
 	if response.Code != http.StatusConflict || decodeMentionError(t, response).Error.Code != "err.server.bot_mention.in_progress" {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if _, enqueues := robots.counts(); enqueues != 0 {
-		t.Fatalf("enqueue calls = %d, want 0", enqueues)
-	}
-}
-
-func TestBotMentionRenewsClaimWhileEnqueueIsBlocked(t *testing.T) {
-	renewSignal := make(chan struct{}, 4)
-	store := &scriptedClaimStore{confirmOK: true, renewSignal: renewSignal}
-	robots := &stubRobotService{
-		exists:          true,
-		eventID:         4242,
-		enqueueStarted:  make(chan struct{}),
-		enqueueContinue: make(chan struct{}),
-	}
-	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
-	module.claimRenewal = time.Millisecond
-	router := newMentionRouter(module)
-
-	result := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		result <- doMentionRequest(t, router, "internal-secret", validMentionRequest())
-	}()
-
-	<-renewSignal // synchronous pre-enqueue renewal
-	<-robots.enqueueStarted
-	select {
-	case <-renewSignal: // periodic renewal while enqueue is still blocked
-	case <-time.After(time.Second):
-		t.Fatal("claim lease was not renewed while enqueue was blocked")
-	}
-	close(robots.enqueueContinue)
-	response := <-result
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	if store.commitCalls != 1 || store.releaseCalls != 0 {
+		t.Fatalf("commit=%d release=%d, want 1 and 0", store.commitCalls, store.releaseCalls)
 	}
 }
 
@@ -767,7 +744,6 @@ func TestBotMentionLostLeaseDuringBlockedEnqueueReplaysSingleVisibleEvent(t *tes
 		releaseFirst: make(chan struct{}),
 	}
 	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
-	module.claimRenewal = time.Millisecond
 	router := newMentionRouter(module)
 	request := validMentionRequest()
 	claimKey := mentionClaimKey(request.BotUID, request.IdempotencyKey)
@@ -791,13 +767,13 @@ func TestBotMentionLostLeaseDuringBlockedEnqueueReplaysSingleVisibleEvent(t *tes
 	if !secondResponse.Accepted || secondResponse.Replay {
 		t.Fatalf("retry response=%+v, want newly accepted event", secondResponse)
 	}
+	close(robots.releaseFirst)
 	select {
 	case <-backend.staleCAS:
 	case <-time.After(time.Second):
 		t.Fatal("blocked attempt did not observe lease loss")
 	}
 
-	close(robots.releaseFirst)
 	var first *httptest.ResponseRecorder
 	select {
 	case first = <-firstResult:
@@ -811,13 +787,26 @@ func TestBotMentionLostLeaseDuringBlockedEnqueueReplaysSingleVisibleEvent(t *tes
 	if !firstResponse.Accepted || !firstResponse.Replay || firstResponse.EventID != secondResponse.EventID {
 		t.Fatalf("first response=%+v, want replay of event_id %d", firstResponse, secondResponse.EventID)
 	}
-	if visible := robots.visibleEventIDs(); len(visible) != 1 || visible[0] != secondResponse.EventID {
+	if visible := backend.queuedEventIDs("robotEvent:" + request.BotUID); len(visible) != 1 || visible[0] != secondResponse.EventID {
 		t.Fatalf("visible event IDs=%v, want only %d", visible, secondResponse.EventID)
 	}
 }
 
-func TestBotMentionConfirmFailureDoesNotRollBackEnqueuedEvent(t *testing.T) {
-	store := &scriptedClaimStore{confirmErr: errors.New("redis cas failed")}
+func TestBotMentionAtomicCommitFailureFailsClosedWithoutRelease(t *testing.T) {
+	store := &scriptedClaimStore{commitErr: errors.New("redis eval failed")}
+	robots := &stubRobotService{exists: true, eventID: 777}
+	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	w := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
+	if w.Code != http.StatusInternalServerError || decodeMentionError(t, w).Error.Code != "err.server.bot_mention.store_failed" {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if store.commitCalls != 1 || store.releaseCalls != 0 {
+		t.Fatalf("commit=%d release=%d, want 1 and 0", store.commitCalls, store.releaseCalls)
+	}
+}
+
+func TestBotMentionRecoversAmbiguousAtomicCommitAsReplay(t *testing.T) {
+	store := &ambiguousCommitClaimStore{}
 	robots := &stubRobotService{exists: true, eventID: 777}
 	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
 	w := doMentionRequest(t, newMentionRouter(module), "internal-secret", validMentionRequest())
@@ -825,10 +814,11 @@ func TestBotMentionConfirmFailureDoesNotRollBackEnqueuedEvent(t *testing.T) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	response := decodeMentionResponse(t, w)
-	if !response.Accepted || response.Replay || response.EventID != 777 {
-		t.Fatalf("response=%+v", response)
+	if !response.Accepted || !response.Replay || response.EventID != 777 {
+		t.Fatalf("response=%+v, want replay of event 777", response)
 	}
-	if store.confirmCalls != 1 || store.releaseCalls != 0 {
-		t.Fatalf("confirm=%d release=%d", store.confirmCalls, store.releaseCalls)
+	commits, releases := store.counts()
+	if commits != 1 || releases != 0 {
+		t.Fatalf("commit=%d release=%d, want 1 and 0", commits, releases)
 	}
 }

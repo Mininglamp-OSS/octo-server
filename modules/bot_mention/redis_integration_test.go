@@ -351,7 +351,8 @@ func assertQueuedEventExpireTracksMessageExpire(t *testing.T, client *redis.Clie
 func assertRealRedisClaimCAS(t *testing.T, claims *claimStore, client *redis.Client) {
 	t.Helper()
 	key := mentionClaimPrefix + fmt.Sprintf("cas-%d", time.Now().UnixNano())
-	t.Cleanup(func() { _ = client.Del(key).Err() })
+	queueKey := "robotEvent:" + key
+	t.Cleanup(func() { _ = client.Del(key, queueKey).Err() })
 
 	outcome, lease, err := claims.Begin(key, "sha-original")
 	if err != nil || outcome.State != claimAcquired || lease == nil {
@@ -366,8 +367,12 @@ func assertRealRedisClaimCAS(t *testing.T, claims *claimStore, client *redis.Cli
 	if released, err := claims.Release(lease); err != nil || released {
 		t.Fatalf("stale real Redis release = %v, %v; want false, nil", released, err)
 	}
-	if confirmed, err := claims.Confirm(lease, 99); err != nil || confirmed {
-		t.Fatalf("stale real Redis confirm = %v, %v; want false, nil", confirmed, err)
+	prepared := robot.PreparedBotTypedEvent{EventID: 99, QueueKey: queueKey, Member: `{"event_id":99}`}
+	if committed, err := claims.Commit(lease, prepared); err != nil || committed {
+		t.Fatalf("stale real Redis commit = %v, %v; want false, nil", committed, err)
+	}
+	if got := client.ZCard(queueKey).Val(); got != 0 {
+		t.Fatalf("stale real Redis commit queued %d events, want 0", got)
 	}
 	if got, err := client.Get(key).Result(); err != nil || !strings.Contains(got, "sha-replacement") {
 		t.Fatalf("replacement claim after stale CAS = %q, %v", got, err)

@@ -50,8 +50,8 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   依赖漂移。
 - 关键存量（octo-server 当前实现已复核，直接复用）：
   - 类型化 bot 事件是队列一等公民：`robotEvent{EventType, EventData}`
-    （`modules/robot/model.go:9-16`），`EnqueueBotTypedEvent` 已存在
-    （`modules/robot/api.go:188`，card_action 也走此路径）。
+    （`modules/robot/model.go:9-16`）；普通调用使用 `EnqueueBotTypedEvent`，本 ingress 使用
+    同一序列化路径的 `PrepareBotTypedEvent` 后原子提交（card_action 仍走普通路径）。
   - 内部服务鉴权可复用 `X-Internal-Token` header、常量时间比较和未配置 fail-closed
     模式；本能力使用独立 token，不复用 notify token。
   - `ExistRobot` 只查询 `robot` 表中 `status=1` 的 User Bot，正好匹配本 MVP；
@@ -66,23 +66,25 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 - docs-backend 为每一次“评论中的某个 bot mention”生成稳定且唯一的
   `idempotency_key`；HTTP 重试必须复用该 key，不得按请求次数生成新 key。
 - octo-server 在正常请求和并发重放下保证同一 `(bot_uid, idempotency_key)` 只入队一次。
-  幂等流程沿用 card_action 的 `claim(pending) → enqueue → confirm(event_id)` 模式：
-  - pending TTL 使用 60 秒；入队失败以 CAS 方式只释放仍为 pending 的 claim；
-  - 入队前必须以 CAS 续租，慢入队期间持续续租；进程退出后续租停止，pending 才按 TTL
-    自然释放，避免正常慢请求跨过 TTL 后被另一请求重新 claim；
-  - confirm TTL 与 `Robot.MessageExpire` 使用同一配置；
+  幂等流程为 `claim(pending) → prepare event → atomic enqueue+confirm(event_id)`：
+  - pending TTL 使用 60 秒；事件序列号分配或序列化失败时，以 CAS 方式只释放仍为 pending
+    的 claim；因此这类失败可安全重试；
+  - 事件准备阶段不写可见队列；最终通过同一 Redis Lua 原子校验 lease、`ZADD` bot 队列、
+    刷新队列 TTL，并把 claim 更新为 done。旧 lease 即使在慢请求后恢复也不能写入队列；
+  - atomic enqueue+confirm 的 claim TTL 与队列 TTL 均使用 `Robot.MessageExpire`；序列号可因
+    lease 失效而出现空洞，bot 消费游标不得假设 event_id 连续；
   - claim 仍存在时，同 key、同规范化请求体回放原 `event_id`，同 key、不同请求体返回冲突；
     docs-backend 对同一 key 的所有重试必须保持规范化请求体稳定，不能把 key 当作可复用业务 ID；
-  - 进程在 enqueue 后、confirm 前崩溃可能产生新的 `event_id` 重投；这是无事务 outbox
-    下保留的 at-least-once 窗口，插件必须按 `idempotency_key` 去重最终副作用。
+  - Redis 提交结果不明确时先读取 claim：done 则按 replay 返回；无法确认则 fail-closed，
+    不释放 pending claim，避免已提交事件被另一请求重复入队。
 - bot 事件记录的 `expire` 和队列 key TTL 均由 `Robot.MessageExpire` 生成。现有队列在新事件
   入队时会刷新整个 key 的 TTL，因此繁忙 bot 的旧成员可能存活更久；离线恢复承诺至少覆盖
   `Robot.MessageExpire`，但插件的持久去重不能只依赖该 TTL，应保存到明确终态/ACK，避免旧事件
   与已过期 claim 重叠时重复产生文档副作用。
 - 插件不得在事件仅被解析时立即 ACK：只有事件已进入可恢复的执行/幂等记录，或任务已经
   到达明确终态后才能 ACK。游标只有在 ACK 成功或事件已被持久 claim 后才能越过该事件。
-- 跨 docs-backend、octo-server、OpenClaw 的分布式 exactly-once 事务不在 MVP 范围；
-  用户可见效果通过稳定 `idempotency_key`、插件持久去重，以及 docs 编辑/回复 API 的
+- 跨 docs-backend、octo-server、OpenClaw 的分布式 exactly-once 事务不在 MVP 范围；bot
+  拉取/执行仍采用 at-least-once delivery。用户可见效果通过稳定 `idempotency_key`、插件持久去重，以及 docs 编辑/回复 API 的
   幂等能力实现 effect-once。若 docs API/现有 octo-cli 不支持幂等 key，必须在开工前确认
   插件侧持久去重足以覆盖进程重启，否则不得声称“一次编辑、一次回复”。
 
@@ -91,7 +93,7 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 ### octo-server
 
 - 新增独立模块 `modules/bot_mention`，并在 `internal/modules.go` 加 blank import；模块通过
-  `robot.IService` 复用 `ExistRobot` 和 `EnqueueBotTypedEvent`。
+  `robot.IService` 复用 `ExistRobot` 和 `PrepareBotTypedEvent`。
 - `modules/robot` 事件队列 wire format（`robotEvent` 结构、score/expiry 语义）只新增
   `event_type` 值，不改结构；`robot/model.go` 与 `bot_api/events.go` 的两处定义保持
   lockstep。
@@ -169,7 +171,7 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 ```
 
 - 首次有效请求：200，`accepted=true, replay=false`。
-- 同 key、同请求体且已 confirm：200，`accepted=true, replay=true`，返回原 `event_id`；
+- 同 key、同请求体且 claim 已为 done：200，`accepted=true, replay=true`，返回原 `event_id`；
   replay 检查先于可变的灰度和 bot 状态检查，已受理事件不会因后来关灰度或停用 bot 而
   改写历史结果。
 - 同 key 尚在 pending：409，返回幂等处理中错误并带 `Retry-After`。
@@ -234,7 +236,8 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
 - `app_bot` 支持。
 - 临时授权票据（task_grant）、平台任务状态机/SLA/终态对账、任务流 UI、通知卡片、
   出站事件订阅——完整版方案内容，按需另立任务。
-- 跨系统 exactly-once 事务；MVP 采用 at-least-once delivery + effect idempotency。
+- 跨系统 exactly-once 事务；MVP 的 bot 拉取/执行采用 at-least-once delivery + effect
+  idempotency，但 octo-server ingress 的 claim 与队列写入保持原子。
 - octo-im、octo-cli 的代码改动；若现有 octo-cli 能力不能满足前置条件，必须回到 brief
   重新定范围，不能在实现时静默扩项。
 - docs-backend / octo-web 内部实现（上报调用、@ 选择器、版本/diff/权限模型均自理；
@@ -253,10 +256,11 @@ docs-backend 在评论写入和实际编辑/回复时判定，`from_uid` 等上�
   - active User Bot 成功；不存在、inactive User Bot 和 `app_bot` 统一拒绝且不入队；
   - 同 key 顺序重放与并发重放只有一个正常入队；replay 返回原 event_id；
   - 同 key 不同 body 409；pending 409 + Retry-After；
-  - enqueue 失败释放 pending 后可重试；confirm 失败不回滚已入队事件；
+  - event 准备失败释放 pending 后可重试；旧 lease 在另一请求接管后恢复时不能入队；
+  - atomic enqueue+confirm 结果不明确时，done 可恢复为 replay，其余情况 fail-closed；
   - 灰度全关、doc 命中、space 命中、空 allowlist、`*` 全量；
   - Redis/DB 故障 fail-closed；日志不包含 token 或完整正文。
-- 事件可被 `POST /v1/bot/events` 拉到并 ACK；队列 TTL 和幂等 confirm TTL 均来自
+- 事件可被 `POST /v1/bot/events` 拉到并 ACK；队列 TTL 和幂等 done TTL 均来自
   `Robot.MessageExpire`。
 - 指标按 accepted/replay/disabled/conflict/error 等结果递增，无高基数 label。
 - `make i18n-extract`、`make i18n-extract-check`、`make i18n-lint`、

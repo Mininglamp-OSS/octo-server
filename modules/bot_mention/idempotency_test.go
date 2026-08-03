@@ -2,10 +2,13 @@ package bot_mention
 
 import (
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 )
 
 type memoryClaimBackend struct {
@@ -13,10 +16,11 @@ type memoryClaimBackend struct {
 
 	values map[string]string
 	ttls   map[string]time.Duration
+	queues map[string]map[int64]string
 
 	getErr    error
 	setNXErr  error
-	setCASErr error
+	commitErr error
 	delCASErr error
 }
 
@@ -30,7 +34,7 @@ func (disappearingSetNXBackend) SetNX(string, string, time.Duration) (bool, erro
 	return false, nil
 }
 
-func (disappearingSetNXBackend) CompareAndSet(string, string, string, time.Duration) (bool, error) {
+func (disappearingSetNXBackend) CompareAndEnqueue(string, string, string, time.Duration, robot.PreparedBotTypedEvent) (bool, error) {
 	return false, nil
 }
 
@@ -39,7 +43,11 @@ func (disappearingSetNXBackend) CompareAndDelete(string, string) (bool, error) {
 }
 
 func newMemoryClaimBackend() *memoryClaimBackend {
-	return &memoryClaimBackend{values: make(map[string]string), ttls: make(map[string]time.Duration)}
+	return &memoryClaimBackend{
+		values: make(map[string]string),
+		ttls:   make(map[string]time.Duration),
+		queues: make(map[string]map[int64]string),
+	}
 }
 
 func (b *memoryClaimBackend) Get(key string) (string, error) {
@@ -69,15 +77,22 @@ func (b *memoryClaimBackend) SetNX(key, value string, ttl time.Duration) (bool, 
 	return true, nil
 }
 
-func (b *memoryClaimBackend) CompareAndSet(key, oldValue, newValue string, ttl time.Duration) (bool, error) {
+func (b *memoryClaimBackend) CompareAndEnqueue(key, oldValue, newValue string, ttl time.Duration, event robot.PreparedBotTypedEvent) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.setCASErr != nil {
-		return false, b.setCASErr
+	if b.commitErr != nil {
+		return false, b.commitErr
 	}
 	if b.values[key] != oldValue {
 		return false, nil
 	}
+	queue := b.queues[event.QueueKey]
+	if queue == nil {
+		queue = make(map[int64]string)
+		b.queues[event.QueueKey] = queue
+	}
+	queue[event.EventID] = event.Member
+	b.ttls[event.QueueKey] = ttl
 	b.values[key] = newValue
 	b.ttls[key] = ttl
 	return true, nil
@@ -102,6 +117,26 @@ func (b *memoryClaimBackend) forceDelete(key string) {
 	delete(b.values, key)
 	delete(b.ttls, key)
 	b.mu.Unlock()
+}
+
+func (b *memoryClaimBackend) queuedEventIDs(key string) []int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	queue := b.queues[key]
+	ids := make([]int64, 0, len(queue))
+	for eventID := range queue {
+		ids = append(ids, eventID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func preparedTestEvent(eventID int64) robot.PreparedBotTypedEvent {
+	return robot.PreparedBotTypedEvent{
+		EventID:  eventID,
+		QueueKey: "robotEvent:bot-a",
+		Member:   "event-payload",
+	}
 }
 
 func deterministicTokens(tokens ...string) func() (string, error) {
@@ -136,13 +171,6 @@ func TestClaimStoreLifecycleAndConflict(t *testing.T) {
 	if backend.ttls[key] != claimPendingTTL {
 		t.Fatalf("pending TTL = %v, want %v", backend.ttls[key], claimPendingTTL)
 	}
-	backend.ttls[key] = time.Second
-	if renewed, err := store.Renew(lease); err != nil || !renewed {
-		t.Fatalf("renew = %v, %v", renewed, err)
-	}
-	if backend.ttls[key] != claimPendingTTL {
-		t.Fatalf("renewed TTL = %v, want %v", backend.ttls[key], claimPendingTTL)
-	}
 
 	pending, _, err := store.Begin(key, "sha-a")
 	if err != nil || pending.State != claimPending {
@@ -153,12 +181,19 @@ func TestClaimStoreLifecycleAndConflict(t *testing.T) {
 		t.Fatalf("conflicting begin = %+v, %v", conflict, err)
 	}
 
-	ok, err := store.Confirm(lease, 4242)
+	event := preparedTestEvent(4242)
+	ok, err := store.Commit(lease, event)
 	if err != nil || !ok {
-		t.Fatalf("confirm = %v, %v", ok, err)
+		t.Fatalf("commit = %v, %v", ok, err)
 	}
 	if backend.ttls[key] != 2*time.Hour {
 		t.Fatalf("done TTL = %v, want 2h", backend.ttls[key])
+	}
+	if backend.ttls[event.QueueKey] != 2*time.Hour {
+		t.Fatalf("queue TTL = %v, want 2h", backend.ttls[event.QueueKey])
+	}
+	if ids := backend.queuedEventIDs(event.QueueKey); len(ids) != 1 || ids[0] != event.EventID {
+		t.Fatalf("queued event IDs = %v, want [%d]", ids, event.EventID)
 	}
 	replay, err := store.Lookup(key, "sha-a")
 	if err != nil || replay.State != claimReplay || replay.EventID != 4242 {
@@ -196,16 +231,16 @@ func TestClaimStoreStaleLeaseCannotMutateReplacement(t *testing.T) {
 	if err != nil || deleted {
 		t.Fatalf("stale release = %v, %v; must not delete replacement", deleted, err)
 	}
-	if renewed, err := store.Renew(oldLease); err != nil || renewed {
-		t.Fatalf("stale renew = %v, %v; must not extend replacement", renewed, err)
-	}
-	ok, err := store.Confirm(newLease, 200)
+	ok, err := store.Commit(newLease, preparedTestEvent(200))
 	if err != nil || !ok {
-		t.Fatalf("new confirm = %v, %v", ok, err)
+		t.Fatalf("new commit = %v, %v", ok, err)
 	}
-	ok, err = store.Confirm(oldLease, 100)
+	ok, err = store.Commit(oldLease, preparedTestEvent(100))
 	if err != nil || ok {
-		t.Fatalf("stale confirm = %v, %v; must not overwrite replacement", ok, err)
+		t.Fatalf("stale commit = %v, %v; must not enqueue or overwrite replacement", ok, err)
+	}
+	if ids := backend.queuedEventIDs("robotEvent:bot-a"); len(ids) != 1 || ids[0] != 200 {
+		t.Fatalf("queued event IDs = %v, want [200]", ids)
 	}
 	replay, err := store.Lookup(key, "sha-a")
 	if err != nil || replay.EventID != 200 {
@@ -257,11 +292,8 @@ func TestClaimStoreDefaultsAndErrorBranches(t *testing.T) {
 	if token, err := newClaimToken(); err != nil || len(token) != 32 {
 		t.Fatalf("newClaimToken() = %q, %v", token, err)
 	}
-	if ok, err := store.Confirm(nil, 0); err == nil || ok {
-		t.Fatalf("Confirm(nil) = %v, %v", ok, err)
-	}
-	if ok, err := store.Renew(nil); err == nil || ok {
-		t.Fatalf("Renew(nil) = %v, %v", ok, err)
+	if ok, err := store.Commit(nil, robot.PreparedBotTypedEvent{}); err == nil || ok {
+		t.Fatalf("Commit(nil) = %v, %v", ok, err)
 	}
 	if ok, err := store.Release(nil); err == nil || ok {
 		t.Fatalf("Release(nil) = %v, %v", ok, err)
@@ -284,21 +316,18 @@ func TestClaimStoreDefaultsAndErrorBranches(t *testing.T) {
 	}
 }
 
-func TestClaimStorePropagatesCASErrors(t *testing.T) {
+func TestClaimStorePropagatesCommitAndReleaseErrors(t *testing.T) {
 	backend := newMemoryClaimBackend()
 	store := newClaimStore(backend, time.Hour, deterministicTokens("lease-a", "lease-b"))
 	_, lease, err := store.Begin("confirm-key", "sha")
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend.setCASErr = errors.New("cas failed")
-	if ok, err := store.Renew(lease); err == nil || ok {
-		t.Fatalf("Renew CAS error = %v, %v", ok, err)
+	backend.commitErr = errors.New("atomic commit failed")
+	if ok, err := store.Commit(lease, preparedTestEvent(1)); err == nil || ok {
+		t.Fatalf("Commit error = %v, %v", ok, err)
 	}
-	if ok, err := store.Confirm(lease, 1); err == nil || ok {
-		t.Fatalf("Confirm CAS error = %v, %v", ok, err)
-	}
-	backend.setCASErr = nil
+	backend.commitErr = nil
 
 	_, releaseLease, err := store.Begin("release-key", "sha")
 	if err != nil {

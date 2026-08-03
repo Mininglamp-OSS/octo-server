@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 )
@@ -57,7 +58,7 @@ type claimLease struct {
 type claimBackend interface {
 	Get(key string) (string, error)
 	SetNX(key, value string, ttl time.Duration) (bool, error)
-	CompareAndSet(key, oldValue, newValue string, ttl time.Duration) (bool, error)
+	CompareAndEnqueue(key, oldValue, newValue string, ttl time.Duration, event robot.PreparedBotTypedEvent) (bool, error)
 	CompareAndDelete(key, oldValue string) (bool, error)
 }
 
@@ -167,28 +168,17 @@ func (s *claimStore) Begin(key, sha string) (claimOutcome, *claimLease, error) {
 	}, nil
 }
 
-func (s *claimStore) Renew(lease *claimLease) (bool, error) {
-	if lease == nil {
-		return false, errors.New("renew bot mention claim: nil lease")
+func (s *claimStore) Commit(lease *claimLease, event robot.PreparedBotTypedEvent) (bool, error) {
+	if lease == nil || event.EventID <= 0 || event.QueueKey == "" || event.Member == "" {
+		return false, errors.New("commit bot mention event: invalid lease or prepared event")
 	}
-	ok, err := s.backend.CompareAndSet(lease.key, lease.pendingValue, lease.pendingValue, claimPendingTTL)
+	done, err := json.Marshal(claimRecord{State: claimRecordDone, SHA: lease.sha, EventID: event.EventID})
 	if err != nil {
-		return false, fmt.Errorf("renew bot mention claim: %w", err)
+		return false, fmt.Errorf("encode committed bot mention claim: %w", err)
 	}
-	return ok, nil
-}
-
-func (s *claimStore) Confirm(lease *claimLease, eventID int64) (bool, error) {
-	if lease == nil || eventID <= 0 {
-		return false, errors.New("confirm bot mention claim: invalid lease or event_id")
-	}
-	done, err := json.Marshal(claimRecord{State: claimRecordDone, SHA: lease.sha, EventID: eventID})
+	ok, err := s.backend.CompareAndEnqueue(lease.key, lease.pendingValue, string(done), s.doneTTL, event)
 	if err != nil {
-		return false, fmt.Errorf("encode confirmed bot mention claim: %w", err)
-	}
-	ok, err := s.backend.CompareAndSet(lease.key, lease.pendingValue, string(done), s.doneTTL)
-	if err != nil {
-		return false, fmt.Errorf("confirm bot mention claim: %w", err)
+		return false, fmt.Errorf("commit bot mention event: %w", err)
 	}
 	return ok, nil
 }
@@ -220,21 +210,25 @@ func (b *redisClaimBackend) SetNX(key, value string, ttl time.Duration) (bool, e
 	return b.client.SetNX(key, value, ttl).Result()
 }
 
-var compareAndSetClaimScript = rd.NewScript(`
+var compareAndEnqueueClaimScript = rd.NewScript(`
 if redis.call("get", KEYS[1]) == ARGV[1] then
+	redis.call("zadd", KEYS[2], ARGV[4], ARGV[5])
+	redis.call("pexpire", KEYS[2], ARGV[3])
 	redis.call("psetex", KEYS[1], ARGV[3], ARGV[2])
 	return 1
 end
 return 0
 `)
 
-func (b *redisClaimBackend) CompareAndSet(key, oldValue, newValue string, ttl time.Duration) (bool, error) {
-	result, err := compareAndSetClaimScript.Run(
+func (b *redisClaimBackend) CompareAndEnqueue(key, oldValue, newValue string, ttl time.Duration, event robot.PreparedBotTypedEvent) (bool, error) {
+	result, err := compareAndEnqueueClaimScript.Run(
 		b.client,
-		[]string{key},
+		[]string{key, event.QueueKey},
 		oldValue,
 		newValue,
 		ttl.Milliseconds(),
+		event.EventID,
+		event.Member,
 	).Int64()
 	return result == 1, err
 }
