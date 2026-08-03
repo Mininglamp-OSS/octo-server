@@ -180,6 +180,15 @@ other = "The upstream service is unavailable."
 ["err.server.bot_api.user_not_found"]
 other = "User not found."
 
+["err.server.bot_mention.idempotency_conflict"]
+other = "This idempotency key was already used with a different request."
+
+["err.server.bot_mention.in_progress"]
+other = "A request with this idempotency key is still in progress."
+
+["err.server.bot_mention.store_failed"]
+other = "Failed to process the bot mention event."
+
 ["err.server.bot_provision.auth_failed"]
 other = "Authentication failed."
 

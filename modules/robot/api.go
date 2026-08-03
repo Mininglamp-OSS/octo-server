@@ -49,6 +49,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// PreparedBotTypedEvent is a typed bot event with its sequence and wire payload
+// allocated, but not yet visible in the Redis queue. Callers that need to
+// combine the queue write with another Redis state transition can commit these
+// fields atomically; ordinary callers should keep using EnqueueBotTypedEvent.
+type PreparedBotTypedEvent struct {
+	EventID  int64
+	QueueKey string
+	Member   string
+}
+
 // IService 为其他模块提供的窄接口，避免持有完整 *Robot 以及由此产生的循环依赖。
 // YUJ-60: 允许 bot 创建者撤回自己 bot 发的消息时，由 message 模块注入并调用。
 //
@@ -96,6 +106,10 @@ type IService interface {
 	// bots key at-least-once idempotency on it per D8). Error only on
 	// GenSeq / ZADD failure.
 	EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error)
+	// PrepareBotTypedEvent allocates and serializes the same queue record as
+	// EnqueueBotTypedEvent without making it visible. The returned event is
+	// intended for an atomic fenced commit by another module.
+	PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error)
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
@@ -196,6 +210,16 @@ func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[s
 	return enqueueBotTypedEventGeneric(rb.ctx, robotID, eventType, eventData)
 }
 
+// PrepareBotTypedEvent — IService — Service variant.
+func (s *Service) PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error) {
+	return prepareBotTypedEvent(s.ctx, robotID, eventType, eventData)
+}
+
+// PrepareBotTypedEvent — IService — *Robot variant.
+func (rb *Robot) PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error) {
+	return prepareBotTypedEvent(rb.ctx, robotID, eventType, eventData)
+}
+
 // enqueueBotEventGeneric is the write-to-bot-event-queue helper shared by
 // EnqueueBotEvent (cross-module synthetic path) and, in typed form, by
 // enqueueBotTypedEventGeneric.
@@ -263,18 +287,36 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 // GenSeq / ZAdd / Expire chokepoint，只是承载 EventType/EventData 而非 Message，
 // 并把分配到的 event_id（= seq）返回给调用方（D4 用作 confirm 值 / D8 bot 幂等键）。
 func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+	prepared, err := prepareBotTypedEvent(ctx, robotID, eventType, eventData)
+	if err != nil {
+		return 0, err
+	}
+	if err := ctx.GetRedisConn().ZAdd(prepared.QueueKey, float64(prepared.EventID), prepared.Member); err != nil {
+		return 0, err
+	}
+	if err := ctx.GetRedisConn().Expire(prepared.QueueKey, ctx.GetConfig().Robot.MessageExpire); err != nil {
+		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
+		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。
+		botevent.Notify(ctx.GetConfig(), robotID)
+		return prepared.EventID, nil
+	}
+	botevent.Notify(ctx.GetConfig(), robotID)
+	return prepared.EventID, nil
+}
+
+func prepareBotTypedEvent(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error) {
 	if ctx == nil {
-		return 0, errors.New("robot: nil ctx, cannot enqueue typed bot event")
+		return PreparedBotTypedEvent{}, errors.New("robot: nil ctx, cannot prepare typed bot event")
 	}
 	if strings.TrimSpace(robotID) == "" {
-		return 0, errors.New("robot: empty robotID, cannot enqueue typed bot event")
+		return PreparedBotTypedEvent{}, errors.New("robot: empty robotID, cannot prepare typed bot event")
 	}
 	if strings.TrimSpace(eventType) == "" {
-		return 0, errors.New("robot: empty eventType, cannot enqueue typed bot event")
+		return PreparedBotTypedEvent{}, errors.New("robot: empty eventType, cannot prepare typed bot event")
 	}
 	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
 	if err != nil {
-		return 0, err
+		return PreparedBotTypedEvent{}, err
 	}
 	messageUpdateJson := util.ToJson(&robotEvent{
 		EventID:   seq,
@@ -282,20 +324,11 @@ func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string,
 		EventData: eventData,
 		Expire:    time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
 	})
-	key := fmt.Sprintf("robotEvent:%s", robotID)
-	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
-		return 0, err
-	}
-	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
-		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
-		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。
-		botevent.Notify(ctx.GetConfig(), robotID)
-		return seq, nil
-	}
-	// 同 enqueueBotEventGeneric：ZADD + EXPIRE 之后再摇铃唤醒 long-poll。
-	// card_action 正是走本路径入队，卡片交互的端到端时延收益就落在这一行上。
-	botevent.Notify(ctx.GetConfig(), robotID)
-	return seq, nil
+	return PreparedBotTypedEvent{
+		EventID:  seq,
+		QueueKey: fmt.Sprintf("robotEvent:%s", robotID),
+		Member:   messageUpdateJson,
+	}, nil
 }
 
 type Robot struct {

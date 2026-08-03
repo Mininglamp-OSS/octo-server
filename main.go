@@ -509,7 +509,11 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 	if err != nil {
 		return nil, err
 	}
-	if err := registry.ValidateNotifyTokenExclusions(os.Getenv("NOTIFY_INTERNAL_TOKEN"), os.Getenv("OCTO_DOCS_NOTIFY_TOKEN")); err != nil {
+	if err := registry.ValidateNotifyTokenExclusions(
+		os.Getenv("NOTIFY_INTERNAL_TOKEN"),
+		os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"),
+		os.Getenv("OCTO_DOCS_BOT_MENTION_TOKEN"),
+	); err != nil {
 		return nil, err
 	}
 	// OCTO_CARD_MESSAGE_ENABLED is the deployment-level master gate (rollout /

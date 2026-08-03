@@ -10,9 +10,11 @@ import (
 )
 
 // TestEveryBotEventQueueWriterRingsTheDoorbell pins the invariant that PR#685's
-// review found broken: **every** site that ZADDs into the bot event queue must
-// ring the doorbell afterwards, or /v1/bot/events long-poll will not wake
-// promptly for the events that site produces.
+// review found broken: every direct Go site that ZADDs into the bot event queue
+// must ring the doorbell afterwards, or /v1/bot/events long-poll will not wake
+// promptly for the events that site produces. The bot_mention atomic Lua writer
+// rings from its handler after commit; its commit, replay-recovery, and notify
+// behavior are covered together by modules/bot_mention API tests.
 //
 // The original change wired only two of five writers because the docstring on
 // enqueueBotEventGeneric claimed it was the shared chokepoint for all of them.
@@ -26,10 +28,10 @@ import (
 func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	root := repoRootForGuard(t)
 
-	// A queue writer is a ZAdd whose key is the bot event queue. Both spellings
-	// in the tree are covered: the `robotEventPrefix` constant and the inline
-	// "robotEvent:%s" literal.
-	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s")`)
+	// A queue writer is a ZAdd whose key is the bot event queue. Cover the two
+	// direct spellings plus the prepared typed-event key produced by
+	// PrepareBotTypedEvent.
+	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s"|prepared\.QueueKey)`)
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
 	// Notify is the producer-facing entry point; Ring is the synchronous
 	// primitive it wraps. Both count: a writer that calls Ring directly is
@@ -43,9 +45,11 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	// unrelated later site cannot be mistaken for this one's.
 	const window = 24
 
-	// Known writers at the time of writing: enqueueBotEventGeneric,
+	// Known direct Go writers at the time of writing: enqueueBotEventGeneric,
 	// enqueueBotTypedEventGeneric, saveRobotMessage, and both
-	// notifyBotJoinedGroup variants. Raise this when a writer is added.
+	// notifyBotJoinedGroup variants. The bot_mention Lua writer is deliberately
+	// outside this syntactic scan and is pinned by its handler behavior tests.
+	// Raise this when another direct Go writer is added.
 	const minKnownQueueWriters = 5
 
 	var violations []string

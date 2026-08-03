@@ -28,6 +28,7 @@ import (
 	// (历史顺序，非 load-bearing —— 真正排序由 SQL 文件时间戳决定)。
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_mention"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
