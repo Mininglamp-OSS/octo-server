@@ -124,6 +124,17 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		search.DELETE("/:space_id/welcome", s.deleteWelcome)
 	}
 
+	// 通讯录目录：本仓库第一个把 space_id 放在路径上、并经由 SpaceMiddleware 完成
+	// 成员校验的路由（中间件按「路径参数优先」解析，见 pkg/space 的 resolveSpaceID）。
+	//
+	// 刻意独立成组，不复用上面的 search 组：那个组里的 members/search、welcome 各自
+	// 已有自己的权限判定（requireSpaceAdmin 等），给它们一并挂上 SpaceMiddleware 会
+	// 改变既有路由的行为，属于另一个任务的范围。
+	directory := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx), spacepkg.SpaceMiddleware(s.ctx))
+	{
+		directory.GET("/:space_id/directory", s.listDirectory)
+	}
+
 	// 邀请码预览端点（公开无认证）严格 per-IP 限流：防枚举 + 暴破（issue #1000）。
 	// 两个端点共享同一 limiter，使同一 IP 跨端点总配额受控。
 	// 阈值与 user 模块 login 同档（10 req/min, burst 5），详见 PR #1090。

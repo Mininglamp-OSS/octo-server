@@ -183,6 +183,72 @@ type memberResp struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// ---------- Directory Response Models ----------
+
+// 目录行的身份取值。kind 只有这两种，没有第三态：停用 bot 不会退化成 human，
+// 它在查询阶段就整行排除（见 directoryWhereClause）。
+const (
+	directoryKindHuman = "human"
+	directoryKindBot   = "bot"
+)
+
+// bot 与当前登录用户的好友关系态，取值与 /v1/robot/space_bots 的 status 一致。
+const (
+	directoryRelationAdded    = "added"
+	directoryRelationPending  = "pending"
+	directoryRelationNotAdded = "not_added"
+)
+
+// directoryBotResp 目录行的 bot 附加信息。
+//
+// 刻意只带 relation。space_bots 还会返回 description / creator_uid /
+// creator_name / bot_commands / auto_approve，本接口一个都不给：目录行渲染的是
+// 头像（由 uid 推导）+ 名字 + 在线态 + AI 的已添加状态，其余字段列表侧无人读，
+// 而 bot_commands 是 bot 的完整命令列表——按线上最大 Space 的 ~4400 个 bot 估算，
+// 胖行会把一次性响应推到 MB 级，精简行约 740KB（gzip 后 ~120KB）。bot 详情自有
+// 接口，列表不兼任详情投影。将来确有调用方需要，应显式加 ?detail=full，而不是
+// 放宽默认返回。
+type directoryBotResp struct {
+	Relation string `json:"relation"`
+}
+
+// directoryItemResp 目录单行。Bot 仅在 Kind == bot 时存在。
+type directoryItemResp struct {
+	UID       string            `json:"uid"`
+	Name      string            `json:"name"`
+	Kind      string            `json:"kind"`
+	Role      int               `json:"role"`
+	CreatedAt string            `json:"created_at"`
+	Bot       *directoryBotResp `json:"bot,omitempty"`
+}
+
+// directoryResp 目录分页响应。Total 是过滤后、分页前的总数，客户端据此渲染
+// tab 计数，不必再把整份名单拉回本地做 filter 计算。
+type directoryResp struct {
+	Total int                 `json:"total"`
+	Page  int                 `json:"page"`
+	Limit int                 `json:"limit"`
+	Items []directoryItemResp `json:"items"`
+}
+
+// directoryRowModel 目录查询的行模型。
+//
+// 复用 MemberDetailModel 以继承 #344 的 DisplayName 兜底链（user.name →
+// user_verification.real_name → 稳定占位符）；其 Robot 字段在这里装载的是
+// user.robot，即「是不是 bot 账号」。ActiveBot 独立记录「robot 表里是否存在
+// status=1 的行」，两者分开才能把停用 bot 与真人区分开。
+type directoryRowModel struct {
+	MemberDetailModel
+	ActiveBot int
+}
+
+// isBot 判定该行是否应以 bot 身份呈现：既是 bot 账号，又处于启用状态。
+// 查询侧已排除「是 bot 账号但未启用」的行，这里的双条件是冗余防御——若将来
+// WHERE 被改动，分类逻辑不会跟着悄悄把停用 bot 归到 human。
+func (m *directoryRowModel) isBot() bool {
+	return m.Robot == 1 && m.ActiveBot == 1
+}
+
 type memberSearchResp struct {
 	UID       string `json:"uid"`
 	Name      string `json:"name"`

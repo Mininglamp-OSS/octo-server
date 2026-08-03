@@ -94,8 +94,8 @@ func (c *InMemoryMembershipCache) Clear() {
 }
 
 // SpaceMiddleware 是 opt-in 中间件，route group 级别注入。
-// 从请求提取 space_id（query param 优先，header X-Space-ID 其次），
-// 无 space_id 则跳过，有则校验用户是否属于该 Space。
+// 从请求提取 space_id（见 resolveSpaceID 的优先级），无 space_id 则跳过，
+// 有则校验用户是否属于该 Space。
 func SpaceMiddleware(ctx *config.Context) wkhttp.HandlerFunc {
 	cache := NewRedisMembershipCache(ctx.GetRedisConn())
 	return spaceMiddleware(func(spaceID, uid string) (bool, error) {
@@ -103,12 +103,31 @@ func SpaceMiddleware(ctx *config.Context) wkhttp.HandlerFunc {
 	}, cache)
 }
 
+// resolveSpaceID 解析请求携带的 space_id，优先级：路径参数 > query > X-Space-ID。
+//
+// 路径参数排最前是安全要求，不是风格偏好。路径作用域的路由（如
+// GET /v1/space/{space_id}/directory）里 handler 读的是 c.Param("space_id")；
+// 若中间件转而用 query / header 里的另一个值完成校验，就会出现「校验 Space A、
+// 返回 Space B 数据」的越权缺口。把路径放在最高优先级，保证中间件校验的对象与
+// handler 查询的对象始终是同一个。
+//
+// 对既有调用方行为中性：当前挂载 SpaceMiddleware 的路由（modules/channel、
+// modules/user 的 pinned / space、modules/search、modules/message 的 message /
+// sidebar / reactions / reaction）均无 :space_id 路径参数，c.Param 返回空串，
+// 解析立即回落到原有的 query → header 顺序。
+func resolveSpaceID(c *wkhttp.Context) string {
+	if spaceID := c.Param("space_id"); spaceID != "" {
+		return spaceID
+	}
+	if spaceID := c.Query("space_id"); spaceID != "" {
+		return spaceID
+	}
+	return c.GetHeader("X-Space-ID")
+}
+
 func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-		spaceID := c.Query("space_id")
-		if spaceID == "" {
-			spaceID = c.GetHeader("X-Space-ID")
-		}
+		spaceID := resolveSpaceID(c)
 		if spaceID == "" {
 			c.Next()
 			return

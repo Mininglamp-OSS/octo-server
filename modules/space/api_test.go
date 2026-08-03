@@ -65,6 +65,11 @@ func TestMain(m *testing.M) {
 		// user_verification 是 queryMembers 的 name 兜底来源（issue #344）：
 		// u.name 为空时回退 real_name。列对齐 modules/user/sql/20260505000003_user_legacy01.sql。
 		"CREATE TABLE IF NOT EXISTS user_verification (user_id VARCHAR(40) NOT NULL, real_name VARCHAR(128) NOT NULL DEFAULT '', source VARCHAR(32) NOT NULL DEFAULT '', source_sub VARCHAR(128) NOT NULL DEFAULT '', emp_id VARCHAR(64) DEFAULT NULL, dept VARCHAR(255) DEFAULT NULL, email VARCHAR(255) DEFAULT NULL, mobile VARCHAR(32) DEFAULT NULL, verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (user_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// friend / friend_apply_record 是目录接口解析 bot relation 的来源
+		// （queryBotRelations）。列对齐 modules/user/sql 的 20191106000003 与
+		// 20231127000001；申请记录的方向是 uid=被申请方、to_uid=申请人。
+		"CREATE TABLE IF NOT EXISTS friend (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', to_uid VARCHAR(40) NOT NULL DEFAULT '', version BIGINT NOT NULL DEFAULT 0, vercode VARCHAR(100) NOT NULL DEFAULT '', is_deleted SMALLINT NOT NULL DEFAULT 0, is_alone SMALLINT NOT NULL DEFAULT 0, initiator SMALLINT NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_friend_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS friend_apply_record (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', to_uid VARCHAR(40) NOT NULL DEFAULT '', remark VARCHAR(200) NOT NULL DEFAULT '', status SMALLINT NOT NULL DEFAULT 1, token VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_apply_uid_touid(uid, to_uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 	}
 	for _, ddl := range depDDLs {
 		if _, err := db.Exec(ddl); err != nil {

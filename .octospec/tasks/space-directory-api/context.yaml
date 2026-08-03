@@ -1,0 +1,28 @@
+injected:
+  - id: space-isolation
+    source: repo
+    # matched: touches[space, isolation, auth, acl] + paths(modules/**/*.go)
+    # load_bearing — this task's core constraint: the endpoint exposes a full
+    # Space roster and must gate on membership via SpaceMiddleware.
+  - id: error-handling
+    source: repo
+    # matched: touches[error-response, i18n, wire-contract] + paths(modules/**/*.go)
+    # load_bearing — all failures via httperr.ResponseErrorL + registered errcode.
+  - id: rate-limit
+    source: repo
+    # matched: touches[rate-limit] + paths(modules/**/*.go)
+    # load_bearing — authenticated list endpoint mounts SharedUIDRateLimiter
+    # after AuthMiddleware; tests must reset ratelimit:uid:*.
+  - id: trust-boundary
+    source: repo
+    # matched: touches[wire-contract] only. Substantively N/A — this is a
+    # read-only roster endpoint with no adapter, no external content, no
+    # markdown/URL emission. The one clause that transfers is "bound the
+    # payload": the limit cap and the lean row shape are the structural bounds.
+  - id: testing
+    source: repo
+    # matched: paths(**/*_test.go) + touches[testing]
+  - id: commit-style
+    source: repo
+    # matched: paths(**) + touches[commit]
+brief: .octospec/tasks/space-directory-api/brief.md

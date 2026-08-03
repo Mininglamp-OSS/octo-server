@@ -31,8 +31,11 @@ rules and merging/deduping/counting them locally.
 The endpoint establishes **one** bot-visibility contract for the directory:
 
 - A directory row is a `space_member` row with `status=1`, keyed uniquely by `uid`.
-- `kind=bot` iff the uid has a `robot` row with `status=1`; everything else is
-  `kind=human`. There is no third state and no row where the two sources disagree.
+- `kind=bot` iff `user.robot=1` **and** a `robot` row with `status=1` exists;
+  `kind=human` iff `user.robot=0`. A uid that is a bot account but has no active
+  `robot` row (a **disabled** bot) is excluded from the directory entirely — it is
+  neither `bot` nor `human`. There is no third state on the wire and no row where
+  the two sources disagree.
 - Bot rows are **not** filtered by `robot.creator_uid`. Visibility is
   Space-membership-scoped only — identical to what `GET /v1/robot/space_bots`
   already returns today, but reached through a handler that actually verifies the
@@ -73,7 +76,13 @@ Request:
 | `space_id` | path | string | — | required |
 | `type` | query | enum `all`\|`human`\|`bot` | `all` | unknown value → 400 business error, not a silent fallback |
 | `page` | query | integer | 1 | `<=0` → 1 |
-| `limit` | query | integer | 50 | `<=0` → 50; capped at 500 |
+| `limit` | query | integer | 50 | `<=0` → 50; capped at 10000 |
+
+The 10000 cap matches `listMembers`. It is deliberately high enough for the contacts
+page to keep loading a whole Space in one request: the largest production Space holds
+~1700 humans + ~4400 bots ≈ 6100 rows, so a 500-row cap would turn today's 2 requests
+into 13 and push `LIMIT/OFFSET` to `OFFSET 6000` on a joined query. `total` is
+returned regardless, so callers that prefer to page can.
 
 Response `200`:
 
@@ -90,11 +99,6 @@ Response `200`:
       "role": 3,                       // space_member.role — present for bots too
       "created_at": "2026-01-02T03:04:05Z",
       "bot": {                         // present iff kind == "bot", omitted otherwise
-        "description": "",
-        "creator_uid": "u_9",
-        "creator_name": "Bob",
-        "bot_commands": "",
-        "auto_approve": 0,
         "relation": "not_added"        // "added" | "pending" | "not_added"
       }
     }
@@ -102,9 +106,44 @@ Response `200`:
 }
 ```
 
-`relation` is the viewer-scoped friend state, carried over verbatim from `spaceBots`
-(`friend` → `added`, else `friend_apply` row → `pending`, else `not_added`). It is
-the one field in the payload that depends on who is asking.
+`relation` is the viewer-scoped friend state — the one field in the payload that
+depends on who is asking. The three values match `spaceBots`' `status` (`friend` →
+`added`, else an open friend application → `pending`, else `not_added`).
+
+**The `pending` derivation deliberately diverges from `spaceBots`.** Discovered while
+implementing: `spaceBots` (`modules/robot/api.go:1541`) runs
+`SELECT to_uid, status FROM friend_apply WHERE uid = ? AND to_uid IN ?`, which is
+wrong twice over —
+
+1. **The table does not exist.** There is no `friend_apply` anywhere in the repo; the
+   applications table is `friend_apply_record`
+   (`modules/user/sql/20231127000001_user_legacy01.sql`).
+2. **The direction is reversed.** Applications are stored as `uid` = the party being
+   applied to, `to_uid` = the applicant (see the write at
+   `modules/user/api_friend.go:473`: `UID: req.ToUID, ToUID: fromUID`).
+
+The query's error is swallowed with `_, _ =`, so `applyMap` is always empty and
+`pending` is an unreachable branch in production today — `space_bots` only ever
+returns `added` or `not_added`. This endpoint queries `friend_apply_record` with the
+correct direction and `status = 0` (未处理). Repairing `spaceBots` would change its
+response for legitimate callers, which the isolation task explicitly forbids, so it
+belongs to neither this task nor `robot-space-bots-space-isolation` — see Out of scope.
+
+**The row is deliberately lean.** `spaceBots` also returns `description`,
+`creator_uid`, `creator_name`, `bot_commands` and `auto_approve`; this endpoint
+returns none of them. A directory row renders an avatar (derived from `uid`), a name,
+an online badge and — for bots — the added/pending state; nothing else is read by
+`Contacts/index.tsx:460-517`, and `bot_commands` is never read there at all.
+`bot_commands` is a bot's full command list, so at ~4400 bots a fat row puts the
+one-shot response in the megabytes while a lean row keeps it around 740 KB
+(~120 KB gzipped). Bot detail already has its own endpoints; the list must not
+double as a detail projection. If a consumer later proves it needs the extra fields,
+add an explicit `?detail=full` rather than widening the default.
+
+**`relation` is computed only when the page actually contains bot rows.** The lookup
+is `friend` / `friend_apply` filtered by `to_uid IN (…)` over the page's bot uids —
+the same shape `spaceBots` runs today, so this is not a regression — but `type=human`
+contains no bots by construction and MUST skip both queries entirely.
 
 Ordering is `sm.role DESC, sm.created_at ASC, sm.uid ASC` for every `type`. The
 `sm.uid` tiebreaker is required: without a unique final sort key, `LIMIT/OFFSET`
@@ -200,6 +239,19 @@ has no reproducible backend source today. The new endpoint must nonetheless
   `modules/search/api.go:44`, `modules/message/api_sidebar.go:170`,
   `modules/message/api.go:349,384,388`). The existing early-return for "no space id
   anywhere" (`c.Next()` passthrough) and the 401/403 branches MUST be unchanged.
+
+  **Path takes the highest priority, not the lowest** (revised during implementation
+  from the original "query wins" note). This is a security requirement: the handler
+  reads `c.Param("space_id")`, so if the middleware validated a *different* id taken
+  from the query string or `X-Space-ID`, a caller could send
+  `GET /v1/space/{forbidden}/directory?space_id={allowed}` and have membership
+  checked against the Space they belong to while the handler returns the one they do
+  not. Path-first makes the validated Space and the queried Space the same value by
+  construction. It stays behavior-neutral for existing consumers because none of them
+  carry a `:space_id` path param, so `c.Param` returns `""` and resolution falls
+  straight through to the original query → header order. The handler additionally
+  asserts `GetSpaceID(c) == c.Param("space_id")` and fails closed, so a future
+  reordering or a missing middleware mount cannot silently serve unvalidated data.
   (rules: space-isolation)
 - **acl** — bot rows drop the `creator_uid` restriction relative to `listMembers`.
   This is **not** a net widening: the same set is already returned by
@@ -244,6 +296,12 @@ has no reproducible backend source today. The new endpoint must nonetheless
   decision.
 - **`avatar`.** Not returned by either endpoint today; clients derive it from uid.
   Adding it is a distinct contract change.
+- **Repairing `spaceBots`' broken `pending` derivation** (nonexistent `friend_apply`
+  table + reversed direction, detailed under the wire contract). It changes what
+  legitimate callers see, so it fits neither this additive task nor
+  `robot-space-bots-space-isolation`, whose acceptance pins a byte-identical payload
+  for permitted callers. It needs its own brief once someone decides whether clients
+  are relying on `pending` never appearing.
 - **`my_bots` / `group/my`.** The contacts page's 「已添加AI」and 「我的群聊」
   accordions are friend-dimension and group-dimension respectively, not directory
   rows. Unchanged.
@@ -261,9 +319,13 @@ has no reproducible backend source today. The new endpoint must nonetheless
   defaults and the `limit` cap, the `200` schema (including `bot` present iff
   `kind == "bot"`), and the 400/403 error envelope.
 - New tests in `pkg/space/` cover the middleware change:
-  - a route with a `:space_id` **path** param now resolves and enforces membership;
-  - `?space_id=` and `X-Space-ID` resolution are unchanged, and query still wins over
-    path when both are present;
+  - a route with a `:space_id` **path** param now resolves and enforces membership
+    (member passes with the path Space in context; non-member is refused);
+  - **path wins over query and header**: a request whose path names a forbidden Space
+    while `?space_id=` and `X-Space-ID` name an allowed one is refused, and the
+    checker is invoked with the path value;
+  - `?space_id=` and `X-Space-ID` resolution are unchanged for routes without a path
+    param, and query still wins over header;
   - a request carrying no space id in any of the three positions still falls through
     via `c.Next()` (the existing opt-in passthrough) rather than being rejected.
 - New tests in `modules/space/` cover:
@@ -288,8 +350,15 @@ has no reproducible backend source today. The new endpoint must nonetheless
   8. **`relation` is viewer-scoped:** the same bot reads `added` for a viewer with a
      `friend` row, `pending` for a viewer with only a `friend_apply` row, and
      `not_added` for a third viewer.
-  9. **Param handling:** `page<=0` → 1, `limit<=0` → 50, `limit>500` → 500,
+  9. **Param handling:** `page<=0` → 1, `limit<=0` → 50, `limit>10000` → 10000,
      unknown `type` → business error via `httperr.ResponseErrorL`.
+  11. **Row is lean:** a bot row's `bot` object carries `relation` and nothing else —
+      assert `description` / `creator_uid` / `creator_name` / `bot_commands` /
+      `auto_approve` are absent from the serialized JSON, so the lean contract cannot
+      be widened by accident.
+  12. **`type=human` issues no friend lookup.** Asserted at the DB-call level (or via
+      a fixture where a stale `friend` row would produce a visible difference if the
+      query ran), so the skip is pinned rather than incidental.
   10. **Name fallback is inherited:** a member with empty `user.name` but a
       `user_verification.real_name` returns `real_name`; both empty returns the
       stable placeholder, never `""`, never `short_no`/`username`.

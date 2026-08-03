@@ -1,0 +1,191 @@
+openapi: 3.0.3
+info:
+  title: "Octo Space Directory API"
+  description: >
+    Space 通讯录目录。一次调用回答「全部 / 只看真人 / 只看 AI」中的一个，
+    取代客户端「拉 space/{space_id}/members + 拉 robot/space_bots 再本地合并
+    去重计数」的做法。
+
+    独立于 modules/space/swagger/api.yaml：那份文档是 Swagger 2.0，同一文档不能
+    混用 OpenAPI 3.x 的路径定义。
+  version: "1.0.0"
+
+servers:
+  - url: https://api.botgate.cn/v1
+    description: 生产环境
+
+tags:
+  - name: space
+    description: 团队空间
+
+paths:
+  /space/{space_id}/directory:
+    get:
+      tags:
+        - space
+      summary: "空间通讯录目录（空间成员）"
+      description: >
+        返回该 Space 的通讯录目录，一行对应一条在册成员（space_member.status=1）。
+
+        **可见范围**：调用者必须是该 Space 的成员，否则拒绝且不返回任何行。
+        bot 行不按创建者过滤——可见范围仅由 Space 成员身份决定。
+
+        **kind 判定**：`user.robot=1` 且 robot 表存在 `status=1` 的行 → `bot`；
+        `user.robot=0` → `human`。「是 bot 账号但已停用」的行整行排除，既不出现在
+        `bot` 里，也不会退化成 `human`。内置账号 `botfather` 始终排除。
+
+        **排序**：`role DESC, created_at ASC, uid ASC`。末位的 uid 是唯一键，
+        保证 LIMIT/OFFSET 翻页稳定，不漏行不重复。
+
+        **返回自己**：调用者本人也是目录的一行，是否隐藏由客户端决定。
+      operationId: listSpaceDirectory
+      parameters:
+        - name: space_id
+          in: path
+          required: true
+          description: 空间 ID
+          schema:
+            type: string
+        - name: type
+          in: query
+          required: false
+          description: >
+            目录切片。`all` 全部，`human` 只看真人，`bot` 只看 AI。
+            取值非法直接报错，不静默回落到 `all`。
+          schema:
+            type: string
+            enum: [all, human, bot]
+            default: all
+        - name: page
+          in: query
+          required: false
+          description: 页码，`<=0` 归 1
+          schema:
+            type: integer
+            format: int64
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          description: >
+            页大小，`<=0` 归 50，超过 10000 截断为 10000。上限刻意留高，
+            便于通讯录一次性拉全一个 Space 建本地索引；响应始终带 `total`，
+            需要翻页的调用方随时可以翻。
+          schema:
+            type: integer
+            format: int64
+            default: 50
+            maximum: 10000
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectoryResp"
+        "400":
+          description: >
+            业务错误，统一走 i18n 错误信封（HTTP 状态固定 400，真实状态在
+            `error.http_status`）。覆盖：`type` 取值非法；调用者不是该 Space
+            成员；服务端查询失败。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+components:
+  schemas:
+    DirectoryResp:
+      type: object
+      required: [total, page, limit, items]
+      properties:
+        total:
+          type: integer
+          description: 当前 `type` 过滤后、分页前的总行数。客户端据此渲染 tab 计数。
+          example: 6100
+        page:
+          type: integer
+          description: 生效的页码（已归一）
+          example: 1
+        limit:
+          type: integer
+          description: 生效的页大小（已归一/截断）
+          example: 50
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DirectoryItem"
+
+    DirectoryItem:
+      type: object
+      required: [uid, name, kind, role, created_at]
+      properties:
+        uid:
+          type: string
+          example: "u_1a2b3c"
+        name:
+          type: string
+          description: >
+            展示名，按 issue #344 的兜底链解析：`user.name` →
+            `user_verification.real_name` → 稳定占位符 `User <uid>`。
+            任何分支都不会返回空串，也不会暴露 short_no / username。
+          example: "Alice"
+        kind:
+          type: string
+          enum: [human, bot]
+        role:
+          type: integer
+          description: 空间角色 0.普通成员 1.管理员 2.拥有者（bot 行同样有）
+          example: 0
+        created_at:
+          type: string
+          description: 入空间时间
+          example: "2026-01-02 03:04:05"
+        bot:
+          allOf:
+            - $ref: "#/components/schemas/DirectoryBot"
+          description: 仅当 `kind == "bot"` 时存在；`kind == "human"` 时该字段不出现。
+
+    DirectoryBot:
+      type: object
+      required: [relation]
+      description: >
+        目录行的 bot 附加信息，刻意只带 relation。
+
+        `/v1/robot/space_bots` 还会返回 description / creator_uid / creator_name /
+        bot_commands / auto_approve，本接口一个都不给：目录行只渲染头像（由 uid
+        推导）、名字、在线态和 AI 的已添加状态。bot_commands 是 bot 的完整命令
+        列表，按线上最大 Space 的约 4400 个 bot 估算，胖行会把一次性响应推到 MB
+        级。bot 详情自有接口，列表不兼任详情投影。
+      properties:
+        relation:
+          type: string
+          enum: [added, pending, not_added]
+          description: >
+            该 bot 与**当前调用者**的好友关系态。口径与 `/v1/robot/space_bots`
+            的 `status` 一致：friend 命中 → added，否则 friend_apply 命中 →
+            pending，都没有 → not_added。这是本响应中唯一因人而异的字段。
+
+    ErrorEnvelope:
+      type: object
+      description: 仓库统一的 i18n 错误信封（pkg/httperr + pkg/errcode）。
+      properties:
+        error:
+          type: object
+          properties:
+            id:
+              type: string
+              description: 错误码 ID
+              example: "err.server.space.not_member"
+            message:
+              type: string
+              description: 已按请求语言本地化的消息
+              example: "You are not a member of this space."
+            http_status:
+              type: integer
+              description: 该错误码的真实 HTTP 状态（线上状态码固定 400 时用它区分）
+              example: 403
+            details:
+              type: object
+              description: 结构化补充字段，按错误码的 SafeDetailKeys 白名单过滤
+              additionalProperties: true
