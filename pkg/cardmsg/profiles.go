@@ -6,8 +6,9 @@ package cardmsg
 // not need to retain every artifact version.
 const RenderProfileOctoChatV1 = "octo-chat/v1"
 
-// IsAcceptedRenderProfile validates an explicit runtime visual profile. An
-// empty value means the permanent legacy renderer and is intentionally valid.
+// IsAcceptedRenderProfile validates a candidate runtime visual profile. An
+// empty value means the owning authoring boundary has not selected its default
+// yet and is intentionally valid here; a present wire value must be non-empty.
 func IsAcceptedRenderProfile(value string) bool {
 	return value == "" || value == RenderProfileOctoChatV1
 }

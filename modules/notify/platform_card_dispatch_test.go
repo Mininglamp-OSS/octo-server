@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -33,16 +34,29 @@ func (platformDispatchAuthorizer) Authorize(
 }
 
 type platformDispatchTransport struct {
-	calls int
-	req   *config.MsgSendReq
+	mu   sync.Mutex
+	reqs []*config.MsgSendReq
 }
 
 func (t *platformDispatchTransport) SendMessageWithResult(req *config.MsgSendReq) (*config.MsgSendResp, error) {
-	t.calls++
 	copyReq := *req
 	copyReq.Payload = append([]byte(nil), req.Payload...)
-	t.req = &copyReq
+	t.mu.Lock()
+	t.reqs = append(t.reqs, &copyReq)
+	t.mu.Unlock()
 	return &config.MsgSendResp{MessageID: 101, MessageSeq: 7, ClientMsgNo: "platform-card-101"}, nil
+}
+
+func (t *platformDispatchTransport) snapshot() []*config.MsgSendReq {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	requests := make([]*config.MsgSendReq, 0, len(t.reqs))
+	for _, req := range t.reqs {
+		copyReq := *req
+		copyReq.Payload = append([]byte(nil), req.Payload...)
+		requests = append(requests, &copyReq)
+	}
+	return requests
 }
 
 func newPlatformDispatchSender(
@@ -76,14 +90,21 @@ func requirePlatformTransportPayload(
 	t *testing.T, transport *platformDispatchTransport, wantProfile string,
 ) map[string]interface{} {
 	t.Helper()
-	require.Equal(t, 1, transport.calls)
-	require.NotNil(t, transport.req)
-	assert.Equal(t, NotifyBotUIDValue, transport.req.FromUID)
-	assert.Equal(t, "user-1", transport.req.ChannelID)
-	assert.Equal(t, common.ChannelTypePerson.Uint8(), transport.req.ChannelType)
+	requests := transport.snapshot()
+	require.Len(t, requests, 1)
+	assert.Equal(t, "user-1", requests[0].ChannelID)
+	return requirePlatformRequestPayload(t, requests[0], wantProfile)
+}
 
+func requirePlatformRequestPayload(
+	t *testing.T, req *config.MsgSendReq, wantProfile string,
+) map[string]interface{} {
+	t.Helper()
+	require.NotNil(t, req)
+	assert.Equal(t, NotifyBotUIDValue, req.FromUID)
+	assert.Equal(t, common.ChannelTypePerson.Uint8(), req.ChannelType)
 	var payload map[string]interface{}
-	require.NoError(t, json.Unmarshal(transport.req.Payload, &payload))
+	require.NoError(t, json.Unmarshal(req.Payload, &payload))
 	assert.Equal(t, float64(cardmsg.InteractiveCard.Int()), payload["type"])
 	assert.Equal(t, wantProfile, payload["profile"])
 	assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
@@ -180,14 +201,14 @@ func TestLegacyDocsNotificationsReachTransportWithRenderProfile(t *testing.T) {
 			})
 			require.NoError(t, err)
 			assert.ElementsMatch(t, []string{"user-1", "user-2"}, response.Delivered)
-			require.Equal(t, 2, transport.calls)
-			require.NotNil(t, transport.req)
-
-			var payload map[string]interface{}
-			require.NoError(t, json.Unmarshal(transport.req.Payload, &payload))
-			assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
-			assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
-			assert.NotContains(t, payload, "card_profile")
+			requests := transport.snapshot()
+			require.Len(t, requests, 2)
+			channels := make([]string, 0, len(requests))
+			for _, req := range requests {
+				channels = append(channels, req.ChannelID)
+				requirePlatformRequestPayload(t, req, cardmsg.ProfileV1)
+			}
+			assert.ElementsMatch(t, []string{"user-1", "user-2"}, channels)
 		})
 	}
 }
