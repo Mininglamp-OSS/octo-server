@@ -2,9 +2,12 @@ package sink
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestMemoryStoreWriteAndReadBack(t *testing.T) {
@@ -134,6 +137,56 @@ func TestFunnelMaterializationCountsClickAndCompletionSeparately(t *testing.T) {
 	}
 }
 
+func TestPostgresMaterializeFunnelUpsertsResult(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("new sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC)
+	rows := sqlmock.NewRows([]string{
+		"event_id", "dedupe_key", "event_name", "event_time", "received_at", "source", "quality",
+		"actor_type", "actor_id", "auth_kind", "space_id", "identity_quality", "identity_error",
+		"request_method", "request_path_template", "request_status", "request_latency_ms",
+		"request_trace_id", "request_id", "request_error_class", "object_json", "flow_id",
+		"client_event_id", "related_event_id", "mapping_rule_id", "schema_version",
+	}).
+		AddRow("evt-click", "dedupe-click", "smart_summary_creation_started", now, now, string(SourceFrontendTracker), string(QualityUIAction),
+			nil, nil, nil, nil, nil, nil,
+			nil, nil, nil, nil,
+			nil, nil, nil, []byte(`{"summary_id":"sum_1"}`), "flow-1",
+			nil, nil, nil, "dap-event-v1").
+		AddRow("evt-completion", "dedupe-completion", "smart_summary_completed", now.Add(time.Minute), now.Add(time.Minute), string(SourceDomainEmit), string(QualityExact),
+			nil, nil, nil, nil, nil, nil,
+			nil, nil, nil, nil,
+			nil, nil, nil, []byte(`{"summary_id":"sum_1"}`), "flow-1",
+			nil, nil, nil, "dap-event-v1")
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT event_id, dedupe_key, event_name, event_time, received_at, source, quality,")).
+		WithArgs(dayUTC(now), dayUTC(now).AddDate(0, 0, 1)).
+		WillReturnRows(rows)
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO dap_events_funnel_daily")).
+		WithArgs(dayUTC(now), "smart_summary", "smart_summary_creation_started", "smart_summary_completed", int64(1), int64(1), int64(1), int64(0)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	result, err := NewPostgresStore(db).MaterializeFunnel(context.Background(), FunnelSpec{
+		Date:            now,
+		Family:          "smart_summary",
+		ClickEvent:      "smart_summary_creation_started",
+		CompletionEvent: "smart_summary_completed",
+	})
+	if err != nil {
+		t.Fatalf("materialize funnel: %v", err)
+	}
+	if result.ConvertedFlowIDs != 1 {
+		t.Fatalf("unexpected funnel result: %+v", result)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestPostgresDDLDoesNotDefineRestrictedColumns(t *testing.T) {
 	lower := strings.ToLower(PostgresDDL)
 	restricted := []string{
@@ -157,6 +210,25 @@ func TestRejectsRestrictedFieldMaterial(t *testing.T) {
 	}
 	if _, err := NewMemoryStore().Write(context.Background(), event); err == nil {
 		t.Fatalf("expected restricted material to be rejected")
+	}
+}
+
+func TestAllowsLegitimateContentPathTemplate(t *testing.T) {
+	event := baseEvent(time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC))
+	event.EventID = "evt-content-path"
+	event.DedupeKey = "dedupe-content-path"
+	event.Source = SourceAccessLog
+	event.Quality = QualityShadow
+	event.Request = Request{
+		Method:       "GET",
+		PathTemplate: "/v1/documents/{id}/content",
+		Status:       200,
+	}
+	event.Object = map[string]string{
+		"document_id": "doc_1",
+	}
+	if _, err := NewMemoryStore().Write(context.Background(), event); err != nil {
+		t.Fatalf("content path should be accepted: %v", err)
 	}
 }
 

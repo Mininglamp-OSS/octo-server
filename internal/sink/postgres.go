@@ -197,7 +197,35 @@ func (s *PostgresStore) MaterializeFunnel(ctx context.Context, spec FunnelSpec) 
 	for _, event := range events {
 		memory.events = append(memory.events, event)
 	}
-	return memory.MaterializeFunnel(ctx, spec)
+	result, err := memory.MaterializeFunnel(ctx, spec)
+	if err != nil {
+		return FunnelResult{}, err
+	}
+	if err := s.upsertFunnelResult(ctx, result); err != nil {
+		return FunnelResult{}, err
+	}
+	return result, nil
+}
+
+func (s *PostgresStore) upsertFunnelResult(ctx context.Context, result FunnelResult) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO dap_events_funnel_daily (
+  event_date, event_family, click_event_name, completion_event_name,
+  click_count, completion_count, converted_flow_count, completion_only_flow_count, updated_at
+) VALUES (
+  $1, $2, $3, $4,
+  $5, $6, $7, $8, now()
+)
+ON CONFLICT (event_date, event_family, click_event_name, completion_event_name)
+DO UPDATE SET
+  click_count = EXCLUDED.click_count,
+  completion_count = EXCLUDED.completion_count,
+  converted_flow_count = EXCLUDED.converted_flow_count,
+  completion_only_flow_count = EXCLUDED.completion_only_flow_count,
+  updated_at = now()`,
+		result.Date, result.Family, result.ClickEvent, result.CompletionEvent,
+		result.ClickCount, result.CompletionCount, result.ConvertedFlowIDs, result.CompletionOnlyIDs)
+	return err
 }
 
 type eventScanner interface {

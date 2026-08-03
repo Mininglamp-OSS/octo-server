@@ -2,7 +2,6 @@ package sink
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -200,27 +199,64 @@ func dayUTC(t time.Time) time.Time {
 }
 
 func containsRestrictedSignal(event Event) bool {
-	raw, err := json.Marshal(event)
-	if err != nil {
-		return true
-	}
-	normalized := strings.ToLower(string(raw))
-	restricted := []string{
-		"to" + "ken",
-		"author" + "ization",
-		"coo" + "kie",
-		"api" + "_key",
-		"bot" + "_token",
-		"secret",
-		"bearer ",
-		"eyj",
-		"body",
-		"content",
-	}
-	for _, marker := range restricted {
-		if strings.Contains(normalized, marker) {
+	for key, value := range event.Object {
+		if restrictedObjectKey(key) || restrictedObjectValue(value) {
 			return true
 		}
 	}
 	return false
+}
+
+func restrictedObjectKey(key string) bool {
+	normalized := strings.ToLower(key)
+	compact := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(normalized)
+	restrictedParts := []string{
+		"access_" + "token",
+		"refresh_" + "token",
+		"id_" + "token",
+		"bot_" + "token",
+		"api_" + "key",
+	}
+	for _, part := range restrictedParts {
+		if strings.Contains(compact, part) {
+			return true
+		}
+	}
+	for _, token := range strings.FieldsFunc(compact, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) {
+		switch token {
+		case "token", "authorization", "cookie", "secret":
+			return true
+		}
+	}
+	return false
+}
+
+func restrictedObjectValue(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "bearer ") {
+		return true
+	}
+	valueSignals := []string{
+		"author" + "ization:",
+		"coo" + "kie:",
+		"api" + "_key=",
+		"access_" + "token=",
+		"refresh_" + "token=",
+	}
+	for _, signal := range valueSignals {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return looksLikeJWT(trimmed)
+}
+
+func looksLikeJWT(value string) bool {
+	if !strings.HasPrefix(value, "eyJ") {
+		return false
+	}
+	return strings.Count(value, ".") >= 2
 }
