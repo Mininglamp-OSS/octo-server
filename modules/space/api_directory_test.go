@@ -144,9 +144,15 @@ func TestDirectory_NonMemberRefused(t *testing.T) {
 	seedDirectoryBot(t, spaceID, "bot_a", "Bot A", "someone_else", 1)
 
 	w := getDirectory(t, srv, testCtx, spaceID, directoryQuery("", 0, 0))
-	resp := decodeDirectory(t, w)
-	assert.Empty(t, resp.Items, "非成员不得拿到任何目录行: %s", w.Body.String())
-	assert.Zero(t, resp.Total)
+
+	// 断言必须能证伪。把错误体反序列化进 directoryRespForTest 后再断言
+	// Items 为空、Total 为 0，在**任何**非 200 响应下都恒成立，等于没断言——
+	// 所以这里直接钉状态码，并断言响应体里不出现任何 fixture 的 uid：
+	// 修复被回滚（拿掉 SpaceMiddleware）时会返回 200 + 完整名册，两条都会失败。
+	assert.Equal(t, http.StatusForbidden, w.Code, "非成员必须被拒: %s", w.Body.String())
+	for _, leaked := range []string{"member_a", "bot_a", "Member A", "Bot A"} {
+		assert.NotContains(t, w.Body.String(), leaked, "响应体不得泄露成员/bot 信息")
+	}
 }
 
 // TestDirectory_BotVisibilityIsCreatorIndependent 钉住本接口与 listMembers 的
@@ -460,10 +466,15 @@ func TestDirectory_RelationIsViewerScoped(t *testing.T) {
 	assert.Empty(t, relations[botUID], "已拒绝的申请不应算作 pending")
 }
 
-// TestDirectory_HumanTypeSkipsRelationLookup type=human 恒无 bot 行，
-// 关系态查询整段跳过。这里从两侧钉住：handler 侧 human 行不带 bot 字段；
-// DB 侧空 uid 列表直接短路返回，不打库。
-func TestDirectory_HumanTypeSkipsRelationLookup(t *testing.T) {
+// TestDirectory_HumanSliceCarriesNoBotPayload type=human 的行不带 bot 字段，
+// 且关系态查询在 uid 列表为空时直接短路。
+//
+// 诚实地说明本用例**没有**覆盖什么：它证明不了 handler 真的跳过了
+// queryBotRelations。fixture 里的 friend 行指向一个本就不在 human 切片里的 bot，
+// 所以即便关系态查询照跑，输出也一模一样。要真正钉住「跳过」需要在 DB 调用层
+// 打桩计数，本包目前没有这个能力。brief 验收里那条「asserted at the DB-call
+// level」因此仍未满足——记在这里，而不是让用例名字替它撒谎。
+func TestDirectory_HumanSliceCarriesNoBotPayload(t *testing.T) {
 	srv, _, err := setup(t)
 	assert.NoError(t, err)
 

@@ -23,8 +23,9 @@ import (
 //
 // ---- 实测结论（MySQL 8.0.46，10×6000 数据集，2026-08）------------------------
 //
-//	count(all/human/bot)      29 / 20 / 35 ms
-//	queryDirectory limit=50   42 ms      ← 与全量几乎同价，原因见下
+//	count(all/human/bot)      22 / 4.5 / 24 ms   （human 受益于 is_bot 单表谓词）
+//	queryDirectory limit=50   42 ms（type=all）  ← 与全量几乎同价，原因见下
+//	human  limit=50           8 ms               ← 单表谓词 + 索引，LIMIT 真下推
 //	queryDirectory limit=6000 55 ms
 //	relation 4300 个 bot      23 ms
 //	HTTP 端到端 limit=50      64 ms   / 6 KB
@@ -38,12 +39,19 @@ import (
 //     才能排序取前 50。这是「一行的身份要靠三张表才能判定」的固有代价，不是索引
 //     能解决的问题。
 //
-//  2. **补排序索引无效，已验证后撤回。** 曾加过
-//     `(space_id, status, role DESC, created_at, uid)`：索引确实被选中、
-//     using_filesort 变 false，但四项耗时全部落在噪声内（limit=50 从 31ms 到 34ms）。
-//     原因是排序只占总耗时约 2ms（41.3ms 的 Sort 减去 39.6ms 的 Stream results），
-//     真正的开销是 6001 次 u 与 r 的 nested-loop 单行查找（各约 12ms）。
-//     为 2ms 给一张写频表加 5 列索引不划算，故不引入。
+//  2. **单独补排序索引无效；与 is_bot 一起才有效。** 先加过
+//     `(space_id, status, role DESC, created_at, uid)`：索引被选中、using_filesort
+//     变 false，但四项耗时全部落在噪声内（limit=50 从 31ms 到 34ms）——排序只占
+//     总耗时约 2ms，真正的开销是逐行 nested-loop 单行查找。于是撤回。
+//     随后把判定挪到 space_member 自己的列（is_bot）上，谓词变成单表，索引才
+//     真正发挥作用，索引也随之以
+//     `(space_id, status, is_bot, role DESC, created_at, uid)` 的形式重新引入
+//     （见 sql/20260803000001_space_member_is_bot.sql）。
+//
+//     **收益只对 human 切片成立**：`is_bot = 0` 是等值条件，能同时满足过滤与排序；
+//     而 type=all 的谓词是 `is_bot = 0 OR r.robot_id IS NOT NULL`，OR 的右半支引用
+//     join 出来的表，索引在第三列断开、robot 的逐行探测一次也省不掉。让 all/bot
+//     也受益需要把可变的启用态一并冗余，那是 space-member-bot-active 的范围。
 //
 //     注意当时差点被自己的 EXPLAIN 助手骗过去：它写的是 `SELECT sm.uid`，
 //     窄投影能被索引覆盖，于是报告「命中新索引、无 filesort」，而线上查询取

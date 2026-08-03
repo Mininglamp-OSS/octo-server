@@ -851,7 +851,10 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 	}
 	if targetSpaceID != "" {
 		_, err = h.ctx.DB().InsertBySql(
-			"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+			// is_bot 恒为 1：本路径插入的只可能是刚建出来的 bot。写字面量而不是像
+			// modules/space 那样从 user 表派生，是因为此处 user 行的写入顺序不保证先于
+			// 本语句，派生会静默取到 0，把 bot 错分成真人（见 space_member.is_bot 的迁移说明）。
+			"INSERT IGNORE INTO space_member (space_id, uid, role, status, is_bot, created_at, updated_at) VALUES (?, ?, 0, 1, 1, NOW(), NOW())",
 			targetSpaceID, robotID,
 		).Exec()
 		if err != nil {

@@ -49,8 +49,8 @@ func TestHandleCommand_ValidCommands(t *testing.T) {
 		"/mybots",
 		"/cancel",
 		"/help extra args",
-		"/HELP",           // uppercase
-		"/help   spaces",  // extra spaces
+		"/HELP",          // uppercase
+		"/help   spaces", // extra spaces
 	}
 
 	for _, cmd := range validCmds {

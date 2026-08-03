@@ -20,6 +20,9 @@ const (
 	// 请求变成十几个，且 OFFSET 会一路推到六千行——纯属自伤。响应始终带 total，
 	// 想翻页的调用方随时可以翻。
 	directoryMaxLimit = 10000
+	// directoryMaxPage 是 page 的上界。10000 页 × 10000 上限 = 1 亿行，
+	// 远超任何真实空间，同时把 (page-1)*limit 牢牢压在 uint64 回绕点以下。
+	directoryMaxPage = 10000
 )
 
 // listDirectory 返回 Space 通讯录目录：全部 / 只看真人 / 只看 AI。
@@ -58,6 +61,13 @@ func (s *Space) listDirectory(c *wkhttp.Context) {
 	page, _ := strconv.ParseUint(c.Query("page"), 10, 64)
 	if page <= 0 {
 		page = 1
+	}
+	// 给 page 封顶：OFFSET 由 (page-1)*limit 算出，两者都是 uint64，
+	// 传个接近 2^64/limit 的 page 会让乘积回绕，返回的其实是靠前的某一页，
+	// 而响应里的 page 还回显着那个天文数字。不是越权（那些行本就可见），
+	// 但翻页契约会被破坏。上界取到任何真实空间都够不着的量级。
+	if page > directoryMaxPage {
+		page = directoryMaxPage
 	}
 	limit, _ := strconv.ParseUint(c.Query("limit"), 10, 64)
 	if limit <= 0 {

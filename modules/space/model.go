@@ -249,8 +249,12 @@ type directoryRowModel struct {
 }
 
 // isBot 判定该行是否应以 bot 身份呈现：既是 bot 账号，又处于启用状态。
-// 查询侧已排除「是 bot 账号但未启用」的行，这里的双条件是冗余防御——若将来
-// WHERE 被改动，分类逻辑不会跟着悄悄把停用 bot 归到 human。
+//
+// 注意这里**不构成**对停用 bot 的防御：若有停用 bot 漏进结果集，本函数返回
+// false，它会被呈现为 human——恰恰是我们想避免的结果。挡住停用 bot 的唯一
+// 一道是 directoryWhereClause（db_directory.go），type=human 更是直接把
+// active_bot 投影成字面量 0，连判定的机会都没有。
+// 双条件在这里的作用仅是与 WHERE 保持同一口径，不是安全网。
 func (m *directoryRowModel) isBot() bool {
 	return m.IsBot == 1 && m.ActiveBot == 1
 }
