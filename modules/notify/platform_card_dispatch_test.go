@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
+	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,7 +65,7 @@ func newPlatformDispatchSender(
 		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
 		GroupPolicy:         carddispatch.GroupPolicyMemberRequired,
 		ActionEventOwner:    actionOwner,
-		MaxInFlight:         1,
+		MaxInFlight:         20,
 	}})
 	sender, err := registry.Sender(producerID)
 	require.NoError(t, err)
@@ -97,30 +98,98 @@ func platformDispatchTarget() carddispatch.Target {
 	}
 }
 
-func TestSummaryCompletedRegistryCardReachesTransportWithRenderProfile(t *testing.T) {
+func TestSummaryRegistryCardsReachTransportWithRenderProfile(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	n := newTestNotify(ctx, nil, nil, nil, "token")
 
-	document, renderProfile, err := n.buildSummaryCardViaRegistry(
-		context.Background(), "space-1", validCard(), "zh-CN",
-		summarycompleted.TemplateID, summarycompleted.StateShown,
-	)
-	require.NoError(t, err)
-	require.Equal(t, cardmsg.RenderProfileOctoChatV1, renderProfile)
+	for _, tc := range []struct {
+		name        string
+		card        *SummaryCardFields
+		templateID  cardtmpl.ID
+		state       cardtmpl.State
+		wantVariant string
+	}{
+		{
+			name: "completed", card: validCard(), templateID: summarycompleted.TemplateID,
+			state: summarycompleted.StateShown, wantVariant: summarycompleted.Variant,
+		},
+		{
+			name: "failed",
+			card: &SummaryCardFields{
+				TaskNo: "TN_abcd", Kind: SummaryCardKindFailed, Title: "产品周会纪要",
+				Reason: "upstream timeout", GeneratedAt: "2026-07-13 15:04",
+			},
+			templateID: summaryfailed.TemplateID, state: summaryfailed.StateShown,
+			wantVariant: summaryfailed.Variant,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			document, renderProfile, err := n.buildSummaryCardViaRegistry(
+				context.Background(), "space-1", tc.card, "zh-CN", tc.templateID, tc.state,
+			)
+			require.NoError(t, err)
+			require.Equal(t, cardmsg.RenderProfileOctoChatV1, renderProfile)
 
-	sender, transport := newPlatformDispatchSender(t, cardmsg.ProfileV1, "")
-	_, err = sender.Send(context.Background(), platformDispatchTarget(), carddispatch.Card{
-		Profile: cardmsg.ProfileV1, RenderProfile: renderProfile, Document: document,
-	})
-	require.NoError(t, err)
-	payload := requirePlatformTransportPayload(t, transport, cardmsg.ProfileV1)
-	card := payload["card"].(map[string]interface{})
-	metadata := card["metadata"].(map[string]interface{})
-	octo := metadata["octo"].(map[string]interface{})
-	assert.Equal(t, "summary.completed", octo["variant"])
+			sender, transport := newPlatformDispatchSender(t, cardmsg.ProfileV1, "")
+			_, err = sender.Send(context.Background(), platformDispatchTarget(), carddispatch.Card{
+				Profile: cardmsg.ProfileV1, RenderProfile: renderProfile, Document: document,
+			})
+			require.NoError(t, err)
+			payload := requirePlatformTransportPayload(t, transport, cardmsg.ProfileV1)
+			card := payload["card"].(map[string]interface{})
+			metadata := card["metadata"].(map[string]interface{})
+			octo := metadata["octo"].(map[string]interface{})
+			assert.Equal(t, tc.wantVariant, octo["variant"])
+		})
+	}
+}
+
+func TestLegacyDocsNotificationsReachTransportWithRenderProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+	}{
+		{name: "approval gate off request", kind: DocsCardKindAccessRequested},
+		{name: "access granted", kind: DocsCardKindAccessGranted},
+		{name: "access denied", kind: DocsCardKindAccessDenied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "true")
+			t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "false")
+			wk := newWuKongServer()
+			defer wk.close()
+			ctx := newTestContext(t, wk)
+			ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+			n := newTestNotify(ctx, nil, nil, nil, "token")
+			n.botOK.Store(true)
+			primeMemberCache(n, "space-1", "user-1", "user-2")
+			sender, transport := newPlatformDispatchSender(t, cardmsg.ProfileV1, "")
+			n.docsSender = sender
+
+			card := validDocsCard()
+			card.Kind = tc.kind
+			if tc.kind == DocsCardKindAccessRequested {
+				card.RequestID = "request-1"
+			}
+			response, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+				SpaceID: "space-1", Service: "docs", Targets: []string{"user-1", "user-2"},
+				ActorUID: "actor-1", DocsCard: card,
+			})
+			require.NoError(t, err)
+			assert.ElementsMatch(t, []string{"user-1", "user-2"}, response.Delivered)
+			require.Equal(t, 2, transport.calls)
+			require.NotNil(t, transport.req)
+
+			var payload map[string]interface{}
+			require.NoError(t, json.Unmarshal(transport.req.Payload, &payload))
+			assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
+			assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
+			assert.NotContains(t, payload, "card_profile")
+		})
+	}
 }
 
 func TestDocsApplicantOutcomesReachTransportWithRenderProfile(t *testing.T) {
