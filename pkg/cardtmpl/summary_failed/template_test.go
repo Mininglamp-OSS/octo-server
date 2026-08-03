@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 )
@@ -59,6 +60,9 @@ func TestRegisterAndRenderSample(t *testing.T) {
 	}
 	if payload["profile"] != "octo/v1" {
 		t.Errorf("wire profile = %v want octo/v1", payload["profile"])
+	}
+	if payload["render_profile"] != cardmsg.RenderProfileOctoChatV1 {
+		t.Errorf("render profile = %v want %s", payload["render_profile"], cardmsg.RenderProfileOctoChatV1)
 	}
 }
 
