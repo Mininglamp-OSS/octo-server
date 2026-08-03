@@ -437,7 +437,16 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 
 	// 2e. Pinned channels
+	//
+	// 查询失败的降级方向按 tab 不同，这是有意区分、不是遗漏：
+	//   - recent tab 会因此整体跳过时间窗口（见下方 case "recent"）—— 空置顶集合
+	//     会让「置顶永不被窗口隐藏」失效，宁可这一批不过滤；
+	//   - follow tab 只丢 `is_pinned` 与置顶排序档位，条目本身照常返回。置顶是
+	//     **呈现**，不是关注**成员关系**；fail-closed 只留给 failClosedForFollow
+	//     列举的那五个查询，它们失败会让关注列表本身失真（PR #679 review,
+	//     yujiawei）。该行为与本 PR 之前完全一致。
 	pinnedSet, err := sb.loadPinnedSet(loginUID, spaceID)
+	pinnedLoadFailed := err != nil
 	if err != nil {
 		sb.Warn("sidebar sync: pinned query failed (non-fatal)", zap.Error(err))
 		pinnedSet = map[string]struct{}{}
@@ -574,6 +583,13 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 	case "recent":
 		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
+		if pinnedLoadFailed {
+			// FAIL-OPEN：置顶集合不可信时整体不套用活跃窗口，而不是拿空豁免集合
+			// 继续过滤（否则一次 DB 抖动就会抹掉用户置顶的安静会话）。与
+			// /v1/conversation/sync 的同款降级保持一致（PR #679 review, yujiawei）。
+			cutoffs = recentCutoffs{}
+			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
+		}
 		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
@@ -584,6 +600,35 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		} else {
 			backfillThreadStatus(items, statusMap)
 		}
+
+		// 归档子区收口 —— **仅 recent tab**（task inactive-hiding-user-control / P0）。
+		//
+		// 收敛到 /v1/conversation/sync 早已在跑的 status=active 语义：安静到被归档的
+		// 子区不再占据「最近」列表。
+		//
+		// **为什么不对 follow tab 做同样的过滤**（PR #679 review, yujiawei）：
+		// follow tab 的响应不只是「要显示什么」，它是客户端唯一的**关注状态真源** ——
+		// 每个条目带 is_followed=true，三端都只从这里构建 followedKeys：
+		//   - Web  ThreadPanel 用 threadList(status:"all") 列出含归档的子区，再从
+		//          tab=follow 推导 is_followed，handleFollow 据此在 follow/unfollow
+		//          之间分支；
+		//   - iOS  WKFollowedKeysStore / Android FollowedKeysStore 同理。
+		// 一旦把 archived 从 follow tab 拿掉，已关注的归档子区 is_followed 变 false，
+		// 「取消关注」按钮反转成「关注」—— 取消关注变得不可能。而这恰好发生在
+		// 「已归档」浏览界面上，也就是本任务指认为 P0 安全垫的那个入口。
+		//
+		// 产品目标（归档子区不出现在会话列表）在 follow tab 上**已由三端自行满足**：
+		// Web 与 IM 缓存取交集且 channelInfo 优先做归档过滤，iOS 按 thread REST
+		// status 排除非 active，Android 构建关注列表时直接跳过 thread 条目。服务端
+		// 再过滤一遍不增加收益，只会摧毁关注状态。
+		//
+		// FAIL-OPEN：只丢 Status 明确等于 archived 的条目。status 查询失败时上面把
+		// Status 留空（0），这里据此保留 —— 与 /v1/conversation/sync 查询失败即跳过
+		// 过滤的方向一致。宁可短暂多显示，绝不因为一次查询抖动把子区藏起来。
+		//
+		// 归档非终态：任何人发消息经 RecordMessageAndReactivate 抬回 active，下一次
+		// sync 即重新出现；手动取消归档同理。
+		items = dropArchivedThreadItems(items)
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -620,15 +665,44 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 // ---------------------------------------------------------------------------
 
 func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, error) {
+	return loadPinnedChannelSet(sb.ctx, uid, spaceID)
+}
+
+// loadPinnedChannelSet is the package-level form, shared with
+// /v1/conversation/sync so the pinned exemption (P2) is resolved identically on
+// both endpoints — divergent pinned lookups would reintroduce exactly the kind
+// of per-endpoint drift this task exists to remove.
+func loadPinnedChannelSet(ctx *config.Context, uid, spaceID string) (map[string]struct{}, error) {
 	type row struct {
 		ChannelID   string `db:"channel_id"`
 		ChannelType uint8  `db:"channel_type"`
 	}
 	var rows []row
-	_, err := sb.ctx.DB().SelectBySql(
-		"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
-		uid, spaceID,
-	).Load(&rows)
+	var err error
+	if spaceID == "" {
+		// 无 Space key 的请求：响应本就跨 Space，置顶集合也取该 uid 的全部。
+		//
+		// 按 space_id='' 查会恒空 —— 写入侧（modules/user/api_pinned.go）拒绝空
+		// Space，表里不存在这样的行，于是置顶豁免在这条路径上是死代码，而
+		// keepDespiteRecentWindow 的文档把置顶描述为绝对豁免（PR #679 review,
+		// yujiawei）。取全部是与该文档一致的 fail-open 读法。
+		//
+		// 影响面（有意为之，已写进 swagger/sidebar.yaml）：本函数的结果在
+		// /v1/sidebar/sync 上有三个消费者 —— 窗口豁免、`is_pinned` 线上字段、
+		// 以及两个 tab 排序的置顶档位。此前这条路径恒返回空集，`is_pinned` 因此
+		// 恒为 false；现在会为真，置顶条目也会浮到顶部。跨 Space 的列表配跨 Space
+		// 的置顶是自洽读法，且 SQL 仍限 `uid=?`、集合只给已在响应里的频道打标，
+		// 不存在越权面（PR #679 review, yujiawei）。
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=?",
+			uid,
+		).Load(&rows)
+	} else {
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
+			uid, spaceID,
+		).Load(&rows)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("loadPinnedSet: %w", err)
 	}
@@ -801,6 +875,39 @@ func loadRecentCutoffs(ctx *config.Context, now time.Time) recentCutoffs {
 	}
 }
 
+// keepDespiteRecentWindow reports whether a conversation must survive the
+// inactivity window regardless of how stale it is (task
+// inactive-hiding-user-control / P2).
+//
+// The window is a per-viewer "this went quiet, fade it out" projection. Three
+// things must never be faded out by it:
+//
+//   - **Unread.** Hiding a conversation that still holds unread messages hides
+//     the messages with it, and the user has no way to know. Discord's
+//     equivalent per-user layer (collapsed categories) always lets unread
+//     through for exactly this reason; ours did not, which is the behaviour
+//     this closes. This is also the precondition for ever letting users pick
+//     their own window (Batch 2) — a window that can swallow unread is not
+//     safe to hand out.
+//   - **Pinned.** Pinning is an explicit statement about position ("keep this
+//     in front of me"). A time window silently overriding it inverts the user's
+//     instruction. Note this is why `pinned` is resolved BEFORE the cutoff
+//     check — the previous order filtered first and only tagged IsPinned
+//     afterwards, so a pinned-but-quiet channel was dropped before anything
+//     knew it was pinned.
+//   - **System bots.** They must stay reachable in every Space. The placeholder
+//     entries EnsureSystemBotsPresentRaw appends carry Timestamp 0 and Unread 0,
+//     so any non-zero person window would drop them on the spot. Exempting them
+//     here keeps that guarantee without reordering the placeholder injection,
+//     and closes the same gap /v1/conversation/sync documented but only covered
+//     when a space_id was supplied.
+func keepDespiteRecentWindow(channelID string, channelType uint8, unread int, pinned bool) bool {
+	if pinned || unread > 0 {
+		return true
+	}
+	return channelType == common.ChannelTypePerson.Uint8() && spacepkg.IsSystemBot(channelID)
+}
+
 // cutoffFor returns the activity cutoff for a given channel type. Unknown
 // channel types (anything that is not group / thread / DM) return 0 = no
 // filter; the recent tab only ever carries those three types, but defaulting
@@ -817,6 +924,29 @@ func (c recentCutoffs) cutoffFor(channelType uint8) int64 {
 	default:
 		return 0
 	}
+}
+
+// dropArchivedThreadItems removes thread entries whose lifecycle status is
+// explicitly archived, mirroring /v1/conversation/sync's status=active
+// whitelist (task inactive-hiding-user-control / P0).
+//
+// Only `Status == ThreadStatusArchived` is dropped. Status 0 means "unknown"
+// (the field is omitempty and stays zero when the status query failed or the
+// row was missing) and is KEPT — the fail-open direction every thread read path
+// in this package already takes. Non-thread items are untouched.
+//
+// Returns a new slice; the input is not mutated, so any caller-side view built
+// from the pre-filter list stays intact.
+func dropArchivedThreadItems(items []*SidebarItem) []*SidebarItem {
+	out := make([]*SidebarItem, 0, len(items))
+	for _, it := range items {
+		if it.TargetType == int(common.ChannelTypeCommunityTopic) &&
+			it.Status == thread.ThreadStatusArchived {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // channelKey returns a string key for (channelID, channelType).
@@ -1162,12 +1292,15 @@ func buildRecentItems(
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
-		if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
-			continue
-		}
 		pinned := false
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
+		}
+		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
+		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
+			if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
+				continue
+			}
 		}
 		parentID := ""
 		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取

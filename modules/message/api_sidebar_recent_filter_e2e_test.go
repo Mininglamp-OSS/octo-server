@@ -86,6 +86,14 @@ func TestE2E_RecentFilter_AdminOverrideTakesEffect(t *testing.T) {
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
 	))
+	// 出口清理：EnsureSystemSettings 是进程级单例且带 ~60s auto-reload TTL，本用例
+	// 写入的 sidebar.* 覆盖会泄漏给同一进程内的后续测试 —— 与 TestE2E_ConvSync_*
+	// 同批运行时，person_days=7 会让它们期望保留的 DM 被过滤掉而失败。在出口恢复
+	// 「无覆盖」状态，而不是要求后来的每个用例都在入口自卫。
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = commonapi.EnsureSystemSettings(ctx).Reload()
+	})
 
 	// Operator: return ALL groups (window off), keep a 3-day thread window, and
 	// start filtering DMs at 7 days.

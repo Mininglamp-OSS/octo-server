@@ -57,7 +57,7 @@ paths:
                 description: "设备uuid"
               recent_filter:
                 type: boolean
-                description: "可选，默认 false。为 true 时对返回的会话列表套用 sidebar recent tab 同款的按频道类型活动窗口过滤（system_settings 的 sidebar.recent_filter_{group,thread,person}_days，0=该类型不过滤）。供 Web「最近」tab 使用；不传则行为与历史完全一致（不过滤）。cursor 推进与 per-Space 未读仍基于过滤前的原始会话。"
+                description: "可选，默认 false。为 true 时对返回的会话列表套用 sidebar recent tab 同款的按频道类型活动窗口过滤（system_settings 的 sidebar.recent_filter_{group,thread,person}_days，0=该类型不过滤）。供 Web「最近」tab 使用；不传则行为与历史完全一致（不过滤）。cursor 推进与 per-Space 未读仍基于过滤前的原始会话。豁免：有未读、已置顶、系统 Bot 的 DM 永不被时间窗口隐藏（与 /v1/sidebar/sync 的 recent tab 逐条一致）；置顶集合查询失败时**整体跳过**本次窗口过滤（返回未过滤的完整列表），而不是套用一个已知不完整的豁免集合去藏东西。"
       responses:
         200:
           description: "返回"

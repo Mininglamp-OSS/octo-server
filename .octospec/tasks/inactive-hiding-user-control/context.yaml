@@ -1,0 +1,22 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: "touches[space,isolation,thread] + paths modules/**/*.go"
+  - id: trust-boundary
+    source: repo
+    why: "touches[wire-contract]"
+  - id: error-handling
+    source: repo
+    why: "touches[error-response,i18n,wire-contract] + paths modules/**/*.go, pkg/errcode/**"
+  - id: rate-limit
+    source: repo
+    why: "paths modules/**/*.go"
+  - id: testing
+    source: repo
+    why: "paths **/*_test.go"
+  - id: commit-style
+    source: repo
+    why: "paths **"
+brief: .octospec/tasks/inactive-hiding-user-control/brief.md
+batch: 1
+scope: [P0, P1, P2]
