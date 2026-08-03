@@ -49,6 +49,21 @@ The endpoint is specified in **OpenAPI 3.0.3**, in a new
 document is invalid. OpenAPI 3.x already has precedent in this repo
 (`modules/integration/swagger/api.yaml`, `modules/botfather/swagger/api.yaml`).
 
+### Route shape
+
+`space_id` is a **path** parameter, not a query parameter. In OpenAPI/REST modeling
+the path carries resource identity and hierarchy while the query carries filtering,
+pagination and projection of the identified collection: `space_id` answers *whose
+directory*, `type`/`page`/`limit` answer *which slice of it*. OpenAPI 3.0 also pins
+path params to `required: true` by construction, so the obligation is expressed by
+the spec rather than by prose. This matches every other Space sub-resource
+(`/space/{space_id}/members`, `/invites`, `/join-applies`, `/members/search`).
+
+The alternative `/v1/space/directory?space_id=` was rejected: its only merit is that
+it happens to fit the current `SpaceMiddleware` lookup order, which is an
+implementation detail driving the public contract backwards. The middleware is
+extended instead — see the `pkg/space/middleware.go` entry in the load-bearing list.
+
 ### Proposed wire contract
 
 Request:
@@ -171,12 +186,21 @@ has no reproducible backend source today. The new endpoint must nonetheless
 
 - **space**, **isolation**, **auth** — the endpoint exposes the full Space roster
   including every bot in the Space. It MUST mount `spacepkg.SpaceMiddleware`
-  (`pkg/space/middleware.go:99`), which reads `space_id` from query/`X-Space-ID`
-  and verifies membership against a Redis-cached `CheckMembership`. Because
-  `space_id` here is a **path** param, the middleware's query/header lookup does not
-  fire on its own — the handler must either receive the id in a form the middleware
-  reads, or perform the same `queryMember` check `listMembers` does. Whichever is
-  chosen, a non-member MUST NOT get rows. (rules: space-isolation)
+  (`pkg/space/middleware.go:99`) so the repo rule "handlers accessing user data must
+  go through the Space middleware" is satisfied literally, and so membership resolves
+  through the Redis-cached `CheckMembership` rather than an uncached per-request
+  `queryMember`. A non-member MUST NOT get rows. (rules: space-isolation)
+- **`pkg/space/middleware.go` (shared middleware)** — `spaceMiddleware` currently
+  resolves the Space id from `c.Query("space_id")` then `c.GetHeader("X-Space-ID")`
+  only (lines 108–111), so a **path** param does not fire it. This task adds
+  `c.Param("space_id")` as a third, last-priority lookup source. Verified
+  behavior-neutral for every existing consumer: no route that currently mounts
+  `SpaceMiddleware` uses a `:space_id` path param (checked all mount sites —
+  `modules/channel/api.go:55`, `modules/user/api.go:265,274`,
+  `modules/search/api.go:44`, `modules/message/api_sidebar.go:170`,
+  `modules/message/api.go:349,384,388`). The existing early-return for "no space id
+  anywhere" (`c.Next()` passthrough) and the 401/403 branches MUST be unchanged.
+  (rules: space-isolation)
 - **acl** — bot rows drop the `creator_uid` restriction relative to `listMembers`.
   This is **not** a net widening: the same set is already returned by
   `/v1/robot/space_bots` to any authenticated caller. Net effect is a narrowing,
@@ -236,6 +260,12 @@ has no reproducible backend source today. The new endpoint must nonetheless
   as valid OpenAPI 3, and documents the path, all four parameters with their
   defaults and the `limit` cap, the `200` schema (including `bot` present iff
   `kind == "bot"`), and the 400/403 error envelope.
+- New tests in `pkg/space/` cover the middleware change:
+  - a route with a `:space_id` **path** param now resolves and enforces membership;
+  - `?space_id=` and `X-Space-ID` resolution are unchanged, and query still wins over
+    path when both are present;
+  - a request carrying no space id in any of the three positions still falls through
+    via `c.Next()` (the existing opt-in passthrough) rather than being rejected.
 - New tests in `modules/space/` cover:
   1. **Non-member is refused.** An authenticated user with no `space_member` row in
      the target Space receives an error and **zero** rows — asserted on the body,
