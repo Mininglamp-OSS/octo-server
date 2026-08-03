@@ -100,19 +100,19 @@ func seedPerfDataset(t *testing.T) time.Duration {
 		for i := 0; i < perfHumansPerSp; i++ {
 			uid := fmt.Sprintf("pf_h_%02d_%04d", s, i)
 			users = append(users, fmt.Sprintf("('%s','Human %d',0)", uid, i))
-			members = append(members, fmt.Sprintf("('%s','%s',0,1)", spaceID, uid))
+			members = append(members, fmt.Sprintf("('%s','%s',0,1,0)", spaceID, uid))
 		}
 		for i := 0; i < perfBotsPerSp; i++ {
 			uid := fmt.Sprintf("pf_b_%02d_%04d", s, i)
 			users = append(users, fmt.Sprintf("('%s','Bot %d',1)", uid, i))
-			members = append(members, fmt.Sprintf("('%s','%s',0,1)", spaceID, uid))
+			members = append(members, fmt.Sprintf("('%s','%s',0,1,1)", spaceID, uid))
 			// creator 轮换，确保数据集里绝大多数 bot 都"不是调用者创建的"——
 			// 这正是 listMembers 会滤掉、而目录必须返回的那部分。
 			robots = append(robots, fmt.Sprintf("('%s',1,'pf_h_%02d_%04d')", uid, s, i%perfHumansPerSp))
 		}
 
 		batchInsert(t, "INSERT INTO `user` (uid, name, robot) VALUES ", users)
-		batchInsert(t, "INSERT INTO space_member (space_id, uid, role, status) VALUES ", members)
+		batchInsert(t, "INSERT INTO space_member (space_id, uid, role, status, is_bot) VALUES ", members)
 		batchInsert(t, "INSERT INTO robot (robot_id, status, creator_uid) VALUES ", robots)
 	}
 

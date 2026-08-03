@@ -103,12 +103,41 @@ func (d *DB) countActiveMembers(spaceId string) (int, error) {
 
 // ---------- Member CRUD ----------
 
+// memberIsBotSubquery 从 user 表派生「是不是 bot 账号」。
+//
+// 所有 space_member 插入点都用它来填 robot 列，而不是让调用方自己传：调用方漏传
+// 会把一个 bot 静默写成真人，而这个错误只会在通讯录目录里表现为「AI 出现在人类
+// 分类下」，极难回溯。放在 SQL 里派生则没有任何调用方能绕过。
+const memberIsBotSubquery = "IFNULL((SELECT u.robot FROM `user` u WHERE u.uid = ?), 0)"
+
+// stampMemberIsBot 为 Record 式插入解析 robot 列。Record 路径按结构体字段生成
+// 列表，插不进子查询，因此这里显式查一次。成员插入相对目录读取是低频操作，
+// 多一次主键查找可以接受。
+func (d *DB) stampMemberIsBot(m *MemberModel, tx *dbr.Tx) error {
+	sess := d.session.SelectBySql("SELECT IFNULL(robot,0) FROM `user` WHERE uid=?", m.UID)
+	if tx != nil {
+		sess = tx.SelectBySql("SELECT IFNULL(robot,0) FROM `user` WHERE uid=?", m.UID)
+	}
+	var robot int
+	if _, err := sess.Load(&robot); err != nil {
+		return err
+	}
+	m.IsBot = robot
+	return nil
+}
+
 func (d *DB) insertMember(m *MemberModel, tx *dbr.Tx) error {
+	if err := d.stampMemberIsBot(m, tx); err != nil {
+		return err
+	}
 	_, err := tx.InsertInto("space_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 func (d *DB) insertMemberNoTx(m *MemberModel) error {
+	if err := d.stampMemberIsBot(m, nil); err != nil {
+		return err
+	}
 	_, err := d.session.InsertInto("space_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
@@ -526,8 +555,8 @@ func GetSpaceMemberUIDs(ctx *config.Context, spaceID string) ([]string, error) {
 // insertMemberIgnore 插入成员（忽略重复）
 func (d *DB) insertMemberIgnore(m *MemberModel) error {
 	_, err := d.session.InsertBySql(
-		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
-		m.SpaceId, m.UID, m.Role, m.Status,
+		"INSERT IGNORE INTO space_member (space_id, uid, role, status, is_bot, created_at, updated_at) VALUES (?, ?, ?, ?, "+memberIsBotSubquery+", NOW(), NOW())",
+		m.SpaceId, m.UID, m.Role, m.Status, m.UID,
 	).Exec()
 	return err
 }
@@ -566,8 +595,8 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 
 	// Insert new member
 	_, err = tx.InsertBySql(
-		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-		spaceId, uid,
+		"INSERT INTO space_member (space_id, uid, role, status, is_bot, created_at, updated_at) VALUES (?, ?, 0, 1, "+memberIsBotSubquery+", NOW(), NOW())",
+		spaceId, uid, uid,
 	).Exec()
 	if err != nil {
 		return err
@@ -813,8 +842,8 @@ func (d *DB) approveJoinApplyAtomic(applyID int64, reviewerUID, spaceId string, 
 			Where("space_id=? AND uid=?", spaceId, row.UID).Exec()
 	} else {
 		_, err = tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-			spaceId, row.UID,
+			"INSERT INTO space_member (space_id, uid, role, status, is_bot, created_at, updated_at) VALUES (?, ?, 0, 1, "+memberIsBotSubquery+", NOW(), NOW())",
+			spaceId, row.UID, row.UID,
 		).Exec()
 	}
 	if err != nil {

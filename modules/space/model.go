@@ -38,6 +38,12 @@ type MemberModel struct {
 	Role    int    // 成员角色 0.普通成员 1.管理员 2.拥有者
 	Status  int    // 状态 1.正常 0.已移除
 	Version int64  // 版本号
+	// IsBot 是否 bot 账号，冗余自 user.robot（不可变，故无需同步）。
+	// 由 DB 层的 stampMemberIsBot / memberIsBotSubquery 统一填充，调用方不要自己设。
+	//
+	// 列名刻意不叫 robot：queryMembers / searchMembers 用 `sm.*` 加自己的
+	// `... as robot` 别名，同名列会在结果集里撞车、改变这两个已废弃接口的取值。
+	IsBot int
 	db.BaseModel
 }
 
@@ -234,9 +240,9 @@ type directoryResp struct {
 // directoryRowModel 目录查询的行模型。
 //
 // 复用 MemberDetailModel 以继承 #344 的 DisplayName 兜底链（user.name →
-// user_verification.real_name → 稳定占位符）；其 Robot 字段在这里装载的是
-// user.robot，即「是不是 bot 账号」。ActiveBot 独立记录「robot 表里是否存在
-// status=1 的行」，两者分开才能把停用 bot 与真人区分开。
+// user_verification.real_name → 稳定占位符）。「是不是 bot 账号」读的是
+// MemberModel.IsBot（space_member 自己的冗余列），ActiveBot 独立记录「robot 表里
+// 是否存在 status=1 的行」，两者分开才能把停用 bot 与真人区分开。
 type directoryRowModel struct {
 	MemberDetailModel
 	ActiveBot int
@@ -246,7 +252,7 @@ type directoryRowModel struct {
 // 查询侧已排除「是 bot 账号但未启用」的行，这里的双条件是冗余防御——若将来
 // WHERE 被改动，分类逻辑不会跟着悄悄把停用 bot 归到 human。
 func (m *directoryRowModel) isBot() bool {
-	return m.Robot == 1 && m.ActiveBot == 1
+	return m.IsBot == 1 && m.ActiveBot == 1
 }
 
 type memberSearchResp struct {

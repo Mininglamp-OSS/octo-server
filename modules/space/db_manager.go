@@ -378,9 +378,9 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	defer tx.RollbackUnlessCommitted()
 	for _, uid := range uids {
 		if _, err := tx.InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
+			"INSERT INTO space_member (space_id, uid, role, status, is_bot, created_at, updated_at) VALUES (?, ?, 0, 1, "+memberIsBotSubquery+", NOW(), NOW()) "+
 				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
-			spaceId, uid,
+			spaceId, uid, uid,
 		).Exec(); err != nil {
 			return err
 		}

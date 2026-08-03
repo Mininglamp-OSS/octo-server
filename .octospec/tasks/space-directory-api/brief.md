@@ -229,6 +229,24 @@ has no reproducible backend source today. The new endpoint must nonetheless
   go through the Space middleware" is satisfied literally, and so membership resolves
   through the Redis-cached `CheckMembership` rather than an uncached per-request
   `queryMember`. A non-member MUST NOT get rows. (rules: space-isolation)
+- **`space_member` schema (new column + index)** — adds `is_bot smallint NOT NULL
+  DEFAULT 0`, denormalised from `user.robot`, plus
+  `spacemember_directory (space_id, status, is_bot, role DESC, created_at, uid)`.
+  Rationale is LIMIT pushdown: while the bot/human predicate referenced a joined
+  column, the optimiser had to join and filter the whole Space before sorting, so
+  `limit=50` cost the same as `limit=6000` (47ms vs 43ms measured at 10x6000).
+  With the predicate on `space_member` itself the human slice drops to 4.5ms for
+  count (from 20ms) and 8.0ms for `limit=50` (from 27.5ms).
+  The copy cannot go stale: `user.robot` is written only at account creation
+  (`modules/user/service.go`, `modules/botfather/command.go`) and never UPDATEd
+  anywhere in the repo, so no sync hook is needed. Every `space_member` insert
+  derives the value in the DB layer (`memberIsBotSubquery` / `stampMemberIsBot`) so
+  no caller can set it wrong. The column is deliberately NOT named `robot`:
+  `queryMembers` / `searchMembers` do `SELECT sm.*` plus their own `... as robot`
+  alias, and a same-named column would collide and change those frozen endpoints.
+  The index alone was previously measured to be worthless — it only pays off once
+  the predicate is single-table, so the two must land together.
+  (rules: space-isolation)
 - **`pkg/space/middleware.go` (shared middleware)** — `spaceMiddleware` currently
   resolves the Space id from `c.Query("space_id")` then `c.GetHeader("X-Space-ID")`
   only (lines 108–111), so a **path** param does not fire it. This task adds
@@ -279,7 +297,13 @@ has no reproducible backend source today. The new endpoint must nonetheless
 
 - **Changing `GET /v1/space/:space_id/members` or `GET /v1/robot/space_bots` in any
   way.** Both stay byte-compatible; the mobile app and shipped web builds consume
-  them. In particular the `r.status=1` join defect and the missing `sm.uid` sort
+  them. Both are now marked `Deprecated:` at their route registration and handler,
+  with the freeze stated explicitly: their known defects (creator-filtered bots,
+  missing total, no sort tiebreaker, robot projection disagreeing with its JOIN,
+  the dead `pending` branch) are recorded but deliberately NOT repaired, because
+  repairing them changes what existing clients see. The single stated exception is
+  the `space_bots` cross-Space leak, which is a live security defect and is not
+  covered by a compatibility freeze — see `robot-space-bots-space-isolation`. In particular the `r.status=1` join defect and the missing `sm.uid` sort
   tiebreaker are *not* repaired in the old query here — the new endpoint simply does
   not reproduce them.
 - **The `/v1/robot/space_bots` cross-Space exposure.** It is a security fix to an

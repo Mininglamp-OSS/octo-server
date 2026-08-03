@@ -417,6 +417,10 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 	//
 	// 顺序：AuthMiddleware → 限流 → Space 校验。限流必须在 AuthMiddleware 之后
 	// 才读得到 uid，否则会静默 fail-open。
+	// Deprecated: 已由 GET /v1/space/:space_id/directory?type=bot 取代，禁止修改。
+	// 保留仅为兼容移动端与已发布的 web 构建，行为与响应形状冻结。
+	// （此前这里记着一条「跨 Space 越权不在冻结范围内」的例外，该缺陷已由 #691
+	// 修复，例外随之取消——现在是真正的全冻结。）
 	spaceBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
 	{
 		spaceBots.GET("/robot/space_bots", rb.spaceBots)
@@ -1555,6 +1559,16 @@ func (rb *Robot) setAutoApprove(c *wkhttp.Context) {
 }
 
 // spaceBots Bot 广场 — 获取 Space 内所有 Bot
+// spaceBots 返回 Space 内所有 Bot。
+//
+// Deprecated: 由 GET /v1/space/:space_id/directory?type=bot 取代（见
+// .octospec/tasks/space-directory-api/）。本函数已冻结，禁止修改——包括已知的
+// pending 死分支：它查的 friend_apply 表全仓库不存在，且 uid/to_uid 方向与
+// friend_apply_record 的存储方向相反，错误又被 `_, _ =` 吞掉，所以线上只会返回
+// added / not_added。修正它会改变存量客户端看到的 status，需单独立项评估。
+//
+// Space 成员校验已由 #691 补上（路由挂了 SpaceMiddleware），此前记在这里的
+// 那条「唯一允许的改动」已完成，本函数现在是全冻结。
 func (rb *Robot) spaceBots(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := c.Query("space_id")

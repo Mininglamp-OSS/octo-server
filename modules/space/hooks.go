@@ -13,10 +13,10 @@ import (
 // 注入 provisioner，两模块生产代码单向依赖（category → space），cycle 消除。
 //
 // 调用方需把任何错误视作非关键路径（降级为 warn），因为：
-//   * category.EnsureDefaultCategory 内部依赖表唯一索引 + INSERT IGNORE，
+//   - category.EnsureDefaultCategory 内部依赖表唯一索引 + INSERT IGNORE，
 //     重复 / 并发调用天然幂等；
-//   * GET /v1/spaces/{id}/categories 端有兜底补偿；
-//   * 生产 flow（创建/加入空间）绝不能因 category 初始化失败而回滚。
+//   - GET /v1/spaces/{id}/categories 端有兜底补偿；
+//   - 生产 flow（创建/加入空间）绝不能因 category 初始化失败而回滚。
 type DefaultCategoryProvisioner func(ctx *config.Context, uid, spaceID string) error
 
 var defaultCategoryProvisioner DefaultCategoryProvisioner

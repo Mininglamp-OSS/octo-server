@@ -84,6 +84,11 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/:space_id", s.updateSpace)
 		auth.DELETE("/:space_id", s.disbandSpace)
 
+		// Deprecated: 已由 GET /v1/space/:space_id/directory 取代，禁止修改。
+		// 保留仅为兼容移动端与已发布的 web 构建。行为、SQL、响应形状一律冻结：
+		// 新需求一律加到 directory 上。它对 bot 的 creator_uid 过滤、缺失的 total、
+		// 以及 robot 判定与 JOIN 条件不一致（停用 bot 以 robot=0 返回）都是已知
+		// 缺陷，刻意不在此修复——修了会改变存量客户端看到的数据。
 		auth.GET("/:space_id/members", s.listMembers)
 		auth.POST("/:space_id/members/add", s.addMembers)
 		auth.POST("/:space_id/members/remove", s.removeMembers)
@@ -625,6 +630,13 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 }
 
 // listMembers 获取空间成员列表
+// listMembers 返回 Space 成员列表。
+//
+// Deprecated: 由 GET /v1/space/:space_id/directory 取代（见
+// .octospec/tasks/space-directory-api/）。本函数已冻结，禁止修改——包括看起来
+// 明显的缺陷：bot 按 creator_uid 过滤导致别人创建的 bot 不可见、无 total、
+// 排序缺唯一 tiebreaker、robot 投影列与 JOIN 条件口径不一致。任何改动都会
+// 改变移动端与存量 web 构建看到的数据。新需求请加在 directory 上。
 func (s *Space) listMembers(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
