@@ -85,9 +85,47 @@ paths:
                 $ref: "#/components/schemas/DirectoryResp"
         "400":
           description: >
-            业务错误，统一走 i18n 错误信封（HTTP 状态固定 400，真实状态在
-            `error.http_status`）。覆盖：`type` 取值非法；调用者不是该 Space
-            成员；服务端查询失败。
+            `type` 取值非法。由 handler 经 `httperr.ResponseErrorL` 返回，
+            线路状态固定 400（D14 兼容），真实状态在 `error.http_status`。
+            `error.id` 为 `err.server.space.request_invalid`，`details.field` 为 `type`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          description: >
+            未登录。由 SpaceMiddleware 返回，`error.id` 为
+            `err.shared.auth.required`。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: >
+            调用者不是该 Space 的成员，或该 Space 已解散。由 SpaceMiddleware
+            返回，`error.id` 为 `err.server.space.not_member`。
+
+            注意与 400 的区别：这一条走 `ResponseErrorLWithStatus`，线路状态就是
+            真实的 403，不做 D14 的固定 400 折叠——中间件既有的出口一直是 403，
+            折叠会打断所有按状态码分支的既有客户端。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          description: >
+            触发 per-UID 限流（`SharedUIDRateLimiter`，进程内跨路由共享配额）。
+            `error.id` 为 `rate.limited`，并带
+            `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `Retry-After` 头。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "500":
+          description: >
+            服务端查询失败（目录查询、总数、关系态，或中间件的成员身份校验）。
+            `error.id` 为 `err.server.space.query_failed`；按仓库的
+            Internal 约定，信封不携带具体原因，排查请看服务端日志。
           content:
             application/json:
               schema:
@@ -168,8 +206,17 @@ components:
 
     ErrorEnvelope:
       type: object
-      description: 仓库统一的 i18n 错误信封（pkg/httperr + pkg/errcode）。
+      description: >
+        仓库统一的 i18n 错误信封（pkg/httperr + pkg/errcode）。是双形态的：
+        既给出结构化的 `error` 对象，也保留 legacy 客户端读的 `msg` / `status`
+        顶层字段，所以对只读 `msg` 的老客户端是纯增量。
       properties:
+        msg:
+          type: string
+          description: 与 `error.message` 相同的本地化文案，为 legacy 客户端保留
+        status:
+          type: integer
+          description: 与线路状态码相同，为 legacy 客户端保留
         error:
           type: object
           properties:
