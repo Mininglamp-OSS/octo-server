@@ -488,3 +488,43 @@ func TestDirectory_HumanTypeSkipsRelationLookup(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Empty(t, relations)
 }
+
+// ---------- frozen legacy endpoint ----------
+
+// TestDirectory_LegacyMembersUnaffectedByIsBot 钉住「已弃用接口禁止改动」这条约束
+// 在本次 schema 变更下依然成立。
+//
+// space_member 新增的 is_bot 列会被 queryMembers 的 `SELECT sm.*` 一并取出。列名
+// 刻意避开 robot 就是为了不与它自己的 `CASE ... as robot` 别名在结果集里撞车——
+// 一旦撞车，listMembers 返回的 robot 取值会静默改变，而移动端与已发布的 web 构建
+// 都在读这个字段。这里用一个同时含真人、启用 bot、停用 bot 的空间做断言。
+func TestDirectory_LegacyMembersUnaffectedByIsBot(t *testing.T) {
+	_, _, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceID := "dir_space_legacy"
+	seedDirectorySpace(t, spaceID, testutil.UID)
+	seedDirectoryHuman(t, spaceID, "lg_human", "Legacy Human", 0)
+	seedDirectoryBot(t, spaceID, "lg_bot_mine", "Mine", testutil.UID, 1)
+	seedDirectoryBot(t, spaceID, "lg_bot_off", "Mine Disabled", testutil.UID, 0)
+	seedDirectoryBot(t, spaceID, "lg_bot_other", "Someone Else's", "another_creator", 1)
+
+	members, err := testSpaceDB.queryMembers(spaceID, testutil.UID, 1, 100)
+	assert.NoError(t, err)
+
+	robotByUID := map[string]int{}
+	for _, m := range members {
+		robotByUID[m.UID] = m.Robot
+	}
+
+	// robot 仍由 queryMembers 自己的 CASE 决定（robot 行存在且 status=1），
+	// 不是新列的值。停用 bot 依旧以 robot=0 出现——这正是那个已知缺陷，
+	// 冻结意味着它保持原样，而不是被这次改动顺手改掉。
+	assert.Equal(t, 0, robotByUID["lg_human"], "真人 robot=0")
+	assert.Equal(t, 1, robotByUID["lg_bot_mine"], "自己创建的启用 bot robot=1")
+	assert.Equal(t, 0, robotByUID["lg_bot_off"], "自己创建的停用 bot 仍以 robot=0 返回（已知缺陷，冻结）")
+
+	// creator 过滤同样保持原样：别人创建的 bot 依旧不可见。
+	_, visible := robotByUID["lg_bot_other"]
+	assert.False(t, visible, "别人创建的 bot 仍应被 creator_uid 过滤掉")
+}
