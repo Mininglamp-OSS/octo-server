@@ -528,3 +528,42 @@ func TestDirectory_LegacyMembersUnaffectedByIsBot(t *testing.T) {
 	_, visible := robotByUID["lg_bot_other"]
 	assert.False(t, visible, "别人创建的 bot 仍应被 creator_uid 过滤掉")
 }
+
+// TestDirectory_TotalStaysCorrectWhenCountIsElided total 在「本页即全部」时由行数
+// 推出、跳过单独的 COUNT 查询。这里钉住三个分支，尤其是最容易写错的边界：
+// 取回行数恰好等于 limit 时无法区分「刚好取完」与「还有下一页」，必须真的去数。
+func TestDirectory_TotalStaysCorrectWhenCountIsElided(t *testing.T) {
+	srv, _, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceID := "dir_space_total"
+	seedDirectorySpace(t, spaceID, testutil.UID) // owner 一行
+	for i := 0; i < 4; i++ {
+		seedDirectoryHuman(t, spaceID, fmt.Sprintf("dir_tot_%d", i), fmt.Sprintf("Tot %d", i), 0)
+	}
+	const want = 5 // owner + 4
+
+	t.Run("limit 大于总数：total 由行数推出", func(t *testing.T) {
+		resp := decodeDirectory(t, getDirectory(t, srv, testCtx, spaceID, directoryQuery(directoryTypeAll, 1, 100)))
+		assert.Equal(t, want, resp.Total)
+		assert.Len(t, resp.Items, want)
+	})
+
+	t.Run("limit 恰好等于总数：仍须实际计数", func(t *testing.T) {
+		resp := decodeDirectory(t, getDirectory(t, srv, testCtx, spaceID, directoryQuery(directoryTypeAll, 1, want)))
+		assert.Equal(t, want, resp.Total, "边界上 total 不能退化成 len(items) 之外的值")
+		assert.Len(t, resp.Items, want)
+	})
+
+	t.Run("非首页：total 是全量而非本页行数", func(t *testing.T) {
+		resp := decodeDirectory(t, getDirectory(t, srv, testCtx, spaceID, directoryQuery(directoryTypeAll, 2, 2)))
+		assert.Equal(t, want, resp.Total, "第二页的 total 必须仍是 %d", want)
+		assert.Len(t, resp.Items, 2)
+	})
+
+	t.Run("越界页：total 保持全量，items 为空", func(t *testing.T) {
+		resp := decodeDirectory(t, getDirectory(t, srv, testCtx, spaceID, directoryQuery(directoryTypeAll, 99, 10)))
+		assert.Equal(t, want, resp.Total)
+		assert.Empty(t, resp.Items)
+	})
+}

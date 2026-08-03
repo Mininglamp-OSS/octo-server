@@ -1,6 +1,7 @@
 package space
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -237,7 +238,11 @@ func TestDirectoryPerf(t *testing.T) {
 	})
 
 	t.Run("HTTP端到端", func(t *testing.T) {
-		for _, limit := range []int{50, 6000} {
+		// 6000 与 10000 是一组对照：本 Space 共 6001 行，limit=6000 取回 6000 行
+		// 恰好等于 limit，无法判断是否还有下一页，必须实打实 COUNT；limit=10000
+		// 取回 6001 行少于 limit，total 直接由行数推出，省掉一次 COUNT。
+		// 通讯录真实调用的就是后者（octo-web 的 getMembers 传 limit=10000）。
+		for _, limit := range []int{50, 6000, 10000} {
 			var status, bytes int
 			avg, worst := timeIt(3, func() {
 				w := getDirectory(t, testSrv, testCtx, spaceID, directoryQuery(directoryTypeAll, 1, limit))
@@ -246,6 +251,36 @@ func TestDirectoryPerf(t *testing.T) {
 			t.Logf("GET /directory?limit=%-5d status=%d body=%.1f KB  avg=%-10v worst=%v",
 				limit, status, float64(bytes)/1024, avg.Round(time.Microsecond), worst.Round(time.Microsecond))
 		}
+	})
+
+	// 端到端耗时里查询之外的那一半花在哪：拆出 JSON 序列化单独计时。
+	// 这决定缓存该缓存什么——若序列化占大头，缓存查询结果收益有限，
+	// 要缓存的是序列化后的字节。
+	t.Run("序列化占比", func(t *testing.T) {
+		rows, err := testSpaceDB.queryDirectory(spaceID, directoryTypeAll, 1, 10000)
+		assert.NoError(t, err)
+		items := make([]directoryItemResp, 0, len(rows))
+		for _, row := range rows {
+			item := directoryItemResp{
+				UID: row.UID, Name: row.DisplayName(), Kind: directoryKindHuman,
+				Role: row.Role, CreatedAt: row.CreatedAt.String(),
+			}
+			if row.isBot() {
+				item.Kind = directoryKindBot
+				item.Bot = &directoryBotResp{Relation: directoryRelationNotAdded}
+			}
+			items = append(items, item)
+		}
+		resp := directoryResp{Total: len(items), Page: 1, Limit: 10000, Items: items}
+
+		var size int
+		avg, worst := timeIt(10, func() {
+			b, err := json.Marshal(resp)
+			assert.NoError(t, err)
+			size = len(b)
+		})
+		t.Logf("json.Marshal(%d 行) = %.1f KB  avg=%-10v worst=%v",
+			len(items), float64(size)/1024, avg.Round(time.Microsecond), worst.Round(time.Microsecond))
 	})
 
 	// 与旧接口的同规模对照：listMembers 的 creator 过滤让它只返回极少数 bot，
