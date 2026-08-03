@@ -39,6 +39,57 @@ type stubRobotService struct {
 	startOnce       sync.Once
 }
 
+type leaseRaceRobotService struct {
+	mu sync.Mutex
+
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	enqueueCalls int
+	eventIDs     []int64
+}
+
+func (s *leaseRaceRobotService) ExistRobot(string) (bool, error) {
+	return true, nil
+}
+
+func (s *leaseRaceRobotService) EnqueueBotTypedEvent(_ string, _ string, _ map[string]interface{}) (int64, error) {
+	s.mu.Lock()
+	s.enqueueCalls++
+	call := s.enqueueCalls
+	s.mu.Unlock()
+
+	if call == 1 {
+		close(s.firstStarted)
+		<-s.releaseFirst
+	}
+
+	eventID := int64(1000 + call)
+	s.mu.Lock()
+	s.eventIDs = append(s.eventIDs, eventID)
+	s.mu.Unlock()
+	return eventID, nil
+}
+
+func (s *leaseRaceRobotService) visibleEventIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.eventIDs...)
+}
+
+type observingClaimBackend struct {
+	*memoryClaimBackend
+	staleCAS chan struct{}
+	once     sync.Once
+}
+
+func (b *observingClaimBackend) CompareAndSet(key, oldValue, newValue string, ttl time.Duration) (bool, error) {
+	ok, err := b.memoryClaimBackend.CompareAndSet(key, oldValue, newValue, ttl)
+	if err == nil && !ok {
+		b.once.Do(func() { close(b.staleCAS) })
+	}
+	return ok, err
+}
+
 func (s *stubRobotService) ExistRobot(uid string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -702,6 +753,66 @@ func TestBotMentionRenewsClaimWhileEnqueueIsBlocked(t *testing.T) {
 	response := <-result
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBotMentionLostLeaseDuringBlockedEnqueueReplaysSingleVisibleEvent(t *testing.T) {
+	backend := &observingClaimBackend{
+		memoryClaimBackend: newMemoryClaimBackend(),
+		staleCAS:           make(chan struct{}),
+	}
+	store := newClaimStore(backend, time.Hour, deterministicTokens("lease-old", "lease-new"))
+	robots := &leaseRaceRobotService{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	module := newTestBotMention(robots, store, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.claimRenewal = time.Millisecond
+	router := newMentionRouter(module)
+	request := validMentionRequest()
+	claimKey := mentionClaimKey(request.BotUID, request.IdempotencyKey)
+
+	firstResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstResult <- doMentionRequest(t, router, "internal-secret", request)
+	}()
+	select {
+	case <-robots.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first enqueue did not block")
+	}
+
+	backend.forceDelete(claimKey)
+	second := doMentionRequest(t, router, "internal-secret", request)
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s", second.Code, second.Body.String())
+	}
+	secondResponse := decodeMentionResponse(t, second)
+	if !secondResponse.Accepted || secondResponse.Replay {
+		t.Fatalf("retry response=%+v, want newly accepted event", secondResponse)
+	}
+	select {
+	case <-backend.staleCAS:
+	case <-time.After(time.Second):
+		t.Fatal("blocked attempt did not observe lease loss")
+	}
+
+	close(robots.releaseFirst)
+	var first *httptest.ResponseRecorder
+	select {
+	case first = <-firstResult:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not finish")
+	}
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	firstResponse := decodeMentionResponse(t, first)
+	if !firstResponse.Accepted || !firstResponse.Replay || firstResponse.EventID != secondResponse.EventID {
+		t.Fatalf("first response=%+v, want replay of event_id %d", firstResponse, secondResponse.EventID)
+	}
+	if visible := robots.visibleEventIDs(); len(visible) != 1 || visible[0] != secondResponse.EventID {
+		t.Fatalf("visible event IDs=%v, want only %d", visible, secondResponse.EventID)
 	}
 }
 
