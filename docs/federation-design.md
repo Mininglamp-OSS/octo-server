@@ -1,0 +1,290 @@
+# octo 跨实例联邦设计：两家自部署企业互信通信 / 跨实例外部群
+
+**status: DRAFT — 待拍板**
+**方案：A 单边托管（single-homed）** — 外部群寄居在其中一方实例上（下称 **Host / A**；对端下称 **Peer / B**）
+**代码基线：** octo-server HEAD `a61b5411`（branch `feat/thread-peruser-visibility`）
+**证据说明：** 本草案的 file:line 结论来自一轮独立代码勘察，撰写时未逐条重开文件复核。凡标注「未验证 / 需实测」处，执行前必须先验证，并 drift check 对齐当时 HEAD。
+
+---
+
+## 0. 范围
+
+**要**：可评审的架构设计，说明两家独立部署的 octo 实例如何建立互信、让双方用户在一个共享外部群里协作。
+**不要**：实现代码。写码票在设计拍板 + 人工理解节点通过后再拆。
+**已定方向（不重新论证）**：方案 A 单边托管。放弃方案 B（双向复制）理由已验证。
+**架构硬约束**：联邦网关必须抽成独立模块 `modules/federation`，不把单边托管假设焊死进业务代码。
+
+---
+
+## 1. 核心设计立场
+
+**联邦 = 复用现有 `is_external` 外部群语义骨架 + 把身份来源从「同实例另一 Space」替换为「对端实例」。** 远端用户在 Host 落一行**普通形态、但被硬约束为「不可认证」的本地 32 位 uid 影子账号**；联邦来源记在旁路表 + 现有 `is_external` 标记里，**绝不把联邦身份编进 uid 字符串**（规避 `@` 毒性与被回滚的列宽放大）。WuKongIM 当哑消息总线（目标零改动，但**发送方伪装能力必须先实测**，见 §5.4）。跨实例信任、授权、消息中继、可靠投递成本全部搬到 octo-server 侧的 `modules/federation`。
+
+
+---
+
+## 2. 与现有 `is_external` 机制的复用边界
+
+| 现有能力 | 证据（file:line，来自前置勘察，未在本轮重核） | 联邦处置 |
+|---|---|---|
+| `is_external=1` 成员标记 + 外部角标渲染 | `docs/external-group-design.md`（v1.1，PR #1167） | **直接复用** |
+| `allow_external` 安全阀 | 同上 | **直接复用**（联邦总开关前置） |
+| 会话过滤放行 | `space_filter.go` | **直接复用** |
+| 搜索放行 | `shouldIncludeGroupForSpace` | **直接复用** |
+| 退群自动恢复 | `is_external_group` 逻辑 | **直接复用** |
+| `source_space_id` 来源标识 | external-group-design.md | **扩展**：新增平行维度 `source_peer_instance_id`（落哪张成员表 / 与 `source_space_id` 共存 / 唯一键，**需实测**，见 §6） |
+| 外部标记缓存 | `external_marker_cache.go:162-168` | **扩展 + 修 bug**（当前静默丢标记，见 §7） |
+| IM 成员名单反查 datasource | `modules/webhook/api.go:141`、`api_datasource.go:84-113`、`modules/group/1module.go:66-78` `GetSubscribableMemberUIDs()` | **直接复用** |
+| `IMAddSubscriber` | `octo-lib/config/msg.go:298`（只传 uid、无握手） | **直接复用** |
+| webhook HMAC-SHA256 签名 | `modules/webhook/hmac.go:30-58`（fail-closed） | **复用为互信起步原语**（仅认证，非授权，见 §4.2） |
+| `user_oidc_identity` 形状 | `modules/oidc/sql/20260427000002:5-24` | **复用形状**新建 `federation_identity` |
+| `modules/federation` 网关 / `federation_peer` 信任表 / 授权层 / 中继协议 / outbox 可靠投递 / 附件异步拉取 / 生命周期事件 | `federat` 全零命中 | **全部新建** |
+
+---
+
+## 3. Q1 · 身份
+
+### 3.1 影子 uid 形态
+远端用户在 Host 上映射到**一个正常生成的本地 32 位 hex uid**（`pkg/util/string.go:15` 同款），**无 namespace 限定符**。理由：`@` 是毒（`octo-lib/common/msg.go:172-174` `IsFakeChannel`、`:157-169` `from@to` 拼 DM，9 处非测试调用点）；列宽 `uid VARCHAR(40)` 焊死（约 40 migration + 索引，oidc 曾放大到 64 并 revert，**revert 原因未验证——执行前必查 git log/PR**）。影子 uid 为普通本地行 → 无声穿过 `QueryByUIDs`、DM 逻辑、全部索引。
+
+### 3.2 `federation_identity`（复用 `user_oidc_identity` 形状）
+```sql
+CREATE TABLE federation_identity (
+  id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+  peer_instance_id VARCHAR(64)  NOT NULL,
+  remote_uid       VARCHAR(64)  NOT NULL,
+  local_shadow_uid VARCHAR(40)  NOT NULL,
+  status           TINYINT      NOT NULL DEFAULT 1,   -- 1=active 2=suspended 3=revoked
+  lease_expires_at DATETIME     NULL,
+  display_name     VARCHAR(128) NULL,                 -- 投影自对端，随 profile 事件更新（§8.3）
+  avatar_url       VARCHAR(255) NULL,
+  created_at       DATETIME     NOT NULL,
+  updated_at       DATETIME     NOT NULL,
+  UNIQUE KEY uk_peer_remote (peer_instance_id, remote_uid),
+  UNIQUE KEY uk_shadow (local_shadow_uid)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+```
+🔴 **并发创建竞态（P0）**：入站消息可能瞬间并发触发同一 `(peer,remote_uid)` 的影子创建，撞 `uk_peer_remote` → 500 + 丢消息。**必须用 DB 级 upsert（`INSERT ... ON DUPLICATE KEY UPDATE` 取回既有行）或 per-key 分布式锁**收敛，禁止「先 SELECT 再 INSERT」裸竞态。
+
+### 3.3 🔴 不可认证影子（Unauthenticatable Federation Shadow）—— 一等约束
+设计评审指出：仅封「好友/推荐/搜索」远远不够。影子是普通本地行意味着**登录、token 铸发、密码/OIDC 绑定、设备注册、通知、@提及、DM 发起、审计、管理后台、导入导出、删除任务、权限缓存**都可能把它当真人。
+
+**约束（spec 级强制）**：影子账号带一个**统一可判定标志**（如 `user.federation_shadow=1`，落 user 表，**列位置/迁移兼容需实测**），并要求执行者**逐路径审计**下表，每条给出「拒绝 / 降级 / 放行」处置，缺一条即 STOP：
+
+| 路径 | 期望处置 |
+|---|---|
+| 登录 / 铸 IM/Web token | **拒绝**（影子永不登录，§5.1 依赖此） |
+| 密码 / OIDC 绑定 | **拒绝** |
+| 加好友 / 好友推荐 / 通讯录 | **排除** |
+| 全局搜索 / 用户目录 | **排除**（仅联邦群内可见） |
+| 发起 DM / 被 DM | **拒绝或仅群内**（待 Yu 定，§16） |
+| @提及 | 仅群内成员范围 |
+| 管理后台 / 导入导出 | 标注为联邦来源，不可当本地成员导出 |
+| 删除 / GDPR 任务 | 随联邦生命周期（§8），不进本地注销流程 |
+| 权限缓存 | 缓存键须含 shadow 判定，吊销时失效（§8.4） |
+
+---
+
+## 4. Q2 · 互信 + 授权
+
+### 4.1 认证选型：HMAC 共享密钥起步
+| 候选 | 结论 |
+|---|---|
+| HMAC 共享密钥（复用 `webhook/hmac.go`，fail-closed，零新基建） | **MVP 选它** |
+| JWT+JWKS（基建已删 `modules/bot_provision/jwt.go`） | 不作起步 |
+| mTLS（无 CA/轮换基建） | 后续 |
+理由：起步是**少量、带合同的点对点配对**，非开放联邦。抽象 `FederationTrust` 接口（`Sign/Verify`）留 JWT/mTLS 迁移位，不动业务代码。
+
+### 4.2 🔴 授权 ≠ 认证（P0）
+HMAC 只证明「请求来自持共享密钥的一方」，**不证明**：① `remote_uid` 当前确属该 peer 且 active；② 该 uid 仍是目标群成员；③ 该 peer 被授权向该 `channel_ref` 写入。**必须显式三段校验，缺任一 fail-closed**：
+1. **peer 认证**：HMAC 验签通过（含 §4.4 防重放）。
+2. **身份绑定**：`federation_identity` 中 `(peer, remote_uid)` 存在且 `status=active` 且租约未过期。
+3. **频道授权**：`channel_ref` 解析出的本地群 `allow_external=1`、且该群已与该 peer 建立联邦关系（新表 `federation_channel`，§4.5）、且该 remote 影子是该群成员。
+> 🔴 **禁止**依赖 `pkg/space/middleware.go:112-115`「无 space_id → 跳过校验」的口子；联邦入站必须显式携带并强校验频道/租户归属（[api] 测试：缺归属的入站请求被拒）。
+
+### 4.3 `federation_peer`
+```sql
+CREATE TABLE federation_peer (
+  peer_instance_id VARCHAR(64) PRIMARY KEY,
+  display_name     VARCHAR(128) NOT NULL,      -- 对端组织名（外部标记用，§7）
+  base_url         VARCHAR(255) NOT NULL,      -- 对端网关入口（见 §4.6 SSRF 约束）
+  hmac_key_id      VARCHAR(32)  NOT NULL,      -- 当前密钥 ID（envelope 回填，§4.4）
+  hmac_secret_enc  VARBINARY(512) NOT NULL,    -- 加密存储
+  hmac_key_id_prev VARCHAR(32)  NULL,          -- 轮换窗口旧密钥 ID
+  hmac_secret_prev VARBINARY(512) NULL,
+  status           TINYINT NOT NULL DEFAULT 1, -- 1=active 2=suspended 3=revoked
+  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+);
+```
+
+### 4.4 🔴 密钥管理 + 防重放（P0/P1）
+- **规范化签名输入**：签名覆盖 `key_id + method + path + sha256(body) + timestamp + nonce`（明确定义拼接顺序，避免歧义）。
+- **时间窗**：`timestamp` 超出 ±N 分钟拒绝；**nonce** 在窗口内去重（Redis SETNX，保留期 ≥ 时间窗），杜绝重放。区分「网络重试（同 idempotency_key，§5.5 幂等吸收）」与「重放攻击（nonce 撞）」。
+- **轮换**：envelope 带 `key_id`，接收方据此选 current/prev 密钥；双密钥窗口内两者都验，窗口结束废弃 prev。
+- **密钥托管**：`hmac_secret_enc` 依赖 KMS / 应用层加密密钥 + 版本管理；**带外人工配对交换，密钥永不回显/入日志/进文档**。删除 peer → 立即 fail-closed，同时失效积压重试队列、连接池、权限缓存。
+
+### 4.5 `federation_channel`（联邦群 ↔ peer 的权威映射）
+🔴 设计评审修正：`channel_ref` 不能是自由字符串。新表把**本地群**与 **peer + 对端频道 ID** 双向绑定，`channel_ref` 用**不可猜测的联邦频道 token**（非本地 group id 直出），Host 为解析权威方：
+```sql
+CREATE TABLE federation_channel (
+  federation_channel_token VARCHAR(64) PRIMARY KEY,  -- 不可猜测
+  local_group_id           VARCHAR(64) NOT NULL,
+  peer_instance_id         VARCHAR(64) NOT NULL,
+  peer_channel_id          VARCHAR(64) NOT NULL,
+  status                   TINYINT NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+  UNIQUE KEY uk_local_peer (local_group_id, peer_instance_id)
+);
+```
+
+### 4.6 🔴 `base_url` 的 SSRF / 路由劫持面（P1）
+管理员配置的 peer URL 未约束会让网关向内网/错主机推数据。**必须**：仅 https；解析 IP 后拒绝私网/环回/元数据段（RFC1918、169.254/16 等）；禁跟随重定向；建议证书 pin 或固定 CA。HMAC 不防错目的地。
+
+---
+
+## 5. Q3 · 消息流
+
+### 5.1 分岔口（2.3(b)）：服务端中继（选定）
+B 客户端只连 **B 自己的 IM**；跨实例由两侧 `modules/federation` 服务端中继。A 的 IM 把影子当**从不连接的订阅者**（2.2：`IMAddSubscriber` 无握手、token 只在真实登录铸）。**不选** Option 2（Host 给 B 用户铸 IM token）——那是给管不着的人铸凭证、把 IM 暴露给不受信客户端，攻击面巨大。
+
+### 5.2 流转（文本，单条，B→A 入站）
+```
+B 用户发消息 → B server 识别频道为联邦 → B 网关 POST A 网关（HMAC 签名 + nonce）
+ → A 网关：§4.2 三段授权 → 解析 remote_uid→shadow_uid（并发 upsert，§3.2）
+ → A 写 outbox（§5.5）→ 以影子 uid 服务端发送写入 A 的 IM 频道 → IM 广播群内订阅者
+```
+A→B 反向为对称链路（Phase 1b，见 §12）。
+
+### 5.3 中继 envelope
+```json
+{ "key_id":"<签名密钥ID>", "peer_instance_id":"<发送方>", "federation_channel_token":"<§4.5>",
+  "remote_uid":"<发送方本地 uid>", "msg_type":"text|image|file|edit|revoke|profile|lifecycle",
+  "payload":{...}, "idempotency_key":"<对端消息唯一键>", "nonce":"<防重放>", "sent_at":"<RFC3339>" }
+```
+🔴 `sent_at` 来自对端，**不可信作排序权威**；Host 以本地接收序 + 自身时钟为准，`sent_at` 仅供展示，避免时钟偏移乱序。
+
+### 5.4 🔴 Phase 0 spike（阻塞性前提）
+仅测「真实用户向含合成 uid 的频道发消息不报错」**不够**。**必须同时实测**「以合成 uid 作为 `from_uid` 走服务端 API 发送（伪装发送者）IM 是否接受」——这才是 Option 1 的真正前提。
+实测断言（全绿才进 Phase 1）：
+1. `IMAddSubscriber` 把从不登录的合成 uid 加入频道 **成功**；
+2. `getSubscribers` datasource 返回列表**含**该 uid；
+3. **以该 uid 为 from_uid 服务端发消息，IM 接受并广播、不校验发送者 token**；
+4. A 能**捕获**群内消息作为出站事件（§5.5 前提）。
+任一失败 → **STOP 上报**，Option 1 前提崩，回设计（评估 Option 2 或消息落库不进 IM 的降级）。
+
+### 5.5 🔴 出站捕获 + 可靠投递（outbox，P0/P1）
+- **出站捕获**：Host 需一个「消息写入联邦频道」的**事件钩子**（webhook / 消息持久化后回调）来触发向 peer 中继。**该钩子在 octo 消息管线中的确切落点未验证——需实测**（候选：现有 webhook 事件流 `modules/webhook`）。
+- **双写难题**：「写 IM」与「记幂等/outbox」非同一事务 → 崩溃窗口造成重复或永久丢消息。**采用 outbox 模式**：入站先落 `federation_inbox`（`(peer, idempotency_key)` 唯一，事务内），再由 worker 幂等地推 IM；出站先落 `federation_outbox`，worker 带 ACK/重试/死信地投递 peer。定义：保留期、最大重试、DLQ、崩溃恢复（重启后扫未 ACK）。
+- **IM 侧去重（P2）**：即便 DB 幂等，网络抖动重试写 IM 仍可能双气泡；需确认 IM 是否支持外置 client-msg-no 去重（**需实测**），否则 worker 必须保证「已确认写入 IM」的状态持久化后才不重发。
+
+---
+
+## 6. Q4 · 成员投影
+影子 uid 是真实本地成员行 → `GetSubscribableMemberUIDs()` 天然返回，datasource 无需改。加成员走 `IMAddSubscriber`，带 `is_external=1` + `source_peer_instance_id`。
+🔴 **成员存储模型（P1）**：`source_peer_instance_id` 落**哪张成员表**、能否与 `source_space_id` 共存、唯一键、迁移兼容——**均需实测现有 group member 表后确定**，不得假设。
+🔴 静默消失（2.4）：`service.go:1452 QueryByUIDs`→`:1497` 遍历 DB 结果丢弃未知 uid——因影子已是真实行而被规避；[api] 测试须断言投递含影子 uid 名单无静默丢弃。
+
+---
+
+## 7. Q5 · 外部标记绝不能丢
+现状 bug：`GetSpaceName` 对远端 space 返回空串 → `external_marker_cache.go:162-168` 丢标签 → 联邦成员渲染成无标记（最坏）。
+**不变量（spec 级强制）**：`source_peer_instance_id` 非空而 space name 不可解析时，**强制**用 `federation_peer.display_name` 渲染外部角标，**绝不渲染成无标记**；缺标记 = 硬 bug。
+🔴 验收精化（P2）：「每一处」需给**完整渲染面清单**（成员列表 / 消息气泡 / 会话列表 / 通知 / @提及 / 历史消息 / 各客户端版本）+ 缓存失效规则；单个 browser 测试不足以证明全覆盖——按渲染面拆多条 [api]/[browser] 断言。移动端渲染为 [manual]（无移动自动化 lane）。
+
+---
+
+## 8. Q6 · 撤销与生命周期（事件驱动为主）
+🔴 设计评审修正：轮询心跳在数百成员下 O(N) 无效轮询 + 生命周期竞态可绕过。修正：
+- **8.1 事件驱动为主**：B 主动推 `lifecycle`（`user_suspended`/`user_revoked`/入群/退群）事件，Host 即时处置。放弃周期性全量轮询。
+- **8.2 租约作 fail-closed 兜底**：`lease_expires_at` 仅作「长时间无任何事件」的保险；过期→`suspended`（禁发言、标记不活跃），非高频轮询。网关断线重连时做一次全量 sync 对账。
+- **8.3 profile 更新通道（P1）**：B 用户改昵称/头像 → 推 `profile` 事件 → 更新 `federation_identity.display_name/avatar_url`，避免影子信息永久停在首条消息快照。
+- **8.4 🔴 吊销的线性化（P1）**：revoke 必须**原子失效**在途请求 + 成员缓存 + 权限缓存，防止「已 revoke 用户借在途请求/陈旧缓存继续写入」。历史消息作者改标注须与现有作者缓存一致（定义失效顺序）。
+
+---
+
+## 9. Q7 · 附件跨域（异步拉取）
+🔴 设计评审修正：同步推送几十~上百 MB 文件经 HTTP 网关会堆积/内存暴涨/超时导致中继失败。**改为**：
+- B 中继消息只带**附件元数据 + B 侧签名下载 token**；A 落消息后由**异步 Worker 回 B 拉取**并转存 A 本地 MinIO，改写 URL 为 Host-local（保「内容落 Host」的数据主权属性）。
+- 必须定义：流式**大小/类型前置校验**、内容哈希完整性、（可选）恶意文件扫描、对象写入与消息引用的**原子提交/失败清理**、重复上传幂等、下载授权、**撤销后历史附件访问策略**。
+- 惰性签名 URL（读时回源）作为备选，但依赖对端长期在线，MVP 不选。
+
+---
+
+## 10. Q8 · E2E 加密
+`signal_identities` 表存在。**结论：Option 1 服务端中继下 E2E 不成立**（server 必须见明文以影子 uid 存/发；影子在 Host 无真实设备/密钥；附件在 Host 落明文）。
+**硬门（fail-closed，双向拦截）**：① 开 E2E 的群拒绝开联邦；② 🔴 **开联邦的群也必须拒绝 `EnableE2E` 接口**（P2——防只拦 CreateFederation 漏改 EnableE2E 造成损坏混合态）。判定须有**单一事实源 + 事务约束**，防群设置并发变更下短暂双开。向用户明示「跨企业协作，非端到端加密」。
+
+---
+
+## 11. Q9 · 安全边界（联邦版信息暴露表）
+**总开关**：群 `allow_external=1`（复用）**且** `federation_peer.status=active`（新增），双前置缺一不可，默认关。
+| 信息面 | 联邦影子能看到 | 不能看到 |
+|---|---|---|
+| 该联邦群消息/附件 | ✅ | — |
+| 群成员列表（影子投影，带角标） | ✅ | 成员跨群/组织内其它信息 |
+| Host 其它 Space/群 | ❌ | ✅ 隔离 |
+| Host 用户目录/全局搜索 | ❌（仅群内） | ✅ 隔离 |
+| Host 好友图/组织架构 | ❌ | ✅ 隔离 |
+复用 `space_filter.go`/`shouldIncludeGroupForSpace` 收敛可见性到该联邦群。
+🔴 复用 §4.2 授权 + 禁用 `middleware.go:112-115` 跳过口子。补：**per-peer 限流 / DoS 防护**（一个被攻陷 peer 洪泛）；**跨实例流量审计日志**（合规需要，记录谁经边界发了什么）。
+
+---
+
+## 12. Q10 · 分阶段落地
+为避免范围自相矛盾（声称单向却验反向），最小切面拆分如下：
+
+| 阶段 | 切面 | 可验证验收 |
+|---|---|---|
+| **Phase 0（spike）** | §5.4 扩展 spike（订阅 + **伪装发送** + 出站捕获） | 四断言全绿→过；任一失败 STOP |
+| **Phase 1a（MVP，真·单向）** | HMAC 配对 + 三段授权 + `federation_identity`(并发 upsert) + 不可认证影子约束 + `federation_channel` + inbox/outbox + **仅 B→A 文本入站** + 硬外部标记 | [api] B 文本经中继出现在 A 群、带正确角标、无静默丢弃；[api] 缺归属/未授权入站被拒；[api] 重放（nonce 撞）被拒、重试（同 idempotency）幂等；[browser] 群内每处见角标 |
+| **Phase 1b** | A→B 反向出站（对称链路） | [api] A 消息经出站 outbox 到达 B、ACK/重试可靠 |
+| **Phase 2** | 附件异步拉取 + 花名册事件同步 + profile 更新 + 吊销/租约生命周期 | [api] 附件落 Host 存储且原子;[api] revoke 后影子移出+发言被拒+缓存失效;[api] profile 事件更新影子;[api] 租约过期→suspended |
+| **Phase 3（加固）** | 密钥轮换（key_id 双窗口）+ SSRF 约束 + per-peer 限流 + 审计日志 + E2E 双向硬 gate | [api] 轮换期 old+new 均验、切换后 old 失效;[api] base_url 私网被拒;[api] E2E 群开联邦 & 联邦群 EnableE2E 均被拒 |
+优先级：[api] > [browser] > [manual]。移动端渲染面为 [manual]。
+
+---
+
+## 13. Out-of-scope
+双向复制（方案 B）；开放联邦 / 多于两家动态发现（起步只做带合同点对点）；联邦 E2E（§10 已知限制）；WuKongIM 源码改动；修改现有 go 业务文件行为（本轮只出设计）；`@` 域名限定 uid。
+
+---
+
+## 14. STOP conditions（执行者遇到即停并上报）
+1. Phase 0：IM 拒绝未知订阅者 **或** 拒绝伪装 from_uid 发送 **或** 无法捕获出站消息 → Option 1 崩，回设计。
+2. 无法建立出站事件捕获钩子 / 无法实现 inbox·outbox 幂等与崩溃恢复 → 停。
+3. 无法建立 `federation_channel` 双端映射 → 停。
+4. oidc 列宽 revert 存在数据/索引级根因影响影子方案 → 停。
+5. `source_peer_instance_id` 无既有成员表可安全承载 / 与 `source_space_id` 冲突 → 停。
+6. `short_no` / `federation_shadow` 列不可空且无安全落位 → 停。
+7. §3.3 影子路径审计发现无法统一拦截的认证入口 → 停。
+8. 发现 uid 上本 spec 未覆盖的强假设（除 `@`/DM 外）→ 停。
+9. 数据主权/合规决策点（§16）未获明确 confirm → 不得进 Phase 1 之后。
+
+---
+
+## 15. 未验证 / 需实测清单（诚实标注）
+1. **2.3(a) 扩展**：IM 接受未知订阅者 **且** 接受伪装 from_uid 服务端发送 **且** 可捕获出站——未验证，Phase 0 必做。
+2. **出站事件捕获钩子在消息管线的确切落点** — 未验证（候选 webhook 事件流）。
+3. **IM 是否支持外置 client-msg-no 去重** — 未验证。
+4. **oidc uid 列宽 64 放大被 revert 的原因** — 本轮未查（仓未配置），执行前必查。
+5. **`short_no` 可空性 / `federation_shadow` 及 `source_peer_instance_id` 列落位与迁移兼容** — 未验证。
+6. **本文档全部 file:line 证据** — 本轮未能重开 octo-server 复核（工作区未配置该仓），沿用前置勘察；执行者 drift check 后逐条对齐当前 HEAD。
+
+---
+
+## 16. 需 Yu confirm 的决策点
+1. 🔴 **数据主权（最重）**：单边托管下 B 的协作数据（消息/附件/成员 profile）物理落 A 服务器。两家法务/合规是否接受？谁是数据控制者？跨境？**联邦解除后 A 上 B 数据是否须清除（GDPR）？**
+2. **互信原语**：MVP 用 HMAC 共享密钥可否，抑或合规要求起步即 mTLS/JWT？
+3. **E2E**：联邦群非端到端加密（双向硬 gate）可否接受？
+4. **消息流分岔**：服务端中继（推荐）vs 给 B 用户铸 A 的 IM token？
+5. **附件**：异步拉取转存 Host（推荐）vs 惰性签名跨取？
+6. **影子 profile 投影范围**：B 用户真实姓名/头像在 A 侧展示到什么程度？影子能否被 DM？
+7. **`short_no` 分配策略**：影子是否占号 / 占哪段？
+8. **谁当 Host（A）**：每个外部群由哪方托管的治理规则 + per-peer 授权到「哪些群」。
+
+---
+
+## 17. 测试要点汇总
+Phase 0 扩展 spike（阻塞）；影子穿 `QueryByUIDs` 无丢弃；外部标记按渲染面多点 fail-safe；缺归属入站被拒 / 影子不可全局搜索·加好友·登录；防重放（nonce）与幂等（idempotency）区分；outbox 崩溃恢复 / ACK；附件原子转存；生命周期 revoke·租约·profile 事件；HMAC 双密钥轮换；base_url SSRF 拒私网；E2E 双向 gate。
+
+---
