@@ -244,11 +244,11 @@ func (s *SystemSettings) getInt(category, key string, fallback int) int {
 // direct DB edit could still introduce — falls back to the code default rather
 // than being served verbatim. Defence in depth for the int settings (D-289).
 func (s *SystemSettings) getIntClamped(category, key string, fallback int) int {
-	v := s.getInt(category, key, fallback)
-	if v < settingIntMin || v > settingIntMax {
+	v, ok := s.lookup(category, key)
+	if !ok {
 		return fallback
 	}
-	return v
+	return parseSettingIntClamped(v, fallback)
 }
 
 func (s *SystemSettings) getFloat(category, key string, fallback float64) float64 {
@@ -587,6 +587,65 @@ func (s *SystemSettings) ThreadArchiveOrdering() ThreadArchiveOrdering {
 		ArchiveDays:    s.ThreadAutoArchiveDays(),
 		RecentDays:     s.SidebarRecentFilterThreadDays(),
 	}
+}
+
+// ThreadArchiveOrderingKeys enumerates the (category, key) pairs the two-stage
+// decay guard reads. Exported-shaped as a function so the write path and the
+// tests cannot drift from the overlay's key strings.
+func ThreadArchiveOrderingKeys() [][2]string {
+	return [][2]string{
+		{"thread", "auto_archive_enabled"},
+		{"thread", "auto_archive_days"},
+		{"sidebar", "recent_filter_thread_days"},
+	}
+}
+
+// ResolveThreadArchiveOrderingFrom builds the ordering from raw system_setting
+// values — the ones read inside the guarded transaction — applying the same
+// DB → env → code-default chain the snapshot getters apply.
+//
+// It exists because SystemSettings.ThreadArchiveOrdering() reads the in-memory
+// snapshot, which has a 60s TTL and is refreshed eagerly only on the writing
+// replica. Validating against that snapshot is precisely what let two concurrent
+// admin writes each pass against a stale view and commit a state the guard
+// forbids (task per-user-hiding-window / P0-A).
+//
+// `rows` holds only the keys that have a row; a missing key falls back, and an
+// existing row with an empty value falls back too — mirroring lookup(), which
+// reports "" as not-configured. Ints mirror getIntClamped: unparseable or
+// outside [settingIntMin, settingIntMax] falls back rather than being honoured,
+// so a row written before the bound existed cannot smuggle a value past the
+// guard that the getters would never return.
+func ResolveThreadArchiveOrderingFrom(rows map[string]string) ThreadArchiveOrdering {
+	o := ThreadArchiveOrdering{
+		ArchiveEnabled: threadAutoArchiveEnabledFromEnv(),
+		ArchiveDays:    threadAutoArchiveDaysFromEnv(),
+		RecentDays:     defaultSidebarRecentFilterThreadDays,
+	}
+	if v, ok := rows[schemaKey("thread", "auto_archive_enabled")]; ok && v != "" {
+		o.ArchiveEnabled = parseSettingBool(v, o.ArchiveEnabled)
+	}
+	if v, ok := rows[schemaKey("thread", "auto_archive_days")]; ok && v != "" {
+		o.ArchiveDays = parseSettingIntClamped(v, o.ArchiveDays)
+	}
+	if v, ok := rows[schemaKey("sidebar", "recent_filter_thread_days")]; ok && v != "" {
+		o.RecentDays = parseSettingIntClamped(v, o.RecentDays)
+	}
+	return o
+}
+
+// parseSettingIntClamped is the string-level half of getIntClamped, factored out
+// so the in-transaction resolver and the snapshot getter cannot diverge on what
+// an out-of-range stored value means.
+func parseSettingIntClamped(v string, fallback int) int {
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	if n < settingIntMin || n > settingIntMax {
+		return fallback
+	}
+	return n
 }
 
 // ApplyThreadArchiveOrderingOverlay merges an incoming admin batch onto the

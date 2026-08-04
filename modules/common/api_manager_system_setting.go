@@ -357,22 +357,29 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			orderingIncoming[p.def.Category+"."+p.def.Key] = p.value
 		}
 	}
+	// Atomic batch: open one transaction, queue every upsert, commit only
+	// if all rows succeed. A mid-batch DB failure rolls back everything
+	// rather than leaving callers to debug partial state.
+	//
+	// The ordering guard runs INSIDE this transaction (below), not before it.
+	// An earlier revision validated against m.systemSettings.ThreadArchiveOrdering()
+	// — a process-local snapshot with a 60s TTL that only the writing replica
+	// refreshes eagerly — and then opened the transaction, so the check and the
+	// write were merely adjacent rather than atomic: from {enabled, archive=6,
+	// recent=3}, one request setting archive=4 and another setting recent=5 each
+	// passed against the same stale view (4>=3, 6>=5) and both committed, landing
+	// 4 < 5 (task per-user-hiding-window / P0-A, from PR #679 review).
+	// Restore the anchor row before opening the transaction, never inside it —
+	// healing must not interact with the lock the transaction is about to take.
+	// No-op in a healthy deployment; see ensureGuardAnchor.
 	if len(orderingIncoming) > 0 {
-		prospective := ApplyThreadArchiveOrderingOverlay(
-			m.systemSettings.ThreadArchiveOrdering(), orderingIncoming,
-		)
-		if ViolatesThreadArchiveOrdering(prospective) {
-			httperr.ResponseErrorL(c, errcode.ErrThreadArchiveWindowOrdering, nil, i18n.Details{
-				"archive_days": strconv.Itoa(prospective.ArchiveDays),
-				"recent_days":  strconv.Itoa(prospective.RecentDays),
-			})
+		if err := m.systemSettingDB.ensureGuardAnchor(); err != nil {
+			m.Error("恢复配置守卫锚点行失败", zap.Error(err))
+			c.ResponseError(errors.New("写入系统设置失败"))
 			return
 		}
 	}
 
-	// Atomic batch: open one transaction, queue every upsert, commit only
-	// if all rows succeed. A mid-batch DB failure rolls back everything
-	// rather than leaving callers to debug partial state.
 	tx, err := m.systemSettingDB.beginTx()
 	if err != nil {
 		m.Error("开启事务失败", zap.Error(err))
@@ -385,6 +392,40 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			_ = tx.Rollback()
 		}
 	}()
+
+	// Guard, under the lock, before any row is written. Skipped entirely when the
+	// batch touches none of the three keys, so unrelated settings writes pay
+	// neither the lock nor the extra reads.
+	if len(orderingIncoming) > 0 {
+		// The anchor row must be locked FIRST — see lockGuardAnchorWithTx. Locking
+		// the three setting rows instead cannot work: the migration deliberately
+		// writes none of them, and FOR UPDATE over absent rows yields only mutually
+		// compatible gap locks, so both writers would pass and then deadlock on
+		// insert intention.
+		if err := m.systemSettingDB.lockGuardAnchorWithTx(tx); err != nil {
+			m.Error("获取配置守卫锁失败", zap.Error(err))
+			c.ResponseError(errors.New("写入系统设置失败"))
+			return
+		}
+		rows, err := m.systemSettingDB.loadValuesWithTx(tx, ThreadArchiveOrderingKeys())
+		if err != nil {
+			m.Error("读取偏序守卫相关配置失败", zap.Error(err))
+			c.ResponseError(errors.New("写入系统设置失败"))
+			return
+		}
+		// Resolved from the rows just read under the lock, NOT from the snapshot.
+		prospective := ApplyThreadArchiveOrderingOverlay(
+			ResolveThreadArchiveOrderingFrom(rows), orderingIncoming,
+		)
+		if ViolatesThreadArchiveOrdering(prospective) {
+			httperr.ResponseErrorL(c, errcode.ErrThreadArchiveWindowOrdering, nil, i18n.Details{
+				"archive_days": strconv.Itoa(prospective.ArchiveDays),
+				"recent_days":  strconv.Itoa(prospective.RecentDays),
+			})
+			return
+		}
+	}
+
 	for _, p := range plans {
 		if p.skip {
 			continue
