@@ -664,6 +664,20 @@ func threadAutoArchiveEnabledFromEnv() bool {
 // legitimate "disable the threshold" value, and any other non-negative integer
 // is honoured verbatim — including values above settingIntMax.
 //
+// "Exactly" includes NOT trimming whitespace. An earlier revision wrapped the
+// lookup in strings.TrimSpace, which reads like a harmless convenience but was
+// the one input where this migration was not behaviour-identical on rollout
+// (PR #679 review, yujiawei): legacy parseDays hands " 9999 " straight to
+// strconv.Atoi, which fails, so today such a deployment archives at the 3-day
+// default — while the trimming version resolves it to 9999 and effectively
+// stops archiving. Whichever reading matches the operator's intent, silently
+// switching between them on a rollout is not this shim's job.
+// TestThreadAutoArchiveDaysFromEnv_MatchesLegacyParseDays pins the equivalence.
+//
+// Note the sibling threadAutoArchiveEnabledFromEnv DOES trim — correctly, because
+// the legacy parseBool it mirrors trims too. The rule is "match the legacy parser",
+// not "trim" or "don't trim".
+//
 // The upper bound deliberately does NOT apply here (PR #679 review, Jerry-Xin).
 // An earlier revision clamped the env layer too, on a defence-in-depth
 // argument, but that silently reinterprets an existing deployment's config:
@@ -678,7 +692,9 @@ func threadAutoArchiveEnabledFromEnv() bool {
 // or a documented fallback (getIntClamped) rather than a silent
 // reinterpretation.
 func threadAutoArchiveDaysFromEnv() int {
-	raw := strings.TrimSpace(os.Getenv(envThreadAutoArchiveDays))
+	// NOT TrimSpace — see the doc comment above. Legacy parseDays reads the raw
+	// value, so this must too.
+	raw := os.Getenv(envThreadAutoArchiveDays)
 	if raw == "" {
 		return defaultThreadAutoArchiveDays
 	}

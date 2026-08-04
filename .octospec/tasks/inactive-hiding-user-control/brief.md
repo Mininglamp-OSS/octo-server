@@ -209,8 +209,16 @@ source: self
 ## 已知边界（评审要求显式记录，非缺陷）
 
 - **P0 与 P2 冲突时 P0 赢。** 一个既 archived 又置顶/有未读的子区仍会被 recent tab
-  丢弃 —— 归档是话题生命周期的客观事实，压过每人视图的豁免。三端本就在客户端隐藏
-  archived，且任何新消息都会复活，故无回归。
+  丢弃 —— 归档是话题生命周期的客观事实，压过每人视图的豁免。
+  **无回归的准确理由是：web 的主最近列表根本不消费这个端点。** 它走
+  `/v1/conversation/sync?recent_filter=true`，而那条路径早在本任务之前就丢弃 archived
+  （`QueryActiveShortIDs`, `status=active`）。`tab=recent` 在 web 上只有两个弹窗选择器
+  在用（转发弹窗、智能纪要会话选择器），转发弹窗自己已经跑 `filterArchivedThreads`。
+  原先这里写的是「三端本就在客户端隐藏 archived」—— 结论相同但理由是错的：
+  `archivedThreads.ts` 的头注释把自己定义为 **follow** tab 的过滤器，调用点也都在
+  `ConversationListGrouped` / 角标 / 转发弹窗，没有一个作用在这个端点的 recent tab 上。
+  照原文写下去，Batch 2 会依赖一个并不存在的客户端过滤
+  （PR #679 review 第 6 轮, yujiawei）。此外任何新消息都会让子区复活。
 - **静音但有未读的群永远不淡出。** `keepDespiteRecentWindow` 没有 mute 入参，两个
   调用点也都拿不到（`config.SyncUserConversationResp` 无 mute 字段，`SidebarItem`
   不暴露；用 `/v1/conversation/sync` 的 `Mute` 会重新制造 per-endpoint 分叉）。后果：

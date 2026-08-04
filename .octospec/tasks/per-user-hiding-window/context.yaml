@@ -1,0 +1,26 @@
+injected:
+  - id: space-isolation
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/per-user-hiding-window/brief.md
+notes: |
+  Resolved from the brief's load-bearing tags (space, isolation, wire-contract,
+  error-response, i18n, rate-limit, thread, system-setting, testing) and from
+  the paths this batch will touch (modules/**/*.go, **/*_test.go, **).
+  .octospec/_global/ is not synced in this checkout, so every rule resolves at
+  repo tier.
+
+  Scope note for the first commit (the five #679 carry-overs): it touches no
+  HTTP handler, so error-handling / rate-limit / space-isolation / trust-boundary
+  impose no new constraint on it beyond running the i18n gates. They are recorded
+  here because they govern the rest of the batch — the /v1/user/space/setting
+  extension is squarely inside all four.

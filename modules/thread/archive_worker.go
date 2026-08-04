@@ -37,6 +37,9 @@ type ArchiveWorker struct {
 	// inactive-hiding-user-control / P1）。生产路径注入 system_settings 读取器；
 	// 为 nil 时回落到 cfg.Enabled / cfg.Threshold，单测据此保持原有构造方式。
 	policy func() (bool, time.Duration)
+	// ordering 读取当前生效的「归档窗口 vs 最近列表隐藏窗口」偏序，仅在 Start() 调一次。
+	// 生产路径注入 system_settings 读取器；为 nil 时跳过（单测默认）。
+	ordering func() commonapi.ThreadArchiveOrdering
 	// lastPolicy 只用于「策略变更时打一条日志」的去抖，避免每小时重复刷同样的值。
 	// 仅在 ticker goroutine 内读写，无并发。
 	lastPolicy   string
@@ -70,7 +73,50 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 		w.warnIfClamped(enabled, days)
 		return enabled, archiveThresholdFromDays(days)
 	}
+	w.ordering = func() commonapi.ThreadArchiveOrdering {
+		return commonapi.EnsureSystemSettings(ctx).ThreadArchiveOrdering()
+	}
 	return w
+}
+
+// orderingViolatesIfEnabled 回答「这组取值**一旦归档开启**是否违反偏序」。
+//
+// 直接调 ViolatesThreadArchiveOrdering 不够：它在 !ArchiveEnabled 时短路返回 false，
+// 这正是本函数要绕开的那个洞（见 logOrderingAtStart）。做法是把 ArchiveEnabled 置真后
+// 再交给守卫本人判定 —— 不等式因此仍然只有一份实现，不在这里复制一遍。
+func orderingViolatesIfEnabled(o commonapi.ThreadArchiveOrdering) bool {
+	o.ArchiveEnabled = true
+	return commonapi.ViolatesThreadArchiveOrdering(o)
+}
+
+// logOrderingAtStart 在 worker 启动时把生效的两级衰减取值打一条日志，违反偏序时升为 WARN。
+//
+// 为什么需要它：管理写路径的守卫只覆盖 DB→DB，且 ViolatesThreadArchiveOrdering 在
+// !ArchiveEnabled 时短路，于是「纯 env 配出来的违规状态」不去写一次管理接口就永远不暴露
+// （PR #679 review 第 7 轮，known boundaries 的「守卫只覆盖 DB→DB」那条）。
+// 进程启动是唯一一个必然发生、且能同时看到两个窗口的时刻。
+//
+// 违规意味着子区会在最近列表的隐藏窗口走完之前就被归档 —— 运维调宽隐藏窗口会看不到任何
+// 效果，因为归档先一步把子区拿走了。归档关着时同样告警（带 archive_enabled=false），
+// 因为那正是「打开开关的瞬间就会生效」的潜伏状态，也正是守卫看不见的那一类。
+func (w *ArchiveWorker) logOrderingAtStart() {
+	if w.ordering == nil {
+		return
+	}
+	o := w.ordering()
+	fields := []zap.Field{
+		zap.Bool("archive_enabled", o.ArchiveEnabled),
+		zap.Int("archive_days", o.ArchiveDays),
+		zap.Int("recent_filter_thread_days", o.RecentDays),
+	}
+	if orderingViolatesIfEnabled(o) {
+		w.Warn("thread archive window is shorter than the recent-tab hiding window; "+
+			"threads are archived before the hiding window elapses, so widening the "+
+			"hiding window has no visible effect",
+			fields...)
+		return
+	}
+	w.Info("thread archive / recent-hiding windows at start", fields...)
 }
 
 // warnIfClamped 在生效天数被 maxArchiveDays 钳住时打一条 WARN。
@@ -163,6 +209,7 @@ func (w *ArchiveWorker) Start(ctx context.Context) {
 			zap.Duration("interval", w.cfg.Interval))
 		return
 	}
+	w.logOrderingAtStart()
 	rctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 	w.wg.Add(1)
