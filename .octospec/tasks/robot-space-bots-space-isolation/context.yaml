@@ -1,0 +1,24 @@
+injected:
+  - id: space-isolation
+    source: repo
+    # matched: touches[space, isolation, auth, acl, bot-api] + paths(modules/**/*.go)
+    # load_bearing — this task IS the isolation boundary being repaired.
+  - id: rate-limit
+    source: repo
+    # matched: touches[rate-limit] + paths(modules/**/*.go)
+    # load_bearing — enumerable list endpoint had no per-UID limiter; added.
+  - id: error-handling
+    source: repo
+    # matched: touches[error-response, i18n, wire-contract] + paths(modules/**/*.go)
+    # The rejection comes from spaceMiddleware's pre-existing raw 403, which this
+    # task deliberately does NOT migrate (shared by every mounting route). The
+    # handler's own error paths are untouched.
+  - id: trust-boundary
+    source: repo
+    # matched: touches[wire-contract] only. Substantively N/A — no adapter, no
+    # external content, no markdown/URL emission.
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/robot-space-bots-space-isolation/brief.md

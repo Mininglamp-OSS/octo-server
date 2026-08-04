@@ -391,7 +391,6 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.GET("/robot/commands", rb.getCommands)                  // 查询机器人命令列表
 		auth.PUT("/robot/:robot_id/description", rb.setDescription)  // 设置 Bot 简介
 		auth.PUT("/robot/:robot_id/auto_approve", rb.setAutoApprove) // 设置是否自动通过好友申请
-		auth.GET("/robot/space_bots", rb.spaceBots)                  // Bot 广场 — Space 内所有 Bot
 		auth.GET("/robot/my_bots", rb.myBots)                        // 我的 Bot — 已添加好友的 Bot
 		// bot 群级免@偏好（octo-server#237）：owner 写/读/列群
 		auth.GET("/robot/:robot_id/groups", rb.listGroups)                                  // 列出 bot 所在群 + no_mention
@@ -403,6 +402,24 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
 	{
 		ownedBots.GET("/robot/owned_bots", rb.ownedBots)
+	}
+
+	// Bot 广场 — Space 内所有 Bot。
+	//
+	// 从上面的共享 auth 组里摘出来单独成组，是为了补两道此前缺失的防护：
+	//
+	//  1. SpaceMiddleware。本路由从 query 取 space_id 后直接查库，全链路没有任何
+	//     成员身份校验，任何登录用户传一个别的 space_id 就能拿到该空间全部 bot 的
+	//     name / description / creator_uid / creator_name / bot_commands——跨租户
+	//     读取。中间件恰好也从 query 读 space_id，因此挂上即可，handler 与响应
+	//     形状都不用动。
+	//  2. SharedUIDRateLimiter。这是个可枚举的列表接口，此前只有全局 IP 限流。
+	//
+	// 顺序：AuthMiddleware → 限流 → Space 校验。限流必须在 AuthMiddleware 之后
+	// 才读得到 uid，否则会静默 fail-open。
+	spaceBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
+	{
+		spaceBots.GET("/robot/space_bots", rb.spaceBots)
 	}
 
 	robotAuth := r.Group("/v1/robots/:robot_id/:app_key", rb.authRobot()) // :robot_id即user的username
