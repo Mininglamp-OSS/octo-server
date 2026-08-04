@@ -1,0 +1,30 @@
+injected:
+  - id: error-handling
+    source: repo
+    # matched: touches[error-response, i18n, wire-contract] + paths(pkg/**/*.go)
+    # load_bearing — this task IS the error-handling migration. Two decisions sit
+    # here: (1) ResponseErrorLWithStatus instead of the D14 default ResponseErrorL,
+    # a documented divergence needing maintainer sign-off, because these exits have
+    # always been 401/403/500 and pinning them to 400 would break status-code
+    # branching; (2) ErrSpaceQueryFailed is Internal=true, so the cause is logged
+    # and never returned.
+  - id: space-isolation
+    source: repo
+    # matched: touches[space, isolation, auth] + paths(pkg/space/**)
+    # The authorization logic is untouched — only how a rejection is serialized.
+    # One isolation-relevant assertion: the 403 body must not echo space_id, or a
+    # non-member gets the Space's existence confirmed.
+  - id: testing
+    source: repo
+    # load_bearing — the absence of body assertions is why the behaviour change
+    # went unnoticed and got described wrongly in a PR. The new tests assert the
+    # exact post-migration msg strings so the claim is machine-checked.
+  - id: commit-style
+    source: repo
+  - id: rate-limit
+    source: repo
+    # N/A — no route mounting, no limiter change.
+  - id: trust-boundary
+    source: repo
+    # N/A — no adapter, no external content, no markdown/URL emission.
+brief: .octospec/tasks/space-middleware-error-envelope/brief.md

@@ -29,4 +29,4 @@
 0 modules/robot/api.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#267)
 8 modules/user/api.go
 4 modules/webhook/github.go  # EXEMPT: GitHub webhook signature errors — external GH never reads the localized envelope
-4 pkg/space/middleware.go
+0 pkg/space/middleware.go  # migrated to httperr.ResponseErrorLWithStatus (space-middleware-error-envelope)

@@ -37,6 +37,11 @@ func ResponseErrorL(c *wkhttp.Context, code codes.Code, params i18n.Params, deta
 //   - the document-comment Bot mention ingress (modules/bot_mention/api.go,
 //     POST /v1/internal/bot-mentions) — a new service-to-service endpoint whose
 //     docs-backend caller branches on 401/404/409/500 retry semantics.
+//   - SpaceMiddleware (pkg/space/middleware.go) — the inverted case: its three
+//     exits have ALWAYS been 401/403/500 (they predate the envelope, written as
+//     raw c.AbortWithStatusJSON), so here the D14 fixed-400 is what would break
+//     existing clients. WithStatus preserves the status quo on the wire while
+//     adding the envelope. See .octospec/tasks/space-middleware-error-envelope/.
 //
 // The body envelope is byte-for-byte identical to ResponseErrorL; only the
 // transport status differs — here it equals the code's canonical HTTPStatus, so
