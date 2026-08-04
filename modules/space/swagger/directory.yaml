@@ -85,37 +85,48 @@ paths:
                 $ref: "#/components/schemas/DirectoryResp"
         "400":
           description: >
-            `type` 取值非法。由 handler 经 `httperr.ResponseErrorL` 返回，
-            线路状态固定 400（D14 兼容），真实状态在 `error.http_status`。
-            `error.id` 为 `err.server.space.request_invalid`，`details.field` 为 `type`。
+            handler 自身的全部错误出口。经 `httperr.ResponseErrorL` 返回，
+            线路状态固定 400（D14 兼容），真实状态在 `error.http_status`：
+
+            * `err.server.space.request_invalid` — `type` 取值非法，
+              `details.field` 为 `type`；真实状态 400。
+            * `err.server.space.not_member` — 通过了中间件但 `c.Param("space_id")`
+              与中间件校验的 Space 不一致（防御性兜底，正常不可达）；真实状态 403。
+            * `err.server.space.query_failed` — 目录 / 总数 / 关系态查询失败；
+              真实状态 500，Internal，信封不携带具体原因。
+
+            按状态码分支的客户端拿不到这三者的区别，必须读 `error.code`。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: >
-            未登录。由 SpaceMiddleware 返回，`error.id` 为
-            `err.shared.auth.required`。
+            未登录。由 SpaceMiddleware 返回。
+
+            **注意：这一条不是错误信封。** 中间件目前用 `c.AbortWithStatusJSON`
+            直接写一个裸 `{"msg": "请先登录"}`，没有 `error.code`，客户端无法按错误码
+            分支——只能按 HTTP 状态码分支。这是既有行为，本接口如实记录而不是
+            粉饰；把中间件迁进信封会改变全部 13 个挂载该中间件的 route group 的
+            响应体，属于独立变更，见
+            `.octospec/tasks/space-middleware-error-envelope/`。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorEnvelope"
+                $ref: "#/components/schemas/MiddlewareRawError"
         "403":
           description: >
-            调用者不是该 Space 的成员，或该 Space 已解散。由 SpaceMiddleware
-            返回，`error.id` 为 `err.server.space.not_member`。
+            调用者不是该 Space 的成员，或该 Space 已解散。由 SpaceMiddleware 返回。
 
-            注意与 400 的区别：这一条走 `ResponseErrorLWithStatus`，线路状态就是
-            真实的 403，不做 D14 的固定 400 折叠——中间件既有的出口一直是 403，
-            折叠会打断所有按状态码分支的既有客户端。
+            与 401 同：裸 `{"msg": "无权访问该 Space"}`，不是错误信封，无 `error.code`。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorEnvelope"
+                $ref: "#/components/schemas/MiddlewareRawError"
         "429":
           description: >
             触发 per-UID 限流（`SharedUIDRateLimiter`，进程内跨路由共享配额）。
-            `error.id` 为 `rate.limited`，并带
+            `error.code` 为 `rate.limited`，并带
             `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `Retry-After` 头。
           content:
             application/json:
@@ -123,13 +134,17 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "500":
           description: >
-            服务端查询失败（目录查询、总数、关系态，或中间件的成员身份校验）。
-            `error.id` 为 `err.server.space.query_failed`；按仓库的
-            Internal 约定，信封不携带具体原因，排查请看服务端日志。
+            中间件校验成员身份时 DB 失败。裸 `{"msg": "校验 Space 成员身份失败"}`，
+            与 401/403 同源、同样不是信封。
+
+            handler 自身的查询失败（目录、总数、关系态）走
+            `httperr.ResponseErrorL`，因此线路状态是 **400** 而不是 500，
+            `error.code` 为 `err.server.space.query_failed`，真实状态在
+            `error.http_status`；按仓库的 Internal 约定信封不携带具体原因。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorEnvelope"
+                $ref: "#/components/schemas/MiddlewareRawError"
 
 components:
   schemas:
@@ -204,6 +219,25 @@ components:
             的 `status` 一致：friend 命中 → added，否则 friend_apply 命中 →
             pending，都没有 → not_added。这是本响应中唯一因人而异的字段。
 
+    MiddlewareRawError:
+      type: object
+      required: [msg]
+      description: >
+        SpaceMiddleware 的裸错误体，**不是**仓库统一的错误信封。
+
+        中间件用 `c.AbortWithStatusJSON` 直接写这个形状，早于 i18n 信封存在，
+        且违反仓库自己的 error-handling 规则。这里如实记录当前线上行为：
+        没有 `error` 对象、没有错误码、文案硬编码中文且不随 `Accept-Language`
+        变化，客户端只能按 HTTP 状态码分支。
+
+        迁移它会改变全部 13 个挂载 SpaceMiddleware 的 route group 的错误响应体，
+        与本接口无关，因此单独立项：`.octospec/tasks/space-middleware-error-envelope/`。
+      properties:
+        msg:
+          type: string
+          description: 硬编码的中文文案，不本地化
+          example: "无权访问该 Space"
+
     ErrorEnvelope:
       type: object
       description: >
@@ -220,9 +254,9 @@ components:
         error:
           type: object
           properties:
-            id:
+            code:
               type: string
-              description: 错误码 ID
+              description: 错误码 ID（渲染器输出的字段名是 `code`，不是 `id`）
               example: "err.server.space.not_member"
             message:
               type: string

@@ -2,37 +2,20 @@ package space
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
-	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
-	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"github.com/gin-gonic/gin"
 )
-
-// abortL 用 i18n 错误信封中止请求。
-//
-// 用 ResponseErrorLWithStatus 而不是 ResponseErrorL：后者把线路状态钉死成 400
-// （D14 兼容），而本中间件既有的出口一直是 401/403/500，改成 400 会打断所有按
-// 状态码分支的客户端。WithStatus 保留真实状态码，同时补上信封——信封本身是
-// 双形态的（renderer.go 同时输出 error{} 与 legacy 的 msg/status），所以对只读
-// msg 的老客户端也是纯增量。
-//
-// 此前这里用的是 c.AbortWithStatusJSON，直接违反仓库的 error-handling 规则，
-// 且让挂载本中间件的每个端点的鉴权失败出口都游离在 OpenAPI 契约之外：
-// 响应体没有 error.id，客户端无法按错误码分支。
-func abortL(c *wkhttp.Context, code codes.Code) {
-	httperr.ResponseErrorLWithStatus(c, code, nil, nil)
-	c.Abort()
-}
 
 // MembershipChecker 校验用户是否属于 Space 的函数签名。
 type MembershipChecker func(spaceID string, uid string) (bool, error)
 
 const cacheTTL = 60 * time.Second         // 正向缓存 60s
-const negativeCacheTTL = 30 * time.Second // 否定结果缓存 30s，新成员加入后快速生效
+const negativeCacheTTL = 30 * time.Second  // 否定结果缓存 30s，新成员加入后快速生效
 
 // MembershipCache 缓存成员身份校验结果的接口。
 type MembershipCache interface {
@@ -152,14 +135,14 @@ func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.Hand
 
 		uid := c.GetLoginUID()
 		if uid == "" {
-			abortL(c, errcode.ErrSharedAuthRequired)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "请先登录"})
 			return
 		}
 
 		// check cache
 		if isMember, found := cache.Get(spaceID, uid); found {
 			if !isMember {
-				abortL(c, errcode.ErrSpaceNotMember)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权访问该 Space"})
 				return
 			}
 			c.Set("space_id", spaceID)
@@ -170,7 +153,7 @@ func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.Hand
 		// query DB
 		isMember, err := check(spaceID, uid)
 		if err != nil {
-			abortL(c, errcode.ErrSpaceQueryFailed)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"msg": "校验 Space 成员身份失败"})
 			return
 		}
 
@@ -181,7 +164,7 @@ func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.Hand
 		cache.Set(spaceID, uid, isMember, ttl)
 
 		if !isMember {
-			abortL(c, errcode.ErrSpaceNotMember)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权访问该 Space"})
 			return
 		}
 
