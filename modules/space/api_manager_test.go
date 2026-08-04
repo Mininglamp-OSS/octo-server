@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	"github.com/Mininglamp-OSS/octo-server/pkg/db"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -1362,12 +1362,12 @@ func TestManager_CreateSpace_ValidationErrors(t *testing.T) {
 
 func TestEscapeLike(t *testing.T) {
 	cases := map[string]string{
-		"":             "",
-		"foo":          "foo",
-		"foo_bar":      `foo\_bar`,
-		"100%":         `100\%`,
-		`a\b`:          `a\\b`,
-		`mix_%\tricky`: `mix\_\%\\tricky`,
+		"":              "",
+		"foo":           "foo",
+		"foo_bar":       `foo\_bar`,
+		"100%":          `100\%`,
+		`a\b`:           `a\\b`,
+		`mix_%\tricky`:  `mix\_\%\\tricky`,
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, escapeLike(in), "in=%q", in)

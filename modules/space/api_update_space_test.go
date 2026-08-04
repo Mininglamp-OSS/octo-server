@@ -273,9 +273,9 @@ func TestUserUpdateSpace_Validation(t *testing.T) {
 			`null`,            // top-level null（旧实现会放过）
 			`[null]`,          // 数组含 null（旧实现会放过并落库 [""]）
 			`["a", null, "b"]`,
-			`[{}]`,   // 数组含对象
-			`[[]]`,   // 数组含数组
-			`[true]`, // 数组含布尔
+			`[{}]`,            // 数组含对象
+			`[[]]`,            // 数组含数组
+			`[true]`,          // 数组含布尔
 		}
 		for _, raw := range cases {
 			w := putSpace(t, spaceId, util.ToJson(map[string]interface{}{"preset_group_ids": raw}), testutil.Token)

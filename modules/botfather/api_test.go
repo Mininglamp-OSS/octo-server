@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 )
 
 func TestObjectPathFormat(t *testing.T) {

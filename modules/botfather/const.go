@@ -51,13 +51,13 @@ const (
 
 // 对话状态
 const (
-	StateNone                 = ""
-	StateWaitingBotName       = "waiting_bot_name"
-	StateWaitingSelectBot     = "waiting_select_bot"
-	StateWaitingNewName       = "waiting_new_name"
-	StateWaitingDescription   = "waiting_description"
-	StateWaitingDeleteConfirm = "waiting_delete_confirm"
-	StateWaitingRevokeConfirm = "waiting_revoke_confirm"
+	StateNone                  = ""
+	StateWaitingBotName        = "waiting_bot_name"
+	StateWaitingSelectBot      = "waiting_select_bot"
+	StateWaitingNewName        = "waiting_new_name"
+	StateWaitingDescription    = "waiting_description"
+	StateWaitingDeleteConfirm  = "waiting_delete_confirm"
+	StateWaitingRevokeConfirm  = "waiting_revoke_confirm"
 )
 
 // 状态上下文字段
