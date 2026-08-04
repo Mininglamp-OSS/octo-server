@@ -311,8 +311,11 @@ reserve → mutate → commit before CMD fan-out.
 ### D6. Existing business and wire semantics remain unchanged
 
 - `/v1/message/extra/sync` request/response fields, ordering, default/max limit,
-  membership checks, fake-channel derivation, and Redis cursor cache are not
-  changed.
+  membership checks, and fake-channel derivation are unchanged. Its Redis cursor
+  cache preserves the existing monotonic `max(cache, request)` behavior for valid
+  values, but untrusted request/cache cursors are constrained to the storage
+  channel's persisted `MAX(message_extra.version)` so they cannot poison the
+  activation floor; historical poisoned entries self-heal on read.
 - `CMDSyncMessageExtra` remains a best-effort notification sent only after the
   authoritative transaction commits. It does not gain card content, message ID,
   or version in this task.
@@ -382,11 +385,13 @@ Deployment is two-phase:
    and therefore continues through the one centralized legacy adapter. Confirm
    image digests/versions, readiness, migrations, and focused tests on every
    replica.
-2. **Cut over** — drain message-extra write traffic, wait for in-flight requests,
-   and confirm no pre-task binary remains. Run the final preflight, then use the
-   operator tool to take an exclusive lock on the state row, assert its expected
-   mode/epoch, and atomically set `cutover_floor=<verified floor>`, increment
-   `epoch`, and set `mode=transactional`. The activation transition runs with a
+2. **Cut over** — drain message-extra write traffic **and the
+   `/message/extra/sync` requests that can advance Redis cursors**, wait for
+   in-flight requests, and confirm no pre-task binary remains. Run the final
+   preflight, then use the operator tool to take an exclusive lock on the state
+   row, assert its expected mode/epoch, and atomically set
+   `cutover_floor=<verified floor>`, increment `epoch`, and set
+   `mode=transactional`. The activation transition runs with a
    short `innodb_lock_wait_timeout` on its own session: if it is issued before
    the write drain completes, the exclusive state-row lock fails fast and reports
    the in-flight writers instead of stalling live message-extra writes. Because
@@ -407,15 +412,20 @@ by the operator tool's compare-and-set during a transition. The transactional
 JavaScript clients can continue to represent JSON integer cursors exactly.
 
 An operator first runs the preflight before draining to estimate the floor and
-validate scan cost. After write traffic and in-flight requests are drained, the
-operator reruns it authoritatively; no message-extra writer may resume between
-that final scan and transactional activation. The tool uses Redis
+validate scan cost. After write traffic, `/message/extra/sync`, and their
+in-flight requests are drained, the operator reruns it authoritatively; no
+message-extra writer or Redis cursor updater may resume between that final scan
+and transactional activation. The tool uses Redis
 `SCAN`/`HSCAN` (never `KEYS`) and bounded DB queries to find the observed
 maximum across:
 
 1. `message_extra.version`;
 2. matching legacy `seq.min_seq` rows; and
-3. every cached `messageExtraVersion:*` hash field.
+3. every cached `messageExtraVersion:*` hash field. Non-negative values at or
+   below the DB/legacy issued ceiling participate in the floor. Malformed,
+   negative, or above-issued values cannot be trusted as server-issued:
+   preflight counts them as poisoned and excludes them, while the upgraded sync
+   handler repairs their per-channel cache entry on its next request.
 
 The task delivers an operator command under `tools/`: its default/read-only
 preflight computes these maxima and validates an operator-supplied floor; an
@@ -508,8 +518,9 @@ allocator, or a future exact-refresh protocol).
   composite cursor.
 - Adding content/message/version to `CMDSyncMessageExtra` or changing web,
   desktop, iOS, or Android refresh behavior.
-- Changing the Redis cursor cache or defining reconnect/foreground source-reset
-  semantics.
+- Redesigning Redis cursor ownership or defining reconnect/foreground
+  source-reset semantics beyond the bounded validation/self-healing required for
+  cutover safety.
 - Automatically re-versioning all historical `message_extra` rows during
   migration or broadcasting a fleet-wide forced resync.
 - Changing card rendering, callback delivery, revision history, `card_seq`,
@@ -572,10 +583,12 @@ allocator, or a future exact-refresh protocol).
   failure, and an optional expected-mode mismatch all fail writes closed and mark
   readiness unhealthy; a bumped `epoch` alone never fails a write; and no local
   environment value can override DB mode.
-- Cutover-preflight/activation tests cover DB/legacy-seq/Redis maxima, stale or
-  regressed `seq.min_seq`, safe-integer overflow rejection, redacted output,
-  expected mode/epoch compare-and-set, atomic DB mode/floor/epoch transition,
-  and transactional refusal when DB state is missing or malformed.
+- Cutover-preflight/activation tests cover DB/legacy-seq/Redis maxima, poisoned
+  Redis cursor classification without floor inflation, per-channel sync-cursor
+  normalization/self-healing, stale or regressed `seq.min_seq`, safe-integer
+  overflow rejection, redacted output, expected mode/epoch compare-and-set,
+  atomic DB mode/floor/epoch transition, and transactional refusal when DB state
+  is missing or malformed.
 - Rollback tests prove normal application rollback keeps DB mode transactional
   and accepts only a transactional-capable binary. Emergency-tool tests merge
   all `channel_type` rows into the legacy channel-ID key, reconcile the maximum

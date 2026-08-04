@@ -186,6 +186,17 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
+	// #627: reserve the message_extra version first (lock order state → channel
+	// seq → message_extra → pinned) so this path and revoke acquire the sequence
+	// and pinned rows in the same order, preventing a cross-writer deadlock.
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, 1)
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	version := versions[0]
 	isPinned := 0
 	isSendSystemMsg := false
 	if pinnedMessage == nil {
@@ -221,13 +232,6 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
-	}
-	version, err := m.genMessageExtraSeq(fakeChannelID)
-	if err != nil {
-		tx.Rollback()
-		m.Error("生成消息扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
 	}
 	err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 		MessageID:   req.MessageID,
@@ -472,7 +476,17 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
-	for _, msg := range updateModel {
+	// #627: reserve the whole range once before the pinned writes (lock order
+	// state → channel seq → message_extra → pinned), then assign deterministically.
+	// updateModel is bounded by the per-channel pinned cap, well under the cap.
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, len(updateModel))
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	for i, msg := range updateModel {
 		err = m.pinnedDB.updateTx(msg, tx)
 		if err != nil {
 			tx.Rollback()
@@ -481,13 +495,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 			return
 		}
 
-		version, err := m.genMessageExtraSeq(fakeChannelID)
-		if err != nil {
-			tx.Rollback()
-			m.Error("生成消息扩展序列号失败！", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
-		}
+		version := versions[i]
 		err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 			MessageID:   msg.MessageId,
 			MessageSeq:  msg.MessageSeq,
@@ -715,18 +723,14 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	})
 }
 
-func (m *Message) deletePinnedMessage(channelID string, channelType uint8, messageIds []string, loginUID string, tx *dbr.Tx) error {
-	fakeChannelID := channelID
-	if channelType == common.ChannelTypePerson.Uint8() {
-		fakeChannelID = common.GetFakeChannelIDWith(channelID, loginUID)
-	}
-	pinnedMessages, err := m.pinnedDB.queryWithMessageIds(fakeChannelID, channelType, messageIds)
+func (m *Message) deletePinnedMessage(storageChannelID string, channelType uint8, messageIds []string, tx *dbr.Tx) (bool, error) {
+	pinnedMessages, err := m.pinnedDB.queryWithMessageIds(storageChannelID, channelType, messageIds)
 	if err != nil {
 		m.Error("查询置顶消息错误", zap.Error(err))
-		return errors.New("查询置顶消息错误")
+		return false, errors.New("查询置顶消息错误")
 	}
 	if len(pinnedMessages) == 0 {
-		return nil
+		return false, nil
 	}
 	for _, pinnedMessage := range pinnedMessages {
 		pinnedMessage.IsDeleted = 1
@@ -735,22 +739,10 @@ func (m *Message) deletePinnedMessage(channelID string, channelType uint8, messa
 		if err != nil {
 			tx.Rollback()
 			m.Error("取消置顶消息错误", zap.Error(err))
-			return errors.New("取消置顶消息错误")
+			return false, errors.New("取消置顶消息错误")
 		}
 	}
-
-	err = m.ctx.SendCMD(config.MsgCMDReq{
-		NoPersist:   true,
-		ChannelID:   channelID,
-		ChannelType: channelType,
-		FromUID:     loginUID,
-		CMD:         common.CMDSyncPinnedMessage,
-	})
-
-	if err != nil {
-		m.Warn("发送cmd失败！", zap.Error(err))
-	}
-	return nil
+	return true, nil
 }
 
 type pinnedMessageResp struct {

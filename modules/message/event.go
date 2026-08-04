@@ -2,10 +2,11 @@ package message
 
 import (
 	"encoding/json"
-	"os"
-	"runtime/debug"
 	"errors"
 	"fmt"
+	"os"
+	"runtime/debug"
+	"sort"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -137,7 +138,16 @@ func (m *Message) handleReadedMessageCount() {
 		FromUIDs    []string
 	}
 	sendCmds := make([]*sendCMDVO, 0)
-	for fakeChannelID, msgs := range messageChannelMap {
+	// #627: iterate channels in sorted order so lock acquisition is deterministic
+	// across concurrent read-receipt batches (brief D4: map iteration must not
+	// decide lock order).
+	sortedChannelIDs := make([]string, 0, len(messageChannelMap))
+	for fakeChannelID := range messageChannelMap {
+		sortedChannelIDs = append(sortedChannelIDs, fakeChannelID)
+	}
+	sort.Strings(sortedChannelIDs)
+	for _, fakeChannelID := range sortedChannelIDs {
+		msgs := messageChannelMap[fakeChannelID]
 		messageIDStrs := make([]string, 0)
 		reqChannelType := common.ChannelTypePerson.Uint8()
 		reqChannelID := ""
@@ -157,14 +167,17 @@ func (m *Message) handleReadedMessageCount() {
 			return
 		}
 		fromUIDs := make([]string, 0, len(messages)) // 消息发送者
-		for _, message := range msgs {
+		// #627: reserve the whole channel group once (chunked) before writing
+		// message_extra, keeping the sequence lock ahead of the business rows.
+		versions, err := m.reserveVersions(tx, fakeChannelID, reqChannelType, len(msgs))
+		if err != nil {
+			tx.Rollback()
+			m.Error("生成消息扩展序列号失败！", zap.Error(err))
+			return
+		}
+		for mi, message := range msgs {
 			fromUIDs = append(fromUIDs, message.FromUID)
-			version, err := m.genMessageExtraSeq(fakeChannelID)
-			if err != nil {
-				tx.Rollback()
-				m.Error("生成消息扩展序列号失败！", zap.Error(err))
-				return
-			}
+			version := versions[mi]
 			count := messageReadedCountMap[message.MessageID]
 			if message.ChannelType == common.ChannelTypePerson.Uint8() {
 				count = 1

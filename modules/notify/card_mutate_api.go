@@ -20,11 +20,14 @@ import (
 )
 
 // docsCardMutateSeqKey is the single shared GenSeq flag for docs access-card
-// mutations. card_seq only needs to be strictly positive and greater than the
-// target card's stored card_seq; a sibling card was sent fresh (no message_extra
-// row => NULL card_seq), so one globally-monotonic counter suffices and avoids
-// an unbounded per-message key space.
-const docsCardMutateSeqKey = common.MessageExtraSeqKey + ":docs-card-mutate"
+// card_seq mutations. The literal preserves the existing persisted sequence key
+// byte-for-byte; despite its historical "messageExtra" prefix, it does NOT
+// allocate message_extra.version and must not use the per-channel ReserveTx
+// cursor allocator. card_seq only needs to be strictly positive and greater than
+// the target card's stored card_seq; a sibling card was sent fresh (no
+// message_extra row => NULL card_seq), so one globally-monotonic counter suffices
+// and avoids an unbounded per-message key space.
+const docsCardMutateSeqKey = "messageExtra:docs-card-mutate"
 
 // docsAccessVariantPrefix gates which cards this docs-capability endpoint may
 // mutate. The shared `notification` bot sends summary / docs / action-outcome

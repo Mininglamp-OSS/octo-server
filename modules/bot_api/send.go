@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
@@ -1118,6 +1119,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			if werr == nil || !isRetriableMySQLLockErr(werr) {
 				break
 			}
+			// Report the whole-transaction retry on the shared allocator metric
+			// (reserve_total result=retry). With the #627 D4 uniform lock order
+			// this is a backstop (1205 lock-wait under load); the transactional
+			// same-message deadlock is removed at the root.
+			ba.seqStore.ObserveReserveRetry()
 			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 		}
 		if werr != nil {
@@ -1387,34 +1393,68 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 			EditedAt: editedAt, CardSeq: cardSeq, StorageChannel: true,
 		})
 	}
+	// The local fallback needs the shared allocator. NewBotAPI wires seqStore
+	// alongside cardMutator; a hand-built &BotAPI{} literal that leaves both nil
+	// would otherwise nil-panic inside seqStore.Mode below — fail with a clear
+	// error instead.
+	if ba.seqStore == nil {
+		return false, fmt.Errorf("bot_api: card write fallback requires a configured seqStore (construct via NewBotAPI)")
+	}
 	tx, err := ba.ctx.DB().Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var stored struct {
-		CardSeq dbr.NullInt64 `db:"card_seq"`
-		Hash    string        `db:"content_edit_hash"`
-	}
-	if selErr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
-		return false, selErr
-	}
-	if stored.CardSeq.Valid && stored.CardSeq.Int64 >= cardSeq {
-		// stored == cardSeq 且内容逐字节相同 → 并发/重复的幂等重试（两个相同帧都过了
-		// 事务前 content_edit_hash 短路、在此串行化），已存的就是这帧：返回成功、不再写，
-		// 避免对幂等重试误报 409（PR#548 review P2）。stored > cardSeq、或相等但内容不同，
-		// 才是真正的乱序/迟到帧 → conflict。
-		if stored.CardSeq.Int64 == cardSeq && stored.Hash == contentMD5 {
-			return false, nil
-		}
-		return true, nil
-	}
-	// 锁内分配 version（见函数注释 P1-2；跨副本单调性范围见 cardVersionInLockWrite 注释
-	// H2/P1-b）：仅 advancing 写才消费 version,冲突帧不消费。
-	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	// #627 D4: choose the lock order by allocator mode so every message_extra
+	// writer shares one global order and cannot deadlock (mirrors the production
+	// path in carddispatch.casWriteOnce). transactional → reserve the channel
+	// sequence FIRST, then take the message-row lock; a stale-frame reject rolls
+	// the tx back and reverts the seq advance, so no version is consumed. legacy →
+	// message-row lock first (GenSeq has no serializing lock; PR#548 monotonicity).
+	mode, err := ba.seqStore.Mode(tx)
 	if err != nil {
 		return false, err
+	}
+	// casGate takes the message-row lock FOR UPDATE and evaluates the card_seq CAS.
+	// done=true means stop before writing: conflict=true is a stale/late frame;
+	// conflict=false with done=true is an idempotent replay (success, no write).
+	casGate := func() (conflict, done bool, gerr error) {
+		var stored struct {
+			CardSeq dbr.NullInt64 `db:"card_seq"`
+			Hash    string        `db:"content_edit_hash"`
+		}
+		if selErr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
+			return false, true, selErr
+		}
+		if stored.CardSeq.Valid && stored.CardSeq.Int64 >= cardSeq {
+			if stored.CardSeq.Int64 == cardSeq && stored.Hash == contentMD5 {
+				return false, true, nil
+			}
+			return true, true, nil
+		}
+		return false, false, nil
+	}
+
+	var version int64
+	if mode == msgextraseq.ModeTransactional {
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return false, rerr
+		}
+		version = versions[0]
+		if conflict, done, gerr := casGate(); gerr != nil || done {
+			return conflict, gerr
+		}
+	} else {
+		if conflict, done, gerr := casGate(); gerr != nil || done {
+			return conflict, gerr
+		}
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return false, rerr
+		}
+		version = versions[0]
 	}
 	if _, err = tx.InsertBySql(
 		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version,card_seq) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version),card_seq=VALUES(card_seq)",
@@ -1444,22 +1484,52 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 // 单进程。彻底的跨副本单调需把 version 换成频道级全序源(DB/Redis 原子计数),牵动所有
 // version 载体(含富文本),超出 #548 范围,列为后续。
 func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int) error {
+	if ba.seqStore == nil {
+		return fmt.Errorf("bot_api: card write fallback requires a configured seqStore (construct via NewBotAPI)")
+	}
 	tx, err := ba.ctx.DB().Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// 取行锁串行化 version 分配(与 cardSeqCASWrite 同一把锁);行不存在时 FOR UPDATE
-	// 取 next-key 锁,让并发首帧也串行。查出的 card_seq 仅作 LoadOne 目标、刻意不参与下方
-	// upsert(LWW 不动 card_seq) —— 本 SELECT 唯一目的是持锁(PR#548 review nit)。
-	var lockHold dbr.NullInt64
-	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&lockHold); selErr != nil && selErr != dbr.ErrNotFound {
-		return selErr
-	}
-	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	// #627 D4: uniform lock order by mode. transactional → reserve the channel
+	// sequence FIRST (seq → message-row), matching all other writers so no deadlock
+	// is possible. legacy → take the message-row lock FIRST to serialize GenSeq
+	// allocation for single-process monotonicity (PR#548). The message-row SELECT
+	// exists only to hold the lock; card_seq is deliberately not compared or
+	// written here (LWW leaves card_seq unchanged).
+	mode, err := ba.seqStore.Mode(tx)
 	if err != nil {
 		return err
+	}
+	lockMessageRow := func() error {
+		var lockHold dbr.NullInt64
+		if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&lockHold); selErr != nil && selErr != dbr.ErrNotFound {
+			return selErr
+		}
+		return nil
+	}
+
+	var version int64
+	if mode == msgextraseq.ModeTransactional {
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return rerr
+		}
+		version = versions[0]
+		if lerr := lockMessageRow(); lerr != nil {
+			return lerr
+		}
+	} else {
+		if lerr := lockMessageRow(); lerr != nil {
+			return lerr
+		}
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return rerr
+		}
+		version = versions[0]
 	}
 	if _, err = tx.InsertBySql(
 		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",

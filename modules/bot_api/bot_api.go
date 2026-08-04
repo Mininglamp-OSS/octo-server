@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
@@ -68,7 +69,10 @@ type BotAPI struct {
 	// cardTemplates is the deployment-global, code-reviewed Bot allowlist over
 	// the broader cardtmpl Registry. Production construction fails closed when
 	// any advertised ref is missing or internally inconsistent.
-	cardTemplates         *botCardTemplateCatalog
+	cardTemplates *botCardTemplateCatalog
+	// seqStore is the shared transactional message_extra version allocator (#627),
+	// used by the local card-write fallbacks when cardMutator is nil.
+	seqStore              *msgextraseq.Store
 	speechClient          *voice_adapter.SpeechClient
 	maxVoiceContextLength int
 	maxBodySize           int64
@@ -247,6 +251,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		cardRevisions:         cardrevision.NewStore(ctx.DB()),
 		cardMutator:           carddispatch.NewCardMutator(ctx),
 		cardTemplates:         cardTemplates,
+		seqStore:              msgextraseq.New(ctx),
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,

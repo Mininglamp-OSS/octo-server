@@ -57,6 +57,11 @@ const MaxReserveCount = 1000
 // represent exactly in JSON. Versions must never cross it (brief D3/D9).
 const maxSafeInteger int64 = 1<<53 - 1
 
+// MaxCutoverFloor is the largest cutover floor Activate accepts: it leaves at
+// least one full MaxReserveCount batch of headroom below maxSafeInteger, so the
+// first reservations after activation cannot immediately hit ErrOverflow.
+const MaxCutoverFloor int64 = maxSafeInteger - MaxReserveCount
+
 // Sentinel errors. Callers map these to their existing localized error contract;
 // the allocator never writes an HTTP response itself (error-handling rule).
 var (
@@ -162,6 +167,37 @@ func (s *Store) ReserveTx(tx *dbr.Tx, channelID string, channelType uint8, count
 	return versions, nil
 }
 
+// Mode returns the currently effective allocator mode, taking the same shared
+// lock on the state row that ReserveTx does (held until the caller commits). It
+// lets a caller pick a lock order that matches the mode BEFORE it reserves.
+//
+// This exists for the card write path (#627 D4): all writers must reserve the
+// channel sequence (ReserveTx) before taking any message-row lock so the global
+// lock order is uniform (state → channel-seq → message-row) and cannot deadlock.
+// Card writers deliberately keep message-row-first in legacy mode (PR#548
+// single-process version monotonicity, where GenSeq has no serializing lock), so
+// they must know the mode up front to choose the order. Non-card writers are
+// already seq-first unconditionally and do not need this.
+//
+// The double state read (Mode here, then again inside ReserveTx) is harmless: it
+// is the same row under a shared lock the caller already holds.
+func (s *Store) Mode(tx *dbr.Tx) (int, error) {
+	st, err := s.readStateForShare(tx)
+	if err != nil {
+		return 0, err
+	}
+	return st.Mode, nil
+}
+
+// ObserveReserveRetry records that a caller retried its whole transaction after a
+// retriable lock error (MySQL 1213 deadlock / 1205 lock-wait timeout). The
+// allocator itself only emits success/failure; retry is a caller-side signal
+// because only the caller owns the transaction it re-runs (metrics.go
+// reserve_total result=retry, brief D8).
+func (s *Store) ObserveReserveRetry() {
+	metricReserveTotal.WithLabelValues("retry").Inc()
+}
+
 // readStateForShare loads the singleton allocator-state row under a shared lock
 // held until the caller's transaction ends. The shared lock is the drain
 // barrier for cutover: it is compatible across writers, but the exclusive
@@ -171,9 +207,9 @@ func (s *Store) ReserveTx(tx *dbr.Tx, channelID string, channelType uint8, count
 func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 	lockStart := time.Now()
 	var row struct {
-		Mode         int   `db:"mode"`
-		Epoch        int64 `db:"epoch"`
-		CutoverFloor int64 `db:"cutover_floor"`
+		Mode         int    `db:"mode"`
+		Epoch        uint64 `db:"epoch"`
+		CutoverFloor int64  `db:"cutover_floor"`
 	}
 	err := tx.SelectBySql(
 		"SELECT `mode`, `epoch`, `cutover_floor` FROM `octo_message_extra_version_state` WHERE `singleton_id`=? FOR SHARE",
@@ -196,7 +232,7 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 		if row.Mode != ModeLegacy && row.Mode != ModeTransactional {
 			return State{}, fmt.Errorf("%w: %d", ErrUnknownMode, row.Mode)
 		}
-		st = State{Mode: row.Mode, Epoch: uint64(row.Epoch), CutoverFloor: row.CutoverFloor}
+		st = State{Mode: row.Mode, Epoch: row.Epoch, CutoverFloor: row.CutoverFloor}
 	}
 	// Expected-mode guard (brief D9 read side): a deployment declares the mode it
 	// expects via OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE. If the resolved mode
@@ -302,7 +338,6 @@ func (s *Store) reserveTransactional(tx *dbr.Tx, channelID string, channelType u
 // read gates the materialize step, and the FOR UPDATE only ever targets a row
 // that already exists (a record lock — no gap, no first-use deadlock).
 func (s *Store) lockSequenceRow(tx *dbr.Tx, channelID string, channelType uint8, floor int64) (int64, error) {
-	lockStart := time.Now()
 	if _, found, err := s.selectSequence(tx, channelID, channelType); err != nil {
 		s.logFailure("lock", channelID, channelType, err)
 		return 0, err
@@ -324,8 +359,13 @@ func (s *Store) lockSequenceRow(tx *dbr.Tx, channelID string, channelType uint8,
 			return 0, fmt.Errorf("msgextraseq: initialize sequence: %w", ierr)
 		}
 	}
-	// The row now exists (pre-existing or just materialized): lock it.
+	// The row now exists (pre-existing or just materialized): lock it. Time only
+	// the FOR UPDATE wait here — starting the clock before the existence read /
+	// bootstrap / insert above would fold that unrelated work into the reported
+	// lock-wait signal (reviewer note on PR #644).
+	lockStart := time.Now()
 	cur, found, err := s.selectSequenceForUpdate(tx, channelID, channelType)
+	metricLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
 	if err != nil {
 		s.logFailure("lock", channelID, channelType, err)
 		return 0, err
@@ -336,7 +376,6 @@ func (s *Store) lockSequenceRow(tx *dbr.Tx, channelID string, channelType uint8,
 		s.logFailure("initialize", channelID, channelType, ErrInvariantViolation)
 		return 0, ErrInvariantViolation
 	}
-	metricLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
 	return cur, nil
 }
 

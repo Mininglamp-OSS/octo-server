@@ -46,8 +46,11 @@ func (m *messageExtraDB) insertOrUpdatePinnedTx(md *messageExtraModel, tx *dbr.T
 	return err
 }
 
-func (m *messageExtraDB) insertOrUpdateDeleted(md *messageExtraModel) error {
-	_, err := m.session.InsertBySql("INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,is_deleted,version) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE is_deleted=VALUES(is_deleted),version=VALUES(version)", md.MessageID, md.MessageSeq, md.ChannelID, md.ChannelType, md.IsDeleted, md.Version).Exec()
+// insertOrUpdateDeletedTx is the transactional variant used by the mutual-delete
+// writer (#627): the message_extra version is allocated under the channel
+// sequence lock in the same transaction as the business row.
+func (m *messageExtraDB) insertOrUpdateDeletedTx(md *messageExtraModel, tx *dbr.Tx) error {
+	_, err := tx.InsertBySql("INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,is_deleted,version) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE is_deleted=VALUES(is_deleted),version=VALUES(version)", md.MessageID, md.MessageSeq, md.ChannelID, md.ChannelType, md.IsDeleted, md.Version).Exec()
 	return err
 }
 
@@ -111,6 +114,21 @@ func (m *messageExtraDB) sync(version int64, channelID string, channelType uint8
 	}
 
 	return models, err
+}
+
+// maxVersion returns the greatest version the server has actually persisted for
+// one storage channel. channel_version_idx serves this equality-prefix MAX query.
+// It is the authoritative upper bound for an untrusted client sync cursor.
+func (m *messageExtraDB) maxVersion(channelID string, channelType uint8) (int64, error) {
+	var version int64
+	err := m.session.SelectBySql(
+		"SELECT COALESCE(MAX(`version`),0) FROM `message_extra` WHERE `channel_id`=? AND `channel_type`=?",
+		channelID, channelType,
+	).LoadOne(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 type messageExtraDetailModelSlice []*messageExtraDetailModel
