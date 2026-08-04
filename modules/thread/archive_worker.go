@@ -204,12 +204,20 @@ func (w *ArchiveWorker) Start(ctx context.Context) {
 	// 启动门只卡 Interval —— enabled 与 threshold 都已是每 tick 重读的策略项，
 	// 卡在启动期会让「管理台开启归档」必须重启才生效，正是 P1 要消除的。
 	// ticker 空转的代价是每 Interval 一次 system_settings 快照读（无 DB 往返）。
+	// 放在 Interval 门**之前**：这条日志的全部意义是「进程启动是唯一必然发生、
+	// 且能同时看到两个窗口的时刻」，摆在提前返回之后就等于把同一个盲区下移一层。
+	//
+	// 注意这是防御性的，不是修一个当前可达的洞：LoadArchiveConfig 走 parseDuration，
+	// 它把 d <= 0 映射回默认值，所以 cfg.Interval <= 0 从 env 根本产生不出来，只有
+	// 手工构造的测试配置能命中。先前的注释断言 DM_THREAD_AUTO_ARCHIVE_INTERVAL=0
+	// 会 park worker，那是错的（PR #695 review 第 4 轮，yujiawei 自陈其前提有误）。
+	// 保留这个顺序是为了移除对该门的依赖，万一它日后变得可达。
+	w.logOrderingAtStart()
 	if w.cfg.Interval <= 0 {
 		w.Info("thread auto-archive worker not started: invalid interval",
 			zap.Duration("interval", w.cfg.Interval))
 		return
 	}
-	w.logOrderingAtStart()
 	rctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 	w.wg.Add(1)

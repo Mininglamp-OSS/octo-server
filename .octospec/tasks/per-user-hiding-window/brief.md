@@ -195,14 +195,29 @@ Batch 1 已把这条写进 brief 的已知边界，并注明「Batch 2 之前必
 
 ### P0 — 前置缺口 B：静音但有未读
 
-- [x] `keepDespiteRecentWindow` 的未读豁免加入 mute 维度，**两个端点行为一致**，
+> **已从 PR #695 撤出，等 import cycle 修好后重做。** 代码曾三次落地
+> （`d3835bdc` → `6235cd51` → `dbfce0d3`），三轮评审在同样的 ~40 行里找到三个缺陷，
+> **而每一个都是 CI 看不见的** —— SQL 在 integration tag 的文件里，那个 tag 因既有
+> import cycle 不编译。第三轮那条是 P0：三分支 UNION 在生产形状的库上直接
+> `ERROR 1271 Illegal mix of collations`（`user_setting`/`group_setting` 无
+> CHARSET 子句 → 服务器默认 `0900_ai_ci`；`thread_setting` 显式 `general_ci`）。
+> 本机 MySQL 8.0.46 上复现确认，两分支的前一版在同一 schema 下通过 —— 是本批引入的回归。
+>
+> 关键教训：CI 与本地开发库都用 `COLLATE utf8mb4_general_ci` 建库，会把三张表归一，
+> 因此「integration 全绿」对生产环境不构成证据。
+>
+> 补丁与两个未修缺陷（UNION 排序规则、DM 的 @我 键不匹配）的完整说明存于
+> `scratchpad/p0b-parked/README.md`。**重做的前置条件是先修 import cycle**，
+> 否则第四轮只会重演。
+
+- [ ] `keepDespiteRecentWindow` 的未读豁免加入 mute 维度，**两个端点行为一致**，
       `TestRecentWindow_BothEndpointsAgree` 保持绿。
-- [x] `/v1/sidebar/sync` 侧补齐 mute 来源，且与 `/v1/conversation/sync` 的
+- [ ] `/v1/sidebar/sync` 侧补齐 mute 来源，且与 `/v1/conversation/sync` 的
       `userDetail.Mute` / `group.Mute` 同源 —— 不同源就是新的 per-endpoint 分叉。
-- [x] **静音 + 有未解决的 @我 仍然保留**，复用 `reminders` / `reminder_done` 的判定
+- [ ] **静音 + 有未解决的 @我 仍然保留**，复用 `reminders` / `reminder_done` 的判定
       （与 `ArchiveStaleBatch` 同一机制，`modules/thread/db.go:446-453`）。
-- [x] mute 查询失败 **fail-open**：按未静音处理（宁可多显示，绝不误藏），与本仓库既有降级方向一致。
-- [x] 用例矩阵：`{静音, 未静音} × {有未读, 无未读} × {有@我, 无@我}` 在超窗输入上的可见性。
+- [ ] mute 查询失败 **fail-open**：按未静音处理（宁可多显示，绝不误藏），与本仓库既有降级方向一致。
+- [ ] 用例矩阵：`{静音, 未静音} × {有未读, 无未读} × {有@我, 无@我}` 在超窗输入上的可见性。
 
 ### P1 — 每人窗口存储与解析
 
