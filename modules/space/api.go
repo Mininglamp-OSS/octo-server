@@ -595,6 +595,9 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 解散同样是撤权：CheckMembership 的 SQL 带 INNER JOIN space ON s.status=1，
+	// 所以 space.status 一翻，全体成员立刻不再是成员——但缓存里的正向判定还在。
+	revokeMembershipCacheForSpace(s.ctx, s, s.db, spaceId)
 	c.ResponseOK()
 }
 
@@ -803,6 +806,9 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		return
 	}
 
+	// 只收集真正被移除的 uid：下面的循环会静默跳过 owner / 同级及更高角色，
+	// 那些人仍是成员，清掉他们的缓存是无谓的额外 Redis 往返。
+	removed := make([]string, 0, len(req.UIDs))
 	for _, uid := range req.UIDs {
 		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
 		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
@@ -815,7 +821,10 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
+		removed = append(removed, uid)
 	}
+	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeMembershipCache）。
+	revokeMembershipCache(s.ctx, s, spaceId, removed...)
 	// 失效通知成员缓存
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)
@@ -857,6 +866,8 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeMembershipCache）。
+	revokeMembershipCache(s.ctx, s, spaceId, loginUID)
 	// 失效通知成员缓存
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)

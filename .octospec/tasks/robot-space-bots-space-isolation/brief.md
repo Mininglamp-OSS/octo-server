@@ -119,6 +119,13 @@ no handler signature or response shape changes.
   `TestSpaceBots_RemovedMemberLosesAccess` calls `InvalidateMembershipCache`
   by hand, so it verifies that the verdict flips once the cache is cleared, NOT
   that production clears it.
+
+  **RESOLVED** by task `space-membership-cache-revocation`, landed with
+  `space-directory-api`. Every removal path now invalidates, and this endpoint
+  inherits the fix — it mounts the same middleware. `TestSpaceBots_RemovedMemberLosesAccess`
+  no longer touches the cache: it leaves the Space through the real
+  `POST /v1/space/{id}/leave` handler and asserts the very next request is refused.
+  Verified failing without the fix (the removed member gets the full bot list back).
 - **Un-skipping `TestSpaceBots_ExcludesDeletedSpaceMembers`** (blocked on
   octo-server#17). New tests here must stand on their own rather than depend on
   that fixture being revived.

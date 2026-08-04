@@ -350,6 +350,9 @@ func (m *Manager) forceDisband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 撤权立即生效：强制解散把 space.status 与全部成员行一起置 0，两者都会让
+	// CheckMembership 返回 false，但缓存里的正向判定还在（见 revokeMembershipCache）。
+	revokeMembershipCacheForSpace(m.ctx, m, m.db, spaceId)
 	m.Info("管理员强制解散空间", zap.String("spaceId", spaceId), zap.String("operator", c.GetLoginUID()))
 	// 刷新 ParseChannelID 缓存，避免已解散的 spaceId 继续被前缀路由认为有效
 	go m.space.loadKnownSpaceIDs()
@@ -709,6 +712,10 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeMembershipCache）。
+	// removeMembersForce 要么整批成功、要么在遇到 owner 时整批失败，所以走到这里
+	// uids 就是实际被移除的集合，无需再过滤。
+	revokeMembershipCache(m.ctx, m, spaceId, uids...)
 	m.Info("管理员移除空间成员", zap.String("spaceId", spaceId), zap.String("operator", c.GetLoginUID()), zap.Strings("uids", uids))
 	c.ResponseOK()
 }

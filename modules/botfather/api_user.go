@@ -496,6 +496,8 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 	if spErr != nil {
 		bf.Error("移除Bot的Space成员记录失败", zap.Error(spErr))
 	}
+	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeBotMembershipCache）。
+	revokeBotMembershipCache(bf.ctx, bf, botID)
 
 	// Soft-delete robot record
 	err = bf.db.deleteRobot(botID)

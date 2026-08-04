@@ -237,11 +237,24 @@ has no reproducible backend source today. The new endpoint must nonetheless
   `limit=50` cost the same as `limit=6000` (47ms vs 43ms measured at 10x6000).
   With the predicate on `space_member` itself the human slice drops to 4.5ms for
   count (from 20ms) and 8.0ms for `limit=50` (from 27.5ms).
-  The copy cannot go stale: `user.robot` is written only at account creation
-  (`modules/user/service.go`, `modules/botfather/command.go`) and never UPDATEd
+  The copy has no *drift* source: `user.robot` is written only at account creation
+  (`modules/user/service.go`, `modules/botfather/command.go`) and is never UPDATEd
   anywhere in the repo, so no sync hook is needed. Every `space_member` insert
-  derives the value in the DB layer (`memberIsBotSubquery` / `stampMemberIsBot`) so
-  no caller can set it wrong. The column is deliberately NOT named `robot`:
+  derives the value in the DB layer (`memberIsBotSubquery` / `stampMemberIsBot`),
+  and `TestSpaceMemberInsertsPopulateIsBot` fails the build on any insert site that
+  does not — the earlier claim that "no caller can set it wrong" was asserted from a
+  `grep | head -12` that silently cut off at the `modules/space` boundary and missed
+  three `modules/botfather` sites, so the guard, not the reasoning, is what makes it
+  true.
+
+  **It can still go stale during a rolling deploy**, which is a different failure
+  from drift: between the migration running and the last old instance draining, old
+  code inserts `space_member` rows without the column, and they default to `is_bot=0`.
+  A bot added in that window is permanently misfiled as a human — nothing
+  self-heals, because the value is only derived at insert. **Deploy runbook: re-run
+  the backfill `UPDATE` from
+  `modules/space/sql/20260803000001_space_member_is_bot.sql` once all instances are
+  on the new build.** It is idempotent and cheap. The column is deliberately NOT named `robot`:
   `queryMembers` / `searchMembers` do `SELECT sm.*` plus their own `... as robot`
   alias, and a same-named column would collide and change those frozen endpoints.
   The index alone was previously measured to be worthless — it only pays off once
@@ -341,7 +354,14 @@ has no reproducible backend source today. The new endpoint must nonetheless
 - `modules/space/swagger/directory.yaml` exists, declares `openapi: 3.0.3`, parses
   as valid OpenAPI 3, and documents the path, all four parameters with their
   defaults and the `limit` cap, the `200` schema (including `bot` present iff
-  `kind == "bot"`), and the 400/403 error envelope.
+  `kind == "bot"`), and every error response the route can produce. Note the spec
+  must describe what the wire actually carries, not what it ought to: the handler's
+  own failures are the i18n envelope pinned at 400, but `SpaceMiddleware`'s
+  401/403/500 are a bare `{"msg": ...}` with no error code. Documenting those as the
+  envelope would be a spec that lies. Migrating them is
+  `space-middleware-error-envelope`, deliberately kept out of this PR — it changes
+  the error body of all 13 route groups mounting the middleware, none of them in
+  scope here.
 - New tests in `pkg/space/` cover the middleware change:
   - a route with a `:space_id` **path** param now resolves and enforces membership
     (member passes with the path Space in context; non-member is refused);

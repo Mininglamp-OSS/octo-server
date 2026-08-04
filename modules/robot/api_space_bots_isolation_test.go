@@ -104,8 +104,22 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 
 func getSpaceBots(t *testing.T, s *server.Server, ctx *config.Context, spaceID string) *httptest.ResponseRecorder {
 	t.Helper()
+	// 只在发请求前做隔离性清理：用例之间共用 testutil.UID，不清会读到上一条用例
+	// 留下的判定。撤权类断言不能用这个助手——见 getSpaceBotsNoCacheReset。
+	if err := spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID); err != nil {
+		t.Fatalf("清除成员缓存失败: %v", err)
+	}
+	return getSpaceBotsNoCacheReset(t, s, ctx, spaceID)
+}
+
+// getSpaceBotsNoCacheReset 发请求但**不碰**成员缓存。
+//
+// 撤权类断言必须走这个助手。getSpaceBots 每次请求前都会失效一遍缓存，等于替生产
+// 代码做了它本该做的事：无论移除路径清不清缓存，断言都会通过。这个仓库正是因此
+// 曾经把「移除后立刻失去访问权」测成了「缓存清掉后判定会翻转」。
+func getSpaceBotsNoCacheReset(t *testing.T, s *server.Server, ctx *config.Context, spaceID string) *httptest.ResponseRecorder {
+	t.Helper()
 	resetUIDRateLimit(t, ctx)
-	spacepkg.InvalidateMembershipCache(ctx.GetRedisConn(), spaceID, testutil.UID)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots?space_id="+spaceID, nil)
 	req.Header.Set("token", testutil.Token)
@@ -181,11 +195,15 @@ func TestSpaceBots_MemberUnaffected(t *testing.T) {
 	assert.Equal(t, "not_added", rows[0]["status"], "未加好友时关系态仍是 not_added")
 }
 
-// TestSpaceBots_RemovedMemberLosesAccess 成员被移出空间后应当失去访问权。
+// TestSpaceBots_RemovedMemberLosesAccess 成员被移出空间后应当**立刻**失去访问权。
 //
-// 中间件的否定缓存 TTL 是 30s、正向 60s，所以这里显式失效一次再断言：
-// 用例验证的是「移除后判定会翻转」，而不是「翻转是瞬时的」——后者中间件本就
-// 不保证，写成瞬时断言会变成一条依赖缓存实现细节的脆弱用例。
+// 之前这条用例走 getSpaceBots，而那个助手每次请求前都会失效一次成员缓存，于是它
+// 实际验证的是「缓存清掉后判定会翻转」——中间件的读逻辑，与移除路径有没有触发
+// 失效无关。缺陷（移除不清缓存、撤权延迟最长 60s）存在时它照样是绿的。
+//
+// 现在改成：走真实的退出空间接口，之后不碰缓存。撤权由生产代码负责，测试只观察。
+// 用 /leave 而不是管理端强制移除，是因为它只需要 testutil.UID 自己的 token，
+// 不必在 robot 包的 harness 里再造一个 owner 身份。
 func TestSpaceBots_RemovedMemberLosesAccess(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
@@ -194,13 +212,20 @@ func TestSpaceBots_RemovedMemberLosesAccess(t *testing.T) {
 	seedIsolationSpace(t, ctx, spaceID, "sb_iso_bot_rm", testutil.UID)
 
 	assert.Equal(t, http.StatusOK, getSpaceBots(t, s, ctx, spaceID).Code, "移除前应可访问")
-
-	_, err := ctx.DB().UpdateBySql(
-		"UPDATE space_member SET status = 0 WHERE space_id = ? AND uid = ?", spaceID, testutil.UID,
-	).Exec()
+	// 前置条件：上一次成功请求必须已经把正向判定写进缓存，否则后面的 403 可能只是
+	// 因为缓存本来就是空的，缺陷存在时用例仍会通过。
+	cached, err := ctx.GetRedisConn().GetString("space:member:" + spaceID + ":" + testutil.UID)
 	assert.NoError(t, err)
+	assert.Equal(t, "1", cached, "前置条件不成立：成员判定应已被缓存为正向")
 
-	w := getSpaceBots(t, s, ctx, spaceID)
+	resetUIDRateLimit(t, ctx)
+	leaveW := httptest.NewRecorder()
+	leaveReq, _ := http.NewRequest(http.MethodPost, "/v1/space/"+spaceID+"/leave", nil)
+	leaveReq.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(leaveW, leaveReq)
+	assert.Equal(t, http.StatusOK, leaveW.Code, "退出空间应成功: %s", leaveW.Body.String())
+
+	w := getSpaceBotsNoCacheReset(t, s, ctx, spaceID)
 	assert.Equal(t, http.StatusForbidden, w.Code, "移除后必须被拒: %s", w.Body.String())
 	// decodeSpaceBots 在 body 非数组时返回 nil，assert.Empty(nil) 恒真——
 	// 所以必须同时断言 body 里不出现 bot 标识，否则响应形状一变就静默失守。

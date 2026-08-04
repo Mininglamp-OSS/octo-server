@@ -56,8 +56,17 @@ func (c *RedisMembershipCache) Set(spaceID, uid string, isMember bool, ttl time.
 }
 
 // InvalidateMembershipCache 删除指定用户在指定 Space 的成员缓存。
-func InvalidateMembershipCache(redisConn *redis.Conn, spaceID, uid string) {
-	_ = redisConn.Del(redisCacheKey(spaceID, uid))
+//
+// 每一条把成员移出 Space 的写路径都必须调用它。正向判定缓存 cacheTTL（60s），
+// 不主动失效就意味着被移除的人还能继续读该 Space 的数据最长 60 秒——对
+// GET /v1/space/{space_id}/directory 这种整份名册（含 PII）的读接口，这是实打实
+// 的授权延迟，不是可以摊销的缓存陈旧。
+//
+// 返回 error 而不是内部吞掉：调用方必须能把失败记成 WARN。失效失败是静默的
+// 安全降级（撤权退回到 60s 生效），日志是唯一能发现它的地方。Del 对不存在的 key
+// 是幂等的，所以重复调用、对已经没有缓存条目的 uid 调用都安全。
+func InvalidateMembershipCache(redisConn *redis.Conn, spaceID, uid string) error {
+	return redisConn.Del(redisCacheKey(spaceID, uid))
 }
 
 // InMemoryMembershipCache 基于内存的 MembershipCache 实现，用于测试。

@@ -70,6 +70,37 @@ and the octo-web client sends `X-Space-Id` on every request), which writes
 can still call `GET /v1/space/S/directory?limit=10000` and receive the full roster
 including every bot.
 
+## Decision: invalidate on write, not re-check on read
+
+Two designs were on the table in review of `space-directory-api` (#692):
+
+**(A) Wire `InvalidateMembershipCache` into every removal path.** Chosen.
+
+**(B) Have `listDirectory` do its own per-request `queryMember` freshness check,
+leaving the cache untouched.** Rejected — explicitly, not by deferral, since the
+reviewer who proposed it asked for exactly that.
+
+Reasons B was rejected:
+
+1. It fixes one endpoint. The stale grant is a property of `SpaceMiddleware`, and
+   thirteen route groups mount it. B leaves the other twelve on the 60s window and
+   makes the directory endpoint the odd one out — the next roster-shaped endpoint
+   has to remember to re-implement the check.
+2. It reintroduces the query the cache exists to remove, on the endpoint with the
+   largest result set. B's cost is one `space_member ⋈ space` lookup on *every*
+   request; A's cost is one Redis `DEL` per removed uid on a *removal*, which is
+   orders of magnitude rarer.
+3. It puts the authorization decision in two places — middleware verdict plus
+   handler re-check — which is how the two drift apart.
+4. `InvalidateMembershipCache` already existed and was already the intended
+   mechanism; it was simply never wired. B routes around the gap instead of closing
+   it.
+
+B's one genuine advantage — correctness does not depend on remembering to call
+something at each new write site — is answered by the source guard
+(`TestSpaceMemberRemovalsRevokeMembershipCache`), which fails the build when a new
+`space_member` removal appears without a registered invalidation.
+
 ## Load-bearing list
 
 - **space**, **isolation**, **auth**, **acl** — this is the revocation path of the
@@ -103,15 +134,30 @@ including every bot.
   `space.status = 1`, so a disbanded Space fails the DB check — but only after the
   cached positive expires. Disband is in scope; a full audit of every status
   transition is not.
-- **Bot removal from a Space.** Bots do not call these endpoints.
+- ~~**Bot removal from a Space.** Bots do not call these endpoints.~~ **Brought
+  into scope during implementation.** The original reasoning asserted rather than
+  checked. Bot deletion (`/deletebot` and `DELETE /v1/user/bots/{id}`) runs
+  `UPDATE space_member SET status=0 WHERE uid=?`, removing the bot from every Space
+  at once — structurally the same revocation as kicking a human, and the same
+  60s stale grant. Whether a deleted bot's token still authenticates is a separate
+  question this task should not have to answer to be correct: the cheap, obviously
+  safe move is to invalidate there too, and the source guard forces the question at
+  every future write site rather than relying on that reasoning staying true.
+  This repo has already paid once for an "I checked, the list is complete" claim
+  (the `is_bot` insert sites, where a truncated grep hid three of them).
 
 ## Acceptance
 
 - `spacepkg.InvalidateMembershipCache` is called for every removed uid in:
-  `removeMembers` (user-facing), `leaveSpace`, the manager-side force-remove
-  (`modules/space/api_manager.go`), and `disbandSpace` (all members).
+  `removeMembers` (user-facing), `leaveSpace`, the manager-side force-remove and
+  force-disband (`modules/space/api_manager.go`), `disbandSpace` (all members), and
+  bot deletion (`modules/botfather`, both paths).
   A source guard or test enumerates these call sites so a future removal path cannot
   quietly skip it.
+- Invalidation is **targeted**, not blanket. Removing one member must not evict the
+  other members' cached verdicts: a Space holds up to ~6000 members, and evicting
+  them all on every removal would push the hot paths the cache exists for
+  (conversation sync, message, search, sidebar) back onto the DB.
 - Invalidation failures are logged at WARN with `space_id` and `uid`, never
   swallowed. A stale grant that nobody can see is the failure mode this task exists
   to remove.

@@ -161,6 +161,18 @@ func (d *DB) queryMember(spaceId string, uid string) (*MemberModel, error) {
 	return &m, nil
 }
 
+// queryAllMemberUIDs 返回该 Space 下所有成员行的 uid，刻意不按 status 过滤。
+//
+// 唯一的调用方是解散路径的缓存失效（revokeMembershipCacheForSpace）：那里要清的
+// 是「可能在 Redis 里留着正向判定」的全部 uid，而不是「当前还在空间里」的成员。
+// 加 status=1 会漏掉解散事务刚刚置为 0 的那批人，正是必须清掉的那批。
+func (d *DB) queryAllMemberUIDs(spaceId string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("uid").From("space_member").
+		Where("space_id=?", spaceId).Load(&uids)
+	return uids, err
+}
+
 // IsMember 检查用户是否是 Space 成员
 func (d *DB) IsMember(spaceId string, uid string) (bool, error) {
 	m, err := d.queryMember(spaceId, uid)

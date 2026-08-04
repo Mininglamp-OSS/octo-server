@@ -671,6 +671,8 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	if err != nil {
 		h.Error("移除Bot的Space成员记录失败", zap.Error(err))
 	}
+	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeBotMembershipCache）。
+	revokeBotMembershipCache(h.ctx, h, botID)
 
 	// Remove bot from friend records with version for client sync (both directions)
 	friendVersion, err := h.ctx.GenSeq(common.FriendSeqKey)

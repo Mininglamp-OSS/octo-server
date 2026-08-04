@@ -4,6 +4,25 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
+// SpaceIDsForMember returns every Space the uid has a member row in, regardless
+// of that row's status.
+//
+// Callers use it to invalidate the membership cache when a principal is removed
+// from every Space at once (bot deletion). Status is deliberately not filtered:
+// the caller may run this either side of the removal write, and the set that
+// needs invalidating is "Spaces that might hold a positive verdict for this uid",
+// not "Spaces the uid is still in". Del on an absent key is idempotent, so an
+// over-broad set costs a cheap round trip; a missed one is an authorization gap.
+func SpaceIDsForMember(session *dbr.Session, uid string) ([]string, error) {
+	if uid == "" {
+		return nil, nil
+	}
+	var spaceIDs []string
+	_, err := session.Select("space_id").From("space_member").
+		Where("uid=?", uid).Load(&spaceIDs)
+	return spaceIDs, err
+}
+
 // CheckMembership checks if uid is an active member of the given Space.
 // Also verifies the Space itself is active (space.status=1).
 func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, error) {
