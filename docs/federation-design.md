@@ -163,7 +163,17 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 ```
 🔴 `sent_at` 来自对端，**不可信作排序权威**；Host 以本地接收序 + 自身时钟为准，`sent_at` 仅供展示，避免时钟偏移乱序。
 
-### 5.4 🔴 Phase 0 spike（阻塞性前提）
+### 5.4 ✅ Phase 0 spike（已执行，四条断言全 PASS）
+**状态：已验证通过**（IM 版本 `wukongim/wukongim:v2.2.4-20260313`，commit `94b06a4`；结论仅对该版本成立）。
+
+| 断言 | 结果 | 证据 |
+|---|---|---|
+| A1 未登录合成 uid 可加入频道 | **PASS** | `POST /channel/subscriber_add` → `{"status":200}` |
+| A2 IM 订阅者名单含它（且后续操作不冲掉） | **PASS** | `GET /cluster/channels/{ch}/2/subscribers` 含该 uid |
+| A3 🔴 以该 uid 作 `from_uid` 服务端发送被接受 | **PASS** | `POST /message/send` → 200 + message_id；真实用户端离线补拉与在线实时均可见 |
+| A4 出站消息可捕获 | **PASS** | gRPC `msg.notify` → `modules/webhook/api.go:208 → :374 → :263`；落库 `message2` |
+
+→ **方案 A 的 IM 地基成立。** 但 spike 同时暴露三个原设计未覆盖的实现项，根因同一：**影子 uid 只存在于 IM 订阅表，octo 侧不存在**。见 §6.1。
 仅测「真实用户向含合成 uid 的频道发消息不报错」**不够**。**必须同时实测**「以合成 uid 作为 `from_uid` 走服务端 API 发送（伪装发送者）IM 是否接受」——这才是 Option 1 的真正前提。
 实测断言（全绿才进 Phase 1）：
 1. `IMAddSubscriber` 把从不登录的合成 uid 加入频道 **成功**；
@@ -173,7 +183,10 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 任一失败 → **STOP 上报**，Option 1 前提崩，回设计（评估 Option 2 或消息落库不进 IM 的降级）。
 
 ### 5.5 🔴 出站捕获 + 可靠投递（outbox，P0/P1）
-- **出站捕获**：Host 需一个「消息写入联邦频道」的**事件钩子**（webhook / 消息持久化后回调）来触发向 peer 中继。**该钩子在 octo 消息管线中的确切落点未验证——需实测**（候选：现有 webhook 事件流 `modules/webhook`）。
+- ✅ **出站捕获（已实测确认，见 §5.4 A4）**：WuKongIM 经 **gRPC** 推事件到 octo-server（`wk.yaml` 的 `webhook.grpcAddr`，仅 docker 网内）。链路：`modules/webhook/api.go:208` `SendWebhook` → `:368` `handleEvent` → `:374-380` 分发 → `:263` `handleMessageNotify`。
+  🔴 **中继必须挂 `EventMsgNotify = "msg.notify"`**（`modules/webhook/common.go:39`）——它对频道内**每条**消息触发一次，与收件人在线/离线无关。**不要挂 `msg.offline`**（`common.go:33`），那条仅在有离线收件人时才来。
+  HTTP 等价入口（备选，HMAC-SHA256 签名）：`api.go:141` `POST /v1/webhook`、`:143` `/v2/webhook`、`:147` `/v1/webhook/message/notify`。
+  ⚠️ 接入时注意别与已挂在同一消息上的 `modules/bot_api/obo_fanout.go:214` OBO fan-out 链相互干扰。
 - **双写难题**：「写 IM」与「记幂等/outbox」非同一事务 → 崩溃窗口造成重复或永久丢消息。**采用 outbox 模式**：入站先落 `federation_inbox`（`(peer, idempotency_key)` 唯一，事务内），再由 worker 幂等地推 IM；出站先落 `federation_outbox`，worker 带 ACK/重试/死信地投递 peer。定义：保留期、最大重试、DLQ、崩溃恢复（重启后扫未 ACK）。
 - **IM 侧去重（P2）**：即便 DB 幂等，网络抖动重试写 IM 仍可能双气泡；需确认 IM 是否支持外置 client-msg-no 去重（**需实测**），否则 worker 必须保证「已确认写入 IM」的状态持久化后才不重发。
 
@@ -183,6 +196,19 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 影子 uid 是真实本地成员行 → `GetSubscribableMemberUIDs()` 天然返回，datasource 无需改。加成员走 `IMAddSubscriber`，带 `is_external=1` + `source_peer_instance_id`。
 🔴 **成员存储模型（P1）**：`source_peer_instance_id` 落**哪张成员表**、能否与 `source_space_id` 共存、唯一键、迁移兼容——**均需实测现有 group member 表后确定**，不得假设。
 🔴 静默消失（2.4）：`service.go:1452 QueryByUIDs`→`:1497` 遍历 DB 结果丢弃未知 uid——因影子已是真实行而被规避；[api] 测试须断言投递含影子 uid 名单无静默丢弃。
+
+### 6.1 🔴 影子 uid 必须双侧落地（Phase 0 spike 实测结论，P0）
+spike 证明：只把影子 uid 加进 IM 订阅表，**IM 侧完全可用**（收发/广播/fan-out 都正常），但 **octo 侧对它一无所知** —— 由此产生三个必须修的后果，且**根因同一、解法同一**：
+
+| # | 后果 | 实测证据 | 处置 |
+|---|---|---|---|
+| 1 | 发送者**无名无头像**（联邦用户显示为幽灵） | `GET /api/v1/channels/{uid}/1` → **400**；`/users/{uid}/avatar` → **404**；日志 `【User】用户不存在` | 影子 uid 必须建 octo `user` 记录（或 web 端提供 fallback 展示源） |
+| 2 | 🔴 **若启用 WuKongIM datasource，影子 uid 会被订阅重载静默抹除** | 本部署 `wk.yaml` 未配 `datasource` 段、`/v1/datasource` 命中 0 次故当前安全；但代码已注册该回调（`modules/group/1module.go:66-78` 返回 `group_member` 权威名单，`db.go:521-537` 注释确认重载会覆盖订阅表） | 影子 uid 必须写入 `group_member`（带 `is_external=1`），使两侧视角一致。**不得**依赖「永久禁用 datasource」这种环境约定 |
+| 3 | 每条群消息刷一条 error 日志（按成员数放大） | `modules/webhook/api.go:644` `pushTo` → `【Webhook】没有找到toUser`（IM 确实把影子当正常收件人 fan-out） | `pushTo` 对影子 uid 早退 |
+
+**统一处置：影子 uid 同时落 `user` + `group_member`（带 `is_external` 标记），而非仅存在于 IM 订阅表。**
+
+✅ 附带利好（实测）：`modules/group` 下 8 处 `IMAddSubscriber` **无一处传 `Reset`**（增量添加），故正常建群/拉人/踢人流程不会误伤影子订阅。
 
 ---
 
@@ -235,7 +261,7 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 
 | 阶段 | 切面 | 可验证验收 |
 |---|---|---|
-| **Phase 0（spike）** | §5.4 扩展 spike（订阅 + **伪装发送** + 出站捕获） | 四断言全绿→过；任一失败 STOP |
+| **Phase 0（spike）** | §5.4 扩展 spike（订阅 + **伪装发送** + 出站捕获） | ✅ **已完成，四断言全 PASS**（IM `v2.2.4-20260313`） |
 | **Phase 1a（MVP，真·单向）** | HMAC 配对 + 三段授权 + `federation_identity`(并发 upsert) + 不可认证影子约束 + `federation_channel` + inbox/outbox + **仅 B→A 文本入站** + 硬外部标记 | [api] B 文本经中继出现在 A 群、带正确角标、无静默丢弃；[api] 缺归属/未授权入站被拒；[api] 重放（nonce 撞）被拒、重试（同 idempotency）幂等；[browser] 群内每处见角标 |
 | **Phase 1b** | A→B 反向出站（对称链路） | [api] A 消息经出站 outbox 到达 B、ACK/重试可靠 |
 | **Phase 2** | 附件异步拉取 + 花名册事件同步 + profile 更新 + 吊销/租约生命周期 | [api] 附件落 Host 存储且原子;[api] revoke 后影子移出+发言被拒+缓存失效;[api] profile 事件更新影子;[api] 租约过期→suspended |
@@ -250,7 +276,8 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 ---
 
 ## 14. STOP conditions（执行者遇到即停并上报）
-1. Phase 0：IM 拒绝未知订阅者 **或** 拒绝伪装 from_uid 发送 **或** 无法捕获出站消息 → Option 1 崩，回设计。
+1. ~~Phase 0：IM 拒绝未知订阅者 **或** 拒绝伪装 from_uid 发送 **或** 无法捕获出站消息~~ → ✅ 已通过（§5.4）。**但：若 IM 升级过 `v2.2.4-20260313`，必须重跑这四条断言** —— 结论仅对已测版本成立。
+1b. 🔴 若发现任何环境已启用 WuKongIM `datasource` 回调而影子 uid 未写入 `group_member`（§6.1 #2）→ 停，影子会被静默抹除。
 2. 无法建立出站事件捕获钩子 / 无法实现 inbox·outbox 幂等与崩溃恢复 → 停。
 3. 无法建立 `federation_channel` 双端映射 → 停。
 4. oidc 列宽 revert 存在数据/索引级根因影响影子方案 → 停。
@@ -263,12 +290,12 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
 ---
 
 ## 15. 未验证 / 需实测清单（诚实标注）
-1. **2.3(a) 扩展**：IM 接受未知订阅者 **且** 接受伪装 from_uid 服务端发送 **且** 可捕获出站——未验证，Phase 0 必做。
-2. **出站事件捕获钩子在消息管线的确切落点** — 未验证（候选 webhook 事件流）。
-3. **IM 是否支持外置 client-msg-no 去重** — 未验证。
-4. **oidc uid 列宽 64 放大被 revert 的原因** — 本轮未查（仓未配置），执行前必查。
-5. **`short_no` 可空性 / `federation_shadow` 及 `source_peer_instance_id` 列落位与迁移兼容** — 未验证。
-6. **本文档全部 file:line 证据** — 本轮未能重开 octo-server 复核（工作区未配置该仓），沿用前置勘察；执行者 drift check 后逐条对齐当前 HEAD。
+1. ~~**2.3(a) 扩展**：IM 接受未知订阅者 **且** 接受伪装 from_uid 服务端发送 **且** 可捕获出站~~ —— ✅ **已实测 PASS**（§5.4，IM `v2.2.4-20260313`；结论仅对该版本成立，升级 IM 需重测）。
+2. ~~**出站事件捕获钩子在消息管线的确切落点**~~ —— ✅ **已实测定位**：gRPC `msg.notify` → `modules/webhook/api.go:208 → :368 → :374 → :263`（§5.5）。
+3. **IM 是否支持外置 client-msg-no 去重** — 仍未验证。
+4. **oidc uid 列宽 64 放大被 revert 的原因** — 仍未查，执行前必查 git log / PR。
+5. **`short_no` 可空性 / `federation_shadow` 及 `source_peer_instance_id` 列落位与迁移兼容** — 仍未验证。
+6. **本文档其余 file:line 证据** — 来自一轮独立勘察，未逐条重开复核；执行者需 drift check 对齐当时 HEAD。（§5.4/§5.5/§6.1 为 spike 实测所得，已核。）
 
 ---
 
