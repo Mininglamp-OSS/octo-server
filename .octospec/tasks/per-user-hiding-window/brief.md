@@ -164,28 +164,45 @@ Batch 1 已把这条写进 brief 的已知边界，并注明「Batch 2 之前必
 
 ### P0 — 前置缺口 A：偏序守卫的写竞态
 
-- [ ] 守卫改为**事务内**校验：`SELECT ... FOR UPDATE` 锁住三行
-      （`thread.auto_archive_enabled` / `thread.auto_archive_days` /
-      `sidebar.recent_filter_thread_days`），在锁内用行的真实值重跑
+- [x] 守卫改为**事务内**校验，在锁内用行的真实值重跑
       `ApplyThreadArchiveOrderingOverlay` + `ViolatesThreadArchiveOrdering`。
-- [ ] 并发回归：两个 goroutine 从 `enabled=true, archive=6, recent=3` 出发分别写
+      **锁的对象与原文不同,已修正**：原文写「`SELECT ... FOR UPDATE` 锁住三行」，
+      照做**不成立**。那三行可能都不存在（迁移刻意不写行，这是 Batch 1 的上线保证），
+      对不存在的行 `FOR UPDATE` 只拿到 gap lock，而 gap-X 锁彼此兼容 —— 两个写入会
+      **全部通过**校验，随后各自 INSERT 抢 insert-intention lock 互等，退化成 InnoDB
+      死锁(1213)，把一次合法并发写变成不透明的 500。本仓库在
+      `incomingwebhook.insertWithQuota` 上踩过并记录过同一个坑
+      （`modules/incomingwebhook/db.go:65`），结论是**锁一个必然存在的单行**；
+      `card_template_catalog_capacity_guard` 是同一形状。
+      实现改为新增单行锚点表 `system_setting_guard_lock`（CHECK 钉死主键=1），
+      事务第一条语句即锁它，其后才读三个 key 的真实值。
+- [x] 并发回归：两个 goroutine 从 `enabled=true, archive=6, recent=3` 出发分别写
       `archive=4` 与 `recent=5`，断言**恰好一个**成功、DB 终态不违反偏序。
-      当前实现下该用例必须先失败（钉住缺陷存在），修复后转绿。
-- [ ] 行不存在时（回落 env/默认）的加锁语义有明确定义并有用例 —— `FOR UPDATE` 锁不住
-      不存在的行，不能因此绕过守卫。
+      已按要求先在旧实现下验证必失败（实测 `codes=[200 200]`、终态 `archive=4 recent=5`），
+      再确认修复后转绿。
+- [x] 行不存在时（回落 env/默认）的加锁语义有明确定义并有用例 ——
+      `TestManagerSystemSetting_OrderingSerialisesWhenNoRowsExist`：锚点行与三个 setting
+      行的存在与否无关，所以「FOR UPDATE 锁不住不存在的行」这条不再构成绕过路径。
 - [ ] 每用户窗口的写入走同一条校验，不得另开一条不加锁的旁路。
-- [ ] 既有 `TestManagerSystemSetting_Ordering*` 全部仍绿（含重置为默认那条）。
+      **随 P1 交付**（本 PR 不含 P1）。守卫与锚点已就位，P1 的写入路径直接复用即可。
+- [x] 既有 `TestManagerSystemSetting_Ordering*` 全部仍绿（含重置为默认那条）。
+- [x] 附带：守卫从「事务前 return」变为「事务内 return」，新增整批回滚回归
+      （`TestManagerSystemSetting_OrderingRejectionRollsBackWholeBatch`）——
+      同批中与偏序无关的合法 key 不得留下部分写入。
+- [x] 附带：锚点行自愈（事务外 `INSERT IGNORE`）。`CleanAllTables` 会清掉它，任何
+      基于 truncate 的恢复同理；没有自愈的话，锚点一丢就让每次配置写入硬失败、
+      看起来像数据库故障。锚点不存任何状态，恢复因此是安全的。
 
 ### P0 — 前置缺口 B：静音但有未读
 
-- [ ] `keepDespiteRecentWindow` 的未读豁免加入 mute 维度，**两个端点行为一致**，
+- [x] `keepDespiteRecentWindow` 的未读豁免加入 mute 维度，**两个端点行为一致**，
       `TestRecentWindow_BothEndpointsAgree` 保持绿。
-- [ ] `/v1/sidebar/sync` 侧补齐 mute 来源，且与 `/v1/conversation/sync` 的
+- [x] `/v1/sidebar/sync` 侧补齐 mute 来源，且与 `/v1/conversation/sync` 的
       `userDetail.Mute` / `group.Mute` 同源 —— 不同源就是新的 per-endpoint 分叉。
-- [ ] **静音 + 有未解决的 @我 仍然保留**，复用 `reminders` / `reminder_done` 的判定
+- [x] **静音 + 有未解决的 @我 仍然保留**，复用 `reminders` / `reminder_done` 的判定
       （与 `ArchiveStaleBatch` 同一机制，`modules/thread/db.go:446-453`）。
-- [ ] mute 查询失败 **fail-open**：按未静音处理（宁可多显示，绝不误藏），与本仓库既有降级方向一致。
-- [ ] 用例矩阵：`{静音, 未静音} × {有未读, 无未读} × {有@我, 无@我}` 在超窗输入上的可见性。
+- [x] mute 查询失败 **fail-open**：按未静音处理（宁可多显示，绝不误藏），与本仓库既有降级方向一致。
+- [x] 用例矩阵：`{静音, 未静音} × {有未读, 无未读} × {有@我, 无@我}` 在超窗输入上的可见性。
 
 ### P1 — 每人窗口存储与解析
 
@@ -223,19 +240,19 @@ Batch 1 已把这条写进 brief 的已知边界，并注明「Batch 2 之前必
 评审第 6/7 轮均判定「不值得为它们再开一个 head」，因为每个新 head 都会作废全部批准并触发一次
 完整重审。因此它们结转到这里，作为独立的、先于功能代码的一个 commit。
 
-- [ ] `modules/common/system_settings.go:681` —— `threadAutoArchiveDaysFromEnv` 的
+- [x] `modules/common/system_settings.go:681` —— `threadAutoArchiveDaysFromEnv` 的
       `strings.TrimSpace` 与 legacy `parseDays` 不一致：`" 9999 "` 在新实现下解析成 9999，
       在 legacy 下回落默认。**这是「上线逐字节相同」唯一不成立的输入。**
       要么去掉 `TrimSpace`，要么改注释别再宣称精确镜像，并把 brief / PR 里的措辞
       改成「除首尾空白外逐字节相同」。
-- [ ] `modules/thread/archive_config.go:13` —— `Enabled` 的注释描述的是 PR 之前的启动门。
+- [x] `modules/thread/archive_config.go:13` —— `Enabled` 的注释描述的是 PR 之前的启动门。
       标记为死字段或指向 `system_settings`。
-- [ ] `modules/thread/archive_config.go:63-70` —— `parseDays` 回落路径未设上界，
+- [x] `modules/thread/archive_config.go:63-70` —— `parseDays` 回落路径未设上界，
       按 `archiveThresholdFromDays` 同样的方式钳住，避免该路径仍能回绕。
-- [ ] Batch 1 `brief.md:211` —— web「无回归」的理由不准确：真正的理由是**主最近列表
+- [x] Batch 1 `brief.md:211` —— web「无回归」的理由不准确：真正的理由是**主最近列表
       从不消费 `/v1/sidebar/sync`**（它走 `/v1/conversation/sync`），而不是「客户端会自己过滤
       这个端点」。后者会让 Batch 2 依赖一个并不存在的客户端过滤。
-- [ ] **worker 启动时打一次生效的归档/隐藏偏序**（第 7 轮新提）。当前守卫只覆盖 DB→DB
+- [x] **worker 启动时打一次生效的归档/隐藏偏序**（第 7 轮新提）。当前守卫只覆盖 DB→DB
       写入，`ViolatesThreadArchiveOrdering` 在 `!ArchiveEnabled` 时短路，所以「纯 env 配出的
       违规状态」不写一次管理接口就永远不暴露。启动日志正好补上这个洞。
 

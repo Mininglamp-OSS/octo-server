@@ -375,7 +375,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	if len(orderingIncoming) > 0 {
 		if err := m.systemSettingDB.ensureGuardAnchor(); err != nil {
 			m.Error("恢复配置守卫锚点行失败", zap.Error(err))
-			c.ResponseError(errors.New("写入系统设置失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 	}
@@ -396,6 +396,14 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Guard, under the lock, before any row is written. Skipped entirely when the
 	// batch touches none of the three keys, so unrelated settings writes pay
 	// neither the lock nor the extra reads.
+	//
+	// The three failure paths below respond through the i18n envelope
+	// (err.shared.internal — 500, Internal:true, so the renderer hides the cause
+	// and the reason stays in the log). The neighbouring DB failures in this
+	// handler still use the legacy c.ResponseError: modules/common has not been
+	// migrated (no baseline entry, no NoLegacyResponseError guard test), and
+	// migrating all 13 sites is out of this task's scope. New code follows the
+	// rule regardless — this file should not accumulate more of them.
 	if len(orderingIncoming) > 0 {
 		// The anchor row must be locked FIRST — see lockGuardAnchorWithTx. Locking
 		// the three setting rows instead cannot work: the migration deliberately
@@ -404,13 +412,13 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		// insert intention.
 		if err := m.systemSettingDB.lockGuardAnchorWithTx(tx); err != nil {
 			m.Error("获取配置守卫锁失败", zap.Error(err))
-			c.ResponseError(errors.New("写入系统设置失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 		rows, err := m.systemSettingDB.loadValuesWithTx(tx, ThreadArchiveOrderingKeys())
 		if err != nil {
 			m.Error("读取偏序守卫相关配置失败", zap.Error(err))
-			c.ResponseError(errors.New("写入系统设置失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 		// Resolved from the rows just read under the lock, NOT from the snapshot.
