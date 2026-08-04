@@ -102,23 +102,31 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: >
-            未登录。由 SpaceMiddleware 返回。
+            未认证。由 **AuthMiddleware** 返回，是标准错误信封：
 
-            **注意：这一条不是错误信封。** 中间件目前用 `c.AbortWithStatusJSON`
-            直接写一个裸 `{"msg": "请先登录"}`，没有 `error.code`，客户端无法按错误码
-            分支——只能按 HTTP 状态码分支。这是既有行为，本接口如实记录而不是
-            粉饰；把中间件迁进信封会改变全部 13 个挂载该中间件的 route group 的
-            响应体，属于独立变更，见
-            `.octospec/tasks/space-middleware-error-envelope/`。
+            * `err.shared.auth.token_missing` — 请求没带 token。
+            * `err.shared.auth.required` — token 无效或已过期。
+
+            SpaceMiddleware 自己也有一条 401 分支（`uid == ""`），但在本路由上
+            **不可达**：路由链是 `AuthMiddleware → SharedUIDRateLimiter →
+            SpaceMiddleware`，AuthMiddleware 会先中止无效请求、并在放行时写好 uid。
+            早先版本的本文档把那条不可达的裸响应写成了 401 的形状，反而漏掉了两条
+            真正会发生的——按当时的描述写客户端，会得出「401 没有 error.code」这个
+            与线上相反的结论。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/MiddlewareRawError"
+                $ref: "#/components/schemas/ErrorEnvelope"
         "403":
           description: >
-            调用者不是该 Space 的成员，或该 Space 已解散。由 SpaceMiddleware 返回。
+            调用者不是该 Space 的成员，或该 Space 已解散 / 被封禁。由 SpaceMiddleware
+            返回。
 
-            与 401 同：裸 `{"msg": "无权访问该 Space"}`，不是错误信封，无 `error.code`。
+            **注意：这一条不是错误信封。** 中间件目前用 `c.AbortWithStatusJSON`
+            直接写一个裸 `{"msg": "无权访问该 Space"}`，没有 `error.code`，客户端只能
+            按 HTTP 状态码分支。这是既有行为，本文档如实记录而不是粉饰；把中间件迁进
+            信封会改变全部 13 个挂载该中间件的 route group 的响应体，属于独立变更，见
+            `.octospec/tasks/space-middleware-error-envelope/`。
           content:
             application/json:
               schema:
@@ -135,7 +143,7 @@ paths:
         "500":
           description: >
             中间件校验成员身份时 DB 失败。裸 `{"msg": "校验 Space 成员身份失败"}`，
-            与 401/403 同源、同样不是信封。
+            与 403 同源、同样不是信封（401 不同源，见上）。
 
             handler 自身的查询失败（目录、总数、关系态）走
             `httperr.ResponseErrorL`，因此线路状态是 **400** 而不是 500，

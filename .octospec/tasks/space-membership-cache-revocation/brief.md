@@ -148,16 +148,48 @@ something at each new write site — is answered by the source guard
 
 ## Acceptance
 
-- `spacepkg.InvalidateMembershipCache` is called for every removed uid in:
-  `removeMembers` (user-facing), `leaveSpace`, the manager-side force-remove and
-  force-disband (`modules/space/api_manager.go`), `disbandSpace` (all members), and
-  bot deletion (`modules/botfather`, both paths).
-  A source guard or test enumerates these call sites so a future removal path cannot
-  quietly skip it.
+- `spacepkg.InvalidateMembershipCache` is called on every write that can flip
+  `CheckMembership` to false. That is three mechanisms, not one — its SQL is
+  `space_member sm INNER JOIN space s ON s.status = 1 WHERE sm.status = 1`, so
+  membership is lost by `space_member.status`, by the row being deleted, **or by
+  `space.status`**. The last one is the easy miss: a Space **ban** (`status = 2`)
+  touches no `space_member` row at all yet drops every member, exactly as disband
+  (`status = 0`) does.
+
+  Sites: `removeMembers` (user-facing), `leaveSpace`, `disbandSpace`, the
+  manager-side force-remove, force-disband and **`liftBan` (both directions —
+  2→1 must clear the negative entry or un-banned members stay locked out for 30s)**,
+  and bot deletion (`modules/botfather`, both paths).
+
+- `removeMembers` invalidates via `defer`, not a tail call. Removal is one
+  transaction per uid inside the loop, so an error at uid[k] returns with
+  uid[0..k-1] already committed as removed; a tail call is skipped entirely and
+  those grants survive. Pinned by `TestRemoveMembersInvalidatesOnEveryExit`, which
+  asserts the structure because the failing branch cannot be triggered
+  deterministically from a test (it needs a real DB error mid-batch).
+
+- A source guard enumerates the call sites so a future removal path cannot quietly
+  skip it. It must key on **function**, not file: keying on file makes "add a
+  removal to the file where removals already live" — the most likely regression —
+  invisible. It must also detect all three mechanisms above, across raw SQL and dbr
+  builders, and must **not** inspect the value written: literal `0`, a named
+  constant (`SpaceStatusBanned` exists), and a variable must all count, or the
+  guard breaks on the first refactor.
 - Invalidation is **targeted**, not blanket. Removing one member must not evict the
   other members' cached verdicts: a Space holds up to ~6000 members, and evicting
   them all on every removal would push the hot paths the cache exists for
   (conversation sync, message, search, sidebar) back onto the DB.
+- Whole-Space invalidation (disband / ban) must not stall the request. octo-lib's
+  `redis.Conn` exposes only single-key `Del` with no pipeline, and 6000 sequential
+  round trips measured **504ms against loopback** — 3–6s at production RTT, on the
+  request thread. Bounded concurrency, not a background goroutine: backgrounding
+  reopens the window this task exists to close.
+- The residual race is **documented, not claimed closed.** Commit-then-DEL narrows
+  the window; it does not eliminate it. A request that read the DB before the
+  removal committed can still write its positive verdict after the DEL and restore
+  a full 60s. It is sub-millisecond and needs an injected delay to reproduce, but
+  test names like `RevokesImmediately` must not be read as a proof it cannot happen.
+  Closing it needs a tombstone key or delayed double-delete — its own task.
 - Invalidation failures are logged at WARN with `space_id` and `uid`, never
   swallowed. A stale grant that nobody can see is the failure mode this task exists
   to remove.

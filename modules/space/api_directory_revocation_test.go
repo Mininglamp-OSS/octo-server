@@ -2,6 +2,7 @@ package space
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,10 @@ func assertMembershipCached(t *testing.T, spaceID, uid string) {
 // 清掉了它（键消失），还是仅仅让它过期（键还在，值仍是 "1"）。
 func assertMembershipCacheCleared(t *testing.T, spaceID, uid string) {
 	t.Helper()
-	val, _ := testCtx.GetRedisConn().GetString(membershipCacheKey(spaceID, uid))
+	// 不吞 Redis 错误：GetString 出错会返回空串，断言「已清除」就恒真，用例在
+	// Redis 不可用时静默通过——正是一条安全断言最不该有的失效方式。
+	val, err := testCtx.GetRedisConn().GetString(membershipCacheKey(spaceID, uid))
+	assert.NoError(t, err)
 	assert.Empty(t, val,
 		"移除路径应当在写库之后立刻清掉成员缓存条目，实际残留 %q"+
 			"（%q 说明正向判定还在，被移除的人在 TTL 到期前仍可访问）", val, val)
@@ -68,7 +72,9 @@ func getDirectoryAs(t *testing.T, srv *server.Server, token, spaceID string, q u
 	}
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, path, nil)
-	req.Header.Set("token", token)
+	if token != "" {
+		req.Header.Set("token", token)
+	}
 	srv.GetRoute().ServeHTTP(w, req)
 	return w
 }
@@ -264,4 +270,98 @@ func TestDirectory_ManagerForceDisbandRevokesImmediately(t *testing.T) {
 	assertMembershipCacheCleared(t, spaceID, testutil.UID)
 	assertMembershipCacheCleared(t, spaceID, ownerUID)
 	assertRevokedImmediately(t, srv, spaceID)
+}
+
+// TestDirectory_BanRevokesImmediately 走管理端封禁。
+//
+// 封禁一行 space_member 都不碰，只把 space.status 置 2——所以它最容易被漏，而
+// CheckMembership 的 SQL 带 INNER JOIN space ON s.status = 1，2 和 0 在这个 JOIN
+// 面前完全等价：全体成员立刻不再是成员。第一版实现就漏了它，是评审用 PoC 找出来的。
+func TestDirectory_BanRevokesImmediately(t *testing.T) {
+	srv, _ := newRenderedTestServer()
+	defer func() { assert.NoError(t, testutil.CleanAllTables(testCtx)) }()
+
+	const spaceID = "sp_revoke_ban"
+	const ownerUID = "sp_revoke_owner7"
+	seedRevocationSpace(t, spaceID, ownerUID)
+
+	ownerToken := joinApplicantToken(t, ownerUID)
+	assert.Equal(t, http.StatusOK, getDirectoryAs(t, srv, testutil.Token, spaceID, nil).Code)
+	assert.Equal(t, http.StatusOK, getDirectoryAs(t, srv, ownerToken, spaceID, nil).Code)
+	assertMembershipCached(t, spaceID, testutil.UID)
+	assertMembershipCached(t, spaceID, ownerUID)
+
+	w := doJSON(t, srv, http.MethodPut,
+		"/v1/manager/spaces/"+spaceID+"/status/2", superAdminToken(t), ``)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// 封禁是全空间撤权，owner 也不例外。
+	assertMembershipCacheCleared(t, spaceID, testutil.UID)
+	assertMembershipCacheCleared(t, spaceID, ownerUID)
+	assertRevokedImmediately(t, srv, spaceID)
+}
+
+// TestDirectory_UnbanRestoresImmediately 解禁（2→1）要清的是**否定**条目。
+//
+// 方向相反但机制相同：不清的话，空间已经恢复正常，成员却还要被拒最长 30s
+// （negativeCacheTTL）。DEL 不区分条目正负，所以同一次调用两个方向一起解决——
+// 这也是 liftBan 无条件失效、而不是「只在封禁时失效」的原因。
+func TestDirectory_UnbanRestoresImmediately(t *testing.T) {
+	srv, _ := newRenderedTestServer()
+	defer func() { assert.NoError(t, testutil.CleanAllTables(testCtx)) }()
+
+	const spaceID = "sp_revoke_unban"
+	seedRevocationSpace(t, spaceID, "sp_revoke_owner8")
+
+	banW := doJSON(t, srv, http.MethodPut,
+		"/v1/manager/spaces/"+spaceID+"/status/2", superAdminToken(t), ``)
+	assert.Equal(t, http.StatusOK, banW.Code, banW.Body.String())
+
+	// 这次被拒的请求会把否定判定写进缓存（30s）——正是解禁必须清掉的东西。
+	assert.Equal(t, http.StatusForbidden, getDirectoryAs(t, srv, testutil.Token, spaceID, nil).Code)
+	val, err := testCtx.GetRedisConn().GetString(membershipCacheKey(spaceID, testutil.UID))
+	assert.NoError(t, err)
+	assert.Equal(t, "0", val, "前置条件：封禁期间的请求应当留下否定缓存")
+
+	unbanW := doJSON(t, srv, http.MethodPut,
+		"/v1/manager/spaces/"+spaceID+"/status/1", superAdminToken(t), ``)
+	assert.Equal(t, http.StatusOK, unbanW.Code, unbanW.Body.String())
+
+	assertMembershipCacheCleared(t, spaceID, testutil.UID)
+	assert.Equal(t, http.StatusOK, getDirectoryAs(t, srv, testutil.Token, spaceID, nil).Code,
+		"解禁后必须立刻恢复访问，不能等否定缓存过期（≤30s）")
+}
+
+// TestDirectory_UnauthenticatedIsEnvelope 钉住 401 的实际形状。
+//
+// 它存在的理由是 directory.yaml 曾经把 401 写错：文档描述的是 SpaceMiddleware 那条
+// 裸 `{"msg":...}`，而路由链是 AuthMiddleware → SharedUIDRateLimiter →
+// SpaceMiddleware，AuthMiddleware 先中止，所以中间件那条 401 在本路由上根本到不了。
+// 照当时的文档写客户端，会得出「401 没有 error.code」这个与线上相反的结论。
+// 没有任何断言看着它，才让错误描述活了下来。
+func TestDirectory_UnauthenticatedIsEnvelope(t *testing.T) {
+	srv, _ := newRenderedTestServer()
+	defer func() { assert.NoError(t, testutil.CleanAllTables(testCtx)) }()
+
+	const spaceID = "sp_revoke_401"
+	seedRevocationSpace(t, spaceID, "sp_revoke_owner9")
+
+	for _, tc := range []struct{ name, token, wantCode string }{
+		{"缺 token", "", "err.shared.auth.token_missing"},
+		{"token 无效", "definitely-not-a-token", "err.shared.auth.required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := getDirectoryAs(t, srv, tc.token, spaceID, nil)
+			assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			var env struct {
+				Error struct {
+					Code       string `json:"code"`
+					HTTPStatus int    `json:"http_status"`
+				} `json:"error"`
+			}
+			assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &env), w.Body.String())
+			assert.Equal(t, tc.wantCode, env.Error.Code)
+			assert.Equal(t, http.StatusUnauthorized, env.Error.HTTPStatus)
+		})
+	}
 }

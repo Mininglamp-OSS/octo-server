@@ -808,7 +808,14 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 
 	// 只收集真正被移除的 uid：下面的循环会静默跳过 owner / 同级及更高角色，
 	// 那些人仍是成员，清掉他们的缓存是无谓的额外 Redis 往返。
-	removed := make([]string, 0, len(req.UIDs))
+	//
+	// defer 而不是在循环后直调：removeMemberLocked 是**每个 uid 一个事务**，逐个提交。
+	// 循环中途出错会 return，此时前面几个 uid 已经作为「已移除」落库了；写在循环
+	// 之后的失效调用会被整个跳过，那几个人的正向缓存原封不动地留着——写入成功、
+	// 撤权丢失，恰好是本次修复要消灭的形态。removeMemberLocked 持 FOR UPDATE，
+	// 与 transferOwnerAdminLocked 存在已知的锁竞争，所以中途失败并不罕见。
+	var removed []string
+	defer func() { revokeMembershipCache(s.ctx, s, spaceId, removed...) }()
 	for _, uid := range req.UIDs {
 		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
 		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
@@ -823,8 +830,6 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		}
 		removed = append(removed, uid)
 	}
-	// 撤权立即生效：清掉 SpaceMiddleware 的正向成员缓存（见 revokeMembershipCache）。
-	revokeMembershipCache(s.ctx, s, spaceId, removed...)
 	// 失效通知成员缓存
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)

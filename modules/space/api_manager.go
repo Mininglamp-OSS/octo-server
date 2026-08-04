@@ -455,6 +455,14 @@ func (m *Manager) liftBan(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 封禁与解散在 CheckMembership 眼里是同一件事：它的 SQL 带
+	// INNER JOIN space ON s.status = 1，所以 1→2 会让全体成员立刻不再是成员，
+	// 和 1→0 一模一样。缓存不清的话，封禁一个被滥用的 Space 之后，任何持有正向
+	// 条目的成员还能继续把整份名册拉走最长 60s——封禁的目的正好被推迟了。
+	//
+	// 2→1 的解禁也一并清：那时缓存里留的是否定条目，不清会让成员在解禁后仍被拒
+	// 最长 30s。DEL 不区分条目正负，一次调用同时解决两个方向。
+	revokeMembershipCacheForSpace(m.ctx, m, m.db, spaceId)
 	m.Info("管理员修改空间状态", zap.String("spaceId", spaceId), zap.String("operator", c.GetLoginUID()), zap.Int("from", sp.Status), zap.Int("to", status))
 	// 刷新 ParseChannelID 缓存：loadKnownSpaceIDs 只加载 status=1 的空间，
 	// 封禁 1→2 需要把该 spaceId 从缓存中剔除，解禁 2→1 需要加回去，否则路由会走偏。

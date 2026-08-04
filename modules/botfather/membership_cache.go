@@ -29,9 +29,6 @@ func revokeBotMembershipCache(ctx *config.Context, lg log.Log, botID string) {
 		return
 	}
 	redisConn := ctx.GetRedisConn()
-	if redisConn == nil {
-		return
-	}
 	var failed []string
 	for _, spaceID := range spaceIDs {
 		if spaceID == "" {
