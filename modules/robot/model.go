@@ -7,8 +7,8 @@ import (
 )
 
 type robotEvent struct {
-	EventID     int64                  `json:"event_id,omitempty"` // 更新ID
-	Message     *config.MessageResp    `json:"message,omitempty"`  // 消息对象
+	EventID     int64                  `json:"event_id,omitempty"`   // 更新ID
+	Message     *config.MessageResp    `json:"message,omitempty"`    // 消息对象
 	InlineQuery *InlineQuery           `json:"inline_query,omitempty"`
 	EventType   string                 `json:"event_type,omitempty"` // 自定义事件类型（如 bot_joined_group）
 	EventData   map[string]interface{} `json:"event_data,omitempty"` // 自定义事件数据

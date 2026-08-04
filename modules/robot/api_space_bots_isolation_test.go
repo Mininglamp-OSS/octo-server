@@ -33,8 +33,10 @@ func seedIsolationSpace(t *testing.T, ctx *config.Context, spaceID, botUID, memb
 
 	// bot：user(robot=1) + robot(status=1) + space_member(status=1)，三者齐全才会
 	// 被 spaceBots 的两个 INNER JOIN 选中。
+	// short_no 必须显式给且互不相同：真实 user 表在该列上有唯一索引，默认值是
+	// 空串，所以同一个库里只能存在一行空 short_no，第二次插入必然撞键。
 	_, err = db.InsertBySql(
-		"INSERT INTO `user` (uid, name, robot) VALUES (?, ?, 1)", botUID, "Secret Bot",
+		"INSERT INTO `user` (uid, name, robot, short_no) VALUES (?, ?, 1, ?)", botUID, "Secret Bot", botUID,
 	).Exec()
 	assert.NoError(t, err)
 	_, err = db.InsertBySql(
@@ -53,6 +55,27 @@ func seedIsolationSpace(t *testing.T, ctx *config.Context, spaceID, botUID, memb
 		).Exec()
 		assert.NoError(t, err)
 	}
+}
+
+// seedIsolationBot 往已有空间里再放一个启用 bot。用于让排序与排除类断言可证伪。
+func seedIsolationBot(t *testing.T, ctx *config.Context, spaceID, botUID, name string) {
+	t.Helper()
+	db := ctx.DB()
+	// 用 IGNORE：botfather 的 user / robot 行由 robot 模块启动时自动创建，
+	// 直接 INSERT 会撞唯一键。本助手要能给它补一条 space_member。
+	_, err := db.InsertBySql(
+		"INSERT IGNORE INTO `user` (uid, name, robot, short_no) VALUES (?, ?, 1, ?)", botUID, name, botUID,
+	).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertBySql(
+		"INSERT IGNORE INTO robot (robot_id, status, creator_uid, description) VALUES (?, 1, ?, ?)",
+		botUID, "seed_creator", "another bot",
+	).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status) VALUES (?, ?, 0, 1)", spaceID, botUID,
+	).Exec()
+	assert.NoError(t, err)
 }
 
 // getSpaceBots 发一次请求。每次调用前清成员缓存：中间件把校验结果缓存在 Redis
@@ -127,13 +150,30 @@ func TestSpaceBots_MemberUnaffected(t *testing.T) {
 
 	const spaceID = "sb_iso_mine"
 	seedIsolationSpace(t, ctx, spaceID, "sb_iso_bot_mine", testutil.UID)
+	// 只有一个 bot 时，ORDER BY u.created_at DESC 与 botfather 排除都恒真、
+	// 无法证伪——而这两件正是本用例声称要钉住的。补第二个 bot（created_at 更晚，
+	// 因此必须排在前面）和一条 botfather 记录，让断言真的能失败。
+	seedIsolationBot(t, ctx, spaceID, "sb_iso_bot_newer", "Newer Bot")
+	seedIsolationBot(t, ctx, spaceID, "botfather", "BotFather")
+	// 显式拉开 created_at：两行同秒插入时 ORDER BY u.created_at DESC 的结果不确定，
+	// 断言会随机翻车。把时间钉死，排序断言才真正在验证排序而不是碰运气。
+	for uid, at := range map[string]string{
+		"sb_iso_bot_mine":  "2026-01-01 00:00:00",
+		"sb_iso_bot_newer": "2026-06-01 00:00:00",
+	} {
+		_, err := ctx.DB().UpdateBySql("UPDATE `user` SET created_at = ? WHERE uid = ?", at, uid).Exec()
+		assert.NoError(t, err)
+	}
 
 	w := getSpaceBots(t, s, ctx, spaceID)
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	rows := decodeSpaceBots(w.Body.Bytes())
-	assert.Len(t, rows, 1)
-	assert.Equal(t, "sb_iso_bot_mine", rows[0]["uid"])
+	assert.Len(t, rows, 2, "botfather 必须被排除: %s", w.Body.String())
+	uids := []string{rows[0]["uid"].(string), rows[1]["uid"].(string)}
+	assert.NotContains(t, uids, "botfather")
+	// u.created_at DESC：后建的排在前面。
+	assert.Equal(t, []string{"sb_iso_bot_newer", "sb_iso_bot_mine"}, uids, "排序应为 created_at DESC")
 	// 字段集保持原样：这几个是客户端在读的。
 	for _, field := range []string{"uid", "name", "description", "creator_uid", "creator_name", "bot_commands", "auto_approve", "status"} {
 		assert.Contains(t, rows[0], field, "响应字段 %s 不应消失", field)
@@ -178,6 +218,7 @@ func TestSpaceBots_MissingSpaceIDKeepsBusinessError(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
+	resetUIDRateLimit(t, ctx)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/robot/space_bots", nil)
 	req.Header.Set("token", testutil.Token)
@@ -205,4 +246,27 @@ func TestSpaceBots_MissingSpaceIDKeepsBusinessError(t *testing.T) {
 	req2.Header.Set("X-Space-Id", spaceID)
 	s.GetRoute().ServeHTTP(w2, req2)
 	assert.Equal(t, http.StatusBadRequest, w2.Code, "成员带 header 但缺 query 时仍是参数错误: %s", w2.Body.String())
+}
+
+// TestSpaceBots_DisbandedSpaceRefusesMember 钉住这次改动对**合法调用方**的行为变更。
+//
+// CheckMembership 除了 space_member.status=1，还额外要求 space.status=1
+// （pkg/space/membership.go），而 handler 自己从不校验 space 行。所以已解散空间的
+// 老成员从「200 + bot 列表」变成 403。这是正确的收紧，但它确实是对一个合法成员的
+// 行为变更——brief 记了，之前却没有任何测试固定它。
+func TestSpaceBots_DisbandedSpaceRefusesMember(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+
+	const spaceID = "sb_iso_disbanded"
+	seedIsolationSpace(t, ctx, spaceID, "sb_iso_bot_dis", testutil.UID)
+
+	assert.Equal(t, http.StatusOK, getSpaceBots(t, s, ctx, spaceID).Code, "解散前成员可访问")
+
+	_, err := ctx.DB().UpdateBySql("UPDATE space SET status = 0 WHERE space_id = ?", spaceID).Exec()
+	assert.NoError(t, err)
+
+	w := getSpaceBots(t, s, ctx, spaceID)
+	assert.Equal(t, http.StatusForbidden, w.Code, "空间解散后成员也应被拒: %s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "sb_iso_bot_dis")
 }
