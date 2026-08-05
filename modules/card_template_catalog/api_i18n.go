@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"go.uber.org/zap"
 )
 
 func respondCatalogForbidden(c *wkhttp.Context) {
@@ -67,9 +68,15 @@ func respondCatalogNotFound(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrSharedNotFound, nil, nil)
 }
 
-func respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
-	// 具体拒绝原因只进日志/错误链，响应保持单一 localized envelope（管理面
-	// 也不回显任意错误文本，防 details 泄漏内部结构）。
-	_ = err
+// respondCatalogGrantInvalid keeps the wire answer to a single localized
+// envelope — the manager plane does not echo arbitrary error text either, so a
+// details map cannot leak internal structure — while the specific reason goes
+// to the log. Dropping the reason entirely would leave an operator with a
+// generic 400 and nothing anywhere to explain it.
+func (a *API) respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
+	if a != nil && a.logger != nil && err != nil {
+		a.logger.Error("card template grant request rejected",
+			zap.String("operation", "grant"), zap.Error(err))
+	}
 	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogGrantInvalid, nil, nil)
 }

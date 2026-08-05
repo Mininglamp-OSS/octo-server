@@ -461,6 +461,13 @@ func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 // sending Bot's own — otherwise a grant in one tenant would deliver into
 // another.
 func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
+	// The target-authoritative resolution only runs when there is a dynamic
+	// decision to make; with the gate closed it is deliberately skipped (see
+	// TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark).
+	previous := cardtmpl.DefaultAuthorizationSource()
+	cardtmpl.SetDefaultAuthorizationSource(&stubAuthorizationSource{newSend: true})
+	t.Cleanup(func() { cardtmpl.SetDefaultAuthorizationSource(previous) })
+
 	querier := &fakeSpaceQuerier{
 		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
 		groupSpaces: map[string]string{"group-1": "space-group"},
@@ -488,5 +495,64 @@ func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
 		if unresolved.SpaceResolved || unresolved.SpaceID != "" {
 			t.Fatalf("principal = %+v, want unresolved", unresolved)
 		}
+	}
+}
+
+// Review follow-up (#6): with the dynamic catalog dark there is nothing to
+// authorize against, so the request must not resolve a Space at all. Before
+// this fix a gates-off deployment paid a space_member/app_bot query on every
+// feature-detection poll — a database dependency the endpoint never had.
+func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
+	previous := cardtmpl.DefaultAuthorizationSource()
+	t.Cleanup(func() { cardtmpl.SetDefaultAuthorizationSource(previous) })
+
+	querier := &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1"}}}
+	ba := newTestBotAPI(querier)
+	ctx := newGrantSpaceContext(t, "")
+
+	for _, source := range []cardtmpl.RuntimeAuthorizationSource{
+		nil,
+		&stubAuthorizationSource{newSend: false},
+	} {
+		querier.calls = nil
+		cardtmpl.SetDefaultAuthorizationSource(source)
+
+		principal := ba.botCatalogPrincipalFor(ctx, "bot-42")
+		if principal.SpaceResolved || principal.SpaceID != "" {
+			t.Fatalf("dark catalog resolved a Space: %+v", principal)
+		}
+		send := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
+		if send.SpaceResolved || send.SpaceID != "" {
+			t.Fatalf("dark catalog resolved a send Space: %+v", send)
+		}
+		if len(querier.calls) != 0 {
+			t.Fatalf("dark catalog issued %v", querier.calls)
+		}
+	}
+
+	cardtmpl.SetDefaultAuthorizationSource(&stubAuthorizationSource{newSend: true})
+	if principal := ba.botCatalogPrincipalFor(ctx, "bot-42"); !principal.SpaceResolved {
+		t.Fatalf("enabled catalog did not resolve a Space: %+v", principal)
+	}
+}
+
+// Review follow-up (#2): a group send authorizes against the target's Space, so
+// the stored marker must carry that Space too. Stamping env.SpaceID (which
+// send.go only fills for DMs) left every group card with space_id:"" — and all
+// three downstream D3 guards are written as `if SpaceID != ""`, so they became
+// no-ops for exactly the frames that cross Space boundaries.
+func TestProvenanceSpacePrefersTheAuthorizedSpaceOverTheRenderEnv(t *testing.T) {
+	group := botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-group", SpaceResolved: true}
+	if got := provenanceSpaceID(group, cardtmpl.BuildEnv{}); got != "space-group" {
+		t.Fatalf("group provenance Space = %q, want the authorized Space", got)
+	}
+	// A DM keeps stamping exactly what it stamped before the target-authoritative
+	// resolver existed.
+	dm := botCatalogPrincipal{BotID: "bot-42"}
+	if got := provenanceSpaceID(dm, cardtmpl.BuildEnv{SpaceID: "space-dm"}); got != "space-dm" {
+		t.Fatalf("DM provenance Space = %q, want the render env Space", got)
+	}
+	if got := provenanceSpaceID(dm, cardtmpl.BuildEnv{}); got != "" {
+		t.Fatalf("unresolved provenance Space = %q, want empty", got)
 	}
 }

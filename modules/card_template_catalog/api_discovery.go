@@ -174,13 +174,14 @@ func (a *API) listTemplates(c *wkhttp.Context) {
 
 	remaining := limit - len(page.Templates)
 	if remaining <= 0 {
-		// Static filled the page exactly. Hand back a dynamic cursor at the top
-		// rather than querying with a zero budget, which the store's clamp
-		// would silently turn back into a full page.
-		page.NextCursor = encodeDiscoveryCursor(discoveryCursor{
-			Version: discoveryCursorVersion, Space: spaceID, Source: discoverySourceDynamic,
-		})
-		page.HasMore = true
+		// Static filled the page exactly, so whether another page exists is a
+		// question about the dynamic source, not something to assume.
+		next, more, err := dynamicPageFollows(ctx, store, spaceID)
+		if err != nil {
+			respondCatalogUnavailable(c)
+			return
+		}
+		page.NextCursor, page.HasMore = next, more
 		writeDiscoveryCacheHeaders(c, spaceID)
 		c.Response(page)
 		return
@@ -220,16 +221,7 @@ func (a *API) staticPage(
 	if len(entries) == 0 {
 		return nil, nil, nil
 	}
-	// Only private entries need a grant lookup, and only for IDs the caller
-	// could still reach on this page — a Space with no grants pays for one
-	// bounded query, not one per template.
-	privateIDs := make([]cardtmpl.ID, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Visibility != cardtmpl.CatalogVisibilityPublic {
-			privateIDs = append(privateIDs, entry.ID)
-		}
-	}
-	granted, err := store.StaticDiscoverGrants(ctx, spaceID, privateIDs)
+	granted, err := store.StaticDiscoverGrants(ctx, spaceID, privateTemplateIDs(entries))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -257,6 +249,50 @@ func (a *API) staticPage(
 		items = append(items, staticListItem(entry))
 	}
 	return items, nil, nil
+}
+
+// dynamicPageFollows peeks at the dynamic source with a budget of one row.
+//
+// The alternative — declaring has_more:true because the static source happened
+// to fill the page — costs every caller iterating this boundary a guaranteed
+// empty round trip, and, worse, teaches them that has_more is not something
+// they can act on anywhere else either.
+func dynamicPageFollows(
+	ctx context.Context,
+	store discoveryStore,
+	spaceID string,
+) (cursor string, hasMore bool, err error) {
+	peek, _, err := store.ListDiscoverable(ctx, spaceID, "", "", 1)
+	if err != nil {
+		return "", false, err
+	}
+	if len(peek) == 0 {
+		return "", false, nil
+	}
+	return encodeDiscoveryCursor(discoveryCursor{
+		Version: discoveryCursorVersion, Space: spaceID, Source: discoverySourceDynamic,
+	}), true, nil
+}
+
+// privateTemplateIDs is the deduplicated set of static template IDs that need a
+// discover-grant probe. Keying by ID rather than by exact version matters: a
+// card registered at three versions would otherwise take three slots in the
+// bounded IN-list and could push a genuinely granted template past the cut,
+// where it is silently treated as ungranted.
+func privateTemplateIDs(entries []cardtmpl.StaticCatalogEntry) []cardtmpl.ID {
+	ids := make([]cardtmpl.ID, 0, len(entries))
+	seen := make(map[cardtmpl.ID]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.Visibility == cardtmpl.CatalogVisibilityPublic {
+			continue
+		}
+		if _, done := seen[entry.ID]; done {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+		ids = append(ids, entry.ID)
+	}
+	return ids
 }
 
 func afterStaticCursor(entry cardtmpl.StaticCatalogEntry, cursor discoveryCursor) bool {

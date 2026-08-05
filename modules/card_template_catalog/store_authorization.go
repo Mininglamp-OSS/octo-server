@@ -49,12 +49,16 @@ const (
 	// selectPrincipalGrantsSQL lists a principal's grant rows across templates
 	// for the Bot advertised set. It is bounded by the caller and covers both
 	// scopes so the same precedence rule applies per template ID.
+	// selectPrincipalGrantsSQL lists a principal's grant rows across templates.
+	// The secondary sort key is not cosmetic: a template's exact and global rows
+	// must be adjacent and in a defined order so the row budget can be truncated
+	// at a template boundary rather than through the middle of a pair.
 	selectPrincipalGrantsSQL = `SELECT template_id, scope_space_id, status,
             can_discover, can_send, can_edit, revision
         FROM card_template_grant
         WHERE principal_type = ? AND principal_id = ?
           AND scope_space_id IN (?, '')
-        ORDER BY template_id ASC
+        ORDER BY template_id ASC, scope_space_id ASC
         LIMIT ?`
 )
 
@@ -314,8 +318,13 @@ func scanPrincipalGrants(
 	principalID, scope string,
 	rowLimit int,
 ) (map[cardtmpl.ID]GrantDecision, error) {
+	// Read one row past the budget so a truncated result is detectable. A
+	// template's exact and global rows are adjacent in this ordering, so a cut
+	// can only ever split the *last* template — and half a pair is worse than
+	// no pair: losing the exact tombstone of a template whose global row is
+	// still active would report a revoked principal as granted.
 	rows, err := tx.QueryContext(ctx, selectPrincipalGrantsSQL,
-		string(principalType), principalID, scope, rowLimit)
+		string(principalType), principalID, scope, rowLimit+1)
 	if err != nil {
 		return nil, fmt.Errorf("card template catalog: list principal grants: %w", err)
 	}
@@ -323,7 +332,16 @@ func scanPrincipalGrants(
 
 	exact := make(map[cardtmpl.ID]GrantRecord)
 	global := make(map[cardtmpl.ID]GrantRecord)
+	var order []cardtmpl.ID
+	seen := make(map[cardtmpl.ID]struct{})
+	truncated := false
+	scanned := 0
 	for rows.Next() {
+		scanned++
+		if scanned > rowLimit {
+			truncated = true
+			break
+		}
 		var templateID string
 		var scopeSpaceID, status string
 		record := GrantRecord{}
@@ -342,6 +360,10 @@ func scanPrincipalGrants(
 			TemplateID: id, PrincipalType: principalType,
 			PrincipalID: principalID, ScopeSpaceID: scopeSpaceID,
 		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			order = append(order, id)
+		}
 		if scopeSpaceID == "" {
 			global[id] = record
 			continue
@@ -350,6 +372,15 @@ func scanPrincipalGrants(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("card template catalog: iterate principal grants: %w", err)
+	}
+	if truncated && len(order) > 0 {
+		// Drop the template the cut landed in. Every earlier template is
+		// complete because the ordering keeps a template's rows contiguous, so
+		// this trades one advertised template for the guarantee that no
+		// remaining decision was made on a partial row set.
+		incomplete := order[len(order)-1]
+		delete(exact, incomplete)
+		delete(global, incomplete)
 	}
 
 	decisions := make(map[cardtmpl.ID]GrantDecision, len(exact)+len(global))

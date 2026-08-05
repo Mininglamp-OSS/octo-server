@@ -273,7 +273,15 @@ func (a *API) detail(c *wkhttp.Context) {
 	if grantStore, ok := a.store.(catalogGrantStore); ok && grantStore != nil {
 		grants, truncated, grantsErr := grantStore.ListGrants(ctx, id, grantSummaryLimit)
 		if grantsErr != nil {
-			a.respondStateError(c, "detail_grants", grantsErr)
+			// The grant summary is an add-on to a control-plane read that
+			// worked long before grants existed. Failing the whole response
+			// would take activation state, versions and revisions away from an
+			// operator at exactly the moment they need them — including the
+			// case where the grant migration has not been applied yet. Report
+			// the outage in the logs and serve the rest.
+			a.logStateError("card template detail grant summary unavailable", "detail_grants", grantsErr)
+			response.GrantsUnavailable = true
+			c.Response(response)
 			return
 		}
 		response.Grants = make([]grantSummaryResponse, len(grants))
@@ -489,8 +497,12 @@ type detailReadResponse struct {
 	Truncated  bool                   `json:"truncated"`
 	// Grants 是 bounded grant summary（PR-C Control APIs）：只在 superAdmin
 	// manager detail 出现，普通 B1/B2 永不返回这些 control fields。
-	Grants          []grantSummaryResponse `json:"grants"`
-	GrantsTruncated bool                   `json:"grants_truncated,omitempty"`
+	Grants []grantSummaryResponse `json:"grants"`
+	// GrantsUnavailable marks a response whose grant summary could not be read.
+	// It is distinct from an empty Grants array — "this template has no grants"
+	// and "we could not tell" are different answers for an operator.
+	GrantsUnavailable bool `json:"grants_unavailable,omitempty"`
+	GrantsTruncated   bool `json:"grants_truncated,omitempty"`
 }
 
 type grantSummaryResponse struct {

@@ -130,7 +130,20 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 	return primary, true
 }
 
+// dynamicCatalogEnabled reports whether any dynamic decision can be reached at
+// all. When it is false there is nothing to authorize against, so resolving the
+// caller's Space would be pure cost: a Space lookup this deployment did not
+// perform before PR-C, plus — for a multi-Space Bot — an ambiguity warn on
+// every poll of an endpoint that never touched the database.
+func dynamicCatalogEnabled() bool {
+	source := cardtmpl.DefaultAuthorizationSource()
+	return source != nil && source.NewSendEnabled()
+}
+
 func (ba *BotAPI) botCatalogPrincipalFor(c *wkhttp.Context, robotID string) botCatalogPrincipal {
+	if !dynamicCatalogEnabled() {
+		return botCatalogPrincipal{BotID: robotID}
+	}
 	spaceID, resolved := ba.resolveBotGrantSpaceID(c, robotID)
 	return botCatalogPrincipal{BotID: robotID, SpaceID: spaceID, SpaceResolved: resolved}
 }
@@ -152,6 +165,12 @@ func (ba *BotAPI) botSendCatalogPrincipal(
 	robotID, channelID string,
 	channelType uint8,
 ) botCatalogPrincipal {
+	if !dynamicCatalogEnabled() {
+		// Same reasoning as botCatalogPrincipalFor: with the gate closed the
+		// send path resolves purely from static policy, so it must not start
+		// reading group rows to answer a question nobody will ask.
+		return botCatalogPrincipal{BotID: robotID}
+	}
 	switch channelType {
 	case common.ChannelTypeGroup.Uint8():
 		return ba.botCatalogPrincipalForGroup(robotID, channelID)

@@ -93,15 +93,15 @@ func (a *API) grantUpsert(c *wkhttp.Context) {
 	identity.ScopeSpaceID = request.ScopeSpaceID
 	permissions := GrantPermissions{Discover: request.Discover, Send: request.Send, Edit: request.Edit}
 	if err := validateGrantIdentity(identity); err != nil {
-		respondCatalogGrantInvalid(c, err)
+		a.respondCatalogGrantInvalid(c, err)
 		return
 	}
 	if err := validateGrantPermissions(identity.PrincipalType, permissions); err != nil {
-		respondCatalogGrantInvalid(c, err)
+		a.respondCatalogGrantInvalid(c, err)
 		return
 	}
 	if !validStateControlText(request.Reason, request.ChangeTicket) {
-		respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
+		a.respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), stateControlTimeout)
@@ -154,11 +154,11 @@ func (a *API) grantRevoke(c *wkhttp.Context) {
 	}
 	identity.ScopeSpaceID = request.ScopeSpaceID
 	if err := validateGrantIdentity(identity); err != nil {
-		respondCatalogGrantInvalid(c, err)
+		a.respondCatalogGrantInvalid(c, err)
 		return
 	}
 	if !validStateControlText(request.Reason, request.ChangeTicket) {
-		respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
+		a.respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
 		return
 	}
 	// Revoke 不做 principal 存在性校验：principal 事后被删除/停用时，撤销
@@ -187,20 +187,20 @@ func (a *API) grantRevoke(c *wkhttp.Context) {
 func (a *API) parseGrantPath(c *wkhttp.Context) (GrantIdentity, bool) {
 	id, ok := parseManagerTemplateID(c.Param("id"))
 	if !ok {
-		respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
+		a.respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
 		return GrantIdentity{}, false
 	}
 	principalType := GrantPrincipalType(c.Param("principal_type"))
 	switch principalType {
 	case GrantPrincipalBot, GrantPrincipalInternalProducer, GrantPrincipalSpace:
 	default:
-		respondCatalogGrantInvalid(c, fmt.Errorf("%w: principal type %q", ErrGrantRequestInvalid, principalType))
+		a.respondCatalogGrantInvalid(c, fmt.Errorf("%w: principal type %q", ErrGrantRequestInvalid, principalType))
 		return GrantIdentity{}, false
 	}
 	principalID := c.Param("principal_id")
 	if principalID == "" || principalID != strings.TrimSpace(principalID) ||
 		len([]rune(principalID)) > maxGrantPrincipalIDRunes {
-		respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
+		a.respondCatalogGrantInvalid(c, ErrGrantRequestInvalid)
 		return GrantIdentity{}, false
 	}
 	return GrantIdentity{TemplateID: id, PrincipalType: principalType, PrincipalID: principalID}, true
@@ -216,7 +216,7 @@ func (a *API) requireGrantPrincipal(c *wkhttp.Context, ctx context.Context, iden
 	}
 	if err := a.validateGrantPrincipal(ctx, identity); err != nil {
 		if errors.Is(err, ErrGrantRequestInvalid) {
-			respondCatalogGrantInvalid(c, err)
+			a.respondCatalogGrantInvalid(c, err)
 			return false
 		}
 		a.logStateError("card template grant principal validation failed", "grant", err)
@@ -244,7 +244,7 @@ func (a *API) respondGrantError(c *wkhttp.Context, operation string, err error) 
 	case errors.Is(err, ErrGrantRequestInvalid), errors.Is(err, ErrGrantTargetUnknown),
 		errors.Is(err, ErrGrantNotFound):
 		a.metrics.observeDB(operation, "rejected")
-		respondCatalogGrantInvalid(c, err)
+		a.respondCatalogGrantInvalid(c, err)
 		return "rejected"
 	case errors.Is(err, ErrCatalogIntegrity):
 		a.metrics.observeDB(operation, "integrity_error")

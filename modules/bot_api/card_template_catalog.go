@@ -287,7 +287,7 @@ func (c *botCardTemplateCatalog) RenderPayload(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend, inbound, env,
-		c.staticRefResolver(c.sendAllowed, "not Bot-callable for new send"), false)
+		c.staticRefResolver(c.sendAllowed, "not Bot-callable for new send"), false, "")
 }
 
 // RenderPayloadForPrincipal is the authenticated new-send path. Unlike the
@@ -306,7 +306,7 @@ func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
 	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeNewSend, inbound, env,
 		func(ctx context.Context, value any) (botTemplateRef, error) {
 			return c.requireSendableRef(ctx, principal, value)
-		}, true)
+		}, true, provenanceSpaceID(principal, env))
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayload(
@@ -318,7 +318,7 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
-		c.staticRefResolver(c.editAllowed, "not edit-compatible"), false)
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), false, "")
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
@@ -331,7 +331,9 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
-		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true)
+		// Historical edit is pinned to a stored frame whose Space the envelope
+		// already carries, so env.SpaceID is the authoritative value here.
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true, env.SpaceID)
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -342,6 +344,14 @@ func (c *botCardTemplateCatalog) renderPayload(
 	env cardtmpl.BuildEnv,
 	resolveRef func(context.Context, any) (botTemplateRef, error),
 	authorProvenance bool,
+	// provenanceSpaceID is the Space the marker is stamped with. It is a
+	// separate value from env.SpaceID on purpose: env.SpaceID drives rendered
+	// content (deep links) and send.go only populates it for DMs, while the
+	// marker must carry the Space the send was actually *authorized* against —
+	// for a group or thread that is the target's Space, which env.SpaceID never
+	// sees. Stamping "" there would silently disable every downstream D3 Space
+	// guard, since all of them are written as `if Provenance.SpaceID != ""`.
+	provenanceSpaceID string,
 ) (map[string]any, error) {
 	if c == nil || c.catalog == nil {
 		return nil, errBotTemplateCatalogUnavailable
@@ -406,7 +416,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 			Version:       cardmsg.CatalogProvenanceVersion,
 			PrincipalType: cardmsg.CatalogPrincipalWireBot,
 			PrincipalID:   botID,
-			SpaceID:       env.SpaceID,
+			SpaceID:       provenanceSpaceID,
 		}.MarshalMap()
 	}
 	for _, key := range []string{"mention", "reply"} {
@@ -551,4 +561,18 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBo
 		}
 	}
 	return nil
+}
+
+// provenanceSpaceID picks the Space a new send's marker is stamped with.
+//
+// The authorization principal wins when it resolved one, because that is the
+// Space the grant decision was actually made against — for a group or thread
+// send it is the target's Space, which env.SpaceID (DM-only) never carries.
+// env.SpaceID remains the fallback so a DM keeps stamping exactly what it
+// stamped before PR-C's target-authoritative resolution existed.
+func provenanceSpaceID(principal botCatalogPrincipal, env cardtmpl.BuildEnv) string {
+	if principal.SpaceResolved && principal.SpaceID != "" {
+		return principal.SpaceID
+	}
+	return env.SpaceID
 }

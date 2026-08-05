@@ -9,6 +9,8 @@ package card_template_catalog
 // a paginating caller sees.
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -130,5 +132,112 @@ func TestBoundedDiscoveryLimitClampsAtTheStore(t *testing.T) {
 	}
 	if got := boundedDiscoveryLimit(7); got != 7 {
 		t.Fatalf("in-range limit = %d", got)
+	}
+}
+
+// fakeDiscoveryStore records what the handler asked for so the tests can assert
+// on the shape of the probe, not only on the answer.
+type fakeDiscoveryStore struct {
+	rows      []DiscoveryRow
+	hasMore   bool
+	listErr   error
+	listCalls []int
+	probedIDs [][]cardtmpl.ID
+	granted   map[cardtmpl.ID]struct{}
+}
+
+func (s *fakeDiscoveryStore) ListDiscoverable(
+	_ context.Context, _ string, _ cardtmpl.ID, _ string, limit int,
+) ([]DiscoveryRow, bool, error) {
+	s.listCalls = append(s.listCalls, limit)
+	if s.listErr != nil {
+		return nil, false, s.listErr
+	}
+	if len(s.rows) > limit {
+		return s.rows[:limit], true, nil
+	}
+	return s.rows, s.hasMore, nil
+}
+
+func (s *fakeDiscoveryStore) LoadDiscoverable(
+	_ context.Context, _ string, _ cardtmpl.ID, _ string,
+) (DiscoveryRow, error) {
+	return DiscoveryRow{}, ErrDiscoveryNotVisible
+}
+
+func (s *fakeDiscoveryStore) StaticDiscoverGrants(
+	_ context.Context, _ string, ids []cardtmpl.ID,
+) (map[cardtmpl.ID]struct{}, error) {
+	s.probedIDs = append(s.probedIDs, append([]cardtmpl.ID(nil), ids...))
+	if s.granted == nil {
+		return map[cardtmpl.ID]struct{}{}, nil
+	}
+	return s.granted, nil
+}
+
+// Review follow-up (#14): the private-ID probe is keyed by template ID. A card
+// registered at several versions must not take several slots in the bounded
+// IN-list, or a genuinely granted template can fall past the cut and be
+// silently treated as ungranted.
+func TestPrivateTemplateIDsDeduplicatesAndDropsPublic(t *testing.T) {
+	entries := []cardtmpl.StaticCatalogEntry{
+		{ID: "docs.access-request", Version: "0.2.0", Visibility: cardtmpl.CatalogVisibilityPrivate},
+		{ID: "docs.access-request", Version: "0.3.0", Visibility: cardtmpl.CatalogVisibilityPrivate},
+		{ID: "ai.reasoning-process", Version: "0.1.0", Visibility: cardtmpl.CatalogVisibilityPrivate},
+		{ID: "ai.reasoning-process", Version: "0.2.0", Visibility: cardtmpl.CatalogVisibilityPrivate},
+		{ID: "ai.reasoning-process", Version: "0.3.0", Visibility: cardtmpl.CatalogVisibilityPrivate},
+		{ID: "docs.shared", Version: "1.0.0", Visibility: cardtmpl.CatalogVisibilityPublic},
+	}
+	got := privateTemplateIDs(entries)
+	want := []cardtmpl.ID{"docs.access-request", "ai.reasoning-process"}
+	if len(got) != len(want) {
+		t.Fatalf("probe ids = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("probe ids = %v, want %v (registration order preserved)", got, want)
+		}
+	}
+	// A public template needs no grant, so probing for one would be pure noise.
+	for _, id := range got {
+		if id == "docs.shared" {
+			t.Fatal("a public template was probed for a discover grant")
+		}
+	}
+}
+
+// Review follow-up (#13): when the static source exactly fills the page,
+// has_more must reflect whether the dynamic source actually holds a row.
+func TestDynamicPageFollowsPeeksInsteadOfAssuming(t *testing.T) {
+	empty := &fakeDiscoveryStore{}
+	cursor, more, err := dynamicPageFollows(context.Background(), empty, "space-1")
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	if more || cursor != "" {
+		t.Fatalf("empty dynamic source advertised another page: cursor=%q more=%v", cursor, more)
+	}
+	// The peek answers "is there anything" — it must not fetch a page nobody
+	// asked for.
+	if len(empty.listCalls) != 1 || empty.listCalls[0] != 1 {
+		t.Fatalf("peek budgets = %v, want [1]", empty.listCalls)
+	}
+
+	stocked := &fakeDiscoveryStore{rows: []DiscoveryRow{{ID: "pilot.card", Version: "1.0.0"}}}
+	cursor, more, err = dynamicPageFollows(context.Background(), stocked, "space-1")
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	if !more || cursor == "" {
+		t.Fatalf("stocked dynamic source did not advertise another page: cursor=%q more=%v", cursor, more)
+	}
+	decoded, ok := decodeDiscoveryCursor(cursor, "space-1")
+	if !ok || decoded.Source != discoverySourceDynamic || decoded.ID != "" {
+		t.Fatalf("boundary cursor = %+v ok=%v, want the top of the dynamic source", decoded, ok)
+	}
+
+	failing := &fakeDiscoveryStore{listErr: errors.New("db unavailable")}
+	if _, _, err := dynamicPageFollows(context.Background(), failing, "space-1"); err == nil {
+		t.Fatal("a failed peek was reported as no-more-pages")
 	}
 }

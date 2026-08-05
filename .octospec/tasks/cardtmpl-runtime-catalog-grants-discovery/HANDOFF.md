@@ -300,44 +300,80 @@ view rather than the deployment's.
 
 ### Slice 4 — B1/B2 discovery and safe export
 
-Production files:
+Landed (`feat: add card template discovery and safe export`):
 
-- `[new] pkg/cardtmpl/export.go`
-- `[modify] pkg/cardtmpl/template.go`
-- `[modify] pkg/cardtmpl/registry.go`
-- `[modify] pkg/cardtmpl/json_artifact.go`
-- `[new] modules/card_template_catalog/store_discovery.go`
-- `[new] modules/card_template_catalog/api_discovery.go`
-- `[modify] modules/card_template_catalog/store_read.go` — manager read-only
-  list summary (source/visibility/active/block + bounded grant summary,
-  includes B1-hidden rows).
-- `[modify] modules/card_template_catalog/api.go`
-- `[modify] modules/card_template_catalog/api_i18n.go`
-- `[modify] modules/card_template_catalog/metrics.go`
-- `[new] pkg/space/middleware_localized.go`
-- `[modify] pkg/errcode/card_template_catalog.go`
-- `[modify] pkg/i18n/locales/active.zh-CN.toml`
-- `[modify] main.go` — composition-root static CatalogMeta injection
-  (visibility/export/sample allowlist); never edit frozen handoff manifests;
-  PR-C keeps every existing static card private.
+- `[new] pkg/cardtmpl/export.go` — `SafeExport`, the immutable B2 projection.
+  Carries manifest/schema/reports plus allowlisted samples; never templates,
+  goldens or canonical bundle bytes. Deterministic export hash (the static
+  ETag), 2 MiB cap, visibility fails closed to private, deep `Clone`.
+- `[modify] pkg/cardtmpl/template.go` — `TemplateMeta.export/contractVersion`
+  plus `Export()`/`ExportHash()`.
+- `[modify] pkg/cardtmpl/registry.go` — projection built at registration from
+  the same reviewed bytes; `rawSchemaBytes`/`rawInteractionReports`;
+  `SetCatalogVisibility` (pre-Freeze composition-root seam) and
+  `StaticCatalog()` for B1.
+- `[modify] pkg/cardtmpl/json_artifact.go` — manifest gains a strict
+  `export.samples` opt-in allowlist; projection built during compile so an
+  allowlist naming a missing sample fails publish rather than serving a hole.
+- `[modify] pkg/cardtmpl/catalog.go` — `CatalogPurposeDiscover`,
+  `CatalogPrincipalSpace`.
+- `[new] modules/card_template_catalog/store_discovery.go` — visibility, block
+  state and the caller's discover grant are all inside the SQL predicate, so
+  they settle before LIMIT; `ErrDiscoveryNotVisible` is the single outcome for
+  unknown/invisible/blocked.
+- `[new] modules/card_template_catalog/api_discovery.go` — B1/B2 handlers, the
+  Space-bound opaque cursor, `{id}@{version}` exact-only refs, ETag/304,
+  `Cache-Control: private, no-cache` for private reads, and the manager
+  template index.
+- `[modify] modules/card_template_catalog/store_read.go` — manager keyset index.
+- `[modify] modules/card_template_catalog/api.go` — B1/B2 route group
+  `Auth → SharedUIDRateLimiter → LocalizedSpaceMiddleware`; manager `GET ""`.
+- `[modify] modules/card_template_catalog/api_i18n.go` — `respondCatalogNotFound`.
+- `[modify] modules/card_template_catalog/runtime_install.go` — public
+  templates are discoverable without a grant; the new-send gate does not apply
+  to discovery.
+- `[new] pkg/space/middleware_localized.go` — same membership rule, cache keys
+  and TTLs as `SpaceMiddleware`; only the failure responses move to `httperr`.
+- `[modify] main.go` — `applyStaticCatalogVisibility`, deliberately an empty
+  list: all five existing L2a cards stay private.
 
-Focused tests:
+Focused tests: `[new] pkg/cardtmpl/export_test.go`,
+`[new] modules/card_template_catalog/api_discovery_test.go`.
 
-- `[new] pkg/cardtmpl/export_test.go`
-- `[new] modules/card_template_catalog/store_discovery_mysql_integration_test.go`
-- `[new] modules/card_template_catalog/api_discovery_test.go`
-- `[new] pkg/space/middleware_localized_test.go`
-- `[modify] modules/card_template_catalog/api_test.go` — add
-  `api_discovery.go` to `TestCatalogNoLegacyErrorResponses`.
+Exit gate: filtering precedes paging; a cursor cannot be replayed across
+Spaces; unknown/invisible/blocked are indistinguishable; samples are opt-in;
+static cards stay private.
 
-Exit gate: public/private/Space/superAdmin matrix, visible-only cursor,
-cross-Space replay rejection, anti-enumeration, ETag/304/cache headers, 2 MiB
-cap and synthetic-only samples are proven. Request handlers read immutable
-projection bytes, never repository source paths. B1 rows expose the
-`action_contract` capability field; existing static cards stay
-private-by-default; the manager list endpoint returns B1-hidden rows to
-superAdmin only and uses `httperr.ResponseErrorL` like every other B1/B2 and
-localized-Space failure.
+### Review follow-ups (post-`/code-review`, folded into Slice 4's commit)
+
+Eight confirmed correctness findings fixed; one finding (MetaDefault losing
+`rejectIntegrity`) verified as a false positive — the unpinned path calls
+`requireReady`, whose error set is a superset.
+
+1. Bot grant Space is resolved only when the dynamic catalog is enabled, so a
+   gates-off deployment keeps `/v1/bot/card/profile` free of a DB dependency.
+2. New-send provenance is stamped with the *authorized* Space (target group or
+   thread parent), not `env.SpaceID`, which send.go fills only for DMs — the
+   downstream D3 guards are `!= ""` and were no-ops for group cards.
+3. `ListAuthorizedTemplates` reads one row past its budget and drops the
+   template the cut landed in, so an exact tombstone can never be separated
+   from its global row.
+4. `dynamicPageFollows` peeks with a budget of one instead of asserting
+   `has_more` at the static/dynamic boundary.
+5. `privateTemplateIDs` deduplicates the grant probe by template ID.
+6. Manager detail serves the rest of the response with `grants_unavailable`
+   when the grant summary read fails, and `ListGrants` orders active rows
+   before tombstones.
+7. `respondCatalogGrantInvalid` logs the rejection reason it previously dropped.
+8. `setupBotCardProfile` resets the `ratelimit:uid:*` bucket now that the route
+   mounts `SharedUIDRateLimiter`.
+
+Still open, tracked for Slice 6: the docs.access-request 0.2.0 result-edit
+guard (`docsResultTemplateVersion` plus the hardcoded V3 in
+`card_mutate_api.go`) — unreachable today because nothing sends 0.2.0, but the
+two call sites need one shared version-selection helper; and the quality
+findings (ReplaceView's extra Snapshot round trip, the provenance double
+marshal, and the two intentional Space/middleware duplications).
 
 ### Slice 5 — docs-notify dynamic pilot
 

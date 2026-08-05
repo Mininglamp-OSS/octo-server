@@ -140,7 +140,11 @@ const (
          can_discover, can_send, can_edit, revision, updated_by, reason, change_ticket, updated_at
         FROM card_template_grant
         WHERE template_id = ?
-        ORDER BY principal_type, principal_id, scope_space_id
+        -- Active rows first. A revoke writes a permanent tombstone rather than
+        -- deleting, so without this a template with a long revoke history would
+        -- let dead rows consume the bounded summary and hide the grants that
+        -- are actually in force.
+        ORDER BY status ASC, principal_type, principal_id, scope_space_id
         LIMIT ?`
 )
 

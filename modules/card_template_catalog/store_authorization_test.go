@@ -269,7 +269,8 @@ func TestStoreListAuthorizedTemplatesSkipsUnadvertisableTemplates(t *testing.T) 
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(authPrincipalPattern)).
-		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", maxAuthorizedTemplates*2).
+		// One row past the budget so a truncated read is detectable.
+		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", maxAuthorizedTemplates*2+1).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"template_id", "scope_space_id", "status",
 			"can_discover", "can_send", "can_edit", "revision",
