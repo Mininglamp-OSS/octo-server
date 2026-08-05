@@ -229,6 +229,33 @@ max score（否则某个高 score 队列的客户端游标会把新号段整体�
 同性质（排障/验证工具）。实现阶段把核心断言抽成 `pkg/botevent` 下的正式测试，工具保留
 供运维复核。
 
+## 实现记录（2026-08-05，commit b4fca040）
+
+实现过程中三处偏离 / 补充了本 brief 的原始判断，记在此处而非默默改掉：
+
+**① 站点是 6 个，不是 5 个。** 新增的 `TestNoGenSeqForBotEventIDs` 守卫立刻抓到
+`modules/robot/api.go` 的 `addInlineQuery` —— 它也从 `RobotEventSeqKey+robotID` 取号。
+本 brief 和 `modules/robot/api.go:232` 的注释都说「five ZADD sites in total」，都漏了它，
+因为它**不写 ZSET**（只 append 到进程内 `inlineQueryEventsMap`）。而 `inlineQueryEventsMap`
+**没有任何读取/投递路径**（只有 add / remove），所以那些 event 从不发给任何人 —— 它唯一的
+实际作用是消耗号码并推进 `min_seq`，即污染队列号源却不产出任何可投递事件。处置：隔离到
+独立 key `inlineQuerySeq:`，仍用 GenSeq（无人消费的 id 没有单调性要求，不值得引入 Redis
+依赖）。**这正是「守卫而非注释」的价值：注释错过一次，守卫一次就抓到。**
+
+**② 队列 key 统一到 `botevent.QueueKey`。** 原先 5 处各自 `fmt.Sprintf("robotEvent:%s", ...)`。
+seed 必须读 producer 写的同一个 key，硬编码分散是真实风险。统一后必须同步更新
+`TestEveryBotEventQueueWriterRingsTheDoorbell` 的 `queueKey` regex —— 否则它 `matched=4 < 5`
+直接 fatal（那个守卫的防盲下限按设计生效了，值得记一笔）。
+
+**③ 测试用独立库 `botevent_test`，不用共享 `test` 库。** `seq` 表由
+`modules/common/sql/20211108000001_common_legacy01.sql` 管理；在 `test` 库裸建它会留下
+`gorp_migrations` 无记录的表，下个包的 `NewTestServer` 就 `Table 'seq' already exists` ——
+与 message 包大量 DB 测试被 skip 的根因同一个。已在实现中踩到并修正。
+
+验证：`pkg/botevent` 全包 19 测试绿（`-race`）；`modules/robot`、`modules/group`、
+`modules/bot_api` 整包绿；`go build ./...`、`go vet`、`gofmt`、`make i18n-extract-check`、
+`make i18n-lint` 全过。
+
 ## Open questions（需人类确认）
 
 1. **现存 3 个碰撞队列（2624 个碰撞 member）要不要一次性重编号？**
