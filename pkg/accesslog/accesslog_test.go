@@ -2,6 +2,9 @@ package accesslog
 
 import (
 	"bytes"
+	"github.com/stretchr/testify/require"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -241,4 +244,57 @@ func TestFormatter_ScrubsToken(t *testing.T) {
 	if !strings.Contains(line, "/v1/incoming-webhooks/iwh_1/***") {
 		t.Fatalf("formatted log line missing masked path: %q", line)
 	}
+}
+
+// TestFormatterAppendsBotID —— bot 归因字段（issue #696）。
+func TestFormatterAppendsBotID(t *testing.T) {
+	base := gin.LogFormatterParams{
+		TimeStamp: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC),
+		Method:    "POST",
+		Path:      "/v1/bot/typing",
+		Latency:   time.Millisecond,
+		ClientIP:  "1.2.3.4",
+	}
+
+	t.Run("bot 请求带 bot= 字段", func(t *testing.T) {
+		p := base
+		p.Keys = map[string]any{ctxKeyRobotID: "ytgeo_bot"}
+		require.Contains(t, Formatter(p), "| bot=ytgeo_bot")
+	})
+
+	// 载荷性：普通用户路由**不得**因本改动改变日志行。它们没有 robot_id key，
+	// 所以整段省略——按列解析的下游管道不受影响（同 trace_id 的既有约定）。
+	t.Run("非 bot 请求逐字节不变", func(t *testing.T) {
+		p := base
+		p.Path = "/v1/users/self"
+		p.Keys = map[string]any{"uid": "10000"} // 用户 uid 不应被记入
+		out := Formatter(p)
+		require.NotContains(t, out, "bot=")
+		require.NotContains(t, out, "10000", "用户 uid 不属于 access log")
+	})
+
+	t.Run("key 缺失或类型不对时省略", func(t *testing.T) {
+		p := base
+		p.Keys = map[string]any{ctxKeyRobotID: 12345} // 非 string
+		require.NotContains(t, Formatter(p), "bot=")
+
+		p.Keys = nil
+		require.NotContains(t, Formatter(p), "bot=")
+	})
+}
+
+// TestCtxKeyRobotIDMatchesBotAPI 钉住跨包的字符串一致性。
+//
+// pkg/ 不 import modules/，所以这里的 key 是字面量。若 bot_api 侧改了常量而这里没跟，
+// 症状是"日志里永远没有 bot 字段"——而那和"这个请求不是 bot 发的"在线上无法区分，
+// 属于静默失效，只能靠守卫拦。
+func TestCtxKeyRobotIDMatchesBotAPI(t *testing.T) {
+	src, err := os.ReadFile("../../modules/bot_api/auth.go")
+	require.NoError(t, err)
+
+	m := regexp.MustCompile(`CtxKeyRobotID\s*=\s*"([^"]+)"`).FindStringSubmatch(string(src))
+	require.Len(t, m, 2, "在 modules/bot_api/auth.go 里找不到 CtxKeyRobotID 定义，守卫失效")
+	require.Equal(t, m[1], ctxKeyRobotID,
+		"bot_api.CtxKeyRobotID 已改为 %q，但 pkg/accesslog 的字面量仍是 %q —— "+
+			"access log 会安静地不再输出 bot 字段", m[1], ctxKeyRobotID)
 }

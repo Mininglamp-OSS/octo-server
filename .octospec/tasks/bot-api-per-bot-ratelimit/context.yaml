@@ -1,0 +1,28 @@
+injected:
+  - id: rate-limit
+    source: repo
+    why: 本任务主轴；brief touches rate-limit/throttle，改动落在 modules/**/*.go
+  - id: space-isolation
+    source: repo
+    why: touches bot-api；改动挂在 /v1/bot 路由组，涉及 authBot 之后的中间件顺序
+  - id: error-handling
+    source: repo
+    why: touches error-response/wire-contract；429 走 err.shared.rate.limited 信封
+  - id: trust-boundary
+    source: repo
+    why: touches wire-contract 命中。已通读——本任务不渲染任何外部内容、不产生
+         markdown/URL 目标，规则的转义/适配器对等条款不适用；仅保留「不得把凭据
+         写进可观测面」这一精神（offenders ZSet 存 robotID 而非 token）。
+  - id: testing
+    source: repo
+    why: 新增测试；且本任务直接触发「CleanAllTables 不清 Redis 限流桶」这条
+  - id: commit-style
+    source: repo
+    why: paths ["**"] 全匹配
+
+brief: .octospec/tasks/bot-api-per-bot-ratelimit/brief.md
+
+notes:
+  - _global 未同步（.octospec/_global/ 不存在），仅 repo 层规则生效。
+  - 令牌桶 Lua 与 octo-lib pkg/wkhttp/ratelimit.go 及 modules/incomingwebhook
+    /ratelimit.go 同源（两者逐字节一致），本任务沿用同一份语义。

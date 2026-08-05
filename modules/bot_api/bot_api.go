@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 )
 
 const (
@@ -175,6 +176,10 @@ type BotAPI struct {
 	// 从而共享限流桶与 sender 缓存。principal 由本模块的 resolveSearchPrincipal 按
 	// on_behalf_of 区分 as-bot / as-user(OBO)。
 	searchHandler *messages_search.Handler
+	// rateLimiters 持有三条 per-bot 限流通道（business / heartbeat / register，
+	// issue #696）。为 nil 时所有限流中间件直接放行——单测里用 piecemeal 构造的
+	// BotAPI 没有 ctx/Redis，不应因为限流而变红。
+	rateLimiters *botRateLimiters
 	log.Log
 }
 
@@ -257,6 +262,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		maxBodySize:           maxBodySize,
 		maxFileSize:           maxFileSize,
 		sendPermissionMetrics: defaultBotSendPermissionMetrics,
+		rateLimiters:          newBotRateLimiters(ctx.GetConfig()),
 		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
@@ -276,18 +282,73 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 
 // Route registers all Bot API routes.
 func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
-	// register endpoint (token needed but not via authBot group — handled inline)
-	r.POST("/v1/bot/register", ba.register)
+	// register endpoint (token needed but not via authBot group — handled inline).
+	//
+	// **两层限流,顺序载荷性**:先 per-IP,再 per-token。
+	//
+	// (1) per-token 指纹(issue #696):此处在 authBot 之前、还没有 bot 身份,而 token
+	//     就在请求里。这一维度命中事故形态——token 失效的 bot 以约 4 rps 持续重试
+	//     register,按 token 分桶能把这类风暴关进它自己的桶,不波及同 IP 的健康 bot。
+	//
+	// (2) per-IP strict(code review 补入):**单靠 (1) 有 keyspace 放大漏洞**。
+	//     token 由客户端提供且在限流之前不做有效性校验,攻击者每次换一个随机 token
+	//     即可换一个新桶——不仅绕过 (1),更糟的是令牌桶 Lua 在首次判定时就会
+	//     HMSET+EXPIRE 建 key(bucket.go),于是 live key 数 = 请求速率 × TTL(约 40s)。
+	//     只靠全局 per-IP 桶(1500 rps)兜底意味着最坏 6 万个 key,而生产 Redis
+	//     **未设 maxmemory**,没有 LRU 淘汰、OOM 直接被 OS kill。
+	//     这道 strict 桶把 key 生成速率从 1500/s 压到 10/s(40s 窗口内约 400 个),
+	//     且必须排在 (1) **之前**——否则 key 已经建好了,挡也来不及。
+	//
+	//     参数是固定值而非热调:IP 层是防滥用底线,不需要按业务负载调整。10 rps /
+	//     burst 50 远高于实测正常量(单 IP register 约 1~2 rps,异常 bot 约 4 rps)。
+	registerIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
+		"bot_register", defaultRegisterIPRPS, defaultRegisterIPBurst)
+	r.POST("/v1/bot/register",
+		registerIPLimit,
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.register },
+			func(c *wkhttp.Context) string { return botTokenFingerprint(extractBotToken(c)) },
+		),
+		ba.register)
+
+	// heartbeat 刻意**不在** botAPI 组内：它必须有独立于业务流量的配额，
+	// 否则一次 7-8 条消息的推理爆发就能顺带把心跳挤掉、进而断联（issue #696）。
+	// 同时它已被移出全局 per-IP 桶（main.go globalRateLimitExcludePaths），
+	// 否则同出网 IP 的邻居仍能把它饿死——这两处改动缺一不可，
+	// 而下面这条自有的桶就是它移出全局桶之后唯一的上限。
+	r.POST("/v1/bot/heartbeat",
+		ba.authBot(),
+		ba.botActorUID(),
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.heartbeat },
+			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+		),
+		ba.heartbeat)
 
 	// Bot API endpoints (unified auth middleware)
-	botAPI := r.Group("/v1/bot", ba.authBot())
+	//
+	// botActorUID 把 robotID 写进 "uid"，供 per-bot 限流取维度。已核实主组内
+	// **没有** handler 读 c.GetLoginUID()（7 处调用全在 /v1/obo/* user-token 组，
+	// 主组内的 oboBotGetGrant 不读），故这一写入不改变任何现有语义；
+	// 该性质由 TestBotAPIMainGroupDoesNotReadLoginUID 源码守卫钉住。
+	//
+	// 顺序是载荷性的：authBot → botActorUID → 限流。限流中间件在拿不到身份时
+	// 旁路放行，顺序颠倒会让它静默失效。
+	botAPI := r.Group("/v1/bot",
+		ba.authBot(),
+		ba.botActorUID(),
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.business },
+			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+		),
+	)
 	{
 		botAPI.POST("/sendMessage", ba.sendMessage)
 		botAPI.POST("/typing", ba.typing)
 		botAPI.POST("/readReceipt", ba.readReceipt)
 		botAPI.POST("/events", ba.getEvents)
 		botAPI.POST("/events/:event_id/ack", ba.eventAck)
-		botAPI.POST("/heartbeat", ba.heartbeat)
 		botAPI.POST("/messages/sync", ba.syncMessages)
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/resolve/targets", ba.botResolveTargets)

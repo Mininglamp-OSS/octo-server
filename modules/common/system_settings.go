@@ -919,6 +919,160 @@ func incomingWebhookMaxTotalPerGroupEnvDefault() int {
 	return defaultIncomingWebhookMaxTotalPerGroup
 }
 
+// ----- bot API rate limit settings (issue #696) -----
+//
+// 三条限流通道（business / heartbeat / register）各自独立的开关、影子开关与配额。
+// 与 incomingwebhook 同源的约定：这些 env 名与默认值是**单一真源**，
+// bot_api 侧只经这些 getter 读取，改动需同步 systemSettingSchema 的 botratelimit 行。
+//
+// 为什么每层都要 enabled 且默认关闭：register 层误配的后果是「全部 bot 无法注册」，
+// 而翻开关比回滚发版快一个数量级。
+//
+// 为什么默认 dry_run=true：初始配额没有数据支撑——在此之前限流拒绝路径完全不写日志、
+// access log 也无 robot_id，集群还没有日志采集，因此「设成 X 会拒谁」无从回答。
+// 影子模式先跑真实判定但不拦截，确认只命中异常 bot 后再关掉 dry_run。
+//
+// 初始配额是按端点语义推的**保守偏宽**值，不是实测结论：正常 bot 的 heartbeat 受
+// bot:heartbeat TTL(60s) 约束在 0.1 rps 量级，register 只在重连时调用，业务流量峰值
+// 参考一次推理连发 7-8 条消息。上线后按影子数据收敛。
+const (
+	envBotRateLimitBusinessEnabled = "OCTO_BOT_RATELIMIT_BUSINESS_ENABLED"
+	envBotRateLimitBusinessDryRun  = "OCTO_BOT_RATELIMIT_BUSINESS_DRY_RUN"
+	envBotRateLimitBusinessRPS     = "OCTO_BOT_RATELIMIT_BUSINESS_RPS"
+	envBotRateLimitBusinessBurst   = "OCTO_BOT_RATELIMIT_BUSINESS_BURST"
+
+	envBotRateLimitHeartbeatEnabled = "OCTO_BOT_RATELIMIT_HEARTBEAT_ENABLED"
+	envBotRateLimitHeartbeatDryRun  = "OCTO_BOT_RATELIMIT_HEARTBEAT_DRY_RUN"
+	envBotRateLimitHeartbeatRPS     = "OCTO_BOT_RATELIMIT_HEARTBEAT_RPS"
+	envBotRateLimitHeartbeatBurst   = "OCTO_BOT_RATELIMIT_HEARTBEAT_BURST"
+
+	envBotRateLimitRegisterEnabled = "OCTO_BOT_RATELIMIT_REGISTER_ENABLED"
+	envBotRateLimitRegisterDryRun  = "OCTO_BOT_RATELIMIT_REGISTER_DRY_RUN"
+	envBotRateLimitRegisterRPS     = "OCTO_BOT_RATELIMIT_REGISTER_RPS"
+	envBotRateLimitRegisterBurst   = "OCTO_BOT_RATELIMIT_REGISTER_BURST"
+
+	defaultBotRateLimitEnabled = false
+	defaultBotRateLimitDryRun  = true
+
+	defaultBotRateLimitBusinessRPS   = 20.0
+	defaultBotRateLimitBusinessBurst = 200
+
+	// heartbeat 的速率下界是硬约束：bot:heartbeat key 的 TTL 是 60s
+	// （modules/bot_api/bot_api.go heartbeatTTL），配额若低到让心跳「一次被限流就
+	// 让 key 过期」，这条保命通道就变成了断联的成因。1 rps 远高于 1/60，留足余量。
+	defaultBotRateLimitHeartbeatRPS   = 1.0
+	defaultBotRateLimitHeartbeatBurst = 10
+
+	// register 是自愈链路的最后一环（心跳失效 → 重连 → 刷 token），正常极低频；
+	// 但它同时是**未鉴权可达**的写入口（会触发 UpdateIMToken），所以不能不设上限。
+	defaultBotRateLimitRegisterRPS   = 0.5
+	defaultBotRateLimitRegisterBurst = 10
+
+	// botRateLimitMinHeartbeatRPS 是 heartbeat 配额的**结构性下界**。低于它意味着
+	// 一次限流就可能让心跳 key 过期，即这条通道自己制造了它本该防止的断联。
+	// 取 1/60 的 6 倍余量。
+	botRateLimitMinHeartbeatRPS = 0.1
+)
+
+// BotRateLimitBusinessEnabled 等三组 getter 的回退链均为 DB → env → code default。
+func (s *SystemSettings) BotRateLimitBusinessEnabled() bool {
+	return s.getBool("botratelimit", "business_enabled", boolEnvDefault(envBotRateLimitBusinessEnabled, defaultBotRateLimitEnabled))
+}
+
+func (s *SystemSettings) BotRateLimitBusinessDryRun() bool {
+	return s.getBool("botratelimit", "business_dry_run", boolEnvDefault(envBotRateLimitBusinessDryRun, defaultBotRateLimitDryRun))
+}
+
+func (s *SystemSettings) BotRateLimitBusinessRPS() float64 {
+	return s.getRateLimitFloat("botratelimit", "business_rps", envBotRateLimitBusinessRPS, defaultBotRateLimitBusinessRPS)
+}
+
+func (s *SystemSettings) BotRateLimitBusinessBurst() int {
+	return s.getRateLimitInt("botratelimit", "business_burst", envBotRateLimitBusinessBurst, defaultBotRateLimitBusinessBurst)
+}
+
+func (s *SystemSettings) BotRateLimitHeartbeatEnabled() bool {
+	return s.getBool("botratelimit", "heartbeat_enabled", boolEnvDefault(envBotRateLimitHeartbeatEnabled, defaultBotRateLimitEnabled))
+}
+
+func (s *SystemSettings) BotRateLimitHeartbeatDryRun() bool {
+	return s.getBool("botratelimit", "heartbeat_dry_run", boolEnvDefault(envBotRateLimitHeartbeatDryRun, defaultBotRateLimitDryRun))
+}
+
+// BotRateLimitHeartbeatRPS 在通用消毒之外再夹一道下界：见 botRateLimitMinHeartbeatRPS。
+// 这条不是防手滑，是防「把保命通道配成断联成因」这个具体的失败模式。
+func (s *SystemSettings) BotRateLimitHeartbeatRPS() float64 {
+	v := s.getRateLimitFloat("botratelimit", "heartbeat_rps", envBotRateLimitHeartbeatRPS, defaultBotRateLimitHeartbeatRPS)
+	if v < botRateLimitMinHeartbeatRPS {
+		return botRateLimitMinHeartbeatRPS
+	}
+	return v
+}
+
+func (s *SystemSettings) BotRateLimitHeartbeatBurst() int {
+	return s.getRateLimitInt("botratelimit", "heartbeat_burst", envBotRateLimitHeartbeatBurst, defaultBotRateLimitHeartbeatBurst)
+}
+
+func (s *SystemSettings) BotRateLimitRegisterEnabled() bool {
+	return s.getBool("botratelimit", "register_enabled", boolEnvDefault(envBotRateLimitRegisterEnabled, defaultBotRateLimitEnabled))
+}
+
+func (s *SystemSettings) BotRateLimitRegisterDryRun() bool {
+	return s.getBool("botratelimit", "register_dry_run", boolEnvDefault(envBotRateLimitRegisterDryRun, defaultBotRateLimitDryRun))
+}
+
+func (s *SystemSettings) BotRateLimitRegisterRPS() float64 {
+	return s.getRateLimitFloat("botratelimit", "register_rps", envBotRateLimitRegisterRPS, defaultBotRateLimitRegisterRPS)
+}
+
+func (s *SystemSettings) BotRateLimitRegisterBurst() int {
+	return s.getRateLimitInt("botratelimit", "register_burst", envBotRateLimitRegisterBurst, defaultBotRateLimitRegisterBurst)
+}
+
+// getRateLimitFloat 是限流配额专用的读侧防御，语义与 IncomingWebhookPerWebhookRPS
+// 那套逐条对应（D-289 同型，覆盖直接改库的旁路）：
+//
+//   - rps <= 0 会让令牌桶 Lua 走 `rate <= 0` 短路，即**整条路由 100% 拒绝**；
+//   - NaN 会让 Lua 的算术全部变 NaN、比较失效，行为不可预测；
+//   - env 兜底自身也可能非有限——wkhttp.ParseRPSFromEnv 底层是 strconv.ParseFloat，
+//     会原样接受 "NaN" / "+Inf"，所以 def 必须先消毒再参与回退。
+//
+// 任何非法值都回退到**永远合法的 code default**，而不是「关闭限流」：
+// 静默 fail-open 会让一个配置错误伪装成「限流正常但没人超限」。
+func (s *SystemSettings) getRateLimitFloat(category, key, envKey string, codeDefault float64) float64 {
+	def := wkhttp.ParseRPSFromEnv(envKey, codeDefault)
+	if math.IsNaN(def) || math.IsInf(def, 0) || def <= 0 {
+		def = codeDefault
+	}
+	v := s.getFloat(category, key, def)
+	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+		return def
+	}
+	return v
+}
+
+// getRateLimitInt 同上。burst <= 0 会让桶永远填不进 1 个 token，同样等于 100% 拒绝。
+func (s *SystemSettings) getRateLimitInt(category, key, envKey string, codeDefault int) int {
+	def := wkhttp.ParseBurstFromEnv(envKey, codeDefault)
+	if def <= 0 {
+		def = codeDefault
+	}
+	v := s.getInt(category, key, def)
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// boolEnvDefault 解析 bool 型 env 兜底，语义与 system_setting 的 bool 字面量一致
+// （1/true/TRUE → true，0/false/FALSE → false，其余 → fallback）。
+func boolEnvDefault(envKey string, fallback bool) bool {
+	if v := os.Getenv(envKey); v != "" {
+		return parseSettingBool(v, fallback)
+	}
+	return fallback
+}
+
 // ---------------------------------------------------------------------------
 // App Bot auth cache (issue #309)
 // ---------------------------------------------------------------------------

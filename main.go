@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -44,6 +45,7 @@ import (
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	"github.com/gin-gonic/gin"
@@ -61,8 +63,20 @@ var Commit string     // git commit id
 var CommitDate string // git commit date
 var TreeState string  // git tree state
 
+// globalRateLimitExcludePaths 列出**不**参与全局 per-IP 令牌桶的路径。
+//
+// 每加一条都是在 DDoS 底线上开洞，因此必须逐条论证，并且被豁免的端点**必须**另有
+// 自己的配额——豁免不等于无限制。
+//
+//   - /v1/ping、/v1/health：存活探针，被限流会让 k8s 误判实例不健康。
+//   - /v1/bot/heartbeat（issue #696）：bot 保活通道。全局桶按 client IP 分片，
+//     于是同一出网 IP 上的所有 bot 共享一份配额；2026-08-05 生产事故中，一个 bot
+//     以约 590 rps 冲刷业务端点就把配额打满，同 IP 其它 bot 的心跳被连坐 429、
+//     心跳 key(TTL 60s)过期、连接判定失效，最终断联且无法自愈。
+//     心跳被业务流量挤掉是纯粹的连带损害——它本身流量极小、且是发现掉线的唯一手段。
+//     其上限改由 modules/bot_api 的 per-bot heartbeat 桶承担（见 ratelimit.go）。
 func globalRateLimitExcludePaths() []string {
-	return []string{"/v1/ping", "/v1/health"}
+	return []string{"/v1/ping", "/v1/health", "/v1/bot/heartbeat"}
 }
 
 func loadConfigFromFile(cfgFile string) *viper.Viper {
@@ -236,6 +250,38 @@ func runAPI(ctx *config.Context) {
 	// 由 sticker 模块在 New() 时落值——策略源在 system_setting(common 模块),故不在此组合根
 	// 设置,避免反向依赖 modules/sticker。
 	metrics.NewStickerMetrics(prometheus.DefaultRegisterer)
+	// Bot API per-bot 限流的观测与配置接线(issue #696)。必须在 register.GetModules
+	// 构造 bot_api 之前完成:限流参数虽是每次判定时才读(热调),但把 wiring 放在模块
+	// 构造前可以避免"进程启动到注入之间的窗口里判定按默认值(全关)进行"这种时序依赖。
+	//
+	// provider 用闭包注入而非让 bot_api 直接读 modules/common,与
+	// bot_api.NewRedisAppBotRegistry 的 ttl 注入同源——bot_api 刻意不依赖
+	// system-settings 包。未注入时 bot_api 侧回退为"三条通道全关"(完全旁路),
+	// 即行为与本改动前一致:限流层的失败模式应当是"没限流"而不是"误拒"。
+	metrics.NewBotRateLimitMetrics(prometheus.DefaultRegisterer)
+	bot_api.SetRateLimitParamsProvider(func() bot_api.RateLimitParams {
+		s := commonmodule.EnsureSystemSettings(ctx)
+		return bot_api.RateLimitParams{
+			Business: ratelimitpkg.Params{
+				Enabled: s.BotRateLimitBusinessEnabled(),
+				DryRun:  s.BotRateLimitBusinessDryRun(),
+				RPS:     s.BotRateLimitBusinessRPS(),
+				Burst:   s.BotRateLimitBusinessBurst(),
+			},
+			Heartbeat: ratelimitpkg.Params{
+				Enabled: s.BotRateLimitHeartbeatEnabled(),
+				DryRun:  s.BotRateLimitHeartbeatDryRun(),
+				RPS:     s.BotRateLimitHeartbeatRPS(),
+				Burst:   s.BotRateLimitHeartbeatBurst(),
+			},
+			Register: ratelimitpkg.Params{
+				Enabled: s.BotRateLimitRegisterEnabled(),
+				DryRun:  s.BotRateLimitRegisterDryRun(),
+				RPS:     s.BotRateLimitRegisterRPS(),
+				Burst:   s.BotRateLimitRegisterBurst(),
+			},
+		}
+	})
 	// Install the one process registry before register.GetModules constructs
 	// module instances. The foundation rollout deliberately has no production
 	// producer registrations; later enablement injects only a bound Sender into
