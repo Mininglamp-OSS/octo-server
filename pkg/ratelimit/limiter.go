@@ -23,6 +23,17 @@ const (
 	OutcomeDenied
 	// OutcomeDegraded 表示 Redis 故障，fail-open 放行。
 	OutcomeDegraded
+	// OutcomeNoKey 表示该层**已启用**，但取不到限流维度（key 为空），因此旁路放行。
+	//
+	// 与 OutcomeBypassed 分开是刻意的（code review 补入）：两者外部行为相同（都放行、
+	// 都不设头），但**成因完全相反**——Bypassed 是运维主动关掉了开关，属预期状态；
+	// NoKey 意味着身份提取失败，而对已鉴权通道来说那只可能是**中间件挂载顺序错了**
+	// （限流挂在了 authBot / botActorUID 之前），也就是本设计明文最怕的失败形态。
+	//
+	// 混在同一个 label 里的后果很具体：影子期看到 outcome="bypassed" 时，无法区分
+	// 「通道还没开」和「开了但每条请求都取不到身份」——后者会让整层静默失效，
+	// 而观测的全部意义就是发现这种「装上了但没生效」。
+	OutcomeNoKey
 )
 
 // String 供指标 label 与日志使用。取值是**固定枚举**，这是 Prometheus label
@@ -39,6 +50,8 @@ func (o Outcome) String() string {
 		return "denied"
 	case OutcomeDegraded:
 		return "degraded"
+	case OutcomeNoKey:
+		return "no_key"
 	default:
 		return "unknown"
 	}
@@ -138,11 +151,20 @@ func New(client *rd.Client, keyPrefix, class string, params ParamsFunc, obs Obse
 // 此时**fail-open** 而不是归入某个共享桶：本包服务的都是已鉴权路径，
 // 身份缺失属于挂载顺序错误（应当由测试守卫拦住），不应在生产上表现为
 // "所有无身份请求共享一个桶"这种更难排查的形态。
+//
+// 但两种旁路要**分别上报**：`enabled=false` 是预期状态（OutcomeBypassed），
+// 而"开着却取不到身份"是配置/挂载错误（OutcomeNoKey）。见 OutcomeNoKey 的注释。
 func (l *Limiter) Check(key string) Result {
 	p := l.params()
-	if !p.Enabled || key == "" {
+	if !p.Enabled {
 		l.observe(key, OutcomeBypassed)
 		return Result{Outcome: OutcomeBypassed}
+	}
+	if key == "" {
+		// 已启用但没有维度可用。行为与 Bypassed 一致（放行、不设头），
+		// 但 outcome 不同——否则这种静默失效在指标上与"通道没开"无法区分。
+		l.observe(key, OutcomeNoKey)
+		return Result{Outcome: OutcomeNoKey}
 	}
 
 	rps := SanitizeRPS(p.RPS, l.fallback.RPS)

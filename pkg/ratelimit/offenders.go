@@ -16,28 +16,46 @@ import (
 // 它就变成了一个无界的身份集合——那正是我们拒绝把 robotID 放进 Prometheus label
 // 的理由，不能在 Redis 里再犯一次。
 //
+// **但每次写入都裁到 topN 会永久饿死新来的 offender。** 第一版就是那样写的:
+// 集合已有 topN 个成员且分数都 >= 2 时,新成员以 1 分进来、成为唯一最低分,
+// 同一趟 Lua 里的 ZREMRANGEBYRANK 立刻把它删掉;下次再犯还是从 1 分开始、再被删掉。
+// 于是**一个在 50 个之后才开始作妖的 bot 会永远不出现在名单里**——而整个灰度计划
+// 恰恰依赖影子模式回答"这个配额会拒谁"。（三位 reviewer 里两位独立指出了这条。）
+//
+// 修法:高水位裁剪。允许集合长到 2*topN 才裁回 topN,新成员因此有一整个水位区间
+// 用来积累分数、公平竞争。代价是常态占用最多翻倍(100 个成员)——仍然**结构性有界**,
+// 而这正是裁剪存在的唯一理由。
+//
 // KEYS[1]: ZSet 键
 // ARGV[1]: member（业务标识，如 robotID）
-// ARGV[2]: topN（保留的最大成员数）
+// ARGV[2]: topN（裁剪后保留的成员数）
 // ARGV[3]: ttl（秒）
+// ARGV[4]: highWater（超过该规模才触发裁剪）
 const offendersScript = `
 local key = KEYS[1]
 local member = ARGV[1]
 local topN = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
+local highWater = tonumber(ARGV[4])
 
 redis.call("ZINCRBY", key, 1, member)
--- 按 score 升序，删掉除最高 topN 之外的全部；集合规模 <= topN 是结构性保证，
--- 不依赖调用方记得清理。
-redis.call("ZREMRANGEBYRANK", key, 0, -topN - 1)
+-- 只在超过高水位时裁剪,且裁到 topN。不是每次写入都裁——那会让新成员在积累到
+-- 有意义的分数之前就被删掉(见上方注释)。
+if redis.call("ZCARD", key) > highWater then
+    redis.call("ZREMRANGEBYRANK", key, 0, -topN - 1)
+end
 redis.call("EXPIRE", key, ttl)
 return 1
 `
 
 const (
-	// defaultOffendersTopN 是保留的 offender 数量上限。50 足够回答「是哪几个 bot」
+	// defaultOffendersTopN 是裁剪后保留的 offender 数量。50 足够回答「是哪几个 bot」
 	// ——生产事故的形态是单个 bot 打爆配额，而不是几百个 bot 各超一点。
 	defaultOffendersTopN = 50
+	// defaultOffendersHighWaterFactor 决定裁剪触发的规模(topN 的倍数)。
+	// 取 2:新 offender 有 topN 个名额的缓冲期用来积累分数,不会一进来就被裁掉;
+	// 同时上界仍然是常数倍,没有失去有界性。
+	defaultOffendersHighWaterFactor = 2
 	// defaultOffendersTTL 让统计窗口自然滚动：不再产生拒绝的 class，其名单会过期
 	// 消失，避免运维看到一个早已恢复的 bot 仍挂在榜首。
 	defaultOffendersTTL = 24 * time.Hour
@@ -79,16 +97,27 @@ func (r *OffenderRecorder) Record(class, key string) {
 	if r == nil || r.client == nil || key == "" {
 		return
 	}
-	_ = r.script.Run(r.client, []string{r.prefix + class}, key, r.topN, int(r.ttl.Seconds())).Err()
+	highWater := r.topN * defaultOffendersHighWaterFactor
+	_ = r.script.Run(r.client, []string{r.prefix + class},
+		key, r.topN, int(r.ttl.Seconds()), highWater).Err()
 }
 
-// Top 返回该 class 当前的 offender 排行（score 降序），供管理端/排查使用。
+// Top 返回该 class 当前的 offender 排行（score 降序），供排查使用。
+//
+// **目前没有生产调用方**，这是刻意的:brief 明确决定不为它建管理端点（多一个鉴权面、
+// 而事故期直接 `redis-cli ZREVRANGE ratelimit:bot:offenders:<class> 0 -1 WITHSCORES`
+// 就够）。保留这个方法的理由是它把 key 拼接与降序语义收在包内一处——将来若要接
+// 管理端点或诊断命令，是唯一该走的读路径，不必在调用方重新拼 key。
+//
+// 上界用 highWater 而非 topN:高水位裁剪允许集合暂时长到 2*topN,若这里仍夹到 topN,
+// 排查时就会看不到水位区间内那些**最新出现**的 offender——而那恰恰是最需要看的。
 func (r *OffenderRecorder) Top(class string, n int) ([]rd.Z, error) {
 	if r == nil || r.client == nil {
 		return nil, nil
 	}
-	if n <= 0 || n > r.topN {
-		n = r.topN
+	max := r.topN * defaultOffendersHighWaterFactor
+	if n <= 0 || n > max {
+		n = max
 	}
 	return r.client.ZRevRangeWithScores(r.prefix+class, 0, int64(n-1)).Result()
 }

@@ -26,14 +26,38 @@ func TestCheckBypassesWithoutTouchingRedis(t *testing.T) {
 	require.False(t, res.ShouldSetHeaders(), "旁路不得下发 X-RateLimit-* 头")
 }
 
-// TestCheckBypassesOnEmptyKey：拿不到身份就限不了流，此时 fail-open。
-// 同样用 nil client 证明未查 Redis。
-func TestCheckBypassesOnEmptyKey(t *testing.T) {
-	l := New(nil, "test:", "business", func() Params {
+// TestCheckReportsNoKeyDistinctlyFromDisabled：**两种旁路的成因相反,必须能区分**。
+//
+// 两者外部行为完全一致（放行、不设头、不查 Redis），但:
+//   - Enabled=false 是运维主动关掉,属预期状态;
+//   - Enabled=true 但 key 为空 = 身份提取失败,对已鉴权通道来说只可能是**挂载顺序错**
+//     （限流挂在了 authBot / botActorUID 之前）——整层静默失效。
+//
+// 若两者共用 outcome="bypassed",影子期就无法区分「通道还没开」和「开了但每条请求
+// 都取不到身份」,而后者恰恰是本设计明文最怕的失败形态。
+// 仍用 nil client 证明两条路径都没查 Redis。
+func TestCheckReportsNoKeyDistinctlyFromDisabled(t *testing.T) {
+	enabled := New(nil, "test:", "business", func() Params {
 		return Params{Enabled: true, RPS: 10, Burst: 10}
 	}, nil, Params{RPS: 1, Burst: 1})
+	disabled := New(nil, "test:", "business", func() Params {
+		return Params{Enabled: false, RPS: 10, Burst: 10}
+	}, nil, Params{RPS: 1, Burst: 1})
 
-	require.Equal(t, OutcomeBypassed, l.Check("").Outcome)
+	noKey := enabled.Check("")
+	off := disabled.Check("bot-1")
+
+	require.Equal(t, OutcomeNoKey, noKey.Outcome,
+		"启用状态下 key 为空应报 no_key,而不是与「开关关闭」混为 bypassed")
+	require.Equal(t, OutcomeBypassed, off.Outcome)
+	require.NotEqual(t, noKey.Outcome.String(), off.Outcome.String(),
+		"两种旁路的 label 必须不同,否则指标上分不出「没开」与「开了但静默失效」")
+
+	// 行为必须一致:都放行、都不下发头。区分只体现在观测上,不改变可观察行为。
+	for name, r := range map[string]Result{"no_key": noKey, "bypassed": off} {
+		require.False(t, r.ShouldReject(), "%s 不得拒绝", name)
+		require.False(t, r.ShouldSetHeaders(), "%s 不得下发 X-RateLimit-* 头", name)
+	}
 }
 
 // TestResultSemantics 钉住四种 outcome 与「是否拒绝 / 是否下发头」的映射。
@@ -55,6 +79,7 @@ func TestResultSemantics(t *testing.T) {
 		{OutcomeWouldDeny, false, false, "would_deny"},
 		{OutcomeDenied, true, true, "denied"},
 		{OutcomeDegraded, false, false, "degraded"},
+		{OutcomeNoKey, false, false, "no_key"},
 	}
 	for _, c := range cases {
 		t.Run(c.labelString, func(t *testing.T) {
@@ -92,12 +117,12 @@ func TestDryRunNeverSetsHeaders(t *testing.T) {
 // 否则「关掉 dry-run 会多拒多少」就无从计算，影子模式失去意义。
 func TestOutcomeStringsAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
-	for _, o := range []Outcome{OutcomeBypassed, OutcomeAllowed, OutcomeWouldDeny, OutcomeDenied, OutcomeDegraded} {
+	for _, o := range []Outcome{OutcomeBypassed, OutcomeAllowed, OutcomeWouldDeny, OutcomeDenied, OutcomeDegraded, OutcomeNoKey} {
 		s := o.String()
 		require.False(t, seen[s], "outcome label 重复: %s", s)
 		seen[s] = true
 	}
-	require.Len(t, seen, 5)
+	require.Len(t, seen, 6)
 }
 
 // TestSanitizeRPS 是**读侧防御**的回归钉。

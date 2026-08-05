@@ -14,20 +14,26 @@ import (
 
 // 本文件是 issue #696 的**源码守卫**。这些性质靠人 review 记不住，必须由测试钉死。
 
-// TestBotAPIMainGroupDoesNotReadLoginUID 是本次改动最危险的一处的守卫。
+// TestBotAPIMainGroupDoesNotReadLoginUID 守卫「bot 身份不得被当成登录用户」。
 //
-// 背景：`/v1/bot` 主组现在挂了 botActorUID()，它做的是 c.Set("uid", robotID)，
-// 而 octo-lib 的 Context.GetLoginUID() 正是读 c.Get("uid")。
-// 于是主组内任何调用 GetLoginUID() 的 handler 都会拿到 **robotID 而不是登录用户**。
+// 背景（含一次自我修正）：初版往 `/v1/bot` 主组挂了 `botActorUID()`，它会
+// `c.Set("uid", robotID)`，而 octo-lib 的 `Context.GetLoginUID()` 正是读 `c.Get("uid")`。
+// 于是主组内任何调 `GetLoginUID()` 的 handler 都会拿到 **robotID 而不是登录用户**。
+// 第二轮 code review 指出：per-bot 限流的维度取自 `"robot_id"`，**压根不需要那个别名**,
+// 所以那个风险是白担的。现已换成 `requireBotIdentity()`——只做 fail-closed 的身份断言,
+// 不写 `uid`。
 //
-// 实现时已逐个核实：包内 7 处 GetLoginUID() 全部在 oboCreateGrant / oboListGrants /
-// oboDeleteGrant / oboUpdateGrant / oboCreateScope / oboDeleteScope / oboListScopes，
-// 它们挂在 /v1/obo/* user-token 组，不在主组；主组内唯一的 obo handler
-// oboBotGetGrant 不读 uid。**当前是安全的。**
+// **守卫因此依然必要,而且理由更强了**:现在主组不再别名 `uid`,所以
+//   - 若有人重新挂上 `botActorUID()`（或任何写 `uid` 的中间件），别名风险原样回来;
+//   - 而只要主组内没有 handler 读 `GetLoginUID()`，那种混淆就无从发生。
 //
-// 但那是一条"今天为真"的性质，不是结构性保证：将来任何人往主组加一个读
-// GetLoginUID() 的 handler，就会静默地把 bot 身份当成登录用户——那是一个鉴权
-// 语义错误，不会有编译错误、大概率也不会有测试失败。这个守卫就是为此存在。
+// 这个守卫钉的是后者——它是那个风险的**结构性前提**，与具体挂了哪个中间件无关。
+// 包内 7 处 `GetLoginUID()` 全在 oboCreateGrant / oboListGrants / oboDeleteGrant /
+// oboUpdateGrant / oboCreateScope / oboDeleteScope / oboListScopes，它们挂在
+// /v1/obo/* user-token 组；主组内唯一的 obo handler oboBotGetGrant 不读 uid。
+//
+// 将来任何人往主组加一个读 `GetLoginUID()` 的 handler，都不会有编译错误、
+// 大概率也不会有别的测试失败——这个守卫就是为此存在。
 func TestBotAPIMainGroupDoesNotReadLoginUID(t *testing.T) {
 	handlers := mainGroupHandlerNames(t)
 	// 自证：解析必须真的抓到了主组 handler。没有这两条，一旦 Route 的写法变化
@@ -50,7 +56,8 @@ func TestBotAPIMainGroupDoesNotReadLoginUID(t *testing.T) {
 
 	require.Empty(t, offenders,
 		"以下 handler 挂在 /v1/bot 主组且调用了 c.GetLoginUID()：%v\n"+
-			"主组挂了 botActorUID()，GetLoginUID() 在这里返回的是 robotID 而非登录用户。"+
+			"该组是 bot-token 组，`uid` 不代表登录用户；一旦有中间件把 robotID 写进 `uid`"+
+			"（如 botActorUID），这些 handler 会静默地把 bot 当成登录用户——鉴权语义错误。"+
 			"若确实需要登录用户身份，该端点不应挂在 bot-token 组下。", offenders)
 }
 
@@ -66,29 +73,38 @@ func TestBotHeartbeatIsOutsideMainGroup(t *testing.T) {
 			"独立配额形同虚设（issue #696）")
 
 	src := readBotAPISource(t)
-	require.Contains(t, src, `r.POST("/v1/bot/heartbeat"`,
+	require.Contains(t, src, `r.Any("/v1/bot/heartbeat"`,
 		"heartbeat 应在主组之外独立注册并挂自己的限流通道")
 }
 
 // TestRateLimitMountOrder 钉住挂载顺序。
 //
-// 顺序必须是 authBot → botActorUID → 限流：per-bot 限流靠 botActorUID 写入的身份
-// 取维度，顺序颠倒会让限流在拿不到 key 时**静默旁路**（fail-open），
+// 顺序必须是 authBot → requireBotIdentity → 限流。限流的维度取自 authBot 写的
+// "robot_id"，顺序颠倒会让它拿不到 key 而**静默旁路**（OutcomeNoKey，fail-open），
 // 即"限流看起来装上了但从未生效"——这种失效没有任何报错，只能靠守卫拦。
+//
+// requireBotIdentity 也必须在限流之前：它是 fail-closed 的身份断言，
+// 排在后面就失去了「身份缺失时报错而非放行」的意义。
 func TestRateLimitMountOrder(t *testing.T) {
 	src := readBotAPISource(t)
 
 	group := extractMainGroupDecl(t, src)
 	authIdx := strings.Index(group, "ba.authBot()")
-	actorIdx := strings.Index(group, "ba.botActorUID()")
+	identityIdx := strings.Index(group, "ba.requireBotIdentity()")
 	limitIdx := strings.Index(group, "ba.rateLimitMiddleware(")
 
 	require.NotEqual(t, -1, authIdx, "主组必须挂 authBot")
-	require.NotEqual(t, -1, actorIdx, "主组必须挂 botActorUID")
+	require.NotEqual(t, -1, identityIdx, "主组必须挂 requireBotIdentity")
 	require.NotEqual(t, -1, limitIdx, "主组必须挂 per-bot 限流")
 
-	require.Less(t, authIdx, actorIdx, "botActorUID 必须在 authBot 之后")
-	require.Less(t, actorIdx, limitIdx, "限流必须在 botActorUID 之后，否则取不到 bot 身份、静默旁路")
+	require.Less(t, authIdx, identityIdx, "requireBotIdentity 必须在 authBot 之后")
+	require.Less(t, identityIdx, limitIdx, "限流必须在身份断言之后，否则取不到 bot 身份、静默旁路")
+
+	// 主组**不得**挂 botActorUID:它会把 robotID 别名成 "uid",而限流并不需要那个别名。
+	// 见 TestBotAPIMainGroupDoesNotReadLoginUID 的注释（第二轮 code review P2-2）。
+	require.NotContains(t, group, "ba.botActorUID()",
+		"主组不应挂 botActorUID——它写 c.Set(\"uid\", robotID)，会让任何调 GetLoginUID() 的 "+
+			"handler 把 bot 当成登录用户，而 per-bot 限流用的是 \"robot_id\"，不需要这个别名")
 }
 
 // TestBotTokenFingerprintDoesNotLeakToken 钉住凭据不落明文。
@@ -199,7 +215,7 @@ func functionsCallingGetLoginUID(t *testing.T) map[string]bool {
 func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
 	src := readBotAPISource(t)
 
-	start := strings.Index(src, `r.POST("/v1/bot/heartbeat"`)
+	start := strings.Index(src, `r.Any("/v1/bot/heartbeat"`)
 	require.NotEqual(t, -1, start, "找不到 heartbeat 路由声明，守卫失效——先修守卫本身")
 	decl := src[start:]
 	if end := strings.Index(decl, "ba.heartbeat)"); end != -1 {
@@ -233,7 +249,7 @@ func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
 		src, "register IP 参数同样必须过 ipLimitParams 消毒")
 
 	// register 侧同样两层，且 IP 在前——否则随机 token 已经把 Redis key 建好了。
-	rStart := strings.Index(src, `r.POST("/v1/bot/register"`)
+	rStart := strings.Index(src, `r.Any("/v1/bot/register"`)
 	require.NotEqual(t, -1, rStart)
 	rDecl := src[rStart:]
 	if end := strings.Index(rDecl, "ba.register)"); end != -1 {

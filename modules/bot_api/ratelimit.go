@@ -3,6 +3,7 @@ package bot_api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -43,10 +44,17 @@ import (
 
 // 限流通道分类。取值是**固定枚举**——它会成为 Prometheus label，
 // 基数有界依赖于此，不得透传 path 或任何请求内容。
+//
+// **导出**是因为组合根（main.go）的 provider 按 class 分支取配置——见
+// RateLimitParamsProvider。包内继续用小写别名，避免大范围改动。
 const (
-	rateLimitClassBusiness  = "business"
-	rateLimitClassHeartbeat = "heartbeat"
-	rateLimitClassRegister  = "register"
+	RateLimitClassBusiness  = "business"
+	RateLimitClassHeartbeat = "heartbeat"
+	RateLimitClassRegister  = "register"
+
+	rateLimitClassBusiness  = RateLimitClassBusiness
+	rateLimitClassHeartbeat = RateLimitClassHeartbeat
+	rateLimitClassRegister  = RateLimitClassRegister
 )
 
 // Redis keyspace。三条通道彼此隔离：共用前缀会让不同语义的流量互相消耗令牌。
@@ -134,26 +142,107 @@ func ipLimitParams(envRPS string, defRPS float64, envBurst string, defBurst int)
 	return rps, burst
 }
 
-// RateLimitParams 是三条通道的运行时配置快照。
+// requireBotIdentity 断言 `authBot` 已经写入了 bot 身份，否则**fail-closed** 中止。
+//
+// 为什么不直接用 `botActorUID()`（第二轮 code review P2-2）：那个中间件除了做同样的
+// 断言，还会 `c.Set("uid", robotID)`——把 robotID 别名成 `uid`。而 `uid` 正是
+// `Context.GetLoginUID()` 读的键，也是 lib `UIDRateLimitMiddleware` 的维度。
+// 于是主组内任何 handler 调 `GetLoginUID()` 都会**静默拿到一个 robotID 而不是登录用户**。
+// 今天恰好没有 handler 这么做（7 处调用全在 /v1/obo/* user-token 组），但那是
+// "此刻为真"而非结构性成立的性质。
+//
+// 而 per-bot 限流**压根不需要那个别名**:它的 keyFn 是 `getRobotIDFromContext`,
+// 读的是 `authBot` 写的 `CtxKeyRobotID`("robot_id")。初版注释声称
+// "botActorUID 供 per-bot 限流取维度"——那是错的,别名在这两处挂载上对限流毫无作用,
+// 白担了一个授权语义被混淆的风险。
+//
+// 但也不能只是删掉:`botActorUID` 的断言是 fail-**closed**（身份缺失即中止），
+// 而限流器对空 key 是 fail-**open**（旁路放行，见 Limiter.Check 的 OutcomeNoKey）。
+// 直接删会把"authBot 通过但没写身份"这种本该报错的状态降级成静默放行。
+// 所以保留断言、去掉别名——两个性质各自独立，本来就不该捆在一个中间件里。
+func (ba *BotAPI) requireBotIdentity() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if getRobotIDFromContext(c) == "" {
+			ba.respondBotAPIIdentityMissing(c)
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// onlyPOST 让非 POST 请求在**已经通过 IP 底线之后**以 404 结束。
+//
+// 存在理由（第二轮 code review P1-2）：octo-lib 的全局限流按
+// `excludeSet[c.Request.URL.Path]` 匹配——**只看路径，不看方法**。而 IP 底线原先只挂在
+// `r.POST` 上。于是 `GET /v1/bot/heartbeat` 会：跳过全局桶（路径被豁免）→ 没有对应
+// 方法的路由 → 落 gin 的 no-route。全局中间件仍会跑（含访问日志），最后渲染 404。
+// 净效果：**任意未鉴权来源可以无界地打 404**，而这两条路径正是全站唯一不受
+// 1500 rps/IP 约束的地方（其它路径连不存在的 URL 都走全局桶）。
+//
+// 单请求成本不高（无 DB、无 Redis），但它违反了 main.go globalRateLimitExcludePaths
+// 注释里那条不变量：**豁免不等于无限制**。所以用 `r.Any` 注册、把底线放在最前，
+// 让所有方法都过桶，再由本中间件收口。
+//
+// 为什么返回 404 而不是 405：保持与改动前**外部可观察行为一致**（那时也是 404），
+// 不引入新的状态码语义。用 i18n 信封而非 `c.AbortWithStatus`，因为后者被
+// `make i18n-lint` 的 D23 守卫禁止；`WithStatus` 门面在这里不涉及 D14 兼容风险——
+// 这个 (路径, 方法) 组合此前**从未**返回过信封响应，不存在依赖固定 400 的历史客户端。
+//
+// **不改 octo-lib**（虽然根因在那儿）：让豁免认方法能一次覆盖 /v1/ping、/v1/health
+// 这两条同形的既有洞，但那是 lib 的既有设计问题、不是本改动造成的，跨仓要等发版 +
+// go.mod bump。已在上游记账，本仓先把自己引入的增量收口。
+func onlyPOST(c *wkhttp.Context) {
+	if c.Request.Method != http.MethodPost {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+		c.Abort()
+		return
+	}
+	c.Next()
+}
+
+// RateLimitParams 是三条通道的运行时配置快照。主要给测试与组合根做便利形状用；
+// 判定路径本身**按通道单独取值**，不构造整个快照（见 RateLimitParamsProvider）。
 type RateLimitParams struct {
 	Business  ratelimit.Params
 	Heartbeat ratelimit.Params
 	Register  ratelimit.Params
 }
 
-// RateLimitParamsProvider 每次判定时被调用，返回当前配置。
+// forClass 把快照按 class 拆出单条通道，供 provider 形状适配用。
+func (p RateLimitParams) forClass(class string) ratelimit.Params {
+	switch class {
+	case rateLimitClassBusiness:
+		return p.Business
+	case rateLimitClassHeartbeat:
+		return p.Heartbeat
+	case rateLimitClassRegister:
+		return p.Register
+	default:
+		return ratelimit.Params{}
+	}
+}
+
+// RateLimitParamsProvider 每次判定时被调用，返回**该 class** 当前的配置。
 //
 // 用注入闭包而不是直接读 modules/common，理由与 RedisAppBotRegistry 的 ttl 注入
 // 一致：让 bot_api 不依赖 system-settings 包。组合根（main.go）负责把它接到热更新
 // 快照上。
-type RateLimitParamsProvider func() RateLimitParams
+//
+// **按 class 取值而非返回三条通道的快照**（第二轮 code review P2-3）：初版签名是
+// `func() RateLimitParams`，于是每个请求都要构造全部三条通道——12 个 getter，
+// 每个 getter 的默认值参数还会被**急切求值**（`os.Getenv` + 解析），
+// 而一次判定只用得上其中一条。这条路径实测被单个 bot 打到过约 590 rps，
+// 且在出厂的全关状态下答案恒为 bypassed。按 class 取值把成本降到 1/3，
+// 再配合组合根里的 `enabled` 短路，全关状态下每请求只读 1 个配置项。
+type RateLimitParamsProvider func(class string) ratelimit.Params
 
-// disabledRateLimitParams 是**未注入时的安全默认**：三条通道全部关闭，
-// 于是每次 Check 都走 OutcomeBypassed，行为与本次改动前逐字节一致。
+// disabledRateLimitParams 是**未注入时的安全默认**：任何 class 都返回零值
+// （Enabled=false），于是每次 Check 都走 OutcomeBypassed，行为与本次改动前逐字节一致。
 //
 // 这条默认值是刻意的：限流层的失败模式应当是「没限流」而不是「误拒」——
 // 一个忘了 wiring 的部署不该表现为全部 bot 被拒。
-func disabledRateLimitParams() RateLimitParams { return RateLimitParams{} }
+func disabledRateLimitParams(string) ratelimit.Params { return ratelimit.Params{} }
 
 var rateLimitParamsProvider atomic.Pointer[RateLimitParamsProvider]
 
@@ -166,11 +255,11 @@ func SetRateLimitParamsProvider(fn RateLimitParamsProvider) {
 	rateLimitParamsProvider.Store(&fn)
 }
 
-func currentRateLimitParams() RateLimitParams {
+func currentRateLimitParams(class string) ratelimit.Params {
 	if p := rateLimitParamsProvider.Load(); p != nil {
-		return (*p)()
+		return (*p)(class)
 	}
-	return disabledRateLimitParams()
+	return disabledRateLimitParams(class)
 }
 
 // rateLimitRedisOnce 让限流 client 在进程内单例化，避免每次 New() 都开新连接池
@@ -230,13 +319,13 @@ func newBotRateLimiters(cfg *config.Config) *botRateLimiters {
 	// 一个与运维预期不同的值，故此处刻意写成同样的数。
 	return &botRateLimiters{
 		business: ratelimit.New(client, rateLimitKeyPrefixBusiness, rateLimitClassBusiness,
-			func() ratelimit.Params { return currentRateLimitParams().Business }, obs,
+			func() ratelimit.Params { return currentRateLimitParams(rateLimitClassBusiness) }, obs,
 			ratelimit.Params{RPS: 20, Burst: 200}),
 		heartbeat: ratelimit.New(client, rateLimitKeyPrefixHeartbeat, rateLimitClassHeartbeat,
-			func() ratelimit.Params { return currentRateLimitParams().Heartbeat }, obs,
+			func() ratelimit.Params { return currentRateLimitParams(rateLimitClassHeartbeat) }, obs,
 			ratelimit.Params{RPS: 1, Burst: 10}),
 		register: ratelimit.New(client, rateLimitKeyPrefixRegister, rateLimitClassRegister,
-			func() ratelimit.Params { return currentRateLimitParams().Register }, obs,
+			func() ratelimit.Params { return currentRateLimitParams(rateLimitClassRegister) }, obs,
 			ratelimit.Params{RPS: 0.5, Burst: 10}),
 	}
 }

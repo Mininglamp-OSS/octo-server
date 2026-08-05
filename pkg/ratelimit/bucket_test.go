@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -134,6 +135,15 @@ func TestTokenBucketScriptRejectsNonPositiveRate(t *testing.T) {
 	require.Equal(t, 1, res.retryAfter)
 }
 
-// testRedisAddr 与 octo-lib testutil.NewTestServer 使用同一个地址，
+// testRedisAddr 默认与 octo-lib testutil.NewTestServer 使用同一个地址，
 // 使本包测试与集成测试对环境的要求一致。
-func testRedisAddr() string { return "127.0.0.1:6379" }
+//
+// 可用 `OCTO_TEST_REDIS_ADDR` 覆盖：同一台机器上并行跑测试的两个会话会争抢同一个
+// Redis——本包的用例要清 `ratelimit:*` 前缀，跨会话互相清桶会产生"限流时好时坏"
+// 这种极难归因的 flaky。写死端口的测试助手正是这类冲突的成因，所以留一个出口。
+func testRedisAddr() string {
+	if addr := os.Getenv("OCTO_TEST_REDIS_ADDR"); addr != "" {
+		return addr
+	}
+	return "127.0.0.1:6379"
+}

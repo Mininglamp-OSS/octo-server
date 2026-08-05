@@ -22,9 +22,12 @@ package ratelimit
 
 import (
 	"math"
+	"sync/atomic"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	rd "github.com/go-redis/redis"
+	"go.uber.org/zap"
 )
 
 // tokenBucketScript 与 octo-lib `pkg/wkhttp/ratelimit.go`、
@@ -91,6 +94,9 @@ type bucket struct {
 	client *rd.Client
 	script *rd.Script
 	prefix string
+	// lastDegradeWarn 是最近一次降级告警的 Unix 秒，用于节流。
+	// 与 octo-lib keyedLimiter 的同名字段同构——见 logDegrade。
+	lastDegradeWarn atomic.Int64
 }
 
 func newBucket(client *rd.Client, prefix string) *bucket {
@@ -99,6 +105,37 @@ func newBucket(client *rd.Client, prefix string) *bucket {
 		script: rd.NewScript(tokenBucketScript),
 		prefix: prefix,
 	}
+}
+
+// degradeWarnInterval 是降级告警的最小间隔（秒）。取值与 octo-lib 一致。
+const degradeWarnInterval = 30
+
+// logDegrade 按 degradeWarnInterval 节流降级告警；首次故障立即打印。
+//
+// **为什么光有指标不够**（code review 补入）：`degraded` 走 Prometheus
+// （OutcomeDegraded）本是刻意设计——Redis 挂掉意味着限流"没在工作"，必须与"工作正常
+// 且无人超限"区分开。但那条可见性**完全押在指标被注册且被抓取上**：
+// 若 registry 没接、或抓取链路断了，fail-open 就是彻底静默的——限流看起来装上了、
+// 实际从未生效，而这正是本包最怕的失败形态。
+//
+// octo-lib 的 keyedLimiter 一直有这条节流告警；本包把它的 Lua 逐字节抄了过来，
+// **却没抄它的可观测性**。这里补齐,使两处降级行为在日志侧也对等。
+//
+// 节流而非每次都打:降级期间每个请求都会命中这条路径,不节流会在故障期把日志打爆——
+// 那本身就是限流要防的那种放大。
+func (b *bucket) logDegrade(msg string, err error) {
+	now := time.Now().Unix()
+	prev := b.lastDegradeWarn.Load()
+	if now-prev < degradeWarnInterval {
+		return
+	}
+	// CAS 失败说明另一个 goroutine 刚打过,让它去打即可。
+	if !b.lastDegradeWarn.CompareAndSwap(prev, now) {
+		return
+	}
+	log.Warn("ratelimit degraded: "+msg,
+		zap.String("prefix", b.prefix),
+		zap.Error(err))
 }
 
 // bucketResult 是一次桶判定的原始结果。
@@ -122,6 +159,7 @@ func (b *bucket) allow(key string, rps float64, burst int) bucketResult {
 	now := float64(time.Now().UnixNano()) / float64(time.Second)
 	res, err := b.script.Run(b.client, []string{b.prefix + key}, rps, burst, now).Result()
 	if err != nil {
+		b.logDegrade("redis script failed, failing open", err)
 		return bucketResult{allowed: true, remaining: burst, degraded: true}
 	}
 
@@ -129,6 +167,10 @@ func (b *bucket) allow(key string, rps float64, burst int) bucketResult {
 	if !ok || len(arr) != 3 {
 		// 返回形状异常：fail-open，但必须让调用方知道（degraded），否则一个真实
 		// bug 会永远藏在「总是放行」后面。
+		//
+		// 这一支比 Redis 故障更值得告警:它意味着**脚本与解析代码不匹配**——
+		// 要么 Lua 被改了返回值,要么解析写错了。Redis 故障会自愈,这个不会。
+		b.logDegrade("unexpected script reply shape, failing open", nil)
 		return bucketResult{allowed: true, remaining: burst, degraded: true}
 	}
 

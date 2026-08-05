@@ -308,8 +308,12 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	registerIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
 		"bot_register", registerIPRPS, registerIPBurst)
-	r.POST("/v1/bot/register",
+	// **用 r.Any 而非 r.POST**:全局限流的豁免只看路径不看方法（lib 的
+	// `excludeSet[c.Request.URL.Path]`），若底线只挂在 POST 上，非 POST 请求会
+	// 既跳过全局桶又碰不到底线（第二轮 code review P1-2）。onlyPOST 在过桶之后收口。
+	r.Any("/v1/bot/register",
 		registerIPLimit,
+		onlyPOST,
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.register },
 			func(c *wkhttp.Context) string { return botTokenFingerprint(extractBotToken(c)) },
@@ -329,17 +333,22 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//     在 `authBot` 里就 abort 了，永远走不到那道桶。缺这一层，攻击者可用任意
 	//     无效 token 无限触发 `authBot` 的 Redis/DB 查询——原本被全局桶挡住的 DDoS
 	//     面因为 exclude 反而被打开。这一层**没有 enabled 开关**，因为 (3) 默认关闭。
-	// (2) authBot + botActorUID —— 鉴权并落 bot 身份。
+	// (2) authBot + requireBotIdentity —— 鉴权并断言 bot 身份已落。
+	//     用 requireBotIdentity 而非 botActorUID:限流维度取自 "robot_id",不需要
+	//     把 robotID 别名成 "uid"（见 ratelimit.go requireBotIdentity 的注释）。
 	// (3) per-bot 桶 —— 防单个已鉴权 bot 滥用；可热调、可影子、默认关闭。
 	heartbeatIPRPS, heartbeatIPBurst := ipLimitParams(
 		envHeartbeatIPRPS, defaultHeartbeatIPRPS, envHeartbeatIPBurst, defaultHeartbeatIPBurst)
 	heartbeatIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
 		"bot_heartbeat", heartbeatIPRPS, heartbeatIPBurst)
-	r.POST("/v1/bot/heartbeat",
+	// **r.Any 而非 r.POST**:同 register，豁免只看路径不看方法,底线必须覆盖所有方法,
+	// 否则 `GET /v1/bot/heartbeat` 既跳过全局桶又碰不到底线（第二轮 code review P1-2）。
+	r.Any("/v1/bot/heartbeat",
 		heartbeatIPLimit,
+		onlyPOST,
 		ba.authBot(),
-		ba.botActorUID(),
+		ba.requireBotIdentity(),
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.heartbeat },
 			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
@@ -349,16 +358,18 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 
 	// Bot API endpoints (unified auth middleware)
 	//
-	// botActorUID 把 robotID 写进 "uid"，供 per-bot 限流取维度。已核实主组内
-	// **没有** handler 读 c.GetLoginUID()（7 处调用全在 /v1/obo/* user-token 组，
-	// 主组内的 oboBotGetGrant 不读），故这一写入不改变任何现有语义；
-	// 该性质由 TestBotAPIMainGroupDoesNotReadLoginUID 源码守卫钉住。
+	// requireBotIdentity 只**断言** `authBot` 已写入 bot 身份（缺失即 fail-closed 中止），
+	// 刻意**不**写 `c.Set("uid", robotID)`。per-bot 限流的维度取自 `getRobotIDFromContext`
+	// （即 authBot 写的 "robot_id"），与 `uid` 无关——初版误用了 `botActorUID()`
+	// 并在注释里声称"供限流取维度",两者都是错的:那个别名会让主组内任何调
+	// `GetLoginUID()` 的 handler 静默拿到 robotID 而不是登录用户，是白担的授权混淆风险
+	// （第二轮 code review P2-2）。
 	//
-	// 顺序是载荷性的：authBot → botActorUID → 限流。限流中间件在拿不到身份时
-	// 旁路放行，顺序颠倒会让它静默失效。
+	// 顺序是载荷性的：authBot → requireBotIdentity → 限流。限流中间件在拿不到身份时
+	// 旁路放行（OutcomeNoKey），顺序颠倒会让它静默失效。
 	botAPI := r.Group("/v1/bot",
 		ba.authBot(),
-		ba.botActorUID(),
+		ba.requireBotIdentity(),
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.business },
 			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },

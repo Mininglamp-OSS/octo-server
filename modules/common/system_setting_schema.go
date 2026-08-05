@@ -184,7 +184,7 @@ var systemSettingSchema = []settingDef{
 	{Category: "botratelimit", Key: "business_burst", Type: settingTypeInt, Description: "单个 Bot 在业务端点上的突发上限（令牌桶 burst）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitBusinessBurst()) }},
 
-	{Category: "botratelimit", Key: "heartbeat_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/heartbeat 启用 per-bot 限流（该端点已移出全局 per-IP 桶，此开关是它唯一的上限）",
+	{Category: "botratelimit", Key: "heartbeat_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/heartbeat 启用 per-bot 限流（按 bot 身份分配额）。该端点已移出全局 per-IP 桶，但鉴权前另有一道常开的 per-IP 底线（strict:bot_heartbeat，env 可调），所以关闭本开关并不等于该端点无限制",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitHeartbeatEnabled()) }},
 	{Category: "botratelimit", Key: "heartbeat_dry_run", Type: settingTypeBool, Description: "心跳限流是否影子运行（只观测不拦截）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitHeartbeatDryRun()) }},
@@ -193,7 +193,7 @@ var systemSettingSchema = []settingDef{
 	{Category: "botratelimit", Key: "heartbeat_burst", Type: settingTypeInt, Description: "单个 Bot 的心跳突发上限（令牌桶 burst）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitHeartbeatBurst()) }},
 
-	{Category: "botratelimit", Key: "register_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/register 启用限流（该端点是掉线自愈的最后一环，同时是未鉴权可达的写入口，误配会让全部 Bot 无法注册）",
+	{Category: "botratelimit", Key: "register_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/register 启用 per-token 限流（该端点是掉线自愈的最后一环，同时是未鉴权可达的写入口，误配会让全部 Bot 无法注册）。它已随 heartbeat 一并移出全局 per-IP 桶——否则邻居 Bot 打满配额时它会被连坐，掉线的 Bot 换不到新 token、永远无法恢复；鉴权前另有一道常开的 per-IP 底线（strict:bot_register，env 可调）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterEnabled()) }},
 	{Category: "botratelimit", Key: "register_dry_run", Type: settingTypeBool, Description: "注册/换 token 限流是否影子运行（只观测不拦截）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterDryRun()) }},

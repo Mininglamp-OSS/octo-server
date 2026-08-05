@@ -13,6 +13,7 @@ package bot_api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -92,8 +93,11 @@ func resetBotRateLimitBuckets(t *testing.T, ctx *config.Context) {
 }
 
 // useParams 安装一份限流配置。返回后立即生效——这本身就是「热调无需重启」的体现。
+//
+// provider 现在按 class 取值（见 RateLimitParamsProvider），这里用 forClass 适配，
+// 让用例仍然能一次性写出三条通道。
 func useParams(p RateLimitParams) {
-	SetRateLimitParamsProvider(func() RateLimitParams { return p })
+	SetRateLimitParamsProvider(p.forClass)
 }
 
 func botGet(t *testing.T, h http.Handler, path, token string) *httptest.ResponseRecorder {
@@ -514,8 +518,15 @@ func drainIPBucket(t *testing.T, ctx *config.Context, key string) {
 
 func heartbeatFrom(t *testing.T, h http.Handler, token, ip string) *httptest.ResponseRecorder {
 	t.Helper()
+	return botRequestFrom(t, h, "POST", "/v1/bot/heartbeat", token, ip)
+}
+
+// botRequestFrom 发一个带指定方法与 client IP 的请求。
+// 方法可变是为了覆盖非 POST 的豁免路径（见 TestExcludedPathsAreLimitedOnEveryMethod）。
+func botRequestFrom(t *testing.T, h http.Handler, method, path, token, ip string) *httptest.ResponseRecorder {
+	t.Helper()
 	w := httptest.NewRecorder()
-	req, err := http.NewRequest("POST", "/v1/bot/heartbeat", nil)
+	req, err := http.NewRequest(method, path, nil)
 	require.NoError(t, err)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -524,6 +535,58 @@ func heartbeatFrom(t *testing.T, h http.Handler, token, ip string) *httptest.Res
 	req.Header.Set("X-Real-Ip", ip)
 	h.ServeHTTP(w, req)
 	return w
+}
+
+// TestExcludedPathsAreLimitedOnEveryMethod —— 第二轮 code review P1-2 的行为回归。
+//
+// octo-lib 的全局限流按 `excludeSet[c.Request.URL.Path]` 匹配——**只看路径,不看方法**。
+// 而两道 IP 底线原先只挂在 `r.POST` 上。于是 `GET /v1/bot/heartbeat`:
+// 跳过全局桶（路径已豁免）→ 没有该方法的路由 → 落 gin no-route,全局中间件照跑
+// （含访问日志）→ 渲染 404。**净效果是任意未鉴权来源可以无界地打 404**,
+// 而这两条路径是全站唯一不受 1500 rps/IP 约束的地方（其它路径连不存在的 URL 都走全局桶）。
+//
+// 修法是改用 `r.Any` 注册、底线放最前、再由 onlyPOST 收口。这条用例钉住它:
+// 非 POST 请求在桶耗尽后**必须**被限流,且 429 来自 strict IP 层。
+//
+// 此前所有 heartbeat/register 用例都是 POST,所以没有任何测试能发现这个洞。
+func TestExcludedPathsAreLimitedOnEveryMethod(t *testing.T) {
+	h, ctx := setupRateLimitTest(t)
+	useParams(RateLimitParams{}) // per-bot 全关:复现生产默认姿态
+
+	cases := []struct {
+		name, method, path, scope string
+		bucketKey                 func(ip string) string
+	}{
+		{"heartbeat/GET", "GET", "/v1/bot/heartbeat", "strict:bot_heartbeat", heartbeatIPBucketKey},
+		{"heartbeat/DELETE", "DELETE", "/v1/bot/heartbeat", "strict:bot_heartbeat", heartbeatIPBucketKey},
+		{"register/GET", "GET", "/v1/bot/register", "strict:bot_register", registerIPBucketKey},
+		{"register/PUT", "PUT", "/v1/bot/register", "strict:bot_register", registerIPBucketKey},
+	}
+
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 每个子用例用独立 IP，避免互相消耗令牌。
+			ip := fmt.Sprintf("198.51.100.%d", 10+i)
+
+			// 对照:桶未耗尽时不应是 429。非 POST 会被 onlyPOST 收口成 404——
+			// 这一条同时确认外部可观察行为与改动前一致（那时是 gin 的 404）。
+			first := botRequestFrom(t, h, c.method, c.path, "", ip)
+			require.NotEqual(t, http.StatusTooManyRequests, first.Code,
+				"桶未耗尽时不应限流——否则是误伤")
+			require.Equal(t, http.StatusNotFound, first.Code,
+				"非 POST 应以 404 结束（与改动前一致），实际 %d", first.Code)
+
+			drainIPBucket(t, ctx, c.bucketKey(ip))
+
+			limited := botRequestFrom(t, h, c.method, c.path, "", ip)
+			require.Equal(t, http.StatusTooManyRequests, limited.Code,
+				"%s %s 在 IP 桶耗尽后仍未被限流——底线只挂在 POST 上,"+
+					"非 POST 既跳过全局桶(豁免只看路径)又碰不到底线,"+
+					"于是任意未鉴权来源可以无界打 404", c.method, c.path)
+			require.Equal(t, c.scope, limited.Header().Get("X-RateLimit-Scope"),
+				"429 应来自 strict IP 层")
+		})
+	}
 }
 
 // TestHeartbeatUnauthenticatedFloodIsRateLimited —— code review P1 的行为回归。
