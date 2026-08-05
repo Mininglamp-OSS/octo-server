@@ -50,11 +50,37 @@ package botevent
 // evicted under pressure — the failure mode that would otherwise make an `INCR`
 // counter quietly unusable.
 //
-// # No fallback to GenSeq, deliberately
+// # No fallback to GenSeq on failure — but there IS a legacy mode
 //
-// When allocation fails, callers must fail the enqueue the same way they failed
-// a `GenSeq` error before. Falling back to `GenSeq` would put two live id
-// sources on one queue, which is precisely the condition that produced #697.
+// These are different things and the distinction is load-bearing.
+//
+// Before activation the allocator *deliberately* delegates to GenSeq, exactly as
+// internal/msgextraseq does in `mode=legacy`. That is not a fallback, it is the
+// pre-activation state: every replica behaves identically to the old binary, so
+// deploying the new code changes nothing.
+//
+// After activation, a Redis failure returns an error and the caller fails the
+// enqueue. It must NOT quietly reach for GenSeq, because two live id sources on
+// one queue is the defect being removed.
+//
+// # Why activation cannot be skipped (reviewer P0)
+//
+// An earlier revision of this file seeded the counter above
+// `max(queue ceiling, min_seq)` and switched immediately, on the theory that
+// "new ids are always higher, so mixed old/new replicas are safe". That is
+// backwards. A legacy replica issues ids from the *bottom* of its block upward,
+// so while the new allocator hands out 7001, a legacy replica is still handing
+// out 5001, 5002, … Once a consumer's cursor reaches 7001 every one of those is
+// permanently invisible — the exact loss this change exists to remove, inflicted
+// by the change itself. A larger safety margin makes it worse, not better: the
+// margin *is* the gap that swallows legacy's ids.
+//
+// So the switch is gated on a DB-authoritative-style state flag and is only
+// flipped once every legacy writer is gone. The flag is read atomically with the
+// allocation itself (one script, see gateSource), so a flip takes effect on the
+// very next allocation with no per-process cache window. The one residual window
+// is a request that has already read `legacy` and not yet ZADDed when the flip
+// commits; drain writes for a few seconds around the flip to close it.
 
 import (
 	"errors"
@@ -76,8 +102,20 @@ const (
 	// and the hint can never collide.
 	SeqKeyPrefix = "botEventSeq:"
 
+	// ModeKey holds the process-wide allocator mode. Absent or anything other than
+	// ModeIncr means legacy, so a deployment with no operator action behaves
+	// exactly like the old binary.
+	ModeKey = "botEventSeq:mode"
+
+	// ModeIncr is the activated state: allocate from the monotonic counter.
+	ModeIncr = "incr"
+
+	// ModeLegacy is the pre-activation state, written explicitly by the operator
+	// tool so preflight can tell "not yet activated" from "never configured".
+	ModeLegacy = "legacy"
+
 	// QueueKeyPrefix is the authoritative per-bot event queue. Defined here so the
-	// five producers and the consumer stop each spelling it with their own
+	// producers and the consumer stop each spelling it with their own
 	// fmt.Sprintf — the seed below has to read the very key the producers write.
 	QueueKeyPrefix = "robotEvent:"
 
@@ -89,12 +127,12 @@ const (
 	// seedSafetyMargin is how far above the observed ceiling a first-time seed
 	// starts.
 	//
-	// Two legacy blocks matter, not one. A replica still running the old binary
-	// during a rolling deploy holds a block whose top is up to `seqStep` above the
-	// ids it has enqueued so far, and `min_seq` in the DB may itself have been
-	// moved *backwards* by another replica's unconditional write-back — so the DB
-	// value is a lower bound on what legacy can still hand out, not an upper one.
-	// Two steps covers a block in flight plus one such regression.
+	// This only has to cover a block that legacy had *reserved* but not fully
+	// issued before it went away — activation guarantees no legacy writer is still
+	// running, so there is nothing left racing upward from below. `min_seq` may
+	// itself have been moved backwards by a replica's unconditional write-back, so
+	// it is a lower bound on what legacy could have handed out; two steps covers
+	// one reserved block plus one such regression.
 	seedSafetyMargin = 2 * legacyGenSeqStep
 )
 
@@ -127,6 +165,20 @@ return tonumber(cur)`
 // bell.go and every other Lua site in this repo.
 var seedScript = rd.NewScript(seedSource)
 
+// gateSource reads the mode and allocates in one atomic step, returning -1 when
+// the allocator is not activated.
+//
+// The atomicity is the point. Caching the mode per process — even for a second —
+// would mean that during that second some replicas allocate from the counter
+// while others still allocate from GenSeq: two live id sources, which is the
+// defect. Reading it inside the same script as the INCR makes a flip take effect
+// on the very next allocation, everywhere, with no window of divergence.
+const gateSource = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+return redis.call('INCR', KEYS[2])`
+
+var gateScript = rd.NewScript(gateSource)
+
 // Scripter is the go-redis surface the allocator needs: INCR, the sorted-set read
 // used to observe the current ceiling, and the scripting set *rd.Script.Run
 // requires. octo-lib's *redis.Conn exposes none of the scripting calls, so the
@@ -136,6 +188,7 @@ var seedScript = rd.NewScript(seedSource)
 // whose INCR succeeds while its seed fails, since the two have different
 // consequences.
 type Scripter interface {
+	Get(key string) *rd.StringCmd
 	Incr(key string) *rd.IntCmd
 	ZRevRangeWithScores(key string, start, stop int64) *rd.ZSliceCmd
 	Eval(script string, keys []string, args ...interface{}) *rd.Cmd
@@ -219,18 +272,78 @@ func nextEventID(ctx *config.Context, client Scripter, robotID string) (int64, e
 	if client == nil {
 		return 0, errors.New("botevent: nil redis client, cannot allocate event id")
 	}
-	if _, ok := seeded.Load(robotID); !ok {
-		if err := seedCounter(ctx, client, robotID); err != nil {
-			seedFailures.Add(1)
-			return 0, fmt.Errorf("botevent: seed event id counter for %q: %w", robotID, err)
+
+	// Steady state after activation: one round trip that checks the mode and
+	// allocates atomically.
+	if _, ok := seeded.Load(robotID); ok {
+		v, err := runGate(client, robotID)
+		if err != nil {
+			return 0, err
 		}
-		seeded.Store(robotID, struct{}{})
+		if v >= 0 {
+			return v, nil
+		}
+		// Activated, then not: there is no supported deactivation, so this means
+		// the mode key was cleared out from under us. Legacy is the safe answer —
+		// it is what every other writer would now be doing too.
+		return legacyEventID(ctx, robotID)
 	}
-	v, err := client.Incr(SeqKey(robotID)).Result()
+
+	mode, err := client.Get(ModeKey).Result()
+	if err != nil && err != rd.Nil {
+		return 0, fmt.Errorf("botevent: read allocator mode: %w", err)
+	}
+	if mode != ModeIncr {
+		return legacyEventID(ctx, robotID)
+	}
+
+	// Activated and this process has not seeded this bot yet. Seed before the
+	// first INCR, never after: an id handed out below the floor is exactly the
+	// unreachable-event bug.
+	if err := seedCounter(ctx, client, robotID); err != nil {
+		seedFailures.Add(1)
+		return 0, fmt.Errorf("botevent: seed event id counter for %q: %w", robotID, err)
+	}
+	seeded.Store(robotID, struct{}{})
+
+	v, err := runGate(client, robotID)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return legacyEventID(ctx, robotID)
+	}
+	return v, nil
+}
+
+// runGate performs the atomic mode-check-and-allocate. -1 means "not activated".
+func runGate(client Scripter, robotID string) (int64, error) {
+	v, err := gateScript.Run(client, []string{ModeKey, SeqKey(robotID)}, ModeIncr).Result()
 	if err != nil {
 		return 0, fmt.Errorf("botevent: allocate event id for %q: %w", robotID, err)
 	}
-	return v, nil
+	id, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("botevent: allocate event id for %q: unexpected script result %T", robotID, v)
+	}
+	return id, nil
+}
+
+// legacyEventID is the pre-activation allocator: the octo-lib GenSeq block
+// allocator this change exists to retire.
+//
+// This is the ONLY permitted GenSeq call site for bot event ids, and the source
+// guard in genseq_guard_test.go allows it here and nowhere else — the same shape
+// internal/msgextraseq uses for its own legacy delegation. It is reached when the
+// allocator has not been activated yet, which is the state every deployment
+// starts in, so it is not dead code and its behaviour still matters: it is
+// bug-compatible with the old binary on purpose, so that deploying the fix
+// changes nothing until an operator flips the mode.
+func legacyEventID(ctx *config.Context, robotID string) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("botevent: nil ctx, cannot allocate legacy event id")
+	}
+	return ctx.GenSeq(common.RobotEventSeqKey + robotID)
 }
 
 // seedCounter raises the counter above everything legacy could have handed out

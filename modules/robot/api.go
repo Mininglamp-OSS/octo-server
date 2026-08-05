@@ -1181,22 +1181,25 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 
 }
 
-// inlineQuerySeqKeyPrefix is the sequence for inline-query event ids.
+// #697 (reviewer P1): inline-query event ids MUST come from the same monotonic
+// source as the queue's, because both streams are merged into one response.
 //
-// #697: these used to be allocated from `RobotEventSeqKey+robotID` — the *same*
-// sequence robotEvent:{robotID} scores came from. Inline-query events are only
-// ever appended to this process's inlineQueryEventsMap and nothing reads that map,
-// so those allocations produced no deliverable event while still consuming ids
-// from, and advancing min_seq of, the sequence the bot event queue depended on:
-// a third party to the block churn behind #697, for nothing. They get their own
-// key. Still GenSeq, deliberately — an id nobody consumes has no monotonicity
-// requirement and does not justify a Redis dependency.
-const inlineQuerySeqKeyPrefix = "inlineQuerySeq:"
-
+// getEventsResult below reads inlineQueryEventsMap, appends it to the events read
+// from robotEvent:{robotID}, sorts the union by EventID, and filters it by the
+// caller's cursor. So the two id spaces are not independent — they share a cursor.
+//
+// An earlier revision of this change gave inline queries their own GenSeq key on
+// the belief that nothing consumed them. That was wrong, and the consequence was
+// worse than the bug being fixed: a fresh GenSeq key starts near 1000001 while the
+// new counter starts low, so one inline event would push the client's cursor into
+// the millions and permanently filter out every ordinary event behind it.
+//
+// Sharing NextEventID keeps them on one source in both modes — one GenSeq
+// sequence before activation, one counter after.
 func (rb *Robot) addInlineQuery(robotID string, inlineQuery *InlineQuery) {
-	seq, err := rb.ctx.GenSeq(inlineQuerySeqKeyPrefix + robotID)
+	seq, err := botevent.NextEventID(rb.ctx, robotID)
 	if err != nil {
-		rb.Error("GenSeq failed", zap.Error(err))
+		rb.Error("allocate inline query event id failed", zap.Error(err), zap.String("robotID", robotID))
 		return
 	}
 	rb.inlineQueryEventsMapLock.Lock()

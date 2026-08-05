@@ -30,6 +30,12 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	// prefix it holds. A caller that inlined the string still counts.
 	legacyAlloc := regexp.MustCompile(`GenSeq\([^)]*(RobotEventSeqKey|"robotEventSeq:)`)
 
+	// pkg/botevent/seq.go is the single allowlisted GenSeq call site, the same
+	// shape internal/msgextraseq uses: the allocator delegates to GenSeq while it
+	// is not activated, so a deployment behaves exactly like the old binary until
+	// an operator flips the mode. Every OTHER caller is a second live id source.
+	const allowlisted = "pkg/botevent/seq.go"
+
 	var violations []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -47,13 +53,16 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		rel, _ := filepath.Rel(root, path)
+		if filepath.ToSlash(rel) == allowlisted {
+			return nil
+		}
 		content, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
 		}
 		for i, line := range strings.Split(string(content), "\n") {
 			if legacyAlloc.MatchString(line) {
-				rel, _ := filepath.Rel(root, path)
 				violations = append(violations, rel+":"+itoaGuard(i+1))
 			}
 		}
@@ -61,6 +70,21 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("walk: %v", err)
+	}
+
+	// The allowlisted file must actually still contain the delegation. If it stops
+	// (say the legacy branch is deleted as "dead code"), pre-activation deployments
+	// silently lose the behaviour that makes them safe, and this guard would go
+	// green while protecting nothing.
+	allowed, readErr := os.ReadFile(filepath.Join(root, allowlisted))
+	if readErr != nil {
+		t.Fatalf("read allowlisted file: %v", readErr)
+	}
+	if !legacyAlloc.Match(allowed) {
+		t.Fatalf("%s no longer delegates to GenSeq. The pre-activation path is what makes "+
+			"deploying this change a no-op until an operator activates it; without it a "+
+			"deploy switches allocators while legacy replicas are still running, which is "+
+			"the mixed-source loss described in #697.", allowlisted)
 	}
 
 	if len(violations) > 0 {

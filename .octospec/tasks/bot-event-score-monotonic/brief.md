@@ -210,14 +210,23 @@ T0 后发号至 `C1`、入队至 `S1`。崩溃恢复到 T0 → 计数器回到 `
 选 per-bot 而非全局 key：单调性只需队列内成立；全局 key 的 floor 必须 ≥ **所有**队列的
 max score（否则某个高 score 队列的客户端游标会把新号段整体挡在门外），且是热点。
 
-**D2. 单阶段部署，不需要 #627 那样的 flip。** 号段单向性（新号恒高于旧号）+ D1 的同域
-自洽性使新旧副本共存是安全的。前提是 floor 引导**幂等**：任何副本任意次引导结果相同，
-不要求「引导必须在第一个新副本启动前完成」。
+**D2.（已更正 —— 原判断是错的）需要显式 activation gate，两阶段，不是单阶段部署。**
 
-> **更正**：本 brief 早先写「用 `SET key <floor> GT`」是错的 —— Redis 的 `SET` 没有
-> `GT` 选项（`GT`/`LT` 属于 `EXPIRE` 和 `ZADD`）。幂等取 max 必须用 Lua
-> （`GET` → 比较 → 条件 `SET`，单脚本内原子），与本仓其他 Lua 站点同模式
-> （`pkg/botevent/bell.go` 的 `EVALSHA` + `NOSCRIPT` 回退）。
+原文写「号段单向性使新旧副本共存安全」，**方向搞反了，review 抓到**。legacy 副本是从它那个块的**底部往上**发号的：新分配器在 7001 发号时，legacy 副本还在发 5001、5002…… 一旦消费者游标到了 7001，legacy 后续发的每一个 id 都永久不可见 —— 正是本任务要消除的丢失，由本任务自己造成。而且 `seedSafetyMargin` 越大越糟：**margin 本身就是吞掉 legacy id 的那个 gap**。
+
+改为：
+- Redis key `botEventSeq:mode`，缺省 / 非 `incr` 即 legacy。**未激活时 `NextEventID` 委托给
+  `GenSeq`**（与 `internal/msgextraseq` 的 `mode=legacy` 同构），所以部署本身行为中立。
+- mode 与分配在**同一个 Lua 脚本内**读取（`gateSource`）—— 刻意不做进程内缓存：缓存哪怕
+  1 秒，也意味着那 1 秒里部分副本用计数器、部分用 GenSeq，即两个活跃号源，正是缺陷本身。
+  flip 后**下一次分配**即生效，无副本间分歧窗口。
+- 残余窗口只剩「已读到 legacy、尚未 ZAdd」的在途请求（微秒级）；flip 前后短暂停写即可关闭。
+- operator 工具 `tools/botevent-seq`（`-action preflight|activate`）。**它无法自动验证
+  「所有旧副本已下线」**，这必须是人工前置步骤，工具用 `-yes` + 显式告警要求确认。
+- 无 online deactivate：回退意味着 legacy id 落在消费者游标下方，是同一种丢失的镜像。
+
+**D1 的「no fallback」与此不冲突，但必须分清**：未激活 → 走 legacy，这是**设计的模式**；
+已激活但 Redis 失败 → 返回错误、拒绝入队，**不**偷偷回退 GenSeq。
 
 **D3. 现存碰撞 member 不重编号**（详见 Open questions 1 —— 这是唯一需要人类签字的一条，
 因为它是唯一涉及写生产数据的选项）。
@@ -233,14 +242,22 @@ max score（否则某个高 score 队列的客户端游标会把新号段整体�
 
 实现过程中三处偏离 / 补充了本 brief 的原始判断，记在此处而非默默改掉：
 
-**① 站点是 6 个，不是 5 个。** 新增的 `TestNoGenSeqForBotEventIDs` 守卫立刻抓到
-`modules/robot/api.go` 的 `addInlineQuery` —— 它也从 `RobotEventSeqKey+robotID` 取号。
-本 brief 和 `modules/robot/api.go:232` 的注释都说「five ZADD sites in total」，都漏了它，
-因为它**不写 ZSET**（只 append 到进程内 `inlineQueryEventsMap`）。而 `inlineQueryEventsMap`
-**没有任何读取/投递路径**（只有 add / remove），所以那些 event 从不发给任何人 —— 它唯一的
-实际作用是消耗号码并推进 `min_seq`，即污染队列号源却不产出任何可投递事件。处置：隔离到
-独立 key `inlineQuerySeq:`，仍用 GenSeq（无人消费的 id 没有单调性要求，不值得引入 Redis
-依赖）。**这正是「守卫而非注释」的价值：注释错过一次，守卫一次就抓到。**
+**①（已更正）站点是 6 个，第 6 个是 `addInlineQuery`，而它的事件**有**消费路径。**
+新增守卫立刻抓到 `modules/robot/api.go` 的 `addInlineQuery` 也从 `RobotEventSeqKey+robotID`
+取号 —— 本 brief 与 `modules/robot/api.go:232` 的注释都只说「five ZADD sites」，都漏了它。
+
+第一版处置是「隔离到独立 `inlineQuerySeq:` key，因为 `inlineQueryEventsMap` 无人读取」。
+**这个前提是错的，review 抓到**：`getEventsResult`（`modules/robot/api.go:1089`）会读该 map，
+把 inline query 事件与 ZSET 事件**合并、按 `EventID` 排序、按同一个 cursor 过滤**。两个
+id 空间共享一个游标。隔离后果比原缺陷更糟：新 GenSeq key 首号约 1000001，而计数器从低位
+起，一条 inline event 就把客户端游标顶到百万，之后的普通事件全部被永久过滤。
+
+**调查失误的具体原因值得记下来**：当时那次 `grep inlineQueryEventsMap` 加了 `| head`，
+输出恰好 10 行被截断，漏掉了 1089 行的读取，然后据此断言「没有任何读取路径」。**截断过的
+搜索结果不能用来证明「不存在」。**
+
+最终处置：`addInlineQuery` 改用 `botevent.NextEventID` —— 与队列事件同一号源，未激活时
+同为一条 GenSeq 序列，激活后同为一个计数器，任何时刻单源。
 
 **② 队列 key 统一到 `botevent.QueueKey`。** 原先 5 处各自 `fmt.Sprintf("robotEvent:%s", ...)`。
 seed 必须读 producer 写的同一个 key，硬编码分散是真实风险。统一后必须同步更新

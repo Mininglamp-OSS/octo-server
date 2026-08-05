@@ -74,15 +74,118 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 	return ctx, client
 }
 
-// fixture clears every trace of a bot so each test starts from a known floor.
+// fixture clears every trace of a bot so each test starts from a known floor, and
+// puts the allocator in the ACTIVATED state — most tests are about post-activation
+// behaviour. The pre-activation path has its own tests below.
 func fixture(t *testing.T, ctx *config.Context, client *rd.Client, robotID string) {
 	t.Helper()
 	clean := func() {
-		client.Del(SeqKey(robotID), QueueKey(robotID))
+		client.Del(SeqKey(robotID), QueueKey(robotID), ModeKey)
 		_, _ = ctx.DB().DeleteFrom("seq").Where("`key`=?", "seq:robotEventSeq:"+robotID).Exec()
 	}
 	clean()
+	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
 	t.Cleanup(clean)
+}
+
+// TestNotActivatedDelegatesToLegacy is what makes deploying this change a no-op.
+//
+// Until an operator activates, every replica must behave exactly like the old
+// binary. If a deploy switched allocators on its own, the new replicas would issue
+// ids above the block that legacy replicas are still issuing from the bottom of,
+// and once a consumer's cursor reached the new range every legacy id behind it
+// would be permanently invisible — the loss of #697, caused by its fix.
+func TestNotActivatedDelegatesToLegacy(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_notactivated_bot"
+	fixture(t, ctx, client, robotID)
+	client.Del(ModeKey) // back to the pre-activation state
+
+	first, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	// GenSeq's first block for a brand-new key starts at 1000001; the counter would
+	// have produced 1. Asserting the shape rather than the exact number keeps this
+	// from breaking if octo-lib changes its base.
+	if first < 1000000 {
+		t.Fatalf("first id %d looks like a counter allocation; before activation it must come "+
+			"from GenSeq so the deploy is behaviour-neutral", first)
+	}
+	if n, _ := client.Exists(SeqKey(robotID)).Result(); n != 0 {
+		t.Error("the counter must not even be created before activation")
+	}
+}
+
+// TestActivationTakesEffectWithoutAProcessCacheWindow pins why the mode is read
+// inside the allocation script rather than cached.
+//
+// A per-process cache — even a one-second one — means that for that second some
+// replicas allocate from the counter while others still allocate from GenSeq. Two
+// live sources is the defect, so the flip has to be visible on the very next
+// allocation.
+func TestActivationTakesEffectWithoutAProcessCacheWindow(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_flip_bot"
+	fixture(t, ctx, client, robotID)
+	client.Del(ModeKey)
+
+	legacyID, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("pre-activation allocate: %v", err)
+	}
+
+	// Activate, with no restart and no cache invalidation of any kind.
+	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	activatedID, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("post-activation allocate: %v", err)
+	}
+	if n, _ := client.Exists(SeqKey(robotID)).Result(); n == 0 {
+		t.Fatal("the very next allocation after activation still used the legacy path")
+	}
+	if activatedID <= legacyID {
+		t.Fatalf("post-activation id %d must be above the last legacy id %d, or the events "+
+			"issued just before the flip land below the consumer's cursor", activatedID, legacyID)
+	}
+}
+
+// TestSeedClearsTheLegacyCeilingAtActivation is the deploy-time safety property:
+// the first activated id must clear everything legacy could have issued, including
+// a block it had reserved but not finished.
+func TestSeedClearsTheLegacyCeilingAtActivation(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_clearceiling_bot"
+	fixture(t, ctx, client, robotID)
+	client.Del(ModeKey)
+
+	// Let legacy issue a few ids and enqueue them, as it would have in production.
+	var lastLegacy int64
+	for i := 0; i < 3; i++ {
+		id, err := nextEventID(ctx, client, robotID)
+		if err != nil {
+			t.Fatalf("legacy allocate: %v", err)
+		}
+		client.ZAdd(QueueKey(robotID), rd.Z{Score: float64(id), Member: fmt.Sprintf(`{"event_id":%d}`, id)})
+		lastLegacy = id
+	}
+
+	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	first, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("activated allocate: %v", err)
+	}
+	if first <= lastLegacy+legacyGenSeqStep {
+		t.Fatalf("first activated id %d does not clear the legacy reserved block above %d; "+
+			"a block legacy reserved but did not finish issuing would overlap", first, lastLegacy)
+	}
 }
 
 func TestNextEventIDIsStrictlyMonotonicUnderConcurrency(t *testing.T) {
