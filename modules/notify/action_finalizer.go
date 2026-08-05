@@ -158,20 +158,11 @@ func truncRunes(s string, max int) string {
 	return s
 }
 
-// docsResultTemplateVersion 选择 same-version result edit 的目标版本
-// （PR-C D3/D7）：durable event 携带 stored card context 时，它是权威 exact
-// version —— Registry 帧的动作必须回到发送时的版本，绝不跟随常量或 active
-// pointer；context 声明了别的 template ID 则是路由错配，fail-close。
-// pre-registry 的 legacy event（零 context）保持 static V3 行为不变。
+// docsResultTemplateVersion resolves the click-driven result edit's target
+// version from the durable event's stored card context. The rules live in
+// docsResultVersion so the sibling mutate endpoint cannot drift from them.
 func docsResultTemplateVersion(event cardactiondispatch.Event) (string, error) {
-	if event.Card.TemplateID == "" && event.Card.TemplateVersion == "" {
-		return docsaccessrequest.TemplateVersionV3, nil
-	}
-	if event.Card.TemplateID != string(docsaccessrequest.TemplateID) ||
-		strings.TrimSpace(event.Card.TemplateVersion) == "" {
-		return "", errors.New("notify: stored card context does not identify docs.access-request")
-	}
-	return event.Card.TemplateVersion, nil
+	return docsResultVersion(event.Card.TemplateID, event.Card.TemplateVersion)
 }
 
 func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, event cardactiondispatch.Event,

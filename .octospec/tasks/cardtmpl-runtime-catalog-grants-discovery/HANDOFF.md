@@ -413,28 +413,41 @@ immediate denial after revoke — with production gates untouched.
 
 ### Slice 6 — verification, operations and PR closeout
 
-Documentation files:
+Landed (`docs: complete E3 PR-C rollout handoff`):
 
-- `[modify] docs/card-template-runtime-catalog-runbook.md` — grant/rollout
-  procedures, plus a note that `l2aOwnerAllowlist` (Registry registration) and
-  `approvedRuntimeOwners` (runtime publish/authorization) are intentionally
-  different lists: a grant for an unapproved runtime owner never enables send.
-- `[modify] docs/card-protocol.md` — §1 additive top-level
-  `template_ref`/`catalog_provenance`; state explicitly that the client render
-  gate still keys on `from_uid` only (provenance is server-side authorization
-  input, not a client rendering contract).
-- `[modify] docs/platform-card-base.md` — §9 actual B1/B2 fields and
-  authorization semantics; §10 new fail-close row for dynamic
-  unauthorized/blocked/DB-unavailable (no fallback-text degradation); §2.2-5
-  note that L2b threshold ④ is not advanced by PR-C.
-- `[modify] .octospec/tasks/cardtmpl-runtime-catalog/brief.md`
-- `[modify] .octospec/tasks/cardtmpl-runtime-catalog-grants-discovery/brief.md`
-- `[modify] this HANDOFF.md` with final SHAs, commands and evidence boundaries.
+- `[new] modules/notify/docs_result_version.go` — one rule for which version a
+  docs result edit renders at, shared by the click finalizer and the sibling
+  mutate endpoint. Closes review findings #1/#15: the two paths had drifted
+  (stored version vs hardcoded V3), which is invisible only while the registry
+  default happens to be V3. A marked `0.2.0` frame is now refused with the
+  reason — that version declares no `result` view, and nothing sends it — rather
+  than failing several layers down inside `ViewFor`.
+- `[modify] modules/notify/{action_finalizer.go,card_mutate_api.go}` — both call
+  the shared helper; the mutate path reads the identity off the frame it is
+  replacing instead of assuming a constant.
+- `[modify] modules/bot_api/card_template_runtime.go` — one nil-context guard up
+  front in `resolveBotGrantSpaceID` (review #11's inconsistency).
+- `[modify] docs/platform-card-base.md` — §9 rewritten to what shipped (B1/B2
+  fields, `action_contract` null semantics, visible ≠ sendable, private by
+  default, one not-found, opt-in samples, pagination/ETag rules); §10 gained the
+  three PR-C fail-closed rows; the L2b threshold ④ progress note now states
+  plainly that PR-C's grants are consumption-side and the threshold is still
+  unmet.
+- `[modify] docs/card-protocol.md` — §1 documents the two server-only markers
+  and their compatibility matrix; §4 gains the stored-provenance verification
+  layer.
+- `[modify] docs/card-template-runtime-catalog-runbook.md` — the two owner
+  allowlists are different on purpose and now say so; the PR-B "avoid consumed
+  template IDs" drill guidance is superseded, and the Bot manifest is
+  request-scoped.
+- `[new] .octospec/journal/shared/cardtmpl-runtime-catalog-grants-discovery.md`,
+  `[modify] .octospec/log.md`.
 
-Exit gate: focused and widened tests, race, build, vet, lint, i18n, source
-guards, real MySQL concurrency, dedicated non-production two-replica
-Redis/WuKongIM pilot, restart/DB-outage and rollback evidence are complete.
-The English PR body links this spec and answers COMPREHENSION; gates stay false.
+Deliberately not done, with reasons recorded in the journal: deduplicating
+`SpaceMiddleware`/`LocalizedSpaceMiddleware` and the two Space resolvers (the
+only difference is failure behaviour, and that difference is the point);
+`ReplaceView`'s extra `Snapshot` round trip; the double marshal in
+`validateCatalogMarkers`; and `action_contract` on B1's dynamic rows.
 
 ## Review and commit boundaries
 

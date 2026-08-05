@@ -4,6 +4,29 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-05 (cardtmpl-runtime-catalog-grants-discovery, roadmap E3 PR-C server)
+
+- **Feature** — Task `cardtmpl-runtime-catalog-grants-discovery`: closed the
+  authorization loop on the dynamic card-template catalog that PR-A/PR-B left
+  inert. Six ordered slices: trusted server-authored `catalog_provenance` on
+  dynamic frames (so historical edit and action-context stop guessing the
+  producer from `msg.FromUID`); a `card_template_grant` table with template-ID
+  `discover|send|edit`, exact-over-global precedence, revision CAS and
+  same-transaction audit; **one-snapshot authorization** — activation, block and
+  grant read in a single REPEATABLE READ transaction behind a store interface
+  the caller cannot pull apart, replacing three independent reads that could be
+  assembled from three points in time; a request-scoped Bot capability manifest
+  merging static policy with dynamic grants through the resolver the send path
+  also uses; B1/B2 discovery with visibility/grant filtering applied *before*
+  paging and one indistinguishable not-found for unknown/invisible/blocked; an
+  immutable safe export projection with per-artifact opt-in samples; and a
+  non-production `docs` pilot whose version preflight is a test-time assertion
+  rather than a runbook step. Fail-closed throughout: an ungranted, blocked or
+  unreadable dynamic version makes the whole template ID unsendable rather than
+  reverting to the static card of the same ID. Production gates keep their
+  `false` defaults; merging authorizes nothing. See the
+  [journal](journal/shared/cardtmpl-runtime-catalog-grants-discovery.md).
+
 ## 2026-07-31 (bot-events-longpoll)
 
 - **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):

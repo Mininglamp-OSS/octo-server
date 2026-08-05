@@ -81,6 +81,11 @@ func (p botCatalogPrincipal) catalogPrincipal() cardtmpl.CatalogPrincipal {
 //     earliest-joined one would silently move a producer's grants between
 //     tenants.
 func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (string, bool) {
+	// One guard up front rather than a mix of guarded and unguarded uses: a nil
+	// context has no signals at all, and "no signals" is a refusal.
+	if c == nil {
+		return "", false
+	}
 	if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
 		if v, ok := c.Get(CtxKeyAppBotSpaceID); ok {
 			if s, _ := v.(string); s != "" {
@@ -92,7 +97,7 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 	if querier == nil {
 		return "", false
 	}
-	if c != nil && c.Request != nil {
+	if c.Request != nil {
 		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {
 			authorized, err := querier.isBotSpaceAuthorized(robotID, hint)
 			if err != nil {

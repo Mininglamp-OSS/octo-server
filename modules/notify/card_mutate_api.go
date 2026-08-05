@@ -243,6 +243,12 @@ func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.Card
 	if storedDocID == "" || storedDocID != strings.TrimSpace(req.DocID) {
 		return fmt.Errorf("%w: document mismatch", errDocsSiblingContextInvalid)
 	}
+	// The version comes from the frame being replaced, exactly as the
+	// click-driven finalizer takes it from the stored card context.
+	version, err := docsResultVersionFromFrame(snapshot.Envelope)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDocsSiblingContextInvalid, err)
+	}
 	denied := req.Kind == DocsCardKindAccessDenied
 	fields, state, err := buildDocsAccessResultFields(env.Lang, docsResultRenderInput{
 		Data:             data,
@@ -260,5 +266,5 @@ func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.Card
 			SpaceID: req.SpaceID, ChannelID: req.ChannelID, ChannelType: req.ChannelType,
 		},
 		SenderUID: NotifyBotUIDValue, MessageID: req.MessageID, CardSeq: cardSeq,
-	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields, env)
+	}, docsaccessrequest.TemplateID, version, state, fields, env)
 }
