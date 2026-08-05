@@ -19,7 +19,7 @@
 CREATE TABLE IF NOT EXISTS `octo_bot_event_seq_state` (
   `singleton_id`  TINYINT UNSIGNED NOT NULL COMMENT '恒为1的单例键',
   `mode`          TINYINT          NOT NULL DEFAULT 0 COMMENT '0=legacy(GenSeq) 1=incr(Redis计数器)',
-  `epoch`         BIGINT UNSIGNED  NOT NULL DEFAULT 0 COMMENT '换代计数,operator CAS 递增;镜像据此判过期',
+  `epoch`         BIGINT UNSIGNED  NOT NULL DEFAULT 0 COMMENT '换代计数,operator CAS 递增;Redis 镜像值为 incr:{epoch},分配器据此拒绝陈旧/伪造镜像',
   `cutover_floor` BIGINT           NOT NULL DEFAULT 0 COMMENT '激活时校验过的号段下界',
   `updated_at`    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`singleton_id`),
@@ -33,5 +33,20 @@ VALUES (1, 0, 0, 0)
 ON DUPLICATE KEY UPDATE `singleton_id` = `singleton_id`;
 
 -- +migrate Down
+
+-- 拒绝在**已激活**状态下 drop 权威行(review P2-2)。
+--
+-- 一旦 mode=1，这张表就是唯一不随 Redis RDB 回滚的激活凭据：drop 掉它之后，
+-- ReadState 返回 ErrStateMissing、按设计被读方当作 legacy，于是任何一次镜像丢失都会让
+-- 分配器发出低于计数器已发号的 GenSeq id，落在活跃游标下方 —— #697 的镜像，由回滚本身
+-- 造成。这个 flip 在别处（tools/botevent-seq、pkg/botevent/seq.go）都写明不可逆，Down
+-- 也必须一致。
+--
+-- 手法：向单例表插入 singleton_id=2，只在 mode=1 时选出行。CHECK (singleton_id = 1)
+-- 于是报 3819 并中止整个 Down；mode=0 时 SELECT 无行，INSERT 是 no-op。用已有约束报错，
+-- 免得为一条条件判断建存储过程。
+-- 若确实要在激活后拆除，先人工把 mode 改回 0 并明白这意味着什么。
+INSERT INTO `octo_bot_event_seq_state` (`singleton_id`, `mode`, `epoch`, `cutover_floor`)
+SELECT 2, 0, 0, 0 FROM `octo_bot_event_seq_state` WHERE `singleton_id` = 1 AND `mode` = 1;
 
 DROP TABLE IF EXISTS `octo_bot_event_seq_state`;
