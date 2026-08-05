@@ -244,7 +244,7 @@ func (c *botCardTemplateCatalog) RenderPayload(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send")
+		inbound, env, c.sendAllowed, "not Bot-callable for new send", false)
 }
 
 func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
@@ -257,7 +257,7 @@ func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send")
+		inbound, env, c.sendAllowed, "not Bot-callable for new send", true)
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayload(
@@ -269,7 +269,7 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible")
+		inbound, env, c.editAllowed, "not edit-compatible", false)
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
@@ -282,7 +282,7 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 		return nil, errBotTemplateCatalogUnavailable
 	}
 	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible")
+		inbound, env, c.editAllowed, "not edit-compatible", true)
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -293,6 +293,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 	env cardtmpl.BuildEnv,
 	allowed map[botTemplateRef]struct{},
 	denialReason string,
+	authorProvenance bool,
 ) (map[string]any, error) {
 	if c == nil || c.catalog == nil {
 		return nil, errBotTemplateCatalogUnavailable
@@ -344,11 +345,21 @@ func (c *botCardTemplateCatalog) renderPayload(
 		}
 		return nil, fmt.Errorf("bot template render %s@%s: %w", ref.ID, ref.Version, err)
 	}
-	// Retain only the canonical ref as server-authored provenance. Raw Model B
-	// ingress rejects card+template_ref, so edit can distinguish a Registry frame
-	// from a caller-authored card that merely forged metadata.octo.template.
+	// Retain the canonical ref plus the authenticated-principal provenance as
+	// server-authored markers (PR-C D3). Raw Model B ingress rejects both keys,
+	// so edit/action ingress can trust a marked frame came from this boundary.
+	// env.SpaceID is server-resolved (send: resolveBotActiveSpaceID; edit: the
+	// Snapshot-pinned envelope Space) — callers never supply it.
 	rendered["template_ref"] = map[string]any{
 		"id": string(ref.ID), "version": ref.Version,
+	}
+	if authorProvenance {
+		rendered[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+			Version:       cardmsg.CatalogProvenanceVersion,
+			PrincipalType: cardmsg.CatalogPrincipalWireBot,
+			PrincipalID:   botID,
+			SpaceID:       env.SpaceID,
+		}.MarshalMap()
 	}
 	for _, key := range []string{"mention", "reply"} {
 		if value, ok := inbound[key]; ok {
@@ -440,7 +451,7 @@ func parseBotTemplateRef(value any) (botTemplateRef, error) {
 	return botTemplateRef{ID: cardtmpl.ID(id), Version: version}, nil
 }
 
-func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef) error {
+func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBotID string) error {
 	decoder := json.NewDecoder(bytes.NewReader(envelope))
 	decoder.UseNumber()
 	var payload map[string]any
@@ -459,6 +470,24 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef) error {
 	version, _ := template["version"].(string)
 	if id != string(want.ID) || version != want.Version {
 		return fmt.Errorf("%w: effective template mismatch", errBotTemplateRequestInvalid)
+	}
+	// PR-C D3：stored catalog_provenance 存在时必须是本 bot 署名的 canonical
+	// 标记，且声明的 Space 与信封自身一致 —— internal producer 的帧、别的 bot
+	// 的帧或被篡改的标记都不能经 Bot 模板编辑路径改写。缺失即 pre-PR-C 帧，
+	// 走既有兼容路径（Snapshot ownership 已保证 FromUID == 编辑 bot）。
+	markers, err := cardmsg.CatalogFrameMarkers(envelope)
+	if err != nil {
+		return fmt.Errorf("%w: effective catalog markers: %v", errBotTemplateRequestInvalid, err)
+	}
+	if markers.HasProvenance {
+		if markers.Provenance.PrincipalType != cardmsg.CatalogPrincipalWireBot ||
+			markers.Provenance.PrincipalID != editorBotID {
+			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
+		}
+		envelopeSpace, _ := payload["space_id"].(string)
+		if markers.Provenance.SpaceID != "" && markers.Provenance.SpaceID != envelopeSpace {
+			return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
+		}
 	}
 	return nil
 }

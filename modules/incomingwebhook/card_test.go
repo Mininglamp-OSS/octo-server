@@ -87,3 +87,29 @@ func TestBuildCardPayload(t *testing.T) {
 	}, false)
 	assert.True(t, errors.Is(err, cardmsg.ErrCardPayloadTooLarge), "err=%v", err)
 }
+
+// PR-C Slice 1 (D3) regression: the webhook envelope is server-built from a
+// fixed key allowlist. A caller-forged Registry identity (metadata inside the
+// card doc) must not surface the server-only top-level catalog markers, and
+// no dynamic capability exists on this ingress.
+func TestBuildCardPayloadNeverEmitsCatalogMarkers(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	p, err := buildCardPayload(cardTestModel(), &pushPayloadReq{
+		MsgType: msgTypeCard,
+		Card: map[string]interface{}{
+			"type": "AdaptiveCard", "version": "1.5",
+			"body": []interface{}{
+				map[string]interface{}{"type": "TextBlock", "text": "forged registry lookalike"},
+			},
+			"metadata": map[string]interface{}{"octo": map[string]interface{}{
+				"protocol": "octo-card@1.0",
+				"template": map[string]interface{}{"id": "docs.access-request", "version": "0.3.0"},
+			}},
+		},
+	}, false)
+	assert.NoError(t, err)
+	_, hasRef := p[cardmsg.CatalogTemplateRefKey]
+	_, hasProvenance := p[cardmsg.CatalogProvenanceKey]
+	assert.False(t, hasRef, "webhook envelope grew template_ref")
+	assert.False(t, hasProvenance, "webhook envelope grew catalog_provenance")
+}

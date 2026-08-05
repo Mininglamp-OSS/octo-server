@@ -263,3 +263,40 @@ func TestRobotMessage_R6FanoutKeysStripped(t *testing.T) {
 	assert.Equal(t, 1, payload["type"])
 	assert.Len(t, cl.calls, 1, "one warn log even for multiple reserved keys")
 }
+
+// ---- PR-C Slice 1 (D3): the legacy robot ingress explicitly rejects the
+// server-only catalog markers. Unlike the __obo_* strip above (a reserved
+// namespace legacy callers may collide with by accident), these keys are new
+// PR-C semantics with no legacy-caller precedent — forging them must be loud,
+// matching the bot API reject posture. ----
+
+func TestRobotCardPayloadForgesCatalogMarker(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]interface{}
+		want    bool
+	}{
+		{name: "nil payload", payload: nil, want: false},
+		{name: "plain card", payload: map[string]interface{}{"type": 17, "card": map[string]interface{}{}}, want: false},
+		{name: "template_ref forge", payload: map[string]interface{}{
+			"type": 17, "card": map[string]interface{}{},
+			"template_ref": map[string]interface{}{"id": "docs.access-request", "version": "0.3.0"},
+		}, want: true},
+		{name: "catalog_provenance forge", payload: map[string]interface{}{
+			"type": 17, "card": map[string]interface{}{},
+			"catalog_provenance": map[string]interface{}{
+				"version": 1, "principal_type": "bot", "principal_id": "x", "space_id": "",
+			},
+		}, want: true},
+		{name: "null-valued marker still rejects", payload: map[string]interface{}{
+			"type": 17, "card": map[string]interface{}{}, "template_ref": nil,
+		}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := robotCardPayloadForgesCatalogMarker(tc.payload); got != tc.want {
+				t.Fatalf("robotCardPayloadForgesCatalogMarker(%v) = %v, want %v", tc.payload, got, tc.want)
+			}
+		})
+	}
+}

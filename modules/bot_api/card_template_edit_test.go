@@ -80,7 +80,7 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	}
 	if err := requireEffectiveCardTemplate([]byte(request.ContentEdit), botTemplateRef{
 		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion,
-	}); err != nil {
+	}, "bot-template"); err != nil {
 		t.Fatalf("replacement identity: %v", err)
 	}
 }
@@ -123,7 +123,7 @@ func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testin
 			}
 			if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
 				ID: aireasoningprocess.TemplateID, Version: historical.version,
-			}); err != nil {
+			}, "bot-template"); err != nil {
 				t.Fatalf("historical replacement identity: %v", err)
 			}
 		})
@@ -539,4 +539,107 @@ func invokeTemplateEdit(t *testing.T, ba *BotAPI, body map[string]any) *httptest
 
 func cardtmplBuildEnvForTest() cardtmpl.BuildEnv {
 	return cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-1"}
+}
+
+// ---- PR-C Slice 1 (D3): Bot template edit re-authors the same-identity
+// provenance, rejects cross-principal stored frames, and raw edit cannot
+// forge or overwrite the server-only markers. ----
+
+func markedRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog, botID string) []byte {
+	t.Helper()
+	env := cardtmplBuildEnvForTest()
+	payload, err := catalog.RenderPayloadForPrincipal(context.Background(), botID, registrySendBody(t,
+		"reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload["space_id"] = env.SpaceID
+	payload["card_seq"] = int64(1)
+	if err := cardmsg.Finalize(payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestBotMessageEditRegistryTemplateReAuthorsSameProvenance(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutator := &fakeBotCardMutator{
+		snapshot:     carddispatch.CardMutationSnapshot{Envelope: markedRegistryEnvelope(t, catalog, "bot-template"), CardSeq: 1},
+		mutateResult: carddispatch.CardMutationResult{Applied: true},
+	}
+	ba := &BotAPI{
+		Log:           log.NewTLog("BotAPI-template-edit-provenance"),
+		cardTemplates: catalog,
+		cardMutator:   mutator,
+	}
+	recorder := invokeTemplateEdit(t, ba, registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	markers, err := cardmsg.CatalogFrameMarkers([]byte(mutator.mutateRequests[0].ContentEdit))
+	if err != nil {
+		t.Fatalf("replacement markers: %v", err)
+	}
+	if !markers.HasProvenance || markers.Provenance.PrincipalType != cardmsg.CatalogPrincipalWireBot ||
+		markers.Provenance.PrincipalID != "bot-template" {
+		t.Fatalf("replacement provenance = %+v", markers)
+	}
+	stored, err := cardmsg.CatalogFrameMarkers(mutator.snapshot.Envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markers.Provenance != stored.Provenance {
+		t.Fatalf("provenance changed across edit: stored=%+v replacement=%+v", stored.Provenance, markers.Provenance)
+	}
+}
+
+func TestBotMessageEditRegistryTemplateRejectsForeignStoredProvenance(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same template, but the stored frame is signed by a different principal.
+	// Even if a Snapshot ownership gap ever let the lookup succeed, the stored
+	// provenance must fail the edit closed.
+	envelope := markedRegistryEnvelope(t, catalog, "another-bot")
+	mutator := &fakeBotCardMutator{
+		snapshot:     carddispatch.CardMutationSnapshot{Envelope: envelope, CardSeq: 1},
+		mutateResult: carddispatch.CardMutationResult{Applied: true},
+	}
+	ba := &BotAPI{
+		Log:           log.NewTLog("BotAPI-template-edit-foreign"),
+		cardTemplates: catalog,
+		cardMutator:   mutator,
+	}
+	recorder := invokeTemplateEdit(t, ba, registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("foreign provenance edit status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(mutator.mutateRequests) != 0 {
+		t.Fatal("foreign provenance edit reached mutation")
+	}
+}
+
+func TestBotRawEditRejectsCatalogProvenanceMarkers(t *testing.T) {
+	// The raw-edit guard treats either server-only marker as Registry
+	// authorship: a target carrying only catalog_provenance is still not
+	// raw-editable, and a raw content_edit carrying it is a forgery.
+	if !cardEnvelopeHasTemplateRef([]byte(`{"type":17,"catalog_provenance":{"version":1}}`)) {
+		t.Fatal("provenance-marked target not recognized as Registry-authored")
+	}
+	if !contentEditHasTemplateRef(`{"type":17,"catalog_provenance":{"version":1,"principal_type":"bot","principal_id":"x","space_id":""}}`) {
+		t.Fatal("raw content_edit forging catalog_provenance not recognized")
+	}
+	if cardEnvelopeHasTemplateRef([]byte(`{"type":17,"card":{"body":[]}}`)) {
+		t.Fatal("legacy raw frame misclassified as Registry-authored")
+	}
 }

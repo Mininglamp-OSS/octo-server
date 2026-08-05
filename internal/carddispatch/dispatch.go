@@ -116,6 +116,23 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		return nil, categorized(terminal, validateErr)
 	}
 
+	// PR-C D3：可信派发边界从「已通过 cardmsg.Validate 的 metadata.octo.template」
+	// 与「已注册 ProducerSpec.ID + 已授权 target Space」为 Registry 产出的卡
+	// 写入 server-authored 顶层 catalog 标记。业务调用方只掌握 Card.Document
+	// （裸 card 节点），够不到信封顶层，因此无法自报 principal；无模板元数据的
+	// legacy 文档不写标记（principal 只能靠猜，宁缺毋假）。
+	if refID, refVersion, ok := cardDocumentTemplateContext(cardDocument); ok {
+		payload[cardmsg.CatalogTemplateRefKey] = map[string]interface{}{
+			"id": refID, "version": refVersion,
+		}
+		payload[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+			Version:       cardmsg.CatalogProvenanceVersion,
+			PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
+			PrincipalID:   string(s.spec.ID),
+			SpaceID:       target.SpaceID,
+		}.MarshalMap()
+	}
+
 	// Authorization has already established this exact active Space. It is the
 	// only source allowed to enrich the wire envelope.
 	payload["space_id"] = target.SpaceID
@@ -200,6 +217,23 @@ func validateRequest(ctx context.Context, target Target, card Card) error {
 		return errors.New("unsupported render profile")
 	}
 	return nil
+}
+
+// cardDocumentTemplateContext 从裸 card 节点提取 Registry 模板身份，语义与
+// cardmsg.CardTemplateContext（信封形态）一致：协议必须是 octo-card@1.0，
+// id/version 非空且已 trim；任何偏差都按「非 Registry 文档」处理（不写标记）。
+func cardDocumentTemplateContext(card map[string]interface{}) (string, string, bool) {
+	metadata, _ := card["metadata"].(map[string]interface{})
+	octo, _ := metadata["octo"].(map[string]interface{})
+	template, _ := octo["template"].(map[string]interface{})
+	protocol, _ := octo["protocol"].(string)
+	id, _ := template["id"].(string)
+	version, _ := template["version"].(string)
+	if protocol != "octo-card@1.0" || id == "" || version == "" ||
+		strings.TrimSpace(id) != id || strings.TrimSpace(version) != version {
+		return "", "", false
+	}
+	return id, version, true
 }
 
 func cardErrorCategory(err error) Category {

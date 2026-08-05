@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -221,10 +222,14 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 	cardSpaceID := m.resolveCardOriginSpaceID(msgM)
-	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardtmpl.CatalogAccess{
-		Purpose: cardtmpl.CatalogPurposeActionContext,
-		Principal: cardtmpl.CatalogPrincipal{
-			Kind: cardtmpl.CatalogPrincipalBot, ID: msgM.FromUID, SpaceID: cardSpaceID,
+	// PR-C D3：principal 从生效帧的 stored provenance 恢复并校验（sender/
+	// producer 绑定/Space 一致性都在 resolveRegistryCardContext 内 fail-close）；
+	// 无标记的 legacy 帧沿用 sender 派生的 bot principal（static 兼容）。
+	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardActionFrameOrigin{
+		SenderUID: msgM.FromUID,
+		SpaceID:   cardSpaceID,
+		ProducerBinding: func(producerID string) (string, bool) {
+			return carddispatch.ProducerBindingFromContext(m.ctx, carddispatch.ProducerID(producerID))
 		},
 	}, effective, req.ActionID, actionData)
 	if err != nil {
@@ -300,12 +305,29 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	c.Response(map[string]interface{}{"accepted": true, "replay": false})
 }
 
+// cardActionFrameOrigin carries the server-side facts a stored frame's
+// provenance is validated against: the stored sender, the card's
+// authoritative origin Space, and the read-only producer-binding resolver.
+// None of these values comes from the click request.
+type cardActionFrameOrigin struct {
+	SenderUID       string
+	SpaceID         string
+	ProducerBinding func(producerID string) (senderUID string, ok bool)
+}
+
 // resolveRegistryCardContext binds callback context to metadata and interaction
 // reports from the effective server-authored frame. Cards without octo-card
 // template metadata retain the legacy zero context.
+//
+// PR-C D3：帧携带 catalog_provenance 时，它是 principal 的唯一来源 —— 先证明
+// 与 stored sender（bot：principal_id==FromUID；internal producer：注册的
+// binding SenderUID==FromUID）及权威 Space 一致，才进入 catalog access 与
+// durable CardContext；任何畸形/不一致 fail-close。无 provenance 的帧（含
+// pre-PR-C 的 template_ref-only Bot 帧）保留 sender 派生的 legacy bot
+// principal，且绝不给 CardContext 发明 validated principal 字段。
 func resolveRegistryCardContext(
 	ctx context.Context,
-	access cardtmpl.CatalogAccess,
+	origin cardActionFrameOrigin,
 	effective []byte,
 	actionID string,
 	actionData map[string]interface{},
@@ -316,6 +338,29 @@ func resolveRegistryCardContext(
 			return cardactiondispatch.CardContext{}, errors.New("message: card template metadata is incomplete")
 		}
 		return cardactiondispatch.CardContext{}, nil
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(effective)
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	access := cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeActionContext,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: origin.SenderUID, SpaceID: origin.SpaceID,
+		},
+	}
+	var validated *cardactiondispatch.CardContext
+	if markers.HasProvenance {
+		principal, err := validatedFramePrincipal(origin, markers.Provenance)
+		if err != nil {
+			return cardactiondispatch.CardContext{}, err
+		}
+		access.Principal = principal
+		validated = &cardactiondispatch.CardContext{
+			PrincipalType: markers.Provenance.PrincipalType,
+			PrincipalID:   principal.ID,
+			SpaceID:       principal.SpaceID,
+		}
 	}
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
@@ -342,9 +387,50 @@ func resolveRegistryCardContext(
 			return cardactiondispatch.CardContext{}, errors.New("message: card template owner does not match action route owner")
 		}
 	}
-	return cardactiondispatch.CardContext{
+	cardContext := cardactiondispatch.CardContext{
 		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(resolved.View),
-	}, nil
+	}
+	if validated != nil {
+		cardContext.PrincipalType = validated.PrincipalType
+		cardContext.PrincipalID = validated.PrincipalID
+		cardContext.SpaceID = validated.SpaceID
+	}
+	return cardContext, nil
+}
+
+// validatedFramePrincipal 证明 stored provenance 与服务端事实一致后，返回
+// catalog principal。失败即篡改/配置漂移信号，一律 fail-close：
+//   - bot principal 必须等于存储行 FromUID（IM 连接鉴权绑定，不可伪造）；
+//   - internal producer 必须在 carddispatch 注册表中绑定到 FromUID；
+//   - provenance 声明的 Space 非空且权威来源 Space 非空时必须一致。
+func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.CatalogProvenance) (cardtmpl.CatalogPrincipal, error) {
+	principal, err := cardtmpl.CatalogPrincipalFromProvenance(provenance)
+	if err != nil {
+		return cardtmpl.CatalogPrincipal{}, err
+	}
+	switch principal.Kind {
+	case cardtmpl.CatalogPrincipalBot:
+		if principal.ID != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored bot provenance does not match message sender")
+		}
+	case cardtmpl.CatalogPrincipalInternalProducer:
+		if origin.ProducerBinding == nil {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: producer binding resolver unavailable")
+		}
+		boundSender, ok := origin.ProducerBinding(principal.ID)
+		if !ok || boundSender != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored producer provenance does not match registered sender")
+		}
+	default:
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: unsupported stored principal kind")
+	}
+	if principal.SpaceID != "" && origin.SpaceID != "" && principal.SpaceID != origin.SpaceID {
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
+	}
+	if principal.SpaceID == "" {
+		principal.SpaceID = origin.SpaceID
+	}
+	return principal, nil
 }
 
 var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")

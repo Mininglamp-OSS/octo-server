@@ -45,6 +45,7 @@
 package robot
 
 import (
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/obopayload"
 	"go.uber.org/zap"
 )
@@ -79,4 +80,24 @@ func sanitizeRobotIngressPayload(payload map[string]interface{}, channelID strin
 			zap.Int("stripped_count", stripped))
 	}
 	return stripped
+}
+
+// robotCardPayloadForgesCatalogMarker reports whether a robot-supplied
+// type-17 payload carries a server-only catalog marker (PR-C D3:
+// `template_ref` / `catalog_provenance`). These are authored exclusively by
+// the trusted Bot Registry and internal carddispatch boundaries; the legacy
+// robot ingress must REJECT them (loud 400-shaped false at the card gate),
+// deliberately diverging from the silent `__obo_*` strip above — the strip's
+// legacy-collision rationale does not apply to keys this PR introduces, and a
+// forged principal must never persist quietly. Presence alone rejects; shape
+// is irrelevant (a "well-formed" forgery is still a forgery).
+func robotCardPayloadForgesCatalogMarker(payload map[string]interface{}) bool {
+	if payload == nil {
+		return false
+	}
+	if _, exists := payload[cardmsg.CatalogTemplateRefKey]; exists {
+		return true
+	}
+	_, exists := payload[cardmsg.CatalogProvenanceKey]
+	return exists
 }

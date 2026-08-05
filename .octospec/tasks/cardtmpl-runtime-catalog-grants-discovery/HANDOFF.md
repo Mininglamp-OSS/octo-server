@@ -78,20 +78,34 @@ OpenClaw stop/retry implementation.
 Purpose: make principal/template/Space identity trustworthy before grants are
 introduced.
 
-Production files:
+Production files (ledger updated at Slice 1 GREEN, 2026-08-05 — the wire
+value object landed in `pkg/cardmsg` because `pkg/cardtmpl` imports
+`internal/carddispatch` (updater), so carddispatch could not import a
+cardtmpl-owned marker type without a cycle; envelope-level parsing also
+belongs with `CardTemplateContext`):
 
-- `[new] pkg/cardtmpl/provenance.go` — canonical marker type, strict parse,
-  clone/equality and dynamic validation helpers.
-- `[modify] pkg/cardtmpl/catalog.go` — carry validated provenance in exact/action
-  context without changing raw caller request shape.
-- `[modify] pkg/cardtmpl/updater.go` — Snapshot before dynamic ReplaceView/Append
-  and preserve exact identity.
-- `[modify] internal/carddispatch/types.go`
-- `[modify] internal/carddispatch/registry.go`
-- `[modify] internal/carddispatch/context.go`
-- `[modify] internal/carddispatch/dispatch.go`
-- `[modify] internal/carddispatch/mutation.go` — author producer-bound marker,
-  retain `template_ref`, and expose read-only binding/Snapshot facts.
+- `[new] pkg/cardmsg/provenance.go` — canonical marker wire type, strict
+  parse/marshal, `CatalogFrameMarkers` frame extraction with
+  `template_ref`↔`metadata.octo.template` cross-check, `Validate()`
+  defense-in-depth hook (see `[modify] pkg/cardmsg/validate.go`).
+- `[new] pkg/cardtmpl/provenance.go` — provenance→CatalogPrincipal mapping
+  (the only bridge from stored frames into authorization input).
+- `pkg/cardtmpl/catalog.go` — no change was needed; the mapping lives in
+  `pkg/cardtmpl/provenance.go` and access construction stays at call sites.
+- `[modify] pkg/cardtmpl/updater.go` — Snapshot before ReplaceView, stored
+  identity/Space pinning, marker preservation, provenance-derived edit
+  principal for both ReplaceView and Append.
+- `internal/carddispatch/types.go` / `mutation.go` — no change was needed:
+  markers are authored from already-validated card metadata (no new Card
+  field), and `Snapshot` already exposes the effective frame.
+- `[modify] internal/carddispatch/registry.go` — read-only
+  `ProducerBinding` fact table (disabled specs keep their identity binding;
+  duplicates/invalid shapes never bind).
+- `[modify] internal/carddispatch/context.go` — `ProducerBindingFromContext`
+  (never returns send capability).
+- `[modify] internal/carddispatch/dispatch.go` — author producer-bound
+  markers from `ProducerSpec.ID` + authorized target Space, only for
+  documents carrying validated Registry metadata.
 - `[modify] modules/bot_api/card_template_catalog.go`
 - `[modify] modules/bot_api/send.go` — author Bot marker and reject raw forgery
   on send/edit.
@@ -100,12 +114,18 @@ Production files:
   separate reject helper; do not reuse or change the semantics of the existing
   `__obo_*` silent-strip function (its file-header rationale does not apply to
   keys this PR introduces).
-- `[modify] modules/message/api_card_action.go`
+- `[modify] modules/message/api_card_action.go` — `cardActionFrameOrigin` +
+  `validatedFramePrincipal`; provenance-derived access with sender/binding/
+  Space consistency, legacy sender fallback for unmarked frames.
 - `[modify] internal/cardactiondispatch/contract.go` — persist validated
-  provenance in additive durable `CardContext` fields.
-- `[modify] modules/notify/card_via_registry.go`
-- `[modify] modules/notify/action_finalizer.go` — consume stored exact identity;
-  do not infer producer from sender/owner.
+  provenance in additive durable `CardContext` fields (the frozen
+  octo-card-v1 callback envelope does not grow the principal).
+- `modules/notify/card_via_registry.go` — no change was needed: its send
+  access is already the composition-injected internal producer, and markers
+  are authored inside `carddispatch.producerSender`.
+- `[modify] modules/notify/action_finalizer.go` — `docsResultTemplateVersion`
+  consumes the event's stored exact identity; foreign template IDs fail
+  closed; legacy zero-context events keep static V3.
 
 Focused tests extend the existing package suites:
 
@@ -127,8 +147,12 @@ Focused tests extend the existing package suites:
 - `modules/notify/card_via_registry_test.go`
 - `modules/notify/action_finalizer_v3_test.go`
 
-Add `[new] pkg/cardtmpl/provenance_test.go` only for the new value object's
-table-driven unit matrix. Do not create one new test file per attack case.
+Add `[new] pkg/cardmsg/provenance_test.go` (wire matrix) and
+`[new] pkg/cardtmpl/provenance_test.go` (principal mapping) only for the new
+value object's table-driven unit matrix. Do not create one new test file per
+attack case. `modules/message/api_card_p1_test.go` and the robot/user absolute
+rejection suites are MySQL/Redis-gated: their existing assertions are the
+regression coverage and must run in CI, not be reported green locally.
 
 Exit gate: raw Bot/robot/user/incoming-webhook forge, cross-bot,
 cross-producer, cross-Space, missing/malformed marker, `template_ref` mismatch

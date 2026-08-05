@@ -19,10 +19,12 @@ type captureViewUpdater struct {
 	state   cardtmpl.State
 	fields  json.RawMessage
 	env     cardtmpl.BuildEnv
+	calls   int
 }
 
 func (u *captureViewUpdater) ReplaceView(_ context.Context, target cardtmpl.UpdateTarget, id cardtmpl.ID,
 	version string, state cardtmpl.State, fields json.RawMessage, env cardtmpl.BuildEnv) error {
+	u.calls++
 	u.target, u.id, u.version, u.state, u.fields, u.env = target, id, version, state, fields, env
 	return nil
 }
@@ -198,5 +200,73 @@ func TestDocsActionFinalizerV3TruncatesOversizedDisplayFields(t *testing.T) {
 	}
 	if !mut.mutated {
 		t.Fatal("mutator was never called — terminal update did not persist")
+	}
+}
+
+// ---- PR-C Slice 1 (D3/D7): the finalizer's result edit pins the version the
+// event's stored frame actually used — never a hardcoded constant, never a
+// foreign template identity. ----
+
+func storedVersionFinalizerFixture(t *testing.T) (*captureViewUpdater, *DocsActionFinalizer, cardactiondispatch.Event, cardactiondispatch.DecisionResult) {
+	t.Helper()
+	wk := newWuKongServer()
+	t.Cleanup(wk.close)
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	updater := &captureViewUpdater{}
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, &captureCardMutator{}, &capturingCardSender{})
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 42, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
+		Data: map[string]any{"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap"},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateApproved,
+		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+	}
+	return updater, finalizer, event, result
+}
+
+func TestDocsActionFinalizerUsesEventStoredTemplateVersion(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	// A dynamic pilot frame stores its own exact version in the durable event.
+	event.Card = cardactiondispatch.CardContext{
+		TemplateID: string(docsaccessrequest.TemplateID), TemplateVersion: "0.4.0-test.1", View: "pending",
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if updater.version != "0.4.0-test.1" {
+		t.Fatalf("result edit version = %q, want the event's stored exact version", updater.version)
+	}
+	if updater.id != docsaccessrequest.TemplateID {
+		t.Fatalf("result edit template = %q", updater.id)
+	}
+}
+
+func TestDocsActionFinalizerLegacyEventKeepsStaticVersion(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	// Pre-registry durable events carry no card context.
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if updater.version != docsaccessrequest.TemplateVersionV3 {
+		t.Fatalf("legacy result edit version = %q, want %q", updater.version, docsaccessrequest.TemplateVersionV3)
+	}
+}
+
+func TestDocsActionFinalizerRejectsForeignStoredTemplate(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	event.Card = cardactiondispatch.CardContext{
+		TemplateID: "summary.completed", TemplateVersion: "0.1.0", View: "default",
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err == nil {
+		t.Fatal("foreign stored template identity finalized")
+	}
+	if updater.calls != 0 {
+		t.Fatalf("foreign identity still edited the card: %d calls", updater.calls)
 	}
 }
