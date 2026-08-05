@@ -11,30 +11,33 @@ import (
 	rd "github.com/go-redis/redis"
 )
 
-// The allocator's contract is about what two concurrent processes and one
-// exclusive cursor do to each other, so these tests run against a real Redis and
-// a real MySQL `seq` row rather than fakes. Fakes would restate the code.
+// These tests need a real MySQL and Redis: the contract is about what two
+// concurrent processes and one exclusive cursor do to each other, and a fake would
+// only restate the code.
 //
-// tools/genseq-repro holds the mirror image: the same assertions against the
-// legacy GenSeq allocator, which fail. Neither is meaningful without the other —
-// a lossless-delivery test that passes for both allocators is testing nothing.
-
-// These tests use a **dedicated database**, not the shared `test` one, and create
-// the `seq` table themselves.
+// They use the standard `test` database and create the `seq` table themselves.
+// `seq` is migration-owned (modules/common/sql/20211108000001_common_legacy01.sql)
+// and this package does not go through testutil.NewTestServer, so there is no
+// sql-migrate ledger here — a bare CREATE would normally leave a table that
+// `gorp_migrations` has no row for, and the next package's NewTestServer would die
+// with `Table 'seq' already exists`.
 //
-// That is not fastidiousness. `seq` is owned by a migration
-// (modules/common/sql/20211108000001_common_legacy01.sql), and this package does
-// not go through testutil.NewTestServer, so it has no sql-migrate ledger. Creating
-// the table bare in `test` would leave a table that `gorp_migrations` has no row
-// for, and the next package whose NewTestServer runs that migration would die with
-// `Table 'seq' already exists` — the exact failure mode that has most of
-// modules/message's DB tests skipped today.
-const defaultSeqTestDB = "root:demo@tcp(127.0.0.1:3306)/botevent_test?charset=utf8mb4&parseTime=true"
+// That is safe here specifically because CI drops and recreates `test` before
+// **every** package (.github/workflows/ci.yml), so nothing this package creates is
+// visible to the next one. Running several packages locally without that reset will
+// reproduce the `already exists` failure — reset between packages, as CI does.
+//
+// An earlier revision used a dedicated `botevent_test` database to dodge the issue.
+// That was worse: CI never creates it, so every one of these integration tests
+// silently Skipped there, which is indistinguishable from passing.
+//
+// tools/genseq-repro holds the mirror image of these assertions against the legacy
+// GenSeq allocator, where they fail. Neither is meaningful without the other.
 
 func testAddrs() (mysqlAddr, redisAddr string) {
 	mysqlAddr = os.Getenv("OCTO_TEST_MYSQL_ADDR")
 	if mysqlAddr == "" {
-		mysqlAddr = defaultSeqTestDB
+		mysqlAddr = config.New().DB.MySQLAddr
 	}
 	redisAddr = os.Getenv("OCTO_TEST_REDIS_ADDR")
 	if redisAddr == "" {
@@ -57,8 +60,7 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 		"`key` varchar(100) NOT NULL, `min_seq` bigint NOT NULL DEFAULT 0, " +
 		"`step` int NOT NULL DEFAULT 0, PRIMARY KEY (`key`)) " +
 		"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"); err != nil {
-		t.Skipf("no usable MySQL at %s (create the database first: "+
-			"CREATE DATABASE botevent_test): %v", mysqlAddr, err)
+		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
 
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})
@@ -82,6 +84,7 @@ func fixture(t *testing.T, ctx *config.Context, client *rd.Client, robotID strin
 	clean := func() {
 		client.Del(SeqKey(robotID), QueueKey(robotID), ModeKey)
 		_, _ = ctx.DB().DeleteFrom("seq").Where("`key`=?", "seq:robotEventSeq:"+robotID).Exec()
+		_, _ = ctx.DB().DeleteFrom("seq").Where("`key`=?", HighWaterSeqKey(robotID)).Exec()
 	}
 	clean()
 	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
@@ -234,8 +237,11 @@ func TestNextEventIDIsStrictlyMonotonicUnderConcurrency(t *testing.T) {
 	// Contiguity is not contractual, but a gap would mean something else is
 	// sharing this counter, which is worth knowing about.
 	if all[len(all)-1]-all[0] != int64(len(all)-1) {
-		t.Errorf("ids are not contiguous (%d..%d for %d allocations) — is another writer sharing %s?",
-			all[0], all[len(all)-1], len(all), SeqKey(robotID))
+		high, _ := highWaterCeiling(ctx, robotID)
+		t.Errorf("ids are not contiguous (%d..%d for %d allocations); rollbacksDetected=%d, "+
+			"durable high-water=%d — a gap means something re-seeded mid-run, which under "+
+			"pure concurrency it must not (see rollbackTolerance)",
+			all[0], all[len(all)-1], len(all), RollbacksDetected(), high)
 	}
 }
 
@@ -427,5 +433,153 @@ func TestExclusiveCursorIsLosslessWithMonotonicIDs(t *testing.T) {
 	if len(delivered) != int(total) {
 		t.Fatalf("exclusive cursor delivered %d of %d members; monotonic ids must make it "+
 			"lossless at any page size", len(delivered), total)
+	}
+}
+
+// TestCounterRollbackIsDetectedAndHealed is the review finding: co-recovery makes
+// ids unique across an RDB rollback but says nothing about consumer cursors, which
+// are external and do not roll back.
+//
+// Simulated by setting the counter back to an earlier value, which is what
+// restoring an older RDB snapshot does to it. The bug this locks is not the
+// regression itself — it is that a replica which has already seeded would keep
+// INCRing the regressed counter and quietly issue every subsequent id below the
+// cursor a client already holds.
+func TestCounterRollbackIsDetectedAndHealed(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_rollback_bot"
+	fixture(t, ctx, client, robotID)
+
+	// Issue enough ids to advance the durable mark at least once.
+	var highest int64
+	for i := 0; i < highWaterInterval+5; i++ {
+		v, err := nextEventID(ctx, client, robotID)
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		highest = v
+	}
+	mark, err := highWaterCeiling(ctx, robotID)
+	if err != nil {
+		t.Fatalf("read high-water: %v", err)
+	}
+	if mark == 0 {
+		t.Fatalf("durable high-water mark was never written after %d allocations; "+
+			"without it a rollback cannot be recovered from", highWaterInterval+5)
+	}
+
+	// The client has read up to `highest`. Now Redis loses data and comes back with
+	// an older counter — the queue would come back older too, but the client's
+	// cursor does not.
+	// Regress by more than rollbackTolerance: smaller regressions are deliberately
+	// indistinguishable from concurrent out-of-order arrival (see that constant).
+	regressedTo := highest - 3*rollbackTolerance
+	if regressedTo < 1 {
+		regressedTo = 1 // a counter is never negative; see gateNotActivated
+	}
+	if err := client.Set(SeqKey(robotID), regressedTo, 0).Err(); err != nil {
+		t.Fatalf("simulate rollback: %v", err)
+	}
+	before := RollbacksDetected()
+
+	next, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate after rollback: %v", err)
+	}
+	if RollbacksDetected() != before+1 {
+		t.Errorf("rollback was not detected (%d -> %d)", before, RollbacksDetected())
+	}
+	if next <= highest {
+		t.Fatalf("id %d after rollback is not above the %d already issued and possibly read; "+
+			"it would land below a live consumer cursor", next, highest)
+	}
+}
+
+// TestHighWaterNeverMovesBackwards pins the GREATEST in the durable write. An
+// unconditional overwrite is exactly how GenSeq lets a lagging replica drag a floor
+// backwards, which is the root cause of #697 — repeating it here would undo the fix.
+func TestHighWaterNeverMovesBackwards(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_highwater_bot"
+	fixture(t, ctx, client, robotID)
+
+	persistHighWater(ctx, robotID, 900000)
+	high, err := highWaterCeiling(ctx, robotID)
+	if err != nil || high == 0 {
+		t.Fatalf("first write did not land (high=%d err=%v)", high, err)
+	}
+
+	// A replica that is behind tries to persist a lower mark, as one would after a
+	// rollback or when running with a stale block.
+	lastPersisted.Delete(robotID)
+	persistHighWater(ctx, robotID, 1000)
+
+	after, err := highWaterCeiling(ctx, robotID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if after < high {
+		t.Fatalf("high-water mark moved backwards from %d to %d; a lagging writer must not "+
+			"be able to lower a floor (this is the #697 root cause)", high, after)
+	}
+}
+
+// TestSeedRecoversFromTheDurableMarkAlone isolates the durable source: no queue, no
+// legacy row, no counter — only the MySQL mark, which is the state left behind by a
+// Redis that lost everything.
+func TestSeedRecoversFromTheDurableMarkAlone(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_durableonly_bot"
+	fixture(t, ctx, client, robotID)
+
+	const mark = 777000
+	persistHighWater(ctx, robotID, mark)
+	// Everything Redis knew is gone.
+	client.Del(SeqKey(robotID), QueueKey(robotID))
+	ResetSeededForTest()
+	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	first, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if first <= mark {
+		t.Fatalf("first id %d after total Redis loss is not above the durable mark %d", first, mark)
+	}
+}
+
+// TestExpectedModeFailsClosedWhenModeIsLost covers the other half of the same
+// rollback: ModeKey also lives in Redis, and dropping to legacy would issue ids from
+// a lower GenSeq block — beneath live cursors, the same loss mirrored.
+func TestExpectedModeFailsClosedWhenModeIsLost(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_expectedmode_bot"
+	fixture(t, ctx, client, robotID)
+
+	if _, err := nextEventID(ctx, client, robotID); err != nil {
+		t.Fatalf("allocate while activated: %v", err)
+	}
+
+	// Redis loses the mode key while this replica expects to be activated.
+	client.Del(ModeKey)
+	restore := SetExpectedModeForTest(ModeIncr)
+	defer restore()
+
+	if _, err := nextEventID(ctx, client, robotID); err == nil {
+		t.Fatal("expected a lost mode key to fail closed when the replica expects incr, " +
+			"got nil error — falling back to legacy would issue ids below live cursors")
+	}
+
+	// With no expectation set, the same state is pre-activation and legacy is right.
+	restore()
+	ResetSeededForTest()
+	v, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("without an expectation, a missing mode must mean legacy: %v", err)
+	}
+	if v == 0 {
+		t.Fatal("legacy allocation returned 0")
 	}
 }

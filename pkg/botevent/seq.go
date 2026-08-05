@@ -31,20 +31,47 @@ package botevent
 // `INCR` on a single instance is strictly monotonic and never reuses a value, so
 // both invariants hold by construction rather than by assumption.
 //
-// The obvious objection is durability: production runs `appendonly no` with only
-// RDB snapshots (`save 3600 1 300 100 60 10000`), so a crash loses the last
-// 60–300 seconds and the counter moves backwards. That is safe **here** for a
-// specific reason: the counter and the queue it guards live in the same Redis
-// instance and therefore the same RDB domain. If the snapshot is at T0 with
-// counter `C0` and queue max score `S0 <= C0`, a crash restores both — the
-// members enqueued after T0 are gone along with the counter's advance, so
-// resuming from `C0+1` cannot collide with anything that survived.
+// The objection is durability: production runs `appendonly no` with only RDB
+// snapshots (`save 3600 1 300 100 60 10000`), so a crash loses the last 60–300
+// seconds and the counter moves backwards.
 //
-// **That argument is why the counter must stay in the same Redis instance and db
-// as the queue.** Moving it to a separate Redis, a separate db, or giving it its
-// own AOF for "durability" breaks the co-recovery property and reintroduces
-// exactly the collision class this package exists to remove. Adding replicas is
-// fine (counter and queue lag together); splitting them is not.
+// # Co-recovery guarantees uniqueness, NOT monotonicity (review finding)
+//
+// Being in the same Redis instance as the queue does buy something real: if the
+// snapshot is at T0 with counter `C0` and queue max `S0 <= C0`, a crash restores
+// both, so the members that could have collided are gone along with the counter's
+// advance. Resuming from `C0+1` therefore cannot produce a **duplicate**.
+//
+// It does NOT buy the other invariant, and an earlier revision of this comment
+// wrongly treated the two as one. **Consumer cursors are external state and do not
+// roll back with Redis.** A bot that read up to 49900 still holds 49900 after the
+// counter regresses to 49000, so ids 49001..49900 are re-issued *below* a live
+// cursor and are permanently invisible — #697 re-inflicted by a crash. On this
+// axis a bare INCR counter is strictly worse than GenSeq, whose `min_seq` lives in
+// MySQL and does not regress when Redis does.
+//
+// Two mechanisms close it, because neither suffices alone:
+//
+//   - **A durable high-water mark in MySQL** (`seq` row `botEventHigh:{robotID}`),
+//     advanced roughly every `highWaterInterval` ids and folded into every seed's
+//     floor. It does not share Redis's recovery domain, so it survives an RDB
+//     rollback. Persisting every id would be a DB write per allocation; persisting
+//     every ~1000 means the mark can trail the true maximum by at most that much,
+//     which `seedSafetyMargin` (2 × step) already covers.
+//   - **Rollback detection in the issuing process.** The durable mark only helps if
+//     something re-seeds, and a long-running replica would otherwise keep INCRing
+//     the regressed counter forever — its `seeded` entry is already set. So every
+//     allocation is compared against the last id this process issued for that bot;
+//     a value that did not advance means the counter regressed, and the allocation
+//     re-seeds and retries. That makes recovery automatic rather than a runbook.
+//
+// The high-water write uses `GREATEST(min_seq, VALUES(min_seq))`. It must: an
+// unconditional `ON DUPLICATE KEY UPDATE` is exactly how `GenSeq` lets a lagging
+// replica move a floor backwards, which is the root cause of #697. Repeating that
+// mistake in the mechanism meant to fix it would be quite something.
+//
+// The counter must still stay in the same Redis instance and db as the queue —
+// splitting them costs the uniqueness half of the argument above.
 //
 // Production also runs `maxmemory 0` / `noeviction`, so the counter cannot be
 // evicted under pressure — the failure mode that would otherwise make an `INCR`
@@ -85,6 +112,7 @@ package botevent
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +141,47 @@ const (
 	// ModeLegacy is the pre-activation state, written explicitly by the operator
 	// tool so preflight can tell "not yet activated" from "never configured".
 	ModeLegacy = "legacy"
+
+	// HighWaterKeyPrefix names the durable high-water row in the `seq` table.
+	//
+	// It reuses that table rather than adding one: the schema (`key`, `min_seq`) is
+	// exactly right, the seed already reads that table for the legacy ceiling, and
+	// it needs no migration. The key namespace is disjoint from GenSeq's
+	// (`seq:robotEventSeq:…`), so neither reads the other's rows.
+	HighWaterKeyPrefix = "botEventHigh:"
+
+	// ExpectedModeEnv makes a lost or rolled-back mode key fail closed instead of
+	// silently degrading to legacy.
+	//
+	// `ModeKey` lives in Redis, so it regresses under exactly the RDB rollback
+	// described above — and dropping to legacy then issues *lower* ids beneath live
+	// cursors, the same loss mirrored. Once activation is verified, roll this out as
+	// `incr` and a missing mode refuses the enqueue instead. Same shape as #627's
+	// OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE. Leave it unset until then: a replica
+	// expecting `incr` before the flip fails every enqueue closed.
+	ExpectedModeEnv = "OCTO_BOTEVENT_EXPECTED_MODE"
+
+	// highWaterInterval is how many ids may be issued between durable writes. One
+	// legacy block, so the mark trails the truth by less than seedSafetyMargin.
+	highWaterInterval = legacyGenSeqStep
+
+	// rollbackTolerance is how far below this process's high-water an allocation may
+	// land before it is treated as a counter regression rather than ordinary
+	// concurrency.
+	//
+	// A tolerance is unavoidable. `INCR` is atomic, but concurrent callers do not
+	// *observe* their results in issue order: with N allocations in flight, the
+	// caller holding 100 can reach the check after the caller holding 140. Comparing
+	// against the running maximum with no slack would flag that as a regression,
+	// re-seed, and jump the counter — which is what an earlier revision did, and the
+	// concurrency test caught it as a 6000-wide gap across 200 allocations.
+	//
+	// One legacy block of slack is far above any real in-flight count (bounded in
+	// practice by msgSem's 100 slots and the client pool) and far below a real
+	// rollback, which loses 60–300 seconds of a live queue's ids. The gap it leaves
+	// is a regression smaller than this bound: those go undetected here, and are
+	// corrected by the next seed, since every seed's floor includes the durable mark.
+	rollbackTolerance = legacyGenSeqStep
 
 	// QueueKeyPrefix is the authoritative per-bot event queue. Defined here so the
 	// producers and the consumer stop each spelling it with their own
@@ -144,6 +213,10 @@ func SeqKey(robotID string) string { return SeqKeyPrefix + robotID }
 // QueueKey returns the authoritative event queue key for robotID.
 func QueueKey(robotID string) string { return QueueKeyPrefix + robotID }
 
+// HighWaterSeqKey returns the `seq` table key holding robotID's durable
+// high-water mark. The `seq:` prefix matches how GenSeq namespaces its own rows.
+func HighWaterSeqKey(robotID string) string { return "seq:" + HighWaterKeyPrefix + robotID }
+
 // seedSource raises the counter to floor if it is currently lower or unset, and
 // returns the resulting value.
 //
@@ -174,6 +247,15 @@ var seedScript = rd.NewScript(seedSource)
 // while others still allocate from GenSeq: two live id sources, which is the
 // defect. Reading it inside the same script as the INCR makes a flip take effect
 // on the very next allocation, everywhere, with no window of divergence.
+// gateNotActivated is the sentinel gateSource returns when the mode does not match.
+//
+// It is distinguishable from any legitimate id because a seeded counter is never
+// negative: every floor is >= 0 and INCR only rises. Callers match it **exactly**
+// rather than testing `v < 0`, so a counter that somehow went negative (a manual
+// SET, a corrupted restore) surfaces as an error instead of being mistaken for
+// "not activated" and silently degrading to the legacy allocator.
+const gateNotActivated = -1
+
 const gateSource = `
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
 return redis.call('INCR', KEYS[2])`
@@ -241,7 +323,35 @@ var (
 	// observability work that owns that namespace, as bell.go notes for its own
 	// counter.
 	seedFailures atomic.Int64
+
+	// lastIssued is the highest id this process has handed out per bot. It is the
+	// rollback detector: Redis INCR cannot go backwards on its own, so an
+	// allocation that fails to advance past this means the counter regressed
+	// underneath us (an RDB-loss restart, or a flushed key).
+	lastIssued sync.Map
+
+	// seedLocks single-flights the seed per bot; see reseed.
+	seedLocks sync.Map
+
+	// lastPersisted tracks how far the durable high-water mark has been advanced,
+	// so the DB write happens once per highWaterInterval rather than per id.
+	lastPersisted sync.Map
+
+	// rollbacksDetected counts regressions caught and self-healed. Non-zero means
+	// Redis lost data; the events issued in the lost window are gone regardless,
+	// but delivery recovers without a runbook.
+	rollbacksDetected atomic.Int64
+
+	// expectedMode is read once. Re-reading os.Getenv per allocation would put a
+	// syscall on the hottest producer path for a value that cannot change.
+	expectedMode = strings.TrimSpace(os.Getenv(ExpectedModeEnv))
 )
+
+// SeedFailures reports how many allocations failed at the seed step.
+func SeedFailures() int64 { return seedFailures.Load() }
+
+// RollbacksDetected reports how many counter regressions were caught and healed.
+func RollbacksDetected() int64 { return rollbacksDetected.Load() }
 
 // SeqClient returns the shared allocator client, built through octoredis so TLS
 // options are honoured and pkg/redis's raw-client chokepoint guard stays
@@ -262,9 +372,6 @@ func SeqClient(cfg *config.Config) Scripter {
 	})
 	return seqClient
 }
-
-// SeedFailures reports how many allocations failed at the seed step.
-func SeedFailures() int64 { return seedFailures.Load() }
 
 // NextEventID allocates the next event id for robotID's queue.
 //
@@ -297,13 +404,10 @@ func nextEventID(ctx *config.Context, client Scripter, robotID string) (int64, e
 		if err != nil {
 			return 0, err
 		}
-		if v >= 0 {
-			return v, nil
+		if v == gateNotActivated {
+			return modeLost(ctx, robotID)
 		}
-		// Activated, then not: there is no supported deactivation, so this means
-		// the mode key was cleared out from under us. Legacy is the safe answer —
-		// it is what every other writer would now be doing too.
-		return legacyEventID(ctx, robotID)
+		return afterIssue(ctx, client, robotID, v)
 	}
 
 	mode, err := client.Get(ModeKey).Result()
@@ -311,26 +415,177 @@ func nextEventID(ctx *config.Context, client Scripter, robotID string) (int64, e
 		return 0, fmt.Errorf("botevent: read allocator mode: %w", err)
 	}
 	if mode != ModeIncr {
-		return legacyEventID(ctx, robotID)
+		return modeLost(ctx, robotID)
 	}
 
 	// Activated and this process has not seeded this bot yet. Seed before the
 	// first INCR, never after: an id handed out below the floor is exactly the
 	// unreachable-event bug.
-	if err := seedCounter(ctx, client, robotID); err != nil {
-		seedFailures.Add(1)
-		return 0, fmt.Errorf("botevent: seed event id counter for %q: %w", robotID, err)
+	if err := reseed(ctx, client, robotID); err != nil {
+		return 0, err
 	}
-	seeded.Store(robotID, struct{}{})
 
 	v, err := runGate(client, robotID)
 	if err != nil {
 		return 0, err
 	}
-	if v < 0 {
-		return legacyEventID(ctx, robotID)
+	if v == gateNotActivated {
+		return modeLost(ctx, robotID)
 	}
+	return afterIssue(ctx, client, robotID, v)
+}
+
+// afterIssue validates the freshly allocated id against what this process has
+// already issued, then advances the durable high-water mark.
+//
+// The check is the rollback detector. INCR is monotonic while the key survives, so
+// an id that does not advance can only mean the counter regressed beneath us — an
+// RDB-loss restart, a FLUSHDB, a manual DEL. Without this, a long-running replica
+// would keep INCRing the regressed counter and every id it issues would sit below
+// live consumer cursors, invisible, until the counter climbed back on its own.
+func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64) (int64, error) {
+	if prev, regressed := checkRegression(robotID, v); regressed {
+		rollbacksDetected.Add(1)
+		// Re-seed from the durable floor and retry once. One retry is enough: the
+		// seed raises the counter above the high-water mark, so the next INCR
+		// cannot land beneath it again unless Redis regresses a second time in
+		// between, which the next allocation would catch in turn.
+		seeded.Delete(robotID)
+		lastPersisted.Delete(robotID)
+		if err := reseed(ctx, client, robotID); err != nil {
+			return 0, err
+		}
+		retried, err := runGate(client, robotID)
+		if err != nil {
+			return 0, err
+		}
+		if retried == gateNotActivated {
+			return modeLost(ctx, robotID)
+		}
+		if retried <= prev {
+			// The floor did not clear the ids this process already handed out, so
+			// issuing would put an event below a cursor we know a client can hold.
+			// Refuse rather than lose it silently.
+			return 0, fmt.Errorf("botevent: counter for %q regressed to %d and re-seeding "+
+				"only reached %d, which is still at or below the %d already issued by this "+
+				"process; refusing to issue an id below a live consumer cursor",
+				robotID, v, retried, prev)
+		}
+		v = retried
+	}
+	recordIssued(robotID, v)
+	persistHighWater(ctx, robotID, v)
 	return v, nil
+}
+
+// checkRegression reports this process's high-water for robotID and whether v is
+// far enough below it to mean the counter regressed. See rollbackTolerance for why
+// "far enough" rather than "at all".
+func checkRegression(robotID string, v int64) (int64, bool) {
+	prev, ok := lastIssued.Load(robotID)
+	if !ok {
+		return 0, false
+	}
+	high := prev.(int64)
+	return high, v+rollbackTolerance <= high
+}
+
+// recordIssued advances this process's high-water monotonically.
+//
+// Compare-and-swap rather than a plain Store: concurrent callers arrive out of
+// order, and a Store would let a later-arriving lower id overwrite the maximum,
+// which would then make the *next* allocation look like a regression.
+func recordIssued(robotID string, v int64) {
+	for {
+		prev, loaded := lastIssued.Load(robotID)
+		if !loaded {
+			if _, already := lastIssued.LoadOrStore(robotID, v); !already {
+				return
+			}
+			continue
+		}
+		high := prev.(int64)
+		if v <= high {
+			return
+		}
+		if lastIssued.CompareAndSwap(robotID, high, v) {
+			return
+		}
+	}
+}
+
+// reseed seeds the counter and marks the bot seeded, counting failures.
+//
+// Single-flighted per bot, with a double check inside the lock. Concurrent first
+// allocations would otherwise each seed: the ones that lose the race run *after*
+// the winner has already issued ids and advanced the durable mark, so their floor
+// is computed from that mark and lands seedSafetyMargin above the live counter —
+// jumping it forward and burning a block of ids per racing caller. The seed is
+// still idempotent (the Lua only raises), so this is about not moving the counter
+// needlessly, not about correctness of a single seed.
+func reseed(ctx *config.Context, client Scripter, robotID string) error {
+	mu := seedMutex(robotID)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, done := seeded.Load(robotID); done {
+		return nil
+	}
+	if err := seedCounter(ctx, client, robotID); err != nil {
+		seedFailures.Add(1)
+		return fmt.Errorf("botevent: seed event id counter for %q: %w", robotID, err)
+	}
+	seeded.Store(robotID, struct{}{})
+	return nil
+}
+
+// seedMutex returns the per-bot seed lock, creating it once.
+func seedMutex(robotID string) *sync.Mutex {
+	if mu, ok := seedLocks.Load(robotID); ok {
+		return mu.(*sync.Mutex)
+	}
+	actual, _ := seedLocks.LoadOrStore(robotID, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
+
+// modeLost handles a mode key that is absent when the caller may have expected it.
+//
+// Unset expectation means pre-activation, and legacy is correct. An explicit
+// `incr` expectation means the mode was lost or rolled back after activation, and
+// legacy would then issue ids from a lower GenSeq block — beneath live cursors, the
+// same loss mirrored. Fail closed instead.
+func modeLost(ctx *config.Context, robotID string) (int64, error) {
+	if expectedMode == ModeIncr {
+		return 0, fmt.Errorf("botevent: %s=%s but %s is not %q; refusing to fall back to the "+
+			"legacy allocator, whose lower ids would land below live consumer cursors",
+			ExpectedModeEnv, expectedMode, ModeKey, ModeIncr)
+	}
+	return legacyEventID(ctx, robotID)
+}
+
+// persistHighWater advances the durable mark at most once per highWaterInterval.
+//
+// Best-effort on purpose: the id is already issued and the enqueue must not fail
+// because a bookkeeping write did. A missed write only shortens how far the mark
+// trails, which seedSafetyMargin absorbs.
+func persistHighWater(ctx *config.Context, robotID string, v int64) {
+	if prev, ok := lastPersisted.Load(robotID); ok && v-prev.(int64) < highWaterInterval {
+		return
+	}
+	// The mark records what has been issued, not a reservation above it. Writing
+	// `v + interval` would compound: every seed adds seedSafetyMargin on top of the
+	// mark, so a mark that already ran ahead would push the counter forward by
+	// interval + margin each time it was consulted.
+	mark := v
+	// GREATEST, never a bare assignment. An unconditional overwrite is precisely how
+	// GenSeq lets a lagging replica drag a floor backwards (the root cause of #697),
+	// and this row is a floor.
+	if _, err := ctx.DB().InsertBySql(
+		"insert into `seq`(`key`,min_seq,step) values(?,?,0) "+
+			"on duplicate key update min_seq = GREATEST(min_seq, VALUES(min_seq))",
+		HighWaterSeqKey(robotID), mark).Exec(); err != nil {
+		return
+	}
+	lastPersisted.Store(robotID, v)
 }
 
 // runGate performs the atomic mode-check-and-allocate. -1 means "not activated".
@@ -342,6 +597,10 @@ func runGate(client Scripter, robotID string) (int64, error) {
 	id, ok := v.(int64)
 	if !ok {
 		return 0, fmt.Errorf("botevent: allocate event id for %q: unexpected script result %T", robotID, v)
+	}
+	if id < gateNotActivated || id == 0 {
+		return 0, fmt.Errorf("botevent: counter for %q returned %d, which is neither a valid id "+
+			"nor the not-activated sentinel; refusing to issue it", robotID, id)
 	}
 	return id, nil
 }
@@ -366,7 +625,7 @@ func legacyEventID(ctx *config.Context, robotID string) (int64, error) {
 // seedCounter raises the counter above everything legacy could have handed out
 // for this bot.
 //
-// Both sources are needed. The queue's max score covers ids already enqueued —
+// Three sources are needed. The queue's max score covers ids already enqueued —
 // including by an old replica whose block sits above a regressed `min_seq`. The
 // `seq` row covers the opposite case: a bot whose queue has been fully acked (or
 // has expired) still has clients holding a cursor near the last id it was ever
@@ -381,9 +640,20 @@ func seedCounter(ctx *config.Context, client Scripter, robotID string) error {
 	if err != nil {
 		return err
 	}
+	// The durable mark is the only floor source that does not share Redis's
+	// recovery domain, so it is what makes a post-activation RDB rollback
+	// survivable. The other two both regress with the counter (queue) or stop
+	// advancing at activation (legacy row).
+	durableMax, err := highWaterCeiling(ctx, robotID)
+	if err != nil {
+		return err
+	}
 	floor := queueMax
 	if legacyMax > floor {
 		floor = legacyMax
+	}
+	if durableMax > floor {
+		floor = durableMax
 	}
 	if floor > 0 {
 		// A bot with no queue and no seq row has never been issued an id, so it
@@ -406,6 +676,22 @@ func queueCeiling(client Scripter, robotID string) (int64, error) {
 	return int64(top[0].Score), nil
 }
 
+// highWaterCeiling returns the durable high-water mark for this bot, or 0.
+//
+// Unlike the queue ceiling and the legacy row, this keeps advancing after
+// activation, which is what lets a seed recover from a Redis rollback.
+func highWaterCeiling(ctx *config.Context, robotID string) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("nil ctx, cannot read high-water mark")
+	}
+	var mark int64
+	if _, err := ctx.DB().Select("min_seq").From("`seq`").
+		Where("`key`=?", HighWaterSeqKey(robotID)).Load(&mark); err != nil {
+		return 0, fmt.Errorf("read high-water mark: %w", err)
+	}
+	return mark, nil
+}
+
 // legacyCeiling returns the legacy `GenSeq` block boundary for this bot's event
 // sequence, or 0 when it never used one.
 //
@@ -425,9 +711,20 @@ func legacyCeiling(ctx *config.Context, robotID string) (int64, error) {
 // ResetSeededForTest clears the process-local seed cache. Tests that seed against
 // different fixtures need it; production never does.
 func ResetSeededForTest() {
-	seeded.Range(func(k, _ interface{}) bool {
-		seeded.Delete(k)
-		return true
-	})
+	for _, m := range []*sync.Map{&seeded, &lastIssued, &lastPersisted, &seedLocks} {
+		m.Range(func(k, _ interface{}) bool {
+			m.Delete(k)
+			return true
+		})
+	}
 	seedFailures.Store(0)
+	rollbacksDetected.Store(0)
+}
+
+// SetExpectedModeForTest overrides the env-derived expectation and returns a
+// restore function.
+func SetExpectedModeForTest(mode string) func() {
+	prev := expectedMode
+	expectedMode = mode
+	return func() { expectedMode = prev }
 }
