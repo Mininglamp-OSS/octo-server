@@ -296,11 +296,13 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//     HMSET+EXPIRE 建 key(bucket.go),于是 live key 数 = 请求速率 × TTL(约 40s)。
 	//     只靠全局 per-IP 桶(1500 rps)兜底意味着最坏 6 万个 key,而生产 Redis
 	//     **未设 maxmemory**,没有 LRU 淘汰、OOM 直接被 OS kill。
-	//     这道 strict 桶把 key 生成速率从 1500/s 压到 10/s(40s 窗口内约 400 个),
+	//     这道 strict 桶把 key 生成速率从 1500/s 压到 100/s(40s 窗口内约 4000 个),
 	//     且必须排在 (1) **之前**——否则 key 已经建好了,挡也来不及。
 	//
-	//     参数是固定值而非热调:IP 层是防滥用底线,不需要按业务负载调整。10 rps /
-	//     burst 50 远高于实测正常量(单 IP register 约 1~2 rps,异常 bot 约 4 rps)。
+	//     参数走 env、不热调:IP 层是防滥用底线,不需要按业务负载反复收敛。
+	//     **但也不能按平峰量裁**:register 未被移出全局桶,所以它原本的上限就是全局的
+	//     1500 rps,而它同时是**自愈路径**——车队集体重连时压得太紧,就是在唯一要紧的
+	//     时刻限流恢复能力。定值理由见 ratelimit.go 的常量注释。
 	registerIPRPS, registerIPBurst := ipLimitParams(
 		envRegisterIPRPS, defaultRegisterIPRPS, envRegisterIPBurst, defaultRegisterIPBurst)
 	registerIPLimit := r.StrictIPRateLimitMiddleware(

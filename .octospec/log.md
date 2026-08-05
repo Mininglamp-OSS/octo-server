@@ -17,7 +17,13 @@ change-log convention (§7). Newest first.
   hot-tunable (lib's middlewares fix them at construction, which is what made
   the incident's own mitigation cost a 93-second oscillating rollout) and adds
   shadow mode so a candidate quota can be evaluated without touching clients.
-  Every layer ships `enabled=false` + `dry_run=true`. See
+  Every **per-bot** layer ships `enabled=false` + `dry_run=true`, so merging
+  changes no limiting behaviour. The two pre-auth per-IP floors are the exception
+  and are live on deploy — deliberately unswitchable, since a toggleable outer
+  layer would leave the excluded heartbeat endpoint unprotected while the inner
+  layer is off. Both were first sized at 2x the measured peak and revised upward
+  before opening the PR: that is how you size a *quota*, whereas a floor only has
+  to turn unbounded into bounded and needs an order of magnitude of headroom. See
   [journal](journal/shared/bot-api-per-bot-ratelimit.md).
 
 ## 2026-07-31 (bot-events-longpoll)

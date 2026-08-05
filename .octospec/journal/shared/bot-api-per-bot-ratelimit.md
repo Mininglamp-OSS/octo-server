@@ -147,6 +147,47 @@ under observation would stop being real.
   share the Redis bucket and each passes its own rps/burst to the script. Never
   sample verification data inside a rollout window; the transitional state is not
   the new configuration.
+- **A test helper that pre-drains a token bucket must stop the clock, not just
+  zero the tokens.** `drainIPBucket` wrote `tokens=0, ts=now`, and the bucket's Lua
+  computes `delta = max(0, now - ts)` then `filled = min(burst, tokens +
+  delta*rate)` — so the milliseconds between draining and issuing the request
+  refill it. At 100 rps that needs 10 ms and the helper looked fine; at 500 rps it
+  needs **2 ms**, less than the Redis and DB round trips in between, and the test
+  started failing intermittently. **The race pre-existed the sizing change; raising
+  the rate only widened the window enough to fire it** — which is the useful part,
+  because a latent millisecond race in a test helper presents as "the limiter
+  occasionally doesn't limit", the most misleading possible symptom. Fix: write
+  `ts` into the future, so `delta` is pinned at 0 regardless of the configured
+  rate.
+- **The same token bucket, used as a quota and used as a floor, must be sized by
+  different methods — and mixing them up produces an availability bug that looks
+  like diligence.** Both IP floors were first sized at twice the measured
+  single-IP peak (`register 10/50`, `heartbeat 100/300`), which is how you size a
+  *quota*: hug the observed traffic and converge from shadow data. A *floor* only
+  has to turn unbounded into bounded, so it wants an order of magnitude of
+  headroom. Sized as quotas, both were too tight in ways that contradicted this
+  change's own thesis: heartbeat had 2.2x headroom against a fleet whose
+  aggregate heartbeat rate is ~97 rps (2903 bots, 60s key TTL) with roughly half
+  of it behind one egress IP — one NAT consolidation from breaching, on the
+  endpoint whose 429 *is* the incident. And `register` — never excluded from the
+  global bucket, so its prior ceiling was the global 1500 rps — was tightened
+  150x **on the self-heal path**, which during a fleet-wide reconnect (the only
+  moment it matters) would drain 1450 bots at 10/s over ~140 seconds. Settled at
+  `100/500` and `500/1500`: still an order of magnitude below the global bucket,
+  still closing the keyspace-amplification hole (100 rps × ~40s TTL ≈ 4000 live
+  keys vs ~60000), but no longer shaping legitimate traffic. The generalisable
+  part: **what a floor blocks does not live near the measured volume, so sizing a
+  floor from measured volume buys nothing and costs availability.** Worth noting
+  how this surfaced: not from review of the limiter, but from the question "does
+  this have breaking changes?" — which forces you to write down the prior ceiling
+  next to the new one, and `1500 → 10` does not survive being written down.
+- **Tests must not couple themselves to quota values.**
+  `TestRegisterIPLimitBoundsKeyspaceGrowth` fired 200 requests to overrun a burst
+  of 50; raising the burst to 500 turned it red although the behaviour under test
+  had not changed. Rewritten to pre-drain and assert attribution via
+  `X-RateLimit-Scope`, it now verifies the claim that actually matters — the floor
+  is in `register`'s chain and rotating tokens cannot get around it —
+  independently of how the floor is sized.
 - **`CleanAllTables` does not clear Redis.** Three keyspaces need resetting in
   test setup (`ratelimit:bot:*` plus `ratelimit:strict:bot_register:*` and
   `ratelimit:strict:bot_heartbeat:*` — the latter two belong to the pre-auth IP

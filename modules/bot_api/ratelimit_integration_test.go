@@ -13,7 +13,6 @@ package bot_api
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -308,27 +307,36 @@ func TestRegisterLimitedByTokenFingerprint(t *testing.T) {
 // 于是 live key 数 = 请求速率 × TTL。生产 Redis **未设 maxmemory**（无 LRU 淘汰、
 // OOM 直接被 OS kill），所以这不只是"绕过限流"，是可被用来撑内存。
 //
-// register 前面那道 per-IP strict 桶就是堵这个的：即使每次换 token，
-// 同一 IP 的请求速率也被压到 10 rps，key 生成速率随之受限。
+// register 前面那道 per-IP strict 桶就是堵这个的：即使每次换 token，同一 IP 的请求
+// 速率也被压住，key 生成速率随之受限（100 rps × TTL 约 40s ≈ 4000 个，相对全局桶
+// 1500 rps 下最坏约 6 万个收敛一个量级）。
 //
-// 用例刻意**每次换一个新 token**——若 IP 层缺失，这些请求会全部穿透
-// （每个都是全新的桶、都有令牌），永远不会出现 429。
+// 用例刻意**每次换一个新 token**——这是要证明的核心：若 IP 层缺失，轮换 token 的请求
+// 会全部穿透（每个都是全新的桶、都有令牌），永远不会出现 429。
+//
+// **不靠"连打 N 次撞上限"来触发。** 初版写死 200 次,默认 burst 从 50 提到 500 后它就
+// 变红了——而被测行为一点没变,红的只是测试对配额数值的耦合。改为预抽干 IP 桶:
+// 断言的是"这道桶在 register 的链路上、且轮换 token 绕不过它",与配额取值无关。
 func TestRegisterIPLimitBoundsKeyspaceGrowth(t *testing.T) {
-	h, _ := setupRateLimitTest(t)
+	h, ctx := setupRateLimitTest(t)
 	// per-token 通道整个关掉，确保观察到的 429 只能来自 IP 层。
 	useParams(RateLimitParams{})
 
-	var got429 bool
-	for i := 0; i < 200; i++ {
-		token := fmt.Sprintf("bf_rotating_%d", i) // 每次都是新 token ⇒ 每次都是新桶
-		if botPost(t, h, "/v1/bot/register", token).Code == http.StatusTooManyRequests {
-			got429 = true
-			break
-		}
-	}
-	require.True(t, got429,
-		"轮换 token 的 register 洪水未被拦住——per-IP strict 桶缺失或参数过宽，"+
+	// 对照:桶未耗尽时,新 token 的 register 应当走到 handler 并被业务逻辑拒绝
+	// （token 查不到 ⇒ 400），而不是 429。这条让上面的断言可归因——
+	// 否则一个"永远 429"的实现也能让下面通过。
+	first := botPost(t, h, "/v1/bot/register", "bf_rotating_probe")
+	require.NotEqual(t, http.StatusTooManyRequests, first.Code,
+		"桶未耗尽时不应限流——否则是误伤,且下面的断言失去归因能力")
+
+	drainIPBucket(t, ctx, registerIPBucketKey(unknownIP))
+
+	limited := botPost(t, h, "/v1/bot/register", "bf_rotating_after_drain")
+	require.Equal(t, http.StatusTooManyRequests, limited.Code,
+		"轮换 token 的 register 洪水未被拦住——per-IP strict 桶缺失,"+
 			"攻击者可用随机 token 无界增长 Redis keyspace")
+	require.Equal(t, "strict:bot_register", limited.Header().Get("X-RateLimit-Scope"),
+		"429 应来自 per-token 桶之前的 strict IP 层（lib 中间件写的 scope）")
 }
 
 // TestRateLimitHotReload —— 热调无需重启。
@@ -463,28 +471,45 @@ func TestDryRunStillExecutesDecision(t *testing.T) {
 	require.True(t, found, "offenders 名单里应出现被影子拒绝的 bot %s，实际: %v", rlBotA, members)
 }
 
-// heartbeatIPBucketKey 是 heartbeat 鉴权前 IP 桶的 Redis key。
+// 鉴权前两道 strict IP 桶的 Redis key。
 // 前缀由 octo-lib 的 StrictIPRateLimitMiddleware 固定为 "ratelimit:strict:{tag}:"。
 func heartbeatIPBucketKey(ip string) string { return "ratelimit:strict:bot_heartbeat:" + ip }
+func registerIPBucketKey(ip string) string  { return "ratelimit:strict:bot_register:" + ip }
 
-// drainIPBucket 把某个 IP 的 strict 桶预先抽干（tokens=0），使下一次请求必然被拒。
+// unknownIP 是 lib 的 getClientIP 在拿不到客户端 IP 时的**失败闭合**取值。
+// httptest 构造的请求没有 RemoteAddr，也没设 X-Real-Ip，故 register 的桶落在这个 key 上。
+const unknownIP = "__unknown_ip__"
+
+// drainIPBucket 把某个 strict 桶预先抽干，使随后一小段时间内的请求必然被拒。
 //
-// 用预抽干而不是"连打几百次"：strict 桶是 100 rps / burst 300，靠真实请求打满既慢
-// （每次都要走 authBot 的 DB 查询）又不稳定（打的过程中 token 一直在回填）。
+// 用预抽干而不是"连打几百次"：靠真实请求打满既慢（每次都要走 DB 查询）又不稳定
+// （打的过程中 token 一直在回填）。更重要的是,**预抽干让测试不依赖具体配额值**——
+// 曾经有一条用例写死"打 200 次总能撞上限",默认 burst 从 50 调到 500 后它就变红了,
+// 而被测行为一点没变。
+//
+// **`ts` 必须写到未来,不能写"现在"。** 令牌桶（本仓与 octo-lib 同一份 Lua）算的是
+// `delta = math.max(0, now - ts)`、`filled = min(burst, tokens + delta*rate)`,
+// 所以 tokens=0 且 ts=now 时,抽干与真正发请求之间流逝的那几毫秒就会回填出令牌:
+// 500 rps 下只需 **2ms** 就有 1 个,而中间还夹着 Redis/DB 往返。第一版正是这么写的,
+// 于是速率从 100 提到 500 rps 后这条用例开始间歇性变红——**一个按毫秒计时的竞态,
+// 表现为"偶尔不限流"**。把 ts 推到未来则 delta 恒为 0,与配置的速率彻底无关。
+//
 // 桶的存储形状是 HMGET/HMSET 的 {tokens, ts}，见 pkg/ratelimit 的 Lua。
-func drainIPBucket(t *testing.T, ctx *config.Context, ip string) {
+func drainIPBucket(t *testing.T, ctx *config.Context, key string) {
 	t.Helper()
 	c := rd.NewClient(&rd.Options{
 		Addr:     ctx.GetConfig().DB.RedisAddr,
 		Password: ctx.GetConfig().DB.RedisPass,
 	})
 	defer c.Close()
-	now := float64(time.Now().UnixNano()) / float64(time.Second)
-	require.NoError(t, c.HMSet(heartbeatIPBucketKey(ip), map[string]interface{}{
+	// +5s 的余量:覆盖抽干到断言之间的全部往返(含 authBot 的 DB 查询),
+	// 又远短于桶的 TTL,不会泄漏到后续用例。
+	future := float64(time.Now().Add(5*time.Second).UnixNano()) / float64(time.Second)
+	require.NoError(t, c.HMSet(key, map[string]interface{}{
 		"tokens": 0,
-		"ts":     now,
+		"ts":     future,
 	}).Err())
-	require.NoError(t, c.Expire(heartbeatIPBucketKey(ip), time.Minute).Err())
+	require.NoError(t, c.Expire(key, time.Minute).Err())
 }
 
 func heartbeatFrom(t *testing.T, h http.Handler, token, ip string) *httptest.ResponseRecorder {
@@ -524,7 +549,7 @@ func TestHeartbeatUnauthenticatedFloodIsRateLimited(t *testing.T) {
 	require.NotEqual(t, http.StatusTooManyRequests, first.Code,
 		"桶未耗尽时不应限流——否则是误伤")
 
-	drainIPBucket(t, ctx, attackerIP)
+	drainIPBucket(t, ctx, heartbeatIPBucketKey(attackerIP))
 
 	limited := heartbeatFrom(t, h, rlUnknownTk, attackerIP)
 	require.Equal(t, http.StatusTooManyRequests, limited.Code,

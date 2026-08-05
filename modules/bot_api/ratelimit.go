@@ -86,19 +86,43 @@ const (
 // 所以 NaN 会穿过它的启动期 panic 校验直达 Lua、让所有算术与比较静默失效。
 // 故统一过 `ratelimit.SanitizeRPS/SanitizeBurst`——与 per-bot 层同一份逻辑。
 //
-// 默认值按生产实测:单 IP 的 register 峰值约 4.4 rps、heartbeat 合计约 45 rps
-// （一台机器多个 bot）,各留两倍余量;相对原先全局桶的 1500 rps 是显著收敛。
+// **默认值按「防滥用底线」定，不按实测流量的小倍数定。** 第一版犯的正是这个错：
+// 按单 IP 实测峰值（register ~4.4 rps、heartbeat ~45 rps）各留两倍余量，得出
+// 10/50 与 100/300。那是**配额**的定值方式，而这两道桶的职责只是"别让未鉴权流量
+// 无限打进来"，两者对余量的要求差一个量级：
+//
+//   - heartbeat：2903 个活跃 bot、心跳 key TTL 60s ⇒ 客户端至少每 60s 打一次，
+//     实际约 30s ⇒ **全车队心跳约 97 rps**。实测单 IP 45 rps 说明约半个车队挤在
+//     一个出网 IP 后面，那么 100 rps 的余量只有 2.2 倍——车队翻倍、或 NAT 收敛成
+//     单出口就顶满。**在一个"被 429 就是事故本身"的端点上留 2.2 倍余量方向是反的。**
+//   - register：它**没有**被移出全局桶，所以原上限是全局的 1500 rps；压到 10 rps
+//     是 150 倍收紧，而且落在**自愈路径**上。车队集体重连时（唯一真正要紧的时刻），
+//     1450 个 bot 里 burst 只放过前 50 个，其余按 10/s 排队要 140 秒——而客户端已知
+//     把 429 与 400 混在一套重试策略里。这条改动的核心论点是"凡是用于恢复的端点都
+//     必须在保命集合里"，按平峰量给它裁上限与该论点直接矛盾。
+//
+// 现值仍然显著收敛，且足以关掉它们各自要关的洞：
+//
+//   - register 100 rps：keyspace 放大的约束是**key 生成速率有界**，不是"贴着实测"。
+//     100 rps × TTL(约 40s) ≈ 4000 个 live key，相对全局 1500 rps 下最坏约 6 万个
+//     已收敛一个量级。（且 per-token 桶默认关闭时 Check 在碰 Redis 前就旁路，
+//     放大只在该通道开启后才存在。）burst 500 让集体重连在约 10 秒内排空。
+//   - heartbeat 500 rps：给全车队 97 rps 留 5 倍余量，同时仍比它原先所在的全局桶
+//     1500 rps 紧 3 倍。它要挡的是"无效 token 无限触发 authBot 的 DB 查询"，
+//     500 rps 完全够——那条路径的成本在 DB 往返，不在计数。
+//
+// 环境变量可就地收紧或放宽，无需改代码。
 const (
 	envRegisterIPRPS    = "OCTO_BOT_RATELIMIT_REGISTER_IP_RPS"
 	envRegisterIPBurst  = "OCTO_BOT_RATELIMIT_REGISTER_IP_BURST"
 	envHeartbeatIPRPS   = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_RPS"
 	envHeartbeatIPBurst = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_BURST"
 
-	defaultRegisterIPRPS   = 10.0
-	defaultRegisterIPBurst = 50
+	defaultRegisterIPRPS   = 100.0
+	defaultRegisterIPBurst = 500
 
-	defaultHeartbeatIPRPS   = 100.0
-	defaultHeartbeatIPBurst = 300
+	defaultHeartbeatIPRPS   = 500.0
+	defaultHeartbeatIPBurst = 1500
 )
 
 // ipLimitParams 读 env 并消毒。**刻意没有 enabled 开关**:per-bot 层默认关闭
