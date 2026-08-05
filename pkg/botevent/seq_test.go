@@ -1,9 +1,11 @@
 package botevent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -63,6 +65,14 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
 
+	if _, err := ctx.DB().Exec("CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
+		"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
+		"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
+		"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`singleton_id`)) " +
+		"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"); err != nil {
+		t.Skipf("cannot create %s at %s: %v", stateTable, mysqlAddr, err)
+	}
+
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})
 	if err := client.Ping().Err(); err != nil {
 		t.Skipf("no usable Redis at %s: %v", redisAddr, err)
@@ -85,12 +95,27 @@ func fixture(t *testing.T, ctx *config.Context, client *rd.Client, robotID strin
 		client.Del(SeqKey(robotID), QueueKey(robotID), ModeKey)
 		_, _ = ctx.DB().DeleteFrom("seq").Where("`key`=?", "seq:robotEventSeq:"+robotID).Exec()
 		_, _ = ctx.DB().DeleteFrom("seq").Where("`key`=?", HighWaterSeqKey(robotID)).Exec()
+		setStateMode(t, ctx, StateModeLegacy, 0)
 	}
 	clean()
+	// Activated state: the DB row is the authority, the Redis key only its mirror.
+	setStateMode(t, ctx, StateModeIncr, 0)
 	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
-		t.Fatalf("activate: %v", err)
+		t.Fatalf("write mode mirror: %v", err)
 	}
 	t.Cleanup(clean)
+}
+
+// setStateMode forces the authoritative state row, bypassing Activate's floor
+// validation. Tests that exercise Activate itself call it directly.
+func setStateMode(t *testing.T, ctx *config.Context, mode int, floor int64) {
+	t.Helper()
+	if _, err := ctx.DB().InsertBySql(
+		"insert into `"+stateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
+			"on duplicate key update `mode`=VALUES(`mode`), `cutover_floor`=VALUES(`cutover_floor`)",
+		stateSingletonID, mode, floor).Exec(); err != nil {
+		t.Fatalf("set state mode: %v", err)
+	}
 }
 
 // TestNotActivatedDelegatesToLegacy is what makes deploying this change a no-op.
@@ -104,7 +129,9 @@ func TestNotActivatedDelegatesToLegacy(t *testing.T) {
 	ctx, client := seqTestCtx(t)
 	robotID := "seqtest_notactivated_bot"
 	fixture(t, ctx, client, robotID)
-	client.Del(ModeKey) // back to the pre-activation state
+	// Pre-activation: authority says legacy, and the mirror is absent.
+	setStateMode(t, ctx, StateModeLegacy, 0)
+	client.Del(ModeKey)
 
 	first, err := nextEventID(ctx, client, robotID)
 	if err != nil {
@@ -133,6 +160,7 @@ func TestActivationTakesEffectWithoutAProcessCacheWindow(t *testing.T) {
 	ctx, client := seqTestCtx(t)
 	robotID := "seqtest_flip_bot"
 	fixture(t, ctx, client, robotID)
+	setStateMode(t, ctx, StateModeLegacy, 0)
 	client.Del(ModeKey)
 
 	legacyID, err := nextEventID(ctx, client, robotID)
@@ -141,6 +169,7 @@ func TestActivationTakesEffectWithoutAProcessCacheWindow(t *testing.T) {
 	}
 
 	// Activate, with no restart and no cache invalidation of any kind.
+	setStateMode(t, ctx, StateModeIncr, 0)
 	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
@@ -165,6 +194,7 @@ func TestSeedClearsTheLegacyCeilingAtActivation(t *testing.T) {
 	ctx, client := seqTestCtx(t)
 	robotID := "seqtest_clearceiling_bot"
 	fixture(t, ctx, client, robotID)
+	setStateMode(t, ctx, StateModeLegacy, 0)
 	client.Del(ModeKey)
 
 	// Let legacy issue a few ids and enqueue them, as it would have in production.
@@ -178,6 +208,7 @@ func TestSeedClearsTheLegacyCeilingAtActivation(t *testing.T) {
 		lastLegacy = id
 	}
 
+	setStateMode(t, ctx, StateModeIncr, 0)
 	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
@@ -537,6 +568,7 @@ func TestSeedRecoversFromTheDurableMarkAlone(t *testing.T) {
 	// Everything Redis knew is gone.
 	client.Del(SeqKey(robotID), QueueKey(robotID))
 	ResetSeededForTest()
+	setStateMode(t, ctx, StateModeIncr, 0)
 	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
@@ -562,7 +594,10 @@ func TestExpectedModeFailsClosedWhenModeIsLost(t *testing.T) {
 		t.Fatalf("allocate while activated: %v", err)
 	}
 
-	// Redis loses the mode key while this replica expects to be activated.
+	// Redis loses the mode key AND the authority says legacy, while this replica
+	// expects to be activated. (A lost mirror with an activated authority is the
+	// self-healing case, covered by TestMirrorRebuiltFromDBAuthority.)
+	setStateMode(t, ctx, StateModeLegacy, 0)
 	client.Del(ModeKey)
 	restore := SetExpectedModeForTest(ModeIncr)
 	defer restore()
@@ -581,5 +616,199 @@ func TestExpectedModeFailsClosedWhenModeIsLost(t *testing.T) {
 	}
 	if v == 0 {
 		t.Fatal("legacy allocation returned 0")
+	}
+}
+
+// TestCounterKeyCannotCollideWithModeKey pins the key-namespace fix.
+//
+// `SeqKeyPrefix` was `botEventSeq:` while `ModeKey` is `botEventSeq:mode`, so
+// SeqKey("mode") *was* ModeKey: a bot with that id would have seeded and INCRed the
+// global activation flag as its own counter. Unreachable with UUID-hex robot ids, but
+// a namespace where a legal input collides with a global key does not get to stay.
+func TestCounterKeyCannotCollideWithModeKey(t *testing.T) {
+	for _, robotID := range []string{"mode", "counter:mode", "", "counter", "mode:"} {
+		if got := SeqKey(robotID); got == ModeKey {
+			t.Errorf("SeqKey(%q) == ModeKey (%q): one bot's counter would be the global "+
+				"activation flag", robotID, ModeKey)
+		}
+		if got := SeqKey(robotID); got == HighWaterSeqKey(robotID) {
+			t.Errorf("SeqKey(%q) collides with its own durable mark key", robotID)
+		}
+	}
+	// And the inverse: the mode key must not be reachable as any counter key.
+	if strings.HasPrefix(ModeKey, SeqKeyPrefix) {
+		t.Errorf("ModeKey %q lives under the counter prefix %q, so some robotID reaches it",
+			ModeKey, SeqKeyPrefix)
+	}
+}
+
+// TestMissingCounterFailsBeforeIssuingFromOne is the EXISTS guard.
+//
+// INCR on a missing key returns 1. Before the guard, the only thing preventing an
+// unseeded INCR was `seeded` — a process-local map guarding Redis state — so a
+// partial restore or a stray DEL that took the counter but left the mirror, with the
+// process still up, renumbered that bot's events from 1: arbitrarily far below its
+// consumer's cursor, and needing the entire historical range re-issued before one
+// event became visible. Failing before issuing beats detecting afterwards.
+func TestMissingCounterFailsBeforeIssuingFromOne(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_counterlost_bot"
+	fixture(t, ctx, client, robotID)
+
+	var highest int64
+	for i := 0; i < 3; i++ {
+		v, err := nextEventID(ctx, client, robotID)
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		highest = v
+	}
+
+	// The counter vanishes; the mirror and this process's `seeded` entry survive.
+	if err := client.Del(SeqKey(robotID)).Err(); err != nil {
+		t.Fatalf("drop counter: %v", err)
+	}
+	before := CountersLost()
+
+	next, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate after counter loss: %v", err)
+	}
+	if CountersLost() != before+1 {
+		t.Errorf("counter loss was not detected (%d -> %d)", before, CountersLost())
+	}
+	if next <= highest {
+		t.Fatalf("id %d after counter loss is not above the %d already issued; INCR on a "+
+			"missing key returns 1, which is what the EXISTS guard exists to prevent", next, highest)
+	}
+}
+
+// TestMirrorRebuiltFromDBAuthority is why the state row exists.
+//
+// The mode mirror is in the same Redis as everything else, so it regresses with an
+// RDB snapshot. Before the state table, losing it dropped the allocator to legacy —
+// whose ids sit below everything the counter had issued, i.e. #697 mirrored. The DB
+// row now decides, and a lost mirror is rebuilt rather than obeyed.
+func TestMirrorRebuiltFromDBAuthority(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_mirror_bot"
+	fixture(t, ctx, client, robotID)
+
+	highest, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	// Redis loses the mirror. The authority still says activated.
+	if err := client.Del(ModeKey).Err(); err != nil {
+		t.Fatalf("drop mirror: %v", err)
+	}
+	before := MirrorRebuilds()
+
+	next, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate after mirror loss: %v", err)
+	}
+	if MirrorRebuilds() != before+1 {
+		t.Errorf("mirror was not rebuilt (%d -> %d)", before, MirrorRebuilds())
+	}
+	if next <= highest {
+		t.Fatalf("id %d after mirror loss is not above the %d already issued — the allocator "+
+			"degraded to legacy instead of consulting the authority", next, highest)
+	}
+	if v, _ := client.Get(ModeKey).Result(); v != ModeIncr {
+		t.Errorf("mirror was not restored (got %q)", v)
+	}
+}
+
+// TestActivateValidatesFloorAndIsIdempotent covers the operator-facing flip.
+func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_activate_bot"
+	fixture(t, ctx, client, robotID)
+	setStateMode(t, ctx, StateModeLegacy, 0)
+	client.Del(ModeKey)
+
+	// A floor at or below what has already been issued would put the first activated
+	// ids under cursors clients already hold.
+	if _, _, err := Activate(ctx, 5000, 5000); !errors.Is(err, ErrFloorTooLow) {
+		t.Fatalf("expected ErrFloorTooLow for floor == observed max, got %v", err)
+	}
+	if _, _, err := Activate(ctx, 4999, 5000); !errors.Is(err, ErrFloorTooLow) {
+		t.Fatalf("expected ErrFloorTooLow for floor < observed max, got %v", err)
+	}
+
+	flipped, epoch, err := Activate(ctx, 7001, 5000)
+	if err != nil || !flipped {
+		t.Fatalf("activate: flipped=%v epoch=%d err=%v", flipped, epoch, err)
+	}
+	st, err := ReadState(ctx)
+	if err != nil || !st.Activated() || st.CutoverFloor != 7001 {
+		t.Fatalf("state after activate: %+v err=%v", st, err)
+	}
+
+	// Idempotent: a second run reports no flip and no error.
+	again, sameEpoch, err := Activate(ctx, 9001, 5000)
+	if err != nil || again {
+		t.Fatalf("second activate should be a no-op: again=%v err=%v", again, err)
+	}
+	if sameEpoch != epoch {
+		t.Errorf("epoch changed on a no-op activate: %d -> %d", epoch, sameEpoch)
+	}
+	if st2, _ := ReadState(ctx); st2.CutoverFloor != 7001 {
+		t.Errorf("a no-op activate must not rewrite the floor (got %d)", st2.CutoverFloor)
+	}
+}
+
+// TestKnownResidualZaddReorderingCanStillSkip records a gap this change does NOT
+// close, so it is a fact in the suite rather than a claim in a PR description.
+//
+// Allocation and publication are two operations. A producer can allocate N, stall
+// (marshal, GC, a slow round trip), while another allocates N+1 and ZADDs — and the
+// doorbell wakes the consumer on precisely that ZADD. The consumer reads N+1, moves
+// its cursor there, and the first producer's ZADD then lands at N, below the cursor,
+// unreachable. Monotonic ids remove collisions and cross-restart inversions; they do
+// not remove this window, which needs a re-delivery window below the cursor
+// (see modules/bot_api/events.go's own note) and is tracked separately.
+//
+// This test asserts the loss still happens. If it starts failing, the residual has
+// been fixed and this test should become the regression test for that fix.
+func TestKnownResidualZaddReorderingCanStillSkip(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_residual_bot"
+	fixture(t, ctx, client, robotID)
+
+	stalled, err := nextEventID(ctx, client, robotID) // producer A allocates, then stalls
+	if err != nil {
+		t.Fatalf("allocate A: %v", err)
+	}
+	ahead, err := nextEventID(ctx, client, robotID) // producer B allocates and publishes
+	if err != nil {
+		t.Fatalf("allocate B: %v", err)
+	}
+	client.ZAdd(QueueKey(robotID), rd.Z{
+		Score: float64(ahead), Member: fmt.Sprintf(`{"event_id":%d,"from":"B"}`, ahead)})
+
+	// Consumer wakes on B's doorbell and advances its cursor.
+	page, err := client.ZRangeByScore(QueueKey(robotID), rd.ZRangeBy{
+		Min: "(0", Max: "+inf", Count: 20}).Result()
+	if err != nil || len(page) != 1 {
+		t.Fatalf("consumer read: page=%v err=%v", page, err)
+	}
+	cursor := ahead
+
+	// A's ZADD finally lands, below the cursor.
+	client.ZAdd(QueueKey(robotID), rd.Z{
+		Score: float64(stalled), Member: fmt.Sprintf(`{"event_id":%d,"from":"A"}`, stalled)})
+
+	after, err := client.ZRangeByScore(QueueKey(robotID), rd.ZRangeBy{
+		Min: fmt.Sprintf("(%d", cursor), Max: "+inf", Count: 20}).Result()
+	if err != nil {
+		t.Fatalf("consumer re-read: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("expected A's event to be unreachable below the cursor (the known residual), "+
+			"but the consumer saw %v — if the re-delivery window has landed, invert this test",
+			after)
 	}
 }

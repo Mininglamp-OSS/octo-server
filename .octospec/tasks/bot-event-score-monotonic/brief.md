@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: bot-event-score-monotonic"
-description: 把 robotEvent:{robotID} 的 score 从 octo-lib GenSeq（进程内 HiLo 块）换成严格单调分配器，使 POST /v1/bot/events 的排他游标分页无损；生产上乱序与碰撞均已实测发生，碰撞还会让 ack 误删未投递事件。核心迁移风险是新号段必须整体高于所有客户端已持有的旧游标。
+description: 把 robotEvent:{robotID} 的 score 从 octo-lib GenSeq（进程内 HiLo 块）换成严格单调分配器，消除排他游标下的碰撞与跨重启倒挂两类永久丢失；生产上两者均已实测发生，碰撞还会让 ack 误删未投递事件。不含 ZADD 重排窗口（见 Out of scope，独立 issue），故不得称为「使排他游标无损」。核心迁移风险是新号段必须整体高于所有客户端已持有的旧游标。
 tags: ["bot-api", "wire-contract", "observability", "testing", "commit"]
 timestamp: 2026-08-05T17:03:42+08:00
 # --- octospec extension fields ---
@@ -17,9 +17,14 @@ source: self
 
 ## Goal
 
-让 `robotEvent:{robotID}` 的 sorted-set score **严格单调、全局唯一**，从而使
-`POST /v1/bot/events` 的排他游标分页（`ZRANGEBYSCORE key (cursor +inf`，
-`modules/bot_api/events.go:251`）成为无损投递。
+让 `robotEvent:{robotID}` 的 sorted-set score **严格单调、全局唯一**，消除
+`POST /v1/bot/events` 排他游标分页（`ZRANGEBYSCORE key (cursor +inf`，
+`modules/bot_api/events.go:251`）下的两类永久丢失：**score 碰撞**与**跨重启的号序倒挂**。
+
+> **范围声明（review 2.3/2.4 要求）**：这**不等于**「排他游标从此无损」。分配与发布是两次
+> 操作，A 分配 `N` 后 stall、B 分配 `N+1` 并 ZADD 摇铃时，消费者的游标会越过 `N`。那个窗口
+> 本任务不修，见 Out of scope，并已被 `TestKnownResidualZaddReorderingCanStillSkip` 钉成
+> 测试事实。原文写「成为无损投递」是过度声称。
 
 **当前的缺陷**：score 来自 octo-lib `GenSeq`（`config/seq.go`），这是**进程内**
 HiLo 块分配器 —— `seqStep = 1000`，块缓存在包级 `seqMap`，只由进程内 mutex 保护，
@@ -79,7 +84,7 @@ PR #644·#648 把 `message_extra.version` 换成了事务性 per-channel 序列
 从来不在那个范围内，**激活 #627 的 cutover 对本路径零影响**。本任务不依赖 #627 的
 激活状态，也不改变它。
 
-**分配器选型（待人类确认）**：
+**分配器选型（已定，见 D1）**：
 
 | 方案 | 单调唯一 | 成本 | 备注 |
 |---|---|---|---|
@@ -127,6 +132,15 @@ PR #644·#648 把 `message_extra.version` 换成了事务性 per-channel 序列
   member 永不清理是另一个 bug，单独处置。
 - **bot 侧游标策略**。正确用法（`event_id=0` + 严格 ack，让 `ZREM` 而非游标定义进度）
   应写进文档并通知 bot 作者，但**不在本任务改任何 bot**。
+- **ZADD 重排窗口（review 2.3，已知 residual，需独立 issue）**。分配与发布是两次操作：
+  A 分配 `N` 后 stall（marshal / GC / 慢往返），B 分配 `N+1` 并 ZADD **且摇铃** → 消费者被
+  唤醒读到 `N+1`、游标推到 `N+1` → A 的 ZADD 才落在 `N`，永久不可达。**doorbell 让它更易
+  发生，不是更难** —— 唤醒正由造成倒挂的那次 ZADD 触发。单调 id 消掉的是碰撞与跨重启倒挂，
+  **不含这个窗口**；它需要游标下方的 re-delivery 窗口（`modules/bot_api/events.go:186-199`
+  自己就写了 "a Redis-side allocator **or** a re-delivery window"，本任务只交付了前者），
+  要改消费侧契约，属独立提案。已用 `TestKnownResidualZaddReorderingCanStillSkip` 把它钉成
+  测试事实而不是 PR 描述里的一句话 —— 那个测试断言「今天仍会丢」，将来修好了它会失败并提醒
+  改成回归测试。**因此本任务不得被描述为「使排他游标无损」。**
 - **重新设计 ack 协议 / 改成 stream（`XADD`）**。`XADD` 天然单调且有 consumer group，
   是更彻底的方向，但会改 wire 契约与所有 bot，属独立提案。
 - **octo-lib `GenSeq` 本身的修复**，以及**已确认的两个同类实例**（不是"待审计"，是
@@ -186,7 +200,13 @@ PR #644·#648 把 `message_extra.version` 换成了事务性 per-channel 序列
 
 ## Decisions（已定，附依据；无需再讨论除非依据被推翻）
 
-**D1. 分配器用 Redis `INCR`，per-bot key（`botevent:seq:{robotID}`）。**
+**D1. 分配器用 Redis `INCR`，per-bot key `botEventSeq:counter:{robotID}`。**
+
+> **更正**：本 brief 原写 `botevent:seq:{robotID}`，实现最初写成 `botEventSeq:{robotID}` ——
+> 而 `ModeKey` 是 `botEventSeq:mode`，于是 `SeqKey("mode")` **就等于** `ModeKey`：robotID 为
+> `mode` 的 bot 会把全局激活开关当自己的计数器 seed + INCR。UUID-hex 的 robotID 让它不可达，
+> 但「一个合法输入能撞上全局键」的命名空间不该留着。已加 `counter:` 段并加回归测试
+> （`TestCounterKeyCannotCollideWithModeKey`）。讽刺的是 brief 原来的拼写本来不会撞。
 
 原先把它列为待决，是因为「Redis 持久化丢失导致计数器回退」这个风险的强度取决于生产
 配置 —— 那是事实问题，不是偏好问题，已查清（生产 Redis，只读 `CONFIG GET` / `INFO`）：
@@ -227,6 +247,25 @@ max score（否则某个高 score 队列的客户端游标会把新号段整体�
 
 **D1 的「no fallback」与此不冲突，但必须分清**：未激活 → 走 legacy，这是**设计的模式**；
 已激活但 Redis 失败 → 返回错误、拒绝入队，**不**偷偷回退 GenSeq。
+
+**D6.（review 后新增）激活状态的权威在 MySQL，Redis 只是镜像 —— 对齐 #627，但不照搬。**
+
+只把 mode 放 Redis 是错的：生产 `appendonly no`，RDB 回滚会让它退回，而**丢失后降级回
+legacy 会发出低于计数器已发出号的 id**，落在活跃游标下方，正是 #697 的镜像。
+
+- 权威：`octo_bot_event_seq_state`（singleton：`mode`/`epoch`/`cutover_floor`），
+  `FOR UPDATE` 的 CAS flip + `ErrFloorTooLow` 的 floor 校验，形状与
+  `octo_message_extra_version_state` 一致
+- 镜像：Redis `botEventSeq:mode`，**唯一目的**是让 mode 能与 `INCR` 在同一个 Lua 里原子读取
+  （热路径不能加 DB 往返）
+- 镜像丢失 → 分配器读权威行；权威说已激活就**重建镜像 + 重新 seed 并继续**（自愈），说
+  legacy 才走 legacy，读不到则按 expected-mode 决定 fail-closed 还是当作未迁移
+
+**刻意不复用 #627 的 `FOR SHARE` drain barrier**：那个 barrier 要求每个写入方在业务事务内
+持状态行锁到 commit，而 `robotEvent` 的写入是 `INCR` + `ZADD` 纯 Redis，**没有 commit 可持**；
+为借用它而给每次分配包一个事务，等于把分配器要避免的「每条消息一次 DB 往返」原样请回来。
+**代价必须写在纸上**：本方案在 flip 瞬间无法 drain 在途写入方，只能靠「运维先确认无旧副本」
++ flip 前后短暂停写。
 
 **D3. 现存碰撞 member 不重编号**（详见 Open questions 1 —— 这是唯一需要人类签字的一条，
 因为它是唯一涉及写生产数据的选项）。
@@ -293,3 +332,42 @@ seed 必须读 producer 写的同一个 key，硬编码分散是真实风险。�
    所以基线要在修复上线前后各取一次。
 
    如果你倾向重编号，我需要额外的授权范围（写哪个队列、是否停写窗口）和一个回滚快照方案。
+
+
+## 第二轮实现记录（review 之后，2026-08-05）
+
+两位 reviewer 独立指出 co-recovery 论证「只证唯一性、不证相对游标的单调性」，据此加了 D6
+与 durable high-water。实现过程中被测试推翻的、以及 review 抓到的，逐条记下：
+
+1. **回退检测在并发下误判**。`INCR` 原子，但并发调用者**不按发号顺序观察结果** —— 拿到 100
+   的可能比拿到 140 的更晚到达检查点。无容差比较把普通并发判成回退，并发测试暴露为「200 次
+   分配跨度 6000」。加 `rollbackTolerance`（一个 legacy block：远高于真实在飞数，远低于真实
+   回退幅度）+ CAS 维护最大值。**代价写明**：小于该容差的回退检测不到，靠下次 seed 修。
+2. **并发首次分配各自 seed**。后到者在赢家已发号并推进高水位之后才算 floor，于是 floor 落在
+   活跃 counter 之上，每个竞争者烧掉一个号段。改为 per-bot 单飞 + 双检。
+3. **高水位写的是 `v + interval` 而非 `v`**，与 seed margin 叠加放大跳变。
+4. **gate 哨兵用 `v < 0` 判断**，于是变负的 counter 会被读成「未激活」而静默降级。改为精确
+   匹配；加第二个哨兵后又漏改这处校验，被测试再抓一次。
+5. **缺 `EXISTS` 守卫**（review 2.2）。`INCR` 在缺失键上返回 **1**，而唯一的阻挡是 `seeded`
+   —— **进程内状态守着 Redis 状态**。mirror 存活、counter 被删、进程不重启，该 bot 的事件会
+   从 1 重新编号，比快照回滚更糟（回滚一个窗口后自愈，这个要重发完整个历史号段才有一个事件
+   可见）。加 `-2` 哨兵，**发号前**失败而不是发完再检测。
+6. **`ModeKey` 与合法 counter key 碰撞**（见 D1 更正）。
+7. **写侧计数器接了 Prometheus，不留 follow-up**。原打算沿用 `bell.go` 把 metric 归给 G1
+   的先例，但那条先例适用的是**门铃丢失**（代价有界：一个 chunk 的延迟）。这四个计数器
+   （回退 / counter 丢失 / 镜像重建 / 高水位写失败）是四个**自愈**机制的唯一可见性 ——
+   自愈意味着没有 error、没有失败入队、没有可告警的日志，不接就等于 RDB 安全边界静默退化。
+   用 `promauto` 注册到 default registry（同 `pkg/i18n/details.go`、`modules/oidc/metrics.go`），
+   无 label（brief 要求低基数），`healCounter` 同时保留一个 atomic 供测试断言，避免生产
+   代码依赖 `prometheus/testutil`。
+8. **`afterIssue` 与 `mirrorMissing` 互相递归无界**（自审发现，非 reviewer）。Redis 反复丢
+   状态时会栈溢出 —— **进程崩溃**，比丢一个事件严重。加 `maxAllocAttempts = 3` 并把尝试
+   计数穿过所有自愈路径。
+9. **测试库判断反复了一次**：为避开污染改用独立库 `botevent_test`，**错得更隐蔽** —— CI 从不
+   创建它，于是所有集成测试在 CI 里静默 `Skip`，与通过无法区分。已改回 `test` 库；CI 每包前
+   `DROP/CREATE test` 才是让这里裸建 migration 表安全的前提。
+
+**验证**（按 `.github/workflows/ci.yml` 的方式：`-race -shuffle=on` + 每包前重置库）：
+`pkg/botevent`（28 测试）、`pkg/redis`、`modules/robot`、`modules/group`、`modules/bot_api`、
+**`modules/message`**（brief 点名、上一轮漏跑，review 抓到）全绿；migration 经真实
+sql-migrate 应用（`gorp_migrations` 有记录、状态表已建）。
