@@ -147,9 +147,10 @@ func QueueKey(robotID string) string { return QueueKeyPrefix + robotID }
 // seedSource raises the counter to floor if it is currently lower or unset, and
 // returns the resulting value.
 //
-// Idempotent by construction, which is what lets the fix ship as a single-stage
-// deploy: every replica seeds on its own first use for a given bot, in any order,
-// any number of times, and they all converge. `SET` has no `GT` option in Redis
+// Idempotent by construction: every replica seeds on its own first use for a given
+// bot, in any order, any number of times, and they all converge. That is what lets
+// activation be a single flip rather than a coordinated restart — but it does NOT
+// make the *deploy* safe on its own; see the activation-gate note above. `SET` has no `GT` option in Redis
 // (`GT`/`LT` belong to `EXPIRE` and `ZADD`), so the compare and the write have to
 // share one script to be atomic against a concurrent seeder.
 const seedSource = `
@@ -197,17 +198,33 @@ type Scripter interface {
 	ScriptLoad(script string) *rd.StringCmd
 }
 
-// Unlike the doorbell, this is not best-effort: a failed allocation must fail the
-// enqueue, so the timeouts trade a little more patience for not dropping events.
-// They stay bounded because `saveRobotMessage` allocates inside a `msgSem` slot,
-// where a slow call stalls fan-out for every bot in the process — the same reason
-// the ring is asynchronous. Worst case here is ~3s (1s × 1 try + 2 retries),
-// which is the same order as the DB round trip GenSeq used to make.
+// Unlike the doorbell, this is not best-effort: a failed allocation fails the
+// enqueue. But it cannot be patient either, and the reason is the one that forced
+// the ring off the producer's goroutine in the first place.
+//
+// `saveRobotMessage` allocates inside a `msgSem` slot (capacity 100), held on the
+// listener goroutine. Anything that slows it down holds a slot longer, and once all
+// 100 are held, message fan-out stalls for **every bot in the process** — including
+// bots that never send an interactive card. So a degraded Redis must cost this call
+// ~1s, not ~3s.
+//
+// The trade is explicit: giving up fails one enqueue (one event, recoverable by a
+// D8 re-tap or a resend), while waiting stalls fan-out for everyone. One retry, not
+// two, for the same reason the ring uses none — a retried allocation is an
+// allocation that took twice as long.
+//
+// This is also a real change in I/O shape versus GenSeq and belongs in the review
+// record, not a footnote: GenSeq served 999 of every 1000 allocations from its
+// process-local block with **no I/O at all**, while every allocation here is a Redis
+// round trip. It cannot be batched back into blocks without recreating #697 (a block
+// is a second id source), and the mode cannot be cached without recreating the
+// mixed-source window (reviewer P0). Load-test the hottest producer before
+// activation, not after.
 const (
-	seqDialTimeout = time.Second
-	seqReadTimeout = time.Second
-	seqPoolTimeout = 500 * time.Millisecond
-	seqMaxRetries  = 2
+	seqDialTimeout = 500 * time.Millisecond
+	seqReadTimeout = 300 * time.Millisecond
+	seqPoolTimeout = 200 * time.Millisecond
+	seqMaxRetries  = 1
 )
 
 var (
