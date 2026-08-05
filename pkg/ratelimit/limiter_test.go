@@ -126,7 +126,7 @@ func TestSanitizeRPS(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			require.Equal(t, c.want, sanitizeRPS(c.in, fallback))
+			require.Equal(t, c.want, SanitizeRPS(c.in, fallback))
 		})
 	}
 }
@@ -134,9 +134,9 @@ func TestSanitizeRPS(t *testing.T) {
 // TestSanitizeBurst：burst<=0 会让桶永远填不进 1 个 token，同样等于 100% 拒绝。
 func TestSanitizeBurst(t *testing.T) {
 	const fallback = 42
-	require.Equal(t, 100, sanitizeBurst(100, fallback))
-	require.Equal(t, fallback, sanitizeBurst(0, fallback))
-	require.Equal(t, fallback, sanitizeBurst(-5, fallback))
+	require.Equal(t, 100, SanitizeBurst(100, fallback))
+	require.Equal(t, fallback, SanitizeBurst(0, fallback))
+	require.Equal(t, fallback, SanitizeBurst(-5, fallback))
 }
 
 // TestObserverReceivesBypassed 确认旁路也会上报——运维需要能从指标上区分

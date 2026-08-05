@@ -751,3 +751,57 @@ exclude 之后就存在一个完全无防护的未鉴权端点。参数按实测
   真打既慢(每次走 authBot 的 DB 查询)又不稳(打的过程中一直在回填)。
 - 两条都做了**负向验证**:把 IP 桶挪到 `authBot` 之后,两条同时变红。
 - `TestHeartbeatBucketStillEnforcesLimit` 的注释已改写,明确它只覆盖鉴权后那一半。
+
+## 两道 per-IP 桶：用 lib 中间件 + env（定稿，经两次反转）
+
+### 先分清目标与对价
+
+**本任务的目标是 per-bot 限流**——按 bot 身份分配额，消除「同出网 IP 的 bot 共享一份
+配额」这个事故成因。三条 per-bot 通道（business / heartbeat / register）是目标本体。
+
+而两道鉴权前的 IP 桶**不是目标**，是两处不得不付的对价：
+
+- `register` 跑在 `authBot` **之前**，没有 bot 身份。token 指纹能挡「失效 token 重试
+  风暴」，但它是客户端提供的值——换 token 即换桶，而令牌桶首次判定就建 Redis key，
+  于是轮换 token 会按请求速率造 key。需要一层不依赖客户端提供值的兜底。
+- `heartbeat` 移出全局 per-IP 桶后（否则邻居饿死它），鉴权前完全无防护——per-bot 桶
+  挂在 `authBot` 之后，无效 token 在鉴权里就 abort。
+
+鉴权前唯一可用的维度是 IP。所以这**不是「回到 IP 维度」**，是「那个阶段只有 IP」。
+
+### 两次反转的判据（记下来，因为每次的理由都不完整）
+
+> 这一节记的是**设计过程**，不是提交历史——中间那两版都已 squash，`git log` 里找不到
+> `clientip.go` 也找不到 4 项 IP 配置。保留它的理由:被推翻的那两个论证本身有信息量。
+
+1. **第一版：lib 中间件 + env。** 理由是自建要复制 lib 未导出的 `getClientIP`，
+   两份实现分叉会「让全局桶与这两道桶对同一请求算出不同 key」。
+2. **第二版：自建 Limiter + system_setting。** 上面那个理由被推翻——两道桶与全局桶
+   是**独立 keyspace**、不共享 token，分叉只导致本桶分片不精确（有界），
+   而 env 要滚动重启、正是二次事故的抖动成因。
+3. **定稿：回到 lib 中间件 + env。** 判据不是技术对错，而是**目标边界**：
+   自建换来的是「参数热调 + 配置统一 + 观测统一」，代价是复制未导出逻辑、
+   **偏离 `rate-limit` 规则明文的第二条**（未鉴权路由挂 `StrictIPRateLimitMiddleware`）、
+   以及约 180 行新基础设施（`clientip.go` 及其测试）。
+   **为一个非目标的对价引入新基础设施、并加重规则偏离，不划算。**
+   IP 底线是防滥用阈值，不像 per-bot 配额需要按影子数据反复收敛，env 够用。
+
+> 第 2 版曾引入 `pkg/ratelimit/clientip.go`（存在的唯一理由就是让 IP 层能自建）
+> 与 `system_setting` 的 4 项 IP 配置,定稿时一并移除。后者尤其要移干净:
+> **留着不生效的配置项比没有更糟**——管理台能改但不生效是最坏的一种。
+
+净结果:规则偏离收窄到**只剩一条**（per-bot 不用 `SharedUIDRateLimiter`），
+那一条论证干净、落在已有 Exception 内、有 incomingwebhook 先例。
+
+### 顺带补上 octo-lib 的一个校验缺口
+
+`ParseRPSFromEnv` 底层是 `strconv.ParseFloat`,**会原样接受 `"NaN"`/`"+Inf"`**;
+而 lib 的 `newKeyedLimiter` 启动期只检查 `rps <= 0` 就 panic——**`NaN <= 0` 为 false**,
+所以 `NaN` 会穿过那道校验直达令牌桶 Lua,让其中所有算术与比较静默失效。
+
+故 env 值统一过 `ratelimit.SanitizeRPS/SanitizeBurst`（为此从 `pkg/ratelimit` 导出,
+两层共用同一份消毒逻辑）。`TestIPLimitParamsSanitizesEnv` 覆盖
+`NaN/±Inf/0/-1/abc` 全部回退 + 合法值仍生效（否则消毒会退化成「永远忽略 env」,
+那么「改 configmap 就能调」的前提也不成立）。
+守卫 `TestHeartbeatIPLimitPrecedesAuth` 追加断言:参数必须经 `ipLimitParams`,
+不得直接把 `ParseRPSFromEnv` 的结果交给 lib。

@@ -301,14 +301,17 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//
 	//     参数是固定值而非热调:IP 层是防滥用底线,不需要按业务负载调整。10 rps /
 	//     burst 50 远高于实测正常量(单 IP register 约 1~2 rps,异常 bot 约 4 rps)。
+	registerIPRPS, registerIPBurst := ipLimitParams(
+		envRegisterIPRPS, defaultRegisterIPRPS, envRegisterIPBurst, defaultRegisterIPBurst)
 	registerIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
-		"bot_register", defaultRegisterIPRPS, defaultRegisterIPBurst)
+		"bot_register", registerIPRPS, registerIPBurst)
 	r.POST("/v1/bot/register",
 		registerIPLimit,
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.register },
 			func(c *wkhttp.Context) string { return botTokenFingerprint(extractBotToken(c)) },
+			"bot",
 		),
 		ba.register)
 
@@ -326,9 +329,11 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//     面因为 exclude 反而被打开。这一层**没有 enabled 开关**，因为 (3) 默认关闭。
 	// (2) authBot + botActorUID —— 鉴权并落 bot 身份。
 	// (3) per-bot 桶 —— 防单个已鉴权 bot 滥用；可热调、可影子、默认关闭。
+	heartbeatIPRPS, heartbeatIPBurst := ipLimitParams(
+		envHeartbeatIPRPS, defaultHeartbeatIPRPS, envHeartbeatIPBurst, defaultHeartbeatIPBurst)
 	heartbeatIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
-		"bot_heartbeat", defaultHeartbeatIPRPS, defaultHeartbeatIPBurst)
+		"bot_heartbeat", heartbeatIPRPS, heartbeatIPBurst)
 	r.POST("/v1/bot/heartbeat",
 		heartbeatIPLimit,
 		ba.authBot(),
@@ -336,6 +341,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.heartbeat },
 			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+			"bot",
 		),
 		ba.heartbeat)
 
@@ -354,6 +360,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		ba.rateLimitMiddleware(
 			func(l *botRateLimiters) *ratelimit.Limiter { return l.business },
 			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+			"bot",
 		),
 	)
 	{

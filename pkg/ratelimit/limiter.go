@@ -145,8 +145,8 @@ func (l *Limiter) Check(key string) Result {
 		return Result{Outcome: OutcomeBypassed}
 	}
 
-	rps := sanitizeRPS(p.RPS, l.fallback.RPS)
-	burst := sanitizeBurst(p.Burst, l.fallback.Burst)
+	rps := SanitizeRPS(p.RPS, l.fallback.RPS)
+	burst := SanitizeBurst(p.Burst, l.fallback.Burst)
 
 	br := l.b.allow(key, rps, burst)
 

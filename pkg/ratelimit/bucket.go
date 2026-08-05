@@ -151,24 +151,27 @@ func (b *bucket) allow(key string, rps float64, burst int) bucketResult {
 	}
 }
 
-// sanitizeRPS 是**读侧防御**：配置值再怎么校验，也可能被直接改库、或被 env 绕过
+// SanitizeRPS 是**读侧防御**：配置值再怎么校验，也可能被直接改库、或被 env 绕过
 // 写侧校验（`ParseRPSFromEnv` 底层是 strconv.ParseFloat，会原样接受 "NaN"/"+Inf"）。
 //
 // 非法值必须回退到一个**合法且仍然限流**的值，绝不能退化成「放行」：
 //   - rps <= 0 会让上面的 Lua 走 `rate <= 0` 分支 → 100% 拒绝（不是放行，但等于
 //     把整条路由打死）；
+//   - **NaN 尤其危险**：octo-lib 的 `newKeyedLimiter` 只检查 `rps <= 0`，而
+//     `NaN <= 0` 为 false，所以 NaN 会穿过它的启动期 panic 校验直达 Lua。
+//     导出本函数正是为了让走 lib 中间件的调用方也能补上这道消毒；
 //   - NaN 会让 Lua 的算术全部变 NaN，比较失败，行为不可预测。
 //
 // 两者都不可接受，故一律回退到 fallback（由调用方给出代码默认值）。
-func sanitizeRPS(v, fallback float64) float64 {
+func SanitizeRPS(v, fallback float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
 		return fallback
 	}
 	return v
 }
 
-// sanitizeBurst 同 sanitizeRPS。burst <= 0 会让桶永远填不进 1 个 token → 100% 拒绝。
-func sanitizeBurst(v, fallback int) int {
+// SanitizeBurst 同 SanitizeRPS。burst <= 0 会让桶永远填不进 1 个 token → 100% 拒绝。
+func SanitizeBurst(v, fallback int) int {
 	if v <= 0 {
 		return fallback
 	}

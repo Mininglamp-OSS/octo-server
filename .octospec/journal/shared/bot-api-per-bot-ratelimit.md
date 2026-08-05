@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: bot-api-per-bot-ratelimit (issue #696)"
-description: Moves bot rate limiting off the client-IP axis onto bot identity, and gives the two self-heal channels — heartbeat and register — quotas of their own. The production incident was not a bot starving itself but a bot starved by a co-located neighbour sharing one per-IP bucket; the follow-on incident showed that protecting heartbeat alone still leaves the bot unable to get back up, because the reconnect path itself was rate limited. Buckets are self-built so quotas are hot-tunable and can run in shadow mode; every layer ships disabled by default.
+description: Moves bot rate limiting off the client-IP axis onto bot identity, and gives the two self-heal channels — heartbeat and register — quotas of their own. The production incident was not a bot starving itself but a bot starved by a co-located neighbour sharing one per-IP bucket; the follow-on incident showed that protecting heartbeat alone still leaves the bot unable to get back up, because the reconnect path itself was rate limited. The three per-bot buckets are self-built so quotas are hot-tunable and can run in shadow mode; the two pre-auth IP floors mount octo-lib's strict middleware instead, because they are the price of the change rather than its goal. Every per-bot layer ships disabled by default.
 tags: ["bot-api", "rate-limit", "throttle", "wire-contract", "observability", "testing"]
 timestamp: 2026-08-05T08:00:00Z
 # --- octospec extension fields ---
@@ -61,16 +61,30 @@ up. Preserving the ability to notice you are down, without preserving the
 ability to get up, ends in the same place. The general lesson: **every endpoint
 that exists to recover from failure belongs in the protected set.**
 
-**Buckets are self-built rather than octo-lib's.** lib's middlewares fix
-rps/burst at construction, so changing a quota requires a rolling restart — and
-the incident's own mitigation (500 → 1500) demonstrated the cost: during the
-93-second rollout, old and new replicas shared one Redis bucket while passing
-different parameters to the Lua script, limiting behaviour oscillated, and a bot
-was kicked inside that window. Any new bucket that could only be retuned by
+**The three per-bot buckets are self-built; the two pre-auth IP floors are not.**
+lib's middlewares fix rps/burst at construction, so changing a quota requires a
+rolling restart — and the incident's own mitigation (500 → 1500) demonstrated the
+cost: during the 93-second rollout, old and new replicas shared one Redis bucket
+while passing different parameters to the Lua script, limiting behaviour
+oscillated, and a bot was kicked inside that window. A per-bot quota is exactly
+the kind of number that will be retuned from shadow data, so binding it to a
 restart would clone that failure mode. `modules/incomingwebhook`'s per-webhook
 bucket had already walked this path (three-tier settings, read per request,
 read-side sanitisation), so this reuses a proven shape instead of a cross-repo
 change to lib.
+
+The two IP floors took the opposite decision, and the dividing line is worth
+stating because it went through two reversals before settling: **is this layer
+the task's goal, or the price of it?** Per-bot quotas are the goal. The floors
+exist only because `register` has no identity to key on before `authBot`, and
+because excluding heartbeat from the global bucket removes its only pre-auth
+ceiling — they are the price. Self-building them would have bought hot tuning and
+config uniformity at the cost of copying lib's unexported `getClientIP`, ~180
+lines of new infrastructure, and **a second deviation from the `rate-limit`
+rule**. An abuse threshold does not need data-driven convergence the way a
+per-identity quota does, so they mount octo-lib's
+`StrictIPRateLimitMiddleware` with env-backed parameters. Net effect: review has
+exactly one rule deviation to weigh instead of two.
 
 **Shadow mode instead of "measure first, then guess a threshold".** There was no
 data to size the quotas: the reject path wrote *no log at all*, access logs had
@@ -133,7 +147,11 @@ under observation would stop being real.
   share the Redis bucket and each passes its own rps/burst to the script. Never
   sample verification data inside a rollout window; the transitional state is not
   the new configuration.
-- **`CleanAllTables` does not clear Redis.** Two keyspaces need resetting in test
-  setup (`ratelimit:bot:*` and `ratelimit:strict:bot_register:*`). Missing the
-  second one produces cross-test pollution whose failures land on assertions that
-  have nothing to do with rate limiting.
+- **`CleanAllTables` does not clear Redis.** Three keyspaces need resetting in
+  test setup (`ratelimit:bot:*` plus `ratelimit:strict:bot_register:*` and
+  `ratelimit:strict:bot_heartbeat:*` — the latter two belong to the pre-auth IP
+  floors, whose prefix octo-lib fixes as `ratelimit:strict:{tag}:`). Missing one
+  produces cross-test pollution whose failures land on assertions that have
+  nothing to do with rate limiting. The count grew from two to three when the P1
+  fix added the heartbeat floor, which is the point: **the reset list is coupled
+  to the middleware list and there is nothing that fails when they drift.**

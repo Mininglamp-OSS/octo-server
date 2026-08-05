@@ -57,39 +57,58 @@ const (
 	rateLimitKeyPrefixOffenders = "ratelimit:bot:offenders:"
 )
 
-// register 端点的 per-IP strict 桶参数（code review 补入）。
+// register / heartbeat 的鉴权前 IP 底线。
 //
-// 这是 token 指纹桶**之外**的一层，专门堵 keyspace 放大：token 由客户端提供、
-// 在限流前不校验有效性，每换一个随机 token 就换一个新桶，而令牌桶首次判定即
-// HMSET+EXPIRE 建 key，于是 live key 数 = 请求速率 × TTL。详见 Route 中的注释。
+// **这两道桶不是本任务的目标**——目标是 per-bot 限流（按 bot 身份分配额）。
+// 它们是两处不得不付的对价：
 //
-// 固定值而非热调：IP 层是防滥用底线，不随业务负载变化。10 rps 远高于实测正常量
-// （单 IP register 约 1~2 rps；事故中那个异常 bot 约 4 rps），但把 key 生成速率
-// 从全局桶允许的 1500/s 压到 10/s。
+//   - `register` 跑在 `authBot` **之前**，此时没有 bot 身份。token 指纹能挡"失效
+//     token 重试风暴"，但它是客户端提供的值，换 token 即换桶；而令牌桶首次判定就
+//     建 Redis key，于是轮换 token 会按请求速率造 key。需要一层不依赖客户端提供值
+//     的兜底。
+//   - `heartbeat` 已被移出全局 per-IP 桶（否则同 IP 邻居会饿死它），而 per-bot 桶挂在
+//     `authBot` 之后——无效 token 在鉴权里就 abort，永远走不到那道桶。移出全局桶就
+//     必须在鉴权前补一层，否则任意无效 token 可无限触发 `authBot` 的 Redis/DB 查询。
+//
+// 鉴权前唯一可用的维度是 IP，所以这不是"回到 IP 维度",而是"那个阶段只有 IP"。
+//
+// **用 octo-lib 的 StrictIPRateLimitMiddleware,不自建**:它正是为未鉴权敏感端点设计
+// 的（login/register/sms/search 等 6 处在用），自带 client-IP 提取。自建虽能换来
+// 参数热调与配置统一,但要复制 lib 未导出的 `getClientIP`、并偏离 rate-limit 规则
+// 明文的第二条——**为一个非目标的对价引入新基础设施不划算**。
+//
+// 参数走 env(`OCTO_BOT_RATELIMIT_{REGISTER,HEARTBEAT}_IP_{RPS,BURST}`)。
+// 与 per-bot 配额不同,IP 底线是防滥用阈值,不需要按影子数据反复收敛;
+// env(改 configmap + 滚动重启)对这类参数够用。
+//
+// **但必须自己消毒**:`ParseRPSFromEnv` 底层是 `strconv.ParseFloat`,会原样接受
+// "NaN"/"+Inf";而 lib 的 `newKeyedLimiter` 只检查 `rps <= 0`,**`NaN <= 0` 为 false**,
+// 所以 NaN 会穿过它的启动期 panic 校验直达 Lua、让所有算术与比较静默失效。
+// 故统一过 `ratelimit.SanitizeRPS/SanitizeBurst`——与 per-bot 层同一份逻辑。
+//
+// 默认值按生产实测:单 IP 的 register 峰值约 4.4 rps、heartbeat 合计约 45 rps
+// （一台机器多个 bot）,各留两倍余量;相对原先全局桶的 1500 rps 是显著收敛。
 const (
+	envRegisterIPRPS    = "OCTO_BOT_RATELIMIT_REGISTER_IP_RPS"
+	envRegisterIPBurst  = "OCTO_BOT_RATELIMIT_REGISTER_IP_BURST"
+	envHeartbeatIPRPS   = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_RPS"
+	envHeartbeatIPBurst = "OCTO_BOT_RATELIMIT_HEARTBEAT_IP_BURST"
+
 	defaultRegisterIPRPS   = 10.0
 	defaultRegisterIPBurst = 50
-)
 
-// heartbeat 端点的 per-IP strict 桶参数（code review P1 补入）。
-//
-// **这道桶是 exclude 的对价，不是锦上添花。** `/v1/bot/heartbeat` 已被移出全局
-// per-IP 桶（否则同出网 IP 的邻居能把心跳饿死，issue #696），但那也移走了它唯一的
-// 未鉴权层防护：per-bot 桶挂在 `authBot` **之后**，无效 token 在鉴权失败时就 abort 了，
-// 永远走不到那道桶。于是攻击者可以用任意无效 token 无限触发 `authBot` 的 Redis/DB
-// 查询——原本被全局桶挡住的 DDoS 面，反而因为 exclude 被打开了。
-//
-// 所以这道桶必须排在 `authBot` **之前**，且**不受任何 enabled 开关控制**：
-// per-bot 桶默认关闭（灰度需要），若这层也可关，exclude 之后就存在一个完全无防护的
-// 未鉴权端点。
-//
-// 参数按实测定：生产单 IP 的 heartbeat 合计峰值约 45 rps（一台机器上多个 bot），
-// 100 rps 留两倍余量；相对原先由全局桶提供的 1500 rps 是显著收敛。
-// 固定值不热调——它是防滥用底线，不随业务负载变化。
-const (
 	defaultHeartbeatIPRPS   = 100.0
 	defaultHeartbeatIPBurst = 300
 )
+
+// ipLimitParams 读 env 并消毒。**刻意没有 enabled 开关**:per-bot 层默认关闭
+// （灰度需要）,若这两道外层也可关,被 exclude 的 heartbeat 就会出现一个
+// 完全无防护的未鉴权端点窗口。
+func ipLimitParams(envRPS string, defRPS float64, envBurst string, defBurst int) (float64, int) {
+	rps := ratelimit.SanitizeRPS(wkhttp.ParseRPSFromEnv(envRPS, defRPS), defRPS)
+	burst := ratelimit.SanitizeBurst(wkhttp.ParseBurstFromEnv(envBurst, defBurst), defBurst)
+	return rps, burst
+}
 
 // RateLimitParams 是三条通道的运行时配置快照。
 type RateLimitParams struct {
@@ -215,7 +234,7 @@ func botTokenFingerprint(token string) string {
 // keyFn 返回空串时 Limiter 会旁路（fail-open）：拿不到身份就限不了流。
 // 对已鉴权路径而言身份缺失属于挂载顺序错误，应当由测试守卫拦住，
 // 而不是在生产上退化成「所有无身份请求共享一个桶」这种更难排查的形态。
-func (ba *BotAPI) rateLimitMiddleware(pick func(*botRateLimiters) *ratelimit.Limiter, keyFn func(*wkhttp.Context) string) wkhttp.HandlerFunc {
+func (ba *BotAPI) rateLimitMiddleware(pick func(*botRateLimiters) *ratelimit.Limiter, keyFn func(*wkhttp.Context) string, scope string) wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		if ba.rateLimiters == nil {
 			c.Next()
@@ -227,7 +246,7 @@ func (ba *BotAPI) rateLimitMiddleware(pick func(*botRateLimiters) *ratelimit.Lim
 		// 影子期若下发，客户端会据此自行降频，观测到的就不再是真实流量——
 		// 而观测的全部意义就是回答「设成这个配额会拒谁」。
 		if res.ShouldSetHeaders() {
-			setBotRateLimitHeaders(c, res)
+			setBotRateLimitHeaders(c, res, scope)
 		}
 		if res.ShouldReject() {
 			respondBotRateLimited(c, res.RetryAfter)
@@ -240,11 +259,11 @@ func (ba *BotAPI) rateLimitMiddleware(pick func(*botRateLimiters) *ratelimit.Lim
 
 // setBotRateLimitHeaders 下发与 octo-lib 三个限流中间件同形的四个头，
 // 使客户端的归因逻辑（尤其 X-RateLimit-Scope）无需为 bot 通道特判。
-func setBotRateLimitHeaders(c *wkhttp.Context, res ratelimit.Result) {
+func setBotRateLimitHeaders(c *wkhttp.Context, res ratelimit.Result, scope string) {
 	h := c.Writer.Header()
 	h.Set("X-RateLimit-Limit", strconv.Itoa(res.Burst))
 	h.Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
-	h.Set("X-RateLimit-Scope", "bot")
+	h.Set("X-RateLimit-Scope", scope)
 	if res.Outcome == ratelimit.OutcomeDenied {
 		h.Set("Retry-After", strconv.Itoa(res.RetryAfter))
 	}

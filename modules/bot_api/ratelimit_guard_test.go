@@ -208,7 +208,7 @@ func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
 
 	ipIdx := strings.Index(decl, "heartbeatIPLimit")
 	authIdx := strings.Index(decl, "ba.authBot()")
-	perBotIdx := strings.Index(decl, "ba.rateLimitMiddleware(")
+	perBotIdx := strings.Index(decl, "l.heartbeat }")
 
 	require.NotEqual(t, -1, ipIdx,
 		"heartbeat 缺少 per-IP strict 限流。它已移出全局 per-IP 桶，"+
@@ -222,8 +222,66 @@ func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
 	require.Less(t, authIdx, perBotIdx,
 		"per-bot 桶必须在 authBot 之后，否则取不到 bot 身份")
 
-	// strict 桶不得挂 enabled 开关：per-bot 桶默认关闭（灰度需要），
-	// 若这层也可关，exclude 之后就存在一个完全无防护的未鉴权端点。
-	require.Contains(t, src, `"bot_heartbeat", defaultHeartbeatIPRPS, defaultHeartbeatIPBurst`,
-		"heartbeat strict 桶应使用固定常量参数，不接 system_setting 开关")
+	// 参数必须过 ipLimitParams 消毒——ParseRPSFromEnv 会接受 "NaN"，而 lib 的
+	// newKeyedLimiter 只挡 rps<=0（NaN<=0 为 false），于是 NaN 会穿过启动期校验
+	// 直达 Lua、让所有算术与比较静默失效。
+	require.Regexp(t,
+		`heartbeatIPRPS,\s*heartbeatIPBurst\s*:=\s*ipLimitParams\(`,
+		src, "heartbeat IP 参数必须过 ipLimitParams 消毒")
+	require.Regexp(t,
+		`registerIPRPS,\s*registerIPBurst\s*:=\s*ipLimitParams\(`,
+		src, "register IP 参数同样必须过 ipLimitParams 消毒")
+
+	// register 侧同样两层，且 IP 在前——否则随机 token 已经把 Redis key 建好了。
+	rStart := strings.Index(src, `r.POST("/v1/bot/register"`)
+	require.NotEqual(t, -1, rStart)
+	rDecl := src[rStart:]
+	if end := strings.Index(rDecl, "ba.register)"); end != -1 {
+		rDecl = rDecl[:end]
+	}
+	require.Less(t, strings.Index(rDecl, "registerIPLimit"), strings.Index(rDecl, "l.register }"),
+		"register 的 IP 桶必须排在 token 指纹桶之前，否则 key 已经建好了")
+}
+
+// TestIPLimitParamsSanitizesEnv 钉住 IP 层的读侧防御。
+//
+// 补的是 octo-lib 的一个真实缺口:`newKeyedLimiter` 构造时只检查 `rps <= 0` 就 panic,
+// 但 **`NaN <= 0` 为 false**,所以 `OCTO_BOT_RATELIMIT_HEARTBEAT_IP_RPS=NaN` 会穿过
+// 那道启动期校验直达令牌桶 Lua,让所有算术和比较失效——行为不可预测且无任何报错。
+// `ParseRPSFromEnv` 底层是 `strconv.ParseFloat`,它确实会接受 "NaN"/"+Inf"。
+func TestIPLimitParamsSanitizesEnv(t *testing.T) {
+	const defRPS, defBurst = 100.0, 300
+
+	t.Run("未设时用默认", func(t *testing.T) {
+		rps, burst := ipLimitParams(envHeartbeatIPRPS, defRPS, envHeartbeatIPBurst, defBurst)
+		require.Equal(t, defRPS, rps)
+		require.Equal(t, defBurst, burst)
+	})
+
+	for _, bad := range []string{"NaN", "+Inf", "-Inf", "0", "-1", "abc"} {
+		t.Run("非法 rps="+bad, func(t *testing.T) {
+			t.Setenv(envHeartbeatIPRPS, bad)
+			rps, _ := ipLimitParams(envHeartbeatIPRPS, defRPS, envHeartbeatIPBurst, defBurst)
+			require.Equal(t, defRPS, rps,
+				"非法 env %q 必须回退——否则 NaN 直达 Lua，或 rps<=0 让整条路由 100%% 拒绝", bad)
+		})
+	}
+
+	for _, bad := range []string{"0", "-5", "abc"} {
+		t.Run("非法 burst="+bad, func(t *testing.T) {
+			t.Setenv(envHeartbeatIPBurst, bad)
+			_, burst := ipLimitParams(envHeartbeatIPRPS, defRPS, envHeartbeatIPBurst, defBurst)
+			require.Equal(t, defBurst, burst)
+		})
+	}
+
+	// 对照:合法 env 必须生效,否则消毒会退化成"永远忽略 env",
+	// 那么"改 configmap 就能调"这个前提也不成立。
+	t.Run("合法 env 生效", func(t *testing.T) {
+		t.Setenv(envHeartbeatIPRPS, "250")
+		t.Setenv(envHeartbeatIPBurst, "800")
+		rps, burst := ipLimitParams(envHeartbeatIPRPS, defRPS, envHeartbeatIPBurst, defBurst)
+		require.Equal(t, 250.0, rps)
+		require.Equal(t, 800, burst)
+	})
 }
