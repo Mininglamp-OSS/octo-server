@@ -3,6 +3,7 @@
 **status: DRAFT — 待拍板**
 **方案：A 单边托管（single-homed）** — 外部群寄居在其中一方实例上（下称 **Host / A**；对端下称 **Peer / B**）
 **代码基线：** octo-server HEAD `a61b5411`（branch `feat/thread-peruser-visibility`）
+**架构总览：** 面向评审者与新加入者的背景 / 架构图 / 端到端场景见 `federation-architecture.md`。本文档为详细设计与决策记录。
 **证据说明：** 本草案的 file:line 结论来自一轮独立代码勘察，撰写时未逐条重开文件复核。凡标注「未验证 / 需实测」处，执行前必须先验证，并 drift check 对齐当时 HEAD。
 
 ---
