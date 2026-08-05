@@ -193,8 +193,10 @@ PR #644·#648 把 `message_extra.version` 换成了事务性 per-channel 序列
   `event_id` 精确删到目标 member。
 - **回归**：`go test -race ./modules/bot_api ./modules/robot ./pkg/botevent ./modules/message -count=1`
   全绿；`modules/group` 的 `notifyBotJoinedGroup` 相关测试全绿。
-- **观测**：新增「score 非单调」计数器（写入时新 score ≤ 队列当前 max 即计数），
-  低基数 label；上线后该计数应恒为 0。
+- **观测**：见下方第三轮记录第 6 条 —— 原文要求的「写入时新 score ≤ 队列当前 max 即计数」
+  **已修订**：那个比较做对了就等于原子 allocate-and-publish（属 Out of scope 的独立
+  follow-up），这里改为交付 6 个自愈计数器 + `AuthorityReads()`，并把跨副本回退检测
+  单独立项（P1-5/P1-6）。低基数、无 label 的要求保留。
 - **迁移验证步骤**（写进 PR 描述，运维可执行）：切换前记录各队列 max score 与
   `seq` 表 `min_seq`，切换后断言新号段整体高于两者。
 
@@ -303,6 +305,13 @@ seed 必须读 producer 写的同一个 key，硬编码分散是真实风险。�
 `TestEveryBotEventQueueWriterRingsTheDoorbell` 的 `queueKey` regex —— 否则它 `matched=4 < 5`
 直接 fatal（那个守卫的防盲下限按设计生效了，值得记一笔）。
 
+> **更正（第三轮）**：这条当时写成已完成，实际只做了 4/5 —— `modules/robot/event.go:367`
+> 仍从 `rb.robotEventPrefix` 拼 key，`api.go` 的读/删两处同样，消费侧
+> `modules/bot_api/bot_api.go:32` 另有一份字面量。PR 描述当时是诚实的（"four of the five
+> writers"），**brief 不是，而 brief 才是下一个人当记录看的东西**（review 抓到）。第三轮
+> 已真正做完：`robotEventPrefix` 字段和 `bot_api` 的常量都删除，六个生产点与消费侧全部
+> 走 `botevent.QueueKey`。
+
 **③ 测试用独立库 `botevent_test`，不用共享 `test` 库。** `seq` 表由
 `modules/common/sql/20211108000001_common_legacy01.sql` 管理；在 `test` 库裸建它会留下
 `gorp_migrations` 无记录的表，下个包的 `NewTestServer` 就 `Table 'seq' already exists` ——
@@ -371,3 +380,68 @@ seed 必须读 producer 写的同一个 key，硬编码分散是真实风险。�
 `pkg/botevent`（28 测试）、`pkg/redis`、`modules/robot`、`modules/group`、`modules/bot_api`、
 **`modules/message`**（brief 点名、上一轮漏跑，review 抓到）全绿；migration 经真实
 sql-migrate 应用（`gorp_migrations` 有记录、状态表已建）。
+
+## 第三轮实现记录（第四轮 review 之后，2026-08-06）
+
+两位 reviewer 独立抓到同一条：**热路径信任正向 mirror，从不校验 MySQL 权威**。另一位还抓到
+上一轮我自己引入的回归。八条 P1 里六条在本轮修，两条（回退检测的设计问题）单独立项 ——
+理由见下第 7 条。
+
+1. **mode 解析没有统一入口，于是三处给出三个不同答案**（P1-1/P1-2/P1-4 是同一个缺失）。
+   新增 `pkg/botevent/mode.go`，不变量收敛成一句：**权威决定，mirror 只能加速、不能翻案**。
+   - 正向信念（activated）对 legacy **终态**：本进程一旦解析出 incr，可以向上刷新 epoch，
+     但永不再回 legacy —— 不因 DB 报错、不因行被回滚、不因表被 drop。这让 P1-4 从「不太可能」
+     变成**结构上不可达**。
+   - 负向信念只在 **mirror 也不声称 incr** 时可信。`mirror=incr` + 缓存 legacy 是**冲突**，
+     强制现场重读。这一条是保住 D2 的关键：flip 的传播**不等 TTL**，因为第一次看到新 mirror
+     的分配就会重读权威。TTL 只兜「operator 的 mirror 写失败」这一种情况。
+   - 确认过的冲突（mirror 说 incr、权威说 legacy）= mirror 被伪造 → 走 legacy + 响亮计数。
+     **这不会撕裂集群**：所有副本读同一行、得同一结论，一致性来自权威而非 mirror。这句话
+     正是上一轮缺的那句。
+2. **D2 需要修订而不是推翻**。D2 禁的是「用缓存判决 gate」，gate 仍每次在 Lua 里读未缓存的
+   mirror；这里缓存的是「mirror 背后的权威」。分歧只可能来自两个副本对同一时刻的权威给出
+   不同答案，而冲突强制重读移除了这种可能。
+3. **mirror 值带 epoch（`incr:{epoch}`）**。gate 比对的是本进程向权威确认过的那个确切字符串，
+   于是手写 `SET botEventSeq:mode incr` 连一次分配都开不了门 —— 它没有代次，只能触发一次
+   权威读。这正是 migration 里 `epoch` 列注释**声称已有而实际没有**的机制（review 记为
+   spec 偏离），现在注释成真。
+4. **顺序倒了：先开全局门，再做 per-bot seed**（P1-3）。改成先 seed 后发布 mirror。并且
+   **mirror 丢失会失效所有 bot 的 seeded 标记**，不只是当前这个 —— mode 键丢失就是 Redis
+   丢数据的证据，本进程认为已 seed 过的每个 counter 都可疑。docstring 写明「mirror 是全局的、
+   seed 是 per-bot」。
+5. **`gateClosed` 与快路径互相打转，是测试抓出来的**：强制重读权威后 `seeded` 仍在，
+   `allocate` 的快路径又撞同一个关闭的门，一直转到 `maxAllocAttempts` 才报错 —— 表现为
+   「mirror 被反复丢失」，而实际上只丢了一次。修法是重读后丢掉该 bot 的 `seeded` 让重试走
+   慢路径。`refreshAuthority` 因此需要一个 `force` 参数：正向信念的短路正是这条路径要绕开的。
+6. **写侧「新 score ≤ 队列 max」检测器：修订 acceptance，不硬加**（原 Acceptance 观测项）。
+   理由不是推脱：那个比较做**对**了就会收敛到我已经原型过又回滚的原子 allocate-and-publish。
+   并发下 A 分配 100、B 分配 101 且先 ZADD，A 再比「100 ≤ 队列 max 101」就是假阳性，除非
+   比较发生在 ZADD 那一刻的同一个 Lua 里 —— 而那与 `modules/bot_mention` 的原子性边界冲突，
+   已在 Out of scope 立项。两位 reviewer 在这条上判断相反（一位判「实质满足」、一位判
+   「未实现」），这个论证解释了两边各对一半：现有计数器覆盖了写侧非单调的**一个**来源，
+   而规格要的那个比较**在当前架构里做不成无假阳性的**。
+7. **P1-5/P1-6 单独立项，门禁定在「激活前」而不是「合并前」。**
+   - P1-5：`rollbackTolerance = 1000` 以下的回退检测不到，而上一轮我写的「靠下次 seed 修」
+     被代码否证 —— `seeded.Delete` 只有三处且**全在已检测分支**，未检测与自愈按构造互斥。
+     那句错的理由同时写在 `seq.go` 和本 brief 第二轮记录第 1 条里，是**重申**而不是承认的
+     取舍。而且生产 `save … 60 10000`，任何每分钟少于 ~1000 事件的 bot（1948 个队列里几乎
+     全部）回退幅度**永远**在容差内 —— 这个机制在常见情形下从不触发。
+   - P1-6：回退检测只比本进程 `lastIssued`，长寿进程冷 per-bot 状态会把跨副本回退当前进。
+   - 两条是同一个设计问题（什么状态会回退 / 谁检测 / 什么重建 floor），需要一张表；而它们
+     **只在 `mode=incr` 之后可达**，本轮把 merge 修成真正惰性（P1-1 去掉每次分配的 DB 往返，
+     P1-2 让野键无法激活）之后，延后才站得住。已立项
+     `Mininglamp-OSS/octo-server#704`，**门禁是「激活前」而不是「合并前」** ——
+     `tools/botevent-seq` 的 `-yes` 拒绝文案也引用了它。
+8. **激活证据结构性漏掉它要保护的 bot**（P1-8）。工具只从 `SCAN robotEvent:*` 发现 bot，
+   队列已 drain 的 bot 一行 `seq` 都不读；`scalarSeq` 还把任何 DB error 变成 0。改为按前缀
+   `SELECT MAX(min_seq)` 全表扫两个命名空间，并像拒绝 sampled 证据一样**拒绝部分失败的证据**。
+9. **`payload.robot_id` 分支从来没做存在性校验**（review 要求人工确认 robotID 来源，查得出来
+   就不该挂在那里）。另外三个分支（mention.uids / @username / ais）都查了 `existRobot`，只有
+   这个把客户端 payload 里的值原样当 bot id。以前的代价只是一个带 TTL 的队列键加一行 `seq`；
+   新分配器会为它建一个**无 TTL** 的 counter 键（Redis `noeviction`）加一行永不回收的
+   `seq`。补上校验。
+10. **测试能静默退化成只跑守卫**（P2-11，与上一轮 `botevent_test` 库同一个失效模式，我在这上面
+    已经栽过一次）。加 `TestMain`：`CI=true` 下依赖缺失直接失败并说明缺什么，本地仍 skip。
+    测试建表也补齐 migration 的 `CHECK` 与 `ON UPDATE`。
+
+**验证**：`pkg/botevent` 42 测试全绿（`-race -shuffle=on`，`CI=true`，**零 skip**）。
