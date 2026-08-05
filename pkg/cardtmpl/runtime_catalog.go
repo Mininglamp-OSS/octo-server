@@ -621,12 +621,27 @@ func validateCompiledArtifact(meta RuntimeArtifactMeta, artifact *CompiledArtifa
 	return nil
 }
 
+// classifyRuntimeStoreError turns a store failure into a typed catalog error.
+// Anything it does not recognise becomes "unavailable", which is the right
+// default for a raw driver error but the wrong answer for a verdict the store
+// already reached.
+//
+// The distinction is load-bearing downstream: `disabled` means an operator
+// deliberately turned this template off and callers withhold it quietly, while
+// `unavailable` means we could not tell and callers surface an outage. Since
+// PR-C moved activation resolution inside the snapshot, a disabled pointer is
+// produced by the store rather than by the catalog — so every typed error the
+// catalog owns has to pass through intact instead of only the two that happened
+// to be listed when the store could not produce the others.
 func classifyRuntimeStoreError(operation string, err error) error {
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, ErrTemplateUnknown), errors.Is(err, ErrRuntimeCatalogIntegrity):
+		errors.Is(err, ErrTemplateUnknown), errors.Is(err, ErrRuntimeCatalogIntegrity),
+		errors.Is(err, ErrRuntimeCatalogDisabled), errors.Is(err, ErrRuntimeCatalogBlocked),
+		errors.Is(err, ErrRuntimeCatalogNotAuthorized), errors.Is(err, ErrRuntimeCatalogNewSendDisabled),
+		errors.Is(err, ErrRuntimeCatalogUnavailable):
 		return fmt.Errorf("cardtmpl: %s: %w", operation, err)
 	default:
 		return fmt.Errorf("%w: %s: %v", ErrRuntimeCatalogUnavailable, operation, err)

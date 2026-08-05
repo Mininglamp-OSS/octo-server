@@ -277,14 +277,25 @@ func newRuntimeCatalogIntegrationDB(t *testing.T) *sql.DB {
 		t.Fatalf("ping integration database: %v", err)
 	}
 	source := runtimeCatalogMigrationSource{}
-	if applied, err := migrate.Exec(db, "mysql", source, migrate.Up); err != nil || applied != 2 {
+	// Derive the expected count from the source rather than hardcoding it. A
+	// hardcoded 2 meant that adding the grant migration broke four unrelated
+	// tests with a message about migration counts — and only on a machine with
+	// MySQL, so the breakage was invisible everywhere else.
+	migrations, err := source.FindMigrations()
+	if err != nil {
 		_ = db.Close()
 		_ = bootstrap.Close()
-		t.Fatalf("apply catalog migrations: applied=%d err=%v", applied, err)
+		t.Fatalf("find catalog migrations: %v", err)
+	}
+	if applied, err := migrate.Exec(db, "mysql", source, migrate.Up); err != nil || applied != len(migrations) {
+		_ = db.Close()
+		_ = bootstrap.Close()
+		t.Fatalf("apply catalog migrations: applied=%d want=%d err=%v", applied, len(migrations), err)
 	}
 	t.Cleanup(func() {
-		if reverted, err := migrate.Exec(db, "mysql", source, migrate.Down); err != nil || reverted != 2 {
-			t.Errorf("revert catalog migrations: reverted=%d err=%v", reverted, err)
+		if reverted, err := migrate.Exec(db, "mysql", source, migrate.Down); err != nil || reverted != len(migrations) {
+			t.Errorf("revert catalog migrations: reverted=%d want=%d err=%v",
+				reverted, len(migrations), err)
 		}
 		if err := db.Close(); err != nil {
 			t.Errorf("close integration database: %v", err)
