@@ -387,7 +387,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 	// Only the access_requested + gate-on branch flows through Registry.Render;
 	// other kinds keep the historical validate-in-builder behavior.
 	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
-		if err := preflightDocsAccessRequestSchema(ctx, card); err != nil {
+		if err := preflightDocsAccessRequestSchema(ctx, req.SpaceID, card); err != nil {
 			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 				n.Error("docs access-request card preflight rejected by runtime catalog",
 					zap.String("catalog_result", failure.result), zap.Error(err),

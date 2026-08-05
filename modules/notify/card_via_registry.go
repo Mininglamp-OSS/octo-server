@@ -115,7 +115,13 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 // R2-2 修正:前版当 registry nil 时返 nil 让 caller 继续走 v2 分支,后者最终降级
 // 文本 —— 那样"错请求"仍然会成功送达一条文本,与 §10 / A14 冲突。现在 preflight
 // 阶段就报 500,让 wiring bug 立刻可见。
-func preflightDocsAccessRequestSchema(parent context.Context, card *DocsCardFields) error {
+// preflightDocsAccessRequestSchema validates the caller's fields against the
+// template contract before anything is delivered (C1). It takes the Space
+// because PR-C made template resolution Space-aware: when the activation
+// pointer resolves to a dynamic version, the producer's grant is read for this
+// Space, and preflighting against an empty Space would authorize a different
+// decision than the send that follows it.
+func preflightDocsAccessRequestSchema(parent context.Context, spaceID string, card *DocsCardFields) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -123,7 +129,7 @@ func preflightDocsAccessRequestSchema(parent context.Context, card *DocsCardFiel
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: docsaccessrequest.TemplateID,
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID), ID: docsaccessrequest.TemplateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(docsaccessrequest.TemplateID, err)

@@ -377,33 +377,39 @@ marshal, and the two intentional Space/middleware duplications).
 
 ### Slice 5 — docs-notify dynamic pilot
 
-Production integration files, only where the generic slices do not already
-complete the path:
+Landed (`feat: add the controlled docs catalog pilot`):
 
-- `[modify] modules/notify/card_via_registry.go`
-- `[modify] modules/notify/action_finalizer.go`
-- `[modify] modules/notify/card.go`
-- `[modify] main.go`
+- `[new] modules/card_template_catalog/testdata/pilot/docs.access-request@0.4.0-pilot.20260805/bundle.json`
+  — owner `docs`, producer `internal_producer/docs-notify`, the existing
+  `docs/access_request.decision` RouteSpec, visibility private, and an
+  `export.samples` allowlist with one synthetic sample so the B2 export path is
+  actually exercised. Same template ID as the static card, new prerelease exact
+  version: that is what makes the shadow behaviour observable.
+- `[new] modules/card_template_catalog/testdata/pilot/README.md` — states in one
+  place that the fixture is publish input only: not registered, not embedded,
+  not an activation, not permission to open the production gates.
+- `[new] modules/card_template_catalog/pilot_mysql_integration_test.go` —
+  `requirePilotVersionUnclaimed` (the preflight gate, in code so it cannot be
+  skipped, failing with the remedy) plus the D7 loop: static baseline →
+  publish → prove publish is neither activation nor grant → grant → prove a
+  grant does not move the pointer → activate → dynamic shadows static for new
+  send → private discovery needs a Space grant and another Space sees nothing →
+  rollback while a pinned historical read is unaffected → revoke denies the very
+  next decision and leaves a tombstone. `TestPilotBundleCompilesAndProjectsSafely`
+  runs with no database so a malformed fixture fails everywhere.
+- `[modify] modules/notify/card_via_registry.go` + `card.go` —
+  `preflightDocsAccessRequestSchema` takes the Space. Template resolution became
+  Space-aware in Slice 3, so preflighting against an empty Space would authorize
+  a different decision than the send that follows it.
+- `modules/notify/action_finalizer.go` — no further change: Slice 1 already made
+  the result edit use the stored `template_id@version`.
+- `main.go` — no change was needed. The pilot fixture is never registered, so
+  the composition root has nothing to wire; treating "merged" as "wired" is
+  exactly the confusion the README exists to prevent.
 
-Pilot fixture and test:
-
-- `[new after version preflight] modules/card_template_catalog/testdata/pilot/docs.access-request@<selected-version>/bundle.json`
-- `[new] modules/notify/runtime_catalog_pilot_integration_test.go`
-
-`<selected-version>` is a placeholder, not a default. Before creating the exact
-directory, query the dedicated non-production catalog and prove the candidate
-has never been claimed. If it is already claimed, choose a new reviewed SemVer;
-never overwrite/reuse the key. The fixture is input to publish/E2E only:
-
-- do not add it to `pkg/cardtmpl/docs_access_request/handoff/`;
-- do not register it in `DefaultRegistry`;
-- do not `go:embed` it into production startup;
-- do not treat its presence in Git as activation or authorization.
-
-Exit gate: establish static `docs.access-request@0.3.0` activation baseline,
-then publish→grant→activate→B1/B2→send→Action.Submit→same-version edit→rollback;
-prove old dynamic historical edit while edit grant remains, then revoke and
-prove rejection.
+Exit gate: the pilot proves publish ≠ activate ≠ grant, dynamic-over-static
+shadowing, private discovery, historical pinning across a rollback, and
+immediate denial after revoke — with production gates untouched.
 
 ### Slice 6 — verification, operations and PR closeout
 
