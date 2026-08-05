@@ -3,7 +3,8 @@
 > Forward-looking implementation guide. `brief.md` in this directory is the
 > contract of record; this file says where implementation starts, which
 > repository files belong to each slice, and what must never be committed.
-> Last updated 2026-08-05. All paths below are repository-relative.
+> Last updated 2026-08-05 (round 2 — brief "Plan refinement log" applied to the
+> Slice 1/4/6 ledgers below). All paths below are repository-relative.
 
 ## TL;DR
 
@@ -95,7 +96,10 @@ Production files:
 - `[modify] modules/bot_api/send.go` — author Bot marker and reject raw forgery
   on send/edit.
 - `[modify] modules/robot/sanitize_robot_ingress.go` — reject the server-only
-  template/provenance fields on the legacy raw robot card ingress.
+  template/provenance fields on the legacy raw robot card ingress. Add a
+  separate reject helper; do not reuse or change the semantics of the existing
+  `__obo_*` silent-strip function (its file-header rationale does not apply to
+  keys this PR introduces).
 - `[modify] modules/message/api_card_action.go`
 - `[modify] internal/cardactiondispatch/contract.go` — persist validated
   provenance in additive durable `CardContext` fields.
@@ -211,12 +215,18 @@ Production files:
 - `[modify] pkg/cardtmpl/json_artifact.go`
 - `[new] modules/card_template_catalog/store_discovery.go`
 - `[new] modules/card_template_catalog/api_discovery.go`
+- `[modify] modules/card_template_catalog/store_read.go` — manager read-only
+  list summary (source/visibility/active/block + bounded grant summary,
+  includes B1-hidden rows).
 - `[modify] modules/card_template_catalog/api.go`
 - `[modify] modules/card_template_catalog/api_i18n.go`
 - `[modify] modules/card_template_catalog/metrics.go`
 - `[new] pkg/space/middleware_localized.go`
 - `[modify] pkg/errcode/card_template_catalog.go`
 - `[modify] pkg/i18n/locales/active.zh-CN.toml`
+- `[modify] main.go` — composition-root static CatalogMeta injection
+  (visibility/export/sample allowlist); never edit frozen handoff manifests;
+  PR-C keeps every existing static card private.
 
 Focused tests:
 
@@ -230,7 +240,11 @@ Focused tests:
 Exit gate: public/private/Space/superAdmin matrix, visible-only cursor,
 cross-Space replay rejection, anti-enumeration, ETag/304/cache headers, 2 MiB
 cap and synthetic-only samples are proven. Request handlers read immutable
-projection bytes, never repository source paths.
+projection bytes, never repository source paths. B1 rows expose the
+`action_contract` capability field; existing static cards stay
+private-by-default; the manager list endpoint returns B1-hidden rows to
+superAdmin only and uses `httperr.ResponseErrorL` like every other B1/B2 and
+localized-Space failure.
 
 ### Slice 5 — docs-notify dynamic pilot
 
@@ -266,9 +280,18 @@ prove rejection.
 
 Documentation files:
 
-- `[modify] docs/card-template-runtime-catalog-runbook.md`
-- `[modify] docs/card-protocol.md`
-- `[modify] docs/platform-card-base.md`
+- `[modify] docs/card-template-runtime-catalog-runbook.md` — grant/rollout
+  procedures, plus a note that `l2aOwnerAllowlist` (Registry registration) and
+  `approvedRuntimeOwners` (runtime publish/authorization) are intentionally
+  different lists: a grant for an unapproved runtime owner never enables send.
+- `[modify] docs/card-protocol.md` — §1 additive top-level
+  `template_ref`/`catalog_provenance`; state explicitly that the client render
+  gate still keys on `from_uid` only (provenance is server-side authorization
+  input, not a client rendering contract).
+- `[modify] docs/platform-card-base.md` — §9 actual B1/B2 fields and
+  authorization semantics; §10 new fail-close row for dynamic
+  unauthorized/blocked/DB-unavailable (no fallback-text degradation); §2.2-5
+  note that L2b threshold ④ is not advanced by PR-C.
 - `[modify] .octospec/tasks/cardtmpl-runtime-catalog/brief.md`
 - `[modify] .octospec/tasks/cardtmpl-runtime-catalog-grants-discovery/brief.md`
 - `[modify] this HANDOFF.md` with final SHAs, commands and evidence boundaries.

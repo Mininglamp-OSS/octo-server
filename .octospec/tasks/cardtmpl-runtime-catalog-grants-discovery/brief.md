@@ -205,7 +205,9 @@ grant/activation/block 强一致读继续走 primary DB。v1 不引入 Redis 或
 ### D5 — B1/B2 read model
 
 - B1：`GET /v1/message/card/templates`；cursor pagination，default 50/hard 100；只返回
-  visible + unblocked exact versions、source/owner/protocol/contract/version/views 和
+  visible + unblocked exact versions、source/owner/protocol/contract/version/views、
+  `action_contract`（owner+action_type 摘要，纯展示卡为 null——对应 platform-card-base §9
+  承诺的 `actionType` 能力发现字段）和
   `active_for_new_send`，明确 `send_allowed` 不是 B1 的承诺。
 - B2：`GET /v1/message/card/templates/{id}@{version}`；只返回
   manifest/schema/reports/samples 的安全 projection，不返回 templates、goldens、audit、
@@ -226,11 +228,23 @@ grant/activation/block 强一致读继续走 primary DB。v1 不引入 Redis 或
   一个已返回的 visible row 推进，不得让 hidden/blocked row 改变 cursor、count 或空页形状。
   cursor 至少绑定 source + template exact + Space/visibility context，跨 Space 重放 fail-close。
 - static Registry 在 Freeze 前显式注入 `engine/visibility/export` metadata；未配置 visibility
-  fail-close 为 private。注册/compile 时构造 immutable safe export projection 并复制 raw
-  manifest/schema/reports；请求期不读源码目录，也不从 compiled schema 反向猜原文。
-- `samples` 默认不导出；只有 handoff manifest 显式列入 export allowlist、且确认是 synthetic
-  fixture 的 sample 才进入 projection。templates、goldens、未列入 sample 和 canonical bundle
+  fail-close 为 private。注入点是 composition root 的 Go 侧注册参数（`main.go` static
+  CatalogMeta），绝不回改已冻结的 L1 handoff manifest（platform-card-base §2.1 发布即冻结）。
+  PR-C 不改变任何现有 static 卡的 visibility——全部保持 fail-close private；把某张 static 卡
+  对普通调用方开放属后续 reviewed composition-root 变更，不是 PR-C 交付物；public 矩阵由
+  测试 fixture 与 pilot dynamic bundle 覆盖。注册/compile 时构造 immutable safe export
+  projection 并复制 raw manifest/schema/reports；请求期不读源码目录，也不从 compiled schema
+  反向猜原文。
+- `samples` 默认不导出；只有 manifest 显式列入 export allowlist、且确认是 synthetic
+  fixture 的 sample 才进入 projection。static 卡受 L1 冻结约束无法回填 allowlist，现有
+  static 卡的 B2 samples 恒为空；dynamic bundle 在自身 manifest 声明 allowlist（compiler
+  strict 校验，未知键继续拒绝），pilot bundle 必须含至少一个 allowlisted synthetic sample
+  证明导出通路。templates、goldens、未列入 sample 和 canonical bundle
   永不进入 B2。static/dynamic 共用同一 projection builder 与 2 MiB 序列化前 hard cap。
+- wire status 决策：B1/B2 与 localized Space middleware variant 的全部错误响应走既有
+  `httperr.ResponseErrorL`（pinned-400，D14 兼容），与 `modules/card_template_catalog`
+  现有 responder 同一契约；不使用 `ResponseErrorLWithStatus`（未取得新端点偏离 D14 的
+  maintainer 确认）。ETag 命中的 304 与缓存响应头不是 error envelope，不受此约束。
 
 ### D6 — Bot capability and runtime authorization
 
@@ -305,9 +319,11 @@ stop/retry 或 OpenClaw rollout 绑定。
 | --- | --- |
 | `PUT /v1/manager/card-templates/{id}/grants/{principal_type}/{principal_id}` | create/update active grant；strict body 包含 scope_space_id、discover/send/edit、expected_revision、reason、change_ticket |
 | `DELETE /v1/manager/card-templates/{id}/grants/{principal_type}/{principal_id}` | logical revoke；strict body 包含 scope_space_id、expected_revision、reason、change_ticket |
+| `GET /v1/manager/card-templates` | 分页只读列表：全部 template 的 source/visibility/active/block 摘要与 bounded grant summary，含普通 B1 隐藏项；补齐父 brief v1 控制面缺失的最后一个 read API（PR-C 是 E3 收尾切片，不再顺延） |
 
 两条写接口都要求 control gate=true、runtime ready、superAdmin、SharedUIDRateLimiter、
-10s deadline 与 typed localized errors。path/body identity 严格 canonical；body actor 字段拒绝。
+10s deadline 与 typed localized errors。只读列表与既有 manager GET detail/audit 同一
+鉴权/限流/deadline 链，不要求 control gate=true，也不涉及 expected_revision。path/body identity 严格 canonical；body actor 字段拒绝。
 manager API 必须按 D2 canonical shape 校验 scope，并在响应中返回实际命中的 revision；对
 revoked exact row 的 re-activate 必须携带 tombstone 当前 revision，不能再用
 `expected_revision=0` 伪装 create。
@@ -379,6 +395,8 @@ between repository fixtures and non-production runtime state are maintained in
 ### Slice 4 — B1/B2 RED→GREEN
 
 - static export retention/hash + dynamic projection；
+- composition-root static CatalogMeta 注入（visibility/export/sample allowlist；不回改冻结 manifest）；
+- manager 只读列表端点（含 B1 隐藏项与 bounded grant summary）；
 - public/private/Space/superAdmin matrix、pagination/hard cap、ETag/304/cache headers；
 - unauthorized vs nonexistent equality、blocked omission、visible-only cursor、cross-Space cursor replay；
 - localized Space errors、synthetic sample allowlist、Bot cannot use B1/B2 as grant bypass。
@@ -394,7 +412,14 @@ between repository fixtures and non-production runtime state are maintained in
 - focused coverage/race/build/vet/lint/i18n/source guards；
 - real MySQL migration/concurrency/two-replica tests；
 - dedicated non-production Redis/WuKongIM E2E, restart and DB outage；
-- runbook rollout/rollback/metrics/alerts and PR Linked Spec/COMPREHENSION。
+- runbook rollout/rollback/metrics/alerts and PR Linked Spec/COMPREHENSION；
+- 文档收口（与代码同 PR）：platform-card-base §9 的 B1/B2 实际字段与授权语义、§10 新增
+  dynamic unauthorized/blocked/DB-unavailable fail-close 行（不降级为 fallback 文本）；
+  card-protocol §1 补 additive 顶层 `template_ref`/`catalog_provenance` 字段并注明客户端
+  渲染门禁仍只看 `from_uid`（provenance 是服务端授权输入，不是客户端渲染契约）；runbook
+  记录 `l2aOwnerAllowlist`（Registry 注册面）与 `approvedRuntimeOwners`（runtime
+  publish/授权面）是两份刻意不同的清单——给未获批 runtime owner 建 grant 不会使其可发；
+  platform-card-base §2.2-5 注明 L2b 硬门槛 ④ 不因 per-principal grant 落地而推进。
 
 ## Acceptance matrix
 
@@ -483,3 +508,31 @@ Accepted with the explicit instruction to start E3 PR-C implementation on 2026-0
   dynamic-over-static shadow matrix.
 - [x] Accept D7: `docs-notify` + existing docs RouteSpec, including explicit static activation baseline,
   as the non-production interactive pilot.
+
+## Plan refinement log
+
+### 2026-08-05 round 2 — repo-doc cross-check
+
+对照父 brief（`.octospec/tasks/cardtmpl-runtime-catalog/brief.md`）、
+`docs/platform-card-base.md`、`docs/card-protocol.md`、`docs/l2b-owners.md` 与
+`main@40627cc0` 代码复核后落入本 brief 的五项细化。均为收敛/补缺，不改变已确认的
+D1–D7 语义：
+
+1. B1 字段补 `action_contract`（platform-card-base §9 的 `actionType` 能力发现承诺；
+   跨仓 SDK 生成依赖它对齐 callback 路由三元组）。
+2. static visibility/export 注入点定为 composition root Go 侧（`main.go` static
+   CatalogMeta），不回改冻结 L1 manifest；PR-C 不改变现有 static 卡 visibility（保持
+   private fail-close）；static B2 samples 恒空，dynamic 由 bundle manifest allowlist
+   承载，pilot bundle 必须证明导出通路。背景：全部 10 个生产 handoff manifest 均无
+   visibility/allowlist 字段，若无此步 B1/B2 对普通调用方为空壳。
+3. 补父 brief 控制面表中缺失的 `GET /v1/manager/card-templates` 只读列表端点
+   （grant 分散到多 principal 后，运维需要可枚举的权威清单入口）。
+4. B1/B2 wire status 定为 `httperr.ResponseErrorL`（pinned-400），与模块既有 9 个
+   responder 同契约；不引入 `ResponseErrorLWithStatus`。
+5. Slice 6 文档收口清单显式化（platform-card-base §9/§10、card-protocol §1/§4、
+   runbook 双 owner 清单差异、L2b 门槛 ④ 不推进声明）。
+
+另记两条既定实现口径（前轮已确认，此处固化）：robot legacy ingress 对
+`template_ref`/`catalog_provenance` 用显式 reject（新增独立函数，不复用也不改变
+`__obo_*` silent-strip 的既有语义）；pilot exact version 仍以非生产 DB preflight 为准，
+`bundle.json` 目录名在 preflight 后才落盘。
