@@ -265,12 +265,26 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 		}
-		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), robotID, req.Payload, cardtmpl.BuildEnv{
+		// PR-C D6: the grant principal is resolved from the *target*, not from
+		// the sender's own membership, and it is a separate value from the
+		// dispatch space_id above — the latter tags the DM envelope for client
+		// SpaceFilter and is deliberately forgiving, while this one authorizes
+		// and is deliberately not.
+		principal := ba.botSendCatalogPrincipal(c, robotID, channelID, req.ChannelType)
+		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), principal, req.Payload, cardtmpl.BuildEnv{
 			WebLoginURL: webLoginURL,
 			Lang:        i18n.OutboundLanguage(c.Request.Context()),
 			SpaceID:     spaceID,
 		})
 		if renderErr != nil {
+			if errors.Is(renderErr, errBotTemplateRuntimeUnavailable) {
+				// The runtime catalog could not be read, so we cannot tell
+				// whether this template ID has been shadowed. Refuse rather
+				// than fall back to the static version of the same ID.
+				ba.Error("Bot 模板运行时目录不可用", zap.Error(renderErr), zap.String("channelID", channelID))
+				httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+				return
+			}
 			if errors.Is(renderErr, errBotTemplateRequestInvalid) {
 				ba.Warn("Bot Registry 模板请求非法", zap.Error(renderErr), zap.String("channelID", channelID))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)

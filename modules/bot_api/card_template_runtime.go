@@ -1,0 +1,427 @@
+package bot_api
+
+// PR-C D6 — merging the code-reviewed static Bot policy with dynamic grants.
+//
+// Two things meet here, and both are easy to get subtly wrong:
+//
+//  1. *Which version of a template ID may this Bot send right now.* Before
+//     PR-C the answer was a process constant. Now the activation pointer can
+//     shadow it with a dynamic version, but only when this Bot actually holds
+//     a send grant in this Space. The full decision table lives in
+//     resolveSendRef below and is the single implementation both the capability
+//     manifest and the send path call — an advertised set that disagreed with
+//     what send accepts is a support incident waiting to happen.
+//
+//  2. *Which Space this Bot is acting in.* The legacy resolver in
+//     space_inject.go is deliberately forgiving: on an unauthorized header, a
+//     DB error or an ambiguous multi-Space Bot it falls back to a
+//     deterministic first Space so that DM delivery keeps working. That
+//     forgiveness is fine for "which Space tag do we stamp on a message"; it is
+//     not fine as an authorization input, because it would let an unauthorized
+//     X-Space-ID header silently downgrade into some *other* Space's grants.
+//     resolveBotGrantSpaceID below is the strict twin: same signals, but every
+//     ambiguity is a refusal.
+//
+// Nothing here loosens the static path. With the new-send gate closed the
+// resolver returns the static policy without touching the runtime DB at all,
+// so a deployment that has not opted into the dynamic catalog cannot acquire a
+// new database dependency — or a new failure mode — from this file.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/gocraft/dbr/v2"
+	"go.uber.org/zap"
+)
+
+// errBotTemplateRuntimeUnavailable marks a runtime-catalog read that could not
+// be completed. Callers must fail closed on it: the whole point of the dynamic
+// overlay is that a template ID may have been shadowed, and a failed read
+// cannot tell us whether it was.
+var errBotTemplateRuntimeUnavailable = errors.New("bot template runtime catalog unavailable")
+
+// botCatalogPrincipal is the authenticated identity one decision is made for.
+// It is always server-derived: the bot ID from the bot token, the Space from
+// the strict resolver below. No part of it comes from the request payload.
+type botCatalogPrincipal struct {
+	BotID   string
+	SpaceID string
+	// SpaceResolved is false when the Bot's Space could not be established
+	// unambiguously. Static policy still applies; every dynamic decision fails
+	// closed, because a grant is meaningless without knowing which Space's
+	// grant to read.
+	SpaceResolved bool
+}
+
+func (p botCatalogPrincipal) catalogPrincipal() cardtmpl.CatalogPrincipal {
+	return cardtmpl.CatalogPrincipal{
+		Kind: cardtmpl.CatalogPrincipalBot, ID: p.BotID, SpaceID: p.SpaceID,
+	}
+}
+
+// resolveBotGrantSpaceID is the authorization-grade Space resolver.
+//
+// It shares its signals with resolveBotActiveSpaceID but not its fallbacks:
+//
+//   - App Bot scope=space — the strongest server-authoritative signal, taken
+//     directly from the authenticated context.
+//   - An explicit X-Space-ID header — honoured only when the Bot is authorized
+//     for that Space. An unauthorized or unverifiable header is a hard refusal
+//     and never falls through to a different Space, which is precisely the
+//     downgrade the legacy resolver would allow.
+//   - Otherwise the Bot's own membership, and only when it is unambiguous. A
+//     Bot in several Spaces with no hint has no single answer, and picking the
+//     earliest-joined one would silently move a producer's grants between
+//     tenants.
+func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (string, bool) {
+	if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
+		if v, ok := c.Get(CtxKeyAppBotSpaceID); ok {
+			if s, _ := v.(string); s != "" {
+				return s, true
+			}
+		}
+	}
+	querier := ba.spaceQuerierOrDefault()
+	if querier == nil {
+		return "", false
+	}
+	if c != nil && c.Request != nil {
+		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {
+			authorized, err := querier.isBotSpaceAuthorized(robotID, hint)
+			if err != nil {
+				ba.Warn("bot_grant_space_hint_unverifiable",
+					zap.String("robotID", robotID), zap.String("hint", hint), zap.Error(err))
+				return "", false
+			}
+			if !authorized {
+				ba.Warn("bot_grant_space_hint_rejected",
+					zap.Bool("x_space_id_header_rejected", true),
+					zap.String("robotID", robotID), zap.String("hint", hint))
+				return "", false
+			}
+			return hint, true
+		}
+	}
+	primary, all, err := querier.querySpaceIDsByRobotID(robotID)
+	if err != nil {
+		if !errors.Is(err, dbr.ErrNotFound) {
+			ba.Warn("bot_grant_space_lookup_failed",
+				zap.String("robotID", robotID), zap.Error(err))
+		}
+		return "", false
+	}
+	if len(all) != 1 || primary == "" {
+		// Zero Spaces: nothing to authorize against. More than one: the caller
+		// must disambiguate with X-Space-ID rather than have the server guess.
+		if len(all) > 1 {
+			ba.Warn("bot_grant_space_ambiguous",
+				zap.Bool("multi_space_membership", true),
+				zap.String("robotID", robotID), zap.Strings("all_space_ids", all))
+		}
+		return "", false
+	}
+	return primary, true
+}
+
+func (ba *BotAPI) botCatalogPrincipalFor(c *wkhttp.Context, robotID string) botCatalogPrincipal {
+	spaceID, resolved := ba.resolveBotGrantSpaceID(c, robotID)
+	return botCatalogPrincipal{BotID: robotID, SpaceID: spaceID, SpaceResolved: resolved}
+}
+
+// botSendCatalogPrincipal resolves the Space one *send* is authorized against.
+//
+// The target decides, not the sender. A Bot can belong to Space A and still be
+// a member of a group that lives in Space B; authorizing that send against
+// Space A's grants would let a grant in one tenant deliver cards into another.
+// So for a group the Space comes from the authoritative group row, for a thread
+// from its parent group's row, and only a personal DM falls back to the Bot's
+// own context — where there is no target row to consult.
+//
+// Every failure is a refusal rather than a fallback: a malformed thread channel
+// ID, a missing group row and a DB error all leave the principal unresolved,
+// which fails the dynamic decision closed while leaving static policy intact.
+func (ba *BotAPI) botSendCatalogPrincipal(
+	c *wkhttp.Context,
+	robotID, channelID string,
+	channelType uint8,
+) botCatalogPrincipal {
+	switch channelType {
+	case common.ChannelTypeGroup.Uint8():
+		return ba.botCatalogPrincipalForGroup(robotID, channelID)
+	case common.ChannelTypeCommunityTopic.Uint8():
+		parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+			return botCatalogPrincipal{BotID: robotID}
+		}
+		return ba.botCatalogPrincipalForGroup(robotID, parts[0])
+	default:
+		return ba.botCatalogPrincipalFor(c, robotID)
+	}
+}
+
+func (ba *BotAPI) botCatalogPrincipalForGroup(robotID, groupNo string) botCatalogPrincipal {
+	querier := ba.spaceQuerierOrDefault()
+	if querier == nil {
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	spaceID, err := querier.queryGroupSpaceID(groupNo)
+	if err != nil {
+		if !errors.Is(err, dbr.ErrNotFound) {
+			ba.Warn("bot_grant_group_space_lookup_failed",
+				zap.String("robotID", robotID), zap.String("groupNo", groupNo), zap.Error(err))
+		}
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	if strings.TrimSpace(spaceID) == "" {
+		// A group outside any Space has no grant scope to read. Static policy
+		// still applies; the dynamic overlay does not.
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	return botCatalogPrincipal{BotID: robotID, SpaceID: spaceID, SpaceResolved: true}
+}
+
+// resolveSendRef implements the D6 decision table for one template ID. The
+// rows, in the order the code checks them:
+//
+//	new-send gate closed          → static policy only, no runtime DB access
+//	no activation row             → static policy version, if the policy has one
+//	pointer → a static exact      → that exact, but only if the policy lists it;
+//	                                a static exact is code-reviewed policy, so no
+//	                                business grant is consulted for it
+//	pointer → dynamic, granted    → the dynamic exact shadows the static version
+//	pointer → dynamic, ungranted  → nothing for this ID; the static version does
+//	                                NOT reappear, because the operator's intent
+//	                                was to replace it
+//	pointer → dynamic, blocked    → nothing for this ID, same reasoning
+//	runtime DB unreachable        → typed error; callers fail closed
+//
+// The two "nothing for this ID" rows are the ones worth restating: once an
+// operator points a template ID at a dynamic version, falling back to the
+// static card of the same ID would send materially different content under a
+// name the producer believes it has replaced. Refusing is the safe answer.
+func (c *botCardTemplateCatalog) resolveSendRef(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+	id cardtmpl.ID,
+) (botTemplateRef, error) {
+	staticRef, hasStatic := c.staticSendVersion(id)
+	source := c.authorizationSource()
+	// Gate closed, no resolver installed, or a Space we could not establish:
+	// the static half of the answer never depended on any of those, so it
+	// stands unchanged and the dynamic overlay is simply withheld.
+	if source == nil || !source.NewSendEnabled() || !principal.SpaceResolved {
+		if hasStatic {
+			return staticRef, nil
+		}
+		return botTemplateRef{}, nil
+	}
+	auth, err := source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: id, Principal: principal.catalogPrincipal(),
+	})
+	if err != nil {
+		if errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+			// A disabled pointer is a deliberate operator state rather than an
+			// outage, but the outcome matches the ungranted row: this ID is not
+			// sendable, and it does not revert to its static version.
+			return botTemplateRef{}, nil
+		}
+		return botTemplateRef{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+	}
+	return c.decideSendRef(id, staticRef, hasStatic, auth), nil
+}
+
+// decideSendRef is the pure half of the table above, split out so the matrix is
+// testable without a store.
+func (c *botCardTemplateCatalog) decideSendRef(
+	id cardtmpl.ID,
+	staticRef botTemplateRef,
+	hasStatic bool,
+	auth cardtmpl.RuntimeAuthorization,
+) botTemplateRef {
+	if auth.Version == "" {
+		if hasStatic {
+			return staticRef
+		}
+		return botTemplateRef{}
+	}
+	pointed := botTemplateRef{ID: id, Version: auth.Version}
+	if auth.Artifact.Source == cardtmpl.RuntimeSourceStatic {
+		if _, listed := c.sendAllowed[pointed]; listed {
+			return pointed
+		}
+		return botTemplateRef{}
+	}
+	if auth.Artifact.Blocked || !auth.Grant.Allows(cardtmpl.CatalogPurposeNewSend) {
+		return botTemplateRef{}
+	}
+	return pointed
+}
+
+// staticSendVersion returns the code-reviewed advertised version for an ID.
+func (c *botCardTemplateCatalog) staticSendVersion(id cardtmpl.ID) (botTemplateRef, bool) {
+	ref, ok := c.staticSendByID[id]
+	return ref, ok
+}
+
+func (c *botCardTemplateCatalog) authorizationSource() cardtmpl.RuntimeAuthorizationSource {
+	if c == nil {
+		return nil
+	}
+	if c.authorization != nil {
+		return c.authorization
+	}
+	return cardtmpl.DefaultAuthorizationSource()
+}
+
+// advertisedSendRefs is the effective advertised set for one principal: every
+// static-policy ID resolved through the table above, plus every additional
+// template the Bot holds an active send grant on.
+//
+// A capability manifest is a hint, not a permit. It is assembled from several
+// snapshots on purpose — binding it into one would suggest a guarantee that
+// send deliberately does not honour, since send always re-resolves.
+func (c *botCardTemplateCatalog) advertisedSendRefs(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+) ([]botTemplateRef, error) {
+	if c == nil {
+		return nil, errBotTemplateCatalogUnavailable
+	}
+	seen := make(map[cardtmpl.ID]struct{}, len(c.staticSendByID))
+	refs := make([]botTemplateRef, 0, len(c.staticSendByID))
+	for _, id := range c.staticSendIDs {
+		ref, err := c.resolveSendRef(ctx, principal, id)
+		if err != nil {
+			return nil, err
+		}
+		seen[id] = struct{}{}
+		if ref.ID != "" {
+			refs = append(refs, ref)
+		}
+	}
+
+	source := c.authorizationSource()
+	if source == nil || !source.NewSendEnabled() || !principal.SpaceResolved {
+		return refs, nil
+	}
+	granted, err := source.ListAuthorizedTemplates(ctx, principal.catalogPrincipal(), 0)
+	if err != nil {
+		return nil, errors.Join(errBotTemplateRuntimeUnavailable, err)
+	}
+	for _, candidate := range granted {
+		if _, done := seen[candidate.ID]; done {
+			continue
+		}
+		seen[candidate.ID] = struct{}{}
+		if ref := c.decideSendRef(candidate.ID, botTemplateRef{}, false, candidate.Authorization); ref.ID != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs, nil
+}
+
+// CapabilityFor is the request-scoped manifest. Before PR-C this was a process
+// constant; it is now resolved per authenticated Bot and Space, because two
+// Bots in the same deployment can legitimately be granted different templates.
+//
+// A runtime read failure is reported to the caller rather than degraded into
+// the static manifest: advertising the static version of an ID that may have
+// been shadowed would tell a producer it can send something the send path will
+// refuse, which is worse than admitting the catalog is briefly unreadable.
+func (c *botCardTemplateCatalog) CapabilityFor(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+) (botTemplatingCapability, error) {
+	if c == nil {
+		return c.Capability(), nil
+	}
+	refs, err := c.advertisedSendRefs(ctx, principal)
+	if err != nil {
+		return botTemplatingCapability{}, err
+	}
+	manifest := botTemplatingCapability{
+		Supported: true, Wire: botTemplateWireV1,
+		Templates: make([]botTemplateCapability, 0, len(refs)),
+	}
+	staticByRef := make(map[botTemplateRef]botTemplateCapability, len(c.capability.Templates))
+	for _, template := range c.capability.Templates {
+		staticByRef[botTemplateRef{ID: cardtmpl.ID(template.ID), Version: template.Version}] = template
+	}
+	for _, ref := range refs {
+		if precomputed, ok := staticByRef[ref]; ok {
+			manifest.Templates = append(manifest.Templates, cloneTemplateCapability(precomputed))
+			continue
+		}
+		meta, err := c.catalog.MetaExact(ctx, cardtmpl.CatalogExactRequest{
+			Access: botCatalogAccess(cardtmpl.CatalogPurposeNewSend, principal.BotID, principal.SpaceID),
+			ID:     ref.ID, Version: ref.Version,
+		})
+		if err != nil {
+			return botTemplatingCapability{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+		}
+		capability, err := templateCapabilityFromMeta(meta)
+		if err != nil {
+			return botTemplatingCapability{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+		}
+		manifest.Templates = append(manifest.Templates, capability)
+	}
+	sort.Slice(manifest.Templates, func(i, j int) bool {
+		left, right := manifest.Templates[i], manifest.Templates[j]
+		if left.ID != right.ID {
+			return left.ID < right.ID
+		}
+		return left.Version < right.Version
+	})
+	return manifest, nil
+}
+
+// requireSendableRef is the send-path authorization boundary for a
+// caller-supplied template_ref. It re-resolves rather than trusting whatever
+// the producer read from a capability manifest: the manifest may be arbitrarily
+// old, and an activate, block or revoke since then must take effect now.
+func (c *botCardTemplateCatalog) requireSendableRef(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+	value any,
+) (botTemplateRef, error) {
+	if c == nil || c.catalog == nil {
+		return botTemplateRef{}, errBotTemplateCatalogUnavailable
+	}
+	ref, err := parseBotTemplateRef(value)
+	if err != nil {
+		return botTemplateRef{}, err
+	}
+	allowed, err := c.resolveSendRef(ctx, principal, ref.ID)
+	if err != nil {
+		return botTemplateRef{}, err
+	}
+	if allowed != ref {
+		// One message for "unknown template", "wrong version" and "not granted"
+		// alike: a producer must not be able to use send rejections to
+		// enumerate which templates exist or which other Bots hold grants.
+		return botTemplateRef{}, fmt.Errorf("%w: not Bot-callable for new send", errBotTemplateRequestInvalid)
+	}
+	return ref, nil
+}
+
+func cloneTemplateCapability(template botTemplateCapability) botTemplateCapability {
+	out := botTemplateCapability{
+		ID: template.ID, Version: template.Version,
+		Views: make([]botTemplateViewCapability, len(template.Views)),
+	}
+	for i, view := range template.Views {
+		out.Views[i] = botTemplateViewCapability{
+			Name: view.Name, WireProfile: view.WireProfile,
+			States:        append(make([]string, 0, len(view.States)), view.States...),
+			SubmitActions: append(make([]string, 0, len(view.SubmitActions)), view.SubmitActions...),
+		}
+	}
+	return out
+}

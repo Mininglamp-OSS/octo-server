@@ -548,8 +548,9 @@ func cardtmplBuildEnvForTest() cardtmpl.BuildEnv {
 func markedRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog, botID string) []byte {
 	t.Helper()
 	env := cardtmplBuildEnvForTest()
-	payload, err := catalog.RenderPayloadForPrincipal(context.Background(), botID, registrySendBody(t,
-		"reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	payload, err := catalog.RenderPayloadForPrincipal(context.Background(),
+		botCatalogPrincipal{BotID: botID, SpaceID: env.SpaceID, SpaceResolved: true},
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
 	if err != nil {
 		t.Fatal(err)
 	}

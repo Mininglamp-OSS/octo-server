@@ -406,7 +406,8 @@ func integrationRuntimeCatalog(t *testing.T, registry *cardtmpl.Registry, store 
 	t.Helper()
 	catalog, err := cardtmpl.NewRuntimeCatalog(registry, store, cardtmpl.RuntimeCatalogConfig{
 		MaxCacheEntries: 8, MaxCacheBytes: 8 << 20, CompileTimeout: 5 * time.Second,
-		AuthorizeDynamic: func(context.Context, cardtmpl.CatalogAccess, cardtmpl.RuntimeArtifactMeta) error {
+		AuthorizeDynamic: func(context.Context, cardtmpl.CatalogAccess, cardtmpl.RuntimeArtifactMeta,
+			cardtmpl.RuntimeGrant) error {
 			return nil
 		},
 	})

@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
 const (
@@ -320,7 +321,6 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/presigned", ba.botUploadPresigned)
 		botAPI.POST("/message/edit", ba.botMessageEdit)
 		botAPI.POST("/message/card/revisions/clear", ba.botCardRevisionsClear) // D10.6 清除卡片修订(写墓碑)
-		botAPI.GET("/card/profile", ba.botCardProfile)                         // D12 卡片能力清单(feature detection)
 		botAPI.GET("/user/info", ba.getUserInfo)
 		// Voice context API (User Bot only)
 		botAPI.PUT("/voice/context", ba.botPutVoiceContext)
@@ -335,6 +335,20 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		// different from the user-token /v1/obo/* CRUD which mutates
 		// grants on behalf of a logged-in grantor.
 		botAPI.GET("/obo-grant", ba.oboBotGetGrant)
+	}
+
+	// D12 卡片能力清单(feature detection)。PR-C D6 把它从进程常量改为
+	// request-scoped：清单现在按认证 bot + 权威 Space 查询 active/unblocked
+	// dynamic send grant，可能落到 runtime DB，因此单独挂 uid 限流。
+	//
+	// 中间件链与 incoming_webhook / search 一致：authBot（bf_/app_ token →
+	// robot_id）→ botActorUID（把 robot_id 写入 "uid"）→ SharedUIDRateLimiter
+	// （必须在 uid 写入之后，否则读不到 uid 会静默 fail-open）。只包这一条路由，
+	// 不给同组既有 legacy Bot 路由静默加上限流。
+	cardProfileAPI := r.Group("/v1/bot",
+		ba.authBot(), ba.botActorUID(), appwkhttp.SharedUIDRateLimiter(r, ba.ctx))
+	{
+		cardProfileAPI.GET("/card/profile", ba.botCardProfile)
 	}
 
 	// Bot File API (separate group for wildcard conflict avoidance)

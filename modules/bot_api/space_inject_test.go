@@ -51,12 +51,28 @@ type fakeSpaceQuerier struct {
 	//       `activeSpaces[spaceID] != false` → scope=space App Bot in own Space
 	// `activeSpaces` defaults to true for any spaceID not explicitly set to
 	// false, so tests that don't care about Space status can omit it.
-	memberships   map[string]map[string]bool
-	authCalls     []memberCall
-	authDefault   bool
-	authErr       error
-	appBots       map[string]appBotShape
-	activeSpaces  map[string]bool
+	memberships  map[string]map[string]bool
+	authCalls    []memberCall
+	authDefault  bool
+	authErr      error
+	appBots      map[string]appBotShape
+	activeSpaces map[string]bool
+	// PR-C: group_no -> Space of the authoritative `group` row. An absent key
+	// answers dbr.ErrNotFound so the grant resolver's fail-closed branch is the
+	// default rather than something a test has to opt into.
+	groupSpaces   map[string]string
+	groupSpaceErr error
+}
+
+func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, error) {
+	f.calls = append(f.calls, "queryGroupSpaceID:"+groupNo)
+	if f.groupSpaceErr != nil {
+		return "", f.groupSpaceErr
+	}
+	if spaceID, ok := f.groupSpaces[groupNo]; ok {
+		return spaceID, nil
+	}
+	return "", dbr.ErrNotFound
 }
 
 type appBotShape struct {

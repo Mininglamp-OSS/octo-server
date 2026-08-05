@@ -226,3 +226,22 @@ func (d *botAPIDB) queryAppBotByUID(uid string) (*appBotModel, error) {
 	_, err := d.session.Select("*").From("app_bot").Where("uid=?", uid).Load(&m)
 	return m, err
 }
+
+// queryGroupSpaceID returns the authoritative Space of a group row. It is the
+// Space a card sent into that group is authorized against — the Bot's own
+// membership Space is not, since a Bot can belong to one Space and be a member
+// of a group that lives in another. An empty result is dbr.ErrNotFound so the
+// caller fails closed rather than treating "no row" as "no Space needed".
+func (d *botAPIDB) queryGroupSpaceID(groupNo string) (string, error) {
+	var spaceIDs []string
+	_, err := d.session.SelectBySql(
+		"SELECT `group`.space_id FROM `group` WHERE `group`.group_no=? LIMIT 1", groupNo,
+	).Load(&spaceIDs)
+	if err != nil {
+		return "", err
+	}
+	if len(spaceIDs) == 0 {
+		return "", dbr.ErrNotFound
+	}
+	return spaceIDs[0], nil
+}

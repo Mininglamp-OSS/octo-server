@@ -26,14 +26,32 @@ package bot_api
 import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"go.uber.org/zap"
 )
 
 // botCardProfile handles GET /v1/bot/card/profile (D12).
 func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	// authBot 已在中间件层校验 bot-token；此处再确认存在 bot 身份（与同组 GET 端点
 	// 一致的防御，非资源属主校验 —— 清单无属主概念）。缺身份 → 既有 bot-auth 拒绝。
-	if getRobotIDFromContext(c) == "" {
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
 		ba.respondBotAPIIdentityMissing(c)
+		return
+	}
+	// PR-C D6: templating is no longer a process constant. Two Bots in the same
+	// deployment can hold different grants, so the manifest is resolved for this
+	// authenticated Bot in its authoritative Space. Everything else on this
+	// response stays deployment-level and stays request-independent.
+	templating, err := ba.cardTemplates.CapabilityFor(c.Request.Context(),
+		ba.botCatalogPrincipalFor(c, robotID))
+	if err != nil {
+		// Reporting the static manifest here would advertise versions that the
+		// send path may already be refusing. An honest "temporarily unknown"
+		// lets a producer retry; a confidently wrong manifest does not.
+		ba.Error("Bot 卡片能力清单不可用", zap.Error(err), zap.String("robotID", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{
@@ -57,7 +75,7 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		// only the explicit Bot catalog, never the broader Registry.List(). A nil
 		// catalog occurs only in focused tests that do not install the production
 		// composition root and reports supported:false rather than inventing refs.
-		"templating": ba.cardTemplates.Capability(),
+		"templating": templating,
 		"limits": map[string]interface{}{
 			"max_payload_bytes":    cardmsg.MaxPayloadBytes,
 			"max_nodes":            cardmsg.MaxNodes,

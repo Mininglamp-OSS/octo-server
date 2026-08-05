@@ -59,6 +59,17 @@ type botCardTemplateCatalog struct {
 	sendAllowed map[botTemplateRef]struct{}
 	editAllowed map[botTemplateRef]struct{}
 	capability  botTemplatingCapability
+	// staticSendByID is the same policy as sendAllowed, keyed by template ID.
+	// PR-C D6 requires at most one advertised send version per ID, so this is a
+	// total map rather than a convenience index — the constructor rejects a
+	// policy that would make it lossy.
+	staticSendByID map[cardtmpl.ID]botTemplateRef
+	// staticSendIDs preserves a deterministic order for the manifest.
+	staticSendIDs []cardtmpl.ID
+	// authorization overrides the process-wide resolver in tests. Production
+	// leaves it nil and reads cardtmpl.DefaultAuthorizationSource() per request,
+	// so a catalog built before the composition root still picks the resolver up.
+	authorization cardtmpl.RuntimeAuthorizationSource
 }
 
 func defaultBotTemplateRefs() []botTemplateRef {
@@ -101,9 +112,10 @@ func newBotCardTemplateCatalogWithPolicy(
 		return nil, fmt.Errorf("bot template catalog: empty edit-compatible allowlist")
 	}
 	catalog := &botCardTemplateCatalog{
-		catalog:     runtimeCatalog,
-		sendAllowed: make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
-		editAllowed: make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
+		catalog:        runtimeCatalog,
+		sendAllowed:    make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
+		editAllowed:    make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
+		staticSendByID: make(map[cardtmpl.ID]botTemplateRef, len(policy.AdvertisedSend)),
 		capability: botTemplatingCapability{
 			Supported: true,
 			Wire:      botTemplateWireV1,
@@ -114,8 +126,15 @@ func newBotCardTemplateCatalogWithPolicy(
 		if strings.TrimSpace(string(ref.ID)) == "" || strings.TrimSpace(ref.Version) == "" {
 			return nil, fmt.Errorf("bot template catalog: id and explicit version are required")
 		}
-		if _, duplicate := catalog.sendAllowed[ref]; duplicate {
-			return nil, fmt.Errorf("bot template catalog: duplicate advertised/send %s@%s", ref.ID, ref.Version)
+		// PR-C D6: the guard is per template ID, not per exact ref. Two
+		// versions of one ID are not a harmless duplicate — the dynamic
+		// activation pointer resolves to a single version per ID, so a policy
+		// advertising two of them has no well-defined answer to "which version
+		// does the pointer shadow", and the manifest and the send path would be
+		// free to pick differently.
+		if existing, duplicate := catalog.staticSendByID[ref.ID]; duplicate {
+			return nil, fmt.Errorf("bot template catalog: %s is advertised at both %s and %s; "+
+				"exactly one send version per template ID", ref.ID, existing.Version, ref.Version)
 		}
 		meta, err := lookupBotTemplateMeta(runtimeCatalog, cardtmpl.CatalogExactRequest{
 			Access: botCatalogAccess(cardtmpl.CatalogPurposeNewSend, "bot-api-manifest", ""),
@@ -128,55 +147,13 @@ func newBotCardTemplateCatalogWithPolicy(
 			return nil, fmt.Errorf("bot template catalog: incomplete metadata for %s@%s", ref.ID, ref.Version)
 		}
 
-		capability := botTemplateCapability{
-			ID: string(meta.ID), Version: meta.Version,
-			Views: make([]botTemplateViewCapability, 0, len(meta.Views)),
+		capability, err := templateCapabilityFromMeta(meta)
+		if err != nil {
+			return nil, err
 		}
-		for view, spec := range meta.Views {
-			if strings.TrimSpace(string(view)) == "" || len(spec.States) == 0 {
-				return nil, fmt.Errorf("bot template catalog: %s@%s has empty view/state metadata", ref.ID, ref.Version)
-			}
-			viewCapability := botTemplateViewCapability{
-				Name:          string(view),
-				WireProfile:   spec.WireProfile,
-				States:        make([]string, 0, len(spec.States)),
-				SubmitActions: make([]string, 0),
-			}
-			for _, state := range spec.States {
-				if strings.TrimSpace(string(state)) == "" {
-					return nil, fmt.Errorf("bot template catalog: %s@%s view %s has empty state", ref.ID, ref.Version, view)
-				}
-				viewCapability.States = append(viewCapability.States, string(state))
-			}
-			sort.Strings(viewCapability.States)
-
-			if spec.WireProfile == cardmsg.ProfileV2 {
-				report, ok := meta.Interaction(view)
-				if !ok {
-					return nil, fmt.Errorf("bot template catalog: %s@%s view %s missing interaction report", ref.ID, ref.Version, view)
-				}
-				seenActions := make(map[string]struct{})
-				for _, action := range report.Actions {
-					if action.Type != "Action.Submit" {
-						continue
-					}
-					if strings.TrimSpace(action.ID) == "" {
-						return nil, fmt.Errorf("bot template catalog: %s@%s view %s has empty Submit id", ref.ID, ref.Version, view)
-					}
-					if _, duplicate := seenActions[action.ID]; duplicate {
-						return nil, fmt.Errorf("bot template catalog: %s@%s view %s has duplicate Submit id %q", ref.ID, ref.Version, view, action.ID)
-					}
-					seenActions[action.ID] = struct{}{}
-					viewCapability.SubmitActions = append(viewCapability.SubmitActions, action.ID)
-				}
-				sort.Strings(viewCapability.SubmitActions)
-			}
-			capability.Views = append(capability.Views, viewCapability)
-		}
-		sort.Slice(capability.Views, func(i, j int) bool {
-			return capability.Views[i].Name < capability.Views[j].Name
-		})
 		catalog.sendAllowed[ref] = struct{}{}
+		catalog.staticSendByID[ref.ID] = ref
+		catalog.staticSendIDs = append(catalog.staticSendIDs, ref.ID)
 		catalog.capability.Templates = append(catalog.capability.Templates, capability)
 	}
 	for _, ref := range policy.EditCompatible {
@@ -210,7 +187,73 @@ func newBotCardTemplateCatalogWithPolicy(
 		}
 		return left.Version < right.Version
 	})
+	sort.Slice(catalog.staticSendIDs, func(i, j int) bool {
+		return catalog.staticSendIDs[i] < catalog.staticSendIDs[j]
+	})
 	return catalog, nil
+}
+
+// templateCapabilityFromMeta projects one template's metadata into the wire
+// capability shape. The constructor and the request-scoped manifest share it so
+// that a dynamic template is described exactly as a static one would be — a
+// producer must not be able to tell the two apart from the manifest, since the
+// whole point of the catalog is that the source is an operator concern.
+func templateCapabilityFromMeta(meta cardtmpl.TemplateMeta) (botTemplateCapability, error) {
+	capability := botTemplateCapability{
+		ID: string(meta.ID), Version: meta.Version,
+		Views: make([]botTemplateViewCapability, 0, len(meta.Views)),
+	}
+	for view, spec := range meta.Views {
+		if strings.TrimSpace(string(view)) == "" || len(spec.States) == 0 {
+			return botTemplateCapability{}, fmt.Errorf(
+				"bot template catalog: %s@%s has empty view/state metadata", meta.ID, meta.Version)
+		}
+		viewCapability := botTemplateViewCapability{
+			Name:          string(view),
+			WireProfile:   spec.WireProfile,
+			States:        make([]string, 0, len(spec.States)),
+			SubmitActions: make([]string, 0),
+		}
+		for _, state := range spec.States {
+			if strings.TrimSpace(string(state)) == "" {
+				return botTemplateCapability{}, fmt.Errorf(
+					"bot template catalog: %s@%s view %s has empty state", meta.ID, meta.Version, view)
+			}
+			viewCapability.States = append(viewCapability.States, string(state))
+		}
+		sort.Strings(viewCapability.States)
+
+		if spec.WireProfile == cardmsg.ProfileV2 {
+			report, ok := meta.Interaction(view)
+			if !ok {
+				return botTemplateCapability{}, fmt.Errorf(
+					"bot template catalog: %s@%s view %s missing interaction report", meta.ID, meta.Version, view)
+			}
+			seenActions := make(map[string]struct{})
+			for _, action := range report.Actions {
+				if action.Type != "Action.Submit" {
+					continue
+				}
+				if strings.TrimSpace(action.ID) == "" {
+					return botTemplateCapability{}, fmt.Errorf(
+						"bot template catalog: %s@%s view %s has empty Submit id", meta.ID, meta.Version, view)
+				}
+				if _, duplicate := seenActions[action.ID]; duplicate {
+					return botTemplateCapability{}, fmt.Errorf(
+						"bot template catalog: %s@%s view %s has duplicate Submit id %q",
+						meta.ID, meta.Version, view, action.ID)
+				}
+				seenActions[action.ID] = struct{}{}
+				viewCapability.SubmitActions = append(viewCapability.SubmitActions, action.ID)
+			}
+			sort.Strings(viewCapability.SubmitActions)
+		}
+		capability.Views = append(capability.Views, viewCapability)
+	}
+	sort.Slice(capability.Views, func(i, j int) bool {
+		return capability.Views[i].Name < capability.Views[j].Name
+	})
+	return capability, nil
 }
 
 func (c *botCardTemplateCatalog) Capability() botTemplatingCapability {
@@ -243,21 +286,27 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send", false)
+	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend, inbound, env,
+		c.staticRefResolver(c.sendAllowed, "not Bot-callable for new send"), false)
 }
 
+// RenderPayloadForPrincipal is the authenticated new-send path. Unlike the
+// compat variant above it re-resolves the ref against the runtime catalog for
+// this exact principal, so an activation, block or revoke takes effect on the
+// very next send rather than at the next process restart.
 func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
 	ctx context.Context,
-	botID string,
+	principal botCatalogPrincipal,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 ) (map[string]any, error) {
-	if c == nil || strings.TrimSpace(botID) == "" {
+	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send", true)
+	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeNewSend, inbound, env,
+		func(ctx context.Context, value any) (botTemplateRef, error) {
+			return c.requireSendableRef(ctx, principal, value)
+		}, true)
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayload(
@@ -268,8 +317,8 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible", false)
+	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), false)
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
@@ -281,8 +330,8 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	if c == nil || strings.TrimSpace(botID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible", true)
+	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true)
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -291,8 +340,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 	purpose cardtmpl.CatalogPurpose,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
-	allowed map[botTemplateRef]struct{},
-	denialReason string,
+	resolveRef func(context.Context, any) (botTemplateRef, error),
 	authorProvenance bool,
 ) (map[string]any, error) {
 	if c == nil || c.catalog == nil {
@@ -313,7 +361,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 	if _, hasCard := inbound["card"]; hasCard {
 		return nil, fmt.Errorf("%w: raw card and template_ref are mutually exclusive", errBotTemplateRequestInvalid)
 	}
-	ref, err := c.requireRef(inbound["template_ref"], allowed, denialReason)
+	ref, err := resolveRef(ctx, inbound["template_ref"])
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +425,19 @@ func (c *botCardTemplateCatalog) requireEditableRef(value any) (botTemplateRef, 
 		return botTemplateRef{}, errBotTemplateCatalogUnavailable
 	}
 	return c.requireRef(value, c.editAllowed, "template is not edit-compatible")
+}
+
+// staticRefResolver adapts a boot-time allowlist to the resolver signature.
+// Historical edit stays on this path on purpose: an edit is pinned to the
+// version already stored in the frame, so following the activation pointer
+// there would rewrite an existing card across versions (D6).
+func (c *botCardTemplateCatalog) staticRefResolver(
+	allowed map[botTemplateRef]struct{},
+	denialReason string,
+) func(context.Context, any) (botTemplateRef, error) {
+	return func(_ context.Context, value any) (botTemplateRef, error) {
+		return c.requireRef(value, allowed, denialReason)
+	}
 }
 
 func (c *botCardTemplateCatalog) requireRef(

@@ -23,11 +23,26 @@ const (
         WHERE template_id = ? AND version = ? AND content_sha256 = ?`
 )
 
+// rowQuerier lets the activation/artifact readers run either standalone or
+// inside the single authorization snapshot without a second copy of the shape
+// validation below. *sql.DB and *sql.Tx both satisfy it.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func (s *store) LoadActivation(ctx context.Context, id cardtmpl.ID) (cardtmpl.RuntimeActivation, error) {
+	return scanRuntimeActivation(ctx, s.db, id)
+}
+
+func scanRuntimeActivation(
+	ctx context.Context,
+	querier rowQuerier,
+	id cardtmpl.ID,
+) (cardtmpl.RuntimeActivation, error) {
 	var version sql.NullString
 	var status string
 	var revision uint64
-	err := s.db.QueryRowContext(ctx, selectRuntimeActivationSQL, string(id)).
+	err := querier.QueryRowContext(ctx, selectRuntimeActivationSQL, string(id)).
 		Scan(&version, &status, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return cardtmpl.RuntimeActivation{}, nil
@@ -59,10 +74,19 @@ func (s *store) LoadArtifactMeta(
 	id cardtmpl.ID,
 	version string,
 ) (cardtmpl.RuntimeArtifactMeta, error) {
+	return scanRuntimeArtifactMeta(ctx, s.db, id, version)
+}
+
+func scanRuntimeArtifactMeta(
+	ctx context.Context,
+	querier rowQuerier,
+	id cardtmpl.ID,
+	version string,
+) (cardtmpl.RuntimeArtifactMeta, error) {
 	var source string
 	var owner, visibility, engine, protocol, contractVersion, hash sql.NullString
 	var blocked bool
-	err := s.db.QueryRowContext(ctx, selectRuntimeArtifactMetaSQL, string(id), version).Scan(
+	err := querier.QueryRowContext(ctx, selectRuntimeArtifactMetaSQL, string(id), version).Scan(
 		&source, &owner, &visibility, &engine, &protocol, &contractVersion, &hash, &blocked,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

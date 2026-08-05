@@ -210,40 +210,93 @@ Down exists for test rollback; production rollback does not rely on Down.
 
 ### Slice 3 — atomic authorization and Bot merge
 
-Production files:
+Landed (`feat: resolve card catalog authorization in one snapshot`):
 
-- `[modify] pkg/cardtmpl/catalog.go`
-- `[modify] pkg/cardtmpl/runtime_catalog.go`
-- `[new] modules/card_template_catalog/store_authorization.go`
-- `[modify] modules/card_template_catalog/store_runtime.go`
-- `[modify] modules/card_template_catalog/runtime_install.go`
-- `[modify] modules/bot_api/card_template_catalog.go`
-- `[modify] modules/bot_api/bot_api.go` — mount only the card-profile route as
-  `authBot → botActorUID → SharedUIDRateLimiter`; do not silently rate-limit
-  unrelated legacy Bot routes.
-- `[modify] modules/bot_api/card_profile.go`
-- `[modify] modules/bot_api/send.go`
-- `[modify] modules/bot_api/resolve_targets.go`
-- `[modify] modules/bot_api/space_inject.go`
-- `[modify] main.go` — inject the shared resolver/binding dependencies; do not
-  create a second grant truth.
+- `[new] pkg/cardtmpl/runtime_authorization.go` — the D4 contract:
+  `RuntimeGrant` (+`Allows(purpose)`), `RuntimeAuthorizationQuery/…Authorization`,
+  the indivisible `RuntimeAuthorizationStore`, `RuntimeAdvertiser`,
+  `RuntimeAuthorizationSource` (readers + the new-send gate) with
+  `SetDefaultAuthorizationSource`/`DefaultAuthorizationSource`, and the single
+  `ActivationVersion` rule both catalog and store call.
+- `[modify] pkg/cardtmpl/runtime_catalog.go` — `resolveVersion` +
+  `resolveDynamic`'s split reads replaced by one `resolve()` that performs at
+  most one snapshot; `verifyAuthorization` rejects an incoherent receipt;
+  `RuntimeDynamicAuthorizeFunc` now carries the grant. Static/explicit reads
+  still return before any store call, so a gates-off deployment gains no DB
+  dependency. `versionMode` distinguishes new-send (may follow the pointer)
+  from historical-edit/action-context (pinned, never follows it).
+- `pkg/cardtmpl/catalog.go` — no change was needed; `Catalog` stays the render
+  surface and the resolver seam lives beside it.
+- `[new] modules/card_template_catalog/store_authorization.go` — one
+  REPEATABLE READ read-only tx reading activation + claim/artifact/block +
+  exact/global grant rows, reduced through the existing `resolveGrantRows`;
+  plus bounded `ListAuthorizedTemplates` for the Bot advertised set.
+  Compile-time assertion that `*store` is the resolver.
+- `[modify] modules/card_template_catalog/store_runtime.go` — activation and
+  artifact scans take a `rowQuerier` so the standalone and in-snapshot reads
+  share one copy of the shape validation.
+- `[modify] modules/card_template_catalog/runtime_install.go` — the authorizer
+  consumes the snapshot grant (purpose→permission, no IO of its own) and the
+  composition root publishes `runtimeAuthorizationSource` (store + gates).
+- `[new] modules/bot_api/card_template_runtime.go` — `botCatalogPrincipal`,
+  the strict `resolveBotGrantSpaceID` (every ambiguity refuses; an
+  unauthorized/unverifiable `X-Space-ID` never falls through), the
+  target-authoritative `botSendCatalogPrincipal` (group row / thread parent
+  row), the D6 `resolveSendRef`/`decideSendRef` matrix, `advertisedSendRefs`,
+  request-scoped `CapabilityFor`, and `requireSendableRef`.
+- `[modify] modules/bot_api/card_template_catalog.go` — per-template-ID single
+  advertised send version guard (was per exact ref); `staticSendByID`/
+  `staticSendIDs`; `renderPayload` takes a ref-resolver seam so new send
+  re-resolves while historical edit stays pinned to the static allowlist;
+  `templateCapabilityFromMeta` shared by boot and request-scoped manifests.
+- `[modify] modules/bot_api/card_profile.go` — manifest resolved per
+  authenticated bot + Space; a runtime read failure returns a typed error
+  instead of advertising a possibly-shadowed static version.
+- `[modify] modules/bot_api/bot_api.go` — `/card/profile` moved to its own
+  group `authBot → botActorUID → SharedUIDRateLimiter`; the other legacy Bot
+  routes are deliberately left unlimited.
+- `[modify] modules/bot_api/send.go` — new send resolves the grant principal
+  from the target and fails closed on `errBotTemplateRuntimeUnavailable`.
+- `[modify] modules/bot_api/{db.go,space_inject.go}` — `queryGroupSpaceID`
+  added to `botSpaceQuerier`.
+- `modules/bot_api/{resolve_targets.go,card_profile route consts}` and
+  `main.go` — no change was needed: `InstallRuntimeCatalog` already runs before
+  the module factories, and publishing the resolver there avoids a second
+  grant truth without new wiring in `main.go`.
 
 Focused tests:
 
-- `[modify] pkg/cardtmpl/runtime_catalog_test.go`
+- `[new] pkg/cardtmpl/runtime_authorization_test.go` — one-snapshot counting,
+  pinned reads never follow the pointer, incoherent-snapshot rejection,
+  static-exact needs no snapshot, a grant-unaware store can never produce an
+  allow, `Allows`/`ActivationVersion` tables.
+- `[new] modules/card_template_catalog/store_authorization_test.go` — tx shape
+  via sqlmock, precedence table, ungrantable principals issue no grant query.
 - `[new] modules/card_template_catalog/store_authorization_mysql_integration_test.go`
-- `[modify] modules/card_template_catalog/runtime_db_integration_test.go`
-- `[modify] modules/bot_api/card_template_catalog_test.go`
-- `[modify] modules/bot_api/card_profile_test.go`
-- `[modify] modules/bot_api/card_template_send_test.go`
-- `[modify] modules/bot_api/card_template_edit_test.go`
-- `[modify] modules/bot_api/resolve_targets_test.go`
-- `[modify] modules/bot_api/space_inject_multispace_test.go`
+  — the linearization point (a held snapshot is unaffected by a concurrent
+  revoke; the next snapshot is already denied), exact tombstone shadowing a
+  live global grant, block/unknown reported from the snapshot.
+- `[new] modules/bot_api/card_template_runtime_test.go` — the eleven-row shadow
+  matrix, manifest/send agreement, stale-ref rejection, granted-dynamic
+  advertisement, list-failure fail-close, the two-versions-per-ID constructor
+  guard, the strict Space resolver table, target-authoritative group/thread
+  Space.
+- `[modify] modules/card_template_catalog/runtime_gates_test.go` — authorizer
+  purpose→permission matrix.
+- `[modify]` signature migrations in `pkg/cardtmpl/runtime_catalog_test.go`,
+  `modules/card_template_catalog/runtime_db_integration_test.go`,
+  `modules/bot_api/{card_template_catalog_test.go,card_template_edit_test.go,
+  space_inject_test.go}`.
 
 Exit gate: active/block/grant are read in one primary-DB snapshot; profile and
 send share the same resolver but make independent decisions; dynamic active
 shadows static same-ID new-send; revoke/DB failure/invalid or ambiguous Space
 never falls back; static gate-off behavior does not gain a DB dependency.
+
+Deferred to Slice 6 (documentation reconciliation): `resolve_targets.go` needs
+no code change, but the runbook must state that a Bot's advertised catalog is
+now request-scoped, so an operator reading `/card/profile` sees that Bot's
+view rather than the deployment's.
 
 ### Slice 4 — B1/B2 discovery and safe export
 

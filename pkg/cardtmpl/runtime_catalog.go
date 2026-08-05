@@ -68,7 +68,11 @@ type RuntimeArtifactStore interface {
 	LoadArtifactBundle(context.Context, ID, string, string) (CanonicalBundle, error)
 }
 
-type RuntimeDynamicAuthorizeFunc func(context.Context, CatalogAccess, RuntimeArtifactMeta) error
+// RuntimeDynamicAuthorizeFunc decides one dynamic access. The grant argument
+// comes from the same snapshot as the artifact metadata (see
+// runtime_authorization.go); an implementation must never go read a grant of
+// its own, because a second read is a second point in time.
+type RuntimeDynamicAuthorizeFunc func(context.Context, CatalogAccess, RuntimeArtifactMeta, RuntimeGrant) error
 
 type RuntimeCatalogHooks struct {
 	OnResolve   func(RuntimeSource, string)
@@ -86,8 +90,12 @@ type RuntimeCatalogConfig struct {
 }
 
 type RuntimeCatalog struct {
-	static           *StaticCatalog
-	store            RuntimeArtifactStore
+	static *StaticCatalog
+	store  RuntimeArtifactStore
+	// authorization is the single-snapshot resolver, present whenever the store
+	// implements it. Production always does; see loadAuthorization for what a
+	// store without it can and cannot do.
+	authorization    RuntimeAuthorizationStore
 	cache            *compiledArtifactCache
 	compileTimeout   time.Duration
 	compile          func(context.Context, Bundle, CompileLimits) (*CompiledArtifact, error)
@@ -119,8 +127,9 @@ func NewRuntimeCatalog(
 	if err != nil {
 		return nil, err
 	}
+	authorization, _ := store.(RuntimeAuthorizationStore)
 	return &RuntimeCatalog{
-		static: static, store: store,
+		static: static, store: store, authorization: authorization,
 		cache: newCompiledArtifactCache(entries, bytes), compileTimeout: timeout,
 		compile:          CompileJSONArtifact,
 		checkReady:       config.CheckReady,
@@ -153,32 +162,17 @@ func (c *RuntimeCatalog) Render(ctx context.Context, request CatalogRenderReques
 	if c == nil || c.static == nil || c.store == nil {
 		return nil, ErrRuntimeCatalogUnavailable
 	}
-	explicit := request.Version != ""
-	version, err := c.resolveVersion(ctx, request.ID, request.Version)
+	resolution, err := c.resolve(ctx, request.Access, request.ID, request.Version, followActivation)
 	if err != nil {
 		return nil, err
 	}
-	if version == "" {
-		payload, err := c.static.Render(ctx, request)
-		c.observeResolve(RuntimeSourceStatic, err)
-		return payload, err
-	}
-	if _, err := c.static.registry.Lookup(request.ID, version); err == nil {
-		if explicit {
-			if err := c.rejectIntegrity(); err != nil {
-				c.observeResolve(RuntimeSourceStatic, err)
-				return nil, err
-			}
-		}
-		request.Version = version
+	request.Version = resolution.version
+	if resolution.serveStatic {
 		payload, renderErr := c.static.Render(ctx, request)
 		c.observeResolve(RuntimeSourceStatic, renderErr)
 		return payload, renderErr
-	} else if !errors.Is(err, ErrTemplateUnknown) {
-		return nil, err
 	}
-	request.Version = version
-	artifact, err := c.resolveDynamic(ctx, request.Access, request.ID, version)
+	artifact, err := c.resolveDynamic(ctx, request.Access, resolution)
 	if err != nil {
 		return nil, err
 	}
@@ -192,17 +186,18 @@ func (c *RuntimeCatalog) MetaExact(ctx context.Context, request CatalogExactRequ
 	if strings.TrimSpace(request.Version) == "" {
 		return TemplateMeta{}, fmt.Errorf("%w: explicit version is required", ErrTemplateUnknown)
 	}
-	if meta, err := c.static.MetaExact(ctx, request); err == nil {
-		if err := c.rejectIntegrity(); err != nil {
-			c.observeResolve(RuntimeSourceStatic, err)
-			return TemplateMeta{}, err
-		}
-		c.observeResolve(RuntimeSourceStatic, nil)
-		return meta, nil
-	} else if !errors.Is(err, ErrTemplateUnknown) {
+	resolution, err := c.resolve(ctx, request.Access, request.ID, request.Version, pinExactVersion)
+	if err != nil {
 		return TemplateMeta{}, err
 	}
-	artifact, err := c.resolveDynamic(ctx, request.Access, request.ID, request.Version)
+	if resolution.serveStatic {
+		meta, metaErr := c.static.MetaExact(ctx, CatalogExactRequest{
+			Access: request.Access, ID: request.ID, Version: resolution.version,
+		})
+		c.observeResolve(RuntimeSourceStatic, metaErr)
+		return meta, metaErr
+	}
+	artifact, err := c.resolveDynamic(ctx, request.Access, resolution)
 	if err != nil {
 		return TemplateMeta{}, err
 	}
@@ -213,44 +208,51 @@ func (c *RuntimeCatalog) MetaDefault(ctx context.Context, request CatalogDefault
 	if c == nil || c.static == nil || c.store == nil {
 		return TemplateMeta{}, ErrRuntimeCatalogUnavailable
 	}
-	version, err := c.resolveVersion(ctx, request.ID, "")
+	resolution, err := c.resolve(ctx, request.Access, request.ID, "", followActivation)
 	if err != nil {
 		return TemplateMeta{}, err
 	}
-	if version == "" {
-		meta, metaErr := c.static.MetaDefault(ctx, request)
+	if resolution.serveStatic {
+		var meta TemplateMeta
+		var metaErr error
+		if resolution.version == "" {
+			meta, metaErr = c.static.MetaDefault(ctx, request)
+		} else {
+			meta, metaErr = c.static.MetaExact(ctx, CatalogExactRequest{
+				Access: request.Access, ID: request.ID, Version: resolution.version,
+			})
+		}
 		c.observeResolve(RuntimeSourceStatic, metaErr)
 		return meta, metaErr
 	}
-	return c.MetaExact(ctx, CatalogExactRequest{Access: request.Access, ID: request.ID, Version: version})
+	artifact, err := c.resolveDynamic(ctx, request.Access, resolution)
+	if err != nil {
+		return TemplateMeta{}, err
+	}
+	return artifact.Meta.Clone(), nil
 }
 
 func (c *RuntimeCatalog) FallbackText(ctx context.Context, request CatalogFallbackRequest) (string, error) {
 	if c == nil || c.static == nil || c.store == nil {
 		return "", ErrRuntimeCatalogUnavailable
 	}
-	explicit := request.Version != ""
-	version, err := c.resolveVersion(ctx, request.ID, request.Version)
+	resolution, err := c.resolve(ctx, request.Access, request.ID, request.Version, followActivation)
 	if err != nil {
 		return "", err
 	}
-	if template, lookupErr := c.static.registry.Lookup(request.ID, version); lookupErr == nil {
-		if explicit {
-			if err := c.rejectIntegrity(); err != nil {
-				c.observeResolve(RuntimeSourceStatic, err)
-				return "", err
+	if resolution.serveStatic {
+		template, lookupErr := c.static.registry.Lookup(request.ID, resolution.version)
+		if lookupErr != nil {
+			if resolution.version == "" && errors.Is(lookupErr, ErrTemplateUnknown) {
+				return "", fmt.Errorf("%w: %s has no default", ErrTemplateUnknown, request.ID)
 			}
+			return "", lookupErr
 		}
 		text, fallbackErr := template.FallbackText(request.State, request.Fields, request.Lang)
 		c.observeResolve(RuntimeSourceStatic, fallbackErr)
 		return text, fallbackErr
-	} else if !errors.Is(lookupErr, ErrTemplateUnknown) {
-		return "", lookupErr
 	}
-	if version == "" {
-		return "", fmt.Errorf("%w: %s has no default", ErrTemplateUnknown, request.ID)
-	}
-	artifact, err := c.resolveDynamic(ctx, request.Access, request.ID, version)
+	artifact, err := c.resolveDynamic(ctx, request.Access, resolution)
 	if err != nil {
 		return "", err
 	}
@@ -261,18 +263,20 @@ func (c *RuntimeCatalog) ActionContext(ctx context.Context, request CatalogActio
 	if c == nil || c.static == nil || c.store == nil {
 		return CatalogActionContext{}, ErrRuntimeCatalogUnavailable
 	}
-	if _, err := c.static.registry.Lookup(request.ID, request.Version); err == nil {
-		if err := c.rejectIntegrity(); err != nil {
-			c.observeResolve(RuntimeSourceStatic, err)
-			return CatalogActionContext{}, err
-		}
+	// An action callback answers a card that already exists, so it reads the
+	// stored exact version and must never follow the activation pointer (D4);
+	// flipping the pointer cannot retarget a button on a card already sent.
+	resolution, err := c.resolve(ctx, request.Access, request.ID, request.Version, pinExactVersion)
+	if err != nil {
+		return CatalogActionContext{}, err
+	}
+	if resolution.serveStatic {
+		request.Version = resolution.version
 		result, actionErr := c.static.ActionContext(ctx, request)
 		c.observeResolve(RuntimeSourceStatic, actionErr)
 		return result, actionErr
-	} else if !errors.Is(err, ErrTemplateUnknown) {
-		return CatalogActionContext{}, err
 	}
-	artifact, err := c.resolveDynamic(ctx, request.Access, request.ID, request.Version)
+	artifact, err := c.resolveDynamic(ctx, request.Access, resolution)
 	if err != nil {
 		return CatalogActionContext{}, err
 	}
@@ -283,63 +287,172 @@ func (c *RuntimeCatalog) ActionContext(ctx context.Context, request CatalogActio
 	return CatalogActionContext{View: view, Meta: artifact.Meta.Clone()}, nil
 }
 
-func (c *RuntimeCatalog) resolveDynamic(
+// versionMode says whether a read is allowed to follow the activation pointer.
+type versionMode bool
+
+const (
+	// followActivation resolves an absent version from the activation pointer.
+	// Only new sends may do this.
+	followActivation versionMode = true
+	// pinExactVersion forbids consulting the pointer, so an absent version can
+	// only be answered by the frozen Registry's own default.
+	pinExactVersion versionMode = false
+)
+
+// runtimeResolution is what at most one DB snapshot decided for one request.
+type runtimeResolution struct {
+	id      ID
+	version string
+	// serveStatic routes the request to the frozen Registry. Static reads never
+	// consult a business grant: a static exact is code-reviewed policy, not
+	// producer-granted state (D6 row 3).
+	serveStatic bool
+	auth        RuntimeAuthorization
+}
+
+// resolve performs at most one primary-DB snapshot and decides static versus
+// dynamic from it. The static branches below deliberately return before any
+// store call so that a deployment with the runtime gates off — or one whose DB
+// is briefly unreachable — keeps serving frozen static cards exactly as it did
+// before the runtime catalog existed.
+func (c *RuntimeCatalog) resolve(
 	ctx context.Context,
 	access CatalogAccess,
 	id ID,
 	version string,
+	mode versionMode,
+) (runtimeResolution, error) {
+	if version != "" || mode == pinExactVersion {
+		if _, err := c.static.registry.Lookup(id, version); err == nil {
+			// A persistent startup integrity failure (a static/dynamic key
+			// collision) still fails closed; a transient DB outage does not.
+			if err := c.rejectIntegrity(); err != nil {
+				c.observeResolve(RuntimeSourceStatic, err)
+				return runtimeResolution{}, err
+			}
+			return runtimeResolution{id: id, version: version, serveStatic: true}, nil
+		} else if !errors.Is(err, ErrTemplateUnknown) {
+			return runtimeResolution{}, err
+		}
+		if version == "" {
+			return runtimeResolution{}, fmt.Errorf("%w: %s has no default", ErrTemplateUnknown, id)
+		}
+	}
+	if err := c.requireReady(); err != nil {
+		c.observeResolve(RuntimeSourceDynamic, err)
+		return runtimeResolution{}, err
+	}
+	auth, err := c.loadAuthorization(ctx, RuntimeAuthorizationQuery{
+		ID: id, Version: version, Principal: access.Principal,
+	})
+	if err != nil {
+		c.observeResolve(RuntimeSourceDynamic, err)
+		return runtimeResolution{}, err
+	}
+	if auth.Version == "" {
+		// No activation row at all: the ID belongs entirely to the frozen
+		// Registry, if it knows it.
+		return runtimeResolution{id: id, serveStatic: true}, nil
+	}
+	if _, err := c.static.registry.Lookup(id, auth.Version); err == nil {
+		return runtimeResolution{id: id, version: auth.Version, serveStatic: true, auth: auth}, nil
+	} else if !errors.Is(err, ErrTemplateUnknown) {
+		return runtimeResolution{}, err
+	}
+	return runtimeResolution{id: id, version: auth.Version, auth: auth}, nil
+}
+
+// loadAuthorization is the single point where an authorization decision's
+// inputs enter the process.
+func (c *RuntimeCatalog) loadAuthorization(
+	ctx context.Context,
+	query RuntimeAuthorizationQuery,
+) (RuntimeAuthorization, error) {
+	if c.authorization != nil {
+		auth, err := c.authorization.LoadAuthorization(ctx, query)
+		if err != nil {
+			return RuntimeAuthorization{}, classifyRuntimeStoreError("load authorization", err)
+		}
+		if err := c.verifyAuthorization(query, auth); err != nil {
+			return RuntimeAuthorization{}, err
+		}
+		return auth, nil
+	}
+	// A store that predates the resolver (test fakes, and any embedding that
+	// never had grants) can still answer version resolution and metadata, but
+	// it returns no grant — so every dynamic business purpose is denied
+	// downstream. A split read therefore cannot manufacture an *allow*, which
+	// is the only direction that matters for the single-snapshot invariant.
+	auth := RuntimeAuthorization{Version: query.Version}
+	if query.Version == "" {
+		activation, err := c.store.LoadActivation(ctx, query.ID)
+		if err != nil {
+			return RuntimeAuthorization{}, classifyRuntimeStoreError("load activation", err)
+		}
+		version, err := ActivationVersion(query.ID, activation)
+		if err != nil {
+			return RuntimeAuthorization{}, err
+		}
+		auth.Activation, auth.Version = activation, version
+		if version == "" {
+			return auth, nil
+		}
+	}
+	meta, err := c.store.LoadArtifactMeta(ctx, query.ID, auth.Version)
+	if err != nil {
+		return RuntimeAuthorization{}, classifyRuntimeStoreError("load artifact metadata", err)
+	}
+	auth.Artifact = meta
+	return auth, nil
+}
+
+// verifyAuthorization re-derives the parts of the receipt the catalog can check
+// itself. A store that answered for a different template, followed the pointer
+// when it was told not to, or disagreed with ActivationVersion has produced an
+// incoherent snapshot, and an incoherent snapshot is an integrity failure — not
+// something to paper over with a second read.
+func (c *RuntimeCatalog) verifyAuthorization(query RuntimeAuthorizationQuery, auth RuntimeAuthorization) error {
+	if query.Version != "" {
+		if auth.Version != query.Version || auth.Activation.Exists {
+			return fmt.Errorf("%w: pinned authorization snapshot for %s@%s is incoherent",
+				ErrRuntimeCatalogIntegrity, query.ID, query.Version)
+		}
+		return nil
+	}
+	expected, err := ActivationVersion(query.ID, auth.Activation)
+	if err != nil {
+		return err
+	}
+	if auth.Version != expected {
+		return fmt.Errorf("%w: authorization snapshot for %s resolved %q against activation %q",
+			ErrRuntimeCatalogIntegrity, query.ID, auth.Version, expected)
+	}
+	return nil
+}
+
+func (c *RuntimeCatalog) resolveDynamic(
+	ctx context.Context,
+	access CatalogAccess,
+	resolution runtimeResolution,
 ) (artifact *CompiledArtifact, err error) {
 	defer func() { c.observeResolve(RuntimeSourceDynamic, err) }()
-	if err := c.requireReady(); err != nil {
-		return nil, err
-	}
 	if c.authorizeDynamic == nil {
 		return nil, ErrRuntimeCatalogNotAuthorized
 	}
-	meta, err := c.store.LoadArtifactMeta(ctx, id, version)
-	if err != nil {
-		return nil, classifyRuntimeStoreError("load artifact metadata", err)
-	}
-	if err := validateRuntimeArtifactMeta(id, version, meta); err != nil {
+	meta := resolution.auth.Artifact
+	if err := validateRuntimeArtifactMeta(resolution.id, resolution.version, meta); err != nil {
 		return nil, err
 	}
 	if meta.Blocked {
-		return nil, fmt.Errorf("%w: %s@%s", ErrRuntimeCatalogBlocked, id, version)
+		return nil, fmt.Errorf("%w: %s@%s", ErrRuntimeCatalogBlocked, resolution.id, resolution.version)
 	}
-	if err := c.authorizeDynamic(ctx, access, meta); err != nil {
+	if err := c.authorizeDynamic(ctx, access, meta, resolution.auth.Grant); err != nil {
 		if errors.Is(err, ErrRuntimeCatalogNotAuthorized) || errors.Is(err, ErrRuntimeCatalogNewSendDisabled) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w: authorize dynamic artifact: %w", ErrRuntimeCatalogUnavailable, err)
 	}
 	return c.loadCompiled(ctx, meta)
-}
-
-func (c *RuntimeCatalog) resolveVersion(ctx context.Context, id ID, explicit string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
-	}
-	if err := c.requireReady(); err != nil {
-		return "", err
-	}
-	activation, err := c.store.LoadActivation(ctx, id)
-	if err != nil {
-		return "", classifyRuntimeStoreError("load activation", err)
-	}
-	if !activation.Exists {
-		return "", nil
-	}
-	switch activation.Status {
-	case RuntimeActivationDisabled:
-		return "", fmt.Errorf("%w: %s revision %d", ErrRuntimeCatalogDisabled, id, activation.Revision)
-	case RuntimeActivationActive:
-		if strings.TrimSpace(activation.Version) == "" {
-			return "", fmt.Errorf("%w: active row has no version", ErrRuntimeCatalogIntegrity)
-		}
-		return activation.Version, nil
-	default:
-		return "", fmt.Errorf("%w: unknown activation status %q", ErrRuntimeCatalogIntegrity, activation.Status)
-	}
 }
 
 func (c *RuntimeCatalog) loadCompiled(ctx context.Context, meta RuntimeArtifactMeta) (*CompiledArtifact, error) {
