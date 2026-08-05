@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 )
 
@@ -37,10 +38,21 @@ var (
 	seedFloor = flag.Int64("seed", 5000, "pre-existing seq.min_seq")
 )
 
-func newCtx() *config.Context {
+func newCfg() *config.Config {
 	cfg := config.New()
 	cfg.DB.MySQLAddr = *mysqlAddr
-	return config.NewContext(cfg)
+	cfg.DB.RedisAddr = *redisAddr
+	return cfg
+}
+
+func newCtx() *config.Context { return config.NewContext(newCfg()) }
+
+// newRedis goes through the octoredis chokepoint rather than rd.NewClient.
+// pkg/redis's TestNoRawRedisClientOutsideChokepoint scans the whole repo, tools
+// included, so a raw client here fails CI — and the instrumentation it enforces
+// (dependency="redis" on every command) is worth having even in a repro tool.
+func newRedis() *rd.Client {
+	return octoredis.NewInstrumentedClient(newCfg(), func(o *rd.Options) { o.MaxRetries = 1 })
 }
 
 // runChild is one replica: cold-start GenSeq, wait for the shared barrier so both
@@ -153,7 +165,7 @@ func main() {
 // modules/bot_api/events.go: ZRANGEBYSCORE with an exclusive Min, and
 // ZREMRANGEBYSCORE(id, id) on ack.
 func proveDeliveryLoss(results [][]int64, labels []string, dupes []int64) {
-	client := rd.NewClient(&rd.Options{Addr: *redisAddr})
+	client := newRedis()
 	qkey := "reproRobotEvent:zset"
 	client.Del(qkey)
 
