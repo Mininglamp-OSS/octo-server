@@ -351,9 +351,12 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		message = &cp
 	}
 
-	seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: monotonic per-bot allocator instead of GenSeq. This is the
+	// highest-volume producer and it runs inside a msgSem slot, which is why the
+	// allocator's timeouts are bounded — see pkg/botevent/seq.go.
+	seq, err := botevent.NextEventID(rb.ctx, robotID)
 	if err != nil {
-		rb.Warn("GenSeq failed", zap.Error(err))
+		rb.Warn("allocate bot event id failed", zap.Error(err), zap.String("robotID", robotID))
 		return
 	}
 	messageUpdateJson := util.ToJson(&robotEvent{

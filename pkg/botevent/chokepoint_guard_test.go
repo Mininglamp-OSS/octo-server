@@ -28,10 +28,11 @@ import (
 func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	root := repoRootForGuard(t)
 
-	// A queue writer is a ZAdd whose key is the bot event queue. Cover the two
-	// direct spellings plus the prepared typed-event key produced by
-	// PrepareBotTypedEvent.
-	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s"|prepared\.QueueKey)`)
+	// A queue writer is a ZAdd whose key is the bot event queue. Cover the shared
+	// QueueKey helper (#697 consolidated the producers onto it, so the seed reads
+	// the exact key they write), the legacy prefix field, the literal spelling,
+	// and the prepared typed-event key produced by PrepareBotTypedEvent.
+	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s"|botevent\.QueueKey|prepared\.QueueKey)`)
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
 	// Notify is the producer-facing entry point; Ring is the synchronous
 	// primitive it wraps. Both count: a writer that calls Ring directly is

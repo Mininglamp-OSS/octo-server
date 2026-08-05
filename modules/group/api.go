@@ -1968,9 +1968,10 @@ func (g *Group) addMembers(members []string, groupNo string, operator, operatorN
 func (g *Group) notifyBotJoinedGroup(botMembers []*user.Model, groupNo, operator, operatorName string) {
 	for _, botMember := range botMembers {
 		robotID := botMember.UID
-		seq, err := g.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+		// #697: monotonic per-bot allocator instead of GenSeq.
+		seq, err := botevent.NextEventID(g.ctx, robotID)
 		if err != nil {
-			g.Warn("GenSeq failed for bot", zap.String("robotID", robotID), zap.Error(err))
+			g.Warn("allocate bot event id failed", zap.String("robotID", robotID), zap.Error(err))
 			continue
 		}
 		eventData := map[string]interface{}{
@@ -1983,7 +1984,7 @@ func (g *Group) notifyBotJoinedGroup(botMembers []*user.Model, groupNo, operator
 			},
 			"expire": time.Now().Add(time.Hour * 24).Unix(),
 		}
-		key := fmt.Sprintf("robotEvent:%s", robotID)
+		key := botevent.QueueKey(robotID)
 		err = g.ctx.GetRedisConn().ZAdd(key, float64(seq), util.ToJson(eventData))
 		if err != nil {
 			g.Error("推送bot_joined_group事件失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("groupNo", groupNo))

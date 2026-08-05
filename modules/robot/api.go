@@ -274,7 +274,11 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 		cp.Payload = normalized
 		message = &cp
 	}
-	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: event ids come from the monotonic per-bot allocator, not GenSeq. A
+	// failure here fails the enqueue exactly as a GenSeq error did — there is
+	// deliberately no fallback, because two live id sources on one queue is the
+	// defect being removed. See pkg/botevent/seq.go.
+	seq, err := botevent.NextEventID(ctx, robotID)
 	if err != nil {
 		return err
 	}
@@ -283,7 +287,7 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 		Message: message,
 		Expire:  time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
 	})
-	key := fmt.Sprintf("robotEvent:%s", robotID)
+	key := botevent.QueueKey(robotID)
 	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
 		return err
 	}
@@ -334,7 +338,8 @@ func prepareBotTypedEvent(ctx *config.Context, robotID, eventType string, eventD
 	if strings.TrimSpace(eventType) == "" {
 		return PreparedBotTypedEvent{}, errors.New("robot: empty eventType, cannot prepare typed bot event")
 	}
-	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: see enqueueBotEventGeneric — monotonic allocator, no GenSeq fallback.
+	seq, err := botevent.NextEventID(ctx, robotID)
 	if err != nil {
 		return PreparedBotTypedEvent{}, err
 	}
@@ -346,7 +351,7 @@ func prepareBotTypedEvent(ctx *config.Context, robotID, eventType string, eventD
 	})
 	return PreparedBotTypedEvent{
 		EventID:  seq,
-		QueueKey: fmt.Sprintf("robotEvent:%s", robotID),
+		QueueKey: botevent.QueueKey(robotID),
 		Member:   messageUpdateJson,
 	}, nil
 }
@@ -1176,8 +1181,20 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 
 }
 
+// inlineQuerySeqKeyPrefix is the sequence for inline-query event ids.
+//
+// #697: these used to be allocated from `RobotEventSeqKey+robotID` — the *same*
+// sequence robotEvent:{robotID} scores came from. Inline-query events are only
+// ever appended to this process's inlineQueryEventsMap and nothing reads that map,
+// so those allocations produced no deliverable event while still consuming ids
+// from, and advancing min_seq of, the sequence the bot event queue depended on:
+// a third party to the block churn behind #697, for nothing. They get their own
+// key. Still GenSeq, deliberately — an id nobody consumes has no monotonicity
+// requirement and does not justify a Redis dependency.
+const inlineQuerySeqKeyPrefix = "inlineQuerySeq:"
+
 func (rb *Robot) addInlineQuery(robotID string, inlineQuery *InlineQuery) {
-	seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	seq, err := rb.ctx.GenSeq(inlineQuerySeqKeyPrefix + robotID)
 	if err != nil {
 		rb.Error("GenSeq failed", zap.Error(err))
 		return
