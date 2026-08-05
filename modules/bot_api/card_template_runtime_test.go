@@ -9,12 +9,14 @@ package bot_api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/gin-gonic/gin"
@@ -472,7 +474,7 @@ func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
 		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
 		groupSpaces: map[string]string{"group-1": "space-group"},
 	}
-	ba := newTestBotAPI(querier)
+	ba := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: true})
 	ctx := newGrantSpaceContext(t, "")
 
 	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
@@ -503,11 +505,7 @@ func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
 // this fix a gates-off deployment paid a space_member/app_bot query on every
 // feature-detection poll — a database dependency the endpoint never had.
 func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
-	previous := cardtmpl.DefaultAuthorizationSource()
-	t.Cleanup(func() { cardtmpl.SetDefaultAuthorizationSource(previous) })
-
 	querier := &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1"}}}
-	ba := newTestBotAPI(querier)
 	ctx := newGrantSpaceContext(t, "")
 
 	for _, source := range []cardtmpl.RuntimeAuthorizationSource{
@@ -515,7 +513,7 @@ func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
 		&stubAuthorizationSource{newSend: false},
 	} {
 		querier.calls = nil
-		cardtmpl.SetDefaultAuthorizationSource(source)
+		ba := newTestBotAPIWithCatalog(t, querier, source)
 
 		principal := ba.botCatalogPrincipalFor(ctx, "bot-42")
 		if principal.SpaceResolved || principal.SpaceID != "" {
@@ -530,10 +528,27 @@ func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
 		}
 	}
 
-	cardtmpl.SetDefaultAuthorizationSource(&stubAuthorizationSource{newSend: true})
-	if principal := ba.botCatalogPrincipalFor(ctx, "bot-42"); !principal.SpaceResolved {
+	enabled := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: true})
+	if principal := enabled.botCatalogPrincipalFor(ctx, "bot-42"); !principal.SpaceResolved {
 		t.Fatalf("enabled catalog did not resolve a Space: %+v", principal)
 	}
+}
+
+// newTestBotAPIWithCatalog wires a Bot API whose template catalog carries the
+// given resolver. The gate and the decision both read the catalog's accessor,
+// so a test that set only the process global would be exercising a path
+// production never takes.
+func newTestBotAPIWithCatalog(
+	t *testing.T,
+	querier botSpaceQuerier,
+	source cardtmpl.RuntimeAuthorizationSource,
+) *BotAPI {
+	t.Helper()
+	ba := newTestBotAPI(querier)
+	catalog := newMustTestCatalog(t)
+	catalog.authorization = source
+	ba.cardTemplates = catalog
+	return ba
 }
 
 // Review follow-up (#2): a group send authorizes against the target's Space, so
@@ -554,5 +569,78 @@ func TestProvenanceSpacePrefersTheAuthorizedSpaceOverTheRenderEnv(t *testing.T) 
 	}
 	if got := provenanceSpaceID(dm, cardtmpl.BuildEnv{}); got != "" {
 		t.Fatalf("unresolved provenance Space = %q, want empty", got)
+	}
+}
+
+// Review follow-up (#1/#3): a group card must stay editable after PR-C started
+// recording the target's Space in the marker.
+//
+// The send stamps the group's Space; a group envelope has no top-level
+// space_id, so an edit guard that compared the marker against the envelope
+// would refuse — and the round trip below is exactly the coverage whose absence
+// let that regression through. The edit must also re-stamp the same Space
+// rather than blanking it, since every downstream guard is written as
+// `if SpaceID != ""`.
+func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
+	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
+		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
+		groupSpaces: map[string]string{"group-1": "space-group"},
+	}, &stubAuthorizationSource{newSend: true})
+	ctx := newGrantSpaceContext(t, "")
+	catalog := ba.cardTemplates
+
+	// Send into a group: the marker records the group's Space, not the Bot's.
+	sendPrincipal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
+	if sendPrincipal.SpaceID != "space-group" {
+		t.Fatalf("send principal = %+v, want the group's Space", sendPrincipal)
+	}
+	env := cardtmpl.BuildEnv{Lang: "zh-CN"} // group sends leave env.SpaceID empty
+	sent, err := catalog.RenderPayloadForPrincipal(context.Background(), sendPrincipal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	if err != nil {
+		t.Fatalf("group send: %v", err)
+	}
+	envelope, err := json.Marshal(sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(envelope)
+	if err != nil {
+		t.Fatalf("stored markers: %v", err)
+	}
+	if markers.Provenance.SpaceID != "space-group" {
+		t.Fatalf("stored provenance Space = %q, want the authorized group Space",
+			markers.Provenance.SpaceID)
+	}
+
+	// Editing the same card resolves the same Space from the same target, so
+	// the guard passes even though the envelope carries no space_id.
+	editPrincipal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", editPrincipal.SpaceID); err != nil {
+		t.Fatalf("group card was refused by its own edit guard: %v", err)
+	}
+
+	// And the re-stamped marker keeps the Space rather than blanking it.
+	edited, err := catalog.RenderEditPayloadForPrincipal(context.Background(), editPrincipal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	if err != nil {
+		t.Fatalf("group edit: %v", err)
+	}
+	editedEnvelope, err := json.Marshal(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	editedMarkers, err := cardmsg.CatalogFrameMarkers(editedEnvelope)
+	if err != nil {
+		t.Fatalf("edited markers: %v", err)
+	}
+	if editedMarkers.Provenance.SpaceID != "space-group" {
+		t.Fatalf("edit erased the authorized Space: %q", editedMarkers.Provenance.SpaceID)
+	}
+
+	// A frame replayed against a target in another Space is still refused.
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", "space-elsewhere"); err == nil {
+		t.Fatal("a frame moved to another Space was accepted")
 	}
 }

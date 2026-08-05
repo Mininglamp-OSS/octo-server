@@ -66,7 +66,7 @@ func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*
 	} else {
 		summaryTid = summaryfailed.TemplateID
 	}
-	if err := preflightSummarySchema(ctx, card, summaryTid); err != nil {
+	if err := preflightSummarySchema(ctx, req.SpaceID, card, summaryTid); err != nil {
 		if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 			n.Error("summary card preflight rejected by runtime catalog",
 				zap.String("catalog_result", failure.result), zap.Error(err),
@@ -415,7 +415,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 		} else {
 			tid = docsshared.TemplateID
 		}
-		if err := preflightDocsDisplaySchema(ctx, card, tid); err != nil {
+		if err := preflightDocsDisplaySchema(ctx, req.SpaceID, card, tid); err != nil {
 			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 				n.Error("docs display card preflight rejected by runtime catalog",
 					zap.String("catalog_result", failure.result), zap.Error(err),

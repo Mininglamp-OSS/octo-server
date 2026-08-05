@@ -75,7 +75,10 @@ func respondCatalogNotFound(c *wkhttp.Context) {
 // generic 400 and nothing anywhere to explain it.
 func (a *API) respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
 	if a != nil && a.logger != nil && err != nil {
-		a.logger.Error("card template grant request rejected",
+		// Warn, not Error: a malformed principal type or an over-long id is an
+		// expected 4xx, and logging it at Error would put routine caller
+		// mistakes into the same bucket as integrity and availability failures.
+		a.logger.Warn("card template grant request rejected",
 			zap.String("operation", "grant"), zap.Error(err))
 	}
 	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogGrantInvalid, nil, nil)

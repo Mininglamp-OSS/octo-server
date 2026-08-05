@@ -279,6 +279,11 @@ func (a *API) detail(c *wkhttp.Context) {
 			// operator at exactly the moment they need them — including the
 			// case where the grant migration has not been applied yet. Report
 			// the outage in the logs and serve the rest.
+			// Still record the DB outcome. Degrading the response must not also
+			// degrade observability: without this the detail_grants metric never
+			// fires for any outcome, and a persistent grant-store outage reads
+			// as 100% success on the dashboard that exists to catch it.
+			a.metrics.observeDB("detail_grants", "error")
 			a.logStateError("card template detail grant summary unavailable", "detail_grants", grantsErr)
 			response.GrantsUnavailable = true
 			c.Response(response)

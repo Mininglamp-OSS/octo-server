@@ -290,7 +290,12 @@ func (n *Notify) buildDocsDisplayCardViaRegistry(
 // preflightDocsDisplaySchema 与 preflightDocsAccessRequestSchema 同思路:在
 // memberCache/docsSender/gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。
 // docs.commented / docs.shared 无用户可控 URL 字段,不需要 avatar https 前置校验。
-func preflightDocsDisplaySchema(parent context.Context, card *DocsCardFields, templateID cardtmpl.ID) error {
+// spaceID is threaded for the same reason preflightDocsAccessRequestSchema
+// takes it: template resolution is Space-aware, so preflighting against an
+// empty Space would validate a different version than the send resolves.
+func preflightDocsDisplaySchema(
+	parent context.Context, spaceID string, card *DocsCardFields, templateID cardtmpl.ID,
+) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -298,7 +303,7 @@ func preflightDocsDisplaySchema(parent context.Context, card *DocsCardFields, te
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: templateID,
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID), ID: templateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(templateID, err)
@@ -479,7 +484,10 @@ func (n *Notify) buildSummaryCardViaRegistry(
 // preflightSummarySchema 与 preflightDocsDisplaySchema 同思路:在 memberCache /
 // docsSender / gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。summary 卡
 // 无用户可控 URL 字段,不需要 https 前置校验。
-func preflightSummarySchema(parent context.Context, card *SummaryCardFields, templateID cardtmpl.ID) error {
+// spaceID is threaded for the same reason the docs preflights take it.
+func preflightSummarySchema(
+	parent context.Context, spaceID string, card *SummaryCardFields, templateID cardtmpl.ID,
+) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -487,7 +495,7 @@ func preflightSummarySchema(parent context.Context, card *SummaryCardFields, tem
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(summaryNotifyProducerID, ""), ID: templateID,
+		Access: notifyCatalogAccess(summaryNotifyProducerID, spaceID), ID: templateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(templateID, err)

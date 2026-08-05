@@ -323,17 +323,21 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 
 func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	ctx context.Context,
-	botID string,
+	principal botCatalogPrincipal,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 ) (map[string]any, error) {
-	if c == nil || strings.TrimSpace(botID) == "" {
+	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
-		// Historical edit is pinned to a stored frame whose Space the envelope
-		// already carries, so env.SpaceID is the authoritative value here.
-		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true, env.SpaceID)
+	// The re-stamped marker has to carry the same Space the original send
+	// recorded, so it is composed the same way: the target-authoritative Space
+	// when one could be resolved, and the envelope's own Space otherwise.
+	// Using env.SpaceID unconditionally would erase a group card's Space on its
+	// first edit, because a group envelope has no top-level space_id.
+	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true,
+		provenanceSpaceID(principal, env))
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -522,7 +526,21 @@ func parseBotTemplateRef(value any) (botTemplateRef, error) {
 	return botTemplateRef{ID: cardtmpl.ID(id), Version: version}, nil
 }
 
-func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBotID string) error {
+// requireEffectiveCardTemplate proves the stored frame is the one this edit is
+// entitled to rewrite.
+//
+// authorizedSpaceID is the Space this edit resolved for the target, composed
+// exactly as the send composed the marker it is being compared against. An
+// earlier revision compared the marker to the envelope's top-level `space_id`,
+// which only DM sends ever write — so once group sends started recording their
+// target Space, every group and thread card became permanently uneditable.
+// Comparing two values produced by the same rule means they agree whenever
+// nothing moved, and disagree exactly when the frame did.
+func requireEffectiveCardTemplate(
+	envelope []byte,
+	want botTemplateRef,
+	editorBotID, authorizedSpaceID string,
+) error {
 	decoder := json.NewDecoder(bytes.NewReader(envelope))
 	decoder.UseNumber()
 	var payload map[string]any
@@ -555,8 +573,11 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBo
 			markers.Provenance.PrincipalID != editorBotID {
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
-		envelopeSpace, _ := payload["space_id"].(string)
-		if markers.Provenance.SpaceID != "" && markers.Provenance.SpaceID != envelopeSpace {
+		expectedSpace := strings.TrimSpace(authorizedSpaceID)
+		if expectedSpace == "" {
+			expectedSpace, _ = payload["space_id"].(string)
+		}
+		if markers.Provenance.SpaceID != "" && markers.Provenance.SpaceID != expectedSpace {
 			return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
 		}
 	}

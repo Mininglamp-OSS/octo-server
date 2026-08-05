@@ -27,6 +27,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,10 +35,17 @@ import (
 )
 
 const (
-	// pilotTemplateID reuses the existing docs L2a template ID on purpose: the
-	// pilot's point is that a dynamic version can shadow a static one for new
-	// sends while historical cards keep rendering at their stored version.
-	pilotTemplateID = cardtmpl.ID("docs.access-request")
+	// pilotTemplateID is a dedicated ID, NOT the live docs.access-request.
+	//
+	// An earlier revision reused the production ID so the shadow behaviour would
+	// be observable on a real card. That is unsafe: the pilot bundle declares its
+	// own `additionalProperties:false` contract, so activating it for the live ID
+	// in any catalog where the notify docs producer runs would make every real
+	// access-request card fail preflight with a 400 and zero delivery. The
+	// shadow path is proven below by activating over a *seeded* static baseline
+	// under this dedicated ID, which exercises the same code with none of that
+	// blast radius.
+	pilotTemplateID = cardtmpl.ID("docs.pilot-access-request")
 	// pilotVersion is a dated prerelease that has never been claimed. It is not
 	// a default and must not be edited in place: if the preflight below ever
 	// finds it claimed, pick a new reviewed SemVer rather than overwriting.
@@ -46,10 +54,18 @@ const (
 	// first, so the later rollback has a genuine previously-active target
 	// instead of inferring one from the Registry default.
 	pilotStaticBaseline = "0.3.0"
+	// pilotProductionTemplateID is the live ID the pilot must never claim. The
+	// test asserts this rather than leaving it to a reader of the constant.
+	pilotProductionTemplateID = cardtmpl.ID("docs.access-request")
 
 	pilotProducerID = "docs-notify"
 	pilotSpaceID    = "space-cardtmpl-pilot"
 	pilotActor      = "admin-pilot"
+
+	// pilotCatalogDSNEnv names the shared non-production catalog the version
+	// preflight interrogates. The per-test database cannot answer the question:
+	// it is created empty moments before the check runs.
+	pilotCatalogDSNEnv = "OCTO_PILOT_CATALOG_DSN"
 )
 
 func pilotBundlePath() string {
@@ -72,22 +88,44 @@ func loadPilotBundle(t *testing.T) cardtmpl.Bundle {
 
 // requirePilotVersionUnclaimed is the preflight gate.
 //
-// A version claim is permanent and global to the catalog, so "has anyone ever
-// claimed this exact version" is the one question that must be answered before
-// the fixture is published anywhere — including on a shared non-production
-// database that other branches also publish to. Answering it in code rather
-// than in a runbook step means it cannot be skipped by whoever runs the pilot
-// next, and the failure names the remedy instead of surfacing later as an
-// opaque immutability conflict.
-func requirePilotVersionUnclaimed(t *testing.T, db *sql.DB, id cardtmpl.ID, version string) {
+// A version claim is permanent and global to a catalog, so "has anyone ever
+// claimed this exact version" must be answered before the fixture is published
+// anywhere. The subtlety is *which* catalog to ask.
+//
+// An earlier revision asked the per-test database — which
+// newCatalogStoreIntegrationDB drops and recreates immediately beforehand, so
+// the answer was unconditionally "no" and the gate could never fire. It read
+// like a safety check and was theatre.
+//
+// The real question is about whatever shared non-production catalog the
+// operator is publishing into, which this process only knows about through
+// OCTO_PILOT_CATALOG_DSN. When that is set the gate queries it for real; when
+// it is not, the gate says so out loud and skips rather than passing silently,
+// because "no shared catalog configured" and "the version is free" are
+// different answers and only one of them is evidence.
+func requirePilotVersionUnclaimed(t *testing.T, id cardtmpl.ID, version string) {
 	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv(pilotCatalogDSNEnv))
+	if dsn == "" {
+		t.Logf("pilot version preflight SKIPPED: %s is unset, so no shared catalog was "+
+			"checked for %s@%s. Set it to the non-production catalog DSN before publishing "+
+			"this fixture anywhere shared.", pilotCatalogDSNEnv, id, version)
+		return
+	}
+	shared, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("pilot version preflight: open %s: %v", pilotCatalogDSNEnv, err)
+	}
+	defer func() { _ = shared.Close() }()
+
 	var claimed int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM card_template_version_claim
-        WHERE template_id = ? AND version = ?`, string(id), version).Scan(&claimed); err != nil {
-		t.Fatalf("pilot version preflight: %v", err)
+	err = shared.QueryRow(`SELECT COUNT(*) FROM card_template_version_claim
+        WHERE template_id = ? AND version = ?`, string(id), version).Scan(&claimed)
+	if err != nil {
+		t.Fatalf("pilot version preflight: query shared catalog: %v", err)
 	}
 	if claimed != 0 {
-		t.Fatalf("pilot version preflight: %s@%s is already claimed in this catalog. "+
+		t.Fatalf("pilot version preflight: %s@%s is already claimed in the shared catalog. "+
 			"A claim is permanent — do not overwrite or reuse it. Choose a new reviewed "+
 			"prerelease version, rename the testdata/pilot directory to match, and update "+
 			"pilotVersion.", id, version)
@@ -166,6 +204,12 @@ func TestPilotBundleCompilesAndProjectsSafely(t *testing.T) {
 	if _, allowlisted := export.Samples["pending"]; !allowlisted {
 		t.Fatalf("pilot exported the wrong sample set: %v", export.Samples)
 	}
+	// The fixture declares its own strict data contract, so claiming the live
+	// template ID would make activating it reject every real access-request
+	// card. Assert the separation rather than trusting a comment on a constant.
+	if artifact.Meta.ID == pilotProductionTemplateID {
+		t.Fatalf("the pilot fixture claims the production template ID %s", pilotProductionTemplateID)
+	}
 }
 
 // TestPilotDynamicCatalogEndToEndRealMySQL is the D7 loop.
@@ -176,7 +220,7 @@ func TestPilotDynamicCatalogEndToEndRealMySQL(t *testing.T) {
 	defer cancel()
 
 	// 1. Preflight: the exact version has never been claimed.
-	requirePilotVersionUnclaimed(t, db, pilotTemplateID, pilotVersion)
+	requirePilotVersionUnclaimed(t, pilotTemplateID, pilotVersion)
 
 	// 2. Baseline: the known-good static exact is active and audited, so the
 	//    rollback in step 9 has a real previously-active target.

@@ -49,7 +49,6 @@ const (
 	// selectPrincipalGrantsSQL lists a principal's grant rows across templates
 	// for the Bot advertised set. It is bounded by the caller and covers both
 	// scopes so the same precedence rule applies per template ID.
-	// selectPrincipalGrantsSQL lists a principal's grant rows across templates.
 	// The secondary sort key is not cosmetic: a template's exact and global rows
 	// must be adjacent and in a defined order so the row budget can be truncated
 	// at a template boundary rather than through the middle of a pair.
@@ -338,10 +337,6 @@ func scanPrincipalGrants(
 	scanned := 0
 	for rows.Next() {
 		scanned++
-		if scanned > rowLimit {
-			truncated = true
-			break
-		}
 		var templateID string
 		var scopeSpaceID, status string
 		record := GrantRecord{}
@@ -356,6 +351,16 @@ func scanPrincipalGrants(
 			return nil, fmt.Errorf("%w: invalid grant status %q", ErrCatalogIntegrity, status)
 		}
 		id := cardtmpl.ID(templateID)
+		if scanned > rowLimit {
+			// The peek row. Read its template ID before stopping: it is the only
+			// way to tell a cut that landed inside a template from one that
+			// landed cleanly on a boundary, and dropping a fully-read template
+			// because the *next* one was truncated loses a grant for nothing.
+			if len(order) > 0 && order[len(order)-1] == id {
+				truncated = true
+			}
+			break
+		}
 		record.Identity = GrantIdentity{
 			TemplateID: id, PrincipalType: principalType,
 			PrincipalID: principalID, ScopeSpaceID: scopeSpaceID,
@@ -374,10 +379,11 @@ func scanPrincipalGrants(
 		return nil, fmt.Errorf("card template catalog: iterate principal grants: %w", err)
 	}
 	if truncated && len(order) > 0 {
-		// Drop the template the cut landed in. Every earlier template is
-		// complete because the ordering keeps a template's rows contiguous, so
-		// this trades one advertised template for the guarantee that no
-		// remaining decision was made on a partial row set.
+		// The cut landed inside this template, so its row set is partial. Drop
+		// it: half a pair is worse than none, because losing an exact tombstone
+		// whose global row is still active reports a revoked principal as
+		// granted. Every earlier template is complete, since the ordering keeps
+		// a template's rows contiguous.
 		incomplete := order[len(order)-1]
 		delete(exact, incomplete)
 		delete(global, incomplete)

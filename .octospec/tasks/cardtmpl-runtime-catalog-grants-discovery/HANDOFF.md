@@ -449,6 +449,58 @@ only difference is failure behaviour, and that difference is the point);
 `ReplaceView`'s extra `Snapshot` round trip; the double marshal in
 `validateCatalogMarkers`; and `action_contract` on B1's dynamic rows.
 
+### Post-Slice-6: integration run and second review
+
+The branch was first validated against real MySQL/Redis/WuKongIM at this point,
+and separately reviewed over the three commits Slice 4's review had not covered.
+Both found defects the earlier passes structurally could not.
+
+Only a live database could show:
+
+- the runtime-catalog integration helper asserted a hardcoded migration count,
+  so the grant migration broke four unrelated tests;
+- `classifyRuntimeStoreError` demoted `ErrRuntimeCatalogDisabled` to
+  "unavailable" once activation resolution moved inside the snapshot, which
+  would have made the Bot send path report an outage where it should have
+  declined quietly.
+
+The second review found eleven, of which two were regressions introduced by the
+*fixes* to the first review — a reminder that a single-point fix without a
+round-trip test is not a fix:
+
+1. Recording the target Space in the marker made every group/thread card
+   permanently uneditable, because the edit guard compared it against the
+   envelope's top-level `space_id`, which only DM sends write. Both sides now
+   compose the Space the same way, and a group send-then-edit round trip covers
+   it.
+2. `docsResultVersionFromFrame` keyed off the top-level `template_ref`, which
+   only exists on post-Slice-1 frames, so the two callers still disagreed for
+   every card already delivered. It reads `metadata.octo.template` now — the
+   same source the click path uses.
+3. The pilot claimed the live `docs.access-request` ID while declaring its own
+   strict contract; activating it anywhere the notify docs producer runs would
+   have rejected every real access-request card. It has a dedicated ID, and the
+   fixture test asserts the separation.
+4. The version preflight queried the per-test database, which is created empty
+   moments earlier, so it could never fail. It now interrogates
+   `OCTO_PILOT_CATALOG_DSN` and says out loud when it verified nothing.
+5. Smaller: the Bot gate now reads the same accessor the decision reads; the
+   advertised-set truncation only drops a template when the cut landed inside
+   it; the degraded grant summary keeps its DB metric; the other two notify
+   preflights are Space-aware; grant rejections log at Warn; stale comments
+   naming V3 are gone.
+
+One review finding was verified as a false positive: `MetaDefault` did not lose
+its integrity guard — the unpinned path calls `requireReady`, whose error set is
+a superset of `rejectIntegrity`'s.
+
+Verification: every affected package passes against real MySQL, Redis and
+WuKongIM (`card_template_catalog`, `bot_api`, `notify`, `message`,
+`incomingwebhook`, `robot`, all of `pkg/...`). Each package needs its own fresh
+`test` schema — module sets differ, so two packages sharing one make sql-migrate
+report "unknown migration in database" — and `modules/robot` needs a 32-byte
+`OCTO_MASTER_KEY`.
+
 ## Review and commit boundaries
 
 Keep all slices in one PR-C branch, but make each slice independently

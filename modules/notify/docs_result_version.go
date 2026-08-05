@@ -63,15 +63,26 @@ func docsResultVersion(storedID, storedVersion string) (string, error) {
 }
 
 // docsResultVersionFromFrame reads the stored identity off a persisted envelope
-// and resolves the result version from it. An envelope with no template marker
-// is a pre-PR-C frame and takes the legacy branch above.
+// and resolves the result version from it.
+//
+// The identity comes from `card.metadata.octo.template`, which is where the
+// click path reads it too (`cardmsg.CardTemplateContext`, via
+// resolveRegistryCardContext). Keying off the top-level `template_ref` instead
+// would look equivalent but is not: that marker only exists on frames sent
+// since PR-C Slice 1, so every card already delivered carries the metadata and
+// no marker — and the two callers would answer differently for exactly the
+// population this helper was written to keep consistent.
+//
+// The marker check still runs first. It does not supply the identity; it
+// rejects a frame whose two identities disagree, which is a tampering signal
+// rather than a version question.
 func docsResultVersionFromFrame(envelope []byte) (string, error) {
-	markers, err := cardmsg.CatalogFrameMarkers(envelope)
-	if err != nil {
+	if _, err := cardmsg.CatalogFrameMarkers(envelope); err != nil {
 		return "", fmt.Errorf("%w: %v", errDocsResultVersion, err)
 	}
-	if !markers.HasRef {
+	stored, ok := cardmsg.CardTemplateContext(envelope)
+	if !ok {
 		return docsResultVersion("", "")
 	}
-	return docsResultVersion(markers.Ref.ID, markers.Ref.Version)
+	return docsResultVersion(stored.ID, stored.Version)
 }

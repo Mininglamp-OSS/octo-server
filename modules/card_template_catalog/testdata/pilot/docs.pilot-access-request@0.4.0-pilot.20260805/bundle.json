@@ -5,8 +5,8 @@
   },
   "manifest": {
     "schemaVersion": 2,
-    "id": "docs.access-request",
-    "name": "Docs access request (non-production pilot)",
+    "id": "docs.pilot-access-request",
+    "name": "Docs access request — non-production pilot (dedicated ID)",
     "version": "0.4.0-pilot.20260805",
     "contractVersion": "1.1.0",
     "protocol": "octo-card@1.0",

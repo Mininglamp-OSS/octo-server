@@ -15,16 +15,32 @@ Specifically, a bundle here is:
   `OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED` and
   `OCTO_CARD_RUNTIME_CATALOG_NEW_SEND_ENABLED` stay false.
 
+## A pilot never claims a production template ID
+
+The bundle declares its own `additionalProperties:false` data contract, which
+does not match any live producer's field shape. Activating it under a template
+ID a real producer sends would make every one of that producer's cards fail
+preflight with a 400 and zero delivery. Pilots therefore use a dedicated ID
+(`docs.pilot-access-request`, not `docs.access-request`); the fixture test
+asserts this rather than trusting the constant's comment.
+
 ## The version is claimed once, forever
 
-A version claim is permanent and global to a catalog database. Before adding a
-new pilot directory, the exact `(template_id, version)` must be proven to have
-never been claimed in the target catalog. `requirePilotVersionUnclaimed` in
-`pilot_mysql_integration_test.go` enforces this at test time so the check cannot
-be skipped, and it fails with the remedy spelled out.
+A version claim is permanent and global to a catalog database, so the exact
+`(template_id, version)` must be proven never claimed **in the catalog you are
+publishing into**.
 
-If the version is already claimed — most likely because a shared non-production
-database has seen an earlier run — **do not overwrite or reuse the directory**.
+`requirePilotVersionUnclaimed` interrogates the database named by
+`OCTO_PILOT_CATALOG_DSN`. Set it to the shared non-production catalog before
+running the pilot there. With it unset the check logs, loudly, that it verified
+nothing — "no shared catalog configured" and "the version is free" are different
+answers and only one of them is evidence.
+
+The per-test database cannot answer this question: `newCatalogStoreIntegrationDB`
+drops and recreates it moments before the check runs, so it is always empty. An
+earlier revision queried exactly that database and could therefore never fail.
+
+If the version is already claimed, **do not overwrite or reuse the directory**.
 Pick a new reviewed prerelease (the convention is `<next>.0-pilot.<yyyymmdd>`),
 rename the directory to match, and update `pilotVersion`.
 

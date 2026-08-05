@@ -79,6 +79,21 @@ func TestDocsResultVersionFromFrameMatchesTheStoredContext(t *testing.T) {
 		t.Fatalf("unmarked frame = %q err=%v, want the legacy V3 branch", got, err)
 	}
 
+	// The population that matters: a card delivered before PR-C Slice 1 has
+	// metadata.octo.template but no top-level template_ref. Reading only the
+	// marker would send this frame down the legacy V3 branch while the click
+	// path resolved 0.2.0 — the exact disagreement this helper exists to remove.
+	metadataOnly := []byte(`{"type":17,"card":{"metadata":{"octo":{"protocol":"octo-card@1.0",` +
+		`"template":{"id":"docs.access-request","version":"0.2.0"}}}}}`)
+	if _, err := docsResultVersionFromFrame(metadataOnly); !errors.Is(err, errDocsResultVersion) {
+		t.Fatalf("metadata-only 0.2.0 frame = %v, want the same refusal the click path gives", err)
+	}
+	metadataOnlyV3 := []byte(`{"type":17,"card":{"metadata":{"octo":{"protocol":"octo-card@1.0",` +
+		`"template":{"id":"docs.access-request","version":"0.3.0"}}}}}`)
+	if got, err := docsResultVersionFromFrame(metadataOnlyV3); err != nil || got != "0.3.0" {
+		t.Fatalf("metadata-only 0.3.0 frame = %q err=%v, want 0.3.0", got, err)
+	}
+
 	marked := []byte(`{"type":17,"template_ref":{"id":"docs.access-request","version":"0.3.0"},` +
 		`"card":{"metadata":{"octo":{"protocol":"octo-card@1.0",` +
 		`"template":{"id":"docs.access-request","version":"0.3.0"}}}}}`)

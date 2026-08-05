@@ -322,7 +322,7 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 }
 
 // buildDocsDecisionTerminalDocument renders the legacy/no-updater fallback for
-// approved/denied outcomes. Production V3 result updates use CardUpdater.
+// approved/denied outcomes. Production result updates use CardUpdater at the card's stored version.
 func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	if denied {

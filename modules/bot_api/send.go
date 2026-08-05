@@ -1226,7 +1226,11 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
 		return
 	}
-	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID); err != nil {
+	// Resolve the edit's Space from the target, the same way the send did, so
+	// the guard below and the re-stamped marker are both comparing like with
+	// like (see requireEffectiveCardTemplate).
+	editPrincipal := ba.botSendCatalogPrincipal(c, robotID, req.ChannelID, req.ChannelType)
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID, editPrincipal.SpaceID); err != nil {
 		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
@@ -1256,7 +1260,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
 	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
-	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), robotID, map[string]any{
+	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), editPrincipal, map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
 		"state":        req.State,

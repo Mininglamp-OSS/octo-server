@@ -140,13 +140,19 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 // caller's Space would be pure cost: a Space lookup this deployment did not
 // perform before PR-C, plus — for a multi-Space Bot — an ambiguity warn on
 // every poll of an endpoint that never touched the database.
-func dynamicCatalogEnabled() bool {
-	source := cardtmpl.DefaultAuthorizationSource()
+//
+// It goes through the catalog's own accessor rather than the process global.
+// The two can differ — an instance resolver exists precisely to override the
+// global one — and if the gate that decides whether to resolve a Space read a
+// different source than the gate that decides whether to use it, grants would
+// be silently ignored in one direction and paid for pointlessly in the other.
+func (c *botCardTemplateCatalog) dynamicCatalogEnabled() bool {
+	source := c.authorizationSource()
 	return source != nil && source.NewSendEnabled()
 }
 
 func (ba *BotAPI) botCatalogPrincipalFor(c *wkhttp.Context, robotID string) botCatalogPrincipal {
-	if !dynamicCatalogEnabled() {
+	if !ba.cardTemplates.dynamicCatalogEnabled() {
 		return botCatalogPrincipal{BotID: robotID}
 	}
 	spaceID, resolved := ba.resolveBotGrantSpaceID(c, robotID)
@@ -170,7 +176,7 @@ func (ba *BotAPI) botSendCatalogPrincipal(
 	robotID, channelID string,
 	channelType uint8,
 ) botCatalogPrincipal {
-	if !dynamicCatalogEnabled() {
+	if !ba.cardTemplates.dynamicCatalogEnabled() {
 		// Same reasoning as botCatalogPrincipalFor: with the gate closed the
 		// send path resolves purely from static policy, so it must not start
 		// reading group rows to answer a question nobody will ask.
