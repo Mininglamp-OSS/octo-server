@@ -692,3 +692,62 @@ Verify 发现实现虽满足功能主张,但有 5 条 Acceptance 没有对应测
 
 3. （附带）**`X-RateLimit-Scope` 新增 `bot` 取值是可观察的契约变化**。
    brief load-bearing 已记"需在 issue #696 同步给插件侧",该同步动作尚未执行。
+
+## 第二轮 code review：P1 —— 未鉴权 heartbeat 绕过全部限流（已修）
+
+**这是 brief 自己写过、实现却没做到的一条约束。** Goal 一节原文：
+
+> 而一旦 exclude，该端点就失去 IP 层防护——未鉴权请求也能一路打到 `authBot`（它要查
+> Redis/DB），**所以 exclude 必须和一个自有的桶成对出现，不能单独做**。
+
+实现确实配了自有的桶,但把它挂在了 `authBot` **之后**:
+
+```
+r.POST("/v1/bot/heartbeat", ba.authBot(), ba.botActorUID(), perBotLimiter, ba.heartbeat)
+```
+
+于是无效 token 的请求在 `authBot` 里就 abort 了,**永远走不到那道桶**;而 per-bot 桶
+默认还是 `enabled=false`。净效果是:heartbeat 移出全局桶之后,未鉴权流量**完全无防护**,
+攻击者可用任意无效 token 无限触发 `authBot` 的 Redis/DB 查询——
+原本被全局桶挡住的 DDoS 面,反而因为 exclude 被打开了。**修复方向和事故本身相反:
+这次是我们自己把面打开的。**
+
+### 为什么测试没抓到（更值得记的部分）
+
+`TestHeartbeatBucketStillEnforcesLimit` 的注释原文声称验证的正是
+「exclude 的那道防护确实被补回来了」。但它用**有效 token**,走的是 authBot 通过之后的
+per-bot 桶,所以在这个漏洞存在时**照样通过**。
+
+**一个断言比它自称覆盖范围更弱的测试,比没有测试更危险**——它让 review 者认为该性质
+已被验证。这类"假绿"在本任务里出现两次(另一次是守卫的空集合恒真断言,当时用自证断言
+堵住),模式相同:**测试覆盖了 happy path,而声明覆盖了全部**。
+
+### 修法
+
+heartbeat 改为三层,顺序载荷性:
+
+| 层 | 位置 | 职责 | 可关? |
+|---|---|---|---|
+| per-IP strict (`bot_heartbeat`, 100 rps / burst 300) | **`authBot` 之前** | 未鉴权洪水底线,exclude 的对价 | **否** |
+| `authBot` + `botActorUID` | 中 | 鉴权 + 落 bot 身份 | 否 |
+| per-bot 桶 | `authBot` 之后 | 防单个已鉴权 bot 滥用 | 是(默认关) |
+
+第一层**刻意不接 `enabled` 开关**:per-bot 桶默认关闭(灰度需要),若这层也可关,
+exclude 之后就存在一个完全无防护的未鉴权端点。参数按实测定——生产单 IP 的 heartbeat
+合计峰值约 45 rps(一台机器多个 bot),100 rps 留两倍余量,相对原先全局桶的 1500 rps
+是显著收敛。
+
+`register` 无此问题:它的 IP 桶已在最前,且该端点没有 `authBot`(handler 自己解析 token)。
+主组亦无此问题:它**未**被 exclude,未鉴权洪水仍由全局 1500 rps 兜底。
+
+### 新增回归
+
+- `TestHeartbeatIPLimitPrecedesAuth` —— 源码守卫,钉住 IP 桶在 `authBot` 之前,
+  并断言它用固定常量而非 setting 开关。
+- `TestHeartbeatUnauthenticatedFloodIsRateLimited` —— 行为回归,用**无效 token**:
+  先断言桶未耗尽时不限流(不误伤),抽干桶后必须 429 且
+  `X-RateLimit-Scope: strict:bot_heartbeat`(证明来自鉴权前那一层),
+  另一个 IP 不受连坐。用预抽干 Redis 桶而非真打几百次——strict 桶 100 rps/burst 300,
+  真打既慢(每次走 authBot 的 DB 查询)又不稳(打的过程中一直在回填)。
+- 两条都做了**负向验证**:把 IP 桶挪到 `authBot` 之后,两条同时变红。
+- `TestHeartbeatBucketStillEnforcesLimit` 的注释已改写,明确它只覆盖鉴权后那一半。

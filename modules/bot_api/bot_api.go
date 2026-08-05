@@ -315,9 +315,22 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// heartbeat 刻意**不在** botAPI 组内：它必须有独立于业务流量的配额，
 	// 否则一次 7-8 条消息的推理爆发就能顺带把心跳挤掉、进而断联（issue #696）。
 	// 同时它已被移出全局 per-IP 桶（main.go globalRateLimitExcludePaths），
-	// 否则同出网 IP 的邻居仍能把它饿死——这两处改动缺一不可，
-	// 而下面这条自有的桶就是它移出全局桶之后唯一的上限。
+	// 否则同出网 IP 的邻居仍能把它饿死。
+	//
+	// **三层，顺序载荷性**（code review P1 修正）：
+	//
+	// (1) per-IP strict —— 必须排在 `authBot` **之前**。这是 exclude 的对价：
+	//     移出全局桶也移走了它唯一的未鉴权层防护，而 (3) 挂在鉴权之后、无效 token
+	//     在 `authBot` 里就 abort 了，永远走不到那道桶。缺这一层，攻击者可用任意
+	//     无效 token 无限触发 `authBot` 的 Redis/DB 查询——原本被全局桶挡住的 DDoS
+	//     面因为 exclude 反而被打开。这一层**没有 enabled 开关**，因为 (3) 默认关闭。
+	// (2) authBot + botActorUID —— 鉴权并落 bot 身份。
+	// (3) per-bot 桶 —— 防单个已鉴权 bot 滥用；可热调、可影子、默认关闭。
+	heartbeatIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
+		"bot_heartbeat", defaultHeartbeatIPRPS, defaultHeartbeatIPBurst)
 	r.POST("/v1/bot/heartbeat",
+		heartbeatIPLimit,
 		ba.authBot(),
 		ba.botActorUID(),
 		ba.rateLimitMiddleware(

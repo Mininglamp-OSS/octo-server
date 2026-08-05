@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
@@ -72,13 +73,18 @@ func resetBotRateLimitBuckets(t *testing.T, ctx *config.Context) {
 	defer c.Close()
 	// 两个 keyspace 都要清：
 	//   ratelimit:bot:*                —— 三条 per-bot 通道 + offenders ZSet
-	//   ratelimit:strict:bot_register:* —— register 的 per-IP strict 桶
+	//   ratelimit:strict:bot_register:*  —— register 的 per-IP strict 桶
+	//   ratelimit:strict:bot_heartbeat:* —— heartbeat 的 per-IP strict 桶
 	//
 	// 漏掉 strict 那条会造成**跨用例污染**：所有用例的请求都来自同一个测试
 	// "client IP"，burst 50 会被几个用例累积耗尽，于是后跑的用例随机拿到 429，
 	// 失败点还落在与限流无关的断言上。这类 flaky 极难排查，参见
 	// modules/category 的 resetUIDRateLimit 与本仓 test_uid_ratelimit 的教训。
-	for _, pattern := range []string{"ratelimit:bot:*", "ratelimit:strict:bot_register:*"} {
+	for _, pattern := range []string{
+		"ratelimit:bot:*",
+		"ratelimit:strict:bot_register:*",
+		"ratelimit:strict:bot_heartbeat:*",
+	} {
 		keys, err := c.Keys(pattern).Result()
 		if err == nil && len(keys) > 0 {
 			require.NoError(t, c.Del(keys...).Err())
@@ -387,14 +393,15 @@ func TestRateLimitSanitizesIllegalConfig(t *testing.T) {
 	}
 }
 
-// TestHeartbeatBucketStillEnforcesLimit —— 「exclude ≠ 无限制」。
+// TestHeartbeatBucketStillEnforcesLimit —— per-bot 桶对**已鉴权** bot 生效。
 //
-// heartbeat 已被移出全局 per-IP 桶（main.go globalRateLimitExcludePaths），
-// 那道桶原本是它唯一的上限。若自有桶不真正生效，heartbeat 就变成一个
-// **未鉴权可达、无任何速率上限**的端点——authBot 之前的每个请求都要查 Redis/DB，
-// 等于把 DDoS 面从"被全局桶挡住"变成"直接打到鉴权层"。
+// ⚠️ 这条用例只覆盖鉴权之后那一半。它原本的注释声称验证了「exclude ≠ 无限制」，
+// 那是错的：它用**有效 token**，走的是 authBot 通过之后的 per-bot 桶，
+// 因此在「authBot 之前完全没有限流」这个 P1 漏洞存在时**照样通过**——
+// 一个假绿的测试，比没有测试更危险，因为它让人以为那条性质已被验证。
 //
-// 所以这条用例断言的不是"限流能用"，而是**exclude 的那道防护确实被补回来了**。
+// 未鉴权那一半由 TestHeartbeatUnauthenticatedFloodIsRateLimited 覆盖
+// （strict IP 桶，排在 authBot 之前）。两条合起来才是完整的「exclude 的对价」。
 func TestHeartbeatBucketStillEnforcesLimit(t *testing.T) {
 	h, _ := setupRateLimitTest(t)
 	useParams(RateLimitParams{
@@ -454,4 +461,79 @@ func TestDryRunStillExecutesDecision(t *testing.T) {
 		}
 	}
 	require.True(t, found, "offenders 名单里应出现被影子拒绝的 bot %s，实际: %v", rlBotA, members)
+}
+
+// heartbeatIPBucketKey 是 heartbeat per-IP strict 桶的 Redis key。
+// 前缀由 octo-lib 的 StrictIPRateLimitMiddleware 固定为 "ratelimit:strict:{tag}:"。
+func heartbeatIPBucketKey(ip string) string { return "ratelimit:strict:bot_heartbeat:" + ip }
+
+// drainIPBucket 把某个 IP 的 strict 桶预先抽干（tokens=0），使下一次请求必然被拒。
+//
+// 用预抽干而不是"连打几百次"：strict 桶是 100 rps / burst 300，靠真实请求打满既慢
+// （每次都要走 authBot 的 DB 查询）又不稳定（打的过程中 token 一直在回填）。
+// 桶的存储形状是 HMGET/HMSET 的 {tokens, ts}，见 pkg/ratelimit 的 Lua。
+func drainIPBucket(t *testing.T, ctx *config.Context, ip string) {
+	t.Helper()
+	c := rd.NewClient(&rd.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer c.Close()
+	now := float64(time.Now().UnixNano()) / float64(time.Second)
+	require.NoError(t, c.HMSet(heartbeatIPBucketKey(ip), map[string]interface{}{
+		"tokens": 0,
+		"ts":     now,
+	}).Err())
+	require.NoError(t, c.Expire(heartbeatIPBucketKey(ip), time.Minute).Err())
+}
+
+func heartbeatFrom(t *testing.T, h http.Handler, token, ip string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/bot/heartbeat", nil)
+	require.NoError(t, err)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	// getClientIP 优先读 X-Real-Ip,故此头决定桶的 key。
+	req.Header.Set("X-Real-Ip", ip)
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// TestHeartbeatUnauthenticatedFloodIsRateLimited —— code review P1 的行为回归。
+//
+// `/v1/bot/heartbeat` 已从全局 per-IP 桶排除,那移走了它唯一的**未鉴权层**防护。
+// per-bot 桶挂在 authBot 之后,而无效 token 在 authBot 里就 abort 了——永远走不到
+// 那道桶,且它默认还是关闭的。缺少 authBot 之前的那道 strict IP 桶,攻击者就能用
+// 任意无效 token 无限触发 authBot 的 Redis/DB 查询。
+//
+// 关键:本用例用**无效 token**。此前的 TestHeartbeatBucketStillEnforcesLimit 用的是
+// 有效 token,只覆盖了鉴权之后那一半——它在这个漏洞存在时照样通过,是个假绿。
+func TestHeartbeatUnauthenticatedFloodIsRateLimited(t *testing.T) {
+	h, ctx := setupRateLimitTest(t)
+	// per-bot 桶全关,复现生产默认姿态:此时唯一的防护就是 strict IP 桶。
+	useParams(RateLimitParams{})
+
+	const attackerIP = "203.0.113.7"
+
+	// 对照:桶未耗尽时,无效 token 应当走到 authBot 并被鉴权拒绝(而非 429),
+	// 证明 IP 桶没有误伤正常流量。
+	first := heartbeatFrom(t, h, rlUnknownTk, attackerIP)
+	require.NotEqual(t, http.StatusTooManyRequests, first.Code,
+		"桶未耗尽时不应限流——否则是误伤")
+
+	drainIPBucket(t, ctx, attackerIP)
+
+	limited := heartbeatFrom(t, h, rlUnknownTk, attackerIP)
+	require.Equal(t, http.StatusTooManyRequests, limited.Code,
+		"未鉴权的 heartbeat 洪水未被拦住——heartbeat 已移出全局 per-IP 桶，"+
+			"若 authBot 之前没有 strict IP 桶，无效 token 可无限触发鉴权层的 Redis/DB 查询")
+	require.Equal(t, "strict:bot_heartbeat", limited.Header().Get("X-RateLimit-Scope"),
+		"429 应来自 authBot 之前的 strict IP 层")
+
+	// 另一个 IP 不受影响:这道桶是 per-IP 的,不是全局开关。
+	other := heartbeatFrom(t, h, rlUnknownTk, "198.51.100.23")
+	require.NotEqual(t, http.StatusTooManyRequests, other.Code,
+		"其它 IP 被连坐了——strict 桶的维度不是 IP")
 }

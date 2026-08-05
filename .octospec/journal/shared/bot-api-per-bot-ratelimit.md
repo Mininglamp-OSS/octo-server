@@ -108,6 +108,27 @@ under observation would stop being real.
   same way externally. `degraded` is a separate outcome from `allowed` for the
   same reason: Redis failure means the limiter is *not working*, and that must be
   visible rather than folded into the success counter.
+- **An exemption moves the attack surface, and the pairing bucket must sit where
+  the unauthenticated traffic actually arrives.** Excluding heartbeat from the
+  global per-IP bucket was paired with a per-bot bucket — but that bucket was
+  mounted *after* `authBot`, so an invalid token aborted in authentication and
+  never reached it (and it ships disabled by default anyway). Net effect: the
+  exemption opened the very DDoS surface it was supposed to keep closed, letting
+  any invalid token drive unbounded Redis/DB lookups in the auth layer. The brief
+  had written this constraint down explicitly; the implementation satisfied its
+  letter (a bucket exists) and not its point (it must cover unauthenticated
+  traffic). Fixed with a strict per-IP bucket *before* `authBot`, deliberately
+  with no enable switch — the per-bot layer defaults to off for rollout, so a
+  toggleable outer layer would leave a window with no protection at all.
+- **A test whose assertion is weaker than its stated scope is worse than no
+  test.** `TestHeartbeatBucketStillEnforcesLimit` claimed to verify "exclusion
+  does not mean unlimited", but used a *valid* token — so it exercised only the
+  post-authentication half and passed happily while the hole above was wide open.
+  This shape appeared twice in this task (the other was a source guard that
+  degraded to a vacuously-true assertion over an empty set). Both times the fix
+  was the same: make the test prove it can fail — self-witness assertions for the
+  guard, and a negative run (move the middleware, watch it go red) for the
+  behaviour test.
 - **Rollout windows are not atomic for limiter parameters.** Old and new replicas
   share the Redis bucket and each passes its own rps/burst to the script. Never
   sample verification data inside a rollout window; the transitional state is not

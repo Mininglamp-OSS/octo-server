@@ -71,6 +71,26 @@ const (
 	defaultRegisterIPBurst = 50
 )
 
+// heartbeat 端点的 per-IP strict 桶参数（code review P1 补入）。
+//
+// **这道桶是 exclude 的对价，不是锦上添花。** `/v1/bot/heartbeat` 已被移出全局
+// per-IP 桶（否则同出网 IP 的邻居能把心跳饿死，issue #696），但那也移走了它唯一的
+// 未鉴权层防护：per-bot 桶挂在 `authBot` **之后**，无效 token 在鉴权失败时就 abort 了，
+// 永远走不到那道桶。于是攻击者可以用任意无效 token 无限触发 `authBot` 的 Redis/DB
+// 查询——原本被全局桶挡住的 DDoS 面，反而因为 exclude 被打开了。
+//
+// 所以这道桶必须排在 `authBot` **之前**，且**不受任何 enabled 开关控制**：
+// per-bot 桶默认关闭（灰度需要），若这层也可关，exclude 之后就存在一个完全无防护的
+// 未鉴权端点。
+//
+// 参数按实测定：生产单 IP 的 heartbeat 合计峰值约 45 rps（一台机器上多个 bot），
+// 100 rps 留两倍余量；相对原先由全局桶提供的 1500 rps 是显著收敛。
+// 固定值不热调——它是防滥用底线，不随业务负载变化。
+const (
+	defaultHeartbeatIPRPS   = 100.0
+	defaultHeartbeatIPBurst = 300
+)
+
 // RateLimitParams 是三条通道的运行时配置快照。
 type RateLimitParams struct {
 	Business  ratelimit.Params

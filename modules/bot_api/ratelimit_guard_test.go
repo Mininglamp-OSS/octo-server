@@ -185,3 +185,45 @@ func functionsCallingGetLoginUID(t *testing.T) map[string]bool {
 	}
 	return out
 }
+
+// TestHeartbeatIPLimitPrecedesAuth 是 code review P1 的源码守卫。
+//
+// `/v1/bot/heartbeat` 已从全局 per-IP 桶排除（main.go globalRateLimitExcludePaths），
+// 那也移走了它唯一的**未鉴权层**防护。per-bot 桶挂在 authBot 之后，而无效 token 在
+// authBot 里就 abort 了——永远走不到那道桶。所以必须有一道 strict IP 桶排在
+// authBot **之前**，否则攻击者可用任意无效 token 无限触发 authBot 的 Redis/DB 查询：
+// 原本被全局桶挡住的 DDoS 面，反而因为 exclude 被打开。
+//
+// 这个顺序无法靠类型系统或编译期保证，且调换后所有既有测试仍然通过
+// （它们都用有效 token，走的是鉴权之后那一半），故必须由守卫钉死。
+func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
+	src := readBotAPISource(t)
+
+	start := strings.Index(src, `r.POST("/v1/bot/heartbeat"`)
+	require.NotEqual(t, -1, start, "找不到 heartbeat 路由声明，守卫失效——先修守卫本身")
+	decl := src[start:]
+	if end := strings.Index(decl, "ba.heartbeat)"); end != -1 {
+		decl = decl[:end]
+	}
+
+	ipIdx := strings.Index(decl, "heartbeatIPLimit")
+	authIdx := strings.Index(decl, "ba.authBot()")
+	perBotIdx := strings.Index(decl, "ba.rateLimitMiddleware(")
+
+	require.NotEqual(t, -1, ipIdx,
+		"heartbeat 缺少 per-IP strict 限流。它已移出全局 per-IP 桶，"+
+			"没有这一层则无效 token 可无限触发 authBot 的 Redis/DB 查询")
+	require.NotEqual(t, -1, authIdx)
+	require.NotEqual(t, -1, perBotIdx)
+
+	require.Less(t, ipIdx, authIdx,
+		"per-IP 限流必须在 authBot 之前——放在之后等于只保护已鉴权流量，"+
+			"而未鉴权洪水正是 exclude 打开的那个面")
+	require.Less(t, authIdx, perBotIdx,
+		"per-bot 桶必须在 authBot 之后，否则取不到 bot 身份")
+
+	// strict 桶不得挂 enabled 开关：per-bot 桶默认关闭（灰度需要），
+	// 若这层也可关，exclude 之后就存在一个完全无防护的未鉴权端点。
+	require.Contains(t, src, `"bot_heartbeat", defaultHeartbeatIPRPS, defaultHeartbeatIPBurst`,
+		"heartbeat strict 桶应使用固定常量参数，不接 system_setting 开关")
+}
