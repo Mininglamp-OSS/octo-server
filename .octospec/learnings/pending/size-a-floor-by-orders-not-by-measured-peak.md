@@ -38,11 +38,17 @@ measured 45 rps on one IP therefore means roughly half the fleet shares an egres
 IP. That is 2.2x headroom, one NAT consolidation or one fleet doubling from
 breaching, **on the endpoint whose 429 was the original incident**.
 
-**`register`**: it was never excluded from the global bucket, so its real prior
+**`register`**: at the time this number was chosen it was still in the global
+bucket, so its real prior
 ceiling was 1500 rps. 10 rps is a 150x tightening — applied to the *self-heal
 path*. During a fleet-wide reconnect (the only moment the path matters) burst 50
 admits 50 bots and the rest queue at 10/s: ~140 seconds for 1450 bots, against
 clients already known to conflate 429 with 400.
+
+(A later round excluded `register` from the global bucket as well. That does not
+change the sizing conclusion — 100 was already the binding constraint of the two
+— but it does mean the floor is now the path's *only* ceiling, which raises the
+cost of getting it wrong rather than lowering it.)
 
 ## Rule of thumb
 

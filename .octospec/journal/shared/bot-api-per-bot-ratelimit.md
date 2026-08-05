@@ -27,8 +27,9 @@ egress IP shares one quota**.
 - **`modules/bot_api/ratelimit.go`** — three independent channels:
   `business` (key = robotID), `heartbeat` (key = robotID),
   `register` (key = SHA-256 fingerprint of the bot token).
-- **`main.go`** — `/v1/bot/heartbeat` added to `globalRateLimitExcludePaths()`,
-  metrics registered, and the settings closure wired in.
+- **`main.go`** — `/v1/bot/heartbeat` **and `/v1/bot/register`** added to
+  `globalRateLimitExcludePaths()` (both self-heal legs, not just one — see the
+  round-3 gotcha below), metrics registered, and the settings closure wired in.
 - **`modules/common`** — 12 settings (DB → env → code default), all hot-tunable,
   each channel with its own `enabled` (default **false**) and `dry_run`
   (default **true**).
@@ -169,13 +170,17 @@ under observation would stop being real.
   change's own thesis: heartbeat had 2.2x headroom against a fleet whose
   aggregate heartbeat rate is ~97 rps (2903 bots, 60s key TTL) with roughly half
   of it behind one egress IP — one NAT consolidation from breaching, on the
-  endpoint whose 429 *is* the incident. And `register` — never excluded from the
-  global bucket, so its prior ceiling was the global 1500 rps — was tightened
-  150x **on the self-heal path**, which during a fleet-wide reconnect (the only
+  endpoint whose 429 *is* the incident. And `register` — still in the global
+  bucket *at the time this number was chosen*, so its prior ceiling was the
+  global 1500 rps — was tightened 150x **on the self-heal path**, which during a
+  fleet-wide reconnect (the only
   moment it matters) would drain 1450 bots at 10/s over ~140 seconds. Settled at
   `100/500` and `500/1500`: still an order of magnitude below the global bucket,
   still closing the keyspace-amplification hole (100 rps × ~40s TTL ≈ 4000 live
-  keys vs ~60000), but no longer shaping legitimate traffic. The generalisable
+  keys vs ~60000), but no longer shaping legitimate traffic. (Round 3 then
+  excluded `register` from the global bucket too, which does not move the
+  effective ceiling — 100 was already the binding constraint — but does make it
+  the *only* one.) The generalisable
   part: **what a floor blocks does not live near the measured volume, so sizing a
   floor from measured volume buys nothing and costs availability.** Worth noting
   how this surfaced: not from review of the limiter, but from the question "does

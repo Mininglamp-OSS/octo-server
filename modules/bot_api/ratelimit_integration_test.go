@@ -522,7 +522,7 @@ func heartbeatFrom(t *testing.T, h http.Handler, token, ip string) *httptest.Res
 }
 
 // botRequestFrom 发一个带指定方法与 client IP 的请求。
-// 方法可变是为了覆盖非 POST 的豁免路径（见 TestExcludedPathsAreLimitedOnEveryMethod）。
+// 方法可变是为了覆盖非 POST 的豁免路径（见 TestExcludedPathsAreLimitedOnRoutedNonPOSTMethods）。
 func botRequestFrom(t *testing.T, h http.Handler, method, path, token, ip string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
@@ -537,7 +537,7 @@ func botRequestFrom(t *testing.T, h http.Handler, method, path, token, ip string
 	return w
 }
 
-// TestExcludedPathsAreLimitedOnEveryMethod —— 第二轮 code review P1-2 的行为回归。
+// TestExcludedPathsAreLimitedOnRoutedNonPOSTMethods —— 第二轮 code review P1-2 的行为回归。
 //
 // octo-lib 的全局限流按 `excludeSet[c.Request.URL.Path]` 匹配——**只看路径,不看方法**。
 // 而两道 IP 底线原先只挂在 `r.POST` 上。于是 `GET /v1/bot/heartbeat`:
@@ -549,7 +549,14 @@ func botRequestFrom(t *testing.T, h http.Handler, method, path, token, ip string
 // 非 POST 请求在桶耗尽后**必须**被限流,且 429 来自 strict IP 层。
 //
 // 此前所有 heartbeat/register 用例都是 POST,所以没有任何测试能发现这个洞。
-func TestExcludedPathsAreLimitedOnEveryMethod(t *testing.T) {
+//
+// **本用例证明的范围仅限 gin 路由得到的方法**（这里取 GET/PUT/DELETE 作代表）。
+// 用例名此前写作 `...OnEveryMethod`,而 `r.Any` 只覆盖 gin 的九个方法,故改名——
+// 一个声称比它实际证明的更强的用例名,比没有用例更坏。
+// 已知不覆盖、也确实仍绕过底线的两类（均非本改动引入,详见 ratelimit.go onlyPOST）:
+//   - 扩展方法 `PROPFIND`/`LOCK`/`FOO` —— 匹配不到路由,落无底线的 no-route 404;
+//   - `OPTIONS` —— 被 CORSMiddleware 在全局限流之前答 204,全站既有行为。
+func TestExcludedPathsAreLimitedOnRoutedNonPOSTMethods(t *testing.T) {
 	h, ctx := setupRateLimitTest(t)
 	useParams(RateLimitParams{}) // per-bot 全关:复现生产默认姿态
 
@@ -569,12 +576,13 @@ func TestExcludedPathsAreLimitedOnEveryMethod(t *testing.T) {
 			ip := fmt.Sprintf("198.51.100.%d", 10+i)
 
 			// 对照:桶未耗尽时不应是 429。非 POST 会被 onlyPOST 收口成 404——
-			// 这一条同时确认外部可观察行为与改动前一致（那时是 gin 的 404）。
+			// 这一条同时确认**状态码**与改动前一致（那时是 gin 的 404）；
+			// 响应体从 gin 纯文本变成了 i18n 信封，此处不断言 body。
 			first := botRequestFrom(t, h, c.method, c.path, "", ip)
 			require.NotEqual(t, http.StatusTooManyRequests, first.Code,
 				"桶未耗尽时不应限流——否则是误伤")
 			require.Equal(t, http.StatusNotFound, first.Code,
-				"非 POST 应以 404 结束（与改动前一致），实际 %d", first.Code)
+				"非 POST 应以 404 结束（状态码与改动前一致），实际 %d", first.Code)
 
 			drainIPBucket(t, ctx, c.bucketKey(ip))
 

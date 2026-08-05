@@ -29,9 +29,12 @@ import (
 // 本文件把限流维度从「出网 IP」换成「bot 身份」，并给两条**自愈通道**单独的配额：
 //
 //	business  —— /v1/bot 主组业务端点，key = robotID
-//	heartbeat —— /v1/bot/heartbeat，key = robotID；该端点同时移出全局 per-IP 桶
-//	             （见 main.go globalRateLimitExcludePaths），否则邻居仍能把它挤死
+//	heartbeat —— /v1/bot/heartbeat，key = robotID
 //	register  —— /v1/bot/register，key = bot token 指纹（**不是** robotID）
+//
+// heartbeat 与 register **两条都移出了全局 per-IP 桶**（见 main.go
+// globalRateLimitExcludePaths），否则邻居 bot 打满共享配额时它们仍会被挤死——
+// 只保住 heartbeat 不够：bot 能"发现自己掉线"却仍换不到新 token，永远起不来。
 //
 // register 用 token 指纹而非 robotID，是因为它挂在 botAPI 组**之外**、跑在
 // authBot 之前，此时还没有 bot 身份。而 token 就在请求里，取其哈希即可得到一个
@@ -40,7 +43,8 @@ import (
 // 它自己的桶，不影响同 IP 的健康 bot。
 //
 // 安全说明：token 是凭据，**只落哈希**，绝不写进 Redis key、日志或指标。
-// 换 token 可绕过该维度，兜底仍由全局 per-IP 桶承担（register 未被 exclude）。
+// 换 token 可绕过该维度，兜底由 `bot_register` 的鉴权前 IP 底线承担
+// （**不是**全局 per-IP 桶——register 已连同 heartbeat 一起被 exclude，见下）。
 
 // 限流通道分类。取值是**固定枚举**——它会成为 Prometheus label，
 // 基数有界依赖于此，不得透传 path 或任何请求内容。
@@ -103,7 +107,7 @@ const (
 //     实际约 30s ⇒ **全车队心跳约 97 rps**。实测单 IP 45 rps 说明约半个车队挤在
 //     一个出网 IP 后面，那么 100 rps 的余量只有 2.2 倍——车队翻倍、或 NAT 收敛成
 //     单出口就顶满。**在一个"被 429 就是事故本身"的端点上留 2.2 倍余量方向是反的。**
-//   - register：它**没有**被移出全局桶，所以原上限是全局的 1500 rps；压到 10 rps
+//   - register：定这个值的时候它还在全局桶里，原上限是全局的 1500 rps；压到 10 rps
 //     是 150 倍收紧，而且落在**自愈路径**上。车队集体重连时（唯一真正要紧的时刻），
 //     1450 个 bot 里 burst 只放过前 50 个，其余按 10/s 排队要 140 秒——而客户端已知
 //     把 429 与 400 混在一套重试策略里。这条改动的核心论点是"凡是用于恢复的端点都
@@ -115,6 +119,12 @@ const (
 //     100 rps × TTL(约 40s) ≈ 4000 个 live key，相对全局 1500 rps 下最坏约 6 万个
 //     已收敛一个量级。（且 per-token 桶默认关闭时 Check 在碰 Redis 前就旁路，
 //     放大只在该通道开启后才存在。）burst 500 让集体重连在约 10 秒内排空。
+//
+//     **后续变更**：register 已随 heartbeat 一并移出全局桶（见 main.go
+//     globalRateLimitExcludePaths）。这不改变上面的定值——移出前 register 同时受
+//     全局 1500 与本底线 100 约束，紧约束本来就是 100，移出后有效上限不变。但它
+//     意味着 100 现在是这条路径**唯一**的上限，调它的人没有外层兜底可依赖。
+//
 //   - heartbeat 500 rps：给全车队 97 rps 留 5 倍余量，同时仍比它原先所在的全局桶
 //     1500 rps 紧 3 倍。它要挡的是"无效 token 无限触发 authBot 的 DB 查询"，
 //     500 rps 完全够——那条路径的成本在 DB 往返，不在计数。
@@ -134,7 +144,7 @@ const (
 )
 
 // ipLimitParams 读 env 并消毒。**刻意没有 enabled 开关**:per-bot 层默认关闭
-// （灰度需要）,若这两道外层也可关,被 exclude 的 heartbeat 就会出现一个
+// （灰度需要）,若这两道外层也可关,被 exclude 的 heartbeat 与 register 就会出现
 // 完全无防护的未鉴权端点窗口。
 func ipLimitParams(envRPS string, defRPS float64, envBurst string, defBurst int) (float64, int) {
 	rps := ratelimit.SanitizeRPS(wkhttp.ParseRPSFromEnv(envRPS, defRPS), defRPS)
@@ -182,16 +192,30 @@ func (ba *BotAPI) requireBotIdentity() wkhttp.HandlerFunc {
 //
 // 单请求成本不高（无 DB、无 Redis），但它违反了 main.go globalRateLimitExcludePaths
 // 注释里那条不变量：**豁免不等于无限制**。所以用 `r.Any` 注册、把底线放在最前，
-// 让所有方法都过桶，再由本中间件收口。
+// 再由本中间件收口。
 //
-// 为什么返回 404 而不是 405：保持与改动前**外部可观察行为一致**（那时也是 404），
-// 不引入新的状态码语义。用 i18n 信封而非 `c.AbortWithStatus`，因为后者被
-// `make i18n-lint` 的 D23 守卫禁止；`WithStatus` 门面在这里不涉及 D14 兼容风险——
-// 这个 (路径, 方法) 组合此前**从未**返回过信封响应，不存在依赖固定 400 的历史客户端。
+// **`r.Any` 不等于"所有方法"——残留两个洞，都不是本改动引入的：**
 //
-// **不改 octo-lib**（虽然根因在那儿）：让豁免认方法能一次覆盖 /v1/ping、/v1/health
-// 这两条同形的既有洞，但那是 lib 的既有设计问题、不是本改动造成的，跨仓要等发版 +
-// go.mod bump。已在上游记账，本仓先把自己引入的增量收口。
+//   - **扩展方法**：gin 1.9.1 的 `anyMethods` 恰好九个（GET/POST/PUT/PATCH/HEAD/
+//     OPTIONS/DELETE/CONNECT/TRACE）。`PROPFIND`/`LOCK`/`curl -X FOO` 这类
+//     `net/http` 接受的 token 仍然匹配不到路由、仍然跳过只看路径的全局豁免、
+//     仍然落无底线的 gin no-route 404。
+//   - **OPTIONS**：`wkhttp.CORSMiddleware()` 注册在 `server.New` 里（octo-lib
+//     `server/server.go`），排在 `route.Use(RateLimitMiddleware)` **之前**，直接答
+//     204，既到不了底线也到不了本中间件。这条是**全站既有**行为，与豁免无关。
+//
+// 增量攻击能力为零：`/v1/ping`、`/v1/health` 同在豁免名单且**故意完全没有底线**，
+// 且 `GET /v1/ping` 比一次路由 miss 更便宜——攻击者拿 `PROPFIND /v1/bot/heartbeat`
+// 做不到今天做不到的事。要结构性关掉，得让豁免认方法（根因在 lib，已上游记账
+// octo-lib#115），或把两道底线改成按路径守卫的 `route.Use` 中间件——后者能一次覆盖
+// no-route 与所有方法，但那是比本改动更大的形状变更。
+//
+// 为什么返回 404 而不是 405：保持与改动前**状态码**一致（那时也是 404），不引入新的
+// 状态码语义。**响应体确实变了**：改动前是 gin 的纯文本 `404 page not found`，现在是
+// 本地化 JSON 信封——这些 (路径, 方法) 组合从来不是有效调用，故认为无影响。用 i18n
+// 信封而非 `c.AbortWithStatus`，因为后者被 `make i18n-lint` 的 D23 守卫禁止；
+// `WithStatus` 门面在这里不涉及 D14 兼容风险——这个组合此前**从未**返回过信封响应，
+// 不存在依赖固定 400 的历史客户端。
 func onlyPOST(c *wkhttp.Context) {
 	if c.Request.Method != http.MethodPost {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)

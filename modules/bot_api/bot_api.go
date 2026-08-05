@@ -300,9 +300,10 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	//     且必须排在 (1) **之前**——否则 key 已经建好了,挡也来不及。
 	//
 	//     参数走 env、不热调:IP 层是防滥用底线,不需要按业务负载反复收敛。
-	//     **但也不能按平峰量裁**:register 未被移出全局桶,所以它原本的上限就是全局的
+	//     **但也不能按平峰量裁**:定这个值的时候 register 还在全局桶里,原上限是全局的
 	//     1500 rps,而它同时是**自愈路径**——车队集体重连时压得太紧,就是在唯一要紧的
-	//     时刻限流恢复能力。定值理由见 ratelimit.go 的常量注释。
+	//     时刻限流恢复能力。它现已一并移出全局桶,所以这 100 rps 是这条路径**唯一**的
+	//     上限,没有外层兜底。定值理由见 ratelimit.go 的常量注释。
 	registerIPRPS, registerIPBurst := ipLimitParams(
 		envRegisterIPRPS, defaultRegisterIPRPS, envRegisterIPBurst, defaultRegisterIPBurst)
 	registerIPLimit := r.StrictIPRateLimitMiddleware(
@@ -311,6 +312,8 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// **用 r.Any 而非 r.POST**:全局限流的豁免只看路径不看方法（lib 的
 	// `excludeSet[c.Request.URL.Path]`），若底线只挂在 POST 上，非 POST 请求会
 	// 既跳过全局桶又碰不到底线（第二轮 code review P1-2）。onlyPOST 在过桶之后收口。
+	// 注意 `r.Any` 只覆盖 gin 的九个方法，扩展方法（PROPFIND 等）仍绕过——
+	// 残留范围与为何不在本仓关闭，见 ratelimit.go onlyPOST 的注释。
 	r.Any("/v1/bot/register",
 		registerIPLimit,
 		onlyPOST,
@@ -342,8 +345,9 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	heartbeatIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
 		"bot_heartbeat", heartbeatIPRPS, heartbeatIPBurst)
-	// **r.Any 而非 r.POST**:同 register，豁免只看路径不看方法,底线必须覆盖所有方法,
-	// 否则 `GET /v1/bot/heartbeat` 既跳过全局桶又碰不到底线（第二轮 code review P1-2）。
+	// **r.Any 而非 r.POST**:同 register，豁免只看路径不看方法,底线必须盖住 gin 路由
+	// 得到的每个方法,否则 `GET /v1/bot/heartbeat` 既跳过全局桶又碰不到底线
+	// （第二轮 code review P1-2）。扩展方法的残留见 ratelimit.go onlyPOST 注释。
 	r.Any("/v1/bot/heartbeat",
 		heartbeatIPLimit,
 		onlyPOST,
