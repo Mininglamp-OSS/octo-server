@@ -674,24 +674,33 @@ Verify 发现实现虽满足功能主张,但有 5 条 Acceptance 没有对应测
 > 多包顺跑会撞 sql-migrate 的 unknown migration(每个测试二进制只 link 自己依赖的
 > module init)。**分包跑、每包前重建 test 库**,这是已知环境约束而非本改动的问题。
 
-### 需人决定(2 项,无法自修)
+### 需人决定 —— **两项均已拍板(2026-08-05)**
 
-1. **`rate-limit` 规则的 Exception 依赖**。规则原文要求 authenticated route 挂
-   `SharedUIDRateLimiter`;本任务自建了限流器。论证写在 `pkg/ratelimit` 包注释里
-   （进程级单例无法表达"独立配额值 + 运行时热调",与 per-webhook 桶同构,
-   落在规则已写明的 Exception 内）。**这个论证需要 maintainer 认可**,
-   否则应改回 lib 中间件并放弃热调能力。
+1. **`rate-limit` 规则的 Exception 依赖 —— 已认可。** 规则原文要求 authenticated
+   route 挂 `SharedUIDRateLimiter`;本任务自建了限流器。论证写在 `pkg/ratelimit` 包
+   注释里(进程级单例无法表达"独立配额值 + 运行时热调",与 per-webhook 桶同构,
+   落在规则已写明的 Exception 内)。
 
-2. **`ResponseErrorLWithStatus` 需要 sign-off**。CLAUDE.md 明文:该门面限
+   **拍板意见还追加了一条理由:把 bot 与真人分开之后,这套限流器可被后续 bot 侧
+   限流需求复用。** 这一点对代码边界有约束,已核实当前实现满足:`pkg/ratelimit`
+   的**非测试代码零 bot 耦合**——`New(client, prefix, class, paramsFunc, observer,
+   fallback)` 全是参数,`bot`/`robotID` 只出现在注释举例中;bot 专属逻辑全部在
+   `modules/bot_api/ratelimit.go`。新增一条通道 = 填 prefix + class + 一个 params
+   来源,**不需要重构**。
+   > 后续维护约束:别把 bot 概念(robotID 字段、bot 专用 key 前缀、bot 专属默认值)
+   > 下沉进 `pkg/ratelimit`,否则复用性就没了。
+
+2. **`ResponseErrorLWithStatus` —— 已签字,限流一律返 429。** CLAUDE.md 明文:该门面限
    "new endpoints only ... diverging from D14 needs maintainer sign-off"。
    本任务用它是为了让限流返回**真正的 429** —— octo-lib 三个限流中间件都走
    `TransportStatus: 429`,客户端(含 issue #696 报告里的插件)按状态码识别限流并决定
    退避;若 bot 通道返回 400,同一系统里就出现两种"被限流"的表示法,客户端要么加分支、
    要么把限流误判成参数错误而**停止重试**。
-   **我的判断是这属于"与既有限流层保持一致"而非"偏离 D14",但按流程仍需签字。**
+   结论与自动 reviewer 一致(*"this one is clearly correct"*):这属于"与既有限流层
+   保持一致"而非"偏离 D14"。
 
 3. （附带）**`X-RateLimit-Scope` 新增 `bot` 取值是可观察的契约变化**。
-   brief load-bearing 已记"需在 issue #696 同步给插件侧",该同步动作尚未执行。
+   已在 issue #696 的 PR 说明留言中同步给插件侧(2026-08-05)。
 
 ## 第二轮 code review：P1 —— 未鉴权 heartbeat 绕过全部限流（已修）
 
