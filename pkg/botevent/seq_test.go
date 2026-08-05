@@ -65,10 +65,16 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
 
+	// Matches modules/robot/sql/20260805000001_bot_event_seq_state.sql, including the
+	// singleton CHECK and the ON UPDATE clause. An abbreviated copy would mean the
+	// tests never exercise the shipped schema — and the CHECK is what the migration's
+	// Down relies on to refuse dropping an activated authority (review P2-11).
 	if _, err := ctx.DB().Exec("CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
 		"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
 		"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
-		"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`singleton_id`)) " +
+		"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, " +
+		"PRIMARY KEY (`singleton_id`), " +
+		"CONSTRAINT `chk_bot_event_seq_singleton` CHECK (`singleton_id` = 1)) " +
 		"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"); err != nil {
 		t.Skipf("cannot create %s at %s: %v", stateTable, mysqlAddr, err)
 	}
@@ -100,7 +106,7 @@ func fixture(t *testing.T, ctx *config.Context, client *rd.Client, robotID strin
 	clean()
 	// Activated state: the DB row is the authority, the Redis key only its mirror.
 	setStateMode(t, ctx, StateModeIncr, 0)
-	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+	if err := client.Set(ModeKey, MirrorValue(0), 0).Err(); err != nil {
 		t.Fatalf("write mode mirror: %v", err)
 	}
 	t.Cleanup(clean)
@@ -110,9 +116,12 @@ func fixture(t *testing.T, ctx *config.Context, client *rd.Client, robotID strin
 // validation. Tests that exercise Activate itself call it directly.
 func setStateMode(t *testing.T, ctx *config.Context, mode int, floor int64) {
 	t.Helper()
+	// epoch is pinned to 0 so the mirror value tests write (MirrorValue(0)) matches.
+	// Without resetting it, a test that ran the real Activate leaves epoch=1 behind and
+	// the next fixture's mirror would be a stale generation.
 	if _, err := ctx.DB().InsertBySql(
 		"insert into `"+stateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
-			"on duplicate key update `mode`=VALUES(`mode`), `cutover_floor`=VALUES(`cutover_floor`)",
+			"on duplicate key update `mode`=VALUES(`mode`), `epoch`=0, `cutover_floor`=VALUES(`cutover_floor`)",
 		stateSingletonID, mode, floor).Exec(); err != nil {
 		t.Fatalf("set state mode: %v", err)
 	}
@@ -170,7 +179,7 @@ func TestActivationTakesEffectWithoutAProcessCacheWindow(t *testing.T) {
 
 	// Activate, with no restart and no cache invalidation of any kind.
 	setStateMode(t, ctx, StateModeIncr, 0)
-	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+	if err := client.Set(ModeKey, MirrorValue(0), 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
 
@@ -209,7 +218,7 @@ func TestSeedClearsTheLegacyCeilingAtActivation(t *testing.T) {
 	}
 
 	setStateMode(t, ctx, StateModeIncr, 0)
-	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+	if err := client.Set(ModeKey, MirrorValue(0), 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
 	first, err := nextEventID(ctx, client, robotID)
@@ -534,7 +543,9 @@ func TestHighWaterNeverMovesBackwards(t *testing.T) {
 	robotID := "seqtest_highwater_bot"
 	fixture(t, ctx, client, robotID)
 
-	persistHighWater(ctx, robotID, 900000)
+	if err := persistHighWater(ctx, robotID, 900000); err != nil {
+		t.Fatalf("persist high-water: %v", err)
+	}
 	high, err := highWaterCeiling(ctx, robotID)
 	if err != nil || high == 0 {
 		t.Fatalf("first write did not land (high=%d err=%v)", high, err)
@@ -543,7 +554,9 @@ func TestHighWaterNeverMovesBackwards(t *testing.T) {
 	// A replica that is behind tries to persist a lower mark, as one would after a
 	// rollback or when running with a stale block.
 	lastPersisted.Delete(robotID)
-	persistHighWater(ctx, robotID, 1000)
+	if err := persistHighWater(ctx, robotID, 1000); err != nil {
+		t.Fatalf("persist lower high-water: %v", err)
+	}
 
 	after, err := highWaterCeiling(ctx, robotID)
 	if err != nil {
@@ -564,12 +577,14 @@ func TestSeedRecoversFromTheDurableMarkAlone(t *testing.T) {
 	fixture(t, ctx, client, robotID)
 
 	const mark = 777000
-	persistHighWater(ctx, robotID, mark)
+	if err := persistHighWater(ctx, robotID, mark); err != nil {
+		t.Fatalf("persist high-water: %v", err)
+	}
 	// Everything Redis knew is gone.
 	client.Del(SeqKey(robotID), QueueKey(robotID))
 	ResetSeededForTest()
 	setStateMode(t, ctx, StateModeIncr, 0)
-	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
+	if err := client.Set(ModeKey, MirrorValue(0), 0).Err(); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
 
@@ -590,19 +605,16 @@ func TestExpectedModeFailsClosedWhenModeIsLost(t *testing.T) {
 	robotID := "seqtest_expectedmode_bot"
 	fixture(t, ctx, client, robotID)
 
-	if _, err := nextEventID(ctx, client, robotID); err != nil {
-		t.Fatalf("allocate while activated: %v", err)
-	}
-
-	// Redis loses the mode key AND the authority says legacy, while this replica
-	// expects to be activated. (A lost mirror with an activated authority is the
-	// self-healing case, covered by TestMirrorRebuiltFromDBAuthority.)
+	// A fresh process (no cached belief, nothing issued) meeting a legacy authority
+	// with the mirror gone: that is what a pre-migration deploy looks like, so the
+	// guard is the only thing that distinguishes it from a lost activation.
 	setStateMode(t, ctx, StateModeLegacy, 0)
 	client.Del(ModeKey)
+	ResetSeededForTest()
 	restore := SetExpectedModeForTest(ModeIncr)
-	defer restore()
 
 	if _, err := nextEventID(ctx, client, robotID); err == nil {
+		restore()
 		t.Fatal("expected a lost mode key to fail closed when the replica expects incr, " +
 			"got nil error — falling back to legacy would issue ids below live cursors")
 	}
@@ -616,6 +628,118 @@ func TestExpectedModeFailsClosedWhenModeIsLost(t *testing.T) {
 	}
 	if v == 0 {
 		t.Fatal("legacy allocation returned 0")
+	}
+}
+
+// TestMalformedExpectedModeFailsClosed pins the other half of that guard.
+//
+// The previous revision compared a free-form env string against ModeIncr, so
+// `OCTO_BOTEVENT_EXPECTED_MODE=inrc` was indistinguishable from unset: a typo silently
+// disarmed the one thing standing between a lost mode and a downgrade (review P1-4).
+// Same shape as #627's internal/msgextraseq, which fails closed on a malformed value.
+func TestMalformedExpectedModeFailsClosed(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_badexpectedmode_bot"
+	fixture(t, ctx, client, robotID)
+	ResetSeededForTest()
+
+	restore := SetExpectedModeForTest("inrc")
+	defer restore()
+
+	if _, err := nextEventID(ctx, client, robotID); err == nil {
+		t.Fatal("a malformed expected-mode value must fail closed; reading it as \"unset\" is " +
+			"how a typo turns a deployment guard into decoration")
+	}
+}
+
+// TestMirrorAloneCannotActivateTheCounter is the review P1-2 / Jerry-Xin 🔴 case.
+//
+// The hot path used to trust a positive mirror outright and never read the authority,
+// so a stray `SET botEventSeq:mode incr` performed the activation the operator tool
+// exists to gate: no floor validation, no `-yes`, no confirmation that every pre-fix
+// replica is gone. That is the mixed-source loss this whole change removes — an
+// activated replica issuing above the ceiling while a legacy one issues from the
+// bottom of a block.
+//
+// Reachable by hand, by a Redis shared with another environment, by a snapshot
+// restored from an activated era, or by rolling the migration back and leaving the
+// mirror behind.
+func TestMirrorAloneCannotActivateTheCounter(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_forgedmirror_bot"
+	fixture(t, ctx, client, robotID)
+
+	for _, mirror := range []string{ModeIncr, MirrorValue(0), MirrorValue(99)} {
+		t.Run(mirror, func(t *testing.T) {
+			// Authority says legacy. Somebody wrote the mirror anyway.
+			setStateMode(t, ctx, StateModeLegacy, 0)
+			ResetSeededForTest()
+			client.Del(SeqKey(robotID))
+			if err := client.Set(ModeKey, mirror, 0).Err(); err != nil {
+				t.Fatalf("plant mirror: %v", err)
+			}
+
+			before := MirrorUnauthorized()
+			id, err := nextEventID(ctx, client, robotID)
+			if err != nil {
+				t.Fatalf("allocate: %v", err)
+			}
+			if n, _ := client.Exists(SeqKey(robotID)).Result(); n != 0 {
+				t.Fatalf("mirror %q activated the counter without the authority; the gate the "+
+					"operator tool implements was bypassed entirely", mirror)
+			}
+			if id < 1000000 {
+				t.Errorf("id %d looks like a counter allocation; with the authority saying legacy "+
+					"it must come from GenSeq", id)
+			}
+			if MirrorUnauthorized() == before {
+				t.Error("an unconfirmed mirror must be counted; it self-heals to legacy, so " +
+					"without the metric a forged or stale mirror is completely invisible")
+			}
+		})
+	}
+}
+
+// TestNotActivatedDoesNotQueryTheAuthorityPerAllocation is review P1-1.
+//
+// The pre-activation path ran `SELECT ... FROM octo_bot_event_seq_state` on **every**
+// allocation, inside a held msgSem slot and with no deadline, which made the PR's
+// central claim ("until an operator activates, every replica delegates to GenSeq
+// exactly as before") false. Nothing pinned it, because the other pre-activation test
+// asserts the id's shape and this is a property of the I/O shape.
+func TestNotActivatedDoesNotQueryTheAuthorityPerAllocation(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_noauthorityspam_bot"
+	fixture(t, ctx, client, robotID)
+	setStateMode(t, ctx, StateModeLegacy, 0)
+	client.Del(ModeKey)
+	ResetSeededForTest()
+
+	before := AuthorityReads()
+	const allocations = 20
+	for i := 0; i < allocations; i++ {
+		if _, err := nextEventID(ctx, client, robotID); err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+	}
+	reads := AuthorityReads() - before
+	// One read for the cold belief. The negative belief is trusted while the mirror
+	// agrees with it, and the mirror is absent throughout, so nothing forces another.
+	if reads > 1 {
+		t.Errorf("%d allocations issued %d authority reads; the merged-but-not-activated build "+
+			"must not put a DB round trip on the fan-out path (it runs inside a msgSem slot)",
+			allocations, reads)
+	}
+
+	// And the cache must expire rather than pin a stale answer forever: a replica whose
+	// mirror write was lost has to notice the flip on its own.
+	AgeModeBeliefForTest()
+	if _, err := nextEventID(ctx, client, robotID); err != nil {
+		t.Fatalf("allocate after the belief aged out: %v", err)
+	}
+	if AuthorityReads()-before <= reads {
+		t.Error("an aged-out negative belief must be re-read; otherwise a replica that missed " +
+			"the mirror write never notices the activation")
 	}
 }
 
@@ -716,8 +840,12 @@ func TestMirrorRebuiltFromDBAuthority(t *testing.T) {
 		t.Fatalf("id %d after mirror loss is not above the %d already issued — the allocator "+
 			"degraded to legacy instead of consulting the authority", next, highest)
 	}
-	if v, _ := client.Get(ModeKey).Result(); v != ModeIncr {
-		t.Errorf("mirror was not restored (got %q)", v)
+	// Rebuilt with the generation, not a bare `incr`: the gate compares the mirror
+	// against the exact value the authority confirmed, so a bare value would be a claim
+	// the allocator then has to go re-verify on every allocation.
+	if v, _ := client.Get(ModeKey).Result(); v != MirrorValue(0) {
+		t.Errorf("mirror was not restored to the generation-stamped value (got %q, want %q)",
+			v, MirrorValue(0))
 	}
 }
 

@@ -38,10 +38,12 @@ package botevent
 // tools/botevent-seq.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -77,12 +79,21 @@ type State struct {
 // Activated reports whether the counter is the authoritative allocator.
 func (s State) Activated() bool { return s.Mode == StateModeIncr }
 
-// ReadState reads the singleton row.
+// ReadState reads the singleton row with no deadline. For the operator tool and
+// tests; the allocator uses ReadStateContext so a stalled MySQL cannot hold a msgSem
+// slot open (review P1-1).
+func ReadState(ctx *config.Context) (State, error) {
+	return ReadStateContext(context.Background(), ctx)
+}
+
+// ReadStateContext reads the singleton row under the caller's deadline.
 //
 // A missing row returns ErrStateMissing rather than a zero State, so callers choose
-// what it means: readers fall back to legacy (safe before the migration), while the
-// operator tool refuses to flip.
-func ReadState(ctx *config.Context) (State, error) {
+// what it means: readers treat it as legacy (which is what a pre-migration deploy
+// is), while the operator tool refuses to flip. Callers must distinguish it from
+// every other error — "the table is not there yet" and "the authority is
+// unreachable" have opposite safe answers once the counter era has begun.
+func ReadStateContext(deadline context.Context, ctx *config.Context) (State, error) {
 	if ctx == nil {
 		return State{}, errors.New("botevent: nil ctx, cannot read allocator state")
 	}
@@ -93,14 +104,31 @@ func ReadState(ctx *config.Context) (State, error) {
 	}
 	count, err := ctx.DB().SelectBySql(
 		"SELECT `mode`, `epoch`, `cutover_floor` FROM `"+stateTable+"` WHERE `singleton_id`=?",
-		stateSingletonID).Load(&row)
+		stateSingletonID).LoadContext(deadline, &row)
 	if err != nil {
+		if isMissingTable(err) {
+			// A pre-migration deploy: the same answer as a missing row, and it must not
+			// be confused with an unreachable authority.
+			return State{}, ErrStateMissing
+		}
 		return State{}, fmt.Errorf("botevent: read allocator state: %w", err)
 	}
 	if count == 0 {
 		return State{}, ErrStateMissing
 	}
 	return State{Mode: row.Mode, Epoch: row.Epoch, CutoverFloor: row.CutoverFloor}, nil
+}
+
+// isMissingTable reports whether err is MySQL's "table doesn't exist" (1146).
+//
+// Matched on the driver's error number rather than the message so it survives a
+// server locale change. It matters because a deploy that has not run the migration
+// yet, and a deploy whose DB is unreachable, are the same *error* to dbr and
+// opposite *states* to the allocator: one is legitimately legacy, the other is
+// unknown and must not downgrade a process that has already issued counter ids.
+func isMissingTable(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1146
 }
 
 // Activate flips the state row from legacy to incr under a row lock, validating the
@@ -168,9 +196,12 @@ func Activate(ctx *config.Context, floor, observedMax int64) (bool, uint64, erro
 //
 // Used by the seed as one more floor source. Best-effort: an unreadable row must not
 // fail an allocation, because the other floor sources (queue ceiling, legacy row,
-// durable high-water) already cover the cases this one is a backstop for.
+// durable high-water) already cover the cases this one is a backstop for. Deadlined
+// like every other DB read on this path — it runs inside a held msgSem slot.
 func stateFloorOrZero(ctx *config.Context) int64 {
-	st, err := ReadState(ctx)
+	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
+	defer cancel()
+	st, err := ReadStateContext(deadline, ctx)
 	if err != nil {
 		return 0
 	}

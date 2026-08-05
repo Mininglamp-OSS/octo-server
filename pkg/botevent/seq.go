@@ -56,8 +56,12 @@ package botevent
 //     advanced roughly every `highWaterInterval` ids and folded into every seed's
 //     floor. It does not share Redis's recovery domain, so it survives an RDB
 //     rollback. Persisting every id would be a DB write per allocation; persisting
-//     every ~1000 means the mark can trail the true maximum by at most that much,
-//     which `seedSafetyMargin` (2 × step) already covers.
+//     every ~1000 keeps the mark within one interval of the truth, which
+//     `seedSafetyMargin` (2 × step) covers — **while the writes land**. That
+//     qualifier is load-bearing and was missing: during a DB outage an unbounded
+//     number of ids would otherwise be issued against a frozen mark, so
+//     `highWaterFailureLimit` bounds how many intervals may pass with no durable
+//     write before allocations fail instead (review P1-7).
 //   - **Rollback detection in the issuing process.** The durable mark only helps if
 //     something re-seeds, and a long-running replica would otherwise keep INCRing
 //     the regressed counter forever — its `seeded` entry is already set. So every
@@ -102,17 +106,18 @@ package botevent
 // by the change itself. A larger safety margin makes it worse, not better: the
 // margin *is* the gap that swallows legacy's ids.
 //
-// So the switch is gated on a DB-authoritative-style state flag and is only
-// flipped once every legacy writer is gone. The flag is read atomically with the
-// allocation itself (one script, see gateSource), so a flip takes effect on the
-// very next allocation with no per-process cache window. The one residual window
-// is a request that has already read `legacy` and not yet ZADDed when the flip
-// commits; drain writes for a few seconds around the flip to close it.
+// So the switch is gated on a state flag whose authority is a MySQL row (state.go),
+// mirrored into Redis so the gate can check it inside the same script as the
+// allocation (see gateSource, and mode.go for who is allowed to believe that mirror).
+// A flip takes effect on the very next allocation everywhere, because the mirror the
+// gate compares against is never cached. The one residual window is a request that
+// has already read `legacy` and not yet ZADDed when the flip commits; drain writes for
+// a few seconds around the flip to close it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,13 +152,24 @@ const (
 	// RDB snapshot, and an absent mirror must therefore mean "consult the DB", never
 	// "fall back to legacy". Falling back would issue GenSeq ids below everything the
 	// counter already handed out — #697 mirrored.
+	//
+	// Its value is `incr:{epoch}`, not a bare `incr`, and it is only ever believed
+	// after the authority has confirmed that generation. mode.go has the rules; the
+	// short version is that a mirror alone cannot activate anything.
 	ModeKey = "botEventSeq:mode"
 
-	// ModeIncr is the activated state: allocate from the monotonic counter.
+	// ModeIncr is the activated state: allocate from the monotonic counter. Also the
+	// prefix of the mirror value, and an accepted ExpectedModeEnv value.
 	ModeIncr = "incr"
 
-	// ModeLegacy is the pre-activation state, written explicitly by the operator
-	// tool so preflight can tell "not yet activated" from "never configured".
+	// ModeLegacy is the pre-activation state: delegate to GenSeq.
+	//
+	// It is an accepted ExpectedModeEnv value — a replica may assert that it expects
+	// *not* to be activated, which fails closed if the authority says otherwise. It is
+	// deliberately not a mirror value: the mirror's only job is to claim activation, and
+	// "absent" already means "consult the authority" (an earlier revision claimed the
+	// operator tool wrote this string so preflight could tell "not yet activated" from
+	// "never configured" — it never did, and preflight reads the DB row for that).
 	ModeLegacy = "legacy"
 
 	// HighWaterKeyPrefix names the durable high-water row in the `seq` table.
@@ -170,14 +186,25 @@ const (
 	// `ModeKey` lives in Redis, so it regresses under exactly the RDB rollback
 	// described above — and dropping to legacy then issues *lower* ids beneath live
 	// cursors, the same loss mirrored. Once activation is verified, roll this out as
-	// `incr` and a missing mode refuses the enqueue instead. Same shape as #627's
-	// OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE. Leave it unset until then: a replica
-	// expecting `incr` before the flip fails every enqueue closed.
+	// `incr` and an unconfirmable mode refuses the enqueue instead. Same shape as
+	// #627's OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE, including that a **malformed**
+	// value fails closed rather than reading as "unset" — see mode.go. Accepted values
+	// are `incr` and `legacy`; leave it unset until the flip, because a replica
+	// expecting `incr` beforehand fails every enqueue closed.
 	ExpectedModeEnv = "OCTO_BOTEVENT_EXPECTED_MODE"
 
 	// highWaterInterval is how many ids may be issued between durable writes. One
 	// legacy block, so the mark trails the truth by less than seedSafetyMargin.
 	highWaterInterval = legacyGenSeqStep
+
+	// highWaterFailureLimit is how many consecutive intervals may pass with no
+	// durable high-water write before allocations start failing.
+	//
+	// The mark is what makes a post-rollback seed land above what was issued before
+	// the rollback, and seedSafetyMargin covers a trailing mark only while the writes
+	// land. Three intervals is ~3 × step of exposure — still inside the margin's
+	// order of magnitude — and long enough that a brief DB blip costs nothing.
+	highWaterFailureLimit = 3
 
 	// maxAllocAttempts bounds the self-healing retries within one allocation.
 	//
@@ -265,24 +292,33 @@ return tonumber(cur)`
 // bell.go and every other Lua site in this repo.
 var seedScript = rd.NewScript(seedSource)
 
-// gateSource reads the mode and allocates in one atomic step, returning -1 when
-// the allocator is not activated.
+// gateSource reads the mode mirror and allocates in one atomic step, returning -1
+// when the mirror does not equal the value the caller validated.
 //
-// The atomicity is the point. Caching the mode per process — even for a second —
-// would mean that during that second some replicas allocate from the counter
-// while others still allocate from GenSeq: two live id sources, which is the
-// defect. Reading it inside the same script as the INCR makes a flip take effect
-// on the very next allocation, everywhere, with no window of divergence.
+// The atomicity is the point, and so is the absence of a cache *here*. If the gate
+// decided from a per-process copy of the mode — even a one-second-old one — then for
+// that second some replicas would allocate from the counter while others still
+// allocated from GenSeq: two live id sources, which is the defect. Reading the mirror
+// inside the same script as the INCR makes a flip take effect on the very next
+// allocation, everywhere, with no window of divergence. (What *is* cached, one level
+// up, is the authority behind the mirror, under rules designed to preserve exactly
+// this property — see mode.go.)
+//
+// ARGV[1] is the full expected mirror value including the generation, so a mirror
+// that was lost, hand-written as a bare `incr`, or replaced by a different epoch
+// closes the gate instead of allocating.
+//
 // Sentinels returned by gateSource. Both are distinguishable from any legitimate id
 // because a seeded counter is never negative: every floor is >= 0 and INCR only
-// rises. Callers match them **exactly** rather than testing `v < 0`, so a counter
-// that somehow went negative (a manual SET, a corrupted restore) surfaces as an
-// error instead of being mistaken for a sentinel and silently degrading.
+// rises. runGate normalises the result before returning it — anything that is neither
+// a positive id nor exactly one of these two becomes an error there — so callers may
+// switch on them, and a counter that somehow went negative (a manual SET, a corrupted
+// restore) surfaces as an error rather than being mistaken for a sentinel.
 const (
-	// gateNotActivated: the mode mirror does not say incr.
+	// gateNotActivated: the mode mirror is not the generation the caller validated.
 	gateNotActivated = -1
 
-	// gateCounterMissing: the mirror says incr but the counter key is gone.
+	// gateCounterMissing: the mirror matches but the counter key is gone.
 	//
 	// This guard is why the script does an EXISTS. `INCR` on a missing key returns
 	// **1**, and the only thing that would otherwise stop an unseeded INCR is
@@ -341,9 +377,10 @@ type Scripter interface {
 // record, not a footnote: GenSeq served 999 of every 1000 allocations from its
 // process-local block with **no I/O at all**, while every allocation here is a Redis
 // round trip. It cannot be batched back into blocks without recreating #697 (a block
-// is a second id source), and the mode cannot be cached without recreating the
-// mixed-source window (reviewer P0). Load-test the hottest producer before
-// activation, not after.
+// is a second id source), and the mirror the gate compares against cannot be cached
+// without recreating the mixed-source window (reviewer P0) — only the *authority
+// behind* it can be, which is what keeps the pre-activation path free of DB round
+// trips (mode.go). Load-test the hottest producer before activation, not after.
 const (
 	seqDialTimeout = 500 * time.Millisecond
 	seqReadTimeout = 300 * time.Millisecond
@@ -404,6 +441,11 @@ var (
 	// so the DB write happens once per highWaterInterval rather than per id.
 	lastPersisted sync.Map
 
+	// highWaterFailures counts consecutive durable-write failures per bot. See
+	// noteHighWaterFailure: the count is what bounds how long the allocator may keep
+	// issuing ids whose recovery floor is not advancing.
+	highWaterFailures sync.Map
+
 	// countersLost counts allocations that found the mirror set but the counter key
 	// gone, and mirrorRebuilds counts mirrors rebuilt from the DB authority. Both
 	// mean Redis lost data; both are self-healed, and both are worth alerting on.
@@ -423,10 +465,6 @@ var (
 	// but delivery recovers without a runbook.
 	rollbacksDetected = newHealCounter("dmwork_bot_event_seq_rollback_total",
 		"Counter regressions detected and self-healed; non-zero means Redis lost data.")
-
-	// expectedMode is read once. Re-reading os.Getenv per allocation would put a
-	// syscall on the hottest producer path for a value that cannot change.
-	expectedMode = strings.TrimSpace(os.Getenv(ExpectedModeEnv))
 )
 
 // SeedFailures reports how many allocations failed at the seed step.
@@ -474,9 +512,14 @@ func NextEventID(ctx *config.Context, robotID string) (int64, error) {
 	if ctx == nil {
 		return 0, errors.New("botevent: nil ctx, cannot allocate event id")
 	}
-	robotID = strings.TrimSpace(robotID)
-	if robotID == "" {
-		return 0, errors.New("botevent: empty robotID, cannot allocate event id")
+	// Reject rather than normalise. Trimming here would make the allocator key off a
+	// different string than the caller's own QueueKey(robotID) / Notify(robotID), so a
+	// padded id would seed one counter and enqueue onto another queue. Unreachable
+	// through today's call sites, and the divergence is what makes it worth an error
+	// rather than a silent fix-up (review P2-12).
+	if robotID == "" || strings.TrimSpace(robotID) != robotID {
+		return 0, fmt.Errorf("botevent: robotID %q is empty or padded, cannot allocate event id; "+
+			"the allocator, the queue key and the doorbell must all use the identical string", robotID)
 	}
 	return nextEventID(ctx, SeqClient(ctx.GetConfig()), robotID)
 }
@@ -492,62 +535,160 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 	if client == nil {
 		return 0, errors.New("botevent: nil redis client, cannot allocate event id")
 	}
+	if attempt >= maxAllocAttempts {
+		return 0, fmt.Errorf("botevent: gave up allocating for %q after %d self-healing attempts; "+
+			"Redis state is changing faster than one allocation can follow", robotID, attempt)
+	}
 
-	// Steady state after activation: one round trip that checks the mode and
-	// allocates atomically.
-	if _, ok := seeded.Load(robotID); ok {
-		v, err := runGate(client, robotID)
-		if err != nil {
-			return 0, err
+	// Steady state after activation: the authority is already resolved and this
+	// process has already seeded this bot, so one round trip checks the mirror and
+	// allocates atomically. No DB access, and no cached mode decides the gate — the
+	// gate compares the live mirror against the validated generation itself.
+	if b := activeBelief.Load(); b != nil && b.activated {
+		if _, ok := seeded.Load(robotID); ok {
+			return allocateFromCounter(ctx, client, robotID, b, attempt)
 		}
-		switch v {
-		case gateNotActivated:
-			return mirrorMissing(ctx, client, robotID, attempt+1)
-		case gateCounterMissing:
-			// The mirror says activated but the counter is gone. Re-seed from the
-			// durable floors and retry; issuing would renumber from 1.
-			countersLost.inc()
-			seeded.Delete(robotID)
-			lastPersisted.Delete(robotID)
-			if err := reseed(ctx, client, robotID); err != nil {
-				return 0, err
-			}
-			retried, err := runGate(client, robotID)
-			if err != nil {
-				return 0, err
-			}
-			if retried < 0 {
-				return 0, fmt.Errorf("botevent: counter for %q still unusable after re-seed (gate=%d)", robotID, retried)
-			}
-			return afterIssue(ctx, client, robotID, retried, attempt+1)
-		}
-		return afterIssue(ctx, client, robotID, v, attempt)
 	}
 
-	mode, err := client.Get(ModeKey).Result()
-	if err != nil && err != rd.Nil {
-		return 0, fmt.Errorf("botevent: read allocator mode: %w", err)
-	}
-	if mode != ModeIncr {
-		return mirrorMissing(ctx, client, robotID, attempt+1)
-	}
-
-	// Activated and this process has not seeded this bot yet. Seed before the
-	// first INCR, never after: an id handed out below the floor is exactly the
-	// unreachable-event bug.
-	if err := reseed(ctx, client, robotID); err != nil {
-		return 0, err
-	}
-
-	v, err := runGate(client, robotID)
+	// Otherwise the decision needs the uncached mirror. Pre-activation this is the
+	// whole cost of an allocation before delegating: one Redis GET, exactly as the
+	// old binary's path shape, with the authority read amortised by the belief cache
+	// (review P1-1).
+	mirror, err := readMirror(client)
 	if err != nil {
 		return 0, err
 	}
-	if v < 0 {
-		return 0, fmt.Errorf("botevent: gate returned %d for %q immediately after a "+
-			"successful seed; the mode mirror or counter is being mutated concurrently", v, robotID)
+	decision, b, err := resolveMode(ctx, mirror)
+	if err != nil {
+		return 0, err
+	}
+	if decision == decideLegacy {
+		return legacyDelegate(ctx, robotID)
+	}
+
+	// Activated. Two orderings matter here and both were wrong before.
+	rebuildMirror := mirror != b.mirrorValue()
+	if rebuildMirror {
+		// The mirror is absent, bare, or from an older generation, so Redis lost the
+		// mode key (or never had this generation's). That is evidence Redis lost data,
+		// and every counter this process believes it seeded is suspect — not just this
+		// bot's. Dropping the whole seeded set makes the next allocation for each of
+		// them re-seed from the durable floors. The seed is idempotent and only ever
+		// raises, so the cost is one extra round trip per active bot.
+		mirrorRebuilds.inc()
+		invalidateSeeded()
+	}
+	// Seed before the first INCR, never after: an id handed out below the floor is
+	// exactly the unreachable-event bug.
+	if err := reseed(ctx, client, robotID); err != nil {
+		return 0, err
+	}
+	if rebuildMirror {
+		// Publish the mirror only now. Writing it first opens the gate for **every**
+		// bot in every replica while only this one has been raised to its floor, so any
+		// goroutine holding a stale seeded entry for another bot could pass the gate and
+		// INCR a counter that has not been re-seeded yet (review P1-3). Note the
+		// asymmetry the ordering exists to contain: the mirror is global, the seed is
+		// per-bot.
+		if err := client.Set(ModeKey, b.mirrorValue(), 0).Err(); err != nil {
+			return 0, fmt.Errorf("botevent: rebuild mode mirror for epoch %d: %w", b.epoch, err)
+		}
+	}
+	return allocateFromCounter(ctx, client, robotID, b, attempt)
+}
+
+// allocateFromCounter runs the gate for a bot this process has seeded under a
+// validated belief, and handles the two ways Redis can have lost state underneath it.
+func allocateFromCounter(ctx *config.Context, client Scripter, robotID string, b *belief, attempt int) (int64, error) {
+	v, err := runGate(client, robotID, b.mirrorValue())
+	if err != nil {
+		return 0, err
+	}
+	switch v {
+	case gateNotActivated:
+		// The live mirror no longer equals the generation this process validated: lost,
+		// overwritten, or replaced by a newer epoch. Re-resolve from the authority.
+		return gateClosed(ctx, client, robotID, attempt+1)
+	case gateCounterMissing:
+		// The mirror is intact but the counter key is gone. Re-seed from the durable
+		// floors and retry; issuing would renumber this bot's events from 1.
+		countersLost.inc()
+		seeded.Delete(robotID)
+		lastPersisted.Delete(robotID)
+		if err := reseed(ctx, client, robotID); err != nil {
+			return 0, err
+		}
+		retried, err := runGate(client, robotID, b.mirrorValue())
+		if err != nil {
+			return 0, err
+		}
+		if retried < 0 {
+			return 0, fmt.Errorf("botevent: counter for %q still unusable after re-seed (gate=%d)", robotID, retried)
+		}
+		return afterIssue(ctx, client, robotID, retried, attempt+1)
 	}
 	return afterIssue(ctx, client, robotID, v, attempt)
+}
+
+// gateClosed re-resolves the authority after the gate refused an allocation this
+// process believed was permitted, then retries the allocation from the top.
+//
+// The authority read is forced rather than served from the cached belief: the gate
+// closing means the mirror changed underneath a belief this process was already acting
+// on, which is exactly what the cache must not answer for. If the authority still says
+// activated, the retry below rebuilds the mirror; if it says legacy, refreshAuthority
+// refuses rather than downgrading a process that has already issued counter ids
+// (review P1-4).
+//
+// Dropping the seeded marker is what makes the retry take the slow path. Without it,
+// allocate's post-activation fast path would run the same closed gate again and the
+// pair would spin to maxAllocAttempts — which is how the tests caught this.
+func gateClosed(ctx *config.Context, client Scripter, robotID string, attempt int) (int64, error) {
+	if attempt >= maxAllocAttempts {
+		return 0, fmt.Errorf("botevent: gave up resolving the allocator mode for %q after %d "+
+			"attempts; the mode mirror is being lost or rewritten repeatedly", robotID, attempt)
+	}
+	if _, _, err := refreshAuthority(ctx, false, true); err != nil {
+		return 0, err
+	}
+	seeded.Delete(robotID)
+	return allocate(ctx, client, robotID, attempt)
+}
+
+// legacyDelegate hands the allocation to GenSeq, refusing if this process has ever
+// issued a counter id for this bot.
+//
+// The refusal is unreachable while the positive belief is terminal, which is the
+// point: it asserts the invariant instead of assuming it. A GenSeq id after the
+// counter era has begun is arbitrarily far below the bot's live consumer cursor, so
+// the event would be born invisible — #697, self-inflicted (review P1-4).
+func legacyDelegate(ctx *config.Context, robotID string) (int64, error) {
+	if prev, issued := lastIssued.Load(robotID); issued {
+		return 0, fmt.Errorf("botevent: refusing to allocate a legacy id for %q after this process "+
+			"already issued counter id %v for it; a GenSeq id here would land below the bot's "+
+			"consumer cursor and never be delivered", robotID, prev)
+	}
+	return legacyEventID(ctx, robotID)
+}
+
+// readMirror returns the raw mode mirror value, or "" when the key is absent.
+func readMirror(client Scripter) (string, error) {
+	v, err := client.Get(ModeKey).Result()
+	if err != nil && err != rd.Nil {
+		return "", fmt.Errorf("botevent: read allocator mode mirror: %w", err)
+	}
+	return v, nil
+}
+
+// invalidateSeeded drops every bot's seeded marker. See the mirror-rebuild branch in
+// allocate for why a lost mirror invalidates more than the bot being allocated for.
+func invalidateSeeded() {
+	for _, m := range []*sync.Map{&seeded, &lastPersisted} {
+		m.Range(func(k, _ interface{}) bool {
+			m.Delete(k)
+			return true
+		})
+	}
 }
 
 // afterIssue validates the freshly allocated id against what this process has
@@ -575,12 +716,18 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 		if err := reseed(ctx, client, robotID); err != nil {
 			return 0, err
 		}
-		retried, err := runGate(client, robotID)
+		b := activeBelief.Load()
+		if b == nil || !b.activated {
+			// The belief cannot have been downgraded (positive is terminal), so this
+			// means it was cleared underneath us — only a test does that.
+			return 0, fmt.Errorf("botevent: allocator belief lost mid-allocation for %q", robotID)
+		}
+		retried, err := runGate(client, robotID, b.mirrorValue())
 		if err != nil {
 			return 0, err
 		}
 		if retried == gateNotActivated {
-			return mirrorMissing(ctx, client, robotID, attempt+1)
+			return gateClosed(ctx, client, robotID, attempt+1)
 		}
 		if retried <= prev {
 			// The floor did not clear the ids this process already handed out, so
@@ -594,7 +741,12 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 		v = retried
 	}
 	recordIssued(robotID, v)
-	persistHighWater(ctx, robotID, v)
+	if err := persistHighWater(ctx, robotID, v); err != nil {
+		// The id is allocated and unique, but the floor that would recover it after a
+		// Redis rollback has stopped advancing for too long. Failing here trades one
+		// enqueue for the RDB safety margin; see noteHighWaterFailure.
+		return 0, err
+	}
 	return v, nil
 }
 
@@ -667,92 +819,108 @@ func seedMutex(robotID string) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
-// mirrorMissing handles a mode mirror that does not say incr.
-//
-// This is where the Redis key stops being an authority. Before the state table
-// existed, an absent mirror meant "fall back to legacy" — which after activation
-// issues GenSeq ids below everything the counter has handed out, i.e. #697 mirrored.
-// Now the DB row decides:
-//
-//   - row says activated  → the mirror was lost or rolled back. Rebuild it from the
-//     authority, re-seed, and carry on. Self-healing, no runbook.
-//   - row says legacy     → genuinely pre-activation. Legacy is correct.
-//   - row unreadable      → cannot tell. If this replica was told to expect incr,
-//     fail closed; otherwise assume pre-activation (a missing table is what a
-//     pre-migration deploy looks like).
-func mirrorMissing(ctx *config.Context, client Scripter, robotID string, attempt int) (int64, error) {
-	if attempt >= maxAllocAttempts {
-		return 0, fmt.Errorf("botevent: gave up resolving the allocator mode for %q after %d "+
-			"attempts; the mode mirror is being lost repeatedly", robotID, attempt)
-	}
-	st, err := ReadState(ctx)
-	if err != nil {
-		if expectedMode == ModeIncr {
-			return 0, fmt.Errorf("botevent: %s=%s but the allocator state is unreadable (%v); "+
-				"refusing to fall back to the legacy allocator, whose lower ids would land "+
-				"below live consumer cursors", ExpectedModeEnv, expectedMode, err)
-		}
-		return legacyEventID(ctx, robotID)
-	}
-	if !st.Activated() {
-		if expectedMode == ModeIncr {
-			return 0, fmt.Errorf("botevent: %s=%s but the allocator state says legacy "+
-				"(epoch=%d); refusing to fall back", ExpectedModeEnv, expectedMode, st.Epoch)
-		}
-		return legacyEventID(ctx, robotID)
-	}
-
-	// Authoritative state says activated, so the mirror is stale. Rebuild and retry.
-	mirrorRebuilds.inc()
-	if err := client.Set(ModeKey, ModeIncr, 0).Err(); err != nil {
-		return 0, fmt.Errorf("botevent: rebuild mode mirror for epoch %d: %w", st.Epoch, err)
-	}
-	seeded.Delete(robotID)
-	lastPersisted.Delete(robotID)
-	if err := reseed(ctx, client, robotID); err != nil {
-		return 0, err
-	}
-	v, err := runGate(client, robotID)
-	if err != nil {
-		return 0, err
-	}
-	if v < 0 {
-		return 0, fmt.Errorf("botevent: gate still refuses (%d) for %q after rebuilding the "+
-			"mirror at epoch %d", v, robotID, st.Epoch)
-	}
-	return afterIssue(ctx, client, robotID, v, attempt+1)
-}
-
 // persistHighWater advances the durable mark at most once per highWaterInterval.
 //
-// Best-effort on purpose: the id is already issued and the enqueue must not fail
-// because a bookkeeping write did. A missed write only shortens how far the mark
-// trails, which seedSafetyMargin absorbs.
-func persistHighWater(ctx *config.Context, robotID string, v int64) {
+// Best-effort about *this* write: the id is already issued and the enqueue must not
+// fail because a bookkeeping write did. Not best-effort about the safety property it
+// underwrites — see highWaterFailureLimit.
+func persistHighWater(ctx *config.Context, robotID string, v int64) error {
 	if prev, ok := lastPersisted.Load(robotID); ok && v-prev.(int64) < highWaterInterval {
-		return
+		return nil
 	}
 	// The mark records what has been issued, not a reservation above it. Writing
 	// `v + interval` would compound: every seed adds seedSafetyMargin on top of the
 	// mark, so a mark that already ran ahead would push the counter forward by
 	// interval + margin each time it was consulted.
 	mark := v
+	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
+	defer cancel()
 	// GREATEST, never a bare assignment. An unconditional overwrite is precisely how
 	// GenSeq lets a lagging replica drag a floor backwards (the root cause of #697),
 	// and this row is a floor.
 	if _, err := ctx.DB().InsertBySql(
 		"insert into `seq`(`key`,min_seq,step) values(?,?,0) "+
 			"on duplicate key update min_seq = GREATEST(min_seq, VALUES(min_seq))",
-		HighWaterSeqKey(robotID), mark).Exec(); err != nil {
+		HighWaterSeqKey(robotID), mark).ExecContext(deadline); err != nil {
 		highWaterWriteFailures.inc()
-		return
+		return noteHighWaterFailure(robotID, v, err)
 	}
-	lastPersisted.Store(robotID, v)
+	highWaterFailures.Delete(robotID)
+	lastPersistedStore(robotID, v)
+	return nil
 }
 
-// runGate performs the atomic mode-check-and-allocate. -1 means "not activated".
-func runGate(client Scripter, robotID string) (int64, error) {
-	v, err := gateScript.Run(client, []string{ModeKey, SeqKey(robotID)}, ModeIncr).Result()
+// noteHighWaterFailure records a failed durable write and decides whether the
+// allocator may keep issuing ids without one.
+//
+// Two things go wrong if a failure is merely counted (review P1-7):
+//
+//   - The once-per-interval guard above keys off lastPersisted, so leaving it unset
+//     means the *next* allocation writes again — one un-deadlined INSERT per event on
+//     the fan-out path for as long as the DB is unhappy. Measured by the reviewer:
+//     50 INSERTs over 50 allocations with the table renamed away, versus 0 healthy.
+//   - The safety argument at the top of this file ("the mark trails the true maximum
+//     by at most highWaterInterval, which seedSafetyMargin covers") is only true while
+//     the writes land. During a prolonged outage an unbounded number of ids is issued
+//     against a frozen mark, and a Redis rollback plus a drained queue after that can
+//     seed below a live cursor.
+//
+// So the mark is advanced *in memory* to re-arm the interval guard — the next attempt
+// happens one interval later, not one id later — and the number of consecutive
+// intervals allowed to pass with no durable write is bounded. Past the bound the
+// allocation fails: refusing one enqueue is recoverable, while silently spending the
+// RDB safety margin is not.
+func noteHighWaterFailure(robotID string, v int64, cause error) error {
+	// Re-arm the interval guard so the retry is one interval away, not one id away.
+	lastPersistedStore(robotID, v)
+
+	n := int64(1)
+	if prev, ok := highWaterFailures.Load(robotID); ok {
+		n = prev.(int64) + 1
+	}
+	highWaterFailures.Store(robotID, n)
+	if n < highWaterFailureLimit {
+		return nil
+	}
+	return fmt.Errorf("botevent: %d consecutive durable high-water writes failed for %q "+
+		"(last error: %w); refusing to keep issuing ids the seed floor cannot recover from "+
+		"after a Redis rollback", n, robotID, cause)
+}
+
+// lastPersistedStore advances the in-memory mark monotonically.
+//
+// CAS rather than a plain Store for the same reason recordIssued uses one: concurrent
+// allocations for one bot arrive out of order, and a lower value overwriting a higher
+// one costs a redundant write later (harmless against the GREATEST upsert, but the
+// asymmetry reads like a bug — review P2-9).
+func lastPersistedStore(robotID string, v int64) {
+	for {
+		prev, loaded := lastPersisted.Load(robotID)
+		if !loaded {
+			if _, already := lastPersisted.LoadOrStore(robotID, v); !already {
+				return
+			}
+			continue
+		}
+		high := prev.(int64)
+		if v <= high {
+			return
+		}
+		if lastPersisted.CompareAndSwap(robotID, high, v) {
+			return
+		}
+	}
+}
+
+// runGate performs the atomic mode-check-and-allocate.
+//
+// expectMirror is the exact ModeKey value this process validated against the
+// authority, including the generation. A mirror that has been lost, downgraded to a
+// bare `incr`, or replaced by another epoch therefore closes the gate rather than
+// allocating — which is what makes a hand-written mirror unable to activate anything
+// (review P1-2).
+func runGate(client Scripter, robotID, expectMirror string) (int64, error) {
+	v, err := gateScript.Run(client, []string{ModeKey, SeqKey(robotID)}, expectMirror).Result()
 	if err != nil {
 		return 0, fmt.Errorf("botevent: allocate event id for %q: %w", robotID, err)
 	}
@@ -855,9 +1023,11 @@ func highWaterCeiling(ctx *config.Context, robotID string) (int64, error) {
 	if ctx == nil {
 		return 0, errors.New("nil ctx, cannot read high-water mark")
 	}
+	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
+	defer cancel()
 	var mark int64
 	if _, err := ctx.DB().Select("min_seq").From("`seq`").
-		Where("`key`=?", HighWaterSeqKey(robotID)).Load(&mark); err != nil {
+		Where("`key`=?", HighWaterSeqKey(robotID)).LoadContext(deadline, &mark); err != nil {
 		return 0, fmt.Errorf("read high-water mark: %w", err)
 	}
 	return mark, nil
@@ -870,10 +1040,12 @@ func highWaterCeiling(ctx *config.Context, robotID string) (int64, error) {
 // allocate — and allocating from the very source being retired is how a "read"
 // turns into a third live id source.
 func legacyCeiling(ctx *config.Context, robotID string) (int64, error) {
+	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
+	defer cancel()
 	var minSeq int64
 	key := fmt.Sprintf("seq:%s%s", common.RobotEventSeqKey, robotID)
 	if _, err := ctx.DB().Select("min_seq").From("`seq`").
-		Where("`key`=?", key).Load(&minSeq); err != nil {
+		Where("`key`=?", key).LoadContext(deadline, &minSeq); err != nil {
 		return 0, fmt.Errorf("read legacy seq row: %w", err)
 	}
 	return minSeq, nil
@@ -882,7 +1054,7 @@ func legacyCeiling(ctx *config.Context, robotID string) (int64, error) {
 // ResetSeededForTest clears the process-local seed cache. Tests that seed against
 // different fixtures need it; production never does.
 func ResetSeededForTest() {
-	for _, m := range []*sync.Map{&seeded, &lastIssued, &lastPersisted, &seedLocks} {
+	for _, m := range []*sync.Map{&seeded, &lastIssued, &lastPersisted, &seedLocks, &highWaterFailures} {
 		m.Range(func(k, _ interface{}) bool {
 			m.Delete(k)
 			return true
@@ -893,12 +1065,8 @@ func ResetSeededForTest() {
 	countersLost.resetForTest()
 	mirrorRebuilds.resetForTest()
 	highWaterWriteFailures.resetForTest()
-}
-
-// SetExpectedModeForTest overrides the env-derived expectation and returns a
-// restore function.
-func SetExpectedModeForTest(mode string) func() {
-	prev := expectedMode
-	expectedMode = mode
-	return func() { expectedMode = prev }
+	// The cached authority belief is process state exactly like `seeded`, and leaving
+	// it behind would make one test's activation leak into the next one's
+	// pre-activation assertions.
+	ResetModeBeliefForTest()
 }

@@ -26,8 +26,23 @@ import (
 func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	root := repoRootForGuard(t)
 
-	// Both spellings of the legacy allocation: the constant and the literal key
-	// prefix it holds. A caller that inlined the string still counts.
+	// Assert on the *key*, not on `GenSeq(...key)`.
+	//
+	// An earlier revision matched `GenSeq\([^)]*(RobotEventSeqKey|"robotEventSeq:)` one
+	// line at a time, which a routine refactor walks straight past (review P2-5):
+	//
+	//	key := common.RobotEventSeqKey + robotID
+	//	seq, err := ctx.GenSeq(key)
+	//
+	// or the same call wrapped across two lines. Nothing outside the allowlisted file
+	// has any business naming this key at all — reading the row, formatting it, logging
+	// it — because every use of it is either an allocation from the retired source or a
+	// reimplementation of the seed's ceiling read. So the key itself is the thing to
+	// forbid, and every spelling of the call becomes unreachable rather than
+	// individually pattern-matched.
+	legacyKey := regexp.MustCompile(`RobotEventSeqKey|"robotEventSeq:|robotEventSeq:%s`)
+
+	// The delegation itself still has to exist; see the assertion below.
 	legacyAlloc := regexp.MustCompile(`GenSeq\([^)]*(RobotEventSeqKey|"robotEventSeq:)`)
 
 	// pkg/botevent/seq.go is the single allowlisted GenSeq call site, the same
@@ -45,7 +60,8 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			switch d.Name() {
 			case ".git", "vendor", "node_modules", ".octospec", "tools":
 				// tools/ is exempt: tools/genseq-repro exists precisely to call the
-				// legacy allocator and demonstrate that it collides.
+				// legacy allocator and demonstrate that it collides, and
+				// tools/botevent-seq reads the legacy rows to compute the cutover floor.
 				return filepath.SkipDir
 			}
 			return nil
@@ -62,7 +78,7 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			return readErr
 		}
 		for i, line := range strings.Split(string(content), "\n") {
-			if legacyAlloc.MatchString(line) {
+			if legacyKey.MatchString(line) {
 				violations = append(violations, rel+":"+itoaGuard(i+1))
 			}
 		}
@@ -88,13 +104,15 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	}
 
 	if len(violations) > 0 {
-		t.Fatalf("bot event ids allocated through octo-lib GenSeq:\n  %s\n\n"+
+		t.Fatalf("the legacy bot-event seq key is named outside %s:\n  %s\n\n"+
 			"GenSeq is a per-process HiLo block allocator, so two replicas can issue the same "+
 			"id and can issue ids out of time order. robotEvent:{robotID} is read with an "+
 			"exclusive cursor and acked by score, both of which require strict monotonicity. "+
 			"Use botevent.NextEventID instead (pkg/botevent/seq.go), and do not add a GenSeq "+
-			"fallback — two live id sources on one queue is the defect this replaced (#697).",
-			strings.Join(violations, "\n  "))
+			"fallback — two live id sources on one queue is the defect this replaced (#697). "+
+			"If you only need to *read* the legacy ceiling, that already exists as "+
+			"legacyCeiling in the allowlisted file.",
+			allowlisted, strings.Join(violations, "\n  "))
 	}
 }
 
@@ -102,15 +120,18 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 // pattern that matches nothing would pass forever while protecting nothing —
 // the same vacuity the sibling guard's minKnownQueueWriters floor defends.
 func TestGenSeqGuardWouldCatchAReintroduction(t *testing.T) {
-	legacyAlloc := regexp.MustCompile(`GenSeq\([^)]*(RobotEventSeqKey|"robotEventSeq:)`)
+	legacyKey := regexp.MustCompile(`RobotEventSeqKey|"robotEventSeq:|robotEventSeq:%s`)
 
 	shouldMatch := []string{
 		`seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))`,
 		`seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))`,
 		`v, _ := c.GenSeq("robotEventSeq:" + id)`,
+		// The two shapes the previous line-anchored pattern walked past (P2-5).
+		`	key := common.RobotEventSeqKey + robotID`,
+		`		common.RobotEventSeqKey + robotID,`,
 	}
 	for _, s := range shouldMatch {
-		if !legacyAlloc.MatchString(s) {
+		if !legacyKey.MatchString(s) {
 			t.Fatalf("guard would not catch a reintroduction: %s", s)
 		}
 	}
@@ -121,9 +142,10 @@ func TestGenSeqGuardWouldCatchAReintroduction(t *testing.T) {
 		`version, err := m.ctx.GenSeq(common.RemindersKey)`,
 		`version, err := co.ctx.GenSeq(common.SyncConversationExtraKey)`,
 		`seq, err := botevent.NextEventID(ctx, robotID)`,
+		`key := botevent.QueueKey(robotID)`,
 	}
 	for _, s := range shouldNotMatch {
-		if legacyAlloc.MatchString(s) {
+		if legacyKey.MatchString(s) {
 			t.Fatalf("guard is too broad, it matched: %s", s)
 		}
 	}
