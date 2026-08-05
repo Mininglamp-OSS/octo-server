@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
@@ -128,7 +129,7 @@ func (ba *BotAPI) filterAppBotEvents(botKind string, robotID string, results []*
 		filtered = append(filtered, r)
 	}
 	if len(filteredIDs) > 0 {
-		key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
+		key := botevent.QueueKey(robotID)
 		for _, id := range filteredIDs {
 			if err := ba.ackEvent(key, id); err != nil {
 				ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
@@ -181,23 +182,38 @@ func (ba *BotAPI) ackEvent(key string, eventID string) error {
 // received. The same equality is what makes the auto-ACK's
 // `ZRemRangeByScore(key, id, id)` address the member it means to.
 //
-// **Uniqueness, which is the stronger one and is NOT currently guaranteed.**
-// Exclusive `Min: "(cursor"` pagination is lossless only if scores are strictly
-// unique. `GenSeq` (octo-lib `config/seq.go`) is a DB-backed *block* allocator:
-// it reads `min_seq` and writes back an absolute value computed from
+// **Uniqueness, which is the stronger one.** Exclusive `Min: "(cursor"`
+// pagination is lossless only if scores are strictly unique, and until #697 they
+// were not. Ids came from `GenSeq` (octo-lib `config/seq.go`), a DB-backed *block*
+// allocator: it reads `min_seq` and writes back an absolute value computed from
 // process-local state, guarded only by a process-local mutex. Two replicas whose
-// blocks race — a concurrent cold start, or a concurrent extend — can hand out
-// the same id. Two members sharing score 42 means a page ending on the first
-// advances the cursor to 42 and the second is **never delivered**; the auto-ACK
-// and `eventAck` likewise remove both.
+// blocks race — a concurrent cold start, or a concurrent extend — hand out the same
+// id. Two members sharing score 42 means a page ending on the first advances the
+// cursor to 42 and the second is **never delivered**; the auto-ACK and `eventAck`
+// likewise remove both. Measured in production: 2624 colliding scores across three
+// queues, still accumulating, plus 19 time-inverted ids on block boundaries.
 //
-// That risk is pre-existing and unchanged here — the exclusive cursor, the
-// auto-ACK and `eventAck` all predate the long poll — but this is the code that
-// promotes the cursor to a stated safety property, so the property is stated
-// honestly: **uniqueness is assumed and unverified**. Reading with
-// `ZRangeByScoreWithScores` would remove the equality assumption but not this
-// one; closing it needs a Redis-side allocator or a re-delivery window below the
-// cursor, which is its own change (PR#685 review, yujiawei P2-3).
+// `pkg/botevent`'s allocator replaces that source with a per-bot monotonic counter,
+// so **once activated** the uniqueness this cursor depends on holds by construction
+// rather than by assumption. Two things about that are worth knowing here:
+//
+//   - Before activation the allocator delegates to GenSeq, so on a merged-but-not-
+//     activated deployment everything in the paragraph above is still live.
+//   - Activation does not make the exclusive cursor lossless, and the sentence this
+//     paragraph replaced named the reason: closing it needs "a Redis-side allocator
+//     **or** a re-delivery window below the cursor". #697 delivered the allocator,
+//     which removes the collision and cross-restart-inversion classes. It does not
+//     remove the reordering window — allocation and publication are two operations,
+//     so a producer that allocates `N` and stalls while another publishes `N+1`
+//     still loses `N` once this cursor passes it, and the doorbell makes that *more*
+//     likely because the wake is triggered by the very ZADD that creates the
+//     inversion. That residual is pinned by
+//     `TestKnownResidualZaddReorderingCanStillSkip` in `pkg/botevent` and needs the
+//     re-delivery window, i.e. a change to this file, not that one.
+//
+// Existing duplicate members are also deliberately left in place: an ack deletes
+// every member sharing a score, and there is no record of which of a pair was ever
+// delivered, so re-scoring them would mean re-delivering both.
 type eventPage struct {
 	// visible is what may be returned to the caller.
 	visible []*eventResp
@@ -247,7 +263,7 @@ func (ba *BotAPI) readEventPage(robotID string, botKind string, cursor int64, li
 // member fails to decode, and callers need the raw count to tell a full page
 // from a short one.
 func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([]*eventResp, int, error) {
-	key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
+	key := botevent.QueueKey(robotID)
 	robotEventJsons, err := ba.ctx.GetRedisConn().ZRangeByScore(key, redis.ZRangeBy{
 		Max:   "+inf",
 		Min:   fmt.Sprintf("(%d", eventID),
@@ -320,7 +336,7 @@ func (ba *BotAPI) eventAck(c *wkhttp.Context) {
 		return
 	}
 
-	key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
+	key := botevent.QueueKey(robotID)
 	err = ba.ctx.GetRedisConn().ZRemRangeByScore(key, fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	if err != nil {
 		ba.Error("ack event failed", zap.Error(err), zap.String("robotID", robotID), zap.Int64("eventID", eventID))

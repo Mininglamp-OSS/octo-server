@@ -48,7 +48,7 @@ func seedLongPollBot(t *testing.T, ctx *config.Context) {
 // touches MySQL, so Redis state leaks between tests unless cleared explicitly.
 func clearLongPollKeys(t *testing.T, ctx *config.Context) {
 	t.Helper()
-	_ = ctx.GetRedisConn().Del(robotEventPrefix + lpBotID)
+	_ = ctx.GetRedisConn().Del(botevent.QueueKey(lpBotID))
 	_ = ctx.GetRedisConn().Del(botevent.BellKey(lpBotID))
 }
 
@@ -58,7 +58,7 @@ func clearLongPollKeys(t *testing.T, ctx *config.Context) {
 func enqueueRaw(t *testing.T, ctx *config.Context, eventID int64) {
 	t.Helper()
 	payload := fmt.Sprintf(`{"event_id":%d,"event_type":"card_action","event_data":{"action_id":"approve"}}`, eventID)
-	assert.NoError(t, ctx.GetRedisConn().ZAdd(robotEventPrefix+lpBotID, float64(eventID), payload))
+	assert.NoError(t, ctx.GetRedisConn().ZAdd(botevent.QueueKey(lpBotID), float64(eventID), payload))
 }
 
 type lpResponse struct {
@@ -352,7 +352,7 @@ func enqueueMessageEvent(t *testing.T, ctx *config.Context, eventID int64, chann
 	payload := fmt.Sprintf(
 		`{"event_id":%d,"message":{"message_id":%d,"message_seq":%d,"from_uid":"u1","channel_id":"c1","channel_type":%d,"timestamp":1}}`,
 		eventID, eventID, eventID, channelType)
-	assert.NoError(t, ctx.GetRedisConn().ZAdd(robotEventPrefix+lpBotID, float64(eventID), payload))
+	assert.NoError(t, ctx.GetRedisConn().ZAdd(botevent.QueueKey(lpBotID), float64(eventID), payload))
 }
 
 // enqueueUndecodable writes a member that survives in the sorted set but cannot
@@ -363,7 +363,7 @@ func enqueueMessageEvent(t *testing.T, ctx *config.Context, eventID int64, chann
 func enqueueUndecodable(t *testing.T, ctx *config.Context, eventID int64) {
 	t.Helper()
 	assert.NoError(t, ctx.GetRedisConn().ZAdd(
-		robotEventPrefix+lpBotID, float64(eventID), fmt.Sprintf("not json at all #%d", eventID)))
+		botevent.QueueKey(lpBotID), float64(eventID), fmt.Sprintf("not json at all #%d", eventID)))
 }
 
 // TestReadEventPageCursorIsAPureFunctionOfTheRead asserts what it says and no
@@ -575,7 +575,7 @@ func TestWaitForEventsMakesProgressWhenTheAutoACKFails(t *testing.T) {
 
 	// The injected failure must have been real: the filtered events are still in
 	// the queue. Without this the test could pass against a working ZREM.
-	remaining, err := ctx.GetRedisConn().ZRangeByScore(robotEventPrefix+lpBotID, rd.ZRangeBy{
+	remaining, err := ctx.GetRedisConn().ZRangeByScore(botevent.QueueKey(lpBotID), rd.ZRangeBy{
 		Min: "-inf", Max: "+inf",
 	})
 	assert.NoError(t, err)

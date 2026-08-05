@@ -360,7 +360,6 @@ type Robot struct {
 	ctx *config.Context
 	log.Log
 	db                                robotDB
-	robotEventPrefix                  string
 	userService                       user.IService
 	appService                        app.IService
 	groupService                      group.IService
@@ -393,7 +392,6 @@ func New(ctx *config.Context) *Robot {
 		ctx:                           ctx,
 		Log:                           log.NewTLog("Robot"),
 		db:                            *newBotDB(ctx),
-		robotEventPrefix:              "robotEvent:",
 		userService:                   user.NewService(ctx),
 		appService:                    app.NewService(ctx),
 		groupService:                  group.NewService(ctx),
@@ -1261,7 +1259,7 @@ func (rb *Robot) getEventsResult(robotID string, eventID int64, limit int64) ([]
 		limit = 100
 	}
 
-	robotEventJsons, err := rb.ctx.GetRedisConn().ZRangeByScore(fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID), redis.ZRangeBy{
+	robotEventJsons, err := rb.ctx.GetRedisConn().ZRangeByScore(botevent.QueueKey(robotID), redis.ZRangeBy{
 		Max:   "+inf",
 		Min:   fmt.Sprintf("%d", eventID),
 		Count: limit,
@@ -1312,7 +1310,7 @@ func (rb *Robot) getEventsResult(robotID string, eventID int64, limit int64) ([]
 
 // 移除指定事件
 func (rb *Robot) removeEvent(robotID string, eventID int64) error {
-	err := rb.ctx.GetRedisConn().ZRemRangeByScore(fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID), fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
+	err := rb.ctx.GetRedisConn().ZRemRangeByScore(botevent.QueueKey(robotID), fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	return err
 }
 

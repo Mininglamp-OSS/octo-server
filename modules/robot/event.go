@@ -168,7 +168,28 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 		if len(robotID) == 0 {
 			robotIDValue := payloadValue.Get("robot_id")
 			if robotIDValue.Exists() {
-				robotID = robotIDValue.String()
+				// #697: validate before adopting it, as the three sibling branches below
+				// already do (mention.uids, @username text, ais broadcast). This one did
+				// not, and it is the only branch whose value comes verbatim out of a
+				// client's message payload.
+				//
+				// It used to cost an unknown value only a queue key with a TTL plus a
+				// `seq` row. The monotonic allocator adds a per-bot counter key with
+				// **no** TTL in a Redis running `noeviction`, plus a durable `seq` row
+				// that is never reclaimed — so an arbitrary payload value would become
+				// permanent per-value state. Rejecting an unknown bot is also just
+				// correct on its own terms: enqueueing onto a queue no bot will ever poll
+				// is not a delivery.
+				candidate := robotIDValue.String()
+				exist, err := rb.existRobot(candidate)
+				if err != nil {
+					rb.Error("查询有效robotID失败！", zap.Error(err), zap.String("robotID", candidate))
+				} else if exist {
+					robotID = candidate
+				} else {
+					rb.Debug("payload.robot_id 不是已知机器人，忽略",
+						zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
+				}
 			} else if payloadValue.Get("mention").Exists() {
 				rb.Debug("检测到@提及", zap.String("mention", payloadValue.Get("mention").String()))
 				mentionValue := payloadValue.Get("mention")
@@ -364,7 +385,7 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		Message: message,
 		Expire:  time.Now().Add(rb.ctx.GetConfig().Robot.MessageExpire).Unix(),
 	})
-	key := fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID)
+	key := botevent.QueueKey(robotID)
 	err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson)
 	if err != nil {
 		rb.Error("投递消息给机器人失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("message", messageUpdateJson))

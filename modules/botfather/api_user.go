@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -469,7 +470,17 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 
 	// Clear heartbeat and event queue
 	bf.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", heartbeatKeyPrefix, botID))
-	bf.ctx.GetRedisConn().Del(fmt.Sprintf("robotEvent:%s", botID))
+	bf.ctx.GetRedisConn().Del(botevent.QueueKey(botID))
+	// #697 (review P2-4): the per-bot event id counter (botEventSeq:counter:{botID})
+	// and its durable high-water row (seq:botEventHigh:{botID}) are deliberately NOT
+	// deleted here. A bot id is a UUID and is never reissued, but "never" is a claim
+	// about a different module — and if one ever were reissued, a counter restarting
+	// from 1 would renumber the new bot's events underneath any cursor a client had
+	// kept from the old one, which is #697 exactly. Keeping them costs one small Redis
+	// key plus one `seq` row per bot ever deleted, in a Redis running `noeviction`.
+	// That is a leak, and it is the cheaper side of the trade; if it ever needs
+	// reclaiming, do it as a dated sweep that also proves the id is not in use, not as
+	// a delete alongside the queue.
 
 	// Remove friend records (both directions) with version for client sync
 	friendVersion, verErr := bf.ctx.GenSeq(common.FriendSeqKey)
