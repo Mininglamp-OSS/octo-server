@@ -77,6 +77,8 @@ func grantPrincipal(principal cardtmpl.CatalogPrincipal) (GrantPrincipalType, st
 		return GrantPrincipalBot, id, true
 	case cardtmpl.CatalogPrincipalInternalProducer:
 		return GrantPrincipalInternalProducer, id, true
+	case cardtmpl.CatalogPrincipalSpace:
+		return GrantPrincipalSpace, id, true
 	default:
 		return "", "", false
 	}

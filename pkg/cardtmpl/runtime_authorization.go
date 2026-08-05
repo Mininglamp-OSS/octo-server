@@ -65,6 +65,8 @@ func (g RuntimeGrant) Allows(purpose CatalogPurpose) bool {
 	switch purpose {
 	case CatalogPurposeNewSend:
 		return g.Send
+	case CatalogPurposeDiscover:
+		return g.Discover
 	case CatalogPurposeHistoricalEdit, CatalogPurposeActionContext:
 		// action_context is gated on edit rather than on discover: an action
 		// callback is the precondition of the edit that answers it, so a

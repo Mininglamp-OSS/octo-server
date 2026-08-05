@@ -754,8 +754,37 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
 	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3)
+	applyStaticCatalogVisibility(registry)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
 	return registry
+}
+
+// applyStaticCatalogVisibility is the composition root's declaration of which
+// frozen static cards the B1/B2 discovery endpoints may show to callers outside
+// the card's own Space (PR-C D5).
+//
+// It lives here, and not in each template's manifest, for two reasons: an L1
+// handoff manifest is frozen at publish and cannot grow a field, and "who may
+// see this card" is a deployment decision that should be reviewable in one
+// place. Every registered template is private until it is named below, so a
+// card becomes publicly discoverable only through an explicit, reviewed edit —
+// never because someone forgot to set something.
+//
+// PR-C deliberately publishes nothing. All five existing L2a cards stay
+// private: opening one up is a separate reviewed change with its own
+// justification, not a side effect of shipping the discovery endpoints. The
+// empty list is the feature; the public path is exercised by test fixtures and
+// by the pilot's dynamic bundle.
+func applyStaticCatalogVisibility(registry *cardtmpl.Registry) {
+	publicStaticTemplates := []struct {
+		id      cardtmpl.ID
+		version string
+	}{
+		// intentionally empty — see the comment above before adding a row.
+	}
+	for _, template := range publicStaticTemplates {
+		registry.SetCatalogVisibility(template.id, template.version, cardtmpl.CatalogVisibilityPublic)
+	}
 }

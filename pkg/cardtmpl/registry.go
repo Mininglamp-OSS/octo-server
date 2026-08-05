@@ -62,6 +62,10 @@ type manifestFile struct {
 	// SourceLabel / SourceIconURL 可选,若手动指定则覆盖 Template 默认 Source。
 	SourceLabel   string `json:"sourceLabel,omitempty"`
 	SourceIconURL string `json:"sourceIconUrl,omitempty"`
+	// Export is the PR-C D5 opt-in allowlist for B2. Absent means "export no
+	// samples", which is the safe default and the permanent answer for frozen
+	// static cards.
+	Export *exportSamples `json:"export,omitempty"`
 }
 
 // manifestView is one entry of manifest.views. Template/Samples are only present
@@ -179,6 +183,16 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	if err != nil {
 		panic(fmt.Errorf("cardtmpl: register %s: %w", root, err))
 	}
+	// PR-C D5: the B2 projection is built here, from the same reviewed bytes
+	// the template itself was built from, and never at request time. A static
+	// L1 card cannot declare an export sample allowlist — its manifest is
+	// frozen — so its exported sample set is permanently empty.
+	export, err := buildSafeExport(meta, "", CatalogVisibilityPrivate, mf.Owner,
+		rawSchemaBytes(assets, root), rawInteractionReports(assets, root, mf.Views), nil, nil)
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: register export projection %s: %w", root, err))
+	}
+	meta.export = export
 
 	// 注入 Meta 到 Template
 	setter, ok := t.(metaSetter)
@@ -285,6 +299,7 @@ func assembleTemplateMeta(
 		Source:                     Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
 		stateIndex:                 stateIndex,
 		interactions:               interactions,
+		contractVersion:            mf.ContractVersion,
 	}, nil
 }
 
@@ -647,4 +662,150 @@ func walkSubmitActions(value any, path string, visit func(string, map[string]any
 		}
 	}
 	return nil
+}
+
+// rawSchemaBytes returns the reviewed data-schema document verbatim. B2 ships
+// this copy rather than re-serializing the compiled schema, because a
+// round-trip through the compiler loses annotations, examples and key order
+// that a producer reads the schema for.
+func rawSchemaBytes(assets embed.FS, root string) json.RawMessage {
+	raw, err := assets.ReadFile(path.Join(root, "contract", "data.schema.json"))
+	if err != nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
+}
+
+// rawInteractionReports returns the v2 views' interaction reports verbatim.
+// loadInteractionReports already proved each one exists and parses, so a read
+// failure here can only mean the embedded FS changed underneath us.
+func rawInteractionReports(assets embed.FS, root string, views map[ViewKey]manifestView) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(views))
+	for view, spec := range views {
+		if spec.WireProfile != profileV2 {
+			continue
+		}
+		raw, err := assets.ReadFile(path.Join(root, "reports", string(view)+".interaction.json"))
+		if err != nil {
+			continue
+		}
+		out[string(view)] = append(json.RawMessage(nil), raw...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SetCatalogVisibility marks a registered static template as discoverable by
+// callers outside its owning Space. It must run before Freeze.
+//
+// PR-C D5 puts this at the composition root rather than in the template's own
+// manifest for two reasons: an L1 manifest is frozen at publish and cannot grow
+// a field, and "who may see this card" is a deployment decision that deserves
+// to be reviewable in one place rather than spread across template packages.
+// Every static template is private until named here, so a card becomes visible
+// only by an explicit, reviewed edit — never by an omission.
+func (r *Registry) SetCatalogVisibility(id ID, version, visibility string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen {
+		panic(fmt.Errorf("%w: cannot SetCatalogVisibility after Freeze", ErrRegistryFrozen))
+	}
+	if visibility != CatalogVisibilityPublic && visibility != CatalogVisibilityPrivate {
+		panic(fmt.Errorf("cardtmpl: unsupported catalog visibility %q for %s@%s", visibility, id, version))
+	}
+	e, ok := r.entries[registryKey{id: id, version: version}]
+	if !ok {
+		panic(fmt.Errorf("cardtmpl: SetCatalogVisibility for unregistered %s@%s", id, version))
+	}
+	if e.meta.export == nil {
+		panic(fmt.Errorf("cardtmpl: %s@%s has no export projection to publish", id, version))
+	}
+	updated := e.meta.export.Clone()
+	updated.Visibility = visibility
+	hash, _, err := hashSafeExport(updated)
+	if err != nil {
+		panic(fmt.Errorf("cardtmpl: rehash export projection %s@%s: %w", id, version, err))
+	}
+	updated.Hash = hash
+	e.meta.export = updated
+}
+
+// ExportFor returns the B2 projection for one frozen template, or nil when the
+// template is unknown.
+//
+// It reads the registry entry rather than Template.Meta() on purpose: a
+// Template holds the copy of its metadata that was injected at registration,
+// and SetCatalogVisibility deliberately does not push a new copy into it (not
+// every Template implementation accepts one). The registry entry is the single
+// place where the current projection lives.
+func (r *Registry) ExportFor(id ID, version string) *SafeExport {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if version == "" {
+		v, ok := r.defaults[id]
+		if !ok {
+			return nil
+		}
+		version = v
+	}
+	e, ok := r.entries[registryKey{id: id, version: version}]
+	if !ok {
+		return nil
+	}
+	return e.meta.export.Clone()
+}
+
+// StaticCatalogEntry is one frozen template as the discovery layer sees it.
+type StaticCatalogEntry struct {
+	ID              ID
+	Version         string
+	Owner           string
+	Protocol        string
+	ContractVersion string
+	Visibility      string
+	ActionContract  *TemplateActionContract
+	ExportHash      string
+	// IsDefault reports whether this exact version is the ID's registered
+	// default, which is what a static new send would resolve to.
+	IsDefault bool
+}
+
+// StaticCatalog lists the frozen templates for B1. It returns metadata only:
+// the projection itself is fetched per template by B2, so a list response never
+// carries manifest or schema bytes.
+func (r *Registry) StaticCatalog() []StaticCatalogEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]StaticCatalogEntry, 0, len(r.entries))
+	for key, e := range r.entries {
+		entry := StaticCatalogEntry{
+			ID: key.id, Version: key.version,
+			Protocol:        e.meta.Protocol,
+			ContractVersion: e.meta.contractVersion,
+			Visibility:      CatalogVisibilityPrivate,
+			IsDefault:       r.defaults[key.id] == key.version,
+		}
+		if e.meta.ActionContract != nil {
+			contract := *e.meta.ActionContract
+			entry.ActionContract = &contract
+			entry.Owner = contract.Owner
+		}
+		if e.meta.export != nil {
+			entry.Visibility = e.meta.export.Visibility
+			entry.ExportHash = e.meta.export.Hash
+			if entry.Owner == "" {
+				entry.Owner = e.meta.export.Owner
+			}
+		}
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ID != out[j].ID {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Version < out[j].Version
+	})
+	return out
 }

@@ -59,6 +59,14 @@ func respondCatalogIntegrityFailure(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 }
 
+// respondCatalogNotFound is the single answer B2 gives for "no such template",
+// "you may not see it" and "it is blocked". Three distinguishable answers would
+// let any authenticated caller enumerate the private catalog by probing IDs
+// (D5 anti-enumeration), so the reason stays in the logs and never on the wire.
+func respondCatalogNotFound(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrSharedNotFound, nil, nil)
+}
+
 func respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
 	// 具体拒绝原因只进日志/错误链，响应保持单一 localized envelope（管理面
 	// 也不回显任意错误文本，防 details 泄漏内部结构）。

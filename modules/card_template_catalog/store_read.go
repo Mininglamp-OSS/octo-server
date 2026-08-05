@@ -21,6 +21,26 @@ const (
         WHERE c.template_id = ?
         ORDER BY c.version ASC
         LIMIT ?`
+	// selectManagerTemplatesSQL is the operator's index of every claimed
+	// template ID. Unlike B1 it applies no visibility or grant predicate — the
+	// manager plane is already super-admin only, and hiding rows there would
+	// make the control surface useless for diagnosing exactly the templates an
+	// operator most needs to see (blocked, ungranted, disabled).
+	selectManagerTemplatesSQL = `SELECT c.template_id,
+            COUNT(*) AS version_count,
+            MAX(c.version) AS latest_version,
+            MAX(act.active_version) AS active_version,
+            MAX(act.status) AS activation_status,
+            SUM(a.blocked_at IS NOT NULL) AS blocked_versions
+        FROM card_template_version_claim c
+        LEFT JOIN card_template_artifact a
+          ON a.template_id = c.template_id AND a.version = c.version
+        LEFT JOIN card_template_activation act
+          ON act.template_id = c.template_id
+        WHERE c.template_id > ?
+        GROUP BY c.template_id
+        ORDER BY c.template_id ASC
+        LIMIT ?`
 	selectTemplateAuditSQL = `SELECT id, actor_uid, operation, version, previous_version, resulting_version,
         previous_revision, resulting_revision, principal_type, principal_id, scope_space_id,
         previous_permissions, resulting_permissions, result, reason, change_ticket, created_at
@@ -186,6 +206,64 @@ func (s *store) ListAudit(
 	if len(entries) > limit {
 		page.Entries = entries[:limit]
 		page.NextCursor = page.Entries[len(page.Entries)-1].ID
+	}
+	return page, nil
+}
+
+// ManagerTemplateSummary is one template ID as the operator index shows it.
+// It is intentionally coarse: counts and pointers, no per-version metadata and
+// no grant state. An operator drills into a single template with the existing
+// detail endpoint, which is where the bounded grant summary already lives.
+type ManagerTemplateSummary struct {
+	ID               cardtmpl.ID
+	VersionCount     int
+	LatestVersion    string
+	ActiveVersion    string
+	ActivationStatus string
+	BlockedVersions  int
+}
+
+// ManagerTemplatePage is a keyset page over template IDs.
+type ManagerTemplatePage struct {
+	Templates []ManagerTemplateSummary
+	// NextCursor is the last returned template ID, empty when the page is the
+	// last one. Keyset rather than offset so a concurrent publish cannot make
+	// the operator skip a row.
+	NextCursor string
+}
+
+// ListTemplates returns the operator index of claimed template IDs.
+func (s *store) ListTemplates(ctx context.Context, after string, limit int) (ManagerTemplatePage, error) {
+	limit = normalizeManagerReadLimit(limit)
+	rows, err := s.db.QueryContext(ctx, selectManagerTemplatesSQL, after, limit+1)
+	if err != nil {
+		return ManagerTemplatePage{}, fmt.Errorf("card template catalog: list templates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	summaries := make([]ManagerTemplateSummary, 0, limit)
+	for rows.Next() {
+		var summary ManagerTemplateSummary
+		var templateID string
+		var latest, active, status sql.NullString
+		var blocked sql.NullInt64
+		if err := rows.Scan(&templateID, &summary.VersionCount, &latest,
+			&active, &status, &blocked); err != nil {
+			return ManagerTemplatePage{}, fmt.Errorf("card template catalog: scan template summary: %w", err)
+		}
+		summary.ID = cardtmpl.ID(templateID)
+		summary.LatestVersion, summary.ActiveVersion = latest.String, active.String
+		summary.ActivationStatus = status.String
+		summary.BlockedVersions = int(blocked.Int64)
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return ManagerTemplatePage{}, fmt.Errorf("card template catalog: iterate templates: %w", err)
+	}
+	page := ManagerTemplatePage{Templates: summaries}
+	if len(summaries) > limit {
+		page.Templates = summaries[:limit]
+		page.NextCursor = string(page.Templates[len(page.Templates)-1].ID)
 	}
 	return page, nil
 }

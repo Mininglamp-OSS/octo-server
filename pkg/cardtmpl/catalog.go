@@ -15,6 +15,11 @@ const (
 	CatalogPurposeNewSend        CatalogPurpose = "new_send"
 	CatalogPurposeHistoricalEdit CatalogPurpose = "historical_edit"
 	CatalogPurposeActionContext  CatalogPurpose = "action_context"
+	// CatalogPurposeDiscover is a read of the catalog's contract surface (B1/B2).
+	// It carries no permission to send or edit: being able to see that a
+	// template exists is deliberately weaker than being able to use it, which
+	// is why discovery has its own purpose rather than reusing new_send.
+	CatalogPurposeDiscover CatalogPurpose = "discover"
 )
 
 type CatalogPrincipalKind string
@@ -23,6 +28,10 @@ const (
 	CatalogPrincipalBot              CatalogPrincipalKind = "bot"
 	CatalogPrincipalInternalProducer CatalogPrincipalKind = "internal_producer"
 	CatalogPrincipalSystem           CatalogPrincipalKind = "system"
+	// CatalogPrincipalSpace is a human caller acting inside one Space. It is
+	// grantable for discovery only (D2): a Space cannot authenticate as a
+	// producer, so it can never hold send or edit.
+	CatalogPrincipalSpace CatalogPrincipalKind = "space"
 )
 
 type CatalogPrincipal struct {

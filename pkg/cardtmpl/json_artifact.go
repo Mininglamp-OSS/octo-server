@@ -488,6 +488,15 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err != nil {
 		return nil, artifactValidationError("manifest", "manifest", err)
 	}
+	// PR-C D5: build the projection before the conformance self-check, so an
+	// artifact whose export allowlist names a sample that does not exist fails
+	// to compile rather than publishing and then serving an empty samples map.
+	export, err := buildSafeExport(meta, bundle.Catalog.Engine, bundle.Catalog.Visibility, mf.Owner,
+		bundle.Schema, bundle.Reports, bundle.Samples, exportSampleAllowlist(mf))
+	if err != nil {
+		return nil, artifactValidationError("export", "manifest", err)
+	}
+	meta.export = export
 	template := &jsonTemplate{
 		meta:                 meta,
 		viewAST:              parsedTemplates,
@@ -614,8 +623,18 @@ func decodeManifest(parsed any) (manifestFile, error) {
 		"schemaVersion", "id", "name", "version", "contractVersion", "protocol",
 		"adaptiveCardVersion", "renderProfile", "renderProfileCompatibility", "defaultLocale",
 		"owner", "actionType", "dataSchema", "views", "sourceLabel", "sourceIconUrl",
+		"export",
 	); err != nil {
 		return manifestFile{}, err
+	}
+	if raw, declared := root["export"]; declared {
+		exportMap, ok := raw.(map[string]any)
+		if !ok {
+			return manifestFile{}, errors.New("export must be an object")
+		}
+		if err := rejectUnknownKeys(exportMap, "samples"); err != nil {
+			return manifestFile{}, fmt.Errorf("export: %w", err)
+		}
 	}
 	views, ok := root["views"].(map[string]any)
 	if !ok {
@@ -1785,4 +1804,18 @@ func (i *utf16Iterator) next() (uint16, bool) {
 	i.pending = uint16(0xdc00 + (r & 0x3ff))
 	i.hasPending = true
 	return uint16(0xd800 + (r >> 10)), true
+}
+
+// exportSampleAllowlist returns the manifest's declared exportable samples in a
+// deterministic order. An absent declaration yields nothing: samples are
+// caller-authored input fixtures and can carry real tenant data, so exporting
+// them is opt-in per artifact rather than a default anyone can forget to turn
+// off (PR-C D5).
+func exportSampleAllowlist(mf manifestFile) []string {
+	if mf.Export == nil || len(mf.Export.Samples) == 0 {
+		return nil
+	}
+	allowlist := append([]string(nil), mf.Export.Samples...)
+	sort.Strings(allowlist)
+	return allowlist
 }

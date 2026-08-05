@@ -253,6 +253,16 @@ func runtimeDynamicAuthorizer(
 		if !isApprovedRuntimeOwner(meta.Owner) {
 			return cardtmpl.ErrRuntimeCatalogNotAuthorized
 		}
+		// Discovery is the one purpose a grant is not strictly required for:
+		// a public template is discoverable by anyone who can reach the API,
+		// which is what "public" means. It stays weaker than use — seeing a
+		// template never implies being able to send or edit it (invariant 5) —
+		// and the new-send gate deliberately does not apply, because reading a
+		// contract is not sending a card.
+		if access.Purpose == cardtmpl.CatalogPurposeDiscover &&
+			meta.Visibility == cardtmpl.CatalogVisibilityPublic {
+			return nil
+		}
 		// A grantable principal is required: `system` and blank identities are
 		// control-plane concepts, never business producers (D2), and the
 		// resolver reports them as ungranted rather than erroring.

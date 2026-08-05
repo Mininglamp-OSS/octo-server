@@ -76,6 +76,13 @@ type TemplateMeta struct {
 	// 查询走 ViewFor / Interaction,不允许直接读。
 	stateIndex   map[State]ViewKey
 	interactions map[ViewKey]InteractionReport
+	// contractVersion mirrors manifest.contractVersion. It is unexported
+	// because it exists for the B2 projection, not for render-time behaviour.
+	contractVersion string
+	// export is the immutable B2 projection built at registration or compile
+	// time (PR-C D5). Nil means this template has nothing safe to export, and
+	// B2 must answer not-found rather than assemble something at request time.
+	export *SafeExport
 }
 
 // ViewFor 返回 state 归属的视图。业务代码不允许自行维护映射,统一走本方法。
@@ -177,6 +184,10 @@ func (m TemplateMeta) Clone() TemplateMeta {
 		RenderProfileCompatibility: m.RenderProfileCompatibility,
 		Source:                     m.Source,
 		InputSchema:                m.InputSchema,
+		contractVersion:            m.contractVersion,
+		// The projection is immutable, so the clone shares the pointer; callers
+		// that need their own copy go through Export(), which deep-copies.
+		export: m.export,
 	}
 	if m.Manifest != nil {
 		out.Manifest = append(json.RawMessage(nil), m.Manifest...)
