@@ -273,6 +273,9 @@ other = "Card template activation is disabled."
 ["err.server.card_template_catalog.forbidden"]
 other = "Only a super admin can manage card templates."
 
+["err.server.card_template_catalog.grant_invalid"]
+other = "The card template grant request is invalid."
+
 ["err.server.card_template_catalog.request_invalid"]
 other = "The card template bundle is invalid."
 

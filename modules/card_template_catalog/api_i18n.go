@@ -58,3 +58,10 @@ func respondCatalogBlocked(c *wkhttp.Context) {
 func respondCatalogIntegrityFailure(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 }
+
+func respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
+	// 具体拒绝原因只进日志/错误链，响应保持单一 localized envelope（管理面
+	// 也不回显任意错误文本，防 details 泄漏内部结构）。
+	_ = err
+	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogGrantInvalid, nil, nil)
+}

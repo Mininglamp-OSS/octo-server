@@ -163,21 +163,37 @@ boundary and receives regression coverage only.
 
 ### Slice 2 — grant migration, store and manager API
 
-Production files:
+Production files (ledger updated at Slice 2 GREEN, 2026-08-05):
 
 - `[new] modules/card_template_catalog/sql/20260805000001_card_template_catalog_grant.sql`
-- `[new] modules/card_template_catalog/store_grant.go`
-- `[new] modules/card_template_catalog/api_grant.go`
-- `[modify] internal/carddispatch/context.go` — consume only the read-only
-  producer-binding resolver installed in Slice 1; the request body cannot
-  construct a `ProducerSpec`.
-- `[modify] modules/card_template_catalog/store.go`
-- `[modify] modules/card_template_catalog/api.go`
-- `[modify] modules/card_template_catalog/api_state.go`
-- `[modify] modules/card_template_catalog/api_i18n.go`
-- `[modify] modules/card_template_catalog/metrics.go`
-- `[modify] pkg/errcode/card_template_catalog.go`
-- `[modify] pkg/i18n/locales/active.zh-CN.toml`
+  — grant table with CHECK-enforced D2 shapes (active⇒discover; tombstone⇒no
+  permissions; space⇒discover-only + global sentinel) plus additive audit
+  principal/permission columns.
+- `[new] modules/card_template_catalog/store_grant.go` — CAS upsert/revoke with
+  same-tx audit and the claim FOR UPDATE target guard; `resolveGrantRows` is
+  the single exact-over-global/tombstone precedence implementation Slice 3
+  must reuse.
+- `[new] modules/card_template_catalog/api_grant.go` — PUT/DELETE handlers,
+  `validateGrantPrincipal` seam (production: botidentity Active + carddispatch
+  ProducerBinding + active-space query; revoke skips existence so stale
+  principals stay revocable).
+- `internal/carddispatch/context.go` — no further change; the Slice 1
+  read-only binding resolver is consumed as-is.
+- `modules/card_template_catalog/store.go` — no change was needed (shared
+  helpers `boundedRequiredText`/`isDuplicateKey`/limits already exist).
+- `[modify] modules/card_template_catalog/api.go` — routes + principal
+  validator wiring.
+- `[modify] modules/card_template_catalog/api_state.go` — detail carries the
+  bounded grant summary (limit 32) when the store implements the grant
+  interface.
+- `[modify] modules/card_template_catalog/store_read.go` — audit page exposes
+  the redacted grant principal/permission columns.
+- `[modify] modules/card_template_catalog/api_i18n.go` — `respondCatalogGrantInvalid`.
+- `modules/card_template_catalog/metrics.go` — no change was needed; the
+  existing operation/db counters take grant/revoke as label values.
+- `[modify] pkg/errcode/card_template_catalog.go` — one new code
+  `err.server.card_template_catalog.grant_invalid`.
+- `[modify] pkg/i18n/locales/active.zh-CN.toml` (+ regenerated i18n markers).
 
 Focused tests:
 

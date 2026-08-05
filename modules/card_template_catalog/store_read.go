@@ -22,7 +22,8 @@ const (
         ORDER BY c.version ASC
         LIMIT ?`
 	selectTemplateAuditSQL = `SELECT id, actor_uid, operation, version, previous_version, resulting_version,
-        previous_revision, resulting_revision, result, reason, change_ticket, created_at
+        previous_revision, resulting_revision, principal_type, principal_id, scope_space_id,
+        previous_permissions, resulting_permissions, result, reason, change_ticket, created_at
         FROM card_template_audit
         WHERE template_id = ? AND (? = 0 OR id < ?)
         ORDER BY id DESC
@@ -51,18 +52,25 @@ type TemplateDetail struct {
 }
 
 type TemplateAuditEntry struct {
-	ID                uint64    `json:"id"`
-	ActorUID          string    `json:"actor_uid"`
-	Operation         string    `json:"operation"`
-	Version           string    `json:"version,omitempty"`
-	PreviousVersion   string    `json:"previous_version,omitempty"`
-	ResultingVersion  string    `json:"resulting_version,omitempty"`
-	PreviousRevision  *uint64   `json:"previous_revision,omitempty"`
-	ResultingRevision *uint64   `json:"resulting_revision,omitempty"`
-	Result            string    `json:"result"`
-	Reason            string    `json:"reason"`
-	ChangeTicket      string    `json:"change_ticket"`
-	CreatedAt         time.Time `json:"created_at"`
+	ID                uint64  `json:"id"`
+	ActorUID          string  `json:"actor_uid"`
+	Operation         string  `json:"operation"`
+	Version           string  `json:"version,omitempty"`
+	PreviousVersion   string  `json:"previous_version,omitempty"`
+	ResultingVersion  string  `json:"resulting_version,omitempty"`
+	PreviousRevision  *uint64 `json:"previous_revision,omitempty"`
+	ResultingRevision *uint64 `json:"resulting_revision,omitempty"`
+	// PR-C grant/revoke 审计的脱敏 principal 身份与权限差异（无 token、无
+	// 卡片 data）；非 grant 操作行恒为空串。
+	PrincipalType        string    `json:"principal_type,omitempty"`
+	PrincipalID          string    `json:"principal_id,omitempty"`
+	ScopeSpaceID         string    `json:"scope_space_id,omitempty"`
+	PreviousPermissions  string    `json:"previous_permissions,omitempty"`
+	ResultingPermissions string    `json:"resulting_permissions,omitempty"`
+	Result               string    `json:"result"`
+	Reason               string    `json:"reason"`
+	ChangeTicket         string    `json:"change_ticket"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type TemplateAuditPage struct {
@@ -147,7 +155,10 @@ func (s *store) ListAudit(
 		if err := rows.Scan(
 			&entry.ID, &entry.ActorUID, &entry.Operation, &entry.Version,
 			&entry.PreviousVersion, &entry.ResultingVersion,
-			&previousRevision, &resultingRevision, &entry.Result, &entry.Reason,
+			&previousRevision, &resultingRevision,
+			&entry.PrincipalType, &entry.PrincipalID, &entry.ScopeSpaceID,
+			&entry.PreviousPermissions, &entry.ResultingPermissions,
+			&entry.Result, &entry.Reason,
 			&entry.ChangeTicket, &entry.CreatedAt,
 		); err != nil {
 			return TemplateAuditPage{}, fmt.Errorf("card template catalog: scan audit: %w", err)

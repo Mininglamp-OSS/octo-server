@@ -267,7 +267,32 @@ func (a *API) detail(c *wkhttp.Context) {
 		a.respondStateError(c, "detail", err)
 		return
 	}
-	c.Response(templateDetailResponse(detail))
+	response := templateDetailResponse(detail)
+	// Bounded grant summary（PR-C）：grant store 可用时附带；fake/legacy store
+	// 不实现该接口则省略（响应 grants 恒为数组，不因缺失变形）。
+	if grantStore, ok := a.store.(catalogGrantStore); ok && grantStore != nil {
+		grants, truncated, grantsErr := grantStore.ListGrants(ctx, id, grantSummaryLimit)
+		if grantsErr != nil {
+			a.respondStateError(c, "detail_grants", grantsErr)
+			return
+		}
+		response.Grants = make([]grantSummaryResponse, len(grants))
+		for i, record := range grants {
+			response.Grants[i] = grantSummaryResponse{
+				PrincipalType: string(record.Identity.PrincipalType),
+				PrincipalID:   record.Identity.PrincipalID,
+				ScopeSpaceID:  record.Identity.ScopeSpaceID,
+				Status:        string(record.Status),
+				Discover:      record.Permissions.Discover,
+				Send:          record.Permissions.Send,
+				Edit:          record.Permissions.Edit,
+				Revision:      record.Revision,
+				UpdatedBy:     record.UpdatedBy,
+			}
+		}
+		response.GrantsTruncated = truncated
+	}
+	c.Response(response)
 }
 
 func (a *API) audit(c *wkhttp.Context) {
@@ -462,11 +487,27 @@ type detailReadResponse struct {
 	Activation activationReadResponse `json:"activation"`
 	Versions   []versionReadResponse  `json:"versions"`
 	Truncated  bool                   `json:"truncated"`
+	// Grants 是 bounded grant summary（PR-C Control APIs）：只在 superAdmin
+	// manager detail 出现，普通 B1/B2 永不返回这些 control fields。
+	Grants          []grantSummaryResponse `json:"grants"`
+	GrantsTruncated bool                   `json:"grants_truncated,omitempty"`
+}
+
+type grantSummaryResponse struct {
+	PrincipalType string `json:"principal_type"`
+	PrincipalID   string `json:"principal_id"`
+	ScopeSpaceID  string `json:"scope_space_id"`
+	Status        string `json:"status"`
+	Discover      bool   `json:"discover"`
+	Send          bool   `json:"send"`
+	Edit          bool   `json:"edit"`
+	Revision      uint64 `json:"revision"`
+	UpdatedBy     string `json:"updated_by"`
 }
 
 func templateDetailResponse(detail TemplateDetail) detailReadResponse {
 	response := detailReadResponse{
-		TemplateID: detail.TemplateID,
+		TemplateID: detail.TemplateID, Grants: []grantSummaryResponse{},
 		Activation: activationReadResponse{
 			Exists: detail.Activation.Exists, Version: detail.Activation.Version,
 			Status: string(detail.Activation.Status), Revision: detail.Activation.Revision,

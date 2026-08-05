@@ -50,4 +50,9 @@ var (
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "The card template version is blocked.",
 	})
+	ErrCardTemplateCatalogGrantInvalid = register(codes.Code{
+		ID:             "err.server.card_template_catalog.grant_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The card template grant request is invalid.",
+	})
 )
