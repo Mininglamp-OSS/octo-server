@@ -197,9 +197,9 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterEnabled()) }},
 	{Category: "botratelimit", Key: "register_dry_run", Type: settingTypeBool, Description: "注册/换 token 限流是否影子运行（只观测不拦截）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterDryRun()) }},
-	{Category: "botratelimit", Key: "register_rps", Type: settingTypeFloat, Description: "单个 Bot token 的注册/刷新速率上限（令牌桶 rps）", Positive: true,
+	{Category: "botratelimit", Key: "register_rps", Type: settingTypeFloat, Description: "单个 Bot token 的注册/刷新速率上限（令牌桶 rps）；读取侧强制不低于 0.05——它与 register_burst 的比值决定令牌桶 key 的 TTL，配额过低会放大 keyspace", Positive: true,
 		Effective: func(s *SystemSettings) string { return floatToCanonical(s.BotRateLimitRegisterRPS()) }},
-	{Category: "botratelimit", Key: "register_burst", Type: settingTypeInt, Description: "单个 Bot token 的注册/刷新突发上限（令牌桶 burst）", Positive: true,
+	{Category: "botratelimit", Key: "register_burst", Type: settingTypeInt, Description: "单个 Bot token 的注册/刷新突发上限（令牌桶 burst）；读取侧夹到 register_rps×20 以内——TTL 是 ceil(burst/rps×2)，而 register 的 key 由客户端提供的 token 决定基数，所以放大比值会放大每 IP 的 live key 数。调低 rps 会同时压低有效 burst，实际生效值见本列", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitRegisterBurst()) }},
 
 	// App Bot 共享鉴权缓存的安全网 TTL（秒）。吊销靠共享 DEL 即时生效，此 TTL 仅兜底

@@ -249,14 +249,26 @@ if !allowed { /* 429 + X-RateLimit-* 头 */ }
 | 现场 | access log | — | 「这一刻发生了什么」（仅 pod 内） |
 
 **第 1 层 — Prometheus（无身份）**
-- `octo_bot_ratelimit_decisions_total{class, decision}`，
-  `decision ∈ {allow, would_deny, deny}`，`class ∈ {business, heartbeat, register, events}`。
+- `dmwork_bot_ratelimit_decisions_total{class, outcome}`，
+  `outcome ∈ {bypassed, no_key, allowed, would_deny, denied, degraded}`，
+  `class ∈ {business, heartbeat, register}`。
   用 `class` 粗分类而非具体 path（bot 端点 40+ 个，放进 label 就白省了 `robot_id` 的基数）。
-- `would_deny` 与 `deny` **必须是两个不同的值**，否则影子期和执行期的数据无法对比。
+- `would_deny` 与 `denied` **必须是两个不同的值**，否则影子期和执行期的数据无法对比。
+
+  > **本节曾与实现脱节（第三轮 review P2-7）**：原文写 label 名 `decision`、
+  > 三个取值、四个 class（含不存在的 `events`），指标前缀也没写。落地实现是
+  > `outcome`（6 值）× `class`（3 值）。Help 字符串与真实枚举的一致性现由
+  > `TestBotRateLimitMetricHelpMatchesActualEnums` 钉住——同一处漂移被三位评审
+  > 提了五次，说明它不该靠人眼守。
 
 **第 2 层 — Redis ZSet（有身份，有界）**
-- `ratelimit:shadow:offenders:{class}`，member = robotID，score = would-deny 累计；
-  写入后 `ZREMRANGEBYRANK` 只保留 top N（建议 50），**基数结构性有界**。
+- `ratelimit:bot:offenders:`，score = would-deny 累计；
+  写入后 `ZREMRANGEBYRANK` 只保留 top N（实现取 50，另有 2× 高水位裁剪），
+  **基数结构性有界**。
+- member **按通道而异**：business / heartbeat 是 robotID；**register 是
+  `SHA-256(token)[:16]`**，因为它跑在 `authBot` 之前、还没有 bot 身份。
+  所以 register 通道的影子数据能回答「有多少个不同 token、什么速率」，
+  但**回答不了「这个配额会拒谁」**——见下方合规表 `trust-boundary` 行。
 - 定位「谁会被误伤」只需一条 `ZREVRANGE ... WITHSCORES`。
   本次事故那种「单个 bot 打爆」的形态，这条命令一眼就能看出来。
 - 该 key 必须有 TTL，且**只在 dry-run 或拒绝发生时写**，不能每请求都写。
@@ -630,7 +642,7 @@ reviewer 把"换 token 绕过限流"本身也算作缺陷。这部分**维持原
 | `rate-limit` | ✓ | 合规,但**依赖 Exception 条款**——见下方「需人决定 #1」 |
 | `space-isolation` | ✓ | 合规。heartbeat 移出主组后仍显式挂 `authBot`,只增不减中间件;未新增 handler,未绕过任何 ownership 检查;`/v1/bot/messages` 用 `r` 独立挂载,不在主组下,未受影响 |
 | `error-handling` | ✓ | 复用已注册的 `err.shared.rate.limited`,无 raw response(i18n-lint 通过)。**但门面选择需 sign-off**——见「需人决定 #2」 |
-| `trust-boundary` | ✓ | 转义条款不适用(不渲染外部内容);凭据条款已守:token 只落 SHA-256、access log 与 offenders 均记 robotID |
+| `trust-boundary` | ✓ | 转义条款不适用(不渲染外部内容);凭据条款已守:token **只落 SHA-256,明文绝不入 Redis key / 日志 / 指标**。但需按实际形态签字:`register` 通道的 offenders member 是 `SHA-256(token)[:16]`(**不是** robotID——它跑在 `authBot` 之前),即会把一个**无盐截断的凭据哈希在 Redis 存 24h**。判断是可接受:bot token 高熵、原像不可行,且能读该 key 的人本来就有 Redis 访问权。access log 侧只记 robotID,且 register 因为在鉴权前压根拿不到——那半是已知限制(见「observability」小节)。原文把这行写成"access log 与 offenders 均记 robotID",是错的(第三轮 review P2-7 指出) |
 | `testing` | — | 合规。已 reset `ratelimit:bot:*` 与 `ratelimit:strict:bot_register:*`;`-race` 全绿 |
 | `commit-style` | — | 尚未 commit,留到 Finish |
 
@@ -775,9 +787,20 @@ exclude 之后就存在一个完全无防护的未鉴权端点。定值理由见
 定稿 `register 100/500`、`heartbeat 500/1500`,仍足以关掉各自要关的洞:
 
 - register 100 rps:keyspace 放大的约束是**生成速率有界**,不是贴着实测。
-  100 rps × TTL(约 40s) ≈ 4000 个 live key,相对全局 1500 rps 下最坏约 6 万个已收敛
+  100 rps × TTL(40s) ≈ 4000 个 live key,相对全局 1500 rps 下最坏约 6 万个已收敛
   一个量级。(且 per-token 桶默认关闭时 `Check` 在碰 Redis 前旁路,放大只在开启后存在。)
   burst 500 让集体重连在约 10 秒内排空。
+
+  > **那个 40s 起初只是碰巧成立(第三轮 review P2-5)**。TTL 是 Lua 从参数推的
+  > `ceil(burst/rps * 2)`,两个值都能热调,且 TTL ∝ burst/rps——所以"按影子数据
+  > **收紧** register_rps"会**放大** keyspace 上界,方向与运维直觉相反且单调
+  > (`rps 0.01 + burst 100` ⇒ TTL 20000s ⇒ 每 IP 约 200 万 key;生产 Redis 无
+  > maxmemory,结局是 OOM-kill 不是淘汰)。**上线流程本身在把系统推向失效模式。**
+  > 现补两道成对夹紧(`botRateLimitMinRegisterRPS` + `botRateLimitMaxRegisterFillRatio`),
+  > 把 burst/rps 压到 <= 20,于是任意合法配置下 TTL 恒为 40s,上面那个 ≈4000
+  > 由代码保证。只夹比值守不住(burst>=1 与比值约束在低 rps 处冲突)——这个洞是
+  > `TestBotRateLimitRegisterKeyspaceBoundHoldsUnderTightening` 抓出来的,不是推出来的。
+  > 只有 register 需要:business/heartbeat 的 key 是 robotID,基数被真实 bot 数封住。
 - heartbeat 500 rps:给全车队 97 rps 留 5 倍余量,仍比它原先所在的全局桶紧 3 倍。
   它要挡的是"无效 token 无限触发 `authBot` 的 DB 查询",成本在 DB 往返而非计数,
   500 rps 够用。

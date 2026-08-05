@@ -972,6 +972,43 @@ const (
 	// 一次限流就可能让心跳 key 过期，即这条通道自己制造了它本该防止的断联。
 	// 取 1/60 的 6 倍余量。
 	botRateLimitMinHeartbeatRPS = 0.1
+
+	// botRateLimitMaxRegisterFillRatio 是 register 通道 `burst/rps` 的**结构性上界**。
+	//
+	// 为什么只有 register 需要这道夹紧（第三轮 review P2-5）：令牌桶 key 的 TTL 由参数
+	// 推导而来，不是常数——`pkg/ratelimit/bucket.go` 的 Lua 是
+	// `ttl = ceil(burst/rate * 2)`。于是**每 IP 的 live key 上界 = 建 key 速率 × TTL**。
+	// business 与 heartbeat 的 key 是 robotID，基数被真实 bot 数量（约 2903）封住，
+	// TTL 多长都不会让 key 数发散。而 register 跑在鉴权之前、key 是
+	// `SHA-256(客户端提供的 token)`，轮换 token 就是一请求一 key——基数只受
+	// `bot_register` IP 底线（100 rps）约束，所以 live key 上界随 TTL 线性增长。
+	//
+	// 陷阱在于**方向**：TTL ∝ burst/rps，而上线流程是"按影子数据收紧 register_rps"。
+	// 收紧配额会**放大** keyspace 上界，与运维的直觉相反且单调。举例（burst=10）：
+	// rps 0.5 → TTL 40s → 约 4000 key；rps 0.05 → TTL 400s → 4 万；
+	// rps 0.01 + burst 100 → TTL 20000s → 每 IP 约 200 万。生产 Redis 无 maxmemory，
+	// 结局是 OOM-kill 而不是淘汰。
+	//
+	// 取 20 使**出厂默认恰好落在界上**（burst 10 / rps 0.5 = 20 ⇒ TTL 40s ⇒
+	// 100 rps × 40s ≈ 4000 key），也就是让 register 底线注释里那个 "≈4000" 从
+	// "在当前默认值下碰巧成立"变成**由代码保证**。
+	//
+	// 夹的是 burst 而不是抬 rps：运维调的是 rps（他要的是速率），抬 rps 会把
+	// "我要收紧"静默变成"放宽了"。降 burst 只削突发额度，保留他表达的稳态速率。
+	botRateLimitMaxRegisterFillRatio = 20.0
+
+	// botRateLimitMinRegisterRPS 是 register 速率的**结构性下界**，与上面的比值上界
+	// 成对存在——单独夹比值是守不住的。
+	//
+	// burst 必须 >= 1（否则桶永远填不进 token，等于 100% 拒绝），所以当 rps 低到
+	// `rps * 比值 < 1` 时，比值约束与 burst>=1 直接冲突，夹紧只能让位给后者，
+	// TTL 随即挣脱上界：rps 0.01 + burst 1 ⇒ TTL 200s ⇒ 每 IP 2 万 key。
+	// 这个洞是本轮那条 keyspace 上界用例抓出来的，不是推导出来的。
+	//
+	// 取 `1/比值` 恰好是"burst=1 时比值仍然成立"的临界点，于是两道夹紧合起来把
+	// TTL **钉成常数 40s**（任意合法 rps 下 burst/rps 都被压到 <= 20），
+	// live key 上界因此恒为 100 rps × 40s ≈ 4000。
+	botRateLimitMinRegisterRPS = 1.0 / botRateLimitMaxRegisterFillRatio
 )
 
 // BotRateLimitBusinessEnabled 等三组 getter 的回退链均为 DB → env → code default。
@@ -1021,12 +1058,39 @@ func (s *SystemSettings) BotRateLimitRegisterDryRun() bool {
 	return s.getBool("botratelimit", "register_dry_run", boolEnvDefault(envBotRateLimitRegisterDryRun, defaultBotRateLimitDryRun))
 }
 
+// BotRateLimitRegisterRPS 在通用消毒之外再夹一道下界：见 botRateLimitMinRegisterRPS。
+// 与 BotRateLimitRegisterBurst 的比值上界成对，共同把令牌桶 key 的 TTL 钉成常数。
 func (s *SystemSettings) BotRateLimitRegisterRPS() float64 {
-	return s.getRateLimitFloat("botratelimit", "register_rps", envBotRateLimitRegisterRPS, defaultBotRateLimitRegisterRPS)
+	v := s.getRateLimitFloat("botratelimit", "register_rps", envBotRateLimitRegisterRPS, defaultBotRateLimitRegisterRPS)
+	if v < botRateLimitMinRegisterRPS {
+		return botRateLimitMinRegisterRPS
+	}
+	return v
 }
 
+// BotRateLimitRegisterBurst 在通用消毒之外再夹一道上界：`burst <= rps * 上限比值`
+// （见 botRateLimitMaxRegisterFillRatio）。
+//
+// 这条不是防手滑，是防「收紧配额反而放大 keyspace」这个方向相反的失败模式：
+// 令牌桶 key 的 TTL 是 `ceil(burst/rps * 2)`，而 register 的 key 由客户端提供的
+// token 决定基数，所以 live key 上界正比于 burst/rps。夹住比值即夹住上界。
+//
+// 夹紧后 rps 与 burst **不再独立**：调低 register_rps 会同时压低有效 burst。
+// 这是刻意的——两者的比值是一个结构性量，不是两个自由参数。
+// 有效值可在管理台的 Effective 列读到，不必靠猜。
 func (s *SystemSettings) BotRateLimitRegisterBurst() int {
-	return s.getRateLimitInt("botratelimit", "register_burst", envBotRateLimitRegisterBurst, defaultBotRateLimitRegisterBurst)
+	burst := s.getRateLimitInt("botratelimit", "register_burst", envBotRateLimitRegisterBurst, defaultBotRateLimitRegisterBurst)
+	maxBurst := int(math.Floor(s.BotRateLimitRegisterRPS() * botRateLimitMaxRegisterFillRatio))
+	if maxBurst < 1 {
+		// 有 botRateLimitMinRegisterRPS 在，这里**不可达**（rps >= 1/比值 ⇒ maxBurst >= 1）。
+		// 保留是因为两道夹紧各自独立成立比互相依赖更结实：若将来有人调了比值或下界
+		// 而忘了另一边，这里兜住的是"100% 拒绝"，比 keyspace 放大更急。
+		maxBurst = 1
+	}
+	if burst > maxBurst {
+		return maxBurst
+	}
+	return burst
 }
 
 // getRateLimitFloat 是限流配额专用的读侧防御，语义与 IncomingWebhookPerWebhookRPS

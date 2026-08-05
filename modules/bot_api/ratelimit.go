@@ -116,9 +116,19 @@ const (
 // 现值仍然显著收敛，且足以关掉它们各自要关的洞：
 //
 //   - register 100 rps：keyspace 放大的约束是**key 生成速率有界**，不是"贴着实测"。
-//     100 rps × TTL(约 40s) ≈ 4000 个 live key，相对全局 1500 rps 下最坏约 6 万个
+//     100 rps × TTL(40s) ≈ 4000 个 live key，相对全局 1500 rps 下最坏约 6 万个
 //     已收敛一个量级。（且 per-token 桶默认关闭时 Check 在碰 Redis 前就旁路，
 //     放大只在该通道开启后才存在。）burst 500 让集体重连在约 10 秒内排空。
+//
+//     **那个 TTL=40s 由代码保证，不是碰巧**（第三轮 review P2-5）。令牌桶 key 的
+//     TTL 是 Lua 从参数推的 `ceil(burst/rps * 2)`，两个值都能从后台热调；而
+//     TTL ∝ burst/rps，所以"按影子数据**收紧** register_rps"会**放大** keyspace
+//     上界——与直觉相反且单调（rps 0.01 + burst 100 ⇒ TTL 20000s ⇒ 每 IP 约 200 万
+//     key，而生产 Redis 无 maxmemory，结局是 OOM-kill 不是淘汰）。
+//     现由 modules/common 的两道成对夹紧钉住：`register_rps` 有下界、
+//     `register_burst` 被夹到 `rps × 20`，合起来把 burst/rps 压到 <= 20，
+//     于是任意合法配置下 TTL 恒为 40s。见 botRateLimitMaxRegisterFillRatio 与
+//     TestBotRateLimitRegisterKeyspaceBoundHoldsUnderTightening。
 //
 //     **后续变更**：register 已随 heartbeat 一并移出全局桶（见 main.go
 //     globalRateLimitExcludePaths）。这不改变上面的定值——移出前 register 同时受
@@ -317,7 +327,7 @@ type botRateLimiters struct {
 
 // botRateLimitObserver 把判定结果分发到两层观测：
 //
-//	Prometheus  —— 无身份、低基数（class × outcome = 20 条 series 封顶）
+//	Prometheus  —— 无身份、低基数（class(3) × outcome(6) = 18 条 series 封顶）
 //	OffenderZSet —— 有身份、有界（top N），只在拒绝/影子拒绝时写
 //
 // 身份不进 Prometheus 是硬约束：生产实测活跃 bot 2903 个且无上界。

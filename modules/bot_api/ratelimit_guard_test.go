@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -202,6 +205,61 @@ func functionsCallingGetLoginUID(t *testing.T) map[string]bool {
 	return out
 }
 
+// TestBotRateLimitMetricHelpMatchesActualEnums —— 指标 Help 必须与真实枚举一致。
+//
+// 这条守卫存在的理由本身就是证据：`class(4) × outcome(5)`、枚举里写一个不存在的
+// `events`、漏掉后来新增的 `no_key`——同一处文档漂移被**三位评审提了五次**，
+// 每次都靠人眼发现。文档与枚举的一致性是可判定的，就不该靠 review 记。
+//
+// 为什么钉在 bot_api 而不是 pkg/metrics：class 枚举在本包，outcome 枚举在
+// pkg/ratelimit，而 pkg/metrics 不能 import 本包（bot_api → metrics 已成依赖）。
+// 本包是两个枚举唯一的交汇点。
+//
+// 钉 Help 而不是注释：Help 是**下发到 Prometheus、被看板作者读到**的那份文档，
+// 漂移的实际代价落在这里；而它可以从 registry 里取回来比对，注释不能。
+func TestBotRateLimitMetricHelpMatchesActualEnums(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.NewBotRateLimitMetrics(reg)
+
+	// CounterVec 在没有任何 label 组合被观测过时不会出现在 Gather 结果里，
+	// 必须先造一个 series 才能取到 Help。
+	m.Decisions.WithLabelValues(RateLimitClassBusiness, ratelimit.OutcomeAllowed.String()).Inc()
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var help string
+	for _, f := range families {
+		if strings.HasSuffix(f.GetName(), "bot_ratelimit_decisions_total") {
+			help = f.GetHelp()
+		}
+	}
+	require.NotEmpty(t, help,
+		"取不到 decisions_total 的 Help——指标改名了？本守卫会因此静默失效")
+
+	// outcome:遍历真实枚举，Help 必须逐个提到。
+	// 用 String() 而非字面量，这样新增 outcome 时本用例自动跟着变严。
+	for _, o := range []ratelimit.Outcome{
+		ratelimit.OutcomeBypassed, ratelimit.OutcomeAllowed, ratelimit.OutcomeWouldDeny,
+		ratelimit.OutcomeDenied, ratelimit.OutcomeDegraded, ratelimit.OutcomeNoKey,
+	} {
+		require.Contains(t, help, o.String(),
+			"Help 未提到 outcome %q。看板作者据 Help 建查询，漏一个就等于那类判定在监控上不存在", o.String())
+	}
+
+	// class:三个通道全部提到。
+	for _, c := range []string{RateLimitClassBusiness, RateLimitClassHeartbeat, RateLimitClassRegister} {
+		require.Contains(t, help, c, "Help 未提到 class %q", c)
+	}
+
+	// 反向:不得出现不存在的枚举值。`events` 是曾经真实写进 Help 的幽灵值,
+	// 它会让看板作者为一个永不产生数据的 class 建查询。
+	require.NotContains(t, help, "events",
+		"Help 提到了不存在的 class `events`——没有任何代码会发出它")
+	require.NotContains(t, help, "unknown",
+		"`unknown` 是 Outcome.String() 的 default 兜底,不是合法枚举值,不应写进 Help")
+}
+
 // TestHeartbeatIPLimitPrecedesAuth 是 code review P1 的源码守卫。
 //
 // `/v1/bot/heartbeat` 已从全局 per-IP 桶排除（main.go globalRateLimitExcludePaths），
@@ -255,7 +313,22 @@ func TestHeartbeatIPLimitPrecedesAuth(t *testing.T) {
 	if end := strings.Index(rDecl, "ba.register)"); end != -1 {
 		rDecl = rDecl[:end]
 	}
-	require.Less(t, strings.Index(rDecl, "registerIPLimit"), strings.Index(rDecl, "l.register }"),
+
+	// 先自证两端都在，再比顺序（第三轮 review P2-6）。
+	// 原先直接 `require.Less(Index(a), Index(b))`：`registerIPLimit` 缺失时 Index 返回
+	// -1，而 `Less(-1, 正数)` **通过**——这条守护 keyspace 放大顺序的断言在中间件被
+	// 删掉时会静默空过。上面 heartbeat 块（:229）本来就是这么写的，这里漏了。
+	// 这正是本任务反复强调的那类失效：守卫一旦匹配不上就退化成恒真断言。
+	rIPIdx := strings.Index(rDecl, "registerIPLimit")
+	rPerTokenIdx := strings.Index(rDecl, "l.register }")
+
+	require.NotEqual(t, -1, rIPIdx,
+		"register 缺少 per-IP strict 限流。它已移出全局 per-IP 桶且跑在鉴权之前，"+
+			"没有这一层则轮换 token 可按请求速率无界地造 Redis key")
+	require.NotEqual(t, -1, rPerTokenIdx,
+		"register 缺少 per-token 指纹桶")
+
+	require.Less(t, rIPIdx, rPerTokenIdx,
 		"register 的 IP 桶必须排在 token 指纹桶之前，否则 key 已经建好了")
 }
 

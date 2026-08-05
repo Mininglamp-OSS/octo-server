@@ -16,12 +16,12 @@ import (
 // label 基数是**硬约束**：生产实测活跃 bot 2903 个（Redis bot:heartbeat:*，TTL 60s）
 // 且随业务增长无上界，因此 robot_id **绝不进 label**。身份维度由
 // pkg/ratelimit.OffenderRecorder 的有界 ZSet 承担。
-// 这里两个 label 都是固定枚举：class(4) × outcome(5) = 20 条 series 封顶。
+// 这里两个 label 都是固定枚举：class(3) × outcome(6) = 18 条 series 封顶。
 
 // BotRateLimitMetrics 持有 bot 限流判定指标。每进程一个实例，注册到一个 Registerer。
 type BotRateLimitMetrics struct {
-	// Decisions 按 class(business/heartbeat/register/events) 与
-	// outcome(bypassed/allowed/would_deny/denied/degraded) 计数每次判定。
+	// Decisions 按 class(business/heartbeat/register) 与
+	// outcome(bypassed/no_key/allowed/would_deny/denied/degraded) 计数每次判定。
 	//
 	// would_deny 与 denied 刻意分开：影子模式（dry-run）下判定为拒绝但不拦截，
 	// 「关掉 dry-run 会多拒多少」正是靠这两个值的对比来回答的——合并就等于
@@ -29,6 +29,10 @@ type BotRateLimitMetrics struct {
 	//
 	// degraded 单列：它表示 Redis 故障导致限流层 fail-open，
 	// 即「限流实际上没在工作」，这必须能在监控上一眼看出来，不能混进 allowed。
+	//
+	// no_key 与 bypassed 分开：bypassed 是「这条通道被显式关闭」（预期状态），
+	// no_key 是「通道开着但取不到限流维度」（配置或中间件顺序出了问题，
+	// 桶实际没生效）。两者都不拦截，混在一起就看不出后者。
 	Decisions *prometheus.CounterVec
 }
 
@@ -44,8 +48,8 @@ func NewBotRateLimitMetrics(reg prometheus.Registerer) *BotRateLimitMetrics {
 			Namespace: metricNamespace,
 			Subsystem: "bot_ratelimit",
 			Name:      "decisions_total",
-			Help: "Bot API rate-limit decisions, labeled by class (business/heartbeat/register/events) " +
-				"and outcome (bypassed/allowed/would_deny/denied/degraded). " +
+			Help: "Bot API rate-limit decisions, labeled by class (business/heartbeat/register) " +
+				"and outcome (bypassed/no_key/allowed/would_deny/denied/degraded). " +
 				"Deliberately carries no bot identity: see pkg/ratelimit.OffenderRecorder for the bounded per-bot view.",
 		}, []string{"class", "outcome"}),
 	}

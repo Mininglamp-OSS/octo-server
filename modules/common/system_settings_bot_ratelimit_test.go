@@ -78,6 +78,91 @@ func TestBotRateLimitHeartbeatRPSLowerBound(t *testing.T) {
 	}
 }
 
+// TestBotRateLimitRegisterBurstFillRatioUpperBound —— register 的 `burst/rps` 上界。
+//
+// 第三轮 review P2-5。令牌桶 key 的 TTL 不是常数,而是
+// `pkg/ratelimit/bucket.go` 的 Lua 从参数推的:`ttl = ceil(burst/rate * 2)`。
+// 于是**每 IP 的 live key 上界 = 建 key 速率 × TTL**。register 的 key 是
+// `SHA-256(客户端提供的 token)`,轮换 token 一请求一 key,基数只受 IP 底线约束,
+// 所以 live key 随 TTL 线性发散;business/heartbeat 的 key 是 robotID,基数被
+// 真实 bot 数封住,不需要这道夹紧。
+//
+// 关键是**方向反直觉**:TTL ∝ burst/rps,而上线流程是"按影子数据收紧 register_rps"。
+// 收紧配额会放大 keyspace 上界。这条用例就是钉住"收紧不会放大"。
+func TestBotRateLimitRegisterBurstFillRatioUpperBound(t *testing.T) {
+	// 自证前提:出厂默认必须恰好落在界上,否则下面的 "≈4000 key" 论证失去锚点,
+	// 而 bot_api 的底线注释是照这个数写的。
+	require.Equal(t, botRateLimitMaxRegisterFillRatio,
+		float64(defaultBotRateLimitRegisterBurst)/defaultBotRateLimitRegisterRPS,
+		"出厂默认的 burst/rps 必须等于上限比值——register 底线注释里的 ≈4000 key 依赖它")
+
+	cases := []struct {
+		name           string
+		dbRPS, dbBurst string
+		want           int
+	}{
+		{"默认原样通过(恰在界上)", "", "", defaultBotRateLimitRegisterBurst},
+		{"超界被夹到 rps*比值", "0.5", "500", 10},
+		{"收紧 rps 会同时压低有效 burst", "0.25", "10", 5},
+		{"放宽 rps 则允许更大 burst", "2", "40", 40},
+		{"未超界原样通过", "1", "5", 5},
+		{"rps 被下界夹紧后 burst 随之为 1", "0.001", "10", 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			snap := map[string]string{}
+			if c.dbRPS != "" {
+				snap["botratelimit.register_rps"] = c.dbRPS
+			}
+			if c.dbBurst != "" {
+				snap["botratelimit.register_burst"] = c.dbBurst
+			}
+			got := botRLSettings(snap).BotRateLimitRegisterBurst()
+			assert.Equal(t, c.want, got)
+			assert.GreaterOrEqual(t, got, 1,
+				"burst 必须 >= 1,否则桶永远填不进 token,等于 100%% 拒绝")
+		})
+	}
+}
+
+// TestBotRateLimitRegisterKeyspaceBoundHoldsUnderTightening —— 上面那条夹紧的**目的**。
+//
+// 单独立一条,是因为 burst 的具体取值不是重点,「TTL 不随收紧而增长」才是。
+// 这条直接复算 Lua 的 TTL 公式并断言 live key 上界不超过设计值,
+// 所以将来有人放宽比值上界时,失败信息会直接指向真正被破坏的性质。
+func TestBotRateLimitRegisterKeyspaceBoundHoldsUnderTightening(t *testing.T) {
+	// bot_register IP 底线的 rps(modules/bot_api defaultRegisterIPRPS)。
+	// 跨包不可引用,硬编码并由本断言锁住语义。
+	const registerIPFloorRPS = 100.0
+	const designedKeyBound = 4000.0
+
+	// 自证前提:两道夹紧成对才守得住。下界必须恰好是"burst=1 时比值仍成立"的临界点,
+	// 否则下面的上界断言会在低 rps 处失效——这个洞正是它抓出来的。
+	require.Equal(t, 1.0, botRateLimitMinRegisterRPS*botRateLimitMaxRegisterFillRatio,
+		"rps 下界必须等于 1/比值,否则 burst>=1 与比值约束冲突,TTL 会挣脱上界")
+
+	for _, rps := range []string{"0.5", "0.25", "0.1", "0.05", "0.01", "0.001"} {
+		t.Run("rps="+rps, func(t *testing.T) {
+			s := botRLSettings(map[string]string{
+				"botratelimit.register_rps": rps,
+				// 故意给一个远超界的 burst:运维不会主动同步调它。
+				"botratelimit.register_burst": "10000",
+			})
+			effRPS := s.BotRateLimitRegisterRPS()
+			effBurst := s.BotRateLimitRegisterBurst()
+
+			// 复算 pkg/ratelimit/bucket.go 的 Lua:ttl = max(1, ceil(burst/rate * 2))
+			ttl := math.Max(1, math.Ceil(float64(effBurst)/effRPS*2))
+			keyBound := registerIPFloorRPS * ttl
+
+			assert.LessOrEqual(t, keyBound, designedKeyBound,
+				"rps=%s: 有效 burst=%d ⇒ TTL=%.0fs ⇒ 每 IP 约 %.0f 个 live key,"+
+					"超过设计上界 %.0f。收紧配额不得放大 keyspace",
+				rps, effBurst, ttl, keyBound, designedKeyBound)
+		})
+	}
+}
+
 // TestBotRateLimitReadSideDefenseRejectsIllegalValues —— 读侧防御。
 //
 // 每条非法输入都对应一个真实失败模式:
