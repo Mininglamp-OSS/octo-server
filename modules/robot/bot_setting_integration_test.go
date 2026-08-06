@@ -397,8 +397,23 @@ func TestBotSettings_BatchValidationRejectsAtomically(t *testing.T) {
 // It calls the writer directly rather than going through HTTP because the
 // registry whitelist makes an over-long key unreachable from the endpoint — which
 // is the point: the only failure the HTTP path can produce trips before Begin().
+//
+// The provocation is sql_mode-dependent, so the mode is asserted rather than
+// assumed (round-3 review P2-5): without STRICT_*_TABLES MySQL truncates the
+// over-long key to 128 chars and the INSERT succeeds, so there is no mid-batch
+// error left to roll back and the test would report a rollback failure that is
+// really a DB-config difference. MySQL 8 is strict by default and CI runs the
+// default, so this skips only on a deliberately loosened local server — and says
+// what coverage that costs rather than passing quietly.
 func TestWriteBotSettingOverrides_RollsBackOnMidBatchFailure(t *testing.T) {
 	_, ctx := setupBotSettings(t)
+
+	var sqlMode string
+	assert.NoError(t, ctx.DB().SelectBySql("SELECT @@SESSION.sql_mode").LoadOne(&sqlMode))
+	if !strings.Contains(sqlMode, "STRICT_TRANS_TABLES") && !strings.Contains(sqlMode, "STRICT_ALL_TABLES") {
+		t.Skipf("rollback coverage skipped: sql_mode=%q is not strict, so an over-long "+
+			"key_name truncates instead of erroring and cannot provoke a mid-batch failure", sqlMode)
+	}
 
 	overlong := strings.Repeat("k", 200) // key_name is VARCHAR(128)
 	err := writeBotSettingOverrides(ctx, settingsRobotID, testutil.UID, []botSettingWritePlan{

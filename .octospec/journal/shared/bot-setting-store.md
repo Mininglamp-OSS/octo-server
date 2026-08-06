@@ -177,29 +177,72 @@ sibling consumer that was not updated when a new gate was introduced.**
    documents 404/403 — a contradiction with its own stated semantics, not a
    hardening preference.
 
+7. **Two predicates for one question is a gap by construction.** The legacy
+   ingress decides "is this a card?" with `maputil.Data.Int("type")`, which
+   coerces strings; `cardmsg.IsCardPayload` — the predicate `Validate` itself
+   short-circuits on — deliberately does not. Nothing was wrong with either
+   function; the defect lived in the gap between them, and it swallowed the URL
+   allowlist, the node/depth caps, profile negotiation, `Finalize` **and** these
+   new switches for any `{"type":"17"}` payload. Same family as lessons 1 and 2
+   (a sibling path, then a sibling consumer) with the radius shrunk to a single
+   function: **when a branch's guard and its body disagree about what reached
+   them, the body wins and the guard is decoration.** Closed by routing on the
+   validator's own predicate, so reachability and enforcement cannot drift.
+
+## Closed after round 3
+
+Three review follow-ups were fixed in this branch rather than deferred, because
+each one's failure direction is "a control silently does not apply":
+
+- **`payloadIsVail` no longer routes on a coerced `type`.** The card branch now
+  guards on `cardmsg.IsCardPayload` — the same predicate `Validate` short-circuits
+  on — so a string `"17"` is refused instead of entering the card branch and
+  skipping every check (see lesson 7 above). This ingress was the **only** one in
+  the repo dispatching on `maputil.Data.Int`; `bot_api`, `message` and `notify`
+  already called `IsCardPayload` directly. The regression test asserts both halves
+  of the gap still exist (`Int` coerces, `IsCardPayload` does not) so it deletes
+  itself honestly if either upstream ever changes, and it uses a `javascript:` URL
+  so a pass means the allowlist ran, not merely that the type was rejected.
+- **`SettingBoolOK` lexes tolerantly** (trim + case-fold). Its callers layer a
+  code default on top, and for all three card switches that default is `true` —
+  so `False` being read as "unconfigured" left on exactly the capability the
+  operator was trying to disable, silently. The *vocabulary* deliberately stays
+  identical to `parseSettingBool`'s; only the lexing relaxed, so one column cannot
+  come to mean different things to two readers of the same table. Pinned by a test
+  that asserts on/off/yes/no are rejected by **both** readers.
+- **A malformed stored override now warns** instead of falling back mutely, once
+  per `(robot, key)`. The dedupe is not polish: resolution runs on every card send
+  and every profile read, and a dirty row is persistent state, so an un-deduped
+  warning is a log flood — which is the same outcome as no log at all.
+
 ## Known gaps at merge
 
-- **`payloadIsVail` routes on a coerced `type`.** `maputil.Data.Int` runs
-  `strconv.Atoi` on strings while `cardmsg.IsCardPayload` deliberately rejects a
-  string `"17"`, and `Validate` no-ops when `IsCardPayload` is false. A
-  `{"type":"17"}` payload therefore enters the card branch on the legacy ingress
-  and skips the URL allowlist, the node/depth caps, profile negotiation,
-  `Finalize`, and these switches. **Pre-existing and outside this change** — the
-  new gate's reachability predicate is `IsCardPayload`, the same predicate the
-  repo's own validator uses, so the gate is exactly as reachable as validation
-  is. Severity depends on whether any client renders a string-typed `type`;
-  tracked separately rather than grown into this task.
-- `SettingBoolOK` matches bool literals exactly, so an operator writing `False`
-  or `off` into a `botcard` global default falls through to the code default —
-  which for all three switches is `true`, i.e. the capability the operator meant
-  to disable stays on. Consistent with every other `system_setting` bool, but the
-  failure direction is worse here; a trimmed, case-insensitive parse is the fix.
-- A malformed stored per-bot override falls through silently with no log line.
+- `SettingBoolOK` remains a **best-effort** tier, as its doc comment says: a
+  replica whose startup `Load()` blipped has an empty snapshot, which is
+  indistinguishable from "not configured", so it reports `configured=false` for up
+  to one reload TTL. Tolerant lexing does not touch this; an operator who needs a
+  capability genuinely off should set it at the tier that enforces.
+- `AdvertisedRef` iterates the capability list twice where once would do
+  (round-3 P2-4). Cosmetic, left alone — the second loop is what makes an
+  ambiguous id fail closed, and rewriting it to save a pass is not worth
+  re-opening a reviewed fail-closed path.
+- `TestListGroups_CarriesGroupAllowNoMention` (`mention_pref_test.go`, unrelated
+  to this task) panics in the local sandbox because the endpoint returns an empty
+  list. It reproduces identically on the pre-change HEAD and is green in CI, so it
+  is an environment difference, not a regression from this branch — recorded so
+  the next person running these packages locally does not chase it.
 
 ## Verification
 
-All 18 CI checks green at the merge head, including the DB-backed `Test` job.
-Locally: `go build ./...`, `go vet`, `make i18n-extract-check`, `make i18n-lint`,
-both modules' `NoLegacyResponseError` source guards, and `-race -shuffle=on` on
-`modules/robot` and `modules/bot_api` against MySQL 8 + Redis + WuKongIM
-v2.2.4, run per-package with the CI drop/create + FLUSHALL discipline.
+All 18 CI checks green at the review head, including the DB-backed `Test` job.
+Locally: `go build ./...`, `go vet ./...`, `make i18n-extract-check`,
+`make i18n-lint`, both modules' `NoLegacyResponseError` source guards, and
+`-race -shuffle=on` on `modules/common`, `modules/robot` and `modules/bot_api`
+against MySQL 8 + Redis + WuKongIM v2.2.4, run per-package with the CI
+drop/create + FLUSHALL discipline.
+
+Each round-3 fix was verified by **reverting only that fix and confirming its
+test fails** — the discipline round 1 taught the hard way, when an atomicity test
+turned out to pass against the code it was written to catch. `SettingBoolOK`'s
+test fails on `"\tfalse\n"`; the ingress test fails with the `javascript:` card
+accepted.

@@ -129,7 +129,8 @@ type IService interface {
 // 与 *Robot 共享底层表结构，但不承担消息/事件监听等副作用，
 // 因此可以被重复 New 出来而不会导致重复注册 listener。
 type Service struct {
-	ctx          *config.Context
+	ctx *config.Context
+	log.Log
 	db           *robotDB
 	creatorCache sync.Map // robotID -> creatorUID
 	// systemSettings mirrors the Robot field: resolved once at construction so
@@ -141,6 +142,7 @@ type Service struct {
 func NewService(ctx *config.Context) IService {
 	return &Service{
 		ctx:            ctx,
+		Log:            log.NewTLog("RobotService"),
 		db:             newBotDB(ctx),
 		systemSettings: commonmodule.EnsureSystemSettings(ctx),
 	}
@@ -921,6 +923,21 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 		// 的 send gate 对称（rollout flag + write-strict Validate）。本 ingress
 		// 的错误形状是单一 content-invalid 400（防枚举）——flag 关闭 / 白名单 /
 		// 大小 / URL 失败的具体原因只进日志。
+		//
+		// 路由谓词与校验谓词必须是同一个（round-3 评审 P2-1）。本 ingress 是全仓
+		// **唯一**用 maputil.Data.Int("type") 分发的入口（bot_api / message / notify
+		// 都直接调 IsCardPayload），而 Int 会对字符串跑 strconv.Atoi，IsCardPayload
+		// 则只认 float64/int/json.Number、**故意**拒掉字符串 "17"。两者不一致时，
+		// {"type":"17"} 会：进本分支 → Validate 因 IsCardPayload=false 直接 return nil
+		// （pkg/cardmsg/validate.go）→ rejectRobotCardBySetting 同样判 false 而跳过全部
+		// per-Bot 开关 → Finalize no-op。于是一棵没过 URL 白名单、节点/深度上限、
+		// profile 协商与能力开关的卡片树被派发出去，只要有客户端对 type 做宽松转换
+		// 就能渲染。在这里收口成 IsCardPayload：卡片分支的可达性从此与校验、与门禁
+		// 完全同源，不再存在「路由认为是卡片、校验认为不是」的夹缝。
+		if !cardmsg.IsCardPayload(payloadResult) {
+			rb.Warn("payload.type 非 JSON 数字，不认作卡片（拒绝而非降级放行）")
+			return false
+		}
 		if !cardmsg.BotEnabled() {
 			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
 			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED；robot 是 bot 生产者之一，

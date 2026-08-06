@@ -23,6 +23,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -301,12 +302,34 @@ func queryBotSettingOverrides(ctx *config.Context, robotID string) (map[string]s
 	return out, nil
 }
 
+// malformedBotSettingSeen 去重「脏覆盖值」告警：脏值是持久状态（人工改库 / 迁移
+// 出错），而解析发生在每次发卡与每次 profile 读上，不去重就是每请求一条 Warn。
+// 只有真正脏的 (robot, key) 才会入表，条目数被损坏行数界定，修好数据后重启即清。
+var malformedBotSettingSeen sync.Map
+
+// warnMalformedBotSetting 每个 (robot, key) 只喊一次。
+func warnMalformedBotSetting(warn func(string, ...zap.Field), robotID, key, raw string) {
+	if warn == nil {
+		return
+	}
+	if _, dup := malformedBotSettingSeen.LoadOrStore(robotID+"\x00"+key, struct{}{}); dup {
+		return
+	}
+	warn("bot_setting 覆盖值非法，已忽略并回落上一层（该 Bot 的这项配置未按你设置的生效）",
+		zap.String("robot_id", robotID), zap.String("key", key), zap.String("value", raw))
+}
+
 // resolveBotSettings 解析该 Bot 的全部已注册键。DB 故障向上抛——配置读不到时
 // **不能**假装成「用默认值」：那会让一次 DB 抖动静默放开本该关闭的能力。
+//
+// warn 收「脏值回落」的告警。它是参数而不是包级 logger，因为两个调用方
+// （*Service 供 bot_api、*Robot 供 legacy ingress）各自有 tag 化的 log.Log，
+// 日志里能看出是哪条路读到的脏值；测试传 nil 即静默。
 func resolveBotSettings(
 	ctx *config.Context,
 	settings *commonmodule.SystemSettings,
 	robotID string,
+	warn func(string, ...zap.Field),
 ) ([]botSettingResolution, error) {
 	overrides, err := queryBotSettingOverrides(ctx, robotID)
 	if err != nil {
@@ -318,6 +341,11 @@ func resolveBotSettings(
 		if raw, ok := overrides[def.Key]; ok && def.Editable {
 			if v, valid := parseBotSettingBool(raw); valid {
 				override = &v
+			} else {
+				// 脏值当作「未配置」回落，而不是当 false 生效——但必须留痕：
+				// 静默回落时 owner 只会看到「跟随默认」，而他明明写过一个值
+				// （round-3 评审 P2-6）。
+				warnMalformedBotSetting(warn, robotID, def.Key, raw)
 			}
 		}
 		var globalValue, globalOK bool
@@ -350,7 +378,7 @@ func botCardConfigFrom(resolutions []botSettingResolution) BotCardConfig {
 // BotCardConfig — IService — 返回该 Bot 的卡片能力有效配置（已 AND 总闸）。
 // bot_api 的 profile 下发与 sendMessage 门禁共用它。
 func (s *Service) BotCardConfig(robotID string) (BotCardConfig, error) {
-	resolutions, err := resolveBotSettings(s.ctx, s.systemSettings, robotID)
+	resolutions, err := resolveBotSettings(s.ctx, s.systemSettings, robotID, s.Warn)
 	if err != nil {
 		return BotCardConfig{}, err
 	}
@@ -359,7 +387,7 @@ func (s *Service) BotCardConfig(robotID string) (BotCardConfig, error) {
 
 // BotCardConfig — IService — *Robot 变体，与 Service 走同一份解析。
 func (rb *Robot) BotCardConfig(robotID string) (BotCardConfig, error) {
-	resolutions, err := resolveBotSettings(rb.ctx, rb.systemSettings, robotID)
+	resolutions, err := resolveBotSettings(rb.ctx, rb.systemSettings, robotID, rb.Warn)
 	if err != nil {
 		return BotCardConfig{}, err
 	}
@@ -379,7 +407,7 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 		return
 	}
 
-	resolutions, err := resolveBotSettings(rb.ctx, rb.systemSettings, robotID)
+	resolutions, err := resolveBotSettings(rb.ctx, rb.systemSettings, robotID, rb.Warn)
 	if err != nil {
 		rb.Error("查询 bot_setting 失败", zap.Error(err), zap.String("robot_id", robotID))
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)

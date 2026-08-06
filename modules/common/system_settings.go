@@ -217,6 +217,20 @@ func (s *SystemSettings) getBool(category, key string, fallback bool) bool {
 // rather than inheriting a silent false — same fail-forward posture getBool
 // takes with its fallback.
 //
+// The literal is trimmed and matched case-insensitively, which getBool's
+// parseSettingBool is not (round-3 evaluation P2-3). The reason is the fallback
+// direction, not taste: this tier's callers layer their own code default on top,
+// and for every key that uses it today (the bot card switches) that default is
+// `true`. So an operator typing `False`, `FALSE ` or `\tfalse` into a
+// system_setting row does not get "no opinion, keep the code default" in some
+// harmless sense — they get **the capability they meant to disable left on**,
+// with no error anywhere. Tolerant lexing removes the class.
+//
+// Deliberately the same *vocabulary* as parseSettingBool (1/0/true/false), only
+// lexed more forgivingly. Accepting on/off/yes/no here would make one column
+// mean different things to two readers of the same table — the divergence
+// pattern this module is meant to avoid, not a convenience.
+//
 // **This tier is best-effort, not enforcement.** EnsureSystemSettings tolerates
 // a failed startup Load() and leaves an empty snapshot for the auto-reload to
 // repair, and an empty snapshot is indistinguishable here from "key not
@@ -231,10 +245,10 @@ func (s *SystemSettings) SettingBoolOK(category, key string) (value bool, config
 	if !ok {
 		return false, false
 	}
-	switch v {
-	case "1", "true", "TRUE":
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
 		return true, true
-	case "0", "false", "FALSE":
+	case "0", "false":
 		return false, true
 	default:
 		return false, false

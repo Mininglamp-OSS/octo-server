@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"go.uber.org/zap"
 )
 
 func boolPtr(v bool) *bool { return &v }
@@ -239,4 +240,40 @@ func TestBuildBotSettingChangedEventData(t *testing.T) {
 			t.Errorf("event data carries %q; it must be a signal to re-fetch, not a value channel", key)
 		}
 	}
+}
+
+// TestWarnMalformedBotSetting_FiresOncePerRobotKey —— 脏值告警必须留痕，且只留一次。
+//
+// 两个要求互相拉扯，都得满足：脏值是**持久**状态（人工改库 / 迁移出错），而解析发生
+// 在每次发卡与每次 profile 读上；不去重就是拿一条运维告警把日志管道淹掉，最后没人看
+// 得见——和不打日志是同一个结果。所以按 (robot, key) 去重，而不是按调用去重。
+func TestWarnMalformedBotSetting_FiresOncePerRobotKey(t *testing.T) {
+	malformedBotSettingSeen.Delete("bot-warn-1\x00" + BotSettingKeyDisplayEnabled)
+	malformedBotSettingSeen.Delete("bot-warn-1\x00" + BotSettingKeyReasoningEnabled)
+	malformedBotSettingSeen.Delete("bot-warn-2\x00" + BotSettingKeyDisplayEnabled)
+	t.Cleanup(func() {
+		malformedBotSettingSeen.Delete("bot-warn-1\x00" + BotSettingKeyDisplayEnabled)
+		malformedBotSettingSeen.Delete("bot-warn-1\x00" + BotSettingKeyReasoningEnabled)
+		malformedBotSettingSeen.Delete("bot-warn-2\x00" + BotSettingKeyDisplayEnabled)
+	})
+
+	calls := 0
+	warn := func(string, ...zap.Field) { calls++ }
+
+	for i := 0; i < 5; i++ {
+		warnMalformedBotSetting(warn, "bot-warn-1", BotSettingKeyDisplayEnabled, "garbage")
+	}
+	if calls != 1 {
+		t.Fatalf("同一 (robot,key) 的脏值告警喊了 %d 次，应只喊一次", calls)
+	}
+
+	// 另一个键、另一个 Bot 都是独立的坏消息，不该被前一条压掉。
+	warnMalformedBotSetting(warn, "bot-warn-1", BotSettingKeyReasoningEnabled, "garbage")
+	warnMalformedBotSetting(warn, "bot-warn-2", BotSettingKeyDisplayEnabled, "garbage")
+	if calls != 3 {
+		t.Fatalf("calls = %d，不同 (robot,key) 的脏值被误并成一条", calls)
+	}
+
+	// 没有 logger 时静默返回而不是 panic：解析器在测试与后台任务里都可能无 logger。
+	warnMalformedBotSetting(nil, "bot-warn-3", BotSettingKeyDisplayEnabled, "garbage")
 }
