@@ -107,7 +107,7 @@ owner 读与 adapter 读分属两个模块）。
   也不留——配置改动要即时生效）。owner 读接口同口径。两处都有测试钉住。
 - **三个卡片生产者入口都必须二次校验**（round-2 评审后修订）：profile 只是能力清单，
   producer 可以持有陈旧副本或干脆不读，所以每条**已鉴权**的发送路径都要独立按有效
-  配置校验。本仓有三个 ingress，`payloadIsVail` 的注释即写明三者须**对称**：
+  配置校验。本任务口径内有三个 ingress，`payloadIsVail` 的注释即写明三者须**对称**：
   `bot_api` 的 `sendMessage`、`bot_api` 的 raw `message/edit`、以及 legacy
   `POST /v1/robots/:robot_id/:app_key/sendMessage`（`modules/robot`）。它们共用同一个
   Bot 身份（`bot_setting.robot_id` 与 `authRobot` / `assertRobotOwner` 取自同一列），
@@ -116,6 +116,13 @@ owner 读与 adapter 读分属两个模块）。
   具体原因只进日志（防枚举）。
   用户 ingress 与 robot 的 `message/edit` 无需加门：前者无条件拒卡，后者经
   `cardmsg.RejectsCardEdit` 拒绝一切卡片编辑。
+  **「三个」是本任务的口径，不是已证实的全仓完备性**（round-7 评审）：
+  `POST /v1/robots/:robot_id/:app_key/stream/start` 把 `Payload []byte` 原样转给
+  WuKongIM，没有形状校验、没有 `allowSendToChannel`、也没有用已鉴权的 `robot_id`
+  覆盖调用方传入的 `from_uid`。该 handler 与 merge-base 逐字节相同、本任务一行未碰，
+  但它是否算第四个卡片入口取决于「客户端会不会把 stream payload 渲染成卡片」——这个
+  事实本仓答不出。**在它被 triage 之前，本条不得被读作「全仓卡片入口已枚举完毕」。**
+  详见 journal 的 known-gaps。
 - **关闭只拦模板卡的续帧，不拦 raw 卡的改写**（round-1 评审后修订）：`sendMessage`
   全量加门；`botMessageEdit` 的**模板分支**不加门——流式推理卡必须能编辑到终态，
   否则线上残留「永久处理中」的卡。但**raw 分支必须加门**：`cardmsg.Validate` 接受

@@ -274,6 +274,11 @@ func rejectRobotCardBySetting(payload map[string]interface{}) bool {
 // 对称」要求的。未知 profile 一律拒（cardmsg.Validate 已经把 profile 钉在接受集内，
 // 走到这里说明形状校验被绕过）。
 //
+// 「三个入口」是**本任务的口径，不是已证实的全仓完备性**：streamStart（本文件同模块，
+// api.go:482）把 payload 原样转给 WuKongIM，不走任何形状校验与本门。它与 merge-base
+// 逐字节相同、本任务未触碰，但在它被 triage 之前，别把这句读成「枚举已闭合」。
+// 详见 .octospec/journal/shared/bot-setting-store.md 的 known-gaps。
+//
 // 本 ingress 不接受 Registry 模板（template_ref 只在 bot_api 实现），故无需 reasoning
 // 判定；模板 ref 出现在这里会先被 cardmsg.Validate 按未知字段/形状拒掉。
 func robotCardPolicyAllows(payload map[string]interface{}, cfg BotCardConfig) bool {
