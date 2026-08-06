@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -1057,6 +1058,18 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
+		// per-Bot 策略门（task bot-setting-store）。**必须**加在 raw 编辑路径上：
+		// cardmsg.Validate 接受 acceptedProfiles 里的任意 profile，且不校验编辑帧与
+		// 原消息的档位是否一致，所以缺了这道门就有一条提权通道 —— 先用 octo/v1 发一张
+		// 展示卡（display 开着即放行），再把 content_edit 换成带 Action.Submit 的
+		// octo/v2 帧；该帧正是动作端点信任的生效帧，于是 interaction_enabled=false 的
+		// Bot 也能产出可点击的交互卡。这与上方 BotEnabled() 出现在本路径的理由同源。
+		//
+		// 只作用于 raw 分支。模板分支（下方 botMessageEditRegistry）刻意不加门 ——
+		// 流式推理卡必须能编辑到终态，否则线上残留「永久处理中」的卡。
+		if ba.rejectRawCardEditByPolicy(c, normalized) {
+			return
+		}
 		req.ContentEdit = normalized
 		cardSeq, hasCardSeq = cardmsg.CardSeqFromContentEdit(normalized)
 	} else {
@@ -1384,12 +1397,18 @@ func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]in
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}
-		if ref.ID != aireasoningprocess.TemplateID {
-			// 当前部署只广告推理卡一张模板。出现别的 id 说明调用方在猜 ref，
-			// 交给下游 requireRef 用同一个泛化码拒。
-			return false
+		allowed, mapped := botTemplateSwitchFor(ref.ID, config)
+		if !mapped {
+			// 未映射到任何开关的模板 id：**fail closed**。今天只广告推理卡一张，
+			// 但若日后往 AdvertisedSend 里加了模板却忘了给它配开关，放行会让它
+			// 完全绕过 per-Bot 策略。未广告的 id 走到这里同样被拒，与下游
+			// requireRef 的结论一致（同一个泛化码）。
+			ba.Warn("模板 id 未映射到 per-Bot 开关，fail-closed 拒绝",
+				zap.String("robot", robotID), zap.String("template", string(ref.ID)))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
 		}
-		if !config.ReasoningEnabled {
+		if !allowed {
 			ba.Warn("Bot 推理卡已关闭，拒绝模板发送", zap.String("robot", robotID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
@@ -1404,19 +1423,91 @@ func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]in
 		return false
 	}
 
-	// raw 卡：按已校验的 profile 分档。octo/v1 = 展示，octo/v2 = 交互。
-	// 这两个开关只作用于 Bot 自拼的 raw 卡，绝不用来切模板卡的 wire profile。
+	// raw 卡：按已校验的 profile 分档。这两个开关只作用于 Bot 自拼的 raw 卡，
+	// 绝不用来切模板卡的 wire profile。
 	profile, _ := payload["profile"].(string)
+	return ba.rejectRawCardByProfile(c, robotID, profile, config)
+}
+
+// botTemplateSwitchFor maps an advertised template to the per-Bot switch that
+// governs it. The second return is false for any template with no mapping, and
+// callers must fail closed on that.
+//
+// Deliberately a lookup rather than an `if id == reasoning` check: the send gate
+// would otherwise let a newly advertised template through untouched, and that
+// regression would be silent. TestBotTemplateSwitchCoversAdvertisedSet asserts
+// this map covers everything defaultBotTemplatePolicy advertises, so adding a
+// template without a switch fails the build's tests instead of production.
+func botTemplateSwitchFor(id cardtmpl.ID, config robot.BotCardConfig) (allowed, mapped bool) {
+	switch id {
+	case aireasoningprocess.TemplateID:
+		return config.ReasoningEnabled, true
+	default:
+		return false, false
+	}
+}
+
+// rejectRawCardEditByPolicy applies the raw-card switches to an already
+// normalized edit frame. Returns true when it has written a response.
+//
+// The edit frame's own profile is what matters, not the original message's:
+// cardmsg.Validate accepts any profile in the accepted set and does not compare
+// the two, so an edit is free to escalate octo/v1 → octo/v2. Checking the frame
+// being written closes that without needing to load the original.
+func (ba *BotAPI) rejectRawCardEditByPolicy(c *wkhttp.Context, normalizedEdit string) bool {
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		ba.respondBotAPIIdentityMissing(c)
+		return true
+	}
+	config, err := ba.resolveBotCardConfig(robotID)
+	if err != nil {
+		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return true
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(normalizedEdit), &payload); err != nil {
+		// Unreachable in practice: NormalizeContentEdit already produced this
+		// JSON. Fail closed rather than silently skipping the gate.
+		ba.Warn("解析已归一化的卡片编辑帧失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return true
+	}
+	profile, _ := payload["profile"].(string)
+	return ba.rejectRawCardByProfile(c, robotID, profile, config)
+}
+
+// rejectRawCardByProfile applies the display/interaction switches to one raw
+// frame's declared profile. Shared by the send and edit paths so a frame cannot
+// be refused on creation and then accepted as an edit.
+//
+// **display is a floor, not a peer of interaction.** octo/v2 is a strict
+// superset of octo/v1 — in cardmsg.validateCard the `interactive` flag only ever
+// relaxes checks, never requires an interactive element — so every card legal as
+// octo/v1 is also legal as octo/v2. Were the two switches treated as parallel
+// arms, a bot could defeat display_enabled=false by changing one string
+// (`"profile":"octo/v2"`) and sending byte-identical display-only cards. So an
+// octo/v2 frame needs BOTH switches: it is a display card that additionally
+// carries interaction.
+func (ba *BotAPI) rejectRawCardByProfile(
+	c *wkhttp.Context,
+	robotID, profile string,
+	config robot.BotCardConfig,
+) bool {
 	switch profile {
 	case cardmsg.ProfileV1:
 		if !config.DisplayEnabled {
-			ba.Warn("Bot 展示卡已关闭，拒绝 raw 发送", zap.String("robot", robotID))
+			ba.Warn("Bot 展示卡已关闭，拒绝 raw 卡", zap.String("robot", robotID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}
 	case cardmsg.ProfileV2:
-		if !config.InteractionEnabled {
-			ba.Warn("Bot 交互卡已关闭，拒绝 raw 发送", zap.String("robot", robotID))
+		if !config.DisplayEnabled || !config.InteractionEnabled {
+			ba.Warn("Bot 展示卡或交互卡已关闭，拒绝 raw 交互卡",
+				zap.String("robot", robotID),
+				zap.Bool("display", config.DisplayEnabled),
+				zap.Bool("interaction", config.InteractionEnabled))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}

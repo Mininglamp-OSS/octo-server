@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -391,4 +393,158 @@ func errorMessageOf(t *testing.T, body []byte) string {
 		return envelope.Error.Message
 	}
 	return envelope.Msg
+}
+
+// TestRejectRawCardByProfile_DisplayIsAFloorNotAPeer is the regression for the
+// bypass review round 1 found: octo/v2 is a strict superset of octo/v1 (the
+// `interactive` flag in cardmsg.validateCard only ever relaxes checks, never
+// requires an interactive element), so if the two switches were parallel arms a
+// bot could defeat display_enabled=false by flipping one string and sending
+// byte-identical display-only cards.
+func TestRejectRawCardByProfile_DisplayIsAFloorNotAPeer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name       string
+		profile    string
+		config     robot.BotCardConfig
+		wantReject bool
+	}{
+		{
+			name: "display off rejects octo/v1", profile: cardmsg.ProfileV1,
+			config:     robot.BotCardConfig{CardEnabled: true, InteractionEnabled: true},
+			wantReject: true,
+		},
+		{
+			name: "display off ALSO rejects octo/v2 — the bypass", profile: cardmsg.ProfileV2,
+			config:     robot.BotCardConfig{CardEnabled: true, InteractionEnabled: true},
+			wantReject: true,
+		},
+		{
+			name: "interaction off rejects octo/v2", profile: cardmsg.ProfileV2,
+			config:     robot.BotCardConfig{CardEnabled: true, DisplayEnabled: true},
+			wantReject: true,
+		},
+		{
+			name: "interaction off leaves octo/v1 alone", profile: cardmsg.ProfileV1,
+			config:     robot.BotCardConfig{CardEnabled: true, DisplayEnabled: true},
+			wantReject: false,
+		},
+		{
+			name: "both on accepts octo/v2", profile: cardmsg.ProfileV2,
+			config: robot.BotCardConfig{
+				CardEnabled: true, DisplayEnabled: true, InteractionEnabled: true,
+			},
+			wantReject: false,
+		},
+		{
+			name: "an unknown profile fails closed", profile: "octo/v9",
+			config: robot.BotCardConfig{
+				CardEnabled: true, DisplayEnabled: true, InteractionEnabled: true,
+			},
+			wantReject: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ba := &BotAPI{Log: log.NewTLog("BotAPI-raw-profile-floor")}
+			recorder := httptest.NewRecorder()
+			ginContext, _ := gin.CreateTestContext(recorder)
+			ginContext.Request = httptest.NewRequest(http.MethodPost, "/x", nil)
+			ctx := &wkhttp.Context{Context: ginContext}
+
+			got := ba.rejectRawCardByProfile(ctx, "bot-1", tc.profile, tc.config)
+			if got != tc.wantReject {
+				t.Fatalf("reject=%v, want %v", got, tc.wantReject)
+			}
+		})
+	}
+}
+
+// TestBotTemplateSwitchCoversAdvertisedSet keeps the template gate honest: every
+// template this deployment advertises for new sends must map to a per-Bot
+// switch. Without this, adding a second template to AdvertisedSend would let it
+// slip past the per-Bot policy entirely, and nothing would say so.
+func TestBotTemplateSwitchCoversAdvertisedSet(t *testing.T) {
+	allOn := robot.BotCardConfig{
+		CardEnabled: true, DisplayEnabled: true,
+		InteractionEnabled: true, ReasoningEnabled: true,
+	}
+	for _, ref := range defaultBotTemplatePolicy().AdvertisedSend {
+		if _, mapped := botTemplateSwitchFor(ref.ID, allOn); !mapped {
+			t.Errorf("advertised template %s has no per-Bot switch; the send gate would not govern it", ref.ID)
+		}
+	}
+	// And an unmapped id must report "no mapping" so the caller fails closed.
+	if _, mapped := botTemplateSwitchFor("some.future-template", allOn); mapped {
+		t.Error("an unmapped template reported a mapping")
+	}
+}
+
+// TestBotMessageEdit_RawCardCannotEscalateProfile is the regression for the
+// privilege-escalation path review round 1 found.
+//
+// cardmsg.Validate accepts any profile in the accepted set and never compares
+// the edit frame against the original message, so before the gate was added to
+// the raw edit path a bot with interaction_enabled=false could: send an octo/v1
+// display card (allowed), then edit content_edit into an octo/v2 frame carrying
+// Action.Submit. That normalized frame is the one the action endpoint treats as
+// authoritative, so the result was a live, clickable card from a bot whose owner
+// had switched interaction off — and any card sent before the flip was a
+// permanent foothold.
+func TestBotMessageEdit_RawCardCannotEscalateProfile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(cardmsg.EnvEnabled, "true")
+
+	interactionOff := robot.BotCardConfig{
+		CardEnabled: true, DisplayEnabled: true, InteractionEnabled: false,
+	}
+	escalatingEdit := map[string]any{
+		"type": cardmsg.InteractiveCard.Int(), "profile": cardmsg.ProfileV2,
+		"card_version": cardmsg.CardVersion,
+		"card": map[string]any{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []any{map[string]any{"type": "TextBlock", "text": "escalated"}},
+			"actions": []any{map[string]any{
+				"type": "Action.Submit", "id": "escalate", "title": "click me",
+			}},
+		},
+	}
+	raw, err := json.Marshal(escalatingEdit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ba := &BotAPI{
+		Log:        log.NewTLog("BotAPI-edit-escalation"),
+		cardConfig: stubCardConfig{config: interactionOff},
+	}
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/x", nil)
+	ctx := &wkhttp.Context{Context: ginContext}
+	ctx.Set(CtxKeyRobotID, "bot-escalation")
+
+	if !ba.rejectRawCardEditByPolicy(ctx, string(raw)) {
+		t.Fatal("an octo/v2 edit frame was accepted while interaction is off")
+	}
+	if msg := errorMessageOf(t, recorder.Body.Bytes()); msg != errcode.ErrBotAPICardInvalid.DefaultMessage {
+		t.Fatalf("msg=%q, want the generic card_invalid", msg)
+	}
+
+	// The same frame is fine once interaction is on — the gate is about policy,
+	// not about rejecting v2 edits wholesale.
+	allowed := &BotAPI{
+		Log:        log.NewTLog("BotAPI-edit-escalation-allowed"),
+		cardConfig: allCardCapabilitiesOn(),
+	}
+	okRecorder := httptest.NewRecorder()
+	okGin, _ := gin.CreateTestContext(okRecorder)
+	okGin.Request = httptest.NewRequest(http.MethodPost, "/x", nil)
+	okCtx := &wkhttp.Context{Context: okGin}
+	okCtx.Set(CtxKeyRobotID, "bot-escalation")
+	if allowed.rejectRawCardEditByPolicy(okCtx, string(raw)) {
+		t.Fatalf("edit refused with every switch on; body=%s", okRecorder.Body.String())
+	}
 }

@@ -97,7 +97,7 @@ func getSettings(t *testing.T, handler http.Handler, robotID string) *httptest.R
 	return w
 }
 
-func putSettings(t *testing.T, handler http.Handler, robotID string, items ...map[string]string) *httptest.ResponseRecorder {
+func putSettings(t *testing.T, handler http.Handler, robotID string, items ...map[string]any) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(map[string]interface{}{"items": items})
 	assert.NoError(t, err)
@@ -179,7 +179,7 @@ func TestBotSettings_OverrideThenDeleteFallsBack(t *testing.T) {
 	handler, _ := setupBotSettings(t)
 
 	w := putSettings(t, handler, settingsRobotID,
-		map[string]string{"key": BotSettingKeyReasoningEnabled, "value": "false"})
+		map[string]any{"key": BotSettingKeyReasoningEnabled, "value": "false"})
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 
 	var resp settingsListResp
@@ -230,7 +230,7 @@ func TestBotSettings_GlobalDefaultLayer(t *testing.T) {
 
 	// A per-bot override outranks the global default even when it disagrees.
 	w := putSettings(t, handler, settingsRobotID,
-		map[string]string{"key": BotSettingKeyReasoningEnabled, "value": "true"})
+		map[string]any{"key": BotSettingKeyReasoningEnabled, "value": "true"})
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 
 	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
@@ -247,12 +247,14 @@ func TestBotSettings_WriteRejections(t *testing.T) {
 
 	cases := []struct {
 		name string
-		item map[string]string
+		item map[string]any
 	}{
-		{"unregistered key", map[string]string{"key": "bot.not_a_real_key", "value": "true"}},
-		{"derived key is read-only", map[string]string{"key": BotSettingKeyCardEnabled, "value": "true"}},
-		{"illegal bool literal", map[string]string{"key": BotSettingKeyDisplayEnabled, "value": "maybe"}},
-		{"empty value", map[string]string{"key": BotSettingKeyDisplayEnabled, "value": ""}},
+		{"unregistered key", map[string]any{"key": "bot.not_a_real_key", "value": "true"}},
+		{"derived key is read-only", map[string]any{"key": BotSettingKeyCardEnabled, "value": "true"}},
+		{"illegal bool literal", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": "maybe"}},
+		{"empty value", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": ""}},
+		{"null value", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": nil}},
+		{"non-bool JSON", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,8 +265,8 @@ func TestBotSettings_WriteRejections(t *testing.T) {
 
 	// A batch containing one bad item must not half-apply the good ones.
 	w := putSettings(t, handler, settingsRobotID,
-		map[string]string{"key": BotSettingKeyDisplayEnabled, "value": "false"},
-		map[string]string{"key": "bot.not_a_real_key", "value": "true"})
+		map[string]any{"key": BotSettingKeyDisplayEnabled, "value": "false"},
+		map[string]any{"key": "bot.not_a_real_key", "value": "true"})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 
 	var resp settingsListResp
@@ -285,7 +287,7 @@ func TestBotSettings_OwnershipGuard(t *testing.T) {
 	})
 	t.Run("write someone else's bot is forbidden", func(t *testing.T) {
 		w := putSettings(t, handler, settingsOtherRobotID,
-			map[string]string{"key": BotSettingKeyReasoningEnabled, "value": "false"})
+			map[string]any{"key": BotSettingKeyReasoningEnabled, "value": "false"})
 		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
 	})
 	t.Run("delete on someone else's bot is forbidden", func(t *testing.T) {
@@ -296,4 +298,71 @@ func TestBotSettings_OwnershipGuard(t *testing.T) {
 		w := getSettings(t, handler, "bot_does_not_exist")
 		assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
 	})
+}
+
+// TestBotSettings_CatalogValueRoundTrips pins that what the read endpoint emits
+// can be written straight back.
+//
+// The catalog serves `value` as a JSON bool, and the obvious client flow is
+// "read the catalog, flip one entry, PUT the item back". If the write side only
+// accepted strings that round trip would 400 at BindJSON and every caller would
+// have to know to stringify — so the write side accepts both shapes.
+func TestBotSettings_CatalogValueRoundTrips(t *testing.T) {
+	handler, _ := setupBotSettings(t)
+
+	// Write with a real JSON bool, exactly as the read endpoint emits it.
+	w := putSettings(t, handler, settingsRobotID,
+		map[string]any{"key": BotSettingKeyDisplayEnabled, "value": false})
+	assert.Equal(t, http.StatusOK, w.Code, "a JSON bool must be accepted; body=%s", w.Body.String())
+
+	var resp settingsListResp
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+	item := findSetting(t, resp, BotSettingKeyDisplayEnabled)
+	assert.NotNil(t, item.Value)
+	assert.False(t, *item.Value)
+	assert.Equal(t, botSettingSourceBot, item.Source)
+
+	// Feed the echoed value straight back — the round trip a UI performs.
+	w = putSettings(t, handler, settingsRobotID,
+		map[string]any{"key": item.Key, "value": *item.Value})
+	assert.Equal(t, http.StatusOK, w.Code, "echoed value must round trip; body=%s", w.Body.String())
+}
+
+// TestBotSettings_BatchWriteIsAtomic pins the all-or-nothing contract the
+// handler claims. A batch that fails partway must leave nothing behind:
+// otherwise the caller sees a 500 and believes nothing applied, while some
+// switches silently did — and the invalidation event never fires, so adapters
+// keep serving the stale profile.
+//
+// Driven through the validation failure (the only failure reachable without
+// breaking the DB): the invalid item is last, so any non-atomic implementation
+// would already have committed the first one.
+func TestBotSettings_BatchWriteIsAtomic(t *testing.T) {
+	handler, _ := setupBotSettings(t)
+
+	w := putSettings(t, handler, settingsRobotID,
+		map[string]any{"key": BotSettingKeyDisplayEnabled, "value": false},
+		map[string]any{"key": BotSettingKeyInteractionEnabled, "value": false},
+		map[string]any{"key": BotSettingKeyReasoningEnabled, "value": "not-a-bool"})
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp settingsListResp
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+	for _, key := range []string{BotSettingKeyDisplayEnabled, BotSettingKeyInteractionEnabled} {
+		assert.Nil(t, findSetting(t, resp, key).Value,
+			"%s was written despite the batch failing", key)
+	}
+
+	// The same batch with every item valid applies completely.
+	w = putSettings(t, handler, settingsRobotID,
+		map[string]any{"key": BotSettingKeyDisplayEnabled, "value": false},
+		map[string]any{"key": BotSettingKeyInteractionEnabled, "value": false})
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+	for _, key := range []string{BotSettingKeyDisplayEnabled, BotSettingKeyInteractionEnabled} {
+		item := findSetting(t, resp, key)
+		assert.NotNil(t, item.Value, "%s must be written when the whole batch is valid", key)
+		assert.False(t, *item.Value)
+	}
 }

@@ -19,6 +19,7 @@ package robot
 // 能正确渲染的前提，也是读接口必须同时返回 value / effective_value / source 的原因。
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -137,6 +138,32 @@ func normalizeBotSettingBool(raw string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// normalizeBotSettingValue 归一化一个入站 JSON value。
+//
+// 同时接受 JSON bool（`true`）与字符串字面量（`"true"` / `"1"`），使读接口下发的
+// 形状可以原样写回：读侧给的是 bool，若写侧只认字符串，「读目录→改一项→PUT 回去」
+// 这条最自然的客户端路径会直接 400。空值 / null / 其它类型一律拒绝。
+func normalizeBotSettingValue(raw json.RawMessage) (string, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", false
+	}
+	// JSON bool：读接口的下发形状。
+	var asBool bool
+	if err := json.Unmarshal(raw, &asBool); err == nil {
+		if asBool {
+			return botSettingTrue, true
+		}
+		return botSettingFalse, true
+	}
+	// 字符串字面量："1"/"0"/"true"/"false"，兼容既有调用方。
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return normalizeBotSettingBool(asString)
+	}
+	return "", false
 }
 
 // parseBotSettingBool 解析库里的 bool 值。非法值（人工改库等）视为未配置，
@@ -325,10 +352,15 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 
 // botSettingUpdateReq 是批量写入体。批量而非单键，是为了让「同时关展示卡和交互卡」
 // 这类操作只产生一次事件推送。
+//
+// Value 是 json.RawMessage 而非 string：读接口把 value 下发成 JSON bool
+// （`true` / `false` / `null`），而 owner UI 的自然写法就是「读目录 → 改一项 → 写回」。
+// 若写侧只收字符串，那条往返会在 BindJSON 就 400，每个客户端都得先自己 stringify。
+// 收原始 JSON 后由 normalizeBotSettingValue 同时接受 bool 与字符串字面量。
 type botSettingUpdateReq struct {
 	Items []struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+		Key   string          `json:"key"`
+		Value json.RawMessage `json:"value"`
 	} `json:"items"`
 }
 
@@ -372,7 +404,7 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		}
 		seen[item.Key] = struct{}{}
 
-		normalized, ok := normalizeBotSettingBool(item.Value)
+		normalized, ok := normalizeBotSettingValue(item.Value)
 		if !ok {
 			respondRobotRequestInvalid(c, "value")
 			return
@@ -386,16 +418,27 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		return
 	}
 
+	// 单事务提交整批。逐条自动提交会让「校验全过、第 2 条写失败」留下半应用状态：
+	// 调用方收到 500 以为什么都没生效，实际前面几项已经落库；更糟的是错误路径会跳过
+	// notifyBotSettingChanged，adapter 继续用旧缓存直到自己的 TTL 到期——正是该事件
+	// 要消灭的那个窗口。事务失败即整批回滚，"绝不半应用"才真正成立。
+	tx, err := rb.ctx.DB().Begin()
+	if err != nil {
+		rb.Error("开启 bot_setting 事务失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
 	for _, p := range plans {
 		// dbr 的 InsertStmt 不暴露 Suffix，用 InsertBySql + ON DUPLICATE KEY UPDATE
 		// 完成 upsert（同 setMentionPref）。updated_at 走列默认自动更新。
-		_, err := rb.ctx.DB().InsertBySql(
+		if _, err := tx.InsertBySql(
 			"INSERT INTO bot_setting (robot_id, key_name, value, updated_by) "+
 				"VALUES (?, ?, ?, ?) "+
 				"ON DUPLICATE KEY UPDATE value=VALUES(value), updated_by=VALUES(updated_by)",
 			robotID, p.key, p.value, loginUID,
-		).Exec()
-		if err != nil {
+		).Exec(); err != nil {
 			rb.Error("写入 bot_setting 失败", zap.Error(err),
 				zap.String("robot_id", robotID), zap.String("key", p.key))
 			httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
@@ -403,6 +446,14 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		rb.Error("提交 bot_setting 事务失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
+		return
+	}
+
+	// 事件只在提交成功之后推：提交失败时没有任何变更生效，推事件会让 adapter 白白
+	// 重拉一次并读到与它已有缓存相同的值。
 	rb.notifyBotSettingChanged(robotID)
 	c.ResponseOK()
 }
