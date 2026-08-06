@@ -387,6 +387,33 @@ intended, because a per-party test passes fine while they disagree.
   does mean `sendMessage` and `typing` gain subarea support as a side effect,
   which is a behaviour change on two endpoints this task does not otherwise own —
   recorded here rather than left to be discovered.
+
+  **And the first version of that grant used the wrong membership predicate —
+  the fourth instance of this branch's signature mistake.** It called
+  `ExistMember`, which filters `is_deleted=0` only and therefore returns true for
+  a blacklisted member. The strict variant `ExistMemberActive` also requires
+  `status=Normal`, and its doc comment in `group/service.go` names this exact
+  situation: *"子区(CommunityTopic)读/发门禁用它替代 ExistMember，避免被拉黑用户越权
+  读/发（YUJ-4185 CR 整改）"*. Every other subarea gate in the tree — `thread`,
+  `message`, `messages_search`, `bot_api/threads.go` — uses the strict one. The
+  new line was the only subarea gate in the repository on the loose predicate,
+  and it mattered more here than elsewhere: robot ingresses send server-side and
+  bypass the IM datasource, so they never receive `thread`'s subarea blacklist
+  inheritance and this local check is the only defence.
+
+  The lesson is the one already written three sections above, applied to the
+  wrong noun. "Enumerate everyone who implements the shared rule" was followed
+  for `allowSendToChannel` — its three *callers* were all found. It was not
+  followed for "how does this repo decide subarea membership", whose
+  *implementers* were never enumerated. **The unit of enumeration is the
+  decision, not the function**: introducing a new authorization grant means
+  finding every existing grant of the same kind and matching its predicate,
+  before writing the call.
+
+  The test that pins it holds `member=true, activeMember=false` — precisely a
+  blacklisted row — so it fails if the predicate is swapped back, and asserts on
+  *which method was called* rather than only on the verdict, because a stub with
+  one shared result would answer both identically and stay green.
 - **`streamEnd` has no caller binding, and one review's description of it is
   wrong.** An automated review suggested a stream's final content could smuggle a
   card via `streamEnd`. It cannot: `config.MessageStreamEndReq` is

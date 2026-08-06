@@ -124,9 +124,19 @@ owner 读与 adapter 读分属两个模块）。
   **拒绝而非补门是刻意的**：补门要在这条路上重建形状校验、URL 白名单、节点/深度上限与
   profile 协商，等于把 `sendMessage` 的流水线复制一遍，也就再造一处会漂移的判定；而流式
   消息的用途是增量文本，卡片有 `sendMessage` 与模板 `message/edit` 两条正规入口。
-  **该 handler 另外两个先于本任务存在的问题不在本任务范围，也不该被这道门掩盖**：缺少
-  `allowSendToChannel`，以及 `from_uid` 由调用方指定而非取自已鉴权的 `robot_id`（冒充
-  类，评审认为比卡片那条更严重）。详见 journal 的 known-gaps。
+  **本任务确实扩到了这两条，规格在此认下**（round-8 评审指出 spec 与实现矛盾）：
+  `from_uid` 现钉为 `c.Param("robot_id")`，`allowSendToChannel` 现被调用。它们最初写在
+  「不在范围」里，随后评审判定卡片拒绝**单独不足以**解除阻塞——「documenting the gap does
+  not close the forgeable `from_uid` symmetry break」——于是同轮补上。留着旧措辞会让规格
+  与代码互相打架，所以改的是规格，不是代码。
+  连带影响必须写在规格里而不是只写在 journal 里：`allowSendToChannel` 是三条 robot
+  ingress 共用的谓词，补上子区（`ChannelTypeCommunityTopic`）判定后，`sendMessage` 与
+  `typing` **也**获得了子区支持——两个本任务不拥有的端点的行为变更。方向是放宽（子区：
+  永远拒 → 按父群活跃成员判定），故不会让今天能发的变成不能发。
+  子区成员判定用 **`ExistMemberActive`**（`is_deleted=0` AND `status=Normal`），不是
+  `ExistMember`：后者对被拉黑成员仍返回 true，而 robot ingress 服务端直发、不经 IM
+  datasource，拿不到 thread 的子区拉黑继承，本地这道门是唯一防线。全仓每一处子区门禁
+  都用严格变体，这里一度是唯一例外（round-8 评审 P1）。
 - **关闭只拦模板卡的续帧，不拦 raw 卡的改写**（round-1 评审后修订）：`sendMessage`
   全量加门；`botMessageEdit` 的**模板分支**不加门——流式推理卡必须能编辑到终态，
   否则线上残留「永久处理中」的卡。但**raw 分支必须加门**：`cardmsg.Validate` 接受

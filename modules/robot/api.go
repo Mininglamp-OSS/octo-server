@@ -1027,8 +1027,13 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 // 那条路先前没有校验，于是成了三条里唯一「子区能发」的例外。
 //
 // 子区的成员资格取决于**父群**：子区 channelID 形如 `<parentGroupNo>____<topicNo>`，
-// 权限模型里子区不单独持有成员表。因此解析出父群再查成员，与群分支同一条规则、同一次
-// 查询，解析是纯字符串操作、不额外碰库。
+// 权限模型里子区不单独持有成员表。因此解析出父群再查成员，解析是纯字符串操作、不额外碰库。
+//
+// **但用的谓词比群分支严**，不是同一条规则：群分支是 ExistMember（只看 is_deleted），
+// 子区分支是 ExistMemberActive（还要求 status=Normal）。这个不对称是全仓既有口径——
+// 子区门禁在 YUJ-4185 被专门加固过，thread / message / messages_search / bot_api 各处
+// 都用严格变体，群门禁则仍是松的。所以「被拉黑的 bot 能发父群、不能发子区」是刻意的，
+// 不是遗漏。收紧群分支是更大范围的行为变更，另行评估。
 //
 // 方向上这是**放宽**（type 5：永远拒 → 按父群成员判定），所以今天能发的一样能发；
 // 受影响的只有先前被无条件 403 的子区请求。
@@ -1053,9 +1058,19 @@ func (rb *Robot) allowSendToChannel(robotID string, channelID string, channelTyp
 			rb.Error("解析子区父群失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
 			return false
 		}
-		exist, err := rb.groupService.ExistMember(parentGroupNo, robotID)
+		// **必须是 ExistMemberActive，不是上面群分支那个 ExistMember**（round-8 评审 P1）。
+		// ExistMember 只过滤 is_deleted=0，被拉黑成员（status=Blacklist）照样返回 true；
+		// ExistMemberActive 额外要求 status=Normal。group/service.go 上该方法的注释点名了
+		// 这个场景：「子区(CommunityTopic)读/发门禁用它替代 ExistMember，避免被拉黑用户
+		// 越权读/发（YUJ-4185 CR 整改）」，thread / message / messages_search / bot_api
+		// 的每一处子区门禁也都用它。
+		//
+		// 这条路尤其不能松：robot ingress 是服务端直发，不经过 IM datasource，因而拿不到
+		// thread 模块的子区拉黑继承（thread/1module.go）——本地这道门就是唯一防线，正是
+		// group/db.go 里「用于绕过 IM 层的接口」那句话所指的情形。
+		exist, err := rb.groupService.ExistMemberActive(parentGroupNo, robotID)
 		if err != nil {
-			rb.Error("检查机器人是否是子区父群成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+			rb.Error("检查机器人是否是子区父群活跃成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
 			return false
 		}
 		return exist

@@ -78,17 +78,31 @@ func seedGroup(t *testing.T, ctx *libconfig.Context, groupNo string, status int)
 // The interface is embedded rather than fully implemented — every other method
 // is nil and would panic if reached, which is the point: if this stub ever needs
 // a second method, the handler started doing something this test does not model.
+//
+// **The two membership predicates return separate fields on purpose.** They are
+// not interchangeable: ExistMember filters is_deleted=0 only, ExistMemberActive
+// also requires status=Normal, and the subarea gate must use the latter so a
+// blacklisted bot cannot post (round-8 review P1). A stub with one shared result
+// would answer both identically, so a test could not tell which one the handler
+// called and swapping them back would stay green. askedMethod records the choice
+// itself rather than only its outcome.
 type stubGroupService struct {
 	group.IService
-	askedUID   string
-	askedGroup string
-	member     bool
+	askedUID     string
+	askedGroup   string
+	askedMethod  string // "ExistMember" | "ExistMemberActive"
+	member       bool   // ExistMember result — is_deleted=0 only
+	activeMember bool   // ExistMemberActive result — also status=Normal
 }
 
 func (s *stubGroupService) ExistMember(groupNo string, uid string) (bool, error) {
-	s.askedUID = uid
-	s.askedGroup = groupNo
+	s.askedUID, s.askedGroup, s.askedMethod = uid, groupNo, "ExistMember"
 	return s.member, nil
+}
+
+func (s *stubGroupService) ExistMemberActive(groupNo string, uid string) (bool, error) {
+	s.askedUID, s.askedGroup, s.askedMethod = uid, groupNo, "ExistMemberActive"
+	return s.activeMember, nil
 }
 
 // postStreamStart sends one stream/start carrying the given raw payload bytes.
@@ -312,7 +326,7 @@ func TestStreamStart_ChannelCheckPrecedesTheCardGate(t *testing.T) {
 func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 
-	gs := &stubGroupService{member: true}
+	gs := &stubGroupService{member: true, activeMember: true}
 	rb := &Robot{ctx: ctx, Log: log.NewTLog("RobotAllowSendTest"), groupService: gs}
 	// 用常量而非字面量 5：常量若改值，字面量会让这条测试静默改测另一种频道。
 	topicType := common.ChannelTypeCommunityTopic.Uint8()
@@ -322,12 +336,12 @@ func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 	assert.Equal(t, "parent_group_1", gs.askedGroup,
 		"成员查询用的不是父群号——拿整个子区 channelID 去查会永远落空")
 
-	gs.member = false
+	gs.activeMember = false
 	assert.False(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", topicType),
 		"非父群成员必须被拒")
 
 	// 形状不合法 → fail-closed，且不得把畸形串当群号去查。
-	gs.member = true
+	gs.activeMember = true
 	gs.askedGroup = ""
 	assert.False(t, rb.allowSendToChannel("bot_a", "no_separator_here", topicType),
 		"子区 channelID 形状不合法时必须拒绝")
@@ -349,7 +363,7 @@ func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 // 因为断言的是「没被频道门拒」而通过，但它证明的东西比名字承诺的少。第一版就是这样过的。
 func TestStreamStart_CommunityTopicFlowsThroughBothGates(t *testing.T) {
 	handler, gs, ctx := streamGateHarness(t)
-	gs.member = true // 父群成员
+	gs.activeMember = true // 父群活跃成员
 	seedGroup(t, ctx, "streamgate_group", 1)
 
 	w := postStreamStartTo(t, handler, "streamgate_group____topic_1",
@@ -377,7 +391,7 @@ func TestStreamStart_CommunityTopicFlowsThroughBothGates(t *testing.T) {
 // 「守卫存在」和「守卫永远放行」就分不出来。
 func TestStreamStart_CommunityTopicDisbandGuardIsLive(t *testing.T) {
 	handler, gs, ctx := streamGateHarness(t)
-	gs.member = true // 成员判定放行，只留解散这一个变量
+	gs.activeMember = true // 成员判定放行，只留解散这一个变量
 	seedGroup(t, ctx, "streamgate_dead", group.GroupStatusDisband)
 
 	w := postStreamStartTo(t, handler, "streamgate_dead____topic_1",
@@ -385,4 +399,32 @@ func TestStreamStart_CommunityTopicDisbandGuardIsLive(t *testing.T) {
 
 	assert.Equal(t, "err.server.robot.group_disbanded", streamGateErrorCode(w),
 		"父群已解散仍放行开流，body=%s", w.Body.String())
+}
+
+// TestAllowSendToChannel_CommunityTopicRefusesBlacklistedMember —— round-8 评审 P1。
+//
+// 这条用例把两个谓词的差别做成**唯一变量**：`member=true, activeMember=false` 正是被拉黑
+// 成员在库里的样子（`is_deleted=0` 通过、`status=Blacklist` 不通过）。用 ExistMember 判定
+// 会放行，用 ExistMemberActive 会拒绝——所以它守的不是「拒绝」这个结果，而是**选了哪个
+// 谓词**。只断言结果的话，把代码换回 ExistMember 而 stub 两个字段又恰好同值时，测试照绿。
+//
+// 为什么这条路必须用严格的那个：robot ingress 是服务端直发，不经过 IM datasource，拿不到
+// thread 模块的子区拉黑继承，本地这道门就是唯一防线。group/service.go 上 ExistMemberActive
+// 的注释点名了子区场景，thread / message / messages_search / bot_api 的每一处子区门禁也都
+// 用它——本函数曾是全仓唯一的例外。
+func TestAllowSendToChannel_CommunityTopicRefusesBlacklistedMember(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+
+	gs := &stubGroupService{member: true, activeMember: false} // 在群里，但被拉黑
+	rb := &Robot{ctx: ctx, Log: log.NewTLog("RobotBlacklistTest"), groupService: gs}
+
+	allowed := rb.allowSendToChannel("bot_a", "parent_group_1____topic_9",
+		common.ChannelTypeCommunityTopic.Uint8())
+
+	assert.False(t, allowed,
+		"被拉黑成员被放行进子区——说明走的是 ExistMember（只看 is_deleted）而非 ExistMemberActive")
+	assert.Equal(t, "ExistMemberActive", gs.askedMethod,
+		"子区门禁必须调 ExistMemberActive；调 ExistMember 会让被拉黑成员通过，"+
+			"且这条路绕过 IM 层的子区拉黑继承，本地判定是唯一防线")
+	assert.Equal(t, "parent_group_1", gs.askedGroup, "活跃成员判定必须落在父群上")
 }
