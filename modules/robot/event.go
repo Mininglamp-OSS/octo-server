@@ -29,9 +29,17 @@ func (rb *Robot) getCreatorUID(robotID string) (string, error) {
 	return uid, nil
 }
 
-// robotIDMaxLen is the width of `robot.robot_id` (VARCHAR(40),
-// modules/robot/sql/20210926000001_robot_legacy01.sql). A longer string cannot be a row in
-// that table, so it cannot name a bot.
+// robotIDMaxLen bounds a candidate bot id in **bytes**.
+//
+// It is the width of `robot.robot_id` (VARCHAR(40),
+// modules/robot/sql/20210926000001_robot_legacy01.sql), which MySQL counts in *characters*
+// under utf8mb4 — so this is deliberately the stricter of the two, and the difference is
+// stated rather than glossed (review round 7). A multibyte id would be rejected here while
+// the column would accept it; that is unreachable today because both id-producing paths are
+// ASCII-only (a client-chosen username is `[a-z0-9_]{1,20}` plus `_bot`, and the generated
+// form is lowercase hex plus `_bot` — modules/botfather), and bytes are what the Redis key
+// and the log line are actually made of. If a multibyte id ever becomes producible, widen
+// this to utf8.RuneCountInString rather than raising the number.
 const robotIDMaxLen = 40
 
 // plausibleRobotID reports whether a client-supplied `payload.robot_id` is shaped like
@@ -44,11 +52,11 @@ const robotIDMaxLen = 40
 // TTL, in a Redis running `noeviction` — plus a `seq` row that is never reclaimed.
 //
 // The length bound is the decisive one and it needs no judgement call: a value longer than
-// the column cannot match any row, so adopting it could only ever create permanent state for
-// a bot that provably does not exist. Whitespace and control characters are rejected for the
-// same reason botevent.NextEventID rejects a padded id — the allocator, the queue key and
-// the doorbell must all key off the identical string, and an id that cannot round-trip
-// through a log line or a `KEYS` listing is not one anybody meant to send.
+// the column can hold cannot match any row, so adopting it could only ever create permanent
+// state for a bot that provably does not exist. Whitespace and control characters are
+// rejected for the same reason botevent.NextEventID rejects a padded id — the allocator, the
+// queue key and the doorbell must all key off the identical string, and an id that cannot
+// round-trip through a log line or a `KEYS` listing is not one anybody meant to send.
 //
 // Deliberately no charset allowlist beyond that: bot ids are UUID-hex in production, but the
 // column stores whatever it is given, and guessing narrower here would silently stop a real
