@@ -538,9 +538,12 @@ the caller's plumbing. `writeExport` now calls `WriteHeaderNow`.
 
 ## Pre-merge operational prerequisites
 
-Two acceptance items in `brief.md` are environmental and cannot be discharged
-from a single-container checkout. They are prerequisites for merge, not
-leftovers, and each needs an operator to record the result:
+The acceptance matrix in `brief.md` is filled in as of 2026-08-06: 27 of its 29
+items name the test that would fail if the property broke, and every cited test
+name was verified to exist. The two below are the remainder. They are
+environmental, cannot be discharged from a single-container checkout, and are
+prerequisites for merge rather than leftovers — each needs an operator to record
+the result:
 
 1. **Multi-replica grant convergence.** Prove that after a grant or revoke, a
    replica with a cold cache and a replica with a hot cache converge on the same

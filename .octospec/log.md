@@ -27,6 +27,30 @@ change-log convention (§7). Newest first.
   `false` defaults; merging authorizes nothing. See the
   [journal](journal/shared/cardtmpl-runtime-catalog-grants-discovery.md).
 
+- **Verification** — Three review passes plus a real MySQL/Redis/WuKongIM run
+  over the same six slices. The passes were not redundant: the live database
+  exposed two defects no amount of reading would have (a hardcoded migration
+  count, and `ErrRuntimeCatalogDisabled` demoted to "unavailable" once
+  activation moved inside the snapshot), and two of the three passes found
+  regressions introduced by the *previous* pass's fixes. The recurring cause
+  was a single-point fix shipped without a round-trip test; the recurring
+  remedy was a test that reproduces the reported failure with the fix reverted,
+  mutation-checked so it cannot pass for the wrong reason.
+
+  Two structural corrections came out of it. An edit now *preserves* the Space
+  its send recorded instead of re-deriving it, so the marker cannot drift with
+  whatever the resolver happens to answer at edit time. And "this Space could
+  not be determined" became a state distinct from "there is no Space" at the
+  three layers that had been conflating them — conflating them is what turned a
+  transient group-table read into a permanently uneditable card, twice.
+
+  The acceptance matrix is filled with the test that would fail if each
+  property broke (69 named tests, all verified to exist). Two items stay open
+  and are recorded as pre-merge operational prerequisites rather than as work
+  quietly dropped: multi-replica grant/revoke cache convergence, and the pilot
+  against a dedicated non-production deployment with `OCTO_PILOT_CATALOG_DSN`
+  set. Neither is reachable from a single container.
+
 ## 2026-07-31 (bot-events-longpoll)
 
 - **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):

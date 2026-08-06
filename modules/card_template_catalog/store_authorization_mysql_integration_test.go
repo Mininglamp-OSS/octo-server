@@ -501,3 +501,69 @@ func TestLoadAuthorizationsKeepsAnsweringAroundADisabledTemplateRealMySQL(t *tes
 		t.Fatalf("per-ID disabled error = %v, want ErrRuntimeCatalogDisabled", err)
 	}
 }
+
+// A grant belongs to the principal it names and to nobody else. This is the
+// isolation the whole per-principal model rests on, and it had no direct
+// evidence: every other test asks with the principal it just granted, so a
+// resolver that ignored principal_id entirely would have passed them all.
+func TestGrantsDoNotLeakBetweenBotsRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	catalogStore := newStore(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	seedAuthorizationTarget(t, db, "1.0.0")
+
+	granted := authorizationIntegrationIdentity()
+	if _, err := catalogStore.UpsertGrant(ctx, UpsertGrantRequest{
+		Identity: granted, Permissions: GrantPermissions{Discover: true, Send: true, Edit: true},
+		ActorUID: "admin-1", Reason: "pilot", ChangeTicket: "CHG-I1",
+	}); err != nil {
+		t.Fatalf("seed grant: %v", err)
+	}
+
+	// Same Space, same template, same deployment — only the Bot differs.
+	neighbour := cardtmpl.CatalogPrincipal{
+		Kind: cardtmpl.CatalogPrincipalBot, ID: "bot-neighbour",
+		SpaceID: granted.ScopeSpaceID,
+	}
+	auth, err := catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: authorizationIntegrationTemplateID, Principal: neighbour,
+	})
+	if err != nil {
+		t.Fatalf("neighbour LoadAuthorization: %v", err)
+	}
+	if auth.Grant.Found || auth.Grant.Discover || auth.Grant.Send || auth.Grant.Edit {
+		t.Fatalf("another Bot's grant was visible to bot-neighbour: %+v", auth.Grant)
+	}
+	// It still resolves the template itself — the denial is about the grant,
+	// not about the Bot being unable to see that the ID exists.
+	if auth.Version != "1.0.0" {
+		t.Fatalf("neighbour authorization = %+v", auth)
+	}
+
+	// The advertised set is the other half: a Bot must not be told about a
+	// template it holds no grant on, however many other Bots do.
+	advertised, err := catalogStore.ListAuthorizedTemplates(ctx, neighbour, 10)
+	if err != nil {
+		t.Fatalf("neighbour ListAuthorizedTemplates: %v", err)
+	}
+	if len(advertised) != 0 {
+		t.Fatalf("neighbour was advertised %+v", advertised)
+	}
+
+	// A principal type change must not match either: bot "x" and
+	// internal_producer "x" are different identities.
+	impostor := cardtmpl.CatalogPrincipal{
+		Kind: cardtmpl.CatalogPrincipalInternalProducer, ID: granted.PrincipalID,
+		SpaceID: granted.ScopeSpaceID,
+	}
+	auth, err = catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: authorizationIntegrationTemplateID, Principal: impostor,
+	})
+	if err != nil {
+		t.Fatalf("impostor LoadAuthorization: %v", err)
+	}
+	if auth.Grant.Found {
+		t.Fatalf("a bot grant matched an internal_producer of the same name: %+v", auth.Grant)
+	}
+}

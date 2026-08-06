@@ -319,3 +319,65 @@ func TestActivationVersionIsTheSingleActivationRule(t *testing.T) {
 		})
 	}
 }
+
+// The compiled-artifact cache must not be able to outlive a revoke. It is keyed
+// on the immutable content hash and holds no grant state, so a hot entry cannot
+// carry a stale permission — but that is an argument, and the acceptance matrix
+// asks for evidence. The sibling test covers a hot cache against a *block*;
+// this one covers it against a revoke, which is the case an operator reaches
+// for when a producer has to be cut off right now.
+func TestRuntimeCatalogHotCacheCannotOutliveARevoke(t *testing.T) {
+	artifact := compileRuntimeFixture(t)
+	store := newAuthorizationStoreStub(artifact, grantedSend())
+	// The permission rule the production authorizer applies. Using the
+	// allow-everything stub here would make the test pass without ever
+	// consulting the grant, which is the very thing being checked.
+	enforceGrant := func(_ context.Context, access CatalogAccess, _ RuntimeArtifactMeta, grant RuntimeGrant) error {
+		if !grant.Allows(access.Purpose) {
+			return ErrRuntimeCatalogNotAuthorized
+		}
+		return nil
+	}
+	catalog := newRuntimeCatalogForTest(t, runtimeStaticRegistry(t), store, enforceGrant)
+	request := dynamicDefaultRequest()
+
+	if _, err := catalog.Render(context.Background(), request); err != nil {
+		t.Fatalf("warm the cache: %v", err)
+	}
+	warmBundleCalls := store.bundleCalls
+	warmSnapshots := store.snapshotCalls()
+	if warmSnapshots == 0 {
+		t.Fatal("the warm render took no snapshot at all")
+	}
+
+	// Revoke: the row becomes a tombstone, which is a *found* grant with no
+	// permissions — not an absent one.
+	store.authMu.Lock()
+	store.auth.Grant = RuntimeGrant{Found: true, Scope: RuntimeGrantScopeExact, Revision: 4}
+	store.authMu.Unlock()
+
+	if _, err := catalog.Render(context.Background(), request); !errors.Is(err, ErrRuntimeCatalogNotAuthorized) {
+		t.Fatalf("post-revoke hot render error = %v, want ErrRuntimeCatalogNotAuthorized", err)
+	}
+	// The denial came from a fresh snapshot, not from a cached decision.
+	if store.snapshotCalls() <= warmSnapshots {
+		t.Fatalf("the hot path answered without re-reading the grant (snapshots %d -> %d)",
+			warmSnapshots, store.snapshotCalls())
+	}
+	// And it did not need to reload the bundle to find out, which is what makes
+	// "the cache holds bytes, never permissions" observable rather than merely
+	// asserted.
+	if store.bundleCalls != warmBundleCalls {
+		t.Fatalf("bundle calls = %d, want the warm load only (%d)", store.bundleCalls, warmBundleCalls)
+	}
+
+	// An edit grant is a separate permission: revoking send must not leave edit
+	// standing, and restoring only edit must not re-enable send.
+	store.authMu.Lock()
+	store.auth.Grant = RuntimeGrant{Found: true, Scope: RuntimeGrantScopeExact, Revision: 5,
+		Discover: true, Edit: true}
+	store.authMu.Unlock()
+	if _, err := catalog.Render(context.Background(), request); !errors.Is(err, ErrRuntimeCatalogNotAuthorized) {
+		t.Fatalf("an edit-only grant authorized a new send: %v", err)
+	}
+}

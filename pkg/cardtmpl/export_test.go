@@ -206,3 +206,38 @@ func TestRegistryStaticCatalogReportsVisibilityAndDefault(t *testing.T) {
 	}()
 	registry.SetCatalogVisibility("test.runtime-parity", "1.0.0", CatalogVisibilityPrivate)
 }
+
+// The 2 MiB cap has to fail the *build*, not the response. A projection that
+// only blew up on the way out would reach a client as a truncated body — and
+// because the projection is built once at registration or compile time, the
+// failure belongs there, where an operator publishing the artifact sees it.
+func TestSafeExportRefusesToBuildAnOversizedProjection(t *testing.T) {
+	artifact := compileBundleForExport(t, validJSONArtifactBundle())
+	meta := artifact.Meta
+
+	// One sample past the cap. Samples are the only unbounded input a manifest
+	// controls, which is why the allowlist is opt-in in the first place.
+	oversized := json.RawMessage(`{"blob":"` + strings.Repeat("a", maxSafeExportBytes+1024) + `"}`)
+	_, err := buildSafeExport(meta, JSONTemplateEngineV1, CatalogVisibilityPrivate, "docs",
+		json.RawMessage(`{"type":"object"}`), nil,
+		map[string]json.RawMessage{"huge": oversized}, []string{"huge"})
+	if err == nil {
+		t.Fatal("an oversized projection was built")
+	}
+	if !strings.Contains(err.Error(), "export") {
+		t.Fatalf("err = %v, want the failure to name the export projection", err)
+	}
+
+	// Just under the cap still builds, so the guard is a bound rather than a
+	// blanket refusal of samples.
+	modest := json.RawMessage(`{"blob":"` + strings.Repeat("a", 1024) + `"}`)
+	export, err := buildSafeExport(meta, JSONTemplateEngineV1, CatalogVisibilityPrivate, "docs",
+		json.RawMessage(`{"type":"object"}`), nil,
+		map[string]json.RawMessage{"modest": modest}, []string{"modest"})
+	if err != nil {
+		t.Fatalf("a projection under the cap was refused: %v", err)
+	}
+	if _, ok := export.Samples["modest"]; !ok {
+		t.Fatalf("the allowlisted sample is missing: %+v", export.Samples)
+	}
+}

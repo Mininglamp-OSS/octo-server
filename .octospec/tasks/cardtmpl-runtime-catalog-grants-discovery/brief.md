@@ -423,48 +423,168 @@ between repository fixtures and non-production runtime state are maintained in
 
 ## Acceptance matrix
 
+Verified 2026-08-06 against MySQL 8.0 + Redis + WuKongIM. Each box names the
+test that would fail if the property broke; `[ ]` items say plainly what is
+still missing and why. Test names are unique across the repo, so `go test -run`
+finds them directly.
+
 ### Authorization and isolation
 
-- [ ] non-superAdmin cannot grant/revoke or inspect hidden grant details.
-- [ ] Bot A cannot discover/send/edit with Bot B's grant even on the same apiUrl/Space.
-- [ ] a Space discover grant never becomes send/edit authority.
-- [ ] exact Space grant overrides global; exact tombstone blocks global without permission union.
-- [ ] `space` principal rejects non-canonical principal/scope combinations.
-- [ ] cross-Space profile/send/edit/action attempts fail before render/enqueue/mutation.
-- [ ] dynamic DM requires both bot and peer in the selected active Space; invalid/ambiguous hints never fallback.
-- [ ] raw callers cannot forge `template_ref` or `catalog_provenance` through any type-17 ingress/edit.
-- [ ] unauthorized and nonexistent B2 responses are wire-equivalent apart from request correlation.
+- [x] non-superAdmin cannot grant/revoke or inspect hidden grant details —
+  `TestGrantWriteRequiresSuperAdminAndControlGate`,
+  `TestControlEndpointsRejectNonSuperAdminBeforeCompile`,
+  `TestManagerListRejectsCallersWhoAreNotSuperAdmin`,
+  `TestRouteRequiresAuthenticationBeforeControlHandlers`; B1/B2 carry no grant
+  state at all (`TestDiscoveryResponsesCarryNoControlPlaneFields`).
+- [x] Bot A cannot discover/send/edit with Bot B's grant even on the same
+  apiUrl/Space — `TestGrantsDoNotLeakBetweenBotsRealMySQL` (same template, same
+  Space, only the Bot differs; also proves `bot:x` and `internal_producer:x`
+  are different identities), plus
+  `TestBotMessageEditRegistryTemplateRejectsForeignStoredProvenance`.
+- [x] a Space discover grant never becomes send/edit authority —
+  `TestValidateGrantPermissionsMatrix`, `TestValidateGrantIdentityCanonicalShapes`,
+  and the `chk_card_template_grant_space` CHECK constraint, so the shape cannot
+  be written even by a future caller that forgets the validator.
+- [x] exact Space grant overrides global; exact tombstone blocks global without
+  permission union — `TestResolveGrantRowsPrecedence` (reducer),
+  `TestStoreLoadAuthorizationExactTombstoneShadowsGlobalRealMySQL` (real rows and
+  collations), `TestLoadAuthorizationsAppliesExactOverGlobalPrecedenceRealMySQL`
+  (the batch reducer, which is a second implementation).
+- [x] `space` principal rejects non-canonical principal/scope combinations —
+  `TestValidateGrantIdentityCanonicalShapes`, `TestGrantPathIdentityCanonicalValidation`.
+- [x] cross-Space profile/send/edit/action attempts fail before
+  render/enqueue/mutation — send `TestBotSendCatalogPrincipalUsesTheTargetGroupSpace`,
+  edit `TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace` (the cross-Space
+  arm), updater `TestCardUpdaterReplaceViewRejectsCrossSpaceStoredProvenance`,
+  action `TestResolveRegistryCardContextRejectsInconsistentProvenance/cross-space_provenance`.
+- [x] dynamic DM requires both bot and peer in the selected active Space;
+  invalid/ambiguous hints never fallback —
+  `TestDMSendRequiresThePeerToBeInTheAuthorizedSpace`,
+  `TestResolveBotGrantSpaceIDRefusesEveryAmbiguity`,
+  `TestDMPeerCheckIsSkippedWhenTheCatalogIsDark`.
+- [x] raw callers cannot forge `template_ref` or `catalog_provenance` through
+  any type-17 ingress/edit — `TestSendMessageRawCardRejectsForgedCatalogProvenance`,
+  `TestBotRawEditRejectsCatalogProvenanceMarkers`,
+  `TestRawContentEditCannotForgeRegistryProvenance`,
+  `TestSendMessageRegistryModeRejectsCallerProvenanceKey`, plus the robot and
+  incoming-webhook absolute-rejection suites.
+- [x] unauthorized and nonexistent B2 responses are wire-equivalent apart from
+  request correlation — `TestGetTemplateAnswersOneNotFoundForEveryInvisibleReason`
+  (byte-compares the bodies, including a malformed ref),
+  `TestLoadDiscoverableGivesOneIndistinguishableMissRealMySQL`.
 
 ### State and consistency
 
-- [ ] publish, activate, grant remain independent; none creates another implicitly.
-- [ ] grant/revoke CAS has one winner; revoke tombstone prevents ABA; audit and state commit together.
-- [ ] capability and send use the same strong active/grant truth; stale explicit ref never switches version.
-- [ ] one authorization decision never combines activation/block/grant values from different DB snapshots.
-- [ ] revoke send blocks subsequent new-send; revoke edit blocks subsequent edit/action; compiled cache cannot bypass.
-- [ ] rollback changes new-send only; old dynamic card remains same-version editable while edit grant exists.
-- [ ] active dynamic same ID shadows static new-send for allowed, denied, blocked and DB-failure cases exactly
-  as the D6 matrix specifies.
+- [x] publish, activate, grant remain independent; none creates another
+  implicitly — `TestPublishUsesAuthenticatedActorAndKeepsArtifactInactive`, and
+  the D7 loop in `TestPilotDynamicCatalogEndToEndRealMySQL` proves each step
+  separately.
+- [x] grant/revoke CAS has one winner; revoke tombstone prevents ABA; audit and
+  state commit together — `TestStoreGrantConcurrentCASHasOneWinnerRealMySQL`,
+  `TestStoreGrantLifecycleRealMySQL`.
+- [x] capability and send use the same strong active/grant truth; stale explicit
+  ref never switches version — `TestBotTemplateManifestAndSendAgree`,
+  `TestBotTemplateSendRejectsStaleDynamicRef`,
+  `TestAdvertisedSendRefsBatchesAndAgreesWithThePerIDPath` (the batched manifest
+  reaches the same conclusion as the per-ID resolver).
+- [x] one authorization decision never combines activation/block/grant values
+  from different DB snapshots — `TestStoreLoadAuthorizationReadsPointerArtifactAndGrantInOneTransaction`,
+  `TestRuntimeCatalogDynamicNewSendUsesExactlyOneSnapshot`,
+  `TestStoreLoadAuthorizationSnapshotIsTheLinearizationPointRealMySQL`,
+  `TestRuntimeCatalogRejectsIncoherentAuthorizationSnapshot`. B2 violated this
+  until the third review pass — it read the discovery predicate and the
+  authorizer separately — and now resolves once.
+- [x] revoke send blocks subsequent new-send; revoke edit blocks subsequent
+  edit/action; compiled cache cannot bypass —
+  `TestRuntimeCatalogHotCacheCannotOutliveARevoke` (a hot entry answers the
+  revoke from a fresh snapshot without reloading the bundle, and an edit-only
+  grant does not authorize a send), `TestStoreLoadAuthorizationSnapshotIsTheLinearizationPointRealMySQL`,
+  and the revoke arm of the D7 pilot loop.
+- [x] rollback changes new-send only; old dynamic card remains same-version
+  editable while edit grant exists — `TestRuntimeCatalogPinnedReadsNeverFollowActivationPointer`,
+  and the rollback arm of the D7 pilot loop.
+- [x] active dynamic same ID shadows static new-send for allowed, denied,
+  blocked and DB-failure cases exactly as the D6 matrix specifies —
+  `TestBotTemplateSendRefFollowsTheShadowMatrix` (all eleven rows),
+  `TestDecideSendRefRefusesADisabledPointerFromTheBatch`.
 
 ### Discovery/export
 
-- [ ] B1 pagination is deterministic and bounded; blocked/unauthorized rows do not leak.
-- [ ] hidden rows do not advance cursor or alter `has_more`; cursor cannot be replayed across Space contexts.
-- [ ] B2 projection contains only manifest/schema/reports/samples and is capped.
-- [ ] only explicitly allowlisted synthetic samples are exported; request handling never reads source files.
-- [ ] static/dynamic ETag is deterministic; `If-None-Match` returns 304 without body.
-- [ ] private response is not shared-cacheable; no audit/grant/token/real sample data leaks.
-- [ ] all B1/B2 and Space-membership failures use the localized envelope; no raw non-OK JSON response remains.
+- [x] B1 pagination is deterministic and bounded; blocked/unauthorized rows do
+  not leak — `TestListDiscoverableFiltersBeforePagingRealMySQL` walks the whole
+  listing at three page sizes over interleaved public/private/granted/blocked/
+  tombstoned rows; `TestDiscoveryPageLimitBounds`,
+  `TestListTemplatesPaginationIsBoundedAndResumable`.
+- [x] hidden rows do not advance cursor or alter `has_more`; cursor cannot be
+  replayed across Space contexts — `TestStaticPageCursorSkipsHiddenRowsWithoutCountingThem`,
+  `TestListDiscoverableReportsMoreWithoutLeakingTheNextRowRealMySQL`,
+  `TestDiscoveryCursorIsBoundToItsSpace`, `TestDiscoveryCursorRejectsWhatItCannotAccountFor`.
+- [x] B2 projection contains only manifest/schema/reports/samples and is capped
+  — `TestSafeExportOmitsTemplatesGoldensAndBundle`,
+  `TestSafeExportRejectsUnknownExportKeys`,
+  `TestSafeExportRefusesToBuildAnOversizedProjection` (the 2 MiB cap fails the
+  build, not the response, so an oversized artifact cannot reach a client as a
+  truncated body).
+- [x] only explicitly allowlisted synthetic samples are exported; request
+  handling never reads source files — `TestSafeExportShipsNoSamplesUnlessTheManifestOptsIn`,
+  `TestSafeExportRejectsAnAllowlistNamingAMissingSample`,
+  `TestStaticRegistryExportIsPrivateWithNoSamples`. The projection is built at
+  registration/compile time, so the request path has no file access to make.
+- [x] static/dynamic ETag is deterministic; `If-None-Match` returns 304 without
+  body — `TestWriteExportServesETagAndA304WithoutABody`,
+  `TestWriteExportFallsBackToTheExportHashForStaticTemplates`,
+  `TestSafeExportHashIsDeterministicAndCoversVisibility`,
+  `TestMatchesETagHandlesListsWildcardAndWeakValidators`.
+- [x] private response is not shared-cacheable; no audit/grant/token/real sample
+  data leaks — `TestWriteExportServesETagAndA304WithoutABody` asserts
+  `Cache-Control: private, no-cache`; `TestDiscoveryResponsesCarryNoControlPlaneFields`.
+- [x] all B1/B2 and Space-membership failures use the localized envelope; no raw
+  non-OK JSON response remains — `TestCatalogNoLegacyErrorResponses` (source
+  guard) plus `make i18n-lint`; the Space half is
+  `TestLocalizedSpaceMiddlewareRejectsANonMemberOnTheEnvelope`,
+  `...ReportsALookupFailureAsUnavailable`,
+  `...RequiresALoginBeforeCheckingMembership`, and
+  `...ResolvesTheSameSpaceAsTheLegacyOne` keeps the twin from becoming a second
+  definition of the membership rule.
 
 ### Runtime and operations
 
-- [ ] gate-off deployment preserves current static Bot/profile/send/edit/action paths during DB outage.
-- [ ] gate-on dynamic DB failure is observable and fail-closed without static same-ID fallback.
-- [ ] two replicas with cold/hot cache converge after grant/activate/rollback/revoke and restart.
-- [ ] dedicated non-production MySQL, Redis and WuKongIM pilot completes before OctoSpec finish/PR ready-for-review.
-- [ ] changed core packages meet at least 80% coverage; focused race suites pass.
-- [ ] `go build ./...`, focused/full relevant tests, `go vet`, `golangci-lint`,
-  `make i18n-extract-check`, `make i18n-lint`, source guards and `git diff --check` pass.
+- [x] gate-off deployment preserves current static Bot/profile/send/edit/action
+  paths during DB outage — `TestRuntimeCatalogStaticExactNeedsNoSnapshot`,
+  `TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark`,
+  `TestDMPeerCheckIsSkippedWhenTheCatalogIsDark`,
+  `TestRuntimeCatalogGatesFailClosedOnMissingAndInvalidValues`,
+  `TestEditSpaceCheckSeparatesUnknownFromEmpty` (a dark gate is a configuration
+  state, never an outage).
+- [x] gate-on dynamic DB failure is observable and fail-closed without static
+  same-ID fallback — `TestRuntimeCatalogDefaultDBFailureDoesNotFallbackStatic`,
+  `TestBotTemplateManifestFailsClosedOnListError`,
+  `TestAdvertisedSendRefsFailsClosedWhenTheBatchReadFails`,
+  `TestStaticPageFailsClosedWhenTheGrantProbeFails`.
+- [ ] two replicas with cold/hot cache converge after grant/activate/rollback/
+  revoke and restart. **Partly covered**:
+  `TestRuntimeCatalogMultiReplicaActivationRollbackBlockAndRestart` covers
+  activate, rollback, block and restart across two stores on one database.
+  Grant/revoke convergence is *not* covered and cannot be from a single
+  container — the gap is the cache-invalidation window between replicas, which
+  is the only place a revoked grant can still be honoured. Pre-merge operational
+  prerequisite; see HANDOFF.md › Pre-merge operational prerequisites.
+- [ ] dedicated non-production MySQL, Redis and WuKongIM pilot completes before
+  OctoSpec finish/PR ready-for-review. **Not done.** The D7 loop in
+  `pilot_mysql_integration_test.go` runs green here, but its exact-version
+  preflight only interrogates real claims when `OCTO_PILOT_CATALOG_DSN` points
+  at the dedicated deployment's catalog database; unset, the test says so out
+  loud. Pre-merge operational prerequisite.
+- [x] changed core packages meet at least 80% coverage; focused race suites pass
+  — `modules/card_template_catalog` 80.6%, `pkg/cardtmpl` 81.2%, `pkg/cardmsg`
+  85.1%; `pkg/space`'s new `localizedSpaceMiddleware` is 91.4% (the package
+  total is dominated by pre-existing untested Redis cache helpers this PR does
+  not touch). `go test -race` passes for `pkg/cardtmpl`, `pkg/cardmsg`,
+  `pkg/space`, `internal/carddispatch`, `internal/cardactiondispatch`.
+- [x] `go build ./...`, focused/full relevant tests, `go vet`, `golangci-lint`,
+  `make i18n-extract-check`, `make i18n-lint`, source guards and
+  `git diff --check` pass — all green on 2026-08-06; `golangci-lint run` reports
+  0 issues across the six changed packages.
 
 ## Rollout / rollback
 
