@@ -166,6 +166,42 @@ var systemSettingSchema = []settingDef{
 	{Category: "incomingwebhook", Key: "member_can_broadcast", Type: settingTypeBool, Description: "非管理员成员创建的 Webhook 是否可用广播型 @（@所有人/@所有 AI）；关闭后即时收回成员广播，管理员创建的不受影响",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.IncomingWebhookMemberCanBroadcast()) }},
 
+	// Bot API 三条限流通道（issue #696）。全部默认关闭 + 默认影子模式：
+	//   enabled  —— kill switch。误配的后果按通道递增，register 层最严重（全部 bot
+	//               无法注册），翻开关比回滚发版快一个数量级，故每层独立可关。
+	//   dry_run  —— 影子模式：跑完整判定并上报观测，但不拦截、不下发 X-RateLimit-*
+	//               头。「不下发头」是硬要求：影子期若下发，客户端会据此自行降频，
+	//               观测到的就不再是真实流量，定值随之失去意义。
+	// 初始配额是按端点语义推的保守偏宽值，不是实测结论；上线后按影子数据收敛。
+	// rps/burst 标 Positive：≤0 会让令牌桶 Lua 走 rate<=0 短路，等于把整条路由打死
+	// （不是"关闭限流"，是 100% 拒绝），读取侧另有回退兜底。
+	{Category: "botratelimit", Key: "business_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot 业务端点启用 per-bot 限流（关闭=完全旁路，不查 Redis 不设响应头）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitBusinessEnabled()) }},
+	{Category: "botratelimit", Key: "business_dry_run", Type: settingTypeBool, Description: "业务端点限流是否影子运行（只观测不拦截，用于定配额）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitBusinessDryRun()) }},
+	{Category: "botratelimit", Key: "business_rps", Type: settingTypeFloat, Description: "单个 Bot 在业务端点上的每秒速率上限（令牌桶 rps）", Positive: true,
+		Effective: func(s *SystemSettings) string { return floatToCanonical(s.BotRateLimitBusinessRPS()) }},
+	{Category: "botratelimit", Key: "business_burst", Type: settingTypeInt, Description: "单个 Bot 在业务端点上的突发上限（令牌桶 burst）", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitBusinessBurst()) }},
+
+	{Category: "botratelimit", Key: "heartbeat_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/heartbeat 启用 per-bot 限流（按 bot 身份分配额）。该端点已移出全局 per-IP 桶，但鉴权前另有一道常开的 per-IP 底线（strict:bot_heartbeat，env 可调），所以关闭本开关并不等于该端点无限制",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitHeartbeatEnabled()) }},
+	{Category: "botratelimit", Key: "heartbeat_dry_run", Type: settingTypeBool, Description: "心跳限流是否影子运行（只观测不拦截）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitHeartbeatDryRun()) }},
+	{Category: "botratelimit", Key: "heartbeat_rps", Type: settingTypeFloat, Description: "单个 Bot 的心跳速率上限（令牌桶 rps）；读取侧强制不低于 0.1——心跳 key TTL 为 60s，配额过低会让这条保命通道自己制造断联", Positive: true,
+		Effective: func(s *SystemSettings) string { return floatToCanonical(s.BotRateLimitHeartbeatRPS()) }},
+	{Category: "botratelimit", Key: "heartbeat_burst", Type: settingTypeInt, Description: "单个 Bot 的心跳突发上限（令牌桶 burst）", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitHeartbeatBurst()) }},
+
+	{Category: "botratelimit", Key: "register_enabled", Type: settingTypeBool, Description: "是否对 /v1/bot/register 启用 per-token 限流（该端点是掉线自愈的最后一环，同时是未鉴权可达的写入口，误配会让全部 Bot 无法注册）。它已随 heartbeat 一并移出全局 per-IP 桶——否则邻居 Bot 打满配额时它会被连坐，掉线的 Bot 换不到新 token、永远无法恢复；鉴权前另有一道常开的 per-IP 底线（strict:bot_register，env 可调）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterEnabled()) }},
+	{Category: "botratelimit", Key: "register_dry_run", Type: settingTypeBool, Description: "注册/换 token 限流是否影子运行（只观测不拦截）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotRateLimitRegisterDryRun()) }},
+	{Category: "botratelimit", Key: "register_rps", Type: settingTypeFloat, Description: "单个 Bot token 的注册/刷新速率上限（令牌桶 rps）；读取侧强制不低于 0.05——它与 register_burst 的比值决定令牌桶 key 的 TTL，配额过低会放大 keyspace", Positive: true,
+		Effective: func(s *SystemSettings) string { return floatToCanonical(s.BotRateLimitRegisterRPS()) }},
+	{Category: "botratelimit", Key: "register_burst", Type: settingTypeInt, Description: "单个 Bot token 的注册/刷新突发上限（令牌桶 burst）；读取侧夹到 register_rps×20 以内——TTL 是 ceil(burst/rps×2)，而 register 的 key 由客户端提供的 token 决定基数，所以放大比值会放大每 IP 的 live key 数。调低 rps 会同时压低有效 burst，实际生效值见本列", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitRegisterBurst()) }},
+
 	// App Bot 共享鉴权缓存的安全网 TTL（秒）。吊销靠共享 DEL 即时生效，此 TTL 仅兜底
 	// DEL 失败 / 极窄的失效-回填竞态（见 modules/bot_api/registry_redis.go）。实时热更新
 	// 无需重启；读取侧再夹紧到 [30, 86400]，超界回落默认值。标记 Positive 以放开

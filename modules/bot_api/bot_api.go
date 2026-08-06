@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
@@ -176,6 +177,10 @@ type BotAPI struct {
 	// 从而共享限流桶与 sender 缓存。principal 由本模块的 resolveSearchPrincipal 按
 	// on_behalf_of 区分 as-bot / as-user(OBO)。
 	searchHandler *messages_search.Handler
+	// rateLimiters 持有三条 per-bot 限流通道（business / heartbeat / register，
+	// issue #696）。为 nil 时所有限流中间件直接放行——单测里用 piecemeal 构造的
+	// BotAPI 没有 ctx/Redis，不应因为限流而变红。
+	rateLimiters *botRateLimiters
 	log.Log
 }
 
@@ -258,6 +263,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		maxBodySize:           maxBodySize,
 		maxFileSize:           maxFileSize,
 		sendPermissionMetrics: defaultBotSendPermissionMetrics,
+		rateLimiters:          newBotRateLimiters(ctx.GetConfig()),
 		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
@@ -277,18 +283,110 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 
 // Route registers all Bot API routes.
 func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
-	// register endpoint (token needed but not via authBot group — handled inline)
-	r.POST("/v1/bot/register", ba.register)
+	// register endpoint (token needed but not via authBot group — handled inline).
+	//
+	// **两层限流,顺序载荷性**:先 per-IP,再 per-token。
+	//
+	// (1) per-token 指纹(issue #696):此处在 authBot 之前、还没有 bot 身份,而 token
+	//     就在请求里。这一维度命中事故形态——token 失效的 bot 以约 4 rps 持续重试
+	//     register,按 token 分桶能把这类风暴关进它自己的桶,不波及同 IP 的健康 bot。
+	//
+	// (2) per-IP strict(code review 补入):**单靠 (1) 有 keyspace 放大漏洞**。
+	//     token 由客户端提供且在限流之前不做有效性校验,攻击者每次换一个随机 token
+	//     即可换一个新桶——不仅绕过 (1),更糟的是令牌桶 Lua 在首次判定时就会
+	//     HMSET+EXPIRE 建 key(bucket.go),于是 live key 数 = 请求速率 × TTL(约 40s)。
+	//     只靠全局 per-IP 桶(1500 rps)兜底意味着最坏 6 万个 key,而生产 Redis
+	//     **未设 maxmemory**,没有 LRU 淘汰、OOM 直接被 OS kill。
+	//     这道 strict 桶把 key 生成速率从 1500/s 压到 100/s(40s 窗口内约 4000 个),
+	//     且必须排在 (1) **之前**——否则 key 已经建好了,挡也来不及。
+	//
+	//     参数走 env、不热调:IP 层是防滥用底线,不需要按业务负载反复收敛。
+	//     **但也不能按平峰量裁**:定这个值的时候 register 还在全局桶里,原上限是全局的
+	//     1500 rps,而它同时是**自愈路径**——车队集体重连时压得太紧,就是在唯一要紧的
+	//     时刻限流恢复能力。它现已一并移出全局桶,所以这 100 rps 是这条路径**唯一**的
+	//     上限,没有外层兜底。定值理由见 ratelimit.go 的常量注释。
+	registerIPRPS, registerIPBurst := ipLimitParams(
+		envRegisterIPRPS, defaultRegisterIPRPS, envRegisterIPBurst, defaultRegisterIPBurst)
+	registerIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
+		"bot_register", registerIPRPS, registerIPBurst)
+	// **用 r.Any 而非 r.POST**:全局限流的豁免只看路径不看方法（lib 的
+	// `excludeSet[c.Request.URL.Path]`），若底线只挂在 POST 上，非 POST 请求会
+	// 既跳过全局桶又碰不到底线（第二轮 code review P1-2）。onlyPOST 在过桶之后收口。
+	// 注意 `r.Any` 只覆盖 gin 的九个方法，扩展方法（PROPFIND 等）仍绕过——
+	// 残留范围与为何不在本仓关闭，见 ratelimit.go onlyPOST 的注释。
+	r.Any("/v1/bot/register",
+		registerIPLimit,
+		onlyPOST,
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.register },
+			func(c *wkhttp.Context) string { return botTokenFingerprint(extractBotToken(c)) },
+			"bot",
+		),
+		ba.register)
+
+	// heartbeat 刻意**不在** botAPI 组内：它必须有独立于业务流量的配额，
+	// 否则一次 7-8 条消息的推理爆发就能顺带把心跳挤掉、进而断联（issue #696）。
+	// 同时它已被移出全局 per-IP 桶（main.go globalRateLimitExcludePaths），
+	// 否则同出网 IP 的邻居仍能把它饿死。
+	//
+	// **三层，顺序载荷性**（code review P1 修正）：
+	//
+	// (1) per-IP strict —— 必须排在 `authBot` **之前**。这是 exclude 的对价：
+	//     移出全局桶也移走了它唯一的未鉴权层防护，而 (3) 挂在鉴权之后、无效 token
+	//     在 `authBot` 里就 abort 了，永远走不到那道桶。缺这一层，攻击者可用任意
+	//     无效 token 无限触发 `authBot` 的 Redis/DB 查询——原本被全局桶挡住的 DDoS
+	//     面因为 exclude 反而被打开。这一层**没有 enabled 开关**，因为 (3) 默认关闭。
+	// (2) authBot + requireBotIdentity —— 鉴权并断言 bot 身份已落。
+	//     用 requireBotIdentity 而非 botActorUID:限流维度取自 "robot_id",不需要
+	//     把 robotID 别名成 "uid"（见 ratelimit.go requireBotIdentity 的注释）。
+	// (3) per-bot 桶 —— 防单个已鉴权 bot 滥用；可热调、可影子、默认关闭。
+	heartbeatIPRPS, heartbeatIPBurst := ipLimitParams(
+		envHeartbeatIPRPS, defaultHeartbeatIPRPS, envHeartbeatIPBurst, defaultHeartbeatIPBurst)
+	heartbeatIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateLimitRedis(ba.ctx.GetConfig()),
+		"bot_heartbeat", heartbeatIPRPS, heartbeatIPBurst)
+	// **r.Any 而非 r.POST**:同 register，豁免只看路径不看方法,底线必须盖住 gin 路由
+	// 得到的每个方法,否则 `GET /v1/bot/heartbeat` 既跳过全局桶又碰不到底线
+	// （第二轮 code review P1-2）。扩展方法的残留见 ratelimit.go onlyPOST 注释。
+	r.Any("/v1/bot/heartbeat",
+		heartbeatIPLimit,
+		onlyPOST,
+		ba.authBot(),
+		ba.requireBotIdentity(),
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.heartbeat },
+			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+			"bot",
+		),
+		ba.heartbeat)
 
 	// Bot API endpoints (unified auth middleware)
-	botAPI := r.Group("/v1/bot", ba.authBot())
+	//
+	// requireBotIdentity 只**断言** `authBot` 已写入 bot 身份（缺失即 fail-closed 中止），
+	// 刻意**不**写 `c.Set("uid", robotID)`。per-bot 限流的维度取自 `getRobotIDFromContext`
+	// （即 authBot 写的 "robot_id"），与 `uid` 无关——初版误用了 `botActorUID()`
+	// 并在注释里声称"供限流取维度",两者都是错的:那个别名会让主组内任何调
+	// `GetLoginUID()` 的 handler 静默拿到 robotID 而不是登录用户，是白担的授权混淆风险
+	// （第二轮 code review P2-2）。
+	//
+	// 顺序是载荷性的：authBot → requireBotIdentity → 限流。限流中间件在拿不到身份时
+	// 旁路放行（OutcomeNoKey），顺序颠倒会让它静默失效。
+	botAPI := r.Group("/v1/bot",
+		ba.authBot(),
+		ba.requireBotIdentity(),
+		ba.rateLimitMiddleware(
+			func(l *botRateLimiters) *ratelimit.Limiter { return l.business },
+			func(c *wkhttp.Context) string { return getRobotIDFromContext(c) },
+			"bot",
+		),
+	)
 	{
 		botAPI.POST("/sendMessage", ba.sendMessage)
 		botAPI.POST("/typing", ba.typing)
 		botAPI.POST("/readReceipt", ba.readReceipt)
 		botAPI.POST("/events", ba.getEvents)
 		botAPI.POST("/events/:event_id/ack", ba.eventAck)
-		botAPI.POST("/heartbeat", ba.heartbeat)
 		botAPI.POST("/messages/sync", ba.syncMessages)
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/resolve/targets", ba.botResolveTargets)
@@ -341,10 +439,22 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// request-scoped：清单现在按认证 bot + 权威 Space 查询 active/unblocked
 	// dynamic send grant，可能落到 runtime DB，因此单独挂 uid 限流。
 	//
-	// 中间件链与 incoming_webhook / search 一致：authBot（bf_/app_ token →
-	// robot_id）→ botActorUID（把 robot_id 写入 "uid"）→ SharedUIDRateLimiter
-	// （必须在 uid 写入之后，否则读不到 uid 会静默 fail-open）。只包这一条路由，
-	// 不给同组既有 legacy Bot 路由静默加上限流。
+	// 中间件链：authBot（bf_/app_ token → robot_id）→ botActorUID（把 robot_id
+	// 写入 "uid"）→ SharedUIDRateLimiter（必须在 uid 写入之后，否则读不到 uid
+	// 会静默 fail-open）。只包这一条路由，不给同组既有 legacy Bot 路由静默加限流。
+	//
+	// **与 #703 per-bot 限流的关系**（合并 main 时对账）：#703 把主 botAPI 组的
+	// `botActorUID()` 换成了 `requireBotIdentity()`，理由是那个别名会让组内任何调
+	// `GetLoginUID()` 的 handler 静默拿到 robotID。这里保留 `botActorUID()` 是安全的
+	// 且必要的：本组只有 `/card/profile` 一条路由，`botCardProfile` 全程走
+	// `getRobotIDFromContext`、从不调 `GetLoginUID()`，所以没有可被混淆的授权判定；
+	// 而 SharedUIDRateLimiter 的维度就是 "uid"，换成 requireBotIdentity 会让它读不到
+	// 维度并**静默放行**——正是上面那行注释警告的失效模式。
+	//
+	// 也没有改挂 #703 的 per-bot business 桶：那个桶默认关闭（可热调、可影子），
+	// 而这条路由是**被轮询的** feature detection，PR-C 之后每次轮询都可能打到 runtime
+	// DB。它需要一道默认就生效的配额，不是一道等运维打开才生效的。两者不冲突也不重复：
+	// gin 的 group 中间件互不继承，botAPI 组的桶不会作用到本组。
 	cardProfileAPI := r.Group("/v1/bot",
 		ba.authBot(), ba.botActorUID(), appwkhttp.SharedUIDRateLimiter(r, ba.ctx))
 	{

@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -44,6 +45,7 @@ import (
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	"github.com/gin-gonic/gin"
@@ -61,8 +63,33 @@ var Commit string     // git commit id
 var CommitDate string // git commit date
 var TreeState string  // git tree state
 
+// globalRateLimitExcludePaths 列出**不**参与全局 per-IP 令牌桶的路径。
+//
+// 每加一条都是在 DDoS 底线上开洞，因此必须逐条论证，并且被豁免的端点**必须**另有
+// 自己的配额——豁免不等于无限制。这条不变量由 main_test.go 的
+// TestExcludedBotPathsEachHaveTheirOwnFloor 结构性钉住（不是靠这段注释）。
+//
+//   - /v1/ping、/v1/health：存活探针，被限流会让 k8s 误判实例不健康。
+//
+// 以下两条是 issue #696 的**自愈通道**，必须成对理解。全局桶按 client IP 分片，
+// 于是同一出网 IP 上的所有 bot 共享一份配额；2026-08-05 生产事故中，一个 bot 以约
+// 590 rps 冲刷业务端点就把配额打满，同 IP 其它 bot 无差别被拒。**组级中间件绕不过
+// route.Use**，所以把路径移出全局桶是让它不被邻居饿死的唯一手段。
+//
+//   - /v1/bot/heartbeat：bot 保活通道，是发现自己掉线的唯一手段。心跳被业务流量
+//     挤掉是纯粹的连带损害——它本身流量极小。上限改由 per-bot heartbeat 桶与鉴权前的
+//     strict:bot_heartbeat IP 底线共同承担。
+//   - /v1/bot/register：**重连时刷 IM token 的必经之路**，即"爬起来"的能力。
+//     第一版漏了它，于是死锁链条仍然通着：邻居打满全局桶 → heartbeat 因已豁免而
+//     活着（能发现掉线）→ register 仍被全局桶拒 → 拿不到新 token → 永远回不来。
+//     **保住"发现掉线"却没保住"爬起来"，最终结果一样是断联。**
+//     它同样已有自己的 strict:bot_register IP 底线（100 rps / burst 500，
+//     见 modules/bot_api/ratelimit.go），与 heartbeat 那道结构完全一致——
+//     所以"豁免会让它失去 IP 层防护"这个原始顾虑不再成立。
+//
+// > 一般性判据：**凡是"失败后用于恢复"的端点都属于保命集合**，不能只保住其中一环。
 func globalRateLimitExcludePaths() []string {
-	return []string{"/v1/ping", "/v1/health"}
+	return []string{"/v1/ping", "/v1/health", "/v1/bot/heartbeat", "/v1/bot/register"}
 }
 
 func loadConfigFromFile(cfgFile string) *viper.Viper {
@@ -236,6 +263,62 @@ func runAPI(ctx *config.Context) {
 	// 由 sticker 模块在 New() 时落值——策略源在 system_setting(common 模块),故不在此组合根
 	// 设置,避免反向依赖 modules/sticker。
 	metrics.NewStickerMetrics(prometheus.DefaultRegisterer)
+	// Bot API per-bot 限流的观测与配置接线(issue #696)。必须在 register.GetModules
+	// 构造 bot_api 之前完成:限流参数虽是每次判定时才读(热调),但把 wiring 放在模块
+	// 构造前可以避免"进程启动到注入之间的窗口里判定按默认值(全关)进行"这种时序依赖。
+	//
+	// provider 用闭包注入而非让 bot_api 直接读 modules/common,与
+	// bot_api.NewRedisAppBotRegistry 的 ttl 注入同源——bot_api 刻意不依赖
+	// system-settings 包。未注入时 bot_api 侧回退为"三条通道全关"(完全旁路),
+	// 即行为与本改动前一致:限流层的失败模式应当是"没限流"而不是"误拒"。
+	metrics.NewBotRateLimitMetrics(prometheus.DefaultRegisterer)
+	// settings 指针在**接线时**捕获一次,不在每次判定时取。EnsureSystemSettings 会取
+	// 进程级 sharedMu 才返回那个既有指针,而这段闭包跑在每一个 /v1/bot 请求上——
+	// 实测被单个 bot 打到过约 590 rps。热更新不受影响:快照在 SystemSettings 内部
+	// 由原子指针换出,getter 每次读到的都是最新值（Load 不持 sharedMu）。
+	botRateLimitSettings := commonmodule.EnsureSystemSettings(ctx)
+	// 按 class 取值:一次判定只读它自己那一条通道的配置项,而不是构造全部三条
+	// （第二轮 code review P2-3）。**并且先看 enabled 再读其余**——出厂状态三条全关,
+	// 此时每请求只读 1 个配置项;若不短路,getter 的默认值参数会被急切求值,
+	// 每个都跑一次 os.Getenv + 解析,在恒为 bypassed 的路径上纯属浪费。
+	bot_api.SetRateLimitParamsProvider(func(class string) ratelimitpkg.Params {
+		s := botRateLimitSettings
+		switch class {
+		case bot_api.RateLimitClassBusiness:
+			if !s.BotRateLimitBusinessEnabled() {
+				return ratelimitpkg.Params{}
+			}
+			return ratelimitpkg.Params{
+				Enabled: true,
+				DryRun:  s.BotRateLimitBusinessDryRun(),
+				RPS:     s.BotRateLimitBusinessRPS(),
+				Burst:   s.BotRateLimitBusinessBurst(),
+			}
+		case bot_api.RateLimitClassHeartbeat:
+			if !s.BotRateLimitHeartbeatEnabled() {
+				return ratelimitpkg.Params{}
+			}
+			return ratelimitpkg.Params{
+				Enabled: true,
+				DryRun:  s.BotRateLimitHeartbeatDryRun(),
+				RPS:     s.BotRateLimitHeartbeatRPS(),
+				Burst:   s.BotRateLimitHeartbeatBurst(),
+			}
+		case bot_api.RateLimitClassRegister:
+			if !s.BotRateLimitRegisterEnabled() {
+				return ratelimitpkg.Params{}
+			}
+			return ratelimitpkg.Params{
+				Enabled: true,
+				DryRun:  s.BotRateLimitRegisterDryRun(),
+				RPS:     s.BotRateLimitRegisterRPS(),
+				Burst:   s.BotRateLimitRegisterBurst(),
+			}
+		default:
+			// 未知 class ⇒ 全关。新增通道忘了接线时表现为「没限流」而不是「误拒」。
+			return ratelimitpkg.Params{}
+		}
+	})
 	// Install the one process registry before register.GetModules constructs
 	// module instances. The foundation rollout deliberately has no production
 	// producer registrations; later enablement injects only a bound Sender into
