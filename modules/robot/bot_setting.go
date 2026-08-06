@@ -135,11 +135,19 @@ func findBotSettingDef(key string) *botSettingDef {
 // normalizeBotSettingBool 把入站 bool 字面量归一化成 "1"/"0"。第二个返回值为 false
 // 表示非法值，调用方必须 400 —— 不接受「猜一个默认」，否则 owner 以为设成了 A，
 // 实际存的是 B。
+//
+// 这是本 feature bool 字面量的**唯一词法**：trim + 折叠大小写，词表 {1,0,true,false}。
+// 写侧（本函数）、读侧（parseBotSettingBool）、以及下一层 system_setting 的
+// SettingBoolOK 三处必须完全一致——它们串在同一条解析链上，任一处的口径不同，都会
+// 出现「这个字面量在这层算数、在那层不算数」。评审逮到过两次同型问题：一次是
+// SettingBoolOK 放宽后管理台 getter 没跟上，一次就是本函数与 parseBotSettingBool
+// 各写各的（后者当时既不 trim 也不认 True）。所以这里不再逐个列举大小写变体，
+// 而是折叠——列举法正是上次分叉的成因：少列一个变体不会报错，只会静默不生效。
 func normalizeBotSettingBool(raw string) (string, bool) {
-	switch strings.TrimSpace(raw) {
-	case "1", "true", "TRUE", "True":
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true":
 		return botSettingTrue, true
-	case "0", "false", "FALSE", "False":
+	case "0", "false":
 		return botSettingFalse, true
 	default:
 		return "", false
@@ -174,15 +182,17 @@ func normalizeBotSettingValue(raw json.RawMessage) (string, bool) {
 
 // parseBotSettingBool 解析库里的 bool 值。非法值（人工改库等）视为未配置，
 // 让解析器落到下一层，而不是把脏值当 false 生效。
+//
+// **委托给写侧的 normalizeBotSettingBool，不另写一份 switch**：读侧接受的集合从此
+// 恒等于写侧接受的集合。此前两处各写各的，写侧 trim 且认 True、读侧两样都不认，于是
+// 手工写入 value='True' 会被读成「覆盖值非法、已忽略」，而同一个字面量走写接口是被
+// 接受的——同一列两套词法。委托是唯一能让这种漂移在语法上无法发生的写法。
 func parseBotSettingBool(raw string) (value bool, ok bool) {
-	switch raw {
-	case botSettingTrue, "true", "TRUE":
-		return true, true
-	case botSettingFalse, "false", "FALSE":
-		return false, true
-	default:
+	normalized, ok := normalizeBotSettingBool(raw)
+	if !ok {
 		return false, false
 	}
+	return normalized == botSettingTrue, true
 }
 
 // botSettingResolution 是单个键的解析结果，同时是 owner 读接口的一行。

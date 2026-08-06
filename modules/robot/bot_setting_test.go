@@ -176,12 +176,12 @@ func TestFindBotSettingDef_RegistryShape(t *testing.T) {
 // false: a hand-edited row must fall through to the next layer, not silently
 // switch a capability off.
 func TestBotSettingBoolLiterals(t *testing.T) {
-	for _, raw := range []string{"1", "true", "TRUE", "True"} {
+	for _, raw := range []string{"1", "true", "TRUE", "True", " true ", "tRuE"} {
 		if got, ok := normalizeBotSettingBool(raw); !ok || got != botSettingTrue {
 			t.Errorf("normalize(%q) = %q,%v want %q,true", raw, got, ok, botSettingTrue)
 		}
 	}
-	for _, raw := range []string{"0", "false", "FALSE", "False", " false "} {
+	for _, raw := range []string{"0", "false", "FALSE", "False", " false ", "fAlSe"} {
 		if got, ok := normalizeBotSettingBool(raw); !ok || got != botSettingFalse {
 			t.Errorf("normalize(%q) = %q,%v want %q,true", raw, got, ok, botSettingFalse)
 		}
@@ -193,6 +193,34 @@ func TestBotSettingBoolLiterals(t *testing.T) {
 	}
 	if _, ok := parseBotSettingBool("garbage"); ok {
 		t.Error("parse accepted a garbage stored value; it must read as not-configured")
+	}
+}
+
+// TestBotSettingBoolLexing_WriteAndReadAgreeLiteralByLiteral 钉住这条链上**只有一套
+// 词法**：写侧接受的字面量集合，必须恒等于读侧认作已配置的集合。
+//
+// 这个不变量此前没有任何测试覆盖，于是两处各写各的能一路活到评审第六轮：写侧
+// trim 且认 `True`，读侧两样都不认。后果是手工写入 `value='True'` 被读成「覆盖值
+// 非法、已忽略」，而同一个字面量走写接口是被接受的——owner 以为设上了，实际在回落。
+//
+// 逐字面量比对，而不是断言「两者行为应当一致」：上一轮那条测试就是因为只钉了自己
+// 想到的那条轴（词表），漏了真正改动的那条轴（词法），才让分叉溜过去的。
+func TestBotSettingBoolLexing_WriteAndReadAgreeLiteralByLiteral(t *testing.T) {
+	for _, raw := range []string{
+		"1", "true", "TRUE", "True", " true ", "\ttrue\n", "tRuE",
+		"0", "false", "FALSE", "False", " false ", "\tfalse\n", "fAlSe",
+		"", " ", "yes", "no", "on", "off", "2", "null", "garbage", "T", "F",
+	} {
+		normalized, writeOK := normalizeBotSettingBool(raw)
+		readValue, readOK := parseBotSettingBool(raw)
+
+		if writeOK != readOK {
+			t.Errorf("%q：写侧接受=%v 读侧接受=%v —— 同一列出现了两套词法", raw, writeOK, readOK)
+			continue
+		}
+		if writeOK && readValue != (normalized == botSettingTrue) {
+			t.Errorf("%q：写侧归一化成 %q，读侧却解析成 %v", raw, normalized, readValue)
+		}
 	}
 }
 

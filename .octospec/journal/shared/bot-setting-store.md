@@ -245,6 +245,26 @@ The structural fix is delegation, not duplication: the getters now call
 `SettingBoolOK`, so there is one lexer for one column and the next change cannot
 land on only one side.
 
+**And the commit that said so was still wrong.** Review found a second pair of
+lexers inside `bot_setting.go` itself — the file that commit edited, under a
+title claiming the class was closed. `normalizeBotSettingBool` (write) trimmed
+and accepted `True`; `parseBotSettingBool` (read) did neither. A hand-written
+`value='True'` was therefore read as "malformed, ignored, fell back" even though
+the write endpoint would have accepted that exact literal. Unreachable through
+the API — writes always normalise to `"1"`/`"0"` — but the same class, one layer
+down, found only because a reviewer read the file the fix touched rather than the
+fix's diff.
+
+Both now share one lexer by delegation, and the rule is the same one
+`SettingBoolOK` uses: trim, case-fold, vocabulary `{1,0,true,false}`. The
+enumerate-the-variants style (`"true", "TRUE", "True"`) was itself the cause —
+omitting a variant produces no error, only a literal that silently stops working
+— so all three sites now fold instead of listing.
+
+The invariant that would have caught it — the write-accepted set and the
+read-accepted set are the same set — had no test at all until now. Three rounds
+of tests asserted what each function does; none asserted that the two agree.
+
 Two smaller ones fixed alongside, both also mine from round 3 or earlier:
 
 - The new malformed-override warning fired on `''`, which
@@ -258,6 +278,14 @@ Two smaller ones fixed alongside, both also mine from round 3 or earlier:
   journal explicitly warns reopens the display bypass if acted on. The brief was
   amended at the time; the comments were not. Both now state display-as-floor and
   point at the shared predicates.
+
+**The generalisable rule, after three instances of it.** Round 1 was a sibling
+path (the raw edit branch), round 2 a sibling consumer (the manifest), rounds 3
+and 6 a sibling *function* reading the same column. Every one was found by
+looking at the neighbourhood rather than the change. **Fixing a shared rule means
+enumerating everyone who implements it, not everyone the diff touches** — and the
+test that proves it must assert the parties *agree*, not that each behaves as
+intended, because a per-party test passes fine while they disagree.
 
 ## Known gaps at merge
 
@@ -286,6 +314,29 @@ Two smaller ones fixed alongside, both also mine from round 3 or earlier:
   contradiction relocated to the owner surface. Needs an explicit decision
   (dominate `effective_value`, or document this as the pre-master-switch tier),
   not another round of implicit.
+- **The "three card producer ingresses" claim may be wrong, and this branch's
+  design rests on it.** `POST /v1/robots/:robot_id/:app_key/stream/start`
+  (`modules/robot/api.go:482`) binds a request whose `Payload` is a raw `[]byte`
+  and hands it straight to `IMStreamStart`. No `payloadIsVail`, no
+  `IsCardPayload`, no `cardmsg.Validate`, no `BotEnabled()`, no per-bot gate —
+  and, unlike the sibling `typing` handler, no `allowSendToChannel` and no
+  override of `req.FromUID` with the authenticated `robot_id` from the path. So
+  on its face an authenticated bot can start a stream carrying a `type:17`
+  payload under an arbitrary `from_uid`. **Entirely pre-existing; this diff does
+  not touch that handler.** What decides whether it is a stale comment or a real
+  bypass is one fact not answerable from this repo: do the clients render a
+  stream payload as a card? Recorded here rather than as an issue by explicit
+  instruction — which means this paragraph is the only record, so whoever picks
+  up the follow-ups should start here. The claim it undermines is asserted in
+  both `payloadIsVail`'s comment and the brief's load-bearing list.
+- **`TestBotMessageEdit_StillReachesTerminalStateWhenReasoningOff` is inert.**
+  It injects a `stubCardConfig` with every sub-switch off, but
+  `botMessageEditViaRegistry` never calls `resolveBotCardConfig`, so the stub
+  changes nothing and the test passes identically with all switches on. It pins
+  none of the condition in its own name. Second instance of this shape on the
+  branch (the first was the atomicity test in round 1), and the tell is the same
+  both times: **the test never fails when the thing it names is broken, because
+  the thing it names is not on the path it drives.**
 - `TestListGroups_CarriesGroupAllowNoMention` (`mention_pref_test.go`, unrelated
   to this task) panics in the local sandbox because the endpoint returns an empty
   list. It reproduces identically on the pre-change HEAD and is green in CI, so it
