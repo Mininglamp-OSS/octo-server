@@ -326,18 +326,40 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	principal botCatalogPrincipal,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
+	storedSpaceID string,
 ) (map[string]any, error) {
 	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	// The re-stamped marker has to carry the same Space the original send
-	// recorded, so it is composed the same way: the target-authoritative Space
-	// when one could be resolved, and the envelope's own Space otherwise.
-	// Using env.SpaceID unconditionally would erase a group card's Space on its
-	// first edit, because a group envelope has no top-level space_id.
+	// An edit *preserves* the marker's Space; it does not re-derive it. The
+	// stored value is what the send was authorized against, and it is already
+	// on the frame — recomputing it here means the answer depends on whether
+	// the resolver happens to work at edit time, so a gate rollback or a group
+	// row that will not load would quietly rewrite the card with an empty
+	// Space and disable every downstream `if Provenance.SpaceID != ""` guard.
+	// This is the same rule pkg/cardtmpl's updater already follows when it
+	// copies the stored markers through verbatim.
+	//
+	// Only a frame with no stored Space at all falls back to composing one,
+	// which is what a pre-PR-C frame being edited for the first time needs.
+	space := strings.TrimSpace(storedSpaceID)
+	if space == "" {
+		space = provenanceSpaceID(principal, env)
+	}
 	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
-		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true,
-		provenanceSpaceID(principal, env))
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true, space)
+}
+
+// storedProvenanceSpaceID reads the Space a frame's own marker records, or ""
+// when the frame carries no marker (a pre-PR-C card) or cannot be parsed. The
+// guard that runs before it has already rejected a malformed marker, so an
+// empty answer here means "nothing was stored", never "we failed to look".
+func storedProvenanceSpaceID(envelope []byte) string {
+	markers, err := cardmsg.CatalogFrameMarkers(envelope)
+	if err != nil || !markers.HasProvenance {
+		return ""
+	}
+	return markers.Provenance.SpaceID
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -613,20 +635,29 @@ func requireEffectiveCardTemplate(
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
 		if markers.Provenance.SpaceID != "" {
-			if space.unavailable {
+			// The envelope's own space_id is a second, independent witness: a DM
+			// send writes it, and it is written from the *forgiving* resolver,
+			// which is also what stamped the marker whenever the strict grant
+			// resolver refused. Consulting it first is what keeps a Bot that
+			// spans two Spaces — a permanent property, not a blip — from being
+			// locked out of editing its own DM cards forever.
+			envelopeSpace, _ := payload["space_id"].(string)
+			switch {
+			case space.verifiable && markers.Provenance.SpaceID == strings.TrimSpace(space.spaceID):
+			case envelopeSpace != "" && markers.Provenance.SpaceID == envelopeSpace:
+			case space.unavailable && envelopeSpace == "":
+				// Nothing to compare against and something should have been
+				// resolvable. Refuse, but as a retryable outage: the frame may
+				// be perfectly valid and the caller cannot fix our lookup.
 				return fmt.Errorf("%w: edit space could not be resolved, stored provenance unverifiable",
 					errBotTemplateRuntimeUnavailable)
-			}
-			if space.verifiable {
-				expectedSpace := strings.TrimSpace(space.spaceID)
-				if expectedSpace == "" {
-					// A DM resolved to no Space still has the envelope's own
-					// value, which is what pre-PR-C sends stamped.
-					expectedSpace, _ = payload["space_id"].(string)
-				}
-				if markers.Provenance.SpaceID != expectedSpace {
-					return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
-				}
+			case !space.verifiable && envelopeSpace == "":
+				// The deployment establishes no Space at all (the dynamic
+				// catalog is dark), so there is nothing this check can assert.
+				// The canonical bot marker, the PrincipalID comparison above and
+				// Snapshot ownership still bind the edit to the card's author.
+			default:
+				return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
 			}
 		}
 	}

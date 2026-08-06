@@ -128,6 +128,16 @@ type RuntimeAuthorizationStore interface {
 // implementation that does provide it MUST return, for every requested ID,
 // exactly what LoadAuthorization would have returned for that ID with an empty
 // Version — the batch buys round trips, never a relaxed check.
+//
+// One difference is forced by batching and is part of the contract: a template
+// whose activation pointer is *disabled* is reported as an entry whose
+// Activation.Status is RuntimeActivationDisabled, not as an error. The per-ID
+// form has only one channel and returns ErrRuntimeCatalogDisabled there, but a
+// batch that failed over one disabled template would send its caller back to
+// asking one ID at a time — reinstating exactly the round trips this interface
+// exists to remove, for as long as an operator leaves that template disabled.
+// Callers must therefore treat a disabled status as "not usable" themselves;
+// it is not a version they may fall back from.
 type RuntimeAuthorizationBatchStore interface {
 	LoadAuthorizations(context.Context, []ID, CatalogPrincipal) (map[ID]RuntimeAuthorization, error)
 }

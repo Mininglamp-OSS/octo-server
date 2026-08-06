@@ -451,3 +451,53 @@ func TestLoadAuthorizationsAppliesExactOverGlobalPrecedenceRealMySQL(t *testing.
 		t.Fatal("an exact tombstone failed to shadow the global grant in the batch reducer")
 	}
 }
+
+// One disabled template must not cost the batch its whole reason to exist. The
+// per-ID resolver signals a disabled pointer with an error because an error is
+// its only channel; a batch that did the same would fail every other template
+// in the call and send the caller back to one-ID-at-a-time reads for as long as
+// an operator left that template disabled.
+func TestLoadAuthorizationsKeepsAnsweringAroundADisabledTemplateRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	catalogStore := newStore(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	seedAuthorizationTarget(t, db, "1.0.0")
+	seedDiscoveryVersion(t, db, "test.disabled-one", "1.0.0", cardtmpl.CatalogVisibilityPrivate, false)
+	seedDiscoveryActivation(t, db, "test.disabled-one", "1.0.0")
+	if _, err := db.Exec(`UPDATE card_template_activation
+        SET status = 'disabled', active_version = NULL WHERE template_id = ?`,
+		"test.disabled-one"); err != nil {
+		t.Fatalf("disable pointer: %v", err)
+	}
+
+	ids := []cardtmpl.ID{authorizationIntegrationTemplateID, "test.disabled-one"}
+	batch, err := catalogStore.LoadAuthorizations(ctx, ids, authorizationIntegrationPrincipal())
+	if err != nil {
+		t.Fatalf("a disabled template failed the whole batch: %v", err)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("batch answered %d of 2: %+v", len(batch), batch)
+	}
+	// The healthy template still resolves normally.
+	if batch[authorizationIntegrationTemplateID].Version != "1.0.0" {
+		t.Fatalf("healthy template = %+v", batch[authorizationIntegrationTemplateID])
+	}
+	// The disabled one reports its status rather than a version, so a caller
+	// cannot mistake it for "no dynamic version, keep your static behaviour".
+	disabled := batch["test.disabled-one"]
+	if disabled.Version != "" {
+		t.Fatalf("disabled template offered version %q", disabled.Version)
+	}
+	if disabled.Activation.Status != cardtmpl.RuntimeActivationDisabled {
+		t.Fatalf("disabled template = %+v, want the disabled status carried through", disabled)
+	}
+	// The per-ID form still reports it as an error — that difference is the
+	// documented contract, not a drift.
+	if _, err := catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: "test.disabled-one", Principal: authorizationIntegrationPrincipal(),
+	}); !errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+		t.Fatalf("per-ID disabled error = %v, want ErrRuntimeCatalogDisabled", err)
+	}
+}

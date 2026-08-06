@@ -1279,7 +1279,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		WebLoginURL: webLoginURL,
 		Lang:        i18n.OutboundLanguage(c.Request.Context()),
 		SpaceID:     spaceID,
-	})
+	}, storedProvenanceSpaceID(snapshot.Envelope))
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))

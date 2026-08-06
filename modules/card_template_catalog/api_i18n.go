@@ -2,6 +2,7 @@ package card_template_catalog
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -78,8 +79,18 @@ func (a *API) respondCatalogGrantInvalid(c *wkhttp.Context, err error) {
 		// Warn, not Error: a malformed principal type or an over-long id is an
 		// expected 4xx, and logging it at Error would put routine caller
 		// mistakes into the same bucket as integrity and availability failures.
+		// Label the operation the way the sibling metric does. The helper is
+		// shared by the upsert and revoke handlers, so a hardcoded "grant"
+		// logged every rejected revoke as a grant — the log and the
+		// observeOperation("revoke", ...) counter disagreed about the same
+		// request. The route method is the discriminator: PUT creates or
+		// updates, DELETE revokes.
+		operation := "grant"
+		if c != nil && c.Request != nil && c.Request.Method == http.MethodDelete {
+			operation = "revoke"
+		}
 		a.logger.Warn("card template grant request rejected",
-			zap.String("operation", "grant"), zap.Error(err))
+			zap.String("operation", operation), zap.Error(err))
 	}
 	httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogGrantInvalid, nil, nil)
 }

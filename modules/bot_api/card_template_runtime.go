@@ -356,12 +356,10 @@ func (c *botCardTemplateCatalog) resolveStaticSendAuthorizations(
 	}
 	resolved, err := batch.LoadAuthorizations(ctx, c.staticSendIDs, principal.catalogPrincipal())
 	if err != nil {
-		if errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
-			// One disabled pointer among the policy IDs is an operator state,
-			// not an outage. Fall back to the per-ID path so each template gets
-			// its own answer instead of the whole manifest inheriting one.
-			return nil, nil
-		}
+		// Per contract a disabled template is reported per ID rather than as a
+		// batch-wide error, so anything that reaches here really is an outage
+		// and the manifest fails closed rather than advertising a version that
+		// may already have been shadowed.
 		return nil, errors.Join(errBotTemplateRuntimeUnavailable, err)
 	}
 	return resolved, nil
@@ -375,6 +373,16 @@ func (c *botCardTemplateCatalog) decideSendRef(
 	hasStatic bool,
 	auth cardtmpl.RuntimeAuthorization,
 ) botTemplateRef {
+	if auth.Activation.Status == cardtmpl.RuntimeActivationDisabled {
+		// A disabled pointer is a deliberate operator state rather than an
+		// outage, but the outcome matches the ungranted row: this ID is not
+		// sendable, and it does not revert to its static version. The per-ID
+		// resolver learns this from ErrRuntimeCatalogDisabled; the batch
+		// resolver reports it as an activation status, because failing a whole
+		// batch over one disabled template would cost every other template in
+		// it a separate round trip.
+		return botTemplateRef{}
+	}
 	if auth.Version == "" {
 		if hasStatic {
 			return staticRef

@@ -623,7 +623,8 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 
 	// And the re-stamped marker keeps the Space rather than blanking it.
 	edited, err := catalog.RenderEditPayloadForPrincipal(context.Background(), editPrincipal,
-		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env,
+		storedProvenanceSpaceID(envelope))
 	if err != nil {
 		t.Fatalf("group edit: %v", err)
 	}
@@ -901,5 +902,141 @@ func TestAdvertisedSendRefsFailsClosedWhenTheBatchReadFails(t *testing.T) {
 		botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true})
 	if !errors.Is(err, errBotTemplateRuntimeUnavailable) {
 		t.Fatalf("err = %v, want errBotTemplateRuntimeUnavailable", err)
+	}
+}
+
+// A Bot that belongs to two Spaces can never satisfy the strict grant resolver
+// — the ambiguity is a permanent property of that Bot, not a blip. Its DM sends
+// still stamp a marker, from the forgiving resolver that also fills the
+// envelope's space_id. If the edit guard only ever consulted the strict
+// resolver, every one of those cards would be uneditable forever.
+func TestDMCardStaysEditableWhenTheStrictResolverCannotAgree(t *testing.T) {
+	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
+		multiRows: map[string][]string{"bot-42": {"space-one", "space-two"}},
+	}, &stubAuthorizationSource{newSend: true})
+	ctx := newGrantSpaceContext(t, "")
+
+	// Ambiguous membership: the grant principal refuses to resolve.
+	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "peer-1", common.ChannelTypePerson.Uint8())
+	if principal.SpaceResolved {
+		t.Fatalf("a two-Space Bot resolved a grant Space: %+v", principal)
+	}
+	// The DM send path still injects the forgiving resolver's Space, and the
+	// marker is stamped from the same value.
+	env := cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-one"}
+	sent, err := ba.cardTemplates.RenderPayloadForPrincipal(context.Background(), principal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	if err != nil {
+		t.Fatalf("dm send: %v", err)
+	}
+	sent = ba.enrichBotPayloadWithResolvedSpaceID("bot-42", sent, "space-one")
+	envelope, err := json.Marshal(sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(envelope)
+	if err != nil {
+		t.Fatalf("stored markers: %v", err)
+	}
+	if markers.Provenance.SpaceID != "space-one" {
+		t.Fatalf("dm marker Space = %q", markers.Provenance.SpaceID)
+	}
+
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	check := editProvenanceSpaceCheck(true, principal)
+	if !check.unavailable {
+		t.Fatalf("expected the strict resolver to report unavailable, got %+v", check)
+	}
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", check); err != nil {
+		t.Fatalf("a multi-Space Bot was locked out of editing its own DM card: %v", err)
+	}
+
+	// A marker naming a Space the envelope does not corroborate is still
+	// refused — the envelope is a witness, not a bypass.
+	forged := map[string]any{}
+	if err := json.Unmarshal(envelope, &forged); err != nil {
+		t.Fatal(err)
+	}
+	forged["space_id"] = "space-elsewhere"
+	forgedEnvelope, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireEffectiveCardTemplate(forgedEnvelope, ref, "bot-42", check); err == nil {
+		t.Fatal("a marker contradicting both witnesses was accepted")
+	}
+}
+
+// An edit preserves the Space the send recorded. Re-deriving it means the answer
+// depends on whether the resolver happens to work at edit time, so a gate
+// rollback would rewrite the card with an empty Space and quietly disable every
+// downstream `if Provenance.SpaceID != ""` guard for it.
+func TestEditPreservesTheStoredProvenanceSpaceEvenWhenTheGateIsDark(t *testing.T) {
+	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
+		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
+		groupSpaces: map[string]string{"group-1": "space-group"},
+	}, &stubAuthorizationSource{newSend: true})
+	ctx := newGrantSpaceContext(t, "")
+	catalog := ba.cardTemplates
+
+	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
+	sent, err := catalog.RenderPayloadForPrincipal(context.Background(), principal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any),
+		cardtmpl.BuildEnv{Lang: "zh-CN"})
+	if err != nil {
+		t.Fatalf("group send: %v", err)
+	}
+	envelope, err := json.Marshal(sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := storedProvenanceSpaceID(envelope); got != "space-group" {
+		t.Fatalf("stored Space = %q", got)
+	}
+
+	// The gate is rolled back: no principal Space, and a group envelope has no
+	// top-level space_id to fall back to either.
+	dark := botCatalogPrincipal{BotID: "bot-42"}
+	edited, err := catalog.RenderEditPayloadForPrincipal(context.Background(), dark,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any),
+		cardtmpl.BuildEnv{Lang: "zh-CN"}, storedProvenanceSpaceID(envelope))
+	if err != nil {
+		t.Fatalf("dark-gate edit: %v", err)
+	}
+	editedEnvelope, err := json.Marshal(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	editedMarkers, err := cardmsg.CatalogFrameMarkers(editedEnvelope)
+	if err != nil {
+		t.Fatalf("edited markers: %v", err)
+	}
+	if editedMarkers.Provenance.SpaceID != "space-group" {
+		t.Fatalf("the edit rewrote the Space to %q, erasing the send's record",
+			editedMarkers.Provenance.SpaceID)
+	}
+}
+
+// The batch reports a disabled pointer as a status rather than an error, so the
+// pure decision has to recognise it. If it did not, a disabled template would
+// look like "no dynamic version" and fall back to its static version — the one
+// outcome D6 forbids, because the operator disabled that ID deliberately.
+func TestDecideSendRefRefusesADisabledPointerFromTheBatch(t *testing.T) {
+	catalog := newMustTestCatalog(t)
+	staticRef, hasStatic := catalog.staticSendVersion(aireasoningprocess.TemplateID)
+	if !hasStatic {
+		t.Fatal("fixture lost its static send policy")
+	}
+	disabled := cardtmpl.RuntimeAuthorization{
+		Activation: cardtmpl.RuntimeActivation{Exists: true, Status: cardtmpl.RuntimeActivationDisabled},
+	}
+	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, disabled); ref.ID != "" {
+		t.Fatalf("a disabled pointer fell back to the static version: %+v", ref)
+	}
+	// And it is the *disabled status* doing the work, not the empty version: a
+	// template with no activation row at all still keeps its static version.
+	none := cardtmpl.RuntimeAuthorization{}
+	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, none); ref != staticRef {
+		t.Fatalf("an unactivated template lost its static version: %+v", ref)
 	}
 }

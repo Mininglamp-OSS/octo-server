@@ -147,13 +147,19 @@ func (s *store) LoadAuthorization(
 // thousands of them — multiplies that into steady primary-DB load for an answer
 // that mostly has not changed.
 //
-// The semantics are LoadAuthorization's, deliberately and exactly: a template
-// with no activation row yields a zero Version (the caller keeps its static
-// behaviour), and a malformed activation or artifact is an error rather than a
-// silent omission. That last part is what separates this from
+// The semantics are LoadAuthorization's, with one documented exception. A
+// template with no activation row yields a zero Version (the caller keeps its
+// static behaviour), and a malformed activation or artifact is an error rather
+// than a silent omission — that is what separates this from
 // ListAuthorizedTemplates, which skips a broken template because one bad row
-// must not empty an entire listing; here a broken row must fail the manifest
-// closed, exactly as the per-ID loop did.
+// must not empty an entire listing.
+//
+// The exception is a *disabled* pointer. The per-ID form returns
+// ErrRuntimeCatalogDisabled because an error is the only channel it has; here
+// that would fail every other template in the batch and push the caller back
+// onto one-ID-at-a-time reads for as long as an operator leaves one template
+// disabled. So it is reported as an entry whose Activation.Status is disabled,
+// and callers treat that as "not usable" — see RuntimeAuthorizationBatchStore.
 func (s *store) LoadAuthorizations(
 	ctx context.Context,
 	ids []cardtmpl.ID,
@@ -181,7 +187,7 @@ func (s *store) LoadAuthorizations(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	pointers, err := scanActivationPointers(ctx, tx, unique)
+	pointers, err := scanActivationPointers(ctx, tx, unique, failOnBrokenRow)
 	if err != nil {
 		return nil, err
 	}
@@ -193,23 +199,28 @@ func (s *store) LoadAuthorizations(
 		result := cardtmpl.RuntimeAuthorization{Grant: grants[id]}
 		if pointer, ok := pointers[id]; ok {
 			version, err := cardtmpl.ActivationVersion(id, pointer.activation)
-			if err != nil {
+			switch {
+			case errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled):
+				// A disabled pointer is one template's deliberate operator
+				// state, and it must stay one template's problem. Propagating
+				// it would fail the whole batch, and the caller's only recourse
+				// is to re-ask per ID — which is exactly the N round trips this
+				// method exists to avoid, for as long as that template stays
+				// disabled. The activation is recorded as it stands; the caller
+				// reads Status and decides, the same way the per-ID path lets
+				// it decide from the returned error.
+				result.Activation = pointer.activation
+			case err != nil:
 				return nil, err
-			}
-			result.Activation, result.Version = pointer.activation, version
-			if version != "" {
-				if version != pointer.version {
-					// The pointer moved between the two halves of one snapshot,
-					// which cannot happen inside REPEATABLE READ. Refuse rather
-					// than serve an artifact from a version nobody pointed at.
-					return nil, fmt.Errorf("%w: activation pointer disagrees with its joined artifact",
-						cardtmpl.ErrRuntimeCatalogIntegrity)
+			default:
+				result.Activation, result.Version = pointer.activation, version
+				if version != "" {
+					meta, err := buildRuntimeArtifactMeta(id, version, pointer.source, pointer.columns, pointer.blocked)
+					if err != nil {
+						return nil, err
+					}
+					result.Artifact = meta
 				}
-				meta, err := buildRuntimeArtifactMeta(id, version, pointer.source, pointer.columns, pointer.blocked)
-				if err != nil {
-					return nil, err
-				}
-				result.Artifact = meta
 			}
 		}
 		out[id] = result
@@ -247,10 +258,24 @@ const selectActivationPointersSQL = `SELECT act.template_id, act.active_version,
       ON a.template_id = c.template_id AND a.version = c.version
     WHERE act.template_id IN (`
 
+// integrityPolicy decides what a structurally broken activation or claim row
+// means to the reader that hit it. The two readers genuinely disagree, and that
+// disagreement is the only reason they are not one call: an authorization read
+// must fail rather than answer from a row it could not parse, while the
+// advertised set drops that one template so a single bad row cannot blank a
+// Bot's entire capability manifest.
+type integrityPolicy int
+
+const (
+	failOnBrokenRow integrityPolicy = iota
+	skipBrokenRow
+)
+
 func scanActivationPointers(
 	ctx context.Context,
 	tx *sql.Tx,
 	ids []cardtmpl.ID,
+	policy integrityPolicy,
 ) (map[cardtmpl.ID]activationPointer, error) {
 	query, args := inListQuery(selectActivationPointersSQL, ids)
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -272,11 +297,17 @@ func scanActivationPointers(
 		}
 		activation, err := buildRuntimeActivation(activeVersion, status, revision)
 		if err != nil {
+			if policy == skipBrokenRow {
+				continue
+			}
 			return nil, err
 		}
 		if activeVersion.Valid && activeVersion.String != "" && !source.Valid {
 			// An active pointer whose claim row is missing is the integrity
 			// failure scanRuntimeArtifactMeta reports as an unknown template.
+			if policy == skipBrokenRow {
+				continue
+			}
 			return nil, fmt.Errorf("%w: %s@%s", cardtmpl.ErrTemplateUnknown, templateID, activeVersion.String)
 		}
 		out[cardtmpl.ID(templateID)] = activationPointer{
@@ -527,27 +558,11 @@ func (s *store) ListAuthorizedTemplates(
 	return results, nil
 }
 
-// selectActiveAuthorizationsSQL resolves the active pointer and its artifact
-// for a bounded set of template IDs in one pass. The inner join on
-// active_version does the same filtering the per-template loop did by
-// discarding absent and disabled pointers: a disabled row has a NULL
-// active_version and joins to nothing, and a template with no activation row
-// simply does not appear.
-const selectActiveAuthorizationsSQL = `SELECT act.template_id, act.active_version, act.status, act.revision,
-        c.source, a.owner, a.visibility, a.engine_contract, a.protocol,
-        a.contract_version, a.content_sha256, a.blocked_at IS NOT NULL
-    FROM card_template_activation act
-    JOIN card_template_version_claim c
-      ON c.template_id = act.template_id AND c.version = act.active_version
-    LEFT JOIN card_template_artifact a
-      ON a.template_id = c.template_id AND a.version = c.version
-    WHERE act.template_id IN (`
-
-// loadActiveAuthorizations completes the snapshot for every candidate at once.
-// A pointer or artifact that is absent, disabled or malformed is omitted rather
-// than reported: the template simply is not advertisable right now, which is a
-// different thing from the read having failed. That is the same rule the
-// single-template path applies, so the two cannot drift.
+// loadAdvertisableAuthorizations keeps only the candidates that are advertisable
+// right now. It shares the batch read and the shape validation with
+// LoadAuthorizations and differs only in policy: a pointer that is absent,
+// disabled or structurally broken drops that one template instead of failing
+// the listing.
 func loadAdvertisableAuthorizations(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -558,42 +573,16 @@ func loadAdvertisableAuthorizations(
 	if len(ids) == 0 {
 		return out, nil
 	}
-	args := make([]any, 0, len(ids))
-	placeholders := make([]string, 0, len(ids))
-	for _, id := range ids {
-		placeholders = append(placeholders, "?")
-		args = append(args, string(id))
-	}
-	rows, err := tx.QueryContext(ctx, selectActiveAuthorizationsSQL+strings.Join(placeholders, ",")+")", args...)
+	pointers, err := scanActivationPointers(ctx, tx, ids, skipBrokenRow)
 	if err != nil {
-		return nil, fmt.Errorf("card template catalog: load active authorizations: %w", err)
+		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var templateID, status string
-		var version sql.NullString
-		var revision uint64
-		var source string
-		var columns artifactMetaColumns
-		var blocked bool
-		if err := rows.Scan(&templateID, &version, &status, &revision, &source,
-			&columns.owner, &columns.visibility, &columns.engine, &columns.protocol,
-			&columns.contractVersion, &columns.hash, &blocked); err != nil {
-			return nil, fmt.Errorf("card template catalog: scan active authorization: %w", err)
-		}
-		id := cardtmpl.ID(templateID)
-		activation, err := buildRuntimeActivation(version, status, revision)
-		if err != nil {
-			if errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
-				continue
-			}
-			return nil, err
-		}
-		activeVersion, err := cardtmpl.ActivationVersion(id, activation)
-		if err != nil || activeVersion == "" {
+	for id, pointer := range pointers {
+		version, err := cardtmpl.ActivationVersion(id, pointer.activation)
+		if err != nil || version == "" {
 			continue
 		}
-		meta, err := buildRuntimeArtifactMeta(id, activeVersion, source, columns, blocked)
+		meta, err := buildRuntimeArtifactMeta(id, version, pointer.source, pointer.columns, pointer.blocked)
 		if err != nil {
 			if errors.Is(err, cardtmpl.ErrTemplateUnknown) || errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
 				continue
@@ -601,11 +590,8 @@ func loadAdvertisableAuthorizations(
 			return nil, err
 		}
 		out[id] = cardtmpl.RuntimeAuthorization{
-			Activation: activation, Version: activeVersion, Artifact: meta, Grant: grants[id],
+			Activation: pointer.activation, Version: version, Artifact: meta, Grant: grants[id],
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("card template catalog: iterate active authorizations: %w", err)
 	}
 	return out, nil
 }
