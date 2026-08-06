@@ -8,6 +8,7 @@ package card_template_catalog
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -285,4 +286,27 @@ func TestGrantRevokeFlow(t *testing.T) {
 		"/docs.access-request/grants/internal_producer/ghost",
 		`{"scope_space_id":"","expected_revision":0,"reason":"noop","change_ticket":"CHG-13"}`)
 	assertCatalogError(t, response, "err.server.card_template_catalog.grant_invalid", http.StatusBadRequest)
+}
+
+// The production principal check is the composition-root implementation of the
+// hook the test above stubs. Its bot / internal_producer / space arms each need
+// a live server context, but its default arm does not — and that arm is the one
+// that must never be reached by accident. A principal type the switch does not
+// recognize has to be rejected outright: falling through to "no scope, nothing
+// to check, return nil" would grant a principal nobody can name.
+func TestProductionGrantPrincipalCheckRejectsAnUnknownPrincipalType(t *testing.T) {
+	api := &API{}
+	err := api.productionGrantPrincipalCheck(context.Background(), GrantIdentity{
+		TemplateID: "docs.access-request", PrincipalType: "operator", PrincipalID: "someone",
+	})
+	if !errors.Is(err, ErrGrantRequestInvalid) {
+		t.Fatalf("err = %v, want ErrGrantRequestInvalid", err)
+	}
+	// The empty principal type is the shape a partly-decoded request produces;
+	// it must land in the same place rather than in a nil-typed arm.
+	if err := api.productionGrantPrincipalCheck(context.Background(), GrantIdentity{
+		TemplateID: "docs.access-request", PrincipalID: "someone",
+	}); !errors.Is(err, ErrGrantRequestInvalid) {
+		t.Fatalf("empty principal type err = %v, want ErrGrantRequestInvalid", err)
+	}
 }

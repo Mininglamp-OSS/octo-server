@@ -192,8 +192,61 @@ func (ba *BotAPI) botSendCatalogPrincipal(
 		}
 		return ba.botCatalogPrincipalForGroup(robotID, parts[0])
 	default:
-		return ba.botCatalogPrincipalFor(c, robotID)
+		// A DM has no target row to read a Space from, so the Bot's own context
+		// supplies it — but the peer has to actually be in that Space. D6 asks
+		// for *both* principals to be valid members: without the peer check a
+		// Bot could use its own Space's grant to deliver a card to somebody
+		// outside that Space, which is a cross-tenant delivery dressed up as a
+		// DM.
+		principal := ba.botCatalogPrincipalFor(c, robotID)
+		if !principal.SpaceResolved {
+			return principal
+		}
+		return ba.requireDMPeerInSpace(principal, channelID, robotID)
 	}
+}
+
+// requireDMPeerInSpace downgrades the principal to unresolved unless the DM's
+// peer holds an active membership in the resolved Space. Downgrading rather
+// than erroring keeps the static path working: what is withheld is the dynamic
+// overlay, which is the only thing the Space was needed for.
+func (ba *BotAPI) requireDMPeerInSpace(
+	principal botCatalogPrincipal,
+	channelID, robotID string,
+) botCatalogPrincipal {
+	peer := strings.TrimSpace(dmPeerUID(channelID, robotID))
+	if peer == "" {
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	querier := ba.spaceQuerierOrDefault()
+	if querier == nil {
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	member, err := querier.isUserSpaceMember(peer, principal.SpaceID)
+	if err != nil {
+		ba.Warn("bot_grant_dm_peer_lookup_failed",
+			zap.String("robotID", robotID), zap.String("spaceID", principal.SpaceID), zap.Error(err))
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	if !member {
+		ba.Warn("bot_grant_dm_peer_outside_space",
+			zap.Bool("dm_peer_outside_space", true),
+			zap.String("robotID", robotID), zap.String("spaceID", principal.SpaceID))
+		return botCatalogPrincipal{BotID: robotID}
+	}
+	return principal
+}
+
+// dmPeerUID extracts the other side of a personal DM channel. WuKongIM routes
+// person channels by the peer's bare uid, so for a Bot-initiated DM the channel
+// ID is the recipient; the guard against a self-channel keeps a malformed
+// request from being read as "the Bot is its own peer".
+func dmPeerUID(channelID, robotID string) string {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" || channelID == strings.TrimSpace(robotID) {
+		return ""
+	}
+	return channelID
 }
 
 func (ba *BotAPI) botCatalogPrincipalForGroup(robotID, groupNo string) botCatalogPrincipal {

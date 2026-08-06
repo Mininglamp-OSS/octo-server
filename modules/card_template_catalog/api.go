@@ -48,7 +48,10 @@ type API struct {
 	controlEnabled         bool
 	// discovery overrides the B1/B2 read surface in tests. Production leaves it
 	// nil and type-asserts the shared store, so there is one read model.
-	discovery     discoveryStore
+	discovery discoveryStore
+	// staticEntries overrides the frozen Registry listing in tests; see
+	// API.staticCatalog. Production leaves it nil.
+	staticEntries func() []cardtmpl.StaticCatalogEntry
 	registry      *cardtmpl.Registry
 	readiness     *runtimeCatalogReadiness
 	startupMu     sync.Mutex

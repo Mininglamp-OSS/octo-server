@@ -244,3 +244,58 @@ func TestStoreLoadAuthorizationReportsBlockAndUnknownFromTheSnapshotRealMySQL(t 
 		t.Fatalf("unknown pinned version error = %v, want ErrTemplateUnknown", err)
 	}
 }
+
+// runtimeAuthorizationSource is the seam every consumer outside this module
+// reads grants through — the Bot capability manifest chiefly. Two things about
+// it are load-bearing and neither is visible from the store alone: it must
+// answer from the same store the runtime resolves against (a second reader
+// would be a second grant truth), and NewSendEnabled must come from the
+// deployment gate rather than from the data, so a dark deployment answers
+// "no new-send" without acquiring the DB dependency it did not have before
+// PR-C.
+func TestRuntimeAuthorizationSourceReadsTheStoreAndTheGateRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	seedAuthorizationTarget(t, db, "1.0.0")
+	catalogStore := newStore(db)
+	identity := authorizationIntegrationIdentity()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := catalogStore.UpsertGrant(ctx, UpsertGrantRequest{
+		Identity: identity, Permissions: GrantPermissions{Discover: true, Send: true},
+		ActorUID: "admin-1", Reason: "pilot", ChangeTicket: "CHG-A4",
+	}); err != nil {
+		t.Fatalf("seed grant: %v", err)
+	}
+
+	dark := &runtimeAuthorizationSource{store: catalogStore, gates: runtimeCatalogGates{}}
+	if dark.NewSendEnabled() {
+		t.Fatal("a gated-off deployment reported new-send as enabled")
+	}
+	live := &runtimeAuthorizationSource{
+		store: catalogStore,
+		gates: runtimeCatalogGates{controlEnabled: true, newSendEnabled: true},
+	}
+	if !live.NewSendEnabled() {
+		t.Fatal("an enabled deployment reported new-send as dark")
+	}
+
+	// The grant the source reports must be the grant the store holds, down to
+	// the permission bits — this is the read the capability manifest trusts.
+	auth, err := live.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: authorizationIntegrationTemplateID, Principal: authorizationIntegrationPrincipal(),
+	})
+	if err != nil {
+		t.Fatalf("source LoadAuthorization: %v", err)
+	}
+	if !auth.Grant.Found || !auth.Grant.Send {
+		t.Fatalf("source grant = %+v", auth.Grant)
+	}
+
+	advertised, err := live.ListAuthorizedTemplates(ctx, authorizationIntegrationPrincipal(), 10)
+	if err != nil {
+		t.Fatalf("source ListAuthorizedTemplates: %v", err)
+	}
+	if len(advertised) != 1 || advertised[0].ID != authorizationIntegrationTemplateID {
+		t.Fatalf("source advertised %+v", advertised)
+	}
+}

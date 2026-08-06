@@ -4,6 +4,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
+	"strings"
 )
 
 type botAPIDB struct {
@@ -244,4 +245,27 @@ func (d *botAPIDB) queryGroupSpaceID(groupNo string) (string, error) {
 		return "", dbr.ErrNotFound
 	}
 	return spaceIDs[0], nil
+}
+
+// isUserSpaceMember reports whether a plain user holds an active membership in
+// an active Space.
+//
+// It is deliberately narrower than isBotSpaceAuthorized: that rule also honours
+// platform App Bots, which are visible in every Space by construction. A human
+// recipient has no such blanket visibility, so a DM's peer is checked against
+// space_member alone.
+func (d *botAPIDB) isUserSpaceMember(uid, spaceID string) (bool, error) {
+	if strings.TrimSpace(uid) == "" || strings.TrimSpace(spaceID) == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id "+
+			"WHERE sm.uid=? AND sm.space_id=? AND sm.status=1 AND s.status=1",
+		uid, spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

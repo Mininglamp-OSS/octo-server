@@ -644,3 +644,74 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 		t.Fatal("a frame moved to another Space was accepted")
 	}
 }
+
+// D6 requires *both* DM principals to be valid members of the Space a dynamic
+// send is authorized against. Checking only the Bot would let its own Space's
+// grant deliver a card to somebody outside that Space — a cross-tenant delivery
+// wearing a DM's clothes.
+func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
+	dm := common.ChannelTypePerson.Uint8()
+	for _, test := range []struct {
+		name       string
+		querier    *fakeSpaceQuerier
+		peer       string
+		wantSpace  string
+		wantResolv bool
+	}{
+		{
+			name: "peer in the Bot's Space authorizes the send",
+			querier: &fakeSpaceQuerier{
+				multiRows:    map[string][]string{"bot-42": {"space-1"}},
+				memberSpaces: map[string]map[string]bool{"user-in": {"space-1": true}},
+			},
+			peer: "user-in", wantSpace: "space-1", wantResolv: true,
+		},
+		{
+			name: "peer outside the Space withholds the dynamic overlay",
+			querier: &fakeSpaceQuerier{
+				multiRows:    map[string][]string{"bot-42": {"space-1"}},
+				memberSpaces: map[string]map[string]bool{"user-in": {"space-1": true}},
+			},
+			peer: "user-elsewhere", wantResolv: false,
+		},
+		{
+			name: "a peer membership lookup failure refuses rather than assumes",
+			querier: &fakeSpaceQuerier{
+				multiRows:      map[string][]string{"bot-42": {"space-1"}},
+				memberSpaceErr: errors.New("db unavailable"),
+			},
+			peer: "user-in", wantResolv: false,
+		},
+		{
+			name: "a self-addressed channel is not a peer",
+			querier: &fakeSpaceQuerier{
+				multiRows:    map[string][]string{"bot-42": {"space-1"}},
+				memberSpaces: map[string]map[string]bool{"bot-42": {"space-1": true}},
+			},
+			peer: "bot-42", wantResolv: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ba := newTestBotAPIWithCatalog(t, test.querier, &stubAuthorizationSource{newSend: true})
+			got := ba.botSendCatalogPrincipal(newGrantSpaceContext(t, ""), "bot-42", test.peer, dm)
+			if got.SpaceResolved != test.wantResolv || got.SpaceID != test.wantSpace {
+				t.Fatalf("DM principal = %+v, want space=%q resolved=%v",
+					got, test.wantSpace, test.wantResolv)
+			}
+		})
+	}
+}
+
+// With the catalog dark the peer is never consulted either — the whole point of
+// the gate is that a gates-off deployment issues no new queries.
+func TestDMPeerCheckIsSkippedWhenTheCatalogIsDark(t *testing.T) {
+	querier := &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1"}}}
+	ba := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: false})
+	if got := ba.botSendCatalogPrincipal(newGrantSpaceContext(t, ""), "bot-42",
+		"user-in", common.ChannelTypePerson.Uint8()); got.SpaceResolved {
+		t.Fatalf("dark catalog resolved a DM Space: %+v", got)
+	}
+	if len(querier.calls) != 0 {
+		t.Fatalf("dark catalog queried %v", querier.calls)
+	}
+}

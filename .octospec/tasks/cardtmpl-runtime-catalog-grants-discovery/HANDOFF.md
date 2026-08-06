@@ -379,12 +379,13 @@ marshal, and the two intentional Space/middleware duplications).
 
 Landed (`feat: add the controlled docs catalog pilot`):
 
-- `[new] modules/card_template_catalog/testdata/pilot/docs.access-request@0.4.0-pilot.20260805/bundle.json`
+- `[new] modules/card_template_catalog/testdata/pilot/docs.pilot-access-request@0.4.0-pilot.20260805/bundle.json`
   — owner `docs`, producer `internal_producer/docs-notify`, the existing
   `docs/access_request.decision` RouteSpec, visibility private, and an
   `export.samples` allowlist with one synthetic sample so the B2 export path is
-  actually exercised. Same template ID as the static card, new prerelease exact
-  version: that is what makes the shadow behaviour observable.
+  actually exercised. The ID is dedicated to the pilot (see the second-review
+  entry below: it originally reused the live `docs.access-request` ID, which
+  would have made activation reject every real access-request card).
 - `[new] modules/card_template_catalog/testdata/pilot/README.md` — states in one
   place that the fixture is publish input only: not registered, not embedded,
   not an activation, not permission to open the production gates.
@@ -500,6 +501,61 @@ WuKongIM (`card_template_catalog`, `bot_api`, `notify`, `message`,
 `test` schema — module sets differ, so two packages sharing one make sql-migrate
 report "unknown migration in database" — and `modules/robot` needs a 32-byte
 `OCTO_MASTER_KEY`.
+
+### Post-review coverage and the DM half of D6
+
+Cross-checking the brief against the branch surfaced two gaps that neither
+review caught, because both are about code that was never executed rather than
+code that was wrong.
+
+- **D6 covered group and thread targets but not DM.** `botSendCatalogPrincipal`
+  resolved the authoritative Space from the group row or the thread parent, and
+  fell back to the Bot's own Space for a personal target without checking that
+  the peer is in it. A Bot in two Spaces could therefore send a card authorized
+  against Space A to a peer who is only in Space B. `requireDMPeerInSpace` now
+  downgrades the principal to unresolved when the peer is not a member or the
+  lookup fails, and a self-addressed channel is refused outright
+  (`isUserSpaceMember` in `db.go`, narrower than `isBotSpaceAuthorized`: it is
+  a `space_member ⨝ space` test and deliberately does not honour the platform
+  App Bot rule, which is about Bots rather than about human peers). The check
+  is skipped entirely when the dynamic catalog is dark, so a gates-off
+  deployment still acquires no new DB dependency on the send path.
+- **The `card_template_catalog` handlers had no handler-level tests**, and the
+  discovery store's central promise — filtering before paging — had no
+  real-MySQL evidence. `[new] api_discovery_handler_test.go` drives B1/B2
+  directly (pagination, the not-found equivalence class, ETag/304 with an empty
+  body, the private cache directive, the manager index and its superAdmin gate),
+  and `[new] store_discovery_mysql_integration_test.go` walks the whole listing
+  at several page sizes against seeded public/private/granted/blocked/tombstoned
+  rows. The interleaving in that fixture is the point: a hidden row sits between
+  two visible ones, so post-filtering would show up as a short page rather than
+  as a merely reordered result. Both were mutation-checked — dropping the
+  visibility predicate makes the walk fail. Package coverage 65.9% → 80.4%.
+
+Fixing the 304 gap also changed production code: `c.Status` only records the
+code and leaves the write to the framework, so "304 with no body" depended on
+the caller's plumbing. `writeExport` now calls `WriteHeaderNow`.
+
+## Pre-merge operational prerequisites
+
+Two acceptance items in `brief.md` are environmental and cannot be discharged
+from a single-container checkout. They are prerequisites for merge, not
+leftovers, and each needs an operator to record the result:
+
+1. **Multi-replica grant convergence.** Prove that after a grant or revoke, a
+   replica with a cold cache and a replica with a hot cache converge on the same
+   answer within the configured TTL, and that the revoking replica is denied
+   immediately. Single-process tests cover the linearization point inside one
+   snapshot; they cannot cover the cache-invalidation window between replicas,
+   which is the only place a revoked grant can still be honoured.
+2. **The pilot on the dedicated non-production environment.** The D7 loop in
+   `pilot_mysql_integration_test.go` must run with `OCTO_PILOT_CATALOG_DSN`
+   pointing at that deployment's catalog database, so the exact-version preflight
+   interrogates real claims. Run against a per-test database the preflight is
+   theatre — it was, until the second review — and the test says so out loud
+   when the variable is unset.
+
+Neither authorizes production activation; the gates stay false either way.
 
 ## Review and commit boundaries
 

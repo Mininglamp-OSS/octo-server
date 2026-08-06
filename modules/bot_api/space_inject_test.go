@@ -62,6 +62,19 @@ type fakeSpaceQuerier struct {
 	// default rather than something a test has to opt into.
 	groupSpaces   map[string]string
 	groupSpaceErr error
+	// memberSpaces answers the DM peer membership check, keyed uid -> spaceID.
+	memberSpaces   map[string]map[string]bool
+	memberSpaceErr error
+}
+
+// PR-C: memberSpaces[uid][spaceID] answers the DM peer check. An absent entry
+// means "not a member", so a test opts a peer in rather than out.
+func (f *fakeSpaceQuerier) isUserSpaceMember(uid, spaceID string) (bool, error) {
+	f.calls = append(f.calls, "isUserSpaceMember:"+uid+":"+spaceID)
+	if f.memberSpaceErr != nil {
+		return false, f.memberSpaceErr
+	}
+	return f.memberSpaces[uid][spaceID], nil
 }
 
 func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, error) {

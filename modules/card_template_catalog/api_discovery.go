@@ -426,7 +426,11 @@ func (a *API) writeExport(
 	etag := `"` + etagSource + `"`
 	c.Header("ETag", etag)
 	if matchesETag(c.GetHeader("If-None-Match"), etag) {
+		// Flush explicitly. c.Status only records the code and leaves the write
+		// to whenever the framework gets around to it, which makes "304 with no
+		// body" depend on the caller's plumbing rather than on this handler.
 		c.Status(http.StatusNotModified)
+		c.Writer.WriteHeaderNow()
 		return
 	}
 	c.Response(export)
@@ -519,7 +523,7 @@ func (a *API) managerList(c *wkhttp.Context) {
 	if !a.requireSuperAdmin(c) {
 		return
 	}
-	store, ok := a.store.(managerTemplateStore)
+	store, ok := a.managerTemplateStore()
 	if !ok {
 		respondCatalogUnavailable(c)
 		return
@@ -548,6 +552,22 @@ func (a *API) managerList(c *wkhttp.Context) {
 	c.Response(response)
 }
 
+// managerTemplateStore resolves the operator index reader. It prefers the test
+// seam for the same reason discoveryStore does: a handler test should not have
+// to stand up the publish store to assert a projection.
+func (a *API) managerTemplateStore() (managerTemplateStore, bool) {
+	if a == nil {
+		return nil, false
+	}
+	if a.discovery != nil {
+		if store, ok := a.discovery.(managerTemplateStore); ok {
+			return store, true
+		}
+	}
+	store, ok := a.store.(managerTemplateStore)
+	return store, ok
+}
+
 // discoveryStore returns the read surface, or false when this API has no store
 // that implements it. Failing closed matters more than degrading: a listing
 // that silently returned only static templates would look like a complete
@@ -565,8 +585,19 @@ func (a *API) discoveryStore() (discoveryStore, bool) {
 
 // staticCatalog lists the frozen Registry. An API constructed without one (as
 // some focused tests are) simply has no static half.
+//
+// staticEntries is a test seam. The frozen Registry is built from embedded
+// template assets that this package does not carry, so without it the static
+// half of pagination — including the rule that a hidden row must not advance
+// the cursor — would have no coverage at all.
 func (a *API) staticCatalog() []cardtmpl.StaticCatalogEntry {
-	if a == nil || a.registry == nil {
+	if a == nil {
+		return nil
+	}
+	if a.staticEntries != nil {
+		return a.staticEntries()
+	}
+	if a.registry == nil {
 		return nil
 	}
 	return a.registry.StaticCatalog()

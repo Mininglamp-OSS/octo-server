@@ -73,6 +73,7 @@ type botSpaceQuerier interface {
 	querySpaceIDsByRobotID(robotID string) (string, []string, error)
 	isBotSpaceAuthorized(robotID, spaceID string) (bool, error)
 	queryGroupSpaceID(groupNo string) (string, error)
+	isUserSpaceMember(uid, spaceID string) (bool, error)
 }
 
 // enrichBotPayloadWithSpaceID 在 PERSONAL DM 派发前用 Bot 的权威 SpaceID 覆盖
