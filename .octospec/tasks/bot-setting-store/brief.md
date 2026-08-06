@@ -116,13 +116,17 @@ owner 读与 adapter 读分属两个模块）。
   具体原因只进日志（防枚举）。
   用户 ingress 与 robot 的 `message/edit` 无需加门：前者无条件拒卡，后者经
   `cardmsg.RejectsCardEdit` 拒绝一切卡片编辑。
-  **「三个」是本任务的口径，不是已证实的全仓完备性**（round-7 评审）：
+  **第四条路径 `stream/start`：拒卡，而不是补门**（round-7 评审阻塞项）：
   `POST /v1/robots/:robot_id/:app_key/stream/start` 把 `Payload []byte` 原样转给
-  WuKongIM，没有形状校验、没有 `allowSendToChannel`、也没有用已鉴权的 `robot_id`
-  覆盖调用方传入的 `from_uid`。该 handler 与 merge-base 逐字节相同、本任务一行未碰，
-  但它是否算第四个卡片入口取决于「客户端会不会把 stream payload 渲染成卡片」——这个
-  事实本仓答不出。**在它被 triage 之前，本条不得被读作「全仓卡片入口已枚举完毕」。**
-  详见 journal 的 known-gaps。
+  WuKongIM，没有任何形状校验与本任务的门。它与 merge-base 逐字节相同，但只要它能发出
+  `type:17`，上面那句「每条已鉴权的发卡路径都按有效配置校验」就是假的。现在在
+  `BindJSON` 之后直接 `cardmsg.IsCardRawPayload` 拒绝。
+  **拒绝而非补门是刻意的**：补门要在这条路上重建形状校验、URL 白名单、节点/深度上限与
+  profile 协商，等于把 `sendMessage` 的流水线复制一遍，也就再造一处会漂移的判定；而流式
+  消息的用途是增量文本，卡片有 `sendMessage` 与模板 `message/edit` 两条正规入口。
+  **该 handler 另外两个先于本任务存在的问题不在本任务范围，也不该被这道门掩盖**：缺少
+  `allowSendToChannel`，以及 `from_uid` 由调用方指定而非取自已鉴权的 `robot_id`（冒充
+  类，评审认为比卡片那条更严重）。详见 journal 的 known-gaps。
 - **关闭只拦模板卡的续帧，不拦 raw 卡的改写**（round-1 评审后修订）：`sendMessage`
   全量加门；`botMessageEdit` 的**模板分支**不加门——流式推理卡必须能编辑到终态，
   否则线上残留「永久处理中」的卡。但**raw 分支必须加门**：`cardmsg.Validate` 接受

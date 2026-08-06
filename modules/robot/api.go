@@ -487,6 +487,49 @@ func (rb *Robot) streamStart(c *wkhttp.Context) {
 		return
 	}
 
+	// 流式入口一律不接受卡片 payload（task bot-setting-store，round-7 评审阻塞项）。
+	//
+	// 本 handler 把 req.Payload（裸 []byte）原样转给 WuKongIM：没有 payloadIsVail、
+	// 没有 cardmsg.Validate、没有 BotEnabled() 总闸、也没有 per-Bot 门。于是 owner 关掉
+	// 展示/交互卡之后，同一个 Bot 换这个端点仍能把 type:17 送出去——本任务对外承诺的是
+	// 「每条已鉴权的发卡路径都按有效配置校验」，少一条这个承诺就是假的。
+	//
+	// 这里**拒绝**而不是补一套完整门禁，是刻意的：补门意味着要在这条路上重建形状校验、
+	// URL 白名单、节点/深度上限与 profile 协商，那是把 sendMessage 的整条流水线复制一遍；
+	// 而流式消息的用途是增量文本，卡片有 sendMessage 与模板 message/edit 两条正规入口，
+	// 没有理由从这里发。拒绝让承诺变真，且不新增一套会和 sendMessage 漂移的判定。
+	//
+	// 本 handler 另有两个**先于本任务存在**的问题不在这里处理，也不该被这道门掩盖：
+	// 缺少 allowSendToChannel，以及 req.FromUID 由调用方指定而非取自已鉴权的 robot_id
+	// （冒充类）。它们与 merge-base 逐字节相同，详见 journal 的 known-gaps。
+	robotID := c.Param("robot_id")
+	if cardmsg.IsCardRawPayload(req.Payload) {
+		rb.Warn("stream/start 不接受卡片 payload，已拒绝", zap.String("robot_id", robotID))
+		respondRobotContentInvalid(c, "payload")
+		return
+	}
+
+	// 身份与频道对齐同组的 sendMessage / typing（round-7 评审阻塞项）。
+	//
+	// FromUID 此前直接取调用方传入的值。同一个 robotAuth 组里，sendMessage 把它钉成
+	// c.Param("robot_id")，typing 同理——只有本 handler 是例外，于是一个已鉴权的 Bot 能
+	// 以**任意 uid** 的身份开流。鉴权解决的是「你是谁」，这里却让请求体决定「你说你是谁」，
+	// 两者不一致时冒充就成立。评审判定这条比卡片那条更重，且与客户端是否渲染卡片无关。
+	//
+	// allowSendToChannel 同理：sendMessage 与 typing 都查，本 handler 不查，于是 Bot 能
+	// 往它并非成员的群开流。两处都不是新增策略，是把这条路补回同组既有口径。
+	// 先钉身份，再拿**钉过之后的 req.FromUID** 去查频道权限——不是拿旁边的 robotID。
+	// 两者此刻等值，但校验的必须是真正会被派发的那个字段：若哪天钉住被删或被移到后面，
+	// 用 robotID 校验会让频道门继续看到正确身份、而 IM 收到伪造身份，门就成了摆设。
+	// 一个变量走到底，这种漂移就不可能发生。
+	req.FromUID = robotID
+	if !rb.allowSendToChannel(req.FromUID, req.ChannelID, req.ChannelType) {
+		rb.Warn("robot 无权向该频道开流",
+			zap.String("robot_id", robotID), zap.String("channel_id", req.ChannelID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
+		return
+	}
+
 	// 解散守卫：群或子区解散后禁止开始流式消息
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
 		if disbanded, err := rb.isGroupDisbanded(req.ChannelID); err != nil {

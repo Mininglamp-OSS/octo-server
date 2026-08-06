@@ -279,6 +279,18 @@ Two smaller ones fixed alongside, both also mine from round 3 or earlier:
   amended at the time; the comments were not. Both now state display-as-floor and
   point at the shared predicates.
 
+**A fourth inert test, caught by the revert discipline rather than by review.**
+The first `from_uid` regression test passed with the pin deleted. The handler
+pinned `req.FromUID = robotID` and then called `allowSendToChannel(robotID, …)`
+— checking a *parallel variable* rather than the field it had just assigned — so
+the stub recorded the right uid whether or not the pin existed. The test observed
+something that could not vary. Fixed on both sides: the handler now checks
+`req.FromUID` after pinning it, so one variable carries identity end to end, and
+the test discriminates. The general form is worth naming because it is not the
+same as the earlier three: **an assertion on a value that is correct for a reason
+other than the one under test is inert**, and the only reliable detector is
+deleting the fix and watching the test go red.
+
 **The generalisable rule, after three instances of it.** Round 1 was a sibling
 path (the raw edit branch), round 2 a sibling consumer (the manifest), rounds 3
 and 6 a sibling *function* reading the same column. Every one was found by
@@ -314,21 +326,31 @@ intended, because a per-party test passes fine while they disagree.
   contradiction relocated to the owner surface. Needs an explicit decision
   (dominate `effective_value`, or document this as the pre-master-switch tier),
   not another round of implicit.
-- **The "three card producer ingresses" claim may be wrong, and this branch's
-  design rests on it.** `POST /v1/robots/:robot_id/:app_key/stream/start`
-  (`modules/robot/api.go:482`) binds a request whose `Payload` is a raw `[]byte`
-  and hands it straight to `IMStreamStart`. No `payloadIsVail`, no
-  `IsCardPayload`, no `cardmsg.Validate`, no `BotEnabled()`, no per-bot gate —
-  and, unlike the sibling `typing` handler, no `allowSendToChannel` and no
-  override of `req.FromUID` with the authenticated `robot_id` from the path. So
-  on its face an authenticated bot can start a stream carrying a `type:17`
-  payload under an arbitrary `from_uid`. **Entirely pre-existing; this diff does
-  not touch that handler.** What decides whether it is a stale comment or a real
-  bypass is one fact not answerable from this repo: do the clients render a
-  stream payload as a card? Recorded here rather than as an issue by explicit
-  instruction — which means this paragraph is the only record, so whoever picks
-  up the follow-ups should start here. The claim it undermines is asserted in
-  both `payloadIsVail`'s comment and the brief's load-bearing list.
+- **`stream/start` — card path closed, two pre-existing holes still open.**
+  Review found a fourth authenticated path: `streamStart`
+  (`modules/robot/api.go:482`) hands a raw `[]byte` `Payload` straight to
+  `IMStreamStart` with no shape validation and none of this task's gates, so a
+  bot could still emit `type:17` after its owner disabled cards. Two reviewers
+  agreed on every fact and split on scope — one blocked (the PR ships a
+  guarantee it does not deliver), one verified the handler is byte-identical to
+  the merge-base and argued it belongs in its own security issue. **Resolved by
+  taking the narrow half**: the handler now refuses card payloads outright
+  (`cardmsg.IsCardRawPayload`), which makes the guarantee true without rebuilding
+  the whole `sendMessage` pipeline on a path whose purpose is incremental text.
+  Refusing rather than gating is the point — a second full validation pipeline is
+  a second thing to drift.
+  **The identity half turned out to be the real blocker, and is now also fixed.**
+  The card refusal alone did not satisfy the blocking review: it separated the
+  two and called the forgeable `from_uid` "a real authorization-symmetry gap
+  independent of card rendering", with "documenting the gap does not close" it.
+  Correct — `sendMessage` and `typing` in the same `robotAuth` group both pin
+  `FromUID` to `c.Param("robot_id")` and both call `allowSendToChannel`;
+  `streamStart` was the lone exception, so auth answered "who are you" while the
+  body got to overwrite "who you say you are". Both are now aligned with the
+  siblings.
+  Remaining on that handler: no `payloadIsVail`/`Validate` for non-card payloads,
+  i.e. it is still the one ingress without shape validation. Deliberate — see the
+  brief for why refusing cards beats rebuilding the pipeline here.
 - **`TestBotMessageEdit_StillReachesTerminalStateWhenReasoningOff` is inert.**
   It injects a `stubCardConfig` with every sub-switch off, but
   `botMessageEditViaRegistry` never calls `resolveBotCardConfig`, so the stub
