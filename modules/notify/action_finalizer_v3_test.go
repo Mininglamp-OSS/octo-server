@@ -8,6 +8,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
@@ -268,5 +269,109 @@ func TestDocsActionFinalizerRejectsForeignStoredTemplate(t *testing.T) {
 	}
 	if updater.calls != 0 {
 		t.Fatalf("foreign identity still edited the card: %d calls", updater.calls)
+	}
+}
+
+// PR-C review round 6 (yujiawei P1-2): a cancelled result must not downgrade a
+// marked card to the legacy rebuild.
+//
+// The pending card is a Registry render, so it carries the server-authored
+// catalog markers. buildTerminalEnvelope assembles a replacement from a fixed
+// six-key allowlist that includes neither, and the marker-preserving branch was
+// taken only for approved/denied — so an ordinary user click on a route that
+// answers `cancelled` erased both markers. Both identity guards in
+// pkg/cardtmpl/updater.go begin `if markers.Has…`, so they went inert for that
+// message, and the frame silently rejoined the legacy population.
+//
+// The absence of any test for a non-terminal finalizer state is why this was
+// invisible for six rounds.
+func TestDocsActionFinalizerRoutesCancelledThroughTheRegistry(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	updater := &captureViewUpdater{}
+	legacyMutator := &captureCardMutator{}
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 43, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1002", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
+		Data: map[string]any{
+			"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
+			"permission_label": "Access", "permission_role_label": "Editor", "source_name": "Docs",
+		},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied,
+		State:       cardactiondispatch.StateCancelled,
+		Display:     map[string]string{"title": "Roadmap"},
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize(cancelled): %v", err)
+	}
+	if len(legacyMutator.requests) != 0 {
+		t.Fatalf("cancelled took the marker-erasing legacy path: %+v", legacyMutator.requests)
+	}
+	if updater.calls != 1 {
+		t.Fatalf("registry replacement calls = %d, want 1", updater.calls)
+	}
+	if updater.id != docsaccessrequest.TemplateID || updater.version != docsaccessrequest.TemplateVersionV3 ||
+		updater.state != docsaccessrequest.StateCancelled {
+		t.Fatalf("update selection = %s@%s/%s", updater.id, updater.version, updater.state)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(updater.fields, &fields); err != nil {
+		t.Fatalf("decode fields: %v", err)
+	}
+	if fields["state"] != "cancelled" {
+		t.Fatalf("wire state = %v", fields["state"])
+	}
+	// Nobody decided a cancelled request, so it carries no operator: emitting
+	// one would put the generic approver placeholder on a card no one acted on.
+	if _, present := fields["decision"]; present {
+		t.Fatalf("cancelled result invented a decision: %+v", fields["decision"])
+	}
+}
+
+// The template must actually be able to render what the finalizer now asks of
+// it — a state the manifest does not declare fails ViewFor with ErrStateUnknown,
+// which would turn the fix above into a runtime error instead of a card.
+func TestDocsAccessRequestV3RendersTheCancelledState(t *testing.T) {
+	fields, state, err := buildDocsAccessResultFields("zh-CN", docsResultRenderInput{
+		Data:      map[string]any{"request_id": "request-1", "doc_id": "doc-1"},
+		Title:     "Roadmap",
+		Cancelled: true,
+	})
+	if err != nil {
+		t.Fatalf("buildDocsAccessResultFields: %v", err)
+	}
+	if state != docsaccessrequest.StateCancelled {
+		t.Fatalf("state = %q", state)
+	}
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.Freeze()
+	payload, err := registry.Render(context.Background(),
+		docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields,
+		cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-1", WebLoginURL: "https://im.example.com/login"})
+	if err != nil {
+		t.Fatalf("render cancelled: %v", err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The render is what makes the markers legal on the replacement frame: only
+	// a Registry render writes metadata.octo.template, which template_ref must
+	// agree with.
+	if tmplCtx, ok := cardmsg.CardTemplateContext(raw); !ok ||
+		tmplCtx.ID != string(docsaccessrequest.TemplateID) || tmplCtx.Version != docsaccessrequest.TemplateVersionV3 {
+		t.Fatalf("cancelled render lost its template identity: %+v ok=%v", tmplCtx, ok)
+	}
+	if variant, _ := cardmsg.CardVariant(raw); variant != docsaccessrequest.VariantCancelled {
+		t.Fatalf("variant = %q, want %q", variant, docsaccessrequest.VariantCancelled)
 	}
 }

@@ -187,6 +187,37 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	if revoked || deleted {
 		return CardMutationResult{}, ErrCardMutationNotFound
 	}
+	// The server-authored catalog markers are the card's identity, and identity
+	// does not change under an edit — pkg/cardtmpl/updater.go states exactly
+	// that, but stated it only for the path that happens to go through the
+	// updater. A caller that assembles a replacement frame from its own key set
+	// simply dropped them, and every guard keyed on their presence then went
+	// inert for that message: the stored-version pin and the cross-Space
+	// refusal both begin `if markers.Has…`. A user click was enough to trigger
+	// it, so this is enforced where every replacement passes rather than at
+	// each site that builds one.
+	//
+	// Absent on both sides is the legacy population and stays legal. Present on
+	// the stored frame and absent on the replacement is the erasure, and it is
+	// refused rather than repaired: re-attaching a template_ref would need the
+	// replacement's own card body to carry the matching metadata.octo.template,
+	// which a non-Registry render does not have, so "repair" would either fail
+	// validation anyway or stamp a Registry identity onto a body that is not
+	// one. The caller has to produce a frame that legitimately carries them.
+	stored, err := cardmsg.CatalogFrameMarkers(message.Payload)
+	if err != nil {
+		return CardMutationResult{}, fmt.Errorf("%w: stored frame markers: %v", ErrCardMutationInvalid, err)
+	}
+	if stored.HasRef || stored.HasProvenance {
+		next, markerErr := cardmsg.CatalogFrameMarkers([]byte(request.ContentEdit))
+		if markerErr != nil {
+			return CardMutationResult{}, fmt.Errorf("%w: replacement frame markers: %v", ErrCardMutationInvalid, markerErr)
+		}
+		if stored.HasRef != next.HasRef || stored.HasProvenance != next.HasProvenance {
+			return CardMutationResult{}, fmt.Errorf(
+				"%w: replacement drops the stored catalog markers", ErrCardMutationInvalid)
+		}
+	}
 	normalized, err := cardmsg.NormalizeContentEdit(request.ContentEdit)
 	if err != nil {
 		return CardMutationResult{}, fmt.Errorf("%w: %v", ErrCardMutationInvalid, err)

@@ -15,9 +15,17 @@ const (
 
 	StateApproved cardtmpl.State = "approved"
 	StateRejected cardtmpl.State = "rejected"
+	// StateCancelled is a request withdrawn or expired rather than decided, so
+	// it carries no `decision` block — the data contract requires one only for
+	// approved/rejected. It renders through the result view like the other two
+	// because a card that has been marked cannot be replaced by a frame built
+	// outside the Registry: the markers assert a template identity, and only a
+	// Registry render produces the metadata.octo.template they must agree with.
+	StateCancelled cardtmpl.State = "cancelled"
 
-	VariantApproved = "docs.access_approved"
-	VariantRejected = "docs.access_denied"
+	VariantApproved  = "docs.access_approved"
+	VariantRejected  = "docs.access_denied"
+	VariantCancelled = "docs.access_cancelled"
 )
 
 type TemplateV3 struct {
@@ -90,7 +98,7 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 			Body: body, Variant: Variant, DeepLink: deepLink, Source: &source,
 		}, nil
 	}
-	if state != StateApproved && state != StateRejected {
+	if state != StateApproved && state != StateRejected && state != StateCancelled {
 		return cardtmpl.BuildResult{}, fmt.Errorf("docs.access-request@0.3.0: unsupported state %q", state)
 	}
 	var input v3Fields
@@ -103,11 +111,20 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 	}
 	labels := resultLabels(env.Lang, state == StateRejected)
 	variant := VariantApproved
-	if state == StateRejected {
+	switch state {
+	case StateRejected:
 		variant = VariantRejected
+	case StateCancelled:
+		labels, variant = cancelledLabels(env.Lang), VariantCancelled
 	}
 	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeV3BodyWithLang(env.Lang, env.WebLoginURL, docID, env.SpaceID, cardtmpl.DocsOutcomeContent{
-		Title: input.Document.Title, Variant: variant, Denied: state == StateRejected,
+		// Denied selects the L0 "not granted" treatment rather than the green
+		// approved one. Cancelled is not a denial, but the outcome builder
+		// carries a two-way flag and the honest half of it is that access was
+		// not granted; the wording comes from the labels above. Giving the base
+		// card a third treatment would change a shared L0 contract for a
+		// display nuance, which does not belong in this fix.
+		Title: input.Document.Title, Variant: variant, Denied: state != StateApproved,
 		HeaderLabel: labels.header, SourceName: input.Document.SourceName,
 		StatusLabel: labels.status, PermissionLabel: input.Permission.Label, ResultText: labels.result,
 		ReasonLabel: labels.reason, Reason: input.Decision.RejectionReason,
@@ -129,7 +146,7 @@ func (t *TemplateV3) FallbackText(state cardtmpl.State, fields json.RawMessage, 
 	if state == StatePending {
 		return New().FallbackText(state, fields, lang)
 	}
-	if state != StateApproved && state != StateRejected {
+	if state != StateApproved && state != StateRejected && state != StateCancelled {
 		return "", fmt.Errorf("docs.access-request@0.3.0: unsupported fallback state %q", state)
 	}
 	var input v3Fields
@@ -137,6 +154,9 @@ func (t *TemplateV3) FallbackText(state cardtmpl.State, fields json.RawMessage, 
 		return "", err
 	}
 	labels := resultLabels(lang, state == StateRejected)
+	if state == StateCancelled {
+		labels = cancelledLabels(lang)
+	}
 	return strings.TrimSpace(input.Document.Title) + " - " + labels.status, nil
 }
 
@@ -163,6 +183,22 @@ func (l resultLabelSet) banner(role string) string {
 		role = "viewer"
 	}
 	return "requested " + role + " access to this document."
+}
+
+// cancelledLabels describes a request that ended without a decision. It reuses
+// resultLabelSet so the outcome body needs no new shape; the reason row stays
+// empty because a cancelled request has no operator and no rejection reason.
+func cancelledLabels(lang string) resultLabelSet {
+	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
+		return resultLabelSet{
+			header: "文档申请", status: "已取消", result: "本次访问申请已取消，权限未发生变更。",
+			reason: "拒绝原因", role: "申请人", requestReason: "申请原因", processedAt: "处理于", zh: true,
+		}
+	}
+	return resultLabelSet{
+		header: "Document access", status: "Cancelled", result: "The access request was cancelled; no permission changed.",
+		reason: "Reason", role: "Requester", requestReason: "Reason", processedAt: "Processed at",
+	}
 }
 
 func resultLabels(lang string, denied bool) resultLabelSet {

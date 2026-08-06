@@ -98,7 +98,16 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 		denyReason = strings.TrimSpace(v)
 	}
 	terminal := result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied
-	if terminal && f.updater != nil {
+	// Cancelled renders through the Registry as well, even though it is not a
+	// terminal decision. The pending card is a Registry render and therefore
+	// carries the server-authored catalog markers; the legacy rebuild below
+	// emits a plain resource card that cannot carry them, so taking that branch
+	// for a marked card erased the markers on an ordinary user click and left
+	// the identity guards in pkg/cardtmpl/updater.go inert for that message.
+	// `terminal` still means "decided" for the notification below — only the
+	// replacement route widens.
+	registryReplaceable := terminal || result.State == cardactiondispatch.StateCancelled
+	if registryReplaceable && f.updater != nil {
 		if err := f.replaceWithRegistryResult(ctx, event, result, channelID, lang, title, denyReason); err != nil {
 			return err
 		}
@@ -178,6 +187,7 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		DecidedAtDisplay: result.Display["decided_at"],
 		DenyReason:       denyReason,
 		Denied:           result.State == cardactiondispatch.StateDenied,
+		Cancelled:        result.State == cardactiondispatch.StateCancelled,
 	})
 	if err != nil {
 		return err
@@ -207,6 +217,7 @@ type docsResultRenderInput struct {
 	DecidedAtDisplay string
 	DenyReason       string
 	Denied           bool
+	Cancelled        bool
 }
 
 func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
@@ -234,9 +245,11 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	}
 	state := docsaccessrequest.StateApproved
 	wireState := "approved"
-	if input.Denied {
-		state = docsaccessrequest.StateRejected
-		wireState = "rejected"
+	switch {
+	case input.Cancelled:
+		state, wireState = docsaccessrequest.StateCancelled, "cancelled"
+	case input.Denied:
+		state, wireState = docsaccessrequest.StateRejected, "rejected"
 	}
 	actor := stringEventData(input.Data, "actor")
 	document := map[string]any{
@@ -256,10 +269,16 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 		"state":     wireState,
 		"document":  document,
 		"requester": requester,
-		"decision": map[string]any{
+	}
+	// A cancelled request was never decided, so it has no operator and no
+	// decision time. The data contract requires `decision` only for
+	// approved/rejected; emitting one here would put the generic operator
+	// placeholder on a card nobody acted on.
+	if !input.Cancelled {
+		fields["decision"] = map[string]any{
 			"operatorName":     truncRunes(operatorName, capResultName),
 			"decidedAtDisplay": truncRunes(strings.TrimSpace(input.DecidedAtDisplay), capResultShortLabel),
-		},
+		}
 	}
 	dataCaps := map[string]int{
 		"requestReason":      capResultReason,

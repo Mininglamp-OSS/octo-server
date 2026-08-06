@@ -445,6 +445,22 @@ finds them directly.
   `TestValidateGrantPermissionsMatrix`, `TestValidateGrantIdentityCanonicalShapes`,
   and the `chk_card_template_grant_space` CHECK constraint, so the shape cannot
   be written even by a future caller that forgets the validator.
+- [x] a server-authored catalog marker cannot be authored invalid, and cannot be
+  dropped by an edit — `TestSendRefusesToAuthorAMarkerItsReadersWouldReject`,
+  `TestCardMutatorRefusesToDropStoredCatalogMarkers`,
+  `TestDocsActionFinalizerRoutesCancelledThroughTheRegistry`,
+  `TestDocsAccessRequestV3RendersTheCancelledState`. Both halves were regressions
+  this PR introduced, and neither was behind a runtime-catalog gate: the marker
+  paths sit behind the pre-existing `OCTO_CARD_MESSAGE_ENABLED`, so the "both new
+  gates are false" argument never covered them. Authoring ran *after*
+  `cardmsg.Validate`, so the hook written to catch a missed path structurally
+  could not see it, and an untrimmed Space produced a frame every reader
+  refuses — permanently unclickable and uneditable. Erasure needed only a
+  `cancelled` result, whose replacement frame came from a six-key allowlist
+  carrying neither marker, leaving both identity guards in `updater.go` inert.
+  Preservation is now enforced at `CardMutator.Mutate` rather than per call
+  site, and `docs.access-request@0.3.0` declares a `cancelled` state so the
+  replacement is a Registry render that legitimately carries the markers.
 - [x] every domain the Go validator enforces is also stated in the schema, so a
   write that skips the validator cannot land a row the validator would refuse —
   `TestGrantSchemaRejectsWritesTheValidatorWouldRefuseRealMySQL` (real rows, each

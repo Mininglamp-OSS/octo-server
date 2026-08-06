@@ -215,3 +215,94 @@ func testCardEnvelope(t *testing.T, cardSeq int64, withAction bool) []byte {
 	}
 	return raw
 }
+
+// markedTestCardEnvelope is testCardEnvelope plus the server-authored catalog
+// markers a Registry render carries: both top-level keys and the matching
+// metadata.octo.template they are validated against.
+func markedTestCardEnvelope(t *testing.T, cardSeq int64, withAction bool) []byte {
+	t.Helper()
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(testCardEnvelope(t, cardSeq, withAction), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	card := envelope["card"].(map[string]interface{})
+	card["metadata"] = map[string]interface{}{
+		"octo": map[string]interface{}{
+			"protocol": "octo-card@1.0",
+			"template": map[string]interface{}{"id": "docs.access-request", "version": "0.3.0"},
+		},
+	}
+	envelope[cardmsg.CatalogTemplateRefKey] = map[string]interface{}{
+		"id": "docs.access-request", "version": "0.3.0",
+	}
+	envelope[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+		Version:       cardmsg.CatalogProvenanceVersion,
+		PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
+		PrincipalID:   "docs-notify",
+		SpaceID:       "space-1",
+	}.MarshalMap()
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// PR-C review round 6 (yujiawei P1-2), the structural half.
+//
+// The catalog markers are the card's identity and identity does not change
+// under an edit. pkg/cardtmpl/updater.go states that, but only the paths that
+// go through the updater honoured it: a caller assembling a replacement from
+// its own key set simply dropped them, and both identity guards — the
+// stored-version pin and the cross-Space refusal — begin `if markers.Has…`, so
+// they went inert for that message. Enforcing it here means no future call site
+// can silently downgrade a marked card, whatever frame it builds.
+func TestCardMutatorRefusesToDropStoredCatalogMarkers(t *testing.T) {
+	marked := markedTestCardEnvelope(t, 0, true)
+
+	t.Run("a replacement that drops the markers is refused", func(t *testing.T) {
+		backend := &fakeMutationBackend{message: storedCardMessage{
+			MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: marked,
+		}}
+		_, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(testCardEnvelope(t, 42, false)), // legacy six-key rebuild
+		})
+		if !errors.Is(err, ErrCardMutationInvalid) {
+			t.Fatalf("Mutate() error = %v, want ErrCardMutationInvalid", err)
+		}
+		if len(backend.writes) != 0 {
+			t.Fatalf("a marker-erasing frame was persisted: %+v", backend.writes)
+		}
+	})
+
+	t.Run("a replacement that carries them through is applied", func(t *testing.T) {
+		backend := &fakeMutationBackend{message: storedCardMessage{
+			MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: marked,
+		}}
+		result, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(markedTestCardEnvelope(t, 42, false)),
+		})
+		if err != nil {
+			t.Fatalf("Mutate() error = %v", err)
+		}
+		if !result.Applied || len(backend.writes) != 1 {
+			t.Fatalf("result = %+v writes = %+v", result, backend.writes)
+		}
+	})
+
+	t.Run("the legacy population is untouched", func(t *testing.T) {
+		backend := &fakeMutationBackend{message: storedCardMessage{
+			MessageID: "1001", MessageSeq: 7, FromUID: "notification",
+			Payload: testCardEnvelope(t, 0, true),
+		}}
+		result, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(testCardEnvelope(t, 42, false)),
+		})
+		if err != nil || !result.Applied {
+			t.Fatalf("an unmarked card must still be editable: result = %+v err = %v", result, err)
+		}
+	})
+}
