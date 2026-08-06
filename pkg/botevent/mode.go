@@ -127,27 +127,23 @@ type belief struct {
 	// epoch is the authority's generation. Meaningful only when activated.
 	epoch uint64
 
-	// confirmed distinguishes "the authority said legacy" from "the authority could
-	// not be read and legacy is what we do about it". Both behave identically and
-	// both expire; the flag exists so the log says which one happened.
-	confirmed bool
-
-	// repairFailedFor / repairFailedAt record a mirror value this process denied and then
-	// could not remove.
+	// deniedMirror / deniedAt record a mirror value the authority explicitly denied, so
+	// the next allocations that see the same value are answered from this belief for a
+	// short cooldown instead of re-reading the authority each time.
 	//
-	// The normal answer to a mirror claiming an unconfirmed activation is to delete it —
-	// see modeResolution.unauthorizedMirror. When that delete fails the key stays, so
-	// without a cooldown every subsequent allocation would read the authority again,
+	// Without it, a mirror nobody clears costs an authority read on **every** allocation,
 	// serialized behind beliefMu inside a held msgSem slot: the storm review P1-C named.
 	//
-	// This is deliberately NOT the general "cache the denial" the previous revision had.
-	// That one keyed on the denied value with the full negativeBeliefTTL and could swallow
-	// the genuine activation, because `Activate` bumps epoch 0 → 1 and the tool then writes
-	// exactly the `incr:1` that may already have been sitting there forged (Jerry-Xin 🔴).
-	// Here the window is short, and it only applies while Redis is rejecting our writes —
-	// a state in which the counter's own INCR would be failing too.
-	repairFailedFor string
-	repairFailedAt  time.Time
+	// The cooldown is deliberately much shorter than negativeBeliefTTL, and it is
+	// deliberately keyed on the exact value, because a cached denial is what swallowed a
+	// genuine activation once already (Jerry-Xin 🔴, round 6): `Activate` bumps epoch 0 → 1
+	// and the tool then writes exactly the `incr:1` that may already have been sitting
+	// there forged, so the denied value and the real one are the same bytes. Nothing
+	// visible from Redis distinguishes them — only a fresh authority read does — so a
+	// window is unavoidable and the choice is how long. See repairCooldown, and note the
+	// caller only arms this when there is no counter to contradict the authority.
+	deniedMirror string
+	deniedAt     time.Time
 
 	resolvedAt time.Time
 }
@@ -161,21 +157,26 @@ type modeResolution struct {
 	// generation closes the gate rather than allocating.
 	belief *belief
 
-	// unauthorizedMirror is a mirror value the authority denied, for the caller to remove.
+	// unauthorizedMirror is a mirror value the authority explicitly denied.
 	//
-	// Deleting it rather than caching the denial is the fix for the swallow described on
-	// belief.repairFailedFor, and it is the symmetric repair to the one the allocator
-	// already performs in the other direction: when the authority says activated and the
-	// mirror disagrees, the mirror is rebuilt. When the authority says legacy, the correct
-	// mirror state is *absent* — "absent" is defined to mean "consult the authority" — so
-	// removing a mirror the authority contradicts restores consistency rather than
-	// destroying information.
+	// The caller uses it to arm the denial cooldown — and **only** that. An earlier
+	// revision had the caller *delete* the key, on the reasoning that the correct mirror
+	// for a legacy authority is absent. That was a fleet-wide-outage regression (review
+	// round 7, P1-1): when the party that regressed is the **authority** rather than the
+	// mirror, one freshly started replica would delete the very artifact every healthy
+	// activated replica's gate compares against. Their gate then returns
+	// gateNotActivated, they force an authority read, find legacy against an activated
+	// belief, and refuse every enqueue for every bot until the state row is restored — a
+	// bookkeeping regression with zero delivery impact turned into total delivery loss by
+	// a rolling restart.
 	//
-	// The race is benign: if an operator activates between the authority read and this
-	// delete, a legitimate mirror is removed, every replica's next allocation consults the
-	// authority, finds it activated, and rebuilds it. One extra read each, no mixed source.
-	// `botevent-seq` also refuses to activate while an unauthorized mirror is present, so
-	// that interleaving needs the key to appear during the flip itself.
+	// Guarding the delete on `!counterExists` was the suggested minimum fix and it does
+	// narrow the window, but it does not close it: the mirror is global while a counter is
+	// per-bot, so an allocation for a bot that has never received an event still has no
+	// counter to object with. Since the delete's only benefit was suppressing the read
+	// storm, and the cooldown suppresses that too, the delete is gone entirely rather than
+	// conditioned. Nothing in the allocator writes this key now; only the operator tool
+	// does, which is the one place a human can see what they are overwriting.
 	unauthorizedMirror string
 }
 
@@ -194,10 +195,16 @@ const (
 	// replica instead of one per allocation.
 	negativeBeliefTTL = 5 * time.Second
 
-	// repairCooldown bounds how long a mirror this process failed to remove is answered
-	// from the cached denial instead of re-reading the authority. See
-	// belief.repairFailedFor for why it exists and why it is much shorter than
-	// negativeBeliefTTL.
+	// repairCooldown bounds how long a mirror the authority denied is answered from the
+	// cached denial instead of re-reading the authority. See belief.deniedMirror for why it
+	// exists and why it is much shorter than negativeBeliefTTL.
+	//
+	// One second, and the tradeoff is explicit: it is the window in which a genuine
+	// activation writing the same bytes as a previously denied mirror is not noticed. That
+	// window cannot be zero without re-reading the authority per allocation, and it is only
+	// entered at all when a mirror claiming activation was already sitting in Redis against
+	// a legacy authority — which `botevent-seq -action activate` now refuses to flip on top
+	// of, so the precondition is checked at the one supervised step.
 	repairCooldown = time.Second
 
 	// authorityTimeout bounds every authority read.
@@ -391,10 +398,10 @@ func resolveMode(ctx *config.Context, mirror string) (modeResolution, error) {
 			return modeResolution{decision: decideLegacy, belief: b}, nil
 		}
 		// A mirror claiming activation normally forces a read — that is what makes a flip
-		// propagate without waiting for the TTL. The one exception is a value this process
-		// already tried and failed to remove: re-reading per allocation then would be the
+		// propagate without waiting for the TTL. The one exception is a value the authority
+		// already denied to this process: re-reading per allocation then would be the
 		// serialized-read storm review P1-C named, with no exit. See repairCooldown.
-		if claims && mirror == b.repairFailedFor && beliefNow().Sub(b.repairFailedAt) < repairCooldown {
+		if claims && mirror == b.deniedMirror && beliefNow().Sub(b.deniedAt) < repairCooldown {
 			return modeResolution{decision: decideLegacy, belief: b}, nil
 		}
 	}
@@ -444,8 +451,8 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		if !mirrorClaimsIncr && beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
 			return modeResolution{decision: decideLegacy, belief: prior}, nil
 		}
-		if mirrorClaimsIncr && mirror == prior.repairFailedFor &&
-			beliefNow().Sub(prior.repairFailedAt) < repairCooldown {
+		if mirrorClaimsIncr && mirror == prior.deniedMirror &&
+			beliefNow().Sub(prior.deniedAt) < repairCooldown {
 			return modeResolution{decision: decideLegacy, belief: prior}, nil
 		}
 	}
@@ -456,7 +463,7 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		if err := assertExpectedMode(true); err != nil {
 			return modeResolution{}, err
 		}
-		return install(&belief{activated: true, epoch: st.Epoch, confirmed: true, resolvedAt: beliefNow()}, "")
+		return install(&belief{activated: true, epoch: st.Epoch, resolvedAt: beliefNow()}, ""), nil
 
 	case err == nil, errors.Is(err, ErrStateMissing):
 		// The authority says legacy, or says nothing because the migration has not
@@ -488,7 +495,7 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		if err := assertExpectedMode(false); err != nil {
 			return modeResolution{}, err
 		}
-		return install(&belief{confirmed: true, resolvedAt: beliefNow()}, unauthorized)
+		return install(&belief{resolvedAt: beliefNow()}, unauthorized), nil
 
 	default:
 		// Inconclusive.
@@ -505,38 +512,46 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		if guardErr := assertExpectedMode(false); guardErr != nil {
 			return modeResolution{}, guardErr
 		}
+		// Which of the two "legacy" reasons this was — the authority said so, or it could
+		// not be read — is distinguished by *which warning fires*, here versus the branch
+		// above. An earlier revision kept a `confirmed` flag on the belief for that and
+		// nothing ever read it (review round 7), so the flag is gone and these two call
+		// sites are the record.
 		unreadableWarn.warn("botevent: allocator authority unreadable; treating as not activated",
 			zap.Error(err))
 		// Cache the inconclusive answer too. During a DB outage the alternative is one
 		// failed read per allocation on the fan-out path, which is the cost this cache
 		// exists to remove.
-		return install(&belief{resolvedAt: beliefNow()}, "")
+		return install(&belief{resolvedAt: beliefNow()}, ""), nil
 	}
 }
 
 // install stores a belief and returns the matching resolution.
 //
+// No error return: it never had a failure mode, and all three call sites used to check one —
+// dead API surface implying a path that does not exist (review round 7).
+//
 // unauthorizedMirror is passed through to the caller rather than acted on here: repairing
 // it is a Redis write and this file deliberately does no Redis I/O — the allocator holds
 // the client.
-func install(b *belief, unauthorizedMirror string) (modeResolution, error) {
+func install(b *belief, unauthorizedMirror string) modeResolution {
 	activeBelief.Store(b)
 	res := modeResolution{belief: b, unauthorizedMirror: unauthorizedMirror}
 	if b.activated {
 		res.decision = decideCounter
-		return res, nil
+		return res
 	}
 	res.decision = decideLegacy
-	return res, nil
+	return res
 }
 
-// noteMirrorRepairFailed records that an unauthorized mirror could not be removed, so the
-// next allocations are answered from the cached denial for repairCooldown rather than
-// re-reading the authority each time. See belief.repairFailedFor.
+// noteMirrorUnauthorized records a mirror value the authority denied, so the next
+// allocations that see the same value are answered from this belief for a short cooldown
+// rather than re-reading the authority each time. See belief.deniedMirror.
 //
 // Copy-on-write like every other belief update: the pointer is swapped, never mutated, so
 // a reader on the hot path cannot see a half-updated belief.
-func noteMirrorRepairFailed(denied string) {
+func noteMirrorUnauthorized(denied string) {
 	beliefMu.Lock()
 	defer beliefMu.Unlock()
 	cur := activeBelief.Load()
@@ -546,8 +561,8 @@ func noteMirrorRepairFailed(denied string) {
 		return
 	}
 	updated := *cur
-	updated.repairFailedFor = denied
-	updated.repairFailedAt = beliefNow()
+	updated.deniedMirror = denied
+	updated.deniedAt = beliefNow()
 	activeBelief.Store(&updated)
 }
 
@@ -566,12 +581,17 @@ func ResetModeBeliefForTest() {
 	authorityUnreadable.resetForTest()
 }
 
-// AgeModeBeliefForTest ages the cached belief past negativeBeliefTTL without
-// sleeping, so a test can prove the negative cache expires rather than persists.
+// AgeModeBeliefForTest ages the cached belief past negativeBeliefTTL and past
+// repairCooldown without sleeping, so a test can prove the caches expire rather than
+// persist. Both timestamps move together: a test that needs one of them stale almost always
+// means "make this belief old".
 func AgeModeBeliefForTest() {
 	if b := activeBelief.Load(); b != nil {
 		aged := *b
 		aged.resolvedAt = b.resolvedAt.Add(-2 * negativeBeliefTTL)
+		if !b.deniedAt.IsZero() {
+			aged.deniedAt = b.deniedAt.Add(-2 * negativeBeliefTTL)
+		}
 		activeBelief.Store(&aged)
 	}
 }

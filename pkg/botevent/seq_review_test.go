@@ -165,30 +165,32 @@ func TestColdProcessRefusesWhenACounterOutlivesTheAuthority(t *testing.T) {
 	setStateMode(t, ctx, StateModeIncr, 0)
 }
 
-// TestUnauthorizedMirrorIsRemovedNotCached is review P1-C and, after it, Jerry-Xin's 🔴.
+// TestUnauthorizedMirrorIsLeftAloneAndDoesNotSwallowActivation covers two findings that
+// pull in opposite directions, which is why it asserts both halves.
 //
-// P1-C: a mirror claiming activation skips the negative TTL by design — that is what makes a
-// flip propagate without waiting — but nothing rewrites or clears a *forged* mirror, so every
+// P1-C (round 5): a mirror claiming activation skips the negative TTL by design — that is
+// what makes a flip propagate without waiting — but nothing clears a forged mirror, so every
 // allocation used to perform its own authority read, serialized behind beliefMu inside a held
-// msgSem slot, with no exit until a human deleted the key.
+// msgSem slot, with no exit. So a denial has to be remembered for *something*.
 //
-// The first attempt at that was to cache the denial keyed on the mirror value. Review found
-// it could swallow the real activation: `Activate` bumps epoch 0 → 1 and the tool then writes
-// exactly `incr:1`, so a forged `incr:1` denied beforehand is byte-identical to the genuine
-// mirror, and those replicas keep serving legacy for the whole TTL while others allocate from
-// the counter. Two live id sources at the flip.
+// Jerry-Xin's 🔴 (round 6): remembering it for negativeBeliefTTL swallowed the genuine
+// activation, because `Activate` bumps epoch 0 → 1 and the tool then writes exactly the
+// `incr:1` that may already have been sitting there forged. The denied value and the real one
+// are the same bytes, and nothing visible from Redis tells them apart.
 //
-// So the answer is to *remove* the contradicted key instead of remembering it — the symmetric
-// repair to rebuilding the mirror when the authority says activated. Both properties then hold
-// with no cache to go stale.
-func TestUnauthorizedMirrorIsRemovedNotCached(t *testing.T) {
+// Round 6 answered that by deleting the key instead of remembering it, and round 7 found that
+// deleting is a fleet-wide outage when the *authority* is the regressed party (see
+// TestRegressedAuthorityDoesNotDestroyTheLegitimateMirror). So the answer is: leave the key
+// alone, remember the denial only briefly, and only when there is no counter to contradict
+// the authority.
+func TestUnauthorizedMirrorIsLeftAloneAndDoesNotSwallowActivation(t *testing.T) {
 	ctx, client := seqTestCtx(t)
 	robotID := "seqtest_unauthmirror_bot"
 	fixture(t, ctx, client, robotID)
 
 	// Authority says legacy; somebody planted a mirror claiming otherwise — and planted
 	// exactly the value the first real activation will produce, which is the case that broke
-	// the previous fix.
+	// round 6's fix. No counter for this bot, so the mirror is the artifact in doubt.
 	setStateMode(t, ctx, StateModeLegacy, 0)
 	ResetSeededForTest()
 	client.Del(SeqKey(robotID))
@@ -204,25 +206,29 @@ func TestUnauthorizedMirrorIsRemovedNotCached(t *testing.T) {
 		}
 	}
 	if reads := AuthorityReads() - before; reads > 1 {
-		t.Errorf("%d allocations against an unauthorized mirror issued %d authority reads; the "+
-			"contradicted key must be removed so subsequent allocations take the ordinary "+
-			"negative-TTL path, not a serialized DB read each", allocations, reads)
-	}
-	if v, err := client.Get(ModeKey).Result(); err != rd.Nil {
-		t.Errorf("the unauthorized mirror is still present (%q, err=%v); the authority said "+
-			"legacy, and the correct mirror state for that is absent", v, err)
+		t.Errorf("%d allocations against an unauthorized mirror issued %d authority reads; a key "+
+			"nobody clears must not cost a serialized DB read per allocation on the fan-out path",
+			allocations, reads)
 	}
 
-	// Now the operator activates for real, to the same epoch the forged key claimed. The
-	// flip must take effect on the next allocation — no TTL, no swallowed activation.
+	// The allocator must not have touched the key. It is not the allocator's to write: only
+	// the operator tool writes it, and round 7 showed what deleting it costs when the
+	// authority is the party that regressed.
+	if v, err := client.Get(ModeKey).Result(); err != nil || v != MirrorValue(1) {
+		t.Errorf("the mirror was modified by the allocator (got %q, err=%v); it must be left "+
+			"exactly as found", v, err)
+	}
+
+	// Now the operator activates for real, to the same epoch the forged key claimed, so the
+	// mirror value does not change at all. Once the denial cooldown lapses the flip must take
+	// effect — the cache may delay it by repairCooldown, never swallow it. Ageing the belief
+	// stands in for that second passing.
 	setStateMode(t, ctx, StateModeIncr, 0)
 	if _, err := ctx.DB().UpdateBySql("update `"+stateTable+"` set `epoch`=1 where `singleton_id`=?",
 		stateSingletonID).Exec(); err != nil {
 		t.Fatalf("advance epoch: %v", err)
 	}
-	if err := client.Set(ModeKey, MirrorValue(1), 0).Err(); err != nil {
-		t.Fatalf("write activation mirror: %v", err)
-	}
+	AgeModeBeliefForTest()
 
 	id, err := nextEventID(ctx, client, robotID)
 	if err != nil {
@@ -407,5 +413,83 @@ func TestAckDeletesExactlyTheTargetMember(t *testing.T) {
 				"payload value while its reads and acks are bounded by score, so the two must "+
 				"stay equal", int64(m.Score), payload.EventID)
 		}
+	}
+}
+
+// TestRegressedAuthorityDoesNotDestroyTheLegitimateMirror is review round 7's P1-1, and it
+// is written before the fix so it can be seen failing.
+//
+// The mirror repair that replaced the denied-mirror cache deletes a mirror the authority
+// contradicts. That is right when the *mirror* is the wrong artifact — a forged key against
+// a genuinely pre-activation authority. It is exactly backwards when the **authority** is
+// the wrong artifact, and the allocator already knows which case it is four lines earlier:
+// `counterExists` means some replica allocated from this counter, which can only have
+// happened after the authority said `incr`.
+//
+// The consequence of getting the order wrong is not a metadata loss. One freshly started
+// replica — a rolling restart, an HPA scale-up, a crash-loop — deletes the mirror that every
+// *healthy activated* replica's gate compares against. Their gate then returns
+// gateNotActivated, they force an authority read, the authority says legacy while their
+// belief is activated, and they hit the deliberate refusal. Every enqueue for every bot
+// fails until the state row is restored. Before this mechanism existed the mirror stayed,
+// the cold replica refused only itself, and the rest of the fleet kept allocating correctly.
+//
+// Same family as the P1-3 accepted in round 4: the evidence that invalidates the operation's
+// premise is computed before it and consulted after it.
+func TestRegressedAuthorityDoesNotDestroyTheLegitimateMirror(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_authorityregressed_bot"
+	fixture(t, ctx, client, robotID)
+
+	// An activated fleet that has issued at least one id, so the counter exists.
+	issued, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate while activated: %v", err)
+	}
+	if n, _ := client.Exists(SeqKey(robotID)).Result(); n == 0 {
+		t.Fatal("fixture did not create the counter, so this test cannot exercise the case")
+	}
+
+	// Now the authority regresses — a restore of a pre-activation dump, or a manual UPDATE.
+	// Redis keeps everything: the legitimate mirror AND the counter are both intact.
+	setStateMode(t, ctx, StateModeLegacy, 0)
+	mirrorBefore, err := client.Get(ModeKey).Result()
+	if err != nil {
+		t.Fatalf("the mirror must still be present at this point: %v", err)
+	}
+
+	// One freshly started replica allocates once. Cold: no belief, no seeded marker, no
+	// lastIssued — it has only what Redis and the authority tell it.
+	ResetSeededForTest()
+
+	if got, err := nextEventID(ctx, client, robotID); err == nil {
+		t.Fatalf("the cold replica allocated %d instead of refusing; a counter that exists while "+
+			"the authority says legacy means the authority regressed (already issued %d)",
+			got, issued)
+	}
+
+	// That refusal is correct. Deleting the mirror on the way to it is not: it is the only
+	// artifact the healthy activated replicas' gate matches against.
+	if v, err := client.Get(ModeKey).Result(); err != nil {
+		t.Fatalf("the legitimate mirror %q was destroyed (%v). One cold replica has now taken "+
+			"every activated replica's gate down: their runGate compares against %q, gets "+
+			"gateNotActivated, forces an authority read, finds legacy against an activated "+
+			"belief, and refuses every enqueue for every bot until the state row is restored. "+
+			"The mirror must survive when counterExists says the authority is the regressed party",
+			mirrorBefore, err, mirrorBefore)
+	} else if v != mirrorBefore {
+		t.Fatalf("the mirror changed from %q to %q; it must be left exactly as it was", mirrorBefore, v)
+	}
+
+	// And the fleet is still able to allocate once the authority is put back, without any
+	// replica having had to rebuild the mirror.
+	setStateMode(t, ctx, StateModeIncr, 0)
+	ResetSeededForTest()
+	next, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate after restoring the authority: %v", err)
+	}
+	if next <= issued {
+		t.Fatalf("id %d after recovery is not above the %d already issued", next, issued)
 	}
 }

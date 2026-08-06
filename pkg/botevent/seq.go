@@ -138,7 +138,6 @@ import (
 	rd "github.com/go-redis/redis"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/zap"
 )
 
 const (
@@ -341,12 +340,6 @@ if redis.call('EXISTS', KEYS[2]) == 0 then return -2 end
 return redis.call('INCR', KEYS[2])`
 
 var gateScript = rd.NewScript(gateSource)
-
-const dropMirrorSource = `
-if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
-return 0`
-
-var dropMirrorScript = rd.NewScript(dropMirrorSource)
 
 // probeSource reads the mode mirror and whether this bot's counter already exists, in one
 // round trip.
@@ -601,11 +594,18 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 	if err != nil {
 		return 0, err
 	}
-	if res.unauthorizedMirror != "" {
-		// The authority denied this mirror, so the correct state for the key is absent.
-		// Best-effort and compare-and-delete: a failure only means the next allocation
-		// re-reads the authority, bounded by repairCooldown.
-		dropUnauthorizedMirror(client, res.unauthorizedMirror)
+	if res.unauthorizedMirror != "" && !counterExists {
+		// The mirror claims an activation the authority denies, and no counter exists for
+		// this bot to contradict the authority — so the mirror is the artifact that is
+		// probably wrong, and the allocation is about to succeed through GenSeq. Suppress
+		// the authority read for a moment so a key nobody clears does not cost a
+		// serialized DB read per allocation. See noteMirrorUnauthorized.
+		//
+		// With a counter present the opposite is true: the *authority* is the artifact that
+		// regressed, legacyDelegate below refuses every allocation for this bot anyway, and
+		// a suppressed read would only delay noticing that the authority came back. So no
+		// cooldown there — deliberately.
+		noteMirrorUnauthorized(res.unauthorizedMirror)
 	}
 	if res.decision == decideLegacy {
 		return legacyDelegate(ctx, robotID, counterExists)
@@ -769,36 +769,21 @@ func probeAllocatorState(client Scripter, robotID string) (mirror string, counte
 	return mirror, exists != 0, nil
 }
 
-// dropUnauthorizedMirror removes a mode mirror the authority denied, if it still holds the
-// exact value that was denied.
-//
-// Compare-and-delete rather than a bare DEL: between the authority read and this call an
-// operator may have activated and written a *different* generation, which must survive.
-//
-// Best-effort. A failure is recorded on the belief so the next allocation is answered from
-// the cached denial for a short cooldown instead of re-reading the authority per
-// allocation — see belief.repairFailedFor. It is not an allocation error: the authority has
-// spoken, legacy is the right answer, and a Redis that rejects this DEL would be failing
-// the counter's own INCR anyway.
-func dropUnauthorizedMirror(client Scripter, denied string) {
-	if err := dropMirrorScript.Run(client, []string{ModeKey}, denied).Err(); err != nil {
-		noteMirrorRepairFailed(denied)
-		unauthorizedWarn.warn("botevent: could not remove the unauthorized mode mirror; "+
-			"allocations stay on the legacy allocator and the authority will be re-read shortly",
-			zap.String("mirrorKey", ModeKey), zap.String("mirrorValue", denied), zap.Error(err))
-	}
-}
-
 // invalidateSeeded drops every bot's seeded marker. See the mirror-rebuild branch in
 // allocate for why a lost mirror invalidates more than the bot being allocated for.
 //
-// `seeded` is cleared **last**, and the order is load-bearing (review P1-2). These are
-// separate unlocked Range passes over every active bot, so a concurrent reseed — which
-// stores its own per-bot state inside seedCounter and only then stores `seeded` — can
-// interleave between them. Clearing `seeded` first would let that reseed's marker survive
-// while its companion state was wiped, i.e. a bot treated as seeded whose bookkeeping this
-// process no longer has. Clearing it last means the worst interleaving leaves a bot
-// *unseeded* with stale bookkeeping, which the next allocation fixes by re-seeding.
+// `seeded` is cleared **last** (review P1-2). These are separate unlocked Range passes over
+// every active bot, so a concurrent reseed — which stores its own per-bot state inside
+// seedCounter and only then stores `seeded` — can interleave between them. Clearing `seeded`
+// first would leave that reseed's marker in place while its companion state was wiped;
+// clearing it last means the worst interleaving leaves a bot *unseeded* with stale
+// bookkeeping, which the next allocation fixes by re-seeding.
+//
+// The stake is smaller than it was when this order was asked for, and the earlier docstring
+// overstated it (review round 7): with the span bound moved to #704, `lastPersisted` is purely
+// a throttle marker, so the worst outcome of the bad interleaving is one redundant durable
+// write. The order is still the right way round — a marker should not outlive the state it
+// stands for — and it costs nothing.
 func invalidateSeeded() {
 	for _, m := range []*sync.Map{&lastPersisted, &seeded} {
 		m.Range(func(k, _ interface{}) bool {
