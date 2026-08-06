@@ -46,7 +46,7 @@
 ## 3. Q1 · 身份
 
 ### 3.1 影子 uid 形态
-远端用户在 Host 上映射到**一个正常生成的本地 32 位 hex uid**（`pkg/util/string.go:15` 同款），**无 namespace 限定符**。理由：`@` 是毒（`octo-lib/common/msg.go:172-174` `IsFakeChannel`、`:157-169` `from@to` 拼 DM，9 处非测试调用点）；列宽 `uid VARCHAR(40)` 焊死（约 40 migration + 索引，oidc 曾放大到 64 并 revert，**revert 原因未验证——执行前必查 git log/PR**）。影子 uid 为普通本地行 → 无声穿过 `QueryByUIDs`、DM 逻辑、全部索引。
+远端用户在 Host 上映射到**一个正常生成的本地 32 位 hex uid**（`pkg/util/string.go:15` 同款），**无 namespace 限定符**。理由：`@` 是毒（`octo-lib/common/msg.go:172-174` `IsFakeChannel`、`:157-169` `from@to` 拼 DM，9 处非测试调用点）；核心 `user` 表列宽 `uid VARCHAR(40)` 焊死（约 40 migration + 索引，现用 32 hex，仅余 8 字符）。影子 uid 为普通本地行 → 无声穿过 `QueryByUIDs`、DM 逻辑、全部索引。
 
 ### 3.2 `federation_identity`（复用 `user_oidc_identity` 形状）
 ```sql
@@ -65,7 +65,13 @@ CREATE TABLE federation_identity (
   UNIQUE KEY uk_shadow (local_shadow_uid)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 ```
-🔴 **并发创建竞态（P0）**：入站消息可能瞬间并发触发同一 `(peer,remote_uid)` 的影子创建，撞 `uk_peer_remote` → 500 + 丢消息。**必须用 DB 级 upsert（`INSERT ... ON DUPLICATE KEY UPDATE` 取回既有行）或 per-key 分布式锁**收敛，禁止「先 SELECT 再 INSERT」裸竞态。
+🔴 **影子身份的创建时机（P0，与 §4.2 授权闸门对齐）**：影子身份**不由入站消息创建**。§4.2 step 2 要求 `(peer, remote_uid)` 在消息被接受前**已存在且 active**，故创建只能发生在**成员开通（provisioning）**阶段：
+
+- **开通路径（唯一创建入口）**：Host 与 peer 建立/变更某个联邦群的成员关系时，由 peer 推送 `member_add` 生命周期事件（§8.1）或管理员显式批准 → Host 在该事件的处理中创建 `federation_identity` 行（+ §6.1 的 `user`/`group_member` 落地）。这是**唯一**允许 INSERT 新影子的路径。
+- **入站消息路径只做「解析 / 刷新」，不创建**：入站按 `(peer, remote_uid)` **查**已有行；查不到 = 未开通 → 按 §4.2 **fail-closed 拒收**（记审计，不静默建号）。允许的写操作仅限刷新既有行的 `display_name`/`avatar_url`/`last_seen_at`。
+  ⚠️ 若允许入站创建，等于「谁能签出 HMAC 就能在 Host 上凭空造账号并进群」，step 2 的身份绑定校验将退化为永真，授权模型失效。
+- **并发竞态（仍需处理，但只在开通路径）**：同一 `(peer,remote_uid)` 的开通事件可能重复/并发投递，撞 `uk_peer_remote` → 500。**开通路径必须用 DB 级 upsert（`INSERT ... ON DUPLICATE KEY UPDATE` 取回既有行）或 per-key 分布式锁**收敛，禁止「先 SELECT 再 INSERT」裸竞态。入站路径为纯读 + 字段刷新，无此竞态。
+- 📌 Phase 1a 需交付该开通路径（否则联邦群无法拉入任何远端成员）；[api] 测试：未开通身份的入站消息被拒且不产生 `federation_identity` 行。
 
 ### 3.3 🔴 不可认证影子（Unauthenticatable Federation Shadow）—— 一等约束
 设计评审指出：仅封「好友/推荐/搜索」远远不够。影子是普通本地行意味着**登录、token 铸发、密码/OIDC 绑定、设备注册、通知、@提及、DM 发起、审计、管理后台、导入导出、删除任务、权限缓存**都可能把它当真人。
@@ -151,7 +157,7 @@ B 客户端只连 **B 自己的 IM**；跨实例由两侧 `modules/federation` �
 ### 5.2 流转（文本，单条，B→A 入站）
 ```
 B 用户发消息 → B server 识别频道为联邦 → B 网关 POST A 网关（HMAC 签名 + nonce）
- → A 网关：§4.2 三段授权 → 解析 remote_uid→shadow_uid（并发 upsert，§3.2）
+ → A 网关：§4.2 三段授权 → 解析 remote_uid→shadow_uid（查既有已开通身份，查不到即 fail-closed 拒收；§3.2）
  → A 写 outbox（§5.5）→ 以影子 uid 服务端发送写入 A 的 IM 频道 → IM 广播群内订阅者
 ```
 A→B 反向为对称链路（Phase 1b，见 §12）。
@@ -190,6 +196,12 @@ A→B 反向为对称链路（Phase 1b，见 §12）。
   ⚠️ 接入时注意别与已挂在同一消息上的 `modules/bot_api/obo_fanout.go:214` OBO fan-out 链相互干扰。
 - **双写难题**：「写 IM」与「记幂等/outbox」非同一事务 → 崩溃窗口造成重复或永久丢消息。**采用 outbox 模式**：入站先落 `federation_inbox`（`(peer, idempotency_key)` 唯一，事务内），再由 worker 幂等地推 IM；出站先落 `federation_outbox`，worker 带 ACK/重试/死信地投递 peer。定义：保留期、最大重试、DLQ、崩溃恢复（重启后扫未 ACK）。
 - **IM 侧去重（P2）**：即便 DB 幂等，网络抖动重试写 IM 仍可能双气泡；需确认 IM 是否支持外置 client-msg-no 去重（**需实测**），否则 worker 必须保证「已确认写入 IM」的状态持久化后才不重发。
+- 🔴 **回环终止规则（P0，spec 级强制）**：`msg.notify` 对频道内**每条**消息触发，**包含中继 worker 自己代影子 uid 写入的入站消息**。若不设终止规则，Phase 1b 双向打通后立即形成 A→B→A 无限回环 / 重复投递。
+  **规则**：出站中继在入队 `federation_outbox` 前**必须**丢弃满足任一条件的消息：
+  1. 该消息行的 `source_peer_instance_id` **非空且等于目标 peer** —— 即「从这个 peer 收来的，绝不再发回这个 peer」（消除 A→B→A 直接回环）；
+  2. 该消息的发送者 uid 是**影子 uid**（`federation_identity` 命中）—— 影子发言在语义上属于其归属 peer，Host 不为其代理出站（消除多 peer 拓扑下的间接扩散）。
+  ⚠️ **幂等键不能替代回环终止**：`(peer, idempotency_key)` 只能压掉「同一条消息被重复处理」，而回环里每一跳都是**新** message id + 新 idempotency_key，幂等表看它们是不同消息，全部放行。二者解决不同问题，必须都有。
+  📌 落地前置：本规则要求 `source_peer_instance_id` 在**出站路径可读**。若成员/消息表最终未能承载该列（见 §6 与 §14 STOP），则回环终止退化为仅靠条件 2，需在评审中重新确认是否足够。
 
 ---
 
@@ -263,7 +275,7 @@ spike 证明：只把影子 uid 加进 IM 订阅表，**IM 侧完全可用**（�
 | 阶段 | 切面 | 可验证验收 |
 |---|---|---|
 | **Phase 0（spike）** | §5.4 扩展 spike（订阅 + **伪装发送** + 出站捕获） | ✅ **已完成，四断言全 PASS**（IM `v2.2.4-20260313`） |
-| **Phase 1a（MVP，真·单向）** | HMAC 配对 + 三段授权 + `federation_identity`(并发 upsert) + 不可认证影子约束 + `federation_channel` + inbox/outbox + **仅 B→A 文本入站** + 硬外部标记 | [api] B 文本经中继出现在 A 群、带正确角标、无静默丢弃；[api] 缺归属/未授权入站被拒；[api] 重放（nonce 撞）被拒、重试（同 idempotency）幂等；[browser] 群内每处见角标 |
+| **Phase 1a（MVP，真·单向）** | HMAC 配对 + 三段授权 + `federation_identity`(开通路径 + 并发 upsert) + 不可认证影子约束 + `federation_channel` + inbox/outbox + **仅 B→A 文本入站** + 硬外部标记 | [api] B 文本经中继出现在 A 群、带正确角标、无静默丢弃；[api] 缺归属/未授权入站被拒；[api] 重放（nonce 撞）被拒、重试（同 idempotency）幂等；[browser] 群内每处见角标 |
 | **Phase 1b** | A→B 反向出站（对称链路） | [api] A 消息经出站 outbox 到达 B、ACK/重试可靠 |
 | **Phase 2** | 附件异步拉取 + 花名册事件同步 + profile 更新 + 吊销/租约生命周期 | [api] 附件落 Host 存储且原子;[api] revoke 后影子移出+发言被拒+缓存失效;[api] profile 事件更新影子;[api] 租约过期→suspended |
 | **Phase 3（加固）** | 密钥轮换（key_id 双窗口）+ SSRF 约束 + per-peer 限流 + 审计日志 + E2E 双向硬 gate | [api] 轮换期 old+new 均验、切换后 old 失效;[api] base_url 私网被拒;[api] E2E 群开联邦 & 联邦群 EnableE2E 均被拒 |
@@ -281,7 +293,6 @@ spike 证明：只把影子 uid 加进 IM 订阅表，**IM 侧完全可用**（�
 1b. 🔴 若发现任何环境已启用 WuKongIM `datasource` 回调而影子 uid 未写入 `group_member`（§6.1 #2）→ 停，影子会被静默抹除。
 2. 无法建立出站事件捕获钩子 / 无法实现 inbox·outbox 幂等与崩溃恢复 → 停。
 3. 无法建立 `federation_channel` 双端映射 → 停。
-4. oidc 列宽 revert 存在数据/索引级根因影响影子方案 → 停。
 5. `source_peer_instance_id` 无既有成员表可安全承载 / 与 `source_space_id` 冲突 → 停。
 6. `short_no` / `federation_shadow` 列不可空且无安全落位 → 停。
 7. §3.3 影子路径审计发现无法统一拦截的认证入口 → 停。
@@ -294,7 +305,7 @@ spike 证明：只把影子 uid 加进 IM 订阅表，**IM 侧完全可用**（�
 1. ~~**2.3(a) 扩展**：IM 接受未知订阅者 **且** 接受伪装 from_uid 服务端发送 **且** 可捕获出站~~ —— ✅ **已实测 PASS**（§5.4，IM `v2.2.4-20260313`；结论仅对该版本成立，升级 IM 需重测）。
 2. ~~**出站事件捕获钩子在消息管线的确切落点**~~ —— ✅ **已实测定位**：gRPC `msg.notify` → `modules/webhook/api.go:208 → :368 → :374 → :263`（§5.5）。
 3. **IM 是否支持外置 client-msg-no 去重** — 仍未验证。
-4. **oidc uid 列宽 64 放大被 revert 的原因** — 仍未查，执行前必查 git log / PR。
+4. ~~**oidc uid 列宽 64 放大被 revert 的原因**~~ —— ✅ **已字节核实：不存在 revert**。`modules/oidc/sql/20260428000002_oidc_legacy01.sql` 的 `+migrate Up` 将 `oidc_audit_log.uid` 改为 `VARCHAR(64)`；`VARCHAR(40)` 仅出现在同文件的 `+migrate Down`（回滚子句）中，后续 `20260515000001_oidc_bind_uniques.sql` 未动列宽。故该列**当前生效宽度就是 64**。支撑「不用域限定 uid」的真实约束是**核心 `user.uid VARCHAR(40)`**（`modules/user/sql/20191106000003_user_legacy01.sql:8` 等），与 oidc 审计表无关。
 5. **`short_no` 可空性 / `federation_shadow` 及 `source_peer_instance_id` 列落位与迁移兼容** — 仍未验证。
 6. **本文档其余 file:line 证据** — 来自一轮独立勘察，未逐条重开复核；执行者需 drift check 对齐当时 HEAD。（§5.4/§5.5/§6.1 为 spike 实测所得，已核。）
 
@@ -327,5 +338,13 @@ spike 证明：只把影子 uid 加进 IM 订阅表，**IM 侧完全可用**（�
 
 ## 17. 测试要点汇总
 Phase 0 扩展 spike（阻塞）；影子穿 `QueryByUIDs` 无丢弃；外部标记按渲染面多点 fail-safe；缺归属入站被拒 / 影子不可全局搜索·加好友·登录；防重放（nonce）与幂等（idempotency）区分；outbox 崩溃恢复 / ACK；附件原子转存；生命周期 revoke·租约·profile 事件；HMAC 双密钥轮换；base_url SSRF 拒私网；E2E 双向 gate。
+
+🔴 **回环终止（P0，§5.5）—— Phase 1b 双向打通前必须绿：**
+- [api] 入站消息（`source_peer_instance_id` = peer B）在出站中继处被丢弃，**不产生**回 B 的 outbox 行。
+- [api] 影子 uid 发出的消息不产生任何出站 outbox 行。
+- [api] 双向配对下，B 发一条消息，A 侧最终只存在 **1 条**该消息、B 侧不再收到自己的回声（跑满一个 relay 周期后断言计数不增长）。
+- [api] 回环终止与幂等键**分别**生效：构造「新 message id + 新 idempotency_key 但带 source_peer 标记」的消息，断言被回环规则拦下（证明不是靠幂等表兜的）。
+
+🔴 **身份开通（P0，§3.2）**：未开通 `(peer, remote_uid)` 的入站消息被拒，且**不新建** `federation_identity` 行。
 
 ---
