@@ -463,3 +463,100 @@ func TestCardMutatorRefusesToRewriteStoredMarkerValues(t *testing.T) {
 		})
 	}
 }
+
+// PR-C review round 9 (Jerry-Xin and yujiawei, independently): the guard read
+// message.Payload, the immutable original, while edits persist to
+// message_extra.content_edit. Snapshot honours that distinction twelve lines
+// above; Mutate did not.
+//
+// The population this strands is the one the round-8 relaxation created. A
+// pre-PR-C card is HasProvenance=false in the original forever, so once the
+// first edit legitimately acquires provenance into content_edit, every later
+// edit was compared against bytes that no longer describe the card: the
+// provenance could be dropped outright, or kept and rewritten, and both clauses
+// were dead.
+//
+// The missing grid axis is not a case, it is the second dimension — the
+// effective frame differing from the original.
+func TestCardMutatorComparesAgainstTheEffectiveFrameNotTheOriginal(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		original  func(*testing.T, int64, bool) []byte
+		effective func(*testing.T, int64, bool) []byte
+		next      func(*testing.T, int64, bool) []byte
+		wantErr   bool
+	}{
+		{
+			// The exact sequence: pre-PR-C card, edit #1 acquires provenance,
+			// edit #2 drops it. Against the original this looked like no change.
+			name:     "provenance acquired by an earlier edit may not be dropped by a later one",
+			original: prePRCRegistryEnvelope, effective: markedTestCardEnvelope, next: prePRCRegistryEnvelope,
+			wantErr: true,
+		},
+		{
+			name:     "nor rewritten once the effective frame carries it",
+			original: prePRCRegistryEnvelope, effective: markedTestCardEnvelope,
+			next: func(t *testing.T, seq int64, act bool) []byte {
+				t.Helper()
+				var envelope map[string]interface{}
+				if err := json.Unmarshal(markedTestCardEnvelope(t, seq, act), &envelope); err != nil {
+					t.Fatal(err)
+				}
+				envelope[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+					Version:       cardmsg.CatalogProvenanceVersion,
+					PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
+					PrincipalID:   "someone-else",
+					SpaceID:       "space-1",
+				}.MarshalMap()
+				raw, err := json.Marshal(envelope)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			},
+			wantErr: true,
+		},
+		{
+			name:     "carrying the acquired provenance through is applied",
+			original: prePRCRegistryEnvelope, effective: markedTestCardEnvelope, next: markedTestCardEnvelope,
+		},
+		{
+			// The gate that used to skip the whole check when the *original*
+			// carried nothing: a legacy original whose effective frame has since
+			// been marked still gets the protection.
+			name:     "an unmarked original does not disable the check",
+			original: testCardEnvelope, effective: markedTestCardEnvelope, next: testCardEnvelope,
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			effective := test.effective(t, 41, false)
+			backend := &fakeMutationBackend{
+				message: storedCardMessage{
+					MessageID: "1001", MessageSeq: 7, FromUID: "notification",
+					Payload: test.original(t, 0, true),
+				},
+				effective: string(effective), effectiveSeq: 41, effectiveSet: true,
+			}
+			_, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+				SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+				ContentEdit: string(test.next(t, 42, false)),
+			})
+			if test.wantErr {
+				if !errors.Is(err, ErrCardMutationInvalid) {
+					t.Fatalf("Mutate() error = %v, want ErrCardMutationInvalid", err)
+				}
+				if len(backend.writes) != 0 {
+					t.Fatalf("a refused replacement was persisted: %+v", backend.writes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Mutate() error = %v, want success", err)
+			}
+			if len(backend.writes) != 1 {
+				t.Fatalf("writes = %+v, want 1", backend.writes)
+			}
+		})
+	}
+}

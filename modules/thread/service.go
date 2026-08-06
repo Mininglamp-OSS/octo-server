@@ -340,17 +340,32 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
 	// thread ext 行已 commit）。
 	if req.SourceMessageID != nil && len(req.SourceMessagePayload) > 0 {
-		// 从消息表查询原始发送者，防止客户端伪造
-		sourceFromUID, err := s.db.QueryMessageFromUID(req.GroupNo, *req.SourceMessageID)
+		// 发送者和内容都从消息表取同一行，防止客户端伪造。
+		//
+		// 只固定 from_uid 是不够的：payload 之前直接用请求里的 source_message_payload，
+		// 所以任何群成员都能造出一条 from_uid 是真实 bot、内容自己写的持久化消息。
+		// PR-C 之后这尤其危险 —— 顶层 template_ref / catalog_provenance 是 server-only
+		// 标记，action 路径把它们当作可信的 producer 身份读取，而这条拷贝路径不经过
+		// cardmsg.Validate，也不在拒绝这两个 key 的四个 ingress 之列。
+		//
+		// 不改成"按 key 拒绝"（其余 ingress 的做法）是因为那会打断合法场景：客户端
+		// 手里的卡片本来就带标记（服务端发给它的），回传创建子区会被拒。用服务端
+		// 自己的字节则两全 —— 合法拷贝照常工作，且 source_message_payload 整个退出
+		// 信任边界，只剩"是否要拷贝"这一个语义。
+		sourceFromUID, sourcePayload, err := s.db.QueryMessageSource(req.GroupNo, *req.SourceMessageID)
 		if err != nil {
-			s.Warn("查询源消息发送者失败，使用创建者作为发送者",
+			s.Warn("查询源消息失败，跳过拷贝",
 				zap.Error(err),
 				zap.Int64("messageID", *req.SourceMessageID))
-			sourceFromUID = req.CreatorUID
-		} else if sourceFromUID == "" {
-			sourceFromUID = req.CreatorUID
+		} else if len(sourcePayload) == 0 {
+			s.Warn("源消息不存在或无内容，跳过拷贝",
+				zap.Int64("messageID", *req.SourceMessageID))
+		} else {
+			if sourceFromUID == "" {
+				sourceFromUID = req.CreatorUID
+			}
+			s.sendSourceMessage(channelID, sourceFromUID, sourcePayload)
 		}
-		s.sendSourceMessage(channelID, sourceFromUID, req.SourceMessagePayload)
 	}
 
 	// 在父群发送子区创建消息（同样在 fanout 之后；与 sendSourceMessage 同序约束）。
@@ -367,10 +382,10 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 // 起点是创建者对父群的 effective space（GetMemberExternalFields 第 4 返回值）：
 //   - 外部成员                       -> 其 source_space_id
 //   - 现代（有 space）内部群的内部成员 -> 群自身 space_id
-//   - legacy（无 space）内部群的内部成员 -> ""（group.space_id==''）
+//   - legacy（无 space）内部群的内部成员 -> ""（group.space_id==”）
 //
 // 只有最后一种 legacy 情况需要归一化：effective space 为空，但现代客户端读 legacy
-// 群时带的是**非空** default space（#484 口径），补行若落 space_id='' 会在 SQL 层被
+// 群时带的是**非空** default space（#484 口径），补行若落 space_id=” 会在 SQL 层被
 // 过滤掉，创建者永远看不到自己刚建的子区（issue #557 的 silent no-op）。因此**仅对
 // 这一路径**（内部成员 + 空 effective space）把 space 归一到创建者自己的 default
 // space——正是读侧（以及 auto_follow fanout 的 follower 行）所在的 space。外部成员、
@@ -378,7 +393,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 //
 // 与 fanout 的关系：fanout（OnThreadCreated）的源数据来自群 ext 行，而群 ext 行只能
 // 由走 validateBase（拒空 space_id）的 follow 路径写入，所以 fanout 复制的必是非空
-// space，**永远不会**落 space_id=''。归一化到创建者 default space 后，创建者补行才
+// space，**永远不会**落 space_id=”。归一化到创建者 default space 后，创建者补行才
 // 与 fanout 的 follower 行落在同一非空 space。
 //
 // best-effort 降级：拿不到 default space（查询失败或用户无 default space）时，返回

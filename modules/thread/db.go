@@ -911,14 +911,23 @@ func (d *DB) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
 	return newVersion, tx.Commit()
 }
 
-// QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者
-func (d *DB) QueryMessageFromUID(channelID string, messageID int64) (string, error) {
+// QueryMessageSource 根据 channelID 和 messageID 查询消息的发送者与原始 payload。
+//
+// 两者都来自同一行，因为拷贝到子区的内容必须是服务端存下来的字节，而不是调用方
+// 回传的副本。此前只取 from_uid（"防止客户端伪造"），payload 仍由请求提供，于是
+// 任何群成员都能构造一条 from_uid 是真实 bot、内容自己写的持久化消息 —— 包括
+// PR-C 的 server-only 顶层标记 template_ref / catalog_provenance，而拷贝这条路径
+// 不经过 cardmsg.Validate。伪造出来的标记随后会被 action 路径当作可信身份读取。
+func (d *DB) QueryMessageSource(channelID string, messageID int64) (fromUID string, payload []byte, err error) {
 	table := d.getMessageTable(channelID)
-	var fromUID string
-	_, err := d.session.Select("from_uid").From(table).
+	var row struct {
+		FromUID string `db:"from_uid"`
+		Payload []byte `db:"payload"`
+	}
+	_, err = d.session.Select("from_uid", "payload").From(table).
 		Where("message_id=? AND channel_id=?", messageID, channelID).
-		Load(&fromUID)
-	return fromUID, err
+		Load(&row)
+	return row.FromUID, row.Payload, err
 }
 
 // SettingModel 子区用户设置
