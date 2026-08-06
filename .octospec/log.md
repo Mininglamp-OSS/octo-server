@@ -4,6 +4,27 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-06 (bot-setting-store)
+
+- **Task** — `bot-setting-store`: added `bot_setting`, a generic per-bot config
+  store, replacing "add another column to `robot`" as the way a bot-level switch
+  gets stored. One registry backs the write whitelist, the owner-facing catalog,
+  and the bot → `system_setting` → code-default resolution chain, so a new key
+  is an entry rather than a migration. First consumer is the four card switches
+  (`card_enabled` derived read-only from the deployment env; display /
+  interaction / reasoning owner-editable, default true because the master switch
+  is already fail-closed). `GET /v1/bot/card/profile` gained one additive
+  `config` object; `sendMessage` enforces the same values independently.
+  The precedent that looked right was the wrong one — `bot_mention_pref` is a
+  table because it is two-dimensional, not because tables are preferred. See
+  [journal](journal/shared/bot-setting-store.md).
+- **Learning (pending)** —
+  [`cleanalltables-does-not-reset-in-process-caches`](learnings/pending/cleanalltables-does-not-reset-in-process-caches.md):
+  generalizes the existing "CleanAllTables does not clear Redis rate-limit
+  buckets" note to every non-DB layer, after a process-wide `SystemSettings`
+  snapshot leaked between cases and failed only under `-shuffle`.
+  Candidate rule: `testing`.
+
 ## 2026-08-05 (bot-api-per-bot-ratelimit)
 
 - **Task** — `bot-api-per-bot-ratelimit` (#696): moved bot rate limiting off the

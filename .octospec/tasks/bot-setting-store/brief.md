@@ -110,9 +110,24 @@ owner 读与 adapter 读分属两个模块）。
 - **写后推事件失效插件缓存**：配置变更后向该 Bot 投递一条合成事件，插件据此即时
   重拉 profile，消除「改了开关要等插件 TTL」的窗口（对齐
   `sendMentionPrefNotification` 的动机）。账号级配置无频道上下文，用既有的
-  `robot.IService.EnqueueBotEvent`（`modules/robot/api.go:81-86`）投进
-  `/v1/bot/events` 队列，**不**照抄 mention_pref 的群频道消息。
+  类型化事件通道 `robot.IService.EnqueueBotTypedEvent`（`modules/robot/api.go`），
+  **不**照抄 mention_pref 的群频道消息——那条走群频道是因为免@偏好本身是群维度的。
+  事件**不携带具体新值**：带值就意味着事件与 profile 两条下发路径各自维护同一份
+  语义，一旦漂移，adapter 会拿事件里的旧形状覆盖 profile 的权威结果。
   best-effort：异步 + recover，投递失败只记日志，绝不影响写接口返回 200。
+- **多副本一致性分两档，且是刻意的**：per-Bot 覆盖**不做进程内缓存**，每次解析直读
+  MySQL，因此 owner 在副本 A 的改动对副本 B 立即可见；全局默认层继承
+  `system_setting` 的进程内快照 + `defaultReloadTTL=60s` 轮询，故改**全局默认**
+  最多 60s 才在所有副本生效。加 per-Bot 缓存会把即时一致换成 TTL 漂移，而失效事件
+  只到得了 Bot、到不了其它副本（要做得上 Redis pub/sub）——一致性优先于这点开销。
+- **热路径不得取进程级锁**：`common.EnsureSystemSettings` 每次调用都取全局 mutex
+  （`modules/common/system_settings.go`），而 `SystemSettings` 的设计前提是
+  「readers 走 atomic.Pointer、永不取锁」。解析器必须在**构造期**解析一次并持有实例
+  （`Robot.systemSettings` / `Service.systemSettings`），绝不可在每次请求里调
+  `EnsureSystemSettings`，否则等于把全局锁加到发卡路径上。
+- **门只加在新建路径**：`sendMessage` 的门在 `if cardIntent` 之内，非卡片消息零开销；
+  推理卡的流式更新走 `message/edit`，该路径**刻意不加门**（关闭只拦新建，已发卡要能
+  进终态）。故新增成本是「每张卡创建一次索引单行读」，而该路径本就有多次 DB 查询。
 
 ## Out of scope
 
