@@ -445,14 +445,24 @@ func (c *botCardTemplateCatalog) renderPayload(
 		"id": string(ref.ID), "version": ref.Version,
 	}
 	if authorProvenance {
-		rendered[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+		provenance := cardmsg.CatalogProvenance{
 			Version:       cardmsg.CatalogProvenanceVersion,
 			PrincipalType: cardmsg.CatalogPrincipalWireBot,
 			// The same access the render authorized under, so the marker cannot
 			// name a principal the render did not actually decide for.
 			PrincipalID: access.Principal.ID,
 			SpaceID:     provenanceSpaceID,
-		}.MarshalMap()
+		}
+		// Same reason as the internal-producer boundary in
+		// internal/carddispatch: an authoring site must not be able to write a
+		// marker its readers reject, and no later stage re-validates. These
+		// inputs are DB-derived rather than caller-supplied, so no failure is
+		// constructible here today — which is exactly why it should be a
+		// checked invariant instead of a property of the current callers.
+		if err := provenance.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: %v", errBotTemplateRequestInvalid, err)
+		}
+		rendered[cardmsg.CatalogProvenanceKey] = provenance.MarshalMap()
 	}
 	for _, key := range []string{"mention", "reply"} {
 		if value, ok := inbound[key]; ok {

@@ -122,15 +122,36 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 	// （裸 card 节点），够不到信封顶层，因此无法自报 principal；无模板元数据的
 	// legacy 文档不写标记（principal 只能靠猜，宁缺毋假）。
 	if refID, refVersion, ok := cardDocumentTemplateContext(cardDocument); ok {
-		payload[cardmsg.CatalogTemplateRefKey] = map[string]interface{}{
-			"id": refID, "version": refVersion,
-		}
-		payload[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+		provenance := cardmsg.CatalogProvenance{
 			Version:       cardmsg.CatalogProvenanceVersion,
 			PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
 			PrincipalID:   string(s.spec.ID),
 			SpaceID:       target.SpaceID,
-		}.MarshalMap()
+		}
+		// Validate before stamping, because nothing downstream will. The
+		// cardmsg.Validate call above runs before these keys exist, and
+		// Finalize only builds `plain` and rechecks size — so this is the last
+		// point at which an invalid marker can be refused.
+		//
+		// Refusing here rather than trimming target.SpaceID is deliberate: this
+		// is the one boundary that authors an internal-producer marker, and it
+		// should be unable to author one the readers reject. The readers are
+		// strict (ParseCatalogProvenance requires a trimmed space_id) while the
+		// gate on the way in only tests emptiness, and whether an untrimmed
+		// Space survives the membership lookup is decided by a collation the
+		// application does not choose: space_member declares none and inherits
+		// the database default, and CI creates that database PAD SPACE
+		// (utf8mb4_general_ci), where 'space-a ' matches 'space-a'. A stamped
+		// frame that no reader accepts is unclickable and uneditable forever,
+		// so this refuses the send instead of delivering a broken card.
+		if err := provenance.Validate(); err != nil {
+			terminal = cardErrorCategory(err)
+			return nil, categorized(terminal, err)
+		}
+		payload[cardmsg.CatalogTemplateRefKey] = map[string]interface{}{
+			"id": refID, "version": refVersion,
+		}
+		payload[cardmsg.CatalogProvenanceKey] = provenance.MarshalMap()
 	}
 
 	// Authorization has already established this exact active Space. It is the

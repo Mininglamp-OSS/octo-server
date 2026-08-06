@@ -747,6 +747,41 @@ func TestSendAuthorsCatalogProvenanceForRegistryDocuments(t *testing.T) {
 	assert.True(t, markers.HasProvenance)
 }
 
+// PR-C review round 6 (yujiawei P1-1): the marker-authoring boundary must be
+// unable to author a marker its readers reject.
+//
+// cardmsg.Validate runs before these keys exist and Finalize does not
+// re-validate, so before this guard an untrimmed target Space produced a stored
+// frame that every reader refuses — ParseCatalogProvenance requires a trimmed
+// space_id. The card rendered and then nothing about it worked: every button
+// click and every edit failed permanently, with no way to repair the message.
+//
+// Reaching it needed only an untrimmed Space to survive the membership lookup,
+// and whether it does is decided by a collation the application does not
+// choose. space_member declares none and inherits the database default; CI
+// creates that database utf8mb4_general_ci, which is PAD SPACE, so 'space-a '
+// matches 'space-a'. Measured both ways: PAD SPACE matches, and the MySQL 8.0
+// default utf8mb4_0900_ai_ci (NO PAD) does not. Refusing the send here removes
+// the dependency on that fact entirely.
+func TestSendRefusesToAuthorAMarkerItsReadersWouldReject(t *testing.T) {
+	registry, _, _, transport, _ := newHarness(t, validSpec())
+	sender, err := registry.Sender("summary-notify")
+	require.NoError(t, err)
+
+	untrimmed := validTarget()
+	untrimmed.SpaceID = "space-a "
+
+	_, err = sender.Send(context.Background(), untrimmed, Card{
+		Profile: cardmsg.ProfileV1, Document: registryCardDocument(),
+	})
+	require.Error(t, err, "an untrimmed Space produced a card whose markers no reader accepts")
+	require.ErrorIs(t, err, cardmsg.ErrCatalogMarkerInvalid)
+
+	// Nothing was delivered: the send fails instead of storing a broken card.
+	_, req := transport.snapshot()
+	assert.Nil(t, req, "a frame with an unreadable marker reached the transport")
+}
+
 func TestSendLeavesLegacyDocumentsUnmarked(t *testing.T) {
 	registry, _, _, transport, _ := newHarness(t, validSpec())
 	sender, err := registry.Sender("summary-notify")
