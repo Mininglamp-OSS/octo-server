@@ -108,7 +108,14 @@ func TestResolveRegistryCardContextRejectsV3LegacyControlIDs(t *testing.T) {
 	}
 	previousCatalog := cardtmpl.DefaultCatalog()
 	cardtmpl.SetDefaultCatalog(static)
-	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(previousCatalog) })
+	// Install the Registry too: the markerless-frame guard consults it, and
+	// production always has one (DefaultCatalog itself falls back to it).
+	previousRegistry := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(registry)
+	t.Cleanup(func() {
+		cardtmpl.SetDefaultCatalog(previousCatalog)
+		cardtmpl.SetDefaultRegistry(previousRegistry)
+	})
 
 	origin := cardActionFrameOrigin{SenderUID: "bot-reasoning", SpaceID: "space-1", SpaceKnown: true}
 	for _, tc := range []struct {
@@ -202,7 +209,17 @@ func provenanceActionFixture(t *testing.T) (*cardtmpl.Registry, *actionContextCa
 	spy := &actionContextCatalogSpy{Catalog: static}
 	previousCatalog := cardtmpl.DefaultCatalog()
 	cardtmpl.SetDefaultCatalog(spy)
-	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(previousCatalog) })
+	// The markerless-frame guard asks the frozen Registry whether it knows the
+	// version a frame names, so the fixture has to install one the way the
+	// composition root does. Without it the guard sees no Registry, answers
+	// "unknown" for everything, and every legacy frame is refused — fail-closed,
+	// but it would make this fixture disagree with production.
+	previousRegistry := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(registry)
+	t.Cleanup(func() {
+		cardtmpl.SetDefaultCatalog(previousCatalog)
+		cardtmpl.SetDefaultRegistry(previousRegistry)
+	})
 	return registry, spy
 }
 
@@ -393,5 +410,113 @@ func TestValidatedFramePrincipalRefusesAFrameSpaceItCannotCheck(t *testing.T) {
 	if _, err := resolveRegistryCardContext(context.Background(), blind, plain,
 		cardtmpl.DocsApproveActionID, plainData); errors.Is(err, errCardOriginSpaceUnavailable) {
 		t.Fatalf("an unmarked frame was refused for a Space it never claimed: %v", err)
+	}
+}
+
+// Review P1-1: the escalation this closes. A markerless frame's template
+// identity comes from `card.metadata.octo.template` — inside the card body a
+// raw caller controls — while raw ingress only rejects the two *top-level*
+// server-only keys. With no marker the principal fell back to the sending
+// Bot's own identity, and `Allows(action_context)` reads `edit`. So a Bot with
+// only `discover+edit` could fabricate a frame naming an active dynamic version
+// and drive its action route, with `edit` standing in for the `send` grant the
+// frame never had.
+//
+// Markerless compatibility exists for cards delivered before PR-C, every one of
+// which names a version the frozen Registry knows. Scoping the fallback to
+// exactly that population keeps invariant 7 and closes the substitution.
+func TestMarkerlessFrameNamingAnUnknownTemplateIsRefused(t *testing.T) {
+	registry, _ := provenanceActionFixture(t)
+	binding := func(string) (string, bool) { return "", false }
+	origin := cardActionFrameOrigin{
+		SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding,
+	}
+
+	// A markerless frame naming the frozen Registry's own version still works —
+	// that is the entire legacy population and it must not regress.
+	legacy, legacyData := markedActionFrame(t, registry, nil)
+	if _, err := resolveRegistryCardContext(context.Background(), origin, legacy,
+		cardtmpl.DocsApproveActionID, legacyData); err != nil {
+		t.Fatalf("a legacy markerless frame was refused: %v", err)
+	}
+
+	// The raw-forgery shape: no top-level marker at all (ingress rejects those
+	// by key presence), only the nested metadata a caller controls, pointed at
+	// a version the Registry does not know. Refused before any authorization.
+	forged := retargetFrameTemplateVersion(t, legacy, "9.9.9-dyn")
+	_, err := resolveRegistryCardContext(context.Background(), origin, forged,
+		cardtmpl.DocsApproveActionID, legacyData)
+	if !errors.Is(err, errMarkerlessDynamicFrame) {
+		t.Fatalf("err = %v, want errMarkerlessDynamicFrame", err)
+	}
+}
+
+// retargetFrameTemplateVersion rewrites metadata.octo.template.version, which is
+// the field a raw caller controls, leaving everything else intact.
+func retargetFrameTemplateVersion(t *testing.T, frame []byte, version string) []byte {
+	t.Helper()
+	var envelope map[string]any
+	if err := json.Unmarshal(frame, &envelope); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	// A raw caller cannot set the top-level marker — ingress rejects it by key
+	// presence — so the forgery has to work without one.
+	delete(envelope, "template_ref")
+	card, _ := envelope["card"].(map[string]any)
+	metadata, _ := card["metadata"].(map[string]any)
+	octo, _ := metadata["octo"].(map[string]any)
+	template, _ := octo["template"].(map[string]any)
+	if template == nil {
+		t.Fatal("frame carries no metadata.octo.template")
+	}
+	template["version"] = version
+	retargeted, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("encode frame: %v", err)
+	}
+	return retargeted
+}
+
+// Review P2-3: an unknown origin Space had to fail closed on *both* branches.
+// The empty-Space branch looks harmless and is not — assigning an unknown
+// origin leaves the principal's Space empty, which resolves against the global
+// grant row alone, so a principal holding an active global grant plus an exact
+// tombstone for the card's real Space would be allowed. That defeats invariant
+// 11, whose whole purpose is letting an exact tombstone shadow a live global
+// grant, and a transient group-row read failure is enough to reach it.
+func TestUnknownOriginSpaceIsRefusedWhateverTheFrameClaims(t *testing.T) {
+	registry, _ := provenanceActionFixture(t)
+	binding := func(producerID string) (string, bool) {
+		if producerID == "docs-notify" {
+			return "notification", true
+		}
+		return "", false
+	}
+	blind := cardActionFrameOrigin{SenderUID: "notification", ProducerBinding: binding}
+
+	for _, frameSpace := range []string{"space-1", ""} {
+		raw, actionData := markedActionFrame(t, registry, map[string]interface{}{
+			"version": 1, "principal_type": "internal_producer",
+			"principal_id": "docs-notify", "space_id": frameSpace,
+		})
+		_, err := resolveRegistryCardContext(context.Background(), blind, raw,
+			cardtmpl.DocsApproveActionID, actionData)
+		if !errors.Is(err, errCardOriginSpaceUnavailable) {
+			t.Fatalf("frame space %q: err = %v, want errCardOriginSpaceUnavailable", frameSpace, err)
+		}
+	}
+
+	// A determined origin still resolves, so the refusal is about not knowing
+	// rather than about the Space being absent.
+	known := blind
+	known.SpaceKnown = true
+	known.SpaceID = "space-1"
+	raw, actionData := markedActionFrame(t, registry, map[string]interface{}{
+		"version": 1, "principal_type": "internal_producer",
+		"principal_id": "docs-notify", "space_id": "space-1",
+	})
+	if _, err := resolveRegistryCardContext(context.Background(), known, raw,
+		cardtmpl.DocsApproveActionID, actionData); err != nil {
+		t.Fatalf("a determined origin Space was refused: %v", err)
 	}
 }

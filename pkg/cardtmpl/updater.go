@@ -208,6 +208,22 @@ func storedMarkersForUpdate(envelope json.RawMessage, target UpdateTarget) (card
 // updaterCatalogAccess 构造 historical_edit 的 catalog access。stored
 // provenance 存在时它是 principal 的唯一来源（D3：不从 sender 反推）；
 // legacy 无标记帧保留既有 sender 派生口径（static 历史兼容，invariant 7）。
+//
+// Review asked whether this fallback needs the same scoping the action ingress
+// just grew — refuse a markerless frame that names a version only the runtime
+// catalog knows. It does not, and the difference is the threat model rather
+// than the shape. At the action ingress the template identity comes from
+// `card.metadata.octo`, inside a card body a raw caller controls, and the
+// derived principal is the *sending Bot's own* grant identity, so a fabricated
+// frame turns an `edit` grant into a substitute for `send`. Here the identity
+// is the caller's own `target.SenderUID`, every caller is an in-process
+// internal producer, and `Snapshot` has already proven that sender owns the
+// stored message. There is no path by which a request supplies it.
+//
+// Adding the check anyway would mean threading a Registry through
+// NewCardUpdater purely to guard a hole nothing can reach, and it would refuse
+// legitimate edits of pre-PR-C frames in any deployment whose default Registry
+// is not the one the updater was built over. Recorded rather than done.
 func updaterCatalogAccess(target UpdateTarget, markers cardmsg.FrameCatalogMarkers) (CatalogAccess, error) {
 	if markers.HasProvenance {
 		principal, err := CatalogPrincipalFromProvenance(markers.Provenance)

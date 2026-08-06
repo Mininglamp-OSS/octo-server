@@ -42,7 +42,10 @@ const (
 	// version. The row-value cursor comparison keeps the scan on the primary
 	// key order, and the grant join is an existence test rather than a fetch —
 	// nothing about the grant reaches the response.
-	selectDiscoverableSQL = `SELECT c.template_id, c.version, a.owner, a.protocol,
+	// %s is the approved-owner predicate, injected from the one policy B2's
+	// authorizer also enforces (owner_policy.go). It is not inlined because a
+	// second literal list here is exactly how the two surfaces drift.
+	selectDiscoverableSQLTemplate = `SELECT c.template_id, c.version, a.owner, a.protocol,
             a.contract_version, a.visibility, a.content_sha256,
             act.active_version IS NOT NULL AND act.active_version = c.version
         FROM card_template_version_claim c
@@ -57,13 +60,14 @@ const (
         WHERE c.source = 'dynamic'
           AND a.blocked_at IS NULL
           AND (a.visibility = ? OR g.template_id IS NOT NULL)
+          AND %s
           AND (c.template_id, c.version) > (?, ?)
         ORDER BY c.template_id ASC, c.version ASC
         LIMIT ?`
 	// selectDiscoverableExactSQL is the B2 metadata read. It applies the same
 	// predicate, so an invisible, blocked or unknown template is a single
 	// indistinguishable empty result — the caller cannot tell which.
-	selectDiscoverableExactSQL = `SELECT c.template_id, c.version, a.owner, a.protocol,
+	selectDiscoverableExactSQLTemplate = `SELECT c.template_id, c.version, a.owner, a.protocol,
             a.contract_version, a.visibility, a.content_sha256,
             act.active_version IS NOT NULL AND act.active_version = c.version
         FROM card_template_version_claim c
@@ -78,7 +82,8 @@ const (
         WHERE c.template_id = ? AND c.version = ?
           AND c.source = 'dynamic'
           AND a.blocked_at IS NULL
-          AND (a.visibility = ? OR g.template_id IS NOT NULL)`
+          AND (a.visibility = ? OR g.template_id IS NOT NULL)
+          AND %s`
 )
 
 // ErrDiscoveryNotVisible is the single outcome for "no such template", "you may
@@ -110,9 +115,12 @@ func (s *store) ListDiscoverable(
 	limit int,
 ) ([]DiscoveryRow, bool, error) {
 	limit = boundedDiscoveryLimit(limit)
-	rows, err := s.db.QueryContext(ctx, selectDiscoverableSQL,
-		strings.TrimSpace(spaceID), cardtmpl.CatalogVisibilityPublic,
-		string(afterID), afterVersion, limit+1)
+	ownerPredicate, ownerArgs := approvedOwnerPredicate("a.owner")
+	args := []any{strings.TrimSpace(spaceID), cardtmpl.CatalogVisibilityPublic}
+	args = append(args, ownerArgs...)
+	args = append(args, string(afterID), afterVersion, limit+1)
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(selectDiscoverableSQLTemplate, ownerPredicate), args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("card template catalog: list discoverable: %w", err)
 	}
@@ -143,8 +151,11 @@ func (s *store) LoadDiscoverable(
 	id cardtmpl.ID,
 	version string,
 ) (DiscoveryRow, error) {
-	rows, err := s.db.QueryContext(ctx, selectDiscoverableExactSQL,
-		strings.TrimSpace(spaceID), string(id), version, cardtmpl.CatalogVisibilityPublic)
+	ownerPredicate, ownerArgs := approvedOwnerPredicate("a.owner")
+	args := []any{strings.TrimSpace(spaceID), string(id), version, cardtmpl.CatalogVisibilityPublic}
+	args = append(args, ownerArgs...)
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(selectDiscoverableExactSQLTemplate, ownerPredicate), args...)
 	if err != nil {
 		return DiscoveryRow{}, fmt.Errorf("card template catalog: load discoverable: %w", err)
 	}

@@ -347,7 +347,7 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 		space = provenanceSpaceID(principal, env)
 	}
 	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
-		c.staticRefResolver(c.editAllowed, "not edit-compatible"), true, space)
+		c.editRefResolver(principal), true, space)
 }
 
 // storedProvenanceSpaceID reads the Space a frame's own marker records, or ""
@@ -461,6 +461,75 @@ func (c *botCardTemplateCatalog) requireEditableRef(value any) (botTemplateRef, 
 		return botTemplateRef{}, errBotTemplateCatalogUnavailable
 	}
 	return c.requireRef(value, c.editAllowed, "template is not edit-compatible")
+}
+
+// resolveEditRef authorizes one historical-edit ref, static or dynamic.
+//
+// PR-C review: `requireEditableRef` alone consults only `editAllowed`, a
+// boot-time map of code-reviewed static exacts. A version published at runtime
+// can never be in that map, so a Bot that had just been granted `send` on a
+// dynamic template — and had used it — was refused every edit of the card it
+// had itself sent, before stored provenance or the runtime authorizer were ever
+// consulted. `send` reached the dynamic authorizer and `edit` never did, which
+// left the D2 `send|edit` grant half-wired.
+//
+// Two rules make this different from the send path:
+//
+//   - It is pinned. The query carries the stored exact version, so it never
+//     follows the activation pointer; following it would rewrite an existing
+//     card across versions, which is exactly what D6 forbids.
+//   - The static allowlist answers first, without any DB read. That is what
+//     keeps a gates-off deployment on precisely its pre-PR-C behaviour: an
+//     unresolved principal (which is what a dark catalog produces) withholds
+//     only the dynamic overlay.
+func (c *botCardTemplateCatalog) resolveEditRef(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+	value any,
+) (botTemplateRef, error) {
+	if c == nil || c.catalog == nil {
+		return botTemplateRef{}, errBotTemplateCatalogUnavailable
+	}
+	ref, err := parseBotTemplateRef(value)
+	if err != nil {
+		return botTemplateRef{}, err
+	}
+	if _, ok := c.editAllowed[ref]; ok {
+		return ref, nil
+	}
+	notEditable := fmt.Errorf("%w: template is not edit-compatible", errBotTemplateRequestInvalid)
+	source := c.authorizationSource()
+	if source == nil || !principal.SpaceResolved {
+		return botTemplateRef{}, notEditable
+	}
+	auth, err := source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: ref.ID, Version: ref.Version, Principal: principal.catalogPrincipal(),
+	})
+	if err != nil {
+		// One indistinguishable refusal for "no such version" and "not granted",
+		// matching the send path: a producer must not be able to use edit
+		// rejections to enumerate which versions exist.
+		if errors.Is(err, cardtmpl.ErrTemplateUnknown) ||
+			errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+			return botTemplateRef{}, notEditable
+		}
+		return botTemplateRef{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+	}
+	if auth.Artifact.Blocked || !auth.Grant.Allows(cardtmpl.CatalogPurposeHistoricalEdit) {
+		return botTemplateRef{}, notEditable
+	}
+	return ref, nil
+}
+
+// editRefResolver adapts resolveEditRef to the render path's resolver
+// signature, so the pre-gate and the render agree by construction rather than
+// by two allowlists that happen to match.
+func (c *botCardTemplateCatalog) editRefResolver(
+	principal botCatalogPrincipal,
+) func(context.Context, any) (botTemplateRef, error) {
+	return func(ctx context.Context, value any) (botTemplateRef, error) {
+		return c.resolveEditRef(ctx, principal, value)
+	}
 }
 
 // staticRefResolver adapts a boot-time allowlist to the resolver signature.

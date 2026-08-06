@@ -30,7 +30,8 @@ type stubAuthorizationSource struct {
 	granted []cardtmpl.RuntimeAdvertisedTemplate
 	listErr error
 
-	loads int
+	loads   int
+	queries []cardtmpl.RuntimeAuthorizationQuery
 }
 
 func (s *stubAuthorizationSource) LoadAuthorization(
@@ -38,6 +39,7 @@ func (s *stubAuthorizationSource) LoadAuthorization(
 	query cardtmpl.RuntimeAuthorizationQuery,
 ) (cardtmpl.RuntimeAuthorization, error) {
 	s.loads++
+	s.queries = append(s.queries, query)
 	if s.err != nil {
 		return cardtmpl.RuntimeAuthorization{}, s.err
 	}
@@ -1038,5 +1040,118 @@ func TestDecideSendRefRefusesADisabledPointerFromTheBatch(t *testing.T) {
 	none := cardtmpl.RuntimeAuthorization{}
 	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, none); ref != staticRef {
 		t.Fatalf("an unactivated template lost its static version: %+v", ref)
+	}
+}
+
+// Review (Jerry-Xin blocking / yujiawei S2+P1-2): the `send|edit` grant was
+// half-wired. `send` reached the dynamic authorizer; `edit` was gated on a
+// boot-time map of static exacts that a runtime-published version can never be
+// in, so a Bot could be granted a dynamic template, send it, and then have no
+// way to edit the card it had just sent. For a state-machine card that is a
+// dead end.
+func TestBotEditResolvesADynamicRefThroughTheEditGrant(t *testing.T) {
+	dynamicRef := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: "9.9.9-dyn"}
+	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true}
+	authorized := func(grant cardtmpl.RuntimeGrant) *stubAuthorizationSource {
+		return &stubAuthorizationSource{
+			newSend: true,
+			auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+				dynamicRef.ID: {
+					Version: dynamicRef.Version,
+					Artifact: cardtmpl.RuntimeArtifactMeta{
+						ID: dynamicRef.ID, Version: dynamicRef.Version,
+						Source: cardtmpl.RuntimeSourceDynamic,
+					},
+					Grant: grant,
+				},
+			},
+		}
+	}
+	refValue := map[string]any{"id": string(dynamicRef.ID), "version": dynamicRef.Version}
+
+	// Granted edit: the dynamic exact resolves even though it is absent from
+	// the static EditCompatible allowlist.
+	catalog := newMustTestCatalog(t)
+	catalog.authorization = authorized(cardtmpl.RuntimeGrant{
+		Found: true, Scope: cardtmpl.RuntimeGrantScopeExact, Discover: true, Edit: true,
+	})
+	if _, ok := catalog.editAllowed[dynamicRef]; ok {
+		t.Fatal("fixture precondition broken: the dynamic ref is in the static allowlist")
+	}
+	got, err := catalog.resolveEditRef(context.Background(), principal, refValue)
+	if err != nil {
+		t.Fatalf("a granted dynamic edit was refused: %v", err)
+	}
+	if got != dynamicRef {
+		t.Fatalf("resolved %+v, want %+v", got, dynamicRef)
+	}
+
+	// The read is pinned to the stored exact version — an edit must never
+	// follow the activation pointer, or it would rewrite a card across
+	// versions (D6).
+	if len(catalog.authorization.(*stubAuthorizationSource).queries) > 0 {
+		if v := catalog.authorization.(*stubAuthorizationSource).queries[0].Version; v != dynamicRef.Version {
+			t.Fatalf("edit query version = %q, want the stored exact %q", v, dynamicRef.Version)
+		}
+	}
+
+	// Revoked (a tombstone: found, no permissions) → refused, and refused as a
+	// client error rather than an outage.
+	revoked := newMustTestCatalog(t)
+	revoked.authorization = authorized(cardtmpl.RuntimeGrant{
+		Found: true, Scope: cardtmpl.RuntimeGrantScopeExact,
+	})
+	if _, err := revoked.resolveEditRef(context.Background(), principal, refValue); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("revoked edit error = %v, want errBotTemplateRequestInvalid", err)
+	}
+
+	// A send-only grant does not confer edit.
+	sendOnly := newMustTestCatalog(t)
+	sendOnly.authorization = authorized(cardtmpl.RuntimeGrant{
+		Found: true, Scope: cardtmpl.RuntimeGrantScopeExact, Discover: true, Send: true,
+	})
+	if _, err := sendOnly.resolveEditRef(context.Background(), principal, refValue); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("send-only edit error = %v, want errBotTemplateRequestInvalid", err)
+	}
+
+	// Blocked artifact refuses even with an edit grant.
+	blockedSource := authorized(cardtmpl.RuntimeGrant{
+		Found: true, Scope: cardtmpl.RuntimeGrantScopeExact, Discover: true, Edit: true,
+	})
+	blockedAuth := blockedSource.auth[dynamicRef.ID]
+	blockedAuth.Artifact.Blocked = true
+	blockedSource.auth[dynamicRef.ID] = blockedAuth
+	blocked := newMustTestCatalog(t)
+	blocked.authorization = blockedSource
+	if _, err := blocked.resolveEditRef(context.Background(), principal, refValue); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("blocked edit error = %v, want errBotTemplateRequestInvalid", err)
+	}
+}
+
+// The static half must not acquire a DB dependency: a code-reviewed static
+// exact stays editable with no resolver at all, which is what keeps a
+// gates-off deployment on exactly its pre-PR-C behaviour.
+func TestBotEditKeepsStaticRefsAnsweringWithoutTheRuntime(t *testing.T) {
+	catalog := newMustTestCatalog(t)
+	staticRef := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	if _, ok := catalog.editAllowed[staticRef]; !ok {
+		t.Fatal("fixture precondition broken: the static ref is not edit-compatible")
+	}
+	refValue := map[string]any{"id": string(staticRef.ID), "version": staticRef.Version}
+
+	// No resolver, unresolved principal — the dark-catalog shape.
+	got, err := catalog.resolveEditRef(context.Background(), botCatalogPrincipal{BotID: "bot-1"}, refValue)
+	if err != nil {
+		t.Fatalf("a static edit needed the runtime: %v", err)
+	}
+	if got != staticRef {
+		t.Fatalf("resolved %+v, want %+v", got, staticRef)
+	}
+
+	// And an unknown dynamic ref is still refused there, rather than falling
+	// open because no resolver was available to say no.
+	unknown := map[string]any{"id": string(aireasoningprocess.TemplateID), "version": "9.9.9-dyn"}
+	if _, err := catalog.resolveEditRef(context.Background(), botCatalogPrincipal{BotID: "bot-1"}, unknown); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("dark-catalog dynamic edit error = %v, want errBotTemplateRequestInvalid", err)
 	}
 }

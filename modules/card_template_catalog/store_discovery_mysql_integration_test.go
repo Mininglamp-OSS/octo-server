@@ -448,3 +448,51 @@ func TestListTemplatesPagesByKeysetRealMySQL(t *testing.T) {
 		}
 	}
 }
+
+// Review P2-1: B1's predicate had no owner clause while B2's authorizer
+// enforces the approved-owner allowlist, so the two could disagree about the
+// same row. Latent while publish gates on the same list — but that list is the
+// per-owner kill switch. Narrow it during an incident and B1 would keep listing
+// every affected template with full metadata, and keep spending LIMIT slots on
+// rows B2 answers not-found for.
+//
+// The row is seeded directly rather than published, because publish rejects an
+// unapproved owner: the state under test is one that already existed when the
+// allowlist was narrowed, which is exactly the incident.
+func TestDiscoveryHidesRowsWhoseOwnerLeftTheAllowlistRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	seedDiscoveryFixture(t, db)
+	catalogStore := newStore(db)
+	ctx := discoveryIntegrationContext(t)
+
+	const retiredOwner = "retired-owner"
+	if isApprovedRuntimeOwner(retiredOwner) {
+		t.Fatalf("fixture precondition broken: %q is still approved", retiredOwner)
+	}
+	seedDiscoveryVersion(t, db, "test.disco-g-retired", "1.0.0", cardtmpl.CatalogVisibilityPublic, false)
+	if _, err := db.Exec(`UPDATE card_template_artifact SET owner = ?
+        WHERE template_id = ? AND version = '1.0.0'`, retiredOwner, "test.disco-g-retired"); err != nil {
+		t.Fatalf("retire owner: %v", err)
+	}
+
+	// B1: absent from every page, and it does not consume a slot on the way.
+	walked := discoveryRowIDs(walkDiscoverable(t, ctx, catalogStore, discoveryIntegrationSpaceID, 2))
+	for _, id := range walked {
+		if strings.HasPrefix(id, "test.disco-g-retired@") {
+			t.Fatalf("a retired-owner row was listed: %v", walked)
+		}
+	}
+
+	// B2: the same row is not visible either, so list and detail agree.
+	if _, err := catalogStore.LoadDiscoverable(ctx, discoveryIntegrationSpaceID,
+		"test.disco-g-retired", "1.0.0"); !errors.Is(err, ErrDiscoveryNotVisible) {
+		t.Fatalf("retired-owner detail err = %v, want ErrDiscoveryNotVisible", err)
+	}
+
+	// An approved owner is untouched — the predicate narrows, it does not
+	// swallow the catalog.
+	if _, err := catalogStore.LoadDiscoverable(ctx, discoveryIntegrationSpaceID,
+		"test.disco-a-public", "1.0.0"); err != nil {
+		t.Fatalf("an approved-owner row was hidden: %v", err)
+	}
+}

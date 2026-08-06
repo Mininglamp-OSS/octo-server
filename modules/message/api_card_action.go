@@ -378,6 +378,25 @@ func resolveRegistryCardContext(
 			PrincipalID:   principal.ID,
 			SpaceID:       principal.SpaceID,
 		}
+	} else if !frozenRegistryKnows(cardtmpl.ID(ref.ID), ref.Version) {
+		// D3 fail-close for a markerless frame that names a *dynamic* version.
+		//
+		// The identity above comes from `card.metadata.octo.template`, which
+		// lives inside the card body a raw caller controls; raw ingress rejects
+		// the two server-only *top-level* keys, not this. Without this branch a
+		// frame carrying no server-authored provenance is authorized against
+		// the sender-derived Bot principal — which is the sending Bot's own
+		// grant identity — and `Allows(action_context)` reads `edit`. So a Bot
+		// holding only `discover+edit` could fabricate a frame naming an active
+		// dynamic version and drive its action route, with `edit` standing in
+		// for the `send` grant the frame never had.
+		//
+		// Markerless compatibility exists for one population: cards delivered
+		// before PR-C, every one of which names a version the frozen Registry
+		// knows. Scoping the fallback to exactly that population keeps invariant
+		// 7 intact and closes the substitution.
+		return cardactiondispatch.CardContext{}, fmt.Errorf(
+			"%w: %s@%s", errMarkerlessDynamicFrame, ref.ID, ref.Version)
 	}
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
@@ -449,15 +468,21 @@ func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.Ca
 	// passing a trusted boundary could name any Space it liked. The bot branch
 	// above pins the principal *id* to the stored sender; nothing pins the
 	// Space but this.
-	if principal.SpaceID != "" {
-		if !origin.SpaceKnown {
-			return cardtmpl.CatalogPrincipal{}, fmt.Errorf(
-				"%w: card origin space is unavailable, cannot verify stored provenance space",
-				errCardOriginSpaceUnavailable)
-		}
-		if principal.SpaceID != origin.SpaceID {
-			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
-		}
+	// Refuse whenever the origin Space is unknown, whether or not the frame
+	// names one. The empty-Space branch looks harmless and is not: assigning an
+	// unknown origin leaves principal.SpaceID == "", which loadGrantDecision
+	// resolves against the *global* row alone. A principal holding an active
+	// global grant plus an exact tombstone for the card's real Space would then
+	// be allowed — defeating invariant 11, which exists precisely so an exact
+	// tombstone can shadow a live global grant. A transient group-row read is
+	// enough to reach it, so the unknown case has to fail closed on both sides.
+	if !origin.SpaceKnown {
+		return cardtmpl.CatalogPrincipal{}, fmt.Errorf(
+			"%w: card origin space is unavailable, cannot resolve the grant scope",
+			errCardOriginSpaceUnavailable)
+	}
+	if principal.SpaceID != "" && principal.SpaceID != origin.SpaceID {
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
 	}
 	if principal.SpaceID == "" {
 		principal.SpaceID = origin.SpaceID
@@ -470,6 +495,27 @@ func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.Ca
 // the first is worth retrying, and reporting it as a client error would tell an
 // operator to go looking at the payload instead of at the group table.
 var errCardOriginSpaceUnavailable = errors.New("message: card origin space unavailable")
+
+// errMarkerlessDynamicFrame is the refusal for a frame that names a template
+// the frozen Registry does not know and carries no server-authored provenance.
+// It is deliberately not merged into the generic invalid-action error class at
+// the source so the reason survives into the logs; the handler still collapses
+// it onto the one client-visible 400, because telling a caller *which* of the
+// action rejections it hit is an enumeration aid.
+var errMarkerlessDynamicFrame = errors.New("message: dynamic frame carries no server-authored provenance")
+
+// frozenRegistryKnows reports whether the process Registry holds this exact
+// version. It is the test for "this card predates the dynamic catalog", not a
+// permission check — a static template being known here says nothing about who
+// may act on it, which is still decided by the authorizer downstream.
+func frozenRegistryKnows(id cardtmpl.ID, version string) bool {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return false
+	}
+	_, err := registry.Lookup(id, version)
+	return err == nil
+}
 
 var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")
 

@@ -452,6 +452,16 @@ finds them directly.
   (the batch reducer, which is a second implementation).
 - [x] `space` principal rejects non-canonical principal/scope combinations —
   `TestValidateGrantIdentityCanonicalShapes`, `TestGrantPathIdentityCanonicalValidation`.
+- [x] an unresolvable card-origin Space refuses the action on both branches,
+  whether or not the frame names a Space —
+  `TestUnknownOriginSpaceIsRefusedWhateverTheFrameClaims`. Assigning an unknown
+  origin used to leave the principal's Space empty, which resolves against the
+  global grant row alone — so an active global grant plus an exact tombstone for
+  the card's real Space would have been allowed, defeating invariant 11.
+- [x] B1's listing predicate and B2's authorizer apply the same approved-owner
+  policy — `TestDiscoveryHidesRowsWhoseOwnerLeftTheAllowlistRealMySQL`. Both now
+  derive from `approvedOwnerPredicate`, so narrowing the allowlist during an
+  incident cannot leave B1 listing rows B2 answers not-found for.
 - [x] cross-Space profile/send/edit/action attempts fail before
   render/enqueue/mutation — send `TestBotSendCatalogPrincipalUsesTheTargetGroupSpace`,
   edit `TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace` (the cross-Space
@@ -462,6 +472,14 @@ finds them directly.
   `TestDMSendRequiresThePeerToBeInTheAuthorizedSpace`,
   `TestResolveBotGrantSpaceIDRefusesEveryAmbiguity`,
   `TestDMPeerCheckIsSkippedWhenTheCatalogIsDark`.
+- [x] a markerless frame naming a template the frozen Registry does not know is
+  refused before authorization — `TestMarkerlessFrameNamingAnUnknownTemplateIsRefused`.
+  Raw ingress rejects the two server-only *top-level* keys, but the template
+  identity also appears in `card.metadata.octo`, inside the body a caller
+  controls. Without this the sender-derived fallback principal is the sending
+  Bot's own grant identity and `Allows(action_context)` reads `edit`, so a
+  fabricated frame let an `edit` grant stand in for the `send` grant it never
+  had. Markerless compatibility is now scoped to the pre-PR-C population.
 - [x] raw callers cannot forge `template_ref` or `catalog_provenance` through
   any type-17 ingress/edit — `TestSendMessageRawCardRejectsForgedCatalogProvenance`,
   `TestBotRawEditRejectsCatalogProvenanceMarkers`,
@@ -487,6 +505,14 @@ finds them directly.
   `TestBotTemplateSendRejectsStaleDynamicRef`,
   `TestAdvertisedSendRefsBatchesAndAgreesWithThePerIDPath` (the batched manifest
   reaches the same conclusion as the per-ID resolver).
+- [x] Bot historical edit consults the runtime `edit` grant, not only the static
+  allowlist — `TestBotEditResolvesADynamicRefThroughTheEditGrant` (granted,
+  revoked, send-only and blocked, with the query pinned to the stored exact
+  version), `TestBotEditKeepsStaticRefsAnsweringWithoutTheRuntime`. Two
+  reviewers flagged this independently: `requireEditableRef` consulted only the
+  boot-time `EditCompatible` map, which a runtime-published version can never
+  be in, so `send` reached the dynamic authorizer and `edit` never did. The
+  brief claimed a closure the code did not have until this was wired.
 - [x] one authorization decision never combines activation/block/grant values
   from different DB snapshots — `TestStoreLoadAuthorizationReadsPointerArtifactAndGrantInOneTransaction`,
   `TestRuntimeCatalogDynamicNewSendUsesExactlyOneSnapshot`,
