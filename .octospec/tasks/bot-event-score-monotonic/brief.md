@@ -160,9 +160,12 @@ PR #644·#648 把 `message_extra.version` 换成了事务性 per-channel 序列
 
 ## Acceptance
 
-- **源码守卫**：新增测试断言 `robotEvent:` 的**每一个** `ZADD` 站点都经由新分配器，
-  且 `GenSeq(RobotEventSeqKey…)` 在 `modules/` 下不再有调用点（参照
-  `TestEveryBotEventQueueWriterRingsTheDoorbell` 与 `msgextraseq` 的 PR-2c 守卫形状）。
+- **源码守卫**：`GenSeq(RobotEventSeqKey…)` 在 `modules/` 下不再有调用点（守卫改为断言
+  **key 符号本身**不得出现在 allowlist 之外，见第四轮记录），且每个 `robotEvent:` 的
+  `ZADD` 都摇门铃。
+  > **DEFERRED（第六轮 review 达成一致）**：本条原文还要求断言每个 `ZADD` 的 **score 来源**
+  > 是新分配器。已发的两个守卫都不约束 score —— 一个用 `time.Now().UnixNano()` 打分的
+  > writer 能同时通过。已记入 `Mininglamp-OSS/octo-server#704` Gap 4，不在本任务交付。
 - **并发单调性（新分配器）**：并发 goroutine × 两个独立分配器实例发 N 号，断言结果
   **严格递增且无重复**。
 - **对照必须失败（已本地验证可行，方法见下）**：同一条无损性断言用今天的 `GenSeq` 跑
@@ -499,3 +502,63 @@ sql-migrate 应用（`gorp_migrations` 有记录、状态表已建）。
 `pkg/redis`、`modules/robot`、`modules/bot_api`、`modules/message` 整包绿。
 `modules/message` 的 `TestE2E_Issue557_*` 一度红过一次并被我误判成迁移文件所致 —— 重跑两次
 均绿，是依赖 IM 的 flaky，**「revert 之后就好了」那一次是巧合**，记在这里以免下次又当因果。
+
+## 第五轮实现记录（第六轮 review 之后，2026-08-06）
+
+上一轮的两条修复又各自以新的方式出错，其中一条是我记为「已修」的。这一轮最重要的决定是
+**停止在本 PR 里迭代 durable-mark 边界**。
+
+1. **改主意：durable-mark 边界整块移交 `#704`，不再本地打第三次补丁。**
+   review 指出上一轮的 span 边界在**每次 seed 后的第一次分配**就已过界，且是确定性的：
+   `seedCounter` 存 `lastDurable = durableMax`，却把计数器 seed 到 `max(sources) + margin`，
+   两者天生差一个 margin。后果是第一次 durable 写失败就拒绝并**丢事件**，探针变成风暴
+   （每 bot 每 200ms 一次 300ms deadline 的 INSERT，都在 msgSem 槽内，约 67 个活跃 bot
+   打满 100 槽），错误文案的算术也是错的。**我的测试第三次断言在旁边那个机制上** —— 它先做
+   一次健康分配才打断写入，于是从没覆盖「seed 时写入就已经坏了」这个边界存在的状态。
+
+   我先按计划试算「让 seed 持久化自己的 floor」，算完发现修不好：
+
+       seed 把计数器设到 S = max(sources) + seedSafetyMargin
+       恢复时的 seed **重放同一个计算**，落在同一个 S。seed 后发出的号是 S+1, S+2, …，全在 S 之上。
+
+   也就是说 seed 后的**第一个 id** 就已经在「从未变的 mark 恢复」够不到的地方 —— 暴露不是
+   在某段宽限之后开始，是立刻开始。要关掉它必须在 seed 时推进 mark，而记录了 seed 值的 mark
+   会回灌进下一次 seed 的 floor，于是**每次 re-seed 复利一个 block**，并推翻
+   `TestSeedIsIdempotentAndNeverLowers` 守的「再 seed 是 no-op」。这不是改一个比较式，是
+   **改变 recovery floor 的定义** —— 正是 `#704` 那张表要做的事，两位 reviewer 也都建议移过去。
+
+   所以现在：保留 mark、节流（失败也重新武装，这是 P1-7 真正修好的那半）、metric，**如实写出
+   「写失败期间 mark 无界滞后」**，并用 `TestFailedDurableWriteIsThrottledAndDoesNotFailTheEnqueue`
+   把这个 gap 钉成测试事实（断言它**仍在**，将来修好会失败并提醒改成回归测试）。
+   算术与两次失败的原因都写进了 `#704` Gap 3，以免第三次重试同一条路。
+
+2. **上一轮的「按被拒 mirror 值缓存否定结论」能吞掉真正的激活。** `Activate` 把 epoch 0→1，
+   工具随后写的 mirror 就是 `incr:1` —— 与一个可能早已躺在 Redis 里的伪造 `incr:1`
+   **字节相同**，缓存命中，那些副本在 TTL 内继续 legacy 而别的副本已用 counter。激活瞬间
+   两个活跃号源。我 docstring 里写的「换一个值、包括真正的激活，仍算冲突」是错的。
+   **改为删除**与权威矛盾的 mirror（按值 CAS 删）：权威说 legacy 时正确的 mirror 状态就是
+   「不存在」，这与「权威说激活就重建 mirror」是对称的修复，于是没有缓存可过期，读风暴也
+   不需要缓存来挡。只剩「删不掉时」的短冷却（1s，而那种状态下 counter 的 INCR 也在失败）。
+   工具另加一道：检测到未授权 mirror 时**拒绝激活**，把前置条件在有人值守的那一步消掉。
+
+3. **`invalidateSeeded` 的删除顺序**能让并发 reseed 留下「已 seeded 但配套状态被清」的 bot。
+   改成 `seeded` 最后删 —— 最坏交错变成「未 seeded 但有残留簿记」，下次分配重 seed 即修。
+
+4. **staleness 快捷路径**会用「针对另一次 mirror 观测解析出的 belief」作答：加 mirror 复核。
+
+5. **那句运维在事故里唯一会读的文案是错的。** `counterExists` 拒绝里我写「restore the state
+   row (or set `OCTO_BOTEVENT_EXPECTED_MODE=incr`)」，但设了这个 env 会走到
+   `assertExpectedMode(false)` 报错，分配照样失败 —— 它是 fail-closed 断言，不是手动 override。
+   已改成说清它到底买到什么。Rollout 第 6 步同样错（三种形态里两种已不再自愈），已拆成三个
+   metric 并写明哪个不自愈。
+
+6. **`payload.robot_id` 的 fail-open 路径加语法界**：长度 ≤ `robot.robot_id` 的列宽（40）+
+   拒空白/控制字符。长度这条不需要判断力 —— 超过列宽的值不可能匹配任何行，所以采用它只可能
+   为一个可证不存在的 bot 创建永久状态。**刻意不做字符集白名单**：生产 id 是 UUID-hex，但列里
+   存什么都行，猜窄了会静默掉一个真 bot 的事件。另加一条测试把常量与列宽绑在一起。
+
+7. **score-source 守卫标为 DEFERRED** 并记入 `#704` Gap 4 —— 上一轮说了「建或移」，结果两样
+   都没做，于是 brief 挂着一条无人跟踪的验收项。
+
+**验证**：`pkg/botevent` 45 测试全绿（`-race -shuffle=on`，`CI=true`，**零 skip**）；
+`modules/robot` 新增 `plausible_robot_id_test.go`。
