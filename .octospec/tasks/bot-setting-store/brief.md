@@ -21,9 +21,17 @@ source: user
 bot_setting（该 Bot 的覆盖）→ system_setting（服务端全局默认）→ 代码默认
 ```
 
-首个消费者是推理进度卡策略：Bot 级的 `mode`(off|on) 与 `template_ref`，由
-`GET /v1/bot/card/profile` 下发已解析好的有效配置，插件不再自行推断；
-`POST /v1/bot/sendMessage` 的模板分支按同一份有效配置二次校验。
+三个面向：
+
+1. **owner 配置面**（`/v1/robot/:robot_id/settings`，user session + `assertRobotOwner`）——
+   「Bot 管理」页要能**查询本部署有哪些可配置项**并**回显当前值**，而不是由客户端
+   硬编码一张列表。读接口返回全部已注册键 + 该 Bot 的覆盖值 + 三层解析后的有效值 +
+   值来源；写/删接口改这一份覆盖。
+2. **adapter 消费面**（`GET /v1/bot/card/profile`，botToken）——下发**已解析好**的
+   卡片有效配置（`reasoning_progress.mode` / `template_ref`），插件不再自行推断。
+3. **发送端**（`POST /v1/bot/sendMessage` 模板分支）——按同一份有效配置二次校验。
+
+首个消费者是推理进度卡策略：Bot 级的 `mode`(off|on) 与 `template_ref`。
 
 ## Background
 
@@ -52,8 +60,13 @@ owner 读与 adapter 读分属两个模块）。
   回退下一层。删除覆盖 == 回落全局，不是「设为 off」。
 - **解析优先级**：bot 覆盖恒优先于全局默认；全局默认恒优先于代码默认。代码默认为
   `mode=off`（未升级/未配置的部署行为不变，零回归）。
-- **键白名单**：未注册的 key 写入必须 400，不得长出野键（同 `system_setting` 的
-  `settingDef` 契约）。
+- **键白名单是可查询的**：同一份注册表既是写入校验的白名单，也是 owner 读接口
+  返回的「可配置项目录」——客户端据此渲染「Bot 管理」列表，新增一个键不需要客户端
+  发版。未注册的 key 写入必须 400，不得长出野键（同 `system_setting` 的 `settingDef`）。
+- **回显三态必须可区分**：读接口对每个键同时返回 `value`（该 Bot 的显式覆盖，未设
+  为空）、`effective_value`（三层解析结果）与 `source`（`bot`/`global`/`default`）。
+  只返回一个合并值，UI 就无法区分「我显式设成了 off」与「我没设、跟随全局默认 off」，
+  也就无法正确渲染「恢复默认」。
 - **`enabled` 从属关系**：`cardmsg.BotEnabled()`（`OCTO_CARD_MESSAGE_ENABLED` AND
   `OCTO_BOT_CARD_ENABLED`）为假时，profile 下发的有效 `mode` 必须是 `off` ——
   清单绝不能报 `on` 而发卡被 `card_disabled` 拒（`pkg/cardmsg/cardmsg.go:177-200`
@@ -95,6 +108,10 @@ owner 读与 adapter 读分属两个模块）。
 - `bot_mention_pref` 的迁入。它是 `(robot_id, group_no)` 二维配置，不属于
   `bot_setting` 的一维模型，保持独立。
 - 配置读缓存。v1 走单行主键查询，与 send 路径已有的 DB 查询同量级。
+- **配置项标题/副标题的服务端本地化下发**。读接口只返回 `key` / `type` / `options`
+  等结构信息，展示文案由客户端按 key 自持（现状「Bot 管理」页的免@回答等条目已是
+  客户端文案）。服务端下发本地化文案需要一套非错误码的 i18n 消息注册面，本任务不建。
+  客户端遇到不认识的 key 应跳过，不阻塞渲染。
 - 插件侧改造（Model B 废弃、`cardProgress` 移除等）。
 
 ## Acceptance
@@ -112,7 +129,11 @@ owner 读与 adapter 读分属两个模块）。
 - Bot A 用不等于自己有效配置的 `template_ref` 发送 → 400 `err.server.bot_api.card_invalid`，
   且响应体不透出「该模板属于其他 Bot」之类可枚举信息。
 - 未注册 key 写入 → 400；已注册 key 的非法值（`mode` 非 off/on）→ 400。
-- 非 owner 写该 Bot 配置 → 403；robot 不存在/无 `creator_uid` → 404；DB 故障 → 500
+- owner 读接口返回全部已注册键；每个键的 `value` / `effective_value` / `source`
+  三者可区分：未设覆盖时 `value==""` 且 `source!="bot"`；显式设为与全局同值时
+  `value` 非空且 `source=="bot"`。
+- 新注册一个键后，owner 读接口立即返回它（客户端无需发版即可发现新配置项）。
+- 非 owner 读/写该 Bot 配置 → 403；robot 不存在/无 `creator_uid` → 404；DB 故障 → 500
   且不被伪装成 404。
 - 删除不存在的覆盖 → 200（幂等）；删除后有效值回落全局默认而非代码默认。
 - 写入成功后向该 Bot 的 `/v1/bot/events` 队列投递一条配置变更事件；事件投递失败
