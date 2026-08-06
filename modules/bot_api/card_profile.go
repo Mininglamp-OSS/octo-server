@@ -24,16 +24,60 @@ package bot_api
 // 改名/删除/改类型 —— SDK 与适配器据此做能力探测与上限读取，改名等同破坏 event_data。
 
 import (
+	"errors"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"go.uber.org/zap"
 )
+
+// botCardConfigResolver is the narrow slice of robot.IService the card paths
+// need: resolve one bot's effective card switches. Both the manifest and the
+// send gate go through it, so what this deployment advertises and what it
+// accepts are computed from one source.
+type botCardConfigResolver interface {
+	BotCardConfig(robotID string) (robot.BotCardConfig, error)
+}
+
+// resolveBotCardConfig reads the caller's effective switches, failing closed.
+//
+// Fail-closed matters in both directions: an unwired resolver or a DB error
+// must not be answered with "everything is on", because that would re-open a
+// capability the owner switched off, and it would make the manifest disagree
+// with the send gate for the duration of the blip.
+func (ba *BotAPI) resolveBotCardConfig(robotID string) (robot.BotCardConfig, error) {
+	if ba.cardConfig == nil {
+		return robot.BotCardConfig{}, errBotCardConfigUnavailable
+	}
+	return ba.cardConfig.BotCardConfig(robotID)
+}
+
+var errBotCardConfigUnavailable = errors.New("bot_api: card config resolver unavailable")
 
 // botCardProfile handles GET /v1/bot/card/profile (D12).
 func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	// authBot 已在中间件层校验 bot-token；此处再确认存在 bot 身份（与同组 GET 端点
-	// 一致的防御，非资源属主校验 —— 清单无属主概念）。缺身份 → 既有 bot-auth 拒绝。
-	if getRobotIDFromContext(c) == "" {
+	// 一致的防御）。缺身份 → 既有 bot-auth 拒绝。
+	//
+	// 注意本端点**保持 botToken 鉴权、不做 owner 化**：它的语义是「Bot 读自己的
+	// 有效配置」，而插件手里只有 bot token、没有 user session。owner 化等于废掉它。
+	// 配置的**写**面才是 owner 专属（/v1/robot/:robot_id/settings）。
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
 		ba.respondBotAPIIdentityMissing(c)
+		return
+	}
+	// 卡片能力的 per-Bot 有效配置（task bot-setting-store）。读失败必须 fail-closed：
+	// 用默认值顶上会让一次 DB 抖动把 owner 关掉的能力静默放开，且此刻下发的清单会
+	// 与 sendMessage 的门禁背离。
+	cardConfig, err := ba.resolveBotCardConfig(robotID)
+	if err != nil {
+		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{
@@ -53,6 +97,10 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		// ToggleVisibility / CopyToClipboard 等 additive 新增本地动作。Action.Submit 属
 		// octo/v2 交互档，经 profiles 隐式发现、不在此列。
 		"actions": cardmsg.DisplayActions(),
+		// config is the per-Bot effective card policy (task bot-setting-store).
+		// Values are already AND-ed with the deployment master switch, so a
+		// producer reads one field instead of recombining `enabled` itself.
+		"config": ba.botCardConfigResponse(cardConfig),
 		// templating is additive to the raw-card capability manifest. It advertises
 		// only the explicit Bot catalog, never the broader Registry.List(). A nil
 		// catalog occurs only in focused tests that do not install the production
@@ -69,4 +117,39 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 			"max_copy_text_bytes": cardmsg.MaxCopyTextBytes,
 		},
 	})
+}
+
+// botCardConfigResponse renders the per-Bot effective card policy.
+//
+// Two invariants this function is responsible for, both asserted in tests:
+//
+//  1. reasoning_enabled=false ⟹ reasoning_template_ref is null. A ref alongside
+//     a false switch invites a producer to send it anyway.
+//  2. reasoning_enabled=true ⟹ the ref is one this deployment also advertises
+//     under `templating.templates` in the same response, and therefore one the
+//     send path will accept. Resolving it through AdvertisedRef (rather than
+//     naming a version here) is what makes that hold by construction.
+//
+// A deployment whose catalog does not advertise the reasoning template at all
+// reports reasoning_enabled=false regardless of configuration: the switch says
+// "allowed", the catalog says "possible", and sending needs both.
+func (ba *BotAPI) botCardConfigResponse(cfg robot.BotCardConfig) map[string]interface{} {
+	reasoningEnabled := cfg.ReasoningEnabled
+	var templateRef interface{}
+	if reasoningEnabled {
+		if ref, ok := ba.cardTemplates.AdvertisedRef(aireasoningprocess.TemplateID); ok {
+			templateRef = map[string]interface{}{
+				"id": string(ref.ID), "version": ref.Version,
+			}
+		} else {
+			reasoningEnabled = false
+		}
+	}
+	return map[string]interface{}{
+		"card_enabled":           cfg.CardEnabled,
+		"display_enabled":        cfg.DisplayEnabled,
+		"interaction_enabled":    cfg.InteractionEnabled,
+		"reasoning_enabled":      reasoningEnabled,
+		"reasoning_template_ref": templateRef,
+	}
 }

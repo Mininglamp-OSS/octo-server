@@ -27,6 +27,11 @@ const (
 	settingIntMax = 3650
 )
 
+// defaultBotCardSwitchEnabled is the code default for every per-bot card
+// capability switch (display / interaction / reasoning). See the "botcard"
+// entries in systemSettingSchema for why true is the safe choice here.
+const defaultBotCardSwitchEnabled = true
+
 // Sidebar recent-tab activity-filter defaults (issue #289). The recent tab of
 // POST /v1/sidebar/sync hides conversations whose last activity is older than
 // a per-channel-type window. These defaults reproduce the historical
@@ -201,6 +206,26 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return floatToCanonical(s.BotRateLimitRegisterRPS()) }},
 	{Category: "botratelimit", Key: "register_burst", Type: settingTypeInt, Description: "单个 Bot token 的注册/刷新突发上限（令牌桶 burst）；读取侧夹到 register_rps×20 以内——TTL 是 ceil(burst/rps×2)，而 register 的 key 由客户端提供的 token 决定基数，所以放大比值会放大每 IP 的 live key 数。调低 rps 会同时压低有效 burst，实际生效值见本列", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.BotRateLimitRegisterBurst()) }},
+
+	// Bot 卡片能力的**服务端全局默认**（task bot-setting-store）。这一层介于
+	// bot_setting 的 per-Bot 覆盖与代码默认之间：某个 Bot 没有写过覆盖时读到这里，
+	// 这里也没配时落到代码默认 true。
+	//
+	// 三个键都不含「总闸」——总闸是 cardmsg.BotEnabled()（OCTO_CARD_MESSAGE_ENABLED
+	// AND OCTO_BOT_CARD_ENABLED），派生只读，不可写；它为假时下面三项的有效值恒为假。
+	// 正因为总闸默认 fail-closed，这三项默认 true 才是安全的：运维开总闸即得到完整
+	// 卡片能力，不必再逐 Bot 开一次。
+	//
+	// display/interaction 只作用于 **raw 卡路径**（Bot 自拼 card JSON），
+	// reasoning 只作用于 **Registry 模板卡**，三者正交。绝不可实现成「按 wire profile
+	// 一刀切」：推理卡自身横跨两档（active/error 是 octo/v2、result 是 octo/v1），
+	// 按 profile 切会把它砍成只剩终态或只剩过程。
+	{Category: "botcard", Key: "display_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送展示型 raw 卡片（octo/v1，Bot 自拼卡片 JSON）；受卡片总闸 OCTO_CARD_MESSAGE_ENABLED 支配，总闸关闭时本项无效",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardDisplayEnabledDefault()) }},
+	{Category: "botcard", Key: "interaction_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送交互型 raw 卡片（octo/v2，含 Action.Submit / Input.*）；不影响服务端模板渲染出的推理进度卡",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardInteractionEnabledDefault()) }},
+	{Category: "botcard", Key: "reasoning_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送推理进度卡（服务端 Registry 模板卡）；关闭只阻止新建，已发出的卡仍可编辑到终态",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardReasoningEnabledDefault()) }},
 
 	// App Bot 共享鉴权缓存的安全网 TTL（秒）。吊销靠共享 DEL 即时生效，此 TTL 仅兜底
 	// DEL 失败 / 极窄的失效-回填竞态（见 modules/bot_api/registry_redis.go）。实时热更新

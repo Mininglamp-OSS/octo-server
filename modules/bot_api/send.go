@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -137,6 +138,11 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 			// any explicit inbound value first for backward-compatible fail-close,
 			// then author the stable outbound key so callers do not need to send it.
 			req.Payload["render_profile"] = cardmsg.RenderProfileOctoChatV1
+		}
+		// per-Bot 卡片策略门（task bot-setting-store）。排在形状校验之后，因为
+		// raw 分支要用已校验过的 profile 决定查 display 还是 interaction。
+		if ba.rejectByBotCardPolicy(c, req.Payload, templateMode) {
+			return
 		}
 	}
 
@@ -1337,6 +1343,91 @@ func cardEnvelopeHasTemplateRef(raw []byte) bool {
 	}
 	_, exists := payload["template_ref"]
 	return exists
+}
+
+// rejectByBotCardPolicy enforces the per-Bot card switches on the send path
+// (task bot-setting-store). Returns true when it has already written a
+// response and the caller must return.
+//
+// This is deliberately a second gate rather than trusting the manifest: a
+// producer can hold a stale /v1/bot/card/profile, or simply ignore it, so the
+// switch has to be enforced where the message is actually accepted. Both sides
+// read robot.IService.BotCardConfig, so what the manifest advertises and what
+// this accepts cannot drift.
+//
+// Every rejection collapses into the single generic ErrBotAPICardInvalid and
+// the specific reason goes to the log only. Splitting it into "reasoning is off
+// for you" vs "that template is not yours" would let a caller probe another
+// bot's configuration by差分 the error code.
+func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]interface{}, templateMode bool) bool {
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		ba.respondBotAPIIdentityMissing(c)
+		return true
+	}
+	config, err := ba.resolveBotCardConfig(robotID)
+	if err != nil {
+		// Fail closed. Substituting defaults here would let a DB blip re-open a
+		// capability the owner switched off.
+		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return true
+	}
+
+	if templateMode {
+		// 模板卡只看 reasoning 开关，**不看** display/interaction —— 推理卡自身
+		// 横跨两档（active/error 是 octo/v2、result 是 octo/v1），若让 interaction
+		// 参与判定，关掉交互卡会把推理卡砍成只剩终态。
+		ref, refErr := parseBotTemplateRef(payload["template_ref"])
+		if refErr != nil {
+			ba.Warn("Bot 模板 ref 形状非法", zap.Error(refErr), zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		if ref.ID != aireasoningprocess.TemplateID {
+			// 当前部署只广告推理卡一张模板。出现别的 id 说明调用方在猜 ref，
+			// 交给下游 requireRef 用同一个泛化码拒。
+			return false
+		}
+		if !config.ReasoningEnabled {
+			ba.Warn("Bot 推理卡已关闭，拒绝模板发送", zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		advertised, ok := ba.cardTemplates.AdvertisedRef(ref.ID)
+		if !ok || advertised != ref {
+			ba.Warn("Bot 模板 ref 与本部署广告集不一致，拒绝",
+				zap.String("robot", robotID), zap.String("version", ref.Version))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		return false
+	}
+
+	// raw 卡：按已校验的 profile 分档。octo/v1 = 展示，octo/v2 = 交互。
+	// 这两个开关只作用于 Bot 自拼的 raw 卡，绝不用来切模板卡的 wire profile。
+	profile, _ := payload["profile"].(string)
+	switch profile {
+	case cardmsg.ProfileV1:
+		if !config.DisplayEnabled {
+			ba.Warn("Bot 展示卡已关闭，拒绝 raw 发送", zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+	case cardmsg.ProfileV2:
+		if !config.InteractionEnabled {
+			ba.Warn("Bot 交互卡已关闭，拒绝 raw 发送", zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+	default:
+		// cardmsg.Validate 已经把 profile 钉在接受集内，走到这里说明校验被绕过。
+		ba.Warn("Bot raw 卡 profile 不在接受集，拒绝",
+			zap.String("robot", robotID), zap.String("profile", profile))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return true
+	}
+	return false
 }
 
 // authorBotRawCardRenderProfile adds the deployment-owned visual compatibility

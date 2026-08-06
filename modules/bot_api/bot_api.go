@@ -54,6 +54,16 @@ type BotAPI struct {
 	// AFTER dispatchFanout succeeds so we only enqueue events that
 	// WuKongIM actually accepted.
 	robotService robot.IService
+	// cardConfig resolves the per-Bot card capability switches (task
+	// bot-setting-store). Production points it at the same robotService
+	// instance above; it is a separate, one-method field so focused tests can
+	// inject a fake without implementing all of robot.IService — same reason
+	// modules/file declares stickerSystemSettings instead of taking the whole
+	// *common.SystemSettings.
+	//
+	// A nil value is a wiring error, not a permissive default: the card paths
+	// fail closed rather than assume every switch is on.
+	cardConfig botCardConfigResolver
 	// ackFilteredEvent overrides the auto-ACK write in filterAppBotEvents.
 	// Production leaves it nil (see BotAPI.ackEvent); tests set it to inject a
 	// Redis whose reads succeed while writes fail, which is the state the
@@ -244,6 +254,8 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		}
 	}
 
+	robotService := robot.NewService(ctx)
+
 	ba := &BotAPI{
 		ctx:                   ctx,
 		db:                    newBotAPIDB(ctx),
@@ -252,7 +264,8 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		groupService:          group.NewService(ctx),
 		userDB:                user.NewDB(ctx),
 		threadService:         thread.NewService(ctx),
-		robotService:          robot.NewService(ctx),
+		robotService:          robotService,
+		cardConfig:            robotService,
 		cardRevisions:         cardrevision.NewStore(ctx.DB()),
 		cardMutator:           carddispatch.NewCardMutator(ctx),
 		cardTemplates:         cardTemplates,

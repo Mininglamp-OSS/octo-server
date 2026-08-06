@@ -204,6 +204,33 @@ func (s *SystemSettings) getBool(category, key string, fallback bool) bool {
 	return parseSettingBool(v, fallback)
 }
 
+// SettingBoolOK reports the configured bool for (category, key) and whether the
+// key is configured at all.
+//
+// getBool collapses "unset" and "explicitly false" into the same `false`, which
+// is fine for a two-tier (DB → yaml) key but wrong for a caller that layers its
+// own override on top of this one: a per-bot resolver must be able to tell
+// "the deployment default says false" from "the deployment has no opinion, fall
+// through to the code default". Hence the second return.
+//
+// An unparseable literal reports configured=false so the caller falls through
+// rather than inheriting a silent false — same fail-forward posture getBool
+// takes with its fallback.
+func (s *SystemSettings) SettingBoolOK(category, key string) (value bool, configured bool) {
+	v, ok := s.lookup(category, key)
+	if !ok {
+		return false, false
+	}
+	switch v {
+	case "1", "true", "TRUE":
+		return true, true
+	case "0", "false", "FALSE":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // parseSettingBool applies the canonical system_setting bool literal rules
 // (1/true/TRUE → true, 0/false/FALSE → false, anything else → fallback).
 // Shared by getBool and the atomic SpaceWelcomeConfig reader so both spell the
@@ -1010,6 +1037,27 @@ const (
 	// live key 上界因此恒为 100 rps × 40s ≈ 4000。
 	botRateLimitMinRegisterRPS = 1.0 / botRateLimitMaxRegisterFillRatio
 )
+
+// BotCardDisplayEnabledDefault 等三个 getter 是 Bot 卡片能力的**服务端全局默认**
+// （task bot-setting-store）。它们只回答「某个 Bot 没写过覆盖时该取什么」，不含
+// per-Bot 覆盖，也不含卡片总闸 cardmsg.BotEnabled() —— 完整解析链由
+// modules/robot 的 bot_setting 解析器组合，管理端的 effective_value 展示的也正是
+// 本层的值（全局默认），而非某个具体 Bot 的有效值。
+//
+// 代码默认一律 true：总闸本身 fail-closed（OCTO_CARD_MESSAGE_ENABLED 未设即关），
+// 安全默认由总闸承担；若这三项再各自默认 false，运维开了总闸还要逐 Bot 补开，
+// 徒增困惑。
+func (s *SystemSettings) BotCardDisplayEnabledDefault() bool {
+	return s.getBool("botcard", "display_enabled", defaultBotCardSwitchEnabled)
+}
+
+func (s *SystemSettings) BotCardInteractionEnabledDefault() bool {
+	return s.getBool("botcard", "interaction_enabled", defaultBotCardSwitchEnabled)
+}
+
+func (s *SystemSettings) BotCardReasoningEnabledDefault() bool {
+	return s.getBool("botcard", "reasoning_enabled", defaultBotCardSwitchEnabled)
+}
 
 // BotRateLimitBusinessEnabled 等三组 getter 的回退链均为 DB → env → code default。
 func (s *SystemSettings) BotRateLimitBusinessEnabled() bool {

@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
+	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -111,6 +112,17 @@ type IService interface {
 	// EnqueueBotTypedEvent without making it visible. The returned event is
 	// intended for an atomic fenced commit by another module.
 	PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error)
+	// BotCardConfig resolves the bot's effective card capability switches
+	// (task bot-setting-store): the bot_setting override, then the
+	// system_setting deployment default, then the code default — already
+	// AND-ed with the deployment master switch cardmsg.BotEnabled().
+	//
+	// Both the /v1/bot/card/profile manifest and the sendMessage gate read
+	// it, so the advertised capability and what the send path accepts cannot
+	// drift. An error means the config could not be read; callers must fail
+	// closed rather than substituting defaults — a DB blip must not silently
+	// re-open a capability the owner turned off.
+	BotCardConfig(robotID string) (BotCardConfig, error)
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
@@ -120,13 +132,17 @@ type Service struct {
 	ctx          *config.Context
 	db           *robotDB
 	creatorCache sync.Map // robotID -> creatorUID
+	// systemSettings mirrors the Robot field: resolved once at construction so
+	// the per-request path never takes common's process-wide singleton mutex.
+	systemSettings *commonmodule.SystemSettings
 }
 
 // NewService 构造一个只读 robot 服务，满足 IService 接口。
 func NewService(ctx *config.Context) IService {
 	return &Service{
-		ctx: ctx,
-		db:  newBotDB(ctx),
+		ctx:            ctx,
+		db:             newBotDB(ctx),
+		systemSettings: commonmodule.EnsureSystemSettings(ctx),
 	}
 }
 
@@ -356,6 +372,12 @@ type Robot struct {
 	// it; it selects legacy GenSeq vs the transactional channel sequence by the
 	// DB-authoritative state row.
 	seqStore *msgextraseq.Store
+	// systemSettings is the process-wide admin-config snapshot, resolved once
+	// here rather than per call. common.EnsureSystemSettings takes a global
+	// mutex on every invocation, so calling it per request would put a
+	// process-wide lock on the card send path and defeat the lock-free
+	// atomic.Pointer read the snapshot is designed around.
+	systemSettings *commonmodule.SystemSettings
 }
 
 func New(ctx *config.Context) *Robot {
@@ -373,6 +395,7 @@ func New(ctx *config.Context) *Robot {
 		mentionRegexp:                 regexp.MustCompile(`@\S+`),
 		msgSem:                        make(chan struct{}, 100), // limit concurrent message processing goroutines
 		seqStore:                      msgextraseq.New(ctx),
+		systemSettings:                commonmodule.EnsureSystemSettings(ctx),
 	}
 	ctx.AddMessagesListener(rb.messagesListen)
 
@@ -397,6 +420,14 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", rb.setMentionPref)       // UPSERT 群级免@偏好
 		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", rb.deleteMentionPref) // 删除回退默认（幂等）
 		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
+		// Bot 级配置（task bot-setting-store）：owner 目录查询 / 批量写 / 删除覆盖。
+		//
+		// SharedUIDRateLimiter 逐路由挂而非挂在整个 auth 组上：本组已有十余个既有
+		// 路由，给整组加限流会改变它们的行为，超出本任务范围。顺序必须在
+		// AuthMiddleware 之后——限流器读不到 uid 会静默 fail-open。
+		auth.GET("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.listBotSettings)
+		auth.PUT("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.updateBotSettings)
+		auth.DELETE("/robot/:robot_id/settings/:key", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteBotSetting)
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
