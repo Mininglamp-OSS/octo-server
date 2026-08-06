@@ -240,3 +240,43 @@ func validateCatalogMarkers(payload map[string]interface{}) error {
 	_, err := catalogMarkersFromPayload(payload, nil)
 	return err
 }
+
+// CatalogMarkersPreserved reports whether a replacement frame keeps the catalog
+// identity a stored frame carries. It is the single definition of that rule:
+// internal/carddispatch's mutation boundary enforces it on every replacement,
+// and tests that stand in for that boundary call this rather than restating the
+// comparison — an earlier version was hand-copied into a test fake, and the copy
+// reproduced a bug in the original instead of catching it.
+//
+// The rule is asymmetric on purpose, which is the part that was wrong when it
+// was written as an equality check:
+//
+//   - Losing a marker is refused. That is the erasure the boundary exists to
+//     stop; both identity guards in pkg/cardtmpl's updater begin `if
+//     markers.Has…`, so a dropped marker silently disables them for that
+//     message and returns the frame to the legacy population.
+//   - Gaining one is allowed. `template_ref` alone is a legal pre-PR-C Registry
+//     frame, and an edit is the only moment such a frame can acquire
+//     provenance. Refusing that made every already-delivered Registry card
+//     permanently uneditable, with no repair path, because the edit that would
+//     add the marker was the operation being refused. The gain is safe because
+//     only a server rendering boundary can author a marker and only the
+//     original sender can reach a mutation.
+//   - Changing one is refused. Identity does not change under an edit, so where
+//     both sides carry a marker the values must match. Presence alone would let
+//     a replacement keep both keys and rewrite principal_id or space_id.
+func CatalogMarkersPreserved(stored, next FrameCatalogMarkers) error {
+	if stored.HasRef && !next.HasRef {
+		return fmt.Errorf("%w: replacement drops the stored template_ref", ErrCatalogMarkerInvalid)
+	}
+	if stored.HasProvenance && !next.HasProvenance {
+		return fmt.Errorf("%w: replacement drops the stored catalog_provenance", ErrCatalogMarkerInvalid)
+	}
+	if stored.HasRef && next.HasRef && stored.Ref != next.Ref {
+		return fmt.Errorf("%w: replacement changes the stored template_ref", ErrCatalogMarkerInvalid)
+	}
+	if stored.HasProvenance && next.HasProvenance && stored.Provenance != next.Provenance {
+		return fmt.Errorf("%w: replacement changes the stored catalog_provenance", ErrCatalogMarkerInvalid)
+	}
+	return nil
+}

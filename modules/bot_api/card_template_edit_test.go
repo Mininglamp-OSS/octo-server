@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,7 +36,30 @@ func (m *fakeBotCardMutator) Snapshot(_ context.Context, _ carddispatch.CardMuta
 	return m.snapshot, m.snapshotErr
 }
 
+// Mutate applies the production marker-preservation rule before recording the
+// request, through the same cardmsg.CatalogMarkersPreserved the real
+// CardMutator calls.
+//
+// PR-C review round 8: without this, the fake returned a canned result and the
+// real guard never ran, so an edit that the production boundary would refuse
+// looked like a pass here. Both blockers in that round lived in exactly this
+// seam — the handler suite stubbed the mutator, the mutator suite hand-built
+// replacements, and the interaction between a real render output and the real
+// guard was covered by neither.
 func (m *fakeBotCardMutator) Mutate(_ context.Context, request carddispatch.CardMutationRequest) (carddispatch.CardMutationResult, error) {
+	if len(m.snapshot.Envelope) > 0 {
+		stored, err := cardmsg.CatalogFrameMarkers(m.snapshot.Envelope)
+		if err != nil {
+			return carddispatch.CardMutationResult{}, err
+		}
+		next, err := cardmsg.CatalogFrameMarkers([]byte(request.ContentEdit))
+		if err != nil {
+			return carddispatch.CardMutationResult{}, err
+		}
+		if err := cardmsg.CatalogMarkersPreserved(stored, next); err != nil {
+			return carddispatch.CardMutationResult{}, fmt.Errorf("%w: %v", carddispatch.ErrCardMutationInvalid, err)
+		}
+	}
 	m.mutateRequests = append(m.mutateRequests, request)
 	return m.mutateResult, m.mutateErr
 }

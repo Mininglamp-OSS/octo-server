@@ -410,12 +410,17 @@ func TestDocsAccessRequestV3RendersTheNonDecisionStates(t *testing.T) {
 	}
 }
 
-// markerEnforcingCardMutator applies the same rule production applies at
-// carddispatch.CardMutator.Mutate, through the same exported helper, against a
+// markerEnforcingCardMutator applies the production preservation rule against a
 // stored frame the test supplies. It exists because the notify package cannot
 // construct a real CardMutator (its constructor takes an unexported backend),
 // and the point of the test below is what StandardActionFinalizer's *output*
 // would do at that boundary — not what the fake does.
+//
+// It calls cardmsg.CatalogMarkersPreserved rather than restating the
+// comparison. An earlier version hand-copied the boolean logic and said it went
+// "through the same exported helper" when no such helper existed; the copy
+// inherited the original's presence-equality bug, so this fake reproduced the
+// defect instead of catching it.
 type markerEnforcingCardMutator struct {
 	stored   []byte
 	requests []carddispatch.CardMutationRequest
@@ -431,7 +436,7 @@ func (m *markerEnforcingCardMutator) Mutate(_ context.Context,
 	if err != nil {
 		return carddispatch.CardMutationResult{}, err
 	}
-	if stored.HasRef != next.HasRef || stored.HasProvenance != next.HasProvenance {
+	if err := cardmsg.CatalogMarkersPreserved(stored, next); err != nil {
 		return carddispatch.CardMutationResult{}, carddispatch.ErrCardMutationInvalid
 	}
 	m.requests = append(m.requests, request)

@@ -197,13 +197,14 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	// it, so this is enforced where every replacement passes rather than at
 	// each site that builds one.
 	//
-	// Absent on both sides is the legacy population and stays legal. Present on
-	// the stored frame and absent on the replacement is the erasure, and it is
-	// refused rather than repaired: re-attaching a template_ref would need the
-	// replacement's own card body to carry the matching metadata.octo.template,
-	// which a non-Registry render does not have, so "repair" would either fail
-	// validation anyway or stamp a Registry identity onto a body that is not
-	// one. The caller has to produce a frame that legitimately carries them.
+	// Absent on both sides is the legacy population and stays legal. The rule
+	// itself lives in cardmsg.CatalogMarkersPreserved so there is one definition
+	// of it: erasure is refused, acquiring a marker on a pre-PR-C frame is
+	// allowed, and changing one where both sides carry it is refused. An earlier
+	// version compared presence for equality here, which also refused the
+	// acquire and so made every already-delivered Registry card permanently
+	// uneditable — the edit that would have added the marker was the operation
+	// being rejected.
 	stored, err := cardmsg.CatalogFrameMarkers(message.Payload)
 	if err != nil {
 		return CardMutationResult{}, fmt.Errorf("%w: stored frame markers: %v", ErrCardMutationInvalid, err)
@@ -213,9 +214,8 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 		if markerErr != nil {
 			return CardMutationResult{}, fmt.Errorf("%w: replacement frame markers: %v", ErrCardMutationInvalid, markerErr)
 		}
-		if stored.HasRef != next.HasRef || stored.HasProvenance != next.HasProvenance {
-			return CardMutationResult{}, fmt.Errorf(
-				"%w: replacement drops the stored catalog markers", ErrCardMutationInvalid)
+		if preserveErr := cardmsg.CatalogMarkersPreserved(stored, next); preserveErr != nil {
+			return CardMutationResult{}, fmt.Errorf("%w: %v", ErrCardMutationInvalid, preserveErr)
 		}
 	}
 	normalized, err := cardmsg.NormalizeContentEdit(request.ContentEdit)
