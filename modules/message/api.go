@@ -384,6 +384,9 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	{
 		// messages.PUT("/:message_id/voicereaded", m.voiceReaded)
 		messages.GET("/:message_id/receipt", m.messageReceiptList) // 消息回执列表
+		// 单聊(DM)单条消息直查：peer_uid=对端 uid，服务端用调用者 loginUID 与之
+		// 对称派生 fakeChannelID 后查询（详见 getPersonMessage）。与群/子区直查并列。
+		messages.GET("/person/:peer_uid/:message_id", m.getPersonMessage)
 	}
 	// 回应。挂 SpaceMiddleware：Person(DM)是跨 Space 共享的同一物理频道，
 	// reaction 读/写必须与 /v1/message 一样按已校验的 Space 隔离 DM 消息，

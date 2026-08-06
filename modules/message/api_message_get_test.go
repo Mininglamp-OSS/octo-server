@@ -585,3 +585,58 @@ func TestGetThreadMessage_InvalidShortID(t *testing.T) {
 	w := doGet(t, s, fmt.Sprintf("/v1/groups/%s/threads/abc/messages/1", groupNo))
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 }
+
+// ---------- Person (DM) ----------
+
+const personPeerUID = "peer_user_1"
+
+// TestGetPersonMessage_Success：DM 一方能按 (peer_uid, message_id) 取到消息。
+// 消息物理落在 fakeChannelID = GetFakeChannelIDWith(loginUID, peerUID)、type=Person。
+func TestGetPersonMessage_Success(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx, _ := setupGroupTestData(t)
+	fakeChannelID := common.GetFakeChannelIDWith(testutil.UID, personPeerUID)
+	const mid int64 = 7001
+	insertGroupMessage(t, ctx, fakeChannelID, common.ChannelTypePerson.Uint8(), mid)
+
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/%d", personPeerUID, mid))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp MsgSyncResp
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, mid, resp.MessageID)
+	assert.Equal(t, fakeChannelID, resp.ChannelID)
+	assert.Equal(t, common.ChannelTypePerson.Uint8(), resp.ChannelType)
+}
+
+// TestGetPersonMessage_NotParticipant：非该 DM 一方查不到——调用者(testutil.UID)
+// 与 peer 派生的 fakeChannelID 不同于消息实际所在的 (otherA, otherB) 频道，命中不到。
+func TestGetPersonMessage_NotParticipant(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx, _ := setupGroupTestData(t)
+	// 消息属于 otherA<->otherB 的 DM，与登录用户无关。
+	otherChannelID := common.GetFakeChannelIDWith("other_a", "other_b")
+	const mid int64 = 7002
+	insertGroupMessage(t, ctx, otherChannelID, common.ChannelTypePerson.Uint8(), mid)
+
+	// 登录用户尝试用 peer=other_b 取——派生的 fakeChannelID(loginUID<->other_b) 不等于
+	// otherChannelID(other_a<->other_b)，查不到 → 404。
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/%d", "other_b", mid))
+	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+}
+
+// TestGetPersonMessage_SelfRejected：禁止自聊(peer == self)。
+func TestGetPersonMessage_SelfRejected(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, _, _ := setupGroupTestData(t)
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/1", testutil.UID))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+}
+
+// TestGetPersonMessage_InvalidMessageID：message_id 非正整数 → 400。
+func TestGetPersonMessage_InvalidMessageID(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, _, _ := setupGroupTestData(t)
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/notanumber", personPeerUID))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+}

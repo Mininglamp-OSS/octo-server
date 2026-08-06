@@ -166,6 +166,38 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	m.respondSingleMessage(c, channelID, common.ChannelTypeCommunityTopic.Uint8(), groupNo, messageID, loginUID)
 }
 
+// getPersonMessage GET /v1/messages/person/:peer_uid/:message_id
+//
+// 单聊(DM)单条消息直查，用于云盘转存等需要按 (会话, 消息ID) 取单条消息元数据的
+// 场景。DM 消息物理存储在 fakeChannelID(= GetFakeChannelIDWith(两个uid) 对称生成的
+// "uidA@uidB") 频道下、channel_type=Person。
+//
+// 鉴权：DM 无独立成员表，fakeChannelID 由调用者 loginUID 与对端 peerUID 对称派生，
+// 「能派生出这个频道」本身即代表 loginUID 是该 DM 的一方；配合 respondSingleMessage
+// 内的 visibles / 双删 / offset 全套可见性校验(与批量同步路径一致)，非参与方既拼不出
+// 命中的 fakeChannelID、也过不了可见性过滤，一律 404。禁止自聊(peer==self)。
+func (m *Message) getPersonMessage(c *wkhttp.Context) {
+	peerUID := c.Param("peer_uid")
+	messageIDStr := c.Param("message_id")
+	loginUID := c.GetLoginUID()
+
+	if strings.TrimSpace(peerUID) == "" {
+		respondMessageRequestInvalid(c, "peer_uid")
+		return
+	}
+	if peerUID == loginUID {
+		respondMessageRequestInvalid(c, "peer_uid")
+		return
+	}
+	messageID, ok := parsePositiveMessageID(messageIDStr)
+	if !ok {
+		respondMessageRequestInvalid(c, "message_id")
+		return
+	}
+	fakeChannelID := common.GetFakeChannelIDWith(loginUID, peerUID)
+	m.respondSingleMessage(c, fakeChannelID, common.ChannelTypePerson.Uint8(), "", messageID, loginUID)
+}
+
 // parsePositiveMessageID 校验 path 参数 message_id 为正整数。
 // 注：WuKongIM 雪花算法生成的 message_id 始终为正，0 视为非法。
 func parsePositiveMessageID(s string) (int64, bool) {
