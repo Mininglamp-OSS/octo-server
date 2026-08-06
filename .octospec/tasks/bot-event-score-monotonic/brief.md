@@ -445,3 +445,57 @@ sql-migrate 应用（`gorp_migrations` 有记录、状态表已建）。
     测试建表也补齐 migration 的 `CHECK` 与 `ON UPDATE`。
 
 **验证**：`pkg/botevent` 42 测试全绿（`-race -shuffle=on`，`CI=true`，**零 skip**）。
+
+## 第四轮实现记录（第五轮 review 之后，2026-08-06）
+
+两位 reviewer 独立抓到同一处：**上一轮记为「已修」的 P1-7 其实没修**。加上另一位的三条，
+六项在本轮修完，回退检测两条仍在 `#704`。逐条记下被推翻的判断：
+
+1. **fail-closed 没生效，而且我的测试给了假信心。** 边界是「连续失败的 interval 数」，但
+   `persistHighWater` 的节流早退发生在**查这个边界之前**，且 `noteHighWaterFailure` 顶上
+   无条件重新武装了节流标记。于是过界后每 1000 次分配只有 1 次真的走到检查，其余 999 次
+   `return nil` 成功 —— 正是「对着冻结的 mark 无界发号」本身。算术上还不只是声明没兑现：
+   limit=3 时 id 跑到 `M+2999`，而 `seedSafetyMargin` 是 2000，从 `M` 重算的 seed 落在
+   `M+2000`；发号进程会 `retried <= prev` 响亮拒绝，但**重启后的进程 `lastIssued` 为空，
+   会静默从 `M+2001` 接着发**，落在已到 `M+2999` 的游标下方。
+   我的测试直接调 helper、参数恰好按 interval 间隔，所以从没经过那个吞掉 999 的早退，
+   断言的是 helper 的返回值而不是分配器的行为。**这条批评完全成立。**
+2. **边界改成「距上次真正落盘的 mark 有多远」**，即安全论证真正依赖的那个量。`lastDurable`
+   与节流标记分开，失败时绝不前进；在 `seedSafetyMargin` 处拒绝，使最大已发号恰好比恢复
+   首号低 1。一条不等式取代了需要手工与 margin 对账的计数，顺带删掉那个非原子的计数器。
+3. **测试逼出两件事**：①过界后按 id 距离节流会让恢复取决于流量（低流量 bot 无界等待），
+   改成时间预算（200ms）；但**不能不节流** —— 300ms deadline 的失败 INSERT 占着 msgSem 槽，
+   对全进程所有 bot 是吞吐悬崖，不因为这次入队注定失败而改变。②未节流路径上不能先查 span：
+   durable 行还不存在的 bot base 为 0，先查会在还没尝试记录之前就拒掉它的第一次分配。
+4. **`mode.go` 里那句核心不变量陈述是假的，而 follow-up 的拆分理由正引用它。** 我写
+   「every replica reads the same authority row and reaches the same conclusion」，但正向
+   belief 直接返回、不再读权威，mirror 完好时 gate 也永不关闭。于是激活后权威回滚会让
+   在跑的副本继续用 counter、新起的副本走 GenSeq —— 两个活跃号源。
+   **修法不需要 DB 读也不依赖 env**：读 mirror 的那次往返顺带返回该 bot 的 counter 是否存在，
+   而 counter 存在只可能因为某个副本从它发过号，也就只可能发生在权威说 incr 之后。冷启动
+   看到 legacy + 活的 counter 就拒绝而非降级。**折进同一次往返**，另开一次就是 P1-1 的缩小版。
+   残余（counter 也一起丢）明确写成 accepted residual 并用测试钉住。
+5. **被拒绝的 mirror 会让每次分配串行读一次权威且没有出口。** mirror 声称 incr 时刻意跳过
+   负向 TTL（这才让 flip 不等 TTL），但没有任何代码会改写或清掉一个伪造的键，于是每次分配
+   在 `beliefMu` 后各读一次、都在 msgSem 槽内 —— 与上一轮修掉的每次分配读权威同一类。改为
+   按**被拒的那个 mirror 值**缓存否定结论，换一个值（包括真正的激活）仍算冲突仍强制重读；
+   forced refresh 也加了指针检查，一次 mode 键丢失只花一次读而不是每个在飞分配各一次。
+6. **队列 key 第三次才真正统一。** 还剩 4 个生产点自己拼（`api_manager.go` 撤 token、
+   `botfather/command.go` 三处 teardown）加一个死字段，全是 `Del`、不影响分配 chokepoint，
+   但「一种拼法」这句话就是假的。现在 `grep -rn '"robotEvent:' modules/` 在非测试代码里为空。
+7. **`payload.robot_id` 的存在性校验改成查询出错时 fail-open。** review 指出照原样发布会把
+   一次 DB/Redis 抖动变成静默丢事件，而它要挡的增长面是「攻击者给的、可证明不存在的 id」，
+   且没有调用方能让这次查询报错。所以保留校验、去掉 fail-closed，改动收敛成「已知不存在才拒」。
+8. **守卫的盲拼法**：`"robotEvent:%s"` 匹配得到，`"robotEvent:" + robotID` 匹配不到 —— 而后者
+   正是 `modules/message`、`modules/bot_mention` 测试里通用的写法，第六个 writer 用它会同时
+   躲过匹配和防盲下限。已补全并在 vacuity 测试里逐个断言。
+9. **`TestMain` 的探针不够**：只探 `SELECT 1` 与 `PING`，而真正卡住测试的是两条 `CREATE TABLE`。
+   CI 上一个权限/collation 问题仍会让整包静默 skip 而 `go test` 退 0 —— 正是这个 TestMain
+   要关掉的盲点。DDL 已与 `seqTestCtx` 共用。
+10. **expected-mode 改 atomic 指针**：测试钩子改写的是生产代码读的包级变量，当前调用点都是
+    单 goroutine 所以 `-race` 干净，但「今天干净」不值得依赖。
+
+**验证**：`pkg/botevent` 46 测试全绿（`-race -shuffle=on`，`CI=true`，**零 skip**）；
+`pkg/redis`、`modules/robot`、`modules/bot_api`、`modules/message` 整包绿。
+`modules/message` 的 `TestE2E_Issue557_*` 一度红过一次并被我误判成迁移文件所致 —— 重跑两次
+均绿，是依赖 IM 的 flaky，**「revert 之后就好了」那一次是巧合**，记在这里以免下次又当因果。
