@@ -94,6 +94,11 @@ owner 读与 adapter 读分属两个模块）。
   `defaultBotTemplatePolicy().AdvertisedSend`）；`false` 时必须为 `null`。
 - **`/v1/bot/card/profile` wire 契约 additive-only**（`modules/bot_api/card_profile.go:23-24`）：
   只增 `config` 对象，现有字段（含 `enabled`）不改名/不删/不改类型/不改语义。
+- **响应变私有后必须禁共享缓存**：加了 `config` 之后该端点不再是「所有 Bot 同一份的
+  部署级常量」，但 **URL 对所有 Bot 逐字节相同**——区分调用者的只有 Authorization
+  头。任何按 URL 缓存的共享代理都会把 Bot A 的配置回给 Bot B。成功路径必须下发
+  `Cache-Control: private, no-store`（`private` 禁共享缓存，`no-store` 连私有副本
+  也不留——配置改动要即时生效）。owner 读接口同口径。两处都有测试钉住。
 - **发送端二次校验**：profile 是能力清单，`sendMessage` 必须独立按有效配置校验
   （模板分支 `reasoning_enabled==false` 拒绝；raw 分支按 `display_enabled` /
   `interaction_enabled` 拒绝），拒绝走单一泛化码 `err.server.bot_api.card_invalid`，

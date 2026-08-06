@@ -165,6 +165,11 @@ func TestBotSettings_CatalogListsEveryRegisteredKey(t *testing.T) {
 	assert.True(t, reasoning.Editable)
 	assert.Equal(t, botSettingSourceDefault, reasoning.Source)
 	assert.True(t, reasoning.Effective, "code default is true")
+
+	// Per-bot private config must never be held by a shared cache.
+	cacheControl := w.Header().Get("Cache-Control")
+	assert.Contains(t, cacheControl, "private")
+	assert.Contains(t, cacheControl, "no-store")
 }
 
 // TestBotSettings_OverrideThenDeleteFallsBack walks the full lifecycle the

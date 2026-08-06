@@ -80,6 +80,11 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
+	// 本响应自带 `config` 起就是**Bot 私有**的，而 URL 对所有 Bot 完全相同——区分调用
+	// 者的只有 Authorization 头。任何按 URL 缓存的共享代理都会把 Bot A 的配置回给
+	// Bot B。private 禁掉共享缓存，no-store 连私有缓存也不留副本（配置改动要即时生效，
+	// 本就不该有陈旧副本）。加在成功路径的最前面，确保和响应体一起写出。
+	c.Header("Cache-Control", "private, no-store")
 	c.Response(map[string]interface{}{
 		"enabled":      cardmsg.BotEnabled(),
 		"card_version": cardmsg.CardVersion,

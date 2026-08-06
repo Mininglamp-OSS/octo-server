@@ -315,6 +315,10 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
+	// 该响应是某个 Bot 的私有配置，且只有登录态区分调用者。与
+	// /v1/bot/card/profile 同口径：private 禁共享代理缓存，no-store 不留副本
+	// —— 改完配置立刻重读要看到新值。
+	c.Header("Cache-Control", "private, no-store")
 	c.Response(map[string]interface{}{"list": resolutions})
 }
 
