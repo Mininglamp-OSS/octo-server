@@ -21,6 +21,7 @@ package robot
 import (
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -230,6 +231,48 @@ type BotCardConfig struct {
 	ReasoningEnabled   bool
 }
 
+// AllowsRawDisplayCard / AllowsRawInteractiveCard 是 raw 卡两个档位的**唯一判定**。
+// 发送门、编辑门与 /v1/bot/card/profile 的清单都必须经它们，绝不各自组合布尔 ——
+// round-2 评审逮到的正是这个：门改成了「v2 要 display AND interaction」，清单却仍
+// 直接回显 InteractionEnabled，于是出现 profile 报 interaction_enabled:true、发卡却
+// 被拒的自相矛盾，恰好是该端点存在的意义（免去「发一条卡看是否 400」）的反面。
+//
+// display 是**下限**而非并列档：octo/v2 是 octo/v1 的严格超集（cardmsg.validateCard
+// 里的 interactive 只放宽校验、从不要求必须有交互元素），所以一张 v2 卡首先是展示卡，
+// 只是额外带了交互面。若两者并列，关掉 display 就能被「改一个 profile 字符串」绕过。
+func (c BotCardConfig) AllowsRawDisplayCard() bool { return c.DisplayEnabled }
+
+func (c BotCardConfig) AllowsRawInteractiveCard() bool {
+	return c.DisplayEnabled && c.InteractionEnabled
+}
+
+// rejectRobotCardBySetting 报告一个 legacy robot ingress 的 payload 是否需要经过
+// per-Bot 卡片策略判定（即它是不是一张卡）。非卡片消息完全不查配置，零开销。
+func rejectRobotCardBySetting(payload map[string]interface{}) bool {
+	return cardmsg.IsCardPayload(payload)
+}
+
+// robotCardPolicyAllows 判定一张 legacy ingress 的 raw 卡是否被该 Bot 的配置放行。
+//
+// 与 bot_api 的 raw 门共用 AllowsRawDisplayCard / AllowsRawInteractiveCard，所以两条
+// ingress 不可能对同一张卡给出不同结论 —— 这正是 payloadIsVail 注释里那句「三个入口
+// 对称」要求的。未知 profile 一律拒（cardmsg.Validate 已经把 profile 钉在接受集内，
+// 走到这里说明形状校验被绕过）。
+//
+// 本 ingress 不接受 Registry 模板（template_ref 只在 bot_api 实现），故无需 reasoning
+// 判定；模板 ref 出现在这里会先被 cardmsg.Validate 按未知字段/形状拒掉。
+func robotCardPolicyAllows(payload map[string]interface{}, cfg BotCardConfig) bool {
+	profile, _ := payload["profile"].(string)
+	switch profile {
+	case cardmsg.ProfileV1:
+		return cfg.AllowsRawDisplayCard()
+	case cardmsg.ProfileV2:
+		return cfg.AllowsRawInteractiveCard()
+	default:
+		return false
+	}
+}
+
 // applyCardMasterSwitch 把总闸支配关系落到实处：总闸为假时三个子开关的有效值恒为假。
 // 单独抽出来是因为它是 brief 的 load-bearing 不变量，需要被单测直接钉住。
 func applyCardMasterSwitch(cfg BotCardConfig) BotCardConfig {
@@ -350,6 +393,9 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 	c.Response(map[string]interface{}{"list": resolutions})
 }
 
+// botSettingWritePlan 是一条已校验、已归一化的待写项。
+type botSettingWritePlan struct{ key, value string }
+
 // botSettingUpdateReq 是批量写入体。批量而非单键，是为了让「同时关展示卡和交互卡」
 // 这类操作只产生一次事件推送。
 //
@@ -382,8 +428,7 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		return
 	}
 
-	type plan struct{ key, value string }
-	plans := make([]plan, 0, len(req.Items))
+	plans := make([]botSettingWritePlan, 0, len(req.Items))
 	seen := make(map[string]struct{}, len(req.Items))
 	for _, item := range req.Items {
 		def := findBotSettingDef(item.Key)
@@ -409,8 +454,14 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 			respondRobotRequestInvalid(c, "value")
 			return
 		}
-		plans = append(plans, plan{key: item.Key, value: normalized})
+		plans = append(plans, botSettingWritePlan{key: item.Key, value: normalized})
 	}
+
+	// 按 key 排序后再写：升级成单事务后，行锁要持有到 commit，两个并发批次若以相反
+	// 顺序提交同样两个键（[display, interaction] vs [interaction, display]）就能互等成
+	// 死锁（MySQL 1213）。逐条自动提交时锁立即释放、窗口可忽略，事务化之后不再是。
+	// 统一锁序是本仓既有做法（见 send.go 的 "#627 D4 uniform lock order"）。
+	sort.Slice(plans, func(i, j int) bool { return plans[i].key < plans[j].key })
 
 	// 属主校验放在形状校验之后、写库之前：形状错误无需查库即可拒，而任何写入都
 	// 必须先过属主门。
@@ -422,11 +473,33 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 	// 调用方收到 500 以为什么都没生效，实际前面几项已经落库；更糟的是错误路径会跳过
 	// notifyBotSettingChanged，adapter 继续用旧缓存直到自己的 TTL 到期——正是该事件
 	// 要消灭的那个窗口。事务失败即整批回滚，"绝不半应用"才真正成立。
-	tx, err := rb.ctx.DB().Begin()
-	if err != nil {
-		rb.Error("开启 bot_setting 事务失败", zap.Error(err), zap.String("robot_id", robotID))
+	if err := writeBotSettingOverrides(rb.ctx, robotID, loginUID, plans); err != nil {
+		rb.Error("写入 bot_setting 失败", zap.Error(err), zap.String("robot_id", robotID))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
+	}
+
+	// 事件只在提交成功之后推：提交失败时没有任何变更生效，推事件会让 adapter 白白
+	// 重拉一次并读到与它已有缓存相同的值。
+	rb.notifyBotSettingChanged(robotID)
+	c.ResponseOK()
+}
+
+// writeBotSettingOverrides 在单事务里 upsert 整批覆盖。
+//
+// 抽成函数不只是为了短：它让「事务中途失败 → 整批回滚」能被直接测到。经 HTTP 走的
+// 话，唯一可达的失败是校验失败，而校验在 Begin() 之前就返回了——那条路径对修复前后
+// 的代码表现完全相同，测不出事务本身。
+//
+// 调用方负责：先校验、先排序（统一锁序）、先过属主门；提交成功后才推变更事件。
+func writeBotSettingOverrides(
+	ctx *config.Context,
+	robotID, updatedBy string,
+	plans []botSettingWritePlan,
+) error {
+	tx, err := ctx.DB().Begin()
+	if err != nil {
+		return err
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -437,25 +510,12 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 			"INSERT INTO bot_setting (robot_id, key_name, value, updated_by) "+
 				"VALUES (?, ?, ?, ?) "+
 				"ON DUPLICATE KEY UPDATE value=VALUES(value), updated_by=VALUES(updated_by)",
-			robotID, p.key, p.value, loginUID,
+			robotID, p.key, p.value, updatedBy,
 		).Exec(); err != nil {
-			rb.Error("写入 bot_setting 失败", zap.Error(err),
-				zap.String("robot_id", robotID), zap.String("key", p.key))
-			httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
-			return
+			return err
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		rb.Error("提交 bot_setting 事务失败", zap.Error(err), zap.String("robot_id", robotID))
-		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
-		return
-	}
-
-	// 事件只在提交成功之后推：提交失败时没有任何变更生效，推事件会让 adapter 白白
-	// 重拉一次并读到与它已有缓存相同的值。
-	rb.notifyBotSettingChanged(robotID)
-	c.ResponseOK()
+	return tx.Commit()
 }
 
 // deleteBotSetting 处理 DELETE /v1/robot/:robot_id/settings/:key。

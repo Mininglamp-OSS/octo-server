@@ -216,6 +216,16 @@ func (s *SystemSettings) getBool(category, key string, fallback bool) bool {
 // An unparseable literal reports configured=false so the caller falls through
 // rather than inheriting a silent false — same fail-forward posture getBool
 // takes with its fallback.
+//
+// **This tier is best-effort, not enforcement.** EnsureSystemSettings tolerates
+// a failed startup Load() and leaves an empty snapshot for the auto-reload to
+// repair, and an empty snapshot is indistinguishable here from "key not
+// configured" — so a replica whose startup load blipped reports configured=false
+// and its caller falls through to the code default for up to one reload TTL.
+// A caller that layers a fail-closed control on top (see modules/robot's
+// bot_setting resolver) fails closed only in ITS own tier; do not read that
+// posture as covering this one. An operator who needs a capability genuinely
+// disabled should set it at the layer that enforces, not only here.
 func (s *SystemSettings) SettingBoolOK(category, key string) (value bool, configured bool) {
 	v, ok := s.lookup(category, key)
 	if !ok {

@@ -76,12 +76,18 @@ owner 读与 adapter 读分属两个模块）。
 - **总闸支配子开关**：`card_enabled==false` ⟹ 三个子开关的有效值全为 `false`。
   profile 绝不能报某个子开关为 true 而发卡被 `card_disabled` 拒
   （`pkg/cardmsg/cardmsg.go:177-200` 已确立的「清单与发卡门禁同源」不变量）。
-- **display / interaction / reasoning 三者正交**：`display_enabled` 与
-  `interaction_enabled` 只管 **raw 卡路径**（bot 自拼 card JSON），**绝不可**实现成
-  「按 wire profile 一刀切」。推理卡自身横跨两档
-  （`ai.reasoning-process@0.3.0/manifest.json`：active/error = `octo/v2`，
-  result = `octo/v1`），按 profile 切会把它砍成只剩终态或只剩过程。模板卡只看
-  `reasoning_enabled`。
+- **raw 卡两档 vs 模板卡正交；display 是 raw 档内的下限**（round-1/2 评审后修订）：
+  `display_enabled` / `interaction_enabled` 只管 **raw 卡路径**（bot 自拼 card JSON），
+  `reasoning_enabled` 只管**模板卡**——这两组之间正交，**绝不可**按 wire profile 一刀切。
+  推理卡自身横跨两档（`ai.reasoning-process@0.3.0/manifest.json`：active/error =
+  `octo/v2`，result = `octo/v1`），按 profile 切会把它砍成只剩终态或只剩过程。
+  但 raw 档**内部**，display 与 interaction 不是并列关系：`octo/v2` 是 `octo/v1` 的
+  严格超集（`cardmsg.validateCard` 的 `interactive` 只放宽校验、从不要求必须有交互
+  元素），所以 `octo/v1` 需要 `display`，`octo/v2` 需要 **`display` AND `interaction`**。
+  并列会让「改一个 profile 字符串」绕过 `display_enabled=false`。
+  判定收口在 `BotCardConfig.AllowsRawDisplayCard()` /
+  `AllowsRawInteractiveCard()`，**发送门、编辑门与 profile 清单三处共用**，不得各自
+  组合布尔——否则会出现清单报 true 而发卡被拒的自相矛盾。
 - **键白名单是可查询的**：同一份注册表既是写入校验的白名单，也是 owner 读接口
   返回的「可配置项目录」——客户端据此渲染「Bot 管理」列表，新增一个键不需要客户端
   发版。未注册的 key 写入必须 400，不得长出野键（同 `system_setting` 的 `settingDef`）。
@@ -99,12 +105,23 @@ owner 读与 adapter 读分属两个模块）。
   头。任何按 URL 缓存的共享代理都会把 Bot A 的配置回给 Bot B。成功路径必须下发
   `Cache-Control: private, no-store`（`private` 禁共享缓存，`no-store` 连私有副本
   也不留——配置改动要即时生效）。owner 读接口同口径。两处都有测试钉住。
-- **发送端二次校验**：profile 是能力清单，`sendMessage` 必须独立按有效配置校验
-  （模板分支 `reasoning_enabled==false` 拒绝；raw 分支按 `display_enabled` /
-  `interaction_enabled` 拒绝），拒绝走单一泛化码 `err.server.bot_api.card_invalid`，
+- **三个卡片生产者入口都必须二次校验**（round-2 评审后修订）：profile 只是能力清单，
+  producer 可以持有陈旧副本或干脆不读，所以每条**已鉴权**的发送路径都要独立按有效
+  配置校验。本仓有三个 ingress，`payloadIsVail` 的注释即写明三者须**对称**：
+  `bot_api` 的 `sendMessage`、`bot_api` 的 raw `message/edit`、以及 legacy
+  `POST /v1/robots/:robot_id/:app_key/sendMessage`（`modules/robot`）。它们共用同一个
+  Bot 身份（`bot_setting.robot_id` 与 `authRobot` / `assertRobotOwner` 取自同一列），
+  漏掉任何一条，这个开关就只是建议而非能力控制。拒绝一律走各自 ingress 既有的单一
+  泛化码（`bot_api` → `err.server.bot_api.card_invalid`；robot → content-invalid），
   具体原因只进日志（防枚举）。
-- **关闭只拦新发**：门加在 `send.go`，`botMessageEdit` 的模板分支不加 —— 已发出的卡
-  必须能编辑到终态，否则线上残留「永久处理中」的卡。
+  用户 ingress 与 robot 的 `message/edit` 无需加门：前者无条件拒卡，后者经
+  `cardmsg.RejectsCardEdit` 拒绝一切卡片编辑。
+- **关闭只拦模板卡的续帧，不拦 raw 卡的改写**（round-1 评审后修订）：`sendMessage`
+  全量加门；`botMessageEdit` 的**模板分支**不加门——流式推理卡必须能编辑到终态，
+  否则线上残留「永久处理中」的卡。但**raw 分支必须加门**：`cardmsg.Validate` 接受
+  接受集内的任意 profile 且不比对编辑帧与原消息，缺了这道门就有提权通道（先发
+  `octo/v1`，再把 `content_edit` 换成带 `Action.Submit` 的 `octo/v2` 帧，而该帧正是
+  动作端点信任的生效帧）。
 - **写入口鉴权 = bot owner 自助**：对齐 `setAutoApprove` / `setMentionPref` 的
   `assertRobotOwner`（`creator_uid == loginUID`，robot 不存在 → 404、非 owner → 403、
   DB 故障 → 500 且不得伪装成 404）。挂在 `/v1/robot/:robot_id/*`（user session）。
@@ -130,9 +147,10 @@ owner 读与 adapter 读分属两个模块）。
   「readers 走 atomic.Pointer、永不取锁」。解析器必须在**构造期**解析一次并持有实例
   （`Robot.systemSettings` / `Service.systemSettings`），绝不可在每次请求里调
   `EnsureSystemSettings`，否则等于把全局锁加到发卡路径上。
-- **门只加在新建路径**：`sendMessage` 的门在 `if cardIntent` 之内，非卡片消息零开销；
-  推理卡的流式更新走 `message/edit`，该路径**刻意不加门**（关闭只拦新建，已发卡要能
-  进终态）。故新增成本是「每张卡创建一次索引单行读」，而该路径本就有多次 DB 查询。
+- **成本只落在卡片路径上**：门都在「这条消息是不是卡」的判断之内，非卡片消息零开销。
+  按路径计：raw 卡新建、raw 卡编辑各一次索引单行读；模板卡只在新建时读一次，
+  流式续帧走 `message/edit` 的模板分支，不加门也就没有额外读。这些路径本就有多次
+  DB 查询，量级相当。
 
 ## Out of scope
 

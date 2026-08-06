@@ -155,9 +155,14 @@ func (ba *BotAPI) botCardConfigResponse(cfg robot.BotCardConfig) map[string]inte
 		}
 	}
 	return map[string]interface{}{
-		"card_enabled":           cfg.CardEnabled,
-		"display_enabled":        cfg.DisplayEnabled,
-		"interaction_enabled":    cfg.InteractionEnabled,
+		"card_enabled": cfg.CardEnabled,
+		// Both booleans come from the same predicates the send/edit gates call,
+		// never from the raw struct fields. interaction_enabled in particular is
+		// display AND interaction: advertising the raw switch while the gate
+		// requires both is exactly the "manifest says yes, send says 400"
+		// contradiction this endpoint exists to prevent.
+		"display_enabled":        cfg.AllowsRawDisplayCard(),
+		"interaction_enabled":    cfg.AllowsRawInteractiveCard(),
 		"reasoning_enabled":      reasoningEnabled,
 		"reasoning_template_ref": templateRef,
 	}

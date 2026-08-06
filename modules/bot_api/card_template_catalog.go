@@ -246,8 +246,24 @@ func (c *botCardTemplateCatalog) AdvertisedRef(id cardtmpl.ID) (botTemplateRef, 
 	if c == nil {
 		return botTemplateRef{}, false
 	}
+	// Ambiguity is reported, not silently resolved. Today AdvertisedSend holds
+	// exactly one version per id, so there is nothing to pick between; the day a
+	// second version of one template is advertised for new sends, binding to
+	// "whichever the sort happened to put first" would decide the wire contract
+	// by accident. Fail closed instead and make that a deliberate decision.
+	var found botTemplateRef
+	matches := 0
 	for _, template := range c.capability.Templates {
-		if template.ID != string(id) {
+		if template.ID == string(id) {
+			matches++
+			found = botTemplateRef{ID: cardtmpl.ID(template.ID), Version: template.Version}
+		}
+	}
+	if matches != 1 {
+		return botTemplateRef{}, false
+	}
+	for _, template := range c.capability.Templates {
+		if template.ID != string(id) || template.Version != found.Version {
 			continue
 		}
 		ref := botTemplateRef{ID: cardtmpl.ID(template.ID), Version: template.Version}

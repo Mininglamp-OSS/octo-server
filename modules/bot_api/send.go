@@ -1497,13 +1497,13 @@ func (ba *BotAPI) rejectRawCardByProfile(
 ) bool {
 	switch profile {
 	case cardmsg.ProfileV1:
-		if !config.DisplayEnabled {
+		if !config.AllowsRawDisplayCard() {
 			ba.Warn("Bot 展示卡已关闭，拒绝 raw 卡", zap.String("robot", robotID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}
 	case cardmsg.ProfileV2:
-		if !config.DisplayEnabled || !config.InteractionEnabled {
+		if !config.AllowsRawInteractiveCard() {
 			ba.Warn("Bot 展示卡或交互卡已关闭，拒绝 raw 交互卡",
 				zap.String("robot", robotID),
 				zap.Bool("display", config.DisplayEnabled),

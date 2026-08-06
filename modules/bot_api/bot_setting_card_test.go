@@ -548,3 +548,56 @@ func TestBotMessageEdit_RawCardCannotEscalateProfile(t *testing.T) {
 		t.Fatalf("edit refused with every switch on; body=%s", okRecorder.Body.String())
 	}
 }
+
+// TestBotCardConfigResponse_ManifestAgreesWithTheGate is the regression for
+// round-2 P1-2: the round-1 floor fix changed what the gate accepts but not what
+// the manifest advertised, so with display=false/interaction=true the profile
+// reported interaction_enabled:true while the gate refused every octo/v2 card.
+//
+// That is the precise failure this endpoint exists to prevent — a producer is
+// supposed to read the manifest instead of probing with "send one and see if it
+// 400s", because a 400 cannot distinguish "capability off" from "card illegal".
+//
+// Asserted as agreement rather than as a literal, so the two can never be
+// changed apart again.
+func TestBotCardConfigResponse_ManifestAgreesWithTheGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba := &BotAPI{Log: log.NewTLog("BotAPI-manifest-gate-agree"), cardTemplates: catalog}
+
+	// Every reachable combination of the two raw switches, master on.
+	for _, display := range []bool{false, true} {
+		for _, interaction := range []bool{false, true} {
+			cfg := robot.BotCardConfig{
+				CardEnabled: true, DisplayEnabled: display, InteractionEnabled: interaction,
+			}
+			out := ba.botCardConfigResponse(cfg)
+
+			for _, tc := range []struct {
+				field   string
+				profile string
+			}{
+				{"display_enabled", cardmsg.ProfileV1},
+				{"interaction_enabled", cardmsg.ProfileV2},
+			} {
+				advertised, _ := out[tc.field].(bool)
+
+				recorder := httptest.NewRecorder()
+				ginContext, _ := gin.CreateTestContext(recorder)
+				ginContext.Request = httptest.NewRequest(http.MethodPost, "/x", nil)
+				gateRefused := ba.rejectRawCardByProfile(
+					&wkhttp.Context{Context: ginContext}, "bot-1", tc.profile, cfg)
+
+				if advertised == gateRefused {
+					t.Errorf("display=%v interaction=%v: manifest %s=%v but gate refused=%v — "+
+						"the manifest advertises a capability the send path does not accept",
+						display, interaction, tc.field, advertised, gateRefused)
+				}
+			}
+		}
+	}
+}

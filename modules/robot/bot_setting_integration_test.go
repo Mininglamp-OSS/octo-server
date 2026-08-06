@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -328,16 +329,14 @@ func TestBotSettings_CatalogValueRoundTrips(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, "echoed value must round trip; body=%s", w.Body.String())
 }
 
-// TestBotSettings_BatchWriteIsAtomic pins the all-or-nothing contract the
-// handler claims. A batch that fails partway must leave nothing behind:
-// otherwise the caller sees a 500 and believes nothing applied, while some
-// switches silently did — and the invalidation event never fires, so adapters
-// keep serving the stale profile.
+// TestBotSettings_BatchValidationRejectsAtomically covers the validation half of
+// the all-or-nothing contract: one bad item rejects the whole batch.
 //
-// Driven through the validation failure (the only failure reachable without
-// breaking the DB): the invalid item is last, so any non-atomic implementation
-// would already have committed the first one.
-func TestBotSettings_BatchWriteIsAtomic(t *testing.T) {
+// Named for what it actually covers. It does NOT exercise the transaction —
+// validation returns before Begin() is reached, so this case passes against the
+// pre-transaction code too. The rollback itself is covered by
+// TestWriteBotSettingOverrides_RollsBackOnMidBatchFailure.
+func TestBotSettings_BatchValidationRejectsAtomically(t *testing.T) {
 	handler, _ := setupBotSettings(t)
 
 	w := putSettings(t, handler, settingsRobotID,
@@ -365,4 +364,37 @@ func TestBotSettings_BatchWriteIsAtomic(t *testing.T) {
 		assert.NotNil(t, item.Value, "%s must be written when the whole batch is valid", key)
 		assert.False(t, *item.Value)
 	}
+}
+
+// TestWriteBotSettingOverrides_RollsBackOnMidBatchFailure exercises the
+// transaction for real: the second item's key exceeds key_name's column width,
+// so MySQL (strict mode) errors on it after the first has already been inserted
+// inside the transaction. Without the rollback the first would survive.
+//
+// It calls the writer directly rather than going through HTTP because the
+// registry whitelist makes an over-long key unreachable from the endpoint — which
+// is the point: the only failure the HTTP path can produce trips before Begin().
+func TestWriteBotSettingOverrides_RollsBackOnMidBatchFailure(t *testing.T) {
+	_, ctx := setupBotSettings(t)
+
+	overlong := strings.Repeat("k", 200) // key_name is VARCHAR(128)
+	err := writeBotSettingOverrides(ctx, settingsRobotID, testutil.UID, []botSettingWritePlan{
+		{key: BotSettingKeyDisplayEnabled, value: botSettingFalse},
+		{key: overlong, value: botSettingFalse},
+	})
+	assert.Error(t, err, "an over-long key must fail the write")
+
+	overrides, queryErr := queryBotSettingOverrides(ctx, settingsRobotID)
+	assert.NoError(t, queryErr)
+	assert.Empty(t, overrides,
+		"the first item survived a failed batch — the transaction did not roll back")
+
+	// The same batch without the poisoned item commits completely.
+	assert.NoError(t, writeBotSettingOverrides(ctx, settingsRobotID, testutil.UID, []botSettingWritePlan{
+		{key: BotSettingKeyDisplayEnabled, value: botSettingFalse},
+		{key: BotSettingKeyInteractionEnabled, value: botSettingFalse},
+	}))
+	overrides, queryErr = queryBotSettingOverrides(ctx, settingsRobotID)
+	assert.NoError(t, queryErr)
+	assert.Len(t, overrides, 2)
 }

@@ -755,6 +755,36 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		respondRobotContentInvalid(c, "payload")
 		return
 	}
+
+	// per-Bot 卡片策略门（task bot-setting-store，round-2 评审 P1-1）。
+	//
+	// 本仓有**三个**卡片生产者入口，payloadIsVail 的 InteractiveCard 分支自己就写着
+	// 「与 bot_api 的 send gate 对称」。bot_setting 上线时只给 bot_api 那道门加了
+	// per-Bot 判定，这条 legacy 路径仍只有部署总闸 + Validate —— 而两条路的身份是**同
+	// 一列**（authRobot 按 robot.robot_id 解析，bot_setting.robot_id 与 assertRobotOwner
+	// 的 creator_uid 取自同一张表）。于是 owner 关掉展示/交互卡后，同一个 Bot 换这个
+	// 端点仍能把卡发出去：一个被某条已鉴权路径忽略的能力开关，就不成其为能力开关。
+	//
+	// 排在 payloadIsVail 之后：形状先过，策略再判，拒绝形状与本 ingress 既有口径一致
+	// （单一 content-invalid，防枚举；具体原因只进日志）。
+	if rejectRobotCardBySetting(payloadResult) {
+		cfg, cfgErr := rb.BotCardConfig(robotID)
+		if cfgErr != nil {
+			// fail-closed：配置读不到时不得放行，否则一次 DB 抖动就把 owner 关掉的
+			// 能力从这条路放开（与 bot_api 侧同姿态）。
+			rb.Error("查询 Bot 卡片配置失败", zap.Error(cfgErr), zap.String("robot_id", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if !robotCardPolicyAllows(payloadResult, cfg) {
+			rb.Warn("Bot 卡片能力已关闭，legacy robot ingress 拒绝",
+				zap.String("robot_id", robotID),
+				zap.Bool("display", cfg.DisplayEnabled),
+				zap.Bool("interaction", cfg.InteractionEnabled))
+			respondRobotContentInvalid(c, "payload")
+			return
+		}
+	}
 	userResp, err := rb.userService.GetUserWithUsername(robotID)
 	if err != nil {
 		rb.Error("查询机器人的用户信息失败！", zap.Error(err))
