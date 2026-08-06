@@ -10,9 +10,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -195,6 +197,39 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		return
 	}
 	fakeChannelID := common.GetFakeChannelIDWith(loginUID, peerUID)
+
+	// Person(DM) Space 隔离：DM 是跨 Space 共享的同一物理频道，单条 DM 读必须与
+	// /v1/message/channel/sync 的 filterPersonMessagesBySpace 走同一套
+	// personSpaceAllows（issue #484 / YUJ-219-A / GH#1283）；不匹配一律 404 归并
+	// （防枚举，与不可见同码）。SpaceMiddleware 未 opt-in（老客户端 / 内部调用不带
+	// X-Space-ID）时 spaceID=="" → 跳过 Space 过滤，与 sync 向前兼容口径一致。
+	// 提前查一次消息用于 Space 判定；respondSingleMessage 内部会再查一次做完整
+	// 可见性校验，代价是主键单条读、可接受。
+	if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
+		msgModel, err := m.db.queryMessageByID(fakeChannelID, common.ChannelTypePerson.Uint8(), strconv.FormatInt(messageID, 10))
+		if err != nil {
+			m.Error("查询 DM 消息失败", zap.Error(err), zap.String("channel_id", fakeChannelID), zap.Int64("message_id", messageID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if msgModel == nil {
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+			return
+		}
+		defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
+		if derr != nil {
+			m.Warn("查询默认 Space 失败，DM 单条读无标签消息按兼容口径放行",
+				zap.Error(derr), zap.String("loginUID", loginUID))
+			defaultSpaceID = spaceID
+		}
+		// IsSystemBot 判定基于对端 uid（peerUID），fakeChannelID 是 loginUID+peerUID
+		// 对称派生的，非 uid 直接可判。
+		if !personSpaceAllows(payloadSpaceIDFromRaw(msgModel.Payload), spacepkg.IsSystemBot(peerUID), spaceID, defaultSpaceID) {
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+			return
+		}
+	}
+
 	m.respondSingleMessage(c, fakeChannelID, common.ChannelTypePerson.Uint8(), "", messageID, loginUID)
 }
 
@@ -314,11 +349,24 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 		return
 	}
 
-	channelOffsetSeq, err := m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
-	if err != nil {
-		m.Error("查询频道设置失败", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-		return
+	channelOffsetSeq := uint32(0)
+	// Person 频道跳过 channel-level offset：对齐 cardCanonicalVisibleToViewer:550
+	// 的 Person 短路（"person 频道跳过偏移... 也避免对已是 fake id 的 person 频道
+	// 二次 fake 化"）。lookupChannelOffsetSeq 对 Person 会内部再做一次
+	// GetFakeChannelIDWith(channelID, loginUID)，那里期望入参是 peer uid 而非已经
+	// fake 好的 fakeChannelID；调用者传入的已经是 fakeChannelID（getPersonMessage
+	// 里已 fake 过一次），再 fake 一次就产生错的 lookup key、channel-level offset
+	// 恒为 0，等价于跳过——不如显式短路，语义清晰、并与 sync 的 messageAllows
+	// Person 分支一致（Person 不做 channel-level offset 截断）。用户级偏移
+	// (channelOffsetDB.queryWithUIDAndChannel) 上面已经做过，仍生效。
+	if channelType != common.ChannelTypePerson.Uint8() {
+		var err error
+		channelOffsetSeq, err = m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
+		if err != nil {
+			m.Error("查询频道设置失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
 	}
 
 	resp := &MsgSyncResp{}

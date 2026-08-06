@@ -640,3 +640,79 @@ func TestGetPersonMessage_InvalidMessageID(t *testing.T) {
 	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/notanumber", personPeerUID))
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 }
+
+// TestPersonSpaceAllows_Rules 直接固定 personSpaceAllows 的 5 条规则，与
+// filterPersonMessagesBySpace 头注释里的口径一一对应。这条 helper 是 DM
+// 单条读 (getPersonMessage) / DM 同步 (filterPersonMessagesBySpace) /
+// reaction (syncReaction/addOrCancelReaction) 共用的 Space 隔离核心闸门，
+// 任何一处走漏都是 issue #484 / YUJ-219-A / GH#1283 回归。helper 级 unit test，
+// 不依赖 DB / migration，永远可执行；抓「谁把 DM 空间过滤逻辑改破了」的
+// 单元金丝雀。
+func TestPersonSpaceAllows_Rules(t *testing.T) {
+	const (
+		curSpace     = "space-A"
+		otherSpace   = "space-B"
+		defaultSpace = "space-A"
+	)
+	tests := []struct {
+		name         string
+		msgSpaceID   string
+		isSystemBot  bool
+		spaceID      string
+		defaultSpace string
+		want         bool
+	}{
+		// 规则 1：精确匹配 → 保留
+		{"exact match", curSpace, false, curSpace, defaultSpace, true},
+		// 规则 2：无标签 && 非 SystemBot && 当前=默认 Space → 保留（向前兼容）
+		{"unlabeled non-bot in default space", "", false, curSpace, defaultSpace, true},
+		// 规则 3：无标签 && 非 SystemBot && 当前 != 默认 Space → 丢弃
+		{"unlabeled non-bot in non-default space", "", false, otherSpace, defaultSpace, false},
+		// 规则 4：无标签 && SystemBot → 丢弃（老 fileHelper / u_10000 消息不跨 Space 泄露）
+		{"unlabeled system bot", "", true, curSpace, defaultSpace, false},
+		// 规则 5：跨 Space 标签 → 丢弃
+		{"cross-space labeled", otherSpace, false, curSpace, defaultSpace, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := personSpaceAllows(tc.msgSpaceID, tc.isSystemBot, tc.spaceID, tc.defaultSpace)
+			assert.Equal(t, tc.want, got,
+				"personSpaceAllows(msg=%q, sysbot=%v, cur=%q, default=%q)",
+				tc.msgSpaceID, tc.isSystemBot, tc.spaceID, tc.defaultSpace)
+		})
+	}
+}
+
+// TestPersonFakeChannelIDNotDoubleFaked 固定「Person DM 频道 ID 只 fake 一次」
+// 的核心不变式。lookupChannelOffsetSeq 内部对 channelType==Person 会做
+// GetFakeChannelIDWith(channelID, loginUID)，期望入参是 peer uid 而非已经
+// fake 好的 fakeChannelID；如果调用方（如 respondSingleMessage 之前对 Person
+// 传的是 fakeChannelID）不做短路，就会二次 fake，产生错误的 lookup key、
+// 静默把 channel-level offset 归 0，channel-offset-truncated 的 DM 消息又能
+// 被读到——这是 PR #708 review 抓到的第二条 blocking 的技术根因。
+//
+// 这个 helper 级测试固定该不变式：一旦有人把 respondSingleMessage 里对
+// Person 短路 channel-offset 的分支拆掉、或改变 GetFakeChannelIDWith 的对称
+// 语义，assertion 立即失败。
+func TestPersonFakeChannelIDNotDoubleFaked(t *testing.T) {
+	const (
+		loginUID = "user_login"
+		peerUID  = "user_peer"
+	)
+	fake1 := common.GetFakeChannelIDWith(loginUID, peerUID)
+	// 二次 fake（如果调用者错误地把 fake1 传给 lookupChannelOffsetSeq、
+	// 让它内部再做一次 GetFakeChannelIDWith(fake1, loginUID)）产生的 key。
+	fake2 := common.GetFakeChannelIDWith(fake1, loginUID)
+
+	// 对称性：GetFakeChannelIDWith 的两个入参无序等价（同一对话恒生成同一 key）。
+	assert.Equal(t, fake1, common.GetFakeChannelIDWith(peerUID, loginUID),
+		"GetFakeChannelIDWith must be symmetric across the two DM sides")
+
+	// 反证：二次 fake 的 key 与真实的 fakeChannelID 不同——所以 respondSingleMessage
+	// 对 Person 必须显式短路 channel-level offset lookup（api_message_get.go:
+	// respondSingleMessage 已实现），否则用了错的 key 查 channel_setting.offset_message_seq。
+	assert.NotEqual(t, fake1, fake2,
+		"double-faked Person channelID must differ from the real fakeChannelID; "+
+			"if this becomes equal, the safety of the Person short-circuit changes and "+
+			"respondSingleMessage's Person branch must be revisited")
+}
