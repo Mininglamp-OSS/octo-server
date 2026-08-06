@@ -21,7 +21,7 @@ func (n *Notify) deliverApprovalCardNotification(req *NotifyReq, capability card
 		return nil, errNotifyCardNotAllowed
 	}
 	card := req.ApprovalCard
-	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 ||
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 ||
 		strings.TrimSpace(card.Title) == "" {
 		return nil, errNotifyCardInvalid
 	}

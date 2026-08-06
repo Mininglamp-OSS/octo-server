@@ -33,6 +33,23 @@ import (
 // existing retry/dedup state machine handles them, exactly as the text path.
 // Ordinary card-build failures retain the legacy text fallback; runtime-catalog
 // safety rejections (blocked/disabled/auth/integrity/unavailable) fail closed.
+// spaceIDAcceptable rejects a Space the card boundary would later refuse.
+//
+// Blank was already rejected here; untrimmed was not, and after PR-C D3 that
+// difference is visible to callers. The marker-authoring boundary in
+// internal/carddispatch validates the Space before stamping it and fails the
+// send, so an untrimmed value used to fan out one goroutine per target and
+// come back as HTTP 200 with every target failed as `card_invalid`, N
+// identical warn lines, and nothing naming the cause. Catching it here turns
+// that into one accurate 400.
+//
+// This is validation, not normalisation: the value is still never rewritten.
+// Trimming it silently would put the caller's card in a Space they did not
+// name, which is the failure the strict reader exists to prevent.
+func spaceIDAcceptable(spaceID string) bool {
+	return spaceID != "" && strings.TrimSpace(spaceID) == spaceID
+}
+
 func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*NotifyResp, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -41,7 +58,7 @@ func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*
 		return nil, errNotifyCardInvalid
 	}
 	card := req.Card
-	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 {
 		return nil, errNotifyCardInvalid
 	}
 	if strings.TrimSpace(card.TaskNo) == "" || strings.TrimSpace(card.Title) == "" {
@@ -362,7 +379,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 		return nil, errNotifyCardInvalid
 	}
 	card := req.DocsCard
-	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 {
 		return nil, errNotifyCardInvalid
 	}
 	if strings.TrimSpace(card.DocID) == "" || strings.TrimSpace(card.Title) == "" {
