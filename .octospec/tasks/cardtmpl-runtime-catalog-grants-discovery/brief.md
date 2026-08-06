@@ -513,6 +513,28 @@ finds them directly.
   boot-time `EditCompatible` map, which a runtime-published version can never
   be in, so `send` reached the dynamic authorizer and `edit` never did. The
   brief claimed a closure the code did not have until this was wired.
+- [x] the ref gate and the render authorize against the *same* Space, so a
+  per-Space grant works on a group or thread target —
+  `TestGroupSendAuthorizesTheRenderWithTheSameSpaceAsTheGate`,
+  `TestGroupEditAuthorizesTheRenderWithTheSameSpaceAsTheGate`. The round above
+  ticked the edit line on the strength of the resolver alone, and both
+  reviewers pointed out the witness stood at the layer where the bug was not:
+  `renderPayload` rebuilt its `CatalogAccess` from `env.SpaceID`, which send.go
+  populates for DMs only, so `cardtmpl.Render` re-resolved the grant in the
+  global scope and refused every exact-Space grant the gate had just accepted.
+  The render now receives the principal the gate decided on. Both tests assert
+  the recorded `Access` directly *and* fail with `ErrRuntimeCatalogNotAuthorized`
+  when the fix is reverted; `stubAuthorizationSource` gained a `grantSpaceID`
+  because until then it ignored `query.Principal` and this whole class of
+  divergence was unobservable in the package.
+- [x] a Space that could not be established never reverts a shadowed template ID
+  to its static version — `TestBotTemplateSendRefFollowsTheShadowMatrix`
+  ("an unavailable Space does not revert a shadowed ID to static", plus the two
+  rows that bound it: static still answers when nothing shadows the ID, and a
+  Space-less target is still authorized by a global grant). `botCatalogPrincipal`
+  carries three Space states rather than a bool, because "this target has no
+  Space" and "we could not read which Space this target is in" were the same
+  `false` and led to opposite correct answers.
 - [x] one authorization decision never combines activation/block/grant values
   from different DB snapshots — `TestStoreLoadAuthorizationReadsPointerArtifactAndGrantInOneTransaction`,
   `TestRuntimeCatalogDynamicNewSendUsesExactlyOneSnapshot`,

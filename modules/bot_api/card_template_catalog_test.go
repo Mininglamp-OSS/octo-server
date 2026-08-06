@@ -114,7 +114,7 @@ func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing
 		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
 	}
 	if _, err := catalog.RenderPayloadForPrincipal(
-		context.Background(), botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-7", SpaceResolved: true},
+		context.Background(), botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-7", Space: botSpaceScoped},
 		payload, cardtmpl.BuildEnv{SpaceID: "space-7"},
 	); err != nil {
 		t.Fatalf("RenderPayloadForPrincipal: %v", err)

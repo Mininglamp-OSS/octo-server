@@ -286,7 +286,8 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend, inbound, env,
+	return c.renderPayload(ctx,
+		botCatalogAccess(cardtmpl.CatalogPurposeNewSend, "bot-api-compat", env.SpaceID), inbound, env,
 		c.staticRefResolver(c.sendAllowed, "not Bot-callable for new send"), false, "")
 }
 
@@ -303,7 +304,7 @@ func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
 	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeNewSend, inbound, env,
+	return c.renderPayload(ctx, principal.access(cardtmpl.CatalogPurposeNewSend), inbound, env,
 		func(ctx context.Context, value any) (botTemplateRef, error) {
 			return c.requireSendableRef(ctx, principal, value)
 		}, true, provenanceSpaceID(principal, env))
@@ -317,7 +318,8 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
+	return c.renderPayload(ctx,
+		botCatalogAccess(cardtmpl.CatalogPurposeHistoricalEdit, "bot-api-compat", env.SpaceID), inbound, env,
 		c.staticRefResolver(c.editAllowed, "not edit-compatible"), false, "")
 }
 
@@ -346,7 +348,7 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	if space == "" {
 		space = provenanceSpaceID(principal, env)
 	}
-	return c.renderPayload(ctx, principal.BotID, cardtmpl.CatalogPurposeHistoricalEdit, inbound, env,
+	return c.renderPayload(ctx, principal.access(cardtmpl.CatalogPurposeHistoricalEdit), inbound, env,
 		c.editRefResolver(principal), true, space)
 }
 
@@ -364,8 +366,13 @@ func storedProvenanceSpaceID(envelope []byte) string {
 
 func (c *botCardTemplateCatalog) renderPayload(
 	ctx context.Context,
-	botID string,
-	purpose cardtmpl.CatalogPurpose,
+	// access is the *authorized* identity, handed down from whoever resolved
+	// the ref. It is a parameter rather than something rebuilt here because
+	// cardtmpl.Render re-resolves the grant from it, and a render that composed
+	// its own Space disagreed with the gate for every group and thread target:
+	// the gate read the target's Space, the render read env.SpaceID, which is
+	// DM-only. An exact-Space grant passed one and was refused by the other.
+	access cardtmpl.CatalogAccess,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 	resolveRef func(context.Context, any) (botTemplateRef, error),
@@ -420,7 +427,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 		return nil, fmt.Errorf("%w: marshal data: %v", errBotTemplateRequestInvalid, err)
 	}
 	rendered, err := c.catalog.Render(ctx, cardtmpl.CatalogRenderRequest{
-		Access: botCatalogAccess(purpose, botID, env.SpaceID),
+		Access: access,
 		ID:     ref.ID, Version: ref.Version, State: cardtmpl.State(state), Fields: rawData, Env: env,
 	})
 	if err != nil {
@@ -441,8 +448,10 @@ func (c *botCardTemplateCatalog) renderPayload(
 		rendered[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
 			Version:       cardmsg.CatalogProvenanceVersion,
 			PrincipalType: cardmsg.CatalogPrincipalWireBot,
-			PrincipalID:   botID,
-			SpaceID:       provenanceSpaceID,
+			// The same access the render authorized under, so the marker cannot
+			// name a principal the render did not actually decide for.
+			PrincipalID: access.Principal.ID,
+			SpaceID:     provenanceSpaceID,
 		}.MarshalMap()
 	}
 	for _, key := range []string{"mention", "reply"} {
@@ -499,7 +508,7 @@ func (c *botCardTemplateCatalog) resolveEditRef(
 	}
 	notEditable := fmt.Errorf("%w: template is not edit-compatible", errBotTemplateRequestInvalid)
 	source := c.authorizationSource()
-	if source == nil || !principal.SpaceResolved {
+	if source == nil || !principal.grantReadable() {
 		return botTemplateRef{}, notEditable
 	}
 	auth, err := source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
@@ -649,9 +658,12 @@ func editProvenanceSpaceCheck(dynamicEnabled bool, principal botCatalogPrincipal
 	if !dynamicEnabled {
 		return editSpaceCheck{}
 	}
-	if !principal.SpaceResolved {
+	if principal.Space == botSpaceUnavailable {
 		return editSpaceCheck{unavailable: true}
 	}
+	// botSpaceGlobalOnly lands here too, as `verifiable` with an empty Space:
+	// "we established this target has no Space" is a determination the stored
+	// marker can legitimately be compared against, not an outage.
 	return editSpaceCheck{spaceID: principal.SpaceID, verifiable: true}
 }
 
@@ -741,7 +753,7 @@ func requireEffectiveCardTemplate(
 // env.SpaceID remains the fallback so a DM keeps stamping exactly what it
 // stamped before PR-C's target-authoritative resolution existed.
 func provenanceSpaceID(principal botCatalogPrincipal, env cardtmpl.BuildEnv) string {
-	if principal.SpaceResolved && principal.SpaceID != "" {
+	if principal.Space == botSpaceScoped && principal.SpaceID != "" {
 		return principal.SpaceID
 	}
 	return env.SpaceID

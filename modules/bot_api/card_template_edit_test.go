@@ -549,7 +549,7 @@ func markedRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog, botID
 	t.Helper()
 	env := cardtmplBuildEnvForTest()
 	payload, err := catalog.RenderPayloadForPrincipal(context.Background(),
-		botCatalogPrincipal{BotID: botID, SpaceID: env.SpaceID, SpaceResolved: true},
+		botCatalogPrincipal{BotID: botID, SpaceID: env.SpaceID, Space: botSpaceScoped},
 		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
 	if err != nil {
 		t.Fatal(err)

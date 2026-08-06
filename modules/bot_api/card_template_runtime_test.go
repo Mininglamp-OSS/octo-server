@@ -29,6 +29,16 @@ type stubAuthorizationSource struct {
 	err     error
 	granted []cardtmpl.RuntimeAdvertisedTemplate
 	listErr error
+	// grantSpaceID, when set, models an *exact-Space* grant row: the stored
+	// RuntimeGrant reaches only a query whose principal names that Space, and
+	// every other principal sees the same authorization with no grant at all.
+	//
+	// Until this existed the stub answered s.auth[query.ID] for every caller and
+	// ignored query.Principal entirely, so no test in this package could observe
+	// two layers authorizing against different Spaces. That blind spot is how
+	// the ref gate and the render came to disagree about which Space to read a
+	// grant in and stayed that way across three review rounds.
+	grantSpaceID string
 
 	loads   int
 	queries []cardtmpl.RuntimeAuthorizationQuery
@@ -43,7 +53,11 @@ func (s *stubAuthorizationSource) LoadAuthorization(
 	if s.err != nil {
 		return cardtmpl.RuntimeAuthorization{}, s.err
 	}
-	return s.auth[query.ID], nil
+	auth := s.auth[query.ID]
+	if s.grantSpaceID != "" && query.Principal.SpaceID != s.grantSpaceID {
+		auth.Grant = cardtmpl.RuntimeGrant{}
+	}
+	return auth, nil
 }
 
 func (s *stubAuthorizationSource) ListAuthorizedTemplates(
@@ -77,8 +91,17 @@ func sendGrant() cardtmpl.RuntimeGrant {
 	}
 }
 
+// globalSendGrant is the row a Space-less target can still be authorized by:
+// the store has already applied exact-over-global precedence, so what reaches
+// the decision is a grant whose scope is the empty sentinel.
+func globalSendGrant() cardtmpl.RuntimeGrant {
+	return cardtmpl.RuntimeGrant{
+		Found: true, Scope: cardtmpl.RuntimeGrantScopeGlobal, Revision: 2, Discover: true, Send: true,
+	}
+}
+
 func resolvedPrincipal() botCatalogPrincipal {
-	return botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-1", SpaceResolved: true}
+	return botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-1", Space: botSpaceScoped}
 }
 
 func TestBotTemplateSendRefFollowsTheShadowMatrix(t *testing.T) {
@@ -183,12 +206,41 @@ func TestBotTemplateSendRefFollowsTheShadowMatrix(t *testing.T) {
 			want:      botTemplateRef{},
 		},
 		{
-			name: "an unresolved Space withholds the dynamic overlay only",
+			// The row this replaces asserted the opposite, and two reviewers
+			// cited it as codifying the bug: an unavailable Space short-circuited
+			// to static policy *before* the pointer was ever read, so a group-row
+			// read that timed out sent the static card of an ID an operator had
+			// already replaced. The pointer is a fact about the template, not
+			// about the caller, so it is read either way; only the grant needs a
+			// scope to be read in.
+			name: "an unavailable Space does not revert a shadowed ID to static",
 			source: &stubAuthorizationSource{newSend: true, auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
 				id: dynamicAuthorization("9.0.0", false, sendGrant()),
 			}},
 			principal: botCatalogPrincipal{BotID: "bot-42"},
+			want:      botTemplateRef{},
+		},
+		{
+			// The other half of the same rule: withholding static is warranted
+			// only because something shadowed it. With no activation row the
+			// static policy is still the whole truth, unavailable Space or not,
+			// and refusing here would take down cards nothing had replaced.
+			name: "an unavailable Space still answers static when nothing shadows the ID",
+			source: &stubAuthorizationSource{newSend: true, auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+				id: {},
+			}},
+			principal: botCatalogPrincipal{BotID: "bot-42"},
 			want:      botTemplateRef{ID: id, Version: staticVersion},
+		},
+		{
+			// A group that belongs to no Space is a determination, not a
+			// failure. Only global grants can apply to it, and one does.
+			name: "a Space-less target is authorized by a global grant",
+			source: &stubAuthorizationSource{newSend: true, auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+				id: dynamicAuthorization("9.0.0", false, globalSendGrant()),
+			}},
+			principal: botCatalogPrincipal{BotID: "bot-42", Space: botSpaceGlobalOnly},
+			want:      botTemplateRef{ID: id, Version: "9.0.0"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -397,31 +449,36 @@ func newGrantSpaceContext(t *testing.T, header string) *wkhttp.Context {
 // resolver is allowed to paper over.
 func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		header  string
-		querier *fakeSpaceQuerier
-		want    string
-		wantOK  bool
+		name      string
+		header    string
+		querier   *fakeSpaceQuerier
+		want      string
+		wantState botCatalogSpaceState
 	}{
 		{
 			name:    "single membership resolves",
 			querier: &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1"}}},
-			want:    "space-1", wantOK: true,
+			want:    "space-1", wantState: botSpaceScoped,
 		},
 		{
-			name:    "multi-Space with no hint refuses instead of picking the first",
-			querier: &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1", "space-2"}}},
-			wantOK:  false,
+			name:      "multi-Space with no hint refuses instead of picking the first",
+			querier:   &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1", "space-2"}}},
+			wantState: botSpaceUnavailable,
 		},
 		{
-			name:    "no membership refuses",
-			querier: &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound},
-			wantOK:  false,
+			// Not a refusal: the query ran and answered "none". A Bot attached
+			// to no Space has no exact grants that could shadow a global one, so
+			// global scope is the honest reading — and treating it as an outage
+			// would make every such Bot permanently unable to send a dynamic
+			// template even with a global grant.
+			name:      "no membership is a determination, not an outage",
+			querier:   &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound},
+			wantState: botSpaceGlobalOnly,
 		},
 		{
-			name:    "a DB error refuses rather than falling back",
-			querier: &fakeSpaceQuerier{defaultErr: errors.New("db unavailable")},
-			wantOK:  false,
+			name:      "a DB error refuses rather than falling back",
+			querier:   &fakeSpaceQuerier{defaultErr: errors.New("db unavailable")},
+			wantState: botSpaceUnavailable,
 		},
 		{
 			name:   "an authorized header is honoured",
@@ -430,7 +487,7 @@ func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 				authDefault: true,
 				multiRows:   map[string][]string{"bot-42": {"space-1", "space-2"}},
 			},
-			want: "space-9", wantOK: true,
+			want: "space-9", wantState: botSpaceScoped,
 		},
 		{
 			name:   "an unauthorized header refuses and never falls through",
@@ -439,7 +496,7 @@ func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 				authDefault: false,
 				multiRows:   map[string][]string{"bot-42": {"space-1"}},
 			},
-			wantOK: false,
+			wantState: botSpaceUnavailable,
 		},
 		{
 			name:   "an unverifiable header refuses",
@@ -448,14 +505,14 @@ func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 				authErr:   errors.New("db unavailable"),
 				multiRows: map[string][]string{"bot-42": {"space-1"}},
 			},
-			wantOK: false,
+			wantState: botSpaceUnavailable,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ba := newTestBotAPI(test.querier)
-			got, ok := ba.resolveBotGrantSpaceID(newGrantSpaceContext(t, test.header), "bot-42")
-			if ok != test.wantOK || got != test.want {
-				t.Fatalf("resolveBotGrantSpaceID = (%q, %v), want (%q, %v)", got, ok, test.want, test.wantOK)
+			got, state := ba.resolveBotGrantSpaceID(newGrantSpaceContext(t, test.header), "bot-42")
+			if state != test.wantState || got != test.want {
+				t.Fatalf("resolveBotGrantSpaceID = (%q, %v), want (%q, %v)", got, state, test.want, test.wantState)
 			}
 		})
 	}
@@ -480,13 +537,13 @@ func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
 	ctx := newGrantSpaceContext(t, "")
 
 	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
-	if !principal.SpaceResolved || principal.SpaceID != "space-group" {
+	if principal.Space != botSpaceScoped || principal.SpaceID != "space-group" {
 		t.Fatalf("group principal = %+v, want the group's Space", principal)
 	}
 
 	thread := ba.botSendCatalogPrincipal(ctx, "bot-42",
 		"group-1"+threadChannelIDSeparator+"t-9", common.ChannelTypeCommunityTopic.Uint8())
-	if !thread.SpaceResolved || thread.SpaceID != "space-group" {
+	if thread.Space != botSpaceScoped || thread.SpaceID != "space-group" {
 		t.Fatalf("thread principal = %+v, want the parent group's Space", thread)
 	}
 
@@ -496,7 +553,7 @@ func TestBotSendCatalogPrincipalUsesTheTargetGroupSpace(t *testing.T) {
 		ba.botSendCatalogPrincipal(ctx, "bot-42", "group-missing", common.ChannelTypeGroup.Uint8()),
 		ba.botSendCatalogPrincipal(ctx, "bot-42", "malformed", common.ChannelTypeCommunityTopic.Uint8()),
 	} {
-		if unresolved.SpaceResolved || unresolved.SpaceID != "" {
+		if unresolved.Space != botSpaceUnavailable || unresolved.SpaceID != "" {
 			t.Fatalf("principal = %+v, want unresolved", unresolved)
 		}
 	}
@@ -518,11 +575,11 @@ func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
 		ba := newTestBotAPIWithCatalog(t, querier, source)
 
 		principal := ba.botCatalogPrincipalFor(ctx, "bot-42")
-		if principal.SpaceResolved || principal.SpaceID != "" {
+		if principal.Space != botSpaceUnavailable || principal.SpaceID != "" {
 			t.Fatalf("dark catalog resolved a Space: %+v", principal)
 		}
 		send := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
-		if send.SpaceResolved || send.SpaceID != "" {
+		if send.Space != botSpaceUnavailable || send.SpaceID != "" {
 			t.Fatalf("dark catalog resolved a send Space: %+v", send)
 		}
 		if len(querier.calls) != 0 {
@@ -531,7 +588,7 @@ func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
 	}
 
 	enabled := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: true})
-	if principal := enabled.botCatalogPrincipalFor(ctx, "bot-42"); !principal.SpaceResolved {
+	if principal := enabled.botCatalogPrincipalFor(ctx, "bot-42"); principal.Space != botSpaceScoped {
 		t.Fatalf("enabled catalog did not resolve a Space: %+v", principal)
 	}
 }
@@ -540,6 +597,158 @@ func TestBotCatalogPrincipalSkipsSpaceLookupWhenTheCatalogIsDark(t *testing.T) {
 // given resolver. The gate and the decision both read the catalog's accessor,
 // so a test that set only the process global would be exercising a path
 // production never takes.
+// grantEnforcingCatalog models the one thing cardtmpl.RuntimeCatalog.Render
+// does that the static test registry does not: it re-resolves the caller's
+// grant from request.Access, the way resolveDynamic does before it will render a
+// dynamic version. The static registry renders whatever it is given, so without
+// this model the render half of an authorization is invisible to this package —
+// and an invisible half is precisely what let the gate and the render disagree.
+type grantEnforcingCatalog struct {
+	cardtmpl.Catalog
+	source     *stubAuthorizationSource
+	lastRender cardtmpl.CatalogRenderRequest
+}
+
+func (c *grantEnforcingCatalog) Render(
+	ctx context.Context,
+	request cardtmpl.CatalogRenderRequest,
+) (map[string]any, error) {
+	c.lastRender = request
+	auth, err := c.source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: request.ID, Version: request.Version, Principal: request.Access.Principal,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !auth.Grant.Allows(request.Access.Purpose) {
+		return nil, cardtmpl.ErrRuntimeCatalogNotAuthorized
+	}
+	return map[string]any{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"card":         map[string]any{"type": "AdaptiveCard", "body": []any{}},
+	}, nil
+}
+
+// PR-C review round 4 — Jerry-Xin "Critical 2" and yujiawei P1-1, found
+// independently by both.
+//
+// requireSendableRef resolves the grant against the *target's* Space, which for
+// a group comes from the authoritative group row. renderPayload then hands the
+// ref to cardtmpl.Render, which re-resolves the grant from request.Access — and
+// used to compose that Access from env.SpaceID, which send.go populates for DMs
+// only. So a Bot holding an exact grant for the target's Space passed the gate
+// and was then refused by the render, and per-Space grants — the primary Bot
+// grant shape, and the entire reason resolveBotGrantSpaceID exists — were inert
+// for every group and thread target.
+//
+// Reverting renderPayload to botCatalogAccess(purpose, botID, env.SpaceID)
+// fails this test with ErrRuntimeCatalogNotAuthorized.
+func TestGroupSendAuthorizesTheRenderWithTheSameSpaceAsTheGate(t *testing.T) {
+	const groupSpace = "space-group"
+	const dynamicVersion = "9.0.0"
+	id := aireasoningprocess.TemplateID
+
+	source := &stubAuthorizationSource{
+		newSend: true,
+		auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+			id: dynamicAuthorization(dynamicVersion, false, sendGrant()),
+		},
+		// An exact row for the group's Space and no global row: the shape
+		// TestGrantsDoNotLeakBetweenBotsRealMySQL exists to protect, and the
+		// only one that can express a per-tenant grant.
+		grantSpaceID: groupSpace,
+	}
+	querier := &fakeSpaceQuerier{
+		// Deliberately different from the group's Space, so a render that fell
+		// back to the *sender's* membership would also be caught.
+		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
+		groupSpaces: map[string]string{"group-1": groupSpace},
+	}
+	ba := newTestBotAPIWithCatalog(t, querier, source)
+	rendering := &grantEnforcingCatalog{source: source}
+	ba.cardTemplates.catalog = rendering
+
+	principal := ba.botSendCatalogPrincipal(newGrantSpaceContext(t, ""), "bot-42",
+		"group-1", common.ChannelTypeGroup.Uint8())
+	if principal.Space != botSpaceScoped || principal.SpaceID != groupSpace {
+		t.Fatalf("gate principal = %+v, want the group's Space %q", principal, groupSpace)
+	}
+
+	// BuildEnv carries no Space, exactly as send.go leaves it for a group
+	// target — that emptiness is what the render used to authorize with.
+	rendered, err := ba.cardTemplates.RenderPayloadForPrincipal(context.Background(), principal,
+		map[string]any{
+			"type":         cardmsg.InteractiveCard.Int(),
+			"template_ref": map[string]any{"id": string(id), "version": dynamicVersion},
+			"state":        "thinking",
+			"data":         map[string]any{"title": "t"},
+		}, cardtmpl.BuildEnv{})
+	if err != nil {
+		t.Fatalf("group dynamic send refused: %v", err)
+	}
+
+	// The ground truth: the Space the render authorized against is the one the
+	// gate decided on, not env.SpaceID and not the sender's own membership.
+	if got := rendering.lastRender.Access.Principal.SpaceID; got != groupSpace {
+		t.Fatalf("render authorized against Space %q, gate used %q", got, groupSpace)
+	}
+	if got := rendering.lastRender.Access.Principal.ID; got != "bot-42" {
+		t.Fatalf("render principal ID = %q, want the authenticated bot", got)
+	}
+	if got := rendering.lastRender.Access.Purpose; got != cardtmpl.CatalogPurposeNewSend {
+		t.Fatalf("render purpose = %v, want new_send", got)
+	}
+	// The marker records that same authorized Space, so the D3 guards
+	// downstream compare against what the send was actually authorized for.
+	provenance, _ := rendered[cardmsg.CatalogProvenanceKey].(map[string]any)
+	if got, _ := provenance["space_id"].(string); got != groupSpace {
+		t.Fatalf("provenance space = %q, want %q", got, groupSpace)
+	}
+}
+
+// The edit half of the same seam: resolveEditRef pins the stored version and
+// authorizes it against the principal's Space, so the render that follows must
+// use that Space too or a per-Space `edit` grant is just as inert as the send
+// one was.
+func TestGroupEditAuthorizesTheRenderWithTheSameSpaceAsTheGate(t *testing.T) {
+	const groupSpace = "space-group"
+	const dynamicVersion = "9.0.0"
+	id := aireasoningprocess.TemplateID
+
+	source := &stubAuthorizationSource{
+		newSend: true,
+		auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+			id: dynamicAuthorization(dynamicVersion, false, cardtmpl.RuntimeGrant{
+				Found: true, Scope: cardtmpl.RuntimeGrantScopeExact,
+				Revision: 4, Discover: true, Send: true, Edit: true,
+			}),
+		},
+		grantSpaceID: groupSpace,
+	}
+	catalog := newMustTestCatalog(t)
+	catalog.authorization = source
+	rendering := &grantEnforcingCatalog{source: source}
+	catalog.catalog = rendering
+
+	principal := botCatalogPrincipal{BotID: "bot-42", SpaceID: groupSpace, Space: botSpaceScoped}
+	if _, err := catalog.RenderEditPayloadForPrincipal(context.Background(), principal,
+		map[string]any{
+			"type":         cardmsg.InteractiveCard.Int(),
+			"template_ref": map[string]any{"id": string(id), "version": dynamicVersion},
+			"state":        "thinking",
+			"data":         map[string]any{"title": "t"},
+		}, cardtmpl.BuildEnv{}, groupSpace); err != nil {
+		t.Fatalf("group dynamic edit refused: %v", err)
+	}
+	if got := rendering.lastRender.Access.Principal.SpaceID; got != groupSpace {
+		t.Fatalf("edit render authorized against Space %q, want %q", got, groupSpace)
+	}
+	if got := rendering.lastRender.Access.Purpose; got != cardtmpl.CatalogPurposeHistoricalEdit {
+		t.Fatalf("edit render purpose = %v, want historical_edit", got)
+	}
+}
+
 func newTestBotAPIWithCatalog(
 	t *testing.T,
 	querier botSpaceQuerier,
@@ -559,7 +768,7 @@ func newTestBotAPIWithCatalog(
 // three downstream D3 guards are written as `if SpaceID != ""`, so they became
 // no-ops for exactly the frames that cross Space boundaries.
 func TestProvenanceSpacePrefersTheAuthorizedSpaceOverTheRenderEnv(t *testing.T) {
-	group := botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-group", SpaceResolved: true}
+	group := botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-group", Space: botSpaceScoped}
 	if got := provenanceSpaceID(group, cardtmpl.BuildEnv{}); got != "space-group" {
 		t.Fatalf("group provenance Space = %q, want the authorized Space", got)
 	}
@@ -655,11 +864,11 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 	dm := common.ChannelTypePerson.Uint8()
 	for _, test := range []struct {
-		name       string
-		querier    *fakeSpaceQuerier
-		peer       string
-		wantSpace  string
-		wantResolv bool
+		name      string
+		querier   *fakeSpaceQuerier
+		peer      string
+		wantSpace string
+		wantState botCatalogSpaceState
 	}{
 		{
 			name: "peer in the Bot's Space authorizes the send",
@@ -667,7 +876,7 @@ func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 				multiRows:    map[string][]string{"bot-42": {"space-1"}},
 				memberSpaces: map[string]map[string]bool{"user-in": {"space-1": true}},
 			},
-			peer: "user-in", wantSpace: "space-1", wantResolv: true,
+			peer: "user-in", wantSpace: "space-1", wantState: botSpaceScoped,
 		},
 		{
 			name: "peer outside the Space withholds the dynamic overlay",
@@ -675,7 +884,7 @@ func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 				multiRows:    map[string][]string{"bot-42": {"space-1"}},
 				memberSpaces: map[string]map[string]bool{"user-in": {"space-1": true}},
 			},
-			peer: "user-elsewhere", wantResolv: false,
+			peer: "user-elsewhere", wantState: botSpaceUnavailable,
 		},
 		{
 			name: "a peer membership lookup failure refuses rather than assumes",
@@ -683,7 +892,7 @@ func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 				multiRows:      map[string][]string{"bot-42": {"space-1"}},
 				memberSpaceErr: errors.New("db unavailable"),
 			},
-			peer: "user-in", wantResolv: false,
+			peer: "user-in", wantState: botSpaceUnavailable,
 		},
 		{
 			name: "a self-addressed channel is not a peer",
@@ -691,15 +900,15 @@ func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 				multiRows:    map[string][]string{"bot-42": {"space-1"}},
 				memberSpaces: map[string]map[string]bool{"bot-42": {"space-1": true}},
 			},
-			peer: "bot-42", wantResolv: false,
+			peer: "bot-42", wantState: botSpaceUnavailable,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ba := newTestBotAPIWithCatalog(t, test.querier, &stubAuthorizationSource{newSend: true})
 			got := ba.botSendCatalogPrincipal(newGrantSpaceContext(t, ""), "bot-42", test.peer, dm)
-			if got.SpaceResolved != test.wantResolv || got.SpaceID != test.wantSpace {
-				t.Fatalf("DM principal = %+v, want space=%q resolved=%v",
-					got, test.wantSpace, test.wantResolv)
+			if got.Space != test.wantState || got.SpaceID != test.wantSpace {
+				t.Fatalf("DM principal = %+v, want space=%q state=%v",
+					got, test.wantSpace, test.wantState)
 			}
 		})
 	}
@@ -711,7 +920,7 @@ func TestDMPeerCheckIsSkippedWhenTheCatalogIsDark(t *testing.T) {
 	querier := &fakeSpaceQuerier{multiRows: map[string][]string{"bot-42": {"space-1"}}}
 	ba := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: false})
 	if got := ba.botSendCatalogPrincipal(newGrantSpaceContext(t, ""), "bot-42",
-		"user-in", common.ChannelTypePerson.Uint8()); got.SpaceResolved {
+		"user-in", common.ChannelTypePerson.Uint8()); got.Space == botSpaceScoped {
 		t.Fatalf("dark catalog resolved a DM Space: %+v", got)
 	}
 	if len(querier.calls) != 0 {
@@ -724,7 +933,7 @@ func TestDMPeerCheckIsSkippedWhenTheCatalogIsDark(t *testing.T) {
 // uneditable the first time; this covers the general form rather than the one
 // path that was reported.
 func TestEditSpaceCheckSeparatesUnknownFromEmpty(t *testing.T) {
-	resolved := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-a", SpaceResolved: true}
+	resolved := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-a", Space: botSpaceScoped}
 	unresolved := botCatalogPrincipal{BotID: "bot-1"}
 
 	if got := editProvenanceSpaceCheck(true, resolved); !got.verifiable || got.unavailable ||
@@ -758,7 +967,7 @@ func TestGroupCardStaysEditableAcrossAGateRollback(t *testing.T) {
 	catalog := ba.cardTemplates
 
 	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
-	if !principal.SpaceResolved || principal.SpaceID != "space-group" {
+	if principal.Space != botSpaceScoped || principal.SpaceID != "space-group" {
 		t.Fatalf("send principal = %+v", principal)
 	}
 	sent, err := catalog.RenderPayloadForPrincipal(context.Background(), principal,
@@ -847,7 +1056,7 @@ func TestAdvertisedSendRefsBatchesAndAgreesWithThePerIDPath(t *testing.T) {
 	}
 	perID := &stubAuthorizationSource{newSend: true, auth: authorizations}
 
-	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true}
+	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", Space: botSpaceScoped}
 	batchedCatalog := newMustTestCatalog(t)
 	batchedCatalog.authorization = batched
 	perIDCatalog := newMustTestCatalog(t)
@@ -901,7 +1110,7 @@ func TestAdvertisedSendRefsFailsClosedWhenTheBatchReadFails(t *testing.T) {
 	catalog := newMustTestCatalog(t)
 	catalog.authorization = batched
 	_, err := catalog.advertisedSendRefs(context.Background(),
-		botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true})
+		botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", Space: botSpaceScoped})
 	if !errors.Is(err, errBotTemplateRuntimeUnavailable) {
 		t.Fatalf("err = %v, want errBotTemplateRuntimeUnavailable", err)
 	}
@@ -920,7 +1129,7 @@ func TestDMCardStaysEditableWhenTheStrictResolverCannotAgree(t *testing.T) {
 
 	// Ambiguous membership: the grant principal refuses to resolve.
 	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "peer-1", common.ChannelTypePerson.Uint8())
-	if principal.SpaceResolved {
+	if principal.Space == botSpaceScoped {
 		t.Fatalf("a two-Space Bot resolved a grant Space: %+v", principal)
 	}
 	// The DM send path still injects the forgiving resolver's Space, and the
@@ -1032,13 +1241,13 @@ func TestDecideSendRefRefusesADisabledPointerFromTheBatch(t *testing.T) {
 	disabled := cardtmpl.RuntimeAuthorization{
 		Activation: cardtmpl.RuntimeActivation{Exists: true, Status: cardtmpl.RuntimeActivationDisabled},
 	}
-	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, disabled); ref.ID != "" {
+	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, disabled, botSpaceScoped); ref.ID != "" {
 		t.Fatalf("a disabled pointer fell back to the static version: %+v", ref)
 	}
 	// And it is the *disabled status* doing the work, not the empty version: a
 	// template with no activation row at all still keeps its static version.
 	none := cardtmpl.RuntimeAuthorization{}
-	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, none); ref != staticRef {
+	if ref := catalog.decideSendRef(aireasoningprocess.TemplateID, staticRef, true, none, botSpaceScoped); ref != staticRef {
 		t.Fatalf("an unactivated template lost its static version: %+v", ref)
 	}
 }
@@ -1051,7 +1260,7 @@ func TestDecideSendRefRefusesADisabledPointerFromTheBatch(t *testing.T) {
 // dead end.
 func TestBotEditResolvesADynamicRefThroughTheEditGrant(t *testing.T) {
 	dynamicRef := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: "9.9.9-dyn"}
-	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true}
+	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", Space: botSpaceScoped}
 	authorized := func(grant cardtmpl.RuntimeGrant) *stubAuthorizationSource {
 		return &stubAuthorizationSource{
 			newSend: true,
