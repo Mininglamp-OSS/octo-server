@@ -180,15 +180,16 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 // 场景。DM 消息物理存储在 fakeChannelID(= GetFakeChannelIDWith(两个uid) 对称生成的
 // "uidA@uidB") 频道下、channel_type=Person。
 //
-// 鉴权分四层（与 modules/messages_search/authz.go checkP2PAccess 一致）：
+// 鉴权与 modules/messages_search/authz.go checkP2PAccess 完整对齐（同一决策
+// 分散实现的历史坑参见 checkPersonDMAccess 头注释）：
 //   1. 基本参数：peer_uid 非空 / 非自聊 / 非 @ 分隔符（P1-3：GetFakeChannelIDWith
 //      内部用 "A@B" 拼接，若 peer_uid 自身含 @，多方 uid 组合会产生同一 fake key
 //      的跨会话碰撞，一律 400 拒）；message_id 正整数。
-//   2. P2P 访问：DM 无独立成员表，采用 same-space OR IsFriend 的"或"关系放行；
-//      两侧都不满足 → 404 归并（防枚举，与不可见同码）。（P1-4）
-//   3. 双向拉黑：任一方向 blacklist 存在即 404（本人偏好 + 反骚扰双语义）。
-//      直查绕过 IM kernel 的 blacklist filter，必须自查（P1-4）。
-//   4. Space 隔离 + respondSingleMessage 里的 visibles / 双删 / offset 全套过滤。
+//   2. P2P 访问 (checkPersonDMAccess)：peer-bot 分类 + real-user same-space/friend
+//      + 双向 blacklist——system bot (fileHelper/botfather 等) 和 own bot 都
+//      归 bot 分支，不走 real-user Space 检查（bot 无 space_member 行）。
+//   3. Space 隔离：real-user 消息按 personSpaceAllows 五规则过滤（issue #484）。
+//   4. respondSingleMessage 内的 visibles / 双删 / offset 全套过滤。
 //
 // fakeChannelID 参数顺序：使用 (peerUID, loginUID)，与 sibling 调用(api.go:1439
 // 等 sync 路径 = "req.ChannelID(=peer_uid), req.LoginUID") 严格对齐；避免碰撞对
@@ -269,29 +270,163 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 	m.respondSingleMessage(c, fakeChannelID, common.ChannelTypePerson.Uint8(), "", peerUID, messageID, loginUID)
 }
 
-// checkPersonDMAccess 复刻 modules/messages_search/authz.go checkP2PAccess 的
-// P2P DM 访问门禁：same-space OR IsFriend 放行 + 双向 blacklist 一票否决。
-// 任何不满足条件都 404 归并（与不可见同码，防枚举）。任何 DB 错误 → 500 fail-closed。
-// 返回 false 时已写响应（handler 直接 return）。
+// personDMAccessDecision 是 checkPersonDMAccess 的纯决策核心：接收所有 DB 已
+// 查出的输入，返回 allow / notFound / 具体分支（用于测试断言与日志）。抽出为
+// 纯函数以便 helper 级 table-driven 测试覆盖 8 条决策路径而无需 mock 38 个方法
+// 的 user.IService（PR #708 review round 3 P1-A/coverage 要求）。
 //
-// 与 checkP2PAccess 的差异：那边支持 as-bot principal 分支；此处 getPersonMessage
-// 的调用者都是真人 token（AuthMiddleware 之后），走真人分支即可。同意 same-space
-// 的空 spaceID 分支（未 opt-in / 兼容路径）：这时不做 same-space 判断，直接落到
-// IsFriend 兜底——与 authz 现有 real-user 分支同口径。
+// 决策次序（与 authz.go:99-207 checkP2PAccess 一致，多一层 SystemBot 短路，
+// 详见 checkPersonDMAccess 头注释里"Step 1a"的说明）：
+//
+//	self==peer                     → allow (notes-to-self)
+//	SystemBot(peer)                → check blacklist → allow/notFound
+//	own bot(peer)                  → allow (skip blacklist)
+//	other user's bot(peer)         → require friend, then check blacklist
+//	real user(peer)                → require same-space OR friend, then check blacklist
+//
+// 每一层 fail 都 fold 成 notFound（防枚举，与 authz.go 一致）。
+type personDMAccessInputs struct {
+	loginUID, peerUID string
+	isSystemBot       bool
+	isRobot           bool
+	creatorUID        string
+	spaceID           string // "" 表示未 opt-in，跳过 same-space
+	sameSpace         bool
+	isFriend          bool
+	blockedByMe       bool
+	blockedByPeer     bool
+}
+
+type personDMAccessResult int
+
+const (
+	personDMAllowNotesToSelf personDMAccessResult = iota
+	personDMAllowSystemBot
+	personDMAllowOwnBot
+	personDMAllowOtherBotFriend
+	personDMAllowRealUserSameSpace
+	personDMAllowRealUserFriend
+	personDMDenyOtherBotNotFriend
+	personDMDenyRealUserNoRelation
+	personDMDenyBlacklist
+)
+
+func personDMAccessDecision(in personDMAccessInputs) personDMAccessResult {
+	// Step 0: notes-to-self
+	if in.peerUID == in.loginUID {
+		return personDMAllowNotesToSelf
+	}
+
+	var allowed personDMAccessResult
+	switch {
+	case in.isSystemBot:
+		// SystemBot 短路，落到 Step 3 blacklist（仍然要执行拉黑检查）
+		allowed = personDMAllowSystemBot
+	case in.isRobot && in.creatorUID == in.loginUID:
+		// Own bot：直接放行，skip blacklist（与 authz.go:110-115 一致）
+		return personDMAllowOwnBot
+	case in.isRobot:
+		// Other user's bot：必须是好友；否则 404
+		if !in.isFriend {
+			return personDMDenyOtherBotNotFriend
+		}
+		allowed = personDMAllowOtherBotFriend
+	default:
+		// Real user：same-space OR friend
+		if in.spaceID != "" && in.sameSpace {
+			allowed = personDMAllowRealUserSameSpace
+		} else if in.isFriend {
+			allowed = personDMAllowRealUserFriend
+		} else {
+			return personDMDenyRealUserNoRelation
+		}
+	}
+
+	// Step 3: 双向 blacklist（own bot 已经在上面 return 跳过）
+	if in.blockedByMe || in.blockedByPeer {
+		return personDMDenyBlacklist
+	}
+	return allowed
+}
+
+func personDMAccessAllowed(r personDMAccessResult) bool {
+	switch r {
+	case personDMAllowNotesToSelf, personDMAllowSystemBot, personDMAllowOwnBot,
+		personDMAllowOtherBotFriend, personDMAllowRealUserSameSpace, personDMAllowRealUserFriend:
+		return true
+	}
+	return false
+}
+
+// checkPersonDMAccess 完整复刻 modules/messages_search/authz.go checkP2PAccess
+// 的 real-user DM 访问门禁：peer-bot 分类 + same-space OR IsFriend + 双向
+// blacklist。任何不满足条件都 404 归并（与不可见同码，防枚举）。DB 错误
+// → 500 fail-closed。返回 false 时已写响应（handler 直接 return）。
+//
+// **必须与 checkP2PAccess 保持每一步一致**：DM 直读绕过 IM kernel 的
+// blacklist filter，同一套访问决策要求分散实现是历史上 issue #484 / YUJ-219-A
+// 一类问题的温床；本 helper 是第二份手写实现，任何时候都对齐它的口径。若
+// 未来抽出跨模块公共 helper，两处一起替换。
+//
+// 已核实分支覆盖（决策核心在 personDMAccessDecision，被 personDMAccessDecision_test
+// 覆盖 8 条路径）：
+//   0. peer_uid == self（notes-to-self）：直接放行
+//   1a. SystemBot 短路（fileHelper 等）：落到 Step 3 blacklist
+//   1b. Step 1 peer-bot 分类（**必须先于 Space**）：own bot 放行；other bot
+//       走 IsFriend + 落到 Step 3 的 blacklist
+//   2. Step 2 real-user：same-space OR IsFriend
+//   3. Step 3 双向 blacklist 一票否决（own-bot 分支已跳过）
 func (m *Message) checkPersonDMAccess(c *wkhttp.Context, loginUID, peerUID string) bool {
-	// same-space OR friend 二选一放行
-	allowed := false
-	if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
-		sameSpace, serr := m.userService.AreSpaceMembers(spaceID, loginUID, peerUID)
-		if serr != nil {
-			m.Error("DM 直读 same-space 查询失败", zap.Error(serr),
-				zap.String("uid", loginUID), zap.String("peer", peerUID), zap.String("space_id", spaceID))
+	// 收集所有决策输入（DB 查询 + context 读取），然后交给纯决策函数。
+	in := personDMAccessInputs{
+		loginUID:    loginUID,
+		peerUID:     peerUID,
+		isSystemBot: spacepkg.IsSystemBot(peerUID),
+	}
+	if in.peerUID == in.loginUID {
+		return true // 上游已拒；defense-in-depth
+	}
+
+	// 只在非 SystemBot 时才需要 QueryPeerRobotInfo（Step 1a 短路避免误 404）。
+	if !in.isSystemBot {
+		isRobot, creatorUID, err := m.userService.QueryPeerRobotInfo(peerUID)
+		if err != nil {
+			m.Error("DM 直读 QueryPeerRobotInfo 查询失败", zap.Error(err),
+				zap.String("uid", loginUID), zap.String("peer", peerUID))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return false
 		}
-		allowed = sameSpace
+		in.isRobot = isRobot
+		in.creatorUID = creatorUID
 	}
-	if !allowed {
+
+	// Own bot 快通道：拿到 (isRobot=true, creatorUID==loginUID) 就直接放行，
+	// 避免为 own bot 白发一次 friend / same-space / blacklist 查询。
+	if in.isRobot && in.creatorUID == loginUID {
+		return true
+	}
+
+	// Real-user 分支才需要 same-space / friend 查询；bot 分支只需要 friend。
+	// 提前判断避免不必要的 DB 请求。
+	if !in.isSystemBot && !in.isRobot {
+		in.spaceID = spacepkg.GetSpaceID(c)
+		if in.spaceID != "" {
+			sameSpace, serr := m.userService.AreSpaceMembers(in.spaceID, loginUID, peerUID)
+			if serr != nil {
+				m.Error("DM 直读 same-space 查询失败", zap.Error(serr),
+					zap.String("uid", loginUID), zap.String("peer", peerUID), zap.String("space_id", in.spaceID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return false
+			}
+			in.sameSpace = sameSpace
+		}
+	}
+
+	// Friend 查询：real-user (若 !sameSpace 才需要) + other-user bot 需要。
+	// SystemBot 与 own bot 都不需要。
+	needFriend := (in.isRobot && !in.isSystemBot) ||
+		(!in.isSystemBot && !in.isRobot && !in.sameSpace)
+	if needFriend {
 		isFriend, ferr := m.userService.IsFriend(loginUID, peerUID)
 		if ferr != nil {
 			m.Error("DM 直读 IsFriend 查询失败", zap.Error(ferr),
@@ -299,14 +434,11 @@ func (m *Message) checkPersonDMAccess(c *wkhttp.Context, loginUID, peerUID strin
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return false
 		}
-		allowed = isFriend
-	}
-	if !allowed {
-		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
-		return false
+		in.isFriend = isFriend
 	}
 
-	// 双向 blacklist 一票否决。批量版一次查两向，性能好。
+	// Blacklist 查询：SystemBot / other bot / real-user 都需要（own bot 已在
+	// 上面 return true 跳过）。批量版一次查两向。
 	blockedByMe, blockedByPeer, err := m.userService.ExistBlacklistsBoth(loginUID, []string{peerUID})
 	if err != nil {
 		m.Error("DM 直读 blacklist 查询失败", zap.Error(err),
@@ -314,7 +446,11 @@ func (m *Message) checkPersonDMAccess(c *wkhttp.Context, loginUID, peerUID strin
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
-	if blockedByMe[peerUID] || blockedByPeer[peerUID] {
+	in.blockedByMe = blockedByMe[peerUID]
+	in.blockedByPeer = blockedByPeer[peerUID]
+
+	result := personDMAccessDecision(in)
+	if !personDMAccessAllowed(result) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return false
 	}

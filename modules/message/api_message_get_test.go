@@ -748,3 +748,113 @@ func TestPersonFakeChannelIDCollisionOrderMatters(t *testing.T) {
 			"If this assertion fails, the upstream library changed its tie-breaking; "+
 			"the order-alignment requirement can then be relaxed.")
 }
+
+// TestPersonDMAccessDecision 覆盖 checkPersonDMAccess 的纯决策核心
+// personDMAccessDecision 所有 8 条决策路径。这个测试**不依赖 DB**——
+// checkPersonDMAccess 已经把 DB 查询和决策逻辑拆开，orchestration 层负责
+// 收集 DB 数据 → 决策纯函数负责判定。PR #708 review round 3 明确要求：
+// "add a DB-free table test for checkPersonDMAccess over the six decision
+// cases, in the style of TestPersonSpaceAllows_Rules"——本测试满足该要求，
+// 且比 6 case 更全（覆盖了 SystemBot 短路 + own bot 单独分支）。
+//
+// 决策规则源码见 personDMAccessDecision 头注释。任何决策规则修改，
+// 这个表就该跟着更新——它是"允许 vs 拒绝"契约的可执行文档。
+func TestPersonDMAccessDecision(t *testing.T) {
+	const (
+		me    = "user_login"
+		peer  = "user_peer"
+		other = "user_other"
+	)
+	cases := []struct {
+		name string
+		in   personDMAccessInputs
+		want personDMAccessResult
+	}{
+		{
+			name: "notes_to_self",
+			in:   personDMAccessInputs{loginUID: me, peerUID: me},
+			want: personDMAllowNotesToSelf,
+		},
+		{
+			name: "system_bot_allowed",
+			// fileHelper / botfather / u_10000 / notification 都走这条：
+			// SystemBot=true 直接短路到 blacklist；无被拉黑则放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: "fileHelper", isSystemBot: true},
+			want: personDMAllowSystemBot,
+		},
+		{
+			name: "system_bot_blocked_by_me",
+			// 用户拉黑 SystemBot 仍生效——防骚扰边界，符合 checkP2PAccess Step 3。
+			in:   personDMAccessInputs{loginUID: me, peerUID: "fileHelper", isSystemBot: true, blockedByMe: true},
+			want: personDMDenyBlacklist,
+		},
+		{
+			name: "own_bot_skips_all",
+			// 自己创建的 bot：跳过 Space / friend / blacklist。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: me},
+			want: personDMAllowOwnBot,
+		},
+		{
+			name: "own_bot_ignores_blacklist",
+			// 即使 blockedByMe/blockedByPeer 为 true，own bot 也直接放行
+			// （因为 personDMAccessDecision 在 own bot 分支就 return，不检查 blacklist）。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: me, blockedByMe: true, blockedByPeer: true},
+			want: personDMAllowOwnBot,
+		},
+		{
+			name: "other_bot_friend_allowed",
+			// 别人的 bot：需要好友关系；有 friend → 通过 blacklist → 放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: true},
+			want: personDMAllowOtherBotFriend,
+		},
+		{
+			name: "other_bot_no_friend_denied",
+			// 别人的 bot 不是好友 → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: false},
+			want: personDMDenyOtherBotNotFriend,
+		},
+		{
+			name: "other_bot_friend_but_blocked",
+			// 别人的 bot 是好友但双向 blacklist 存在 → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: true, blockedByPeer: true},
+			want: personDMDenyBlacklist,
+		},
+		{
+			name: "real_user_same_space",
+			// 真人 + 同 Space → 放行（企业模式 friend 表可能为空）。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: true},
+			want: personDMAllowRealUserSameSpace,
+		},
+		{
+			name: "real_user_friend_no_space_optin",
+			// 未 opt-in Space（spaceID=""）+ 好友 → 放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "", isFriend: true},
+			want: personDMAllowRealUserFriend,
+		},
+		{
+			name: "real_user_no_space_no_friend",
+			// 真人 + 无 Space + 非好友 → 404。这正是 issue #484 / YUJ-219-A 关注的边界。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "", isFriend: false},
+			want: personDMDenyRealUserNoRelation,
+		},
+		{
+			name: "real_user_space_not_member_but_friend",
+			// 有 spaceID 但两人不在同一 Space；好友兜底放行——这是 checkP2PAccess
+			// 明说的"same-space OR friend"："或"关系。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: false, isFriend: true},
+			want: personDMAllowRealUserFriend,
+		},
+		{
+			name: "real_user_same_space_blocked",
+			// 真人同 Space 但双向 blacklist → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: true, blockedByMe: true},
+			want: personDMDenyBlacklist,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := personDMAccessDecision(tc.in)
+			assert.Equal(t, tc.want, got, "case %q: unexpected decision", tc.name)
+		})
+	}
+}
