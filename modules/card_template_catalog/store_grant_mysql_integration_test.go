@@ -48,6 +48,69 @@ func countGrantAuditRows(t *testing.T, db *sql.DB, operation string) int {
 	return count
 }
 
+// PR-C review round 5 (Jerry-Xin, plus the S4 identity item): the grant table's
+// CHECK constraints are the last line that holds when a write does not come
+// through the Go validator, so every domain the validator enforces has to be
+// stated in the schema too.
+//
+// The two gaps this covers were both reachable by direct SQL against the
+// previous schema. can_send/can_edit outside {0,1} on an active row was caught
+// only downstream, where GrantPermissions scans into Go bools and the driver
+// refuses the value — fail-closed by accident of the scan type rather than by
+// the schema. A blank principal_id was accepted outright.
+func TestGrantSchemaRejectsWritesTheValidatorWouldRefuseRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	seedGrantTargetClaim(t, db)
+
+	insert := `INSERT INTO card_template_grant
+        (template_id, principal_type, principal_id, scope_space_id, status,
+         can_discover, can_send, can_edit, revision, updated_by, reason, change_ticket)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'operator', 'reason', 'ticket')`
+	tmpl := string(grantIntegrationTemplateID)
+
+	for _, test := range []struct {
+		name string
+		args []any
+	}{
+		{
+			name: "can_send outside the boolean domain",
+			args: []any{tmpl, "bot", "bot-send", "", "active", 1, 7, 0},
+		},
+		{
+			name: "can_edit outside the boolean domain",
+			args: []any{tmpl, "bot", "bot-edit", "", "active", 1, 0, 2},
+		},
+		{
+			// Redundant with chk_card_template_grant_shape, which already pins
+			// can_discover to 1 on an active row and 0 on a tombstone — so this
+			// cell passes with or without the new constraint. It is here because
+			// the column belongs in the stated domain regardless of which
+			// constraint currently enforces it.
+			name: "can_discover outside the boolean domain",
+			args: []any{tmpl, "bot", "bot-discover", "", "active", 3, 0, 0},
+		},
+		{
+			name: "a grant with no principal",
+			args: []any{tmpl, "bot", "", "", "active", 1, 1, 0},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// A distinct principal per case, so that a schema which wrongly
+			// accepts one row cannot make a later case fail on a duplicate key
+			// instead of on its own claim.
+			if _, err := db.Exec(insert, test.args...); err == nil {
+				t.Fatal("the schema accepted a row the validator would refuse")
+			}
+		})
+	}
+
+	// The canonical shape it must still accept, so the constraints are not
+	// merely rejecting everything.
+	if _, err := db.Exec(insert, tmpl, "bot", "bot-valid", "", "active", 1, 1, 1); err != nil {
+		t.Fatalf("a valid grant was rejected: %v", err)
+	}
+}
+
 func TestStoreGrantLifecycleRealMySQL(t *testing.T) {
 	db := newCatalogStoreIntegrationDB(t)
 	seedGrantTargetClaim(t, db)

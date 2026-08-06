@@ -445,6 +445,18 @@ finds them directly.
   `TestValidateGrantPermissionsMatrix`, `TestValidateGrantIdentityCanonicalShapes`,
   and the `chk_card_template_grant_space` CHECK constraint, so the shape cannot
   be written even by a future caller that forgets the validator.
+- [x] every domain the Go validator enforces is also stated in the schema, so a
+  write that skips the validator cannot land a row the validator would refuse —
+  `TestGrantSchemaRejectsWritesTheValidatorWouldRefuseRealMySQL` (real rows, each
+  case rejected by the database itself). Two gaps were open: `can_send`/`can_edit`
+  outside `{0,1}` on an active row, and a blank `principal_id`. The first was
+  fail-closed only by accident of the read — `GrantPermissions` scans into Go
+  bools and the driver refuses the value, so the authorization load errored — and
+  a future reader that scanned into an int and tested `!= 0` would have turned the
+  same row into a grant. `chk_card_template_grant_bools` and
+  `chk_card_template_grant_identity` state it where the value is written.
+  (`can_discover` was already pinned by `chk_card_template_grant_shape` on both
+  statuses; it is named in the new constraint for completeness, not coverage.)
 - [x] exact Space grant overrides global; exact tombstone blocks global without
   permission union — `TestResolveGrantRowsPrecedence` (reducer),
   `TestStoreLoadAuthorizationExactTombstoneShadowsGlobalRealMySQL` (real rows and

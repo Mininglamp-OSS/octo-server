@@ -40,7 +40,26 @@ CREATE TABLE card_template_grant (
     -- D2: a space principal is discover-only and its only canonical shape is
     -- principal_id=<space_id> with the global sentinel scope.
     CONSTRAINT chk_card_template_grant_space
-        CHECK (principal_type <> 'space' OR (can_send = 0 AND can_edit = 0 AND scope_space_id = ''))
+        CHECK (principal_type <> 'space' OR (can_send = 0 AND can_edit = 0 AND scope_space_id = '')),
+    -- The permission columns are booleans, and TINYINT(1) is not. The shape and
+    -- space constraints above already pin can_discover on both statuses, and
+    -- send/edit on a tombstone or a space principal — but an active bot or
+    -- producer row could hold any TINYINT in can_send/can_edit. Today that is
+    -- caught downstream, because GrantPermissions scans into Go bools and the
+    -- driver refuses a value outside {0,1}, so the authorization read errors and
+    -- the caller denies. That is fail-closed by accident of the scan type, not
+    -- by the schema: a future reader that scanned into an int and tested != 0
+    -- would turn the same row into a grant. State the domain where the value is
+    -- written instead of relying on how it is later read.
+    CONSTRAINT chk_card_template_grant_bools
+        CHECK (can_discover IN (0, 1) AND can_send IN (0, 1) AND can_edit IN (0, 1)),
+    -- An unnamed principal is not a principal. The Go canonical-shape validator
+    -- rejects a blank identity before any write, and grantPrincipal refuses to
+    -- map one on the read side, so a blank row can only arrive by direct SQL —
+    -- where it would sit in the table looking like a grant that no lookup can
+    -- ever match.
+    CONSTRAINT chk_card_template_grant_identity
+        CHECK (principal_id <> '')
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Grant/revoke audit rides the existing append-only card_template_audit in
