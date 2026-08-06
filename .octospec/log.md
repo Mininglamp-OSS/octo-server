@@ -4,6 +4,28 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-05 (bot-api-per-bot-ratelimit)
+
+- **Task** — `bot-api-per-bot-ratelimit` (#696): moved bot rate limiting off the
+  client-IP axis onto bot identity, and gave the two self-heal channels
+  (`heartbeat`, `register`) quotas of their own. The reported cause was wrong in
+  a way that changed the fix — the shared axis was IP, not "business vs
+  heartbeat", so a bot was starved by a co-located neighbour rather than by
+  itself. A follow-on incident showed protecting heartbeat alone is not enough:
+  the reconnect path (`register`) was rate limited too, so the bot could notice
+  it was down but never get back up. New `pkg/ratelimit` keeps quotas
+  hot-tunable (lib's middlewares fix them at construction, which is what made
+  the incident's own mitigation cost a 93-second oscillating rollout) and adds
+  shadow mode so a candidate quota can be evaluated without touching clients.
+  Every **per-bot** layer ships `enabled=false` + `dry_run=true`, so merging
+  changes no limiting behaviour. The two pre-auth per-IP floors are the exception
+  and are live on deploy — deliberately unswitchable, since a toggleable outer
+  layer would leave the excluded heartbeat endpoint unprotected while the inner
+  layer is off. Both were first sized at 2x the measured peak and revised upward
+  before opening the PR: that is how you size a *quota*, whereas a floor only has
+  to turn unbounded into bounded and needs an order of magnitude of headroom. See
+  [journal](journal/shared/bot-api-per-bot-ratelimit.md).
+
 ## 2026-07-31 (bot-events-longpoll)
 
 - **Feature** — Task `bot-events-longpoll` (card-message-interaction D5 / P3-2):

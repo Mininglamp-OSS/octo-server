@@ -136,7 +136,25 @@ func Formatter(param gin.LogFormatterParams) string {
 	if traceID != "" {
 		traceSuffix = " | trace_id=" + traceID
 	}
-	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s |%s %-7s %s %#v%s\n%s",
+	// bot 归因(issue #696)。2026-08-05 的限流事故里,access log 能看出"某个出网 IP
+	// 在冲刷 /v1/bot/typing",但看不出**是哪个 bot**——最后只能靠 Redis 里残留的
+	// typing_start:* key 去猜,无法确证。这一段补上那最后一跳。
+	//
+	// 只有经过 bot 鉴权中间件的请求才带此字段(modules/bot_api.authBot 写入
+	// CtxKeyRobotID),所以:
+	//   - 普通用户路由的日志行**逐字节不变**——它们没有这个 key;
+	//   - /v1/bot/register 拿不到(它跑在 authBot 之前,token 无效时压根没有 bot 身份),
+	//     那类失败仍只能按 IP 归因,这是已知限制而非遗漏。
+	//
+	// 与 offenders ZSet 的分工:ZSet 只记**被限流拒绝**的 bot;这里覆盖它看不到的
+	// 部分——未触发限流但异常的请求(参数错误的 4xx、慢请求),以及限流整层关闭时。
+	//
+	// 记 robotID 而非 token:robotID 是公开标识,token 是凭据,永不入日志(#246 教训)。
+	botSuffix := ""
+	if botID, _ := param.Keys[ctxKeyRobotID].(string); botID != "" {
+		botSuffix = " | bot=" + botID
+	}
+	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s |%s %-7s %s %#v%s%s\n%s",
 		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 		statusColor, param.StatusCode, resetColor,
 		param.Latency,
@@ -144,6 +162,15 @@ func Formatter(param gin.LogFormatterParams) string {
 		methodColor, param.Method, resetColor,
 		ScrubPath(param.Path),
 		traceSuffix,
+		botSuffix,
 		param.ErrorMessage,
 	)
 }
+
+// ctxKeyRobotID 必须与 modules/bot_api.CtxKeyRobotID 保持一致。
+//
+// 刻意用字面量而不 import 那个常量:pkg/ 不应依赖 modules/。
+// 两边一致性由 TestCtxKeyRobotIDMatchesBotAPI 源码守卫钉住——否则哪天有人改了
+// bot_api 侧的常量,这里会安静地永远取不到值,而"日志里没有 bot 字段"和
+// "这个请求不是 bot 发的"在线上看起来一模一样。
+const ctxKeyRobotID = "robot_id"
