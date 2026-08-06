@@ -466,14 +466,16 @@ func TestResolveBotGrantSpaceIDRefusesEveryAmbiguity(t *testing.T) {
 			wantState: botSpaceUnavailable,
 		},
 		{
-			// Not a refusal: the query ran and answered "none". A Bot attached
-			// to no Space has no exact grants that could shadow a global one, so
-			// global scope is the honest reading — and treating it as an outage
-			// would make every such Bot permanently unable to send a dynamic
-			// template even with a global grant.
-			name:      "no membership is a determination, not an outage",
+			// The previous round read this sentinel as "this Bot belongs to no
+			// Space" and answered GlobalOnly. It cannot mean that: platform App
+			// Bots are authorized for every active Space and never get a
+			// space_member row, so for them "no membership" and "no Space" are
+			// different facts, and answering the second let an X-Space-ID header
+			// choose between a scope that sees an exact revoke tombstone and one
+			// that does not.
+			name:      "no membership is something this resolver could not establish",
 			querier:   &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound},
-			wantState: botSpaceGlobalOnly,
+			wantState: botSpaceUnavailable,
 		},
 		{
 			name:      "a DB error refuses rather than falling back",
@@ -857,6 +859,99 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 	}
 }
 
+// PR-C review round 5 — yujiawei P1-2.
+//
+// requireEffectiveCardTemplate accepts the envelope's own top-level space_id as
+// a witness for the stored marker. That value is server-authored and pinned by
+// Snapshot, so it is a trustworthy record of what the send wrote — but it is the
+// frame speaking about itself. Matching it proves the frame is internally
+// consistent; it proves nothing about which Space the grant behind *this* edit
+// was read in, and resolveEditRef reads that grant from principal.SpaceID, which
+// for a DM comes from the current request's X-Space-ID header.
+//
+// So while the envelope could substitute for the real comparison, a Bot in
+// Spaces A and B could send a card under A's grant, lose A's edit permission,
+// then rewrite that same card by presenting X-Space-ID: space-B — case 1 failed
+// correctly, and the frame's own "space-A" waved it through. The witness now
+// applies only where no Space was established at all, which is the multi-Space
+// DM lockout it was added for.
+func TestEditRefusesAFrameFromAnotherSpaceEvenWhenTheEnvelopeCorroboratesIt(t *testing.T) {
+	catalog := newMustTestCatalog(t)
+	catalog.authorization = &stubAuthorizationSource{newSend: false}
+
+	principal := botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-a", Space: botSpaceScoped}
+	sent, err := catalog.RenderPayloadForPrincipal(context.Background(), principal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any),
+		cardtmpl.BuildEnv{SpaceID: "space-a"})
+	if err != nil {
+		t.Fatalf("DM send: %v", err)
+	}
+	// What the DM send path stamps on the envelope after rendering.
+	sent["space_id"] = "space-a"
+	envelope, err := json.Marshal(sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+
+	// The grant behind this edit was read in space-b. The frame's own claim of
+	// space-a must not stand in for the comparison that just failed.
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42",
+		verifiableEditSpace("space-b")); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("cross-Space edit error = %v, want errBotTemplateRequestInvalid", err)
+	}
+	// Authorized in the frame's own Space: accepted, as before.
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42",
+		verifiableEditSpace("space-a")); err != nil {
+		t.Fatalf("same-Space edit refused: %v", err)
+	}
+	// And the case the witness exists for is preserved: a multi-Space Bot with
+	// no header establishes no Space, so the envelope is all there is.
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42",
+		editSpaceCheck{unavailable: true}); err != nil {
+		t.Fatalf("multi-Space DM edit lost its envelope witness: %v", err)
+	}
+}
+
+// PR-C review round 5 — yujiawei P2-5, and the group half of Octo-Q's C4.
+//
+// space.status = 1 is load-bearing in every other Space resolver in
+// modules/bot_api/db.go — querySpaceIDsByRobotID, both branches of
+// isBotSpaceAuthorized, and isUserSpaceMember all require it. queryGroupSpaceID
+// did not, so a grant scoped to a Space an operator had disabled still
+// authorized sends into that Space's groups, while the same bot's membership,
+// an X-Space-ID naming it, and a DM peer inside it were all refused.
+//
+// A disabled Space is not "no Space" either: answering botSpaceGlobalOnly would
+// let a global grant deliver where the scoped one had just been switched off.
+func TestAGroupInADisabledSpaceHasNoReadableGrantScope(t *testing.T) {
+	querier := &fakeSpaceQuerier{
+		multiRows: map[string][]string{"bot-42": {"space-bot"}},
+		groupSpaces: map[string]string{
+			"group-live":      "space-live",
+			"group-disabled":  "space-disabled",
+			"group-spaceless": "",
+		},
+		inactiveSpaces: map[string]bool{"space-disabled": true},
+	}
+	ba := newTestBotAPIWithCatalog(t, querier, &stubAuthorizationSource{newSend: true})
+	ctx := newGrantSpaceContext(t, "")
+	group := common.ChannelTypeGroup.Uint8()
+
+	if got := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-live", group); got.Space != botSpaceScoped ||
+		got.SpaceID != "space-live" {
+		t.Fatalf("active group principal = %+v, want scoped to space-live", got)
+	}
+	if got := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-disabled", group); got.Space != botSpaceUnavailable ||
+		got.SpaceID != "" {
+		t.Fatalf("disabled-Space group principal = %+v, want unavailable with no Space", got)
+	}
+	// The determination this must stay distinct from.
+	if got := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-spaceless", group); got.Space != botSpaceGlobalOnly {
+		t.Fatalf("Space-less group principal = %+v, want global-only", got)
+	}
+}
+
 // D6 requires *both* DM principals to be valid members of the Space a dynamic
 // send is authorized against. Checking only the Bot would let its own Space's
 // grant deliver a card to somebody outside that Space — a cross-tenant delivery
@@ -901,6 +996,26 @@ func TestDMSendRequiresThePeerToBeInTheAuthorizedSpace(t *testing.T) {
 				memberSpaces: map[string]map[string]bool{"bot-42": {"space-1": true}},
 			},
 			peer: "bot-42", wantState: botSpaceUnavailable,
+		},
+		{
+			// The cell no case in this table could previously construct: every
+			// other one seeds a membership, so the resolver never returned
+			// dbr.ErrNotFound and the DM × "no membership" combination went
+			// unexercised.
+			//
+			// It is the platform App Bot population — visible in every active
+			// Space, never given a space_member row (db.go isBotSpaceAuthorized
+			// branch 2). Reading that absence as "this Bot has no Space" made the
+			// principal global-scoped, which skips requireDMPeerInSpace entirely
+			// and reads the grant with scope_space_id IN ('',''), where an exact
+			// revoke tombstone for the peer's Space is not even visible. Sending
+			// X-Space-ID would have been refused by that tombstone, so omitting
+			// one header selected the more permissive of two answers.
+			name: "a Bot with no membership never becomes global-scoped on a DM",
+			querier: &fakeSpaceQuerier{
+				memberSpaces: map[string]map[string]bool{"user-in": {"space-1": true}},
+			},
+			peer: "user-in", wantState: botSpaceUnavailable,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

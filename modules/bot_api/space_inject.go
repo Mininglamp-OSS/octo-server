@@ -72,7 +72,7 @@ type botSpaceQuerier interface {
 	querySpaceIDByRobotID(robotID string) (string, error)
 	querySpaceIDsByRobotID(robotID string) (string, []string, error)
 	isBotSpaceAuthorized(robotID, spaceID string) (bool, error)
-	queryGroupSpaceID(groupNo string) (string, error)
+	queryGroupSpaceID(groupNo string) (spaceID string, spaceActive bool, err error)
 	isUserSpaceMember(uid, spaceID string) (bool, error)
 }
 

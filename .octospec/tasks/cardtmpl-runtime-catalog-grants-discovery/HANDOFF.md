@@ -560,6 +560,37 @@ the result:
 
 Neither authorizes production activation; the gates stay false either way.
 
+### 3. Make the DM grant scope target-authoritative — blocks the new-send gate
+
+Not a merge item, and deliberately so: it changes no behaviour while
+`OCTO_CARD_RUNTIME_CATALOG_NEW_SEND_ENABLED` is false. It is a hard prerequisite
+for flipping that gate, and nothing else in this document is allowed to be read
+as discharging it.
+
+For a group or thread the grant scope is **target-authoritative**: it is read
+from the group row, so the caller cannot steer it. For a DM there is no target
+row, so the scope is derived from the *sender's* request context — where
+`X-Space-ID` steers it. Three separate defects have now come out of that
+asymmetry (review rounds 3, 4 and 5), each one a case where the Space that
+authorized a decision and the Space that some later layer derived were not the
+same value. The last of them was introduced by the commit whose stated purpose
+was to remove that class.
+
+The point fixes in `f80d30fb` and its successor close every instance found so
+far and are individually regression-tested. They do not remove the asymmetry.
+Before the gate is flipped, resolve the **peer's** Space and scope the DM grant
+to it, the way `botCatalogPrincipalForGroup` already does for a group, instead
+of deriving the scope from the sender's membership and then verifying the peer
+against it. Authorize a historical edit against the Space the *frame* records
+rather than the one the request presents, for the same reason: the frame is the
+authoritative record of what its send was authorized for, and an edit is already
+pinned to the stored version.
+
+Until that lands, treat every new consumer of `botCatalogSpaceState` as
+requiring the same audit — the three-state split is correct but it is a
+description of what a single resolver could establish, not a guarantee that two
+layers consulted the same one.
+
 ## Review and commit boundaries
 
 Keep all slices in one PR-C branch, but make each slice independently

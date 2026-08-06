@@ -62,6 +62,10 @@ type fakeSpaceQuerier struct {
 	// default rather than something a test has to opt into.
 	groupSpaces   map[string]string
 	groupSpaceErr error
+	// inactiveSpaces marks a Space as space.status != 1 for the group resolver,
+	// which is the only way to reach the "the group names a Space that is no
+	// longer active" branch.
+	inactiveSpaces map[string]bool
 	// memberSpaces answers the DM peer membership check, keyed uid -> spaceID.
 	memberSpaces   map[string]map[string]bool
 	memberSpaceErr error
@@ -77,15 +81,23 @@ func (f *fakeSpaceQuerier) isUserSpaceMember(uid, spaceID string) (bool, error) 
 	return f.memberSpaces[uid][spaceID], nil
 }
 
-func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, error) {
+// queryGroupSpaceID mirrors the production LEFT JOIN: a group whose Space is
+// listed in inactiveSpaces resolves its space_id but reports the Space inactive,
+// which is a different answer from "this group has no Space" (empty space_id)
+// and from "no such group" (dbr.ErrNotFound).
+func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, bool, error) {
 	f.calls = append(f.calls, "queryGroupSpaceID:"+groupNo)
 	if f.groupSpaceErr != nil {
-		return "", f.groupSpaceErr
+		return "", false, f.groupSpaceErr
 	}
-	if spaceID, ok := f.groupSpaces[groupNo]; ok {
-		return spaceID, nil
+	spaceID, ok := f.groupSpaces[groupNo]
+	if !ok {
+		return "", false, dbr.ErrNotFound
 	}
-	return "", dbr.ErrNotFound
+	if spaceID == "" {
+		return "", false, nil
+	}
+	return spaceID, !f.inactiveSpaces[spaceID], nil
 }
 
 type appBotShape struct {

@@ -478,6 +478,11 @@ func (s *botCatalogSpy) Render(ctx context.Context, request cardtmpl.CatalogRend
 // verifiableEditSpace is the "we know the Space, and it is this" state, which
 // is what every edit-guard test that predates the three-state check meant by
 // passing a bare string.
+//
+// Note that verifiableEditSpace("") is a real state and not a don't-care: it
+// asserts the target was established to have no Space, so a frame carrying one
+// is a mismatch. A test that only wants to skip the Space comparison wants the
+// gates-dark check, editSpaceCheck{}.
 func verifiableEditSpace(spaceID string) editSpaceCheck {
 	return editSpaceCheck{spaceID: spaceID, verifiable: true}
 }

@@ -716,16 +716,26 @@ func requireEffectiveCardTemplate(
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
 		if markers.Provenance.SpaceID != "" {
-			// The envelope's own space_id is a second, independent witness: a DM
-			// send writes it, and it is written from the *forgiving* resolver,
-			// which is also what stamped the marker whenever the strict grant
-			// resolver refused. Consulting it first is what keeps a Bot that
-			// spans two Spaces — a permanent property, not a blip — from being
-			// locked out of editing its own DM cards forever.
+			// The envelope's own space_id is a fallback witness: a DM send writes
+			// it from the *forgiving* resolver, which is also what stamped the
+			// marker whenever the strict grant resolver refused. It is what keeps
+			// a Bot that spans two Spaces — a permanent property, not a blip —
+			// from being locked out of editing its own DM cards forever.
+			//
+			// It is a fallback and not an alternative, and the difference is
+			// load-bearing. The envelope is the frame speaking about itself:
+			// matching it proves the frame is internally consistent, never that
+			// the grant behind this edit was read in the frame's Space. While it
+			// could substitute for the real comparison, a Bot in Spaces A and B
+			// could send a card under A's grant, lose A's edit permission, and
+			// then rewrite that card by presenting X-Space-ID: space-B — the
+			// grant was read in B, case 1 failed correctly, and the envelope's
+			// own "space-A" waved it through. So it applies only where there is
+			// no established Space to compare against.
 			envelopeSpace, _ := payload["space_id"].(string)
 			switch {
 			case space.verifiable && markers.Provenance.SpaceID == strings.TrimSpace(space.spaceID):
-			case envelopeSpace != "" && markers.Provenance.SpaceID == envelopeSpace:
+			case !space.verifiable && envelopeSpace != "" && markers.Provenance.SpaceID == envelopeSpace:
 			case space.unavailable && envelopeSpace == "":
 				// Nothing to compare against and something should have been
 				// resolvable. Refuse, but as a retryable outage: the frame may

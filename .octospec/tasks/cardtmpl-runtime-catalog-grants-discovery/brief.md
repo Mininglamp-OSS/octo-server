@@ -535,6 +535,26 @@ finds them directly.
   carries three Space states rather than a bool, because "this target has no
   Space" and "we could not read which Space this target is in" were the same
   `false` and led to opposite correct answers.
+- [x] every producer of that Space state is witnessed too, not just the pure
+  decision that consumes it — `TestDMSendRequiresThePeerToBeInTheAuthorizedSpace`
+  ("a Bot with no membership never becomes global-scoped on a DM"),
+  `TestAGroupInADisabledSpaceHasNoReadableGrantScope`,
+  `TestEditRefusesAFrameFromAnotherSpaceEvenWhenTheEnvelopeCorroboratesIt`. The
+  round that added the row above ticked it on `decideSendRef` alone, and the
+  reviewer's objection was that the witness stood one layer above the defect:
+  the matrix was green while the *resolver* producing the state was wrong. Three
+  producer-side defects were behind that line — membership absence read as "no
+  Space" (which for platform App Bots, who never get a `space_member` row, made
+  an `X-Space-ID` header the difference between seeing an exact revoke tombstone
+  and not seeing it), a group resolver that alone among this file's four Space
+  resolvers ignored `space.status = 1`, and an edit whose Space check could be
+  satisfied by the frame's own `space_id` while its grant was read in the
+  request's Space. Each has a test that fails when its fix is reverted.
+  **Not closed by these**: the DM scope is still derived from the sender's
+  request context rather than from the target, which is the asymmetry all three
+  came out of. It is recorded in `HANDOFF.md` as a hard prerequisite for
+  flipping the new-send gate, not as a merge item — it changes nothing while the
+  gate is false.
 - [x] one authorization decision never combines activation/block/grant values
   from different DB snapshots — `TestStoreLoadAuthorizationReadsPointerArtifactAndGrantInOneTransaction`,
   `TestRuntimeCatalogDynamicNewSendUsesExactlyOneSnapshot`,

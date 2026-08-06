@@ -162,19 +162,27 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 	}
 	primary, all, err := querier.querySpaceIDsByRobotID(robotID)
 	if err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
-			// The query ran and found no membership. That is a determination,
-			// not a failure: this Bot has no Space-scoped grants by definition,
-			// so global scope is the whole truth for it — exactly what the empty
-			// scope sentinel means in the grant table. Both the production
-			// querier and the test fake report "no rows" through this sentinel
-			// rather than as an empty slice, so this is the branch that carries
-			// the case; a Bot attached to no Space is otherwise unable to send a
-			// dynamic template even holding a global grant.
-			return "", botSpaceGlobalOnly
+		// Including dbr.ErrNotFound, which this query returns for "no rows".
+		//
+		// An earlier revision read that sentinel as "this Bot belongs to no
+		// Space" and answered botSpaceGlobalOnly. It is not that determination,
+		// because a whole production population has no space_member row *and is
+		// still authorized for Spaces*: platform App Bots are visible in every
+		// active Space and never get a membership insert (db.go's
+		// isBotSpaceAuthorized, branch 2). For them the sentinel meant "global
+		// scope" while isBotSpaceAuthorized would happily have confirmed any
+		// active Space — so the two answers disagreed, and which one a request
+		// got was decided by whether it sent an X-Space-ID header. Omitting the
+		// header selected the global scope, where an exact revoke tombstone for
+		// the target Space is not even visible to the grant query. A revoke was
+		// bypassable by dropping one header.
+		//
+		// Membership absence therefore cannot be read as a Space determination
+		// here at all. It is one more thing this resolver could not establish.
+		if !errors.Is(err, dbr.ErrNotFound) {
+			ba.Warn("bot_grant_space_lookup_failed",
+				zap.String("robotID", robotID), zap.Error(err))
 		}
-		ba.Warn("bot_grant_space_lookup_failed",
-			zap.String("robotID", robotID), zap.Error(err))
 		return "", botSpaceUnavailable
 	}
 	if len(all) > 1 {
@@ -318,7 +326,7 @@ func (ba *BotAPI) botCatalogPrincipalForGroup(robotID, groupNo string) botCatalo
 	if querier == nil {
 		return botCatalogPrincipal{BotID: robotID}
 	}
-	spaceID, err := querier.queryGroupSpaceID(groupNo)
+	spaceID, spaceActive, err := querier.queryGroupSpaceID(groupNo)
 	if err != nil {
 		// Including dbr.ErrNotFound: a group row we cannot read tells us nothing
 		// about which tenant this send lands in, so the grant scope is
@@ -334,6 +342,19 @@ func (ba *BotAPI) botCatalogPrincipalForGroup(robotID, groupNo string) botCatalo
 		// belongs to no tenant, so only a global grant can authorize a send into
 		// it. It is emphatically not the same as the read failing above.
 		return botCatalogPrincipal{BotID: robotID, Space: botSpaceGlobalOnly}
+	}
+	if !spaceActive {
+		// The group names a Space that is no longer active. Reading that Space's
+		// grants would honour a scope the rest of the system already refuses —
+		// membership, the X-Space-ID header and the DM peer check all require an
+		// active Space. A disabled Space is not "no Space" either: falling
+		// through to global scope would let a global grant deliver where the
+		// scoped one has been switched off.
+		ba.Warn("bot_grant_group_space_inactive",
+			zap.Bool("group_space_inactive", true),
+			zap.String("robotID", robotID), zap.String("groupNo", groupNo),
+			zap.String("spaceID", spaceID))
+		return botCatalogPrincipal{BotID: robotID}
 	}
 	return botCatalogPrincipal{BotID: robotID, SpaceID: spaceID, Space: botSpaceScoped}
 }

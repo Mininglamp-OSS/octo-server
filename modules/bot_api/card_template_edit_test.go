@@ -78,9 +78,13 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	if plain, _ := frame["plain"].(string); plain == "" {
 		t.Fatal("replacement plain missing")
 	}
+	// The frame lives in the fixture's Space, so that is what an edit of it
+	// resolves. Passing "" here used to read as "don't care"; it now means "we
+	// established this target has no Space", which a space-1 frame correctly
+	// fails. Asserting the real Space also checks the replacement kept it.
 	if err := requireEffectiveCardTemplate([]byte(request.ContentEdit), botTemplateRef{
 		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion,
-	}, "bot-template", verifiableEditSpace("")); err != nil {
+	}, "bot-template", verifiableEditSpace(cardtmplBuildEnvForTest().SpaceID)); err != nil {
 		t.Fatalf("replacement identity: %v", err)
 	}
 }
@@ -123,7 +127,7 @@ func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testin
 			}
 			if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
 				ID: aireasoningprocess.TemplateID, Version: historical.version,
-			}, "bot-template", verifiableEditSpace("")); err != nil {
+			}, "bot-template", verifiableEditSpace(cardtmplBuildEnvForTest().SpaceID)); err != nil {
 				t.Fatalf("historical replacement identity: %v", err)
 			}
 		})
