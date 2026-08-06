@@ -45,6 +45,8 @@ ON DUPLICATE KEY UPDATE `singleton_id` = `singleton_id`;
 -- 手法：向单例表插入 singleton_id=2，只在 mode=1 时选出行。CHECK (singleton_id = 1)
 -- 于是报 3819 并中止整个 Down；mode=0 时 SELECT 无行，INSERT 是 no-op。用已有约束报错，
 -- 免得为一条条件判断建存储过程。
+-- 前提：MySQL >= 8.0.16 才真正强制 CHECK（更早的版本解析后忽略，这条 Down 会静默放过）。
+-- 本项目锁定 MySQL 8.0，所以这个前提成立。
 -- 若确实要在激活后拆除，先人工把 mode 改回 0 并明白这意味着什么。
 INSERT INTO `octo_bot_event_seq_state` (`singleton_id`, `mode`, `epoch`, `cutover_floor`)
 SELECT 2, 0, 0, 0 FROM `octo_bot_event_seq_state` WHERE `singleton_id` = 1 AND `mode` = 1;

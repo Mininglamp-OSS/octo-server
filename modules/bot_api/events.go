@@ -174,9 +174,12 @@ func (ba *BotAPI) ackEvent(key string, eventID string) error {
 //
 // **Equality.** The cursor is a payload `event_id` (`getEventsResult` decodes
 // it), while the read that consumes it is bounded by the sorted-set **score**
-// (`Min: "(cursor"`). The two are the same number by construction at all five
-// producers — each does `ZAdd(key, float64(seq), payload{EventID: seq})` — and
-// `GenSeq` returns small integers well inside float64's exact range. A future
+// (`Min: "(cursor"`). The two are the same number by construction at every
+// producer — each does `ZAdd(key, float64(seq), payload{EventID: seq})` — and
+// both id sources return integers well inside float64's exact range, which
+// `tools/botevent-seq` keeps true by refusing a cutover floor near 2^53. (The
+// count was "five" until `addInlineQuery` was found to be a sixth; naming a
+// number here just invites the next one to be missed.) A future
 // writer that scored by, say, timestamp while keeping a separate `event_id`
 // would break this silently: the cursor would jump past members the caller never
 // received. The same equality is what makes the auto-ACK's

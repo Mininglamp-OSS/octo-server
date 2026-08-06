@@ -246,11 +246,13 @@ func (rb *Robot) PrepareBotTypedEvent(robotID, eventType string, eventData map[s
 //
 // It is NOT the only writer, and this comment used to claim otherwise.
 // `saveRobotMessage` (modules/robot/event.go) carries its own inline
-// GenSeq / ZAdd / Expire copy for the listener fast-path, and both
-// `notifyBotJoinedGroup` variants in modules/group write the queue directly
-// as well — five ZADD sites in total. PR#685's review caught the doorbell
-// being wired to only two of them because the brief trusted this docstring
-// instead of the call graph.
+// allocator / ZAdd / Expire copy for the listener fast-path, `addInlineQuery`
+// below writes the merged inline-query stream, and both `notifyBotJoinedGroup`
+// variants in modules/group write the queue directly as well. PR#685's review
+// caught the doorbell being wired to only two of them because the brief trusted
+// this docstring instead of the call graph, and #697's review then found the
+// count itself was wrong. Both guards in pkg/botevent are the record now;
+// this paragraph is orientation, not inventory.
 //
 // If you add a queue writer, it must also ring the doorbell
 // (pkg/botevent.Ring) after a successful ZADD, or /v1/bot/events long-poll

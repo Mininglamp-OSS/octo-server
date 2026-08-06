@@ -180,13 +180,24 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 				// permanent per-value state. Rejecting an unknown bot is also just
 				// correct on its own terms: enqueueing onto a queue no bot will ever poll
 				// is not a delivery.
+				//
+				// A *lookup error* deliberately falls through to the old behaviour
+				// rather than dropping the event. The growth surface this closes is
+				// attacker-shaped — an id that provably does not exist — and no caller
+				// can force this query to error, so failing closed here would only
+				// convert a DB blip into silently lost bot events that used to be
+				// delivered (review, fifth round). The change is therefore strictly
+				// "reject when the bot is known not to exist".
 				candidate := robotIDValue.String()
 				exist, err := rb.existRobot(candidate)
-				if err != nil {
-					rb.Error("查询有效robotID失败！", zap.Error(err), zap.String("robotID", candidate))
-				} else if exist {
+				switch {
+				case err != nil:
+					rb.Error("查询有效robotID失败，按原行为放行",
+						zap.Error(err), zap.String("robotID", candidate))
 					robotID = candidate
-				} else {
+				case exist:
+					robotID = candidate
+				default:
 					rb.Debug("payload.robot_id 不是已知机器人，忽略",
 						zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
 				}

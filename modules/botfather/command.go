@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"go.uber.org/zap"
 )
@@ -621,7 +622,7 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	h.ctx.GetRedisConn().Del(heartbeatKey)
 
 	// 清除事件队列
-	eventKey := fmt.Sprintf("robotEvent:%s", botID)
+	eventKey := botevent.QueueKey(botID)
 	h.ctx.GetRedisConn().Del(eventKey)
 
 	// Remove bot from all groups
@@ -758,7 +759,7 @@ func (h *commandHandler) onRevokeConfirm(fromUID string, input string) {
 	h.ctx.GetRedisConn().Del(heartbeatKey)
 
 	// 清除事件队列
-	eventKey := fmt.Sprintf("robotEvent:%s", botID)
+	eventKey := botevent.QueueKey(botID)
 	h.ctx.GetRedisConn().Del(eventKey)
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
@@ -789,7 +790,7 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 	h.ctx.GetRedisConn().Del(heartbeatKey)
 
 	// 4. 清除待处理事件队列
-	eventKey := fmt.Sprintf("robotEvent:%s", bot.RobotID)
+	eventKey := botevent.QueueKey(bot.RobotID)
 	h.ctx.GetRedisConn().Del(eventKey)
 
 	h.replyL(fromUID, MsgBotDisconnected, map[string]any{"BotDisplay": h.formatBotDisplay(bot.RobotID)})
