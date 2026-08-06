@@ -50,11 +50,34 @@ package botevent
 //     does — and even then every replica converges within one interval.
 //
 // A *confirmed* conflict (mirror says `incr`, authority says `legacy`) is a forged
-// mirror. The answer is `legacy`, loudly, and it does not split the fleet: every
-// replica reads the same authority row and reaches the same conclusion, so
-// consistency comes from the authority rather than from the mirror. That sentence is
-// what the previous revision was missing, and it is why trusting the authority over
-// the mirror is safe where trusting a cache would not be.
+// mirror, and the answer is `legacy`, loudly.
+//
+// # What that does NOT mean (review P1-A)
+//
+// An earlier revision of this comment said it "does not split the fleet: every replica
+// reads the same authority row and reaches the same conclusion". That is not what the
+// code does, and the difference mattered because the claim was load-bearing. A replica
+// with a positive belief returns from resolveMode without reading the authority again,
+// and with an intact mirror the gate never closes, so nothing forces it to. So if the
+// authority itself regresses *after* activation — a restore from before the migration, a
+// manual `UPDATE … SET mode=0`, the table dropped outside sql-migrate — the fleet does
+// split: replicas already running keep allocating from the counter, while a replica that
+// starts afterwards reads `legacy` and would delegate to GenSeq. Two live id sources on
+// one queue, which is #697.
+//
+// That path is now closed, with no DB read and without depending on the env guard: the
+// same round trip that reads the mirror also reports whether this bot's counter key
+// exists, and a counter exists only because some replica allocated from it, which can
+// only have happened after the authority said `incr`. So a cold process that sees
+// `legacy` alongside a live counter refuses instead of degrading — see legacyDelegate.
+//
+// One residual is accepted rather than claimed away: if the counter key is gone **as
+// well** — a Redis flush or restore correlated with a regressed authority — a cold
+// process has no evidence at all and delegates to GenSeq. Only
+// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it only after
+// activation is verified, so the window is open by design during the flip itself. It is a
+// residual rather than a defect because both halves of the evidence have to be lost at
+// once, and the operator step that closes it exists and is documented.
 //
 // # Why the mirror carries the epoch
 //
@@ -108,6 +131,18 @@ type belief struct {
 	// not be read and legacy is what we do about it". Both behave identically and
 	// both expire; the flag exists so the log says which one happened.
 	confirmed bool
+
+	// deniedMirror is the mirror value this belief was resolved against when that
+	// mirror claimed activation the authority did not confirm.
+	//
+	// Without it, a forged mirror sitting in Redis costs an authority read on **every**
+	// allocation, serialized behind beliefMu, inside a held msgSem slot — the same
+	// hazard class as the per-allocation read review P1-1 removed, and with no exit,
+	// because nothing rewrites or clears that key (review P1-C). Caching the denial
+	// keyed on the exact value denied keeps the guarantee that matters: a *different*
+	// mirror value, including a genuine activation, is still a conflict and still
+	// forces a read.
+	deniedMirror string
 
 	resolvedAt time.Time
 }
@@ -194,43 +229,51 @@ func AuthorityUnreadable() int64 { return authorityUnreadable.load() }
 // previous revision compared a free-form env string against ModeIncr, so
 // `OCTO_BOTEVENT_EXPECTED_MODE=inrc` was indistinguishable from unset — a typo
 // disarming the one guard that exists to stop a silent downgrade (review P1-4).
-var (
-	expectedModeSet       bool
-	expectedModeIncr      bool
-	expectedModeMalformed bool
-)
+//
+// Held behind an atomic pointer rather than three package vars because the test hook
+// rewrites it while production code reads it. Both current call sites are
+// single-goroutine so `-race` was clean, but combining the hook with the concurrency
+// test would not be, and "clean today" is not a property worth relying on (review P2-3).
+type expectedModeGuard struct {
+	set       bool
+	incr      bool
+	malformed bool
+}
 
-func init() { loadExpectedMode(os.Getenv(ExpectedModeEnv)) }
+var expectedMode atomic.Pointer[expectedModeGuard]
 
-func loadExpectedMode(raw string) {
-	expectedModeSet, expectedModeIncr, expectedModeMalformed = false, false, false
+func init() { expectedMode.Store(parseExpectedMode(os.Getenv(ExpectedModeEnv))) }
+
+func parseExpectedMode(raw string) *expectedModeGuard {
 	switch strings.TrimSpace(raw) {
 	case "":
+		return &expectedModeGuard{}
 	case ModeLegacy:
-		expectedModeSet = true
+		return &expectedModeGuard{set: true}
 	case ModeIncr:
-		expectedModeSet, expectedModeIncr = true, true
+		return &expectedModeGuard{set: true, incr: true}
 	default:
-		expectedModeSet, expectedModeMalformed = true, true
+		return &expectedModeGuard{set: true, malformed: true}
 	}
 }
 
 // assertExpectedMode enforces the optional deployment guard against a resolved mode.
 func assertExpectedMode(activated bool) error {
-	if !expectedModeSet {
+	g := expectedMode.Load()
+	if g == nil || !g.set {
 		return nil
 	}
-	if expectedModeMalformed {
+	if g.malformed {
 		return fmt.Errorf("botevent: %s is set to an unrecognised value; refusing to allocate "+
 			"rather than run with a guard that silently does nothing (want %q or %q)",
 			ExpectedModeEnv, ModeLegacy, ModeIncr)
 	}
-	if expectedModeIncr && !activated {
+	if g.incr && !activated {
 		return fmt.Errorf("botevent: %s=%s but the authority says the allocator is not activated; "+
 			"refusing to fall back to the legacy allocator, whose lower ids would land below "+
 			"live consumer cursors", ExpectedModeEnv, ModeIncr)
 	}
-	if !expectedModeIncr && activated {
+	if !g.incr && activated {
 		return fmt.Errorf("botevent: %s=%s but the authority says the allocator is activated; "+
 			"refusing to allocate from a mode this replica was not deployed for",
 			ExpectedModeEnv, ModeLegacy)
@@ -296,12 +339,17 @@ func resolveMode(ctx *config.Context, mirror string) (modeDecision, *belief, err
 		if b.activated {
 			return decideCounter, b, nil
 		}
-		// Negative is trusted only while the mirror agrees.
-		if !claims && beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
-			return decideLegacy, b, nil
+		if beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
+			// Negative is trusted while the mirror agrees with it, and also when the
+			// mirror is the *same* value this belief already denied — otherwise a forged
+			// key sitting in Redis costs an authority read per allocation with no exit
+			// (review P1-C).
+			if !claims || (b.confirmed && b.deniedMirror == mirror) {
+				return decideLegacy, b, nil
+			}
 		}
 	}
-	return refreshAuthority(ctx, claims, false)
+	return refreshAuthority(ctx, claims, mirror, false)
 }
 
 // refreshAuthority reads the authority and installs the resulting belief.
@@ -311,23 +359,37 @@ func resolveMode(ctx *config.Context, mirror string) (modeDecision, *belief, err
 // activation issues ids below live cursors. Without one, unreadable means the same
 // thing a pre-migration deploy means, and legacy is the honest answer.
 //
-// force skips the cached-answer short circuits, including the positive one. It is for
-// the gate-closed path, where the whole point is that something changed the mirror
-// underneath a belief this process was already acting on: serving that caller from the
-// belief it is trying to re-verify would spin.
-func refreshAuthority(ctx *config.Context, mirrorClaimsIncr, force bool) (modeDecision, *belief, error) {
+// force skips the TTL short circuits, including the positive one. It is for the
+// gate-closed path, where the whole point is that something changed the mirror underneath
+// a belief this process was already acting on: serving that caller from the belief it is
+// trying to re-verify would spin. It does NOT skip the *staleness* check below — a forced
+// caller that arrives after somebody else already did the read it wanted is served from
+// that result, so one lost mode key costs one authority read rather than one per in-flight
+// allocation (review P1-C).
+func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string, force bool) (modeDecision, *belief, error) {
+	seen := activeBelief.Load()
 	beliefMu.Lock()
 	defer beliefMu.Unlock()
 
 	prior := activeBelief.Load()
 	// Double-check under the lock: a concurrent caller may already have paid for the
 	// answer this one was about to ask for.
+	if prior != nil && prior != seen {
+		// Somebody refreshed while this caller waited for the lock. That is the answer it
+		// came for, forced or not.
+		if prior.activated {
+			return decideCounter, prior, nil
+		}
+		return decideLegacy, prior, nil
+	}
 	if prior != nil && !force {
 		if prior.activated {
 			return decideCounter, prior, nil
 		}
-		if !mirrorClaimsIncr && beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
-			return decideLegacy, prior, nil
+		if beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
+			if !mirrorClaimsIncr || (prior.confirmed && prior.deniedMirror == mirror) {
+				return decideLegacy, prior, nil
+			}
 		}
 	}
 
@@ -354,10 +416,11 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr, force bool) (modeDe
 				"consumer cursors", prior.epoch, err)
 		}
 		if mirrorClaimsIncr {
-			// A mirror claiming an activation the authority denies. Legacy is correct
-			// and is what every replica concludes from the same row, so this does not
-			// split the fleet — but somebody wrote that key, and nothing else about
-			// this is visible from outside.
+			// A mirror claiming an activation the authority denies. Legacy is what the
+			// authority says, so that is the answer — but somebody wrote that key, and
+			// nothing else about this is visible from outside. Note this does NOT by
+			// itself keep the fleet on one id source; see the P1-A section in the file
+			// header for what does and what remains residual.
 			mirrorUnauthorized.inc()
 			unauthorizedWarn.warn("botevent: mode mirror claims activation but the authority does not; "+
 				"ignoring the mirror and allocating from the legacy allocator",
@@ -366,7 +429,13 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr, force bool) (modeDe
 		if err := assertExpectedMode(false); err != nil {
 			return decideLegacy, nil, err
 		}
-		return install(&belief{confirmed: true, resolvedAt: beliefNow()})
+		// deniedMirror records which value was denied, so the next allocation seeing the
+		// same forged key is served from this belief instead of paying for another read.
+		denied := ""
+		if mirrorClaimsIncr {
+			denied = mirror
+		}
+		return install(&belief{confirmed: true, deniedMirror: denied, resolvedAt: beliefNow()})
 
 	default:
 		// Inconclusive.
@@ -429,9 +498,7 @@ func AgeModeBeliefForTest() {
 // SetExpectedModeForTest overrides the env-derived expectation and returns a restore
 // function. Takes the raw env spelling so a test can exercise a malformed value.
 func SetExpectedModeForTest(raw string) func() {
-	prevSet, prevIncr, prevMalformed := expectedModeSet, expectedModeIncr, expectedModeMalformed
-	loadExpectedMode(raw)
-	return func() {
-		expectedModeSet, expectedModeIncr, expectedModeMalformed = prevSet, prevIncr, prevMalformed
-	}
+	prev := expectedMode.Load()
+	expectedMode.Store(parseExpectedMode(raw))
+	return func() { expectedMode.Store(prev) }
 }

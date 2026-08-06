@@ -43,6 +43,12 @@ func TestMain(m *testing.M) {
 }
 
 // probeTestDependencies reports the first missing dependency, if any.
+//
+// It performs the same two CREATE TABLEs seqTestCtx does, because those are what actually
+// gate the tests: probing only `SELECT 1` and `PING` left the interesting failure — a
+// privilege or collation problem on the writes — skipping every integration test while
+// `go test` exited 0, which is the exact blind spot this TestMain was added to close
+// (review, fifth round).
 func probeTestDependencies() error {
 	mysqlAddr, redisAddr := testAddrs()
 
@@ -51,6 +57,12 @@ func probeTestDependencies() error {
 	ctx := config.NewContext(cfg)
 	if _, err := ctx.DB().Exec("SELECT 1"); err != nil {
 		return fmt.Errorf("no usable MySQL at %s: %w", mysqlAddr, err)
+	}
+	if _, err := ctx.DB().Exec(seqTableDDL); err != nil {
+		return fmt.Errorf("cannot create the `seq` table at %s: %w", mysqlAddr, err)
+	}
+	if _, err := ctx.DB().Exec(stateTableDDL); err != nil {
+		return fmt.Errorf("cannot create %s at %s: %w", stateTable, mysqlAddr, err)
 	}
 
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})

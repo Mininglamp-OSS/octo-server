@@ -29,10 +29,17 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 	root := repoRootForGuard(t)
 
 	// A queue writer is a ZAdd whose key is the bot event queue. Cover the shared
-	// QueueKey helper (#697 consolidated the producers onto it, so the seed reads
-	// the exact key they write), the legacy prefix field, the literal spelling,
-	// and the prepared typed-event key produced by PrepareBotTypedEvent.
-	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:%s"|botevent\.QueueKey|prepared\.QueueKey)`)
+	// QueueKey helper (#697 consolidated every producer *and* every Del site onto it,
+	// so the seed reads the exact key they write) and the prepared typed-event key
+	// produced by PrepareBotTypedEvent — plus every hand-rolled spelling of the
+	// literal, so a writer that reintroduces one is still recognised rather than
+	// silently skipped.
+	//
+	// `"robotEvent:"` on its own matters: review found the previous pattern matched
+	// `"robotEvent:%s"` but not `"robotEvent:" + robotID`, which is the spelling used
+	// throughout modules/message and modules/bot_mention tests. A sixth writer using it
+	// would have cleared both the match and the vacuity floor below.
+	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:|botevent\.QueueKey|prepared\.QueueKey)`)
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
 	// Notify is the producer-facing entry point; Ring is the synchronous
 	// primitive it wraps. Both count: a writer that calls Ring directly is
@@ -130,6 +137,23 @@ func TestEveryBotEventQueueWriterRingsTheDoorbell(t *testing.T) {
 func TestGuardWouldCatchAnUnrungWriter(t *testing.T) {
 	zaddCall := regexp.MustCompile(`\.ZAdd\(`)
 	ringCall := regexp.MustCompile(`botevent\.(Notify|Ring)\(`)
+	queueKey := regexp.MustCompile(`(robotEventPrefix|"robotEvent:|botevent\.QueueKey|prepared\.QueueKey)`)
+
+	// Every spelling a writer could reach for has to be recognised as a queue key, or
+	// that writer is skipped rather than checked. The concatenation form is the one the
+	// previous pattern missed (review, fifth round).
+	for _, spelling := range []string{
+		`key := botevent.QueueKey(robotID)`,
+		`key := fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID)`,
+		`key := fmt.Sprintf("robotEvent:%s", robotID)`,
+		`key := "robotEvent:" + robotID`,
+		`err := c.ZAdd(prepared.QueueKey, score, member)`,
+	} {
+		if !queueKey.MatchString(spelling) {
+			t.Errorf("queue-key pattern does not recognise %q, so a writer spelled that way "+
+				"would be skipped by the guard instead of checked", spelling)
+		}
+	}
 
 	unrung := []string{
 		`key := fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID)`,

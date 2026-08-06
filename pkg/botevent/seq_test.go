@@ -48,6 +48,29 @@ func testAddrs() (mysqlAddr, redisAddr string) {
 	return
 }
 
+// seqTableDDL creates the migration-owned `seq` table. The row is the load-bearing half
+// of the seed: it is the only record of how high the legacy allocator ever went for a bot
+// whose queue is now empty.
+//
+// Shared with probeTestDependencies in main_test.go, which runs the identical statements
+// so a CI environment that cannot execute them fails loudly instead of skipping.
+const seqTableDDL = "CREATE TABLE IF NOT EXISTS `seq` (" +
+	"`key` varchar(100) NOT NULL, `min_seq` bigint NOT NULL DEFAULT 0, " +
+	"`step` int NOT NULL DEFAULT 0, PRIMARY KEY (`key`)) " +
+	"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+// stateTableDDL matches modules/robot/sql/20260805000001_bot_event_seq_state.sql,
+// including the singleton CHECK and the ON UPDATE clause. An abbreviated copy would mean
+// the tests never exercise the shipped schema — and the CHECK is what the migration's Down
+// relies on to refuse dropping an activated authority (review P2-11).
+const stateTableDDL = "CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
+	"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
+	"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
+	"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, " +
+	"PRIMARY KEY (`singleton_id`), " +
+	"CONSTRAINT `chk_bot_event_seq_singleton` CHECK (`singleton_id` = 1)) " +
+	"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
 func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 	t.Helper()
 	mysqlAddr, redisAddr := testAddrs()
@@ -56,26 +79,10 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 	cfg.DB.MySQLAddr = mysqlAddr
 	ctx := config.NewContext(cfg)
 
-	// The `seq` row is the load-bearing half of the seed: it is the only record of
-	// how high the legacy allocator ever went for a bot whose queue is now empty.
-	if _, err := ctx.DB().Exec("CREATE TABLE IF NOT EXISTS `seq` (" +
-		"`key` varchar(100) NOT NULL, `min_seq` bigint NOT NULL DEFAULT 0, " +
-		"`step` int NOT NULL DEFAULT 0, PRIMARY KEY (`key`)) " +
-		"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"); err != nil {
+	if _, err := ctx.DB().Exec(seqTableDDL); err != nil {
 		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
-
-	// Matches modules/robot/sql/20260805000001_bot_event_seq_state.sql, including the
-	// singleton CHECK and the ON UPDATE clause. An abbreviated copy would mean the
-	// tests never exercise the shipped schema — and the CHECK is what the migration's
-	// Down relies on to refuse dropping an activated authority (review P2-11).
-	if _, err := ctx.DB().Exec("CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
-		"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
-		"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
-		"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, " +
-		"PRIMARY KEY (`singleton_id`), " +
-		"CONSTRAINT `chk_bot_event_seq_singleton` CHECK (`singleton_id` = 1)) " +
-		"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"); err != nil {
+	if _, err := ctx.DB().Exec(stateTableDDL); err != nil {
 		t.Skipf("cannot create %s at %s: %v", stateTable, mysqlAddr, err)
 	}
 
