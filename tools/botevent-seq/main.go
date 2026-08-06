@@ -304,44 +304,100 @@ func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
 // It must be the exact spelling the allocator validates (botevent.MirrorValue): a bare
 // `incr` is only a claim, and every replica would keep re-reading the authority until
 // somebody wrote the real value.
-// refuseUnauthorizedMirror stops an activation while a mirror claiming activation is
-// already present against a legacy authority.
+// mirrorVerdict is what the pre-flip mirror check decided.
+type mirrorVerdict int
+
+const (
+	// mirrorOK: nothing to say.
+	mirrorOK mirrorVerdict = iota
+	// mirrorNote: worth printing, does not stop the flip.
+	mirrorNote
+	// mirrorRefuse: stop.
+	mirrorRefuse
+)
+
+// judgeMirror decides what a pre-flip mirror value means, given whether the authority says
+// the allocator is already activated.
 //
-// Two reasons, and the second is the one that is easy to miss:
+// Split out from the Redis/MySQL plumbing so the matrix is testable without either — this
+// tool carries the whole activation procedure and had no tests at all, which is how the bug
+// below shipped (review round 7 P2-1, found independently by two reviewers).
 //
-//   - It is evidence that this Redis is not in the state the operator thinks it is —
-//     someone wrote that key, or it is shared with another environment, or a snapshot from
-//     an activated era was restored. Any of those wants a human look before an
-//     irreversible flip.
-//   - The allocator's repair for such a key is to delete it, and the first activation
-//     produces `incr:1` — byte-identical to a forged `incr:1`. Removing the precondition
-//     here means the delete can never race the genuine mirror write. Replicas would
-//     recover on their own even if it did (they would consult the authority and rebuild),
-//     but "recovers on its own" is not a thing to spend at a supervised step.
-//
-// Runs after the floor checks so the operator sees every other problem in one pass.
-func refuseUnauthorizedMirror(ctx *config.Context, client *rd.Client) {
-	v, err := client.Get(botevent.ModeKey).Result()
-	if err == rd.Nil {
-		return
+// `activated` is the authority's answer, and reading it first is the entire fix. The previous
+// revision refused on *any* parseable mirror claim without consulting the state row, so
+// re-running `activate -yes` on an already-activated system — a correct mirror, the normal
+// state after a successful flip — died with "already holds incr:1 while the authority says
+// legacy … Confirm which, then DEL the key and rerun". Every clause was false in the common
+// case, it told the operator to delete the live mirror, and it made the documented
+// "already activated; reconcile the mirror" branch unreachable whenever a mirror existed.
+func judgeMirror(activated bool, mirror string, absent bool) (mirrorVerdict, string) {
+	if absent {
+		return mirrorOK, ""
 	}
-	if err != nil {
-		fatal("cannot read the mode mirror (%v); refusing to activate without knowing whether a "+
-			"stale one is present", err)
+	epoch, claims := botevent.ParseMirrorEpoch(mirror)
+	if !claims {
+		// Not a claim of activation. Worth reporting, but it does not interact with the
+		// flip: the allocator treats a malformed value as absent, and this run overwrites it.
+		return mirrorNote, fmt.Sprintf("note: %s holds %q, which is not a valid mirror value; "+
+			"allocators treat it as absent and it will be overwritten\n", botevent.ModeKey, mirror)
 	}
-	if _, ok := botevent.ParseMirrorEpoch(v); !ok {
-		// Not a claim of activation. A malformed value is worth reporting but does not
-		// interact with the flip: the allocator treats it as absent.
-		fmt.Fprintf(os.Stderr, "note: %s holds %q, which is not a valid mirror value; allocators "+
-			"treat it as absent and it will be overwritten by this activation\n", botevent.ModeKey, v)
-		return
+	if activated {
+		// The authority agrees. This is the ordinary re-run, and reconciling the mirror is
+		// exactly what the operator wants — `activate` is documented as idempotent.
+		return mirrorNote, fmt.Sprintf("note: %s already holds %q and the authority agrees "+
+			"(epoch %d); the mirror will be reconciled\n", botevent.ModeKey, mirror, epoch)
 	}
-	fatal("refusing to activate: %s already holds %q while the authority says legacy.\n"+
+	return mirrorRefuse, fmt.Sprintf("refusing to activate: %s holds %q while the authority "+
+		"says the allocator is NOT activated.\n"+
 		"Nothing should have written that — it means this Redis was activated before, is shared "+
 		"with another environment, or was restored from an activated snapshot. Confirm which, "+
 		"then DEL the key and rerun.\n"+
 		"Allocators are meanwhile ignoring it and staying on the legacy allocator "+
-		"(dmwork_bot_event_seq_mirror_unauthorized_total is counting it).", botevent.ModeKey, v)
+		"(dmwork_bot_event_seq_mirror_unauthorized_total is counting it). Note they do NOT "+
+		"delete it: round 7 of #697's review showed that deleting a mirror on the authority's "+
+		"word takes the fleet down when the authority is the party that regressed.",
+		botevent.ModeKey, mirror)
+}
+
+// refuseUnauthorizedMirror stops an activation while a mirror claiming activation sits
+// against an authority that says otherwise.
+//
+// That state means this Redis is not what the operator believes: someone wrote the key, it is
+// shared with another environment, or a snapshot from an activated era was restored. Any of
+// those wants a human look before an irreversible flip — and it is also the precondition for
+// the one residual window in the allocator's denial cooldown (see pkg/botevent/mode.go), so
+// checking it here is where that window gets closed in practice.
+//
+// Runs after the floor checks so the operator sees every other problem in one pass.
+func refuseUnauthorizedMirror(ctx *config.Context, client *rd.Client) {
+	v, err := client.Get(botevent.ModeKey).Result()
+	absent := err == rd.Nil
+	if err != nil && !absent {
+		fatal("cannot read the mode mirror (%v); refusing to activate without knowing whether a "+
+			"stale one is present", err)
+	}
+
+	// Read the authority before judging the mirror. Skipping this is what made a correct
+	// mirror look like a forged one.
+	activated := false
+	switch st, sErr := botevent.ReadState(ctx); {
+	case sErr == nil:
+		activated = st.Activated()
+	case errors.Is(sErr, botevent.ErrStateMissing):
+		// The migration has not run. Not activated, and a mirror claiming otherwise is
+		// exactly the case worth refusing on.
+	default:
+		fatal("cannot read the allocator state (%v); refusing to judge the mirror without it — "+
+			"that is the mistake this check was added to fix", sErr)
+	}
+
+	verdict, msg := judgeMirror(activated, v, absent)
+	switch verdict {
+	case mirrorRefuse:
+		fatal("%s", msg)
+	case mirrorNote:
+		fmt.Fprint(os.Stderr, msg)
+	}
 }
 
 func writeMirror(client *rd.Client, epoch uint64) {
