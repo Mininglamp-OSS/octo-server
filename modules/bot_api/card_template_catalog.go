@@ -526,20 +526,59 @@ func parseBotTemplateRef(value any) (botTemplateRef, error) {
 	return botTemplateRef{ID: cardtmpl.ID(id), Version: version}, nil
 }
 
+// editSpaceCheck is what this edit knows about the Space it is authorized
+// against. Three states, deliberately distinct — collapsing them is what made
+// the Space comparison a source of permanent failures twice over.
+//
+//   - verifiable, with a Space: compare the stored marker against it.
+//   - not verifiable: the deployment never establishes a Space at all (the
+//     dynamic catalog is dark), so there is nothing to compare with. The edit
+//     is still bound to its author by the canonical bot marker, the
+//     PrincipalID == editor check and Snapshot ownership.
+//   - unavailable: a Space should have been resolvable and was not. The edit
+//     cannot be verified now but may well succeed later, so it must not be
+//     reported as a permanent client error.
+type editSpaceCheck struct {
+	spaceID     string
+	verifiable  bool
+	unavailable bool
+}
+
+// editProvenanceSpaceCheck maps the send-side principal onto those three
+// states. dynamicEnabled is read at the call site rather than inferred from the
+// principal because botSendCatalogPrincipal returns the same zero principal for
+// "the gate is closed" and "the group row would not load", and only the second
+// of those is an outage.
+//
+// A DM whose peer turned out to be outside the Bot's Space also lands in
+// `unavailable`. That is a deny wearing an outage's clothes, and the imprecision
+// is deliberate: over-reporting an outage costs a retry, while under-reporting
+// one costs a permanently uneditable card.
+func editProvenanceSpaceCheck(dynamicEnabled bool, principal botCatalogPrincipal) editSpaceCheck {
+	if !dynamicEnabled {
+		return editSpaceCheck{}
+	}
+	if !principal.SpaceResolved {
+		return editSpaceCheck{unavailable: true}
+	}
+	return editSpaceCheck{spaceID: principal.SpaceID, verifiable: true}
+}
+
 // requireEffectiveCardTemplate proves the stored frame is the one this edit is
 // entitled to rewrite.
 //
-// authorizedSpaceID is the Space this edit resolved for the target, composed
-// exactly as the send composed the marker it is being compared against. An
-// earlier revision compared the marker to the envelope's top-level `space_id`,
-// which only DM sends ever write — so once group sends started recording their
-// target Space, every group and thread card became permanently uneditable.
-// Comparing two values produced by the same rule means they agree whenever
-// nothing moved, and disagree exactly when the frame did.
+// space is the Space this edit resolved for the target, composed exactly as the
+// send composed the marker it is being compared against. An earlier revision
+// compared the marker to the envelope's top-level `space_id`, which only DM
+// sends ever write — so once group sends started recording their target Space,
+// every group and thread card became permanently uneditable. Comparing two
+// values produced by the same rule means they agree whenever nothing moved, and
+// disagree exactly when the frame did.
 func requireEffectiveCardTemplate(
 	envelope []byte,
 	want botTemplateRef,
-	editorBotID, authorizedSpaceID string,
+	editorBotID string,
+	space editSpaceCheck,
 ) error {
 	decoder := json.NewDecoder(bytes.NewReader(envelope))
 	decoder.UseNumber()
@@ -573,12 +612,22 @@ func requireEffectiveCardTemplate(
 			markers.Provenance.PrincipalID != editorBotID {
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
-		expectedSpace := strings.TrimSpace(authorizedSpaceID)
-		if expectedSpace == "" {
-			expectedSpace, _ = payload["space_id"].(string)
-		}
-		if markers.Provenance.SpaceID != "" && markers.Provenance.SpaceID != expectedSpace {
-			return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
+		if markers.Provenance.SpaceID != "" {
+			if space.unavailable {
+				return fmt.Errorf("%w: edit space could not be resolved, stored provenance unverifiable",
+					errBotTemplateRuntimeUnavailable)
+			}
+			if space.verifiable {
+				expectedSpace := strings.TrimSpace(space.spaceID)
+				if expectedSpace == "" {
+					// A DM resolved to no Space still has the envelope's own
+					// value, which is what pre-PR-C sends stamped.
+					expectedSpace, _ = payload["space_id"].(string)
+				}
+				if markers.Provenance.SpaceID != expectedSpace {
+					return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
+				}
+			}
 		}
 	}
 	return nil

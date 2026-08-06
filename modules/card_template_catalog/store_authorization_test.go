@@ -24,7 +24,28 @@ const (
 	authArtifactPattern   = `SELECT c.source, a.owner, a.visibility`
 	authGrantPattern      = `SELECT scope_space_id, status, can_discover, can_send, can_edit, revision`
 	authPrincipalPattern  = `SELECT template_id, scope_space_id, status`
+	// The advertised set resolves every candidate's pointer and artifact in one
+	// statement; the per-template pair above is the single-template path.
+	authAdvertisePattern = `SELECT act.template_id, act.active_version, act.status, act.revision`
+	authBatchGrantPrefix = `SELECT template_id, scope_space_id, status,
+        can_discover, can_send, can_edit, revision
+    FROM card_template_grant`
 )
+
+// advertiseRows are the columns of the batched activation+artifact read.
+func advertiseRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"template_id", "active_version", "status", "revision",
+		"source", "owner", "visibility", "engine_contract",
+		"protocol", "contract_version", "content_sha256", "blocked",
+	})
+}
+
+func dynamicAdvertiseRow(rows *sqlmock.Rows, id, version string, revision int) *sqlmock.Rows {
+	return rows.AddRow(id, version, string(activationStatusActive), revision,
+		claimSourceDynamic, "docs", cardtmpl.CatalogVisibilityPrivate,
+		cardtmpl.JSONTemplateEngineV1, cardtmpl.Protocol, "1.0.0", strings.Repeat("a", 64), false)
+}
 
 func dynamicArtifactRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
@@ -279,19 +300,14 @@ func TestStoreListAuthorizedTemplatesSkipsUnadvertisableTemplates(t *testing.T) 
 			AddRow("test.disabled", "", string(GrantStatusActive), true, true, false, 1).
 			AddRow("test.revoked", "space-1", string(GrantStatusRevoked), false, false, false, 8))
 
-	// Sorted by template ID: active, then disabled. The revoked one never gets
-	// a state read at all — a tombstone is decided before touching activation.
-	mock.ExpectQuery(regexp.QuoteMeta(authActivationPattern)).
-		WithArgs("test.active").
-		WillReturnRows(sqlmock.NewRows([]string{"active_version", "status", "revision"}).
-			AddRow("2.0.0", string(activationStatusActive), 4))
-	mock.ExpectQuery(regexp.QuoteMeta(authArtifactPattern)).
-		WithArgs("test.active", "2.0.0").
-		WillReturnRows(dynamicArtifactRows())
-	mock.ExpectQuery(regexp.QuoteMeta(authActivationPattern)).
-		WithArgs("test.disabled").
-		WillReturnRows(sqlmock.NewRows([]string{"active_version", "status", "revision"}).
-			AddRow(nil, string(activationStatusDisabled), 2))
+	// One batched state read for both surviving candidates, sorted by template
+	// ID. The revoked one is not among them at all — a tombstone is decided
+	// before touching activation. test.disabled has no row in the result
+	// because the inner join on active_version drops a disabled pointer, which
+	// is the same outcome the per-template loop produced by discarding it.
+	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
+		WithArgs("test.active", "test.disabled").
+		WillReturnRows(dynamicAdvertiseRow(advertiseRows(), "test.active", "2.0.0", 4))
 	mock.ExpectCommit()
 
 	templates, err := store.ListAuthorizedTemplates(context.Background(), botAuthPrincipal(), 0)
@@ -315,6 +331,106 @@ func TestStoreListAuthorizedTemplatesIgnoresUngrantablePrincipals(t *testing.T) 
 		cardtmpl.CatalogPrincipal{Kind: cardtmpl.CatalogPrincipalSystem, ID: "startup"}, 10)
 	if err != nil || templates != nil {
 		t.Fatalf("templates = %+v err = %v, want no lookup at all", templates, err)
+	}
+	assertMockExpectations(t, mock)
+}
+
+// The batch resolver's whole reason to exist is the shape of its transaction:
+// one snapshot, one activation/artifact statement, one grant statement, however
+// many templates were asked about. sqlmock is the only place that shape can be
+// asserted — a real-MySQL test proves the answers agree but says nothing about
+// how many round trips produced them.
+func TestStoreLoadAuthorizationsUsesTwoStatementsForManyTemplates(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
+		WithArgs("test.a", "test.b", "test.c").
+		WillReturnRows(dynamicAdvertiseRow(advertiseRows(), "test.a", "1.0.0", 2))
+	mock.ExpectQuery(regexp.QuoteMeta(authBatchGrantPrefix)).
+		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", "test.a", "test.b", "test.c").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"template_id", "scope_space_id", "status",
+			"can_discover", "can_send", "can_edit", "revision",
+		}).AddRow("test.a", "space-1", string(GrantStatusActive), true, true, false, 5))
+	mock.ExpectCommit()
+
+	got, err := store.LoadAuthorizations(context.Background(),
+		[]cardtmpl.ID{"test.a", "test.b", "test.c"}, botAuthPrincipal())
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("answered %d of 3 templates: %+v", len(got), got)
+	}
+	if got["test.a"].Version != "1.0.0" || !got["test.a"].Grant.Send {
+		t.Fatalf("test.a = %+v", got["test.a"])
+	}
+	// A template with no activation row still gets an entry, because "no
+	// dynamic version" is an answer the caller acts on (it keeps its static
+	// behaviour) rather than an absence it has to guess about.
+	for _, id := range []cardtmpl.ID{"test.b", "test.c"} {
+		if entry, ok := got[id]; !ok || entry.Version != "" || entry.Grant.Found {
+			t.Fatalf("%s = %+v (present=%v)", id, entry, ok)
+		}
+	}
+	assertMockExpectations(t, mock)
+}
+
+// A duplicated ID must not widen the IN list, and a blank one is a caller bug
+// that has to surface rather than quietly resolving to nothing.
+func TestStoreLoadAuthorizationsRejectsBlankIDsAndDeduplicates(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	if _, err := store.LoadAuthorizations(context.Background(),
+		[]cardtmpl.ID{"test.a", "  "}, botAuthPrincipal()); !errors.Is(err, cardtmpl.ErrTemplateUnknown) {
+		t.Fatalf("blank id error = %v, want ErrTemplateUnknown", err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
+		WithArgs("test.a").
+		WillReturnRows(advertiseRows())
+	mock.ExpectQuery(regexp.QuoteMeta(authBatchGrantPrefix)).
+		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", "test.a").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"template_id", "scope_space_id", "status",
+			"can_discover", "can_send", "can_edit", "revision",
+		}))
+	mock.ExpectCommit()
+	got, err := store.LoadAuthorizations(context.Background(),
+		[]cardtmpl.ID{"test.a", "test.a"}, botAuthPrincipal())
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("deduplicated result = %+v", got)
+	}
+	assertMockExpectations(t, mock)
+}
+
+// An ungrantable principal issues no grant query, exactly as the single-template
+// path does — `system` and blank identities are control-plane concepts, and a
+// lookup on them could accidentally match an empty-string row.
+func TestStoreLoadAuthorizationsSkipsTheGrantQueryForUngrantablePrincipals(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
+		WithArgs("test.a").
+		WillReturnRows(dynamicAdvertiseRow(advertiseRows(), "test.a", "1.0.0", 2))
+	mock.ExpectCommit()
+
+	got, err := store.LoadAuthorizations(context.Background(), []cardtmpl.ID{"test.a"},
+		cardtmpl.CatalogPrincipal{Kind: cardtmpl.CatalogPrincipalSystem, ID: "startup"})
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	if got["test.a"].Grant.Found {
+		t.Fatalf("a system principal was issued a grant: %+v", got["test.a"])
 	}
 	assertMockExpectations(t, mock)
 }

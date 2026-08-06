@@ -102,6 +102,17 @@ func (s *runtimeAuthorizationSource) LoadAuthorization(
 	return s.store.LoadAuthorization(ctx, query)
 }
 
+// LoadAuthorizations exposes the store's batched resolver. Consumers type-assert
+// for cardtmpl.RuntimeAuthorizationBatchStore, so forgetting to forward it here
+// would silently drop them back onto the per-ID path.
+func (s *runtimeAuthorizationSource) LoadAuthorizations(
+	ctx context.Context,
+	ids []cardtmpl.ID,
+	principal cardtmpl.CatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	return s.store.LoadAuthorizations(ctx, ids, principal)
+}
+
 func (s *runtimeAuthorizationSource) ListAuthorizedTemplates(
 	ctx context.Context,
 	principal cardtmpl.CatalogPrincipal,

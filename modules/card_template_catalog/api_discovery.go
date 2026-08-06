@@ -372,18 +372,21 @@ func (a *API) getTemplate(c *wkhttp.Context) {
 		return
 	}
 
-	row, err := store.LoadDiscoverable(ctx, spaceID, id, version)
-	if err != nil {
-		if errors.Is(err, ErrDiscoveryNotVisible) {
-			respondCatalogNotFound(c)
-			return
-		}
-		respondCatalogUnavailable(c)
-		return
-	}
-	// The projection comes from the compiled artifact, which is the same
-	// immutable object the renderer uses. Building it here from the row would
-	// mean two definitions of "what this template promises".
+	// One authorized read decides everything about this response — that the
+	// caller may see the template, what its contract says, and which validator
+	// and cache directive describe it.
+	//
+	// An earlier revision asked twice: the discovery predicate for visibility
+	// and the ETag source, then the runtime catalog for the projection. Two
+	// independent reads mean two instants, and a grant that moved between them
+	// produced either a 404 for a template the caller could see a millisecond
+	// earlier or a response whose headers described a snapshot the body did not
+	// come from. That is precisely the torn read the one-snapshot resolver
+	// exists to eliminate, so B2 no longer performs it.
+	//
+	// Dropping the predicate read cannot widen what is served: the authorizer
+	// applies the same visibility-or-grant rule *plus* the owner allowlist, and
+	// rejects blocked and unknown artifacts on its own.
 	meta, err := a.discoveryMeta(ctx, spaceID, id, version)
 	if err != nil {
 		if errors.Is(err, cardtmpl.ErrTemplateUnknown) ||
@@ -400,11 +403,12 @@ func (a *API) getTemplate(c *wkhttp.Context) {
 		respondCatalogNotFound(c)
 		return
 	}
-	// A dynamic template's ETag is its immutable content hash rather than the
-	// projection digest: the content hash also covers the documents the
-	// projection omits, so it can never collide across two artifacts that
-	// happen to project identically.
-	a.writeExport(c, spaceID, row.Visibility, row.ContentSHA256, export)
+	// The validator is the projection's own deterministic digest, which is the
+	// one hash guaranteed to describe the bytes being written. Two artifacts
+	// that project identically therefore share a validator — correct for a
+	// cache, since the responses are byte-identical. Visibility likewise comes
+	// from the projection, which fails closed to private.
+	a.writeExport(c, spaceID, export.Visibility, export.Hash, export)
 }
 
 // writeExport emits the projection with conditional-request and cache headers.

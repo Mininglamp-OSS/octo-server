@@ -116,6 +116,22 @@ type RuntimeAuthorizationStore interface {
 	LoadAuthorization(context.Context, RuntimeAuthorizationQuery) (RuntimeAuthorization, error)
 }
 
+// RuntimeAuthorizationBatchStore is the optional batched form of
+// LoadAuthorization, for callers that must ask the same question about a whole
+// policy list at once — the Bot capability manifest, chiefly. Answering those
+// one transaction at a time turns a feature-detection poll into N round trips,
+// and a deployment with a large Bot population multiplies that into standing
+// primary-DB load.
+//
+// It is a separate interface rather than a third method on the required one so
+// that an implementation without it keeps working through the per-ID path. An
+// implementation that does provide it MUST return, for every requested ID,
+// exactly what LoadAuthorization would have returned for that ID with an empty
+// Version — the batch buys round trips, never a relaxed check.
+type RuntimeAuthorizationBatchStore interface {
+	LoadAuthorizations(context.Context, []ID, CatalogPrincipal) (map[ID]RuntimeAuthorization, error)
+}
+
 // RuntimeAdvertisedTemplate is one template a principal holds a grant on,
 // paired with the activation snapshot that decides whether it is advertisable
 // right now.

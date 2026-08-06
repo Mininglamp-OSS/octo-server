@@ -189,6 +189,14 @@ func storedMarkersForUpdate(envelope json.RawMessage, target UpdateTarget) (card
 	if err != nil {
 		return cardmsg.FrameCatalogMarkers{}, fmt.Errorf("%w: %v", ErrUpdateInvalid, err)
 	}
+	// An *empty* target Space never reaches here: validateUpdateTarget rejects
+	// one at the entry to both ReplaceView and Append, so by this point the
+	// caller has established a Space and a mismatch really is a mismatch. That
+	// is worth stating, because the neighbouring guards in bot_api and
+	// modules/message had to grow an explicit "unknown is not empty" state and
+	// this one looks like it is missing the same treatment. It is not — the
+	// distinction is enforced one layer up, and the click ingress refuses to
+	// create an event at all when the card's origin Space cannot be read.
 	if markers.HasProvenance && markers.Provenance.SpaceID != "" &&
 		markers.Provenance.SpaceID != target.Target.SpaceID {
 		return cardmsg.FrameCatalogMarkers{}, fmt.Errorf("%w: stored provenance space %q does not match target space %q",

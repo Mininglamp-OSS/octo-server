@@ -83,7 +83,7 @@ const notifyCatalogCallTimeout = 10 * time.Second
 // buildDocsFallbackText 会先调本函数,让 fallback 文本走 pilot Template 的 L0
 // 定义。Registry 未注入 / Template 未注册 / mapping/unmarshal 失败 → 返 ok=false,
 // caller 兜回 legacy 多行组装。
-func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
+func templateFallbackText(card *DocsCardFields, lang, spaceID string) (string, bool) {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return "", false
@@ -95,7 +95,7 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 	ctx, cancel := boundedNotifyCatalogContext(context.Background())
 	defer cancel()
 	text, err := catalog.FallbackText(ctx, cardtmpl.CatalogFallbackRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""),
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
 		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending,
 		Fields: fields, Lang: lang,
 	})

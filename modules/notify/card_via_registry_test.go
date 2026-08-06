@@ -165,7 +165,7 @@ func TestNotifyCatalogOperationsUseBoundedContexts(t *testing.T) {
 	if err := preflightDocsAccessRequestSchema(parent, "space-preflight", card); err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	if _, ok := templateFallbackText(card, "zh-CN"); !ok {
+	if _, ok := templateFallbackText(card, "zh-CN", ""); !ok {
 		t.Fatal("template fallback was unavailable")
 	}
 	n := newTestNotify(ctx, nil, nil, nil, "tk")

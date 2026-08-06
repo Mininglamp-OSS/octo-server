@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -221,19 +222,30 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
-	cardSpaceID := m.resolveCardOriginSpaceID(msgM)
+	cardSpaceID, cardSpaceKnown := m.resolveCardOriginSpaceID(msgM)
 	// PR-C D3：principal 从生效帧的 stored provenance 恢复并校验（sender/
 	// producer 绑定/Space 一致性都在 resolveRegistryCardContext 内 fail-close）；
 	// 无标记的 legacy 帧沿用 sender 派生的 bot principal（static 兼容）。
 	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardActionFrameOrigin{
-		SenderUID: msgM.FromUID,
-		SpaceID:   cardSpaceID,
+		SenderUID:  msgM.FromUID,
+		SpaceID:    cardSpaceID,
+		SpaceKnown: cardSpaceKnown,
 		ProducerBinding: func(producerID string) (string, bool) {
 			return carddispatch.ProducerBindingFromContext(m.ctx, carddispatch.ProducerID(producerID))
 		},
 	}, effective, req.ActionID, actionData)
 	if err != nil {
 		m.releaseCardClaim(idemKey)
+		if errors.Is(err, errCardOriginSpaceUnavailable) {
+			// The click is well formed and the frame may be perfectly valid; we
+			// simply could not read the card's Space to check it against. That
+			// is an outage on our side, and answering 400 would both mislead
+			// the operator and tell the client not to retry.
+			m.Error("卡片来源 Space 不可用,无法校验 stored provenance",
+				zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
 		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
 			zap.Error(err), zap.String("messageID", req.MessageID), zap.String("actionID", req.ActionID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
@@ -310,8 +322,13 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 // authoritative origin Space, and the read-only producer-binding resolver.
 // None of these values comes from the click request.
 type cardActionFrameOrigin struct {
-	SenderUID       string
-	SpaceID         string
+	SenderUID string
+	SpaceID   string
+	// SpaceKnown reports that SpaceID is a determined fact. False means the
+	// origin lookup did not answer, which is not the same as "this card is in
+	// no Space" — see resolveCardOriginSpaceID. A frame's provenance can only
+	// be validated against a Space that was actually established.
+	SpaceKnown      bool
 	ProducerBinding func(producerID string) (senderUID string, ok bool)
 }
 
@@ -424,14 +441,35 @@ func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.Ca
 	default:
 		return cardtmpl.CatalogPrincipal{}, errors.New("message: unsupported stored principal kind")
 	}
-	if principal.SpaceID != "" && origin.SpaceID != "" && principal.SpaceID != origin.SpaceID {
-		return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
+	// A frame that names a Space is only trustworthy once that claim has been
+	// checked against the server's own answer. Skipping the check when the
+	// origin could not be determined would leave principal.SpaceID set to
+	// whatever the frame said, and that value becomes the grant scope for the
+	// action_context authorization — so a frame that reached storage without
+	// passing a trusted boundary could name any Space it liked. The bot branch
+	// above pins the principal *id* to the stored sender; nothing pins the
+	// Space but this.
+	if principal.SpaceID != "" {
+		if !origin.SpaceKnown {
+			return cardtmpl.CatalogPrincipal{}, fmt.Errorf(
+				"%w: card origin space is unavailable, cannot verify stored provenance space",
+				errCardOriginSpaceUnavailable)
+		}
+		if principal.SpaceID != origin.SpaceID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
+		}
 	}
 	if principal.SpaceID == "" {
 		principal.SpaceID = origin.SpaceID
 	}
 	return principal, nil
 }
+
+// errCardOriginSpaceUnavailable separates "the card's Space could not be read
+// right now" from "this click is malformed". Both refuse the action, but only
+// the first is worth retrying, and reporting it as a client error would tell an
+// operator to go looking at the payload instead of at the group table.
+var errCardOriginSpaceUnavailable = errors.New("message: card origin space unavailable")
 
 var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")
 
@@ -585,14 +623,23 @@ func (m *Message) authorizeCardChannelMember(c *wkhttp.Context, loginUID, messag
 //
 // 任一步取不到 → 返回 ""(fail-closed:调用方省略 event_data.space_id,与 send 路径
 // 无权威值时 strip 客户端 space 的行为对齐;绝不回退到客户端可影响的上下文 Space)。
-func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) string {
+//
+// The second return value separates two outcomes that used to share one empty
+// string. `known=true, spaceID=""` is a determined fact — a DM outside any
+// Space. `known=false` means the lookup itself did not answer: a group row that
+// could not be read, a malformed thread channel, an unparseable payload. The
+// distinction is load-bearing downstream: a frame's provenance can only be
+// checked against an origin Space that was actually established, and treating
+// "could not determine" as "there is none" both skips that check and turns
+// transient outages into permanent-looking rejections.
+func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) (string, bool) {
 	switch msgM.ChannelType {
 	case common.ChannelTypeGroup.Uint8():
 		return m.groupSpaceIDOrEmpty(msgM.ChannelID)
 	case common.ChannelTypeCommunityTopic.Uint8():
 		parent, err := m.resolveParentGroupNo(msgM.ChannelID)
 		if err != nil || parent == "" {
-			return ""
+			return "", false
 		}
 		return m.groupSpaceIDOrEmpty(parent)
 	case common.ChannelTypePerson.Uint8():
@@ -600,21 +647,24 @@ func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) string {
 			SpaceID string `json:"space_id"`
 		}
 		if err := json.Unmarshal(msgM.Payload, &env); err != nil {
-			return ""
+			return "", false
 		}
-		return env.SpaceID
+		// A DM payload legitimately carries no Space when the sender had none
+		// to stamp, so an absent value here is an answer rather than a failure.
+		return env.SpaceID, true
 	default:
-		return ""
+		return "", false
 	}
 }
 
-// groupSpaceIDOrEmpty 查群的权威 SpaceID;任何错误 / 空群 / 空 SpaceID → ""。
-func (m *Message) groupSpaceIDOrEmpty(groupNo string) string {
+// groupSpaceIDOrEmpty 查群的权威 SpaceID。查询失败 / 群不存在 → ("", false):
+// 未能判定。群存在但没有 SpaceID → ("", true):判定为「不属于任何 Space」。
+func (m *Message) groupSpaceIDOrEmpty(groupNo string) (string, bool) {
 	g, err := m.groupService.GetGroupWithGroupNo(groupNo)
 	if err != nil || g == nil {
-		return ""
+		return "", false
 	}
-	return g.SpaceID
+	return g.SpaceID, true
 }
 
 // cardCanonicalVisibleToViewer 复刻单条读 respondSingleMessage 的「内容可见性」层

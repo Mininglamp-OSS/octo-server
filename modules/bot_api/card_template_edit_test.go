@@ -80,7 +80,7 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	}
 	if err := requireEffectiveCardTemplate([]byte(request.ContentEdit), botTemplateRef{
 		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion,
-	}, "bot-template", ""); err != nil {
+	}, "bot-template", verifiableEditSpace("")); err != nil {
 		t.Fatalf("replacement identity: %v", err)
 	}
 }
@@ -123,7 +123,7 @@ func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testin
 			}
 			if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
 				ID: aireasoningprocess.TemplateID, Version: historical.version,
-			}, "bot-template", ""); err != nil {
+			}, "bot-template", verifiableEditSpace("")); err != nil {
 				t.Fatalf("historical replacement identity: %v", err)
 			}
 		})

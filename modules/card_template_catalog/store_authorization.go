@@ -138,6 +138,243 @@ func (s *store) LoadAuthorization(
 	return result, nil
 }
 
+// LoadAuthorizations answers the same question as LoadAuthorization for a whole
+// set of templates, from one snapshot and a bounded number of statements.
+//
+// It exists for the capability manifest, which asks about every ID in a static
+// policy list on every poll. One transaction per ID turned a feature-detection
+// read into N round trips, and a deployment whose Bots are user-created —
+// thousands of them — multiplies that into steady primary-DB load for an answer
+// that mostly has not changed.
+//
+// The semantics are LoadAuthorization's, deliberately and exactly: a template
+// with no activation row yields a zero Version (the caller keeps its static
+// behaviour), and a malformed activation or artifact is an error rather than a
+// silent omission. That last part is what separates this from
+// ListAuthorizedTemplates, which skips a broken template because one bad row
+// must not empty an entire listing; here a broken row must fail the manifest
+// closed, exactly as the per-ID loop did.
+func (s *store) LoadAuthorizations(
+	ctx context.Context,
+	ids []cardtmpl.ID,
+	principal cardtmpl.CatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	out := make(map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, len(ids))
+	unique := make([]cardtmpl.ID, 0, len(ids))
+	seen := make(map[cardtmpl.ID]struct{}, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(string(id)) == "" {
+			return nil, fmt.Errorf("%w: authorization query has no template", cardtmpl.ErrTemplateUnknown)
+		}
+		if _, done := seen[id]; done {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return out, nil
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("card template catalog: begin batch authorization: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	pointers, err := scanActivationPointers(ctx, tx, unique)
+	if err != nil {
+		return nil, err
+	}
+	grants, err := scanScopedGrantDecisions(ctx, tx, unique, principal)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range unique {
+		result := cardtmpl.RuntimeAuthorization{Grant: grants[id]}
+		if pointer, ok := pointers[id]; ok {
+			version, err := cardtmpl.ActivationVersion(id, pointer.activation)
+			if err != nil {
+				return nil, err
+			}
+			result.Activation, result.Version = pointer.activation, version
+			if version != "" {
+				if version != pointer.version {
+					// The pointer moved between the two halves of one snapshot,
+					// which cannot happen inside REPEATABLE READ. Refuse rather
+					// than serve an artifact from a version nobody pointed at.
+					return nil, fmt.Errorf("%w: activation pointer disagrees with its joined artifact",
+						cardtmpl.ErrRuntimeCatalogIntegrity)
+				}
+				meta, err := buildRuntimeArtifactMeta(id, version, pointer.source, pointer.columns, pointer.blocked)
+				if err != nil {
+					return nil, err
+				}
+				result.Artifact = meta
+			}
+		}
+		out[id] = result
+	}
+	// Commit for the same reason the single read does: a connection-level
+	// failure must surface as an error, not as a truncated read that reads like
+	// a denial.
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("card template catalog: commit batch authorization: %w", err)
+	}
+	return out, nil
+}
+
+// activationPointer is one template's activation row joined to the artifact it
+// points at, as the batch read returns them together.
+type activationPointer struct {
+	activation cardtmpl.RuntimeActivation
+	version    string
+	source     string
+	columns    artifactMetaColumns
+	blocked    bool
+}
+
+// selectActivationPointersSQL is the batch form of the activation + artifact
+// reads. The join is LEFT so a disabled pointer (NULL active_version) still
+// produces its activation row: the caller has to distinguish "disabled" from
+// "no activation row at all", and an inner join would erase that difference.
+const selectActivationPointersSQL = `SELECT act.template_id, act.active_version, act.status, act.revision,
+        c.source, a.owner, a.visibility, a.engine_contract, a.protocol,
+        a.contract_version, a.content_sha256, a.blocked_at IS NOT NULL
+    FROM card_template_activation act
+    LEFT JOIN card_template_version_claim c
+      ON c.template_id = act.template_id AND c.version = act.active_version
+    LEFT JOIN card_template_artifact a
+      ON a.template_id = c.template_id AND a.version = c.version
+    WHERE act.template_id IN (`
+
+func scanActivationPointers(
+	ctx context.Context,
+	tx *sql.Tx,
+	ids []cardtmpl.ID,
+) (map[cardtmpl.ID]activationPointer, error) {
+	query, args := inListQuery(selectActivationPointersSQL, ids)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("card template catalog: load activation pointers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[cardtmpl.ID]activationPointer, len(ids))
+	for rows.Next() {
+		var templateID, status string
+		var activeVersion, source sql.NullString
+		var revision uint64
+		var columns artifactMetaColumns
+		var blocked bool
+		if err := rows.Scan(&templateID, &activeVersion, &status, &revision, &source,
+			&columns.owner, &columns.visibility, &columns.engine, &columns.protocol,
+			&columns.contractVersion, &columns.hash, &blocked); err != nil {
+			return nil, fmt.Errorf("card template catalog: scan activation pointer: %w", err)
+		}
+		activation, err := buildRuntimeActivation(activeVersion, status, revision)
+		if err != nil {
+			return nil, err
+		}
+		if activeVersion.Valid && activeVersion.String != "" && !source.Valid {
+			// An active pointer whose claim row is missing is the integrity
+			// failure scanRuntimeArtifactMeta reports as an unknown template.
+			return nil, fmt.Errorf("%w: %s@%s", cardtmpl.ErrTemplateUnknown, templateID, activeVersion.String)
+		}
+		out[cardtmpl.ID(templateID)] = activationPointer{
+			activation: activation, version: activeVersion.String,
+			source: source.String, columns: columns, blocked: blocked,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("card template catalog: iterate activation pointers: %w", err)
+	}
+	return out, nil
+}
+
+// selectScopedGrantsSQL is loadGrantDecision's query widened to a set of
+// templates. It keeps both candidate scopes per template for the same reason
+// the single-template form does: an exact tombstone has to be able to shadow an
+// active global grant, and a "first match wins" query cannot express that.
+const selectScopedGrantsSQL = `SELECT template_id, scope_space_id, status,
+        can_discover, can_send, can_edit, revision
+    FROM card_template_grant
+    WHERE principal_type = ? AND principal_id = ? AND scope_space_id IN (?, '')
+      AND template_id IN (`
+
+func scanScopedGrantDecisions(
+	ctx context.Context,
+	tx *sql.Tx,
+	ids []cardtmpl.ID,
+	principal cardtmpl.CatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeGrant, error) {
+	out := make(map[cardtmpl.ID]cardtmpl.RuntimeGrant, len(ids))
+	principalType, principalID, grantable := grantPrincipal(principal)
+	if !grantable {
+		return out, nil
+	}
+	scope := strings.TrimSpace(principal.SpaceID)
+	query, idArgs := inListQuery(selectScopedGrantsSQL, ids)
+	args := append([]any{string(principalType), principalID, scope}, idArgs...)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("card template catalog: load batch authorization grants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	exact := make(map[cardtmpl.ID]GrantRecord, len(ids))
+	global := make(map[cardtmpl.ID]GrantRecord, len(ids))
+	for rows.Next() {
+		var templateID string
+		var record GrantRecord
+		var status string
+		if err := rows.Scan(&templateID, &record.Identity.ScopeSpaceID, &status,
+			&record.Permissions.Discover, &record.Permissions.Send, &record.Permissions.Edit,
+			&record.Revision); err != nil {
+			return nil, fmt.Errorf("card template catalog: scan batch authorization grant: %w", err)
+		}
+		record.Status = GrantStatus(status)
+		if record.Status != GrantStatusActive && record.Status != GrantStatusRevoked {
+			return nil, fmt.Errorf("%w: invalid grant status %q", ErrCatalogIntegrity, status)
+		}
+		id := cardtmpl.ID(templateID)
+		record.Identity.TemplateID = id
+		record.Identity.PrincipalType, record.Identity.PrincipalID = principalType, principalID
+		if record.Identity.ScopeSpaceID == "" {
+			global[id] = record
+			continue
+		}
+		if record.Identity.ScopeSpaceID != scope {
+			return nil, fmt.Errorf("%w: grant scope %q is outside the query",
+				ErrCatalogIntegrity, record.Identity.ScopeSpaceID)
+		}
+		exact[id] = record
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("card template catalog: iterate batch authorization grants: %w", err)
+	}
+	for _, id := range ids {
+		var exactRow, globalRow *GrantRecord
+		if record, ok := exact[id]; ok {
+			exactRow = &record
+		}
+		if record, ok := global[id]; ok {
+			globalRow = &record
+		}
+		out[id] = runtimeGrantFromDecision(resolveGrantRows(exactRow, globalRow))
+	}
+	return out, nil
+}
+
+// inListQuery closes an `... IN (` prefix with one placeholder per id.
+func inListQuery(prefix string, ids []cardtmpl.ID) (string, []any) {
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, string(id))
+	}
+	return prefix + strings.Join(placeholders, ",") + ")", args
+}
+
 // loadGrantDecision reads both candidate rows and reduces them through the one
 // precedence implementation shared with the manager control plane.
 func loadGrantDecision(
@@ -254,16 +491,28 @@ func (s *store) ListAuthorizedTemplates(
 	if err != nil {
 		return nil, err
 	}
-	results := make([]cardtmpl.RuntimeAdvertisedTemplate, 0, len(decisions))
+	grants := make(map[cardtmpl.ID]cardtmpl.RuntimeGrant, len(decisions))
+	candidates := make([]cardtmpl.ID, 0, len(decisions))
 	for _, id := range sortedTemplateIDs(decisions) {
 		grant := runtimeGrantFromDecision(decisions[id])
 		if !grant.Discover && !grant.Send && !grant.Edit {
 			continue
 		}
-		authorization, ok, err := loadActiveAuthorization(ctx, tx, id, grant)
-		if err != nil {
-			return nil, err
-		}
+		grants[id] = grant
+		candidates = append(candidates, id)
+	}
+	// One statement for every candidate rather than two per candidate. The old
+	// loop held this REPEATABLE READ snapshot open across up to 129 round trips
+	// to assemble a manifest that a Bot polls for feature detection; with a
+	// fleet of Bots that is steady primary-DB load for an answer the fleet
+	// mostly already knows.
+	active, err := loadAdvertisableAuthorizations(ctx, tx, candidates, grants)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]cardtmpl.RuntimeAdvertisedTemplate, 0, len(candidates))
+	for _, id := range candidates {
+		authorization, ok := active[id]
 		if !ok {
 			continue
 		}
@@ -278,36 +527,87 @@ func (s *store) ListAuthorizedTemplates(
 	return results, nil
 }
 
-// loadActiveAuthorization completes one listed template's snapshot. A pointer
-// that is absent, disabled or malformed yields ok=false: the template simply is
-// not advertisable right now, which is different from an error.
-func loadActiveAuthorization(
+// selectActiveAuthorizationsSQL resolves the active pointer and its artifact
+// for a bounded set of template IDs in one pass. The inner join on
+// active_version does the same filtering the per-template loop did by
+// discarding absent and disabled pointers: a disabled row has a NULL
+// active_version and joins to nothing, and a template with no activation row
+// simply does not appear.
+const selectActiveAuthorizationsSQL = `SELECT act.template_id, act.active_version, act.status, act.revision,
+        c.source, a.owner, a.visibility, a.engine_contract, a.protocol,
+        a.contract_version, a.content_sha256, a.blocked_at IS NOT NULL
+    FROM card_template_activation act
+    JOIN card_template_version_claim c
+      ON c.template_id = act.template_id AND c.version = act.active_version
+    LEFT JOIN card_template_artifact a
+      ON a.template_id = c.template_id AND a.version = c.version
+    WHERE act.template_id IN (`
+
+// loadActiveAuthorizations completes the snapshot for every candidate at once.
+// A pointer or artifact that is absent, disabled or malformed is omitted rather
+// than reported: the template simply is not advertisable right now, which is a
+// different thing from the read having failed. That is the same rule the
+// single-template path applies, so the two cannot drift.
+func loadAdvertisableAuthorizations(
 	ctx context.Context,
 	tx *sql.Tx,
-	id cardtmpl.ID,
-	grant cardtmpl.RuntimeGrant,
-) (cardtmpl.RuntimeAuthorization, bool, error) {
-	activation, err := scanRuntimeActivation(ctx, tx, id)
+	ids []cardtmpl.ID,
+	grants map[cardtmpl.ID]cardtmpl.RuntimeGrant,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	out := make(map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	args := make([]any, 0, len(ids))
+	placeholders := make([]string, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, string(id))
+	}
+	rows, err := tx.QueryContext(ctx, selectActiveAuthorizationsSQL+strings.Join(placeholders, ",")+")", args...)
 	if err != nil {
-		if errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
-			return cardtmpl.RuntimeAuthorization{}, false, nil
+		return nil, fmt.Errorf("card template catalog: load active authorizations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var templateID, status string
+		var version sql.NullString
+		var revision uint64
+		var source string
+		var columns artifactMetaColumns
+		var blocked bool
+		if err := rows.Scan(&templateID, &version, &status, &revision, &source,
+			&columns.owner, &columns.visibility, &columns.engine, &columns.protocol,
+			&columns.contractVersion, &columns.hash, &blocked); err != nil {
+			return nil, fmt.Errorf("card template catalog: scan active authorization: %w", err)
 		}
-		return cardtmpl.RuntimeAuthorization{}, false, err
-	}
-	version, err := cardtmpl.ActivationVersion(id, activation)
-	if err != nil || version == "" {
-		return cardtmpl.RuntimeAuthorization{}, false, nil
-	}
-	meta, err := scanRuntimeArtifactMeta(ctx, tx, id, version)
-	if err != nil {
-		if errors.Is(err, cardtmpl.ErrTemplateUnknown) || errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
-			return cardtmpl.RuntimeAuthorization{}, false, nil
+		id := cardtmpl.ID(templateID)
+		activation, err := buildRuntimeActivation(version, status, revision)
+		if err != nil {
+			if errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
+				continue
+			}
+			return nil, err
 		}
-		return cardtmpl.RuntimeAuthorization{}, false, err
+		activeVersion, err := cardtmpl.ActivationVersion(id, activation)
+		if err != nil || activeVersion == "" {
+			continue
+		}
+		meta, err := buildRuntimeArtifactMeta(id, activeVersion, source, columns, blocked)
+		if err != nil {
+			if errors.Is(err, cardtmpl.ErrTemplateUnknown) || errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
+				continue
+			}
+			return nil, err
+		}
+		out[id] = cardtmpl.RuntimeAuthorization{
+			Activation: activation, Version: activeVersion, Artifact: meta, Grant: grants[id],
+		}
 	}
-	return cardtmpl.RuntimeAuthorization{
-		Activation: activation, Version: version, Artifact: meta, Grant: grant,
-	}, true, nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("card template catalog: iterate active authorizations: %w", err)
+	}
+	return out, nil
 }
 
 func scanPrincipalGrants(

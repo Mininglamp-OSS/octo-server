@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"go.uber.org/zap"
 )
 
 const (
@@ -175,6 +177,16 @@ func (s *store) StaticDiscoverGrants(
 		return granted, nil
 	}
 	if len(ids) > maxStaticGrantProbe {
+		// Dropping the tail is safe — a missing grant can only hide a template,
+		// never reveal one — but it is not silent. Without this an operator who
+		// granted a Space access to the 129th private static template would see
+		// the grant land in the table, take effect nowhere, and have nothing
+		// anywhere telling them why.
+		log.Warn("static discover grant probe truncated",
+			zap.Bool("static_grant_probe_truncated", true),
+			zap.String("space_id", space),
+			zap.Int("requested", len(ids)),
+			zap.Int("probed", maxStaticGrantProbe))
 		ids = ids[:maxStaticGrantProbe]
 	}
 	args := make([]any, 0, len(ids)+1)

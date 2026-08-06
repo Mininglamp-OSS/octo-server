@@ -1230,7 +1230,17 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 	// the guard below and the re-stamped marker are both comparing like with
 	// like (see requireEffectiveCardTemplate).
 	editPrincipal := ba.botSendCatalogPrincipal(c, robotID, req.ChannelID, req.ChannelType)
-	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID, editPrincipal.SpaceID); err != nil {
+	spaceCheck := editProvenanceSpaceCheck(ba.cardTemplates.dynamicCatalogEnabled(), editPrincipal)
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID, spaceCheck); err != nil {
+		if errors.Is(err, errBotTemplateRuntimeUnavailable) {
+			// The frame may be entirely valid; we could not read the Space to
+			// check it. Answering 400 would tell the Bot its request is
+			// malformed and not to retry, which is the opposite of the truth.
+			ba.Error("Bot Registry edit 无法解析目标 Space", zap.Error(err),
+				zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
 		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return

@@ -617,7 +617,7 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 	// the guard passes even though the envelope carries no space_id.
 	editPrincipal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
 	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
-	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", editPrincipal.SpaceID); err != nil {
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", editProvenanceSpaceCheck(true, editPrincipal)); err != nil {
 		t.Fatalf("group card was refused by its own edit guard: %v", err)
 	}
 
@@ -640,7 +640,7 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 	}
 
 	// A frame replayed against a target in another Space is still refused.
-	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", "space-elsewhere"); err == nil {
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", verifiableEditSpace("space-elsewhere")); err == nil {
 		t.Fatal("a frame moved to another Space was accepted")
 	}
 }
@@ -713,5 +713,193 @@ func TestDMPeerCheckIsSkippedWhenTheCatalogIsDark(t *testing.T) {
 	}
 	if len(querier.calls) != 0 {
 		t.Fatalf("dark catalog queried %v", querier.calls)
+	}
+}
+
+// The Space guard has to tell "we know of no Space" apart from "we could not
+// find out". Conflating them is what made every group card permanently
+// uneditable the first time; this covers the general form rather than the one
+// path that was reported.
+func TestEditSpaceCheckSeparatesUnknownFromEmpty(t *testing.T) {
+	resolved := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-a", SpaceResolved: true}
+	unresolved := botCatalogPrincipal{BotID: "bot-1"}
+
+	if got := editProvenanceSpaceCheck(true, resolved); !got.verifiable || got.unavailable ||
+		got.spaceID != "space-a" {
+		t.Fatalf("a resolved Space produced %+v", got)
+	}
+	if got := editProvenanceSpaceCheck(true, unresolved); got.verifiable || !got.unavailable {
+		t.Fatalf("an unresolvable Space under a live gate produced %+v", got)
+	}
+	// The gate being closed is a configuration state, not an outage: nothing
+	// ever asked for a Space, so there is nothing to be unavailable.
+	if got := editProvenanceSpaceCheck(false, unresolved); got.verifiable || got.unavailable {
+		t.Fatalf("a dark catalog produced %+v", got)
+	}
+	if got := editProvenanceSpaceCheck(false, resolved); got.verifiable || got.unavailable {
+		t.Fatalf("a dark catalog with a stale principal produced %+v", got)
+	}
+}
+
+// The regression this closes: a group card sent while the dynamic catalog was
+// live records the group's Space, and rolling the gate back must not make that
+// card uneditable forever. A transient lookup failure must not make it
+// uneditable either — but it must not silently pass the check, so it reports a
+// retryable outage instead of a permanent client error.
+func TestGroupCardStaysEditableAcrossAGateRollback(t *testing.T) {
+	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
+		multiRows:   map[string][]string{"bot-42": {"space-bot"}},
+		groupSpaces: map[string]string{"group-1": "space-group"},
+	}, &stubAuthorizationSource{newSend: true})
+	ctx := newGrantSpaceContext(t, "")
+	catalog := ba.cardTemplates
+
+	principal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
+	if !principal.SpaceResolved || principal.SpaceID != "space-group" {
+		t.Fatalf("send principal = %+v", principal)
+	}
+	sent, err := catalog.RenderPayloadForPrincipal(context.Background(), principal,
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any),
+		cardtmpl.BuildEnv{Lang: "zh-CN"})
+	if err != nil {
+		t.Fatalf("group send: %v", err)
+	}
+	envelope, err := json.Marshal(sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+
+	// The gate rolls back. The card still names space-group, and the edit path
+	// can no longer resolve any Space at all.
+	dark := editProvenanceSpaceCheck(false, botCatalogPrincipal{BotID: "bot-42"})
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", dark); err != nil {
+		t.Fatalf("a gate rollback made an existing group card uneditable: %v", err)
+	}
+
+	// The gate is live but the group row will not load. That is an outage, and
+	// it must be reported as one — never as "your request is malformed".
+	blind := editProvenanceSpaceCheck(true, botCatalogPrincipal{BotID: "bot-42"})
+	err = requireEffectiveCardTemplate(envelope, ref, "bot-42", blind)
+	if !errors.Is(err, errBotTemplateRuntimeUnavailable) {
+		t.Fatalf("an unresolvable Space error = %v, want errBotTemplateRuntimeUnavailable", err)
+	}
+	// And it is still not an invalid-request error, which is what the handler
+	// branches on to decide between 500 and 400.
+	if errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatal("an outage was also classified as a client error")
+	}
+
+	// A genuinely different Space is still refused, permanently.
+	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42",
+		verifiableEditSpace("space-elsewhere")); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("cross-Space edit error = %v, want errBotTemplateRequestInvalid", err)
+	}
+}
+
+// batchAuthorizationSource is stubAuthorizationSource plus the optional batch
+// interface, so the manifest takes the fast path. It answers from the same map,
+// which is the point: the two paths must not be able to disagree.
+type batchAuthorizationSource struct {
+	stubAuthorizationSource
+	batches    int
+	batchErr   error
+	batchedIDs [][]cardtmpl.ID
+}
+
+func (s *batchAuthorizationSource) LoadAuthorizations(
+	_ context.Context, ids []cardtmpl.ID, _ cardtmpl.CatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	s.batches++
+	s.batchedIDs = append(s.batchedIDs, append([]cardtmpl.ID(nil), ids...))
+	if s.batchErr != nil {
+		return nil, s.batchErr
+	}
+	out := make(map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, len(ids))
+	for _, id := range ids {
+		out[id] = s.auth[id]
+	}
+	return out, nil
+}
+
+// The manifest resolves the whole static policy list in one round trip, and
+// reaches the same conclusion it reached one query at a time. The second half
+// is what matters: a batch that saved round trips by dropping the "activated
+// but ungranted" row would silently re-advertise the static version of a
+// template an operator had already moved to a dynamic one.
+func TestAdvertisedSendRefsBatchesAndAgreesWithThePerIDPath(t *testing.T) {
+	authorizations := map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+		// Activated dynamically, but this Bot holds no grant: the ID becomes
+		// unsendable and must NOT fall back to its static version.
+		aireasoningprocess.TemplateID: {
+			Version: "0.4.0-dyn",
+			Artifact: cardtmpl.RuntimeArtifactMeta{
+				ID: aireasoningprocess.TemplateID, Version: "0.4.0-dyn",
+				Source: cardtmpl.RuntimeSourceDynamic,
+			},
+		},
+	}
+	batched := &batchAuthorizationSource{
+		stubAuthorizationSource: stubAuthorizationSource{newSend: true, auth: authorizations},
+	}
+	perID := &stubAuthorizationSource{newSend: true, auth: authorizations}
+
+	principal := botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true}
+	batchedCatalog := newMustTestCatalog(t)
+	batchedCatalog.authorization = batched
+	perIDCatalog := newMustTestCatalog(t)
+	perIDCatalog.authorization = perID
+
+	fromBatch, err := batchedCatalog.advertisedSendRefs(context.Background(), principal)
+	if err != nil {
+		t.Fatalf("batched advertisedSendRefs: %v", err)
+	}
+	fromLoop, err := perIDCatalog.advertisedSendRefs(context.Background(), principal)
+	if err != nil {
+		t.Fatalf("per-ID advertisedSendRefs: %v", err)
+	}
+	if len(fromBatch) != len(fromLoop) {
+		t.Fatalf("batched = %+v, per-ID = %+v", fromBatch, fromLoop)
+	}
+	for i := range fromBatch {
+		if fromBatch[i] != fromLoop[i] {
+			t.Fatalf("batched = %+v, per-ID = %+v", fromBatch, fromLoop)
+		}
+	}
+	for _, ref := range fromBatch {
+		if ref.ID == aireasoningprocess.TemplateID {
+			t.Fatalf("an activated-but-ungranted template was still advertised: %+v", ref)
+		}
+	}
+
+	// One batch, and no per-ID reads left over for the policy list.
+	if batched.batches != 1 {
+		t.Fatalf("batch calls = %d, want exactly one", batched.batches)
+	}
+	if batched.loads != 0 {
+		t.Fatalf("the batched source still issued %d per-ID reads", batched.loads)
+	}
+	if len(batched.batchedIDs) != 1 || len(batched.batchedIDs[0]) != len(perIDCatalog.staticSendIDs) {
+		t.Fatalf("batched IDs = %+v, want the whole policy list", batched.batchedIDs)
+	}
+	if perID.loads != len(perIDCatalog.staticSendIDs) {
+		t.Fatalf("per-ID reads = %d, want one per policy ID", perID.loads)
+	}
+}
+
+// A batch read that fails is an outage, and the manifest must fail closed
+// rather than quietly degrading to the static answer — advertising a version
+// that may have been shadowed is exactly the D6 row this whole path exists for.
+func TestAdvertisedSendRefsFailsClosedWhenTheBatchReadFails(t *testing.T) {
+	batched := &batchAuthorizationSource{
+		stubAuthorizationSource: stubAuthorizationSource{newSend: true},
+		batchErr:                errors.New("db unavailable"),
+	}
+	catalog := newMustTestCatalog(t)
+	catalog.authorization = batched
+	_, err := catalog.advertisedSendRefs(context.Background(),
+		botCatalogPrincipal{BotID: "bot-1", SpaceID: "space-1", SpaceResolved: true})
+	if !errors.Is(err, errBotTemplateRuntimeUnavailable) {
+		t.Fatalf("err = %v, want errBotTemplateRuntimeUnavailable", err)
 	}
 }

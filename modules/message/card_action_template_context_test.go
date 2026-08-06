@@ -42,7 +42,7 @@ func TestResolveRegistryCardContextUsesEffectiveMetadataAndReport(t *testing.T) 
 	if !ok {
 		t.Fatal("approve action not found in rendered card")
 	}
-	origin := cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1"}
+	origin := cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true}
 	got, err := resolveRegistryCardContext(context.Background(), origin, raw, cardtmpl.DocsApproveActionID, actionData)
 	if err != nil {
 		t.Fatalf("resolveRegistryCardContext: %v", err)
@@ -110,7 +110,7 @@ func TestResolveRegistryCardContextRejectsV3LegacyControlIDs(t *testing.T) {
 	cardtmpl.SetDefaultCatalog(static)
 	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(previousCatalog) })
 
-	origin := cardActionFrameOrigin{SenderUID: "bot-reasoning", SpaceID: "space-1"}
+	origin := cardActionFrameOrigin{SenderUID: "bot-reasoning", SpaceID: "space-1", SpaceKnown: true}
 	for _, tc := range []struct {
 		state    cardtmpl.State
 		actionID string
@@ -213,7 +213,7 @@ func TestResolveRegistryCardContextUsesStoredProvenancePrincipal(t *testing.T) {
 		"principal_id": "docs-notify", "space_id": "space-1",
 	})
 	origin := cardActionFrameOrigin{
-		SenderUID: "notification", SpaceID: "space-1",
+		SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true,
 		ProducerBinding: func(producerID string) (string, bool) {
 			if producerID == "docs-notify" {
 				return "notification", true
@@ -262,7 +262,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "internal_producer",
 				"principal_id": "docs-notify", "space_id": "space-1",
 			},
-			origin: cardActionFrameOrigin{SenderUID: "other-bot", SpaceID: "space-1", ProducerBinding: binding},
+			origin: cardActionFrameOrigin{SenderUID: "other-bot", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding},
 		},
 		{
 			name: "unregistered producer",
@@ -270,7 +270,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "internal_producer",
 				"principal_id": "rogue-producer", "space_id": "space-1",
 			},
-			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", ProducerBinding: binding},
+			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding},
 		},
 		{
 			name: "bot provenance names a different bot",
@@ -278,7 +278,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "bot",
 				"principal_id": "bot-a", "space_id": "space-1",
 			},
-			origin: cardActionFrameOrigin{SenderUID: "bot-b", SpaceID: "space-1", ProducerBinding: binding},
+			origin: cardActionFrameOrigin{SenderUID: "bot-b", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding},
 		},
 		{
 			name: "cross-space provenance",
@@ -286,7 +286,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "internal_producer",
 				"principal_id": "docs-notify", "space_id": "space-2",
 			},
-			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", ProducerBinding: binding},
+			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding},
 		},
 		{
 			name: "malformed provenance",
@@ -294,7 +294,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "internal_producer",
 				"principal_id": "docs-notify", "space_id": "space-1", "extra": true,
 			},
-			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", ProducerBinding: binding},
+			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true, ProducerBinding: binding},
 		},
 		{
 			name: "no binding resolver fails closed",
@@ -302,7 +302,7 @@ func TestResolveRegistryCardContextRejectsInconsistentProvenance(t *testing.T) {
 				"version": 1, "principal_type": "internal_producer",
 				"principal_id": "docs-notify", "space_id": "space-1",
 			},
-			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1"},
+			origin: cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true},
 		},
 	}
 	for _, tc := range cases {
@@ -320,7 +320,7 @@ func TestResolveRegistryCardContextBotProvenanceMatchesSender(t *testing.T) {
 	raw, actionData := markedActionFrame(t, registry, map[string]interface{}{
 		"version": 1, "principal_type": "bot", "principal_id": "bot-a", "space_id": "space-1",
 	})
-	origin := cardActionFrameOrigin{SenderUID: "bot-a", SpaceID: "space-1"}
+	origin := cardActionFrameOrigin{SenderUID: "bot-a", SpaceID: "space-1", SpaceKnown: true}
 	got, err := resolveRegistryCardContext(context.Background(), origin, raw, cardtmpl.DocsApproveActionID, actionData)
 	if err != nil {
 		t.Fatalf("resolveRegistryCardContext: %v", err)
@@ -334,7 +334,7 @@ func TestResolveRegistryCardContextLegacyFrameKeepsSenderPrincipal(t *testing.T)
 	registry, spy := provenanceActionFixture(t)
 	// Pre-PR-C Bot Registry frame: template_ref only, no provenance.
 	raw, actionData := markedActionFrame(t, registry, nil)
-	origin := cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1"}
+	origin := cardActionFrameOrigin{SenderUID: "notification", SpaceID: "space-1", SpaceKnown: true}
 	got, err := resolveRegistryCardContext(context.Background(), origin, raw, cardtmpl.DocsApproveActionID, actionData)
 	if err != nil {
 		t.Fatalf("resolveRegistryCardContext: %v", err)
@@ -347,5 +347,51 @@ func TestResolveRegistryCardContextLegacyFrameKeepsSenderPrincipal(t *testing.T)
 	}
 	if spy.lastRequest.Access.Principal != wantPrincipal {
 		t.Fatalf("legacy catalog access = %+v, want %+v", spy.lastRequest.Access.Principal, wantPrincipal)
+	}
+}
+
+// A frame that names a Space is only as trustworthy as the check against the
+// server's own answer. When that answer is unavailable the click must be
+// refused — and refused as an outage, because the frame may be perfectly valid
+// and the caller has no way to fix a group-table read from its side.
+func TestValidatedFramePrincipalRefusesAFrameSpaceItCannotCheck(t *testing.T) {
+	registry, _ := provenanceActionFixture(t)
+	raw, actionData := markedActionFrame(t, registry, map[string]interface{}{
+		"version": 1, "principal_type": "internal_producer",
+		"principal_id": "docs-notify", "space_id": "space-1",
+	})
+	binding := func(producerID string) (string, bool) {
+		if producerID == "docs-notify" {
+			return "notification", true
+		}
+		return "", false
+	}
+	blind := cardActionFrameOrigin{
+		SenderUID: "notification", ProducerBinding: binding,
+		// SpaceKnown deliberately false: the group row would not load.
+	}
+	_, err := resolveRegistryCardContext(context.Background(), blind, raw,
+		cardtmpl.DocsApproveActionID, actionData)
+	if !errors.Is(err, errCardOriginSpaceUnavailable) {
+		t.Fatalf("err = %v, want errCardOriginSpaceUnavailable", err)
+	}
+
+	// A determined "this card is in no Space" is a different answer, and a
+	// frame claiming one then genuinely disagrees with the server.
+	determined := cardActionFrameOrigin{
+		SenderUID: "notification", SpaceKnown: true, ProducerBinding: binding,
+	}
+	_, err = resolveRegistryCardContext(context.Background(), determined, raw,
+		cardtmpl.DocsApproveActionID, actionData)
+	if err == nil || errors.Is(err, errCardOriginSpaceUnavailable) {
+		t.Fatalf("err = %v, want a plain mismatch rejection", err)
+	}
+
+	// An unmarked frame carries no Space claim, so an unavailable origin is
+	// nothing to verify and the legacy path stays open.
+	plain, plainData := markedActionFrame(t, registry, nil)
+	if _, err := resolveRegistryCardContext(context.Background(), blind, plain,
+		cardtmpl.DocsApproveActionID, plainData); errors.Is(err, errCardOriginSpaceUnavailable) {
+		t.Fatalf("an unmarked frame was refused for a Space it never claimed: %v", err)
 	}
 }

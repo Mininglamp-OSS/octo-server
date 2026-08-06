@@ -179,11 +179,30 @@ func TestListTemplatesFailsClosedWithoutAStore(t *testing.T) {
 	}
 }
 
+// installEmptyRuntimeCatalog points the process default at a catalog that knows
+// no templates, so every dynamic B2 resolve answers ErrTemplateUnknown. B2 is
+// decided entirely by the runtime catalog now — it deliberately no longer asks
+// the discovery predicate a second time — so a handler test that says anything
+// about B2's answers has to install one.
+func installEmptyRuntimeCatalog(t *testing.T) {
+	t.Helper()
+	registry := cardtmpl.NewRegistry()
+	registry.Freeze()
+	catalog, err := cardtmpl.NewStaticCatalog(registry)
+	if err != nil {
+		t.Fatalf("build empty catalog: %v", err)
+	}
+	previous := cardtmpl.DefaultCatalog()
+	cardtmpl.SetDefaultCatalog(catalog)
+	t.Cleanup(func() { cardtmpl.SetDefaultCatalog(previous) })
+}
+
 // Unknown, invisible and blocked must be wire-identical. If they were not, an
-// authenticated caller could map the private catalog by probing IDs.
+// authenticated caller could map the private catalog by probing IDs. A
+// malformed ref has to land on the same answer too, since a distinguishable
+// parse error would confirm that the rest of the path exists.
 func TestGetTemplateAnswersOneNotFoundForEveryInvisibleReason(t *testing.T) {
-	// The fake's LoadDiscoverable always reports ErrDiscoveryNotVisible, which
-	// is precisely the store's single answer for all three reasons.
+	installEmptyRuntimeCatalog(t)
 	store := &fakeDiscoveryStore{}
 	var bodies []string
 	for _, ref := range []string{

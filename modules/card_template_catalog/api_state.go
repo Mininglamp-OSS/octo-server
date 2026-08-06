@@ -289,6 +289,11 @@ func (a *API) detail(c *wkhttp.Context) {
 			c.Response(response)
 			return
 		}
+		// The matching success observation. Without it the error counter above
+		// is the only sample the detail_grants metric ever takes, so the
+		// error-rate panel it exists to feed reads 100% the moment it has any
+		// data at all — the exact inverse of the blind spot it was added for.
+		a.metrics.observeDB("detail_grants", "ok")
 		response.Grants = make([]grantSummaryResponse, len(grants))
 		for i, record := range grants {
 			response.Grants[i] = grantSummaryResponse{

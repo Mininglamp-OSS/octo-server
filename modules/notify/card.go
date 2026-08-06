@@ -535,7 +535,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 	}
 	fallbackText := ""
 	if !canCard {
-		fallbackText = buildDocsFallbackText(card, lang)
+		fallbackText = buildDocsFallbackText(card, lang, req.SpaceID)
 	}
 
 	type sendResult struct {
@@ -762,9 +762,15 @@ func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (strin
 // pilot Template. Other kinds keep the historical multi-line composition.
 // If Template.FallbackText is unavailable (Registry unwired / mapping fails),
 // fall back to the historical composition so callers never lose the text path.
-func buildDocsFallbackText(card *DocsCardFields, lang string) string {
+// spaceID is the Space the accompanying send is authorized against. It is not
+// decoration: template resolution became Space-aware in Slice 3, so resolving
+// the fallback with an empty Space would authorize a different principal than
+// the send this text belongs to — and the only visible symptom would be a card
+// rendered from the dynamic template whose plain-text twin came from the legacy
+// hardcoded labels.
+func buildDocsFallbackText(card *DocsCardFields, lang, spaceID string) string {
 	if card != nil && card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
-		if text, ok := templateFallbackText(card, lang); ok {
+		if text, ok := templateFallbackText(card, lang, spaceID); ok {
 			return text
 		}
 	}

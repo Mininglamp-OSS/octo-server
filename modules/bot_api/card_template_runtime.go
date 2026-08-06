@@ -294,6 +294,20 @@ func (c *botCardTemplateCatalog) resolveSendRef(
 	principal botCatalogPrincipal,
 	id cardtmpl.ID,
 ) (botTemplateRef, error) {
+	return c.resolveSendRefFrom(ctx, principal, id, nil)
+}
+
+// resolveSendRefFrom is resolveSendRef with an optional pre-resolved snapshot
+// for this principal. The manifest resolves every policy ID in one batch and
+// passes the result here; the send path passes nil and reads the single ID it
+// needs. Both then run the identical decision, so the manifest cannot come to a
+// different conclusion than the send it is advertising.
+func (c *botCardTemplateCatalog) resolveSendRefFrom(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+	id cardtmpl.ID,
+	batch map[cardtmpl.ID]cardtmpl.RuntimeAuthorization,
+) (botTemplateRef, error) {
 	staticRef, hasStatic := c.staticSendVersion(id)
 	source := c.authorizationSource()
 	// Gate closed, no resolver installed, or a Space we could not establish:
@@ -305,19 +319,52 @@ func (c *botCardTemplateCatalog) resolveSendRef(
 		}
 		return botTemplateRef{}, nil
 	}
-	auth, err := source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
-		ID: id, Principal: principal.catalogPrincipal(),
-	})
-	if err != nil {
-		if errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
-			// A disabled pointer is a deliberate operator state rather than an
-			// outage, but the outcome matches the ungranted row: this ID is not
-			// sendable, and it does not revert to its static version.
-			return botTemplateRef{}, nil
+	auth, ok := batch[id]
+	if !ok {
+		var err error
+		auth, err = source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+			ID: id, Principal: principal.catalogPrincipal(),
+		})
+		if err != nil {
+			if errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+				// A disabled pointer is a deliberate operator state rather than
+				// an outage, but the outcome matches the ungranted row: this ID
+				// is not sendable, and it does not revert to its static version.
+				return botTemplateRef{}, nil
+			}
+			return botTemplateRef{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
 		}
-		return botTemplateRef{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
 	}
 	return c.decideSendRef(id, staticRef, hasStatic, auth), nil
+}
+
+// resolveStaticSendAuthorizations pre-resolves every statically advertised ID in
+// one round trip when the store offers a batch read. A nil result is not a
+// failure: the caller falls back to one read per ID, which is what a store
+// without the batch interface gets.
+func (c *botCardTemplateCatalog) resolveStaticSendAuthorizations(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	source := c.authorizationSource()
+	if source == nil || !source.NewSendEnabled() || !principal.SpaceResolved || len(c.staticSendIDs) == 0 {
+		return nil, nil
+	}
+	batch, ok := source.(cardtmpl.RuntimeAuthorizationBatchStore)
+	if !ok {
+		return nil, nil
+	}
+	resolved, err := batch.LoadAuthorizations(ctx, c.staticSendIDs, principal.catalogPrincipal())
+	if err != nil {
+		if errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+			// One disabled pointer among the policy IDs is an operator state,
+			// not an outage. Fall back to the per-ID path so each template gets
+			// its own answer instead of the whole manifest inheriting one.
+			return nil, nil
+		}
+		return nil, errors.Join(errBotTemplateRuntimeUnavailable, err)
+	}
+	return resolved, nil
 }
 
 // decideSendRef is the pure half of the table above, split out so the matrix is
@@ -379,8 +426,12 @@ func (c *botCardTemplateCatalog) advertisedSendRefs(
 	}
 	seen := make(map[cardtmpl.ID]struct{}, len(c.staticSendByID))
 	refs := make([]botTemplateRef, 0, len(c.staticSendByID))
+	staticAuth, err := c.resolveStaticSendAuthorizations(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
 	for _, id := range c.staticSendIDs {
-		ref, err := c.resolveSendRef(ctx, principal, id)
+		ref, err := c.resolveSendRefFrom(ctx, principal, id, staticAuth)
 		if err != nil {
 			return nil, err
 		}

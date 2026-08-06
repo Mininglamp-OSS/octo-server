@@ -299,3 +299,155 @@ func TestRuntimeAuthorizationSourceReadsTheStoreAndTheGateRealMySQL(t *testing.T
 		t.Fatalf("source advertised %+v", advertised)
 	}
 }
+
+// The batch resolver exists only to save round trips, so the property that
+// matters is that it saves nothing else: for every template it must return
+// exactly what the per-ID resolver would have. A divergence here would be
+// invisible — the manifest and the send it advertises would simply disagree,
+// and only for whichever templates happened to differ.
+func TestLoadAuthorizationsAgreesWithThePerTemplateResolverRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	catalogStore := newStore(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	principal := authorizationIntegrationPrincipal()
+
+	// One template of each shape the resolver distinguishes.
+	seedAuthorizationTarget(t, db, "1.0.0") // active pointer, grant added below
+	seedDiscoveryVersion(t, db, "test.batch-no-activation", "1.0.0",
+		cardtmpl.CatalogVisibilityPrivate, false) // claimed, never activated
+	seedDiscoveryVersion(t, db, "test.batch-blocked", "1.0.0",
+		cardtmpl.CatalogVisibilityPublic, true)
+	seedDiscoveryActivation(t, db, "test.batch-blocked", "1.0.0")
+	seedDiscoveryVersion(t, db, "test.batch-ungranted", "1.0.0",
+		cardtmpl.CatalogVisibilityPrivate, false)
+	seedDiscoveryActivation(t, db, "test.batch-ungranted", "1.0.0")
+	if _, err := catalogStore.UpsertGrant(ctx, UpsertGrantRequest{
+		Identity:    authorizationIntegrationIdentity(),
+		Permissions: GrantPermissions{Discover: true, Send: true},
+		ActorUID:    "admin-1", Reason: "pilot", ChangeTicket: "CHG-B1",
+	}); err != nil {
+		t.Fatalf("seed grant: %v", err)
+	}
+
+	ids := []cardtmpl.ID{
+		authorizationIntegrationTemplateID,
+		"test.batch-no-activation",
+		"test.batch-blocked",
+		"test.batch-ungranted",
+		"test.batch-does-not-exist",
+	}
+	batch, err := catalogStore.LoadAuthorizations(ctx, ids, principal)
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	if len(batch) != len(ids) {
+		t.Fatalf("batch answered %d of %d templates", len(batch), len(ids))
+	}
+	for _, id := range ids {
+		single, err := catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+			ID: id, Principal: principal,
+		})
+		if err != nil {
+			t.Fatalf("per-template LoadAuthorization(%s): %v", id, err)
+		}
+		if batch[id] != single {
+			t.Fatalf("%s: batch = %+v, per-template = %+v", id, batch[id], single)
+		}
+	}
+
+	// The interesting rows, spelled out so a future change that makes both
+	// paths wrong in the same way still fails.
+	if got := batch[authorizationIntegrationTemplateID]; got.Version != "1.0.0" || !got.Grant.Send {
+		t.Fatalf("granted active template = %+v", got)
+	}
+	if got := batch["test.batch-no-activation"]; got.Version != "" || got.Grant.Found {
+		t.Fatalf("unactivated template = %+v, want a zero version and no grant", got)
+	}
+	if got := batch["test.batch-blocked"]; got.Version != "1.0.0" || !got.Artifact.Blocked {
+		t.Fatalf("blocked template = %+v", got)
+	}
+	if got := batch["test.batch-ungranted"]; got.Version != "1.0.0" || got.Grant.Found {
+		t.Fatalf("ungranted active template = %+v", got)
+	}
+	if got := batch["test.batch-does-not-exist"]; got.Version != "" || got.Grant.Found {
+		t.Fatalf("unknown template = %+v", got)
+	}
+
+	// A revoke has to move both paths at the same instant.
+	if _, err := catalogStore.RevokeGrant(ctx, RevokeGrantRequest{
+		Identity: authorizationIntegrationIdentity(), ExpectedRevision: 1,
+		ActorUID: "admin-1", Reason: "offboard", ChangeTicket: "CHG-B2",
+	}); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	after, err := catalogStore.LoadAuthorizations(ctx, ids, principal)
+	if err != nil {
+		t.Fatalf("post-revoke LoadAuthorizations: %v", err)
+	}
+	single, err := catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: authorizationIntegrationTemplateID, Principal: principal,
+	})
+	if err != nil {
+		t.Fatalf("post-revoke LoadAuthorization: %v", err)
+	}
+	if after[authorizationIntegrationTemplateID] != single {
+		t.Fatalf("post-revoke batch = %+v, per-template = %+v",
+			after[authorizationIntegrationTemplateID], single)
+	}
+	if after[authorizationIntegrationTemplateID].Grant.Send {
+		t.Fatal("the batch still reports send after a revoke")
+	}
+}
+
+// An exact tombstone must shadow a live global grant in the batch reducer too —
+// the batch reads both scopes per template for exactly this reason, and a
+// reducer that took "first row wins" would silently re-grant every offboarded
+// principal that still holds a global row.
+func TestLoadAuthorizationsAppliesExactOverGlobalPrecedenceRealMySQL(t *testing.T) {
+	db := newCatalogStoreIntegrationDB(t)
+	catalogStore := newStore(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	identity := authorizationIntegrationIdentity()
+	seedAuthorizationTarget(t, db, "1.0.0")
+
+	global := identity
+	global.ScopeSpaceID = ""
+	if _, err := catalogStore.UpsertGrant(ctx, UpsertGrantRequest{
+		Identity: global, Permissions: GrantPermissions{Discover: true, Send: true},
+		ActorUID: "admin-1", Reason: "fleet", ChangeTicket: "CHG-B3",
+	}); err != nil {
+		t.Fatalf("seed global grant: %v", err)
+	}
+	if _, err := catalogStore.UpsertGrant(ctx, UpsertGrantRequest{
+		Identity: identity, Permissions: GrantPermissions{Discover: true, Send: true},
+		ActorUID: "admin-1", Reason: "exact", ChangeTicket: "CHG-B4",
+	}); err != nil {
+		t.Fatalf("seed exact grant: %v", err)
+	}
+	if _, err := catalogStore.RevokeGrant(ctx, RevokeGrantRequest{
+		Identity: identity, ExpectedRevision: 1,
+		ActorUID: "admin-1", Reason: "offboard", ChangeTicket: "CHG-B5",
+	}); err != nil {
+		t.Fatalf("revoke exact grant: %v", err)
+	}
+
+	ids := []cardtmpl.ID{authorizationIntegrationTemplateID}
+	batch, err := catalogStore.LoadAuthorizations(ctx, ids, authorizationIntegrationPrincipal())
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	single, err := catalogStore.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: authorizationIntegrationTemplateID, Principal: authorizationIntegrationPrincipal(),
+	})
+	if err != nil {
+		t.Fatalf("LoadAuthorization: %v", err)
+	}
+	if batch[authorizationIntegrationTemplateID] != single {
+		t.Fatalf("batch = %+v, per-template = %+v", batch[authorizationIntegrationTemplateID], single)
+	}
+	if batch[authorizationIntegrationTemplateID].Grant.Send {
+		t.Fatal("an exact tombstone failed to shadow the global grant in the batch reducer")
+	}
+}

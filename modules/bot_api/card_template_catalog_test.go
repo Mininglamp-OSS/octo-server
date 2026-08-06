@@ -424,18 +424,18 @@ func TestEffectiveCardTemplateIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion}
-	if err := requireEffectiveCardTemplate(raw, want, "bot-template", ""); err != nil {
+	if err := requireEffectiveCardTemplate(raw, want, "bot-template", verifiableEditSpace("")); err != nil {
 		t.Fatalf("requireEffectiveCardTemplate: %v", err)
 	}
 	delete(payload, "template_ref")
 	metadataOnly, _ := json.Marshal(payload)
-	if err := requireEffectiveCardTemplate(metadataOnly, want, "bot-template", ""); !errors.Is(err, errBotTemplateRequestInvalid) {
+	if err := requireEffectiveCardTemplate(metadataOnly, want, "bot-template", verifiableEditSpace("")); !errors.Is(err, errBotTemplateRequestInvalid) {
 		t.Fatalf("metadata-only target error = %v", err)
 	}
-	if err := requireEffectiveCardTemplate(raw, botTemplateRef{ID: want.ID, Version: "9.9.9"}, "bot-template", ""); !errors.Is(err, errBotTemplateRequestInvalid) {
+	if err := requireEffectiveCardTemplate(raw, botTemplateRef{ID: want.ID, Version: "9.9.9"}, "bot-template", verifiableEditSpace("")); !errors.Is(err, errBotTemplateRequestInvalid) {
 		t.Fatalf("mismatch error = %v", err)
 	}
-	if err := requireEffectiveCardTemplate([]byte(`{"type":17,"card":{}}`), want, "bot-template", ""); !errors.Is(err, errBotTemplateRequestInvalid) {
+	if err := requireEffectiveCardTemplate([]byte(`{"type":17,"card":{}}`), want, "bot-template", verifiableEditSpace("")); !errors.Is(err, errBotTemplateRequestInvalid) {
 		t.Fatalf("non-registry error = %v", err)
 	}
 }
@@ -473,4 +473,11 @@ func (s *botCatalogSpy) MetaExact(
 func (s *botCatalogSpy) Render(ctx context.Context, request cardtmpl.CatalogRenderRequest) (map[string]any, error) {
 	s.lastRender = request
 	return s.Catalog.Render(ctx, request)
+}
+
+// verifiableEditSpace is the "we know the Space, and it is this" state, which
+// is what every edit-guard test that predates the three-state check meant by
+// passing a bare string.
+func verifiableEditSpace(spaceID string) editSpaceCheck {
+	return editSpaceCheck{spaceID: spaceID, verifiable: true}
 }
