@@ -1071,16 +1071,29 @@ const (
 // 代码默认一律 true：总闸本身 fail-closed（OCTO_CARD_MESSAGE_ENABLED 未设即关），
 // 安全默认由总闸承担；若这三项再各自默认 false，运维开了总闸还要逐 Bot 补开，
 // 徒增困惑。
+//
+// 三者都委托给 SettingBoolOK 而不是 getBool，是因为 modules/robot 的解析器读的正是
+// SettingBoolOK：走两条路就等于同一列有两套词法。上一轮把 SettingBoolOK 放宽成
+// trim + 折叠大小写却没动这里，`botcard` 里一行 `False` 就会让管理台显示「开」而每个
+// Bot 解析成「关」—— 同一列对两个读者含义不同，正是本层要消灭的东西。委托而非复制：
+// 词法只有一份，下次再改也不会只改一边。
 func (s *SystemSettings) BotCardDisplayEnabledDefault() bool {
-	return s.getBool("botcard", "display_enabled", defaultBotCardSwitchEnabled)
+	return s.botCardSwitchDefault("display_enabled")
 }
 
 func (s *SystemSettings) BotCardInteractionEnabledDefault() bool {
-	return s.getBool("botcard", "interaction_enabled", defaultBotCardSwitchEnabled)
+	return s.botCardSwitchDefault("interaction_enabled")
 }
 
 func (s *SystemSettings) BotCardReasoningEnabledDefault() bool {
-	return s.getBool("botcard", "reasoning_enabled", defaultBotCardSwitchEnabled)
+	return s.botCardSwitchDefault("reasoning_enabled")
+}
+
+func (s *SystemSettings) botCardSwitchDefault(key string) bool {
+	if v, configured := s.SettingBoolOK("botcard", key); configured {
+		return v
+	}
+	return defaultBotCardSwitchEnabled
 }
 
 // BotRateLimitBusinessEnabled 等三组 getter 的回退链均为 DB → env → code default。

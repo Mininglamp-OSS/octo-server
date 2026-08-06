@@ -61,7 +61,11 @@ const (
 //     能发、发出去被 card_disabled 拒，正好违反 pkg/cardmsg 已确立的「清单与发卡
 //     门禁同源」不变量。
 //   - display/interaction 只作用于 **raw 卡路径**（Bot 自拼 card JSON）；
-//     reasoning 只作用于 **Registry 模板卡**。三者正交。
+//     reasoning 只作用于 **Registry 模板卡**。**raw 这一组与 reasoning 正交，但
+//     display 与 interaction 之间不正交**：display 是 raw 档内的下限，octo/v1 要
+//     display，octo/v2 要 display AND interaction。把三者一律说成「正交」是 round-1
+//     评审推翻过的说法，照着它改会重开旁路——判定一律走 AllowsRawDisplayCard /
+//     AllowsRawInteractiveCard，理由见那两个方法上的注释。
 //     绝不可实现成「按 wire profile 一刀切」：推理卡自身横跨两档
 //     （active/error 是 octo/v2、result 是 octo/v1），按 profile 切会把它砍成只剩
 //     终态或只剩过程。
@@ -297,6 +301,13 @@ func queryBotSettingOverrides(ctx *config.Context, robotID string) (map[string]s
 	}
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
+		// 空值 == 未配置，是本表 DDL 自己写下的定义（见 sql/20260806000001_bot_setting.sql）。
+		// 在这里就丢掉，而不是留给 parseBotSettingBool 落进 default 分支——否则一行空值
+		// 会被当成脏值告警「覆盖值非法」，与迁移里的定义自相矛盾。回落行为两种写法一致，
+		// 差别只在日志说了真话还是假话。与 system_settings.lookup 把 "" 视作未命中同义。
+		if r.Value == "" {
+			continue
+		}
 		out[r.KeyName] = r.Value
 	}
 	return out, nil

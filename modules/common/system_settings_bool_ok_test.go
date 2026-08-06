@@ -37,6 +37,46 @@ func TestSettingBoolOK_LexingIsForgiving(t *testing.T) {
 	}
 }
 
+// TestBotCardDefaults_AgreeWithTheResolverOnEveryLiteral —— 同一列必须只有一套词法。
+//
+// 这条是补上一轮**自己捅的窟窿**。上一轮把 SettingBoolOK 放宽成 trim + 折叠大小写，
+// 却没动这三个 getter（当时走 getBool → parseSettingBool，精确匹配），于是同一列
+// `botcard.display_enabled` 出现了两个读者两套词法：
+//
+//	resolver（SettingBoolOK）      → "False" = 显式关闭
+//	管理台 effective_value（getBool）→ "False" 解析失败、回落 true = 开启
+//
+// 运维会在控制台看到「展示卡开着」，而每个 Bot 都解析成关。上一轮的测试只在**词表**
+// 轴上钉住了（下面那条），恰恰漏了自己动过的**词法**轴——所以这条按字面量逐个比对
+// 两个读者，而不是再断言一次「行为应该一致」。
+func TestBotCardDefaults_AgreeWithTheResolverOnEveryLiteral(t *testing.T) {
+	getters := map[string]func(*SystemSettings) bool{
+		"display_enabled":     (*SystemSettings).BotCardDisplayEnabledDefault,
+		"interaction_enabled": (*SystemSettings).BotCardInteractionEnabledDefault,
+		"reasoning_enabled":   (*SystemSettings).BotCardReasoningEnabledDefault,
+	}
+	// 含放宽后才被接受的写法，以及仍应回落的脏值。
+	for _, raw := range []string{
+		"true", "TRUE", "True", "1", " true ", "\ttrue\n",
+		"false", "FALSE", "False", "0", " false ", "\tfalse\n",
+		"", "maybe", "on", "off",
+	} {
+		for key, getter := range getters {
+			s := &SystemSettings{Log: log.NewTLog("SystemSettingsTest")}
+			m := map[string]string{schemaKey("botcard", key): raw}
+			s.snapshot.Store(&m)
+
+			// 解析器看到的答案 —— per-Bot 解析链的中间层就是这个。
+			want, configured := s.SettingBoolOK("botcard", key)
+			if !configured {
+				want = defaultBotCardSwitchEnabled
+			}
+			assert.Equal(t, want, getter(s),
+				"botcard.%s = %q：管理台 getter 与 SettingBoolOK 结论不一致，同一列出现了两套词法", key, raw)
+		}
+	}
+}
+
 // TestSettingBoolOK_VocabularyMatchesParseSettingBool —— 词表故意不扩张。
 //
 // 放宽的只是词法（trim + 大小写），不是词表。把 on/off/yes/no 也收进来，会让

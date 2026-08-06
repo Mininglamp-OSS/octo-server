@@ -217,9 +217,13 @@ var systemSettingSchema = []settingDef{
 	// 卡片能力，不必再逐 Bot 开一次。
 	//
 	// display/interaction 只作用于 **raw 卡路径**（Bot 自拼 card JSON），
-	// reasoning 只作用于 **Registry 模板卡**，三者正交。绝不可实现成「按 wire profile
-	// 一刀切」：推理卡自身横跨两档（active/error 是 octo/v2、result 是 octo/v1），
-	// 按 profile 切会把它砍成只剩终态或只剩过程。
+	// reasoning 只作用于 **Registry 模板卡**：raw 这一组与 reasoning 正交，但
+	// **display 与 interaction 之间不正交** —— display 是 raw 档内的下限（octo/v1 要
+	// display，octo/v2 要 display AND interaction，因为 octo/v2 是 octo/v1 的严格超集）。
+	// 判定收口在 modules/robot 的 AllowsRawDisplayCard / AllowsRawInteractiveCard；
+	// 这里只是这两个开关的**全局默认值**，不重述判定。
+	// 绝不可实现成「按 wire profile 一刀切」：推理卡自身横跨两档（active/error 是
+	// octo/v2、result 是 octo/v1），按 profile 切会把它砍成只剩终态或只剩过程。
 	{Category: "botcard", Key: "display_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送展示型 raw 卡片（octo/v1，Bot 自拼卡片 JSON）；受卡片总闸 OCTO_CARD_MESSAGE_ENABLED 支配，总闸关闭时本项无效",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardDisplayEnabledDefault()) }},
 	{Category: "botcard", Key: "interaction_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送交互型 raw 卡片（octo/v2，含 Action.Submit / Input.*）；不影响服务端模板渲染出的推理进度卡",

@@ -207,13 +207,57 @@ each one's failure direction is "a control silently does not apply":
   code default on top, and for all three card switches that default is `true` —
   so `False` being read as "unconfigured" left on exactly the capability the
   operator was trying to disable, silently. The *vocabulary* deliberately stays
-  identical to `parseSettingBool`'s; only the lexing relaxed, so one column cannot
-  come to mean different things to two readers of the same table. Pinned by a test
-  that asserts on/off/yes/no are rejected by **both** readers.
+  identical to `parseSettingBool`'s; only the lexing relaxed. **This fix was
+  itself half-done and shipped a regression for one round — see below.**
 - **A malformed stored override now warns** instead of falling back mutely, once
   per `(robot, key)`. The dedupe is not polish: resolution runs on every card send
   and every profile read, and a dirty row is persistent state, so an un-deduped
   warning is a log flood — which is the same outcome as no log at all.
+
+## The round-3 fix that broke the thing it was fixing
+
+Worth its own section because it is the sharpest lesson on this branch, and
+because it was caught by review rather than by me.
+
+`SettingBoolOK` was relaxed to trim and case-fold. The three
+`BotCard*EnabledDefault()` getters — the *other* reader of the very same
+`botcard` rows, feeding the admin console's `effective_value` — were left on
+`getBool` → `parseSettingBool`, which still matched exactly. So after the fix:
+
+| reader | `botcard.display_enabled = "False"` |
+|---|---|
+| per-bot resolver (`SettingBoolOK`) | explicitly **false** |
+| admin console (`parseSettingBool`) | unparseable → fallback → **true** |
+
+An operator would see "display cards on" in the console while every bot resolved
+it off. The comment I wrote directly above the fix says one column must not come
+to mean different things to two readers — and the fix made that false in exactly
+the dimension it touched.
+
+The test missed it for a reason worth naming: it pinned the **vocabulary** axis
+(`on`/`off`/`yes`/`no` rejected by both readers) because that was the axis I had
+been thinking about while writing the fix. The axis I *changed* — lexing — went
+unpinned. **A test written from the same mental model as the fix inherits the
+fix's blind spot.** The replacement asserts the two readers agree literal-by-
+literal, including whitespace and case forms, rather than restating the intent.
+
+The structural fix is delegation, not duplication: the getters now call
+`SettingBoolOK`, so there is one lexer for one column and the next change cannot
+land on only one side.
+
+Two smaller ones fixed alongside, both also mine from round 3 or earlier:
+
+- The new malformed-override warning fired on `''`, which
+  `sql/20260806000001_bot_setting.sql` itself defines as "not configured" — so a
+  perfectly legal empty row was logged as corrupt. Empty values are now dropped
+  in `queryBotSettingOverrides`, matching how `system_settings.lookup` already
+  treats `""`. Fallback behaviour is identical either way; the difference is
+  whether the log tells the truth, which is the entire point of that line.
+- Two code comments (`bot_setting.go`, `system_setting_schema.go`) still said the
+  three switches were "三者正交" — the claim round 1 overturned, and the one this
+  journal explicitly warns reopens the display bypass if acted on. The brief was
+  amended at the time; the comments were not. Both now state display-as-floor and
+  point at the shared predicates.
 
 ## Known gaps at merge
 
@@ -222,10 +266,26 @@ each one's failure direction is "a control silently does not apply":
   indistinguishable from "not configured", so it reports `configured=false` for up
   to one reload TTL. Tolerant lexing does not touch this; an operator who needs a
   capability genuinely off should set it at the tier that enforces.
-- `AdvertisedRef` iterates the capability list twice where once would do
-  (round-3 P2-4). Cosmetic, left alone — the second loop is what makes an
-  ambiguous id fail closed, and rewriting it to save a pass is not worth
-  re-opening a reviewed fail-closed path.
+- **`AdvertisedRef` fails closed loudly on the manifest and silently everywhere
+  else.** Advertising two versions of one template id — which
+  `newBotCardTemplateCatalog` permits, rejecting only exact duplicates — makes it
+  return `(zero, false)`, which degrades one manifest field but rejects *every*
+  template send. Reasoning cards would be completely dead with only a `Warn` line
+  as the signal. The loop count (round-3 P2-4) was never the issue; the missing
+  invariant is. The fix is to reject such a policy at catalog construction so a
+  silent production outage becomes a startup error — deliberately deferred, as it
+  changes a constructor's contract and belongs with the other template-catalog
+  follow-ups rather than in a round-4 hotfix.
+- **The owner catalog's `effective_value` is not master-switch-dominated.**
+  `listBotSettings` returns the raw resolution while `botCardConfigFrom` applies
+  `applyCardMasterSwitch`, so with cards off at the deployment level the Bot
+  management page shows `display_enabled: true` while the profile says false and
+  every send 400s. The same response carries `bot.card_enabled` with
+  `source:"env"`, so a client *can* compose the truth — but nothing in the
+  contract obliges it to, which makes this the "manifest disagrees with the gate"
+  contradiction relocated to the owner surface. Needs an explicit decision
+  (dominate `effective_value`, or document this as the pre-master-switch tier),
+  not another round of implicit.
 - `TestListGroups_CarriesGroupAllowNoMention` (`mention_pref_test.go`, unrelated
   to this task) panics in the local sandbox because the endpoint returns an empty
   list. It reproduces identically on the pre-change HEAD and is green in CI, so it

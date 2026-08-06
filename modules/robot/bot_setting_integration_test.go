@@ -436,3 +436,34 @@ func TestWriteBotSettingOverrides_RollsBackOnMidBatchFailure(t *testing.T) {
 	assert.NoError(t, queryErr)
 	assert.Len(t, overrides, 2)
 }
+
+// TestQueryBotSettingOverrides_EmptyValueIsNotConfigured —— 空值即未配置，且**不是**脏值。
+//
+// 迁移里 `value` 的 DEFAULT ” 就是「未配置」的定义（sql/20260806000001_bot_setting.sql）。
+// 上一轮加脏值告警时没照顾到这条：空串落进 parseBotSettingBool 的 default 分支，于是一行
+// 合法的「未配置」会被喊成「覆盖值非法」，和迁移自己的定义打架。回落行为两种写法一致，
+// 差别只在日志说的是真话还是假话——而这条告警存在的全部意义就是让运维看见真相。
+//
+// 写入路径永远不会存 ”（normalizeBotSettingValue 只产出 "0"/"1"），所以直接插库构造。
+func TestQueryBotSettingOverrides_EmptyValueIsNotConfigured(t *testing.T) {
+	handler, ctx := setupBotSettings(t)
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO bot_setting (robot_id, key_name, value) VALUES (?, ?, '')",
+		settingsRobotID, BotSettingKeyDisplayEnabled,
+	).Exec()
+	assert.NoError(t, err)
+
+	overrides, err := queryBotSettingOverrides(ctx, settingsRobotID)
+	assert.NoError(t, err)
+	assert.NotContains(t, overrides, BotSettingKeyDisplayEnabled,
+		"空值行被当成了覆盖，会走脏值告警路径并与迁移里 '' == 未配置 的定义矛盾")
+
+	// 回落行为不变：读接口仍报「跟随默认」，而不是「显式关闭」。
+	var resp settingsListResp
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+	item := findSetting(t, resp, BotSettingKeyDisplayEnabled)
+	assert.Nil(t, item.Value, "空值必须回显为「未设置」")
+	assert.Equal(t, botSettingSourceDefault, item.Source)
+	assert.True(t, item.Effective)
+}
