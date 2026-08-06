@@ -385,11 +385,15 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
-	// 该响应是某个 Bot 的私有配置，且只有登录态区分调用者。与
-	// /v1/bot/card/profile 同口径：private 禁共享代理缓存，no-store 不留副本
-	// —— 改完配置立刻重读要看到新值。
+	// 该响应是某个 Bot 的私有配置，且只有登录态区分调用者：private 禁共享代理
+	// 缓存，no-store 不留副本 —— 改完配置立刻重读要看到新值。
+	//
+	// Vary 命名的是**本路由实际使用的**鉴权头。用户会话走 `token`
+	// （octo-lib/pkg/wkhttp/http.go 的 c.GetHeader("token")），不是 Authorization ——
+	// /v1/bot/card/profile 才是 Authorization（bot token）。照抄那边会声明一个不影响
+	// 响应的头，读起来像做了隔离其实没有。
 	c.Header("Cache-Control", "private, no-store")
-	c.Header("Vary", "Authorization")
+	c.Header("Vary", "token")
 	c.Response(map[string]interface{}{"list": resolutions})
 }
 
@@ -428,6 +432,14 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		return
 	}
 
+	// 属主校验放在逐项校验**之前**（round-2/3 评审反复提到）：否则一个非属主用户
+	// 能靠 400 与 403 的差别探测「某个键是否已注册且可写」，且对不存在 / 非自己的
+	// Bot 会收到 400 而不是文档承诺的 404 / 403 —— 削弱的是本端点自己声明的属主语义。
+	// 代价只是给形状错误的请求多一次查库，可以忽略。
+	if rb.assertRobotOwner(c, robotID, loginUID) {
+		return
+	}
+
 	plans := make([]botSettingWritePlan, 0, len(req.Items))
 	seen := make(map[string]struct{}, len(req.Items))
 	for _, item := range req.Items {
@@ -462,12 +474,6 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 	// 死锁（MySQL 1213）。逐条自动提交时锁立即释放、窗口可忽略，事务化之后不再是。
 	// 统一锁序是本仓既有做法（见 send.go 的 "#627 D4 uniform lock order"）。
 	sort.Slice(plans, func(i, j int) bool { return plans[i].key < plans[j].key })
-
-	// 属主校验放在形状校验之后、写库之前：形状错误无需查库即可拒，而任何写入都
-	// 必须先过属主门。
-	if rb.assertRobotOwner(c, robotID, loginUID) {
-		return
-	}
 
 	// 单事务提交整批。逐条自动提交会让「校验全过、第 2 条写失败」留下半应用状态：
 	// 调用方收到 500 以为什么都没生效，实际前面几项已经落库；更糟的是错误路径会跳过
@@ -526,13 +532,13 @@ func (rb *Robot) deleteBotSetting(c *wkhttp.Context) {
 	robotID := c.Param("robot_id")
 	key := c.Param("key")
 
-	def := findBotSettingDef(key)
-	if def == nil || !def.Editable {
-		respondRobotRequestInvalid(c, "key")
+	if rb.assertRobotOwner(c, robotID, loginUID) {
 		return
 	}
 
-	if rb.assertRobotOwner(c, robotID, loginUID) {
+	def := findBotSettingDef(key)
+	if def == nil || !def.Editable {
+		respondRobotRequestInvalid(c, "key")
 		return
 	}
 

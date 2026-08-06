@@ -167,10 +167,13 @@ func TestBotSettings_CatalogListsEveryRegisteredKey(t *testing.T) {
 	assert.Equal(t, botSettingSourceDefault, reasoning.Source)
 	assert.True(t, reasoning.Effective, "code default is true")
 
-	// Per-bot private config must never be held by a shared cache.
+	// Per-bot private config must never be held by a shared cache. Vary names
+	// the header this route actually authenticates with — user session is
+	// `token`, not Authorization (that is the bot-token profile endpoint).
 	cacheControl := w.Header().Get("Cache-Control")
 	assert.Contains(t, cacheControl, "private")
 	assert.Contains(t, cacheControl, "no-store")
+	assert.Equal(t, "token", w.Header().Get("Vary"))
 }
 
 // TestBotSettings_OverrideThenDeleteFallsBack walks the full lifecycle the
@@ -298,6 +301,26 @@ func TestBotSettings_OwnershipGuard(t *testing.T) {
 	t.Run("unknown bot is not found", func(t *testing.T) {
 		w := getSettings(t, handler, "bot_does_not_exist")
 		assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
+	})
+
+	// Ownership is decided before per-item validation, so a malformed request
+	// against a bot you do not own answers 403/404 rather than 400. Two things
+	// depend on that ordering: the endpoint's documented ownership semantics,
+	// and not letting a non-owner tell "registered and writable" (403) apart
+	// from "unknown key" (400) — which would enumerate the server-side registry.
+	t.Run("a malformed write on someone else's bot is still forbidden", func(t *testing.T) {
+		w := putSettings(t, handler, settingsOtherRobotID,
+			map[string]any{"key": "bot.not_a_real_key", "value": "nonsense"})
+		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
+	})
+	t.Run("a malformed write on an unknown bot is still not found", func(t *testing.T) {
+		w := putSettings(t, handler, "bot_does_not_exist",
+			map[string]any{"key": "bot.not_a_real_key", "value": "nonsense"})
+		assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
+	})
+	t.Run("an unknown key on someone else's bot is forbidden, not bad request", func(t *testing.T) {
+		w := deleteSetting(t, handler, settingsOtherRobotID, "bot.not_a_real_key")
+		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
 	})
 }
 
