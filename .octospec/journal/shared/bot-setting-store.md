@@ -351,6 +351,25 @@ intended, because a per-party test passes fine while they disagree.
   Remaining on that handler: no `payloadIsVail`/`Validate` for non-card payloads,
   i.e. it is still the one ingress without shape validation. Deliberate — see the
   brief for why refusing cards beats rebuilding the pipeline here.
+  **Order is part of the fix, not cosmetics.** Identity → channel → content, the
+  same rule the settings endpoints landed on after three rounds ("answering about
+  content before establishing authorization contradicts the endpoint's own 403").
+  The first draft had the card gate first, which meant a non-member sending a card
+  got `content_invalid` instead of `channel_send_forbidden`. Caught in self-review
+  by diffing against `sendMessage`, where `allowSendToChannel` precedes
+  `payloadIsVail`. Pinned by `TestStreamStart_ChannelCheckPrecedesTheCardGate` —
+  which is the only case that fails when the two are swapped, because every other
+  case trips exactly one gate and stays green either way.
+- **`streamEnd` has no caller binding, and one review's description of it is
+  wrong.** An automated review suggested a stream's final content could smuggle a
+  card via `streamEnd`. It cannot: `config.MessageStreamEndReq` is
+  `{StreamNo, ChannelID, ChannelType}` with no payload field, so there is nothing
+  there to validate. Recorded because inheriting that claim would send the next
+  person hunting for a gate with nothing to gate. The *real* gap on that handler
+  is different and untouched: `StreamNo` is not bound to the caller, so any
+  authenticated bot can end any stream whose number it can name. Pre-existing,
+  byte-identical to the merge-base, out of scope here — and since no issue was
+  opened by instruction, this paragraph is its only record.
 - **`TestBotMessageEdit_StillReachesTerminalStateWhenReasoningOff` is inert.**
   It injects a `stubCardConfig` with every sub-switch off, but
   `botMessageEditViaRegistry` never calls `resolveBotCardConfig`, so the stub

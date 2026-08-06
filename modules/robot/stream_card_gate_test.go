@@ -226,3 +226,39 @@ func TestStreamStart_ChecksChannelPermission(t *testing.T) {
 	assert.Equal(t, "err.server.robot.channel_send_forbidden", streamGateErrorCode(w),
 		"非群成员必须被拒，且与 sendMessage 用同一个码，body=%s", w.Body.String())
 }
+
+// TestStreamStart_ChannelCheckPrecedesTheCardGate —— 顺序也是契约。
+//
+// 一个**非群成员**发一张卡：两道门都会拒，但必须是频道门先答。sendMessage 的顺序就是
+// allowSendToChannel 在 payloadIsVail 之前——先确定有没有资格往这里发，再看发的是什么。
+// 本分支为同一条原则改过一次：settings 端点的属主校验被连提三轮后前移到形状校验之前，
+// 理由是「对无权资源先就内容表态，与端点自述的 403 语义矛盾」。
+//
+// 没有这条用例，两道门的相对位置就是无人防守的：任谁为了省一次 DB 查询把拒卡挪到前面，
+// 全部既有用例照样绿——因为每一条都只触发其中一道门。
+func TestStreamStart_ChannelCheckPrecedesTheCardGate(t *testing.T) {
+	handler, gs := streamGateHarness(t)
+	gs.member = false // 非群成员：频道门会拒
+
+	card := []byte(`{"type":17,"card_version":"1.0","profile":"octo/v1",` +
+		`"card":{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"x"}]}}`)
+	body, err := json.Marshal(libconfig.MessageStreamStartReq{
+		ClientMsgNo: "streamgate-order",
+		FromUID:     streamGateRobotID,
+		ChannelID:   "streamgate_group",
+		ChannelType: 2,
+		Payload:     card, // 卡片门也会拒
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST",
+		"/v1/robots/"+streamGateRobotID+"/appkey/stream/start", bytes.NewReader(body))
+	assert.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, "err.server.robot.channel_send_forbidden", streamGateErrorCode(w),
+		"卡片门抢在频道门前面答了：等于在鉴权之前就对内容表态，与 sendMessage 的顺序相反。"+
+			"body=%s", w.Body.String())
+}
