@@ -562,3 +562,62 @@ sql-migrate 应用（`gorp_migrations` 有记录、状态表已建）。
 
 **验证**：`pkg/botevent` 45 测试全绿（`-race -shuffle=on`，`CI=true`，**零 skip**）；
 `modules/robot` 新增 `plausible_robot_id_test.go`。
+
+## 第六轮实现记录（第七轮 review 之后，2026-08-06）
+
+上一轮我把 durable-mark 边界移交 #704 是对的（reviewer 明确认可），但**同一种复发转移到了
+mirror repair** —— 它已被重写两次（缓存否定 → 删除键），第二次有了新的失效模式。这一轮
+先复现、再修，且第三种做法是「不再自动修 mirror」。
+
+1. **删除与权威矛盾的 mirror，在「权威才是回滚方」时是全 fleet 中断（review P1-1）。**
+   `allocate` 在 `:596` 就拿到 `counterExists`，`:604` 删 mirror，`:611` 才用同一个
+   `counterExists` 断定「权威曾激活过、现在回滚了」并拒绝 —— **代码在确认权威不可靠之前，
+   已经按权威的说法销毁了 mirror**。一个新起的副本就能删掉每个健康已激活副本 gate 比对的
+   那个 artifact，于是它们 gate 返回 -1 → 强制读权威 → legacy vs 已激活 belief → 拒绝
+   每一次入队，直到有人恢复状态行。**一次滚动重启把零投递影响的簿记回滚放大成全面中断。**
+   与第四轮被接受的 P1-3 同族：推翻操作前提的证据在操作之前算出、在操作之后才被使用。
+
+   **我先写了复现测试并看它失败**（`TestRegressedAuthorityDoesNotDestroyTheLegitimateMirror`），
+   报错正是「the legitimate mirror "incr:0" was destroyed」。上一轮随修复发的测试第三次
+   断言在旁边的性质上 —— 它 `Del` 掉了 counter，所以 `counterExists` 全程为 false。
+
+2. **修法不是加 `!counterExists`，是不再删。** reviewer 给的最小修法能收窄窗口但不闭合：
+   mirror 是全局的、counter 是 per-bot 的，一个从未收过事件的 bot 的分配仍然没有 counter
+   可以反对。而删除的**唯一收益**是压住读风暴，而冷却也能压住 —— 所以删除整体去掉，不是
+   加条件。现在**分配器在 legacy 路径上永不写 mirror**，只有 operator 工具写它，那是唯一
+   有人能看见自己在覆盖什么的地方。
+   代价如实写出：按值缓存的否定结论有 ≤1s 的窗口，期间「与被拒值字节相同的真激活」不被
+   察觉。这个窗口不可能为 0（区分二者只能读权威），且只在「已有 mirror 声称激活而权威说
+   legacy」时进入 —— 而工具现在拒绝在这个前置条件下激活。冷却**只在无 counter 时武装**：
+   有 counter 时分配一律拒绝，读风暴伤不到正常流量，且权威一恢复立刻生效。
+
+3. **工具不幂等，且它的拒绝断言了一个它没检查过的事实（P2-1，两位 reviewer 独立发现）。**
+   `refuseUnauthorizedMirror` 跑在 `Activate` 之前且**从不读状态行**，于是在「已成功激活 +
+   mirror 正确」这个正常状态下重跑 `activate -yes` 会死掉，并告诉运维「…while the authority
+   says legacy…then DEL the key」—— 每一句在常见情形下都是假的，还指示删掉活的 mirror。
+   已改为**先读权威**。并且把判定抽成纯函数 `judgeMirror`，给这个工具补了**第一个测试文件**
+   —— 它承载整个激活流程、是切换时唯一由人手跑的组件，两轮出两个问题而零测试。
+
+4. `belief.confirmed` 只写不读（docstring 承诺了一个没人 surface 的区分）→ **删掉字段**，
+   两个 warn 调用点本身就是那个区分的记录。`install` 永不返回错误而三处都在检查 → 去掉。
+   `plausibleRobotID` 卡字节而理由说的是字符（`VARCHAR(40)` 在 utf8mb4 下按字符）→ 写清它
+   **故意是更严的那个**，并说明为何今天不可达（两条产 id 的路径都是纯 ASCII）。
+   `invalidateSeeded` 的 docstring 夸大了顺序的重要性（span 边界移走后 `lastPersisted` 只是
+   节流标记）→ 改成真实的赌注。
+   botfather 保留 per-bot counter 的注释补上「为什么 bot-count 尺度可接受、payload 尺度不行」
+   —— 滥用单位不同：payload 字段每条消息免费且无界，bot 是限流、审计、有配额的对象。
+
+5. **「behaviour-neutral … exactly as before」第三轮被提，这次改在声明本身**：未激活时每次
+   分配确实多一次 Redis EVALSHA（`probeAllocatorState`），而 GenSeq 999/1000 次零 I/O。
+   披露从 Rollout 第 3 步（写成激活的后果）移到 Summary 里那句声明旁边，并点名
+   `addInlineQuery` 是唯一真正新增 Redis 依赖的地方。
+
+6. **#704 加 Gap 5**：mirror repair 没有安全的自动形式（两次尝试及各自失效原因），加上它依赖
+   却无人审计的两件事（`counterExists` 只是 EXISTS、无 provenance 无 TTL；每进程重启把每个
+   活跃 bot 的 counter 抬 ~2000 的 id 空间消耗），以及保留状态的回收 sweep。
+
+**验证**：`pkg/botevent` 46 测试、`tools/botevent-seq` 首个测试文件、`pkg/redis`、
+`modules/robot`、`modules/bot_api`、`modules/message` 全绿（`-race -shuffle=on`，`CI=true`，
+零 skip）。`modules/message` 的 `TestE2E_Issue557_*` 一度连续红，查明是**本地 WuKongIM 的
+raft 超时**（`propose batch until applied timeout` / `store message failed: context deadline
+exceeded`）—— 在 HEAD 上同样红，重启 IM 容器后即绿。
