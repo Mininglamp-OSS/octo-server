@@ -98,16 +98,20 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 		denyReason = strings.TrimSpace(v)
 	}
 	terminal := result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied
-	// Cancelled renders through the Registry as well, even though it is not a
-	// terminal decision. The pending card is a Registry render and therefore
-	// carries the server-authored catalog markers; the legacy rebuild below
-	// emits a plain resource card that cannot carry them, so taking that branch
-	// for a marked card erased the markers on an ordinary user click and left
-	// the identity guards in pkg/cardtmpl/updater.go inert for that message.
-	// `terminal` still means "decided" for the notification below — only the
-	// replacement route widens.
-	registryReplaceable := terminal || result.State == cardactiondispatch.StateCancelled
-	if registryReplaceable && f.updater != nil {
+	// Every state renders through the Registry when an updater is present, not
+	// just the decided ones. The pending card is a Registry render and so
+	// carries the server-authored catalog markers; the fallback below rebuilds
+	// the frame from a six-key allowlist that holds neither, so routing a
+	// marked card there erased both on an ordinary user click and left the
+	// identity guards in pkg/cardtmpl/updater.go inert for that message.
+	//
+	// Selecting the route by state was the bug's shape, so the state list is
+	// gone rather than extended: `cancelled` was the reported case, `pending`
+	// reaches the same branch, and a state added later would have inherited the
+	// defect silently. What remains is the distinction the fallback was written
+	// for — a deployment with no updater at all. `terminal` still means
+	// "decided", and still gates the notification below.
+	if f.updater != nil {
 		if err := f.replaceWithRegistryResult(ctx, event, result, channelID, lang, title, denyReason); err != nil {
 			return err
 		}
@@ -188,6 +192,13 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		DenyReason:       denyReason,
 		Denied:           result.State == cardactiondispatch.StateDenied,
 		Cancelled:        result.State == cardactiondispatch.StateCancelled,
+		// Anything that is not a decision and not an explicit cancellation —
+		// `pending` today, whatever a later contract adds — renders as
+		// unavailable, which is what the pre-Registry fallback already showed
+		// for those states.
+		Unavailable: result.State != cardactiondispatch.StateApproved &&
+			result.State != cardactiondispatch.StateDenied &&
+			result.State != cardactiondispatch.StateCancelled,
 	})
 	if err != nil {
 		return err
@@ -218,6 +229,7 @@ type docsResultRenderInput struct {
 	DenyReason       string
 	Denied           bool
 	Cancelled        bool
+	Unavailable      bool
 }
 
 func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
@@ -246,6 +258,8 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	state := docsaccessrequest.StateApproved
 	wireState := "approved"
 	switch {
+	case input.Unavailable:
+		state, wireState = docsaccessrequest.StateUnavailable, "unavailable"
 	case input.Cancelled:
 		state, wireState = docsaccessrequest.StateCancelled, "cancelled"
 	case input.Denied:
@@ -274,7 +288,7 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	// decision time. The data contract requires `decision` only for
 	// approved/rejected; emitting one here would put the generic operator
 	// placeholder on a card nobody acted on.
-	if !input.Cancelled {
+	if !input.Cancelled && !input.Unavailable {
 		fields["decision"] = map[string]any{
 			"operatorName":     truncRunes(operatorName, capResultName),
 			"decidedAtDisplay": truncRunes(strings.TrimSpace(input.DecidedAtDisplay), capResultShortLabel),

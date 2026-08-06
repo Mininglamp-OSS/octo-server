@@ -28,12 +28,14 @@
       "states": [
         "approved",
         "rejected",
-        "cancelled"
+        "cancelled",
+        "unavailable"
       ],
       "samples": [
         "samples/approved.json",
         "samples/rejected.json",
-        "samples/cancelled.json"
+        "samples/cancelled.json",
+        "samples/unavailable.json"
       ]
     }
   }

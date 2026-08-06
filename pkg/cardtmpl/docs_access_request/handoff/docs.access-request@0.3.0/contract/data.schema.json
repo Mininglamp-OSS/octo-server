@@ -20,7 +20,8 @@
         "pending",
         "approved",
         "rejected",
-        "cancelled"
+        "cancelled",
+        "unavailable"
       ]
     },
     "document": {

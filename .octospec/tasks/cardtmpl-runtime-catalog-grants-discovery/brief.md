@@ -459,8 +459,17 @@ finds them directly.
   `cancelled` result, whose replacement frame came from a six-key allowlist
   carrying neither marker, leaving both identity guards in `updater.go` inert.
   Preservation is now enforced at `CardMutator.Mutate` rather than per call
-  site, and `docs.access-request@0.3.0` declares a `cancelled` state so the
-  replacement is a Registry render that legitimately carries the markers.
+  site, and `docs.access-request@0.3.0` declares `cancelled` and `unavailable`
+  states so the replacement is a Registry render that legitimately carries the
+  markers. Selecting the replacement route by state was the defect's shape, so
+  the state list is gone rather than extended — `pending` reached the same
+  branch and a later state would have inherited it silently; what remains is
+  the no-updater fallback the branch was written for.
+  `TestStandardActionFinalizerCannotSilentlyDowngradeAMarkedCard` pins the
+  latent second caller: it is the default finalizer for every non-docs owner and
+  routes every state through the same helper, harmless today only because
+  `BuildApprovalRequestCard` writes no template metadata, so its cards are never
+  marked.
 - [x] every domain the Go validator enforces is also stated in the schema, so a
   write that skips the validator cannot land a row the validator would refuse —
   `TestGrantSchemaRejectsWritesTheValidatorWouldRefuseRealMySQL` (real rows, each

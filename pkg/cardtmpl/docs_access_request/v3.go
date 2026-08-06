@@ -22,10 +22,16 @@ const (
 	// outside the Registry: the markers assert a template identity, and only a
 	// Registry render produces the metadata.octo.template they must agree with.
 	StateCancelled cardtmpl.State = "cancelled"
+	// StateUnavailable is the outcome for an action that reached no decision at
+	// all — the finalizer's catch-all, which previously rendered a plain
+	// resource card. It exists for the same reason StateCancelled does: the
+	// replacement for a marked card has to be a Registry render.
+	StateUnavailable cardtmpl.State = "unavailable"
 
-	VariantApproved  = "docs.access_approved"
-	VariantRejected  = "docs.access_denied"
-	VariantCancelled = "docs.access_cancelled"
+	VariantApproved    = "docs.access_approved"
+	VariantRejected    = "docs.access_denied"
+	VariantCancelled   = "docs.access_cancelled"
+	VariantUnavailable = "docs.access_unavailable"
 )
 
 type TemplateV3 struct {
@@ -98,7 +104,8 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 			Body: body, Variant: Variant, DeepLink: deepLink, Source: &source,
 		}, nil
 	}
-	if state != StateApproved && state != StateRejected && state != StateCancelled {
+	if state != StateApproved && state != StateRejected &&
+		state != StateCancelled && state != StateUnavailable {
 		return cardtmpl.BuildResult{}, fmt.Errorf("docs.access-request@0.3.0: unsupported state %q", state)
 	}
 	var input v3Fields
@@ -116,6 +123,8 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 		variant = VariantRejected
 	case StateCancelled:
 		labels, variant = cancelledLabels(env.Lang), VariantCancelled
+	case StateUnavailable:
+		labels, variant = unavailableLabels(env.Lang), VariantUnavailable
 	}
 	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeV3BodyWithLang(env.Lang, env.WebLoginURL, docID, env.SpaceID, cardtmpl.DocsOutcomeContent{
 		// Denied selects the L0 "not granted" treatment rather than the green
@@ -146,7 +155,8 @@ func (t *TemplateV3) FallbackText(state cardtmpl.State, fields json.RawMessage, 
 	if state == StatePending {
 		return New().FallbackText(state, fields, lang)
 	}
-	if state != StateApproved && state != StateRejected && state != StateCancelled {
+	if state != StateApproved && state != StateRejected &&
+		state != StateCancelled && state != StateUnavailable {
 		return "", fmt.Errorf("docs.access-request@0.3.0: unsupported fallback state %q", state)
 	}
 	var input v3Fields
@@ -154,8 +164,11 @@ func (t *TemplateV3) FallbackText(state cardtmpl.State, fields json.RawMessage, 
 		return "", err
 	}
 	labels := resultLabels(lang, state == StateRejected)
-	if state == StateCancelled {
+	switch state {
+	case StateCancelled:
 		labels = cancelledLabels(lang)
+	case StateUnavailable:
+		labels = unavailableLabels(lang)
 	}
 	return strings.TrimSpace(input.Document.Title) + " - " + labels.status, nil
 }
@@ -183,6 +196,21 @@ func (l resultLabelSet) banner(role string) string {
 		role = "viewer"
 	}
 	return "requested " + role + " access to this document."
+}
+
+// unavailableLabels describes an action that reached no decision at all — the
+// finalizer's catch-all when a route answers something other than a decision.
+func unavailableLabels(lang string) resultLabelSet {
+	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
+		return resultLabelSet{
+			header: "文档申请", status: "暂不可用", result: "本次访问申请暂时无法处理，权限未发生变更。",
+			reason: "拒绝原因", role: "申请人", requestReason: "申请原因", processedAt: "处理于", zh: true,
+		}
+	}
+	return resultLabelSet{
+		header: "Document access", status: "Unavailable", result: "The access request could not be processed; no permission changed.",
+		reason: "Reason", role: "Requester", requestReason: "Reason", processedAt: "Processed at",
+	}
 }
 
 // cancelledLabels describes a request that ended without a decision. It reuses
