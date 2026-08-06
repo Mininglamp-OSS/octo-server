@@ -360,6 +360,33 @@ intended, because a per-party test passes fine while they disagree.
   `payloadIsVail`. Pinned by `TestStreamStart_ChannelCheckPrecedesTheCardGate` —
   which is the only case that fails when the two are swapped, because every other
   case trips exactly one gate and stays green either way.
+- **Adding the channel gate exposed that `allowSendToChannel` never handled
+  subareas — in three handlers, not one.** Review caught that the new gate turned
+  community-topic (`ChannelType` 5) streaming into a 403, because
+  `allowSendToChannel` recognised only Person and Group and fell through to
+  `return false`. Real regression, and it was unpinned: the stream tests covered
+  only types 1 and 2.
+
+  The supporting argument was that `streamStart`'s community-topic disband guard
+  had become unreachable — a guard written for a type the function now refuses.
+  True, but checking the other call sites changed the conclusion: `sendMessage`
+  (check at :746, dead subarea branch at :761) and `typing` (:679 / :694) carry
+  the *identical* unreachable branch on `main` today. So subareas were already
+  refused on both of those, and `streamStart` was not the victim of a new
+  narrowing — it was the one path where the missing check had accidentally left
+  subareas working. Three guards that resolve a parent group, all dead, is not
+  three mistakes; it is one missing case in the shared predicate.
+
+  Fixed there rather than in `streamStart`: `allowSendToChannel` now resolves the
+  parent group for type 5 and checks membership on it, which is where subarea
+  membership actually lives. Deliberately **not** a local branch in `streamStart`
+  — that would have been a fourth private copy of the channel rule, the exact
+  drift this task spent three rounds eliminating elsewhere. The change is strictly
+  permissive (type 5: always-deny → membership-checked), so nothing that works
+  today stops working; only previously-403'd subarea requests are affected. It
+  does mean `sendMessage` and `typing` gain subarea support as a side effect,
+  which is a behaviour change on two endpoints this task does not otherwise own —
+  recorded here rather than left to be discovered.
 - **`streamEnd` has no caller binding, and one review's description of it is
   wrong.** An automated review suggested a stream's final content could smuggle a
   card via `streamEnd`. It cannot: `config.MessageStreamEndReq` is

@@ -1016,6 +1016,22 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 }
 
 // 是否允许发送消息到频道
+//
+// 三个 robot ingress（sendMessage / typing / streamStart）共用这一份判定，所以这里
+// 少认一种频道类型，那种类型就在三条路上同时不可用。
+//
+// **子区（CommunityTopic）此前落在末尾的「未知类型」里被一律拒绝**，而 sendMessage、
+// typing、streamStart 三处各自都写着一个解析父群的子区解散守卫——那三个分支因此永远
+// 不可达。守卫会去 resolveParentGroupNo 说明作者本就打算让子区能用，是本函数漏了这个
+// case，不是那三处多写了。streamStart 补上频道校验时（round-8 评审）这个洞才暴露出来：
+// 那条路先前没有校验，于是成了三条里唯一「子区能发」的例外。
+//
+// 子区的成员资格取决于**父群**：子区 channelID 形如 `<parentGroupNo>____<topicNo>`，
+// 权限模型里子区不单独持有成员表。因此解析出父群再查成员，与群分支同一条规则、同一次
+// 查询，解析是纯字符串操作、不额外碰库。
+//
+// 方向上这是**放宽**（type 5：永远拒 → 按父群成员判定），所以今天能发的一样能发；
+// 受影响的只有先前被无条件 403 的子区请求。
 func (rb *Robot) allowSendToChannel(robotID string, channelID string, channelType uint8) bool {
 	if channelType == common.ChannelTypePerson.Uint8() {
 		// 个人频道允许机器人发送消息
@@ -1026,6 +1042,20 @@ func (rb *Robot) allowSendToChannel(robotID string, channelID string, channelTyp
 		exist, err := rb.groupService.ExistMember(channelID, robotID)
 		if err != nil {
 			rb.Error("检查机器人是否是频道成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+			return false
+		}
+		return exist
+	}
+	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// 子区：成员资格在父群上。channelID 形状不合法时 fail-closed。
+		parentGroupNo, err := rb.resolveParentGroupNo(channelID)
+		if err != nil {
+			rb.Error("解析子区父群失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+			return false
+		}
+		exist, err := rb.groupService.ExistMember(parentGroupNo, robotID)
+		if err != nil {
+			rb.Error("检查机器人是否是子区父群成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
 			return false
 		}
 		return exist

@@ -67,12 +67,14 @@ func streamGateHarness(t *testing.T) (*wkhttp.WKHttp, *stubGroupService) {
 // a second method, the handler started doing something this test does not model.
 type stubGroupService struct {
 	group.IService
-	askedUID string
-	member   bool
+	askedUID   string
+	askedGroup string
+	member     bool
 }
 
 func (s *stubGroupService) ExistMember(groupNo string, uid string) (bool, error) {
 	s.askedUID = uid
+	s.askedGroup = groupNo
 	return s.member, nil
 }
 
@@ -261,4 +263,72 @@ func TestStreamStart_ChannelCheckPrecedesTheCardGate(t *testing.T) {
 	assert.Equal(t, "err.server.robot.channel_send_forbidden", streamGateErrorCode(w),
 		"卡片门抢在频道门前面答了：等于在鉴权之前就对内容表态，与 sendMessage 的顺序相反。"+
 			"body=%s", w.Body.String())
+}
+
+// TestAllowSendToChannel_CommunityTopicResolvesParentGroup —— 子区按父群判成员。
+//
+// 直接测这份共用判定，而不是只从 streamStart 打进去：三个 robot ingress
+// （sendMessage / typing / streamStart）都调它，这里少认一种频道类型，那种类型就在三条
+// 路上同时不可用。round-8 评审正是因为 streamStart 补了频道校验才让这个洞浮出水面——
+// 而它先前已经让 sendMessage 与 typing 的子区解散守卫永远不可达。
+//
+// 断言按父群查：子区 channelID 形如 `<parentGroupNo>____<topicNo>`，成员表挂在父群上，
+// 拿整个 channelID 去查成员会永远查不到，那是「看起来实现了、实际全拒」的失败形态。
+func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+
+	gs := &stubGroupService{member: true}
+	rb := &Robot{ctx: ctx, Log: log.NewTLog("RobotAllowSendTest"), groupService: gs}
+
+	assert.True(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", 5),
+		"父群成员必须被允许向子区发送")
+	assert.Equal(t, "parent_group_1", gs.askedGroup,
+		"成员查询用的不是父群号——拿整个子区 channelID 去查会永远落空")
+
+	gs.member = false
+	assert.False(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", 5),
+		"非父群成员必须被拒")
+
+	// 形状不合法 → fail-closed，且不得把畸形串当群号去查。
+	gs.member = true
+	gs.askedGroup = ""
+	assert.False(t, rb.allowSendToChannel("bot_a", "no_separator_here", 5),
+		"子区 channelID 形状不合法时必须拒绝")
+	assert.Empty(t, gs.askedGroup, "形状不合法时不该发起成员查询")
+
+	// 未知类型仍然一律拒——放宽只针对 type 5。
+	assert.False(t, rb.allowSendToChannel("bot_a", "whatever", 99),
+		"未知频道类型必须继续拒绝")
+}
+
+// TestStreamStart_CommunityTopicIsNotRefusedByTheChannelGate —— round-8 评审的回归。
+//
+// 加频道校验之前，streamStart 是三条 robot 路里唯一子区能发的（因为它压根没校验）。
+// 补上校验后，allowSendToChannel 不认 type 5，子区流式立刻变成 403 —— 一个子区助手用
+// 流式增量回复正是最自然的用法。评审指出这一点时没有测试守着，因为原有用例只覆盖了
+// type 1 和 type 2。
+func TestStreamStart_CommunityTopicIsNotRefusedByTheChannelGate(t *testing.T) {
+	handler, gs := streamGateHarness(t)
+	gs.member = true // 父群成员
+
+	body, err := json.Marshal(libconfig.MessageStreamStartReq{
+		ClientMsgNo: "streamgate-topic",
+		FromUID:     streamGateRobotID,
+		ChannelID:   "streamgate_group____topic_1",
+		ChannelType: 5,
+		Payload:     []byte(`{"type":1,"content":"hello"}`),
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST",
+		"/v1/robots/"+streamGateRobotID+"/appkey/stream/start", bytes.NewReader(body))
+	assert.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+
+	assert.NotEqual(t, "err.server.robot.channel_send_forbidden", streamGateErrorCode(w),
+		"父群成员的子区流式被频道门拒了，body=%s", w.Body.String())
+	assert.Equal(t, "streamgate_group", gs.askedGroup,
+		"子区成员判定必须落在父群上")
 }
