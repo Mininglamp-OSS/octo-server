@@ -319,6 +319,7 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 	// /v1/bot/card/profile 同口径：private 禁共享代理缓存，no-store 不留副本
 	// —— 改完配置立刻重读要看到新值。
 	c.Header("Cache-Control", "private, no-store")
+	c.Header("Vary", "Authorization")
 	c.Response(map[string]interface{}{"list": resolutions})
 }
 

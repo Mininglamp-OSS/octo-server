@@ -85,6 +85,10 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	// Bot B。private 禁掉共享缓存，no-store 连私有缓存也不留副本（配置改动要即时生效，
 	// 本就不该有陈旧副本）。加在成功路径的最前面，确保和响应体一起写出。
 	c.Header("Cache-Control", "private, no-store")
+	// Belt-and-braces for an intermediary that honours Vary but mishandles
+	// no-store: the response body is a function of the bot token, so a cache
+	// keyed on URL alone would be keyed on the wrong thing.
+	c.Header("Vary", "Authorization")
 	c.Response(map[string]interface{}{
 		"enabled":      cardmsg.BotEnabled(),
 		"card_version": cardmsg.CardVersion,
