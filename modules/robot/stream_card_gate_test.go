@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	libconfig "github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -46,7 +47,7 @@ const streamGateRobotID = "streamgate_bot"
 // Setup-time CleanAllTables only, never on exit: every sibling setup in this
 // package cleans before it runs, and cleaning afterwards instead puts the wipe
 // between some other test's setup and its assertions once the order shuffles.
-func streamGateHarness(t *testing.T) (*wkhttp.WKHttp, *stubGroupService) {
+func streamGateHarness(t *testing.T) (*wkhttp.WKHttp, *stubGroupService, *libconfig.Context) {
 	t.Helper()
 	_, ctx := testutil.NewTestServer()
 
@@ -55,7 +56,19 @@ func streamGateHarness(t *testing.T) (*wkhttp.WKHttp, *stubGroupService) {
 	r := wkhttp.New()
 	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	r.POST("/v1/robots/:robot_id/:app_key/stream/start", rb.streamStart)
-	return r, gs
+	return r, gs, ctx
+}
+
+// seedGroup inserts the parent group row the disband guard reads. Needed only by
+// the subarea cases: the guard is skipped for Person and, for Group, these cases
+// never get past the channel stub.
+func seedGroup(t *testing.T, ctx *libconfig.Context, groupNo string, status int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, ?, ?, '')",
+		groupNo, groupNo, status,
+	).Exec()
+	assert.NoError(t, err)
 }
 
 // stubGroupService records which uid allowSendToChannel asked about, which is
@@ -102,6 +115,28 @@ func postStreamStart(t *testing.T, handler http.Handler, payload []byte) *httpte
 	return w
 }
 
+// postStreamStartTo is postStreamStart with the channel under test's control,
+// for the subarea cases.
+func postStreamStartTo(t *testing.T, handler http.Handler, channelID string, channelType uint8, payload []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(libconfig.MessageStreamStartReq{
+		ClientMsgNo: "streamgate-topic",
+		FromUID:     streamGateRobotID,
+		ChannelID:   channelID,
+		ChannelType: channelType,
+		Payload:     payload,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST",
+		"/v1/robots/"+streamGateRobotID+"/appkey/stream/start", bytes.NewReader(body))
+	assert.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	return w
+}
+
 func streamGateErrorCode(w *httptest.ResponseRecorder) string {
 	var envelope struct {
 		Error struct {
@@ -121,7 +156,7 @@ func streamGateErrorCode(w *httptest.ResponseRecorder) string {
 // 同一个 Bot 换这个端点仍能把 type:17 送出去——本任务承诺「每条已鉴权的发卡路径都按有效
 // 配置校验」，少一条这个承诺就是假的。
 func TestStreamStart_RefusesCardPayload(t *testing.T) {
-	handler, _ := streamGateHarness(t)
+	handler, _, _ := streamGateHarness(t)
 
 	card := []byte(`{"type":17,"card_version":"1.0","profile":"octo/v1",` +
 		`"card":{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"x"}]}}`)
@@ -137,7 +172,7 @@ func TestStreamStart_RefusesCardPayload(t *testing.T) {
 // 断言「没有被**这道门**拒掉」，而不是「返回 200」：放行之后请求会一路走到 WuKongIM，
 // 其成败取决于 IM 侧状态，拿它当断言会把一条门禁测试变成环境测试。
 func TestStreamStart_TextPayloadIsNotRefusedByTheCardGate(t *testing.T) {
-	handler, _ := streamGateHarness(t)
+	handler, _, _ := streamGateHarness(t)
 
 	w := postStreamStart(t, handler, []byte(`{"type":1,"content":"hello"}`))
 
@@ -157,7 +192,7 @@ func TestStreamStart_TextPayloadIsNotRefusedByTheCardGate(t *testing.T) {
 // 字符串 type 能否被客户端渲染成卡片是仓外事实（见 journal known-gaps）。哪天答案是
 // 「能」，本用例会连同 sendMessage 侧一起改，而不是让人误以为这里已经覆盖了。
 func TestStreamStart_StringTypedPayloadIsNotACard(t *testing.T) {
-	handler, _ := streamGateHarness(t)
+	handler, _, _ := streamGateHarness(t)
 
 	w := postStreamStart(t, handler, []byte(`{"type":"17","card":{}}`))
 
@@ -178,7 +213,7 @@ func TestStreamStart_StringTypedPayloadIsNotACard(t *testing.T) {
 // 断言的是 stub 记下的 uid，而不是最终状态码：拿状态码当证据的话，「拒绝」既可能因为
 // 钉住生效、也可能因为 victim 恰好也不在群里，两种原因给出同一个绿灯。
 func TestStreamStart_PinsFromUIDToTheAuthenticatedRobot(t *testing.T) {
-	handler, gs := streamGateHarness(t)
+	handler, gs, _ := streamGateHarness(t)
 	gs.member = true // 成员判定放行，把频道门从断言里摘掉，只留身份这一个变量
 
 	body, err := json.Marshal(libconfig.MessageStreamStartReq{
@@ -206,7 +241,7 @@ func TestStreamStart_PinsFromUIDToTheAuthenticatedRobot(t *testing.T) {
 // 与上一条分开：上一条问「按谁的身份查」，这条问「查不过时会不会拒」。合成一条的话，
 // 任何一半坏掉都被另一半的绿灯掩盖。
 func TestStreamStart_ChecksChannelPermission(t *testing.T) {
-	handler, gs := streamGateHarness(t)
+	handler, gs, _ := streamGateHarness(t)
 	gs.member = false // 非群成员
 
 	body, err := json.Marshal(libconfig.MessageStreamStartReq{
@@ -239,7 +274,7 @@ func TestStreamStart_ChecksChannelPermission(t *testing.T) {
 // 没有这条用例，两道门的相对位置就是无人防守的：任谁为了省一次 DB 查询把拒卡挪到前面，
 // 全部既有用例照样绿——因为每一条都只触发其中一道门。
 func TestStreamStart_ChannelCheckPrecedesTheCardGate(t *testing.T) {
-	handler, gs := streamGateHarness(t)
+	handler, gs, _ := streamGateHarness(t)
 	gs.member = false // 非群成员：频道门会拒
 
 	card := []byte(`{"type":17,"card_version":"1.0","profile":"octo/v1",` +
@@ -279,20 +314,22 @@ func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 
 	gs := &stubGroupService{member: true}
 	rb := &Robot{ctx: ctx, Log: log.NewTLog("RobotAllowSendTest"), groupService: gs}
+	// 用常量而非字面量 5：常量若改值，字面量会让这条测试静默改测另一种频道。
+	topicType := common.ChannelTypeCommunityTopic.Uint8()
 
-	assert.True(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", 5),
+	assert.True(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", topicType),
 		"父群成员必须被允许向子区发送")
 	assert.Equal(t, "parent_group_1", gs.askedGroup,
 		"成员查询用的不是父群号——拿整个子区 channelID 去查会永远落空")
 
 	gs.member = false
-	assert.False(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", 5),
+	assert.False(t, rb.allowSendToChannel("bot_a", "parent_group_1____topic_9", topicType),
 		"非父群成员必须被拒")
 
 	// 形状不合法 → fail-closed，且不得把畸形串当群号去查。
 	gs.member = true
 	gs.askedGroup = ""
-	assert.False(t, rb.allowSendToChannel("bot_a", "no_separator_here", 5),
+	assert.False(t, rb.allowSendToChannel("bot_a", "no_separator_here", topicType),
 		"子区 channelID 形状不合法时必须拒绝")
 	assert.Empty(t, gs.askedGroup, "形状不合法时不该发起成员查询")
 
@@ -301,34 +338,51 @@ func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 		"未知频道类型必须继续拒绝")
 }
 
-// TestStreamStart_CommunityTopicIsNotRefusedByTheChannelGate —— round-8 评审的回归。
+// TestStreamStart_CommunityTopicFlowsThroughBothGates —— round-8 评审的回归。
 //
 // 加频道校验之前，streamStart 是三条 robot 路里唯一子区能发的（因为它压根没校验）。
-// 补上校验后，allowSendToChannel 不认 type 5，子区流式立刻变成 403 —— 一个子区助手用
-// 流式增量回复正是最自然的用法。评审指出这一点时没有测试守着，因为原有用例只覆盖了
-// type 1 和 type 2。
-func TestStreamStart_CommunityTopicIsNotRefusedByTheChannelGate(t *testing.T) {
-	handler, gs := streamGateHarness(t)
+// 补上校验后 allowSendToChannel 不认 type 5，子区流式立刻 403 —— 而子区助手用流式增量
+// 回复正是最自然的用法。原有用例只覆盖 type 1 和 2，所以没人拦住。
+//
+// **父群行必须先插进去**：修好频道门之后，那个此前不可达的子区解散守卫第一次被执行，
+// 它会去查 `group` 表。不插这一行的话，请求会在守卫里以 query_failed 结束——本用例仍会
+// 因为断言的是「没被频道门拒」而通过，但它证明的东西比名字承诺的少。第一版就是这样过的。
+func TestStreamStart_CommunityTopicFlowsThroughBothGates(t *testing.T) {
+	handler, gs, ctx := streamGateHarness(t)
 	gs.member = true // 父群成员
+	seedGroup(t, ctx, "streamgate_group", 1)
 
-	body, err := json.Marshal(libconfig.MessageStreamStartReq{
-		ClientMsgNo: "streamgate-topic",
-		FromUID:     streamGateRobotID,
-		ChannelID:   "streamgate_group____topic_1",
-		ChannelType: 5,
-		Payload:     []byte(`{"type":1,"content":"hello"}`),
-	})
-	assert.NoError(t, err)
+	w := postStreamStartTo(t, handler, "streamgate_group____topic_1",
+		common.ChannelTypeCommunityTopic.Uint8(), []byte(`{"type":1,"content":"hello"}`))
 
-	w := httptest.NewRecorder()
-	req, err := http.NewRequest("POST",
-		"/v1/robots/"+streamGateRobotID+"/appkey/stream/start", bytes.NewReader(body))
-	assert.NoError(t, err)
-	req.Header.Set("Content-Type", "application/json")
-	handler.ServeHTTP(w, req)
-
-	assert.NotEqual(t, "err.server.robot.channel_send_forbidden", streamGateErrorCode(w),
-		"父群成员的子区流式被频道门拒了，body=%s", w.Body.String())
 	assert.Equal(t, "streamgate_group", gs.askedGroup,
 		"子区成员判定必须落在父群上")
+	for _, refusal := range []string{
+		"err.server.robot.channel_send_forbidden",
+		"err.server.robot.group_disbanded",
+		"err.server.robot.query_failed",
+	} {
+		assert.NotEqual(t, refusal, streamGateErrorCode(w),
+			"父群成员向未解散子区开流被 %s 拦下了，body=%s", refusal, w.Body.String())
+	}
+}
+
+// TestStreamStart_CommunityTopicDisbandGuardIsLive —— 覆盖被本次改动**激活**的代码。
+//
+// 三个 handler 各有一个解析父群的子区解散守卫，在 allowSendToChannel 认识 type 5 之前
+// 全是死代码——一行都跑不到。修好频道门等于把它们同时启用了，而启用一段从未执行过的分支
+// 却不测它，正是「改动看起来没风险」最容易出事的地方。
+//
+// 与上一条配对：上一条证明未解散的子区能过，这一条证明已解散的过不去。少了任何一条，
+// 「守卫存在」和「守卫永远放行」就分不出来。
+func TestStreamStart_CommunityTopicDisbandGuardIsLive(t *testing.T) {
+	handler, gs, ctx := streamGateHarness(t)
+	gs.member = true // 成员判定放行，只留解散这一个变量
+	seedGroup(t, ctx, "streamgate_dead", group.GroupStatusDisband)
+
+	w := postStreamStartTo(t, handler, "streamgate_dead____topic_1",
+		common.ChannelTypeCommunityTopic.Uint8(), []byte(`{"type":1,"content":"hello"}`))
+
+	assert.Equal(t, "err.server.robot.group_disbanded", streamGateErrorCode(w),
+		"父群已解散仍放行开流，body=%s", w.Body.String())
 }
