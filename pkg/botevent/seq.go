@@ -50,24 +50,26 @@ package botevent
 // axis a bare INCR counter is strictly worse than GenSeq, whose `min_seq` lives in
 // MySQL and does not regress when Redis does.
 //
-// Two mechanisms close it, because neither suffices alone:
+// Two mechanisms close it, and **neither is complete in this change** — see
+// Mininglamp-OSS/octo-server#704, which gates activation on finishing them:
 //
 //   - **A durable high-water mark in MySQL** (`seq` row `botEventHigh:{robotID}`),
 //     advanced roughly every `highWaterInterval` ids and folded into every seed's
 //     floor. It does not share Redis's recovery domain, so it survives an RDB
 //     rollback. Persisting every id would be a DB write per allocation; persisting
-//     every ~1000 keeps the mark within one interval of the truth, which
-//     `seedSafetyMargin` (2 × step) covers — **while the writes land**. That
-//     qualifier is load-bearing and was missing: during a DB outage an unbounded
-//     number of ids would otherwise be issued against a frozen mark, so
-//     the refusal in persistHighWater bounds how far an id may run past the last
-//     mark that actually landed (review P1-7, corrected in the round after it).
+//     every ~1000 keeps the mark within one interval of the truth in healthy
+//     operation, which `seedSafetyMargin` (2 × step) covers. **While durable writes
+//     are failing it trails without bound**, and two attempts to bound that inside
+//     this PR were both wrong — see persistHighWater for the arithmetic that says why
+//     the fix is a change to what the recovery floor *is*, which is #704's.
 //   - **Rollback detection in the issuing process.** The durable mark only helps if
 //     something re-seeds, and a long-running replica would otherwise keep INCRing
 //     the regressed counter forever — its `seeded` entry is already set. So every
 //     allocation is compared against the last id this process issued for that bot;
 //     a value that did not advance means the counter regressed, and the allocation
-//     re-seeds and retries. That makes recovery automatic rather than a runbook.
+//     re-seeds and retries. That makes recovery automatic rather than a runbook —
+//     but the comparison is process-local and tolerance-bounded, which is the other
+//     half of #704.
 //
 // The high-water write uses `GREATEST(min_seq, VALUES(min_seq))`. It must: an
 // unconditional `ON DUPLICATE KEY UPDATE` is exactly how `GenSeq` lets a lagging
@@ -136,6 +138,7 @@ import (
 	rd "github.com/go-redis/redis"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.uber.org/zap"
 )
 
 const (
@@ -205,15 +208,6 @@ const (
 	// seedSafetyMargin with a full interval to spare. What happens when the writes stop
 	// landing is bounded separately, by span rather than by count — see persistHighWater.
 	highWaterInterval = legacyGenSeqStep
-
-	// highWaterProbeEvery is how often a bot past its unpersisted-span bound may attempt
-	// the durable write again.
-	//
-	// The refusal has to be able to end on its own, and it must not depend on the bot's
-	// traffic: the ordinary throttle is measured in ids, so a low-traffic bot would stay
-	// refused long after the DB recovered. A time budget bounds the attempt rate (≤5/s per
-	// bot) while keeping recovery within one budget of the DB coming back.
-	highWaterProbeEvery = 200 * time.Millisecond
 
 	// maxAllocAttempts bounds the self-healing retries within one allocation.
 	//
@@ -348,6 +342,12 @@ return redis.call('INCR', KEYS[2])`
 
 var gateScript = rd.NewScript(gateSource)
 
+const dropMirrorSource = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0`
+
+var dropMirrorScript = rd.NewScript(dropMirrorSource)
+
 // probeSource reads the mode mirror and whether this bot's counter already exists, in one
 // round trip.
 //
@@ -468,19 +468,10 @@ var (
 
 	// lastPersisted throttles the durable write to once per highWaterInterval. It
 	// advances on a *failed* write too, so a DB outage costs one attempt per interval
-	// rather than one per event — which is why it cannot double as the record of what
-	// actually landed. That is lastDurable.
+	// rather than one per event, which is the half of review P1-7 that stays fixed. It is
+	// therefore NOT a record of what landed — see persistHighWater for why this revision
+	// does not try to bound the gap and #704 for who does.
 	lastPersisted sync.Map
-
-	// lastDurable is the highest value this process has successfully written to the
-	// durable mark, seeded from the row itself at seed time. persistHighWater measures
-	// the refusal span from this, so it must never advance on a failure.
-	lastDurable sync.Map
-
-	// lastProbe is when a bot past its unpersisted-span bound last attempted the durable
-	// write. See probeDue: past the bound the refusal must be able to end on its own
-	// without turning every doomed allocation into a blocking DB attempt.
-	lastProbe sync.Map
 
 	// countersLost counts allocations that found the mirror set but the counter key
 	// gone, and mirrorRebuilds counts mirrors rebuilt from the DB authority. Both
@@ -606,13 +597,20 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 	if err != nil {
 		return 0, err
 	}
-	decision, b, err := resolveMode(ctx, mirror)
+	res, err := resolveMode(ctx, mirror)
 	if err != nil {
 		return 0, err
 	}
-	if decision == decideLegacy {
+	if res.unauthorizedMirror != "" {
+		// The authority denied this mirror, so the correct state for the key is absent.
+		// Best-effort and compare-and-delete: a failure only means the next allocation
+		// re-reads the authority, bounded by repairCooldown.
+		dropUnauthorizedMirror(client, res.unauthorizedMirror)
+	}
+	if res.decision == decideLegacy {
 		return legacyDelegate(ctx, robotID, counterExists)
 	}
+	b := res.belief
 
 	// Activated. Two orderings matter here and both were wrong before.
 	rebuildMirror := mirror != b.mirrorValue()
@@ -663,7 +661,6 @@ func allocateFromCounter(ctx *config.Context, client Scripter, robotID string, b
 		countersLost.inc()
 		seeded.Delete(robotID)
 		lastPersisted.Delete(robotID)
-		lastDurable.Delete(robotID)
 		if err := reseed(ctx, client, robotID); err != nil {
 			return 0, err
 		}
@@ -697,7 +694,7 @@ func gateClosed(ctx *config.Context, client Scripter, robotID string, attempt in
 		return 0, fmt.Errorf("botevent: gave up resolving the allocator mode for %q after %d "+
 			"attempts; the mode mirror is being lost or rewritten repeatedly", robotID, attempt)
 	}
-	if _, _, err := refreshAuthority(ctx, false, "", true); err != nil {
+	if _, err := refreshAuthority(ctx, false, "", true); err != nil {
 		return 0, err
 	}
 	seeded.Delete(robotID)
@@ -723,6 +720,10 @@ func gateClosed(ctx *config.Context, client Scripter, robotID string, attempt in
 // that reads legacy — a cold process has no evidence at all and delegates to GenSeq. Only
 // `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it after activation
 // is verified (step 5), so the window is open by design during the flip itself.
+//
+// Note what the env guard does and does not buy, because the refusal message below used to
+// get it wrong: it is a fail-closed *assertion*, not a manual override. Setting it makes an
+// unconfirmable mode refuse loudly on every replica; it never lets one proceed.
 func legacyDelegate(ctx *config.Context, robotID string, counterExists bool) (int64, error) {
 	if prev, issued := lastIssued.Load(robotID); issued {
 		return 0, fmt.Errorf("botevent: refusing to allocate a legacy id for %q after this process "+
@@ -734,9 +735,11 @@ func legacyDelegate(ctx *config.Context, robotID string, counterExists bool) (in
 		return 0, fmt.Errorf("botevent: the authority says the allocator is not activated, but "+
 			"%q already has a counter — which only exists because some replica allocated from it, "+
 			"i.e. the authority was activated and has regressed. Refusing to issue a legacy id "+
-			"below the counter's range; restore the state row (or set %s=%s) rather than letting "+
-			"two id sources onto one queue",
-			SeqKey(robotID), ExpectedModeEnv, ModeIncr)
+			"below the counter's range. Fix the authority: restore %s to mode=1 with the epoch and "+
+			"cutover_floor it had. Setting %s=%s does NOT let this replica proceed — it is a "+
+			"fail-closed assertion, so it only makes every replica refuse loudly instead of some "+
+			"of them degrading",
+			SeqKey(robotID), stateTable, ExpectedModeEnv, ModeIncr)
 	}
 	return legacyEventID(ctx, robotID)
 }
@@ -766,10 +769,38 @@ func probeAllocatorState(client Scripter, robotID string) (mirror string, counte
 	return mirror, exists != 0, nil
 }
 
+// dropUnauthorizedMirror removes a mode mirror the authority denied, if it still holds the
+// exact value that was denied.
+//
+// Compare-and-delete rather than a bare DEL: between the authority read and this call an
+// operator may have activated and written a *different* generation, which must survive.
+//
+// Best-effort. A failure is recorded on the belief so the next allocation is answered from
+// the cached denial for a short cooldown instead of re-reading the authority per
+// allocation — see belief.repairFailedFor. It is not an allocation error: the authority has
+// spoken, legacy is the right answer, and a Redis that rejects this DEL would be failing
+// the counter's own INCR anyway.
+func dropUnauthorizedMirror(client Scripter, denied string) {
+	if err := dropMirrorScript.Run(client, []string{ModeKey}, denied).Err(); err != nil {
+		noteMirrorRepairFailed(denied)
+		unauthorizedWarn.warn("botevent: could not remove the unauthorized mode mirror; "+
+			"allocations stay on the legacy allocator and the authority will be re-read shortly",
+			zap.String("mirrorKey", ModeKey), zap.String("mirrorValue", denied), zap.Error(err))
+	}
+}
+
 // invalidateSeeded drops every bot's seeded marker. See the mirror-rebuild branch in
 // allocate for why a lost mirror invalidates more than the bot being allocated for.
+//
+// `seeded` is cleared **last**, and the order is load-bearing (review P1-2). These are
+// separate unlocked Range passes over every active bot, so a concurrent reseed — which
+// stores its own per-bot state inside seedCounter and only then stores `seeded` — can
+// interleave between them. Clearing `seeded` first would let that reseed's marker survive
+// while its companion state was wiped, i.e. a bot treated as seeded whose bookkeeping this
+// process no longer has. Clearing it last means the worst interleaving leaves a bot
+// *unseeded* with stale bookkeeping, which the next allocation fixes by re-seeding.
 func invalidateSeeded() {
-	for _, m := range []*sync.Map{&seeded, &lastPersisted, &lastDurable} {
+	for _, m := range []*sync.Map{&lastPersisted, &seeded} {
 		m.Range(func(k, _ interface{}) bool {
 			m.Delete(k)
 			return true
@@ -799,7 +830,6 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 		// between, which the next allocation would catch in turn.
 		seeded.Delete(robotID)
 		lastPersisted.Delete(robotID)
-		lastDurable.Delete(robotID)
 		if err := reseed(ctx, client, robotID); err != nil {
 			return 0, err
 		}
@@ -828,12 +858,9 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 		v = retried
 	}
 	recordIssued(robotID, v)
-	if err := persistHighWater(ctx, robotID, v); err != nil {
-		// The id is allocated and unique, but the floor that would recover it after a
-		// Redis rollback has stopped advancing for too long. Failing here trades one
-		// enqueue for the RDB safety margin; see noteHighWaterFailure.
-		return 0, err
-	}
+	// Best-effort, and deliberately not fatal: see persistHighWater for what that costs
+	// and why bounding it is #704's rather than this function's.
+	persistHighWater(ctx, robotID, v)
 	return v, nil
 }
 
@@ -906,54 +933,53 @@ func seedMutex(robotID string) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
-// persistHighWater advances the durable mark, and refuses the allocation when the mark
-// has fallen too far behind for a post-rollback seed to recover from it.
+// persistHighWater advances the durable mark, throttled to once per highWaterInterval.
 //
-// # The bound is a span, not a failure count (review: Jerry-Xin 🔴 / yujiawei P1-B)
+// # It is best-effort, and this revision stops claiming otherwise
 //
-// The previous revision counted consecutive failed intervals and claimed "past the bound
-// the allocation fails". It did not fail. `noteHighWaterFailure` re-armed the throttle
-// marker, and the throttle check ran *before* the bound, so only 1 allocation in every
-// `highWaterInterval` even reached the bound — the other 999 returned nil and succeeded.
-// Issuance continued indefinitely against a frozen mark at a 0.1% failure rate, which is
-// the exact "unbounded ids against a frozen mark" the mechanism existed to stop. And the
-// arithmetic made it a loss path rather than only an unmet claim: with a limit of 3
-// intervals, ids up to `M+2999` were issued while a later seed computed from `M` lands at
-// `M+2000`, so a *restarted* process (empty lastIssued, no in-process refusal) resumes at
-// `M+2001` beneath cursors that already reached `M+2999`.
+// Two previous revisions put a bound here and both were wrong, in opposite directions:
+// a failure *count* that the throttle short-circuited before ever consulting (so only
+// 1 allocation in `highWaterInterval` failed and 999 succeeded against a frozen mark),
+// then a *span* measured from the durable mark — which is over its bound on the very
+// first allocation after every seed, because `seedCounter` sets the counter to
+// `base + seedSafetyMargin` while the mark stays at `base`. That made the refusal fire
+// on the first failed write with no grace, drop the event, and turn the recovery probe
+// into a storm inside `msgSem` slots.
 //
-// So the bound is now the quantity the safety argument actually rests on: how far the
-// issued id has run past the last **durably recorded** mark. A total Redis loss followed
-// by a drained queue leaves `seedCounter` with the durable mark `M` as its only floor
-// source, and it seeds at `M + seedSafetyMargin`. Every id ever issued must therefore be
-// at or below that, so the span is refused at `seedSafetyMargin` and the largest issued id
-// is `M + seedSafetyMargin - 1` — below the first id recovery would hand out. Stated as
-// one inequality instead of a count that had to be reconciled with the margin by hand.
+// Working the arithmetic out properly says why a third local patch would fail too:
 //
-// The throttle stays: a failed write re-arms the interval marker, so a retry is one
-// interval away rather than one id away, and a DB outage costs one INSERT attempt per
-// `highWaterInterval` rather than one per event. Between the first failed attempt and the
-// span bound there is a full interval of grace, so a transient failure costs nothing.
-func persistHighWater(ctx *config.Context, robotID string, v int64) error {
-	base, span, known := unpersistedSpan(robotID, v)
-	overBound := known && span >= seedSafetyMargin
-
-	// Past the bound the allocation is going to fail anyway, so the only thing left worth
-	// doing is recovering promptly. The ordinary throttle cannot do it: it is measured in
-	// ids, so recovery would wait for another ~1000 (refused) allocations after the DB came
-	// back, and for a low-traffic bot that is unbounded wall-clock time. So the probe
-	// switches to a time budget, which bounds the attempt rate without tying recovery to
-	// traffic. It must stay a throttle of some kind: a failing INSERT with a 300ms deadline
-	// inside a held msgSem slot is the hazard, and it does not stop being one because the
-	// enqueue is doomed — 100 slots each blocked 300ms is a throughput cliff for every bot
-	// in the process, healthy ones included.
-	if overBound && !probeDue(robotID) {
-		return unpersistedSpanError(robotID, v, base, span)
-	}
-	if !overBound {
-		if prev, ok := lastPersisted.Load(robotID); ok && v-prev.(int64) < highWaterInterval {
-			return nil
-		}
+//	A seed sets the counter to S = max(sources) + seedSafetyMargin.
+//	A recovery seed replays the *same* computation over the surviving MySQL sources, so
+//	it lands at S again. Ids issued after a seed are S+1, S+2, …, all of them above S.
+//
+// So the first id after any seed is already outside what a recovery from the unchanged
+// mark could reach — the exposure does not start after some grace, it starts
+// immediately. Closing it requires the mark to advance *at seed time*, and a mark that
+// records the seeded value feeds back into the next seed's floor, so every re-seed
+// compounds it by a block (which also breaks the no-op property
+// TestSeedIsIdempotentAndNeverLowers guards). That is a change to what the recovery
+// floor *is*, not a tweak to a comparison — and it is exactly the question
+// Mininglamp-OSS/octo-server#704 owns, together with rollback detection, which has the
+// same shape ("what state can regress, who detects it, what re-establishes the floor").
+// Both reviewers recommended moving it there in one piece rather than iterating here.
+//
+// # So what this function guarantees, plainly
+//
+// In healthy operation the mark trails the highest issued id by less than
+// `highWaterInterval`, which is what makes a post-rollback seed land above what was
+// issued before the rollback. **While durable writes are failing it trails without
+// bound**, and an unbounded number of ids can be issued against a frozen mark. A Redis
+// rollback plus a drained queue after that can then seed below a live consumer cursor.
+// `dmwork_bot_event_seq_high_water_write_failure_total` is the signal, and #704 is the
+// gate: it must be closed before an operator activates, so this exposure is not
+// reachable by merging.
+//
+// The throttle re-arms on failure, so a DB outage costs one INSERT attempt per
+// `highWaterInterval` rather than one per event. That much was never contested and is
+// the half of the earlier finding (P1-7) that stays fixed here.
+func persistHighWater(ctx *config.Context, robotID string, v int64) {
+	if prev, ok := lastPersisted.Load(robotID); ok && v-prev.(int64) < highWaterInterval {
+		return
 	}
 	// The mark records what has been issued, not a reservation above it. Writing
 	// `v + interval` would compound: every seed adds seedSafetyMargin on top of the
@@ -970,90 +996,19 @@ func persistHighWater(ctx *config.Context, robotID string, v int64) error {
 			"on duplicate key update min_seq = GREATEST(min_seq, VALUES(min_seq))",
 		HighWaterSeqKey(robotID), mark).ExecContext(deadline); err != nil {
 		highWaterWriteFailures.inc()
-		// Re-arm the throttle so the retry is one interval away, not one id away. The
-		// durable mark deliberately does NOT advance — it is what the span is measured
-		// from, and advancing it on failure is what made the previous bound unreachable.
+		// Re-arm the throttle so the retry is one interval away, not one id away.
 		storeMonotonic(&lastPersisted, robotID, v)
-		if overBound {
-			return unpersistedSpanError(robotID, v, base, span)
-		}
-		return nil
+		return
 	}
-	// The write landed, so the span collapses to zero and an allocation that was being
-	// refused a moment ago succeeds. That is the recovery path, and it is why the probe
-	// interval above shrinks rather than the refusal becoming permanent.
-	storeMonotonic(&lastDurable, robotID, v)
 	storeMonotonic(&lastPersisted, robotID, v)
-	return nil
-}
-
-// unpersistedSpan reports how far v has run past the last mark that actually landed.
-//
-// known is false for a bot this process has never seeded and never written for; there is
-// no base to measure from, and the first allocation for a bot is never throttled, so the
-// healthy path establishes one immediately.
-func unpersistedSpan(robotID string, v int64) (base, span int64, known bool) {
-	durable, ok := lastDurable.Load(robotID)
-	if !ok {
-		return 0, 0, false
-	}
-	base = durable.(int64)
-	return base, v - base, true
-}
-
-// probeDue reports whether a bot past its bound may attempt the durable write again, and
-// claims the slot if so.
-//
-// CAS rather than load-then-store so concurrent refused allocations for one bot cannot all
-// decide they are the probe.
-func probeDue(robotID string) bool {
-	now := time.Now()
-	for {
-		prev, loaded := lastProbe.Load(robotID)
-		if !loaded {
-			if _, already := lastProbe.LoadOrStore(robotID, now); !already {
-				return true
-			}
-			continue
-		}
-		at := prev.(time.Time)
-		if now.Sub(at) < highWaterProbeEvery {
-			return false
-		}
-		if lastProbe.CompareAndSwap(robotID, at, now) {
-			return true
-		}
-	}
-}
-
-// unpersistedSpanError is the refusal when an id has run too far past the last durable
-// mark.
-//
-// The bound is `seedSafetyMargin` because that is the arithmetic the recovery path uses.
-// After a total Redis loss with a drained queue, `seedCounter`'s surviving floor sources
-// are all in MySQL, and it seeds at `base + seedSafetyMargin`. Every id ever issued has to
-// be at or below that seed, so the span may reach `seedSafetyMargin - 1` and no further;
-// refusing there makes the largest issued id exactly one below the first id a recovery
-// would hand out.
-//
-// The alternative — keep issuing and count the failures — is what the previous revision
-// did, and the arithmetic came out the wrong side of the margin: ids ran to `base+2999`
-// against a margin of 2000, so a restarted process with an empty `lastIssued` resumed at
-// `base+2001`, beneath cursors that had already reached `base+2999`.
-func unpersistedSpanError(robotID string, v, base, span int64) error {
-	return fmt.Errorf("botevent: %q has issued id %d, %d past the last durable high-water mark "+
-		"(%d), and durable writes are failing; a seed recovering from that mark alone would land "+
-		"at %d — at or below ids already issued — so refusing to issue more rather than spend the "+
-		"rollback safety margin silently", robotID, v, span, base, base+seedSafetyMargin)
 }
 
 // storeMonotonic advances a per-bot int64 marker, never lowering it.
 //
 // CAS rather than a plain Store for the same reason recordIssued uses one: concurrent
 // allocations for one bot arrive out of order, and a lower value overwriting a higher one
-// would both cost a redundant write and — for lastDurable — overstate the span, arriving
-// at the refusal earlier than the facts warrant (review P2-9, and the non-atomic
-// read-modify-write the failure counter used to do).
+// costs a redundant durable write later (harmless against the GREATEST upsert, but the
+// asymmetry reads like a bug — review P2-9).
 func storeMonotonic(m *sync.Map, robotID string, v int64) {
 	for {
 		prev, loaded := m.Load(robotID)
@@ -1142,12 +1097,6 @@ func seedCounter(ctx *config.Context, client Scripter, robotID string) error {
 	if err != nil {
 		return err
 	}
-	// Record it as this process's durable base. persistHighWater measures its refusal
-	// span from here, so without this a fresh process would have no base until its
-	// first *successful* write — and if durable writes are already failing, that first
-	// success never comes and the span is never computed. Reading it here costs nothing:
-	// the seed already did the query.
-	storeMonotonic(&lastDurable, robotID, durableMax)
 	floor := queueMax
 	if legacyMax > floor {
 		floor = legacyMax
@@ -1221,7 +1170,7 @@ func legacyCeiling(ctx *config.Context, robotID string) (int64, error) {
 // ResetSeededForTest clears the process-local seed cache. Tests that seed against
 // different fixtures need it; production never does.
 func ResetSeededForTest() {
-	for _, m := range []*sync.Map{&seeded, &lastIssued, &lastPersisted, &lastDurable, &lastProbe, &seedLocks} {
+	for _, m := range []*sync.Map{&seeded, &lastIssued, &lastPersisted, &seedLocks} {
 		m.Range(func(k, _ interface{}) bool {
 			m.Delete(k)
 			return true

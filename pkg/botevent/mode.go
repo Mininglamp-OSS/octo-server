@@ -132,19 +132,51 @@ type belief struct {
 	// both expire; the flag exists so the log says which one happened.
 	confirmed bool
 
-	// deniedMirror is the mirror value this belief was resolved against when that
-	// mirror claimed activation the authority did not confirm.
+	// repairFailedFor / repairFailedAt record a mirror value this process denied and then
+	// could not remove.
 	//
-	// Without it, a forged mirror sitting in Redis costs an authority read on **every**
-	// allocation, serialized behind beliefMu, inside a held msgSem slot — the same
-	// hazard class as the per-allocation read review P1-1 removed, and with no exit,
-	// because nothing rewrites or clears that key (review P1-C). Caching the denial
-	// keyed on the exact value denied keeps the guarantee that matters: a *different*
-	// mirror value, including a genuine activation, is still a conflict and still
-	// forces a read.
-	deniedMirror string
+	// The normal answer to a mirror claiming an unconfirmed activation is to delete it —
+	// see modeResolution.unauthorizedMirror. When that delete fails the key stays, so
+	// without a cooldown every subsequent allocation would read the authority again,
+	// serialized behind beliefMu inside a held msgSem slot: the storm review P1-C named.
+	//
+	// This is deliberately NOT the general "cache the denial" the previous revision had.
+	// That one keyed on the denied value with the full negativeBeliefTTL and could swallow
+	// the genuine activation, because `Activate` bumps epoch 0 → 1 and the tool then writes
+	// exactly the `incr:1` that may already have been sitting there forged (Jerry-Xin 🔴).
+	// Here the window is short, and it only applies while Redis is rejecting our writes —
+	// a state in which the counter's own INCR would be failing too.
+	repairFailedFor string
+	repairFailedAt  time.Time
 
 	resolvedAt time.Time
+}
+
+// modeResolution is what resolveMode answers with.
+type modeResolution struct {
+	decision modeDecision
+
+	// belief is what the caller must use for the gate: its mirrorValue() is the exact
+	// string the gate compares against, so a mirror that has drifted from the validated
+	// generation closes the gate rather than allocating.
+	belief *belief
+
+	// unauthorizedMirror is a mirror value the authority denied, for the caller to remove.
+	//
+	// Deleting it rather than caching the denial is the fix for the swallow described on
+	// belief.repairFailedFor, and it is the symmetric repair to the one the allocator
+	// already performs in the other direction: when the authority says activated and the
+	// mirror disagrees, the mirror is rebuilt. When the authority says legacy, the correct
+	// mirror state is *absent* — "absent" is defined to mean "consult the authority" — so
+	// removing a mirror the authority contradicts restores consistency rather than
+	// destroying information.
+	//
+	// The race is benign: if an operator activates between the authority read and this
+	// delete, a legitimate mirror is removed, every replica's next allocation consults the
+	// authority, finds it activated, and rebuilds it. One extra read each, no mixed source.
+	// `botevent-seq` also refuses to activate while an unauthorized mirror is present, so
+	// that interleaving needs the key to appear during the flip itself.
+	unauthorizedMirror string
 }
 
 // mirrorValue is the exact ModeKey value the gate must find for this belief.
@@ -161,6 +193,12 @@ const (
 	// pre-activation steady state costs well under one authority read per second per
 	// replica instead of one per allocation.
 	negativeBeliefTTL = 5 * time.Second
+
+	// repairCooldown bounds how long a mirror this process failed to remove is answered
+	// from the cached denial instead of re-reading the authority. See
+	// belief.repairFailedFor for why it exists and why it is much shorter than
+	// negativeBeliefTTL.
+	repairCooldown = time.Second
 
 	// authorityTimeout bounds every authority read.
 	//
@@ -290,8 +328,18 @@ func formatMirror(epoch uint64) string {
 //
 // Exported for the operator tool, which must write the same spelling the allocator
 // validates. A bare `incr` would be accepted as a *claim* and then force every replica
-// into an authority read on every allocation until one of them rewrote the key.
+// into an authority read on every allocation until one of them removed the key.
 func MirrorValue(epoch uint64) string { return formatMirror(epoch) }
+
+// ParseMirrorEpoch reports whether a raw ModeKey value claims activation, and for which
+// generation.
+//
+// Exported so the operator tool can recognise a mirror that claims activation the authority
+// has not granted, and refuse to flip while one is present.
+func ParseMirrorEpoch(v string) (uint64, bool) {
+	claims, epoch, _ := parseMirror(v)
+	return epoch, claims
+}
 
 // parseMirror reports whether a mirror value claims activation.
 //
@@ -331,22 +379,23 @@ func cutPrefix(s, prefix string) (string, bool) {
 // caller must use for the gate: its mirrorValue() is the exact string the gate
 // compares against, so a mirror that has drifted from the validated generation
 // closes the gate rather than allocating.
-func resolveMode(ctx *config.Context, mirror string) (modeDecision, *belief, error) {
+func resolveMode(ctx *config.Context, mirror string) (modeResolution, error) {
 	claims, _, _ := parseMirror(mirror)
 
 	if b := activeBelief.Load(); b != nil {
 		// Positive is terminal with respect to legacy.
 		if b.activated {
-			return decideCounter, b, nil
+			return modeResolution{decision: decideCounter, belief: b}, nil
 		}
-		if beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
-			// Negative is trusted while the mirror agrees with it, and also when the
-			// mirror is the *same* value this belief already denied — otherwise a forged
-			// key sitting in Redis costs an authority read per allocation with no exit
-			// (review P1-C).
-			if !claims || (b.confirmed && b.deniedMirror == mirror) {
-				return decideLegacy, b, nil
-			}
+		if !claims && beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
+			return modeResolution{decision: decideLegacy, belief: b}, nil
+		}
+		// A mirror claiming activation normally forces a read — that is what makes a flip
+		// propagate without waiting for the TTL. The one exception is a value this process
+		// already tried and failed to remove: re-reading per allocation then would be the
+		// serialized-read storm review P1-C named, with no exit. See repairCooldown.
+		if claims && mirror == b.repairFailedFor && beliefNow().Sub(b.repairFailedAt) < repairCooldown {
+			return modeResolution{decision: decideLegacy, belief: b}, nil
 		}
 	}
 	return refreshAuthority(ctx, claims, mirror, false)
@@ -366,7 +415,7 @@ func resolveMode(ctx *config.Context, mirror string) (modeDecision, *belief, err
 // caller that arrives after somebody else already did the read it wanted is served from
 // that result, so one lost mode key costs one authority read rather than one per in-flight
 // allocation (review P1-C).
-func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string, force bool) (modeDecision, *belief, error) {
+func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string, force bool) (modeResolution, error) {
 	seen := activeBelief.Load()
 	beliefMu.Lock()
 	defer beliefMu.Unlock()
@@ -375,21 +424,29 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 	// Double-check under the lock: a concurrent caller may already have paid for the
 	// answer this one was about to ask for.
 	if prior != nil && prior != seen {
-		// Somebody refreshed while this caller waited for the lock. That is the answer it
-		// came for, forced or not.
+		// Somebody refreshed while this caller waited for the lock. That is usually the
+		// answer this caller came for — but not when it observed a mirror claiming
+		// activation and the fresh belief is negative: that belief was resolved against a
+		// *different* mirror observation, so serving it here would delegate to GenSeq on
+		// evidence this caller has already contradicted (review P2-3). Fall through and
+		// read.
 		if prior.activated {
-			return decideCounter, prior, nil
+			return modeResolution{decision: decideCounter, belief: prior}, nil
 		}
-		return decideLegacy, prior, nil
+		if !mirrorClaimsIncr {
+			return modeResolution{decision: decideLegacy, belief: prior}, nil
+		}
 	}
 	if prior != nil && !force {
 		if prior.activated {
-			return decideCounter, prior, nil
+			return modeResolution{decision: decideCounter, belief: prior}, nil
 		}
-		if beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
-			if !mirrorClaimsIncr || (prior.confirmed && prior.deniedMirror == mirror) {
-				return decideLegacy, prior, nil
-			}
+		if !mirrorClaimsIncr && beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
+			return modeResolution{decision: decideLegacy, belief: prior}, nil
+		}
+		if mirrorClaimsIncr && mirror == prior.repairFailedFor &&
+			beliefNow().Sub(prior.repairFailedAt) < repairCooldown {
+			return modeResolution{decision: decideLegacy, belief: prior}, nil
 		}
 	}
 
@@ -397,9 +454,9 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 	switch {
 	case err == nil && st.Activated():
 		if err := assertExpectedMode(true); err != nil {
-			return decideLegacy, nil, err
+			return modeResolution{}, err
 		}
-		return install(&belief{activated: true, epoch: st.Epoch, confirmed: true, resolvedAt: beliefNow()})
+		return install(&belief{activated: true, epoch: st.Epoch, confirmed: true, resolvedAt: beliefNow()}, "")
 
 	case err == nil, errors.Is(err, ErrStateMissing):
 		// The authority says legacy, or says nothing because the migration has not
@@ -410,11 +467,12 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 			// Asserted rather than assumed: the consequence of getting it wrong is a
 			// permanently invisible event, and this is the exact shape a migration
 			// rollback produces (review P1-4).
-			return decideLegacy, nil, fmt.Errorf("botevent: the authority now says the allocator "+
+			return modeResolution{}, fmt.Errorf("botevent: the authority now says the allocator "+
 				"is not activated (epoch %d, %v), but this process has already issued counter ids; "+
 				"refusing to downgrade to the legacy allocator, whose ids would land below live "+
 				"consumer cursors", prior.epoch, err)
 		}
+		unauthorized := ""
 		if mirrorClaimsIncr {
 			// A mirror claiming an activation the authority denies. Legacy is what the
 			// authority says, so that is the answer — but somebody wrote that key, and
@@ -423,51 +481,74 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 			// header for what does and what remains residual.
 			mirrorUnauthorized.inc()
 			unauthorizedWarn.warn("botevent: mode mirror claims activation but the authority does not; "+
-				"ignoring the mirror and allocating from the legacy allocator",
-				zap.String("mirrorKey", ModeKey), zap.Error(err))
+				"removing the stale mirror and allocating from the legacy allocator",
+				zap.String("mirrorKey", ModeKey), zap.String("mirrorValue", mirror), zap.Error(err))
+			unauthorized = mirror
 		}
 		if err := assertExpectedMode(false); err != nil {
-			return decideLegacy, nil, err
+			return modeResolution{}, err
 		}
-		// deniedMirror records which value was denied, so the next allocation seeing the
-		// same forged key is served from this belief instead of paying for another read.
-		denied := ""
-		if mirrorClaimsIncr {
-			denied = mirror
-		}
-		return install(&belief{confirmed: true, deniedMirror: denied, resolvedAt: beliefNow()})
+		return install(&belief{confirmed: true, resolvedAt: beliefNow()}, unauthorized)
 
 	default:
 		// Inconclusive.
 		authorityUnreadable.inc()
 		if prior != nil && prior.activated {
-			return decideLegacy, nil, fmt.Errorf("botevent: the authority is unreadable (%w) and this "+
+			return modeResolution{}, fmt.Errorf("botevent: the authority is unreadable (%w) and this "+
 				"process has already issued counter ids; refusing to downgrade to the legacy allocator", err)
 		}
 		if mirrorClaimsIncr {
-			return decideLegacy, nil, fmt.Errorf("botevent: the mode mirror claims activation but the "+
+			return modeResolution{}, fmt.Errorf("botevent: the mode mirror claims activation but the "+
 				"authority is unreadable (%w); refusing to allocate — the counter cannot be trusted "+
 				"unconfirmed, and legacy would issue ids below live cursors if the claim is true", err)
 		}
 		if guardErr := assertExpectedMode(false); guardErr != nil {
-			return decideLegacy, nil, guardErr
+			return modeResolution{}, guardErr
 		}
 		unreadableWarn.warn("botevent: allocator authority unreadable; treating as not activated",
 			zap.Error(err))
 		// Cache the inconclusive answer too. During a DB outage the alternative is one
 		// failed read per allocation on the fan-out path, which is the cost this cache
 		// exists to remove.
-		return install(&belief{resolvedAt: beliefNow()})
+		return install(&belief{resolvedAt: beliefNow()}, "")
 	}
 }
 
-// install stores a belief and returns the matching decision.
-func install(b *belief) (modeDecision, *belief, error) {
+// install stores a belief and returns the matching resolution.
+//
+// unauthorizedMirror is passed through to the caller rather than acted on here: repairing
+// it is a Redis write and this file deliberately does no Redis I/O — the allocator holds
+// the client.
+func install(b *belief, unauthorizedMirror string) (modeResolution, error) {
 	activeBelief.Store(b)
+	res := modeResolution{belief: b, unauthorizedMirror: unauthorizedMirror}
 	if b.activated {
-		return decideCounter, b, nil
+		res.decision = decideCounter
+		return res, nil
 	}
-	return decideLegacy, b, nil
+	res.decision = decideLegacy
+	return res, nil
+}
+
+// noteMirrorRepairFailed records that an unauthorized mirror could not be removed, so the
+// next allocations are answered from the cached denial for repairCooldown rather than
+// re-reading the authority each time. See belief.repairFailedFor.
+//
+// Copy-on-write like every other belief update: the pointer is swapped, never mutated, so
+// a reader on the hot path cannot see a half-updated belief.
+func noteMirrorRepairFailed(denied string) {
+	beliefMu.Lock()
+	defer beliefMu.Unlock()
+	cur := activeBelief.Load()
+	if cur == nil || cur.activated {
+		// Nothing to cool down: an activated belief does not consult the mirror claim at
+		// all, and with no belief the next allocation reads the authority anyway.
+		return
+	}
+	updated := *cur
+	updated.repairFailedFor = denied
+	updated.repairFailedAt = beliefNow()
+	activeBelief.Store(&updated)
 }
 
 // readStateDeadlined reads the authority under authorityTimeout.

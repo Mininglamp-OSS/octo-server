@@ -3,7 +3,6 @@ package botevent
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	rd "github.com/go-redis/redis"
@@ -166,23 +165,34 @@ func TestColdProcessRefusesWhenACounterOutlivesTheAuthority(t *testing.T) {
 	setStateMode(t, ctx, StateModeIncr, 0)
 }
 
-// TestDeniedMirrorIsNotRereadPerAllocation is review P1-C.
+// TestUnauthorizedMirrorIsRemovedNotCached is review P1-C and, after it, Jerry-Xin's 🔴.
 //
-// A mirror claiming activation skips the negative TTL by design — that is what makes a
-// flip propagate without waiting. But nothing rewrites or clears a *forged* mirror, so
-// before this fix every allocation performed its own authority read, serialized behind
-// beliefMu, inside a held msgSem slot, with no exit until a human deleted the key. That is
-// the same hazard class as the per-allocation read review P1-1 removed.
-func TestDeniedMirrorIsNotRereadPerAllocation(t *testing.T) {
+// P1-C: a mirror claiming activation skips the negative TTL by design — that is what makes a
+// flip propagate without waiting — but nothing rewrites or clears a *forged* mirror, so every
+// allocation used to perform its own authority read, serialized behind beliefMu inside a held
+// msgSem slot, with no exit until a human deleted the key.
+//
+// The first attempt at that was to cache the denial keyed on the mirror value. Review found
+// it could swallow the real activation: `Activate` bumps epoch 0 → 1 and the tool then writes
+// exactly `incr:1`, so a forged `incr:1` denied beforehand is byte-identical to the genuine
+// mirror, and those replicas keep serving legacy for the whole TTL while others allocate from
+// the counter. Two live id sources at the flip.
+//
+// So the answer is to *remove* the contradicted key instead of remembering it — the symmetric
+// repair to rebuilding the mirror when the authority says activated. Both properties then hold
+// with no cache to go stale.
+func TestUnauthorizedMirrorIsRemovedNotCached(t *testing.T) {
 	ctx, client := seqTestCtx(t)
-	robotID := "seqtest_deniedmirror_bot"
+	robotID := "seqtest_unauthmirror_bot"
 	fixture(t, ctx, client, robotID)
 
-	// Authority says legacy; somebody planted a mirror claiming otherwise.
+	// Authority says legacy; somebody planted a mirror claiming otherwise — and planted
+	// exactly the value the first real activation will produce, which is the case that broke
+	// the previous fix.
 	setStateMode(t, ctx, StateModeLegacy, 0)
 	ResetSeededForTest()
 	client.Del(SeqKey(robotID))
-	if err := client.Set(ModeKey, MirrorValue(7), 0).Err(); err != nil {
+	if err := client.Set(ModeKey, MirrorValue(1), 0).Err(); err != nil {
 		t.Fatalf("plant mirror: %v", err)
 	}
 
@@ -193,117 +203,140 @@ func TestDeniedMirrorIsNotRereadPerAllocation(t *testing.T) {
 			t.Fatalf("allocate %d: %v", i, err)
 		}
 	}
-	reads := AuthorityReads() - before
-	if reads > 1 {
-		t.Errorf("%d allocations against a denied mirror issued %d authority reads; a forged key "+
-			"nobody clears must not cost a serialized DB read per allocation on the fan-out path",
-			allocations, reads)
+	if reads := AuthorityReads() - before; reads > 1 {
+		t.Errorf("%d allocations against an unauthorized mirror issued %d authority reads; the "+
+			"contradicted key must be removed so subsequent allocations take the ordinary "+
+			"negative-TTL path, not a serialized DB read each", allocations, reads)
+	}
+	if v, err := client.Get(ModeKey).Result(); err != rd.Nil {
+		t.Errorf("the unauthorized mirror is still present (%q, err=%v); the authority said "+
+			"legacy, and the correct mirror state for that is absent", v, err)
 	}
 
-	// A *different* mirror value is still a conflict and must still be read — otherwise a
-	// genuine activation would be swallowed by the cached denial.
-	if err := client.Set(ModeKey, MirrorValue(8), 0).Err(); err != nil {
-		t.Fatalf("change mirror: %v", err)
+	// Now the operator activates for real, to the same epoch the forged key claimed. The
+	// flip must take effect on the next allocation — no TTL, no swallowed activation.
+	setStateMode(t, ctx, StateModeIncr, 0)
+	if _, err := ctx.DB().UpdateBySql("update `"+stateTable+"` set `epoch`=1 where `singleton_id`=?",
+		stateSingletonID).Exec(); err != nil {
+		t.Fatalf("advance epoch: %v", err)
 	}
-	if _, err := nextEventID(ctx, client, robotID); err != nil {
-		t.Fatalf("allocate after the mirror changed: %v", err)
+	if err := client.Set(ModeKey, MirrorValue(1), 0).Err(); err != nil {
+		t.Fatalf("write activation mirror: %v", err)
 	}
-	if AuthorityReads()-before <= reads {
-		t.Error("a mirror value that has not been denied yet must force an authority read; " +
-			"caching the denial by value is what keeps a real flip from being swallowed")
+
+	id, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("allocate after activation: %v", err)
+	}
+	if n, _ := client.Exists(SeqKey(robotID)).Result(); n == 0 {
+		t.Fatalf("the allocation after activation returned %d without creating the counter, so it "+
+			"came from GenSeq: the genuine activation was swallowed because its mirror value "+
+			"happened to equal one that had been denied earlier", id)
 	}
 }
 
-// round's P1-7 "fix", which both reviewers found did not fail closed.
+// TestFailedDurableWriteIsThrottledAndDoesNotFailTheEnqueue pins what the durable mark
+// mechanism actually guarantees, after two attempts to bound it were both wrong.
 //
-// The bound was a count of failed intervals, and `persistHighWater` short-circuited on the
-// throttle marker *before* consulting it — so once the bound was reached only 1 allocation
-// in every `highWaterInterval` even reached the check, and the other 999 succeeded.
-// Issuance continued indefinitely against a frozen mark at a 0.1% failure rate, which is
-// the unbounded exposure the mechanism claimed to prevent. Worse, with a limit of 3 the ids
-// ran to `M+2999` while `seedSafetyMargin` is 2000, so a *restarted* process (empty
-// lastIssued, no in-process refusal) would resume at `M+2001` beneath cursors that had
-// already reached `M+2999`.
+// What is guaranteed:
 //
-// The previous test could not see any of it: it called `noteHighWaterFailure` directly with
-// values spaced exactly one interval apart, so it never went through the short-circuit that
-// swallowed the intervening 999, and it asserted a helper's return value rather than the
-// allocator's behaviour. This one drives real allocations with the durable write broken,
-// which is the only shape that could have caught it.
-func TestHighWaterFailuresStopIssuanceThroughTheRealPath(t *testing.T) {
+//   - A failing durable write does not fail the enqueue. The id is already allocated and
+//     unique; refusing here would trade a live event for bookkeeping.
+//   - The attempt is throttled to roughly one per highWaterInterval rather than one per
+//     event. That is the half of review P1-7 that stays fixed here: leaving the throttle
+//     marker unset on failure put one un-deadlined INSERT on the fan-out path per event.
+//
+// What is NOT guaranteed, and is pinned as a test fact below rather than asserted away:
+// while the writes keep failing the mark trails **without bound**. See persistHighWater for
+// the arithmetic showing why bounding it means changing what the recovery floor is, and
+// Mininglamp-OSS/octo-server#704, which owns that and gates activation.
+func TestFailedDurableWriteIsThrottledAndDoesNotFailTheEnqueue(t *testing.T) {
 	ctx, client := seqTestCtx(t)
-	robotID := "seqtest_highwaterbound_bot"
+	robotID := "seqtest_highwaterthrottle_bot"
 	fixture(t, ctx, client, robotID)
 
-	// One healthy allocation establishes the durable base, as the first allocation for a
-	// bot always does (it is never throttled).
-	first, err := nextEventID(ctx, client, robotID)
-	if err != nil {
+	// One healthy allocation, so the mark exists and the throttle marker is armed.
+	if _, err := nextEventID(ctx, client, robotID); err != nil {
 		t.Fatalf("first allocate: %v", err)
 	}
-	base, err := highWaterCeiling(ctx, robotID)
-	if err != nil || base == 0 {
-		t.Fatalf("the first allocation must land the durable mark (base=%d err=%v)", base, err)
+	mark, err := highWaterCeiling(ctx, robotID)
+	if err != nil || mark == 0 {
+		t.Fatalf("the first allocation must land the durable mark (mark=%d err=%v)", mark, err)
 	}
 
-	// Now the durable write breaks. Renaming the row's table out from under the allocator
-	// is the closest thing to a DB outage that leaves Redis usable, which is the state the
-	// bound exists for.
+	// Renaming the table out from under the allocator is the closest thing to a
+	// write-side DB outage that leaves Redis perfectly usable, which is the state that
+	// matters: the seed's reads already succeeded, so this is reachable without a full
+	// MySQL outage (a read-only failover, disk full, lock contention, or simply the
+	// 300ms deadline under load).
 	if _, err := ctx.DB().Exec("RENAME TABLE `seq` TO `seq_hidden_for_test`"); err != nil {
 		t.Skipf("cannot rename seq table to simulate a durable-write outage: %v", err)
 	}
+	restored := false
 	t.Cleanup(func() {
-		_, _ = ctx.DB().Exec("RENAME TABLE `seq_hidden_for_test` TO `seq`")
+		if !restored {
+			_, _ = ctx.DB().Exec("RENAME TABLE `seq_hidden_for_test` TO `seq`")
+		}
 	})
 
-	// Walk the counter forward past the bound. Every allocation must either succeed with an
-	// id inside the recoverable window, or fail — never succeed outside it.
-	var lastOK int64 = first
-	refusedAt := int64(0)
-	for i := 0; i < 3*seedSafetyMargin; i++ {
-		v, err := nextEventID(ctx, client, robotID)
-		if err != nil {
-			refusedAt = lastOK
-			break
+	before := HighWaterWriteFailures()
+	const allocations = 3 * highWaterInterval
+	for i := 0; i < allocations; i++ {
+		if _, err := nextEventID(ctx, client, robotID); err != nil {
+			t.Fatalf("allocation %d failed while durable writes were broken: %v — the mark is "+
+				"bookkeeping, and a failed write must not cost a live event", i, err)
 		}
-		if v-base >= seedSafetyMargin {
-			t.Fatalf("allocation %d succeeded at id %d, %d past the frozen durable mark %d; a "+
-				"seed recovering from that mark lands at %d, so this id is unrecoverable and "+
-				"must have been refused", i, v, v-base, base, base+seedSafetyMargin)
-		}
-		lastOK = v
 	}
-	if refusedAt == 0 {
-		t.Fatalf("issuance never stopped: %d allocations succeeded with the durable write "+
-			"failing throughout, which is the unbounded exposure the bound exists to close",
-			3*seedSafetyMargin)
+	attempts := HighWaterWriteFailures() - before
+	if attempts == 0 {
+		t.Fatal("no durable write was even attempted, so this test proved nothing about the throttle")
+	}
+	// Roughly one attempt per interval. The bound is generous — what it rules out is the
+	// per-event storm, which would be ~3000 here.
+	if maxAttempts := int64(allocations/highWaterInterval) + 2; attempts > maxAttempts {
+		t.Errorf("%d allocations with the durable write failing produced %d attempts (max %d); "+
+			"the throttle must not be re-armed only on success, or a DB outage puts one "+
+			"un-deadlined INSERT on the fan-out path per event", allocations, attempts, maxAttempts)
 	}
 
-	// And it stays refused — the bound is not a once-per-interval probe.
-	for i := 0; i < 5; i++ {
-		if _, err := nextEventID(ctx, client, robotID); err == nil {
-			t.Fatalf("allocation %d past the bound succeeded; the refusal must apply to every "+
-				"allocation in the frozen window, not one per interval", i)
-		}
-	}
-
-	// Recovery must be reachable, and must not depend on the bot's traffic: the probe
-	// while past the bound is on a time budget, so one budget after the DB comes back the
-	// next allocation lands the mark and succeeds.
+	// The known gap, asserted as still present so it becomes the regression test the day
+	// #704 closes it: the mark has not moved while thousands of ids were issued above it.
 	if _, err := ctx.DB().Exec("RENAME TABLE `seq_hidden_for_test` TO `seq`"); err != nil {
 		t.Fatalf("restore seq table: %v", err)
 	}
-	deadline := time.Now().Add(5 * highWaterProbeEvery)
-	for {
-		if _, err := nextEventID(ctx, client, robotID); err == nil {
-			break
+	restored = true
+	after, err := highWaterCeiling(ctx, robotID)
+	if err != nil {
+		t.Fatalf("read mark: %v", err)
+	}
+	if after != mark {
+		t.Fatalf("the durable mark moved from %d to %d while writes were failing, which this "+
+			"test does not expect — if the mechanism now advances it some other way, this "+
+			"assertion is the one to update", mark, after)
+	}
+	issued, _ := client.Get(SeqKey(robotID)).Int64()
+	if issued-after < seedSafetyMargin {
+		t.Fatalf("only %d ids were issued past the frozen mark, less than seedSafetyMargin (%d); "+
+			"this test is supposed to demonstrate the *unbounded* trail, so it needs to run "+
+			"longer to be meaningful", issued-after, int64(seedSafetyMargin))
+	}
+	t.Logf("known gap (#704): %d ids issued past a frozen durable mark at %d; a seed recovering "+
+		"from that mark alone would land at %d, below ids already issued",
+		issued-after, after, after+seedSafetyMargin)
+
+	// And it recovers on its own once writes work again — after one more interval of ids,
+	// because the throttle marker was re-armed at the last failed attempt. That latency is
+	// the price of not putting an INSERT on every allocation, and it is stated here rather
+	// than assumed: an earlier revision added a second, time-based probe to shorten it,
+	// which is what turned the failure path into a storm inside msgSem slots.
+	for i := 0; i <= highWaterInterval; i++ {
+		if _, err := nextEventID(ctx, client, robotID); err != nil {
+			t.Fatalf("allocate %d after restoring the table: %v", i, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("allocation did not resume within %v of durable writes working again; the "+
-				"refusal has to be able to end on its own, not wait for the bot's next %d ids",
-				5*highWaterProbeEvery, highWaterInterval)
-		}
-		time.Sleep(highWaterProbeEvery / 4)
+	}
+	if final, err := highWaterCeiling(ctx, robotID); err != nil || final <= after {
+		t.Errorf("the mark must resume advancing once durable writes work (was %d, now %d, err=%v)",
+			after, final, err)
 	}
 }
 

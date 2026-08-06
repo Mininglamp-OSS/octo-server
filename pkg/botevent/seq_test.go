@@ -550,9 +550,7 @@ func TestHighWaterNeverMovesBackwards(t *testing.T) {
 	robotID := "seqtest_highwater_bot"
 	fixture(t, ctx, client, robotID)
 
-	if err := persistHighWater(ctx, robotID, 900000); err != nil {
-		t.Fatalf("persist high-water: %v", err)
-	}
+	persistHighWater(ctx, robotID, 900000)
 	high, err := highWaterCeiling(ctx, robotID)
 	if err != nil || high == 0 {
 		t.Fatalf("first write did not land (high=%d err=%v)", high, err)
@@ -561,9 +559,7 @@ func TestHighWaterNeverMovesBackwards(t *testing.T) {
 	// A replica that is behind tries to persist a lower mark, as one would after a
 	// rollback or when running with a stale block.
 	lastPersisted.Delete(robotID)
-	if err := persistHighWater(ctx, robotID, 1000); err != nil {
-		t.Fatalf("persist lower high-water: %v", err)
-	}
+	persistHighWater(ctx, robotID, 1000)
 
 	after, err := highWaterCeiling(ctx, robotID)
 	if err != nil {
@@ -584,9 +580,7 @@ func TestSeedRecoversFromTheDurableMarkAlone(t *testing.T) {
 	fixture(t, ctx, client, robotID)
 
 	const mark = 777000
-	if err := persistHighWater(ctx, robotID, mark); err != nil {
-		t.Fatalf("persist high-water: %v", err)
-	}
+	persistHighWater(ctx, robotID, mark)
 	// Everything Redis knew is gone.
 	client.Del(SeqKey(robotID), QueueKey(robotID))
 	ResetSeededForTest()
