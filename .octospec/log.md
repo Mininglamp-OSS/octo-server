@@ -18,6 +18,11 @@ change-log convention (§7). Newest first.
   The precedent that looked right was the wrong one — `bot_mention_pref` is a
   table because it is two-dimensional, not because tables are preferred. See
   [journal](journal/shared/bot-setting-store.md).
+  Three review rounds across four heads found three P1s, every one a sibling
+  path or sibling consumer left behind when a new gate went in: the raw branch
+  of `bot/message/edit`, the legacy robot send ingress, and the manifest that
+  advertises what the gate accepts. The journal's "What review found that the
+  author did not" section records the pattern rather than only the fixes.
 - **Learning (pending)** —
   [`cleanalltables-does-not-reset-in-process-caches`](learnings/pending/cleanalltables-does-not-reset-in-process-caches.md):
   generalizes the existing "CleanAllTables does not clear Redis rate-limit
