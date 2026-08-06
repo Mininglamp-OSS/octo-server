@@ -266,6 +266,7 @@ func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
 		fatal("refusing floor=%d: it must be positive and at most %d, above which int64 ids no "+
 			"longer have distinct float64 sorted-set scores", floor, int64(maxSafeFloor))
 	}
+	refuseUnauthorizedMirror(ctx, client)
 	fmt.Printf("\nactivating with floor=%d (observed max=%d)\n", floor, ev.observedMax())
 
 	flipped, epoch, err := botevent.Activate(ctx, floor, ev.observedMax())
@@ -303,6 +304,46 @@ func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
 // It must be the exact spelling the allocator validates (botevent.MirrorValue): a bare
 // `incr` is only a claim, and every replica would keep re-reading the authority until
 // somebody wrote the real value.
+// refuseUnauthorizedMirror stops an activation while a mirror claiming activation is
+// already present against a legacy authority.
+//
+// Two reasons, and the second is the one that is easy to miss:
+//
+//   - It is evidence that this Redis is not in the state the operator thinks it is —
+//     someone wrote that key, or it is shared with another environment, or a snapshot from
+//     an activated era was restored. Any of those wants a human look before an
+//     irreversible flip.
+//   - The allocator's repair for such a key is to delete it, and the first activation
+//     produces `incr:1` — byte-identical to a forged `incr:1`. Removing the precondition
+//     here means the delete can never race the genuine mirror write. Replicas would
+//     recover on their own even if it did (they would consult the authority and rebuild),
+//     but "recovers on its own" is not a thing to spend at a supervised step.
+//
+// Runs after the floor checks so the operator sees every other problem in one pass.
+func refuseUnauthorizedMirror(ctx *config.Context, client *rd.Client) {
+	v, err := client.Get(botevent.ModeKey).Result()
+	if err == rd.Nil {
+		return
+	}
+	if err != nil {
+		fatal("cannot read the mode mirror (%v); refusing to activate without knowing whether a "+
+			"stale one is present", err)
+	}
+	if _, ok := botevent.ParseMirrorEpoch(v); !ok {
+		// Not a claim of activation. A malformed value is worth reporting but does not
+		// interact with the flip: the allocator treats it as absent.
+		fmt.Fprintf(os.Stderr, "note: %s holds %q, which is not a valid mirror value; allocators "+
+			"treat it as absent and it will be overwritten by this activation\n", botevent.ModeKey, v)
+		return
+	}
+	fatal("refusing to activate: %s already holds %q while the authority says legacy.\n"+
+		"Nothing should have written that — it means this Redis was activated before, is shared "+
+		"with another environment, or was restored from an activated snapshot. Confirm which, "+
+		"then DEL the key and rerun.\n"+
+		"Allocators are meanwhile ignoring it and staying on the legacy allocator "+
+		"(dmwork_bot_event_seq_mirror_unauthorized_total is counting it).", botevent.ModeKey, v)
+}
+
 func writeMirror(client *rd.Client, epoch uint64) {
 	if err := client.Set(botevent.ModeKey, botevent.MirrorValue(epoch), 0).Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: authority is at epoch %d but the mirror write failed "+
