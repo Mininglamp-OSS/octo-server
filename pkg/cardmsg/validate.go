@@ -44,6 +44,12 @@ func Validate(payload map[string]interface{}) error {
 			return fmt.Errorf("%w: render_profile=%q", ErrCardProfileUnsupported, renderProfile)
 		}
 	}
+	// PR-C D3 defense in depth：携带 server-authored catalog 标记的信封必须是
+	// canonical 形状（strict parse + template_ref↔metadata 一致）。raw ingress
+	// 的显式拒绝在各自边界；这里兜住任何遗漏路径与编辑重写。
+	if err := validateCatalogMarkers(payload); err != nil {
+		return err
+	}
 	card, ok := payload["card"].(map[string]interface{})
 	if !ok || len(card) == 0 {
 		return ErrCardMissing

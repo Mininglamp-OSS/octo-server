@@ -31,6 +31,19 @@
 - `card_version` 当前固定 `"1.5"`；`profile` 见 §3。
 - 未知的**额外**顶层字段被容忍（前向兼容）。P2 起信封新增可选字段：
   `card_seq`（整数，乱序防护）、`transient`（bool，进度帧不入变更历史）。
+- E3 PR-C 起另有两个**服务端独占**的顶层标记，用于 Registry / dynamic catalog 帧：
+  `template_ref`（`{id, version}`，已存在）与 `catalog_provenance`
+  （`{version, principal_type, principal_id, space_id}`，新增）。两者都**只能由
+  服务端在渲染出口写入**：raw ingress（bot 原始发卡、robot、incoming webhook）
+  携带任一 key 一律拒绝，编辑路径也不能新增或改写它们。
+  - 兼容矩阵（`cardmsg.CatalogFrameMarkers`）：两者皆无 = pre-PR-C 旧帧，合法；
+    只有 `template_ref` = pre-PR-C 的 Bot Registry 帧，合法；两者皆有 = 严格校验，
+    `template_ref` 必须与 `card.metadata.octo.template` 完全一致；
+    **只有 `catalog_provenance` 而无 `template_ref` = 拒绝**（无法验证它在描述什么）。
+  - `principal_type` 只取 `bot` / `internal_producer`。`space_id` 是这次发送**被授权
+    针对的** Space：群/子区取目标群行的 Space，DM 取 bot 的权威 Space。
+  - 存在这两个标记的意义：历史编辑与 action-context 不再靠 `msg.FromUID` 猜
+    producer 身份，而是从服务端自己写下的帧里恢复。
 
 ## 2. octo/v1 profile（P1 展示白名单）
 
@@ -163,6 +176,11 @@ view/state/wire profile 以及每个 view 的 `submit_actions`；不能从
    ingress —— 渲染门禁是残余风险的最后防线。`from_uid` 由 IM 连接鉴权绑定，
    不可伪造。
 3. **P2 动作端点**再次服务端复验目标消息 sender 身份。
+4. **E3 PR-C：动作端点还复验存储 provenance**。帧带 `catalog_provenance` 时，
+   声明的 principal 必须与存储 `FromUID` 一致（bot），或经只读 producer binding
+   解析回同一个 `FromUID`（internal producer）；声明的 Space 与信封 Space 两者
+   都非空时必须相等。缺失即 pre-PR-C 帧，走既有兼容路径。这一层挡的是「拿到一个
+   合法帧、改掉里面的 principal 去冒充另一个 producer」。
 
 **服务端展示面的对应纪律**：推送 / 搜索命中 / 摘要 / 置顶 / 引用等由服务端
 产出文案的面，对 sender 非 bot/webhook 身份的 type-17 一律显示 `[卡片]`，

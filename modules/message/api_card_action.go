@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -220,15 +222,30 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
-	cardSpaceID := m.resolveCardOriginSpaceID(msgM)
-	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardtmpl.CatalogAccess{
-		Purpose: cardtmpl.CatalogPurposeActionContext,
-		Principal: cardtmpl.CatalogPrincipal{
-			Kind: cardtmpl.CatalogPrincipalBot, ID: msgM.FromUID, SpaceID: cardSpaceID,
+	cardSpaceID, cardSpaceKnown := m.resolveCardOriginSpaceID(msgM)
+	// PR-C D3：principal 从生效帧的 stored provenance 恢复并校验（sender/
+	// producer 绑定/Space 一致性都在 resolveRegistryCardContext 内 fail-close）；
+	// 无标记的 legacy 帧沿用 sender 派生的 bot principal（static 兼容）。
+	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardActionFrameOrigin{
+		SenderUID:  msgM.FromUID,
+		SpaceID:    cardSpaceID,
+		SpaceKnown: cardSpaceKnown,
+		ProducerBinding: func(producerID string) (string, bool) {
+			return carddispatch.ProducerBindingFromContext(m.ctx, carddispatch.ProducerID(producerID))
 		},
 	}, effective, req.ActionID, actionData)
 	if err != nil {
 		m.releaseCardClaim(idemKey)
+		if errors.Is(err, errCardOriginSpaceUnavailable) {
+			// The click is well formed and the frame may be perfectly valid; we
+			// simply could not read the card's Space to check it against. That
+			// is an outage on our side, and answering 400 would both mislead
+			// the operator and tell the client not to retry.
+			m.Error("卡片来源 Space 不可用,无法校验 stored provenance",
+				zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
 		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
 			zap.Error(err), zap.String("messageID", req.MessageID), zap.String("actionID", req.ActionID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
@@ -300,12 +317,34 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	c.Response(map[string]interface{}{"accepted": true, "replay": false})
 }
 
+// cardActionFrameOrigin carries the server-side facts a stored frame's
+// provenance is validated against: the stored sender, the card's
+// authoritative origin Space, and the read-only producer-binding resolver.
+// None of these values comes from the click request.
+type cardActionFrameOrigin struct {
+	SenderUID string
+	SpaceID   string
+	// SpaceKnown reports that SpaceID is a determined fact. False means the
+	// origin lookup did not answer, which is not the same as "this card is in
+	// no Space" — see resolveCardOriginSpaceID. A frame's provenance can only
+	// be validated against a Space that was actually established.
+	SpaceKnown      bool
+	ProducerBinding func(producerID string) (senderUID string, ok bool)
+}
+
 // resolveRegistryCardContext binds callback context to metadata and interaction
 // reports from the effective server-authored frame. Cards without octo-card
 // template metadata retain the legacy zero context.
+//
+// PR-C D3：帧携带 catalog_provenance 时，它是 principal 的唯一来源 —— 先证明
+// 与 stored sender（bot：principal_id==FromUID；internal producer：注册的
+// binding SenderUID==FromUID）及权威 Space 一致，才进入 catalog access 与
+// durable CardContext；任何畸形/不一致 fail-close。无 provenance 的帧（含
+// pre-PR-C 的 template_ref-only Bot 帧）保留 sender 派生的 legacy bot
+// principal，且绝不给 CardContext 发明 validated principal 字段。
 func resolveRegistryCardContext(
 	ctx context.Context,
-	access cardtmpl.CatalogAccess,
+	origin cardActionFrameOrigin,
 	effective []byte,
 	actionID string,
 	actionData map[string]interface{},
@@ -316,6 +355,48 @@ func resolveRegistryCardContext(
 			return cardactiondispatch.CardContext{}, errors.New("message: card template metadata is incomplete")
 		}
 		return cardactiondispatch.CardContext{}, nil
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(effective)
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	access := cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeActionContext,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: origin.SenderUID, SpaceID: origin.SpaceID,
+		},
+	}
+	var validated *cardactiondispatch.CardContext
+	if markers.HasProvenance {
+		principal, err := validatedFramePrincipal(origin, markers.Provenance)
+		if err != nil {
+			return cardactiondispatch.CardContext{}, err
+		}
+		access.Principal = principal
+		validated = &cardactiondispatch.CardContext{
+			PrincipalType: markers.Provenance.PrincipalType,
+			PrincipalID:   principal.ID,
+			SpaceID:       principal.SpaceID,
+		}
+	} else if !frozenRegistryKnows(cardtmpl.ID(ref.ID), ref.Version) {
+		// D3 fail-close for a markerless frame that names a *dynamic* version.
+		//
+		// The identity above comes from `card.metadata.octo.template`, which
+		// lives inside the card body a raw caller controls; raw ingress rejects
+		// the two server-only *top-level* keys, not this. Without this branch a
+		// frame carrying no server-authored provenance is authorized against
+		// the sender-derived Bot principal — which is the sending Bot's own
+		// grant identity — and `Allows(action_context)` reads `edit`. So a Bot
+		// holding only `discover+edit` could fabricate a frame naming an active
+		// dynamic version and drive its action route, with `edit` standing in
+		// for the `send` grant the frame never had.
+		//
+		// Markerless compatibility exists for one population: cards delivered
+		// before PR-C, every one of which names a version the frozen Registry
+		// knows. Scoping the fallback to exactly that population keeps invariant
+		// 7 intact and closes the substitution.
+		return cardactiondispatch.CardContext{}, fmt.Errorf(
+			"%w: %s@%s", errMarkerlessDynamicFrame, ref.ID, ref.Version)
 	}
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
@@ -342,9 +423,98 @@ func resolveRegistryCardContext(
 			return cardactiondispatch.CardContext{}, errors.New("message: card template owner does not match action route owner")
 		}
 	}
-	return cardactiondispatch.CardContext{
+	cardContext := cardactiondispatch.CardContext{
 		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(resolved.View),
-	}, nil
+	}
+	if validated != nil {
+		cardContext.PrincipalType = validated.PrincipalType
+		cardContext.PrincipalID = validated.PrincipalID
+		cardContext.SpaceID = validated.SpaceID
+	}
+	return cardContext, nil
+}
+
+// validatedFramePrincipal 证明 stored provenance 与服务端事实一致后，返回
+// catalog principal。失败即篡改/配置漂移信号，一律 fail-close：
+//   - bot principal 必须等于存储行 FromUID（IM 连接鉴权绑定，不可伪造）；
+//   - internal producer 必须在 carddispatch 注册表中绑定到 FromUID；
+//   - provenance 声明的 Space 非空且权威来源 Space 非空时必须一致。
+func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.CatalogProvenance) (cardtmpl.CatalogPrincipal, error) {
+	principal, err := cardtmpl.CatalogPrincipalFromProvenance(provenance)
+	if err != nil {
+		return cardtmpl.CatalogPrincipal{}, err
+	}
+	switch principal.Kind {
+	case cardtmpl.CatalogPrincipalBot:
+		if principal.ID != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored bot provenance does not match message sender")
+		}
+	case cardtmpl.CatalogPrincipalInternalProducer:
+		if origin.ProducerBinding == nil {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: producer binding resolver unavailable")
+		}
+		boundSender, ok := origin.ProducerBinding(principal.ID)
+		if !ok || boundSender != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored producer provenance does not match registered sender")
+		}
+	default:
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: unsupported stored principal kind")
+	}
+	// A frame that names a Space is only trustworthy once that claim has been
+	// checked against the server's own answer. Skipping the check when the
+	// origin could not be determined would leave principal.SpaceID set to
+	// whatever the frame said, and that value becomes the grant scope for the
+	// action_context authorization — so a frame that reached storage without
+	// passing a trusted boundary could name any Space it liked. The bot branch
+	// above pins the principal *id* to the stored sender; nothing pins the
+	// Space but this.
+	// Refuse whenever the origin Space is unknown, whether or not the frame
+	// names one. The empty-Space branch looks harmless and is not: assigning an
+	// unknown origin leaves principal.SpaceID == "", which loadGrantDecision
+	// resolves against the *global* row alone. A principal holding an active
+	// global grant plus an exact tombstone for the card's real Space would then
+	// be allowed — defeating invariant 11, which exists precisely so an exact
+	// tombstone can shadow a live global grant. A transient group-row read is
+	// enough to reach it, so the unknown case has to fail closed on both sides.
+	if !origin.SpaceKnown {
+		return cardtmpl.CatalogPrincipal{}, fmt.Errorf(
+			"%w: card origin space is unavailable, cannot resolve the grant scope",
+			errCardOriginSpaceUnavailable)
+	}
+	if principal.SpaceID != "" && principal.SpaceID != origin.SpaceID {
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
+	}
+	if principal.SpaceID == "" {
+		principal.SpaceID = origin.SpaceID
+	}
+	return principal, nil
+}
+
+// errCardOriginSpaceUnavailable separates "the card's Space could not be read
+// right now" from "this click is malformed". Both refuse the action, but only
+// the first is worth retrying, and reporting it as a client error would tell an
+// operator to go looking at the payload instead of at the group table.
+var errCardOriginSpaceUnavailable = errors.New("message: card origin space unavailable")
+
+// errMarkerlessDynamicFrame is the refusal for a frame that names a template
+// the frozen Registry does not know and carries no server-authored provenance.
+// It is deliberately not merged into the generic invalid-action error class at
+// the source so the reason survives into the logs; the handler still collapses
+// it onto the one client-visible 400, because telling a caller *which* of the
+// action rejections it hit is an enumeration aid.
+var errMarkerlessDynamicFrame = errors.New("message: dynamic frame carries no server-authored provenance")
+
+// frozenRegistryKnows reports whether the process Registry holds this exact
+// version. It is the test for "this card predates the dynamic catalog", not a
+// permission check — a static template being known here says nothing about who
+// may act on it, which is still decided by the authorizer downstream.
+func frozenRegistryKnows(id cardtmpl.ID, version string) bool {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return false
+	}
+	_, err := registry.Lookup(id, version)
+	return err == nil
 }
 
 var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")
@@ -499,14 +669,23 @@ func (m *Message) authorizeCardChannelMember(c *wkhttp.Context, loginUID, messag
 //
 // 任一步取不到 → 返回 ""(fail-closed:调用方省略 event_data.space_id,与 send 路径
 // 无权威值时 strip 客户端 space 的行为对齐;绝不回退到客户端可影响的上下文 Space)。
-func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) string {
+//
+// The second return value separates two outcomes that used to share one empty
+// string. `known=true, spaceID=""` is a determined fact — a DM outside any
+// Space. `known=false` means the lookup itself did not answer: a group row that
+// could not be read, a malformed thread channel, an unparseable payload. The
+// distinction is load-bearing downstream: a frame's provenance can only be
+// checked against an origin Space that was actually established, and treating
+// "could not determine" as "there is none" both skips that check and turns
+// transient outages into permanent-looking rejections.
+func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) (string, bool) {
 	switch msgM.ChannelType {
 	case common.ChannelTypeGroup.Uint8():
 		return m.groupSpaceIDOrEmpty(msgM.ChannelID)
 	case common.ChannelTypeCommunityTopic.Uint8():
 		parent, err := m.resolveParentGroupNo(msgM.ChannelID)
 		if err != nil || parent == "" {
-			return ""
+			return "", false
 		}
 		return m.groupSpaceIDOrEmpty(parent)
 	case common.ChannelTypePerson.Uint8():
@@ -514,21 +693,24 @@ func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) string {
 			SpaceID string `json:"space_id"`
 		}
 		if err := json.Unmarshal(msgM.Payload, &env); err != nil {
-			return ""
+			return "", false
 		}
-		return env.SpaceID
+		// A DM payload legitimately carries no Space when the sender had none
+		// to stamp, so an absent value here is an answer rather than a failure.
+		return env.SpaceID, true
 	default:
-		return ""
+		return "", false
 	}
 }
 
-// groupSpaceIDOrEmpty 查群的权威 SpaceID;任何错误 / 空群 / 空 SpaceID → ""。
-func (m *Message) groupSpaceIDOrEmpty(groupNo string) string {
+// groupSpaceIDOrEmpty 查群的权威 SpaceID。查询失败 / 群不存在 → ("", false):
+// 未能判定。群存在但没有 SpaceID → ("", true):判定为「不属于任何 Space」。
+func (m *Message) groupSpaceIDOrEmpty(groupNo string) (string, bool) {
 	g, err := m.groupService.GetGroupWithGroupNo(groupNo)
 	if err != nil || g == nil {
-		return ""
+		return "", false
 	}
-	return g.SpaceID
+	return g.SpaceID, true
 }
 
 // cardCanonicalVisibleToViewer 复刻单条读 respondSingleMessage 的「内容可见性」层

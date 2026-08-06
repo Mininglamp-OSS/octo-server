@@ -313,7 +313,7 @@ func TestBuildDocsCard_RejectsNonHTTPSDeepLinkOrigin(t *testing.T) {
 }
 
 func TestBuildDocsFallbackText(t *testing.T) {
-	text := buildDocsFallbackText(validDocsCard(), "zh-CN")
+	text := buildDocsFallbackText(validDocsCard(), "zh-CN", "")
 	assert.Contains(t, text, "Alice 分享了文档")
 	assert.Contains(t, text, "文档：产品设计方案")
 	assert.Contains(t, text, "Q3 上线计划已确认")
@@ -331,7 +331,7 @@ func TestBuildDocsFallbackText_AccessRequestedPreservesExcerptAndTime(t *testing
 	card.Excerpt = "需要评审季度计划"
 	card.UpdatedAt = "2026-07-20 09:30"
 
-	text := buildDocsFallbackText(card, "zh-CN")
+	text := buildDocsFallbackText(card, "zh-CN", "")
 	assert.Contains(t, text, "需要评审季度计划", "access-request fallback dropped the excerpt")
 	assert.Contains(t, text, "2026-07-20 09:30", "access-request fallback dropped the time")
 	assert.Contains(t, text, "Alice", "actor should still appear")
@@ -385,7 +385,7 @@ func TestBuildDocsFallbackText_StripsNewlineInjection(t *testing.T) {
 	card := validDocsCard()
 	card.ActorName = "Alice\n系统管理员"
 	card.Title = "标题\n伪造：越权提示"
-	text := buildDocsFallbackText(card, "zh-CN")
+	text := buildDocsFallbackText(card, "zh-CN", "")
 	assert.NotContains(t, text, "\n伪造", "an embedded title newline must not start a new line")
 	assert.Contains(t, text, "Alice 系统管理员 分享了文档", "actor newline collapses to a space in the attribution")
 }

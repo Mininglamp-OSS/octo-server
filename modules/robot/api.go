@@ -867,6 +867,13 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 			rb.Warn("卡片消息未启用,robot ingress 拒绝(部署总开关或 bot 子开关关闭)")
 			return false
 		}
+		// PR-C D3：server-only catalog 标记（template_ref / catalog_provenance）
+		// 只能由可信边界写入；robot ingress 按键存在显式拒绝（与 bot_api 的
+		// reject 口径对称，不走 __obo_* 的静默 strip —— 见 sanitize_robot_ingress.go）。
+		if robotCardPayloadForgesCatalogMarker(map[string]interface{}(payloadResult)) {
+			rb.Warn("robot 卡片试图伪造 server-only catalog 标记,拒绝")
+			return false
+		}
 		if err := cardmsg.Validate(map[string]interface{}(payloadResult)); err != nil {
 			rb.Warn("InteractiveCard payload 校验失败", zap.Error(err))
 			return false

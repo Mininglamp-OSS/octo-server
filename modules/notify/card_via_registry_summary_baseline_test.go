@@ -47,7 +47,7 @@ func TestMapSummaryFields_TruncatesDisplayFields(t *testing.T) {
 		Members:     -5,
 		MsgCount:    -1,
 	}
-	if err := preflightSummarySchema(context.Background(), huge, summaryfailed.TemplateID); err != nil {
+	if err := preflightSummarySchema(context.Background(), "space-preflight", huge, summaryfailed.TemplateID); err != nil {
 		t.Fatalf("preflight should PASS after truncation, got %v", err)
 	}
 	if _, _, err := n.buildSummaryCardViaRegistry(context.Background(),
@@ -59,7 +59,7 @@ func TestMapSummaryFields_TruncatesDisplayFields(t *testing.T) {
 	badTask := &SummaryCardFields{
 		TaskNo: strings.Repeat("x", 300), Title: "OK", Kind: SummaryCardKindCompleted,
 	}
-	err := preflightSummarySchema(context.Background(), badTask, summarycompleted.TemplateID)
+	err := preflightSummarySchema(context.Background(), "space-preflight", badTask, summarycompleted.TemplateID)
 	if err == nil || !errorsIsFieldsInvalid(err) {
 		t.Fatalf("over-length taskNo must stay C1 400, got %v", err)
 	}
@@ -130,7 +130,7 @@ func TestMapSummaryFields_ClampsOverMaxCounts(t *testing.T) {
 			if s.kind == SummaryCardKindFailed {
 				card.Reason = "boom"
 			}
-			if err := preflightSummarySchema(context.Background(), card, s.templateID); err != nil {
+			if err := preflightSummarySchema(context.Background(), "space-preflight", card, s.templateID); err != nil {
 				t.Fatalf("preflight should PASS after count clamp, got %v", err)
 			}
 			if _, _, err := n.buildSummaryCardViaRegistry(context.Background(),
@@ -350,7 +350,7 @@ func TestPreflightSummarySchema_C1RejectsEmptyTaskNo(t *testing.T) {
 
 	// taskNo 空 → schema minLength=1 违规(completed 分支)
 	badCompleted := &SummaryCardFields{TaskNo: "", Title: "T", Kind: SummaryCardKindCompleted}
-	err := preflightSummarySchema(context.Background(), badCompleted, summarycompleted.TemplateID)
+	err := preflightSummarySchema(context.Background(), "space-preflight", badCompleted, summarycompleted.TemplateID)
 	if err == nil {
 		t.Fatal("expected ErrFieldsInvalid (completed), got nil")
 	}
@@ -360,7 +360,7 @@ func TestPreflightSummarySchema_C1RejectsEmptyTaskNo(t *testing.T) {
 
 	// 同样 taskNo 空 → schema minLength=1 违规(failed 分支)
 	badFailed := &SummaryCardFields{TaskNo: "", Title: "T", Kind: SummaryCardKindFailed, Reason: "r"}
-	err = preflightSummarySchema(context.Background(), badFailed, summaryfailed.TemplateID)
+	err = preflightSummarySchema(context.Background(), "space-preflight", badFailed, summaryfailed.TemplateID)
 	if err == nil {
 		t.Fatal("expected ErrFieldsInvalid (failed), got nil")
 	}
@@ -377,7 +377,7 @@ func TestPreflightSummarySchema_F7RegistryUnwired(t *testing.T) {
 	defer cardtmpl.SetDefaultRegistry(prev)
 
 	card := &SummaryCardFields{TaskNo: "t", Title: "T", Kind: SummaryCardKindCompleted}
-	err := preflightSummarySchema(context.Background(), card, summarycompleted.TemplateID)
+	err := preflightSummarySchema(context.Background(), "space-preflight", card, summarycompleted.TemplateID)
 	if err == nil {
 		t.Fatal("expected errCardTmplUnavailable, got nil")
 	}

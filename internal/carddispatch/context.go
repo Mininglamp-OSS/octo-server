@@ -22,6 +22,21 @@ func Install(ctx ValueStore, registry *Registry) error {
 	return nil
 }
 
+// ProducerBindingFromContext 解析已安装 Registry 的只读 producer 身份绑定
+// （PR-C D3）。Registry 未安装或 producer 未注册一律 (\"\", false)，调用方
+// 对 dynamic provenance fail-close。与 SenderFromContext 不同，它绝不返回
+// 发送能力 —— 业务 caller 无法借它构造 ProducerSpec 或拿到 Sender。
+func ProducerBindingFromContext(ctx ValueStore, id ProducerID) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	registry, ok := ctx.Value(registryContextKey).(*Registry)
+	if !ok || registry == nil {
+		return "", false
+	}
+	return registry.ProducerBinding(id)
+}
+
 func SenderFromContext(ctx ValueStore, id ProducerID) (Sender, error) {
 	if ctx == nil {
 		return nil, categorized(CategoryProducerDisabled, errors.New("application context unavailable"))

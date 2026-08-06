@@ -16,13 +16,27 @@
   "views": {
     "pending": {
       "wireProfile": "octo/v2",
-      "states": ["pending"],
-      "samples": ["samples/pending.json"]
+      "states": [
+        "pending"
+      ],
+      "samples": [
+        "samples/pending.json"
+      ]
     },
     "result": {
       "wireProfile": "octo/v1",
-      "states": ["approved", "rejected"],
-      "samples": ["samples/approved.json", "samples/rejected.json"]
+      "states": [
+        "approved",
+        "rejected",
+        "cancelled",
+        "unavailable"
+      ],
+      "samples": [
+        "samples/approved.json",
+        "samples/rejected.json",
+        "samples/cancelled.json",
+        "samples/unavailable.json"
+      ]
     }
   }
 }

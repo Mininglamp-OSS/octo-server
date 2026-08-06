@@ -98,7 +98,20 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 		denyReason = strings.TrimSpace(v)
 	}
 	terminal := result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied
-	if terminal && f.updater != nil {
+	// Every state renders through the Registry when an updater is present, not
+	// just the decided ones. The pending card is a Registry render and so
+	// carries the server-authored catalog markers; the fallback below rebuilds
+	// the frame from a six-key allowlist that holds neither, so routing a
+	// marked card there erased both on an ordinary user click and left the
+	// identity guards in pkg/cardtmpl/updater.go inert for that message.
+	//
+	// Selecting the route by state was the bug's shape, so the state list is
+	// gone rather than extended: `cancelled` was the reported case, `pending`
+	// reaches the same branch, and a state added later would have inherited the
+	// defect silently. What remains is the distinction the fallback was written
+	// for — a deployment with no updater at all. `terminal` still means
+	// "decided", and still gates the notification below.
+	if f.updater != nil {
 		if err := f.replaceWithRegistryResult(ctx, event, result, channelID, lang, title, denyReason); err != nil {
 			return err
 		}
@@ -158,8 +171,19 @@ func truncRunes(s string, max int) string {
 	return s
 }
 
+// docsResultTemplateVersion resolves the click-driven result edit's target
+// version from the durable event's stored card context. The rules live in
+// docsResultVersion so the sibling mutate endpoint cannot drift from them.
+func docsResultTemplateVersion(event cardactiondispatch.Event) (string, error) {
+	return docsResultVersion(event.Card.TemplateID, event.Card.TemplateVersion)
+}
+
 func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, event cardactiondispatch.Event,
 	result cardactiondispatch.DecisionResult, channelID, lang, title, denyReason string) error {
+	version, err := docsResultTemplateVersion(event)
+	if err != nil {
+		return err
+	}
 	fields, state, err := buildDocsAccessResultFields(lang, docsResultRenderInput{
 		Data:             event.Data,
 		Title:            title,
@@ -167,6 +191,14 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		DecidedAtDisplay: result.Display["decided_at"],
 		DenyReason:       denyReason,
 		Denied:           result.State == cardactiondispatch.StateDenied,
+		Cancelled:        result.State == cardactiondispatch.StateCancelled,
+		// Anything that is not a decision and not an explicit cancellation —
+		// `pending` today, whatever a later contract adds — renders as
+		// unavailable, which is what the pre-Registry fallback already showed
+		// for those states.
+		Unavailable: result.State != cardactiondispatch.StateApproved &&
+			result.State != cardactiondispatch.StateDenied &&
+			result.State != cardactiondispatch.StateCancelled,
 	})
 	if err != nil {
 		return err
@@ -180,7 +212,7 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		// .octospec/learnings/pending/cardtmpl-interaction-closure.md)。若未来 event
 		// ID 生成器改为非单调,CAS 会静默丢弃合法更新——务必同步复核。
 		SenderUID: event.SenderUID, MessageID: event.MessageID, CardSeq: event.EventID,
-	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields, cardtmpl.BuildEnv{
+	}, docsaccessrequest.TemplateID, version, state, fields, cardtmpl.BuildEnv{
 		WebLoginURL: f.ctx.GetConfig().External.WebLoginURL, Lang: lang, SpaceID: event.SpaceID,
 	})
 }
@@ -196,6 +228,8 @@ type docsResultRenderInput struct {
 	DecidedAtDisplay string
 	DenyReason       string
 	Denied           bool
+	Cancelled        bool
+	Unavailable      bool
 }
 
 func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
@@ -223,9 +257,13 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	}
 	state := docsaccessrequest.StateApproved
 	wireState := "approved"
-	if input.Denied {
-		state = docsaccessrequest.StateRejected
-		wireState = "rejected"
+	switch {
+	case input.Unavailable:
+		state, wireState = docsaccessrequest.StateUnavailable, "unavailable"
+	case input.Cancelled:
+		state, wireState = docsaccessrequest.StateCancelled, "cancelled"
+	case input.Denied:
+		state, wireState = docsaccessrequest.StateRejected, "rejected"
 	}
 	actor := stringEventData(input.Data, "actor")
 	document := map[string]any{
@@ -245,10 +283,16 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 		"state":     wireState,
 		"document":  document,
 		"requester": requester,
-		"decision": map[string]any{
+	}
+	// A cancelled request was never decided, so it has no operator and no
+	// decision time. The data contract requires `decision` only for
+	// approved/rejected; emitting one here would put the generic operator
+	// placeholder on a card nobody acted on.
+	if !input.Cancelled && !input.Unavailable {
+		fields["decision"] = map[string]any{
 			"operatorName":     truncRunes(operatorName, capResultName),
 			"decidedAtDisplay": truncRunes(strings.TrimSpace(input.DecidedAtDisplay), capResultShortLabel),
-		},
+		}
 	}
 	dataCaps := map[string]int{
 		"requestReason":      capResultReason,
@@ -311,7 +355,7 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 }
 
 // buildDocsDecisionTerminalDocument renders the legacy/no-updater fallback for
-// approved/denied outcomes. Production V3 result updates use CardUpdater.
+// approved/denied outcomes. Production result updates use CardUpdater at the card's stored version.
 func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	if denied {

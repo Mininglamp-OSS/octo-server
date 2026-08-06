@@ -116,6 +116,44 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		return nil, categorized(terminal, validateErr)
 	}
 
+	// PR-C D3：可信派发边界从「已通过 cardmsg.Validate 的 metadata.octo.template」
+	// 与「已注册 ProducerSpec.ID + 已授权 target Space」为 Registry 产出的卡
+	// 写入 server-authored 顶层 catalog 标记。业务调用方只掌握 Card.Document
+	// （裸 card 节点），够不到信封顶层，因此无法自报 principal；无模板元数据的
+	// legacy 文档不写标记（principal 只能靠猜，宁缺毋假）。
+	if refID, refVersion, ok := cardDocumentTemplateContext(cardDocument); ok {
+		provenance := cardmsg.CatalogProvenance{
+			Version:       cardmsg.CatalogProvenanceVersion,
+			PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
+			PrincipalID:   string(s.spec.ID),
+			SpaceID:       target.SpaceID,
+		}
+		// Validate before stamping, because nothing downstream will. The
+		// cardmsg.Validate call above runs before these keys exist, and
+		// Finalize only builds `plain` and rechecks size — so this is the last
+		// point at which an invalid marker can be refused.
+		//
+		// Refusing here rather than trimming target.SpaceID is deliberate: this
+		// is the one boundary that authors an internal-producer marker, and it
+		// should be unable to author one the readers reject. The readers are
+		// strict (ParseCatalogProvenance requires a trimmed space_id) while the
+		// gate on the way in only tests emptiness, and whether an untrimmed
+		// Space survives the membership lookup is decided by a collation the
+		// application does not choose: space_member declares none and inherits
+		// the database default, and CI creates that database PAD SPACE
+		// (utf8mb4_general_ci), where 'space-a ' matches 'space-a'. A stamped
+		// frame that no reader accepts is unclickable and uneditable forever,
+		// so this refuses the send instead of delivering a broken card.
+		if err := provenance.Validate(); err != nil {
+			terminal = cardErrorCategory(err)
+			return nil, categorized(terminal, err)
+		}
+		payload[cardmsg.CatalogTemplateRefKey] = map[string]interface{}{
+			"id": refID, "version": refVersion,
+		}
+		payload[cardmsg.CatalogProvenanceKey] = provenance.MarshalMap()
+	}
+
 	// Authorization has already established this exact active Space. It is the
 	// only source allowed to enrich the wire envelope.
 	payload["space_id"] = target.SpaceID
@@ -200,6 +238,23 @@ func validateRequest(ctx context.Context, target Target, card Card) error {
 		return errors.New("unsupported render profile")
 	}
 	return nil
+}
+
+// cardDocumentTemplateContext 从裸 card 节点提取 Registry 模板身份，语义与
+// cardmsg.CardTemplateContext（信封形态）一致：协议必须是 octo-card@1.0，
+// id/version 非空且已 trim；任何偏差都按「非 Registry 文档」处理（不写标记）。
+func cardDocumentTemplateContext(card map[string]interface{}) (string, string, bool) {
+	metadata, _ := card["metadata"].(map[string]interface{})
+	octo, _ := metadata["octo"].(map[string]interface{})
+	template, _ := octo["template"].(map[string]interface{})
+	protocol, _ := octo["protocol"].(string)
+	id, _ := template["id"].(string)
+	version, _ := template["version"].(string)
+	if protocol != "octo-card@1.0" || id == "" || version == "" ||
+		strings.TrimSpace(id) != id || strings.TrimSpace(version) != version {
+		return "", "", false
+	}
+	return id, version, true
 }
 
 func cardErrorCategory(err error) Category {
