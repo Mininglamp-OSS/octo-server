@@ -37,14 +37,30 @@ var errDocsResultVersion = errors.New("notify: docs result edit has no usable te
 //   - No stored identity at all. The frame predates PR-C's provenance markers,
 //     so there is nothing to honour and the historical behaviour — render V3 —
 //     is preserved exactly.
+//
 //   - A stored identity naming some other template. That is a routing mistake,
 //     not something to paper over by rendering the docs card anyway.
+//
 //   - A stored identity naming 0.2.0. That version's manifest declares only the
-//     `pending` view, so it has no `result` to render into. Nothing sends 0.2.0
-//     today — new sends resolve through the registry default — so a *marked*
-//     0.2.0 frame is an impossible state rather than a case to upgrade. Say so
-//     here instead of failing several layers down inside ViewFor, where the
-//     error names a missing view and not the reason it is missing.
+//     `pending` view, so there is no `result` to render into and the card is
+//     upgraded to the V3 result view — which is what main.go's registration
+//     comment promises ("旧 0.2.0 pending 消息仍可由 finalizer 升级成
+//     0.3.0/result") and what the pre-PR-C finalizer did by hardcoding V3.
+//
+//     An earlier revision refused this instead, on the reasoning that a
+//     *marked* 0.2.0 frame is an impossible state. That much is true — markers
+//     postdate 0.2.0 — but it is not what reaches here. The identity comes from
+//     `card.metadata.octo.template`, which unmarked pre-PR-C frames carry too,
+//     so the refusal landed on exactly the legacy population it argued was out
+//     of reach: 0.2.0 was the shipped registry default between #633 and #641,
+//     so those cards were delivered to production, and a reviewer clicking one
+//     got a failed finalization instead of the documented upgrade, leaving the
+//     card pending forever.
+//
+//     The upgrade needs no extra machinery. An unmarked frame has
+//     markers.HasRef false, so ReplaceView's stored-identity pin does not fire
+//     and rendering V3 over a stored 0.2.0 frame works exactly as it did before
+//     this package existed.
 func docsResultVersion(storedID, storedVersion string) (string, error) {
 	storedID, storedVersion = strings.TrimSpace(storedID), strings.TrimSpace(storedVersion)
 	if storedID == "" && storedVersion == "" {
@@ -55,9 +71,7 @@ func docsResultVersion(storedID, storedVersion string) (string, error) {
 			errDocsResultVersion, storedID, storedVersion)
 	}
 	if storedVersion == docsaccessrequest.TemplateVersion {
-		return "", fmt.Errorf("%w: %s@%s declares no result view; a marked frame at this version "+
-			"should not exist because new sends resolve through the registry default",
-			errDocsResultVersion, storedID, storedVersion)
+		return docsaccessrequest.TemplateVersionV3, nil
 	}
 	return storedVersion, nil
 }

@@ -37,9 +37,16 @@ func TestDocsResultVersionRules(t *testing.T) {
 			want: "0.4.0-pilot.20260805",
 		},
 		{
-			name: "0.2.0 has no result view and is refused with the reason",
+			// 0.2.0 declares only the `pending` view, so it is upgraded to the
+			// V3 result view — the contract main.go's registration comment
+			// states, and what the pre-PR-C finalizer did by hardcoding V3.
+			// Refusing it instead stranded every in-flight 0.2.0 card: 0.2.0
+			// was the shipped registry default between #633 and #641, so those
+			// cards exist, and a click on one failed finalization and left it
+			// pending forever.
+			name: "0.2.0 is upgraded to the V3 result view",
 			id:   string(docsaccessrequest.TemplateID), version: docsaccessrequest.TemplateVersion,
-			wantErr: true,
+			want: docsaccessrequest.TemplateVersionV3,
 		},
 		{
 			name: "another template is a routing mistake",
@@ -79,14 +86,17 @@ func TestDocsResultVersionFromFrameMatchesTheStoredContext(t *testing.T) {
 		t.Fatalf("unmarked frame = %q err=%v, want the legacy V3 branch", got, err)
 	}
 
-	// The population that matters: a card delivered before PR-C Slice 1 has
-	// metadata.octo.template but no top-level template_ref. Reading only the
-	// marker would send this frame down the legacy V3 branch while the click
-	// path resolved 0.2.0 — the exact disagreement this helper exists to remove.
+	// The population that matters, and the one an earlier revision broke: a card
+	// delivered before PR-C Slice 1 has metadata.octo.template but no top-level
+	// template_ref. The reasoning for refusing 0.2.0 here was that a *marked*
+	// 0.2.0 frame cannot exist — true, but the identity is read from the
+	// metadata, which this frame has and every legacy card has, so the refusal
+	// landed on precisely the population it argued was unreachable.
 	metadataOnly := []byte(`{"type":17,"card":{"metadata":{"octo":{"protocol":"octo-card@1.0",` +
 		`"template":{"id":"docs.access-request","version":"0.2.0"}}}}}`)
-	if _, err := docsResultVersionFromFrame(metadataOnly); !errors.Is(err, errDocsResultVersion) {
-		t.Fatalf("metadata-only 0.2.0 frame = %v, want the same refusal the click path gives", err)
+	if got, err := docsResultVersionFromFrame(metadataOnly); err != nil ||
+		got != docsaccessrequest.TemplateVersionV3 {
+		t.Fatalf("metadata-only 0.2.0 frame = %q err=%v, want the documented upgrade to V3", got, err)
 	}
 	metadataOnlyV3 := []byte(`{"type":17,"card":{"metadata":{"octo":{"protocol":"octo-card@1.0",` +
 		`"template":{"id":"docs.access-request","version":"0.3.0"}}}}}`)
