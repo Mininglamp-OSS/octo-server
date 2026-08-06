@@ -704,15 +704,47 @@ func TestPersonFakeChannelIDNotDoubleFaked(t *testing.T) {
 	// 让它内部再做一次 GetFakeChannelIDWith(fake1, loginUID)）产生的 key。
 	fake2 := common.GetFakeChannelIDWith(fake1, loginUID)
 
-	// 对称性：GetFakeChannelIDWith 的两个入参无序等价（同一对话恒生成同一 key）。
-	assert.Equal(t, fake1, common.GetFakeChannelIDWith(peerUID, loginUID),
-		"GetFakeChannelIDWith must be symmetric across the two DM sides")
-
-	// 反证：二次 fake 的 key 与真实的 fakeChannelID 不同——所以 respondSingleMessage
-	// 对 Person 必须显式短路 channel-level offset lookup（api_message_get.go:
-	// respondSingleMessage 已实现），否则用了错的 key 查 channel_setting.offset_message_seq。
+	// 反证：二次 fake 的 key 与真实的 fakeChannelID 不同——这是 lookupChannelOffsetSeq
+	// 现在必须无条件用 channelID (而非再 fake) 的原因 (api_message_get.go
+	// lookupChannelOffsetSeq)。如果这个不等式被打破，helper 的 caller 契约需要
+	// 重新审视。
 	assert.NotEqual(t, fake1, fake2,
 		"double-faked Person channelID must differ from the real fakeChannelID; "+
-			"if this becomes equal, the safety of the Person short-circuit changes and "+
-			"respondSingleMessage's Person branch must be revisited")
+			"if this becomes equal, lookupChannelOffsetSeq's caller contract needs revisiting")
+
+	// 常规（非碰撞）情况下的对称性——GetFakeChannelIDWith 用 CRC32 排序两侧 uid，
+	// 无碰撞时两个 uid 生成同一 key。多数正常场景走这条分支。
+	assert.Equal(t, fake1, common.GetFakeChannelIDWith(peerUID, loginUID),
+		"GetFakeChannelIDWith should be symmetric across the two DM sides "+
+			"when their CRC32 hashes differ")
+}
+
+// TestPersonFakeChannelIDCollisionOrderMatters 固定 CRC32 碰撞时
+// GetFakeChannelIDWith 的**参数顺序敏感性**——碰撞会走 `toUID@fromUID` fallthrough，
+// 因此 (A,B) 与 (B,A) 会得到不同 key。所有 Person 相关调用者必须与 sibling
+// 保持参数顺序一致 (统一为 `(peer_uid, login_uid)`，参见 api.go:1439 sync 路径)，
+// 否则同一对话的读 / 写路径会为同一对 uid 生成不同 key、发生"写入的消息读不出来"
+// 的静默 miss——PR #708 review round 2 P2 抓到的坑。
+//
+// 该测试用 review 提供的真实碰撞对 u_xgnb / u_cr7xslzj（CRC32 == 3955193408）。
+// 只要 CRC32 算法或 GetFakeChannelIDWith fallthrough 逻辑没变，测试就有效；
+// 如果哪天上游库改了 tie-breaking 让对称性也成立，assertion 会失败，
+// 提示我们可以放宽对参数顺序的约束。
+func TestPersonFakeChannelIDCollisionOrderMatters(t *testing.T) {
+	const (
+		uidA = "u_xgnb"
+		uidB = "u_cr7xslzj"
+	)
+	// review 里提到 CRC32(uidA) == CRC32(uidB) == 3955193408，导致 tie。
+	// 直接调 GetFakeChannelIDWith 两种顺序，如果 tie 逻辑仍是 fallthrough，
+	// 两个结果不同——本测试的核心断言。
+	keyAB := common.GetFakeChannelIDWith(uidA, uidB)
+	keyBA := common.GetFakeChannelIDWith(uidB, uidA)
+	assert.NotEqual(t, keyAB, keyBA,
+		"CRC32-tied uids currently produce order-sensitive fake channel IDs "+
+			"(GetFakeChannelIDWith falls through to toUID@fromUID on tie); "+
+			"all Person callers must therefore align parameter order with siblings "+
+			"(canonical order = (peer_uid, login_uid), see api.go:1439). "+
+			"If this assertion fails, the upstream library changed its tie-breaking; "+
+			"the order-alignment requirement can then be relaxed.")
 }

@@ -122,7 +122,7 @@ func (m *Message) getGroupMessage(c *wkhttp.Context) {
 	if !m.requireGroupMember(c, groupNo, loginUID) {
 		return
 	}
-	m.respondSingleMessage(c, groupNo, common.ChannelTypeGroup.Uint8(), groupNo, messageID, loginUID)
+	m.respondSingleMessage(c, groupNo, common.ChannelTypeGroup.Uint8(), groupNo, "", messageID, loginUID)
 }
 
 // getThreadMessage GET /v1/groups/:group_no/threads/:short_id/messages/:message_id
@@ -165,7 +165,7 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	}
 
 	channelID := thread.BuildChannelID(groupNo, shortID)
-	m.respondSingleMessage(c, channelID, common.ChannelTypeCommunityTopic.Uint8(), groupNo, messageID, loginUID)
+	m.respondSingleMessage(c, channelID, common.ChannelTypeCommunityTopic.Uint8(), groupNo, "", messageID, loginUID)
 }
 
 // getPersonMessage GET /v1/messages/person/:peer_uid/:message_id
@@ -174,10 +174,25 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 // 场景。DM 消息物理存储在 fakeChannelID(= GetFakeChannelIDWith(两个uid) 对称生成的
 // "uidA@uidB") 频道下、channel_type=Person。
 //
-// 鉴权：DM 无独立成员表，fakeChannelID 由调用者 loginUID 与对端 peerUID 对称派生，
-// 「能派生出这个频道」本身即代表 loginUID 是该 DM 的一方；配合 respondSingleMessage
-// 内的 visibles / 双删 / offset 全套可见性校验(与批量同步路径一致)，非参与方既拼不出
-// 命中的 fakeChannelID、也过不了可见性过滤，一律 404。禁止自聊(peer==self)。
+// getPersonMessage GET /v1/messages/person/:peer_uid/:message_id
+//
+// 单聊(DM)单条消息直查，用于云盘转存等需要按 (会话, 消息ID) 取单条消息元数据的
+// 场景。DM 消息物理存储在 fakeChannelID(= GetFakeChannelIDWith(两个uid) 对称生成的
+// "uidA@uidB") 频道下、channel_type=Person。
+//
+// 鉴权分四层（与 modules/messages_search/authz.go checkP2PAccess 一致）：
+//   1. 基本参数：peer_uid 非空 / 非自聊 / 非 @ 分隔符（P1-3：GetFakeChannelIDWith
+//      内部用 "A@B" 拼接，若 peer_uid 自身含 @，多方 uid 组合会产生同一 fake key
+//      的跨会话碰撞，一律 400 拒）；message_id 正整数。
+//   2. P2P 访问：DM 无独立成员表，采用 same-space OR IsFriend 的"或"关系放行；
+//      两侧都不满足 → 404 归并（防枚举，与不可见同码）。（P1-4）
+//   3. 双向拉黑：任一方向 blacklist 存在即 404（本人偏好 + 反骚扰双语义）。
+//      直查绕过 IM kernel 的 blacklist filter，必须自查（P1-4）。
+//   4. Space 隔离 + respondSingleMessage 里的 visibles / 双删 / offset 全套过滤。
+//
+// fakeChannelID 参数顺序：使用 (peerUID, loginUID)，与 sibling 调用(api.go:1439
+// 等 sync 路径 = "req.ChannelID(=peer_uid), req.LoginUID") 严格对齐；避免碰撞对
+// (CRC32 tie) 场景下同一对话在读/写两侧生成不同 key（P2, PR #708 review）。
 func (m *Message) getPersonMessage(c *wkhttp.Context) {
 	peerUID := c.Param("peer_uid")
 	messageIDStr := c.Param("message_id")
@@ -191,12 +206,31 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "peer_uid")
 		return
 	}
+	// P1-3: peer_uid 含 @ 会与 GetFakeChannelIDWith 的 "A@B" 拼接语义碰撞：
+	//   GetFakeChannelIDWith("alice@bob", "carol") == GetFakeChannelIDWith("alice", "bob@carol")
+	//   == "alice@bob@carol"
+	// 允许含 @ 的 peer_uid 会让一条 DM 消息被"多种 (loginUID, peer_uid) 组合"取到，
+	// 变成跨会话读。直接 400 拒。
+	if strings.Contains(peerUID, "@") {
+		respondMessageRequestInvalid(c, "peer_uid")
+		return
+	}
 	messageID, ok := parsePositiveMessageID(messageIDStr)
 	if !ok {
 		respondMessageRequestInvalid(c, "message_id")
 		return
 	}
-	fakeChannelID := common.GetFakeChannelIDWith(loginUID, peerUID)
+
+	// P1-4: P2P 访问 + 双向拉黑门禁。DM 直读绕过 IM kernel 的
+	// blacklist / friend / space filter，必须在应用层自查，形成与
+	// modules/messages_search/authz.go:139-207 checkP2PAccess 一致的四层门禁：
+	// same-space OR friend 二选一放行，双向 blacklist 一票否决。任何一层
+	// 不满足都 404 归并（防枚举）。
+	if !m.checkPersonDMAccess(c, loginUID, peerUID) {
+		return
+	}
+
+	fakeChannelID := common.GetFakeChannelIDWith(peerUID, loginUID)
 
 	// Person(DM) Space 隔离：DM 是跨 Space 共享的同一物理频道，单条 DM 读必须与
 	// /v1/message/channel/sync 的 filterPersonMessagesBySpace 走同一套
@@ -230,7 +264,61 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		}
 	}
 
-	m.respondSingleMessage(c, fakeChannelID, common.ChannelTypePerson.Uint8(), "", messageID, loginUID)
+	// personPeerUID 传 peerUID：respondSingleMessage 里的用户级 channel_offset
+	// 表（清历史）用 bare peer uid 作 key，不是 fakeChannelID (P1-1a)。
+	m.respondSingleMessage(c, fakeChannelID, common.ChannelTypePerson.Uint8(), "", peerUID, messageID, loginUID)
+}
+
+// checkPersonDMAccess 复刻 modules/messages_search/authz.go checkP2PAccess 的
+// P2P DM 访问门禁：same-space OR IsFriend 放行 + 双向 blacklist 一票否决。
+// 任何不满足条件都 404 归并（与不可见同码，防枚举）。任何 DB 错误 → 500 fail-closed。
+// 返回 false 时已写响应（handler 直接 return）。
+//
+// 与 checkP2PAccess 的差异：那边支持 as-bot principal 分支；此处 getPersonMessage
+// 的调用者都是真人 token（AuthMiddleware 之后），走真人分支即可。同意 same-space
+// 的空 spaceID 分支（未 opt-in / 兼容路径）：这时不做 same-space 判断，直接落到
+// IsFriend 兜底——与 authz 现有 real-user 分支同口径。
+func (m *Message) checkPersonDMAccess(c *wkhttp.Context, loginUID, peerUID string) bool {
+	// same-space OR friend 二选一放行
+	allowed := false
+	if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
+		sameSpace, serr := m.userService.AreSpaceMembers(spaceID, loginUID, peerUID)
+		if serr != nil {
+			m.Error("DM 直读 same-space 查询失败", zap.Error(serr),
+				zap.String("uid", loginUID), zap.String("peer", peerUID), zap.String("space_id", spaceID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return false
+		}
+		allowed = sameSpace
+	}
+	if !allowed {
+		isFriend, ferr := m.userService.IsFriend(loginUID, peerUID)
+		if ferr != nil {
+			m.Error("DM 直读 IsFriend 查询失败", zap.Error(ferr),
+				zap.String("uid", loginUID), zap.String("peer", peerUID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return false
+		}
+		allowed = isFriend
+	}
+	if !allowed {
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+		return false
+	}
+
+	// 双向 blacklist 一票否决。批量版一次查两向，性能好。
+	blockedByMe, blockedByPeer, err := m.userService.ExistBlacklistsBoth(loginUID, []string{peerUID})
+	if err != nil {
+		m.Error("DM 直读 blacklist 查询失败", zap.Error(err),
+			zap.String("uid", loginUID), zap.String("peer", peerUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return false
+	}
+	if blockedByMe[peerUID] || blockedByPeer[peerUID] {
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+		return false
+	}
+	return true
 }
 
 // parsePositiveMessageID 校验 path 参数 message_id 为正整数。
@@ -296,7 +384,15 @@ func (m *Message) requireGroupMember(c *wkhttp.Context, groupNo, loginUID string
 //
 // groupNoForEnrich 仅在群消息（channelType=Group）时用作 enrichExternalMarkers 的
 // 父群定位参数；子区消息这一参数无效（enrich 函数本身按消息 channel_type 分派）。
-func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, channelType uint8, groupNoForEnrich string, messageID int64, loginUID string) {
+//
+// personPeerUID 仅在 Person(DM) 直查时非空，用于用户级 channel_offset 表的 lookup：
+// 用户清历史通过 POST /v1/message/offset 写 channel_offset，DM 场景 writer 存的
+// ChannelID 是**对端 bare peer uid**（modules/message/api.go:2821，与 sync 读侧
+// api.go:3575 一致），不是消息物理存储用的 fakeChannelID。因此 Person 单条直查
+// 用 channelID (== fakeChannelID) 去 queryWithUIDAndChannel 恒 miss、绕过用户级
+// 历史清理——必须传 peer uid 才能命中同一行 (P1-1a, PR #708 review round 2)。
+// Group/Thread 无 fake，channelID 本身就是 physical id，personPeerUID 保持空即可。
+func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, channelType uint8, groupNoForEnrich, personPeerUID string, messageID int64, loginUID string) {
 	// VARCHAR(20) 列必须用字符串绑定才能命中索引；详见 queryMessageByID 注释。
 	messageIDStr := strconv.FormatInt(messageID, 10)
 	msgModel, err := m.db.queryMessageByID(channelID, channelType, messageIDStr)
@@ -340,7 +436,16 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	// 内按此跳过 message_seq <= offset 的消息；单条直查必须显式比对，否则用户清理
 	// 后还能按 ID 把旧消息读回来。注意这与 lookupChannelOffsetSeq 查的频道级
 	// channel_setting.offset_message_seq 是两张不同的表 / 两套语义，必须都查。
-	if userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, channelID, channelType); err != nil {
+	//
+	// Person(DM) 场景 offset key: writer 存的 channel_id 是 bare peer uid
+	// (api.go:2821 `ChannelID: req.ChannelID` 直存)，不是消息物理 fakeChannelID；
+	// sync 读侧也用 bare peer uid (api.go:3575)。因此这里 Person 走 personPeerUID
+	// (非空)，其它类型 channelID 本身就是 physical id (P1-1a)。
+	userOffsetChannelID := channelID
+	if channelType == common.ChannelTypePerson.Uint8() && personPeerUID != "" {
+		userOffsetChannelID = personPeerUID
+	}
+	if userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, userOffsetChannelID, channelType); err != nil {
 		m.Error("查询用户清理偏移失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
@@ -349,24 +454,11 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 		return
 	}
 
-	channelOffsetSeq := uint32(0)
-	// Person 频道跳过 channel-level offset：对齐 cardCanonicalVisibleToViewer:550
-	// 的 Person 短路（"person 频道跳过偏移... 也避免对已是 fake id 的 person 频道
-	// 二次 fake 化"）。lookupChannelOffsetSeq 对 Person 会内部再做一次
-	// GetFakeChannelIDWith(channelID, loginUID)，那里期望入参是 peer uid 而非已经
-	// fake 好的 fakeChannelID；调用者传入的已经是 fakeChannelID（getPersonMessage
-	// 里已 fake 过一次），再 fake 一次就产生错的 lookup key、channel-level offset
-	// 恒为 0，等价于跳过——不如显式短路，语义清晰、并与 sync 的 messageAllows
-	// Person 分支一致（Person 不做 channel-level offset 截断）。用户级偏移
-	// (channelOffsetDB.queryWithUIDAndChannel) 上面已经做过，仍生效。
-	if channelType != common.ChannelTypePerson.Uint8() {
-		var err error
-		channelOffsetSeq, err = m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
-		if err != nil {
-			m.Error("查询频道设置失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
+	channelOffsetSeq, err := m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
+	if err != nil {
+		m.Error("查询频道设置失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
 	}
 
 	resp := &MsgSyncResp{}
@@ -424,13 +516,24 @@ func (m *Message) fetchMessageExtras(messageID int64, loginUID string, channelID
 	return extra, userExtra, reactions, nil
 }
 
-// lookupChannelOffsetSeq 复用 syncChannelMessage 的 channel offset 查询，私聊用 fakeChannelID。
+// lookupChannelOffsetSeq 查询 channel_setting.offset_message_seq，用于同步/直查
+// 场景下过滤已被"频道清历史"截断的旧消息。
+//
+// 约定：调用者传入的 channelID 必须是**消息物理存储的 channel_id**
+// （消息表按此分表；对 Person 而言就是 fakeChannelID，对 Group/Thread 就是
+// group_no / thread channel_id）。channel_setting 表的 key 就是这个物理 id，
+// 与 sync 路径 (api.go:1437-1443) 同一 fakeChannelID 一致。历史版本对
+// channelType==Person 会内部再做一次 GetFakeChannelIDWith(channelID, loginUID)，
+// 期望入参是 peer uid；但（a）sync 已经自己算 fake、不走此函数；
+// (b) cardCanonicalVisibleToViewer 里的 Person 分支在此调用之前 return true 短路；
+// (c) 直查路径 (respondSingleMessage) 传的 channelID 已经是 fakeChannelID。
+// 三个 caller 没有一个会传 bare peer uid 进来。为了不再让"错误 caller 二次 fake"
+// 成为隐藏坑，这里显式统一：所有 channelType 都直接用 channelID 作 lookup key。
+// (P1-1b, PR #708 review round 2.)
 func (m *Message) lookupChannelOffsetSeq(channelID string, channelType uint8, loginUID string) (uint32, error) {
-	lookupID := channelID
-	if channelType == common.ChannelTypePerson.Uint8() {
-		lookupID = common.GetFakeChannelIDWith(channelID, loginUID)
-	}
-	settings, err := m.channelService.GetChannelSettings([]string{lookupID})
+	_ = channelType // 参数保留：签名不变，避免影响调用者；语义上不再对类型分派。
+	_ = loginUID    // 参数保留：签名不变；不再需要 loginUID 二次 fake。
+	settings, err := m.channelService.GetChannelSettings([]string{channelID})
 	if err != nil {
 		return 0, err
 	}
