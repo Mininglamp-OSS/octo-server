@@ -4,11 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -136,14 +140,10 @@ func TestScanLoginPollSecret_TTLCoversWorstCaseFlow(t *testing.T) {
 	// 最坏路径：mint 后 60s 扫码（qrcode 初始 TTL）→ handleScanLogin 续 5min →
 	// grantLogin 再续 5min = 660s。密钥必须活得比这久，否则扫得晚的用户拿不到
 	// auth_code。上一版取 6min（=360s）零余量，扫码发生在第 59 秒时必然踩中。
-	worstCase := 60*time.Second + scanLoginAuthCodeTTLMirror + scanLoginAuthCodeTTLMirror
+	worstCase := 60*time.Second + ScanLoginAuthCodeTTL + ScanLoginAuthCodeTTL
 	assert.Greater(t, scanLoginPollSecretTTL, worstCase,
 		"轮询密钥 TTL 必须严格覆盖二维码状态的最长可读窗口并留余量")
 }
-
-// scanLoginAuthCodeTTLMirror 镜像 modules/qrcode.scanLoginAuthCodeTTL（跨包不可见）。
-// 两者漂移时上面的 TTL 断言会失效，故在此显式标注依赖。
-const scanLoginAuthCodeTTLMirror = 5 * time.Minute
 
 // ---------------------------------------------------------------------------
 // 行为测试：字段白名单
@@ -197,30 +197,6 @@ func TestHashScanLoginPollSecret_IsDeterministicSHA256Hex(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 行为测试：来源上下文
-// ---------------------------------------------------------------------------
-
-func TestScanLoginOrigin_RoundTrip(t *testing.T) {
-	store := newFakePollSecretStore()
-	const uuid = "uuid-1"
-	want := ScanLoginOrigin{IP: "203.0.113.9", DeviceName: "Chrome", DeviceModel: "Windows", UserAgent: "UA/1"}
-
-	require.NoError(t, storeScanLoginOrigin(store, uuid, want))
-
-	got, err := LoadScanLoginOrigin(store, uuid)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, want, *got)
-}
-
-func TestScanLoginOrigin_MissingIsNotAnError(t *testing.T) {
-	// 上下文缺失只该退化为「确认页不展示」，不能阻断扫码。
-	got, err := LoadScanLoginOrigin(newFakePollSecretStore(), "absent")
-	require.NoError(t, err)
-	assert.Nil(t, got)
-}
-
-// ---------------------------------------------------------------------------
 // 源码契约锁：只锁「无法在无 Redis 环境端到端跑」的 handler 结构不变量
 // ---------------------------------------------------------------------------
 
@@ -264,8 +240,8 @@ func TestGetLoginUUID_KeepsPollSecretOutOfQRCodePayload(t *testing.T) {
 func TestGetLoginStatus_DataOnlyLeavesThroughTheGate(t *testing.T) {
 	fn := readFuncBody(t, "api.go", "func (u *User) getloginStatus(")
 
-	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, c.GetHeader(ScanLoginPollSecretHeader))",
-		"轮询密钥必须从请求头读取，不能走 query（会被 access log 记录）")
+	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, scanLoginPresentedPollSecret(c))",
+		"轮询密钥必须经 scanLoginPresentedPollSecret 读取（请求头优先、query 兜底）")
 	assert.Contains(t, fn, "filterScanLoginPublicFields(model.Data)")
 
 	closureStart := strings.Index(fn, "respondStatus := func(")
@@ -284,8 +260,8 @@ func TestGetLoginStatus_ReleasesOnDisconnectAndOwnsItsChannel(t *testing.T) {
 	assert.Contains(t, fn, "case <-c.Request.Context().Done():",
 		"长轮询必须在客户端断开时立即释放")
 	assert.Contains(t, fn, "defer timeout.Stop()")
-	// 必须只回收自己注册的 channel：removeQRCodeChan(uuid) 会关掉 map 里当前那个，
-	// 而该接口未认证 —— 任何知道 uuid 的人反复连了就断即可踢掉合法轮询方。
+	// 必须只回收自己注册的 channel。无归属校验的 removeQRCodeChan 已删除，这里锁住
+	// 它不会被重新引入 —— 那会把跨请求关闭别人 channel 的洞放回来。
 	assert.NotContains(t, fn, "u.removeQRCodeChan(uuid)",
 		"必须用带归属校验的 removeQRCodeChanOwned")
 	assert.Contains(t, fn, "u.removeQRCodeChanOwned(uuid, qrcodeChan)")
@@ -306,4 +282,82 @@ func TestScanLoginRoutesCarryStrictIPRateLimit(t *testing.T) {
 	assert.Contains(t, body, `v.GET("/user/loginstatus", scanLoginStatusLimit, u.getloginStatus)`)
 	assert.Contains(t, body, `"scanlogin_uuid"`)
 	assert.Contains(t, body, `"scanlogin_status"`)
+}
+
+// TestScanLoginPresentedPollSecret_PrefersHeaderFallsBackToQuery 锁住双通道取值：
+// 请求头优先（不进 access log），query 仅为跨源部署的过渡兜底 —— octo-lib 的 CORS
+// 白名单不含自定义头，跨源预检会把整个请求拒掉，连降级都轮不到。
+func TestScanLoginPresentedPollSecret_PrefersHeaderFallsBackToQuery(t *testing.T) {
+	newCtx := func(header string, query string) *wkhttp.Context {
+		u := "/v1/user/loginstatus?uuid=x"
+		if query != "" {
+			u += "&" + scanLoginPollSecretQuery + "=" + query
+		}
+		req := httptest.NewRequest(http.MethodGet, u, nil)
+		if header != "" {
+			req.Header.Set(ScanLoginPollSecretHeader, header)
+		}
+		gc, _ := gin.CreateTestContext(httptest.NewRecorder())
+		gc.Request = req
+		return &wkhttp.Context{Context: gc}
+	}
+
+	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("h", "")), "只有头时取头")
+	assert.Equal(t, "q", scanLoginPresentedPollSecret(newCtx("", "q")), "只有 query 时回落")
+	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("h", "q")), "两者都有时头优先")
+	assert.Equal(t, "", scanLoginPresentedPollSecret(newCtx("", "")), "都没有时为空 → fail-closed")
+	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("  h  ", "")), "两端空白要裁掉")
+}
+
+// TestGetLoginStatus_OnlyAuthorizedPollersRegisterAChannel 锁住 P2-1 的修复：
+// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，未授权方一旦也能注册，就能靠反复轮询
+// 持续顶掉合法轮询方的 channel，让对方每轮白等满 10 秒。
+func TestGetLoginStatus_OnlyAuthorizedPollersRegisterAChannel(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) getloginStatus(")
+
+	assert.Contains(t, fn, "if authorized {",
+		"channel 注册必须以 authorized 为前提")
+	regIdx := strings.Index(fn, "u.getQRCodeModelChan(uuid)")
+	gateIdx := strings.Index(fn, "if authorized {")
+	require.NotEqual(t, -1, regIdx)
+	require.NotEqual(t, -1, gateIdx)
+	assert.Less(t, gateIdx, regIdx, "授权判断必须在注册之前")
+}
+
+// TestGrantLogin_RenewsAuthCodeTTL 锁住 P1-3 的修复。authCode 在**扫码**时签发，用户
+// 可以在确认页停到该 TTL 的最后一刻；若这里只续 qrcode 不续 authCode，就会出现
+// 「status=authed、附带的 auth_code 只剩一秒」，浏览器兑换必然失败且状态机无路可走。
+func TestGrantLogin_RenewsAuthCodeTTL(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) grantLogin(")
+
+	assert.Contains(t, fn, "common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL",
+		"确认时必须按同一档位给 authCode 重新计时")
+
+	renewIdx := strings.Index(fn, "common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL")
+	qrIdx := strings.Index(fn, "common.QRCodeCachePrefix, uuid)")
+	require.NotEqual(t, -1, renewIdx)
+	require.NotEqual(t, -1, qrIdx)
+	assert.Less(t, renewIdx, qrIdx,
+		"先续 authCode 再写 qrcode —— 续期失败就不该对外宣告 authed")
+
+	// 两者必须用同一个常量，否则窗口又会倒挂。
+	assert.NotContains(t, fn, "time.Minute*5",
+		"TTL 必须走 ScanLoginAuthCodeTTL 常量，不要再散落字面量")
+}
+
+// TestLoginWithAuthCode_ClearsScanLoginState 锁住 P2-3：登录完成后本轮扫码的所有状态
+// 都要清掉。qrcode:{uuid} 里还带着 encrypt（Signal 密钥材料），没有理由留在 Redis。
+func TestLoginWithAuthCode_ClearsScanLoginState(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) loginWithAuthCode(")
+
+	assert.Contains(t, fn, "u.deleteScanLoginPollSecret(uuid)", "必须吊销轮询密钥")
+	assert.Contains(t, fn, "common.QRCodeCachePrefix, uuid)",
+		"必须一并删除 qrcode:{uuid}，它仍携带 uid / auth_code / encrypt")
+}
+
+// TestGetLoginUUID_SetsNoStore 锁住 P2-5：响应体带着 bearer 级密钥，任何中间缓存或
+// 浏览器 bfcache 留存都等于泄露它。
+func TestGetLoginUUID_SetsNoStore(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) getLoginUUID(")
+	assert.Contains(t, fn, `c.Header("Cache-Control", "no-store")`)
 }

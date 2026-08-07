@@ -16,10 +16,15 @@ change-log convention (§7). Newest first.
   the secret is revoked on redemption; the 10s long poll releases on disconnect
   and only reclaims its own channel. Cross-repo: octo-web replays the header.
   **This closes QR-observer hijack, not QRLJacking** — the attacker mints the
-  uuid and so receives the secret too. The server half of the real mitigation
-  (requesting device/IP on the confirm screen) ships here and is blocked on
-  iOS/Android rendering it. See
-  [journal](journal/shared/scanlogin-poll-binding.md).
+  uuid and so receives the secret too. The confirm-screen device context that
+  *would* close it was pulled after review: every field of it is
+  attacker-controlled today (gin trusts all proxies, so even the IP is
+  forgeable), which would have turned weak evidence into false assurance.
+  Tracked in octo-ios#71 / octo-android#116. Review also surfaced an auth-code
+  expiry inversion that the TTL change had made reachable, a channel-displacement
+  vector on the long poll, and post-login state (incl. Signal key material)
+  outliving the session — all fixed here. Needs octo-lib#116 for the header to
+  work cross-origin. See [journal](journal/shared/scanlogin-poll-binding.md).
 
 ## 2026-08-06 (bot-setting-store)
 

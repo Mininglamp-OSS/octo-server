@@ -1075,7 +1075,7 @@ func TestSendQRCodeInfo_ConcurrentSendAndRemove(t *testing.T) {
 		// Goroutine 2: 移除 channel
 		go func() {
 			defer wg.Done()
-			u.removeQRCodeChan(uuid)
+			u.removeQRCodeChanOwned(uuid, qrcodeChan)
 		}()
 
 		// 等待两个 goroutine 完成
@@ -1101,7 +1101,7 @@ func TestSendQRCodeInfo_NoReceiverDoesNotBlock(t *testing.T) {
 	uuid := "test-no-receiver"
 
 	// 使用 getQRCodeModelChan（buffered channel, size=1）
-	_ = u.getQRCodeModelChan(uuid)
+	qrcodeChan := u.getQRCodeModelChan(uuid)
 
 	// 不启动接收者，直接发送
 	done := make(chan bool)
@@ -1122,18 +1122,19 @@ func TestSendQRCodeInfo_NoReceiverDoesNotBlock(t *testing.T) {
 	}
 
 	// 清理
-	u.removeQRCodeChan(uuid)
+	u.removeQRCodeChanOwned(uuid, qrcodeChan)
 }
 
-// TestRemoveQRCodeChan_ClosesChannel 测试 removeQRCodeChan 关闭 channel 不会 panic
-func TestRemoveQRCodeChan_ClosesChannel(t *testing.T) {
+// TestRemoveQRCodeChanOwned_ClosesOwnChannel 测试 removeQRCodeChanOwned 关闭自己注册的
+// channel 不会 panic，且重复调用安全。
+func TestRemoveQRCodeChanOwned_ClosesOwnChannel(t *testing.T) {
 	u := &User{}
 	uuid := "test-close-chan"
 
 	ch := u.getQRCodeModelChan(uuid)
 
 	// remove should close the channel
-	u.removeQRCodeChan(uuid)
+	u.removeQRCodeChanOwned(uuid, ch)
 
 	// reading from closed channel should return zero value, not block
 	select {
@@ -1146,7 +1147,7 @@ func TestRemoveQRCodeChan_ClosesChannel(t *testing.T) {
 	}
 
 	// double remove should not panic
-	u.removeQRCodeChan(uuid)
+	u.removeQRCodeChanOwned(uuid, ch)
 }
 
 // TestBufferedChannel_PreventsTOCTOU 测试 buffered channel 防止 TOCTOU 消息丢失
@@ -1175,5 +1176,5 @@ func TestBufferedChannel_PreventsTOCTOU(t *testing.T) {
 		t.Fatal("buffered channel should have data available immediately")
 	}
 
-	u.removeQRCodeChan(uuid)
+	u.removeQRCodeChanOwned(uuid, ch)
 }

@@ -2064,9 +2064,11 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 	}
 	// 轮询密钥：把「二维码状态里的敏感字段」绑定到申请二维码的这个浏览器会话。
 	//
-	// 没有它时，uuid 是读取 auth_code 的唯一凭据，而 uuid 可以由任何人向本接口申请
-	// —— 攻击者把自己申请到的二维码贴进钓鱼页，受害者用真 App 扫码确认后，攻击者
-	// 轮询 loginstatus 就能拿到 auth_code 并兑换成受害者的 token（QRLJacking）。
+	// 没有它时，uuid 是读取 auth_code 的唯一凭据 —— 任何看得到二维码的人（肩窥、
+	// 转发的截图、投屏、录屏）都能轮询出 auth_code 并兑换成受害者的 token。
+	//
+	// 注意它挡不住 QRLJacking（攻击者自建二维码钓鱼）：那条链路里攻击者就是调用本
+	// 接口的人，密钥连同 uuid 一起发给了他。那条只能靠确认环节的人识破，服务端无解。
 	//
 	// 明文只出现在本响应里，绝不写进 qrcode:{uuid} 的 payload —— 那份 payload 正是
 	// getloginStatus 要回显给匿名轮询方的内容。
@@ -2076,22 +2078,25 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	// 记录「是谁请求了这个二维码」，扫码时回给手机端展示。
-	//
-	// 这才是 QRLJacking 的真正断点：poll_secret 挡不住它（攻击者自己调本接口，密钥
-	// 也在他手里），能识破钓鱼的只有确认环节的人 —— 前提是他看得到「请求方是一台
-	// 陌生设备、来自陌生 IP」。服务端在此把依据备齐；生效还需移动端渲染确认弹窗。
-	u.storeScanLoginOrigin(uuid, ScanLoginOrigin{
-		IP:          c.ClientIP(),
-		DeviceName:  deviceName,
-		DeviceModel: deviceModel,
-		UserAgent:   c.Request.UserAgent(),
-	})
+	// 响应体里带着 bearer 级别的密钥，任何中间缓存或浏览器 bfcache 留存都等于泄露它。
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
 		"uuid":        uuid,
 		"poll_secret": pollSecret,
 		"qrcode":      fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
 	})
+}
+
+// scanLoginPresentedPollSecret 取出轮询方出示的密钥。
+//
+// header 优先、query 兜底：header 是首选通道（不进 access log），但 octo-lib 的
+// CORS 白名单目前不含它，跨源部署（Tauri/Electron 正式包）的预检会直接拒掉整个请求。
+// 见 ScanLoginPollSecretHeader / scanLoginPollSecretQuery 的注释与其中的 SUNSET 条件。
+func scanLoginPresentedPollSecret(c *wkhttp.Context) string {
+	if v := strings.TrimSpace(c.GetHeader(ScanLoginPollSecretHeader)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(c.Query(scanLoginPollSecretQuery))
 }
 
 // 通过loginUUID获取登录状态
@@ -2134,7 +2139,7 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// 授权判定放在所有早退分支之后：过期 / 未知 uuid 上面已经返回，不必为它们多花一次
 	// Redis 读 —— 本接口未认证，任何「无效输入也要付出后端开销」的路径都是放大器。
 	// 在进入长轮询前一次性定下，避免 select 的多个出口重复查询。
-	authorized := u.scanLoginPollSecretMatches(uuid, c.GetHeader(ScanLoginPollSecretHeader))
+	authorized := u.scanLoginPollSecretMatches(uuid, scanLoginPresentedPollSecret(c))
 	respondStatus := func(model *common.QRCodeModel) {
 		if model == nil {
 			// channel 被同 uuid 的另一个请求关掉时会收到 nil。此处必须仍然写出响应：
@@ -2153,7 +2158,20 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 		}
 		c.JSON(http.StatusOK, model.Data)
 	}
-	qrcodeChan := u.getQRCodeModelChan(uuid)
+	// 只有持密钥的一方才注册推送 channel。
+	//
+	// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，所以未授权方一旦也能注册，就能靠
+	// 反复轮询持续把合法轮询方的 channel 顶掉：grantLogin 的推送落到攻击者那一侧（凭据
+	// 有白名单拦着不会泄露），而合法方收不到通知，每轮白等满 10 秒才拿到旧状态 —— 未认证
+	// 端点上的一个廉价登录延迟惩罚。未授权方本来也只能拿到白名单字段，订阅对它毫无意义。
+	//
+	// 不注册时 qrcodeChan 为 nil：从 nil channel 接收永远阻塞，select 自然落到超时分支。
+	// 刻意让未授权方也等满同样的 10 秒 —— 立刻返回会泄露「密钥对不对」的时序信号，
+	// 也会让攻击者能高频轮询。
+	var qrcodeChan <-chan *common.QRCodeModel
+	if authorized {
+		qrcodeChan = u.getQRCodeModelChan(uuid)
+	}
 	// 显式 Timer 而非 time.After：加了 ctx.Done() 分支后，提前返回的路径会把
 	// time.After 的底层 timer 留到 10s 后才被 GC 回收；Stop 掉更干净。
 	timeout := time.NewTimer(10 * time.Second)
@@ -2344,10 +2362,17 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	// 登录已完成，轮询密钥再留着就只是一段多余的可利用窗口 —— 期间任何拿到它的人
-	// 仍能从 qrcode:{uuid}（还有最长 5 分钟寿命）读出 uid/encrypt。与上面删除 authCode
-	// 同一个理由，只是这条此前漏了。失败不阻断登录，密钥仍会按 TTL 自然过期。
+	// 登录已完成，与上面删除 authCode 同一个理由：把这一轮扫码留下的状态全部清掉，
+	// 不给已完成的会话留任何残余窗口。两处失败都不阻断登录（各自 TTL 会兜底）。
+	//   - 轮询密钥：留着等于多一段能读出凭据字段的时间
+	//   - qrcode:{uuid}：还携带 uid / auth_code / encrypt，其中 encrypt 是 Signal 密钥
+	//     材料，登录完成后没有任何理由继续留在 Redis 里
 	u.deleteScanLoginPollSecret(uuid)
+	if uuid != "" {
+		if delErr := u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid)); delErr != nil {
+			u.Warn("清理扫码二维码状态失败", zap.String("uuid", uuid), zap.Error(delErr))
+		}
+	}
 
 	err = u.ctx.Cache().SetAndExpire(fmt.Sprintf("%s%d%s", u.ctx.GetConfig().Cache.UIDTokenCachePrefix, flag, userModel.UID), token, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
@@ -2381,15 +2406,6 @@ func (u *User) getQRCodeModelChan(uuid string) <-chan *common.QRCodeModel {
 	qrcodeChanLock.Unlock()
 	return qrcodeModelChan
 }
-func (u *User) removeQRCodeChan(uuid string) {
-	qrcodeChanLock.Lock()
-	defer qrcodeChanLock.Unlock()
-	ch, exist := qrcodeChanMap[uuid]
-	if exist {
-		delete(qrcodeChanMap, uuid)
-		close(ch) // close channel to unblock any pending sender
-	}
-}
 
 // removeQRCodeChanOwned 只在 map 中登记的仍是本请求注册的那个 channel 时才摘除并关闭。
 //
@@ -2399,6 +2415,9 @@ func (u *User) removeQRCodeChan(uuid string) {
 // 对方立刻收到 nil，本轮长轮询作废；grantLogin 的推送则落到已被替换的 channel 上，
 // 在 SendQRCodeInfo 的 default 分支被静默丢弃。带归属校验后，每个请求只回收自己那个。
 func (u *User) removeQRCodeChanOwned(uuid string, own <-chan *common.QRCodeModel) {
+	if own == nil {
+		return // 未授权的轮询方压根没注册，没有东西要回收
+	}
 	qrcodeChanLock.Lock()
 	defer qrcodeChanLock.Unlock()
 	ch, exist := qrcodeChanMap[uuid]
@@ -2469,6 +2488,21 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 		return
 	}
 	uuid, _ := authInfoMap["uuid"].(string)
+	// authCode 是在**扫码**时签发的（handleScanLogin，TTL = ScanLoginAuthCodeTTL），而
+	// 用户可以在确认页停留到该 TTL 的最后一刻。下面把 qrcode:{uuid} 续成满 TTL 却不续
+	// authCode，就会出现「status 显示 authed、附带的 auth_code 只剩一秒」——浏览器兑换时
+	// 撞 ErrUserAuthCodeNotFound，而状态机已经停在 authed 无路可走。
+	//
+	// 在这里按同一档位重新计时：确认之后 authCode 与 qrcode 同时起算、同时到期，窗口
+	// 不再可能倒挂。（此前 authCode 是 10min、确认窗口 5min，靠 5 分钟余量把这个竞态盖住
+	// 了；TTL 收敛到 5min 后余量归零，必须显式修。）
+	if err = u.ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL,
+	); err != nil {
+		u.Error("续期扫码授权码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
 	qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
 		"app_id":    "wukongchat",
 		"status":    common.ScanLoginStatusAuthed,
@@ -2476,7 +2510,7 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 		"auth_code": authCode,
 		"encrypt":   encrypt,
 	})
-	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), time.Minute*5)
+	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginAuthCodeTTL)
 	if err != nil {
 		u.Error("更新二维码信息失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)

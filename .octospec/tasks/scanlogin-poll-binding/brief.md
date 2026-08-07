@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: scanlogin-poll-binding"
-description: Bind the scan-login poll channel to the browser that minted the QR, closing the QRLJacking account-takeover path.
+description: Bind the scan-login poll channel to the browser that minted the QR. Closes QR-observer hijack; QRLJacking is explicitly NOT closed and needs the mobile confirm dialog.
 tags: ["auth", "scan-login", "security", "rate-limit", "wire-contract"]
 timestamp: 2026-08-07T00:00:00Z
 # --- octospec extension fields ---
@@ -27,9 +27,15 @@ source: self
 >
 > QRLJacking 无法在服务端单独关闭 —— 服务端区分不出「受害者扫了攻击者的码」与
 > 「本人扫了自己的码」，**只有确认的人能**。唯一的真断点是让确认者看见「请求登录的
-> 是一台陌生设备、来自陌生 IP」并因此拒绝。本任务补齐该能力的服务端半边
-> （`ScanLoginOrigin` 随扫码结果下发给手机），**但在 iOS/Android 把它渲染进确认弹窗
-> 之前，QRLJacking 依然成立**。移动端工作是本漏洞的阻塞项，另开任务跟踪。
+> 是一台陌生设备、来自陌生 IP」并因此拒绝。
+>
+> **二次修订（PR #715 review 后）**：该能力的服务端半边（`ScanLoginOrigin`）曾在本任务
+> 里实现，现已**整体撤除**。原因是那些「依据」目前全部由攻击者掌控：`device_name` /
+> `device_model` 直接来自 `loginuuid` 的 query 参数、`User-Agent` 是请求头，而 IP 走
+> `c.ClientIP()` —— 本仓与 octo-lib 都没调过 `SetTrustedProxies`，gin 默认信任
+> `0.0.0.0/0`、取 `X-Forwarded-For` 最左项，客户端可预置。攻击者能让确认弹窗显示受害者
+> **自己的** IP 和设备名，把弱证据变成假保证，比不显示更糟。要做对需先定下可信来源，
+> 而那依赖运维确认反代对 XFF 是覆盖还是追加。跟踪：octo-ios#71 / octo-android#116。
 
 ## Background
 
@@ -85,9 +91,9 @@ source: self
 
 - **取消 `login_authcode` 这一跳**（让 `loginstatus` 直接下发 token）—— 协议重构，
   影响面超出本次；`poll_secret` 已经堵住利用链
-- **手机确认页 UI 渲染设备上下文** —— 服务端已在本次补齐数据下发
-  （`ScanLoginOrigin` → `HandlerTypeLoginConfirm.origin`），但渲染在 iOS/Android，
-  那两个仓不在本次范围。**这是关闭 QRLJacking 的阻塞项**，必须另开任务跟到底
+- **确认页设备上下文（服务端下发 + 移动端渲染）** —— 整体移出本任务，见上面的二次修订。
+  服务端要先解决可信来源问题，移动端再渲染。**这是关闭 QRLJacking 的阻塞项**，
+  跟踪于 octo-ios#71 / octo-android#116
 - **`modules/file` 预签名上传/下载越权**（复测 4.2/4.4/4.6）—— 独立任务
 - **`pkg/space` SpaceMiddleware fail-open**（复测 4.11）—— 独立任务
 - **octo-lib 的 `common/constant.go`** —— 外部模块，新前缀在 octo-server 本地定义
@@ -105,12 +111,23 @@ source: self
 - [ ] `GET /v1/user/loginstatus?uuid=X&poll_secret=<对值>` 返回完整 Data 含 `auth_code`
 - [ ] 端到端回归：mint → 扫码 → grantLogin → 带对 secret 轮询 → `login_authcode` 兑换成功
 - [ ] `loginuuid` / `loginstatus` 命中 `StrictIPRateLimitMiddleware`，tag 分别为
-      `scanlogin_uuid`（20 req/min，burst 10）与 `scanlogin_status`（120 req/min，
-      burst 60），阈值可经 env 覆盖
+      `scanlogin_uuid`（120 req/min，burst 60）与 `scanlogin_status`（600 req/min，
+      burst 300），阈值可经 env 覆盖。给得松是刻意的：qrcode 初始 TTL 只有 60s，每个停在
+      登录页的浏览器约每分钟重铸一次 uuid，且反代没配 XFF 时 getClientIP 回落 RemoteAddr
+      会把整个部署塌进一个桶
 - [ ] `authcode` TTL = 5min（用户选择的保守值），扫码/授权后 `qrcode` TTL 维持 5min；
       `scanLoginPollSecretTTL` 严格大于最坏可读窗口 60s+5min+5min=660s 并留余量
 - [ ] `getloginStatus` 的 select 含 `c.Request.Context().Done()` 分支
-- [ ] `poll_secret` 经**请求头** `X-Scan-Poll-Secret` 传递，不出现在 URL / access log
+- [ ] `poll_secret` 首选经请求头 `X-Scan-Poll-Secret` 传递；跨源部署可退回 `poll_secret`
+      query（octo-lib CORS 白名单不含自定义头，跨源预检会拒掉整个请求 —— 见 octo-lib#116，
+      合并并 bump 依赖后删除 query 分支）
+- [ ] `grantLogin` 确认时按同一档位给 `authCode` 续期，杜绝「status=authed 但 auth_code
+      已过期」的倒挂窗口
+- [ ] 未授权轮询方**不注册**长轮询 channel（否则可持续顶掉合法轮询方），但仍等满同样
+      时长，不泄露密钥正确与否的时序信号
+- [ ] `loginWithAuthCode` 兑换后一并删除 `qrcode:{uuid}`（仍携带 `encrypt` Signal 密钥材料）
+- [ ] `getLoginUUID` 响应带 `Cache-Control: no-store`
+- [ ] swagger 记录 `poll_secret` 响应字段与两个凭据通道
 - [ ] 敏感字段过滤用**白名单**（`scanLoginPublicDataKeys`）而非黑名单——payload 有
       三处写入方（`getLoginUUID` / `handleScanLogin` / `grantLogin`），黑名单对新增
       字段 fail-open
