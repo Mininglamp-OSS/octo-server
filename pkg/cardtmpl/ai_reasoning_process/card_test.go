@@ -530,18 +530,19 @@ func worstCasePhases(thoughtMax int) []any {
 
 // reasoningThoughtMax is the per-version `phases[].thought` ceiling. V2/V3 pinned
 // it to the producer's observed output (280 + `…` = 281); V4 raised it to a
-// platform product cap (4000 + `…` = 4001) that deliberately no longer tracks
-// producer truncation, so the two must be asserted separately rather than
-// through one shared constant. Keyed explicitly per version and fatal on an
-// unknown one: a default would silently bless a future version that narrowed the
-// bound back down, since the bounds table would still pass.
+// platform product cap that no longer tracks producer truncation but IS
+// calibrated against what the persistence layer can store at the worst-case
+// encoding — see TestSimplifiedSuccessorCeilingIsPersistenceSafe. Keyed
+// explicitly per version and fatal on an unknown one: a default would silently
+// bless a future version that narrowed the bound back down, since the bounds
+// table would still pass.
 func reasoningThoughtMax(t *testing.T, version string) int {
 	t.Helper()
 	switch version {
 	case aireasoningprocess.TemplateVersionV2, reasoningVersionV3:
 		return 281
 	case reasoningVersionV4:
-		return 4001
+		return 400
 	default:
 		t.Fatalf("reasoningThoughtMax: unhandled version %q — add its ceiling explicitly", version)
 		return 0

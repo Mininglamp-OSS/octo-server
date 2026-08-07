@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -603,53 +604,61 @@ func TestSimplifiedSuccessorResultFrameRejectsSubmitEvenWithMatchingGolden(t *te
 	}
 }
 
-// D3a persistence ceiling. `cardmsg.MaxPayloadBytes` (512 KiB) is the only size
-// gate a rendered frame passes, but it is not the smallest one downstream: the
-// authoritative bot-edit write stores the whole marshalled frame in
-// `message_extra.content_edit`, a MySQL TEXT column (65,535 bytes, never widened
-// by a later migration — `octo_message_card_revision.content` likewise).
+// D3a persistence ceiling — the contract must not admit what the store cannot
+// hold. `cardmsg.MaxPayloadBytes` (512 KiB) is the only size gate a rendered
+// frame passes, but it is not the smallest one downstream: the authoritative
+// bot-edit write puts the whole marshalled frame into
+// `message_extra.content_edit` (`internal/carddispatch/mutation.go`), and that
+// column's width is discovered only at INSERT time — as `Data too long for
+// column` under STRICT_TRANS_TABLES, or a silent truncation into invalid JSON
+// without it.
 //
-// This test is deliberately a *record of the gap*, not a green-path assertion:
-// what the schema now admits exceeds that column, and D3a makes widening it (or
-// capping the producer) a precondition of the consumer's THOUGHT_MAX bump. Two
-// things are pinned so the record cannot silently drift:
+// So this asserts the invariant directly: at the schema's own ceiling, under the
+// worst-case *byte* encoding, the frame still fits the column. Two things make
+// that non-trivial and are covered explicitly:
 //
-//  1. at the producer's actual cap today (281) every encoding still fits, which
-//     is why nothing regresses at this head;
-//  2. at the schema ceiling it does not fit — and the byte worst case is NOT the
-//     CJK fixture the other tests use. JSON Schema counts code points while the
-//     wire counts bytes, and Go escapes `<`, `>`, `&`, U+2028, U+2029 to six
-//     bytes each, so the true maximum is ~1.7× the CJK figure.
-//
-// If someone widens the column or lowers the ceiling, this test's numbers move
-// and the brief/journal claims have to move with them.
-func TestSimplifiedSuccessorFrameVsPersistedTextColumn(t *testing.T) {
-	// MySQL TEXT, per modules/message/sql/20220414000001_message_legacy01.sql:3.
-	const mysqlTextLimit = 65535
+//   - JSON Schema counts code points while the column counts bytes, and Go
+//     escapes `<`, `>`, `&`, U+2028 and U+2029 to six bytes each. The CJK
+//     fixture the other tests use is therefore NOT the byte worst case, and
+//     neither is escaping `thought` alone — every free string has to escape.
+//   - the column width is read out of the migration rather than hand-copied, so
+//     widening it to MEDIUMTEXT is observable here instead of leaving the
+//     ceiling silently over-conservative.
+func TestSimplifiedSuccessorCeilingIsPersistenceSafe(t *testing.T) {
+	columnBytes := contentEditColumnBytes(t)
 	reg := newRegistry(t)
 
-	worstFrameBytes := func(t *testing.T, thoughtLen int, unit string) int {
+	// escapeAll drives every free string to 6 bytes per code point, not just
+	// `thought`: the other fields sit in the same frame and inflate the baseline
+	// with it (measured: 30,036 B of baseline as CJK vs 42,024 B escaped).
+	worstFrameBytes := func(t *testing.T, thoughtLen int, escapeAll bool) int {
 		t.Helper()
+		filler := func(n int, cjk string) string {
+			if escapeAll {
+				return strings.Repeat("<", n)
+			}
+			return strings.Repeat(cjk, n)
+		}
 		var maxSeen int
 		for _, tc := range reasoningStates {
 			data := readSampleMap(t, reasoningRootV4, "reasoning")
 			data["state"] = string(tc.state)
 			data["reasoningId"] = strings.Repeat("r", 512)
-			data["title"] = strings.Repeat("题", 64)
-			data["statusLabel"] = strings.Repeat("状", 32)
-			data["timerText"] = strings.Repeat("时", 128)
-			data["collapsedSummary"] = strings.Repeat("摘", 160)
-			data["progressText"] = strings.Repeat("进", 160)
-			data["errorTitle"] = strings.Repeat("错", 64)
-			data["errorMessage"] = strings.Repeat("误", 121)
+			data["title"] = filler(64, "题")
+			data["statusLabel"] = filler(32, "状")
+			data["timerText"] = filler(128, "时")
+			data["collapsedSummary"] = filler(160, "摘")
+			data["progressText"] = filler(160, "进")
+			data["errorTitle"] = filler(64, "错")
+			data["errorMessage"] = filler(121, "误")
 			phases := phasesWithActionCounts(3, 2, 2, 2, 2, 2)
 			for _, rawPhase := range phases {
 				phase := rawPhase.(map[string]any)
-				phase["thought"] = strings.Repeat(unit, thoughtLen)
+				phase["thought"] = filler(thoughtLen, "思")
 				for _, rawAction := range phase["actions"].([]any) {
 					action := rawAction.(map[string]any)
-					action["tool"] = strings.Repeat("工", 81)
-					action["detail"] = strings.Repeat("详", 192)
+					action["tool"] = filler(81, "工")
+					action["detail"] = filler(192, "详")
 				}
 			}
 			data["phases"] = phases
@@ -660,7 +669,7 @@ func TestSimplifiedSuccessorFrameVsPersistedTextColumn(t *testing.T) {
 			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
 				reasoningVersionV4, tc.state, raw, cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
 			if err != nil {
-				t.Fatalf("thought=%d unit=%q state=%s: %v", thoughtLen, unit, tc.state, err)
+				t.Fatalf("thought=%d escapeAll=%v state=%s: %v", thoughtLen, escapeAll, tc.state, err)
 			}
 			encoded, err := json.Marshal(payload)
 			if err != nil {
@@ -673,38 +682,115 @@ func TestSimplifiedSuccessorFrameVsPersistedTextColumn(t *testing.T) {
 		return maxSeen
 	}
 
-	// (1) Today's producer cap fits the column under every encoding.
-	producerCap := reasoningThoughtMax(t, reasoningVersionV3) // 281, what the plugin emits
-	for _, unit := range []string{"思", "😀", "<"} {
-		if got := worstFrameBytes(t, producerCap, unit); got > mysqlTextLimit {
-			t.Fatalf("frame at the producer's current cap (%d x %q) = %d B, over the %d B column — "+
-				"this would be a live regression, not deferred headroom",
-				producerCap, unit, got, mysqlTextLimit)
+	ceiling := reasoningThoughtMax(t, reasoningVersionV4)
+	cjk := worstFrameBytes(t, ceiling, false)
+	escaped := worstFrameBytes(t, ceiling, true)
+
+	// The invariant. If this fails, the advertised contract accepts frames the
+	// authoritative write cannot persist — a bot can send schema-valid data and
+	// get a 500 with the card frozen mid-stream.
+	if escaped > columnBytes {
+		t.Fatalf("frame at the schema ceiling (thought=%d, every free string escaped) = %d B, "+
+			"over message_extra.content_edit's %d B: the contract would admit payloads the "+
+			"authoritative write cannot store. Lower the ceiling, gate the frame at the "+
+			"persistence boundary, or widen the column — and update D3a with it",
+			ceiling, escaped, columnBytes)
+	}
+	// Escaping only `thought` understates the maximum; guard the fixture choice
+	// so a future edit cannot quietly reintroduce a CJK-only "worst case".
+	if escaped <= cjk {
+		t.Fatalf("escape-heavy frame (%d B) should exceed the CJK frame (%d B): Go escapes "+
+			"<, >, &, U+2028, U+2029 to 6 bytes, so CJK is not the byte worst case", escaped, cjk)
+	}
+	if escaped > cardmsg.MaxPayloadBytes {
+		t.Fatalf("escape-heavy frame = %d B exceeds cardmsg.MaxPayloadBytes (%d)", escaped, cardmsg.MaxPayloadBytes)
+	}
+	t.Logf("ceiling %d cp/phase: %d B CJK / %d B fully escaped, both within the %d B column (%.0f%% used)",
+		ceiling, cjk, escaped, columnBytes, float64(escaped)/float64(columnBytes)*100)
+}
+
+// contentEditColumnBytes derives the persistence ceiling from the migration that
+// declares the column, so that widening it (the MEDIUMTEXT follow-up D3a
+// anticipates) changes this test's behaviour instead of leaving a hand-copied
+// constant behind.
+func contentEditColumnBytes(t *testing.T) int {
+	t.Helper()
+	const migration = "../../../modules/message/sql/20220414000001_message_legacy01.sql"
+	raw, err := os.ReadFile(migration)
+	if err != nil {
+		t.Fatalf("read %s: %v (the column declaration moved; re-point this test)", migration, err)
+	}
+	// e.g. "ADD COLUMN content_edit TEXT COMMENT ..."
+	re := regexp.MustCompile(`(?i)content_edit\s+(TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)`)
+	match := re.FindSubmatch(raw)
+	if match == nil {
+		t.Fatalf("no content_edit text-column declaration found in %s", migration)
+	}
+	widths := map[string]int{
+		"TINYTEXT":   255,
+		"TEXT":       65535,
+		"MEDIUMTEXT": 16777215,
+		"LONGTEXT":   4294967295,
+	}
+	declared := strings.ToUpper(string(match[1]))
+	width, ok := widths[declared]
+	if !ok {
+		t.Fatalf("unknown column type %q for content_edit", declared)
+	}
+	return width
+}
+
+// D4a: the chevrons fetch their icons from a third-party CDN. That is an accepted,
+// disclosed decision for 0.4.0 — not an oversight — so pin exactly what ships:
+// which host, and that nothing else outbound crept in alongside it. `cardmsg`'s
+// checkURL only constrains the scheme, and a template-authored URL is
+// server-authored and therefore trusted by construction, so no other gate would
+// notice a new external dependency being added to a template.
+//
+// If this fails, either the icons moved (update D4a and its CSP/egress
+// precondition) or a second outbound reference was introduced, which needs its own
+// decision rather than inheriting this one.
+func TestSimplifiedSuccessorOutboundResourceHostsAreDisclosed(t *testing.T) {
+	const disclosed = "https://api.iconify.design/lucide/chevron-"
+	urlPattern := regexp.MustCompile(`https?://[^"\s]+`)
+
+	for _, relative := range []string{
+		"templates/active.template.json", "templates/result.template.json",
+		"templates/error.template.json",
+		"goldens/reasoning.card.json", "goldens/answering.card.json",
+		"goldens/completed.card.json", "goldens/stopped.card.json",
+		"goldens/error.card.json",
+	} {
+		content := string(readAsset(t, reasoningRootV4+"/"+relative))
+		for _, found := range urlPattern.FindAllString(content, -1) {
+			switch {
+			case strings.HasPrefix(found, disclosed):
+				// The documented chevron dependency (D4a).
+			case strings.HasPrefix(found, "http://adaptivecards.io/schemas/"):
+				// $schema meta-identifier, never fetched.
+			default:
+				t.Fatalf("%s references undisclosed outbound URL %q — a built-in template's "+
+					"external dependencies are trusted by construction (checkURL gates the "+
+					"scheme, not the host), so each one needs a recorded decision like D4a",
+					relative, found)
+			}
 		}
 	}
 
-	// (2) The schema ceiling does not, and the escape-heavy case is the real max.
-	ceiling := reasoningThoughtMax(t, reasoningVersionV4) // 4001
-	cjk := worstFrameBytes(t, ceiling, "思")
-	escaped := worstFrameBytes(t, ceiling, "<")
-	if cjk <= mysqlTextLimit {
-		t.Fatalf("frame at the schema ceiling = %d B, now within the %d B column — "+
-			"the column was widened or the ceiling lowered; update D3a, the journal, "+
-			"and the pending learning, which all document this as an open precondition",
-			cjk, mysqlTextLimit)
+	// The frozen predecessors carry no outbound runtime dependency at all; keep that
+	// contrast true, since it is what makes V4's the precedent-setting one.
+	for _, root := range []string{aireasoningprocess.HandoffRootV1, aireasoningprocess.HandoffRootV2, reasoningRootV3} {
+		for _, relative := range []string{
+			"templates/active.template.json", "templates/result.template.json",
+			"templates/error.template.json",
+		} {
+			content := string(readAsset(t, root+"/"+relative))
+			if strings.Contains(content, "api.iconify.design") {
+				t.Fatalf("%s/%s gained an outbound icon reference; frozen versions must not change",
+					root, relative)
+			}
+		}
 	}
-	if escaped <= cjk {
-		t.Fatalf("escape-heavy frame (%d B) should exceed the CJK frame (%d B): "+
-			"Go escapes <, >, &, U+2028, U+2029 to 6 bytes, so CJK is not the byte worst case",
-			escaped, cjk)
-	}
-	if escaped > cardmsg.MaxPayloadBytes {
-		t.Fatalf("escape-heavy frame = %d B exceeds cardmsg.MaxPayloadBytes (%d) — "+
-			"the render gate itself would now reject the schema's own worst case",
-			escaped, cardmsg.MaxPayloadBytes)
-	}
-	t.Logf("frame vs 64 KiB TEXT column: producer cap %d fits; ceiling %d = %d B CJK (%.2fx) / %d B escaped (%.2fx)",
-		producerCap, ceiling, cjk, float64(cjk)/mysqlTextLimit, escaped, float64(escaped)/mysqlTextLimit)
 }
 
 func jsonNumber(t *testing.T, raw any) int {

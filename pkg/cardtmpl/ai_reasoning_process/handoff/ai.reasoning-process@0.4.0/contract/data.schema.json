@@ -111,8 +111,8 @@
           "thought": {
             "type": "string",
             "minLength": 1,
-            "description": "该阶段面向用户的推理摘要。上限为平台产品上限，不再跟随 producer 的截断长度；producer 侧仍应自行截断到不超过此值。",
-            "maxLength": 4001
+            "description": "该阶段面向用户的推理摘要。上限为平台产品上限，不再跟随 producer 的截断长度；已按最坏编码校准到持久化层可存储的范围内。",
+            "maxLength": 400
           },
           "actions": {
             "type": "array",
