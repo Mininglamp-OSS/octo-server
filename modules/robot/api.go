@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -2427,10 +2428,27 @@ func (rb *Robot) isGroupDisbanded(groupNo string) (bool, error) {
 
 // resolveParentGroupNo 从子区 channelID 解析父群号。
 // 子区 channelID 格式：groupNo____threadID（4个下划线分隔）
+// resolveParentGroupNo 从子区 channelID 解析父群号。
+//
+// 委托给 thread.ParseChannelID，**不自己写解析**（round-9 评审 P2-2）。原实现用
+// `SplitN(channelID, "____", 2)`，只要能切出两段就通过；标准解析器用 `Split`（非
+// SplitN）要求**恰好**两段、且两段都非空。差别在本函数只喂解散守卫时无害，但现在它
+// 还喂 allowSendToChannel 的子区分支——也就是**鉴权判定**：
+//
+//	"groupA____topic____extra" → SplitN 给出 parts[0]="groupA"，成员校验按 groupA 过，
+//	而派发出去的是原始的非规范 channelID；下游一律走 ParseChannelID，于是那条消息
+//	解析失败、投不到任何订阅者。门与投递目标对「什么是合法子区 ID」的判断不一致。
+//
+// 这与刚修的 P1（子区成员判定用了比全仓更松的谓词）是同一族问题：robot 模块把一个
+// 全仓已有的判定又实现了一遍，而且更松。所以这里不再「顺手收紧」，直接用那一份。
+//
+// 不额外套 thread.IsValidShortID（15–20 位数字）：本函数要保证的性质是「校验成员的
+// 群 == 消息实际投递的群」，恰好两段非空即可确定 parts[0] 无歧义；short id 的取值域
+// 是另一回事，收紧它的影响面本处无法核实。
 func (rb *Robot) resolveParentGroupNo(channelID string) (string, error) {
-	parts := strings.SplitN(channelID, "____", 2)
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid community topic channelID format: %s", channelID)
+	groupNo, _, err := thread.ParseChannelID(channelID)
+	if err != nil {
+		return "", fmt.Errorf("invalid community topic channelID format: %s: %w", channelID, err)
 	}
-	return parts[0], nil
+	return groupNo, nil
 }

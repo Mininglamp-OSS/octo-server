@@ -299,6 +299,33 @@ enumerating everyone who implements it, not everyone the diff touches** — and 
 test that proves it must assert the parties *agree*, not that each behaves as
 intended, because a per-party test passes fine while they disagree.
 
+## Split out deliberately, not forgotten
+
+Review recommended landing the config store and taking the authorization work as
+its own change, reviewed as the authorization change it is. Agreed — the last
+rounds were spent on `stream/start` and `allowSendToChannel`, and the one P1 came
+out of that expansion rather than out of the store. What stays behind, with the
+reason it is safe to defer:
+
+- **`stream/end` has no ownership check on `StreamNo`.** Bot A can observe Bot B's
+  stream number and end B's stream — a denial of service against a peer. Byte-
+  identical to the merge-base and untouched here. Note that the rebuttal recorded
+  above (a card cannot be smuggled through `streamEnd`, since
+  `MessageStreamEndReq` has no payload field) answers only the *card* question;
+  it does not clear the endpoint on ownership, and should not be read as if it
+  did.
+- **The `ChannelTypeGroup` branch of `allowSendToChannel` still uses
+  `ExistMember`.** So a blacklisted bot can post to a parent group while being
+  correctly refused from its subareas. That asymmetry mirrors the repo's existing
+  one and is now documented at the call site, but it deserves a decision rather
+  than inheritance.
+- **App Bots are not covered by this store at all.** They live in `app_bot` with
+  no `robot` row, and `assertRobotOwner` reads `robot` — so
+  `PUT /v1/robot/<appBotUID>/settings` can only ever 404 and no override is
+  expressible for them. Not a regression (the three editable switches default
+  true, i.e. pre-PR behaviour) and the global `system_setting` tier still applies,
+  but `BotCardConfig`'s doc comment reads as though it covers every bot.
+
 ## Known gaps at merge
 
 - `SettingBoolOK` remains a **best-effort** tier, as its doc comment says: a
@@ -414,6 +441,29 @@ intended, because a per-party test passes fine while they disagree.
   blacklisted row — so it fails if the predicate is swapped back, and asserts on
   *which method was called* rather than only on the verdict, because a stub with
   one shared result would answer both identically and stay green.
+
+  **Then the same thing again, one line over.** The next round found
+  `resolveParentGroupNo` — the parser feeding that very gate — splitting with
+  `SplitN(channelID, "____", 2)`, while the repo's `thread.ParseChannelID` uses
+  `Split`, requires exactly two parts, and requires both non-empty. Harmless while
+  it only fed disband guards; not harmless once it decides *which group's
+  membership is checked*. `groupA____topic____extra` and `groupA____` both yielded
+  `parts[0] == "groupA"`, passed membership, and were dispatched under the
+  non-canonical id — which every downstream reader then rejected via
+  `ParseChannelID`, so the gate and the delivery target disagreed about what a
+  subarea id even is. Now delegates to `ParseChannelID`.
+
+  Deliberately **not** also applying `thread.IsValidShortID` (15–20 digits): the
+  property this function owes is "the group whose membership was checked is the
+  group the message reaches", and exactly-two-non-empty-parts is what makes
+  `parts[0]` unambiguous. The short-id value domain is a separate question whose
+  blast radius could not be verified here.
+
+  Two instances of one mistake in adjacent lines, found in consecutive rounds, is
+  the strongest evidence on this branch for the rule stated above: **the unit of
+  enumeration is the decision, not the function.** Both were the robot module
+  re-implementing a repo-wide judgement more loosely than every other caller. The
+  fix in both cases was to delete the local implementation, not to tighten it.
 - **`streamEnd` has no caller binding, and one review's description of it is
   wrong.** An automated review suggested a stream's final content could smuggle a
   card via `streamEnd`. It cannot: `config.MessageStreamEndReq` is

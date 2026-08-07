@@ -341,11 +341,25 @@ func TestAllowSendToChannel_CommunityTopicResolvesParentGroup(t *testing.T) {
 		"非父群成员必须被拒")
 
 	// 形状不合法 → fail-closed，且不得把畸形串当群号去查。
-	gs.activeMember = true
-	gs.askedGroup = ""
-	assert.False(t, rb.allowSendToChannel("bot_a", "no_separator_here", topicType),
-		"子区 channelID 形状不合法时必须拒绝")
-	assert.Empty(t, gs.askedGroup, "形状不合法时不该发起成员查询")
+	//
+	// 这几种形状全仓标准解析器 thread.ParseChannelID 都拒（恰好两段、两段非空），
+	// 而原来那版 SplitN(...,2) 只拒第一种：后两种会切出 parts[0]="groupA" 通过成员
+	// 校验，再把非规范 channelID 原样投出去——下游同样走 ParseChannelID，于是门按
+	// groupA 放行、消息却投不到任何订阅者。门与投递目标对「合法子区 ID」判断不一致，
+	// 正是 round-9 评审 P2-2（与刚修的 P1 同一族：本模块把全仓判定又实现了一遍且更松）。
+	for _, malformed := range []string{
+		"no_separator_here",        // 没有分隔符
+		"groupA____topic____extra", // 多一个分隔符：SplitN 会放行
+		"groupA____",               // 尾段为空：SplitN 会放行
+		"____topic_1",              // 群号为空：SplitN 会放行且把 "" 当群号
+	} {
+		gs.activeMember = true
+		gs.askedGroup = ""
+		assert.False(t, rb.allowSendToChannel("bot_a", malformed, topicType),
+			"子区 channelID %q 形状不合法时必须拒绝", malformed)
+		assert.Empty(t, gs.askedGroup,
+			"%q 形状不合法却发起了成员查询——说明解析器放行了一个下游会拒的 ID", malformed)
+	}
 
 	// 未知类型仍然一律拒——放宽只针对 type 5。
 	assert.False(t, rb.allowSendToChannel("bot_a", "whatever", 99),
