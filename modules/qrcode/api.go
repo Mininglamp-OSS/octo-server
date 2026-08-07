@@ -163,6 +163,14 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 
 }
 
+// scanLoginAuthCodeTTL 是扫码登录授权码的存活时间。
+//
+// authCode 可被 POST /v1/user/login_authcode/{code} 直接兑换成 scaner 的完整 token，
+// 且该接口不校验兑换者身份，所以这里的 TTL 就是「凭据一旦外泄的可利用窗口」。原值
+// 10 分钟远超实际所需 —— 从扫码到浏览器完成兑换通常在数秒内。收敛到 5 分钟，既压窄
+// 窗口，又给弱网 / 用户在确认页停顿留足余量。
+const scanLoginAuthCodeTTL = 5 * time.Minute
+
 // 处理扫描登录
 func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel common.QRCodeModel) (interface{}, error) {
 	authCode := util.GenerUUID()
@@ -170,7 +178,7 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 		"scaner": loginUID,
 		"type":   common.AuthCodeTypeScanLogin,
 		"uuid":   uuid,
-	}), time.Minute*10)
+	}), scanLoginAuthCodeTTL)
 	if err != nil {
 		q.Error("生成扫码登录授权码失败", zap.Error(err))
 		return nil, fmt.Errorf("%w: scan login auth code", errQRCodeInternalStoreFailed)
@@ -190,9 +198,29 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 		return nil, fmt.Errorf("%w: scan login state", errQRCodeInternalStoreFailed)
 	}
 	user.SendQRCodeInfo(uuid, qrcodeInfo)
+
+	// 把「请求登录的那一端是谁」一并回给手机，供确认弹窗展示。
+	//
+	// 扫码登录唯一挡得住 QRLJacking（攻击者自己申请二维码、贴到钓鱼页诱导他人扫码）
+	// 的位置就是这里 —— 服务端无法区分「受害者扫了攻击者的码」和「本人扫了自己的
+	// 码」，只有确认的人能。前提是他看得到请求方的设备与 IP。读取失败不阻断扫码，
+	// 退化为不展示。**移动端渲染前，本字段不产生任何防护效果。**
+	var originResp map[string]interface{}
+	if origin, oErr := user.LoadScanLoginOrigin(q.ctx.GetRedisConn(), uuid); oErr != nil {
+		q.Warn("读取扫码登录来源失败", zap.String("uuid", uuid), zap.Error(oErr))
+	} else if origin != nil {
+		originResp = map[string]interface{}{
+			"ip":           origin.IP,
+			"device_name":  origin.DeviceName,
+			"device_model": origin.DeviceModel,
+			"user_agent":   origin.UserAgent,
+		}
+	}
+
 	return NewHandleResult(ForwardNative, HandlerTypeLoginConfirm, map[string]interface{}{
 		"auth_code": authCode,
 		"pub_key":   pubkey,
+		"origin":    originResp,
 	}), nil
 }
 

@@ -204,6 +204,18 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	registerLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "register", 5.0/60, 3)  // 5 req/min, burst 3
 	smsLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "sms", 5.0/60, 3)            // 5 req/min, burst 3
 	searchLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "search", 30.0/60, 15)    // 30 req/min, burst 15
+	// 扫码登录的两个端点此前既未认证也未限流：loginuuid 可被用来批量铸造钓鱼二维码，
+	// loginstatus 每次请求挂起 10 秒、可用来占满连接与 goroutine。
+	//
+	// 阈值刻意比 login 松，且做成 env 可调：loginstatus 是长轮询（单浏览器约 6 次/分，
+	// 多开标签页会翻倍），而企业 NAT 下整层楼共用一个出口 IP —— 卡太死的后果是一片人
+	// 登不上，比放过一点扫描流量严重得多。运维撞到 NAT 墙时可不重新发版直接上调。
+	scanLoginUUIDLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_uuid",
+		wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_RPS", defaultScanLoginUUIDRateLimitRPS),
+		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_BURST", defaultScanLoginUUIDRateLimitBurst))
+	scanLoginStatusLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_status",
+		wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_RPS", defaultScanLoginStatusRateLimitRPS),
+		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_BURST", defaultScanLoginStatusRateLimitBurst))
 
 	auth := r.Group("/v1", u.ctx.AuthMiddleware(r))
 	{
@@ -292,12 +304,12 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.GET("/user/web3verifytext", u.getVerifyText)              // 获取验证字符串
 		v.POST("/user/web3verifysign", u.web3verifySignature)       // 验证签名
 		//v.POST("user/wxlogin", u.wxLogin)
-		v.POST("/user/sms/forgetpwd", smsLimit, u.getForgetPwdSMS) //获取忘记密码验证码
-		v.POST("/user/pwdforget", loginLimit, u.pwdforget)         //重置登录密码
-		v.GET("/users/:uid/avatar", u.UserAvatar)                  // 用户头像
-		v.GET("/users/:uid/im", u.userIM)                          // 获取用户所在IM节点信息
-		v.GET("/user/loginuuid", u.getLoginUUID)                   // 获取扫描用的登录uuid
-		v.GET("/user/loginstatus", u.getloginStatus)
+		v.POST("/user/sms/forgetpwd", smsLimit, u.getForgetPwdSMS)   //获取忘记密码验证码
+		v.POST("/user/pwdforget", loginLimit, u.pwdforget)           //重置登录密码
+		v.GET("/users/:uid/avatar", u.UserAvatar)                    // 用户头像
+		v.GET("/users/:uid/im", u.userIM)                            // 获取用户所在IM节点信息
+		v.GET("/user/loginuuid", scanLoginUUIDLimit, u.getLoginUUID) // 获取扫描用的登录uuid
+		v.GET("/user/loginstatus", scanLoginStatusLimit, u.getloginStatus)
 		v.POST("/user/sms/registercode", smsLimit, u.sendRegisterCode)             //获取注册短信验证码
 		v.POST("/user/login_authcode/:auth_code", loginLimit, u.loginWithAuthCode) // 通过认证码登录
 		v.POST("/user/sms/login_check_phone", smsLimit, u.sendLoginCheckPhoneCode) //发送登录设备验证验证码
@@ -2050,13 +2062,48 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 			return
 		}
 	}
+	// 轮询密钥：把「二维码状态里的敏感字段」绑定到申请二维码的这个浏览器会话。
+	//
+	// 没有它时，uuid 是读取 auth_code 的唯一凭据，而 uuid 可以由任何人向本接口申请
+	// —— 攻击者把自己申请到的二维码贴进钓鱼页，受害者用真 App 扫码确认后，攻击者
+	// 轮询 loginstatus 就能拿到 auth_code 并兑换成受害者的 token（QRLJacking）。
+	//
+	// 明文只出现在本响应里，绝不写进 qrcode:{uuid} 的 payload —— 那份 payload 正是
+	// getloginStatus 要回显给匿名轮询方的内容。
+	pollSecret, err := u.mintScanLoginPollSecret(uuid)
+	if err != nil {
+		u.Error("生成扫码轮询密钥失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	// 记录「是谁请求了这个二维码」，扫码时回给手机端展示。
+	//
+	// 这才是 QRLJacking 的真正断点：poll_secret 挡不住它（攻击者自己调本接口，密钥
+	// 也在他手里），能识破钓鱼的只有确认环节的人 —— 前提是他看得到「请求方是一台
+	// 陌生设备、来自陌生 IP」。服务端在此把依据备齐；生效还需移动端渲染确认弹窗。
+	u.storeScanLoginOrigin(uuid, ScanLoginOrigin{
+		IP:          c.ClientIP(),
+		DeviceName:  deviceName,
+		DeviceModel: deviceModel,
+		UserAgent:   c.Request.UserAgent(),
+	})
 	c.JSON(http.StatusOK, gin.H{
-		"uuid":   uuid,
-		"qrcode": fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
+		"uuid":        uuid,
+		"poll_secret": pollSecret,
+		"qrcode":      fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
 	})
 }
 
 // 通过loginUUID获取登录状态
+//
+// 本接口按设计保持匿名可达（二维码在用户登录之前就要渲染，此时没有任何 token 可用），
+// 故不挂 AuthMiddleware。取而代之的边界是 poll_secret：只有持有 getLoginUUID 下发的
+// 那枚密钥的调用方，才能读到 auth_code / uid / encrypt 这些凭据字段；其余调用方拿到的
+// 是被 stripScanLoginSensitiveFields 剥过的状态。
+//
+// 校验失败时刻意返回「真实 status + 剥掉敏感字段」而不是报错：发布窗口内仍持有旧
+// bundle 的浏览器会停在授权页等待（用户刷新即恢复），而不是被 expired 状态推去无限
+// 重新申请二维码。安全性不因此打折 —— 旧 bundle 同样拿不到 auth_code。
 func (u *User) getloginStatus(c *wkhttp.Context) {
 	uuid := c.Query("uuid")
 	qrcodeInfo, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid))
@@ -2084,20 +2131,45 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 		})
 		return
 	}
-	qrcodeChan := u.getQRCodeModelChan(uuid)
-	select {
-	case qrcodeModel := <-qrcodeChan:
-		u.removeQRCodeChan(uuid)
-		if qrcodeModel == nil {
-			break
+	// 授权判定放在所有早退分支之后：过期 / 未知 uuid 上面已经返回，不必为它们多花一次
+	// Redis 读 —— 本接口未认证，任何「无效输入也要付出后端开销」的路径都是放大器。
+	// 在进入长轮询前一次性定下，避免 select 的多个出口重复查询。
+	authorized := u.scanLoginPollSecretMatches(uuid, c.GetHeader(ScanLoginPollSecretHeader))
+	respondStatus := func(model *common.QRCodeModel) {
+		if model == nil {
+			// channel 被同 uuid 的另一个请求关掉时会收到 nil。此处必须仍然写出响应：
+			// 上一版直接 return，gin 会发一个零长度的 200，前端 result.status 变成
+			// undefined → loginStatus=undefined → 状态机匹配不到分支 → 轮询永久停摆。
+			// 回落到请求开始时读到的状态，客户端至少能继续推进。
+			model = qrcodeModel
 		}
-		c.JSON(http.StatusOK, qrcodeModel.Data)
-		break
-	case <-time.After(10 * time.Second):
-		u.removeQRCodeChan(uuid)
-		c.JSON(http.StatusOK, qrcodeModel.Data)
-		break
-
+		if model == nil {
+			c.JSON(http.StatusOK, gin.H{"status": common.ScanLoginStatusExpired})
+			return
+		}
+		if !authorized {
+			c.JSON(http.StatusOK, filterScanLoginPublicFields(model.Data))
+			return
+		}
+		c.JSON(http.StatusOK, model.Data)
+	}
+	qrcodeChan := u.getQRCodeModelChan(uuid)
+	// 显式 Timer 而非 time.After：加了 ctx.Done() 分支后，提前返回的路径会把
+	// time.After 的底层 timer 留到 10s 后才被 GC 回收；Stop 掉更干净。
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	select {
+	case pushed := <-qrcodeChan:
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+		respondStatus(pushed)
+	case <-c.Request.Context().Done():
+		// 客户端断开（关页面 / 切登录方式 / 网关超时）时立即释放，不再空转满 10 秒。
+		// 该接口未认证且长轮询挂起，缺这一路等于让任意断开的连接都占住一个 goroutine
+		// 与一个 channel 槽位直到超时。此处不写响应 —— 连接已经没了。
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+	case <-timeout.C:
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+		respondStatus(qrcodeModel)
 	}
 }
 
@@ -2272,6 +2344,10 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
+	// 登录已完成，轮询密钥再留着就只是一段多余的可利用窗口 —— 期间任何拿到它的人
+	// 仍能从 qrcode:{uuid}（还有最长 5 分钟寿命）读出 uid/encrypt。与上面删除 authCode
+	// 同一个理由，只是这条此前漏了。失败不阻断登录，密钥仍会按 TTL 自然过期。
+	u.deleteScanLoginPollSecret(uuid)
 
 	err = u.ctx.Cache().SetAndExpire(fmt.Sprintf("%s%d%s", u.ctx.GetConfig().Cache.UIDTokenCachePrefix, flag, userModel.UID), token, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
@@ -2313,6 +2389,24 @@ func (u *User) removeQRCodeChan(uuid string) {
 		delete(qrcodeChanMap, uuid)
 		close(ch) // close channel to unblock any pending sender
 	}
+}
+
+// removeQRCodeChanOwned 只在 map 中登记的仍是本请求注册的那个 channel 时才摘除并关闭。
+//
+// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，而 loginstatus 未认证 —— 任何知道
+// uuid 的人（在钓鱼场景里 uuid 就是攻击者自己的，其余场景直接从展示中的二维码读出）
+// 反复发起并立刻中断请求，就能借 removeQRCodeChan 把合法轮询方登记的 channel 关掉：
+// 对方立刻收到 nil，本轮长轮询作废；grantLogin 的推送则落到已被替换的 channel 上，
+// 在 SendQRCodeInfo 的 default 分支被静默丢弃。带归属校验后，每个请求只回收自己那个。
+func (u *User) removeQRCodeChanOwned(uuid string, own <-chan *common.QRCodeModel) {
+	qrcodeChanLock.Lock()
+	defer qrcodeChanLock.Unlock()
+	ch, exist := qrcodeChanMap[uuid]
+	if !exist || ch != own {
+		return
+	}
+	delete(qrcodeChanMap, uuid)
+	close(ch) // close channel to unblock any pending sender
 }
 
 // SendQRCodeInfo 发送二维码数据
