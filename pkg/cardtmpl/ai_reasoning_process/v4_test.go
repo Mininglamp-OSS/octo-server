@@ -709,34 +709,53 @@ func TestSimplifiedSuccessorCeilingIsPersistenceSafe(t *testing.T) {
 		ceiling, cjk, escaped, columnBytes, float64(escaped)/float64(columnBytes)*100)
 }
 
-// contentEditColumnBytes derives the persistence ceiling from the migration that
-// declares the column, so that widening it (the MEDIUMTEXT follow-up D3a
+// contentEditColumnBytes derives the persistence ceiling from the migrations that
+// declare or alter the column, so that widening it (the MEDIUMTEXT follow-up D3a
 // anticipates) changes this test's behaviour instead of leaving a hand-copied
-// constant behind.
+// constant behind. The whole migration directory is scanned in filename order and
+// the last declaration wins, because a widening would land in a *new* migration
+// rather than by editing the original one.
 func contentEditColumnBytes(t *testing.T) int {
 	t.Helper()
-	const migration = "../../../modules/message/sql/20220414000001_message_legacy01.sql"
-	raw, err := os.ReadFile(migration)
+	const migrationDir = "../../../modules/message/sql"
+	entries, err := os.ReadDir(migrationDir)
 	if err != nil {
-		t.Fatalf("read %s: %v (the column declaration moved; re-point this test)", migration, err)
+		t.Fatalf("read %s: %v", migrationDir, err)
 	}
-	// e.g. "ADD COLUMN content_edit TEXT COMMENT ..."
-	re := regexp.MustCompile(`(?i)content_edit\s+(TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)`)
-	match := re.FindSubmatch(raw)
-	if match == nil {
-		t.Fatalf("no content_edit text-column declaration found in %s", migration)
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			names = append(names, entry.Name())
+		}
 	}
+	sort.Strings(names) // migrations are date-prefixed, so name order is apply order
 	widths := map[string]int{
 		"TINYTEXT":   255,
 		"TEXT":       65535,
 		"MEDIUMTEXT": 16777215,
 		"LONGTEXT":   4294967295,
 	}
-	declared := strings.ToUpper(string(match[1]))
-	width, ok := widths[declared]
-	if !ok {
-		t.Fatalf("unknown column type %q for content_edit", declared)
+	re := regexp.MustCompile(`(?i)content_edit\s+(TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)`)
+	width := 0
+	var declaredIn, declaredAs string
+	for _, name := range names {
+		raw, err := os.ReadFile(migrationDir + "/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if match := re.FindSubmatch(raw); match != nil {
+			declaredAs = strings.ToUpper(string(match[1]))
+			w, ok := widths[declaredAs]
+			if !ok {
+				t.Fatalf("unknown column type %q for content_edit in %s", declaredAs, name)
+			}
+			width, declaredIn = w, name
+		}
 	}
+	if width == 0 {
+		t.Fatalf("no content_edit text-column declaration found under %s", migrationDir)
+	}
+	t.Logf("content_edit is %s (%d B) per %s", declaredAs, width, declaredIn)
 	return width
 }
 

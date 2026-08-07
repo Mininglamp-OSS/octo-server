@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: cardtmpl-reasoning-phase-tools-successor"
-description: Published ai.reasoning-process@0.4.0 — the front-end's per-phase collapsible tool panels and simplified header, adapted onto the bounded #667/#681 data contract rather than the handoff's unbounded schema. Registry default and Bot new-send cut to 0.4.0 via image release; 0.1.0-0.3.0 stay frozen and exact-version editable. thought's ceiling was deliberately widened 281 to 4001, breaking its old habit of mirroring the producer's truncation length.
+description: Published ai.reasoning-process@0.4.0 — the front-end's per-phase collapsible tool panels and simplified header, adapted onto the bounded #667/#681 data contract rather than the handoff's unbounded schema. Registry default and Bot new-send cut to 0.4.0 via image release; 0.1.0-0.3.0 stay frozen and exact-version editable. thought's ceiling moved 281 to 400 — raised enough to break its coupling to the producer's truncation length, but derived from the 64 KiB TEXT column the frame is persisted in rather than from a producer constant.
 tags: ["card", "cardtmpl", "ai-reasoning-process", "json-template", "bot-api", "wire-contract", "trust-boundary", "test", "testing", "rollback"]
 timestamp: 2026-08-07T12:00:00Z
 # --- octospec extension fields ---
