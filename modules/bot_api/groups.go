@@ -320,7 +320,11 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 		Robot int    `json:"robot"`
 	}
 
-	var members []MemberInfo
+	// 非 nil 空 slice：dbr 的 Load 在零行时不动这个变量，nil slice 会被 Gin 序列化成
+	// `null` 而不是 `[]`。翻页把空结果从边缘情况变成了常规终止信号（走过末页、keyword
+	// 无命中），调用方必须能对返回值直接迭代；同一 handler 在「bot 不属于任何 Space」
+	// 分支本来就回 `[]`，这里补齐后整个端点形状一致。
+	members := make([]MemberInfo, 0)
 	var err error
 
 	if spaceID == "" {
