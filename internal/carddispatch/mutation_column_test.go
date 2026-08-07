@@ -139,3 +139,40 @@ func TestMaxContentEditBytesMatchesTheMigrationChain(t *testing.T) {
 		})
 	}
 }
+
+// WriteCAS 是 raw 卡片编辑（modules/bot_api）走的写入口：调用方自己跑 cardmsg 收敛
+// 和 render_profile 改写，然后把结果直接递进来。它原本没有列宽检查，于是成了绕过
+// NormalizeFrameForPersistence 的通道 —— 一个 cardmsg 合法（512 KiB 上限内）但比 TEXT
+// 列宽的帧直达 INSERT（PR#712 review）。闸放在这里而不是只放调用点，让未来的调用方
+// 也拿不到旁路。
+func TestWriteCASRefusesFramesWiderThanTheColumn(t *testing.T) {
+	backend := &fakeMutationBackend{}
+	mutator := newCardMutator(backend)
+
+	oversized := strings.Repeat("x", maxContentEditBytes+1)
+	_, err := mutator.WriteCAS(CardMutationCASRequest{
+		MessageID: "1001", MessageSeq: 7, ChannelID: "user-b", ChannelType: 1,
+		ContentEdit: oversized, ContentHash: "h", EditedAt: 1, CardSeq: 2,
+	})
+	if !errors.Is(err, ErrCardMutationTooLarge) {
+		t.Fatalf("WriteCAS(oversized) error = %v, want ErrCardMutationTooLarge", err)
+	}
+	if !errors.Is(err, ErrCardMutationInvalid) {
+		t.Fatalf("ErrCardMutationTooLarge must wrap ErrCardMutationInvalid; err = %v", err)
+	}
+	if len(backend.writes) != 0 {
+		t.Fatalf("oversized frame reached CASWrite: %d writes", len(backend.writes))
+	}
+
+	// 边界另一侧：正好等于列宽的帧照常写入，闸不越界收紧。
+	backend = &fakeMutationBackend{}
+	if _, err := newCardMutator(backend).WriteCAS(CardMutationCASRequest{
+		MessageID: "1001", MessageSeq: 7, ChannelID: "user-b", ChannelType: 1,
+		ContentEdit: strings.Repeat("x", maxContentEditBytes), ContentHash: "h", EditedAt: 1, CardSeq: 2,
+	}); err != nil {
+		t.Fatalf("WriteCAS at exactly the column width should succeed, got %v", err)
+	}
+	if len(backend.writes) != 1 {
+		t.Fatalf("at-limit frame should be written once, got %d", len(backend.writes))
+	}
+}

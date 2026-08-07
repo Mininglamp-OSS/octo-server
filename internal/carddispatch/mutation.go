@@ -49,6 +49,11 @@ var (
 // （非严格模式 → 客户端渲染不出的坏帧）换成一个确定的、带字节数的拒绝。
 const maxContentEditBytes = 65535
 
+// MaxPersistedFrameBytes 是 maxContentEditBytes 的导出别名，供发送侧做同口径预检
+// （modules/bot_api 的模板分支）。发送侧不写 content_edit，但一张发出后编辑不了的卡
+// 等于发出即报废，所以它需要拿到同一个数而不是自己抄一份 —— 抄的那份会漂移。
+const MaxPersistedFrameBytes = maxContentEditBytes
+
 // NormalizeFrameForPersistence 是「一帧卡片能否落库」的唯一判据，所有在写入前重新校验
 // 帧的路径都必须走它：CardMutator.Mutate、以及 pkg/cardtmpl 的 CardUpdater.Append /
 // ReplaceView。返回的是 canonical 字节（cardmsg 已重算权威 plain），可直接写库。
@@ -286,6 +291,15 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 func (m *CardMutator) WriteCAS(request CardMutationCASRequest) (bool, error) {
 	if m == nil || m.backend == nil {
 		return false, ErrCardMutationInvalid
+	}
+	// 列宽兜底。本方法接受**已经**规范化过的帧（调用方自己跑 cardmsg 收敛 + Finalize，
+	// 因为它还要在中途改写 render_profile），所以这里不重跑校验 —— 但宽度必须查，否则
+	// 这条路就成了绕过 NormalizeFrameForPersistence 的通道，直接把超宽帧递给 INSERT。
+	// PR#712 review 抓到的正是这个：闸接了 Mutate 与两个 CardUpdater 路径，漏了 raw
+	// 编辑的 CAS 分支。放在这里而不是只放调用点，是为了让未来的调用方也拿不到旁路。
+	if len(request.ContentEdit) > maxContentEditBytes {
+		return false, fmt.Errorf("%w: %d B > %d B",
+			ErrCardMutationTooLarge, len(request.ContentEdit), maxContentEditBytes)
 	}
 	conflict, _, err := m.backend.CASWrite(cardMutationWrite{
 		MessageID: request.MessageID, MessageSeq: request.MessageSeq, ChannelID: request.ChannelID,

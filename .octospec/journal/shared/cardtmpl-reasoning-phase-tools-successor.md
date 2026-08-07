@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: cardtmpl-reasoning-phase-tools-successor"
-description: Published ai.reasoning-process@0.4.0 — the front-end's per-phase collapsible tool panels and simplified header, adapted onto the bounded #667/#681 data contract rather than the handoff's unbounded schema. Registry default and Bot new-send cut to 0.4.0 via image release; 0.1.0-0.3.0 stay frozen and exact-version editable. thought's ceiling moved 281 to 400 — raised enough to break its coupling to the producer's truncation length, but derived from the 64 KiB TEXT column the frame is persisted in rather than from a producer constant.
+description: Published ai.reasoning-process@0.4.0 — the front-end's per-phase collapsible tool panels and simplified header, adapted onto the bounded #667/#681 data contract rather than the handoff's unbounded schema. Registry default and Bot new-send cut to 0.4.0 via image release; 0.1.0-0.3.0 stay frozen and exact-version editable. thought stops mirroring the producer's truncation length and gains two ceilings — accept 4001, display 400 with server-side truncation — so a long summary renders clamped instead of failing the card. The 400 is a product decision, not a storage derivation: measured on the bytes actually persisted (which include the plain copy Finalize appends, +47%), no thought ceiling makes the adversarial worst case fit, and frozen 0.3.0 is already over at its own bound. The storage budget therefore moved to the write boundary, where one check covers every published version.
 tags: ["card", "cardtmpl", "ai-reasoning-process", "json-template", "bot-api", "wire-contract", "trust-boundary", "test", "testing", "rollback"]
 timestamp: 2026-08-07T12:00:00Z
 # --- octospec extension fields ---
@@ -213,13 +213,13 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
 
 ## Follow-ups / notes
 
-- **Consumer change is optional, and at 400 it carries no precondition.** Raising `thought` cannot
-  reject anything the plugin sends today, so no plugin release is required and the plugin keeps working
-  untouched at `THOUGHT_MAX = 280`. Because 400 is storage-safe at the worst-case encoding, a later bump
-  to 399 is a plain independently-deployable change — no column migration first, unlike the `4001` shape
-  this started as. Two encoding hazards still apply to that bump: grapheme-aware truncation would
-  overshoot (one grapheme can be many code points — combining marks, ZWJ emoji, flags, skin-tone
-  modifiers), and `...` instead of `…` breaks the `+1` arithmetic.
+- **Consumer change is optional, and the two repos are now decoupled through this bound.** The change
+  cannot reject anything the plugin sends today, so no plugin release is required and the plugin keeps
+  working untouched at `THOUGHT_MAX = 280`. Better: with truncation in place the consumer no longer has to
+  match a server number at all — anything up to the 4001 accept ceiling is taken and clamped to 400. That
+  removes the cross-repo arithmetic that caused the first two rounds of correction here, and with it the
+  two encoding hazards that used to matter (grapheme-aware truncation overshooting a `+1` bound, `...`
+  instead of `…`): neither can break a bound that no longer has to line up.
 - **Getting to a few thousand code points needs the column first.** `message_extra.content_edit` and
   `octo_message_card_revision.content` are both `TEXT`; widening them (e.g. `MEDIUMTEXT`) is a
   `MODIFY COLUMN` rebuild on a large hot table, so it needs its own brief and rollout plan, and then a

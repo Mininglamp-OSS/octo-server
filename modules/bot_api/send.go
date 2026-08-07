@@ -313,6 +313,25 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		return
 	}
 
+	// 模板发送的列宽预检（PR#712 review, lml2468 P1-2）。send 侧原本只查 512 KiB，
+	// 而编辑侧查 TEXT 列宽 65,535 B —— 两者不一致就能造出「发得出去、第一次编辑就被拒」
+	// 的卡，而推理卡靠反复编辑推进阶段，等于一张永久停在首帧的卡。把不一致提前到发送口，
+	// 让它变成一次明确的拒绝，而不是一张已经存在、却再也动不了的卡。
+	//
+	// 只作用于**模板**分支，刻意不管 raw 发送：模板帧的尺寸完全由服务端产物 + schema
+	// 有界输入决定（实测出厂样本 7–12 KB，占列宽不到 20%），所以这道检查只会在病态输入
+	// 上触发；而 raw 卡片是调用方自己作者的一次性内容，对外承诺的就是 512 KiB，收紧它
+	// 会拒掉今天能发、且从不被编辑因而永远不碰 content_edit 的卡。
+	if templateMode {
+		if frame, mErr := json.Marshal(payload); mErr == nil && len(frame) > carddispatch.MaxPersistedFrameBytes {
+			ba.Warn("模板渲染帧超出持久化列宽,拒绝发送(否则卡片发出后无法编辑)",
+				zap.String("channelID", channelID), zap.Int("frameBytes", len(frame)),
+				zap.Int("columnBytes", carddispatch.MaxPersistedFrameBytes))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+	}
+
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
 	// listener pipeline. Marker key lives in the reserved `__obo_*`
@@ -1055,6 +1074,21 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		normalized, cErr = authorBotRawCardRenderProfile(normalized)
 		if cErr != nil {
 			ba.Warn("InteractiveCard content_edit render_profile 写入失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		// 落库列宽闸。必须在 render_profile 改写**之后**跑：改写会加一个顶层键并重跑
+		// Finalize，所以它之前量的不是最终字节。这条路径的两个写分支（带 card_seq 的
+		// CAS、不带的 LWW）和修订历史追加都消费下面这个 normalized，所以在这里查一次
+		// 就覆盖三者 —— 而 carddispatch.WriteCAS 里还有一道同口径的兜底。
+		//
+		// 为什么 raw 编辑也要查:cardmsg 只有 512 KiB 的 payload 上限,比承接它的
+		// TEXT 列宽 8 倍,所以一个 cardmsg 完全合法的帧照样存不下(PR#712 review:闸接了
+		// Mutate 与两个 CardUpdater 路径,漏了这条,超宽帧直达 INSERT)。
+		if _, cErr = carddispatch.NormalizeFrameForPersistence(normalized); cErr != nil {
+			ba.Warn("InteractiveCard content_edit 超出持久化列宽,拒绝编辑",
+				zap.Error(cErr), zap.String("messageID", req.MessageID),
+				zap.Int("frameBytes", len(normalized)))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}

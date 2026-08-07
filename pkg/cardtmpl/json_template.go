@@ -41,8 +41,17 @@ type jsonTemplateAggregateArrayLimit struct {
 // failing the whole card.
 //
 // It also makes the rendered frame's size independent of how generous the accept
-// ceiling is, which is what keeps the frame inside the column it is persisted in
-// no matter what a caller sends.
+// ceiling is — the declared field contributes the same bytes whether the caller
+// sent 400 code points or 4001.
+//
+// That is NOT the same as keeping the frame inside the column it is persisted in,
+// and an earlier version of this comment wrongly claimed it was. A frame's size is
+// the template's fixed chrome plus *every* free string plus the `plain` copy
+// cardmsg.Finalize appends, so clamping one field bounds one term of a sum.
+// Measured on ai.reasoning-process@0.4.0: with `thought` clamped to a single code
+// point the adversarial worst case is still 107% of the column. The persistence
+// budget is enforced at the write boundary instead — see
+// carddispatch.NormalizeFrameForPersistence.
 type jsonTemplateStringTruncation struct {
 	// ArrayField, when set, scopes Field to objects inside that top-level array
 	// (e.g. ArrayField="phases", Field="thought" → phases[].thought). Empty

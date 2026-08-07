@@ -170,7 +170,9 @@ provenance) and is out of scope here.
 
 - Start from the frozen `0.3.0` schema and apply only these deltas:
   - `timerText` moves from `required` to optional (relaxation; see D8);
-  - `phases[].thought` `maxLength` goes from `281` to `400` (relaxation; see D3a);
+  - `phases[].thought` gains two ceilings: `maxLength` (the *accept* ceiling) goes from `281` to `4001`,
+    and a narrower display ceiling of `400` is declared in `x-octo-constraints.truncateStrings` and applied
+    by the engine after validation (relaxation; see D3a);
   - descriptions/examples updated to match the new presentation.
 - **`timerText` must stay in `properties` even though no template binds it.** The schema root is
   `additionalProperties: false` and the producer sends the field unconditionally
@@ -565,14 +567,17 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 - [ ] Every string/array/aggregate `limit+1` case is rejected with `ErrFieldsInvalid` before template
   expansion; every exact-limit case renders. The `thought` limit is resolved per version, so V2/V3 keep
   asserting 281 while V4 asserts 400.
-- [ ] The worst case at the new ceiling (6 phases each carrying a 400-rune `thought`, 13 aggregate
+- [ ] The worst case at the display ceiling (6 phases each carrying a 400-rune `thought`, 13 aggregate
   actions) renders in all five states and stays inside `cardmsg.MaxPayloadBytes`.
-- [ ] **Contract ≤ storage is enforced by a test, not by prose.** At the schema's own ceiling, with every
-  free string driven to its worst-case byte encoding (6 bytes per code point), the rendered frame fits
-  `message_extra.content_edit`. The column width is read out of the migration rather than hand-copied, so
-  widening it to `MEDIUMTEXT` is observable here instead of leaving the ceiling silently
-  over-conservative; and the escape-heavy frame is asserted to exceed the CJK frame, so a future edit
-  cannot quietly reintroduce a CJK-only "worst case".
+- [ ] **The storage budget is enforced by a test on the bytes that are actually persisted, not by prose.**
+  The measurement is taken through the production check (`carddispatch.NormalizeFrameForPersistence`), so it
+  includes the `plain` field `Finalize` appends — measuring the render output instead understates it by
+  roughly a third, which is the specific mistake an earlier revision of this brief made. Asserted: the
+  persisted encoding strictly exceeds the rendered one (so the wrong artifact cannot be measured again);
+  shipped samples keep margin; and the adversarial escape-heavy frame at the accept ceiling is **refused by
+  the persistence gate with a typed error and a byte count** rather than reaching MySQL. It is *not*
+  asserted to fit — it does not, and neither does frozen `0.3.0` at its own bound (D3a). The column width
+  is read out of the migration rather than hand-copied, in both directions.
 - [ ] `CompileJSONArtifact` succeeds under **both** `staticCompileLimits()` and `DefaultCompileLimits()`
   (the latter proving `RequireOwner` / `RequireProtocol` / `RequireBoundedSchema` are satisfied).
 

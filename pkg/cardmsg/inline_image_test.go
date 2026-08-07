@@ -35,13 +35,19 @@ func TestInlineImageAllowlistIsExactBytes(t *testing.T) {
 		{"审过图标截断", chevronDownIcon[:len(chevronDownIcon)-10]},
 		{"审过图标后追加内容", chevronDownIcon + "%3Cscript%3E"},
 
-		// 以下是子串黑名单版本挡不住的五个绕过（PR#712 review）。精确匹配下它们与
-		// 任何其他未审字节串同等被拒，不再依赖过滤器认得出它们。
+		// 以下是子串黑名单版本挡不住的绕过（PR#712 review 给出 5 个，addendum 又加 2 个）。
+		// 精确匹配下它们与任何其他未审字节串同等被拒，不再依赖过滤器认得出它们 ——
+		// 这正是 addendum 的结论「黑名单不可能靠加 token 补完」的处理方式。
 		{"命名空间前缀 script", inlineSVG(`<svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></svg>`)},
 		{"命名空间前缀 use", inlineSVG(`<svg xmlns:s="http://www.w3.org/2000/svg"><s:use/></svg>`)},
 		{"CSS 标识符转义 url(", inlineSVG(`<svg><style>path{fill:\75 rl(http://evil/x)}</style></svg>`)},
 		{"CSS 标识符转义 @import", inlineSVG(`<svg><style>@\69 mport "http://evil/x.css";</style></svg>`)},
 		{"SVG 1.2 Tiny handler 元素", inlineSVG(`<svg><handler type="text/javascript">alert(1)</handler></svg>`)},
+		{"命名空间前缀 foreignObject 带 srcdoc", inlineSVG(
+			`<svg xmlns:s="http://www.w3.org/2000/svg" xmlns:h="http://www.w3.org/1999/xhtml">` +
+				`<s:foreignObject><h:iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"/></s:foreignObject></svg>`)},
+		{"CSS image-set 外部取材", inlineSVG(
+			`<svg><style>rect{fill:image-set("https://example.invalid/pixel" 1x)}</style></svg>`)},
 
 		// 经典载荷，一并留作回归。
 		{"script 元素", inlineSVG(`<svg><script>alert(1)</script></svg>`)},
