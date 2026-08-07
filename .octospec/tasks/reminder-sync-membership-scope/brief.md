@@ -75,10 +75,30 @@ body `{"version":0,"limit":100,"channel_ids":[]}`。
 - `reminder_done` LEFT JOIN 与 `is_deleted` 语义 — 不得改变已读/已删判定
 - 群成员语义 — 复用 `group_member` 的既有口径 `uid=? AND group_no=? AND is_deleted=0`
   （见 `modules/group/db.go:464`），不新造一套
+- **频道类型矩阵** — 频道级提醒的 `ChannelType` 从消息原样拷贝
+  （`api_reminders.go:247`），而 `hasMention`（`:427`）只检查 payload 有无
+  `mention` 字段、**不判频道类型**（`ExpandAisToBotUIDs` 的 GROUP 限制只作用于
+  `ais`，不作用于触发提醒的 `humans`）。octo-lib `common.ChannelType` 有 6 个值，
+  各自的成员来源并不一致：
+
+  | 值 | 类型 | 成员来源 | 本次是否加谓词 |
+  |---|---|---|---|
+  | 1 | Person | 无表，需从 fakeChannelID 推导 | 否 |
+  | 2 | Group | `group_member` | **是** |
+  | 3 | CustomerService | 未知 | 否 |
+  | 4 | Community | 未知 | 否 |
+  | 5 | CommunityTopic | 父群 `group_member` | **是** |
+  | 6 | Info | 未知 | 否 |
+
+  octo-server 内没有通用成员表（会话在 WuKongIM 侧，`conversation_extra` 只是
+  元数据、非权威成员关系）。**对 1/3/4/6 一律要求 `group_member` 会静默丢弃
+  合法提醒**（功能回归，非安全收益），故只覆盖 2/5。
 - 子区（CommunityTopic）频道 ID 形状 — `groupNo____shortID`
   （分隔符 `"____"`，解析惯例 `SplitN(channelID, "____", 2)`，见
-  `modules/group/api.go:3949`）。频道级提醒的 `ChannelType` 取自消息
-  （`api_reminders.go:247`），故群与子区都可能出现，成员归属都落在父群
+  `modules/group/api.go:3949`），成员归属落在父群。纳入本次范围虽超出报告字面
+  （截图中记录全部为 `channel_type:2`），但它与类型 2 是同一成员域、同一代码
+  路径、同一缺陷 —— 依 `trust-boundary` 规则的 adapter parity 条款，给一侧加防护
+  而放着同源的另一侧是漏洞本身，不是范围扩大
 - 热表查询计划 — `reminders` 是热表，新谓词不得退化为全表扫
 
 ## Out of scope
@@ -96,6 +116,10 @@ body `{"version":0,"limit":100,"channel_ids":[]}`。
   （`modules/user/api.go:3893` 注释：friend/sync、conversation/sync 已对他人下发，
   三端 displayName 依赖），需产品口径而非代码修复。
 - 报告其余未修项（§4.3/4.4 上传、§4.6 下载越权、§4.8 未授权配置）。
+- **频道类型 1 / 3 / 4 / 6 的频道级提醒不加成员谓词**（知情保留的残留）。没有可用
+  的成员来源，也没有证据表明这类行存在；猜一个过滤条件丢掉真实数据的风险大于
+  收益。残留以守卫测试监控：一旦有新的写入路径让这些类型也能产生频道级提醒，
+  测试转红，而不是悄悄留洞。经维护者确认后保留。
 - 不改 `reminders` 表结构，不加 `space_id` 列。
 
 ## Acceptance
@@ -116,6 +140,17 @@ body `{"version":0,"limit":100,"channel_ids":[]}`。
 - [ ] `done` 判定不变：已 `reminder_done` 的记录在 `version==0` 分支仍被排除；
       入群前的提醒仍标 `done=1`。
 - [ ] 自己发布的 `@所有人` 仍不返回给自己（YUJ-1377 行为不回归）。
+- [ ] **频道类型 1 / 3 / 4 / 6 的频道级提醒行为与改动前逐字节一致**（证明未误伤
+      成员来源不可解析的类型）。
+- [ ] **守卫测试**锁定「能产生频道级提醒的频道类型集合」：当前写入路径只会生成
+      类型 2 / 5，新增能产生其它类型的路径时该测试必须转红。
 - [ ] `go test ./modules/message/...` 通过；新增用例覆盖上述每一条。
 - [ ] `golangci-lint run ./...`、`make i18n-extract-check`、`make i18n-lint` 通过。
-- [ ] 新谓词的执行计划不是全表扫（`EXPLAIN` 记录在 journal；必要时补索引迁移）。
+- [ ] 新谓词**不劣化**执行计划：改动前后 `EXPLAIN` 的 type / key / rows / Extra
+      一致（`EXPLAIN` 记录在 journal）。
+
+      原验收写的是"执行计划不是全表扫"，实测后改掉：该查询在 `origin/main` 上
+      **本来就是** `type: ALL` + `Using filesort`（顶层 `OR reminders.uid` 加
+      `ORDER BY version`，而 `reminders` 上没有 `version` 索引）。要求本次改动达成
+      一个改动前也不成立的标准，只会逼出一个超范围的索引迁移。索引缺失单独记录为
+      后续项，本次不动 DDL。

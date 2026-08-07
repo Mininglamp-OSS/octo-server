@@ -4,6 +4,39 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-07 (reminder-sync-membership-scope)
+
+- **Task** — `reminder-sync-membership-scope`: `POST /v1/message/reminder/sync`
+  returned every channel-level (`@所有人`) reminder in the system to any
+  authenticated caller — `channel_id` / `publisher` / `message_id` /
+  `message_seq` for channels they had never joined. `remindersDB.sync`'s
+  `uid=''` branch had no membership predicate, and an empty client-supplied
+  `channel_ids` meant "no filter" rather than "no channels". Channel-level rows
+  are now scoped to the caller's active groups
+  (`group.IService.ActiveMemberGroupNos`, mirroring `ExistMemberActive`'s
+  `is_deleted=0 AND status=Normal`); the client's list can only narrow.
+  The 2026-07-30 retest filed this as §4.11 "垂直越权 via X-Space-Id removal" —
+  **that attribution would have produced a false fix**: the handler never reads
+  the validated `space_id`, and a caller holding a header for a space they do
+  belong to got the same dump. The primary regression test therefore keeps a
+  valid `X-Space-Id` and still requires non-member rows to be absent. Scope
+  covers channel types Group and CommunityTopic only; Person / CustomerService /
+  Community / Info have no resolvable membership source in octo-server and are a
+  knowingly-retained residual, pinned by `TestChannelLevelReminderChannelTypes`.
+  Membership is matched with bind-parameter `IN`, not a join to `group_member`:
+  the two tables can land on different collations per deployment (Error 1267),
+  and pinning `COLLATE` costs the index — the trap documented in
+  `20260711000001`. `SpaceMiddleware`'s fail-open and the same shape in DM Space
+  filtering are deliberately out of scope. `EXPLAIN` is plan-neutral; the query
+  was already a full scan on `main` (no `version` index), recorded as a
+  follow-up rather than fixed here.
+  See [journal](journal/shared/reminder-sync-membership-scope.md).
+- **Learning (pending)** —
+  [a-repro-is-not-a-root-cause](learnings/pending/a-repro-is-not-a-root-cause.md):
+  a reproduction proves reachability, not which missing check allowed it; write
+  the primary regression test against the variant that keeps the report's toggle
+  intact.
+
 ## 2026-08-07 (scanlogin-poll-binding)
 
 - **Task** — `scanlogin-poll-binding`: `loginstatus` no longer hands `auth_code`

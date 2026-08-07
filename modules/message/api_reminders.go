@@ -97,7 +97,21 @@ func (m *Message) reminderSync(c *wkhttp.Context) {
 		return
 	}
 	loginUID := c.GetLoginUID()
-	reminders, err := m.remindersDB.sync(loginUID, req.Version, req.Limit, req.ChannelIDs)
+
+	// 频道级（uid=''）提醒的授权依据。必须从成员关系反推，不能用 req.ChannelIDs：
+	// 那是客户端可控输入，拿它当授权范围等于让调用方自己决定能看什么 —— 正是本次
+	// 修复的漏洞（传空数组即"不过滤"，拉走全表）。见 channelLevelVisibility。
+	//
+	// 查询失败必须中断而不是降级成空集合或跳过过滤：前者会让合法用户丢红点，后者
+	// 会在 DB 抖动时把授权边界整个打开。
+	memberGroupNos, err := m.groupService.ActiveMemberGroupNos(loginUID)
+	if err != nil {
+		m.Error("查询登录用户所属群失败！", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+
+	reminders, err := m.remindersDB.sync(loginUID, req.Version, req.Limit, req.ChannelIDs, memberGroupNos)
 	if err != nil {
 		m.Error("同步提醒项失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

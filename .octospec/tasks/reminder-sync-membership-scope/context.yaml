@@ -1,0 +1,81 @@
+---
+type: Context
+title: "Context: reminder-sync-membership-scope"
+description: Rules resolved for the reminder membership-scoping change, and how each was applied.
+tags: ["space", "isolation", "acl"]
+timestamp: 2026-08-07T16:19:08Z
+slug: reminder-sync-membership-scope
+---
+
+# Rule resolution
+
+`.octospec/_global/` is not synced in this checkout (directory absent), so only
+repo-tier rules from `.octospec/rules/_index.yaml` were resolved.
+
+## Injected and applied
+
+- **space-isolation** (priority 92, load_bearing) — matched on both
+  `paths: modules/**/*.go` and `touches: space/isolation/acl`.
+  Its "a missing or fail-open check is a cross-tenant data leak (P0)" is
+  literally this defect. Applied by moving the authorization decision onto the
+  membership relation (`group.IService.ActiveMemberGroupNos`) instead of
+  client-supplied input, and by reusing the existing fail-closed member
+  predicate (`is_deleted=0 AND status=Normal`) rather than defining a second
+  one. The rule's "handlers accessing user data must go through the Space
+  middleware" was deliberately NOT satisfied by leaning on `SpaceMiddleware`:
+  that middleware is opt-in and fail-open, and `reminderSync` never read its
+  validated `space_id` at all — see the brief's Out of scope for why fixing it
+  is a separate task.
+
+- **testing** (priority 70) — matched on `**/*_test.go`.
+  Followed the repo's isolated-database pattern
+  (`thread_ext_blacklist_filter_test.go`): dedicated database, hand-built
+  minimal tables, raw INSERT seeds. Avoids the shared `test` database and the
+  per-module migration-set collision documented in
+  `.octospec/tasks/scanlogin-poll-binding/integration-test-env.md`.
+
+- **commit-style** (priority 60) — matched on `paths: **`.
+  English Conventional Commits.
+
+## Injected, deliberately not applicable
+
+- **trust-boundary** (priority 90, load_bearing) — injected via the
+  `wire-contract` tag in the brief's load-bearing list, not via paths (this
+  change touches no adapter, webhook, or richtext code).
+  Its concrete clauses (escaping at the boundary, adapter parity, URL
+  destination breakout, markdown injection, payload bounds) address rendering
+  attacker-controlled content, which this change does not do — it adds a SQL
+  authorization predicate and emits no new content.
+
+  One clause **was** applied by analogy: **adapter parity**. It is why
+  `ChannelTypeCommunityTopic` is in scope even though the pentest report only
+  demonstrated `channel_type: 2` — topics share the membership domain and the
+  code path with groups, and defending one sibling while leaving the other open
+  is the vulnerability, not a scope saving.
+
+- **rate-limit** (priority 80, load_bearing) — matched on
+  `paths: modules/**/*.go`, but this change adds no endpoint and alters no
+  throttling. `/v1/message/reminder/sync` keeps the `SharedUIDRateLimiter`
+  already mounted on the `/v1/message` group. No hand-rolled Redis counter was
+  introduced.
+
+- **error-handling** (priority 85, load_bearing) — matched on
+  `paths: modules/**/*.go`. No new error code was needed: the new failure path
+  (membership lookup fails) reuses the already-registered
+  `errcode.ErrMessageQueryFailed` via `httperr.ResponseErrorL`, matching the
+  sibling failure right below it. No raw `c.ResponseError` / `c.JSON` /
+  `AbortWithStatusJSON` added, so the module's
+  `TestMessageNoLegacyResponseError` guard needs no new entry.
+
+# Prior art consulted
+
+- `modules/group/db.go:175` `ExistMemberActive` — the canonical fail-closed
+  member predicate that `QueryActiveMemberGroupNosWithUID` mirrors.
+- `modules/message/api_reminders.go:113` (YUJ-1377) — the existing decision that
+  read-path filtering must live in SQL so the version/limit cursor keeps
+  advancing. The membership predicate follows it for the same reason.
+- `modules/message/sql/20260711000001_reminders_channel_mention_index.sql` — the
+  collation trap (Error 1267 across tables, and index loss when pinning
+  `COLLATE`) that drove the bind-parameter `IN` design over a JOIN/EXISTS.
+- `modules/message/thread_ext_blacklist_filter_test.go` — isolated-database test
+  scaffolding.
