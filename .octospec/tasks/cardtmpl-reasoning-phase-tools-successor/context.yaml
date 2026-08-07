@@ -1,0 +1,23 @@
+# Rule injection record for the Implement phase.
+# Resolution: inject_when.paths glob OR inject_when.touches tag (union).
+# .octospec/_global/ is not synced in this checkout, so every rule is repo-tier.
+injected:
+  # touches: wire-contract (L4/L5/L10) + paths: modules/bot_api/*.go
+  - id: error-handling
+    source: repo
+  # touches: trust-boundary (L2/L3/L10), wire-contract
+  - id: trust-boundary
+    source: repo
+  # touches: bot-api (L8/L9) + paths: modules/bot_api/*.go
+  - id: space-isolation
+    source: repo
+  # paths: modules/**/*.go (bot_api catalog policy)
+  - id: rate-limit
+    source: repo
+  # touches: test, testing (L13) + paths: **/*_test.go
+  - id: testing
+    source: repo
+  # paths: ** (applies to the Finish phase; Implement does not commit)
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/cardtmpl-reasoning-phase-tools-successor/brief.md
