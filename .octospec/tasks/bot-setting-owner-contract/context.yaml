@@ -1,0 +1,66 @@
+brief: .octospec/tasks/bot-setting-owner-contract/brief.md
+
+injected:
+  - id: space-isolation
+    source: repo
+    why: >
+      paths modules/**/*.go + brief touches auth/bot-api. 本任务动的三个 owner 端点
+      全部依赖 assertRobotOwner，P2-3 改的正是「属主校验相对 body 解析的位置」——
+      规则里「Bot API：任何操作之前先校验 bot 归属」直接适用，且是把校验**上移**而非
+      下移，方向与规则一致。
+  - id: trust-boundary
+    source: repo
+    why: >
+      paths 不匹配（不碰 adapter/webhook/richtext），但 brief 的 touches 含
+      wire-contract，按 index 的 paths OR touches 语义命中。**它裁决了 brief 的
+      Open question 1**：规则要求「只在下游调用方无法绕过的边界上处理，不要把责任
+      推给没有能力执行它的调用方」。owner 目录的 effective_value 因此必须在服务端
+      经同一组判定投影，而不是新增字段、要求每个客户端自己 AND 总闸——后者正是
+      「把责任推给调用方」。规则的 adapter parity 一条同构：一处消费方加的防线必须
+      对每个兄弟消费方成立，owner 目录是 AllowsRaw* 的第四个消费方而它什么都没组合。
+  - id: error-handling
+    source: repo
+    why: >
+      paths modules/**/*.go + brief touches wire-contract。所有新增/移动的拒绝分支
+      必须走 httperr.ResponseErrorL + 已注册 errcode，改完跑两个 i18n gate。
+      **同时约束 P2-2 的解法**：CLAUDE.md 把 ResponseErrorLWithStatus 限定为「无客户端
+      依赖固定 400 的新端点」，且偏离 D14 需 maintainer 签字；/v1/bot/card/profile
+      既非新端点也已有消费方，故本任务取「写进契约」而非「改 wire status」。
+  - id: rate-limit
+    source: repo
+    why: >
+      paths modules/**/*.go。三个 settings 路由各自挂了 SharedUIDRateLimiter，本任务
+      不得改动挂载方式；规则的 testing note 也适用——命中限流路由的测试必须在 setup
+      里清 ratelimit:uid:*（既有 resetSettingsUIDRateLimit 已做）。
+  - id: testing
+    source: repo
+    why: >
+      paths **/*_test.go。新增用例沿用 testutil.NewTestServer + CleanAllTables，
+      并遵循「带风险的改动要有与风险相称的测试」——本任务每条修复都要能用
+      「只回退该修复、确认其测试失败」验证。
+  - id: commit-style
+    source: repo
+    why: paths ** 全匹配。英文 Conventional Commits。
+
+decisions_from_rules:
+  - question: "P2-1 取服务端投影还是新增 enforced_value 字段？"
+    resolved: "服务端投影"
+    by: trust-boundary
+    note: >
+      新增字段仍要求每个消费方正确选择，等于保留了原来的坑只是换了标签；规则明确
+      禁止把无法执行的责任推给调用方。value / source 保持不变，三态契约不受影响。
+  - question: "P2-2 改 wire status 还是写契约？"
+    resolved: "写契约"
+    by: error-handling
+    note: >
+      D14 约定 + CLAUDE.md 对 ResponseErrorLWithStatus 的适用范围限定；该端点有既有
+      消费方，改状态码需 maintainer 签字，不在本任务授权内。
+
+decisions_by_author:
+  - question: "P2-5 PUT 收到 null 是 no-op 还是删除覆盖？"
+    resolved: "no-op"
+    note: >
+      规则未覆盖，作者裁量。取 no-op 的理由是失败方向：若 null 表示删除，那么把读
+      接口返回的整份目录原样写回（brief 里正是要支持的流程）会**静默清空用户没碰过的
+      每一个覆盖**——一个无害动作产生破坏性后果。DELETE 端点已经存在且语义显式，
+      不需要第二种拼写。

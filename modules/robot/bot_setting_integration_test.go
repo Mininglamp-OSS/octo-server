@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 )
@@ -58,6 +59,16 @@ func setupBotSettings(t *testing.T) (http.Handler, *config.Context) {
 	// expected, and only under -shuffle. Same family as the rate-limit bucket
 	// above: CleanAllTables clears tables, not in-process caches.
 	assert.NoError(t, commonmodule.EnsureSystemSettings(ctx).Reload())
+	// 显式打开卡片总闸。
+	//
+	// 本文件多数用例断言的是**三层解析链**（覆盖 → 全局 → 代码默认），而 owner 目录的
+	// effective_value 现在经总闸投影（task bot-setting-owner-contract / P2-1）：总闸关闭
+	// 时四个键一律为 false，解析链就观察不到了。此前这些用例能过，靠的是一个从未写明的
+	// 前提——「投影不存在」；投影加上之后，这个前提必须变成显式设置。
+	//
+	// 需要总闸关闭的用例（CatalogAgreesWithTheEnforcedProjection）在自己内部覆盖它。
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	t.Setenv(cardmsg.EnvBotEnabled, "true")
 
 	_, err := ctx.DB().InsertBySql(
 		"INSERT INTO robot (robot_id, status, creator_uid) VALUES (?, 1, ?)",
@@ -257,7 +268,6 @@ func TestBotSettings_WriteRejections(t *testing.T) {
 		{"derived key is read-only", map[string]any{"key": BotSettingKeyCardEnabled, "value": "true"}},
 		{"illegal bool literal", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": "maybe"}},
 		{"empty value", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": ""}},
-		{"null value", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": nil}},
 		{"non-bool JSON", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": 1}},
 	}
 	for _, tc := range cases {
@@ -321,6 +331,26 @@ func TestBotSettings_OwnershipGuard(t *testing.T) {
 	t.Run("an unknown key on someone else's bot is forbidden, not bad request", func(t *testing.T) {
 		w := deleteSetting(t, handler, settingsOtherRobotID, "bot.not_a_real_key")
 		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
+	})
+
+	// The two whole-body checks (BindJSON, empty items) used to run before the
+	// ownership guard, so these answered 400 — contradicting the semantics the
+	// endpoint documents for itself. The subtests above cannot catch it: they all
+	// send a well-formed body with a bad *key*, which only reaches the per-item
+	// loop. These two never get that far.
+	t.Run("an empty items list on someone else's bot is forbidden, not bad request", func(t *testing.T) {
+		w := putSettings(t, handler, settingsOtherRobotID)
+		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
+	})
+	t.Run("an unparseable body on an unknown bot is not found, not bad request", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, err := http.NewRequest("PUT", "/v1/robot/bot_does_not_exist/settings",
+			bytes.NewReader([]byte("{ this is not json")))
+		assert.NoError(t, err)
+		req.Header.Set("token", token)
+		req.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
 	})
 }
 
@@ -466,4 +496,84 @@ func TestQueryBotSettingOverrides_EmptyValueIsNotConfigured(t *testing.T) {
 	assert.Nil(t, item.Value, "空值必须回显为「未设置」")
 	assert.Equal(t, botSettingSourceDefault, item.Source)
 	assert.True(t, item.Effective)
+}
+
+// TestBotSettings_CatalogAgreesWithTheEnforcedProjection —— owner 目录不得与发送门
+// 给出相反答案（task bot-setting-owner-contract / P2-1）。
+//
+// 断言的是**两个投影一致**，而不是「目录返回 false」：后者写死了预期值，一旦总闸语义
+// 改了就要跟着改；前者钉的是真正的不变量——owner 看到的能力必须等于发卡时生效的能力。
+//
+// 这条用例必须在总闸关闭下跑。此前的目录测试全都在总闸开启时运行，所以这个矛盾一直
+// 没有任何测试覆盖：总闸开着时两个投影恰好相等。
+func TestBotSettings_CatalogAgreesWithTheEnforcedProjection(t *testing.T) {
+	handler, _ := setupBotSettings(t)
+	// 总闸关闭（缺省即关，显式写出来是为了让用例的前提可读）。
+	t.Setenv(cardmsg.EnvEnabled, "")
+	t.Setenv(cardmsg.EnvBotEnabled, "")
+
+	var resp settingsListResp
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+
+	cardEnabled := findSetting(t, resp, BotSettingKeyCardEnabled)
+	assert.False(t, cardEnabled.Effective, "总闸关闭时 card_enabled 必须为 false")
+
+	for _, key := range []string{
+		BotSettingKeyDisplayEnabled, BotSettingKeyInteractionEnabled,
+		BotSettingKeyReasoningEnabled,
+	} {
+		item := findSetting(t, resp, key)
+		assert.False(t, item.Effective,
+			"%s 的 effective_value 报 true，而总闸关闭时发卡一律被拒——"+
+				"owner 会在管理页看到「开」却一张卡也发不出去", key)
+		// 三态契约不受投影影响：没设过覆盖就仍是 null。
+		assert.Nil(t, item.Value,
+			"%s 的 value 被投影污染了；value 必须始终是「显式覆盖」而非生效值", key)
+	}
+}
+
+// TestBotSettings_FullCatalogRoundTripsIncludingNulls —— 读改写回必须能跑通
+// （task bot-setting-owner-contract / P2-5）。
+//
+// 「读目录 → 改一项 → 整份写回」是 botSettingUpdateReq 用 json.RawMessage 的理由，
+// 但整份目录必然带上未配置项的 `null`，而 null 此前按非法值拒绝、批量又是全有或全无，
+// 于是这条被设计注释背书的流程整个 400。
+//
+// 既有的 CatalogValueRoundTrips 抓不到：它只回灌单个**非 null** 值。
+func TestBotSettings_FullCatalogRoundTripsIncludingNulls(t *testing.T) {
+	handler, _ := setupBotSettings(t)
+
+	var resp settingsListResp
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+
+	// 原样回灌整份目录（此时三个可写键都还没有覆盖，value 全是 null），只改一项。
+	items := make([]map[string]any, 0, len(resp.List))
+	for _, item := range resp.List {
+		if !item.Editable {
+			continue // 派生只读键本就不该出现在写请求里
+		}
+		var value any // nil → JSON null
+		if item.Value != nil {
+			value = *item.Value
+		}
+		if item.Key == BotSettingKeyDisplayEnabled {
+			value = false // 用户实际改动的那一项
+		}
+		items = append(items, map[string]any{"key": item.Key, "value": value})
+	}
+	assert.Greater(t, len(items), 1, "回灌样本必须同时含 null 项与非 null 项")
+
+	w := putSettings(t, handler, settingsRobotID, items...)
+	assert.Equal(t, http.StatusOK, w.Code,
+		"整份目录回灌被拒——null 仍被当成非法值，读改写回走不通。body=%s", w.Body.String())
+
+	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
+	changed := findSetting(t, resp, BotSettingKeyDisplayEnabled)
+	assert.NotNil(t, changed.Value, "改动的那一项必须落库")
+	assert.False(t, *changed.Value)
+	// null 是 no-op，不是删除：其余项保持「未设置」，而不是被这次写入清空或写值。
+	untouched := findSetting(t, resp, BotSettingKeyInteractionEnabled)
+	assert.Nil(t, untouched.Value,
+		"null 项被当成了写入或删除；它必须是 no-op，否则整份回灌会静默清空用户没碰过的覆盖")
+	assert.Equal(t, botSettingSourceDefault, untouched.Source)
 }

@@ -74,6 +74,21 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	// 卡片能力的 per-Bot 有效配置（task bot-setting-store）。读失败必须 fail-closed：
 	// 用默认值顶上会让一次 DB 抖动把 owner 关掉的能力静默放开，且此刻下发的清单会
 	// 与 sendMessage 的门禁背离。
+	// 重试契约（消费方必读）：本端点在引入 per-Bot 配置之前是鉴权后的常量、不可能失败，
+	// 现在要读库，因此**多了一个全新的失败面**。
+	//
+	// 关键是它在线路上的形状：ResponseErrorL 按 D14 把传输状态钉成 **400**，真实的 500
+	// 只出现在响应体的 `error.http_status`。所以按 HTTP 状态码分支的消费方会看到 4xx，
+	// 读成「请求有问题、别重试」——与实际要求相反。
+	//
+	// **消费方必须按 `error.code == "err.shared.internal"` 判定重试，不要按 HTTP 状态
+	// 码判定；更不要把这个错误当作「该 Bot 的卡片能力已关闭」缓存下来**——把一次数据库
+	// 抖动记成能力关闭，会让 Bot 在故障恢复后仍长时间不发卡，直到下一次重新拉取。
+	//
+	// 这里保持 ResponseErrorL 而不改用 ResponseErrorLWithStatus，是遵守本仓约定：后者
+	// 限定于「没有客户端依赖固定 400 的新端点」，偏离 D14 需 maintainer 签字，而本端点
+	// 既非新端点、也已有消费方（task bot-setting-owner-contract / 规则 error-handling）。
+	// 换句话说，能改的是文档不是状态码——所以文档必须写在这里。
 	cardConfig, err := ba.resolveBotCardConfig(robotID)
 	if err != nil {
 		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))

@@ -154,6 +154,15 @@ func normalizeBotSettingBool(raw string) (string, bool) {
 	}
 }
 
+// isNullBotSettingValue 判断一个入站 value 是不是 JSON null（或字段整个缺省）。
+//
+// 与 normalizeBotSettingValue 的「非法值」区分开：null 是读接口对未配置项的**正常**
+// 下发形状，回灌时应当被当作「本项不动」，而不是和 `"maybe"` 一样按非法拒绝。
+func isNullBotSettingValue(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed == "" || trimmed == "null"
+}
+
 // normalizeBotSettingValue 归一化一个入站 JSON value。
 //
 // 同时接受 JSON bool（`true`）与字符串字面量（`"true"` / `"1"`），使读接口下发的
@@ -383,6 +392,45 @@ func resolveBotSettings(
 	return out, nil
 }
 
+// projectCardEffectiveValues 把 owner 目录的 effective_value 换成**发送门真正会用的**
+// 那个值：经总闸支配、且经 AllowsRaw* 两个判定。
+//
+// 为什么必须在服务端做，而不是新增一个字段让客户端自己 AND（task
+// bot-setting-owner-contract，规则 trust-boundary）：规则要求「只在下游调用方无法绕过
+// 的边界上处理，不要把责任推给没有能力执行它的调用方」。加字段并不消除这个坑，只是给
+// 它换个标签——每个消费方仍然要自己选对。同一规则的 adapter parity 一条同构：一处消费
+// 方加的防线必须对每个兄弟消费方成立，而 AllowsRaw* 此前有三个消费方（发送门、编辑门、
+// profile 清单），owner 目录是第四个，且它什么都没组合。
+//
+// 修的是什么：总闸关闭时，本接口曾报 display_enabled.effective_value=true，而
+// /v1/bot/card/profile 报 false、发卡 400。owner 在管理页看到「展示卡：开」，一张也发
+// 不出去。display=false + interaction=true 时同理——目录报 interaction 可用，而发送门
+// 要求两者同时成立。这正是 botCardConfigResponse 刻意消灭、却被搬到 owner 界面上的
+// 「清单说行、发送说 400」矛盾。
+//
+// **不动 value 与 source**：三态契约（未设置 / 显式设置 / 生效值）是 owner UI「恢复
+// 默认」的前提，折叠任何一个都会让「我显式设成 false」与「我没设、上层默认 false」不可
+// 区分。source 继续标注**覆盖来自哪一层**，而不是「有效值为何是这个」——后者由
+// bot.card_enabled 那一行回答（它带 source:"env"、editable:false，是 UI 置灰的依据）。
+func projectCardEffectiveValues(resolutions []botSettingResolution) []botSettingResolution {
+	cfg := botCardConfigFrom(resolutions)
+	out := make([]botSettingResolution, len(resolutions))
+	copy(out, resolutions)
+	for i := range out {
+		switch out[i].Key {
+		case BotSettingKeyCardEnabled:
+			out[i].Eff = cfg.CardEnabled
+		case BotSettingKeyDisplayEnabled:
+			out[i].Eff = cfg.AllowsRawDisplayCard()
+		case BotSettingKeyInteractionEnabled:
+			out[i].Eff = cfg.AllowsRawInteractiveCard()
+		case BotSettingKeyReasoningEnabled:
+			out[i].Eff = cfg.ReasoningEnabled
+		}
+	}
+	return out
+}
+
 // botCardConfigFrom 把解析结果投影成卡片四键，并施加总闸支配。
 func botCardConfigFrom(resolutions []botSettingResolution) BotCardConfig {
 	var cfg BotCardConfig
@@ -439,6 +487,7 @@ func (rb *Robot) listBotSettings(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
+	resolutions = projectCardEffectiveValues(resolutions)
 	// 该响应是某个 Bot 的私有配置，且只有登录态区分调用者：private 禁共享代理
 	// 缓存，no-store 不留副本 —— 改完配置立刻重读要看到新值。
 	//
@@ -476,6 +525,22 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	robotID := c.Param("robot_id")
 
+	// 属主校验放在**一切请求体处理之前**——包括 BindJSON 与空 items 检查。
+	//
+	// 早先版本只把它提到「逐项校验」之前，于是整体形状检查仍抢在前面：对不存在 /
+	// 非自己的 Bot 发 `{}` 或 `{"items":[]}` 会得到 400，而本端点自述的语义是
+	// 404 / 403。#706 三轮评审推动的就是这个排序，这里是它最后一个洞。
+	//
+	// 需要说清楚它**不是**什么：那个 400 无论目标 Bot 存在与否、属主是谁都字节相同，
+	// 因此它泄露的比刻意保留的 404/403 拆分**更少**，不是信息泄露（评审里有一条腿
+	// 这么定性，被驳回了）。真正的问题是端点违背自己声明的语义。
+	//
+	// 代价是形状错误的请求也要多查一次库。这个取舍上一版注释已经接受过一次，这里
+	// 只是让它覆盖到整个请求体。
+	if rb.assertRobotOwner(c, robotID, loginUID) {
+		return
+	}
+
 	var req botSettingUpdateReq
 	if err := c.BindJSON(&req); err != nil {
 		respondRobotRequestInvalid(c, "")
@@ -483,14 +548,6 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 	}
 	if len(req.Items) == 0 {
 		respondRobotRequestInvalid(c, "items")
-		return
-	}
-
-	// 属主校验放在逐项校验**之前**（round-2/3 评审反复提到）：否则一个非属主用户
-	// 能靠 400 与 403 的差别探测「某个键是否已注册且可写」，且对不存在 / 非自己的
-	// Bot 会收到 400 而不是文档承诺的 404 / 403 —— 削弱的是本端点自己声明的属主语义。
-	// 代价只是给形状错误的请求多一次查库，可以忽略。
-	if rb.assertRobotOwner(c, robotID, loginUID) {
 		return
 	}
 
@@ -515,12 +572,34 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		}
 		seen[item.Key] = struct{}{}
 
+		// `null` == 本项不动（no-op），不是「删除覆盖」。
+		//
+		// 读接口对每个**未配置**的键都下发 `"value": null`，而 botSettingUpdateReq 用
+		// json.RawMessage 的理由写的就是支持「读目录 → 改一项 → 写回」。整份回灌必然
+		// 带上未改动的 null 项，此前每一项都校验失败，而批量是全有或全无 —— 于是那条
+		// 被设计注释背书的流程整个 400。
+		//
+		// 取 no-op 而不是「删除」，理由是失败方向：若 null 表示删除，把读接口返回的
+		// 整份目录原样写回就会**静默清空用户没碰过的每一个覆盖**，一个无害动作产生
+		// 破坏性后果。DELETE 端点已经存在且语义显式，不需要第二种拼写。
+		if isNullBotSettingValue(item.Value) {
+			continue
+		}
+
 		normalized, ok := normalizeBotSettingValue(item.Value)
 		if !ok {
 			respondRobotRequestInvalid(c, "value")
 			return
 		}
 		plans = append(plans, botSettingWritePlan{key: item.Key, value: normalized})
+	}
+
+	// 整批都是 null（例如原样回灌一份尚无任何覆盖的目录）：什么都不写，也不推失效
+	// 事件——没有变化就不该让每个适配器去重新拉一次 profile。仍返回成功：调用方表达
+	// 的「这些项保持不变」已经达成。
+	if len(plans) == 0 {
+		c.ResponseOK()
+		return
 	}
 
 	// 按 key 排序后再写：升级成单事务后，行锁要持有到 commit，两个并发批次若以相反

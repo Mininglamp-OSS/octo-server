@@ -224,11 +224,11 @@ var systemSettingSchema = []settingDef{
 	// 这里只是这两个开关的**全局默认值**，不重述判定。
 	// 绝不可实现成「按 wire profile 一刀切」：推理卡自身横跨两档（active/error 是
 	// octo/v2、result 是 octo/v1），按 profile 切会把它砍成只剩终态或只剩过程。
-	{Category: "botcard", Key: "display_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送展示型 raw 卡片（octo/v1，Bot 自拼卡片 JSON）；受卡片总闸 OCTO_CARD_MESSAGE_ENABLED 支配，总闸关闭时本项无效",
+	{Category: "botcard", Key: "display_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送展示型 raw 卡片（octo/v1，Bot 自拼卡片 JSON）；受卡片总闸 OCTO_CARD_MESSAGE_ENABLED 支配，总闸关闭时本项无效；**本层为兜底默认、非强制层**：改动最长 60s 才传播到每个副本，且某副本若启动加载失败会临时落到代码默认（开启）。要确保关闭，请用环境总闸或该 Bot 的单独覆盖",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardDisplayEnabledDefault()) }},
-	{Category: "botcard", Key: "interaction_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送交互型 raw 卡片（octo/v2，含 Action.Submit / Input.*）；不影响服务端模板渲染出的推理进度卡",
+	{Category: "botcard", Key: "interaction_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送交互型 raw 卡片（octo/v2，含 Action.Submit / Input.*）；不影响服务端模板渲染出的推理进度卡；**本层为兜底默认、非强制层**：改动最长 60s 才传播到每个副本，且某副本若启动加载失败会临时落到代码默认（开启）。要确保关闭，请用环境总闸或该 Bot 的单独覆盖",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardInteractionEnabledDefault()) }},
-	{Category: "botcard", Key: "reasoning_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送推理进度卡（服务端 Registry 模板卡）；关闭只阻止新建，已发出的卡仍可编辑到终态",
+	{Category: "botcard", Key: "reasoning_enabled", Type: settingTypeBool, Description: "Bot 未单独配置时，是否允许其发送推理进度卡（服务端 Registry 模板卡）；关闭只阻止新建，已发出的卡仍可编辑到终态；**本层为兜底默认、非强制层**：改动最长 60s 才传播到每个副本，且某副本若启动加载失败会临时落到代码默认（开启）。要确保关闭，请用环境总闸或该 Bot 的单独覆盖",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.BotCardReasoningEnabledDefault()) }},
 
 	// App Bot 共享鉴权缓存的安全网 TTL（秒）。吊销靠共享 DEL 即时生效，此 TTL 仅兜底
