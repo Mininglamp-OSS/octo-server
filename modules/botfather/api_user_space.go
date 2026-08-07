@@ -21,11 +21,17 @@ const spaceIDField = "space_id"
 // 无绑定 Space 的 key（历史行的 space_id 为空串）没有可执行的租户，原样放行——这与
 // /v1/user/bots* 既有 handler 在绑定为空时跳过 Space 校验的口径一致，不新增放宽面。
 //
-// 注入实现依赖 gin 的 query 缓存尚未建立：`c.Query` 首次调用才会解析并缓存
-// URL.RawQuery，此中间件之前的链路（authUserAPIKey 只读 Authorization 头、
-// SharedUIDRateLimiter 只读 context 里的 uid）都不读 query，故改写 RawQuery 后
-// handler 读到的是注入后的值。TestUserKeySpaceRuleInjectsBoundSpace 端到端锁住这一点，
-// 若日后有中间件前移到此处之前并读了 query，该测试会立刻失败。
+// 🔴 注入必须绕开 `c.Query`。gin 在 `c.Query` 首次调用时把 URL.RawQuery 解析进
+// Context 私有的 queryCache，此后改写 RawQuery 对 handler 完全不可见——本中间件若用
+// `c.Query` 读一次 space_id，就等于亲手把旧值缓存下来，handler 拿到的仍是「没有
+// space_id」，user.search 于是落回「任意共同 Space」分支，跨 Space 泄漏。queryCache 是
+// 私有字段、无法从外部重置，所以读和写都只能走 `c.Request.URL.Query()`，让 handler 的
+// 第一次 `c.Query` 去解析注入后的 RawQuery。
+//
+// 残留约束：本中间件之前的链路不得调用 gin 的 query 访问器（现状不会——
+// authUserAPIKey 只读 Authorization 头，SharedUIDRateLimiter 只读 context 里的 uid）。
+// TestUserKeySpaceRuleInjectsBoundSpace 端到端锁住这一点：一旦有中间件前移并读了
+// query，该用例立刻失败。
 func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		bound := authtree.BoundSpaceID(c)
@@ -44,7 +50,8 @@ func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 			return
 		}
 
-		if requested := c.Query(spaceIDField); requested != "" {
+		query := c.Request.URL.Query()
+		if requested := query.Get(spaceIDField); requested != "" {
 			if requested != bound {
 				bf.rejectSpaceMismatch(c)
 				return
@@ -53,9 +60,8 @@ func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 			return
 		}
 
-		q := c.Request.URL.Query()
-		q.Set(spaceIDField, bound)
-		c.Request.URL.RawQuery = q.Encode()
+		query.Set(spaceIDField, bound)
+		c.Request.URL.RawQuery = query.Encode()
 		c.Next()
 	}
 }
