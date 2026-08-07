@@ -5,6 +5,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"go.uber.org/zap"
 )
 
 // spaceIDField 是路径参数与 query 参数里 Space 的字段名，两处同名。
@@ -14,12 +16,21 @@ const spaceIDField = "space_id"
 //
 // 一个 `uk_*` 的租户在签发时就已验证并写入 api_key_space_id，请求不得把它放宽或改向：
 //
-//	请求未带 space_id  → 注入绑定值，使按 space_id 分支的 handler（user.search）留在租户内
-//	space_id 等于绑定值 → 放行
-//	space_id 不等于绑定值 → 403，直接拒绝，不做降级
+//	space_id 不等于绑定值   → 403，直接拒绝，不做降级
+//	key 主人已不在绑定 Space → 403，fail-closed
+//	其余情况               → 把 query 的 space_id 钉成绑定值后放行
 //
 // 无绑定 Space 的 key（历史行的 space_id 为空串）没有可执行的租户，原样放行——这与
 // /v1/user/bots* 既有 handler 在绑定为空时跳过 Space 校验的口径一致，不新增放宽面。
+//
+// 成员资格必须在这里复查（YUJ-58 同款结论，与 resolveUKPrincipal 一致）。authUserAPIKey
+// 只校验 key status / integration-client enablement / user active，不问主人现在还在不在
+// api_key_space_id 冻结的那个 Space。缺这道门时：一个在成员期签发、之后主人被移出该
+// Space 的存量 key 仍被无限期信任，而下面的注入会让 user.search 永远走「按 space_id 过滤」
+// 分支——该分支只校验**目标**用户是否属于该 Space，从不校验调用者，于是 HaveCommonSpace
+// 那道调用者侧的门永远不执行，已失效的成员仍能探测该 Space 现任成员的存在性与资料。
+// 刻意不走 SpaceMiddleware 的 Redis 成员缓存：撤销必须立即生效，60s 正向 TTL 会把上面
+// 那个窗口重新开出来。
 //
 // 🔴 注入必须绕开 `c.Query`。gin 在 `c.Query` 首次调用时把 URL.RawQuery 解析进
 // Context 私有的 queryCache，此后改写 RawQuery 对 handler 完全不可见——本中间件若用
@@ -34,41 +45,60 @@ const spaceIDField = "space_id"
 // query，该用例立刻失败。
 func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-		bound := authtree.BoundSpaceID(c)
-		if bound == "" {
-			c.Next()
-			return
-		}
-
-		// 路径参数优先：/space/:space_id/members 这类路由的 Space 总是显式给出的。
-		if requested := c.Param(spaceIDField); requested != "" {
-			if requested != bound {
-				bf.rejectSpaceMismatch(c)
-				return
-			}
-			c.Next()
-			return
-		}
-
-		query := c.Request.URL.Query()
-		if requested := query.Get(spaceIDField); requested != "" {
-			if requested != bound {
-				bf.rejectSpaceMismatch(c)
-				return
-			}
-			c.Next()
-			return
-		}
-
-		query.Set(spaceIDField, bound)
-		c.Request.URL.RawQuery = query.Encode()
-		c.Next()
+		bf.enforceKeySpaceWithChecker(c, func(spaceID, uid string) (bool, error) {
+			return spacepkg.CheckMembership(bf.ctx.DB(), spaceID, uid)
+		})
 	}
+}
+
+// enforceKeySpaceWithChecker 是 enforceKeySpace 的可注入实现：checkMembership 抽出便于
+// 单测替身（成例见 resolveUKPrincipalWithChecker）。
+func (bf *BotFather) enforceKeySpaceWithChecker(c *wkhttp.Context, checkMembership spacepkg.MembershipChecker) {
+	bound := authtree.BoundSpaceID(c)
+	if bound == "" {
+		c.Next()
+		return
+	}
+
+	// 越界判定先做：不匹配无需查库即可拒，免得把 403 路径变成 DB 放大器。
+	// 路径参数优先——/space/:space_id/members 这类路由的 Space 总是显式给出的。
+	query := c.Request.URL.Query()
+	requested := c.Param(spaceIDField)
+	if requested == "" {
+		requested = query.Get(spaceIDField)
+	}
+	if requested != "" && requested != bound {
+		bf.rejectSpaceMismatch(c)
+		return
+	}
+
+	// uid 缺失说明中间件链装配有误（authUserAPIKey 必先落 api_key_uid）；CheckMembership
+	// 对空 uid 返回 false，于是走下面的 403，方向是 fail-closed。
+	member, err := checkMembership(bound, getAPIKeyUID(c))
+	if err != nil {
+		bf.Error("校验 uk 绑定 Space 成员身份失败", zap.String("space_id", bound), zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		c.Abort()
+		return
+	}
+	if !member {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
+		c.Abort()
+		return
+	}
+
+	// 单一来源：无论 space_id 原本缺失、来自 query、还是来自路径参数，都把 query 钉成
+	// bound。路径命中时也覆盖，是为了让 handler 不可能同时看到两个不一致的来源——今天
+	// 没有 handler 既读 :space_id 又读 query space_id，但一旦有，读哪个都必须得到同一
+	// 个已校验的值。
+	query.Set(spaceIDField, bound)
+	c.Request.URL.RawQuery = query.Encode()
+	c.Next()
 }
 
 // rejectSpaceMismatch 对跨 Space 请求统一回 403。不回显请求值与绑定值：调用方只需要
 // 知道「这个 key 不能操作那个 Space」，回显会把绑定租户泄露给拿到 key 但不知其作用域的
-// 一方。具体差异只进日志。
+// 一方。
 func (bf *BotFather) rejectSpaceMismatch(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
 	c.Abort()

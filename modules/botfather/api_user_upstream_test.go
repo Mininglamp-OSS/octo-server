@@ -97,8 +97,8 @@ func TestUserKeyUpstreamRoutesAreMountedAndAuthGated(t *testing.T) {
 
 // TestUserKeyActorIsTheRealPerson proves §4's premise: the reused handler reads
 // its actor from the same context key the uk middleware writes, so the person —
-// not a bot — is the subject. listMembers is the probe because it 403s any caller
-// who is not a member of the Space, which only holds if actor == uid.
+// not a bot — is the subject. listMembers is the probe because the member list it
+// returns must contain the key's owner, which only holds if actor == uid.
 func TestUserKeyActorIsTheRealPerson(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
@@ -120,15 +120,15 @@ func TestUserKeyActorIsTheRealPerson(t *testing.T) {
 	}
 	assert.Contains(t, uids, member, "actor must resolve to the person bound to the key")
 
-	// An outsider's key resolves to the outsider and is refused membership —
-	// confirming the Space check keys off the real actor rather than being
-	// bypassed by the key itself.
+	// An outsider's key resolves to the outsider, so the tenant middleware's
+	// membership gate (F1) refuses it before listMembers runs — the key alone never
+	// buys access to the Space it is bound to.
 	outsider := "u_" + util.GenerUUID()[:8]
 	insertTestUser(t, ctx, outsider, "outsider")
 	w = httptest.NewRecorder()
 	route.ServeHTTP(w, userAPIRequest(t, http.MethodGet,
 		"/v1/user/space/"+spaceID+"/members", mintUserAPIKeyInSpace(t, ctx, outsider, spaceID), nil))
-	assert.NotEqual(t, http.StatusOK, w.Code,
+	assert.Equal(t, http.StatusForbidden, w.Code,
 		"a non-member's key must not read the member list: %s", w.Body.String())
 }
 
@@ -281,10 +281,16 @@ func TestHumanSpaceMyStillReturnsAllSpaces(t *testing.T) {
 		"human /v1/space/my must still return every Space, got %s", w.Body.String())
 }
 
-// TestUserKeySpaceMyEmptyWhenBindingUnusable pins the "0 elements, not a 500"
-// contract: a disabled Space or a membership that has since been revoked is a
-// legitimate empty scope, not a failure.
-func TestUserKeySpaceMyEmptyWhenBindingUnusable(t *testing.T) {
+// TestUserKeySpaceMyRefusesRevokedBinding pins what a dead binding does on the uk
+// tree: enforceKeySpace's membership gate refuses it (403) rather than letting
+// boundSpaceOnly report an empty scope. A disabled Space and a revoked membership
+// are the same thing to CheckMembership, which joins space.status=1.
+//
+// This is a deliberate change from the pre-F1 behaviour (200 + `[]`): a key whose
+// owner has no live membership has no verified tenant, so every uk upstream route
+// — /space/my included — fails closed uniformly instead of one route reporting
+// "empty" while the others reject.
+func TestUserKeySpaceMyRefusesRevokedBinding(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
 	uid := "u_" + util.GenerUUID()[:8]
@@ -298,6 +304,28 @@ func TestUserKeySpaceMyEmptyWhenBindingUnusable(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, "/v1/user/space/my", token, nil))
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	var env errEnvelope
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env))
+	assert.Equal(t, "err.shared.auth.forbidden", env.Error.Code)
+}
+
+// TestUserKeySpaceMyEmptyWhenKeyHasNoBinding keeps the "0 elements, not a 500"
+// contract for the one case that still reaches boundSpaceOnly: a key with no bound
+// Space at all (historical rows with an empty space_id). There is no tenant to
+// verify, so the membership gate passes through and the handler reports an empty
+// scope — which is a legitimate state, not a failure.
+func TestUserKeySpaceMyEmptyWhenKeyHasNoBinding(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+
+	uid := "u_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, uid, "owner")
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceID, uid)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, "/v1/user/space/my",
+		mintUserAPIKeyInSpace(t, ctx, uid, ""), nil))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.JSONEq(t, "[]", w.Body.String())
 }

@@ -604,8 +604,11 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 //
 // 一个 `uk_*` 的租户在签发时就已确定；若让自动化路径顺带枚举到本人的其它空间，等于把
 // 凭据从未被授权的范围交出去。响应形状与 mySpaces 完全一致（spaceResp 数组），客户端
-// 解析器无需区分，只是数组长度为 0 或 1。凭据无绑定、Space 已停用、或调用者已退出该
-// Space，三种情况都返回空数组而非报错——「当前作用域内没有空间」是合法状态，不是故障。
+// 解析器无需区分，只是数组长度为 0 或 1。
+//
+// 空数组只剩「凭据没有绑定 Space」一种到达方式：绑定已失效（本人被移出、Space 停用）
+// 的请求由 enforceKeySpace 的成员资格门在此之前就 403 了，不会走到这里。下面的
+// sp == nil 分支因此是防御性的——它与那道门共用同一组可见性条件。
 func (s *Space) boundSpaceOnly(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := authtree.BoundSpaceID(c)
