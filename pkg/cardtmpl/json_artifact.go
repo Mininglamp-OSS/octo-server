@@ -449,6 +449,10 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err != nil {
 		return nil, artifactValidationError("constraint", "schema", err)
 	}
+	stringTruncations, err := parseStringTruncations(schemaMap)
+	if err != nil {
+		return nil, artifactValidationError("constraint", "schema", err)
+	}
 	if limits.RequireBoundedSchema {
 		if err := validateBoundedInputSchemaContext(ctx, schemaMap, limits.MaxJSONNodes); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -492,6 +496,7 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 		meta:                 meta,
 		viewAST:              parsedTemplates,
 		aggregateArrayLimits: aggregateLimits,
+		stringTruncations:    stringTruncations,
 	}
 	if err := selfCheckCompiledJSON(ctx, template, meta, bundle.Samples, sampleAssignments); err != nil {
 		return nil, artifactValidationError("conformance", err.document, err.cause)
@@ -1069,7 +1074,7 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 	if !ok {
 		return nil, errors.New("x-octo-constraints must be an object")
 	}
-	if err := rejectUnknownKeys(constraints, "aggregateArrayLimits"); err != nil {
+	if err := rejectUnknownKeys(constraints, "aggregateArrayLimits", "truncateStrings"); err != nil {
 		return nil, err
 	}
 	rawLimits, ok := constraints["aggregateArrayLimits"].([]any)
@@ -1110,6 +1115,128 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 		limits = append(limits, limit)
 	}
 	return limits, nil
+}
+
+// parseStringTruncations reads the optional x-octo-constraints.truncateStrings
+// declaration. Each entry names a string field the engine clamps at render time
+// instead of rejecting, so the schema's maxLength becomes the *accept* ceiling and
+// this the narrower *display* one. Opt-in per field: everything not declared keeps
+// the fail-close behaviour.
+func parseStringTruncations(schema map[string]any) ([]jsonTemplateStringTruncation, error) {
+	raw, exists := schema["x-octo-constraints"]
+	if !exists {
+		return nil, nil
+	}
+	constraints, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("x-octo-constraints must be an object")
+	}
+	rawEntries, exists := constraints["truncateStrings"]
+	if !exists {
+		return nil, nil
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		return nil, errors.New("x-octo-constraints.truncateStrings must be a non-empty array")
+	}
+	truncations := make([]jsonTemplateStringTruncation, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for index, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("truncateStrings[%d] must be an object", index)
+		}
+		if err := rejectUnknownKeys(entry, "arrayField", "field", "maxRunes", "ellipsis"); err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d]: %w", index, err)
+		}
+		arrayField, _ := entry["arrayField"].(string)
+		field, _ := entry["field"].(string)
+		ellipsis, _ := entry["ellipsis"].(string)
+		if field == "" || field != strings.TrimSpace(field) {
+			return nil, fmt.Errorf("truncateStrings[%d].field is required and must be trimmed", index)
+		}
+		if arrayField != strings.TrimSpace(arrayField) {
+			return nil, fmt.Errorf("truncateStrings[%d].arrayField must be trimmed", index)
+		}
+		maxRunes, err := positiveJSONInt(entry["maxRunes"])
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].maxRunes must be positive", index)
+		}
+		if ellipsisRunes := len([]rune(ellipsis)); ellipsisRunes >= maxRunes {
+			return nil, fmt.Errorf("truncateStrings[%d].ellipsis (%d runes) must be shorter than maxRunes (%d)",
+				index, ellipsisRunes, maxRunes)
+		}
+		truncation := jsonTemplateStringTruncation{
+			ArrayField: arrayField, Field: field, MaxRunes: maxRunes, Ellipsis: ellipsis,
+		}
+		key := arrayField + "\x00" + field
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("duplicate truncateStrings target %s", truncationTarget(truncation))
+		}
+		seen[key] = struct{}{}
+		if err := validateTruncationTarget(schema, truncation); err != nil {
+			return nil, err
+		}
+		truncations = append(truncations, truncation)
+	}
+	return truncations, nil
+}
+
+func truncationTarget(tr jsonTemplateStringTruncation) string {
+	if tr.ArrayField == "" {
+		return tr.Field
+	}
+	return tr.ArrayField + "[]." + tr.Field
+}
+
+// validateTruncationTarget proves the declaration points at a real string field
+// whose schema maxLength is at least the display ceiling — otherwise the two
+// bounds contradict each other and the field would be rejected before the
+// truncation could ever apply.
+func validateTruncationTarget(schema map[string]any, tr jsonTemplateStringTruncation) error {
+	properties, _ := schema["properties"].(map[string]any)
+	if properties == nil {
+		return fmt.Errorf("truncateStrings target %s: schema has no properties", truncationTarget(tr))
+	}
+	if tr.ArrayField != "" {
+		array, _ := properties[tr.ArrayField].(map[string]any)
+		if array == nil {
+			return fmt.Errorf("truncateStrings target %s: %q is not a declared property",
+				truncationTarget(tr), tr.ArrayField)
+		}
+		if kind, _ := array["type"].(string); kind != "array" {
+			return fmt.Errorf("truncateStrings target %s: %q is %q, want array",
+				truncationTarget(tr), tr.ArrayField, kind)
+		}
+		items, _ := array["items"].(map[string]any)
+		if items == nil {
+			return fmt.Errorf("truncateStrings target %s: %q has no items schema",
+				truncationTarget(tr), tr.ArrayField)
+		}
+		properties, _ = items["properties"].(map[string]any)
+		if properties == nil {
+			return fmt.Errorf("truncateStrings target %s: %q items have no properties",
+				truncationTarget(tr), tr.ArrayField)
+		}
+	}
+	field, _ := properties[tr.Field].(map[string]any)
+	if field == nil {
+		return fmt.Errorf("truncateStrings target %s is not a declared property", truncationTarget(tr))
+	}
+	if kind, _ := field["type"].(string); kind != "string" {
+		return fmt.Errorf("truncateStrings target %s is %q, want string", truncationTarget(tr), kind)
+	}
+	maxLength, err := positiveJSONInt(field["maxLength"])
+	if err != nil {
+		return fmt.Errorf("truncateStrings target %s must declare a positive maxLength accept ceiling",
+			truncationTarget(tr))
+	}
+	if tr.MaxRunes > maxLength {
+		return fmt.Errorf("truncateStrings target %s: maxRunes %d exceeds the schema maxLength %d, "+
+			"so the value would be rejected before truncation applies",
+			truncationTarget(tr), tr.MaxRunes, maxLength)
+	}
+	return nil
 }
 
 func positiveJSONInt(value any) (int, error) {

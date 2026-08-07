@@ -467,6 +467,111 @@ const (
 	validArtifactProperties  = `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}}}`
 )
 
+// truncateStrings lets an artifact declare a *display* ceiling below the schema's
+// *accept* ceiling, so an over-long value renders truncated instead of failing the
+// card. It is opt-in per field, so the compiler has to refuse declarations that
+// would silently soften a bound or point at nothing — otherwise "truncate" becomes
+// a way to smuggle past fail-close validation.
+func TestCompileJSONArtifactRejectsInvalidTruncateStrings(t *testing.T) {
+	constraintWith := func(entry string) string {
+		return `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}],` +
+			`"truncateStrings":[` + entry + `]}`
+	}
+	for _, tc := range []struct {
+		name  string
+		entry string
+		want  string
+	}{{
+		name:  "display ceiling above the accept ceiling",
+		entry: `{"field":"title","maxRunes":64,"ellipsis":"…"}`,
+		want:  "exceeds the schema maxLength",
+	}, {
+		name:  "field is not declared in the schema",
+		entry: `{"field":"nosuch","maxRunes":8,"ellipsis":"…"}`,
+		want:  "not a declared property",
+	}, {
+		name:  "field is not a string",
+		entry: `{"field":"groups","maxRunes":8,"ellipsis":"…"}`,
+		want:  `want string`,
+	}, {
+		name:  "target field has no accept ceiling to sit under",
+		entry: `{"arrayField":"groups","field":"items","maxRunes":4,"ellipsis":"…"}`,
+		want:  "want string",
+	}, {
+		name:  "ellipsis alone would fill the budget",
+		entry: `{"field":"title","maxRunes":1,"ellipsis":"…"}`,
+		want:  "must be shorter than maxRunes",
+	}, {
+		name:  "non-positive maxRunes",
+		entry: `{"field":"title","maxRunes":0,"ellipsis":"…"}`,
+		want:  "maxRunes must be positive",
+	}, {
+		name:  "unknown key",
+		entry: `{"field":"title","maxRunes":8,"suffix":"…"}`,
+		want:  "unknown key",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = json.RawMessage(fmt.Sprintf(
+				`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+					`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+				validArtifactProperties, constraintWith(tc.entry),
+			))
+			_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err == nil {
+				t.Fatalf("compiled an artifact with %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// The happy path: a declared display ceiling clamps at render time, and the value
+// is accepted rather than rejected — the behaviour ai.reasoning-process@0.4.0 relies
+// on for `phases[].thought`.
+func TestCompileJSONArtifactTruncatesDeclaredStringAtRender(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Schema = json.RawMessage(fmt.Sprintf(
+		`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+			`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+		validArtifactProperties,
+		`{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}],`+
+			`"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+	))
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact: %v", err)
+	}
+
+	// 32 is the accept ceiling; 8 the display one. A 20-rune title must render as
+	// 7 runes + the ellipsis, not be refused.
+	fields := json.RawMessage(`{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`)
+	card, err := artifact.Template.Build(context.Background(), "shown", fields, BuildEnv{Lang: "en-US"})
+	if err != nil {
+		t.Fatalf("Build with an over-display-ceiling title: %v", err)
+	}
+	encoded, err := json.Marshal(card.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(encoded); !strings.Contains(got, `"aaaaaaa…"`) {
+		t.Fatalf("body = %s, want the title clamped to 7 runes + ellipsis", got)
+	}
+
+	// At or under the display ceiling nothing changes.
+	exact := json.RawMessage(`{"title":"aaaaaaaa","groups":[{"items":["a"]}]}`)
+	card, err = artifact.Template.Build(context.Background(), "shown", exact, BuildEnv{Lang: "en-US"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ = json.Marshal(card.Body)
+	if got := string(encoded); !strings.Contains(got, `"aaaaaaaa"`) || strings.Contains(got, "…") {
+		t.Fatalf("body = %s, want the exact-length title untouched", got)
+	}
+}
+
 func validJSONArtifactBundle() Bundle {
 	return Bundle{
 		Catalog: CatalogDescriptor{
