@@ -30,6 +30,41 @@
 // immediately. Keying on the router — not on a process-global list — is what
 // makes repeated module.Setup calls safe: every testutil.NewTestServer builds a
 // fresh engine, and routes must never leak into a previous one.
+//
+// # Tenant posture per route
+//
+// Every Route must declare a TenantScope (see Route.Tenant), so what confines a
+// contribution is answerable without tracing into its handler. The current census
+// — keep it accurate when adding a route, it is the reviewable form of the
+// credential's advertised scope:
+//
+//	TreeUserKey (`uk_*`, tenant = the Space frozen into the key)
+//	  /user/search                                   ScopeRouteGuard  enforceKeySpace pins query space_id; handler filters by it
+//	  /space/:space_id/members                       ScopeRouteGuard  enforceKeySpace rejects a mismatched path Space
+//	  /space/my                                      ScopeRouteGuard  boundSpaceOnly reports only the bound Space
+//	  /messages/person/:peer_uid/:message_id         ScopeBoundSpace  handler isolates on pkg/space GetSpaceID
+//	  /users/:uid                                    ScopeRouteGuard  user.requireBoundSpaceMember
+//	  /groups/:group_no/messages/:message_id         ScopeRouteGuard  message.requireBoundSpaceGroup
+//	  /groups/:group_no/threads/.../:message_id      ScopeRouteGuard  message.requireBoundSpaceGroup (parent group)
+//	  /file/upload/presigned                         ScopeUnscoped    signs a caller-supplied object path; see below
+//	  /file/download/url                             ScopeUnscoped    signs a caller-supplied object path; see below
+//
+//	TreeBotToken (`bf_*` / `app_*`; a bot token freezes no Space and a bot has no
+//	space_member row, so there is normally no tenant to enforce)
+//	  /messages/person/:peer_uid/:message_id         ScopeRouteGuard  bot_api.appBotDMSpaceGuard (scope=space App Bots)
+//	  /groups/:group_no/messages/:message_id         ScopeUnscoped    gate is the bot's own group membership
+//	  /groups/:group_no/threads/.../:message_id      ScopeUnscoped    same
+//
+// The two file routes are the one place where a uk key is NOT confined to its
+// Space: both handlers sign a presigned URL for whatever object path the caller
+// names, with no ownership or Space-prefix check, so knowing another tenant's
+// object key is enough for a cross-tenant read or overwrite. That is faithful
+// parity with the human session route they are reused from, and this PR keeps the
+// existing human object-ownership model rather than introducing a second one — but
+// a `uk_*` is a long-lived non-interactive bearer token handed to CLI and drive
+// clients, so the practical blast radius is larger than for a session cookie.
+// Tightening object ownership has to cover both routes at once and is tracked
+// separately; ScopeUnscoped is the honest declaration until then.
 package authtree
 
 import (
@@ -117,9 +152,12 @@ const (
 	// anchor. MountOn injects BoundSpaceContext for these routes — declaring the
 	// scope is what installs it, so the declaration cannot drift from the wiring.
 	ScopeBoundSpace TenantScope = "bound_space"
-	// ScopeRouteGuard: the handler does not read the request Space, so the route
-	// carries its own guard in Middlewares that rejects targets outside the bound
-	// Space (see user.requireBoundSpaceMember, message.requireBoundSpaceGroup).
+	// ScopeRouteGuard: the handler does not read the request Space, so a guard
+	// specific to this route rejects targets outside the credential's tenant —
+	// either contributed here in Middlewares (see user.requireBoundSpaceMember,
+	// message.requireBoundSpaceGroup) or installed by the tree at its mount point
+	// when only the tree knows the credential's semantics (see
+	// bot_api.appBotDMSpaceGuard).
 	ScopeRouteGuard TenantScope = "route_guard"
 	// ScopeUnscoped: the route is deliberately NOT confined to a bound Space, and
 	// the handler's own gates (friendship, group membership, bilateral blacklist)

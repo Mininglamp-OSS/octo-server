@@ -24,6 +24,11 @@ import (
 // threadChannelIDSeparator marks a thread channel id.
 const threadChannelIDSeparator = "____"
 
+// maxMemberPage caps botSpaceMembers' 1-based page so (page-1)*limit cannot
+// overflow into a negative OFFSET. At the 200 upper limit this still addresses
+// 200M members, far past any real Space.
+const maxMemberPage = 1_000_000
+
 // getGroups handles GET /v1/bot/groups.
 func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
@@ -299,6 +304,12 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	if l, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil || l == 0 {
 		limit = 50
 	}
+	// 低位夹紧必须在算 offset 之前。Sscanf("-5") 返回 (1, nil)，limit 保持 -5，上面的
+	// >200 夹紧不触发，于是 `LIMIT -5` 让 MySQL 报 1064、端点 500——把一个非法客户端
+	// 参数变成服务端错误。负 limit 同时会把 offset 也算成负数。
+	if limit < 1 {
+		limit = 50
+	}
 	if limit > 200 {
 		limit = 200
 	}
@@ -308,9 +319,16 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	//
 	// 语义与 human 侧 listMembers 的 page 对齐。不传 page 时 OFFSET 为 0，与加分页前
 	// 完全一致；非法值（负数、非数字）也落回第一页而不是报错，保持既有的宽松解析口径。
+	//
+	// 上限同样要夹：Atoi 接受到 MaxInt64，(page-1)*limit 会整数溢出成负 offset，又是一条
+	// 1064 → 500 的路径。maxMemberPage 之后的页在任何真实 Space 上都是空页，直接夹到它
+	// 与「走过末页返回空」的既有终止语义一致。
 	page := 1
 	if p, err := strconv.Atoi(strings.TrimSpace(c.Query("page"))); err == nil && p > 1 {
 		page = p
+	}
+	if page > maxMemberPage {
+		page = maxMemberPage
 	}
 	offset := (page - 1) * limit
 

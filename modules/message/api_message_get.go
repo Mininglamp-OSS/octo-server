@@ -253,15 +253,18 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		}
 		defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
 		if derr != nil {
-			// 置空串 sentinel，不是置 spaceID。理由同 space_filter.go 的 defaultSpaceID：
-			// 置 spaceID 会让 personSpaceAllows 的规则 2（无标签 DM 只在默认 Space 向前
-			// 兼容）对任意请求 Space 恒真，把用户全部无标签 DM 历史放开到当前 Space——
-			// per-Space DM 隔离正是这条路径要建立的属性，错误路径必须偏向隐藏。spaceID
-			// 在此恒非空（外层 if 保证），故 "" 是「永不等于 spaceID」的 fail-closed
-			// sentinel：无标签 DM 本次请求返回 404，精确匹配的 DM 不受影响。
-			m.Warn("查询默认 Space 失败，DM 单条读对无标签消息 fail-closed（defaultSpaceID 置空 sentinel）",
+			// 与批量 DM 同步路径逐字一致（modules/message/api.go 的 channel/sync 分支）：
+			// 默认 Space 查不到时无法判定归属，按兼容口径 fail-open 保留无标签历史，
+			// 避免一次 DB 抖动把合法 DM 历史静默截断。两个入口必须同口径，否则同一条
+			// 无标签 DM 会出现「sync 能拉到、单条直查 404」的漂移。
+			//
+			// PR #713 review 有分歧：lml2468 认为这里该照 space_filter.go 用 "" sentinel
+			// fail-closed；yujiawei 复核后认为现状正确——那个 sentinel 属于会话/群过滤的
+			// 另一套谓词，而 DM 路径的 fail-open 是上面那条注释里写明的既有决策。保持与
+			// sibling 一致，方向变更留给人来拍板。
+			m.Warn("查询默认 Space 失败，DM 单条读无标签消息按兼容口径放行",
 				zap.Error(derr), zap.String("loginUID", loginUID))
-			defaultSpaceID = ""
+			defaultSpaceID = spaceID
 		}
 		// IsSystemBot 判定基于对端 uid（peerUID），fakeChannelID 是 loginUID+peerUID
 		// 对称派生的，非 uid 直接可判。

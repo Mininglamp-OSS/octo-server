@@ -91,20 +91,23 @@ func TestGroupSpaceAllows(t *testing.T) {
 	}
 }
 
-// TestPersonSpaceAllowsDefaultSpaceSentinelFailsClosed 固定 getPersonMessage 在默认
-// Space 查询失败时传 "" sentinel 的语义（PR #713 review lml2468 P1）。
+// TestPersonSpaceAllowsUnlabelledDMIsDefaultSpaceOnly 固定 personSpaceAllows 规则 2
+// 与 getPersonMessage 默认 Space 错误路径的关系。
 //
-// 之前那里把 defaultSpaceID 置成当前请求 Space，于是 personSpaceAllows 的规则 2
-// （无标签 DM 只在默认 Space 向前兼容）对任意请求 Space 恒真——一次默认 Space 查询
-// 失败就把用户全部无标签 DM 历史放开到 key 绑定的那个 Space。sentinel 让同一分支
-// 变成永假。
-func TestPersonSpaceAllowsDefaultSpaceSentinelFailsClosed(t *testing.T) {
+// PR #713 review 对错误路径有分歧：lml2468 要求置 "" sentinel（fail-closed），
+// yujiawei 复核认为现状（置请求 Space，fail-open）正确，因为批量 DM 同步路径
+// 逐字同款且注释写明是刻意决策，两个入口必须同口径。当前实现按后者保持 fail-open；
+// 本用例锁住 sentinel 与 fail-open 两种取值各自的后果，这样将来若拍板改方向，
+// 改的人能立刻看到差别在哪一条规则上。
+func TestPersonSpaceAllowsUnlabelledDMIsDefaultSpaceOnly(t *testing.T) {
 	const requested = "sp_a"
 
-	assert.False(t, personSpaceAllows("", false, requested, ""),
-		"默认 Space 查询失败时，无标签 DM 必须隐藏而不是按当前 Space 放行")
 	assert.True(t, personSpaceAllows("", false, requested, requested),
-		"默认 Space 解析成功且等于请求 Space 时，无标签 DM 仍按向前兼容放行（回归对照）")
+		"无标签 DM 在默认 Space 等于请求 Space 时按向前兼容保留（现状 fail-open 走的就是这条）")
+	assert.False(t, personSpaceAllows("", false, requested, "sp_other"),
+		"无标签 DM 在非默认 Space 不保留")
+	assert.False(t, personSpaceAllows("", false, requested, ""),
+		"若改用 \"\" sentinel，同一条无标签 DM 变为隐藏——这就是两位 reviewer 的分歧点")
 	assert.True(t, personSpaceAllows(requested, false, requested, ""),
-		"精确匹配的 DM 不受 sentinel 影响")
+		"精确匹配的 DM 与 defaultSpaceID 取值无关")
 }

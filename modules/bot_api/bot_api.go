@@ -452,7 +452,10 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// 由 message 模块贡献的群内单条消息查询（见 pkg/authtree 的 why）。botActorUID 只挂在
 	// 这些复用路由上、不挂整个 botAPI 组：组级别名会让组内任何调 GetLoginUID() 的 handler
 	// 静默拿到 robotID，是白担的授权混淆风险；而这些 handler 的 actor 本就应当是 bot 自己。
-	authtree.Mount(authtree.TreeBotToken, r, authtree.MountOn(botAPI, ba.botActorUID()))
+	//
+	// appBotDMSpaceGuard 补上读侧的 App Bot 租户门：复用的 getPersonMessage 只做
+	// friend/blacklist 判定，不看 App Bot 的 scope=space 绑定，比发送侧宽（详见该函数注释）。
+	authtree.Mount(authtree.TreeBotToken, r, authtree.MountOn(botAPI, ba.botActorUID(), ba.appBotDMSpaceGuard()))
 
 	// Bot File API (separate group for wildcard conflict avoidance)
 	botFileAPI := r.Group("/v1/botfile", ba.authBot())

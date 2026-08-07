@@ -455,8 +455,11 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	//         human 带 verified Space 时相同。无绑定 Space 的 key 到不了这里：
 	//         enforceKeySpace 已对它们 fail-closed，因此这条路由上不存在「空 Space 走
 	//         兼容路径」的分支。
-	//   bot → 无租户可落：bot 没有 space_member 行，同样也拿不到 same-space 放行，
-	//         跨会话面由 checkPersonDMAccess 的 friend + 双向 blacklist 门承担。
+	//   bot → 没有可发布的租户（bot 没有 space_member 行），跨会话面由
+	//         checkPersonDMAccess 的 friend + 双向 blacklist 门承担。但 scope=space 的
+	//         App Bot 确实有一个绑定 Space，而那条链不看它——读会比发送侧宽。补齐这道门
+	//         需要 bot 树自己的凭据语义，故由 bot_api 在挂载点挂 appBotDMSpaceGuard，
+	//         这里声明 ScopeRouteGuard 记录该事实。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/messages/person/:peer_uid/:message_id",
@@ -466,7 +469,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/messages/person/:peer_uid/:message_id",
-		Tenant:  authtree.ScopeUnscoped,
+		Tenant:  authtree.ScopeRouteGuard,
 		Handler: m.getPersonMessage,
 	})
 	// 子区单条读与上面 human 的 groups 组共用同一个 flag：关闭时 thread 模块的 API 与

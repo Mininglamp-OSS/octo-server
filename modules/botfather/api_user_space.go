@@ -12,6 +12,9 @@ import (
 // spaceIDField 是路径参数与 query 参数里 Space 的字段名，两处同名。
 const spaceIDField = "space_id"
 
+// spaceIDHeader 是 human 侧声明 Space 的请求头，pkg/space 的 SpaceMiddleware 读它。
+const spaceIDHeader = "X-Space-ID"
+
 // enforceKeySpace 把复用到 uk 树的 human handler 钉在 API Key 冻结的那个 Space 上。
 //
 // 一个 `uk_*` 的租户在签发时就已验证并写入 api_key_space_id，请求不得把它放宽或改向：
@@ -100,6 +103,12 @@ func (bf *BotFather) enforceKeySpaceWithChecker(c *wkhttp.Context, checkMembersh
 	// 个已校验的值。
 	query.Set(spaceIDField, bound)
 	c.Request.URL.RawQuery = query.Encode()
+	// X-Space-ID 同样钉成 bound。今天这棵树上没有 handler 直接读它（pkg/space 的
+	// SpaceMiddleware 也没挂在这里），所以这行当前是纯预防：少了它，将来任何读
+	// X-Space-ID 的贡献都会拿到调用方自选的租户，而 query 已被钉住这件事会让人误以为
+	// 整个请求都归一了。归一而不是删除，是为了让「读哪个来源都得到同一个已校验值」这条
+	// 不变量对 header 也成立。
+	c.Request.Header.Set(spaceIDHeader, bound)
 	c.Next()
 }
 
