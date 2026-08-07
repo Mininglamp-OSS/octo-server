@@ -17,9 +17,11 @@ source: user
 >
 > Status: **draft, awaiting human confirmation of the brief as a whole.** The
 > product decisions it depended on are resolved: D7 keeps `${statusGlyph}` bound,
-> D8 adopts the simplified header (so `timerText` is no longer rendered), and D8b
-> keeps the `octo-*` design-system primitives out. No consumer change is implied
-> by any of them.
+> D8 adopts the simplified header (so `timerText` is no longer rendered), D8b
+> keeps the `octo-*` design-system primitives out, and D3a widens
+> `phases[].thought` to 4001. None of them *requires* a consumer change; D3a
+> only takes visible effect once the consumer raises `THOUGHT_MAX`, which the
+> maintainer owns separately.
 
 ## Goal
 
@@ -31,7 +33,9 @@ redesigned presentation:
 - a simplified header that drops the `${timerText}` line.
 
 Adapt that presentation onto the **existing bounded server data contract** (#667/#681), not onto the
-attachment's unbounded schema. Preserve all five states and the existing state-to-view/wire mapping:
+attachment's unbounded schema — with one deliberate widening, `phases[].thought` 281 → 4001 (D3a), which
+raises a ceiling rather than removing it. Preserve all five states and the existing state-to-view/wire
+mapping:
 
 | View | States | Wire profile | `0.4.0` actions |
 | --- | --- | --- | --- |
@@ -84,14 +88,15 @@ The consumer's constants and the server's schema bounds line up exactly:
 
 | `openclaw-channel-octo/src/reasoning-process.ts` | server schema bound |
 | --- | --- |
-| `THOUGHT_MAX = 280` + `…` | `thought: 281` |
+| `THOUGHT_MAX = 280` + `…` | `thought: 281` → **widened to 4001, see D3a** |
 | `TOOL_NAME_MAX = 80` + `…` | `tool: 81` |
 | `REASONING_ID_MAX_LENGTH = 512` | `reasoningId: 512` |
 | `MAX_RENDERED_PHASES = 6` | `phases.maxItems: 6` |
 | `SUMMARY_MAX 64` + `ERROR_MAX 120` joined | `detail: 192` |
 
-Deleting them is not a gap in the handoff; it removes the contract both repos were built against. They are
-restored verbatim.
+Deleting them is not a gap in the handoff; it removes the contract both repos were built against. Every
+bound is therefore restored verbatim **except `thought`, which is deliberately widened** (D3a) — a widening
+is a relaxation, so it cannot reject a payload the consumer already sends.
 
 ### Node budget under the new presentation
 
@@ -106,13 +111,18 @@ The redesign costs materially more nodes per phase. Measured through `renderCore
 
 The aggregate cap of 13 therefore stays; it must not be relaxed as part of this change.
 
-### Consumer impact: none required
+### Consumer impact: none required, one optional follow-up
 
 `openclaw-channel-octo` deliberately carries **no local version allowlist**
 (`selectReasoningProcessTemplate`, asserted by `it.each(["0.1.0","0.2.0","0.3.0","1.0.0","9.8.7"])`), and
 `reasoning_template_ref` is derived server-side from `AdvertisedRef()` rather than stored per bot
 (`modules/bot_api/card_profile.go:149`). Moving `AdvertisedSend` to `0.4.0` propagates to the plugin with
 no plugin release, because the view/wire/state/`submit_actions` shape is unchanged.
+
+D3a does not change that: widening `thought` cannot reject anything the current producer sends, so the
+plugin keeps working untouched at `THOUGHT_MAX = 280`. It does, however, mean the extra capacity sits
+unused until the consumer opts in by raising that constant — a separate, maintainer-owned change with no
+ordering dependency on this one (server first is the safe order, and it is the order being taken).
 
 ### Why a release, not a hot update
 
@@ -137,10 +147,13 @@ provenance) and is out of scope here.
 
 - Add `pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@0.4.0/`.
 - `id` stays `ai.reasoning-process`; `version` becomes `0.4.0`.
-- Adopt the attachment's `contractVersion=1.2.0` (justified by D8's `required` relaxation, the one real
-  data-contract delta) and `renderProfile=octo-chat@1.2.0-rc.2` (provenance only — the server never
-  validates it and the wire carries `renderProfileCompatibility=octo-chat/v1` instead); keep
-  `renderProfileCompatibility=octo-chat/v1`, `adaptiveCardVersion=1.5`, `defaultLocale=zh-CN`.
+- Adopt the attachment's `contractVersion=1.2.0` and `renderProfile=octo-chat@1.2.0-rc.2` (provenance
+  only — the server never validates it and the wire carries `renderProfileCompatibility=octo-chat/v1`
+  instead); keep `renderProfileCompatibility=octo-chat/v1`, `adaptiveCardVersion=1.5`,
+  `defaultLocale=zh-CN`. `1.2.0` covers **two** data-contract relaxations relative to `1.1.0`: D8's
+  `timerText` `required` relaxation and D3a's `thought` widening. It is not bumped to `1.3.0` for the
+  second one because `1.2.0` has never shipped — `0.4.0` is the first artifact to carry it, so both
+  relaxations land as one published delta rather than as a fabricated version history.
 - Restore `owner=ai` and `protocol=octo-card@1.0`. Omit `actionType` — with no `Action.Submit`,
   `TemplateMeta.ActionContract` must stay nil.
 
@@ -154,18 +167,71 @@ provenance) and is out of scope here.
 
 - Start from the frozen `0.3.0` schema and apply only these deltas:
   - `timerText` moves from `required` to optional (relaxation; see D8);
+  - `phases[].thought` `maxLength` goes from `281` to `4001` (relaxation; see D3a);
   - descriptions/examples updated to match the new presentation.
 - **`timerText` must stay in `properties` even though no template binds it.** The schema root is
   `additionalProperties: false` and the producer sends the field unconditionally
   (`ReasoningProcessData.timerText` is non-optional), so deleting the property would reject every
   payload the current plugin emits. Optional-but-present is the only safe shape: the template stops
   consuming it, existing producers keep validating, and future producers may omit it.
-- Restore verbatim: every `maxLength`, `phases.maxItems: 6`, `actions.maxItems: 12`, and
+- Restore verbatim: every other `maxLength`, `phases.maxItems: 6`, `actions.maxItems: 12`, and
   `x-octo-constraints.aggregateArrayLimits` (`phases[].actions` `maxTotalItems: 13`).
 - **Drop `phaseState`.** The attachment adds it, but no template in any view binds it and the producer
   does not send it. A required-nothing/read-by-nobody field is contract debt.
 - Retain the `traceExpanded`/`traceCollapsed` mutual-exclusion `oneOf` and the state-conditional
   `required` blocks unchanged.
+
+### D3a — `thought` ceiling is raised to 4001 and stops tracking the producer
+
+`0.2.0`/`0.3.0` pinned `thought: 281` because that was the producer's *observed* output at the time
+(`THOUGHT_MAX = 280` + `…`, per the `cardtmpl-reasoning-schema-successor` brief's D2 table, sourced from
+consumer snapshot `530bc2dc`). That brief explicitly declined to present these numbers as a product
+contract. Two problems follow from keeping it:
+
+- **Zero headroom.** `280 + 1 = 281` is exactly the ceiling. The consumer currently truncates with
+  `slice(0, 280)` (UTF-16 code units) and JSON Schema `maxLength` counts code points, and since code
+  points ≤ code units that direction is safe — but any of these breaks it with no warning: switching to
+  grapheme-aware truncation (one grapheme can be many code points — combining marks, ZWJ emoji, flags),
+  or changing the ellipsis from `…` (1 code point) to `...` (3).
+- **It caps a product surface at an implementation detail.** 280 characters is roughly two sentences;
+  the field is the user-facing summary of a reasoning phase.
+
+`4001` is chosen as a platform product cap (`4000 + …`, the same `N + ellipsis` shape as the old `281`),
+not a mirror of any producer constant. Budget is not the constraint. Measured on the **`0.4.0` template**
+at the worst case the schema admits (6 phases / 13 aggregate actions / every other string at max), so the
+two rows isolate the bound change rather than conflating it with the template redesign — max across all
+five states:
+
+| `thought` data | worst-case payload | share of `cardmsg.MaxPayloadBytes` (512 KiB) |
+| --- | --- | --- |
+| 281 runes (what `0.3.0`'s bound allowed) | 35,076 B | 6.69% |
+| 4001 runes (the new ceiling) | 102,036 B | 19.46% |
+
+Even fully saturated the card uses under a fifth of the payload budget, leaving ~4× headroom.
+`MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — longer text adds no nodes, so the node
+budget in the section above is unaffected and the aggregate cap of 13 still stands unchanged.
+
+The jump is deliberately large (14×) rather than a token widening: the point is to stop the ceiling from
+being a number that has to be revisited every time the producer's truncation changes. It is affordable
+here specifically because V4 puts the tool rows — and with them the long text — behind per-phase
+collapsible panels that default to collapsed (D4), so a 4000-character phase summary does not expand the
+card on arrival. A larger cap would start to matter for payload budget under 6 saturated phases; a much
+smaller one would leave the same "revisit it later" problem in place.
+
+The field stays explicitly bounded on both ends: an unbounded string fails
+`DefaultCompileLimits().RequireBoundedSchema`, and the `trust-boundary` rule requires an explicit
+ceiling. Widening is safe in the rollout direction that matters — a relaxation cannot reject a payload
+the current consumer already sends, so no plugin release is *required* by this change.
+
+**Realising the longer text requires a consumer change, which is out of scope here.** Actual output
+length is decided by the consumer's `THOUGHT_MAX` truncation; until that constant is raised
+(`THOUGHT_MAX = 4000` to keep the `+…` at exactly 4001), server-side capacity is headroom the producer
+does not use. That change is owned separately by the maintainer, in `openclaw-channel-octo`, and is not
+part of this task's diff.
+
+Only `thought` is widened. `tool: 81`, `detail: 192`, and `errorMessage: 121` carry the same zero-headroom
+design and are knowingly left alone — `tool` is the most exposed of them (MCP tool names can exceed 80),
+and revisiting them is a follow-up decision, not an unstated part of this change.
 
 ### D4 — Templates
 
@@ -257,9 +323,11 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 
 - **L1 immutable artifact identity (`cardtmpl`, `wire-contract`)** — published `0.1.0`/`0.2.0`/`0.3.0` bytes
   cannot change. The redesign requires a new exact version, never an in-place edit of `0.3.0`.
-- **L2 bounded producer contract (`cardtmpl`, `trust-boundary`)** — all `maxLength`/`maxItems` values, the
-  `phases[].actions` aggregate cap of 13, and fail-close schema classification survive verbatim. The
-  attachment's unbounded schema must not replace them.
+- **L2 bounded producer contract (`cardtmpl`, `trust-boundary`)** — every `maxLength`/`maxItems` value, the
+  `phases[].actions` aggregate cap of 13, and fail-close schema classification survive verbatim, with
+  `thought`'s single deliberate widening to 4001 (D3a) as the sole exception. The attachment's *unbounded*
+  schema must not replace them: widening a ceiling is not the same as removing it, and every field —
+  `thought` included — stays bounded on both ends.
 - **L3 card node/depth budget (`wire-contract`, `trust-boundary`)** — the richer per-phase markup must stay
   inside `cardmsg.MaxNodes = 200` / `MaxDepth = 16` at the worst case the schema still admits.
 - **L4 interaction truth (`cardtmpl`, `wire-contract`)** — templates, reports, goldens,
@@ -288,7 +356,9 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 
 - Modifying any file under frozen `ai.reasoning-process@0.1.0`, `@0.2.0`, or `@0.3.0`.
 - Any change to `openclaw-channel-octo`. The plugin requires no release for this cutover, and none of the
-  resolved decisions (D7/D8/D8b) implies one.
+  resolved decisions (D7/D8/D8b/D3a) implies one — D3a is a relaxation, so the current plugin keeps
+  validating unchanged. Raising `THOUGHT_MAX` there to use the new headroom is tracked as the separate
+  maintainer-owned follow-up noted in D3a.
 - Restoring the `octo-*` primitives or the two-column header (D8b/D8). Revisiting the simplified look is a
   future template version, not this one.
 - Hot update: enabling the runtime catalog gates, publishing V4 as a dynamic artifact, persisting an
@@ -298,8 +368,11 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 - Making `AdvertisedSend` runtime-resolvable. That moves wire-contract authority from the image to the
   database and needs its own reviewed brief.
 - Importing `render-profile/` package files or reconciling its `maxDepth: 24` with `cardmsg.MaxDepth = 16`.
-- Relaxing any bound (`phases.maxItems`, `actions.maxItems`, aggregate 13, any `maxLength`) or raising
-  `cardmsg.MaxNodes`.
+- Relaxing any bound other than `thought` (`phases.maxItems`, `actions.maxItems`, aggregate 13, or any
+  other `maxLength` — including the same-shaped `tool: 81` / `detail: 192` / `errorMessage: 121`), or
+  raising `cardmsg.MaxNodes`. The `thought` widening is in scope and specified in D3a.
+- Raising the consumer's `THOUGHT_MAX` so the widened ceiling is actually used. That is an
+  `openclaw-channel-octo` change owned by the maintainer; this task only removes the server-side cap.
 - Adding `phaseState` rendering, reintroducing `reasoning_stop`/`reasoning_retry`, or adding any
   `Action.Submit`, RouteSpec, or callback.
 - Adding routes, DB migrations, error codes, localized error responses, or rate-limit surfaces.
@@ -322,10 +395,15 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 ### B. Bounded contract preserved
 
 - [ ] V4 schema retains every `0.3.0` bound and the `x-octo-constraints` aggregate cap of 13; the only
-  deltas are `timerText` optionality and documentation text. A test asserts bound-by-bound equality with
-  the V3 schema rather than comparing whole files.
+  deltas are `timerText` optionality, `thought`'s widening to 4001, and documentation text. A test asserts
+  bound-by-bound equality with the V3 schema rather than comparing whole files.
+- [ ] `thought` is `4001` in V4 and still `281` in V3, is a strict widening, and remains bounded on both
+  ends (D3a) — so a later edit cannot narrow it back or drop the bound unnoticed.
 - [ ] Every string/array/aggregate `limit+1` case is rejected with `ErrFieldsInvalid` before template
-  expansion; every exact-limit case renders.
+  expansion; every exact-limit case renders. The `thought` limit is resolved per version, so V2/V3 keep
+  asserting 281 while V4 asserts 4001.
+- [ ] The worst case at the widened ceiling (6 phases each carrying a 4001-rune `thought`, 13 aggregate
+  actions) renders in all five states and stays inside `cardmsg.MaxPayloadBytes`.
 - [ ] `CompileJSONArtifact` succeeds under **both** `staticCompileLimits()` and `DefaultCompileLimits()`
   (the latter proving `RequireOwner` / `RequireProtocol` / `RequireBoundedSchema` are satisfied).
 

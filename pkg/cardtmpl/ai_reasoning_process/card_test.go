@@ -355,9 +355,12 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		return func(data map[string]any, value string) { data[key] = value }
 	}
 	tests := []struct {
-		name  string
-		limit int
-		set   func(map[string]any, string)
+		name string
+		// limit is the ceiling shared by every bounded version. perVersion
+		// overrides it for fields whose ceiling diverged across versions.
+		limit      int
+		perVersion func(string) int
+		set        func(map[string]any, string)
 	}{
 		{name: "reasoningId", limit: 512, set: setTop("reasoningId")},
 		{name: "title", limit: 64, set: setTop("title")},
@@ -365,7 +368,7 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		{name: "timerText", limit: 128, set: setTop("timerText")},
 		{name: "collapsedSummary", limit: 160, set: setTop("collapsedSummary")},
 		{name: "progressText", limit: 160, set: setTop("progressText")},
-		{name: "thought", limit: 281, set: setFirstThought},
+		{name: "thought", perVersion: reasoningThoughtMax, set: setFirstThought},
 		{name: "tool", limit: 81, set: setFirstActionField("tool")},
 		{name: "detail", limit: 192, set: setFirstActionField("detail")},
 		{name: "errorTitle", limit: 64, set: setTop("errorTitle")},
@@ -375,17 +378,21 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 	for _, version := range boundedReasoningVersions {
 		for i, tc := range tests {
 			t.Run(version.version+"/"+tc.name, func(t *testing.T) {
+				limit := tc.limit
+				if tc.perVersion != nil {
+					limit = tc.perVersion(version.version)
+				}
 				unit := units[i%len(units)]
 				exact := readSampleMap(t, version.root, "reasoning")
-				tc.set(exact, strings.Repeat(unit, tc.limit))
+				tc.set(exact, strings.Repeat(unit, limit))
 				if err := renderData(reg, version.version, "reasoning", exact); err != nil {
-					t.Fatalf("exact %d-rune value rejected: %v", tc.limit, err)
+					t.Fatalf("exact %d-rune value rejected: %v", limit, err)
 				}
 
 				over := readSampleMap(t, version.root, "reasoning")
-				tc.set(over, strings.Repeat(unit, tc.limit+1))
+				tc.set(over, strings.Repeat(unit, limit+1))
 				if err := renderData(reg, version.version, "reasoning", over); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
-					t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", tc.limit+1, err)
+					t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", limit+1, err)
 				}
 			})
 		}
@@ -442,7 +449,7 @@ func TestSuccessorWorstCaseRendersEveryView(t *testing.T) {
 				data["progressText"] = strings.Repeat("进", 160)
 				data["errorTitle"] = strings.Repeat("错", 64)
 				data["errorMessage"] = strings.Repeat("误", 121)
-				data["phases"] = worstCasePhases()
+				data["phases"] = worstCasePhases(reasoningThoughtMax(version.version))
 
 				if err := renderData(reg, version.version, tc.state, data); err != nil {
 					t.Fatalf("worst-case %s render: %v", tc.state, err)
@@ -507,11 +514,11 @@ func phasesWithActionCounts(counts ...int) []any {
 	return phases
 }
 
-func worstCasePhases() []any {
+func worstCasePhases(thoughtMax int) []any {
 	phases := phasesWithActionCounts(3, 2, 2, 2, 2, 2)
 	for _, rawPhase := range phases {
 		phase := rawPhase.(map[string]any)
-		phase["thought"] = strings.Repeat("思", 281)
+		phase["thought"] = strings.Repeat("思", thoughtMax)
 		for _, rawAction := range phase["actions"].([]any) {
 			action := rawAction.(map[string]any)
 			action["tool"] = strings.Repeat("工", 81)
@@ -519,6 +526,18 @@ func worstCasePhases() []any {
 		}
 	}
 	return phases
+}
+
+// reasoningThoughtMax is the per-version `phases[].thought` ceiling. V2/V3 pinned
+// it to the producer's observed output (280 + `…` = 281); V4 raised it to a
+// platform product cap (4000 + `…` = 4001) that deliberately no longer tracks
+// producer truncation, so the two must be asserted separately rather than
+// through one shared constant.
+func reasoningThoughtMax(version string) int {
+	if version == reasoningVersionV4 {
+		return 4001
+	}
+	return 281
 }
 
 func renderData(reg *cardtmpl.Registry, version string, state cardtmpl.State, data map[string]any) error {
