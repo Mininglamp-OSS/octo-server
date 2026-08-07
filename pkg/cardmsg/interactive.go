@@ -294,7 +294,7 @@ func findSubmitAction(v interface{}, actionID string) (map[string]interface{}, b
 //     在此合法），随后 Finalize 重算权威 plain，返回 canonical JSON 供落库。
 //
 // 跨类型变异（D6 不变量 (a)）由调用方比对原消息类型后拒绝 —— 本函数只看编辑体。
-func NormalizeContentEdit(contentEdit string) (string, error) {
+func NormalizeContentEdit(contentEdit string, opts ...ValidateOption) (string, error) {
 	payload, err := decodeEnvelope(contentEdit)
 	if err != nil {
 		return contentEdit, nil
@@ -302,7 +302,7 @@ func NormalizeContentEdit(contentEdit string) (string, error) {
 	if !IsCardPayload(payload) {
 		return contentEdit, nil
 	}
-	if err := Validate(payload); err != nil {
+	if err := Validate(payload, opts...); err != nil {
 		return "", err
 	}
 	if err := Finalize(payload); err != nil {

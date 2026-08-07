@@ -1,10 +1,13 @@
 package cardmsg
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -19,7 +22,7 @@ import (
 //
 // Validate 不修改 payload，只做 gate；plain 的权威生成在所有 enrich 之后由
 // Finalize 完成（与 pkg/richtext 的两步纪律对称）。
-func Validate(payload map[string]interface{}) error {
+func Validate(payload map[string]interface{}, opts ...ValidateOption) error {
 	if !IsCardPayload(payload) {
 		return nil
 	}
@@ -48,14 +51,14 @@ func Validate(payload map[string]interface{}) error {
 	if !ok || len(card) == 0 {
 		return ErrCardMissing
 	}
-	return validateCard(card, interactive)
+	return validateCard(card, interactive, opts...)
 }
 
 // validateCard 遍历标准 AC 卡片对象，按 profile 档位（interactive=octo/v2）执行
 // 白名单 + 结构上限校验。卡片根上的未知标量字段（$schema/speak/lang 等）保持
 // 宽容（前向兼容，与信封顶层字段同口径）；body/actions/selectAction/type/version
 // 严格校验。
-func validateCard(card map[string]interface{}, interactive bool) error {
+func validateCard(card map[string]interface{}, interactive bool, opts ...ValidateOption) error {
 	if t, present := card["type"]; present {
 		if s, _ := t.(string); s != "AdaptiveCard" {
 			return fmt.Errorf("%w: card.type=%v", ErrCardBadShape, t)
@@ -67,6 +70,9 @@ func validateCard(card map[string]interface{}, interactive bool) error {
 		}
 	}
 	w := &walker{interactive: interactive}
+	for _, opt := range opts {
+		opt(w)
+	}
 	// 卡片根上的 backgroundImage 等 URL 面（AdaptiveCard.backgroundImage）。
 	if err := checkNodeURLs(card); err != nil {
 		return err
@@ -137,7 +143,97 @@ type walker struct {
 	// targetRefs 遍历期累积的 ToggleVisibility.targetElements 引用；全卡走完后由
 	// resolveTargetRefs 统一校验存在性 —— 前向引用安全（target 可先于/后于 toggle 出现）。
 	targetRefs []string
+	// allowInlineImage 放行 `Image.url` / `ImageSet.images[].url` 上的
+	// `data:image/svg+xml` 内联图（且仅这两处、且仅这一个 MIME、且 SVG 内容过
+	// checkInlineSVG 白名单）。**信任来自调用位置，不来自被校验的数据** —— 只有服务端
+	// 自建模板的渲染路径（pkg/cardtmpl）会开它；Bot raw card（modules/bot_api/send.go
+	// 的 hasRawCard 分支与 raw edit）、incomingwebhook adapter、message edit 一律走
+	// 默认关闭，因为那些 card 树是调用方/外部内容控制的。默认 false 使
+	// TestValidateURLAllowlist 的 data: 必拒名单继续成立。
+	allowInlineImage bool
 }
+
+// ValidateOption 调整 Validate 的档位。option 只由服务端可信调用点传入；不从 payload
+// 内容推断（raw card 可以伪造任何字段，provenance 型判断在这一层不可靠）。
+type ValidateOption func(*walker)
+
+// AllowInlineImageData 放行 `data:image/svg+xml` 内联图，用于服务端自建卡片模板 —— 它们
+// 的 card 树由本仓库的 handoff 产物决定，不含调用方输入。见 walker.allowInlineImage。
+func AllowInlineImageData() ValidateOption {
+	return func(w *walker) { w.allowInlineImage = true }
+}
+
+// maxInlineImageBytes 单个内联图的 data URI 上限。内联图会随每一帧持久化（卡片写入
+// message_extra.content_edit）并下发给每个客户端，所以它按"图标"而非"图片"定尺：
+// 现有 chevron 是 208/212 字节，4 KiB 留足余量又不至于让人把照片塞进模板。
+const maxInlineImageBytes = 4 << 10
+
+// checkImageURL 校验图片类字段的 URL。allowInline 为真时额外接受受限的
+// `data:image/svg+xml`；其余一切（含其他 data: MIME、javascript:、相对路径）仍走
+// checkURL 的正向 allowlist。
+func checkImageURL(raw string, allowInline bool) error {
+	trimmed := strings.TrimSpace(raw)
+	if !allowInline || !strings.HasPrefix(strings.ToLower(trimmed), "data:") {
+		return checkURL(raw)
+	}
+	return checkInlineSVG(trimmed)
+}
+
+// checkInlineSVG 校验一个 `data:image/svg+xml` URI。SVG 是 XSS 的经典载体，而服务端
+// 无法知道客户端是用 <img src> 渲染（浏览器沙箱化，脚本不执行）还是内联进 DOM（脚本会
+// 执行），所以内容按后者的最坏假设过白名单，而不是依赖渲染端的善意。
+func checkInlineSVG(raw string) error {
+	const (
+		plainPrefix  = "data:image/svg+xml,"
+		base64Prefix = "data:image/svg+xml;base64,"
+	)
+	if len(raw) > maxInlineImageBytes {
+		return fmt.Errorf("%w: 内联图 %d 字节超过 %d", ErrCardBadURLScheme, len(raw), maxInlineImageBytes)
+	}
+	var svg string
+	switch {
+	case strings.HasPrefix(raw, base64Prefix):
+		decoded, err := base64.StdEncoding.DecodeString(raw[len(base64Prefix):])
+		if err != nil {
+			return fmt.Errorf("%w: 内联图 base64 解码失败", ErrCardBadURLScheme)
+		}
+		svg = string(decoded)
+	case strings.HasPrefix(raw, plainPrefix):
+		decoded, err := url.QueryUnescape(raw[len(plainPrefix):])
+		if err != nil {
+			return fmt.Errorf("%w: 内联图 URL 解码失败", ErrCardBadURLScheme)
+		}
+		svg = decoded
+	default:
+		// 其他 data: MIME（image/png、text/html…）一律不放行：本档位只为矢量图标开。
+		return fmt.Errorf("%w: %q", ErrCardBadURLScheme, raw)
+	}
+	if !utf8.ValidString(svg) {
+		return fmt.Errorf("%w: 内联 SVG 非 UTF-8", ErrCardBadURLScheme)
+	}
+	lower := strings.ToLower(svg)
+	if !strings.Contains(lower, "<svg") {
+		return fmt.Errorf("%w: 内联图不是 SVG 文档", ErrCardBadURLScheme)
+	}
+	// 脚本执行面、外部引用面、以及能引出二者的元素/属性一律拒。宁可拒掉合法但花哨的
+	// 图标，也不放过一个能拉外部资源或跑脚本的。
+	for _, forbidden := range []string{
+		"<script", "<foreignobject", "<use", "<image", "<iframe", "<embed", "<object",
+		"<animate", "<set", "javascript:", "xlink:", "href", "url(", "@import", "<!entity", "<!doctype",
+	} {
+		if strings.Contains(lower, forbidden) {
+			return fmt.Errorf("%w: 内联 SVG 含禁止内容 %q", ErrCardBadURLScheme, forbidden)
+		}
+	}
+	// on* 事件属性（onload / onclick / …）——用 "on" + 字母 + "=" 的形状匹配，避免误伤
+	// 形如 stroke-linejoin 里的 "on"。
+	if inlineSVGEventAttr.MatchString(lower) {
+		return fmt.Errorf("%w: 内联 SVG 含事件属性", ErrCardBadURLScheme)
+	}
+	return nil
+}
+
+var inlineSVGEventAttr = regexp.MustCompile(`(^|[\s"';])on[a-z]+\s*=`)
 
 // registerID 记录一个 Action.Submit / Input.* / 展示元素 的 id 并强制帧内唯一（P2 D1 +
 // ToggleVisibility）。三类共享同一 seenIDs 空间：Submit id 与元素 id 同名亦判重复（对齐 AC 的
@@ -265,7 +361,7 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if u == "" {
 			return fmt.Errorf("%w: Image.url 必填", ErrCardBadShape)
 		}
-		if err := checkURL(u); err != nil {
+		if err := checkImageURL(u, w.allowInlineImage); err != nil {
 			return err
 		}
 	case "Container":
@@ -615,7 +711,7 @@ func (w *walker) imageChild(img map[string]interface{}, depth int) error {
 	if u == "" {
 		return fmt.Errorf("%w: ImageSet.images[].url 必填", ErrCardBadShape)
 	}
-	return checkURL(u)
+	return checkImageURL(u, w.allowInlineImage)
 }
 
 // column 校验 ColumnSet 中的单列。AC 允许 Column 省略 type 字段；显式给出时必须
