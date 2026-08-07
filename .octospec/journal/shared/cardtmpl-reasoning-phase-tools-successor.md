@@ -53,6 +53,19 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
   of `cardmsg.MaxPayloadBytes`) at 281 → 102,036 B (19.46%) at 4001. `MaxNodes` /
   `MaxDepth` are *structural*, so longer text costs no nodes and the aggregate cap of 13
   was untouched.
+
+  **Review corrected the headroom claim, and the correction is the interesting part.**
+  512 KiB is the only size gate a rendered frame passes, but it is not the binding one:
+  the authoritative bot-edit write puts the whole marshalled frame into
+  `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**, never widened by
+  any later migration (`octo_message_card_revision.content` likewise). Against *that*, the
+  saturated frame is 1.56× over with CJK and **2.66× over (174,054 B)** when every
+  character escapes to 6 bytes. So the arbitrary-looking `producer_cap + 1` bound was, in
+  this one instance, the only thing keeping the template inside a real storage limit —
+  which is close to the opposite of what the first draft of the learning asserted. The
+  contract value stays 4001 (it is a product cap, every server-enforced gate passes, and
+  the producer still truncates at 280 so the headroom is unused), but the consumer bump is
+  now gated on a stated precondition instead of being "no ordering dependency".
 - **`timerText` optional but retained in `properties`** (D3/D8). No template binds it, but
   the root is `additionalProperties: false` and the producer sends it unconditionally, so
   deleting the property would have rejected every payload the current plugin emits.
@@ -120,13 +133,25 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
 
 ## Follow-ups / notes
 
-- **Consumer change is optional and maintainer-owned.** Widening `thought` cannot reject
-  anything the plugin sends today, so no plugin release is required; the new headroom
-  simply goes unused until `openclaw-channel-octo` raises `THOUGHT_MAX` to 4000 (keeping
-  the `+…` at exactly 4001). Server-first is the safe order and is the order taken. Two
-  hazards for that change: switching to grapheme-aware truncation would reintroduce the
-  overflow (one grapheme can be many code points), and changing the ellipsis from `…`
-  (1 cp) to `...` (3 cp) would break the arithmetic.
+- **Consumer change is maintainer-owned and has a hard precondition.** Widening `thought`
+  cannot reject anything the plugin sends today, so no plugin release is required and the
+  new headroom simply goes unused until `openclaw-channel-octo` raises `THOUGHT_MAX` to
+  4000 (keeping the `+…` at exactly 4001). Server-first is the safe order **for
+  validation** — it is not sufficient for storage. Before that bump lands, one of these has
+  to be true: (1) `message_extra.content_edit` and `octo_message_card_revision.content` are
+  widened, e.g. to `MEDIUMTEXT` — `message_extra` is a large hot table so that is a
+  `MODIFY COLUMN` rebuild needing its own brief, deliberately not bundled here; (2) the
+  effective producer cap stays under the persistence-safe ceiling for the worst-case
+  encoding (~987 code points per phase if the text can contain `<`/`>`/`&`/U+2028/U+2029,
+  ~1,973 for pure CJK); or (3) the frame is capped or spilled at the persistence boundary.
+  Otherwise a ~6-long-phase card renders, passes `cardmsg.Validate`, and then the
+  transactional insert fails with `Data too long for column` under `STRICT_TRANS_TABLES`
+  (surfacing as `ErrBotAPIStoreFailed`, freezing the card mid-stream) — or is silently
+  truncated into invalid JSON on a non-strict deployment. So the hazards are **three**, not
+  two: grapheme-aware truncation, the `…` → `...` arithmetic, and this persistence ceiling.
+  Worth noting the 512 KiB-gate-vs-64 KiB-column mismatch is pre-existing platform debt —
+  the ordinary message-edit endpoint already admits 1 MiB of RichText into the same column
+  (`modules/message/api.go:60`) — this change only makes the card path able to reach it.
 - **`tool: 81`, `detail: 192`, `errorMessage: 121` still carry the zero-headroom design**
   and were knowingly left alone. `tool` is the most exposed — MCP tool names can exceed
   80 characters. Recorded in D3a and Out of scope so it reads as a decision, not an

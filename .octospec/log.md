@@ -65,6 +65,21 @@ change-log convention (§7). Newest first.
   code points vs JS UTF-16 code units vs graphemes, measured and confirmed).
   Over-limit means the whole card fails to send, not a display regression.
   Candidate rule: `trust-boundary`.
+- **Review correction** — the first draft of that learning ended "the bound was
+  never protecting a real resource", and D3a claimed "~4× headroom". Review
+  (PR #712) showed both were measured against the wrong ceiling: 512 KiB is the
+  only gate a rendered frame *passes*, but the authoritative bot-edit write puts
+  the whole frame into `message_extra.content_edit`, a MySQL `TEXT` column of
+  65,535 bytes never widened by a later migration. The saturated frame is 1.56×
+  over with CJK and 2.66× over (174,054 B) when every character escapes to six
+  bytes — so in this instance the arbitrary-looking bound *was* the only thing
+  keeping the template inside a real storage limit. The contract value stays
+  4001, but the consumer's `THOUGHT_MAX` bump is now gated on an explicit
+  precondition (widen the column, or cap under ~987 code points per phase for
+  the worst-case encoding, or cap at the persistence boundary) instead of
+  "no ordering dependency", and the gap is pinned by a test so the prose cannot
+  drift from it. Generalized in the learning as: a validator ceiling is not a
+  storage ceiling, and code points are not bytes.
 
 ## 2026-08-06 (bot-setting-store)
 

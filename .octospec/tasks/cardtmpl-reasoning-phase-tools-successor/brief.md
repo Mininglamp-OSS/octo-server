@@ -197,37 +197,78 @@ contract. Two problems follow from keeping it:
   the field is the user-facing summary of a reasoning phase.
 
 `4001` is chosen as a platform product cap (`4000 + …`, the same `N + ellipsis` shape as the old `281`),
-not a mirror of any producer constant. Budget is not the constraint. Measured on the **`0.4.0` template**
-at the worst case the schema admits (6 phases / 13 aggregate actions / every other string at max), so the
-two rows isolate the bound change rather than conflating it with the template redesign — max across all
-five states:
+not a mirror of any producer constant. Measured on the **`0.4.0` template** at the worst case the schema
+admits (6 phases / 13 aggregate actions / every other string at max), so the rows isolate the bound change
+rather than conflating it with the template redesign — max across all five states:
 
-| `thought` data | worst-case payload | share of `cardmsg.MaxPayloadBytes` (512 KiB) |
-| --- | --- | --- |
-| 281 runes (what `0.3.0`'s bound allowed) | 35,076 B | 6.69% |
-| 4001 runes (the new ceiling) | 102,036 B | 19.46% |
+| `thought` content | worst-case frame | vs `cardmsg.MaxPayloadBytes` (512 KiB) | vs `content_edit` `TEXT` (64 KiB) |
+| --- | --- | --- | --- |
+| 281 runes CJK (what `0.3.0` allowed) | 35,076 B | 6.69% | fits |
+| 4001 runes CJK | 102,036 B | 19.46% | **1.56× over** |
+| 4001 runes all-escaping (`<`, U+2028 → 6 B each) | 174,054 B | 33.2% | **2.66× over** |
 
-Even fully saturated the card uses under a fifth of the payload budget, leaving ~4× headroom.
-`MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — longer text adds no nodes, so the node
-budget in the section above is unaffected and the aggregate cap of 13 still stands unchanged.
+**Two ceilings, and the smaller one is not the validator** (found in review, corrected here). 512 KiB is
+the only size gate a rendered frame passes (`pkg/cardmsg/validate.go:30`), and against it there is ~4×
+headroom. But the authoritative write on the bot edit path stores the whole marshalled frame in
+`message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**
+(`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later migration;
+`octo_message_card_revision.content` is `TEXT` too). Against *that* the saturated frame does not fit.
+
+Because bytes-per-code-point varies (CJK 3, non-BMP 4, Go-escaped `<`/`>`/`&`/U+2028/U+2029 6), the
+persistence-safe ceiling depends on content: roughly 1,973 code points per phase for CJK, ~1,480 for
+emoji, **~987 fully escaped** (structure baseline ≈ 30,018 B plus `6 phases × N × bytes-per-cp`).
+
+`4001` is still the right *contract* value — it is a product cap, the frame passes every gate the server
+itself enforces, and nothing regresses at this head because the producer still truncates at 280 so the
+headroom is deliberately unused. The 512-KiB-gate-vs-64-KiB-column mismatch is also pre-existing platform
+debt, not created here: the ordinary message-edit endpoint already admits up to 1 MiB of RichText into the
+same column (`modules/message/api.go:60`, `hardParsePayloadLimit`). What this change does is make the card
+path able to reach it, which is why the consumer bump below is gated on fixing it.
+
+`MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — longer text adds no nodes, so the node budget
+in the section above is unaffected and the aggregate cap of 13 still stands unchanged.
 
 The jump is deliberately large (14×) rather than a token widening: the point is to stop the ceiling from
 being a number that has to be revisited every time the producer's truncation changes. It is affordable
 here specifically because V4 puts the tool rows — and with them the long text — behind per-phase
 collapsible panels that default to collapsed (D4), so a 4000-character phase summary does not expand the
-card on arrival. A larger cap would start to matter for payload budget under 6 saturated phases; a much
-smaller one would leave the same "revisit it later" problem in place.
+card on arrival.
 
 The field stays explicitly bounded on both ends: an unbounded string fails
 `DefaultCompileLimits().RequireBoundedSchema`, and the `trust-boundary` rule requires an explicit
 ceiling. Widening is safe in the rollout direction that matters — a relaxation cannot reject a payload
 the current consumer already sends, so no plugin release is *required* by this change.
 
-**Realising the longer text requires a consumer change, which is out of scope here.** Actual output
-length is decided by the consumer's `THOUGHT_MAX` truncation; until that constant is raised
-(`THOUGHT_MAX = 4000` to keep the `+…` at exactly 4001), server-side capacity is headroom the producer
+**Realising the longer text requires a consumer change, and that change has a hard precondition.** Actual
+output length is decided by the consumer's `THOUGHT_MAX` truncation; until it is raised
+(`THOUGHT_MAX = 4000`, keeping the `+…` at exactly 4001), server-side capacity is headroom the producer
 does not use. That change is owned separately by the maintainer, in `openclaw-channel-octo`, and is not
 part of this task's diff.
+
+Server-first is the safe order **for validation**, and nothing regresses at this head. It is *not*
+sufficient for storage. Before the `THOUGHT_MAX` bump lands, one of these must be true:
+
+1. `message_extra.content_edit` and `octo_message_card_revision.content` are widened (e.g. `MEDIUMTEXT`);
+   note `message_extra` is a large hot table, so that is a `MODIFY COLUMN` rebuild needing its own brief
+   and rollout plan — it is deliberately not bundled here; **or**
+2. the effective producer cap is kept under the persistence-safe ceiling for the worst-case encoding
+   (~987 code points per phase if the text can contain `<`/`>`/`&`/U+2028/U+2029, ~1,973 for pure CJK);
+   **or**
+3. the frame is capped or spilled at the persistence boundary rather than at the schema.
+
+Otherwise the failure mode is: a card with ~6 long phases renders, passes `cardmsg.Validate`, and then the
+transactional `content_edit` insert fails with `Data too long for column` under `STRICT_TRANS_TABLES` —
+surfacing as `ErrBotAPIStoreFailed` (`modules/bot_api/send.go:1317`) and freezing the card mid-stream. On a
+non-strict deployment the frame is silently truncated into invalid JSON instead. The revision append
+degrades more gently because it is best-effort (`internal/carddispatch/mutation.go:221-225`), so there it
+is silent frame loss rather than a hard failure.
+
+So the hazards on that follow-up are **three**, not two:
+
+- switching to grapheme-aware truncation would reintroduce the overflow (one grapheme can be many code
+  points — combining marks, ZWJ emoji, flags, skin-tone modifiers);
+- changing the ellipsis from `…` (1 code point) to `...` (3) breaks the `+1` arithmetic;
+- **the 64 KiB persistence ceiling above** — the one that breaks this card's own streaming path.
 
 Only `thought` is widened. `tool: 81`, `detail: 192`, and `errorMessage: 121` carry the same zero-headroom
 design and are knowingly left alone — `tool` is the most exposed of them (MCP tool names can exceed 80),
@@ -404,6 +445,12 @@ status badge, or a footer surface on this card. **This is intentional and is kep
   asserting 281 while V4 asserts 4001.
 - [ ] The worst case at the widened ceiling (6 phases each carrying a 4001-rune `thought`, 13 aggregate
   actions) renders in all five states and stays inside `cardmsg.MaxPayloadBytes`.
+- [ ] A test records the persistence gap D3a documents rather than leaving it in prose only: at the
+  producer's current cap (281) the frame fits `message_extra.content_edit`'s 64 KiB `TEXT` column under
+  every encoding, while at the schema ceiling it does not — and the escape-heavy case (6 bytes per code
+  point) is asserted to exceed the CJK case, so "the worst case the schema admits" is not silently read as
+  the CJK fixture. Widening the column or lowering the ceiling must make that test fail loudly, forcing
+  D3a / the journal / the pending learning to be updated with it.
 - [ ] `CompileJSONArtifact` succeeds under **both** `staticCompileLimits()` and `DefaultCompileLimits()`
   (the latter proving `RequireOwner` / `RequireProtocol` / `RequireBoundedSchema` are satisfied).
 
