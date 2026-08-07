@@ -387,9 +387,13 @@ func TestSendMessageRegistryTemplateAuthorsCatalogProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	ba := &BotAPI{
-		Log:              log.NewTLog("BotAPI-template-provenance"),
-		cardTemplates:    catalog,
-		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		Log:           log.NewTLog("BotAPI-template-provenance"),
+		cardTemplates: catalog,
+		spaceQuerier:  &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// The send path resolves the bot's card switches and fails closed when
+		// the resolver is unwired (#706), so a hand-built BotAPI has to supply
+		// one. This test is about provenance authoring, not per-bot policy.
+		cardConfig:       allCardCapabilitiesOn(),
 		dispatchOverride: dispatch.hook,
 	}
 	recorder := invokeTemplateSend(t, ba, registrySendBody(t, "reasoning", testReasoningData(t, "reasoning")), "")
