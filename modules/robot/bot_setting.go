@@ -560,12 +560,6 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 			respondRobotRequestInvalid(c, "key")
 			return
 		}
-		if !def.Editable {
-			// 派生只读键（card_enabled）：写入必须失败，否则库里会出现与 env
-			// 相矛盾的值，profile 与发卡门禁随之背离。
-			respondRobotRequestInvalid(c, "key")
-			return
-		}
 		if _, dup := seen[item.Key]; dup {
 			respondRobotRequestInvalid(c, "key")
 			return
@@ -582,8 +576,22 @@ func (rb *Robot) updateBotSettings(c *wkhttp.Context) {
 		// 取 no-op 而不是「删除」，理由是失败方向：若 null 表示删除，把读接口返回的
 		// 整份目录原样写回就会**静默清空用户没碰过的每一个覆盖**，一个无害动作产生
 		// 破坏性后果。DELETE 端点已经存在且语义显式，不需要第二种拼写。
+		//
+		// **必须早于 Editable 判定**，且这一条是被验收标准逼出来的：目录里也含派生
+		// 只读键 card_enabled，它下发的 value 同样是 null。若先判 Editable，「把完整
+		// list 原样写回」仍然整批 400 —— 与 null 本身被拒是同一个缺陷，只是换了一个键
+		// 触发，而客户端同样要靠一条从形状上看不出来的规则先做过滤。
+		// 相对地，未注册键即便携 null 也仍然拒绝（判定在上面）：服务端对那个键没有任何
+		// 定义，无法确认自己理解了调用方的意图，白名单契约不能靠「反正是 no-op」松掉。
 		if isNullBotSettingValue(item.Value) {
 			continue
+		}
+
+		if !def.Editable {
+			// 派生只读键（card_enabled）带**实际值**：写入必须失败，否则库里会出现与
+			// env 相矛盾的值，profile 与发卡门禁随之背离。
+			respondRobotRequestInvalid(c, "key")
+			return
 		}
 
 		normalized, ok := normalizeBotSettingValue(item.Value)

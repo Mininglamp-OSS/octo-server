@@ -122,6 +122,12 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
   前向兼容协商——即便 `card_version` 停在 `"1.5"`、`profiles` 不变，也能探测是否接受
   `Input.Number/Date/Time`、`ToggleVisibility`/`CopyToClipboard` 等 additive 新增能力。
   P1 期间生产者以发送被 400/`card_disabled` 拒绝为「未启用」信号。
+- **该清单不再全是部署级常量**：`config` 对象是**调用方这一个 Bot** 的有效卡片策略
+  （`bot_setting` 三层解析 AND 总闸），因此同一部署对不同 bot token 返回不同 `config`，
+  响应带 `Cache-Control: private, no-store` + `Vary: Authorization`，按 URL 缓存会把
+  A 的配置回给 B。它同时**引入了本端点的第一个失败面**（要读库）：失败时返回
+  `err.shared.internal`，而 D14 把线路状态钉成 400——消费方必须按 `error.code` 判重试，
+  且**不得**把该错误当作「能力已关闭」缓存。详见 `docs/bot-setting-api.md`。
 
 `templating` 是 Bot Registry 模式的服务端新发 allowlist，不是整个
 `Registry.List()`。消费者必须同时校验 `supported`、wire 版本、模板精确版本、
@@ -177,6 +183,21 @@ view/state/wire profile 以及每个 view 的 `submit_actions`；不能从
 通知 / incoming webhook / card_action 仍按总闸照常发卡。有效门禁
 `BotEnabled() = 总闸 AND 子开关`；`GET /v1/bot/card/profile` 的 `enabled` 字段取
 的正是它，故清单与实际发卡门禁**同源**，绝不出现「报 enabled 却发被拒」。
+
+**per-Bot 子开关**：`bot_setting` 表（`bot.display_enabled` / `bot.interaction_enabled` /
+`bot.reasoning_enabled`，属主经 `/v1/robot/:id/settings` 读写）。它们**在**上述部署级
+门禁**之下**——总闸关闭时一律无效，`bot.card_enabled` 是它们的派生只读总闸。
+
+`display` 与 `interaction` 不正交：`octo/v1` 要 display，`octo/v2` 要
+`display AND interaction`。raw 卡的判定**一律**走
+`AllowsRawDisplayCard`/`AllowsRawInteractiveCard`，owner 目录、profile 清单、bot 发送门、
+bot 编辑门、legacy robot ingress 共用同一个判定，绝不各自重写一次布尔组合。
+
+`reasoning` 与上面两个**不同构，别照搬**：它只 gate **新发**，编辑路径故意不 gate。
+关掉它要停的是新卡，不是把已经在屏幕上、进度帧还在飞的卡冻在「思考中」——那样生产者
+再也无法把它推到终态。此外 profile 下发的 `reasoning_enabled` 还会 AND 一次「本部署的
+模板目录是否广告了推理模板」，这是部署组装事实、owner 目录看不到（见
+`docs/bot-setting-api.md` 的同名说明）。
 
 ## 5. plain 派生规则（服务端权威）
 

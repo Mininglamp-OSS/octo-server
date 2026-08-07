@@ -122,6 +122,20 @@ func putSettings(t *testing.T, handler http.Handler, robotID string, items ...ma
 	return w
 }
 
+// putRawSettings sends a body verbatim, so a case can exercise wire shapes
+// putSettings cannot produce — an empty object, or bytes that are not JSON.
+func putRawSettings(t *testing.T, handler http.Handler, robotID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("PUT", "/v1/robot/"+robotID+"/settings",
+		bytes.NewReader([]byte(body)))
+	assert.NoError(t, err)
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, req)
+	return w
+}
+
 func deleteSetting(t *testing.T, handler http.Handler, robotID, key string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
@@ -265,7 +279,19 @@ func TestBotSettings_WriteRejections(t *testing.T) {
 		item map[string]any
 	}{
 		{"unregistered key", map[string]any{"key": "bot.not_a_real_key", "value": "true"}},
+		// The asymmetry `null` introduced, pinned from both sides.
+		//
+		// A read-only key carrying null is a no-op and is accepted (the catalog
+		// emits card_enabled with value null, so writing the catalog back must
+		// work) — covered by TestBotSettings_FullCatalogRoundTripsIncludingNulls.
+		// Carrying a real *value* is still refused, because a stored value would
+		// contradict env and split the manifest from the send gate.
 		{"derived key is read-only", map[string]any{"key": BotSettingKeyCardEnabled, "value": "true"}},
+		// An unregistered key is refused even as a no-op: the server holds no
+		// definition for it at all, so it cannot confirm it understood the
+		// caller. "It writes nothing anyway" is not a reason to loosen the
+		// whitelist — that is what makes this different from the case above.
+		{"unregistered key is refused even as a no-op", map[string]any{"key": "bot.not_a_real_key", "value": nil}},
 		{"illegal bool literal", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": "maybe"}},
 		{"empty value", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": ""}},
 		{"non-bool JSON", map[string]any{"key": BotSettingKeyDisplayEnabled, "value": 1}},
@@ -337,21 +363,29 @@ func TestBotSettings_OwnershipGuard(t *testing.T) {
 	// ownership guard, so these answered 400 — contradicting the semantics the
 	// endpoint documents for itself. The subtests above cannot catch it: they all
 	// send a well-formed body with a bad *key*, which only reaches the per-item
-	// loop. These two never get that far.
-	t.Run("an empty items list on someone else's bot is forbidden, not bad request", func(t *testing.T) {
-		w := putSettings(t, handler, settingsOtherRobotID)
-		assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
-	})
-	t.Run("an unparseable body on an unknown bot is not found, not bad request", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		req, err := http.NewRequest("PUT", "/v1/robot/bot_does_not_exist/settings",
-			bytes.NewReader([]byte("{ this is not json")))
-		assert.NoError(t, err)
-		req.Header.Set("token", token)
-		req.Header.Set("Content-Type", "application/json")
-		handler.ServeHTTP(w, req)
-		assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
-	})
+	// loop. The bodies below never get that far.
+	//
+	// Both empty spellings are covered because they fail at different points:
+	// `{}` leaves items nil after a successful bind, `{"items":[]}` leaves it
+	// non-nil but empty, and an unparseable body fails inside BindJSON itself.
+	// A guard placed between any two of those would pass one and fail another.
+	for _, body := range []struct {
+		name string
+		raw  string
+	}{
+		{"an empty object", `{}`},
+		{"an empty items list", `{"items":[]}`},
+		{"an unparseable body", `{ this is not json`},
+	} {
+		t.Run(body.name+" on someone else's bot is forbidden, not bad request", func(t *testing.T) {
+			w := putRawSettings(t, handler, settingsOtherRobotID, body.raw)
+			assert.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
+		})
+		t.Run(body.name+" on an unknown bot is not found, not bad request", func(t *testing.T) {
+			w := putRawSettings(t, handler, "bot_does_not_exist", body.raw)
+			assert.Equal(t, http.StatusNotFound, w.Code, "body=%s", w.Body.String())
+		})
+	}
 }
 
 // TestBotSettings_CatalogValueRoundTrips pins that what the read endpoint emits
@@ -498,15 +532,18 @@ func TestQueryBotSettingOverrides_EmptyValueIsNotConfigured(t *testing.T) {
 	assert.True(t, item.Effective)
 }
 
-// TestBotSettings_CatalogAgreesWithTheEnforcedProjection —— owner 目录不得与发送门
-// 给出相反答案（task bot-setting-owner-contract / P2-1）。
+// TestBotSettings_MasterSwitchOffZeroesTheCatalog —— 总闸关闭时 owner 目录必须一律
+// 报 false，且 `value` 不被投影污染（task bot-setting-owner-contract / P2-1）。
 //
-// 断言的是**两个投影一致**，而不是「目录返回 false」：后者写死了预期值，一旦总闸语义
-// 改了就要跟着改；前者钉的是真正的不变量——owner 看到的能力必须等于发卡时生效的能力。
+// **本包能断言的只有半条契约。** P2-1 的缺陷形态是「owner 目录与生产者清单对同一个
+// Bot 的同一能力给出相反答案」，而 `/v1/bot/card/profile` 属 bot_api——依赖方向是
+// bot_api → robot，本包的测试二进制里没有那条路由。跨端点一致性由
+// bot_api.TestBotCardCapability_OwnerCatalogAgreesWithProducerManifest 覆盖；这里留
+// 一条包内的快速信号，钉住投影本身与三态契约的边界。
 //
-// 这条用例必须在总闸关闭下跑。此前的目录测试全都在总闸开启时运行，所以这个矛盾一直
-// 没有任何测试覆盖：总闸开着时两个投影恰好相等。
-func TestBotSettings_CatalogAgreesWithTheEnforcedProjection(t *testing.T) {
+// 这条用例必须在总闸关闭下跑：此前的目录测试全在总闸开启时运行，而总闸开着时投影前后
+// 恰好相等，所以这个矛盾一直没有任何测试覆盖。
+func TestBotSettings_MasterSwitchOffZeroesTheCatalog(t *testing.T) {
 	handler, _ := setupBotSettings(t)
 	// 总闸关闭（缺省即关，显式写出来是为了让用例的前提可读）。
 	t.Setenv(cardmsg.EnvEnabled, "")
@@ -546,11 +583,17 @@ func TestBotSettings_FullCatalogRoundTripsIncludingNulls(t *testing.T) {
 	var resp settingsListResp
 	assert.NoError(t, json.Unmarshal(getSettings(t, handler, settingsRobotID).Body.Bytes(), &resp))
 
-	// 原样回灌整份目录（此时三个可写键都还没有覆盖，value 全是 null），只改一项。
+	// 原样回灌**整份**目录，不做任何过滤——包括派生只读键 card_enabled。
+	//
+	// 不过滤是这条用例的要点：验收标准说的是「把读接口返回的完整 list 原样 PUT 回去
+	// 成功」，而目录里恰好含一个 editable:false 的键、它下发的 value 同样是 null。用
+	// `if !item.Editable { continue }` 先筛掉它，用例就退化成只覆盖可写键，而客户端
+	// 仍然要靠一条从响应形状上看不出来的规则先做过滤——那正是本项要消灭的东西。
 	items := make([]map[string]any, 0, len(resp.List))
+	readOnlySeen := false
 	for _, item := range resp.List {
 		if !item.Editable {
-			continue // 派生只读键本就不该出现在写请求里
+			readOnlySeen = true
 		}
 		var value any // nil → JSON null
 		if item.Value != nil {
@@ -562,6 +605,8 @@ func TestBotSettings_FullCatalogRoundTripsIncludingNulls(t *testing.T) {
 		items = append(items, map[string]any{"key": item.Key, "value": value})
 	}
 	assert.Greater(t, len(items), 1, "回灌样本必须同时含 null 项与非 null 项")
+	assert.True(t, readOnlySeen,
+		"目录里已没有 editable:false 的键，这条用例不再覆盖「只读键携 null 回灌」")
 
 	w := putSettings(t, handler, settingsRobotID, items...)
 	assert.Equal(t, http.StatusOK, w.Code,

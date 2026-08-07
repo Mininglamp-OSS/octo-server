@@ -124,11 +124,24 @@ owner 界面上。brief 当时写明 `AllowsRaw*` 是「发送门、编辑门与
 - `go vet ./...`、两个 i18n gate、两个 `NoLegacyResponseError` guard 通过。
 - 每条修复用「只回退该修复、确认其测试失败」验证过。
 
-## Open questions（需人确认）
+## Open questions
 
-1. **P2-1 取哪种修法？** (a) `effective_value` 直接经 `botCardConfigFrom` 的投影——UI 不用
-   改，但「这一层的解析结果」这个语义丢失；(b) 保留现字段、新增 `enforced_value`——语义更
-   准，但客户端要改。已在客户端对接说明里让 UI 自行 AND 作为过渡，两种方案都不会让它出错。
-2. **`null` 是 no-op 还是删除覆盖？** 后者更符合读侧形状，但会让 `DELETE` 端点变成冗余。
-3. **profile 的重试契约**：改 wire status（与 `bot_api` 其余错误不一致）还是写文档
-   （依赖消费方正确实现）？需要 `openclaw-channel-octo` 侧一起确认。
+1. ~~**P2-1 取哪种修法？**~~ **已决：(a) 服务端投影。** 由规则 `trust-boundary` 裁决，
+   非作者裁量——规则要求「只在下游调用方无法绕过的边界上处理」，新增 `enforced_value`
+   等于保留原坑换个标签。`value` / `source` 不动，三态契约不受影响。
+   见 `context.yaml` 的 `decisions_from_rules`。
+2. ~~**`null` 是 no-op 还是删除覆盖？**~~ **已决：no-op。** 作者裁量，取失败方向：若表示
+   删除，整份回灌会静默清空用户没碰过的每个覆盖。`DELETE` 语义已显式，不需要第二种拼写。
+3. **profile 的重试契约** —— 服务端侧已决：**写契约、不改 wire status**（规则
+   `error-handling` + CLAUDE.md 对 `ResponseErrorLWithStatus` 的适用范围限定；该端点非新
+   端点且已有消费方，偏离 D14 需 maintainer 签字）。落点：`docs/bot-setting-api.md`
+   第二节 + `modules/bot_api/card_profile.go` 的代码契约。
+   **仍需 `openclaw-channel-octo` 侧确认已按 `error.code` 分支**——这一半在仓外，本仓无法
+   自证，是唯一未闭环项。
+
+## 已知残留（实现后确认，不阻塞）
+
+- **`reasoning_enabled` 在两个端点间仍可能不一致**，条件是部署裁剪过卡片模板目录：
+  profile 额外 AND 了「本部署是否广告了推理模板」，owner 目录看不到这件事。镜像它需要
+  `robot` 反向依赖 `bot_api` 的模板目录，故不做。标准部署广告该模板，两端一致。
+  已写入 `docs/bot-setting-api.md` 与跨端点用例的注释。
