@@ -179,10 +179,17 @@ provenance) and is out of scope here.
 
 ### D5 — Reports
 
-- Ship `reports/active.interaction.json` and `reports/error.interaction.json` only, listing the toggle
-  actions each view actually renders.
+- Ship `reports/active.interaction.json` and `reports/error.interaction.json` only.
 - **Do not ship `reports/result.interaction.json`.** `result` is `octo/v1`; `LoadJSONBundle` reads reports
   only for `octo/v2` views, and a runtime-assembled bundle carrying it would fail `unreferenced`.
+- **Declare only data-independent action ids** — `reasoning_toggle` and
+  `reasoning_toggle_expanded_action`. Found during Verify: the attachment's reports enumerate
+  `reasoning_tools_toggle_action_0/1`, but those ids are generated per phase by `${$index}`, so the
+  delivered report is true only for a 2-phase card. It under-declares the `answering` sample (3 phases →
+  8 toggles) that the same `active` view serves. Nothing catches this — `assertInteractionReport`
+  compares `Action.Submit` and `Input` ids only, and the Bot capability skips non-Submit entries — so an
+  indexed id is a published claim no gate verifies. A report that cannot enumerate every instance must
+  declare the stable subset instead of an arbitrary two.
 
 ### D6 — Exclude the render-profile package
 
@@ -337,9 +344,11 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 - [ ] `TemplateMeta.ActionContract == nil` for V4; V1–V3 contracts unchanged.
 - [ ] Every rendered `Action.ToggleVisibility` target resolves to an element id present in the same frame,
   for every state and for phase counts 1…6 (covering the `${$index}` expansion).
-- [ ] `active`/`error` reports exactly match rendered actions; `result` has no report document and its
-  `octo/v1` frame still rejects an injected `Action.Submit` at `cardmsg.Validate` even with a matching
-  golden (mutation test, per #681).
+- [ ] `active`/`error` reports declare no index-suffixed id, and every id they do declare is present in
+  every state that view serves at every phase count 1…6. (Revised during Verify: "exactly match rendered
+  actions" is unsatisfiable once toggle ids are `${$index}`-generated — see D5.)
+- [ ] `result` has no report document and its `octo/v1` frame still rejects an injected `Action.Submit` at
+  `cardmsg.Validate` even with a matching golden (mutation test, per #681).
 
 ### E. Registry, Bot, and runtime catalog
 

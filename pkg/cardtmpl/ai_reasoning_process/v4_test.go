@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -100,6 +101,11 @@ func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 		{"properties", "phases", "items", "properties", "actions", "maxItems"},
 		{"properties", "phases", "items", "properties", "actions", "items", "properties", "tool", "maxLength"},
 		{"properties", "phases", "items", "properties", "actions", "items", "properties", "detail", "maxLength"},
+		// D7 restored the ${statusGlyph} binding, so this bound is load-bearing
+		// again: the value now lands in TextBlock text, and a 2-rune cap is what
+		// keeps it too short to forge markdown.
+		{"properties", "phases", "items", "properties", "actions", "items", "properties", "statusGlyph", "maxLength"},
+		{"properties", "phases", "items", "properties", "actions", "items", "properties", "statusGlyph", "minLength"},
 	} {
 		key := strings.Join(path, ".")
 		want, ok := lookupPath(v3, path)
@@ -338,6 +344,156 @@ func TestSimplifiedSuccessorMatchesConsumerCompatibilityShape(t *testing.T) {
 	}
 	if meta.ActionContract != nil {
 		t.Fatalf("ActionContract = %+v, want nil", meta.ActionContract)
+	}
+}
+
+// V4's toggle ids are data-driven (`reasoning_tools_toggle_action_${$index}`),
+// so an interaction report can only honestly declare the actions that exist in
+// every frame. The engine never notices the difference — assertInteractionReport
+// compares Action.Submit and Input ids only, and the Bot capability skips
+// non-Submit entries — so an indexed id in the report would be a published lie
+// that no gate catches. Assert both halves: nothing index-suffixed is declared,
+// and everything declared really is present in every state.
+func TestSimplifiedSuccessorReportDeclaresOnlyDataIndependentActions(t *testing.T) {
+	reg := newRegistry(t)
+	tmpl, err := reg.Lookup(aireasoningprocess.TemplateID, reasoningVersionV4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := tmpl.Meta()
+
+	indexed := regexp.MustCompile(`_\d+$`)
+	viewStates := map[cardtmpl.ViewKey][]string{
+		"active": {"reasoning", "answering"},
+		"error":  {"error"},
+	}
+	for view, states := range viewStates {
+		report, ok := meta.Interaction(view)
+		if !ok {
+			t.Fatalf("interaction report missing for %s", view)
+		}
+		if len(report.Inputs) != 0 {
+			t.Fatalf("%s declares inputs %+v, want none", view, report.Inputs)
+		}
+		if len(report.Actions) == 0 {
+			t.Fatalf("%s declares no actions", view)
+		}
+		for _, action := range report.Actions {
+			if indexed.MatchString(action.ID) {
+				t.Fatalf("%s declares data-driven id %q; a report cannot enumerate per-phase toggles",
+					view, action.ID)
+			}
+		}
+
+		// Every declared id must appear in every state this view serves, at every
+		// phase count the schema admits.
+		for _, state := range states {
+			for phases := 1; phases <= 6; phases++ {
+				data := readSampleMap(t, reasoningRootV4, "reasoning")
+				data["state"] = state
+				data["errorTitle"] = "Generation failed"
+				data["errorMessage"] = "upstream timed out"
+				counts := make([]int, phases)
+				for i := range counts {
+					counts[i] = 1
+				}
+				data["phases"] = phasesWithActionCounts(counts...)
+
+				raw, err := json.Marshal(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+					reasoningVersionV4, cardtmpl.State(state), raw,
+					cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rendered []map[string]any
+				collectActions(payload, &rendered)
+				present := make(map[string]struct{}, len(rendered))
+				for _, action := range rendered {
+					if id, _ := action["id"].(string); id != "" {
+						present[id] = struct{}{}
+					}
+				}
+				for _, action := range report.Actions {
+					if _, ok := present[action.ID]; !ok {
+						t.Fatalf("%s report declares %q, absent from %s with %d phase(s)",
+							view, action.ID, state, phases)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Acceptance B3: the runtime publish path applies RequireOwner /
+// RequireProtocol / RequireBoundedSchema, all of which static registration
+// skips. Compiling under both profiles is what proves the manifest and schema
+// corrections actually landed, rather than only satisfying the laxer path.
+func TestSimplifiedSuccessorCompilesUnderRuntimePublishLimits(t *testing.T) {
+	bundle, err := cardtmpl.LoadJSONBundle(aireasoningprocess.Assets, reasoningRootV4,
+		cardtmpl.CatalogDescriptor{
+			Engine:     cardtmpl.JSONTemplateEngineV1,
+			Visibility: cardtmpl.CatalogVisibilityPublic,
+		})
+	if err != nil {
+		t.Fatalf("LoadJSONBundle: %v", err)
+	}
+	artifact, err := cardtmpl.CompileJSONArtifact(context.Background(), bundle, cardtmpl.DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("compile under DefaultCompileLimits: %v", err)
+	}
+	if artifact.Owner != "ai" {
+		t.Fatalf("compiled owner = %q, want ai", artifact.Owner)
+	}
+	if artifact.ContractVersion != "1.2.0" {
+		t.Fatalf("compiled contractVersion = %q, want 1.2.0", artifact.ContractVersion)
+	}
+}
+
+// Acceptance D1: the frozen-out controls must not reappear anywhere in the
+// shipped artifact or in a rendered frame.
+func TestSimplifiedSuccessorCarriesNoLegacyControlVocabulary(t *testing.T) {
+	forbidden := []string{
+		"Action.Submit", "reasoning_stop", "reasoning_retry",
+		"stop_reasoning", "retry_reasoning", "可以重试", "phaseState",
+	}
+	for _, relative := range []string{
+		"templates/active.template.json", "templates/result.template.json",
+		"templates/error.template.json",
+		"reports/active.interaction.json", "reports/error.interaction.json",
+		"contract/data.schema.json",
+		"goldens/reasoning.card.json", "goldens/answering.card.json",
+		"goldens/completed.card.json", "goldens/stopped.card.json",
+		"goldens/error.card.json",
+	} {
+		content := string(readAsset(t, reasoningRootV4+"/"+relative))
+		for _, needle := range forbidden {
+			if strings.Contains(content, needle) {
+				t.Fatalf("%s contains %q", relative, needle)
+			}
+		}
+	}
+
+	reg := newRegistry(t)
+	for _, tc := range reasoningStates {
+		payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+			reasoningVersionV4, tc.state, readSample(t, reasoningRootV4, string(tc.state)),
+			cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, needle := range forbidden {
+			if strings.Contains(string(encoded), needle) {
+				t.Fatalf("rendered %s frame contains %q", tc.state, needle)
+			}
+		}
 	}
 }
 
