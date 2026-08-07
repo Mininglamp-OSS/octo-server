@@ -184,7 +184,7 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 		"status": common.ScanLoginStatusScanned,
 		"uid":    loginUID,
 	})
-	err = q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), time.Minute*5)
+	err = q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), user.ScanLoginConfirmWindow)
 	if err != nil {
 		q.Error("设置扫描登录二维码信息失败", zap.Error(err))
 		return nil, fmt.Errorf("%w: scan login state", errQRCodeInternalStoreFailed)

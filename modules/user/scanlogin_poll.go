@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"go.uber.org/zap"
 )
@@ -46,15 +47,24 @@ const scanLoginPollSecretQuery = "poll_secret"
 // authCode 续期（见 P1-3），而 qrcode 已经 import user，反向 import 会成环。
 const ScanLoginAuthCodeTTL = 5 * time.Minute
 
+// ScanLoginConfirmWindow 是「二维码已被扫描 / 已授权」状态的存活时间，也就是用户可以
+// 停在确认页、以及浏览器完成兑换的时间上限。
+//
+// 单独命名而不是继续散落 time.Minute*5：scanLoginPollSecretTTL 的推导把这个量当作
+// 一个三项累加里的两项在用，写成字面量就意味着注释里的算术、守卫测试里的建模、以及
+// 代码实际行为是三份互不相干的东西。两个写入方（modules/qrcode.handleScanLogin 与
+// grantLogin）现在都引用它。
+const ScanLoginConfirmWindow = 5 * time.Minute
+
 // scanLoginPollSecretTTL 是轮询密钥的存活时间。
 //
 // 必须覆盖「二维码状态还可能被读到」的最坏路径，否则用户扫得晚一点就会拿不到
 // auth_code。该路径是三段累加：
 //
 //	mint 后 60s 内扫码（getLoginUUID 写 qrcode:{uuid} 的初始 TTL）
-//	+ 300s   （handleScanLogin 把 qrcode 续到 5min，用户在确认页停顿的上限）
-//	+ 300s   （grantLogin 确认后再续 5min，浏览器兑换前的窗口）
-//	= 660s
+//	+ ScanLoginConfirmWindow（handleScanLogin 续期，用户停在确认页的上限）
+//	+ ScanLoginConfirmWindow（grantLogin 确认后再续，浏览器兑换前的窗口）
+//	= 60s + 2×5min = 660s
 //
 // 取 12 分钟给 60s 余量，避免 Redis 与应用间的时钟漂移或调用延迟正好卡在边界上把
 // 已扫码的用户甩掉。
@@ -74,11 +84,18 @@ const scanLoginPollSecretTTL = 12 * time.Minute
 //
 // 卡死的后果是「一层楼扫不了码」，比放过一些扫描流量严重得多。全局 RateLimitMiddleware
 // （1000 req/min/IP）仍在外层兜底。大规模 NAT 部署可直接上调。
+//
+// 档位刻意留一个数量级的余量，而不是贴着上面那笔估算走：初版取 120/600，正好是估算值
+// 的 83%/100% —— 讲着「要留余量」却没留。100 人同时打开登录页（重启后、上班高峰）会
+// 直接吃满 burst，而失败面是通用的 i18n rate.limited，运维根本归因不到这两个桶。
+//
+// 更贴切的建模其实是并发上限而非请求速率（loginstatus 是 10s 长轮询，一个请求占的是
+// 连接而不是一次调用），但那要换一套中间件；在此之前用宽档位换「绝不误伤」。
 const (
-	defaultScanLoginUUIDRateLimitRPS     = 120.0 / 60 // 120 req/min
-	defaultScanLoginUUIDRateLimitBurst   = 60
-	defaultScanLoginStatusRateLimitRPS   = 600.0 / 60 // 600 req/min
-	defaultScanLoginStatusRateLimitBurst = 300
+	defaultScanLoginUUIDRateLimitRPS     = 1200.0 / 60 // 1200 req/min
+	defaultScanLoginUUIDRateLimitBurst   = 600
+	defaultScanLoginStatusRateLimitRPS   = 6000.0 / 60 // 6000 req/min
+	defaultScanLoginStatusRateLimitBurst = 3000
 )
 
 // scanLoginPublicDataKeys 是 qrcode:{uuid} 状态里允许回给**任意**匿名轮询方的键。
@@ -201,4 +218,27 @@ func (u *User) deleteScanLoginPollSecret(uuid string) {
 		// 清理失败不该让登录失败：密钥仍会按 TTL 自然过期。
 		u.Warn("清理扫码轮询密钥失败", zap.String("uuid", uuid), zap.Error(err))
 	}
+}
+
+// ensureScanLoginStatus 保证下发给未授权轮询方的 payload 里一定有 status。
+//
+// 白名单的默认行为是「新字段不下发」，这对凭据是对的、对 status 是错的：一旦过滤后
+// 的 map 里没有 status（Data 为 nil，或将来某个写入方构造出一份键全被丢掉的 payload），
+// 前端拿到的 result.status 是 undefined → loginStatus 变 undefined → 状态机匹配不到
+// 任何分支 → 轮询永久停摆。这正是 respondStatus 当初要消除的故障。
+//
+// 回落顺序：过滤结果里的 status → 原始 Data 里的 status → expired。
+func ensureScanLoginStatus(filtered map[string]interface{}, original map[string]interface{}) map[string]interface{} {
+	if filtered == nil {
+		filtered = map[string]interface{}{}
+	}
+	if _, ok := filtered["status"]; ok {
+		return filtered
+	}
+	if v, ok := original["status"]; ok {
+		filtered["status"] = v
+		return filtered
+	}
+	filtered["status"] = common.ScanLoginStatusExpired
+	return filtered
 }

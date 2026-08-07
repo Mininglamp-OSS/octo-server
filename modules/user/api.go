@@ -64,9 +64,12 @@ var (
 
 // qrcodeChanMap stores channels for QR code login long-polling.
 // Concurrency safety is ensured by qrcodeChanLock:
-// - SendQRCodeInfo: holds lock during both map read AND channel send (no TOCTOU)
-// - removeQRCodeChan: holds lock during map delete AND channel close
-// - getQRCodeModelChan: holds lock during map write
+//   - SendQRCodeInfo: holds lock during both map read AND channel send (no TOCTOU)
+//   - removeQRCodeChanOwned: holds lock during map delete AND channel close, and
+//     only acts when the registered channel is still the caller's own — that
+//     ownership check is what makes a cross-request close impossible
+//   - getQRCodeModelChan: holds lock during map write
+//
 // The channel is buffered (size 1) to prevent message loss between
 // getQRCodeModelChan return and the caller's select/receive.
 // See: #294, #345 for race condition fixes.
@@ -2129,6 +2132,15 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// 在进入长轮询前一次性定下，避免 select 的多个出口重复查询。
 	authorized := u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))
 	respondStatus := func(model *common.QRCodeModel) {
+		// 这个响应在授权分支上携带 auth_code / uid / encrypt。没有显式新鲜度信息的
+		// 200 GET 是可被启发式缓存的（RFC 9111 §4.2.2），而同文件的头像路由就故意下发
+		// Cache-Control: public, max-age=86400 —— 说明这个源站前面本来就预期有缓存。
+		// 无条件 no-store：凭据响应不该被任何中间层留存。
+		//
+		// 顺带说明为什么没有 Vary：密钥现在走 query，已经进了缓存键，所以「不带密钥的
+		// 请求命中带密钥的缓存条目」这条路本身不成立。若将来改回请求头通道，必须同时
+		// 加上 Vary，否则两种请求的 URL 完全相同、缓存无从区分。
+		c.Header("Cache-Control", "no-store")
 		if model == nil {
 			// channel 被同 uuid 的另一个请求关掉时会收到 nil。此处必须仍然写出响应：
 			// 上一版直接 return，gin 会发一个零长度的 200，前端 result.status 变成
@@ -2141,7 +2153,7 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 			return
 		}
 		if !authorized {
-			c.JSON(http.StatusOK, filterScanLoginPublicFields(model.Data))
+			c.JSON(http.StatusOK, ensureScanLoginStatus(filterScanLoginPublicFields(model.Data), model.Data))
 			return
 		}
 		c.JSON(http.StatusOK, model.Data)
@@ -2498,7 +2510,7 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 		"auth_code": authCode,
 		"encrypt":   encrypt,
 	})
-	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginAuthCodeTTL)
+	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginConfirmWindow)
 	if err != nil {
 		u.Error("更新二维码信息失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)

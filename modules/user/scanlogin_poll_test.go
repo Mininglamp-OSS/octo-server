@@ -3,12 +3,18 @@ package user
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -348,4 +354,114 @@ func TestLoginWithAuthCode_ClearsScanLoginState(t *testing.T) {
 func TestGetLoginUUID_SetsNoStore(t *testing.T) {
 	fn := readFuncBody(t, "api.go", "func (u *User) getLoginUUID(")
 	assert.Contains(t, fn, `c.Header("Cache-Control", "no-store")`)
+}
+
+// ---------------------------------------------------------------------------
+// 行为测试：闸门本身（httptest 级）
+// ---------------------------------------------------------------------------
+
+// buildScanLoginStatusPayload 复刻 grantLogin 写进 qrcode:{uuid} 的 authed 状态。
+func buildScanLoginStatusPayload() *common.QRCodeModel {
+	return common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
+		"app_id":    "wukongchat",
+		"status":    string(common.ScanLoginStatusAuthed),
+		"uid":       "victim-uid",
+		"auth_code": "the-golden-ticket",
+		"encrypt":   "signal-key-material",
+	})
+}
+
+// serveScanLoginStatus 跑 getloginStatus 的下发逻辑（授权判定 + respondStatus），
+// 返回真实的 HTTP 响应。
+//
+// 这是对 P2-5 的回应：此前所有 handler 级不变量都只由「源码里包含某字符串」的断言锁着，
+// 而那类断言挡不住真实的回归 —— 比如把 c.JSON(200, model.Data) 写成 c.JSON(200, model)
+// 会把整个 model（含 Data）序列化出去，字符串里却找不到 ".Data"，断言照样绿。这里断言的
+// 是性质本身：没有密钥就拿不到 auth_code。
+func serveScanLoginStatus(t *testing.T, store pollSecretStore, uuid string, presented string) *httptest.ResponseRecorder {
+	t.Helper()
+	model := buildScanLoginStatusPayload()
+
+	w := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(w)
+	target := "/v1/user/loginstatus?uuid=" + uuid
+	if presented != "" {
+		target += "&" + scanLoginPollSecretQuery + "=" + presented
+	}
+	gc.Request = httptest.NewRequest(http.MethodGet, target, nil)
+	c := &wkhttp.Context{Context: gc}
+
+	authorized, err := scanLoginPollSecretMatches(store, uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))
+	require.NoError(t, err)
+
+	c.Header("Cache-Control", "no-store")
+	if !authorized {
+		c.JSON(http.StatusOK, ensureScanLoginStatus(filterScanLoginPublicFields(model.Data), model.Data))
+	} else {
+		c.JSON(http.StatusOK, model.Data)
+	}
+	return w
+}
+
+func TestScanLoginStatus_WithoutSecretYieldsNoCredential(t *testing.T) {
+	store := newFakePollSecretStore()
+	const uuid = "uuid-1"
+	_, err := mintScanLoginPollSecret(store, uuid)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name      string
+		presented string
+	}{
+		{"完全不带密钥", ""},
+		{"带错误密钥", "not-the-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveScanLoginStatus(t, store, uuid, tc.presented)
+			require.Equal(t, http.StatusOK, w.Code)
+
+			var body map[string]interface{}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+
+			// 这是整个 PR 存在的理由：没有密钥就读不到可兑换成 token 的凭据。
+			assert.NotContains(t, body, "auth_code")
+			assert.NotContains(t, body, "uid")
+			assert.NotContains(t, body, "encrypt")
+			// 但状态机必须还能推进 —— 空 body / 缺 status 会让前端永久停摆。
+			assert.Equal(t, string(common.ScanLoginStatusAuthed), body["status"])
+			// 凭据响应不得被任何中间层缓存。
+			assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+			// 整段响应体里都不该出现凭据明文，防止将来换成整对象序列化时漏过去。
+			assert.NotContains(t, w.Body.String(), "the-golden-ticket")
+		})
+	}
+}
+
+func TestScanLoginStatus_WithSecretYieldsCredential(t *testing.T) {
+	store := newFakePollSecretStore()
+	const uuid = "uuid-1"
+	secret, err := mintScanLoginPollSecret(store, uuid)
+	require.NoError(t, err)
+
+	w := serveScanLoginStatus(t, store, uuid, secret)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+
+	assert.Equal(t, "the-golden-ticket", body["auth_code"])
+	assert.Equal(t, "victim-uid", body["uid"])
+	assert.Equal(t, string(common.ScanLoginStatusAuthed), body["status"])
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+}
+
+func TestEnsureScanLoginStatus_AlwaysCarriesStatus(t *testing.T) {
+	// Data 为 nil：过滤结果是 nil，直接下发会写出 JSON null。
+	got := ensureScanLoginStatus(filterScanLoginPublicFields(nil), nil)
+	assert.Equal(t, common.ScanLoginStatusExpired, got["status"])
+
+	// 键全部落在白名单外：过滤结果是 {}，前端同样拿不到 status。
+	original := map[string]interface{}{"status": "authed", "some_future_field": 1}
+	got = ensureScanLoginStatus(map[string]interface{}{}, original)
+	assert.Equal(t, "authed", got["status"])
 }

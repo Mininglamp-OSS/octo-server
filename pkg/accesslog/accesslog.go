@@ -35,6 +35,44 @@ var webhookPushPrefixes = []string{
 	"/v1/webhooks/",
 }
 
+// secretQueryInPath masks the VALUE of credential-bearing query parameters.
+//
+// gin builds the logged path as `URL.Path + "?" + URL.RawQuery` (logger.go), so a
+// credential passed as a query parameter lands verbatim on the access-log line —
+// the same #246 concern that created this package, just via the query string
+// instead of a path segment.
+//
+//   - poll_secret: the scan-login poll credential. Holding it together with the
+//     `uuid` (also on that line) is exactly what lets a caller read `auth_code`
+//     out of GET /v1/user/loginstatus, so logging both defeats the gate for
+//     anyone with log read access. Valid for scanLoginPollSecretTTL (12 min).
+//
+// The value is everything up to the next separator; the parameter NAME is kept so
+// the line stays useful for correlation. Case-insensitive for the same reason as
+// ScrubPath — scrubbing is the security control, so it must survive casing
+// variants that a router would 404 but the logger would still print.
+var secretQueryInPath = regexp.MustCompile(`(?i)\b(poll_secret=)[^&\s?"']*`)
+
+// authCodeInPath masks the redeemable scan-login auth code, which travels as a
+// path segment.
+//
+// POST /v1/user/login_authcode/{code} exchanges {code} for a full user token
+// without checking who is redeeming. loginWithAuthCode deletes the code on
+// success, so a logged line for a successful redemption is already spent — but
+// the early returns for an IM failure or a destroyed account happen BEFORE that
+// delete, so a failed redemption leaves a still-valid code in the log for up to
+// ScanLoginAuthCodeTTL (5 min).
+var authCodeInPath = regexp.MustCompile(`(?i)(/v1/user/login_authcode/)[^/\s?"']+`)
+
+// scrubSecretPatterns applies the non-webhook maskers. Split out so both the
+// access-log path (ScrubPath) and the panic-dump path (scrubbingErrorWriter) run
+// the identical set — the two sinks drifting apart is how #246 happened twice.
+func scrubSecretPatterns(s string) string {
+	s = secretQueryInPath.ReplaceAllString(s, "${1}"+maskedToken)
+	s = authCodeInPath.ReplaceAllString(s, "${1}"+maskedToken)
+	return s
+}
+
 // ScrubPath masks secrets embedded in a request path before it is logged.
 //
 // It targets the incoming-webhook push routes
@@ -62,11 +100,11 @@ func ScrubPath(path string) string {
 		// mask.
 		slash := strings.IndexByte(rest, '/')
 		if slash < 0 {
-			return path
+			return scrubSecretPatterns(path)
 		}
-		return path[:len(prefix)] + rest[:slash] + "/" + maskedToken
+		return scrubSecretPatterns(path[:len(prefix)] + rest[:slash] + "/" + maskedToken)
 	}
-	return path
+	return scrubSecretPatterns(path)
 }
 
 // tokenInText matches a webhook push path embedded anywhere in free-form log
@@ -105,6 +143,11 @@ func NewErrorWriter(w io.Writer) io.Writer { return scrubbingErrorWriter{w: w} }
 // possibility, buffer until newline here.
 func (s scrubbingErrorWriter) Write(p []byte) (int, error) {
 	scrubbed := tokenInText.ReplaceAll(p, []byte("${1}***"))
+	// Same maskers the access-log line gets. The panic dump embeds the full
+	// request line, so a poll_secret query or an auth-code path segment reaches
+	// this sink too — and it is the sink that persists on failure, which is
+	// exactly when a credential is most likely still live.
+	scrubbed = []byte(scrubSecretPatterns(string(scrubbed)))
 	if _, err := s.w.Write(scrubbed); err != nil {
 		return 0, err
 	}
