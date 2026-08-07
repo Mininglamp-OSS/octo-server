@@ -80,9 +80,10 @@ func TestSimplifiedSuccessorShipsNoUnconsumedAssets(t *testing.T) {
 	}
 }
 
-// D3: the bounded contract from #667 survives verbatim. Asserted bound-by-bound
-// against the frozen V3 schema rather than by file comparison, because the two
-// legitimately differ in `required`, descriptions, and examples.
+// D3: the bounded contract from #667 survives verbatim, with one deliberate
+// relaxation (thought, see D3a). Asserted bound-by-bound against the frozen V3
+// schema rather than by file comparison, because the two legitimately differ in
+// `required`, descriptions, and examples.
 func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 	v3 := readAssetMap(t, reasoningRootV3+"/contract/data.schema.json")
 	v4 := readAssetMap(t, reasoningRootV4+"/contract/data.schema.json")
@@ -97,7 +98,6 @@ func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 		{"properties", "errorTitle", "maxLength"},
 		{"properties", "errorMessage", "maxLength"},
 		{"properties", "phases", "maxItems"},
-		{"properties", "phases", "items", "properties", "thought", "maxLength"},
 		{"properties", "phases", "items", "properties", "actions", "maxItems"},
 		{"properties", "phases", "items", "properties", "actions", "items", "properties", "tool", "maxLength"},
 		{"properties", "phases", "items", "properties", "actions", "items", "properties", "detail", "maxLength"},
@@ -131,6 +131,71 @@ func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 		if _, exists := properties["phaseState"]; exists {
 			t.Fatal("V4 schema must not carry phaseState")
 		}
+	}
+}
+
+// D3a: `thought` is the one bound V4 deliberately widens. V2/V3 pinned it to the
+// producer's observed output (280 + `…` = 281); V4 sets a platform product cap
+// instead. Assert the exact new value and the direction — a future edit that
+// narrows it below V3, or that quietly drops the bound entirely, is a contract
+// regression the fail-close publish path would otherwise be the only thing to
+// notice.
+func TestSimplifiedSuccessorWidensThoughtBound(t *testing.T) {
+	thoughtPath := []string{"properties", "phases", "items", "properties", "thought"}
+	v3, _ := lookupPath(readAssetMap(t, reasoningRootV3+"/contract/data.schema.json"), thoughtPath)
+	v4, _ := lookupPath(readAssetMap(t, reasoningRootV4+"/contract/data.schema.json"), thoughtPath)
+	v3Spec, _ := v3.(map[string]any)
+	v4Spec, _ := v4.(map[string]any)
+	if v3Spec == nil || v4Spec == nil {
+		t.Fatal("thought missing from V3 or V4 schema")
+	}
+
+	v3Max, v4Max := jsonNumber(t, v3Spec["maxLength"]), jsonNumber(t, v4Spec["maxLength"])
+	if want := reasoningThoughtMax(reasoningVersionV4); v4Max != want {
+		t.Fatalf("V4 thought maxLength = %d, want %d", v4Max, want)
+	}
+	if v3Max != reasoningThoughtMax(reasoningVersionV3) {
+		t.Fatalf("V3 thought maxLength = %d, want it frozen at %d",
+			v3Max, reasoningThoughtMax(reasoningVersionV3))
+	}
+	if v4Max <= v3Max {
+		t.Fatalf("V4 thought maxLength = %d must be a widening of V3's %d", v4Max, v3Max)
+	}
+	// Still bounded: an unbounded string fails DefaultCompileLimits' fail-close
+	// publish path, and trust-boundary requires an explicit ceiling.
+	if v4Spec["minLength"] == nil || v4Spec["maxLength"] == nil {
+		t.Fatal("thought must stay explicitly bounded on both ends")
+	}
+
+	// The widened ceiling must actually render at the worst case, not just
+	// validate: 6 phases each carrying a max-length thought.
+	reg := newRegistry(t)
+	for _, tc := range reasoningStates {
+		data := readSampleMap(t, reasoningRootV4, "reasoning")
+		data["state"] = string(tc.state)
+		data["errorTitle"] = "Generation failed"
+		data["errorMessage"] = "upstream timed out"
+		data["phases"] = worstCasePhases(v4Max)
+		if err := renderData(reg, reasoningVersionV4, tc.state, data); err != nil {
+			t.Fatalf("%s at the widened thought ceiling: %v", tc.state, err)
+		}
+	}
+}
+
+func jsonNumber(t *testing.T, raw any) int {
+	t.Helper()
+	switch value := raw.(type) {
+	case float64:
+		return int(value)
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			t.Fatalf("maxLength %v is not an integer: %v", raw, err)
+		}
+		return int(parsed)
+	default:
+		t.Fatalf("maxLength %v has unexpected type %T", raw, raw)
+		return 0
 	}
 }
 
@@ -253,7 +318,7 @@ func TestSimplifiedSuccessorNodeBudgetCeiling(t *testing.T) {
 			data["progressText"] = strings.Repeat("进", 160)
 			data["errorTitle"] = strings.Repeat("错", 64)
 			data["errorMessage"] = strings.Repeat("误", 121)
-			data["phases"] = worstCasePhases()
+			data["phases"] = worstCasePhases(reasoningThoughtMax(reasoningVersionV4))
 			if err := renderData(reg, reasoningVersionV4, tc.state, data); err != nil {
 				t.Fatalf("worst case admitted by the schema must render: %v", err)
 			}
@@ -494,6 +559,58 @@ func TestSimplifiedSuccessorCarriesNoLegacyControlVocabulary(t *testing.T) {
 				t.Fatalf("rendered %s frame contains %q", tc.state, needle)
 			}
 		}
+	}
+}
+
+// Acceptance D5: `result` is octo/v1 and ships no interaction report, so the
+// wire profile — not the golden — is what forbids Action.Submit there. Prove the
+// golden cannot launder a forged control: mutate the result template to carry a
+// Submit AND update the two result goldens to match it, so the golden gate would
+// pass. Compilation must still fail, because selfCheckCompiledJSON runs
+// cardmsg.Validate before checkArtifactGoldens is ever reached.
+func TestSimplifiedSuccessorResultFrameRejectsSubmitEvenWithMatchingGolden(t *testing.T) {
+	bundle, err := cardtmpl.LoadJSONBundle(aireasoningprocess.Assets, reasoningRootV4,
+		cardtmpl.CatalogDescriptor{
+			Engine:     cardtmpl.JSONTemplateEngineV1,
+			Visibility: cardtmpl.CatalogVisibilityPublic,
+		})
+	if err != nil {
+		t.Fatalf("LoadJSONBundle: %v", err)
+	}
+	const forged = `[{"type":"Action.Submit","id":"forged_submit","title":"probe"}]`
+	injectTopLevelActions := func(t *testing.T, doc json.RawMessage) json.RawMessage {
+		t.Helper()
+		var card map[string]any
+		if err := json.Unmarshal(doc, &card); err != nil {
+			t.Fatalf("unmarshal document: %v", err)
+		}
+		if _, exists := card["actions"]; exists {
+			t.Fatal("result frame already declares top-level actions; this probe assumes none")
+		}
+		card["actions"] = json.RawMessage(forged)
+		mutated, err := json.Marshal(card)
+		if err != nil {
+			t.Fatalf("marshal document: %v", err)
+		}
+		return mutated
+	}
+
+	bundle.Templates["result"] = injectTopLevelActions(t, bundle.Templates["result"])
+	for _, state := range []string{"completed", "stopped"} {
+		golden, ok := bundle.Goldens[state]
+		if !ok {
+			t.Fatalf("golden %q missing from bundle (keys drifted)", state)
+		}
+		bundle.Goldens[state] = injectTopLevelActions(t, golden)
+	}
+
+	if _, err := cardtmpl.CompileJSONArtifact(context.Background(), bundle,
+		cardtmpl.DefaultCompileLimits()); err == nil {
+		t.Fatal("octo/v1 result view accepted Action.Submit with a matching golden")
+	} else if got := err.Error(); !strings.Contains(got, "cardmsg.Validate") ||
+		!strings.Contains(got, "Action.Submit") || !strings.Contains(got, "octo/v1") {
+		t.Fatalf("error = %q, want an octo/v1 cardmsg profile rejection "+
+			"(a golden mismatch here would mean the frame check is not the guard)", got)
 	}
 }
 

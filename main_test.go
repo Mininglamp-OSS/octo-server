@@ -156,7 +156,7 @@ func TestAccessLogIgnorePathsIncludesProbeEndpoints(t *testing.T) {
 	require.Contains(t, paths, "/v1/ready")
 }
 
-func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV3Default(t *testing.T) {
+func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV4Default(t *testing.T) {
 	previousRegistry := cardtmpl.DefaultRegistry()
 	previousRegisterer := prometheus.DefaultRegisterer
 	previousGatherer := prometheus.DefaultGatherer
