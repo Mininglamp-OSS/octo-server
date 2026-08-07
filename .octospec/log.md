@@ -9,7 +9,7 @@ change-log convention (§7). Newest first.
 - **Task** — `scanlogin-poll-binding`: `loginstatus` no longer hands `auth_code`
   to any anonymous caller who knows the uuid. `loginuuid` mints a `poll_secret`
   (response body only, never in the QR payload) and `loginstatus` releases the
-  credential fields only to a caller presenting it via `X-Scan-Poll-Secret`;
+  credential fields only to a caller presenting it;
   everyone else gets the real status filtered through an allow-list. Both
   endpoints — unauthenticated by design, since the QR renders before any token
   exists — gained `StrictIPRateLimitMiddleware`; `auth_code` TTL 10min → 5min;
@@ -23,8 +23,10 @@ change-log convention (§7). Newest first.
   Tracked in octo-ios#71 / octo-android#116. Review also surfaced an auth-code
   expiry inversion that the TTL change had made reachable, a channel-displacement
   vector on the long poll, and post-login state (incl. Signal key material)
-  outliving the session — all fixed here. Needs octo-lib#116 for the header to
-  work cross-origin. See [journal](journal/shared/scanlogin-poll-binding.md).
+  outliving the session — all fixed here. The secret travels as a query
+  parameter; a custom header was tried and reverted — it breaks cross-origin
+  scan-login for a benefit that only holds against readers who already have
+  Redis access. See [journal](journal/shared/scanlogin-poll-binding.md).
 
 ## 2026-08-06 (bot-setting-store)
 

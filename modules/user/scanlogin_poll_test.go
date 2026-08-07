@@ -4,15 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -240,8 +236,8 @@ func TestGetLoginUUID_KeepsPollSecretOutOfQRCodePayload(t *testing.T) {
 func TestGetLoginStatus_DataOnlyLeavesThroughTheGate(t *testing.T) {
 	fn := readFuncBody(t, "api.go", "func (u *User) getloginStatus(")
 
-	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, scanLoginPresentedPollSecret(c))",
-		"轮询密钥必须经 scanLoginPresentedPollSecret 读取（请求头优先、query 兜底）")
+	// 凭据通道本身由 TestGetLoginStatus_ReadsSecretFromQuery 单独锁，这里只关心
+	// 「所有 Data 出口都过闸门」。
 	assert.Contains(t, fn, "filterScanLoginPublicFields(model.Data)")
 
 	closureStart := strings.Index(fn, "respondStatus := func(")
@@ -284,29 +280,21 @@ func TestScanLoginRoutesCarryStrictIPRateLimit(t *testing.T) {
 	assert.Contains(t, body, `"scanlogin_status"`)
 }
 
-// TestScanLoginPresentedPollSecret_PrefersHeaderFallsBackToQuery 锁住双通道取值：
-// 请求头优先（不进 access log），query 仅为跨源部署的过渡兜底 —— octo-lib 的 CORS
-// 白名单不含自定义头，跨源预检会把整个请求拒掉，连降级都轮不到。
-func TestScanLoginPresentedPollSecret_PrefersHeaderFallsBackToQuery(t *testing.T) {
-	newCtx := func(header string, query string) *wkhttp.Context {
-		u := "/v1/user/loginstatus?uuid=x"
-		if query != "" {
-			u += "&" + scanLoginPollSecretQuery + "=" + query
-		}
-		req := httptest.NewRequest(http.MethodGet, u, nil)
-		if header != "" {
-			req.Header.Set(ScanLoginPollSecretHeader, header)
-		}
-		gc, _ := gin.CreateTestContext(httptest.NewRecorder())
-		gc.Request = req
-		return &wkhttp.Context{Context: gc}
-	}
+// TestGetLoginStatus_ReadsSecretFromQuery 锁住凭据通道。
+//
+// 曾短暂改用自定义请求头 X-Scan-Poll-Secret 想让明文不进 access log，后来退回 query：
+// 自定义头会让轮询变成非简单请求，而 octo-lib 的 CORS 白名单写死且不含它、OPTIONS 又
+// 立即 abort —— 跨源预检拒掉的是**真正的请求**，Tauri/Electron 正式包扫码登录直接不可用。
+// 收益（挡住能读日志的运维，而这批人本来就有 Redis 权限）远不抵这个代价。
+func TestGetLoginStatus_ReadsSecretFromQuery(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) getloginStatus(")
 
-	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("h", "")), "只有头时取头")
-	assert.Equal(t, "q", scanLoginPresentedPollSecret(newCtx("", "q")), "只有 query 时回落")
-	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("h", "q")), "两者都有时头优先")
-	assert.Equal(t, "", scanLoginPresentedPollSecret(newCtx("", "")), "都没有时为空 → fail-closed")
-	assert.Equal(t, "h", scanLoginPresentedPollSecret(newCtx("  h  ", "")), "两端空白要裁掉")
+	assert.Contains(t, fn, `c.Query(scanLoginPollSecretQuery)`,
+		"密钥必须从 query 读取")
+	assert.NotContains(t, fn, "GetHeader",
+		"不要再引入自定义请求头 —— 跨源预检会拒掉整个请求，见常量注释")
+	assert.Equal(t, "poll_secret", scanLoginPollSecretQuery,
+		"参数名是对外契约，改动会打断已发布的客户端")
 }
 
 // TestGetLoginStatus_OnlyAuthorizedPollersRegisterAChannel 锁住 P2-1 的修复：

@@ -17,26 +17,24 @@ import (
 // 外部模块，加常量需要先发版；本 key 的生命周期完全由 modules/user 掌握。
 const scanLoginPollSecretPrefix = "scanlogin:poll:"
 
-// ScanLoginPollSecretHeader 是轮询方出示密钥的**首选**通道。
+// scanLoginPollSecretQuery 是轮询方出示密钥的 query 参数名。
 //
-// 走 header 而非 query：密钥明文若进 URL，会被 nginx/ingress access log、CDN/WAF 日志、
-// APM trace span 与浏览器历史逐字记录 —— 那正好抵消「Redis 只存摘要」想防的泄露面。
+// 曾经改成自定义请求头 X-Scan-Poll-Secret，想让明文不进 access log —— 后来退回来了。
+// 这里记下取舍，免得有人再走一遍：
 //
-// 注意 header 通道**目前只在同源部署可用**：octo-lib 的 CORSMiddleware
-// （pkg/wkhttp/http.go）把 Access-Control-Allow-Headers 写死成一份不含本头的清单，且对
-// OPTIONS 直接 AbortWithStatus(204)，headers 当场 flush —— octo-server 侧无论把中间件挂
-// 在它之前还是之后都改不动。自定义头会让轮询变成非简单请求，跨源浏览器预检被拒后**真正
-// 的 GET 根本发不出去**，连「剥字段降级」都轮不到。受影响的是 Tauri/Electron 正式包
-// （apps/web/src/apiURL.ts 对桌面端返回绝对地址直连），Web 走相对路径不受影响。
-const ScanLoginPollSecretHeader = "X-Scan-Poll-Secret"
-
-// scanLoginPollSecretQuery 是跨源客户端的**过渡**通道。
+// 收益侧很窄。能读 nginx/APM 日志的是运维，同一批人有 Redis 权限，可以直接
+// GET qrcode:{uuid} 读出 auth_code，甚至直接读 token 缓存 —— 自定义头挡不住任何一个
+// 本来就能轻易接管账号的人。而这枚密钥 12 分钟过期、兑换即吊销，且单独毫无用处
+// （必须有一个正在进行中的扫码流程同时存在）。
 //
-// 存在的唯一理由是上面那条 CORS 限制。它把明文放回 URL，因此劣于 header —— 但两害相权：
-// 桌面端要么用它、要么扫码登录完全不可用。
+// 成本侧却很实。自定义头会让轮询变成非简单请求，而 octo-lib 的 CORSMiddleware 把
+// Access-Control-Allow-Headers 写死、且对 OPTIONS 立即 AbortWithStatus(204) 并 flush
+// —— 下游无论把中间件挂在它之前还是之后都改不动。跨源预检被拒后**真正的 GET 根本发不
+// 出去**，Tauri/Electron 正式包（apps/web/src/apiURL.ts 走绝对地址）扫码登录直接不可用。
+// 要修就得 octo-lib 改白名单 → 发版 → 本仓 bump 依赖，再加一套 header/query 双通道过渡。
 //
-// SUNSET：octo-lib 把 X-Scan-Poll-Secret 加进 Access-Control-Allow-Headers 并发版、
-// 本仓 bump 依赖之后，删掉这个 query 分支与 octo-web 侧对应的兜底。
+// 真要防日志泄露，正确的位置是日志层脱敏（nginx map 重写 $request、APM 的 URL
+// scrubbing），一次配置覆盖所有敏感 query 参数，而不是每加一个就动一次共享库的 CORS。
 const scanLoginPollSecretQuery = "poll_secret"
 
 // ScanLoginAuthCodeTTL 是扫码登录授权码的存活时间。

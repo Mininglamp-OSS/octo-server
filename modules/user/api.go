@@ -2087,18 +2087,6 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 	})
 }
 
-// scanLoginPresentedPollSecret 取出轮询方出示的密钥。
-//
-// header 优先、query 兜底：header 是首选通道（不进 access log），但 octo-lib 的
-// CORS 白名单目前不含它，跨源部署（Tauri/Electron 正式包）的预检会直接拒掉整个请求。
-// 见 ScanLoginPollSecretHeader / scanLoginPollSecretQuery 的注释与其中的 SUNSET 条件。
-func scanLoginPresentedPollSecret(c *wkhttp.Context) string {
-	if v := strings.TrimSpace(c.GetHeader(ScanLoginPollSecretHeader)); v != "" {
-		return v
-	}
-	return strings.TrimSpace(c.Query(scanLoginPollSecretQuery))
-}
-
 // 通过loginUUID获取登录状态
 //
 // 本接口按设计保持匿名可达（二维码在用户登录之前就要渲染，此时没有任何 token 可用），
@@ -2139,7 +2127,7 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// 授权判定放在所有早退分支之后：过期 / 未知 uuid 上面已经返回，不必为它们多花一次
 	// Redis 读 —— 本接口未认证，任何「无效输入也要付出后端开销」的路径都是放大器。
 	// 在进入长轮询前一次性定下，避免 select 的多个出口重复查询。
-	authorized := u.scanLoginPollSecretMatches(uuid, scanLoginPresentedPollSecret(c))
+	authorized := u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))
 	respondStatus := func(model *common.QRCodeModel) {
 		if model == nil {
 			// channel 被同 uuid 的另一个请求关掉时会收到 nil。此处必须仍然写出响应：

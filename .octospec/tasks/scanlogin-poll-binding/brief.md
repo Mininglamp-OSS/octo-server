@@ -118,9 +118,10 @@ source: self
 - [ ] `authcode` TTL = 5min（用户选择的保守值），扫码/授权后 `qrcode` TTL 维持 5min；
       `scanLoginPollSecretTTL` 严格大于最坏可读窗口 60s+5min+5min=660s 并留余量
 - [ ] `getloginStatus` 的 select 含 `c.Request.Context().Done()` 分支
-- [ ] `poll_secret` 首选经请求头 `X-Scan-Poll-Secret` 传递；跨源部署可退回 `poll_secret`
-      query（octo-lib CORS 白名单不含自定义头，跨源预检会拒掉整个请求 —— 见 octo-lib#116，
-      合并并 bump 依赖后删除 query 分支）
+- [ ] `poll_secret` 经 `poll_secret` query 参数传递。**不用自定义请求头**：那会让轮询
+      变成非简单请求，而 octo-lib 的 CORS 白名单写死且不含它、OPTIONS 又立即 abort，
+      跨源预检拒掉的是真正的 GET，桌面端扫码登录直接不可用；换来的只是「明文不进
+      access log」，而能读日志的运维本来就有 Redis 权限。日志泄露应在日志层脱敏解决
 - [ ] `grantLogin` 确认时按同一档位给 `authCode` 续期，杜绝「status=authed 但 auth_code
       已过期」的倒挂窗口
 - [ ] 未授权轮询方**不注册**长轮询 channel（否则可持续顶掉合法轮询方），但仍等满同样

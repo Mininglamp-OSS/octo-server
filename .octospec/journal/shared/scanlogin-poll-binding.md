@@ -52,16 +52,15 @@ octo-ios#71 / octo-android#116.
   `filterScanLoginPublicFields`. All of it is written against a small `pollSecretStore`
   interface so the gate is unit-testable without Redis.
 - `modules/user/api.go`: `getLoginUUID` mints the secret and sets `Cache-Control: no-store`;
-  `getloginStatus` resolves the secret through `scanLoginPresentedPollSecret` (header first,
-  query fallback) and routes every payload emission through one `respondStatus` gate, and
-  only registers a long-poll channel when authorized; `grantLogin` renews the auth code at
+  `getloginStatus` reads the secret from the `poll_secret` query parameter, routes every
+  payload emission through one `respondStatus` gate, and only registers a long-poll channel
+  when authorized; `grantLogin` renews the auth code at
   confirm time; `loginWithAuthCode` revokes the secret and deletes `qrcode:{uuid}`.
   Both routes carry `StrictIPRateLimitMiddleware`. `removeQRCodeChan` is gone.
 - `modules/qrcode/api.go`: auth-code TTL now `user.ScanLoginAuthCodeTTL` (5min).
 - `modules/user/swagger/api.yaml`: documents `poll_secret` and both credential channels.
-- octo-lib#116: registers `X-Scan-Poll-Secret` in the CORS allow-list.
-- octo-web `login_vm.tsx`: stores `poll_secret`, sends the header (plus a query copy when
-  the API base is cross-origin), and re-mints the QR when `auth_code` is withheld.
+- octo-web `login_vm.tsx`: stores `poll_secret`, replays it on every poll, and re-mints the
+  QR when `auth_code` is withheld.
 
 ## Load-bearing decisions
 
@@ -72,16 +71,20 @@ octo-ios#71 / octo-android#116.
   that may leave (`status`, `app_id`); everything else is dropped by default.
 - **The secret must never enter the qrcode payload**, which is exactly what
   `getloginStatus` echoes. Locked by a test that parses the `NewQRCodeModel(...)` literal.
-- **Header first, query only where the header cannot travel.** Plaintext in a URL is
-  written verbatim into nginx/CDN/WAF access logs, APM spans and browser history, which
-  would cancel out storing only a digest at rest. But a custom header makes the poll a
-  non-simple request, and octo-lib's `CORSMiddleware` hardcodes `Access-Control-Allow-Headers`
-  and aborts `OPTIONS` with 204 the moment it is set — headers are flushed, so no downstream
-  middleware can extend the list. A cross-origin preflight would reject the *real* request:
-  the Tauri/Electron desktop build (absolute API origin) would lose scan-login entirely, and
-  "degrade by stripping" cannot help because nothing reaches the handler. octo-lib#116 fixes
-  the list; until it ships, cross-origin clients send the secret in the query and the server
-  accepts either. Both sides carry a `SUNSET` comment naming the removal condition.
+- **Query parameter, not a custom header.** A first pass used `X-Scan-Poll-Secret` to keep
+  the plaintext out of access logs, and it was reverted. The benefit is narrow: whoever can
+  read nginx/APM logs is ops, and the same people hold Redis credentials — they can read
+  `auth_code` straight out of `qrcode:{uuid}`, so the header stops nobody who could not
+  already take over any account. The secret also expires in 12 minutes, is revoked on
+  redemption, and is useless without a scan flow running concurrently. The cost was real:
+  a custom header makes the poll a non-simple request, octo-lib's `CORSMiddleware` hardcodes
+  `Access-Control-Allow-Headers` and aborts `OPTIONS` the moment it sets them, so the
+  cross-origin preflight rejects the *actual* request and the Tauri/Electron desktop build
+  loses scan-login entirely — fixable only via an octo-lib release, a dependency bump, and a
+  dual-channel transition. If log exposure is worth addressing, the right place is log-layer
+  scrubbing (nginx `map` rewriting `$request`, APM URL scrubbing), which covers every
+  sensitive query parameter at once instead of amending a shared library's CORS list per
+  parameter.
 - **Renew the auth code at confirm, not just the QR state.** The code is minted at *scan*
   time and the user can sit on the confirm screen for its whole TTL. Refreshing only
   `qrcode:{uuid}` produced `status: authed` carrying a credential with a second left —

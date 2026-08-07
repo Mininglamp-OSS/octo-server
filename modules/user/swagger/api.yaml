@@ -2198,8 +2198,7 @@ paths:
         未出示 poll_secret 时仍返回真实 status，但 auth_code / uid / encrypt
         会被剥掉 —— 只有申请该二维码的调用方能拿到凭据字段。
 
-        密钥优先经 X-Scan-Poll-Secret 请求头出示（不进 access log）；跨源部署因
-        octo-lib CORS 白名单暂不含该头，可退回 poll_secret query 参数。
+        密钥经 poll_secret query 参数出示。
       operationId: "quit pc"
       consumes:
         - "application/json"
@@ -2211,16 +2210,11 @@ paths:
           required: true
           type: string
           description: "loginuuid 返回的 uuid"
-        - name: "X-Scan-Poll-Secret"
-          in: "header"
-          required: false
-          type: string
-          description: "loginuuid 返回的 poll_secret（首选通道）"
         - name: "poll_secret"
           in: "query"
           required: false
           type: string
-          description: "poll_secret 的跨源过渡通道，与请求头二选一；请求头优先"
+          description: "loginuuid 返回的 poll_secret；缺失时凭据字段会被剥离"
       responses:
         200:
           description: "返回"
