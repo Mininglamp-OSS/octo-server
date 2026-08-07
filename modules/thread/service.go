@@ -106,12 +106,14 @@ func NewService(ctx *config.Context) IService {
 
 // CreateThreadReq 创建子区请求
 type CreateThreadReq struct {
-	GroupNo              string
-	Name                 string
-	CreatorUID           string
-	CreatorName          string
-	SourceMessageID      *int64
-	SourceMessagePayload json.RawMessage // 源消息原始 payload，用于拷贝到子区
+	GroupNo         string
+	Name            string
+	CreatorUID      string
+	CreatorName     string
+	SourceMessageID *int64
+	// SourceMessagePayload 只表达「要不要拷贝源消息」。内容一律以服务端从消息行
+	// 读到的字节为准（见 CreateThread），这个字段不得流向任何被持久化的字段。
+	SourceMessagePayload json.RawMessage
 }
 
 // ThreadResp 子区响应
@@ -339,6 +341,12 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
 	// thread ext 行已 commit）。
+	//
+	// copiedPayload 是实际拷进子区的服务端字节；为空表示这次没有拷贝。父群通知的
+	// message_count 与 last_message 预览都由它派生，不能再用请求里的字段：自从内容
+	// 改从数据库读，「请求带了 payload」与「确实拷贝成功了」就是两个不同的判断，
+	// 源行缺失时父群会宣告一条子区里并不存在的首条消息，且之后没有事件纠正。
+	var copiedPayload json.RawMessage
 	if req.SourceMessageID != nil && len(req.SourceMessagePayload) > 0 {
 		// 发送者和内容都从消息表取同一行，防止客户端伪造。
 		//
@@ -348,10 +356,12 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		// 标记，action 路径把它们当作可信的 producer 身份读取，而这条拷贝路径不经过
 		// cardmsg.Validate，也不在拒绝这两个 key 的四个 ingress 之列。
 		//
-		// 不改成"按 key 拒绝"（其余 ingress 的做法）是因为那会打断合法场景：客户端
+		// 不改成「按 key 拒绝」（其余 ingress 的做法）是因为那会打断合法场景：客户端
 		// 手里的卡片本来就带标记（服务端发给它的），回传创建子区会被拒。用服务端
-		// 自己的字节则两全 —— 合法拷贝照常工作，且 source_message_payload 整个退出
-		// 信任边界，只剩"是否要拷贝"这一个语义。
+		// 自己的字节则两全 —— 合法拷贝照常工作。
+		//
+		// req.SourceMessagePayload 因此只剩「要不要拷贝」这一个语义，内容一律以服务端
+		// 读到的为准；它不得再流向任何被持久化的字段。
 		sourceFromUID, sourcePayload, err := s.db.QueryMessageSource(req.GroupNo, *req.SourceMessageID)
 		if err != nil {
 			s.Warn("查询源消息失败，跳过拷贝",
@@ -365,11 +375,12 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				sourceFromUID = req.CreatorUID
 			}
 			s.sendSourceMessage(channelID, sourceFromUID, sourcePayload)
+			copiedPayload = sourcePayload
 		}
 	}
 
 	// 在父群发送子区创建消息（同样在 fanout 之后；与 sendSourceMessage 同序约束）。
-	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, req.SourceMessagePayload)
+	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, copiedPayload)
 
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
@@ -447,6 +458,8 @@ func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName
 		payload["source_message_id"] = *sourceMessageID
 	}
 
+	// sourcePayload 是实际拷贝进子区的服务端字节（未拷贝时为空），不是请求字段：
+	// 计数与预览必须描述子区里真实存在的东西。
 	var messageCount int64
 	if len(sourcePayload) > 0 {
 		messageCount = 1
