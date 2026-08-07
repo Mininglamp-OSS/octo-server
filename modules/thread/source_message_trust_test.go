@@ -6,147 +6,65 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-
-	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 )
 
-// PR-C review rounds 9–11 (yujiawei): the thread source-message copy writes a
-// persisted message from bytes that arrived from outside, so it is a boundary
-// for the server-only catalog markers, and it took three attempts to place the
-// enforcement correctly. The two rejected shapes are recorded here because each
-// was defensible in isolation and wrong in consequence.
+// PR-C review rounds 9–12 (yujiawei, Jerry-Xin): the thread source-message copy
+// persists caller-supplied JSON under the *source message's* sender, and the id
+// and the payload are never checked against each other. Three enforcement
+// shapes were tried before this one, and the first two were each correct about
+// the property they targeted while the next consequence went un-enumerated.
 //
-//   - Copy the caller's payload verbatim (original). Any active group member
-//     could persist a message whose from_uid is a real bot's and whose
-//     top-level template_ref / catalog_provenance they wrote, which the action
-//     path then reads as trusted producer identity.
-//   - Substitute the server's stored bytes (round 10). That closed forgery and
-//     opened something worse: message_id became an unchecked read credential.
-//     A single-message read applies five gates — visibles, revoke/is_deleted,
-//     per-user deletion, both history offsets, Expire — and a bare
-//     SELECT payload applies none, so a member could have the server
-//     re-publish a revoked message's unredacted body (redaction happens in the
-//     response layer, not in storage) under its original sender, into a channel
-//     the whole group is subscribed to.
-//   - Strip the two keys from the caller's payload (now). The property needed
-//     is "these keys cannot arrive from outside", and stripping is the minimal
-//     enforcement of exactly that: the caller can only supply bytes they
-//     already hold, so no authorization surface is required, and the result is
-//     a legal unmarked frame — which is what a copy should be, since it never
-//     passed the rendering boundary that authored the original.
-func TestSourceMessageCopyStripsServerOnlyMarkers(t *testing.T) {
-	marked := []byte(`{"type":17,"card_version":"1.5","profile":"octo/v2",` +
-		`"template_ref":{"id":"docs.access-request","version":"0.3.0"},` +
-		`"catalog_provenance":{"version":1,"principal_type":"internal_producer",` +
-		`"principal_id":"docs-notify","space_id":"space-1"},` +
-		`"card":{"type":"AdaptiveCard","body":[]}}`)
-
-	stripped, err := cardmsg.StripCatalogMarkers(marked)
-	if err != nil {
-		t.Fatalf("StripCatalogMarkers: %v", err)
-	}
-	var decoded map[string]interface{}
-	if err := json.Unmarshal(stripped, &decoded); err != nil {
-		t.Fatalf("stripped payload is not valid JSON: %v", err)
-	}
-	if _, present := decoded[cardmsg.CatalogTemplateRefKey]; present {
-		t.Fatal("template_ref survived the strip")
-	}
-	if _, present := decoded[cardmsg.CatalogProvenanceKey]; present {
-		t.Fatal("catalog_provenance survived the strip")
-	}
-	// Everything else is the caller's own content and must be preserved — the
-	// legitimate case is a client echoing back a card it was really sent.
-	if decoded["type"] != float64(17) || decoded["profile"] != "octo/v2" {
-		t.Fatalf("the strip damaged the caller's frame: %+v", decoded)
-	}
-	if _, present := decoded["card"]; !present {
-		t.Fatal("the strip dropped the card body")
-	}
-
-	t.Run("an unmarked payload is returned byte-identical", func(t *testing.T) {
-		plain := []byte(`{"type":1,"content":"你好"}`)
-		out, err := cardmsg.StripCatalogMarkers(plain)
-		if err != nil {
-			t.Fatalf("StripCatalogMarkers: %v", err)
-		}
-		if string(out) != string(plain) {
-			t.Fatalf("an unmarked payload was rewritten: %s", out)
-		}
-	})
-
-	t.Run("a non-object payload is passed through", func(t *testing.T) {
-		for _, raw := range []string{`"just a string"`, `[1,2,3]`, `not json at all`} {
-			out, err := cardmsg.StripCatalogMarkers([]byte(raw))
-			if err != nil {
-				t.Fatalf("StripCatalogMarkers(%s): %v", raw, err)
-			}
-			if string(out) != raw {
-				t.Fatalf("payload %s was rewritten to %s", raw, out)
-			}
-		}
-	})
-}
-
-// The guard is over the boundary, not over one call site. Its first version
-// regexed sendSourceMessage only and was green while the same field still
-// reached sendThreadCreatedMessage and the persisted parent-group preview.
+//   - Copy the caller's bytes verbatim (original). Any group member could
+//     persist a message whose from_uid is a real bot's and whose top-level
+//     template_ref / catalog_provenance they wrote.
+//   - Substitute the server's stored bytes (round 10). Closed forgery, opened
+//     an unchecked read: a single-message read applies five gates — visibles,
+//     revoke/is_deleted, per-user deletion, both history offsets, Expire — and
+//     a bare SELECT payload by id applies none, so a member could have the
+//     server re-publish a revoked message's unredacted body under its original
+//     sender into a channel the whole group is subscribed to.
+//   - Strip the two top-level keys (round 11). Narrowed forgery without closing
+//     it. The identity the action route actually falls back to is
+//     card.metadata.octo.template, which lives *inside* the card body the
+//     caller controls. A markerless frame naming a frozen-known template takes
+//     the legacy-compatible branch, and static ActionContext does not authorize
+//     the principal — so a forged card plus chosen Action.Submit data is
+//     accepted as a trusted bot card, bypassing the "users cannot send cards"
+//     ban entirely.
 //
-// What must hold now: the copy path never passes req.SourceMessagePayload on
-// without stripping it, and it does not read message content out of the message
-// table by id.
-func TestSourceMessageCopyEnforcesTheBoundaryInSource(t *testing.T) {
+// Refusing type-17 outright is what closes it. It matches the user ingress in
+// modules/message/api.go, where card rejection is absolute — independent of
+// channel type and friendship, and taken before any DB work. The cost is that a
+// thread created from a card message has no first message; that is deliberate.
+func TestSourceMessageCopyRefusesCards(t *testing.T) {
 	raw, err := os.ReadFile("service.go")
 	if err != nil {
 		t.Fatalf("read service.go: %v", err)
 	}
 	code := stripGoComments(string(raw))
 
-	if !strings.Contains(code, "cardmsg.StripCatalogMarkers(req.SourceMessagePayload)") {
-		t.Fatal("the caller's payload is no longer stripped before it is copied")
+	if !strings.Contains(code, "isCardSourcePayload(req.SourceMessagePayload)") {
+		t.Fatal("the copy path no longer refuses card payloads; stripping keys is not sufficient, " +
+			"because the identity the action route trusts lives inside the card body")
 	}
 
 	// Reading stored content by message id would reintroduce the round-10
-	// bypass: that read applies none of the five gates a single-message read
-	// applies, so it hands back revoked, deleted, visibles-excluded and
-	// pre-offset content on the strength of an id alone.
-	//
-	// The query lives in db.go, so this half of the guard has to read that file
-	// — the first version checked service.go only and was blind to the very
-	// mutation it names.
+	// bypass, which applies none of the five gates a single-message read does.
 	dbRaw, err := os.ReadFile("db.go")
 	if err != nil {
 		t.Fatalf("read db.go: %v", err)
 	}
-	dbCode := stripGoComments(string(dbRaw))
 	payloadRead := regexp.MustCompile(`Select\([^)]*"payload"`)
-	for _, line := range strings.Split(dbCode, "\n") {
+	for _, line := range strings.Split(stripGoComments(string(dbRaw)), "\n") {
 		if payloadRead.MatchString(line) {
 			t.Fatalf("the copy path reads message content out of the message table by id:\n  %s\n"+
-				"That bypasses visibles / revoke / per-user deletion / both history offsets / Expire, "+
-				"so a member can have the server re-publish content they may not read.",
+				"That bypasses visibles / revoke / per-user deletion / both history offsets / Expire.",
 				strings.TrimSpace(line))
 		}
 	}
-
-	declaration := regexp.MustCompile(`SourceMessagePayload\s+json\.RawMessage`)
-	stripCall := regexp.MustCompile(`StripCatalogMarkers\(req\.SourceMessagePayload\)`)
-	decision := regexp.MustCompile(`len\(req\.SourceMessagePayload\)`)
-	for _, line := range strings.Split(code, "\n") {
-		if !strings.Contains(line, "SourceMessagePayload") {
-			continue
-		}
-		trimmed := strings.TrimSpace(line)
-		if declaration.MatchString(trimmed) || stripCall.MatchString(trimmed) || decision.MatchString(trimmed) {
-			continue
-		}
-		t.Fatalf("the caller's payload is used unstripped:\n  %s\n"+
-			"Every use must be the declaration, the len() test that decides whether to copy, "+
-			"or the strip itself.", trimmed)
-	}
 }
 
-// stripGoComments removes // and /* */ comments so the guard reads code rather
+// stripGoComments removes // and /* */ comments so the guards read code rather
 // than the prose describing it — the comments here necessarily name the field.
 func stripGoComments(source string) string {
 	source = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(source, "")
@@ -160,12 +78,9 @@ func stripGoComments(source string) string {
 }
 
 // The parent-group notification must describe the thread that actually exists.
-//
-// message_count and the last_message preview are derived from the bytes
-// actually copied, not from the request field. Those were the same value before
-// round 10 and diverged when the content moved server-side; they are the same
-// value again now, and deriving from the copy keeps them correct if the copy is
-// ever skipped for another reason.
+// message_count and the last_message preview are derived from the bytes that
+// were actually copied — empty when the payload was a refused card, when the
+// send failed, or when no source was given.
 func TestThreadCreatedNotificationDescribesTheCopyThatHappened(t *testing.T) {
 	const shortID, name, channelID = "t-1", "设计评审", "g-1@t-1"
 	sourceID := int64(9001)
@@ -194,4 +109,30 @@ func TestThreadCreatedNotificationDescribesTheCopyThatHappened(t *testing.T) {
 			t.Fatalf("preview content = %v, want the copied bytes' content", last["content"])
 		}
 	})
+}
+
+// The refusal has to key off the wire type, not off the marker keys — a frame
+// with the markers already removed is still a card, and still carries the
+// in-body template identity that makes it actionable.
+func TestCardDetectionCoversMarkerlessFrames(t *testing.T) {
+	markerless := []byte(`{"type":17,"card_version":"1.5","profile":"octo/v2",` +
+		`"card":{"type":"AdaptiveCard","metadata":{"octo":{"protocol":"octo-card@1.0",` +
+		`"template":{"id":"docs.access-request","version":"0.3.0"}}}}}`)
+	var probe map[string]interface{}
+	if err := json.Unmarshal(markerless, &probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasRef := probe["template_ref"]; hasRef {
+		t.Fatal("fixture is not markerless")
+	}
+	if _, hasProvenance := probe["catalog_provenance"]; hasProvenance {
+		t.Fatal("fixture is not markerless")
+	}
+	if !isCardSourcePayload(markerless) {
+		t.Fatal("a markerless type-17 frame was not recognised as a card; " +
+			"it still carries metadata.octo.template, which is the identity the action route trusts")
+	}
+	if isCardSourcePayload([]byte(`{"type":1,"content":"文本"}`)) {
+		t.Fatal("a plain text message was refused as a card")
+	}
 }

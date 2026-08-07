@@ -280,39 +280,3 @@ func CatalogMarkersPreserved(stored, next FrameCatalogMarkers) error {
 	}
 	return nil
 }
-
-// StripCatalogMarkers removes the two server-only top-level markers from a
-// payload that arrived from outside, returning the input untouched when there
-// is nothing to remove.
-//
-// This is the enforcement for "these keys cannot arrive from outside" on a path
-// that copies caller-supplied bytes rather than authoring them. It strips
-// rather than rejects on purpose: a client echoing back a card it was
-// legitimately sent is carrying real markers, so refusing the request would
-// break the legitimate case, while removing them leaves a perfectly valid
-// unmarked frame — which is what the compatibility matrix calls a legacy frame
-// and what a copy should be anyway. A copy is a new message; it did not come
-// from the rendering boundary that authored the original, so it must not claim
-// that boundary's identity.
-//
-// Non-object and unparseable payloads are returned verbatim. There is nothing
-// to strip, and rewriting bytes this function does not understand would be a
-// worse outcome than passing them through.
-func StripCatalogMarkers(raw []byte) ([]byte, error) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return raw, nil
-	}
-	_, hasRef := payload[CatalogTemplateRefKey]
-	_, hasProvenance := payload[CatalogProvenanceKey]
-	if !hasRef && !hasProvenance {
-		return raw, nil
-	}
-	delete(payload, CatalogTemplateRefKey)
-	delete(payload, CatalogProvenanceKey)
-	stripped, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: re-encode stripped payload: %v", ErrCatalogMarkerInvalid, err)
-	}
-	return stripped, nil
-}
