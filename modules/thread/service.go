@@ -112,8 +112,14 @@ type CreateThreadReq struct {
 	CreatorUID      string
 	CreatorName     string
 	SourceMessageID *int64
-	// SourceMessagePayload 只表达「要不要拷贝源消息」。内容一律以服务端从消息行
-	// 读到的字节为准（见 CreateThread），这个字段不得流向任何被持久化的字段。
+	// SourceMessagePayload 是调用方提供的源消息内容，**会被原样持久化**到子区，
+	// 并以 SourceMessageID 那一行的 from_uid 发出。服务端只核对发送者，从不校验
+	// 这段内容与 SourceMessageID 是否对应 —— 也就是说，任何有权在该群建子区的人
+	// 都能让一条自己写的消息挂在别人（含 bot）名下。
+	//
+	// 因此新增任何消费方之前先想清楚：这是**不可信输入**，只是恰好被记在可信的
+	// 发送者名下。卡片（type-17）已在 CreateThread 里整体拒绝，因为对卡片而言这
+	// 条性质会跨越 action 路由的信任边界；文本的内容造假是既有行为，本 PR 不改。
 	SourceMessagePayload json.RawMessage
 }
 
@@ -391,7 +397,14 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	}
 
 	// 在父群发送子区创建消息（同样在 fanout 之后；与 sendSourceMessage 同序约束）。
-	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, copiedPayload)
+	// 拷贝被拒绝（卡片）或发送失败时不记录 source_message_id：父群通知不应声称
+	// 一个子区里并不存在的来源。子区本身照常创建 —— 用户的主要意图是建子区，
+	// 而不是拷贝那条消息。
+	announcedSourceID := req.SourceMessageID
+	if len(copiedPayload) == 0 {
+		announcedSourceID = nil
+	}
+	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, announcedSourceID, copiedPayload)
 
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
@@ -469,8 +482,9 @@ func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName
 		payload["source_message_id"] = *sourceMessageID
 	}
 
-	// sourcePayload 是实际拷贝进子区的服务端字节（未拷贝时为空），不是请求字段：
-	// 计数与预览必须描述子区里真实存在的东西。
+	// sourcePayload 是实际拷贝进子区的那段字节（未拷贝时为空）。它来自请求，
+	// 但只有在拷贝真正发出之后才会传到这里：计数与预览必须描述子区里真实存在
+	// 的东西，而不是调用方请求过什么。
 	var messageCount int64
 	if len(sourcePayload) > 0 {
 		messageCount = 1

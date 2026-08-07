@@ -42,14 +42,36 @@ Three properties, each with a test that fails when its fix alone is reverted:
    that can refuse. An untrimmed target Space otherwise produced a frame every
    reader rejects — permanently unclickable and uneditable.
    `TestSendRefusesToAuthorAMarkerItsReadersWouldReject`.
-2. **A marker cannot be forged.** Every raw ingress — bot, robot, incoming
-   webhook, user edit — rejects both keys.
+2. **A marker cannot be forged.** No external input can carry the two keys in.
+   The four external entry points do not all achieve that the same way, and the
+   difference is worth stating because a single sentence hid a real gap for
+   three rounds: bot raw send and robot ingress **reject by key**; bot template
+   mode has no such field in its request shape and the server authors the
+   markers at the rendering boundary; the incoming webhook builds its envelope
+   from a fixed field allowlist so caller keys never reach the top level; and
+   the thread source-message copy **refuses type-17 payloads outright**, because
+   there the caller's bytes are persisted under another sender's identity and
+   the identity the action route trusts lives inside the card body, where
+   stripping the top-level keys does not reach.
 3. **A marker cannot be dropped.** `CardMutator.Mutate` refuses a replacement
    that loses markers the stored frame carries, so no call site can silently
    downgrade a marked card into the legacy population and leave the identity
    guards inert. `TestCardMutatorRefusesToDropStoredCatalogMarkers`,
    `TestDocsActionFinalizerRoutesEveryStateThroughTheRegistry`,
    `TestStandardActionFinalizerCannotSilentlyDowngradeAMarkedCard`.
+
+## Behaviour changes worth an owner's attention
+
+- **A thread created from a card message no longer copies a first message.**
+  The copy path persists caller-supplied bytes under the source message's
+  sender and never checks the id against the payload, so for a card that is a
+  way to send a card as another user — which the user ingress bans outright.
+  Refusing type-17 there matches that ban. The thread is still created and
+  `source_message_id` is simply not announced, so nothing claims a first
+  message that does not exist. Owner: whoever owns `modules/thread` should
+  confirm the product is willing to lose the card preview on that flow; the
+  alternative is authorizing the copy through the same visibility gates a
+  single-message read applies, which is a larger change than this slice.
 
 ## Out of scope
 

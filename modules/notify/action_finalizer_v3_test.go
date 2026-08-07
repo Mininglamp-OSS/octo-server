@@ -272,67 +272,86 @@ func TestDocsActionFinalizerRejectsForeignStoredTemplate(t *testing.T) {
 	}
 }
 
-// PR-C review round 6 (yujiawei P1-2): a cancelled result must not downgrade a
-// marked card to the legacy rebuild.
+// PR-C review rounds 5 and 7 (yujiawei): the replacement route must not be
+// selected by state.
 //
-// The pending card is a Registry render, so it carries the server-authored
-// catalog markers. buildTerminalEnvelope assembles a replacement from a fixed
-// six-key allowlist that includes neither, and the marker-preserving branch was
-// taken only for approved/denied — so an ordinary user click on a route that
-// answers `cancelled` erased both markers. Both identity guards in
-// pkg/cardtmpl/updater.go begin `if markers.Has…`, so they went inert for that
-// message, and the frame silently rejoined the legacy population.
+// The pending card is a Registry render and carries the server-authored
+// catalog markers; the fallback rebuilds the frame from a six-key allowlist
+// that holds neither, so routing a marked card there erased both on an ordinary
+// user click and left the identity guards in pkg/cardtmpl/updater.go inert for
+// that message. `cancelled` was the reported case and `pending` reaches the
+// same branch, so an allowlist of "states that render through the Registry"
+// would have gone stale the next time the contract grew a state — silently, in
+// the direction of erasing markers. The route turns on whether an updater
+// exists instead, and this table is what holds that shape.
 //
-// The absence of any test for a non-terminal finalizer state is why this was
-// invisible for six rounds.
-func TestDocsActionFinalizerRoutesCancelledThroughTheRegistry(t *testing.T) {
-	wk := newWuKongServer()
-	defer wk.close()
-	ctx := newTestContext(t, wk)
-	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
-	updater := &captureViewUpdater{}
-	legacyMutator := &captureCardMutator{}
-	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
-	if err != nil {
-		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
-	}
-	event := cardactiondispatch.Event{
-		EventID: 43, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
-		MessageID: "1002", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
-		Data: map[string]any{
-			"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
-			"permission_label": "Access", "permission_role_label": "Editor", "source_name": "Docs",
-		},
-	}
-	result := cardactiondispatch.DecisionResult{
-		Disposition: cardactiondispatch.DispositionApplied,
-		State:       cardactiondispatch.StateCancelled,
-		Display:     map[string]string{"title": "Roadmap"},
-	}
-	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
-		t.Fatalf("Finalize(cancelled): %v", err)
-	}
-	if len(legacyMutator.requests) != 0 {
-		t.Fatalf("cancelled took the marker-erasing legacy path: %+v", legacyMutator.requests)
-	}
-	if updater.calls != 1 {
-		t.Fatalf("registry replacement calls = %d, want 1", updater.calls)
-	}
-	if updater.id != docsaccessrequest.TemplateID || updater.version != docsaccessrequest.TemplateVersionV3 ||
-		updater.state != docsaccessrequest.StateCancelled {
-		t.Fatalf("update selection = %s@%s/%s", updater.id, updater.version, updater.state)
-	}
-	var fields map[string]any
-	if err := json.Unmarshal(updater.fields, &fields); err != nil {
-		t.Fatalf("decode fields: %v", err)
-	}
-	if fields["state"] != "cancelled" {
-		t.Fatalf("wire state = %v", fields["state"])
-	}
-	// Nobody decided a cancelled request, so it carries no operator: emitting
-	// one would put the generic approver placeholder on a card no one acted on.
-	if _, present := fields["decision"]; present {
-		t.Fatalf("cancelled result invented a decision: %+v", fields["decision"])
+// This test was written in round 7, reported as landed, and then removed by a
+// later whole-section edit in the same session. Nothing went red, because a
+// deleted test is not a failing test — which is the argument for the table
+// rather than for one more single-state case.
+func TestDocsActionFinalizerRoutesEveryStateThroughTheRegistry(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		state     cardactiondispatch.State
+		wantState cardtmpl.State
+		wantWire  string
+	}{
+		{"approved", cardactiondispatch.StateApproved, docsaccessrequest.StateApproved, "approved"},
+		{"denied", cardactiondispatch.StateDenied, docsaccessrequest.StateRejected, "rejected"},
+		{"cancelled", cardactiondispatch.StateCancelled, docsaccessrequest.StateCancelled, "cancelled"},
+		// The state that would have kept the defect alive after the cancelled
+		// fix: valid, decodable, and previously routed to the legacy rebuild.
+		{"pending", cardactiondispatch.StatePending, docsaccessrequest.StateUnavailable, "unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wk := newWuKongServer()
+			defer wk.close()
+			ctx := newTestContext(t, wk)
+			ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+			updater := &captureViewUpdater{}
+			legacyMutator := &captureCardMutator{}
+			finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
+			if err != nil {
+				t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
+			}
+			event := cardactiondispatch.Event{
+				EventID: 44, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+				MessageID: "1003", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+				OperatorUID: "reviewer-1",
+				Data: map[string]any{
+					"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
+				},
+			}
+			result := cardactiondispatch.DecisionResult{
+				Disposition: cardactiondispatch.DispositionApplied, State: test.state,
+				RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+			}
+			if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+				t.Fatalf("Finalize(%s): %v", test.state, err)
+			}
+			if len(legacyMutator.requests) != 0 {
+				t.Fatalf("%s took the marker-erasing legacy path", test.state)
+			}
+			if updater.state != test.wantState {
+				t.Fatalf("registry state = %q, want %q", updater.state, test.wantState)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(updater.fields, &fields); err != nil {
+				t.Fatalf("decode fields: %v", err)
+			}
+			if fields["state"] != test.wantWire {
+				t.Fatalf("wire state = %v, want %q", fields["state"], test.wantWire)
+			}
+			// Nobody decided cancelled or pending, so neither carries an
+			// operator: emitting one would put the generic approver placeholder
+			// on a card no one acted on.
+			_, hasDecision := fields["decision"]
+			wantDecision := test.state == cardactiondispatch.StateApproved ||
+				test.state == cardactiondispatch.StateDenied
+			if hasDecision != wantDecision {
+				t.Fatalf("decision present = %v, want %v for %s", hasDecision, wantDecision, test.state)
+			}
+		})
 	}
 }
 

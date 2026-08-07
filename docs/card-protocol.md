@@ -34,8 +34,16 @@
 - E3 PR-C 起另有两个**服务端独占**的顶层标记，用于 Registry / dynamic catalog 帧：
   `template_ref`（`{id, version}`，已存在）与 `catalog_provenance`
   （`{version, principal_type, principal_id, space_id}`，新增）。两者都**只能由
-  服务端在渲染出口写入**：raw ingress（bot 原始发卡、robot、incoming webhook）
-  携带任一 key 一律拒绝，编辑路径也不能新增或改写它们。
+  服务端在渲染出口写入**，任何外部输入都不能带着它们进来。四条外部入口各自的
+  做法不同，写在这里以免读者以为它们同形：
+  - bot 原始发卡、robot ingress —— **按 key 拒绝**，出现任一即整条请求失败；
+  - bot 模板模式 —— 请求形状里根本没有这两个 key，服务端在渲染出口自己写；
+  - incoming webhook —— 信封由固定字段白名单从零构造，调用方的 key 到不了顶层；
+  - 子区源消息拷贝（`modules/thread`）—— 整条 type-17 payload **拒绝拷贝**：这条
+    路径把调用方的字节以源消息发送者的身份持久化，而 action 路由信任的模板身份在
+    卡体内部（`card.metadata.octo.template`），剥掉顶层 key 并不触及它。
+
+  编辑路径也不能新增或改写它们。
   - 兼容矩阵（`cardmsg.CatalogFrameMarkers`）：两者皆无 = pre-PR-C 旧帧，合法；
     只有 `template_ref` = pre-PR-C 的 Bot Registry 帧，合法；两者皆有 = 严格校验，
     `template_ref` 必须与 `card.metadata.octo.template` 完全一致；

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -425,8 +426,12 @@ func TestSendMessageRawCardRejectsForgedCatalogProvenance(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dispatch := &dispatchCapture{}
 	ba := &BotAPI{
-		Log:              log.NewTLog("BotAPI-raw-forge"),
-		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		Log:          log.NewTLog("BotAPI-raw-forge"),
+		spaceQuerier: &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// Without a card config resolver the send fails closed before it ever
+		// reaches the forgery check, and ResponseErrorL pins every refusal to
+		// 400 — so a bare status assertion would pass for the wrong reason.
+		cardConfig:       allCardCapabilitiesOn(),
 		dispatchOverride: dispatch.hook,
 	}
 	// A fully self-consistent forgery: provenance + metadata agree. The raw
@@ -452,8 +457,10 @@ func TestSendMessageRawCardRejectsForgedCatalogProvenance(t *testing.T) {
 		"payload": payload,
 	}
 	recorder := invokeTemplateSend(t, ba, body, "")
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("forged provenance status=%d body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "card") {
+		t.Fatalf("forged provenance status=%d body=%s (want the card-invalid refusal, "+
+			"not an unrelated 400)", recorder.Code, recorder.Body.String())
 	}
 	dispatch.mu.Lock()
 	defer dispatch.mu.Unlock()
@@ -473,13 +480,17 @@ func TestSendMessageRegistryModeRejectsCallerProvenanceKey(t *testing.T) {
 		Log:           log.NewTLog("BotAPI-registry-forge"),
 		cardTemplates: catalog,
 		spaceQuerier:  &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// See above: the resolver has to be wired or the refusal proves nothing.
+		cardConfig: allCardCapabilitiesOn(),
 	}
 	body := registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))
 	body["payload"].(map[string]any)["catalog_provenance"] = map[string]any{
 		"version": 1, "principal_type": "bot", "principal_id": "another-bot", "space_id": "space-x",
 	}
 	recorder := invokeTemplateSend(t, ba, body, "")
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("registry-mode caller provenance status=%d body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "card") {
+		t.Fatalf("registry-mode caller provenance status=%d body=%s (want the card-invalid refusal, "+
+			"not an unrelated 400)", recorder.Code, recorder.Body.String())
 	}
 }

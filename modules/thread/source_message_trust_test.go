@@ -136,3 +136,55 @@ func TestCardDetectionCoversMarkerlessFrames(t *testing.T) {
 		t.Fatal("a plain text message was refused as a card")
 	}
 }
+
+// A refused or failed copy must not leave the parent group announcing a source
+// the thread does not have. source_message_id, message_count and the preview
+// all describe the same thing, so they are derived from the same fact: whether
+// bytes were actually copied.
+func TestThreadCreatedNotificationOmitsTheSourceWhenNothingWasCopied(t *testing.T) {
+	sourceID := int64(9001)
+	payload := buildThreadCreatedPayload("t-1", "设计评审", "g-1@t-1", "u-1", "创建者", nil, nil)
+	if _, present := payload["source_message_id"]; present {
+		t.Fatalf("a source was announced with no copy: %+v", payload["source_message_id"])
+	}
+	withCopy := buildThreadCreatedPayload("t-1", "设计评审", "g-1@t-1", "u-1", "创建者",
+		&sourceID, []byte(`{"type":1,"content":"文本"}`))
+	if withCopy["source_message_id"] != sourceID {
+		t.Fatalf("source_message_id = %v, want %d when the copy happened", withCopy["source_message_id"], sourceID)
+	}
+}
+
+// The caller-supplied payload is persisted, and the request contract has to say
+// so. An earlier revision read the content server-side, and when that was
+// reverted the comment stating "this field must never reach persisted data"
+// stayed behind — a false rule on the one exported field whose misuse is an
+// impersonation vector, which is the highest-value thing to get wrong.
+func TestSourceMessagePayloadContractCommentMatchesTheCode(t *testing.T) {
+	raw, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Fatalf("read service.go: %v", err)
+	}
+	text := string(raw)
+	idx := strings.Index(text, "SourceMessagePayload json.RawMessage")
+	if idx < 0 {
+		t.Fatal("SourceMessagePayload field not found")
+	}
+	// The doc comment immediately above the field.
+	head := text[:idx]
+	blockStart := strings.LastIndex(head, "\n\n")
+	comment := head[blockStart:]
+
+	for _, stale := range []string{
+		"不得流向任何被持久化的字段",
+		"内容一律以服务端从消息行",
+	} {
+		if strings.Contains(comment, stale) {
+			t.Fatalf("the field's contract still claims %q, but the code persists the caller's bytes "+
+				"and verifies only from_uid", stale)
+		}
+	}
+	if !strings.Contains(comment, "会被原样持久化") {
+		t.Fatal("the field's contract no longer states that the caller's bytes are persisted; " +
+			"a consumer written against a softer claim reintroduces the impersonation path")
+	}
+}
