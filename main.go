@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
@@ -596,6 +597,20 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		os.Getenv("NOTIFY_INTERNAL_TOKEN"),
 		os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"),
 		os.Getenv("OCTO_DOCS_BOT_MENTION_TOKEN"),
+		// Cross-capability exclusion for OCTO_DRIVE_INTERNAL_TOKEN vs the
+		// dynamic route-scoped notify tokens / callback secrets loaded from
+		// OCTO_CARD_ACTION_ROUTES MUST happen here — modules/internal_resolve
+		// only sees the four fixed internal-token envs and cannot detect a
+		// collision with route-level credentials. Without this argument, an
+		// operator who accidentally sets the drive token equal to a route's
+		// notify_token_env value would pass all three local checks (drive
+		// module, registry construction, and this call), and a single leaked
+		// value would then authorize BOTH resolve-bot-owner AND route notify
+		// — breaking the "one credential / one capability" invariant.
+		//
+		// modules/internal_resolve/main_wiring_test.go asserts this argument
+		// stays present so a future refactor cannot delete it silently.
+		os.Getenv(internal_resolve.DriveInternalTokenEnv),
 	); err != nil {
 		return nil, err
 	}
