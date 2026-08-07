@@ -1,0 +1,337 @@
+---
+type: Task
+title: "Task: cardtmpl-reasoning-phase-tools-successor"
+description: Publish ai.reasoning-process@0.4.0 with per-phase collapsible tool panels and a simplified header, adapted onto the bounded server contract, and cut Registry default and Bot new-send to it via a server release.
+tags: [card, cardtmpl, ai-reasoning-process, json-template, bot-api, wire-contract, trust-boundary, test, testing, rollback]
+timestamp: 2026-08-07T09:59:46+08:00
+# --- octospec extension fields ---
+slug: cardtmpl-reasoning-phase-tools-successor
+upstream: "front-end handoff attachment `ai.reasoningprocess0.3.0.handoff_1.zip` sha256 dd83e4dc89a296fe8409f6ab0543c2cf78d0cf451ee18fd93dd6f701da77e374; server PRs #657 (0.1.0) / #667 (0.2.0) / #681 (0.3.0) / #675 (RuntimeCatalog overlay)"
+source: user
+---
+
+# Task: cardtmpl-reasoning-phase-tools-successor
+
+> One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for
+> the work. AI may draft it from existing code; a human confirms it.
+>
+> Status: **draft, awaiting human confirmation.** Two product decisions (D7
+> `statusGlyph`, D8 `timerText`) are called out below and must be resolved before
+> `/octospec-go`.
+
+## Goal
+
+Publish a new immutable built-in JSON artifact, `ai.reasoning-process@0.4.0`, carrying the front-end's
+redesigned presentation:
+
+- per-phase collapsible tool panels (`reasoning_tools_panel_${$index}`), collapsed by default;
+- chevron `Image` + `selectAction` toggles replacing the footer `ActionSet` toggle button;
+- a simplified header that drops the `${timerText}` line.
+
+Adapt that presentation onto the **existing bounded server data contract** (#667/#681), not onto the
+attachment's unbounded schema. Preserve all five states and the existing state-to-view/wire mapping:
+
+| View | States | Wire profile | `0.4.0` actions |
+| --- | --- | --- | --- |
+| `active` | `reasoning`, `answering` | `octo/v2` | `Action.ToggleVisibility` only |
+| `result` | `completed`, `stopped` | `octo/v1` | `Action.ToggleVisibility` only |
+| `error` | `error` | `octo/v2` | `Action.ToggleVisibility` only |
+
+Register `0.1.0`–`0.4.0` together; make `0.4.0` the Registry default and the only Bot version advertised
+for new `template_ref` sends; retain exact-version edit compatibility for all four. `0.1.0`, `0.2.0`, and
+`0.3.0` remain byte-for-byte frozen.
+
+This is a **server-release** cutover. Hot-publishing through the runtime catalog is explicitly not the
+delivery mechanism (see Background § Why a release).
+
+## Background
+
+### The attachment collides with an already-published version
+
+The handoff declares `version: 0.3.0`, but `ai.reasoning-process@0.3.0` was already published by PR #681
+and is live: registered in `main.go:installCardTmplRegistry`, advertised as the sole Bot new-send version,
+and pinned by stored messages for exact-version historical edits. The attachment is a *different* artifact
+under the same identity (`contractVersion` 1.1.0→1.2.0, `renderProfile` rc.1→rc.2, templates ~2× larger).
+
+Overwriting `0.3.0` in place would re-render already-delivered historical cards with different content and
+break the one-permanent-source-per-exact-key invariant. The delta therefore lands as `0.4.0`.
+
+### Measured compile results against the current engine
+
+The attachment bundle was compiled against `CompileJSONArtifact` on both limit profiles. Three defects
+block it; everything else already passes:
+
+| Defect | Error | Path affected |
+| --- | --- | --- |
+| per-view `"submit_actions": []` in manifest | `view "active": unknown key "submit_actions"` | both |
+| missing `owner` / `protocol` | `owner is required` | runtime publish only |
+| schema stripped of all `maxLength`/`maxItems`/`x-octo-constraints` | `$.properties.collapsedSummary string is unbounded` | runtime publish only |
+
+With those three corrected, **both** `staticCompileLimits()` and `DefaultCompileLimits()` compile clean:
+templates expand, all five goldens match canonically, samples validate, `jsontmpl.ValidateToggleTargets`
+passes, and interaction-report conformance passes. The template's `${$index}` and `${if($index == 0, …)}`
+usage is already inside the frozen `jsontmpl` subset — **no expression-engine change is required.**
+
+`submit_actions` is a *derived* field in this repo (`modules/bot_api/card_template_catalog.go:170`
+computes it from the interaction report). A manifest must not declare it; doing so would introduce the
+hand-maintained list that #681 deliberately refused.
+
+### The dropped bounds are a co-designed cross-repo contract
+
+The consumer's constants and the server's schema bounds line up exactly:
+
+| `openclaw-channel-octo/src/reasoning-process.ts` | server schema bound |
+| --- | --- |
+| `THOUGHT_MAX = 280` + `…` | `thought: 281` |
+| `TOOL_NAME_MAX = 80` + `…` | `tool: 81` |
+| `REASONING_ID_MAX_LENGTH = 512` | `reasoningId: 512` |
+| `MAX_RENDERED_PHASES = 6` | `phases.maxItems: 6` |
+| `SUMMARY_MAX 64` + `ERROR_MAX 120` joined | `detail: 192` |
+
+Deleting them is not a gap in the handoff; it removes the contract both repos were built against. They are
+restored verbatim.
+
+### Node budget under the new presentation
+
+The redesign costs materially more nodes per phase. Measured through `renderCore → cardmsg.Validate`
+(`MaxNodes = 200`, `MaxDepth = 16`):
+
+- new template, 6 phases: **13 aggregate actions OK, 15 OK, 16 fails** (`卡片节点数超过上限`);
+- worst case admitted by the retained schema (6 phases / 13 actions / every string at its max) renders
+  successfully in all five states;
+- the only production producer already self-caps at 6 phases / **12** aggregate actions
+  (`MAX_RENDERED_PHASES` / `MAX_RENDERED_ACTIONS` + `trimForRender`).
+
+The aggregate cap of 13 therefore stays; it must not be relaxed as part of this change.
+
+### Consumer impact: none required
+
+`openclaw-channel-octo` deliberately carries **no local version allowlist**
+(`selectReasoningProcessTemplate`, asserted by `it.each(["0.1.0","0.2.0","0.3.0","1.0.0","9.8.7"])`), and
+`reasoning_template_ref` is derived server-side from `AdvertisedRef()` rather than stored per bot
+(`modules/bot_api/card_profile.go:149`). Moving `AdvertisedSend` to `0.4.0` propagates to the plugin with
+no plugin release, because the view/wire/state/`submit_actions` shape is unchanged.
+
+### Why a release, not a hot update
+
+The runtime control plane (`/v1/manager/card-templates/…`) exists but cannot deliver this change:
+
+- it is dark by default (`OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED` /
+  `..._NEW_SEND_ENABLED` both `false`);
+- publish/activate is not a producer grant (`docs/card-template-runtime-catalog-runbook.md:14`);
+- Bot advertisement is a compile-time constant resolved by **exact** version
+  (`defaultBotTemplateRefs()`, `CatalogExactRequest{ID, Version}`), so an activation pointer cannot change
+  what the plugin sees;
+- the runbook explicitly forbids Activate/Rollback for built-in static version selection and names this
+  template: *"do not Activate or Rollback `ai.reasoning-process` … as a shortcut for the image cutover"* —
+  an orphan activation pointer takes replicas out of readiness on binary rollback.
+
+Making this hot-updatable is PR-C scope (`card_template_grant`, dynamic Bot capability merging, producer
+provenance) and is out of scope here.
+
+## Contract decisions
+
+### D1 — New immutable identity
+
+- Add `pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@0.4.0/`.
+- `id` stays `ai.reasoning-process`; `version` becomes `0.4.0`.
+- Adopt the attachment's `contractVersion=1.2.0` and `renderProfile=octo-chat@1.2.0-rc.2`; keep
+  `renderProfileCompatibility=octo-chat/v1`, `adaptiveCardVersion=1.5`, `defaultLocale=zh-CN`.
+- Restore `owner=ai` and `protocol=octo-card@1.0`. Omit `actionType` — with no `Action.Submit`,
+  `TemplateMeta.ActionContract` must stay nil.
+
+### D2 — Manifest normalization
+
+- Remove per-view `submit_actions` from the manifest. Capability stays derived from the interaction
+  reports; no hand-maintained Submit list is introduced.
+- Views, states, wire profiles, template paths, and sample paths are otherwise taken as-is.
+
+### D3 — Schema: bounded contract preserved
+
+- Start from the frozen `0.3.0` schema and apply only these deltas:
+  - `timerText` moves from `required` to optional (relaxation; see D8);
+  - descriptions/examples updated to match the new presentation.
+- Restore verbatim: every `maxLength`, `phases.maxItems: 6`, `actions.maxItems: 12`, and
+  `x-octo-constraints.aggregateArrayLimits` (`phases[].actions` `maxTotalItems: 13`).
+- **Drop `phaseState`.** The attachment adds it, but no template in any view binds it and the producer
+  does not send it. A required-nothing/read-by-nobody field is contract debt.
+- Retain the `traceExpanded`/`traceCollapsed` mutual-exclusion `oneOf` and the state-conditional
+  `required` blocks unchanged.
+
+### D4 — Templates
+
+- Adopt the attachment's three templates: per-phase `Container id=reasoning_phase_${$index}` with a
+  chevron pair (`reasoning_tools_toggle_collapsed_${$index}` / `…_expanded_${$index}`) driving
+  `reasoning_tools_panel_${$index}` (`isVisible: false` by default), and the header chevron pair driving
+  `trace_panel` / `collapsed_panel`.
+- `errorTitle`/`errorMessage` stay at body top level with **no** `isVisible` binding, as in `0.3.0`, so the
+  failure reason is visible while the trace is collapsed.
+- `result` stays `octo/v1`; `Action.ToggleVisibility` is permitted there per the card protocol §2.2.
+
+### D5 — Reports
+
+- Ship `reports/active.interaction.json` and `reports/error.interaction.json` only, listing the toggle
+  actions each view actually renders.
+- **Do not ship `reports/result.interaction.json`.** `result` is `octo/v1`; `LoadJSONBundle` reads reports
+  only for `octo/v2` views, and a runtime-assembled bundle carrying it would fail `unreferenced`.
+
+### D6 — Exclude the render-profile package
+
+Do not import `render-profile/` (manifest/host-config/theme.css/styles.css/tokens/capabilities/checksums).
+No Go code consumes it; `//go:embed all:handoff` would only grow the binary. Its
+`capabilities.json` also declares `maxDepth: 24` against this server's authoritative
+`cardmsg.MaxDepth = 16`; the divergence is reported to the front-end rather than tracked here.
+
+### D7 — `statusGlyph` (**decision required**)
+
+The new templates hardcode `•` and no longer bind `${statusGlyph}`, while the producer sends `●` and its
+local fallback renderer still draws `●` — the two render lanes would disagree. Pick one:
+
+- **(a)** template binds `${statusGlyph}` again — smallest change, keeps lanes consistent, keeps the field
+  meaningful; or
+- **(b)** keep the hardcoded glyph and open a consumer issue to change the producer constant to `•`, and
+  drop `statusGlyph` from `required`.
+
+Default recommendation: **(a)**.
+
+### D8 — `timerText` no longer rendered (**product confirmation required**)
+
+The new header drops the `${timerText}` line, so server-rendered cards lose `12s · 3 phases · 13 tool
+calls` and the `stopped` variant `12s · stopped at phase 3`. The schema's own description says the
+simplified card does not show it, so this reads as intentional; the producer keeps sending it harmlessly.
+Confirm the product intent before freezing `0.4.0`.
+
+Note the failure reason is **not** lost: `errorMessage` is top-level and always visible in both `0.3.0` and
+`0.4.0`, so the consumer's belt-and-braces copy in `timerText` was already redundant.
+
+### D9 — Registry and Bot cutover
+
+- Add `HandoffRootV4` / `TemplateVersionV4`; current-version aliases point to V4.
+- Register V1→V4 before `Registry.Freeze()`; `SetDefault` to V4.
+- Bot `AdvertisedSend` = `{ai.reasoning-process@0.4.0}` only.
+- Bot `EditCompatible` = V1, V2, V3, V4. Stored messages stay pinned to their exact version; no
+  cross-version edit or migration.
+- `botTemplateSwitchFor` must keep covering the advertised set (`TestBotTemplateSwitchCoversAdvertisedSet`).
+- RuntimeCatalog learns V4 as a new static claim at startup; no dynamic artifact, grant, or activation row
+  is added.
+
+## Load-bearing list
+
+- **L1 immutable artifact identity (`cardtmpl`, `wire-contract`)** — published `0.1.0`/`0.2.0`/`0.3.0` bytes
+  cannot change. The redesign requires a new exact version, never an in-place edit of `0.3.0`.
+- **L2 bounded producer contract (`cardtmpl`, `trust-boundary`)** — all `maxLength`/`maxItems` values, the
+  `phases[].actions` aggregate cap of 13, and fail-close schema classification survive verbatim. The
+  attachment's unbounded schema must not replace them.
+- **L3 card node/depth budget (`wire-contract`, `trust-boundary`)** — the richer per-phase markup must stay
+  inside `cardmsg.MaxNodes = 200` / `MaxDepth = 16` at the worst case the schema still admits.
+- **L4 interaction truth (`cardtmpl`, `wire-contract`)** — templates, reports, goldens,
+  `TemplateMeta.ActionContract`, and Bot `submit_actions` must all agree V4 has zero `Action.Submit`.
+- **L5 view/state/profile stability (`wire-contract`)** — five states, `active`/`error` = `octo/v2`,
+  `result` = `octo/v1`. The consumer's compatibility filter depends on this shape being unchanged.
+- **L6 toggle-target integrity (`cardtmpl`, `wire-contract`)** — data-driven `${$index}` toggle ids skip
+  `jsontmpl.ValidateToggleTargets`' static check, so `cardmsg.Validate`'s whole-card `resolveTargetRefs`
+  becomes the only enforcement of dangling targets and frame-unique ids.
+- **L7 Registry multi-version/default (`cardtmpl`)** — four exact versions coexist; only V4 is default;
+  `Freeze()` and global exact-key uniqueness unchanged.
+- **L8 Bot capability/new-send/edit boundary (`bot-api`, `wire-contract`)** — only V4 discoverable and
+  sendable; V1–V3 exact edits still possible without cross-version overwrite or existence probing.
+- **L9 derived capability (`bot-api`)** — `submit_actions` and `reasoning_template_ref` stay derived from
+  the interaction report and `AdvertisedRef()`; neither becomes manifest- or config-declared.
+- **L10 cross-repo producer contract (`wire-contract`, `trust-boundary`)** — the consumer's sanitizer
+  ceilings must remain ≤ the server bounds, and its no-version-allowlist selector must still resolve V4.
+- **L11 runtime catalog reconciliation (`cardtmpl`, `testing`)** — V4 becomes a new static claim; a
+  pre-existing dynamic claim on the same exact key must fail readiness, not select per replica.
+- **L12 rollout/rollback (`rollback`)** — an older binary cannot edit a V4 card. V4 is selected by the image
+  Registry default only; no static activation pointer may be persisted for it.
+- **L13 regression evidence (`test`, `testing`)** — conformance, report drift, goldens, bounds, worst-case
+  node budget, Bot policy, historical edits, runtime startup, race, build, vet, lint, diff hygiene.
+
+## Out of scope
+
+- Modifying any file under frozen `ai.reasoning-process@0.1.0`, `@0.2.0`, or `@0.3.0`.
+- Any change to `openclaw-channel-octo`. The plugin requires no release for this cutover; D7(b), if
+  chosen, is filed as a separate consumer issue.
+- Hot update: enabling the runtime catalog gates, publishing V4 as a dynamic artifact, persisting an
+  activation pointer, or using Activate/Rollback for built-in version selection.
+- PR-C scope — `card_template_grant`, grant/revoke APIs, dynamic Bot capability merging, trusted producer
+  provenance, B1/B2 discovery/export.
+- Making `AdvertisedSend` runtime-resolvable. That moves wire-contract authority from the image to the
+  database and needs its own reviewed brief.
+- Importing `render-profile/` package files or reconciling its `maxDepth: 24` with `cardmsg.MaxDepth = 16`.
+- Relaxing any bound (`phases.maxItems`, `actions.maxItems`, aggregate 13, any `maxLength`) or raising
+  `cardmsg.MaxNodes`.
+- Adding `phaseState` rendering, reintroducing `reasoning_stop`/`reasoning_retry`, or adding any
+  `Action.Submit`, RouteSpec, or callback.
+- Adding routes, DB migrations, error codes, localized error responses, or rate-limit surfaces.
+- Retroactively rewriting delivered V1–V3 payloads; they remain immutable historical messages.
+- Enabling production Bot/runtime gates or claiming cross-repo E2E completion.
+
+## Acceptance
+
+### A. Artifact identity and immutability
+
+- [ ] Tracked `ai.reasoning-process@0.4.0` handoff exists with exact `id`/`version`, `owner=ai`,
+  `protocol=octo-card@1.0`, `contractVersion=1.2.0`, `renderProfile=octo-chat@1.2.0-rc.2`,
+  `adaptiveCardVersion=1.5`, and no `actionType`.
+- [ ] `git diff origin/main -- pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@0.{1,2,3}.0`
+  is empty.
+- [ ] No manifest view declares `submit_actions`; no `render-profile/` directory and no
+  `reports/result.interaction.json` are added.
+- [ ] `phaseState` appears in neither the schema nor any template.
+
+### B. Bounded contract preserved
+
+- [ ] V4 schema retains every `0.3.0` bound and the `x-octo-constraints` aggregate cap of 13; the only
+  deltas are `timerText` optionality and documentation text. A test asserts bound-by-bound equality with
+  the V3 schema rather than comparing whole files.
+- [ ] Every string/array/aggregate `limit+1` case is rejected with `ErrFieldsInvalid` before template
+  expansion; every exact-limit case renders.
+- [ ] `CompileJSONArtifact` succeeds under **both** `staticCompileLimits()` and `DefaultCompileLimits()`
+  (the latter proving `RequireOwner` / `RequireProtocol` / `RequireBoundedSchema` are satisfied).
+
+### C. Node budget
+
+- [ ] Worst case admitted by the schema (6 phases, 13 aggregate actions, every string at max) renders
+  through `cardmsg.Validate` in all five states.
+- [ ] A regression asserts the ceiling: 6 phases / 13 actions renders, and a deliberately over-cap payload
+  is rejected — so a future template edit that inflates per-phase markup fails the build rather than
+  production.
+
+### D. No unsupported controls
+
+- [ ] V4 templates, reports, and goldens contain no `Action.Submit`, `reasoning_stop`, `reasoning_retry`,
+  `stop_reasoning`, `retry_reasoning`, or "可以重试".
+- [ ] `TemplateMeta.ActionContract == nil` for V4; V1–V3 contracts unchanged.
+- [ ] Every rendered `Action.ToggleVisibility` target resolves to an element id present in the same frame,
+  for every state and for phase counts 1…6 (covering the `${$index}` expansion).
+- [ ] `active`/`error` reports exactly match rendered actions; `result` has no report document and its
+  `octo/v1` frame still rejects an injected `Action.Submit` at `cardmsg.Validate` even with a matching
+  golden (mutation test, per #681).
+
+### E. Registry, Bot, and runtime catalog
+
+- [ ] Registry lists exactly `0.1.0`, `0.2.0`, `0.3.0`, `0.4.0`; `Lookup(id, "")` returns `0.4.0`.
+- [ ] `/v1/bot/card/profile` advertises exactly one `ai.reasoning-process` entry at `0.4.0`, three views,
+  empty `submit_actions` on all three, and `reasoning_template_ref = {id, 0.4.0}`.
+- [ ] New sends at V1–V3 fail before dispatch with zero side effects; exact-version edits at V1–V4 succeed.
+- [ ] `TestBotTemplateSwitchCoversAdvertisedSet` still passes.
+- [ ] RuntimeCatalog startup reconciles V4 as a static claim; a dynamic claim on the same exact key fails
+  readiness. No activation row is created.
+
+### F. Cross-repo consistency
+
+- [ ] A test (or documented check) proves the plugin's compatibility filter still resolves V4: three views
+  named `active`/`result`/`error` with wire profiles `octo/v2`/`octo/v1`/`octo/v2`, states as mapped, and
+  `submit_actions` empty.
+- [ ] D7 resolved and reflected in both the template and the acceptance evidence; if D7(b), a consumer
+  issue is linked.
+- [ ] D8 confirmed by the product owner and recorded in the journal.
+
+### G. Gates
+
+- [ ] Focused suites pass: `pkg/cardtmpl/...`, `modules/bot_api/...`, `modules/card_template_catalog/...`,
+  and the composition-root default test in `main_test.go`.
+- [ ] Race lanes pass for cardtmpl, catalog, cardmsg, and the focused Bot capability/send/edit paths.
+- [ ] `go build ./...`, `go vet ./...`, `golangci-lint run ./...`, and `git diff --check` pass.
+- [ ] No `pkg/errcode` / i18n change is expected; if one appears, `make i18n-extract-check` and
+  `make i18n-lint` pass.
