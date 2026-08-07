@@ -2167,13 +2167,19 @@ paths:
         - "application/json"
       responses:
         200:
-          description: "返回"
+          description: "返回（响应头带 Cache-Control: no-store —— body 含 bearer 级密钥）"
           schema:
             type: object
             properties:
               uuid:
                 type: string
                 description: "uuid"
+              poll_secret:
+                type: string
+                description: >-
+                  轮询密钥。调用 /user/loginstatus 时必须出示，否则响应里的
+                  auth_code / uid / encrypt 会被剥掉。仅在本响应中返回一次，
+                  不会出现在二维码内容里。
               qrcode:
                 type: string
                 description: "二维码"
@@ -2186,12 +2192,29 @@ paths:
       tags:
         - "user"
       summary: "获取登录状态"
-      description: "通过login uid获取登录状态"
+      description: >-
+        通过 login uuid 获取登录状态（10 秒长轮询）。
+
+        未出示 poll_secret 时仍返回真实 status，但 auth_code / uid / encrypt
+        会被剥掉 —— 只有申请该二维码的调用方能拿到凭据字段。
+
+        密钥经 poll_secret query 参数出示。
       operationId: "quit pc"
       consumes:
         - "application/json"
       produces:
         - "application/json"
+      parameters:
+        - name: "uuid"
+          in: "query"
+          required: true
+          type: string
+          description: "loginuuid 返回的 uuid"
+        - name: "poll_secret"
+          in: "query"
+          required: false
+          type: string
+          description: "loginuuid 返回的 poll_secret；缺失时凭据字段会被剥离"
       responses:
         200:
           description: "返回"

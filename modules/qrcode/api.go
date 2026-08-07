@@ -170,7 +170,7 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 		"scaner": loginUID,
 		"type":   common.AuthCodeTypeScanLogin,
 		"uuid":   uuid,
-	}), time.Minute*10)
+	}), user.ScanLoginAuthCodeTTL)
 	if err != nil {
 		q.Error("生成扫码登录授权码失败", zap.Error(err))
 		return nil, fmt.Errorf("%w: scan login auth code", errQRCodeInternalStoreFailed)
@@ -184,12 +184,26 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 		"status": common.ScanLoginStatusScanned,
 		"uid":    loginUID,
 	})
-	err = q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), time.Minute*5)
+	err = q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), user.ScanLoginConfirmWindow)
 	if err != nil {
 		q.Error("设置扫描登录二维码信息失败", zap.Error(err))
 		return nil, fmt.Errorf("%w: scan login state", errQRCodeInternalStoreFailed)
 	}
 	user.SendQRCodeInfo(uuid, qrcodeInfo)
+
+	// 关于「把请求方设备/IP 回给手机端展示」：这是 QRLJacking 唯一真正的断点（服务端
+	// 区分不出「受害者扫了攻击者的码」和「本人扫了自己的码」，只有确认的人能），但**故意
+	// 不在本次实现**。
+	//
+	// 原因是这些依据目前全部由攻击者掌控：device_name/device_model 直接来自 loginuuid
+	// 的 query 参数，User-Agent 是请求头，而 IP 走 gin 的 c.ClientIP() —— 本仓与 octo-lib
+	// 都没调用过 SetTrustedProxies，默认信任 0.0.0.0/0，取的是 X-Forwarded-For 最左项，
+	// 客户端可预置。攻击者能让确认弹窗显示受害者自己的 IP 和设备名，把「弱证据」变成
+	// 「假保证」——比什么都不显示更糟。
+	//
+	// 要做对，得先定下可信来源（与限流同一条 trusted-proxy 感知的取 IP 路径、客户端上报
+	// 字段标记为 unverified 并限长），而这依赖运维确认反代对 XFF 是覆盖还是追加。
+	// 跟踪：Mininglamp-OSS/octo-ios#71、Mininglamp-OSS/octo-android#116。
 	return NewHandleResult(ForwardNative, HandlerTypeLoginConfirm, map[string]interface{}{
 		"auth_code": authCode,
 		"pub_key":   pubkey,

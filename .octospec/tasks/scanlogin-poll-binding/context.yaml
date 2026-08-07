@@ -1,0 +1,63 @@
+# Rules resolved for this task. See .octospec/rules/_index.yaml for semantics.
+slug: scanlogin-poll-binding
+resolved_at: 2026-08-07
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    priority: 92
+    load_bearing: true
+    matched_by: "touches:auth + paths:modules/**/*.go"
+    applied: >-
+      扫码登录是未认证 → 已认证的凭据签发链路。规则要求「路由默认过 AuthMiddleware，
+      显式豁免必须在代码里写明理由」。loginuuid / loginstatus 按设计必须保持匿名
+      （二维码在登录前渲染），因此改为「匿名可达但凭据字段需持有 mint 时下发的
+      poll_secret」，并在代码注释里写明豁免理由与替代边界。
+  - id: rate-limit
+    tier: repo
+    priority: 80
+    load_bearing: true
+    matched_by: "touches:rate-limit + paths:modules/**/*.go"
+    applied: >-
+      未认证路由使用 StrictIPRateLimitMiddleware（非 SharedUIDRateLimiter，这两个
+      端点没有 uid）。不手写 Redis 计数器。poll_secret 的存储是「按业务身份的一次性
+      凭据」，不是请求频率计数，不触犯「禁止手写计数器」条款。
+  - id: error-handling
+    tier: repo
+    priority: 85
+    load_bearing: true
+    matched_by: "touches:error-response,i18n + paths:modules/**/*.go"
+    applied: >-
+      本次未新增拒绝式错误路径 —— secret 不匹配走「剥离敏感字段」而非报错，故无需
+      注册新 errcode。既有 respondUserError 调用点保持不变。新增文件 scanlogin_poll.go
+      不含 handler，无响应写出。限流中间件自带 i18n rate.limited。
+  - id: testing
+    tier: repo
+    priority: 70
+    load_bearing: false
+    matched_by: "paths:**/*_test.go"
+    applied: >-
+      新增 scanlogin_poll_test.go 覆盖 mint/verify/strip 三组纯函数逻辑，
+      以及 loginstatus 在「无 secret / 错 secret / 对 secret」三态下的响应形状。
+      注意 CleanAllTables 不清 Redis，测试需自行清理 scanlogin:poll:* 与限流桶。
+  - id: commit-style
+    tier: repo
+    priority: 60
+    load_bearing: false
+    matched_by: "paths:**"
+    applied: "英文 Conventional Commits；PR 描述英文。"
+
+files_touched:
+  octo-server:
+    - modules/user/scanlogin_poll.go        # new — secret mint/verify/strip helpers
+    - modules/user/scanlogin_poll_test.go   # new — unit + handler-shape coverage
+    - modules/user/api.go                   # getLoginUUID / getloginStatus / routes / limiters
+    - modules/user/api_i18n_test.go         # add new file to the legacy-response guard list
+    - modules/qrcode/api.go                 # authcode TTL 10min -> 5min
+  octo-web:
+    - packages/dmworklogin/src/login_vm.tsx # persist + replay poll_secret
+
+notes:
+  - octo-lib 的 common/constant.go 是外部模块，不可改；新 Redis 前缀在 octo-server 本地定义。
+  - poll_secret TTL 取 6min = 初始二维码 1min + 扫码后续期 5min 的最坏路径总和，
+    避免用户在第 55 秒扫码时 secret 已过期而 qrcode 刚被续到 5min。

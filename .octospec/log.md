@@ -4,6 +4,30 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-07 (scanlogin-poll-binding)
+
+- **Task** — `scanlogin-poll-binding`: `loginstatus` no longer hands `auth_code`
+  to any anonymous caller who knows the uuid. `loginuuid` mints a `poll_secret`
+  (response body only, never in the QR payload) and `loginstatus` releases the
+  credential fields only to a caller presenting it;
+  everyone else gets the real status filtered through an allow-list. Both
+  endpoints — unauthenticated by design, since the QR renders before any token
+  exists — gained `StrictIPRateLimitMiddleware`; `auth_code` TTL 10min → 5min;
+  the secret is revoked on redemption; the 10s long poll releases on disconnect
+  and only reclaims its own channel. Cross-repo: octo-web replays the header.
+  **This closes QR-observer hijack, not QRLJacking** — the attacker mints the
+  uuid and so receives the secret too. The confirm-screen device context that
+  *would* close it was pulled after review: every field of it is
+  attacker-controlled today (gin trusts all proxies, so even the IP is
+  forgeable), which would have turned weak evidence into false assurance.
+  Tracked in octo-ios#71 / octo-android#116. Review also surfaced an auth-code
+  expiry inversion that the TTL change had made reachable, a channel-displacement
+  vector on the long poll, and post-login state (incl. Signal key material)
+  outliving the session — all fixed here. The secret travels as a query
+  parameter; a custom header was tried and reverted — it breaks cross-origin
+  scan-login for a benefit that only holds against readers who already have
+  Redis access. See [journal](journal/shared/scanlogin-poll-binding.md).
+
 ## 2026-08-06 (bot-setting-store)
 
 - **Task** — `bot-setting-store`: added `bot_setting`, a generic per-bot config
