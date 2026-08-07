@@ -431,8 +431,10 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	//
 	// 群 / 子区读的租户锚点是 requireBoundSpaceGroup，不是 space_id 注入：两个 handler 都
 	// 不读请求 Space，requireGroupMember 也只校验群成员资格，于是「主人同时在别的 Space
-	// 有群」就能用这把 key 跨租户读那个群。bot 树没有租户可锚（bot token 不冻结 Space、
-	// bot 无 space_member 行），按 ScopeUnscoped 显式声明，边界是 handler 自己的成员门。
+	// 有群」就能用这把 key 跨租户读那个群。bot 树上 bot token 不冻结 Space、bot 也没有
+	// space_member 行，所以没有租户可锚；但 App Bot 是 DM-only，群/子区读必须显式拒它
+	// （与本模块其它 bot 群端点同一条策略），这道门由 bot_api 在挂载点的 appBotScopeGuard
+	// 承担，故两棵树都声明 ScopeRouteGuard。`bf_*` 的边界仍是 handler 自己的群成员门。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:      http.MethodGet,
 		Path:        "/groups/:group_no/messages/:message_id",
@@ -443,7 +445,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/groups/:group_no/messages/:message_id",
-		Tenant:  authtree.ScopeUnscoped,
+		Tenant:  authtree.ScopeRouteGuard,
 		Handler: m.getGroupMessage,
 	})
 	// DM 单条读。getPersonMessage 是这三种形状里唯一读 Space 的 handler：
@@ -487,7 +489,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 			Method:  http.MethodGet,
 			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
-			Tenant:  authtree.ScopeUnscoped,
+			Tenant:  authtree.ScopeRouteGuard,
 			Handler: m.getThreadMessage,
 		})
 	}

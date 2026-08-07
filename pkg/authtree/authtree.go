@@ -34,37 +34,77 @@
 // # Tenant posture per route
 //
 // Every Route must declare a TenantScope (see Route.Tenant), so what confines a
-// contribution is answerable without tracing into its handler. The current census
-// — keep it accurate when adding a route, it is the reviewable form of the
-// credential's advertised scope:
+// contribution is answerable without tracing into its handler.
+//
+// The census below lists, per route, EVERY request-derived input its handler reads
+// and the confinement for each. Enumerating inputs rather than naming one anchor
+// per route is deliberate: PR #713's review found four cross-tenant reads in a row
+// by walking from a guarded input to an unguarded sibling on the same route or the
+// same tree (/users/:uid was pinned on :uid while its group_no query stayed open
+// for three rounds). A route whose inputs cannot be enumerated does not belong on a
+// tenant-scoped tree. Keep this current when adding a route or when a reused
+// handler starts reading a new input.
 //
 //	TreeUserKey (`uk_*`, tenant = the Space frozen into the key)
-//	  /user/search                                   ScopeRouteGuard  enforceKeySpace pins query space_id; handler filters by it
-//	  /space/:space_id/members                       ScopeRouteGuard  enforceKeySpace rejects a mismatched path Space
-//	  /space/my                                      ScopeRouteGuard  boundSpaceOnly reports only the bound Space
-//	  /messages/person/:peer_uid/:message_id         ScopeBoundSpace  handler isolates on pkg/space GetSpaceID
-//	  /users/:uid                                    ScopeRouteGuard  user.requireBoundSpaceMember
-//	  /groups/:group_no/messages/:message_id         ScopeRouteGuard  message.requireBoundSpaceGroup
-//	  /groups/:group_no/threads/.../:message_id      ScopeRouteGuard  message.requireBoundSpaceGroup (parent group)
-//	  /file/upload/presigned                         ScopeUnscoped    signs a caller-supplied object path; see below
-//	  /file/download/url                             ScopeUnscoped    signs a caller-supplied object path; see below
+//	  GET /user/search                                  ScopeRouteGuard
+//	      ?space_id   pinned to the bound Space by enforceKeySpace
+//	      ?keyword    not tenant-bearing; handler returns only bound-Space members
+//	  GET /space/:space_id/members                      ScopeRouteGuard
+//	      :space_id   enforceKeySpace rejects a mismatch with the bound Space
+//	      ?page/?limit  pagination only
+//	  GET /space/my                                     ScopeRouteGuard
+//	      (no input)  boundSpaceOnly reports only the bound Space
+//	  GET /messages/person/:peer_uid/:message_id        ScopeBoundSpace
+//	      :peer_uid   channel is derived from (peer, key owner); a third party's DM
+//	                  is unreachable, and checkPersonDMAccess gates the rest
+//	      :message_id per-message Space filter via personSpaceAllows on the bound Space
+//	  GET /users/:uid                                   ScopeRouteGuard
+//	      :uid        user.requireBoundSpaceMember — must be a bound-Space member
+//	                  (exempt: self, system bots)
+//	      ?group_no   STRIPPED by that guard. Unguarded it returns another Space's
+//	                  group metadata (source_space_id/name, vercode) because
+//	                  GetGroupMember/IsShowShortNo never check the caller.
+//	  GET /groups/:group_no/messages/:message_id        ScopeRouteGuard
+//	      :group_no   message.requireBoundSpaceGroup — group's effective Space must
+//	                  equal the bound Space
+//	      :message_id visibility handled by respondSingleMessage
+//	  GET /groups/:group_no/threads/:short_id/messages/:message_id  ScopeRouteGuard
+//	      :group_no   same guard (a thread's attribution is its parent group's)
+//	      :short_id / :message_id  thread status + visibility, not tenant-bearing
+//	  GET /file/upload/presigned                        ScopeUnscoped
+//	      ?type/?path/?filename/?fileSize  signs a PUT for a caller-named object
+//	                  key; NOT confined — see below
+//	  GET /file/download/url                            ScopeUnscoped
+//	      ?path       signs a GET for a caller-named object key; NOT confined
 //
 //	TreeBotToken (`bf_*` / `app_*`; a bot token freezes no Space and a bot has no
 //	space_member row, so there is normally no tenant to enforce)
-//	  /messages/person/:peer_uid/:message_id         ScopeRouteGuard  bot_api.appBotDMSpaceGuard (scope=space App Bots)
-//	  /groups/:group_no/messages/:message_id         ScopeUnscoped    gate is the bot's own group membership
-//	  /groups/:group_no/threads/.../:message_id      ScopeUnscoped    same
+//	  GET /messages/person/:peer_uid/:message_id        ScopeRouteGuard
+//	      :peer_uid   bot_api.appBotScopeGuard — a scope=space App Bot's peer must
+//	                  still be a member of its bound Space (mirrors the send path);
+//	                  `bf_*` and platform-scope App Bots are gated by
+//	                  checkPersonDMAccess's friend + bilateral blacklist
+//	  GET /groups/:group_no/messages/:message_id        ScopeRouteGuard
+//	      :group_no   appBotScopeGuard rejects App Bots outright (DM-only, matching
+//	                  every other bot group endpoint); for `bf_*` the gate is the
+//	                  bot's own active group membership
+//	  GET /groups/:group_no/threads/:short_id/messages/:message_id  ScopeRouteGuard
+//	      :group_no   same
+//
+// Mediation covers path params, the query string and X-Space-ID — NOT request
+// bodies. Every route above is a GET, so that is complete today; see
+// enforceKeySpace's comment before adding a non-GET route.
 //
 // The two file routes are the one place where a uk key is NOT confined to its
 // Space: both handlers sign a presigned URL for whatever object path the caller
 // names, with no ownership or Space-prefix check, so knowing another tenant's
-// object key is enough for a cross-tenant read or overwrite. That is faithful
-// parity with the human session route they are reused from, and this PR keeps the
-// existing human object-ownership model rather than introducing a second one — but
-// a `uk_*` is a long-lived non-interactive bearer token handed to CLI and drive
-// clients, so the practical blast radius is larger than for a session cookie.
-// Tightening object ownership has to cover both routes at once and is tracked
-// separately; ScopeUnscoped is the honest declaration until then.
+// object key is enough for a cross-tenant read (download) or overwrite (upload).
+// That is faithful parity with the human session route they are reused from, and
+// this PR keeps the existing human object-ownership model rather than introducing a
+// second one — but a `uk_*` is a long-lived non-interactive bearer token handed to
+// CLI and drive clients, so the practical blast radius is larger than for a session
+// cookie. Tightening object ownership has to cover both routes at once and is
+// tracked separately; ScopeUnscoped is the honest declaration until then.
 package authtree
 
 import (

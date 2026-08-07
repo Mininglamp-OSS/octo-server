@@ -253,15 +253,15 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		}
 		defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
 		if derr != nil {
-			// 与批量 DM 同步路径逐字一致（modules/message/api.go 的 channel/sync 分支）：
-			// 默认 Space 查不到时无法判定归属，按兼容口径 fail-open 保留无标签历史，
-			// 避免一次 DB 抖动把合法 DM 历史静默截断。两个入口必须同口径，否则同一条
-			// 无标签 DM 会出现「sync 能拉到、单条直查 404」的漂移。
+			// 默认 Space 查不到时无法判定归属，按兼容口径 fail-open 保留无标签历史，避免
+			// 一次 DB 抖动把合法 DM 历史静默截断。
 			//
-			// PR #713 review 有分歧：lml2468 认为这里该照 space_filter.go 用 "" sentinel
-			// fail-closed；yujiawei 复核后认为现状正确——那个 sentinel 属于会话/群过滤的
-			// 另一套谓词，而 DM 路径的 fail-open 是上面那条注释里写明的既有决策。保持与
-			// sibling 一致，方向变更留给人来拍板。
+			// 这是 personSpaceAllows 这一族调用点的统一约定，本处是第四个，另三处逐字同款
+			// （modules/message/api.go 的 DM channel sync、DM reaction 读、DM reaction
+			// toggle）。space_filter.go 里那个 "" fail-closed sentinel 服务的是
+			// decideConvKeepInSpace —— 会话**列表**谓词，不是这一族；把本处单独改成
+			// fail-closed 只会造出「sync 能拉到、单条直查 404」的入口漂移，而这条读路径
+			// 存在的意义就是与 sync 同口径。约定本身若要改，四处一起改。
 			m.Warn("查询默认 Space 失败，DM 单条读无标签消息按兼容口径放行",
 				zap.Error(derr), zap.String("loginUID", loginUID))
 			defaultSpaceID = spaceID

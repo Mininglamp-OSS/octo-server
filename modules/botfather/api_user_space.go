@@ -52,6 +52,12 @@ const spaceIDHeader = "X-Space-ID"
 // authUserAPIKey 只读 Authorization 头，SharedUIDRateLimiter 只读 context 里的 uid）。
 // TestUserKeySpaceRuleInjectsBoundSpace 端到端锁住这一点：一旦有中间件前移并读了
 // query，该用例立刻失败。
+//
+// 🔴 中介范围只到 query 与 header，**不含请求体**。今天挂上来的路由全是 GET，所以覆盖是
+// 完整的；但 authtree.MountOn 接受 POST/PUT/DELETE，第一个从 JSON / 表单里读 space_id 的
+// 贡献者会拿到一个「没被校验过的输入」——更糟的是 Go 的 ParseForm 会把 body 值排在 query
+// 值**前面**合进 r.Form，于是 body 里的 space_id 会盖掉上面注入的值。给这棵树加非 GET
+// 路由之前必须先补 body 中介，或者干脆在 Add 处拒掉非 GET。
 func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		bf.enforceKeySpaceWithChecker(c, func(spaceID, uid string) (bool, error) {

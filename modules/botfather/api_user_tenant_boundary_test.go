@@ -177,3 +177,56 @@ func TestUserKeyUserDetailIsPinnedToBoundSpace(t *testing.T) {
 	assert.NotContains(t, cross.Body.String(), "outsider",
 		"the refusal must not leak the target's profile fields")
 }
+
+// 🔴 PR #713 review round 4 P1-1 — the second tenant anchor on /users/:uid.
+//
+// u.get reads group_no as well as :uid, and neither GetGroupMember nor IsShowShortNo
+// checks whether the CALLER is in that group. So a Space-A-bound key naming a Space-B
+// group used to get that group's member block for the target, including vercode
+// (consumed as invite_vercode in the friend-add flow) and the external-member markers
+// source_space_id / source_space_name — another Space's id and human-readable name.
+//
+// requireBoundSpaceMember strips the parameter, so the profile still resolves for an
+// in-Space target while no group-scoped field comes back. The target here is a
+// genuine Space-A colleague, which is what isolates this from the :uid gap already
+// covered above: the only thing under test is group_no.
+func TestUserKeyUserDetailIgnoresCallerSuppliedGroupNo(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+
+	owner := "u_" + util.GenerUUID()[:8]
+	colleague := "u_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, owner, "owner")
+	insertTestUser(t, ctx, colleague, "colleague")
+
+	spaceA := "sp_" + util.GenerUUID()[:8]
+	spaceB := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceA, owner)
+	insertTestSpace(t, ctx, spaceA, colleague)
+	insertTestSpace(t, ctx, spaceB, colleague)
+
+	// A Space-B group the colleague belongs to and the key owner does not.
+	groupNo := newGroupNo()
+	insertTestGroupInSpaceWithMember(t, ctx, groupNo, spaceB, colleague)
+
+	get := func(token, query string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, userAPIRequest(t, http.MethodGet,
+			"/v1/user/users/"+colleague+query, token, nil))
+		return w
+	}
+
+	token := mintUserAPIKeyInSpace(t, ctx, owner, spaceA)
+
+	plain := get(token, "")
+	require.Equal(t, http.StatusOK, plain.Code,
+		"an in-Space colleague must still resolve: %s", plain.Body.String())
+
+	withGroup := get(token, "?group_no="+groupNo)
+	require.Equal(t, http.StatusOK, withGroup.Code, withGroup.Body.String())
+	for _, leaked := range []string{"vercode", "source_space_name", "source_space_id", spaceB} {
+		assert.NotContains(t, withGroup.Body.String(), leaked,
+			"a caller-supplied group_no must not surface %q: %s", leaked, withGroup.Body.String())
+	}
+	assert.JSONEq(t, plain.Body.String(), withGroup.Body.String(),
+		"group_no is stripped, so the response must be identical to the one without it")
+}

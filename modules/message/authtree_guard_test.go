@@ -94,11 +94,10 @@ func TestGroupSpaceAllows(t *testing.T) {
 // TestPersonSpaceAllowsUnlabelledDMIsDefaultSpaceOnly 固定 personSpaceAllows 规则 2
 // 与 getPersonMessage 默认 Space 错误路径的关系。
 //
-// PR #713 review 对错误路径有分歧：lml2468 要求置 "" sentinel（fail-closed），
-// yujiawei 复核认为现状（置请求 Space，fail-open）正确，因为批量 DM 同步路径
-// 逐字同款且注释写明是刻意决策，两个入口必须同口径。当前实现按后者保持 fail-open；
-// 本用例锁住 sentinel 与 fail-open 两种取值各自的后果，这样将来若拍板改方向，
-// 改的人能立刻看到差别在哪一条规则上。
+// 该错误路径按这一族调用点的统一约定 fail-open（defaultSpaceID = 请求 Space），四个
+// 调用点逐字同款；space_filter.go 的 "" sentinel 服务的是会话列表谓词，不是这一族。
+// 本用例把两种取值各自的后果都锁住：将来若整族改成 fail-closed，改的人能立刻看到差别
+// 落在哪一条规则上。
 func TestPersonSpaceAllowsUnlabelledDMIsDefaultSpaceOnly(t *testing.T) {
 	const requested = "sp_a"
 
@@ -107,7 +106,7 @@ func TestPersonSpaceAllowsUnlabelledDMIsDefaultSpaceOnly(t *testing.T) {
 	assert.False(t, personSpaceAllows("", false, requested, "sp_other"),
 		"无标签 DM 在非默认 Space 不保留")
 	assert.False(t, personSpaceAllows("", false, requested, ""),
-		"若改用 \"\" sentinel，同一条无标签 DM 变为隐藏——这就是两位 reviewer 的分歧点")
+		"若整族改用 \"\" sentinel，同一条无标签 DM 变为隐藏——这是约定变更的落点")
 	assert.True(t, personSpaceAllows(requested, false, requested, ""),
 		"精确匹配的 DM 与 defaultSpaceID 取值无关")
 }

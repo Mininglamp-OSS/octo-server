@@ -20,11 +20,11 @@ type appBotGuardCredential struct {
 	spaceID string
 }
 
-// newAppBotDMGuardRoute mounts the two contributed bot-tree shapes (a DM read with
-// :peer_uid and a group read without one) behind appBotDMSpaceGuard, with the
+// newAppBotGuardRoute mounts the two contributed bot-tree shapes (a DM read with
+// :peer_uid and a group read without one) behind appBotScopeGuard, with the
 // space-membership query injected. spaceMemberQueryOverride exists for exactly this
 // kind of DB-free App Bot permission test (see send_permission_observability_test).
-func newAppBotDMGuardRoute(cred appBotGuardCredential, check func(uid, spaceID string) (bool, error)) *wkhttp.WKHttp {
+func newAppBotGuardRoute(cred appBotGuardCredential, check func(uid, spaceID string) (bool, error)) *wkhttp.WKHttp {
 	ba := &BotAPI{Log: log.NewTLog("app-bot-dm-guard-test"), spaceMemberQueryOverride: check}
 	r := wkhttp.New()
 	group := r.Group("/v1/bot", func(c *wkhttp.Context) {
@@ -39,7 +39,7 @@ func newAppBotDMGuardRoute(cred appBotGuardCredential, check func(uid, spaceID s
 		}
 		c.Next()
 	})
-	mount := authtree.MountOn(group, ba.appBotDMSpaceGuard())
+	mount := authtree.MountOn(group, ba.appBotScopeGuard())
 	reached := func(c *wkhttp.Context) { c.String(http.StatusOK, "reached") }
 	mount(authtree.Route{
 		Method: http.MethodGet, Path: "/messages/person/:peer_uid/:message_id",
@@ -47,7 +47,7 @@ func newAppBotDMGuardRoute(cred appBotGuardCredential, check func(uid, spaceID s
 	})
 	mount(authtree.Route{
 		Method: http.MethodGet, Path: "/groups/:group_no/messages/:message_id",
-		Tenant: authtree.ScopeUnscoped, Handler: reached,
+		Tenant: authtree.ScopeRouteGuard, Handler: reached,
 	})
 	return r
 }
@@ -72,9 +72,9 @@ var allowMembership = func(string, string) (bool, error) { return true, nil }
 // BotKindApp rule 3 refuses when the target is no longer a member of the bot's
 // Space. Without this guard a scope=space App Bot can therefore READ historical DM
 // bodies for a user it can no longer SEND to.
-func TestAppBotDMSpaceGuardRefusesPeerOutsideBoundSpace(t *testing.T) {
+func TestAppBotScopeGuardRefusesPeerOutsideBoundSpace(t *testing.T) {
 	var gotUID, gotSpace string
-	r := newAppBotDMGuardRoute(
+	r := newAppBotGuardRoute(
 		appBotGuardCredential{kind: BotKindApp, scope: "space", spaceID: "sp_bot"},
 		func(uid, spaceID string) (bool, error) {
 			gotUID, gotSpace = uid, spaceID
@@ -91,8 +91,8 @@ func TestAppBotDMSpaceGuardRefusesPeerOutsideBoundSpace(t *testing.T) {
 
 // The positive control: a peer still inside the bound Space reads normally, so the
 // guard narrows the reachable set rather than disabling the route.
-func TestAppBotDMSpaceGuardAllowsPeerInBoundSpace(t *testing.T) {
-	r := newAppBotDMGuardRoute(
+func TestAppBotScopeGuardAllowsPeerInBoundSpace(t *testing.T) {
+	r := newAppBotGuardRoute(
 		appBotGuardCredential{kind: BotKindApp, scope: "space", spaceID: "sp_bot"},
 		allowMembership)
 
@@ -104,13 +104,13 @@ func TestAppBotDMSpaceGuardAllowsPeerInBoundSpace(t *testing.T) {
 // Credentials the rule does not apply to must pass through untouched: a User Bot
 // (`bf_`) has no scope binding at all, and a platform-scope App Bot is deliberately
 // not Space-confined. Neither may cost a membership lookup.
-func TestAppBotDMSpaceGuardIgnoresUnscopedCredentials(t *testing.T) {
+func TestAppBotScopeGuardIgnoresUnscopedCredentials(t *testing.T) {
 	for _, cred := range []appBotGuardCredential{
 		{kind: BotKindUser},
 		{kind: BotKindApp, scope: "platform"},
 	} {
 		called := false
-		r := newAppBotDMGuardRoute(cred, func(string, string) (bool, error) {
+		r := newAppBotGuardRoute(cred, func(string, string) (bool, error) {
 			called = true
 			return false, nil
 		})
@@ -123,8 +123,8 @@ func TestAppBotDMSpaceGuardIgnoresUnscopedCredentials(t *testing.T) {
 
 // A scope=space App Bot with no bound Space in context is a wiring fault, and the
 // send path treats it as a hard failure rather than a pass. The read must too.
-func TestAppBotDMSpaceGuardFailsClosedOnMissingSpaceContext(t *testing.T) {
-	r := newAppBotDMGuardRoute(
+func TestAppBotScopeGuardFailsClosedOnMissingSpaceContext(t *testing.T) {
+	r := newAppBotGuardRoute(
 		appBotGuardCredential{kind: BotKindApp, scope: "space"},
 		allowMembership)
 
@@ -134,8 +134,8 @@ func TestAppBotDMSpaceGuardFailsClosedOnMissingSpaceContext(t *testing.T) {
 }
 
 // A membership-lookup failure must not be folded into "allowed".
-func TestAppBotDMSpaceGuardFailsClosedOnCheckError(t *testing.T) {
-	r := newAppBotDMGuardRoute(
+func TestAppBotScopeGuardFailsClosedOnCheckError(t *testing.T) {
+	r := newAppBotGuardRoute(
 		appBotGuardCredential{kind: BotKindApp, scope: "space", spaceID: "sp_bot"},
 		func(string, string) (bool, error) { return false, errors.New("space member store down") })
 
@@ -144,20 +144,46 @@ func TestAppBotDMSpaceGuardFailsClosedOnCheckError(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "reached")
 }
 
-// The guard sits in the bot tree's shared before-chain, so it runs for every
-// contributed route — it must be inert on the ones with no DM peer. Group and
-// thread reads are gated by the bot's own group membership instead; blocking them
-// here would break that capability for every scope=space App Bot.
-func TestAppBotDMSpaceGuardIgnoresRoutesWithoutPeerUID(t *testing.T) {
+// PR #713 review round 4 P2-1 — the group shape. Every other bot group/thread
+// endpoint rejects App Bots outright ("App Bot is DM-only", validateBotGroupAccess
+// and the inline equivalents in groups.go). These two contributed routes happen to
+// 404 for `app_*` anyway, because requireGroupMember needs an active group_member
+// row and App Bots have none — but that is luck standing in for the policy the rest
+// of the module states explicitly, so state it here too.
+func TestAppBotScopeGuardRejectsAppBotOnGroupRoutes(t *testing.T) {
 	called := false
-	r := newAppBotDMGuardRoute(
+	r := newAppBotGuardRoute(
 		appBotGuardCredential{kind: BotKindApp, scope: "space", spaceID: "sp_bot"},
 		func(string, string) (bool, error) {
 			called = true
-			return false, nil
+			return true, nil
 		})
 
 	w := appBotGuardGet(t, r, "/v1/bot/groups/g_1/messages/1")
+	assert.NotEqual(t, http.StatusOK, w.Code,
+		"App Bot is DM-only; group reads must be refused: %s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "reached", "the handler must not run")
+	assert.False(t, called, "a group route has no DM peer to check membership for")
+
+	// A platform-scope App Bot is refused on the same grounds — the DM-only policy is
+	// about the credential kind, not its scope.
+	platform := appBotGuardGet(t,
+		newAppBotGuardRoute(appBotGuardCredential{kind: BotKindApp, scope: "platform"}, allowMembership),
+		"/v1/bot/groups/g_1/messages/1")
+	assert.NotEqual(t, http.StatusOK, platform.Code, platform.Body.String())
+}
+
+// A User Bot (`bf_*`) must keep reaching the group route — its gate is its own active
+// group membership, and the App Bot rejection must not cost it that capability.
+func TestAppBotScopeGuardAllowsUserBotOnGroupRoutes(t *testing.T) {
+	called := false
+	r := newAppBotGuardRoute(appBotGuardCredential{kind: BotKindUser}, func(string, string) (bool, error) {
+		called = true
+		return false, nil
+	})
+
+	w := appBotGuardGet(t, r, "/v1/bot/groups/g_1/messages/1")
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.False(t, called, "a route with no DM peer has nothing for this guard to decide")
+	assert.Equal(t, "reached", w.Body.String())
+	assert.False(t, called, "a group route must not trigger a DM-peer Space check")
 }

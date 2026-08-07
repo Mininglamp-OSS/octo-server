@@ -347,8 +347,12 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 
 	if spaceID == "" {
 		var spaceIDs []string
+		// ORDER BY 是必需的，不是整洁癖：没有它 MySQL 可以在两次请求间返回不同的第一行，
+		// 于是同一个客户端翻 1..N 页可能被喂来自**不同 Space** 的页。加分页之前只取一页，
+		// 这个不确定性看不出来；drive 的 IsSpaceMember 要翻过 200 人正是本端点的动机，
+		// 所以这是真实危害而非理论问题。
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT space_id FROM space_member WHERE uid=? AND status=1", robotID,
+			"SELECT space_id FROM space_member WHERE uid=? AND status=1 ORDER BY space_id", robotID,
 		).Load(&spaceIDs)
 		if err != nil || len(spaceIDs) == 0 {
 			c.JSON(http.StatusOK, []MemberInfo{})
