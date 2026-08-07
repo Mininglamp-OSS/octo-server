@@ -359,7 +359,7 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		// limit is the ceiling shared by every bounded version. perVersion
 		// overrides it for fields whose ceiling diverged across versions.
 		limit      int
-		perVersion func(string) int
+		perVersion func(*testing.T, string) int
 		set        func(map[string]any, string)
 	}{
 		{name: "reasoningId", limit: 512, set: setTop("reasoningId")},
@@ -380,7 +380,7 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 			t.Run(version.version+"/"+tc.name, func(t *testing.T) {
 				limit := tc.limit
 				if tc.perVersion != nil {
-					limit = tc.perVersion(version.version)
+					limit = tc.perVersion(t, version.version)
 				}
 				unit := units[i%len(units)]
 				exact := readSampleMap(t, version.root, "reasoning")
@@ -449,7 +449,7 @@ func TestSuccessorWorstCaseRendersEveryView(t *testing.T) {
 				data["progressText"] = strings.Repeat("进", 160)
 				data["errorTitle"] = strings.Repeat("错", 64)
 				data["errorMessage"] = strings.Repeat("误", 121)
-				data["phases"] = worstCasePhases(reasoningThoughtMax(version.version))
+				data["phases"] = worstCasePhases(reasoningThoughtMax(t, version.version))
 
 				if err := renderData(reg, version.version, tc.state, data); err != nil {
 					t.Fatalf("worst-case %s render: %v", tc.state, err)
@@ -532,12 +532,20 @@ func worstCasePhases(thoughtMax int) []any {
 // it to the producer's observed output (280 + `…` = 281); V4 raised it to a
 // platform product cap (4000 + `…` = 4001) that deliberately no longer tracks
 // producer truncation, so the two must be asserted separately rather than
-// through one shared constant.
-func reasoningThoughtMax(version string) int {
-	if version == reasoningVersionV4 {
+// through one shared constant. Keyed explicitly per version and fatal on an
+// unknown one: a default would silently bless a future version that narrowed the
+// bound back down, since the bounds table would still pass.
+func reasoningThoughtMax(t *testing.T, version string) int {
+	t.Helper()
+	switch version {
+	case aireasoningprocess.TemplateVersionV2, reasoningVersionV3:
+		return 281
+	case reasoningVersionV4:
 		return 4001
+	default:
+		t.Fatalf("reasoningThoughtMax: unhandled version %q — add its ceiling explicitly", version)
+		return 0
 	}
-	return 281
 }
 
 func renderData(reg *cardtmpl.Registry, version string, state cardtmpl.State, data map[string]any) error {

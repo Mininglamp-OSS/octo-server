@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 )
@@ -151,20 +152,25 @@ func TestSimplifiedSuccessorWidensThoughtBound(t *testing.T) {
 	}
 
 	v3Max, v4Max := jsonNumber(t, v3Spec["maxLength"]), jsonNumber(t, v4Spec["maxLength"])
-	if want := reasoningThoughtMax(reasoningVersionV4); v4Max != want {
+	if want := reasoningThoughtMax(t, reasoningVersionV4); v4Max != want {
 		t.Fatalf("V4 thought maxLength = %d, want %d", v4Max, want)
 	}
-	if v3Max != reasoningThoughtMax(reasoningVersionV3) {
+	if v3Max != reasoningThoughtMax(t, reasoningVersionV3) {
 		t.Fatalf("V3 thought maxLength = %d, want it frozen at %d",
-			v3Max, reasoningThoughtMax(reasoningVersionV3))
+			v3Max, reasoningThoughtMax(t, reasoningVersionV3))
 	}
 	if v4Max <= v3Max {
 		t.Fatalf("V4 thought maxLength = %d must be a widening of V3's %d", v4Max, v3Max)
 	}
 	// Still bounded: an unbounded string fails DefaultCompileLimits' fail-close
-	// publish path, and trust-boundary requires an explicit ceiling.
-	if v4Spec["minLength"] == nil || v4Spec["maxLength"] == nil {
-		t.Fatal("thought must stay explicitly bounded on both ends")
+	// publish path, and trust-boundary requires an explicit ceiling. Assert the
+	// lower bound's *value* against V3, not just its presence — `minLength: 0`
+	// would satisfy a presence check while admitting the empty string.
+	if v4Spec["maxLength"] == nil {
+		t.Fatal("thought must keep an explicit upper bound")
+	}
+	if v3Min, v4Min := jsonNumber(t, v3Spec["minLength"]), jsonNumber(t, v4Spec["minLength"]); v4Min != v3Min {
+		t.Fatalf("thought minLength = %d, want V3's %d (only the ceiling moves)", v4Min, v3Min)
 	}
 
 	// The widened ceiling must actually render at the worst case, not just
@@ -179,23 +185,6 @@ func TestSimplifiedSuccessorWidensThoughtBound(t *testing.T) {
 		if err := renderData(reg, reasoningVersionV4, tc.state, data); err != nil {
 			t.Fatalf("%s at the widened thought ceiling: %v", tc.state, err)
 		}
-	}
-}
-
-func jsonNumber(t *testing.T, raw any) int {
-	t.Helper()
-	switch value := raw.(type) {
-	case float64:
-		return int(value)
-	case json.Number:
-		parsed, err := value.Int64()
-		if err != nil {
-			t.Fatalf("maxLength %v is not an integer: %v", raw, err)
-		}
-		return int(parsed)
-	default:
-		t.Fatalf("maxLength %v has unexpected type %T", raw, raw)
-		return 0
 	}
 }
 
@@ -318,7 +307,7 @@ func TestSimplifiedSuccessorNodeBudgetCeiling(t *testing.T) {
 			data["progressText"] = strings.Repeat("进", 160)
 			data["errorTitle"] = strings.Repeat("错", 64)
 			data["errorMessage"] = strings.Repeat("误", 121)
-			data["phases"] = worstCasePhases(reasoningThoughtMax(reasoningVersionV4))
+			data["phases"] = worstCasePhases(reasoningThoughtMax(t, reasoningVersionV4))
 			if err := renderData(reg, reasoningVersionV4, tc.state, data); err != nil {
 				t.Fatalf("worst case admitted by the schema must render: %v", err)
 			}
@@ -611,6 +600,127 @@ func TestSimplifiedSuccessorResultFrameRejectsSubmitEvenWithMatchingGolden(t *te
 		!strings.Contains(got, "Action.Submit") || !strings.Contains(got, "octo/v1") {
 		t.Fatalf("error = %q, want an octo/v1 cardmsg profile rejection "+
 			"(a golden mismatch here would mean the frame check is not the guard)", got)
+	}
+}
+
+// D3a persistence ceiling. `cardmsg.MaxPayloadBytes` (512 KiB) is the only size
+// gate a rendered frame passes, but it is not the smallest one downstream: the
+// authoritative bot-edit write stores the whole marshalled frame in
+// `message_extra.content_edit`, a MySQL TEXT column (65,535 bytes, never widened
+// by a later migration — `octo_message_card_revision.content` likewise).
+//
+// This test is deliberately a *record of the gap*, not a green-path assertion:
+// what the schema now admits exceeds that column, and D3a makes widening it (or
+// capping the producer) a precondition of the consumer's THOUGHT_MAX bump. Two
+// things are pinned so the record cannot silently drift:
+//
+//  1. at the producer's actual cap today (281) every encoding still fits, which
+//     is why nothing regresses at this head;
+//  2. at the schema ceiling it does not fit — and the byte worst case is NOT the
+//     CJK fixture the other tests use. JSON Schema counts code points while the
+//     wire counts bytes, and Go escapes `<`, `>`, `&`, U+2028, U+2029 to six
+//     bytes each, so the true maximum is ~1.7× the CJK figure.
+//
+// If someone widens the column or lowers the ceiling, this test's numbers move
+// and the brief/journal claims have to move with them.
+func TestSimplifiedSuccessorFrameVsPersistedTextColumn(t *testing.T) {
+	// MySQL TEXT, per modules/message/sql/20220414000001_message_legacy01.sql:3.
+	const mysqlTextLimit = 65535
+	reg := newRegistry(t)
+
+	worstFrameBytes := func(t *testing.T, thoughtLen int, unit string) int {
+		t.Helper()
+		var maxSeen int
+		for _, tc := range reasoningStates {
+			data := readSampleMap(t, reasoningRootV4, "reasoning")
+			data["state"] = string(tc.state)
+			data["reasoningId"] = strings.Repeat("r", 512)
+			data["title"] = strings.Repeat("题", 64)
+			data["statusLabel"] = strings.Repeat("状", 32)
+			data["timerText"] = strings.Repeat("时", 128)
+			data["collapsedSummary"] = strings.Repeat("摘", 160)
+			data["progressText"] = strings.Repeat("进", 160)
+			data["errorTitle"] = strings.Repeat("错", 64)
+			data["errorMessage"] = strings.Repeat("误", 121)
+			phases := phasesWithActionCounts(3, 2, 2, 2, 2, 2)
+			for _, rawPhase := range phases {
+				phase := rawPhase.(map[string]any)
+				phase["thought"] = strings.Repeat(unit, thoughtLen)
+				for _, rawAction := range phase["actions"].([]any) {
+					action := rawAction.(map[string]any)
+					action["tool"] = strings.Repeat("工", 81)
+					action["detail"] = strings.Repeat("详", 192)
+				}
+			}
+			data["phases"] = phases
+			raw, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+				reasoningVersionV4, tc.state, raw, cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+			if err != nil {
+				t.Fatalf("thought=%d unit=%q state=%s: %v", thoughtLen, unit, tc.state, err)
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(encoded) > maxSeen {
+				maxSeen = len(encoded)
+			}
+		}
+		return maxSeen
+	}
+
+	// (1) Today's producer cap fits the column under every encoding.
+	producerCap := reasoningThoughtMax(t, reasoningVersionV3) // 281, what the plugin emits
+	for _, unit := range []string{"思", "😀", "<"} {
+		if got := worstFrameBytes(t, producerCap, unit); got > mysqlTextLimit {
+			t.Fatalf("frame at the producer's current cap (%d x %q) = %d B, over the %d B column — "+
+				"this would be a live regression, not deferred headroom",
+				producerCap, unit, got, mysqlTextLimit)
+		}
+	}
+
+	// (2) The schema ceiling does not, and the escape-heavy case is the real max.
+	ceiling := reasoningThoughtMax(t, reasoningVersionV4) // 4001
+	cjk := worstFrameBytes(t, ceiling, "思")
+	escaped := worstFrameBytes(t, ceiling, "<")
+	if cjk <= mysqlTextLimit {
+		t.Fatalf("frame at the schema ceiling = %d B, now within the %d B column — "+
+			"the column was widened or the ceiling lowered; update D3a, the journal, "+
+			"and the pending learning, which all document this as an open precondition",
+			cjk, mysqlTextLimit)
+	}
+	if escaped <= cjk {
+		t.Fatalf("escape-heavy frame (%d B) should exceed the CJK frame (%d B): "+
+			"Go escapes <, >, &, U+2028, U+2029 to 6 bytes, so CJK is not the byte worst case",
+			escaped, cjk)
+	}
+	if escaped > cardmsg.MaxPayloadBytes {
+		t.Fatalf("escape-heavy frame = %d B exceeds cardmsg.MaxPayloadBytes (%d) — "+
+			"the render gate itself would now reject the schema's own worst case",
+			escaped, cardmsg.MaxPayloadBytes)
+	}
+	t.Logf("frame vs 64 KiB TEXT column: producer cap %d fits; ceiling %d = %d B CJK (%.2fx) / %d B escaped (%.2fx)",
+		producerCap, ceiling, cjk, float64(cjk)/mysqlTextLimit, escaped, float64(escaped)/mysqlTextLimit)
+}
+
+func jsonNumber(t *testing.T, raw any) int {
+	t.Helper()
+	switch value := raw.(type) {
+	case float64:
+		return int(value)
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			t.Fatalf("bound %v is not an integer: %v", raw, err)
+		}
+		return int(parsed)
+	default:
+		t.Fatalf("bound %v has unexpected type %T", raw, raw)
+		return 0
 	}
 }
 
