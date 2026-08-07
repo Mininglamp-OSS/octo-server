@@ -896,20 +896,17 @@ func contentEditColumnBytes(t *testing.T) int {
 	return width
 }
 
-// D4a: the chevrons fetch their icons from a third-party CDN. That is an accepted,
-// disclosed decision for 0.4.0 — not an oversight — so pin exactly what ships:
-// which host, and that nothing else outbound crept in alongside it. `cardmsg`'s
-// checkURL only constrains the scheme, and a template-authored URL is
-// server-authored and therefore trusted by construction, so no other gate would
-// notice a new external dependency being added to a template.
+// D4a: the chevrons are inline `data:image/svg+xml` icons, not a third-party fetch.
+// The shape this replaced pulled them from api.iconify.design, which made every
+// viewer of every reasoning card hit an external host — and because rendered cards
+// are persisted immutably, that reference would have been permanent. Pin the
+// outcome: no outbound runtime URL at all, in the templates or the goldens.
 //
-// If this fails, either the icons moved (update D4a and its CSP/egress
-// precondition) or a second outbound reference was introduced, which needs its own
-// decision rather than inheriting this one.
-func TestSimplifiedSuccessorOutboundResourceHostsAreDisclosed(t *testing.T) {
-	const disclosed = "https://api.iconify.design/lucide/chevron-"
+// `cardmsg`'s checkURL only constrains the scheme, and a template-authored URL is
+// server-authored, so nothing else here would notice an external reference coming
+// back.
+func TestSimplifiedSuccessorHasNoOutboundRuntimeDependency(t *testing.T) {
 	urlPattern := regexp.MustCompile(`https?://[^"\s]+`)
-
 	for _, relative := range []string{
 		"templates/active.template.json", "templates/result.template.json",
 		"templates/error.template.json",
@@ -920,35 +917,48 @@ func TestSimplifiedSuccessorOutboundResourceHostsAreDisclosed(t *testing.T) {
 		content := string(readAsset(t, reasoningRootV4+"/"+relative))
 		for _, found := range urlPattern.FindAllString(content, -1) {
 			switch {
-			case strings.HasPrefix(found, disclosed):
-				// The documented chevron dependency (D4a).
 			case strings.HasPrefix(found, "http://adaptivecards.io/schemas/"):
 				// $schema meta-identifier, never fetched.
+			case strings.HasPrefix(found, "http://www.w3.org/2000/svg"):
+				// SVG namespace inside the inline data URI — an identifier, not a fetch.
 			default:
-				t.Fatalf("%s references undisclosed outbound URL %q — a built-in template's "+
-					"external dependencies are trusted by construction (checkURL gates the "+
-					"scheme, not the host), so each one needs a recorded decision like D4a",
-					relative, found)
+				t.Fatalf("%s references outbound URL %q; V4 must carry no runtime "+
+					"dependency outside the deployment (D4a)", relative, found)
 			}
 		}
 	}
 
-	// The frozen predecessors carry no outbound runtime dependency at all; keep that
-	// contrast true, since it is what makes V4's the precedent-setting one.
+	// The icons must actually be inline, and must survive the render path — which
+	// accepts them only because cardtmpl passes cardmsg.AllowInlineImageData().
+	reg := newRegistry(t)
+	for _, tc := range reasoningStates {
+		payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+			reasoningVersionV4, tc.state, readSample(t, reasoningRootV4, string(tc.state)),
+			cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+		if err != nil {
+			t.Fatalf("render %s: %v", tc.state, err)
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(encoded), "data:image/svg+xml,") {
+			t.Fatalf("rendered %s frame carries no inline icon", tc.state)
+		}
+	}
+
+	// The frozen predecessors never had one; keep that true.
 	for _, root := range []string{aireasoningprocess.HandoffRootV1, aireasoningprocess.HandoffRootV2, reasoningRootV3} {
 		for _, relative := range []string{
 			"templates/active.template.json", "templates/result.template.json",
 			"templates/error.template.json",
 		} {
-			content := string(readAsset(t, root+"/"+relative))
-			if strings.Contains(content, "api.iconify.design") {
-				t.Fatalf("%s/%s gained an outbound icon reference; frozen versions must not change",
-					root, relative)
+			if strings.Contains(string(readAsset(t, root+"/"+relative)), "api.iconify.design") {
+				t.Fatalf("%s/%s gained an outbound icon reference", root, relative)
 			}
 		}
 	}
 }
-
 func jsonNumber(t *testing.T, raw any) int {
 	t.Helper()
 	switch value := raw.(type) {
