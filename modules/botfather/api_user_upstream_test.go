@@ -363,3 +363,74 @@ func TestUserKeyBotsRoutesUnaffectedByTenantMiddleware(t *testing.T) {
 		"/v1/user/bots?space_id=sp_totally_unrelated", token, nil))
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
+
+// TestUserKeyPresignedUploadRefusesCallerObjectKey exercises the guard through the
+// real uk tree — its own auth and tenant middleware in front — which is the one
+// thing modules/file cannot assert DB-free: that the refusal survives contact with
+// the tree, and that tightening the route did not turn it into a second door for
+// the other two credential kinds.
+//
+// 🔴 PR #713 review (lml2468 P1 / yujiawei S-1) — the integrity hole it closes.
+// getUploadCredentials signs a 30-minute PUT for whatever object key the caller
+// puts in `path`, and nothing below it checks who owns that key. A `uk_*` is a
+// long-lived non-interactive bearer token on a CLI/drive client, so without this
+// guard knowing any object key buys write access to it and the object can be
+// overwritten. The guard refuses a caller-named key outright, leaving only
+// server-minted ones — see modules/file/authtree_guard.go for why rejecting beats
+// validating here, and modules/file/authtree_guard_test.go for the route-level
+// behaviour (whitespace path, server-minted key shape, human route untouched).
+//
+// Download is deliberately NOT guarded the same way; the asymmetry is a
+// maintainer-confirmed trade-off recorded in pkg/authtree's census.
+func TestUserKeyPresignedUploadRefusesCallerObjectKey(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+
+	uid := "u_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, uid, "owner")
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceID, uid)
+	ukToken := mintUserAPIKeyInSpace(t, ctx, uid, spaceID)
+
+	botID := "bot_" + util.GenerUUID()[:8]
+	botToken := insertTestBot(t, ctx, botID, uid)
+
+	const withPath = "/v1/user/file/upload/presigned" +
+		"?type=common&path=/common/victim/secret.pdf&filename=a.pdf&fileSize=10"
+	const withoutPath = "/v1/user/file/upload/presigned" +
+		"?type=common&filename=a.pdf&fileSize=10"
+
+	// The guard's own refusal, matched on its message so an unrelated 400
+	// (bad fileSize, blocked extension) cannot stand in for it.
+	const guardRefusal = "自定义上传路径"
+
+	t.Run("uk with a caller-named path is refused", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, withPath, ukToken, nil))
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), guardRefusal,
+			"the guard must be mounted on this route, not just defined")
+	})
+
+	// The positive control: the shape octo-drive actually sends must still pass the
+	// guard. Asserted as "the guard did not fire" rather than 200, because whether
+	// the signer succeeds depends on the object-storage backend configured for the
+	// test run, and that is not what this test is about.
+	t.Run("uk without a path passes the guard", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, withoutPath, ukToken, nil))
+		assert.NotContains(t, w.Body.String(), guardRefusal,
+			"omitting path is the supported shape and must not be refused: %s", w.Body.String())
+	})
+
+	// The wrong credentials still bounce off authUserAPIKey, ahead of the guard —
+	// the tightening must not have turned the route into a second door.
+	for name, token := range map[string]string{"bf": botToken, "session": testutil.Token} {
+		t.Run(name+" is still rejected", func(t *testing.T) {
+			for _, path := range []string{withPath, withoutPath} {
+				w := httptest.NewRecorder()
+				route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, path, token, nil))
+				assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+			}
+		})
+	}
+}

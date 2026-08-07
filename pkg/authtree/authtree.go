@@ -71,12 +71,16 @@
 //	  GET /groups/:group_no/threads/:short_id/messages/:message_id  ScopeRouteGuard
 //	      :group_no   same guard (a thread's attribution is its parent group's)
 //	      :short_id / :message_id  thread status + visibility, not tenant-bearing
-//	  GET /file/upload/presigned                        ScopeUnscoped
-//	      ?type/?path/?filename/?fileSize/?contentType  signs a PUT for a
-//	                  caller-named object key; NOT confined — see below
+//	  GET /file/upload/presigned                        ScopeRouteGuard
+//	      ?path       REJECTED when non-empty by file.rejectCallerObjectKey, so
+//	                  the object key is always server-minted — a caller cannot
+//	                  name an existing object to obtain a PUT URL for it
+//	      ?type       allow-listed by checkReq; becomes the key's prefix
+//	      ?filename/?fileSize/?contentType  only the (allow-listed) extension
+//	                  reaches the key; filename goes to Content-Disposition
 //	  GET /file/download/url                            ScopeUnscoped
 //	      ?path/?filename/?disposition  signs a GET for a caller-named object key;
-//	                  NOT confined
+//	                  deliberately NOT confined — see below
 //
 //	TreeBotToken (`bf_*` / `app_*`; a bot token freezes no Space and a bot has no
 //	space_member row, so there is normally no tenant to enforce)
@@ -96,16 +100,33 @@
 // bodies. Every route above is a GET, so that is complete today; see
 // enforceKeySpace's comment before adding a non-GET route.
 //
-// The two file routes are the one place where a uk key is NOT confined to its
-// Space: both handlers sign a presigned URL for whatever object path the caller
-// names, with no ownership or Space-prefix check, so knowing another tenant's
-// object key is enough for a cross-tenant read (download) or overwrite (upload).
-// That is faithful parity with the human session route they are reused from, and
-// this PR keeps the existing human object-ownership model rather than introducing a
-// second one — but a `uk_*` is a long-lived non-interactive bearer token handed to
-// CLI and drive clients, so the practical blast radius is larger than for a session
-// cookie. Tightening object ownership has to cover both routes at once and is
-// tracked separately; ScopeUnscoped is the honest declaration until then.
+// The two file routes are the only place where a uk key's reach is not defined by
+// the Space frozen into it, because what they authorize is an object key rather
+// than a tenant-owned row. The two sides are NOT symmetric, and this PR treats
+// them differently on a maintainer-confirmed trade-off:
+//
+// Download stays ScopeUnscoped, deliberately. Buckets are created public-read
+// (modules/file/service_minio.go applies readOnlyAnonymousPolicy — "allow
+// anonymous download only"; service_oss.go creates with oss.ACLPublicRead), so
+// knowing an object key is already enough to GET the object with no credential at
+// all. Under that deployment model an object key IS the read capability, and the
+// 30-minute signed URL supplies filename/disposition rather than confidentiality.
+// Adding a Space check to this one signing route would therefore move no real
+// boundary while implying one exists. Confidentiality has to be fixed a layer
+// down (ownership table, capability token, bucket policy) and is tracked
+// separately.
+//
+// Upload is ScopeRouteGuard, tightened here. Its risk is integrity, not
+// confidentiality: signing a PUT for a caller-named key hands out write access to
+// an existing object, and that boundary really does live on this route — nothing
+// downstream re-checks it. file.rejectCallerObjectKey refuses a non-empty `path`
+// outright, so the key is always server-minted and no known-key overwrite is
+// reachable. Rejecting rather than validating is the point: the server has no
+// fact source for "who owns this key", so removing the caller's ability to name a
+// target is the only guard that cannot be written wrong. The bot tree already
+// works this way (bot_api.botUploadPresigned takes only filename + fileSize).
+// The human session routes and the shared handler are unchanged — a browser's
+// custom `path` is a capability octo-web uses today.
 package authtree
 
 import (
