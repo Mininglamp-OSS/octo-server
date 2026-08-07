@@ -73,13 +73,21 @@ func BoundSpaceID(c *wkhttp.Context) string {
 //
 // Only TreeUserKey has a tenant to publish: its credential freezes a Space at
 // issue time and its mount re-checks the owner's membership in that Space before
-// this runs. A bot token carries no Space and a bot has no space_member row, so
+// this runs. A key issued before Space binding carries no Space, so it keeps the
+// empty-Space path exactly as a session without a verified Space does — a
+// backwards-compatibility case, not the posture new keys should be issued in.
+// A bot token likewise carries no Space and a bot has no space_member row, so
 // TreeBotToken routes keep the empty-Space path; what stops them reaching
 // another tenant's data is the handler's own relationship gate, not this.
 //
 // Add it per route rather than tree-wide: it is only correct for handlers whose
 // Space semantics match "the key's Space", and a tree-wide c.Set would silently
 // change the behaviour of every route mounted later.
+//
+// Follow-up (not this change): this is the only reason pkg/authtree depends on
+// pkg/space and the only reason space.SetSpaceID is exported. Both narrow if
+// pkg/space grows a middleware constructor taking a resolver func, letting the
+// contributing module supply BoundSpaceID at the call site.
 func BoundSpaceContext() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		if spaceID := BoundSpaceID(c); spaceID != "" {

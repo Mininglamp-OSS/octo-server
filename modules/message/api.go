@@ -417,8 +417,9 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	{
 		groups.GET("/:group_no/messages/:message_id", m.getGroupMessage)
 		// thread 路由与 modules/thread/1module.go 同一 feature flag 对齐：
-		// DM_THREAD_ON 关闭时 thread 模块不注册、thread 表迁移不跑，
-		// 此时若仍注册 GET 路由会让请求落到不存在的 thread 表上。
+		// DM_THREAD_ON 关闭时 thread 模块只停 API 与 archive worker，schema 迁移仍
+		// 无条件执行（1module.go 的 SQLDir 与 flag 解耦，见那里的注释），所以理由不是
+		// "表不存在"，而是不能对外暴露一条 thread 功能已关闭时并不存在的读口。
 		if threadFeatureEnabled() {
 			groups.GET("/:group_no/threads/:short_id/messages/:message_id", m.getThreadMessage)
 		}
@@ -442,7 +443,11 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	// human 路由是靠 handler 级 SpaceMiddleware 落那个 context key 的——两棵树上都没有
 	// 它。空 Space 会让 handler 走 sync 的向前兼容路径，跳过整个 Space 过滤，所以：
 	//   uk  → BoundSpaceContext 把 key 冻结的（且已由树上 enforceKeySpace 复查过成员
-	//         资格的）Space 落进 context，隔离强度与 human 带 X-Space-ID 时相同。
+	//         资格的）Space 落进 context。**仅对绑定了 Space 的 key**：此时隔离强度与
+	//         human 带 verified Space 时相同。Space 未绑定的历史 key 没有租户可落，
+	//         与 human 不带 verified Space 一样走空 Space 兼容路径、不做 Space 过滤，
+	//         跨会话面只由下面那道 friend + 双向 blacklist 门承担——这是向后兼容的
+	//         既有口径，不是推荐姿态；新签发的 key 应当绑定 Space。
 	//   bot → 无租户可落：bot 没有 space_member 行，同样也拿不到 same-space 放行，
 	//         跨会话面由 checkPersonDMAccess 的 friend + 双向 blacklist 门承担。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{

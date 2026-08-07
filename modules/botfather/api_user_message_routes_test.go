@@ -36,6 +36,14 @@ import (
 //     route and nothing fills on this tree — hence authtree.BoundSpaceContext.
 //   - the thread route only exists while DM_THREAD_ON is on, mirroring the
 //     human route, so automation never sees a path humans do not have.
+//
+// One consequence of reusing personSpaceAllows verbatim, recorded here so the
+// 404s it produces are not later read as a bug: that rule only lets an unlabelled
+// DM message through when the request's Space is the caller's default one. So a
+// key bound to a non-default Space cannot read DM messages predating Space
+// labelling — it gets the same "not found" a person browsing that Space gets, and
+// the fold to 404 is the anti-enumeration posture, not a distinct error. Anything
+// that surfaces this to an end user should say "not in this Space", not "deleted".
 // ===========================================================================
 
 // messageShardTable mirrors message.DB.getTable: the message body lives in one of
@@ -278,6 +286,56 @@ func TestUserKeyPersonMessageIsolatesCrossSpaceForFriends(t *testing.T) {
 	assert.NotContains(t, cross.Body.String(), "hello")
 }
 
+// TestUserKeyPersonMessageSpaceUnboundKeyIsLegacyCompatibilityPath pins the
+// behaviour of a key issued before Space binding existed, so the exception stays
+// visible instead of being rediscovered as a hole.
+//
+// Such a key carries no Space, so BoundSpaceContext has nothing to publish and
+// the handler takes its empty-Space compatibility path — the same one a session
+// without a verified Space takes: no per-message Space filter at all, with the
+// DM open on the friendship alone. The cross-Space-labelled message is therefore
+// READABLE here and refused for the space-bound key on the identical fixtures,
+// and the only difference between the two requests is the key's binding.
+//
+// This is backwards compatibility, NOT the recommended posture: keys issued today
+// bind a Space and get the isolation asserted by the two tests above. If key
+// issuance is ever tightened to require a Space, this test should be deleted
+// along with the compatibility path — not relaxed.
+func TestUserKeyPersonMessageSpaceUnboundKeyIsLegacyCompatibilityPath(t *testing.T) {
+	route, ctx := newUserAPITestServer(t)
+
+	owner := "u_" + util.GenerUUID()[:8]
+	peer := "u_" + util.GenerUUID()[:8]
+	insertTestUser(t, ctx, owner, "owner")
+	insertTestUser(t, ctx, peer, "peer")
+	insertFriendPair(t, ctx, owner, peer)
+
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceID, owner)
+	otherSpaceID := "sp_" + util.GenerUUID()[:8]
+
+	channelID := common.GetFakeChannelIDWith(peer, owner)
+	const crossSpaceMsg int64 = 90101
+	insertMessageRow(t, ctx, channelID, common.ChannelTypePerson.Uint8(), crossSpaceMsg, peer, otherSpaceID)
+
+	get := func(token string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, userAPIRequest(t, http.MethodGet,
+			fmt.Sprintf("/v1/user/messages/person/%s/%d", peer, crossSpaceMsg), token, nil))
+		return w
+	}
+
+	// Keys are stored per (uid, space, client) triple, so these are two distinct
+	// credentials for the same person.
+	legacy := get(mintUserAPIKey(t, ctx, owner))
+	require.Equal(t, http.StatusOK, legacy.Code,
+		"a Space-unbound key keeps the empty-Space compatibility path: %s", legacy.Body.String())
+
+	bound := get(mintUserAPIKeyInSpace(t, ctx, owner, spaceID))
+	assert.NotEqual(t, http.StatusOK, bound.Code,
+		"the same fixtures must be refused once the key carries a Space: %s", bound.Body.String())
+}
+
 // TestUserKeyPersonMessageRejectsOtherPeoplesDM keeps the anti-enumeration
 // posture: a DM the key owner is not part of stays invisible even when the
 // caller names one of its participants.
@@ -430,10 +488,54 @@ func TestUserKeyPersonMessageMatchesHumanResponse(t *testing.T) {
 		"the uk tree must return the human handler's response verbatim")
 }
 
-// TestUserKeyMessagesSubtreeCoexists guards the Gin routing tree: /v1/user/messages
-// now carries both the search subtree and a parameterised GET below the same
-// segment. Both must stay reachable — a shadowed sibling would show up as a 404
-// on one of them (and an outright conflict as a panic in module setup).
+// TestUserKeyThreadMessageMatchesHumanResponse is the response-shape guard for the
+// thread shape, the DM one's counterpart. getThreadMessage reads no Space, so the
+// two requests differ in nothing but the credential and the path prefix — which is
+// exactly what makes any divergence a wrapper or a renamed field.
+func TestUserKeyThreadMessageMatchesHumanResponse(t *testing.T) {
+	t.Setenv("DM_THREAD_ON", "true")
+	route, ctx := newUserAPITestServer(t)
+
+	owner := testutil.UID // the session token resolves to this uid
+	insertTestUser(t, ctx, owner, "owner")
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	insertTestSpace(t, ctx, spaceID, owner)
+
+	groupNo := newGroupNo()
+	shortID := newShortID()
+	insertTestGroupWithMember(t, ctx, groupNo, owner)
+	insertTestThreadRow(t, ctx, groupNo, shortID, owner)
+
+	const mid int64 = 99101
+	insertMessageRow(t, ctx, threadChannelID(groupNo, shortID),
+		common.ChannelTypeCommunityTopic.Uint8(), mid, owner, "")
+
+	suffix := fmt.Sprintf("/groups/%s/threads/%s/messages/%d", groupNo, shortID, mid)
+	humanReq := httptest.NewRequest(http.MethodGet, "/v1"+suffix, nil)
+	humanReq.Header.Set("token", testutil.Token)
+	human := httptest.NewRecorder()
+	route.ServeHTTP(human, humanReq)
+	require.Equal(t, http.StatusOK, human.Code, human.Body.String())
+
+	uk := httptest.NewRecorder()
+	route.ServeHTTP(uk, userAPIRequest(t, http.MethodGet, "/v1/user"+suffix,
+		mintUserAPIKeyInSpace(t, ctx, owner, spaceID), nil))
+	require.Equal(t, http.StatusOK, uk.Code, uk.Body.String())
+
+	assert.JSONEq(t, human.Body.String(), uk.Body.String(),
+		"the uk tree must return the human handler's response verbatim")
+}
+
+// TestUserKeyMessagesSubtreeCoexists is the zero-regression guard for the
+// /v1/user/messages prefix: module setup must not panic once a parameterised
+// route joins the search subtree under the same segment, and both must still be
+// reachable over HTTP.
+//
+// It is deliberately NOT a same-method-tree shadowing test: the search subtree
+// contributes POST endpoints only, the new route is a GET, and Gin keeps one
+// radix tree per method — so nothing here can shadow anything. What this pins is
+// registration and reachability, which is where a future sibling (a GET added to
+// the search subtree, say) would first break.
 func TestUserKeyMessagesSubtreeCoexists(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
@@ -447,7 +549,7 @@ func TestUserKeyMessagesSubtreeCoexists(t *testing.T) {
 	route.ServeHTTP(search, userAPIRequest(t, http.MethodPost,
 		"/v1/user/messages/_search", token, map[string]any{"keyword": "x"}))
 	assert.NotEqual(t, http.StatusNotFound, search.Code,
-		"the search subtree must survive the new sibling: %s", search.Body.String())
+		"the search subtree must stay registered next to the new sibling: %s", search.Body.String())
 
 	person := httptest.NewRecorder()
 	route.ServeHTTP(person, userAPIRequest(t, http.MethodGet,

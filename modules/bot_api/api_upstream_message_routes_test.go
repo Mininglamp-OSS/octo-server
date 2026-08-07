@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -130,6 +131,12 @@ func TestBotMessageRoutesAreMountedAndAuthGated(t *testing.T) {
 		uk := upstreamGet(t, route, path, "uk_"+util.GenerUUID())
 		assert.Equal(t, http.StatusUnauthorized, uk.Code,
 			"a user key must not authenticate on the bot tree: %s %s", path, uk.Body.String())
+
+		// A browser session token is the third credential kind and must not open
+		// the bot tree either — authBot only accepts bf_/app_.
+		session := upstreamGet(t, route, path, testutil.Token)
+		assert.Equal(t, http.StatusUnauthorized, session.Code,
+			"a session token must not authenticate on the bot tree: %s %s", path, session.Body.String())
 	}
 }
 
@@ -275,8 +282,11 @@ func TestBotThreadMessageAbsentWhenThreadDisabled(t *testing.T) {
 	assert.NotEqual(t, http.StatusNotFound, w.Code, w.Body.String())
 }
 
-// TestBotMessagesSubtreeCoexists guards the Gin tree on the bot side: the search
-// subtree and the new parameterised GET share the /v1/bot/messages segment.
+// TestBotMessagesSubtreeCoexists is the bot-side zero-regression guard for the
+// /v1/bot/messages prefix: setup must not panic with a parameterised route under
+// the same segment as the search subtree, and both must stay reachable. Not a
+// shadowing test — the search subtree is POST-only and this route is a GET, and
+// Gin keeps one tree per method.
 func TestBotMessagesSubtreeCoexists(t *testing.T) {
 	route, ctx := newUpstreamTestServer(t)
 
@@ -290,7 +300,7 @@ func TestBotMessagesSubtreeCoexists(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	route.ServeHTTP(search, req)
 	assert.NotEqual(t, http.StatusNotFound, search.Code,
-		"the search subtree must survive the new sibling: %s", search.Body.String())
+		"the search subtree must stay registered next to the new sibling: %s", search.Body.String())
 
 	person := upstreamGet(t, route, "/v1/bot/messages/person/peer_x/1", token)
 	assert.NotEqual(t, http.StatusNotFound, person.Code,
