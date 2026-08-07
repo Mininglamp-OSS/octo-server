@@ -72,10 +72,11 @@
 //	      :group_no   same guard (a thread's attribution is its parent group's)
 //	      :short_id / :message_id  thread status + visibility, not tenant-bearing
 //	  GET /file/upload/presigned                        ScopeUnscoped
-//	      ?type/?path/?filename/?fileSize  signs a PUT for a caller-named object
-//	                  key; NOT confined — see below
+//	      ?type/?path/?filename/?fileSize/?contentType  signs a PUT for a
+//	                  caller-named object key; NOT confined — see below
 //	  GET /file/download/url                            ScopeUnscoped
-//	      ?path       signs a GET for a caller-named object key; NOT confined
+//	      ?path/?filename/?disposition  signs a GET for a caller-named object key;
+//	                  NOT confined
 //
 //	TreeBotToken (`bf_*` / `app_*`; a bot token freezes no Space and a bot has no
 //	space_member row, so there is normally no tenant to enforce)
@@ -197,7 +198,7 @@ const (
 	// either contributed here in Middlewares (see user.requireBoundSpaceMember,
 	// message.requireBoundSpaceGroup) or installed by the tree at its mount point
 	// when only the tree knows the credential's semantics (see
-	// bot_api.appBotDMSpaceGuard).
+	// bot_api.appBotScopeGuard).
 	ScopeRouteGuard TenantScope = "route_guard"
 	// ScopeUnscoped: the route is deliberately NOT confined to a bound Space, and
 	// the handler's own gates (friendship, group membership, bilateral blacklist)

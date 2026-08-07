@@ -231,18 +231,18 @@ func TestUserKeyUserDetailIgnoresCallerSuppliedGroupNo(t *testing.T) {
 
 	// Field-level backstops. vercode / join_group_* are always present in the
 	// response shape (so assert on their VALUES, not on the key names), while the
-	// external-member markers are only emitted when a group is resolved — their
-	// absence is what proves no group was.
+	// external-member markers live one level down under the omitempty `group_member`
+	// key — asserting them against the top-level map would pass whether or not a
+	// group resolved, which is the same mistake as asserting on a key name.
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(withGroup.Body.Bytes(), &got))
 	assert.Empty(t, got["vercode"],
 		"vercode is the friend-add invite capability; a caller-named group must not fill it")
 	assert.Empty(t, got["join_group_invite_uid"])
 	assert.Empty(t, got["join_group_invite_name"])
-	for _, marker := range []string{"source_space_id", "source_space_name", "home_space_id", "home_space_name", "is_external"} {
-		assert.NotContains(t, got, marker,
-			"a caller-supplied group_no must not surface another Space's markers")
-	}
+	assert.NotContains(t, got, "group_member",
+		"group_member is omitempty, so no group resolving means the key is absent entirely — "+
+			"its presence would mean the strip did not take effect")
 	assert.NotContains(t, withGroup.Body.String(), spaceB,
 		"no Space-B identifier may reach a Space-A-bound key")
 }
