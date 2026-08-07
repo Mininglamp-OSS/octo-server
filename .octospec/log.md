@@ -28,6 +28,44 @@ change-log convention (§7). Newest first.
   scan-login for a benefit that only holds against readers who already have
   Redis access. See [journal](journal/shared/scanlogin-poll-binding.md).
 
+## 2026-08-07 (cardtmpl-reasoning-phase-tools-successor)
+
+- **Task** — `cardtmpl-reasoning-phase-tools-successor`: published
+  `ai.reasoning-process@0.4.0` carrying the front-end's per-phase collapsible
+  tool panels and simplified header, adapted onto the bounded #667/#681 data
+  contract instead of the handoff's unbounded schema. Registry default and Bot
+  new-send cut to `0.4.0` by image release (not a runtime activation — Bot
+  advertisement is a compile-time exact-version constant); `0.1.0`–`0.3.0` stay
+  byte-frozen and exact-version editable. The handoff declared itself `0.3.0`,
+  colliding with the live `0.3.0`, so the delta had to become a new exact
+  version rather than an in-place edit. Three handoff defects were corrected
+  rather than adopted: manifest-declared `submit_actions` (it is derived from
+  the interaction report here), missing `owner`/`protocol`, and a schema with
+  every bound stripped. See
+  [journal](journal/shared/cardtmpl-reasoning-phase-tools-successor.md).
+  Verify found two things no gate would have caught: the shipped interaction
+  reports enumerated `${$index}`-generated toggle ids (true only for a 2-phase
+  card — `assertInteractionReport` compares Submit/Input ids only, so an
+  indexed id is an unverified published claim), and the "a matching golden
+  cannot launder an injected `Action.Submit` in the `octo/v1` result frame"
+  invariant had a generic-compiler test but none for this artifact.
+- **Decision** — `phases[].thought` widened `281` → `4001`, deliberately
+  breaking its old habit of mirroring the producer's truncation length. Still
+  bounded on both ends; fully-saturated payload went 6.69% → 19.46% of
+  `cardmsg.MaxPayloadBytes` and cost zero nodes (`MaxNodes`/`MaxDepth` are
+  structural). Realising the longer text needs an `openclaw-channel-octo`
+  `THOUGHT_MAX` bump, which is maintainer-owned and has no ordering dependency
+  — a widening cannot reject what the plugin already sends. `tool: 81` /
+  `detail: 192` / `errorMessage: 121` keep the same zero-headroom design and
+  were knowingly left alone.
+- **Learning (pending)** —
+  [`schema-bound-must-not-mirror-producer-truncation`](learnings/pending/schema-bound-must-not-mirror-producer-truncation.md):
+  a `maxLength` equal to `producer_cap + 1` is a coupling, not a bound — it is
+  exactly saturated, and the two sides count in different units (JSON Schema
+  code points vs JS UTF-16 code units vs graphemes, measured and confirmed).
+  Over-limit means the whole card fails to send, not a display regression.
+  Candidate rule: `trust-boundary`.
+
 ## 2026-08-06 (bot-setting-store)
 
 - **Task** — `bot-setting-store`: added `bot_setting`, a generic per-bot config
