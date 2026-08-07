@@ -1292,10 +1292,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
-	// AllowInlineImageData：raw 是上面 RenderEditPayloadForPrincipal 的产物，card 树来自
-	// 服务端 handoff 模板（调用方只能填 schema 校验过的 data 字段），与 :1049 的 raw card
-	// 编辑路径相反 —— 那里必须保持默认严格，因为 card 树由调用方提供。
-	contentEdit, err := cardmsg.NormalizeContentEdit(string(raw), cardmsg.AllowInlineImageData())
+	contentEdit, err := cardmsg.NormalizeContentEdit(string(raw))
 	if err != nil {
 		ba.Error("Bot Registry edit normalize 失败", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)

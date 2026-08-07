@@ -638,3 +638,69 @@ func (t *goConstraintTemplate) Build(context.Context, State, json.RawMessage, Bu
 func (t *goConstraintTemplate) FallbackText(State, json.RawMessage, string) (string, error) {
 	return "test", nil
 }
+
+// The two x-octo-constraints declarations are independently optional. This used to
+// be false: parseAggregateArrayLimits required aggregateArrayLimits whenever the
+// block existed, so an artifact that only wanted a display ceiling could not compile
+// (PR#712 review). An empty block stays an error — it declares nothing, so it is
+// always a mistake rather than a deliberate no-op.
+func TestCompileJSONArtifactConstraintsAreIndependentlyOptional(t *testing.T) {
+	compile := func(t *testing.T, constraints string) (*CompiledArtifact, error) {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		schema := `{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",` +
+			`"additionalProperties":false,"required":["title"],"properties":` + validArtifactProperties
+		if constraints != "" {
+			schema += `,"x-octo-constraints":` + constraints
+		}
+		bundle.Schema = json.RawMessage(schema + `}`)
+		return CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	}
+
+	const aggregate = `"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}]`
+	const truncate = `"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]`
+
+	for _, tc := range []struct{ name, constraints string }{
+		{"no constraints block at all", ""},
+		{"aggregate limits only", `{` + aggregate + `}`},
+		{"truncations only", `{` + truncate + `}`},
+		{"both", `{` + aggregate + `,` + truncate + `}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := compile(t, tc.constraints); err != nil {
+				t.Fatalf("CompileJSONArtifact(%s): %v", tc.name, err)
+			}
+		})
+	}
+
+	t.Run("empty block is refused", func(t *testing.T) {
+		_, err := compile(t, `{}`)
+		if err == nil {
+			t.Fatal("compiled an artifact whose x-octo-constraints declares nothing")
+		}
+		if !strings.Contains(err.Error(), "at least one constraint") {
+			t.Fatalf("error = %q, want it to name the empty declaration", err.Error())
+		}
+	})
+
+	// Truncation must actually take effect when declared alone — otherwise the key
+	// would parse but the engine would ignore it, which is worse than rejecting it.
+	t.Run("truncation alone still clamps at render", func(t *testing.T) {
+		artifact, err := compile(t, `{`+truncate+`}`)
+		if err != nil {
+			t.Fatalf("CompileJSONArtifact: %v", err)
+		}
+		fields := json.RawMessage(`{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`)
+		card, err := artifact.Template.Build(context.Background(), "shown", fields, BuildEnv{Lang: "en-US"})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		encoded, err := json.Marshal(card.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(encoded); !strings.Contains(got, `"aaaaaaa…"`) {
+			t.Fatalf("body = %s, want the title clamped to 7 runes + ellipsis", got)
+		}
+	})
+}

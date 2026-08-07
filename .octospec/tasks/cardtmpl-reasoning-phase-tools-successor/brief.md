@@ -217,39 +217,74 @@ Measured behaviour (`TestSimplifiedSuccessorTruncatesThought`):
 | 401 … 4001 | clamped to 399 runes + `…`; **frame size becomes constant** regardless of input length |
 | ≥ 4002 | `ErrFieldsInvalid` |
 
-#### Why this is the persistence-safe shape, not just the friendlier one
+#### Where the storage budget is actually enforced
+
+**This subsection previously derived `400` from a measurement of the wrong bytes. Both the number and the
+reasoning are corrected here; the correction was found in review (PR#712) and reproduced independently.**
 
 The binding ceiling for this card is not `cardmsg.MaxPayloadBytes` (512 KiB, the only size gate a rendered
-frame passes, `pkg/cardmsg/validate.go:30`). The authoritative bot-edit write stores the whole marshalled
-frame in `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**
+frame passes, `pkg/cardmsg/validate.go:30`). The authoritative bot-edit write stores the frame in
+`message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**
 (`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later migration;
 `octo_message_card_revision.content` is `TEXT` too). That width is discovered only at `INSERT` — as
 `Data too long for column` under `STRICT_TRANS_TABLES`, or a silent truncation into invalid JSON without it.
 
-Earlier attempts got this wrong twice. First `4001` was set as a plain `maxLength` on the theory that
-512 KiB left ~4× headroom; against the real column the frame was 1.56× over with CJK and **2.84× over
-(186,024 B)** with every free string escaped. Then `400` was set as a plain `maxLength`, which was safe but
-turned every long summary into a failed card.
+**The error was measuring `json.Marshal` of what `Render` returns.** That is the *pre-*`Finalize` envelope.
+`cardmsg.Finalize` (`pkg/cardmsg/plain.go:30`) then adds a top-level `plain` built from every visible text
+node, and *that* value is what `NormalizeContentEdit` canonicalizes and what gets written. `plain` inflates
+this card's frame by **+47%**. Every byte figure in the earlier version of this subsection was therefore
+low by roughly a third.
 
-With a display ceiling the guarantee is stronger than either: **the rendered frame's size no longer depends
-on what the caller sends.** Worst case the schema admits (6 phases / 13 aggregate actions / every other
-string at max, max across five states), with every free string escaped to 6 bytes per code point:
+Re-measured on the bytes that are actually persisted (worst shape the schema admits — 6 phases / 13
+aggregate actions / every other string at max — max across all five states):
 
-| `thought` input | rendered frame | share of the 64 KiB column |
-| --- | --- | --- |
-| 281 (V3's bound) | 52,104 B | 79.5% |
-| **400 (display ceiling)** | **56,388 B** | **86.0%** |
-| 4001 (accept ceiling) | **56,388 B — truncation makes it identical** | 86.0% |
+| version | `thought` | encoding | persisted | share of the 64 KiB column |
+| --- | --- | --- | --- | --- |
+| `0.3.0` (live, frozen) | 281 (its own bound) | escaped | 79,678 B | **121.6%** |
+| `0.4.0` | 400 (display ceiling) | CJK | 60,658 B | 92.6% |
+| `0.4.0` | 400 | escaped | 98,998 B | **151.1%** |
+| `0.4.0` | **1** | escaped | 70,270 B | **107.2%** |
+| `0.4.0` | 400, `tool`/`detail` at 1 | escaped | 56,722 B | 86.6% |
 
-So a bot cannot produce a frame the store cannot hold, whatever it sends. That is what
-`TestSimplifiedSuccessorCeilingIsPersistenceSafe` asserts, and it now feeds the *accept* ceiling in to
-prove it — the earlier version could only assert it for the one input length the schema happened to allow.
+**Two conclusions follow, and both contradict the earlier version of this decision.**
 
-Note the escaped baseline at `thought = 1` is already **42,024 B, 64% of the column**: 13 actions ×
-(`tool` 81 + `detail` 192) is most of the frame. That is why 400 rather than something larger — 654 is the
-arithmetic limit for the display ceiling and would leave no headroom, which is the mistake this decision
-exists to correct. A display ceiling in the thousands still needs the `MEDIUMTEXT` widening first (own
-brief; `message_extra` is a large hot table) and then a `0.5.0`, because `0.4.0`'s bytes are immutable.
+First, **`thought` is not the dominant term and never was.** At `thought = 1` the frame is still 107% of the
+column; drop `tool`/`detail` to one code point instead and it falls to 87%. The frame is dominated by
+13 actions × (`tool` 81 + `detail` 192) plus the `plain` copy. No value of the `thought` display ceiling
+makes the worst case fit, so `400` cannot be — and is not — derived from the storage budget.
+
+Second, **`0.3.0` is already over.** At its own bound, in the same encoding, the live version persists at
+121.6%. This is pre-existing platform debt, it is not introduced by `0.4.0`, and it is unfixable in place
+because `0.3.0`'s bytes are frozen. Any fix that lives inside one template version therefore leaves the
+installed base exposed.
+
+So the budget is enforced where it applies to every version at once: **a column-width check at the
+persistence boundary.** `carddispatch.NormalizeFrameForPersistence` is now the single judge of "can this
+frame be stored", and all three write paths that re-validate a frame go through it —
+`CardMutator.Mutate`, `CardUpdater.Append`, `CardUpdater.ReplaceView`. Over-width frames get
+`ErrCardMutationTooLarge` (which wraps `ErrCardMutationInvalid`, so existing error mapping is unchanged)
+carrying the byte count, logged with the message and sender. What this buys:
+
+- it covers `0.1.0`–`0.4.0` and every future template, including ones nobody has written yet;
+- it costs nothing for realistic traffic — the shipped samples persist at 7–12 KB, under 20% of the column;
+- `Data too long` / silent truncation into a frame no client can render becomes a deterministic, typed,
+  logged refusal. The card still cannot advance, but the failure names itself instead of surfacing as a 500.
+
+`400` is therefore a **product decision** — the requirement was "≤ 400 is fine, truncate above it
+server-side, don't error" — and the truncation engine's real contribution is that **frame size stops
+depending on caller input** (400 and 4001 produce identical bytes). It is not a storage-budget derivation.
+`TestSimplifiedSuccessorPersistedFrameIsMeasuredAndGated` asserts the corrected shape: that the persisted
+encoding exceeds the rendered one (so nobody measures the wrong artifact again), that shipped samples keep
+margin, and that the adversarial worst case is refused by the production gate rather than by MySQL.
+
+**Open, and deliberately not fixed here.** A frame with every field legitimately filled to its schema
+maximum in CJK persists at **92.6%** — inside the column, but with under 5 KB of margin, and an escape-heavy
+mix (a `detail` carrying SQL or code, e.g. `a < 5 AND b > 3`) can cross it. The gate turns that into a clean
+refusal rather than corruption, but the card still freezes. The durable fixes are widening `content_edit`
+to `MEDIUMTEXT` (`TEXT`→`MEDIUMTEXT` needs `ALGORITHM=COPY, LOCK=SHARED` — measured; `message_extra` is a
+large hot table, so this needs its own brief and a maintenance window) or extending `truncateStrings` to
+`phases[].actions[].tool` / `.detail`, which is a visual change to how tool calls are displayed and so a
+product decision rather than an engineering one. Both are out of scope for `0.4.0`; neither is blocked by it.
 
 `MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — text length adds no nodes, so the node budget
 in the section above is unaffected and the aggregate cap of 13 stands unchanged.
@@ -278,60 +313,78 @@ Only `thought` is declared truncatable. `tool: 81`, `detail: 192`, and `errorMes
 zero-headroom fail-close design and are knowingly left alone — `tool` is the most exposed (MCP tool names
 can exceed 80). Extending truncation to them is a follow-up decision, not an unstated part of this change.
 
-### D4a — The chevrons fetch icons from a third-party CDN; accepted here, disclosed and owned
+### D4a — The chevrons are inlined as vetted `data:image/svg+xml` bytes, not fetched
 
-Found in review, and it is the first outbound runtime dependency any built-in template in this repo has
-carried, so it is recorded as a decision rather than left as an implementation detail.
+**This decision reversed during review (PR#712). The earlier version accepted a third-party CDN and listed
+inlining as *rejected*; the reverse shipped. What follows describes the code.**
 
-**What ships.** All three V4 templates hardcode the chevron icons to a third party — 12 occurrences:
+The chevron icons were originally authored — in the front-end handoff — as fetches from `api.iconify.design`
+(12 occurrences across the three V4 templates, expanding to 34 in the persisted goldens). That made them the
+first outbound runtime dependency any built-in template in this repo carries: `@0.1.0`–`@0.3.0` contain
+zero, their only `http(s)` strings being `$schema` meta-identifiers that are never fetched. And because a
+published version's bytes are frozen, cards sent under `0.4.0` would have carried those URLs permanently.
 
-```
-"url": "https://api.iconify.design/lucide/chevron-{down,up}.svg?color=%23a1a6ab"
-```
+Three things made that unacceptable rather than merely noted: `api.iconify.design` is not reliably reachable
+from mainland China networks and this is a `zh-CN`-default enterprise product; every viewer of every
+reasoning card would disclose IP, user-agent and timing to a third party, with the distinctive
+`lucide/chevron-down` path fingerprinting *which* card is open; and third-party-controlled SVG bytes would
+render in end-user clients with the server neither proxying nor pinning them.
 
-It is not a build-time asset reference. The URL expands into all five **persisted goldens** (34
-occurrences), i.e. it is card content, stored immutably and shipped to every client. And because
-`0.4.0`'s bytes are frozen once published, cards sent under it carry these URLs permanently; changing
-this later means a `0.5.0`.
+**What ships instead.** The icon bytes are embedded in the templates as `data:image/svg+xml,` URIs
+(345/349 B each, Lucide `chevron-down`/`chevron-up` at `#a1a6ab`). No outbound request, nothing to reach,
+nothing to pin. `TestSimplifiedSuccessorHasNoOutboundRuntimeDependency` asserts every `http(s)` string in
+the V4 templates and goldens is either the SVG namespace identifier or an unfetched `$schema`.
 
-**No precedent, and only a scheme gate.** `@0.1.0`/`@0.2.0`/`@0.3.0` contain zero external runtime URLs —
-their only `http(s)` matches are the `$schema` meta-identifiers, which are never fetched. Nothing
-structurally prevents this: `cardmsg`'s `checkURL` (`pkg/cardmsg/validate.go:808`) is a positive allowlist
-on the **scheme** only (`http`/`https` + non-empty host); it does not constrain the host, and template-
-authored URLs are server-authored and therefore trusted by construction — unlike data-supplied URLs such
-as `docs.access-request`'s `avatarUrl`, which are additionally pattern-constrained in schema and
-preflighted through `cardtmpl.AbsoluteHTTPSURL`.
+**The gate this needed, and the shape it settled on.** `cardmsg`'s `checkURL` is a positive allowlist that
+admits only absolute `http`/`https`, so `data:` was refused — correctly, since an SVG is a classic XSS
+carrier and the server cannot know whether a client renders it via `<img src>` (sandboxed, scripts inert) or
+inlines it into the DOM (scripts execute). It must assume the latter.
 
-**Risks accepted.** Availability: `api.iconify.design` is not reliably reachable from mainland China
-networks, and this is a `zh-CN`-default enterprise product. Privacy: every viewer of every reasoning card
-issues a request to a third party, disclosing client IP, user-agent and timing, and the distinctive
-`lucide/chevron-down` path fingerprints *which* card is being viewed. Supply chain: third-party-controlled
-SVG bytes render in end-user clients, with the server neither proxying nor pinning them.
+The first implementation opened a *trusted-caller* mode: a `ValidateOption` the render path passed and other
+callers did not, plus a substring denylist over the SVG content. Review broke both halves, and both breaks
+were reproduced before being accepted:
 
-**Why it is accepted rather than fixed here.** The severity is bounded by a property of the markup: every
-chevron carries `altText` ("展开"/"收起"/"展开工具"/"收起工具") and its `selectAction` is on the `Image`
-element itself, not on the fetched resource. So when the icon fails to load, clients render the alt text
-and the toggle still works — the per-phase panels stay operable and discoverable, rather than becoming
-unreachable. Each alternative also has a real obstacle:
+- **The trust boundary was one-sided.** The option was applied at the render call site but not at the three
+  places that re-validate the same frame before persisting it (`carddispatch` mutation, `CardUpdater.Append`,
+  `CardUpdater.ReplaceView`). Since a reasoning card advances by repeated edits, every `0.4.0` card would
+  have rendered its first frame and then frozen — the exact failure mode D3a warns about, reached from the
+  other side. Tests missed it because the bot-edit tests inject a fake mutator that never re-validates.
+- **The denylist was porous.** Five accepted bypasses: namespace-prefixed elements (`<s:script>`, `<s:use>`),
+  CSS identifier escapes (`fill:\75 rl(...)`, `@\69 mport`), and the SVG 1.2 Tiny `<handler>` element. A
+  substring denylist over two independently escapable syntaxes (XML and CSS) is structurally leaky.
 
-- **Inline SVG data URI** — rejected by `cardmsg.Validate`. `checkURL`'s positive allowlist admits only
-  absolute `http`/`https`; `data:` is explicitly refused (`pkg/cardmsg/cardmsg_test.go:142` pins it), and
-  that refusal is a load-bearing anti-injection guard, not an oversight to work around.
-- **Self-hosted icon endpoint** — needs a static-asset route the server does not have. `BuildEnv`
-  (`pkg/cardtmpl/template.go:130`) does give a precedent for injecting a deployment URL into a template
-  (`WebLoginURL`, used for deep links), so it is feasible — but adding an asset endpoint plus a new
-  `BuildEnv` field is out of scope here.
-- **Text affordance, as V1–V3 used** — `selectAction` is not a `TextBlock` property in Adaptive Cards, so
-  a reliable version needs each chevron wrapped in a `Container` carrying the action: 2 in the header plus
-  2 × 6 per phase = 14 new containers. The node budget already fails at 16 aggregate actions on 6 phases
-  (see Background § Node budget), so this trades a network dependency for a structural-limit risk.
+So the mechanism changed rather than being patched: **an exact-byte allowlist** (`pkg/cardmsg/inline_image.go`).
+Only the specific vetted byte strings pass — no decoding, no parsing, no filtering. This is smaller than what
+it replaced and closes four things at once:
 
-**Preconditions and ownership.** Deploying V4 requires confirming that client CSP and egress policy allow
-`api.iconify.design`; where they do not, the cards degrade to alt-text toggles rather than breaking, but
-that should be a known state, not a discovery. The underlying choice is the front-end's — it came in with
-the handoff — so it is reported back to them together with the `render-profile/capabilities.json`
-`maxDepth: 24` divergence (D6), with self-hosting or inlining as the preferred long-term shape. Server-side
-this stays as-is for `0.4.0`.
+- Validation no longer depends on the call site, so no write path can disagree with the render that produced
+  the frame. The P0 above is structurally impossible, not merely fixed.
+- The sanitizer's holes stop being reachable: arbitrary SVG never matches, so the five bypasses and any
+  sixth are all equally excluded.
+- A template's `Image.url` must be a literal — an interpolated `${field}` cannot equal a constant — so a
+  bot-supplied data field can never become a `data:` sink. No separate compile-time rule is needed.
+- Adding an icon is an explicit source change to `cardmsg`, which puts a human in front of exactly the bytes
+  that would be inlined into every client's DOM.
+
+The cost is that template authors cannot freely use icons. That is intended.
+
+**What did not change.** `data:` remains refused everywhere else: on non-image URL fields (`Action.OpenUrl.url`,
+`iconUrl`, `backgroundImage`) even for vetted bytes, and on any unvetted bytes anywhere. `TestValidateURLAllowlist`
+is untouched. Raw bot cards, incoming-webhook adapters and message edits are unaffected — they were never
+special-cased and still are not, because there is no case to special-name any more.
+
+**Not adopted.** A self-hosted icon endpoint (`OCTO_CARD_ASSET_BASE_URL` + a static-asset route) remains the
+right shape if icons ever outgrow an allowlist; it needs a `BuildEnv` field and a route the server does not
+have, and is deferred to its own brief. Reverting to a text affordance as V1–V3 used is not viable:
+`selectAction` is not a `TextBlock` property, so each chevron needs a wrapping `Container` — 14 of them —
+and the node budget already fails at 16 aggregate actions on 6 phases (Background § Node budget).
+
+**Reported back.** The handoff's CDN choice is the front-end's, so the reversal is reported to them together
+with the `render-profile/capabilities.json` `maxDepth: 24` divergence (D6). One consequence worth their
+attention: `plain` (which feeds push previews and search) does not consider `isVisible`, and now renders six
+`[图片]` placeholder lines for the chevrons. The collapsed *content* was already fully disclosed in `0.3.0`'s
+`plain`, so that part is not a regression — but the placeholder noise is new, and suppressing `Image` nodes
+in `BuildPlain` would change previews for every card type, so it is filed rather than fixed here.
 
 ### D4 — Templates
 
@@ -565,9 +618,18 @@ status badge, or a footer surface on this card. **This is intentional and is kep
   survived the `required` relaxation under `additionalProperties: false` (D3/D8).
 - [ ] No template declares an `octo-surface-*` or `octo-badge-*` id (D8b), and a rendered card is checked
   to contain none.
-- [ ] Every outbound `http(s)` URL in the V4 templates and goldens is either the chevron icon host
-  disclosed in D4a or a never-fetched `$schema` identifier — asserted, so a second external dependency
-  cannot be added without its own decision. The frozen V1–V3 templates are checked to still carry none.
+- [ ] V4 carries **no** outbound runtime dependency: every `http(s)` string in its templates and goldens is
+  either the SVG namespace identifier inside an inline icon or a never-fetched `$schema` identifier (D4a) —
+  asserted, so an external dependency cannot be introduced without its own decision. The frozen V1–V3
+  templates are checked to still carry none.
+- [ ] The inline icon bytes are in `cardmsg`'s vetted allowlist, so a rendered V4 frame survives the
+  **production persistence check** (`carddispatch.NormalizeFrameForPersistence`) and not merely the render
+  path — a render/persist disagreement would send the first frame and freeze every edit after it (D4a).
+- [ ] Unvetted `data:` bytes are refused on image fields, and vetted bytes are refused on non-image URL
+  fields (`Action.OpenUrl.url`, `iconUrl`, `backgroundImage`); `TestValidateURLAllowlist` is unchanged.
+- [ ] The persisted frame — `NormalizeContentEdit` output, i.e. **including** the `plain` that `Finalize`
+  adds — is what the storage assertions measure; shipped samples keep margin against the 64 KiB column, and
+  the adversarial worst case is refused by the persistence gate rather than by MySQL (D3a).
 
 ### G. Gates
 

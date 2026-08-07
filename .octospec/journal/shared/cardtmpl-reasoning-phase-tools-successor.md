@@ -44,35 +44,58 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
   exception, `thought` (below). Verified by a bound-by-bound comparison against the frozen
   V3 schema rather than a file diff, since the two legitimately differ in `required`,
   descriptions, and examples.
-- **`thought` 281 → 400, and the number comes from the store** (D3a). The old value existed only because
+- **`thought` gets two ceilings: accept 4001, display 400 with server-side truncation** (D3a). The old
+  value existed only because
   it mirrored the producer's observed output (`THOUGHT_MAX = 280` + `…`); see the learning below. It
   stays bounded on both ends — an unbounded string fails
   `DefaultCompileLimits().RequireBoundedSchema`, and widening a ceiling is not removing it.
 
-  **This took two review rounds to get right, and the interesting part is what the reviews found.**
-  The first attempt set `4001`, arguing that at 19.5% of `cardmsg.MaxPayloadBytes` (512 KiB) there was
-  ~4× headroom. 512 KiB is the only size gate a rendered frame *passes*, but not the smallest one
-  downstream: the authoritative bot-edit write puts the whole marshalled frame into
-  `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**, never widened by any later
-  migration (`octo_message_card_revision.content` likewise). Against that, the `4001` frame was 1.56×
-  over with CJK text and **2.84× over (186,024 B)** with every free string escaped.
+  **This took four review rounds, and the interesting part is what each round found.**
+  The first attempt set `4001` as a plain `maxLength`, arguing that at 19.5% of
+  `cardmsg.MaxPayloadBytes` (512 KiB) there was ~4× headroom. 512 KiB is the only size gate a rendered
+  frame *passes*, but not the smallest one downstream: the authoritative bot-edit write puts the whole
+  marshalled frame into `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**, never
+  widened by any later migration (`octo_message_card_revision.content` likewise).
 
-  The second attempt kept `4001` and proposed rejecting oversized frames at the persistence boundary.
-  Review rejected that too, correctly: the schema is published to **every** bot through
+  The second attempt kept `4001` and proposed refusing oversized frames at the persistence boundary.
+  Review rejected *that framing*, correctly: the schema is published to **every** bot through
   `/v1/bot/card/profile` — alongside `"max_payload_bytes": 524288`, which actively suggests there is
   room — so a contract promising 4001 while the server refused most of it is still a contract that lies.
   The realistic actor is not an attacker but the next bot author who reads `maxLength` and trusts it.
 
-  What the measurement actually shows is that a large widening is not available at all here: the
-  escaped-encoding baseline at `thought = 1` is already **42,024 B, 64% of the column**, before
-  `thought` contributes anything. `400` leaves ~14% headroom (56,388 B, 86%); `654` is the arithmetic
-  limit and would be another zero-headroom design — the exact mistake this decision exists to correct.
-  So `400` is only 1.42× the producer's cap, but the coupling is broken: the ceiling now derives from a
-  measured storage budget instead of `THOUGHT_MAX + 1`.
+  The third attempt separated the two ceilings, which is what ships: accept 4001, display 400, clamp in
+  between. This answers the objection above rather than working around it — 4001 is *genuinely* accepted,
+  it renders as 399 runes + `…`, and no frame is refused for length. The engine capability
+  (`x-octo-constraints.truncateStrings`) exists for this, and its real contribution is that **frame size
+  stops depending on caller input**: 400 and 4001 produce byte-identical frames.
 
-  Getting to a few thousand code points requires widening the two columns first and then a `0.5.0`,
-  since `0.4.0`'s bytes are immutable once shipped. That is recorded in D3a as a precondition, not
-  deferred inside this change.
+  **The fourth round is the one worth remembering, because it invalidated my own arithmetic.** Every byte
+  figure in the first three rounds was measured on `json.Marshal` of what `Render` returns — the
+  *pre-*`Finalize` envelope. `cardmsg.Finalize` then adds a top-level `plain` built from every visible
+  text node, and *that* is what gets written. For this card `plain` is **+47%**. Re-measured on the bytes
+  actually persisted, two conclusions reversed:
+
+  - **`thought` was never the dominant term.** At `thought = 1` the frame is still **107%** of the column;
+    hold `thought` at 400 and drop `tool`/`detail` to one code point instead and it falls to 87%. The frame
+    is dominated by 13 actions × (`tool` 81 + `detail` 192) plus the `plain` copy. So no value of the
+    display ceiling makes the worst case fit, and `400` is **not** derived from the storage budget — it is
+    the product requirement ("≤ 400 is fine, truncate above it, don't error"). The earlier journal text
+    claiming the number "comes from the store" was wrong.
+  - **`0.3.0` is already over.** At its own bound, same encoding, the live version persists at **121.6%**.
+    Pre-existing debt, not introduced here, and unfixable in place because its bytes are frozen.
+
+  Which means the storage budget cannot live in any single template version. It now lives at the write
+  boundary: `carddispatch.NormalizeFrameForPersistence` is the single judge of "can this frame be stored",
+  shared by `CardMutator.Mutate` and both `CardUpdater` paths, returning `ErrCardMutationTooLarge` with a
+  byte count. That is not the same thing round two rejected — it does not refuse frames for declared
+  field length (truncation handles that), it refuses frames that overflow for reasons no field bound can
+  express, and it covers `0.1.0`–`0.4.0` plus every future template at once.
+
+  Still open, deliberately: an all-fields-at-maximum CJK frame persists at **92.6%** — inside, but under
+  5 KB of margin, and an escape-heavy `detail` (SQL, code) can cross it. The gate makes that a clean
+  refusal instead of corruption, but the card still freezes. Durable fixes are widening to `MEDIUMTEXT`
+  (`ALGORITHM=COPY, LOCK=SHARED`, large hot table — own brief) or truncating `tool`/`detail`, which is a
+  visual change and therefore a product decision. Recorded in D3a as open, not as done.
 - **`timerText` optional but retained in `properties`** (D3/D8). No template binds it, but
   the root is `additionalProperties: false` and the producer sends it unconditionally, so
   deleting the property would have rejected every payload the current plugin emits.
@@ -88,28 +111,55 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
 
 ## Gotchas worth remembering
 
-- **A template-authored URL is trusted by construction, and nobody was checking the host.**
-  Review caught that all three V4 templates fetch their chevrons from
-  `api.iconify.design` (12 occurrences, expanded into all five persisted goldens — so it is
-  card content, shipped to every client, and permanent because `0.4.0`'s bytes are frozen).
-  This is the first outbound runtime dependency any built-in template in this repo carries:
-  `@0.1.0`–`@0.3.0` have zero, their only `http(s)` strings being `$schema` identifiers that
-  are never fetched. And `cardmsg`'s `checkURL` is a positive allowlist on the **scheme**
-  only — it does not constrain the host, because data-supplied URLs get their host
-  discipline elsewhere (schema `pattern` + `AbsoluteHTTPSURL` preflight) while
-  template-authored ones are server-authored and therefore assumed safe. Accepted for
-  `0.4.0` and recorded as D4a with its CSP/egress precondition, rather than fixed: every
-  chevron carries `altText` and its `selectAction` sits on the `Image` element, not on the
-  fetched resource, so a CDN failure degrades to a working alt-text toggle instead of an
-  unreachable panel. All three alternatives had real obstacles — `data:` URIs are refused by
-  `checkURL`'s anti-injection allowlist, self-hosting needs an asset route the server does
-  not have, and a `TextBlock` affordance needs 14 extra `Container`s to carry `selectAction`
-  (which `TextBlock` does not support) against a node budget that already fails at 16
-  aggregate actions.
-- **My own Verify pass missed it.** I checked `octo-surface-*`/`octo-badge-*` ids, `Action.Submit`,
-  bounds, toggle targets and report honesty — but never enumerated outbound resource
-  references, on a change whose whole point is replacing text controls with `Image`
-  elements. Worth adding "what does this fetch, from whom" to the artifact checklist.
+- **A trust boundary applied at one call site is a bug waiting for the second call site.**
+  The chevrons arrived in the handoff as `api.iconify.design` fetches — the first outbound
+  runtime dependency any built-in template in this repo would have carried (`@0.1.0`–`@0.3.0`
+  have zero; their only `http(s)` strings are `$schema` identifiers, never fetched), permanent
+  because a published version's bytes are frozen, and unreachable from mainland China networks
+  in a `zh-CN`-default product. Inlining the bytes as `data:image/svg+xml` was the fix, which
+  meant relaxing `cardmsg`'s `checkURL` allowlist.
+
+  The first relaxation was a *trusted-caller* mode: a `ValidateOption` the render path passed
+  and others did not, plus a substring denylist over the SVG content. Both halves broke, and
+  both breaks are the lesson:
+
+  - **The option was applied at render but not at the three paths that re-validate the frame
+    before persisting it** (`carddispatch` mutation, `CardUpdater.Append`, `.ReplaceView`).
+    A reasoning card advances by repeated edits, so every `0.4.0` card would have rendered its
+    first frame and then frozen. Tests missed it because the bot-edit tests inject a fake
+    mutator that never re-validates — the second validation pass had no coverage at all.
+  - **The denylist was porous in a way a denylist over escapable syntax always is.** Five
+    accepted bypasses: namespace prefixes (`<s:script>`, `<s:use>`), CSS identifier escapes
+    (`fill:\75 rl(...)`, `@\69 mport`), and SVG 1.2 Tiny's `<handler>`. XML and CSS are each
+    independently escapable; `strings.Contains` cannot see through either.
+
+  The fix was to change the *mechanism*, not patch either half: an **exact-byte allowlist**
+  (`pkg/cardmsg/inline_image.go`). Only vetted byte strings pass — no decoding, no parsing, no
+  filtering. It is smaller than what it replaced and removes four problems at once: validation
+  no longer depends on the call site (so no write path can disagree with the render that
+  produced the frame); arbitrary SVG never matches, so the sanitizer's holes stop being
+  reachable; a template's `Image.url` must be a literal, since an interpolated `${field}` cannot
+  equal a constant, which closes the "bot data becomes a `data:` sink" path without a separate
+  compile-time rule; and adding an icon is an explicit source change that puts a human in front
+  of the exact bytes going into every client's DOM.
+
+  **The generalizable form:** if a validation relaxation is expressed as "trusted callers may do
+  X", then every path that re-validates the same artifact has to agree about who is trusted, and
+  nothing in the type system makes them. Prefer relaxations expressed as properties of the
+  *artifact* (these exact bytes are safe) over properties of the *caller* (this caller is
+  trusted) — the former cannot drift out of sync because there is nothing to keep in sync.
+- **My own Verify pass missed the CDN dependency entirely.** I checked `octo-surface-*`/
+  `octo-badge-*` ids, `Action.Submit`, bounds, toggle targets and report honesty — but never
+  enumerated outbound resource references, on a change whose whole point is replacing text
+  controls with `Image` elements. "What does this fetch, and from whom" now belongs on the
+  artifact checklist.
+- **`plain` does not consider `isVisible`, and it feeds push previews.** `0.4.0` is the first
+  version to put content behind collapsed panels and the first to use `Image`. Measured: the
+  collapsed tool names, details and file paths were *already* fully present in `0.3.0`'s `plain`
+  (760 B vs `0.4.0`'s 742 B), so that disclosure is not a regression — but the six `[图片]`
+  placeholder lines the inline chevrons add are new. Suppressing `Image` in `BuildPlain` would
+  change previews for every card type, so it is filed in D4a rather than fixed here. Worth
+  knowing before the next template reaches for an icon.
 
 - **An interaction report cannot honestly declare a data-generated action id.** The
   handoff's reports enumerated `reasoning_tools_toggle_action_0/1`, but those ids are

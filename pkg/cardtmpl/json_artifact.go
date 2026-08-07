@@ -1065,7 +1065,14 @@ func compileJSONSchema(document any) (*jsonschema.Schema, error) {
 	return schema, nil
 }
 
-func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateArrayLimit, error) {
+// constraintsBlock reads the optional `x-octo-constraints` object, rejecting
+// unknown keys and an empty declaration. Each recognized constraint inside it is
+// independently optional — an artifact may declare only aggregate limits, only
+// string truncations, or both. (It previously required aggregateArrayLimits
+// whenever the block existed, which made truncateStrings unusable on its own;
+// PR#712 review.) An empty `{}` is still an error: it declares nothing, so it is
+// always an authoring mistake rather than a deliberate no-op.
+func constraintsBlock(schema map[string]any) (map[string]any, error) {
 	raw, exists := schema["x-octo-constraints"]
 	if !exists {
 		return nil, nil
@@ -1077,7 +1084,22 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 	if err := rejectUnknownKeys(constraints, "aggregateArrayLimits", "truncateStrings"); err != nil {
 		return nil, err
 	}
-	rawLimits, ok := constraints["aggregateArrayLimits"].([]any)
+	if len(constraints) == 0 {
+		return nil, errors.New("x-octo-constraints must declare at least one constraint")
+	}
+	return constraints, nil
+}
+
+func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateArrayLimit, error) {
+	constraints, err := constraintsBlock(schema)
+	if err != nil || constraints == nil {
+		return nil, err
+	}
+	rawEntries, exists := constraints["aggregateArrayLimits"]
+	if !exists {
+		return nil, nil
+	}
+	rawLimits, ok := rawEntries.([]any)
 	if !ok || len(rawLimits) == 0 {
 		return nil, errors.New("x-octo-constraints.aggregateArrayLimits must be a non-empty array")
 	}
@@ -1123,13 +1145,9 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 // this the narrower *display* one. Opt-in per field: everything not declared keeps
 // the fail-close behaviour.
 func parseStringTruncations(schema map[string]any) ([]jsonTemplateStringTruncation, error) {
-	raw, exists := schema["x-octo-constraints"]
-	if !exists {
-		return nil, nil
-	}
-	constraints, ok := raw.(map[string]any)
-	if !ok {
-		return nil, errors.New("x-octo-constraints must be an object")
+	constraints, err := constraintsBlock(schema)
+	if err != nil || constraints == nil {
+		return nil, err
 	}
 	rawEntries, exists := constraints["truncateStrings"]
 	if !exists {

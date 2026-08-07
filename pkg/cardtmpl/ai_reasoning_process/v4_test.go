@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
@@ -741,34 +742,43 @@ func TestSimplifiedSuccessorResultFrameRejectsSubmitEvenWithMatchingGolden(t *te
 	}
 }
 
-// D3a persistence ceiling — the contract must not admit what the store cannot
-// hold. `cardmsg.MaxPayloadBytes` (512 KiB) is the only size gate a rendered
-// frame passes, but it is not the smallest one downstream: the authoritative
-// bot-edit write puts the whole marshalled frame into
-// `message_extra.content_edit` (`internal/carddispatch/mutation.go`), and that
-// column's width is discovered only at INSERT time — as `Data too long for
-// column` under STRICT_TRANS_TABLES, or a silent truncation into invalid JSON
-// without it.
+// D3a persistence budget — measured on the bytes that are actually stored.
 //
-// So this asserts the invariant directly: at the schema's own ceiling, under the
-// worst-case *byte* encoding, the frame still fits the column. Two things make
-// that non-trivial and are covered explicitly:
+// The load-bearing subtlety, and the reason the first version of this test was
+// wrong: a rendered frame is NOT what gets persisted. `Render` returns the
+// envelope before `cardmsg.Finalize`, and Finalize adds a top-level `plain`
+// (`pkg/cardmsg/plain.go`) derived from every visible TextBlock/FactSet in the
+// card. That finalized value is what `NormalizeContentEdit` canonicalizes and what
+// `internal/carddispatch/mutation.go` writes into `message_extra.content_edit`
+// (MySQL TEXT) and `octo_message_card_revision.content`. Measuring
+// `json.Marshal(payload)` straight out of Render understates the stored size by
+// roughly a third to a half, so a ceiling derived from it is derived from the
+// wrong number.
 //
-//   - JSON Schema counts code points while the column counts bytes, and Go
-//     escapes `<`, `>`, `&`, U+2028 and U+2029 to six bytes each. The CJK
-//     fixture the other tests use is therefore NOT the byte worst case, and
-//     neither is escaping `thought` alone — every free string has to escape.
-//   - the column width is read out of the migration rather than hand-copied, so
-//     widening it to MEDIUMTEXT is observable here instead of leaving the
-//     ceiling silently over-conservative.
-func TestSimplifiedSuccessorCeilingIsPersistenceSafe(t *testing.T) {
+// What is asserted here:
+//
+//   - measurement unit — the persisted encoding is strictly larger than the
+//     rendered one, so a future edit cannot quietly go back to measuring the
+//     render output.
+//   - realistic frames have real margin against the column.
+//   - the adversarial worst case is known and gated: it is measured through the
+//     production persistence check (carddispatch.NormalizeFrameForPersistence,
+//     the same function Mutate and CardUpdater use), and whatever the verdict, it
+//     is deterministic — never a MySQL `Data too long` and never a silent
+//     truncation into invalid JSON.
+//
+// Byte-vs-code-point is the reason the adversarial case matters at all: JSON
+// Schema counts code points while the column counts bytes, and Go escapes `<`,
+// `>`, `&`, U+2028 and U+2029 to six bytes each. The CJK fixtures the other tests
+// use are therefore NOT the byte worst case, and neither is escaping `thought`
+// alone — every free string has to escape.
+func TestSimplifiedSuccessorPersistedFrameIsMeasuredAndGated(t *testing.T) {
 	columnBytes := contentEditColumnBytes(t)
 	reg := newRegistry(t)
 
-	// escapeAll drives every free string to 6 bytes per code point, not just
-	// `thought`: the other fields sit in the same frame and inflate the baseline
-	// with it (measured: 30,036 B of baseline as CJK vs 42,024 B escaped).
-	worstFrameBytes := func(t *testing.T, thoughtLen int, escapeAll bool) int {
+	// frameBytes renders one worst-case-shaped frame per state and reports both the
+	// rendered size and the size that would actually be persisted.
+	frameBytes := func(t *testing.T, thoughtLen int, escapeAll bool) (rendered, persisted int, worstState string, gate error) {
 		t.Helper()
 		filler := func(n int, cjk string) string {
 			if escapeAll {
@@ -776,7 +786,6 @@ func TestSimplifiedSuccessorCeilingIsPersistenceSafe(t *testing.T) {
 			}
 			return strings.Repeat(cjk, n)
 		}
-		var maxSeen int
 		for _, tc := range reasoningStates {
 			data := readSampleMap(t, reasoningRootV4, "reasoning")
 			data["state"] = string(tc.state)
@@ -808,42 +817,96 @@ func TestSimplifiedSuccessorCeilingIsPersistenceSafe(t *testing.T) {
 			if err != nil {
 				t.Fatalf("thought=%d escapeAll=%v state=%s: %v", thoughtLen, escapeAll, tc.state, err)
 			}
+			// card_seq / space_id are what the mutation path adds before the write;
+			// without them the persistence check would reject on shape, not size.
+			payload["card_seq"] = 2
+			payload["space_id"] = "space-x"
 			encoded, err := json.Marshal(payload)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(encoded) > maxSeen {
-				maxSeen = len(encoded)
+			// The production gate: cardmsg convergence + Finalize + column width.
+			normalized, gateErr := carddispatch.NormalizeFrameForPersistence(string(encoded))
+			size := len(normalized)
+			if gateErr != nil {
+				// Refused. Measure it independently so the log still reports how far over.
+				finalized, ferr := cardmsg.NormalizeContentEdit(string(encoded))
+				if ferr != nil {
+					t.Fatalf("state=%s frame is not even cardmsg-valid: %v", tc.state, ferr)
+				}
+				size = len(finalized)
+			}
+			if size > persisted {
+				rendered, persisted, worstState, gate = len(encoded), size, string(tc.state), gateErr
 			}
 		}
-		return maxSeen
+		return rendered, persisted, worstState, gate
 	}
 
-	ceiling := reasoningThoughtMax(t, reasoningVersionV4)
-	cjk := worstFrameBytes(t, ceiling, false)
-	escaped := worstFrameBytes(t, ceiling, true)
+	// (1) Measurement unit. The persisted encoding must exceed the rendered one — that gap is
+	// `plain`, and it is the whole reason the earlier measurement was wrong.
+	rendered, persisted, worstState, _ := frameBytes(t, reasoningThoughtDisplayMax, false)
+	if persisted <= rendered {
+		t.Fatalf("persisted frame (%d B) should exceed the rendered frame (%d B): cardmsg.Finalize "+
+			"adds a top-level `plain` copy of every visible text node. If this no longer holds, "+
+			"either Finalize changed or this test went back to measuring the wrong artifact.",
+			persisted, rendered)
+	}
+	t.Logf("realistic worst shape (%s, CJK): rendered %d B → persisted %d B (+%.0f%% from plain), "+
+		"%.0f%% of the %d B column", worstState, rendered, persisted,
+		100*float64(persisted-rendered)/float64(rendered),
+		100*float64(persisted)/float64(columnBytes), columnBytes)
 
-	// The invariant. If this fails, the advertised contract accepts frames the
-	// authoritative write cannot persist — a bot can send schema-valid data and
-	// get a 500 with the card frozen mid-stream.
-	if escaped > columnBytes {
-		t.Fatalf("frame at the schema ceiling (thought=%d, every free string escaped) = %d B, "+
-			"over message_extra.content_edit's %d B: the contract would admit payloads the "+
-			"authoritative write cannot store. Lower the ceiling, gate the frame at the "+
-			"persistence boundary, or widen the column — and update D3a with it",
-			ceiling, escaped, columnBytes)
+	// (2) Realistic frames keep margin. The shipped samples are what production
+	// actually sends; they must sit well clear of the column, not just inside it.
+	for _, tc := range reasoningStates {
+		payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+			reasoningVersionV4, tc.state, readSample(t, reasoningRootV4, string(tc.state)),
+			cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+		if err != nil {
+			t.Fatalf("render %s: %v", tc.state, err)
+		}
+		payload["card_seq"] = 2
+		payload["space_id"] = "space-x"
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		normalized, err := carddispatch.NormalizeFrameForPersistence(string(encoded))
+		if err != nil {
+			t.Fatalf("shipped %s sample cannot be persisted: %v", tc.state, err)
+		}
+		if share := float64(len(normalized)) / float64(columnBytes); share > 0.5 {
+			t.Errorf("shipped %s sample persists at %d B = %.0f%% of the column — too little "+
+				"headroom for a frame this ordinary; the template grew or plain did",
+				tc.state, len(normalized), share*100)
+		}
 	}
-	// Escaping only `thought` understates the maximum; guard the fixture choice
-	// so a future edit cannot quietly reintroduce a CJK-only "worst case".
-	if escaped <= cjk {
-		t.Fatalf("escape-heavy frame (%d B) should exceed the CJK frame (%d B): Go escapes "+
-			"<, >, &, U+2028, U+2029 to 6 bytes, so CJK is not the byte worst case", escaped, cjk)
+
+	// (3) The adversarial case is deterministic either way. Whatever the verdict,
+	// it is decided here and not by MySQL.
+	_, advPersisted, advState, advGate := frameBytes(t, reasoningThoughtMax(t, reasoningVersionV4), true)
+	switch {
+	case advGate == nil && advPersisted > columnBytes:
+		t.Fatalf("adversarial frame (%s) = %d B is over the %d B column but the persistence "+
+			"gate accepted it — that write would hit MySQL", advState, advPersisted, columnBytes)
+	case advGate != nil && !errors.Is(advGate, carddispatch.ErrCardMutationTooLarge):
+		t.Fatalf("adversarial frame (%s) was refused for the wrong reason: %v", advState, advGate)
+	case advGate != nil:
+		t.Logf("adversarial worst case (%s, every free string escaped, thought at the %d accept "+
+			"ceiling): %d B = %.0f%% of the %d B column → refused deterministically by the "+
+			"persistence gate. Frames this shape are unreachable through normal use; the point "+
+			"is that the refusal is a typed error with a byte count, not `Data too long`.",
+			advState, reasoningThoughtMax(t, reasoningVersionV4), advPersisted,
+			100*float64(advPersisted)/float64(columnBytes), columnBytes)
+	default:
+		t.Logf("adversarial worst case (%s): %d B, within the %d B column", advState, advPersisted, columnBytes)
 	}
-	if escaped > cardmsg.MaxPayloadBytes {
-		t.Fatalf("escape-heavy frame = %d B exceeds cardmsg.MaxPayloadBytes (%d)", escaped, cardmsg.MaxPayloadBytes)
+	if advPersisted > cardmsg.MaxPayloadBytes {
+		t.Fatalf("adversarial frame = %d B exceeds cardmsg.MaxPayloadBytes (%d): it would fail "+
+			"at render, before the persistence gate could give a specific reason",
+			advPersisted, cardmsg.MaxPayloadBytes)
 	}
-	t.Logf("ceiling %d cp/phase: %d B CJK / %d B fully escaped, both within the %d B column (%.0f%% used)",
-		ceiling, cjk, escaped, columnBytes, float64(escaped)/float64(columnBytes)*100)
 }
 
 // contentEditColumnBytes derives the persistence ceiling from the migrations that
@@ -928,8 +991,11 @@ func TestSimplifiedSuccessorHasNoOutboundRuntimeDependency(t *testing.T) {
 		}
 	}
 
-	// The icons must actually be inline, and must survive the render path — which
-	// accepts them only because cardtmpl passes cardmsg.AllowInlineImageData().
+	// The icons must actually be inline, and must survive the production persist
+	// path — not just the render path. cardmsg vets inline icons by exact bytes, so
+	// a strict NormalizeContentEdit (what carddispatch runs before the write) has to
+	// accept the very frame cardtmpl produced. If these two ever disagree, a V4 card
+	// sends fine and then fails on its first edit, freezing mid-stream.
 	reg := newRegistry(t)
 	for _, tc := range reasoningStates {
 		payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
@@ -944,6 +1010,16 @@ func TestSimplifiedSuccessorHasNoOutboundRuntimeDependency(t *testing.T) {
 		}
 		if !strings.Contains(string(encoded), "data:image/svg+xml,") {
 			t.Fatalf("rendered %s frame carries no inline icon", tc.state)
+		}
+		payload["card_seq"] = 2
+		payload["space_id"] = "space-x"
+		framed, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cardmsg.NormalizeContentEdit(string(framed)); err != nil {
+			t.Fatalf("%s frame renders but the persist-path validator rejects it: %v\n"+
+				"the inline icon bytes must be in cardmsg's vetted allowlist", tc.state, err)
 		}
 	}
 

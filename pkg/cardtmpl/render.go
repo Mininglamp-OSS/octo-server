@@ -180,11 +180,8 @@ func renderCore(
 		payload["render_profile"] = meta.RenderProfileCompatibility
 	}
 
-	// step 8: cardmsg.Validate 一次总校验 (白名单 / 上限 / interaction 门)。
-	// AllowInlineImageData: 这条路径上的 card 树完全来自本仓库的 handoff 模板产物
-	// (调用方只能填 schema 校验过的 data 字段, 填不出 Image.url), 所以内联矢量图标
-	// 在这里是可信的。Bot raw card / webhook adapter / message edit 不传此 option。
-	if err := cardmsg.Validate(payload, cardmsg.AllowInlineImageData()); err != nil {
+	// step 8: cardmsg.Validate 一次总校验 (白名单 / 上限 / interaction 门)
+	if err := cardmsg.Validate(payload); err != nil {
 		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
 		return nil, fmt.Errorf("%w: cardmsg.Validate: %v", ErrRenderFailed, err)
 	}

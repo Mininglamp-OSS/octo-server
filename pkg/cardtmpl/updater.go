@@ -144,7 +144,7 @@ func (u *updater) Append(ctx context.Context, target UpdateTarget, element json.
 	if err != nil {
 		return fmt.Errorf("%w: marshal append frame: %v", ErrUpdateInvalid, err)
 	}
-	normalized, err := cardmsg.NormalizeContentEdit(string(raw))
+	normalized, err := carddispatch.NormalizeFrameForPersistence(string(raw))
 	if err != nil {
 		return fmt.Errorf("%w: validate append frame: %v", ErrUpdateInvalid, err)
 	}
@@ -199,7 +199,7 @@ func updateEnvelope(document json.RawMessage, profile, renderProfile, spaceID st
 	if err != nil {
 		return "", fmt.Errorf("%w: marshal replacement frame: %v", ErrUpdateInvalid, err)
 	}
-	normalized, err := cardmsg.NormalizeContentEdit(string(raw))
+	normalized, err := carddispatch.NormalizeFrameForPersistence(string(raw))
 	if err != nil {
 		return "", fmt.Errorf("%w: validate replacement frame: %v", ErrUpdateInvalid, err)
 	}

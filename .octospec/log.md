@@ -49,16 +49,39 @@ change-log convention (§7). Newest first.
   indexed id is an unverified published claim), and the "a matching golden
   cannot launder an injected `Action.Submit` in the `octo/v1` result frame"
   invariant had a generic-compiler test but none for this artifact.
-- **Decision** — `phases[].thought` raised `281` → **`400`**, breaking its old habit of
-  mirroring the producer's truncation length. The number is derived from the persistence
-  layer, not the producer: it took two review rounds to establish that the binding ceiling
-  is `message_extra.content_edit`'s 64 KiB `TEXT` column, not `cardmsg.MaxPayloadBytes`
-  (512 KiB). At the worst-case byte encoding this card is already at 64% of the column
-  before `thought` contributes anything, so no ceiling in the thousands was available;
-  `400` leaves ~14% headroom, and a test enforces contract ≤ storage so the claim cannot
-  rot. Reaching a few thousand code points needs the `MEDIUMTEXT` widening (own brief, hot
-  table) and then a `0.5.0`. `tool: 81` / `detail: 192` / `errorMessage: 121` keep the same
+- **Decision** — `phases[].thought` gets **two ceilings**: accept `4001`, display `400` with
+  server-side truncation (`x-octo-constraints.truncateStrings`, new engine capability). It
+  stops mirroring the producer's truncation length either way, and an over-long summary now
+  renders clamped instead of failing the card. The display number is a **product decision**
+  ("≤ 400 is fine, truncate above it, don't error"); the engine's real contribution is that
+  frame size stops depending on caller input — 400 and 4001 produce byte-identical frames.
+  Four review rounds to get here, and the fourth invalidated the previous three's arithmetic:
+  they measured the render output, but `cardmsg.Finalize` afterwards adds a top-level `plain`
+  worth **+47%**, and that is what gets stored. Re-measured on persisted bytes, `thought` turns
+  out never to have been the dominant term (at `thought = 1` the worst frame is still **107%**
+  of the 64 KiB column; the frame is dominated by 13 actions × (`tool` 81 + `detail` 192) plus
+  `plain`), and the live `0.3.0` is **already at 121.6%** at its own bound — pre-existing debt,
+  unfixable in place because its bytes are frozen. `tool` / `detail` / `errorMessage` keep their
   zero-headroom design and were knowingly left alone.
+- **Decision** — The storage budget moved to the **write boundary**, since no single schema
+  version can enforce it. `carddispatch.NormalizeFrameForPersistence` is now the one judge of
+  "can this frame be stored", shared by `CardMutator.Mutate` and both `CardUpdater` paths,
+  returning `ErrCardMutationTooLarge` (wrapping `ErrCardMutationInvalid`, so existing error
+  mapping is unchanged) with the byte count. Covers `0.1.0`–`0.4.0` and every future template;
+  turns MySQL `Data too long` / silent truncation into invalid JSON into a typed, logged refusal.
+  Still open: an all-fields-at-maximum CJK frame persists at **92.6%** — under 5 KB of margin —
+  so `MEDIUMTEXT` widening (own brief, hot table, `ALGORITHM=COPY, LOCK=SHARED`) or truncating
+  `tool`/`detail` (a visual change, hence a product decision) remain the durable fixes.
+- **Decision (reversed in review)** — D4a: the handoff's chevrons fetched from
+  `api.iconify.design` — the repo's first outbound template dependency, permanent once the
+  version's bytes freeze, and unreachable from mainland China networks. Now **inlined as vetted
+  `data:image/svg+xml` bytes**. The first relaxation of `cardmsg`'s URL allowlist used a
+  trusted-caller `ValidateOption` plus a substring denylist; review broke both — the option was
+  applied at render but not at the three paths that re-validate before persisting (so every
+  `0.4.0` card would send once and freeze on first edit), and the denylist had five reproduced
+  bypasses (namespace prefixes, CSS identifier escapes, SVG 1.2 Tiny `<handler>`). Replaced by
+  an **exact-byte allowlist**, which is smaller and makes all four problems unrepresentable
+  rather than fixed. `data:` stays refused on non-image URL fields and for any unvetted bytes.
 - **Learning (pending)** —
   [`schema-bound-must-not-mirror-producer-truncation`](learnings/pending/schema-bound-must-not-mirror-producer-truncation.md):
   a `maxLength` equal to `producer_cap + 1` is a coupling, not a bound — it is
@@ -66,20 +89,25 @@ change-log convention (§7). Newest first.
   code points vs JS UTF-16 code units vs graphemes, measured and confirmed).
   Over-limit means the whole card fails to send, not a display regression.
   Candidate rule: `trust-boundary`.
-- **Review corrections (two rounds, both worth recording)** — the first draft of that
-  learning ended "the bound was never protecting a real resource", and D3a claimed "~4×
-  headroom" at `thought: 4001`. Round one showed both were measured against the wrong
-  ceiling (512 KiB render gate vs 64 KiB storage column; the frame was 1.56× over with CJK,
-  2.84× over fully escaped). Round two rejected the follow-up proposal to keep `4001` and
-  gate oversized frames at the persistence boundary — a contract published to *every* bot
-  via `/v1/bot/card/profile` (which also advertises a 512 KiB payload allowance) must not
-  admit what the store cannot hold, however politely the write fails. It also caught that
-  the "persistence-safe cap" figure in all four documents was ~50% too high in the *unsafe*
-  direction, because the escaped baseline had been measured with the non-`thought` strings
-  left as CJK (30,036 B vs the real 42,024 B). Generalized in the learning as three claims:
-  a validator ceiling is not a storage ceiling; code points are not bytes and one field's
-  fixture is not the worst case; and check how much of the budget the rest of the payload
-  already spends before promising a widening at all.
+- **Review corrections (four rounds)** — the first draft of that learning ended "the bound was
+  never protecting a real resource", and D3a claimed "~4× headroom" at `thought: 4001`. Round
+  one showed both were measured against the wrong ceiling (512 KiB render gate vs 64 KiB storage
+  column). Round two rejected keeping `4001` with a boundary refusal for *declared field length*
+  — a contract published to *every* bot via `/v1/bot/card/profile` (which also advertises a
+  512 KiB payload allowance) must not admit what the store cannot hold, however politely the
+  write fails. Round three answered that with the accept/display split. Round four found the
+  error under all three: **every byte figure had been measured on the render output, not on the
+  bytes that get stored** — `cardmsg.Finalize` adds a top-level `plain` afterwards worth +47%.
+  Correcting it reversed two conclusions (`thought` was never the dominant term; `0.3.0` is
+  already over) and relocated the enforcement point from the schema to the write boundary. The
+  same round found the inline-icon trust boundary applied at one call site out of four, with the
+  gap invisible because the edit tests use a fake mutator that never re-validates.
+- **Learning (pending)** —
+  [`relax-validation-by-artifact-not-by-caller`](learnings/pending/relax-validation-by-artifact-not-by-caller.md):
+  a validator relaxed via a trusted-caller flag has to be kept in sync across every path that
+  re-validates the same artifact, and nothing types that coupling. Key the relaxation on the
+  artifact (these exact bytes are vetted) instead — it cannot drift, it makes sanitizer bypasses
+  unreachable, and it forces interpolated values out of the relaxed position by construction.
 
 ## 2026-08-06 (bot-setting-store)
 
