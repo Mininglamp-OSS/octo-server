@@ -1,0 +1,29 @@
+{
+  "actions": [
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_toggle"
+    },
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_toggle_expanded_action"
+    },
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_tools_toggle_action_0"
+    },
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_tools_toggle_expanded_action_0"
+    },
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_tools_toggle_action_1"
+    },
+    {
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_tools_toggle_expanded_action_1"
+    }
+  ],
+  "inputs": []
+}

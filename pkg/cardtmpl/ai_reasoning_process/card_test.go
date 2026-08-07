@@ -28,6 +28,8 @@ var reasoningStates = []struct {
 const (
 	reasoningVersionV3 = aireasoningprocess.TemplateVersionV3
 	reasoningRootV3    = aireasoningprocess.HandoffRootV3
+	reasoningVersionV4 = aireasoningprocess.TemplateVersionV4
+	reasoningRootV4    = aireasoningprocess.HandoffRootV4
 )
 
 var reasoningVersions = []struct {
@@ -37,9 +39,15 @@ var reasoningVersions = []struct {
 	{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 	{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
 	{reasoningVersionV3, reasoningRootV3},
+	{reasoningVersionV4, reasoningRootV4},
 }
 
+// boundedReasoningVersions skips the pre-#667 V1, which has no bounds to assert.
 var boundedReasoningVersions = reasoningVersions[1:]
+
+// noSubmitReasoningVersions are the versions whose action surface is the local
+// toggle only; V1/V2 still carry their frozen stop/retry Submit contracts.
+var noSubmitReasoningVersions = reasoningVersions[2:]
 
 func newRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
@@ -47,20 +55,25 @@ func newRegistry(t *testing.T) *cardtmpl.Registry {
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	reg.RegisterJSON(aireasoningprocess.Assets, reasoningRootV3)
-	reg.SetDefault(aireasoningprocess.TemplateID, reasoningVersionV3)
+	reg.RegisterJSON(aireasoningprocess.Assets, reasoningRootV4)
+	reg.SetDefault(aireasoningprocess.TemplateID, reasoningVersionV4)
 	reg.Freeze()
 	return reg
 }
 
-func TestRegistersAllVersionsAndDefaultsToHiddenControlsSuccessor(t *testing.T) {
+func TestRegistersAllVersionsAndDefaultsToSimplifiedSuccessor(t *testing.T) {
 	reg := newRegistry(t)
+	noSubmit := make(map[string]struct{}, len(noSubmitReasoningVersions))
+	for _, version := range noSubmitReasoningVersions {
+		noSubmit[version.version] = struct{}{}
+	}
 	var versions []string
 	for _, meta := range reg.List() {
 		if meta.ID != aireasoningprocess.TemplateID {
 			continue
 		}
 		versions = append(versions, meta.Version)
-		if meta.Version == reasoningVersionV3 {
+		if _, ok := noSubmit[meta.Version]; ok {
 			if meta.ActionContract != nil {
 				t.Fatalf("%s ActionContract = %+v, want nil", meta.Version, meta.ActionContract)
 			}
@@ -76,21 +89,22 @@ func TestRegistersAllVersionsAndDefaultsToHiddenControlsSuccessor(t *testing.T) 
 		aireasoningprocess.TemplateVersionV1,
 		aireasoningprocess.TemplateVersionV2,
 		reasoningVersionV3,
+		reasoningVersionV4,
 	}
 	if !equalStrings(versions, wantVersions) {
 		t.Fatalf("registered versions = %v, want %v", versions, wantVersions)
 	}
-	if aireasoningprocess.TemplateVersion != reasoningVersionV3 || aireasoningprocess.HandoffRoot != reasoningRootV3 {
+	if aireasoningprocess.TemplateVersion != reasoningVersionV4 || aireasoningprocess.HandoffRoot != reasoningRootV4 {
 		t.Fatalf("current aliases = %s / %s, want %s / %s",
-			aireasoningprocess.TemplateVersion, aireasoningprocess.HandoffRoot, reasoningVersionV3, reasoningRootV3)
+			aireasoningprocess.TemplateVersion, aireasoningprocess.HandoffRoot, reasoningVersionV4, reasoningRootV4)
 	}
 
 	tmpl, err := reg.Lookup(aireasoningprocess.TemplateID, "")
 	if err != nil {
 		t.Fatalf("Lookup(default): %v", err)
 	}
-	if got := tmpl.Meta().Version; got != reasoningVersionV3 {
-		t.Fatalf("default version = %q, want %q", got, reasoningVersionV3)
+	if got := tmpl.Meta().Version; got != reasoningVersionV4 {
+		t.Fatalf("default version = %q, want %q", got, reasoningVersionV4)
 	}
 }
 
@@ -262,39 +276,41 @@ func TestHiddenControlsSuccessorRejectsLegacySubmitIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		state    cardtmpl.State
-		actionID string
-	}{
-		{state: "reasoning", actionID: "reasoning_stop"},
-		{state: "answering", actionID: "reasoning_stop"},
-		{state: "error", actionID: "reasoning_retry"},
-	} {
-		t.Run(string(tc.state)+"/"+tc.actionID, func(t *testing.T) {
-			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
-				reasoningVersionV3, tc.state, readSample(t, reasoningRootV3, string(tc.state)),
-				cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			encoded, err := json.Marshal(payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, found := cardmsg.SubmitAction(encoded, tc.actionID); found {
-				t.Fatalf("legacy action %q resolved from V3 %s frame", tc.actionID, tc.state)
-			}
-			_, err = catalog.ActionContext(context.Background(), cardtmpl.CatalogActionRequest{
-				CatalogExactRequest: cardtmpl.CatalogExactRequest{
-					Access: cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeActionContext},
-					ID:     aireasoningprocess.TemplateID, Version: reasoningVersionV3,
-				},
-				ActionID: tc.actionID,
+	for _, version := range noSubmitReasoningVersions {
+		for _, tc := range []struct {
+			state    cardtmpl.State
+			actionID string
+		}{
+			{state: "reasoning", actionID: "reasoning_stop"},
+			{state: "answering", actionID: "reasoning_stop"},
+			{state: "error", actionID: "reasoning_retry"},
+		} {
+			t.Run(version.version+"/"+string(tc.state)+"/"+tc.actionID, func(t *testing.T) {
+				payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+					version.version, tc.state, readSample(t, version.root, string(tc.state)),
+					cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, found := cardmsg.SubmitAction(encoded, tc.actionID); found {
+					t.Fatalf("legacy action %q resolved from %s %s frame", tc.actionID, version.version, tc.state)
+				}
+				_, err = catalog.ActionContext(context.Background(), cardtmpl.CatalogActionRequest{
+					CatalogExactRequest: cardtmpl.CatalogExactRequest{
+						Access: cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeActionContext},
+						ID:     aireasoningprocess.TemplateID, Version: version.version,
+					},
+					ActionID: tc.actionID,
+				})
+				if !errors.Is(err, cardtmpl.ErrActionUnknown) {
+					t.Fatalf("legacy action %q ActionContext error = %v, want ErrActionUnknown", tc.actionID, err)
+				}
 			})
-			if !errors.Is(err, cardtmpl.ErrActionUnknown) {
-				t.Fatalf("legacy action %q ActionContext error = %v, want ErrActionUnknown", tc.actionID, err)
-			}
-		})
+		}
 	}
 }
 
