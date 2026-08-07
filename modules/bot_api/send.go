@@ -313,17 +313,30 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		return
 	}
 
-	// 模板发送的列宽预检（PR#712 review, lml2468 P1-2）。send 侧原本只查 512 KiB，
-	// 而编辑侧查 TEXT 列宽 65,535 B —— 两者不一致就能造出「发得出去、第一次编辑就被拒」
-	// 的卡，而推理卡靠反复编辑推进阶段，等于一张永久停在首帧的卡。把不一致提前到发送口，
-	// 让它变成一次明确的拒绝，而不是一张已经存在、却再也动不了的卡。
+	// 模板发送的列宽预检（PR#712 review lml2468 P1-2）。send 侧原本只查 512 KiB，而编辑
+	// 侧查 TEXT 列宽 65,535 B，两者不一致就能造出「发得出去、第一次编辑就被拒」的卡。
 	//
-	// 只作用于**模板**分支，刻意不管 raw 发送：模板帧的尺寸完全由服务端产物 + schema
-	// 有界输入决定（实测出厂样本 7–12 KB，占列宽不到 20%），所以这道检查只会在病态输入
-	// 上触发；而 raw 卡片是调用方自己作者的一次性内容，对外承诺的就是 512 KiB，收紧它
-	// 会拒掉今天能发、且从不被编辑因而永远不碰 content_edit 的卡。
+	// 这道检查**只覆盖第一帧**，不是那个不一致的通解（review P2-3）：编辑信封会多出
+	// card_seq / transient，而且推理卡的后续帧数据更多（phases 从 1 累积到 6），所以首帧
+	// 装得下推不出第 N 帧装得下。它能挡住的是病态的首帧 —— 那种发出去就注定动不了的卡。
+	// 真正的通解是迁 MEDIUMTEXT 或给 tool/detail 上截断，见 brief D3a 的 open 项。
+	//
+	// 只作用于**模板**分支，刻意不管 raw 发送：模板帧的尺寸由服务端产物 + schema 有界输入
+	// 决定（实测出厂样本 10.3–18.3 KB，占列宽 15.7%–27.9%），所以这道检查只会在病态输入上
+	// 触发；而 raw 卡片是调用方自己作者的一次性内容，对外承诺的就是 512 KiB，收紧它会拒掉
+	// 今天能发、且从不被编辑因而永远不碰 content_edit 的卡。
 	if templateMode {
-		if frame, mErr := json.Marshal(payload); mErr == nil && len(frame) > carddispatch.MaxPersistedFrameBytes {
+		// fail-closed：marshal 失败必须拒绝，不能跳过尺寸检查。实践上不可达
+		// （payload 是 JSON 解出来的 map，上面 cardmsg.Finalize 刚 marshal 过一次），
+		// 但一个 fail-open 的条件不该出现在这个位置（review P2-4）。
+		frame, mErr := json.Marshal(payload)
+		if mErr != nil {
+			ba.Error("模板渲染帧 marshal 失败,无法做列宽预检", zap.Error(mErr),
+				zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		if len(frame) > carddispatch.MaxPersistedFrameBytes {
 			ba.Warn("模板渲染帧超出持久化列宽,拒绝发送(否则卡片发出后无法编辑)",
 				zap.String("channelID", channelID), zap.Int("frameBytes", len(frame)),
 				zap.Int("columnBytes", carddispatch.MaxPersistedFrameBytes))

@@ -269,7 +269,9 @@ frame be stored", and all three write paths that re-validate a frame go through 
 carrying the byte count, logged with the message and sender. What this buys:
 
 - it covers `0.1.0`–`0.4.0` and every future template, including ones nobody has written yet;
-- it costs nothing for realistic traffic — the shipped samples persist at 7–12 KB, under 20% of the column;
+- it costs nothing for realistic traffic — the five shipped samples persist at 10,310 / 10,724 / 12,069 /
+  16,233 / 18,259 B, i.e. **15.7%–27.9%** of the column (measured through the production gate; an earlier
+  revision of this line said "7–12 KB, under 20%", which was wrong for two of the five states — review P2-1);
 - `Data too long` / silent truncation into a frame no client can render becomes a deterministic, typed,
   logged refusal. The card still cannot advance, but the failure names itself instead of surfacing as a 500.
 
@@ -292,6 +294,13 @@ product decision rather than an engineering one. **Note for whoever plans that s
 *top-level* array, and `tool`/`detail` live one level deeper, in `phases[].actions[]`. So the fields that
 dominate the frame are exactly the ones the current mechanism structurally cannot clamp; that option needs an
 engine change (nested path support) before it needs a product decision. Both are out of scope for `0.4.0`; neither is blocked by it.
+
+One more thing whoever picks that up will be triaging (review P2-5): both new gates collapse "too large"
+into `ErrBotAPICardInvalid`, deliberately, because a new public error code is out of scope here
+(`ErrCardMutationTooLarge` wraps `ErrCardMutationInvalid` so the existing mapping absorbs it). The
+observable consequence is that a producer hitting the column gets a generic "invalid card" with no hint
+that shortening would help — the byte count exists only in the server log. If the column is widened or
+`tool`/`detail` gain display ceilings, a distinguishable code for this case belongs in the same change.
 
 `MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — text length adds no nodes, so the node budget
 in the section above is unaffected and the aggregate cap of 13 stands unchanged.

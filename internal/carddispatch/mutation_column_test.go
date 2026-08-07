@@ -218,3 +218,28 @@ func TestWriteCASRefusesFramesWiderThanTheColumn(t *testing.T) {
 		t.Fatalf("at-limit frame should be written once, got %d", len(backend.writes))
 	}
 }
+
+// MaxPersistedFrameBytes 是发送侧（modules/bot_api 模板分支）做同口径预检用的导出
+// 别名。它必须等于闸自己用的那个数 —— 两边一旦分叉，发送预检就会放过编辑一定会拒的帧，
+// 「发得出去、第一次编辑就被拒」这个失败模式原样回来。review 指出这个常量此前零测试
+// 覆盖（P2-2），而它所在的文件正是本轮 blocker 出问题的地方。
+func TestMaxPersistedFrameBytesTracksTheGate(t *testing.T) {
+	if MaxPersistedFrameBytes != maxContentEditBytes {
+		t.Fatalf("MaxPersistedFrameBytes = %d, 闸用的 maxContentEditBytes = %d —— "+
+			"发送侧预检与写入侧闸口径分叉了", MaxPersistedFrameBytes, maxContentEditBytes)
+	}
+	// 自证这个别名真的是闸的判据：正好等于它的帧放行，多一个字节被拒。
+	backend := &fakeMutationBackend{}
+	if _, err := newCardMutator(backend).WriteCAS(CardMutationCASRequest{
+		MessageID: "1001", MessageSeq: 7, ChannelID: "user-b", ChannelType: 1,
+		ContentEdit: strings.Repeat("x", MaxPersistedFrameBytes), ContentHash: "h", EditedAt: 1, CardSeq: 2,
+	}); err != nil {
+		t.Fatalf("MaxPersistedFrameBytes 个字节应放行，得到 %v", err)
+	}
+	if _, err := newCardMutator(&fakeMutationBackend{}).WriteCAS(CardMutationCASRequest{
+		MessageID: "1001", MessageSeq: 7, ChannelID: "user-b", ChannelType: 1,
+		ContentEdit: strings.Repeat("x", MaxPersistedFrameBytes+1), ContentHash: "h", EditedAt: 1, CardSeq: 2,
+	}); !errors.Is(err, ErrCardMutationTooLarge) {
+		t.Fatalf("MaxPersistedFrameBytes+1 个字节应被拒，得到 %v", err)
+	}
+}
