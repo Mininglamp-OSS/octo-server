@@ -50,38 +50,51 @@ explicitly bounded — removing the bound is not the fix, and an unbounded strin
 `DefaultCompileLimits().RequireBoundedSchema` anyway.
 
 **But find the *binding* ceiling before declaring headroom, and look past the validator.**
-This is the part the original version of this learning got wrong. Widening `thought` from
-281 to 4001 moved the fully-saturated frame from 6.69% to 19.46% of
-`cardmsg.MaxPayloadBytes` (512 KiB) — the only size gate a rendered frame actually passes
-— and cost zero nodes, since `MaxNodes`/`MaxDepth` are structural limits that text length
-does not touch. That looked like ~4× headroom. It was not: the authoritative write on the
-bot edit path stores the whole marshalled frame in `message_extra.content_edit`, a MySQL
-**`TEXT` column — 65,535 bytes**, never widened by any later migration. Measured on the
-same fixture, the saturated frame is 102,036 B with CJK text (1.56× over the column) and
-174,054 B when every character escapes to 6 bytes (2.66× over). So in *this* instance the
-`producer_cap + 1` bound, arbitrary as its provenance was, happened to be the only thing
-keeping the template inside a real storage limit.
+This is the part the original version of this learning got wrong, twice. The first attempt raised
+`thought` from 281 to 4001 on the grounds that the fully-saturated frame was only 19.5% of
+`cardmsg.MaxPayloadBytes` (512 KiB) — the only size gate a rendered frame passes — and cost zero nodes,
+since `MaxNodes`/`MaxDepth` are structural limits that text length does not touch. That looked like ~4×
+headroom. It was not: the authoritative write on the bot edit path stores the whole marshalled frame in
+`message_extra.content_edit`, a MySQL **`TEXT` column — 65,535 bytes**, never widened by any later
+migration. The 4001 frame was 1.56× over that with CJK text and **2.84× over (186,024 B)** with every
+free string escaped.
 
-Two things generalize from that:
+The second attempt kept 4001 and proposed rejecting oversized frames at the persistence boundary. That
+is also wrong, and for a reason worth stating separately: **a published contract that admits what the
+store cannot hold is a defect regardless of how politely the write fails.** The schema was advertised to
+every bot through a capability endpoint — one that also reports a 512 KiB payload allowance, actively
+suggesting there is room. The realistic actor is not an attacker but the next integrator who reads
+`maxLength` and trusts it.
 
-- **A validator ceiling is not a storage ceiling.** `cardmsg.MaxPayloadBytes` is checked at
-  render; the column width is discovered at `INSERT`. Under `STRICT_TRANS_TABLES` the write
-  fails (`Data too long for column`) *after* the frame validated — on a non-strict
-  deployment it is silently truncated into invalid JSON instead. Trace the value to every
-  place it is persisted, cached, or re-serialized, not just to the gate that rejects it.
-- **Code points are not bytes.** JSON Schema counts code points; a column counts bytes; and
-  Go's encoder escapes `<`, `>`, `&`, U+2028 and U+2029 to six bytes each. The same
-  `maxLength` therefore buys 3×, 4×, or 6× the bytes depending on content, so the
-  byte-worst case is the one that has to fit. Here the persistence-safe ceiling moves from
-  ~1,973 code points per phase (CJK) to ~987 (fully escaped).
+The bound ended up at **400**, derived from the storage budget rather than from any producer constant.
+Three things generalize:
+
+- **A validator ceiling is not a storage ceiling.** `cardmsg.MaxPayloadBytes` is checked at render; the
+  column width is discovered at `INSERT`. Under `STRICT_TRANS_TABLES` the write fails (`Data too long for
+  column`) *after* the frame validated — on a non-strict deployment it is silently truncated into invalid
+  JSON instead. Trace the value to every place it is persisted, cached, or re-serialized, not just to the
+  gate that rejects it.
+- **Code points are not bytes, and one field's fixture is not the worst case.** JSON Schema counts code
+  points; a column counts bytes; and Go's encoder escapes `<`, `>`, `&`, U+2028 and U+2029 to six bytes
+  each. Measuring with a CJK fixture understated the maximum by 1.8×. Escaping only the field under
+  discussion still understated it, because the *other* strings in the same frame escape too: the
+  baseline moved from 30,036 B to 42,024 B once they did.
+- **Check the baseline before promising a widening at all.** At the worst-case encoding this card was
+  already at 64% of the column with `thought` set to one character — 13 actions × (81 + 192) code points
+  is most of the frame. No `thought` ceiling in the thousands was ever available; the only honest options
+  were a modest raise or widening the column first. Measure the floor before negotiating the ceiling.
+
+The final value is 1.42× the old one — modest, but the coupling is what mattered: the number is now
+traceable to a measured budget rather than to `producer_cap + 1`, and a test enforces contract ≤ storage
+at the worst-case encoding so the claim cannot rot.
 
 If a bound genuinely must track a client constant, then write the unit down on both sides
 and put a test on the arithmetic — otherwise it is an undocumented coupling that looks
 like a safety limit.
 
-**Rule of thumb**: a `maxLength` equal to `producer_cap + 1` is a coupling, not a bound —
-but before replacing it, find every ceiling the value has to pass (validator, column,
-cache, envelope) and size against the smallest one, in bytes, at the worst-case encoding.
-Bound the payload for real (structural caps, byte caps, node caps) and let the string
-ceiling be a product decision with room above every producer *and* below every store.
+**Rule of thumb**: a `maxLength` equal to `producer_cap + 1` is a coupling, not a bound — but before
+replacing it, find every ceiling the value has to pass (validator, column, cache, envelope), size against
+the smallest one in bytes at the worst-case encoding, and check how much of that budget the rest of the
+payload already spends. Then bound the payload for real (structural caps, byte caps, node caps) and let
+the string ceiling be a product decision with room above every producer *and* below every store.
 

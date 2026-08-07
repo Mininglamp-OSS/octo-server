@@ -44,28 +44,35 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
   exception, `thought` (below). Verified by a bound-by-bound comparison against the frozen
   V3 schema rather than a file diff, since the two legitimately differ in `required`,
   descriptions, and examples.
-- **`thought` 281 → 4001** (D3a). The old value existed only because it mirrored the
-  producer's observed output (`THOUGHT_MAX = 280` + `…`); see the learning below. It stays
-  bounded on both ends — an unbounded string fails
-  `DefaultCompileLimits().RequireBoundedSchema`, and widening a ceiling is not removing
-  it. Measured on the `0.4.0` template at the worst case the schema admits (6 phases / 13
-  aggregate actions / every other string at max, max across five states): 35,076 B (6.69%
-  of `cardmsg.MaxPayloadBytes`) at 281 → 102,036 B (19.46%) at 4001. `MaxNodes` /
-  `MaxDepth` are *structural*, so longer text costs no nodes and the aggregate cap of 13
-  was untouched.
+- **`thought` 281 → 400, and the number comes from the store** (D3a). The old value existed only because
+  it mirrored the producer's observed output (`THOUGHT_MAX = 280` + `…`); see the learning below. It
+  stays bounded on both ends — an unbounded string fails
+  `DefaultCompileLimits().RequireBoundedSchema`, and widening a ceiling is not removing it.
 
-  **Review corrected the headroom claim, and the correction is the interesting part.**
-  512 KiB is the only size gate a rendered frame passes, but it is not the binding one:
-  the authoritative bot-edit write puts the whole marshalled frame into
-  `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**, never widened by
-  any later migration (`octo_message_card_revision.content` likewise). Against *that*, the
-  saturated frame is 1.56× over with CJK and **2.66× over (174,054 B)** when every
-  character escapes to 6 bytes. So the arbitrary-looking `producer_cap + 1` bound was, in
-  this one instance, the only thing keeping the template inside a real storage limit —
-  which is close to the opposite of what the first draft of the learning asserted. The
-  contract value stays 4001 (it is a product cap, every server-enforced gate passes, and
-  the producer still truncates at 280 so the headroom is unused), but the consumer bump is
-  now gated on a stated precondition instead of being "no ordering dependency".
+  **This took two review rounds to get right, and the interesting part is what the reviews found.**
+  The first attempt set `4001`, arguing that at 19.5% of `cardmsg.MaxPayloadBytes` (512 KiB) there was
+  ~4× headroom. 512 KiB is the only size gate a rendered frame *passes*, but not the smallest one
+  downstream: the authoritative bot-edit write puts the whole marshalled frame into
+  `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**, never widened by any later
+  migration (`octo_message_card_revision.content` likewise). Against that, the `4001` frame was 1.56×
+  over with CJK text and **2.84× over (186,024 B)** with every free string escaped.
+
+  The second attempt kept `4001` and proposed rejecting oversized frames at the persistence boundary.
+  Review rejected that too, correctly: the schema is published to **every** bot through
+  `/v1/bot/card/profile` — alongside `"max_payload_bytes": 524288`, which actively suggests there is
+  room — so a contract promising 4001 while the server refused most of it is still a contract that lies.
+  The realistic actor is not an attacker but the next bot author who reads `maxLength` and trusts it.
+
+  What the measurement actually shows is that a large widening is not available at all here: the
+  escaped-encoding baseline at `thought = 1` is already **42,024 B, 64% of the column**, before
+  `thought` contributes anything. `400` leaves ~14% headroom (56,388 B, 86%); `654` is the arithmetic
+  limit and would be another zero-headroom design — the exact mistake this decision exists to correct.
+  So `400` is only 1.42× the producer's cap, but the coupling is broken: the ceiling now derives from a
+  measured storage budget instead of `THOUGHT_MAX + 1`.
+
+  Getting to a few thousand code points requires widening the two columns first and then a `0.5.0`,
+  since `0.4.0`'s bytes are immutable once shipped. That is recorded in D3a as a precondition, not
+  deferred inside this change.
 - **`timerText` optional but retained in `properties`** (D3/D8). No template binds it, but
   the root is `additionalProperties: false` and the producer sends it unconditionally, so
   deleting the property would have rejected every payload the current plugin emits.
@@ -80,6 +87,29 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
   on binary rollback).
 
 ## Gotchas worth remembering
+
+- **A template-authored URL is trusted by construction, and nobody was checking the host.**
+  Review caught that all three V4 templates fetch their chevrons from
+  `api.iconify.design` (12 occurrences, expanded into all five persisted goldens — so it is
+  card content, shipped to every client, and permanent because `0.4.0`'s bytes are frozen).
+  This is the first outbound runtime dependency any built-in template in this repo carries:
+  `@0.1.0`–`@0.3.0` have zero, their only `http(s)` strings being `$schema` identifiers that
+  are never fetched. And `cardmsg`'s `checkURL` is a positive allowlist on the **scheme**
+  only — it does not constrain the host, because data-supplied URLs get their host
+  discipline elsewhere (schema `pattern` + `AbsoluteHTTPSURL` preflight) while
+  template-authored ones are server-authored and therefore assumed safe. Accepted for
+  `0.4.0` and recorded as D4a with its CSP/egress precondition, rather than fixed: every
+  chevron carries `altText` and its `selectAction` sits on the `Image` element, not on the
+  fetched resource, so a CDN failure degrades to a working alt-text toggle instead of an
+  unreachable panel. All three alternatives had real obstacles — `data:` URIs are refused by
+  `checkURL`'s anti-injection allowlist, self-hosting needs an asset route the server does
+  not have, and a `TextBlock` affordance needs 14 extra `Container`s to carry `selectAction`
+  (which `TextBlock` does not support) against a node budget that already fails at 16
+  aggregate actions.
+- **My own Verify pass missed it.** I checked `octo-surface-*`/`octo-badge-*` ids, `Action.Submit`,
+  bounds, toggle targets and report honesty — but never enumerated outbound resource
+  references, on a change whose whole point is replacing text controls with `Image`
+  elements. Worth adding "what does this fetch, from whom" to the artifact checklist.
 
 - **An interaction report cannot honestly declare a data-generated action id.** The
   handoff's reports enumerated `reasoning_tools_toggle_action_0/1`, but those ids are
@@ -133,25 +163,20 @@ declaring it reintroduces the hand-maintained list #681 refused), missing
 
 ## Follow-ups / notes
 
-- **Consumer change is maintainer-owned and has a hard precondition.** Widening `thought`
-  cannot reject anything the plugin sends today, so no plugin release is required and the
-  new headroom simply goes unused until `openclaw-channel-octo` raises `THOUGHT_MAX` to
-  4000 (keeping the `+…` at exactly 4001). Server-first is the safe order **for
-  validation** — it is not sufficient for storage. Before that bump lands, one of these has
-  to be true: (1) `message_extra.content_edit` and `octo_message_card_revision.content` are
-  widened, e.g. to `MEDIUMTEXT` — `message_extra` is a large hot table so that is a
-  `MODIFY COLUMN` rebuild needing its own brief, deliberately not bundled here; (2) the
-  effective producer cap stays under the persistence-safe ceiling for the worst-case
-  encoding (~987 code points per phase if the text can contain `<`/`>`/`&`/U+2028/U+2029,
-  ~1,973 for pure CJK); or (3) the frame is capped or spilled at the persistence boundary.
-  Otherwise a ~6-long-phase card renders, passes `cardmsg.Validate`, and then the
-  transactional insert fails with `Data too long for column` under `STRICT_TRANS_TABLES`
-  (surfacing as `ErrBotAPIStoreFailed`, freezing the card mid-stream) — or is silently
-  truncated into invalid JSON on a non-strict deployment. So the hazards are **three**, not
-  two: grapheme-aware truncation, the `…` → `...` arithmetic, and this persistence ceiling.
-  Worth noting the 512 KiB-gate-vs-64 KiB-column mismatch is pre-existing platform debt —
-  the ordinary message-edit endpoint already admits 1 MiB of RichText into the same column
-  (`modules/message/api.go:60`) — this change only makes the card path able to reach it.
+- **Consumer change is optional, and at 400 it carries no precondition.** Raising `thought` cannot
+  reject anything the plugin sends today, so no plugin release is required and the plugin keeps working
+  untouched at `THOUGHT_MAX = 280`. Because 400 is storage-safe at the worst-case encoding, a later bump
+  to 399 is a plain independently-deployable change — no column migration first, unlike the `4001` shape
+  this started as. Two encoding hazards still apply to that bump: grapheme-aware truncation would
+  overshoot (one grapheme can be many code points — combining marks, ZWJ emoji, flags, skin-tone
+  modifiers), and `...` instead of `…` breaks the `+1` arithmetic.
+- **Getting to a few thousand code points needs the column first.** `message_extra.content_edit` and
+  `octo_message_card_revision.content` are both `TEXT`; widening them (e.g. `MEDIUMTEXT`) is a
+  `MODIFY COLUMN` rebuild on a large hot table, so it needs its own brief and rollout plan, and then a
+  `0.5.0` to raise the bound (`0.4.0`'s bytes are immutable once shipped). Worth noting the
+  512-KiB-gate-vs-64-KiB-column mismatch is pre-existing platform debt — `modules/message/api.go:60`
+  already admits 1 MiB of RichText into the same column — so the column is under-sized for more than
+  this card.
 - **`tool: 81`, `detail: 192`, `errorMessage: 121` still carry the zero-headroom design**
   and were knowingly left alone. `tool` is the most exposed — MCP tool names can exceed
   80 characters. Recorded in D3a and Out of scope so it reads as a decision, not an

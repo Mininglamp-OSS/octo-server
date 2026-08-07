@@ -18,10 +18,12 @@ source: user
 > Status: **draft, awaiting human confirmation of the brief as a whole.** The
 > product decisions it depended on are resolved: D7 keeps `${statusGlyph}` bound,
 > D8 adopts the simplified header (so `timerText` is no longer rendered), D8b
-> keeps the `octo-*` design-system primitives out, and D3a widens
-> `phases[].thought` to 4001. None of them *requires* a consumer change; D3a
-> only takes visible effect once the consumer raises `THOUGHT_MAX`, which the
-> maintainer owns separately.
+> keeps the `octo-*` design-system primitives out, and D3a raises
+> `phases[].thought` to 400 — a ceiling derived from the persistence layer's
+> measured budget rather than from the producer's truncation length. None of them
+> requires a consumer change, and D3a's ceiling is storage-safe at the worst-case
+> encoding, so raising the consumer's `THOUGHT_MAX` later carries no ordering
+> dependency on anything else.
 
 ## Goal
 
@@ -33,7 +35,7 @@ redesigned presentation:
 - a simplified header that drops the `${timerText}` line.
 
 Adapt that presentation onto the **existing bounded server data contract** (#667/#681), not onto the
-attachment's unbounded schema — with one deliberate widening, `phases[].thought` 281 → 4001 (D3a), which
+attachment's unbounded schema — with one deliberate widening, `phases[].thought` 281 → 400 (D3a), which
 raises a ceiling rather than removing it. Preserve all five states and the existing state-to-view/wire
 mapping:
 
@@ -88,7 +90,7 @@ The consumer's constants and the server's schema bounds line up exactly:
 
 | `openclaw-channel-octo/src/reasoning-process.ts` | server schema bound |
 | --- | --- |
-| `THOUGHT_MAX = 280` + `…` | `thought: 281` → **widened to 4001, see D3a** |
+| `THOUGHT_MAX = 280` + `…` | `thought: 281` → **widened to 400, see D3a** |
 | `TOOL_NAME_MAX = 80` + `…` | `tool: 81` |
 | `REASONING_ID_MAX_LENGTH = 512` | `reasoningId: 512` |
 | `MAX_RENDERED_PHASES = 6` | `phases.maxItems: 6` |
@@ -119,10 +121,11 @@ The aggregate cap of 13 therefore stays; it must not be relaxed as part of this 
 (`modules/bot_api/card_profile.go:149`). Moving `AdvertisedSend` to `0.4.0` propagates to the plugin with
 no plugin release, because the view/wire/state/`submit_actions` shape is unchanged.
 
-D3a does not change that: widening `thought` cannot reject anything the current producer sends, so the
-plugin keeps working untouched at `THOUGHT_MAX = 280`. It does, however, mean the extra capacity sits
-unused until the consumer opts in by raising that constant — a separate, maintainer-owned change with no
-ordering dependency on this one (server first is the safe order, and it is the order being taken).
+D3a does not change that: raising `thought` to 400 is a relaxation, so it cannot reject anything the
+current producer sends and the plugin keeps working untouched at `THOUGHT_MAX = 280`. Because 400 is
+storage-safe at the worst-case encoding (D3a), a later consumer-side bump to 399 needs **no** column
+migration or other precondition first — it is a plain, independently-deployable change. Server-first is
+the order being taken, and either order is safe.
 
 ### Why a release, not a hot update
 
@@ -167,7 +170,7 @@ provenance) and is out of scope here.
 
 - Start from the frozen `0.3.0` schema and apply only these deltas:
   - `timerText` moves from `required` to optional (relaxation; see D8);
-  - `phases[].thought` `maxLength` goes from `281` to `4001` (relaxation; see D3a);
+  - `phases[].thought` `maxLength` goes from `281` to `400` (relaxation; see D3a);
   - descriptions/examples updated to match the new presentation.
 - **`timerText` must stay in `properties` even though no template binds it.** The schema root is
   `additionalProperties: false` and the producer sends the field unconditionally
@@ -181,7 +184,7 @@ provenance) and is out of scope here.
 - Retain the `traceExpanded`/`traceCollapsed` mutual-exclusion `oneOf` and the state-conditional
   `required` blocks unchanged.
 
-### D3a — `thought` ceiling is raised to 4001 and stops tracking the producer
+### D3a — `thought` ceiling stops mirroring the producer, and is calibrated against the store
 
 `0.2.0`/`0.3.0` pinned `thought: 281` because that was the producer's *observed* output at the time
 (`THOUGHT_MAX = 280` + `…`, per the `cardtmpl-reasoning-schema-successor` brief's D2 table, sourced from
@@ -196,83 +199,134 @@ contract. Two problems follow from keeping it:
 - **It caps a product surface at an implementation detail.** 280 characters is roughly two sentences;
   the field is the user-facing summary of a reasoning phase.
 
-`4001` is chosen as a platform product cap (`4000 + …`, the same `N + ellipsis` shape as the old `281`),
-not a mirror of any producer constant. Measured on the **`0.4.0` template** at the worst case the schema
-admits (6 phases / 13 aggregate actions / every other string at max), so the rows isolate the bound change
-rather than conflating it with the template redesign — max across all five states:
+**The ceiling is `400`, and the number is set by the persistence layer, not by the producer.** This is
+the whole point of the decision and it took two review rounds to get right (see below): the binding
+constraint is not `cardmsg.MaxPayloadBytes` but the MySQL `TEXT` column the frame is stored in.
 
-| `thought` content | worst-case frame | vs `cardmsg.MaxPayloadBytes` (512 KiB) | vs `content_edit` `TEXT` (64 KiB) |
-| --- | --- | --- | --- |
-| 281 runes CJK (what `0.3.0` allowed) | 35,076 B | 6.69% | fits |
-| 4001 runes CJK | 102,036 B | 19.46% | **1.56× over** |
-| 4001 runes all-escaping (`<`, U+2028 → 6 B each) | 174,054 B | 33.2% | **2.66× over** |
+#### The two ceilings
 
-**Two ceilings, and the smaller one is not the validator** (found in review, corrected here). 512 KiB is
-the only size gate a rendered frame passes (`pkg/cardmsg/validate.go:30`), and against it there is ~4×
-headroom. But the authoritative write on the bot edit path stores the whole marshalled frame in
-`message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**
-(`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later migration;
-`octo_message_card_revision.content` is `TEXT` too). Against *that* the saturated frame does not fit.
+`cardmsg.MaxPayloadBytes` (512 KiB) is the only size gate a rendered frame *passes*
+(`pkg/cardmsg/validate.go:30`). It is not the smallest one downstream. The authoritative write on the bot
+edit path stores the whole marshalled frame in `message_extra.content_edit`, a MySQL **`TEXT` column =
+65,535 bytes** (`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later
+migration; `octo_message_card_revision.content` is `TEXT` too). That width is discovered only at `INSERT`
+time — as `Data too long for column` under `STRICT_TRANS_TABLES`, or a silent truncation into invalid JSON
+without it.
 
-Because bytes-per-code-point varies (CJK 3, non-BMP 4, Go-escaped `<`/`>`/`&`/U+2028/U+2029 6), the
-persistence-safe ceiling depends on content: roughly 1,973 code points per phase for CJK, ~1,480 for
-emoji, **~987 fully escaped** (structure baseline ≈ 30,018 B plus `6 phases × N × bytes-per-cp`).
+#### Measured budget
 
-`4001` is still the right *contract* value — it is a product cap, the frame passes every gate the server
-itself enforces, and nothing regresses at this head because the producer still truncates at 280 so the
-headroom is deliberately unused. The 512-KiB-gate-vs-64-KiB-column mismatch is also pre-existing platform
-debt, not created here: the ordinary message-edit endpoint already admits up to 1 MiB of RichText into the
-same column (`modules/message/api.go:60`, `hardParsePayloadLimit`). What this change does is make the card
-path able to reach it, which is why the consumer bump below is gated on fixing it.
+Worst case the schema admits (6 phases / 13 aggregate actions / every other string at its own max), max
+across the five states. Two encodings, because JSON Schema counts **code points** while the column counts
+**bytes** and Go escapes `<`, `>`, `&`, U+2028, U+2029 to six bytes each — so a CJK fixture is *not* the
+byte worst case, and neither is escaping `thought` alone:
+
+| `thought` | frame (CJK) | frame (every free string escaped) | share of the 64 KiB column | headroom |
+| --- | --- | --- | --- | --- |
+| 281 (V3's bound) | 35,076 B | 52,104 B | 79.5% | 13,431 B |
+| **400 (V4)** | **37,218 B** | **56,388 B** | **86.0%** | **9,147 B** |
+| 512 | — | 60,420 B | 92.2% | 5,115 B |
+| 600 | — | 63,588 B | 97.0% | 1,947 B |
+| 654 | — | 65,532 B | 100.0% | 3 B |
+| 4001 (first attempt) | 102,036 B | 186,024 B | **284%** | **over by 120,489 B** |
+
+The escaped-baseline at `thought = 1` is already **42,024 B — 64% of the column**. That is the real
+finding: this card is close to full at the worst-case encoding before `thought` contributes anything, so
+a large widening is not available at all under a `TEXT` column. `400` was chosen to leave ~14% headroom
+rather than to maximise the number; `654` is the arithmetic limit and would be another zero-headroom
+design, which is exactly the mistake this decision exists to correct.
+
+`400` is 1.42× the producer's current cap. Modest, but it breaks the coupling — the ceiling is now
+derived from a measured storage budget rather than from `THOUGHT_MAX + 1`, so a producer-side truncation
+change no longer silently invalidates it.
 
 `MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — longer text adds no nodes, so the node budget
 in the section above is unaffected and the aggregate cap of 13 still stands unchanged.
 
-The jump is deliberately large (14×) rather than a token widening: the point is to stop the ceiling from
-being a number that has to be revisited every time the producer's truncation changes. It is affordable
-here specifically because V4 puts the tool rows — and with them the long text — behind per-phase
-collapsible panels that default to collapsed (D4), so a 4000-character phase summary does not expand the
-card on arrival.
+#### Why not 4001, and why not a frame-size gate
 
-The field stays explicitly bounded on both ends: an unbounded string fails
-`DefaultCompileLimits().RequireBoundedSchema`, and the `trust-boundary` rule requires an explicit
-ceiling. Widening is safe in the rollout direction that matters — a relaxation cannot reject a payload
-the current consumer already sends, so no plugin release is *required* by this change.
+The first attempt set `4001` (`4000 + …`) on the reasoning that 512 KiB left ~4× headroom. Review showed
+that was measured against the wrong ceiling. A second attempt kept `4001` and proposed rejecting oversized
+frames at the persistence boundary; that is strictly worse than lowering the bound, because the advertised
+contract would still promise 4001 while the server refused most of it — the schema is published to
+**every** bot via `/v1/bot/card/profile` (alongside `"max_payload_bytes": 524288`, which actively suggests
+there is room), not just to the one cooperative plugin. A contract that admits what the store cannot hold
+is a defect regardless of how politely the write fails.
 
-**Realising the longer text requires a consumer change, and that change has a hard precondition.** Actual
-output length is decided by the consumer's `THOUGHT_MAX` truncation; until it is raised
-(`THOUGHT_MAX = 4000`, keeping the `+…` at exactly 4001), server-side capacity is headroom the producer
-does not use. That change is owned separately by the maintainer, in `openclaw-channel-octo`, and is not
-part of this task's diff.
+Getting `thought` to a few thousand code points therefore requires widening
+`message_extra.content_edit` and `octo_message_card_revision.content` (e.g. `MEDIUMTEXT`) **first**, and
+then a `0.5.0` to raise the bound — `0.4.0`'s bytes are immutable once shipped. `message_extra` is a large
+hot table, so that `MODIFY COLUMN` rebuild needs its own brief and rollout plan and is explicitly out of
+scope here. Note the 512-KiB-gate-vs-64-KiB-column mismatch is pre-existing platform debt, not created
+here: `modules/message/api.go:60` (`hardParsePayloadLimit`) already admits 1 MiB of RichText into the same
+column.
 
-Server-first is the safe order **for validation**, and nothing regresses at this head. It is *not*
-sufficient for storage. Before the `THOUGHT_MAX` bump lands, one of these must be true:
+#### Consumer impact
 
-1. `message_extra.content_edit` and `octo_message_card_revision.content` are widened (e.g. `MEDIUMTEXT`);
-   note `message_extra` is a large hot table, so that is a `MODIFY COLUMN` rebuild needing its own brief
-   and rollout plan — it is deliberately not bundled here; **or**
-2. the effective producer cap is kept under the persistence-safe ceiling for the worst-case encoding
-   (~987 code points per phase if the text can contain `<`/`>`/`&`/U+2028/U+2029, ~1,973 for pure CJK);
-   **or**
-3. the frame is capped or spilled at the persistence boundary rather than at the schema.
+None required, and none implied. `400` is a relaxation, so it cannot reject anything the plugin sends at
+`THOUGHT_MAX = 280`. If the consumer ever raises that constant it must stay at or below 400 minus its own
+ellipsis, and the same two encoding hazards apply: grapheme-aware truncation would overshoot (one grapheme
+can be many code points), and `...` instead of `…` breaks the `+1` arithmetic.
 
-Otherwise the failure mode is: a card with ~6 long phases renders, passes `cardmsg.Validate`, and then the
-transactional `content_edit` insert fails with `Data too long for column` under `STRICT_TRANS_TABLES` —
-surfacing as `ErrBotAPIStoreFailed` (`modules/bot_api/send.go:1317`) and freezing the card mid-stream. On a
-non-strict deployment the frame is silently truncated into invalid JSON instead. The revision append
-degrades more gently because it is best-effort (`internal/carddispatch/mutation.go:221-225`), so there it
-is silent frame loss rather than a hard failure.
-
-So the hazards on that follow-up are **three**, not two:
-
-- switching to grapheme-aware truncation would reintroduce the overflow (one grapheme can be many code
-  points — combining marks, ZWJ emoji, flags, skin-tone modifiers);
-- changing the ellipsis from `…` (1 code point) to `...` (3) breaks the `+1` arithmetic;
-- **the 64 KiB persistence ceiling above** — the one that breaks this card's own streaming path.
-
-Only `thought` is widened. `tool: 81`, `detail: 192`, and `errorMessage: 121` carry the same zero-headroom
+Only `thought` moves. `tool: 81`, `detail: 192`, and `errorMessage: 121` carry the same zero-headroom
 design and are knowingly left alone — `tool` is the most exposed of them (MCP tool names can exceed 80),
-and revisiting them is a follow-up decision, not an unstated part of this change.
+and revisiting them is a follow-up decision, not an unstated part of this change. Note they are also part
+of why the escaped baseline is already 64%: 13 actions × (81 + 192) code points is a large share of the
+frame.
+
+### D4a — The chevrons fetch icons from a third-party CDN; accepted here, disclosed and owned
+
+Found in review, and it is the first outbound runtime dependency any built-in template in this repo has
+carried, so it is recorded as a decision rather than left as an implementation detail.
+
+**What ships.** All three V4 templates hardcode the chevron icons to a third party — 12 occurrences:
+
+```
+"url": "https://api.iconify.design/lucide/chevron-{down,up}.svg?color=%23a1a6ab"
+```
+
+It is not a build-time asset reference. The URL expands into all five **persisted goldens** (34
+occurrences), i.e. it is card content, stored immutably and shipped to every client. And because
+`0.4.0`'s bytes are frozen once published, cards sent under it carry these URLs permanently; changing
+this later means a `0.5.0`.
+
+**No precedent, and only a scheme gate.** `@0.1.0`/`@0.2.0`/`@0.3.0` contain zero external runtime URLs —
+their only `http(s)` matches are the `$schema` meta-identifiers, which are never fetched. Nothing
+structurally prevents this: `cardmsg`'s `checkURL` (`pkg/cardmsg/validate.go:808`) is a positive allowlist
+on the **scheme** only (`http`/`https` + non-empty host); it does not constrain the host, and template-
+authored URLs are server-authored and therefore trusted by construction — unlike data-supplied URLs such
+as `docs.access-request`'s `avatarUrl`, which are additionally pattern-constrained in schema and
+preflighted through `cardtmpl.AbsoluteHTTPSURL`.
+
+**Risks accepted.** Availability: `api.iconify.design` is not reliably reachable from mainland China
+networks, and this is a `zh-CN`-default enterprise product. Privacy: every viewer of every reasoning card
+issues a request to a third party, disclosing client IP, user-agent and timing, and the distinctive
+`lucide/chevron-down` path fingerprints *which* card is being viewed. Supply chain: third-party-controlled
+SVG bytes render in end-user clients, with the server neither proxying nor pinning them.
+
+**Why it is accepted rather than fixed here.** The severity is bounded by a property of the markup: every
+chevron carries `altText` ("展开"/"收起"/"展开工具"/"收起工具") and its `selectAction` is on the `Image`
+element itself, not on the fetched resource. So when the icon fails to load, clients render the alt text
+and the toggle still works — the per-phase panels stay operable and discoverable, rather than becoming
+unreachable. Each alternative also has a real obstacle:
+
+- **Inline SVG data URI** — rejected by `cardmsg.Validate`. `checkURL`'s positive allowlist admits only
+  absolute `http`/`https`; `data:` is explicitly refused (`pkg/cardmsg/cardmsg_test.go:142` pins it), and
+  that refusal is a load-bearing anti-injection guard, not an oversight to work around.
+- **Self-hosted icon endpoint** — needs a static-asset route the server does not have. `BuildEnv`
+  (`pkg/cardtmpl/template.go:130`) does give a precedent for injecting a deployment URL into a template
+  (`WebLoginURL`, used for deep links), so it is feasible — but adding an asset endpoint plus a new
+  `BuildEnv` field is out of scope here.
+- **Text affordance, as V1–V3 used** — `selectAction` is not a `TextBlock` property in Adaptive Cards, so
+  a reliable version needs each chevron wrapped in a `Container` carrying the action: 2 in the header plus
+  2 × 6 per phase = 14 new containers. The node budget already fails at 16 aggregate actions on 6 phases
+  (see Background § Node budget), so this trades a network dependency for a structural-limit risk.
+
+**Preconditions and ownership.** Deploying V4 requires confirming that client CSP and egress policy allow
+`api.iconify.design`; where they do not, the cards degrade to alt-text toggles rather than breaking, but
+that should be a known state, not a discovery. The underlying choice is the front-end's — it came in with
+the handoff — so it is reported back to them together with the `render-profile/capabilities.json`
+`maxDepth: 24` divergence (D6), with self-hosting or inlining as the preferred long-term shape. Server-side
+this stays as-is for `0.4.0`.
 
 ### D4 — Templates
 
@@ -366,7 +420,7 @@ status badge, or a footer surface on this card. **This is intentional and is kep
   cannot change. The redesign requires a new exact version, never an in-place edit of `0.3.0`.
 - **L2 bounded producer contract (`cardtmpl`, `trust-boundary`)** — every `maxLength`/`maxItems` value, the
   `phases[].actions` aggregate cap of 13, and fail-close schema classification survive verbatim, with
-  `thought`'s single deliberate widening to 4001 (D3a) as the sole exception. The attachment's *unbounded*
+  `thought`'s single deliberate widening to 400 (D3a) as the sole exception. The attachment's *unbounded*
   schema must not replace them: widening a ceiling is not the same as removing it, and every field —
   `thought` included — stays bounded on both ends.
 - **L3 card node/depth budget (`wire-contract`, `trust-boundary`)** — the richer per-phase markup must stay
@@ -411,9 +465,11 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 - Importing `render-profile/` package files or reconciling its `maxDepth: 24` with `cardmsg.MaxDepth = 16`.
 - Relaxing any bound other than `thought` (`phases.maxItems`, `actions.maxItems`, aggregate 13, or any
   other `maxLength` — including the same-shaped `tool: 81` / `detail: 192` / `errorMessage: 121`), or
-  raising `cardmsg.MaxNodes`. The `thought` widening is in scope and specified in D3a.
-- Raising the consumer's `THOUGHT_MAX` so the widened ceiling is actually used. That is an
-  `openclaw-channel-octo` change owned by the maintainer; this task only removes the server-side cap.
+  raising `cardmsg.MaxNodes`. The `thought` widening to 400 is in scope and specified in D3a.
+- Widening `message_extra.content_edit` / `octo_message_card_revision.content` to `MEDIUMTEXT`. That is
+  what a `thought` ceiling in the thousands would require, and `message_extra` is a large hot table, so
+  the `MODIFY COLUMN` rebuild needs its own brief and rollout plan. D3a records it as the precondition for
+  a future `0.5.0`, not as work deferred inside this change.
 - Adding `phaseState` rendering, reintroducing `reasoning_stop`/`reasoning_retry`, or adding any
   `Action.Submit`, RouteSpec, or callback.
 - Adding routes, DB migrations, error codes, localized error responses, or rate-limit surfaces.
@@ -436,21 +492,21 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 ### B. Bounded contract preserved
 
 - [ ] V4 schema retains every `0.3.0` bound and the `x-octo-constraints` aggregate cap of 13; the only
-  deltas are `timerText` optionality, `thought`'s widening to 4001, and documentation text. A test asserts
+  deltas are `timerText` optionality, `thought`'s widening to 400, and documentation text. A test asserts
   bound-by-bound equality with the V3 schema rather than comparing whole files.
-- [ ] `thought` is `4001` in V4 and still `281` in V3, is a strict widening, and remains bounded on both
+- [ ] `thought` is `400` in V4 and still `281` in V3, is a strict widening, and remains bounded on both
   ends (D3a) — so a later edit cannot narrow it back or drop the bound unnoticed.
 - [ ] Every string/array/aggregate `limit+1` case is rejected with `ErrFieldsInvalid` before template
   expansion; every exact-limit case renders. The `thought` limit is resolved per version, so V2/V3 keep
-  asserting 281 while V4 asserts 4001.
-- [ ] The worst case at the widened ceiling (6 phases each carrying a 4001-rune `thought`, 13 aggregate
+  asserting 281 while V4 asserts 400.
+- [ ] The worst case at the new ceiling (6 phases each carrying a 400-rune `thought`, 13 aggregate
   actions) renders in all five states and stays inside `cardmsg.MaxPayloadBytes`.
-- [ ] A test records the persistence gap D3a documents rather than leaving it in prose only: at the
-  producer's current cap (281) the frame fits `message_extra.content_edit`'s 64 KiB `TEXT` column under
-  every encoding, while at the schema ceiling it does not — and the escape-heavy case (6 bytes per code
-  point) is asserted to exceed the CJK case, so "the worst case the schema admits" is not silently read as
-  the CJK fixture. Widening the column or lowering the ceiling must make that test fail loudly, forcing
-  D3a / the journal / the pending learning to be updated with it.
+- [ ] **Contract ≤ storage is enforced by a test, not by prose.** At the schema's own ceiling, with every
+  free string driven to its worst-case byte encoding (6 bytes per code point), the rendered frame fits
+  `message_extra.content_edit`. The column width is read out of the migration rather than hand-copied, so
+  widening it to `MEDIUMTEXT` is observable here instead of leaving the ceiling silently
+  over-conservative; and the escape-heavy frame is asserted to exceed the CJK frame, so a future edit
+  cannot quietly reintroduce a CJK-only "worst case".
 - [ ] `CompileJSONArtifact` succeeds under **both** `staticCompileLimits()` and `DefaultCompileLimits()`
   (the latter proving `RequireOwner` / `RequireProtocol` / `RequireBoundedSchema` are satisfied).
 
@@ -496,6 +552,9 @@ status badge, or a footer surface on this card. **This is intentional and is kep
   survived the `required` relaxation under `additionalProperties: false` (D3/D8).
 - [ ] No template declares an `octo-surface-*` or `octo-badge-*` id (D8b), and a rendered card is checked
   to contain none.
+- [ ] Every outbound `http(s)` URL in the V4 templates and goldens is either the chevron icon host
+  disclosed in D4a or a never-fetched `$schema` identifier — asserted, so a second external dependency
+  cannot be added without its own decision. The frozen V1–V3 templates are checked to still carry none.
 
 ### G. Gates
 

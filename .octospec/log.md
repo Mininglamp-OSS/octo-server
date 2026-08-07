@@ -49,15 +49,16 @@ change-log convention (§7). Newest first.
   indexed id is an unverified published claim), and the "a matching golden
   cannot launder an injected `Action.Submit` in the `octo/v1` result frame"
   invariant had a generic-compiler test but none for this artifact.
-- **Decision** — `phases[].thought` widened `281` → `4001`, deliberately
-  breaking its old habit of mirroring the producer's truncation length. Still
-  bounded on both ends; fully-saturated payload went 6.69% → 19.46% of
-  `cardmsg.MaxPayloadBytes` and cost zero nodes (`MaxNodes`/`MaxDepth` are
-  structural). Realising the longer text needs an `openclaw-channel-octo`
-  `THOUGHT_MAX` bump, which is maintainer-owned and has no ordering dependency
-  — a widening cannot reject what the plugin already sends. `tool: 81` /
-  `detail: 192` / `errorMessage: 121` keep the same zero-headroom design and
-  were knowingly left alone.
+- **Decision** — `phases[].thought` raised `281` → **`400`**, breaking its old habit of
+  mirroring the producer's truncation length. The number is derived from the persistence
+  layer, not the producer: it took two review rounds to establish that the binding ceiling
+  is `message_extra.content_edit`'s 64 KiB `TEXT` column, not `cardmsg.MaxPayloadBytes`
+  (512 KiB). At the worst-case byte encoding this card is already at 64% of the column
+  before `thought` contributes anything, so no ceiling in the thousands was available;
+  `400` leaves ~14% headroom, and a test enforces contract ≤ storage so the claim cannot
+  rot. Reaching a few thousand code points needs the `MEDIUMTEXT` widening (own brief, hot
+  table) and then a `0.5.0`. `tool: 81` / `detail: 192` / `errorMessage: 121` keep the same
+  zero-headroom design and were knowingly left alone.
 - **Learning (pending)** —
   [`schema-bound-must-not-mirror-producer-truncation`](learnings/pending/schema-bound-must-not-mirror-producer-truncation.md):
   a `maxLength` equal to `producer_cap + 1` is a coupling, not a bound — it is
@@ -65,21 +66,20 @@ change-log convention (§7). Newest first.
   code points vs JS UTF-16 code units vs graphemes, measured and confirmed).
   Over-limit means the whole card fails to send, not a display regression.
   Candidate rule: `trust-boundary`.
-- **Review correction** — the first draft of that learning ended "the bound was
-  never protecting a real resource", and D3a claimed "~4× headroom". Review
-  (PR #712) showed both were measured against the wrong ceiling: 512 KiB is the
-  only gate a rendered frame *passes*, but the authoritative bot-edit write puts
-  the whole frame into `message_extra.content_edit`, a MySQL `TEXT` column of
-  65,535 bytes never widened by a later migration. The saturated frame is 1.56×
-  over with CJK and 2.66× over (174,054 B) when every character escapes to six
-  bytes — so in this instance the arbitrary-looking bound *was* the only thing
-  keeping the template inside a real storage limit. The contract value stays
-  4001, but the consumer's `THOUGHT_MAX` bump is now gated on an explicit
-  precondition (widen the column, or cap under ~987 code points per phase for
-  the worst-case encoding, or cap at the persistence boundary) instead of
-  "no ordering dependency", and the gap is pinned by a test so the prose cannot
-  drift from it. Generalized in the learning as: a validator ceiling is not a
-  storage ceiling, and code points are not bytes.
+- **Review corrections (two rounds, both worth recording)** — the first draft of that
+  learning ended "the bound was never protecting a real resource", and D3a claimed "~4×
+  headroom" at `thought: 4001`. Round one showed both were measured against the wrong
+  ceiling (512 KiB render gate vs 64 KiB storage column; the frame was 1.56× over with CJK,
+  2.84× over fully escaped). Round two rejected the follow-up proposal to keep `4001` and
+  gate oversized frames at the persistence boundary — a contract published to *every* bot
+  via `/v1/bot/card/profile` (which also advertises a 512 KiB payload allowance) must not
+  admit what the store cannot hold, however politely the write fails. It also caught that
+  the "persistence-safe cap" figure in all four documents was ~50% too high in the *unsafe*
+  direction, because the escaped baseline had been measured with the non-`thought` strings
+  left as CJK (30,036 B vs the real 42,024 B). Generalized in the learning as three claims:
+  a validator ceiling is not a storage ceiling; code points are not bytes and one field's
+  fixture is not the worst case; and check how much of the budget the rest of the payload
+  already spends before promising a widening at all.
 
 ## 2026-08-06 (bot-setting-store)
 
