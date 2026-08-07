@@ -74,6 +74,26 @@ Three properties, each with a test that fails when its fix alone is reverted:
   alternative is authorizing the copy through the same visibility gates a
   single-message read applies, which is a larger change than this slice.
 
+### Decision: `source_message_id` means "created from", the notification means "copied in"
+
+Raised in review because the `thread` row and the parent-group notification now
+disagree: `CreateThread` writes `req.SourceMessageID` to the row unconditionally,
+while the notification omits it when nothing was copied. Both readings are
+defensible, so the decision is recorded rather than left to the next reader.
+
+- **The row keeps the unconditional write.** It records provenance — which
+  message this thread was created from — and that is true whether or not the
+  copy happened. Dropping it would lose the only link back to the originating
+  message for exactly the threads created from cards.
+- **The notification keeps the conditional one.** It is a client-facing
+  description of the thread's contents, sitting beside `message_count` and the
+  preview, and a client that follows an announced `source_message_id` into an
+  empty thread has been lied to.
+
+They are the same key with two audiences, not one key with two meanings. Making
+them agree would require breaking one of the two; if a future reader wants one
+answer, the row's field should be renamed rather than the notification changed.
+
 ## Out of scope
 
 Grants, the grant table and its migration, one-snapshot authorization, the Bot
@@ -82,12 +102,24 @@ middleware, and the pilot. All of those stay in the parent task.
 
 ## Acceptance
 
-- **No external input can author or persist either marker.** That is the
-  invariant; "rejected by key" is only one of the ways it is met, and stating it
-  as if it were the only one is what hid a real gap for three rounds. Per
-  ingress:
-  - bot raw send / raw edit, and robot ingress — **reject the request** when
-    either key is present;
+- **No marker that any reader will honour can come from external input.** That
+  is the invariant. It is deliberately not the stronger "no external input can
+  persist either key": a frame typed `{"type":"17"}` (string, not number) is not
+  a card to `cardmsg.IsCardPayload`, so an ordinary caller can persist those
+  bytes — and the same predicate gates `CatalogFrameMarkers` and
+  `CardTemplateContext`, so no reader ever sees markers on it. Writer gate and
+  reader gate being one predicate is what makes that safe. "Rejected by key" is
+  likewise only one of the ways the invariant is met, and stating it as if it
+  were the only one is what hid a real gap for three rounds. Per ingress:
+  - bot raw send — **rejects `catalog_provenance` by key** on the raw branch. A
+    top-level `template_ref` is *not* rejected there: it selects template mode
+    (`send.go:97`), where the ref is checked against the bot's permitted refs
+    and the server re-authors both markers itself, and a raw `card` alongside it
+    is refused as a double-mode request. The two bullets are jointly complete;
+  - bot raw edit — rejects **both** keys in both directions
+    (`cardEnvelopeHasCatalogMarker`): a marked target is not raw-editable, and a
+    marked edit body is a forgery;
+  - robot ingress — rejects on presence of either key;
   - bot template mode — the request shape has no such field, and the server
     authors both markers itself at the rendering boundary;
   - incoming webhook — builds its envelope from a fixed field allowlist

@@ -189,14 +189,24 @@ func storedMarkersForUpdate(envelope json.RawMessage, target UpdateTarget) (card
 	if err != nil {
 		return cardmsg.FrameCatalogMarkers{}, fmt.Errorf("%w: %v", ErrUpdateInvalid, err)
 	}
-	// An *empty* target Space never reaches here: validateUpdateTarget rejects
-	// one at the entry to both ReplaceView and Append, so by this point the
-	// caller has established a Space and a mismatch really is a mismatch. That
-	// is worth stating, because the neighbouring guards in bot_api and
-	// modules/message had to grow an explicit "unknown is not empty" state and
-	// this one looks like it is missing the same treatment. It is not — the
-	// distinction is enforced one layer up, and the click ingress refuses to
-	// create an event at all when the card's origin Space cannot be read.
+	// Two different Spaces are in play here and the guard only concerns one of
+	// them; an earlier version of this comment answered about the other, which
+	// is why it read as if the empty case were already handled.
+	//
+	//   - target.Target.SpaceID — never empty. validateUpdateTarget rejects an
+	//     empty one at the entry to both ReplaceView and Append, so by this
+	//     point the caller has established a Space and a mismatch really is a
+	//     mismatch. The neighbouring guards in bot_api and modules/message had
+	//     to grow an explicit "unknown is not empty" state; this one does not,
+	//     because the distinction is enforced one layer up and the click
+	//     ingress refuses to create an event at all when the card's origin
+	//     Space cannot be read.
+	//   - markers.Provenance.SpaceID — *can* be empty; it is a documented
+	//     reachable marker shape (pkg/cardmsg/provenance.go). The comparison
+	//     below deliberately skips that case rather than treating "" as a
+	//     mismatch against every target, because an unscoped marker is not a
+	//     cross-Space edit. updaterCatalogAccess is what resolves it, by
+	//     pinning the empty value to the target Space — see there.
 	if markers.HasProvenance && markers.Provenance.SpaceID != "" &&
 		markers.Provenance.SpaceID != target.Target.SpaceID {
 		return cardmsg.FrameCatalogMarkers{}, fmt.Errorf("%w: stored provenance space %q does not match target space %q",
@@ -229,6 +239,23 @@ func updaterCatalogAccess(target UpdateTarget, markers cardmsg.FrameCatalogMarke
 		principal, err := CatalogPrincipalFromProvenance(markers.Provenance)
 		if err != nil {
 			return CatalogAccess{}, fmt.Errorf("%w: %v", ErrUpdateInvalid, err)
+		}
+		// Pin an empty provenance Space to the authoritative target Space,
+		// exactly as the click ingress does (validatedFramePrincipal,
+		// modules/message/api_card_action.go). An empty space_id is a
+		// documented reachable marker shape, and storedMarkersForUpdate only
+		// compares the *non-empty* case — so without this the two readers of
+		// one marker derive two different principals from it.
+		//
+		// The difference is not cosmetic once grants exist: a principal with
+		// SpaceID "" resolves against the global grant row alone, so an active
+		// global grant plus an exact tombstone for the card's real Space would
+		// be allowed, which is the shadowing invariant 11 exists to prevent.
+		// Inert in this tree — nothing consumes Access on the static path — and
+		// it refuses more rather than less, so it is safe to land ahead of the
+		// grant machinery that makes it matter.
+		if principal.SpaceID == "" {
+			principal.SpaceID = target.Target.SpaceID
 		}
 		return CatalogAccess{Purpose: CatalogPurposeHistoricalEdit, Principal: principal}, nil
 	}

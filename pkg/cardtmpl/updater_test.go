@@ -511,3 +511,41 @@ func TestCardUpdaterAppendValidatesStoredMarkers(t *testing.T) {
 		}
 	})
 }
+
+// An unscoped provenance marker (`space_id: ""`) is a documented reachable
+// shape, and the two readers of that marker have to derive the same principal
+// from it. The click ingress pins the empty value to the card's authoritative
+// origin Space (validatedFramePrincipal); this path pins it to the equally
+// authoritative UpdateTarget Space.
+//
+// The asymmetry it replaces was invisible in this tree — nothing consumes
+// Access on the static path — and becomes an authorization defect the moment
+// grants land: a principal carrying SpaceID "" resolves against the global
+// grant row alone, so an active global grant plus an exact tombstone for the
+// card's real Space would be allowed, which is precisely the shadowing that
+// invariant 11 exists to prevent.
+func TestCardUpdaterPinsAnUnscopedProvenanceToTheTargetSpace(t *testing.T) {
+	snapshot := markedV3Snapshot(t, func(frame map[string]any) {
+		provenance, _ := frame["catalog_provenance"].(map[string]any)
+		provenance["space_id"] = ""
+	})
+	catalog, _, updater := v3UpdaterFixture(t, snapshot)
+	target := v3UpdateTarget()
+
+	if err := updater.ReplaceView(context.Background(), target, docsaccessrequest.TemplateID,
+		docsaccessrequest.TemplateVersionV3, docsaccessrequest.StateApproved, approvedV3Fields(),
+		cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "en", SpaceID: "space-1"}); err != nil {
+		t.Fatalf("ReplaceView refused an unscoped marker, which is a legitimate stored shape: %v", err)
+	}
+	if len(catalog.renderAccess) == 0 {
+		t.Fatal("render was never reached")
+	}
+	want := cardtmpl.CatalogPrincipal{
+		Kind: cardtmpl.CatalogPrincipalInternalProducer, ID: "docs-notify", SpaceID: target.Target.SpaceID,
+	}
+	if got := catalog.renderAccess[0].Principal; got != want {
+		t.Fatalf("edit principal = %+v, want %+v; an unscoped principal resolves against the global "+
+			"grant row alone, so an exact tombstone for %q could no longer shadow a live global grant",
+			got, want, target.Target.SpaceID)
+	}
+}

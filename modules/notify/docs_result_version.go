@@ -70,7 +70,12 @@ func docsResultVersion(storedID, storedVersion string) (string, error) {
 		return "", fmt.Errorf("%w: stored card context identifies %q@%q, not docs.access-request",
 			errDocsResultVersion, storedID, storedVersion)
 	}
-	if storedVersion == docsaccessrequest.TemplateVersion {
+	// TemplateVersionV2, not TemplateVersion: this branch names the specific
+	// version whose manifest has no `result` view, not whatever the registry
+	// default happens to be. Keyed off the moving pointer, a version bump turns
+	// this into a no-op and strands in-flight 0.2.0 cards pending forever —
+	// which is the exact failure this function was written to fix.
+	if storedVersion == docsaccessrequest.TemplateVersionV2 {
 		return docsaccessrequest.TemplateVersionV3, nil
 	}
 	return storedVersion, nil

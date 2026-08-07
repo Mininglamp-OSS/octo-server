@@ -414,10 +414,10 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 // 起点是创建者对父群的 effective space（GetMemberExternalFields 第 4 返回值）：
 //   - 外部成员                       -> 其 source_space_id
 //   - 现代（有 space）内部群的内部成员 -> 群自身 space_id
-//   - legacy（无 space）内部群的内部成员 -> ""（group.space_id==”）
+//   - legacy（无 space）内部群的内部成员 -> 空串（group.space_id 为空串）
 //
 // 只有最后一种 legacy 情况需要归一化：effective space 为空，但现代客户端读 legacy
-// 群时带的是**非空** default space（#484 口径），补行若落 space_id=” 会在 SQL 层被
+// 群时带的是**非空** default space（#484 口径），补行若落空串 space_id 会在 SQL 层被
 // 过滤掉，创建者永远看不到自己刚建的子区（issue #557 的 silent no-op）。因此**仅对
 // 这一路径**（内部成员 + 空 effective space）把 space 归一到创建者自己的 default
 // space——正是读侧（以及 auto_follow fanout 的 follower 行）所在的 space。外部成员、
@@ -425,7 +425,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 //
 // 与 fanout 的关系：fanout（OnThreadCreated）的源数据来自群 ext 行，而群 ext 行只能
 // 由走 validateBase（拒空 space_id）的 follow 路径写入，所以 fanout 复制的必是非空
-// space，**永远不会**落 space_id=”。归一化到创建者 default space 后，创建者补行才
+// space，**永远不会**落空串 space_id。归一化到创建者 default space 后，创建者补行才
 // 与 fanout 的 follower 行落在同一非空 space。
 //
 // best-effort 降级：拿不到 default space（查询失败或用户无 default space）时，返回

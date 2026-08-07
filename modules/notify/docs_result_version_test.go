@@ -44,8 +44,14 @@ func TestDocsResultVersionRules(t *testing.T) {
 			// was the shipped registry default between #633 and #641, so those
 			// cards exist, and a click on one failed finalization and left it
 			// pending forever.
+			//
+			// The version is a literal here on purpose. Both this case and the
+			// branch it drives used to reach for docsaccessrequest.TemplateVersion,
+			// the *moving* default pointer — so a version bump would have moved
+			// them together, the branch would have quietly stopped matching real
+			// 0.2.0 frames, and this test would have kept passing while doing so.
 			name: "0.2.0 is upgraded to the V3 result view",
-			id:   string(docsaccessrequest.TemplateID), version: docsaccessrequest.TemplateVersion,
+			id:   string(docsaccessrequest.TemplateID), version: "0.2.0",
 			want: docsaccessrequest.TemplateVersionV3,
 		},
 		{
