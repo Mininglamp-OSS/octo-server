@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"go.uber.org/zap"
 )
@@ -341,41 +342,46 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
 	// thread ext 行已 commit）。
+	// copiedPayload 是实际拷进子区的字节：调用方给的 payload 剥掉两个 server-only
+	// 顶层标记之后的结果。为空表示这次没有拷贝。
 	//
-	// copiedPayload 是实际拷进子区的服务端字节；为空表示这次没有拷贝。父群通知的
-	// message_count 与 last_message 预览都由它派生，不能再用请求里的字段：自从内容
-	// 改从数据库读，「请求带了 payload」与「确实拷贝成功了」就是两个不同的判断，
-	// 源行缺失时父群会宣告一条子区里并不存在的首条消息，且之后没有事件纠正。
+	// 需要保证的属性是「template_ref / catalog_provenance 不能从外部到达」，剥离是
+	// 对它的最小实施。之前两版都没有做对：
+	//
+	//   - 直接用调用方 payload —— 任何群成员都能造出一条 from_uid 是真实 bot、自己
+	//     写标记的持久化消息，action 路径会把它当作可信 producer 身份读取。
+	//   - 改成从消息行读服务端字节 —— 封住了伪造，却让 message_id 成了免检读取凭证。
+	//     单条读要过 visibles、revoke/is_deleted、按人删除、两个 offset、Expire 五道
+	//     门，那个查询一道都不过，等于凭 id 就能把已撤回原文（脱敏只在响应层）重新
+	//     发布到全群订阅的子区频道里，还挂在原发送者名下。
+	//
+	// 剥离两者都避开：调用方只能提供他本来就持有的字节，所以不需要给这个模块引入
+	// 授权面；而拷贝出来的是一条合法的无标记帧 —— 拷贝本就是一条新消息，没有经过
+	// 授权原件的那个渲染边界，不该继承它的身份。
+	//
+	// 同时这也让拷贝内容回到调用方正在显示的那一帧。message.payload 是不可变原件，
+	// 编辑存在 message_extra.content_edit 里，从原件读会把编辑过的消息拷成旧正文，
+	// 把流式卡拷成第一个残帧。
 	var copiedPayload json.RawMessage
 	if req.SourceMessageID != nil && len(req.SourceMessagePayload) > 0 {
-		// 发送者和内容都从消息表取同一行，防止客户端伪造。
-		//
-		// 只固定 from_uid 是不够的：payload 之前直接用请求里的 source_message_payload，
-		// 所以任何群成员都能造出一条 from_uid 是真实 bot、内容自己写的持久化消息。
-		// PR-C 之后这尤其危险 —— 顶层 template_ref / catalog_provenance 是 server-only
-		// 标记，action 路径把它们当作可信的 producer 身份读取，而这条拷贝路径不经过
-		// cardmsg.Validate，也不在拒绝这两个 key 的四个 ingress 之列。
-		//
-		// 不改成「按 key 拒绝」（其余 ingress 的做法）是因为那会打断合法场景：客户端
-		// 手里的卡片本来就带标记（服务端发给它的），回传创建子区会被拒。用服务端
-		// 自己的字节则两全 —— 合法拷贝照常工作。
-		//
-		// req.SourceMessagePayload 因此只剩「要不要拷贝」这一个语义，内容一律以服务端
-		// 读到的为准；它不得再流向任何被持久化的字段。
-		sourceFromUID, sourcePayload, err := s.db.QueryMessageSource(req.GroupNo, *req.SourceMessageID)
+		stripped, err := cardmsg.StripCatalogMarkers(req.SourceMessagePayload)
 		if err != nil {
-			s.Warn("查询源消息失败，跳过拷贝",
+			s.Warn("剥离源消息 server-only 标记失败，跳过拷贝",
 				zap.Error(err),
 				zap.Int64("messageID", *req.SourceMessageID))
-		} else if len(sourcePayload) == 0 {
-			s.Warn("源消息不存在或无内容，跳过拷贝",
-				zap.Int64("messageID", *req.SourceMessageID))
 		} else {
-			if sourceFromUID == "" {
+			// 发送者仍从消息行求证，这是拷贝里唯一不能信调用方的部分。
+			sourceFromUID, queryErr := s.db.QueryMessageFromUID(req.GroupNo, *req.SourceMessageID)
+			if queryErr != nil {
+				s.Warn("查询源消息发送者失败，使用创建者作为发送者",
+					zap.Error(queryErr),
+					zap.Int64("messageID", *req.SourceMessageID))
+				sourceFromUID = req.CreatorUID
+			} else if sourceFromUID == "" {
 				sourceFromUID = req.CreatorUID
 			}
-			s.sendSourceMessage(channelID, sourceFromUID, sourcePayload)
-			copiedPayload = sourcePayload
+			s.sendSourceMessage(channelID, sourceFromUID, stripped)
+			copiedPayload = stripped
 		}
 	}
 

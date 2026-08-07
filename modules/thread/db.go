@@ -911,23 +911,21 @@ func (d *DB) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
 	return newVersion, tx.Commit()
 }
 
-// QueryMessageSource 根据 channelID 和 messageID 查询消息的发送者与原始 payload。
+// QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者。
 //
-// 两者都来自同一行，因为拷贝到子区的内容必须是服务端存下来的字节，而不是调用方
-// 回传的副本。此前只取 from_uid（"防止客户端伪造"），payload 仍由请求提供，于是
-// 任何群成员都能构造一条 from_uid 是真实 bot、内容自己写的持久化消息 —— 包括
-// PR-C 的 server-only 顶层标记 template_ref / catalog_provenance，而拷贝这条路径
-// 不经过 cardmsg.Validate。伪造出来的标记随后会被 action 路径当作可信身份读取。
-func (d *DB) QueryMessageSource(channelID string, messageID int64) (fromUID string, payload []byte, err error) {
+// 只取 from_uid：这是拷贝到子区时唯一需要向服务端求证的东西（防止客户端伪造发送
+// 者）。内容不从这里读 —— 单条消息读取要过 visibles 白名单、revoke/is_deleted、
+// message_user_extra 的按人删除、两个 offset 和 Expire 五道门，凭 message_id 直接
+// 取 payload 会绕过全部五道，等于让任何群成员凭 id 读回本群任意消息（包括已撤回
+// 的原文 —— 撤回脱敏发生在响应层，存储里原文还在）。拷贝内容改用调用方自己的字
+// 节并剥掉 server-only 标记，见 CreateThread。
+func (d *DB) QueryMessageFromUID(channelID string, messageID int64) (string, error) {
 	table := d.getMessageTable(channelID)
-	var row struct {
-		FromUID string `db:"from_uid"`
-		Payload []byte `db:"payload"`
-	}
-	_, err = d.session.Select("from_uid", "payload").From(table).
+	var fromUID string
+	_, err := d.session.Select("from_uid").From(table).
 		Where("message_id=? AND channel_id=?", messageID, channelID).
-		Load(&row)
-	return row.FromUID, row.Payload, err
+		Load(&fromUID)
+	return fromUID, err
 }
 
 // SettingModel 子区用户设置
