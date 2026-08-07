@@ -29,8 +29,13 @@ package cardmsg
 
 // chevronDownIcon / chevronUpIcon 是 ai.reasoning-process@0.4.0 折叠/展开箭头的
 // 内联字节（Lucide chevron-down / chevron-up，stroke 取 #a1a6ab，1em 方形）。
-// 与 handoff 模板里的字面量逐字节一致 —— TestInlineImageAllowlistCoversTemplates
-// 会遍历所有已注册模板，任何一个不在本白名单里的 data: URL 都会让该测试失败。
+// 与 handoff 模板里的字面量逐字节一致。
+//
+// 这个一致性是**结构性**保证的，不靠某条专门的测试：模板注册时 renderCore 会拿样本
+// 渲染并跑 cardmsg.Validate（json_artifact.go 的 selfCheckCompiledJSON），所以任何
+// 引用了未审字节的模板在注册那一刻就编译失败。V4 侧另有
+// TestSimplifiedSuccessorHasNoOutboundRuntimeDependency 把五个状态的渲染帧推过
+// 生产回写用的严格校验器，正面确认这条。
 const (
 	chevronDownIcon = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E"
 	chevronUpIcon   = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E"

@@ -704,3 +704,46 @@ func TestCompileJSONArtifactConstraintsAreIndependentlyOptional(t *testing.T) {
 		}
 	})
 }
+
+// 声明了展示上限之后，goldens 必须记录**渲染器真正吐出的**字节。这两条路以前是分开的：
+// checkArtifactGoldens 直接展开原始样本，而 jsonTemplate.Build 先截断再展开，所以一个
+// 超过自身展示上限的样本会让 goldens 记下生产永不产出的字节（PR#712 review P2-1）。
+// goldens 是产物唯一的字节级记录，而「匹配的 golden 洗不白伪造的控件」这条论证依赖
+// selfCheckCompiledJSON 与 golden 检查看的是同一帧 —— 两边口径不同这条论证就塌了。
+func TestCompileJSONArtifactGoldensSeeTheTruncatedRender(t *testing.T) {
+	// 样本 title 是 20 个 a，展示上限 8 ⇒ 渲染结果是 7 个 a + 省略号。
+	const sample = `{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`
+	const truncated = `aaaaaaa…`
+	const untruncated = `aaaaaaaaaaaaaaaaaaaa`
+
+	build := func(t *testing.T, goldenText string) (*CompiledArtifact, error) {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		bundle.Schema = json.RawMessage(fmt.Sprintf(
+			`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+				`"additionalProperties":false,"required":["title"],"properties":%s,`+
+				`"x-octo-constraints":{"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}}`,
+			validArtifactProperties,
+		))
+		bundle.Samples["shown"] = json.RawMessage(sample)
+		bundle.Goldens["shown"] = json.RawMessage(fmt.Sprintf(
+			`{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":%q,"wrap":true}]}`,
+			goldenText))
+		return CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	}
+
+	// 记录截断后字节的 golden 必须通过 —— 那才是生产字节。
+	if _, err := build(t, truncated); err != nil {
+		t.Fatalf("golden recording the truncated render should compile: %v", err)
+	}
+
+	// 记录未截断字节的 golden 必须被拒。这正是修复前会被接受的情形。
+	_, err := build(t, untruncated)
+	if err == nil {
+		t.Fatal("golden recording the UNtruncated expansion compiled — the golden gate is not " +
+			"looking at what the renderer emits, so goldens can record bytes production never sends")
+	}
+	if !strings.Contains(err.Error(), "does not match golden") {
+		t.Fatalf("error = %q, want a golden mismatch", err.Error())
+	}
+}

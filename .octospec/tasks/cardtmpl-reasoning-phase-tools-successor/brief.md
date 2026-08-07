@@ -21,9 +21,10 @@ source: user
 > keeps the `octo-*` design-system primitives out, and D3a gives
 > `phases[].thought` two ceilings — accept 4001, display 400 with server-side
 > truncation — so an over-long summary renders truncated instead of failing the
-> card. None of them requires a consumer change, and because the rendered frame is
-> now bounded by the display ceiling regardless of input, no caller can produce a
-> frame the persistence layer cannot hold.
+> card. None of them requires a consumer change. The rendered frame is bounded by
+> the display ceiling regardless of input, but that alone does **not** bound the
+> frame against the store: `thought` is not the dominant term (see D3a), so the
+> storage budget is enforced at the write boundary instead.
 
 ## Goal
 
@@ -286,7 +287,11 @@ refusal rather than corruption, but the card still freezes. The durable fixes ar
 to `MEDIUMTEXT` (`TEXT`→`MEDIUMTEXT` needs `ALGORITHM=COPY, LOCK=SHARED` — measured; `message_extra` is a
 large hot table, so this needs its own brief and a maintenance window) or extending `truncateStrings` to
 `phases[].actions[].tool` / `.detail`, which is a visual change to how tool calls are displayed and so a
-product decision rather than an engineering one. Both are out of scope for `0.4.0`; neither is blocked by it.
+product decision rather than an engineering one. **Note for whoever plans that second option** (review P2-4):
+`applyStringTruncations` cannot express it as written — `ArrayField` scopes `Field` to objects inside one
+*top-level* array, and `tool`/`detail` live one level deeper, in `phases[].actions[]`. So the fields that
+dominate the frame are exactly the ones the current mechanism structurally cannot clamp; that option needs an
+engine change (nested path support) before it needs a product decision. Both are out of scope for `0.4.0`; neither is blocked by it.
 
 `MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — text length adds no nodes, so the node budget
 in the section above is unaffected and the aggregate cap of 13 stands unchanged.
@@ -372,8 +377,18 @@ The cost is that template authors cannot freely use icons. That is intended.
 
 **What did not change.** `data:` remains refused everywhere else: on non-image URL fields (`Action.OpenUrl.url`,
 `iconUrl`, `backgroundImage`) even for vetted bytes, and on any unvetted bytes anywhere. `TestValidateURLAllowlist`
-is untouched. Raw bot cards, incoming-webhook adapters and message edits are unaffected — they were never
-special-cased and still are not, because there is no case to special-name any more.
+is untouched.
+
+**What did widen, stated rather than denied** (review P2-5 — an earlier version of this section claimed raw bot
+cards, incoming-webhook adapters and message edits were "unaffected", which is not accurate). Previously
+`checkImageURL(u, false)` refused *every* `data:` URI for those callers; now `checkImageURL(u)` admits the two
+vetted chevrons for **every** caller, because the allowance is a property of the bytes rather than of the caller.
+That is the whole point of the redesign, and it cuts both ways. The widening is two fixed byte strings — a Lucide
+chevron of two `<path>` elements, no script, no external reference, no interpolation point, matched by full-string
+equality with no normalization — so a bot embedding that exact icon in a raw card is harmless. It is still a
+widening of an anti-injection allowlist, and it is flagged for the human security reviewer, because the remaining
+question is client-side and the server cannot answer it: `<img src>` sandboxes an SVG while inlining it into the
+DOM does not, and the server cannot tell which a given client does.
 
 **Not adopted.** A self-hosted icon endpoint (`OCTO_CARD_ASSET_BASE_URL` + a static-asset route) remains the
 right shape if icons ever outgrow an allowlist; it needs a `BuildEnv` field and a route the server does not

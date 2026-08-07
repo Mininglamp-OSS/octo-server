@@ -501,7 +501,8 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err := selfCheckCompiledJSON(ctx, template, meta, bundle.Samples, sampleAssignments); err != nil {
 		return nil, artifactValidationError("conformance", err.document, err.cause)
 	}
-	if err := checkArtifactGoldens(ctx, parsedTemplates, parsedSamples, parsedGoldens, sampleAssignments); err != nil {
+	if err := checkArtifactGoldens(ctx, parsedTemplates, parsedSamples, parsedGoldens,
+		sampleAssignments, stringTruncations); err != nil {
 		return nil, err
 	}
 
@@ -973,12 +974,31 @@ func selfCheckCompiledJSON(
 	return nil
 }
 
+// deepCopyJSONObject round-trips through JSON so a caller can mutate the copy
+// without touching the original. Compile-time only, so the cost is irrelevant;
+// correctness is not — the samples map is validated and reused after the golden
+// check, and the clamp it needs is in-place.
+func deepCopyJSONObject(src map[string]any) (map[string]any, error) {
+	raw, err := json.Marshal(src)
+	if err != nil {
+		return nil, fmt.Errorf("copy sample: %w", err)
+	}
+	var out map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber() // keep 64-bit ints exact, matching how samples are parsed
+	if err := decoder.Decode(&out); err != nil {
+		return nil, fmt.Errorf("copy sample: %w", err)
+	}
+	return out, nil
+}
+
 func checkArtifactGoldens(
 	ctx context.Context,
 	templates map[ViewKey]any,
 	samples map[string]any,
 	goldens map[string]any,
 	assignments []sampleAssignment,
+	truncations []jsonTemplateStringTruncation,
 ) error {
 	assignmentByKey := make(map[string]sampleAssignment, len(assignments))
 	for _, assignment := range assignments {
@@ -996,6 +1016,22 @@ func checkArtifactGoldens(
 		data, ok := samples[key].(map[string]any)
 		if !ok {
 			return artifactValidationError("shape", "samples."+key, errors.New("sample root must be an object"))
+		}
+		// Clamp exactly as jsonTemplate.Build does before expanding. Without this
+		// the goldens would record the *untruncated* expansion while production
+		// emits the truncated one, i.e. the artifact's only byte-level record of
+		// what it emits would be wrong — and the ordering argument the rest of the
+		// safety story leans on (selfCheckCompiledJSON before this check, so a
+		// matching golden cannot launder a forged control) assumes both look at the
+		// same frame. Applied to a copy: `samples` is validated and reused after
+		// this, and clamping is in-place (PR#712 review P2-1).
+		if len(truncations) > 0 {
+			clamped, err := deepCopyJSONObject(data)
+			if err != nil {
+				return artifactValidationError("shape", "samples."+key, err)
+			}
+			applyStringTruncationsTo(truncations, clamped)
+			data = clamped
 		}
 		expanded, err := jsontmpl.Expand(ctx, templates[assignment.view], jsontmpl.Scope{Data: data}, jsonTemplateEscaper)
 		if err != nil {

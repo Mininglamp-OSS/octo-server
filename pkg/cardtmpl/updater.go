@@ -146,7 +146,10 @@ func (u *updater) Append(ctx context.Context, target UpdateTarget, element json.
 	}
 	normalized, err := carddispatch.NormalizeFrameForPersistence(string(raw))
 	if err != nil {
-		return fmt.Errorf("%w: validate append frame: %v", ErrUpdateInvalid, err)
+		// 双 %w：ErrUpdateInvalid 是本包对外的分类，而 err 可能是
+		// carddispatch.ErrCardMutationTooLarge —— 那个哨兵是刻意做成可区分的，用 %v
+		// 会把它吞掉，modules/notify 的调用方就分不出「太大」和「非法」（review P2-7）。
+		return fmt.Errorf("%w: validate append frame: %w", ErrUpdateInvalid, err)
 	}
 	_, err = u.mutator.Mutate(ctx, mutationRequest(target, normalized))
 	return err
@@ -201,7 +204,8 @@ func updateEnvelope(document json.RawMessage, profile, renderProfile, spaceID st
 	}
 	normalized, err := carddispatch.NormalizeFrameForPersistence(string(raw))
 	if err != nil {
-		return "", fmt.Errorf("%w: validate replacement frame: %v", ErrUpdateInvalid, err)
+		// 双 %w，理由同 Append：保留 ErrCardMutationTooLarge 哨兵。
+		return "", fmt.Errorf("%w: validate replacement frame: %w", ErrUpdateInvalid, err)
 	}
 	return normalized, nil
 }

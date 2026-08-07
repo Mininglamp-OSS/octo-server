@@ -91,7 +91,17 @@ func (t *jsonTemplate) Meta() TemplateMeta { return t.meta.Clone() }
 // x-octo-constraints.truncateStrings keeps the fail-close behaviour, so this
 // cannot silently soften a bound nobody opted into.
 func (t *jsonTemplate) applyStringTruncations(data map[string]any) {
-	if len(t.stringTruncations) == 0 || data == nil {
+	applyStringTruncationsTo(t.stringTruncations, data)
+}
+
+// applyStringTruncationsTo is the free form, so the compile-time golden check can
+// run the *same* clamp the renderer does. Keeping it a method only would leave the
+// two paths agreeing by coincidence: checkArtifactGoldens expands the raw sample,
+// so a sample above its own display ceiling would make the goldens record bytes
+// production never emits — and the goldens are the artifact's only byte-level
+// record of what a template emits (PR#712 review P2-1).
+func applyStringTruncationsTo(truncations []jsonTemplateStringTruncation, data map[string]any) {
+	if len(truncations) == 0 || data == nil {
 		return
 	}
 	clamp := func(holder map[string]any, field string, tr jsonTemplateStringTruncation) {
@@ -107,7 +117,7 @@ func (t *jsonTemplate) applyStringTruncations(data map[string]any) {
 			holder[field] = truncated
 		}
 	}
-	for _, tr := range t.stringTruncations {
+	for _, tr := range truncations {
 		if tr.ArrayField == "" {
 			clamp(data, tr.Field, tr)
 			continue

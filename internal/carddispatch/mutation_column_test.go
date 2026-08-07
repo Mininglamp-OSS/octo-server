@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,6 +85,13 @@ func TestCardMutatorRejectsFramesWiderThanTheColumn(t *testing.T) {
 // maxContentEditBytes 是从 DDL 抄来的常量，所以它必须和 DDL 一致。若哪天有人把
 // content_edit 迁成 MEDIUMTEXT 而忘了改这里，闸会继续按 64 KiB 拒绝本来能存下的帧
 // —— 一个静默收紧。反过来若列被改窄，闸会放过存不下的帧。两个方向都由这条测试挡住。
+//
+// 扫描必须**限定到具名表**。modules/message/sql 下有三张不同的表各自声明了一个裸
+// `content TEXT`（20210305000001 / 20220810000001 / 20250708000002），不限定表就是按
+// 文件名顺序取最后一条 —— 今天恰好命中对的那张纯属排序运气。一旦某次迁宽落在**别的**
+// 表上，扫描会读出 16 MB，这条测试失败，而它的失败消息正是「去同步这个常量」，照做就
+// 会把闸放宽到 16 MB 对着一个 64 KiB 的列，`Data too long` 原样回来。反向陷阱比不检查
+// 更糟（PR#712 review P2-6）。
 func TestMaxContentEditBytesMatchesTheMigrationChain(t *testing.T) {
 	widths := map[string]int{
 		"TINYTEXT": 255, "TEXT": 65535, "MEDIUMTEXT": 16777215, "LONGTEXT": 4294967295,
@@ -91,11 +99,10 @@ func TestMaxContentEditBytesMatchesTheMigrationChain(t *testing.T) {
 
 	// 按文件名顺序扫全链，取最后一次声明为准 —— 后面的 MODIFY/CHANGE 会覆盖前面的
 	// ADD COLUMN，只看第一条就会把已经迁宽过的列读成原始宽度。
-	scan := func(t *testing.T, dir, column string) int {
-		t.Helper()
+	scan := func(dir, table, column string) (int, error) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("read %s: %v", dir, err)
+			return 0, fmt.Errorf("read %s: %w", dir, err)
 		}
 		names := make([]string, 0, len(entries))
 		for _, entry := range entries {
@@ -104,34 +111,69 @@ func TestMaxContentEditBytesMatchesTheMigrationChain(t *testing.T) {
 			}
 		}
 		// os.ReadDir 已按文件名排序，迁移文件名以日期开头，故等于时间顺序。
-		pattern := regexp.MustCompile(`(?i)` + "`?" + regexp.QuoteMeta(column) + "`?" +
+		quoted := "`?" + regexp.QuoteMeta(table) + "`?"
+		// 每条 CREATE/ALTER 语句切成一段，只在**目标表**那些段里找列声明。
+		stmtRE := regexp.MustCompile(`(?is)(CREATE\s+TABLE|ALTER\s+TABLE)\s+(?:IF\s+NOT\s+EXISTS\s+)?` +
+			"`?[A-Za-z0-9_]+`?")
+		colRE := regexp.MustCompile(`(?i)` + "`?" + regexp.QuoteMeta(column) + "`?" +
 			`\s+(TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT)\b`)
+		targetRE := regexp.MustCompile(`(?is)(?:CREATE|ALTER)\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + quoted + `\b`)
 		width := 0
+		matchedTable := false
 		for _, name := range names {
-			body, err := os.ReadFile(filepath.Join(dir, name))
+			raw, err := os.ReadFile(filepath.Join(dir, name))
 			if err != nil {
-				t.Fatalf("read %s: %v", name, err)
+				return 0, fmt.Errorf("read %s: %w", name, err)
 			}
-			for _, match := range pattern.FindAllStringSubmatch(string(body), -1) {
-				w, ok := widths[strings.ToUpper(match[1])]
-				if !ok {
-					t.Fatalf("%s: 未知的 TEXT 变体 %q", name, match[1])
+			body := string(raw)
+			starts := stmtRE.FindAllStringIndex(body, -1)
+			for i, span := range starts {
+				end := len(body)
+				if i+1 < len(starts) {
+					end = starts[i+1][0]
 				}
-				width = w
+				segment := body[span[0]:end]
+				if !targetRE.MatchString(segment) {
+					continue
+				}
+				matchedTable = true
+				for _, match := range colRE.FindAllStringSubmatch(segment, -1) {
+					w, ok := widths[strings.ToUpper(match[1])]
+					if !ok {
+						return 0, fmt.Errorf("%s: 未知的 TEXT 变体 %q", name, match[1])
+					}
+					width = w
+				}
 			}
+		}
+		if !matchedTable {
+			return 0, fmt.Errorf("在 %s 里找不到表 %s 的 CREATE/ALTER 语句 —— 表名改了就要同步这里", dir, table)
 		}
 		if width == 0 {
-			t.Fatalf("在 %s 里找不到 %s 的列声明", dir, column)
+			return 0, fmt.Errorf("在 %s 的表 %s 里找不到 %s 的 TEXT 系列列声明", dir, table, column)
 		}
-		return width
+		return width, nil
 	}
 
-	for _, tc := range []struct{ name, dir, column string }{
-		{"message_extra.content_edit", "../../modules/message/sql", "content_edit"},
-		{"octo_message_card_revision.content", "../../modules/message/sql", "content"},
+	// 自证限定生效：一个不存在的表必须让扫描失败，而不是退回去匹配别人的
+	// `content TEXT`。没有这条，上面两个用例在正则退化成表盲时依然会通过。
+	t.Run("scoping is active", func(t *testing.T) {
+		if width, err := scan("../../modules/message/sql", "no_such_table", "content"); err == nil {
+			t.Fatalf("扫描一个不存在的表返回了 %d B —— 说明表限定没生效，它匹配到了别的表的 "+
+				"content 列；三张表都声明了裸 content TEXT，不限定表这条测试就只是在赌文件名顺序", width)
+		}
+	})
+
+	for _, tc := range []struct{ name, dir, table, column string }{
+		{"message_extra.content_edit", "../../modules/message/sql", "message_extra", "content_edit"},
+		{"octo_message_card_revision.content", "../../modules/message/sql", "octo_message_card_revision", "content"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := scan(t, tc.dir, tc.column); got != maxContentEditBytes {
+			got, err := scan(tc.dir, tc.table, tc.column)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != maxContentEditBytes {
 				t.Fatalf("%s 的 DDL 宽度是 %d B，maxContentEditBytes 是 %d B —— "+
 					"迁移改了列宽就要同步这个常量（改宽而不改常量会静默收紧，改窄而不改会放过存不下的帧）",
 					tc.name, got, maxContentEditBytes)

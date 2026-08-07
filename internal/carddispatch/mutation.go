@@ -240,10 +240,15 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	normalized, err := NormalizeFrameForPersistence(request.ContentEdit)
 	if err != nil {
 		if errors.Is(err, ErrCardMutationTooLarge) && m.logger != nil {
+			// zap.Error 是必须的：真实字节数只在错误串里。request.ContentEdit 是
+			// **pre-Finalize** 的入参，而拒绝是按 post-Finalize 字节判的（本 PR 实测
+			// +47%），所以单独打它会印出一个比 column_bytes 还小的 frame_bytes，配上
+			// 「超出列宽」的消息自相矛盾，读日志的人会以为闸误判（PR#712 review P2-2）。
 			m.logger.Error("card mutation frame exceeds the persistence column",
+				zap.Error(err),
 				zap.String("message_id", request.MessageID),
 				zap.String("sender_uid", request.SenderUID),
-				zap.Int("frame_bytes", len(request.ContentEdit)),
+				zap.Int("request_bytes_pre_finalize", len(request.ContentEdit)),
 				zap.Int("column_bytes", maxContentEditBytes))
 		}
 		return CardMutationResult{}, err
