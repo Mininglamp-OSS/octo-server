@@ -38,6 +38,7 @@ import (
 	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 )
 
 // Tree identifies one non-session authentication tree.
@@ -62,6 +63,30 @@ func BoundSpaceID(c *wkhttp.Context) string {
 	v, _ := c.Get(CtxKeySpaceID)
 	s, _ := v.(string)
 	return s
+}
+
+// BoundSpaceContext publishes the user-key tree's verified tenant as the
+// request's Space, so a reused human handler that reads pkg/space's GetSpaceID
+// isolates by Space exactly as it does for a browser session presenting
+// X-Space-ID. Without it those handlers see an empty Space and take their
+// backwards-compatibility path — which skips the isolation entirely.
+//
+// Only TreeUserKey has a tenant to publish: its credential freezes a Space at
+// issue time and its mount re-checks the owner's membership in that Space before
+// this runs. A bot token carries no Space and a bot has no space_member row, so
+// TreeBotToken routes keep the empty-Space path; what stops them reaching
+// another tenant's data is the handler's own relationship gate, not this.
+//
+// Add it per route rather than tree-wide: it is only correct for handlers whose
+// Space semantics match "the key's Space", and a tree-wide c.Set would silently
+// change the behaviour of every route mounted later.
+func BoundSpaceContext() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if spaceID := BoundSpaceID(c); spaceID != "" {
+			space.SetSpaceID(c, spaceID)
+		}
+		c.Next()
+	}
 }
 
 // Route is one handler a module contributes to a tree.

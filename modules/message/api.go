@@ -423,10 +423,10 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 			groups.GET("/:group_no/threads/:short_id/messages/:message_id", m.getThreadMessage)
 		}
 	}
-	// 同一条群内单条消息查询开放给两棵非会话认证树，供云盘转存按 (群, 消息ID) 取元数据。
-	// handler 的 actor 取自 GetLoginUID()：uk 树的中间件已落真人 UID；bot 树刻意不给整组
-	// 别名 uid（避免授权混淆），因此只在这条路由上挂 botActorUID 把 robot_id 落成 actor，
-	// 于是成员校验与 visibles 过滤都按 bot 自己的可见性执行。
+	// 群 / DM / 子区三种单条消息查询开放给两棵非会话认证树，供云盘转存按 (会话, 消息ID)
+	// 取元数据。handler 的 actor 取自 GetLoginUID()：uk 树的中间件已落真人 UID；bot 树
+	// 刻意不给整组别名 uid（避免授权混淆），因此只在 authtree 的挂载点上挂 botActorUID
+	// 把 robot_id 落成 actor，于是成员校验与 visibles 过滤都按 bot 自己的可见性执行。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/groups/:group_no/messages/:message_id",
@@ -437,6 +437,40 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		Path:    "/groups/:group_no/messages/:message_id",
 		Handler: m.getGroupMessage,
 	})
+	// DM 单条读。getPersonMessage 是这三种形状里唯一读 Space 的 handler：
+	// personSpaceAllows 隔离与 same-space 放行分支都走 pkg/space 的 GetSpaceID，而
+	// human 路由是靠 handler 级 SpaceMiddleware 落那个 context key 的——两棵树上都没有
+	// 它。空 Space 会让 handler 走 sync 的向前兼容路径，跳过整个 Space 过滤，所以：
+	//   uk  → BoundSpaceContext 把 key 冻结的（且已由树上 enforceKeySpace 复查过成员
+	//         资格的）Space 落进 context，隔离强度与 human 带 X-Space-ID 时相同。
+	//   bot → 无租户可落：bot 没有 space_member 行，同样也拿不到 same-space 放行，
+	//         跨会话面由 checkPersonDMAccess 的 friend + 双向 blacklist 门承担。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/messages/person/:peer_uid/:message_id",
+		Middlewares: []wkhttp.HandlerFunc{authtree.BoundSpaceContext()},
+		Handler:     m.getPersonMessage,
+	})
+	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/messages/person/:peer_uid/:message_id",
+		Handler: m.getPersonMessage,
+	})
+	// 子区单条读与上面 human 的 groups 组共用同一个 flag：关闭时 thread 模块的 API 与
+	// archive worker 不上线，两棵树同样不得注册，否则自动化调用方拿到的是一条 human
+	// 侧并不存在的路径。getThreadMessage 不读 Space，无需 BoundSpaceContext。
+	if threadFeatureEnabled() {
+		authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+			Method:  http.MethodGet,
+			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Handler: m.getThreadMessage,
+		})
+		authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+			Method:  http.MethodGet,
+			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Handler: m.getThreadMessage,
+		})
+	}
 	m.ctx.AddMessagesListener(m.listenerMessages) // 监听消息
 	m.syncMessageReadedCount()
 }
