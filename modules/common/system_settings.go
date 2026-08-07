@@ -204,6 +204,57 @@ func (s *SystemSettings) getBool(category, key string, fallback bool) bool {
 	return parseSettingBool(v, fallback)
 }
 
+// SettingBoolOK reports the configured bool for (category, key) and whether the
+// key is configured at all.
+//
+// getBool collapses "unset" and "explicitly false" into the same `false`, which
+// is fine for a two-tier (DB → yaml) key but wrong for a caller that layers its
+// own override on top of this one: a per-bot resolver must be able to tell
+// "the deployment default says false" from "the deployment has no opinion, fall
+// through to the code default". Hence the second return.
+//
+// An unparseable literal reports configured=false so the caller falls through
+// rather than inheriting a silent false — same fail-forward posture getBool
+// takes with its fallback.
+//
+// The literal is trimmed and matched case-insensitively, which getBool's
+// parseSettingBool is not (round-3 evaluation P2-3). The reason is the fallback
+// direction, not taste: this tier's callers layer their own code default on top,
+// and for every key that uses it today (the bot card switches) that default is
+// `true`. So an operator typing `False`, `FALSE ` or `\tfalse` into a
+// system_setting row does not get "no opinion, keep the code default" in some
+// harmless sense — they get **the capability they meant to disable left on**,
+// with no error anywhere. Tolerant lexing removes the class.
+//
+// Deliberately the same *vocabulary* as parseSettingBool (1/0/true/false), only
+// lexed more forgivingly. Accepting on/off/yes/no here would make one column
+// mean different things to two readers of the same table — the divergence
+// pattern this module is meant to avoid, not a convenience.
+//
+// **This tier is best-effort, not enforcement.** EnsureSystemSettings tolerates
+// a failed startup Load() and leaves an empty snapshot for the auto-reload to
+// repair, and an empty snapshot is indistinguishable here from "key not
+// configured" — so a replica whose startup load blipped reports configured=false
+// and its caller falls through to the code default for up to one reload TTL.
+// A caller that layers a fail-closed control on top (see modules/robot's
+// bot_setting resolver) fails closed only in ITS own tier; do not read that
+// posture as covering this one. An operator who needs a capability genuinely
+// disabled should set it at the layer that enforces, not only here.
+func (s *SystemSettings) SettingBoolOK(category, key string) (value bool, configured bool) {
+	v, ok := s.lookup(category, key)
+	if !ok {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
+		return true, true
+	case "0", "false":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // parseSettingBool applies the canonical system_setting bool literal rules
 // (1/true/TRUE → true, 0/false/FALSE → false, anything else → fallback).
 // Shared by getBool and the atomic SpaceWelcomeConfig reader so both spell the
@@ -1010,6 +1061,40 @@ const (
 	// live key 上界因此恒为 100 rps × 40s ≈ 4000。
 	botRateLimitMinRegisterRPS = 1.0 / botRateLimitMaxRegisterFillRatio
 )
+
+// BotCardDisplayEnabledDefault 等三个 getter 是 Bot 卡片能力的**服务端全局默认**
+// （task bot-setting-store）。它们只回答「某个 Bot 没写过覆盖时该取什么」，不含
+// per-Bot 覆盖，也不含卡片总闸 cardmsg.BotEnabled() —— 完整解析链由
+// modules/robot 的 bot_setting 解析器组合，管理端的 effective_value 展示的也正是
+// 本层的值（全局默认），而非某个具体 Bot 的有效值。
+//
+// 代码默认一律 true：总闸本身 fail-closed（OCTO_CARD_MESSAGE_ENABLED 未设即关），
+// 安全默认由总闸承担；若这三项再各自默认 false，运维开了总闸还要逐 Bot 补开，
+// 徒增困惑。
+//
+// 三者都委托给 SettingBoolOK 而不是 getBool，是因为 modules/robot 的解析器读的正是
+// SettingBoolOK：走两条路就等于同一列有两套词法。上一轮把 SettingBoolOK 放宽成
+// trim + 折叠大小写却没动这里，`botcard` 里一行 `False` 就会让管理台显示「开」而每个
+// Bot 解析成「关」—— 同一列对两个读者含义不同，正是本层要消灭的东西。委托而非复制：
+// 词法只有一份，下次再改也不会只改一边。
+func (s *SystemSettings) BotCardDisplayEnabledDefault() bool {
+	return s.botCardSwitchDefault("display_enabled")
+}
+
+func (s *SystemSettings) BotCardInteractionEnabledDefault() bool {
+	return s.botCardSwitchDefault("interaction_enabled")
+}
+
+func (s *SystemSettings) BotCardReasoningEnabledDefault() bool {
+	return s.botCardSwitchDefault("reasoning_enabled")
+}
+
+func (s *SystemSettings) botCardSwitchDefault(key string) bool {
+	if v, configured := s.SettingBoolOK("botcard", key); configured {
+		return v
+	}
+	return defaultBotCardSwitchEnabled
+}
 
 // BotRateLimitBusinessEnabled 等三组 getter 的回退链均为 DB → env → code default。
 func (s *SystemSettings) BotRateLimitBusinessEnabled() bool {

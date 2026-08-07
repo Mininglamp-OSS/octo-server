@@ -29,8 +29,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
+	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -111,22 +113,39 @@ type IService interface {
 	// EnqueueBotTypedEvent without making it visible. The returned event is
 	// intended for an atomic fenced commit by another module.
 	PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (PreparedBotTypedEvent, error)
+	// BotCardConfig resolves the bot's effective card capability switches
+	// (task bot-setting-store): the bot_setting override, then the
+	// system_setting deployment default, then the code default — already
+	// AND-ed with the deployment master switch cardmsg.BotEnabled().
+	//
+	// Both the /v1/bot/card/profile manifest and the sendMessage gate read
+	// it, so the advertised capability and what the send path accepts cannot
+	// drift. An error means the config could not be read; callers must fail
+	// closed rather than substituting defaults — a DB blip must not silently
+	// re-open a capability the owner turned off.
+	BotCardConfig(robotID string) (BotCardConfig, error)
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
 // 与 *Robot 共享底层表结构，但不承担消息/事件监听等副作用，
 // 因此可以被重复 New 出来而不会导致重复注册 listener。
 type Service struct {
-	ctx          *config.Context
+	ctx *config.Context
+	log.Log
 	db           *robotDB
 	creatorCache sync.Map // robotID -> creatorUID
+	// systemSettings mirrors the Robot field: resolved once at construction so
+	// the per-request path never takes common's process-wide singleton mutex.
+	systemSettings *commonmodule.SystemSettings
 }
 
 // NewService 构造一个只读 robot 服务，满足 IService 接口。
 func NewService(ctx *config.Context) IService {
 	return &Service{
-		ctx: ctx,
-		db:  newBotDB(ctx),
+		ctx:            ctx,
+		Log:            log.NewTLog("RobotService"),
+		db:             newBotDB(ctx),
+		systemSettings: commonmodule.EnsureSystemSettings(ctx),
 	}
 }
 
@@ -356,6 +375,12 @@ type Robot struct {
 	// it; it selects legacy GenSeq vs the transactional channel sequence by the
 	// DB-authoritative state row.
 	seqStore *msgextraseq.Store
+	// systemSettings is the process-wide admin-config snapshot, resolved once
+	// here rather than per call. common.EnsureSystemSettings takes a global
+	// mutex on every invocation, so calling it per request would put a
+	// process-wide lock on the card send path and defeat the lock-free
+	// atomic.Pointer read the snapshot is designed around.
+	systemSettings *commonmodule.SystemSettings
 }
 
 func New(ctx *config.Context) *Robot {
@@ -373,6 +398,7 @@ func New(ctx *config.Context) *Robot {
 		mentionRegexp:                 regexp.MustCompile(`@\S+`),
 		msgSem:                        make(chan struct{}, 100), // limit concurrent message processing goroutines
 		seqStore:                      msgextraseq.New(ctx),
+		systemSettings:                commonmodule.EnsureSystemSettings(ctx),
 	}
 	ctx.AddMessagesListener(rb.messagesListen)
 
@@ -397,6 +423,14 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", rb.setMentionPref)       // UPSERT 群级免@偏好
 		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", rb.deleteMentionPref) // 删除回退默认（幂等）
 		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
+		// Bot 级配置（task bot-setting-store）：owner 目录查询 / 批量写 / 删除覆盖。
+		//
+		// SharedUIDRateLimiter 逐路由挂而非挂在整个 auth 组上：本组已有十余个既有
+		// 路由，给整组加限流会改变它们的行为，超出本任务范围。顺序必须在
+		// AuthMiddleware 之后——限流器读不到 uid 会静默 fail-open。
+		auth.GET("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.listBotSettings)
+		auth.PUT("/robot/:robot_id/settings", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.updateBotSettings)
+		auth.DELETE("/robot/:robot_id/settings/:key", appwkhttp.SharedUIDRateLimiter(r, rb.ctx), rb.deleteBotSetting)
 	}
 
 	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
@@ -451,6 +485,54 @@ func (rb *Robot) streamStart(c *wkhttp.Context) {
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
 		respondRobotRequestInvalid(c, "")
+		return
+	}
+
+	// 身份 → 频道 → 内容，与同组 sendMessage 逐条对齐（round-7 评审阻塞项）。
+	//
+	// 顺序本身是契约的一部分，不是排版：sendMessage 先 allowSendToChannel 再
+	// payloadIsVail，即**先确定你有没有资格往这里发，再看你发的是什么**。本分支已经为
+	// 同一条原则改过一次——settings 三个端点的属主校验被三位 reviewer 连提三轮，最终
+	// 前移到形状校验之前，理由是「对未知/无权资源返回 400 与端点自述的 404/403 语义
+	// 矛盾」。这里同理：非群成员发一张卡，该答 channel_send_forbidden（你没资格），
+	// 而不是 content_invalid（你东西不对）——后者等于在鉴权之前就对内容表态。
+	robotID := c.Param("robot_id")
+
+	// FromUID 此前直接取调用方传入的值。同一个 robotAuth 组里 sendMessage 与 typing 都把
+	// 它钉成 c.Param("robot_id")，只有本 handler 是例外，于是一个已鉴权的 Bot 能以**任意
+	// uid** 开流。鉴权解决的是「你是谁」，这里却让请求体决定「你说你是谁」。评审判定这条
+	// 比卡片那条更重，且与客户端是否渲染卡片无关。
+	//
+	// 钉完之后拿**钉过的 req.FromUID** 去查频道权限，而不是旁边的 robotID：两者此刻等值，
+	// 但校验的必须是真正会被派发的那个字段。若哪天钉住被删或被移到后面，用 robotID 校验会
+	// 让频道门继续看到正确身份、而 IM 收到伪造身份，门就成了摆设。一个变量走到底，这种漂移
+	// 不可能发生。
+	req.FromUID = robotID
+	if !rb.allowSendToChannel(req.FromUID, req.ChannelID, req.ChannelType) {
+		rb.Warn("robot 无权向该频道开流",
+			zap.String("robot_id", robotID), zap.String("channel_id", req.ChannelID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
+		return
+	}
+
+	// 流式入口一律不接受卡片 payload。
+	//
+	// 本 handler 把 req.Payload（裸 []byte）原样转给 WuKongIM：没有 payloadIsVail、
+	// 没有 cardmsg.Validate、没有 BotEnabled() 总闸、也没有 per-Bot 门。于是 owner 关掉
+	// 展示/交互卡之后，同一个 Bot 换这个端点仍能把 type:17 送出去——本任务对外承诺的是
+	// 「每条已鉴权的发卡路径都按有效配置校验」，少一条这个承诺就是假的。
+	//
+	// **拒绝**而不是补一套完整门禁，是刻意的：补门意味着要在这条路上重建形状校验、
+	// URL 白名单、节点/深度上限与 profile 协商，那是把 sendMessage 的整条流水线复制一遍；
+	// 而流式消息的用途是增量文本，卡片有 sendMessage 与模板 message/edit 两条正规入口，
+	// 没有理由从这里发。拒绝让承诺变真，且不新增一套会和 sendMessage 漂移的判定。
+	//
+	// 边界：IsCardRawPayload 只认 JSON 数字 type，与 IsCardPayload 同源。本 handler 不做
+	// 类型分发，因此不存在 legacy sendMessage 那个「路由强转字符串、校验不认」的夹缝
+	// （round-3 P2-1）；`{"type":"17"}` 在这里当普通 payload 转发，见 journal known-gaps。
+	if cardmsg.IsCardRawPayload(req.Payload) {
+		rb.Warn("stream/start 不接受卡片 payload，已拒绝", zap.String("robot_id", robotID))
+		respondRobotContentInvalid(c, "payload")
 		return
 	}
 
@@ -724,6 +806,36 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		respondRobotContentInvalid(c, "payload")
 		return
 	}
+
+	// per-Bot 卡片策略门（task bot-setting-store，round-2 评审 P1-1）。
+	//
+	// 本仓有**三个**卡片生产者入口，payloadIsVail 的 InteractiveCard 分支自己就写着
+	// 「与 bot_api 的 send gate 对称」。bot_setting 上线时只给 bot_api 那道门加了
+	// per-Bot 判定，这条 legacy 路径仍只有部署总闸 + Validate —— 而两条路的身份是**同
+	// 一列**（authRobot 按 robot.robot_id 解析，bot_setting.robot_id 与 assertRobotOwner
+	// 的 creator_uid 取自同一张表）。于是 owner 关掉展示/交互卡后，同一个 Bot 换这个
+	// 端点仍能把卡发出去：一个被某条已鉴权路径忽略的能力开关，就不成其为能力开关。
+	//
+	// 排在 payloadIsVail 之后：形状先过，策略再判，拒绝形状与本 ingress 既有口径一致
+	// （单一 content-invalid，防枚举；具体原因只进日志）。
+	if rejectRobotCardBySetting(payloadResult) {
+		cfg, cfgErr := rb.BotCardConfig(robotID)
+		if cfgErr != nil {
+			// fail-closed：配置读不到时不得放行，否则一次 DB 抖动就把 owner 关掉的
+			// 能力从这条路放开（与 bot_api 侧同姿态）。
+			rb.Error("查询 Bot 卡片配置失败", zap.Error(cfgErr), zap.String("robot_id", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if !robotCardPolicyAllows(payloadResult, cfg) {
+			rb.Warn("Bot 卡片能力已关闭，legacy robot ingress 拒绝",
+				zap.String("robot_id", robotID),
+				zap.Bool("display", cfg.DisplayEnabled),
+				zap.Bool("interaction", cfg.InteractionEnabled))
+			respondRobotContentInvalid(c, "payload")
+			return
+		}
+	}
 	userResp, err := rb.userService.GetUserWithUsername(robotID)
 	if err != nil {
 		rb.Error("查询机器人的用户信息失败！", zap.Error(err))
@@ -860,6 +972,21 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 		// 的 send gate 对称（rollout flag + write-strict Validate）。本 ingress
 		// 的错误形状是单一 content-invalid 400（防枚举）——flag 关闭 / 白名单 /
 		// 大小 / URL 失败的具体原因只进日志。
+		//
+		// 路由谓词与校验谓词必须是同一个（round-3 评审 P2-1）。本 ingress 是全仓
+		// **唯一**用 maputil.Data.Int("type") 分发的入口（bot_api / message / notify
+		// 都直接调 IsCardPayload），而 Int 会对字符串跑 strconv.Atoi，IsCardPayload
+		// 则只认 float64/int/json.Number、**故意**拒掉字符串 "17"。两者不一致时，
+		// {"type":"17"} 会：进本分支 → Validate 因 IsCardPayload=false 直接 return nil
+		// （pkg/cardmsg/validate.go）→ rejectRobotCardBySetting 同样判 false 而跳过全部
+		// per-Bot 开关 → Finalize no-op。于是一棵没过 URL 白名单、节点/深度上限、
+		// profile 协商与能力开关的卡片树被派发出去，只要有客户端对 type 做宽松转换
+		// 就能渲染。在这里收口成 IsCardPayload：卡片分支的可达性从此与校验、与门禁
+		// 完全同源，不再存在「路由认为是卡片、校验认为不是」的夹缝。
+		if !cardmsg.IsCardPayload(payloadResult) {
+			rb.Warn("payload.type 非 JSON 数字，不认作卡片（拒绝而非降级放行）")
+			return false
+		}
 		if !cardmsg.BotEnabled() {
 			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
 			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED；robot 是 bot 生产者之一，
@@ -897,6 +1024,27 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 }
 
 // 是否允许发送消息到频道
+//
+// 三个 robot ingress（sendMessage / typing / streamStart）共用这一份判定，所以这里
+// 少认一种频道类型，那种类型就在三条路上同时不可用。
+//
+// **子区（CommunityTopic）此前落在末尾的「未知类型」里被一律拒绝**，而 sendMessage、
+// typing、streamStart 三处各自都写着一个解析父群的子区解散守卫——那三个分支因此永远
+// 不可达。守卫会去 resolveParentGroupNo 说明作者本就打算让子区能用，是本函数漏了这个
+// case，不是那三处多写了。streamStart 补上频道校验时（round-8 评审）这个洞才暴露出来：
+// 那条路先前没有校验，于是成了三条里唯一「子区能发」的例外。
+//
+// 子区的成员资格取决于**父群**：子区 channelID 形如 `<parentGroupNo>____<topicNo>`，
+// 权限模型里子区不单独持有成员表。因此解析出父群再查成员，解析是纯字符串操作、不额外碰库。
+//
+// **但用的谓词比群分支严**，不是同一条规则：群分支是 ExistMember（只看 is_deleted），
+// 子区分支是 ExistMemberActive（还要求 status=Normal）。这个不对称是全仓既有口径——
+// 子区门禁在 YUJ-4185 被专门加固过，thread / message / messages_search / bot_api 各处
+// 都用严格变体，群门禁则仍是松的。所以「被拉黑的 bot 能发父群、不能发子区」是刻意的，
+// 不是遗漏。收紧群分支是更大范围的行为变更，另行评估。
+//
+// 方向上这是**放宽**（type 5：永远拒 → 按父群成员判定），所以今天能发的一样能发；
+// 受影响的只有先前被无条件 403 的子区请求。
 func (rb *Robot) allowSendToChannel(robotID string, channelID string, channelType uint8) bool {
 	if channelType == common.ChannelTypePerson.Uint8() {
 		// 个人频道允许机器人发送消息
@@ -907,6 +1055,30 @@ func (rb *Robot) allowSendToChannel(robotID string, channelID string, channelTyp
 		exist, err := rb.groupService.ExistMember(channelID, robotID)
 		if err != nil {
 			rb.Error("检查机器人是否是频道成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+			return false
+		}
+		return exist
+	}
+	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// 子区：成员资格在父群上。channelID 形状不合法时 fail-closed。
+		parentGroupNo, err := rb.resolveParentGroupNo(channelID)
+		if err != nil {
+			rb.Error("解析子区父群失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+			return false
+		}
+		// **必须是 ExistMemberActive，不是上面群分支那个 ExistMember**（round-8 评审 P1）。
+		// ExistMember 只过滤 is_deleted=0，被拉黑成员（status=Blacklist）照样返回 true；
+		// ExistMemberActive 额外要求 status=Normal。group/service.go 上该方法的注释点名了
+		// 这个场景：「子区(CommunityTopic)读/发门禁用它替代 ExistMember，避免被拉黑用户
+		// 越权读/发（YUJ-4185 CR 整改）」，thread / message / messages_search / bot_api
+		// 的每一处子区门禁也都用它。
+		//
+		// 这条路尤其不能松：robot ingress 是服务端直发，不经过 IM datasource，因而拿不到
+		// thread 模块的子区拉黑继承（thread/1module.go）——本地这道门就是唯一防线，正是
+		// group/db.go 里「用于绕过 IM 层的接口」那句话所指的情形。
+		exist, err := rb.groupService.ExistMemberActive(parentGroupNo, robotID)
+		if err != nil {
+			rb.Error("检查机器人是否是子区父群活跃成员失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
 			return false
 		}
 		return exist
@@ -2263,10 +2435,27 @@ func (rb *Robot) isGroupDisbanded(groupNo string) (bool, error) {
 
 // resolveParentGroupNo 从子区 channelID 解析父群号。
 // 子区 channelID 格式：groupNo____threadID（4个下划线分隔）
+// resolveParentGroupNo 从子区 channelID 解析父群号。
+//
+// 委托给 thread.ParseChannelID，**不自己写解析**（round-9 评审 P2-2）。原实现用
+// `SplitN(channelID, "____", 2)`，只要能切出两段就通过；标准解析器用 `Split`（非
+// SplitN）要求**恰好**两段、且两段都非空。差别在本函数只喂解散守卫时无害，但现在它
+// 还喂 allowSendToChannel 的子区分支——也就是**鉴权判定**：
+//
+//	"groupA____topic____extra" → SplitN 给出 parts[0]="groupA"，成员校验按 groupA 过，
+//	而派发出去的是原始的非规范 channelID；下游一律走 ParseChannelID，于是那条消息
+//	解析失败、投不到任何订阅者。门与投递目标对「什么是合法子区 ID」的判断不一致。
+//
+// 这与刚修的 P1（子区成员判定用了比全仓更松的谓词）是同一族问题：robot 模块把一个
+// 全仓已有的判定又实现了一遍，而且更松。所以这里不再「顺手收紧」，直接用那一份。
+//
+// 不额外套 thread.IsValidShortID（15–20 位数字）：本函数要保证的性质是「校验成员的
+// 群 == 消息实际投递的群」，恰好两段非空即可确定 parts[0] 无歧义；short id 的取值域
+// 是另一回事，收紧它的影响面本处无法核实。
 func (rb *Robot) resolveParentGroupNo(channelID string) (string, error) {
-	parts := strings.SplitN(channelID, "____", 2)
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid community topic channelID format: %s", channelID)
+	groupNo, _, err := thread.ParseChannelID(channelID)
+	if err != nil {
+		return "", fmt.Errorf("invalid community topic channelID format: %s: %w", channelID, err)
 	}
-	return parts[0], nil
+	return groupNo, nil
 }

@@ -30,7 +30,7 @@ func httperrL(c *wkhttp.Context, code codes.Code) {
 // envelope (respondRobotAuth* helpers) and the inline-query timeout via
 // respondRobotInlineQueryTimeout, so no raw gin abort should remain.
 func TestRobotNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go", "api_manager.go", "mention_pref.go"}
+	files := []string{"api.go", "api_manager.go", "mention_pref.go", "bot_setting.go"}
 	banned := []string{
 		".ResponseError(",
 		".ResponseErrorf(",

@@ -235,6 +235,49 @@ func (c *botCardTemplateCatalog) Capability() botTemplatingCapability {
 	return out
 }
 
+// AdvertisedRef returns the ref this deployment advertises for id, if any.
+//
+// The manifest's reasoning_template_ref must be resolvable from exactly the
+// same source the send allowlist checks, so a bot can never be handed a ref
+// that requireRef would then reject. Iterating the capability (rather than
+// sendAllowed) also keeps the answer aligned with what the same response
+// advertises under `templating.templates`.
+func (c *botCardTemplateCatalog) AdvertisedRef(id cardtmpl.ID) (botTemplateRef, bool) {
+	if c == nil {
+		return botTemplateRef{}, false
+	}
+	// Ambiguity is reported, not silently resolved. Today AdvertisedSend holds
+	// exactly one version per id, so there is nothing to pick between; the day a
+	// second version of one template is advertised for new sends, binding to
+	// "whichever the sort happened to put first" would decide the wire contract
+	// by accident. Fail closed instead and make that a deliberate decision.
+	var found botTemplateRef
+	matches := 0
+	for _, template := range c.capability.Templates {
+		if template.ID == string(id) {
+			matches++
+			found = botTemplateRef{ID: cardtmpl.ID(template.ID), Version: template.Version}
+		}
+	}
+	if matches != 1 {
+		return botTemplateRef{}, false
+	}
+	for _, template := range c.capability.Templates {
+		if template.ID != string(id) || template.Version != found.Version {
+			continue
+		}
+		ref := botTemplateRef{ID: cardtmpl.ID(template.ID), Version: template.Version}
+		if _, ok := c.sendAllowed[ref]; !ok {
+			// Defensive: the constructor builds both from one policy, so a
+			// mismatch means the invariant broke. Report "not advertised"
+			// rather than handing out a ref the send path would reject.
+			return botTemplateRef{}, false
+		}
+		return ref, true
+	}
+	return botTemplateRef{}, false
+}
+
 func (c *botCardTemplateCatalog) RenderPayload(
 	ctx context.Context,
 	inbound map[string]any,

@@ -1,0 +1,53 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: |
+      本任务主轴。brief touches auth/bot-api，且改动落在 modules/**/*.go。
+      落实点：owner 端点全部经 assertRobotOwner（creator_uid == loginUID）后才
+      触碰 bot_setting；/v1/bot/card/profile 与 sendMessage 的 robotID 一律取自
+      authBot 上下文，绝不信任 query/body。bot_setting 是 (robot_id) 一维、
+      非 Space 维数据，不挂 SpaceMiddleware——与既有 bot_mention_pref 同口径。
+  - id: error-handling
+    source: repo
+    why: |
+      touches error-response/i18n/wire-contract。所有新响应走
+      httperr.ResponseErrorL + 已注册 errcode；复用 robot 既有码
+      （ErrRobotRequestInvalid / ErrRobotNotFound / ErrRobotCreatorOnly /
+      ErrRobotQueryFailed / ErrRobotStoreFailed）与 bot_api 的
+      ErrBotAPICardInvalid，本任务不新增错误码。发送端拒绝统一收敛到
+      card_invalid 单码（防枚举），具体原因只进日志。
+  - id: rate-limit
+    source: repo
+    why: |
+      新增三个已鉴权 owner 路由。robot 的主 auth 组
+      （api.go:387 r.Group("/v1", AuthMiddleware)）没有挂 UID 限流，
+      为不改动既有路由的行为，新路由按 per-route middleware 挂
+      appwkhttp.SharedUIDRateLimiter，顺序在 AuthMiddleware 之后（否则读不到
+      uid 会静默 fail-open）。不自建 Redis 计数器。
+  - id: trust-boundary
+    source: repo
+    why: |
+      经 touches wire-contract 命中。已通读——本任务不渲染外部内容、不产出
+      markdown/URL 目标，转义与适配器对等条款不适用。保留的精神是「在调用方
+      跨不过去的边界上校验」：键白名单与 bool 字面量校验放在服务端写入路径，
+      而不是依赖客户端只提交合法值；card_enabled 做成派生只读，调用方无法
+      通过写库伪造「卡片已启用」。
+  - id: testing
+    source: repo
+    why: 新增测试文件；解析链与守卫判定抽成纯函数以便无 DB 单测。
+  - id: commit-style
+    source: repo
+    why: paths ["**"] 全匹配；提交信息用英文 Conventional Commits。
+
+brief: .octospec/tasks/bot-setting-store/brief.md
+
+notes:
+  - _global 未同步（.octospec/_global/ 不存在），仅 repo 层规则生效。
+  - 解析链第二层复用 modules/common 的 system_setting。modules/robot 此前不依赖
+    modules/common，已确认无环：modules/common 只导入 modules/base/common，
+    后者不导入 modules/robot。
+  - bot_setting 的稀疏语义与 updated_by 审计列照搬 bot_mention_pref
+    （modules/robot/sql/20260603000001_bot_mention_pref.sql）。
+  - 配置变更事件用 robot.IService.EnqueueBotEvent（账号级、无频道上下文），
+    不照抄 sendMentionPrefNotification 的群频道消息——后者走群频道是因为它的
+    偏好本身是群维度的。
