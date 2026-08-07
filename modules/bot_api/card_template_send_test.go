@@ -27,6 +27,7 @@ func TestSendMessageRegistryTemplateRendersAndDispatches(t *testing.T) {
 	ba := &BotAPI{
 		Log:              log.NewTLog("BotAPI-template-send"),
 		cardTemplates:    catalog,
+		cardConfig:       allCardCapabilitiesOn(),
 		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
 		dispatchOverride: dispatch.hook,
 	}
@@ -97,6 +98,7 @@ func TestSendMessageRawCardAuthorsRenderProfile(t *testing.T) {
 			dispatch := &dispatchCapture{}
 			ba := &BotAPI{
 				Log:              log.NewTLog("BotAPI-raw-card-render-profile"),
+				cardConfig:       allCardCapabilitiesOn(),
 				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
 				dispatchOverride: dispatch.hook,
 			}
@@ -190,6 +192,7 @@ func TestSendMessageRegistryTemplateRejectsHistoricalVersionsWithoutDispatch(t *
 			ba := &BotAPI{
 				Log:              log.NewTLog("BotAPI-template-send-historical"),
 				cardTemplates:    catalog,
+				cardConfig:       allCardCapabilitiesOn(),
 				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
 				dispatchOverride: dispatch.hook,
 			}
@@ -266,6 +269,7 @@ func TestSendMessageRegistryTemplateRejectsInvalidWithoutDispatch(t *testing.T) 
 			ba := &BotAPI{
 				Log:              log.NewTLog("BotAPI-template-send-invalid"),
 				cardTemplates:    catalog,
+				cardConfig:       allCardCapabilitiesOn(),
 				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
 				dispatchOverride: dispatch.hook,
 			}
@@ -295,6 +299,7 @@ func TestSendMessageRegistryTemplateKeepsOBOCardExclusion(t *testing.T) {
 	ba := &BotAPI{
 		Log:              log.NewTLog("BotAPI-template-send-obo"),
 		cardTemplates:    catalog,
+		cardConfig:       allCardCapabilitiesOn(),
 		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
 		dispatchOverride: dispatch.hook,
 	}

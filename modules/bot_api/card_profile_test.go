@@ -211,6 +211,25 @@ func TestBotCardProfile_Unauthenticated(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w2.Code, "非法 token 必须被拒绝; body=%s", w2.Body.String())
 }
 
+// TestBotCardProfile_IsNotSharedCacheable pins Cache-Control on the success
+// path. Since the response carries per-Bot `config`, and the URL is byte-identical
+// for every Bot (only the Authorization header differs), a shared proxy caching
+// by URL would hand Bot A's configuration to Bot B. The header is the only thing
+// standing between the two.
+func TestBotCardProfile_IsNotSharedCacheable(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	handler, _ := setupBotCardProfile(t)
+
+	w := getCardProfile(t, handler, cpBotToken)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	cacheControl := w.Header().Get("Cache-Control")
+	assert.Contains(t, cacheControl, "private",
+		"响应含 per-Bot config，必须禁止共享代理缓存")
+	assert.Contains(t, cacheControl, "no-store",
+		"配置改动要即时生效，不得留缓存副本")
+}
+
 // TestBotCardProfile_AdditiveContractFieldSet（D12.4）：pin 死顶层 + limits 字段集，
 // 任何改名/删除都会让本测试失败（additive-only：只许新增字段）。
 func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
@@ -226,7 +245,11 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 	for k := range raw {
 		gotTop = append(gotTop, k)
 	}
-	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs", "actions", "templating"}, gotTop,
+	assert.ElementsMatch(t, []string{
+		"enabled", "card_version", "profiles", "limits", "elements", "inputs", "actions", "templating",
+		// config：per-Bot 卡片策略（task bot-setting-store）。additive 新增。
+		"config",
+	}, gotTop,
 		"D12 additive-only：顶层字段集冻结（新增新字段，绝不改名/删除）")
 
 	var limits map[string]json.RawMessage
@@ -239,6 +262,18 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 		"max_payload_bytes", "max_nodes", "max_depth", "max_input_text_bytes", "max_inputs_bytes",
 		"max_copy_text_bytes",
 	}, gotLimits, "D12 additive-only：limits 字段集冻结")
+
+	// config 的子字段集同样冻结：插件按名读这五个键，改名等同破坏 event_data。
+	var cfg map[string]json.RawMessage
+	assert.NoError(t, json.Unmarshal(raw["config"], &cfg))
+	gotConfig := make([]string, 0, len(cfg))
+	for k := range cfg {
+		gotConfig = append(gotConfig, k)
+	}
+	assert.ElementsMatch(t, []string{
+		"card_enabled", "display_enabled", "interaction_enabled", "reasoning_enabled",
+		"reasoning_template_ref",
+	}, gotConfig, "D12 additive-only：config 字段集冻结")
 }
 
 func newMustTestCatalog(t *testing.T) *botCardTemplateCatalog {
