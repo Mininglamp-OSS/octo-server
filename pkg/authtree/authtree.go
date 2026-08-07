@@ -102,31 +102,46 @@
 //
 // The two file routes are the only place where a uk key's reach is not defined by
 // the Space frozen into it, because what they authorize is an object key rather
-// than a tenant-owned row. The two sides are NOT symmetric, and this PR treats
-// them differently on a maintainer-confirmed trade-off:
+// than a tenant-owned row. The two sides are NOT symmetric, and this change treats
+// them differently:
 //
-// Download stays ScopeUnscoped, deliberately. Buckets are created public-read
-// (modules/file/service_minio.go applies readOnlyAnonymousPolicy — "allow
-// anonymous download only"; service_oss.go creates with oss.ACLPublicRead), so
-// knowing an object key is already enough to GET the object with no credential at
-// all. Under that deployment model an object key IS the read capability, and the
-// 30-minute signed URL supplies filename/disposition rather than confidentiality.
-// Adding a Space check to this one signing route would therefore move no real
-// boundary while implying one exists. Confidentiality has to be fixed a layer
-// down (ownership table, capability token, bucket policy) and is tracked
-// separately.
+// Download stays ScopeUnscoped — deferred, not solved. Be precise about why, since
+// an earlier draft of this comment justified it with a property the code does not
+// have. Object confidentiality is not enforced anywhere in this repository today.
+// Of the six storage backends in modules/file, only two apply a public-read policy
+// at all, and only on the path where they create the bucket themselves:
+// service_minio.go's ensureBucket returns early when BucketExists reports true, so
+// SetBucketPolicy never runs for an ops-provisioned bucket, and service_oss.go's
+// CreateBucket(oss.ACLPublicRead) sits behind a `bucket == nil` check that
+// client.Bucket does not satisfy. service_cos.go, service_s3.go, service_qiniu.go
+// and service_seaweedfs.go apply none. service_s3.go's own DownloadURL comment
+// states the opposite of the convenient reading — private buckets are "the AWS
+// default with Block Public Access on", and /v1/file/download/url is named there as
+// the presigned route that exists FOR them.
+//
+// So on a private-bucket deployment the signed URL is the read capability, and a
+// Space-A key presenting a Space-B object key gets a working authenticated GET.
+// What keeps that off this route's critical path is not a boundary here: keys are
+// <type>/<ts>/<uuid>/<uuid><ext>, high-entropy and not enumerable, so it needs an
+// out-of-band key leak; every message-read route on this tree IS Space-confined, so
+// a Space-A key cannot harvest Space-B keys through them; and the exposure equals
+// the human session route already in production. Closing it properly means an
+// ownership table, a capability token or a bucket-policy change — a layer below this
+// route, covering the human route too — and is tracked as separate work. Deferring
+// it is a product decision; ScopeUnscoped is the honest declaration meanwhile.
 //
 // Upload is ScopeRouteGuard, tightened here. Its risk is integrity, not
 // confidentiality: signing a PUT for a caller-named key hands out write access to
-// an existing object, and that boundary really does live on this route — nothing
-// downstream re-checks it. file.rejectCallerObjectKey refuses a non-empty `path`
-// outright, so the key is always server-minted and no known-key overwrite is
-// reachable. Rejecting rather than validating is the point: the server has no
-// fact source for "who owns this key", so removing the caller's ability to name a
-// target is the only guard that cannot be written wrong. The bot tree already
-// works this way (bot_api.botUploadPresigned takes only filename + fileSize).
-// The human session routes and the shared handler are unchanged — a browser's
-// custom `path` is a capability octo-web uses today.
+// an existing object, and unlike the read side that boundary really does live on
+// this route — nothing downstream re-checks it. file.rejectCallerObjectKey refuses a
+// non-empty `path` outright, so the key is always server-minted and no known-key
+// overwrite is reachable. Rejecting rather than validating is the point: the server
+// has no fact source for "who owns this key" — that is the ownership table above —
+// so removing the caller's ability to name a target is the only guard here that
+// cannot be written wrong. The bot tree already works this way
+// (bot_api.botUploadPresigned takes only filename + fileSize). The human session
+// routes and the shared handler are unchanged — a browser's custom `path` is a
+// capability octo-web uses today.
 package authtree
 
 import (
@@ -215,11 +230,16 @@ const (
 	// scope is what installs it, so the declaration cannot drift from the wiring.
 	ScopeBoundSpace TenantScope = "bound_space"
 	// ScopeRouteGuard: the handler does not read the request Space, so a guard
-	// specific to this route rejects targets outside the credential's tenant —
-	// either contributed here in Middlewares (see user.requireBoundSpaceMember,
-	// message.requireBoundSpaceGroup) or installed by the tree at its mount point
-	// when only the tree knows the credential's semantics (see
-	// bot_api.appBotScopeGuard).
+	// specific to this route removes the caller's cross-tenant reach — either by
+	// rejecting targets outside the credential's tenant, or by taking away the
+	// ability to name a target at all when the server has no ownership fact to
+	// check against (see file.rejectCallerObjectKey, which refuses a caller-named
+	// object key so only server-minted ones exist; note such a route is not
+	// *confined* to the bound Space, it simply has no cross-tenant target left).
+	// The guard is either contributed here in Middlewares (see
+	// user.requireBoundSpaceMember, message.requireBoundSpaceGroup) or installed by
+	// the tree at its mount point when only the tree knows the credential's
+	// semantics (see bot_api.appBotScopeGuard).
 	ScopeRouteGuard TenantScope = "route_guard"
 	// ScopeUnscoped: the route is deliberately NOT confined to a bound Space, and
 	// the handler's own gates (friendship, group membership, bilateral blacklist)

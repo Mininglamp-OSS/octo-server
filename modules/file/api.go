@@ -100,13 +100,13 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 	//   upload  → ScopeRouteGuard。rejectCallerObjectKey 在 path 非空时 fail-closed
 	//             拒绝，object key 只能由服务端生成，调用方拿不到「对已知 key 的 PUT
 	//             URL」，跨租户覆写因此不可达（by construction，不靠校验写对）。
-	//   download → ScopeUnscoped，且是 maintainer 已确认的产品/安全取舍而非遗漏：桶按
-	//             public-read 建（service_minio.go readOnlyAnonymousPolicy、
-	//             service_oss.go oss.ACLPublicRead），对象可匿名 GET，object key 在
-	//             现有部署模型下就是读取能力本身。30 分钟签名 URL 提供的是文件名 /
-	//             disposition，不是对象保密边界，所以只在这条签名路由上加 Space 校验
-	//             并不能形成真实边界。收紧对象保密属于另一层设计（归属表 / capability
-	//             token / bucket 策略），不在本 PR 范围。
+	//   download → ScopeUnscoped，是「另一层的问题，本次不解」而非「这里没问题」。对象保密
+	//             在本仓今天哪一层都没强制：六个后端里只有 minio / oss 会加 public-read 且
+	//             只在自建桶那条路径上，cos / s3 / qiniu / seaweedfs 一个都不加；私有桶部署
+	//             下签名 URL 就是读取能力本身。压住它的是 object key 的高熵不可枚举、本 PR
+	//             的消息读路由都 Space-confined、以及暴露面与已在生产的 human 路由等同 ——
+	//             不是这条路由上的边界。要真堵得靠归属表 / capability token / bucket 策略，
+	//             在这条路由之下的一层且同样覆盖 human 路由，属独立追踪的工作。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:      http.MethodGet,
 		Path:        "/file/upload/presigned",

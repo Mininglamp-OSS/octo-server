@@ -380,8 +380,9 @@ func TestUserKeyBotsRoutesUnaffectedByTenantMiddleware(t *testing.T) {
 // validating here, and modules/file/authtree_guard_test.go for the route-level
 // behaviour (whitespace path, server-minted key shape, human route untouched).
 //
-// Download is deliberately NOT guarded the same way; the asymmetry is a
-// maintainer-confirmed trade-off recorded in pkg/authtree's census.
+// Download is deliberately NOT guarded the same way; that asymmetry, and the fact
+// that it is a deferral rather than a solved problem, is recorded in pkg/authtree's
+// census.
 func TestUserKeyPresignedUploadRefusesCallerObjectKey(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
