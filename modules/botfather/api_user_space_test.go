@@ -135,25 +135,28 @@ func TestEnforceKeySpacePathParamTakesPrecedenceAndPinsQuery(t *testing.T) {
 		"a conflicting query param must be overwritten, not left for the handler to read")
 }
 
-// A key with no bound Space carries no tenant to enforce: nothing is injected,
-// nothing is refused, and there is no membership to look up — matching how
-// /v1/user/bots* already behaves on empty bindings.
-func TestEnforceKeySpaceUnboundKeyPassesThrough(t *testing.T) {
+// A key with no bound Space carries no tenant to enforce, so it is refused
+// outright on this subtree rather than being let through with a caller-chosen
+// space_id (PR #713 review, Jerry-Xin blocker 3 / lml2468 P0). Passing through
+// would be fail-open tenant selection: user.search would fall onto its
+// "filter by the caller's space_id" branch, which only ever validates the TARGET's
+// membership, and the DM read would skip Space filtering entirely on the empty
+// Space. This is not a back-compat break — enforceKeySpace only fronts the
+// authtree-contributed upstream routes, which did not exist before this change, so
+// no unbound key ever reached them. /v1/user/bots* does not pass through here.
+func TestEnforceKeySpaceUnboundKeyIsRefused(t *testing.T) {
 	called := false
 	r := newSpaceGuardRouteWithChecker("", func(string, string) (bool, error) {
 		called = true
 		return true, nil
 	})
 
-	w := spaceGuardGet(t, r, "/v1/user/echo")
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "", w.Body.String(), "no binding means no injection")
+	assert.Equal(t, http.StatusForbidden, spaceGuardGet(t, r, "/v1/user/echo").Code,
+		"an unbound key has no enforceable tenant and must be refused, not passed through")
+	assert.Equal(t, http.StatusForbidden, spaceGuardGet(t, r, "/v1/user/echo?space_id=sp_anything").Code,
+		"an unbound key must not be able to select its own tenant via space_id")
 
-	w = spaceGuardGet(t, r, "/v1/user/echo?space_id=sp_anything")
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "sp_anything", w.Body.String(), "no binding means nothing to conflict with")
-
-	assert.False(t, called, "an unbound key has no Space membership to verify")
+	assert.False(t, called, "the refusal must not cost a membership lookup")
 }
 
 // F1 / YUJ-58 — the key's owner must still be a live member of the bound Space.

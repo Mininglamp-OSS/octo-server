@@ -223,14 +223,23 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	// 复用后 actor 仍是真人而非 bot。search 带上 human 侧同一条 per-IP 严格限流：它是
 	// 用户存在性探测面，而 uk 树的 per-uid 桶（120 req/min）比 human 的 30 req/min 宽松，
 	// 缺这一层会让自动化路径成为更省力的枚举入口。
+	//
+	// 两条路由的租户锚点不同，故 Tenant 声明不同：
+	//   /users/:uid  → handler 不读请求 Space，注入对它是 no-op，必须靠路由自己的
+	//                  requireBoundSpaceMember 把目标 UID 限制在绑定 Space 内。
+	//   /user/search → handler 直接读 query 的 space_id，enforceKeySpace 已把它钉成
+	//                  绑定值，注入即约束（"按该 Space 过滤"分支只返回该 Space 成员）。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
-		Method:  http.MethodGet,
-		Path:    "/users/:uid",
-		Handler: u.get,
+		Method:      http.MethodGet,
+		Path:        "/users/:uid",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{u.requireBoundSpaceMember()},
+		Handler:     u.get,
 	})
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:      http.MethodGet,
 		Path:        "/user/search",
+		Tenant:      authtree.ScopeRouteGuard,
 		Middlewares: []wkhttp.HandlerFunc{searchLimit},
 		Handler:     u.search,
 	})

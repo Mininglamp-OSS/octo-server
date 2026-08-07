@@ -286,22 +286,22 @@ func TestUserKeyPersonMessageIsolatesCrossSpaceForFriends(t *testing.T) {
 	assert.NotContains(t, cross.Body.String(), "hello")
 }
 
-// TestUserKeyPersonMessageSpaceUnboundKeyIsLegacyCompatibilityPath pins the
-// behaviour of a key issued before Space binding existed, so the exception stays
-// visible instead of being rediscovered as a hole.
+// TestUserKeyPersonMessageSpaceUnboundKeyIsRefused pins the fail-closed posture
+// for a key issued before Space binding existed (PR #713 review, Jerry-Xin
+// blocker 3 / lml2468 P0).
 //
-// Such a key carries no Space, so BoundSpaceContext has nothing to publish and
-// the handler takes its empty-Space compatibility path — the same one a session
-// without a verified Space takes: no per-message Space filter at all, with the
-// DM open on the friendship alone. The cross-Space-labelled message is therefore
-// READABLE here and refused for the space-bound key on the identical fixtures,
-// and the only difference between the two requests is the key's binding.
+// Such a key carries no Space, so there is no tenant to enforce and nothing for
+// BoundSpaceContext to publish. Letting it through would hand the handler an empty
+// Space, which takes the compatibility path that skips per-message Space filtering
+// entirely — a credential whose stated guarantee is tenant confinement would then
+// read a message labelled for another Space on the friendship alone. enforceKeySpace
+// therefore refuses it with 403 before the handler runs.
 //
-// This is backwards compatibility, NOT the recommended posture: keys issued today
-// bind a Space and get the isolation asserted by the two tests above. If key
-// issuance is ever tightened to require a Space, this test should be deleted
-// along with the compatibility path — not relaxed.
-func TestUserKeyPersonMessageSpaceUnboundKeyIsLegacyCompatibilityPath(t *testing.T) {
+// This is not a back-compat break: these upstream routes did not exist before this
+// change, so no unbound key ever had access to lose. The space-bound key is refused
+// on the same fixtures too, with the handler's own 404 — the two credentials differ
+// only in binding, and neither can read across the boundary.
+func TestUserKeyPersonMessageSpaceUnboundKeyIsRefused(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
 	owner := "u_" + util.GenerUUID()[:8]
@@ -327,13 +327,14 @@ func TestUserKeyPersonMessageSpaceUnboundKeyIsLegacyCompatibilityPath(t *testing
 
 	// Keys are stored per (uid, space, client) triple, so these are two distinct
 	// credentials for the same person.
-	legacy := get(mintUserAPIKey(t, ctx, owner))
-	require.Equal(t, http.StatusOK, legacy.Code,
-		"a Space-unbound key keeps the empty-Space compatibility path: %s", legacy.Body.String())
+	unbound := get(mintUserAPIKey(t, ctx, owner))
+	assert.Equal(t, http.StatusForbidden, unbound.Code,
+		"a Space-unbound key has no enforceable tenant and must be refused: %s", unbound.Body.String())
+	assert.NotContains(t, unbound.Body.String(), "hello")
 
 	bound := get(mintUserAPIKeyInSpace(t, ctx, owner, spaceID))
 	assert.NotEqual(t, http.StatusOK, bound.Code,
-		"the same fixtures must be refused once the key carries a Space: %s", bound.Body.String())
+		"the same fixtures must stay refused for a key bound elsewhere: %s", bound.Body.String())
 }
 
 // TestUserKeyPersonMessageRejectsOtherPeoplesDM keeps the anti-enumeration

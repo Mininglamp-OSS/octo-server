@@ -310,24 +310,37 @@ func TestUserKeySpaceMyRefusesRevokedBinding(t *testing.T) {
 	assert.Equal(t, "err.shared.auth.forbidden", env.Error.Code)
 }
 
-// TestUserKeySpaceMyEmptyWhenKeyHasNoBinding keeps the "0 elements, not a 500"
-// contract for the one case that still reaches boundSpaceOnly: a key with no bound
-// Space at all (historical rows with an empty space_id). There is no tenant to
-// verify, so the membership gate passes through and the handler reports an empty
-// scope — which is a legitimate state, not a failure.
-func TestUserKeySpaceMyEmptyWhenKeyHasNoBinding(t *testing.T) {
+// TestUserKeyUpstreamRefusesKeyWithNoBinding pins the fail-closed posture for a key
+// with no bound Space at all (historical rows with an empty space_id): every uk
+// upstream route refuses it (PR #713 review, Jerry-Xin blocker 3 / lml2468 P0).
+//
+// There is no tenant to enforce, so passing through would let the caller pick its
+// own tenant via space_id — fail-open tenant selection on a credential whose stated
+// guarantee is tenant confinement. These routes did not exist before this change,
+// so no unbound key loses access it previously had; /v1/user/bots* does not pass
+// through enforceKeySpace and is covered separately below.
+func TestUserKeyUpstreamRefusesKeyWithNoBinding(t *testing.T) {
 	route, ctx := newUserAPITestServer(t)
 
 	uid := "u_" + util.GenerUUID()[:8]
 	insertTestUser(t, ctx, uid, "owner")
 	spaceID := "sp_" + util.GenerUUID()[:8]
 	insertTestSpace(t, ctx, spaceID, uid)
+	groupNo := "g" + util.GenerUUID()[:12]
 
-	w := httptest.NewRecorder()
-	route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, "/v1/user/space/my",
-		mintUserAPIKeyInSpace(t, ctx, uid, ""), nil))
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.JSONEq(t, "[]", w.Body.String())
+	unboundToken := mintUserAPIKeyInSpace(t, ctx, uid, "")
+
+	for _, path := range ukUpstreamPaths(spaceID, groupNo) {
+		t.Run(path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			route.ServeHTTP(w, userAPIRequest(t, http.MethodGet, path, unboundToken, nil))
+			require.Equal(t, http.StatusForbidden, w.Code,
+				"an unbound key has no enforceable tenant and must be refused: %s", w.Body.String())
+			var env errEnvelope
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env))
+			assert.Equal(t, "err.shared.auth.forbidden", env.Error.Code)
+		})
+	}
 }
 
 // TestUserKeyBotsRoutesUnaffectedByTenantMiddleware guards the reason the tenant

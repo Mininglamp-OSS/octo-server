@@ -428,51 +428,63 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	// 取元数据。handler 的 actor 取自 GetLoginUID()：uk 树的中间件已落真人 UID；bot 树
 	// 刻意不给整组别名 uid（避免授权混淆），因此只在 authtree 的挂载点上挂 botActorUID
 	// 把 robot_id 落成 actor，于是成员校验与 visibles 过滤都按 bot 自己的可见性执行。
+	//
+	// 群 / 子区读的租户锚点是 requireBoundSpaceGroup，不是 space_id 注入：两个 handler 都
+	// 不读请求 Space，requireGroupMember 也只校验群成员资格，于是「主人同时在别的 Space
+	// 有群」就能用这把 key 跨租户读那个群。bot 树没有租户可锚（bot token 不冻结 Space、
+	// bot 无 space_member 行），按 ScopeUnscoped 显式声明，边界是 handler 自己的成员门。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
-		Method:  http.MethodGet,
-		Path:    "/groups/:group_no/messages/:message_id",
-		Handler: m.getGroupMessage,
+		Method:      http.MethodGet,
+		Path:        "/groups/:group_no/messages/:message_id",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{m.requireBoundSpaceGroup()},
+		Handler:     m.getGroupMessage,
 	})
 	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/groups/:group_no/messages/:message_id",
+		Tenant:  authtree.ScopeUnscoped,
 		Handler: m.getGroupMessage,
 	})
 	// DM 单条读。getPersonMessage 是这三种形状里唯一读 Space 的 handler：
 	// personSpaceAllows 隔离与 same-space 放行分支都走 pkg/space 的 GetSpaceID，而
 	// human 路由是靠 handler 级 SpaceMiddleware 落那个 context key 的——两棵树上都没有
 	// 它。空 Space 会让 handler 走 sync 的向前兼容路径，跳过整个 Space 过滤，所以：
-	//   uk  → BoundSpaceContext 把 key 冻结的（且已由树上 enforceKeySpace 复查过成员
-	//         资格的）Space 落进 context。**仅对绑定了 Space 的 key**：此时隔离强度与
-	//         human 带 verified Space 时相同。Space 未绑定的历史 key 没有租户可落，
-	//         与 human 不带 verified Space 一样走空 Space 兼容路径、不做 Space 过滤，
-	//         跨会话面只由下面那道 friend + 双向 blacklist 门承担——这是向后兼容的
-	//         既有口径，不是推荐姿态；新签发的 key 应当绑定 Space。
+	//   uk  → ScopeBoundSpace，挂载点据此注入 BoundSpaceContext，把 key 冻结的（且已由
+	//         树上 enforceKeySpace 复查过成员资格的）Space 落进 context，隔离强度与
+	//         human 带 verified Space 时相同。无绑定 Space 的 key 到不了这里：
+	//         enforceKeySpace 已对它们 fail-closed，因此这条路由上不存在「空 Space 走
+	//         兼容路径」的分支。
 	//   bot → 无租户可落：bot 没有 space_member 行，同样也拿不到 same-space 放行，
 	//         跨会话面由 checkPersonDMAccess 的 friend + 双向 blacklist 门承担。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
-		Method:      http.MethodGet,
-		Path:        "/messages/person/:peer_uid/:message_id",
-		Middlewares: []wkhttp.HandlerFunc{authtree.BoundSpaceContext()},
-		Handler:     m.getPersonMessage,
+		Method:  http.MethodGet,
+		Path:    "/messages/person/:peer_uid/:message_id",
+		Tenant:  authtree.ScopeBoundSpace,
+		Handler: m.getPersonMessage,
 	})
 	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/messages/person/:peer_uid/:message_id",
+		Tenant:  authtree.ScopeUnscoped,
 		Handler: m.getPersonMessage,
 	})
 	// 子区单条读与上面 human 的 groups 组共用同一个 flag：关闭时 thread 模块的 API 与
 	// archive worker 不上线，两棵树同样不得注册，否则自动化调用方拿到的是一条 human
-	// 侧并不存在的路径。getThreadMessage 不读 Space，无需 BoundSpaceContext。
+	// 侧并不存在的路径。子区无独立 Space，权威归属在父群，故与群读共用同一个 guard
+	// （路径同样带 :group_no）。
 	if threadFeatureEnabled() {
 		authtree.Add(authtree.TreeUserKey, r, authtree.Route{
-			Method:  http.MethodGet,
-			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
-			Handler: m.getThreadMessage,
+			Method:      http.MethodGet,
+			Path:        "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Tenant:      authtree.ScopeRouteGuard,
+			Middlewares: []wkhttp.HandlerFunc{m.requireBoundSpaceGroup()},
+			Handler:     m.getThreadMessage,
 		})
 		authtree.Add(authtree.TreeBotToken, r, authtree.Route{
 			Method:  http.MethodGet,
 			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Tenant:  authtree.ScopeUnscoped,
 			Handler: m.getThreadMessage,
 		})
 	}

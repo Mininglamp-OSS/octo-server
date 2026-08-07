@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,7 +42,7 @@ func get(t *testing.T, r *wkhttp.WKHttp, path string) *httptest.ResponseRecorder
 func TestAddBeforeMountIsInstalled(t *testing.T) {
 	r, group := newRouter()
 
-	Add(TreeUserKey, r, Route{Method: http.MethodGet, Path: "/early", Handler: okHandler("early")})
+	Add(TreeUserKey, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/early", Handler: okHandler("early")})
 	Mount(TreeUserKey, r, MountOn(group, stampHandler("X-Tree", "user_key")))
 
 	w := get(t, r, "/v1/tree/early")
@@ -56,7 +57,7 @@ func TestAddAfterMountIsInstalled(t *testing.T) {
 	r, group := newRouter()
 
 	Mount(TreeUserKey, r, MountOn(group, stampHandler("X-Tree", "user_key")))
-	Add(TreeUserKey, r, Route{Method: http.MethodGet, Path: "/late", Handler: okHandler("late")})
+	Add(TreeUserKey, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/late", Handler: okHandler("late")})
 
 	w := get(t, r, "/v1/tree/late")
 	require.Equal(t, http.StatusOK, w.Code)
@@ -72,6 +73,7 @@ func TestRouteMiddlewareRunsAfterTreeMiddleware(t *testing.T) {
 	Add(TreeUserKey, r, Route{
 		Method: http.MethodGet,
 		Path:   "/ordered",
+		Tenant: ScopeUnscoped,
 		Middlewares: []wkhttp.HandlerFunc{func(c *wkhttp.Context) {
 			order = append(order, "route")
 			c.Next()
@@ -97,12 +99,12 @@ func TestRoutersDoNotCrossWire(t *testing.T) {
 	r1, g1 := newRouter()
 	r2, g2 := newRouter()
 
-	Add(TreeUserKey, r1, Route{Method: http.MethodGet, Path: "/only-first", Handler: okHandler("first")})
+	Add(TreeUserKey, r1, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/only-first", Handler: okHandler("first")})
 	Mount(TreeUserKey, r1, MountOn(g1))
 
 	// Same tree, different engine: r1's contribution must not leak in, and
 	// mounting r2 must not re-touch r1.
-	Add(TreeUserKey, r2, Route{Method: http.MethodGet, Path: "/only-second", Handler: okHandler("second")})
+	Add(TreeUserKey, r2, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/only-second", Handler: okHandler("second")})
 	Mount(TreeUserKey, r2, MountOn(g2))
 
 	assert.Equal(t, http.StatusOK, get(t, r1, "/v1/tree/only-first").Code)
@@ -118,8 +120,8 @@ func TestTreesAreIndependent(t *testing.T) {
 	userGroup := r.Group("/v1/user")
 	botGroup := r.Group("/v1/bot")
 
-	Add(TreeUserKey, r, Route{Method: http.MethodGet, Path: "/shared", Handler: okHandler("user")})
-	Add(TreeBotToken, r, Route{Method: http.MethodGet, Path: "/shared", Handler: okHandler("bot")})
+	Add(TreeUserKey, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/shared", Handler: okHandler("user")})
+	Add(TreeBotToken, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/shared", Handler: okHandler("bot")})
 	Mount(TreeUserKey, r, MountOn(userGroup))
 	Mount(TreeBotToken, r, MountOn(botGroup))
 
@@ -144,7 +146,7 @@ func TestBoundSpaceID(t *testing.T) {
 	r := wkhttp.New()
 	group := r.Group("/v1/tree")
 
-	Add(TreeUserKey, r, Route{Method: http.MethodGet, Path: "/space", Handler: func(c *wkhttp.Context) {
+	Add(TreeUserKey, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/space", Handler: func(c *wkhttp.Context) {
 		c.String(http.StatusOK, BoundSpaceID(c))
 	}})
 	Mount(TreeUserKey, r, MountOn(group, func(c *wkhttp.Context) {
@@ -157,4 +159,39 @@ func TestBoundSpaceID(t *testing.T) {
 	assert.Equal(t, "sp_1", get(t, r, "/v1/tree/space?bind=sp_1").Body.String())
 	assert.Equal(t, "", get(t, r, "/v1/tree/space").Body.String(),
 		"an unbound credential must report no Space rather than a stale one")
+}
+
+// A route contributed without a Tenant declaration must fail at startup. This is
+// the guard against the PR #713 review's root finding: without it a Space-blind
+// handler mounted under a tenant middleware looks protected while silently
+// answering across tenants.
+func TestAddWithoutTenantPanics(t *testing.T) {
+	r, _ := newRouter()
+
+	assert.PanicsWithValue(t,
+		`authtree: route GET "/undeclared" has no Tenant declaration`,
+		func() {
+			Add(TreeUserKey, r, Route{Method: http.MethodGet, Path: "/undeclared", Handler: okHandler("x")})
+		})
+}
+
+// ScopeBoundSpace must be load-bearing, not documentation: declaring it is what
+// installs BoundSpaceContext, so the declaration cannot drift from the wiring.
+// ScopeUnscoped on the same tree must leave the request Space untouched.
+func TestScopeBoundSpacePublishesTenant(t *testing.T) {
+	r := wkhttp.New()
+	group := r.Group("/v1/tree")
+
+	reportSpace := func(c *wkhttp.Context) { c.String(http.StatusOK, space.GetSpaceID(c)) }
+	Add(TreeUserKey, r, Route{Tenant: ScopeBoundSpace, Method: http.MethodGet, Path: "/anchored", Handler: reportSpace})
+	Add(TreeUserKey, r, Route{Tenant: ScopeUnscoped, Method: http.MethodGet, Path: "/unscoped", Handler: reportSpace})
+	Mount(TreeUserKey, r, MountOn(group, func(c *wkhttp.Context) {
+		c.Set(CtxKeySpaceID, "sp_bound")
+		c.Next()
+	}))
+
+	assert.Equal(t, "sp_bound", get(t, r, "/v1/tree/anchored").Body.String(),
+		"a ScopeBoundSpace route must see the credential's Space as the request Space")
+	assert.Equal(t, "", get(t, r, "/v1/tree/unscoped").Body.String(),
+		"an unscoped route must not have a Space published on its behalf")
 }

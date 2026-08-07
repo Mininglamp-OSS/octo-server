@@ -18,10 +18,16 @@ const spaceIDField = "space_id"
 //
 //	space_id 不等于绑定值   → 403，直接拒绝，不做降级
 //	key 主人已不在绑定 Space → 403，fail-closed
+//	key 没有绑定 Space      → 403，fail-closed（见下）
 //	其余情况               → 把 query 的 space_id 钉成绑定值后放行
 //
-// 无绑定 Space 的 key（历史行的 space_id 为空串）没有可执行的租户，原样放行——这与
-// /v1/user/bots* 既有 handler 在绑定为空时跳过 Space 校验的口径一致，不新增放宽面。
+// 🔴 无绑定 Space 的 key（历史行 space_id 为空串）在这棵子树上一律拒绝。这里没有可执行
+// 的租户，放行等于让调用方自己用 query 的 space_id 选租户——对一条以「租户封闭」为卖点
+// 的凭据来说是 fail-open 的租户选择：user.search 会落到「按调用方给定 space_id 过滤」
+// 分支（该分支只校验目标用户属于该 Space，从不校验调用者），DM 单条读会因空 Space 跳过
+// 整个 Space 过滤。这不是向后兼容问题——本中间件只前置在 authtree 贡献的上游能力路由上
+// （见 setupUserAPIRoutes 的挂载点），那些路由在本 PR 之前并不存在，无绑定 key 从未能
+// 访问它们，收紧不构成回归；既有 /v1/user/bots* 区块不经过本中间件，不受影响。
 //
 // 成员资格必须在这里复查（YUJ-58 同款结论，与 resolveUKPrincipal 一致）。authUserAPIKey
 // 只校验 key status / integration-client enablement / user active，不问主人现在还在不在
@@ -56,7 +62,8 @@ func (bf *BotFather) enforceKeySpace() wkhttp.HandlerFunc {
 func (bf *BotFather) enforceKeySpaceWithChecker(c *wkhttp.Context, checkMembership spacepkg.MembershipChecker) {
 	bound := authtree.BoundSpaceID(c)
 	if bound == "" {
-		c.Next()
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
+		c.Abort()
 		return
 	}
 

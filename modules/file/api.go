@@ -93,14 +93,22 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 	// 同两条预签名端点开放给 User API Key（`uk_*`）树，供 octo-drive / octo-cli 以真人
 	// 身份直传与下载。两个 handler 只读 query 参数、不读登录身份，因此 actor 语义与
 	// session 路径完全一致；授权、限流与租户校验由 botfather 侧的 uk 中间件承担。
+	//
+	// ScopeUnscoped 是显式声明而非遗漏：这两个 handler 签的是对象路径，不消费任何身份或
+	// Space，所以 space_id 注入无法授权一个对象 key。这里的暴露面与 human session 路径
+	// 逐字相同（上面 auth 组的同两条端点也不做对象归属校验），本 PR 采用既有 human
+	// handler 的对象归属模型，不在此引入新的归属表或 capability token；收紧对象归属是
+	// 覆盖两条路径的独立改动，不属于本 PR 的范围。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/file/upload/presigned",
+		Tenant:  authtree.ScopeUnscoped,
 		Handler: f.getUploadCredentials,
 	})
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/file/download/url",
+		Tenant:  authtree.ScopeUnscoped,
 		Handler: f.getDownloadURL,
 	})
 }

@@ -97,6 +97,38 @@ func BoundSpaceContext() wkhttp.HandlerFunc {
 	}
 }
 
+// TenantScope declares what confines a contributed route to the credential's
+// tenant. It is required on every Route.
+//
+// Why a declaration rather than a convention. The tree prepends a tenant
+// middleware that validates and pins the request's space_id, which makes every
+// route mounted under it *look* protected. But injection only isolates a handler
+// that reads the injected value: a handler keyed on a bare :uid or :group_no
+// ignores it, and the route silently answers across tenants (PR #713 review —
+// three of the four blockers were exactly this shape). Naming the anchor forces
+// the contributor to answer "what actually confines this?" at the Add site, and
+// makes the answer reviewable in one place instead of requiring a trace into each
+// handler.
+type TenantScope string
+
+const (
+	// ScopeBoundSpace: the handler isolates on pkg/space's GetSpaceID, so
+	// publishing the credential's bound Space as the request Space is the whole
+	// anchor. MountOn injects BoundSpaceContext for these routes — declaring the
+	// scope is what installs it, so the declaration cannot drift from the wiring.
+	ScopeBoundSpace TenantScope = "bound_space"
+	// ScopeRouteGuard: the handler does not read the request Space, so the route
+	// carries its own guard in Middlewares that rejects targets outside the bound
+	// Space (see user.requireBoundSpaceMember, message.requireBoundSpaceGroup).
+	ScopeRouteGuard TenantScope = "route_guard"
+	// ScopeUnscoped: the route is deliberately NOT confined to a bound Space, and
+	// the handler's own gates (friendship, group membership, bilateral blacklist)
+	// are the entire boundary. Every TreeBotToken route is unscoped by
+	// construction — a bot token freezes no Space and a bot has no space_member
+	// row. Use it on TreeUserKey only with the reason written at the Add site.
+	ScopeUnscoped TenantScope = "unscoped"
+)
+
 // Route is one handler a module contributes to a tree.
 type Route struct {
 	// Method is an HTTP method constant. Only the verbs wkhttp.RouterGroup
@@ -105,9 +137,14 @@ type Route struct {
 	// Path is relative to the tree's group, e.g. "/file/upload/presigned"
 	// resolves to /v1/user/file/upload/presigned on TreeUserKey.
 	Path string
+	// Tenant declares what confines this route to the credential's tenant.
+	// Required: Add panics on the zero value, so a route cannot reach production
+	// without someone having answered the question.
+	Tenant TenantScope
 	// Middlewares run after the tree's own middleware and before Handler. Use it
 	// to carry route-local hardening the human route also applies (e.g. the
-	// per-IP limiter on user search), which the tree cannot know about.
+	// per-IP limiter on user search), which the tree cannot know about, and the
+	// route's own tenant guard when Tenant is ScopeRouteGuard.
 	Middlewares []wkhttp.HandlerFunc
 	// Handler is the module's bound handler method.
 	Handler wkhttp.HandlerFunc
@@ -134,7 +171,13 @@ var (
 
 // Add contributes a route to tree on router. Call it from the contributing
 // module's own Route(r), passing the same r.
+//
+// Panics on a route with no Tenant declaration: an undeclared route is a wiring
+// bug that must surface at startup, not as a cross-tenant read in production.
 func Add(tree Tree, router *wkhttp.WKHttp, route Route) {
+	if route.Tenant == "" {
+		panic(fmt.Sprintf("authtree: route %s %q has no Tenant declaration", route.Method, route.Path))
+	}
 	mu.Lock()
 	e := entryLocked(tree, router)
 	if e.mounter == nil {
@@ -176,10 +219,20 @@ func entryLocked(tree Tree, router *wkhttp.WKHttp) *entry {
 // tree-wide middleware in before. Panics on a verb wkhttp.RouterGroup cannot
 // register — a contribution with an unmountable method is a wiring bug that must
 // surface at startup, not as a 404 in production.
+//
+// A ScopeBoundSpace route gets BoundSpaceContext installed here, after the tree's
+// own middleware (which is what validates the binding) and before the route's
+// own. Injecting from the declaration rather than asking each contributor to
+// remember the middleware is what keeps the two from drifting apart. It is a
+// no-op on a tree whose credential carries no Space, so this is safe for every
+// tree.
 func MountOn(group *wkhttp.RouterGroup, before ...wkhttp.HandlerFunc) Mounter {
 	return func(route Route) {
-		handlers := make([]wkhttp.HandlerFunc, 0, len(before)+len(route.Middlewares)+1)
+		handlers := make([]wkhttp.HandlerFunc, 0, len(before)+len(route.Middlewares)+2)
 		handlers = append(handlers, before...)
+		if route.Tenant == ScopeBoundSpace {
+			handlers = append(handlers, BoundSpaceContext())
+		}
 		handlers = append(handlers, route.Middlewares...)
 		handlers = append(handlers, route.Handler)
 

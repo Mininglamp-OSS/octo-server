@@ -253,9 +253,15 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		}
 		defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
 		if derr != nil {
-			m.Warn("查询默认 Space 失败，DM 单条读无标签消息按兼容口径放行",
+			// 置空串 sentinel，不是置 spaceID。理由同 space_filter.go 的 defaultSpaceID：
+			// 置 spaceID 会让 personSpaceAllows 的规则 2（无标签 DM 只在默认 Space 向前
+			// 兼容）对任意请求 Space 恒真，把用户全部无标签 DM 历史放开到当前 Space——
+			// per-Space DM 隔离正是这条路径要建立的属性，错误路径必须偏向隐藏。spaceID
+			// 在此恒非空（外层 if 保证），故 "" 是「永不等于 spaceID」的 fail-closed
+			// sentinel：无标签 DM 本次请求返回 404，精确匹配的 DM 不受影响。
+			m.Warn("查询默认 Space 失败，DM 单条读对无标签消息 fail-closed（defaultSpaceID 置空 sentinel）",
 				zap.Error(derr), zap.String("loginUID", loginUID))
-			defaultSpaceID = spaceID
+			defaultSpaceID = ""
 		}
 		// IsSystemBot 判定基于对端 uid（peerUID），fakeChannelID 是 loginUID+peerUID
 		// 对称派生的，非 uid 直接可判。

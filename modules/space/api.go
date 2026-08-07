@@ -108,16 +108,19 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	// 成员名单与「我的空间」开放给 User API Key（`uk_*`）树，供 octo-drive / octo-cli
 	// 解析成员与当前租户。listMembers 原样复用：它的 actor 与 Space 都来自
 	// GetLoginUID() 与路径参数，而 uk 树的租户中间件会先断言路径 Space 就是 key 绑定的
-	// 那个。/space/my 不能原样复用 mySpaces —— 它无参数可校验，复用即让自动化凭据枚举
-	// 到绑定之外的空间，故换成只报告绑定 Space 的 boundSpaceOnly。
+	// 那个（ScopeRouteGuard 的 guard 即 enforceKeySpace 对 :space_id 的比对）。
+	// /space/my 不能原样复用 mySpaces —— 它无参数可校验，复用即让自动化凭据枚举到绑定
+	// 之外的空间，故换成只报告绑定 Space 的 boundSpaceOnly，租户锚点在 handler 自身。
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/space/:space_id/members",
+		Tenant:  authtree.ScopeRouteGuard,
 		Handler: s.listMembers,
 	})
 	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
 		Method:  http.MethodGet,
 		Path:    "/space/my",
+		Tenant:  authtree.ScopeRouteGuard,
 		Handler: s.boundSpaceOnly,
 	})
 
