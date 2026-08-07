@@ -528,26 +528,37 @@ func worstCasePhases(thoughtMax int) []any {
 	return phases
 }
 
-// reasoningThoughtMax is the per-version `phases[].thought` ceiling. V2/V3 pinned
-// it to the producer's observed output (280 + `…` = 281); V4 raised it to a
-// platform product cap that no longer tracks producer truncation but IS
-// calibrated against what the persistence layer can store at the worst-case
-// encoding — see TestSimplifiedSuccessorCeilingIsPersistenceSafe. Keyed
-// explicitly per version and fatal on an unknown one: a default would silently
-// bless a future version that narrowed the bound back down, since the bounds
-// table would still pass.
+// reasoningThoughtMax is the per-version `phases[].thought` *accept* ceiling —
+// the schema maxLength above which a payload is rejected outright. V2/V3 pinned it
+// to the producer's observed output (280 + `…` = 281) and have no truncation, so
+// for them accept == display. V4 separates the two: it accepts up to 4001 and
+// clamps to reasoningThoughtDisplayMax at render time, so an over-long summary
+// degrades to truncated text instead of failing the card.
+//
+// Keyed explicitly per version and fatal on an unknown one: a default would
+// silently bless a future version that narrowed the bound back down, since the
+// bounds table would still pass.
 func reasoningThoughtMax(t *testing.T, version string) int {
 	t.Helper()
 	switch version {
 	case aireasoningprocess.TemplateVersionV2, reasoningVersionV3:
 		return 281
 	case reasoningVersionV4:
-		return 400
+		return 4001
 	default:
 		t.Fatalf("reasoningThoughtMax: unhandled version %q — add its ceiling explicitly", version)
 		return 0
 	}
 }
+
+// reasoningThoughtDisplayMax is V4's rendered ceiling, declared in the schema as
+// x-octo-constraints.truncateStrings. It is what actually bounds the frame, so it
+// — not the accept ceiling — is the number the persistence budget is sized against.
+const reasoningThoughtDisplayMax = 400
+
+// reasoningThoughtTruncates reports whether a version clamps instead of rejecting
+// above its display ceiling. Only V4 does.
+func reasoningThoughtTruncates(version string) bool { return version == reasoningVersionV4 }
 
 func renderData(reg *cardtmpl.Registry, version string, state cardtmpl.State, data map[string]any) error {
 	raw, err := json.Marshal(data)

@@ -18,12 +18,12 @@ source: user
 > Status: **draft, awaiting human confirmation of the brief as a whole.** The
 > product decisions it depended on are resolved: D7 keeps `${statusGlyph}` bound,
 > D8 adopts the simplified header (so `timerText` is no longer rendered), D8b
-> keeps the `octo-*` design-system primitives out, and D3a raises
-> `phases[].thought` to 400 — a ceiling derived from the persistence layer's
-> measured budget rather than from the producer's truncation length. None of them
-> requires a consumer change, and D3a's ceiling is storage-safe at the worst-case
-> encoding, so raising the consumer's `THOUGHT_MAX` later carries no ordering
-> dependency on anything else.
+> keeps the `octo-*` design-system primitives out, and D3a gives
+> `phases[].thought` two ceilings — accept 4001, display 400 with server-side
+> truncation — so an over-long summary renders truncated instead of failing the
+> card. None of them requires a consumer change, and because the rendered frame is
+> now bounded by the display ceiling regardless of input, no caller can produce a
+> frame the persistence layer cannot hold.
 
 ## Goal
 
@@ -35,9 +35,9 @@ redesigned presentation:
 - a simplified header that drops the `${timerText}` line.
 
 Adapt that presentation onto the **existing bounded server data contract** (#667/#681), not onto the
-attachment's unbounded schema — with one deliberate widening, `phases[].thought` 281 → 400 (D3a), which
-raises a ceiling rather than removing it. Preserve all five states and the existing state-to-view/wire
-mapping:
+attachment's unbounded schema — with one deliberate change, `phases[].thought` gains a display ceiling of
+400 enforced by server-side truncation plus an accept ceiling of 4001 (D3a), so long summaries degrade
+instead of erroring. Preserve all five states and the existing state-to-view/wire mapping:
 
 | View | States | Wire profile | `0.4.0` actions |
 | --- | --- | --- | --- |
@@ -90,15 +90,16 @@ The consumer's constants and the server's schema bounds line up exactly:
 
 | `openclaw-channel-octo/src/reasoning-process.ts` | server schema bound |
 | --- | --- |
-| `THOUGHT_MAX = 280` + `…` | `thought: 281` → **widened to 400, see D3a** |
+| `THOUGHT_MAX = 280` + `…` | `thought: 281` → **accept 4001 / display 400, truncated; see D3a** |
 | `TOOL_NAME_MAX = 80` + `…` | `tool: 81` |
 | `REASONING_ID_MAX_LENGTH = 512` | `reasoningId: 512` |
 | `MAX_RENDERED_PHASES = 6` | `phases.maxItems: 6` |
 | `SUMMARY_MAX 64` + `ERROR_MAX 120` joined | `detail: 192` |
 
 Deleting them is not a gap in the handoff; it removes the contract both repos were built against. Every
-bound is therefore restored verbatim **except `thought`, which is deliberately widened** (D3a) — a widening
-is a relaxation, so it cannot reject a payload the consumer already sends.
+bound is therefore restored verbatim **except `thought`** (D3a), which stops being a shared constant
+altogether: the server accepts up to 4001 and clamps to 400 at render time, so the consumer no longer has
+to match a server number at all.
 
 ### Node budget under the new presentation
 
@@ -121,11 +122,10 @@ The aggregate cap of 13 therefore stays; it must not be relaxed as part of this 
 (`modules/bot_api/card_profile.go:149`). Moving `AdvertisedSend` to `0.4.0` propagates to the plugin with
 no plugin release, because the view/wire/state/`submit_actions` shape is unchanged.
 
-D3a does not change that: raising `thought` to 400 is a relaxation, so it cannot reject anything the
-current producer sends and the plugin keeps working untouched at `THOUGHT_MAX = 280`. Because 400 is
-storage-safe at the worst-case encoding (D3a), a later consumer-side bump to 399 needs **no** column
-migration or other precondition first — it is a plain, independently-deployable change. Server-first is
-the order being taken, and either order is safe.
+D3a does not change that: the accept ceiling rises to 4001 and anything above the 400 display ceiling is
+truncated, so nothing the plugin sends at `THOUGHT_MAX = 280` is affected. If the consumer ever raises that
+constant it no longer needs to match the server's number — any value up to 4001 is accepted and clamped —
+which removes the cross-repo arithmetic that caused two rounds of correction here.
 
 ### Why a release, not a hot update
 
@@ -184,7 +184,7 @@ provenance) and is out of scope here.
 - Retain the `traceExpanded`/`traceCollapsed` mutual-exclusion `oneOf` and the state-conditional
   `required` blocks unchanged.
 
-### D3a — `thought` ceiling stops mirroring the producer, and is calibrated against the store
+### D3a — `thought` gets two ceilings: accept 4001, display 400 with server-side truncation
 
 `0.2.0`/`0.3.0` pinned `thought: 281` because that was the producer's *observed* output at the time
 (`THOUGHT_MAX = 280` + `…`, per the `cardtmpl-reasoning-schema-successor` brief's D2 table, sourced from
@@ -199,79 +199,84 @@ contract. Two problems follow from keeping it:
 - **It caps a product surface at an implementation detail.** 280 characters is roughly two sentences;
   the field is the user-facing summary of a reasoning phase.
 
-**The ceiling is `400`, and the number is set by the persistence layer, not by the producer.** This is
-the whole point of the decision and it took two review rounds to get right (see below): the binding
-constraint is not `cardmsg.MaxPayloadBytes` but the MySQL `TEXT` column the frame is stored in.
+**The fix is not a bigger number, it is separating two different ceilings** — an accept ceiling and a
+display ceiling. Rejecting an over-long summary fails the whole card; truncating it costs the reader some
+tail text. For a *display* field the second is obviously right, and it was the requirement: "≤ 400 is
+fine, truncate above it server-side, don't error."
 
-#### The two ceilings
+| | value | enforced by | behaviour |
+| --- | --- | --- | --- |
+| **display ceiling** | **400 code points** | `x-octo-constraints.truncateStrings`, applied in `jsonTemplate.Build` after validation | over-long text renders as 399 runes + `…` |
+| **accept ceiling** | **4001 code points** | schema `maxLength` | above this, `ErrFieldsInvalid` — truncation is not a licence for unbounded input, and `RequireBoundedSchema` needs a bound |
 
-`cardmsg.MaxPayloadBytes` (512 KiB) is the only size gate a rendered frame *passes*
-(`pkg/cardmsg/validate.go:30`). It is not the smallest one downstream. The authoritative write on the bot
-edit path stores the whole marshalled frame in `message_extra.content_edit`, a MySQL **`TEXT` column =
-65,535 bytes** (`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later
-migration; `octo_message_card_revision.content` is `TEXT` too). That width is discovered only at `INSERT`
-time — as `Data too long for column` under `STRICT_TRANS_TABLES`, or a silent truncation into invalid JSON
-without it.
+Measured behaviour (`TestSimplifiedSuccessorTruncatesThought`):
 
-#### Measured budget
+| input | result |
+| --- | --- |
+| ≤ 400 | rendered untouched, no ellipsis |
+| 401 … 4001 | clamped to 399 runes + `…`; **frame size becomes constant** regardless of input length |
+| ≥ 4002 | `ErrFieldsInvalid` |
 
-Worst case the schema admits (6 phases / 13 aggregate actions / every other string at its own max), max
-across the five states. Two encodings, because JSON Schema counts **code points** while the column counts
-**bytes** and Go escapes `<`, `>`, `&`, U+2028, U+2029 to six bytes each — so a CJK fixture is *not* the
-byte worst case, and neither is escaping `thought` alone:
+#### Why this is the persistence-safe shape, not just the friendlier one
 
-| `thought` | frame (CJK) | frame (every free string escaped) | share of the 64 KiB column | headroom |
-| --- | --- | --- | --- | --- |
-| 281 (V3's bound) | 35,076 B | 52,104 B | 79.5% | 13,431 B |
-| **400 (V4)** | **37,218 B** | **56,388 B** | **86.0%** | **9,147 B** |
-| 512 | — | 60,420 B | 92.2% | 5,115 B |
-| 600 | — | 63,588 B | 97.0% | 1,947 B |
-| 654 | — | 65,532 B | 100.0% | 3 B |
-| 4001 (first attempt) | 102,036 B | 186,024 B | **284%** | **over by 120,489 B** |
+The binding ceiling for this card is not `cardmsg.MaxPayloadBytes` (512 KiB, the only size gate a rendered
+frame passes, `pkg/cardmsg/validate.go:30`). The authoritative bot-edit write stores the whole marshalled
+frame in `message_extra.content_edit`, a MySQL **`TEXT` column = 65,535 bytes**
+(`modules/message/sql/20220414000001_message_legacy01.sql:3`, never widened by any later migration;
+`octo_message_card_revision.content` is `TEXT` too). That width is discovered only at `INSERT` — as
+`Data too long for column` under `STRICT_TRANS_TABLES`, or a silent truncation into invalid JSON without it.
 
-The escaped-baseline at `thought = 1` is already **42,024 B — 64% of the column**. That is the real
-finding: this card is close to full at the worst-case encoding before `thought` contributes anything, so
-a large widening is not available at all under a `TEXT` column. `400` was chosen to leave ~14% headroom
-rather than to maximise the number; `654` is the arithmetic limit and would be another zero-headroom
-design, which is exactly the mistake this decision exists to correct.
+Earlier attempts got this wrong twice. First `4001` was set as a plain `maxLength` on the theory that
+512 KiB left ~4× headroom; against the real column the frame was 1.56× over with CJK and **2.84× over
+(186,024 B)** with every free string escaped. Then `400` was set as a plain `maxLength`, which was safe but
+turned every long summary into a failed card.
 
-`400` is 1.42× the producer's current cap. Modest, but it breaks the coupling — the ceiling is now
-derived from a measured storage budget rather than from `THOUGHT_MAX + 1`, so a producer-side truncation
-change no longer silently invalidates it.
+With a display ceiling the guarantee is stronger than either: **the rendered frame's size no longer depends
+on what the caller sends.** Worst case the schema admits (6 phases / 13 aggregate actions / every other
+string at max, max across five states), with every free string escaped to 6 bytes per code point:
 
-`MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — longer text adds no nodes, so the node budget
-in the section above is unaffected and the aggregate cap of 13 still stands unchanged.
+| `thought` input | rendered frame | share of the 64 KiB column |
+| --- | --- | --- |
+| 281 (V3's bound) | 52,104 B | 79.5% |
+| **400 (display ceiling)** | **56,388 B** | **86.0%** |
+| 4001 (accept ceiling) | **56,388 B — truncation makes it identical** | 86.0% |
 
-#### Why not 4001, and why not a frame-size gate
+So a bot cannot produce a frame the store cannot hold, whatever it sends. That is what
+`TestSimplifiedSuccessorCeilingIsPersistenceSafe` asserts, and it now feeds the *accept* ceiling in to
+prove it — the earlier version could only assert it for the one input length the schema happened to allow.
 
-The first attempt set `4001` (`4000 + …`) on the reasoning that 512 KiB left ~4× headroom. Review showed
-that was measured against the wrong ceiling. A second attempt kept `4001` and proposed rejecting oversized
-frames at the persistence boundary; that is strictly worse than lowering the bound, because the advertised
-contract would still promise 4001 while the server refused most of it — the schema is published to
-**every** bot via `/v1/bot/card/profile` (alongside `"max_payload_bytes": 524288`, which actively suggests
-there is room), not just to the one cooperative plugin. A contract that admits what the store cannot hold
-is a defect regardless of how politely the write fails.
+Note the escaped baseline at `thought = 1` is already **42,024 B, 64% of the column**: 13 actions ×
+(`tool` 81 + `detail` 192) is most of the frame. That is why 400 rather than something larger — 654 is the
+arithmetic limit for the display ceiling and would leave no headroom, which is the mistake this decision
+exists to correct. A display ceiling in the thousands still needs the `MEDIUMTEXT` widening first (own
+brief; `message_extra` is a large hot table) and then a `0.5.0`, because `0.4.0`'s bytes are immutable.
 
-Getting `thought` to a few thousand code points therefore requires widening
-`message_extra.content_edit` and `octo_message_card_revision.content` (e.g. `MEDIUMTEXT`) **first**, and
-then a `0.5.0` to raise the bound — `0.4.0`'s bytes are immutable once shipped. `message_extra` is a large
-hot table, so that `MODIFY COLUMN` rebuild needs its own brief and rollout plan and is explicitly out of
-scope here. Note the 512-KiB-gate-vs-64-KiB-column mismatch is pre-existing platform debt, not created
-here: `modules/message/api.go:60` (`hardParsePayloadLimit`) already admits 1 MiB of RichText into the same
-column.
+`MaxNodes = 200` / `MaxDepth = 16` are *structural* limits — text length adds no nodes, so the node budget
+in the section above is unaffected and the aggregate cap of 13 stands unchanged.
+
+#### The engine capability this needs
+
+`x-octo-constraints.truncateStrings` is new in `pkg/cardtmpl` (parsed alongside the existing
+`aggregateArrayLimits`, applied in `jsonTemplate.Build` before expansion). Deliberate properties:
+
+- **Opt-in per field.** Anything not named keeps the fail-close behaviour, so this cannot silently soften
+  a bound nobody asked to soften. V1–V3 declare nothing and are unchanged.
+- **Counted in code points**, matching `maxLength`'s unit — cutting by byte would split a rune.
+- **The ellipsis counts toward the ceiling**, so the result is never longer than declared.
+- **Compile-time validation** refuses a declaration whose display ceiling exceeds the field's `maxLength`
+  (the value would be rejected before truncation could apply), that points at a missing or non-string
+  field, whose ellipsis alone would fill the budget, or that carries an unknown key.
 
 #### Consumer impact
 
-None required, and none implied. `400` is a relaxation, so it cannot reject anything the plugin sends at
-`THOUGHT_MAX = 280`. If the consumer ever raises that constant it must stay at or below 400 minus its own
-ellipsis, and the same two encoding hazards apply: grapheme-aware truncation would overshoot (one grapheme
-can be many code points), and `...` instead of `…` breaks the `+1` arithmetic.
+None required. The plugin keeps truncating at `THOUGHT_MAX = 280` and nothing changes for it. If it ever
+raises that constant it no longer has to match the server's number at all — anything up to 4001 is accepted
+and clamped, so the two repos stop being coupled through this bound. That is the actual win over a plain
+`maxLength`: the cross-repo arithmetic that caused all of this goes away.
 
-Only `thought` moves. `tool: 81`, `detail: 192`, and `errorMessage: 121` carry the same zero-headroom
-design and are knowingly left alone — `tool` is the most exposed of them (MCP tool names can exceed 80),
-and revisiting them is a follow-up decision, not an unstated part of this change. Note they are also part
-of why the escaped baseline is already 64%: 13 actions × (81 + 192) code points is a large share of the
-frame.
+Only `thought` is declared truncatable. `tool: 81`, `detail: 192`, and `errorMessage: 121` keep the
+zero-headroom fail-close design and are knowingly left alone — `tool` is the most exposed (MCP tool names
+can exceed 80). Extending truncation to them is a follow-up decision, not an unstated part of this change.
 
 ### D4a — The chevrons fetch icons from a third-party CDN; accepted here, disclosed and owned
 
@@ -420,9 +425,9 @@ status badge, or a footer surface on this card. **This is intentional and is kep
   cannot change. The redesign requires a new exact version, never an in-place edit of `0.3.0`.
 - **L2 bounded producer contract (`cardtmpl`, `trust-boundary`)** — every `maxLength`/`maxItems` value, the
   `phases[].actions` aggregate cap of 13, and fail-close schema classification survive verbatim, with
-  `thought`'s single deliberate widening to 400 (D3a) as the sole exception. The attachment's *unbounded*
-  schema must not replace them: widening a ceiling is not the same as removing it, and every field —
-  `thought` included — stays bounded on both ends.
+  `thought`'s accept/display split (D3a) as the sole exception. The attachment's *unbounded* schema must not
+  replace them: raising an accept ceiling while clamping the rendered value is not the same as removing a
+  bound, and every field — `thought` included — stays bounded on both ends.
 - **L3 card node/depth budget (`wire-contract`, `trust-boundary`)** — the richer per-phase markup must stay
   inside `cardmsg.MaxNodes = 200` / `MaxDepth = 16` at the worst case the schema still admits.
 - **L4 interaction truth (`cardtmpl`, `wire-contract`)** — templates, reports, goldens,
@@ -465,7 +470,7 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 - Importing `render-profile/` package files or reconciling its `maxDepth: 24` with `cardmsg.MaxDepth = 16`.
 - Relaxing any bound other than `thought` (`phases.maxItems`, `actions.maxItems`, aggregate 13, or any
   other `maxLength` — including the same-shaped `tool: 81` / `detail: 192` / `errorMessage: 121`), or
-  raising `cardmsg.MaxNodes`. The `thought` widening to 400 is in scope and specified in D3a.
+  raising `cardmsg.MaxNodes`. The `thought` accept/display split is in scope and specified in D3a.
 - Widening `message_extra.content_edit` / `octo_message_card_revision.content` to `MEDIUMTEXT`. That is
   what a `thought` ceiling in the thousands would require, and `message_extra` is a large hot table, so
   the `MODIFY COLUMN` rebuild needs its own brief and rollout plan. D3a records it as the precondition for
@@ -492,10 +497,18 @@ status badge, or a footer surface on this card. **This is intentional and is kep
 ### B. Bounded contract preserved
 
 - [ ] V4 schema retains every `0.3.0` bound and the `x-octo-constraints` aggregate cap of 13; the only
-  deltas are `timerText` optionality, `thought`'s widening to 400, and documentation text. A test asserts
-  bound-by-bound equality with the V3 schema rather than comparing whole files.
-- [ ] `thought` is `400` in V4 and still `281` in V3, is a strict widening, and remains bounded on both
-  ends (D3a) — so a later edit cannot narrow it back or drop the bound unnoticed.
+  deltas are `timerText` optionality, `thought`'s accept ceiling plus its `truncateStrings` declaration, and
+  documentation text. A test asserts bound-by-bound equality with the V3 schema rather than comparing whole
+  files, and asserts V3 declares no `truncateStrings` (it stays frozen fail-close).
+- [ ] `thought` declares an accept ceiling of 4001 (schema `maxLength`) and a display ceiling of 400
+  (`x-octo-constraints.truncateStrings`), V3 is still 281 with no truncation, and the display ceiling is
+  asserted to sit under the accept ceiling so the value cannot be rejected before truncation applies.
+- [ ] Rendering asserts the three-way behaviour: at or below 400 untouched, 401…4001 clamped to
+  399 runes + `…` (never rejected), ≥ 4002 rejected with `ErrFieldsInvalid`. V2/V3 are asserted to still
+  reject one rune over their own ceiling.
+- [ ] The engine refuses malformed `truncateStrings` declarations at compile time — display ceiling above
+  the accept ceiling, missing or non-string target, ellipsis filling the whole budget, non-positive
+  `maxRunes`, unknown keys.
 - [ ] Every string/array/aggregate `limit+1` case is rejected with `ErrFieldsInvalid` before template
   expansion; every exact-limit case renders. The `thought` limit is resolved per version, so V2/V3 keep
   asserting 281 while V4 asserts 400.

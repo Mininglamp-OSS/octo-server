@@ -123,8 +123,24 @@ func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 		}
 	}
 
-	if got, want := canon(t, v4["x-octo-constraints"]), canon(t, v3["x-octo-constraints"]); got != want {
-		t.Fatalf("x-octo-constraints drifted\ngot=%s\nwant=%s", got, want)
+	// The aggregate cap must be verbatim; V4 additionally declares truncateStrings,
+	// which V3 has no equivalent for (see TestSimplifiedSuccessorTruncatesThought).
+	v3Constraints, _ := v3["x-octo-constraints"].(map[string]any)
+	v4Constraints, _ := v4["x-octo-constraints"].(map[string]any)
+	if v3Constraints == nil || v4Constraints == nil {
+		t.Fatal("both schemas must declare x-octo-constraints")
+	}
+	if got, want := canon(t, v4Constraints["aggregateArrayLimits"]),
+		canon(t, v3Constraints["aggregateArrayLimits"]); got != want {
+		t.Fatalf("aggregateArrayLimits drifted\ngot=%s\nwant=%s", got, want)
+	}
+	for key := range v3Constraints {
+		if _, present := v4Constraints[key]; !present {
+			t.Fatalf("V4 x-octo-constraints dropped %q", key)
+		}
+	}
+	if _, present := v3Constraints["truncateStrings"]; present {
+		t.Fatal("V3 must not declare truncateStrings; it is frozen with fail-close bounds")
 	}
 
 	// D3: read by no template, sent by no producer.
@@ -132,6 +148,127 @@ func TestSimplifiedSuccessorKeepsV3Bounds(t *testing.T) {
 	if properties, _ := items.(map[string]any); properties != nil {
 		if _, exists := properties["phaseState"]; exists {
 			t.Fatal("V4 schema must not carry phaseState")
+		}
+	}
+}
+
+// D3a: `thought` separates two ceilings. The schema's `maxLength` is the *accept*
+// ceiling — a pathological payload is still refused, and an unbounded string would
+// fail RequireBoundedSchema. The narrower *display* ceiling is declared in
+// x-octo-constraints.truncateStrings and applied after validation, so a long
+// summary renders truncated instead of failing the card. Callers asked for
+// "<= 400 is fine, truncate above it, don't error".
+func TestSimplifiedSuccessorTruncatesThought(t *testing.T) {
+	reg := newRegistry(t)
+	display := reasoningThoughtDisplayMax
+	accept := reasoningThoughtMax(t, reasoningVersionV4)
+
+	// The schema must declare both, and the display ceiling must sit under the
+	// accept ceiling — otherwise the value is rejected before truncation applies.
+	schema := readAssetMap(t, reasoningRootV4+"/contract/data.schema.json")
+	thought, _ := lookupPath(schema, []string{"properties", "phases", "items", "properties", "thought"})
+	thoughtSpec, _ := thought.(map[string]any)
+	if thoughtSpec == nil {
+		t.Fatal("thought missing from V4 schema")
+	}
+	if got := jsonNumber(t, thoughtSpec["maxLength"]); got != accept {
+		t.Fatalf("thought accept ceiling = %d, want %d", got, accept)
+	}
+	constraints, _ := schema["x-octo-constraints"].(map[string]any)
+	declared, _ := constraints["truncateStrings"].([]any)
+	if len(declared) != 1 {
+		t.Fatalf("truncateStrings = %v, want exactly the thought entry", declared)
+	}
+	entry, _ := declared[0].(map[string]any)
+	if got, _ := entry["arrayField"].(string); got != "phases" {
+		t.Fatalf("truncateStrings[0].arrayField = %q, want phases", got)
+	}
+	if got, _ := entry["field"].(string); got != "thought" {
+		t.Fatalf("truncateStrings[0].field = %q, want thought", got)
+	}
+	if got := jsonNumber(t, entry["maxRunes"]); got != display {
+		t.Fatalf("truncateStrings[0].maxRunes = %d, want %d", got, display)
+	}
+	ellipsis, _ := entry["ellipsis"].(string)
+	if ellipsis == "" {
+		t.Fatal("truncateStrings[0].ellipsis must be set so a cut is visible to the reader")
+	}
+
+	renderedThoughtRunes := func(t *testing.T, input string) (int, bool) {
+		t.Helper()
+		data := readSampleMap(t, reasoningRootV4, "reasoning")
+		setFirstThought(data, input)
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+			reasoningVersionV4, "reasoning", raw, cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+		if err != nil {
+			t.Fatalf("input of %d runes rejected: %v", len([]rune(input)), err)
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The fixture rune repeats, so the longest run in the frame is the thought.
+		longest, run := 0, 0
+		for _, r := range string(encoded) {
+			if r == '思' {
+				run++
+				if run > longest {
+					longest = run
+				}
+				continue
+			}
+			run = 0
+		}
+		return longest, strings.Contains(string(encoded), "思"+ellipsis)
+	}
+
+	// At or below the display ceiling: untouched, no ellipsis.
+	for _, n := range []int{1, display - 1, display} {
+		got, cut := renderedThoughtRunes(t, strings.Repeat("思", n))
+		if got != n || cut {
+			t.Fatalf("input %d runes rendered %d runes (truncated=%v), want %d untouched", n, got, cut, n)
+		}
+	}
+
+	// Above it, up to the accept ceiling: clamped to exactly the display ceiling
+	// including the ellipsis, and never rejected.
+	for _, n := range []int{display + 1, display * 2, accept} {
+		got, cut := renderedThoughtRunes(t, strings.Repeat("思", n))
+		if !cut {
+			t.Fatalf("input %d runes was not truncated; the reader gets no cut marker", n)
+		}
+		if want := display - len([]rune(ellipsis)); got != want {
+			t.Fatalf("input %d runes rendered %d runes of text, want %d (+%q = %d total)",
+				n, got, want, ellipsis, display)
+		}
+	}
+
+	// Past the accept ceiling it is still refused — truncation is not a licence for
+	// unbounded input.
+	data := readSampleMap(t, reasoningRootV4, "reasoning")
+	setFirstThought(data, strings.Repeat("思", accept+1))
+	if err := renderData(reg, reasoningVersionV4, "reasoning", data); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+		t.Fatalf("input of %d runes error = %v, want ErrFieldsInvalid", accept+1, err)
+	}
+
+	// V2/V3 are frozen fail-close: no truncation, so the accept ceiling is the
+	// display ceiling and one rune over is rejected.
+	for _, version := range []string{aireasoningprocess.TemplateVersionV2, reasoningVersionV3} {
+		if reasoningThoughtTruncates(version) {
+			t.Fatalf("%s must not truncate", version)
+		}
+		root := aireasoningprocess.HandoffRootV2
+		if version == reasoningVersionV3 {
+			root = reasoningRootV3
+		}
+		frozen := readSampleMap(t, root, "reasoning")
+		setFirstThought(frozen, strings.Repeat("思", reasoningThoughtMax(t, version)+1))
+		if err := renderData(reg, version, "reasoning", frozen); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+			t.Fatalf("%s over-limit error = %v, want ErrFieldsInvalid", version, err)
 		}
 	}
 }

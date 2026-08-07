@@ -9,6 +9,14 @@
         "childArray": "actions",
         "maxTotalItems": 13
       }
+    ],
+    "truncateStrings": [
+      {
+        "arrayField": "phases",
+        "field": "thought",
+        "maxRunes": 400,
+        "ellipsis": "…"
+      }
     ]
   },
   "type": "object",
@@ -111,8 +119,8 @@
           "thought": {
             "type": "string",
             "minLength": 1,
-            "description": "该阶段面向用户的推理摘要。上限为平台产品上限，不再跟随 producer 的截断长度；已按最坏编码校准到持久化层可存储的范围内。",
-            "maxLength": 400
+            "description": "该阶段面向用户的推理摘要。展示上限 400 码点（见 x-octo-constraints.truncateStrings）；超出部分由服务端截断并追加省略号，不报错。此处的 maxLength 是受理上限，仅用于拒绝病态超长载荷。",
+            "maxLength": 4001
           },
           "actions": {
             "type": "array",
