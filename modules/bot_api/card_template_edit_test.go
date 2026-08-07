@@ -657,13 +657,13 @@ func TestBotRawEditRejectsCatalogProvenanceMarkers(t *testing.T) {
 	// The raw-edit guard treats either server-only marker as Registry
 	// authorship: a target carrying only catalog_provenance is still not
 	// raw-editable, and a raw content_edit carrying it is a forgery.
-	if !cardEnvelopeHasTemplateRef([]byte(`{"type":17,"catalog_provenance":{"version":1}}`)) {
+	if !cardEnvelopeHasCatalogMarker([]byte(`{"type":17,"catalog_provenance":{"version":1}}`)) {
 		t.Fatal("provenance-marked target not recognized as Registry-authored")
 	}
-	if !contentEditHasTemplateRef(`{"type":17,"catalog_provenance":{"version":1,"principal_type":"bot","principal_id":"x","space_id":""}}`) {
+	if !contentEditHasCatalogMarker(`{"type":17,"catalog_provenance":{"version":1,"principal_type":"bot","principal_id":"x","space_id":""}}`) {
 		t.Fatal("raw content_edit forging catalog_provenance not recognized")
 	}
-	if cardEnvelopeHasTemplateRef([]byte(`{"type":17,"card":{"body":[]}}`)) {
+	if cardEnvelopeHasCatalogMarker([]byte(`{"type":17,"card":{"body":[]}}`)) {
 		t.Fatal("legacy raw frame misclassified as Registry-authored")
 	}
 }

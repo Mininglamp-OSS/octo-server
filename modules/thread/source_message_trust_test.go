@@ -141,12 +141,26 @@ func TestCardDetectionCoversMarkerlessFrames(t *testing.T) {
 // the thread does not have. source_message_id, message_count and the preview
 // all describe the same thing, so they are derived from the same fact: whether
 // bytes were actually copied.
+//
+// The input that matters is the *inconsistent* one — a request that named a
+// source paired with nothing copied — because that is the state CreateThread
+// hands over for a refused card or a failed send. An earlier revision of this
+// test passed an already-nil id, which asserted only that nil stays nil: the
+// decision it meant to guard lived at the call site and deleting it kept the
+// test green (lml2468, review round 13). The decision now lives in the builder,
+// so driving the builder drives the decision.
 func TestThreadCreatedNotificationOmitsTheSourceWhenNothingWasCopied(t *testing.T) {
 	sourceID := int64(9001)
-	payload := buildThreadCreatedPayload("t-1", "设计评审", "g-1@t-1", "u-1", "创建者", nil, nil)
-	if _, present := payload["source_message_id"]; present {
-		t.Fatalf("a source was announced with no copy: %+v", payload["source_message_id"])
+
+	refused := buildThreadCreatedPayload("t-1", "设计评审", "g-1@t-1", "u-1", "创建者", &sourceID, nil)
+	if got, present := refused["source_message_id"]; present {
+		t.Fatalf("the parent group announced source_message_id=%v for a message the thread "+
+			"does not contain; a client following that id finds an empty thread", got)
 	}
+	if got := refused["message_count"]; got != int64(0) {
+		t.Fatalf("message_count = %v, want 0 when the copy was refused", got)
+	}
+
 	withCopy := buildThreadCreatedPayload("t-1", "设计评审", "g-1@t-1", "u-1", "创建者",
 		&sourceID, []byte(`{"type":1,"content":"文本"}`))
 	if withCopy["source_message_id"] != sourceID {

@@ -397,14 +397,11 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	}
 
 	// 在父群发送子区创建消息（同样在 fanout 之后；与 sendSourceMessage 同序约束）。
-	// 拷贝被拒绝（卡片）或发送失败时不记录 source_message_id：父群通知不应声称
-	// 一个子区里并不存在的来源。子区本身照常创建 —— 用户的主要意图是建子区，
-	// 而不是拷贝那条消息。
-	announcedSourceID := req.SourceMessageID
-	if len(copiedPayload) == 0 {
-		announcedSourceID = nil
-	}
-	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, announcedSourceID, copiedPayload)
+	// copiedPayload 为空（卡片被拒或发送失败）时，buildThreadCreatedPayload 会连
+	// 带丢掉 source_message_id：父群通知不应声称一个子区里并不存在的来源。这里
+	// 只管传「请求里的 id」和「实际拷了什么」，一致性由那一处判定，见该函数注释。
+	// 子区本身照常创建 —— 用户的主要意图是建子区，而不是拷贝那条消息。
+	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, copiedPayload)
 
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
@@ -460,7 +457,17 @@ func (s *Service) resolveCreatorBackfillSpaceID(groupNo, creatorUID string) (str
 	return creatorSpaceID, nil
 }
 
-// buildThreadCreatedPayload 构建子区创建通知消息的 payload
+// buildThreadCreatedPayload 构建子区创建通知消息的 payload。
+//
+// source_message_id、message_count、last_message 三者描述的是同一件事 —— 子区里
+// 到底有没有那条首条消息 —— 所以都由同一个事实派生：sourcePayload 是否非空。它是
+// **实际拷贝进子区的字节**，拷贝被拒（卡片）或发送失败时为空。
+//
+// 这个判断放在这里而不是调用方，是 PR-C review（lml2468）的直接结果。放在调用方
+// 时它只是一条约定：调用方忘了把 id 置空，父群就会宣告一条子区里并不存在的来源，
+// 而任何驱动本函数的测试都看不见这个错误 —— 当时那条测试正是传入已经为 nil 的 id
+// 去断言「没有 source_message_id」，删掉调用方的置空逻辑它照样绿。搬进来之后，
+// 「有 id 但没拷贝」这个不一致状态在本函数内被消解，调用方构造不出它。
 func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName string, sourceMessageID *int64, sourcePayload json.RawMessage) map[string]interface{} {
 	participants := []map[string]string{
 		{"uid": creatorUID, "name": creatorName},
@@ -478,15 +485,15 @@ func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName
 		"participants": participants,
 	}
 
-	if sourceMessageID != nil {
+	// 有拷贝才有来源。sourcePayload 来自请求，但只有在拷贝真正发出之后才会传到
+	// 这里：id、计数与预览必须描述子区里真实存在的东西，而不是调用方请求过什么。
+	copied := len(sourcePayload) > 0
+	if sourceMessageID != nil && copied {
 		payload["source_message_id"] = *sourceMessageID
 	}
 
-	// sourcePayload 是实际拷贝进子区的那段字节（未拷贝时为空）。它来自请求，
-	// 但只有在拷贝真正发出之后才会传到这里：计数与预览必须描述子区里真实存在
-	// 的东西，而不是调用方请求过什么。
 	var messageCount int64
-	if len(sourcePayload) > 0 {
+	if copied {
 		messageCount = 1
 		payload["last_message"] = map[string]interface{}{
 			"from_uid":  creatorUID,

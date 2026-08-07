@@ -917,8 +917,10 @@ func (d *DB) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
 // 者）。内容不从这里读 —— 单条消息读取要过 visibles 白名单、revoke/is_deleted、
 // message_user_extra 的按人删除、两个 offset 和 Expire 五道门，凭 message_id 直接
 // 取 payload 会绕过全部五道，等于让任何群成员凭 id 读回本群任意消息（包括已撤回
-// 的原文 —— 撤回脱敏发生在响应层，存储里原文还在）。拷贝内容改用调用方自己的字
-// 节并剥掉 server-only 标记，见 CreateThread。
+// 的原文 —— 撤回脱敏发生在响应层，存储里原文还在）。拷贝内容用调用方自己的字节，
+// 原样持久化；卡片（type-17）则整体拒绝拷贝 —— 按 key 剥掉 server-only 标记曾是
+// 中间方案，但够不到卡体内部的 metadata.octo.template，只收窄了伪造面。见
+// CreateThread。
 func (d *DB) QueryMessageFromUID(channelID string, messageID int64) (string, error) {
 	table := d.getMessageTable(channelID)
 	var fromUID string

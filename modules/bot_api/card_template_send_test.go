@@ -222,13 +222,13 @@ func TestRawContentEditCannotForgeRegistryProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contentEditHasTemplateRef(string(encoded)) {
+	if !contentEditHasCatalogMarker(string(encoded)) {
 		t.Fatal("raw content_edit provenance marker was not detected")
 	}
-	if !cardEnvelopeHasTemplateRef(encoded) {
+	if !cardEnvelopeHasCatalogMarker(encoded) {
 		t.Fatal("Registry-authored target provenance marker was not detected")
 	}
-	if contentEditHasTemplateRef(string(mustJSON(t, imCardEnvelope("raw", 1)))) {
+	if contentEditHasCatalogMarker(string(mustJSON(t, imCardEnvelope("raw", 1)))) {
 		t.Fatal("ordinary raw content_edit falsely detected as Registry provenance")
 	}
 }

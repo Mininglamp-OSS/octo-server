@@ -43,9 +43,10 @@ Three properties, each with a test that fails when its fix alone is reverted:
    reader rejects — permanently unclickable and uneditable.
    `TestSendRefusesToAuthorAMarkerItsReadersWouldReject`.
 2. **A marker cannot be forged.** No external input can carry the two keys in.
-   The four external entry points do not all achieve that the same way, and the
-   difference is worth stating because a single sentence hid a real gap for
-   three rounds: bot raw send and robot ingress **reject by key**; bot template
+   The entry points do not all achieve that the same way, and the difference is
+   worth stating because a single sentence hid a real gap for three rounds (the
+   normative per-ingress list is under Acceptance): bot raw send and robot
+   ingress **reject by key**; bot template
    mode has no such field in its request shape and the server authors the
    markers at the rendering boundary; the incoming webhook builds its envelope
    from a fixed field allowlist so caller keys never reach the top level; and
@@ -81,8 +82,30 @@ middleware, and the pilot. All of those stay in the parent task.
 
 ## Acceptance
 
-- Raw ingress carrying either key is rejected on every path (bot, robot,
-  incoming webhook, user edit).
+- **No external input can author or persist either marker.** That is the
+  invariant; "rejected by key" is only one of the ways it is met, and stating it
+  as if it were the only one is what hid a real gap for three rounds. Per
+  ingress:
+  - bot raw send / raw edit, and robot ingress — **reject the request** when
+    either key is present;
+  - bot template mode — the request shape has no such field, and the server
+    authors both markers itself at the rendering boundary;
+  - incoming webhook — builds its envelope from a fixed field allowlist
+    (`buildCardPayload`), so caller keys never reach the top level; a request
+    carrying them is **not rejected for that reason**, the keys are simply not
+    copied. The allowlist covers the two markers only: the caller still owns the
+    whole `card` node including `metadata.octo.template`. That is unchanged
+    legacy behaviour and not an impersonation — a webhook sends under its own
+    identity, and a markerless frame takes the static-`ActionContext` branch,
+    which authorizes no principal. It is the same in-body identity that made
+    key-stripping insufficient one bullet down, where the sender *is* someone
+    else's;
+  - thread source-message copy — **refuses type-17 payloads outright**, because
+    key-stripping does not reach the in-body identity
+    (`card.metadata.octo.template`) that the action route falls back to;
+  - user send / user edit — never reaches a marker question at all: cards are
+    refused as a message type (`modules/message/api.go`), both when the edit
+    body is one and when the target is.
 - Both authoring boundaries refuse to write a marker their readers reject.
 - A replacement frame cannot drop markers the stored frame carries, and the
   refusal is enforced at the mutation boundary rather than per call site.
