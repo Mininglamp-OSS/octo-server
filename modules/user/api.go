@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -216,6 +217,23 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		auth.POST("/users/:uid/avatar", u.uploadAvatar)              //上传用户头像
 		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate) // 更新用户设置
 	}
+
+	// 用户详情与用户搜索开放给 User API Key（`uk_*`）树。两个 handler 的 actor 都取自
+	// MustGet("uid") / GetLoginUID()，uk 中间件把真人 UID 落在同一个 context key，因此
+	// 复用后 actor 仍是真人而非 bot。search 带上 human 侧同一条 per-IP 严格限流：它是
+	// 用户存在性探测面，而 uk 树的 per-uid 桶（120 req/min）比 human 的 30 req/min 宽松，
+	// 缺这一层会让自动化路径成为更省力的枚举入口。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/users/:uid",
+		Handler: u.get,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/user/search",
+		Middlewares: []wkhttp.HandlerFunc{searchLimit},
+		Handler:     u.search,
+	})
 
 	user := r.Group("/v1/user", u.ctx.AuthMiddleware(r))
 	{

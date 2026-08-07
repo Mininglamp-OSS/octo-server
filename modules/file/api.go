@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -88,6 +89,20 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 		// 预签名下载 URL
 		auth.GET("/download/url", f.getDownloadURL)
 	}
+
+	// 同两条预签名端点开放给 User API Key（`uk_*`）树，供 octo-drive / octo-cli 以真人
+	// 身份直传与下载。两个 handler 只读 query 参数、不读登录身份，因此 actor 语义与
+	// session 路径完全一致；授权、限流与租户校验由 botfather 侧的 uk 中间件承担。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/file/upload/presigned",
+		Handler: f.getUploadCredentials,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/file/download/url",
+		Handler: f.getDownloadURL,
+	})
 }
 
 func (f *File) stickerUploadHandlers(r *wkhttp.WKHttp) []wkhttp.HandlerFunc {

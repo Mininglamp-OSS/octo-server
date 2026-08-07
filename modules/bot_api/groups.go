@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -301,6 +302,17 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	if limit > 200 {
 		limit = 200
 	}
+	// page 是本端点唯一的翻页出口（1-based，缺省 1）。没有它，bot 只能看到该 Space 的
+	// 前 limit 名成员：drive 的 IsSpaceMember 在满页时无法区分「不是成员」与「被截断」，
+	// 只能 fail-close 成 500，>200 人的 Space 上 bot 身份的邀请接受因此直接失败。
+	//
+	// 语义与 human 侧 listMembers 的 page 对齐。不传 page 时 OFFSET 为 0，与加分页前
+	// 完全一致；非法值（负数、非数字）也落回第一页而不是报错，保持既有的宽松解析口径。
+	page := 1
+	if p, err := strconv.Atoi(strings.TrimSpace(c.Query("page"))); err == nil && p > 1 {
+		page = p
+	}
+	offset := (page - 1) * limit
 
 	type MemberInfo struct {
 		UID   string `json:"uid"`
@@ -336,19 +348,22 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 		}
 	}
 
+	// ORDER BY sm.id：翻页必须有确定顺序，否则 page=2 可能与 page=1 重复或漏行。取
+	// AUTO_INCREMENT 主键即入库顺序，与加分页前 InnoDB 的实际扫描顺序一致，故不传 page
+	// 时返回的成员集合与次序都不变。
 	if keyword != "" {
 		// Escape LIKE wildcards in user input
 		escaped := strings.ReplaceAll(keyword, "\\", "\\\\")
 		escaped = strings.ReplaceAll(escaped, "%", "\\%")
 		escaped = strings.ReplaceAll(escaped, "_", "\\_")
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND u.name LIKE ? LIMIT ?",
-			spaceID, "%"+escaped+"%", limit,
+			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND u.name LIKE ? ORDER BY sm.id LIMIT ? OFFSET ?",
+			spaceID, "%"+escaped+"%", limit, offset,
 		).Load(&members)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 LIMIT ?",
-			spaceID, limit,
+			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 ORDER BY sm.id LIMIT ? OFFSET ?",
+			spaceID, limit, offset,
 		).Load(&members)
 	}
 	if err != nil {

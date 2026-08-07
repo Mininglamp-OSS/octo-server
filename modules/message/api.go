@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -422,6 +423,20 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 			groups.GET("/:group_no/threads/:short_id/messages/:message_id", m.getThreadMessage)
 		}
 	}
+	// 同一条群内单条消息查询开放给两棵非会话认证树，供云盘转存按 (群, 消息ID) 取元数据。
+	// handler 的 actor 取自 GetLoginUID()：uk 树的中间件已落真人 UID；bot 树刻意不给整组
+	// 别名 uid（避免授权混淆），因此只在这条路由上挂 botActorUID 把 robot_id 落成 actor，
+	// 于是成员校验与 visibles 过滤都按 bot 自己的可见性执行。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/groups/:group_no/messages/:message_id",
+		Handler: m.getGroupMessage,
+	})
+	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/groups/:group_no/messages/:message_id",
+		Handler: m.getGroupMessage,
+	})
 	m.ctx.AddMessagesListener(m.listenerMessages) // 监听消息
 	m.syncMessageReadedCount()
 }

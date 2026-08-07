@@ -32,11 +32,12 @@ func httperrLWS(c *wkhttp.Context, code codes.Code) {
 //
 // After the /v1/bot/* handlers moved to modules/bot_api (#277/#278), the only
 // migrated live HTTP surface left in botfather is Robot Apply (api_apply.go) and
-// User Bot management (api_user.go); api.go now carries only doc/init code with
-// no error responses.
+// User Bot management (api_user.go, plus the user-key tenant middleware in
+// api_user_space.go); api.go now carries only doc/init code with no error
+// responses.
 func TestBotfatherNoLegacyResponseError(t *testing.T) {
 	files := []string{
-		"api_apply.go", "api_user.go", "api_runtime_onboarding.go",
+		"api_apply.go", "api_user.go", "api_user_space.go", "api_runtime_onboarding.go",
 	}
 	banned := []string{
 		".ResponseError(",

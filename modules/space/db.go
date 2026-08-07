@@ -78,6 +78,27 @@ func (d *DB) queryMySpaces(uid string) ([]*SpaceDetailModel, error) {
 	return models, err
 }
 
+// queryMySpace 查询用户加入的指定空间（带角色和成员数）。可见性条件与 queryMySpaces
+// 完全一致（sm.status=1 AND s.status=1），只是把范围收窄到单个 space_id，供只应报告
+// 自身绑定租户的非会话凭据使用。不存在 / 已停用 / 已退出均返回 (nil, nil)。
+func (d *DB) queryMySpace(uid string, spaceID string) (*SpaceDetailModel, error) {
+	var models []*SpaceDetailModel
+	_, err := d.session.SelectBySql(`
+		SELECT s.*, sm.role,
+			(SELECT COUNT(*) FROM space_member WHERE space_id=s.space_id AND status=1) as member_count
+		FROM space s
+		INNER JOIN space_member sm ON s.space_id = sm.space_id
+		WHERE sm.uid=? AND sm.space_id=? AND sm.status=1 AND s.status=1
+	`, uid, spaceID).Load(&models)
+	if err != nil {
+		return nil, err
+	}
+	if len(models) == 0 {
+		return nil, nil
+	}
+	return models[0], nil
+}
+
 // querySpaceDetail 查询空间详情（带当前用户角色和成员数）
 func (d *DB) querySpaceDetail(spaceId string, uid string) (*SpaceDetailModel, error) {
 	var m SpaceDetailModel

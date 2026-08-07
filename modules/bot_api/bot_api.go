@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
@@ -447,6 +448,11 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		// grants on behalf of a logged-in grantor.
 		botAPI.GET("/obo-grant", ba.oboBotGetGrant)
 	}
+
+	// 由 message 模块贡献的群内单条消息查询（见 pkg/authtree 的 why）。botActorUID 只挂在
+	// 这些复用路由上、不挂整个 botAPI 组：组级别名会让组内任何调 GetLoginUID() 的 handler
+	// 静默拿到 robotID，是白担的授权混淆风险；而这些 handler 的 actor 本就应当是 bot 自己。
+	authtree.Mount(authtree.TreeBotToken, r, authtree.MountOn(botAPI, ba.botActorUID()))
 
 	// Bot File API (separate group for wildcard conflict avoidance)
 	botFileAPI := r.Group("/v1/botfile", ba.authBot())
