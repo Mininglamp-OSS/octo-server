@@ -15,9 +15,11 @@ source: user
 > One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for
 > the work. AI may draft it from existing code; a human confirms it.
 >
-> Status: **draft, awaiting human confirmation.** Two product decisions (D7
-> `statusGlyph`, D8 `timerText`) are called out below and must be resolved before
-> `/octospec-go`.
+> Status: **draft, awaiting human confirmation of the brief as a whole.** The
+> product decisions it depended on are resolved: D7 keeps `${statusGlyph}` bound,
+> D8 adopts the simplified header (so `timerText` is no longer rendered), and D8b
+> keeps the `octo-*` design-system primitives out. No consumer change is implied
+> by any of them.
 
 ## Goal
 
@@ -135,7 +137,9 @@ provenance) and is out of scope here.
 
 - Add `pkg/cardtmpl/ai_reasoning_process/handoff/ai.reasoning-process@0.4.0/`.
 - `id` stays `ai.reasoning-process`; `version` becomes `0.4.0`.
-- Adopt the attachment's `contractVersion=1.2.0` and `renderProfile=octo-chat@1.2.0-rc.2`; keep
+- Adopt the attachment's `contractVersion=1.2.0` (justified by D8's `required` relaxation, the one real
+  data-contract delta) and `renderProfile=octo-chat@1.2.0-rc.2` (provenance only — the server never
+  validates it and the wire carries `renderProfileCompatibility=octo-chat/v1` instead); keep
   `renderProfileCompatibility=octo-chat/v1`, `adaptiveCardVersion=1.5`, `defaultLocale=zh-CN`.
 - Restore `owner=ai` and `protocol=octo-card@1.0`. Omit `actionType` — with no `Action.Submit`,
   `TemplateMeta.ActionContract` must stay nil.
@@ -151,6 +155,11 @@ provenance) and is out of scope here.
 - Start from the frozen `0.3.0` schema and apply only these deltas:
   - `timerText` moves from `required` to optional (relaxation; see D8);
   - descriptions/examples updated to match the new presentation.
+- **`timerText` must stay in `properties` even though no template binds it.** The schema root is
+  `additionalProperties: false` and the producer sends the field unconditionally
+  (`ReasoningProcessData.timerText` is non-optional), so deleting the property would reject every
+  payload the current plugin emits. Optional-but-present is the only safe shape: the template stops
+  consuming it, existing producers keep validating, and future producers may omit it.
 - Restore verbatim: every `maxLength`, `phases.maxItems: 6`, `actions.maxItems: 12`, and
   `x-octo-constraints.aggregateArrayLimits` (`phases[].actions` `maxTotalItems: 13`).
 - **Drop `phaseState`.** The attachment adds it, but no template in any view binds it and the producer
@@ -182,27 +191,49 @@ No Go code consumes it; `//go:embed all:handoff` would only grow the binary. Its
 `capabilities.json` also declares `maxDepth: 24` against this server's authoritative
 `cardmsg.MaxDepth = 16`; the divergence is reported to the front-end rather than tracked here.
 
-### D7 — `statusGlyph` (**decision required**)
+### D7 — `statusGlyph` stays data-driven (**resolved**)
 
-The new templates hardcode `•` and no longer bind `${statusGlyph}`, while the producer sends `●` and its
-local fallback renderer still draws `●` — the two render lanes would disagree. Pick one:
+The attachment hardcodes `•` in the tool rows and no longer binds `${statusGlyph}`. **Bind it again.**
 
-- **(a)** template binds `${statusGlyph}` again — smallest change, keeps lanes consistent, keeps the field
-  meaningful; or
-- **(b)** keep the hardcoded glyph and open a consumer issue to change the producer constant to `•`, and
-  drop `statusGlyph` from `required`.
+The glyph is the only per-call success/failure marker in the tool list — the producer sends `Attention`
+tone with it on a failed call — and freezing it to a lighter `•` weakens the failure signal for no gain.
+This is orthogonal to the header simplification (D8): the tool rows are behind a chevron and are the one
+place a reader is deliberately inspecting detail. `statusGlyph` therefore stays `required`.
 
-Default recommendation: **(a)**.
+Note the earlier "two render lanes would disagree" concern does **not** apply:
+`renderReasoningProcessCard` is dead code in the consumer — no production call site and not exported from
+`index.ts`, only its own test references it. No consumer change is implied either way.
 
-### D8 — `timerText` no longer rendered (**product confirmation required**)
+### D8 — Header simplification is intentional; `timerText` is not rendered (**resolved**)
 
-The new header drops the `${timerText}` line, so server-rendered cards lose `12s · 3 phases · 13 tool
-calls` and the `stopped` variant `12s · stopped at phase 3`. The schema's own description says the
-simplified card does not show it, so this reads as intentional; the producer keeps sending it harmlessly.
-Confirm the product intent before freezing `0.4.0`.
+The redesigned header deliberately drops the `${timerText}` line to slim the card down. Adopt it: do not
+restore the line, and do not restore the two-column header that carried it.
 
-Note the failure reason is **not** lost: `errorMessage` is top-level and always visible in both `0.3.0` and
-`0.4.0`, so the consumer's belt-and-braces copy in `timerText` was already redundant.
+Consequences accepted with this:
+
+- Server-rendered cards lose `12.3s · 3 phases · 9 tool calls` and the `stopped` variant
+  `6.1s · stopped at phase 1`. Elapsed time survives in `collapsedSummary`; the phase/tool counts do not.
+  They are largely redundant with the phase list the reader can expand.
+- The failure reason is **not** lost: `errorTitle`/`errorMessage` are top-level with no `isVisible`
+  binding in both `0.3.0` and `0.4.0`, so the consumer's belt-and-braces copy inside `timerText` was
+  already redundant.
+- `timerText` becomes optional but stays in the schema — see D3 for why deleting it is unsafe.
+- This relaxation of `required` is what justifies `contractVersion=1.2.0` in D1.
+
+### D8b — `octo-*` design-system primitives stay out (**resolved**)
+
+The attachment drops every `octo-surface-accent-header-*`, `octo-badge-*-status`, and
+`octo-surface-default-footer-*` id, so octo-web's `styles.css` no longer paints an accent header, a pill
+status badge, or a footer surface on this card. **This is intentional and is kept.**
+
+- It is pure presentation: no Go code reads these ids, `cardmsg` treats them as ordinary element ids
+  subject only to frame-uniqueness, and nothing on the wire or in the schema depends on them.
+- `octo-badge-*` is also used by `docs.access-request` V3 (`docs_action_v3.go`), so the reasoning card's
+  status will render as plain toned text where the docs card renders a pill. That cross-card difference is
+  accepted: the two are different genres (an in-place-updating progress card vs a static action card), and
+  a pill is heavier than the simplification is aiming for.
+- Because the rendered card is persisted immutably, revisiting this later means a new template version;
+  cards sent under `0.4.0` keep this look permanently.
 
 ### D9 — Registry and Bot cutover
 
@@ -249,8 +280,10 @@ Note the failure reason is **not** lost: `errorMessage` is top-level and always 
 ## Out of scope
 
 - Modifying any file under frozen `ai.reasoning-process@0.1.0`, `@0.2.0`, or `@0.3.0`.
-- Any change to `openclaw-channel-octo`. The plugin requires no release for this cutover; D7(b), if
-  chosen, is filed as a separate consumer issue.
+- Any change to `openclaw-channel-octo`. The plugin requires no release for this cutover, and none of the
+  resolved decisions (D7/D8/D8b) implies one.
+- Restoring the `octo-*` primitives or the two-column header (D8b/D8). Revisiting the simplified look is a
+  future template version, not this one.
 - Hot update: enabling the runtime catalog gates, publishing V4 as a dynamic artifact, persisting an
   activation pointer, or using Activate/Rollback for built-in version selection.
 - PR-C scope — `card_template_grant`, grant/revoke APIs, dynamic Bot capability merging, trusted producer
@@ -323,9 +356,12 @@ Note the failure reason is **not** lost: `errorMessage` is top-level and always 
 - [ ] A test (or documented check) proves the plugin's compatibility filter still resolves V4: three views
   named `active`/`result`/`error` with wire profiles `octo/v2`/`octo/v1`/`octo/v2`, states as mapped, and
   `submit_actions` empty.
-- [ ] D7 resolved and reflected in both the template and the acceptance evidence; if D7(b), a consumer
-  issue is linked.
-- [ ] D8 confirmed by the product owner and recorded in the journal.
+- [ ] Every tool row binds `${statusGlyph}`; no template hardcodes a glyph (D7), and `statusGlyph`
+  remains `required`.
+- [ ] No template binds `${timerText}`, yet a payload carrying it still validates — proving the property
+  survived the `required` relaxation under `additionalProperties: false` (D3/D8).
+- [ ] No template declares an `octo-surface-*` or `octo-badge-*` id (D8b), and a rendered card is checked
+  to contain none.
 
 ### G. Gates
 
