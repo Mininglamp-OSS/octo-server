@@ -8,6 +8,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
@@ -19,10 +20,12 @@ type captureViewUpdater struct {
 	state   cardtmpl.State
 	fields  json.RawMessage
 	env     cardtmpl.BuildEnv
+	calls   int
 }
 
 func (u *captureViewUpdater) ReplaceView(_ context.Context, target cardtmpl.UpdateTarget, id cardtmpl.ID,
 	version string, state cardtmpl.State, fields json.RawMessage, env cardtmpl.BuildEnv) error {
+	u.calls++
 	u.target, u.id, u.version, u.state, u.fields, u.env = target, id, version, state, fields, env
 	return nil
 }
@@ -199,4 +202,365 @@ func TestDocsActionFinalizerV3TruncatesOversizedDisplayFields(t *testing.T) {
 	if !mut.mutated {
 		t.Fatal("mutator was never called — terminal update did not persist")
 	}
+}
+
+// ---- PR-C Slice 1 (D3/D7): the finalizer's result edit pins the version the
+// event's stored frame actually used — never a hardcoded constant, never a
+// foreign template identity. ----
+
+func storedVersionFinalizerFixture(t *testing.T) (*captureViewUpdater, *DocsActionFinalizer, cardactiondispatch.Event, cardactiondispatch.DecisionResult) {
+	t.Helper()
+	wk := newWuKongServer()
+	t.Cleanup(wk.close)
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	updater := &captureViewUpdater{}
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, &captureCardMutator{}, &capturingCardSender{})
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 42, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
+		Data: map[string]any{"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap"},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateApproved,
+		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+	}
+	return updater, finalizer, event, result
+}
+
+func TestDocsActionFinalizerUsesEventStoredTemplateVersion(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	// A dynamic pilot frame stores its own exact version in the durable event.
+	event.Card = cardactiondispatch.CardContext{
+		TemplateID: string(docsaccessrequest.TemplateID), TemplateVersion: "0.4.0-test.1", View: "pending",
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if updater.version != "0.4.0-test.1" {
+		t.Fatalf("result edit version = %q, want the event's stored exact version", updater.version)
+	}
+	if updater.id != docsaccessrequest.TemplateID {
+		t.Fatalf("result edit template = %q", updater.id)
+	}
+}
+
+func TestDocsActionFinalizerLegacyEventKeepsStaticVersion(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	// Pre-registry durable events carry no card context.
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if updater.version != docsaccessrequest.TemplateVersionV3 {
+		t.Fatalf("legacy result edit version = %q, want %q", updater.version, docsaccessrequest.TemplateVersionV3)
+	}
+}
+
+func TestDocsActionFinalizerRejectsForeignStoredTemplate(t *testing.T) {
+	updater, finalizer, event, result := storedVersionFinalizerFixture(t)
+	event.Card = cardactiondispatch.CardContext{
+		TemplateID: "summary.completed", TemplateVersion: "0.1.0", View: "default",
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err == nil {
+		t.Fatal("foreign stored template identity finalized")
+	}
+	if updater.calls != 0 {
+		t.Fatalf("foreign identity still edited the card: %d calls", updater.calls)
+	}
+}
+
+// PR-C review rounds 5 and 7 (yujiawei): the replacement route must not be
+// selected by state.
+//
+// The pending card is a Registry render and carries the server-authored
+// catalog markers; the fallback rebuilds the frame from a six-key allowlist
+// that holds neither, so routing a marked card there erased both on an ordinary
+// user click and left the identity guards in pkg/cardtmpl/updater.go inert for
+// that message. `cancelled` was the reported case and `pending` reaches the
+// same branch, so an allowlist of "states that render through the Registry"
+// would have gone stale the next time the contract grew a state — silently, in
+// the direction of erasing markers. The route turns on whether an updater
+// exists instead, and this table is what holds that shape.
+//
+// This test was written in round 7, reported as landed, and then removed by a
+// later whole-section edit in the same session. Nothing went red, because a
+// deleted test is not a failing test — which is the argument for the table
+// rather than for one more single-state case.
+func TestDocsActionFinalizerRoutesEveryStateThroughTheRegistry(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		state     cardactiondispatch.State
+		wantState cardtmpl.State
+		wantWire  string
+	}{
+		{"approved", cardactiondispatch.StateApproved, docsaccessrequest.StateApproved, "approved"},
+		{"denied", cardactiondispatch.StateDenied, docsaccessrequest.StateRejected, "rejected"},
+		{"cancelled", cardactiondispatch.StateCancelled, docsaccessrequest.StateCancelled, "cancelled"},
+		// The state that would have kept the defect alive after the cancelled
+		// fix: valid, decodable, and previously routed to the legacy rebuild.
+		{"pending", cardactiondispatch.StatePending, docsaccessrequest.StateUnavailable, "unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wk := newWuKongServer()
+			defer wk.close()
+			ctx := newTestContext(t, wk)
+			ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+			updater := &captureViewUpdater{}
+			legacyMutator := &captureCardMutator{}
+			finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
+			if err != nil {
+				t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
+			}
+			event := cardactiondispatch.Event{
+				EventID: 44, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+				MessageID: "1003", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+				OperatorUID: "reviewer-1",
+				Data: map[string]any{
+					"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
+				},
+			}
+			result := cardactiondispatch.DecisionResult{
+				Disposition: cardactiondispatch.DispositionApplied, State: test.state,
+				RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+			}
+			if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+				t.Fatalf("Finalize(%s): %v", test.state, err)
+			}
+			if len(legacyMutator.requests) != 0 {
+				t.Fatalf("%s took the marker-erasing legacy path", test.state)
+			}
+			if updater.state != test.wantState {
+				t.Fatalf("registry state = %q, want %q", updater.state, test.wantState)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(updater.fields, &fields); err != nil {
+				t.Fatalf("decode fields: %v", err)
+			}
+			if fields["state"] != test.wantWire {
+				t.Fatalf("wire state = %v, want %q", fields["state"], test.wantWire)
+			}
+			// Nobody decided cancelled or pending, so neither carries an
+			// operator: emitting one would put the generic approver placeholder
+			// on a card no one acted on.
+			_, hasDecision := fields["decision"]
+			wantDecision := test.state == cardactiondispatch.StateApproved ||
+				test.state == cardactiondispatch.StateDenied
+			if hasDecision != wantDecision {
+				t.Fatalf("decision present = %v, want %v for %s", hasDecision, wantDecision, test.state)
+			}
+		})
+	}
+}
+
+// The template must actually be able to render what the finalizer now asks of
+// it — a state the manifest does not declare fails ViewFor with ErrStateUnknown,
+// which would turn the routing fix into a runtime error instead of a card. The
+// finalizer tests above drive a capturing fake and never reach ViewFor, so this
+// is the only thing that witnesses the manifest declaration.
+func TestDocsAccessRequestV3RendersTheNonDecisionStates(t *testing.T) {
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.Freeze()
+
+	for _, test := range []struct {
+		name        string
+		input       docsResultRenderInput
+		wantState   cardtmpl.State
+		wantVariant string
+	}{
+		{
+			name:        "cancelled",
+			input:       docsResultRenderInput{Cancelled: true},
+			wantState:   docsaccessrequest.StateCancelled,
+			wantVariant: docsaccessrequest.VariantCancelled,
+		},
+		{
+			name:        "unavailable",
+			input:       docsResultRenderInput{Unavailable: true},
+			wantState:   docsaccessrequest.StateUnavailable,
+			wantVariant: docsaccessrequest.VariantUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := test.input
+			input.Data = map[string]any{"request_id": "request-1", "doc_id": "doc-1"}
+			input.Title = "Roadmap"
+			fields, state, err := buildDocsAccessResultFields("zh-CN", input)
+			if err != nil {
+				t.Fatalf("buildDocsAccessResultFields: %v", err)
+			}
+			if state != test.wantState {
+				t.Fatalf("state = %q, want %q", state, test.wantState)
+			}
+			payload, err := registry.Render(context.Background(),
+				docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, fields,
+				cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-1", WebLoginURL: "https://im.example.com/login"})
+			if err != nil {
+				t.Fatalf("render %s: %v", test.wantState, err)
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The render is what makes the markers legal on the replacement
+			// frame: only a Registry render writes metadata.octo.template, which
+			// template_ref must agree with.
+			if tmplCtx, ok := cardmsg.CardTemplateContext(raw); !ok ||
+				tmplCtx.ID != string(docsaccessrequest.TemplateID) ||
+				tmplCtx.Version != docsaccessrequest.TemplateVersionV3 {
+				t.Fatalf("%s render lost its template identity: %+v ok=%v", test.wantState, tmplCtx, ok)
+			}
+			if variant, _ := cardmsg.CardVariant(raw); variant != test.wantVariant {
+				t.Fatalf("variant = %q, want %q", variant, test.wantVariant)
+			}
+			// Nobody decided these, so they carry no operator: emitting one
+			// would put the generic approver placeholder on an untouched card.
+			var decoded map[string]any
+			if err := json.Unmarshal(fields, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := decoded["decision"]; present {
+				t.Fatalf("%s invented a decision: %+v", test.wantState, decoded["decision"])
+			}
+		})
+	}
+}
+
+// markerEnforcingCardMutator applies the production preservation rule against a
+// stored frame the test supplies. It exists because the notify package cannot
+// construct a real CardMutator (its constructor takes an unexported backend),
+// and the point of the test below is what StandardActionFinalizer's *output*
+// would do at that boundary — not what the fake does.
+//
+// It calls cardmsg.CatalogMarkersPreserved rather than restating the
+// comparison. An earlier version hand-copied the boolean logic and said it went
+// "through the same exported helper" when no such helper existed; the copy
+// inherited the original's presence-equality bug, so this fake reproduced the
+// defect instead of catching it.
+type markerEnforcingCardMutator struct {
+	stored   []byte
+	requests []carddispatch.CardMutationRequest
+}
+
+func (m *markerEnforcingCardMutator) Mutate(_ context.Context,
+	request carddispatch.CardMutationRequest) (carddispatch.CardMutationResult, error) {
+	stored, err := cardmsg.CatalogFrameMarkers(m.stored)
+	if err != nil {
+		return carddispatch.CardMutationResult{}, err
+	}
+	next, err := cardmsg.CatalogFrameMarkers([]byte(request.ContentEdit))
+	if err != nil {
+		return carddispatch.CardMutationResult{}, err
+	}
+	if err := cardmsg.CatalogMarkersPreserved(stored, next); err != nil {
+		return carddispatch.CardMutationResult{}, carddispatch.ErrCardMutationInvalid
+	}
+	m.requests = append(m.requests, request)
+	return carddispatch.CardMutationResult{Applied: true}, nil
+}
+
+// PR-C review round 7 (yujiawei): StandardActionFinalizer is the default
+// finalizer for every owner except docs, it has no updater, and it routes every
+// state — approved and denied included — through buildTerminalEnvelope.
+//
+// It is latent rather than live today, and the reason is worth pinning down
+// rather than assuming: BuildApprovalRequestCard hand-builds its document
+// without metadata.octo.protocol/template, so cardDocumentTemplateContext
+// returns false and those cards are never marked in the first place. The moment
+// any non-docs owner's card becomes a Registry render, it would be marked, and
+// this finalizer would erase the markers on every finalize.
+//
+// The mutation boundary is what stops that becoming a silent regression, so
+// this asserts the boundary refuses it — the finalizer fails loudly instead of
+// downgrading a marked card. Today's unmarked cards keep working unchanged.
+func TestStandardActionFinalizerCannotSilentlyDowngradeAMarkedCard(t *testing.T) {
+	newEvent := func() (cardactiondispatch.Event, cardactiondispatch.DecisionResult) {
+		return cardactiondispatch.Event{
+				EventID: 85, SenderUID: NotifyBotUIDValue, Owner: "tasks", ActionType: "task.decision",
+				MessageID: "2002", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+				OperatorUID: "user-b",
+			}, cardactiondispatch.DecisionResult{
+				Disposition: cardactiondispatch.DispositionApplied,
+				State:       cardactiondispatch.StateApproved, RequesterUID: "user-a",
+				Display: map[string]string{"title": "Deploy release"},
+			}
+	}
+
+	t.Run("a marked stored frame is refused, not erased", func(t *testing.T) {
+		mutator := &markerEnforcingCardMutator{stored: markedNotifyFrame(t)}
+		finalizer, err := NewStandardActionFinalizer(mutator, &capturingCardSender{})
+		if err != nil {
+			t.Fatalf("NewStandardActionFinalizer: %v", err)
+		}
+		event, result := newEvent()
+		if err := finalizer.Finalize(context.Background(), event, result); err == nil {
+			t.Fatal("a marked card was silently downgraded by the standard finalizer")
+		}
+		if len(mutator.requests) != 0 {
+			t.Fatalf("a marker-erasing frame was persisted: %+v", mutator.requests)
+		}
+	})
+
+	t.Run("today's unmarked cards are unaffected", func(t *testing.T) {
+		mutator := &markerEnforcingCardMutator{stored: unmarkedNotifyFrame(t)}
+		finalizer, err := NewStandardActionFinalizer(mutator, &capturingCardSender{})
+		if err != nil {
+			t.Fatalf("NewStandardActionFinalizer: %v", err)
+		}
+		event, result := newEvent()
+		if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+			t.Fatalf("an unmarked card must still finalize: %v", err)
+		}
+		if len(mutator.requests) != 1 {
+			t.Fatalf("mutation count = %d, want 1", len(mutator.requests))
+		}
+	})
+}
+
+func unmarkedNotifyFrame(t *testing.T) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"type": cardmsg.InteractiveCard.Int(), "card_version": cardmsg.CardVersion,
+		"profile": cardmsg.ProfileV2, "space_id": "space-1", "card_seq": 1,
+		"card": map[string]any{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []any{map[string]any{"type": "TextBlock", "text": "Deploy release"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// markedNotifyFrame is what a Registry-rendered card of this family would look
+// like: the top-level markers plus the metadata.octo.template they are checked
+// against.
+func markedNotifyFrame(t *testing.T) []byte {
+	t.Helper()
+	var frame map[string]any
+	if err := json.Unmarshal(unmarkedNotifyFrame(t), &frame); err != nil {
+		t.Fatal(err)
+	}
+	frame["card"].(map[string]any)["metadata"] = map[string]any{
+		"octo": map[string]any{
+			"protocol": "octo-card@1.0",
+			"template": map[string]any{"id": "tasks.decision", "version": "1.0.0"},
+		},
+	}
+	frame[cardmsg.CatalogTemplateRefKey] = map[string]any{"id": "tasks.decision", "version": "1.0.0"}
+	frame[cardmsg.CatalogProvenanceKey] = cardmsg.CatalogProvenance{
+		Version:       cardmsg.CatalogProvenanceVersion,
+		PrincipalType: cardmsg.CatalogPrincipalWireInternalProducer,
+		PrincipalID:   "tasks-notify",
+		SpaceID:       "space-1",
+	}.MarshalMap()
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

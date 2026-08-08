@@ -83,7 +83,7 @@ const notifyCatalogCallTimeout = 10 * time.Second
 // buildDocsFallbackText 会先调本函数,让 fallback 文本走 pilot Template 的 L0
 // 定义。Registry 未注入 / Template 未注册 / mapping/unmarshal 失败 → 返 ok=false,
 // caller 兜回 legacy 多行组装。
-func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
+func templateFallbackText(card *DocsCardFields, lang, spaceID string) (string, bool) {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return "", false
@@ -95,7 +95,7 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 	ctx, cancel := boundedNotifyCatalogContext(context.Background())
 	defer cancel()
 	text, err := catalog.FallbackText(ctx, cardtmpl.CatalogFallbackRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""),
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
 		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending,
 		Fields: fields, Lang: lang,
 	})
@@ -115,7 +115,13 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 // R2-2 修正:前版当 registry nil 时返 nil 让 caller 继续走 v2 分支,后者最终降级
 // 文本 —— 那样"错请求"仍然会成功送达一条文本,与 §10 / A14 冲突。现在 preflight
 // 阶段就报 500,让 wiring bug 立刻可见。
-func preflightDocsAccessRequestSchema(parent context.Context, card *DocsCardFields) error {
+// preflightDocsAccessRequestSchema validates the caller's fields against the
+// template contract before anything is delivered (C1). It takes the Space
+// because PR-C made template resolution Space-aware: when the activation
+// pointer resolves to a dynamic version, the producer's grant is read for this
+// Space, and preflighting against an empty Space would authorize a different
+// decision than the send that follows it.
+func preflightDocsAccessRequestSchema(parent context.Context, spaceID string, card *DocsCardFields) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -123,7 +129,7 @@ func preflightDocsAccessRequestSchema(parent context.Context, card *DocsCardFiel
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: docsaccessrequest.TemplateID,
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID), ID: docsaccessrequest.TemplateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(docsaccessrequest.TemplateID, err)
@@ -284,7 +290,12 @@ func (n *Notify) buildDocsDisplayCardViaRegistry(
 // preflightDocsDisplaySchema 与 preflightDocsAccessRequestSchema 同思路:在
 // memberCache/docsSender/gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。
 // docs.commented / docs.shared 无用户可控 URL 字段,不需要 avatar https 前置校验。
-func preflightDocsDisplaySchema(parent context.Context, card *DocsCardFields, templateID cardtmpl.ID) error {
+// spaceID is threaded for the same reason preflightDocsAccessRequestSchema
+// takes it: template resolution is Space-aware, so preflighting against an
+// empty Space would validate a different version than the send resolves.
+func preflightDocsDisplaySchema(
+	parent context.Context, spaceID string, card *DocsCardFields, templateID cardtmpl.ID,
+) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -292,7 +303,7 @@ func preflightDocsDisplaySchema(parent context.Context, card *DocsCardFields, te
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, ""), ID: templateID,
+		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID), ID: templateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(templateID, err)
@@ -473,7 +484,10 @@ func (n *Notify) buildSummaryCardViaRegistry(
 // preflightSummarySchema 与 preflightDocsDisplaySchema 同思路:在 memberCache /
 // docsSender / gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。summary 卡
 // 无用户可控 URL 字段,不需要 https 前置校验。
-func preflightSummarySchema(parent context.Context, card *SummaryCardFields, templateID cardtmpl.ID) error {
+// spaceID is threaded for the same reason the docs preflights take it.
+func preflightSummarySchema(
+	parent context.Context, spaceID string, card *SummaryCardFields, templateID cardtmpl.ID,
+) error {
 	catalog := cardtmpl.DefaultCatalog()
 	if catalog == nil {
 		return fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
@@ -481,7 +495,7 @@ func preflightSummarySchema(parent context.Context, card *SummaryCardFields, tem
 	ctx, cancel := boundedNotifyCatalogContext(parent)
 	defer cancel()
 	meta, err := catalog.MetaDefault(ctx, cardtmpl.CatalogDefaultRequest{
-		Access: notifyCatalogAccess(summaryNotifyProducerID, ""), ID: templateID,
+		Access: notifyCatalogAccess(summaryNotifyProducerID, spaceID), ID: templateID,
 	})
 	if err != nil {
 		return notifyCatalogLookupError(templateID, err)

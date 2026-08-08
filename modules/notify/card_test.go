@@ -313,7 +313,7 @@ func TestBuildDocsCard_RejectsNonHTTPSDeepLinkOrigin(t *testing.T) {
 }
 
 func TestBuildDocsFallbackText(t *testing.T) {
-	text := buildDocsFallbackText(validDocsCard(), "zh-CN")
+	text := buildDocsFallbackText(validDocsCard(), "zh-CN", "")
 	assert.Contains(t, text, "Alice 分享了文档")
 	assert.Contains(t, text, "文档：产品设计方案")
 	assert.Contains(t, text, "Q3 上线计划已确认")
@@ -331,7 +331,7 @@ func TestBuildDocsFallbackText_AccessRequestedPreservesExcerptAndTime(t *testing
 	card.Excerpt = "需要评审季度计划"
 	card.UpdatedAt = "2026-07-20 09:30"
 
-	text := buildDocsFallbackText(card, "zh-CN")
+	text := buildDocsFallbackText(card, "zh-CN", "")
 	assert.Contains(t, text, "需要评审季度计划", "access-request fallback dropped the excerpt")
 	assert.Contains(t, text, "2026-07-20 09:30", "access-request fallback dropped the time")
 	assert.Contains(t, text, "Alice", "actor should still appear")
@@ -385,7 +385,7 @@ func TestBuildDocsFallbackText_StripsNewlineInjection(t *testing.T) {
 	card := validDocsCard()
 	card.ActorName = "Alice\n系统管理员"
 	card.Title = "标题\n伪造：越权提示"
-	text := buildDocsFallbackText(card, "zh-CN")
+	text := buildDocsFallbackText(card, "zh-CN", "")
 	assert.NotContains(t, text, "\n伪造", "an embedded title newline must not start a new line")
 	assert.Contains(t, text, "Alice 系统管理员 分享了文档", "actor newline collapses to a space in the attribution")
 }
@@ -452,6 +452,37 @@ func TestIntegration_NotifyBatchRejectsCardField(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, w.Code)
 			assert.Contains(t, w.Body.String(), "err.server.notify.card_invalid")
 			assert.Zero(t, atomic.LoadInt32(&wk.messageCount))
+		})
+	}
+}
+
+// PR-C review round 7 (yujiawei P2-A): the three card ingresses rejected a
+// blank Space but not an untrimmed one, and after D3 that difference reaches
+// the caller. The marker-authoring boundary validates the Space before
+// stamping and fails the send, so an untrimmed value fanned out one goroutine
+// per target and returned HTTP 200 with every target failed as `card_invalid`
+// — N identical warn lines and nothing naming the cause.
+//
+// The value is still never rewritten. Trimming silently would deliver the
+// card into a Space the caller did not name, which is the failure the strict
+// reader exists to prevent; this only refuses earlier and says why.
+func TestCardIngressRejectsAnUntrimmedSpaceBeforeFanout(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		spaceID string
+		want    bool
+	}{
+		{"canonical", "space-1", true},
+		{"blank", "", false},
+		{"empty after trim", "   ", false},
+		{"trailing space", "space-1 ", false},
+		{"leading space", " space-1", false},
+		{"trailing newline", "space-1\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := spaceIDAcceptable(test.spaceID); got != test.want {
+				t.Fatalf("spaceIDAcceptable(%q) = %v, want %v", test.spaceID, got, test.want)
+			}
 		})
 	}
 }

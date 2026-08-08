@@ -51,10 +51,19 @@ type Event struct {
 
 // CardContext is derived from the effective server-authored card frame before
 // enqueue. Zero value means a legacy card without registry metadata.
+//
+// PrincipalType/PrincipalID/SpaceID are additive PR-C D3 fields: the action
+// ingress copies them from the frame's validated `catalog_provenance` marker
+// after proving consistency with the stored sender and authoritative Space.
+// They are absent on frames sent before provenance existed; consumers must
+// not fall back to guessing a principal from sender/owner when they are set.
 type CardContext struct {
 	TemplateID      string `json:"template_id,omitempty"`
 	TemplateVersion string `json:"template_version,omitempty"`
 	View            string `json:"view,omitempty"`
+	PrincipalType   string `json:"principal_type,omitempty"`
+	PrincipalID     string `json:"principal_id,omitempty"`
+	SpaceID         string `json:"space_id,omitempty"`
 }
 
 type CallbackFormat string

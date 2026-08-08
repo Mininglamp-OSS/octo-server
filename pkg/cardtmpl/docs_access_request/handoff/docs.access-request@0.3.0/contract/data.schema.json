@@ -6,7 +6,7 @@
   "required": ["requestId", "state", "document"],
   "properties": {
     "requestId": {"type": "string", "minLength": 1, "maxLength": 200},
-    "state": {"type": "string", "enum": ["pending", "approved", "rejected"]},
+    "state": {"type": "string", "enum": ["pending", "approved", "rejected", "cancelled", "unavailable"]},
     "document": {
       "type": "object",
       "additionalProperties": false,

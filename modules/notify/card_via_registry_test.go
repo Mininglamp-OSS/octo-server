@@ -162,10 +162,10 @@ func TestNotifyCatalogOperationsUseBoundedContexts(t *testing.T) {
 
 	parent, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := preflightDocsAccessRequestSchema(parent, card); err != nil {
+	if err := preflightDocsAccessRequestSchema(parent, "space-preflight", card); err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	if _, ok := templateFallbackText(card, "zh-CN"); !ok {
+	if _, ok := templateFallbackText(card, "zh-CN", ""); !ok {
 		t.Fatal("template fallback was unavailable")
 	}
 	n := newTestNotify(ctx, nil, nil, nil, "tk")
@@ -196,7 +196,7 @@ func TestPreflightDocsAccessRequestPreservesRuntimeCatalogFailures(t *testing.T)
 			cardtmpl.SetDefaultCatalog(&notifyFailureCatalog{Catalog: static, metaErr: cause})
 			t.Cleanup(func() { cardtmpl.SetDefaultCatalog(nil) })
 
-			err := preflightDocsAccessRequestSchema(context.Background(), validAccessRequestDocsCard())
+			err := preflightDocsAccessRequestSchema(context.Background(), "space-preflight", validAccessRequestDocsCard())
 			if !errors.Is(err, cause) {
 				t.Fatalf("preflight error = %v, want cause %v", err, cause)
 			}

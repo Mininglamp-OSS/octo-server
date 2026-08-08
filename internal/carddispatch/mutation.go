@@ -259,6 +259,67 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	if revoked || deleted {
 		return CardMutationResult{}, ErrCardMutationNotFound
 	}
+	// The server-authored catalog markers are the card's identity, and identity
+	// does not change under an edit — pkg/cardtmpl/updater.go states exactly
+	// that, but stated it only for the path that happens to go through the
+	// updater. A caller that assembles a replacement frame from its own key set
+	// simply dropped them, and every guard keyed on their presence then went
+	// inert for that message: the stored-version pin and the cross-Space
+	// refusal both begin `if markers.Has…`. A user click was enough to trigger
+	// it, so this is enforced where every replacement passes rather than at
+	// each site that builds one.
+	//
+	// Absent on both sides is the legacy population and stays legal. The rule
+	// itself lives in cardmsg.CatalogMarkersPreserved so there is one definition
+	// of it: erasure is refused, acquiring a marker on a pre-PR-C frame is
+	// allowed, and changing one where both sides carry it is refused. An earlier
+	// version compared presence for equality here, which also refused the
+	// acquire and so made every already-delivered Registry card permanently
+	// uneditable — the edit that would have added the marker was the operation
+	// being rejected.
+	//
+	// The comparison is against the *effective* frame, the same one Snapshot
+	// returns, not against message.Payload. Payload is the immutable original;
+	// edits live in message_extra.content_edit. Allowing the acquire above is
+	// exactly what makes those two diverge in markers, so reading the original
+	// here would have made the guard inert for the population the relaxation
+	// just created: a pre-PR-C frame is HasProvenance=false in the original
+	// forever, so from the second edit onward a replacement could drop the
+	// provenance the first edit added, or keep it and rewrite its values, and
+	// both clauses would compare against bytes that never change.
+	//
+	// The call is unconditional. Reading the effective frame already makes the
+	// old `if stored.HasRef || stored.HasProvenance` gate redundant rather than
+	// wrong — it is dropped because CatalogMarkersPreserved answers "nothing to
+	// preserve" for the both-absent case anyway, and a gate that skips the whole
+	// check is the shape that hid the previous defect.
+	effective, _, hasEffective, err := m.backend.EffectiveContent(request.MessageID)
+	if err != nil {
+		return CardMutationResult{}, fmt.Errorf("carddispatch: query effective card: %w", err)
+	}
+	storedFrame := message.Payload
+	if hasEffective {
+		storedFrame = []byte(effective)
+	}
+	stored, err := cardmsg.CatalogFrameMarkers(storedFrame)
+	if err != nil {
+		return CardMutationResult{}, fmt.Errorf("%w: stored frame markers: %v", ErrCardMutationInvalid, err)
+	}
+	next, err := cardmsg.CatalogFrameMarkers([]byte(request.ContentEdit))
+	if err != nil {
+		return CardMutationResult{}, fmt.Errorf("%w: replacement frame markers: %v", ErrCardMutationInvalid, err)
+	}
+	if preserveErr := cardmsg.CatalogMarkersPreserved(stored, next); preserveErr != nil {
+		return CardMutationResult{}, fmt.Errorf("%w: %v", ErrCardMutationInvalid, preserveErr)
+	}
+	// The marker check reads request.ContentEdit while the bytes that actually
+	// get persisted are `normalized`. That is safe rather than the same
+	// check-the-wrong-thing defect this guard was moved here to fix, and the
+	// reason is worth stating: NormalizeContentEdit decodes the envelope into a
+	// map, validates, finalizes and re-marshals the *whole* map, so unknown
+	// top-level keys — which is exactly what these two markers are to it —
+	// round-trip untouched. If normalization ever grows a top-level allowlist,
+	// this check has to move below it.
 	normalized, err := NormalizeFrameForPersistence(request.ContentEdit)
 	if err != nil {
 		if errors.Is(err, ErrCardMutationTooLarge) && m.logger != nil {

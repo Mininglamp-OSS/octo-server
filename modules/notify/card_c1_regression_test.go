@@ -137,7 +137,7 @@ func TestPreflightDocsAccessRequestSchema_AvatarSemantics(t *testing.T) {
 	for _, u := range bad {
 		card := validAccessRequestDocsCard()
 		card.ActorAvatarURL = u
-		if err := preflightDocsAccessRequestSchema(context.Background(), card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+		if err := preflightDocsAccessRequestSchema(context.Background(), "space-preflight", card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
 			t.Errorf("avatar %q: want ErrFieldsInvalid, got %v", u, err)
 		}
 	}
@@ -146,7 +146,7 @@ func TestPreflightDocsAccessRequestSchema_AvatarSemantics(t *testing.T) {
 	for _, u := range ok {
 		card := validAccessRequestDocsCard()
 		card.ActorAvatarURL = u
-		if err := preflightDocsAccessRequestSchema(context.Background(), card); err != nil {
+		if err := preflightDocsAccessRequestSchema(context.Background(), "space-preflight", card); err != nil {
 			t.Errorf("avatar %q: want pass, got %v", u, err)
 		}
 	}
@@ -163,7 +163,7 @@ func TestPreflight_EmitsFieldsInvalidMetric(t *testing.T) {
 
 	card := validAccessRequestDocsCard()
 	card.Title = "" // schema violation: document.title minLength=1
-	if err := preflightDocsAccessRequestSchema(context.Background(), card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+	if err := preflightDocsAccessRequestSchema(context.Background(), "space-preflight", card); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
 		t.Fatalf("want ErrFieldsInvalid, got %v", err)
 	}
 

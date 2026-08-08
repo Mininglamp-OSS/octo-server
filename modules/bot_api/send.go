@@ -130,6 +130,15 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 				return
 			}
 		} else {
+			// PR-C D3：catalog_provenance 是 server-only 顶层键，raw Bot 卡片按
+			// 键存在显式拒绝（不依赖形状校验，也不依赖客户端"不会传"）。
+			// template_ref 由上方 XOR 覆盖：出现即进 Registry 模式，raw card 共存
+			// 已被拒绝。
+			if _, forged := req.Payload[cardmsg.CatalogProvenanceKey]; forged {
+				ba.Warn("raw Bot 卡片试图伪造 catalog_provenance", zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
 			if err := cardmsg.Validate(req.Payload); err != nil {
 				ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
@@ -1045,7 +1054,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	// richtext（=14）原有路径。user/robot 编辑路径对卡片仍永久拒绝（各自守卫）。
 	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
 	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
-	if origIsCard && cardEnvelopeHasTemplateRef(msgPayload) {
+	if origIsCard && cardEnvelopeHasCatalogMarker(msgPayload) {
 		ba.Warn("raw card edit attempted to replace Registry-authored target", zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
@@ -1071,7 +1080,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
 			return
 		}
-		if contentEditHasTemplateRef(req.ContentEdit) {
+		if contentEditHasCatalogMarker(req.ContentEdit) {
 			ba.Warn("raw card edit attempted to forge Registry provenance", zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
@@ -1289,7 +1298,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
 		return
 	}
-	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref); err != nil {
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID); err != nil {
 		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
@@ -1412,16 +1421,23 @@ func effectiveEnvelopeSpaceID(raw json.RawMessage) string {
 	return spaceID
 }
 
-func contentEditHasTemplateRef(contentEdit string) bool {
-	return cardEnvelopeHasTemplateRef([]byte(contentEdit))
+func contentEditHasCatalogMarker(contentEdit string) bool {
+	return cardEnvelopeHasCatalogMarker([]byte(contentEdit))
 }
 
-func cardEnvelopeHasTemplateRef(raw []byte) bool {
+// cardEnvelopeHasCatalogMarker 报告一个信封是否携带任一 server-only catalog
+// 标记（template_ref / catalog_provenance，PR-C D3）。raw 编辑路径用它双向
+// 拒绝：目标是 Registry/internal 产出的帧 → raw 不能覆盖；编辑体携带标记 →
+// raw 不能伪造。
+func cardEnvelopeHasCatalogMarker(raw []byte) bool {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return false
 	}
-	_, exists := payload["template_ref"]
+	if _, exists := payload[cardmsg.CatalogTemplateRefKey]; exists {
+		return true
+	}
+	_, exists := payload[cardmsg.CatalogProvenanceKey]
 	return exists
 }
 

@@ -698,3 +698,162 @@ func metricHasLabels(pairs []*dto.LabelPair, want map[string]string) bool {
 	}
 	return true
 }
+
+// ---- PR-C Slice 1 (D3): the trusted dispatch boundary authors catalog
+// provenance from the registered ProducerSpec and the authorized target Space.
+// Business callers cannot self-report a principal. ----
+
+func registryCardDocument() json.RawMessage {
+	return json.RawMessage(`{
+		"type":"AdaptiveCard","version":"1.5",
+		"body":[{"type":"TextBlock","text":"pending"}],
+		"metadata":{"octo":{
+			"protocol":"octo-card@1.0",
+			"template":{"id":"docs.access-request","version":"0.3.0"}
+		}}
+	}`)
+}
+
+func TestSendAuthorsCatalogProvenanceForRegistryDocuments(t *testing.T) {
+	registry, _, _, transport, _ := newHarness(t, validSpec())
+	sender, err := registry.Sender("summary-notify")
+	require.NoError(t, err)
+
+	_, err = sender.Send(context.Background(), validTarget(), Card{
+		Profile: cardmsg.ProfileV1, Document: registryCardDocument(),
+	})
+	require.NoError(t, err)
+	_, req := transport.snapshot()
+	require.NotNil(t, req)
+	var wire map[string]interface{}
+	require.NoError(t, json.Unmarshal(req.Payload, &wire))
+
+	ref, _ := wire["template_ref"].(map[string]interface{})
+	require.NotNil(t, ref, "server-authored template_ref missing: %s", req.Payload)
+	assert.Equal(t, "docs.access-request", ref["id"])
+	assert.Equal(t, "0.3.0", ref["version"])
+
+	provenance, err := cardmsg.ParseCatalogProvenance(wire["catalog_provenance"])
+	require.NoError(t, err, "authored provenance must be canonical: %#v", wire["catalog_provenance"])
+	assert.Equal(t, cardmsg.CatalogPrincipalWireInternalProducer, provenance.PrincipalType)
+	assert.Equal(t, "summary-notify", provenance.PrincipalID, "principal is the registered ProducerSpec.ID")
+	assert.Equal(t, "space-a", provenance.SpaceID, "space is the authorized target Space")
+
+	// The outbound frame must satisfy the same strict marker contract the
+	// action ingress will later enforce.
+	markers, err := cardmsg.CatalogFrameMarkers(req.Payload)
+	require.NoError(t, err)
+	assert.True(t, markers.HasRef)
+	assert.True(t, markers.HasProvenance)
+}
+
+// PR-C review round 6 (yujiawei P1-1): the marker-authoring boundary must be
+// unable to author a marker its readers reject.
+//
+// cardmsg.Validate runs before these keys exist and Finalize does not
+// re-validate, so before this guard an untrimmed target Space produced a stored
+// frame that every reader refuses — ParseCatalogProvenance requires a trimmed
+// space_id. The card rendered and then nothing about it worked: every button
+// click and every edit failed permanently, with no way to repair the message.
+//
+// Reaching it needed only an untrimmed Space to survive the membership lookup,
+// and whether it does is decided by a collation the application does not
+// choose. space_member declares none and inherits the database default; CI
+// creates that database utf8mb4_general_ci, which is PAD SPACE, so 'space-a '
+// matches 'space-a'. Measured both ways: PAD SPACE matches, and the MySQL 8.0
+// default utf8mb4_0900_ai_ci (NO PAD) does not. Refusing the send here removes
+// the dependency on that fact entirely.
+func TestSendRefusesToAuthorAMarkerItsReadersWouldReject(t *testing.T) {
+	registry, _, _, transport, _ := newHarness(t, validSpec())
+	sender, err := registry.Sender("summary-notify")
+	require.NoError(t, err)
+
+	untrimmed := validTarget()
+	untrimmed.SpaceID = "space-a "
+
+	_, err = sender.Send(context.Background(), untrimmed, Card{
+		Profile: cardmsg.ProfileV1, Document: registryCardDocument(),
+	})
+	require.Error(t, err, "an untrimmed Space produced a card whose markers no reader accepts")
+	require.ErrorIs(t, err, cardmsg.ErrCatalogMarkerInvalid)
+
+	// Nothing was delivered: the send fails instead of storing a broken card.
+	_, req := transport.snapshot()
+	assert.Nil(t, req, "a frame with an unreadable marker reached the transport")
+}
+
+func TestSendLeavesLegacyDocumentsUnmarked(t *testing.T) {
+	registry, _, _, transport, _ := newHarness(t, validSpec())
+	sender, err := registry.Sender("summary-notify")
+	require.NoError(t, err)
+
+	_, err = sender.Send(context.Background(), validTarget(), Card{
+		Profile: cardmsg.ProfileV1, Document: validCardDocument(),
+	})
+	require.NoError(t, err)
+	_, req := transport.snapshot()
+	require.NotNil(t, req)
+	var wire map[string]interface{}
+	require.NoError(t, json.Unmarshal(req.Payload, &wire))
+	_, hasRef := wire["template_ref"]
+	_, hasProvenance := wire["catalog_provenance"]
+	assert.False(t, hasRef, "legacy document grew template_ref")
+	assert.False(t, hasProvenance, "legacy document grew catalog_provenance")
+}
+
+func TestProducerBindingExposesReadOnlySenderFacts(t *testing.T) {
+	enabled := validSpec()
+	disabled := validSpec()
+	disabled.ID = "docs-notify"
+	disabled.SenderUID = "notification"
+	disabled.Enabled = false
+	registry := NewRegistry(Dependencies{
+		IdentityResolver: &fakeIdentityResolver{identity: &botidentity.Identity{UID: "summary", Kind: botidentity.KindUserBot}},
+		Authorizer:       &fakeAuthorizer{},
+		Transport:        &fakeTransport{},
+		Metrics:          NewMetrics(prometheus.NewRegistry()),
+	}, []ProducerSpec{enabled, disabled})
+
+	sender, ok := registry.ProducerBinding("summary-notify")
+	require.True(t, ok)
+	assert.Equal(t, "summary", sender)
+
+	// A disabled producer cannot send, but its declared identity binding is
+	// still a fact the action ingress may verify historical frames against.
+	sender, ok = registry.ProducerBinding("docs-notify")
+	require.True(t, ok)
+	assert.Equal(t, "notification", sender)
+
+	_, ok = registry.ProducerBinding("never-registered")
+	assert.False(t, ok)
+
+	store := &fakeValueStore{}
+	require.NoError(t, Install(store, registry))
+	sender, ok = ProducerBindingFromContext(store, "summary-notify")
+	require.True(t, ok)
+	assert.Equal(t, "summary", sender)
+	_, ok = ProducerBindingFromContext(store, "never-registered")
+	assert.False(t, ok)
+	_, ok = ProducerBindingFromContext(&fakeValueStore{}, "summary-notify")
+	assert.False(t, ok, "missing registry must fail closed")
+}
+
+func TestProducerBindingRejectsAmbiguousOrInvalidSpecs(t *testing.T) {
+	duplicateA := validSpec()
+	duplicateB := validSpec()
+	invalid := validSpec()
+	invalid.ID = "docs-notify"
+	invalid.SenderUID = "iwh_webhook"
+	registry := NewRegistry(Dependencies{
+		IdentityResolver: &fakeIdentityResolver{identity: &botidentity.Identity{UID: "summary", Kind: botidentity.KindUserBot}},
+		Authorizer:       &fakeAuthorizer{},
+		Transport:        &fakeTransport{},
+		Metrics:          NewMetrics(prometheus.NewRegistry()),
+	}, []ProducerSpec{duplicateA, duplicateB, invalid})
+	if _, ok := registry.ProducerBinding("summary-notify"); ok {
+		t.Fatal("duplicate producer ID must not expose a binding")
+	}
+	if _, ok := registry.ProducerBinding("docs-notify"); ok {
+		t.Fatal("webhook-prefixed sender must not expose a binding")
+	}
+}

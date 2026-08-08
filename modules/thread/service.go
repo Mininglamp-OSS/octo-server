@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"go.uber.org/zap"
 )
@@ -106,12 +107,20 @@ func NewService(ctx *config.Context) IService {
 
 // CreateThreadReq 创建子区请求
 type CreateThreadReq struct {
-	GroupNo              string
-	Name                 string
-	CreatorUID           string
-	CreatorName          string
-	SourceMessageID      *int64
-	SourceMessagePayload json.RawMessage // 源消息原始 payload，用于拷贝到子区
+	GroupNo         string
+	Name            string
+	CreatorUID      string
+	CreatorName     string
+	SourceMessageID *int64
+	// SourceMessagePayload 是调用方提供的源消息内容，**会被原样持久化**到子区，
+	// 并以 SourceMessageID 那一行的 from_uid 发出。服务端只核对发送者，从不校验
+	// 这段内容与 SourceMessageID 是否对应 —— 也就是说，任何有权在该群建子区的人
+	// 都能让一条自己写的消息挂在别人（含 bot）名下。
+	//
+	// 因此新增任何消费方之前先想清楚：这是**不可信输入**，只是恰好被记在可信的
+	// 发送者名下。卡片（type-17）已在 CreateThread 里整体拒绝，因为对卡片而言这
+	// 条性质会跨越 action 路由的信任边界；文本的内容造假是既有行为，本 PR 不改。
+	SourceMessagePayload json.RawMessage
 }
 
 // ThreadResp 子区响应
@@ -339,22 +348,60 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
 	// thread ext 行已 commit）。
+	// copiedPayload 是实际拷进子区的字节；为空表示这次没有拷贝，父群通知的
+	// message_count 与 last_message 预览都由它派生。
+	//
+	// 卡片（type-17）一律不拷贝。这条路径把调用方给的 JSON 以**源消息发送者的
+	// 身份**持久化，而 source_message_id 与 payload 之间从不校验对应关系，所以
+	// 任何群成员都能让一条自己写的消息挂在某个 bot 名下。对普通文本这只是内容
+	// 造假；对卡片则跨越了信任边界：
+	//
+	//   - action 路由信任的模板身份是 card.metadata.octo.template，它在卡体
+	//     **内部**，调用方完全控制。剥掉 template_ref / catalog_provenance 两个
+	//     顶层标记并不触及它。
+	//   - 无标记帧命中 legacy 兼容分支，而静态 ActionContext 不授权 principal
+	//     （pkg/cardtmpl/catalog.go），于是伪造帧连同自选的 Action.Submit 数据
+	//     被当作可信的 bot 卡片受理 —— 等于绕过「用户不能发卡」这条禁令。
+	//
+	// 所以按 key 剥离是把伪造面收窄，不是关闭。拒绝才是关闭，而且与用户 ingress
+	// 的既有策略同形（modules/message/api.go：卡片拒绝不依赖频道类型、好友关系，
+	// 也不触库）。代价是从卡片消息创建的子区没有首条消息 —— 这是有意的取舍。
+	var copiedPayload json.RawMessage
 	if req.SourceMessageID != nil && len(req.SourceMessagePayload) > 0 {
-		// 从消息表查询原始发送者，防止客户端伪造
-		sourceFromUID, err := s.db.QueryMessageFromUID(req.GroupNo, *req.SourceMessageID)
-		if err != nil {
-			s.Warn("查询源消息发送者失败，使用创建者作为发送者",
-				zap.Error(err),
+		if isCardSourcePayload(req.SourceMessagePayload) {
+			s.Warn("源消息是卡片，跳过拷贝",
+				zap.Bool("source_card_refused", true),
+				zap.String("groupNo", req.GroupNo),
+				zap.String("creatorUID", req.CreatorUID),
 				zap.Int64("messageID", *req.SourceMessageID))
-			sourceFromUID = req.CreatorUID
-		} else if sourceFromUID == "" {
-			sourceFromUID = req.CreatorUID
+		} else {
+			// 发送者从消息行求证，这是拷贝里唯一不能信调用方的部分。
+			sourceFromUID, queryErr := s.db.QueryMessageFromUID(req.GroupNo, *req.SourceMessageID)
+			if queryErr != nil {
+				s.Warn("查询源消息发送者失败，使用创建者作为发送者",
+					zap.Error(queryErr),
+					zap.Int64("messageID", *req.SourceMessageID))
+				sourceFromUID = req.CreatorUID
+			} else if sourceFromUID == "" {
+				sourceFromUID = req.CreatorUID
+			}
+			// 只有真正发出去了才算拷贝成功：父群宣告的首条消息必须确实存在。
+			if sendErr := s.sendSourceMessage(channelID, sourceFromUID, req.SourceMessagePayload); sendErr != nil {
+				s.Error("拷贝源消息到子区失败，父群不宣告首条消息",
+					zap.Error(sendErr),
+					zap.String("channelID", channelID))
+			} else {
+				copiedPayload = req.SourceMessagePayload
+			}
 		}
-		s.sendSourceMessage(channelID, sourceFromUID, req.SourceMessagePayload)
 	}
 
 	// 在父群发送子区创建消息（同样在 fanout 之后；与 sendSourceMessage 同序约束）。
-	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, req.SourceMessagePayload)
+	// copiedPayload 为空（卡片被拒或发送失败）时，buildThreadCreatedPayload 会连
+	// 带丢掉 source_message_id：父群通知不应声称一个子区里并不存在的来源。这里
+	// 只管传「请求里的 id」和「实际拷了什么」，一致性由那一处判定，见该函数注释。
+	// 子区本身照常创建 —— 用户的主要意图是建子区，而不是拷贝那条消息。
+	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, copiedPayload)
 
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
@@ -367,10 +414,10 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 // 起点是创建者对父群的 effective space（GetMemberExternalFields 第 4 返回值）：
 //   - 外部成员                       -> 其 source_space_id
 //   - 现代（有 space）内部群的内部成员 -> 群自身 space_id
-//   - legacy（无 space）内部群的内部成员 -> ""（group.space_id==''）
+//   - legacy（无 space）内部群的内部成员 -> 空串（group.space_id 为空串）
 //
 // 只有最后一种 legacy 情况需要归一化：effective space 为空，但现代客户端读 legacy
-// 群时带的是**非空** default space（#484 口径），补行若落 space_id='' 会在 SQL 层被
+// 群时带的是**非空** default space（#484 口径），补行若落空串 space_id 会在 SQL 层被
 // 过滤掉，创建者永远看不到自己刚建的子区（issue #557 的 silent no-op）。因此**仅对
 // 这一路径**（内部成员 + 空 effective space）把 space 归一到创建者自己的 default
 // space——正是读侧（以及 auto_follow fanout 的 follower 行）所在的 space。外部成员、
@@ -378,7 +425,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 //
 // 与 fanout 的关系：fanout（OnThreadCreated）的源数据来自群 ext 行，而群 ext 行只能
 // 由走 validateBase（拒空 space_id）的 follow 路径写入，所以 fanout 复制的必是非空
-// space，**永远不会**落 space_id=''。归一化到创建者 default space 后，创建者补行才
+// space，**永远不会**落空串 space_id。归一化到创建者 default space 后，创建者补行才
 // 与 fanout 的 follower 行落在同一非空 space。
 //
 // best-effort 降级：拿不到 default space（查询失败或用户无 default space）时，返回
@@ -410,7 +457,17 @@ func (s *Service) resolveCreatorBackfillSpaceID(groupNo, creatorUID string) (str
 	return creatorSpaceID, nil
 }
 
-// buildThreadCreatedPayload 构建子区创建通知消息的 payload
+// buildThreadCreatedPayload 构建子区创建通知消息的 payload。
+//
+// source_message_id、message_count、last_message 三者描述的是同一件事 —— 子区里
+// 到底有没有那条首条消息 —— 所以都由同一个事实派生：sourcePayload 是否非空。它是
+// **实际拷贝进子区的字节**，拷贝被拒（卡片）或发送失败时为空。
+//
+// 这个判断放在这里而不是调用方，是 PR-C review（lml2468）的直接结果。放在调用方
+// 时它只是一条约定：调用方忘了把 id 置空，父群就会宣告一条子区里并不存在的来源，
+// 而任何驱动本函数的测试都看不见这个错误 —— 当时那条测试正是传入已经为 nil 的 id
+// 去断言「没有 source_message_id」，删掉调用方的置空逻辑它照样绿。搬进来之后，
+// 「有 id 但没拷贝」这个不一致状态在本函数内被消解，调用方构造不出它。
 func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName string, sourceMessageID *int64, sourcePayload json.RawMessage) map[string]interface{} {
 	participants := []map[string]string{
 		{"uid": creatorUID, "name": creatorName},
@@ -428,12 +485,15 @@ func buildThreadCreatedPayload(shortID, name, channelID, creatorUID, creatorName
 		"participants": participants,
 	}
 
-	if sourceMessageID != nil {
+	// 有拷贝才有来源。sourcePayload 来自请求，但只有在拷贝真正发出之后才会传到
+	// 这里：id、计数与预览必须描述子区里真实存在的东西，而不是调用方请求过什么。
+	copied := len(sourcePayload) > 0
+	if sourceMessageID != nil && copied {
 		payload["source_message_id"] = *sourceMessageID
 	}
 
 	var messageCount int64
-	if len(sourcePayload) > 0 {
+	if copied {
 		messageCount = 1
 		payload["last_message"] = map[string]interface{}{
 			"from_uid":  creatorUID,
@@ -469,7 +529,10 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 
 // sendSourceMessage 将源消息拷贝到子区频道作为首条消息
 // fromUID 应该是经过服务端验证的原始消息发送者
-func (s *Service) sendSourceMessage(channelID, fromUID string, payload json.RawMessage) {
+// sendSourceMessage returns the send error so the caller can tell whether the
+// copy actually happened. The parent-group notification advertises a first
+// message and a preview, and those must describe a message that exists.
+func (s *Service) sendSourceMessage(channelID, fromUID string, payload json.RawMessage) error {
 	err := s.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			NoPersist: 0,
@@ -482,8 +545,9 @@ func (s *Service) sendSourceMessage(channelID, fromUID string, payload json.RawM
 		Payload:     payload,
 	})
 	if err != nil {
-		s.Error("拷贝源消息到子区失败", zap.Error(err), zap.String("channelID", channelID))
+		return fmt.Errorf("thread: copy source message: %w", err)
 	}
+	return nil
 }
 
 // UpdateName 修改子区名称
@@ -1288,4 +1352,12 @@ func sanitizeListStatuses(statuses []int) []int {
 		return []int{ThreadStatusActive}
 	}
 	return out
+}
+
+// isCardSourcePayload reports whether a caller-supplied source payload is a
+// card. It keys off the wire type rather than the marker keys: a frame whose
+// markers were removed is still a card, and still carries the in-body
+// metadata.octo.template that makes it actionable.
+func isCardSourcePayload(payload json.RawMessage) bool {
+	return cardmsg.IsCardRawPayload(payload)
 }

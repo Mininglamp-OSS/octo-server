@@ -33,6 +33,23 @@ import (
 // existing retry/dedup state machine handles them, exactly as the text path.
 // Ordinary card-build failures retain the legacy text fallback; runtime-catalog
 // safety rejections (blocked/disabled/auth/integrity/unavailable) fail closed.
+// spaceIDAcceptable rejects a Space the card boundary would later refuse.
+//
+// Blank was already rejected here; untrimmed was not, and after PR-C D3 that
+// difference is visible to callers. The marker-authoring boundary in
+// internal/carddispatch validates the Space before stamping it and fails the
+// send, so an untrimmed value used to fan out one goroutine per target and
+// come back as HTTP 200 with every target failed as `card_invalid`, N
+// identical warn lines, and nothing naming the cause. Catching it here turns
+// that into one accurate 400.
+//
+// This is validation, not normalisation: the value is still never rewritten.
+// Trimming it silently would put the caller's card in a Space they did not
+// name, which is the failure the strict reader exists to prevent.
+func spaceIDAcceptable(spaceID string) bool {
+	return spaceID != "" && strings.TrimSpace(spaceID) == spaceID
+}
+
 func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*NotifyResp, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -41,7 +58,7 @@ func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*
 		return nil, errNotifyCardInvalid
 	}
 	card := req.Card
-	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 {
 		return nil, errNotifyCardInvalid
 	}
 	if strings.TrimSpace(card.TaskNo) == "" || strings.TrimSpace(card.Title) == "" {
@@ -66,7 +83,7 @@ func (n *Notify) deliverCardNotification(ctx context.Context, req *NotifyReq) (*
 	} else {
 		summaryTid = summaryfailed.TemplateID
 	}
-	if err := preflightSummarySchema(ctx, card, summaryTid); err != nil {
+	if err := preflightSummarySchema(ctx, req.SpaceID, card, summaryTid); err != nil {
 		if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 			n.Error("summary card preflight rejected by runtime catalog",
 				zap.String("catalog_result", failure.result), zap.Error(err),
@@ -362,7 +379,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 		return nil, errNotifyCardInvalid
 	}
 	card := req.DocsCard
-	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
+	if !spaceIDAcceptable(req.SpaceID) || len(req.Targets) == 0 || len(req.Targets) > 200 {
 		return nil, errNotifyCardInvalid
 	}
 	if strings.TrimSpace(card.DocID) == "" || strings.TrimSpace(card.Title) == "" {
@@ -387,7 +404,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 	// Only the access_requested + gate-on branch flows through Registry.Render;
 	// other kinds keep the historical validate-in-builder behavior.
 	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
-		if err := preflightDocsAccessRequestSchema(ctx, card); err != nil {
+		if err := preflightDocsAccessRequestSchema(ctx, req.SpaceID, card); err != nil {
 			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 				n.Error("docs access-request card preflight rejected by runtime catalog",
 					zap.String("catalog_result", failure.result), zap.Error(err),
@@ -415,7 +432,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 		} else {
 			tid = docsshared.TemplateID
 		}
-		if err := preflightDocsDisplaySchema(ctx, card, tid); err != nil {
+		if err := preflightDocsDisplaySchema(ctx, req.SpaceID, card, tid); err != nil {
 			if failure, ok := classifyNotifyCatalogRuntimeFailure(err); ok {
 				n.Error("docs display card preflight rejected by runtime catalog",
 					zap.String("catalog_result", failure.result), zap.Error(err),
@@ -535,7 +552,7 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 	}
 	fallbackText := ""
 	if !canCard {
-		fallbackText = buildDocsFallbackText(card, lang)
+		fallbackText = buildDocsFallbackText(card, lang, req.SpaceID)
 	}
 
 	type sendResult struct {
@@ -762,9 +779,15 @@ func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (strin
 // pilot Template. Other kinds keep the historical multi-line composition.
 // If Template.FallbackText is unavailable (Registry unwired / mapping fails),
 // fall back to the historical composition so callers never lose the text path.
-func buildDocsFallbackText(card *DocsCardFields, lang string) string {
+// spaceID is the Space the accompanying send is authorized against. It is not
+// decoration: template resolution became Space-aware in Slice 3, so resolving
+// the fallback with an empty Space would authorize a different principal than
+// the send this text belongs to — and the only visible symptom would be a card
+// rendered from the dynamic template whose plain-text twin came from the legacy
+// hardcoded labels.
+func buildDocsFallbackText(card *DocsCardFields, lang, spaceID string) string {
 	if card != nil && card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
-		if text, ok := templateFallbackText(card, lang); ok {
+		if text, ok := templateFallbackText(card, lang, spaceID); ok {
 			return text
 		}
 	}

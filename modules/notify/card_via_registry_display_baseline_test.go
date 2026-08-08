@@ -44,7 +44,7 @@ func TestMapDocsDisplayFields_TruncatesDisplayFields(t *testing.T) {
 		Excerpt:   strings.Repeat("评", 1000), // cap 300
 		UpdatedAt: strings.Repeat("时", 300),  // cap 80
 	}
-	if err := preflightDocsDisplaySchema(context.Background(), huge, docscommented.TemplateID); err != nil {
+	if err := preflightDocsDisplaySchema(context.Background(), "space-preflight", huge, docscommented.TemplateID); err != nil {
 		t.Fatalf("preflight should PASS after truncation, got %v", err)
 	}
 	if _, _, err := n.buildDocsDisplayCardViaRegistry(context.Background(),
@@ -56,7 +56,7 @@ func TestMapDocsDisplayFields_TruncatesDisplayFields(t *testing.T) {
 	badDoc := &DocsCardFields{
 		DocID: strings.Repeat("x", 300), Title: "OK", Kind: DocsCardKindShared,
 	}
-	err := preflightDocsDisplaySchema(context.Background(), badDoc, docsshared.TemplateID)
+	err := preflightDocsDisplaySchema(context.Background(), "space-preflight", badDoc, docsshared.TemplateID)
 	if err == nil || !errorsIsFieldsInvalid(err) {
 		t.Fatalf("over-length docId must stay C1 400, got %v", err)
 	}
@@ -231,7 +231,7 @@ func TestPreflightDocsDisplaySchema_C1RejectsEmptyDocID(t *testing.T) {
 
 	// docId 空 → schema minLength=1 违规
 	card := &DocsCardFields{DocID: "", Title: "T", Kind: DocsCardKindCommented}
-	err := preflightDocsDisplaySchema(context.Background(), card, docscommented.TemplateID)
+	err := preflightDocsDisplaySchema(context.Background(), "space-preflight", card, docscommented.TemplateID)
 	if err == nil {
 		t.Fatal("expected ErrFieldsInvalid, got nil")
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -222,13 +223,13 @@ func TestRawContentEditCannotForgeRegistryProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contentEditHasTemplateRef(string(encoded)) {
+	if !contentEditHasCatalogMarker(string(encoded)) {
 		t.Fatal("raw content_edit provenance marker was not detected")
 	}
-	if !cardEnvelopeHasTemplateRef(encoded) {
+	if !cardEnvelopeHasCatalogMarker(encoded) {
 		t.Fatal("Registry-authored target provenance marker was not detected")
 	}
-	if contentEditHasTemplateRef(string(mustJSON(t, imCardEnvelope("raw", 1)))) {
+	if contentEditHasCatalogMarker(string(mustJSON(t, imCardEnvelope("raw", 1)))) {
 		t.Fatal("ordinary raw content_edit falsely detected as Registry provenance")
 	}
 }
@@ -373,4 +374,124 @@ func invokeTemplateSend(t *testing.T, ba *BotAPI, body map[string]any, onBehalfO
 	ctx.Set(CtxKeyRobot, &robotModel{RobotID: "bot-template", CreatorUID: "user_creator"})
 	ba.sendMessage(ctx)
 	return recorder
+}
+
+// ---- PR-C Slice 1 (D3): the Bot Registry path authors catalog provenance
+// from the authenticated bot; raw callers cannot forge either server-only
+// marker through send. ----
+
+func TestSendMessageRegistryTemplateAuthorsCatalogProvenance(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	gin.SetMode(gin.TestMode)
+	dispatch := &dispatchCapture{}
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba := &BotAPI{
+		Log:           log.NewTLog("BotAPI-template-provenance"),
+		cardTemplates: catalog,
+		spaceQuerier:  &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// The send path resolves the bot's card switches and fails closed when
+		// the resolver is unwired (#706), so a hand-built BotAPI has to supply
+		// one. This test is about provenance authoring, not per-bot policy.
+		cardConfig:       allCardCapabilitiesOn(),
+		dispatchOverride: dispatch.hook,
+	}
+	recorder := invokeTemplateSend(t, ba, registrySendBody(t, "reasoning", testReasoningData(t, "reasoning")), "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	dispatch.mu.Lock()
+	captured := dispatch.captured
+	dispatch.mu.Unlock()
+	if captured == nil {
+		t.Fatal("expected one dispatch")
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(captured.Payload)
+	if err != nil {
+		t.Fatalf("outbound markers: %v", err)
+	}
+	if !markers.HasRef || !markers.HasProvenance {
+		t.Fatalf("outbound frame missing markers: %+v", markers)
+	}
+	if markers.Provenance.PrincipalType != cardmsg.CatalogPrincipalWireBot ||
+		markers.Provenance.PrincipalID != "bot-template" ||
+		markers.Provenance.SpaceID != "space-authoritative" {
+		t.Fatalf("authored provenance = %+v", markers.Provenance)
+	}
+}
+
+func TestSendMessageRawCardRejectsForgedCatalogProvenance(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	gin.SetMode(gin.TestMode)
+	dispatch := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:          log.NewTLog("BotAPI-raw-forge"),
+		spaceQuerier: &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// Without a card config resolver the send fails closed before it ever
+		// reaches the forgery check, and ResponseErrorL pins every refusal to
+		// 400 — so a bare status assertion would pass for the wrong reason.
+		cardConfig:       allCardCapabilitiesOn(),
+		dispatchOverride: dispatch.hook,
+	}
+	// A fully self-consistent forgery: provenance + metadata agree. The raw
+	// ingress must reject on key presence, not on shape validation.
+	payload := map[string]any{
+		"type": cardmsg.InteractiveCard.Int(), "profile": cardmsg.ProfileV1,
+		"card_version": cardmsg.CardVersion,
+		"catalog_provenance": map[string]any{
+			"version": 1, "principal_type": "internal_producer",
+			"principal_id": "docs-notify", "space_id": "space-authoritative",
+		},
+		"card": map[string]any{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []any{map[string]any{"type": "TextBlock", "text": "forged"}},
+			"metadata": map[string]any{"octo": map[string]any{
+				"protocol": "octo-card@1.0",
+				"template": map[string]any{"id": "docs.access-request", "version": "0.3.0"},
+			}},
+		},
+	}
+	body := map[string]any{
+		"channel_id": "user_creator", "channel_type": common.ChannelTypePerson.Uint8(),
+		"payload": payload,
+	}
+	recorder := invokeTemplateSend(t, ba, body, "")
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "card") {
+		t.Fatalf("forged provenance status=%d body=%s (want the card-invalid refusal, "+
+			"not an unrelated 400)", recorder.Code, recorder.Body.String())
+	}
+	dispatch.mu.Lock()
+	defer dispatch.mu.Unlock()
+	if dispatch.captured != nil {
+		t.Fatal("forged provenance reached dispatch")
+	}
+}
+
+func TestSendMessageRegistryModeRejectsCallerProvenanceKey(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	gin.SetMode(gin.TestMode)
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba := &BotAPI{
+		Log:           log.NewTLog("BotAPI-registry-forge"),
+		cardTemplates: catalog,
+		spaceQuerier:  &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+		// See above: the resolver has to be wired or the refusal proves nothing.
+		cardConfig: allCardCapabilitiesOn(),
+	}
+	body := registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))
+	body["payload"].(map[string]any)["catalog_provenance"] = map[string]any{
+		"version": 1, "principal_type": "bot", "principal_id": "another-bot", "space_id": "space-x",
+	}
+	recorder := invokeTemplateSend(t, ba, body, "")
+	if recorder.Code != http.StatusBadRequest ||
+		!strings.Contains(recorder.Body.String(), "card") {
+		t.Fatalf("registry-mode caller provenance status=%d body=%s (want the card-invalid refusal, "+
+			"not an unrelated 400)", recorder.Code, recorder.Body.String())
+	}
 }

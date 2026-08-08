@@ -30,8 +30,15 @@ const (
 	HandoffRoot = "handoff/docs.access-request@0.2.0"
 	// TemplateID 稳定 ID 常量,供 composition root 引用。
 	TemplateID cardtmpl.ID = "docs.access-request"
-	// TemplateVersion 本模板当前版本。
-	TemplateVersion = "0.2.0"
+	// TemplateVersionV2 是 v2 交互档这一**具体版本**的稳定标识。需要指名 0.2.0
+	// 本身（而不是"当前版本"）的代码必须用它 —— 例如 notify.docsResultVersion 的
+	// 0.2.0→V3 result 升级分支：0.2.0 的 manifest 只声明 pending view，没有 result
+	// 可渲染，所以那条分支说的是 0.2.0 这个版本，不是"默认版本"。
+	TemplateVersionV2 = "0.2.0"
+	// TemplateVersion 本模板当前版本 —— 一个**会移动**的指针（它已经从 0.2.0 移到
+	// 过 0.3.0 又移回来）。只有真正想跟着默认版本走的代码才该用它；拿它去比较某个
+	// 历史版本，会在下次改版时静默变成永假分支。
+	TemplateVersion = TemplateVersionV2
 
 	// StatePending 是 v2 交互档视图 "pending" 承载的唯一状态。
 	// 本 PR 只注册 pending view;approved/rejected(result view)延后到 outcome PR。

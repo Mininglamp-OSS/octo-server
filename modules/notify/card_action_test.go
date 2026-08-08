@@ -138,7 +138,7 @@ func TestDocsOutcomeCardsAreV1AndDeniedDoesNotLeakApproverOrReason(t *testing.T)
 		if kind == DocsCardKindAccessDenied {
 			assert.NotContains(t, string(document), "denial-reason-secret")
 			assert.Contains(t, string(document), "访问申请已拒绝")
-			fallback := buildDocsFallbackText(card, "zh-CN")
+			fallback := buildDocsFallbackText(card, "zh-CN", "")
 			assert.NotContains(t, fallback, "approver-secret")
 			assert.NotContains(t, fallback, "denial-reason-secret")
 		} else {

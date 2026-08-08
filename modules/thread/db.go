@@ -911,7 +911,16 @@ func (d *DB) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
 	return newVersion, tx.Commit()
 }
 
-// QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者
+// QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者。
+//
+// 只取 from_uid：这是拷贝到子区时唯一需要向服务端求证的东西（防止客户端伪造发送
+// 者）。内容不从这里读 —— 单条消息读取要过 visibles 白名单、revoke/is_deleted、
+// message_user_extra 的按人删除、两个 offset 和 Expire 五道门，凭 message_id 直接
+// 取 payload 会绕过全部五道，等于让任何群成员凭 id 读回本群任意消息（包括已撤回
+// 的原文 —— 撤回脱敏发生在响应层，存储里原文还在）。拷贝内容用调用方自己的字节，
+// 原样持久化；卡片（type-17）则整体拒绝拷贝 —— 按 key 剥掉 server-only 标记曾是
+// 中间方案，但够不到卡体内部的 metadata.octo.template，只收窄了伪造面。见
+// CreateThread。
 func (d *DB) QueryMessageFromUID(channelID string, messageID int64) (string, error) {
 	table := d.getMessageTable(channelID)
 	var fromUID string

@@ -596,3 +596,60 @@ func sha256Hex(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
 }
+
+// ---- PR-C Slice 1 (D3): CardContext carries the validated stored principal
+// as additive durable fields. The cross-repo callback envelope is frozen and
+// must not grow the principal; only the internal event record does. ----
+
+func TestCardContextPrincipalFieldsAreDurableAndAdditive(t *testing.T) {
+	event := Event{
+		EventID: 7, ActionID: "docs-access-approve", OperatorUID: "user-1",
+		MessageID: "1001", ChannelID: "user-1", ChannelType: 1,
+		Card: CardContext{
+			TemplateID: "docs.access-request", TemplateVersion: "0.3.0", View: "pending",
+			PrincipalType: "internal_producer", PrincipalID: "docs-notify", SpaceID: "space-1",
+		},
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Event
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Card != event.Card {
+		t.Fatalf("durable round trip = %+v, want %+v", decoded.Card, event.Card)
+	}
+
+	// Old durable events (no principal fields) keep decoding into the same shape.
+	var legacyDecoded Event
+	if err := json.Unmarshal([]byte(`{"event_id":7,"card":{"template_id":"docs.access-request","template_version":"0.3.0","view":"pending"}}`), &legacyDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if legacyDecoded.Card.PrincipalID != "" || legacyDecoded.Card.TemplateVersion != "0.3.0" {
+		t.Fatalf("legacy durable decode = %+v", legacyDecoded.Card)
+	}
+
+	// The frozen octo-card-v1 callback envelope must not leak the principal.
+	body, err := MarshalCallbackRequest(event, CallbackFormatOctoCardV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	card, _ := envelope["card"].(map[string]interface{})
+	for _, forbidden := range []string{"principal_type", "principal_id", "space_id"} {
+		if _, leaked := card[forbidden]; leaked {
+			t.Fatalf("callback envelope leaked %s: %s", forbidden, body)
+		}
+	}
+
+	// A partially-filled principal context is still a complete octo-card
+	// context for callback purposes (view/template drive the envelope).
+	if event.Card == (CardContext{}) {
+		t.Fatal("populated context compared equal to zero value")
+	}
+}
