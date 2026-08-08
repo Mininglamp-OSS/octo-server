@@ -988,11 +988,14 @@ func TestVCSCardEnvelopeSelectsForgeWithoutExposingCallerOverride(t *testing.T) 
 		require.NoError(t, err)
 		var native pushPayloadReq
 		require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(
-			`{"msg_type":"card","render_profile":"octo-chat/v1","card":%s}`, cardJSON,
+			`{"msg_type":"card","render_profile":"octo-chat/v1","plain_projection":{"body":[{"type":"TextBlock","text":"forged"}]},"card":%s}`,
+			cardJSON,
 		)), &native))
+		assert.Nil(t, native.plainProjection, "native JSON cannot select a server-owned plain projection")
 		nativePayload, err := buildCardPayload(m, &native, false)
 		require.NoError(t, err)
 		assert.NotContains(t, nativePayload, "render_profile")
+		assert.NotEqual(t, "forged", nativePayload["plain"])
 	})
 }
 
