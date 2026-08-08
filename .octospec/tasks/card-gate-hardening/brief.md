@@ -25,6 +25,10 @@ touched.
 2. **Both guards added to `modules/bot_api` had zero test coverage in that package.** All
    coverage sat in `internal/carddispatch`, behind that layer's fakes.
 3. **The persistence judge's doc comment listed three write paths; there are five.**
+4. **The template-send precheck measured the send frame, not the first-edit envelope.** The edit
+   path always appends `card_seq` and, for progress frames, `transient` — so sizing the precheck
+   on the send frame leaves a window as wide as that overhead in which a card sends successfully
+   and then fails its very first edit, which is the exact failure the precheck exists to prevent.
 
 ## Background
 
@@ -70,8 +74,20 @@ enumeration itself will drift again.
 - `pkg/cardtmpl/json_artifact.go` — `parseStringTruncations` / `parseAggregateArrayLimits`.
   Optionality must be preserved: omitting `arrayField` (top-level scope) and `ellipsis`
   (no ellipsis) stays legal. Only *present-but-wrong-typed* becomes an error.
+  **`ellipsis` must also keep accepting untrimmed values.** The first revision of this change
+  read it through the same helper as `arrayField` and so gave it a trim requirement it never
+  had — a correctly-typed `" …"` went from accepted to rejected, which is exactly the class of
+  tightening this list rules out (caught in review). The two kinds of field now use separate
+  readers: fields naming a schema path are trimmed (an untrimmed one can never match a property
+  name), display text is taken verbatim. Reachability matters here — `POST
+  /v1/manager/card-templates/validate` reaches the compiler with **no** `requireRuntimeReady`
+  gate, unlike `/publish`, so "the runtime path is disabled" is not a sufficient argument.
 - `internal/carddispatch/mutation.go` — the doc comment is the only change; no behaviour.
-- `modules/bot_api` — tests only; no production change.
+- `modules/bot_api` — the template-send precheck now measures a worst-case first-edit envelope
+  (`card_seq` at the int64 ceiling, `transient` true) through
+  `carddispatch.NormalizeFrameForPersistence` rather than comparing the send frame's length to a
+  constant, so the width judge stays single-sourced and a future envelope key cannot reopen the
+  window. The probe runs on a copy — the outbound payload must not gain those keys.
 
 ## Out of scope
 
@@ -99,10 +115,36 @@ enumeration itself will drift again.
       `content_edit` still holds the control frame.
 - [ ] Removing the gate makes that test fail — and fail with the store error, showing the
       frame reached MySQL.
-- [ ] `modules/bot_api` proves the template-send precheck is not dead code: a schema-valid
-      worst-case payload renders to a frame that passes `cardmsg.MaxPayloadBytes` and exceeds
-      the column.
-- [ ] A source guard counts the persistence judge's write paths and fails when the count
-      diverges from the number the doc comment claims. Proven to fire by removing one.
+- [ ] The template-send precheck is exercised **through the real `sendMessage` handler**, not by
+      re-implementing its arithmetic: `POST /v1/bot/sendMessage` in template mode, positive
+      control first, then 400 + the `card_invalid` message + **no dispatch**. Deleting the
+      guard's rejection must turn it red — the first revision asserted only the judgment, so the
+      whole `if templateMode` block could be removed with the suite still green (caught in
+      review; the same shape as the #712 P0 this brief diagnoses, one level up).
+- [ ] A separate liveness test keeps proving the target is reachable from schema-valid input (the
+      worst case renders to 151% of the column while passing `cardmsg.MaxPayloadBytes`), since
+      that fact is what makes the guard non-dead — but it is explicitly not the guard's test.
+- [ ] An untrimmed `ellipsis` is asserted **accepted**, and an untrimmed `arrayField` / `field`
+      asserted rejected, so the contract split is pinned in both directions.
+- [ ] `requiredStringField` reports `must not be empty` and `must be trimmed` separately — an
+      empty string is trimmed, so one message cannot stand for both rules.
+- [ ] The DB-backed await fails rather than skips once IM health has been confirmed, so the one
+      guard this change actually wires cannot pass by skipping.
+- [ ] The precheck is sized on the first-edit envelope: a test measures the overhead the edit
+      path adds, asserts it is positive, and asserts the window it opens is non-empty — so if a
+      future change makes the two frames identical the test says so instead of passing quietly.
+      The measured overhead is printed rather than written into a comment as a magic number.
+- [ ] A source guard counts the persistence judge's use sites and fails when the count diverges
+      from the number the doc comment claims. It scans the **whole module recursively** (an
+      earlier revision read three hardcoded directories non-recursively, making a fourth package
+      invisible), skips the judge's own body so its internal width check is not miscounted as a
+      second gate, and accepts either constant name so renaming to the exported alias does not
+      produce a misleading failure. Its message states what it does **not** prove: counting call
+      sites can never detect a write path that bypasses the judge — that class (#712's P0) is out
+      of reach by construction and only a human enumeration of write entry points covers it.
+      Proven to fire three times: deliberately (a `CardUpdater` path pointed back at
+      `cardmsg.NormalizeContentEdit`), for real (the first-edit-envelope probe took the count 5→6,
+      forcing the comment to separate write paths from the non-writing precheck), and on the
+      widened scan (a probe file in a fourth package was seen).
 - [ ] `go build ./...`, `go vet ./...`, gofmt, `git diff --check`, `golangci-lint`, `-race`
       on the three touched packages, and the DB-backed `modules/bot_api` suite all pass.

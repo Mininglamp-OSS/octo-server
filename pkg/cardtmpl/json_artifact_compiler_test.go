@@ -799,6 +799,23 @@ func TestCompileJSONArtifactRejectsWrongTypedConstraintFields(t *testing.T) {
 			constraints: `{"truncateStrings":[{"maxRunes":8,"ellipsis":"…"}]}`,
 			want:        "field is required",
 		},
+		// 空串与未 trim 是两条不同的规则，消息不能互相指控（review of #716）。
+		{
+			name:        "field 是空串",
+			constraints: `{"truncateStrings":[{"field":"","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must not be empty",
+		},
+		{
+			name:        "field 前后有空白",
+			constraints: `{"truncateStrings":[{"field":" title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must be trimmed",
+		},
+		// arrayField 是 schema 路径，未 trim 永远匹配不上属性名，所以照旧要求 trim。
+		{
+			name:        "arrayField 前后有空白",
+			constraints: `{"truncateStrings":[{"arrayField":"groups ","field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be trimmed",
+		},
 		{
 			name:        "parentArray 是数字",
 			constraints: `{"aggregateArrayLimits":[{"parentArray":1,"childArray":"items","maxTotalItems":2}]}`,
@@ -827,9 +844,17 @@ func TestCompileJSONArtifactRejectsWrongTypedConstraintFields(t *testing.T) {
 	}
 
 	// 反向：合法的省略 arrayField / ellipsis 必须继续通过，否则这次收紧就把可选性也一起收掉了。
+	//
+	// **ellipsis 不做 trim 要求**：它是展示文本而非 schema 路径，#716 之前的解析器逐字使用它，
+	// 而 " …"（前导空格的省略号）是合法的排版选择。给它加 trim 会把一个**类型正确**的值从
+	// 接受变成拒绝 —— 超出「只有 present-but-wrong-typed 才报错」这个本次改动自己声明的
+	// 契约（review of #716 抓到这处过度收紧）。所以这里正面钉住它仍被接受。
 	for _, tc := range []struct{ name, constraints string }{
 		{"省略 arrayField（顶层字段）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}`},
 		{"省略 ellipsis（无省略号截断）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8}]}`},
+		{"ellipsis 前导空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":" …"}]}`},
+		{"ellipsis 尾随空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"… "}]}`},
+		{"ellipsis 含换行", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"...\n"}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := compile(t, tc.constraints); err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,12 +14,14 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -135,10 +138,15 @@ func TestBotRawCardEditRejectsFrameWiderThanTheColumn(t *testing.T) {
 }
 
 // awaitP1CardStored 等 IM 异步持久化完成，返回可用于编辑的 messageSeq。
+//
+// 超时**判失败、不 skip**（review of #716）：调用方在此之前已经用 skipWithoutIMBot 确认过
+// :5001 健康，所以到这里还等不到就是真问题。原来写 t.Skip 会让本 PR 唯一真正接线 guard 的
+// 那条用例在负载高的 runner 上变成 pass-by-skip —— 与真通过在结果里分不出来，正是「测试
+// 存在但什么都没保证」的那一类。预算也从 6s 抬到 15s，减少误判。
 func awaitP1CardStored(t *testing.T, ctx *config.Context, clientMsgID int64) uint32 {
 	t.Helper()
 	var msgSeq uint32
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 50; i++ {
 		sr, err := ctx.IMSearchMessages(&config.MsgSearchReq{
 			ChannelID:   testutil.UID,
 			ChannelType: common.ChannelTypePerson.Uint8(),
@@ -152,30 +160,81 @@ func awaitP1CardStored(t *testing.T, ctx *config.Context, clientMsgID int64) uin
 		time.Sleep(300 * time.Millisecond)
 	}
 	if msgSeq == 0 {
-		t.Skip("消息未在预期时间内完成 IM 异步持久化，跳过（非本用例断言的对象）")
+		t.Fatalf("消息未在 15s 内完成 IM 异步持久化（clientMsgID=%d）。IM 健康检查已通过，"+
+			"所以这是真失败而不是环境缺失 —— 不能 skip，否则本 PR 唯一接线 guard 的用例"+
+			"会以「通过」的形式静默失效", clientMsgID)
 	}
 	return msgSeq
 }
 
-// 模板发送预检（sendMessage 的模板分支）：send 侧原本只查 512 KiB、编辑侧查 TEXT 列宽，
-// 两者不一致就能造出「发得出去、第一次编辑就被拒」的卡。这条用例证明**schema 合法**的
-// 输入确实能渲染出超列宽的帧（所以预检不是死代码），并且预检用的常量与写入侧闸同源。
+// 模板发送预检（sendMessage 的模板分支）**必须驱动真 handler**。
 //
-// 刻意不打 HTTP：这里要钉的是「渲染结果 vs 列宽」这个判断，用真实 catalog 渲染 + 真实
-// 常量即可，不必拖上 DB/IM。raw 编辑那条闸的接线才需要真实 handler（见上）。
-func TestTemplateSendPrecheckCatchesSchemaValidButUnstorableFrame(t *testing.T) {
+// 这条用例的第一版只是渲染出最坏帧、然后自己比一次长度 —— 那是重新实现了预检的算术，
+// 根本没走到预检：review 把 send.go 里整个 `if templateMode { … }` 块删掉，测试照样绿。
+// 那正是本 PR 自己诊断的 #712 P0 的形状（断言判断、不断言接线），只是高了一层，所以必须
+// 修成打 POST /v1/bot/sendMessage。不需要 DB —— dispatchOverride 就能截住派发。
+func TestTemplateSendPrecheckRejectsUnstorableFrameThroughHandler(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
-	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
-	if err != nil {
-		t.Fatal(err)
+	gin.SetMode(gin.TestMode)
+
+	newAPI := func(dispatch *dispatchCapture) *BotAPI {
+		catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &BotAPI{
+			Log:              log.NewTLog("BotAPI-precheck"),
+			cardTemplates:    catalog,
+			cardConfig:       allCardCapabilitiesOn(),
+			spaceQuerier:     &fakeSpaceQuerier{defaultSpace: "space-authoritative"},
+			dispatchOverride: dispatch.hook,
+		}
 	}
 
-	// 最坏形状：6 阶段 / 13 条聚合 action（schema 的聚合上限）/ 每个自由字符串顶到上限，
-	// 且全部用会被 Go 转义成 6 字节的 `<`。thought 给到受理上限，由引擎截到展示上限。
+	// **正向对照，先跑**：出厂样本必须发得出去。没有它，下面那条「被拒」可能是任何原因
+	// （模板未注册、策略门、Space 解析）造成的，归因不到列宽。
+	control := &dispatchCapture{}
+	recorder := invokeTemplateSend(t, newAPI(control),
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning")), "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("出厂样本的模板发送应成功；这条不过说明 harness 有问题，后面无法归因: status=%d body=%s",
+			recorder.Code, recorder.Body.String())
+	}
+	control.mu.Lock()
+	controlDispatched := control.captured != nil
+	control.mu.Unlock()
+	if !controlDispatched {
+		t.Fatal("正向对照应产生一次派发")
+	}
+
+	// 同一套 harness，只把 data 换成 schema 合法的最坏形状（实测首次编辑信封 151% 列宽）。
+	blocked := &dispatchCapture{}
+	recorder = invokeTemplateSend(t, newAPI(blocked),
+		registrySendBody(t, "error", worstCaseReasoningData(t)), "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("超列宽的模板发送应被预检拒绝（否则卡片发出后第一次编辑就动不了）: status=%d body=%s",
+			recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), errcode.ErrBotAPICardInvalid.DefaultMessage) {
+		t.Fatalf("应映射到 card-invalid: %s", recorder.Body.String())
+	}
+	// 关键：不得派发。预检必须挡在出站之前，而不是发出去再说。
+	blocked.mu.Lock()
+	dispatched := blocked.captured
+	blocked.mu.Unlock()
+	if dispatched != nil {
+		t.Fatal("超列宽帧被派发了 —— 预检没有挡在出站之前，这张卡会发出去且永远编辑不动")
+	}
+}
+
+// worstCaseReasoningData 构造 schema 允许的最坏形状：6 阶段 / 13 条聚合 action（聚合上限）/
+// 每个自由字符串顶到上限，且全用会被 Go 转义成 6 字节的 `<`。thought 给到受理上限，由引擎
+// 截到展示上限。实测渲染后的首次编辑信封是列宽的 151%。
+func worstCaseReasoningData(t *testing.T) json.RawMessage {
+	t.Helper()
 	filler := func(n int) string { return strings.Repeat("<", n) }
 	phases := make([]any, 0, 6)
-	actionCounts := []int{3, 2, 2, 2, 2, 2}
-	for _, count := range actionCounts {
+	for _, count := range []int{3, 2, 2, 2, 2, 2} {
 		actions := make([]any, 0, count)
 		for i := 0; i < count; i++ {
 			actions = append(actions, map[string]any{
@@ -185,31 +244,40 @@ func TestTemplateSendPrecheckCatchesSchemaValidButUnstorableFrame(t *testing.T) 
 		}
 		phases = append(phases, map[string]any{"thought": filler(4001), "actions": actions})
 	}
-	fields := map[string]any{
+	raw, err := json.Marshal(map[string]any{
 		"reasoningId": strings.Repeat("r", 512), "state": "error",
 		"title": filler(64), "statusLabel": filler(32), "statusTone": "Attention",
 		"traceExpanded": true, "traceCollapsed": false,
 		"collapsedSummary": filler(160), "progressText": filler(160),
 		"errorTitle": filler(64), "errorMessage": filler(121),
 		"phases": phases,
-	}
-	raw, err := json.Marshal(fields)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return raw
+}
 
+// 保留这条只量字节的用例作为**活性事实**：证明 schema 合法的输入确实能渲染出超列宽的帧，
+// 所以上面那条 handler 用例测的不是死代码。它单独不足以守住 guard（review P1 已证），
+// 两条一起才完整。
+func TestTemplateSendPrecheckTargetIsReachableFromSchemaValidInput(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
 	rendered, err := catalog.RenderPayload(context.Background(), map[string]any{
 		"type": float64(17),
 		"template_ref": map[string]any{
 			"id": "ai.reasoning-process", "version": testReasoningVersionCurrent,
 		},
 		"state": "error",
-		"data":  rawJSONToMap(t, raw),
+		"data":  rawJSONToMap(t, worstCaseReasoningData(t)),
 	}, cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
 	if err != nil {
-		t.Fatalf("最坏形状必须 schema 合法、渲染得出来（否则测不到预检）: %v", err)
+		t.Fatalf("最坏形状必须 schema 合法、渲染得出来: %v", err)
 	}
-	// 与 sendMessage 同口径：预检量的是 Finalize 之后的出站帧。
 	if err := cardmsg.Finalize(rendered); err != nil {
 		t.Fatal(err)
 	}
@@ -217,16 +285,76 @@ func TestTemplateSendPrecheckCatchesSchemaValidButUnstorableFrame(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// ① 这一帧过得了 cardmsg 的 512 KiB 上限 —— 所以 send 侧靠 cardmsg 是拦不住的。
+	// ① 过得了 cardmsg 的 512 KiB 上限 —— 所以 send 侧靠 cardmsg 拦不住。
 	assert.NoError(t, cardmsg.RecheckPayloadSize(rendered),
 		"最坏帧应仍在 cardmsg.MaxPayloadBytes 内，否则它在渲染阶段就挂了，预检永远走不到")
-	// ② 但它存不下 —— 预检必须拦住，否则卡片发出后第一次编辑就被写入侧的闸拒掉。
+	// ② 但存不下。
 	assert.Greater(t, len(frame), carddispatch.MaxPersistedFrameBytes,
-		"schema 允许的最坏帧竟然装得下列宽 —— 若模板收窄到这个程度，预检可以移除；"+
-			"在那之前它是活的，不能当死代码删掉")
-
+		"schema 允许的最坏帧竟然装得下列宽 —— 若模板收窄到这个程度，预检可以移除；在那之前它是活的")
 	t.Logf("最坏帧 %d B = 列宽 %d B 的 %.0f%%（cardmsg 上限 %d B 拦不住它）",
 		len(frame), carddispatch.MaxPersistedFrameBytes,
 		100*float64(len(frame))/float64(carddispatch.MaxPersistedFrameBytes), cardmsg.MaxPayloadBytes)
+}
+
+// 预检必须按**首次编辑信封**量，而不是按发送帧量。编辑路径必然追加 card_seq、进度帧还会
+// 追加 transient（send.go 的 registry edit 分支）。所以按发送帧长度
+// 放行会留下一个与该开销同宽的窗口：落在其中的帧发得出去、第一次编辑就被写入侧的
+// 闸拒掉 —— 正是这道预检存在的理由（follow-up review）。字段长度连续可变，区间可达。
+func TestTemplateSendPrecheckAccountsForTheFirstEditEnvelope(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := catalog.RenderPayload(context.Background(), map[string]any{
+		"type": float64(17),
+		"template_ref": map[string]any{
+			"id": "ai.reasoning-process", "version": testReasoningVersionCurrent,
+		},
+		"state": "reasoning",
+		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
+	}, cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cardmsg.Finalize(rendered); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 复刻编辑路径的信封改写，取最坏值（int64 上界的 card_seq + transient）。
+	probe := make(map[string]interface{}, len(rendered)+2)
+	for k, v := range rendered {
+		probe[k] = v
+	}
+	probe["card_seq"] = int64(math.MaxInt64)
+	probe["transient"] = true
+	editFrame, err := json.Marshal(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	overhead := len(editFrame) - len(sendFrame)
+	assert.Positive(t, overhead,
+		"首次编辑信封必须比发送帧大，否则这条用例测的东西不存在")
+	t.Logf("发送帧 %d B → 首次编辑信封 %d B，开销 %d B（这就是按发送帧量会漏掉的窗口宽度）",
+		len(sendFrame), len(editFrame), overhead)
+
+	// 关键断言：一个恰好落在窗口里的帧 —— 发送帧装得下、编辑信封装不下 —— 必须被预检
+	// 用的那个判据拒掉。这里直接对判据下手，不必构造一张真到 65,491 B 的卡。
+	windowSend := strings.Repeat("x", carddispatch.MaxPersistedFrameBytes-overhead/2)
+	assert.LessOrEqual(t, len(windowSend), carddispatch.MaxPersistedFrameBytes,
+		"窗口内的发送帧按定义应装得下列宽")
+	assert.Greater(t, len(windowSend)+overhead, carddispatch.MaxPersistedFrameBytes,
+		"窗口内的帧加上编辑信封开销后应超出列宽 —— 否则窗口是空的，这条用例无意义")
+
+	// 同一份渲染结果，两种量法给出不同答案，这就是修复前后的差别。
+	assert.LessOrEqual(t, len(sendFrame), carddispatch.MaxPersistedFrameBytes,
+		"出厂样本的发送帧本来就远在列宽内（此处只是钉住前提）")
+	if _, err := carddispatch.NormalizeFrameForPersistence(string(editFrame)); err != nil {
+		t.Fatalf("出厂样本的首次编辑信封应通过判据: %v", err)
+	}
 }

@@ -57,16 +57,24 @@ const MaxPersistedFrameBytes = maxContentEditBytes
 // NormalizeFrameForPersistence 是「一帧卡片能否落库」的唯一判据。返回 canonical 字节
 // （cardmsg 已重算权威 plain），可直接写库。
 //
-// 覆盖面是**五条**写路径，不是三条（此前这段注释只列了前三条，而 #712 后续轮次又接进来
-// 两条 —— 一段断言了不成立的不变量的注释，正是那两轮 blocker 的成因，所以这里逐条列全）：
+// 覆盖面是**六处**，其中五处是写路径、一处是发送侧预检（此前这段注释只列了前三条，而
+// #712 后续轮次又接进来三处 —— 一段断言了不成立的不变量的注释，正是那两轮 blocker 的成因，
+// 所以这里逐条列全，并由 TestPersistenceJudgeCallSitesMatchItsDocumentedCount 钉住计数）：
 //
-//  1. CardMutator.Mutate（本文件）——  bot 模板编辑与内部生产者编辑
+// 写路径（帧确实要落库）：
+//
+//  1. CardMutator.Mutate（本文件）—— bot 模板编辑与内部生产者编辑
 //  2. pkg/cardtmpl CardUpdater.Append
 //  3. pkg/cardtmpl CardUpdater.ReplaceView
 //  4. modules/bot_api raw 卡片编辑分支 —— 一处调用覆盖它下游的三个写动作
 //     （card_seq CAS / 非 card_seq LWW / 修订历史追加，三者消费同一份字节）
 //  5. CardMutator.WriteCAS 自己再查一次宽度（见那里的注释）—— 不是重复，而是让
 //     旁路对未来的调用方也不可得，而非仅对今天的调用方关闭
+//
+// 非写路径（**不**落库，只借判据做判断）：
+//
+//  6. modules/bot_api 模板发送预检 —— 拿「最坏的首次编辑信封」问一次「这张卡将来编辑得动
+//     吗」。它不写任何东西；走这个函数是为了让宽度判据只有一份，而不是在发送侧抄一个魔数。
 //
 // 不在覆盖面内、且**刻意**不在的：modules/robot 与 modules/message 的 content_edit 写入
 // 载不了卡片帧（两者都在 cardmsg.RejectsCardEdit 之后，type-17 双向都拒），非卡片的

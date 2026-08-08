@@ -1207,7 +1207,7 @@ func parseStringTruncations(schema map[string]any) ([]jsonTemplateStringTruncati
 		// must not be read with `v, _ := ...`: for an optional field that idiom maps
 		// a wrong-typed value onto the same "" the absent case produces, so the
 		// declaration silently changes meaning. See optionalStringField.
-		arrayField, err := optionalStringField(entry, "arrayField")
+		arrayField, err := optionalTrimmedStringField(entry, "arrayField")
 		if err != nil {
 			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
 		}
@@ -1322,6 +1322,25 @@ func optionalStringField(entry map[string]any, key string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%s must be a string", key)
 	}
+	return value, nil
+}
+
+// optionalTrimmedStringField is optionalStringField plus a trim requirement, for the
+// fields that name a schema path — an untrimmed one can never match a property name,
+// so accepting it would only defer the failure.
+//
+// Deliberately NOT applied to `ellipsis` (review of #716): that field is display text,
+// not a path, and the pre-#716 parser used it verbatim. A leading-space suffix like
+// " …" is a legitimate typographic choice, so trimming it would turn a
+// correctly-typed value from accepted into rejected — a tightening beyond "only
+// present-but-wrong-typed becomes an error", which is the contract this change
+// declared. Sharing one helper across both kinds of field is what introduced that
+// over-reach; keeping them separate is what prevents it.
+func optionalTrimmedStringField(entry map[string]any, key string) (string, error) {
+	value, err := optionalStringField(entry, key)
+	if err != nil {
+		return "", err
+	}
 	if value != strings.TrimSpace(value) {
 		return "", fmt.Errorf("%s must be trimmed", key)
 	}
@@ -1342,8 +1361,13 @@ func requiredStringField(entry map[string]any, key string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%s must be a string", key)
 	}
-	if value == "" || value != strings.TrimSpace(value) {
-		return "", fmt.Errorf("%s is required and must be trimmed", key)
+	// 空串与「有前后空白」是两条不同的规则，分开报 —— 本次改动的目标就是修这类
+	// 「消息指控了一条值没违反的规则」（review of #716）。空串本身是 trimmed 的。
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", key)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s must be trimmed", key)
 	}
 	return value, nil
 }
