@@ -243,3 +243,61 @@ func TestMaxPersistedFrameBytesTracksTheGate(t *testing.T) {
 		t.Fatalf("MaxPersistedFrameBytes+1 个字节应被拒，得到 %v", err)
 	}
 }
+
+// NormalizeFrameForPersistence 的文档注释逐条列出了它覆盖的五条写路径。这类枚举会漂移，
+// 而一段断言了不成立的不变量的注释正是 #712 里两轮 blocker 的成因（注释说「所有回写路径
+// 都走这个判据」，而 raw 编辑分支和 WriteCAS 都不走）。所以这里用源码守卫钉住计数：调用点
+// 增减时测试失败，逼着改注释，而不是等下一个人相信一段过时的断言。
+func TestPersistenceJudgeCallSitesMatchItsDocumentedCount(t *testing.T) {
+	// 注释里声明的条数。改这个数就必须同步改上面那段枚举。
+	const documented = 5
+
+	roots := map[string]string{
+		"internal/carddispatch": ".",
+		"modules/bot_api":       "../../modules/bot_api",
+		"pkg/cardtmpl":          "../../pkg/cardtmpl",
+	}
+	callRE := regexp.MustCompile(`NormalizeFrameForPersistence\(`)
+	// WriteCAS 自己查宽度，不经过那个函数，所以按注释第 5 条单独计。
+	standaloneRE := regexp.MustCompile(`len\(request\.ContentEdit\) > maxContentEditBytes`)
+
+	sites := 0
+	standalone := 0
+	for label, dir := range roots {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", label, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			body, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("read %s/%s: %v", label, name, err)
+			}
+			text := string(body)
+			// 函数自身的声明与注释里的提及不算调用点。
+			for _, line := range strings.Split(text, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "func NormalizeFrameForPersistence") {
+					continue
+				}
+				if callRE.MatchString(line) {
+					sites++
+				}
+				if standaloneRE.MatchString(line) {
+					standalone++
+				}
+			}
+		}
+	}
+
+	if got := sites + standalone; got != documented {
+		t.Fatalf("持久化判据的写路径实测 %d 条（%d 处调用 + %d 处独立设闸），注释声明 %d 条。\n"+
+			"增删了写路径就要同步 NormalizeFrameForPersistence 的注释枚举 —— 一段过时的\n"+
+			"「所有路径都走这里」正是 #712 两轮 blocker 的成因。",
+			got, sites, standalone, documented)
+	}
+}

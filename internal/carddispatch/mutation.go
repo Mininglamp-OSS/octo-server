@@ -54,9 +54,23 @@ const maxContentEditBytes = 65535
 // 等于发出即报废，所以它需要拿到同一个数而不是自己抄一份 —— 抄的那份会漂移。
 const MaxPersistedFrameBytes = maxContentEditBytes
 
-// NormalizeFrameForPersistence 是「一帧卡片能否落库」的唯一判据，所有在写入前重新校验
-// 帧的路径都必须走它：CardMutator.Mutate、以及 pkg/cardtmpl 的 CardUpdater.Append /
-// ReplaceView。返回的是 canonical 字节（cardmsg 已重算权威 plain），可直接写库。
+// NormalizeFrameForPersistence 是「一帧卡片能否落库」的唯一判据。返回 canonical 字节
+// （cardmsg 已重算权威 plain），可直接写库。
+//
+// 覆盖面是**五条**写路径，不是三条（此前这段注释只列了前三条，而 #712 后续轮次又接进来
+// 两条 —— 一段断言了不成立的不变量的注释，正是那两轮 blocker 的成因，所以这里逐条列全）：
+//
+//  1. CardMutator.Mutate（本文件）——  bot 模板编辑与内部生产者编辑
+//  2. pkg/cardtmpl CardUpdater.Append
+//  3. pkg/cardtmpl CardUpdater.ReplaceView
+//  4. modules/bot_api raw 卡片编辑分支 —— 一处调用覆盖它下游的三个写动作
+//     （card_seq CAS / 非 card_seq LWW / 修订历史追加，三者消费同一份字节）
+//  5. CardMutator.WriteCAS 自己再查一次宽度（见那里的注释）—— 不是重复，而是让
+//     旁路对未来的调用方也不可得，而非仅对今天的调用方关闭
+//
+// 不在覆盖面内、且**刻意**不在的：modules/robot 与 modules/message 的 content_edit 写入
+// 载不了卡片帧（两者都在 cardmsg.RejectsCardEdit 之后，type-17 双向都拒），非卡片的
+// richtext content_edit 仍未对列宽设限（既有债，不在本函数职责内）。
 //
 // 为什么要有这个函数而不是各调用点自己拼：PR#712 的 P0 就是各点自己拼出来的 ——
 // 渲染侧和回写侧对「同一帧是否合法」给出了不同答案，于是卡片发得出去、编辑必失败。
