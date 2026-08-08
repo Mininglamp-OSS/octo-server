@@ -79,14 +79,16 @@ platform-owned.
   was found in current octo-web/main.
 - Use the neutral Lucide `git-branch` icon for both sources; visible source text
   differentiates GitHub from GitLab. The reviewed source is Lucide
-  `0.577.0`, official repository `lucide-icons/lucide`, licensed under ISC.
+  `0.577.0`, official repository `lucide-icons/lucide`. Its upstream license
+  file carries ISC terms plus the MIT notice for Feather-derived portions.
 - Vendor one compact, URL-encoded `data:image/svg+xml,...` constant with a
   fixed neutral stroke suitable for the Forge card header. Do not use base64,
   runtime Iconify/CDN fetches, arbitrary SVG registration, or caller-supplied
   icon bytes.
-- Add the Lucide copyright, source/version, and ISC license notice to the
-  repository's third-party notice material. The icon constant must document
-  the upstream file and any byte-level modifications (size/color/minification).
+- Add the Lucide copyright, source/version, ISC terms, and Feather MIT notice
+  to the repository's third-party notice material. The icon constant must
+  document the upstream file and any byte-level modifications
+  (size/color/minification).
 
 ## Proposed design
 
@@ -242,7 +244,8 @@ Event builders supply only event-specific content and safe semantic literals.
   markdown cannot create links/emphasis/lists, non-HTTP(S) destinations cannot
   become actions, and malformed icon/navigation data degrades safely.
 - `NOTICE` (or the repository's canonical third-party notice location)
-  contains the Lucide 0.577.0 source, copyright, and ISC license notice.
+  contains the Lucide 0.577.0 source, copyright, ISC terms, and Feather MIT
+  notice from that release's upstream license file.
 
 ### Compatibility and visual verification
 

@@ -55,6 +55,12 @@ func buildCardPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverrid
 		// space_id 由服务端从 group 派生，不接受调用方覆盖（与 buildPayload 一致）。
 		"space_id": m.SpaceID,
 	}
+	// renderProfile is intentionally package-internal: server-authored producers
+	// may opt into a renderer contract, while native request JSON cannot forge or
+	// override it. Add it before both authoritative validation passes.
+	if req.renderProfile != "" {
+		payload["render_profile"] = req.renderProfile
+	}
 	if err := cardmsg.Validate(payload); err != nil {
 		return nil, err
 	}

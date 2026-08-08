@@ -141,15 +141,16 @@ func httpURLForCard(raw string) string {
 // already-safe markdown (composed with escapeCardText / cardCodeSpan); the assembler
 // does not re-escape.
 type vcsCardData struct {
-	source   string    // "GitHub" / "GitLab": metadata.octo.source.label + button label
-	variant  string    // metadata.octo.variant, e.g. "vcs.github.push"
-	headline string    // bold title line (whole TextBlock is Bolder)
-	status   string    // "", "Attention", "Good", "Warning" — headline color (pipeline status)
-	subtitle string    // subtle repo/context line; "" omits it
-	lines    []string  // body lines (commit list / "#N · title"); each its own TextBlock
-	facts    []vcsFact // labeled metadata rows (pipeline Branch/Status/Duration/Jobs); "" omits the FactSet
-	quote    string    // comment snippet; "" omits it; rendered in an emphasis Container
-	url      string    // Action.OpenUrl target (already http(s)-validated); "" omits the button
+	source     string    // "GitHub" / "GitLab": metadata.octo.source.label + button label
+	variant    string    // metadata.octo.variant, e.g. "vcs.github.push"
+	badge      string    // fixed event label, or an escaped pipeline status
+	badgeColor string    // optional semantic color for the pipeline status badge
+	headline   string    // bold title line in the neutral content surface
+	subtitle   string    // subtle repository/project context in the header; "" omits it
+	lines      []string  // body lines (commit list / "#N · title"); each its own TextBlock
+	facts      []vcsFact // labeled metadata rows (pipeline Branch/Status/Duration/Jobs); "" omits the FactSet
+	quote      string    // comment snippet; "" omits it; rendered in an emphasis Container
+	url        string    // Action.OpenUrl target (already http(s)-validated); "" omits the footer
 }
 
 // vcsFact is one FactSet row (title/value already-safe markdown; the assembler does
@@ -165,22 +166,15 @@ type vcsFact struct {
 // ActionSet(Action.OpenUrl).
 func (d vcsCardData) card(lang string) map[string]interface{} {
 	headline := map[string]interface{}{
-		"type": "TextBlock", "text": d.headline, "weight": "Bolder", "wrap": true,
+		"type": "TextBlock", "id": "vcs-headline", "text": d.headline,
+		"weight": "Bolder", "wrap": true,
 	}
-	if d.status != "" {
-		headline["color"] = d.status
-	}
-	body := []interface{}{headline}
-	if d.subtitle != "" {
-		body = append(body, map[string]interface{}{
-			"type": "TextBlock", "text": d.subtitle, "isSubtle": true, "spacing": "None", "wrap": true,
-		})
-	}
+	contentItems := []interface{}{headline}
 	for _, ln := range d.lines {
 		if ln == "" {
 			continue
 		}
-		body = append(body, map[string]interface{}{
+		contentItems = append(contentItems, map[string]interface{}{
 			"type": "TextBlock", "text": ln, "wrap": true, "spacing": "Small",
 		})
 	}
@@ -189,14 +183,66 @@ func (d vcsCardData) card(lang string) map[string]interface{} {
 		for _, f := range d.facts {
 			facts = append(facts, map[string]interface{}{"title": f.title, "value": f.value})
 		}
-		body = append(body, map[string]interface{}{"type": "FactSet", "facts": facts})
+		contentItems = append(contentItems, map[string]interface{}{"type": "FactSet", "facts": facts})
 	}
 	if d.quote != "" {
-		body = append(body, map[string]interface{}{
+		contentItems = append(contentItems, map[string]interface{}{
 			"type": "Container", "style": "emphasis",
 			"items": []interface{}{
 				map[string]interface{}{"type": "TextBlock", "text": d.quote, "wrap": true, "isSubtle": true},
 			},
+		})
+	}
+
+	headerColumns := []interface{}{
+		map[string]interface{}{
+			"type": "Column", "width": "auto",
+			"items": []interface{}{map[string]interface{}{
+				"type": "Image", "id": "vcs-source-icon", "url": cardmsg.VCSGitBranchIcon,
+				"width": "16px", "height": "16px", "spacing": "None",
+			}},
+		},
+		map[string]interface{}{
+			"type": "Column", "width": "stretch", "spacing": "Small",
+			"items": vcsHeaderTextItems(d.source, d.subtitle),
+		},
+	}
+	if d.badge != "" {
+		badge := map[string]interface{}{
+			"type": "TextBlock", "id": "vcs-event-badge", "text": d.badge,
+			"size": "Small", "weight": "Bolder", "spacing": "None", "wrap": false,
+		}
+		if d.badgeColor != "" {
+			badge["color"] = d.badgeColor
+		}
+		headerColumns = append(headerColumns, map[string]interface{}{
+			"type": "Column", "width": "auto", "spacing": "Small",
+			"items": []interface{}{badge},
+		})
+	}
+	body := []interface{}{
+		map[string]interface{}{
+			"type": "ColumnSet", "id": "vcs-header", "spacing": "None",
+			"verticalContentAlignment": "Center", "columns": headerColumns,
+		},
+		map[string]interface{}{
+			"type": "Container", "id": "vcs-content", "style": "accent", "bleed": true,
+			"separator": true, "spacing": "Small", "items": contentItems,
+		},
+	}
+	if d.url != "" {
+		// Navigation remains one structured Action.OpenUrl. The destination was
+		// preflighted by httpURLForCard and is checked again by cardmsg.Validate;
+		// it is not duplicated into unvalidated metadata or card.actions.
+		body = append(body, map[string]interface{}{
+			"type": "Container", "id": "vcs-footer", "style": "emphasis", "bleed": true,
+			"separator": true, "spacing": "None",
+			"items": []interface{}{map[string]interface{}{
+				"type": "ActionSet", "spacing": "None",
+				"actions": []interface{}{map[string]interface{}{
+					"type": "Action.OpenUrl", "title": vcsViewLabel(d.source, lang), "url": d.url,
+				}},
+			}},
 		})
 	}
 	metaOcto := map[string]interface{}{"source": map[string]interface{}{"label": d.source}}
@@ -209,19 +255,21 @@ func (d vcsCardData) card(lang string) map[string]interface{} {
 		"metadata": map[string]interface{}{"octo": metaOcto},
 		"body":     body,
 	}
-	// Navigation is the single structured Action.OpenUrl (allowlisted by both
-	// httpURLForCard and cardmsg.Validate). We deliberately do NOT also mirror the URL
-	// into metadata.webUrl: cardmsg's validator does not walk the metadata subtree, so
-	// carrying a URL there would rely on incidental coupling for the "every rendered URL
-	// was allowlisted" invariant (PR #596 review, yujiawei P2).
-	if d.url != "" {
-		card["actions"] = []interface{}{
-			map[string]interface{}{
-				"type": "Action.OpenUrl", "title": vcsViewLabel(d.source, lang), "url": d.url,
-			},
-		}
-	}
 	return card
+}
+
+func vcsHeaderTextItems(source, context string) []interface{} {
+	items := []interface{}{map[string]interface{}{
+		"type": "TextBlock", "id": "vcs-source-label", "text": source,
+		"size": "Small", "weight": "Bolder", "spacing": "None", "wrap": false,
+	}}
+	if context != "" {
+		items = append(items, map[string]interface{}{
+			"type": "TextBlock", "id": "vcs-source-context", "text": context,
+			"size": "Small", "isSubtle": true, "spacing": "None", "wrap": true,
+		})
+	}
+	return items
 }
 
 // vcsViewLabel localizes the "View on {GitHub|GitLab}" action title via the
@@ -244,10 +292,11 @@ func isZhLang(lang string) bool {
 // (from / space_id) are not needed by Validate (it checks structure / URL / size).
 func validateVCSCard(card map[string]interface{}) error {
 	return cardmsg.Validate(map[string]interface{}{
-		"type":         cardmsg.InteractiveCard.Int(),
-		"card":         card,
-		"card_version": cardmsg.CardVersion,
-		"profile":      cardmsg.ProfileV1,
+		"type":           cardmsg.InteractiveCard.Int(),
+		"card":           card,
+		"card_version":   cardmsg.CardVersion,
+		"profile":        cardmsg.ProfileV1,
+		"render_profile": cardmsg.RenderProfileOctoChatV1,
 	})
 }
 
@@ -266,7 +315,11 @@ func vcsPushReq(text string, card map[string]interface{}) *pushPayloadReq {
 			zap.L().Warn("incomingwebhook: built VCS card failed self-validation; degrading to text",
 				zap.Error(err))
 		} else {
-			return &pushPayloadReq{MsgType: msgTypeCard, Card: card}
+			return &pushPayloadReq{
+				MsgType:       msgTypeCard,
+				Card:          card,
+				renderProfile: cardmsg.RenderProfileOctoChatV1,
+			}
 		}
 	}
 	return &pushPayloadReq{Content: clipRunes(text, maxContentRunes())}
@@ -288,14 +341,23 @@ const maxRenderedLabels = 10
 const cardFactItemMax = 64
 
 // cappedFactValue builds a capped, "/"-joined FactSet value from raw external name
-// strings — shared by the pipeline card's Jobs fact and the GitLab MR/Issue Labels
-// fact (previously duplicated inline at each call site, which could let their
-// escaping/capping decisions silently drift apart). Each name is escaped via
+// strings for GitHub/GitLab PR/MR/Issue Labels. Each name is escaped via
 // escapeCardText; blank names (e.g. an empty label title) are dropped before capping
 // and counting, so the fact never shows an empty slot or an inflated (N). Returns
 // ("", 0) when there is nothing left to show — the caller omits the FactSet row
 // entirely in that case.
 func cappedFactValue(rawNames []string, max int) (value string, count int) {
+	return cappedFactValueWithSeparator(rawNames, max, " / ", " …")
+}
+
+// cappedPipelineJobsValue preserves the same filtering, escaping, ordering, cap,
+// count, and overflow semantics as Labels, but gives every rendered job its own
+// line. It is intentionally pipeline-only so Labels retain their slash separator.
+func cappedPipelineJobsValue(rawNames []string, max int) (value string, count int) {
+	return cappedFactValueWithSeparator(rawNames, max, "\n", "\n…")
+}
+
+func cappedFactValueWithSeparator(rawNames []string, max int, separator, overflowSuffix string) (value string, count int) {
 	names := make([]string, 0, len(rawNames))
 	for _, n := range rawNames {
 		if v := escapeCardText(n, cardFactItemMax); v != "" {
@@ -310,9 +372,9 @@ func cappedFactValue(rawNames []string, max int) (value string, count int) {
 	if overflow {
 		shown = names[:max]
 	}
-	value = strings.Join(shown, " / ")
+	value = strings.Join(shown, separator)
 	if overflow {
-		value += " …"
+		value += overflowSuffix
 	}
 	return value, len(names)
 }
@@ -331,15 +393,13 @@ func vcsCardLabelsFor(lang string) vcsCardLabels {
 	return vcsCardLabels{source: "Source", target: "Target", labels: "Labels"}
 }
 
-// pipelineLabels are the localized FactSet titles for the pipeline card.
+// pipelineLabels are deliberately language-neutral: product terminology for the
+// pipeline card remains English even when the surrounding action title is localized.
 type pipelineLabels struct {
 	branch, status, duration, jobs string
 }
 
-func pipelineLabelsFor(lang string) pipelineLabels {
-	if isZhLang(lang) {
-		return pipelineLabels{branch: "分支", status: "状态", duration: "耗时", jobs: "任务"}
-	}
+func pipelineLabelsFor(_ string) pipelineLabels {
 	return pipelineLabels{branch: "Branch", status: "Status", duration: "Duration", jobs: "Jobs"}
 }
 
@@ -376,9 +436,8 @@ func formatPipelineDuration(sec int) string {
 	}
 }
 
-// pipelineStatusColor maps a GitLab terminal pipeline status to an AC TextBlock
-// color so the headline reads at a glance (success green / failed red / canceled
-// amber). Unknown → "" (default color).
+// pipelineStatusColor maps a GitLab pipeline status to the compact badge color.
+// The headline stays neutral. Unknown → "" (default badge color).
 func pipelineStatusColor(status string) string {
 	switch status {
 	case "success":
