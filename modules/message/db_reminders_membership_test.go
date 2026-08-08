@@ -29,6 +29,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -478,4 +479,54 @@ func TestChannelLevelReminderChannelTypes(t *testing.T) {
 
 	assert.True(t, covered[common.ChannelTypeGroup.Uint8()], "Group 必须被覆盖")
 	assert.True(t, covered[common.ChannelTypeCommunityTopic.Uint8()], "CommunityTopic 必须被覆盖")
+}
+
+// TestActiveMemberGroupNos_IsTheAuthorizationSource 覆盖授权数据来源本身。
+//
+// 上面的用例都把成员集合当参数传进 sync，验证的是"给定正确集合时谓词是否正确"。
+// 但集合是 group.IService.ActiveMemberGroupNos 算出来的 —— 它错了，谓词再对也没用。
+// 这里用 message 侧的真实调用方式（groupService.ActiveMemberGroupNos）打真库，
+// 把 fail-closed 口径钉死：退群、被拉黑都不算成员。
+func TestActiveMemberGroupNos_IsTheAuthorizationSource(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	remMemberSeed(t, ctx)
+
+	svc := group.NewService(ctx)
+	got, err := svc.ActiveMemberGroupNos(remUIDA)
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{remGroupA}, got,
+		"只有活跃成员关系算数：remGroupC 已退群(is_deleted=1)、remGroupD 被拉黑(status!=Normal)")
+
+	// B 在 remGroupB 里，A 不在 —— 换个人算出来的集合必须不同，否则说明 uid 没生效。
+	gotB, err := svc.ActiveMemberGroupNos(remUIDB)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{remGroupB}, gotB)
+
+	// 不存在的用户拿到空集合而不是全量 —— 空集合下 sync 不得放行任何类型 2/5。
+	gotNobody, err := svc.ActiveMemberGroupNos("u_nobody")
+	require.NoError(t, err)
+	assert.Empty(t, gotNobody)
+}
+
+// TestRemindersSync_EndToEndWithRealMembershipSource 把两半接起来：成员集合不再是
+// 手写常量，而是与 handler 同一条路径算出来的。任何一侧的口径漂移都会在这里显形。
+func TestRemindersSync_EndToEndWithRealMembershipSource(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	remMemberSeed(t, ctx)
+
+	// handler 里就是这两行（api_reminders.go）。
+	memberGroupNos, err := group.NewService(ctx).ActiveMemberGroupNos(remUIDA)
+	require.NoError(t, err)
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, memberGroupNos)
+	require.NoError(t, err)
+
+	ids := channelLevelIDsOf(got)
+	assert.NotContains(t, ids, remGroupB, "端到端仍不得泄露非成员频道")
+	assert.NotContains(t, ids, remGroupC, "退群后不再可见")
+	assert.NotContains(t, ids, remGroupD, "被拉黑后不再可见")
+	assert.Contains(t, ids, remGroupA)
+	assert.Contains(t, ids, remTopicA, "子区经父群成员关系可见")
 }
