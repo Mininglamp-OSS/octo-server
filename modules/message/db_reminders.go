@@ -74,6 +74,18 @@ func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, chann
 // 手写副本，再加一处只会让它们更容易漂移（PR#717 review P2-5）。
 const topicChannelSeparator = thread.ChannelIDSeparator
 
+// unscopedChannelTypes 是「没有成员来源、按改动前行为原样放行」的频道类型白名单。
+// 逐条理由见 channelLevelVisibility 的说明。
+//
+// 元素类型是 int 而非 uint8：Go 里 []uint8 就是 []byte，dbr 会把它当二进制串插值，
+// 生成的不是 IN 列表。这个坑不会报错，只会静默产出一个匹配不上任何行的谓词。
+var unscopedChannelTypes = []int{
+	int(common.ChannelTypePerson.Uint8()),          // 1：channel_id 自描述，可判定当事人；留着是因无已知生产者
+	int(common.ChannelTypeCustomerService.Uint8()), // 3：全仓无生产者
+	int(common.ChannelTypeCommunity.Uint8()),       // 4：全仓无生产者
+	int(common.ChannelTypeInfo.Uint8()),            // 6：全仓无生产者
+}
+
 // channelLevelVisibility 构造「频道级（uid=”）提醒对本调用方可见」的 SQL 谓词。
 //
 // 为什么需要它：uid=” 按建表注释表示「提醒项为整个频道内的成员」，也就是说这条
@@ -82,14 +94,15 @@ const topicChannelSeparator = thread.ChannelIDSeparator
 // 拿到自己从未加入的频道的 channel_id / publisher / message_id / message_seq。
 // channelIDs 由客户端提供，只能用来**收窄**，永远不能充当授权依据。
 //
-// 覆盖范围只有 Group 与 CommunityTopic 两种频道类型，这是刻意的：
+// 成员校验只覆盖 Group 与 CommunityTopic；其余类型走 unscopedChannelTypes 白名单
+// 原样放行，理由见该变量上的逐条注释（3/4/6 无生产者；1 可判定但无已知生产者）。
 //
-//	类型 1 Person / 3 CustomerService / 4 Community / 6 Info 在 octo-server 侧
-//	没有可用的成员关系表（会话在 WuKongIM，conversation_extra 只是元数据），
-//	一律要求 group_member 会把这些类型的合法提醒静默丢掉 —— 那是功能回归，不是
-//	安全收益。而 hasMention 不判频道类型，理论上这些类型也能产生频道级提醒，
-//	所以这里是一处**知情保留的残留**，由 TestChannelLevelReminderChannelTypes
-//	守卫：一旦有新的写入路径让这些类型真的产生频道级提醒，该测试转红。
+// **用白名单而不是 `not in (2,5)` 黑名单**，是 PR#717 review P1 的整改：黑名单下
+// 「2/5 之外的任何值」都放行，包括将来往 common.ChannelType 里新增的枚举值 ——
+// 而 hasMention 不判频道类型，新类型会立刻产生全局可读的频道级行。reviewer 用
+// channel_type=99 实测过。改成白名单后未知类型默认**拒绝**：新增枚举值的失败模式
+// 从「悄悄泄露」变成「悄悄不可见」，后者才是安全的方向，且要让它可见必须有人显式
+// 加进上面的白名单 —— 那是一次留痕的决策，不是默认行为。
 //
 // memberGroupNos 必须来自成员关系反推（group.IService.ActiveMemberGroupNos），
 // 口径 is_deleted=0 AND status=Normal，不可用客户端传入的集合替代。
@@ -103,21 +116,23 @@ func channelLevelVisibility(memberGroupNos []string) (string, []interface{}) {
 	grp := common.ChannelTypeGroup.Uint8()
 	topic := common.ChannelTypeCommunityTopic.Uint8()
 	if len(memberGroupNos) == 0 {
-		// 不是任何群的活跃成员：类型 2/5 一条都不可见。不能生成 `IN ()`——那不是
-		// 合法 SQL，而 dbr 对空切片的展开行为也不该被依赖。
-		return "reminders.channel_type not in (?,?)", []interface{}{grp, topic}
+		// 不是任何群的活跃成员：类型 2/5 一条都不可见，其余按白名单放行。
+		// 不能生成 `IN ()`——那不是合法 SQL；unscopedChannelTypes 恒非空，无此风险。
+		return "reminders.channel_type in ?", []interface{}{unscopedChannelTypes}
 	}
 	// 子区那一支的分隔符计数条件（`… = 1`）是为了与 thread.ParseChannelID 口径一致：
 	// 它用 strings.Split 要求**恰好**两段，"g____a____b" 直接判非法；而单靠
 	// substring_index 只取第一段，会把这种畸形 ID 当成属于 g（PR#717 review）。
-	// 构造不出可利用路径（channel_id 由写入方按规范拼接，第一段本来就是所属群），
-	// 但"更宽松但大概没事"是个需要每次重新论证的状态，收成一致更省事。
-	return "(reminders.channel_type not in (?,?)" +
+	//
+	// 两侧都用 length()（字节）：除数绑的是 Go 的 len(sep)，也是字节。改动前这里是
+	// char_length()（字符），只因分隔符恰好是 ASCII 才等价 —— 一个授权谓词里不该
+	// 埋着「只要分隔符一直是 ASCII 就成立」这种隐含前提（PR#717 review P2-2）。
+	return "(reminders.channel_type in ?" +
 			" or (reminders.channel_type=? and reminders.channel_id in ?)" +
 			" or (reminders.channel_type=? and substring_index(reminders.channel_id,?,1) in ?" +
-			" and (char_length(reminders.channel_id)-char_length(replace(reminders.channel_id,?,'')))/?=1))",
+			" and (length(reminders.channel_id)-length(replace(reminders.channel_id,?,'')))/?=1))",
 		[]interface{}{
-			grp, topic,
+			unscopedChannelTypes,
 			grp, memberGroupNos,
 			topic, topicChannelSeparator, memberGroupNos,
 			topicChannelSeparator, len(topicChannelSeparator),

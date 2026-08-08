@@ -417,12 +417,11 @@ func TestRemindersSync_SurvivesGroupMemberCollationMismatch(t *testing.T) {
 func TestChannelLevelVisibility_EmptyMemberSet(t *testing.T) {
 	sql, args := channelLevelVisibility(nil)
 
-	assert.NotContains(t, sql, "in ?",
-		"空成员集合不得生成 IN 子句")
-	assert.Contains(t, sql, "not in (?,?)")
-	assert.Equal(t,
-		[]interface{}{common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8()},
-		args, "空集合下只应绑定被覆盖的两个频道类型")
+	assert.NotContains(t, sql, "not in",
+		"谓词必须是白名单：黑名单会放行任何枚举外的新类型（PR#717 review P1）")
+	assert.Contains(t, sql, "reminders.channel_type in ?")
+	assert.Equal(t, []interface{}{unscopedChannelTypes}, args,
+		"空集合下只应绑定不受成员约束的类型白名单，Group/CommunityTopic 一律不可见")
 }
 
 // TestChannelLevelReminderChannelTypes 守卫"知情保留的残留"。
@@ -440,8 +439,16 @@ func TestChannelLevelVisibility_EmptyMemberSet(t *testing.T) {
 //
 // 二者之差就是残留集合，必须与下面的 wantResidual 逐字相等。于是：
 //   - 有人给 getReminders 加了频道类型门禁 → 差集变小 → 红，提示可以收缩残留；
-//   - 有人新增了能产生频道级提醒的类型 → 差集变大 → 红，提示新类型正在泄露；
 //   - 有人扩展了 channelLevelVisibility → 差集变小 → 红，提示更新本表。
+//
+// **本测试不覆盖「往 common.ChannelType 追加新枚举值」**，而 PR 描述一度声称它覆盖
+// （PR#717 review P1）：allTypes 是手写字面量，看不见新值，于是差集不变、测试照绿。
+// 追加类型这一路改由**代码**兜底而不是测试：channelLevelVisibility 已从黑名单
+// (`not in (2,5)`) 改成白名单，未知类型默认拒绝，失败模式是「不可见」而非「泄露」。
+// 见 TestRemindersSync_UnknownChannelTypeIsDenied。
+//
+// 这个区分要写明白：一个声称覆盖了实则没覆盖的保证，比一个如实记录的开放缺口更糟 ——
+// 它会成为将来某人引用的「我们有测试」。
 //
 // 任何一种都必须由人来复核，而不是悄悄改变授权边界。
 func TestChannelLevelReminderChannelTypes(t *testing.T) {
@@ -477,14 +484,17 @@ func TestChannelLevelReminderChannelTypes(t *testing.T) {
 		}
 	}
 
-	// channelLevelVisibility 覆盖的类型：非空成员集合下前两个绑定参数即被覆盖类型。
-	_, args := channelLevelVisibility([]string{"g_any"})
-	require.GreaterOrEqual(t, len(args), 2)
+	// 受成员约束的类型 = 不在白名单里的类型。白名单是唯一的放行入口，所以从它反推
+	// 比解析 SQL 参数位置稳固：谓词形状变了这里不用跟着改，语义变了才会红。
+	unscoped := map[uint8]bool{}
+	for _, ct := range unscopedChannelTypes {
+		unscoped[uint8(ct)] = true
+	}
 	covered := map[uint8]bool{}
-	for _, a := range args[:2] {
-		ct, ok := a.(uint8)
-		require.True(t, ok, "channelLevelVisibility 的前两个参数应为频道类型")
-		covered[ct] = true
+	for _, ct := range allTypes {
+		if !unscoped[ct] {
+			covered[ct] = true
+		}
 	}
 
 	residual := make([]uint8, 0, len(allTypes))
@@ -609,8 +619,10 @@ func TestRemindersSync_EmptyCallerUIDIsRejected(t *testing.T) {
 func TestChannelLevelVisibility_TopicRequiresExactlyOneSeparator(t *testing.T) {
 	sql, _ := channelLevelVisibility([]string{"g_any"})
 
-	assert.Contains(t, sql, "char_length",
+	assert.Contains(t, sql, "length(reminders.channel_id)",
 		"子区分支必须带分隔符计数条件，否则畸形 ID 会继承第一段的成员关系")
+	assert.NotContains(t, sql, "char_length",
+		"除数绑的是 Go 的 len()（字节），两侧必须都用 length() 而非 char_length()")
 	assert.Contains(t, sql, "substring_index")
 }
 
@@ -634,4 +646,68 @@ func TestRemindersSync_MalformedTopicIDDoesNotInheritParent(t *testing.T) {
 		"畸形子区 ID 不得凭第一段继承父群成员关系（thread.ParseChannelID 会判其非法）")
 	// 合法子区仍然可见，确认收紧没有误伤。
 	assert.Contains(t, channelLevelIDsOf(got), remTopicA)
+}
+
+// TestRemindersSync_UnknownChannelTypeIsDenied 是 PR#717 review P1 的直接回归。
+//
+// reviewer 用 channel_type=99 实测：黑名单谓词 `not in (2,5)` 下，任何枚举外的值
+// 都放行，而守卫测试因为 allTypes 是手写字面量、看不见新值，照样是绿的。
+// 白名单谓词把未知类型的失败模式从「悄悄泄露」翻转成「悄悄不可见」。
+//
+// 99 在这里代表"任何不在 unscopedChannelTypes 也不是 2/5 的值"，包括将来往
+// common.ChannelType 里追加的枚举成员。
+func TestRemindersSync_UnknownChannelTypeIsDenied(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	myGroups := remMemberSeed(t, ctx)
+
+	const unknownType = 99
+	_, err := ctx.DB().Exec(
+		"INSERT INTO reminders (channel_id, channel_type, uid, publisher, version, reminder_type, text) VALUES (?,?,'',?,?,1,'[有人@我]')",
+		"future_ch", unknownType, remUIDB, 40)
+	require.NoError(t, err)
+
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, myGroups)
+	require.NoError(t, err)
+
+	assert.NotContains(t, channelLevelIDsOf(got), "future_ch",
+		"枚举外的频道类型必须默认拒绝；黑名单谓词会放行它并且守卫测试察觉不到")
+
+	// 成员集合为空的分支走的是另一段 SQL，同样必须拒绝。
+	gotNoGroups, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, channelLevelIDsOf(gotNoGroups), "future_ch",
+		"空成员集合分支同样必须拒绝未知类型")
+}
+
+// TestRemindersSync_TopicWithoutSeparatorIsDenied —— PR#717 review P2-3。
+//
+// 分隔符计数条件要求恰好一个，所以 channel_id 里一个分隔符都没有的 type-5 行现在
+// 被排除；改动前 substring_index 会返回整串、从而匹配上同名的群。方向是 fail-closed
+// 且 thread.BuildChannelID 不可能产生这种 ID，但这是比"收紧子区 ID 解析"字面含义
+// 更宽的一个行为变化，值得钉住。
+func TestRemindersSync_TopicWithoutSeparatorIsDenied(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	myGroups := remMemberSeed(t, ctx)
+
+	// channel_id 恰好等于调用方所属的群，但声明成子区类型且不含分隔符。
+	_, err := ctx.DB().Exec(
+		"INSERT INTO reminders (channel_id, channel_type, uid, publisher, version, reminder_type, text) VALUES (?,?,'',?,?,1,'[有人@我]')",
+		remGroupA, common.ChannelTypeCommunityTopic.Uint8(), remUIDB, 41)
+	require.NoError(t, err)
+
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, myGroups)
+	require.NoError(t, err)
+
+	var bare int
+	for _, r := range got {
+		if r.UID == "" && r.ChannelID == remGroupA &&
+			r.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			bare++
+		}
+	}
+	assert.Zero(t, bare, "无分隔符的 type-5 行不得靠整串匹配群成员关系")
+	// 同名的群类型行仍然正常可见，确认没有误伤。
+	assert.Contains(t, channelLevelIDsOf(got), remGroupA)
 }
