@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -89,6 +90,29 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	// no-store: the response body is a function of the bot token, so a cache
 	// keyed on URL alone would be keyed on the wrong thing.
 	c.Header("Vary", "Authorization")
+	// The manifest is resolved for *this* Bot and Space, not read off the
+	// boot-time constant — review blocker on #720 (Jerry-Xin), and the whole
+	// reason CapabilityFor exists.
+	//
+	// The static manifest is only correct while no dynamic version has shadowed
+	// an ID. Once one has, `Capability()` advertises the static version that
+	// `sendMessage` now refuses, and omits the granted dynamic templates that it
+	// accepts — the exact "manifest says yes, send says 400" divergence this
+	// endpoint exists to prevent. That divergence is what makes feature
+	// detection worth doing at all, so an endpoint that answers from a
+	// different source than the send path is not a lesser version of this
+	// endpoint; it is a misleading one.
+	//
+	// Fail-closed on an unreadable runtime, for the same reason the send path
+	// does: an unreadable catalog cannot prove an ID is *not* shadowed, and
+	// answering with the static manifest would be asserting exactly that.
+	templating, capErr := ba.cardTemplates.CapabilityFor(
+		c.Request.Context(), ba.botCatalogPrincipalFor(c, robotID))
+	if capErr != nil {
+		ba.Error("解析 Bot 卡片能力清单失败", zap.Error(capErr), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
 	c.Response(map[string]interface{}{
 		"enabled":      cardmsg.BotEnabled(),
 		"card_version": cardmsg.CardVersion,
@@ -109,12 +133,12 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		// config is the per-Bot effective card policy (task bot-setting-store).
 		// Values are already AND-ed with the deployment master switch, so a
 		// producer reads one field instead of recombining `enabled` itself.
-		"config": ba.botCardConfigResponse(cardConfig),
+		"config": ba.botCardConfigResponse(cardConfig, templating),
 		// templating is additive to the raw-card capability manifest. It advertises
 		// only the explicit Bot catalog, never the broader Registry.List(). A nil
 		// catalog occurs only in focused tests that do not install the production
 		// composition root and reports supported:false rather than inventing refs.
-		"templating": ba.cardTemplates.Capability(),
+		"templating": templating,
 		"limits": map[string]interface{}{
 			"max_payload_bytes":    cardmsg.MaxPayloadBytes,
 			"max_nodes":            cardmsg.MaxNodes,
@@ -136,17 +160,28 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 //     a false switch invites a producer to send it anyway.
 //  2. reasoning_enabled=true ⟹ the ref is one this deployment also advertises
 //     under `templating.templates` in the same response, and therefore one the
-//     send path will accept. Resolving it through AdvertisedRef (rather than
-//     naming a version here) is what makes that hold by construction.
+//     send path will accept.
+//
+// Invariant 2 is why the ref is read out of the *same* manifest value this
+// response carries, rather than resolved separately. It used to come from the
+// static AdvertisedRef, which made the two fields answer from different
+// sources: once a dynamic version shadows ai.reasoning-process, `templating`
+// would list the dynamic one while `reasoning_template_ref` still named the
+// static version — and a producer that trusts the ref, as this field exists to
+// be trusted, would send a version the gate refuses. Deriving both from one
+// value makes the invariant hold by construction instead of by coincidence.
 //
 // A deployment whose catalog does not advertise the reasoning template at all
 // reports reasoning_enabled=false regardless of configuration: the switch says
 // "allowed", the catalog says "possible", and sending needs both.
-func (ba *BotAPI) botCardConfigResponse(cfg robot.BotCardConfig) map[string]interface{} {
+func (ba *BotAPI) botCardConfigResponse(
+	cfg robot.BotCardConfig,
+	templating botTemplatingCapability,
+) map[string]interface{} {
 	reasoningEnabled := cfg.ReasoningEnabled
 	var templateRef interface{}
 	if reasoningEnabled {
-		if ref, ok := ba.cardTemplates.AdvertisedRef(aireasoningprocess.TemplateID); ok {
+		if ref, ok := advertisedRefIn(templating, aireasoningprocess.TemplateID); ok {
 			templateRef = map[string]interface{}{
 				"id": string(ref.ID), "version": ref.Version,
 			}
@@ -166,4 +201,18 @@ func (ba *BotAPI) botCardConfigResponse(cfg robot.BotCardConfig) map[string]inte
 		"reasoning_enabled":      reasoningEnabled,
 		"reasoning_template_ref": templateRef,
 	}
+}
+
+// advertisedRefIn finds a template ID in an already-resolved manifest.
+//
+// D6 allows at most one advertised send version per ID, so the first match is
+// the answer; a manifest carrying two would be a policy-construction bug the
+// catalog constructor already refuses.
+func advertisedRefIn(manifest botTemplatingCapability, id cardtmpl.ID) (botTemplateRef, bool) {
+	for _, template := range manifest.Templates {
+		if cardtmpl.ID(template.ID) == id {
+			return botTemplateRef{ID: id, Version: template.Version}, true
+		}
+	}
+	return botTemplateRef{}, false
 }

@@ -61,7 +61,7 @@ func TestBotCardConfigResponse_ReasoningRefMatchesAdvertisedCatalog(t *testing.T
 		out := ba.botCardConfigResponse(robot.BotCardConfig{
 			CardEnabled: true, DisplayEnabled: true,
 			InteractionEnabled: true, ReasoningEnabled: true,
-		})
+		}, ba.cardTemplates.Capability())
 		if out["reasoning_enabled"] != true {
 			t.Fatalf("reasoning_enabled = %v, want true", out["reasoning_enabled"])
 		}
@@ -93,7 +93,7 @@ func TestBotCardConfigResponse_ReasoningRefMatchesAdvertisedCatalog(t *testing.T
 		out := ba.botCardConfigResponse(robot.BotCardConfig{
 			CardEnabled: true, DisplayEnabled: true,
 			InteractionEnabled: true, ReasoningEnabled: false,
-		})
+		}, ba.cardTemplates.Capability())
 		if out["reasoning_enabled"] != false {
 			t.Fatalf("reasoning_enabled = %v, want false", out["reasoning_enabled"])
 		}
@@ -113,7 +113,7 @@ func TestBotCardConfigResponse_NoCatalogForcesReasoningOff(t *testing.T) {
 	out := ba.botCardConfigResponse(robot.BotCardConfig{
 		CardEnabled: true, DisplayEnabled: true,
 		InteractionEnabled: true, ReasoningEnabled: true,
-	})
+	}, ba.cardTemplates.Capability())
 	if out["reasoning_enabled"] != false {
 		t.Fatalf("reasoning_enabled = %v, want false when nothing is advertised", out["reasoning_enabled"])
 	}
@@ -161,7 +161,7 @@ func TestBotCardConfigResponse_MasterSwitchOffZeroesEverything(t *testing.T) {
 
 	// This is what robot.BotCardConfig returns once applyCardMasterSwitch has
 	// run with the deployment gate off.
-	out := ba.botCardConfigResponse(robot.BotCardConfig{})
+	out := ba.botCardConfigResponse(robot.BotCardConfig{}, ba.cardTemplates.Capability())
 	for _, key := range []string{
 		"card_enabled", "display_enabled", "interaction_enabled", "reasoning_enabled",
 	} {
@@ -575,7 +575,7 @@ func TestBotCardConfigResponse_ManifestAgreesWithTheGate(t *testing.T) {
 			cfg := robot.BotCardConfig{
 				CardEnabled: true, DisplayEnabled: display, InteractionEnabled: interaction,
 			}
-			out := ba.botCardConfigResponse(cfg)
+			out := ba.botCardConfigResponse(cfg, ba.cardTemplates.Capability())
 
 			for _, tc := range []struct {
 				field   string
