@@ -188,8 +188,10 @@ Event builders supply only event-specific content and safe semantic literals.
 - **Authoritative plain:** the final VCS envelope must derive `plain` from the
   already-validated semantic `vcs-content` projection, not from the decorative
   Forge header. The event headline remains the first line used by notifications,
-  conversation previews, search, summaries, and pins. Native cards and non-VCS
-  card producers retain the existing whole-card `Finalize` behavior.
+  conversation previews, search, summaries, and pins; the existing repository/
+  project context follows it so those surfaces retain source identity. Native
+  cards and non-VCS card producers retain the existing whole-card `Finalize`
+  behavior.
 - **Degrade and delivery:** flag-off text bytes, card-build failure to text,
   ping/skip/no_event, audit, auth, mention expansion, and final payload-size
   checks remain unchanged.
@@ -224,9 +226,9 @@ Event builders supply only event-specific content and safe semantic literals.
   card for its valid fixture, uses the same header/content/action anatomy,
   passes `cardmsg.Validate`, and derives a non-placeholder `plain`.
 - A production VCS envelope derives `plain` from `vcs-content`: its first line is
-  the event headline and it has no leading `[图片]`, source label, repository/
-  project context, or badge. The projection is package-internal and cannot be
-  selected by native `msg_type:"card"` JSON.
+  the event headline, repository/project context follows immediately when present,
+  and it has no leading `[图片]`, source label, or badge. The projection is
+  package-internal and cannot be selected by native `msg_type:"card"` JSON.
 - Header tests assert the exact vetted icon URI, visible `GitHub`/`GitLab`
   label, repository/project context, and appropriate event/status badge.
 - Pipeline headline has no semantic `color`; its status badge carries the

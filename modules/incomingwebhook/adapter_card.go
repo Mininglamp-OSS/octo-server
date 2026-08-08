@@ -301,9 +301,10 @@ func validateVCSCard(card map[string]interface{}) error {
 }
 
 // vcsPlainProjection returns the semantic content area as a standalone card-shaped
-// projection for authoritative plain derivation. The Forge header is visual chrome:
-// its icon, source/context labels, and badge must not displace the event headline in
-// push notifications, conversation previews, search, or summaries.
+// projection for authoritative plain derivation. The Forge icon, source label, and
+// badge are visual chrome and stay excluded. Repository/project context is retained
+// immediately after the event headline so notifications and search results remain
+// attributable without letting header chrome displace the headline.
 //
 // The projection is package-internal and is extracted from the already validated
 // server-authored card. Native msg_type:"card" callers cannot select or forge it.
@@ -321,7 +322,45 @@ func vcsPlainProjection(card map[string]interface{}) map[string]interface{} {
 		if !ok {
 			return nil
 		}
-		return map[string]interface{}{"body": items}
+		context := vcsHeaderContextForPlain(body)
+		if context == nil || len(items) == 0 {
+			return map[string]interface{}{"body": items}
+		}
+		projectionItems := make([]interface{}, 0, len(items)+1)
+		projectionItems = append(projectionItems, items[0], context)
+		projectionItems = append(projectionItems, items[1:]...)
+		return map[string]interface{}{"body": projectionItems}
+	}
+	return nil
+}
+
+func vcsHeaderContextForPlain(body []interface{}) map[string]interface{} {
+	for _, raw := range body {
+		header, ok := raw.(map[string]interface{})
+		if !ok || header["id"] != "vcs-header" {
+			continue
+		}
+		columns, ok := header["columns"].([]interface{})
+		if !ok {
+			return nil
+		}
+		for _, rawColumn := range columns {
+			column, ok := rawColumn.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			items, ok := column["items"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, rawItem := range items {
+				item, ok := rawItem.(map[string]interface{})
+				if ok && item["id"] == "vcs-source-context" {
+					return item
+				}
+			}
+		}
+		return nil
 	}
 	return nil
 }
