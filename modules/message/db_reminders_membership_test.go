@@ -583,3 +583,55 @@ func TestRemMemberDSN_ForcesIsolatedDatabase(t *testing.T) {
 	assert.Equal(t, cfg.Addr, bootCfg.Addr, "建库连接与测试连接必须同服务器")
 	assert.Equal(t, "information_schema", bootCfg.DBName)
 }
+
+// TestRemindersSync_EmptyCallerUIDIsRejected —— PR#717 review P2-2。
+//
+// 空 uid 会让 `reminders.uid=?` 退化成 `reminders.uid=”`，那是频道级行的标记，
+// 于是第一个析取项直接命中全部频道级行，channelLevelVisibility 根本不会被求值。
+// reviewer 在种子库上实测确认过。本函数已是授权边界，退化身份必须拒绝而不是放行。
+func TestRemindersSync_EmptyCallerUIDIsRejected(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	remMemberSeed(t, ctx)
+	db := newRemindersDB(ctx)
+
+	got, err := db.sync("", 0, 100, nil, nil)
+
+	require.Error(t, err, "空 uid 必须报错，而不是返回数据")
+	assert.Empty(t, got, "拒绝路径不得返回任何行")
+}
+
+// TestChannelLevelVisibility_TopicRequiresExactlyOneSeparator 钉住与
+// thread.ParseChannelID 的口径一致（PR#717 review 🔵）。
+//
+// ParseChannelID 用 strings.Split 要求恰好两段，"g____a____b" 判非法；单靠
+// substring_index 取第一段则会把它当成属于 g。谓词里的分隔符计数条件负责这个收敛。
+func TestChannelLevelVisibility_TopicRequiresExactlyOneSeparator(t *testing.T) {
+	sql, _ := channelLevelVisibility([]string{"g_any"})
+
+	assert.Contains(t, sql, "char_length",
+		"子区分支必须带分隔符计数条件，否则畸形 ID 会继承第一段的成员关系")
+	assert.Contains(t, sql, "substring_index")
+}
+
+// TestRemindersSync_MalformedTopicIDDoesNotInheritParent 是上一条的行为版：
+// 造一条分隔符多余的畸形子区行，确认它不会因为第一段是调用方的群而被放行。
+func TestRemindersSync_MalformedTopicIDDoesNotInheritParent(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	myGroups := remMemberSeed(t, ctx)
+
+	// 第一段是 A 确实所属的群，但整体不是合法子区 ID。
+	_, err := ctx.DB().Exec(
+		"INSERT INTO reminders (channel_id, channel_type, uid, publisher, version, reminder_type, text) VALUES (?,?,'',?,?,1,'[有人@我]')",
+		remGroupA+"____x____y", common.ChannelTypeCommunityTopic.Uint8(), remUIDB, 30)
+	require.NoError(t, err)
+
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, myGroups)
+	require.NoError(t, err)
+
+	assert.NotContains(t, channelLevelIDsOf(got), remGroupA+"____x____y",
+		"畸形子区 ID 不得凭第一段继承父群成员关系（thread.ParseChannelID 会判其非法）")
+	// 合法子区仍然可见，确认收紧没有误伤。
+	assert.Contains(t, channelLevelIDsOf(got), remTopicA)
+}

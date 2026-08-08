@@ -96,17 +96,37 @@ then reproduced deliberately.
 `getReminders` copies `ChannelType` straight off the message
 (`api_reminders.go:247`) and `hasMention` (`:427`) does not look at channel type
 at all, so all six `common.ChannelType` values can structurally produce a
-channel-level reminder. But octo-server has no general membership table
-(conversations live in WuKongIM; `conversation_extra` is metadata, not
-authority). Membership is resolvable only for Group and CommunityTopic.
+channel-level reminder — including the four left unfiltered.
+`TestChannelLevelReminderChannelTypes` asserts exactly that, and its
+`wantResidual` of `{1,3,4,6}` is the machine-checked statement of it.
 
-Requiring `group_member` for Person / CustomerService / Community / Info would
-silently drop their legitimate reminders — a functional regression, not a
-security gain. Those four are left unfiltered, with maintainer sign-off, and
-`TestChannelLevelReminderChannelTypes` pins the difference between "types that
-emit channel-level reminders" and "types the predicate covers". Narrowing the
-gate, widening the emitter, or adding a channel type all turn it red, forcing a
-human to re-decide rather than letting the boundary drift.
+The reason each of the four is left alone is **not** uniform, and an earlier
+draft of this journal got it wrong by claiming they all lack a membership
+source. Corrected per PR#717 review:
+
+- **3 CustomerService / 4 Community / 6 Info — no producer.**
+  `grep -rn 'ChannelTypeCustomerService|ChannelTypeCommunity\b|ChannelTypeInfo'
+  --include=*.go modules/ | grep -v _test.go` returns zero hits server-wide.
+  Nothing creates or serves these channels, so there is nothing to expose.
+- **1 Person — a membership source does exist, and it was not used.** A Person
+  channel ID is self-describing (`common.GetFakeChannelIDWith` builds
+  `"<uidX>@<uidY>"`), so the caller's party-hood is checkable with no table at
+  all. The brief's own channel-type table says as much
+  (`1 | Person | 无表，需从 fakeChannelID 推导`); the journal's earlier "no usable
+  membership source" contradicted it and was simply false. This is the one
+  residual type that could be closed today. It is left open because no client
+  emits `mention.humans=1` on a Person channel, so no such row is known to
+  exist — a weaker justification than "unclosable", and it is recorded as a
+  follow-up rather than dressed up as a design constraint.
+
+Requiring `group_member` for any of the four would silently drop their
+reminders if they ever became real — a functional regression, not a security
+gain — which is why the gate is not simply widened to "everything".
+
+The guard test pins the difference between "types that emit channel-level
+reminders" and "types the predicate covers". Narrowing the gate, widening the
+emitter, or adding a channel type all turn it red, forcing a human to re-decide
+rather than letting the boundary drift.
 
 ### The client's `channel_ids` narrows, never widens
 

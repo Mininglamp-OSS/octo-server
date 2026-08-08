@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -68,10 +69,10 @@ func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, chann
 	return list, err
 }
 
-// topicChannelSeparator 是子区频道 ID 里父群编号与短 ID 的分隔符：
-// channel_id == "<groupNo>____<shortID>"（见 modules/group/api.go 的
-// threadSeparator，以及 20260711 迁移里的 CONCAT(t.group_no,'____',t.short_id)）。
-const topicChannelSeparator = "____"
+// topicChannelSeparator 取自 modules/thread —— 子区频道 ID 的所有者包，
+// channel_id == "<groupNo>____<shortID>"。不在本包另立常量：仓库里已经有好几处
+// 手写副本，再加一处只会让它们更容易漂移（PR#717 review P2-5）。
+const topicChannelSeparator = thread.ChannelIDSeparator
 
 // channelLevelVisibility 构造「频道级（uid=”）提醒对本调用方可见」的 SQL 谓词。
 //
@@ -106,10 +107,21 @@ func channelLevelVisibility(memberGroupNos []string) (string, []interface{}) {
 		// 合法 SQL，而 dbr 对空切片的展开行为也不该被依赖。
 		return "reminders.channel_type not in (?,?)", []interface{}{grp, topic}
 	}
+	// 子区那一支的分隔符计数条件（`… = 1`）是为了与 thread.ParseChannelID 口径一致：
+	// 它用 strings.Split 要求**恰好**两段，"g____a____b" 直接判非法；而单靠
+	// substring_index 只取第一段，会把这种畸形 ID 当成属于 g（PR#717 review）。
+	// 构造不出可利用路径（channel_id 由写入方按规范拼接，第一段本来就是所属群），
+	// 但"更宽松但大概没事"是个需要每次重新论证的状态，收成一致更省事。
 	return "(reminders.channel_type not in (?,?)" +
 			" or (reminders.channel_type=? and reminders.channel_id in ?)" +
-			" or (reminders.channel_type=? and substring_index(reminders.channel_id,?,1) in ?))",
-		[]interface{}{grp, topic, grp, memberGroupNos, topic, topicChannelSeparator, memberGroupNos}
+			" or (reminders.channel_type=? and substring_index(reminders.channel_id,?,1) in ?" +
+			" and (char_length(reminders.channel_id)-char_length(replace(reminders.channel_id,?,'')))/?=1))",
+		[]interface{}{
+			grp, topic,
+			grp, memberGroupNos,
+			topic, topicChannelSeparator, memberGroupNos,
+			topicChannelSeparator, len(topicChannelSeparator),
+		}
 }
 
 /*
@@ -135,6 +147,14 @@ stall the client's incremental sync.
 */
 func (r *remindersDB) sync(uid string, version int64, limit uint64, channelIDs []string, memberGroupNos []string) ([]*remindersDetailModel, error) {
 	var models []*remindersDetailModel
+
+	// 与 reminderSync 的同名守卫成对存在。空 uid 会让下面的 reminders.uid=? 退化成
+	// reminders.uid=''，直接命中全部频道级行且完全跳过成员校验。handler 已经挡了一道，
+	// 这里再挡一道：本函数是授权边界，将来多一个调用方就多一次绕过机会，而这种绕过
+	// 不会以报错的形式暴露 —— 它只是安静地多返回数据。
+	if uid == "" {
+		return nil, errors.New("reminders sync: empty caller uid")
+	}
 
 	visSQL, visArgs := channelLevelVisibility(memberGroupNos)
 
