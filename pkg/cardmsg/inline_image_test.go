@@ -8,6 +8,10 @@ import (
 	"testing"
 )
 
+// Lucide git-branch@0.577.0，缩到 16px 并把 currentColor 固定为 Forge
+// header 使用的中性色。生产常量必须与这串审过的字节逐字节一致。
+const vcsGitBranchIconForTest = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%236b7075%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%206a9%209%200%200%200-9%209V3%22%2F%3E%3Ccircle%20cx%3D%2218%22%20cy%3D%226%22%20r%3D%223%22%2F%3E%3Ccircle%20cx%3D%226%22%20cy%3D%2218%22%20r%3D%223%22%2F%3E%3C%2Fsvg%3E"
+
 func inlineSVG(svg string) string {
 	return "data:image/svg+xml," + url.QueryEscape(svg)
 }
@@ -61,6 +65,30 @@ func TestInlineImageAllowlistIsExactBytes(t *testing.T) {
 			card := cardWithBody(map[string]interface{}{"type": "Image", "url": tc.raw})
 			if err := Validate(envelope(card)); !errors.Is(err, ErrCardBadURLScheme) {
 				t.Fatalf("未审过的字节应被拒 (%s), err=%v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestVCSGitBranchIconIsExactVettedImage(t *testing.T) {
+	card := cardWithBody(map[string]interface{}{"type": "Image", "url": vcsGitBranchIconForTest})
+	if err := Validate(envelope(card)); err != nil {
+		t.Fatalf("reviewed VCS git-branch icon should pass Image.url validation: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		uri  string
+	}{
+		{name: "one byte mutation", uri: strings.Replace(vcsGitBranchIconForTest, "%236b7075", "%236b7076", 1)},
+		{name: "leading whitespace", uri: " " + vcsGitBranchIconForTest},
+		{name: "appended content", uri: vcsGitBranchIconForTest + "%3Cscript%3E"},
+		{name: "base64 re-encoding", uri: "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString([]byte(`<svg viewBox="0 0 24 24"/>`))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			card := cardWithBody(map[string]interface{}{"type": "Image", "url": tc.uri})
+			if err := Validate(envelope(card)); !errors.Is(err, ErrCardBadURLScheme) {
+				t.Fatalf("non-vetted VCS icon bytes should be rejected, err=%v", err)
 			}
 		})
 	}

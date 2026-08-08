@@ -552,11 +552,13 @@ func buildGitHubPushCard(ev *ghPushEvent, lang string) map[string]interface{} {
 	d := vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.push",
+		badge:    "Push",
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		url:      ghRepoURLCard(ev.Compare, ev.Repository),
 	}
 	switch {
 	case strings.HasPrefix(ev.Ref, "refs/tags/"):
+		d.badge = "Tag"
 		if ev.Deleted {
 			d.headline = fmt.Sprintf("%s deleted tag %s", who, ref)
 		} else {
@@ -618,6 +620,7 @@ func buildGitHubPullRequestCard(ev *ghPullRequestEvent, lang string) map[string]
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.pull_request",
+		badge:    "Pull Request",
 		headline: headline,
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.PullRequest.Number, ev.PullRequest.Title)},
@@ -638,6 +641,7 @@ func buildGitHubIssuesCard(ev *ghIssuesEvent, lang string) map[string]interface{
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.issues",
+		badge:    "Issue",
 		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
@@ -669,6 +673,7 @@ func buildGitHubIssueCommentCard(ev *ghIssueCommentEvent, lang string) map[strin
 	d := vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.issue_comment",
+		badge:    "Comment",
 		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
@@ -692,6 +697,7 @@ func buildGitHubReleaseCard(ev *ghReleaseEvent, lang string) map[string]interfac
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.release",
+		badge:    "Release",
 		headline: fmt.Sprintf("%s %s a release", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{escapeCardText(title, cardTitleMax)},

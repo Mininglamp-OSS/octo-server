@@ -39,13 +39,19 @@ package cardmsg
 const (
 	chevronDownIcon = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E"
 	chevronUpIcon   = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E"
+
+	// VCSGitBranchIcon is Lucide git-branch@0.577.0, minified and URL-encoded
+	// after changing its 24px size to 16px and currentColor to the fixed neutral
+	// Forge header stroke #6b7075. NOTICE carries the upstream license text.
+	VCSGitBranchIcon = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%236b7075%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%206a9%209%200%200%200-9%209V3%22%2F%3E%3Ccircle%20cx%3D%2218%22%20cy%3D%226%22%20r%3D%223%22%2F%3E%3Ccircle%20cx%3D%226%22%20cy%3D%2218%22%20r%3D%223%22%2F%3E%3C%2Fsvg%3E"
 )
 
 // vettedInlineImages 是允许出现在图片类 URL 字段上的内联图，按完整字节索引。
 // 只读，进程生命周期内不变 —— 没有注册接口，加图标必须改这份源码。
 var vettedInlineImages = map[string]struct{}{
-	chevronDownIcon: {},
-	chevronUpIcon:   {},
+	chevronDownIcon:  {},
+	chevronUpIcon:    {},
+	VCSGitBranchIcon: {},
 }
 
 // isVettedInlineImage 报告 raw 是否与某个审过的内联图逐字节相同。

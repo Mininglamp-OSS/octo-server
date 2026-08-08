@@ -117,7 +117,16 @@ type pushPayloadReq struct {
 	// Card 是 msg_type:"card" 的标准 Adaptive Cards 1.5 JSON（octo/v1 白名单
 	// 子集，card-message-protocol P1）。Text 在 card 形态下是可选 plain 种子
 	// （仅当卡片派生 plain 为空时使用，Decision 8）。
-	Card      map[string]interface{} `json:"card,omitempty"`
+	Card map[string]interface{} `json:"card,omitempty"`
+	// renderProfile 是服务端生产者专用的视觉契约选择，不对请求 JSON 开放。
+	// 目前只有通过 vcsPushReq 构造的 GitHub/GitLab 卡片会设置它；原生
+	// msg_type:"card" 调用方即使提交同名 JSON 字段也无法写入。
+	renderProfile string
+	// plainProjection 是服务端 VCS 生产者从已校验卡片的语义内容区提取的
+	// plain 投影，不对请求 JSON 开放。它排除新 Forge header 的装饰图标、来源和
+	// badge，避免这些视觉元素取代事件 headline 成为推送/会话预览首行。
+	plainProjection map[string]interface{}
+
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
 	Extra     map[string]interface{} `json:"extra,omitempty"`

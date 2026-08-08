@@ -525,6 +525,7 @@ func buildGitLabPushCard(ev *glPushEvent, lang string) map[string]interface{} {
 	d := vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.push",
+		badge:    "Push",
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		url:      httpURLForCard(ev.Project.WebURL),
 	}
@@ -561,6 +562,7 @@ func buildGitLabTagPushCard(ev *glPushEvent, lang string) map[string]interface{}
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.tag_push",
+		badge:    "Tag",
 		headline: headline,
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		url:      httpURLForCard(ev.Project.WebURL),
@@ -588,6 +590,7 @@ func buildGitLabMergeRequestCard(ev *glMergeRequestEvent, lang string) map[strin
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.merge_request",
+		badge:    "Merge Request",
 		headline: fmt.Sprintf("%s %s a merge request", glActorCard(ev.User.Username, ev.User.Name), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("!", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
@@ -608,6 +611,7 @@ func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} 
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.issue",
+		badge:    "Issue",
 		headline: fmt.Sprintf("%s %s an issue", glActorCard(ev.User.Username, ev.User.Name), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
@@ -652,6 +656,7 @@ func buildGitLabNoteCard(ev *glNoteEvent, lang string) map[string]interface{} {
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.note",
+		badge:    "Comment",
 		headline: fmt.Sprintf("%s commented", glActorCard(ev.User.Username, ev.User.Name)),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{target},
@@ -679,7 +684,7 @@ func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interf
 		for i, b := range ev.Builds {
 			names[i] = b.Name
 		}
-		if value, n := cappedFactValue(names, maxRenderedJobs); n > 0 {
+		if value, n := cappedPipelineJobsValue(names, maxRenderedJobs); n > 0 {
 			facts = append(facts, vcsFact{title: fmt.Sprintf("%s (%d)", labels.jobs, n), value: value})
 		}
 	}
@@ -688,12 +693,13 @@ func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interf
 		url = fmt.Sprintf("%s/-/pipelines/%d", strings.TrimRight(p, "/"), ev.ObjectAttributes.ID)
 	}
 	return vcsCardData{
-		source:   cardSourceGitLab,
-		variant:  "vcs.gitlab.pipeline",
-		headline: fmt.Sprintf("Pipeline #%d", ev.ObjectAttributes.ID),
-		status:   pipelineStatusColor(ev.ObjectAttributes.Status),
-		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
-		facts:    facts,
-		url:      url,
+		source:     cardSourceGitLab,
+		variant:    "vcs.gitlab.pipeline",
+		badge:      escapeCardText(ev.ObjectAttributes.Status, cardActorMax),
+		badgeColor: pipelineStatusColor(ev.ObjectAttributes.Status),
+		headline:   fmt.Sprintf("Pipeline #%d", ev.ObjectAttributes.ID),
+		subtitle:   escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		facts:      facts,
+		url:        url,
 	}.card(lang)
 }

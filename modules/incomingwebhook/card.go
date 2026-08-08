@@ -26,7 +26,9 @@ var errCardDisabled = errors.New("incomingwebhook: card messages disabled")
 //     card_version/profile（服务端钉 octo/v1，不接受调用方覆盖 —— 与丢弃
 //     req.Extra 的安全基线一致）、from.kind=webhook、服务端派生 space_id；
 //   - cardmsg.Validate：白名单/大小/URL/树上限 write-strict（与 bot ingress
-//     同一权威）；cardmsg.Finalize：重算权威 plain + 完整出站 payload 复检；
+//     同一权威）；cardmsg.Finalize：重算默认权威 plain + 完整出站 payload 复检；
+//     服务端 VCS 生产者可通过不可由 JSON 构造的 plainProjection，把 plain 收口到
+//     已校验卡片的语义内容区，排除纯视觉 header；投影覆盖后再次复检出站大小；
 //   - Decision 8 `text` 种子语义：仅当派生 plain 为空（= [卡片] 兜底）且调用方
 //     给了 text 时，用 text 作 plain（rune 上限与纯文本路径一致）；卡片 body
 //     产出文本时 text 被忽略 —— 派生始终权威。种子覆盖发生在 Finalize 复检之后、
@@ -55,11 +57,23 @@ func buildCardPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverrid
 		// space_id 由服务端从 group 派生，不接受调用方覆盖（与 buildPayload 一致）。
 		"space_id": m.SpaceID,
 	}
+	// renderProfile is intentionally package-internal: server-authored producers
+	// may opt into a renderer contract, while native request JSON cannot forge or
+	// override it. Add it before both authoritative validation passes.
+	if req.renderProfile != "" {
+		payload["render_profile"] = req.renderProfile
+	}
 	if err := cardmsg.Validate(payload); err != nil {
 		return nil, err
 	}
 	if err := cardmsg.Finalize(payload); err != nil {
 		return nil, err
+	}
+	if req.plainProjection != nil {
+		payload["plain"] = cardmsg.BuildPlain(req.plainProjection)
+		if err := cardmsg.RecheckPayloadSize(payload); err != nil {
+			return nil, err
+		}
 	}
 	if payload["plain"] == cardmsg.PlaceholderCard {
 		seed := req.Text
