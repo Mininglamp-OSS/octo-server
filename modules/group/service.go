@@ -94,6 +94,13 @@ type IService interface {
 	// ExistMembersActive 批量版 ExistMemberActive：返回 uid 处于「活跃」状态
 	// （is_deleted=0 AND status=Normal）的群编号集合，排除被拉黑成员
 	ExistMembersActive(groupNos []string, uid string) ([]string, error)
+	// ActiveMemberGroupNos 返回 uid 作为活跃成员所属的**全部**群编号，判定口径与
+	// ExistMemberActive 一致（is_deleted=0 AND status=Normal）。
+	//
+	// 与 ExistMembersActive 的区别是不需要调用方先给出候选集：当调用方要判定的
+	// 对象来自不可信输入（或压根没有输入，如"我能看到哪些频道"），拿候选集去做
+	// 交集就等于让调用方决定授权范围。此时必须用本方法从成员关系反推集合。
+	ActiveMemberGroupNos(uid string) ([]string, error)
 	// GetGroupsWithMemberUID 获取某个用户的所有群
 	GetGroupsWithMemberUID(uid string) ([]*InfoResp, error)
 	// 获取指定群的群成员的最大数据版本
@@ -624,6 +631,11 @@ func (s *Service) ExistMembers(groupNos []string, uid string) ([]string, error) 
 // 子区(CommunityTopic)批量读门禁用它替代 ExistMembers（YUJ-4185 CR 整改）。
 func (s *Service) ExistMembersActive(groupNos []string, uid string) ([]string, error) {
 	return s.db.existMembersActive(groupNos, uid)
+}
+
+// ActiveMemberGroupNos 见 IService 上的说明。
+func (s *Service) ActiveMemberGroupNos(uid string) ([]string, error) {
+	return s.db.QueryActiveMemberGroupNosWithUID(uid)
 }
 
 func (s *Service) GetSettings(groupNos []string, uid string) ([]*SettingResp, error) {

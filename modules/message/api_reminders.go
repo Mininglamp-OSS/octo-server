@@ -97,7 +97,33 @@ func (m *Message) reminderSync(c *wkhttp.Context) {
 		return
 	}
 	loginUID := c.GetLoginUID()
-	reminders, err := m.remindersDB.sync(loginUID, req.Version, req.Limit, req.ChannelIDs)
+	// 退化身份必须 fail-closed。sync 的谓词以 reminders.uid=? 作为「点名给我」的
+	// 分支，uid 为空串时它退化成 reminders.uid=''，直接命中**所有**频道级行而
+	// 完全不经过成员校验（PR#717 review P2-2，已在种子库上实测）。
+	//
+	// AuthMiddleware 正常总会设置 uid，但 legacy token 解析只取缓存串的 parts[0]、
+	// 不单独要求非空，一条畸形会话记录就能到达这里。本函数现在是授权边界，
+	// 与下面成员查询失败同样处理：宁可拒绝，不可放行。
+	if loginUID == "" {
+		m.Error("提醒同步拿到空的登录 uid，拒绝")
+		respondMessageNotLoggedIn(c)
+		return
+	}
+
+	// 频道级（uid=''）提醒的授权依据。必须从成员关系反推，不能用 req.ChannelIDs：
+	// 那是客户端可控输入，拿它当授权范围等于让调用方自己决定能看什么 —— 正是本次
+	// 修复的漏洞（传空数组即"不过滤"，拉走全表）。见 channelLevelVisibility。
+	//
+	// 查询失败必须中断而不是降级成空集合或跳过过滤：前者会让合法用户丢红点，后者
+	// 会在 DB 抖动时把授权边界整个打开。
+	memberGroupNos, err := m.groupService.ActiveMemberGroupNos(loginUID)
+	if err != nil {
+		m.Error("查询登录用户所属群失败！", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+
+	reminders, err := m.remindersDB.sync(loginUID, req.Version, req.Limit, req.ChannelIDs, memberGroupNos)
 	if err != nil {
 		m.Error("同步提醒项失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

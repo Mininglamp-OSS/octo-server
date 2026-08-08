@@ -1070,7 +1070,16 @@ paths:
       tags:
         - "message"
       summary: "同步消息提醒"
-      description: "同步消息提醒"
+      description: >-
+        同步消息提醒。
+
+        频道级提醒（uid 为空，即 `@所有人` 产生的 "[有人@我]"）只返回调用方**当前是
+        活跃成员**的频道 —— 判定口径为 is_deleted=0 且成员状态正常，因此退群或被拉黑
+        后不再返回该频道的频道级提醒。点名提醒（uid 等于调用方）不受此约束，即便调用方
+        已不在该频道也照常返回。
+
+        当前按成员关系收敛的频道类型为群(2)与子区(5)；子区按其父群的成员关系判定。
+        其余频道类型的频道级提醒行为不变。
       operationId: "sync reminder msg"
       consumes:
         - "application/json"
@@ -1094,7 +1103,12 @@ paths:
                 type: array
                 items:
                   type: string
-                  description: "频道ids"
+                description: >-
+                  频道 ids，仅用于**收窄**返回范围，不构成授权依据：传入调用方非成员的
+                  频道不会返回该频道的频道级提醒。
+
+                  留空表示不额外按频道收窄（此时仍受成员关系约束），**不是**"返回全部
+                  频道"。
       responses:
         200:
           description: "返回"

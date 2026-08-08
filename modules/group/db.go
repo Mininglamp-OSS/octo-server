@@ -465,6 +465,23 @@ func (d *DB) QueryMemberWithUIDAndGroupNos(uid string, groupNos []string) ([]*Me
 	return memberModels, err
 }
 
+// QueryActiveMemberGroupNosWithUID 返回 uid 作为**活跃**成员所属的全部群编号。
+//
+// 判定口径与 ExistMemberActive 完全一致（is_deleted=0 AND status=Normal），
+// 是白名单式 fail-closed：被拉黑及将来新增的任何非 Normal 状态都不算成员。
+// 用作授权谓词的调用方必须用本方法而不是 QueryMemberWithUIDAndGroupNos —— 后者
+// 只看 is_deleted，会把被拉黑成员当作仍然在群。
+//
+// 只取 group_no 一列：调用方要的是「可见频道集合」，拉整行会在成员数多的账号上
+// 平白搬运一堆用不上的字段。走 group_member_uid 索引。
+func (d *DB) QueryActiveMemberGroupNosWithUID(uid string) ([]string, error) {
+	var groupNos []string
+	_, err := d.session.Select("group_no").From("group_member").
+		Where("uid=? and is_deleted=0 and status=?", uid, common.GroupMemberStatusNormal).
+		Load(&groupNos)
+	return groupNos, err
+}
+
 // SyncMembers 同步群成员
 func (d *DB) SyncMembers(groupNo string, version int64, limit uint64) ([]*MemberDetailModel, error) {
 

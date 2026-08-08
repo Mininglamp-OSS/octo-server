@@ -1,0 +1,258 @@
+---
+type: Journal
+title: "Journal: reminder-sync-membership-scope"
+description: Scoping channel-level reminders to real membership, and why the pentest report's root-cause attribution would have produced a false fix.
+tags: ["space", "isolation", "acl", "sql", "collation"]
+timestamp: 2026-08-07T16:19:08Z
+slug: reminder-sync-membership-scope
+---
+
+# reminder-sync-membership-scope
+
+## What was wrong
+
+`POST /v1/message/reminder/sync` returned **every** channel-level (`@所有人`)
+reminder in the system to any authenticated caller — the `channel_id`,
+`publisher`, `message_id`, `message_seq` and timestamp of channels the caller
+had never joined. Cross-tenant metadata leak; enough to enumerate the group
+graph and who broadcasts in it.
+
+`remindersDB.sync`'s `uid=''` branch carried no channel-membership predicate.
+With `channel_ids: []` there was not even a `channel_id IN (?)` constraint, so
+the query returned the whole table minus the caller's own broadcasts and
+already-read rows.
+
+## Why the report's attribution was wrong
+
+The 2026-07-30 retest filed this as §4.11 "逻辑漏洞垂直越权", reproduced by
+deleting the `X-Space-Id` header: with the header → `403 无权访问该 Space`,
+without it → `200` and a 26 KB dump.
+
+That reproduction is real but the diagnosis is not, and following it would have
+shipped a false fix:
+
+- `reminderSync` never reads `space.GetSpaceID(c)`. `SpaceMiddleware` was the
+  only Space gate on the route, and it fails open when no `space_id` is present
+  (`pkg/space/middleware.go:112`). Deleting the header only walks past that
+  gate.
+- The leak itself has nothing to do with Space. A caller who *is* a legitimate
+  member of any one Space keeps the header, passes the middleware, and gets the
+  identical full dump.
+- `reminders` has no `space_id` column at all — only `channel_id`. A
+  space-scoped fix was never possible here.
+
+Had the middleware been made fail-closed, the report's exact reproduction would
+have turned green while the vulnerability stayed fully open. **The primary
+acceptance test therefore keeps a valid `X-Space-Id` header** and still requires
+non-member channels to be absent — a middleware-only fix cannot pass it.
+
+## What was changed
+
+- `modules/group/db.go` — `QueryActiveMemberGroupNosWithUID`, the caller's full
+  active-group set. Predicate mirrors `ExistMemberActive` exactly
+  (`is_deleted=0 AND status=Normal`), so a blacklisted or departed member is not
+  a member. Selects `group_no` only.
+- `modules/group/service.go` — exposed as `IService.ActiveMemberGroupNos`. The
+  interface addition is safe: the only stub (`modules/robot/
+  stream_card_gate_test.go`) embeds `group.IService` rather than implementing
+  it.
+- `modules/message/db_reminders.go` — `channelLevelVisibility` builds the
+  channel-level predicate; `sync` takes the member set and applies it. The four
+  near-duplicate `Where` branches collapsed into one composed predicate.
+- `modules/message/api_reminders.go` — resolves the member set before the query.
+  A membership lookup failure aborts the request; it must not degrade to an
+  empty set (legitimate users silently lose red dots) nor skip the filter (the
+  boundary opens on a DB blip).
+
+## Decisions worth keeping
+
+### Bind parameters, not a JOIN to `group_member`
+
+The obvious implementation is `EXISTS (SELECT 1 FROM group_member …)`. It was
+rejected on a schema hazard:
+
+`reminders` was force-converted to `utf8mb4_general_ci` by
+`20260711000001_reminders_channel_mention_index.sql`. `group_member` declares no
+`CHARSET`/`COLLATE` at all (`20191106000002_group_legacy01.sql:33`) and inherits
+the *database* default at creation time, and it is not in the
+`20260512000001_base_oss_compat_repair.sql` normalisation set. On a deployment
+whose database default is MySQL 8's `utf8mb4_0900_ai_ci`, the two tables differ
+and a column-to-column comparison raises Error 1267 — in the reminder-sync hot
+path. Pinning `COLLATE` to dodge it is the trap that same migration documents:
+it destroys index ordering and degrades to a full scan.
+
+Comparing a column against **bound literals** has no such problem — literals
+coerce to the column's collation. `TestRemindersSync_SurvivesGroupMemberCollationMismatch`
+builds `group_member` as `utf8mb4_0900_ai_ci` against a `general_ci` `reminders`
+and pins this; reverting to a column-to-column join turns it red.
+
+Note the local test database is created `utf8mb4_general_ci`, so simply running
+the suite could never have surfaced this — the collations match *because the
+setup chose them*. The hazard had to be reasoned from the migration history and
+then reproduced deliberately.
+
+### Which channel types are gated, and why the residual shrank
+
+`getReminders` copies `ChannelType` straight off the message and `hasMention`
+does not look at channel type at all, so all six `common.ChannelType` values can
+structurally produce a channel-level reminder. The gate therefore has to say
+something about every one of them.
+
+- **2 Group / 5 CommunityTopic — group membership.** Topics resolve through the
+  parent group.
+- **1 Person — party-hood.** The recipient's uid *is* the `channel_id`, so this
+  needs no table at all.
+- **3 CustomerService / 4 Community / 6 Info — passed through.** No producer
+  exists anywhere in the server (a grep for the three constants outside tests
+  returns nothing), so there is nothing to expose; and requiring `group_member`
+  for them would silently drop their reminders if they ever became real, which
+  is a functional regression rather than a security gain.
+- **Anything else — denied.** The gate is an allowlist, so a future enum member
+  fails closed.
+
+**Person was in the pass-through list for two revisions, and that was wrong.**
+The justification given for the whole group was "requiring `group_member` would
+silently drop legitimate reminders" — but that argument does not apply to type 1
+at all: no membership lookup is involved, the recipient's uid is right there in
+the row, and the sender is already excluded by the existing
+`NOT (uid='' AND publisher=?)` clause. The brief had even written down that
+party-hood was decidable for Person, and then filed it under "no known
+producer" anyway. Reason and conclusion did not match.
+
+Two reviewers independently found the reachable producer: the DM send path
+accepts `ChannelTypePerson` and does not sanitise `mention.humans`, and the
+payload handed to the reminder listener is the pre-substitution `message` (see
+`toConfigMessageResp`), so a crafted DM lands a channel-level Person row whose
+`channel_id` is the recipient. Passing that through published *who is talking to
+whom* to every authenticated caller — the same social-graph disclosure this task
+exists to close, on a neighbouring channel type. One of the two reviewers had
+rated it advisory twice and reversed their own approval after checking it.
+
+The lesson worth keeping is narrower than "we missed a case": **"no known
+producer today" is a likelihood statement, not an invariant, and it had already
+been rejected once in this same task** — it is exactly the reasoning that got
+the denylist replaced with an allowlist for unknown types. Applying it to
+unknown types and then accepting it for Person, in consecutive revisions, was
+inconsistent. Where a decidable authorization predicate exists, "nobody produces
+this today" is not a reason to skip it.
+
+### The client's `channel_ids` narrows, never widens
+
+The list is caller-controlled, so it can only ever intersect the authorized set.
+The empty list now means "no channel filter requested", not "no filter at all" —
+that conflation was the bug. The web client builds it from its conversation
+list (`octo-web/packages/dmworkdatasource/src/im-callbacks/reminders.ts:15-28`);
+`[]` is a hand-made shape.
+
+### Filtering stays in SQL
+
+Same reason YUJ-1377 gives for the publisher exclusion: post-filtering in Go
+leaves the version/limit cursor parked on hidden rows, and the client re-requests
+the same version forever.
+
+## Verification
+
+- `go test ./modules/message/` — **pass** (fresh database), including 9 new tests.
+- `go test ./modules/group/` — 7 failures, **all pre-existing**: the failing test
+  names are byte-identical to a clean `origin/main` (2d8c875) worktree run
+  against a fresh database.
+- `go build ./...`, `go vet` — pass. `gofmt -l` count unchanged at the repo's
+  pre-existing 18 (only the two files authored here were formatted; untouched
+  files were left alone).
+
+### EXPLAIN, 50 000 rows
+
+| | type | key | rows | Extra |
+|---|---|---|---|---|
+| before | ALL | NULL | 50037 | Using where; Using filesort |
+| after | ALL | NULL | 50037 | Using where; Using filesort |
+
+Plan-neutral. The brief's original acceptance said "the plan must not be a full
+scan"; that was rewritten after measuring, because **it was already a full scan
+on `main`** — the top-level `OR reminders.uid` plus `ORDER BY version` against a
+table with no `version` index. Holding this change to a bar its baseline never
+met would only have forced an out-of-scope index migration.
+
+Two follow-ups fall out of that measurement, neither actioned here:
+
+1. `reminders` has no index supporting `version > ? ORDER BY version`. Every
+   reminder sync full-scans. Pre-existing and unrelated to this fix.
+2. Because the membership predicate rejects rows, a caller in few groups now
+   scans further to fill `LIMIT`. Inherent to any correct fix, but it interacts
+   with (1): the cheapest real mitigation is the missing index, not a weaker
+   predicate.
+
+## Client impact — verified, not assumed
+
+Every consumer of this endpoint was read before merging, because the fix removes
+rows and the dangerous failure mode would be a client that treats the response as
+authoritative and prunes local state against it. **No client does.**
+
+| | call site | `channel_ids` | `uid == ""` rows | local pruning |
+|---|---|---|---|---|
+| octo-web | `dmworkdatasource/src/im-callbacks/reminders.ts:15-28` | conversation list (Group + Topic) | n/a | — |
+| octo-ios | `WKDataSourceModule.m:398` | conversation list (Group + Topic) | **dropped** | none |
+| octo-android | `MsgService.java:94`, built at `MsgModel.java:1092` | conversation list (**Group only**) | kept | none |
+
+- **No pruning anywhere.** iOS persists via `ON CONFLICT(reminder_id) DO UPDATE`
+  (`WKReminderDB.m:12`) and Android via insert/update keyed on `reminder_id`
+  (`ReminderDBManager.java:242,249`); neither repo contains a `DELETE` against
+  the reminders table. Fewer rows in a response can never remove local state.
+- **No count is taken from the response.** iOS badges sum conversation unread
+  (`WKApp.m:790`); Android recomputes from its own DB (`ChatActivity.java:2634`);
+  list-level indicators are booleans on both.
+- **Both already filter by the local conversation list at display time**
+  (`WKReminderManager.m:114-119`, `ChatFragment.java:2665`), so leaked rows for
+  channels the user never joined were stored but never rendered. The leak was
+  real but was not user-visible on either mobile client.
+- **The `limit` interaction is the one behavioural improvement.** Neither client
+  paginates (iOS `limit: 1000`, Android `limit: 200`). Before this change a user
+  in few groups could have that budget consumed by other tenants' rows, pushing
+  their own reminders out of the window. Afterwards the budget carries only rows
+  that concern them.
+
+Two pre-existing client defects surfaced while verifying this. Both are outside
+this repo and are **not** consequences of this change; recorded here only so the
+next person does not rediscover them:
+
+1. iOS drops every channel-level row. `WKDataSourceModule.m:408` reads
+   `if (uid && currentUID && ![uid isEqualToString:currentUID]) continue;`, and
+   in Objective-C `@""` is a non-nil object, hence truthy — so `uid == ""`
+   (the server's channel-level marker) takes the `continue`.
+2. Android keeps them: `MsgModel.java:1113` uses `!TextUtils.isEmpty(...)`,
+   which is false for `""`. Its comment claims the logic is aligned with iOS
+   (`对齐 iOS`); the two platforms in fact behave oppositely, so at least one of
+   them — and the comment — is wrong.
+
+## Before rollout
+
+Run once against production:
+
+```sql
+SELECT channel_type, count(*) FROM reminders WHERE uid='' GROUP BY channel_type;
+```
+
+The gate is an allowlist, so a channel-level row whose `channel_type` sits outside
+`{1,2,3,4,5,6}` is now invisible to **everyone**, including callers who should see
+it. `getReminders` copies `ChannelType` off the message with no writer-side
+validation, so such a row is insertable in principle. Fail-closed is the right
+default and this is not a reason to weaken it — but it is the one behaviour change
+here whose failure mode is silent, and the query settles it in seconds. Raised in
+review (P2-1); recorded rather than assumed away.
+
+Also worth announcing to support: users who left a group or were blacklisted stop
+receiving that group's channel-level reminders. Correct and intended, but visible.
+
+## Not fixed here
+
+- `SpaceMiddleware`'s opt-in fail-open. Documented old-client compatibility
+  across conversation / message sync / reactions / search / pinned; needs
+  per-route evaluation. This endpoint no longer depends on it.
+- The same fail-open shape in DM Space filtering. Real, but a different blast
+  radius — a caller only ever reaches DMs they are already a party to. Locations
+  are deliberately not listed: this repository is public, and naming the exact
+  call sites of an unremediated finding publishes an exploitable map. Tracked
+  out-of-band.
+- Retest §4.10 `real_name` disclosure: dispositioned as a product decision
+  (YUJ-413), not an oversight. Needs a product call, not a code change. Same
+  reason for not citing lines here.
