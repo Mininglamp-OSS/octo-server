@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const expectedVCSGitBranchIcon = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%236b7075%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%206a9%209%200%200%200-9%209V3%22%2F%3E%3Ccircle%20cx%3D%2218%22%20cy%3D%226%22%20r%3D%223%22%2F%3E%3Ccircle%20cx%3D%226%22%20cy%3D%2218%22%20r%3D%223%22%2F%3E%3C%2Fsvg%3E"
+
 // The card builders take the already-parsed *ev (parse unmarshals once); these
 // helpers unmarshal a JSON fixture and build, keeping the tests fixture-driven.
 func ghPushCardFrom(t *testing.T, body string) map[string]interface{} {
@@ -122,21 +124,136 @@ func cardBodyText(card map[string]interface{}) string {
 	return b.String()
 }
 
-// cardOpenURL returns the first Action.OpenUrl (url, title) on the card, or "","".
-func cardOpenURL(card map[string]interface{}) (url, title string) {
-	acts, _ := card["actions"].([]interface{})
-	for _, a := range acts {
-		act, _ := a.(map[string]interface{})
-		if act != nil && act["type"] == "Action.OpenUrl" {
-			u, _ := act["url"].(string)
-			t, _ := act["title"].(string)
-			return u, t
+func walkCardValue(value interface{}, visit func(map[string]interface{})) {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		visit(v)
+		for _, child := range v {
+			walkCardValue(child, visit)
+		}
+	case []interface{}:
+		for _, child := range v {
+			walkCardValue(child, visit)
 		}
 	}
-	return "", ""
+}
+
+func cardNodeByID(card map[string]interface{}, id string) map[string]interface{} {
+	var found map[string]interface{}
+	walkCardValue(card, func(node map[string]interface{}) {
+		if found == nil && node["id"] == id {
+			found = node
+		}
+	})
+	return found
+}
+
+func cardFactValue(card map[string]interface{}, title string) string {
+	var value string
+	walkCardValue(card, func(node map[string]interface{}) {
+		if value != "" || node["type"] != "FactSet" {
+			return
+		}
+		facts, _ := node["facts"].([]interface{})
+		for _, raw := range facts {
+			fact, _ := raw.(map[string]interface{})
+			if fact != nil && fact["title"] == title {
+				value, _ = fact["value"].(string)
+				return
+			}
+		}
+	})
+	return value
+}
+
+// cardOpenURL returns the first Action.OpenUrl (url, title) on the card, or "","".
+func cardOpenURL(card map[string]interface{}) (url, title string) {
+	walkCardValue(card, func(node map[string]interface{}) {
+		if url == "" && node["type"] == "Action.OpenUrl" {
+			url, _ = node["url"].(string)
+			title, _ = node["title"].(string)
+		}
+	})
+	return url, title
 }
 
 func cardActionURL(card map[string]interface{}) string { u, _ := cardOpenURL(card); return u }
+
+func TestVCSCardForgeAnatomy(t *testing.T) {
+	tests := []struct {
+		name      string
+		card      map[string]interface{}
+		source    string
+		context   string
+		badge     string
+		actionURL string
+	}{
+		{
+			name: "github push",
+			card: ghPushCardFrom(t, `{
+				"ref":"refs/heads/main",
+				"compare":"https://github.com/o/r/compare/a...b",
+				"commits":[{"id":"abc1234","message":"ship"}],
+				"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},
+				"sender":{"login":"alice"}}`),
+			source: "GitHub", context: "o/r", badge: "Push",
+			actionURL: "https://github.com/o/r/compare/a...b",
+		},
+		{
+			name: "gitlab pipeline",
+			card: glPipelineCardFrom(t, `{
+				"object_attributes":{"id":42,"status":"success","ref":"main"},
+				"project":{"path_with_namespace":"g/r","web_url":"https://gitlab.com/g/r"}}`),
+			source: "GitLab", context: "g/r", badge: "success",
+			actionURL: "https://gitlab.com/g/r/-/pipelines/42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NotNil(t, tt.card)
+			require.NoError(t, validateVCSCard(tt.card))
+
+			header := cardNodeByID(tt.card, "vcs-header")
+			require.NotNil(t, header)
+			assert.Equal(t, "ColumnSet", header["type"])
+
+			icon := cardNodeByID(tt.card, "vcs-source-icon")
+			require.NotNil(t, icon)
+			assert.Equal(t, expectedVCSGitBranchIcon, icon["url"])
+			assert.Equal(t, "16px", icon["width"])
+			assert.Equal(t, "16px", icon["height"])
+
+			source := cardNodeByID(tt.card, "vcs-source-label")
+			require.NotNil(t, source)
+			assert.Equal(t, tt.source, source["text"])
+			context := cardNodeByID(tt.card, "vcs-source-context")
+			require.NotNil(t, context)
+			assert.Equal(t, tt.context, context["text"])
+
+			badge := cardNodeByID(tt.card, "vcs-event-badge")
+			require.NotNil(t, badge)
+			assert.Equal(t, tt.badge, badge["text"])
+
+			content := cardNodeByID(tt.card, "vcs-content")
+			require.NotNil(t, content)
+			assert.Equal(t, "Container", content["type"])
+			assert.Equal(t, "accent", content["style"])
+			assert.Equal(t, true, content["bleed"])
+
+			headline := cardNodeByID(tt.card, "vcs-headline")
+			require.NotNil(t, headline)
+			assert.NotContains(t, headline, "color", "headline stays neutral; semantic color belongs to the badge")
+
+			footer := cardNodeByID(tt.card, "vcs-footer")
+			require.NotNil(t, footer)
+			assert.Equal(t, "emphasis", footer["style"])
+			assert.Equal(t, true, footer["bleed"])
+			assert.NotContains(t, tt.card, "actions", "navigation is rendered once inside the footer")
+			assert.Equal(t, tt.actionURL, cardActionURL(tt.card))
+		})
+	}
+}
 
 func TestBuildGitHubPushCard(t *testing.T) {
 	card := ghPushCardFrom(t, `{
@@ -300,15 +417,20 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	require.NotNil(t, card)
 	require.NoError(t, validateVCSCard(card))
 
-	// success → headline TextBlock carries color=Good; status word lives in the FactSet.
-	body0 := card["body"].([]interface{})[0].(map[string]interface{})
-	assert.Equal(t, "Good", body0["color"])
+	// success → semantic color lives only on the compact status badge.
+	headline := cardNodeByID(card, "vcs-headline")
+	require.NotNil(t, headline)
+	assert.NotContains(t, headline, "color")
+	badge := cardNodeByID(card, "vcs-event-badge")
+	require.NotNil(t, badge)
+	assert.Equal(t, "success", badge["text"])
+	assert.Equal(t, "Good", badge["color"])
 	plain := cardmsg.BuildPlain(card)
 	assert.Contains(t, plain, "Pipeline #4567")
 	assert.Contains(t, plain, "Branch: test")
 	assert.Contains(t, plain, "Status: success")
 	assert.Contains(t, plain, "Duration: 7m 26s", "446s → 7m 26s")
-	assert.Contains(t, plain, "Jobs (5): build / unit / lint / e2e / deploy")
+	assert.Equal(t, "build\nunit\nlint\ne2e\ndeploy", cardFactValue(card, "Jobs (5)"))
 	assert.Equal(t, "https://gitlab.com/grp/app/-/pipelines/4567", cardActionURL(card))
 
 	// Non-terminal statuses are rendered too (no longer filtered to success/failed/canceled).
@@ -319,8 +441,9 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 			card := glPipelineCardFrom(t, fmt.Sprintf(`{"object_attributes":{"id":1,"status":%q}}`, status))
 			require.NotNil(t, card)
 			require.NoError(t, validateVCSCard(card))
-			body0 := card["body"].([]interface{})[0].(map[string]interface{})
-			assert.Equal(t, "Accent", body0["color"])
+			badge := cardNodeByID(card, "vcs-event-badge")
+			require.NotNil(t, badge)
+			assert.Equal(t, "Accent", badge["color"])
 			// `_` is escaped by escapeCardText (`_` → `\_`); BuildPlain's stripMarkdown
 			// (a real markdown parser) does not fold that back to a bare `_`, so the
 			// plain rendering keeps the backslash — confirmed empirically here.
@@ -334,11 +457,46 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	unknown := glPipelineCardFrom(t, `{"object_attributes":{"id":1,"status":"some_future_gitlab_status"}}`)
 	require.NotNil(t, unknown)
 	require.NoError(t, validateVCSCard(unknown))
-	unknownBody0 := unknown["body"].([]interface{})[0].(map[string]interface{})
-	assert.NotContains(t, unknownBody0, "color", "unmapped status keeps the default headline color")
+	unknownBadge := cardNodeByID(unknown, "vcs-event-badge")
+	require.NotNil(t, unknownBadge)
+	assert.NotContains(t, unknownBadge, "color", "unmapped status keeps the default badge color")
 
 	// Missing status (malformed payload, nothing to render) → no card.
 	assert.Nil(t, glPipelineCardFrom(t, `{"object_attributes":{"id":1}}`))
+}
+
+func TestBuildGitLabPipelineCard_UsesEnglishLabelsAndJobLinesForAllLanguages(t *testing.T) {
+	var ev glPipelineEvent
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"object_attributes":{"id":7,"status":"success","ref":"main","duration":42},
+		"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"},
+		"builds":[{"name":"build"},{"name":"unit"},{"name":"deploy"}]
+	}`), &ev))
+
+	for _, lang := range []string{"en-US", "zh-CN"} {
+		t.Run(lang, func(t *testing.T) {
+			card := buildGitLabPipelineCard(&ev, lang)
+			require.NotNil(t, card)
+			require.NoError(t, validateVCSCard(card))
+			assert.Equal(t, "main", cardFactValue(card, "Branch"))
+			assert.Equal(t, "success", cardFactValue(card, "Status"))
+			assert.Equal(t, "42s", cardFactValue(card, "Duration"))
+			assert.Equal(t, "build\nunit\ndeploy", cardFactValue(card, "Jobs (3)"))
+			assert.Empty(t, cardFactValue(card, "分支"))
+			assert.Empty(t, cardFactValue(card, "任务 (3)"))
+		})
+	}
+
+	t.Run("labels keep slash separator", func(t *testing.T) {
+		card := glIssueCardFrom(t, `{
+			"user":{"username":"alice"},
+			"object_attributes":{"iid":1,"title":"bug","url":"https://gitlab.com/o/r/-/issues/1","action":"open"},
+			"labels":[{"title":"backend"},{"title":"needs-review"}],
+			"project":{"path_with_namespace":"o/r"}
+		}`)
+		require.NotNil(t, card)
+		assert.Equal(t, "backend / needs-review", cardFactValue(card, "Labels (2)"))
+	})
 }
 
 func TestFormatPipelineDuration(t *testing.T) {
@@ -500,41 +658,72 @@ func TestGlLabelsFact_OverflowAndEscaping(t *testing.T) {
 	})
 }
 
-// TestAllVCSCardBuilders_Smoke exercises every event-specific builder (the ones only
-// indirectly covered elsewhere: GitHub PR/issues/release, GitLab tag/note) so a
-// regression in any one is caught: card is non-nil, passes the authoritative
-// validator, derives non-empty plain, and carries the expected headline.
+// TestAllVCSCardBuilders_Smoke exercises every event-specific builder so a regression
+// in any one is caught: card is non-nil, passes the authoritative validator, derives
+// non-empty plain, carries the expected headline, and uses the shared Forge anatomy.
 func TestAllVCSCardBuilders_Smoke(t *testing.T) {
 	cases := []struct {
 		name     string
 		build    func(t *testing.T) map[string]interface{}
 		headline string
+		source   string
+		badge    string
 	}{
+		{"gh push", func(t *testing.T) map[string]interface{} {
+			var ev ghPushEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"ref":"refs/heads/main","commits":[{"id":"abc1234","message":"ship"}],"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},"sender":{"login":"amy"}}`), &ev))
+			return buildGitHubPushCard(&ev, "en-US")
+		}, "amy pushed 1 commit(s)", "GitHub", "Push"},
 		{"gh pull_request opened", func(t *testing.T) map[string]interface{} {
 			var ev ghPullRequestEvent
 			require.NoError(t, json.Unmarshal([]byte(`{"action":"opened","pull_request":{"number":9,"title":"Add cards","html_url":"https://github.com/o/r/pull/9"},"repository":{"full_name":"o/r"},"sender":{"login":"alice"}}`), &ev))
 			return buildGitHubPullRequestCard(&ev, "en-US")
-		}, "alice opened a pull request"},
+		}, "alice opened a pull request", "GitHub", "Pull Request"},
 		{"gh issues closed", func(t *testing.T) map[string]interface{} {
 			var ev ghIssuesEvent
 			require.NoError(t, json.Unmarshal([]byte(`{"action":"closed","issue":{"number":3,"title":"Bug","html_url":"https://github.com/o/r/issues/3"},"repository":{"full_name":"o/r"},"sender":{"login":"bob"}}`), &ev))
 			return buildGitHubIssuesCard(&ev, "en-US")
-		}, "bob closed an issue"},
+		}, "bob closed an issue", "GitHub", "Issue"},
+		{"gh issue comment", func(t *testing.T) map[string]interface{} {
+			var ev ghIssueCommentEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"action":"created","issue":{"number":4,"title":"Bug"},"comment":{"body":"lgtm","html_url":"https://github.com/o/r/issues/4#issuecomment-1"},"repository":{"full_name":"o/r"},"sender":{"login":"bea"}}`), &ev))
+			return buildGitHubIssueCommentCard(&ev, "en-US")
+		}, "bea commented on an issue", "GitHub", "Comment"},
 		{"gh release published", func(t *testing.T) map[string]interface{} {
 			var ev ghReleaseEvent
 			require.NoError(t, json.Unmarshal([]byte(`{"action":"published","release":{"tag_name":"v1.2.0","name":"v1.2.0","html_url":"https://github.com/o/r/releases/v1.2.0"},"repository":{"full_name":"o/r"},"sender":{"login":"carol"}}`), &ev))
 			return buildGitHubReleaseCard(&ev, "en-US")
-		}, "carol published a release"},
+		}, "carol published a release", "GitHub", "Release"},
+		{"gl push", func(t *testing.T) map[string]interface{} {
+			var ev glPushEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"ref":"refs/heads/main","commits":[{"id":"abc123","message":"ship"}],"user_username":"dana","project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
+			return buildGitLabPushCard(&ev, "en-US")
+		}, "dana pushed 1 commit(s)", "GitLab", "Push"},
 		{"gl tag push", func(t *testing.T) map[string]interface{} {
 			var ev glPushEvent
 			require.NoError(t, json.Unmarshal([]byte(`{"ref":"refs/tags/v2.0.0","after":"abc123","user_username":"dave","project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
 			return buildGitLabTagPushCard(&ev, "en-US")
-		}, "dave pushed tag"},
+		}, "dave pushed tag", "GitLab", "Tag"},
+		{"gl merge request", func(t *testing.T) map[string]interface{} {
+			var ev glMergeRequestEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"user":{"username":"erin"},"object_attributes":{"iid":5,"title":"Refactor","action":"open","url":"https://gitlab.com/o/r/-/merge_requests/5"},"project":{"path_with_namespace":"o/r"}}`), &ev))
+			return buildGitLabMergeRequestCard(&ev, "en-US")
+		}, "erin opened a merge request", "GitLab", "Merge Request"},
+		{"gl issue", func(t *testing.T) map[string]interface{} {
+			var ev glIssueEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"user":{"username":"finn"},"object_attributes":{"iid":6,"title":"Bug","action":"open","url":"https://gitlab.com/o/r/-/issues/6"},"project":{"path_with_namespace":"o/r"}}`), &ev))
+			return buildGitLabIssueCard(&ev, "en-US")
+		}, "finn opened an issue", "GitLab", "Issue"},
 		{"gl note on MR", func(t *testing.T) map[string]interface{} {
 			var ev glNoteEvent
 			require.NoError(t, json.Unmarshal([]byte(`{"user":{"username":"erin"},"object_attributes":{"note":"lgtm","noteable_type":"MergeRequest","url":"https://gitlab.com/o/r/-/merge_requests/5#note_1"},"merge_request":{"iid":5,"title":"Refactor"},"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
 			return buildGitLabNoteCard(&ev, "en-US")
-		}, "erin commented"},
+		}, "erin commented", "GitLab", "Comment"},
+		{"gl pipeline", func(t *testing.T) map[string]interface{} {
+			var ev glPipelineEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"object_attributes":{"id":7,"status":"success","ref":"main"},"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
+			return buildGitLabPipelineCard(&ev, "en-US")
+		}, "Pipeline #7", "GitLab", "success"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -543,6 +732,8 @@ func TestAllVCSCardBuilders_Smoke(t *testing.T) {
 			require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
 			assert.NotEmpty(t, cardmsg.BuildPlain(card))
 			assert.Contains(t, cardBodyText(card), c.headline)
+			assert.Equal(t, c.source, cardNodeByID(card, "vcs-source-label")["text"])
+			assert.Equal(t, c.badge, cardNodeByID(card, "vcs-event-badge")["text"])
 		})
 	}
 }
@@ -740,6 +931,7 @@ func TestBuildCardPayload_AdapterEnvelope(t *testing.T) {
 	assert.Equal(t, cardmsg.InteractiveCard.Int(), payload["type"])
 	assert.Equal(t, cardmsg.CardVersion, payload["card_version"])
 	assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
+	assert.NotContains(t, payload, "render_profile", "generic native card requests retain legacy rendering unless their own contract opts in")
 	assert.Equal(t, "sp_1", payload["space_id"], "space_id is server-derived from the webhook row")
 
 	from, _ := payload["from"].(map[string]interface{})
@@ -752,6 +944,41 @@ func TestBuildCardPayload_AdapterEnvelope(t *testing.T) {
 	assert.NotEmpty(t, plain, "Finalize derives an authoritative plain")
 	assert.NotEqual(t, cardmsg.PlaceholderCard, plain, "plain comes from the card body, not the [卡片] fallback")
 	assert.Contains(t, plain, "pushed")
+}
+
+func TestVCSCardEnvelopeSelectsForgeWithoutExposingCallerOverride(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "1")
+	body := []byte(`{
+		"ref":"refs/heads/main",
+		"commits":[{"id":"abc1234","message":"ship"}],
+		"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},
+		"sender":{"login":"alice"}
+	}`)
+	req, skip, invalid := parseGitHubPush(ghHeader("push"), body)
+	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
+	require.Equal(t, msgTypeCard, req.MsgType)
+
+	m := &incomingWebhookModel{WebhookID: "iwh_vcs", SpaceID: "sp_1", Name: "VCS"}
+	payload, err := buildCardPayload(m, req, false)
+	require.NoError(t, err)
+	assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
+	assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
+	require.NoError(t, cardmsg.Validate(payload))
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"render_profile":"octo-chat/v1"`)
+
+	t.Run("native JSON cannot author render profile", func(t *testing.T) {
+		cardJSON, err := json.Marshal(req.Card)
+		require.NoError(t, err)
+		var native pushPayloadReq
+		require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(
+			`{"msg_type":"card","render_profile":"octo-chat/v1","card":%s}`, cardJSON,
+		)), &native))
+		nativePayload, err := buildCardPayload(m, &native, false)
+		require.NoError(t, err)
+		assert.NotContains(t, nativePayload, "render_profile")
+	})
 }
 
 func TestVCSViewLabel(t *testing.T) {
