@@ -35,6 +35,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	liblog "github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/gocraft/dbr/v2"
@@ -623,11 +624,30 @@ func (c *botCardTemplateCatalog) CapabilityFor(
 			ID:     ref.ID, Version: ref.Version,
 		})
 		if err != nil {
-			return botTemplatingCapability{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+			// Drop the template, do not fail the manifest — review P1-1.
+			//
+			// The layer below already chose this policy and documented the
+			// reason: loadAdvertisableAuthorizations reads with skipBrokenRow so
+			// "a single bad row cannot blank a Bot's entire capability
+			// manifest", while an *authorization* read still fails hard. Failing
+			// the whole manifest here re-introduced exactly the failure mode
+			// that policy exists to prevent, one call up — and since the profile
+			// handler turns the error into a 500, one uncompilable artifact
+			// among a Bot's grants would take feature detection down for that
+			// Bot entirely, on the endpoint whose whole job is to answer when
+			// things are partly unavailable.
+			//
+			// Dropping is also the honest answer: a template whose artifact will
+			// not compile is one the send path would refuse anyway, so omitting
+			// it keeps the manifest's promise — everything advertised here is
+			// sendable — rather than breaking it.
+			logBotTemplateManifestDrop(principal, ref, err)
+			continue
 		}
 		capability, err := templateCapabilityFromMeta(meta)
 		if err != nil {
-			return botTemplatingCapability{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+			logBotTemplateManifestDrop(principal, ref, err)
+			continue
 		}
 		manifest.Templates = append(manifest.Templates, capability)
 	}
@@ -683,4 +703,17 @@ func cloneTemplateCapability(template botTemplateCapability) botTemplateCapabili
 		}
 	}
 	return out
+}
+
+// logBotTemplateManifestDrop records a template omitted from an advertised
+// manifest. Silence here would leave an operator who granted a template, saw
+// the row land, and then could not find it in the profile with nothing to go
+// on — the same reason StaticDiscoverGrants logs its own truncation.
+func logBotTemplateManifestDrop(principal botCatalogPrincipal, ref botTemplateRef, err error) {
+	liblog.NewTLog("BotCardManifest").Warn("bot card manifest dropped an unreadable template",
+		zap.String("bot_id", principal.BotID),
+		zap.String("space_id", principal.SpaceID),
+		zap.String("template_id", string(ref.ID)),
+		zap.String("template_version", ref.Version),
+		zap.Error(err))
 }

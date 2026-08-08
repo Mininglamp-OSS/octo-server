@@ -6,8 +6,8 @@
 // any future PUT {active:1} on those rows, turning the persona
 // selector into a one-way trip:
 //
-//   A active → switch to B (PUT {active:1} on B) → A demoted with
-//   revoked_at=now. Switch back to A → 404.
+//	A active → switch to B (PUT {active:1} on B) → A demoted with
+//	revoked_at=now. Switch back to A → 404.
 //
 // Fix: siblings are PAUSED, not REVOKED. Only revokeGrant (DELETE
 // /v1/obo/grants/:id) writes `revoked_at`. The demote UPDATE drops

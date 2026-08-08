@@ -897,7 +897,6 @@ func TestFanout_OriginalSenderHasNoConversationLeak(t *testing.T) {
 	}
 }
 
-
 // invariant: a MsgSendReq must carry EXACTLY ONE of (channel_id set with
 // empty subscribers) OR (empty channel_id with subscribers set). Setting
 // both triggers the production rejection observed in PR#82 R5 P0:

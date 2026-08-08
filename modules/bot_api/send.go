@@ -1386,6 +1386,10 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
 	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
+	// Two values, not one: an empty stored Space on a *marked* frame must be
+	// preserved, while an absent marker must be recomposed. See P1-0 in
+	// RenderEditPayloadForPrincipal.
+	storedSpace, storedMarked := storedProvenanceSpaceID(snapshot.Envelope)
 	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), editPrincipal, map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
@@ -1395,7 +1399,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		WebLoginURL: webLoginURL,
 		Lang:        i18n.OutboundLanguage(c.Request.Context()),
 		SpaceID:     spaceID,
-	}, storedProvenanceSpaceID(snapshot.Envelope))
+	}, storedSpace, storedMarked)
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))

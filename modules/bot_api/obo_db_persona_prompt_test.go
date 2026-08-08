@@ -74,10 +74,10 @@ func TestInsertGrant_WritesPersonaPromptColumn(t *testing.T) {
 
 // TestFindGrantByID_NullPersonaPromptDoesNotPanic regresses the GH#122
 // trigger: a row whose persona_prompt column is NULL (legacy rows from
-// before the migration backfilled '' / rows written by code paths that
+// before the migration backfilled ” / rows written by code paths that
 // did not include the column) used to fail loading into the struct because
 // `PersonaPrompt string` cannot scan NULL. The fix wraps the column in
-// `COALESCE(persona_prompt, '')` so the driver hands the scanner an empty
+// `COALESCE(persona_prompt, ”)` so the driver hands the scanner an empty
 // string instead. We assert both that the production SQL contains the
 // COALESCE rewrite and that the load succeeds with PersonaPrompt == "".
 func TestFindGrantByID_NullPersonaPromptDoesNotPanic(t *testing.T) {

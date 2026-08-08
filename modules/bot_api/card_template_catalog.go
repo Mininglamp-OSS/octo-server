@@ -374,6 +374,7 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 	storedSpaceID string,
+	storedMarked bool,
 ) (map[string]any, error) {
 	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
@@ -387,26 +388,46 @@ func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	// This is the same rule pkg/cardtmpl's updater already follows when it
 	// copies the stored markers through verbatim.
 	//
-	// Only a frame with no stored Space at all falls back to composing one,
-	// which is what a pre-PR-C frame being edited for the first time needs.
+	// Only a frame with **no provenance marker at all** falls back to composing
+	// one, which is what a pre-PR-C frame being edited for the first time needs.
+	// A marked frame keeps its stored Space verbatim — including when that Space
+	// is the empty string, which is a real recorded state and not a gap.
+	//
+	// Collapsing those two into one sentinel is review finding P1-0, and it was
+	// not theoretical: with the new-send gate off, `botSendCatalogPrincipal`
+	// short-circuits and `env.SpaceID` is populated for DMs only, so **every**
+	// group/thread Registry card stored so far carries an empty marker Space.
+	// Recomposing on that emptiness meant that the moment the gate flipped, the
+	// edit stamped the group's real Space, `Mutate` compared the whole
+	// provenance struct, and every one of those cards became permanently
+	// un-editable — `ai.reasoning-process` streaming cards frozen mid-stream
+	// with no repair path. That is the same symptom the acquire-asymmetry fix in
+	// internal/carddispatch/mutation.go records having already been hit once.
 	space := strings.TrimSpace(storedSpaceID)
-	if space == "" {
+	if !storedMarked {
 		space = provenanceSpaceID(principal, env)
 	}
 	return c.renderPayload(ctx, principal.access(cardtmpl.CatalogPurposeHistoricalEdit), inbound, env,
 		c.editRefResolver(principal), true, space)
 }
 
-// storedProvenanceSpaceID reads the Space a frame's own marker records, or ""
-// when the frame carries no marker (a pre-PR-C card) or cannot be parsed. The
-// guard that runs before it has already rejected a malformed marker, so an
-// empty answer here means "nothing was stored", never "we failed to look".
-func storedProvenanceSpaceID(envelope []byte) string {
+// storedProvenanceSpaceID reads the Space a frame's own marker records.
+//
+// The second return distinguishes the two states an empty string used to
+// conflate: `false` means the frame carries no provenance marker (a pre-PR-C
+// card), `true` with an empty string means it carries one that records no
+// Space. Both are legitimate stored shapes and they need opposite handling on
+// edit — the first recomposes, the second must be preserved exactly — so the
+// caller cannot be left to infer which it has from the string alone.
+//
+// The guard that runs before this has already rejected a malformed marker, so
+// `false` here means "nothing was stored", never "we failed to look".
+func storedProvenanceSpaceID(envelope []byte) (string, bool) {
 	markers, err := cardmsg.CatalogFrameMarkers(envelope)
 	if err != nil || !markers.HasProvenance {
-		return ""
+		return "", false
 	}
-	return markers.Provenance.SpaceID
+	return markers.Provenance.SpaceID, true
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
@@ -770,7 +791,19 @@ func requireEffectiveCardTemplate(
 			markers.Provenance.PrincipalID != editorBotID {
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
-		if markers.Provenance.SpaceID != "" {
+		if markers.Provenance.SpaceID == "" {
+			// An empty stored Space is a *recorded* state, not a gap, and it is
+			// the majority state today: with the new-send gate off every
+			// group/thread Registry send stamps one (env.SpaceID is DM-only).
+			// There is nothing to compare — the marker asserts no Space — and
+			// refusing on the grounds that the resolver can now establish one
+			// is precisely the lockout P1-0 describes, since the stored frame
+			// can never gain a Space. The edit preserves the empty value
+			// verbatim (see RenderEditPayloadForPrincipal), so Mutate's
+			// whole-struct comparison matches and the card stays editable. The
+			// PrincipalID check above and Snapshot ownership still bind this
+			// edit to the card's author.
+		} else {
 			// The envelope's own space_id is a fallback witness: a DM send writes
 			// it from the *forgiving* resolver, which is also what stamped the
 			// marker whenever the strict grant resolver refused. It is what keeps

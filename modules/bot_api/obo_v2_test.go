@@ -1,18 +1,18 @@
 // Package bot_api · YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2
 // regression coverage for the four spec items the v2 task lands:
 //
-//   1. fan-out trigger narrowing (mention.uids must contain grantor for
-//      group / community-topic traffic; @AI / @bot / plain messages do
-//      not summon the persona);
-//   2. fan-out payload — v2 obo_grantor_uid / obo_grantor_name /
-//      obo_respond_as / obo_system_hint, with persona_prompt appended;
-//   3. fan-out response target — adapter-owned but the payload carries
-//      obo_origin_channel_id / obo_origin_channel_type / obo_grantor_uid
-//      so the adapter has every field it needs to route a reply back;
-//   5. grant mutual exclusion — creating / reactivating a grant
-//      atomically demotes every other active grant for the same
-//      grantor;
-//   6. persona_prompt — CRUD round-trip (create / update / list).
+//  1. fan-out trigger narrowing (mention.uids must contain grantor for
+//     group / community-topic traffic; @AI / @bot / plain messages do
+//     not summon the persona);
+//  2. fan-out payload — v2 obo_grantor_uid / obo_grantor_name /
+//     obo_respond_as / obo_system_hint, with persona_prompt appended;
+//  3. fan-out response target — adapter-owned but the payload carries
+//     obo_origin_channel_id / obo_origin_channel_type / obo_grantor_uid
+//     so the adapter has every field it needs to route a reply back;
+//  5. grant mutual exclusion — creating / reactivating a grant
+//     atomically demotes every other active grant for the same
+//     grantor;
+//  6. persona_prompt — CRUD round-trip (create / update / list).
 //
 // Item 4 (typing indicator OBO identity) lives in obo_v2_typing_test.go
 // alongside the existing typing test surface.

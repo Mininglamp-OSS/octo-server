@@ -740,7 +740,7 @@ func TestGroupEditAuthorizesTheRenderWithTheSameSpaceAsTheGate(t *testing.T) {
 			"template_ref": map[string]any{"id": string(id), "version": dynamicVersion},
 			"state":        "thinking",
 			"data":         map[string]any{"title": "t"},
-		}, cardtmpl.BuildEnv{}, groupSpace); err != nil {
+		}, cardtmpl.BuildEnv{}, groupSpace, true); err != nil {
 		t.Fatalf("group dynamic edit refused: %v", err)
 	}
 	if got := rendering.lastRender.Access.Principal.SpaceID; got != groupSpace {
@@ -835,9 +835,10 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 	}
 
 	// And the re-stamped marker keeps the Space rather than blanking it.
+	storedSpace, storedMarked := storedProvenanceSpaceID(envelope)
 	edited, err := catalog.RenderEditPayloadForPrincipal(context.Background(), editPrincipal,
 		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env,
-		storedProvenanceSpaceID(envelope))
+		storedSpace, storedMarked)
 	if err != nil {
 		t.Fatalf("group edit: %v", err)
 	}
@@ -1316,16 +1317,17 @@ func TestEditPreservesTheStoredProvenanceSpaceEvenWhenTheGateIsDark(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := storedProvenanceSpaceID(envelope); got != "space-group" {
+	if got, _ := storedProvenanceSpaceID(envelope); got != "space-group" {
 		t.Fatalf("stored Space = %q", got)
 	}
 
 	// The gate is rolled back: no principal Space, and a group envelope has no
 	// top-level space_id to fall back to either.
 	dark := botCatalogPrincipal{BotID: "bot-42"}
+	dmStoredSpace, dmStoredMarked := storedProvenanceSpaceID(envelope)
 	edited, err := catalog.RenderEditPayloadForPrincipal(context.Background(), dark,
 		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any),
-		cardtmpl.BuildEnv{Lang: "zh-CN"}, storedProvenanceSpaceID(envelope))
+		cardtmpl.BuildEnv{Lang: "zh-CN"}, dmStoredSpace, dmStoredMarked)
 	if err != nil {
 		t.Fatalf("dark-gate edit: %v", err)
 	}
