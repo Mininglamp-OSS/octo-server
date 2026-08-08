@@ -121,11 +121,32 @@ func (s *store) LoadAuthorization(
 		}
 		result.Artifact = meta
 	}
-	grant, err := loadGrantDecision(ctx, tx, query.ID, query.Principal)
-	if err != nil {
-		return cardtmpl.RuntimeAuthorization{}, err
+	// The grant read is *inside* the resolved-version guard, and that placement
+	// is load-bearing rather than an optimisation — review P1-B (yujiawei).
+	//
+	// With no resolved version there is no dynamic decision for a grant to
+	// participate in: both cardtmpl.RuntimeCatalog.resolve and
+	// bot_api.decideSendRef return the static answer without ever reading
+	// result.Grant. So the query was not merely wasted work — it was a
+	// card_template_grant dependency acquired on a path that runs with *both*
+	// gates false.
+	//
+	// That path is the internal-producer notification render: a default-version
+	// read (Version == "", followActivation) skips RuntimeCatalog's frozen-Registry
+	// short-circuit and reaches here, and installRuntimeCatalog publishes the
+	// authorization source unconditionally. So every notify Registry card render
+	// was touching this table. That contradicts the promise runtime_install.go
+	// makes and the merge argument this PR rests on — and unlike the control
+	// plane, which tolerates "the migration has not been applied yet"
+	// (api_state.go), this path had no such tolerance: a missing table would
+	// surface as a failed render of an ordinary notification card.
+	if result.Version != "" {
+		grant, err := loadGrantDecision(ctx, tx, query.ID, query.Principal)
+		if err != nil {
+			return cardtmpl.RuntimeAuthorization{}, err
+		}
+		result.Grant = grant
 	}
-	result.Grant = grant
 
 	// Commit a read-only transaction rather than relying on the deferred
 	// rollback: it releases the snapshot deterministically and turns a

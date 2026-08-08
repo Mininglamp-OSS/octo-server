@@ -248,14 +248,28 @@ func TestStoreLoadAuthorizationSkipsGrantLookupForUngrantablePrincipals(t *testi
 
 // A template with no activation row resolves to no version, so the artifact
 // read is skipped — the caller falls back to the frozen Registry.
-func TestStoreLoadAuthorizationWithoutActivationSkipsArtifactRead(t *testing.T) {
+// A default-version read that resolves no activation issues exactly one query:
+// the activation probe. Neither the artifact read nor the grant read runs.
+//
+// The grant half is review P1-B. It used to run unconditionally, which was not
+// merely wasted work — RuntimeCatalog.resolve and decideSendRef both return the
+// static answer without reading Grant when no version resolved, so the query
+// bought nothing and cost a card_template_grant dependency on a path that runs
+// with *both* runtime-catalog gates false. The internal-producer notification
+// render is that path (MetaDefault with an empty version), so every notify
+// Registry card render was touching a table this PR introduces, contradicting
+// the merge argument the PR rests on.
+//
+// The expectations below are the assertion: sqlmock fails on an unmet
+// expectation *and* on an unexpected query, so adding the grant read back turns
+// this test red rather than leaving it silently passing.
+func TestStoreLoadAuthorizationWithoutActivationReadsNeitherArtifactNorGrant(t *testing.T) {
 	store, mock, closeDB := newMockStore(t)
 	defer closeDB()
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(authActivationPattern)).
 		WillReturnRows(sqlmock.NewRows([]string{"active_version", "status", "revision"}))
-	mock.ExpectQuery(regexp.QuoteMeta(authGrantPattern)).WillReturnRows(grantScopeRows())
 	mock.ExpectCommit()
 
 	auth, err := store.LoadAuthorization(context.Background(), cardtmpl.RuntimeAuthorizationQuery{
