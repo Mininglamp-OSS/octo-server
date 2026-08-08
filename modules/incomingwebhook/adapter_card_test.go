@@ -999,7 +999,7 @@ func TestVCSCardEnvelopeSelectsForgeWithoutExposingCallerOverride(t *testing.T) 
 	})
 }
 
-func TestVCSCardEnvelopePlainStartsWithEventHeadline(t *testing.T) {
+func TestVCSCardEnvelopePlainStartsWithEventHeadlineAndKeepsContext(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "1")
 	body := []byte(`{
 		"object_attributes":{"id":21511,"status":"success","ref":"develop"},
@@ -1015,8 +1015,8 @@ func TestVCSCardEnvelopePlainStartsWithEventHeadline(t *testing.T) {
 		false,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "Pipeline #21511\nBranch: develop\nStatus: success", payload["plain"],
-		"decorative VCS header content must not displace the event headline in notifications and previews")
+	assert.Equal(t, "Pipeline #21511\ndmwork/octo-server\nBranch: develop\nStatus: success", payload["plain"],
+		"plain must start with the event headline, retain repository context, and exclude decorative header content")
 }
 
 func TestVCSViewLabel(t *testing.T) {
