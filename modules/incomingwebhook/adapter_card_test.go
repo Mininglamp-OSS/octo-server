@@ -430,7 +430,8 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	assert.Contains(t, plain, "Branch: test")
 	assert.Contains(t, plain, "Status: success")
 	assert.Contains(t, plain, "Duration: 7m 26s", "446s → 7m 26s")
-	assert.Equal(t, "build\nunit\nlint\ne2e\ndeploy", cardFactValue(card, "Jobs (5)"))
+	assert.Equal(t, "build  \nunit  \nlint  \ne2e  \ndeploy", cardFactValue(card, "Jobs (5)"),
+		"two spaces before each newline produce CommonMark hard breaks in octo-web")
 	assert.Equal(t, "https://gitlab.com/grp/app/-/pipelines/4567", cardActionURL(card))
 
 	// Non-terminal statuses are rendered too (no longer filtered to success/failed/canceled).
@@ -481,7 +482,8 @@ func TestBuildGitLabPipelineCard_UsesEnglishLabelsAndJobLinesForAllLanguages(t *
 			assert.Equal(t, "main", cardFactValue(card, "Branch"))
 			assert.Equal(t, "success", cardFactValue(card, "Status"))
 			assert.Equal(t, "42s", cardFactValue(card, "Duration"))
-			assert.Equal(t, "build\nunit\ndeploy", cardFactValue(card, "Jobs (3)"))
+			assert.Equal(t, "build  \nunit  \ndeploy", cardFactValue(card, "Jobs (3)"),
+				"raw newlines are CommonMark soft breaks and collapse in browser layout")
 			assert.Empty(t, cardFactValue(card, "分支"))
 			assert.Empty(t, cardFactValue(card, "任务 (3)"))
 		})
