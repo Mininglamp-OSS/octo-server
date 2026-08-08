@@ -30,6 +30,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -48,11 +49,41 @@ const (
 	remTopicB = "g_alice_not_in____t2"
 )
 
+// remMemberBaseDSN 是本文件所有连接的服务器地址与凭据来源。
+// MSG_REMINDERS_TEST_MYSQL_ADDR 可覆盖（CI 上 MySQL 未必在 127.0.0.1）。
+func remMemberBaseDSN() string {
+	if raw := os.Getenv("MSG_REMINDERS_TEST_MYSQL_ADDR"); raw != "" {
+		return raw
+	}
+	return "root:demo@tcp(127.0.0.1:3306)/" + remMemberDBName + "?charset=utf8mb4&parseTime=true"
+}
+
+// remMemberDSNWithDB 取 base DSN 的服务器与凭据，把库名换成 dbName。
+//
+// 库名必须由代码强制、不能直接采信环境变量（PR#717 review）：remMemberEnsureTables
+// 会 DROP 掉 reminders / reminder_done / group_member 三张表，若环境变量指向的是
+// 一个真实库，一次配置失误就能删掉真实数据。同理建库用的连接也必须与测试连接指向
+// **同一台**服务器 —— 否则隔离库建在 A、测试连到 B，症状是"表不存在"而不是报错。
+//
+// 用驱动自带的 ParseDSN 而不是字符串切割：unix socket 形式
+// (user@unix(/var/run/mysqld/mysqld.sock)/db) 的 DSN 里含斜杠，手写切割会切错。
+func remMemberDSNWithDB(t *testing.T, dbName string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(remMemberBaseDSN())
+	require.NoError(t, err, "MSG_REMINDERS_TEST_MYSQL_ADDR 不是合法的 MySQL DSN")
+	cfg.DBName = dbName
+	return cfg.FormatDSN()
+}
+
 func remMemberNewCtx(t *testing.T, collate string) *config.Context {
 	t.Helper()
+
+	// 建库连接：与测试连接同源，只把库名指到 information_schema（必然存在，且这里
+	// 只发 server 级的 DROP/CREATE DATABASE，不碰其中任何表）。
 	bootCfg := config.New()
 	bootCfg.Test = true
 	bootCfg.DB.Migration = false
+	bootCfg.DB.MySQLAddr = remMemberDSNWithDB(t, "information_schema")
 	boot := config.NewContext(bootCfg)
 	_, err := boot.DB().Exec("DROP DATABASE IF EXISTS " + remMemberDBName)
 	require.NoError(t, err, "drop isolated db")
@@ -60,14 +91,10 @@ func remMemberNewCtx(t *testing.T, collate string) *config.Context {
 		"CREATE DATABASE " + remMemberDBName + " CHARACTER SET utf8mb4 COLLATE " + collate)
 	require.NoError(t, err, "create isolated db")
 
-	addr := os.Getenv("MSG_REMINDERS_TEST_MYSQL_ADDR")
-	if addr == "" {
-		addr = "root:demo@tcp(127.0.0.1:3306)/" + remMemberDBName + "?charset=utf8mb4&parseTime=true"
-	}
 	cfg := config.New()
 	cfg.Test = true
 	cfg.DB.Migration = false
-	cfg.DB.MySQLAddr = addr
+	cfg.DB.MySQLAddr = remMemberDSNWithDB(t, remMemberDBName)
 	return config.NewContext(cfg)
 }
 
@@ -529,4 +556,30 @@ func TestRemindersSync_EndToEndWithRealMembershipSource(t *testing.T) {
 	assert.NotContains(t, ids, remGroupD, "被拉黑后不再可见")
 	assert.Contains(t, ids, remGroupA)
 	assert.Contains(t, ids, remTopicA, "子区经父群成员关系可见")
+}
+
+// TestRemMemberDSN_ForcesIsolatedDatabase 钉住测试夹具的一条安全属性
+// （PR#717 review 的 🔵 建议）。
+//
+// remMemberEnsureTables 会 DROP 掉 reminders / reminder_done / group_member。
+// 只要库名还能被环境变量左右，把 MSG_REMINDERS_TEST_MYSQL_ADDR 指错一次就足以
+// 删掉真实数据。因此库名由代码强制，环境变量只能影响服务器与凭据。
+func TestRemMemberDSN_ForcesIsolatedDatabase(t *testing.T) {
+	t.Setenv("MSG_REMINDERS_TEST_MYSQL_ADDR",
+		"someuser:somepass@tcp(10.0.0.1:3306)/production?charset=utf8mb4&parseTime=true")
+
+	cfg, err := mysql.ParseDSN(remMemberDSNWithDB(t, remMemberDBName))
+	require.NoError(t, err)
+
+	assert.Equal(t, remMemberDBName, cfg.DBName,
+		"库名必须被强制为隔离库；采信 env 的库名会让 DROP TABLE 打到真实库上")
+	// 服务器与凭据仍取自 env —— 覆盖能力本身是要保留的，CI 上 MySQL 未必在本机。
+	assert.Equal(t, "10.0.0.1:3306", cfg.Addr)
+	assert.Equal(t, "someuser", cfg.User)
+
+	// 建库连接必须落在同一台服务器上，否则隔离库建在 A、测试连到 B。
+	bootCfg, err := mysql.ParseDSN(remMemberDSNWithDB(t, "information_schema"))
+	require.NoError(t, err)
+	assert.Equal(t, cfg.Addr, bootCfg.Addr, "建库连接与测试连接必须同服务器")
+	assert.Equal(t, "information_schema", bootCfg.DBName)
 }
