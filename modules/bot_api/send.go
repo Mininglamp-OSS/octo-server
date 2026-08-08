@@ -1104,10 +1104,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,
 		// 非撤回,放行。
 		var lifecycle struct {
-			Revoke    int `db:"revoke"`
-			IsDeleted int `db:"is_deleted"`
+			Revoke      int    `db:"revoke"`
+			IsDeleted   int    `db:"is_deleted"`
+			ContentEdit string `db:"content_edit"`
 		}
-		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
+		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted, IFNULL(content_edit, '') AS content_edit FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
 			ba.Error("查询卡片撤回/删除状态失败", zap.Error(lErr), zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
@@ -1116,6 +1117,32 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			ba.Warn("卡片已撤回/删除,拒绝编辑", zap.String("messageID", req.MessageID),
 				zap.Int("revoke", lifecycle.Revoke), zap.Int("isDeleted", lifecycle.IsDeleted))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		// The same guard as above, but against the *effective* frame — review
+		// P2-1 (yujiawei), raised specifically as a gate on this PR.
+		//
+		// The check on msgPayload is the immutable original. That was complete
+		// only by induction over the three template_ref authors in the tree:
+		// each of them either writes the original payload, or is an edit path
+		// already gated on the effective frame carrying the marker, so
+		// effective-has-marker implied original-has-marker. That is a property
+		// of the current author set, not one anyone stated — and this is the PR
+		// that adds send and edit paths, so it is exactly where the induction
+		// can quietly stop holding. A frame that acquires a marker through
+		// content_edit while its payload stays markerless would be raw-editable,
+		// and the raw write goes through WriteCAS, which does not run
+		// CatalogMarkersPreserved. Both identity guards in pkg/cardtmpl/updater.go
+		// begin `if markers.Has…`, so erasing the marker disables them silently.
+		//
+		// Reading it from the row already fetched above costs nothing extra:
+		// this is the same "content_edit when present, else payload" rule
+		// CardMutator.Mutate applies.
+		if effective := strings.TrimSpace(lifecycle.ContentEdit); effective != "" &&
+			cardEnvelopeHasCatalogMarker([]byte(effective)) {
+			ba.Warn("raw card edit attempted to replace a frame whose effective content is Registry-authored",
+				zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
 		// P2 D6：type-17 content_edit 跑与 send 同一套 cardmsg 校验（白名单/大小/

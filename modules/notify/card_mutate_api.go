@@ -114,7 +114,18 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
 		return
 	}
-	if req.SpaceID == "" || req.ChannelID == "" || req.MessageID == "" || req.DocID == "" ||
+	// spaceIDAcceptable rather than a bare emptiness test, matching the three
+	// send ingresses. An untrimmed Space is not refused here today so much as
+	// refused *later* and less usefully: for a frame whose stored provenance
+	// names a Space, storedMarkersForUpdate rejects the mismatch several layers
+	// down as errDocsSiblingContextInvalid, which names neither the field nor
+	// the reason; and for an unscoped or markerless frame it is not refused at
+	// all — the untrimmed value is stamped straight into the replacement
+	// envelope's space_id. That last case is inert only because nothing reads
+	// that value for authorization yet, which stops being true the moment this
+	// PR's grants make Space the grant scope. Catching it at the boundary is
+	// the same trade the send path already made (review: mochashanyao).
+	if !spaceIDAcceptable(req.SpaceID) || req.ChannelID == "" || req.MessageID == "" || req.DocID == "" ||
 		(req.Kind != DocsCardKindAccessGranted && req.Kind != DocsCardKindAccessDenied) {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
 		return

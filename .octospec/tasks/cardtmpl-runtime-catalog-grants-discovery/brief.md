@@ -103,6 +103,33 @@ PR-C 合并表示“dynamic catalog 已具备受控消费能力”，不表示�
 
 ## Accepted implementation decisions
 
+### D0 — PR-C ships as two PRs, and `docs.access-request@0.3.0` was widened in place
+
+Two decisions review asked to see recorded rather than inferred.
+
+**The milestone split.** D1 below argued for one PR, and that was overtaken: the
+ungated half merged separately as #709 (`cardtmpl-provenance-markers`) because
+the two halves need different merge arguments. The provenance markers take
+effect wherever `OCTO_CARD_MESSAGE_ENABLED` is already on, so they needed
+line-by-line review of a ~4k-line diff; everything remaining here is inert
+behind `OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED` / `_NEW_SEND_ENABLED` and
+merges on that argument. D1's actual concern — no "grant written but the
+consuming boundary is unwired" half-state — is preserved, because the split ran
+the other way: the ungated consumer landed first and this PR adds the grants.
+
+**`0.3.0` widened in place.** Adding the `cancelled` and `unavailable` states to
+a shipped version rather than publishing `0.4.0` deviates from the repo's
+frozen-version convention, and both reviewers asked for an explicit answer
+instead of silence. The answer is that the extension is additive and cannot
+invalidate a stored card: the manifest only *gains* two states, no existing
+state's view or data contract changes, and a card can only be re-rendered by a
+Registry render whose `metadata.octo.template` must agree with the marker it
+already carries. A `0.4.0` would have been the more conventional move and would
+have cost an extra activation step plus a migration path for in-flight `0.3.0`
+cards, for no behavioural difference. Recorded here as an accepted deviation,
+not an oversight — a *non*-additive change to a shipped version still requires a
+new version.
+
 ### D1 — One PR-C milestone, ordered internal slices
 
 保持一个 octo-server PR-C，避免 migrations/API/runtime wiring 跨 PR 出现“grant 已写入但

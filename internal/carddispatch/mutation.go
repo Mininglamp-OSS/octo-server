@@ -75,6 +75,10 @@ const MaxPersistedFrameBytes = maxContentEditBytes
 //
 //  6. modules/bot_api 模板发送预检 —— 拿「最坏的首次编辑信封」问一次「这张卡将来编辑得动
 //     吗」。它不写任何东西；走这个函数是为了让宽度判据只有一份，而不是在发送侧抄一个魔数。
+//  7. internal/carddispatch 内部 producer 发送预检 —— 与第 6 条同形、同理由，只是发送方是
+//     进程内 producer 而非 bot（review P2-3）。此前只有 bot 侧有这道闸，于是 notify 的
+//     Registry 卡可以发出一个「渲染得出、却永远结不了单」的帧：512 KiB 的 wire 上限放行了
+//     它，65,535 B 的列宽在第一次 finalize 时拒绝它，而那正是用户点按钮的时刻。
 //
 // 不在覆盖面内、且**刻意**不在的：modules/robot 与 modules/message 的 content_edit 写入
 // 载不了卡片帧（两者都在 cardmsg.RejectsCardEdit 之后，type-17 双向都拒），非卡片的

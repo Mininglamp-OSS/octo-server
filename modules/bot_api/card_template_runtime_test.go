@@ -105,7 +105,7 @@ func resolvedPrincipal() botCatalogPrincipal {
 }
 
 func TestBotTemplateSendRefFollowsTheShadowMatrix(t *testing.T) {
-	staticVersion := aireasoningprocess.TemplateVersionV3
+	staticVersion := testReasoningVersionCurrent
 	id := aireasoningprocess.TemplateID
 
 	for _, test := range []struct {
@@ -314,7 +314,7 @@ func TestBotTemplateManifestAndSendAgree(t *testing.T) {
 				// too — an advertised-empty manifest with a sendable ref would
 				// be the exact drift this test exists to catch.
 				if _, err := catalog.requireSendableRef(context.Background(), principal, map[string]any{
-					"id": string(id), "version": aireasoningprocess.TemplateVersionV3,
+					"id": string(id), "version": testReasoningVersionCurrent,
 				}); !errors.Is(err, errBotTemplateRequestInvalid) {
 					t.Fatalf("empty manifest still accepted the static ref: %v", err)
 				}
@@ -387,7 +387,7 @@ func TestBotTemplateManifestIncludesGrantedDynamicTemplates(t *testing.T) {
 	for _, ref := range refs {
 		found[ref.ID] = ref.Version
 	}
-	if found[aireasoningprocess.TemplateID] != aireasoningprocess.TemplateVersionV3 {
+	if found[aireasoningprocess.TemplateID] != testReasoningVersionCurrent {
 		t.Fatalf("static policy ref missing from %+v", refs)
 	}
 	if found[extra] != "0.4.0" {
@@ -422,11 +422,11 @@ func TestBotTemplateCatalogRejectsTwoSendVersionsOfOneID(t *testing.T) {
 	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
 		AdvertisedSend: []botTemplateRef{
 			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
-			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3},
+			{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent},
 		},
 		EditCompatible: []botTemplateRef{
 			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
-			{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3},
+			{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent},
 		},
 	})
 	if err == nil {
@@ -829,7 +829,7 @@ func TestGroupCardStaysEditableAndKeepsItsAuthorizedSpace(t *testing.T) {
 	// Editing the same card resolves the same Space from the same target, so
 	// the guard passes even though the envelope carries no space_id.
 	editPrincipal := ba.botSendCatalogPrincipal(ctx, "bot-42", "group-1", common.ChannelTypeGroup.Uint8())
-	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent}
 	if err := requireEffectiveCardTemplate(envelope, ref, "bot-42", editProvenanceSpaceCheck(true, editPrincipal)); err != nil {
 		t.Fatalf("group card was refused by its own edit guard: %v", err)
 	}
@@ -892,7 +892,7 @@ func TestEditRefusesAFrameFromAnotherSpaceEvenWhenTheEnvelopeCorroboratesIt(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent}
 
 	// The grant behind this edit was read in space-b. The frame's own claim of
 	// space-a must not stand in for the comparison that just failed.
@@ -1095,7 +1095,7 @@ func TestGroupCardStaysEditableAcrossAGateRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent}
 
 	// The gate rolls back. The card still names space-group, and the edit path
 	// can no longer resolve any Space at all.
@@ -1268,7 +1268,7 @@ func TestDMCardStaysEditableWhenTheStrictResolverCannotAgree(t *testing.T) {
 		t.Fatalf("dm marker Space = %q", markers.Provenance.SpaceID)
 	}
 
-	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	ref := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent}
 	check := editProvenanceSpaceCheck(true, principal)
 	if !check.unavailable {
 		t.Fatalf("expected the strict resolver to report unavailable, got %+v", check)
@@ -1457,7 +1457,7 @@ func TestBotEditResolvesADynamicRefThroughTheEditGrant(t *testing.T) {
 // gates-off deployment on exactly its pre-PR-C behaviour.
 func TestBotEditKeepsStaticRefsAnsweringWithoutTheRuntime(t *testing.T) {
 	catalog := newMustTestCatalog(t)
-	staticRef := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3}
+	staticRef := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent}
 	if _, ok := catalog.editAllowed[staticRef]; !ok {
 		t.Fatal("fixture precondition broken: the static ref is not edit-compatible")
 	}

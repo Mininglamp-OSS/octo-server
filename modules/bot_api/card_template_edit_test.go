@@ -102,9 +102,13 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	if plain, _ := frame["plain"].(string); plain == "" {
 		t.Fatal("replacement plain missing")
 	}
+	// The frame lives in the fixture's Space, so that is what an edit of it
+	// resolves. Passing "" here used to read as "don't care"; it now means "we
+	// established this target has no Space", which a space-1 frame correctly
+	// fails. Asserting the real Space also checks the replacement kept it.
 	if err := requireEffectiveCardTemplate([]byte(request.ContentEdit), botTemplateRef{
 		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion,
-	}, "bot-template"); err != nil {
+	}, "bot-template", verifiableEditSpace(cardtmplBuildEnvForTest().SpaceID)); err != nil {
 		t.Fatalf("replacement identity: %v", err)
 	}
 }
@@ -148,7 +152,7 @@ func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testin
 			}
 			if err := requireEffectiveCardTemplate([]byte(mutator.mutateRequests[0].ContentEdit), botTemplateRef{
 				ID: aireasoningprocess.TemplateID, Version: historical.version,
-			}, "bot-template"); err != nil {
+			}, "bot-template", verifiableEditSpace(cardtmplBuildEnvForTest().SpaceID)); err != nil {
 				t.Fatalf("historical replacement identity: %v", err)
 			}
 		})
@@ -575,8 +579,9 @@ func cardtmplBuildEnvForTest() cardtmpl.BuildEnv {
 func markedRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog, botID string) []byte {
 	t.Helper()
 	env := cardtmplBuildEnvForTest()
-	payload, err := catalog.RenderPayloadForPrincipal(context.Background(), botID, registrySendBody(t,
-		"reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
+	payload, err := catalog.RenderPayloadForPrincipal(context.Background(),
+		botCatalogPrincipal{BotID: botID, SpaceID: env.SpaceID, Space: botSpaceScoped},
+		registrySendBody(t, "reasoning", testReasoningData(t, "reasoning"))["payload"].(map[string]any), env)
 	if err != nil {
 		t.Fatal(err)
 	}
