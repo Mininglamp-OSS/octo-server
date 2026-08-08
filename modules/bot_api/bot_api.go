@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
@@ -447,6 +448,15 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		// grants on behalf of a logged-in grantor.
 		botAPI.GET("/obo-grant", ba.oboBotGetGrant)
 	}
+
+	// 由 message 模块贡献的群内单条消息查询（见 pkg/authtree 的 why）。botActorUID 只挂在
+	// 这些复用路由上、不挂整个 botAPI 组：组级别名会让组内任何调 GetLoginUID() 的 handler
+	// 静默拿到 robotID，是白担的授权混淆风险；而这些 handler 的 actor 本就应当是 bot 自己。
+	//
+	// appBotScopeGuard 补上这些路由的 App Bot 授权规则：DM 读要求 scope=space 的 App Bot
+	// 证明对端仍在其绑定 Space（复用的 getPersonMessage 只做 friend/blacklist 判定，比发送
+	// 侧宽），群/子区读一律拒 App Bot（与本模块其它群端点同一条 DM-only 策略）。
+	authtree.Mount(authtree.TreeBotToken, r, authtree.MountOn(botAPI, ba.botActorUID(), ba.appBotScopeGuard()))
 
 	// Bot File API (separate group for wildcard conflict avoidance)
 	botFileAPI := r.Group("/v1/botfile", ba.authBot())

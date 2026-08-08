@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -103,6 +104,25 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.GET("/:space_id/email-invites", s.listMemberEmailInvites)
 		auth.DELETE("/:space_id/email-invites/:id", s.revokeMemberEmailInvite)
 	}
+
+	// 成员名单与「我的空间」开放给 User API Key（`uk_*`）树，供 octo-drive / octo-cli
+	// 解析成员与当前租户。listMembers 原样复用：它的 actor 与 Space 都来自
+	// GetLoginUID() 与路径参数，而 uk 树的租户中间件会先断言路径 Space 就是 key 绑定的
+	// 那个（ScopeRouteGuard 的 guard 即 enforceKeySpace 对 :space_id 的比对）。
+	// /space/my 不能原样复用 mySpaces —— 它无参数可校验，复用即让自动化凭据枚举到绑定
+	// 之外的空间，故换成只报告绑定 Space 的 boundSpaceOnly，租户锚点在 handler 自身。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/space/:space_id/members",
+		Tenant:  authtree.ScopeRouteGuard,
+		Handler: s.listMembers,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/space/my",
+		Tenant:  authtree.ScopeRouteGuard,
+		Handler: s.boundSpaceOnly,
+	})
 
 	// 加入申请提交：一次成功的重申会给该 Space 的每个管理员各发一条私信，是一条
 	// 用户可触发的扇出路径。第一道约束是"内容真的变了才通知"（见 joinSpace），
@@ -580,6 +600,57 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 		return
 	}
 	c.ResponseOK()
+}
+
+// boundSpaceOnly 在非会话认证树上回答 GET /space/my：只报告凭据里冻结的那一个
+// Space，而不是调用者所属的全部 Space。
+//
+// 一个 `uk_*` 的租户在签发时就已确定；若让自动化路径顺带枚举到本人的其它空间，等于把
+// 凭据从未被授权的范围交出去。响应形状与 mySpaces 完全一致（spaceResp 数组），客户端
+// 解析器无需区分，只是数组长度为 0 或 1。
+//
+// 空数组只剩「凭据没有绑定 Space」一种到达方式：绑定已失效（本人被移出、Space 停用）
+// 的请求由 enforceKeySpace 的成员资格门在此之前就 403 了，不会走到这里。下面的
+// sp == nil 分支因此是防御性的——它与那道门共用同一组可见性条件。
+func (s *Space) boundSpaceOnly(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	spaceID := authtree.BoundSpaceID(c)
+	if spaceID == "" {
+		c.Response([]spaceResp{})
+		return
+	}
+
+	sp, err := s.db.queryMySpace(loginUID, spaceID)
+	if err != nil {
+		s.Error("查询绑定空间失败", zap.Error(err),
+			zap.String("loginUID", loginUID), zap.String("spaceID", spaceID))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+		return
+	}
+	if sp == nil {
+		c.Response([]spaceResp{})
+		return
+	}
+	c.Response([]spaceResp{newSpaceResp(sp)})
+}
+
+// newSpaceResp 把空间详情映射为对外响应。刻意只在 boundSpaceOnly 使用：mySpaces 的
+// 内联映射保持原样不动，以确保 human /v1/space/my 零回归。
+func newSpaceResp(sp *SpaceDetailModel) spaceResp {
+	return spaceResp{
+		SpaceId:     sp.SpaceId,
+		Name:        sp.Name,
+		Description: sp.Description,
+		Logo:        sp.Logo,
+		Creator:     sp.Creator,
+		Status:      sp.Status,
+		Role:        sp.Role,
+		MaxUsers:    sp.MaxUsers,
+		MemberCount: sp.MemberCount,
+		JoinMode:    sp.JoinMode,
+		CreatedAt:   sp.CreatedAt.String(),
+		UpdatedAt:   sp.UpdatedAt.String(),
+	}
 }
 
 // mySpaces 我的空间列表

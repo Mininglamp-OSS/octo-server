@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -22,6 +23,11 @@ import (
 
 // threadChannelIDSeparator marks a thread channel id.
 const threadChannelIDSeparator = "____"
+
+// maxMemberPage caps botSpaceMembers' 1-based page so (page-1)*limit cannot
+// overflow into a negative OFFSET. At the 200 upper limit this still addresses
+// 200M members, far past any real Space.
+const maxMemberPage = 1_000_000
 
 // getGroups handles GET /v1/bot/groups.
 func (ba *BotAPI) getGroups(c *wkhttp.Context) {
@@ -298,9 +304,33 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	if l, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil || l == 0 {
 		limit = 50
 	}
+	// 低位夹紧必须在算 offset 之前。Sscanf("-5") 返回 (1, nil)，limit 保持 -5，上面的
+	// >200 夹紧不触发，于是 `LIMIT -5` 让 MySQL 报 1064、端点 500——把一个非法客户端
+	// 参数变成服务端错误。负 limit 同时会把 offset 也算成负数。
+	if limit < 1 {
+		limit = 50
+	}
 	if limit > 200 {
 		limit = 200
 	}
+	// page 是本端点唯一的翻页出口（1-based，缺省 1）。没有它，bot 只能看到该 Space 的
+	// 前 limit 名成员：drive 的 IsSpaceMember 在满页时无法区分「不是成员」与「被截断」，
+	// 只能 fail-close 成 500，>200 人的 Space 上 bot 身份的邀请接受因此直接失败。
+	//
+	// 语义与 human 侧 listMembers 的 page 对齐。不传 page 时 OFFSET 为 0，与加分页前
+	// 完全一致；非法值（负数、非数字）也落回第一页而不是报错，保持既有的宽松解析口径。
+	//
+	// 上限同样要夹：Atoi 接受到 MaxInt64，(page-1)*limit 会整数溢出成负 offset，又是一条
+	// 1064 → 500 的路径。maxMemberPage 之后的页在任何真实 Space 上都是空页，直接夹到它
+	// 与「走过末页返回空」的既有终止语义一致。
+	page := 1
+	if p, err := strconv.Atoi(strings.TrimSpace(c.Query("page"))); err == nil && p > 1 {
+		page = p
+	}
+	if page > maxMemberPage {
+		page = maxMemberPage
+	}
+	offset := (page - 1) * limit
 
 	type MemberInfo struct {
 		UID   string `json:"uid"`
@@ -308,13 +338,21 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 		Robot int    `json:"robot"`
 	}
 
-	var members []MemberInfo
+	// 非 nil 空 slice：dbr 的 Load 在零行时不动这个变量，nil slice 会被 Gin 序列化成
+	// `null` 而不是 `[]`。翻页把空结果从边缘情况变成了常规终止信号（走过末页、keyword
+	// 无命中），调用方必须能对返回值直接迭代；同一 handler 在「bot 不属于任何 Space」
+	// 分支本来就回 `[]`，这里补齐后整个端点形状一致。
+	members := make([]MemberInfo, 0)
 	var err error
 
 	if spaceID == "" {
 		var spaceIDs []string
+		// ORDER BY 是必需的，不是整洁癖：没有它 MySQL 可以在两次请求间返回不同的第一行，
+		// 于是同一个客户端翻 1..N 页可能被喂来自**不同 Space** 的页。加分页之前只取一页，
+		// 这个不确定性看不出来；drive 的 IsSpaceMember 要翻过 200 人正是本端点的动机，
+		// 所以这是真实危害而非理论问题。
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT space_id FROM space_member WHERE uid=? AND status=1", robotID,
+			"SELECT space_id FROM space_member WHERE uid=? AND status=1 ORDER BY space_id", robotID,
 		).Load(&spaceIDs)
 		if err != nil || len(spaceIDs) == 0 {
 			c.JSON(http.StatusOK, []MemberInfo{})
@@ -336,19 +374,22 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 		}
 	}
 
+	// ORDER BY sm.id：翻页必须有确定顺序，否则 page=2 可能与 page=1 重复或漏行。取
+	// AUTO_INCREMENT 主键即入库顺序，与加分页前 InnoDB 的实际扫描顺序一致，故不传 page
+	// 时返回的成员集合与次序都不变。
 	if keyword != "" {
 		// Escape LIKE wildcards in user input
 		escaped := strings.ReplaceAll(keyword, "\\", "\\\\")
 		escaped = strings.ReplaceAll(escaped, "%", "\\%")
 		escaped = strings.ReplaceAll(escaped, "_", "\\_")
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND u.name LIKE ? LIMIT ?",
-			spaceID, "%"+escaped+"%", limit,
+			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND u.name LIKE ? ORDER BY sm.id LIMIT ? OFFSET ?",
+			spaceID, "%"+escaped+"%", limit, offset,
 		).Load(&members)
 	} else {
 		_, err = ba.ctx.DB().SelectBySql(
-			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 LIMIT ?",
-			spaceID, limit,
+			"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(u.robot,0) as robot FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 ORDER BY sm.id LIMIT ? OFFSET ?",
+			spaceID, limit, offset,
 		).Load(&members)
 	}
 	if err != nil {

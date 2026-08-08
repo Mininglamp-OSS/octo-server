@@ -253,6 +253,15 @@ func (m *Message) getPersonMessage(c *wkhttp.Context) {
 		}
 		defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
 		if derr != nil {
+			// 默认 Space 查不到时无法判定归属，按兼容口径 fail-open 保留无标签历史，避免
+			// 一次 DB 抖动把合法 DM 历史静默截断。
+			//
+			// 这是 personSpaceAllows 这一族调用点的统一约定，本处是第四个，另三处逐字同款
+			// （modules/message/api.go 的 DM channel sync、DM reaction 读、DM reaction
+			// toggle）。space_filter.go 里那个 "" fail-closed sentinel 服务的是
+			// decideConvKeepInSpace —— 会话**列表**谓词，不是这一族；把本处单独改成
+			// fail-closed 只会造出「sync 能拉到、单条直查 404」的入口漂移，而这条读路径
+			// 存在的意义就是与 sync 同口径。约定本身若要改，四处一起改。
 			m.Warn("查询默认 Space 失败，DM 单条读无标签消息按兼容口径放行",
 				zap.Error(derr), zap.String("loginUID", loginUID))
 			defaultSpaceID = spaceID

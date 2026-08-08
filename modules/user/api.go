@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -231,6 +232,34 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		auth.POST("/users/:uid/avatar", u.uploadAvatar)              //上传用户头像
 		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate) // 更新用户设置
 	}
+
+	// 用户详情与用户搜索开放给 User API Key（`uk_*`）树。两个 handler 的 actor 都取自
+	// MustGet("uid") / GetLoginUID()，uk 中间件把真人 UID 落在同一个 context key，因此
+	// 复用后 actor 仍是真人而非 bot。search 复用 human 侧那**同一个** searchLimit 实例，
+	// 于是两棵树共享 per-IP 的 `strict:search` 桶——这是刻意的取舍：搜索是用户存在性探测
+	// 面，共享桶意味着攻击者无法通过换 surface 把配额翻倍；代价是同一出口 IP 下的自动化
+	// 客户端会吃掉真人的额度。反枚举优先于额度隔离，故选共享。（uk 树自己的 per-uid 桶是
+	// 120 req/min，比 human 的 30 req/min 宽，缺这一层会让自动化路径成为更省力的入口。）
+	//
+	// 两条路由的租户锚点不同，故 Tenant 声明不同：
+	//   /users/:uid  → handler 不读请求 Space，注入对它是 no-op，必须靠路由自己的
+	//                  requireBoundSpaceMember 把目标 UID 限制在绑定 Space 内。
+	//   /user/search → handler 直接读 query 的 space_id，enforceKeySpace 已把它钉成
+	//                  绑定值，注入即约束（"按该 Space 过滤"分支只返回该 Space 成员）。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/users/:uid",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{u.requireBoundSpaceMember()},
+		Handler:     u.get,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/user/search",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{searchLimit},
+		Handler:     u.search,
+	})
 
 	user := r.Group("/v1/user", u.ctx.AuthMiddleware(r))
 	{

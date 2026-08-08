@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -88,6 +89,37 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 		// 预签名下载 URL
 		auth.GET("/download/url", f.getDownloadURL)
 	}
+
+	// 同两条预签名端点开放给 User API Key（`uk_*`）树，供 octo-drive / octo-cli 以真人
+	// 身份直传与下载。两个 handler 只读 query 参数、不读登录身份，因此 actor 语义与
+	// session 路径完全一致；授权、限流与租户校验由 botfather 侧的 uk 中间件承担。
+	//
+	// 两条路由的 Tenant 声明不同，因为两侧的风险与可堵性不同 —— 完整的取舍记录见
+	// pkg/authtree 的 census 与 rejectCallerObjectKey 的注释：
+	//
+	//   upload  → ScopeRouteGuard。rejectCallerObjectKey 在 path 非空时 fail-closed
+	//             拒绝，object key 只能由服务端生成，调用方拿不到「对已知 key 的 PUT
+	//             URL」，跨租户覆写因此不可达（by construction，不靠校验写对）。
+	//   download → ScopeUnscoped，是「另一层的问题，本次不解」而非「这里没问题」。对象保密
+	//             在本仓今天哪一层都没强制：六个后端里只有 minio / oss 会加 public-read 且
+	//             只在自建桶那条路径上，cos / s3 / qiniu / seaweedfs 一个都不加；私有桶部署
+	//             下签名 URL 就是读取能力本身。压住它的是 object key 的高熵不可枚举、本 PR
+	//             的消息读路由都 Space-confined、以及暴露面与已在生产的 human 路由等同 ——
+	//             不是这条路由上的边界。要真堵得靠归属表 / capability token / bucket 策略，
+	//             在这条路由之下的一层且同样覆盖 human 路由，属独立追踪的工作。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/file/upload/presigned",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{f.rejectCallerObjectKey()},
+		Handler:     f.getUploadCredentials,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/file/download/url",
+		Tenant:  authtree.ScopeUnscoped,
+		Handler: f.getDownloadURL,
+	})
 }
 
 func (f *File) stickerUploadHandlers(r *wkhttp.WKHttp) []wkhttp.HandlerFunc {

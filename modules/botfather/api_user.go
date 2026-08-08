@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -67,7 +68,7 @@ func (bf *BotFather) authUserAPIKey() wkhttp.HandlerFunc {
 
 		c.Set("uid", keyModel.UID)
 		c.Set("api_key_uid", keyModel.UID)
-		c.Set("api_key_space_id", keyModel.SpaceID)
+		c.Set(authtree.CtxKeySpaceID, keyModel.SpaceID)
 		c.Set("api_key_id", keyModel.ID)
 		c.Set("api_key_client_id", keyModel.ClientID)
 		c.Next()
@@ -86,14 +87,7 @@ func getAPIKeyUID(c *wkhttp.Context) string {
 }
 
 func getAPIKeySpaceID(c *wkhttp.Context) string {
-	v, _ := c.Get("api_key_space_id")
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
+	return authtree.BoundSpaceID(c)
 }
 
 // isBotInSpace checks whether a bot belongs to the given (active) Space.
@@ -118,6 +112,12 @@ func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
 		userAPI.POST("/bots/:bot_id/bind", bf.bindUserBot)
 		userAPI.DELETE("/bots/:bot_id/bind", bf.unbindUserBot)
 	}
+
+	// 上游能力：由 file / space / user / message 模块贡献自己的 handler，在此挂到同一棵
+	// uk 树下（见 pkg/authtree 的 why）。租户中间件 enforceKeySpace 只前置在这些复用路由
+	// 上、不挂到上面的 /bots* 区块 —— 那些 handler 自己读 api_key_space_id 做校验，多一层
+	// 参数注入只会改动既有契约。
+	authtree.Mount(authtree.TreeUserKey, r, authtree.MountOn(userAPI, bf.enforceKeySpace()))
 }
 
 // ========== User Bot CRUD APIs ==========

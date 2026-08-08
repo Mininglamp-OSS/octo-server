@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -416,11 +417,81 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	{
 		groups.GET("/:group_no/messages/:message_id", m.getGroupMessage)
 		// thread 路由与 modules/thread/1module.go 同一 feature flag 对齐：
-		// DM_THREAD_ON 关闭时 thread 模块不注册、thread 表迁移不跑，
-		// 此时若仍注册 GET 路由会让请求落到不存在的 thread 表上。
+		// DM_THREAD_ON 关闭时 thread 模块只停 API 与 archive worker，schema 迁移仍
+		// 无条件执行（1module.go 的 SQLDir 与 flag 解耦，见那里的注释），所以理由不是
+		// "表不存在"，而是不能对外暴露一条 thread 功能已关闭时并不存在的读口。
 		if threadFeatureEnabled() {
 			groups.GET("/:group_no/threads/:short_id/messages/:message_id", m.getThreadMessage)
 		}
+	}
+	// 群 / DM / 子区三种单条消息查询开放给两棵非会话认证树，供云盘转存按 (会话, 消息ID)
+	// 取元数据。handler 的 actor 取自 GetLoginUID()：uk 树的中间件已落真人 UID；bot 树
+	// 刻意不给整组别名 uid（避免授权混淆），因此只在 authtree 的挂载点上挂 botActorUID
+	// 把 robot_id 落成 actor，于是成员校验与 visibles 过滤都按 bot 自己的可见性执行。
+	//
+	// 群 / 子区读的租户锚点是 requireBoundSpaceGroup，不是 space_id 注入：两个 handler 都
+	// 不读请求 Space，requireGroupMember 也只校验群成员资格，于是「主人同时在别的 Space
+	// 有群」就能用这把 key 跨租户读那个群。bot 树上 bot token 不冻结 Space、bot 也没有
+	// space_member 行，所以没有租户可锚；但 App Bot 是 DM-only，群/子区读必须显式拒它
+	// （与本模块其它 bot 群端点同一条策略），这道门由 bot_api 在挂载点的 appBotScopeGuard
+	// 承担，故两棵树都声明 ScopeRouteGuard。`bf_*` 的边界仍是 handler 自己的群成员门。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/groups/:group_no/messages/:message_id",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{m.requireBoundSpaceGroup()},
+		Handler:     m.getGroupMessage,
+	})
+	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/groups/:group_no/messages/:message_id",
+		Tenant:  authtree.ScopeRouteGuard,
+		Handler: m.getGroupMessage,
+	})
+	// DM 单条读。getPersonMessage 是这三种形状里唯一读 Space 的 handler：
+	// personSpaceAllows 隔离与 same-space 放行分支都走 pkg/space 的 GetSpaceID，而
+	// human 路由是靠 handler 级 SpaceMiddleware 落那个 context key 的——两棵树上都没有
+	// 它。空 Space 会让 handler 走 sync 的向前兼容路径，跳过整个 Space 过滤，所以：
+	//   uk  → ScopeBoundSpace，挂载点据此注入 BoundSpaceContext，把 key 冻结的（且已由
+	//         树上 enforceKeySpace 复查过成员资格的）Space 落进 context，隔离强度与
+	//         human 带 verified Space 时相同。无绑定 Space 的 key 到不了这里：
+	//         enforceKeySpace 已对它们 fail-closed，因此这条路由上不存在「空 Space 走
+	//         兼容路径」的分支。
+	//   bot → 没有可发布的租户（bot 没有 space_member 行），跨会话面由
+	//         checkPersonDMAccess 的 friend + 双向 blacklist 门承担。但 scope=space 的
+	//         App Bot 确实有一个绑定 Space，而那条链不看它——读会比发送侧宽。补齐这道门
+	//         需要 bot 树自己的凭据语义，故由 bot_api 在挂载点挂 appBotDMSpaceGuard，
+	//         这里声明 ScopeRouteGuard 记录该事实。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/messages/person/:peer_uid/:message_id",
+		Tenant:  authtree.ScopeBoundSpace,
+		Handler: m.getPersonMessage,
+	})
+	authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+		Method:  http.MethodGet,
+		Path:    "/messages/person/:peer_uid/:message_id",
+		Tenant:  authtree.ScopeRouteGuard,
+		Handler: m.getPersonMessage,
+	})
+	// 子区单条读与上面 human 的 groups 组共用同一个 flag：关闭时 thread 模块的 API 与
+	// archive worker 不上线，两棵树同样不得注册，否则自动化调用方拿到的是一条 human
+	// 侧并不存在的路径。子区无独立 Space，权威归属在父群，故与群读共用同一个 guard
+	// （路径同样带 :group_no）。
+	if threadFeatureEnabled() {
+		authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+			Method:      http.MethodGet,
+			Path:        "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Tenant:      authtree.ScopeRouteGuard,
+			Middlewares: []wkhttp.HandlerFunc{m.requireBoundSpaceGroup()},
+			Handler:     m.getThreadMessage,
+		})
+		authtree.Add(authtree.TreeBotToken, r, authtree.Route{
+			Method:  http.MethodGet,
+			Path:    "/groups/:group_no/threads/:short_id/messages/:message_id",
+			Tenant:  authtree.ScopeRouteGuard,
+			Handler: m.getThreadMessage,
+		})
 	}
 	m.ctx.AddMessagesListener(m.listenerMessages) // 监听消息
 	m.syncMessageReadedCount()

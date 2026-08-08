@@ -126,7 +126,7 @@ func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.Hand
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权访问该 Space"})
 				return
 			}
-			c.Set("space_id", spaceID)
+			SetSpaceID(c, spaceID)
 			c.Next()
 			return
 		}
@@ -149,14 +149,26 @@ func spaceMiddleware(check MembershipChecker, cache MembershipCache) wkhttp.Hand
 			return
 		}
 
-		c.Set("space_id", spaceID)
+		SetSpaceID(c, spaceID)
 		c.Next()
 	}
 }
 
+// ctxKeySpaceID is the gin context key carrying the request's verified Space.
+// SetSpaceID and GetSpaceID are its only accessors.
+const ctxKeySpaceID = "space_id"
+
+// SetSpaceID marks spaceID as the request's verified Space, so handlers reading
+// GetSpaceID apply their Space isolation. The caller owns the verification:
+// SpaceMiddleware checks membership itself, and a non-session authentication
+// tree publishes the tenant its credential was issued against.
+func SetSpaceID(c *wkhttp.Context, spaceID string) {
+	c.Set(ctxKeySpaceID, spaceID)
+}
+
 // GetSpaceID 从 gin context 读取 space_id。
 func GetSpaceID(c *wkhttp.Context) string {
-	if v, exists := c.Get("space_id"); exists {
+	if v, exists := c.Get(ctxKeySpaceID); exists {
 		if s, ok := v.(string); ok {
 			return s
 		}
