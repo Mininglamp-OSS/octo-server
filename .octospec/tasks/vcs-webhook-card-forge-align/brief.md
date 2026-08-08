@@ -185,9 +185,11 @@ Event builders supply only event-specific content and safe semantic literals.
   remains absolute HTTP(S).
 - **Image security:** only reviewed exact bytes may bypass the general HTTP(S)
   image URL rule. Client sanitization is defense in depth, not server authority.
-- **Authoritative plain:** `Finalize` must still derive a non-placeholder,
-  readable `plain` containing the meaningful event content after the body is
-  rearranged.
+- **Authoritative plain:** the final VCS envelope must derive `plain` from the
+  already-validated semantic `vcs-content` projection, not from the decorative
+  Forge header. The event headline remains the first line used by notifications,
+  conversation previews, search, summaries, and pins. Native cards and non-VCS
+  card producers retain the existing whole-card `Finalize` behavior.
 - **Degrade and delivery:** flag-off text bytes, card-build failure to text,
   ping/skip/no_event, audit, auth, mention expansion, and final payload-size
   checks remain unchanged.
@@ -221,6 +223,10 @@ Event builders supply only event-specific content and safe semantic literals.
 - Every one of the 11 current GitHub/GitLab card builders returns a non-nil
   card for its valid fixture, uses the same header/content/action anatomy,
   passes `cardmsg.Validate`, and derives a non-placeholder `plain`.
+- A production VCS envelope derives `plain` from `vcs-content`: its first line is
+  the event headline and it has no leading `[图片]`, source label, repository/
+  project context, or badge. The projection is package-internal and cannot be
+  selected by native `msg_type:"card"` JSON.
 - Header tests assert the exact vetted icon URI, visible `GitHub`/`GitLab`
   label, repository/project context, and appropriate event/status badge.
 - Pipeline headline has no semantic `color`; its status badge carries the

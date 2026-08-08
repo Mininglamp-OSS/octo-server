@@ -300,10 +300,36 @@ func validateVCSCard(card map[string]interface{}) error {
 	})
 }
 
+// vcsPlainProjection returns the semantic content area as a standalone card-shaped
+// projection for authoritative plain derivation. The Forge header is visual chrome:
+// its icon, source/context labels, and badge must not displace the event headline in
+// push notifications, conversation previews, search, or summaries.
+//
+// The projection is package-internal and is extracted from the already validated
+// server-authored card. Native msg_type:"card" callers cannot select or forge it.
+func vcsPlainProjection(card map[string]interface{}) map[string]interface{} {
+	body, ok := card["body"].([]interface{})
+	if !ok {
+		return nil
+	}
+	for _, raw := range body {
+		element, ok := raw.(map[string]interface{})
+		if !ok || element["id"] != "vcs-content" {
+			continue
+		}
+		items, ok := element["items"].([]interface{})
+		if !ok {
+			return nil
+		}
+		return map[string]interface{}{"body": items}
+	}
+	return nil
+}
+
 // vcsPushReq picks the pushPayloadReq for a rendered VCS event: a card request when a
 // card was built (flag on) AND it self-validates, else the text request (the degrade
-// path — flag off OR card build/validate failure). Card plain is derived by Finalize
-// from the card body, so no text seed is needed.
+// path — flag off OR card build/validate failure). Card plain is derived from the
+// server-owned semantic content projection, so no caller-controlled text seed is used.
 func vcsPushReq(text string, card map[string]interface{}) *pushPayloadReq {
 	if card != nil {
 		if err := validateVCSCard(card); err != nil {
@@ -315,10 +341,16 @@ func vcsPushReq(text string, card map[string]interface{}) *pushPayloadReq {
 			zap.L().Warn("incomingwebhook: built VCS card failed self-validation; degrading to text",
 				zap.Error(err))
 		} else {
+			plainProjection := vcsPlainProjection(card)
+			if plainProjection == nil {
+				zap.L().Warn("incomingwebhook: built VCS card is missing its semantic content projection; degrading to text")
+				return &pushPayloadReq{Content: clipRunes(text, maxContentRunes())}
+			}
 			return &pushPayloadReq{
-				MsgType:       msgTypeCard,
-				Card:          card,
-				renderProfile: cardmsg.RenderProfileOctoChatV1,
+				MsgType:         msgTypeCard,
+				Card:            card,
+				renderProfile:   cardmsg.RenderProfileOctoChatV1,
+				plainProjection: plainProjection,
 			}
 		}
 	}

@@ -872,6 +872,17 @@ func TestVCSPushReq_Degrade(t *testing.T) {
 		assert.NotNil(t, req.Card)
 		assert.Empty(t, req.Content, "card path does not set text content")
 	})
+
+	t.Run("missing semantic content projection → text", func(t *testing.T) {
+		card := map[string]interface{}{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []interface{}{map[string]interface{}{"type": "TextBlock", "text": "headline"}},
+		}
+		require.NoError(t, validateVCSCard(card), "precondition: the generic card shape is valid")
+		req := vcsPushReq("fallback text", card)
+		assert.Empty(t, req.MsgType, "a malformed server-authored VCS anatomy must not reach the card path")
+		assert.Equal(t, "fallback text", req.Content)
+	})
 }
 
 // TestVCSParse_FlagGate covers the top-level dispatch: with the flag off the adapter
