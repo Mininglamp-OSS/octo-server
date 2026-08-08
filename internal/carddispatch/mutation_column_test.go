@@ -243,3 +243,93 @@ func TestMaxPersistedFrameBytesTracksTheGate(t *testing.T) {
 		t.Fatalf("MaxPersistedFrameBytes+1 个字节应被拒，得到 %v", err)
 	}
 }
+
+// NormalizeFrameForPersistence 的文档注释逐条列出了它的全部使用点（五条写路径 + 一处发送侧
+// 预检）。这类枚举会漂移，
+// 而一段断言了不成立的不变量的注释正是 #712 里两轮 blocker 的成因（注释说「所有回写路径
+// 都走这个判据」，而 raw 编辑分支和 WriteCAS 都不走）。所以这里用源码守卫钉住计数：调用点
+// 增减时测试失败，逼着改注释，而不是等下一个人相信一段过时的断言。
+//
+// **这条守卫证明的是什么、不是什么**（review of #716 要求写清）：它只保证那段注释里的计数与
+// 源码里判据的使用点数量一致 —— 也就是「注释别撒谎」。它**无法**发现一条绕过判据直接写库的
+// 路径，那种缺陷按构造就在「数调用点」这个手段的射程之外，无论扫多少目录。#712 的 P0 正是那
+// 一类，只能靠人枚举写入口（见 NormalizeFrameForPersistence 注释里的「刻意不在覆盖面内」段）。
+//
+// 扫描范围是整个 module（递归），所以在第四个包或子包里新增调用也会被看见 —— 早先的版本只扫
+// 三个硬编码目录且非递归，那时新包是隐形的。
+func TestPersistenceJudgeCallSitesMatchItsDocumentedCount(t *testing.T) {
+	// 注释里声明的条数。改这个数就必须同步改那段枚举 —— 反过来也一样：这条守卫在本次
+	// follow-up 里真的响过一次（新增模板发送预检后实测 6 条 vs 声明 5 条），逼着把第 6 条
+	// 补进注释并说明它是「不落库、只借判据」的那一类。守卫有效性由此自证。
+	const documented = 6
+
+	// 递归扫整个 module，而不是三个硬编码目录 —— 第四个包/子包里的调用不能是隐形的。
+	const repoRoot = "../.."
+	callRE := regexp.MustCompile(`NormalizeFrameForPersistence\(`)
+	// WriteCAS 自己查宽度、不经过那个函数，所以按注释里的「独立设闸」单独计。两个常量名
+	// 都接受：写死一个会让改用导出别名时报出「你增删了写路径」这种误导性失败。
+	standaloneRE := regexp.MustCompile(`>\s*(maxContentEditBytes|MaxPersistedFrameBytes)\b`)
+
+	sites := 0
+	standalone := 0
+	if err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "node_modules", "vendor", "assets", "docs", ".octospec":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		// 判据**自己**函数体内的那次宽度检查不算「另一处设闸」—— 它就是判据本身。用
+		// 「见到声明起、见到列首 } 止」跳过它；靠变量名区分（len(normalized) vs
+		// len(request.ContentEdit)）会让重命名接收者变量就误报「你增删了写路径」。
+		inJudgeBody := false
+		for _, line := range strings.Split(string(body), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "func NormalizeFrameForPersistence") {
+				inJudgeBody = true
+				continue
+			}
+			if inJudgeBody {
+				if line == "}" {
+					inJudgeBody = false
+				}
+				continue
+			}
+			// 行注释不算使用点。块注释 / 字符串字面量里的同名文本仍会被算进来 —— 这是已知
+			// 的粗糙处，彻底解决要用 go/ast；当前树里没有这种写法，且方向是 fail-closed
+			// （多算只会让计数不符而报错，不会漏算）。
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if callRE.MatchString(line) {
+				sites++
+			}
+			if standaloneRE.MatchString(line) {
+				standalone++
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %s: %v", repoRoot, err)
+	}
+
+	if got := sites + standalone; got != documented {
+		t.Fatalf("持久化判据的使用点实测 %d 处（%d 处调用 + %d 处独立设闸），注释声明 %d 处。\n"+
+			"增删使用点就要同步 NormalizeFrameForPersistence 的注释枚举，并标明新增那处是\n"+
+			"「写路径」还是「不落库的预检」。注意本守卫的射程：它只保证注释里的计数不撒谎，\n"+
+			"发现不了绕过判据直接写库的路径 —— 那种缺陷（#712 的 P0）只能靠人枚举写入口。",
+			got, sites, standalone, documented)
+	}
+}

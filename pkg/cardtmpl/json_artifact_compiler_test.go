@@ -747,3 +747,119 @@ func TestCompileJSONArtifactGoldensSeeTheTruncatedRender(t *testing.T) {
 		t.Fatalf("error = %q, want a golden mismatch", err.Error())
 	}
 }
+
+// x-octo-constraints 里的字符串字段必须**显式**按类型读。可选字段（arrayField /
+// ellipsis）尤其如此：用 `v, _ := entry[k].(string)` 会把「类型不对」映射到与「键不存在」
+// 相同的 ""，于是声明的语义被静默改写，编译期无错、渲染期无信号。
+//
+// 具体后果（#712 follow-up）：非字符串 arrayField 变 "" 后，截断从 phases[].thought
+// 重定向到一个不存在的顶层 thought —— **声明的展示上限彻底停止生效**，而这正是
+// truncateStrings 存在的唯一目的。非字符串 ellipsis 变 "" 则静默丢掉省略号，截断过的值
+// 与本来就短的值再也分不出来。
+func TestCompileJSONArtifactRejectsWrongTypedConstraintFields(t *testing.T) {
+	compile := func(t *testing.T, constraints string) error {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		bundle.Schema = json.RawMessage(fmt.Sprintf(
+			`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+				`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+			validArtifactProperties, constraints,
+		))
+		_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+		return err
+	}
+
+	const aggregate = `"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}]`
+
+	for _, tc := range []struct{ name, constraints, want string }{
+		// 两个可选字段：这两条是真正的 fail-open，修复前**编译通过**。
+		{
+			name:        "arrayField 是数字",
+			constraints: `{"truncateStrings":[{"arrayField":7,"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be a string",
+		},
+		{
+			name:        "arrayField 是布尔",
+			constraints: `{"truncateStrings":[{"arrayField":false,"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be a string",
+		},
+		{
+			name:        "ellipsis 是数字",
+			constraints: `{"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":3}]}`,
+			want:        "ellipsis must be a string",
+		},
+		// 必填字段：修复前靠下游 `== ""` 偶然挡住，但把类型错误报成「is required」。
+		{
+			name:        "field 是数字",
+			constraints: `{"truncateStrings":[{"field":9,"maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must be a string",
+		},
+		{
+			name:        "field 缺失",
+			constraints: `{"truncateStrings":[{"maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field is required",
+		},
+		// 空串与未 trim 是两条不同的规则，消息不能互相指控（review of #716）。
+		{
+			name:        "field 是空串",
+			constraints: `{"truncateStrings":[{"field":"","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must not be empty",
+		},
+		{
+			name:        "field 前后有空白",
+			constraints: `{"truncateStrings":[{"field":" title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must be trimmed",
+		},
+		// arrayField 是 schema 路径，未 trim 永远匹配不上属性名，所以照旧要求 trim。
+		{
+			name:        "arrayField 前后有空白",
+			constraints: `{"truncateStrings":[{"arrayField":"groups ","field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be trimmed",
+		},
+		{
+			name:        "parentArray 是数字",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":1,"childArray":"items","maxTotalItems":2}]}`,
+			want:        "parentArray must be a string",
+		},
+		{
+			name:        "childArray 是对象",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":{},"maxTotalItems":2}]}`,
+			want:        "childArray must be a string",
+		},
+		{
+			name:        "childArray 缺失",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":"groups","maxTotalItems":2}]}`,
+			want:        "childArray is required",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := compile(t, tc.constraints)
+			if err == nil {
+				t.Fatalf("类型错误的 %s 编译通过了 —— 声明会被静默改写语义", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// 反向：合法的省略 arrayField / ellipsis 必须继续通过，否则这次收紧就把可选性也一起收掉了。
+	//
+	// **ellipsis 不做 trim 要求**：它是展示文本而非 schema 路径，#716 之前的解析器逐字使用它，
+	// 而 " …"（前导空格的省略号）是合法的排版选择。给它加 trim 会把一个**类型正确**的值从
+	// 接受变成拒绝 —— 超出「只有 present-but-wrong-typed 才报错」这个本次改动自己声明的
+	// 契约（review of #716 抓到这处过度收紧）。所以这里正面钉住它仍被接受。
+	for _, tc := range []struct{ name, constraints string }{
+		{"省略 arrayField（顶层字段）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}`},
+		{"省略 ellipsis（无省略号截断）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8}]}`},
+		{"ellipsis 前导空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":" …"}]}`},
+		{"ellipsis 尾随空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"… "}]}`},
+		{"ellipsis 含换行", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"...\n"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := compile(t, tc.constraints); err != nil {
+				t.Fatalf("合法的省略应通过：%v", err)
+			}
+		})
+	}
+}

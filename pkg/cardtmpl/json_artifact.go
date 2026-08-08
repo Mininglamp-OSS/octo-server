@@ -1149,13 +1149,13 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 		if err := rejectUnknownKeys(entry, "parentArray", "childArray", "maxTotalItems"); err != nil {
 			return nil, fmt.Errorf("aggregateArrayLimits[%d]: %w", index, err)
 		}
-		parent, _ := entry["parentArray"].(string)
-		child, _ := entry["childArray"].(string)
-		if parent == "" || parent != strings.TrimSpace(parent) {
-			return nil, fmt.Errorf("aggregateArrayLimits[%d].parentArray is required and must be trimmed", index)
+		parent, err := requiredStringField(entry, "parentArray")
+		if err != nil {
+			return nil, fmt.Errorf("aggregateArrayLimits[%d].%w", index, err)
 		}
-		if child == "" || child != strings.TrimSpace(child) {
-			return nil, fmt.Errorf("aggregateArrayLimits[%d].childArray is required and must be trimmed", index)
+		child, err := requiredStringField(entry, "childArray")
+		if err != nil {
+			return nil, fmt.Errorf("aggregateArrayLimits[%d].%w", index, err)
 		}
 		maxItems, err := positiveJSONInt(entry["maxTotalItems"])
 		if err != nil {
@@ -1203,14 +1203,21 @@ func parseStringTruncations(schema map[string]any) ([]jsonTemplateStringTruncati
 		if err := rejectUnknownKeys(entry, "arrayField", "field", "maxRunes", "ellipsis"); err != nil {
 			return nil, fmt.Errorf("truncateStrings[%d]: %w", index, err)
 		}
-		arrayField, _ := entry["arrayField"].(string)
-		field, _ := entry["field"].(string)
-		ellipsis, _ := entry["ellipsis"].(string)
-		if field == "" || field != strings.TrimSpace(field) {
-			return nil, fmt.Errorf("truncateStrings[%d].field is required and must be trimmed", index)
+		// arrayField and ellipsis are genuinely optional, which is exactly why they
+		// must not be read with `v, _ := ...`: for an optional field that idiom maps
+		// a wrong-typed value onto the same "" the absent case produces, so the
+		// declaration silently changes meaning. See optionalStringField.
+		arrayField, err := optionalTrimmedStringField(entry, "arrayField")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
 		}
-		if arrayField != strings.TrimSpace(arrayField) {
-			return nil, fmt.Errorf("truncateStrings[%d].arrayField must be trimmed", index)
+		field, err := requiredStringField(entry, "field")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
+		}
+		ellipsis, err := optionalStringField(entry, "ellipsis")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
 		}
 		maxRunes, err := positiveJSONInt(entry["maxRunes"])
 		if err != nil {
@@ -1291,6 +1298,78 @@ func validateTruncationTarget(schema map[string]any, tr jsonTemplateStringTrunca
 			truncationTarget(tr), tr.MaxRunes, maxLength)
 	}
 	return nil
+}
+
+// optionalStringField reads a string-valued key that may legitimately be absent.
+// Absent yields "" with no error; a key that is *present* with a non-string value
+// is an error rather than "".
+//
+// Why this exists instead of `v, _ := m[k].(string)`: for an **optional** field
+// that idiom collapses "wrong type" onto the same "" the absent case produces, so
+// the declaration silently changes meaning instead of failing to compile. Two live
+// cases in truncateStrings (found reviewing #712): a non-string `arrayField`
+// becomes "", which re-scopes the clamp from `phases[].thought` to a top-level
+// `thought` that does not exist — the declared display ceiling then simply stops
+// applying, with no error at compile time and no signal at render time. A
+// non-string `ellipsis` becomes "", silently dropping the ellipsis so a truncated
+// value is indistinguishable from a short one.
+func optionalStringField(entry map[string]any, key string) (string, error) {
+	raw, present := entry[key]
+	if !present {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	return value, nil
+}
+
+// optionalTrimmedStringField is optionalStringField plus a trim requirement, for the
+// fields that name a schema path — an untrimmed one can never match a property name,
+// so accepting it would only defer the failure.
+//
+// Deliberately NOT applied to `ellipsis` (review of #716): that field is display text,
+// not a path, and the pre-#716 parser used it verbatim. A leading-space suffix like
+// " …" is a legitimate typographic choice, so trimming it would turn a
+// correctly-typed value from accepted into rejected — a tightening beyond "only
+// present-but-wrong-typed becomes an error", which is the contract this change
+// declared. Sharing one helper across both kinds of field is what introduced that
+// over-reach; keeping them separate is what prevents it.
+func optionalTrimmedStringField(entry map[string]any, key string) (string, error) {
+	value, err := optionalStringField(entry, key)
+	if err != nil {
+		return "", err
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s must be trimmed", key)
+	}
+	return value, nil
+}
+
+// requiredStringField is optionalStringField plus presence and non-emptiness.
+// The callers previously leaned on a downstream `== ""` comparison to catch a
+// wrong-typed value: that happens to fail closed, but it fails closed by accident
+// and reports "is required" for what is actually a type error. Making the check
+// explicit keeps the outcome and fixes the diagnosis.
+func requiredStringField(entry map[string]any, key string) (string, error) {
+	raw, present := entry[key]
+	if !present {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	// 空串与「有前后空白」是两条不同的规则，分开报 —— 本次改动的目标就是修这类
+	// 「消息指控了一条值没违反的规则」（review of #716）。空串本身是 trimmed 的。
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", key)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s must be trimmed", key)
+	}
+	return value, nil
 }
 
 func positiveJSONInt(value any) (int, error) {
