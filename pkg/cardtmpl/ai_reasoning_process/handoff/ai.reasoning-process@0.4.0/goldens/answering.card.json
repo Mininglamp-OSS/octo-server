@@ -1,0 +1,934 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "body": [
+    {
+      "items": [
+        {
+          "columns": [
+            {
+              "items": [
+                {
+                  "columns": [
+                    {
+                      "items": [
+                        {
+                          "size": "Small",
+                          "spacing": "None",
+                          "text": "深度思考",
+                          "type": "TextBlock",
+                          "weight": "Bolder",
+                          "wrap": true
+                        }
+                      ],
+                      "type": "Column",
+                      "width": "auto"
+                    },
+                    {
+                      "items": [
+                        {
+                          "altText": "展开",
+                          "id": "reasoning_toggle_collapsed",
+                          "isVisible": false,
+                          "selectAction": {
+                            "id": "reasoning_toggle",
+                            "targetElements": [
+                              "trace_panel",
+                              "collapsed_panel",
+                              "reasoning_toggle_collapsed",
+                              "reasoning_toggle_expanded"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        },
+                        {
+                          "altText": "收起",
+                          "id": "reasoning_toggle_expanded",
+                          "isVisible": true,
+                          "selectAction": {
+                            "id": "reasoning_toggle_expanded_action",
+                            "targetElements": [
+                              "trace_panel",
+                              "collapsed_panel",
+                              "reasoning_toggle_collapsed",
+                              "reasoning_toggle_expanded"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "auto"
+                    }
+                  ],
+                  "spacing": "None",
+                  "type": "ColumnSet"
+                },
+                {
+                  "color": "Accent",
+                  "size": "Small",
+                  "spacing": "None",
+                  "text": "回答中",
+                  "type": "TextBlock",
+                  "wrap": true
+                }
+              ],
+              "type": "Column",
+              "width": "stretch"
+            }
+          ],
+          "id": "reasoning_header",
+          "spacing": "None",
+          "type": "ColumnSet"
+        },
+        {
+          "id": "trace_panel",
+          "isVisible": true,
+          "items": [
+            {
+              "id": "reasoning_phase_0",
+              "items": [
+                {
+                  "columns": [
+                    {
+                      "items": [
+                        {
+                          "size": "Small",
+                          "spacing": "None",
+                          "text": "先拆分线索、试用激活与付费三段漏斗，核对近 90 天数据。",
+                          "type": "TextBlock",
+                          "wrap": true
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "stretch"
+                    },
+                    {
+                      "items": [
+                        {
+                          "altText": "展开工具",
+                          "id": "reasoning_tools_toggle_collapsed_0",
+                          "isVisible": true,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_action_0",
+                            "targetElements": [
+                              "reasoning_tools_panel_0",
+                              "reasoning_tools_toggle_collapsed_0",
+                              "reasoning_tools_toggle_expanded_0"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        },
+                        {
+                          "altText": "收起工具",
+                          "id": "reasoning_tools_toggle_expanded_0",
+                          "isVisible": false,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_expanded_action_0",
+                            "targetElements": [
+                              "reasoning_tools_panel_0",
+                              "reasoning_tools_toggle_collapsed_0",
+                              "reasoning_tools_toggle_expanded_0"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "auto"
+                    }
+                  ],
+                  "spacing": "None",
+                  "type": "ColumnSet"
+                },
+                {
+                  "id": "reasoning_tools_panel_0",
+                  "isVisible": false,
+                  "items": [
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "query_metrics",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "channel=B · range=90d · group=stage",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "None",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "read_file",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "~/analytics/funnel_definition.sql · ×2",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "run_sql",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "按漏斗阶段汇总数量与转化率",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    }
+                  ],
+                  "spacing": "Small",
+                  "type": "Container"
+                }
+              ],
+              "spacing": "None",
+              "type": "Container"
+            },
+            {
+              "id": "reasoning_phase_1",
+              "items": [
+                {
+                  "columns": [
+                    {
+                      "items": [
+                        {
+                          "size": "Small",
+                          "spacing": "None",
+                          "text": "激活率的降幅高于线索量，交叉核验行业结构、客服工单、NPS 与季节性。",
+                          "type": "TextBlock",
+                          "wrap": true
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "stretch"
+                    },
+                    {
+                      "items": [
+                        {
+                          "altText": "展开工具",
+                          "id": "reasoning_tools_toggle_collapsed_1",
+                          "isVisible": true,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_action_1",
+                            "targetElements": [
+                              "reasoning_tools_panel_1",
+                              "reasoning_tools_toggle_collapsed_1",
+                              "reasoning_tools_toggle_expanded_1"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        },
+                        {
+                          "altText": "收起工具",
+                          "id": "reasoning_tools_toggle_expanded_1",
+                          "isVisible": false,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_expanded_action_1",
+                            "targetElements": [
+                              "reasoning_tools_panel_1",
+                              "reasoning_tools_toggle_collapsed_1",
+                              "reasoning_tools_toggle_expanded_1"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "auto"
+                    }
+                  ],
+                  "spacing": "None",
+                  "type": "ColumnSet"
+                },
+                {
+                  "id": "reasoning_tools_panel_1",
+                  "isVisible": false,
+                  "items": [
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "query_metrics",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "按行业拆分激活率",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "None",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "search_tickets",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "渠道 B · 试用 / 激活失败 · 近 60 天",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "read_file",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "~/nps/2026Q2_channelB.csv",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "query_metrics",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "叠加节假日与季节性校正",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    }
+                  ],
+                  "spacing": "Small",
+                  "type": "Container"
+                }
+              ],
+              "spacing": "Small",
+              "type": "Container"
+            },
+            {
+              "id": "reasoning_phase_2",
+              "items": [
+                {
+                  "columns": [
+                    {
+                      "items": [
+                        {
+                          "size": "Small",
+                          "spacing": "None",
+                          "text": "主因确认：教育与专业服务合计贡献 63% 降幅，激活断点集中在试用权益触达。",
+                          "type": "TextBlock",
+                          "wrap": true
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "stretch"
+                    },
+                    {
+                      "items": [
+                        {
+                          "altText": "展开工具",
+                          "id": "reasoning_tools_toggle_collapsed_2",
+                          "isVisible": true,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_action_2",
+                            "targetElements": [
+                              "reasoning_tools_panel_2",
+                              "reasoning_tools_toggle_collapsed_2",
+                              "reasoning_tools_toggle_expanded_2"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        },
+                        {
+                          "altText": "收起工具",
+                          "id": "reasoning_tools_toggle_expanded_2",
+                          "isVisible": false,
+                          "selectAction": {
+                            "id": "reasoning_tools_toggle_expanded_action_2",
+                            "targetElements": [
+                              "reasoning_tools_panel_2",
+                              "reasoning_tools_toggle_collapsed_2",
+                              "reasoning_tools_toggle_expanded_2"
+                            ],
+                            "type": "Action.ToggleVisibility"
+                          },
+                          "size": "Small",
+                          "spacing": "None",
+                          "type": "Image",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "width": "14px"
+                        }
+                      ],
+                      "type": "Column",
+                      "verticalContentAlignment": "Center",
+                      "width": "auto"
+                    }
+                  ],
+                  "spacing": "None",
+                  "type": "ColumnSet"
+                },
+                {
+                  "id": "reasoning_tools_panel_2",
+                  "isVisible": false,
+                  "items": [
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "run_sql",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "按行业汇总转化降幅贡献",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "None",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Good",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "edit_file",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "~/reports/channelB_rootcause.md · 已编辑",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    },
+                    {
+                      "columns": [
+                        {
+                          "items": [],
+                          "type": "Column",
+                          "width": "8px"
+                        },
+                        {
+                          "items": [
+                            {
+                              "color": "Accent",
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "●",
+                              "type": "TextBlock"
+                            }
+                          ],
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "think",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "auto"
+                        },
+                        {
+                          "items": [
+                            {
+                              "isSubtle": true,
+                              "size": "Small",
+                              "spacing": "None",
+                              "text": "正在组织结论、证据与下周建议…",
+                              "type": "TextBlock",
+                              "wrap": true
+                            }
+                          ],
+                          "spacing": "Small",
+                          "type": "Column",
+                          "verticalContentAlignment": "Center",
+                          "width": "stretch"
+                        }
+                      ],
+                      "spacing": "Small",
+                      "type": "ColumnSet"
+                    }
+                  ],
+                  "spacing": "Small",
+                  "type": "Container"
+                }
+              ],
+              "spacing": "Small",
+              "type": "Container"
+            },
+            {
+              "color": "Accent",
+              "size": "Small",
+              "spacing": "Medium",
+              "text": "◌  推理已完成，正在生成回答…",
+              "type": "TextBlock",
+              "wrap": true
+            }
+          ],
+          "spacing": "Medium",
+          "type": "Container"
+        },
+        {
+          "id": "collapsed_panel",
+          "isVisible": false,
+          "items": [
+            {
+              "isSubtle": true,
+              "size": "Small",
+              "spacing": "None",
+              "text": "正在生成回答",
+              "type": "TextBlock",
+              "wrap": true
+            }
+          ],
+          "spacing": "Small",
+          "type": "Container"
+        }
+      ],
+      "spacing": "None",
+      "style": "emphasis",
+      "type": "Container"
+    }
+  ],
+  "type": "AdaptiveCard",
+  "version": "1.5"
+}

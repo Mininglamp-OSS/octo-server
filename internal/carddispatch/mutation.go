@@ -25,7 +25,57 @@ var (
 	ErrCardMutationNotFound  = errors.New("carddispatch: card mutation target not found")
 	ErrCardMutationForbidden = errors.New("carddispatch: card mutation sender mismatch")
 	ErrCardMutationConflict  = errors.New("carddispatch: stale card mutation")
+
+	// ErrCardMutationTooLarge 是「帧合法但存不下」——它刻意 wrap ErrCardMutationInvalid，
+	// 这样既给调用方/测试一个可区分的哨兵，又让既有的 ErrCardMutationInvalid 映射
+	// （bot_api → ErrBotAPICardInvalid）继续成立，不必新增对外错误码。
+	ErrCardMutationTooLarge = fmt.Errorf("%w: frame exceeds the persistence column", ErrCardMutationInvalid)
 )
+
+// maxContentEditBytes 是卡片帧落库的字节上限，等于承接它的两列的物理宽度：
+// message_extra.content_edit（MySQL TEXT，modules/message/sql/20220414000001）与
+// octo_message_card_revision.content（TEXT，20250708000002）。TEXT 是 65,535
+// **字节**，与字符集无关；utf8mb4 下一个 CJK 字符占 3 字节，一个被 JSON 转义的
+// `<` 占 6 字节，所以码点级的 schema 上限换算不出这个数。
+//
+// 为什么闸设在这里，而不是靠调低各模板的展示上限：帧的字节数由「模板固定骨架 +
+// 调用方填的自由字符串 + Finalize 追加的 plain 副本」三项相加，压任何单一字段都压不住
+// 它（实测 ai.reasoning-process@0.4.0 把 thought 压到 1 码点，最坏帧仍是列宽的 107%，
+// 主导项是 13 条 action 的 tool/detail 加 plain）。而且 @0.3.0 的字节已冻结、根本改不动，
+// 它在自身上限下就已经是 121%。所以唯一能同时覆盖既有版本、当前版本和未来模板的位置，
+// 就是写入前的这一道边界。
+//
+// 闸的作用是把 MySQL 的 `Data too long`（严格模式 → 500）或静默截断成非法 JSON
+// （非严格模式 → 客户端渲染不出的坏帧）换成一个确定的、带字节数的拒绝。
+const maxContentEditBytes = 65535
+
+// MaxPersistedFrameBytes 是 maxContentEditBytes 的导出别名，供发送侧做同口径预检
+// （modules/bot_api 的模板分支）。发送侧不写 content_edit，但一张发出后编辑不了的卡
+// 等于发出即报废，所以它需要拿到同一个数而不是自己抄一份 —— 抄的那份会漂移。
+const MaxPersistedFrameBytes = maxContentEditBytes
+
+// NormalizeFrameForPersistence 是「一帧卡片能否落库」的唯一判据，所有在写入前重新校验
+// 帧的路径都必须走它：CardMutator.Mutate、以及 pkg/cardtmpl 的 CardUpdater.Append /
+// ReplaceView。返回的是 canonical 字节（cardmsg 已重算权威 plain），可直接写库。
+//
+// 为什么要有这个函数而不是各调用点自己拼：PR#712 的 P0 就是各点自己拼出来的 ——
+// 渲染侧和回写侧对「同一帧是否合法」给出了不同答案，于是卡片发得出去、编辑必失败。
+// 校验规则一旦有两份，它们就会漂移；这里让它只有一份。
+func NormalizeFrameForPersistence(contentEdit string) (string, error) {
+	normalized, err := cardmsg.NormalizeContentEdit(contentEdit)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrCardMutationInvalid, err)
+	}
+	// 列宽闸。normalized 是 message_extra.content_edit 与
+	// octo_message_card_revision.content 共同写入的那一份字节（已含 Finalize 追加的
+	// plain —— 它能把帧再撑大一半，量 cardmsg.Validate 之前的渲染结果会显著低估），
+	// 所以在这里量一次就覆盖两张表。见 maxContentEditBytes 的说明。
+	if len(normalized) > maxContentEditBytes {
+		return "", fmt.Errorf("%w: %d B > %d B",
+			ErrCardMutationTooLarge, len(normalized), maxContentEditBytes)
+	}
+	return normalized, nil
+}
 
 const cardMutationCASMaxAttempts = 5
 
@@ -187,9 +237,21 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	if revoked || deleted {
 		return CardMutationResult{}, ErrCardMutationNotFound
 	}
-	normalized, err := cardmsg.NormalizeContentEdit(request.ContentEdit)
+	normalized, err := NormalizeFrameForPersistence(request.ContentEdit)
 	if err != nil {
-		return CardMutationResult{}, fmt.Errorf("%w: %v", ErrCardMutationInvalid, err)
+		if errors.Is(err, ErrCardMutationTooLarge) && m.logger != nil {
+			// zap.Error 是必须的：真实字节数只在错误串里。request.ContentEdit 是
+			// **pre-Finalize** 的入参，而拒绝是按 post-Finalize 字节判的（本 PR 实测
+			// +47%），所以单独打它会印出一个比 column_bytes 还小的 frame_bytes，配上
+			// 「超出列宽」的消息自相矛盾，读日志的人会以为闸误判（PR#712 review P2-2）。
+			m.logger.Error("card mutation frame exceeds the persistence column",
+				zap.Error(err),
+				zap.String("message_id", request.MessageID),
+				zap.String("sender_uid", request.SenderUID),
+				zap.Int("request_bytes_pre_finalize", len(request.ContentEdit)),
+				zap.Int("column_bytes", maxContentEditBytes))
+		}
+		return CardMutationResult{}, err
 	}
 	cardSeq, hasCardSeq := cardmsg.CardSeqFromContentEdit(normalized)
 	if !hasCardSeq || cardSeq <= 0 {
@@ -234,6 +296,15 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 func (m *CardMutator) WriteCAS(request CardMutationCASRequest) (bool, error) {
 	if m == nil || m.backend == nil {
 		return false, ErrCardMutationInvalid
+	}
+	// 列宽兜底。本方法接受**已经**规范化过的帧（调用方自己跑 cardmsg 收敛 + Finalize，
+	// 因为它还要在中途改写 render_profile），所以这里不重跑校验 —— 但宽度必须查，否则
+	// 这条路就成了绕过 NormalizeFrameForPersistence 的通道，直接把超宽帧递给 INSERT。
+	// PR#712 review 抓到的正是这个：闸接了 Mutate 与两个 CardUpdater 路径，漏了 raw
+	// 编辑的 CAS 分支。放在这里而不是只放调用点，是为了让未来的调用方也拿不到旁路。
+	if len(request.ContentEdit) > maxContentEditBytes {
+		return false, fmt.Errorf("%w: %d B > %d B",
+			ErrCardMutationTooLarge, len(request.ContentEdit), maxContentEditBytes)
 	}
 	conflict, _, err := m.backend.CASWrite(cardMutationWrite{
 		MessageID: request.MessageID, MessageSeq: request.MessageSeq, ChannelID: request.ChannelID,
