@@ -147,14 +147,25 @@ func channelLevelVisibility(uid string, memberGroupNos []string) (string, []inte
 	// 它用 strings.Split 要求**恰好**两段，"g____a____b" 直接判非法；而单靠
 	// substring_index 只取第一段，会把这种畸形 ID 当成属于 g（PR#717 review）。
 	//
-	// 两侧都用 length()（字节）：除数绑的是 Go 的 len(sep)，也是字节。改动前这里是
-	// char_length()（字符），只因分隔符恰好是 ASCII 才等价 —— 一个授权谓词里不该
-	// 埋着「只要分隔符一直是 ASCII 就成立」这种隐含前提（PR#717 review P2-2）。
+	// 两侧都用 length()（字节）：比较的对象绑的是 Go 的 len(sep)，也是字节。改动前
+	// 这里是 char_length()（字符），只因分隔符恰好是 ASCII 才等价 —— 一个授权谓词里
+	// 不该埋着「只要分隔符一直是 ASCII 就成立」这种隐含前提（PR#717 review P2-2）。
+	//
+	// 直接与 len(sep) 比而不是除以它再比 1：MySQL 的整数除法产出 DECIMAL，两种写法
+	// 结果相同，但少一次运算，也让这条授权谓词里不再有任何算术（同 review P2-6）。
+	//
+	// 关于 `channel_id in ?` 的一个隐含前提，留给下一个改 schema 的人：
+	// reminders.channel_id 是 utf8mb4_general_ci（PAD SPACE + 大小写不敏感），所以
+	// 这个比较会忽略尾随空格与大小写。当前不可利用 —— group_no 是服务端生成的 UUID
+	// （modules/group/service.go 的 GenerUUID），调用方无法指定，且 group 表上有
+	// group_no 的唯一索引，两个 collate-相等的群号不可能并存。**若 group_no 将来改成
+	// 可由外部提供（导入、租户自带标识），这条前提立即失效，本谓词就变成 collation
+	// 敏感的了。**
 	return "(reminders.channel_type in ?" +
 			" or " + personVisible +
 			" or (reminders.channel_type=? and reminders.channel_id in ?)" +
 			" or (reminders.channel_type=? and substring_index(reminders.channel_id,?,1) in ?" +
-			" and (length(reminders.channel_id)-length(replace(reminders.channel_id,?,'')))/?=1))",
+			" and length(reminders.channel_id)-length(replace(reminders.channel_id,?,''))=?))",
 		append(append([]interface{}{unscopedChannelTypes}, personArgs...),
 			grp, memberGroupNos,
 			topic, topicChannelSeparator, memberGroupNos,

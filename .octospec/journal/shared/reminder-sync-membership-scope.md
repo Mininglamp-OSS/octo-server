@@ -224,6 +224,25 @@ next person does not rediscover them:
    (`对齐 iOS`); the two platforms in fact behave oppositely, so at least one of
    them — and the comment — is wrong.
 
+## Before rollout
+
+Run once against production:
+
+```sql
+SELECT channel_type, count(*) FROM reminders WHERE uid='' GROUP BY channel_type;
+```
+
+The gate is an allowlist, so a channel-level row whose `channel_type` sits outside
+`{1,2,3,4,5,6}` is now invisible to **everyone**, including callers who should see
+it. `getReminders` copies `ChannelType` off the message with no writer-side
+validation, so such a row is insertable in principle. Fail-closed is the right
+default and this is not a reason to weaken it — but it is the one behaviour change
+here whose failure mode is silent, and the query settles it in seconds. Raised in
+review (P2-1); recorded rather than assumed away.
+
+Also worth announcing to support: users who left a group or were blacklisted stop
+receiving that group's channel-level reminders. Correct and intended, but visible.
+
 ## Not fixed here
 
 - `SpaceMiddleware`'s opt-in fail-open. Documented old-client compatibility
