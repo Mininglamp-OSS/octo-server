@@ -154,6 +154,48 @@ Two follow-ups fall out of that measurement, neither actioned here:
    with (1): the cheapest real mitigation is the missing index, not a weaker
    predicate.
 
+## Client impact — verified, not assumed
+
+Every consumer of this endpoint was read before merging, because the fix removes
+rows and the dangerous failure mode would be a client that treats the response as
+authoritative and prunes local state against it. **No client does.**
+
+| | call site | `channel_ids` | `uid == ""` rows | local pruning |
+|---|---|---|---|---|
+| octo-web | `dmworkdatasource/src/im-callbacks/reminders.ts:15-28` | conversation list (Group + Topic) | n/a | — |
+| octo-ios | `WKDataSourceModule.m:398` | conversation list (Group + Topic) | **dropped** | none |
+| octo-android | `MsgService.java:94`, built at `MsgModel.java:1092` | conversation list (**Group only**) | kept | none |
+
+- **No pruning anywhere.** iOS persists via `ON CONFLICT(reminder_id) DO UPDATE`
+  (`WKReminderDB.m:12`) and Android via insert/update keyed on `reminder_id`
+  (`ReminderDBManager.java:242,249`); neither repo contains a `DELETE` against
+  the reminders table. Fewer rows in a response can never remove local state.
+- **No count is taken from the response.** iOS badges sum conversation unread
+  (`WKApp.m:790`); Android recomputes from its own DB (`ChatActivity.java:2634`);
+  list-level indicators are booleans on both.
+- **Both already filter by the local conversation list at display time**
+  (`WKReminderManager.m:114-119`, `ChatFragment.java:2665`), so leaked rows for
+  channels the user never joined were stored but never rendered. The leak was
+  real but was not user-visible on either mobile client.
+- **The `limit` interaction is the one behavioural improvement.** Neither client
+  paginates (iOS `limit: 1000`, Android `limit: 200`). Before this change a user
+  in few groups could have that budget consumed by other tenants' rows, pushing
+  their own reminders out of the window. Afterwards the budget carries only rows
+  that concern them.
+
+Two pre-existing client defects surfaced while verifying this. Both are outside
+this repo and are **not** consequences of this change; recorded here only so the
+next person does not rediscover them:
+
+1. iOS drops every channel-level row. `WKDataSourceModule.m:408` reads
+   `if (uid && currentUID && ![uid isEqualToString:currentUID]) continue;`, and
+   in Objective-C `@""` is a non-nil object, hence truthy — so `uid == ""`
+   (the server's channel-level marker) takes the `continue`.
+2. Android keeps them: `MsgModel.java:1113` uses `!TextUtils.isEmpty(...)`,
+   which is false for `""`. Its comment claims the logic is aligned with iOS
+   (`对齐 iOS`); the two platforms in fact behave oppositely, so at least one of
+   them — and the comment — is wrong.
+
 ## Not fixed here
 
 - `SpaceMiddleware`'s opt-in fail-open. Documented old-client compatibility
