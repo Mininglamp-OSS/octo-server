@@ -352,9 +352,12 @@ func cappedFactValue(rawNames []string, max int) (value string, count int) {
 
 // cappedPipelineJobsValue preserves the same filtering, escaping, ordering, cap,
 // count, and overflow semantics as Labels, but gives every rendered job its own
-// line. It is intentionally pipeline-only so Labels retain their slash separator.
+// line. The two spaces before each newline are CommonMark's hard-break syntax;
+// bare newlines are soft breaks and octo-web's markdown renderer collapses them
+// to spaces. It is intentionally pipeline-only so Labels retain their slash
+// separator.
 func cappedPipelineJobsValue(rawNames []string, max int) (value string, count int) {
-	return cappedFactValueWithSeparator(rawNames, max, "\n", "\n…")
+	return cappedFactValueWithSeparator(rawNames, max, "  \n", "  \n…")
 }
 
 func cappedFactValueWithSeparator(rawNames []string, max int, separator, overflowSuffix string) (value string, count int) {

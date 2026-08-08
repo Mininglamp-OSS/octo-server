@@ -132,6 +132,8 @@ Event builders supply only event-specific content and safe semantic literals.
   `Duration`, and `Jobs (N)`, independent of outbound language.
 - Pipeline jobs retain current ordering, non-blank count, per-item rune cap,
   maximum rendered count, and overflow marker, but render one job per line.
+  Encode separators as CommonMark hard breaks (`"  \n"`), because octo-web's
+  card markdown renderer collapses bare soft-break newlines to spaces.
   Do not change the shared slash-joined representation used by MR/PR/Issue
   `Labels (N)`.
 - Existing user-visible action localization remains unchanged.
