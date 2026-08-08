@@ -985,6 +985,26 @@ func TestVCSCardEnvelopeSelectsForgeWithoutExposingCallerOverride(t *testing.T) 
 	})
 }
 
+func TestVCSCardEnvelopePlainStartsWithEventHeadline(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "1")
+	body := []byte(`{
+		"object_attributes":{"id":21511,"status":"success","ref":"develop"},
+		"project":{"path_with_namespace":"dmwork/octo-server","web_url":"https://gitlab.com/dmwork/octo-server"}
+	}`)
+	req, skip, invalid := parseGitLabPush(glHeader("Pipeline Hook"), body)
+	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
+	require.Equal(t, msgTypeCard, req.MsgType)
+
+	payload, err := buildCardPayload(
+		&incomingWebhookModel{WebhookID: "iwh_vcs", SpaceID: "sp_1", Name: "VCS"},
+		req,
+		false,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Pipeline #21511\nBranch: develop\nStatus: success", payload["plain"],
+		"decorative VCS header content must not displace the event headline in notifications and previews")
+}
+
 func TestVCSViewLabel(t *testing.T) {
 	assert.Equal(t, "View on GitHub", vcsViewLabel(cardSourceGitHub, "en-US"))
 	assert.Equal(t, "在 GitHub 查看", vcsViewLabel(cardSourceGitHub, "zh-CN"))
