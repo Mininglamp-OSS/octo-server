@@ -12,9 +12,11 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
+// The advertised/new-send version, tracked in one place so a successor bump
+// touches this constant rather than every assertion below.
 const (
-	testReasoningVersionV3 = aireasoningprocess.TemplateVersionV3
-	testReasoningRootV3    = aireasoningprocess.HandoffRootV3
+	testReasoningVersionCurrent = aireasoningprocess.TemplateVersionV4
+	testReasoningRootCurrent    = aireasoningprocess.HandoffRootV4
 )
 
 func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
@@ -22,8 +24,9 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 	r := cardtmpl.NewRegistry()
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
-	r.RegisterJSON(aireasoningprocess.Assets, testReasoningRootV3)
-	r.SetDefault(aireasoningprocess.TemplateID, testReasoningVersionV3)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+	r.RegisterJSON(aireasoningprocess.Assets, testReasoningRootCurrent)
+	r.SetDefault(aireasoningprocess.TemplateID, testReasoningVersionCurrent)
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
@@ -31,7 +34,7 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 }
 
 func testReasoningData(t *testing.T, state string) json.RawMessage {
-	return testReasoningDataVersion(t, testReasoningRootV3, state)
+	return testReasoningDataVersion(t, testReasoningRootCurrent, state)
 }
 
 func testReasoningDataVersion(t *testing.T, root, state string) json.RawMessage {
@@ -52,7 +55,7 @@ func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
 	}
 
 	capability := catalog.Capability()
-	if len(capability.Templates) != 1 || capability.Templates[0].Version != testReasoningVersionV3 {
+	if len(capability.Templates) != 1 || capability.Templates[0].Version != testReasoningVersionCurrent {
 		t.Fatalf("advertised templates = %+v, want successor only", capability.Templates)
 	}
 
@@ -62,6 +65,7 @@ func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
 	}{
 		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+		{aireasoningprocess.TemplateVersionV3, aireasoningprocess.HandoffRootV3},
 	} {
 		t.Run(historical.version, func(t *testing.T) {
 			legacyRef := map[string]any{
@@ -108,7 +112,7 @@ func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing
 	payload := map[string]any{
 		"type": float64(17),
 		"template_ref": map[string]any{
-			"id": string(aireasoningprocess.TemplateID), "version": testReasoningVersionV3,
+			"id": string(aireasoningprocess.TemplateID), "version": testReasoningVersionCurrent,
 		},
 		"state": "reasoning",
 		"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
@@ -129,7 +133,7 @@ func TestBotCardTemplateCatalogPassesAuthoritativePrincipalAndPurpose(t *testing
 func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T) {
 	_, err := newBotCardTemplateCatalogWithPolicy(testBotTemplateRegistry(t), botTemplatePolicy{
 		AdvertisedSend: []botTemplateRef{{
-			ID: aireasoningprocess.TemplateID, Version: testReasoningVersionV3,
+			ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent,
 		}},
 		EditCompatible: []botTemplateRef{{
 			ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV1,
@@ -143,7 +147,7 @@ func TestBotCardTemplatePolicyRequiresEverySendRefToRemainEditable(t *testing.T)
 func TestBotCardTemplatePolicyFailsClosed(t *testing.T) {
 	registry := testBotTemplateRegistry(t)
 	successor := botTemplateRef{
-		ID: aireasoningprocess.TemplateID, Version: testReasoningVersionV3,
+		ID: aireasoningprocess.TemplateID, Version: testReasoningVersionCurrent,
 	}
 	missing := botTemplateRef{ID: "ai.missing", Version: "1.0.0"}
 	tests := []struct {

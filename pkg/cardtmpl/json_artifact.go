@@ -449,6 +449,10 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 	if err != nil {
 		return nil, artifactValidationError("constraint", "schema", err)
 	}
+	stringTruncations, err := parseStringTruncations(schemaMap)
+	if err != nil {
+		return nil, artifactValidationError("constraint", "schema", err)
+	}
 	if limits.RequireBoundedSchema {
 		if err := validateBoundedInputSchemaContext(ctx, schemaMap, limits.MaxJSONNodes); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -492,11 +496,13 @@ func CompileJSONArtifact(ctx context.Context, bundle Bundle, limits CompileLimit
 		meta:                 meta,
 		viewAST:              parsedTemplates,
 		aggregateArrayLimits: aggregateLimits,
+		stringTruncations:    stringTruncations,
 	}
 	if err := selfCheckCompiledJSON(ctx, template, meta, bundle.Samples, sampleAssignments); err != nil {
 		return nil, artifactValidationError("conformance", err.document, err.cause)
 	}
-	if err := checkArtifactGoldens(ctx, parsedTemplates, parsedSamples, parsedGoldens, sampleAssignments); err != nil {
+	if err := checkArtifactGoldens(ctx, parsedTemplates, parsedSamples, parsedGoldens,
+		sampleAssignments, stringTruncations); err != nil {
 		return nil, err
 	}
 
@@ -968,12 +974,31 @@ func selfCheckCompiledJSON(
 	return nil
 }
 
+// deepCopyJSONObject round-trips through JSON so a caller can mutate the copy
+// without touching the original. Compile-time only, so the cost is irrelevant;
+// correctness is not — the samples map is validated and reused after the golden
+// check, and the clamp it needs is in-place.
+func deepCopyJSONObject(src map[string]any) (map[string]any, error) {
+	raw, err := json.Marshal(src)
+	if err != nil {
+		return nil, fmt.Errorf("copy sample: %w", err)
+	}
+	var out map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber() // keep 64-bit ints exact, matching how samples are parsed
+	if err := decoder.Decode(&out); err != nil {
+		return nil, fmt.Errorf("copy sample: %w", err)
+	}
+	return out, nil
+}
+
 func checkArtifactGoldens(
 	ctx context.Context,
 	templates map[ViewKey]any,
 	samples map[string]any,
 	goldens map[string]any,
 	assignments []sampleAssignment,
+	truncations []jsonTemplateStringTruncation,
 ) error {
 	assignmentByKey := make(map[string]sampleAssignment, len(assignments))
 	for _, assignment := range assignments {
@@ -991,6 +1016,22 @@ func checkArtifactGoldens(
 		data, ok := samples[key].(map[string]any)
 		if !ok {
 			return artifactValidationError("shape", "samples."+key, errors.New("sample root must be an object"))
+		}
+		// Clamp exactly as jsonTemplate.Build does before expanding. Without this
+		// the goldens would record the *untruncated* expansion while production
+		// emits the truncated one, i.e. the artifact's only byte-level record of
+		// what it emits would be wrong — and the ordering argument the rest of the
+		// safety story leans on (selfCheckCompiledJSON before this check, so a
+		// matching golden cannot launder a forged control) assumes both look at the
+		// same frame. Applied to a copy: `samples` is validated and reused after
+		// this, and clamping is in-place (PR#712 review P2-1).
+		if len(truncations) > 0 {
+			clamped, err := deepCopyJSONObject(data)
+			if err != nil {
+				return artifactValidationError("shape", "samples."+key, err)
+			}
+			applyStringTruncationsTo(truncations, clamped)
+			data = clamped
 		}
 		expanded, err := jsontmpl.Expand(ctx, templates[assignment.view], jsontmpl.Scope{Data: data}, jsonTemplateEscaper)
 		if err != nil {
@@ -1060,7 +1101,14 @@ func compileJSONSchema(document any) (*jsonschema.Schema, error) {
 	return schema, nil
 }
 
-func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateArrayLimit, error) {
+// constraintsBlock reads the optional `x-octo-constraints` object, rejecting
+// unknown keys and an empty declaration. Each recognized constraint inside it is
+// independently optional — an artifact may declare only aggregate limits, only
+// string truncations, or both. (It previously required aggregateArrayLimits
+// whenever the block existed, which made truncateStrings unusable on its own;
+// PR#712 review.) An empty `{}` is still an error: it declares nothing, so it is
+// always an authoring mistake rather than a deliberate no-op.
+func constraintsBlock(schema map[string]any) (map[string]any, error) {
 	raw, exists := schema["x-octo-constraints"]
 	if !exists {
 		return nil, nil
@@ -1069,10 +1117,25 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 	if !ok {
 		return nil, errors.New("x-octo-constraints must be an object")
 	}
-	if err := rejectUnknownKeys(constraints, "aggregateArrayLimits"); err != nil {
+	if err := rejectUnknownKeys(constraints, "aggregateArrayLimits", "truncateStrings"); err != nil {
 		return nil, err
 	}
-	rawLimits, ok := constraints["aggregateArrayLimits"].([]any)
+	if len(constraints) == 0 {
+		return nil, errors.New("x-octo-constraints must declare at least one constraint")
+	}
+	return constraints, nil
+}
+
+func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateArrayLimit, error) {
+	constraints, err := constraintsBlock(schema)
+	if err != nil || constraints == nil {
+		return nil, err
+	}
+	rawEntries, exists := constraints["aggregateArrayLimits"]
+	if !exists {
+		return nil, nil
+	}
+	rawLimits, ok := rawEntries.([]any)
 	if !ok || len(rawLimits) == 0 {
 		return nil, errors.New("x-octo-constraints.aggregateArrayLimits must be a non-empty array")
 	}
@@ -1086,13 +1149,13 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 		if err := rejectUnknownKeys(entry, "parentArray", "childArray", "maxTotalItems"); err != nil {
 			return nil, fmt.Errorf("aggregateArrayLimits[%d]: %w", index, err)
 		}
-		parent, _ := entry["parentArray"].(string)
-		child, _ := entry["childArray"].(string)
-		if parent == "" || parent != strings.TrimSpace(parent) {
-			return nil, fmt.Errorf("aggregateArrayLimits[%d].parentArray is required and must be trimmed", index)
+		parent, err := requiredStringField(entry, "parentArray")
+		if err != nil {
+			return nil, fmt.Errorf("aggregateArrayLimits[%d].%w", index, err)
 		}
-		if child == "" || child != strings.TrimSpace(child) {
-			return nil, fmt.Errorf("aggregateArrayLimits[%d].childArray is required and must be trimmed", index)
+		child, err := requiredStringField(entry, "childArray")
+		if err != nil {
+			return nil, fmt.Errorf("aggregateArrayLimits[%d].%w", index, err)
 		}
 		maxItems, err := positiveJSONInt(entry["maxTotalItems"])
 		if err != nil {
@@ -1110,6 +1173,203 @@ func parseAggregateArrayLimits(schema map[string]any) ([]jsonTemplateAggregateAr
 		limits = append(limits, limit)
 	}
 	return limits, nil
+}
+
+// parseStringTruncations reads the optional x-octo-constraints.truncateStrings
+// declaration. Each entry names a string field the engine clamps at render time
+// instead of rejecting, so the schema's maxLength becomes the *accept* ceiling and
+// this the narrower *display* one. Opt-in per field: everything not declared keeps
+// the fail-close behaviour.
+func parseStringTruncations(schema map[string]any) ([]jsonTemplateStringTruncation, error) {
+	constraints, err := constraintsBlock(schema)
+	if err != nil || constraints == nil {
+		return nil, err
+	}
+	rawEntries, exists := constraints["truncateStrings"]
+	if !exists {
+		return nil, nil
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		return nil, errors.New("x-octo-constraints.truncateStrings must be a non-empty array")
+	}
+	truncations := make([]jsonTemplateStringTruncation, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for index, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("truncateStrings[%d] must be an object", index)
+		}
+		if err := rejectUnknownKeys(entry, "arrayField", "field", "maxRunes", "ellipsis"); err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d]: %w", index, err)
+		}
+		// arrayField and ellipsis are genuinely optional, which is exactly why they
+		// must not be read with `v, _ := ...`: for an optional field that idiom maps
+		// a wrong-typed value onto the same "" the absent case produces, so the
+		// declaration silently changes meaning. See optionalStringField.
+		arrayField, err := optionalTrimmedStringField(entry, "arrayField")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
+		}
+		field, err := requiredStringField(entry, "field")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
+		}
+		ellipsis, err := optionalStringField(entry, "ellipsis")
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].%w", index, err)
+		}
+		maxRunes, err := positiveJSONInt(entry["maxRunes"])
+		if err != nil {
+			return nil, fmt.Errorf("truncateStrings[%d].maxRunes must be positive", index)
+		}
+		if ellipsisRunes := len([]rune(ellipsis)); ellipsisRunes >= maxRunes {
+			return nil, fmt.Errorf("truncateStrings[%d].ellipsis (%d runes) must be shorter than maxRunes (%d)",
+				index, ellipsisRunes, maxRunes)
+		}
+		truncation := jsonTemplateStringTruncation{
+			ArrayField: arrayField, Field: field, MaxRunes: maxRunes, Ellipsis: ellipsis,
+		}
+		key := arrayField + "\x00" + field
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("duplicate truncateStrings target %s", truncationTarget(truncation))
+		}
+		seen[key] = struct{}{}
+		if err := validateTruncationTarget(schema, truncation); err != nil {
+			return nil, err
+		}
+		truncations = append(truncations, truncation)
+	}
+	return truncations, nil
+}
+
+func truncationTarget(tr jsonTemplateStringTruncation) string {
+	if tr.ArrayField == "" {
+		return tr.Field
+	}
+	return tr.ArrayField + "[]." + tr.Field
+}
+
+// validateTruncationTarget proves the declaration points at a real string field
+// whose schema maxLength is at least the display ceiling — otherwise the two
+// bounds contradict each other and the field would be rejected before the
+// truncation could ever apply.
+func validateTruncationTarget(schema map[string]any, tr jsonTemplateStringTruncation) error {
+	properties, _ := schema["properties"].(map[string]any)
+	if properties == nil {
+		return fmt.Errorf("truncateStrings target %s: schema has no properties", truncationTarget(tr))
+	}
+	if tr.ArrayField != "" {
+		array, _ := properties[tr.ArrayField].(map[string]any)
+		if array == nil {
+			return fmt.Errorf("truncateStrings target %s: %q is not a declared property",
+				truncationTarget(tr), tr.ArrayField)
+		}
+		if kind, _ := array["type"].(string); kind != "array" {
+			return fmt.Errorf("truncateStrings target %s: %q is %q, want array",
+				truncationTarget(tr), tr.ArrayField, kind)
+		}
+		items, _ := array["items"].(map[string]any)
+		if items == nil {
+			return fmt.Errorf("truncateStrings target %s: %q has no items schema",
+				truncationTarget(tr), tr.ArrayField)
+		}
+		properties, _ = items["properties"].(map[string]any)
+		if properties == nil {
+			return fmt.Errorf("truncateStrings target %s: %q items have no properties",
+				truncationTarget(tr), tr.ArrayField)
+		}
+	}
+	field, _ := properties[tr.Field].(map[string]any)
+	if field == nil {
+		return fmt.Errorf("truncateStrings target %s is not a declared property", truncationTarget(tr))
+	}
+	if kind, _ := field["type"].(string); kind != "string" {
+		return fmt.Errorf("truncateStrings target %s is %q, want string", truncationTarget(tr), kind)
+	}
+	maxLength, err := positiveJSONInt(field["maxLength"])
+	if err != nil {
+		return fmt.Errorf("truncateStrings target %s must declare a positive maxLength accept ceiling",
+			truncationTarget(tr))
+	}
+	if tr.MaxRunes > maxLength {
+		return fmt.Errorf("truncateStrings target %s: maxRunes %d exceeds the schema maxLength %d, "+
+			"so the value would be rejected before truncation applies",
+			truncationTarget(tr), tr.MaxRunes, maxLength)
+	}
+	return nil
+}
+
+// optionalStringField reads a string-valued key that may legitimately be absent.
+// Absent yields "" with no error; a key that is *present* with a non-string value
+// is an error rather than "".
+//
+// Why this exists instead of `v, _ := m[k].(string)`: for an **optional** field
+// that idiom collapses "wrong type" onto the same "" the absent case produces, so
+// the declaration silently changes meaning instead of failing to compile. Two live
+// cases in truncateStrings (found reviewing #712): a non-string `arrayField`
+// becomes "", which re-scopes the clamp from `phases[].thought` to a top-level
+// `thought` that does not exist — the declared display ceiling then simply stops
+// applying, with no error at compile time and no signal at render time. A
+// non-string `ellipsis` becomes "", silently dropping the ellipsis so a truncated
+// value is indistinguishable from a short one.
+func optionalStringField(entry map[string]any, key string) (string, error) {
+	raw, present := entry[key]
+	if !present {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	return value, nil
+}
+
+// optionalTrimmedStringField is optionalStringField plus a trim requirement, for the
+// fields that name a schema path — an untrimmed one can never match a property name,
+// so accepting it would only defer the failure.
+//
+// Deliberately NOT applied to `ellipsis` (review of #716): that field is display text,
+// not a path, and the pre-#716 parser used it verbatim. A leading-space suffix like
+// " …" is a legitimate typographic choice, so trimming it would turn a
+// correctly-typed value from accepted into rejected — a tightening beyond "only
+// present-but-wrong-typed becomes an error", which is the contract this change
+// declared. Sharing one helper across both kinds of field is what introduced that
+// over-reach; keeping them separate is what prevents it.
+func optionalTrimmedStringField(entry map[string]any, key string) (string, error) {
+	value, err := optionalStringField(entry, key)
+	if err != nil {
+		return "", err
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s must be trimmed", key)
+	}
+	return value, nil
+}
+
+// requiredStringField is optionalStringField plus presence and non-emptiness.
+// The callers previously leaned on a downstream `== ""` comparison to catch a
+// wrong-typed value: that happens to fail closed, but it fails closed by accident
+// and reports "is required" for what is actually a type error. Making the check
+// explicit keeps the outcome and fixes the diagnosis.
+func requiredStringField(entry map[string]any, key string) (string, error) {
+	raw, present := entry[key]
+	if !present {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	// 空串与「有前后空白」是两条不同的规则，分开报 —— 本次改动的目标就是修这类
+	// 「消息指控了一条值没违反的规则」（review of #716）。空串本身是 trimmed 的。
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", key)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s must be trimmed", key)
+	}
+	return value, nil
 }
 
 func positiveJSONInt(value any) (int, error) {

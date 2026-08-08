@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -320,6 +321,57 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		ba.Error("InteractiveCard finalize 失败", zap.Error(err), zap.String("channelID", channelID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
+	}
+
+	// 模板发送的列宽预检（PR#712 review lml2468 P1-2）。send 侧原本只查 512 KiB，而编辑
+	// 侧查 TEXT 列宽 65,535 B，两者不一致就能造出「发得出去、第一次编辑就被拒」的卡。
+	//
+	// 量的是**最坏的首次编辑信封**，不是发送帧本身：编辑路径会在渲染结果上追加 card_seq
+	// （必然）和 transient（进度帧）。card_seq 取 int64 上界、transient 取 true，两者都是最坏
+	// 取值，实测合计 48 字节。按发送帧长度放行会留下一个同宽的窗口 —— 落在其中的帧发得出去、
+	// 第一次编辑就被写入侧的闸拒掉，而字段长度是连续可变的，所以这个区间可达
+	// （follow-up review；具体字节数由 TestTemplateSendPrecheckAccountsForTheFirstEditEnvelope
+	// 实测并打印，不写死在这里当魔数）。
+	//
+	// 用 carddispatch.NormalizeFrameForPersistence 而不是自己比长度：宽度判据只有一份，
+	// 编辑路径以后再多加一个信封键，这里不会因为漏改一个魔数而重新裂开。代价是每次模板
+	// 发送多跑一次 Validate+Finalize+marshal —— 一张卡只在首帧付一次，后续帧走编辑路径。
+	//
+	// 这道检查**只覆盖第一帧**，仍不是那个不一致的通解（review P2-3）：推理卡的后续帧数据
+	// 更多（phases 从 1 累积到 6），首帧装得下推不出第 N 帧装得下。它能挡住的是那种发出去
+	// 就注定动不了的卡。真正的通解是迁 MEDIUMTEXT 或给 tool/detail 上截断，见 brief D3a。
+	//
+	// 只作用于**模板**分支，刻意不管 raw 发送：模板帧的尺寸由服务端产物 + schema 有界输入
+	// 决定（实测出厂样本 10.3–18.3 KB，占列宽 15.7%–27.9%），所以这道检查只会在病态输入上
+	// 触发；而 raw 卡片是调用方自己作者的一次性内容，对外承诺的就是 512 KiB，收紧它会拒掉
+	// 今天能发、且从不被编辑因而永远不碰 content_edit 的卡。
+	if templateMode {
+		// 浅拷贝：只往顶层加键，card 子树不动，且**不能**污染真正出站的 payload。
+		probe := make(map[string]interface{}, len(payload)+2)
+		for k, v := range payload {
+			probe[k] = v
+		}
+		probe["card_seq"] = int64(math.MaxInt64)
+		probe["transient"] = true
+
+		// fail-closed：marshal 失败必须拒绝，不能跳过尺寸检查。实践上不可达
+		// （payload 是 JSON 解出来的 map，上面 cardmsg.Finalize 刚 marshal 过一次），
+		// 但一个 fail-open 的条件不该出现在这个位置（review P2-4）。
+		probeFrame, mErr := json.Marshal(probe)
+		if mErr != nil {
+			ba.Error("模板渲染帧 marshal 失败,无法做列宽预检", zap.Error(mErr),
+				zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		if _, pErr := carddispatch.NormalizeFrameForPersistence(string(probeFrame)); pErr != nil {
+			ba.Warn("模板渲染帧的首次编辑信封超出持久化列宽,拒绝发送(否则卡片发出后无法编辑)",
+				zap.Error(pErr), zap.String("channelID", channelID),
+				zap.Int("sendFrameBytes", len(probeFrame)),
+				zap.Int("columnBytes", carddispatch.MaxPersistedFrameBytes))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
 	}
 
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
@@ -1064,6 +1116,21 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		normalized, cErr = authorBotRawCardRenderProfile(normalized)
 		if cErr != nil {
 			ba.Warn("InteractiveCard content_edit render_profile 写入失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		// 落库列宽闸。必须在 render_profile 改写**之后**跑：改写会加一个顶层键并重跑
+		// Finalize，所以它之前量的不是最终字节。这条路径的两个写分支（带 card_seq 的
+		// CAS、不带的 LWW）和修订历史追加都消费下面这个 normalized，所以在这里查一次
+		// 就覆盖三者 —— 而 carddispatch.WriteCAS 里还有一道同口径的兜底。
+		//
+		// 为什么 raw 编辑也要查:cardmsg 只有 512 KiB 的 payload 上限,比承接它的
+		// TEXT 列宽 8 倍,所以一个 cardmsg 完全合法的帧照样存不下(PR#712 review:闸接了
+		// Mutate 与两个 CardUpdater 路径,漏了这条,超宽帧直达 INSERT)。
+		if _, cErr = carddispatch.NormalizeFrameForPersistence(normalized); cErr != nil {
+			ba.Warn("InteractiveCard content_edit 超出持久化列宽,拒绝编辑",
+				zap.Error(cErr), zap.String("messageID", req.MessageID),
+				zap.Int("frameBytes", len(normalized)))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}

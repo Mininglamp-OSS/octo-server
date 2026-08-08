@@ -28,6 +28,8 @@ var reasoningStates = []struct {
 const (
 	reasoningVersionV3 = aireasoningprocess.TemplateVersionV3
 	reasoningRootV3    = aireasoningprocess.HandoffRootV3
+	reasoningVersionV4 = aireasoningprocess.TemplateVersionV4
+	reasoningRootV4    = aireasoningprocess.HandoffRootV4
 )
 
 var reasoningVersions = []struct {
@@ -37,9 +39,15 @@ var reasoningVersions = []struct {
 	{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 	{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
 	{reasoningVersionV3, reasoningRootV3},
+	{reasoningVersionV4, reasoningRootV4},
 }
 
+// boundedReasoningVersions skips the pre-#667 V1, which has no bounds to assert.
 var boundedReasoningVersions = reasoningVersions[1:]
+
+// noSubmitReasoningVersions are the versions whose action surface is the local
+// toggle only; V1/V2 still carry their frozen stop/retry Submit contracts.
+var noSubmitReasoningVersions = reasoningVersions[2:]
 
 func newRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
@@ -47,20 +55,25 @@ func newRegistry(t *testing.T) *cardtmpl.Registry {
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	reg.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	reg.RegisterJSON(aireasoningprocess.Assets, reasoningRootV3)
-	reg.SetDefault(aireasoningprocess.TemplateID, reasoningVersionV3)
+	reg.RegisterJSON(aireasoningprocess.Assets, reasoningRootV4)
+	reg.SetDefault(aireasoningprocess.TemplateID, reasoningVersionV4)
 	reg.Freeze()
 	return reg
 }
 
-func TestRegistersAllVersionsAndDefaultsToHiddenControlsSuccessor(t *testing.T) {
+func TestRegistersAllVersionsAndDefaultsToSimplifiedSuccessor(t *testing.T) {
 	reg := newRegistry(t)
+	noSubmit := make(map[string]struct{}, len(noSubmitReasoningVersions))
+	for _, version := range noSubmitReasoningVersions {
+		noSubmit[version.version] = struct{}{}
+	}
 	var versions []string
 	for _, meta := range reg.List() {
 		if meta.ID != aireasoningprocess.TemplateID {
 			continue
 		}
 		versions = append(versions, meta.Version)
-		if meta.Version == reasoningVersionV3 {
+		if _, ok := noSubmit[meta.Version]; ok {
 			if meta.ActionContract != nil {
 				t.Fatalf("%s ActionContract = %+v, want nil", meta.Version, meta.ActionContract)
 			}
@@ -76,21 +89,22 @@ func TestRegistersAllVersionsAndDefaultsToHiddenControlsSuccessor(t *testing.T) 
 		aireasoningprocess.TemplateVersionV1,
 		aireasoningprocess.TemplateVersionV2,
 		reasoningVersionV3,
+		reasoningVersionV4,
 	}
 	if !equalStrings(versions, wantVersions) {
 		t.Fatalf("registered versions = %v, want %v", versions, wantVersions)
 	}
-	if aireasoningprocess.TemplateVersion != reasoningVersionV3 || aireasoningprocess.HandoffRoot != reasoningRootV3 {
+	if aireasoningprocess.TemplateVersion != reasoningVersionV4 || aireasoningprocess.HandoffRoot != reasoningRootV4 {
 		t.Fatalf("current aliases = %s / %s, want %s / %s",
-			aireasoningprocess.TemplateVersion, aireasoningprocess.HandoffRoot, reasoningVersionV3, reasoningRootV3)
+			aireasoningprocess.TemplateVersion, aireasoningprocess.HandoffRoot, reasoningVersionV4, reasoningRootV4)
 	}
 
 	tmpl, err := reg.Lookup(aireasoningprocess.TemplateID, "")
 	if err != nil {
 		t.Fatalf("Lookup(default): %v", err)
 	}
-	if got := tmpl.Meta().Version; got != reasoningVersionV3 {
-		t.Fatalf("default version = %q, want %q", got, reasoningVersionV3)
+	if got := tmpl.Meta().Version; got != reasoningVersionV4 {
+		t.Fatalf("default version = %q, want %q", got, reasoningVersionV4)
 	}
 }
 
@@ -262,39 +276,41 @@ func TestHiddenControlsSuccessorRejectsLegacySubmitIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		state    cardtmpl.State
-		actionID string
-	}{
-		{state: "reasoning", actionID: "reasoning_stop"},
-		{state: "answering", actionID: "reasoning_stop"},
-		{state: "error", actionID: "reasoning_retry"},
-	} {
-		t.Run(string(tc.state)+"/"+tc.actionID, func(t *testing.T) {
-			payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
-				reasoningVersionV3, tc.state, readSample(t, reasoningRootV3, string(tc.state)),
-				cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			encoded, err := json.Marshal(payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, found := cardmsg.SubmitAction(encoded, tc.actionID); found {
-				t.Fatalf("legacy action %q resolved from V3 %s frame", tc.actionID, tc.state)
-			}
-			_, err = catalog.ActionContext(context.Background(), cardtmpl.CatalogActionRequest{
-				CatalogExactRequest: cardtmpl.CatalogExactRequest{
-					Access: cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeActionContext},
-					ID:     aireasoningprocess.TemplateID, Version: reasoningVersionV3,
-				},
-				ActionID: tc.actionID,
+	for _, version := range noSubmitReasoningVersions {
+		for _, tc := range []struct {
+			state    cardtmpl.State
+			actionID string
+		}{
+			{state: "reasoning", actionID: "reasoning_stop"},
+			{state: "answering", actionID: "reasoning_stop"},
+			{state: "error", actionID: "reasoning_retry"},
+		} {
+			t.Run(version.version+"/"+string(tc.state)+"/"+tc.actionID, func(t *testing.T) {
+				payload, err := reg.Render(context.Background(), aireasoningprocess.TemplateID,
+					version.version, tc.state, readSample(t, version.root, string(tc.state)),
+					cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-x"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, found := cardmsg.SubmitAction(encoded, tc.actionID); found {
+					t.Fatalf("legacy action %q resolved from %s %s frame", tc.actionID, version.version, tc.state)
+				}
+				_, err = catalog.ActionContext(context.Background(), cardtmpl.CatalogActionRequest{
+					CatalogExactRequest: cardtmpl.CatalogExactRequest{
+						Access: cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeActionContext},
+						ID:     aireasoningprocess.TemplateID, Version: version.version,
+					},
+					ActionID: tc.actionID,
+				})
+				if !errors.Is(err, cardtmpl.ErrActionUnknown) {
+					t.Fatalf("legacy action %q ActionContext error = %v, want ErrActionUnknown", tc.actionID, err)
+				}
 			})
-			if !errors.Is(err, cardtmpl.ErrActionUnknown) {
-				t.Fatalf("legacy action %q ActionContext error = %v, want ErrActionUnknown", tc.actionID, err)
-			}
-		})
+		}
 	}
 }
 
@@ -339,9 +355,12 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		return func(data map[string]any, value string) { data[key] = value }
 	}
 	tests := []struct {
-		name  string
-		limit int
-		set   func(map[string]any, string)
+		name string
+		// limit is the ceiling shared by every bounded version. perVersion
+		// overrides it for fields whose ceiling diverged across versions.
+		limit      int
+		perVersion func(*testing.T, string) int
+		set        func(map[string]any, string)
 	}{
 		{name: "reasoningId", limit: 512, set: setTop("reasoningId")},
 		{name: "title", limit: 64, set: setTop("title")},
@@ -349,7 +368,7 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 		{name: "timerText", limit: 128, set: setTop("timerText")},
 		{name: "collapsedSummary", limit: 160, set: setTop("collapsedSummary")},
 		{name: "progressText", limit: 160, set: setTop("progressText")},
-		{name: "thought", limit: 281, set: setFirstThought},
+		{name: "thought", perVersion: reasoningThoughtMax, set: setFirstThought},
 		{name: "tool", limit: 81, set: setFirstActionField("tool")},
 		{name: "detail", limit: 192, set: setFirstActionField("detail")},
 		{name: "errorTitle", limit: 64, set: setTop("errorTitle")},
@@ -359,17 +378,21 @@ func TestSuccessorFreeStringBounds(t *testing.T) {
 	for _, version := range boundedReasoningVersions {
 		for i, tc := range tests {
 			t.Run(version.version+"/"+tc.name, func(t *testing.T) {
+				limit := tc.limit
+				if tc.perVersion != nil {
+					limit = tc.perVersion(t, version.version)
+				}
 				unit := units[i%len(units)]
 				exact := readSampleMap(t, version.root, "reasoning")
-				tc.set(exact, strings.Repeat(unit, tc.limit))
+				tc.set(exact, strings.Repeat(unit, limit))
 				if err := renderData(reg, version.version, "reasoning", exact); err != nil {
-					t.Fatalf("exact %d-rune value rejected: %v", tc.limit, err)
+					t.Fatalf("exact %d-rune value rejected: %v", limit, err)
 				}
 
 				over := readSampleMap(t, version.root, "reasoning")
-				tc.set(over, strings.Repeat(unit, tc.limit+1))
+				tc.set(over, strings.Repeat(unit, limit+1))
 				if err := renderData(reg, version.version, "reasoning", over); !errors.Is(err, cardtmpl.ErrFieldsInvalid) {
-					t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", tc.limit+1, err)
+					t.Fatalf("%d-rune value error = %v, want ErrFieldsInvalid", limit+1, err)
 				}
 			})
 		}
@@ -426,7 +449,7 @@ func TestSuccessorWorstCaseRendersEveryView(t *testing.T) {
 				data["progressText"] = strings.Repeat("进", 160)
 				data["errorTitle"] = strings.Repeat("错", 64)
 				data["errorMessage"] = strings.Repeat("误", 121)
-				data["phases"] = worstCasePhases()
+				data["phases"] = worstCasePhases(reasoningThoughtMax(t, version.version))
 
 				if err := renderData(reg, version.version, tc.state, data); err != nil {
 					t.Fatalf("worst-case %s render: %v", tc.state, err)
@@ -491,11 +514,11 @@ func phasesWithActionCounts(counts ...int) []any {
 	return phases
 }
 
-func worstCasePhases() []any {
+func worstCasePhases(thoughtMax int) []any {
 	phases := phasesWithActionCounts(3, 2, 2, 2, 2, 2)
 	for _, rawPhase := range phases {
 		phase := rawPhase.(map[string]any)
-		phase["thought"] = strings.Repeat("思", 281)
+		phase["thought"] = strings.Repeat("思", thoughtMax)
 		for _, rawAction := range phase["actions"].([]any) {
 			action := rawAction.(map[string]any)
 			action["tool"] = strings.Repeat("工", 81)
@@ -504,6 +527,38 @@ func worstCasePhases() []any {
 	}
 	return phases
 }
+
+// reasoningThoughtMax is the per-version `phases[].thought` *accept* ceiling —
+// the schema maxLength above which a payload is rejected outright. V2/V3 pinned it
+// to the producer's observed output (280 + `…` = 281) and have no truncation, so
+// for them accept == display. V4 separates the two: it accepts up to 4001 and
+// clamps to reasoningThoughtDisplayMax at render time, so an over-long summary
+// degrades to truncated text instead of failing the card.
+//
+// Keyed explicitly per version and fatal on an unknown one: a default would
+// silently bless a future version that narrowed the bound back down, since the
+// bounds table would still pass.
+func reasoningThoughtMax(t *testing.T, version string) int {
+	t.Helper()
+	switch version {
+	case aireasoningprocess.TemplateVersionV2, reasoningVersionV3:
+		return 281
+	case reasoningVersionV4:
+		return 4001
+	default:
+		t.Fatalf("reasoningThoughtMax: unhandled version %q — add its ceiling explicitly", version)
+		return 0
+	}
+}
+
+// reasoningThoughtDisplayMax is V4's rendered ceiling, declared in the schema as
+// x-octo-constraints.truncateStrings. It is what actually bounds the frame, so it
+// — not the accept ceiling — is the number the persistence budget is sized against.
+const reasoningThoughtDisplayMax = 400
+
+// reasoningThoughtTruncates reports whether a version clamps instead of rejecting
+// above its display ceiling. Only V4 does.
+func reasoningThoughtTruncates(version string) bool { return version == reasoningVersionV4 }
 
 func renderData(reg *cardtmpl.Registry, version string, state cardtmpl.State, data map[string]any) error {
 	raw, err := json.Marshal(data)

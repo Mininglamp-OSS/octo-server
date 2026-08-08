@@ -384,6 +384,17 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	{
 		// messages.PUT("/:message_id/voicereaded", m.voiceReaded)
 		messages.GET("/:message_id/receipt", m.messageReceiptList) // 消息回执列表
+		// 单聊(DM)单条消息直查：peer_uid=对端 uid，服务端用调用者 loginUID 与之
+		// 对称派生 fakeChannelID 后查询（详见 getPersonMessage）。与群/子区直查并列。
+		//
+		// SpaceMiddleware(handler 级)：Person 是跨 Space 共享的同一物理频道，
+		// 单条 DM 读必须与 /v1/message/channel/sync 的 filterPersonMessagesBySpace
+		// 走同一套 personSpaceAllows 空间隔离（issue #484 / YUJ-219-A / GH#1283），
+		// 否则一方在非默认 Space 里可以按 msg_id 反查到 sync 路径会隐藏的跨 Space
+		// DM 消息元数据（含 ObjectPath / uploader / SystemBot 老消息等）。挂在
+		// 这条 handler 上而不是整个组，是为了不影响 /:message_id/receipt。
+		messages.GET("/person/:peer_uid/:message_id",
+			spacepkg.SpaceMiddleware(m.ctx), m.getPersonMessage)
 	}
 	// 回应。挂 SpaceMiddleware：Person(DM)是跨 Space 共享的同一物理频道，
 	// reaction 读/写必须与 /v1/message 一样按已校验的 Space 隔离 DM 消息，

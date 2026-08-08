@@ -40,6 +40,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/integration"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/messages_search"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/notify"

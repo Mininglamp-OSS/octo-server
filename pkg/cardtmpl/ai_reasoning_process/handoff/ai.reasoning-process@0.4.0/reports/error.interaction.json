@@ -1,0 +1,13 @@
+{
+  "actions": [
+    {
+      "id": "reasoning_toggle",
+      "type": "Action.ToggleVisibility"
+    },
+    {
+      "id": "reasoning_toggle_expanded_action",
+      "type": "Action.ToggleVisibility"
+    }
+  ],
+  "inputs": []
+}

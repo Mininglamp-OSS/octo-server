@@ -125,10 +125,12 @@ func TestInitializeRuntimeCatalogAcceptsRegisteredStaticReasoningTargets(t *test
 	registry := cardtmpl.NewRegistry()
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV4)
 	registry.Freeze()
 	store := &startupStoreStub{targets: []startupActivationTarget{
 		{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV2},
 		{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV3},
+		{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersionV4},
 	}}
 	api := &API{store: store, registry: registry}
 	api.validateStateTarget = api.validateTarget

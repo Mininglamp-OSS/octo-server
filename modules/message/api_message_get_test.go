@@ -585,3 +585,276 @@ func TestGetThreadMessage_InvalidShortID(t *testing.T) {
 	w := doGet(t, s, fmt.Sprintf("/v1/groups/%s/threads/abc/messages/1", groupNo))
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 }
+
+// ---------- Person (DM) ----------
+
+const personPeerUID = "peer_user_1"
+
+// TestGetPersonMessage_Success：DM 一方能按 (peer_uid, message_id) 取到消息。
+// 消息物理落在 fakeChannelID = GetFakeChannelIDWith(loginUID, peerUID)、type=Person。
+func TestGetPersonMessage_Success(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx, _ := setupGroupTestData(t)
+	fakeChannelID := common.GetFakeChannelIDWith(testutil.UID, personPeerUID)
+	const mid int64 = 7001
+	insertGroupMessage(t, ctx, fakeChannelID, common.ChannelTypePerson.Uint8(), mid)
+
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/%d", personPeerUID, mid))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp MsgSyncResp
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, mid, resp.MessageID)
+	assert.Equal(t, fakeChannelID, resp.ChannelID)
+	assert.Equal(t, common.ChannelTypePerson.Uint8(), resp.ChannelType)
+}
+
+// TestGetPersonMessage_NotParticipant：非该 DM 一方查不到——调用者(testutil.UID)
+// 与 peer 派生的 fakeChannelID 不同于消息实际所在的 (otherA, otherB) 频道，命中不到。
+func TestGetPersonMessage_NotParticipant(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx, _ := setupGroupTestData(t)
+	// 消息属于 otherA<->otherB 的 DM，与登录用户无关。
+	otherChannelID := common.GetFakeChannelIDWith("other_a", "other_b")
+	const mid int64 = 7002
+	insertGroupMessage(t, ctx, otherChannelID, common.ChannelTypePerson.Uint8(), mid)
+
+	// 登录用户尝试用 peer=other_b 取——派生的 fakeChannelID(loginUID<->other_b) 不等于
+	// otherChannelID(other_a<->other_b)，查不到 → 404。
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/%d", "other_b", mid))
+	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+}
+
+// TestGetPersonMessage_SelfRejected：禁止自聊(peer == self)。
+func TestGetPersonMessage_SelfRejected(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, _, _ := setupGroupTestData(t)
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/1", testutil.UID))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+}
+
+// TestGetPersonMessage_InvalidMessageID：message_id 非正整数 → 400。
+func TestGetPersonMessage_InvalidMessageID(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, _, _ := setupGroupTestData(t)
+	w := doGet(t, s, fmt.Sprintf("/v1/messages/person/%s/notanumber", personPeerUID))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+}
+
+// TestPersonSpaceAllows_Rules 直接固定 personSpaceAllows 的 5 条规则，与
+// filterPersonMessagesBySpace 头注释里的口径一一对应。这条 helper 是 DM
+// 单条读 (getPersonMessage) / DM 同步 (filterPersonMessagesBySpace) /
+// reaction (syncReaction/addOrCancelReaction) 共用的 Space 隔离核心闸门，
+// 任何一处走漏都是 issue #484 / YUJ-219-A / GH#1283 回归。helper 级 unit test，
+// 不依赖 DB / migration，永远可执行；抓「谁把 DM 空间过滤逻辑改破了」的
+// 单元金丝雀。
+func TestPersonSpaceAllows_Rules(t *testing.T) {
+	const (
+		curSpace     = "space-A"
+		otherSpace   = "space-B"
+		defaultSpace = "space-A"
+	)
+	tests := []struct {
+		name         string
+		msgSpaceID   string
+		isSystemBot  bool
+		spaceID      string
+		defaultSpace string
+		want         bool
+	}{
+		// 规则 1：精确匹配 → 保留
+		{"exact match", curSpace, false, curSpace, defaultSpace, true},
+		// 规则 2：无标签 && 非 SystemBot && 当前=默认 Space → 保留（向前兼容）
+		{"unlabeled non-bot in default space", "", false, curSpace, defaultSpace, true},
+		// 规则 3：无标签 && 非 SystemBot && 当前 != 默认 Space → 丢弃
+		{"unlabeled non-bot in non-default space", "", false, otherSpace, defaultSpace, false},
+		// 规则 4：无标签 && SystemBot → 丢弃（老 fileHelper / u_10000 消息不跨 Space 泄露）
+		{"unlabeled system bot", "", true, curSpace, defaultSpace, false},
+		// 规则 5：跨 Space 标签 → 丢弃
+		{"cross-space labeled", otherSpace, false, curSpace, defaultSpace, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := personSpaceAllows(tc.msgSpaceID, tc.isSystemBot, tc.spaceID, tc.defaultSpace)
+			assert.Equal(t, tc.want, got,
+				"personSpaceAllows(msg=%q, sysbot=%v, cur=%q, default=%q)",
+				tc.msgSpaceID, tc.isSystemBot, tc.spaceID, tc.defaultSpace)
+		})
+	}
+}
+
+// TestPersonFakeChannelIDNotDoubleFaked 固定「Person DM 频道 ID 只 fake 一次」
+// 的核心不变式。lookupChannelOffsetSeq 内部对 channelType==Person 会做
+// GetFakeChannelIDWith(channelID, loginUID)，期望入参是 peer uid 而非已经
+// fake 好的 fakeChannelID；如果调用方（如 respondSingleMessage 之前对 Person
+// 传的是 fakeChannelID）不做短路，就会二次 fake，产生错误的 lookup key、
+// 静默把 channel-level offset 归 0，channel-offset-truncated 的 DM 消息又能
+// 被读到——这是 PR #708 review 抓到的第二条 blocking 的技术根因。
+//
+// 这个 helper 级测试固定该不变式：一旦有人把 respondSingleMessage 里对
+// Person 短路 channel-offset 的分支拆掉、或改变 GetFakeChannelIDWith 的对称
+// 语义，assertion 立即失败。
+func TestPersonFakeChannelIDNotDoubleFaked(t *testing.T) {
+	const (
+		loginUID = "user_login"
+		peerUID  = "user_peer"
+	)
+	fake1 := common.GetFakeChannelIDWith(loginUID, peerUID)
+	// 二次 fake（如果调用者错误地把 fake1 传给 lookupChannelOffsetSeq、
+	// 让它内部再做一次 GetFakeChannelIDWith(fake1, loginUID)）产生的 key。
+	fake2 := common.GetFakeChannelIDWith(fake1, loginUID)
+
+	// 反证：二次 fake 的 key 与真实的 fakeChannelID 不同——这是 lookupChannelOffsetSeq
+	// 现在必须无条件用 channelID (而非再 fake) 的原因 (api_message_get.go
+	// lookupChannelOffsetSeq)。如果这个不等式被打破，helper 的 caller 契约需要
+	// 重新审视。
+	assert.NotEqual(t, fake1, fake2,
+		"double-faked Person channelID must differ from the real fakeChannelID; "+
+			"if this becomes equal, lookupChannelOffsetSeq's caller contract needs revisiting")
+
+	// 常规（非碰撞）情况下的对称性——GetFakeChannelIDWith 用 CRC32 排序两侧 uid，
+	// 无碰撞时两个 uid 生成同一 key。多数正常场景走这条分支。
+	assert.Equal(t, fake1, common.GetFakeChannelIDWith(peerUID, loginUID),
+		"GetFakeChannelIDWith should be symmetric across the two DM sides "+
+			"when their CRC32 hashes differ")
+}
+
+// TestPersonFakeChannelIDCollisionOrderMatters 固定 CRC32 碰撞时
+// GetFakeChannelIDWith 的**参数顺序敏感性**——碰撞会走 `toUID@fromUID` fallthrough，
+// 因此 (A,B) 与 (B,A) 会得到不同 key。所有 Person 相关调用者必须与 sibling
+// 保持参数顺序一致 (统一为 `(peer_uid, login_uid)`，参见 api.go:1439 sync 路径)，
+// 否则同一对话的读 / 写路径会为同一对 uid 生成不同 key、发生"写入的消息读不出来"
+// 的静默 miss——PR #708 review round 2 P2 抓到的坑。
+//
+// 该测试用 review 提供的真实碰撞对 u_xgnb / u_cr7xslzj（CRC32 == 3955193408）。
+// 只要 CRC32 算法或 GetFakeChannelIDWith fallthrough 逻辑没变，测试就有效；
+// 如果哪天上游库改了 tie-breaking 让对称性也成立，assertion 会失败，
+// 提示我们可以放宽对参数顺序的约束。
+func TestPersonFakeChannelIDCollisionOrderMatters(t *testing.T) {
+	const (
+		uidA = "u_xgnb"
+		uidB = "u_cr7xslzj"
+	)
+	// review 里提到 CRC32(uidA) == CRC32(uidB) == 3955193408，导致 tie。
+	// 直接调 GetFakeChannelIDWith 两种顺序，如果 tie 逻辑仍是 fallthrough，
+	// 两个结果不同——本测试的核心断言。
+	keyAB := common.GetFakeChannelIDWith(uidA, uidB)
+	keyBA := common.GetFakeChannelIDWith(uidB, uidA)
+	assert.NotEqual(t, keyAB, keyBA,
+		"CRC32-tied uids currently produce order-sensitive fake channel IDs "+
+			"(GetFakeChannelIDWith falls through to toUID@fromUID on tie); "+
+			"all Person callers must therefore align parameter order with siblings "+
+			"(canonical order = (peer_uid, login_uid), see api.go:1439). "+
+			"If this assertion fails, the upstream library changed its tie-breaking; "+
+			"the order-alignment requirement can then be relaxed.")
+}
+
+// TestPersonDMAccessDecision 覆盖 checkPersonDMAccess 的纯决策核心
+// personDMAccessDecision 所有 8 条决策路径。这个测试**不依赖 DB**——
+// checkPersonDMAccess 已经把 DB 查询和决策逻辑拆开，orchestration 层负责
+// 收集 DB 数据 → 决策纯函数负责判定。PR #708 review round 3 明确要求：
+// "add a DB-free table test for checkPersonDMAccess over the six decision
+// cases, in the style of TestPersonSpaceAllows_Rules"——本测试满足该要求，
+// 且比 6 case 更全（覆盖了 SystemBot 短路 + own bot 单独分支）。
+//
+// 决策规则源码见 personDMAccessDecision 头注释。任何决策规则修改，
+// 这个表就该跟着更新——它是"允许 vs 拒绝"契约的可执行文档。
+func TestPersonDMAccessDecision(t *testing.T) {
+	const (
+		me    = "user_login"
+		peer  = "user_peer"
+		other = "user_other"
+	)
+	cases := []struct {
+		name string
+		in   personDMAccessInputs
+		want personDMAccessResult
+	}{
+		{
+			name: "notes_to_self",
+			in:   personDMAccessInputs{loginUID: me, peerUID: me},
+			want: personDMAllowNotesToSelf,
+		},
+		{
+			name: "system_bot_allowed",
+			// fileHelper / botfather / u_10000 / notification 都走这条：
+			// SystemBot=true 直接短路到 blacklist；无被拉黑则放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: "fileHelper", isSystemBot: true},
+			want: personDMAllowSystemBot,
+		},
+		{
+			name: "system_bot_blocked_by_me",
+			// 用户拉黑 SystemBot 仍生效——防骚扰边界，符合 checkP2PAccess Step 3。
+			in:   personDMAccessInputs{loginUID: me, peerUID: "fileHelper", isSystemBot: true, blockedByMe: true},
+			want: personDMDenyBlacklist,
+		},
+		{
+			name: "own_bot_skips_all",
+			// 自己创建的 bot：跳过 Space / friend / blacklist。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: me},
+			want: personDMAllowOwnBot,
+		},
+		{
+			name: "own_bot_ignores_blacklist",
+			// 即使 blockedByMe/blockedByPeer 为 true，own bot 也直接放行
+			// （因为 personDMAccessDecision 在 own bot 分支就 return，不检查 blacklist）。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: me, blockedByMe: true, blockedByPeer: true},
+			want: personDMAllowOwnBot,
+		},
+		{
+			name: "other_bot_friend_allowed",
+			// 别人的 bot：需要好友关系；有 friend → 通过 blacklist → 放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: true},
+			want: personDMAllowOtherBotFriend,
+		},
+		{
+			name: "other_bot_no_friend_denied",
+			// 别人的 bot 不是好友 → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: false},
+			want: personDMDenyOtherBotNotFriend,
+		},
+		{
+			name: "other_bot_friend_but_blocked",
+			// 别人的 bot 是好友但双向 blacklist 存在 → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, isRobot: true, creatorUID: other, isFriend: true, blockedByPeer: true},
+			want: personDMDenyBlacklist,
+		},
+		{
+			name: "real_user_same_space",
+			// 真人 + 同 Space → 放行（企业模式 friend 表可能为空）。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: true},
+			want: personDMAllowRealUserSameSpace,
+		},
+		{
+			name: "real_user_friend_no_space_optin",
+			// 未 opt-in Space（spaceID=""）+ 好友 → 放行。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "", isFriend: true},
+			want: personDMAllowRealUserFriend,
+		},
+		{
+			name: "real_user_no_space_no_friend",
+			// 真人 + 无 Space + 非好友 → 404。这正是 issue #484 / YUJ-219-A 关注的边界。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "", isFriend: false},
+			want: personDMDenyRealUserNoRelation,
+		},
+		{
+			name: "real_user_space_not_member_but_friend",
+			// 有 spaceID 但两人不在同一 Space；好友兜底放行——这是 checkP2PAccess
+			// 明说的"same-space OR friend"："或"关系。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: false, isFriend: true},
+			want: personDMAllowRealUserFriend,
+		},
+		{
+			name: "real_user_same_space_blocked",
+			// 真人同 Space 但双向 blacklist → 404。
+			in:   personDMAccessInputs{loginUID: me, peerUID: peer, spaceID: "s1", sameSpace: true, blockedByMe: true},
+			want: personDMDenyBlacklist,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := personDMAccessDecision(tc.in)
+			assert.Equal(t, tc.want, got, "case %q: unexpected decision", tc.name)
+		})
+	}
+}

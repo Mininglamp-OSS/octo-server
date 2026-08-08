@@ -271,7 +271,7 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if u == "" {
 			return fmt.Errorf("%w: Image.url 必填", ErrCardBadShape)
 		}
-		if err := checkURL(u); err != nil {
+		if err := checkImageURL(u); err != nil {
 			return err
 		}
 	case "Container":
@@ -621,7 +621,7 @@ func (w *walker) imageChild(img map[string]interface{}, depth int) error {
 	if u == "" {
 		return fmt.Errorf("%w: ImageSet.images[].url 必填", ErrCardBadShape)
 	}
-	return checkURL(u)
+	return checkImageURL(u)
 }
 
 // column 校验 ColumnSet 中的单列。AC 允许 Column 省略 type 字段；显式给出时必须

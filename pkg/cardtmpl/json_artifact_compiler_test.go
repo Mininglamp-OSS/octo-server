@@ -467,6 +467,111 @@ const (
 	validArtifactProperties  = `{"title":{"type":"string","maxLength":32},"groups":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"properties":{"items":{"type":"array","maxItems":2,"items":{"type":"string","maxLength":8}}}}}}`
 )
 
+// truncateStrings lets an artifact declare a *display* ceiling below the schema's
+// *accept* ceiling, so an over-long value renders truncated instead of failing the
+// card. It is opt-in per field, so the compiler has to refuse declarations that
+// would silently soften a bound or point at nothing — otherwise "truncate" becomes
+// a way to smuggle past fail-close validation.
+func TestCompileJSONArtifactRejectsInvalidTruncateStrings(t *testing.T) {
+	constraintWith := func(entry string) string {
+		return `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}],` +
+			`"truncateStrings":[` + entry + `]}`
+	}
+	for _, tc := range []struct {
+		name  string
+		entry string
+		want  string
+	}{{
+		name:  "display ceiling above the accept ceiling",
+		entry: `{"field":"title","maxRunes":64,"ellipsis":"…"}`,
+		want:  "exceeds the schema maxLength",
+	}, {
+		name:  "field is not declared in the schema",
+		entry: `{"field":"nosuch","maxRunes":8,"ellipsis":"…"}`,
+		want:  "not a declared property",
+	}, {
+		name:  "field is not a string",
+		entry: `{"field":"groups","maxRunes":8,"ellipsis":"…"}`,
+		want:  `want string`,
+	}, {
+		name:  "target field has no accept ceiling to sit under",
+		entry: `{"arrayField":"groups","field":"items","maxRunes":4,"ellipsis":"…"}`,
+		want:  "want string",
+	}, {
+		name:  "ellipsis alone would fill the budget",
+		entry: `{"field":"title","maxRunes":1,"ellipsis":"…"}`,
+		want:  "must be shorter than maxRunes",
+	}, {
+		name:  "non-positive maxRunes",
+		entry: `{"field":"title","maxRunes":0,"ellipsis":"…"}`,
+		want:  "maxRunes must be positive",
+	}, {
+		name:  "unknown key",
+		entry: `{"field":"title","maxRunes":8,"suffix":"…"}`,
+		want:  "unknown key",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle := validJSONArtifactBundle()
+			bundle.Schema = json.RawMessage(fmt.Sprintf(
+				`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+					`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+				validArtifactProperties, constraintWith(tc.entry),
+			))
+			_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+			if err == nil {
+				t.Fatalf("compiled an artifact with %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// The happy path: a declared display ceiling clamps at render time, and the value
+// is accepted rather than rejected — the behaviour ai.reasoning-process@0.4.0 relies
+// on for `phases[].thought`.
+func TestCompileJSONArtifactTruncatesDeclaredStringAtRender(t *testing.T) {
+	bundle := validJSONArtifactBundle()
+	bundle.Schema = json.RawMessage(fmt.Sprintf(
+		`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+			`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+		validArtifactProperties,
+		`{"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}],`+
+			`"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+	))
+	artifact, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	if err != nil {
+		t.Fatalf("CompileJSONArtifact: %v", err)
+	}
+
+	// 32 is the accept ceiling; 8 the display one. A 20-rune title must render as
+	// 7 runes + the ellipsis, not be refused.
+	fields := json.RawMessage(`{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`)
+	card, err := artifact.Template.Build(context.Background(), "shown", fields, BuildEnv{Lang: "en-US"})
+	if err != nil {
+		t.Fatalf("Build with an over-display-ceiling title: %v", err)
+	}
+	encoded, err := json.Marshal(card.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(encoded); !strings.Contains(got, `"aaaaaaa…"`) {
+		t.Fatalf("body = %s, want the title clamped to 7 runes + ellipsis", got)
+	}
+
+	// At or under the display ceiling nothing changes.
+	exact := json.RawMessage(`{"title":"aaaaaaaa","groups":[{"items":["a"]}]}`)
+	card, err = artifact.Template.Build(context.Background(), "shown", exact, BuildEnv{Lang: "en-US"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ = json.Marshal(card.Body)
+	if got := string(encoded); !strings.Contains(got, `"aaaaaaaa"`) || strings.Contains(got, "…") {
+		t.Fatalf("body = %s, want the exact-length title untouched", got)
+	}
+}
+
 func validJSONArtifactBundle() Bundle {
 	return Bundle{
 		Catalog: CatalogDescriptor{
@@ -532,4 +637,229 @@ func (t *goConstraintTemplate) Build(context.Context, State, json.RawMessage, Bu
 }
 func (t *goConstraintTemplate) FallbackText(State, json.RawMessage, string) (string, error) {
 	return "test", nil
+}
+
+// The two x-octo-constraints declarations are independently optional. This used to
+// be false: parseAggregateArrayLimits required aggregateArrayLimits whenever the
+// block existed, so an artifact that only wanted a display ceiling could not compile
+// (PR#712 review). An empty block stays an error — it declares nothing, so it is
+// always a mistake rather than a deliberate no-op.
+func TestCompileJSONArtifactConstraintsAreIndependentlyOptional(t *testing.T) {
+	compile := func(t *testing.T, constraints string) (*CompiledArtifact, error) {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		schema := `{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",` +
+			`"additionalProperties":false,"required":["title"],"properties":` + validArtifactProperties
+		if constraints != "" {
+			schema += `,"x-octo-constraints":` + constraints
+		}
+		bundle.Schema = json.RawMessage(schema + `}`)
+		return CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	}
+
+	const aggregate = `"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}]`
+	const truncate = `"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]`
+
+	for _, tc := range []struct{ name, constraints string }{
+		{"no constraints block at all", ""},
+		{"aggregate limits only", `{` + aggregate + `}`},
+		{"truncations only", `{` + truncate + `}`},
+		{"both", `{` + aggregate + `,` + truncate + `}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := compile(t, tc.constraints); err != nil {
+				t.Fatalf("CompileJSONArtifact(%s): %v", tc.name, err)
+			}
+		})
+	}
+
+	t.Run("empty block is refused", func(t *testing.T) {
+		_, err := compile(t, `{}`)
+		if err == nil {
+			t.Fatal("compiled an artifact whose x-octo-constraints declares nothing")
+		}
+		if !strings.Contains(err.Error(), "at least one constraint") {
+			t.Fatalf("error = %q, want it to name the empty declaration", err.Error())
+		}
+	})
+
+	// Truncation must actually take effect when declared alone — otherwise the key
+	// would parse but the engine would ignore it, which is worse than rejecting it.
+	t.Run("truncation alone still clamps at render", func(t *testing.T) {
+		artifact, err := compile(t, `{`+truncate+`}`)
+		if err != nil {
+			t.Fatalf("CompileJSONArtifact: %v", err)
+		}
+		fields := json.RawMessage(`{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`)
+		card, err := artifact.Template.Build(context.Background(), "shown", fields, BuildEnv{Lang: "en-US"})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		encoded, err := json.Marshal(card.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(encoded); !strings.Contains(got, `"aaaaaaa…"`) {
+			t.Fatalf("body = %s, want the title clamped to 7 runes + ellipsis", got)
+		}
+	})
+}
+
+// 声明了展示上限之后，goldens 必须记录**渲染器真正吐出的**字节。这两条路以前是分开的：
+// checkArtifactGoldens 直接展开原始样本，而 jsonTemplate.Build 先截断再展开，所以一个
+// 超过自身展示上限的样本会让 goldens 记下生产永不产出的字节（PR#712 review P2-1）。
+// goldens 是产物唯一的字节级记录，而「匹配的 golden 洗不白伪造的控件」这条论证依赖
+// selfCheckCompiledJSON 与 golden 检查看的是同一帧 —— 两边口径不同这条论证就塌了。
+func TestCompileJSONArtifactGoldensSeeTheTruncatedRender(t *testing.T) {
+	// 样本 title 是 20 个 a，展示上限 8 ⇒ 渲染结果是 7 个 a + 省略号。
+	const sample = `{"title":"aaaaaaaaaaaaaaaaaaaa","groups":[{"items":["a"]}]}`
+	const truncated = `aaaaaaa…`
+	const untruncated = `aaaaaaaaaaaaaaaaaaaa`
+
+	build := func(t *testing.T, goldenText string) (*CompiledArtifact, error) {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		bundle.Schema = json.RawMessage(fmt.Sprintf(
+			`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+				`"additionalProperties":false,"required":["title"],"properties":%s,`+
+				`"x-octo-constraints":{"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}}`,
+			validArtifactProperties,
+		))
+		bundle.Samples["shown"] = json.RawMessage(sample)
+		bundle.Goldens["shown"] = json.RawMessage(fmt.Sprintf(
+			`{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":%q,"wrap":true}]}`,
+			goldenText))
+		return CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+	}
+
+	// 记录截断后字节的 golden 必须通过 —— 那才是生产字节。
+	if _, err := build(t, truncated); err != nil {
+		t.Fatalf("golden recording the truncated render should compile: %v", err)
+	}
+
+	// 记录未截断字节的 golden 必须被拒。这正是修复前会被接受的情形。
+	_, err := build(t, untruncated)
+	if err == nil {
+		t.Fatal("golden recording the UNtruncated expansion compiled — the golden gate is not " +
+			"looking at what the renderer emits, so goldens can record bytes production never sends")
+	}
+	if !strings.Contains(err.Error(), "does not match golden") {
+		t.Fatalf("error = %q, want a golden mismatch", err.Error())
+	}
+}
+
+// x-octo-constraints 里的字符串字段必须**显式**按类型读。可选字段（arrayField /
+// ellipsis）尤其如此：用 `v, _ := entry[k].(string)` 会把「类型不对」映射到与「键不存在」
+// 相同的 ""，于是声明的语义被静默改写，编译期无错、渲染期无信号。
+//
+// 具体后果（#712 follow-up）：非字符串 arrayField 变 "" 后，截断从 phases[].thought
+// 重定向到一个不存在的顶层 thought —— **声明的展示上限彻底停止生效**，而这正是
+// truncateStrings 存在的唯一目的。非字符串 ellipsis 变 "" 则静默丢掉省略号，截断过的值
+// 与本来就短的值再也分不出来。
+func TestCompileJSONArtifactRejectsWrongTypedConstraintFields(t *testing.T) {
+	compile := func(t *testing.T, constraints string) error {
+		t.Helper()
+		bundle := validJSONArtifactBundle()
+		bundle.Schema = json.RawMessage(fmt.Sprintf(
+			`{"$schema":"http://json-schema.org/draft-07/schema#","type":"object",`+
+				`"additionalProperties":false,"required":["title"],"properties":%s,"x-octo-constraints":%s}`,
+			validArtifactProperties, constraints,
+		))
+		_, err := CompileJSONArtifact(context.Background(), bundle, DefaultCompileLimits())
+		return err
+	}
+
+	const aggregate = `"aggregateArrayLimits":[{"parentArray":"groups","childArray":"items","maxTotalItems":2}]`
+
+	for _, tc := range []struct{ name, constraints, want string }{
+		// 两个可选字段：这两条是真正的 fail-open，修复前**编译通过**。
+		{
+			name:        "arrayField 是数字",
+			constraints: `{"truncateStrings":[{"arrayField":7,"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be a string",
+		},
+		{
+			name:        "arrayField 是布尔",
+			constraints: `{"truncateStrings":[{"arrayField":false,"field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be a string",
+		},
+		{
+			name:        "ellipsis 是数字",
+			constraints: `{"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":3}]}`,
+			want:        "ellipsis must be a string",
+		},
+		// 必填字段：修复前靠下游 `== ""` 偶然挡住，但把类型错误报成「is required」。
+		{
+			name:        "field 是数字",
+			constraints: `{"truncateStrings":[{"field":9,"maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must be a string",
+		},
+		{
+			name:        "field 缺失",
+			constraints: `{"truncateStrings":[{"maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field is required",
+		},
+		// 空串与未 trim 是两条不同的规则，消息不能互相指控（review of #716）。
+		{
+			name:        "field 是空串",
+			constraints: `{"truncateStrings":[{"field":"","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must not be empty",
+		},
+		{
+			name:        "field 前后有空白",
+			constraints: `{"truncateStrings":[{"field":" title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "field must be trimmed",
+		},
+		// arrayField 是 schema 路径，未 trim 永远匹配不上属性名，所以照旧要求 trim。
+		{
+			name:        "arrayField 前后有空白",
+			constraints: `{"truncateStrings":[{"arrayField":"groups ","field":"title","maxRunes":8,"ellipsis":"…"}]}`,
+			want:        "arrayField must be trimmed",
+		},
+		{
+			name:        "parentArray 是数字",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":1,"childArray":"items","maxTotalItems":2}]}`,
+			want:        "parentArray must be a string",
+		},
+		{
+			name:        "childArray 是对象",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":"groups","childArray":{},"maxTotalItems":2}]}`,
+			want:        "childArray must be a string",
+		},
+		{
+			name:        "childArray 缺失",
+			constraints: `{"aggregateArrayLimits":[{"parentArray":"groups","maxTotalItems":2}]}`,
+			want:        "childArray is required",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := compile(t, tc.constraints)
+			if err == nil {
+				t.Fatalf("类型错误的 %s 编译通过了 —— 声明会被静默改写语义", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// 反向：合法的省略 arrayField / ellipsis 必须继续通过，否则这次收紧就把可选性也一起收掉了。
+	//
+	// **ellipsis 不做 trim 要求**：它是展示文本而非 schema 路径，#716 之前的解析器逐字使用它，
+	// 而 " …"（前导空格的省略号）是合法的排版选择。给它加 trim 会把一个**类型正确**的值从
+	// 接受变成拒绝 —— 超出「只有 present-but-wrong-typed 才报错」这个本次改动自己声明的
+	// 契约（review of #716 抓到这处过度收紧）。所以这里正面钉住它仍被接受。
+	for _, tc := range []struct{ name, constraints string }{
+		{"省略 arrayField（顶层字段）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"…"}]}`},
+		{"省略 ellipsis（无省略号截断）", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8}]}`},
+		{"ellipsis 前导空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":" …"}]}`},
+		{"ellipsis 尾随空格", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"… "}]}`},
+		{"ellipsis 含换行", `{` + aggregate + `,"truncateStrings":[{"field":"title","maxRunes":8,"ellipsis":"...\n"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := compile(t, tc.constraints); err != nil {
+				t.Fatalf("合法的省略应通过：%v", err)
+			}
+		})
+	}
 }

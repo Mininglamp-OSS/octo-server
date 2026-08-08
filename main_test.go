@@ -156,7 +156,7 @@ func TestAccessLogIgnorePathsIncludesProbeEndpoints(t *testing.T) {
 	require.Contains(t, paths, "/v1/ready")
 }
 
-func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV3Default(t *testing.T) {
+func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV4Default(t *testing.T) {
 	previousRegistry := cardtmpl.DefaultRegistry()
 	previousRegisterer := prometheus.DefaultRegisterer
 	previousGatherer := prometheus.DefaultGatherer
@@ -182,11 +182,12 @@ func TestInstallCardTmplRegistryRegistersReasoningHistoryAndV3Default(t *testing
 		aireasoningprocess.TemplateVersionV1,
 		aireasoningprocess.TemplateVersionV2,
 		aireasoningprocess.TemplateVersionV3,
+		aireasoningprocess.TemplateVersionV4,
 	}, versions)
 
 	current, err := registry.Lookup(aireasoningprocess.TemplateID, "")
 	require.NoError(t, err)
-	require.Equal(t, aireasoningprocess.TemplateVersionV3, current.Meta().Version)
+	require.Equal(t, aireasoningprocess.TemplateVersionV4, current.Meta().Version)
 	for _, version := range versions {
 		_, err := registry.Lookup(aireasoningprocess.TemplateID, version)
 		require.NoError(t, err)

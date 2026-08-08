@@ -121,6 +121,7 @@ func TestBotMessageEditRegistryTemplateKeepsHistoricalVersionsEditable(t *testin
 	}{
 		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+		{aireasoningprocess.TemplateVersionV3, aireasoningprocess.HandoffRootV3},
 	} {
 		t.Run(historical.version, func(t *testing.T) {
 			mutator := &fakeBotCardMutator{
@@ -487,12 +488,14 @@ func initialRegistryEnvelopeVersion(
 	state string,
 ) []byte {
 	t.Helper()
-	root := testReasoningRootV3
+	root := testReasoningRootCurrent
 	switch version {
 	case aireasoningprocess.TemplateVersionV1:
 		root = aireasoningprocess.HandoffRootV1
 	case aireasoningprocess.TemplateVersionV2:
 		root = aireasoningprocess.HandoffRootV2
+	case aireasoningprocess.TemplateVersionV3:
+		root = aireasoningprocess.HandoffRootV3
 	}
 	data := testReasoningDataVersion(t, root, state)
 	env := cardtmplBuildEnvForTest()

@@ -134,7 +134,7 @@ func TestAdvertisedRef_UnknownTemplateIsNotAdvertised(t *testing.T) {
 		t.Fatal("AdvertisedRef returned a ref for a template that is not advertised to bots")
 	}
 	if ref, ok := catalog.AdvertisedRef(aireasoningprocess.TemplateID); !ok ||
-		ref.Version != aireasoningprocess.TemplateVersionV3 {
+		ref.Version != aireasoningprocess.TemplateVersionV4 {
 		t.Fatalf("AdvertisedRef(%s) = %#v ok=%v", aireasoningprocess.TemplateID, ref, ok)
 	}
 }

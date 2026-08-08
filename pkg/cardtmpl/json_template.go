@@ -20,6 +20,7 @@ type jsonTemplate struct {
 	meta                 TemplateMeta
 	viewAST              map[ViewKey]any
 	aggregateArrayLimits []jsonTemplateAggregateArrayLimit
+	stringTruncations    []jsonTemplateStringTruncation
 }
 
 type jsonTemplateFieldValidator interface {
@@ -32,11 +33,106 @@ type jsonTemplateAggregateArrayLimit struct {
 	MaxTotalItems int    `json:"maxTotalItems"`
 }
 
+// jsonTemplateStringTruncation declares a field the engine clamps at render time
+// instead of rejecting. The schema's own `maxLength` stays the *accept* ceiling
+// (an unbounded string would fail RequireBoundedSchema, and a pathological
+// payload must still be refused); this is the narrower *display* ceiling applied
+// after validation, so an over-long value degrades to truncated text rather than
+// failing the whole card.
+//
+// It also makes the rendered frame's size independent of how generous the accept
+// ceiling is — the declared field contributes the same bytes whether the caller
+// sent 400 code points or 4001.
+//
+// That is NOT the same as keeping the frame inside the column it is persisted in,
+// and an earlier version of this comment wrongly claimed it was. A frame's size is
+// the template's fixed chrome plus *every* free string plus the `plain` copy
+// cardmsg.Finalize appends, so clamping one field bounds one term of a sum.
+// Measured on ai.reasoning-process@0.4.0: with `thought` clamped to a single code
+// point the adversarial worst case is still 107% of the column. The persistence
+// budget is enforced at the write boundary instead — see
+// carddispatch.NormalizeFrameForPersistence.
+type jsonTemplateStringTruncation struct {
+	// ArrayField, when set, scopes Field to objects inside that top-level array
+	// (e.g. ArrayField="phases", Field="thought" → phases[].thought). Empty
+	// means Field is a top-level property.
+	ArrayField string `json:"arrayField"`
+	Field      string `json:"field"`
+	MaxRunes   int    `json:"maxRunes"`
+	// Ellipsis is appended when a value is cut, and counts toward MaxRunes, so
+	// the result is never longer than MaxRunes code points.
+	Ellipsis string `json:"ellipsis"`
+}
+
+// truncate returns value clamped to MaxRunes code points, appending Ellipsis when
+// it had to cut. Counting is by code point to match JSON Schema's maxLength unit;
+// cutting by byte would split a multi-byte rune.
+func (tr jsonTemplateStringTruncation) truncate(value string) (string, bool) {
+	runes := []rune(value)
+	if len(runes) <= tr.MaxRunes {
+		return value, false
+	}
+	suffix := []rune(tr.Ellipsis)
+	keep := tr.MaxRunes - len(suffix)
+	if keep < 0 {
+		keep = 0
+	}
+	return string(runes[:keep]) + tr.Ellipsis, true
+}
+
 // SetMeta satisfies metaSetter; Registry injects the assembled meta at Register.
 func (t *jsonTemplate) SetMeta(m TemplateMeta) { t.meta = m }
 
 // Meta returns a defensive deep copy, matching the Template contract.
 func (t *jsonTemplate) Meta() TemplateMeta { return t.meta.Clone() }
+
+// applyStringTruncations clamps declared fields in place, after schema validation
+// and before expansion. Declared-only: anything not named in
+// x-octo-constraints.truncateStrings keeps the fail-close behaviour, so this
+// cannot silently soften a bound nobody opted into.
+func (t *jsonTemplate) applyStringTruncations(data map[string]any) {
+	applyStringTruncationsTo(t.stringTruncations, data)
+}
+
+// applyStringTruncationsTo is the free form, so the compile-time golden check can
+// run the *same* clamp the renderer does. Keeping it a method only would leave the
+// two paths agreeing by coincidence: checkArtifactGoldens expands the raw sample,
+// so a sample above its own display ceiling would make the goldens record bytes
+// production never emits — and the goldens are the artifact's only byte-level
+// record of what a template emits (PR#712 review P2-1).
+func applyStringTruncationsTo(truncations []jsonTemplateStringTruncation, data map[string]any) {
+	if len(truncations) == 0 || data == nil {
+		return
+	}
+	clamp := func(holder map[string]any, field string, tr jsonTemplateStringTruncation) {
+		raw, exists := holder[field]
+		if !exists {
+			return
+		}
+		value, ok := raw.(string)
+		if !ok {
+			return
+		}
+		if truncated, cut := tr.truncate(value); cut {
+			holder[field] = truncated
+		}
+	}
+	for _, tr := range truncations {
+		if tr.ArrayField == "" {
+			clamp(data, tr.Field, tr)
+			continue
+		}
+		items, ok := data[tr.ArrayField].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawItem := range items {
+			if item, ok := rawItem.(map[string]any); ok {
+				clamp(item, tr.Field, tr)
+			}
+		}
+	}
+}
 
 func (t *jsonTemplate) validateFields(value any) error {
 	if len(t.aggregateArrayLimits) == 0 {
@@ -120,6 +216,7 @@ func (t *jsonTemplate) Build(ctx context.Context, state State, fields json.RawMe
 	if err := json.Unmarshal(fields, &data); err != nil {
 		return BuildResult{}, fmt.Errorf("jsonTemplate: unmarshal fields: %w", err)
 	}
+	t.applyStringTruncations(data)
 	expanded, err := jsontmpl.Expand(ctx, ast, jsontmpl.Scope{Data: data}, jsonTemplateEscaper)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("jsonTemplate: expand view %q: %w", view, err)

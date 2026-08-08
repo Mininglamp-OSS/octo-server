@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	cardtemplatecatalog "github.com/Mininglamp-OSS/octo-server/modules/card_template_catalog"
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
@@ -596,6 +597,20 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		os.Getenv("NOTIFY_INTERNAL_TOKEN"),
 		os.Getenv("OCTO_DOCS_NOTIFY_TOKEN"),
 		os.Getenv("OCTO_DOCS_BOT_MENTION_TOKEN"),
+		// Cross-capability exclusion for OCTO_DRIVE_INTERNAL_TOKEN vs the
+		// dynamic route-scoped notify tokens / callback secrets loaded from
+		// OCTO_CARD_ACTION_ROUTES MUST happen here — modules/internal_resolve
+		// only sees the four fixed internal-token envs and cannot detect a
+		// collision with route-level credentials. Without this argument, an
+		// operator who accidentally sets the drive token equal to a route's
+		// notify_token_env value would pass all three local checks (drive
+		// module, registry construction, and this call), and a single leaked
+		// value would then authorize BOTH resolve-bot-owner AND route notify
+		// — breaking the "one credential / one capability" invariant.
+		//
+		// modules/internal_resolve/main_wiring_test.go asserts this argument
+		// stays present so a future refactor cannot delete it silently.
+		os.Getenv(internal_resolve.DriveInternalTokenEnv),
 	); err != nil {
 		return nil, err
 	}
@@ -828,15 +843,16 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
 	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
 	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
-	// roadmap E1/E1c safety successor:保留冻结的 0.1.0/0.2.0 供历史消息按原
-	// 契约编辑且不跨版本迁移，同时注册隐藏未实现 stop/retry 控件的 0.3.0
-	// 并设为新默认。
+	// roadmap E1/E1c safety successor:保留冻结的 0.1.0/0.2.0/0.3.0 供历史消息按
+	// 原契约编辑且不跨版本迁移，同时注册精简版式的 0.4.0 并设为新默认。0.4.0 与
+	// 0.3.0 的动作面完全一致（只有客户端本地 toggle），差异全在展示层。
 	// Bot 新发/历史 edit 的授权集合由 bot_api catalog 独立收口；Registry 多版本
 	// 只提供精确版本渲染能力，不隐式开放 Bot 权限。
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
-	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV3)
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV4)
+	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV4)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)

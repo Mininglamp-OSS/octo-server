@@ -298,3 +298,121 @@ func TestCtxKeyRobotIDMatchesBotAPI(t *testing.T) {
 		"bot_api.CtxKeyRobotID 已改为 %q，但 pkg/accesslog 的字面量仍是 %q —— "+
 			"access log 会安静地不再输出 bot 字段", m[1], ctxKeyRobotID)
 }
+
+// TestScrubPath_MasksPollSecret pins that the scan-login poll credential never
+// reaches an access-log line.
+//
+// gin composes the logged path as URL.Path + "?" + URL.RawQuery, so a credential
+// passed as a query parameter lands verbatim on the log line — the same class of
+// exposure as #246, just via the query string. Holding poll_secret together with
+// the uuid (also on that line) is exactly what lets a caller read auth_code out of
+// /v1/user/loginstatus, so logging both would defeat the gate for anyone with log
+// read access.
+func TestScrubPath_MasksPollSecret(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "loginstatus poll",
+			in:   "/v1/user/loginstatus?uuid=U1&poll_secret=S3CR3T",
+			want: "/v1/user/loginstatus?uuid=U1&poll_secret=***",
+		},
+		{
+			name: "secret first, uuid after",
+			in:   "/v1/user/loginstatus?poll_secret=S3CR3T&uuid=U1",
+			want: "/v1/user/loginstatus?poll_secret=***&uuid=U1",
+		},
+		{
+			name: "casing variant still masked",
+			in:   "/V1/USER/LOGINSTATUS?POLL_SECRET=S3CR3T",
+			want: "/V1/USER/LOGINSTATUS?POLL_SECRET=***",
+		},
+		{
+			name: "empty value is a no-op, not a crash",
+			in:   "/v1/user/loginstatus?uuid=U1&poll_secret=",
+			want: "/v1/user/loginstatus?uuid=U1&poll_secret=***",
+		},
+		{
+			name: "uuid alone is preserved for correlation",
+			in:   "/v1/user/loginstatus?uuid=U1",
+			want: "/v1/user/loginstatus?uuid=U1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ScrubPath(tc.in); got != tc.want {
+				t.Errorf("ScrubPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScrubPath_MasksAuthCode pins the redeemable scan-login code, which travels
+// as a path segment.
+//
+// loginWithAuthCode deletes the code on success, so a logged line for a successful
+// redemption is already spent. But the early returns for an IM failure or a
+// destroyed account happen BEFORE that delete, so a failed redemption leaves a
+// still-valid code in the log for up to ScanLoginAuthCodeTTL.
+func TestScrubPath_MasksAuthCode(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "redeem path",
+			in:   "/v1/user/login_authcode/A-REDEEMABLE-CODE",
+			want: "/v1/user/login_authcode/***",
+		},
+		{
+			name: "with query suffix",
+			in:   "/v1/user/login_authcode/A-CODE?flag=1",
+			want: "/v1/user/login_authcode/***?flag=1",
+		},
+		{
+			name: "casing variant still masked",
+			in:   "/V1/USER/LOGIN_AUTHCODE/A-CODE",
+			want: "/V1/USER/LOGIN_AUTHCODE/***",
+		},
+		{
+			name: "prefix without a code is untouched",
+			in:   "/v1/user/login_authcode/",
+			want: "/v1/user/login_authcode/",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ScrubPath(tc.in); got != tc.want {
+				t.Errorf("ScrubPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestErrorWriter_MasksScanLoginSecrets covers the OTHER sink. gin.Recovery's
+// panic dump embeds the full request line and bypasses the access logger
+// entirely — and it is the sink that persists on failure, which is exactly when a
+// credential is most likely still live.
+func TestErrorWriter_MasksScanLoginSecrets(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewErrorWriter(&buf)
+
+	dump := "panic serving request\nGET /v1/user/loginstatus?uuid=U1&poll_secret=S3CR3T HTTP/1.1\n" +
+		"POST /v1/user/login_authcode/A-CODE HTTP/1.1\n"
+	if _, err := w.Write([]byte(dump)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got := buf.String()
+	for _, leaked := range []string{"S3CR3T", "A-CODE"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("panic dump leaked %q: %s", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "uuid=U1") {
+		t.Errorf("uuid should survive for correlation: %s", got)
+	}
+}

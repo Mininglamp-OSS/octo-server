@@ -183,6 +183,7 @@ func TestSendMessageRegistryTemplateRejectsHistoricalVersionsWithoutDispatch(t *
 	}{
 		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
+		{aireasoningprocess.TemplateVersionV3, aireasoningprocess.HandoffRootV3},
 	} {
 		t.Run(historical.version, func(t *testing.T) {
 			dispatch := &dispatchCapture{}
