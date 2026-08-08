@@ -832,7 +832,9 @@ func TestVCSCard_ListMarkerNeutralized(t *testing.T) {
 			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`)
 		require.NotNil(t, card)
 		require.NoError(t, validateVCSCard(card))
-		headline := card["body"].([]interface{})[0].(map[string]interface{})["text"].(string)
+		headlineNode := cardNodeByID(card, "vcs-headline")
+		require.NotNil(t, headlineNode)
+		headline, _ := headlineNode["text"].(string)
 		assert.True(t, strings.HasPrefix(headline, `\- Security Team`),
 			"a display name starting with '- ' must not open a bullet list in the headline; got %q", headline)
 	})
