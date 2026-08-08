@@ -51,12 +51,53 @@ type fakeSpaceQuerier struct {
 	//       `activeSpaces[spaceID] != false` → scope=space App Bot in own Space
 	// `activeSpaces` defaults to true for any spaceID not explicitly set to
 	// false, so tests that don't care about Space status can omit it.
-	memberships   map[string]map[string]bool
-	authCalls     []memberCall
-	authDefault   bool
-	authErr       error
-	appBots       map[string]appBotShape
-	activeSpaces  map[string]bool
+	memberships  map[string]map[string]bool
+	authCalls    []memberCall
+	authDefault  bool
+	authErr      error
+	appBots      map[string]appBotShape
+	activeSpaces map[string]bool
+	// PR-C: group_no -> Space of the authoritative `group` row. An absent key
+	// answers dbr.ErrNotFound so the grant resolver's fail-closed branch is the
+	// default rather than something a test has to opt into.
+	groupSpaces   map[string]string
+	groupSpaceErr error
+	// inactiveSpaces marks a Space as space.status != 1 for the group resolver,
+	// which is the only way to reach the "the group names a Space that is no
+	// longer active" branch.
+	inactiveSpaces map[string]bool
+	// memberSpaces answers the DM peer membership check, keyed uid -> spaceID.
+	memberSpaces   map[string]map[string]bool
+	memberSpaceErr error
+}
+
+// PR-C: memberSpaces[uid][spaceID] answers the DM peer check. An absent entry
+// means "not a member", so a test opts a peer in rather than out.
+func (f *fakeSpaceQuerier) isUserSpaceMember(uid, spaceID string) (bool, error) {
+	f.calls = append(f.calls, "isUserSpaceMember:"+uid+":"+spaceID)
+	if f.memberSpaceErr != nil {
+		return false, f.memberSpaceErr
+	}
+	return f.memberSpaces[uid][spaceID], nil
+}
+
+// queryGroupSpaceID mirrors the production LEFT JOIN: a group whose Space is
+// listed in inactiveSpaces resolves its space_id but reports the Space inactive,
+// which is a different answer from "this group has no Space" (empty space_id)
+// and from "no such group" (dbr.ErrNotFound).
+func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, bool, error) {
+	f.calls = append(f.calls, "queryGroupSpaceID:"+groupNo)
+	if f.groupSpaceErr != nil {
+		return "", false, f.groupSpaceErr
+	}
+	spaceID, ok := f.groupSpaces[groupNo]
+	if !ok {
+		return "", false, dbr.ErrNotFound
+	}
+	if spaceID == "" {
+		return "", false, nil
+	}
+	return spaceID, !f.inactiveSpaces[spaceID], nil
 }
 
 type appBotShape struct {

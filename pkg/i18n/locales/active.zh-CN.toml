@@ -1361,6 +1361,9 @@ other = "卡片模板状态已变化，请刷新后重试。"
 ["err.server.card_template_catalog.blocked"]
 other = "该卡片模板版本已被阻断。"
 
+["err.server.card_template_catalog.grant_invalid"]
+other = "卡片模板授权请求无效。"
+
 ["err.server.bot_mention.in_progress"]
 other = "相同幂等键的请求仍在处理中，请稍后重试。"
 

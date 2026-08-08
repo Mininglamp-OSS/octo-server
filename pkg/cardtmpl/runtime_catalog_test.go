@@ -746,7 +746,9 @@ func dynamicDefaultRequest() CatalogRenderRequest {
 	}
 }
 
-func allowDynamicForTest(context.Context, CatalogAccess, RuntimeArtifactMeta) error { return nil }
+func allowDynamicForTest(context.Context, CatalogAccess, RuntimeArtifactMeta, RuntimeGrant) error {
+	return nil
+}
 
 type runtimeStoreStub struct {
 	mu              sync.Mutex

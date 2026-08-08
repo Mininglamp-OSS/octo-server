@@ -64,10 +64,16 @@ import (
 //     space_member: it also recognizes platform App Bots (scope='platform'
 //     visible in every active Space) and scope=space App Bots dispatching
 //     into their own Space — see modules/bot_api/db.go for the full rule.
+//
+// PR-C adds queryGroupSpaceID for the dynamic-catalog grant resolver: a card
+// sent into a group is authorized against the *group's* Space, which is not
+// necessarily the Bot's own.
 type botSpaceQuerier interface {
 	querySpaceIDByRobotID(robotID string) (string, error)
 	querySpaceIDsByRobotID(robotID string) (string, []string, error)
 	isBotSpaceAuthorized(robotID, spaceID string) (bool, error)
+	queryGroupSpaceID(groupNo string) (spaceID string, spaceActive bool, err error)
+	isUserSpaceMember(uid, spaceID string) (bool, error)
 }
 
 // enrichBotPayloadWithSpaceID 在 PERSONAL DM 派发前用 Bot 的权威 SpaceID 覆盖

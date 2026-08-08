@@ -267,7 +267,50 @@ func (a *API) detail(c *wkhttp.Context) {
 		a.respondStateError(c, "detail", err)
 		return
 	}
-	c.Response(templateDetailResponse(detail))
+	response := templateDetailResponse(detail)
+	// Bounded grant summary（PR-C）：grant store 可用时附带；fake/legacy store
+	// 不实现该接口则省略（响应 grants 恒为数组，不因缺失变形）。
+	if grantStore, ok := a.store.(catalogGrantStore); ok && grantStore != nil {
+		grants, truncated, grantsErr := grantStore.ListGrants(ctx, id, grantSummaryLimit)
+		if grantsErr != nil {
+			// The grant summary is an add-on to a control-plane read that
+			// worked long before grants existed. Failing the whole response
+			// would take activation state, versions and revisions away from an
+			// operator at exactly the moment they need them — including the
+			// case where the grant migration has not been applied yet. Report
+			// the outage in the logs and serve the rest.
+			// Still record the DB outcome. Degrading the response must not also
+			// degrade observability: without this the detail_grants metric never
+			// fires for any outcome, and a persistent grant-store outage reads
+			// as 100% success on the dashboard that exists to catch it.
+			a.metrics.observeDB("detail_grants", "error")
+			a.logStateError("card template detail grant summary unavailable", "detail_grants", grantsErr)
+			response.GrantsUnavailable = true
+			c.Response(response)
+			return
+		}
+		// The matching success observation. Without it the error counter above
+		// is the only sample the detail_grants metric ever takes, so the
+		// error-rate panel it exists to feed reads 100% the moment it has any
+		// data at all — the exact inverse of the blind spot it was added for.
+		a.metrics.observeDB("detail_grants", "ok")
+		response.Grants = make([]grantSummaryResponse, len(grants))
+		for i, record := range grants {
+			response.Grants[i] = grantSummaryResponse{
+				PrincipalType: string(record.Identity.PrincipalType),
+				PrincipalID:   record.Identity.PrincipalID,
+				ScopeSpaceID:  record.Identity.ScopeSpaceID,
+				Status:        string(record.Status),
+				Discover:      record.Permissions.Discover,
+				Send:          record.Permissions.Send,
+				Edit:          record.Permissions.Edit,
+				Revision:      record.Revision,
+				UpdatedBy:     record.UpdatedBy,
+			}
+		}
+		response.GrantsTruncated = truncated
+	}
+	c.Response(response)
 }
 
 func (a *API) audit(c *wkhttp.Context) {
@@ -462,11 +505,31 @@ type detailReadResponse struct {
 	Activation activationReadResponse `json:"activation"`
 	Versions   []versionReadResponse  `json:"versions"`
 	Truncated  bool                   `json:"truncated"`
+	// Grants 是 bounded grant summary（PR-C Control APIs）：只在 superAdmin
+	// manager detail 出现，普通 B1/B2 永不返回这些 control fields。
+	Grants []grantSummaryResponse `json:"grants"`
+	// GrantsUnavailable marks a response whose grant summary could not be read.
+	// It is distinct from an empty Grants array — "this template has no grants"
+	// and "we could not tell" are different answers for an operator.
+	GrantsUnavailable bool `json:"grants_unavailable,omitempty"`
+	GrantsTruncated   bool `json:"grants_truncated,omitempty"`
+}
+
+type grantSummaryResponse struct {
+	PrincipalType string `json:"principal_type"`
+	PrincipalID   string `json:"principal_id"`
+	ScopeSpaceID  string `json:"scope_space_id"`
+	Status        string `json:"status"`
+	Discover      bool   `json:"discover"`
+	Send          bool   `json:"send"`
+	Edit          bool   `json:"edit"`
+	Revision      uint64 `json:"revision"`
+	UpdatedBy     string `json:"updated_by"`
 }
 
 func templateDetailResponse(detail TemplateDetail) detailReadResponse {
 	response := detailReadResponse{
-		TemplateID: detail.TemplateID,
+		TemplateID: detail.TemplateID, Grants: []grantSummaryResponse{},
 		Activation: activationReadResponse{
 			Exists: detail.Activation.Exists, Version: detail.Activation.Version,
 			Status: string(detail.Activation.Status), Revision: detail.Activation.Revision,

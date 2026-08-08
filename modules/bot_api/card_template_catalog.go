@@ -59,6 +59,17 @@ type botCardTemplateCatalog struct {
 	sendAllowed map[botTemplateRef]struct{}
 	editAllowed map[botTemplateRef]struct{}
 	capability  botTemplatingCapability
+	// staticSendByID is the same policy as sendAllowed, keyed by template ID.
+	// PR-C D6 requires at most one advertised send version per ID, so this is a
+	// total map rather than a convenience index — the constructor rejects a
+	// policy that would make it lossy.
+	staticSendByID map[cardtmpl.ID]botTemplateRef
+	// staticSendIDs preserves a deterministic order for the manifest.
+	staticSendIDs []cardtmpl.ID
+	// authorization overrides the process-wide resolver in tests. Production
+	// leaves it nil and reads cardtmpl.DefaultAuthorizationSource() per request,
+	// so a catalog built before the composition root still picks the resolver up.
+	authorization cardtmpl.RuntimeAuthorizationSource
 }
 
 func defaultBotTemplateRefs() []botTemplateRef {
@@ -103,9 +114,10 @@ func newBotCardTemplateCatalogWithPolicy(
 		return nil, fmt.Errorf("bot template catalog: empty edit-compatible allowlist")
 	}
 	catalog := &botCardTemplateCatalog{
-		catalog:     runtimeCatalog,
-		sendAllowed: make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
-		editAllowed: make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
+		catalog:        runtimeCatalog,
+		sendAllowed:    make(map[botTemplateRef]struct{}, len(policy.AdvertisedSend)),
+		editAllowed:    make(map[botTemplateRef]struct{}, len(policy.EditCompatible)),
+		staticSendByID: make(map[cardtmpl.ID]botTemplateRef, len(policy.AdvertisedSend)),
 		capability: botTemplatingCapability{
 			Supported: true,
 			Wire:      botTemplateWireV1,
@@ -116,8 +128,15 @@ func newBotCardTemplateCatalogWithPolicy(
 		if strings.TrimSpace(string(ref.ID)) == "" || strings.TrimSpace(ref.Version) == "" {
 			return nil, fmt.Errorf("bot template catalog: id and explicit version are required")
 		}
-		if _, duplicate := catalog.sendAllowed[ref]; duplicate {
-			return nil, fmt.Errorf("bot template catalog: duplicate advertised/send %s@%s", ref.ID, ref.Version)
+		// PR-C D6: the guard is per template ID, not per exact ref. Two
+		// versions of one ID are not a harmless duplicate — the dynamic
+		// activation pointer resolves to a single version per ID, so a policy
+		// advertising two of them has no well-defined answer to "which version
+		// does the pointer shadow", and the manifest and the send path would be
+		// free to pick differently.
+		if existing, duplicate := catalog.staticSendByID[ref.ID]; duplicate {
+			return nil, fmt.Errorf("bot template catalog: %s is advertised at both %s and %s; "+
+				"exactly one send version per template ID", ref.ID, existing.Version, ref.Version)
 		}
 		meta, err := lookupBotTemplateMeta(runtimeCatalog, cardtmpl.CatalogExactRequest{
 			Access: botCatalogAccess(cardtmpl.CatalogPurposeNewSend, "bot-api-manifest", ""),
@@ -130,55 +149,13 @@ func newBotCardTemplateCatalogWithPolicy(
 			return nil, fmt.Errorf("bot template catalog: incomplete metadata for %s@%s", ref.ID, ref.Version)
 		}
 
-		capability := botTemplateCapability{
-			ID: string(meta.ID), Version: meta.Version,
-			Views: make([]botTemplateViewCapability, 0, len(meta.Views)),
+		capability, err := templateCapabilityFromMeta(meta)
+		if err != nil {
+			return nil, err
 		}
-		for view, spec := range meta.Views {
-			if strings.TrimSpace(string(view)) == "" || len(spec.States) == 0 {
-				return nil, fmt.Errorf("bot template catalog: %s@%s has empty view/state metadata", ref.ID, ref.Version)
-			}
-			viewCapability := botTemplateViewCapability{
-				Name:          string(view),
-				WireProfile:   spec.WireProfile,
-				States:        make([]string, 0, len(spec.States)),
-				SubmitActions: make([]string, 0),
-			}
-			for _, state := range spec.States {
-				if strings.TrimSpace(string(state)) == "" {
-					return nil, fmt.Errorf("bot template catalog: %s@%s view %s has empty state", ref.ID, ref.Version, view)
-				}
-				viewCapability.States = append(viewCapability.States, string(state))
-			}
-			sort.Strings(viewCapability.States)
-
-			if spec.WireProfile == cardmsg.ProfileV2 {
-				report, ok := meta.Interaction(view)
-				if !ok {
-					return nil, fmt.Errorf("bot template catalog: %s@%s view %s missing interaction report", ref.ID, ref.Version, view)
-				}
-				seenActions := make(map[string]struct{})
-				for _, action := range report.Actions {
-					if action.Type != "Action.Submit" {
-						continue
-					}
-					if strings.TrimSpace(action.ID) == "" {
-						return nil, fmt.Errorf("bot template catalog: %s@%s view %s has empty Submit id", ref.ID, ref.Version, view)
-					}
-					if _, duplicate := seenActions[action.ID]; duplicate {
-						return nil, fmt.Errorf("bot template catalog: %s@%s view %s has duplicate Submit id %q", ref.ID, ref.Version, view, action.ID)
-					}
-					seenActions[action.ID] = struct{}{}
-					viewCapability.SubmitActions = append(viewCapability.SubmitActions, action.ID)
-				}
-				sort.Strings(viewCapability.SubmitActions)
-			}
-			capability.Views = append(capability.Views, viewCapability)
-		}
-		sort.Slice(capability.Views, func(i, j int) bool {
-			return capability.Views[i].Name < capability.Views[j].Name
-		})
 		catalog.sendAllowed[ref] = struct{}{}
+		catalog.staticSendByID[ref.ID] = ref
+		catalog.staticSendIDs = append(catalog.staticSendIDs, ref.ID)
 		catalog.capability.Templates = append(catalog.capability.Templates, capability)
 	}
 	for _, ref := range policy.EditCompatible {
@@ -212,7 +189,73 @@ func newBotCardTemplateCatalogWithPolicy(
 		}
 		return left.Version < right.Version
 	})
+	sort.Slice(catalog.staticSendIDs, func(i, j int) bool {
+		return catalog.staticSendIDs[i] < catalog.staticSendIDs[j]
+	})
 	return catalog, nil
+}
+
+// templateCapabilityFromMeta projects one template's metadata into the wire
+// capability shape. The constructor and the request-scoped manifest share it so
+// that a dynamic template is described exactly as a static one would be — a
+// producer must not be able to tell the two apart from the manifest, since the
+// whole point of the catalog is that the source is an operator concern.
+func templateCapabilityFromMeta(meta cardtmpl.TemplateMeta) (botTemplateCapability, error) {
+	capability := botTemplateCapability{
+		ID: string(meta.ID), Version: meta.Version,
+		Views: make([]botTemplateViewCapability, 0, len(meta.Views)),
+	}
+	for view, spec := range meta.Views {
+		if strings.TrimSpace(string(view)) == "" || len(spec.States) == 0 {
+			return botTemplateCapability{}, fmt.Errorf(
+				"bot template catalog: %s@%s has empty view/state metadata", meta.ID, meta.Version)
+		}
+		viewCapability := botTemplateViewCapability{
+			Name:          string(view),
+			WireProfile:   spec.WireProfile,
+			States:        make([]string, 0, len(spec.States)),
+			SubmitActions: make([]string, 0),
+		}
+		for _, state := range spec.States {
+			if strings.TrimSpace(string(state)) == "" {
+				return botTemplateCapability{}, fmt.Errorf(
+					"bot template catalog: %s@%s view %s has empty state", meta.ID, meta.Version, view)
+			}
+			viewCapability.States = append(viewCapability.States, string(state))
+		}
+		sort.Strings(viewCapability.States)
+
+		if spec.WireProfile == cardmsg.ProfileV2 {
+			report, ok := meta.Interaction(view)
+			if !ok {
+				return botTemplateCapability{}, fmt.Errorf(
+					"bot template catalog: %s@%s view %s missing interaction report", meta.ID, meta.Version, view)
+			}
+			seenActions := make(map[string]struct{})
+			for _, action := range report.Actions {
+				if action.Type != "Action.Submit" {
+					continue
+				}
+				if strings.TrimSpace(action.ID) == "" {
+					return botTemplateCapability{}, fmt.Errorf(
+						"bot template catalog: %s@%s view %s has empty Submit id", meta.ID, meta.Version, view)
+				}
+				if _, duplicate := seenActions[action.ID]; duplicate {
+					return botTemplateCapability{}, fmt.Errorf(
+						"bot template catalog: %s@%s view %s has duplicate Submit id %q",
+						meta.ID, meta.Version, view, action.ID)
+				}
+				seenActions[action.ID] = struct{}{}
+				viewCapability.SubmitActions = append(viewCapability.SubmitActions, action.ID)
+			}
+			sort.Strings(viewCapability.SubmitActions)
+		}
+		capability.Views = append(capability.Views, viewCapability)
+	}
+	sort.Slice(capability.Views, func(i, j int) bool {
+		return capability.Views[i].Name < capability.Views[j].Name
+	})
+	return capability, nil
 }
 
 func (c *botCardTemplateCatalog) Capability() botTemplatingCapability {
@@ -288,21 +331,28 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send", false)
+	return c.renderPayload(ctx,
+		botCatalogAccess(cardtmpl.CatalogPurposeNewSend, "bot-api-compat", env.SpaceID), inbound, env,
+		c.staticRefResolver(c.sendAllowed, "not Bot-callable for new send"), false, "")
 }
 
+// RenderPayloadForPrincipal is the authenticated new-send path. Unlike the
+// compat variant above it re-resolves the ref against the runtime catalog for
+// this exact principal, so an activation, block or revoke takes effect on the
+// very next send rather than at the next process restart.
 func (c *botCardTemplateCatalog) RenderPayloadForPrincipal(
 	ctx context.Context,
-	botID string,
+	principal botCatalogPrincipal,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
 ) (map[string]any, error) {
-	if c == nil || strings.TrimSpace(botID) == "" {
+	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeNewSend,
-		inbound, env, c.sendAllowed, "not Bot-callable for new send", true)
+	return c.renderPayload(ctx, principal.access(cardtmpl.CatalogPurposeNewSend), inbound, env,
+		func(ctx context.Context, value any) (botTemplateRef, error) {
+			return c.requireSendableRef(ctx, principal, value)
+		}, true, provenanceSpaceID(principal, env))
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayload(
@@ -313,32 +363,73 @@ func (c *botCardTemplateCatalog) RenderEditPayload(
 	if c == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, "bot-api-compat", cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible", false)
+	return c.renderPayload(ctx,
+		botCatalogAccess(cardtmpl.CatalogPurposeHistoricalEdit, "bot-api-compat", env.SpaceID), inbound, env,
+		c.staticRefResolver(c.editAllowed, "not edit-compatible"), false, "")
 }
 
 func (c *botCardTemplateCatalog) RenderEditPayloadForPrincipal(
 	ctx context.Context,
-	botID string,
+	principal botCatalogPrincipal,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
+	storedSpaceID string,
 ) (map[string]any, error) {
-	if c == nil || strings.TrimSpace(botID) == "" {
+	if c == nil || strings.TrimSpace(principal.BotID) == "" {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	return c.renderPayload(ctx, botID, cardtmpl.CatalogPurposeHistoricalEdit,
-		inbound, env, c.editAllowed, "not edit-compatible", true)
+	// An edit *preserves* the marker's Space; it does not re-derive it. The
+	// stored value is what the send was authorized against, and it is already
+	// on the frame — recomputing it here means the answer depends on whether
+	// the resolver happens to work at edit time, so a gate rollback or a group
+	// row that will not load would quietly rewrite the card with an empty
+	// Space and disable every downstream `if Provenance.SpaceID != ""` guard.
+	// This is the same rule pkg/cardtmpl's updater already follows when it
+	// copies the stored markers through verbatim.
+	//
+	// Only a frame with no stored Space at all falls back to composing one,
+	// which is what a pre-PR-C frame being edited for the first time needs.
+	space := strings.TrimSpace(storedSpaceID)
+	if space == "" {
+		space = provenanceSpaceID(principal, env)
+	}
+	return c.renderPayload(ctx, principal.access(cardtmpl.CatalogPurposeHistoricalEdit), inbound, env,
+		c.editRefResolver(principal), true, space)
+}
+
+// storedProvenanceSpaceID reads the Space a frame's own marker records, or ""
+// when the frame carries no marker (a pre-PR-C card) or cannot be parsed. The
+// guard that runs before it has already rejected a malformed marker, so an
+// empty answer here means "nothing was stored", never "we failed to look".
+func storedProvenanceSpaceID(envelope []byte) string {
+	markers, err := cardmsg.CatalogFrameMarkers(envelope)
+	if err != nil || !markers.HasProvenance {
+		return ""
+	}
+	return markers.Provenance.SpaceID
 }
 
 func (c *botCardTemplateCatalog) renderPayload(
 	ctx context.Context,
-	botID string,
-	purpose cardtmpl.CatalogPurpose,
+	// access is the *authorized* identity, handed down from whoever resolved
+	// the ref. It is a parameter rather than something rebuilt here because
+	// cardtmpl.Render re-resolves the grant from it, and a render that composed
+	// its own Space disagreed with the gate for every group and thread target:
+	// the gate read the target's Space, the render read env.SpaceID, which is
+	// DM-only. An exact-Space grant passed one and was refused by the other.
+	access cardtmpl.CatalogAccess,
 	inbound map[string]any,
 	env cardtmpl.BuildEnv,
-	allowed map[botTemplateRef]struct{},
-	denialReason string,
+	resolveRef func(context.Context, any) (botTemplateRef, error),
 	authorProvenance bool,
+	// provenanceSpaceID is the Space the marker is stamped with. It is a
+	// separate value from env.SpaceID on purpose: env.SpaceID drives rendered
+	// content (deep links) and send.go only populates it for DMs, while the
+	// marker must carry the Space the send was actually *authorized* against —
+	// for a group or thread that is the target's Space, which env.SpaceID never
+	// sees. Stamping "" there would silently disable every downstream D3 Space
+	// guard, since all of them are written as `if Provenance.SpaceID != ""`.
+	provenanceSpaceID string,
 ) (map[string]any, error) {
 	if c == nil || c.catalog == nil {
 		return nil, errBotTemplateCatalogUnavailable
@@ -358,7 +449,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 	if _, hasCard := inbound["card"]; hasCard {
 		return nil, fmt.Errorf("%w: raw card and template_ref are mutually exclusive", errBotTemplateRequestInvalid)
 	}
-	ref, err := c.requireRef(inbound["template_ref"], allowed, denialReason)
+	ref, err := resolveRef(ctx, inbound["template_ref"])
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +472,7 @@ func (c *botCardTemplateCatalog) renderPayload(
 		return nil, fmt.Errorf("%w: marshal data: %v", errBotTemplateRequestInvalid, err)
 	}
 	rendered, err := c.catalog.Render(ctx, cardtmpl.CatalogRenderRequest{
-		Access: botCatalogAccess(purpose, botID, env.SpaceID),
+		Access: access,
 		ID:     ref.ID, Version: ref.Version, State: cardtmpl.State(state), Fields: rawData, Env: env,
 	})
 	if err != nil {
@@ -402,17 +493,17 @@ func (c *botCardTemplateCatalog) renderPayload(
 		provenance := cardmsg.CatalogProvenance{
 			Version:       cardmsg.CatalogProvenanceVersion,
 			PrincipalType: cardmsg.CatalogPrincipalWireBot,
-			PrincipalID:   botID,
-			SpaceID:       env.SpaceID,
+			// The same access the render authorized under, so the marker cannot
+			// name a principal the render did not actually decide for.
+			PrincipalID: access.Principal.ID,
+			SpaceID:     provenanceSpaceID,
 		}
 		// Same reason as the internal-producer boundary in
 		// internal/carddispatch: an authoring site must not be able to write a
-		// marker its readers reject, and no later stage re-validates —
-		// cardmsg.Validate runs before these keys exist and Finalize does not
-		// look at them. These inputs are server-resolved rather than
-		// caller-supplied, so no failure is constructible here today, which is
-		// exactly why it should be a checked invariant instead of a property of
-		// the current callers.
+		// marker its readers reject, and no later stage re-validates. These
+		// inputs are DB-derived rather than caller-supplied, so no failure is
+		// constructible here today — which is exactly why it should be a
+		// checked invariant instead of a property of the current callers.
 		if err := provenance.Validate(); err != nil {
 			return nil, fmt.Errorf("%w: %v", errBotTemplateRequestInvalid, err)
 		}
@@ -434,6 +525,88 @@ func (c *botCardTemplateCatalog) requireEditableRef(value any) (botTemplateRef, 
 		return botTemplateRef{}, errBotTemplateCatalogUnavailable
 	}
 	return c.requireRef(value, c.editAllowed, "template is not edit-compatible")
+}
+
+// resolveEditRef authorizes one historical-edit ref, static or dynamic.
+//
+// PR-C review: `requireEditableRef` alone consults only `editAllowed`, a
+// boot-time map of code-reviewed static exacts. A version published at runtime
+// can never be in that map, so a Bot that had just been granted `send` on a
+// dynamic template — and had used it — was refused every edit of the card it
+// had itself sent, before stored provenance or the runtime authorizer were ever
+// consulted. `send` reached the dynamic authorizer and `edit` never did, which
+// left the D2 `send|edit` grant half-wired.
+//
+// Two rules make this different from the send path:
+//
+//   - It is pinned. The query carries the stored exact version, so it never
+//     follows the activation pointer; following it would rewrite an existing
+//     card across versions, which is exactly what D6 forbids.
+//   - The static allowlist answers first, without any DB read. That is what
+//     keeps a gates-off deployment on precisely its pre-PR-C behaviour: an
+//     unresolved principal (which is what a dark catalog produces) withholds
+//     only the dynamic overlay.
+func (c *botCardTemplateCatalog) resolveEditRef(
+	ctx context.Context,
+	principal botCatalogPrincipal,
+	value any,
+) (botTemplateRef, error) {
+	if c == nil || c.catalog == nil {
+		return botTemplateRef{}, errBotTemplateCatalogUnavailable
+	}
+	ref, err := parseBotTemplateRef(value)
+	if err != nil {
+		return botTemplateRef{}, err
+	}
+	if _, ok := c.editAllowed[ref]; ok {
+		return ref, nil
+	}
+	notEditable := fmt.Errorf("%w: template is not edit-compatible", errBotTemplateRequestInvalid)
+	source := c.authorizationSource()
+	if source == nil || !principal.grantReadable() {
+		return botTemplateRef{}, notEditable
+	}
+	auth, err := source.LoadAuthorization(ctx, cardtmpl.RuntimeAuthorizationQuery{
+		ID: ref.ID, Version: ref.Version, Principal: principal.catalogPrincipal(),
+	})
+	if err != nil {
+		// One indistinguishable refusal for "no such version" and "not granted",
+		// matching the send path: a producer must not be able to use edit
+		// rejections to enumerate which versions exist.
+		if errors.Is(err, cardtmpl.ErrTemplateUnknown) ||
+			errors.Is(err, cardtmpl.ErrRuntimeCatalogDisabled) {
+			return botTemplateRef{}, notEditable
+		}
+		return botTemplateRef{}, errors.Join(errBotTemplateRuntimeUnavailable, err)
+	}
+	if auth.Artifact.Blocked || !auth.Grant.Allows(cardtmpl.CatalogPurposeHistoricalEdit) {
+		return botTemplateRef{}, notEditable
+	}
+	return ref, nil
+}
+
+// editRefResolver adapts resolveEditRef to the render path's resolver
+// signature, so the pre-gate and the render agree by construction rather than
+// by two allowlists that happen to match.
+func (c *botCardTemplateCatalog) editRefResolver(
+	principal botCatalogPrincipal,
+) func(context.Context, any) (botTemplateRef, error) {
+	return func(ctx context.Context, value any) (botTemplateRef, error) {
+		return c.resolveEditRef(ctx, principal, value)
+	}
+}
+
+// staticRefResolver adapts a boot-time allowlist to the resolver signature.
+// Historical edit stays on this path on purpose: an edit is pinned to the
+// version already stored in the frame, so following the activation pointer
+// there would rewrite an existing card across versions (D6).
+func (c *botCardTemplateCatalog) staticRefResolver(
+	allowed map[botTemplateRef]struct{},
+	denialReason string,
+) func(context.Context, any) (botTemplateRef, error) {
+	return func(_ context.Context, value any) (botTemplateRef, error) {
+		return c.requireRef(value, allowed, denialReason)
+	}
 }
 
 func (c *botCardTemplateCatalog) requireRef(
@@ -508,7 +681,63 @@ func parseBotTemplateRef(value any) (botTemplateRef, error) {
 	return botTemplateRef{ID: cardtmpl.ID(id), Version: version}, nil
 }
 
-func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBotID string) error {
+// editSpaceCheck is what this edit knows about the Space it is authorized
+// against. Three states, deliberately distinct — collapsing them is what made
+// the Space comparison a source of permanent failures twice over.
+//
+//   - verifiable, with a Space: compare the stored marker against it.
+//   - not verifiable: the deployment never establishes a Space at all (the
+//     dynamic catalog is dark), so there is nothing to compare with. The edit
+//     is still bound to its author by the canonical bot marker, the
+//     PrincipalID == editor check and Snapshot ownership.
+//   - unavailable: a Space should have been resolvable and was not. The edit
+//     cannot be verified now but may well succeed later, so it must not be
+//     reported as a permanent client error.
+type editSpaceCheck struct {
+	spaceID     string
+	verifiable  bool
+	unavailable bool
+}
+
+// editProvenanceSpaceCheck maps the send-side principal onto those three
+// states. dynamicEnabled is read at the call site rather than inferred from the
+// principal because botSendCatalogPrincipal returns the same zero principal for
+// "the gate is closed" and "the group row would not load", and only the second
+// of those is an outage.
+//
+// A DM whose peer turned out to be outside the Bot's Space also lands in
+// `unavailable`. That is a deny wearing an outage's clothes, and the imprecision
+// is deliberate: over-reporting an outage costs a retry, while under-reporting
+// one costs a permanently uneditable card.
+func editProvenanceSpaceCheck(dynamicEnabled bool, principal botCatalogPrincipal) editSpaceCheck {
+	if !dynamicEnabled {
+		return editSpaceCheck{}
+	}
+	if principal.Space == botSpaceUnavailable {
+		return editSpaceCheck{unavailable: true}
+	}
+	// botSpaceGlobalOnly lands here too, as `verifiable` with an empty Space:
+	// "we established this target has no Space" is a determination the stored
+	// marker can legitimately be compared against, not an outage.
+	return editSpaceCheck{spaceID: principal.SpaceID, verifiable: true}
+}
+
+// requireEffectiveCardTemplate proves the stored frame is the one this edit is
+// entitled to rewrite.
+//
+// space is the Space this edit resolved for the target, composed exactly as the
+// send composed the marker it is being compared against. An earlier revision
+// compared the marker to the envelope's top-level `space_id`, which only DM
+// sends ever write — so once group sends started recording their target Space,
+// every group and thread card became permanently uneditable. Comparing two
+// values produced by the same rule means they agree whenever nothing moved, and
+// disagree exactly when the frame did.
+func requireEffectiveCardTemplate(
+	envelope []byte,
+	want botTemplateRef,
+	editorBotID string,
+	space editSpaceCheck,
+) error {
 	decoder := json.NewDecoder(bytes.NewReader(envelope))
 	decoder.UseNumber()
 	var payload map[string]any
@@ -541,10 +770,56 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef, editorBo
 			markers.Provenance.PrincipalID != editorBotID {
 			return fmt.Errorf("%w: stored provenance does not match editing bot", errBotTemplateRequestInvalid)
 		}
-		envelopeSpace, _ := payload["space_id"].(string)
-		if markers.Provenance.SpaceID != "" && markers.Provenance.SpaceID != envelopeSpace {
-			return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
+		if markers.Provenance.SpaceID != "" {
+			// The envelope's own space_id is a fallback witness: a DM send writes
+			// it from the *forgiving* resolver, which is also what stamped the
+			// marker whenever the strict grant resolver refused. It is what keeps
+			// a Bot that spans two Spaces — a permanent property, not a blip —
+			// from being locked out of editing its own DM cards forever.
+			//
+			// It is a fallback and not an alternative, and the difference is
+			// load-bearing. The envelope is the frame speaking about itself:
+			// matching it proves the frame is internally consistent, never that
+			// the grant behind this edit was read in the frame's Space. While it
+			// could substitute for the real comparison, a Bot in Spaces A and B
+			// could send a card under A's grant, lose A's edit permission, and
+			// then rewrite that card by presenting X-Space-ID: space-B — the
+			// grant was read in B, case 1 failed correctly, and the envelope's
+			// own "space-A" waved it through. So it applies only where there is
+			// no established Space to compare against.
+			envelopeSpace, _ := payload["space_id"].(string)
+			switch {
+			case space.verifiable && markers.Provenance.SpaceID == strings.TrimSpace(space.spaceID):
+			case !space.verifiable && envelopeSpace != "" && markers.Provenance.SpaceID == envelopeSpace:
+			case space.unavailable && envelopeSpace == "":
+				// Nothing to compare against and something should have been
+				// resolvable. Refuse, but as a retryable outage: the frame may
+				// be perfectly valid and the caller cannot fix our lookup.
+				return fmt.Errorf("%w: edit space could not be resolved, stored provenance unverifiable",
+					errBotTemplateRuntimeUnavailable)
+			case !space.verifiable && envelopeSpace == "":
+				// The deployment establishes no Space at all (the dynamic
+				// catalog is dark), so there is nothing this check can assert.
+				// The canonical bot marker, the PrincipalID comparison above and
+				// Snapshot ownership still bind the edit to the card's author.
+			default:
+				return fmt.Errorf("%w: stored provenance space mismatch", errBotTemplateRequestInvalid)
+			}
 		}
 	}
 	return nil
+}
+
+// provenanceSpaceID picks the Space a new send's marker is stamped with.
+//
+// The authorization principal wins when it resolved one, because that is the
+// Space the grant decision was actually made against — for a group or thread
+// send it is the target's Space, which env.SpaceID (DM-only) never carries.
+// env.SpaceID remains the fallback so a DM keeps stamping exactly what it
+// stamped before PR-C's target-authoritative resolution existed.
+func provenanceSpaceID(principal botCatalogPrincipal, env cardtmpl.BuildEnv) string {
+	if principal.Space == botSpaceScoped && principal.SpaceID != "" {
+		return principal.SpaceID
+	}
+	return env.SpaceID
 }

@@ -273,12 +273,26 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 		}
-		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), robotID, req.Payload, cardtmpl.BuildEnv{
+		// PR-C D6: the grant principal is resolved from the *target*, not from
+		// the sender's own membership, and it is a separate value from the
+		// dispatch space_id above — the latter tags the DM envelope for client
+		// SpaceFilter and is deliberately forgiving, while this one authorizes
+		// and is deliberately not.
+		principal := ba.botSendCatalogPrincipal(c, robotID, channelID, req.ChannelType)
+		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), principal, req.Payload, cardtmpl.BuildEnv{
 			WebLoginURL: webLoginURL,
 			Lang:        i18n.OutboundLanguage(c.Request.Context()),
 			SpaceID:     spaceID,
 		})
 		if renderErr != nil {
+			if errors.Is(renderErr, errBotTemplateRuntimeUnavailable) {
+				// The runtime catalog could not be read, so we cannot tell
+				// whether this template ID has been shadowed. Refuse rather
+				// than fall back to the static version of the same ID.
+				ba.Error("Bot 模板运行时目录不可用", zap.Error(renderErr), zap.String("channelID", channelID))
+				httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+				return
+			}
 			if errors.Is(renderErr, errBotTemplateRequestInvalid) {
 				ba.Warn("Bot Registry 模板请求非法", zap.Error(renderErr), zap.String("channelID", channelID))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
@@ -1278,7 +1292,14 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
-	ref, err := ba.cardTemplates.requireEditableRef(req.TemplateRef)
+	// Resolve the edit's Space from the target, the same way the send did, so
+	// the ref gate below, the provenance guard and the re-stamped marker all
+	// compare like with like (see requireEffectiveCardTemplate). This runs
+	// before the ref gate because a dynamic ref is authorized by *this
+	// principal's* edit grant — the static allowlist alone cannot answer for a
+	// version published at runtime.
+	editPrincipal := ba.botSendCatalogPrincipal(c, robotID, req.ChannelID, req.ChannelType)
+	ref, err := ba.cardTemplates.resolveEditRef(c.Request.Context(), editPrincipal, req.TemplateRef)
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit template_ref 非法或未开放", zap.Error(err))
@@ -1298,7 +1319,17 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
 		return
 	}
-	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID); err != nil {
+	spaceCheck := editProvenanceSpaceCheck(ba.cardTemplates.dynamicCatalogEnabled(), editPrincipal)
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID, spaceCheck); err != nil {
+		if errors.Is(err, errBotTemplateRuntimeUnavailable) {
+			// The frame may be entirely valid; we could not read the Space to
+			// check it. Answering 400 would tell the Bot its request is
+			// malformed and not to retry, which is the opposite of the truth.
+			ba.Error("Bot Registry edit 无法解析目标 Space", zap.Error(err),
+				zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
 		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
@@ -1328,7 +1359,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
 	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
-	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), robotID, map[string]any{
+	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), editPrincipal, map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
 		"state":        req.State,
@@ -1337,7 +1368,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		WebLoginURL: webLoginURL,
 		Lang:        i18n.OutboundLanguage(c.Request.Context()),
 		SpaceID:     spaceID,
-	})
+	}, storedProvenanceSpaceID(snapshot.Envelope))
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))

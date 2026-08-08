@@ -82,6 +82,9 @@ scripts/healthcheck.sh
 .claude/*
 !.claude/commands/
 !.claude/skills/
+# Agent collaboration scratch (redacted command output, hashes, test summaries).
+# Never a PR deliverable — see .octospec/tasks/*/HANDOFF.md fixture policy.
+.context/
 testenv/miniodata/
 
 # TestMakeCompose temporary fixture (modules/file/service_test.go:46)

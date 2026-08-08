@@ -50,11 +50,14 @@ func TestStoreListAuditUsesDescendingCursorAndHardLimit(t *testing.T) {
 		WithArgs("test.runtime-card", uint64(50), uint64(50), 3).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "actor_uid", "operation", "version", "previous_version", "resulting_version",
-			"previous_revision", "resulting_revision", "result", "reason", "change_ticket", "created_at",
+			"previous_revision", "resulting_revision",
+			"principal_type", "principal_id", "scope_space_id",
+			"previous_permissions", "resulting_permissions",
+			"result", "reason", "change_ticket", "created_at",
 		}).
-			AddRow(49, "admin-1", "rollback", "1.0.0", "1.1.0", "1.0.0", 3, 4, "ok", "incident", "INC-1", now).
-			AddRow(48, "admin-1", "activate", "1.1.0", "1.0.0", "1.1.0", 2, 3, "ok", "rollout", "CHG-2", now).
-			AddRow(47, "admin-1", "publish", "1.1.0", "", "", nil, nil, "created", "reviewed", "CHG-1", now))
+			AddRow(49, "admin-1", "rollback", "1.0.0", "1.1.0", "1.0.0", 3, 4, "", "", "", "", "", "ok", "incident", "INC-1", now).
+			AddRow(48, "admin-1", "grant", "", "", "", 0, 1, "bot", "bot-1", "space-1", "", "discover,send", "ok", "pilot", "CHG-2", now).
+			AddRow(47, "admin-1", "publish", "1.1.0", "", "", nil, nil, "", "", "", "", "", "created", "reviewed", "CHG-1", now))
 
 	page, err := store.ListAudit(context.Background(), "test.runtime-card", 50, 2)
 	if err != nil {

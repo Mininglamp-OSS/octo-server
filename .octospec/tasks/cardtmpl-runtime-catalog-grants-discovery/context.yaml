@@ -1,0 +1,39 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: >-
+      PR-C introduces per-Space discovery and producer grants on Bot, notify,
+      message action-context, and manager routes. Principal and Space values must
+      come from authenticated or stored server-authored state, never request JSON.
+  - id: trust-boundary
+    source: repo
+    why: >-
+      B2 exports stored artifacts and dynamic cards cross external producer and
+      client boundaries. Export projection, provenance, canonical hashes, payload
+      bounds, and raw-ingress rejection are load-bearing wire contracts.
+  - id: error-handling
+    source: repo
+    why: >-
+      Grant/revoke and B1/B2 add user-visible failures. They must use registered
+      localized envelopes, hide existence and grant details, and log internal
+      causes before returning internal errors.
+  - id: rate-limit
+    source: repo
+    why: >-
+      Manager and discovery routes are authenticated and must use the shared UID
+      limiter. Bot profile becomes a per-Bot DB read and therefore must mount
+      botActorUID before the same limiter.
+  - id: testing
+    source: repo
+    why: >-
+      PR-C changes a migration, CAS authorization state, multi-tenant discovery,
+      Bot send/edit/profile hot paths, message action ingress, and multi-replica
+      behavior; focused, real-MySQL, Redis/WuKongIM, race, and rollback evidence is
+      required before finish.
+  - id: commit-style
+    source: repo
+    why: >-
+      The eventual commits and PR use English Conventional Commits, an English PR
+      body, Linked Spec, COMPREHENSION answers, and an issue link. Plan phase makes
+      no commit.
+brief: .octospec/tasks/cardtmpl-runtime-catalog-grants-discovery/brief.md

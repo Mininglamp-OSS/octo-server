@@ -4,6 +4,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
+	"strings"
 )
 
 type botAPIDB struct {
@@ -225,4 +226,62 @@ func (d *botAPIDB) queryAppBotByUID(uid string) (*appBotModel, error) {
 	var m *appBotModel
 	_, err := d.session.Select("*").From("app_bot").Where("uid=?", uid).Load(&m)
 	return m, err
+}
+
+// queryGroupSpaceID returns the authoritative Space of a group row, and whether
+// that Space is currently active. It is the Space a card sent into that group is
+// authorized against — the Bot's own membership Space is not, since a Bot can
+// belong to one Space and be a member of a group that lives in another. An empty
+// result is dbr.ErrNotFound so the caller fails closed rather than treating "no
+// row" as "no Space needed".
+//
+// The active flag exists because every other Space resolver in this file treats
+// `space.status = 1` as load-bearing — querySpaceIDsByRobotID, both branches of
+// isBotSpaceAuthorized, and isUserSpaceMember all require it — and this one did
+// not. A grant scoped to a Space an operator had disabled therefore still
+// authorized sends into that Space's groups, while the same bot's membership,
+// an X-Space-ID header naming it, and a DM peer inside it were all refused. The
+// join is LEFT rather than INNER so that "this group belongs to no Space" stays
+// distinguishable from "this group's Space is disabled": the first is a
+// determination the caller can act on, the second is a Space it must not use.
+func (d *botAPIDB) queryGroupSpaceID(groupNo string) (spaceID string, spaceActive bool, err error) {
+	var rows []struct {
+		SpaceID string `db:"space_id"`
+		Active  bool   `db:"active"`
+	}
+	_, err = d.session.SelectBySql(
+		"SELECT `group`.space_id AS space_id, (s.space_id IS NOT NULL) AS active "+
+			"FROM `group` LEFT JOIN space s ON s.space_id = `group`.space_id AND s.status = 1 "+
+			"WHERE `group`.group_no=? LIMIT 1", groupNo,
+	).Load(&rows)
+	if err != nil {
+		return "", false, err
+	}
+	if len(rows) == 0 {
+		return "", false, dbr.ErrNotFound
+	}
+	return rows[0].SpaceID, rows[0].Active, nil
+}
+
+// isUserSpaceMember reports whether a plain user holds an active membership in
+// an active Space.
+//
+// It is deliberately narrower than isBotSpaceAuthorized: that rule also honours
+// platform App Bots, which are visible in every Space by construction. A human
+// recipient has no such blanket visibility, so a DM's peer is checked against
+// space_member alone.
+func (d *botAPIDB) isUserSpaceMember(uid, spaceID string) (bool, error) {
+	if strings.TrimSpace(uid) == "" || strings.TrimSpace(spaceID) == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id "+
+			"WHERE sm.uid=? AND sm.space_id=? AND sm.status=1 AND s.status=1",
+		uid, spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
