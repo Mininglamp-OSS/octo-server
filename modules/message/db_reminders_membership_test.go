@@ -191,8 +191,11 @@ func remMemberSeed(t *testing.T, ctx *config.Context) []string {
 		{remGroupD, common.ChannelTypeGroup.Uint8(), "", remUIDB, 13},
 		{remTopicA, common.ChannelTypeCommunityTopic.Uint8(), "", remUIDB, 14},
 		{remTopicB, common.ChannelTypeCommunityTopic.Uint8(), "", remUIDB, 15},
-		// 成员来源不可解析的类型：本次刻意不加谓词，行为必须保持不变
+		// Person：channel_id 是**收件人** uid。发给别人的那条对 A 不可见，
+		// 发给 A 的那条可见 —— 当事人判定，不需要任何成员表。
 		{"person_ch", common.ChannelTypePerson.Uint8(), "", remUIDB, 16},
+		{remUIDA, common.ChannelTypePerson.Uint8(), "", remUIDB, 22},
+		// 成员来源不可解析的类型：本次刻意不加谓词，行为必须保持不变
 		{"cs_ch", common.ChannelTypeCustomerService.Uint8(), "", remUIDB, 17},
 		{"community_ch", common.ChannelTypeCommunity.Uint8(), "", remUIDB, 18},
 		{"info_ch", common.ChannelTypeInfo.Uint8(), "", remUIDB, 19},
@@ -293,10 +296,15 @@ func TestRemindersSync_UnresolvableChannelTypesUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	ids := channelIDsOf(got)
 
-	for _, ch := range []string{"person_ch", "cs_ch", "community_ch", "info_ch"} {
+	for _, ch := range []string{"cs_ch", "community_ch", "info_ch"} {
 		assert.Contains(t, ids, ch,
-			"成员来源不可解析的频道类型行为必须保持不变，否则是功能回归而非安全收益")
+			"成员来源不可解析的频道类型（3/4/6）行为必须保持不变，否则是功能回归而非安全收益")
 	}
+	// Person（类型 1）不在此列：它有可达生产者且当事人可判定，已单独加谓词。
+	assert.NotContains(t, ids, "person_ch",
+		"发给别人的 DM 频道级提醒不得对第三方可见")
+	assert.Contains(t, ids, remUIDA,
+		"发给调用方本人的 DM 频道级提醒必须仍然可见")
 }
 
 // TestRemindersSync_ClientChannelIDsCannotWiden —— channelIDs 由客户端提供，
@@ -333,7 +341,9 @@ func TestRemindersSync_NoGroupsSeesNoChannelLevel(t *testing.T) {
 	for _, ch := range []string{remGroupA, remGroupB, remGroupC, remGroupD, remTopicA, remTopicB} {
 		assert.NotContains(t, ids, ch, "非任何群成员不得看到类型 2/5 的频道级提醒")
 	}
-	assert.Contains(t, ids, "person_ch", "不可解析类型仍不受影响")
+	assert.Contains(t, ids, "cs_ch", "不可解析类型（3/4/6）仍不受影响")
+	assert.Contains(t, ids, remUIDA, "发给本人的 DM 提醒不依赖群成员关系，仍可见")
+	assert.NotContains(t, ids, "person_ch", "发给别人的 DM 仍不可见")
 }
 
 // TestRemindersSync_PublisherExclusionStillHolds —— YUJ-1377 行为不回归：
@@ -415,13 +425,18 @@ func TestRemindersSync_SurvivesGroupMemberCollationMismatch(t *testing.T) {
 // TestChannelLevelVisibility_EmptyMemberSet 是不依赖 DB 的形状守卫：空集合不得
 // 落到 `IN ()`（非法 SQL），且必须是"类型 2/5 全部排除"而不是"全部放行"。
 func TestChannelLevelVisibility_EmptyMemberSet(t *testing.T) {
-	sql, args := channelLevelVisibility(nil)
+	sql, args := channelLevelVisibility(remUIDA, nil)
 
 	assert.NotContains(t, sql, "not in",
 		"谓词必须是白名单：黑名单会放行任何枚举外的新类型（PR#717 review P1）")
 	assert.Contains(t, sql, "reminders.channel_type in ?")
-	assert.Equal(t, []interface{}{unscopedChannelTypes}, args,
-		"空集合下只应绑定不受成员约束的类型白名单，Group/CommunityTopic 一律不可见")
+	assert.Equal(t,
+		[]interface{}{unscopedChannelTypes, common.ChannelTypePerson.Uint8(), remUIDA},
+		args,
+		"空集合下应绑定：无生产者类型白名单 + Person 当事人判定；"+
+			"Group/CommunityTopic 一律不可见，但 DM 当事人关系不依赖群成员关系")
+	assert.Contains(t, sql, "reminders.channel_id=?",
+		"空成员集合分支同样必须带 Person 当事人谓词，否则 DM 边在这条路径上仍然泄露")
 }
 
 // TestChannelLevelReminderChannelTypes 守卫"知情保留的残留"。
@@ -505,7 +520,8 @@ func TestChannelLevelReminderChannelTypes(t *testing.T) {
 	}
 
 	wantResidual := []uint8{
-		common.ChannelTypePerson.Uint8(),
+		// Person(1) 已移出残留：它有可达生产者且当事人可判定，见 channelLevelVisibility
+		// 的 Person 分支（PR#717 review）。
 		common.ChannelTypeCustomerService.Uint8(),
 		common.ChannelTypeCommunity.Uint8(),
 		common.ChannelTypeInfo.Uint8(),
@@ -617,7 +633,7 @@ func TestRemindersSync_EmptyCallerUIDIsRejected(t *testing.T) {
 // ParseChannelID 用 strings.Split 要求恰好两段，"g____a____b" 判非法；单靠
 // substring_index 取第一段则会把它当成属于 g。谓词里的分隔符计数条件负责这个收敛。
 func TestChannelLevelVisibility_TopicRequiresExactlyOneSeparator(t *testing.T) {
-	sql, _ := channelLevelVisibility([]string{"g_any"})
+	sql, _ := channelLevelVisibility(remUIDA, []string{"g_any"})
 
 	assert.Contains(t, sql, "length(reminders.channel_id)",
 		"子区分支必须带分隔符计数条件，否则畸形 ID 会继承第一段的成员关系")
@@ -710,4 +726,70 @@ func TestRemindersSync_TopicWithoutSeparatorIsDenied(t *testing.T) {
 	assert.Zero(t, bare, "无分隔符的 type-5 行不得靠整串匹配群成员关系")
 	// 同名的群类型行仍然正常可见，确认没有误伤。
 	assert.Contains(t, channelLevelIDsOf(got), remGroupA)
+}
+
+// TestRemindersSync_PersonRequiresPartyhood 是 PR#717 两位 reviewer 独立 block 的
+// 那条的回归。
+//
+// 链路：AddMessagesListener 无频道类型过滤 → getReminders 只看 mention.humans、
+// 原样拷贝 ChannelType → DM 发送路径接受 Person 且不清洗 mention.humans。于是
+// 客户端可以构造一条 {"mention":{"humans":1}} 的 DM，落出频道级 Person 行
+// (channel_id=收件人uid, publisher=发送者uid)。此前它走白名单放行 = 把「谁在跟谁
+// 私聊」公开给所有登录用户，正是本 PR 要关的那类社交图谱泄露。
+//
+// 判定不需要任何成员表：收件人 uid 就是 channel_id。
+func TestRemindersSync_PersonRequiresPartyhood(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	myGroups := remMemberSeed(t, ctx)
+
+	// C 与 B 之间的 DM，A 完全无关 —— 泄露的正是这条边。
+	_, err := ctx.DB().Exec(
+		"INSERT INTO reminders (channel_id, channel_type, uid, publisher, version, reminder_type, text) VALUES (?,?,'',?,?,1,'[有人@我]')",
+		"u_carol", common.ChannelTypePerson.Uint8(), remUIDB, 50)
+	require.NoError(t, err)
+
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, myGroups)
+	require.NoError(t, err)
+	ids := channelLevelIDsOf(got)
+
+	assert.NotContains(t, ids, "u_carol",
+		"第三方之间的 DM 边不得暴露给无关调用方")
+	assert.NotContains(t, ids, "person_ch",
+		"发给别人的 DM 频道级提醒不得对第三方可见")
+	assert.Contains(t, ids, remUIDA,
+		"发给调用方本人的 DM 频道级提醒必须可见 —— 收紧不能误伤当事人")
+
+	// 空成员集合分支走的是另一段 SQL，当事人判定必须同样生效。
+	gotNoGroups, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, nil)
+	require.NoError(t, err)
+	idsNoGroups := channelLevelIDsOf(gotNoGroups)
+	assert.NotContains(t, idsNoGroups, "u_carol", "空成员集合分支同样不得泄露 DM 边")
+	assert.Contains(t, idsNoGroups, remUIDA, "当事人判定不依赖群成员关系")
+}
+
+// TestRemindersSync_PersonSenderStillExcluded —— 发送者不该收到自己发的 DM 广播。
+// 现有的 NOT (uid=” AND publisher=?) 负责这个，新加的当事人谓词不得把它推翻。
+func TestRemindersSync_PersonSenderStillExcluded(t *testing.T) {
+	ctx := remMemberNewCtx(t, "utf8mb4_general_ci")
+	remMemberEnsureTables(t, ctx, "utf8mb4_general_ci")
+	myGroups := remMemberSeed(t, ctx)
+
+	// A 给自己发（收件人=A 且 publisher=A）——两个条件同时成立的边界情形。
+	_, err := ctx.DB().Exec(
+		"INSERT INTO reminders (channel_id, channel_type, uid, publisher, version, reminder_type, text) VALUES (?,?,'',?,?,1,'[有人@我]')",
+		remUIDA, common.ChannelTypePerson.Uint8(), remUIDA, 51)
+	require.NoError(t, err)
+
+	got, err := newRemindersDB(ctx).sync(remUIDA, 0, 100, nil, myGroups)
+	require.NoError(t, err)
+
+	var selfPublished int
+	for _, r := range got {
+		if r.UID == "" && r.ChannelID == remUIDA && r.Publisher == remUIDA {
+			selfPublished++
+		}
+	}
+	assert.Zero(t, selfPublished,
+		"自己发布的频道级广播仍不得回给自己（YUJ-1377），当事人谓词不覆盖它")
 }

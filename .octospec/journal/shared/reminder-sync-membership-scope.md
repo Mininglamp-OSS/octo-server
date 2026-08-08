@@ -91,42 +91,50 @@ the suite could never have surfaced this — the collations match *because the
 setup chose them*. The hazard had to be reasoned from the migration history and
 then reproduced deliberately.
 
-### Only channel types 2 and 5 — a knowingly-retained residual
+### Which channel types are gated, and why the residual shrank
 
-`getReminders` copies `ChannelType` straight off the message
-(`api_reminders.go:247`) and `hasMention` (`:427`) does not look at channel type
-at all, so all six `common.ChannelType` values can structurally produce a
-channel-level reminder — including the four left unfiltered.
-`TestChannelLevelReminderChannelTypes` asserts exactly that, and its
-`wantResidual` of `{1,3,4,6}` is the machine-checked statement of it.
+`getReminders` copies `ChannelType` straight off the message and `hasMention`
+does not look at channel type at all, so all six `common.ChannelType` values can
+structurally produce a channel-level reminder. The gate therefore has to say
+something about every one of them.
 
-The reason each of the four is left alone is **not** uniform, and an earlier
-draft of this journal got it wrong by claiming they all lack a membership
-source. Corrected per PR#717 review:
+- **2 Group / 5 CommunityTopic — group membership.** Topics resolve through the
+  parent group.
+- **1 Person — party-hood.** The recipient's uid *is* the `channel_id`, so this
+  needs no table at all.
+- **3 CustomerService / 4 Community / 6 Info — passed through.** No producer
+  exists anywhere in the server (a grep for the three constants outside tests
+  returns nothing), so there is nothing to expose; and requiring `group_member`
+  for them would silently drop their reminders if they ever became real, which
+  is a functional regression rather than a security gain.
+- **Anything else — denied.** The gate is an allowlist, so a future enum member
+  fails closed.
 
-- **3 CustomerService / 4 Community / 6 Info — no producer.**
-  `grep -rn 'ChannelTypeCustomerService|ChannelTypeCommunity\b|ChannelTypeInfo'
-  --include=*.go modules/ | grep -v _test.go` returns zero hits server-wide.
-  Nothing creates or serves these channels, so there is nothing to expose.
-- **1 Person — a membership source does exist, and it was not used.** A Person
-  channel ID is self-describing (`common.GetFakeChannelIDWith` builds
-  `"<uidX>@<uidY>"`), so the caller's party-hood is checkable with no table at
-  all. The brief's own channel-type table says as much
-  (`1 | Person | 无表，需从 fakeChannelID 推导`); the journal's earlier "no usable
-  membership source" contradicted it and was simply false. This is the one
-  residual type that could be closed today. It is left open because no client
-  emits `mention.humans=1` on a Person channel, so no such row is known to
-  exist — a weaker justification than "unclosable", and it is recorded as a
-  follow-up rather than dressed up as a design constraint.
+**Person was in the pass-through list for two revisions, and that was wrong.**
+The justification given for the whole group was "requiring `group_member` would
+silently drop legitimate reminders" — but that argument does not apply to type 1
+at all: no membership lookup is involved, the recipient's uid is right there in
+the row, and the sender is already excluded by the existing
+`NOT (uid='' AND publisher=?)` clause. The brief had even written down that
+party-hood was decidable for Person, and then filed it under "no known
+producer" anyway. Reason and conclusion did not match.
 
-Requiring `group_member` for any of the four would silently drop their
-reminders if they ever became real — a functional regression, not a security
-gain — which is why the gate is not simply widened to "everything".
+Two reviewers independently found the reachable producer: the DM send path
+accepts `ChannelTypePerson` and does not sanitise `mention.humans`, and the
+payload handed to the reminder listener is the pre-substitution `message` (see
+`toConfigMessageResp`), so a crafted DM lands a channel-level Person row whose
+`channel_id` is the recipient. Passing that through published *who is talking to
+whom* to every authenticated caller — the same social-graph disclosure this task
+exists to close, on a neighbouring channel type. One of the two reviewers had
+rated it advisory twice and reversed their own approval after checking it.
 
-The guard test pins the difference between "types that emit channel-level
-reminders" and "types the predicate covers". Narrowing the gate, widening the
-emitter, or adding a channel type all turn it red, forcing a human to re-decide
-rather than letting the boundary drift.
+The lesson worth keeping is narrower than "we missed a case": **"no known
+producer today" is a likelihood statement, not an invariant, and it had already
+been rejected once in this same task** — it is exactly the reasoning that got
+the denylist replaced with an allowlist for unknown types. Applying it to
+unknown types and then accepting it for Person, in consecutive revisions, was
+inconsistent. Where a decidable authorization predicate exists, "nobody produces
+this today" is not a reason to skip it.
 
 ### The client's `channel_ids` narrows, never widens
 
@@ -221,9 +229,11 @@ next person does not rediscover them:
 - `SpaceMiddleware`'s opt-in fail-open. Documented old-client compatibility
   across conversation / message sync / reactions / search / pinned; needs
   per-route evaluation. This endpoint no longer depends on it.
-- The same fail-open shape in DM Space filtering
-  (`modules/message/space_filter.go:593` and `:482`, `api.go:1973` / `:2165`,
-  `api_message_get.go:262`). Real, but a different blast radius — a caller only
-  ever reaches DMs they are already a party to.
-- Retest §4.10 `real_name` disclosure: YUJ-413 product decision
-  (`modules/user/api.go:3893`), not an oversight. Needs a product call.
+- The same fail-open shape in DM Space filtering. Real, but a different blast
+  radius — a caller only ever reaches DMs they are already a party to. Locations
+  are deliberately not listed: this repository is public, and naming the exact
+  call sites of an unremediated finding publishes an exploitable map. Tracked
+  out-of-band.
+- Retest §4.10 `real_name` disclosure: dispositioned as a product decision
+  (YUJ-413), not an oversight. Needs a product call, not a code change. Same
+  reason for not citing lines here.

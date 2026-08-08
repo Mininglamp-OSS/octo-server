@@ -20,9 +20,12 @@ change-log convention (§7). Newest first.
   the validated `space_id`, and a caller holding a header for a space they do
   belong to got the same dump. The primary regression test therefore keeps a
   valid `X-Space-Id` and still requires non-member rows to be absent. Scope
-  covers channel types Group and CommunityTopic only; Person / CustomerService /
-  Community / Info have no resolvable membership source in octo-server and are a
-  knowingly-retained residual, pinned by `TestChannelLevelReminderChannelTypes`.
+  covers Group and CommunityTopic (group membership) plus Person (party-hood —
+  the recipient's uid *is* the `channel_id`, so no table is needed). Only
+  CustomerService / Community / Info remain a knowingly-retained residual, and
+  for a different reason: they have no producer anywhere in the server. The gate
+  is an allowlist, so an unknown or future channel type fails closed. The
+  residual set is pinned by `TestChannelLevelReminderChannelTypes`.
   Membership is matched with bind-parameter `IN`, not a join to `group_member`:
   the two tables can land on different collations per deployment (Error 1267),
   and pinning `COLLATE` costs the index — the trap documented in

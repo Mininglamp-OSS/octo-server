@@ -79,8 +79,9 @@ const topicChannelSeparator = thread.ChannelIDSeparator
 //
 // 元素类型是 int 而非 uint8：Go 里 []uint8 就是 []byte，dbr 会把它当二进制串插值，
 // 生成的不是 IN 列表。这个坑不会报错，只会静默产出一个匹配不上任何行的谓词。
+// 类型 1 Person **不在**此列：它有可达的生产者，且当事人可判定，见
+// channelLevelVisibility 里的 Person 分支。
 var unscopedChannelTypes = []int{
-	int(common.ChannelTypePerson.Uint8()),          // 1：channel_id 自描述，可判定当事人；留着是因无已知生产者
 	int(common.ChannelTypeCustomerService.Uint8()), // 3：全仓无生产者
 	int(common.ChannelTypeCommunity.Uint8()),       // 4：全仓无生产者
 	int(common.ChannelTypeInfo.Uint8()),            // 6：全仓无生产者
@@ -94,8 +95,9 @@ var unscopedChannelTypes = []int{
 // 拿到自己从未加入的频道的 channel_id / publisher / message_id / message_seq。
 // channelIDs 由客户端提供，只能用来**收窄**，永远不能充当授权依据。
 //
-// 成员校验只覆盖 Group 与 CommunityTopic；其余类型走 unscopedChannelTypes 白名单
-// 原样放行，理由见该变量上的逐条注释（3/4/6 无生产者；1 可判定但无已知生产者）。
+// 授权判定覆盖 Group / CommunityTopic（成员关系）与 Person（当事人关系）；
+// 只有 3/4/6 走 unscopedChannelTypes 白名单原样放行 —— 它们在全仓无生产者，且没有
+// 可用的成员来源，硬套 group_member 只会在它们将来变成真实数据时静默丢弃合法提醒。
 //
 // **用白名单而不是 `not in (2,5)` 黑名单**，是 PR#717 review P1 的整改：黑名单下
 // 「2/5 之外的任何值」都放行，包括将来往 common.ChannelType 里新增的枚举值 ——
@@ -112,13 +114,34 @@ var unscopedChannelTypes = []int{
 // 继承建库默认 —— 两者在部分部署上会落到不同 collation，列对列比较会抛 Error 1267，
 // 而用 COLLATE pin 绕开又会让索引失效退化成全表扫（同迁移的注释已记录这个陷阱）。
 // 与字面量比较不存在该问题：字面量按列的 collation 强制转换。
-func channelLevelVisibility(memberGroupNos []string) (string, []interface{}) {
+func channelLevelVisibility(uid string, memberGroupNos []string) (string, []interface{}) {
 	grp := common.ChannelTypeGroup.Uint8()
 	topic := common.ChannelTypeCommunityTopic.Uint8()
+	person := common.ChannelTypePerson.Uint8()
+
+	// Person 分支：调用方必须是这条 DM 的**收件人**。
+	//
+	// Person 消息在 webhook 落库前，message.ChannelID 就是收件人 uid —— 它要与
+	// FromUID 合成才得到 fakeChannelID（modules/webhook/api.go:291-293），而喂给
+	// 监听器的 confMessages 用的是 toConfigMessageResp()，取的是**替换前**的原值。
+	// 所以频道级 Person 行的形状是 (channel_id=收件人uid, publisher=发送者uid)。
+	//
+	// 为什么必须加这一支：DM 发送路径接受 ChannelTypePerson 且不清洗 mention.humans，
+	// 所以客户端可以构造 {"mention":{"humans":1}} 的 DM，落出一条频道级 Person 行。
+	// 此前它走白名单放行，等于把「收件人是谁」公开给所有登录用户 —— 正是本 PR 要关的
+	// 那类社交图谱泄露，只是换了个频道类型（PR#717 review，两位 reviewer 独立发现）。
+	//
+	// 之前把它归入残留的理由是「硬套 group_member 会误伤合法提醒」，但那个理由**对
+	// 类型 1 根本不适用**：不需要任何成员表，收件人 uid 就是 channel_id，发送者也已被
+	// 现有的 NOT (uid='' AND publisher=?) 排除。理由与结论对不上，是我的论证错误。
+	personVisible := "(reminders.channel_type=? and reminders.channel_id=?)"
+	personArgs := []interface{}{person, uid}
+
 	if len(memberGroupNos) == 0 {
-		// 不是任何群的活跃成员：类型 2/5 一条都不可见，其余按白名单放行。
-		// 不能生成 `IN ()`——那不是合法 SQL；unscopedChannelTypes 恒非空，无此风险。
-		return "reminders.channel_type in ?", []interface{}{unscopedChannelTypes}
+		// 不是任何群的活跃成员：类型 2/5 一条都不可见，Person 仍按当事人判定，
+		// 其余按白名单放行。unscopedChannelTypes 恒非空，不会生成非法的 `IN ()`。
+		return "(reminders.channel_type in ? or " + personVisible + ")",
+			append([]interface{}{unscopedChannelTypes}, personArgs...)
 	}
 	// 子区那一支的分隔符计数条件（`… = 1`）是为了与 thread.ParseChannelID 口径一致：
 	// 它用 strings.Split 要求**恰好**两段，"g____a____b" 直接判非法；而单靠
@@ -128,15 +151,15 @@ func channelLevelVisibility(memberGroupNos []string) (string, []interface{}) {
 	// char_length()（字符），只因分隔符恰好是 ASCII 才等价 —— 一个授权谓词里不该
 	// 埋着「只要分隔符一直是 ASCII 就成立」这种隐含前提（PR#717 review P2-2）。
 	return "(reminders.channel_type in ?" +
+			" or " + personVisible +
 			" or (reminders.channel_type=? and reminders.channel_id in ?)" +
 			" or (reminders.channel_type=? and substring_index(reminders.channel_id,?,1) in ?" +
 			" and (length(reminders.channel_id)-length(replace(reminders.channel_id,?,'')))/?=1))",
-		[]interface{}{
-			unscopedChannelTypes,
+		append(append([]interface{}{unscopedChannelTypes}, personArgs...),
 			grp, memberGroupNos,
 			topic, topicChannelSeparator, memberGroupNos,
 			topicChannelSeparator, len(topicChannelSeparator),
-		}
+		)
 }
 
 /*
@@ -171,7 +194,7 @@ func (r *remindersDB) sync(uid string, version int64, limit uint64, channelIDs [
 		return nil, errors.New("reminders sync: empty caller uid")
 	}
 
-	visSQL, visArgs := channelLevelVisibility(memberGroupNos)
+	visSQL, visArgs := channelLevelVisibility(uid, memberGroupNos)
 
 	// 频道级分支：先按客户端给的 channelIDs 收窄（可选），再过成员可见性（强制）。
 	channelLevel := "reminders.uid='' and " + visSQL
