@@ -116,10 +116,22 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	fencedUID := userInfo.UID
 	loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
 	if err != nil {
 		u.Error("初始化用户名登录会话栅栏失败", zap.Error(err))
 		respondUserServiceError(c)
+		return
+	}
+	userInfo, err = u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+	if err != nil {
+		u.Error("会话栅栏后复核用户名登录用户失败", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil || userInfo.UID != fencedUID {
+		u.loginGuard.RecordFailureLogged(req.Username)
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	// 已注销账号拒绝登录；冷静期账号允许登录（响应中附带注销状态提示）

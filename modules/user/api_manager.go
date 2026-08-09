@@ -276,6 +276,17 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
+	fencedUID := userInfo.UID
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(req.Username)
+	if err != nil {
+		m.Error("会话栅栏后复核管理端用户失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil || userInfo.UID != fencedUID {
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)

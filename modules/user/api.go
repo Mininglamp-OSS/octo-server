@@ -1633,10 +1633,28 @@ func (u *User) login(c *wkhttp.Context) {
 		return
 	}
 	if userInfo != nil {
+		fencedUID := userInfo.UID
 		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
 		if err != nil {
 			u.Error("初始化登录会话栅栏失败", zap.Error(err))
 			respondUserServiceError(c)
+			return
+		}
+		// BeginIssue must precede the authoritative credential read. If a
+		// password reset commits after the first lookup but before the fence,
+		// validating that stale in-memory hash would issue a session under the
+		// post-reset generation. Re-read the same login identity and require it
+		// to still resolve to the fenced UID; a later reset is stopped by the
+		// final fence CAS in IssueNewSession.
+		userInfo, err = u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+		if err != nil {
+			u.Error("会话栅栏后复核用户信息失败", zap.String("username", req.Username), zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if userInfo == nil || userInfo.UID != fencedUID {
+			u.loginGuard.RecordFailureLogged(req.Username)
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
 	}
