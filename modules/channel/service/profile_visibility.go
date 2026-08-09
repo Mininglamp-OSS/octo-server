@@ -31,8 +31,12 @@ type PersonProfileInput struct {
 	// Robot：目标是 bot。资料公开可查——用户要先看到 bot 才能决定是否添加；
 	// "查看资料" != "已可交互"，未加好友仍不能与 bot 对话。
 	Robot bool
-	// Followed：已关注。user.GetUserDetail 已把「好友」与「同 Space 可直接聊天」
-	// 两种可达关系合并进 Follow，故这里一个布尔即覆盖两者。
+	// Followed：调用方与目标存在可达关系（好友，或同属一个**正常状态**的 Space）。
+	//
+	// 必须由调用方用**授权口径**计算（user.IService.HasAuthzRelation），
+	// **不要**直接传 UserDetailResp.Follow / ChannelResp.Follow：那是展示字段，
+	// 其"同 Space"来源不校验 Space 活性（封禁 Space 只翻父行、成员行仍在），
+	// 用它做授权会让封禁冻结失效。
 	Followed bool
 }
 

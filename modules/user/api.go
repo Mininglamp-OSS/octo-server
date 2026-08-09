@@ -1263,15 +1263,25 @@ func (u *User) get(c *wkhttp.Context) {
 	// 判定与 /v1/channels/:id/:type 共用 channel/service，两端口径不会漂移。
 	// 与 channelGet 最小集的差异：这里**保留** follow —— 资料页要靠它渲染加好友入口，
 	// 省略会让"陌生人可加好友"这个正常入口消失（channelGet 是发送者渲染，不需要）。
-	visible, err := chservice.PersonProfileVisible(chservice.PersonProfileInput{
-		LoginUID: loginUID,
-		PeerUID:  uid,
-		// SyntheticIdentity 恒为 false：iwh_ 前缀在上方已提前 return，走不到这里。
-		// 显式留空而不是重复前缀判断，避免读起来像 load-bearing 的死条件。
+	// 身份类放行（本人 / bot / 系统账号）先判定，不命中才付关系查询的代价。
+	// SyntheticIdentity 恒为 false：iwh_ 前缀在上方已提前 return，走不到这里。
+	fastPath := chservice.PersonProfileInput{
+		LoginUID:      loginUID,
+		PeerUID:       uid,
 		SystemAccount: userDetailResp.Category == CategorySystem || userDetailResp.Category == CategoryCustomerService,
 		Robot:         userDetailResp.Robot == 1,
-		Followed:      userDetailResp.Follow == 1,
-	}, chservice.CommonGroupChecker(getCommonGroupChecker()))
+	}
+	visible, err := chservice.PersonProfileVisible(fastPath, nil)
+	if err == nil && !visible {
+		// 关系腿走授权口径：不能用 userDetailResp.Follow（展示字段，其同 Space 来源
+		// 不校验 Space 活性，封禁 Space 的成员行仍在）。
+		var related bool
+		if related, err = u.userService.HasAuthzRelation(loginUID, uid); err == nil {
+			in := fastPath
+			in.Followed = related
+			visible, err = chservice.PersonProfileVisible(in, chservice.CommonGroupChecker(getCommonGroupChecker()))
+		}
+	}
 	if err != nil {
 		u.Error("查询用户资料可见关系失败", zap.Error(err), zap.String("uid", uid))
 		respondUserError(c, errcode.ErrUserQueryFailed)

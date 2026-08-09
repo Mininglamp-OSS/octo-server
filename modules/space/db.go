@@ -433,8 +433,41 @@ func (d *DB) updateInvitation(code string, maxUses *int, expiresAt *time.Time) e
 	return err
 }
 
+// HasActiveCommonSpace 判定两个用户是否同属一个**正常状态**的 Space（双方在籍
+// status=1，且 space.status=SpaceStatusNormal）。
+//
+// 与 GetCommonSpaceID 的关键差别是 JOIN 了 space 表校验父实体活性：封禁 / 解散
+// Space 走的是 updateSpaceStatus（db_manager.go），它**只翻 space.status、不清
+// space_member 行**（与 forceDisbandSpace 不同）。因此只查关联表的判定会让封禁
+// Space 的两个成员仍被视为"同 Space 可达"，绕过封禁冻结——与
+// api_member_search.go 里已经处理过的同一类问题。
+//
+// 授权判定必须用本函数；GetCommonSpaceID 保留给展示/兼容用途（它有十余个调用方，
+// 语义不在本次范围内变更）。
+func HasActiveCommonSpace(ctx *config.Context, uid1, uid2 string) (bool, error) {
+	if uid1 == "" || uid2 == "" {
+		return false, nil
+	}
+	var exists int
+	_, err := ctx.DB().SelectBySql(`
+		SELECT 1 FROM space_member sm1
+		INNER JOIN space_member sm2 ON sm1.space_id = sm2.space_id
+		INNER JOIN space s ON s.space_id = sm1.space_id
+		WHERE sm1.uid=? AND sm2.uid=? AND sm1.status=1 AND sm2.status=1
+		  AND s.status=?
+		LIMIT 1
+	`, uid1, uid2, SpaceStatusNormal).Load(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists > 0, nil
+}
+
 // GetCommonSpaceID 查找两个用户共同所在的第一个 Space
 // 返回 space_id 或空字符串（无共同 Space）
+//
+// 注意：本函数**不校验 Space 活性**（不 JOIN space 表），仅供展示用途。
+// 授权判定请用 HasActiveCommonSpace。
 func GetCommonSpaceID(ctx *config.Context, uid1, uid2 string) string {
 	var spaceID string
 	_, err := ctx.DB().SelectBySql(`

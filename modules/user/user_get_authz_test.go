@@ -74,6 +74,26 @@ func getUser(s *server.Server, uid string) *httptest.ResponseRecorder {
 // seedUserGroupMemberInvited 带 invite_uid 建成员行。u.get 只有在成员行 InviteUID
 // 非空时才把 group_member 塞进响应，所以验证"群维度富化是否被抑制"必须用这个 seeder
 // ——否则负向断言恒成立（空断言），证明不了门禁起作用。
+// seedSpace 建 Space 父行并指定 status（1=正常, 2=封禁, 0=已解散）。
+// 授权判定要 JOIN space 校验活性，所以测试必须建父行——只插 space_member 会让
+// "同 Space" 判定为假（这正是 P2-1 修复后的预期行为）。
+func seedSpace(t *testing.T, ctx *config.Context, spaceID string, status int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space (space_id, name, creator, status, version) VALUES (?,?,?,?,1)",
+		spaceID, "sp-"+spaceID, testutil.UID, status,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+func seedSpaceMemberRow(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, version) VALUES (?,?,0,1,1)", spaceID, uid,
+	).Exec()
+	assert.NoError(t, err)
+}
+
 func seedUserGroupMemberInvited(t *testing.T, ctx *config.Context, groupNo, uid, inviteUID string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
@@ -121,11 +141,9 @@ func TestUserGet_SameSpace_Full(t *testing.T) {
 	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
 		UID: "ut_same", Name: "SameSpaceU", ShortNo: "SNSAMEU",
 	}))
+	seedSpace(t, ctx, "sp_a", 1) // 1 = SpaceStatusNormal
 	for _, uid := range []string{testutil.UID, "ut_same"} {
-		_, err := ctx.DB().InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, version) VALUES ('sp_a',?,0,1,1)", uid,
-		).Exec()
-		assert.NoError(t, err)
+		seedSpaceMemberRow(t, ctx, "sp_a", uid)
 	}
 
 	w := getUser(s, "ut_same")
@@ -318,4 +336,43 @@ func TestUserGet_CommonGroupButBlacklisted_Minimal(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
 	assert.Contains(t, body, "BlacklistedPeer", "名字仍可渲染，不裂图")
 	assert.NotContains(t, body, "short_no", "被该群拉黑后不应再凭该群拿到完整资料, body=%s", body)
+}
+
+// 同属一个**已封禁** Space：不构成授权口径的可达关系 → 降级最小集（P2-1）。
+// 封禁只翻 space.status、不清 space_member 行，若判定只查关联表，封禁冻结会失效。
+func TestUserGet_BannedCommonSpace_Minimal(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_banned", Name: "BannedSpacePeer", ShortNo: "SNBANNED",
+	}))
+	seedSpace(t, ctx, "sp_banned", 2) // 2 = SpaceStatusBanned
+	seedSpaceMemberRow(t, ctx, "sp_banned", testutil.UID)
+	seedSpaceMemberRow(t, ctx, "sp_banned", "ut_banned")
+
+	w := getUser(s, "ut_banned")
+	body := w.Body.String()
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
+	assert.Contains(t, body, "BannedSpacePeer", "名字仍可渲染")
+	assert.NotContains(t, body, "short_no", "封禁 Space 不应再构成可达关系, body=%s", body)
+	assert.NotContains(t, body, "SNBANNED")
+}
+
+// 同属一个**已解散** Space（status=0）同样不构成可达关系。
+func TestUserGet_DisbandedCommonSpace_Minimal(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_dis", Name: "DisbandedSpacePeer", ShortNo: "SNDIS",
+	}))
+	seedSpace(t, ctx, "sp_dis", 0) // 0 = SpaceStatusDisbanded
+	seedSpaceMemberRow(t, ctx, "sp_dis", testutil.UID)
+	seedSpaceMemberRow(t, ctx, "sp_dis", "ut_dis")
+
+	w := getUser(s, "ut_dis")
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "short_no", "已解散 Space 不应构成可达关系")
 }

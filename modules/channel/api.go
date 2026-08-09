@@ -308,14 +308,26 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 // modules/channel/service（与 /v1/users/:uid 共用，避免两端口径漂移）；这里只负责把
 // 本模块能看到的目标属性翻译成该函数的输入。
 func (ch *Channel) personProfileVisible(loginUID string, peerID string, resp *model.ChannelResp) (bool, error) {
-	return chservice.PersonProfileVisible(chservice.PersonProfileInput{
+	// 身份类放行（本人 / webhook / bot / 系统账号）不需要查关系，先判定；只有都不命中
+	// 才付出 HasAuthzRelation 的查询代价。
+	fastPath := chservice.PersonProfileInput{
 		LoginUID:          loginUID,
 		PeerUID:           peerID,
 		SyntheticIdentity: strings.HasPrefix(peerID, user.WebhookUIDPrefix),
 		SystemAccount:     resp.Category == user.CategorySystem || resp.Category == user.CategoryCustomerService,
 		Robot:             resp.Robot == 1,
-		Followed:          resp.Follow == 1,
-	}, ch.groupService.ExistCommonGroup)
+	}
+	if visible, err := chservice.PersonProfileVisible(fastPath, nil); err != nil || visible {
+		return visible, err
+	}
+	// 关系腿走授权口径：不能用 resp.Follow（展示字段，同 Space 来源不校验 Space 活性）。
+	related, err := ch.userService.HasAuthzRelation(loginUID, peerID)
+	if err != nil {
+		return false, err
+	}
+	in := fastPath
+	in.Followed = related
+	return chservice.PersonProfileVisible(in, ch.groupService.ExistCommonGroup)
 }
 
 func (ch *Channel) state(c *wkhttp.Context) {

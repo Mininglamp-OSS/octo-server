@@ -82,8 +82,19 @@ func seedMemberDeleted(t *testing.T, ctx *config.Context, groupNo, uid string, r
 	assert.NoError(t, err)
 }
 
-// seedSpaceMember 把 uid 加入某 Space（status=1 在籍）。GetCommonSpaceID 只查
-// space_member，不需要 space 表行。
+// seedSpace 建 Space 父行（status: 1=正常 / 2=封禁 / 0=已解散）。
+// 授权口径的"同 Space"判定会 JOIN space 校验活性（space.HasActiveCommonSpace），
+// 所以只插 space_member 不建父行 = 不可达——这正是封禁冻结生效的机制。
+func seedSpace(t *testing.T, ctx *config.Context, spaceID string, status int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space (space_id, name, creator, status, version) VALUES (?,?,?,?,1)",
+		spaceID, "sp-"+spaceID, testutil.UID, status,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+// seedSpaceMember 把 uid 加入某 Space（成员行 status=1 在籍）。
 func seedSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
@@ -282,6 +293,8 @@ func TestChannelGet_Person_CrossSpace_Minimal_SpaceHeaderIrrelevant(t *testing.T
 	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
 		UID: "t_otherspace", Name: "OtherSpaceUser", ShortNo: "SNOTHERSP",
 	}))
+	seedSpace(t, ctx, "space_a", 1)
+	seedSpace(t, ctx, "space_b", 1)
 	seedSpaceMember(t, ctx, "space_a", testutil.UID)   // 调用方在 A
 	seedSpaceMember(t, ctx, "space_b", "t_otherspace") // 目标在 B
 
@@ -312,6 +325,7 @@ func TestChannelGet_Person_SameSpace_Full(t *testing.T) {
 	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
 		UID: "t_samespace", Name: "SameSpaceUser", ShortNo: "SNSAMESP",
 	}))
+	seedSpace(t, ctx, "space_a", 1) // 正常 Space
 	seedSpaceMember(t, ctx, "space_a", testutil.UID)
 	seedSpaceMember(t, ctx, "space_a", "t_samespace")
 

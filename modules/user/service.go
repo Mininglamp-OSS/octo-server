@@ -64,6 +64,13 @@ type IService interface {
 	GetRegisterCountWithDateSpace(startDate, endDate string) (map[string]int64, error)
 	// IsFriend 查询两个用户是否为好友关系
 	IsFriend(uid string, toUID string) (bool, error)
+	// HasAuthzRelation 判定 loginUID 与 peerUID 之间是否存在**授权口径**的可达关系：
+	// 好友，或同属一个正常状态的 Space。
+	//
+	// 不要用 UserDetailResp.Follow 代替它：Follow 是展示字段，其"同 Space"来源
+	// （space.GetCommonSpaceID）不校验 Space 活性，封禁 Space 的成员行仍在，会让
+	// 冻结失效。对象级资料可见性判定必须走本方法。
+	HasAuthzRelation(loginUID string, peerUID string) (bool, error)
 	// 获取在线用户
 	GetUserOnlineStatus([]string) ([]*OnLineUserResp, error)
 	// 更新用户信息
@@ -1154,6 +1161,25 @@ func (s *Service) GetRegisterCountWithDateSpace(startDate, endDate string) (map[
 }
 
 // IsFriend 查询两个用户是否为好友关系
+// HasAuthzRelation 见 IService 的说明。两条腿按代价升序判定：先好友（单表查询），
+// 再同 Space（两表 JOIN + space 活性）。任一成立即返回，避免无谓的第二次查询。
+func (s *Service) HasAuthzRelation(loginUID string, peerUID string) (bool, error) {
+	if loginUID == "" || peerUID == "" {
+		return false, nil
+	}
+	if loginUID == peerUID {
+		return true, nil
+	}
+	isFriend, err := s.IsFriend(loginUID, peerUID)
+	if err != nil {
+		return false, err
+	}
+	if isFriend {
+		return true, nil
+	}
+	return space.HasActiveCommonSpace(s.ctx, loginUID, peerUID)
+}
+
 func (s *Service) IsFriend(uid string, toUID string) (bool, error) {
 	if uid == "" || toUID == "" {
 		return false, errors.New("用户ID不能为空")
