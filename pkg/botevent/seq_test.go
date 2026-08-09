@@ -13,6 +13,22 @@ import (
 	rd "github.com/go-redis/redis"
 )
 
+type gateMutationClient struct {
+	*rd.Client
+	gateCalls  int
+	beforeGate func(call int)
+}
+
+func (c *gateMutationClient) EvalSha(hash string, keys []string, args ...interface{}) *rd.Cmd {
+	if hash == gateScript.Hash() {
+		c.gateCalls++
+		if c.beforeGate != nil {
+			c.beforeGate(c.gateCalls)
+		}
+	}
+	return c.Client.EvalSha(hash, keys, args...)
+}
+
 // These tests need a real MySQL and Redis: the contract is about what two
 // concurrent processes and one exclusive cursor do to each other, and a fake would
 // only restate the code.
@@ -235,6 +251,74 @@ func TestSeedClearsTheLegacyCeilingAtActivation(t *testing.T) {
 	if first <= lastLegacy+legacyGenSeqStep {
 		t.Fatalf("first activated id %d does not clear the legacy reserved block above %d; "+
 			"a block legacy reserved but did not finish issuing would overlap", first, lastLegacy)
+	}
+}
+
+// TestValidatedBeliefRetainsTheCutoverFloor covers the stateFloorOrZero hole.
+//
+// Once a process has validated an activated authority, a later seed for another bot must
+// use the cutover floor carried by that positive belief. Re-reading the state row during
+// seed and turning any error/missing row into zero silently discards the one global floor
+// that was validated at activation, allowing a new counter to restart at 1.
+func TestValidatedBeliefRetainsTheCutoverFloor(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	resolverBot := "seqtest_floor_resolver_bot"
+	newBot := "seqtest_floor_new_bot"
+	fixture(t, ctx, client, resolverBot)
+
+	const cutoverFloor = int64(8_000_000)
+	setStateMode(t, ctx, StateModeIncr, cutoverFloor)
+	ResetSeededForTest()
+	if _, err := nextEventID(ctx, client, resolverBot); err != nil {
+		t.Fatalf("resolve activated authority: %v", err)
+	}
+
+	client.Del(SeqKey(newBot), QueueKey(newBot))
+	_, _ = ctx.DB().DeleteFrom("seq").Where("`key` in ?", []string{
+		"seq:robotEventSeq:" + newBot,
+		HighWaterSeqKey(newBot),
+	}).Exec()
+	if _, err := ctx.DB().DeleteFrom(stateTable).Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
+		t.Fatalf("remove authority after positive resolution: %v", err)
+	}
+
+	got, err := nextEventID(ctx, client, newBot)
+	if err != nil {
+		t.Fatalf("allocate from retained positive belief: %v", err)
+	}
+	if got <= cutoverFloor {
+		t.Fatalf("id %d did not retain validated cutover floor %d after the authority row became unreadable; "+
+			"re-reading the floor during seed and swallowing the error can restart a bot below live cursors",
+			got, cutoverFloor)
+	}
+}
+
+// TestSeedLoadsBothSeqFloorsWithOneQuery is an I/O-shape guard. A mirror rebuild
+// invalidates every active bot's seed marker, so two point SELECTs per bot amplify an
+// already expensive recovery burst. The legacy and durable rows share one table and must
+// be loaded by one conditional aggregate query.
+func TestSeedLoadsBothSeqFloorsWithOneQuery(t *testing.T) {
+	source, err := os.ReadFile("seq.go")
+	if err != nil {
+		t.Fatalf("read seq.go: %v", err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func seedCounter(")
+	if start < 0 {
+		t.Fatal("could not locate seedCounter body")
+	}
+	end := strings.Index(text[start:], "\nfunc queueCeiling(")
+	if end < 0 {
+		t.Fatal("could not locate seedCounter body")
+	}
+	body := text[start : start+end]
+	if !strings.Contains(body, "seqCeilings(ctx, robotID)") {
+		t.Error("seedCounter must load legacy and durable seq floors through one seqCeilings query")
+	}
+	for _, old := range []string{"legacyCeiling(ctx, robotID)", "highWaterCeiling(ctx, robotID)"} {
+		if strings.Contains(body, old) {
+			t.Errorf("seedCounter still calls %s; mirror recovery would issue multiple MySQL reads per bot", old)
+		}
 	}
 }
 
@@ -854,6 +938,75 @@ func TestMissingCounterFailsBeforeIssuingFromOne(t *testing.T) {
 	}
 }
 
+// TestRetryReResolvesWhenTheMirrorChangesAfterReseed covers the retry-specific
+// gateNotActivated sentinel. The mirror can disappear between a successful re-seed and
+// the retrying gate. Treating every negative value as a generic "counter unusable" error
+// loses the existing authority-recovery path and reports the wrong fault.
+func TestRetryReResolvesWhenTheMirrorChangesAfterReseed(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_retry_mirror_bot"
+	fixture(t, ctx, client, robotID)
+
+	highest, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("initial allocation: %v", err)
+	}
+	if err := client.Del(SeqKey(robotID)).Err(); err != nil {
+		t.Fatalf("drop counter: %v", err)
+	}
+
+	wrapped := &gateMutationClient{Client: client}
+	wrapped.beforeGate = func(call int) {
+		if call == 2 {
+			_ = client.Del(ModeKey).Err()
+		}
+	}
+	next, err := nextEventID(ctx, wrapped, robotID)
+	if err != nil {
+		t.Fatalf("mirror changed between re-seed and retry: %v", err)
+	}
+	if next <= highest {
+		t.Fatalf("recovered id %d is not above prior id %d", next, highest)
+	}
+}
+
+// TestRegressionRetryNamesACounterThatDisappearsAgain covers gateCounterMissing on
+// the other retry site. Reporting sentinel -2 as a numeric floor reached by re-seeding
+// sends an operator toward the wrong recovery action.
+func TestRegressionRetryNamesACounterThatDisappearsAgain(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_retry_counter_bot"
+	fixture(t, ctx, client, robotID)
+	if err := client.Set(SeqKey(robotID), 10_000, 0).Err(); err != nil {
+		t.Fatalf("raise initial counter: %v", err)
+	}
+
+	highest, err := nextEventID(ctx, client, robotID)
+	if err != nil {
+		t.Fatalf("initial allocation: %v", err)
+	}
+	if err := client.Set(SeqKey(robotID), highest-3*rollbackTolerance, 0).Err(); err != nil {
+		t.Fatalf("regress counter: %v", err)
+	}
+
+	wrapped := &gateMutationClient{Client: client}
+	wrapped.beforeGate = func(call int) {
+		if call == 2 {
+			_ = client.Del(SeqKey(robotID)).Err()
+		}
+	}
+	_, err = nextEventID(ctx, wrapped, robotID)
+	if err == nil {
+		t.Fatal("counter disappearing again during rollback recovery must fail closed")
+	}
+	if !strings.Contains(err.Error(), "counter") || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("error must identify the retry sentinel as a missing counter, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "only reached -2") {
+		t.Fatalf("error misreports gateCounterMissing as a numeric re-seed floor: %v", err)
+	}
+}
+
 // TestMirrorRebuiltFromDBAuthority is why the state row exists.
 //
 // The mode mirror is in the same Redis as everything else, so it regresses with an
@@ -893,6 +1046,58 @@ func TestMirrorRebuiltFromDBAuthority(t *testing.T) {
 	if v, _ := client.Get(ModeKey).Result(); v != MirrorValue(0) {
 		t.Errorf("mirror was not restored to the generation-stamped value (got %q, want %q)",
 			v, MirrorValue(0))
+	}
+}
+
+// TestHigherMirrorEpochForcesAuthorityRefresh prevents an old process from overwriting
+// a newer generation. Positive beliefs are terminal with respect to legacy, but not with
+// respect to a mirror that names a strictly higher epoch.
+func TestHigherMirrorEpochForcesAuthorityRefresh(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_higher_epoch_bot"
+	fixture(t, ctx, client, robotID)
+
+	if _, err := ctx.DB().Update(stateTable).
+		Set("mode", StateModeIncr).
+		Set("epoch", 2).
+		Set("cutover_floor", 9000).
+		Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
+		t.Fatalf("advance authority epoch: %v", err)
+	}
+	if err := client.Set(ModeKey, MirrorValue(2), 0).Err(); err != nil {
+		t.Fatalf("write newer mirror: %v", err)
+	}
+	activeBelief.Store(&belief{activated: true, epoch: 1, resolvedAt: beliefNow()})
+	seeded.Delete(robotID)
+	client.Del(SeqKey(robotID), QueueKey(robotID))
+
+	if _, err := nextEventID(ctx, client, robotID); err != nil {
+		t.Fatalf("allocate after observing a higher mirror epoch: %v", err)
+	}
+	if got, err := client.Get(ModeKey).Result(); err != nil || got != MirrorValue(2) {
+		t.Fatalf("older belief overwrote newer mirror: got %q err=%v, want %q", got, err, MirrorValue(2))
+	}
+	if b := activeBelief.Load(); b == nil || b.epoch != 2 {
+		t.Fatalf("authority was not refreshed upward (belief=%+v)", b)
+	}
+}
+
+// TestRunGateRejectsIDsOutsideFloat64ExactIntegerRange protects the wire invariant
+// score == event_id. At 2^53, the next integer cannot be represented as a distinct ZSET
+// score, recreating collision, cursor skip, and multi-member ack.
+func TestRunGateRejectsIDsOutsideFloat64ExactIntegerRange(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_float64_limit_bot"
+	fixture(t, ctx, client, robotID)
+
+	const largestSafeID = int64(1<<53 - 1)
+	if err := client.Set(SeqKey(robotID), largestSafeID, 0).Err(); err != nil {
+		t.Fatalf("set counter at exact-integer boundary: %v", err)
+	}
+	if id, err := runGate(client, robotID, MirrorValue(0)); err == nil {
+		t.Fatalf("runGate returned id %d at/above 2^53; adjacent ids no longer have distinct float64 scores", id)
+	} else if !strings.Contains(err.Error(), "float64") {
+		t.Fatalf("boundary refusal must explain the score precision invariant, got: %v", err)
 	}
 }
 

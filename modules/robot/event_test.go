@@ -2,9 +2,17 @@ package robot
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	rd "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
 
@@ -222,10 +230,10 @@ func TestShouldSkipFriendCheck(t *testing.T) {
 // the new mention.entities field. This mirrors the parsing logic at event.go:135-153.
 func TestRobotMentionParsingWithEntities(t *testing.T) {
 	tests := []struct {
-		name         string
-		payload      string
-		expectUIDs   []string
-		expectPanic  bool
+		name        string
+		payload     string
+		expectUIDs  []string
+		expectPanic bool
 	}{
 		{
 			name: "v2 payload with uids and entities",
@@ -403,6 +411,57 @@ func TestGjsonIgnoresUnknownFields(t *testing.T) {
 		parsed.Get("mention.uids").String(),
 		parsedWithout.Get("mention.uids").String(),
 		"uids should be identical with or without entities")
+}
+
+// TestUnknownPayloadRobotIDIsNegativelyCachedAndFallsThroughToMention covers two
+// properties of the client-controlled payload.robot_id branch:
+//  1. repeated well-shaped unknown ids must not cause one MySQL query per message;
+//  2. a declined payload id must not swallow a valid sibling mention route.
+func TestUnknownPayloadRobotIDIsNegativelyCachedAndFallsThroughToMention(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+
+	rb := New(ctx)
+	validBot := fmt.Sprintf("mention_fallback_%d_bot", time.Now().UnixNano())
+	unknownBot := fmt.Sprintf("missing_payload_%d_bot", time.Now().UnixNano())
+	if _, err := ctx.DB().InsertInto("robot").
+		Columns("robot_id", "status", "creator_uid", "description").
+		Values(validBot, 1, "owner", "fallback fixture").Exec(); err != nil {
+		t.Fatalf("insert mentioned bot: %v", err)
+	}
+
+	unknownCacheKey := "robot:exist:" + unknownBot
+	queueKey := botevent.QueueKey(validBot)
+	_ = ctx.GetRedisConn().Del(unknownCacheKey)
+	_ = ctx.GetRedisConn().Del("robot:exist:" + validBot)
+	_ = ctx.GetRedisConn().Del(queueKey)
+	t.Cleanup(func() {
+		_ = ctx.GetRedisConn().Del(unknownCacheKey)
+		_ = ctx.GetRedisConn().Del("robot:exist:" + validBot)
+		_ = ctx.GetRedisConn().Del(queueKey)
+	})
+
+	payload := []byte(fmt.Sprintf(`{"type":1,"content":"hello","robot_id":%q,"mention":{"uids":[%q]}}`,
+		unknownBot, validBot))
+	rb.robotMessageListen([]*config.MessageResp{{
+		MessageID:   time.Now().UnixNano(),
+		FromUID:     "sender",
+		ChannelID:   "group",
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Payload:     payload,
+	}})
+
+	require.Eventually(t, func() bool {
+		members, err := ctx.GetRedisConn().ZRangeByScore(queueKey, rd.ZRangeBy{Min: "-inf", Max: "+inf"})
+		return err == nil && len(members) == 1
+	}, 3*time.Second, 20*time.Millisecond, "valid mention route was swallowed by an unknown payload.robot_id")
+
+	if cached, err := ctx.GetRedisConn().GetString(unknownCacheKey); err != nil || cached != "0" {
+		t.Fatalf("unknown bot was not negatively cached (value=%q err=%v); repeated messages would query MySQL", cached, err)
+	}
+	if exists, err := rb.existRobot(unknownBot); err != nil || exists {
+		t.Fatalf("negative cache did not answer the repeated lookup (exists=%v err=%v)", exists, err)
+	}
 }
 
 // extractBotCommandKey extracts the bot command from content using entities.

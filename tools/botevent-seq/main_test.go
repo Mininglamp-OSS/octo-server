@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,30 @@ func TestActivationPreconditionsRemainVisibleWithYes(t *testing.T) {
 	} {
 		if !strings.Contains(activationPreconditions, want) {
 			t.Errorf("activation preconditions do not contain %q", want)
+		}
+	}
+}
+
+// TestPreflightPagesQueueMembers guards the operator tool's production footprint.
+// ZRANGE 0 -1 returns one unbounded Redis response and the previous implementation then
+// retained a score-sized map. Rank pagination plus adjacent-score accounting bounds both.
+func TestPreflightPagesQueueMembers(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(source)
+	for _, forbidden := range []string{
+		"ZRangeWithScores(k, 0, -1)",
+		"make(map[float64]struct{}",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("preflight still uses unbounded queue accounting %q", forbidden)
+		}
+	}
+	for _, required := range []string{"queueScanPageSize", "scanQueueScores"} {
+		if !strings.Contains(text, required) {
+			t.Errorf("preflight does not contain bounded paging helper %q", required)
 		}
 	}
 }
