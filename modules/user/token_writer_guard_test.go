@@ -6,22 +6,33 @@ import (
 	"go/parser"
 	gotoken "go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestProductionTokenWritersUseSessionStore(t *testing.T) {
+	root := tokenWriterRepoRoot(t)
+	authPackage := filepath.Join(root, "pkg", "auth")
 	var violations []string
-	err := filepath.WalkDir("..", func(path string, entry fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || filepath.Ext(path) != ".go" || filepath.Ext(path) == ".test" || filepath.Base(path) == "token_writer_guard_test.go" {
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".context", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			if path == authPackage {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		if len(path) >= len("_test.go") && path[len(path)-len("_test.go"):] == "_test.go" {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		found, err := directTokenWriterViolations(path)
@@ -82,7 +93,12 @@ func tokenWriterViolations(fset *gotoken.FileSet, file *ast.File, path string) [
 			return true
 		}
 		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || (selector.Sel.Name != "Set" && selector.Sel.Name != "SetAndExpire" && selector.Sel.Name != "SetNX") {
+		if !ok {
+			return true
+		}
+		switch selector.Sel.Name {
+		case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt":
+		default:
 			return true
 		}
 		if expressionContainsTokenPrefix(call.Args[0]) {
@@ -92,6 +108,22 @@ func tokenWriterViolations(fset *gotoken.FileSet, file *ast.File, path string) [
 		return true
 	})
 	return violations
+}
+
+func tokenWriterRepoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	require.NoError(t, err)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found walking up from test directory")
+		}
+		dir = parent
+	}
 }
 
 func expressionContainsTokenPrefix(expression ast.Expr) bool {
