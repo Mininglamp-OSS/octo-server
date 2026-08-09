@@ -1,17 +1,64 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateTokenExpireConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		env     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", want: 720 * time.Hour},
+		{name: "yaml override", yaml: "cache:\n  tokenExpire: 48h\n", want: 48 * time.Hour},
+		{name: "env overrides yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "24h", want: 24 * time.Hour},
+		{name: "day suffix unsupported", yaml: "cache:\n  tokenExpire: 30d\n", wantErr: true},
+		{name: "bare number unsupported", yaml: "cache:\n  tokenExpire: 24\n", wantErr: true},
+		{name: "malformed", yaml: "cache:\n  tokenExpire: tomorrow\n", wantErr: true},
+		{name: "zero", yaml: "cache:\n  tokenExpire: 0s\n", wantErr: true},
+		{name: "negative", yaml: "cache:\n  tokenExpire: -1h\n", wantErr: true},
+		{name: "over hard limit", yaml: "cache:\n  tokenExpire: 721h\n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vp := viper.New()
+			if tt.yaml != "" {
+				vp.SetConfigType("yaml")
+				require.NoError(t, vp.ReadConfig(bytes.NewBufferString(tt.yaml)))
+			}
+			vp.SetEnvPrefix("TS")
+			vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+			vp.AutomaticEnv()
+			if tt.env != "" {
+				t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
+			}
+
+			got, err := validateTokenExpireConfig(vp)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
 
 func TestGlobalRateLimitExcludePathsIncludesProbeEndpoints(t *testing.T) {
 	paths := globalRateLimitExcludePaths()

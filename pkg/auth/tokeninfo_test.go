@@ -4,7 +4,63 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestEncodeV3RoundTrip(t *testing.T) {
+	t.Parallel()
+	issuedAt := time.Date(2026, time.August, 9, 8, 0, 0, 0, time.UTC)
+	in := TokenInfo{
+		UID:               "u1",
+		Name:              "alice",
+		Role:              "admin",
+		Language:          "zh-CN",
+		IssuedAt:          issuedAt.Unix(),
+		ExpiresAt:         issuedAt.Add(24 * time.Hour).Unix(),
+		DeviceFlag:        1,
+		DeviceID:          "device-1",
+		SessionGeneration: "generation-1",
+	}
+
+	encoded, err := EncodeV3(in)
+	if err != nil {
+		t.Fatalf("EncodeV3: %v", err)
+	}
+	if !strings.HasPrefix(encoded, v3Prefix) {
+		t.Fatalf("encoded value missing v3 prefix: %q", encoded)
+	}
+	got, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got != in {
+		t.Fatalf("round trip mismatch: got %+v want %+v", got, in)
+	}
+	if !got.IsV3() {
+		t.Fatal("decoded v3 payload must report IsV3")
+	}
+}
+
+func TestDecodeV3RejectsInvalidLifetime(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "missing issued at", raw: "v3:{\"uid\":\"u1\",\"expires_at\":2,\"session_generation\":\"g\"}"},
+		{name: "missing expires at", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"session_generation\":\"g\"}"},
+		{name: "deadline not after issue", raw: "v3:{\"uid\":\"u1\",\"issued_at\":2,\"expires_at\":2,\"session_generation\":\"g\"}"},
+		{name: "missing generation", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"expires_at\":2}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Decode(tt.raw)
+			if !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf("Decode(%q): want ErrInvalidToken, got %v", tt.raw, err)
+			}
+		})
+	}
+}
 
 func TestEncodeRoundTrip(t *testing.T) {
 	t.Parallel()
