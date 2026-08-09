@@ -1,0 +1,448 @@
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	rd "github.com/go-redis/redis"
+)
+
+var (
+	migrateLegacyTokenScript = rd.NewScript(`
+local value = redis.call("GET", KEYS[1])
+if not value then
+  return {0, -2, 0}
+end
+local ttl = redis.call("PTTL", KEYS[1])
+local version = 1
+if string.sub(value, 1, 3) == "v3:" then
+  version = 3
+elseif string.sub(value, 1, 3) == "v2:" then
+  version = 2
+end
+if version == 3 then
+  if ttl <= 0 then
+    return {version, ttl, 2}
+  end
+  return {version, ttl, 0}
+end
+if ttl == -2 then
+  return {0, ttl, 0}
+end
+if ttl ~= -1 and ttl <= 0 then
+  return {version, ttl, 2}
+end
+local target = tonumber(ARGV[1])
+local cap_target = tonumber(ARGV[2]) + tonumber(ARGV[3])
+if cap_target < target then
+  target = cap_target
+end
+local target_ttl = target - tonumber(ARGV[2])
+local shorten = ttl == -1 or target_ttl <= 0 or ttl > target_ttl
+if not shorten then
+  return {version, ttl, 0}
+end
+if ARGV[4] == "1" then
+  redis.call("PEXPIREAT", KEYS[1], target)
+end
+return {version, ttl, 1}
+`)
+	renewMigrationLockScript = rd.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+`)
+)
+
+var (
+	ErrMigrationLockHeld = errors.New("auth: token migration lock is held")
+	ErrMigrationLockLost = errors.New("auth: token migration lock was lost")
+)
+
+type LegacyMigrationOptions struct {
+	CampaignID string
+	CutoffAt   time.Time
+	BatchSize  int64
+	Interval   time.Duration
+	Apply      bool
+	Lease      time.Duration
+}
+
+type LegacyMigrationResult struct {
+	Complete    bool   `json:"complete"`
+	CampaignID  string `json:"campaign_id"`
+	Scanned     int64  `json:"scanned"`
+	Missing     int64  `json:"missing"`
+	V1          int64  `json:"v1"`
+	V2          int64  `json:"v2"`
+	V3          int64  `json:"v3"`
+	Shortened   int64  `json:"shortened"`
+	Unchanged   int64  `json:"unchanged"`
+	Invalid     int64  `json:"invalid"`
+	V3NonFinite int64  `json:"v3_non_finite"`
+	LastCursor  uint64 `json:"last_cursor"`
+	LockLost    bool   `json:"lock_lost"`
+}
+
+type legacyMigrationCampaign struct {
+	CampaignID   string `json:"campaign_id"`
+	CutoffAtMS   int64  `json:"cutoff_at_unix_ms"`
+	MaxTTLMS     int64  `json:"max_ttl_ms"`
+	BatchSize    int64  `json:"batch_size"`
+	IntervalMS   int64  `json:"interval_ms"`
+	FinitePolicy string `json:"finite_policy"`
+}
+
+type legacyMigrationCheckpoint struct {
+	CampaignID string                `json:"campaign_id"`
+	Cursor     uint64                `json:"cursor"`
+	Result     LegacyMigrationResult `json:"result"`
+}
+
+func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options LegacyMigrationOptions) (result LegacyMigrationResult, err error) {
+	campaign, err := s.validateMigrationOptions(options)
+	if err != nil {
+		return LegacyMigrationResult{}, err
+	}
+	result.CampaignID = campaign.CampaignID
+	if options.Apply {
+		control, err := s.RolloutControl(ctx)
+		if err != nil {
+			return result, err
+		}
+		if control == nil || control.ModeFloor.rank() < SessionModeRevoke.rank() {
+			return result, errors.New("auth: migration apply requires persisted revoke rollout floor")
+		}
+	}
+
+	owner := ""
+	var lockErrors <-chan error
+	if options.Apply {
+		if err := s.ensureMigrationCampaign(campaign); err != nil {
+			return result, err
+		}
+		owner, err = newSessionGeneration()
+		if err != nil {
+			return result, err
+		}
+		acquired, err := s.client.SetNX(s.migrationLockKey(), owner, options.Lease).Result()
+		if err != nil {
+			return result, fmt.Errorf("auth: acquire migration lock: %w", err)
+		}
+		if !acquired {
+			return result, ErrMigrationLockHeld
+		}
+		defer func() {
+			_, _ = compareDeleteScript.Run(s.client, []string{s.migrationLockKey()}, owner).Result()
+		}()
+		keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
+		defer stopKeepalive()
+		lockErrors = s.keepMigrationLockAlive(keepaliveCtx, owner, options.Lease)
+		checkpoint, loadErr := s.loadMigrationCheckpoint(campaign.CampaignID)
+		if loadErr != nil {
+			return result, loadErr
+		}
+		if checkpoint != nil && !checkpoint.Result.Complete {
+			result = checkpoint.Result
+			result.Complete = false
+			result.LockLost = false
+		}
+	}
+
+	var throttle <-chan time.Time
+	var ticker *time.Ticker
+	if options.Interval > 0 {
+		ticker = time.NewTicker(options.Interval)
+		defer ticker.Stop()
+		throttle = ticker.C
+	}
+	cursor := result.LastCursor
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if options.Apply {
+			if err := migrationLockError(lockErrors); err != nil {
+				result.LockLost = errors.Is(err, ErrMigrationLockLost)
+				return result, err
+			}
+			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+				result.LockLost = errors.Is(err, ErrMigrationLockLost)
+				return result, err
+			}
+		}
+		keys, next, err := s.client.Scan(cursor, s.tokenPrefix+"*", options.BatchSize).Result()
+		if err != nil {
+			return result, fmt.Errorf("auth: migration scan: %w", err)
+		}
+		for _, key := range keys {
+			if options.Apply {
+				if err := migrationLockError(lockErrors); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
+				}
+			}
+			if throttle != nil {
+				select {
+				case <-ctx.Done():
+					return result, ctx.Err()
+				case <-throttle:
+				}
+			}
+			if options.Apply {
+				if err := migrationLockError(lockErrors); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
+				}
+			}
+			if err := s.migrateLegacyToken(key, campaign, options.Apply, &result); err != nil {
+				return result, err
+			}
+		}
+		cursor = next
+		result.LastCursor = cursor
+		if options.Apply {
+			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+				result.LockLost = errors.Is(err, ErrMigrationLockLost)
+				return result, err
+			}
+			if err := s.saveMigrationCheckpoint(campaign.CampaignID, cursor, result); err != nil {
+				return result, err
+			}
+		}
+		if cursor == 0 {
+			result.Complete = true
+			if options.Apply {
+				if err := s.saveMigrationCheckpoint(campaign.CampaignID, 0, result); err != nil {
+					return result, err
+				}
+			}
+			return result, nil
+		}
+	}
+}
+
+func (s *RedisSessionStore) validateMigrationOptions(options LegacyMigrationOptions) (legacyMigrationCampaign, error) {
+	campaignID := strings.TrimSpace(options.CampaignID)
+	if campaignID == "" || len(campaignID) > 64 {
+		return legacyMigrationCampaign{}, errors.New("auth: migration campaign id must contain 1-64 characters")
+	}
+	if options.CutoffAt.IsZero() {
+		return legacyMigrationCampaign{}, errors.New("auth: migration cutoff is required")
+	}
+	if options.BatchSize <= 0 || options.BatchSize > 10_000 {
+		return legacyMigrationCampaign{}, errors.New("auth: migration batch size must be between 1 and 10000")
+	}
+	if options.Interval < 0 {
+		return legacyMigrationCampaign{}, errors.New("auth: migration interval must not be negative")
+	}
+	if options.Apply {
+		if options.Lease < 5*time.Second || options.Lease > 5*time.Minute {
+			return legacyMigrationCampaign{}, errors.New("auth: migration lease must be between 5s and 5m")
+		}
+		if !options.CutoffAt.After(time.Now()) {
+			return legacyMigrationCampaign{}, errors.New("auth: migration cutoff must be in the future when apply is enabled")
+		}
+	}
+	return legacyMigrationCampaign{
+		CampaignID:   campaignID,
+		CutoffAtMS:   options.CutoffAt.UTC().UnixMilli(),
+		MaxTTLMS:     s.maxTTL.Milliseconds(),
+		BatchSize:    options.BatchSize,
+		IntervalMS:   options.Interval.Milliseconds(),
+		FinitePolicy: "cap",
+	}, nil
+}
+
+func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrationCampaign, apply bool, result *LegacyMigrationResult) error {
+	nowMS := time.Now().UTC().UnixMilli()
+	applyArg := "0"
+	if apply {
+		applyArg = "1"
+	}
+	raw, err := migrateLegacyTokenScript.Run(
+		s.client,
+		[]string{key},
+		campaign.CutoffAtMS,
+		nowMS,
+		campaign.MaxTTLMS,
+		applyArg,
+	).Result()
+	if err != nil {
+		return fmt.Errorf("auth: migrate token record: %w", err)
+	}
+	parts, ok := raw.([]interface{})
+	if !ok || len(parts) != 3 {
+		return fmt.Errorf("auth: invalid migration result %T", raw)
+	}
+	version, err := redisInteger(parts[0])
+	if err != nil {
+		return err
+	}
+	ttl, err := redisInteger(parts[1])
+	if err != nil {
+		return err
+	}
+	action, err := redisInteger(parts[2])
+	if err != nil {
+		return err
+	}
+	result.Scanned++
+	switch version {
+	case 0:
+		result.Missing++
+	case 1:
+		result.V1++
+	case 2:
+		result.V2++
+	case 3:
+		result.V3++
+		if ttl <= 0 {
+			result.V3NonFinite++
+		}
+	default:
+		result.Invalid++
+	}
+	switch action {
+	case 0:
+		result.Unchanged++
+	case 1:
+		result.Shortened++
+	case 2:
+		result.Invalid++
+	default:
+		return fmt.Errorf("auth: invalid migration action %d", action)
+	}
+	return nil
+}
+
+func (s *RedisSessionStore) ensureMigrationCampaign(campaign legacyMigrationCampaign) error {
+	encoded, err := json.Marshal(campaign)
+	if err != nil {
+		return err
+	}
+	created, err := s.client.SetNX(s.migrationCampaignKey(), string(encoded), 0).Result()
+	if err != nil {
+		return fmt.Errorf("auth: initialize migration campaign: %w", err)
+	}
+	if created {
+		return nil
+	}
+	current, err := s.client.Get(s.migrationCampaignKey()).Result()
+	if err != nil {
+		return fmt.Errorf("auth: load migration campaign: %w", err)
+	}
+	if current != string(encoded) {
+		return errors.New("auth: migration campaign parameters do not match persisted campaign")
+	}
+	if ttl, err := s.client.PTTL(s.migrationCampaignKey()).Result(); err != nil || ttl != -time.Millisecond {
+		return errors.New("auth: migration campaign record must not expire")
+	}
+	return nil
+}
+
+func (s *RedisSessionStore) loadMigrationCheckpoint(campaignID string) (*legacyMigrationCheckpoint, error) {
+	raw, err := s.client.Get(s.migrationCheckpointKey()).Result()
+	if err == rd.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("auth: load migration checkpoint: %w", err)
+	}
+	var checkpoint legacyMigrationCheckpoint
+	if err := json.Unmarshal([]byte(raw), &checkpoint); err != nil {
+		return nil, fmt.Errorf("auth: decode migration checkpoint: %w", err)
+	}
+	if checkpoint.CampaignID != campaignID {
+		return nil, errors.New("auth: migration checkpoint belongs to another campaign")
+	}
+	return &checkpoint, nil
+}
+
+func (s *RedisSessionStore) saveMigrationCheckpoint(campaignID string, cursor uint64, result LegacyMigrationResult) error {
+	encoded, err := json.Marshal(legacyMigrationCheckpoint{CampaignID: campaignID, Cursor: cursor, Result: result})
+	if err != nil {
+		return err
+	}
+	if err := s.client.Set(s.migrationCheckpointKey(), string(encoded), 0).Err(); err != nil {
+		return fmt.Errorf("auth: save migration checkpoint: %w", err)
+	}
+	return nil
+}
+
+func (s *RedisSessionStore) renewMigrationLock(owner string, lease time.Duration) (bool, error) {
+	result, err := renewMigrationLockScript.Run(s.client, []string{s.migrationLockKey()}, owner, lease.Milliseconds()).Result()
+	if err != nil {
+		return false, fmt.Errorf("auth: renew migration lock: %w", err)
+	}
+	value, err := redisInteger(result)
+	return value == 1, err
+}
+
+func (s *RedisSessionStore) confirmMigrationLock(owner string, lease time.Duration) error {
+	ok, err := s.renewMigrationLock(owner, lease)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrMigrationLockLost
+	}
+	return nil
+}
+
+func (s *RedisSessionStore) keepMigrationLockAlive(ctx context.Context, owner string, lease time.Duration) <-chan error {
+	errorsCh := make(chan error, 1)
+	interval := lease / 3
+	if interval > time.Second {
+		interval = time.Second
+	}
+	go func() {
+		defer close(errorsCh)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.confirmMigrationLock(owner, lease); err != nil {
+					errorsCh <- err
+					return
+				}
+			}
+		}
+	}()
+	return errorsCh
+}
+
+func migrationLockError(errorsCh <-chan error) error {
+	if errorsCh == nil {
+		return nil
+	}
+	select {
+	case err, ok := <-errorsCh:
+		if !ok {
+			return nil
+		}
+		return err
+	default:
+		return nil
+	}
+}
+
+func (s *RedisSessionStore) migrationCampaignKey() string {
+	return s.uidTokenPrefix + "auth:migration:campaign"
+}
+
+func (s *RedisSessionStore) migrationCheckpointKey() string {
+	return s.uidTokenPrefix + "auth:migration:checkpoint"
+}
+
+func (s *RedisSessionStore) migrationLockKey() string {
+	return s.uidTokenPrefix + "auth:migration:lock"
+}
