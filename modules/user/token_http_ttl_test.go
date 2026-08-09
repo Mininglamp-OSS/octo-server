@@ -128,6 +128,45 @@ func TestLocalCredentialCannotCrossPasswordChangeBeforeIssueFence(t *testing.T) 
 		require.Equal(t, newHash, fresh.Password)
 	})
 
+	t.Run("manager login rechecks account state after fence", func(t *testing.T) {
+		uid := util.GenerUUID()
+		username := "disabled-manager-" + uid[:12]
+		password := "manager-password"
+		hash, err := HashPassword(password)
+		require.NoError(t, err)
+		require.NoError(t, managerAPI.userDB.Insert(&Model{
+			UID:      uid,
+			Username: username,
+			Name:     "Disabled Manager",
+			ShortNo:  "mgr_" + uid[:12],
+			Password: hash,
+			Role:     string(wkhttp.SuperAdmin),
+			Status:   int(common.UserAvailable),
+		}))
+		managerAPI.sessionStore = &passwordChangeOnBeginIssueStore{
+			RedisSessionStore: realStore,
+			mutate: func() error {
+				_, err := managerAPI.userDB.session.Update("user").
+					Set("status", int(common.UserDisable)).
+					Where("uid=?", uid).
+					Exec()
+				return err
+			},
+		}
+
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"username": username,
+			"password": password,
+		}))))
+		request.Header.Set("Content-Type", "application/json")
+		server.GetRoute().ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusBadRequest, recorder.Code, "body=%s", recorder.Body.String())
+		fresh, err := managerAPI.userDB.QueryByUID(uid)
+		require.NoError(t, err)
+		require.Equal(t, int(common.UserDisable), fresh.Status)
+	})
+
 	t.Run("external login rechecks account state after fence", func(t *testing.T) {
 		uid := util.GenerUUID()
 		require.NoError(t, userAPI.db.Insert(&Model{
