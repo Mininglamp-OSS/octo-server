@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -45,6 +46,80 @@ func TestRedisSessionStoreKeepsTokenDeadline(t *testing.T) {
 	got, err := client.Get(cfg.Cache.TokenCachePrefix + token).Result()
 	require.NoError(t, err)
 	require.Equal(t, "new", got)
+}
+
+func TestRedisSessionStoreRejectsV3PayloadDowngrade(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	store := NewRedisSessionStore(client, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	token := "session-store-v3-downgrade-" + util.GenerUUID()
+	key := cfg.Cache.TokenCachePrefix + token
+	t.Cleanup(func() {
+		_ = client.Del(key).Err()
+		_ = client.Close()
+	})
+	now := time.Now().UTC()
+	v3, err := EncodeV3(TokenInfo{
+		UID:               "u-v3",
+		IssuedAt:          now.Add(-time.Minute).Unix(),
+		ExpiresAt:         now.Add(time.Minute).Unix(),
+		SessionGeneration: "generation-v3",
+	})
+	require.NoError(t, err)
+	v2, err := Encode(TokenInfo{UID: "u-v3", Name: "renamed"})
+	require.NoError(t, err)
+	require.NoError(t, client.Set(key, v3, time.Minute).Err())
+	before, err := client.PTTL(key).Result()
+	require.NoError(t, err)
+
+	ok, err := store.UpdatePayloadKeepDeadline(context.Background(), token, v2)
+	require.False(t, ok)
+	require.ErrorContains(t, err, "version downgrade")
+	after, ttlErr := client.PTTL(key).Result()
+	require.NoError(t, ttlErr)
+	require.Positive(t, after)
+	require.LessOrEqual(t, after, before)
+	got, getErr := client.Get(key).Result()
+	require.NoError(t, getErr)
+	require.Equal(t, v3, got, "a rejected update must leave the v3 payload unchanged")
+}
+
+type sessionStoreProber interface {
+	Probe(context.Context) error
+}
+
+func TestRedisSessionStoreProbeExecutesReadOnlyLua(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-probe:" + util.GenerUUID() + ":"
+	store := NewRedisSessionStore(client, prefix, "session-probe-uid:", time.Minute)
+	t.Cleanup(func() { _ = client.Close() })
+
+	prober, ok := interface{}(store).(sessionStoreProber)
+	require.True(t, ok, "RedisSessionStore must expose a startup Lua compatibility probe")
+	require.NoError(t, prober.Probe(context.Background()))
+	keys, err := client.Keys(prefix + "*").Result()
+	require.NoError(t, err)
+	require.Empty(t, keys, "the startup probe must not write Redis")
+}
+
+func TestRedisSessionStoreProbeFailsClosed(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	store := NewRedisSessionStore(client, "session-probe-fail:", "session-probe-fail-uid:", time.Minute)
+	t.Cleanup(func() { _ = client.Close() })
+	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
+		return func(cmd rd.Cmder) error {
+			if cmd.Name() == "evalsha" || cmd.Name() == "eval" {
+				return errors.New("injected lua rejection")
+			}
+			return old(cmd)
+		}
+	})
+
+	prober, ok := interface{}(store).(sessionStoreProber)
+	require.True(t, ok, "RedisSessionStore must expose a startup Lua compatibility probe")
+	require.ErrorContains(t, prober.Probe(context.Background()), "injected lua rejection")
 }
 
 func TestRedisSessionStoreConcurrentLogoutCannotBeResurrected(t *testing.T) {
@@ -205,6 +280,36 @@ func TestRedisSessionStoreObserveAggregatesOnly(t *testing.T) {
 	require.Equal(t, int64(1), stats.V1)
 	require.Equal(t, int64(2), stats.V2)
 	require.Equal(t, int64(1), stats.V3)
+}
+
+func TestRedisSessionStoreObserveCountsZeroTTLAsInvalid(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "observe-zero-ttl:" + util.GenerUUID() + ":"
+	key := prefix + "token"
+	store := NewRedisSessionStore(client, prefix, "observe-zero-ttl-uid:", time.Minute)
+	require.NoError(t, client.Set(key, "u1@legacy", time.Minute).Err())
+	t.Cleanup(func() {
+		_ = client.Del(key).Err()
+		_ = client.Close()
+	})
+	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
+		return func(cmd rd.Cmder) error {
+			if cmd.Name() == "evalsha" {
+				args := cmd.Args()
+				args[0] = "eval"
+				args[1] = `return {"u1@legacy", 0}`
+				args[2] = 0
+			}
+			return old(cmd)
+		}
+	})
+
+	stats, err := store.Observe(context.Background(), 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), stats.Total)
+	require.Equal(t, int64(1), stats.InvalidTTL)
+	require.Zero(t, stats.Finite)
 }
 
 func TestRedisSessionStoreMissingTokenIsNotRecreated(t *testing.T) {

@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"regexp"
 	"sort"
@@ -21,13 +24,15 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 		name    string
 		yaml    string
 		env     string
+		envSet  bool
 		want    time.Duration
 		wantErr bool
 	}{
 		{name: "default", want: 720 * time.Hour},
 		{name: "yaml override", yaml: "cache:\n  tokenExpire: 48h\n", want: 48 * time.Hour},
-		{name: "env overrides yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "24h", want: 24 * time.Hour},
-		{name: "invalid env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "30d", wantErr: true},
+		{name: "env overrides yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "24h", envSet: true, want: 24 * time.Hour},
+		{name: "empty env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", envSet: true, wantErr: true},
+		{name: "invalid env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "30d", envSet: true, wantErr: true},
 		{name: "day suffix unsupported", yaml: "cache:\n  tokenExpire: 30d\n", wantErr: true},
 		{name: "bare number unsupported", yaml: "cache:\n  tokenExpire: 24\n", wantErr: true},
 		{name: "malformed", yaml: "cache:\n  tokenExpire: tomorrow\n", wantErr: true},
@@ -38,6 +43,15 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			old, existed := os.LookupEnv("TS_CACHE_TOKENEXPIRE")
+			require.NoError(t, os.Unsetenv("TS_CACHE_TOKENEXPIRE"))
+			t.Cleanup(func() {
+				if existed {
+					_ = os.Setenv("TS_CACHE_TOKENEXPIRE", old)
+					return
+				}
+				_ = os.Unsetenv("TS_CACHE_TOKENEXPIRE")
+			})
 			vp := viper.New()
 			if tt.yaml != "" {
 				vp.SetConfigType("yaml")
@@ -46,7 +60,9 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 			vp.SetEnvPrefix("TS")
 			vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 			vp.AutomaticEnv()
-			t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
+			if tt.envSet {
+				t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
+			}
 
 			got, err := validateTokenExpireConfig(vp)
 			if tt.wantErr {
@@ -57,6 +73,44 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestRunAPIRegistersSessionRedisPool(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	foundRegistration := false
+	foundSession := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "RegisterPoolCollectors" || len(call.Args) < 3 {
+			return true
+		}
+		foundRegistration = true
+		clients, ok := call.Args[2].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		for _, element := range clients.Elts {
+			pair, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := pair.Key.(*ast.BasicLit)
+			if ok && key.Value == `"session"` {
+				foundSession = true
+			}
+		}
+		return true
+	})
+
+	require.True(t, foundRegistration, "main must register Redis pool collectors")
+	require.True(t, foundSession, "the shared authentication session pool must be observable")
 }
 
 func TestGlobalRateLimitExcludePathsIncludesProbeEndpoints(t *testing.T) {
