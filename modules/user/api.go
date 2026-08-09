@@ -2206,6 +2206,15 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 		}
 		c.JSON(http.StatusOK, model.Data)
 	}
+	// authed is terminal for this polling cycle. In a multi-replica deployment,
+	// grant_login may have published the state through another process, so this
+	// process cannot receive its in-memory channel notification. Once the shared
+	// Redis read already shows authed, entering the 10-second long poll only adds
+	// latency and retains a goroutine without waiting for any useful transition.
+	if fmt.Sprint(qrcodeModel.Data["status"]) == string(common.ScanLoginStatusAuthed) {
+		respondStatus(qrcodeModel)
+		return
+	}
 	// 只有持密钥的一方才注册推送 channel。
 	//
 	// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，所以未授权方一旦也能注册，就能靠
