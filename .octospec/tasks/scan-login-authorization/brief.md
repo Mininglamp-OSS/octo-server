@@ -14,8 +14,8 @@ source: self
 
 Make the server the policy authority for scan login.
 
-Add the DB-backed System Setting `login.scan_enabled`, defaulting to `true` for
-backward compatibility, and expose it as `scan_login_enabled` from both
+Add the DB-backed System Setting `login.scan_enabled`, defaulting to `false` for
+a safe server-first rollout, and expose it as `scan_login_enabled` from both
 `GET /v1/common/appconfig` response branches. When the setting is `false`, the
 server must reject creation, scanning, confirmation, and redemption of scan-login
 sessions; status polling must return an explicit `disabled` state.
@@ -35,11 +35,14 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - `error-response` — disabled entry points use the localized error envelope and
   one registered user error code.
 - `system-settings` — `login.scan_enabled` is hot-reloaded from the shared
-  snapshot and defaults to enabled when absent.
+  snapshot, fails closed before the first successful load, and defaults to
+  disabled when absent. Later reload failures retain the last good snapshot.
 - `multi-instance` — pending promotion and final consumption use shared Redis;
-  atomicity must hold across replicas and concurrent requests.
+  atomicity must hold across replicas, concurrent requests, and different auth
+  codes minted for the same QR UUID.
 - `secret-handling` — `poll_secret` remains hashed at rest, is required for
-  redemption, and must stay redacted from access and recovery logs.
+  redemption, and must stay redacted from access and recovery logs. The
+  `grant_login` query parameters `auth_code` and `encrypt` are redacted too.
 - `rate-limit` — existing strict per-IP limits on anonymous scan-login endpoints
   remain in place, and non-finite RPS environment values fall back to safe
   defaults instead of degrading the Redis limiter into fail-open behavior.
@@ -47,13 +50,15 @@ session's existing `poll_secret` and must be atomic and one-shot.
 ## State model
 
 1. `loginuuid` creates the QR state and a browser-only `poll_secret`.
-2. Scanning creates a pending authorization tied to scanner UID and QR UUID. The
-   QR state becomes `scanned` and contains no UID or redeemable credential.
+2. Scanning a `waitScan` QR creates a pending authorization tied to scanner UID
+   and QR UUID. The QR state becomes `scanned` and contains no UID or redeemable
+   credential; sequential re-scans are rejected.
 3. `grant_login` verifies the authenticated scanner and atomically promotes the
-   pending record into a redeemable authorization. The QR state becomes `authed`.
+   pending record into a redeemable authorization while claiming the QR UUID.
+   At most one auth code can hold that claim. The QR state becomes `authed`.
 4. `login_authcode` validates the authorization type and UUID, validates the
-   matching `poll_secret`, then atomically consumes the authorization before
-   issuing login side effects.
+   matching `poll_secret`, then atomically consumes the authorization and marks
+   the UUID claim consumed before issuing login side effects.
 
 ## Out of scope
 
@@ -66,8 +71,10 @@ session's existing `poll_secret` and must be atomic and one-shot.
 
 ## Acceptance
 
-- `login.scan_enabled` defaults to `true`, accepts a DB override, and is returned
+- `login.scan_enabled` defaults to `false`, accepts a DB override, and is returned
   as `scan_login_enabled` from both appconfig branches.
+- Before the first successful System Settings load, scan login is disabled. A
+  failed later reload keeps the last successfully loaded value.
 - With the switch disabled, `loginuuid`, scan-login QR handling, `grant_login`,
   and `login_authcode` are rejected; `loginstatus` returns `disabled` immediately.
 - Non-login QR codes are unaffected.
@@ -77,6 +84,9 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - Missing or wrong `poll_secret` does not consume a ready authorization.
 - Correct `poll_secret` permits exactly one atomic consume; concurrent or replayed
   redemption cannot issue a second login.
+- Two different auth codes tied to one QR UUID cannot both become ready or issue
+  sessions, including when confirmations arrive concurrently on different
+  replicas. A consumed UUID remains claimed for the confirmation window.
 - Two independently constructed server instances sharing the same Redis permit
   exactly one pending promotion and one session issuance. Every replica can read
   the confirmed state. A new poll that reads an already `authed` state returns
@@ -93,9 +103,13 @@ session's existing `poll_secret` and must be atomic and one-shot.
 ## Client and rollout contract
 
 - Production currently disables local login and registration and uses OIDC as
-  the unified authentication flow. Pre-create `login.scan_enabled=false` before
-  starting the new binaries so Web does not expose scan login and mobile exits
-  the flow on `err.server.user.scan_login_disabled` or polling state `disabled`.
+  the unified authentication flow. Keep `login.scan_enabled=false` so Web does
+  not expose scan login and mobile exits the flow on
+  `err.server.user.scan_login_disabled` or polling state `disabled`.
+- The shipped Web client sends `poll_secret` while polling but not when calling
+  `POST /v1/user/login_authcode/{code}`. Therefore every deployment, not only
+  OIDC-only production, must keep scan login disabled until a client release
+  sends the secret on redemption. There is no legacy compatibility bypass.
 - `POST /v1/user/login_authcode/{code}` now requires the `poll_secret` returned
   by `GET /v1/user/loginuuid`. The `scanned` polling state no longer includes a
   scanner UID; clients must not depend on that field before confirmation.
@@ -134,11 +148,12 @@ session's existing `poll_secret` and must be atomic and one-shot.
   may already be updated while the client received no credentials. This remains
   fail-closed against replay; the client must restart the complete scan flow
   instead of retrying the consumed authorization code.
-- Other deployments keep the backward-compatible default
-  `login.scan_enabled=true` while clients adopt `scan_login_enabled`, `disabled`,
-  and `poll_secret`.
+- An absent setting defaults to disabled. Enabling is an explicit rollout action
+  performed only after Web and mobile clients have passed the contract tests for
+  `scan_login_enabled`, `disabled`, explicit confirmation, and redemption with
+  `poll_secret`.
 - Rollback requires no schema migration. Deployments that intentionally use scan
-  login can restore `login.scan_enabled=true` when reverting this behavior. The
+  login can set `login.scan_enabled=true` only with compatible clients. The
   OIDC-only production deployment must keep the setting `false`; before rolling
   back to an older binary that ignores the key, block scan-login routes at the
   ingress so rollback does not re-expose the historical enabled behavior.

@@ -9,7 +9,11 @@ change-log convention (§7). Newest first.
 - **Task** — `scan-login-authorization`: added a deployment-wide
   `login.scan_enabled` policy gate, split scan from explicit confirmation, bound
   redemption to the browser-issued `poll_secret`, and made confirmation and
-  redemption atomic across replicas. Anonymous polling exposes credential fields
+  redemption atomic across replicas. Review follow-up added a per-UUID claim so
+  different auth codes for one displayed QR cannot both become redeemable,
+  made the rollout gate default disabled and fail closed before the first
+  successful settings load, and scrubbed confirmation credentials from logs.
+  Anonymous polling exposes credential fields
   only to the matching browser and keeps strict per-IP limits; non-finite scan
   limiter values fall back to finite defaults. Incomplete post-consume login work
   emits a bounded warning, while failed QR-state publication restores the pending

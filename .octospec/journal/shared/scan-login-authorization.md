@@ -29,11 +29,23 @@ source: self
   push latency, ambiguous Redis outcomes, consume-first response loss, mixed
   versions, the System Settings reload window, and the OIDC-only production
   requirement to keep scan login disabled.
+- Review follow-up changed the absent-setting default to disabled. An
+  uninitialized System Settings snapshot is represented by nil and fails closed;
+  a successful empty snapshot also stays disabled, while explicit `1` enables
+  the flow. This permits the server to ship before the Web redemption call sends
+  `poll_secret`.
+- Added `scanlogin:claim:{uuid}` to promotion, rollback, and consumption. Lua
+  scripts now allow only one auth code to claim a browser QR session and retain
+  a consumed marker for five minutes. Sequential scans after `waitScan` are
+  rejected; concurrent scans may mint pending codes, but only one can promote.
+- Extended application access/recovery-log scrubbing to the `grant_login`
+  `auth_code` and Signal `encrypt` query values.
 
 ## Verification
 
 - `go test ./modules/user -run 'Test(ScanLogin|LoginWithAuthCode|GrantLogin|GetLogin)' -count=1`
-- `go test -race ./modules/user -run 'Test(ScanLoginRedemptionAuditWarnsOnlyWhenLoginIsIncomplete|ScanLoginAuthorization_(PromoteAndConsumeAreAtomic|RollbackPromotionRestoresPending|MultipleReplicasRedeemOnce)|ScanLoginRateLimitsRejectNonFiniteRPSConfig)$' -count=1`
+- `go test ./modules/user -count=1`
+- `go test -race ./modules/user -run 'TestScanLoginAuthorization_(PromoteAndConsumeAreAtomic|UUIDClaimAllowsOnlyOneAuthorization|RollbackPromotionRestoresPending|MultipleReplicasRedeemOnce|MultipleAuthCodesForOneUUIDRedeemOnce)$' -count=1`
 - `go test ./modules/qrcode -count=1`
 - `go test ./modules/common -run 'Test(GetAppConfig_ScanLogin|SystemSettings_ScanLogin)' -count=1`
 - `go test ./pkg/accesslog -count=1`
@@ -52,6 +64,13 @@ full-package run.
 - Correctness must live in shared Redis state; process-local QR push channels
   are latency optimizations only. An in-flight poll on another replica can still
   wait for its 10-second timeout.
+- Atomicity per auth code is not atomicity per browser session. When multiple
+  credentials share one UUID and one browser secret, the UUID itself must have
+  a shared claim and consumed state.
+- A required client parameter makes a default-on server rollout incompatible
+  even if the server API is additive. Default the gate off until the last
+  consumer is verified; do not add a fail-open compatibility branch to an auth
+  credential check.
 - Consume-first is the safe replay posture, but a downstream failure burns the
   authorization. Clients must restart the complete scan flow rather than retry
   the same credential.
@@ -67,6 +86,7 @@ full-package run.
   ingress, CDN, and APM URL logs must redact it.
 - Other `ParseRPSFromEnv` call sites still need a repository-wide finite-number
   hardening change; this task sanitizes only the two scan-login endpoints.
-- OIDC-only production must pre-create `login.scan_enabled=false`. Old binaries
-  ignore the key, so mixed-version deployment and rollback require an ingress
-  block or blue/green cutover.
+- Scan login now defaults to disabled. OIDC-only production should still
+  explicitly persist `login.scan_enabled=false` for operational clarity. Old
+  binaries ignore the key, so mixed-version deployment and rollback require an
+  ingress block or blue/green cutover.
