@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -125,6 +126,37 @@ func TestLocalCredentialCannotCrossPasswordChangeBeforeIssueFence(t *testing.T) 
 		fresh, err := managerAPI.userDB.QueryByUID(uid)
 		require.NoError(t, err)
 		require.Equal(t, newHash, fresh.Password)
+	})
+
+	t.Run("external login rechecks account state after fence", func(t *testing.T) {
+		uid := util.GenerUUID()
+		require.NoError(t, userAPI.db.Insert(&Model{
+			UID:      uid,
+			Username: "external" + uid[:8],
+			Name:     "Fenced External User",
+			ShortNo:  "ext_" + uid[:12],
+			Status:   1,
+		}))
+		mutationCalled := false
+		userAPI.sessionStore = &passwordChangeOnBeginIssueStore{
+			RedisSessionStore: realStore,
+			mutate: func() error {
+				mutationCalled = true
+				_, err := userAPI.db.session.Update("user").Set("status", int(common.UserDisable)).Where("uid=?", uid).Exec()
+				return err
+			},
+		}
+
+		result, err := userAPI.externalLoginExisting(context.Background(), ExternalLoginReq{
+			ExistingUID: uid,
+			DeviceFlag:  config.Web,
+		})
+		require.Error(t, err)
+		require.True(t, mutationCalled, "test must mutate status inside BeginIssue; err=%v", err)
+		require.Nil(t, result)
+		fresh, queryErr := userAPI.db.QueryByUID(uid)
+		require.NoError(t, queryErr)
+		require.Equal(t, int(common.UserDisable), fresh.Status)
 	})
 
 	_, client := auth.SessionStoreAndClientForContext(ctx)
