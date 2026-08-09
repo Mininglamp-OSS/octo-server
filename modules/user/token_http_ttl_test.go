@@ -25,13 +25,131 @@ var tokenHTTPTestDatabases struct {
 }
 
 func TestTokenDeadlineOverHTTP(t *testing.T) {
-	server, ctx := newTokenHTTPTestServer(t)
+	server, ctx, _, _ := newTokenHTTPTestServer(t)
 	t.Run("manager login issues a finite token", func(t *testing.T) {
 		testManagerLoginIssuesFiniteTokenOverHTTP(t, server, ctx)
 	})
 	t.Run("nickname update preserves the deadline", func(t *testing.T) {
 		testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t, server, ctx)
 	})
+}
+
+func TestLocalCredentialCannotCrossPasswordChangeBeforeIssueFence(t *testing.T) {
+	t.Setenv("OCTO_AUTH_SESSION_MODE", string(auth.SessionModeV3Write))
+	t.Setenv("OCTO_AUTH_SESSION_MAX_PER_UID", "10")
+	server, ctx, userAPI, managerAPI := newTokenHTTPTestServer(t)
+	realStore, ok := userAPI.sessionStore.(*auth.RedisSessionStore)
+	require.True(t, ok)
+
+	t.Run("user login rechecks password after fence", func(t *testing.T) {
+		uid := util.GenerUUID()
+		username := "fenceduser" + uid[:8]
+		oldPassword := "old-user-password"
+		newPassword := "new-user-password"
+		oldHash, err := HashPassword(oldPassword)
+		require.NoError(t, err)
+		newHash, err := HashPassword(newPassword)
+		require.NoError(t, err)
+		require.NoError(t, userAPI.db.Insert(&Model{
+			UID:      uid,
+			Username: username,
+			Name:     "Fenced User",
+			ShortNo:  "usr_" + uid[:12],
+			Password: oldHash,
+			Status:   1,
+		}))
+		loaded, err := userAPI.db.QueryByUsername(username)
+		require.NoError(t, err)
+		require.NotNil(t, loaded)
+		matched, _ := CheckPassword(oldPassword, loaded.Password)
+		require.True(t, matched)
+		require.Equal(t, auth.SessionModeV3Write, realStore.Mode())
+		mutationCalled := false
+		userAPI.sessionStore = &passwordChangeOnBeginIssueStore{
+			RedisSessionStore: realStore,
+			mutate: func() error {
+				mutationCalled = true
+				return userAPI.db.UpdateUsersWithField("password", newHash, uid)
+			},
+		}
+
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/user/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"username": username,
+			"password": oldPassword,
+			"flag":     int(config.Web),
+		}))))
+		request.Header.Set("Content-Type", "application/json")
+		server.GetRoute().ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusBadRequest, recorder.Code, "body=%s", recorder.Body.String())
+		fresh, err := userAPI.db.QueryByUID(uid)
+		require.NoError(t, err)
+		require.True(t, mutationCalled, "test must mutate the password inside BeginIssue; body=%s", recorder.Body.String())
+		matched, _ = CheckPassword(newPassword, fresh.Password)
+		require.True(t, matched, "the committed password change must remain authoritative")
+	})
+
+	t.Run("manager login rechecks password after fence", func(t *testing.T) {
+		uid := util.GenerUUID()
+		username := "fenced-manager-" + uid[:12]
+		oldPassword := "old-manager-password"
+		newPassword := "new-manager-password"
+		oldHash, err := HashPassword(oldPassword)
+		require.NoError(t, err)
+		newHash, err := HashPassword(newPassword)
+		require.NoError(t, err)
+		require.NoError(t, managerAPI.userDB.Insert(&Model{
+			UID:      uid,
+			Username: username,
+			Name:     "Fenced Manager",
+			ShortNo:  "mgr_" + uid[:12],
+			Password: oldHash,
+			Role:     string(wkhttp.SuperAdmin),
+			Status:   1,
+		}))
+		managerAPI.sessionStore = &passwordChangeOnBeginIssueStore{
+			RedisSessionStore: realStore,
+			mutate: func() error {
+				return managerAPI.userDB.UpdateUsersWithField("password", newHash, uid)
+			},
+		}
+
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"username": username,
+			"password": oldPassword,
+		}))))
+		request.Header.Set("Content-Type", "application/json")
+		server.GetRoute().ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusBadRequest, recorder.Code, "body=%s", recorder.Body.String())
+		fresh, err := managerAPI.userDB.QueryByUID(uid)
+		require.NoError(t, err)
+		require.Equal(t, newHash, fresh.Password)
+	})
+
+	_, client := auth.SessionStoreAndClientForContext(ctx)
+	keys, err := client.Keys(ctx.GetConfig().Cache.TokenCachePrefix + "*").Result()
+	require.NoError(t, err)
+	require.Empty(t, keys, "stale credentials must not produce bearer keys")
+}
+
+type passwordChangeOnBeginIssueStore struct {
+	*auth.RedisSessionStore
+	once   sync.Once
+	mutate func() error
+	err    error
+}
+
+func (s *passwordChangeOnBeginIssueStore) BeginIssue(ctx context.Context, uid string) (auth.IssueFence, error) {
+	s.once.Do(func() {
+		if s.mutate != nil {
+			s.err = s.mutate()
+		}
+	})
+	if s.err != nil {
+		return auth.IssueFence{}, s.err
+	}
+	return s.RedisSessionStore.BeginIssue(ctx, uid)
 }
 
 func testManagerLoginIssuesFiniteTokenOverHTTP(t *testing.T, server *libserver.Server, ctx *config.Context) {
@@ -111,7 +229,7 @@ func testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t *testing.T, server
 	require.LessOrEqual(t, after, before, "profile updates must not extend the bearer deadline")
 }
 
-func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context) {
+func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *User, *Manager) {
 	t.Helper()
 	databaseName := "octo_user_token_ttl_" + util.GenerUUID()[:12]
 	bootstrapConfig := config.New()
@@ -128,6 +246,8 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context) {
 	cfg := config.New()
 	cfg.Test = true
 	cfg.DB.MySQLAddr = fmt.Sprintf("root:demo@tcp(127.0.0.1:3306)/%s?charset=utf8mb4&parseTime=true", databaseName)
+	cfg.Cache.TokenCachePrefix = "token-http:" + util.GenerUUID() + ":"
+	cfg.Cache.UIDTokenCachePrefix = "token-http-uid:" + util.GenerUUID() + ":"
 	ctx := config.NewContext(cfg)
 
 	// module.Setup must run the complete migration set, but octo-lib caches its
@@ -146,7 +266,7 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context) {
 	server := libserver.New(ctx)
 	server.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(server.GetRoute())
-	store := auth.SessionStoreForContext(ctx)
+	store, client := auth.SessionStoreAndClientForContext(ctx)
 	server.GetRoute().SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		cfg.Cache.TokenCachePrefix,
@@ -155,8 +275,17 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context) {
 	userAPI := New(ctx)
 	managerAPI := NewManager(ctx)
 	server.GetRoute().POST("/v1/manager/login", managerAPI.login)
+	server.GetRoute().POST("/v1/user/login", userAPI.login)
 	server.GetRoute().Group("/v1/user", ctx.AuthMiddleware(server.GetRoute())).PUT("/current", userAPI.userUpdateWithField)
-	return server, ctx
+	t.Cleanup(func() {
+		keys, _ := client.Keys(cfg.Cache.TokenCachePrefix + "*").Result()
+		metadata, _ := client.Keys(cfg.Cache.UIDTokenCachePrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+	})
+	return server, ctx, userAPI, managerAPI
 }
 
 func cleanupTokenHTTPTestDatabases() error {
