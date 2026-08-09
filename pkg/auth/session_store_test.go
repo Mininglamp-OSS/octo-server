@@ -29,7 +29,9 @@ func TestRedisSessionStoreKeepsTokenDeadline(t *testing.T) {
 		_ = client.Close()
 	})
 
-	require.NoError(t, store.IssueNew(context.Background(), token, "old", "u1", 1))
+	oldPayload, err := Encode(TokenInfo{UID: "u1", Name: "old"})
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNew(context.Background(), token, oldPayload, "u1", 1))
 	before, err := client.PTTL(cfg.Cache.TokenCachePrefix + token).Result()
 	require.NoError(t, err)
 	require.Positive(t, before)
@@ -135,7 +137,9 @@ func TestRedisSessionStoreConcurrentLogoutCannotBeResurrected(t *testing.T) {
 		_ = clientA.Close()
 		_ = clientB.Close()
 	})
-	require.NoError(t, storeA.IssueNew(context.Background(), token, "old", "u-race", 1))
+	oldPayload, err := Encode(TokenInfo{UID: "u-race", Name: "old"})
+	require.NoError(t, err)
+	require.NoError(t, storeA.IssueNew(context.Background(), token, oldPayload, "u-race", 1))
 
 	start := make(chan struct{})
 	errCh := make(chan error, 33)
@@ -191,8 +195,10 @@ func TestRedisSessionStoreIssueFailureCompensatesNewCredential(t *testing.T) {
 		}
 	})
 
-	err := store.IssueNew(context.Background(), token, "payload", "u-compensate", 1)
-	require.Error(t, err)
+	payload, err := Encode(TokenInfo{UID: "u-compensate", Name: "issued"})
+	require.NoError(t, err)
+	issueErr := store.IssueNew(context.Background(), token, payload, "u-compensate", 1)
+	require.Error(t, issueErr)
 	exists, existsErr := client.Exists(tokenKey).Result()
 	require.NoError(t, existsErr)
 	require.Zero(t, exists, "partial issue must not leave an orphan bearer")

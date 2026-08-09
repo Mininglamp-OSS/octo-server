@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -51,6 +53,8 @@ end
 return 0
 `)
 )
+
+const issuedOwnerField = "_octo_issue_owner"
 
 var (
 	ErrTokenCollision        = errors.New("auth: generated token already exists")
@@ -105,8 +109,10 @@ func (s *RedisSessionStore) uidTokenKey(uid string, deviceFlag int) string {
 	return s.uidTokenPrefix + strconv.Itoa(deviceFlag) + uid
 }
 
-// IssueNew creates a finite bearer and compatibility device index. If the
-// index write fails, the new credential is deleted as compensation.
+// IssueNew creates a finite bearer and compatibility device index. The stored
+// payload carries an internal ownership marker until another request rewrites
+// it through ReuseExisting or UpdatePayloadKeepDeadline. If the index write
+// fails, only the still-owned credential is deleted as compensation.
 func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid string, deviceFlag int) (err error) {
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("issue", started, err) }()
@@ -116,7 +122,11 @@ func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	created, err := s.client.SetNX(s.tokenKey(token), payload, s.maxTTL).Result()
+	ownedPayload, err := markIssuedPayload(payload, token)
+	if err != nil {
+		return fmt.Errorf("auth: mark issued token payload: %w", err)
+	}
+	created, err := s.client.SetNX(s.tokenKey(token), ownedPayload, s.maxTTL).Result()
 	if err != nil {
 		return fmt.Errorf("auth: issue token: %w", err)
 	}
@@ -124,7 +134,11 @@ func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid st
 		return ErrTokenCollision
 	}
 	if err := s.client.Set(s.uidTokenKey(uid, deviceFlag), token, s.maxTTL).Err(); err != nil {
-		cleanupErr := s.client.Del(s.tokenKey(token)).Err()
+		_, cleanupErr := compareDeleteScript.Run(
+			s.client,
+			[]string{s.tokenKey(token)},
+			ownedPayload,
+		).Result()
 		if cleanupErr != nil {
 			return fmt.Errorf("auth: bind token device: %w (credential cleanup failed: %v)", err, cleanupErr)
 		}
@@ -243,14 +257,51 @@ func (s *RedisSessionStore) DeleteToken(ctx context.Context, token string) error
 	return nil
 }
 
-// RevokeIssued compensates a new credential. Never use it for a reused token.
+// RevokeIssued compensates a credential only while it is still owned by its
+// original issue attempt. Adoption by another request removes the ownership
+// marker atomically with its payload update, making this method a no-op.
 func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string, deviceFlag int) error {
-	if strings.TrimSpace(uid) == "" || deviceFlag < 0 {
-		return errors.New("auth: revoke token requires uid and non-negative device flag")
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(uid) == "" || deviceFlag < 0 {
+		return errors.New("auth: revoke token requires token, uid, and non-negative device flag")
 	}
-	if err := s.DeleteToken(ctx, token); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	currentPayload, err := s.client.Get(s.tokenKey(token)).Result()
+	if err == rd.Nil {
+		return s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+	}
+	if err != nil {
+		return fmt.Errorf("auth: load issued token for revoke: %w", err)
+	}
+	owner, ok := issuedPayloadOwner(currentPayload)
+	if !ok || owner != issueOwner(token) {
+		// ReuseExisting and UpdatePayloadKeepDeadline rewrite the canonical
+		// payload without the issue marker. Once that happens, another request
+		// owns the live credential and the original issuer must not revoke it.
+		return nil
+	}
+	result, err := compareDeleteScript.Run(
+		s.client,
+		[]string{s.tokenKey(token)},
+		currentPayload,
+	).Result()
+	if err != nil {
+		return fmt.Errorf("auth: delete issued token: %w", err)
+	}
+	deleted, err := redisInteger(result)
+	if err != nil {
+		return fmt.Errorf("auth: decode issued token delete result: %w", err)
+	}
+	if deleted == 0 {
+		// The token changed after the ownership read. Preserve both keys: the
+		// concurrent writer may have adopted this credential.
+		return nil
+	}
+	return s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+}
+
+func (s *RedisSessionStore) compareDeleteDeviceIndex(token, uid string, deviceFlag int) error {
 	if _, err := compareDeleteScript.Run(
 		s.client,
 		[]string{s.uidTokenKey(uid, deviceFlag)},
@@ -259,6 +310,68 @@ func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string,
 		return fmt.Errorf("auth: delete token device index: %w", err)
 	}
 	return nil
+}
+
+func markIssuedPayload(payload, token string) (string, error) {
+	prefix, body, err := versionedPayloadJSON(payload)
+	if err != nil {
+		return "", err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &fields); err != nil {
+		return "", fmt.Errorf("decode token payload: %w", err)
+	}
+	if fields == nil {
+		return "", errors.New("decode token payload: expected JSON object")
+	}
+	owner, err := json.Marshal(issueOwner(token))
+	if err != nil {
+		return "", fmt.Errorf("encode issue owner: %w", err)
+	}
+	fields[issuedOwnerField] = owner
+	marked, err := json.Marshal(fields)
+	if err != nil {
+		return "", fmt.Errorf("encode issued token payload: %w", err)
+	}
+	return prefix + string(marked), nil
+}
+
+func issuedPayloadOwner(payload string) (string, bool) {
+	_, body, err := versionedPayloadJSON(payload)
+	if err != nil {
+		return "", false
+	}
+	var marker struct {
+		Owner string `json:"_octo_issue_owner"`
+	}
+	if err := json.Unmarshal([]byte(body), &marker); err != nil || marker.Owner == "" {
+		return "", false
+	}
+	return marker.Owner, true
+}
+
+func versionedPayloadJSON(payload string) (string, string, error) {
+	switch {
+	case strings.HasPrefix(payload, v2Prefix):
+		return v2Prefix, strings.TrimPrefix(payload, v2Prefix), nil
+	case strings.HasPrefix(payload, v3Prefix):
+		return v3Prefix, strings.TrimPrefix(payload, v3Prefix), nil
+	default:
+		info, err := Decode(payload)
+		if err != nil {
+			return "", "", fmt.Errorf("decode token payload: %w", err)
+		}
+		encoded, err := Encode(info)
+		if err != nil {
+			return "", "", err
+		}
+		return v2Prefix, strings.TrimPrefix(encoded, v2Prefix), nil
+	}
+}
+
+func issueOwner(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func (s *RedisSessionStore) ReadToken(ctx context.Context, key string) (record TokenRecord, err error) {

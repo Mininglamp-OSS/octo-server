@@ -26,7 +26,9 @@ func TestRedisSessionStoreDeviceLookupAndCompensation(t *testing.T) {
 		_ = client.Close()
 	})
 
-	require.NoError(t, store.IssueNew(context.Background(), token, "payload", uid, 1))
+	payload, err := Encode(TokenInfo{UID: uid, Name: "issued"})
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNew(context.Background(), token, payload, uid, 1))
 	got, err := store.DeviceToken(context.Background(), uid, 1)
 	require.NoError(t, err)
 	require.Equal(t, token, got)
