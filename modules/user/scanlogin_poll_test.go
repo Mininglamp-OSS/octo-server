@@ -321,22 +321,37 @@ func TestGetLoginStatus_OnlyAuthorizedPollersRegisterAChannel(t *testing.T) {
 // TestGrantLogin_RenewsAuthCodeTTL 锁住 P1-3 的修复。authCode 在**扫码**时签发，用户
 // 可以在确认页停到该 TTL 的最后一刻；若这里只续 qrcode 不续 authCode，就会出现
 // 「status=authed、附带的 auth_code 只剩一秒」，浏览器兑换必然失败且状态机无路可走。
-func TestGrantLogin_RenewsAuthCodeTTL(t *testing.T) {
+func TestGrantLogin_PromotesPendingAuthorizationBeforePublishingAuthed(t *testing.T) {
 	fn := readFuncBody(t, "api.go", "func (u *User) grantLogin(")
 
-	assert.Contains(t, fn, "common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL",
-		"确认时必须按同一档位给 authCode 重新计时")
+	assert.Contains(t, fn, "u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)",
+		"确认时必须原子地把 pending 授权提升为可兑换授权")
+	assert.NotContains(t, fn, "SetAndExpire(\n\t\tfmt.Sprintf(\"%s%s\", common.AuthCodeCachePrefix",
+		"确认流程不得绕过原子 promote 直接覆盖可兑换授权")
 
-	renewIdx := strings.Index(fn, "common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL")
+	renewIdx := strings.Index(fn, "u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)")
 	qrIdx := strings.Index(fn, "common.QRCodeCachePrefix, uuid)")
 	require.NotEqual(t, -1, renewIdx)
 	require.NotEqual(t, -1, qrIdx)
 	assert.Less(t, renewIdx, qrIdx,
-		"先续 authCode 再写 qrcode —— 续期失败就不该对外宣告 authed")
+		"先提升授权再写 qrcode —— 提升失败就不该对外宣告 authed")
 
-	// 两者必须用同一个常量，否则窗口又会倒挂。
 	assert.NotContains(t, fn, "time.Minute*5",
 		"TTL 必须走 ScanLoginAuthCodeTTL 常量，不要再散落字面量")
+}
+
+func TestLoginWithAuthCode_ConsumesBeforeIssuingSession(t *testing.T) {
+	fn := readFuncBody(t, "api.go", "func (u *User) loginWithAuthCode(")
+
+	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))")
+	consume := strings.Index(fn, "u.scanLoginAuthorizations.Consume(authCode, authInfo)")
+	cacheWrite := strings.Index(fn, "u.ctx.Cache().SetAndExpire")
+	imUpdate := strings.Index(fn, "u.ctx.UpdateIMToken")
+	require.NotEqual(t, -1, consume)
+	require.NotEqual(t, -1, cacheWrite)
+	require.NotEqual(t, -1, imUpdate)
+	assert.Less(t, consume, cacheWrite, "授权必须先原子消费，再写登录 token")
+	assert.Less(t, consume, imUpdate, "授权必须先原子消费，再产生 IM 登录副作用")
 }
 
 // TestLoginWithAuthCode_ClearsScanLoginState 锁住 P2-3：登录完成后本轮扫码的所有状态

@@ -373,6 +373,11 @@ func TestScrubPath_MasksAuthCode(t *testing.T) {
 			want: "/v1/user/login_authcode/***?flag=1",
 		},
 		{
+			name: "redeem path and browser secret",
+			in:   "/v1/user/login_authcode/A-CODE?flag=1&poll_secret=S3CR3T",
+			want: "/v1/user/login_authcode/***?flag=1&poll_secret=***",
+		},
+		{
 			name: "casing variant still masked",
 			in:   "/V1/USER/LOGIN_AUTHCODE/A-CODE",
 			want: "/V1/USER/LOGIN_AUTHCODE/***",
