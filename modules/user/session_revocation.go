@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -303,9 +304,16 @@ func (u *User) processPendingSessionRevocations() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	u.observeSessionRevocationBacklog(ctx)
+	defer func() {
+		observeCtx, observeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer observeCancel()
+		u.observeSessionRevocationBacklog(observeCtx)
+	}()
 	for processed := 0; processed < sessionRevocationBatchSize; processed++ {
 		intent, err := u.db.claimSessionRevocation(ctx, u.revocationWorkerOwner, time.Now().UTC())
 		if err != nil {
+			metrics.ObserveSessionRevocationRetry("claim")
 			u.Error("领取会话撤销任务失败", zap.Error(err))
 			return
 		}
@@ -313,17 +321,30 @@ func (u *User) processPendingSessionRevocations() {
 			return
 		}
 		if err := applySessionRevocation(ctx, u.sessionStore, intent); err != nil {
+			metrics.ObserveSessionRevocationRetry("redis_apply")
 			if releaseErr := u.db.releaseSessionRevocation(ctx, intent, u.revocationWorkerOwner); releaseErr != nil {
+				metrics.ObserveSessionRevocationRetry("release")
 				u.Error("释放会话撤销任务失败", zap.String("subject", sessionRevocationSubject(intent.UID)), zap.Error(releaseErr))
 			}
 			u.Warn("应用会话撤销任务失败", zap.String("subject", sessionRevocationSubject(intent.UID)), zap.String("reason", intent.Reason))
 			continue
 		}
 		if err := u.db.markSessionRevocationApplied(ctx, intent, u.revocationWorkerOwner); err != nil {
+			metrics.ObserveSessionRevocationRetry("mark_applied")
 			u.Error("完成会话撤销任务失败", zap.String("subject", sessionRevocationSubject(intent.UID)), zap.Error(err))
 			return
 		}
 	}
+}
+
+func (u *User) observeSessionRevocationBacklog(ctx context.Context) {
+	var backlog int64
+	_, err := u.db.session.Select("COUNT(*)").From("user_session_revocation_intent").Where("status=?", sessionRevocationPending).LoadContext(ctx, &backlog)
+	if err != nil {
+		u.Warn("查询会话撤销积压失败", zap.Error(err))
+		return
+	}
+	metrics.SetSessionRevocationBacklog(backlog)
 }
 
 func sessionRevocationSubject(uid string) string {
