@@ -332,6 +332,11 @@ const (
 	// event became visible again. Failing before issuing is strictly better than
 	// detecting it afterwards. (Review finding 2.2.)
 	gateCounterMissing = -2
+
+	// maxExactScoreID is the largest event id whose successor can still be encoded as a
+	// distinct float64 sorted-set score. At 2^53, 2^53+1 rounds to the same score and
+	// recreates the collision, cursor skip and multi-member ack #697 removes.
+	maxExactScoreID = int64(1<<53 - 1)
 )
 
 const gateSource = `
@@ -635,7 +640,7 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 	}
 	// Seed before the first INCR, never after: an id handed out below the floor is
 	// exactly the unreachable-event bug.
-	if err := reseed(ctx, client, robotID); err != nil {
+	if err := reseed(ctx, client, robotID, b); err != nil {
 		return 0, err
 	}
 	if rebuildMirror {
@@ -670,15 +675,15 @@ func allocateFromCounter(ctx *config.Context, client Scripter, robotID string, b
 		countersLost.inc()
 		seeded.Delete(robotID)
 		lastPersisted.Delete(robotID)
-		if err := reseed(ctx, client, robotID); err != nil {
+		if err := reseed(ctx, client, robotID, b); err != nil {
 			return 0, err
 		}
 		retried, err := runGate(client, robotID, b.mirrorValue())
 		if err != nil {
 			return 0, err
 		}
-		if retried < 0 {
-			return 0, fmt.Errorf("botevent: counter for %q still unusable after re-seed (gate=%d)", robotID, retried)
+		if final, handled, retryErr := handleGateRetrySentinel(ctx, client, robotID, retried, attempt+1); handled {
+			return final, retryErr
 		}
 		return afterIssue(ctx, client, robotID, retried, attempt+1)
 	}
@@ -825,21 +830,21 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 		// between, which the next allocation would catch in turn.
 		seeded.Delete(robotID)
 		lastPersisted.Delete(robotID)
-		if err := reseed(ctx, client, robotID); err != nil {
-			return 0, err
-		}
 		b := activeBelief.Load()
 		if b == nil || !b.activated {
 			// The belief cannot have been downgraded (positive is terminal), so this
 			// means it was cleared underneath us — only a test does that.
 			return 0, fmt.Errorf("botevent: allocator belief lost mid-allocation for %q", robotID)
 		}
+		if err := reseed(ctx, client, robotID, b); err != nil {
+			return 0, err
+		}
 		retried, err := runGate(client, robotID, b.mirrorValue())
 		if err != nil {
 			return 0, err
 		}
-		if retried == gateNotActivated {
-			return gateClosed(ctx, client, robotID, attempt+1)
+		if final, handled, retryErr := handleGateRetrySentinel(ctx, client, robotID, retried, attempt+1); handled {
+			return final, retryErr
 		}
 		if retried <= prev {
 			// The floor did not clear the ids this process already handed out, so
@@ -857,6 +862,22 @@ func afterIssue(ctx *config.Context, client Scripter, robotID string, v int64, a
 	// and why bounding it is #704's rather than this function's.
 	persistHighWater(ctx, robotID, v)
 	return v, nil
+}
+
+// handleGateRetrySentinel gives both post-seed retry sites the same explicit handling.
+// A changed mirror re-enters the authority recovery path; a counter that disappears again
+// fails closed with the actual fault instead of being reported as a numeric floor.
+func handleGateRetrySentinel(ctx *config.Context, client Scripter, robotID string, result int64, attempt int) (int64, bool, error) {
+	switch result {
+	case gateNotActivated:
+		id, err := gateClosed(ctx, client, robotID, attempt)
+		return id, true, err
+	case gateCounterMissing:
+		return 0, true, fmt.Errorf("botevent: counter for %q is still missing after re-seed; "+
+			"refusing to issue from an unseeded key", robotID)
+	default:
+		return result, false, nil
+	}
 }
 
 // checkRegression reports this process's high-water for robotID and whether v is
@@ -904,14 +925,17 @@ func recordIssued(robotID string, v int64) {
 // jumping it forward and burning a block of ids per racing caller. The seed is
 // still idempotent (the Lua only raises), so this is about not moving the counter
 // needlessly, not about correctness of a single seed.
-func reseed(ctx *config.Context, client Scripter, robotID string) error {
+func reseed(ctx *config.Context, client Scripter, robotID string, b *belief) error {
 	mu := seedMutex(robotID)
 	mu.Lock()
 	defer mu.Unlock()
 	if _, done := seeded.Load(robotID); done {
 		return nil
 	}
-	if err := seedCounter(ctx, client, robotID); err != nil {
+	if b == nil || !b.activated {
+		return errors.New("botevent: cannot seed without a validated activated belief")
+	}
+	if err := seedCounter(ctx, client, robotID, b.cutoverFloor); err != nil {
 		seedFailures.inc()
 		return fmt.Errorf("botevent: seed event id counter for %q: %w", robotID, err)
 	}
@@ -1046,6 +1070,11 @@ func runGate(client Scripter, robotID, expectMirror string) (int64, error) {
 		return 0, fmt.Errorf("botevent: counter for %q returned %d, which is neither a valid id "+
 			"nor a known sentinel; refusing to issue it", robotID, id)
 	}
+	if id > maxExactScoreID {
+		return 0, fmt.Errorf("botevent: counter for %q returned %d, above the largest event id %d "+
+			"with an exact float64 sorted-set score; refusing to recreate score collisions",
+			robotID, id, maxExactScoreID)
+	}
 	return id, nil
 }
 
@@ -1075,20 +1104,12 @@ func legacyEventID(ctx *config.Context, robotID string) (int64, error) {
 // has expired) still has clients holding a cursor near the last id it was ever
 // issued, and seeding below that cursor would make every new event unreachable —
 // the very failure this change exists to remove, self-inflicted at deploy time.
-func seedCounter(ctx *config.Context, client Scripter, robotID string) error {
+func seedCounter(ctx *config.Context, client Scripter, robotID string, cutoverFloor int64) error {
 	queueMax, err := queueCeiling(client, robotID)
 	if err != nil {
 		return err
 	}
-	legacyMax, err := legacyCeiling(ctx, robotID)
-	if err != nil {
-		return err
-	}
-	// The durable mark is the only floor source that does not share Redis's
-	// recovery domain, so it is what makes a post-activation RDB rollback
-	// survivable. The other two both regress with the counter (queue) or stop
-	// advancing at activation (legacy row).
-	durableMax, err := highWaterCeiling(ctx, robotID)
+	legacyMax, durableMax, err := seqCeilings(ctx, robotID)
 	if err != nil {
 		return err
 	}
@@ -1099,11 +1120,11 @@ func seedCounter(ctx *config.Context, client Scripter, robotID string) error {
 	if durableMax > floor {
 		floor = durableMax
 	}
-	// The floor recorded at activation, validated against the observed maximum at
-	// that time. A backstop for the case where every Redis-side source has been lost
-	// at once and the durable mark has not caught up yet.
-	if stateFloor := stateFloorOrZero(ctx); stateFloor > floor {
-		floor = stateFloor
+	// The floor recorded at activation, validated in the same authority read that
+	// produced the positive belief. It is carried by that immutable belief rather than
+	// re-read here: an unreadable row must not silently turn a validated floor into zero.
+	if cutoverFloor > floor {
+		floor = cutoverFloor
 	}
 	if floor > 0 {
 		// A bot with no queue and no seq row has never been issued an id, so it
@@ -1112,6 +1133,36 @@ func seedCounter(ctx *config.Context, client Scripter, robotID string) error {
 		floor += seedSafetyMargin
 	}
 	return seedScript.Run(client, []string{SeqKey(robotID)}, floor).Err()
+}
+
+// seqCeilings loads the legacy and durable rows with one query.
+//
+// A lost mode mirror invalidates every process-local seed marker. Folding these two
+// same-table point reads into one conditional aggregate keeps that fleet-wide recovery
+// burst to one deadlined MySQL round trip per active bot; the cutover floor itself comes
+// from the already-validated positive belief and needs no third read.
+func seqCeilings(ctx *config.Context, robotID string) (legacy, durable int64, err error) {
+	if ctx == nil {
+		return 0, 0, errors.New("nil ctx, cannot read seq ceilings")
+	}
+	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
+	defer cancel()
+	legacyKey := fmt.Sprintf("seq:%s%s", common.RobotEventSeqKey, robotID)
+	durableKey := HighWaterSeqKey(robotID)
+	var row struct {
+		Legacy  int64 `db:"legacy_ceiling"`
+		Durable int64 `db:"durable_ceiling"`
+	}
+	_, err = ctx.DB().SelectBySql(
+		"SELECT COALESCE(MAX(CASE WHEN `key`=? THEN min_seq END),0) AS legacy_ceiling, "+
+			"COALESCE(MAX(CASE WHEN `key`=? THEN min_seq END),0) AS durable_ceiling "+
+			"FROM `seq` WHERE `key` IN (?,?)",
+		legacyKey, durableKey, legacyKey, durableKey,
+	).LoadContext(deadline, &row)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read legacy and durable seq rows: %w", err)
+	}
+	return row.Legacy, row.Durable, nil
 }
 
 // queueCeiling returns the highest score currently in the bot's queue, or 0.
@@ -1131,17 +1182,8 @@ func queueCeiling(client Scripter, robotID string) (int64, error) {
 // Unlike the queue ceiling and the legacy row, this keeps advancing after
 // activation, which is what lets a seed recover from a Redis rollback.
 func highWaterCeiling(ctx *config.Context, robotID string) (int64, error) {
-	if ctx == nil {
-		return 0, errors.New("nil ctx, cannot read high-water mark")
-	}
-	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
-	defer cancel()
-	var mark int64
-	if _, err := ctx.DB().Select("min_seq").From("`seq`").
-		Where("`key`=?", HighWaterSeqKey(robotID)).LoadContext(deadline, &mark); err != nil {
-		return 0, fmt.Errorf("read high-water mark: %w", err)
-	}
-	return mark, nil
+	_, durable, err := seqCeilings(ctx, robotID)
+	return durable, err
 }
 
 // legacyCeiling returns the legacy `GenSeq` block boundary for this bot's event
@@ -1151,15 +1193,8 @@ func highWaterCeiling(ctx *config.Context, robotID string) (int64, error) {
 // allocate — and allocating from the very source being retired is how a "read"
 // turns into a third live id source.
 func legacyCeiling(ctx *config.Context, robotID string) (int64, error) {
-	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
-	defer cancel()
-	var minSeq int64
-	key := fmt.Sprintf("seq:%s%s", common.RobotEventSeqKey, robotID)
-	if _, err := ctx.DB().Select("min_seq").From("`seq`").
-		Where("`key`=?", key).LoadContext(deadline, &minSeq); err != nil {
-		return 0, fmt.Errorf("read legacy seq row: %w", err)
-	}
-	return minSeq, nil
+	legacy, _, err := seqCeilings(ctx, robotID)
+	return legacy, err
 }
 
 // ResetSeededForTest clears the process-local seed cache. Tests that seed against

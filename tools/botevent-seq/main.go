@@ -112,6 +112,14 @@ type evidence struct {
 	failures int
 }
 
+const queueScanPageSize int64 = 500
+
+type queueScoreStats struct {
+	members    int
+	duplicates int
+	maxScore   int64
+}
+
 func (e evidence) observedMax() int64 {
 	m := e.maxQueueScore
 	if e.maxLegacyMinSeq > m {
@@ -159,26 +167,56 @@ func gather(ctx *config.Context, client *rd.Client, sample int) evidence {
 	ev.inspected = len(inspect)
 
 	for _, k := range inspect {
-		members, err := client.ZRangeWithScores(k, 0, -1).Result()
+		stats, err := scanQueueScores(func(start, stop int64) ([]rd.Z, error) {
+			return client.ZRangeWithScores(k, start, stop).Result()
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  %s: read failed: %v\n", k, err)
 			ev.failures++
 			continue
 		}
-		seen := make(map[float64]struct{}, len(members))
-		for _, m := range members {
-			seen[m.Score] = struct{}{}
-			if int64(m.Score) > ev.maxQueueScore {
-				ev.maxQueueScore = int64(m.Score)
-			}
+		if stats.maxScore > ev.maxQueueScore {
+			ev.maxQueueScore = stats.maxScore
 		}
-		if dup := len(members) - len(seen); dup > 0 {
+		if stats.duplicates > 0 {
 			ev.dupQueues++
-			ev.dupMembers += dup
-			fmt.Printf("  COLLISIONS %s: members=%d distinct=%d dup=%d\n", k, len(members), len(seen), dup)
+			ev.dupMembers += stats.duplicates
+			fmt.Printf("  COLLISIONS %s: members=%d distinct=%d dup=%d\n",
+				k, stats.members, stats.members-stats.duplicates, stats.duplicates)
 		}
 	}
 	return ev
+}
+
+// scanQueueScores reads one sorted set in bounded rank pages and counts adjacent equal
+// scores as duplicates. ZRANGE orders by score and then member, so equal scores remain
+// adjacent even across page boundaries; retaining only the previous score keeps memory O(1)
+// regardless of queue size and caps every Redis response at queueScanPageSize members.
+func scanQueueScores(fetch func(start, stop int64) ([]rd.Z, error)) (queueScoreStats, error) {
+	var stats queueScoreStats
+	var previous float64
+	havePrevious := false
+	for start := int64(0); ; {
+		page, err := fetch(start, start+queueScanPageSize-1)
+		if err != nil {
+			return queueScoreStats{}, err
+		}
+		for _, member := range page {
+			stats.members++
+			if havePrevious && member.Score == previous {
+				stats.duplicates++
+			}
+			previous = member.Score
+			havePrevious = true
+			if score := int64(member.Score); score > stats.maxScore {
+				stats.maxScore = score
+			}
+		}
+		if int64(len(page)) < queueScanPageSize {
+			return stats, nil
+		}
+		start += int64(len(page))
+	}
 }
 
 // maxSeqByPrefix returns the highest min_seq across every `seq` row in a namespace.

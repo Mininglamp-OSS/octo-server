@@ -212,3 +212,41 @@ func TestPreflightPagesQueueMembers(t *testing.T) {
 		}
 	}
 }
+
+func TestScanQueueScoresCountsDuplicatesAcrossPageBoundaries(t *testing.T) {
+	members := make([]rd.Z, 0, queueScanPageSize+2)
+	for i := int64(0); i < queueScanPageSize-1; i++ {
+		members = append(members, rd.Z{Score: float64(i), Member: i})
+	}
+	// The duplicate straddles page 1 / page 2. An implementation that resets its
+	// previous-score state per page silently misses exactly this case.
+	members = append(members,
+		rd.Z{Score: 10_000, Member: "a"},
+		rd.Z{Score: 10_000, Member: "b"},
+		rd.Z{Score: 10_001, Member: "c"},
+	)
+	var requests [][2]int64
+	stats, err := scanQueueScores(func(start, stop int64) ([]rd.Z, error) {
+		requests = append(requests, [2]int64{start, stop})
+		if stop-start+1 > queueScanPageSize {
+			t.Fatalf("requested unbounded page %d..%d", start, stop)
+		}
+		if start >= int64(len(members)) {
+			return nil, nil
+		}
+		end := stop + 1
+		if end > int64(len(members)) {
+			end = int64(len(members))
+		}
+		return members[start:end], nil
+	})
+	if err != nil {
+		t.Fatalf("scanQueueScores: %v", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests=%v, want exactly two bounded pages", requests)
+	}
+	if stats.members != len(members) || stats.duplicates != 1 || stats.maxScore != 10_001 {
+		t.Fatalf("stats=%+v, want members=%d duplicates=1 max=10001", stats, len(members))
+	}
+}

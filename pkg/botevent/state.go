@@ -191,19 +191,3 @@ func Activate(ctx *config.Context, floor, observedMax int64) (bool, uint64, erro
 	}
 	return true, locked.Epoch + 1, nil
 }
-
-// stateFloorOrZero returns the recorded cutover floor, or 0 when unreadable.
-//
-// Used by the seed as one more floor source. Best-effort: an unreadable row must not
-// fail an allocation, because the other floor sources (queue ceiling, legacy row,
-// durable high-water) already cover the cases this one is a backstop for. Deadlined
-// like every other DB read on this path — it runs inside a held msgSem slot.
-func stateFloorOrZero(ctx *config.Context) int64 {
-	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
-	defer cancel()
-	st, err := ReadStateContext(deadline, ctx)
-	if err != nil {
-		return 0
-	}
-	return st.CutoverFloor
-}

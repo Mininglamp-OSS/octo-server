@@ -42,6 +42,8 @@ func (rb *Robot) getCreatorUID(robotID string) (string, error) {
 // this to utf8.RuneCountInString rather than raising the number.
 const robotIDMaxLen = 40
 
+const robotMissingCacheTTL = 30 * time.Second
+
 // plausibleRobotID reports whether a client-supplied `payload.robot_id` is shaped like
 // something that could name a bot at all.
 //
@@ -102,6 +104,9 @@ func (rb *Robot) existRobot(robotID string) (bool, error) {
 	if exist == "1" {
 		return true, nil
 	}
+	if exist == "0" {
+		return false, nil
+	}
 	existB, err := rb.db.exist(robotID)
 	if err != nil {
 		return false, err
@@ -112,6 +117,13 @@ func (rb *Robot) existRobot(robotID string) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	}
+	// Unknown client-supplied ids are common on this listener path. Cache a proven miss
+	// briefly so one repeated payload cannot turn into one MySQL query per message. Keep
+	// the TTL short: bot creation is allowed to make a previously missing id valid, and
+	// no creation hook can invalidate every replica's local observation atomically.
+	if err := rb.ctx.GetRedisConn().SetAndExpire(key, "0", robotMissingCacheTTL); err != nil {
+		rb.Warn("缓存不存在的robotID失败", zap.Error(err), zap.String("robotID", robotID))
 	}
 	return false, nil
 
@@ -272,7 +284,8 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 							zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
 					}
 				}
-			} else if payloadValue.Get("mention").Exists() {
+			}
+			if len(robotID) == 0 && payloadValue.Get("mention").Exists() {
 				rb.Debug("检测到@提及", zap.String("mention", payloadValue.Get("mention").String()))
 				mentionValue := payloadValue.Get("mention")
 				mentionUIDsValue := mentionValue.Get("uids")
@@ -355,7 +368,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 						}
 					}
 				}
-			} else {
+			} else if len(robotID) == 0 {
 				if common.ContentType(payloadValue.Get("type").Int()) == common.Text {
 					content := payloadValue.Get("content").String()
 					if strings.Contains(content, "@") {

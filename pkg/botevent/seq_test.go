@@ -322,6 +322,33 @@ func TestSeedLoadsBothSeqFloorsWithOneQuery(t *testing.T) {
 	}
 }
 
+func TestSeqCeilingsReturnsLegacyAndDurableRows(t *testing.T) {
+	ctx, client := seqTestCtx(t)
+	robotID := "seqtest_combined_ceilings_bot"
+	fixture(t, ctx, client, robotID)
+
+	const legacy, durable = int64(12_000), int64(34_000)
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO `seq`(`key`, min_seq, step) VALUES(?,?,?)",
+		"seq:robotEventSeq:"+robotID, legacy, legacyGenSeqStep).Exec(); err != nil {
+		t.Fatalf("insert legacy ceiling: %v", err)
+	}
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO `seq`(`key`, min_seq, step) VALUES(?,?,?)",
+		HighWaterSeqKey(robotID), durable, highWaterInterval).Exec(); err != nil {
+		t.Fatalf("insert durable ceiling: %v", err)
+	}
+
+	gotLegacy, gotDurable, err := seqCeilings(ctx, robotID)
+	if err != nil {
+		t.Fatalf("load combined ceilings: %v", err)
+	}
+	if gotLegacy != legacy || gotDurable != durable {
+		t.Fatalf("seqCeilings = (%d, %d), want (%d, %d)",
+			gotLegacy, gotDurable, legacy, durable)
+	}
+}
+
 func TestNextEventIDIsStrictlyMonotonicUnderConcurrency(t *testing.T) {
 	ctx, client := seqTestCtx(t)
 	robotID := "seqtest_monotonic_bot"
@@ -433,7 +460,7 @@ func TestSeedIsIdempotentAndNeverLowers(t *testing.T) {
 
 	client.ZAdd(QueueKey(robotID), rd.Z{Score: 5000, Member: `{"event_id":5000}`})
 
-	if err := seedCounter(ctx, client, robotID); err != nil {
+	if err := seedCounter(ctx, client, robotID, 0); err != nil {
 		t.Fatalf("first seed: %v", err)
 	}
 	afterFirst, _ := client.Get(SeqKey(robotID)).Int64()
@@ -445,7 +472,7 @@ func TestSeedIsIdempotentAndNeverLowers(t *testing.T) {
 	advanced, _ := client.Get(SeqKey(robotID)).Int64()
 
 	for i := 0; i < 3; i++ {
-		if err := seedCounter(ctx, client, robotID); err != nil {
+		if err := seedCounter(ctx, client, robotID, 0); err != nil {
 			t.Fatalf("re-seed %d: %v", i, err)
 		}
 	}

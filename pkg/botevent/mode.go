@@ -127,6 +127,12 @@ type belief struct {
 	// epoch is the authority's generation. Meaningful only when activated.
 	epoch uint64
 
+	// cutoverFloor is the global floor validated in the same authoritative read as
+	// activated/epoch. It must travel with the positive belief: re-reading the state row
+	// during a later per-bot seed and treating an error as zero discards the activation
+	// proof and can restart a new counter below live cursors.
+	cutoverFloor int64
+
 	// deniedMirror / deniedAt record a mirror value the authority explicitly denied, so
 	// the next allocations that see the same value are answered from this belief for a
 	// short cooldown instead of re-reading the authority each time.
@@ -409,11 +415,30 @@ func cutPrefix(s, prefix string) (string, bool) {
 // compares against, so a mirror that has drifted from the validated generation
 // closes the gate rather than allocating.
 func resolveMode(ctx *config.Context, mirror string) (modeResolution, error) {
-	claims, _, _ := parseMirror(mirror)
+	claims, mirrorEpoch, hasEpoch := parseMirror(mirror)
 
 	if b := activeBelief.Load(); b != nil {
 		// Positive is terminal with respect to legacy.
 		if b.activated {
+			// Positive is not terminal with respect to a newer generation. An old
+			// process must refresh before it considers rebuilding the mirror, otherwise
+			// it can overwrite a legitimate incr:N+1 with its cached incr:N.
+			if claims && hasEpoch && mirrorEpoch > b.epoch {
+				res, err := refreshAuthority(ctx, true, mirror, true)
+				if err != nil {
+					return modeResolution{}, err
+				}
+				confirmedEpoch := uint64(0)
+				if res.belief != nil {
+					confirmedEpoch = res.belief.epoch
+				}
+				if res.belief == nil || !res.belief.activated || confirmedEpoch < mirrorEpoch {
+					return modeResolution{}, fmt.Errorf("botevent: mode mirror claims newer epoch %d but "+
+						"the authority only confirmed epoch %d; refusing to overwrite the newer mirror",
+						mirrorEpoch, confirmedEpoch)
+				}
+				return res, nil
+			}
 			return resolutionFromBelief(b, "")
 		}
 		if !claims && beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
@@ -482,7 +507,12 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 	st, err := readStateDeadlined(ctx)
 	switch {
 	case err == nil && st.Activated():
-		return install(&belief{activated: true, epoch: st.Epoch, resolvedAt: beliefNow()}, "")
+		return install(&belief{
+			activated:    true,
+			epoch:        st.Epoch,
+			cutoverFloor: st.CutoverFloor,
+			resolvedAt:   beliefNow(),
+		}, "")
 
 	case err == nil, errors.Is(err, ErrStateMissing):
 		// The authority says legacy, or says nothing because the migration has not
