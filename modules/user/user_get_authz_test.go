@@ -129,6 +129,9 @@ func TestUserGet_NoRelation_MinimalKeepsFollow(t *testing.T) {
 	assert.Contains(t, body, "\"follow\":0",
 		"资料页需要 follow 渲染加好友入口，且走到最小集必然是 0（不能从展示字段复制）, body=%s", body)
 	assert.NotContains(t, body, "\"follow\":1", "最小集不得声称已关注")
+	assert.Contains(t, body, "\"status\":1",
+		"status 必须下发：缺失会被三端当成 0=已封禁并写回缓存（Android 隐藏输入框）, body=%s", body)
+	assert.NotContains(t, body, "\"status\":0", "status 绝不能是 0")
 	// 身份细节必须剥离
 	for _, leaked := range []string{"SNSTRU", "short_no", "device_flag", "last_offline", "source_desc", "sex", "vercode"} {
 		assert.NotContains(t, body, leaked, "无关系不得下发 %s", leaked)
@@ -231,7 +234,7 @@ func TestUserGet_NotExist_NotFound(t *testing.T) {
 func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 	full := &UserDetailResp{
 		// Follow 刻意给 1：最小集必须按授权决策输出 0，而不是复制这个展示字段。
-		UID: "u1", Name: "N", Follow: 1, Robot: 0,
+		UID: "u1", Name: "N", Follow: 1, Robot: 0, Status: 1,
 		ShortNo: "SN", Sex: 1, Online: 1, LastOffline: 123, Vercode: "vc",
 		SourceDesc: "src", RealName: "张三", RealnameVerified: true, Phone: "13000000000",
 	}
@@ -246,8 +249,10 @@ func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	assert.Equal(t, []string{"follow", "name", "robot", "uid"}, keys,
-		"最小集只能有这四个顶层字段, got=%s", string(b))
+	assert.Equal(t, []string{"follow", "name", "robot", "status", "uid"}, keys,
+		"最小集只能有这五个顶层字段, got=%s", string(b))
+	assert.Contains(t, string(b), "\"status\":1",
+		"status 必须原样透传：缺失会被客户端当成 0=已封禁并写回缓存")
 	assert.Contains(t, string(b), "\"follow\":0", "入参 Follow=1 时输出仍须为 0, got=%s", string(b))
 	for _, leaked := range []string{"SN", "short_no", "sex", "online", "last_offline", "vercode", "source_desc", "real_name", "张三", "13000000000"} {
 		assert.NotContains(t, string(b), leaked)

@@ -187,7 +187,11 @@ func TestChannelGet_Person_NoRelation_Minimal(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "SNSTRANGER", "无关系不得下发短号值")
 	// 最小集是专用 DTO：零值字段也不得出现（follow:0 会被客户端误判为"明确非好友"）。
 	assert.NotContains(t, w.Body.String(), "\"follow\"", "最小集不得含 follow 字段, body=%s", w.Body.String())
-	assert.NotContains(t, w.Body.String(), "\"status\"", "最小集不得含 status 字段")
+	// status 与 follow 取舍相反：必须下发。缺失会被三端当成 0="已禁用/封禁"哨兵并写回
+	// 本地缓存（Android 隐藏输入框）。值来自调用方自己的拉黑状态，永不为 0。
+	assert.Contains(t, w.Body.String(), "\"status\":1",
+		"最小集必须下发 status 且为正常值, body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "\"status\":0", "status 绝不能是 0（客户端封禁哨兵）")
 	assert.NotContains(t, w.Body.String(), "\"extra\"", "最小集不得含 extra 字段")
 	assert.NotContains(t, w.Body.String(), "\"device_flag\"", "最小集不得含 device_flag 字段")
 }
@@ -376,9 +380,10 @@ func TestMinimalChannelResp_JSONShape(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	assert.Equal(t, []string{"channel", "logo", "name", "robot"}, keys,
-		"最小集只能有这四个顶层字段, got=%s", string(b))
-	for _, leaked := range []string{"short_no", "SNX", "follow", "status", "notice", "extra"} {
+	assert.Equal(t, []string{"channel", "logo", "name", "robot", "status"}, keys,
+		"最小集只能有这五个顶层字段, got=%s", string(b))
+	assert.Contains(t, string(b), "\"status\":2", "status 必须原样透传（此处入参为 2）")
+	for _, leaked := range []string{"short_no", "SNX", "follow", "notice", "extra"} {
 		assert.NotContains(t, string(b), leaked)
 	}
 }

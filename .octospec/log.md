@@ -53,7 +53,10 @@ change-log convention (§7). Newest first.
   `modules/user` already imports) so the two endpoints cannot drift, with the
   common-group lookup injected via a registration hook because `modules/user`
   cannot import `modules/group`. The profile endpoint's minimal set keeps
-  `follow` (the add-friend entry needs it) where the channel one omits it.
+  `follow` (the add-friend entry needs it) where the channel one omits it; both
+  emit `status`, because clients read an absent `status` as their banned
+  sentinel and persist it, so "absent" had to be decided per field rather than
+  applied as a blanket rule.
   Review follow-ups: a public brief must not point at an unpatched sibling
   (fixed by landing both); `status = Normal` was too strict — admin-disabled
   groups are live everywhere else in the module, so the check is

@@ -73,23 +73,36 @@ func PersonProfileVisible(in PersonProfileInput, hasCommonGroup CommonGroupCheck
 //
 // 刻意省略 follow：本端点用于渲染任意发送者，不是关系页，客户端不应据此判断关系。
 // （/v1/users/:uid 的最小集相反**保留** follow —— 那是资料页，要靠它渲染加好友入口。）
+//
+// 但 status **必须下发**，这与 follow 的取舍方向相反，原因是两者的"缺失"被客户端解读
+// 得不一样：
+//   - follow 缺失 → 客户端当作未知（给 0 反而会被读成"明确非好友"），故省略更安全；
+//   - status 缺失 → 三端都把零值 0 当作"已禁用/封禁"哨兵并**写回本地缓存**
+//     （Android WKChannelStatus.statusDisabled = 0 → 隐藏输入框并显示封禁视图；
+//     iOS 会整行覆盖，且历史上已为 mute 单独硬编码过同类保护），故省略更危险。
+//
+// 且 status 在本响应里是**调用方自己**是否拉黑对方（1=未拉黑 / 2=已拉黑，见
+// user.GetUserDetail 的 blacklist 计算），既非对方身份信息，也永不为 0，下发它不削弱
+// 本次的隐私收窄目标——真正买到隐私的是 short_no / 在线状态 / 设备指纹等的省略。
 type MinimalChannelResp struct {
 	Channel struct {
 		ChannelID   string `json:"channel_id"`
 		ChannelType uint8  `json:"channel_type"`
 	} `json:"channel"`
-	Name  string `json:"name"`
-	Logo  string `json:"logo"`
-	Robot int    `json:"robot"`
+	Name   string `json:"name"`
+	Logo   string `json:"logo"`
+	Robot  int    `json:"robot"`
+	Status int    `json:"status"`
 }
 
 // NewMinimalChannelResp 从完整详情里挑出白名单四项。白名单式构造——将来给
 // model.ChannelResp 新增字段时默认不泄露。
 func NewMinimalChannelResp(full *model.ChannelResp) MinimalChannelResp {
 	m := MinimalChannelResp{
-		Name:  full.Name,
-		Logo:  full.Logo,
-		Robot: full.Robot,
+		Name:   full.Name,
+		Logo:   full.Logo,
+		Robot:  full.Robot,
+		Status: full.Status,
 	}
 	m.Channel.ChannelID = full.Channel.ChannelID
 	m.Channel.ChannelType = full.Channel.ChannelType

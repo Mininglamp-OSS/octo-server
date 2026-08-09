@@ -22,6 +22,11 @@ type minimalUserDetailResp struct {
 	// Robot 供客户端区分 bot 与真人的渲染分支。注意 bot 恒可见完整资料，故走到最小集
 	// 时它必为 0；保留该字段只为让契约形状稳定，客户端无需按分支解析。
 	Robot int `json:"robot"`
+	// Status **必须下发**（与省略 follow 的方向相反）：三端都把缺失时的零值 0 当作
+	// "已禁用/封禁"哨兵并写回本地缓存（Android 会隐藏输入框），所以对 status 而言
+	// 省略比给值更危险。它在本响应里是**调用方自己**是否拉黑对方（1=未拉黑 /
+	// 2=已拉黑），是调用方自身状态、永不为 0，下发不削弱隐私收窄。
+	Status int `json:"status"`
 }
 
 // newMinimalUserDetailResp 白名单式构造最小资料集：剥离 short_no / sex / online /
@@ -42,5 +47,6 @@ func newMinimalUserDetailResp(full *UserDetailResp) minimalUserDetailResp {
 		// Space"的事实。这正是本次要消除的展示/授权混淆。
 		Follow: 0,
 		Robot:  full.Robot,
+		Status: full.Status,
 	}
 }

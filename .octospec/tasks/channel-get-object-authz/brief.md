@@ -29,7 +29,7 @@ source: self
     见 Background）/ 系统账号 / `iwh_` webhook —— 返回完整详情，字段与今天完全
     一致（含 `real_name`，保持对外可见，不改动）。
   - **完全无关系** —— 只回渲染历史消息发送者所需的最小集
-    （`channel_id` / `name` / `logo` / `robot`），不下发 `short_no` / `sex` /
+    （`channel_id` / `name` / `logo` / `robot` / `status`），不下发 `short_no` / `sex` /
     `device_flag` / `last_offline` / `source_desc` / `vercode` 等身份细节
     （`real_name` 等 `extra` 字段随整个 `extra` 一并不下发，是"最小集不含"而非
     "对 real_name 单独剥离"）。
@@ -41,6 +41,16 @@ source: self
 「加好友」入口的依据，省略会让陌生人加好友这个正常入口消失（channelGet 是发送者渲染，
 不需要 follow，故刻意省略）。加好友流程不依赖本响应其它字段——`vercode` 由 search /
 扫码路径铸造并校验，且该端点对非好友本来就返回空 `vercode`。
+
+最小集的"省略 vs 给值"按**客户端如何解读缺失**逐字段决定，两个方向都出现：
+- `follow`：channelGet 省略（给 0 会被读成"明确非好友"），users/:uid 保留（资料页靠
+  `follow==0` 渲染加好友入口）；
+- `status`：**两端都必须下发**。三端客户端把缺失时的零值 0 当作"已禁用/封禁"哨兵并
+  写回本地缓存（Android `WKChannelStatus.statusDisabled = 0` → 隐藏输入框并显示封禁
+  视图；iOS 整行覆盖，历史上已为 `mute` 单独硬编码过同类保护）。该字段在本响应里是
+  **调用方自己**是否拉黑对方（1/2，永不为 0），非对方身份信息，下发不削弱隐私收窄。
+  触发路径不是陌生人，而是"当前正在 1:1 的对端离开可见集"——同 Space 对端所在 Space
+  被封禁、或唯一共同群解散/自己退群，下次频道信息刷新即命中。
 
 同时消除两个放大风险：群不存在触发的 nil-panic（500，构成存在性枚举
 oracle），以及该路由缺少 per-UID 限流（批量枚举无成本）。
@@ -162,7 +172,7 @@ helper**，需新建（外部群跨 Space 成员既非好友也非共同 Space�
       一致，均不下发 `name`/`notice`/`member_count`/`space_id`。
 - [ ] COMMUNITY_TOPIC：非父群成员调用 `GET /v1/channels/{topicID}/5` 被拒，
       不下发子区名 / `group_no` / `creator_uid` / `message_count`。
-- [ ] PERSON 无关系目标：仅返回 `channel_id` / `name` / `logo` / `robot`；
+- [ ] PERSON 无关系目标：仅返回 `channel_id` / `name` / `logo` / `robot` / `status`；
       断言响应不下发 `short_no` / `sex` / `device_flag` / `last_offline` /
       `source_desc` / `vercode`（即 `extra` 不下发身份细节）。
 - [ ] PERSON 有关系目标（本人 / 好友 / 共同 Space / 共同群 / Bot / 系统账号）：
@@ -177,7 +187,7 @@ helper**，需新建（外部群跨 Space 成员既非好友也非共同 Space�
 
 ### A2. `GET /v1/users/:uid`（同根因，一并修复）
 
-- [ ] 无关系目标：降级为最小集（`uid`/`name`/`follow`/`robot`），不下发 `short_no` /
+- [ ] 无关系目标：降级为最小集（`uid`/`name`/`follow`/`robot`/`status`），不下发 `short_no` /
       `sex` / `online` / `last_offline` / `device_flag` / `source_desc` / `vercode` /
       实名字段。
 - [ ] 最小集**保留 `follow`**：陌生人资料页仍能渲染「加好友」入口（与 channelGet

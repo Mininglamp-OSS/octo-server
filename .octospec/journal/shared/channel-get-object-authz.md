@@ -83,6 +83,18 @@ was itself an existence oracle.
   through to the unified not-found. There was already a zombie
   `ErrorUserNotExist` (defined, never used) — reused it instead of adding a
   second near-identical sentinel.
+- **"Absent" is not a neutral default — decide it per field, per client.** The
+  minimal sets omit `follow` because a `0` reads as "definitely not a friend",
+  but they must **emit** `status`, because all three clients decode an absent
+  `status` as `0`, which is their disabled/banned sentinel, and write it back
+  over the cached row (Android hides the message composer; iOS had already
+  hard-coded a guard for exactly this on `mute`). Same reasoning, opposite
+  conclusion, one field apart. The trigger is not the stranger case but a peer
+  you are currently in a 1:1 with who leaves the visible set — a shared Space
+  gets banned, or the only shared group is disbanded — i.e. precisely the
+  transitions this change made load-bearing. Ask, for every field you drop from
+  a response the client caches: what does the client's zero value mean, and does
+  it get persisted?
 - **A minimal response needs its own DTO.** `model.ChannelResp` has no
   `omitempty`, so copying four fields still serializes `follow:0` / `status:0` /
   `extra:null` — and `follow:0` reads to clients as "definitely not a friend".
