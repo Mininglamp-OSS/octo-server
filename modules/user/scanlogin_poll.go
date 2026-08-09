@@ -114,6 +114,13 @@ var scanLoginPublicDataKeys = map[string]struct{}{
 	"app_id": {}, // 常量标识，无信息量
 }
 
+func scanLoginStatusIs(model *common.QRCodeModel, status string) bool {
+	if model == nil {
+		return false
+	}
+	return fmt.Sprint(model.Data["status"]) == status
+}
+
 // pollSecretStore 是轮询密钥所需的最小存储能力，签名对齐 octo-lib 的 *redis.Conn。
 //
 // 抽成接口是为了让密钥的写入/比对/删除能在没有 Redis 的环境下做真实行为测试 ——

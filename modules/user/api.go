@@ -2211,7 +2211,7 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// process cannot receive its in-memory channel notification. Once the shared
 	// Redis read already shows authed, entering the 10-second long poll only adds
 	// latency and retains a goroutine without waiting for any useful transition.
-	if fmt.Sprint(qrcodeModel.Data["status"]) == string(common.ScanLoginStatusAuthed) {
+	if scanLoginStatusIs(qrcodeModel, string(common.ScanLoginStatusAuthed)) {
 		respondStatus(qrcodeModel)
 		return
 	}
