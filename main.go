@@ -185,7 +185,13 @@ func runAPI(ctx *config.Context) {
 	// 角色（user_role:{uid} 热缓存 → DB），把降权生效窗口收敛到缓存 TTL。
 	userLangSvc := user.NewLanguageService(user.NewDB(ctx), ctx.Cache())
 	userRoleSvc := user.NewRoleService(user.NewDB(ctx), ctx.Cache())
-	tokenStore := auth.SessionStoreForContext(ctx)
+	tokenStore, sessionRedis := auth.SessionStoreAndClientForContext(ctx)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := tokenStore.Probe(probeCtx); err != nil {
+		probeCancel()
+		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
+	}
+	probeCancel()
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
@@ -391,6 +397,7 @@ func runAPI(ctx *config.Context) {
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit":            rlRedis,
+		"session":              sessionRedis,
 		"card_action_dispatch": cardActionRuntime.redisClient,
 	})
 	// 在所有指标族注册完成后再起 scrape 端点,避免启动窗口内的 scrape 漏掉

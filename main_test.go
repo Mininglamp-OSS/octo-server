@@ -113,6 +113,41 @@ func TestRunAPIRegistersSessionRedisPool(t *testing.T) {
 	require.True(t, foundSession, "the shared authentication session pool must be observable")
 }
 
+func TestRunAPIProbesSessionLuaBeforeInstallingTokenParser(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	var probePosition, parserPosition token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "runAPI" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch selector.Sel.Name {
+			case "Probe":
+				probePosition = call.Pos()
+			case "SetTokenParser":
+				parserPosition = call.Pos()
+			}
+			return true
+		})
+	}
+
+	require.NotZero(t, probePosition, "API startup must exercise the real session read Lua")
+	require.NotZero(t, parserPosition, "API startup must install the canonical token parser")
+	require.Less(t, probePosition, parserPosition, "Lua compatibility must be proven before authentication is installed")
+}
+
 func TestGlobalRateLimitExcludePathsIncludesProbeEndpoints(t *testing.T) {
 	paths := globalRateLimitExcludePaths()
 

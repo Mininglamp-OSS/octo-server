@@ -21,9 +21,16 @@ end
 return {value, redis.call("PTTL", KEYS[1])}
 `)
 	updatePayloadKeepDeadlineScript = rd.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if not current then
+  return {-2, 0}
+end
 local ttl = redis.call("PTTL", KEYS[1])
 if ttl == -2 then
   return {-2, 0}
+end
+if string.sub(current, 1, 3) == "v3:" and string.sub(ARGV[1], 1, 3) ~= "v3:" then
+  return {-3, 0}
 end
 local persistent = 0
 if ttl == -1 then
@@ -45,7 +52,10 @@ return 0
 `)
 )
 
-var ErrTokenCollision = errors.New("auth: generated token already exists")
+var (
+	ErrTokenCollision        = errors.New("auth: generated token already exists")
+	ErrTokenVersionDowngrade = errors.New("auth: token payload version downgrade rejected")
+)
 
 // SessionObservation contains low-cardinality migration facts only. It never
 // includes a token, Redis key, UID, or payload.
@@ -180,6 +190,9 @@ func (s *RedisSessionStore) updatePayloadKeepDeadline(ctx context.Context, token
 	if ttlMS == -2 {
 		return 0, false, nil
 	}
+	if ttlMS == -3 {
+		return 0, false, ErrTokenVersionDowngrade
+	}
 	if ttlMS <= 0 {
 		return 0, false, fmt.Errorf("auth: update token payload returned invalid ttl %d", ttlMS)
 	}
@@ -187,6 +200,17 @@ func (s *RedisSessionStore) updatePayloadKeepDeadline(ctx context.Context, token
 		metrics.ObservePersistentSession()
 	}
 	return time.Duration(ttlMS) * time.Millisecond, true, nil
+}
+
+// Probe executes the same read-only, single-key Lua used by the authentication
+// hot path. It is intended for startup compatibility checks before accepting
+// traffic; it never creates or mutates a Redis key.
+func (s *RedisSessionStore) Probe(ctx context.Context) error {
+	const probeToken = "__octo_auth_session_lua_probe__"
+	if _, err := s.ReadToken(ctx, s.tokenKey(probeToken)); err != nil {
+		return fmt.Errorf("auth: probe session read script: %w", err)
+	}
+	return nil
 }
 
 func (s *RedisSessionStore) DeviceToken(ctx context.Context, uid string, deviceFlag int) (string, error) {
@@ -333,7 +357,7 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 				continue
 			case record.TTL == -1:
 				stats.Persistent++
-			case record.TTL >= 0:
+			case record.TTL > 0:
 				stats.Finite++
 				if record.TTL > s.maxTTL {
 					stats.OverMax++

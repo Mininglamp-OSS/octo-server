@@ -15,6 +15,9 @@ const MaxTokenExpire = 720 * time.Hour
 // default. Only an actually absent key receives the 720h default.
 func ValidateTokenExpire(vp *viper.Viper) (time.Duration, error) {
 	const key = "cache.tokenExpire"
+	// An explicitly present but empty TS_CACHE_TOKENEXPIRE must not be treated
+	// as absent and silently fall back to 720h.
+	vp.AllowEmptyEnv(true)
 	if !vp.IsSet(key) {
 		return MaxTokenExpire, nil
 	}

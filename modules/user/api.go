@@ -1775,6 +1775,28 @@ func (u *User) compensateIssuedToken(token, uid string, deviceFlag int) error {
 	return u.sessionStore.RevokeIssued(ctx, token, uid, deviceFlag)
 }
 
+// replaceAPPToken keeps device-verification login aligned with the existing
+// APP single-session policy: revoke the currently indexed HTTP bearer before
+// publishing a new credential. Every step uses the shared Redis-backed Session
+// Store rather than a process-local lock; a Redis failure stops issuance. Full
+// concurrent-issuance serialization remains part of the v3 generation/CAS
+// release described by the task brief.
+func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) error {
+	oldToken, err := u.sessionStore.DeviceToken(ctx, uid, int(config.APP))
+	if err != nil {
+		return fmt.Errorf("load previous APP token: %w", err)
+	}
+	if strings.TrimSpace(oldToken) != "" {
+		if err := u.sessionStore.DeleteToken(ctx, oldToken); err != nil {
+			return fmt.Errorf("revoke previous APP token: %w", err)
+		}
+	}
+	if err := u.sessionStore.IssueNew(ctx, token, payload, uid, int(config.APP)); err != nil {
+		return fmt.Errorf("issue APP token: %w", err)
+	}
+	return nil
+}
+
 // sendWelcomeMsg 发送欢迎语
 func (u *User) sentWelcomeMsg(publicIP, uid string) {
 	appconfig, err := u.commonService.GetAppConfig()
@@ -3171,7 +3193,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	err = u.sessionStore.IssueNew(spanCtx, token, tokenPayload, userInfo.UID, int(config.APP))
+	err = u.replaceAPPToken(spanCtx, token, tokenPayload, userInfo.UID)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)

@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -111,7 +110,7 @@ func TestRedisSessionStoreProbeFailsClosed(t *testing.T) {
 	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
 		return func(cmd rd.Cmder) error {
 			if cmd.Name() == "evalsha" || cmd.Name() == "eval" {
-				return errors.New("injected lua rejection")
+				cmd.Args()[0] = "eval-disabled-by-proxy"
 			}
 			return old(cmd)
 		}
@@ -119,7 +118,7 @@ func TestRedisSessionStoreProbeFailsClosed(t *testing.T) {
 
 	prober, ok := interface{}(store).(sessionStoreProber)
 	require.True(t, ok, "RedisSessionStore must expose a startup Lua compatibility probe")
-	require.ErrorContains(t, prober.Probe(context.Background()), "injected lua rejection")
+	require.ErrorContains(t, prober.Probe(context.Background()), "unknown command")
 }
 
 func TestRedisSessionStoreConcurrentLogoutCannotBeResurrected(t *testing.T) {

@@ -107,8 +107,9 @@ Redis 原子更新优先使用 Lua `PTTL + SET PX`，兼容当前 go-redis 版�
 
 #### 多副本与性能约束
 
-- 同一进程的所有 Token reader/writer 必须复用 `config.Context` 内唯一的 Session Store 和唯一的有界 go-redis 连接池，不能由 group/message/user 等模块各自建池。PR 1 当前每副本池大小为 10，带有限 dial/read/write/pool timeout 和一次重试；上线前需按副本数核算 Redis `maxclients`，并通过 session latency/error 指标确认没有 pool wait 饱和。若需扩容连接池，应基于压测或生产证据单独调整，不能靠每个模块复制 client 绕过。
+- 同一进程的所有 Token reader/writer 必须复用 `config.Context` 内唯一的 Session Store 和唯一的有界 go-redis 连接池，不能由 group/message/user 等模块各自建池。PR 1 默认 `PoolSize=10*GOMAXPROCS`、`PoolTimeout=3s`、`MaxRetries=1`，可分别用严格校验的 `OCTO_AUTH_SESSION_REDIS_POOL_SIZE`（正整数，上限为 `max(4096, 默认 PoolSize)`）和 `OCTO_AUTH_SESSION_REDIS_POOL_TIMEOUT`（Go duration，`>0` 且 `<=30s`）覆盖；显式空值或非法值启动失败。该池纳入现有 Redis pool collector，label 固定为 `session`。上线前必须按 `pool size × 副本数` 核算 Redis `maxclients`，并通过 session latency/error 与 pool timeout 指标确认没有排队饱和；不能靠每个模块复制 client 绕过。
 - 认证热路径的 payload 与 PTTL 读取必须由一个单-key Lua 原子完成；脚本缓存命中后的稳态为一次 Redis 往返，新 Redis 节点首次 `EVALSHA` 遇到 `NOSCRIPT` 时允许由客户端回退一次 `EVAL`。不得先 `GET` 再 `PTTL` 形成 TOCTOU，也不得在每个已认证请求上写 TTL、索引或 generation。资料更新、登录和撤销才允许写 Redis，避免把本次安全修复变成按请求写放大。
+- API 副本开始服务前必须用真实的认证读取脚本执行一次只读 missing-key probe；失败直接阻止启动。不得提供回退旧 `GET` 认证语义的 kill-switch，因为那会绕过 payload+PTTL 原子校验。生产仍需在发布前确认 proxy/Cluster 对 `EVALSHA`/`EVAL` 的兼容性，启动 probe 不是压测替代品。
 - 未确认生产 Cluster 拓扑前，PR 1 的 Lua 只能操作一个 key；Token key 与兼容 `UIDToken` 索引分步写，并以“新 credential 可补偿、旧 credential 不误删”的状态机处理部分失败。不同副本必须只通过 Redis 中的原子条件协调，不能依赖进程锁或本地缓存保证安全。
 - migration observe/apply 不得随每个副本启动；显式运维进程默认限速、连接池独立且更小，可取消并只输出聚合。在线请求与迁移流量的 Redis 延迟、错误率必须分别可观测，避免扫描挤占认证连接。
 
@@ -126,13 +127,14 @@ Redis 原子更新优先使用 Lua `PTTL + SET PX`，兼容当前 go-redis 版�
 
 generation key 的生命周期至少覆盖该 UID 最晚到期的 v3 Token；validator 发现 generation 缺失必须 fail closed，不能把缺失解释为默认值而重新接受旧 Token。`RevokeAll` 即使索引缺失也必须创建新的 generation。
 
-阶段一的推荐策略为：沿用现有 `Cache.TokenExpire`（YAML `cache.tokenExpire` / env `TS_CACHE_TOKENEXPIRE`），但在 `ConfigureWithViper` 吞掉解析错误之前，对 env 覆盖后的原始值显式校验：缺省才使用 720h；显式值必须是带单位的合法 Go duration、`> 0` 且不超过经安全/产品确认的硬上限。建议暂定最大 720h。生产配置若非法或超过上限，预检必须先处理，不能在发布时静默回退、截断或带错配置启动。启动日志和低基数指标应暴露最终生效的 TTL，便于确认配置覆盖结果。
+阶段一的推荐策略为：沿用现有 `Cache.TokenExpire`（YAML `cache.tokenExpire` / env `TS_CACHE_TOKENEXPIRE`），但在 `ConfigureWithViper` 吞掉解析错误之前，对 env 覆盖后的原始值显式校验：缺省才使用 720h；显式值（包括显式空字符串）必须是带单位的合法 Go duration、`> 0` 且不超过经安全/产品确认的硬上限。建议暂定最大 720h。生产配置若非法或超过上限，预检必须先处理，不能在发布时静默回退、截断或带错配置启动。启动日志和低基数指标应暴露最终生效的 TTL，便于确认配置覆盖结果。
 
 所有直接读取 Token cache 后调用 `auth.Decode` 的验证入口也必须走同一个 validator，特别是公开邀请可选认证、`message.sendMsg` 的 body Token、`/auth/verify` 和二维码入口，避免主 AuthMiddleware 已收紧但辅助入口仍接受过期 payload。
 
 ### 3. 绝对寿命与重复登录
 
 - 资料更新永远保留原 deadline。
+- Session Store 必须原子拒绝把现有 `v3:` payload 重写成 v2/legacy；Release A 即锁住该不变量，避免 Release B 激活后资料更新绕过 `expires_at` 与 generation 撤销。
 - Web/PC 显式重复登录若继续复用旧 Token，只保留剩余寿命，不续满 30 天。
 - 若产品要求“重新输入凭据后获得新的完整寿命”，必须签发新 Token；不能通过延长旧 Token 模拟。新 Token 对已有多端会话的影响需由会话索引和设备策略显式处理。
 - APP 当前替换旧 Token 的行为可保留，但签发与删除必须由 Session Store 完成。
@@ -242,7 +244,7 @@ v3 是新的 cache value 格式，当前旧二进制不能解码。必须采用 
 ## Acceptance
 
 - 真实 Redis 集成测试证明：新登录 Token TTL `> 0` 且 `<= configured max`；改昵称前后 TTL 不增加，绝不会从有限值变为 `-1`。
-- 配置测试证明合法的 `cache.tokenExpire` 和 `TS_CACHE_TOKENEXPIRE`（例如 `48h`）能覆盖默认 720h，且 env 优先；`30d`、无单位数字、其他 malformed 值、零值、负值或超过硬上限配置均在启动期 fail loudly，不能静默回退默认值。
+- 配置测试证明合法的 `cache.tokenExpire` 和 `TS_CACHE_TOKENEXPIRE`（例如 `48h`）能覆盖默认 720h，且 env 优先；显式空 env、`30d`、无单位数字、其他 malformed 值、零值、负值或超过硬上限配置均在启动期 fail loudly，不能静默回退默认值。
 - payload v3 被人工放入永久 Redis key 时，无论 `expires_at` 是否仍有效都因 `PTTL=-1` 被拒；有限 TTL key 中 `expires_at <= now` 或 generation 不匹配的 v3 仍被所有认证/verify/辅助入口拒绝。
 - Web/PC/扫码复用旧 Token 时以 `PTTL + SET PX` 保留原 deadline；并发 logout 后不得复活 Token。
 - 所有生产 Token writer 通过 Session Store；源码守卫禁止业务代码直接对 `TokenCachePrefix` / `UIDTokenCachePrefix` 执行 `Set` / `SetAndExpire`。
@@ -256,6 +258,7 @@ v3 是新的 cache value 格式，当前旧二进制不能解码。必须采用 
 - 混版测试证明 Release A 能读取 v2/v3，Release B 写 v3；发布检查能阻止旧副本存活时进入 enforce。
 - 迁移完成后按配置的 Token 前缀扫描：`persistent=0`、`over_max=0`、`v1/v2=0`；enforce 期间新增这些类型会触发告警。
 - Redis 不可用或 payload/TTL 不合法时认证 fail closed，且保持现有 i18n/anti-enumeration wire contract。
+- API 启动在接受流量前执行认证读取 Lua 的只读 probe；脚本不兼容或 Redis 失败时阻止启动，不回退旧认证语义。
 - 认证 validator 稳态每次请求执行一次单-key Redis 脚本且不写 Redis（允许新节点首次 `NOSCRIPT` 回退）；每副本只创建一个 Session Store 连接池，池大小、timeout、retry 和操作时延均有测试或指标证据，迁移扫描不与在线池混用。
 - 相关测试至少覆盖 `pkg/auth`、`modules/user`、`modules/oidc`；运行 focused tests、`go test ./...`、`make i18n-extract-check`、`make i18n-lint` 和 lint。
 
