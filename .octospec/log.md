@@ -4,6 +4,22 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-10 (token-lifecycle-hardening PR 2)
+
+- **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,
+  monotonic v3 session rollout; absolute deadlines, generation/fence validation,
+  generation-scoped bounded indexes, durable high-risk revocation intents, and
+  a controlled legacy migration/admin tool. Review follow-up prevented stale
+  revocation replay from erasing post-event index entries and blocked disabled
+  administrators from reissuing sessions. Production activation, device-scope
+  completion, migration, enforce, and security retest remain explicit gates. See
+  [journal](journal/shared/token-lifecycle-hardening-pr2.md).
+- **Learning (pending)** —
+  [scope-revocation-cleanup-to-generation](learnings/pending/token-lifecycle-hardening-pr2.md):
+  a monotonic authority update does not make later shared-index cleanup safe;
+  partition cleanup by the exact revoked generation and test secondary
+  invariants such as caps after event replay.
+
 ## 2026-08-09 (token-lifecycle-hardening PR 1)
 
 - **Task** — `token-lifecycle-hardening`: bounded all new and touched user HTTP

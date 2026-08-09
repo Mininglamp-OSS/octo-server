@@ -37,8 +37,9 @@ source: self
 
 ### PR 1 基线（已验证）
 
-- 基线为 `origin/main@b46de7b9`，即 [#723](https://github.com/Mininglamp-OSS/octo-server/pull/723)
-  squash merge 后的 main。
+- 实现基线为 `origin/main@d3daa912`；其中 PR 1 已由
+  [#723](https://github.com/Mininglamp-OSS/octo-server/pull/723) squash merge 为 `b46de7b9`，
+  后续主干提交也已纳入本分支。
 - PR 1 已收口生产 Token writer，阻止新 Token 或被资料更新/重复登录触达的 Token 变为永久，
   并保持 Web/PC 复用 Token 的剩余 TTL，不再续满。
 - `pkg/auth` 已具备 v3 编解码和严格校验骨架；但 `auth.Encode` 仍写 v2，运行时没有接入真实
@@ -63,6 +64,27 @@ source: self
 - 生产 Redis 是 standalone、sentinel、兼容单端点 proxy 还是 native Cluster 尚未核实。当前
   go-redis `*redis.Client + redisAddr` 不提供 native Cluster discovery，因此 PR 2 不得靠跨 key
   Lua 或 hash slot 假设声明兼容。
+
+### 当前实现状态（2026-08-10，仅代码分支）
+
+- 已实现默认 `expand` 的单调 rollout mode、持久 floor、v3 绝对到期、generation/issuance
+  fence、按 UID + generation 隔离的有界会话索引、legacy deny、默认 dry-run 的可续跑 migration
+  apply，以及独立小连接池的 `token-session-admin`。合并或部署不会自动切到 v3、apply 或 enforce。
+- 已把主动改密/重置、账号禁用/最终注销、管理员删除与 monotonic revocation intent 放入同一
+  MySQL 事务；同步 Redis 应用失败后由带 owner lease 的多副本 worker 幂等重试。当前退出先撤
+  HTTP bearer，再执行既有 IM 退出。
+- 登录 writer 已覆盖普通、username、email、manager、微信、GitHub、Gitee、OIDC/external、扫码、
+  设备验证和注册；密码或账号状态在 issuance fence 后重新读取。管理端同时重查 `status` 与
+  `is_destroy`，禁用/注销账号不能在撤销后重新登录。
+- 复核额外发现并修复了旧 revocation event 重放清空新会话索引的问题：索引按 generation 隔离，
+  Lua 返回本事件实际撤销的上一 generation，重试只清理该旧索引，不影响事件后新登录的 cap。
+- 本地 MySQL/Redis/WuKongIM 环境中，`pkg/auth`、`modules/user`、`modules/oidc` focused/integration、
+  auth race、build、vet、golangci-lint 和 i18n 均通过。`go test ./...` 未全绿：未改动的
+  `internal/msgextraseq` 持有共享 `test` 库直到 10 分钟超时，其他并发 package 随后报 MySQL 1205
+  lock wait；PR 不得把该次全仓运行写成通过。
+- `/v1/user/pc/quit`、设备删除和 OIDC sync `invalid_grant` 的精确撤销 scope 尚未获产品签字，当前
+  实现没有擅自扩大。它们与生产 Redis 拓扑/QPS/连接预算、session cap 值、cutoff 和迁移策略同为
+  激活前门禁；因此当前状态不是漏洞关闭。
 
 ## Security invariants
 
@@ -168,7 +190,9 @@ record GET/单 key Lua；两次均不写 Redis。不采用跨 Token/generation k
 
 ### 4. 有界 per-UID 会话索引
 
-新增按 UID 枚举 v3 会话的可过期索引，`UIDToken` 仅在兼容期继续服务旧行为：
+新增按 UID + generation 枚举 v3 会话的可过期索引，`UIDToken` 仅在兼容期继续服务旧行为。
+generation 隔离使撤销事件只清理自己淘汰的旧索引；事件后新登录写入新索引，不会被旧事件重放
+或首次撤销的并发尾部误删：
 
 - 索引成员至少能定位 Token，并带 device flag/device ID 与绝对到期信息；score 使用
   `expires_at`，每次读写先清除过期成员，索引 key TTL 对齐当前最晚成员。并发新增只能延长 key
@@ -179,8 +203,9 @@ record GET/单 key Lua；两次均不写 Redis。不采用跨 Token/generation k
   分步写，按状态机补偿；不得把多个不同 key 放进 Lua 后假设生产一定不分 slot。
 - 新签发在索引失败时不能返回 credential。既有 Token 的复用/提升需要与新签发不同的补偿
   语义，故障注入必须覆盖 Token/index/UIDToken/generation 每一步及两个副本交错执行。
-- `RevokeAll` 永远以 generation 为即时安全结果，再 best-effort 清索引。设备级撤销只有在索引
-  完整性可证明时才精确删除；否则扩大撤销并产生低基数告警。
+- `RevokeAll` 永远以 generation 为即时安全结果，再按 Lua 返回的上一 generation 精确清理旧索引；
+  重放相同事件不得删除当前 generation 的索引。设备级撤销只有在索引完整性可证明时才精确删除；
+  否则扩大撤销并产生低基数告警。
 - Redis 中的索引仍属于 credential 数据，必须使用与 Token cache 相同的 ACL、备份和访问边界；
   工具、日志、指标和 API 均不得枚举其成员。
 
@@ -361,7 +386,7 @@ grace 已经过期推断 v1/v2 已清零。
   发布前签字的 p95/p99、pool timeout 和 Redis 余量 SLO。
 - 两个独立 Redis client/Session Store 模拟两个副本，覆盖 issue/reuse/logout/password reset
   交错；安全事件前开始的登录不能在事件后产生有效 bearer，旧 durable event 重试不能撤销事件
-  后的新会话。
+  后的新会话，也不能从有界索引移除事件后会话而绕过 session cap。
 - 故障注入逐步覆盖 generation/Token/index/UIDToken/DB commit/outbox/IM：新 credential 失败不
   留可用孤儿；复用失败不误删已接管会话；DB 事件不丢；重复 worker 幂等。
 - session cap 在并发新签发下仍不超限；索引缺失时 `RevokeAll` 仍即时有效，设备撤销不能证明完整
@@ -382,7 +407,10 @@ grace 已经过期推断 v1/v2 已清零。
   `make i18n-extract-check` 和 `make i18n-lint`；若环境导致未完成，PR 必须明确列出未验证项，
   不得宣称全绿。
 
-## Decisions required before implementation/activation
+## Decisions required before activation / remaining scope
+
+代码使用两个安全默认但仍需上线签字：单 UID cap 必须显式配置且超限时拒绝新登录；主动改密撤销
+包含当前设备在内的全部会话。以下环境参数和未接线路径不能由代码自行猜测：
 
 - legacy grace 与绝对 `legacy_cutoff_at`：原建议 7 天，需生产 observe 后签字。
 - finite v1/v2：自然等待最长 TTL，还是全部压到 cutoff；后者重新登录影响更大。
