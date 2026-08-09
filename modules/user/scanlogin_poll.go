@@ -16,7 +16,10 @@ import (
 //
 // 该前缀在 octo-server 本地定义（而非 octo-lib common.*CachePrefix）：octo-lib 是
 // 外部模块，加常量需要先发版；本 key 的生命周期完全由 modules/user 掌握。
-const scanLoginPollSecretPrefix = "scanlogin:poll:"
+const (
+	scanLoginPollSecretPrefix = "scanlogin:poll:"
+	scanLoginStatusDisabled   = "disabled"
+)
 
 // scanLoginPollSecretQuery 是轮询方出示密钥的 query 参数名。
 //
@@ -40,11 +43,12 @@ const scanLoginPollSecretQuery = "poll_secret"
 
 // ScanLoginAuthCodeTTL 是扫码登录授权码的存活时间。
 //
-// authCode 可被 POST /v1/user/login_authcode/{code} 直接兑换成 scaner 的完整 token，
-// 所以这个 TTL 就是「凭据一旦外泄的可利用窗口」。原值 10 分钟远超实际所需。
+// authCode 在 grantLogin 明确确认后才会进入可兑换命名空间，并可被 POST
+// /v1/user/login_authcode/{code} 兑换成 scanner 的完整 token，所以这个 TTL 就是
+// 「已确认凭据一旦外泄的可利用窗口」。原值 10 分钟远超实际所需。
 //
-// 定义在 modules/user 而非 modules/qrcode：grantLogin（本包）确认时要按同一档位给
-// authCode 续期（见 P1-3），而 qrcode 已经 import user，反向 import 会成环。
+// 定义在 modules/user 而非 modules/qrcode：grantLogin（本包）确认时用它设置 ready
+// authorization 的完整窗口，而 qrcode 已经 import user，反向 import 会成环。
 const ScanLoginAuthCodeTTL = 5 * time.Minute
 
 // ScanLoginConfirmWindow 是「二维码已被扫描 / 已授权」状态的存活时间，也就是用户可以
@@ -69,8 +73,9 @@ const ScanLoginConfirmWindow = 5 * time.Minute
 // 取 12 分钟给 60s 余量，避免 Redis 与应用间的时钟漂移或调用延迟正好卡在边界上把
 // 已扫码的用户甩掉。
 //
-// 长活本身不额外授权：密钥只是读取凭据的门票，qrcode 状态一过期就无内容可读；且
-// loginWithAuthCode 兑换成功后会立刻 deleteScanLoginPollSecret，常态下活不满 TTL。
+// 长活本身不额外授权：密钥必须与已确认 auth_code 配对才能兑换，qrcode 状态一过期
+// 也无内容可读；loginWithAuthCode 兑换成功后会立刻 deleteScanLoginPollSecret，常态下
+// 活不满 TTL。
 const scanLoginPollSecretTTL = 12 * time.Minute
 
 // 扫码登录两个未认证端点的默认限流档位（可经 DM_API_SCANLOGIN_*_RATELIMIT_{RPS,BURST}
@@ -107,6 +112,13 @@ const (
 var scanLoginPublicDataKeys = map[string]struct{}{
 	"status": {}, // 扫码进度，前端状态机必需
 	"app_id": {}, // 常量标识，无信息量
+}
+
+func scanLoginStatusIs(model *common.QRCodeModel, status string) bool {
+	if model == nil {
+		return false
+	}
+	return fmt.Sprint(model.Data["status"]) == status
 }
 
 // pollSecretStore 是轮询密钥所需的最小存储能力，签名对齐 octo-lib 的 *redis.Conn。

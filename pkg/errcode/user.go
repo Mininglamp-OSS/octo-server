@@ -126,6 +126,11 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "Local login is disabled.",
 	})
+	ErrUserScanLoginDisabled = register(codes.Code{
+		ID:             "err.server.user.scan_login_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Scan login is disabled.",
+	})
 	ErrUserPhoneRegionUnsupported = register(codes.Code{
 		ID:             "err.server.user.phone_region_unsupported",
 		HTTPStatus:     http.StatusBadRequest,

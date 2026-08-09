@@ -1,0 +1,293 @@
+package user
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	rd "github.com/go-redis/redis"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type fakeScanLoginPendingStore struct {
+	key     string
+	value   string
+	expire  time.Duration
+	deleted string
+}
+
+func (s *fakeScanLoginPendingStore) SetAndExpire(key string, value interface{}, expire time.Duration) error {
+	s.key = key
+	s.value = fmt.Sprint(value)
+	s.expire = expire
+	return nil
+}
+
+func (s *fakeScanLoginPendingStore) Del(key string) error {
+	s.deleted = key
+	return nil
+}
+
+func TestSavePendingScanLoginAuthorization_UsesNonRedeemableNamespace(t *testing.T) {
+	store := &fakeScanLoginPendingStore{}
+	require.NoError(t, SavePendingScanLoginAuthorization(store, "code-1", "scanner-1", "uuid-1"))
+
+	assert.Equal(t, scanLoginPendingAuthorizationKey("code-1"), store.key)
+	assert.NotEqual(t, scanLoginReadyAuthorizationKey("code-1"), store.key)
+	assert.Equal(t, ScanLoginConfirmWindow, store.expire)
+	want, err := encodeScanLoginAuthorization("scanner-1", "uuid-1")
+	require.NoError(t, err)
+	assert.Equal(t, want, store.value)
+}
+
+func TestScanLoginAuthorization_RejectsInvalidPayloadsAndArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		encoded string
+	}{
+		{name: "invalid JSON", encoded: "not-json"},
+		{name: "missing scanner", encoded: `{"type":"scan_login","uuid":"uuid-1"}`},
+		{name: "missing UUID", encoded: `{"scaner":"scanner-1","type":"scan_login"}`},
+		{name: "wrong type", encoded: `{"scaner":"scanner-1","type":"group","uuid":"uuid-1"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := scanLoginAuthorizationUUID(tc.encoded)
+			require.Error(t, err)
+		})
+	}
+
+	_, err := encodeScanLoginAuthorization("", "uuid-1")
+	require.ErrorIs(t, err, errScanLoginAuthorizationInvalid)
+	_, err = encodeScanLoginAuthorization("scanner-1", "")
+	require.ErrorIs(t, err, errScanLoginAuthorizationInvalid)
+
+	fake := &fakeScanLoginPendingStore{}
+	require.ErrorIs(t,
+		SavePendingScanLoginAuthorization(nil, "code", "scanner-1", "uuid-1"),
+		errScanLoginAuthorizationInvalid)
+	require.ErrorIs(t,
+		SavePendingScanLoginAuthorization(fake, "", "scanner-1", "uuid-1"),
+		errScanLoginAuthorizationInvalid)
+	require.NoError(t, DeletePendingScanLoginAuthorization(nil, "code"))
+	require.NoError(t, DeletePendingScanLoginAuthorization(fake, ""))
+	require.NoError(t, DeletePendingScanLoginAuthorization(fake, "code"))
+	assert.Equal(t, scanLoginPendingAuthorizationKey("code"), fake.deleted)
+
+	invalidStore := &scanLoginAuthorizationStore{}
+	_, err = invalidStore.Promote("code", "payload", time.Minute)
+	require.ErrorIs(t, err, errScanLoginAuthorizationInvalid)
+	_, err = invalidStore.RollbackPromotion("code", "payload", time.Minute)
+	require.ErrorIs(t, err, errScanLoginAuthorizationInvalid)
+	_, err = invalidStore.Consume("code", "payload")
+	require.ErrorIs(t, err, errScanLoginAuthorizationInvalid)
+
+	decodingStore := &scanLoginAuthorizationStore{client: rd.NewClient(&rd.Options{Addr: "127.0.0.1:0"})}
+	t.Cleanup(func() { _ = decodingStore.client.Close() })
+	_, err = decodingStore.Promote("code", "not-json", time.Minute)
+	require.Error(t, err)
+	_, err = decodingStore.RollbackPromotion("code", "not-json", time.Minute)
+	require.Error(t, err)
+	_, err = decodingStore.Consume("code", "not-json")
+	require.Error(t, err)
+}
+
+func newScanLoginAuthorizationStoreForTest(t *testing.T) *scanLoginAuthorizationStore {
+	t.Helper()
+	client := rd.NewClient(&rd.Options{
+		Addr:         "127.0.0.1:6399",
+		MaxRetries:   1,
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	})
+	if err := client.Ping().Err(); err != nil {
+		_ = client.Close()
+		t.Skipf("test Redis unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return newScanLoginAuthorizationStore(client)
+}
+
+func TestScanLoginAuthorization_PromoteAndConsumeAreAtomic(t *testing.T) {
+	store := newScanLoginAuthorizationStoreForTest(t)
+	authCode := "scan-auth-" + time.Now().Format("150405.000000000")
+	pendingKey := scanLoginPendingAuthorizationKey(authCode)
+	readyKey := scanLoginReadyAuthorizationKey(authCode)
+	claimKey := scanLoginUUIDClaimKey("uuid-1")
+	t.Cleanup(func() {
+		_ = store.client.Del(pendingKey, readyKey, claimKey).Err()
+	})
+	require.NoError(t, store.client.Del(claimKey).Err())
+
+	expected, err := encodeScanLoginAuthorization("scanner-1", "uuid-1")
+	require.NoError(t, err)
+	wrongExpected, err := encodeScanLoginAuthorization("scanner-wrong", "uuid-1")
+	require.NoError(t, err)
+	require.NoError(t, store.client.Set(pendingKey, expected, time.Minute).Err())
+
+	wrong, err := store.Promote(authCode, wrongExpected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, wrong)
+	assert.Equal(t, expected, store.client.Get(pendingKey).Val())
+	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
+
+	const workers = 32
+	var promoted int32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			ok, promoteErr := store.Promote(authCode, expected, time.Minute)
+			if promoteErr != nil {
+				t.Errorf("promote: %v", promoteErr)
+				return
+			}
+			if ok {
+				atomic.AddInt32(&promoted, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), promoted)
+	assert.Equal(t, rd.Nil, store.client.Get(pendingKey).Err())
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+
+	consumedWrong, err := store.Consume(authCode, wrongExpected)
+	require.NoError(t, err)
+	assert.False(t, consumedWrong)
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+
+	var consumed int32
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			ok, consumeErr := store.Consume(authCode, expected)
+			if consumeErr != nil {
+				t.Errorf("consume: %v", consumeErr)
+				return
+			}
+			if ok {
+				atomic.AddInt32(&consumed, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), consumed)
+	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
+}
+
+func TestScanLoginAuthorization_UUIDClaimAllowsOnlyOneAuthorization(t *testing.T) {
+	store := newScanLoginAuthorizationStoreForTest(t)
+	uuid := "scan-uuid-claim-" + time.Now().Format("150405.000000000")
+	authCodes := []string{uuid + "-a", uuid + "-b"}
+	claimKey := scanLoginUUIDClaimKey(uuid)
+	expected, err := encodeScanLoginAuthorization("scanner-1", uuid)
+	require.NoError(t, err)
+
+	keys := []string{claimKey}
+	for _, authCode := range authCodes {
+		pendingKey := scanLoginPendingAuthorizationKey(authCode)
+		readyKey := scanLoginReadyAuthorizationKey(authCode)
+		keys = append(keys, pendingKey, readyKey)
+		require.NoError(t, store.client.Set(pendingKey, expected, time.Minute).Err())
+	}
+	t.Cleanup(func() { _ = store.client.Del(keys...).Err() })
+
+	start := make(chan struct{})
+	results := make([]bool, len(authCodes))
+	errs := make([]error, len(authCodes))
+	var wg sync.WaitGroup
+	wg.Add(len(authCodes))
+	for i, authCode := range authCodes {
+		go func(i int, authCode string) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = store.Promote(authCode, expected, time.Minute)
+		}(i, authCode)
+	}
+	close(start)
+	wg.Wait()
+
+	winner := -1
+	for i := range authCodes {
+		require.NoError(t, errs[i])
+		if results[i] {
+			require.Equal(t, -1, winner, "only one auth code may claim a QR session")
+			winner = i
+		}
+	}
+	require.NotEqual(t, -1, winner)
+	loser := 1 - winner
+	assert.Equal(t, authCodes[winner], store.client.Get(claimKey).Val())
+	assert.Equal(t, expected, store.client.Get(scanLoginReadyAuthorizationKey(authCodes[winner])).Val())
+	assert.Equal(t, rd.Nil, store.client.Get(scanLoginPendingAuthorizationKey(authCodes[loser])).Err(),
+		"the losing pending authorization must be removed")
+	assert.Equal(t, rd.Nil, store.client.Get(scanLoginReadyAuthorizationKey(authCodes[loser])).Err())
+
+	consumed, err := store.Consume(authCodes[winner], expected)
+	require.NoError(t, err)
+	require.True(t, consumed)
+	assert.Equal(t, "consumed:"+authCodes[winner], store.client.Get(claimKey).Val())
+
+	lateAuthCode := uuid + "-late"
+	latePendingKey := scanLoginPendingAuthorizationKey(lateAuthCode)
+	lateReadyKey := scanLoginReadyAuthorizationKey(lateAuthCode)
+	keys = append(keys, latePendingKey, lateReadyKey)
+	require.NoError(t, store.client.Set(latePendingKey, expected, time.Minute).Err())
+	promoted, err := store.Promote(lateAuthCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, promoted, "a consumed QR session must reject later authorizations")
+	assert.Equal(t, rd.Nil, store.client.Get(latePendingKey).Err())
+	assert.Equal(t, rd.Nil, store.client.Get(lateReadyKey).Err())
+}
+
+func TestScanLoginAuthorization_RollbackPromotionRestoresPending(t *testing.T) {
+	store := newScanLoginAuthorizationStoreForTest(t)
+	authCode := "scan-rollback-" + time.Now().Format("150405.000000000")
+	pendingKey := scanLoginPendingAuthorizationKey(authCode)
+	readyKey := scanLoginReadyAuthorizationKey(authCode)
+	uuid := "uuid-" + authCode
+	claimKey := scanLoginUUIDClaimKey(uuid)
+	t.Cleanup(func() {
+		_ = store.client.Del(pendingKey, readyKey, claimKey).Err()
+	})
+
+	expected, err := encodeScanLoginAuthorization("scanner-1", uuid)
+	require.NoError(t, err)
+	wrongExpected, err := encodeScanLoginAuthorization("scanner-wrong", uuid)
+	require.NoError(t, err)
+	require.NoError(t, store.client.Set(readyKey, expected, time.Minute).Err())
+	require.NoError(t, store.client.Set(claimKey, authCode, time.Minute).Err())
+
+	wrong, err := store.RollbackPromotion(authCode, wrongExpected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, wrong)
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+	assert.Equal(t, rd.Nil, store.client.Get(pendingKey).Err())
+
+	require.NoError(t, store.client.Set(pendingKey, "newer-pending", time.Minute).Err())
+	conflict, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, conflict, "rollback must not overwrite an existing pending authorization")
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+	assert.Equal(t, "newer-pending", store.client.Get(pendingKey).Val())
+	require.NoError(t, store.client.Del(pendingKey).Err())
+
+	restored, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.True(t, restored)
+	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
+	assert.Equal(t, expected, store.client.Get(pendingKey).Val())
+	assert.Equal(t, authCode, store.client.Get(claimKey).Val())
+	assert.Greater(t, store.client.PTTL(pendingKey).Val(), time.Duration(0))
+	assert.Greater(t, store.client.PTTL(claimKey).Val(), time.Duration(0))
+
+	replayed, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, replayed)
+}

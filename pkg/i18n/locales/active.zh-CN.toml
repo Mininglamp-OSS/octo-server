@@ -167,6 +167,9 @@ other = "注册通道暂未开放。"
 ["err.server.user.local_login_disabled"]
 other = "本地登录已关闭。"
 
+["err.server.user.scan_login_disabled"]
+other = "扫码登录已关闭。"
+
 ["err.server.user.phone_region_unsupported"]
 other = "仅支持中国大陆手机号。"
 

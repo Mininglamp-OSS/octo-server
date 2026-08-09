@@ -390,6 +390,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			Version:                appConfigM.Version,
 			SystemBotUIDs:          spacepkg.SystemBotList(),
 			LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+			ScanLoginEnabled:       cn.systemSettings.ScanLoginEnabled(),
 			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 			SearchEnabled:          searchEnabled,
 			MessagesSearchOn:       searchEnabled,
@@ -441,6 +442,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		// YUJ-219-A / GH#1283：单一真源下发系统 Bot UID 列表，替代三端硬编码。
 		SystemBotUIDs:          spacepkg.SystemBotList(),
 		LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+		ScanLoginEnabled:       cn.systemSettings.ScanLoginEnabled(),
 		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 		SearchEnabled:          searchEnabled,
 		MessagesSearchOn:       searchEnabled,
@@ -774,6 +776,12 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦：即使客户端命中 version 短路分支，也必须能拿到
 	// 最新值，否则 admin 切换开关后老客户端会被本地缓存住。和 SystemBotUIDs 同理。
 	LocalLoginOff int `json:"local_login_off"`
+
+	// ScanLoginEnabled is the client-facing view of login.scan_enabled. Unlike
+	// a display-only toggle, the same setting is enforced by every server-side
+	// scan-login entry point. It is deliberately present in both appconfig
+	// branches so an app_config version cache cannot hide a live policy change.
+	ScanLoginEnabled bool `json:"scan_login_enabled"`
 
 	// DisableUserCreateSpace 控制客户端是否隐藏「创建空间」入口。
 	// 来源 system_setting space.disable_user_create,回退到 env

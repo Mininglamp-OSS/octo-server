@@ -957,7 +957,7 @@ paths:
       tags:
         - "user"
       summary: "通过认证码登录"
-      description: "通过认证码登录"
+      description: "通过已确认的扫码认证码登录；认证码必须与 loginuuid 返回的 poll_secret 配对且只能消费一次"
       operationId: "login_authcode"
       consumes:
         - "application/json"
@@ -968,6 +968,11 @@ paths:
           name: "auth_code"
           type: string
           description: "授权码"
+          required: true
+        - in: "query"
+          name: "poll_secret"
+          type: string
+          description: "loginuuid 返回的浏览器会话密钥；错误或缺失不会消费 auth_code"
           required: true
       responses:
         200:
@@ -2194,6 +2199,8 @@ paths:
       summary: "获取登录状态"
       description: >-
         通过 login uuid 获取登录状态（10 秒长轮询）。
+
+        login.scan_enabled=false 时立即返回 status=disabled。
 
         未出示 poll_secret 时仍返回真实 status，但 auth_code / uid / encrypt
         会被剥掉 —— 只有申请该二维码的调用方能拿到凭据字段。

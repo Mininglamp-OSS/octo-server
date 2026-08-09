@@ -4,6 +4,29 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-09 (scan-login-authorization)
+
+- **Task** — `scan-login-authorization`: added a deployment-wide
+  `login.scan_enabled` policy gate, split scan from explicit confirmation, bound
+  redemption to the browser-issued `poll_secret`, and made confirmation and
+  redemption atomic across replicas. Review follow-up added a per-UUID claim so
+  different auth codes for one displayed QR cannot both become redeemable,
+  made the rollout gate default disabled and fail closed before the first
+  successful settings load, and scrubbed confirmation credentials from logs.
+  Anonymous polling exposes credential fields
+  only to the matching browser and keeps strict per-IP limits; non-finite scan
+  limiter values fall back to finite defaults. Incomplete post-consume login work
+  emits a bounded warning, while failed QR-state publication restores the pending
+  confirmation without overwriting a newer attempt. The OIDC-only production
+  rollout keeps scan login disabled before new binaries start and blocks the
+  routes during any old/new mixed-version or rollback window. See
+  [journal](journal/shared/scan-login-authorization.md).
+- **Learning (pending)** —
+  [redis-write-errors-have-ambiguous-outcomes](learnings/pending/scan-login-authorization.md):
+  a Redis write error does not prove the write was absent; compensation and
+  clients must tolerate the committed-write/error-response branch without
+  reopening an authentication credential.
+
 ## 2026-08-07 (reminder-sync-membership-scope)
 
 - **Task** — `reminder-sync-membership-scope`: `POST /v1/message/reminder/sync`

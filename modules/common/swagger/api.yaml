@@ -562,6 +562,9 @@ paths:
                 items:
                   type: string
                 description: "系统级 Bot UID 列表（跨 Space 可见），单一真源 pkg/space.SystemBots = {botfather, u_10000, fileHelper}。客户端据此替换硬编码 botfather 判定，避免 SYSTEM_BOTS 跨端漂移 (YUJ-219 / GH#1283)"
+              scan_login_enabled:
+                type: boolean
+                description: "是否启用扫码登录。值来自 system_setting login.scan_enabled；默认 false，客户端完成 poll_secret 兑换适配后方可显式开启"
               message_reaction:
                 type: object
                 description: "普通 Web/iOS/Android 客户端的全局消息 Reaction 能力；由 system_setting message_reaction.read/write 独立控制，默认可读不可写，Bot 身份覆盖不在此公共接口处理"

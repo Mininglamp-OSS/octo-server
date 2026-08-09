@@ -1182,6 +1182,9 @@ other = "Registration is currently closed."
 ["err.server.user.request_invalid"]
 other = "Invalid request."
 
+["err.server.user.scan_login_disabled"]
+other = "Scan login is disabled."
+
 ["err.server.user.short_no_already_changed"]
 other = "Short ID can only be changed once."
 
