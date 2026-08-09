@@ -19,6 +19,8 @@ source: self
 
 当前依赖的 Viper v1.16 / cast v1.5.1 最终使用 Go `time.ParseDuration`，不支持 `30d` 这种 day 后缀。仓库示例中的 `tokenExpire: 30d` 会解析为零，再被 octo-lib 静默替换成默认 30 天，容易造成“覆盖已生效”的误判；实现时必须把示例改为 `720h`，并在 octo-server 启动层对 Viper 已完成 env 覆盖后的原始值做显式解析和校验。
 
+显式空值 env 的校验只能用 `os.LookupEnv("TS_CACHE_TOKENEXPIRE")` 收敛到该唯一配置项；不得调用 `AllowEmptyEnv` 改变共享 Viper 实例的全局语义，否则其他空 `TS_*` env 可能覆盖 YAML 中的数据库地址或 Redis TLS 配置。校验前后，非 Token 配置的 env/YAML 优先级必须保持不变。
+
 ## Goal
 
 让所有用户 Access Token 同时满足以下约束：
