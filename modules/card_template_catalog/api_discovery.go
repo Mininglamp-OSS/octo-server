@@ -358,9 +358,14 @@ func staticListItem(entry cardtmpl.StaticCatalogEntry) discoveryListItem {
 		ID: string(entry.ID), Version: entry.Version, Source: discoverySourceStatic,
 		Owner: entry.Owner, Protocol: entry.Protocol,
 		ContractVersion: entry.ContractVersion, Visibility: entry.Visibility,
-		// A static template has no activation row of its own here; the default
-		// version registered in the frozen Registry is what a static new send
-		// resolves to.
+		// The Registry default. This is NOT always what a new send resolves to
+		// (review P2-2, yujiawei): loadStateTargetForUpdate accepts a static
+		// claim as an activation target, and decideSendRef then resolves that
+		// exact version, so an activation pointing at static X@1.0.0 while the
+		// default is X@2.0.0 makes this field report the inverse on both rows.
+		// Unreachable today because creating such an activation needs the
+		// control plane, which is gated off — D0h records it as a condition to
+		// resolve before that gate is enabled anywhere.
 		ActiveForNewSend: entry.IsDefault,
 	}
 	// A static entry carries its contract inline, so this row is never in the
@@ -526,6 +531,15 @@ func matchesETag(header, etag string) bool {
 }
 
 func writeDiscoveryCacheHeaders(c *wkhttp.Context, spaceID string) {
+	// The body is a function of the Space, and the Space can arrive in a header
+	// at a fixed URL (LocalizedSpaceMiddleware reads ?space_id then X-Space-ID),
+	// so a cache keyed on URL alone would be keyed on the wrong thing.
+	// `private, no-cache` already makes that correct against a compliant cache
+	// and B1 emits no validator, so this is margin rather than a live fix — but
+	// /v1/bot/card/profile in this same package family sets Vary: Authorization
+	// for exactly this reason, and one of the two having it is how the other
+	// gets forgotten (review P2-5, yujiawei).
+	c.Header("Vary", "X-Space-ID")
 	if spaceID != "" {
 		c.Header("Cache-Control", "private, no-cache")
 		return

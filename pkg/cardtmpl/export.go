@@ -150,7 +150,11 @@ func buildSafeExport(
 		export.Views = append(export.Views, view)
 	}
 	if meta.Manifest != nil {
-		export.Manifest = append(json.RawMessage(nil), meta.Manifest...)
+		published, err := publishedManifest(meta.Manifest)
+		if err != nil {
+			return nil, err
+		}
+		export.Manifest = published
 	}
 	if schema != nil {
 		export.Schema = append(json.RawMessage(nil), schema...)
@@ -261,4 +265,59 @@ func sortedViewNames(views map[ViewKey]ViewSpec) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// publishedManifest is the subset of manifest.json B2 means to serve.
+//
+// The projection used to pass `meta.Manifest` through verbatim, and the sample
+// opt-in it sits next to made that look safer than it was (review P2-3,
+// yujiawei). The opt-in is airtight about sample *bodies* — buildSafeExport
+// only ever reads keys named in the allowlist — but the raw manifest still
+// announced the whole inventory: `views.*.samples` lists every fixture path,
+// including the ones a manifest deliberately did not export, so a template that
+// opted in one sample disclosed the names of the rest.
+//
+// Dropped, and why each one:
+//
+//   - `views` — SafeExport.Views already carries the published view surface
+//     (name, states, wire profile, submit actions), built field by field. The
+//     manifest's copy adds nothing a caller needs and carries the per-view
+//     `template` path and `samples` inventory.
+//   - `dataSchema`, `template` — repository-relative artifact paths. Internal
+//     storage layout is not part of a contract.
+//   - `renderProfile` — json_artifact.go describes it as provenance-only
+//     metadata for the exact Forge artifact, "not retained at runtime". Its
+//     stable sibling renderProfileCompatibility is what the wire uses, and that
+//     one is published.
+//   - `export` — the allowlist itself, which is the policy rather than the
+//     contract.
+//
+// Unknown keys are dropped by construction: this decodes into a fixed struct
+// rather than a map, so a manifest field added later is not published until
+// somebody adds it here on purpose. That is the direction the default should
+// fail on an endpoint that serves artifacts to any caller who can discover them.
+func publishedManifest(raw json.RawMessage) (json.RawMessage, error) {
+	var published struct {
+		SchemaVersion              int    `json:"schemaVersion,omitempty"`
+		ID                         ID     `json:"id,omitempty"`
+		Name                       string `json:"name,omitempty"`
+		Version                    string `json:"version,omitempty"`
+		ContractVersion            string `json:"contractVersion,omitempty"`
+		Protocol                   string `json:"protocol,omitempty"`
+		AdaptiveCardVersion        string `json:"adaptiveCardVersion,omitempty"`
+		DefaultLocale              string `json:"defaultLocale,omitempty"`
+		RenderProfileCompatibility string `json:"renderProfileCompatibility,omitempty"`
+		Owner                      string `json:"owner,omitempty"`
+		ActionType                 string `json:"actionType,omitempty"`
+		SourceLabel                string `json:"sourceLabel,omitempty"`
+		SourceIconURL              string `json:"sourceIconUrl,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &published); err != nil {
+		return nil, fmt.Errorf("export manifest projection: %w", err)
+	}
+	out, err := json.Marshal(published)
+	if err != nil {
+		return nil, fmt.Errorf("export manifest projection: %w", err)
+	}
+	return out, nil
 }

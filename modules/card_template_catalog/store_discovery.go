@@ -184,6 +184,17 @@ func (s *store) LoadDiscoverable(
 // an active discover grant on. Static templates are private by default, so
 // without this a granted static card would be invisible even to the Space it
 // was granted to.
+// Load-bearing coupling, stated here rather than two files away (review P2-7,
+// yujiawei): this query re-derives effective discover permission in SQL —
+// global scope only, no exact row, `can_discover = 1` standing in for a status
+// check — while store_grant.go says precedence collapses on resolveGrantRows and
+// that a second implementation is not allowed.
+//
+// It is equivalent to the reducer only because `chk_card_template_grant_space`
+// forbids a non-global scope for `space` principals, so an exact row that could
+// mask this global one cannot exist. **Relax that CHECK and this query silently
+// keeps discovering a template whose exact tombstone should have masked it.**
+// See D0h for why it is not routed through the reducer in this PR.
 func (s *store) StaticDiscoverGrants(
 	ctx context.Context,
 	spaceID string,

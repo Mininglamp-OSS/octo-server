@@ -345,6 +345,59 @@ can answer what three clients render.
 from #709 and now closed: a thread created from a card message announces its
 source rather than copying the card body. No further work.
 
+### D0h — Three review-round-5 P2s recorded rather than guessed at
+
+Review P2-2, P2-6 and P2-7 (yujiawei). Each is real; each has a fix whose right
+shape is a decision rather than a mechanical edit, and guessing one in a review
+round is how the last three defects in this family were introduced.
+
+**P2-2 — B1's static `active_for_new_send` ignores the activation pointer.**
+`staticListItem` derives it from `entry.IsDefault`, and its comment asserts a
+static template "has no activation row of its own here". It can:
+`loadStateTargetForUpdate` accepts a static claim as an activation target and
+`decideSendRef` resolves a static-sourced pointer to that exact version. So with
+an activation pointing at static `X@1.0.0` while the Registry default is
+`X@2.0.0`, B1 reports the field's inverse on both rows.
+
+Not fixed here, and the reason is reachability rather than effort: creating a
+static activation requires the control plane, which is gated off, so no
+deployment can currently be in that state. The two candidate fixes are an extra
+activation read on the static page — which the static page exists to avoid — or
+narrowing the field to mean "is the Registry default". The second is a wire
+contract change and should be taken with the B1 field set as a whole, not
+piecemeal. **Gate condition: resolve this before `_CONTROL_ENABLED` is enabled
+anywhere**, because that is the moment the state becomes reachable.
+
+**P2-6 — `managerList`'s `latest_version` is lexicographic.** `MAX(c.version)`
+over an `ascii_bin` column, while `managerVersionPattern` permits multi-digit
+minors, so `1.10.0` sorts below `1.9.0` and the operator index — whose stated
+purpose is that a freshly published template is easy to find — names the older
+one as latest.
+
+Not fixed here because the fix is a semver comparator, this repository has none,
+and inventing one inside a review round to sort an operator convenience field is
+the wrong place for a new ordering primitive that activation targeting would
+then be tempted to reuse. The correct fix is a shared comparator plus a decision
+about whether prerelease ordering follows semver precedence — the pilot versions
+are `<next>.0-pilot.<yyyymmdd>`, so that question is not academic. Meanwhile
+`version_count` and the detail endpoint give the operator the true list.
+
+**P2-7 — `StaticDiscoverGrants` is a second grant-precedence reader.**
+`store_grant.go` states that precedence collapses on `resolveGrantRows` and that
+a second implementation is not allowed; this query re-derives effective discover
+permission in SQL, hardcoding `scope_space_id = ''`, never fetching an exact
+row, and substituting `can_discover = 1` for a status check.
+
+It is equivalent today only because `chk_card_template_grant_space` forbids a
+non-global scope for `space` principals — a coupling documented two files away
+from the query that depends on it. Not restructured here: routing static
+discover through `resolveGrantRows` means fetching both scopes per template
+across an IN-list of up to 128 ids, which changes the query shape on an ungated
+live route, and D0d already defers query-shape changes on this table until the
+`EXPLAIN` measurement exists. What is done instead is to state the dependency
+where it can be seen — the guard is a schema CHECK, and relaxing that CHECK
+silently makes this query wrong.
+
 ### D1 — One PR-C milestone, ordered internal slices
 
 保持一个 octo-server PR-C，避免 migrations/API/runtime wiring 跨 PR 出现“grant 已写入但

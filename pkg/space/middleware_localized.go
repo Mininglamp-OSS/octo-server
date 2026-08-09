@@ -18,9 +18,11 @@ package space
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"go.uber.org/zap"
 )
 
 // LocalizedSpaceMiddleware validates the requested Space the same way
@@ -60,7 +62,7 @@ func localizedSpaceMiddleware(check MembershipChecker, cache MembershipCache) wk
 				c.Abort()
 				return
 			}
-			c.Set("space_id", spaceID)
+			SetSpaceID(c, spaceID)
 			c.Next()
 			return
 		}
@@ -71,6 +73,17 @@ func localizedSpaceMiddleware(check MembershipChecker, cache MembershipCache) wk
 			// said no: answering "forbidden" here would train callers to retry
 			// with a different Space, and answering "allowed" would be a
 			// tenant-isolation hole. Report the outage.
+			//
+			// Logged as well as answered, because the two twins report an outage
+			// at different wire statuses (review P2-4, yujiawei). SpaceMiddleware
+			// answers a wire 500; ResponseErrorL pins this one to 400 for D14
+			// compatibility and carries the real status inside the envelope. A
+			// MySQL or Redis failure inside CheckMembership would therefore be
+			// invisible to 5xx-based alerting on these routes, so the log line is
+			// the signal. Changing the wire status instead would need the D14
+			// sign-off that ResponseErrorLWithStatus is reserved for.
+			log.Error("localized space middleware: membership check failed",
+				zap.String("space_id", spaceID), zap.String("uid", uid), zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			c.Abort()
 			return
@@ -88,7 +101,7 @@ func localizedSpaceMiddleware(check MembershipChecker, cache MembershipCache) wk
 			return
 		}
 
-		c.Set("space_id", spaceID)
+		SetSpaceID(c, spaceID)
 		c.Next()
 	}
 }

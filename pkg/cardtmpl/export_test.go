@@ -241,3 +241,66 @@ func TestSafeExportRefusesToBuildAnOversizedProjection(t *testing.T) {
 		t.Fatalf("the allowlisted sample is missing: %+v", export.Samples)
 	}
 }
+
+// TestPublishedManifestDropsPathsAndTheSampleInventory is review P2-3
+// (yujiawei). The sample opt-in gates sample *bodies* and always did; what
+// leaked was the manifest announcing the inventory those bodies belong to.
+//
+// The assertion is on the serialized bytes rather than on struct fields,
+// because the defect was a pass-through: any check that decoded into a known
+// shape would have looked at exactly the fields that were fine.
+func TestPublishedManifestDropsPathsAndTheSampleInventory(t *testing.T) {
+	raw := json.RawMessage(`{
+        "schemaVersion": 1,
+        "id": "docs.pilot",
+        "name": "Pilot",
+        "version": "0.4.0",
+        "contractVersion": "1.0.0",
+        "protocol": "octo-card@1.0",
+        "adaptiveCardVersion": "1.5",
+        "defaultLocale": "zh-CN",
+        "renderProfile": "octo-chat@1.2.0-rc.1",
+        "renderProfileCompatibility": "octo-chat@1.2",
+        "owner": "docs",
+        "actionType": "access_request.decision",
+        "dataSchema": "contract/data.schema.json",
+        "views": {"result": {
+            "template": "templates/pending.template.json",
+            "samples": ["samples/approved.json", "samples/rejected.json"]
+        }},
+        "export": {"samples": ["pending"]}
+    }`)
+
+	published, err := publishedManifest(raw)
+	if err != nil {
+		t.Fatalf("publishedManifest: %v", err)
+	}
+	body := string(published)
+
+	// Nothing that names where a document lives, and nothing that enumerates
+	// the fixtures the manifest did not opt into exporting.
+	for _, forbidden := range []string{
+		"samples/approved.json", "samples/rejected.json",
+		"templates/pending.template.json", "contract/data.schema.json",
+		"dataSchema", "views", "export",
+		// renderProfile is provenance-only for the exact Forge artifact; the
+		// stable renderProfileCompatibility is the published one, and a
+		// substring check would match both, so this asserts the exact value.
+		"octo-chat@1.2.0-rc.1",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("published manifest leaked %q: %s", forbidden, body)
+		}
+	}
+
+	// And it still carries the contract a caller came for.
+	for _, required := range []string{
+		`"id":"docs.pilot"`, `"version":"0.4.0"`, `"contractVersion":"1.0.0"`,
+		`"protocol":"octo-card@1.0"`, `"actionType":"access_request.decision"`,
+		`"renderProfileCompatibility":"octo-chat@1.2"`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("published manifest dropped %s: %s", required, body)
+		}
+	}
+}

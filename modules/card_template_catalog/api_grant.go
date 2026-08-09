@@ -238,7 +238,16 @@ func (a *API) grantStore(c *wkhttp.Context) (catalogGrantStore, bool) {
 
 func (a *API) respondGrantError(c *wkhttp.Context, operation string, err error) string {
 	switch {
-	case errors.Is(err, ErrGrantConflict), errors.Is(err, ErrGrantAlreadyRevoked):
+	case errors.Is(err, ErrGrantConflict), errors.Is(err, ErrGrantAlreadyRevoked),
+		// ErrActivationConflict reaches here because the grant writes share
+		// requireOneStateRow with the activation writes, and that helper names
+		// the caller it was written for. Without this arm a grant CAS miss fell
+		// through to the default and answered a 5xx plus a log line about
+		// "activation CAS" for a grant write (review P2-8, yujiawei). It is
+		// barely reachable — `revision = revision + 1` makes affected-rows 1
+		// whenever the row was matched — but "barely reachable" is exactly when
+		// the operator has the least context to reinterpret the message.
+		errors.Is(err, ErrActivationConflict):
 		a.metrics.observeDB(operation, "conflict")
 		respondCatalogStateConflict(c)
 		return "conflict"
@@ -329,7 +338,13 @@ func (a *API) productionGrantPrincipalCheck(ctx context.Context, identity GrantI
 // Fail-closed, but expensive to diagnose — the operator sees a successful write
 // and a capability that does nothing, with nothing anywhere connecting the two.
 // So the write path rejects a spelling the read path could not match, and names
-// the canonical one, which is safe to disclose on a super-admin-only route.
+// the canonical one.
+//
+// Where that name lands: respondCatalogGrantInvalid logs the wrapped error and
+// answers with a bare code, so the canonical spelling reaches the server log,
+// not the HTTP response (review P2-10, yujiawei). That is the right split for a
+// route that must not become an identity oracle even for a super-admin, and it
+// still puts the answer one `grep` away from the operator who made the request.
 //
 // Rejecting rather than silently canonicalising: the stored identity is part of
 // the grant's CAS/revision contract, and quietly writing a different identity
@@ -365,14 +380,29 @@ func byteExactIdentity(what, stored, requested string) error {
 // id is re-read here rather than by changing botidentity, whose other callers
 // resolve identities for delivery and want the forgiving comparison.
 func (a *API) requireByteExactBot(ctx context.Context, botID string) error {
-	var stored string
+	// Both identity tables are consulted, and a byte-exact match wins over table
+	// order (review P2-9, yujiawei). COALESCE alone returned the `robot` row
+	// first, so a Bot whose `robot` spelling differs in case while `app_bot`
+	// holds the exact one was rejected — and the error named the wrong canonical
+	// identity, which is the opposite of what this function exists to do.
+	var fromRobot, fromAppBot string
 	err := a.ctx.DB().DB.QueryRowContext(ctx,
-		"SELECT COALESCE("+
-			"(SELECT robot_id FROM robot WHERE robot_id = ? AND status = 1 LIMIT 1),"+
-			"(SELECT uid FROM app_bot WHERE uid = ? AND status = 1 LIMIT 1), '')",
-		botID, botID).Scan(&stored)
+		"SELECT "+
+			"COALESCE((SELECT robot_id FROM robot WHERE robot_id = ? AND status = 1 LIMIT 1), ''), "+
+			"COALESCE((SELECT uid FROM app_bot WHERE uid = ? AND status = 1 LIMIT 1), '')",
+		botID, botID).Scan(&fromRobot, &fromAppBot)
 	if err != nil {
 		return fmt.Errorf("card template catalog: resolve bot identity: %w", err)
+	}
+	// A byte-exact match from either table wins over table order. Comparing in
+	// Go rather than in SQL keeps this free of collation operators (MySQL 8
+	// deprecated `BINARY x`) and makes the precedence visible at the call site.
+	stored := fromRobot
+	switch {
+	case fromRobot == botID || fromAppBot == botID:
+		stored = botID
+	case stored == "":
+		stored = fromAppBot
 	}
 	if stored == "" {
 		// Active() already said this Bot exists, so an empty answer here means
