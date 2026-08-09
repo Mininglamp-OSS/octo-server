@@ -11,6 +11,7 @@ import (
 
 var (
 	errQRCodeUnsupportedType     = errors.New("qrcode: unsupported type")
+	errQRCodeNotFound            = errors.New("qrcode: not found")
 	errQRCodeGroupDataInvalid    = errors.New("qrcode: group data invalid")
 	errQRCodeGroupNotFound       = errors.New("qrcode: group not found")
 	errQRCodeGroupSpaceForbidden = errors.New("qrcode: group space forbidden")
@@ -37,6 +38,8 @@ func respondQRCodeHandleError(c *wkhttp.Context, err error) {
 		respondQRCodeRequestInvalid(c, "code")
 	case errors.Is(err, errQRCodeGroupNotFound):
 		httperr.ResponseErrorL(c, errcode.ErrQRCodeGroupNotFound, nil, nil)
+	case errors.Is(err, errQRCodeNotFound):
+		httperr.ResponseErrorL(c, errcode.ErrQRCodeNotFound, nil, nil)
 	case errors.Is(err, errQRCodeGroupSpaceForbidden):
 		httperr.ResponseErrorL(c, errcode.ErrQRCodeGroupSpaceForbidden, nil, nil)
 	case errors.Is(err, errQRCodeScanLoginDisabled):

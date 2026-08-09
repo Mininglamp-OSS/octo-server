@@ -33,10 +33,10 @@ var (
 // EnsureSystemSettings returns the process-wide SystemSettings instance,
 // constructing it on first call. Safe to call from any goroutine.
 //
-// Failed initial Load is non-fatal: an empty-snapshot instance is stored
-// and the background auto-reload (started here) will retry every
-// reloadTTL. Until then all getters fall back to yaml — degraded mode,
-// not a hard failure. A successful subsequent reload self-heals.
+// Failed initial Load is non-fatal: the background auto-reload (started here)
+// retries every reloadTTL. Ordinary getters fall back to yaml while the
+// snapshot is nil; security gates such as ScanLoginEnabled fail closed until a
+// successful load publishes the first snapshot. A subsequent reload self-heals.
 func EnsureSystemSettings(ctx *config.Context) *SystemSettings {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
@@ -98,19 +98,17 @@ type SystemSettings struct {
 	log.Log
 }
 
-// NewSystemSettings builds a helper with an empty initial snapshot.
-// Callers must invoke Load() once at startup before serving traffic;
-// Reload() is safe to call at any time (admin write path uses it).
+// NewSystemSettings builds a helper with an uninitialized snapshot. A nil
+// snapshot distinguishes "the DB successfully returned no rows" from "the DB
+// has never been read successfully". Callers must invoke Load() once at startup
+// before serving traffic; Reload() is safe at any time.
 func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings {
-	s := &SystemSettings{
+	return &SystemSettings{
 		ctx:       ctx,
 		db:        db,
 		reloadTTL: defaultReloadTTL,
 		Log:       log.NewTLog("SystemSettings"),
 	}
-	empty := map[string]string{}
-	s.snapshot.Store(&empty)
-	return s
 }
 
 // Load reads every row from system_setting and atomically replaces the
@@ -371,12 +369,16 @@ func (s *SystemSettings) LocalLoginOff() bool {
 
 // ScanLoginEnabled returns whether QR-code login is enabled deployment-wide.
 //
-// Default true preserves the historical behavior for deployments that have not
-// configured the setting. Unlike LocalLoginOff, this switch is itself the
-// server-side security boundary: every scan-login entry point reads the same
-// hot-reloaded snapshot, while unrelated QR-code types remain available.
+// Default false permits a server-first rollout without breaking clients that do
+// not yet send poll_secret on redemption. Operators must explicitly enable scan
+// login only after every client in the flow supports the hardened contract.
+// Before the first successful settings load the snapshot is nil and this gate
+// also fails closed; later reload failures retain the last successful snapshot.
 func (s *SystemSettings) ScanLoginEnabled() bool {
-	return s.getBool("login", "scan_enabled", true)
+	if s.snapshot.Load() == nil {
+		return false
+	}
+	return s.getBool("login", "scan_enabled", false)
 }
 
 // anyThirdPartyLoginConfigured reports whether at least one external login

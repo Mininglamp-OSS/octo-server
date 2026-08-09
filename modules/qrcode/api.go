@@ -170,6 +170,10 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 
 // 处理扫描登录
 func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel common.QRCodeModel) (interface{}, error) {
+	if qrCodeModel.Data == nil ||
+		fmt.Sprint(qrCodeModel.Data["status"]) != string(common.ScanLoginStatusWaitScan) {
+		return nil, errQRCodeNotFound
+	}
 	authCode := util.GenerUUID()
 	err := user.SavePendingScanLoginAuthorization(q.ctx.GetRedisConn(), authCode, loginUID, uuid)
 	if err != nil {

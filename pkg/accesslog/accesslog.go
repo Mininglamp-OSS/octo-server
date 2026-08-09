@@ -46,12 +46,15 @@ var webhookPushPrefixes = []string{
 //     `uuid` (also on that line) is exactly what lets a caller read `auth_code`
 //     out of GET /v1/user/loginstatus, so logging both defeats the gate for
 //     anyone with log read access. Valid for scanLoginPollSecretTTL (12 min).
+//   - auth_code: grant_login promotes this one-time authorization into a full
+//     login credential after the authenticated scanner confirms.
+//   - encrypt: Signal key material supplied by the scanner at confirmation.
 //
 // The value is everything up to the next separator; the parameter NAME is kept so
 // the line stays useful for correlation. Case-insensitive for the same reason as
 // ScrubPath — scrubbing is the security control, so it must survive casing
 // variants that a router would 404 but the logger would still print.
-var secretQueryInPath = regexp.MustCompile(`(?i)\b(poll_secret=)[^&\s?"']*`)
+var secretQueryInPath = regexp.MustCompile(`(?i)\b((?:poll_secret|auth_code|encrypt)=)[^&\s?"']*`)
 
 // authCodeInPath masks the redeemable scan-login auth code, which travels as a
 // path segment.
