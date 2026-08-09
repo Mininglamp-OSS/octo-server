@@ -653,6 +653,52 @@ func TestMalformedExpectedModeFailsClosed(t *testing.T) {
 	}
 }
 
+// TestExpectedModeRefusalDoesNotReadAuthorityPerAllocation is the regression
+// from the post-rebase review on head 6a5cd9a6.
+//
+// A deployment guard mismatch is stable for the lifetime of the process. Once
+// the authority has been resolved, refusing the allocation must not re-read the
+// same row for every message while holding a msgSem slot. A malformed guard is
+// even cheaper: it is process-local configuration and must fail before any DB
+// read at all.
+func TestExpectedModeRefusalDoesNotReadAuthorityPerAllocation(t *testing.T) {
+	cases := []struct {
+		name     string
+		expected string
+		maxReads int64
+	}{
+		{name: "expects incr while authority is legacy", expected: ModeIncr, maxReads: 1},
+		{name: "malformed expectation", expected: "inrc", maxReads: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, client := seqTestCtx(t)
+			robotID := "seqtest_expected_refusal_" + strings.ReplaceAll(tc.name, " ", "_")
+			fixture(t, ctx, client, robotID)
+			setStateMode(t, ctx, StateModeLegacy, 0)
+			client.Del(ModeKey)
+			ResetSeededForTest()
+
+			restore := SetExpectedModeForTest(tc.expected)
+			defer restore()
+
+			before := AuthorityReads()
+			const allocations = 20
+			for i := 0; i < allocations; i++ {
+				if id, err := nextEventID(ctx, client, robotID); err == nil {
+					t.Fatalf("allocation %d returned id %d; the expected-mode guard must fail closed", i, id)
+				}
+			}
+			if reads := AuthorityReads() - before; reads > tc.maxReads {
+				t.Fatalf("%d refused allocations issued %d authority reads, want at most %d; "+
+					"a stable deployment error must not serialize every message on MySQL",
+					allocations, reads, tc.maxReads)
+			}
+		})
+	}
+}
+
 // TestMirrorAloneCannotActivateTheCounter is the review P1-2 / Jerry-Xin 🔴 case.
 //
 // The hot path used to trust a positive mirror outright and never read the authority,
