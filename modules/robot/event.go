@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -28,6 +29,72 @@ func (rb *Robot) getCreatorUID(robotID string) (string, error) {
 	return uid, nil
 }
 
+// robotIDMaxLen bounds a candidate bot id in **bytes**.
+//
+// It is the width of `robot.robot_id` (VARCHAR(40),
+// modules/robot/sql/20210926000001_robot_legacy01.sql), which MySQL counts in *characters*
+// under utf8mb4 — so this is deliberately the stricter of the two, and the difference is
+// stated rather than glossed (review round 7). A multibyte id would be rejected here while
+// the column would accept it; that is unreachable today because both id-producing paths are
+// ASCII-only (a client-chosen username is `[a-z0-9_]{1,20}` plus `_bot`, and the generated
+// form is lowercase hex plus `_bot` — modules/botfather), and bytes are what the Redis key
+// and the log line are actually made of. If a multibyte id ever becomes producible, widen
+// this to utf8.RuneCountInString rather than raising the number.
+const robotIDMaxLen = 40
+
+const robotMissingCacheTTL = 30 * time.Second
+
+// plausibleRobotID reports whether a client-supplied `payload.robot_id` is shaped like
+// something that could name a bot at all.
+//
+// This is a *syntactic* gate in front of the existRobot lookup, and it exists because that
+// lookup is on a client-controlled path. The monotonic allocator turns every adopted value
+// into a permanent `botEventSeq:counter:{id}` key — no TTL, in a Redis running `noeviction`
+// — plus a `seq` row that is never reclaimed. This check bounds one key's size and rejects
+// spellings no real bot can use; it does **not** bound cardinality, because a client can send
+// arbitrarily many distinct well-shaped values. Positive existence verification below is
+// what closes that dimension.
+//
+// The length bound is the decisive one and it needs no judgement call: a value longer than
+// the column can hold cannot match any row, so adopting it could only ever create permanent
+// state for a bot that provably does not exist. Whitespace and control characters are
+// rejected for the same reason botevent.NextEventID rejects a padded id — the allocator, the
+// queue key and the doorbell must all key off the identical string, and an id that cannot
+// round-trip through a log line or a `KEYS` listing is not one anybody meant to send.
+//
+// Deliberately no charset allowlist beyond that: bot ids are UUID-hex in production, but the
+// column stores whatever it is given, and guessing narrower here would silently stop a real
+// bot's events for the sake of a surface the length bound already closes.
+func plausibleRobotID(candidate string) bool {
+	if candidate == "" || len(candidate) > robotIDMaxLen {
+		return false
+	}
+	for _, r := range candidate {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifiedPayloadRobotID applies the trust boundary for client-controlled
+// payload.robot_id values.
+//
+// Only a successful, positive lookup is authority to adopt the candidate. Treating a lookup
+// error as existence lets a client create a fresh permanent counter key for every distinct
+// value throughout a dependency outage; the syntactic bound above limits key size, not key
+// count. Returning the lookup error lets the caller surface the availability failure while
+// keeping the unverified id out of the allocator.
+func verifiedPayloadRobotID(candidate string, exists bool, lookupErr error) (string, error) {
+	if lookupErr != nil {
+		return "", lookupErr
+	}
+	if !exists {
+		return "", nil
+	}
+	return candidate, nil
+}
+
 func (rb *Robot) existRobot(robotID string) (bool, error) {
 	key := fmt.Sprintf("robot:exist:%s", robotID)
 	exist, err := rb.ctx.GetRedisConn().GetString(key)
@@ -36,6 +103,9 @@ func (rb *Robot) existRobot(robotID string) (bool, error) {
 	}
 	if exist == "1" {
 		return true, nil
+	}
+	if exist == "0" {
+		return false, nil
 	}
 	existB, err := rb.db.exist(robotID)
 	if err != nil {
@@ -47,6 +117,13 @@ func (rb *Robot) existRobot(robotID string) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	}
+	// Unknown client-supplied ids are common on this listener path. Cache a proven miss
+	// briefly so one repeated payload cannot turn into one MySQL query per message. Keep
+	// the TTL short: bot creation is allowed to make a previously missing id valid, and
+	// no creation hook can invalidate every replica's local observation atomically.
+	if err := rb.ctx.GetRedisConn().SetAndExpire(key, "0", robotMissingCacheTTL); err != nil {
+		rb.Warn("缓存不存在的robotID失败", zap.Error(err), zap.String("robotID", robotID))
 	}
 	return false, nil
 
@@ -168,8 +245,47 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 		if len(robotID) == 0 {
 			robotIDValue := payloadValue.Get("robot_id")
 			if robotIDValue.Exists() {
-				robotID = robotIDValue.String()
-			} else if payloadValue.Get("mention").Exists() {
+				// #697: validate before adopting it, as the three sibling branches below
+				// already do (mention.uids, @username text, ais broadcast). This one did
+				// not, and it is the only branch whose value comes verbatim out of a
+				// client's message payload.
+				//
+				// It used to cost an unknown value only a queue key with a TTL plus a
+				// `seq` row. The monotonic allocator adds a per-bot counter key with
+				// **no** TTL in a Redis running `noeviction`, plus a durable `seq` row
+				// that is never reclaimed — so an arbitrary payload value would become
+				// permanent per-value state. Rejecting an unknown bot is also just
+				// correct on its own terms: enqueueing onto a queue no bot will ever poll
+				// is not a delivery.
+				//
+				// A lookup error must not turn into authority to adopt the value. During
+				// a dependency outage a client can submit arbitrarily many distinct,
+				// well-shaped ids; adopting them would leave one permanent counter per
+				// value. The syntactic gate limits each key's size, not their count, so
+				// this branch accepts only a positively verified bot. The availability
+				// trade-off is explicit: an event routed solely by payload.robot_id is
+				// ignored while its identity cannot be verified.
+				candidate := robotIDValue.String()
+				if !plausibleRobotID(candidate) {
+					rb.Debug("payload.robot_id 形状不合法，忽略",
+						zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
+				} else {
+					exist, err := rb.existRobot(candidate)
+					verified, verifyErr := verifiedPayloadRobotID(candidate, exist, err)
+					switch {
+					case verifyErr != nil:
+						rb.Error("查询有效robotID失败，无法正向验证，忽略payload.robot_id",
+							zap.Error(verifyErr), zap.String("robotID", candidate),
+							zap.Int64("messageID", message.MessageID))
+					case verified != "":
+						robotID = verified
+					default:
+						rb.Debug("payload.robot_id 不是已知机器人，忽略",
+							zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
+					}
+				}
+			}
+			if len(robotID) == 0 && payloadValue.Get("mention").Exists() {
 				rb.Debug("检测到@提及", zap.String("mention", payloadValue.Get("mention").String()))
 				mentionValue := payloadValue.Get("mention")
 				mentionUIDsValue := mentionValue.Get("uids")
@@ -252,7 +368,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 						}
 					}
 				}
-			} else {
+			} else if len(robotID) == 0 {
 				if common.ContentType(payloadValue.Get("type").Int()) == common.Text {
 					content := payloadValue.Get("content").String()
 					if strings.Contains(content, "@") {
@@ -351,9 +467,12 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		message = &cp
 	}
 
-	seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: monotonic per-bot allocator instead of GenSeq. This is the
+	// highest-volume producer and it runs inside a msgSem slot, which is why the
+	// allocator's timeouts are bounded — see pkg/botevent/seq.go.
+	seq, err := botevent.NextEventID(rb.ctx, robotID)
 	if err != nil {
-		rb.Warn("GenSeq failed", zap.Error(err))
+		rb.Warn("allocate bot event id failed", zap.Error(err), zap.String("robotID", robotID))
 		return
 	}
 	messageUpdateJson := util.ToJson(&robotEvent{
@@ -361,7 +480,7 @@ func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
 		Message: message,
 		Expire:  time.Now().Add(rb.ctx.GetConfig().Robot.MessageExpire).Unix(),
 	})
-	key := fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID)
+	key := botevent.QueueKey(robotID)
 	err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson)
 	if err != nil {
 		rb.Error("投递消息给机器人失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("message", messageUpdateJson))

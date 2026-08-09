@@ -29,9 +29,6 @@ const (
 	// heartbeat Redis key prefix and TTL
 	heartbeatKeyPrefix = "bot:heartbeat:"
 	heartbeatTTL       = 60
-
-	// robotEventPrefix for events queue
-	robotEventPrefix = "robotEvent:"
 )
 
 // BotAPI is the public Bot API gateway module.

@@ -27,19 +27,18 @@ import (
 
 // BotFather BotFather模块
 type BotFather struct {
-	ctx              *config.Context
-	db               *botfatherDB
-	cmdHandler       *commandHandler
-	userService      user.IService
-	appService       app.IService
-	fileService      file.IService
-	groupService     group.IService
-	apiKeyService    UserAPIKeyService
-	userDB           *user.DB
-	threadService    thread.IService
-	robotEventPrefix string
-	initOnce         sync.Once
-	msgSem           chan struct{} // 限制并发消息处理的信号量
+	ctx           *config.Context
+	db            *botfatherDB
+	cmdHandler    *commandHandler
+	userService   user.IService
+	appService    app.IService
+	fileService   file.IService
+	groupService  group.IService
+	apiKeyService UserAPIKeyService
+	userDB        *user.DB
+	threadService thread.IService
+	initOnce      sync.Once
+	msgSem        chan struct{} // 限制并发消息处理的信号量
 	// searchHandler 是共享的消息搜索 Handler（messages_search.Shared）。uk 搜索路由
 	// /v1/user/messages/_search* 复用它（YUJ-49 / #B，决策十正式接线）：authUserAPIKey
 	// 鉴权、principal=uk（subjectUID=keyModel.UID，spaceID=api_key_space_id）。与 web、
@@ -51,20 +50,19 @@ type BotFather struct {
 // New 创建BotFather实例
 func New(ctx *config.Context) *BotFather {
 	bf := &BotFather{
-		ctx:              ctx,
-		db:               newBotfatherDB(ctx),
-		cmdHandler:       newCommandHandler(ctx),
-		userService:      user.NewService(ctx),
-		appService:       app.NewService(ctx),
-		fileService:      file.NewService(ctx),
-		groupService:     group.NewService(ctx),
-		apiKeyService:    NewUserAPIKeyService(ctx),
-		userDB:           user.NewDB(ctx),
-		threadService:    thread.NewService(ctx),
-		robotEventPrefix: "robotEvent:",
-		msgSem:           make(chan struct{}, 100),
-		searchHandler:    messages_search.Shared(ctx),
-		Log:              log.NewTLog("BotFather"),
+		ctx:           ctx,
+		db:            newBotfatherDB(ctx),
+		cmdHandler:    newCommandHandler(ctx),
+		userService:   user.NewService(ctx),
+		appService:    app.NewService(ctx),
+		fileService:   file.NewService(ctx),
+		groupService:  group.NewService(ctx),
+		apiKeyService: NewUserAPIKeyService(ctx),
+		userDB:        user.NewDB(ctx),
+		threadService: thread.NewService(ctx),
+		msgSem:        make(chan struct{}, 100),
+		searchHandler: messages_search.Shared(ctx),
+		Log:           log.NewTLog("BotFather"),
 	}
 
 	// 注册消息监听器

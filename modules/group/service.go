@@ -2085,9 +2085,10 @@ func (s *Service) notifyBotJoinedGroup(memberUsers []*user.Model, addedUIDSet ma
 			continue
 		}
 		robotID := memberUser.UID
-		seq, err := s.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+		// #697: monotonic per-bot allocator instead of GenSeq.
+		seq, err := botevent.NextEventID(s.ctx, robotID)
 		if err != nil {
-			s.Error("generate bot event seq failed", zap.Error(err), zap.String("robotID", robotID))
+			s.Error("allocate bot event id failed", zap.Error(err), zap.String("robotID", robotID))
 			continue
 		}
 		eventData := map[string]interface{}{
@@ -2099,7 +2100,7 @@ func (s *Service) notifyBotJoinedGroup(memberUsers []*user.Model, addedUIDSet ma
 				"operator_name": operatorName,
 			},
 		}
-		key := fmt.Sprintf("robotEvent:%s", robotID)
+		key := botevent.QueueKey(robotID)
 		err = s.ctx.GetRedisConn().ZAdd(key, float64(seq), util.ToJson(eventData))
 		if err != nil {
 			s.Error("push bot_joined_group event failed", zap.Error(err), zap.String("robotID", robotID))

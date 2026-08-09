@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -371,7 +372,7 @@ func (m *Manager) cleanupBotConnection(robotID string) error {
 	m.ctx.GetRedisConn().Del(heartbeatKey)
 
 	// 4. 清除事件队列 Redis key
-	eventKey := fmt.Sprintf("robotEvent:%s", robotID)
+	eventKey := botevent.QueueKey(robotID)
 	m.ctx.GetRedisConn().Del(eventKey)
 
 	return nil

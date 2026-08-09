@@ -246,11 +246,13 @@ func (rb *Robot) PrepareBotTypedEvent(robotID, eventType string, eventData map[s
 //
 // It is NOT the only writer, and this comment used to claim otherwise.
 // `saveRobotMessage` (modules/robot/event.go) carries its own inline
-// GenSeq / ZAdd / Expire copy for the listener fast-path, and both
-// `notifyBotJoinedGroup` variants in modules/group write the queue directly
-// as well — five ZADD sites in total. PR#685's review caught the doorbell
-// being wired to only two of them because the brief trusted this docstring
-// instead of the call graph.
+// allocator / ZAdd / Expire copy for the listener fast-path, `addInlineQuery`
+// below writes the merged inline-query stream, and both `notifyBotJoinedGroup`
+// variants in modules/group write the queue directly as well. PR#685's review
+// caught the doorbell being wired to only two of them because the brief trusted
+// this docstring instead of the call graph, and #697's review then found the
+// count itself was wrong. Both guards in pkg/botevent are the record now;
+// this paragraph is orientation, not inventory.
 //
 // If you add a queue writer, it must also ring the doorbell
 // (pkg/botevent.Ring) after a successful ZADD, or /v1/bot/events long-poll
@@ -274,7 +276,11 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 		cp.Payload = normalized
 		message = &cp
 	}
-	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: event ids come from the monotonic per-bot allocator, not GenSeq. A
+	// failure here fails the enqueue exactly as a GenSeq error did — there is
+	// deliberately no fallback, because two live id sources on one queue is the
+	// defect being removed. See pkg/botevent/seq.go.
+	seq, err := botevent.NextEventID(ctx, robotID)
 	if err != nil {
 		return err
 	}
@@ -283,7 +289,7 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 		Message: message,
 		Expire:  time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
 	})
-	key := fmt.Sprintf("robotEvent:%s", robotID)
+	key := botevent.QueueKey(robotID)
 	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
 		return err
 	}
@@ -334,7 +340,8 @@ func prepareBotTypedEvent(ctx *config.Context, robotID, eventType string, eventD
 	if strings.TrimSpace(eventType) == "" {
 		return PreparedBotTypedEvent{}, errors.New("robot: empty eventType, cannot prepare typed bot event")
 	}
-	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	// #697: see enqueueBotEventGeneric — monotonic allocator, no GenSeq fallback.
+	seq, err := botevent.NextEventID(ctx, robotID)
 	if err != nil {
 		return PreparedBotTypedEvent{}, err
 	}
@@ -346,7 +353,7 @@ func prepareBotTypedEvent(ctx *config.Context, robotID, eventType string, eventD
 	})
 	return PreparedBotTypedEvent{
 		EventID:  seq,
-		QueueKey: fmt.Sprintf("robotEvent:%s", robotID),
+		QueueKey: botevent.QueueKey(robotID),
 		Member:   messageUpdateJson,
 	}, nil
 }
@@ -355,7 +362,6 @@ type Robot struct {
 	ctx *config.Context
 	log.Log
 	db                                robotDB
-	robotEventPrefix                  string
 	userService                       user.IService
 	appService                        app.IService
 	groupService                      group.IService
@@ -388,7 +394,6 @@ func New(ctx *config.Context) *Robot {
 		ctx:                           ctx,
 		Log:                           log.NewTLog("Robot"),
 		db:                            *newBotDB(ctx),
-		robotEventPrefix:              "robotEvent:",
 		userService:                   user.NewService(ctx),
 		appService:                    app.NewService(ctx),
 		groupService:                  group.NewService(ctx),
@@ -1176,10 +1181,25 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 
 }
 
+// #697 (reviewer P1): inline-query event ids MUST come from the same monotonic
+// source as the queue's, because both streams are merged into one response.
+//
+// getEventsResult below reads inlineQueryEventsMap, appends it to the events read
+// from robotEvent:{robotID}, sorts the union by EventID, and filters it by the
+// caller's cursor. So the two id spaces are not independent — they share a cursor.
+//
+// An earlier revision of this change gave inline queries their own GenSeq key on
+// the belief that nothing consumed them. That was wrong, and the consequence was
+// worse than the bug being fixed: a fresh GenSeq key starts near 1000001 while the
+// new counter starts low, so one inline event would push the client's cursor into
+// the millions and permanently filter out every ordinary event behind it.
+//
+// Sharing NextEventID keeps them on one source in both modes — one GenSeq
+// sequence before activation, one counter after.
 func (rb *Robot) addInlineQuery(robotID string, inlineQuery *InlineQuery) {
-	seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	seq, err := botevent.NextEventID(rb.ctx, robotID)
 	if err != nil {
-		rb.Error("GenSeq failed", zap.Error(err))
+		rb.Error("allocate inline query event id failed", zap.Error(err), zap.String("robotID", robotID))
 		return
 	}
 	rb.inlineQueryEventsMapLock.Lock()
@@ -1241,7 +1261,7 @@ func (rb *Robot) getEventsResult(robotID string, eventID int64, limit int64) ([]
 		limit = 100
 	}
 
-	robotEventJsons, err := rb.ctx.GetRedisConn().ZRangeByScore(fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID), redis.ZRangeBy{
+	robotEventJsons, err := rb.ctx.GetRedisConn().ZRangeByScore(botevent.QueueKey(robotID), redis.ZRangeBy{
 		Max:   "+inf",
 		Min:   fmt.Sprintf("%d", eventID),
 		Count: limit,
@@ -1292,7 +1312,7 @@ func (rb *Robot) getEventsResult(robotID string, eventID int64, limit int64) ([]
 
 // 移除指定事件
 func (rb *Robot) removeEvent(robotID string, eventID int64) error {
-	err := rb.ctx.GetRedisConn().ZRemRangeByScore(fmt.Sprintf("%s%s", rb.robotEventPrefix, robotID), fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
+	err := rb.ctx.GetRedisConn().ZRemRangeByScore(botevent.QueueKey(robotID), fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	return err
 }
 
