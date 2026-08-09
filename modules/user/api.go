@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	rd "github.com/go-redis/redis"
@@ -218,10 +219,16 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	// 多开标签页会翻倍），而企业 NAT 下整层楼共用一个出口 IP —— 卡太死的后果是一片人
 	// 登不上，比放过一点扫描流量严重得多。运维撞到 NAT 墙时可不重新发版直接上调。
 	scanLoginUUIDLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_uuid",
-		wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_RPS", defaultScanLoginUUIDRateLimitRPS),
+		ratelimit.SanitizeRPS(
+			wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_RPS", defaultScanLoginUUIDRateLimitRPS),
+			defaultScanLoginUUIDRateLimitRPS,
+		),
 		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_BURST", defaultScanLoginUUIDRateLimitBurst))
 	scanLoginStatusLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_status",
-		wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_RPS", defaultScanLoginStatusRateLimitRPS),
+		ratelimit.SanitizeRPS(
+			wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_RPS", defaultScanLoginStatusRateLimitRPS),
+			defaultScanLoginStatusRateLimitRPS,
+		),
 		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_BURST", defaultScanLoginStatusRateLimitBurst))
 
 	auth := r.Group("/v1", u.ctx.AuthMiddleware(r))
