@@ -126,7 +126,9 @@ func TestUserGet_NoRelation_MinimalKeepsFollow(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
 	assert.Contains(t, body, "StrangerU", "最小集仍需返回 name")
-	assert.Contains(t, body, "\"follow\"", "资料页需要 follow 渲染加好友入口, body=%s", body)
+	assert.Contains(t, body, "\"follow\":0",
+		"资料页需要 follow 渲染加好友入口，且走到最小集必然是 0（不能从展示字段复制）, body=%s", body)
+	assert.NotContains(t, body, "\"follow\":1", "最小集不得声称已关注")
 	// 身份细节必须剥离
 	for _, leaked := range []string{"SNSTRU", "short_no", "device_flag", "last_offline", "source_desc", "sex", "vercode"} {
 		assert.NotContains(t, body, leaked, "无关系不得下发 %s", leaked)
@@ -228,7 +230,8 @@ func TestUserGet_NotExist_NotFound(t *testing.T) {
 // 顶层字段。断言 key 集合而非逐字段取值——后者在给 DTO 新增第五个字段时仍会通过。
 func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 	full := &UserDetailResp{
-		UID: "u1", Name: "N", Follow: 0, Robot: 0,
+		// Follow 刻意给 1：最小集必须按授权决策输出 0，而不是复制这个展示字段。
+		UID: "u1", Name: "N", Follow: 1, Robot: 0,
 		ShortNo: "SN", Sex: 1, Online: 1, LastOffline: 123, Vercode: "vc",
 		SourceDesc: "src", RealName: "张三", RealnameVerified: true, Phone: "13000000000",
 	}
@@ -245,6 +248,7 @@ func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 	sort.Strings(keys)
 	assert.Equal(t, []string{"follow", "name", "robot", "uid"}, keys,
 		"最小集只能有这四个顶层字段, got=%s", string(b))
+	assert.Contains(t, string(b), "\"follow\":0", "入参 Follow=1 时输出仍须为 0, got=%s", string(b))
 	for _, leaked := range []string{"SN", "short_no", "sex", "online", "last_offline", "vercode", "source_desc", "real_name", "张三", "13000000000"} {
 		assert.NotContains(t, string(b), leaked)
 	}
@@ -261,11 +265,12 @@ func TestUserGet_GroupNoEnrichment_CallerNotMember_Suppressed(t *testing.T) {
 	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
 		UID: "ut_target", Name: "TargetU", ShortNo: "SNTGT",
 	}))
+	// 必须建 space 父行：授权判定 JOIN space 校验活性，只插 space_member 会让目标
+	// 判为不可见 → 请求直接走最小集、到不了群维度富化块，本用例的负向断言就恒成立
+	// （空断言）。这里踩过一次，见 PR #722 review。
+	seedSpace(t, ctx, "sp_x", 1)
 	for _, uid := range []string{testutil.UID, "ut_target"} {
-		_, err := ctx.DB().InsertBySql(
-			"INSERT INTO space_member (space_id, uid, role, status, version) VALUES ('sp_x',?,0,1,1)", uid,
-		).Exec()
-		assert.NoError(t, err)
+		seedSpaceMemberRow(t, ctx, "sp_x", uid)
 	}
 	_, err := ctx.DB().InsertBySql(
 		"INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('ug_outsider','outsider-grp','ut_target',1,1)",
@@ -311,7 +316,13 @@ func TestUserGet_GroupNoEnrichment_CallerIsMember_Works(t *testing.T) {
 }
 
 // 被该群拉黑（status=Blacklist，is_deleted 仍为 0）后，该群不再构成"有共同群"关系
-// → 降级为最小集。与子区门禁 ExistMemberActive 口径一致。
+// → 降级为最小集。
+//
+// 注意本用例的**有效范围**：newUserAuthzServer 为消除全局状态污染注册了自写的 checker
+// 替身（modules/user 不能 import modules/group），所以这里验证的是「checker 判否时
+// handler 正确降级」这条接线，**不是** ExistCommonGroup 谓词本身。谓词语义（黑名单 /
+// 已解散 / 禁用群仍算 / 已退群）由 modules/group/db_common_group_test.go 直接钉在生产
+// 实现上，并逐条做过变异验证——曾经在这里误以为覆盖了谓词，见 PR #722 review。
 func TestUserGet_CommonGroupButBlacklisted_Minimal(t *testing.T) {
 	s, ctx := newUserAuthzServer(t)
 	defer testutil.CleanAllTables(ctx)
@@ -356,6 +367,9 @@ func TestUserGet_BannedCommonSpace_Minimal(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
 	assert.Contains(t, body, "BannedSpacePeer", "名字仍可渲染")
+	assert.Contains(t, body, "\"follow\":0", "授权判定认定无关系，最小集必须回 follow:0, body=%s", body)
+	assert.NotContains(t, body, "\"follow\":1",
+		"不得复制展示字段：封禁 Space 会让 full.Follow 仍为 1，照抄即泄露该共属事实")
 	assert.NotContains(t, body, "short_no", "封禁 Space 不应再构成可达关系, body=%s", body)
 	assert.NotContains(t, body, "SNBANNED")
 }
@@ -375,4 +389,6 @@ func TestUserGet_DisbandedCommonSpace_Minimal(t *testing.T) {
 	w := getUser(s, "ut_dis")
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 	assert.NotContains(t, w.Body.String(), "short_no", "已解散 Space 不应构成可达关系")
+	assert.Contains(t, w.Body.String(), "\"follow\":0", "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "\"follow\":1")
 }

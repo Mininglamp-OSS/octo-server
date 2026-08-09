@@ -32,9 +32,15 @@ type minimalUserDetailResp struct {
 // 白名单而非黑名单——将来给 UserDetailResp 新增字段时默认不泄露。
 func newMinimalUserDetailResp(full *UserDetailResp) minimalUserDetailResp {
 	return minimalUserDetailResp{
-		UID:    full.UID,
-		Name:   full.Name,
-		Follow: full.Follow,
+		UID:  full.UID,
+		Name: full.Name,
+		// Follow 恒为 0，**不能**从 full.Follow 复制。走到最小集意味着授权判定已认定
+		// 无可达关系（非好友、无**活跃**共同 Space、无共同有效群）；而 full.Follow 是
+		// 展示字段，它的同 Space 来源（GetCommonSpaceID）不校验 Space 活性，封禁 / 解散
+		// Space 会让它仍为 1。照抄会让响应自相矛盾——一边剥掉身份字段说"无关系"，一边
+		// 告诉客户端"已关注"，并且恰好泄露了本要隐去的那条"你们同属某个（已封禁）
+		// Space"的事实。这正是本次要消除的展示/授权混淆。
+		Follow: 0,
 		Robot:  full.Robot,
 	}
 }
