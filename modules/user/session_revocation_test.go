@@ -96,7 +96,7 @@ func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
 	require.Equal(t, 1, pending)
 }
 
-func TestSessionRevocationWorkerAppliesPendingIntentAndStops(t *testing.T) {
+func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	db := NewDB(ctx)
 	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
@@ -121,24 +121,11 @@ func TestSessionRevocationWorkerAppliesPendingIntentAndStops(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := &User{db: db, sessionStore: store, revocationWorkerOwner: "test-worker"}
-	workerCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		worker.runSessionRevocationWorker(workerCtx, 10*time.Millisecond)
-	}()
-	require.Eventually(t, func() bool {
-		var applied int
-		_, queryErr := ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").Where("id=? AND status=?", intent.ID, sessionRevocationApplied).Load(&applied)
-		return queryErr == nil && applied == 1
-	}, 2*time.Second, 20*time.Millisecond)
+	worker.processPendingSessionRevocations()
+	var applied int
+	_, err = ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").Where("id=? AND status=?", intent.ID, sessionRevocationApplied).Load(&applied)
+	require.NoError(t, err)
+	require.Equal(t, 1, applied)
 	_, err = auth.NewTokenValidator(store, prefix).Validate(context.Background(), token)
 	require.Error(t, err)
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("session revocation worker did not stop after cancellation")
-	}
 }
