@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,4 +225,92 @@ func TestScanLoginAuthorization_RequiresConfirmationAndRedeemsOnce(t *testing.T)
 	setPublicIPForUserTest(req, "9.9.8.42")
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Contains(t, w.Body.String(), "err.server.user.auth_code_not_found")
+}
+
+func TestScanLoginAuthorization_MultipleReplicasRedeemOnce(t *testing.T) {
+	s1, ctx := testutil.NewTestServer()
+	s2, _ := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s1)
+	wireI18nRendererForUserTest(s2)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	db := NewDB(ctx)
+	model, err := db.QueryByUID(testutil.UID)
+	require.NoError(t, err)
+	if model == nil {
+		require.NoError(t, db.Insert(&Model{
+			UID:      testutil.UID,
+			Name:     "multi replica scan login user",
+			Username: "multi_replica_scan_login_user",
+			ShortNo:  "scan002",
+			Status:   1,
+		}))
+	}
+
+	authCode := util.GenerUUID()
+	uuid := util.GenerUUID()
+	require.NoError(t, SavePendingScanLoginAuthorization(ctx.GetRedisConn(), authCode, testutil.UID, uuid))
+	pollSecret, err := mintScanLoginPollSecret(ctx.GetRedisConn(), uuid)
+	require.NoError(t, err)
+
+	routes := []http.Handler{s1.GetRoute(), s2.GetRoute()}
+	callBoth := func(method string, path string, token bool) []*httptest.ResponseRecorder {
+		t.Helper()
+		responses := make([]*httptest.ResponseRecorder, len(routes))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(len(routes))
+		for i, route := range routes {
+			go func(i int, route http.Handler) {
+				defer wg.Done()
+				<-start
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(method, path, nil)
+				setPublicIPForUserTest(req, "9.9.9."+strconv.Itoa(i+1))
+				if token {
+					req.Header.Set("token", testutil.Token)
+				}
+				route.ServeHTTP(w, req)
+				responses[i] = w
+			}(i, route)
+		}
+		close(start)
+		wg.Wait()
+		return responses
+	}
+
+	confirmResponses := callBoth(http.MethodGet, "/v1/user/grant_login?auth_code="+authCode, true)
+	confirmSuccesses := 0
+	for _, response := range confirmResponses {
+		if response.Code == http.StatusOK {
+			confirmSuccesses++
+			continue
+		}
+		assert.Contains(t, response.Body.String(), "err.server.user.auth_code_not_found")
+	}
+	require.Equal(t, 1, confirmSuccesses, "only one replica may promote the pending authorization")
+	statusStarted := time.Now()
+	statusResponses := callBoth(http.MethodGet,
+		"/v1/user/loginstatus?uuid="+uuid+"&poll_secret="+pollSecret, false)
+	assert.Less(t, time.Since(statusStarted), time.Second,
+		"a replica that reads an already confirmed shared state must not enter the long poll")
+	for _, response := range statusResponses {
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), authCode,
+			"every replica must read the confirmed state from shared Redis")
+	}
+
+	redeemResponses := callBoth(http.MethodPost,
+		"/v1/user/login_authcode/"+authCode+"?poll_secret="+pollSecret, false)
+	redeemSuccesses := 0
+	for _, response := range redeemResponses {
+		if response.Code == http.StatusOK {
+			redeemSuccesses++
+			assert.Contains(t, response.Body.String(), `"token"`)
+			continue
+		}
+		assert.Contains(t, response.Body.String(), "err.server.user.auth_code_not_found")
+	}
+	require.Equal(t, 1, redeemSuccesses, "only one replica may consume and issue a session")
 }
