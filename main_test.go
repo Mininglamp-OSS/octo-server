@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,6 +74,31 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestValidateTokenExpireConfigDoesNotChangeOtherEmptyEnvSemantics(t *testing.T) {
+	const yamlConfig = `
+db:
+  mysqlAddr: produser:prodpass@tcp(prod-mysql:3306)/prod
+  redisTLS: true
+`
+
+	vp := viper.New()
+	vp.SetConfigType("yaml")
+	require.NoError(t, vp.ReadConfig(bytes.NewBufferString(yamlConfig)))
+	vp.SetEnvPrefix("TS")
+	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	vp.AutomaticEnv()
+	t.Setenv("TS_DB_MYSQLADDR", "")
+	t.Setenv("TS_DB_REDISTLS", "")
+
+	_, err := validateTokenExpireConfig(vp)
+	require.NoError(t, err)
+
+	cfg := config.New()
+	cfg.ConfigureWithViper(vp)
+	require.Equal(t, "produser:prodpass@tcp(prod-mysql:3306)/prod", cfg.DB.MySQLAddr)
+	require.True(t, cfg.DB.RedisTLS)
 }
 
 func TestRunAPIRegistersSessionRedisPool(t *testing.T) {
