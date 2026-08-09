@@ -8,11 +8,13 @@ import (
 
 // TestPlausibleRobotID pins the syntactic gate in front of the payload.robot_id lookup.
 //
-// #697 review, sixth round: the lookup fails open on a query error so a DB blip cannot drop
-// a bot event, which leaves the fail-open path able to adopt an arbitrary client-supplied
-// string. The monotonic allocator turns every distinct value into a permanent
-// `botEventSeq:counter:{id}` key (no TTL, `noeviction`) plus a `seq` row that is never
-// reclaimed, so the bound is what keeps that state finite.
+// #697 review, sixth round added this syntactic bound before the lookup. The latest re-review
+// corrected what the bound proves: it limits one Redis key's size and rejects spellings no
+// real bot can use, but it does not limit how many distinct well-shaped values a client can
+// send. Positive existence verification closes that cardinality dimension separately in
+// TestVerifiedPayloadRobotIDRequiresPositiveVerification. The monotonic allocator turns
+// every adopted value into a permanent `botEventSeq:counter:{id}` key (no TTL, `noeviction`)
+// plus a `seq` row that is never reclaimed.
 func TestPlausibleRobotID(t *testing.T) {
 	cases := []struct {
 		name      string
