@@ -159,7 +159,7 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 				// botCatalogPrincipalFor and botSendCatalogPrincipal both return
 				// before calling this when dynamicCatalogEnabled() is false, so
 				// no ungated deployment acquires a query here.
-				authorized, err := querier.isBotSpaceAuthorized(robotID, s)
+				canonical, authorized, err := querier.isBotSpaceAuthorized(robotID, s)
 				if err != nil {
 					ba.Warn("bot_grant_space_appbot_unverifiable",
 						zap.String("robotID", robotID), zap.String("space", s), zap.Error(err))
@@ -170,13 +170,15 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 						zap.String("robotID", robotID), zap.String("space", s))
 					return "", botSpaceUnavailable
 				}
-				return s, botSpaceScoped
+				// The canonical spelling, never the context value — see the
+				// canonicalisation note above the header branch below.
+				return canonical, botSpaceScoped
 			}
 		}
 	}
 	if c.Request != nil {
 		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {
-			authorized, err := querier.isBotSpaceAuthorized(robotID, hint)
+			canonical, authorized, err := querier.isBotSpaceAuthorized(robotID, hint)
 			if err != nil {
 				ba.Warn("bot_grant_space_hint_unverifiable",
 					zap.String("robotID", robotID), zap.String("hint", hint), zap.Error(err))
@@ -188,7 +190,16 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 					zap.String("robotID", robotID), zap.String("hint", hint))
 				return "", botSpaceUnavailable
 			}
-			return hint, botSpaceScoped
+			// The canonical space.space_id, never `hint`. This value becomes a
+			// byte-for-byte lookup key against card_template_grant's
+			// utf8mb4_bin scope column, while the authorization above joined
+			// case-insensitively. Returning the caller's spelling authorizes
+			// under one comparison and looks up under another, and where they
+			// disagree an exact-scope revoke tombstone is simply not found —
+			// the still-active global grant answers instead. That is a revoke
+			// bypass costing one character of case (review P0-1, yujiawei), and
+			// it is the third defect this collation split has produced.
+			return canonical, botSpaceScoped
 		}
 	}
 	primary, all, err := querier.querySpaceIDsByRobotID(robotID)

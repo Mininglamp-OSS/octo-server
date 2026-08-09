@@ -741,6 +741,32 @@ func scanPrincipalGrants(
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("card template catalog: iterate principal grants: %w", err)
 	}
+	// The budget was hit whenever a peek row came back, whether or not it landed
+	// inside a template. Both shapes are reported, because both mean the same
+	// thing to an operator — templates past this point were never read — and the
+	// earlier version logged only the mid-template cut, which is the *rarer* of
+	// the two (review P2-1, yujiawei; the commit that added the log claimed all
+	// three caps were covered and this one was half covered).
+	//
+	// Worth knowing when reading the log: the budget bites before the
+	// activation/blocked filter in loadAdvertisableAuthorizations, so a granted
+	// template with no activation still consumes its slot and can crowd out an
+	// advertisable one. No headroom constant is invented here to paper over
+	// that — the fix is to filter before the budget, which is a query change and
+	// needs the EXPLAIN measurement D0d already gates on. Until then this line
+	// is how the situation is visible at all.
+	if scanned > rowLimit {
+		dropped := ""
+		if truncated && len(order) > 0 {
+			dropped = string(order[len(order)-1])
+		}
+		log.Warn("principal grant read hit the row budget",
+			zap.Bool("principal_grant_rows_truncated", true),
+			zap.String("principal_type", string(principalType)),
+			zap.String("principal_id", principalID),
+			zap.String("partial_template_dropped", dropped),
+			zap.Int("row_budget", rowLimit))
+	}
 	if truncated && len(order) > 0 {
 		// The cut landed inside this template, so its row set is partial. Drop
 		// it: half a pair is worse than none, because losing an exact tombstone
@@ -748,15 +774,6 @@ func scanPrincipalGrants(
 		// granted. Every earlier template is complete, since the ordering keeps
 		// a template's rows contiguous.
 		incomplete := order[len(order)-1]
-		// Safe but not silent, for the same reason StaticDiscoverGrants logs its
-		// own truncation: an operator whose grant lands in the table and takes
-		// effect nowhere otherwise has nothing anywhere telling them why.
-		log.Warn("principal grant read truncated at the row budget",
-			zap.Bool("principal_grant_rows_truncated", true),
-			zap.String("principal_type", string(principalType)),
-			zap.String("principal_id", principalID),
-			zap.String("dropped_template", string(incomplete)),
-			zap.Int("row_budget", rowLimit))
 		delete(exact, incomplete)
 		delete(global, incomplete)
 	}

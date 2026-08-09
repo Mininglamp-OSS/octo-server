@@ -111,9 +111,9 @@ Two decisions review asked to see recorded rather than inferred.
 ungated half merged separately as #709 (`cardtmpl-provenance-markers`) because
 the two halves need different merge arguments. The provenance markers take
 effect wherever `OCTO_CARD_MESSAGE_ENABLED` is already on, so they needed
-line-by-line review of a ~4k-line diff; everything remaining here is inert
-behind `OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED` / `_NEW_SEND_ENABLED` and
-merges on that argument. D1's actual concern — no "grant written but the
+line-by-line review of a ~4k-line diff; the *message path* remaining here is
+inert behind `OCTO_CARD_RUNTIME_CATALOG_CONTROL_ENABLED` / `_NEW_SEND_ENABLED`
+and merges on that argument. It is not wholly inert — see D0g. D1's actual concern — no "grant written but the
 consuming boundary is unwired" half-state — is preserved, because the split ran
 the other way: the ungated consumer landed first and this PR adds the grants.
 
@@ -129,6 +129,43 @@ have cost an extra activation step plus a migration path for in-flight `0.3.0`
 cards, for no behavioural difference. Recorded here as an accepted deviation,
 not an oversight — a *non*-additive change to a shipped version still requires a
 new version.
+
+### D0g — What is *not* gated, recorded rather than asserted away
+
+Review S8, carried four rounds (yujiawei). The merge argument said "everything
+remaining here is inert behind the two gates" and the PR body said "nothing that
+takes effect on merge". Both overstated it, and S8 is the one item of the review
+set that was never written down here — it kept being answered by editing the PR
+description, which is not the contract of record.
+
+What goes live the moment this merges, with both gates false:
+
+- **B1 and B2 are mounted by neither gate** (`modules/card_template_catalog/api.go`).
+  `listTemplates` checks no feature flag, and `runtime_install.go` deliberately
+  exempts `CatalogPurposeDiscover` from the new-send gate, so discovery is
+  reachable by design rather than by omission. Both routes query
+  `card_template_grant` on every request. There is no kill switch short of a
+  redeploy.
+- `GET /v1/manager/card-templates/:id` gains `grants` / `grants_unavailable`.
+- B1's `action_contract` omits the key for dynamic rows instead of sending
+  `null` (D0c/S5). No dynamic artifact is published in production, so no
+  response changes today, but the wire shape did.
+- Two refuse-more behaviours on the message path: an internal-producer send
+  whose worst-case first-edit envelope exceeds the persistence column is
+  refused at send, and the docs mutate endpoint refuses an untrimmed
+  `space_id`.
+
+Why this is accepted rather than gated. Discovery is authenticated,
+Space-scoped and operator/producer-facing; the visibility predicate settles
+inside SQL before `LIMIT`; every static template is private, so a deployment
+that has published no dynamic artifact lists nothing. Gating it would also gate
+the surface an operator needs *while* deciding whether to enable the gates.
+What was wrong was the claim, not the behaviour.
+
+The gap this leaves is a real one and is named rather than closed: with no
+feature flag, the only way to take discovery offline is to redeploy. If that is
+not acceptable operationally, add the flag — it is a small change, and this
+entry is the record that it was considered.
 
 ### D0b — A Bot `send` grant does not reach template IDs beyond the static policy in this milestone
 

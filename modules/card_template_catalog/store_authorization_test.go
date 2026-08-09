@@ -10,6 +10,7 @@ package card_template_catalog
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"strings"
@@ -493,4 +494,93 @@ func TestStoreLoadAuthorizationsSkipsTheGrantQueryForUngrantablePrincipals(t *te
 		t.Fatalf("a system principal was issued a grant: %+v", got["test.a"])
 	}
 	assertMockExpectations(t, mock)
+}
+
+// The row budget had no test at all (review P2-1, yujiawei) — the existing
+// batch cases supply 3 rows against a 129-row budget, so every truncation
+// branch was dead code from the suite's point of view.
+//
+// Two cut shapes, and the earlier logging covered only the rarer one. A cut
+// landing inside a template drops that template, because half a pair is worse
+// than none: losing an exact tombstone whose global row is still active would
+// report a revoked principal as granted. A cut landing cleanly on a boundary
+// drops nothing, and used to say nothing either.
+func TestScanPrincipalGrantsDropsOnlyThePartiallyReadTemplate(t *testing.T) {
+	grantRow := func(id, scope, status string, send bool, revision int) []driver.Value {
+		return []driver.Value{id, scope, status, true, send, false, revision}
+	}
+	columns := []string{
+		"template_id", "scope_space_id", "status",
+		"can_discover", "can_send", "can_edit", "revision",
+	}
+
+	for _, test := range []struct {
+		name string
+		// rows are what the LIMIT rowLimit+1 query returns, peek row included.
+		rows        [][]driver.Value
+		rowLimit    int
+		wantPresent []cardtmpl.ID
+		wantAbsent  []cardtmpl.ID
+	}{
+		{
+			name: "a cut inside a template drops it",
+			rows: [][]driver.Value{
+				grantRow("test.a", "", string(GrantStatusActive), true, 1),
+				grantRow("test.b", "", string(GrantStatusActive), true, 1),
+				// peek: test.b's second scope, so test.b was read in half.
+				grantRow("test.b", "space-1", string(GrantStatusRevoked), false, 2),
+			},
+			rowLimit:    2,
+			wantPresent: []cardtmpl.ID{"test.a"},
+			wantAbsent:  []cardtmpl.ID{"test.b"},
+		},
+		{
+			name: "a cut on a boundary keeps everything read",
+			rows: [][]driver.Value{
+				grantRow("test.a", "", string(GrantStatusActive), true, 1),
+				grantRow("test.b", "", string(GrantStatusActive), true, 1),
+				// peek: a different template entirely, so test.b is complete.
+				grantRow("test.c", "", string(GrantStatusActive), true, 1),
+			},
+			rowLimit:    2,
+			wantPresent: []cardtmpl.ID{"test.a", "test.b"},
+			wantAbsent:  []cardtmpl.ID{"test.c"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, mock, closeDB := newMockStore(t)
+			defer closeDB()
+
+			rows := sqlmock.NewRows(columns)
+			for _, row := range test.rows {
+				rows = rows.AddRow(row...)
+			}
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta(authBatchGrantPrefix[:40])).WillReturnRows(rows)
+			mock.ExpectCommit()
+
+			tx, err := store.db.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			decisions, err := scanPrincipalGrants(context.Background(), tx,
+				GrantPrincipalBot, "bot-1", "space-1", test.rowLimit)
+			if err != nil {
+				t.Fatalf("scanPrincipalGrants: %v", err)
+			}
+			_ = tx.Commit()
+
+			for _, id := range test.wantPresent {
+				if _, ok := decisions[id]; !ok {
+					t.Fatalf("%s was fully read and must survive the cut: %+v", id, decisions)
+				}
+			}
+			for _, id := range test.wantAbsent {
+				if _, ok := decisions[id]; ok {
+					t.Fatalf("%s was past the budget or only half read and must not appear: %+v",
+						id, decisions)
+				}
+			}
+		})
+	}
 }

@@ -71,7 +71,9 @@ import (
 type botSpaceQuerier interface {
 	querySpaceIDByRobotID(robotID string) (string, error)
 	querySpaceIDsByRobotID(robotID string) (string, []string, error)
-	isBotSpaceAuthorized(robotID, spaceID string) (bool, error)
+	// Returns the canonical space.space_id alongside the verdict; callers must
+	// propagate that rather than the spelling they asked about (P0-1).
+	isBotSpaceAuthorized(robotID, spaceID string) (canonical string, authorized bool, err error)
 	queryGroupSpaceID(groupNo string) (spaceID string, spaceActive bool, err error)
 	isUserSpaceMember(uid, spaceID string) (bool, error)
 }
@@ -165,12 +167,17 @@ func (ba *BotAPI) resolveBotActiveSpaceID(c *wkhttp.Context, robotID string) str
 	// rejected as non-member and emitted noisy reject warns.
 	if c != nil && c.Request != nil {
 		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {
-			isAuthorized, err := q.isBotSpaceAuthorized(robotID, hint)
+			canonical, isAuthorized, err := q.isBotSpaceAuthorized(robotID, hint)
 			if err != nil {
 				ba.Warn("isBotSpaceAuthorized 失败，回退到 deterministic DB 查询",
 					zap.String("robotID", robotID), zap.String("hint", hint), zap.Error(err))
 			} else if isAuthorized {
-				return hint
+				// The canonical spelling, not the header's. This resolver only
+				// stamps a dispatch tag rather than reading grants, so a
+				// case-differing value here is not the P0-1 bypass — but the
+				// tag ends up on messages and in Space filters, and there is no
+				// reason for two spellings of one Space to circulate.
+				return canonical
 			} else {
 				// Header sent but Bot isn't authorized for that Space: log so
 				// operators can detect bots that need to be added (or attackers

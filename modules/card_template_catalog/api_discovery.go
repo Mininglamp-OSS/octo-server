@@ -88,6 +88,19 @@ func decodeDiscoveryCursor(encoded, spaceID string) (discoveryCursor, bool) {
 	if cursor.Source != discoverySourceStatic && cursor.Source != discoverySourceDynamic {
 		return discoveryCursor{}, false
 	}
+	// ID and Exact are the other two fields that reach SQL — the row-value
+	// comparison `(c.template_id, c.version) > (?, ?)` — and the cursor is
+	// base64 JSON, so a caller can put any bytes in them. Same `ascii_bin`
+	// hazard as parseDiscoveryRef; an empty pair is the legitimate "start of
+	// this source" position and stays allowed.
+	if cursor.ID != "" {
+		if _, ok := parseManagerTemplateID(cursor.ID); !ok {
+			return discoveryCursor{}, false
+		}
+	}
+	if cursor.Exact != "" && !validManagerVersion(cursor.Exact) {
+		return discoveryCursor{}, false
+	}
 	return cursor, true
 }
 
@@ -184,6 +197,27 @@ func (a *API) listTemplates(c *wkhttp.Context) {
 		}
 		// The static source is exhausted; continue into dynamic from the top.
 		cursor = discoveryCursor{Version: discoveryCursorVersion, Space: spaceID, Source: discoverySourceDynamic}
+	}
+
+	// The dynamic source is gated on runtime readiness and the integrity flag,
+	// exactly as B2's dynamic branch is (review P1-2, yujiawei).
+	//
+	// B2 reaches RuntimeCatalog.resolve, which calls rejectIntegrity/requireReady
+	// before any store read; B1 went straight to the store's SQL. So after a
+	// startup reconciliation marked a static/dynamic key collision — the state
+	// whose whole point is that the dynamic surface is permanently fail-closed —
+	// B1 kept listing every dynamic row with full metadata while B2 answered
+	// unavailable for each of them. Two halves of one contract disagreeing about
+	// whether the catalog is usable.
+	//
+	// The gate is here rather than at the top of the handler because the static
+	// half genuinely does not depend on the runtime: B2's static path is not
+	// gated either, and refusing static discovery because the *dynamic* overlay
+	// is unready would be a fail-closed answer to a question that was never
+	// asked. The cost is that a caller mid-iteration gets an error on the page
+	// where the sources change over, which is the honest report.
+	if ready, _ := a.requireRuntimeReady(c); !ready {
+		return
 	}
 
 	remaining := limit - len(page.Templates)
@@ -513,7 +547,23 @@ func parseDiscoveryRef(ref string) (cardtmpl.ID, string, bool) {
 	if id == "" || version == "" {
 		return "", "", false
 	}
-	return cardtmpl.ID(id), version, true
+	// Bounded and charset-checked with the manager plane's validators rather
+	// than a second pair (review P1-1, yujiawei). `template_id` and `version`
+	// are `ascii_bin` columns, and MySQL does not treat a non-ASCII parameter
+	// against one as a miss — it is error 1267 / 3988, which
+	// scanRuntimeArtifactMeta does not special-case and getTemplate maps to the
+	// catalog-unavailable code. So an unvalidated ref let any authenticated
+	// caller drive this deployment's outage code and its error counters at
+	// will, on the surface whose alerting exists to catch a real outage; and an
+	// unbounded id additionally reached a per-request linear scan over a freshly
+	// allocated, re-sorted static catalog. Rejecting here answers not-found
+	// instead, which is also what the "unknown, invisible and blocked are
+	// indistinguishable" promise requires.
+	parsedID, ok := parseManagerTemplateID(id)
+	if !ok || !validManagerVersion(version) {
+		return "", "", false
+	}
+	return parsedID, version, true
 }
 
 func discoveryPageLimit(raw string) (int, bool) {

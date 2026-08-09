@@ -252,9 +252,12 @@ Landed (`feat: resolve card catalog authorization in one snapshot`):
 - `[modify] modules/bot_api/card_profile.go` — manifest resolved per
   authenticated bot + Space; a runtime read failure returns a typed error
   instead of advertising a possibly-shadowed static version.
-- `[modify] modules/bot_api/bot_api.go` — `/card/profile` moved to its own
-  group `authBot → botActorUID → SharedUIDRateLimiter`; the other legacy Bot
-  routes are deliberately left unlimited.
+- `modules/bot_api/bot_api.go` — **not modified for the profile route.** An
+  earlier draft moved `/card/profile` to its own `authBot → botActorUID →
+  SharedUIDRateLimiter` group; that was rejected in review as an
+  authorization-confusion risk, and the endpoint stays in the Bot group whose
+  limiter keys on the robot id. See D0c/S9 — D6's limiter row is the text that
+  was superseded, not the code.
 - `[modify] modules/bot_api/send.go` — new send resolves the grant principal
   from the target and fails closed on `errBotTemplateRuntimeUnavailable`.
 - `[modify] modules/bot_api/{db.go,space_inject.go}` — `queryGroupSpaceID`
@@ -369,8 +372,9 @@ Eight confirmed correctness findings fixed; one finding (MetaDefault losing
    when the grant summary read fails, and `ListGrants` orders active rows
    before tombstones.
 7. `respondCatalogGrantInvalid` logs the rejection reason it previously dropped.
-8. `setupBotCardProfile` resets the `ratelimit:uid:*` bucket now that the route
-   mounts `SharedUIDRateLimiter`.
+8. `setupBotCardProfile` does **not** reset the `ratelimit:uid:*` bucket. It did
+   in an earlier draft, justified by a route shape that does not exist; the
+   flush was inert and was removed with the claim (D0c/S9).
 
 Still open, tracked for Slice 6: the docs.access-request 0.2.0 result-edit
 guard (`docsResultTemplateVersion` plus the hardcoded V3 in

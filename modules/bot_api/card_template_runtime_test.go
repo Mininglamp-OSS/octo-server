@@ -1548,3 +1548,76 @@ func TestGrantSpaceRefusesAnAppBotWhoseSpaceIsDisabled(t *testing.T) {
 		})
 	}
 }
+
+// TestGrantSpaceIsTheCanonicalSpellingNotTheCallers is review P0-1 (yujiawei),
+// and it is the third defect this one collation split has produced.
+//
+// `card_template_grant.scope_space_id` is `utf8mb4_bin` and the resolver matches
+// it byte-for-byte; `space` / `space_member` / `app_bot` declare no collation and
+// inherit a case-insensitive default. So a `X-Space-ID: SPACE-A` header against a
+// stored `space-a` is *authorized* under one comparison and *looked up* under
+// another — and where they disagree, the exact-scope revoke tombstone is not
+// found and the still-active global grant answers in its place. A revoke bypassed
+// by one character of case.
+//
+// The assertion is on the returned spelling rather than on a grant decision,
+// because that is where the fix lives and where a regression would reappear: the
+// store's byte-exact matching is correct and stays untouched. The end-to-end
+// consequence — tombstone masked, global grant honoured — is measured against
+// real MySQL in the catalog package.
+func TestGrantSpaceIsTheCanonicalSpellingNotTheCallers(t *testing.T) {
+	const canonical = "space-a"
+
+	for _, test := range []struct {
+		name    string
+		querier *fakeSpaceQuerier
+		set     func(c *wkhttp.Context)
+	}{
+		{
+			name: "X-Space-ID header",
+			querier: &fakeSpaceQuerier{
+				memberships: map[string]map[string]bool{"bot-42": {canonical: true}},
+			},
+			set: func(*wkhttp.Context) {},
+		},
+		{
+			name: "App Bot scope=space context value",
+			querier: &fakeSpaceQuerier{
+				appBots: map[string]appBotShape{
+					"bot-42": {scopeSpaceID: canonical, published: true},
+				},
+			},
+			set: func(c *wkhttp.Context) {
+				c.Set(CtxKeyAppBotScope, "space")
+				c.Set(CtxKeyAppBotSpaceID, "SPACE-A")
+			},
+		},
+		{
+			name: "unambiguous membership",
+			querier: &fakeSpaceQuerier{
+				multiRows: map[string][]string{"bot-42": {canonical}},
+			},
+			set: func(*wkhttp.Context) {},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ba := newTestBotAPI(test.querier)
+			c := newGrantSpaceContext(t, "")
+			if test.name == "X-Space-ID header" {
+				c = newGrantSpaceContext(t, "SPACE-A")
+			}
+			test.set(c)
+
+			space, state := ba.resolveBotGrantSpaceID(c, "bot-42")
+			if state != botSpaceScoped {
+				t.Fatalf("state = %v, want botSpaceScoped (the fixture is authorized)", state)
+			}
+			if space != canonical {
+				t.Fatalf("grant Space = %q, want the canonical %q. This value is a "+
+					"byte-for-byte key against card_template_grant.scope_space_id, so a "+
+					"non-canonical spelling silently misses the exact-scope tombstone and "+
+					"the global grant answers instead — a revoke bypass.", space, canonical)
+			}
+		})
+	}
+}
