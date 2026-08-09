@@ -176,19 +176,22 @@ oversight. Recorded here because a scope decision that lives only in a Go
 comment is indistinguishable from a bug.
 
 **S1 — `GET /v1/manager/card-templates` carries no `source` / `visibility` /
-grant summary**, though line 349 and line 426 of this brief ask for them. The
+grant summary**, though the D9 Control-APIs table row for it and the D9 deliverables list both
+ask for them ("全部 template 的 source/visibility/active/block 摘要与 bounded
+grant summary，含普通 B1 隐藏项"). The
 narrowing is right and the brief is what should change: `source` and
 `visibility` are properties of an artifact *version*, and the manager index is
 keyed by template *ID*. One ID can hold both static and dynamic versions —
 that is the entire shadowing model — so there is no single `source` to report at
 that granularity. The per-version answers, and the bounded grant summary, are
 already on the detail endpoint (`GET .../card-templates/:id`), which is where an
-operator drills in. Lines 349 and 426 are superseded by this entry.
+operator drills in. Those two passages are superseded by this entry.
 
-**S2 — B1 list items carry no `views`**, though line 234 asks for them. A view
+**S2 — B1 list items carry no `views`**, though D5's B1 field list asks for them
+("source/owner/protocol/contract/version/**views**"). A view
 array per row makes a list page grow with templates × views, on an endpoint
 whose job is to let a producer decide *whether* to fetch the contract. B2
-carries them. Line 234 is superseded.
+carries them. That clause of D5 is superseded.
 
 **S3 — no composition-root static `CatalogMeta` injection.**
 `Registry.SetCatalogVisibility` exists and is tested; nothing in `main.go` calls
@@ -203,9 +206,10 @@ projection while `RegisterJSON` passes the bundle's. A Go-coded template has no
 JSON template engine, so empty is the accurate answer for it, not a missing
 value.
 
-**S4 — B1/B2 have no super-admin bypass**, though line 243 allows one. Not
+**S4 — B1/B2 have no super-admin bypass**, though D5's route-chain bullet allows one
+("private 必须命中经过 middleware 验证的当前 Space grant 或 superAdmin"). Not
 built: it is a convenience for operators who already have the manager endpoints,
-and every path that lacks it fails closed. Line 243 is superseded.
+and every path that lacks it fails closed. That clause of D5 is superseded.
 
 **S9 — D6 describes `/v1/bot/card/profile` as `authBot → botActorUID →
 SharedUIDRateLimiter`; the route uses the Bot group's own limiter.** The code is
