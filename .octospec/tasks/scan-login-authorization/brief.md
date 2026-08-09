@@ -92,8 +92,8 @@ session's existing `poll_secret` and must be atomic and one-shot.
 ## Client and rollout contract
 
 - Production currently disables local login and registration and uses OIDC as
-  the unified authentication flow. Set `login.scan_enabled=false` explicitly
-  after deploying the server so Web does not expose scan login and mobile exits
+  the unified authentication flow. Pre-create `login.scan_enabled=false` before
+  starting the new binaries so Web does not expose scan login and mobile exits
   the flow on `err.server.user.scan_login_disabled` or polling state `disabled`.
 - `POST /v1/user/login_authcode/{code}` now requires the `poll_secret` returned
   by `GET /v1/user/loginuuid`. The `scanned` polling state no longer includes a
@@ -108,9 +108,8 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - `poll_secret` remains a query parameter for current CORS compatibility. It is
   scrubbed by application access/recovery logs; ingress, CDN, and APM URL logs
   must also redact it.
-- For the OIDC-only production deployment, pre-create
-  `login.scan_enabled=false` in `system_setting` before starting the new
-  binaries. Old binaries ignore this key, so use a blue/green cutover or
+- Old binaries ignore the pre-created `login.scan_enabled` key, so use a
+  blue/green cutover or
   temporarily block the anonymous scan-login entry points until old replicas
   have drained; do not expose a mixed-version scan-login window.
 - Runtime setting changes are immediate only on the replica handling the admin
