@@ -116,6 +116,12 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化用户名登录会话栅栏失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
 	// 已注销账号拒绝登录；冷静期账号允许登录（响应中附带注销状态提示）
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
@@ -524,7 +530,7 @@ func (u *User) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = u.db.UpdateUsersWithField("password", newHash, userInfo.UID)
+	err = updateUserFieldAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, userInfo.UID, "password", newHash, "password_change")
 	if err != nil {
 		u.Error("修改登录密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)

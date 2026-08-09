@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -195,7 +196,18 @@ func (u *User) finalizeDestroy(m *Model) error {
 	stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	phone := fmt.Sprintf("%s@%s@delete", m.Phone, stamp)
 	username := anonymizeUsername(m.UID, m.Zone, phone, stamp)
-	switch err := u.db.finalizeDestroyAccount(m.UID, username, phone); err {
+	var destroyErr error
+	if sessionRevocationActive(u.sessionStore) {
+		intent, err := u.db.destroyAccountWithSessionRevocation(context.Background(), m.UID, username, phone, IsDestroyApplying)
+		if err == nil {
+			destroyErr = u.applySessionRevocationIntent(context.Background(), intent)
+		} else {
+			destroyErr = err
+		}
+	} else {
+		destroyErr = u.db.finalizeDestroyAccount(m.UID, username, phone)
+	}
+	switch destroyErr {
 	case nil:
 		// 写入成功
 	case ErrDestroyStateConflict:
@@ -203,7 +215,7 @@ func (u *User) finalizeDestroy(m *Model) error {
 		u.Info("用户已撤销注销，跳过 finalize", zap.String("uid", m.UID))
 		return nil
 	default:
-		return fmt.Errorf("update user destroy: %w", err)
+		return fmt.Errorf("update user destroy: %w", destroyErr)
 	}
 	if err := u.ctx.QuitUserDevice(m.UID, -1); err != nil {
 		// 设备踢出失败不阻塞 DB 状态更新——一旦写入 is_destroy=2，下次扫描不会再处理本账号。

@@ -59,11 +59,11 @@ func run() error {
 	}
 	interval := time.Duration(float64(time.Second) / *qps)
 	stats, err := store.ObserveRateLimited(ctx, *batchSize, interval)
-	if err != nil {
-		return fmt.Errorf("observe token sessions: %w", err)
-	}
 	if err := json.NewEncoder(os.Stdout).Encode(stats); err != nil {
 		return fmt.Errorf("encode aggregate observation: %w", err)
+	}
+	if err != nil {
+		return fmt.Errorf("observe token sessions: %w", err)
 	}
 	return nil
 }

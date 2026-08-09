@@ -137,7 +137,7 @@ func TestLoginCheckPhoneUsesAPPTokenReplacementBeforeIMUpdate(t *testing.T) {
 				return true
 			}
 			switch selector.Sel.Name {
-			case "replaceAPPToken":
+			case "replaceAPPToken", "replaceAPPTokenSession":
 				replacePos = call.Pos()
 			case "UpdateIMToken":
 				imPos = call.Pos()

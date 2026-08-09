@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	mysql "github.com/go-sql-driver/mysql"
@@ -159,12 +160,7 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
-	o.tokenKill = cacheCurrentTokenInvalidator{
-		cache:          ctx.Cache(),
-		tokenPrefix:    ctx.GetConfig().Cache.TokenCachePrefix,
-		uidTokenPrefix: ctx.GetConfig().Cache.UIDTokenCachePrefix,
-		indexDel:       newRedisCompareDeleter(ctx),
-	}
+	o.tokenKill = auth.SessionStoreForContext(ctx)
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
 		callbackGuardThresholdFromEnv(),

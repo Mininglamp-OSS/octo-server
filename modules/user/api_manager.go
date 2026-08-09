@@ -270,6 +270,12 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
+	if err != nil {
+		m.Error("初始化管理端登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
@@ -286,19 +292,14 @@ func (m *Manager) login(c *wkhttp.Context) {
 		return
 	}
 	token := util.GenerUUID()
-	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userInfo.UID,
-		Name:     userInfo.Name,
-		Role:     userInfo.Role,
-		Language: userInfo.Language,
-	})
-	if err != nil {
-		m.Error("编码token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(config.Web),
 	}
-	err = m.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userInfo.UID, int(config.Web))
+	err = issueUserSession(c.Request.Context(), m.sessionStore, token, sessionInfo, issueFence)
 	if err != nil {
 		m.Error("设置管理端token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
@@ -360,7 +361,7 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = m.userDB.UpdateUsersWithField("password", newHash, req.Uid)
+	err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, req.Uid, "password", newHash, "password_reset")
 	if err != nil {
 		m.Error("重置用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
@@ -399,7 +400,16 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin)
 		return
 	}
-	err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
+	if sessionRevocationActive(m.sessionStore) {
+		intent, mutateErr := m.userDB.deleteAdminWithSessionRevocation(c.Request.Context(), uid, string(wkhttp.Admin))
+		if mutateErr == nil {
+			err = applyAndMarkSessionRevocation(c.Request.Context(), m.userDB, m.sessionStore, intent)
+		} else {
+			err = mutateErr
+		}
+	} else {
+		err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
+	}
 	if err != nil {
 		m.Error("删除管理员错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
@@ -413,10 +423,12 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 	m.roleService.Invalidate(user.UID)
 	// 撤销该管理员在所有设备端（APP/Web/PC）的登录态，而不只是 Web。尽力删除每个端
 	// （不在首个错误就中断），最大化吊销面；任一失败仍向调用方报错以便排查。
-	if err := m.revokeAllDeviceTokens(user.UID); err != nil {
-		m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
+	if !sessionRevocationActive(m.sessionStore) {
+		if err := m.revokeAllDeviceTokens(user.UID); err != nil {
+			m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
+			respondUserError(c, errcode.ErrUserTokenCacheFailed)
+			return
+		}
 	}
 	c.ResponseOK()
 }
@@ -1069,7 +1081,11 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		c.ResponseOK()
 		return
 	}
-	err = m.userDB.UpdateUsersWithField("status", status, uid)
+	if userStatus == int(common.UserDisable) {
+		err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
+	} else {
+		err = m.userDB.UpdateUsersWithField("status", status, uid)
+	}
 	if err != nil {
 		m.Error("修改用户状态错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
@@ -1150,25 +1166,28 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = m.userDB.UpdateUsersWithField("password", newHashedPassword, loginUID)
+	err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, loginUID, "password", newHashedPassword, "password_change")
 	if err != nil {
 		m.Error("修改用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
 	}
-	// 清除token缓存
-	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
-	if err != nil {
-		m.Error("获取旧token错误", zap.Error(err))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
-	}
-	if oldToken != "" {
-		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
+	if !sessionRevocationActive(m.sessionStore) {
+		// expand/v3-write compatibility path; revoke mode already rotated the
+		// generation and persisted a legacy deny marker above.
+		oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
 		if err != nil {
-			m.Error("清除旧token数据错误", zap.Error(err))
+			m.Error("获取旧token错误", zap.Error(err))
 			respondUserError(c, errcode.ErrUserTokenCacheFailed)
 			return
+		}
+		if oldToken != "" {
+			err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
+			if err != nil {
+				m.Error("清除旧token数据错误", zap.Error(err))
+				respondUserError(c, errcode.ErrUserTokenCacheFailed)
+				return
+			}
 		}
 	}
 	c.ResponseOK()

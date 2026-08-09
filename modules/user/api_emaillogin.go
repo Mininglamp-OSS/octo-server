@@ -288,6 +288,12 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化邮箱登录会话栅栏失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		// 密码路径同样泄露账号状态，统一为通用错误 + 计入失败计数
 		if req.Password != "" {
@@ -385,7 +391,7 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	if err := u.db.updatePassword(newHash, userInfo.UID); err != nil {
+	if err := updateUserFieldAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, userInfo.UID, "password", newHash, "password_reset"); err != nil {
 		u.Error("更新密码失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return

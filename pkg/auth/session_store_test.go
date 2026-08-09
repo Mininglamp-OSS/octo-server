@@ -65,6 +65,7 @@ func TestRedisSessionStoreRejectsV3PayloadDowngrade(t *testing.T) {
 		IssuedAt:          now.Add(-time.Minute).Unix(),
 		ExpiresAt:         now.Add(time.Minute).Unix(),
 		SessionGeneration: "generation-v3",
+		SessionRevision:   1,
 	})
 	require.NoError(t, err)
 	v2, err := Encode(TokenInfo{UID: "u-v3", Name: "renamed"})
@@ -267,6 +268,7 @@ func TestRedisSessionStoreObserveAggregatesOnly(t *testing.T) {
 		IssuedAt:          now.Add(-time.Minute).Unix(),
 		ExpiresAt:         now.Add(time.Minute).Unix(),
 		SessionGeneration: "g3",
+		SessionRevision:   1,
 	})
 	require.NoError(t, err)
 	require.NoError(t, client.Set(keys[0], "u1@legacy", 0).Err())

@@ -137,6 +137,12 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 
 	var loginResp *loginUserDetailResp
 	if userInfoM != nil { // 存在就登录
+		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfoM.UID)
+		if err != nil {
+			u.Error("初始化 Gitee 登录会话栅栏失败", zap.Error(err))
+			respondUserServiceError(c)
+			return
+		}
 		if userInfoM.IsDestroy == IsDestroyDone {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return
