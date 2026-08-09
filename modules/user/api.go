@@ -2585,10 +2585,12 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginConfirmWindow)
 	if err != nil {
 		u.Error("更新二维码信息失败！", zap.Error(err))
-		if revoked, revokeErr := u.scanLoginAuthorizations.Consume(authCode, authInfo); revokeErr != nil {
-			u.Warn("回滚扫码授权码失败！", zap.Error(revokeErr))
-		} else if !revoked {
-			u.Warn("扫码授权码在状态写入失败后已不再可回滚", zap.String("uuid", uuid))
+		if restored, rollbackErr := u.scanLoginAuthorizations.RollbackPromotion(
+			authCode, authInfo, ScanLoginConfirmWindow,
+		); rollbackErr != nil {
+			u.Warn("恢复扫码待确认授权失败！", zap.String("uuid", uuid), zap.Error(rollbackErr))
+		} else if !restored {
+			u.Warn("扫码授权码在状态写入失败后已无法恢复", zap.String("uuid", uuid))
 		}
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return

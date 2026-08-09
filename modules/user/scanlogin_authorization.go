@@ -101,6 +101,10 @@ return 1
 // Promote atomically moves the exact pending payload into the redeemable
 // namespace. Comparing the value prevents a stale reader from promoting a
 // record that changed between GET and the script.
+//
+// The script spans pending and ready keys without Redis hash tags. This service
+// currently uses a single-node *redis.Client; migrating this path to Redis
+// Cluster requires colocating both keys in one hash slot before rollout.
 func (s *scanLoginAuthorizationStore) Promote(authCode, expected string, ttl time.Duration) (bool, error) {
 	if s == nil || s.client == nil || authCode == "" || expected == "" || ttl <= 0 {
 		return false, errScanLoginAuthorizationInvalid
@@ -116,6 +120,41 @@ func (s *scanLoginAuthorizationStore) Promote(authCode, expected string, ttl tim
 	).Int64()
 	if err != nil {
 		return false, fmt.Errorf("promote scan login authorization: %w", err)
+	}
+	return result == 1, nil
+}
+
+var rollbackScanLoginAuthorizationScript = rd.NewScript(`
+local ready = redis.call("GET", KEYS[1])
+if not ready or ready ~= ARGV[1] then
+  return 0
+end
+if redis.call("EXISTS", KEYS[2]) == 1 then
+  return 0
+end
+redis.call("SET", KEYS[2], ready, "PX", ARGV[2])
+redis.call("DEL", KEYS[1])
+return 1
+`)
+
+// RollbackPromotion atomically restores a ready authorization to pending when
+// publishing the authed QR state fails. It never overwrites an existing pending
+// record, so a stale rollback cannot replace a newer confirmation attempt.
+func (s *scanLoginAuthorizationStore) RollbackPromotion(authCode, expected string, ttl time.Duration) (bool, error) {
+	if s == nil || s.client == nil || authCode == "" || expected == "" || ttl <= 0 {
+		return false, errScanLoginAuthorizationInvalid
+	}
+	result, err := rollbackScanLoginAuthorizationScript.Run(
+		s.client,
+		[]string{
+			scanLoginReadyAuthorizationKey(authCode),
+			scanLoginPendingAuthorizationKey(authCode),
+		},
+		expected,
+		strconv.FormatInt(ttl.Milliseconds(), 10),
+	).Int64()
+	if err != nil {
+		return false, fmt.Errorf("rollback scan login authorization: %w", err)
 	}
 	return result == 1, nil
 }
