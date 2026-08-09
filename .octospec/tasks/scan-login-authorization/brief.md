@@ -77,6 +77,10 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - Missing or wrong `poll_secret` does not consume a ready authorization.
 - Correct `poll_secret` permits exactly one atomic consume; concurrent or replayed
   redemption cannot issue a second login.
+- Two independently constructed server instances sharing the same Redis permit
+  exactly one pending promotion and one session issuance. Every replica can read
+  the confirmed state, and an already `authed` state returns immediately instead
+  of retaining a 10-second long-poll goroutine.
 - Non-finite `DM_API_SCANLOGIN_*_RATELIMIT_RPS` values such as `NaN` and `+Inf`
   are replaced with the corresponding finite default before limiter creation.
 - Disabling the switch blocks sessions created before the setting changed while
@@ -104,9 +108,23 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - `poll_secret` remains a query parameter for current CORS compatibility. It is
   scrubbed by application access/recovery logs; ingress, CDN, and APM URL logs
   must also redact it.
-- Deploy server code first, then apply the production setting above. Other
-  deployments keep the backward-compatible default `login.scan_enabled=true`
-  while clients adopt `scan_login_enabled`, `disabled`, and `poll_secret`.
+- For the OIDC-only production deployment, pre-create
+  `login.scan_enabled=false` in `system_setting` before starting the new
+  binaries. Old binaries ignore this key, so use a blue/green cutover or
+  temporarily block the anonymous scan-login entry points until old replicas
+  have drained; do not expose a mixed-version scan-login window.
+- Runtime setting changes are immediate only on the replica handling the admin
+  write. Peer replicas inherit the existing System Settings auto-reload budget
+  of up to 60 seconds. Incident response that requires an immediate global stop
+  must also block the scan-login routes at the ingress or restart all replicas.
+- QR status push channels remain process-local. A poll already waiting on a
+  different replica can wait until the existing 10-second timeout before its
+  next shared-Redis read; this affects latency only and does not bypass the
+  `poll_secret`, confirmation, or one-shot consume gates. Sticky routing can
+  reduce this bounded delay but is not required for correctness.
+- Other deployments keep the backward-compatible default
+  `login.scan_enabled=true` while clients adopt `scan_login_enabled`, `disabled`,
+  and `poll_secret`.
 - Roll back operationally by restoring `login.scan_enabled=true`; no schema
   migration is required. Code rollback is safe because the default remains the
   historical enabled behavior.
