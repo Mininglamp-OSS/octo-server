@@ -95,3 +95,50 @@ func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, pending)
 }
+
+func TestSessionRevocationWorkerAppliesPendingIntentAndStops(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	db := NewDB(ctx)
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
+	prefix := "user-revocation-worker-token:" + util.GenerUUID() + ":"
+	uidPrefix := "user-revocation-worker-uid:" + util.GenerUUID() + ":"
+	store := auth.NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, auth.WithSessionMode(auth.SessionModeRevoke), auth.WithSessionMaxPerUID(4))
+	uid := util.GenerUUID()
+	token := "token-" + util.GenerUUID()
+	require.NoError(t, db.Insert(&Model{UID: uid, Name: "worker-user", ShortNo: uid, Password: "before", Status: 1}))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+		_ = store.DeleteToken(context.Background(), token)
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNewSession(context.Background(), token, auth.TokenInfo{UID: uid, DeviceFlag: int(config.Web)}, fence))
+	intent, err := db.updateUserFieldWithSessionRevocation(context.Background(), uid, "password", "after", "password_reset")
+	require.NoError(t, err)
+
+	worker := &User{db: db, sessionStore: store, revocationWorkerOwner: "test-worker"}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.runSessionRevocationWorker(workerCtx, 10*time.Millisecond)
+	}()
+	require.Eventually(t, func() bool {
+		var applied int
+		_, queryErr := ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").Where("id=? AND status=?", intent.ID, sessionRevocationApplied).Load(&applied)
+		return queryErr == nil && applied == 1
+	}, 2*time.Second, 20*time.Millisecond)
+	_, err = auth.NewTokenValidator(store, prefix).Validate(context.Background(), token)
+	require.Error(t, err)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("session revocation worker did not stop after cancellation")
+	}
+}
