@@ -64,11 +64,16 @@ func init() {
 					}
 					userDetailResp, err := api.userService.GetUserDetail(channelID, loginUID)
 					if err != nil {
+						// 用户不存在（哨兵）→ 交还链路，让上层（channelGet）走统一的
+						// not_found 响应；真实查询故障才向上传播（不可降级为 not-found）。
+						if errors.Is(err, ErrorUserNotExist) {
+							return nil, register.ErrDatasourceNotProcess
+						}
 						return nil, err
 					}
 					if userDetailResp == nil {
 						api.Error("用户不存在！", zap.String("channel_id", channelID))
-						return nil, errors.New("用户不存在！")
+						return nil, register.ErrDatasourceNotProcess
 					}
 					return newChannelRespWithUserDetailResp(userDetailResp), nil
 				},

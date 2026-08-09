@@ -193,6 +193,45 @@ func (d *DB) ExistMemberActiveInternal(uid string, groupNo string) (bool, error)
 	return count > 0, err
 }
 
+// ExistCommonGroup 判定两个用户是否至少同属一个「未解散」的未退出群（两侧
+// is_deleted=0 且群 status<>GroupStatusDisband）。用于单聊频道详情的关系可见性判定：
+// 外部群里跨 Space 的非好友成员，既非好友也无共同 Space，仅靠共同群可达；不据此
+// 开放展示资料，群内成员名/头像会裂图。
+//
+// 必须关联 group 排除已解散群：解散（disband）只 UpdateStatusTx 改 group.status=2，
+// 成员清理是异步事件，成员行会在窗口期（或异步失败时）残留 is_deleted=0。若只查
+// group_member，两人仅共同属于已解散群也会被误判为「有共同群」，从而拿到完整个人
+// 资料——授权判定不能 fail-open 依赖异步清理。
+//
+// 用 status<>Disband 黑名单而非 status=Normal 白名单：GroupStatusDisabled(0) 是
+// 管理员可设的独立状态（api_manager.go 的 groupStatusUpdate 只翻 status、保留成员），
+// 全模块 liveness 检查一律只排除 Disband，禁用群仍是"活着的群"。若这里用白名单，
+// 两人唯一共同群被管理员禁用就会静默丢失互相可见性，正是 PERSON 分级要避免的裂图。
+//
+// 成员侧要求**双方** status=Normal：群黑名单（GroupMemberStatusBlacklist）只置
+// status、保留 is_deleted=0，若不排除，被某群拉黑的人仍能凭该群拿到对方完整资料。
+// 与子区门禁 ExistMemberActive 的口径一致（同一 PR 内两个新谓词不应互相矛盾）。
+// 降级后对方的名字/头像仍可渲染（最小集含 name/logo），不会裂图。
+//
+// SELECT 1 ... LIMIT 1 而非 COUNT(*)：这是存在性判断，且是本端点最热的读路径
+// （每次对无关系 peer 的 channelGet 都会走），让 MySQL 命中首行即停，不必枚举
+// 整个交集。
+func (d *DB) ExistCommonGroup(uidA string, uidB string) (bool, error) {
+	if uidA == "" || uidB == "" {
+		return false, nil
+	}
+	var exists int
+	_, err := d.session.SelectBySql(
+		"SELECT 1 FROM group_member m1 "+
+			"INNER JOIN group_member m2 ON m1.group_no = m2.group_no "+
+			"INNER JOIN `group` g ON g.group_no = m1.group_no "+
+			"WHERE m1.uid = ? AND m2.uid = ? AND m1.is_deleted = 0 AND m2.is_deleted = 0 "+
+			"AND m1.status = ? AND m2.status = ? AND g.status <> ? LIMIT 1",
+		uidA, uidB, common.GroupMemberStatusNormal, common.GroupMemberStatusNormal, GroupStatusDisband,
+	).Load(&exists)
+	return exists > 0, err
+}
+
 func (d *DB) existMembers(groupNos []string, uid string) ([]string, error) {
 	var results []string
 	_, err := d.session.Select("group_no").From("group_member").Where("group_no in ? and uid=? and is_deleted=0", groupNos, uid).Load(&results)

@@ -1,0 +1,12 @@
+injected:
+  - id: space-isolation
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: testing
+    source: repo
+brief: .octospec/tasks/channel-get-object-authz/brief.md

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -12,11 +13,15 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -43,9 +48,11 @@ func (ch *Channel) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1", ch.ctx.AuthMiddleware(r))
 	{
 		auth.GET("/channel/state", ch.state)
-		auth.GET("/channels/:channel_id/:channel_type", ch.channelGet)                          // 获取频道信息
-		auth.POST("/channels/:channel_id/:channel_type/message/clear", ch.clearChannelMessages) // 清空频道消息
-		auth.GET("/channels/:channel_id/:channel_type/storyline", ch.getStoryline)              // 获取群聊个人故事线
+		// channelGet 是跨用户读频道详情的入口，单独挂 SharedUIDRateLimiter（须在
+		// AuthMiddleware 之后才能读到 uid），封顶批量枚举频道/用户的速率。
+		auth.GET("/channels/:channel_id/:channel_type", appwkhttp.SharedUIDRateLimiter(r, ch.ctx), ch.channelGet) // 获取频道信息
+		auth.POST("/channels/:channel_id/:channel_type/message/clear", ch.clearChannelMessages)                   // 清空频道消息
+		auth.GET("/channels/:channel_id/:channel_type/storyline", ch.getStoryline)                                // 获取群聊个人故事线
 	}
 
 	// Routes that build PERSONAL MsgSendReq need SpaceMiddleware so the
@@ -169,6 +176,23 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 		}
 	}
 
+	// 对象级授权（GROUP 前置）：非成员——含群不存在（ExistMember 对不存在群同样返回
+	// false）——统一 forbidden。既堵越权（历史上任意登录用户替换 channel_id 即可读
+	// 群名/公告/成员数/space_id），也不泄露群是否存在，口径与 GET /v1/groups/:group_no
+	// （groupGet）一致。
+	if channelType == common.ChannelTypeGroup.Uint8() {
+		isMember, err := ch.groupService.ExistMember(channelID, loginUID)
+		if err != nil {
+			ch.Error("查询群成员关系失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, errcode.ErrGroupViewForbidden, nil, nil)
+			return
+		}
+	}
+
 	modules := register.GetModules(ch.ctx)
 	var err error
 	var channelResp *model.ChannelResp
@@ -187,10 +211,62 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 		}
 	}
 	if channelResp == nil {
-		ch.Error("频道不存在！", zap.String("channel_id", channelID), zap.Uint8("channelType", channelType))
-		c.ResponseError(errors.New("频道不存在！"))
+		// 目标不存在：按类型分流，避免存在性枚举 oracle。
+		//   - COMMUNITY_TOPIC：与"非父群成员"统一 forbidden，不泄露子区是否存在。
+		//   - PERSON：统一 not_found（"无关系但存在"的用户仍需返回名/头像供历史发送者
+		//     渲染，故无法与 not_found 合并，见 task brief）。
+		//   - 其它类型：保持原有"频道不存在"。
+		switch channelType {
+		case common.ChannelTypeCommunityTopic.Uint8():
+			httperr.ResponseErrorL(c, errcode.ErrGroupViewForbidden, nil, nil)
+		case common.ChannelTypePerson.Uint8():
+			httperr.ResponseErrorL(c, errcode.ErrUserNotFound, nil, nil)
+		default:
+			ch.Error("频道不存在！", zap.String("channel_id", channelID), zap.Uint8("channelType", channelType))
+			c.ResponseError(errors.New("频道不存在！"))
+		}
 		return
 	}
+
+	// 对象级授权（COMMUNITY_TOPIC 后置）：子区详情继承父群 ACL。父群号从展示数据
+	// 的 extra 取（channel 模块不直接依赖 thread 的 channel_id 解析），用活跃成员
+	// 校验（排除黑名单，语义同 ExistMemberActive 关于 CommunityTopic 的说明）。
+	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _ := channelResp.Extra["group_no"].(string)
+		if parentGroupNo == "" {
+			httperr.ResponseErrorL(c, errcode.ErrGroupViewForbidden, nil, nil)
+			return
+		}
+		isMember, err := ch.groupService.ExistMemberActive(parentGroupNo, loginUID)
+		if err != nil {
+			ch.Error("查询子区父群成员关系失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, errcode.ErrGroupViewForbidden, nil, nil)
+			return
+		}
+	}
+
+	// 对象级授权（PERSON 分级降级）：无可见关系时只返回渲染历史发送者所需的最小集，
+	// 不下发短号/在线状态/设备指纹/实名等身份细节。不做二元 403——渲染任意消息发送者
+	// 名/头像是本端点的既有职责（YUJ-411），硬拒会让外部群跨 Space 成员裂图。
+	// 只在这里**判定**，降级响应推迟到 channelSettingDB 富化之后再构造：
+	// msg_auto_delete / parent_channel 是那一步才附到 channelResp 上的，而它们属于
+	// 调用方自己的会话设置，必须进最小集（缺失会让 iOS 新消息不再自动删除）。
+	personMinimal := false
+	if channelType == common.ChannelTypePerson.Uint8() {
+		visible, err := ch.personProfileVisible(loginUID, channelID, channelResp)
+		if err != nil {
+			// 用 user 域错误码：这是单聊（人）资料读取失败，客户端不该看到群错误。
+			ch.Error("查询单聊资料可见关系失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrUserQueryFailed, nil, nil)
+			return
+		}
+		personMinimal = !visible
+	}
+
 	fakeChannelID := channelID
 	if channelType == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, channelID)
@@ -217,6 +293,14 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 		}
 	}
 
+	// 无可见关系：剥掉对方身份、保留调用方自身会话设置后返回（见
+	// chservice.NewMinimalChannelResp 的取舍规则）。放在设置富化之后、BotFather 文案
+	// 重渲染之前——后者只对 bot 生效，而 bot 恒可见，走不到这里。
+	if personMinimal {
+		c.JSON(http.StatusOK, chservice.NewMinimalChannelResp(channelResp))
+		return
+	}
+
 	// BotFather 的命令菜单是服务端自有文案：库里只存部署默认语言的兜底，这里按
 	// 请求协商语言重渲染（#335）。其余 bot 的 commands 是创建者内容，原样透传。
 	if channelType == common.ChannelTypePerson.Uint8() && channelID == cmdmenu.BotFatherUID && channelResp.Extra != nil {
@@ -227,6 +311,32 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 
 	c.JSON(http.StatusOK, channelResp)
 
+}
+
+// personProfileVisible 判定 loginUID 是否可见 peerID 的完整单聊资料。判定本身收口在
+// modules/channel/service（与 /v1/users/:uid 共用，避免两端口径漂移）；这里只负责把
+// 本模块能看到的目标属性翻译成该函数的输入。
+func (ch *Channel) personProfileVisible(loginUID string, peerID string, resp *model.ChannelResp) (bool, error) {
+	// 身份类放行（本人 / webhook / bot / 系统账号）不需要查关系，先判定；只有都不命中
+	// 才付出 HasAuthzRelation 的查询代价。
+	fastPath := chservice.PersonProfileInput{
+		LoginUID:          loginUID,
+		PeerUID:           peerID,
+		SyntheticIdentity: strings.HasPrefix(peerID, user.WebhookUIDPrefix),
+		SystemAccount:     resp.Category == user.CategorySystem || resp.Category == user.CategoryCustomerService,
+		Robot:             resp.Robot == 1,
+	}
+	if visible, err := chservice.PersonProfileVisible(fastPath, nil); err != nil || visible {
+		return visible, err
+	}
+	// 关系腿走授权口径：不能用 resp.Follow（展示字段，同 Space 来源不校验 Space 活性）。
+	related, err := ch.userService.HasAuthzRelation(loginUID, peerID)
+	if err != nil {
+		return false, err
+	}
+	in := fastPath
+	in.Followed = related
+	return chservice.PersonProfileVisible(in, ch.groupService.ExistCommonGroup)
 }
 
 func (ch *Channel) state(c *wkhttp.Context) {

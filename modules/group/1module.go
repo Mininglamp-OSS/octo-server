@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 )
 
 //go:embed sql
@@ -30,6 +30,13 @@ func init() {
 		// source_space_* / home_space_* 字段，让 Web/Android/iOS UserInfo 能区分
 		// "同 Space 非好友 → 直接发消息" vs "跨 Space 外部成员 → 仅可在群内交流"。
 		user.RegisterGroupMemberExternalProvider(api.groupService.GetMemberExternalFields)
+		// 注册共同群判定，供 user 模块的 /v1/users/:uid 做对象级资料可见性判定
+		// （与 /v1/channels/:id/:type 共用 channel/service 的判定函数）。
+		user.RegisterCommonGroupChecker(api.groupService.ExistCommonGroup)
+		// 活跃成员口径（排该群黑名单），供 /v1/users/:uid 的 ?group_no= 富化门禁使用；
+		// 与 RegisterGroupMemberChecker（ExistMember，服务置顶等既有路径）分开，避免
+		// 收紧一处波及另一处。
+		user.RegisterActiveGroupMemberChecker(api.groupService.ExistMemberActive)
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {
@@ -101,6 +108,12 @@ func init() {
 					groupResp, err := api.groupService.GetGroupDetail(channelID, loginUID)
 					if err != nil {
 						return nil, err
+					}
+					if groupResp == nil {
+						// 群不存在：交还链路，由上层优雅回落（频道不存在 / forbidden），
+						// 不把 nil 传给 newChannelRespWithGroupResp 解引用 panic（历史上
+						// 群不存在返回 500 空 body，构成存在性枚举 oracle）。
+						return nil, register.ErrDatasourceNotProcess
 					}
 					return newChannelRespWithGroupResp(groupResp), nil
 				},

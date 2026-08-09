@@ -21,6 +21,62 @@ const pinnedMaxPerSpace = 7
 // GroupMemberCheckFunc 检查用户是否为群成员的函数类型
 type GroupMemberCheckFunc func(groupNo string, uid string) (bool, error)
 
+// CommonGroupCheckFunc 检查两个用户是否至少同属一个未解散的群。
+// 由 group 模块的 register.AddModule factory 注册（modules/user 不能 import
+// modules/group——反向依赖，group/1module.go 引用 user），同 GroupMemberCheckFunc 的
+// 注入方向。factory 在首次 register.GetModules 时执行——不是包 init——但路由也由
+// GetModules 挂载，所以端点能对外服务时 hook 必然已就位；nil 路径本身也 fail closed。
+type CommonGroupCheckFunc func(uidA string, uidB string) (bool, error)
+
+// ActiveGroupMemberCheckFunc 检查用户是否为群的**活跃**成员（is_deleted=0 且
+// status=Normal，即排除被该群拉黑者）。
+//
+// 与 GroupMemberCheckFunc 分开注册、不复用：后者绑定的是 group.ExistMember（只看
+// is_deleted），且同时服务置顶频道访问校验等既有路径，收紧它会改变那些路径的语义。
+// 需要"活跃成员"口径的新门禁（如 /v1/users/:uid 的 ?group_no= 富化）用本函数，与
+// 子区门禁 ExistMemberActive、共同群判定 ExistCommonGroup 的口径保持一致。
+type ActiveGroupMemberCheckFunc func(groupNo string, uid string) (bool, error)
+
+var (
+	activeGroupMemberCheckerMu sync.RWMutex
+	activeGroupMemberChecker   ActiveGroupMemberCheckFunc
+)
+
+// RegisterActiveGroupMemberChecker 注册活跃群成员检查函数（供 group 模块调用）。
+func RegisterActiveGroupMemberChecker(fn ActiveGroupMemberCheckFunc) {
+	activeGroupMemberCheckerMu.Lock()
+	activeGroupMemberChecker = fn
+	activeGroupMemberCheckerMu.Unlock()
+}
+
+// getActiveGroupMemberChecker 返回已注册的活跃群成员检查函数；未注册返回 nil，
+// 调用方据此 fail closed（不做群维度富化）。
+func getActiveGroupMemberChecker() ActiveGroupMemberCheckFunc {
+	activeGroupMemberCheckerMu.RLock()
+	defer activeGroupMemberCheckerMu.RUnlock()
+	return activeGroupMemberChecker
+}
+
+var (
+	commonGroupCheckerMu sync.RWMutex
+	commonGroupChecker   CommonGroupCheckFunc
+)
+
+// RegisterCommonGroupChecker 注册共同群检查函数（供 group 模块调用）。
+func RegisterCommonGroupChecker(fn CommonGroupCheckFunc) {
+	commonGroupCheckerMu.Lock()
+	commonGroupChecker = fn
+	commonGroupCheckerMu.Unlock()
+}
+
+// getCommonGroupChecker 返回已注册的共同群检查函数；未注册返回 nil，调用方据此
+// fail closed（资料降级为最小集），不得因依赖缺失而放开完整资料。
+func getCommonGroupChecker() CommonGroupCheckFunc {
+	commonGroupCheckerMu.RLock()
+	defer commonGroupCheckerMu.RUnlock()
+	return commonGroupChecker
+}
+
 var (
 	groupMemberCheckerMu sync.RWMutex
 	groupMemberChecker   GroupMemberCheckFunc

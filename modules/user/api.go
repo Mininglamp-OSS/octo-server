@@ -19,6 +19,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
@@ -28,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
 	"github.com/opentracing/opentracing-go"
@@ -226,7 +228,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1", u.ctx.AuthMiddleware(r))
 	{
 
-		auth.GET("/users/:uid", u.get) // 根据uid查询用户信息
+		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才能读到 uid）：该端点是
+		// 对象级资料读取面，UID 虽是 32 位 hex 高熵，但认证用户批量探测不应只受全局
+		// per-IP 桶约束。与 channelGet 对齐（modules/channel/api.go）。
+		auth.GET("/users/:uid", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.get) // 根据uid查询用户信息
 		// 获取用户的会话信息
 		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
 
@@ -1236,12 +1241,51 @@ func (u *User) get(c *wkhttp.Context) {
 
 	userDetailResp, err := u.userService.GetUserDetail(uid, loginUID)
 	if err != nil {
+		// 目标不存在与查询故障必须分开：前者是稳定的 not_found（不能报"查询失败"误导
+		// 客户端重试），后者才是 5xx 语义的查询故障。
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
 		u.Error("获取用户详情失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userDetailResp == nil {
 		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+
+	// 对象级授权：无可见关系时降级为最小资料集，不再仅凭目标 UID 返回完整身份。
+	// 判定与 /v1/channels/:id/:type 共用 channel/service，两端口径不会漂移。
+	// 与 channelGet 最小集的差异：这里**保留** follow —— 资料页要靠它渲染加好友入口，
+	// 省略会让"陌生人可加好友"这个正常入口消失（channelGet 是发送者渲染，不需要）。
+	// 身份类放行（本人 / bot / 系统账号）先判定，不命中才付关系查询的代价。
+	// SyntheticIdentity 恒为 false：iwh_ 前缀在上方已提前 return，走不到这里。
+	fastPath := chservice.PersonProfileInput{
+		LoginUID:      loginUID,
+		PeerUID:       uid,
+		SystemAccount: userDetailResp.Category == CategorySystem || userDetailResp.Category == CategoryCustomerService,
+		Robot:         userDetailResp.Robot == 1,
+	}
+	visible, err := chservice.PersonProfileVisible(fastPath, nil)
+	if err == nil && !visible {
+		// 关系腿走授权口径：不能用 userDetailResp.Follow（展示字段，其同 Space 来源
+		// 不校验 Space 活性，封禁 Space 的成员行仍在）。
+		var related bool
+		if related, err = u.userService.HasAuthzRelation(loginUID, uid); err == nil {
+			in := fastPath
+			in.Followed = related
+			visible, err = chservice.PersonProfileVisible(in, chservice.CommonGroupChecker(getCommonGroupChecker()))
+		}
+	}
+	if err != nil {
+		u.Error("查询用户资料可见关系失败", zap.Error(err), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if !visible {
+		c.Response(newMinimalUserDetailResp(userDetailResp))
 		return
 	}
 	// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染（#335）；
@@ -1252,6 +1296,33 @@ func (u *User) get(c *wkhttp.Context) {
 	isShowShortNo := false
 	vercode := ""
 	var groupMember *model.GroupMemberResp
+	// group_no 是**调用方传入**的，其富化会下发该群维度的数据：IsShowShortNo 在群
+	// ForbiddenAddFriend==0 时返回目标的 vercode，GetGroupMember 返回目标的成员行
+	// （role / status / 邀请人 / 入群时间）以及外部成员来源 Space 字段。两个 datasource
+	// 都只校验**目标**在该群的可见性规则，完全不接收调用方 uid ——所以必须在这里先确认
+	// 调用方自己是该群成员，否则任何能看到目标的人都可以拿一个自己不在的群号，反查该群
+	// 维度的元数据。
+	//
+	// 非成员（含 checker 未注入 → fail closed）时**静默忽略** group_no，等价于没传：
+	// 比报错更保守，不会打断持有过期/无效 group_no 的客户端，同时该群维度的字段一律不
+	// 下发。
+	if groupNo != "" {
+		callerInGroup := false
+		// 用**活跃成员**口径（排该群黑名单），与子区门禁 ExistMemberActive、共同群判定
+		// 保持一致：被该群拉黑的人不应还能凭该群号反查群维度元数据。不复用
+		// getGroupMemberChecker（ExistMember，只看 is_deleted），那个钩子还服务着置顶
+		// 频道校验等既有路径。
+		if checker := getActiveGroupMemberChecker(); checker != nil {
+			ok, err := checker(groupNo, loginUID)
+			if err != nil {
+				u.Error("查询调用方群成员关系失败", zap.Error(err), zap.String("group_no", groupNo))
+			}
+			callerInGroup = ok
+		}
+		if !callerInGroup {
+			groupNo = ""
+		}
+	}
 	if groupNo != "" {
 		modules := register.GetModules(u.ctx)
 		for _, m := range modules {
