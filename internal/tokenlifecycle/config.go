@@ -2,6 +2,7 @@ package tokenlifecycle
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -15,9 +16,10 @@ const MaxTokenExpire = 720 * time.Hour
 // default. Only an actually absent key receives the 720h default.
 func ValidateTokenExpire(vp *viper.Viper) (time.Duration, error) {
 	const key = "cache.tokenExpire"
-	// An explicitly present but empty TS_CACHE_TOKENEXPIRE must not be treated
-	// as absent and silently fall back to 720h.
-	vp.AllowEmptyEnv(true)
+	const envKey = "TS_CACHE_TOKENEXPIRE"
+	if value, ok := os.LookupEnv(envKey); ok {
+		return parseTokenExpire(strings.TrimSpace(value), envKey)
+	}
 	if !vp.IsSet(key) {
 		return MaxTokenExpire, nil
 	}
@@ -26,16 +28,19 @@ func ValidateTokenExpire(vp *viper.Viper) (time.Duration, error) {
 	if !ok {
 		return 0, fmt.Errorf("%s must be a duration string with a Go unit, got %T", key, raw)
 	}
-	value = strings.TrimSpace(value)
+	return parseTokenExpire(strings.TrimSpace(value), key)
+}
+
+func parseTokenExpire(value, source string) (time.Duration, error) {
 	duration, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, value, err)
+		return 0, fmt.Errorf("invalid %s %q: %w", source, value, err)
 	}
 	if duration <= 0 {
-		return 0, fmt.Errorf("%s must be greater than zero", key)
+		return 0, fmt.Errorf("%s must be greater than zero", source)
 	}
 	if duration > MaxTokenExpire {
-		return 0, fmt.Errorf("%s must not exceed %s", key, MaxTokenExpire)
+		return 0, fmt.Errorf("%s must not exceed %s", source, MaxTokenExpire)
 	}
 	return duration, nil
 }
