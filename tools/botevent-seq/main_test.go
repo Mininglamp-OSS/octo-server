@@ -250,3 +250,50 @@ func TestScanQueueScoresCountsDuplicatesAcrossPageBoundaries(t *testing.T) {
 		t.Fatalf("stats=%+v, want members=%d duplicates=1 max=10001", stats, len(members))
 	}
 }
+
+// TestInspectQueueScoresKeepsAtomicMaxWhenRankPagesShift reproduces the cutover
+// evidence regression from review round 10. Pausing producers does not pause ACKs:
+// removing members from the low end between rank pages shifts every later rank left,
+// so the diagnostic walk can stop early after observing only scores 1..500 while the
+// queue still contains scores through 2000. The activation floor must use a separate,
+// single-command maximum and never the paged walk's incomplete view.
+func TestInspectQueueScoresKeepsAtomicMaxWhenRankPagesShift(t *testing.T) {
+	members := make([]rd.Z, 0, 2000)
+	for i := 1; i <= 2000; i++ {
+		members = append(members, rd.Z{Score: float64(i), Member: i})
+	}
+
+	pageCalls := 0
+	stats, err := inspectQueueScores(
+		func() ([]rd.Z, error) {
+			return []rd.Z{members[len(members)-1]}, nil
+		},
+		func(start, stop int64) ([]rd.Z, error) {
+			pageCalls++
+			if start >= int64(len(members)) {
+				return nil, nil
+			}
+			end := stop + 1
+			if end > int64(len(members)) {
+				end = int64(len(members))
+			}
+			page := append([]rd.Z(nil), members[start:end]...)
+			if pageCalls == 1 {
+				// Simulate ACKs removing scores 1..1600 after page 1. The next
+				// rank request starts at 500 against a 400-member set and therefore
+				// returns a short/empty page even though score 2000 still exists.
+				members = members[1600:]
+			}
+			return page, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("inspectQueueScores: %v", err)
+	}
+	if stats.maxScore != 2000 {
+		t.Fatalf("maxScore=%d, want atomic queue maximum 2000; rank paging understated the irreversible cutover evidence", stats.maxScore)
+	}
+	if stats.members != int(queueScanPageSize) {
+		t.Fatalf("diagnostic walk read %d members, want %d to prove the rank view shifted", stats.members, queueScanPageSize)
+	}
+}
