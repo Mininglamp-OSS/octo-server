@@ -642,3 +642,31 @@ exceeded`）—— 在 HEAD 上同样红，重启 IM 容器后即绿。
 非法 + authority 不可读 + 当前 bot 尚无 counter（新建或空闲 bot）**，不只限于「mirror 和
 counter 被同一次 Redis 恢复一起丢失」。因此激活验证完成后仍必须最后滚动设置
 `OCTO_BOTEVENT_EXPECTED_MODE=incr`；它是断言，不是激活开关。
+
+## 第八轮实现记录（head `c175ca6e` 重审之后，2026-08-09）
+
+最新重审确认上一轮两条 blocker 已修，但又找出四处会误导激活操作或评审边界的声明，以及
+一处激活 floor 风险。本轮继续先写失败测试，再做最小修复：
+
+1. **MySQL 已翻转、Redis mirror 写失败不能算成功。** 原工具只打印 warning 并退出 0，还说
+   下一次 allocation 会立即修复；实际已有 negative belief 的副本最长 5 秒仍可走 GenSeq。
+   `writeMirror` 现在返回 error，两条 activate 路径都 fatal 非零，并明确要求保持 bot-event
+   停写，直到 `botEventSeq:mode` 出现期望的 `incr:{epoch}`。测试
+   `TestMirrorWriteFailureStopsActivationAndExplainsPause` 覆盖退出契约依赖的错误内容。
+2. **`-yes` 不再隐藏前置条件。** 三项前置条件每次 activate 都输出；`-yes` 只表示 operator
+   已核实。清单补上 cutover floor 不能继承已回退的 legacy `min_seq` 并落到现存 consumer
+   cursor 下方；完整算术交由 #704。
+3. **unauthorized mirror 不会被删除，也不会自动自愈。** allocator 无法判断回退的是 mirror
+   还是 authority，因此保留冲突键；日志、metric 注释和 operator 文案全部改成要求人工诊断，
+   只有确认 mirror 非法后才可删除。allocator 仅在已验证激活且当前 bot 完成 re-seed 后重建
+   丢失的 mirror；不是 legacy 路径上的自愈。
+4. **证据空洞比上一轮写得更宽。** 精确条件是「任意 negative belief + 当前 bot 无 counter」：
+   包括 authority 可读但已回退为 legacy/missing，也包括 authority 不可读且 mirror 不声称激活。
+   `OCTO_BOTEVENT_EXPECTED_MODE=incr` 仍是激活验证后的最终 fail-closed assertion。
+5. **守卫边界保持 DEFERRED。** 已有 guard 证明每个 queue ZADD 会响 doorbell；它不证明 score
+   一定来自 allocator。score-source guard 仍由 #704 Gap 4 承接，PR 描述不得再把两者等同。
+
+**验证**：新增两条工具测试转绿；`pkg/botevent`、`tools/botevent-seq`、`pkg/redis`、
+`modules/robot`、`modules/bot_api`、`modules/group`、`modules/message` 均以
+`-race -shuffle=on` 通过（模块包按 CI 方式逐包重建 MySQL test 库并清 Redis）；另通过
+`go build ./...`、`go vet ./...`、i18n extract/lint 与 `git diff --check`。

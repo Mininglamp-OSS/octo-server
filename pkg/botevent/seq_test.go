@@ -740,8 +740,8 @@ func TestMirrorAloneCannotActivateTheCounter(t *testing.T) {
 					"it must come from GenSeq", id)
 			}
 			if MirrorUnauthorized() == before {
-				t.Error("an unconfirmed mirror must be counted; it self-heals to legacy, so " +
-					"without the metric a forged or stale mirror is completely invisible")
+				t.Error("an unconfirmed mirror must be counted; the allocator leaves the " +
+					"conflict intact for operator diagnosis, so without the metric it is invisible")
 			}
 		})
 	}
