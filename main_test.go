@@ -39,6 +39,8 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 		{name: "malformed", yaml: "cache:\n  tokenExpire: tomorrow\n", wantErr: true},
 		{name: "zero", yaml: "cache:\n  tokenExpire: 0s\n", wantErr: true},
 		{name: "negative", yaml: "cache:\n  tokenExpire: -1h\n", wantErr: true},
+		{name: "sub-millisecond", yaml: "cache:\n  tokenExpire: 1us\n", wantErr: true},
+		{name: "one millisecond", yaml: "cache:\n  tokenExpire: 1ms\n", want: time.Millisecond},
 		{name: "over hard limit", yaml: "cache:\n  tokenExpire: 721h\n", wantErr: true},
 	}
 
