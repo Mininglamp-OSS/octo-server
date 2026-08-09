@@ -71,13 +71,14 @@ package botevent
 // only have happened after the authority said `incr`. So a cold process that sees
 // `legacy` alongside a live counter refuses instead of degrading — see legacyDelegate.
 //
-// One residual is accepted rather than claimed away: if the counter key is gone **as
-// well** — a Redis flush or restore correlated with a regressed authority — a cold
-// process has no evidence at all and delegates to GenSeq. Only
-// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it only after
-// activation is verified, so the window is open by design during the flip itself. It is a
-// residual rather than a defect because both halves of the evidence have to be lost at
-// once, and the operator step that closes it exists and is documented.
+// One residual is accepted rather than claimed away: when the mirror is absent or invalid,
+// the authority is unreadable, and this bot has no counter yet (a new or idle bot), a cold
+// process has no evidence that the counter era began and delegates to GenSeq. Only
+// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it only after activation
+// is verified, so the window is open by design during the flip itself. This is broader than
+// "the mirror and counter were restored away": an authority outage plus a bot that has never
+// created its counter has the same evidence shape. The operator assertion closes it after the
+// flip and is documented as a required last step.
 //
 // # Why the mirror carries the epoch
 //
@@ -302,6 +303,20 @@ func parseExpectedMode(raw string) *expectedModeGuard {
 	}
 }
 
+// validateExpectedMode rejects a malformed deployment guard without needing to know
+// which allocator the authority selected. allocate calls this before any Redis or DB I/O:
+// a typo is process-local, stable configuration, so discovering it once per allocation
+// must be both immediate and cheap.
+func validateExpectedMode() error {
+	g := expectedMode.Load()
+	if g == nil || !g.set || !g.malformed {
+		return nil
+	}
+	return fmt.Errorf("botevent: %s is set to an unrecognised value; refusing to allocate "+
+		"rather than run with a guard that silently does nothing (want %q or %q)",
+		ExpectedModeEnv, ModeLegacy, ModeIncr)
+}
+
 // assertExpectedMode enforces the optional deployment guard against a resolved mode.
 func assertExpectedMode(activated bool) error {
 	g := expectedMode.Load()
@@ -309,9 +324,7 @@ func assertExpectedMode(activated bool) error {
 		return nil
 	}
 	if g.malformed {
-		return fmt.Errorf("botevent: %s is set to an unrecognised value; refusing to allocate "+
-			"rather than run with a guard that silently does nothing (want %q or %q)",
-			ExpectedModeEnv, ModeLegacy, ModeIncr)
+		return validateExpectedMode()
 	}
 	if g.incr && !activated {
 		return fmt.Errorf("botevent: %s=%s but the authority says the allocator is not activated; "+
@@ -392,17 +405,17 @@ func resolveMode(ctx *config.Context, mirror string) (modeResolution, error) {
 	if b := activeBelief.Load(); b != nil {
 		// Positive is terminal with respect to legacy.
 		if b.activated {
-			return modeResolution{decision: decideCounter, belief: b}, nil
+			return resolutionFromBelief(b, "")
 		}
 		if !claims && beliefNow().Sub(b.resolvedAt) < negativeBeliefTTL {
-			return modeResolution{decision: decideLegacy, belief: b}, nil
+			return resolutionFromBelief(b, "")
 		}
 		// A mirror claiming activation normally forces a read — that is what makes a flip
 		// propagate without waiting for the TTL. The one exception is a value the authority
 		// already denied to this process: re-reading per allocation then would be the
 		// serialized-read storm review P1-C named, with no exit. See repairCooldown.
 		if claims && mirror == b.deniedMirror && beliefNow().Sub(b.deniedAt) < repairCooldown {
-			return modeResolution{decision: decideLegacy, belief: b}, nil
+			return resolutionFromBelief(b, "")
 		}
 	}
 	return refreshAuthority(ctx, claims, mirror, false)
@@ -438,32 +451,29 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		// evidence this caller has already contradicted (review P2-3). Fall through and
 		// read.
 		if prior.activated {
-			return modeResolution{decision: decideCounter, belief: prior}, nil
+			return resolutionFromBelief(prior, "")
 		}
 		if !mirrorClaimsIncr {
-			return modeResolution{decision: decideLegacy, belief: prior}, nil
+			return resolutionFromBelief(prior, "")
 		}
 	}
 	if prior != nil && !force {
 		if prior.activated {
-			return modeResolution{decision: decideCounter, belief: prior}, nil
+			return resolutionFromBelief(prior, "")
 		}
 		if !mirrorClaimsIncr && beliefNow().Sub(prior.resolvedAt) < negativeBeliefTTL {
-			return modeResolution{decision: decideLegacy, belief: prior}, nil
+			return resolutionFromBelief(prior, "")
 		}
 		if mirrorClaimsIncr && mirror == prior.deniedMirror &&
 			beliefNow().Sub(prior.deniedAt) < repairCooldown {
-			return modeResolution{decision: decideLegacy, belief: prior}, nil
+			return resolutionFromBelief(prior, "")
 		}
 	}
 
 	st, err := readStateDeadlined(ctx)
 	switch {
 	case err == nil && st.Activated():
-		if err := assertExpectedMode(true); err != nil {
-			return modeResolution{}, err
-		}
-		return install(&belief{activated: true, epoch: st.Epoch, resolvedAt: beliefNow()}, ""), nil
+		return install(&belief{activated: true, epoch: st.Epoch, resolvedAt: beliefNow()}, "")
 
 	case err == nil, errors.Is(err, ErrStateMissing):
 		// The authority says legacy, or says nothing because the migration has not
@@ -492,10 +502,7 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 				zap.String("mirrorKey", ModeKey), zap.String("mirrorValue", mirror), zap.Error(err))
 			unauthorized = mirror
 		}
-		if err := assertExpectedMode(false); err != nil {
-			return modeResolution{}, err
-		}
-		return install(&belief{resolvedAt: beliefNow()}, unauthorized), nil
+		return install(&belief{resolvedAt: beliefNow()}, unauthorized)
 
 	default:
 		// Inconclusive.
@@ -509,9 +516,6 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 				"authority is unreadable (%w); refusing to allocate — the counter cannot be trusted "+
 				"unconfirmed, and legacy would issue ids below live cursors if the claim is true", err)
 		}
-		if guardErr := assertExpectedMode(false); guardErr != nil {
-			return modeResolution{}, guardErr
-		}
 		// Which of the two "legacy" reasons this was — the authority said so, or it could
 		// not be read — is distinguished by *which warning fires*, here versus the branch
 		// above. An earlier revision kept a `confirmed` flag on the belief for that and
@@ -522,27 +526,41 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 		// Cache the inconclusive answer too. During a DB outage the alternative is one
 		// failed read per allocation on the fan-out path, which is the cost this cache
 		// exists to remove.
-		return install(&belief{resolvedAt: beliefNow()}, ""), nil
+		return install(&belief{resolvedAt: beliefNow()}, "")
 	}
 }
 
-// install stores a belief and returns the matching resolution.
+// install stores a belief before enforcing the deployment guard and returning the
+// matching resolution.
 //
-// No error return: it never had a failure mode, and all three call sites used to check one —
-// dead API surface implying a path that does not exist (review round 7).
+// The ordering is load-bearing: a guard mismatch is stable process configuration, not a
+// reason to throw away a successfully parsed authority result. Keeping the belief means
+// later refusals reuse it instead of serializing every message on another MySQL read. Cached
+// resolutions still re-run assertExpectedMode, so retaining a negative belief cannot make an
+// `EXPECTED_MODE=incr` replica fall through to GenSeq.
 //
 // unauthorizedMirror is passed through to the caller rather than acted on here: repairing
 // it is a Redis write and this file deliberately does no Redis I/O — the allocator holds
 // the client.
-func install(b *belief, unauthorizedMirror string) modeResolution {
+func install(b *belief, unauthorizedMirror string) (modeResolution, error) {
 	activeBelief.Store(b)
+	return resolutionFromBelief(b, unauthorizedMirror)
+}
+
+// resolutionFromBelief applies the deployment assertion every time a cached or freshly
+// installed belief is used. The belief decides the candidate mode; the assertion decides
+// whether this replica is permitted to act on it.
+func resolutionFromBelief(b *belief, unauthorizedMirror string) (modeResolution, error) {
+	if err := assertExpectedMode(b.activated); err != nil {
+		return modeResolution{}, err
+	}
 	res := modeResolution{belief: b, unauthorizedMirror: unauthorizedMirror}
 	if b.activated {
 		res.decision = decideCounter
-		return res
+		return res, nil
 	}
 	res.decision = decideLegacy
-	return res
+	return res, nil
 }
 
 // noteMirrorUnauthorized records a mirror value the authority denied, so the next

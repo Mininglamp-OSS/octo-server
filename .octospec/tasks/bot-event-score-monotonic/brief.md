@@ -621,3 +621,24 @@ mirror repair** —— 它已被重写两次（缓存否定 → 删除键），�
 零 skip）。`modules/message` 的 `TestE2E_Issue557_*` 一度连续红，查明是**本地 WuKongIM 的
 raft 超时**（`propose batch until applied timeout` / `store message failed: context deadline
 exceeded`）—— 在 HEAD 上同样红，重启 IM 容器后即绿。
+
+## 第七轮实现记录（head `6a5cd9a6` 重审之后，2026-08-09）
+
+最新重审确认两处合并即暴露的边界，均先加失败测试再修复：
+
+1. **expected-mode 拒绝没有保存已解析的权威结果。** 当权威为 legacy 而
+   `OCTO_BOTEVENT_EXPECTED_MODE=incr` 时，原实现先返回 mismatch error、后 `install`，所以每条
+   被拒消息都在 `msgSem` 槽内重新读取 MySQL；拼错值（如 `inrc`）也先 probe Redis、再读 MySQL
+   才失败。现在 malformed guard 在任何依赖 I/O 前拒绝；已成功解析的权威 belief 先保存、再执行
+   assertion，缓存 belief 每次使用仍重新 assertion。结果是 mismatch 首次最多一次权威读、之后
+   快速拒绝，不会因缓存 negative belief 而放行 legacy；mirror 真正翻到新 epoch 时仍会触发刷新。
+2. **`payload.robot_id` 的 40 字节形状界只限制单键大小，不限制键数量。** 原来的 lookup-error
+   fail-open 允许客户端在 DB/Redis 故障窗口提交无限多个不同但合法形状的 id，并为每个值留下无
+   TTL counter 与永久 `seq` 行。现在只有 `err == nil && exists == true` 才采用客户端 id；查询失败
+   会记录错误并忽略这条仅靠 `payload.robot_id` 路由的事件。这个可用性取舍在**合并部署后立即
+   生效**，与 allocator activation 无关；它避免把一次依赖故障放大成永久、无界状态增长。
+
+同时更正 rollout 残余的描述：需要 fail-closed assertion 覆盖的真实证据空洞是 **mirror 缺失或
+非法 + authority 不可读 + 当前 bot 尚无 counter（新建或空闲 bot）**，不只限于「mirror 和
+counter 被同一次 Redis 恢复一起丢失」。因此激活验证完成后仍必须最后滚动设置
+`OCTO_BOTEVENT_EXPECTED_MODE=incr`；它是断言，不是激活开关。

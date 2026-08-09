@@ -46,10 +46,12 @@ const robotIDMaxLen = 40
 // something that could name a bot at all.
 //
 // This is a *syntactic* gate in front of the existRobot lookup, and it exists because that
-// lookup fails open (#697 review, sixth round): a DB blip must not drop a bot event, but it
-// must also not let an arbitrary-length client string through, because the monotonic
-// allocator turns every distinct value into a permanent `botEventSeq:counter:{id}` key — no
-// TTL, in a Redis running `noeviction` — plus a `seq` row that is never reclaimed.
+// lookup is on a client-controlled path. The monotonic allocator turns every adopted value
+// into a permanent `botEventSeq:counter:{id}` key — no TTL, in a Redis running `noeviction`
+// — plus a `seq` row that is never reclaimed. This check bounds one key's size and rejects
+// spellings no real bot can use; it does **not** bound cardinality, because a client can send
+// arbitrarily many distinct well-shaped values. Positive existence verification below is
+// what closes that dimension.
 //
 // The length bound is the decisive one and it needs no judgement call: a value longer than
 // the column can hold cannot match any row, so adopting it could only ever create permanent
@@ -71,6 +73,24 @@ func plausibleRobotID(candidate string) bool {
 		}
 	}
 	return true
+}
+
+// verifiedPayloadRobotID applies the trust boundary for client-controlled
+// payload.robot_id values.
+//
+// Only a successful, positive lookup is authority to adopt the candidate. Treating a lookup
+// error as existence lets a client create a fresh permanent counter key for every distinct
+// value throughout a dependency outage; the syntactic bound above limits key size, not key
+// count. Returning the lookup error lets the caller surface the availability failure while
+// keeping the unverified id out of the allocator.
+func verifiedPayloadRobotID(candidate string, exists bool, lookupErr error) (string, error) {
+	if lookupErr != nil {
+		return "", lookupErr
+	}
+	if !exists {
+		return "", nil
+	}
+	return candidate, nil
 }
 
 func (rb *Robot) existRobot(robotID string) (bool, error) {
@@ -226,32 +246,27 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 				// correct on its own terms: enqueueing onto a queue no bot will ever poll
 				// is not a delivery.
 				//
-				// A *lookup error* deliberately falls through to the old behaviour
-				// rather than dropping the event. No caller can force this query to
-				// error, so failing closed here would only convert a DB blip into
-				// silently lost bot events that used to be delivered (review, fifth
-				// round). The change is therefore strictly "reject when the bot is
-				// known not to exist".
-				//
-				// Which leaves the fail-open path able to adopt an arbitrary
-				// client-supplied string, so it gets a *syntactic* bound first (review,
-				// sixth round). That bound needs no database and cannot blip: it is the
-				// difference between "an id shaped like every real bot id" and "any
-				// length of anything", which is what decides whether the permanent
-				// per-value state above is bounded.
+				// A lookup error must not turn into authority to adopt the value. During
+				// a dependency outage a client can submit arbitrarily many distinct,
+				// well-shaped ids; adopting them would leave one permanent counter per
+				// value. The syntactic gate limits each key's size, not their count, so
+				// this branch accepts only a positively verified bot. The availability
+				// trade-off is explicit: an event routed solely by payload.robot_id is
+				// ignored while its identity cannot be verified.
 				candidate := robotIDValue.String()
 				if !plausibleRobotID(candidate) {
 					rb.Debug("payload.robot_id 形状不合法，忽略",
 						zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
 				} else {
 					exist, err := rb.existRobot(candidate)
+					verified, verifyErr := verifiedPayloadRobotID(candidate, exist, err)
 					switch {
-					case err != nil:
-						rb.Error("查询有效robotID失败，按原行为放行",
-							zap.Error(err), zap.String("robotID", candidate))
-						robotID = candidate
-					case exist:
-						robotID = candidate
+					case verifyErr != nil:
+						rb.Error("查询有效robotID失败，无法正向验证，忽略payload.robot_id",
+							zap.Error(verifyErr), zap.String("robotID", candidate),
+							zap.Int64("messageID", message.MessageID))
+					case verified != "":
+						robotID = verified
 					default:
 						rb.Debug("payload.robot_id 不是已知机器人，忽略",
 							zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))

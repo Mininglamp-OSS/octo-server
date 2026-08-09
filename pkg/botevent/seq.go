@@ -563,6 +563,11 @@ func nextEventID(ctx *config.Context, client Scripter, robotID string) (int64, e
 
 // allocate is nextEventID with the self-healing attempt counter threaded through.
 func allocate(ctx *config.Context, client Scripter, robotID string, attempt int) (int64, error) {
+	// A malformed expected-mode value is process-local configuration. Reject it before
+	// probing Redis or reading the authority; no dependency can make a typo become valid.
+	if err := validateExpectedMode(); err != nil {
+		return 0, err
+	}
 	if client == nil {
 		return 0, errors.New("botevent: nil redis client, cannot allocate event id")
 	}
@@ -576,6 +581,9 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 	// allocates atomically. No DB access, and no cached mode decides the gate — the
 	// gate compares the live mirror against the validated generation itself.
 	if b := activeBelief.Load(); b != nil && b.activated {
+		if err := assertExpectedMode(true); err != nil {
+			return 0, err
+		}
 		if _, ok := seeded.Load(robotID); ok {
 			return allocateFromCounter(ctx, client, robotID, b, attempt)
 		}
@@ -715,11 +723,13 @@ func gateClosed(ctx *config.Context, client Scripter, robotID string, attempt in
 //     regressed underneath an activated fleet" (review P1-A). A GenSeq id in the second
 //     case lands arbitrarily far below the bot's live cursor: #697, self-inflicted.
 //
-// The residual this does NOT cover is stated rather than papered over: if the counter key
-// is gone *as well* — a Redis flush or restore that took it, correlated with an authority
-// that reads legacy — a cold process has no evidence at all and delegates to GenSeq. Only
-// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it after activation
-// is verified (step 5), so the window is open by design during the flip itself.
+// The residual this does NOT cover is stated rather than papered over: if the mirror is
+// absent or invalid, the authority is unreadable, and this bot has no counter yet (new or
+// idle), a cold process has no evidence at all and delegates to GenSeq. A correlated Redis
+// restore can create that shape, but it is not required; an authority outage plus a bot that
+// has never created its counter is enough. Only `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes
+// it, and the rollout arms it after activation is verified (step 5), so the window is open
+// by design during the flip itself.
 //
 // Note what the env guard does and does not buy, because the refusal message below used to
 // get it wrong: it is a fail-closed *assertion*, not a manual override. Setting it makes an
