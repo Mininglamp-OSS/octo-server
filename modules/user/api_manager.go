@@ -283,7 +283,8 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
-	if userInfo == nil || userInfo.UID != fencedUID {
+	if userInfo == nil || userInfo.UID != fencedUID ||
+		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}

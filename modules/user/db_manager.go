@@ -160,12 +160,14 @@ func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
 }
 
 type managerLoginModel struct {
-	Username string
-	UID      string
-	Name     string
-	Password string
-	Role     string
-	Language string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
+	Username  string
+	UID       string
+	Name      string
+	Password  string
+	Role      string
+	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
+	Status    int
+	IsDestroy int
 }
 
 type managerUserModel struct {
