@@ -126,3 +126,31 @@ func TestThreadUpdateName_ExternalMember_Denied(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "原始子区名", got.Name, "外部成员被拒后子区名不变")
 }
+
+// TestThreadUpdateName_SameNameByUnauthorized_Denied 锁定安全边界：同名 no-op 短路必须在
+// 两道权限门之后。无权者（龙虾 / 黑名单 / 外部成员）即便提交子区「当前名」也应被拒绝，
+// 而不是拿到 200——否则短路会变成越权成功 + 「猜名=当前名」的探测 oracle。
+func TestThreadUpdateName_SameNameByUnauthorized_Denied(t *testing.T) {
+	const currentName = "原始子区名" // 与 seedRenameThread 建的子区名一致
+
+	// 各档无权者独立 seed（各自独立的 DB 清库 + 数据），提交当前名。
+	seeds := map[string]func(*testing.T) (*Service, string, string, string){
+		"robot":     func(t *testing.T) (*Service, string, string, string) { return seedRenameThread(t, int(common.GroupMemberStatusNormal), 1) },
+		"blacklist": func(t *testing.T) (*Service, string, string, string) { return seedRenameThread(t, int(common.GroupMemberStatusBlacklist), 0) },
+		"external":  func(t *testing.T) (*Service, string, string, string) { return seedRenameThreadExternal(t, int(common.GroupMemberStatusNormal), 0, 1) },
+	}
+
+	for name, seed := range seeds {
+		t.Run(name, func(t *testing.T) {
+			svc, groupNo, shortID, operatorUID := seed(t)
+
+			err := svc.UpdateName(groupNo, shortID, operatorUID, currentName)
+			require.Error(t, err, "无权者提交当前名也必须被拒绝（短路须在权限门之后）")
+			require.Contains(t, err.Error(), "no permission")
+
+			got, err := svc.GetThread(groupNo, shortID, operatorUID)
+			require.NoError(t, err)
+			require.Equal(t, currentName, got.Name, "被拒后子区名不变")
+		})
+	}
+}

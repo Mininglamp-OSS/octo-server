@@ -573,12 +573,6 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 		return errors.New("thread has been deleted")
 	}
 
-	// 同名 no-op 短路：db.UpdateName 无条件 bump version 且总报成功，若不拦截，重试或
-	// save-on-blur 式 UI 会重复发 tip。名字没变就直接返回，符合 #663「只发一次，不重复」。
-	if thread.Name == name {
-		return nil
-	}
-
 	// 企业微信式解散语义（产品决策 2026-06）：子区改名属低风险写，解散后仍允许——
 	// 对齐会话置顶（group/api.go:groupSettingUpdate 的 settingActionMap 豁免解散校验）。
 	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群内部活跃人类成员 + 龙虾排除」
@@ -604,6 +598,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	}
 	if isRobot {
 		return errors.New("no permission to update")
+	}
+
+	// 同名 no-op 短路：db.UpdateName 无条件 bump version 且总报成功，若不拦截，重试或
+	// save-on-blur 式 UI 会重复发 tip。名字没变就直接返回，符合 #663「只发一次，不重复」。
+	// 必须放在上面两道权限门（ExistMemberActiveInternal + IsRobot）之后：否则无权者提交
+	// 当前名会拿到 200 而非拒绝，且成为「猜名=当前名」的探测 oracle（越权读子区名）。
+	if thread.Name == name {
+		return nil
 	}
 
 	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {
