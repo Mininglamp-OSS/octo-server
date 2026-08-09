@@ -50,6 +50,21 @@ func write(ctx Context, renamed string) {
 	require.Len(t, tokenWriterViolations(fset, file, "fixture.go"), 1)
 }
 
+func TestDirectTokenWriterGuardRejectsDeadlineMutationMethods(t *testing.T) {
+	for _, method := range []string{"Persist", "Expire", "ExpireAt"} {
+		t.Run(method, func(t *testing.T) {
+			source := fmt.Sprintf(`package fixture
+func write(ctx Context, renamed string) {
+	ctx.Cache().%s(ctx.GetConfig().Cache.TokenCachePrefix + renamed, deadline)
+}`, method)
+			fset := gotoken.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", source, 0)
+			require.NoError(t, err)
+			require.Len(t, tokenWriterViolations(fset, file, "fixture.go"), 1)
+		})
+	}
+}
+
 func directTokenWriterViolations(path string) ([]string, error) {
 	fset := gotoken.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, 0)
