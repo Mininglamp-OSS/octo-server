@@ -2,7 +2,6 @@ package accesslog
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/require"
 	"os"
 	"regexp"
 	"strings"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestScrubPath(t *testing.T) {
@@ -349,6 +350,30 @@ func TestScrubPath_MasksPollSecret(t *testing.T) {
 	}
 }
 
+func TestScrubPath_MasksGrantLoginSecrets(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "auth code and signal material",
+			in:   "/v1/user/grant_login?auth_code=A-CODE&encrypt=SIGNAL-KEY",
+			want: "/v1/user/grant_login?auth_code=***&encrypt=***",
+		},
+		{
+			name: "mixed case parameters",
+			in:   "/v1/user/grant_login?AUTH_CODE=A-CODE&ENCRYPT=SIGNAL-KEY&keep=value",
+			want: "/v1/user/grant_login?AUTH_CODE=***&ENCRYPT=***&keep=value",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ScrubPath(tc.in))
+		})
+	}
+}
+
 // TestScrubPath_MasksAuthCode pins the redeemable scan-login code, which travels
 // as a path segment.
 //
@@ -406,13 +431,14 @@ func TestErrorWriter_MasksScanLoginSecrets(t *testing.T) {
 	w := NewErrorWriter(&buf)
 
 	dump := "panic serving request\nGET /v1/user/loginstatus?uuid=U1&poll_secret=S3CR3T HTTP/1.1\n" +
-		"POST /v1/user/login_authcode/A-CODE HTTP/1.1\n"
+		"POST /v1/user/login_authcode/A-CODE HTTP/1.1\n" +
+		"GET /v1/user/grant_login?auth_code=GRANT-CODE&encrypt=SIGNAL-KEY HTTP/1.1\n"
 	if _, err := w.Write([]byte(dump)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
 	got := buf.String()
-	for _, leaked := range []string{"S3CR3T", "A-CODE"} {
+	for _, leaked := range []string{"S3CR3T", "A-CODE", "GRANT-CODE", "SIGNAL-KEY"} {
 		if strings.Contains(got, leaked) {
 			t.Errorf("panic dump leaked %q: %s", leaked, got)
 		}

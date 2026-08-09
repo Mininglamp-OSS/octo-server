@@ -17,8 +17,16 @@ func scanLoginSettings(snapshot map[string]string) *SystemSettings {
 	return s
 }
 
-func TestSystemSettings_ScanLoginEnabledDefaultsTrue(t *testing.T) {
-	assert.True(t, scanLoginSettings(nil).ScanLoginEnabled())
+func TestSystemSettings_ScanLoginEnabledDefaultsFalse(t *testing.T) {
+	assert.False(t, scanLoginSettings(nil).ScanLoginEnabled(),
+		"server-first rollout must stay gated until clients send poll_secret on redemption")
+}
+
+func TestSystemSettings_ScanLoginEnabledFailsClosedBeforeFirstSuccessfulLoad(t *testing.T) {
+	s := &SystemSettings{Log: log.NewTLog("SystemSettingsTest")}
+
+	assert.False(t, s.ScanLoginEnabled(),
+		"an uninitialized settings snapshot must not enable the scan-login security boundary")
 }
 
 func TestSystemSettings_ScanLoginEnabledHonoursDBSnapshot(t *testing.T) {

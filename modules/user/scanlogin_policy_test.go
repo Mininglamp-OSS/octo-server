@@ -11,12 +11,19 @@ import (
 	"time"
 
 	libcommon "github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func enableScanLoginForUserTest(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	setSystemSettingForUserTest(t, ctx, "login", "scan_enabled", "1", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+}
 
 func TestScanLoginDisabledBlocksUserEntryPoints(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
@@ -89,7 +96,7 @@ func TestScanLoginRateLimitsRejectNonFiniteRPSConfig(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+	enableScanLoginForUserTest(t, ctx)
 
 	const ip = "9.9.8.21"
 	for _, key := range []string{
@@ -128,7 +135,7 @@ func TestLoginWithAuthCode_WrongPollSecretDoesNotConsumeAuthorization(t *testing
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+	enableScanLoginForUserTest(t, ctx)
 
 	authCode := util.GenerUUID()
 	uuid := util.GenerUUID()
@@ -155,7 +162,7 @@ func TestScanLoginAuthorization_RequiresConfirmationAndRedeemsOnce(t *testing.T)
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+	enableScanLoginForUserTest(t, ctx)
 
 	db := NewDB(ctx)
 	model, err := db.QueryByUID(testutil.UID)
@@ -233,7 +240,7 @@ func TestScanLoginAuthorization_MultipleReplicasRedeemOnce(t *testing.T) {
 	wireI18nRendererForUserTest(s1)
 	wireI18nRendererForUserTest(s2)
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+	enableScanLoginForUserTest(t, ctx)
 
 	db := NewDB(ctx)
 	model, err := db.QueryByUID(testutil.UID)
@@ -313,4 +320,93 @@ func TestScanLoginAuthorization_MultipleReplicasRedeemOnce(t *testing.T) {
 		assert.Contains(t, response.Body.String(), "err.server.user.auth_code_not_found")
 	}
 	require.Equal(t, 1, redeemSuccesses, "only one replica may consume and issue a session")
+}
+
+func TestScanLoginAuthorization_MultipleAuthCodesForOneUUIDRedeemOnce(t *testing.T) {
+	s1, ctx := testutil.NewTestServer()
+	s2, _ := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s1)
+	wireI18nRendererForUserTest(s2)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	enableScanLoginForUserTest(t, ctx)
+
+	db := NewDB(ctx)
+	model, err := db.QueryByUID(testutil.UID)
+	require.NoError(t, err)
+	if model == nil {
+		require.NoError(t, db.Insert(&Model{
+			UID:      testutil.UID,
+			Name:     "single QR claim user",
+			Username: "single_qr_claim_user",
+			ShortNo:  "scan004",
+			Status:   1,
+		}))
+	}
+
+	uuid := util.GenerUUID()
+	authCodes := []string{util.GenerUUID(), util.GenerUUID()}
+	for _, authCode := range authCodes {
+		require.NoError(t, SavePendingScanLoginAuthorization(ctx.GetRedisConn(), authCode, testutil.UID, uuid))
+	}
+	pollSecret, err := mintScanLoginPollSecret(ctx.GetRedisConn(), uuid)
+	require.NoError(t, err)
+
+	routes := []http.Handler{s1.GetRoute(), s2.GetRoute()}
+	callBoth := func(method string, paths []string, token bool) []*httptest.ResponseRecorder {
+		t.Helper()
+		responses := make([]*httptest.ResponseRecorder, len(routes))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(len(routes))
+		for i, route := range routes {
+			go func(i int, route http.Handler) {
+				defer wg.Done()
+				<-start
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(method, paths[i], nil)
+				setPublicIPForUserTest(req, "9.9.11."+strconv.Itoa(i+1))
+				if token {
+					req.Header.Set("token", testutil.Token)
+				}
+				route.ServeHTTP(w, req)
+				responses[i] = w
+			}(i, route)
+		}
+		close(start)
+		wg.Wait()
+		return responses
+	}
+
+	confirmPaths := []string{
+		"/v1/user/grant_login?auth_code=" + authCodes[0],
+		"/v1/user/grant_login?auth_code=" + authCodes[1],
+	}
+	confirmResponses := callBoth(http.MethodGet, confirmPaths, true)
+	confirmSuccesses := 0
+	for _, response := range confirmResponses {
+		if response.Code == http.StatusOK {
+			confirmSuccesses++
+			continue
+		}
+		assert.Contains(t, response.Body.String(), "err.server.user.auth_code_not_found")
+	}
+	require.Equal(t, 1, confirmSuccesses,
+		"two auth codes for one QR session must not both become redeemable")
+
+	redeemPaths := []string{
+		"/v1/user/login_authcode/" + authCodes[0] + "?poll_secret=" + pollSecret,
+		"/v1/user/login_authcode/" + authCodes[1] + "?poll_secret=" + pollSecret,
+	}
+	redeemResponses := callBoth(http.MethodPost, redeemPaths, false)
+	redeemSuccesses := 0
+	for _, response := range redeemResponses {
+		if response.Code == http.StatusOK {
+			redeemSuccesses++
+			assert.Contains(t, response.Body.String(), `"token"`)
+			continue
+		}
+		assert.Contains(t, response.Body.String(), "err.server.user.auth_code_not_found")
+	}
+	require.Equal(t, 1, redeemSuccesses,
+		"one displayed QR session must issue at most one login session")
 }

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGetAppConfig_ScanLoginEnabledDefaultsTrue(t *testing.T) {
+func TestGetAppConfig_ScanLoginEnabledDefaultsFalse(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	cn := New(ctx)
 	cleanAllTablesAndReloadSettings(t, ctx)
@@ -21,7 +21,7 @@ func TestGetAppConfig_ScanLoginEnabledDefaultsTrue(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), `"scan_login_enabled":true`)
+	assert.Contains(t, w.Body.String(), `"scan_login_enabled":false`)
 }
 
 func TestGetAppConfig_ScanLoginDisabledInEveryResponseBranch(t *testing.T) {

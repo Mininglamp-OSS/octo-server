@@ -126,6 +126,71 @@ func TestScanLoginAuthorization_PromoteAndConsumeAreAtomic(t *testing.T) {
 	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
 }
 
+func TestScanLoginAuthorization_UUIDClaimAllowsOnlyOneAuthorization(t *testing.T) {
+	store := newScanLoginAuthorizationStoreForTest(t)
+	uuid := "scan-uuid-claim-" + time.Now().Format("150405.000000000")
+	authCodes := []string{uuid + "-a", uuid + "-b"}
+	claimKey := "scanlogin:claim:" + uuid
+	expected, err := encodeScanLoginAuthorization("scanner-1", uuid)
+	require.NoError(t, err)
+
+	keys := []string{claimKey}
+	for _, authCode := range authCodes {
+		pendingKey := scanLoginPendingAuthorizationKey(authCode)
+		readyKey := scanLoginReadyAuthorizationKey(authCode)
+		keys = append(keys, pendingKey, readyKey)
+		require.NoError(t, store.client.Set(pendingKey, expected, time.Minute).Err())
+	}
+	t.Cleanup(func() { _ = store.client.Del(keys...).Err() })
+
+	start := make(chan struct{})
+	results := make([]bool, len(authCodes))
+	errs := make([]error, len(authCodes))
+	var wg sync.WaitGroup
+	wg.Add(len(authCodes))
+	for i, authCode := range authCodes {
+		go func(i int, authCode string) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = store.Promote(authCode, expected, time.Minute)
+		}(i, authCode)
+	}
+	close(start)
+	wg.Wait()
+
+	winner := -1
+	for i := range authCodes {
+		require.NoError(t, errs[i])
+		if results[i] {
+			require.Equal(t, -1, winner, "only one auth code may claim a QR session")
+			winner = i
+		}
+	}
+	require.NotEqual(t, -1, winner)
+	loser := 1 - winner
+	assert.Equal(t, authCodes[winner], store.client.Get(claimKey).Val())
+	assert.Equal(t, expected, store.client.Get(scanLoginReadyAuthorizationKey(authCodes[winner])).Val())
+	assert.Equal(t, rd.Nil, store.client.Get(scanLoginPendingAuthorizationKey(authCodes[loser])).Err(),
+		"the losing pending authorization must be removed")
+	assert.Equal(t, rd.Nil, store.client.Get(scanLoginReadyAuthorizationKey(authCodes[loser])).Err())
+
+	consumed, err := store.Consume(authCodes[winner], expected)
+	require.NoError(t, err)
+	require.True(t, consumed)
+	assert.Equal(t, "consumed:"+authCodes[winner], store.client.Get(claimKey).Val())
+
+	lateAuthCode := uuid + "-late"
+	latePendingKey := scanLoginPendingAuthorizationKey(lateAuthCode)
+	lateReadyKey := scanLoginReadyAuthorizationKey(lateAuthCode)
+	keys = append(keys, latePendingKey, lateReadyKey)
+	require.NoError(t, store.client.Set(latePendingKey, expected, time.Minute).Err())
+	promoted, err := store.Promote(lateAuthCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, promoted, "a consumed QR session must reject later authorizations")
+	assert.Equal(t, rd.Nil, store.client.Get(latePendingKey).Err())
+	assert.Equal(t, rd.Nil, store.client.Get(lateReadyKey).Err())
+}
+
 func TestScanLoginAuthorization_RollbackPromotionRestoresPending(t *testing.T) {
 	store := newScanLoginAuthorizationStoreForTest(t)
 	authCode := "scan-rollback-" + time.Now().Format("150405.000000000")

@@ -323,10 +323,11 @@ func TestGetLoginStatus_OnlyAuthorizedPollersRegisterAChannel(t *testing.T) {
 // 「status=authed、附带的 auth_code 只剩一秒」，浏览器兑换必然失败且状态机无路可走。
 func TestGrantLogin_PromotesPendingAuthorizationBeforePublishingAuthed(t *testing.T) {
 	fn := readFuncBody(t, "api.go", "func (u *User) grantLogin(")
+	compact := strings.Join(strings.Fields(fn), "")
 
 	assert.Contains(t, fn, "u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)",
 		"确认时必须原子地把 pending 授权提升为可兑换授权")
-	assert.NotContains(t, fn, "SetAndExpire(\n\t\tfmt.Sprintf(\"%s%s\", common.AuthCodeCachePrefix",
+	assert.NotContains(t, compact, "SetAndExpire(fmt.Sprintf(\"%s%s\",common.AuthCodeCachePrefix",
 		"确认流程不得绕过原子 promote 直接覆盖可兑换授权")
 
 	renewIdx := strings.Index(fn, "u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)")
