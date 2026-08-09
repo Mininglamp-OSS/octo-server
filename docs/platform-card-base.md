@@ -605,7 +605,7 @@ type CardUpdater interface {
 关于这两个端点，有四条与早期草案不同、必须按实现理解的约束：
 
 1. **可见 ≠ 可发**。出现在列表里只代表调用方有权看见该模板的契约；能否 new send / historical edit 由 grant 决定，Bot 的权威发现面仍是 `GET /v1/bot/card/profile`。不要拿 B1/B2 绕过 bot grant。
-2. **默认不可见**。static 卡一律 private，是否对外可发现由 composition root 的显式登记决定（`main.go` 的 `applyStaticCatalogVisibility`，PR-C 交付时**故意为空**）；private 模板需要调用方当前 Space 持有 `discover` grant。
+2. **默认不可见**。static 卡一律 private —— 这是 `Registry.Register`/`RegisterJSON` 写死的 fail-close 值。要对外可发现，需在 Freeze 前调用 `Registry.SetCatalogVisibility`；该方法已实现（`pkg/cardtmpl/registry.go`），但 PR-C **没有在 `main.go` 里接线任何调用**，即当前部署没有任何 public static 卡。（早期草案在此处点名过一个 `main.go` 的 `applyStaticCatalogVisibility` 包装函数；它从未存在，接线本身是待办。）private 模板需要调用方当前 Space 持有 `discover` grant。
 3. **不存在 / 无权见 / 已 block 返回同一个 localized not-found**。三者可区分等于给出私有目录的枚举 oracle。
 4. **samples 是 per-artifact opt-in**。只有 manifest 里 `export.samples` 显式列出、且确认是合成 fixture 的 sample 才会导出；templates、goldens、canonical bundle bytes、audit、grants、内部 DB ID 永不出现在 B2。static L1 manifest 已冻结、无法追加该声明，因此**现有 static 卡的 B2 samples 恒为空**——这是正确答案，不是缺口。
 

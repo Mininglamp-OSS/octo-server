@@ -169,6 +169,88 @@ set is now bounded by the switch map, which has one entry, so `CapabilityFor`'s
 observable second half today. The drop itself is still asserted; the survival
 half returns when a second switch does.
 
+### D0c — Discovery scope narrowed against this brief, itemised
+
+Review S1–S4 and S9 (yujiawei), each an accepted narrowing rather than an
+oversight. Recorded here because a scope decision that lives only in a Go
+comment is indistinguishable from a bug.
+
+**S1 — `GET /v1/manager/card-templates` carries no `source` / `visibility` /
+grant summary**, though line 349 and line 426 of this brief ask for them. The
+narrowing is right and the brief is what should change: `source` and
+`visibility` are properties of an artifact *version*, and the manager index is
+keyed by template *ID*. One ID can hold both static and dynamic versions —
+that is the entire shadowing model — so there is no single `source` to report at
+that granularity. The per-version answers, and the bounded grant summary, are
+already on the detail endpoint (`GET .../card-templates/:id`), which is where an
+operator drills in. Lines 349 and 426 are superseded by this entry.
+
+**S2 — B1 list items carry no `views`**, though line 234 asks for them. A view
+array per row makes a list page grow with templates × views, on an endpoint
+whose job is to let a producer decide *whether* to fetch the contract. B2
+carries them. Line 234 is superseded.
+
+**S3 — no composition-root static `CatalogMeta` injection.**
+`Registry.SetCatalogVisibility` exists and is tested; nothing in `main.go` calls
+it, so no static card is public. That is the intended end state, reached by
+absent wiring rather than by an explicit empty allowlist. Two documents named an
+`applyStaticCatalogVisibility` function that was never written; both are
+corrected. Wiring it is follow-up work, and it is inert until someone wants a
+public static card.
+
+Related and *not* a defect: `Register` passes an empty `engine` to the export
+projection while `RegisterJSON` passes the bundle's. A Go-coded template has no
+JSON template engine, so empty is the accurate answer for it, not a missing
+value.
+
+**S4 — B1/B2 have no super-admin bypass**, though line 243 allows one. Not
+built: it is a convenience for operators who already have the manager endpoints,
+and every path that lacks it fails closed. Line 243 is superseded.
+
+**S9 — D6 describes `/v1/bot/card/profile` as `authBot → botActorUID →
+SharedUIDRateLimiter`; the route uses the Bot group's own limiter.** The code is
+right and the contract is wrong: mounting `botActorUID` on the main Bot group
+was rejected in an earlier round as an authorization-confusion risk, and it
+survives only on the reused authtree routes, which do not include this endpoint.
+D6's limiter row is superseded by this entry. The test fixture that flushed
+`ratelimit:uid:*` for this endpoint was written against D6's text rather than
+the route and has been removed with it.
+
+### D0d — Two performance items deferred behind the gate, with a gate condition
+
+Review P2 (yujiawei). Both are real and neither is reachable today, because
+`OCTO_CARD_RUNTIME_CATALOG_NEW_SEND_ENABLED` is false.
+
+- **Profile-poll transaction amplification.** `CapabilityFor` re-reads each ref
+  through `MetaExact` after `ListAuthorizedTemplates` already returned a full
+  authorization — up to ~65 transactions per poll at the 64-grant budget, on an
+  endpoint a Bot fleet polls for feature detection.
+- **`selectPrincipalGrantsSQL`'s sort key is not a prefix of
+  `idx_card_template_grant_principal`**, so the `LIMIT` cannot be pushed down.
+
+Neither is fixed here: both are optimisations whose shape depends on measurement
+this container cannot produce, and guessing would risk the ordering property the
+row budget relies on (a template's exact and global rows must stay adjacent).
+**Gate condition: run `EXPLAIN` on realistic grant volumes before
+`_NEW_SEND_ENABLED` is turned on anywhere**, and fix what it shows.
+
+### D0e — The pinned-read TOCTOU is accepted, not overlooked
+
+Review (Jerry-Xin, non-blocking). `requireSendableRef` authorizes an exact
+dynamic ref, and `catalog.Render` then reads that ref as *pinned* —
+`verifyAuthorization` requires no activation receipt for a pinned read. An
+activation or rollback committing in that window renders a version that is
+superseded but still granted.
+
+Accepted. It is byte-unchanged from the merge base and it follows from the
+documented pinned-read design: a pinned read is *defined* as "this exact
+version, regardless of where the pointer now points", which is what makes
+historical edit of an already-sent card work at all. The exposure is bounded to
+one request whose authorization snapshot was valid when taken, which is the same
+guarantee D4's linearization point gives every other path — an in-flight request
+is allowed to finish. Revocation is not affected: the grant is re-read in the
+same snapshot.
+
 ### D1 — One PR-C milestone, ordered internal slices
 
 保持一个 octo-server PR-C，避免 migrations/API/runtime wiring 跨 PR 出现“grant 已写入但

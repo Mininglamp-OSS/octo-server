@@ -7,7 +7,6 @@ package bot_api
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/go-redis/redis"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -39,18 +38,14 @@ func setupBotCardProfile(t *testing.T) (http.Handler, *config.Context) {
 		cpBotID, "owner_cp", cpBotToken,
 	).Exec()
 	assert.NoError(t, err)
-	// PR-C mounted SharedUIDRateLimiter on /v1/bot/card/profile, and the uid
-	// bucket lives in Redis across tests — CleanAllTables does not touch it.
-	// Without this reset the suite starts partway through the burst and later
-	// cases fail with 429s unrelated to the code under test.
-	rds := redis.NewClient(&redis.Options{
-		Addr:     ctx.GetConfig().DB.RedisAddr,
-		Password: ctx.GetConfig().DB.RedisPass,
-	})
-	defer rds.Close()
-	if keys, keysErr := rds.Keys("ratelimit:uid:*").Result(); keysErr == nil && len(keys) > 0 {
-		_ = rds.Del(keys...).Err()
-	}
+	// No ratelimit:uid:* reset here. An earlier version of this helper flushed
+	// that bucket and explained itself with "PR-C mounted SharedUIDRateLimiter
+	// on /v1/bot/card/profile" — which is not true (review S9/P2-4, yujiawei).
+	// This endpoint is registered inside the Bot group, whose limiter is keyed
+	// on the robot id, and SharedUIDRateLimiter appears nowhere in bot_api.go;
+	// mounting botActorUID on that group was rejected in an earlier round. The
+	// flush was therefore inert, and keeping it would have gone on implying a
+	// route shape that does not exist.
 	return s.GetRoute(), ctx
 }
 

@@ -143,8 +143,12 @@ codebase wearing a justification.
 
 - Production activation. Both gates keep their `false` defaults and no commit
   changes them.
-- Publishing any existing static card. `applyStaticCatalogVisibility` ships as
-  an empty list so opening one up stays a separate reviewed decision.
+- Publishing any existing static card. Every static card stays private, so
+  opening one up stays a separate reviewed decision. (This bullet used to credit
+  an `applyStaticCatalogVisibility` empty list in `main.go`; no such function was
+  written. The privacy comes from `Register`/`RegisterJSON` fail-closing to
+  private, and `Registry.SetCatalogVisibility` has no production caller — see
+  D0c.)
 - Deduplicating `SpaceMiddleware`/`LocalizedSpaceMiddleware` and the two Space
   resolvers. Both pairs are near-copies whose *only* difference is failure
   behaviour, and that difference is the point; collapsing them would put a

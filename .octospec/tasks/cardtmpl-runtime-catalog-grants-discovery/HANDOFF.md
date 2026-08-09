@@ -334,8 +334,12 @@ Landed (`feat: add card template discovery and safe export`):
   to discovery.
 - `[new] pkg/space/middleware_localized.go` — same membership rule, cache keys
   and TTLs as `SpaceMiddleware`; only the failure responses move to `httperr`.
-- `[modify] main.go` — `applyStaticCatalogVisibility`, deliberately an empty
-  list: all five existing L2a cards stay private.
+- `main.go` — **not modified.** An earlier draft of this list named an
+  `applyStaticCatalogVisibility` wrapper here; it was never written, and
+  `Registry.SetCatalogVisibility` (which does exist) has no production caller.
+  The outcome is the intended one — all five existing L2a cards stay private,
+  because `Register`/`RegisterJSON` fail-close to private — but it is reached by
+  the absence of the wiring rather than by an empty allowlist. Recorded in D0c.
 
 Focused tests: `[new] pkg/cardtmpl/export_test.go`,
 `[new] modules/card_template_catalog/api_discovery_test.go`.
