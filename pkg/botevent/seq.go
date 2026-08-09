@@ -628,7 +628,8 @@ func allocate(ctx *config.Context, client Scripter, robotID string, attempt int)
 		// and every counter this process believes it seeded is suspect — not just this
 		// bot's. Dropping the whole seeded set makes the next allocation for each of
 		// them re-seed from the durable floors. The seed is idempotent and only ever
-		// raises, so the cost is one extra round trip per active bot.
+		// raises, but it is not a cheap probe: each bot pays the durable floor reads
+		// (state, legacy min_seq, and high-water) plus the Redis seed before allocating.
 		mirrorRebuilds.inc()
 		invalidateSeeded()
 	}
@@ -723,13 +724,12 @@ func gateClosed(ctx *config.Context, client Scripter, robotID string, attempt in
 //     regressed underneath an activated fleet" (review P1-A). A GenSeq id in the second
 //     case lands arbitrarily far below the bot's live cursor: #697, self-inflicted.
 //
-// The residual this does NOT cover is stated rather than papered over: if the mirror is
-// absent or invalid, the authority is unreadable, and this bot has no counter yet (new or
-// idle), a cold process has no evidence at all and delegates to GenSeq. A correlated Redis
-// restore can create that shape, but it is not required; an authority outage plus a bot that
-// has never created its counter is enough. Only `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes
-// it, and the rollout arms it after activation is verified (step 5), so the window is open
-// by design during the flip itself.
+// The residual this does NOT cover is stated rather than papered over: any negative belief
+// combined with no counter for this bot can delegate to GenSeq. The authority may be readable
+// but regressed to legacy/missing, or unreadable while the mirror does not claim activation;
+// either way a new or idle bot has no per-bot evidence that the counter era began. Only
+// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes it, and the rollout arms it after activation is
+// verified (step 5), so the window is open by design during the flip itself.
 //
 // Note what the env guard does and does not buy, because the refusal message below used to
 // get it wrong: it is a fail-closed *assertion*, not a manual override. Setting it makes an

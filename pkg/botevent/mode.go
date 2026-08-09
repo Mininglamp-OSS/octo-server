@@ -71,14 +71,13 @@ package botevent
 // only have happened after the authority said `incr`. So a cold process that sees
 // `legacy` alongside a live counter refuses instead of degrading — see legacyDelegate.
 //
-// One residual is accepted rather than claimed away: when the mirror is absent or invalid,
-// the authority is unreadable, and this bot has no counter yet (a new or idle bot), a cold
-// process has no evidence that the counter era began and delegates to GenSeq. Only
-// `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that, and the rollout arms it only after activation
-// is verified, so the window is open by design during the flip itself. This is broader than
-// "the mirror and counter were restored away": an authority outage plus a bot that has never
-// created its counter has the same evidence shape. The operator assertion closes it after the
-// flip and is documented as a required last step.
+// One residual is accepted rather than claimed away: any negative belief may delegate to
+// GenSeq when this bot has no counter yet. That includes an authority that is readable but has
+// regressed to legacy or missing, and an unreadable authority when the mirror does not claim
+// activation. In both cases a new or idle bot has no per-bot evidence that the counter era
+// began. Only `OCTO_BOTEVENT_EXPECTED_MODE=incr` closes that evidence gap, and the rollout arms
+// it only after activation is verified, so the window is open by design during the flip itself.
+// The operator assertion closes it after the flip and is documented as a required last step.
 //
 // # Why the mirror carries the epoch
 //
@@ -176,8 +175,9 @@ type modeResolution struct {
 	// per-bot, so an allocation for a bot that has never received an event still has no
 	// counter to object with. Since the delete's only benefit was suppressing the read
 	// storm, and the cooldown suppresses that too, the delete is gone entirely rather than
-	// conditioned. Nothing in the allocator writes this key now; only the operator tool
-	// does, which is the one place a human can see what they are overwriting.
+	// conditioned. Nothing on the allocator's legacy path writes this key now. The activated
+	// recovery path can rebuild it only after validating the authority and re-seeding the
+	// current bot; the operator tool is the only writer during the supervised cutover.
 	unauthorizedMirror string
 }
 
@@ -218,6 +218,13 @@ const (
 	authorityTimeout = 300 * time.Millisecond
 )
 
+// NegativeBeliefTTL is the longest interval for which an allocator may reuse a
+// pre-activation belief while the mode mirror is absent.
+//
+// The operator tool uses this bound in its cutover failure instructions: once the
+// authority has been flipped, a failed mirror write is not a successful activation.
+func NegativeBeliefTTL() time.Duration { return negativeBeliefTTL }
+
 var (
 	// activeBelief is read on the hottest producer path and written only by a
 	// resolution, so it is an atomic pointer rather than a mutex-guarded var. nil
@@ -232,8 +239,10 @@ var (
 	beliefNow = time.Now
 
 	// mirrorUnauthorized counts mirrors claiming an activation the authority denied.
-	// It self-heals to legacy, so without this metric a forged or stale mirror is
-	// invisible — no error, no failed enqueue, nothing to alert on.
+	// The allocator deliberately leaves the mirror intact: it cannot know whether the
+	// mirror or the authority regressed. Without this metric the conflict is invisible,
+	// and activation remains blocked until an operator diagnoses it and removes only a
+	// mirror proven to be unauthorized.
 	mirrorUnauthorized = newHealCounter("dmwork_bot_event_seq_mirror_unauthorized_total",
 		"Mode mirrors claiming an activation the DB authority did not confirm.")
 
@@ -498,7 +507,8 @@ func refreshAuthority(ctx *config.Context, mirrorClaimsIncr bool, mirror string,
 			// header for what does and what remains residual.
 			mirrorUnauthorized.inc()
 			unauthorizedWarn.warn("botevent: mode mirror claims activation but the authority does not; "+
-				"removing the stale mirror and allocating from the legacy allocator",
+				"leaving the conflicting mirror intact and allocating from the legacy allocator "+
+				"only when this bot has no counter evidence; operator diagnosis is required before activation",
 				zap.String("mirrorKey", ModeKey), zap.String("mirrorValue", mirror), zap.Error(err))
 			unauthorized = mirror
 		}

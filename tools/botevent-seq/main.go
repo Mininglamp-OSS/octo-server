@@ -3,8 +3,10 @@
 //
 // The authority is the `octo_bot_event_seq_state` row in MySQL, not the Redis key.
 // The Redis key is a mirror that lets the hot path check the mode inside the same Lua
-// script as the allocation; a lost mirror is rebuilt from this row by the allocator
-// itself. Writing only Redis would leave activation state in an instance running
+// script as the allocation. A lost mirror can eventually be rebuilt from this row by
+// an allocator after its negative belief expires, but publishing the mirror is still a
+// required cutover step: this command fails and writes must stay paused if that write
+// does not complete. Writing only Redis would leave activation state in an instance running
 // `appendonly no`, where an RDB rollback would silently drop every replica back to
 // the legacy allocator — whose lower ids land beneath live consumer cursors.
 //
@@ -37,6 +39,19 @@ import (
 	"github.com/spf13/viper"
 )
 
+const activationPreconditions = `activate preconditions this tool CANNOT check:
+  1. Mininglamp-OSS/octo-server#704 is closed, including an independently reviewed
+     cutover floor that cannot inherit a regressed legacy min_seq and land below a
+     cursor already held by a consumer. Merging or deploying #702 is not activation.
+  2. EVERY replica runs the post-#697 image. Activating while a pre-fix replica still
+     allocates from GenSeq puts two id sources on one queue, which is the bug (#697),
+     not the fix.
+  3. Bot-event writes are paused for a few seconds around the flip. This design has no
+     drain barrier (a robotEvent writer is INCR + ZADD with no transaction), so a
+     request that resolved legacy before the flip can otherwise publish a low id after it.
+
+`
+
 func main() {
 	configFile := flag.String("config", "configs/tsdd.yaml", "octo-server config file")
 	action := flag.String("action", "preflight", "preflight | activate")
@@ -59,19 +74,10 @@ func main() {
 	case "preflight":
 		preflight(ctx, client, *sample)
 	case "activate":
+		// -yes confirms these conditions; it must not hide them from the audit log.
+		fmt.Fprint(os.Stderr, activationPreconditions)
 		if !*yes {
-			fatal("activate requires -yes, and three preconditions this tool CANNOT check:\n" +
-				"  1. Mininglamp-OSS/octo-server#704 is closed. Counter-rollback detection is\n" +
-				"     currently tolerance-bounded and process-local, and both gaps are only\n" +
-				"     reachable AFTER activation. Merging #702 did not make activation safe.\n" +
-				"  2. EVERY replica runs the post-#697 image. Activating while a pre-fix replica\n" +
-				"     still allocates from GenSeq puts two id sources on one queue, which is the\n" +
-				"     bug (#697), not the fix.\n" +
-				"  3. Bot-event writes are paused for a few seconds around the flip. This design\n" +
-				"     deliberately has no drain barrier (a robotEvent writer is INCR + ZADD with no\n" +
-				"     transaction, so there is nothing to hold a lock until), so a request that has\n" +
-				"     already resolved `legacy` and not yet ZADDed will land a low id after the\n" +
-				"     flip. The pause is the only thing that closes that window.")
+			fatal("activate requires -yes after every precondition above has been verified")
 		}
 		activate(ctx, client, *floor, *sample)
 	default:
@@ -275,15 +281,18 @@ func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
 	}
 	if !flipped {
 		fmt.Printf("already activated at epoch %d; nothing to do\n", epoch)
-		// Still reconcile the mirror: an already-flipped authority with a stale or
-		// missing mirror is the state that makes every replica read the authority on
-		// every allocation until one of them rewrites the key.
-		writeMirror(client, epoch)
+		// Still reconcile the mirror. Failure is operationally incomplete even though
+		// the authority was already committed, so preserve the write pause and exit non-zero.
+		if err := writeMirror(client, epoch); err != nil {
+			fatal("%v", err)
+		}
 		return
 	}
-	// Mirror second: the authority is committed, and the allocator rebuilds the
-	// mirror on its own if this write fails.
-	writeMirror(client, epoch)
+	// Mirror second: the authority is committed. A failure here leaves cached negative
+	// beliefs able to use GenSeq temporarily, so it is not a successful activation.
+	if err := writeMirror(client, epoch); err != nil {
+		fatal("%v", err)
+	}
 	fmt.Printf("activated at epoch %d. Replicas switch on their next allocation.\n\n", epoch)
 	fmt.Printf("Verify now:\n")
 	fmt.Printf("  - no `botevent: seed event id counter` errors in logs (a failed seed refuses\n")
@@ -299,11 +308,6 @@ func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
 	fmt.Printf("the same loss, in reverse. Roll forward.\n")
 }
 
-// writeMirror publishes the generation-stamped mirror value.
-//
-// It must be the exact spelling the allocator validates (botevent.MirrorValue): a bare
-// `incr` is only a claim, and every replica would keep re-reading the authority until
-// somebody wrote the real value.
 // mirrorVerdict is what the pre-flip mirror check decided.
 type mirrorVerdict int
 
@@ -400,11 +404,21 @@ func refuseUnauthorizedMirror(ctx *config.Context, client *rd.Client) {
 	}
 }
 
-func writeMirror(client *rd.Client, epoch uint64) {
-	if err := client.Set(botevent.ModeKey, botevent.MirrorValue(epoch), 0).Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: authority is at epoch %d but the mirror write failed "+
-			"(%v). Allocators will rebuild it from the DB on their next allocation.\n", epoch, err)
+// writeMirror publishes the generation-stamped mirror value.
+//
+// It must be the exact spelling the allocator validates (botevent.MirrorValue): a bare
+// `incr` is only a claim. Failure is returned because the MySQL authority is already
+// activated at this point while replicas may retain a negative belief for a bounded
+// interval; callers must exit non-zero and keep bot-event writes paused.
+func writeMirror(client *rd.Client, epoch uint64) error {
+	want := botevent.MirrorValue(epoch)
+	if err := client.Set(botevent.ModeKey, want, 0).Err(); err != nil {
+		return fmt.Errorf("authority is already activated at epoch %d, but writing Redis mirror "+
+			"%s=%q failed: %w; replicas may retain a legacy belief for up to %s, so keep "+
+			"bot-event writes paused until %s exists with expected value %q",
+			epoch, botevent.ModeKey, want, err, botevent.NegativeBeliefTTL(), botevent.ModeKey, want)
 	}
+	return nil
 }
 
 func readMirror(ctx *config.Context) (string, error) {
