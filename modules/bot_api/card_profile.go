@@ -109,8 +109,16 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 	templating, capErr := ba.cardTemplates.CapabilityFor(
 		c.Request.Context(), ba.botCatalogPrincipalFor(c, robotID))
 	if capErr != nil {
+		// A typed 503 rather than a generic 500 (D6's "runtime DB unavailable →
+		// typed localized unavailable" row; review S7, yujiawei). The
+		// distinction is actionable: this is the one failure on this endpoint
+		// that is expected to clear on its own, and a producer doing feature
+		// detection at startup should back off and retry rather than treat the
+		// deployment as broken. ResponseErrorL still pins the wire status to
+		// 400 for D14 compatibility, so what the caller reads is the code ID
+		// plus error.http_status: 503.
 		ba.Error("解析 Bot 卡片能力清单失败", zap.Error(capErr), zap.String("robot", robotID))
-		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		httperr.ResponseErrorL(c, errcode.ErrCardTemplateCatalogUnavailable, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{

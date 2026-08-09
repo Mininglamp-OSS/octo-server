@@ -79,9 +79,18 @@ type SafeExport struct {
 	// Samples holds only the fixtures the manifest opted into exporting.
 	Samples map[string]json.RawMessage `json:"samples"`
 
-	// Hash is a deterministic digest of everything above. Static templates use
-	// it as their ETag; dynamic ones use their immutable content hash, which is
-	// stronger because it also covers the documents this projection omits.
+	// Hash is a deterministic digest of everything above, and it is the ETag
+	// for static and dynamic templates alike.
+	//
+	// An earlier draft had dynamic templates validate on their immutable
+	// content_sha256 instead, on the argument that it is stronger because it
+	// also covers the documents this projection omits. That is true and it is
+	// the wrong property for a validator: covering bytes the response does not
+	// contain means two artifacts that project identically get different ETags,
+	// so a cache revalidates responses that are byte-for-byte the same. The
+	// validator has to describe the bytes being written, which is exactly what
+	// this digest does (review S6, yujiawei — the code was already right and
+	// three texts described the draft).
 	Hash string `json:"-"`
 }
 

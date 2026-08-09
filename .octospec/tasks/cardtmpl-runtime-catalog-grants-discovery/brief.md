@@ -248,9 +248,14 @@ grant/activation/block 强一致读继续走 primary DB。v1 不引入 Redis 或
   `/v1/bot/card/profile` 为权威，不允许拿 B1/B2 绕过 bot grant。
 - unauthorized/nonexistent/blocked 对普通 B2 返回同一个 localized not-found envelope；
   manager API 保留诊断视角。
-- dynamic ETag 使用 immutable `content_sha256`；static 使用 deterministic export hash；
-  支持 `If-None-Match`/304。private 响应至少 `Cache-Control: private, no-cache`；响应
-  projection 有 2 MiB hard cap。
+- B2 ETag 统一使用 projection 的 deterministic export hash —— dynamic 与 static 同源。
+  早期草案让 dynamic 用 immutable `content_sha256`，理由是它更强（还覆盖 projection 省略
+  的文档）；那恰恰是 validator 不该有的性质：覆盖了响应体不含的字节，两个 projection 完全
+  相同的 artifact 就会拿到不同 ETag，缓存被迫重验一份逐字节相同的响应。validator 必须描述
+  被写出的字节。支持 `If-None-Match`/304。private 响应至少 `Cache-Control: private,
+  no-cache`；响应 projection 有 2 MiB hard cap。
+  （`card_template_artifact.content_sha256` 仍被 discovery 行加载并由 pilot 集成测试断言
+  往返一致 —— 它是 artifact 不可变性的 schema 守卫，不是 ETag 来源。）
 - B1 visibility/block/grant 必须在 pagination limit 与 `has_more` 计算前完成；cursor 只从最后
   一个已返回的 visible row 推进，不得让 hidden/blocked row 改变 cursor、count 或空页形状。
   cursor 至少绑定 source + template exact + Space/visibility context，跨 Space 重放 fail-close。

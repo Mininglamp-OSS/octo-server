@@ -368,13 +368,56 @@ func TestStaticPageShowsPublicAndGrantedPrivateOnly(t *testing.T) {
 	}
 	// A display-only card reports action_contract:null; a card with a callback
 	// reports the routing pair. That null is the §9 promise, so it is asserted
-	// on the decoded item rather than inferred from the struct.
-	if seen["docs.granted"].ActionContract != nil {
-		t.Fatalf("private fixture unexpectedly carried a contract: %+v", seen["docs.granted"])
+	// on the raw JSON rather than inferred from the struct — a static row is
+	// never in the third, "not loaded" state, and asserting non-nil-ness would
+	// no longer tell the two apart.
+	if got := string(seen["docs.granted"].ActionContract); got != "null" {
+		t.Fatalf("display-only static row action_contract = %q, want the explicit null §9 promises", got)
 	}
-	contract := seen["docs.open"].ActionContract
-	if contract == nil || contract.Owner != "docs" || contract.ActionType != "access_request.decision" {
+	var contract discoveryActionContract
+	if err := json.Unmarshal(seen["docs.open"].ActionContract, &contract); err != nil {
+		t.Fatalf("public row action_contract = %q: %v", seen["docs.open"].ActionContract, err)
+	}
+	if contract.Owner != "docs" || contract.ActionType != "access_request.decision" {
 		t.Fatalf("public row action_contract = %+v", contract)
+	}
+}
+
+// TestDynamicRowOmitsTheContractItNeverLoaded is the S5 regression (yujiawei).
+//
+// action_contract has three states and B1 must keep them apart: an object, an
+// explicit null meaning "no callback will ever arrive" (platform-card-base §9),
+// and an absent key meaning "B1 did not load this — ask B2". A dynamic row is
+// the third: its contract lives in the compiled projection, and B1 deliberately
+// does not compile rows.
+//
+// While the field was a *discoveryActionContract there was no third state, so a
+// dynamic row serialized as null and made the §9 promise on a template whose
+// contract had simply not been read. The assertion is on the raw body because
+// that collapse is invisible after decoding — both states decode to a nil
+// pointer.
+func TestDynamicRowOmitsTheContractItNeverLoaded(t *testing.T) {
+	store := &fakeDiscoveryStore{rows: []DiscoveryRow{dynamicRow("pilot.one", "1.0.0", true)}}
+	c, recorder := newDiscoveryRequest(t, "/v1/message/card/templates", "space-1", nil)
+	discoveryAPI(store).listTemplates(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("list = HTTP %d, %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "action_contract") {
+		t.Fatalf("a dynamic row carried action_contract, promising something B1 never read: %s",
+			recorder.Body.String())
+	}
+
+	// And prove the omission is specific to not-loaded rows rather than the key
+	// having been dropped outright — a static display-only row in the same
+	// response shape still carries its explicit null.
+	staticAPI := staticDiscoveryAPI(&fakeDiscoveryStore{},
+		staticEntry("docs.displayonly", "1.0.0", cardtmpl.CatalogVisibilityPublic, true))
+	staticC, staticRecorder := newDiscoveryRequest(t, "/v1/message/card/templates", "space-1", nil)
+	staticAPI.listTemplates(staticC)
+	if !strings.Contains(staticRecorder.Body.String(), `"action_contract"`) {
+		t.Fatalf("the static row lost its action_contract key entirely: %s", staticRecorder.Body.String())
 	}
 }
 

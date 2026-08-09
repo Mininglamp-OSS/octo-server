@@ -609,7 +609,7 @@ type CardUpdater interface {
 3. **不存在 / 无权见 / 已 block 返回同一个 localized not-found**。三者可区分等于给出私有目录的枚举 oracle。
 4. **samples 是 per-artifact opt-in**。只有 manifest 里 `export.samples` 显式列出、且确认是合成 fixture 的 sample 才会导出；templates、goldens、canonical bundle bytes、audit、grants、内部 DB ID 永不出现在 B2。static L1 manifest 已冻结、无法追加该声明，因此**现有 static 卡的 B2 samples 恒为空**——这是正确答案，不是缺口。
 
-分页与缓存：cursor 分页，默认 50 / 硬上限 100；visibility、block、grant 全部在**分页 limit 之前**结算（否则隐藏行会缩短页面，页长本身就成了计数 oracle）；cursor 绑定发放它的 Space，跨 Space 重放 fail-close 回到第一页。dynamic 用不可变 `content_sha256` 作 ETag、static 用确定性 export hash，支持 `If-None-Match`/304；private 响应至少 `Cache-Control: private, no-cache`。
+分页与缓存：cursor 分页，默认 50 / 硬上限 100；visibility、block、grant 全部在**分页 limit 之前**结算（否则隐藏行会缩短页面，页长本身就成了计数 oracle）；cursor 绑定发放它的 Space，跨 Space 重放 fail-close 回到第一页。dynamic 与 static 统一用 projection 的确定性 export hash 作 ETag（validator 必须描述被写出的字节；用 `content_sha256` 会让两个 projection 相同的 artifact 拿到不同 ETag，白白重验一份逐字节相同的响应），支持 `If-None-Match`/304；private 响应至少 `Cache-Control: private, no-cache`。
 
 ---
 

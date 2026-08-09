@@ -95,12 +95,19 @@ var ErrDiscoveryNotVisible = fmt.Errorf("card template is not discoverable")
 // grant, audit or storage state — only the contract surface a producer needs
 // to decide whether to look the template up in full.
 type DiscoveryRow struct {
-	ID               cardtmpl.ID
-	Version          string
-	Owner            string
-	Protocol         string
-	ContractVersion  string
-	Visibility       string
+	ID              cardtmpl.ID
+	Version         string
+	Owner           string
+	Protocol        string
+	ContractVersion string
+	Visibility      string
+	// ContentSHA256 is the artifact's immutable content hash. It is loaded but
+	// is deliberately NOT the B2 ETag — that validator has to describe the
+	// bytes actually written, which is the projection digest (see
+	// cardtmpl.SafeExport.Hash, and review S6). What it is for is the
+	// immutability guard: the pilot integration test asserts the stored row
+	// still hashes to the artifact it was published from, which is how a
+	// silently rewritten artifact would be caught.
 	ContentSHA256    string
 	ActiveForNewSend bool
 }

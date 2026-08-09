@@ -26,6 +26,9 @@ package bot_api
 //  4. Handler level, `reasoning_template_ref` is read out of the resolved
 //     manifest rather than the static policy — the invariant
 //     `botCardConfigResponse`'s doc comment claims and `6637b8a4` rewired.
+//  5. Handler level, an unreadable runtime answers D6's typed unavailable code
+//     rather than a generic internal error, so a producer backing off at
+//     startup can tell "retry shortly" from "this deployment is broken".
 //
 // Still NOT covered, deliberately, and it is the open half of P1-1: a Bot
 // granted send on a dynamic template whose ID is not `ai.reasoning-process` is
@@ -38,6 +41,7 @@ package bot_api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -47,6 +51,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 )
 
@@ -310,5 +315,50 @@ func TestBotCardProfileReasoningRefTracksTheResolvedManifest(t *testing.T) {
 					body.Templating.Templates)
 			}
 		})
+	}
+}
+
+// TestBotCardProfileReportsTheTypedUnavailableWhenTheRuntimeIsUnreadable is S7
+// (yujiawei): D6 specifies "runtime DB unavailable → typed localized
+// unavailable", and this handler answered the generic internal code.
+//
+// The distinction is not cosmetic on this endpoint in particular. Feature
+// detection runs at producer startup, and this is the one failure here that is
+// expected to clear on its own — a producer that reads "internal error" has no
+// reason to retry, while one that reads the catalog-unavailable code does.
+// Fail-closed is unchanged either way: both refuse to answer with the static
+// manifest, which is the part that would actually be unsafe.
+func TestBotCardProfileReportsTheTypedUnavailableWhenTheRuntimeIsUnreadable(t *testing.T) {
+	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
+		multiRows: map[string][]string{"bot-42": {"space-bot"}},
+	}, &stubAuthorizationSource{newSend: true, err: errors.New("catalog is down")})
+	ba.cardConfig = stubBotCardConfig{cfg: allBotCardSwitchesOn()}
+
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodGet, "/v1/bot/card/profile", nil)
+	ginContext.Set(CtxKeyRobotID, "bot-42")
+	ba.botCardProfile(&wkhttp.Context{Context: ginContext})
+
+	// Asserted through the message because a bare gin test context has no i18n
+	// middleware, so ResponseErrorL falls back to the legacy {msg,status} shape
+	// and error.code/error.http_status are not on the wire here. The two codes
+	// have distinct DefaultMessages, so this still pins which code was chosen —
+	// which is the whole of what S7 changes. The full envelope, including
+	// http_status: 503, is the i18n renderer's own contract and is tested there.
+	got := errorMessageOf(t, recorder.Body.Bytes())
+	if got == errcode.ErrSharedInternal.DefaultMessage {
+		t.Fatal("an unreadable runtime still answers the generic internal code; " +
+			"a producer cannot tell a transient catalog outage from a broken deployment")
+	}
+	if got != errcode.ErrCardTemplateCatalogUnavailable.DefaultMessage {
+		t.Fatalf("error = %q, want the typed catalog-unavailable code %q",
+			got, errcode.ErrCardTemplateCatalogUnavailable.DefaultMessage)
+	}
+	// And the code really does carry 503, which is the half a client acts on
+	// once the envelope is rendered in full.
+	if errcode.ErrCardTemplateCatalogUnavailable.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("the typed code is registered as HTTP %d, want 503",
+			errcode.ErrCardTemplateCatalogUnavailable.HTTPStatus)
 	}
 }

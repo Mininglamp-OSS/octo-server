@@ -106,11 +106,25 @@ type discoveryListItem struct {
 	Protocol        string `json:"protocol"`
 	ContractVersion string `json:"contract_version,omitempty"`
 	Visibility      string `json:"visibility"`
-	// ActionContract is null for a display-only card. That null is the
-	// platform-card-base §9 promise: it tells a producer no callback will ever
-	// arrive for this template, which "absent field" could not distinguish
-	// from "not populated yet".
-	ActionContract *discoveryActionContract `json:"action_contract"`
+	// ActionContract has three distinguishable states on the wire, and keeping
+	// them distinguishable is the whole point of the field:
+	//
+	//   - an object — this template declares a server callback contract;
+	//   - JSON null — a display-only card. That null is the platform-card-base
+	//     §9 promise: no callback will ever arrive for this template;
+	//   - the key absent — B1 did not load it, so ask B2.
+	//
+	// Dynamic rows are the third state. Their contract lives in the compiled
+	// projection, which a metadata listing deliberately does not compile —
+	// doing so would make one list page cost as much as N detail requests.
+	//
+	// This used to be a *discoveryActionContract, which collapsed the third
+	// state into the second: a dynamic row serialized as null and thereby
+	// promised "no callback will ever arrive" about a template whose contract
+	// had merely not been read (review S5, yujiawei). One page could carry that
+	// null beside a genuine one — one field, two contradictory meanings, in one
+	// response.
+	ActionContract json.RawMessage `json:"action_contract,omitempty"`
 	// ActiveForNewSend reports that this exact version is what the activation
 	// pointer resolves to. It is emphatically not a statement that the caller
 	// may send it — send authorization lives behind the Bot profile.
@@ -315,13 +329,29 @@ func staticListItem(entry cardtmpl.StaticCatalogEntry) discoveryListItem {
 		// resolves to.
 		ActiveForNewSend: entry.IsDefault,
 	}
-	if entry.ActionContract != nil {
-		item.ActionContract = &discoveryActionContract{
-			Owner: entry.ActionContract.Owner, ActionType: entry.ActionContract.ActionType,
-		}
+	// A static entry carries its contract inline, so this row is never in the
+	// "not loaded" state: it is an object or an explicit null.
+	if entry.ActionContract == nil {
+		item.ActionContract = jsonNull
+		return item
 	}
+	raw, err := json.Marshal(discoveryActionContract{
+		Owner: entry.ActionContract.Owner, ActionType: entry.ActionContract.ActionType,
+	})
+	if err != nil {
+		// Two strings cannot fail to marshal, but if that ever changed, leaving
+		// the key absent sends the caller to B2. Falling back to null would
+		// instead assert "display-only" about a template that declares a
+		// contract — the one answer worse than not answering.
+		return item
+	}
+	item.ActionContract = raw
 	return item
 }
+
+// jsonNull is the explicit null a display-only static row carries, as opposed
+// to the absent key a not-yet-loaded contract carries.
+var jsonNull = json.RawMessage("null")
 
 func dynamicListItem(row DiscoveryRow) discoveryListItem {
 	return discoveryListItem{
