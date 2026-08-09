@@ -137,6 +137,8 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - Other deployments keep the backward-compatible default
   `login.scan_enabled=true` while clients adopt `scan_login_enabled`, `disabled`,
   and `poll_secret`.
-- Roll back operationally by restoring `login.scan_enabled=true`; no schema
-  migration is required. Code rollback is safe because the default remains the
-  historical enabled behavior.
+- Rollback requires no schema migration. Deployments that intentionally use scan
+  login can restore `login.scan_enabled=true` when reverting this behavior. The
+  OIDC-only production deployment must keep the setting `false`; before rolling
+  back to an older binary that ignores the key, block scan-login routes at the
+  ingress so rollback does not re-expose the historical enabled behavior.
