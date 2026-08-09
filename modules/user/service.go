@@ -19,6 +19,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// ErrorUserNotExist 是「用户不存在」的哨兵错误。GetUserDetail 命中空行时返回它，
+// 供调用方用 errors.Is 与「真实查询故障」区分（真实故障不可降级为 not-found，见
+// webhook_identity 的 (nil,nil)/(nil,err) 语义）：channelGet 的数据源据此把不存在的
+// 用户交还链路，最终走统一的 not_found 响应，而非旧的 raw error。
 var ErrorUserNotExist = errors.New("用户不存在！")
 
 // IService 用户服务接口
@@ -417,6 +421,7 @@ func (s *Service) GetAllUsers() ([]*Resp, error) {
 	}
 	return list, nil
 }
+
 func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, error) {
 	model, err := s.db.QueryDetailByUID(uid, loginUID)
 	if err != nil {
@@ -424,7 +429,7 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 		return nil, err
 	}
 	if model == nil {
-		return nil, errors.New("用户信息不存在！")
+		return nil, ErrorUserNotExist
 	}
 	onlineM, err := s.onlineDB.queryLastOnlineDeviceWithUID(uid)
 	if err != nil {

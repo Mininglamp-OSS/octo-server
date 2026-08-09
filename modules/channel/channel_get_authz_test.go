@@ -1,0 +1,370 @@
+package channel
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/model"
+	"github.com/Mininglamp-OSS/octo-lib/server"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-redis/redis"
+	"github.com/stretchr/testify/assert"
+)
+
+// channel_get_authz_test.go —— GET /v1/channels/:channel_id/:channel_type 的对象级
+// 授权矩阵（task channel-get-object-authz）。该端点历史上无任何鉴权：任意登录用户
+// 替换 channel_id 即可读取无权访问的频道详情。
+
+// resetChannelUIDRateLimit 清掉 SharedUIDRateLimiter 为本测试用户建的 per-uid 桶。
+// channelGet 现挂了 SharedUIDRateLimiter，桶持久且不被 CleanAllTables 清除，
+// 连续用例会累积把 loginUID 限流掉——须在每个用例 setup 时显式重置。
+//
+// 只删 testutil.UID 这一个 key：限流器是进程级单例、共享同一 Redis keyspace，而
+// testutil.UID 跨包通用；用 KEYS ratelimit:uid:* + DEL 全量会删掉并发运行的其它包的
+// 桶（KEYS 本身也是 O(keyspace) 阻塞命令）。
+func resetChannelUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rds := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rds.Close()
+	_ = rds.Del("ratelimit:uid:" + testutil.UID).Err()
+}
+
+func newChannelAuthzServer(t *testing.T) (*server.Server, *config.Context) {
+	t.Helper()
+	s, ctx := testutil.NewTestServer()
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+	// 不注入 renderer 时错误信封拿不到 error.code；forbidden/not_found 断言依赖它。
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	resetChannelUIDRateLimit(t, ctx)
+	// 登录用户
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{UID: testutil.UID, Name: "login-user", ShortNo: "SNLOGIN"}))
+	return s, ctx
+}
+
+func seedGroup(t *testing.T, ctx *config.Context, groupNo, name, notice, creator string) {
+	seedGroupStatus(t, ctx, groupNo, name, notice, creator, 1) // 1 = GroupStatusNormal
+}
+
+// seedGroupStatus 建群并显式指定 group.status（1=正常, 2=已解散）。
+func seedGroupStatus(t *testing.T, ctx *config.Context, groupNo, name, notice, creator string, status int) {
+	t.Helper()
+	// 反引号：group 是 MySQL 保留字（见 dbr 表名反引号约定）。
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, notice, creator, status, version) VALUES (?,?,?,?,?,1)",
+		groupNo, name, notice, creator, status,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+func seedMember(t *testing.T, ctx *config.Context, groupNo, uid string, role int) {
+	seedMemberDeleted(t, ctx, groupNo, uid, role, 0)
+}
+
+// seedMemberDeleted 建群成员并显式指定 is_deleted（1 = 已退群/已移除，行仍保留）。
+func seedMemberDeleted(t *testing.T, ctx *config.Context, groupNo, uid string, role, isDeleted int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, status, version, vercode, is_deleted) VALUES (?,?,?,1,1,?,?)",
+		groupNo, uid, role, fmt.Sprintf("vc-%s-%s", groupNo, uid), isDeleted,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+// seedSpaceMember 把 uid 加入某 Space（status=1 在籍）。GetCommonSpaceID 只查
+// space_member，不需要 space 表行。
+func seedSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, version) VALUES (?,?,0,1,1)",
+		spaceID, uid,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+// setUserCategory 把用户标记为系统/客服账号（AddUserReq 没有 Category 字段）。
+func setUserCategory(t *testing.T, ctx *config.Context, uid, category string) {
+	t.Helper()
+	_, err := ctx.DB().UpdateBySql("UPDATE `user` SET category=? WHERE uid=?", category, uid).Exec()
+	assert.NoError(t, err)
+}
+
+func getChannel(s *server.Server, channelID string, channelType uint8) *httptest.ResponseRecorder {
+	return getChannelWithSpace(s, channelID, channelType, "")
+}
+
+// getChannelWithSpace 允许指定（或省略）X-Space-Id，用于验证 Space 头不是授权输入。
+func getChannelWithSpace(s *server.Server, channelID string, channelType uint8, spaceID string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", fmt.Sprintf("/v1/channels/%s/%d", channelID, channelType), nil)
+	req.Header.Set("token", testutil.Token)
+	if spaceID != "" {
+		req.Header.Set("X-Space-Id", spaceID)
+	}
+	s.GetRoute().ServeHTTP(w, req)
+	return w
+}
+
+// GROUP 非成员：不再回群详情，返回 view_forbidden，且不泄露群名/公告。
+func TestChannelGet_Group_NonMember_Forbidden(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	seedGroup(t, ctx, "g_authz_nm", "SECRET_GROUP_NAME", "SECRET_NOTICE", "creator_x")
+	seedMember(t, ctx, "g_authz_nm", "creator_x", 1) // 仅 creator_x，loginUID 非成员
+
+	w := getChannel(s, "g_authz_nm", common.ChannelTypeGroup.Uint8())
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String()) // D14 兼容期固定 400
+	assert.Contains(t, w.Body.String(), "err.server.group.view_forbidden", "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "SECRET_GROUP_NAME", "非成员不得读到群名")
+	assert.NotContains(t, w.Body.String(), "SECRET_NOTICE", "非成员不得读到群公告")
+}
+
+// GROUP 成员：正常返回群详情。
+func TestChannelGet_Group_Member_OK(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	seedGroup(t, ctx, "g_authz_m", "MEMBER_GROUP_NAME", "", "creator_x")
+	seedMember(t, ctx, "g_authz_m", "creator_x", 1)
+	seedMember(t, ctx, "g_authz_m", testutil.UID, 0) // loginUID 是成员
+
+	w := getChannel(s, "g_authz_m", common.ChannelTypeGroup.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "MEMBER_GROUP_NAME")
+}
+
+// GROUP 不存在：不再 500（nil-panic 修复），且与非成员统一为 forbidden（不泄露存在性）。
+func TestChannelGet_Group_NotFound_NoPanicUnified(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	w := getChannel(s, "g_does_not_exist", common.ChannelTypeGroup.Uint8())
+
+	assert.NotEqual(t, http.StatusInternalServerError, w.Code, "群不存在不应再 panic 成 500, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.view_forbidden",
+		"不存在与非成员应返回同一 forbidden 响应, body=%s", w.Body.String())
+}
+
+// PERSON 无关系：只回最小集（name/logo/robot），不下发 short_no 等身份细节。
+func TestChannelGet_Person_NoRelation_Minimal(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_stranger", Name: "StrangerName", ShortNo: "SNSTRANGER",
+	}))
+
+	w := getChannel(s, "t_stranger", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "StrangerName", "最小集仍需返回 name 供发送者渲染")
+	assert.NotContains(t, w.Body.String(), "short_no", "无关系不得下发 short_no")
+	assert.NotContains(t, w.Body.String(), "SNSTRANGER", "无关系不得下发短号值")
+	// 最小集是专用 DTO：零值字段也不得出现（follow:0 会被客户端误判为"明确非好友"）。
+	assert.NotContains(t, w.Body.String(), "\"follow\"", "最小集不得含 follow 字段, body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "\"status\"", "最小集不得含 status 字段")
+	assert.NotContains(t, w.Body.String(), "\"extra\"", "最小集不得含 extra 字段")
+	assert.NotContains(t, w.Body.String(), "\"device_flag\"", "最小集不得含 device_flag 字段")
+}
+
+// PERSON 仅共同群（非好友、无共同 Space）：视为可见，返回完整资料（含 short_no）。
+// 覆盖 Acceptance「外部群跨 Space 非好友成员 name/logo 仍可渲染」。
+func TestChannelGet_Person_CommonGroupOnly_Full(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_cofellow", Name: "CoGroupMate", ShortNo: "SNCOFELLOW",
+	}))
+	// 两人同属一群，但不是好友、无共同 Space。
+	seedGroup(t, ctx, "g_common", "co-group", "", testutil.UID)
+	seedMember(t, ctx, "g_common", testutil.UID, 1)
+	seedMember(t, ctx, "g_common", "t_cofellow", 0)
+
+	w := getChannel(s, "t_cofellow", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "CoGroupMate")
+	assert.Contains(t, w.Body.String(), "short_no", "共同群可达应返回完整资料（含 extra）")
+}
+
+// PERSON Bot：即使调用方未加好友也可查看 bot 资料（不降级）。
+func TestChannelGet_Person_Bot_Viewable(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_bot", Name: "SomeBot", ShortNo: "SNBOT", Robot: 1,
+	}))
+
+	w := getChannel(s, "t_bot", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "SomeBot")
+	assert.Contains(t, w.Body.String(), "short_no", "bot 资料应完整可查，不被降级为最小集")
+}
+
+// PERSON 真实不存在用户：走统一 i18n not_found，不再是旧 raw error，也不 500。
+func TestChannelGet_Person_NotExist_NotFound(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	// 不建该用户。
+	w := getChannel(s, "no_such_user_zzz", common.ChannelTypePerson.Uint8())
+
+	assert.NotEqual(t, http.StatusInternalServerError, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.user.not_found",
+		"不存在用户应走统一 not_found i18n 信封, body=%s", w.Body.String())
+}
+
+// PERSON 仅共同「已解散」群：不构成有效共同群关系，降级最小集（P1-1 修复）。
+func TestChannelGet_Person_CommonGroupDisbanded_Minimal(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_disband", Name: "DisbandMate", ShortNo: "SNDISBAND",
+	}))
+	// 唯一共同群已解散（status=2）；成员行仍在（disband 只改群状态、成员异步清理）。
+	seedGroupStatus(t, ctx, "g_disband", "dg", "", testutil.UID, 2)
+	seedMember(t, ctx, "g_disband", testutil.UID, 1)
+	seedMember(t, ctx, "g_disband", "t_disband", 0)
+
+	w := getChannel(s, "t_disband", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "DisbandMate")
+	assert.NotContains(t, w.Body.String(), "short_no", "已解散群不构成共同群关系，应降级为最小集")
+	assert.NotContains(t, w.Body.String(), "SNDISBAND")
+}
+
+// GROUP 已退群成员（group_member 行仍在，is_deleted=1）：不得再读群详情。
+// 这是线上复现用的退群闭环场景——修复前 groups/{gno} 返回 403 而 channels/{gno}/2
+// 仍返回 200 + 完整详情（响应里 quit:1 已表明服务端知道调用方退群了）。
+func TestChannelGet_Group_LeftMember_Forbidden(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	seedGroup(t, ctx, "g_left", "LEFT_GROUP_NAME", "LEFT_NOTICE", "creator_x")
+	seedMember(t, ctx, "g_left", "creator_x", 1)
+	seedMemberDeleted(t, ctx, "g_left", testutil.UID, 0, 1) // 已退群
+
+	w := getChannel(s, "g_left", common.ChannelTypeGroup.Uint8())
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.view_forbidden", "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "LEFT_GROUP_NAME", "退群后不得再读到群名")
+	assert.NotContains(t, w.Body.String(), "LEFT_NOTICE", "退群后不得再读到群公告")
+	// quit 标记也不该出现——整个详情都不下发，而不是"带 quit:1 的详情"。
+	assert.NotContains(t, w.Body.String(), "\"quit\"", "退群后不得下发任何群详情字段")
+}
+
+// PERSON 跨 Space（双方各在不同 Space、非好友、无共同群）：只回最小集；
+// 且 X-Space-Id 缺失 / 伪造 / 指向自己的 Space 结果完全一致——证明 Space 头不是授权输入。
+func TestChannelGet_Person_CrossSpace_Minimal_SpaceHeaderIrrelevant(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_otherspace", Name: "OtherSpaceUser", ShortNo: "SNOTHERSP",
+	}))
+	seedSpaceMember(t, ctx, "space_a", testutil.UID)   // 调用方在 A
+	seedSpaceMember(t, ctx, "space_b", "t_otherspace") // 目标在 B
+
+	for _, spaceHeader := range []string{"", "space_a", "space_b", "bogus_space_xyz"} {
+		name := spaceHeader
+		if name == "" {
+			name = "(无头)"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetChannelUIDRateLimit(t, ctx)
+			w := getChannelWithSpace(s, "t_otherspace", common.ChannelTypePerson.Uint8(), spaceHeader)
+
+			assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "OtherSpaceUser", "最小集仍需回 name")
+			assert.NotContains(t, w.Body.String(), "short_no", "跨 Space 不得下发 short_no（Space 头无论如何都不能提权）")
+			assert.NotContains(t, w.Body.String(), "SNOTHERSP")
+			assert.NotContains(t, w.Body.String(), "\"extra\"")
+		})
+	}
+}
+
+// PERSON 同 Space（无好友关系）：可直接聊天，故资料完整可见——锁住"同 Space 即可达"，
+// 防止把跨 Space 的收紧误伤成同 Space 也降级。
+func TestChannelGet_Person_SameSpace_Full(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_samespace", Name: "SameSpaceUser", ShortNo: "SNSAMESP",
+	}))
+	seedSpaceMember(t, ctx, "space_a", testutil.UID)
+	seedSpaceMember(t, ctx, "space_a", "t_samespace")
+
+	w := getChannel(s, "t_samespace", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "SameSpaceUser")
+	assert.Contains(t, w.Body.String(), "short_no", "同 Space 可直接聊天，资料应完整下发")
+}
+
+// PERSON 系统账号：无需任何关系即可查看（category=system / customerService）。
+func TestChannelGet_Person_SystemAccount_Viewable(t *testing.T) {
+	s, ctx := newChannelAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, user.NewService(ctx).AddUser(&user.AddUserReq{
+		UID: "t_sysacct", Name: "SystemAccount", ShortNo: "SNSYSACCT",
+	}))
+	setUserCategory(t, ctx, "t_sysacct", user.CategorySystem)
+
+	w := getChannel(s, "t_sysacct", common.ChannelTypePerson.Uint8())
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "SystemAccount")
+	assert.Contains(t, w.Body.String(), "short_no", "系统账号资料应完整可查，不被降级为最小集")
+}
+
+// 最小集的 JSON 线上形状（判定与构造已收口到 modules/channel/service，纯逻辑分支在
+// 那里的 profile_visibility_test.go 里锁；这里只钉序列化后的字段集合）。
+func TestMinimalChannelResp_JSONShape(t *testing.T) {
+	full := &model.ChannelResp{}
+	full.Channel.ChannelID = "u1"
+	full.Channel.ChannelType = common.ChannelTypePerson.Uint8()
+	full.Name = "N"
+	full.Logo = "users/u1/avatar"
+	full.Follow = 1
+	full.Status = 2
+	full.Notice = "secret-notice"
+	full.Extra = map[string]interface{}{"short_no": "SNX"}
+
+	b, err := json.Marshal(chservice.NewMinimalChannelResp(full))
+	assert.NoError(t, err)
+
+	var m map[string]json.RawMessage
+	assert.NoError(t, json.Unmarshal(b, &m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	assert.Equal(t, []string{"channel", "logo", "name", "robot"}, keys,
+		"最小集只能有这四个顶层字段, got=%s", string(b))
+	for _, leaked := range []string{"short_no", "SNX", "follow", "status", "notice", "extra"} {
+		assert.NotContains(t, string(b), leaked)
+	}
+}

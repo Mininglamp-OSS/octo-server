@@ -21,6 +21,31 @@ const pinnedMaxPerSpace = 7
 // GroupMemberCheckFunc 检查用户是否为群成员的函数类型
 type GroupMemberCheckFunc func(groupNo string, uid string) (bool, error)
 
+// CommonGroupCheckFunc 检查两个用户是否至少同属一个未解散的群。
+// 由 group 模块在 init 阶段注册（modules/user 不能 import modules/group——反向依赖，
+// group/1module.go 引用 user），同 GroupMemberCheckFunc 的注入方向。
+type CommonGroupCheckFunc func(uidA string, uidB string) (bool, error)
+
+var (
+	commonGroupCheckerMu sync.RWMutex
+	commonGroupChecker   CommonGroupCheckFunc
+)
+
+// RegisterCommonGroupChecker 注册共同群检查函数（供 group 模块调用）。
+func RegisterCommonGroupChecker(fn CommonGroupCheckFunc) {
+	commonGroupCheckerMu.Lock()
+	commonGroupChecker = fn
+	commonGroupCheckerMu.Unlock()
+}
+
+// getCommonGroupChecker 返回已注册的共同群检查函数；未注册返回 nil，调用方据此
+// fail closed（资料降级为最小集），不得因依赖缺失而放开完整资料。
+func getCommonGroupChecker() CommonGroupCheckFunc {
+	commonGroupCheckerMu.RLock()
+	defer commonGroupCheckerMu.RUnlock()
+	return commonGroupChecker
+}
+
 var (
 	groupMemberCheckerMu sync.RWMutex
 	groupMemberChecker   GroupMemberCheckFunc

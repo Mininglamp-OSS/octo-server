@@ -27,6 +27,40 @@ change-log convention (§7). Newest first.
   clients must tolerate the committed-write/error-response branch without
   reopening an authentication credential.
 
+## 2026-08-09 (channel-get-object-authz)
+
+- **Task** — `channel-get-object-authz`: `GET /v1/channels/:channel_id/:channel_type`
+  (`channelGet`) had no object-level authorization — `loginUID` was a render
+  param, never an authz subject, so any authenticated caller could swap
+  `channel_id` and read group detail (name/notice/member count/`space_id`) of
+  groups they'd left or never joined, sub-channel metadata with no parent
+  membership check, and any user's `short_no`/device flags/realname. Added
+  per-type gating: GROUP/COMMUNITY_TOPIC require (parent) membership
+  (non-member + missing → one `ErrGroupViewForbidden`, no existence oracle);
+  PERSON is relationship-graded (self/friend/same-Space/common-group/bot/system/
+  webhook → full; unrelated → a minimal whitelist DTO, *not* a 403, since this
+  is the sole datasource for rendering arbitrary message senders). Mounted
+  `SharedUIDRateLimiter`; fixed a missing-group nil-panic (500 empty body) that
+  was itself an existence oracle. Traps: display-layer datasources are not an
+  authz layer; a `group_member` row outlives a disbanded group (async cleanup)
+  so `ExistCommonGroup` must `JOIN group` and exclude dissolved ones; a datasource
+  error had stranded the handler's not-found branch (fixed via the
+  `ErrorUserNotExist` sentinel → `ErrDatasourceNotProcess`); a minimal response
+  needs its own DTO because `model.ChannelResp` has no `omitempty`. Origin: an
+  internal security review (object-level read). `GET /v1/users/:uid` is the same
+  root cause through a second door and is fixed in the same change: the decision
+  now lives in `modules/channel/service` (dependency-free leaf that
+  `modules/user` already imports) so the two endpoints cannot drift, with the
+  common-group lookup injected via a registration hook because `modules/user`
+  cannot import `modules/group`. The profile endpoint's minimal set keeps
+  `follow` (the add-friend entry needs it) where the channel one omits it.
+  Review follow-ups: a public brief must not point at an unpatched sibling
+  (fixed by landing both); `status = Normal` was too strict — admin-disabled
+  groups are live everywhere else in the module, so the check is
+  `<> GroupStatusDisband`; existence checks use `SELECT 1 ... LIMIT 1`. See
+  [journal](journal/shared/channel-get-object-authz.md);
+  learning [membership-row-outlives-its-parent](learnings/pending/membership-row-outlives-its-parent.md).
+
 ## 2026-08-07 (reminder-sync-membership-scope)
 
 - **Task** — `reminder-sync-membership-scope`: `POST /v1/message/reminder/sync`

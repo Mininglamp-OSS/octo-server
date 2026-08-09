@@ -81,6 +81,10 @@ type IService interface {
 	GetMemberTotalAndOnlineCount(groupNo string) (int, int, error)
 	// 是否存在群成员
 	ExistMember(groupNo string, uid string) (bool, error)
+	// ExistCommonGroup 判定两个用户是否至少同属一个未解散的群。用于单聊频道详情与
+	// 用户资料的关系可见性判定（外部群跨 Space 非好友成员仅靠共同群可达）。
+	// 命名与 db 层同名，保持两层一致（同 ExistMember / ExistMemberActive）。
+	ExistCommonGroup(uidA string, uidB string) (bool, error)
 	// ExistMemberActive 是否存在「活跃」群成员（is_deleted=0 AND status=Normal，
 	// 白名单语义、fail-closed），排除被拉黑成员。供绕过 IM 直查本地分表的读/发门禁，
 	// 以及子区(CommunityTopic)解析父群后的读/写门禁使用，防止被拉黑用户越权读子区内容。
@@ -606,6 +610,11 @@ func (s *Service) GetMemberTotalAndOnlineCount(groupNo string) (int, int, error)
 
 func (s *Service) ExistMember(groupNo string, uid string) (bool, error) {
 	return s.db.ExistMember(uid, groupNo)
+}
+
+// ExistCommonGroup 判定两个用户是否至少同属一个未解散的群。
+func (s *Service) ExistCommonGroup(uidA string, uidB string) (bool, error) {
+	return s.db.ExistCommonGroup(uidA, uidB)
 }
 
 // ExistMemberActive 是 ExistMember 的白名单（fail closed）变体：除 is_deleted=0 外还

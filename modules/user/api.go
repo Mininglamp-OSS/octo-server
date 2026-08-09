@@ -19,6 +19,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
@@ -1239,12 +1240,40 @@ func (u *User) get(c *wkhttp.Context) {
 
 	userDetailResp, err := u.userService.GetUserDetail(uid, loginUID)
 	if err != nil {
+		// 目标不存在与查询故障必须分开：前者是稳定的 not_found（不能报"查询失败"误导
+		// 客户端重试），后者才是 5xx 语义的查询故障。
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
 		u.Error("获取用户详情失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userDetailResp == nil {
 		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+
+	// 对象级授权：无可见关系时降级为最小资料集，不再仅凭目标 UID 返回完整身份。
+	// 判定与 /v1/channels/:id/:type 共用 channel/service，两端口径不会漂移。
+	// 与 channelGet 最小集的差异：这里**保留** follow —— 资料页要靠它渲染加好友入口，
+	// 省略会让"陌生人可加好友"这个正常入口消失（channelGet 是发送者渲染，不需要）。
+	visible, err := chservice.PersonProfileVisible(chservice.PersonProfileInput{
+		LoginUID:          loginUID,
+		PeerUID:           uid,
+		SyntheticIdentity: strings.HasPrefix(uid, webhookUIDPrefix),
+		SystemAccount:     userDetailResp.Category == CategorySystem || userDetailResp.Category == CategoryCustomerService,
+		Robot:             userDetailResp.Robot == 1,
+		Followed:          userDetailResp.Follow == 1,
+	}, chservice.CommonGroupChecker(getCommonGroupChecker()))
+	if err != nil {
+		u.Error("查询用户资料可见关系失败", zap.Error(err), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if !visible {
+		c.Response(newMinimalUserDetailResp(userDetailResp))
 		return
 	}
 	// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染（#335）；
