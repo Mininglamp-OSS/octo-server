@@ -24,6 +24,12 @@ contract:
   Writers issue finite credentials, preserve the existing deadline on reuse or
   profile updates, compensate failed new issuance, and never recreate a bearer
   deleted by a concurrent replica.
+- Added a per-issue ownership marker inside the versioned Token payload. Reuse
+  atomically removes that marker on the existing single Token key, while failed
+  issuance compensation compare-deletes only the still-owned payload. A stalled
+  replica therefore cannot revoke the same Token after another replica has
+  successfully adopted it; no process lock, extra Redis key, or auth-hot-path
+  write was introduced.
 - Replaced split `GET`/TTL assumptions with one single-key Lua read. API replicas
   execute the real read script as a read-only startup probe and refuse to serve
   if the configured Redis path cannot execute it.
@@ -60,8 +66,9 @@ Redis pool whose capacity must be budgeted across replicas.
 - `go test . ./pkg/auth ./pkg/metrics -count=1` — pass.
 - Focused `modules/user` writer, login, Redis, and HTTP TTL tests — pass.
 - `make i18n-extract-check` and `make i18n-lint` — pass.
-- `pkg/auth` race and coverage checks were run during implementation; auth
-  coverage was above the task threshold.
+- Two independent Redis clients/Session Stores reproduce the issue-adopt-fail
+  ordering and prove compensation preserves the adopted Token and device index.
+- `go test -race -count=1 ./pkg/auth/...` — pass; auth coverage 87.2%.
 
 A broad user-package regex initially selected an unrelated scan-login test and
 hit the shared MySQL migration drift (`group` table already present without the
@@ -77,6 +84,10 @@ The shared database was not cleaned or modified to hide that environment issue.
   write on every request. Before rollout, verify `EVALSHA`/`EVAL` through the
   production endpoint and budget Session Store `PoolSize x replica count`
   against Redis `maxclients`.
+- A Token string or payload equality is not sufficient issue-attempt ownership:
+  Web/PC login intentionally reuses the same Token. Ownership must be represented
+  in shared Redis state and removed atomically when another request adopts it;
+  compensation then uses exact compare-delete rather than unconditional `DEL`.
 - Web/PC explicit login currently reuses the bearer without extending its
   deadline. Product approval is required because a near-expiry bearer can still
   expire shortly after a successful login.
