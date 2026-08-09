@@ -670,3 +670,37 @@ counter 被同一次 Redis 恢复一起丢失」。因此激活验证完成后�
 `modules/robot`、`modules/bot_api`、`modules/group`、`modules/message` 均以
 `-race -shuffle=on` 通过（模块包按 CI 方式逐包重建 MySQL test 库并清 Redis）；另通过
 `go build ./...`、`go vet ./...`、i18n extract/lint 与 `git diff --check`。
+
+## 第九轮实现记录（head `d96efa38` 后续复核，2026-08-09）
+
+本轮先为七个可复现缺口提交 RED checkpoint（`795675f0`），逐项确认失败来自目标逻辑，
+再提交生产修复（`2c3a0d18`）：
+
+1. **已验证的正向 belief 丢失 cutover floor。** floor 现在与 `activated` / `epoch` 一起保存在
+   不可变 belief 中，后续 per-bot seed 直接使用同一次权威读取验证过的值；不会再单独重读状态行
+   并把读取失败折成 0。`TestValidatedBeliefRetainsTheCutoverFloor` 覆盖权威行随后不可读的形状。
+2. **一次 seed 做两次同表 MySQL 查询。** legacy ceiling 与 durable high-water 合并成一条带
+   deadline 的条件聚合查询；mirror 丢失导致全进程 seed 失效时，每个活跃 bot 只产生一次 DB
+   往返。既有 I/O-shape guard 与真实行值集成测试同时覆盖。
+3. **preflight 对单队列做 `ZRANGE 0 -1` 并保留 score-sized map。** 改为每页 500 条的 rank
+   分页；利用 ZRANGE 按 score/member 排序的性质，仅保留上一条 score，就能跨分页统计重复且
+   内存为 O(1)。激活仍要求写暂停，因此 rank 视图不会在证据采集中漂移。
+4. **两个 recovery retry 对 gate sentinel 解释不一致。** `gateNotActivated(-1)` 统一重新进入
+   权威恢复；`gateCounterMissing(-2)` 统一按 counter 再次丢失 fail closed，不再把 -2 误报为
+   数字 floor。两个 race fixture 分别在 retry 前删除 mirror / counter。
+5. **正向 belief 会覆盖更高 mirror epoch。** 观察到高于本地 belief 的 `incr:N` 时强制刷新
+   MySQL 权威；权威不能确认该代次就拒绝，确认后才允许继续，旧进程不能把新 mirror 写回旧代次。
+6. **运行时 counter 没有 float64 score 精度上界。** `runGate` 在 Redis `INCR` 后拒绝
+   `>= 2^53` 的 id；否则相邻 int64 会映射为同一 ZSET score，重新制造 #697 的碰撞、游标跳过
+   与按 score ack 连带删除。operator floor 的 2^50 上界仍保留更大的提前余量。
+7. **未知 `payload.robot_id` 既重复查 MySQL，又吞掉 sibling mention 路由。** 可证不存在的 bot
+   以 `robot:exist:{id}=0` 负缓存 30 秒；仅当 payload id 正向验证成功才停止后续路由，否则继续
+   解析 `mention` / 文本 @。短 TTL 明确承担“刚创建 bot 最多延迟 30 秒被该缓存看见”的取舍，
+   避免客户端控制的重复未知 id 把 listener 变成逐消息 DB 查询。
+
+**完整验证**：按 CI 脚本逐个 `go list ./...` 包执行 `-race -shuffle=on -count=1 -timeout=5m`，
+每包前重建 `test` 库并 `FLUSHALL`；本地漏设 CI 的 `max_connections=1000` 时
+`modules/common` 首次以 `Error 1040` 失败，对齐 CI 后单独重跑通过，其余包一次通过。
+另通过 `CGO_ENABLED=0 go build ./...`、`go vet ./...`、`golangci-lint run ./...`、
+`make i18n-extract-check`、`make i18n-lint` 与 `git diff --check`。#704 的 activation-only
+Gap 1–7 仍是独立门禁；本轮没有把“合并/部署”描述成“已激活”。
