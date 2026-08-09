@@ -206,7 +206,12 @@ func TestPreflightPagesQueueMembers(t *testing.T) {
 			t.Errorf("preflight still uses unbounded queue accounting %q", forbidden)
 		}
 	}
-	for _, required := range []string{"queueScanPageSize", "scanQueueScores"} {
+	for _, required := range []string{
+		"queueScanPageSize",
+		"scanQueueScores",
+		"inspectQueueScores",
+		"ZRevRangeWithScores(k, 0, 0)",
+	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("preflight does not contain bounded paging helper %q", required)
 		}

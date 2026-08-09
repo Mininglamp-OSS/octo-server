@@ -167,9 +167,14 @@ func gather(ctx *config.Context, client *rd.Client, sample int) evidence {
 	ev.inspected = len(inspect)
 
 	for _, k := range inspect {
-		stats, err := scanQueueScores(func(start, stop int64) ([]rd.Z, error) {
-			return client.ZRangeWithScores(k, start, stop).Result()
-		})
+		stats, err := inspectQueueScores(
+			func() ([]rd.Z, error) {
+				return client.ZRevRangeWithScores(k, 0, 0).Result()
+			},
+			func(start, stop int64) ([]rd.Z, error) {
+				return client.ZRangeWithScores(k, start, stop).Result()
+			},
+		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  %s: read failed: %v\n", k, err)
 			ev.failures++
@@ -188,10 +193,38 @@ func gather(ctx *config.Context, client *rd.Client, sample int) evidence {
 	return ev
 }
 
+// inspectQueueScores captures the load-bearing maximum with one atomic Redis command,
+// then gathers diagnostic duplicate counts in bounded rank pages.
+//
+// The separation is deliberate. Pausing producers at cutover does not pause consumer ACKs:
+// ZREM from the low end shifts subsequent ranks, so a paged walk can stop before observing
+// the surviving high end. A ZREVRANGE 0 0 result taken before that walk is an upper bound
+// under ACK-only mutation and therefore safe to validate an irreversible floor against.
+func inspectQueueScores(fetchMax func() ([]rd.Z, error), fetchPage func(start, stop int64) ([]rd.Z, error)) (queueScoreStats, error) {
+	top, err := fetchMax()
+	if err != nil {
+		return queueScoreStats{}, err
+	}
+	stats, err := scanQueueScores(fetchPage)
+	if err != nil {
+		return queueScoreStats{}, err
+	}
+	if len(top) > 0 {
+		atomicMax := int64(top[0].Score)
+		if atomicMax > stats.maxScore {
+			stats.maxScore = atomicMax
+		}
+	}
+	return stats, nil
+}
+
 // scanQueueScores reads one sorted set in bounded rank pages and counts adjacent equal
 // scores as duplicates. ZRANGE orders by score and then member, so equal scores remain
 // adjacent even across page boundaries; retaining only the previous score keeps memory O(1)
 // regardless of queue size and caps every Redis response at queueScanPageSize members.
+// Under concurrent ACKs these diagnostics may be a lower bound; inspectQueueScores obtains
+// the activation-critical maximum independently, so this best-effort walk cannot lower the
+// cutover floor.
 func scanQueueScores(fetch func(start, stop int64) ([]rd.Z, error)) (queueScoreStats, error) {
 	var stats queueScoreStats
 	var previous float64

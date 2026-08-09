@@ -704,3 +704,15 @@ counter 被同一次 Redis 恢复一起丢失」。因此激活验证完成后�
 另通过 `CGO_ENABLED=0 go build ./...`、`go vet ./...`、`golangci-lint run ./...`、
 `make i18n-extract-check`、`make i18n-lint` 与 `git diff --check`。#704 的 activation-only
 Gap 1–7 仍是独立门禁；本轮没有把“合并/部署”描述成“已激活”。
+
+## 第十轮实现记录（head `60c2dd0e` 重审之后，2026-08-09）
+
+重审确认第九轮 preflight 的内存修复引入了一条 cutover 证据回退：停写不等于停 ACK，
+低端 `ZREM` 会在两次 rank 分页之间把后续成员左移，使分页提前结束并静默低估队列最大 score。
+该值直接参与不可逆激活的 floor 校验，因此属于 blocker。
+
+本轮先提交编译期 RED（`ad187e12`），用 2000 个 score 模拟第一页后 ACK 掉前 1600 条；旧实现
+只观察到最大值 500，而真实最大值 2000 仍在队列。修复将两类证据拆开：重复 score 数量继续用
+500 条 rank 分页与 O(1) 状态做诊断；激活所依赖的最大 score 单独用一次原子的
+`ZREVRANGE 0 0 WITHSCORES` 获取。ACK 只会缩小队列，所以预先捕获的最大值可能保守偏高，
+不会低估 cutover floor；新写入仍由激活前停写前置条件排除。
