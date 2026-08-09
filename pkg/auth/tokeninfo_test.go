@@ -41,6 +41,39 @@ func TestEncodeV3RoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeV3RejectsIncompleteSecurityClaims(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		info TokenInfo
+	}{
+		{
+			name: "missing uid",
+			info: TokenInfo{IssuedAt: 1, ExpiresAt: 2, SessionGeneration: "g1"},
+		},
+		{
+			name: "missing issued at",
+			info: TokenInfo{UID: "u1", ExpiresAt: 2, SessionGeneration: "g1"},
+		},
+		{
+			name: "deadline not after issue",
+			info: TokenInfo{UID: "u1", IssuedAt: 2, ExpiresAt: 2, SessionGeneration: "g1"},
+		},
+		{
+			name: "blank generation",
+			info: TokenInfo{UID: "u1", IssuedAt: 1, ExpiresAt: 2, SessionGeneration: "  "},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := EncodeV3(tt.info)
+			if !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf("EncodeV3: want ErrInvalidToken, got %v", err)
+			}
+		})
+	}
+}
+
 func TestDecodeV3RejectsInvalidLifetime(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -51,6 +84,8 @@ func TestDecodeV3RejectsInvalidLifetime(t *testing.T) {
 		{name: "missing expires at", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"session_generation\":\"g\"}"},
 		{name: "deadline not after issue", raw: "v3:{\"uid\":\"u1\",\"issued_at\":2,\"expires_at\":2,\"session_generation\":\"g\"}"},
 		{name: "missing generation", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"expires_at\":2}"},
+		{name: "missing uid", raw: "v3:{\"issued_at\":1,\"expires_at\":2,\"session_generation\":\"g\"}"},
+		{name: "bad json", raw: "v3:{not-json}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

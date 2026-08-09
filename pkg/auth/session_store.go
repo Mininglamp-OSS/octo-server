@@ -1,0 +1,380 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	rd "github.com/go-redis/redis"
+)
+
+var (
+	readTokenScript = rd.NewScript(`
+local value = redis.call("GET", KEYS[1])
+if not value then
+  return {false, -2}
+end
+return {value, redis.call("PTTL", KEYS[1])}
+`)
+	updatePayloadKeepDeadlineScript = rd.NewScript(`
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl == -2 then
+  return {-2, 0}
+end
+local persistent = 0
+if ttl == -1 then
+  ttl = tonumber(ARGV[2])
+  persistent = 1
+elseif ttl <= 0 then
+  return {-2, 0}
+elseif ttl > tonumber(ARGV[2]) then
+  ttl = tonumber(ARGV[2])
+end
+redis.call("SET", KEYS[1], ARGV[1], "PX", ttl, "XX")
+return {ttl, persistent}
+`)
+	compareDeleteScript = rd.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+)
+
+var ErrTokenCollision = errors.New("auth: generated token already exists")
+
+// SessionObservation contains low-cardinality migration facts only. It never
+// includes a token, Redis key, UID, or payload.
+type SessionObservation struct {
+	Total         int64 `json:"total"`
+	Missing       int64 `json:"missing"`
+	Persistent    int64 `json:"persistent"`
+	Finite        int64 `json:"finite"`
+	OverMax       int64 `json:"over_max"`
+	InvalidTTL    int64 `json:"invalid_ttl"`
+	DecodeInvalid int64 `json:"decode_invalid"`
+	V1            int64 `json:"v1"`
+	V2            int64 `json:"v2"`
+	V3            int64 `json:"v3"`
+}
+
+// RedisSessionStore is the sole v2 credential writer in Release A. It owns
+// token and compatibility UIDToken key construction so handlers cannot
+// accidentally drop or extend a bearer deadline.
+type RedisSessionStore struct {
+	client         *rd.Client
+	tokenPrefix    string
+	uidTokenPrefix string
+	maxTTL         time.Duration
+}
+
+func NewRedisSessionStore(client *rd.Client, tokenPrefix, uidTokenPrefix string, maxTTL time.Duration) *RedisSessionStore {
+	if client == nil {
+		panic("auth: NewRedisSessionStore requires non-nil redis client")
+	}
+	if maxTTL <= 0 {
+		panic("auth: NewRedisSessionStore requires positive max TTL")
+	}
+	return &RedisSessionStore{
+		client:         client,
+		tokenPrefix:    tokenPrefix,
+		uidTokenPrefix: uidTokenPrefix,
+		maxTTL:         maxTTL,
+	}
+}
+
+func (s *RedisSessionStore) tokenKey(token string) string {
+	return s.tokenPrefix + token
+}
+
+func (s *RedisSessionStore) uidTokenKey(uid string, deviceFlag int) string {
+	return s.uidTokenPrefix + strconv.Itoa(deviceFlag) + uid
+}
+
+// IssueNew creates a finite bearer and compatibility device index. If the
+// index write fails, the new credential is deleted as compensation.
+func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid string, deviceFlag int) (err error) {
+	started := time.Now()
+	defer func() { metrics.ObserveSessionOperation("issue", started, err) }()
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(payload) == "" || strings.TrimSpace(uid) == "" || deviceFlag < 0 {
+		return errors.New("auth: issue token requires token, payload, uid, and non-negative device flag")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	created, err := s.client.SetNX(s.tokenKey(token), payload, s.maxTTL).Result()
+	if err != nil {
+		return fmt.Errorf("auth: issue token: %w", err)
+	}
+	if !created {
+		return ErrTokenCollision
+	}
+	if err := s.client.Set(s.uidTokenKey(uid, deviceFlag), token, s.maxTTL).Err(); err != nil {
+		cleanupErr := s.client.Del(s.tokenKey(token)).Err()
+		if cleanupErr != nil {
+			return fmt.Errorf("auth: bind token device: %w (credential cleanup failed: %v)", err, cleanupErr)
+		}
+		return fmt.Errorf("auth: bind token device: %w", err)
+	}
+	return nil
+}
+
+// ReuseExisting updates a bearer without extending its deadline and aligns
+// the compatibility index to the same TTL. A missing bearer is never recreated.
+func (s *RedisSessionStore) ReuseExisting(ctx context.Context, token, payload, uid string, deviceFlag int) (ok bool, err error) {
+	started := time.Now()
+	defer func() { metrics.ObserveSessionOperation("reuse", started, err) }()
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(payload) == "" || strings.TrimSpace(uid) == "" || deviceFlag < 0 {
+		return false, errors.New("auth: reuse token requires token, payload, uid, and non-negative device flag")
+	}
+	ttl, ok, err := s.updatePayloadKeepDeadline(ctx, token, payload)
+	if err != nil || !ok {
+		return ok, err
+	}
+	if err := s.client.Set(s.uidTokenKey(uid, deviceFlag), token, ttl).Err(); err != nil {
+		// This was a pre-existing credential, so failure must not delete it.
+		return true, fmt.Errorf("auth: refresh token device index: %w", err)
+	}
+	return true, nil
+}
+
+func (s *RedisSessionStore) UpdatePayloadKeepDeadline(ctx context.Context, token, payload string) (ok bool, err error) {
+	started := time.Now()
+	defer func() { metrics.ObserveSessionOperation("update_payload", started, err) }()
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(payload) == "" {
+		return false, errors.New("auth: update token requires token and payload")
+	}
+	_, ok, err = s.updatePayloadKeepDeadline(ctx, token, payload)
+	return ok, err
+}
+
+func (s *RedisSessionStore) updatePayloadKeepDeadline(ctx context.Context, token, payload string) (time.Duration, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	result, err := updatePayloadKeepDeadlineScript.Run(
+		s.client,
+		[]string{s.tokenKey(token)},
+		payload,
+		s.maxTTL.Milliseconds(),
+	).Result()
+	if err != nil {
+		return 0, false, fmt.Errorf("auth: update token payload: %w", err)
+	}
+	parts, ok := result.([]interface{})
+	if !ok || len(parts) != 2 {
+		return 0, false, fmt.Errorf("auth: invalid token update result %T", result)
+	}
+	ttlMS, err := redisInteger(parts[0])
+	if err != nil {
+		return 0, false, err
+	}
+	persistent, err := redisInteger(parts[1])
+	if err != nil {
+		return 0, false, err
+	}
+	if ttlMS == -2 {
+		return 0, false, nil
+	}
+	if ttlMS <= 0 {
+		return 0, false, fmt.Errorf("auth: update token payload returned invalid ttl %d", ttlMS)
+	}
+	if persistent == 1 {
+		metrics.ObservePersistentSession()
+	}
+	return time.Duration(ttlMS) * time.Millisecond, true, nil
+}
+
+func (s *RedisSessionStore) DeviceToken(ctx context.Context, uid string, deviceFlag int) (string, error) {
+	if strings.TrimSpace(uid) == "" || deviceFlag < 0 {
+		return "", errors.New("auth: load device token requires uid and non-negative device flag")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	token, err := s.client.Get(s.uidTokenKey(uid, deviceFlag)).Result()
+	if err == rd.Nil {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("auth: load device token: %w", err)
+	}
+	return token, nil
+}
+
+func (s *RedisSessionStore) DeleteToken(ctx context.Context, token string) error {
+	if strings.TrimSpace(token) == "" {
+		return errors.New("auth: delete token requires token")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.client.Del(s.tokenKey(token)).Err(); err != nil {
+		return fmt.Errorf("auth: delete token: %w", err)
+	}
+	return nil
+}
+
+// RevokeIssued compensates a new credential. Never use it for a reused token.
+func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string, deviceFlag int) error {
+	if strings.TrimSpace(uid) == "" || deviceFlag < 0 {
+		return errors.New("auth: revoke token requires uid and non-negative device flag")
+	}
+	if err := s.DeleteToken(ctx, token); err != nil {
+		return err
+	}
+	if _, err := compareDeleteScript.Run(
+		s.client,
+		[]string{s.uidTokenKey(uid, deviceFlag)},
+		token,
+	).Result(); err != nil {
+		return fmt.Errorf("auth: delete token device index: %w", err)
+	}
+	return nil
+}
+
+func (s *RedisSessionStore) ReadToken(ctx context.Context, key string) (record TokenRecord, err error) {
+	started := time.Now()
+	defer func() { metrics.ObserveSessionOperation("read", started, err) }()
+	if strings.TrimSpace(key) == "" {
+		return TokenRecord{}, errors.New("auth: read token requires key")
+	}
+	if err := ctx.Err(); err != nil {
+		return TokenRecord{}, err
+	}
+	result, err := readTokenScript.Run(s.client, []string{key}).Result()
+	if err != nil {
+		return TokenRecord{}, fmt.Errorf("auth: read token: %w", err)
+	}
+	parts, ok := result.([]interface{})
+	if !ok || len(parts) != 2 {
+		return TokenRecord{}, fmt.Errorf("auth: invalid token read result %T", result)
+	}
+	ttlMS, err := redisInteger(parts[1])
+	if err != nil {
+		return TokenRecord{}, err
+	}
+	if ttlMS == -2 {
+		return TokenRecord{TTL: -2}, nil
+	}
+	payload, ok := parts[0].(string)
+	if !ok {
+		if bytes, bytesOK := parts[0].([]byte); bytesOK {
+			payload = string(bytes)
+		} else {
+			return TokenRecord{}, fmt.Errorf("auth: invalid token payload result %T", parts[0])
+		}
+	}
+	if ttlMS == -1 {
+		return TokenRecord{Payload: payload, TTL: -1}, nil
+	}
+	return TokenRecord{Payload: payload, TTL: time.Duration(ttlMS) * time.Millisecond}, nil
+}
+
+// Observe performs an explicit, read-only cursor scan for migration planning.
+// It is never called at process startup. The result is aggregate-only, and
+// each batch checks context cancellation so operators can stop it safely.
+func (s *RedisSessionStore) Observe(ctx context.Context, batchSize int64) (stats SessionObservation, err error) {
+	return s.ObserveRateLimited(ctx, batchSize, 0)
+}
+
+// ObserveRateLimited is Observe with an optional minimum interval between
+// token reads. Production tooling must pass a positive interval to cap Redis
+// load; zero is intended for bounded tests and offline environments.
+func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize int64, interval time.Duration) (stats SessionObservation, err error) {
+	started := time.Now()
+	defer func() { metrics.ObserveSessionOperation("observe", started, err) }()
+	if batchSize <= 0 || batchSize > 10_000 {
+		return SessionObservation{}, fmt.Errorf("auth: observe batch size must be between 1 and 10000")
+	}
+	if interval < 0 {
+		return SessionObservation{}, fmt.Errorf("auth: observe interval must not be negative")
+	}
+	var throttle <-chan time.Time
+	var ticker *time.Ticker
+	if interval > 0 {
+		ticker = time.NewTicker(interval)
+		defer ticker.Stop()
+		throttle = ticker.C
+	}
+	var cursor uint64
+	pattern := s.tokenPrefix + "*"
+	for {
+		if err := ctx.Err(); err != nil {
+			return SessionObservation{}, err
+		}
+		keys, next, err := s.client.Scan(cursor, pattern, batchSize).Result()
+		if err != nil {
+			return SessionObservation{}, fmt.Errorf("auth: observe scan: %w", err)
+		}
+		for _, key := range keys {
+			if throttle != nil {
+				select {
+				case <-ctx.Done():
+					return SessionObservation{}, ctx.Err()
+				case <-throttle:
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				return SessionObservation{}, err
+			}
+			stats.Total++
+			record, err := s.ReadToken(ctx, key)
+			if err != nil {
+				return SessionObservation{}, fmt.Errorf("auth: observe token record: %w", err)
+			}
+			switch {
+			case record.TTL == -2:
+				stats.Missing++
+				continue
+			case record.TTL == -1:
+				stats.Persistent++
+			case record.TTL >= 0:
+				stats.Finite++
+				if record.TTL > s.maxTTL {
+					stats.OverMax++
+				}
+			default:
+				stats.InvalidTTL++
+			}
+
+			if _, err := Decode(record.Payload); err != nil {
+				stats.DecodeInvalid++
+				continue
+			}
+			switch {
+			case strings.HasPrefix(record.Payload, v3Prefix):
+				stats.V3++
+			case strings.HasPrefix(record.Payload, v2Prefix):
+				stats.V2++
+			default:
+				stats.V1++
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return stats, nil
+		}
+	}
+}
+
+func redisInteger(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case int64:
+		return v, nil
+	case string:
+		result, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("auth: invalid redis integer %q: %w", v, err)
+		}
+		return result, nil
+	case []byte:
+		return redisInteger(string(v))
+	default:
+		return 0, fmt.Errorf("auth: invalid redis integer result %T", value)
+	}
+}

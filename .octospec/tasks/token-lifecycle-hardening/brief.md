@@ -105,6 +105,13 @@ Redis 原子更新优先使用 Lua `PTTL + SET PX`，兼容当前 go-redis 版�
 
 新签发和复用旧 Token 必须使用不同补偿语义：`IssueNew` 在索引或 IM 更新失败时删除本次新建的 credential；`ReuseExisting` 失败时不得把登录前已有效的旧 Token 当作“新 Token”删除。APP 替换旧 Token、Redis 部分成功、IM 成功/失败的每个组合都要有明确状态机和故障注入测试，避免孤儿 credential 或误踢已有会话。
 
+#### 多副本与性能约束
+
+- 同一进程的所有 Token reader/writer 必须复用 `config.Context` 内唯一的 Session Store 和唯一的有界 go-redis 连接池，不能由 group/message/user 等模块各自建池。PR 1 当前每副本池大小为 10，带有限 dial/read/write/pool timeout 和一次重试；上线前需按副本数核算 Redis `maxclients`，并通过 session latency/error 指标确认没有 pool wait 饱和。若需扩容连接池，应基于压测或生产证据单独调整，不能靠每个模块复制 client 绕过。
+- 认证热路径的 payload 与 PTTL 读取必须由一个单-key Lua 原子完成；脚本缓存命中后的稳态为一次 Redis 往返，新 Redis 节点首次 `EVALSHA` 遇到 `NOSCRIPT` 时允许由客户端回退一次 `EVAL`。不得先 `GET` 再 `PTTL` 形成 TOCTOU，也不得在每个已认证请求上写 TTL、索引或 generation。资料更新、登录和撤销才允许写 Redis，避免把本次安全修复变成按请求写放大。
+- 未确认生产 Cluster 拓扑前，PR 1 的 Lua 只能操作一个 key；Token key 与兼容 `UIDToken` 索引分步写，并以“新 credential 可补偿、旧 credential 不误删”的状态机处理部分失败。不同副本必须只通过 Redis 中的原子条件协调，不能依赖进程锁或本地缓存保证安全。
+- migration observe/apply 不得随每个副本启动；显式运维进程默认限速、连接池独立且更小，可取消并只输出聚合。在线请求与迁移流量的 Redis 延迟、错误率必须分别可观测，避免扫描挤占认证连接。
+
 ### 2. Token payload v3 绝对到期
 
 新增可向后解码的 v3 payload，至少包含：
@@ -243,11 +250,13 @@ v3 是新的 cache value 格式，当前旧二进制不能解码。必须采用 
 - 故障注入覆盖 Token/index/UIDToken/IM 每一步失败：新签发失败无可用孤儿 credential，复用失败不误删登录前已有效的旧 Token。
 - 当前退出、全部退出、密码修改、各类密码重置、禁用和注销按撤销矩阵测试；旧 Token 随后访问返回统一未认证响应。
 - 并发测试证明旧密码校验与密码修改/重置竞态时，安全事件前开始、事件后才提交的会话不能存活；v3 索引缺失时 `RevokeAll` 仍通过 generation 立即失效 Token，legacy 孤儿则由 deny marker 阻断。
+- 两个独立 Redis client/Session Store 实例模拟不同副本时，并发复用与 logout 不得复活 bearer；补偿撤销只能 compare-delete 自己的兼容索引，不能删除其他副本刚写入的新 Token 索引。
 - OIDC logout 继续撤当前 HTTP Token、吊销该 UID 全部未吊销 IdP RT、踢全部 IM 设备，并保持现有 best-effort/RP-Initiated Logout 响应行为。
 - legacy 迁移工具 dry-run 不写 Redis、不输出秘密；apply 可中断续跑、幂等且不延长 TTL；测试覆盖 `TTL=-2/-1/>max/normal`。
 - 混版测试证明 Release A 能读取 v2/v3，Release B 写 v3；发布检查能阻止旧副本存活时进入 enforce。
 - 迁移完成后按配置的 Token 前缀扫描：`persistent=0`、`over_max=0`、`v1/v2=0`；enforce 期间新增这些类型会触发告警。
 - Redis 不可用或 payload/TTL 不合法时认证 fail closed，且保持现有 i18n/anti-enumeration wire contract。
+- 认证 validator 稳态每次请求执行一次单-key Redis 脚本且不写 Redis（允许新节点首次 `NOSCRIPT` 回退）；每副本只创建一个 Session Store 连接池，池大小、timeout、retry 和操作时延均有测试或指标证据，迁移扫描不与在线池混用。
 - 相关测试至少覆盖 `pkg/auth`、`modules/user`、`modules/oidc`；运行 focused tests、`go test ./...`、`make i18n-extract-check`、`make i18n-lint` 和 lint。
 
 ## Decisions required before implementation

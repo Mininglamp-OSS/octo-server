@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -49,34 +49,41 @@ func TestRedisSessionStoreKeepsTokenDeadline(t *testing.T) {
 
 func TestRedisSessionStoreConcurrentLogoutCannotBeResurrected(t *testing.T) {
 	cfg := config.New()
-	client := octoredis.NewInstrumentedClient(cfg)
-	store := NewRedisSessionStore(client, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	clientA := octoredis.NewInstrumentedClient(cfg)
+	clientB := octoredis.NewInstrumentedClient(cfg)
+	storeA := NewRedisSessionStore(clientA, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	storeB := NewRedisSessionStore(clientB, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
 	token := "session-store-race-" + util.GenerUUID()
 	tokenKey := cfg.Cache.TokenCachePrefix + token
 	uidKey := cfg.Cache.UIDTokenCachePrefix + "1u-race"
 	t.Cleanup(func() {
-		_ = client.Del(tokenKey, uidKey).Err()
-		_ = client.Close()
+		_ = clientA.Del(tokenKey, uidKey).Err()
+		_ = clientA.Close()
+		_ = clientB.Close()
 	})
-	require.NoError(t, store.IssueNew(context.Background(), token, "old", "u-race", 1))
+	require.NoError(t, storeA.IssueNew(context.Background(), token, "old", "u-race", 1))
 
 	start := make(chan struct{})
 	errCh := make(chan error, 33)
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
+		store := storeA
+		if i%2 == 1 {
+			store = storeB
+		}
 		wg.Add(1)
-		go func() {
+		go func(store *RedisSessionStore) {
 			defer wg.Done()
 			<-start
 			_, err := store.ReuseExisting(context.Background(), token, "new", "u-race", 1)
 			errCh <- err
-		}()
+		}(store)
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-start
-		errCh <- store.DeleteToken(context.Background(), token)
+		errCh <- storeB.DeleteToken(context.Background(), token)
 	}()
 	close(start)
 	wg.Wait()
@@ -84,7 +91,7 @@ func TestRedisSessionStoreConcurrentLogoutCannotBeResurrected(t *testing.T) {
 	for err := range errCh {
 		require.NoError(t, err)
 	}
-	exists, err := client.Exists(tokenKey).Result()
+	exists, err := clientA.Exists(tokenKey).Result()
 	require.NoError(t, err)
 	require.Zero(t, exists, "SET XX Lua serialized with DEL must never recreate a logged-out bearer")
 }
@@ -100,19 +107,18 @@ func TestRedisSessionStoreIssueFailureCompensatesNewCredential(t *testing.T) {
 		_ = client.Del(tokenKey, uidKey).Err()
 		_ = client.Close()
 	})
-	injected := errors.New("injected uid index failure")
 	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
 		return func(cmd rd.Cmder) error {
 			args := cmd.Args()
-			if cmd.Name() == "set" && len(args) > 1 && args[1] == uidKey {
-				return injected
+			if cmd.Name() == "set" && !redisArgsContain(args, "nx") {
+				args[0] = "injected-uid-index-failure"
 			}
 			return old(cmd)
 		}
 	})
 
 	err := store.IssueNew(context.Background(), token, "payload", "u-compensate", 1)
-	require.ErrorIs(t, err, injected)
+	require.Error(t, err)
 	exists, existsErr := client.Exists(tokenKey).Result()
 	require.NoError(t, existsErr)
 	require.Zero(t, exists, "partial issue must not leave an orphan bearer")
@@ -130,12 +136,11 @@ func TestRedisSessionStoreReuseFailureKeepsExistingCredential(t *testing.T) {
 		_ = client.Close()
 	})
 	require.NoError(t, client.Set(tokenKey, "old", time.Minute).Err())
-	injected := errors.New("injected uid index failure")
 	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
 		return func(cmd rd.Cmder) error {
 			args := cmd.Args()
-			if cmd.Name() == "set" && len(args) > 1 && args[1] == uidKey {
-				return injected
+			if cmd.Name() == "set" && !redisArgsContain(args, "nx") {
+				args[0] = "injected-uid-index-failure"
 			}
 			return old(cmd)
 		}
@@ -143,10 +148,19 @@ func TestRedisSessionStoreReuseFailureKeepsExistingCredential(t *testing.T) {
 
 	ok, err := store.ReuseExisting(context.Background(), token, "new", "u-reuse", 1)
 	require.True(t, ok)
-	require.ErrorIs(t, err, injected)
+	require.Error(t, err)
 	got, getErr := client.Get(tokenKey).Result()
 	require.NoError(t, getErr)
 	require.Equal(t, "new", got, "reuse failure must not delete a credential that predated the attempt")
+}
+
+func redisArgsContain(args []interface{}, want string) bool {
+	for _, arg := range args {
+		if fmt.Sprint(arg) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRedisSessionStoreObserveAggregatesOnly(t *testing.T) {
@@ -208,7 +222,7 @@ func TestRedisSessionStoreMissingTokenIsNotRecreated(t *testing.T) {
 	require.Zero(t, exists)
 }
 
-func TestRedisSessionStoreBoundsTouchedPersistentToken(t *testing.T) {
+func TestRedisSessionStoreBoundsTouchedLegacyToken(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
 	store := NewRedisSessionStore(client, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
@@ -227,4 +241,16 @@ func TestRedisSessionStoreBoundsTouchedPersistentToken(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, ttl)
 	require.LessOrEqual(t, ttl, time.Minute)
+
+	overMaxToken := "session-store-over-max-" + util.GenerUUID()
+	overMaxKey := cfg.Cache.TokenCachePrefix + overMaxToken
+	t.Cleanup(func() { _ = client.Del(overMaxKey).Err() })
+	require.NoError(t, client.Set(overMaxKey, "old", 2*time.Minute).Err())
+	ok, err = store.UpdatePayloadKeepDeadline(context.Background(), overMaxToken, "new")
+	require.NoError(t, err)
+	require.True(t, ok)
+	ttl, err = client.PTTL(overMaxKey).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+	require.LessOrEqual(t, ttl, time.Minute, "touched over-max token must be clamped, never preserved beyond policy")
 }

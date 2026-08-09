@@ -21,6 +21,15 @@ type fakeTokenRecordReader struct {
 	err     error
 }
 
+type fakeSessionGenerationResolver struct {
+	generation string
+	err        error
+}
+
+func (r fakeSessionGenerationResolver) CurrentGeneration(context.Context, string) (string, error) {
+	return r.generation, r.err
+}
+
 func (r *fakeTokenRecordReader) ReadToken(_ context.Context, key string) (TokenRecord, error) {
 	if r.err != nil {
 		return TokenRecord{}, r.err
@@ -354,19 +363,26 @@ func TestTokenValidatorV3LifetimeAndRedisTTL(t *testing.T) {
 	}
 
 	tests := []struct {
-		name   string
-		record TokenRecord
-		wantOK bool
+		name       string
+		record     TokenRecord
+		generation string
+		wantOK     bool
 	}{
-		{name: "finite and before absolute deadline", record: TokenRecord{Payload: valid, TTL: time.Minute}, wantOK: true},
-		{name: "persistent redis key", record: TokenRecord{Payload: valid, TTL: -1}},
-		{name: "expired payload", record: TokenRecord{Payload: expired, TTL: time.Minute}},
-		{name: "missing key", record: TokenRecord{TTL: -2}},
+		{name: "finite and before absolute deadline", record: TokenRecord{Payload: valid, TTL: time.Minute}, generation: "g1", wantOK: true},
+		{name: "persistent redis key", record: TokenRecord{Payload: valid, TTL: -1}, generation: "g1"},
+		{name: "expired payload", record: TokenRecord{Payload: expired, TTL: time.Minute}, generation: "g1"},
+		{name: "generation mismatch", record: TokenRecord{Payload: valid, TTL: time.Minute}, generation: "g2"},
+		{name: "missing key", record: TokenRecord{TTL: -2}, generation: "g1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := &fakeTokenRecordReader{records: map[string]TokenRecord{testPrefix + "tok": tt.record}}
-			validator := NewTokenValidator(reader, testPrefix, WithValidatorClock(func() time.Time { return now }))
+			validator := NewTokenValidator(
+				reader,
+				testPrefix,
+				WithValidatorClock(func() time.Time { return now }),
+				WithSessionGenerationResolver(fakeSessionGenerationResolver{generation: tt.generation}),
+			)
 			_, validateErr := validator.Validate(context.Background(), "tok")
 			if tt.wantOK && validateErr != nil {
 				t.Fatalf("Validate: %v", validateErr)

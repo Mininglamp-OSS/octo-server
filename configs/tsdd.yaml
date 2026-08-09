@@ -250,7 +250,7 @@ smsCode: "123456" # 测试短信验证码， 如果不为空，则短信验证�
 # #################### 缓存配置 ####################
 #cache:
 #  tokenCachePrefix: "token:" # token缓存前缀
-#  tokenExpire: 30d # token过期时间
+#  tokenExpire: 720h # token过期时间；Go duration 不支持 30d
 #  loginDeviceCachePrefix: "login_device:" # 登录设备缓存前缀
 #  loginDeviceCacheExpire: 5m # 登录设备缓存过期时间
 #  uidTokenCachePrefix: "uidtoken:" # uid和token的缓存前缀

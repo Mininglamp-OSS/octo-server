@@ -27,6 +27,7 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 		{name: "default", want: 720 * time.Hour},
 		{name: "yaml override", yaml: "cache:\n  tokenExpire: 48h\n", want: 48 * time.Hour},
 		{name: "env overrides yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "24h", want: 24 * time.Hour},
+		{name: "invalid env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "30d", wantErr: true},
 		{name: "day suffix unsupported", yaml: "cache:\n  tokenExpire: 30d\n", wantErr: true},
 		{name: "bare number unsupported", yaml: "cache:\n  tokenExpire: 24\n", wantErr: true},
 		{name: "malformed", yaml: "cache:\n  tokenExpire: tomorrow\n", wantErr: true},
@@ -45,9 +46,7 @@ func TestValidateTokenExpireConfig(t *testing.T) {
 			vp.SetEnvPrefix("TS")
 			vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 			vp.AutomaticEnv()
-			if tt.env != "" {
-				t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
-			}
+			t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
 
 			got, err := validateTokenExpireConfig(vp)
 			if tt.wantErr {

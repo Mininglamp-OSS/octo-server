@@ -75,10 +75,20 @@ type CacheTokenParser struct {
 	Prefix       string
 	resolver     LanguageResolver
 	roleResolver RoleResolver
+	validator    *TokenValidator
 }
 
 // ParserOption configures optional CacheTokenParser behaviour.
 type ParserOption func(*CacheTokenParser)
+
+// WithTokenValidator makes Parse use the canonical payload+PTTL validator.
+func WithTokenValidator(v *TokenValidator) ParserOption {
+	return func(p *CacheTokenParser) {
+		if v != nil {
+			p.validator = v
+		}
+	}
+}
 
 // WithLanguageResolver wires a LanguageResolver into the parser; nil resolver
 // is a no-op so callers can pass an interface value that may be unset in test
@@ -127,20 +137,31 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 	parseStart := time.Now()
 	var tokenMs, langMs, roleMs int64
 	tokenStart := time.Now()
-	raw, err := p.Cache.Get(p.Prefix + token)
+	var info TokenInfo
+	var err error
+	if p.validator != nil {
+		info, err = p.validator.Validate(ctx, token)
+	} else {
+		var raw string
+		raw, err = p.Cache.Get(p.Prefix + token)
+		if err != nil {
+			err = fmt.Errorf("auth: load token from cache: %w", err)
+		} else if strings.TrimSpace(raw) == "" {
+			err = wkhttp.ErrTokenNotFound
+		} else {
+			info, err = Decode(raw)
+			if errors.Is(err, ErrEmptyToken) {
+				err = wkhttp.ErrTokenNotFound
+			} else if err != nil {
+				err = fmt.Errorf("%w: %v", wkhttp.ErrTokenInvalid, err)
+			} else if info.IsV3() {
+				err = fmt.Errorf("%w: v3 token requires ttl-aware validator", wkhttp.ErrTokenInvalid)
+			}
+		}
+	}
 	tokenMs = time.Since(tokenStart).Milliseconds()
 	if err != nil {
-		return wkhttp.UserInfo{}, fmt.Errorf("auth: load token from cache: %w", err)
-	}
-	if strings.TrimSpace(raw) == "" {
-		return wkhttp.UserInfo{}, wkhttp.ErrTokenNotFound
-	}
-	info, err := Decode(raw)
-	if err != nil {
-		if errors.Is(err, ErrEmptyToken) {
-			return wkhttp.UserInfo{}, wkhttp.ErrTokenNotFound
-		}
-		return wkhttp.UserInfo{}, fmt.Errorf("%w: %v", wkhttp.ErrTokenInvalid, err)
+		return wkhttp.UserInfo{}, err
 	}
 	language := info.Language
 	if p.resolver != nil {
