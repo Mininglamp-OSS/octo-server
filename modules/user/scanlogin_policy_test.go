@@ -1,6 +1,7 @@
 package user
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,12 @@ func TestScanLoginDisabledBlocksUserEntryPoints(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	authInfo, err := encodeScanLoginAuthorization(testutil.UID, "disabled-existing-uuid")
+	require.NoError(t, err)
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(
+		scanLoginPendingAuthorizationKey("code"), authInfo, time.Minute))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(
+		scanLoginReadyAuthorizationKey("code"), authInfo, time.Minute))
 	setSystemSettingForUserTest(t, ctx, "login", "scan_enabled", "0", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
 
@@ -45,6 +52,12 @@ func TestScanLoginDisabledBlocksUserEntryPoints(t *testing.T) {
 			assert.Contains(t, w.Body.String(), "err.server.user.scan_login_disabled")
 		})
 	}
+	pending, err := ctx.GetRedisConn().GetString(scanLoginPendingAuthorizationKey("code"))
+	require.NoError(t, err)
+	ready, err := ctx.GetRedisConn().GetString(scanLoginReadyAuthorizationKey("code"))
+	require.NoError(t, err)
+	assert.Equal(t, authInfo, pending, "disabled confirmation must not promote or delete an existing pending record")
+	assert.Equal(t, authInfo, ready, "disabled redemption must not consume an existing ready record")
 }
 
 func TestScanLoginStatusReturnsDisabledStateImmediately(t *testing.T) {
@@ -56,10 +69,12 @@ func TestScanLoginStatusReturnsDisabledStateImmediately(t *testing.T) {
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/user/loginstatus?uuid=existing-or-new", nil)
 	setPublicIPForUserTest(req, "9.9.8.20")
+	started := time.Now()
 	s.GetRoute().ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.JSONEq(t, `{"status":"disabled"}`, w.Body.String())
+	assert.Less(t, time.Since(started), time.Second, "disabled status must bypass the 10-second long poll")
 }
 
 func TestLoginWithAuthCode_WrongPollSecretDoesNotConsumeAuthorization(t *testing.T) {
@@ -87,4 +102,80 @@ func TestLoginWithAuthCode_WrongPollSecretDoesNotConsumeAuthorization(t *testing
 	stillReady, err := ctx.GetRedisConn().GetString(authKey)
 	require.NoError(t, err)
 	assert.Equal(t, authInfo, stillReady, "wrong browser secret must not burn a valid confirmation")
+}
+
+func TestScanLoginAuthorization_RequiresConfirmationAndRedeemsOnce(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	db := NewDB(ctx)
+	model, err := db.QueryByUID(testutil.UID)
+	require.NoError(t, err)
+	if model == nil {
+		require.NoError(t, db.Insert(&Model{
+			UID:      testutil.UID,
+			Name:     "scan login user",
+			Username: "scan_login_user",
+			ShortNo:  "scan001",
+			Status:   1,
+		}))
+	}
+
+	authCode := util.GenerUUID()
+	uuid := util.GenerUUID()
+	require.NoError(t, SavePendingScanLoginAuthorization(ctx.GetRedisConn(), authCode, testutil.UID, uuid))
+	pollSecret, err := mintScanLoginPollSecret(ctx.GetRedisConn(), uuid)
+	require.NoError(t, err)
+
+	// Scanning alone creates no ready authorization, even for the browser that
+	// owns the correct poll secret.
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost,
+		"/v1/user/login_authcode/"+authCode+"?poll_secret="+pollSecret, nil)
+	setPublicIPForUserTest(req, "9.9.8.40")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), "err.server.user.auth_code_not_found")
+	pendingBeforeConfirm, err := ctx.GetRedisConn().GetString(scanLoginPendingAuthorizationKey(authCode))
+	require.NoError(t, err)
+	assert.NotEmpty(t, pendingBeforeConfirm)
+
+	// The authenticated scanner explicitly confirms, atomically promoting the
+	// pending record and publishing authed state to the browser.
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/v1/user/grant_login?auth_code="+authCode, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	pendingAfterConfirm, err := ctx.GetRedisConn().GetString(scanLoginPendingAuthorizationKey(authCode))
+	require.NoError(t, err)
+	ready, err := ctx.GetRedisConn().GetString(scanLoginReadyAuthorizationKey(authCode))
+	require.NoError(t, err)
+	assert.Empty(t, pendingAfterConfirm)
+	assert.Equal(t, pendingBeforeConfirm, ready)
+
+	qrcodeRaw, err := ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", libcommon.QRCodeCachePrefix, uuid))
+	require.NoError(t, err)
+	var qrcodeState libcommon.QRCodeModel
+	require.NoError(t, json.Unmarshal([]byte(qrcodeRaw), &qrcodeState))
+	assert.Equal(t, string(libcommon.ScanLoginStatusAuthed), fmt.Sprint(qrcodeState.Data["status"]))
+
+	// Exactly one redemption can issue a session. The second request observes
+	// the atomic consume and cannot replay the same authorization.
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost,
+		"/v1/user/login_authcode/"+authCode+"?poll_secret="+pollSecret, nil)
+	setPublicIPForUserTest(req, "9.9.8.41")
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"token"`)
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost,
+		"/v1/user/login_authcode/"+authCode+"?poll_secret="+pollSecret, nil)
+	setPublicIPForUserTest(req, "9.9.8.42")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), "err.server.user.auth_code_not_found")
 }

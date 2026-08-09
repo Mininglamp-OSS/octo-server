@@ -369,6 +369,16 @@ func (s *SystemSettings) LocalLoginOff() bool {
 	return anyThirdPartyLoginConfigured(s.ctx.GetConfig())
 }
 
+// ScanLoginEnabled returns whether QR-code login is enabled deployment-wide.
+//
+// Default true preserves the historical behavior for deployments that have not
+// configured the setting. Unlike LocalLoginOff, this switch is itself the
+// server-side security boundary: every scan-login entry point reads the same
+// hot-reloaded snapshot, while unrelated QR-code types remain available.
+func (s *SystemSettings) ScanLoginEnabled() bool {
+	return s.getBool("login", "scan_enabled", true)
+}
+
 // anyThirdPartyLoginConfigured reports whether at least one external login
 // provider has the credentials it needs to handle a real auth round-trip.
 // LocalLoginOff guards on this so flipping the master switch without wiring

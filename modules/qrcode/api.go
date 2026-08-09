@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -150,7 +151,11 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 	case common.QRCodeTypeGroup: // 扫描入群
 		result, err = q.handleJoinGroup(loginUID, qrCodeModel)
 	case common.QRCodeTypeScanLogin: // 扫描登录
-		result, err = q.handleScanLogin(loginUID, code, qrCodeModel)
+		if !commonsettings.EnsureSystemSettings(q.ctx).ScanLoginEnabled() {
+			err = errQRCodeScanLoginDisabled
+		} else {
+			result, err = q.handleScanLogin(loginUID, code, qrCodeModel)
+		}
 	default:
 		err = errQRCodeUnsupportedType
 	}
@@ -166,14 +171,10 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 // 处理扫描登录
 func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel common.QRCodeModel) (interface{}, error) {
 	authCode := util.GenerUUID()
-	err := q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), util.ToJson(map[string]interface{}{
-		"scaner": loginUID,
-		"type":   common.AuthCodeTypeScanLogin,
-		"uuid":   uuid,
-	}), user.ScanLoginAuthCodeTTL)
+	err := user.SavePendingScanLoginAuthorization(q.ctx.GetRedisConn(), authCode, loginUID, uuid)
 	if err != nil {
-		q.Error("生成扫码登录授权码失败", zap.Error(err))
-		return nil, fmt.Errorf("%w: scan login auth code", errQRCodeInternalStoreFailed)
+		q.Error("生成扫码登录待确认记录失败", zap.Error(err))
+		return nil, fmt.Errorf("%w: scan login pending authorization", errQRCodeInternalStoreFailed)
 	}
 	var pubkey string
 	if qrCodeModel.Data != nil && qrCodeModel.Data["pub_key"] != nil {
@@ -182,11 +183,13 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 	qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
 		"app_id": "wukongchat",
 		"status": common.ScanLoginStatusScanned,
-		"uid":    loginUID,
 	})
 	err = q.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), user.ScanLoginConfirmWindow)
 	if err != nil {
 		q.Error("设置扫描登录二维码信息失败", zap.Error(err))
+		if cleanupErr := user.DeletePendingScanLoginAuthorization(q.ctx.GetRedisConn(), authCode); cleanupErr != nil {
+			q.Warn("清理扫码登录待确认记录失败", zap.String("uuid", uuid), zap.Error(cleanupErr))
+		}
 		return nil, fmt.Errorf("%w: scan login state", errQRCodeInternalStoreFailed)
 	}
 	user.SendQRCodeInfo(uuid, qrcodeInfo)

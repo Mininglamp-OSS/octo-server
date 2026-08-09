@@ -14,6 +14,7 @@ var (
 	errQRCodeGroupDataInvalid    = errors.New("qrcode: group data invalid")
 	errQRCodeGroupNotFound       = errors.New("qrcode: group not found")
 	errQRCodeGroupSpaceForbidden = errors.New("qrcode: group space forbidden")
+	errQRCodeScanLoginDisabled   = errors.New("qrcode: scan login disabled")
 	errQRCodeInternalQueryFailed = errors.New("qrcode: internal query failed")
 	errQRCodeInternalStoreFailed = errors.New("qrcode: internal store failed")
 )
@@ -38,6 +39,8 @@ func respondQRCodeHandleError(c *wkhttp.Context, err error) {
 		httperr.ResponseErrorL(c, errcode.ErrQRCodeGroupNotFound, nil, nil)
 	case errors.Is(err, errQRCodeGroupSpaceForbidden):
 		httperr.ResponseErrorL(c, errcode.ErrQRCodeGroupSpaceForbidden, nil, nil)
+	case errors.Is(err, errQRCodeScanLoginDisabled):
+		httperr.ResponseErrorL(c, errcode.ErrUserScanLoginDisabled, nil, nil)
 	case errors.Is(err, errQRCodeInternalStoreFailed):
 		httperr.ResponseErrorL(c, errcode.ErrQRCodeStoreFailed, nil, nil)
 	default:

@@ -1,6 +1,7 @@
 package user
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,37 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type fakeScanLoginPendingStore struct {
+	key     string
+	value   string
+	expire  time.Duration
+	deleted string
+}
+
+func (s *fakeScanLoginPendingStore) SetAndExpire(key string, value interface{}, expire time.Duration) error {
+	s.key = key
+	s.value = fmt.Sprint(value)
+	s.expire = expire
+	return nil
+}
+
+func (s *fakeScanLoginPendingStore) Del(key string) error {
+	s.deleted = key
+	return nil
+}
+
+func TestSavePendingScanLoginAuthorization_UsesNonRedeemableNamespace(t *testing.T) {
+	store := &fakeScanLoginPendingStore{}
+	require.NoError(t, SavePendingScanLoginAuthorization(store, "code-1", "scanner-1", "uuid-1"))
+
+	assert.Equal(t, scanLoginPendingAuthorizationKey("code-1"), store.key)
+	assert.NotEqual(t, scanLoginReadyAuthorizationKey("code-1"), store.key)
+	assert.Equal(t, ScanLoginConfirmWindow, store.expire)
+	want, err := encodeScanLoginAuthorization("scanner-1", "uuid-1")
+	require.NoError(t, err)
+	assert.Equal(t, want, store.value)
+}
 
 func newScanLoginAuthorizationStoreForTest(t *testing.T) *scanLoginAuthorizationStore {
 	t.Helper()

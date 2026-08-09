@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,13 @@ func TestScanLoginQRCodeCreatesPendingStateOnly(t *testing.T) {
 func TestNonLoginQRCodeRemainsAvailableWhenScanLoginDisabled(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, user.NewDB(ctx).Insert(&user.Model{
+		UID:      testutil.UID,
+		Name:     "QR user",
+		Username: "qr_user",
+		ShortNo:  "qr001",
+		Status:   1,
+	}))
 	_, err := ctx.DB().InsertInto("system_setting").
 		Columns("category", "key_name", "value", "value_type").
 		Values("login", "scan_enabled", "0", "bool").Exec()
@@ -109,5 +117,6 @@ func TestNonLoginQRCodeRemainsAvailableWhenScanLoginDisabled(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
+	require.Equal(t, http.StatusOK, w.Code)
 	assert.NotContains(t, w.Body.String(), "err.server.user.scan_login_disabled")
 }

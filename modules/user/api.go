@@ -115,6 +115,7 @@ type User struct {
 	verificationDB           *verificationDB
 	languageService          *LanguageService
 	existingTokenSetter      existingTokenSetter
+	scanLoginAuthorizations  *scanLoginAuthorizationStore
 }
 
 type existingTokenSetter interface {
@@ -134,6 +135,9 @@ func (s redisExistingTokenSetter) SetIfExists(key string, value string, expire t
 
 // New New
 func New(ctx *config.Context) *User {
+	loginRedisClient := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
+		o.PoolSize = 10
+	})
 	u := &User{
 		ctx:                      ctx,
 		db:                       NewDB(ctx),
@@ -165,10 +169,9 @@ func New(ctx *config.Context) *User {
 		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
 		verificationDB:           newVerificationDB(ctx),
 		existingTokenSetter: redisExistingTokenSetter{
-			client: octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
-				o.PoolSize = 10
-			}),
+			client: loginRedisClient,
 		},
+		scanLoginAuthorizations: newScanLoginAuthorizationStore(loginRedisClient),
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
 	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
@@ -2067,6 +2070,10 @@ func (u *User) unregisterUserDeviceToken(c *wkhttp.Context) {
 
 // 获取登录的uuid（web登录）
 func (u *User) getLoginUUID(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
 	uuid := util.GenerUUID()
 	deviceId := c.Query("device_id")
 	deviceName := c.Query("device_name")
@@ -2130,6 +2137,11 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 // bundle 的浏览器会停在授权页等待（用户刷新即恢复），而不是被 expired 状态推去无限
 // 重新申请二维码。安全性不因此打折 —— 旧 bundle 同样拿不到 auth_code。
 func (u *User) getloginStatus(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"status": "disabled"})
+		return
+	}
 	uuid := c.Query("uuid")
 	qrcodeInfo, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid))
 	if err != nil {
@@ -2222,8 +2234,12 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 
 // 通过authCode登录
 func (u *User) loginWithAuthCode(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
 	authCode := c.Param("auth_code")
-	authCodeKey := fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode)
+	authCodeKey := scanLoginReadyAuthorizationKey(authCode)
 	flagI64, _ := strconv.ParseInt(c.Query("flag"), 10, 64)
 	var flag config.DeviceFlag
 	if flagI64 == 0 {
@@ -2262,6 +2278,30 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserAuthInfoInvalid(c, "scaner")
 		return
 	}
+	uuid, ok := authInfoMap["uuid"].(string)
+	if !ok || uuid == "" {
+		respondUserAuthInfoInvalid(c, "uuid")
+		return
+	}
+	if !u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery))) {
+		// Missing and wrong browser credentials intentionally collapse to the
+		// same response as an unknown authorization code.
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	consumed, err := u.scanLoginAuthorizations.Consume(authCode, authInfo)
+	if err != nil {
+		u.Error("原子消费扫码授权码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !consumed {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	// Consumption happens before any login side effect. A downstream failure
+	// burns this authorization and requires a fresh scan; fail-closed behavior
+	// is preferable to making a credential replayable across replicas.
 	// 获取老的token
 	token, err := u.ctx.Cache().Get(fmt.Sprintf("%s%d%s", u.ctx.GetConfig().Cache.UIDTokenCachePrefix, flag, scaner))
 	if err != nil {
@@ -2289,7 +2329,6 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		return
 	}
 	// 获取缓存设备
-	uuid, _ := authInfoMap["uuid"].(string)
 	if uuid != "" {
 		deviceCache, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid))
 		if err != nil {
@@ -2385,13 +2424,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		return
 	}
 
-	err = u.ctx.GetRedisConn().Del(authCodeKey)
-	if err != nil {
-		u.Error("删除授权码失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
-	}
-	// 登录已完成，与上面删除 authCode 同一个理由：把这一轮扫码留下的状态全部清掉，
+	// 登录已完成，把这一轮扫码留下的状态全部清掉，
 	// 不给已完成的会话留任何残余窗口。两处失败都不阻断登录（各自 TTL 会兜底）。
 	//   - 轮询密钥：留着等于多一段能读出凭据字段的时间
 	//   - qrcode:{uuid}：还携带 uid / auth_code / encrypt，其中 encrypt 是 Signal 密钥
@@ -2474,6 +2507,10 @@ func SendQRCodeInfo(uuid string, qrcode *common.QRCodeModel) {
 
 // 授权登录
 func (u *User) grantLogin(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
 	authCode := c.Query("auth_code")
 	loginUID := c.MustGet("uid").(string)
 	encrypt := c.Query("encrypt") // signal相关密钥
@@ -2481,7 +2518,7 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "auth_code")
 		return
 	}
-	authInfo, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
+	authInfo, err := u.ctx.GetRedisConn().GetString(scanLoginPendingAuthorizationKey(authCode))
 	if err != nil {
 		u.Error("获取授权信息失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
@@ -2516,20 +2553,19 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserAuthScannerMismatch)
 		return
 	}
-	uuid, _ := authInfoMap["uuid"].(string)
-	// authCode 是在**扫码**时签发的（handleScanLogin，TTL = ScanLoginAuthCodeTTL），而
-	// 用户可以在确认页停留到该 TTL 的最后一刻。下面把 qrcode:{uuid} 续成满 TTL 却不续
-	// authCode，就会出现「status 显示 authed、附带的 auth_code 只剩一秒」——浏览器兑换时
-	// 撞 ErrUserAuthCodeNotFound，而状态机已经停在 authed 无路可走。
-	//
-	// 在这里按同一档位重新计时：确认之后 authCode 与 qrcode 同时起算、同时到期，窗口
-	// 不再可能倒挂。（此前 authCode 是 10min、确认窗口 5min，靠 5 分钟余量把这个竞态盖住
-	// 了；TTL 收敛到 5min 后余量归零，必须显式修。）
-	if err = u.ctx.GetRedisConn().SetAndExpire(
-		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authInfo, ScanLoginAuthCodeTTL,
-	); err != nil {
-		u.Error("续期扫码授权码失败！", zap.Error(err))
+	uuid, ok := authInfoMap["uuid"].(string)
+	if !ok || uuid == "" {
+		respondUserAuthInfoInvalid(c, "uuid")
+		return
+	}
+	promoted, err := u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)
+	if err != nil {
+		u.Error("提升扫码授权码失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !promoted {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
 		return
 	}
 	qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
@@ -2542,6 +2578,11 @@ func (u *User) grantLogin(c *wkhttp.Context) {
 	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginConfirmWindow)
 	if err != nil {
 		u.Error("更新二维码信息失败！", zap.Error(err))
+		if revoked, revokeErr := u.scanLoginAuthorizations.Consume(authCode, authInfo); revokeErr != nil {
+			u.Warn("回滚扫码授权码失败！", zap.Error(revokeErr))
+		} else if !revoked {
+			u.Warn("扫码授权码在状态写入失败后已不再可回滚", zap.String("uuid", uuid))
+		}
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
