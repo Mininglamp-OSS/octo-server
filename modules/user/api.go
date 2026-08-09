@@ -2306,6 +2306,8 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
 		return
 	}
+	redemptionAudit := newScanLoginRedemptionAudit(u.Log, uuid, scaner)
+	defer redemptionAudit.WarnIfIncomplete()
 	// Consumption happens before any login side effect. A downstream failure
 	// burns this authorization and requires a fresh scan; fail-closed behavior
 	// is preferable to making a credential replayable across replicas.
@@ -2464,6 +2466,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	// newLoginUserDetailResp,必须单独补三个实名字段 —— 否则扫码登录的客户端
 	// 永远拿不到 self 实名态,和 POST /v1/user/login 契约不一致。
 	u.applyRealnameToAuthCodeMap(resp, userModel.UID)
+	redemptionAudit.MarkCompleted()
 	c.Response(resp)
 }
 
