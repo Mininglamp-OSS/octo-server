@@ -49,6 +49,49 @@ func TestRedisSessionStoreDeviceLookupAndCompensation(t *testing.T) {
 	require.Empty(t, got)
 }
 
+func TestRedisSessionStoreCompensationPreservesTokenAdoptedByAnotherReplica(t *testing.T) {
+	cfg := config.New()
+	clientA := octoredis.NewInstrumentedClient(cfg)
+	clientB := octoredis.NewInstrumentedClient(cfg)
+	storeA := NewRedisSessionStore(clientA, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	storeB := NewRedisSessionStore(clientB, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	uid := "session-adopted-" + util.GenerUUID()
+	token := "session-adopted-token-" + util.GenerUUID()
+	tokenKey := cfg.Cache.TokenCachePrefix + token
+	uidKey := cfg.Cache.UIDTokenCachePrefix + "1" + uid
+	t.Cleanup(func() {
+		_ = clientA.Del(tokenKey, uidKey).Err()
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+	payload, err := Encode(TokenInfo{UID: uid, Name: "same-payload"})
+	require.NoError(t, err)
+
+	// Replica A publishes a new credential, then stalls while updating IM.
+	require.NoError(t, storeA.IssueNew(context.Background(), token, payload, uid, 1))
+
+	// Replica B observes the compatibility index, adopts the same token, and
+	// completes its login. The payload is deliberately byte-identical so the
+	// store cannot mistake payload equality for issue-attempt ownership.
+	indexedToken, err := storeB.DeviceToken(context.Background(), uid, 1)
+	require.NoError(t, err)
+	require.Equal(t, token, indexedToken)
+	adopted, err := storeB.ReuseExisting(context.Background(), token, payload, uid, 1)
+	require.NoError(t, err)
+	require.True(t, adopted)
+
+	// Replica A's IM call now fails. Its compensation must not revoke the
+	// credential that replica B has already adopted and returned to a client.
+	require.NoError(t, storeA.RevokeIssued(context.Background(), token, uid, 1))
+	record, err := storeB.ReadToken(context.Background(), tokenKey)
+	require.NoError(t, err)
+	require.Equal(t, payload, record.Payload)
+	require.Positive(t, record.TTL)
+	indexedToken, err = storeB.DeviceToken(context.Background(), uid, 1)
+	require.NoError(t, err)
+	require.Equal(t, token, indexedToken)
+}
+
 func TestRedisSessionStoreReadsAtomicPayloadAndTTLStates(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
