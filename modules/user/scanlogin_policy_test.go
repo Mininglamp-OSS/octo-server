@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -43,12 +44,13 @@ func TestScanLoginDisabledBlocksUserEntryPoints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			req, _ := http.NewRequest(tc.method, tc.path, nil)
-			setPublicIPForUserTest(req, "9.9.8."+string(rune('1'+i)))
+			setPublicIPForUserTest(req, "9.9.8."+strconv.Itoa(i+1))
 			if tc.token {
 				req.Header.Set("token", testutil.Token)
 			}
 			s.GetRoute().ServeHTTP(w, req)
 
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Contains(t, w.Body.String(), "err.server.user.scan_login_disabled")
 		})
 	}
@@ -73,7 +75,7 @@ func TestScanLoginStatusReturnsDisabledStateImmediately(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	assert.JSONEq(t, `{"status":"disabled"}`, w.Body.String())
+	assert.JSONEq(t, `{"status":"`+scanLoginStatusDisabled+`"}`, w.Body.String())
 	assert.Less(t, time.Since(started), time.Second, "disabled status must bypass the 10-second long poll")
 }
 

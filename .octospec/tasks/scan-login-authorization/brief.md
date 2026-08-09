@@ -41,7 +41,8 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - `secret-handling` — `poll_secret` remains hashed at rest, is required for
   redemption, and must stay redacted from access and recovery logs.
 - `rate-limit` — existing strict per-IP limits on anonymous scan-login endpoints
-  remain in place.
+  remain in place, and non-finite RPS environment values fall back to safe
+  defaults instead of degrading the Redis limiter into fail-open behavior.
 
 ## State model
 
@@ -76,19 +77,36 @@ session's existing `poll_secret` and must be atomic and one-shot.
 - Missing or wrong `poll_secret` does not consume a ready authorization.
 - Correct `poll_secret` permits exactly one atomic consume; concurrent or replayed
   redemption cannot issue a second login.
+- Non-finite `DM_API_SCANLOGIN_*_RATELIMIT_RPS` values such as `NaN` and `+Inf`
+  are replaced with the corresponding finite default before limiter creation.
 - Disabling the switch blocks sessions created before the setting changed while
   it remains disabled.
 - Focused Go tests, race tests for the authorization store, i18n extraction/lint,
   formatting, and vet pass, or any infrastructure-only blocker is recorded with
   the exact command and error.
 
-## Rollout and rollback
+## Client and rollout contract
 
-- Deploy server code with the default enabled; this preserves existing behavior
-  while clients adopt `scan_login_enabled` and `disabled`.
-- In deployments that use only external identity login, set
-  `login.scan_enabled=false` through the System Setting management API. Replicas
-  converge through the existing snapshot reload mechanism.
+- Production currently disables local login and registration and uses OIDC as
+  the unified authentication flow. Set `login.scan_enabled=false` explicitly
+  after deploying the server so Web does not expose scan login and mobile exits
+  the flow on `err.server.user.scan_login_disabled` or polling state `disabled`.
+- `POST /v1/user/login_authcode/{code}` now requires the `poll_secret` returned
+  by `GET /v1/user/loginuuid`. The `scanned` polling state no longer includes a
+  scanner UID; clients must not depend on that field before confirmation.
+- The mobile client must present a real user confirmation step before calling
+  `grant_login`. The server closes scan-alone redemption and binds redemption to
+  the browser session, but does not by itself guarantee protection when a client
+  automatically confirms a scan.
+- Rolling deployment can invalidate in-flight scan sessions when old and new
+  replicas handle different steps. Users should restart the scan flow after the
+  deployment window; do not treat old sessions as backward-compatible.
+- `poll_secret` remains a query parameter for current CORS compatibility. It is
+  scrubbed by application access/recovery logs; ingress, CDN, and APM URL logs
+  must also redact it.
+- Deploy server code first, then apply the production setting above. Other
+  deployments keep the backward-compatible default `login.scan_enabled=true`
+  while clients adopt `scan_login_enabled`, `disabled`, and `poll_secret`.
 - Roll back operationally by restoring `login.scan_enabled=true`; no schema
   migration is required. Code rollback is safe because the default remains the
   historical enabled behavior.

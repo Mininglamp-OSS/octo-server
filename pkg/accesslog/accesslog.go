@@ -56,12 +56,10 @@ var secretQueryInPath = regexp.MustCompile(`(?i)\b(poll_secret=)[^&\s?"']*`)
 // authCodeInPath masks the redeemable scan-login auth code, which travels as a
 // path segment.
 //
-// POST /v1/user/login_authcode/{code} exchanges {code} for a full user token
-// without checking who is redeeming. loginWithAuthCode deletes the code on
-// success, so a logged line for a successful redemption is already spent — but
-// the early returns for an IM failure or a destroyed account happen BEFORE that
-// delete, so a failed redemption leaves a still-valid code in the log for up to
-// ScanLoginAuthCodeTTL (5 min).
+// POST /v1/user/login_authcode/{code} treats {code} as one half of the login
+// credential: the matching browser poll_secret is also required, and a valid
+// code is atomically consumed before login side effects. Rejected requests can
+// still contain an unspent code, so the path segment must always be masked.
 var authCodeInPath = regexp.MustCompile(`(?i)(/v1/user/login_authcode/)[^/\s?"']+`)
 
 // scrubSecretPatterns applies the non-webhook maskers. Split out so both the

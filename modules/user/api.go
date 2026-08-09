@@ -2146,7 +2146,7 @@ func (u *User) getLoginUUID(c *wkhttp.Context) {
 func (u *User) getloginStatus(c *wkhttp.Context) {
 	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
 		c.Header("Cache-Control", "no-store")
-		c.JSON(http.StatusOK, gin.H{"status": "disabled"})
+		c.JSON(http.StatusOK, gin.H{"status": scanLoginStatusDisabled})
 		return
 	}
 	uuid := c.Query("uuid")

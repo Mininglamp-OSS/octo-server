@@ -16,7 +16,10 @@ import (
 //
 // 该前缀在 octo-server 本地定义（而非 octo-lib common.*CachePrefix）：octo-lib 是
 // 外部模块，加常量需要先发版；本 key 的生命周期完全由 modules/user 掌握。
-const scanLoginPollSecretPrefix = "scanlogin:poll:"
+const (
+	scanLoginPollSecretPrefix = "scanlogin:poll:"
+	scanLoginStatusDisabled   = "disabled"
+)
 
 // scanLoginPollSecretQuery 是轮询方出示密钥的 query 参数名。
 //
