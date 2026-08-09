@@ -74,4 +74,3 @@ matrix is complete or widen those operations without a stable device identity.
   management account able to log in again.
 - The rollout floor prevents phase rollback but cannot prove Kubernetes replica
   retirement or production capacity. Those remain explicit go/no-go checks.
-

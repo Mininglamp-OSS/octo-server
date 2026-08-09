@@ -40,4 +40,3 @@ Checking only that the post-event bearer still authenticates misses the defect:
 the damage is to capacity and future revocation behavior. The pattern applies to
 distributed indexes, leases, caches, and outboxes whenever a primary monotonic
 state change is followed by non-transactional cleanup.
-
