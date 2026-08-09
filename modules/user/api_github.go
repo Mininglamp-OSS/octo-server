@@ -79,6 +79,16 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 			respondUserServiceError(c)
 			return
 		}
+		userInfoM, err = u.reloadUserAfterIssueFence(loginSpanCtx, userInfoM.UID)
+		if err != nil {
+			if errors.Is(err, ErrorUserNotExist) {
+				respondUserError(c, errcode.ErrUserNotFound)
+				return
+			}
+			u.Error("会话栅栏后复核 GitHub 登录用户失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
 		if userInfoM.IsDestroy == IsDestroyDone {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return

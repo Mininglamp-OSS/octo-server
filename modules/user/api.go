@@ -1548,6 +1548,16 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 			respondUserServiceError(c)
 			return
 		}
+		userInfo, err = u.reloadUserAfterIssueFence(loginSpanCtx, userInfo.UID)
+		if err != nil {
+			if errors.Is(err, ErrorUserNotExist) {
+				respondUserError(c, errcode.ErrUserNotFound)
+				return
+			}
+			u.Error("会话栅栏后复核微信登录用户失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
 		if userInfo.IsDestroy == IsDestroyDone {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return
@@ -1926,6 +1936,17 @@ func userSessionIssueFenceFromContext(ctx context.Context, uid string) (auth.Iss
 		return auth.IssueFence{}, false
 	}
 	return value.fence, true
+}
+
+func (u *User) reloadUserAfterIssueFence(ctx context.Context, uid string) (*Model, error) {
+	user, err := u.db.QueryByUID(uid)
+	if err != nil {
+		return nil, fmt.Errorf("reload fenced user: %w", err)
+	}
+	if user == nil || user.UID != uid {
+		return nil, ErrorUserNotExist
+	}
+	return user, nil
 }
 
 func issueUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) error {
@@ -3382,6 +3403,24 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	if err != nil {
 		u.Error("初始化设备验证登录会话栅栏失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	userInfo, err = u.reloadUserAfterIssueFence(spanCtx, userInfo.UID)
+	if err != nil {
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		u.Error("会话栅栏后复核设备验证用户失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	if userInfo.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountUnavailable)
 		return
 	}
 	err = u.smsServie.Verify(spanCtx, userInfo.Zone, userInfo.Phone, req.Code, commonapi.CodeTypeCheckMobile)
