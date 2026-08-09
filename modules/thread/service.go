@@ -521,6 +521,13 @@ func (s *Service) sendThreadRenamedMessage(groupNo, shortID, operatorUID, name s
 	channelID := BuildChannelID(groupNo, shortID)
 	payload := buildThreadRenamedPayload(operatorUID, operatorName, name)
 
+	// 注入父群权威 space_id：COMMUNITY_TOPIC 消息必须携带父群 SpaceID，客户端 SpaceFilter
+	// 据此归类 Space。裸 s.ctx.SendMessage 绕过了 message 模块的 enrichPayloadWithSpaceID，
+	// 缺失 space_id 会让冷缓存客户端回退到 channelInfo cache 推导 Space 并命中 fail-open，
+	// 把改名 tip 落到错误 Space。契约与 enrichPayloadWithSpaceIDCore 的 COMMUNITY_TOPIC
+	// 分支一致：父群 SpaceID 非空覆盖，空（老群 / 非 Space 部署）删除。
+	s.enrichThreadTipSpaceID(groupNo, payload)
+
 	err := s.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			NoPersist: 0,
@@ -534,6 +541,23 @@ func (s *Service) sendThreadRenamedMessage(groupNo, shortID, operatorUID, name s
 	})
 	if err != nil {
 		s.Warn("发送子区改名消息失败", zap.Error(err), zap.String("channel_id", channelID))
+	}
+}
+
+// enrichThreadTipSpaceID 按父群权威 SpaceID 注入 payload["space_id"]，与 message 模块
+// enrichPayloadWithSpaceIDCore 的 COMMUNITY_TOPIC 分支保持同一契约：父群 SpaceID 非空则覆盖，
+// 空（老群 / 非 Space 部署）则删除任何既有值，避免跨 Space 污染。查父群失败仅告警并跳过注入
+// （best-effort，不阻断发送）。
+func (s *Service) enrichThreadTipSpaceID(groupNo string, payload map[string]interface{}) {
+	g, err := s.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil {
+		s.Warn("查父群失败，跳过子区 tip space_id 注入", zap.String("group_no", groupNo), zap.Error(err))
+		return
+	}
+	if g != nil && g.SpaceID != "" {
+		payload["space_id"] = g.SpaceID
+	} else {
+		delete(payload, "space_id")
 	}
 }
 

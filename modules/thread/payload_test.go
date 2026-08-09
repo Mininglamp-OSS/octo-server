@@ -100,3 +100,31 @@ func TestParsePayloadType(t *testing.T) {
 	assert.Equal(t, 0, parsePayloadType(nil))
 	assert.Equal(t, 0, parsePayloadType([]byte(`not json`)))
 }
+
+// TestShouldProcessThreadMessage 在 listener 决策层（onMessages 用到的同一判定）锁定不变式：
+// 只有子区频道里的用户聊天正文才触发「解档 / message_count / preview / 自动加入」；子区改名 tip
+// 等系统消息必须被跳过。相比只喂 parsePayloadType 的纯单测，这里用真实 config.MessageResp
+// 覆盖了 channel-type 门 + content-type 门的组合，未来 listener 重接线若漏掉过滤会在此失败。
+func TestShouldProcessThreadMessage(t *testing.T) {
+	topic := common.ChannelTypeCommunityTopic.Uint8()
+	renameTip := []byte(util.ToJson(buildThreadRenamedPayload("uid_op", "操作者", "新子区名")))
+
+	tests := []struct {
+		name string
+		msg  *config.MessageResp
+		want bool
+	}{
+		{"nil message", nil, false},
+		{"non-topic channel (group) skipped", &config.MessageResp{ChannelType: common.ChannelTypeGroup.Uint8(), Payload: []byte(`{"type":1,"content":"hi"}`)}, false},
+		{"topic + rename Tip skipped", &config.MessageResp{ChannelType: topic, ChannelID: "g____s", FromUID: "uid_op", Payload: renameTip}, false},
+		{"topic + generic system type skipped", &config.MessageResp{ChannelType: topic, Payload: []byte(`{"type":1005}`)}, false},
+		{"topic + user text processed", &config.MessageResp{ChannelType: topic, ChannelID: "g____s", FromUID: "uid_u", Payload: []byte(`{"type":1,"content":"hello"}`)}, true},
+		{"topic + rich text processed", &config.MessageResp{ChannelType: topic, Payload: []byte(`{"type":14,"content":"rich"}`)}, true},
+		{"topic + unparseable payload processed (fail-safe)", &config.MessageResp{ChannelType: topic, Payload: []byte(`not json`)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, shouldProcessThreadMessage(tt.msg))
+		})
+	}
+}
