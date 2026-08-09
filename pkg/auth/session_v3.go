@@ -53,16 +53,18 @@ local current = redis.call("GET", KEYS[1])
 local revision = 0
 local last_version = 0
 local ttl = -2
+local previous_generation = ""
 if current then
   local decoded = cjson.decode(current)
   revision = tonumber(decoded.revision) or 0
   last_version = tonumber(decoded.last_event_version) or 0
   if last_version >= tonumber(ARGV[2]) then
     if last_version == tonumber(ARGV[2]) and decoded.last_event_id == ARGV[3] then
-      return 0
+      return {0, decoded.last_revoked_generation or ""}
     end
-    return -1
+    return {-1, ""}
   end
+  previous_generation = decoded.generation or ""
   ttl = redis.call("PTTL", KEYS[1])
 end
 local next = cjson.encode({
@@ -70,7 +72,8 @@ local next = cjson.encode({
   revision = revision + 1,
   state = "active",
   last_event_version = tonumber(ARGV[2]),
-  last_event_id = ARGV[3]
+  last_event_id = ARGV[3],
+  last_revoked_generation = previous_generation
 })
 if ttl == -1 then
   redis.call("SET", KEYS[1], next)
@@ -81,7 +84,7 @@ else
   end
   redis.call("SET", KEYS[1], next, "PX", next_ttl)
 end
-return 1
+return {1, previous_generation}
 `)
 	extendGenerationDeadlineScript = rd.NewScript(`
 local current = redis.call("GET", KEYS[1])
@@ -143,11 +146,12 @@ type RevocationEvent struct {
 }
 
 type sessionGenerationRecord struct {
-	Generation       string `json:"generation"`
-	Revision         uint64 `json:"revision"`
-	State            string `json:"state"`
-	LastEventVersion uint64 `json:"last_event_version,omitempty"`
-	LastEventID      string `json:"last_event_id,omitempty"`
+	Generation            string `json:"generation"`
+	Revision              uint64 `json:"revision"`
+	State                 string `json:"state"`
+	LastEventVersion      uint64 `json:"last_event_version,omitempty"`
+	LastEventID           string `json:"last_event_id,omitempty"`
+	LastRevokedGeneration string `json:"last_revoked_generation,omitempty"`
 }
 
 type sessionIndexMember struct {
@@ -302,7 +306,7 @@ func (s *RedisSessionStore) ReuseSession(ctx context.Context, token string, snap
 			return ok, err
 		}
 	}
-	s.cleanupIndexReservationIfLegacy(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID)
+	s.cleanupIndexReservationIfLegacy(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation)
 	return false, errors.New("auth: reused token changed too frequently")
 }
 
@@ -393,7 +397,7 @@ func (s *RedisSessionStore) reuseExistingV3(ctx context.Context, token, currentP
 	if err != nil {
 		return false, false, err
 	}
-	if err := s.addSessionIndex(current.UID, member, current.ExpiresAt, ttl); err != nil {
+	if err := s.addSessionIndex(current.UID, current.SessionGeneration, member, current.ExpiresAt, ttl); err != nil {
 		return false, false, err
 	}
 	if err := s.client.Set(s.uidTokenKey(current.UID, current.DeviceFlag), token, ttl).Err(); err != nil {
@@ -439,23 +443,23 @@ func (s *RedisSessionStore) promoteLegacySession(ctx context.Context, token stri
 	if err != nil {
 		return false, false, err
 	}
-	if err := s.addSessionIndex(snapshot.UID, member, expiresAt, capTTL); err != nil {
+	if err := s.addSessionIndex(snapshot.UID, fence.Generation, member, expiresAt, capTTL); err != nil {
 		return false, false, err
 	}
 	ttl, replaced, conflict, err := s.casReplacePayloadKeepDeadline(ctx, token, record.Payload, ownedPayload, capTTL)
 	if err != nil {
-		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID), member).Err()
+		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID, fence.Generation), member).Err()
 		return false, false, err
 	}
 	if conflict {
 		return false, true, nil
 	}
 	if !replaced {
-		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID), member).Err()
+		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID, fence.Generation), member).Err()
 		return false, false, nil
 	}
 	cleanup := func(primary error) error {
-		cleanupErr := s.cleanupIssuedV3(token, ownedPayload, snapshot.UID, snapshot.DeviceFlag, member)
+		cleanupErr := s.cleanupIssuedV3(token, ownedPayload, snapshot.UID, snapshot.DeviceFlag, fence.Generation, member)
 		if cleanupErr != nil {
 			return fmt.Errorf("%w (promoted credential cleanup failed: %v)", primary, cleanupErr)
 		}
@@ -524,7 +528,7 @@ func (s *RedisSessionStore) casReplacePayloadKeepDeadline(ctx context.Context, t
 	return time.Duration(ttlMS) * time.Millisecond, true, false, nil
 }
 
-func (s *RedisSessionStore) cleanupIndexReservationIfLegacy(token, uid string, deviceFlag int, deviceID string) {
+func (s *RedisSessionStore) cleanupIndexReservationIfLegacy(token, uid string, deviceFlag int, deviceID, generation string) {
 	raw, err := s.client.Get(s.tokenKey(token)).Result()
 	if err == nil {
 		if info, decodeErr := Decode(raw); decodeErr == nil && info.IsV3() {
@@ -533,7 +537,7 @@ func (s *RedisSessionStore) cleanupIndexReservationIfLegacy(token, uid string, d
 	}
 	member, err := encodeSessionIndexMember(token, deviceFlag, deviceID)
 	if err == nil {
-		_ = s.client.ZRem(s.sessionIndexKey(uid), member).Err()
+		_ = s.client.ZRem(s.sessionIndexKey(uid, generation), member).Err()
 	}
 }
 
@@ -586,14 +590,14 @@ func (s *RedisSessionStore) IssueNewSession(ctx context.Context, token string, i
 		return ErrTokenCollision
 	}
 	cleanup := func(primary error) error {
-		cleanupErr := s.cleanupIssuedV3(token, ownedPayload, info.UID, info.DeviceFlag, member)
+		cleanupErr := s.cleanupIssuedV3(token, ownedPayload, info.UID, info.DeviceFlag, fence.Generation, member)
 		if cleanupErr != nil {
 			return fmt.Errorf("%w (credential cleanup failed: %v)", primary, cleanupErr)
 		}
 		return primary
 	}
 
-	if err := s.addSessionIndex(info.UID, member, expiresAt, ttl); err != nil {
+	if err := s.addSessionIndex(info.UID, fence.Generation, member, expiresAt, ttl); err != nil {
 		return cleanup(err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -666,20 +670,35 @@ func (s *RedisSessionStore) RevokeAll(ctx context.Context, uid string, event Rev
 	if err != nil {
 		return fmt.Errorf("auth: rotate session generation: %w", err)
 	}
-	code, err := redisInteger(result)
+	parts, ok := result.([]interface{})
+	if !ok || len(parts) != 2 {
+		return fmt.Errorf("auth: invalid session generation rotation result %T", result)
+	}
+	code, err := redisInteger(parts[0])
 	if err != nil {
 		return err
 	}
-	alreadyApplied := code <= 0
+	previousGeneration, err := redisString(parts[1])
+	if err != nil {
+		return err
+	}
+	if code == -1 {
+		return ErrRevocationAlreadyApplied
+	}
+	if code != 0 && code != 1 {
+		return fmt.Errorf("auth: unexpected session generation rotation result %d", code)
+	}
 	if s.mode.rank() >= SessionModeRevoke.rank() {
 		if err := s.client.Set(s.legacyDenyKey(uid), strconv.FormatUint(event.Version, 10), 0).Err(); err != nil {
 			return fmt.Errorf("auth: persist legacy session deny marker: %w", err)
 		}
 	}
-	if err := s.client.Del(s.sessionIndexKey(uid)).Err(); err != nil {
-		return fmt.Errorf("auth: session generation revoked but index cleanup failed: %w", err)
+	if previousGeneration != "" {
+		if err := s.client.Del(s.sessionIndexKey(uid, previousGeneration)).Err(); err != nil {
+			return fmt.Errorf("auth: session generation revoked but index cleanup failed: %w", err)
+		}
 	}
-	if alreadyApplied {
+	if code == 0 {
 		return ErrRevocationAlreadyApplied
 	}
 	return nil
@@ -732,7 +751,7 @@ func (s *RedisSessionStore) RevokeCurrent(ctx context.Context, token, uid string
 			if err != nil {
 				return err
 			}
-			if err := s.client.ZRem(s.sessionIndexKey(uid), member).Err(); err != nil {
+			if err := s.client.ZRem(s.sessionIndexKey(uid, info.SessionGeneration), member).Err(); err != nil {
 				return fmt.Errorf("auth: delete current v3 session index: %w", err)
 			}
 		}
@@ -789,10 +808,13 @@ func (s *RedisSessionStore) requireFence(ctx context.Context, uid string, fence 
 	return nil
 }
 
-func (s *RedisSessionStore) addSessionIndex(uid, member string, expiresAt int64, ttl time.Duration) error {
+func (s *RedisSessionStore) addSessionIndex(uid, generation, member string, expiresAt int64, ttl time.Duration) error {
+	if strings.TrimSpace(generation) == "" {
+		return errors.New("auth: add v3 session index requires generation")
+	}
 	result, err := addSessionIndexScript.Run(
 		s.client,
-		[]string{s.sessionIndexKey(uid)},
+		[]string{s.sessionIndexKey(uid, generation)},
 		s.now().UTC().Unix(),
 		member,
 		expiresAt,
@@ -815,7 +837,7 @@ func (s *RedisSessionStore) addSessionIndex(uid, member string, expiresAt int64,
 	return nil
 }
 
-func (s *RedisSessionStore) cleanupIssuedV3(token, ownedPayload, uid string, deviceFlag int, member string) error {
+func (s *RedisSessionStore) cleanupIssuedV3(token, ownedPayload, uid string, deviceFlag int, generation, member string) error {
 	result, err := compareDeleteScript.Run(s.client, []string{s.tokenKey(token)}, ownedPayload).Result()
 	if err != nil {
 		return fmt.Errorf("auth: delete issued v3 token: %w", err)
@@ -830,7 +852,7 @@ func (s *RedisSessionStore) cleanupIssuedV3(token, ownedPayload, uid string, dev
 	if err := s.compareDeleteDeviceIndex(token, uid, deviceFlag); err != nil {
 		return err
 	}
-	if err := s.client.ZRem(s.sessionIndexKey(uid), member).Err(); err != nil {
+	if err := s.client.ZRem(s.sessionIndexKey(uid, generation), member).Err(); err != nil {
 		return fmt.Errorf("auth: delete issued v3 session index: %w", err)
 	}
 	return nil
@@ -840,8 +862,8 @@ func (s *RedisSessionStore) generationKey(uid string) string {
 	return s.uidTokenPrefix + "auth:generation:" + sessionSubject(uid)
 }
 
-func (s *RedisSessionStore) sessionIndexKey(uid string) string {
-	return s.uidTokenPrefix + "auth:sessions:" + sessionSubject(uid)
+func (s *RedisSessionStore) sessionIndexKey(uid, generation string) string {
+	return s.uidTokenPrefix + "auth:sessions:" + sessionSubject(uid) + ":" + sessionSubject(generation)
 }
 
 func (s *RedisSessionStore) legacyDenyKey(uid string) string {
@@ -879,6 +901,17 @@ func decodeSessionGeneration(value interface{}) (sessionGenerationRecord, error)
 		return sessionGenerationRecord{}, errors.New("auth: invalid session generation record")
 	}
 	return record, nil
+}
+
+func redisString(value interface{}) (string, error) {
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case []byte:
+		return string(typed), nil
+	default:
+		return "", fmt.Errorf("auth: invalid redis string result %T", value)
+	}
 }
 
 func encodeSessionIndexMember(token string, deviceFlag int, deviceID string) (string, error) {

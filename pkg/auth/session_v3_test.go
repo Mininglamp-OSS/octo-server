@@ -296,7 +296,7 @@ func TestRedisSessionStoreConcurrentIndexNeverExceedsBound(t *testing.T) {
 	for err := range errs {
 		require.ErrorIs(t, err, ErrSessionLimitReached)
 	}
-	count, err := clientA.ZCard(storeA.sessionIndexKey(uid)).Result()
+	count, err := clientA.ZCard(storeA.sessionIndexKey(uid, fence.Generation)).Result()
 	require.NoError(t, err)
 	require.EqualValues(t, 2, count)
 }
