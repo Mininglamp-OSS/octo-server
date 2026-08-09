@@ -39,6 +39,12 @@ func parseTokenExpire(value, source string) (time.Duration, error) {
 	if duration <= 0 {
 		return 0, fmt.Errorf("%s must be greater than zero", source)
 	}
+	// Redis PX and the Session Store Lua contract represent deadlines in whole
+	// milliseconds. Accepting a smaller duration would pass startup validation
+	// but become PX 0 at write time, making every token write fail at runtime.
+	if duration < time.Millisecond {
+		return 0, fmt.Errorf("%s must be at least %s", source, time.Millisecond)
+	}
 	if duration > MaxTokenExpire {
 		return 0, fmt.Errorf("%s must not exceed %s", source, MaxTokenExpire)
 	}

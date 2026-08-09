@@ -130,10 +130,32 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context) {
 	cfg.DB.MySQLAddr = fmt.Sprintf("root:demo@tcp(127.0.0.1:3306)/%s?charset=utf8mb4&parseTime=true", databaseName)
 	ctx := config.NewContext(cfg)
 
+	// module.Setup must run the complete migration set, but octo-lib caches its
+	// module instances behind a process-wide sync.Once. Under CI's shuffled
+	// package tests those instances may belong to an earlier `test` database
+	// context, so routes registered by Setup must not serve this isolated DB.
+	migrationServer := libserver.New(ctx)
+	migrationServer.GetRoute().UseGin(ctx.Tracer().GinMiddle())
+	ctx.SetHttpRoute(migrationServer.GetRoute())
+	require.NoError(t, module.Setup(ctx), "set up modules in isolated token TTL database")
+
+	// Register only the handlers exercised here from objects constructed with
+	// this test's context. This keeps handler reads and fixture writes on the
+	// same isolated database regardless of which package test initialized the
+	// global module registry first.
 	server := libserver.New(ctx)
 	server.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(server.GetRoute())
-	require.NoError(t, module.Setup(ctx), "set up modules in isolated token TTL database")
+	store := auth.SessionStoreForContext(ctx)
+	server.GetRoute().SetTokenParser(auth.NewCacheTokenParser(
+		ctx.Cache(),
+		cfg.Cache.TokenCachePrefix,
+		auth.WithTokenValidator(auth.NewTokenValidator(store, cfg.Cache.TokenCachePrefix)),
+	))
+	userAPI := New(ctx)
+	managerAPI := NewManager(ctx)
+	server.GetRoute().POST("/v1/manager/login", managerAPI.login)
+	server.GetRoute().Group("/v1/user", ctx.AuthMiddleware(server.GetRoute())).PUT("/current", userAPI.userUpdateWithField)
 	return server, ctx
 }
 
