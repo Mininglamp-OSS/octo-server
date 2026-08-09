@@ -310,7 +310,8 @@ func TestRedisSessionStoreRevocationRetryDoesNotRevokePostEventSession(t *testin
 	storeA := NewRedisSessionStore(clientA, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeRevoke), WithSessionMaxPerUID(2))
 	storeB := NewRedisSessionStore(clientB, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeRevoke), WithSessionMaxPerUID(2))
 	uid := "u-" + util.GenerUUID()
-	token := "t-" + util.GenerUUID()
+	tokenA := "t-" + util.GenerUUID()
+	tokenB := "t-" + util.GenerUUID()
 	event := RevocationEvent{Version: 1, ID: "event-" + util.GenerUUID()}
 	t.Cleanup(func() {
 		keys, _ := clientA.Keys(prefix + "*").Result()
@@ -328,12 +329,18 @@ func TestRedisSessionStoreRevocationRetryDoesNotRevokePostEventSession(t *testin
 	require.NoError(t, storeA.RevokeAll(context.Background(), uid, event))
 	postEventFence, err := storeB.BeginIssue(context.Background(), uid)
 	require.NoError(t, err)
-	require.NoError(t, storeB.IssueNewSession(context.Background(), token, TokenInfo{UID: uid, DeviceFlag: 1}, postEventFence))
+	require.NoError(t, storeB.IssueNewSession(context.Background(), tokenA, TokenInfo{UID: uid, DeviceFlag: 1}, postEventFence))
+	require.NoError(t, storeB.IssueNewSession(context.Background(), tokenB, TokenInfo{UID: uid, DeviceFlag: 2}, postEventFence))
 	require.ErrorIs(t, storeA.RevokeAll(context.Background(), uid, event), ErrRevocationAlreadyApplied)
 
 	validator := NewTokenValidator(storeA, prefix)
-	_, err = validator.Validate(context.Background(), token)
+	_, err = validator.Validate(context.Background(), tokenA)
 	require.NoError(t, err)
+	_, err = validator.Validate(context.Background(), tokenB)
+	require.NoError(t, err)
+	err = storeA.IssueNewSession(context.Background(), "t-"+util.GenerUUID(), TokenInfo{UID: uid, DeviceFlag: 3}, postEventFence)
+	require.ErrorIs(t, err, ErrSessionLimitReached,
+		"replaying an old revocation event must not erase post-event sessions from the bounded index")
 }
 
 func TestTokenValidatorAppliesLegacyRolloutPolicy(t *testing.T) {
