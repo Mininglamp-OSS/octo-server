@@ -1,11 +1,13 @@
 package user
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,32 +24,40 @@ import (
 // 只依赖 Redis(CI 必备),不碰 WuKongIM —— 完整 HTTP e2e 因 CI 的 IM 不接受给未注册 uid
 // 发 token(UpdateIMToken 返回 im_call_failed)而不可移植,故下沉到 race 真正发生的
 // Redis 层。配套 fake 实现的纯单测见 TestRefreshExistingLoginToken_DoesNotRecreateDeletedToken。
-func TestRedisExistingTokenSetter_SetXX_RealRedis(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
-	setter := redisExistingTokenSetter{
-		client: octoredis.NewInstrumentedClient(ctx.GetConfig()),
-	}
-	prefix := ctx.GetConfig().Cache.TokenCachePrefix
+func TestRedisSessionStore_ReuseExisting_RealRedis(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	t.Cleanup(func() { _ = client.Close() })
+	store := auth.NewRedisSessionStore(client, cfg.Cache.TokenCachePrefix, cfg.Cache.UIDTokenCachePrefix, time.Minute)
+	prefix := cfg.Cache.TokenCachePrefix
 
 	t.Run("key不存在_不创建_模拟logout已删除", func(t *testing.T) {
-		key := prefix + "pr225-missing-" + util.GenerUUID()
-		require.NoError(t, ctx.GetRedisConn().Del(key)) // 前置:token:<old> 已被 logout 删除
-		ok, err := setter.SetIfExists(key, "payload", time.Minute)
+		token := "pr225-missing-" + util.GenerUUID()
+		key := prefix + token
+		require.NoError(t, client.Del(key).Err())
+		ok, err := store.ReuseExisting(context.Background(), token, "payload", "u1", 1)
 		require.NoError(t, err)
 		assert.False(t, ok, "SET XX 对不存在的 key 必须返回 false,不能复活已登出 token")
-		got, err := ctx.Cache().Get(key)
+		exists, err := client.Exists(key).Result()
 		require.NoError(t, err)
-		assert.Empty(t, got, "已登出的 token key 不得被重新创建")
+		assert.Zero(t, exists, "已登出的 token key 不得被重新创建")
 	})
 
 	t.Run("key存在_刷新payload_保证Web多端复用", func(t *testing.T) {
-		key := prefix + "pr225-exists-" + util.GenerUUID()
-		require.NoError(t, ctx.Cache().SetAndExpire(key, "old-payload", time.Minute))
-		ok, err := setter.SetIfExists(key, "new-payload", time.Minute)
+		token := "pr225-exists-" + util.GenerUUID()
+		key := prefix + token
+		require.NoError(t, client.Set(key, "old-payload", time.Minute).Err())
+		before, err := client.PTTL(key).Result()
+		require.NoError(t, err)
+		ok, err := store.ReuseExisting(context.Background(), token, "new-payload", "u1", 1)
 		require.NoError(t, err)
 		assert.True(t, ok, "SET XX 对存在的 key 必须返回 true(正常 Web 多端复用)")
-		got, err := ctx.Cache().Get(key)
+		got, err := client.Get(key).Result()
 		require.NoError(t, err)
 		assert.Equal(t, "new-payload", got, "SET XX 必须刷新已存在 key 的 payload")
+		after, err := client.PTTL(key).Result()
+		require.NoError(t, err)
+		assert.LessOrEqual(t, after, before, "复用旧 token 不得延长 deadline")
+		require.NoError(t, client.Del(key, cfg.Cache.UIDTokenCachePrefix+"1u1").Err())
 	})
 }

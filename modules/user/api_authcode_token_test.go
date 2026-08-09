@@ -28,17 +28,18 @@ func TestLoginWithAuthCode_ReusedTokenGuardedBySetXX(t *testing.T) {
 	require.NotEqual(t, -1, fnEnd)
 	fnBody := body[fnStart : fnStart+len(fnSig)+fnEnd]
 
-	// 1. 复用旧 token 必须走 SET XX 守卫(refreshExistingLoginToken),
-	//    不能再无条件 SetAndExpire 复活 token key。
-	assert.Contains(t, fnBody, "u.refreshExistingLoginToken(",
-		"loginWithAuthCode 复用旧 token 必须经 refreshExistingLoginToken(SET XX)校验,避免复活已登出 token")
+	// 1. 复用旧 token 必须走 Session Store 的保 deadline 守卫。
+	assert.Contains(t, fnBody, "u.reuseExistingLoginToken(",
+		"loginWithAuthCode 复用旧 token 必须经 Session Store 校验,避免复活或续期已登出 token")
 
-	// 2. 必须保留 reuseExistingToken 标记,SetAndExpire 只能在 !reuseExistingToken 分支兜底。
+	// 2. 必须保留 reuseExistingToken 标记,IssueNew 只能在新签发分支执行。
 	assert.Contains(t, fnBody, "if !reuseExistingToken {",
-		"loginWithAuthCode 只能在 !reuseExistingToken 分支无条件写 token 缓存")
+		"loginWithAuthCode 只能在 !reuseExistingToken 分支签发新 token")
+	assert.Contains(t, fnBody, "u.sessionStore.IssueNew(",
+		"loginWithAuthCode 新 token 必须通过 Session Store 签发")
 
 	// 3. token 缓存的最终决策必须在调用 IM 之前完成,否则 IM 会拿到回退前的旧 token。
-	guardIdx := strings.Index(fnBody, "u.refreshExistingLoginToken(")
+	guardIdx := strings.Index(fnBody, "u.reuseExistingLoginToken(")
 	imIdx := strings.Index(fnBody, "u.ctx.UpdateIMToken(")
 	require.NotEqual(t, -1, imIdx, "loginWithAuthCode 必须调用 UpdateIMToken")
 	assert.Less(t, guardIdx, imIdx,
