@@ -98,7 +98,7 @@ Redis 原子更新优先使用 Lua `PTTL + SET PX`，兼容当前 go-redis 版�
 
 - `PTTL > 0`：以原剩余毫秒数重写 value。
 - `PTTL == -2`：返回 missing，调用方不得重建相同 Token。
-- `PTTL == -1`：记录 `persistent_detected`，在兼容迁移阶段只赋予一次固定 legacy grace TTL；不得继续保持永久。
+- `PTTL == -1`：记录 `persistent_detected` 且不得继续保持永久。Release A 的在线资料更新/重复登录只把被触达 key 收敛到当前 `TokenExpire` 上限（默认最多 720h），不冒充尚未批准的 7 天迁移；显式 migration apply 在生产盘点和 go/no-go 后才使用一次固定 legacy grace，且重复执行不得延长已有 TTL。因此进入 enforce 仍必须以 observe 的实际 `v1/v2=0` 为准，不能按“已过 7 天”推断。
 
 多 key Lua 前必须核对生产 Redis 是否为 Cluster。若为 Cluster，key 设计必须使用同一 hash tag，或拆成单 key 原子操作并明确补偿；不能假设 standalone。
 当前仓库的 `*redis.Client + 单 redisAddr` 没有原生 Cluster 拓扑发现能力；若生产是 native Redis Cluster 而不是兼容单端点 proxy，应先把客户端/slot 设计作为阻塞前置项，不能只调整 Lua key 名后宣称支持。
