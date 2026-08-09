@@ -140,6 +140,12 @@ return 1
 // RollbackPromotion atomically restores a ready authorization to pending when
 // publishing the authed QR state fails. It never overwrites an existing pending
 // record, so a stale rollback cannot replace a newer confirmation attempt.
+//
+// A Redis write error can be outcome-ambiguous: the authed QR state may have
+// reached Redis before its caller observed an error. Rolling back still favors
+// non-redeemability, so the QR may temporarily say authed while this record is
+// pending again. Clients must treat a failed redemption as retryable by starting
+// a fresh scan flow instead of treating the displayed QR state as final success.
 func (s *scanLoginAuthorizationStore) RollbackPromotion(authCode, expected string, ttl time.Duration) (bool, error) {
 	if s == nil || s.client == nil || authCode == "" || expected == "" || ttl <= 0 {
 		return false, errScanLoginAuthorizationInvalid

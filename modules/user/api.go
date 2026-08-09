@@ -2211,6 +2211,10 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// process cannot receive its in-memory channel notification. Once the shared
 	// Redis read already shows authed, entering the 10-second long poll only adds
 	// latency and retains a goroutine without waiting for any useful transition.
+	// Authorized and unauthorized callers take the same early return, so it does
+	// not reveal whether poll_secret matched. respondStatus still strips credential
+	// fields for unauthorized callers, and the strict per-IP limiter remains the
+	// abuse-control fallback for repeated terminal-state polling.
 	if scanLoginStatusIs(qrcodeModel, string(common.ScanLoginStatusAuthed)) {
 		respondStatus(qrcodeModel)
 		return
@@ -2223,8 +2227,9 @@ func (u *User) getloginStatus(c *wkhttp.Context) {
 	// 端点上的一个廉价登录延迟惩罚。未授权方本来也只能拿到白名单字段，订阅对它毫无意义。
 	//
 	// 不注册时 qrcodeChan 为 nil：从 nil channel 接收永远阻塞，select 自然落到超时分支。
-	// 刻意让未授权方也等满同样的 10 秒 —— 立刻返回会泄露「密钥对不对」的时序信号，
-	// 也会让攻击者能高频轮询。
+	// 对尚未 authed 的状态，刻意让未授权方等满 10 秒 —— 此时立刻返回会泄露「密钥
+	// 对不对」的时序信号，也会让攻击者能高频轮询。上面的 authed 终态短路对授权与
+	// 未授权方一致，因此不携带这类密钥判定信号。
 	var qrcodeChan <-chan *common.QRCodeModel
 	if authorized {
 		qrcodeChan = u.getQRCodeModelChan(uuid)

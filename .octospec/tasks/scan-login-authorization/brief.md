@@ -79,8 +79,9 @@ session's existing `poll_secret` and must be atomic and one-shot.
   redemption cannot issue a second login.
 - Two independently constructed server instances sharing the same Redis permit
   exactly one pending promotion and one session issuance. Every replica can read
-  the confirmed state, and an already `authed` state returns immediately instead
-  of retaining a 10-second long-poll goroutine.
+  the confirmed state. A new poll that reads an already `authed` state returns
+  immediately instead of retaining a 10-second long-poll goroutine; a poll that
+  was already waiting on another replica can still take up to 10 seconds.
 - Non-finite `DM_API_SCANLOGIN_*_RATELIMIT_RPS` values such as `NaN` and `+Inf`
   are replaced with the corresponding finite default before limiter creation.
 - Disabling the switch blocks sessions created before the setting changed while
@@ -120,7 +121,19 @@ session's existing `poll_secret` and must be atomic and one-shot.
   different replica can wait until the existing 10-second timeout before its
   next shared-Redis read; this affects latency only and does not bypass the
   `poll_secret`, confirmation, or one-shot consume gates. Sticky routing can
-  reduce this bounded delay but is not required for correctness.
+  reduce this bounded delay but is not required for correctness. A new poll that
+  initially reads `authed` returns immediately; `scanned` has no equivalent
+  shared-state short circuit and can still take up to 10 seconds to surface.
+- A failed QR-state publish is rolled back to pending. Because a Redis write can
+  succeed server-side before the caller observes an error, the QR can briefly
+  report `authed` while redemption is unavailable. Confirmation or redemption
+  failures and ambiguous outcomes must restart the complete scan flow; clients
+  must not treat the displayed QR state as proof of a completed login.
+- Redemption consumes the authorization before issuing the session. If session
+  issuance succeeds but the HTTP response is lost, the token cache and IM state
+  may already be updated while the client received no credentials. This remains
+  fail-closed against replay; the client must restart the complete scan flow
+  instead of retrying the consumed authorization code.
 - Other deployments keep the backward-compatible default
   `login.scan_enabled=true` while clients adopt `scan_login_enabled`, `disabled`,
   and `poll_secret`.
