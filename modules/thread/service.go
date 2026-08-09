@@ -33,6 +33,29 @@ func parsePayloadContent(payload []byte) string {
 	return m.Content
 }
 
+// parsePayloadType 从消息 payload 中提取 type（content type）字段。
+// 解析失败或缺省返回 0（普通文本消息的 type 落在 1~99，缺省视为普通消息）。
+func parsePayloadType(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	var m struct {
+		Type int `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return 0
+	}
+	return m.Type
+}
+
+// isSystemContentType 判断是否为系统通知类 content type（Tip=2000 / 群通知 1000+ / 客服 1200+ /
+// 通话结果 9989 等，均 >= 1000）。这类消息不是用户聊天正文：不应触发子区解档、message_count
+// 自增、thread-list preview 覆盖，也不应把 operator 自动加入子区。普通用户消息 content type 均 < 1000
+// （文本 1、图片 2……富文本 14），由 sendSourceMessage 拷贝到子区的源消息也落在该区间。
+func isSystemContentType(contentType int) bool {
+	return contentType >= int(common.FriendApply)
+}
+
 // IService 子区服务接口
 type IService interface {
 	// CreateThread 创建子区
@@ -468,8 +491,10 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 }
 
 // buildThreadRenamedPayload 构建子区改名 Tip 系统消息的 payload。
-// 与群改名（octo-lib msg_group.go SendGroupUpdate 的 GroupAttrKeyName 分支）对称：
-// content 以 "{0}" 占位符开头，客户端渲染时用 extra[0] 的用户名替换成 operator 显示名。
+// schema 采用「Tip + {0} 占位符 + extra」这套系统 tip 格式（与群解散 group/event.go、
+// 置顶消息 message/api_pinned.go 一致）：content 以 "{0}" 开头，客户端渲染时用 extra[0] 的
+// 用户名替换成 operator 显示名。注意这不是群改名 SendGroupUpdate 的 schema——群改名用的是
+// type=GroupUpdate(1005) + data，客户端按 GroupUpdate 处理；#663 明确要求 Tip，故走 tip 系。
 func buildThreadRenamedPayload(operatorUID, operatorName, name string) map[string]interface{} {
 	return map[string]interface{}{
 		"from_uid":  operatorUID,
@@ -482,12 +507,19 @@ func buildThreadRenamedPayload(operatorUID, operatorName, name string) map[strin
 	}
 }
 
-// sendThreadRenamedMessage 子区改名成功后向子区 channel 发一条 Tip 系统消息，
-// 与群改名（octo-lib SendGroupUpdate）对称。best-effort：失败仅告警，改名已落库不回滚，
-// 推送标题缓存失效 + TTL 兜底。
+// sendThreadRenamedMessage 子区改名成功后向子区 channel 发一条 Tip 系统消息（防滥用 + 可追溯）。
+// best-effort：失败仅告警，改名已落库不回滚，推送标题缓存失效 + TTL 兜底。
+// 若 operator 用户名解析为空（用户服务瞬时故障等），跳过发送而非发一条匿名 tip——
+// 匿名 tip 会渲染成「(空){0}...修改子区名为...」这种没有操作者的历史记录，不如不发。
 func (s *Service) sendThreadRenamedMessage(groupNo, shortID, operatorUID, name string) {
+	operatorName := s.getUserName(operatorUID)
+	if operatorName == "" {
+		s.Warn("跳过子区改名 tip：operator 用户名解析为空", zap.String("operator_uid", operatorUID), zap.String("short_id", shortID))
+		return
+	}
+
 	channelID := BuildChannelID(groupNo, shortID)
-	payload := buildThreadRenamedPayload(operatorUID, s.getUserName(operatorUID), name)
+	payload := buildThreadRenamedPayload(operatorUID, operatorName, name)
 
 	err := s.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
@@ -539,6 +571,12 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	}
 	if thread.Status == ThreadStatusDeleted {
 		return errors.New("thread has been deleted")
+	}
+
+	// 同名 no-op 短路：db.UpdateName 无条件 bump version 且总报成功，若不拦截，重试或
+	// save-on-blur 式 UI 会重复发 tip。名字没变就直接返回，符合 #663「只发一次，不重复」。
+	if thread.Name == name {
+		return nil
 	}
 
 	// 企业微信式解散语义（产品决策 2026-06）：子区改名属低风险写，解散后仍允许——

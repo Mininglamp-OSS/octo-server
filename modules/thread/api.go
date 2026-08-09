@@ -57,6 +57,15 @@ func (t *Thread) onMessages(messages []*config.MessageResp) {
 			continue
 		}
 
+		// 只对用户聊天正文做「解档 + 统计 + 自动加入」。系统通知类消息（Tip / 群通知等，
+		// content type >= 1000）不是真实消息：跳过它们，避免子区改名/置顶等系统 tip 静默
+		// 解档归档子区、把 message_count 永久 +1、用未渲染的 {0} 占位符覆盖 thread-list
+		// preview，或把 operator 自动加入子区。（改名 tip 由 sendThreadRenamedMessage 发到本
+		// channel；置顶 tip 走 message/api_pinned.go，二者都落在这里。）
+		if isSystemContentType(parsePayloadType(msg.Payload)) {
+			continue
+		}
+
 		thread, err := t.db.QueryByGroupNoAndShortID(groupNo, shortID)
 		if err != nil || thread == nil {
 			continue
