@@ -17,36 +17,52 @@ package user
 type minimalUserDetailResp struct {
 	UID  string `json:"uid"`
 	Name string `json:"name"`
-	// Follow 0=未关注（陌生人）1=已关注。见文件头：资料页据此渲染加好友入口。
+	// Follow 0=未关注（陌生人）。走到最小集意味着授权判定已认定无可达关系，故恒为 0，
+	// **不能**从 full.Follow 复制（那是展示字段，其同 Space 来源不校验 Space 活性）。
+	// 资料页据此渲染加好友入口。
 	Follow int `json:"follow"`
-	// Robot 供客户端区分 bot 与真人的渲染分支。注意 bot 恒可见完整资料，故走到最小集
-	// 时它必为 0；保留该字段只为让契约形状稳定，客户端无需按分支解析。
+	// Robot 供客户端区分 bot 与真人的渲染分支。
 	Robot int `json:"robot"`
-	// Status **必须下发**（与省略 follow 的方向相反）：三端都把缺失时的零值 0 当作
-	// "已禁用/封禁"哨兵并写回本地缓存（Android 会隐藏输入框），所以对 status 而言
-	// 省略比给值更危险。它在本响应里是**调用方自己**是否拉黑对方（1=未拉黑 /
-	// 2=已拉黑），是调用方自身状态、永不为 0，下发不削弱隐私收窄。
-	Status int `json:"status"`
+
+	// ── 以下全部是**调用方自己**的状态，必须原样透传 ──
+	// 规则见 chservice.MinimalChannelResp 的文档：客户端整行写回缓存且不做字段存在性
+	// 检查，省略"调用方自己的设置"买不到任何隐私，只会把用户自己开启的功能悄悄关掉。
+	Status       int    `json:"status"`        // 调用方是否拉黑对方（1/2，永不为 0）
+	Mute         int    `json:"mute"`          // 免打扰
+	Top          int    `json:"top"`           // 置顶
+	ChatPwdOn    int    `json:"chat_pwd_on"`   // 聊天密码锁——缺失会让锁静默失效
+	Screenshot   int    `json:"screenshot"`    // 截屏通知
+	RevokeRemind int    `json:"revoke_remind"` // 撤回提醒
+	Receipt      int    `json:"receipt"`       // 消息回执
+	Flame        int    `json:"flame"`         // 阅后即焚
+	FlameSecond  int    `json:"flame_second"`  // 阅后即焚秒数
+	Remark       string `json:"remark"`        // 调用方给对方设置的备注
 }
 
-// newMinimalUserDetailResp 白名单式构造最小资料集：剥离 short_no / sex / online /
-// last_offline / device_flag / source_desc / vercode / remark / 实名 等全部身份与关系
-// 细节。手机号 / 邮箱 / 区号本就只对本人下发（见 NewUserDetailResp 的 self 判定），
-// 不在此重复。
+// newMinimalUserDetailResp 按「调用方自身状态全留、对方身份全剥」构造最小资料集。
 //
-// 白名单而非黑名单——将来给 UserDetailResp 新增字段时默认不泄露。
+// 剥掉的是对方身份/在线态：username / short_no / sex / category / source_desc /
+// vercode / online / last_offline / device_flag / 实名字段 / bot_* / be_deleted /
+// be_blacklist（后两者是**对方**对调用方的动作，属对方信息）。
+// 手机号 / 邮箱 / 区号本就只对本人下发（见 NewUserDetailResp 的 self 判定）。
+//
+// 白名单而非黑名单——将来给 UserDetailResp 新增字段时默认不泄露；新增的若属"调用方
+// 自己的状态"，须显式加进来，否则客户端写回时会把它清零。
 func newMinimalUserDetailResp(full *UserDetailResp) minimalUserDetailResp {
 	return minimalUserDetailResp{
-		UID:  full.UID,
-		Name: full.Name,
-		// Follow 恒为 0，**不能**从 full.Follow 复制。走到最小集意味着授权判定已认定
-		// 无可达关系（非好友、无**活跃**共同 Space、无共同有效群）；而 full.Follow 是
-		// 展示字段，它的同 Space 来源（GetCommonSpaceID）不校验 Space 活性，封禁 / 解散
-		// Space 会让它仍为 1。照抄会让响应自相矛盾——一边剥掉身份字段说"无关系"，一边
-		// 告诉客户端"已关注"，并且恰好泄露了本要隐去的那条"你们同属某个（已封禁）
-		// Space"的事实。这正是本次要消除的展示/授权混淆。
-		Follow: 0,
-		Robot:  full.Robot,
-		Status: full.Status,
+		UID:          full.UID,
+		Name:         full.Name,
+		Follow:       0,
+		Robot:        full.Robot,
+		Status:       full.Status,
+		Mute:         full.Mute,
+		Top:          full.Top,
+		ChatPwdOn:    full.ChatPwdOn,
+		Screenshot:   full.Screenshot,
+		RevokeRemind: full.RevokeRemind,
+		Receipt:      full.Receipt,
+		Flame:        full.Flame,
+		FlameSecond:  full.FlameSecond,
+		Remark:       full.Remark,
 	}
 }

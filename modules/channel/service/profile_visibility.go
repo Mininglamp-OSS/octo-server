@@ -64,47 +64,92 @@ func PersonProfileVisible(in PersonProfileInput, hasCommonGroup CommonGroupCheck
 	return hasCommonGroup(in.LoginUID, in.PeerUID)
 }
 
-// MinimalChannelResp 是 channelGet 在无可见关系时的最小响应契约：只序列化频道标识 /
-// 名称 / 头像 / 是否机器人，供客户端渲染历史消息发送者。
+// MinimalChannelResp 是 channelGet 在无可见关系时的最小响应契约。
 //
-// 不复用 model.ChannelResp——它绝大多数字段无 omitempty，即便只赋值四项，序列化仍会
-// 带出 follow:0 / status:0 / notice:"" / extra:null，其中 follow:0 会被客户端读成
-// 「明确非好友」。用独立 DTO 从字节层面保证「仅这四项」。
+// 取舍规则（本次的核心政策，逐字段判断而非一刀切白名单）：
 //
-// 刻意省略 follow：本端点用于渲染任意发送者，不是关系页，客户端不应据此判断关系。
-// （/v1/users/:uid 的最小集相反**保留** follow —— 那是资料页，要靠它渲染加好友入口。）
+//	下发所有「调用方自己的状态」，只省略「对方的身份」。
 //
-// 但 status **必须下发**，这与 follow 的取舍方向相反，原因是两者的"缺失"被客户端解读
-// 得不一样：
-//   - follow 缺失 → 客户端当作未知（给 0 反而会被读成"明确非好友"），故省略更安全；
-//   - status 缺失 → 三端都把零值 0 当作"已禁用/封禁"哨兵并**写回本地缓存**
-//     （Android WKChannelStatus.statusDisabled = 0 → 隐藏输入框并显示封禁视图；
-//     iOS 会整行覆盖，且历史上已为 mute 单独硬编码过同类保护），故省略更危险。
+// 理由是客户端**整行写回缓存**且不做字段存在性检查：三端都用一个新分配的对象接收本
+// 响应，缺失键取零值，再无条件覆盖 SDK 缓存里正确的值。所以省略一个"调用方自己的
+// 设置"不会买到任何隐私，只会把用户自己开启的功能悄悄关掉——已实测的后果包括：
+//   - 缺 status → 零值 0 撞上"已禁用/封禁"哨兵，Android 隐藏输入框、显示封禁视图；
+//   - 缺 extra.chat_pwd_on → 聊天密码锁失效，加锁会话直接打开且不提示、列表预览
+//     不再打码（Android 内存态、iOS 落盘）；
+//   - 缺 extra.msg_auto_delete → iOS 新发消息不再按期自动删除（该 key 全端只由本
+//     接口注入）；
+//   - 缺 mute/stick/save/remark → 免打扰、置顶、备注被重置（iOS 历史上已为 mute
+//     单独硬编码过兜底，说明这是已知且已复发过的 bug class）。
 //
-// 且 status 在本响应里是**调用方自己**是否拉黑对方（1=未拉黑 / 2=已拉黑，见
-// user.GetUserDetail 的 blacklist 计算），既非对方身份信息，也永不为 0，下发它不削弱
-// 本次的隐私收窄目标——真正买到隐私的是 short_no / 在线状态 / 设备指纹等的省略。
+// 真正买到隐私的是对方身份/在线态的省略：username、short_no、sex、category、
+// source_desc、vercode、online、last_offline、device_flag、实名字段、bot_* 等。
+// follow 与 be_deleted / be_blacklist 也不下发：前者是关系判决（发送者渲染不需要，
+// 给 0 会被读成"明确非好友"），后两者是**对方**对调用方的动作，属对方信息。
 type MinimalChannelResp struct {
 	Channel struct {
 		ChannelID   string `json:"channel_id"`
 		ChannelType uint8  `json:"channel_type"`
 	} `json:"channel"`
-	Name   string `json:"name"`
-	Logo   string `json:"logo"`
-	Robot  int    `json:"robot"`
-	Status int    `json:"status"`
+	ParentChannel *struct {
+		ChannelID   string `json:"channel_id"`
+		ChannelType uint8  `json:"channel_type"`
+	} `json:"parent_channel,omitempty"`
+
+	// 渲染必需（对方的可公开展示信息）
+	Name  string `json:"name"`
+	Logo  string `json:"logo"`
+	Robot int    `json:"robot"`
+
+	// 以下全部是**调用方自己**的状态，必须原样透传
+	Status      int `json:"status"`       // 调用方是否拉黑对方（1/2，永不为 0）
+	Receipt     int `json:"receipt"`      // 消息回执设置
+	Stick       int `json:"stick"`        // 置顶
+	Mute        int `json:"mute"`         // 免打扰
+	ShowNick    int `json:"show_nick"`    // 显示昵称
+	Flame       int `json:"flame"`        // 阅后即焚
+	FlameSecond int `json:"flame_second"` // 阅后即焚秒数
+
+	Remark string `json:"remark"` // 调用方给对方设置的备注
+
+	// Extra 只保留调用方自己的会话设置键，不含对方身份（实名、bot_* 等一律不进）。
+	Extra map[string]interface{} `json:"extra"`
 }
 
-// NewMinimalChannelResp 从完整详情里挑出白名单四项。白名单式构造——将来给
-// model.ChannelResp 新增字段时默认不泄露。
+// callerOwnedExtraKeys 是 Extra 中属于**调用方自己**的键；其余（realname_verified /
+// real_name / short_no / sex / source_desc / vercode / bot_* 等）是对方身份，不下发。
+var callerOwnedExtraKeys = []string{
+	"chat_pwd_on",     // 聊天密码锁——缺失会让锁静默失效
+	"screenshot",      // 截屏通知
+	"revoke_remind",   // 撤回提醒
+	"msg_auto_delete", // 消息定时删除——缺失会让 iOS 新消息不再自动删除
+}
+
+// NewMinimalChannelResp 按「调用方自身状态全留、对方身份全剥」构造最小集。
+//
+// 必须在 channelSettingDB 富化**之后**调用：msg_auto_delete 与 parent_channel 是那一
+// 步才附到 full 上的，提前返回会让它们永远缺失。
 func NewMinimalChannelResp(full *model.ChannelResp) MinimalChannelResp {
 	m := MinimalChannelResp{
-		Name:   full.Name,
-		Logo:   full.Logo,
-		Robot:  full.Robot,
-		Status: full.Status,
+		ParentChannel: full.ParentChannel,
+		Name:          full.Name,
+		Logo:          full.Logo,
+		Robot:         full.Robot,
+		Status:        full.Status,
+		Receipt:       full.Receipt,
+		Stick:         full.Stick,
+		Mute:          full.Mute,
+		ShowNick:      full.ShowNick,
+		Flame:         full.Flame,
+		FlameSecond:   full.FlameSecond,
+		Remark:        full.Remark,
+		Extra:         map[string]interface{}{},
 	}
 	m.Channel.ChannelID = full.Channel.ChannelID
 	m.Channel.ChannelType = full.Channel.ChannelType
+	for _, k := range callerOwnedExtraKeys {
+		if v, ok := full.Extra[k]; ok {
+			m.Extra[k] = v
+		}
+	}
 	return m
 }

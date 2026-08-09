@@ -33,6 +33,10 @@ func init() {
 		// 注册共同群判定，供 user 模块的 /v1/users/:uid 做对象级资料可见性判定
 		// （与 /v1/channels/:id/:type 共用 channel/service 的判定函数）。
 		user.RegisterCommonGroupChecker(api.groupService.ExistCommonGroup)
+		// 活跃成员口径（排该群黑名单），供 /v1/users/:uid 的 ?group_no= 富化门禁使用；
+		// 与 RegisterGroupMemberChecker（ExistMember，服务置顶等既有路径）分开，避免
+		// 收紧一处波及另一处。
+		user.RegisterActiveGroupMemberChecker(api.groupService.ExistMemberActive)
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

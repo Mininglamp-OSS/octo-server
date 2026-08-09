@@ -28,11 +28,15 @@ source: self
   - **有关系** —— 本人 / 好友 / 共同 Space / 共同群 / Bot（`robot==1`，恒可查，
     见 Background）/ 系统账号 / `iwh_` webhook —— 返回完整详情，字段与今天完全
     一致（含 `real_name`，保持对外可见，不改动）。
-  - **完全无关系** —— 只回渲染历史消息发送者所需的最小集
-    （`channel_id` / `name` / `logo` / `robot` / `status`），不下发 `short_no` / `sex` /
-    `device_flag` / `last_offline` / `source_desc` / `vercode` 等身份细节
-    （`real_name` 等 `extra` 字段随整个 `extra` 一并不下发，是"最小集不含"而非
-    "对 real_name 单独剥离"）。
+  - **完全无关系** —— 降级为最小集，规则是**下发全部「调用方自己的状态」、只省略
+    「对方的身份」**：保留 `channel_id` / `name` / `logo` / `robot` 以供渲染，保留
+    `status` / `stick` / `mute` / `show_nick` / `receipt` / `remark` / `flame` /
+    `flame_second` / `parent_channel`，以及 `extra` 中调用方自己的键
+    （`chat_pwd_on` / `screenshot` / `revoke_remind` / `msg_auto_delete`）；
+    省略对方身份与在线态：`username` / `short_no` / `sex` / `category` /
+    `source_desc` / `vercode` / `online` / `last_offline` / `device_flag` /
+    实名字段 / `bot_*`，以及 `be_deleted` / `be_blacklist`（对方对调用方的动作）
+    和 `follow`（关系判决，发送者渲染不需要）。
 
 `GET /v1/users/:uid`（`u.get`）是**同一根因的第二个出口**：同样只有登录鉴权、同样
 直调 `GetUserDetail` 不校验关系，任意登录用户拿任意 UID 即可读到完整身份。本次一并
@@ -42,15 +46,28 @@ source: self
 不需要 follow，故刻意省略）。加好友流程不依赖本响应其它字段——`vercode` 由 search /
 扫码路径铸造并校验，且该端点对非好友本来就返回空 `vercode`。
 
-最小集的"省略 vs 给值"按**客户端如何解读缺失**逐字段决定，两个方向都出现：
-- `follow`：channelGet 省略（给 0 会被读成"明确非好友"），users/:uid 保留（资料页靠
-  `follow==0` 渲染加好友入口）；
-- `status`：**两端都必须下发**。三端客户端把缺失时的零值 0 当作"已禁用/封禁"哨兵并
-  写回本地缓存（Android `WKChannelStatus.statusDisabled = 0` → 隐藏输入框并显示封禁
-  视图；iOS 整行覆盖，历史上已为 `mute` 单独硬编码过同类保护）。该字段在本响应里是
-  **调用方自己**是否拉黑对方（1/2，永不为 0），非对方身份信息，下发不削弱隐私收窄。
-  触发路径不是陌生人，而是"当前正在 1:1 的对端离开可见集"——同 Space 对端所在 Space
-  被封禁、或唯一共同群解散/自己退群，下次频道信息刷新即命中。
+最小集的"省略 vs 给值"按**客户端如何解读缺失**逐字段决定，统一到一条规则：
+
+> **下发所有「调用方自己的状态」，只省略「对方的身份」。**
+
+依据：三端客户端**整行写回本地缓存且不做字段存在性检查**——用新分配的对象接收响应，
+缺失键取零值，再无条件覆盖 SDK 缓存里正确的值。所以省略"调用方自己的设置"买不到任何
+隐私，只会把用户自己开启的功能悄悄关掉。已被追证的后果：
+
+- 缺 `status` → 零值 0 撞上"已禁用/封禁"哨兵（Android `WKChannelStatus.statusDisabled
+  = 0`）→ 隐藏输入框并显示封禁视图；
+- 缺 `extra.chat_pwd_on` → **聊天密码锁静默失效**，加锁会话直接打开且不提示、会话列表
+  预览不再打码（Android 内存态、iOS 落盘）；
+- 缺 `extra.msg_auto_delete` → iOS 新发消息不再按期自动删除（该键全端只由本接口注入）；
+- 缺 `mute` / `stick` / `remark` → 免打扰、置顶、备注被重置（iOS 历史上已为 `mute`
+  单独硬编码过兜底，说明这是已复发过的 bug class）。
+
+唯一例外是 `follow`：channelGet 省略它（给 0 会被读成"明确非好友"，且发送者渲染不需要
+关系判决），users/:uid 保留它（资料页靠 `follow==0` 渲染加好友入口，且走到最小集必然
+是 0）。
+
+触发路径不是陌生人，而是"当前正在 1:1 的对端离开可见集"——删好友、同 Space 对端所在
+Space 被封禁、或唯一共同群解散/自己退群，下次频道信息刷新即命中。
 
 同时消除两个放大风险：群不存在触发的 nil-panic（500，构成存在性枚举
 oracle），以及该路由缺少 per-UID 限流（批量枚举无成本）。
@@ -172,9 +189,11 @@ helper**，需新建（外部群跨 Space 成员既非好友也非共同 Space�
       一致，均不下发 `name`/`notice`/`member_count`/`space_id`。
 - [ ] COMMUNITY_TOPIC：非父群成员调用 `GET /v1/channels/{topicID}/5` 被拒，
       不下发子区名 / `group_no` / `creator_uid` / `message_count`。
-- [ ] PERSON 无关系目标：仅返回 `channel_id` / `name` / `logo` / `robot` / `status`；
-      断言响应不下发 `short_no` / `sex` / `device_flag` / `last_offline` /
-      `source_desc` / `vercode`（即 `extra` 不下发身份细节）。
+- [ ] PERSON 无关系目标：按「调用方自身状态全留、对方身份全剥」降级——断言响应**保留**
+      `status` / `stick` / `mute` / `remark` / `extra.chat_pwd_on` /
+      `extra.msg_auto_delete` 等调用方自身设置（缺失会让用户自己开启的功能被清零），
+      且**不下发** `short_no` / `sex` / `device_flag` / `last_offline` /
+      `source_desc` / `vercode` / 实名字段 / `follow`。
 - [ ] PERSON 有关系目标（本人 / 好友 / 共同 Space / 共同群 / Bot / 系统账号）：
       现有字段齐全无回归，`real_name` / `realname_verified` 等在已实名好友视角
       下仍正常下发（保持现状）。
@@ -187,9 +206,11 @@ helper**，需新建（外部群跨 Space 成员既非好友也非共同 Space�
 
 ### A2. `GET /v1/users/:uid`（同根因，一并修复）
 
-- [ ] 无关系目标：降级为最小集（`uid`/`name`/`follow`/`robot`/`status`），不下发 `short_no` /
-      `sex` / `online` / `last_offline` / `device_flag` / `source_desc` / `vercode` /
-      实名字段。
+- [ ] 无关系目标：降级为最小集，同样遵循「调用方自身状态全留、对方身份全剥」——保留
+      `uid`/`name`/`robot`/`follow`（恒 0）以及 `status`/`mute`/`top`/`chat_pwd_on`/
+      `screenshot`/`revoke_remind`/`receipt`/`flame`/`flame_second`/`remark`；
+      不下发 `short_no` / `sex` / `online` / `last_offline` / `device_flag` /
+      `source_desc` / `vercode` / 实名字段 / `be_deleted` / `be_blacklist`。
 - [ ] 最小集**保留 `follow`**：陌生人资料页仍能渲染「加好友」入口（与 channelGet
       最小集的刻意差异，理由见 Goal）。
 - [ ] 有关系目标（本人 / 好友 / 同 Space / 共同群 / bot / 系统账号）：字段无回归。

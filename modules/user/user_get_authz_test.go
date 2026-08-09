@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -20,12 +21,30 @@ import (
 // 该端点与 /v1/channels/:id/:type 同根因：都只有登录鉴权、共用 GetUserDetail，任意
 // 登录用户拿任意 UID 就能读到完整身份（短号 / 性别 / 在线状态 / 设备指纹 / 实名）。
 // 可见性判定收口在 modules/channel/service，两端共用，故这里主要钉本端点特有的部分：
-// 最小集**保留 follow**（资料页要靠它渲染加好友入口），以及不存在目标的响应码。
+// 最小集的字段取舍（保留 follow 与全部「调用方自身状态」，见 user_profile_minimal.go）
+// 以及不存在目标的响应码。
+
+// resetUserUIDRateLimit 清掉本测试用户的 per-uid 令牌桶。
+//
+// /v1/users/:uid 现在挂了 SharedUIDRateLimiter，桶在 Redis 持久且**不被
+// CleanAllTables 清除**；本文件十余个用例共用 testutil.UID，重复执行（-count=N）或与
+// 其它包并行跑会把桶耗尽而收到限流响应。只删自己这一把 key —— KEYS 全量扫是 O(keyspace)
+// 阻塞命令，且会删掉并发包的桶（与 channel 侧同款做法）。
+func resetUserUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rds := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rds.Close()
+	_ = rds.Del("ratelimit:uid:" + testutil.UID).Err()
+}
 
 func newUserAuthzServer(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
+	resetUserUIDRateLimit(t, ctx)
 	// 显式注册两个 group 侧 hook，并在用例结束后复原。
 	//
 	// 不能依赖模块 bootstrap 注册的全局值：同包的 pinned_test.go 会把
@@ -43,6 +62,18 @@ func newUserAuthzServer(t *testing.T) (*server.Server, *config.Context) {
 		var cnt int
 		_, err := ctx.DB().SelectBySql(
 			"SELECT 1 FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 LIMIT 1", groupNo, uid,
+		).Load(&cnt)
+		return cnt > 0, err
+	})
+	// ?group_no= 富化门禁用的是**活跃成员**口径（排该群黑名单），与 group.ExistMemberActive
+	// 一致。谓词本身由 modules/group 的单测钉在生产实现上；这里只需等价替身。
+	prevActive := getActiveGroupMemberChecker()
+	t.Cleanup(func() { RegisterActiveGroupMemberChecker(prevActive) })
+	RegisterActiveGroupMemberChecker(func(groupNo, uid string) (bool, error) {
+		var cnt int
+		_, err := ctx.DB().SelectBySql(
+			"SELECT 1 FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 AND status=1 LIMIT 1",
+			groupNo, uid,
 		).Load(&cnt)
 		return cnt > 0, err
 	})
@@ -229,12 +260,15 @@ func TestUserGet_NotExist_NotFound(t *testing.T) {
 	assert.NotContains(t, body, "err.server.user.query_failed", "不得再报查询失败")
 }
 
-// newMinimalUserDetailResp 是白名单构造：**序列化后**只有 uid/name/follow/robot 四个
-// 顶层字段。断言 key 集合而非逐字段取值——后者在给 DTO 新增第五个字段时仍会通过。
+// newMinimalUserDetailResp 是白名单构造：序列化后的字段集合固定为「渲染必需 + 调用方
+// 自身全部会话状态」，不含对方身份。断言 key 集合而非逐字段取值——后者在给 DTO 新增
+// 字段时仍会通过，而新增字段若属对方身份就是一次泄露。
 func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 	full := &UserDetailResp{
 		// Follow 刻意给 1：最小集必须按授权决策输出 0，而不是复制这个展示字段。
 		UID: "u1", Name: "N", Follow: 1, Robot: 0, Status: 1,
+		Mute: 1, Top: 1, ChatPwdOn: 1, Screenshot: 1, RevokeRemind: 1, Receipt: 1,
+		Flame: 1, FlameSecond: 30, Remark: "my-remark",
 		ShortNo: "SN", Sex: 1, Online: 1, LastOffline: 123, Vercode: "vc",
 		SourceDesc: "src", RealName: "张三", RealnameVerified: true, Phone: "13000000000",
 	}
@@ -249,10 +283,16 @@ func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	assert.Equal(t, []string{"follow", "name", "robot", "status", "uid"}, keys,
-		"最小集只能有这五个顶层字段, got=%s", string(b))
+	assert.Equal(t, []string{
+		"chat_pwd_on", "flame", "flame_second", "follow", "mute", "name", "receipt",
+		"remark", "revoke_remind", "robot", "screenshot", "status", "top", "uid",
+	}, keys, "最小集字段集合已固定（调用方自身状态全留、对方身份全剥）, got=%s", string(b))
 	assert.Contains(t, string(b), "\"status\":1",
 		"status 必须原样透传：缺失会被客户端当成 0=已封禁并写回缓存")
+	assert.Contains(t, string(b), "\"chat_pwd_on\":1",
+		"聊天密码锁必须透传：缺失会让加锁会话直接打开且不提示")
+	assert.Contains(t, string(b), "\"mute\":1")
+	assert.Contains(t, string(b), "\"remark\":\"my-remark\"")
 	assert.Contains(t, string(b), "\"follow\":0", "入参 Follow=1 时输出仍须为 0, got=%s", string(b))
 	for _, leaked := range []string{"SN", "short_no", "sex", "online", "last_offline", "vercode", "source_desc", "real_name", "张三", "13000000000"} {
 		assert.NotContains(t, string(b), leaked)
@@ -396,4 +436,44 @@ func TestUserGet_DisbandedCommonSpace_Minimal(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "short_no", "已解散 Space 不应构成可达关系")
 	assert.Contains(t, w.Body.String(), "\"follow\":0", "body=%s", w.Body.String())
 	assert.NotContains(t, w.Body.String(), "\"follow\":1")
+}
+
+// 调用方**被该群拉黑**（group_member.status=Blacklist，is_deleted 仍为 0）时，
+// ?group_no= 富化必须被抑制：门禁用活跃成员口径，与子区门禁 / 共同群判定一致。
+// 否则被拉黑的人仍能凭该群号反查该群维度的成员元数据与 vercode。
+func TestUserGet_GroupNoEnrichment_CallerBlacklistedInGroup_Suppressed(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	// 目标可见（同一正常 Space），但调用方在 ug_blkgate 群里被拉黑。
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_blkgate", Name: "BlkGateTarget", ShortNo: "SNBLKGATE",
+	}))
+	seedSpace(t, ctx, "sp_blkgate", 1)
+	seedSpaceMemberRow(t, ctx, "sp_blkgate", testutil.UID)
+	seedSpaceMemberRow(t, ctx, "sp_blkgate", "ut_blkgate")
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('ug_blkgate','blkgate','ut_blkgate',1,1)",
+	).Exec()
+	assert.NoError(t, err)
+	// 调用方成员行存在但 status=2（被拉黑）
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, status, version, vercode, is_deleted) VALUES ('ug_blkgate',?,0,2,1,'vc-blkgate-self',0)",
+		testutil.UID,
+	).Exec()
+	assert.NoError(t, err)
+	seedUserGroupMemberInvited(t, ctx, "ug_blkgate", "ut_blkgate", "ut_inviter2")
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/users/ut_blkgate?group_no=ug_blkgate", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
+	assert.Contains(t, body, "BlkGateTarget", "目标本身可见，主响应不受影响")
+	assert.NotContains(t, body, "\"group_member\":{",
+		"被该群拉黑的调用方不得拿到群成员元数据, body=%s", body)
+	assert.NotContains(t, body, "vc-ug_blkgate", "不得泄露该群维度的 vercode")
 }

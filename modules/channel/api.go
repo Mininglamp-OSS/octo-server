@@ -252,6 +252,10 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 	// 对象级授权（PERSON 分级降级）：无可见关系时只返回渲染历史发送者所需的最小集，
 	// 不下发短号/在线状态/设备指纹/实名等身份细节。不做二元 403——渲染任意消息发送者
 	// 名/头像是本端点的既有职责（YUJ-411），硬拒会让外部群跨 Space 成员裂图。
+	// 只在这里**判定**，降级响应推迟到 channelSettingDB 富化之后再构造：
+	// msg_auto_delete / parent_channel 是那一步才附到 channelResp 上的，而它们属于
+	// 调用方自己的会话设置，必须进最小集（缺失会让 iOS 新消息不再自动删除）。
+	personMinimal := false
 	if channelType == common.ChannelTypePerson.Uint8() {
 		visible, err := ch.personProfileVisible(loginUID, channelID, channelResp)
 		if err != nil {
@@ -260,10 +264,7 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrUserQueryFailed, nil, nil)
 			return
 		}
-		if !visible {
-			c.JSON(http.StatusOK, chservice.NewMinimalChannelResp(channelResp))
-			return
-		}
+		personMinimal = !visible
 	}
 
 	fakeChannelID := channelID
@@ -290,6 +291,14 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 		if channelSettingM.MsgAutoDelete > 0 {
 			channelResp.Extra["msg_auto_delete"] = channelSettingM.MsgAutoDelete
 		}
+	}
+
+	// 无可见关系：剥掉对方身份、保留调用方自身会话设置后返回（见
+	// chservice.NewMinimalChannelResp 的取舍规则）。放在设置富化之后、BotFather 文案
+	// 重渲染之前——后者只对 bot 生效，而 bot 恒可见，走不到这里。
+	if personMinimal {
+		c.JSON(http.StatusOK, chservice.NewMinimalChannelResp(channelResp))
+		return
 	}
 
 	// BotFather 的命令菜单是服务端自有文案：库里只存部署默认语言的兜底，这里按

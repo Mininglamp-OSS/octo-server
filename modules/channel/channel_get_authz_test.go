@@ -192,8 +192,12 @@ func TestChannelGet_Person_NoRelation_Minimal(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "\"status\":1",
 		"最小集必须下发 status 且为正常值, body=%s", w.Body.String())
 	assert.NotContains(t, w.Body.String(), "\"status\":0", "status 绝不能是 0（客户端封禁哨兵）")
-	assert.NotContains(t, w.Body.String(), "\"extra\"", "最小集不得含 extra 字段")
 	assert.NotContains(t, w.Body.String(), "\"device_flag\"", "最小集不得含 device_flag 字段")
+	// 调用方自己的会话设置必须保留：客户端整行写回缓存，省略会把用户自己开的功能关掉。
+	for _, kept := range []string{"\"mute\"", "\"stick\"", "\"remark\"", "\"extra\"", "\"chat_pwd_on\""} {
+		assert.Contains(t, w.Body.String(), kept,
+			"最小集必须保留调用方自身设置 %s, body=%s", kept, w.Body.String())
+	}
 }
 
 // PERSON 仅共同群（非好友、无共同 Space）：视为可见，返回完整资料（含 short_no）。
@@ -315,7 +319,9 @@ func TestChannelGet_Person_CrossSpace_Minimal_SpaceHeaderIrrelevant(t *testing.T
 			assert.Contains(t, w.Body.String(), "OtherSpaceUser", "最小集仍需回 name")
 			assert.NotContains(t, w.Body.String(), "short_no", "跨 Space 不得下发 short_no（Space 头无论如何都不能提权）")
 			assert.NotContains(t, w.Body.String(), "SNOTHERSP")
-			assert.NotContains(t, w.Body.String(), "\"extra\"")
+			// extra 存在但只含调用方自己的会话设置，不含对方身份键。
+			assert.Contains(t, w.Body.String(), "\"chat_pwd_on\"")
+			assert.NotContains(t, w.Body.String(), "real_name")
 		})
 	}
 }
@@ -368,7 +374,17 @@ func TestMinimalChannelResp_JSONShape(t *testing.T) {
 	full.Follow = 1
 	full.Status = 2
 	full.Notice = "secret-notice"
-	full.Extra = map[string]interface{}{"short_no": "SNX"}
+	full.Mute = 1
+	full.Stick = 1
+	full.ShowNick = 1
+	full.Receipt = 1
+	full.Remark = "my-remark"
+	full.Flame = 1
+	full.FlameSecond = 30
+	full.Extra = map[string]interface{}{
+		"short_no": "SNX", "real_name": "张三", "sex": 1,
+		"chat_pwd_on": 1, "screenshot": 1, "revoke_remind": 1, "msg_auto_delete": 60,
+	}
 
 	b, err := json.Marshal(chservice.NewMinimalChannelResp(full))
 	assert.NoError(t, err)
@@ -380,10 +396,20 @@ func TestMinimalChannelResp_JSONShape(t *testing.T) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	assert.Equal(t, []string{"channel", "logo", "name", "robot", "status"}, keys,
-		"最小集只能有这五个顶层字段, got=%s", string(b))
+	// 规则：调用方自身状态全留、对方身份全剥。
+	assert.Equal(t, []string{
+		"channel", "extra", "flame", "flame_second", "logo", "mute", "name",
+		"receipt", "remark", "robot", "show_nick", "status", "stick",
+	}, keys, "最小集字段集合已固定, got=%s", string(b))
 	assert.Contains(t, string(b), "\"status\":2", "status 必须原样透传（此处入参为 2）")
-	for _, leaked := range []string{"short_no", "SNX", "follow", "notice", "extra"} {
+	assert.Contains(t, string(b), "\"mute\":1", "调用方的免打扰设置必须透传")
+	assert.Contains(t, string(b), "\"chat_pwd_on\":1",
+		"聊天密码锁必须透传：缺失会让加锁会话直接打开且不提示, got=%s", string(b))
+	assert.Contains(t, string(b), "\"msg_auto_delete\":60",
+		"消息定时删除必须透传：缺失会让 iOS 新消息不再自动删除, got=%s", string(b))
+	// 对方身份/在线态一律不下发；follow 是关系判决，同样不下发。
+	for _, leaked := range []string{"short_no", "SNX", "\"follow\"", "notice",
+		"real_name", "device_flag", "last_offline", "\"sex\"", "vercode", "\"online\""} {
 		assert.NotContains(t, string(b), leaked)
 	}
 }

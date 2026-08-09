@@ -1311,7 +1311,11 @@ func (u *User) get(c *wkhttp.Context) {
 	// 下发。
 	if groupNo != "" {
 		callerInGroup := false
-		if checker := getGroupMemberChecker(); checker != nil {
+		// 用**活跃成员**口径（排该群黑名单），与子区门禁 ExistMemberActive、共同群判定
+		// 保持一致：被该群拉黑的人不应还能凭该群号反查群维度元数据。不复用
+		// getGroupMemberChecker（ExistMember，只看 is_deleted），那个钩子还服务着置顶
+		// 频道校验等既有路径。
+		if checker := getActiveGroupMemberChecker(); checker != nil {
 			ok, err := checker(groupNo, loginUID)
 			if err != nil {
 				u.Error("查询调用方群成员关系失败", zap.Error(err), zap.String("group_no", groupNo))

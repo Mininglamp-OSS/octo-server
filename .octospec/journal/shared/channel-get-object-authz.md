@@ -94,11 +94,16 @@ was itself an existence oracle.
   gets banned, or the only shared group is disbanded — i.e. precisely the
   transitions this change made load-bearing. Ask, for every field you drop from
   a response the client caches: what does the client's zero value mean, and does
-  it get persisted?
-- **A minimal response needs its own DTO.** `model.ChannelResp` has no
-  `omitempty`, so copying four fields still serializes `follow:0` / `status:0` /
-  `extra:null` — and `follow:0` reads to clients as "definitely not a friend".
-  Use a dedicated whitelist DTO and assert at the JSON key level.
+  it get persisted? The rule that fell out of it: emit everything that is the
+  caller's own state (settings, per-conversation flags, their own blacklist
+  flag), omit only the peer's identity and presence.
+- **A minimal response needs its own DTO, and the whitelist is not "as few
+  fields as possible".** `model.ChannelResp` has no `omitempty`, so assigning a
+  subset of its fields still serializes the rest as zeros — `follow:0` reads to
+  clients as "definitely not a friend". A dedicated DTO fixes that, but the
+  first cut then over-corrected: the right line is **caller's own state in,
+  peer's identity out**, not "smallest possible object". Assert the serialized
+  key set, so both directions are pinned.
 - **PERSON existence can't be unified the way GROUP can.** GROUP folds
   missing+forbidden into one response; PERSON can't, because an
   unrelated-but-existing user must still return name/logo for sender rendering.
