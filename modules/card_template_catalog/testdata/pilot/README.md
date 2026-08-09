@@ -31,10 +31,21 @@ A version claim is permanent and global to a catalog database, so the exact
 publishing into**.
 
 `requirePilotVersionUnclaimed` interrogates the database named by
-`OCTO_PILOT_CATALOG_DSN`. Set it to the shared non-production catalog before
-running the pilot there. With it unset the check logs, loudly, that it verified
-nothing — "no shared catalog configured" and "the version is free" are different
-answers and only one of them is evidence.
+`OCTO_PILOT_CATALOG_DSN`, and it is armed by a separate switch:
+
+| `OCTO_PILOT_CATALOG_ENABLED` | `OCTO_PILOT_CATALOG_DSN` | outcome |
+|---|---|---|
+| unset / `false` | anything | not armed; reports what it did **not** check (and says so again if a DSN is set but ignored) |
+| `true` | set | queries that catalog for real |
+| `true` | empty | **hard failure** — arming without naming a catalog cannot be satisfied |
+| malformed (e.g. `yes`) | anything | **hard failure** — a typo in a safety switch reads as neither on nor off |
+
+Two settings rather than one because a lone DSN cannot distinguish "this
+deployment runs no pilot" from "somebody meant to configure one and the variable
+did not reach the process" — and the earlier shape answered both by logging and
+passing. "No shared catalog configured" and "the version is free" are different
+answers and only one of them is evidence, so the gate never silently approves a
+version.
 
 The per-test database cannot answer this question: `newCatalogStoreIntegrationDB`
 drops and recreates it moments before the check runs, so it is always empty. An

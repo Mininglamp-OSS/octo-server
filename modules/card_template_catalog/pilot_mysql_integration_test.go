@@ -66,7 +66,35 @@ const (
 	// preflight interrogates. The per-test database cannot answer the question:
 	// it is created empty moments before the check runs.
 	pilotCatalogDSNEnv = "OCTO_PILOT_CATALOG_DSN"
+	// pilotCatalogEnabledEnv arms the preflight. Two settings rather than one,
+	// on request, and the split is what makes the check honest: with a lone DSN
+	// there is no way to distinguish "this deployment does not run pilots" from
+	// "somebody meant to configure one and the variable did not reach the
+	// process" — and the old code answered both by logging and passing.
+	//
+	// Armed, a missing DSN is a hard failure: you asked for the preflight, so
+	// you have to say which catalog to ask. Unarmed, it reports that it is
+	// unarmed. The gate never silently approves a version.
+	pilotCatalogEnabledEnv = "OCTO_PILOT_CATALOG_ENABLED"
 )
+
+// pilotPreflightArmed reads the switch with the same strictness the production
+// runtime gates use (runtime_install.go strictRuntimeBool): missing *or*
+// malformed means off. A typo in a safety switch must not read as "on", and it
+// must not read as a silent "off" either — the malformed case is reported.
+func pilotPreflightArmed(t *testing.T) bool {
+	t.Helper()
+	raw, present := os.LookupEnv(pilotCatalogEnabledEnv)
+	if !present {
+		return false
+	}
+	armed, valid := strictRuntimeBool(raw)
+	if !valid {
+		t.Fatalf("%s=%q is not a valid boolean. A safety switch must not be guessed at: "+
+			"set it to exactly \"true\" or \"false\".", pilotCatalogEnabledEnv, raw)
+	}
+	return armed
+}
 
 func pilotBundlePath() string {
 	return filepath.Join("testdata", "pilot",
@@ -106,11 +134,27 @@ func loadPilotBundle(t *testing.T) cardtmpl.Bundle {
 func requirePilotVersionUnclaimed(t *testing.T, id cardtmpl.ID, version string) {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv(pilotCatalogDSNEnv))
-	if dsn == "" {
-		t.Logf("pilot version preflight SKIPPED: %s is unset, so no shared catalog was "+
-			"checked for %s@%s. Set it to the non-production catalog DSN before publishing "+
-			"this fixture anywhere shared.", pilotCatalogDSNEnv, id, version)
+	if !pilotPreflightArmed(t) {
+		// Unarmed is a configured state, not an accident. Say so, and say what
+		// was *not* checked — "no shared catalog configured" and "the version is
+		// free" are different answers and only one of them is evidence.
+		t.Logf("pilot version preflight NOT ARMED (%s is not true): no shared catalog was "+
+			"checked for %s@%s. Before publishing this fixture anywhere shared, set %s=true "+
+			"and %s to that catalog's DSN.",
+			pilotCatalogEnabledEnv, id, version, pilotCatalogEnabledEnv, pilotCatalogDSNEnv)
+		if dsn != "" {
+			// A DSN with the switch off is the shape of a half-finished
+			// configuration, and silence here is how it would stay that way.
+			t.Logf("pilot version preflight: %s is set but %s is not true, so the DSN was "+
+				"ignored.", pilotCatalogDSNEnv, pilotCatalogEnabledEnv)
+		}
 		return
+	}
+	if dsn == "" {
+		t.Fatalf("pilot version preflight: %s is true but %s is empty. Arming the preflight "+
+			"without naming a catalog cannot be satisfied — set the non-production catalog "+
+			"DSN, or set %s=false to state that this deployment runs no pilot.",
+			pilotCatalogEnabledEnv, pilotCatalogDSNEnv, pilotCatalogEnabledEnv)
 	}
 	shared, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -399,5 +443,60 @@ func TestPilotDynamicCatalogEndToEndRealMySQL(t *testing.T) {
 	}
 	if !revoked.Grant.Found {
 		t.Fatal("revoke deleted the row instead of writing a tombstone")
+	}
+}
+
+// The pilot preflight switch has exactly three outcomes and only one of them
+// runs a query. Asserted because the switch exists to stop a half-configured
+// pilot reading as a passed safety check, which is the failure the previous
+// shape had: an unset DSN logged and returned, indistinguishable from evidence.
+func TestPilotPreflightArmingIsExplicit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		set       bool
+		value     string
+		wantArmed bool
+	}{
+		{name: "unset is off", set: false},
+		{name: "false is off", set: true, value: "false"},
+		{name: "true arms it", set: true, value: "true", wantArmed: true},
+		{name: "mixed case is accepted", set: true, value: "TRUE", wantArmed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.set {
+				t.Setenv(pilotCatalogEnabledEnv, test.value)
+			} else {
+				// t.Setenv restores on cleanup, so clearing here is safe and is
+				// the only way to test the genuinely-unset case under a runner
+				// that may have it set.
+				t.Setenv(pilotCatalogEnabledEnv, "")
+				os.Unsetenv(pilotCatalogEnabledEnv)
+			}
+			if got := pilotPreflightArmed(t); got != test.wantArmed {
+				t.Fatalf("pilotPreflightArmed = %v, want %v for %q(set=%v)",
+					got, test.wantArmed, test.value, test.set)
+			}
+		})
+	}
+}
+
+// A malformed switch is neither on nor quietly off — it stops the run. The
+// production gates take the same position (strictRuntimeBool), and the reason is
+// sharper here: this switch guards a permanent, global version claim.
+func TestPilotPreflightRefusesAMalformedSwitch(t *testing.T) {
+	t.Setenv(pilotCatalogEnabledEnv, "yes")
+	fake := &testing.T{}
+	// pilotPreflightArmed calls Fatalf, which stops the calling goroutine, so it
+	// is driven on its own goroutine against a throwaway T.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = recover() }()
+		pilotPreflightArmed(fake)
+	}()
+	<-done
+	if !fake.Failed() {
+		t.Fatal("a malformed switch was accepted; a typo in a safety switch must not " +
+			"read as either on or off")
 	}
 }

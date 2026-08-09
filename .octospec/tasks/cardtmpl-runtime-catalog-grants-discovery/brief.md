@@ -255,6 +255,59 @@ guarantee D4's linearization point gives every other path — an in-flight reque
 is allowed to finish. Revocation is not affected: the grant is re-read in the
 same snapshot.
 
+### D0f — The five carried acceptance items, resolved
+
+Owner review of the items this task had left for a human. Three are closed, one
+gained a switch, two remain.
+
+**1. Multi-replica grant/revoke convergence — closed, from the code.** This was
+listed as needing a two-replica run, and it does not: there is no replica-local
+grant state to converge. The only cache on the path is
+`compiledArtifactCache`, keyed on `engine + ":" + content_hash` — immutable
+bytes, no activation, block or grant state — and `verifyAuthorization` runs
+*before* `loadCompiled`, so a hot entry cannot carry a stale permission. Every
+replica therefore answers from its own REPEATABLE READ snapshot of the same
+MySQL rows, which is exactly D4's linearization point: shared, not process-local.
+
+Already pinned by `TestRuntimeCatalogHotCacheCannotOutliveARevoke`, which warms
+the cache with an authorized render, revokes, renders again expecting a denial,
+**and asserts the snapshot count increased** — so it proves the denial came from
+a fresh read rather than from a cache that happened to miss. A sibling covers
+block.
+
+The genuine multi-replica residual is not a cache, and naming it matters more
+than the item it replaces: `_CONTROL_ENABLED` / `_NEW_SEND_ENABLED` are
+per-process environment reads, so a partial rollout has replicas answering
+*differently* — one accepting a dynamic send another refuses. #702 hit the same
+class for bot event ids and resolved it by making MySQL the authority and Redis
+a mirror that can shortcut but never override. Adopting that shape here is a
+real option and is not done in this PR; until it is, **flipping either gate must
+be a full-fleet operation, not a canary**.
+
+**2. `OCTO_PILOT_CATALOG_DSN` — now a switch plus a configurable item.** The DSN
+alone could not distinguish "this deployment runs no pilot" from "somebody meant
+to configure one and the variable did not arrive", and the old code answered
+both by logging and returning — a safety check that reads as passed. Split into
+`OCTO_PILOT_CATALOG_ENABLED` (strict boolean, missing *or* malformed → off, same
+parser as the runtime gates) and the DSN. Armed with no DSN is now a hard
+failure; unarmed says it is unarmed; a DSN with the switch off says the DSN was
+ignored. The gate never silently approves a permanent version claim.
+
+An operator-facing CLI in the shape of `tools/botevent-seq` (#702) would be the
+next step if the pilot is to be run by someone who is not running `go test`;
+not built here.
+
+**3. `EXPLAIN` on realistic grant volumes — still open**, and it is the gate
+condition recorded in D0d.
+
+**4. iOS / Android / web smoke of a marked frame — still open**, carried from
+#709. Server-side the marker is additive and forward-compat, but no server test
+can answer what three clients render.
+
+**5. `modules/thread` losing the card preview — accepted by the owner.** Carried
+from #709 and now closed: a thread created from a card message announces its
+source rather than copying the card body. No further work.
+
 ### D1 — One PR-C milestone, ordered internal slices
 
 保持一个 octo-server PR-C，避免 migrations/API/runtime wiring 跨 PR 出现“grant 已写入但
