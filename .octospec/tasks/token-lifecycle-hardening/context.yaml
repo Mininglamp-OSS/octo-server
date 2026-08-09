@@ -1,0 +1,62 @@
+# Rules resolved for this task (octospec Implement phase).
+slug: token-lifecycle-hardening
+resolved_at: 2026-08-09T18:42:28+08:00
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      Authentication validity is a tenant boundary. All HTTP-token readers now
+      share one validator and fail closed for malformed or invalid v3 session
+      state without changing the existing unauthenticated wire response.
+    applied:
+      - Explicit token readers in group, message, qrcode, user, and auth routes
+        use the canonical validator instead of decoding Redis values directly.
+      - Session state is shared through Redis and coordinated atomically rather
+        than through process-local locks, so replicas cannot resurrect a bearer
+        deleted by a concurrent logout.
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: >
+      Token expiry and Redis failures are authentication failures whose public
+      response must retain the existing anti-enumeration and i18n contract.
+    applied:
+      - No new raw error responses or reason-specific authentication details
+        were exposed to clients.
+      - Infrastructure and validation reasons remain bounded internal metrics;
+        i18n extraction and direct-response lint stay clean.
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: >
+      Internal and module files are touched, but this task does not add or move
+      routes or request-frequency policies.
+    applied:
+      - Existing global, strict-IP, and shared-UID middleware placement is
+        unchanged.
+      - Migration observation is an explicit rate-limited operator process and
+        does not run inside API replicas.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    applied:
+      - Real Redis tests cover finite TTL, atomic read/update, concurrent logout,
+        failure compensation, v3 downgrade prevention, and read-only observation.
+      - HTTP tests use isolated temporary databases and verify login TTL plus
+        nickname-update deadline preservation.
+      - Source guards prevent production readers/writers from bypassing the
+        canonical auth boundary.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    applied:
+      - Commits use English Conventional Commit subjects; PR content is English.
+
+notes:
+  - This is PR 1 of 2. It stops new or touched credentials from becoming
+    unbounded but intentionally does not bulk-expire historical persistent v1/v2
+    sessions.
+  - PR 2 owns v3 activation, generation/session indexes, the revocation matrix,
+    migration apply/enforce, and the associated go/no-go gates.

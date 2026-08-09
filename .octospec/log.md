@@ -4,6 +4,23 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-09 (token-lifecycle-hardening PR 1)
+
+- **Task** — `token-lifecycle-hardening`: bounded all new and touched user HTTP
+  bearers with the existing Token TTL, centralized readers/writers in a shared
+  Redis Session Store, preserved deadlines atomically across replicas, added
+  strict v3 forward validation, startup Lua compatibility probing, bounded pool
+  metrics, and a rate-limited aggregate-only migration observer. This PR does
+  not bulk-expire historical persistent v1/v2 sessions; v3 activation,
+  generation/indexed revocation, migration apply/enforce, and final security
+  closure remain PR 2 plus controlled operations. See
+  [journal](journal/shared/token-lifecycle-hardening.md).
+- **Learning (pending)** —
+  [scope-explicit-empty-env-validation](learnings/pending/token-lifecycle-hardening.md):
+  distinguish absent from explicitly empty security env values by reading the
+  one documented key; never mutate shared configuration semantics as a local
+  validation shortcut.
+
 ## 2026-08-09 (scan-login-authorization)
 
 - **Task** — `scan-login-authorization`: added a deployment-wide
