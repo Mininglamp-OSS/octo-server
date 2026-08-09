@@ -30,13 +30,11 @@ package bot_api
 //     rather than a generic internal error, so a producer backing off at
 //     startup can tell "retry shortly" from "this deployment is broken".
 //
-// Still NOT covered, deliberately, and it is the open half of P1-1: a Bot
-// granted send on a dynamic template whose ID is not `ai.reasoning-process` is
-// advertised by `advertisedSendRefs` and refused by `rejectByBotCardPolicy`'s
-// `!mapped` branch. Adding such a grant to property 3's fixture below turns it
-// red — correctly, because the divergence is real. Which side gives way is a
-// contract decision (does a Bot grant reach IDs beyond the static policy in
-// this milestone?), so the test lands with the fix rather than ahead of it.
+// Property 3 covers both halves of P1-1. Its fixture carries a dynamically
+// shadowed ai.reasoning-process (which the deleted `AdvertisedRef` comparison
+// refused) *and* a granted dynamic template with an unmapped ID (which
+// `rejectByBotCardPolicy`'s `!mapped` branch refuses). Reverting either fix
+// turns it red.
 
 import (
 	"context"
@@ -96,30 +94,27 @@ func TestCapabilityForIsTheStaticManifestWhileTheGateIsOff(t *testing.T) {
 }
 
 func TestCapabilityForDropsAnUnreadableTemplateInsteadOfFailingTheManifest(t *testing.T) {
-	// A granted dynamic template the catalog cannot resolve — the shape a bundle
-	// that decodes but will not compile, or one whose compile times out under
-	// load, presents to CapabilityFor. advertisedSendRefs returns it (proven by
-	// TestBotTemplateManifestIncludesGrantedDynamicTemplates), so it reaches the
-	// per-ref MetaExact that used to abort the whole manifest.
+	// A granted dynamic activation the catalog cannot resolve — the shape a
+	// bundle that decodes but will not compile, or one whose compile times out
+	// under load, presents to CapabilityFor. It reaches the per-ref MetaExact
+	// that used to abort the whole manifest.
 	//
 	// Before cf574fa0 this returned errBotTemplateRuntimeUnavailable, which
-	// card_profile.go turns into a 500 — one bad artifact among a Bot's grants
+	// card_profile.go turns into a 5xx — one bad artifact among a Bot's grants
 	// taking feature detection down for that Bot entirely, on the endpoint whose
 	// job is to answer when things are partly unavailable.
-	const unresolvable = cardtmpl.ID("pilot.not-in-this-catalog")
+	//
+	// The fixture shadows ai.reasoning-process at an unregistered version rather
+	// than granting a new ID: since switchMappedRefs (P1-1) the advertised set
+	// contains only switch-mapped IDs, so a granted new ID never reaches
+	// MetaExact at all and would make this test vacuous.
+	const unresolvable = "9.9.9-not-registered"
 	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
 		multiRows: map[string][]string{"bot-42": {"space-bot"}},
 	}, &stubAuthorizationSource{
 		newSend: true,
-		granted: []cardtmpl.RuntimeAdvertisedTemplate{
-			{ID: unresolvable, Authorization: cardtmpl.RuntimeAuthorization{
-				Version: "0.4.0-pilot.20260805",
-				Artifact: cardtmpl.RuntimeArtifactMeta{
-					ID: unresolvable, Version: "0.4.0-pilot.20260805",
-					Source: cardtmpl.RuntimeSourceDynamic, Owner: "docs",
-				},
-				Grant: sendGrant(),
-			}},
+		auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
+			aireasoningprocess.TemplateID: dynamicAuthorization(unresolvable, false, sendGrant()),
 		},
 	})
 	principal := botCatalogPrincipal{BotID: "bot-42", SpaceID: "space-bot", Space: botSpaceScoped}
@@ -133,28 +128,32 @@ func TestCapabilityForDropsAnUnreadableTemplateInsteadOfFailingTheManifest(t *te
 	}
 	var offered bool
 	for _, ref := range refs {
-		if ref.ID == unresolvable {
+		if ref.ID == aireasoningprocess.TemplateID && ref.Version == unresolvable {
 			offered = true
 		}
 	}
 	if !offered {
-		t.Fatalf("fixture precondition broken: the unresolvable template is not in the advertised set %+v", refs)
+		t.Fatalf("fixture precondition broken: the unresolvable version is not in the advertised set %+v", refs)
 	}
 
+	// The property: a manifest, not an error. Reverting cf574fa0's drop makes
+	// this call fail and the profile answer 5xx.
 	got, err := ba.cardTemplates.CapabilityFor(context.Background(), principal)
 	if err != nil {
 		t.Fatalf("one unreadable template failed the whole manifest: %v", err)
 	}
 	for _, template := range got.Templates {
-		if cardtmpl.ID(template.ID) == unresolvable {
-			t.Fatalf("the unreadable template %s was advertised anyway", template.ID)
+		if template.Version == unresolvable {
+			t.Fatalf("the unreadable template %s@%s was advertised anyway",
+				template.ID, template.Version)
 		}
 	}
-	// And the rest of the manifest survived, which is the half that makes this
-	// a drop rather than a failure.
-	if len(got.Templates) == 0 {
-		t.Fatal("the manifest was blanked by a single unreadable template")
-	}
+	// The other half of "drop rather than blank" — that surviving templates
+	// survive — is not assertable here today: switchMappedRefs bounds the
+	// advertised set to the switch-mapped IDs, and botTemplateSwitchFor has
+	// exactly one entry, so an unreadable manifest is legitimately empty. When a
+	// second switch is added, TestBotTemplateSwitchCoversAdvertisedSet is the
+	// tripwire that says so, and this assertion should come back with it.
 }
 
 // TestEveryAdvertisedRefIsOneThePrefilterAccepts is property 3, driven through
@@ -168,16 +167,35 @@ func TestCapabilityForDropsAnUnreadableTemplateInsteadOfFailingTheManifest(t *te
 // is the mutation that proves it: restore the comparison and 0.3.0 != the
 // static 0.4.0, so the prefilter rejects and this test goes red.
 //
+// The `!mapped` half is the other one. `rejectByBotCardPolicy` fails closed on
+// any template ID with no per-Bot switch, before the resolver runs, while
+// `advertisedSendRefs` used to append every granted candidate — so a Bot
+// granted `pilot.docs-card` saw it advertised and got a 400 on every send. The
+// fixture therefore also carries a granted, unmapped, perfectly resolvable
+// dynamic ID: it must not appear in the advertised set at all. Deleting
+// `switchMappedRefs` puts it back in and turns this red.
+//
 // It is written as a loop over the advertised set rather than one hard-coded
 // ref so that it keeps meaning what its name says as the set grows.
 func TestEveryAdvertisedRefIsOneThePrefilterAccepts(t *testing.T) {
 	const shadowed = aireasoningprocess.TemplateVersionV3
+	const unmapped = cardtmpl.ID("pilot.docs-card")
 	ba := newTestBotAPIWithCatalog(t, &fakeSpaceQuerier{
 		multiRows: map[string][]string{"bot-42": {"space-bot"}},
 	}, &stubAuthorizationSource{
 		newSend: true,
 		auth: map[cardtmpl.ID]cardtmpl.RuntimeAuthorization{
 			aireasoningprocess.TemplateID: dynamicAuthorization(shadowed, false, sendGrant()),
+		},
+		granted: []cardtmpl.RuntimeAdvertisedTemplate{
+			{ID: unmapped, Authorization: cardtmpl.RuntimeAuthorization{
+				Version: "1.0.0",
+				Artifact: cardtmpl.RuntimeArtifactMeta{
+					ID: unmapped, Version: "1.0.0",
+					Source: cardtmpl.RuntimeSourceDynamic, Owner: "docs",
+				},
+				Grant: sendGrant(),
+			}},
 		},
 	})
 	ba.cardConfig = stubBotCardConfig{cfg: allBotCardSwitchesOn()}
@@ -194,6 +212,10 @@ func TestEveryAdvertisedRefIsOneThePrefilterAccepts(t *testing.T) {
 	for _, ref := range refs {
 		if ref.ID == aireasoningprocess.TemplateID && ref.Version == shadowed {
 			shadowOffered = true
+		}
+		if ref.ID == unmapped {
+			t.Fatalf("the manifest advertises %s, which rejectByBotCardPolicy refuses "+
+				"unconditionally — advertised must mean sendable; refs=%+v", ref.ID, refs)
 		}
 	}
 	if !shadowOffered {

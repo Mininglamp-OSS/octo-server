@@ -1580,14 +1580,19 @@ func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]in
 		// this deployment does not advertise for this principal — with strictly
 		// more information than this line had.
 		//
-		// STILL OPEN, and this comment used to claim otherwise (review P1-1,
-		// yujiawei): a granted dynamic template whose ID is *not*
-		// ai.reasoning-process still never reaches requireSendableRef, because
-		// the `!mapped` branch above returns first while advertisedSendRefs
-		// advertises it. That divergence is unresolved here; closing it needs a
-		// decision about whether a Bot grant reaches IDs beyond the static
-		// policy in this milestone, and then either applying this switch inside
-		// advertisedSendRefs or having it defer to the grant for non-static IDs.
+		// The `!mapped` branch above is the other half of the same invariant,
+		// and it stays where it is (review P1-1, yujiawei). A granted dynamic
+		// template whose ID has no per-Bot switch never reaches
+		// requireSendableRef, because that branch returns first — so the
+		// manifest must not advertise it either, and switchMappedRefs makes
+		// sure it does not. The agreement is asserted end to end by
+		// TestEveryAdvertisedRefIsOneThePrefilterAccepts, which drives this
+		// function over whatever advertisedSendRefs offers.
+		//
+		// Deferring this switch to the grant for non-static IDs is the other
+		// way to close it, and it is deliberately not taken here: it would move
+		// the per-Bot policy check after ref resolution, changing the send
+		// path's ordering rather than a hint. See the D0 entry.
 		return false
 	}
 

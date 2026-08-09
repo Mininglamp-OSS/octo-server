@@ -350,9 +350,22 @@ func TestBotTemplateSendRejectsStaleDynamicRef(t *testing.T) {
 	}
 }
 
-// The advertised set is the union of the static policy and the Bot's other
-// granted templates, with the static IDs resolved through the same matrix.
-func TestBotTemplateManifestIncludesGrantedDynamicTemplates(t *testing.T) {
+// The advertised set is the static policy resolved through the matrix, plus the
+// Bot's other granted templates — minus anything the per-Bot send gate refuses
+// unconditionally.
+//
+// That last clause is review P1-1 (yujiawei), and this test used to assert its
+// opposite: it required `pilot.docs-card` to be advertised, while
+// `rejectByBotCardPolicy` refused that same ID before the resolver was reached.
+// The suite therefore demonstrated the manifest/send divergence and asserted
+// only the half that agreed. Under the milestone decision recorded in D0 — a Bot
+// grant does not reach template IDs beyond the static policy — the manifest is
+// the side that gives way, so the granted-but-unmapped ID must now be absent.
+//
+// The grant still does work here: it is what makes a *shadowed* version of a
+// mapped ID advertisable, which TestBotTemplateSendRefFollowsTheShadowMatrix and
+// TestEveryAdvertisedRefIsOneThePrefilterAccepts cover.
+func TestBotTemplateManifestExcludesGrantsTheSendGateRefuses(t *testing.T) {
 	extra := cardtmpl.ID("pilot.docs-card")
 	source := &stubAuthorizationSource{
 		newSend: true,
@@ -390,8 +403,13 @@ func TestBotTemplateManifestIncludesGrantedDynamicTemplates(t *testing.T) {
 	if found[aireasoningprocess.TemplateID] != testReasoningVersionCurrent {
 		t.Fatalf("static policy ref missing from %+v", refs)
 	}
-	if found[extra] != "0.4.0" {
-		t.Fatalf("granted dynamic ref missing from %+v", refs)
+	// Granted, active, unblocked, and perfectly resolvable — and still not
+	// advertised, because botTemplateSwitchFor has no entry for it and the send
+	// prefilter would answer 400 on every attempt. Advertising it is the
+	// contradiction /v1/bot/card/profile exists to prevent.
+	if version, advertised := found[extra]; advertised {
+		t.Fatalf("granted-but-unmapped %s@%s was advertised; the send prefilter refuses it "+
+			"unconditionally (send.go botTemplateSwitchFor)", extra, version)
 	}
 	if _, blocked := found["pilot.blocked"]; blocked {
 		t.Fatalf("blocked template was advertised: %+v", refs)

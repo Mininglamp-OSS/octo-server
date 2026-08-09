@@ -130,6 +130,45 @@ cards, for no behavioural difference. Recorded here as an accepted deviation,
 not an oversight — a *non*-additive change to a shipped version still requires a
 new version.
 
+### D0b — A Bot `send` grant does not reach template IDs beyond the static policy in this milestone
+
+Review P1-1 (yujiawei) / S10: D6 requires the profile and the send path to
+answer from one resolver, and they did not. `rejectByBotCardPolicy` fails closed
+on any template ID absent from `botTemplateSwitchFor` — which today holds exactly
+one entry, `ai.reasoning-process` — *before* the runtime resolver is reached,
+while `advertisedSendRefs` appended every granted candidate. A Bot granted send
+on any other activated dynamic template therefore saw it advertised by
+`/v1/bot/card/profile` and got a `400` on every send: the precise contradiction
+that endpoint exists to prevent.
+
+Both sides could give way. The decision is that **the manifest does**:
+`switchMappedRefs` drops any ref whose ID has no per-Bot switch, so a Bot grant
+on a new ID is inert for send until that ID is given a switch.
+
+Why this side. The alternative — having the switch defer to the grant for
+non-static IDs — requires moving the per-Bot policy check to after ref
+resolution, which changes the ordering of the send path itself rather than the
+content of a hint; that is not a change to make in a review round. This
+direction is also strictly fail-closed (it only removes entries from an
+advertised set) and is reversible by deleting one filter, whereas the other
+direction is not reversible as cheaply once producers have seen the wider
+manifest. `_NEW_SEND_ENABLED` is false in production, so nothing depends on the
+wider behaviour today.
+
+What this costs, stated plainly: for Bot principals the D2 `send` grant is
+meaningful only for `ai.reasoning-process` in this milestone — it is what makes
+a *shadowed version* of that ID sendable, not what admits new IDs. The grant
+table's other consumers (internal-producer and Space principals, and `discover`
+for B1) are unaffected. Lifting this is a milestone decision: add the switch
+entry, and `TestBotTemplateSwitchCoversAdvertisedSet` is the tripwire that says
+a newly advertised template still needs one.
+
+One consequence worth recording because it makes a test weaker: the advertised
+set is now bounded by the switch map, which has one entry, so `CapabilityFor`'s
+"one unreadable template drops out and the rest survives" policy has no
+observable second half today. The drop itself is still asserted; the survival
+half returns when a second switch does.
+
 ### D1 — One PR-C milestone, ordered internal slices
 
 保持一个 octo-server PR-C，避免 migrations/API/runtime wiring 跨 PR 出现“grant 已写入但

@@ -37,6 +37,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	liblog "github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -568,7 +569,7 @@ func (c *botCardTemplateCatalog) advertisedSendRefs(
 	// above, there is no activation pointer to check for an ID we only learn
 	// about from a grant.
 	if source == nil || !source.NewSendEnabled() || !principal.grantReadable() {
-		return refs, nil
+		return switchMappedRefs(principal, refs), nil
 	}
 	granted, err := source.ListAuthorizedTemplates(ctx, principal.catalogPrincipal(), 0)
 	if err != nil {
@@ -584,7 +585,52 @@ func (c *botCardTemplateCatalog) advertisedSendRefs(
 			refs = append(refs, ref)
 		}
 	}
-	return refs, nil
+	return switchMappedRefs(principal, refs), nil
+}
+
+// errBotTemplateSwitchUnmapped explains a manifest omission in the log. It is
+// never returned to a caller: an ID with no per-Bot switch is simply not part
+// of this deployment's advertised set.
+var errBotTemplateSwitchUnmapped = errors.New(
+	"template id has no per-Bot switch, so the send path fails it closed")
+
+// switchMappedRefs drops any ref whose ID has no per-Bot switch mapping.
+//
+// This closes the last half of the manifest-versus-send divergence (review
+// P1-1, yujiawei). `rejectByBotCardPolicy` fails closed on an unmapped template
+// ID *before* the runtime resolver is reached, so a Bot granted send on a
+// dynamic template other than ai.reasoning-process used to see it advertised
+// here and get a 400 on every send — the exact contradiction
+// /v1/bot/card/profile exists to prevent, and the one CapabilityFor's own
+// comment promises does not happen ("everything advertised here is sendable").
+//
+// Two ways to close it, and this is the narrower one: the manifest stops
+// advertising what the switch refuses. The alternative — having the switch
+// defer to the grant for non-static IDs — would move the per-Bot policy check
+// after the ref resolves, which is a change to the send path's ordering rather
+// than to a hint. That is a milestone decision (D0: Bot grants do not reach
+// template IDs beyond the static policy in this milestone), and it can be taken
+// later by deleting this filter; taking it the other way first could not be
+// undone as cheaply.
+//
+// The switch lookup is config-independent in its second return, so this needs
+// no per-Bot configuration: "is there a switch for this ID at all" is a
+// property of the deployment, not of the Bot. Whether that switch is *on* stays
+// where it was — the send gate, and `reasoning_enabled` in the same profile
+// response.
+func switchMappedRefs(principal botCatalogPrincipal, refs []botTemplateRef) []botTemplateRef {
+	kept := refs[:0]
+	for _, ref := range refs {
+		if _, mapped := botTemplateSwitchFor(ref.ID, robot.BotCardConfig{}); !mapped {
+			// Logged rather than dropped in silence: an operator who wrote a
+			// grant, saw the row land, and then cannot find the template in the
+			// profile would otherwise have nothing to go on.
+			logBotTemplateManifestDrop(principal, ref, errBotTemplateSwitchUnmapped)
+			continue
+		}
+		kept = append(kept, ref)
+	}
+	return kept
 }
 
 // CapabilityFor is the request-scoped manifest. Before PR-C this was a process
