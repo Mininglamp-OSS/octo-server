@@ -71,3 +71,27 @@ func TestPasswordMutationAndSessionRevocationIntentAreDurableAndApplied(t *testi
 	_, err = auth.NewTokenValidator(store, prefix, auth.WithValidatorClock(func() time.Time { return time.Now() })).Validate(context.Background(), postToken)
 	require.NoError(t, err)
 }
+
+func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	db := NewDB(ctx)
+	uid := util.GenerUUID()
+	require.NoError(t, db.Insert(&Model{UID: uid, Name: "disable-user", ShortNo: uid, Status: 1}))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+	})
+
+	intent, err := db.updateUserFieldWithSessionRevocation(context.Background(), uid, "status", "0", "account_disable")
+	require.NoError(t, err)
+	require.NotNil(t, intent)
+	updated, err := db.QueryByUID(uid)
+	require.NoError(t, err)
+	require.Zero(t, updated.Status)
+
+	var pending int
+	_, err = ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").Where("id=? AND status=?", intent.ID, sessionRevocationPending).Load(&pending)
+	require.NoError(t, err)
+	require.Equal(t, 1, pending)
+}
