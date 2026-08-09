@@ -3,8 +3,10 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	rd "github.com/go-redis/redis"
 )
 
 // This is the first test file in tools/botevent-seq, and the reason it exists is that the
@@ -134,5 +136,54 @@ func TestMaxSafeFloorKeepsScoresDistinct(t *testing.T) {
 	if maxSafeFloor < 1<<40 {
 		t.Fatalf("maxSafeFloor = %d leaves too little headroom above plausible ids",
 			int64(maxSafeFloor))
+	}
+}
+
+// TestMirrorWriteFailureStopsActivationAndExplainsPause is the round-8 D-4 regression.
+//
+// Committing the MySQL flip but failing to publish the mirror leaves replicas with cached
+// negative beliefs on the legacy allocator until that cache expires. The operator command
+// must therefore fail non-zero (the caller treats this returned error as fatal), and the
+// message must tell the operator to keep writes paused instead of claiming the next
+// allocation repairs the state immediately.
+func TestMirrorWriteFailureStopsActivationAndExplainsPause(t *testing.T) {
+	client := rd.NewClient(&rd.Options{
+		Addr:         "127.0.0.1:1",
+		DialTimeout:  10 * time.Millisecond,
+		ReadTimeout:  10 * time.Millisecond,
+		WriteTimeout: 10 * time.Millisecond,
+		MaxRetries:   0,
+	})
+	defer client.Close()
+
+	err := writeMirror(client, 7)
+	if err == nil {
+		t.Fatal("mirror write failure returned nil; activate would exit 0 after an incomplete cutover")
+	}
+	for _, want := range []string{
+		"authority is already activated",
+		"keep bot-event writes paused",
+		botevent.ModeKey,
+		botevent.MirrorValue(7),
+		botevent.NegativeBeliefTTL().String(),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("mirror write error does not contain %q: %v", want, err)
+		}
+	}
+}
+
+// TestActivationPreconditionsRemainVisibleWithYes pins the text printed for every activate
+// invocation. -yes confirms the operator read the warning; it must not suppress the warning.
+func TestActivationPreconditionsRemainVisibleWithYes(t *testing.T) {
+	for _, want := range []string{
+		"#704",
+		"cutover floor",
+		"EVERY replica",
+		"writes are paused",
+	} {
+		if !strings.Contains(activationPreconditions, want) {
+			t.Errorf("activation preconditions do not contain %q", want)
+		}
 	}
 }
