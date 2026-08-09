@@ -335,6 +335,9 @@ func TestGrantLogin_PromotesPendingAuthorizationBeforePublishingAuthed(t *testin
 	require.NotEqual(t, -1, qrIdx)
 	assert.Less(t, renewIdx, qrIdx,
 		"先提升授权再写 qrcode —— 提升失败就不该对外宣告 authed")
+	assert.Contains(t, fn,
+		"u.scanLoginAuthorizations.RollbackPromotion(authCode, authInfo, ScanLoginConfirmWindow)",
+		"qrcode 状态写失败时必须原子恢复 pending，让移动端可以重试确认")
 
 	assert.NotContains(t, fn, "time.Minute*5",
 		"TTL 必须走 ScanLoginAuthCodeTTL 常量，不要再散落字面量")

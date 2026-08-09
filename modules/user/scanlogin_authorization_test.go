@@ -125,3 +125,42 @@ func TestScanLoginAuthorization_PromoteAndConsumeAreAtomic(t *testing.T) {
 	assert.Equal(t, int32(1), consumed)
 	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
 }
+
+func TestScanLoginAuthorization_RollbackPromotionRestoresPending(t *testing.T) {
+	store := newScanLoginAuthorizationStoreForTest(t)
+	authCode := "scan-rollback-" + time.Now().Format("150405.000000000")
+	pendingKey := scanLoginPendingAuthorizationKey(authCode)
+	readyKey := scanLoginReadyAuthorizationKey(authCode)
+	t.Cleanup(func() {
+		_ = store.client.Del(pendingKey, readyKey).Err()
+	})
+
+	expected, err := encodeScanLoginAuthorization("scanner-1", "uuid-1")
+	require.NoError(t, err)
+	require.NoError(t, store.client.Set(readyKey, expected, time.Minute).Err())
+
+	wrong, err := store.RollbackPromotion(authCode, expected+"-wrong", time.Minute)
+	require.NoError(t, err)
+	assert.False(t, wrong)
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+	assert.Equal(t, rd.Nil, store.client.Get(pendingKey).Err())
+
+	require.NoError(t, store.client.Set(pendingKey, "newer-pending", time.Minute).Err())
+	conflict, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, conflict, "rollback must not overwrite an existing pending authorization")
+	assert.Equal(t, expected, store.client.Get(readyKey).Val())
+	assert.Equal(t, "newer-pending", store.client.Get(pendingKey).Val())
+	require.NoError(t, store.client.Del(pendingKey).Err())
+
+	restored, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.True(t, restored)
+	assert.Equal(t, rd.Nil, store.client.Get(readyKey).Err())
+	assert.Equal(t, expected, store.client.Get(pendingKey).Val())
+	assert.Greater(t, store.client.PTTL(pendingKey).Val(), time.Duration(0))
+
+	replayed, err := store.RollbackPromotion(authCode, expected, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, replayed)
+}
