@@ -212,12 +212,8 @@ func (s *store) LoadAuthorizations(
 	if err != nil {
 		return nil, err
 	}
-	grants, err := scanScopedGrantDecisions(ctx, tx, unique, principal)
-	if err != nil {
-		return nil, err
-	}
 	for _, id := range unique {
-		result := cardtmpl.RuntimeAuthorization{Grant: grants[id]}
+		var result cardtmpl.RuntimeAuthorization
 		if pointer, ok := pointers[id]; ok {
 			version, err := cardtmpl.ActivationVersion(id, pointer.activation)
 			switch {
@@ -245,6 +241,41 @@ func (s *store) LoadAuthorizations(
 			}
 		}
 		out[id] = result
+	}
+	// The grant read is scoped to the templates that actually resolved a
+	// version, mirroring the guard the single-ID path applies (review P2-1,
+	// yujiawei). Two reasons, and both are contract rather than taste:
+	//
+	//   - RuntimeAuthorizationBatchStore's MUST says the batch returns, for
+	//     every requested ID, exactly what LoadAuthorization would have returned
+	//     with an empty Version, and it documents exactly one exception (a
+	//     disabled pointer). Populating Grant where the single path leaves it
+	//     zero is a second, undocumented one. The state is reachable: a grant
+	//     needs only a permanent version claim, explicitly not an activation
+	//     (D4, store_grant.go).
+	//   - It keeps the "a deployment with no activations never touches the grant
+	//     table" property the single path was fixed to restore, which is what
+	//     the merge argument for the ungated half rests on.
+	//
+	// Still inside the same REPEATABLE READ transaction as the pointer scan, so
+	// this remains one snapshot — the indivisibility the resolver is built on is
+	// unaffected by reading the two sets in sequence.
+	resolved := make([]cardtmpl.ID, 0, len(unique))
+	for _, id := range unique {
+		if out[id].Version != "" {
+			resolved = append(resolved, id)
+		}
+	}
+	if len(resolved) > 0 {
+		grants, err := scanScopedGrantDecisions(ctx, tx, resolved, principal)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range resolved {
+			result := out[id]
+			result.Grant = grants[id]
+			out[id] = result
+		}
 	}
 	// Commit for the same reason the single read does: a connection-level
 	// failure must surface as an error, not as a truncated read that reads like

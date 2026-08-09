@@ -163,9 +163,10 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 //     send path will accept.
 //
 // Invariant 2 is why the ref is read out of the *same* manifest value this
-// response carries, rather than resolved separately. It used to come from the
-// static AdvertisedRef, which made the two fields answer from different
-// sources: once a dynamic version shadows ai.reasoning-process, `templating`
+// response carries, rather than resolved separately. It used to come from a
+// boot-time lookup (botCardTemplateCatalog.AdvertisedRef, since retired), which
+// made the two fields answer from different sources: once a dynamic version
+// shadows ai.reasoning-process, `templating`
 // would list the dynamic one while `reasoning_template_ref` still named the
 // static version — and a producer that trusts the ref, as this field exists to
 // be trusted, would send a version the gate refuses. Deriving both from one

@@ -362,8 +362,13 @@ func TestStoreLoadAuthorizationsUsesTwoStatementsForManyTemplates(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
 		WithArgs("test.a", "test.b", "test.c").
 		WillReturnRows(dynamicAdvertiseRow(advertiseRows(), "test.a", "1.0.0", 2))
+	// Only test.a resolved a version, so only test.a is in the grant IN list —
+	// the batch mirrors the single path's version guard (review P2-1, yujiawei),
+	// and sqlmock's argument matching is what pins the narrowing: widening this
+	// back to all three IDs fails here rather than silently returning a Grant
+	// where LoadAuthorization would have returned none.
 	mock.ExpectQuery(regexp.QuoteMeta(authBatchGrantPrefix)).
-		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", "test.a", "test.b", "test.c").
+		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", "test.a").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"template_id", "scope_space_id", "status",
 			"can_discover", "can_send", "can_edit", "revision",
@@ -407,12 +412,8 @@ func TestStoreLoadAuthorizationsRejectsBlankIDsAndDeduplicates(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
 		WithArgs("test.a").
 		WillReturnRows(advertiseRows())
-	mock.ExpectQuery(regexp.QuoteMeta(authBatchGrantPrefix)).
-		WithArgs(string(GrantPrincipalBot), "bot-1", "space-1", "test.a").
-		WillReturnRows(sqlmock.NewRows([]string{
-			"template_id", "scope_space_id", "status",
-			"can_discover", "can_send", "can_edit", "revision",
-		}))
+	// No grant query: advertiseRows() is empty, so nothing resolved a version.
+	// See TestStoreLoadAuthorizationsWithoutActivationReadNoGrantEither.
 	mock.ExpectCommit()
 	got, err := store.LoadAuthorizations(context.Background(),
 		[]cardtmpl.ID{"test.a", "test.a"}, botAuthPrincipal())
@@ -421,6 +422,51 @@ func TestStoreLoadAuthorizationsRejectsBlankIDsAndDeduplicates(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("deduplicated result = %+v", got)
+	}
+	assertMockExpectations(t, mock)
+}
+
+// TestStoreLoadAuthorizationsWithoutActivationReadNoGrantEither is the batch
+// mirror of TestStoreLoadAuthorizationWithoutActivationReadsNeitherArtifactNor-
+// Grant, and it exists because the two paths had drifted apart (review P2-1,
+// yujiawei).
+//
+// RuntimeAuthorizationBatchStore's contract says the batch must return, for
+// every requested ID, exactly what LoadAuthorization would have returned with an
+// empty Version, and it documents precisely one exception (a disabled pointer).
+// After the single path moved its grant read inside the resolved-version guard,
+// the batch kept populating Grant unconditionally — a second, undocumented
+// exception, in a state that is reachable because a grant needs only a permanent
+// version claim and explicitly not an activation (D4).
+//
+// The assertion is structural, not a field check: sqlmock fails on an
+// *unexpected* query, so restoring the unconditional read turns this red instead
+// of quietly re-introducing the divergence.
+func TestStoreLoadAuthorizationsWithoutActivationReadNoGrantEither(t *testing.T) {
+	store, mock, closeDB := newMockStore(t)
+	defer closeDB()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(authAdvertisePattern)).
+		WithArgs("test.a", "test.b").
+		WillReturnRows(advertiseRows())
+	mock.ExpectCommit()
+
+	got, err := store.LoadAuthorizations(context.Background(),
+		[]cardtmpl.ID{"test.a", "test.b"}, botAuthPrincipal())
+	if err != nil {
+		t.Fatalf("LoadAuthorizations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("answered %d of 2 templates: %+v", len(got), got)
+	}
+	// And the returned shape is the one the single path returns: no version, no
+	// grant. A zero Grant with Found=false is a denial, so this is fail-closed
+	// in both directions.
+	for _, id := range []cardtmpl.ID{"test.a", "test.b"} {
+		if entry := got[id]; entry.Version != "" || entry.Grant.Found {
+			t.Fatalf("%s = %+v, want the empty-Version shape LoadAuthorization returns", id, entry)
+		}
 	}
 	assertMockExpectations(t, mock)
 }

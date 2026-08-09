@@ -1558,32 +1558,36 @@ func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]in
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}
-		// Deliberately *not* comparing against AdvertisedRef here — review P1-A
-		// (Jerry-Xin, then yujiawei), and the reason is worth stating because
-		// deleting a check reads like weakening one.
+		// Deliberately *not* comparing against a boot-time advertised set here —
+		// review P1-A (Jerry-Xin, then yujiawei), and the reason is worth
+		// stating because deleting a check reads like weakening one.
 		//
-		// This prefilter runs before the principal-based render, so it can only
-		// consult the boot-time static policy. `requireSendableRef` is the
+		// This prefilter runs before the principal-based render, so it could
+		// only consult the boot-time static policy. `requireSendableRef` is the
 		// advertised-set authority: with the new-send gate on it resolves the
 		// ref through the runtime catalog for *this* Bot and Space, which is
 		// what makes a dynamic version sendable at all. A static comparison
-		// here therefore rejected exactly the versions the runtime would
-		// authorize — a granted dynamic template with a new ID never reached
-		// the resolver, and a dynamically shadowed ai.reasoning-process was
-		// refused as "not advertised" while /v1/bot/card/profile advertised it
-		// in the same breath.
-		//
-		// That last part is the sharp end: card_profile.go documents the
-		// invariant "reasoning_enabled=true ⟹ the ref is one the send path will
-		// accept", and wiring CapabilityFor into the profile made that
-		// invariant false rather than true — it moved the manifest/send
-		// divergence one layer down instead of removing it. Removing this
-		// comparison is what actually removes it.
+		// here therefore rejected a *dynamically shadowed* ai.reasoning-process
+		// as "not advertised" while /v1/bot/card/profile advertised it in the
+		// same breath — card_profile.go documents the invariant
+		// "reasoning_enabled=true ⟹ the ref is one the send path will accept",
+		// and wiring CapabilityFor into the profile made that invariant false
+		// rather than true. Removing the comparison is what removes it, and
+		// TestEveryAdvertisedRefIsOneThePrefilterAccepts fails if it comes back.
 		//
 		// Nothing is weakened. The per-Bot switch above still fail-closes on an
 		// unmapped or disabled template, and requireSendableRef refuses any ref
 		// this deployment does not advertise for this principal — with strictly
 		// more information than this line had.
+		//
+		// STILL OPEN, and this comment used to claim otherwise (review P1-1,
+		// yujiawei): a granted dynamic template whose ID is *not*
+		// ai.reasoning-process still never reaches requireSendableRef, because
+		// the `!mapped` branch above returns first while advertisedSendRefs
+		// advertises it. That divergence is unresolved here; closing it needs a
+		// decision about whether a Bot grant reaches IDs beyond the static
+		// policy in this milestone, and then either applying this switch inside
+		// advertisedSendRefs or having it defer to the grant for non-static IDs.
 		return false
 	}
 
