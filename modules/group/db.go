@@ -207,7 +207,11 @@ func (d *DB) ExistMemberActiveInternal(uid string, groupNo string) (bool, error)
 // 管理员可设的独立状态（api_manager.go 的 groupStatusUpdate 只翻 status、保留成员），
 // 全模块 liveness 检查一律只排除 Disband，禁用群仍是"活着的群"。若这里用白名单，
 // 两人唯一共同群被管理员禁用就会静默丢失互相可见性，正是 PERSON 分级要避免的裂图。
-// 可见口径与 ExistMember 一致（不额外排黑名单）——共同群关系不因一方被禁言而消失。
+//
+// 成员侧要求**双方** status=Normal：群黑名单（GroupMemberStatusBlacklist）只置
+// status、保留 is_deleted=0，若不排除，被某群拉黑的人仍能凭该群拿到对方完整资料。
+// 与子区门禁 ExistMemberActive 的口径一致（同一 PR 内两个新谓词不应互相矛盾）。
+// 降级后对方的名字/头像仍可渲染（最小集含 name/logo），不会裂图。
 //
 // SELECT 1 ... LIMIT 1 而非 COUNT(*)：这是存在性判断，且是本端点最热的读路径
 // （每次对无关系 peer 的 channelGet 都会走），让 MySQL 命中首行即停，不必枚举
@@ -222,8 +226,8 @@ func (d *DB) ExistCommonGroup(uidA string, uidB string) (bool, error) {
 			"INNER JOIN group_member m2 ON m1.group_no = m2.group_no "+
 			"INNER JOIN `group` g ON g.group_no = m1.group_no "+
 			"WHERE m1.uid = ? AND m2.uid = ? AND m1.is_deleted = 0 AND m2.is_deleted = 0 "+
-			"AND g.status <> ? LIMIT 1",
-		uidA, uidB, GroupStatusDisband,
+			"AND m1.status = ? AND m2.status = ? AND g.status <> ? LIMIT 1",
+		uidA, uidB, common.GroupMemberStatusNormal, common.GroupMemberStatusNormal, GroupStatusDisband,
 	).Load(&exists)
 	return exists > 0, err
 }

@@ -255,8 +255,9 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 	if channelType == common.ChannelTypePerson.Uint8() {
 		visible, err := ch.personProfileVisible(loginUID, channelID, channelResp)
 		if err != nil {
+			// 用 user 域错误码：这是单聊（人）资料读取失败，客户端不该看到群错误。
 			ch.Error("查询单聊资料可见关系失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			httperr.ResponseErrorL(c, errcode.ErrUserQueryFailed, nil, nil)
 			return
 		}
 		if !visible {

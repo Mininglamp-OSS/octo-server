@@ -22,8 +22,10 @@ const pinnedMaxPerSpace = 7
 type GroupMemberCheckFunc func(groupNo string, uid string) (bool, error)
 
 // CommonGroupCheckFunc 检查两个用户是否至少同属一个未解散的群。
-// 由 group 模块在 init 阶段注册（modules/user 不能 import modules/group——反向依赖，
-// group/1module.go 引用 user），同 GroupMemberCheckFunc 的注入方向。
+// 由 group 模块的 register.AddModule factory 注册（modules/user 不能 import
+// modules/group——反向依赖，group/1module.go 引用 user），同 GroupMemberCheckFunc 的
+// 注入方向。factory 在首次 register.GetModules 时执行——不是包 init——但路由也由
+// GetModules 挂载，所以端点能对外服务时 hook 必然已就位；nil 路径本身也 fail closed。
 type CommonGroupCheckFunc func(uidA string, uidB string) (bool, error)
 
 var (

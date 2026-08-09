@@ -1,9 +1,11 @@
 package user
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -24,6 +26,37 @@ func newUserAuthzServer(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
+	// 显式注册两个 group 侧 hook，并在用例结束后复原。
+	//
+	// 不能依赖模块 bootstrap 注册的全局值：同包的 pinned_test.go 会把
+	// groupMemberChecker 置为 nil，整包跑时会污染这些用例（单独跑通过、整包跑失败）。
+	// 这里直连 group 的 db 语义显然不可能（modules/user 不能 import modules/group，
+	// 反向依赖），所以用等价的最小实现——判定口径与 group.ExistMember /
+	// ExistCommonGroup 一致：group_member 行未删且（共同群还要求）双方 status 正常、
+	// 群未解散。
+	prevMember, prevCommon := getGroupMemberChecker(), getCommonGroupChecker()
+	t.Cleanup(func() {
+		setGroupMemberChecker(prevMember)
+		RegisterCommonGroupChecker(prevCommon)
+	})
+	setGroupMemberChecker(func(groupNo, uid string) (bool, error) {
+		var cnt int
+		_, err := ctx.DB().SelectBySql(
+			"SELECT 1 FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 LIMIT 1", groupNo, uid,
+		).Load(&cnt)
+		return cnt > 0, err
+	})
+	RegisterCommonGroupChecker(func(a, b string) (bool, error) {
+		var cnt int
+		_, err := ctx.DB().SelectBySql(
+			"SELECT 1 FROM group_member m1 "+
+				"INNER JOIN group_member m2 ON m1.group_no=m2.group_no "+
+				"INNER JOIN `group` g ON g.group_no=m1.group_no "+
+				"WHERE m1.uid=? AND m2.uid=? AND m1.is_deleted=0 AND m2.is_deleted=0 "+
+				"AND m1.status=1 AND m2.status=1 AND g.status<>2 LIMIT 1", a, b,
+		).Load(&cnt)
+		return cnt > 0, err
+	})
 	// 不注入 renderer 拿不到 error.code
 	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{UID: testutil.UID, Name: "login-user", ShortNo: "SNLOGINU"}))
@@ -36,6 +69,18 @@ func getUser(s *server.Server, uid string) *httptest.ResponseRecorder {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	return w
+}
+
+// seedUserGroupMemberInvited 带 invite_uid 建成员行。u.get 只有在成员行 InviteUID
+// 非空时才把 group_member 塞进响应，所以验证"群维度富化是否被抑制"必须用这个 seeder
+// ——否则负向断言恒成立（空断言），证明不了门禁起作用。
+func seedUserGroupMemberInvited(t *testing.T, ctx *config.Context, groupNo, uid, inviteUID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, status, version, vercode, is_deleted, invite_uid) VALUES (?,?,0,1,1,?,0,?)",
+		groupNo, uid, fmt.Sprintf("vc-%s-%s", groupNo, uid), inviteUID,
+	).Exec()
+	assert.NoError(t, err)
 }
 
 func seedUserGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string) {
@@ -161,16 +206,116 @@ func TestUserGet_NotExist_NotFound(t *testing.T) {
 	assert.NotContains(t, body, "err.server.user.query_failed", "不得再报查询失败")
 }
 
-// newMinimalUserDetailResp 是白名单构造：只有 uid/name/follow/robot 四个字段。
+// newMinimalUserDetailResp 是白名单构造：**序列化后**只有 uid/name/follow/robot 四个
+// 顶层字段。断言 key 集合而非逐字段取值——后者在给 DTO 新增第五个字段时仍会通过。
 func TestNewMinimalUserDetailResp_WhitelistOnly(t *testing.T) {
 	full := &UserDetailResp{
 		UID: "u1", Name: "N", Follow: 0, Robot: 0,
 		ShortNo: "SN", Sex: 1, Online: 1, LastOffline: 123, Vercode: "vc",
 		SourceDesc: "src", RealName: "张三", RealnameVerified: true, Phone: "13000000000",
 	}
-	m := newMinimalUserDetailResp(full)
-	assert.Equal(t, "u1", m.UID)
-	assert.Equal(t, "N", m.Name)
-	assert.Equal(t, 0, m.Follow)
-	assert.Equal(t, 0, m.Robot)
+
+	b, err := json.Marshal(newMinimalUserDetailResp(full))
+	assert.NoError(t, err)
+
+	var m map[string]json.RawMessage
+	assert.NoError(t, json.Unmarshal(b, &m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	assert.Equal(t, []string{"follow", "name", "robot", "uid"}, keys,
+		"最小集只能有这四个顶层字段, got=%s", string(b))
+	for _, leaked := range []string{"SN", "short_no", "sex", "online", "last_offline", "vercode", "source_desc", "real_name", "张三", "13000000000"} {
+		assert.NotContains(t, string(b), leaked)
+	}
+}
+
+// group_no 是调用方传入的：调用方**不在**该群时，群维度富化必须整体不下发
+// （group_member / 外部来源 Space 字段 / 该群的 vercode）。否则任何能看到目标的人
+// 都能拿一个自己不在的群号反查该群维度元数据。
+func TestUserGet_GroupNoEnrichment_CallerNotMember_Suppressed(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	// 目标可见（同 Space），但调用方不在 ug_outsider 群里。
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_target", Name: "TargetU", ShortNo: "SNTGT",
+	}))
+	for _, uid := range []string{testutil.UID, "ut_target"} {
+		_, err := ctx.DB().InsertBySql(
+			"INSERT INTO space_member (space_id, uid, role, status, version) VALUES ('sp_x',?,0,1,1)", uid,
+		).Exec()
+		assert.NoError(t, err)
+	}
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('ug_outsider','outsider-grp','ut_target',1,1)",
+	).Exec()
+	assert.NoError(t, err)
+	seedUserGroupMemberInvited(t, ctx, "ug_outsider", "ut_target", "ut_inviter") // 只有目标在群里
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/users/ut_target?group_no=ug_outsider", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
+	assert.Contains(t, body, "TargetU", "目标本身可见，主响应不受影响")
+	assert.NotContains(t, body, "\"group_member\":{", "调用方非群成员不得拿到群成员元数据, body=%s", body)
+	assert.NotContains(t, body, "vc-ug_outsider", "不得泄露该群维度的 vercode")
+}
+
+// 调用方确实在该群时，群维度富化正常工作（确保上面的门禁不是把功能整体关掉）。
+func TestUserGet_GroupNoEnrichment_CallerIsMember_Works(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_mate", Name: "MateU", ShortNo: "SNMATE",
+	}))
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('ug_shared','shared-grp',?,1,1)", testutil.UID,
+	).Exec()
+	assert.NoError(t, err)
+	seedUserGroupMember(t, ctx, "ug_shared", testutil.UID)
+	seedUserGroupMemberInvited(t, ctx, "ug_shared", "ut_mate", testutil.UID)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/users/ut_mate?group_no=ug_shared", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
+	assert.Contains(t, body, "group_member", "同群调用方应能拿到群成员信息, body=%s", body)
+}
+
+// 被该群拉黑（status=Blacklist，is_deleted 仍为 0）后，该群不再构成"有共同群"关系
+// → 降级为最小集。与子区门禁 ExistMemberActive 口径一致。
+func TestUserGet_CommonGroupButBlacklisted_Minimal(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_blk", Name: "BlacklistedPeer", ShortNo: "SNBLK",
+	}))
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, creator, status, version) VALUES ('ug_blk','blk-grp','ut_blk',1,1)",
+	).Exec()
+	assert.NoError(t, err)
+	// 调用方在群里但被拉黑（status=2），目标正常。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, role, status, version, vercode, is_deleted) VALUES ('ug_blk',?,0,2,1,'vc-blk-self',0)", testutil.UID,
+	).Exec()
+	assert.NoError(t, err)
+	seedUserGroupMember(t, ctx, "ug_blk", "ut_blk")
+
+	w := getUser(s, "ut_blk")
+	body := w.Body.String()
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", body)
+	assert.Contains(t, body, "BlacklistedPeer", "名字仍可渲染，不裂图")
+	assert.NotContains(t, body, "short_no", "被该群拉黑后不应再凭该群拿到完整资料, body=%s", body)
 }
