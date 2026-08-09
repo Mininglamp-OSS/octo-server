@@ -305,6 +305,7 @@ type Message struct {
 	// exercised by the matrix suite, so widening the seam there is
 	// deliberately deferred to keep the diff minimal.
 	reminderSeqOverride func() (int64, error)
+	tokenValidator      *auth.TokenValidator
 }
 
 // New New
@@ -339,6 +340,10 @@ func New(ctx *config.Context) *Message {
 		cardRevisions:  cardrevision.NewStore(ctx.DB()),
 		seqStore:       msgextraseq.New(ctx),
 		stopChan:       make(chan struct{}),
+		tokenValidator: auth.NewTokenValidator(
+			auth.SessionStoreForContext(ctx),
+			ctx.GetConfig().Cache.TokenCachePrefix,
+		),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
 	m.ctx.AddEventListener(event.GroupMemberScanJoin, m.handleGroupMemberScanJoinEvent)
@@ -524,18 +529,13 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "payload")
 		return
 	}
-	raw, err := m.ctx.Cache().Get(m.ctx.GetConfig().Cache.TokenCachePrefix + req.Token)
+	info, err := m.tokenValidator.Validate(c.Request.Context(), req.Token)
 	if err != nil {
 		m.Error("解析token错误", zap.Error(err))
-		respondMessageTokenInvalid(c)
-		return
-	}
-	if strings.TrimSpace(raw) == "" {
-		respondMessageNotLoggedIn(c)
-		return
-	}
-	info, decodeErr := auth.Decode(raw)
-	if decodeErr != nil {
+		if errors.Is(err, wkhttp.ErrTokenNotFound) {
+			respondMessageNotLoggedIn(c)
+			return
+		}
 		respondMessageTokenInvalid(c)
 		return
 	}

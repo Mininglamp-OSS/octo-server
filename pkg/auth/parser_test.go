@@ -16,6 +16,27 @@ type fakeCache struct {
 	getErr error
 }
 
+type fakeTokenRecordReader struct {
+	records map[string]TokenRecord
+	err     error
+}
+
+type fakeSessionGenerationResolver struct {
+	generation string
+	err        error
+}
+
+func (r fakeSessionGenerationResolver) CurrentGeneration(context.Context, string) (string, error) {
+	return r.generation, r.err
+}
+
+func (r *fakeTokenRecordReader) ReadToken(_ context.Context, key string) (TokenRecord, error) {
+	if r.err != nil {
+		return TokenRecord{}, r.err
+	}
+	return r.records[key], nil
+}
+
 func newFakeCache() *fakeCache { return &fakeCache{store: map[string]string{}} }
 
 func (c *fakeCache) Set(key, value string) error { c.store[key] = value; return nil }
@@ -128,8 +149,8 @@ func TestCacheTokenParserPropagatesCacheError(t *testing.T) {
 // stubResolver is used to exercise the LanguageResolver hook without pulling
 // modules/user into pkg/auth's test deps.
 type stubResolver struct {
-	lang string
-	err  error
+	lang   string
+	err    error
 	gotUID string
 }
 
@@ -316,5 +337,101 @@ func TestWithRoleResolverNilIsNoOp(t *testing.T) {
 	}
 	if got.Role != "admin" {
 		t.Fatalf("without a resolver the token snapshot role must pass through, got %q", got.Role)
+	}
+}
+
+func TestTokenValidatorV3LifetimeAndRedisTTL(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 9, 8, 0, 0, 0, time.UTC)
+	valid, err := EncodeV3(TokenInfo{
+		UID:               "u1",
+		IssuedAt:          now.Add(-time.Hour).Unix(),
+		ExpiresAt:         now.Add(time.Hour).Unix(),
+		SessionGeneration: "g1",
+	})
+	if err != nil {
+		t.Fatalf("EncodeV3: %v", err)
+	}
+	expired, err := EncodeV3(TokenInfo{
+		UID:               "u1",
+		IssuedAt:          now.Add(-2 * time.Hour).Unix(),
+		ExpiresAt:         now.Unix(),
+		SessionGeneration: "g1",
+	})
+	if err != nil {
+		t.Fatalf("EncodeV3 expired: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		record     TokenRecord
+		generation string
+		wantOK     bool
+	}{
+		{name: "finite and before absolute deadline", record: TokenRecord{Payload: valid, TTL: time.Minute}, generation: "g1", wantOK: true},
+		{name: "persistent redis key", record: TokenRecord{Payload: valid, TTL: -1}, generation: "g1"},
+		{name: "expired payload", record: TokenRecord{Payload: expired, TTL: time.Minute}, generation: "g1"},
+		{name: "generation mismatch", record: TokenRecord{Payload: valid, TTL: time.Minute}, generation: "g2"},
+		{name: "missing key", record: TokenRecord{TTL: -2}, generation: "g1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := &fakeTokenRecordReader{records: map[string]TokenRecord{testPrefix + "tok": tt.record}}
+			validator := NewTokenValidator(
+				reader,
+				testPrefix,
+				WithValidatorClock(func() time.Time { return now }),
+				WithSessionGenerationResolver(fakeSessionGenerationResolver{generation: tt.generation}),
+			)
+			_, validateErr := validator.Validate(context.Background(), "tok")
+			if tt.wantOK && validateErr != nil {
+				t.Fatalf("Validate: %v", validateErr)
+			}
+			if !tt.wantOK && !errors.Is(validateErr, wkhttp.ErrTokenInvalid) && !errors.Is(validateErr, wkhttp.ErrTokenNotFound) {
+				t.Fatalf("Validate: want auth sentinel, got %v", validateErr)
+			}
+		})
+	}
+}
+
+func TestTokenValidatorKeepsLegacyCompatibility(t *testing.T) {
+	t.Parallel()
+	v2, err := Encode(TokenInfo{UID: "u1", Name: "alice"})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	reader := &fakeTokenRecordReader{records: map[string]TokenRecord{
+		testPrefix + "v2":     {Payload: v2, TTL: time.Minute},
+		testPrefix + "legacy": {Payload: "u1@alice", TTL: -1},
+	}}
+	validator := NewTokenValidator(reader, testPrefix)
+	for _, token := range []string{"v2", "legacy"} {
+		if _, err := validator.Validate(context.Background(), token); err != nil {
+			t.Fatalf("Validate(%q): legacy compatibility must remain enabled, got %v", token, err)
+		}
+	}
+}
+
+func TestCacheTokenParserUsesTokenValidator(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 9, 8, 0, 0, 0, time.UTC)
+	raw, err := EncodeV3(TokenInfo{
+		UID:               "u1",
+		IssuedAt:          now.Add(-2 * time.Hour).Unix(),
+		ExpiresAt:         now.Unix(),
+		SessionGeneration: "g1",
+	})
+	if err != nil {
+		t.Fatalf("EncodeV3: %v", err)
+	}
+	reader := &fakeTokenRecordReader{records: map[string]TokenRecord{
+		testPrefix + "tok": {Payload: raw, TTL: time.Minute},
+	}}
+	validator := NewTokenValidator(reader, testPrefix, WithValidatorClock(func() time.Time { return now }))
+	p := NewCacheTokenParser(newFakeCache(), testPrefix, WithTokenValidator(validator))
+
+	_, err = p.Parse(context.Background(), "tok")
+	if !errors.Is(err, wkhttp.ErrTokenInvalid) {
+		t.Fatalf("Parse: expired v3 must be rejected, got %v", err)
 	}
 }

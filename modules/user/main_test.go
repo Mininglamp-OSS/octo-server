@@ -3,6 +3,7 @@ package user
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -23,5 +24,10 @@ func TestMain(m *testing.M) {
 		_, _ = rand.Read(key)
 		_ = os.Setenv("OCTO_MASTER_KEY", hex.EncodeToString(key))
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	if err := cleanupTokenHTTPTestDatabases(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	os.Exit(code)
 }

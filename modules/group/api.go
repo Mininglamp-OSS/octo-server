@@ -48,12 +48,13 @@ import (
 type Group struct {
 	ctx *config.Context
 	log.Log
-	db            *DB
-	settingDB     *settingDB
-	userDB        *user.DB
-	groupService  IService
-	fileService   file.IService
-	commonService common2.IService
+	db             *DB
+	settingDB      *settingDB
+	userDB         *user.DB
+	groupService   IService
+	fileService    file.IService
+	commonService  common2.IService
+	tokenValidator *auth.TokenValidator
 	// welcomeStore backs the per-group 入群欢迎语 CRUD (task group-welcome-message).
 	welcomeStore *common2.GroupWelcomeConfigStore
 }
@@ -70,7 +71,11 @@ func New(ctx *config.Context) *Group {
 		groupService:  NewService(ctx),
 		fileService:   file.NewService(ctx),
 		commonService: common2.NewService(ctx),
-		welcomeStore:  common2.NewGroupWelcomeConfigStore(ctx.DB()),
+		tokenValidator: auth.NewTokenValidator(
+			auth.SessionStoreForContext(ctx),
+			ctx.GetConfig().Cache.TokenCachePrefix,
+		),
+		welcomeStore: common2.NewGroupWelcomeConfigStore(ctx.DB()),
 	}
 	g.ctx.AddEventListener(event.GroupDisband, g.handleGroupDisbandEvent)
 	g.ctx.AddEventListener(event.EventUserRegister, g.handleRegisterUserEvent)
@@ -4673,14 +4678,10 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 	// 预览路径，不破坏未登录访问者的 external_blocked 硬拦截语义。
 	var loginUID string
 	if token := strings.TrimSpace(c.GetHeader("token")); token != "" {
-		raw, cacheErr := g.ctx.Cache().Get(g.ctx.GetConfig().Cache.TokenCachePrefix + token)
-		if cacheErr == nil && strings.TrimSpace(raw) != "" {
-			// AuthMiddleware 的 token value 由 pkg/auth 收口编解码：v2 JSON 或
-			// 灰度期残留的 "uid@name[@role]"。auth.Decode 返回 ErrInvalidToken
-			// 时安全降级为未登录访问者，沿用 external_blocked 硬拦截语义。
-			if info, decodeErr := auth.Decode(raw); decodeErr == nil {
-				loginUID = info.UID
-			}
+		// 可选鉴权失败安全降级为匿名访问者；唯一 validator 同时执行
+		// payload 版本、Redis PTTL 与 v3 绝对到期检查。
+		if info, validateErr := g.tokenValidator.Validate(c.Request.Context(), token); validateErr == nil {
+			loginUID = info.UID
 		}
 	}
 

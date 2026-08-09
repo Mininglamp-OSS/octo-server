@@ -1,17 +1,180 @@
 package main
 
 import (
+	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateTokenExpireConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		env     string
+		envSet  bool
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", want: 720 * time.Hour},
+		{name: "yaml override", yaml: "cache:\n  tokenExpire: 48h\n", want: 48 * time.Hour},
+		{name: "env overrides yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "24h", envSet: true, want: 24 * time.Hour},
+		{name: "empty env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", envSet: true, wantErr: true},
+		{name: "invalid env does not fall back to yaml", yaml: "cache:\n  tokenExpire: 48h\n", env: "30d", envSet: true, wantErr: true},
+		{name: "day suffix unsupported", yaml: "cache:\n  tokenExpire: 30d\n", wantErr: true},
+		{name: "bare number unsupported", yaml: "cache:\n  tokenExpire: 24\n", wantErr: true},
+		{name: "malformed", yaml: "cache:\n  tokenExpire: tomorrow\n", wantErr: true},
+		{name: "zero", yaml: "cache:\n  tokenExpire: 0s\n", wantErr: true},
+		{name: "negative", yaml: "cache:\n  tokenExpire: -1h\n", wantErr: true},
+		{name: "sub-millisecond", yaml: "cache:\n  tokenExpire: 1us\n", wantErr: true},
+		{name: "one millisecond", yaml: "cache:\n  tokenExpire: 1ms\n", want: time.Millisecond},
+		{name: "over hard limit", yaml: "cache:\n  tokenExpire: 721h\n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old, existed := os.LookupEnv("TS_CACHE_TOKENEXPIRE")
+			require.NoError(t, os.Unsetenv("TS_CACHE_TOKENEXPIRE"))
+			t.Cleanup(func() {
+				if existed {
+					_ = os.Setenv("TS_CACHE_TOKENEXPIRE", old)
+					return
+				}
+				_ = os.Unsetenv("TS_CACHE_TOKENEXPIRE")
+			})
+			vp := viper.New()
+			if tt.yaml != "" {
+				vp.SetConfigType("yaml")
+				require.NoError(t, vp.ReadConfig(bytes.NewBufferString(tt.yaml)))
+			}
+			vp.SetEnvPrefix("TS")
+			vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+			vp.AutomaticEnv()
+			if tt.envSet {
+				t.Setenv("TS_CACHE_TOKENEXPIRE", tt.env)
+			}
+
+			got, err := validateTokenExpireConfig(vp)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateTokenExpireConfigDoesNotChangeOtherEmptyEnvSemantics(t *testing.T) {
+	const yamlConfig = `
+db:
+  mysqlAddr: produser:prodpass@tcp(prod-mysql:3306)/prod
+  redisTLS: true
+`
+
+	vp := viper.New()
+	vp.SetConfigType("yaml")
+	require.NoError(t, vp.ReadConfig(bytes.NewBufferString(yamlConfig)))
+	vp.SetEnvPrefix("TS")
+	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	vp.AutomaticEnv()
+	t.Setenv("TS_DB_MYSQLADDR", "")
+	t.Setenv("TS_DB_REDISTLS", "")
+
+	_, err := validateTokenExpireConfig(vp)
+	require.NoError(t, err)
+
+	cfg := config.New()
+	cfg.ConfigureWithViper(vp)
+	require.Equal(t, "produser:prodpass@tcp(prod-mysql:3306)/prod", cfg.DB.MySQLAddr)
+	require.True(t, cfg.DB.RedisTLS)
+}
+
+func TestRunAPIRegistersSessionRedisPool(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	foundRegistration := false
+	foundSession := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "RegisterPoolCollectors" || len(call.Args) < 3 {
+			return true
+		}
+		foundRegistration = true
+		clients, ok := call.Args[2].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		for _, element := range clients.Elts {
+			pair, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := pair.Key.(*ast.BasicLit)
+			if ok && key.Value == `"session"` {
+				foundSession = true
+			}
+		}
+		return true
+	})
+
+	require.True(t, foundRegistration, "main must register Redis pool collectors")
+	require.True(t, foundSession, "the shared authentication session pool must be observable")
+}
+
+func TestRunAPIProbesSessionLuaBeforeInstallingTokenParser(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	var probePosition, parserPosition token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "runAPI" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch selector.Sel.Name {
+			case "Probe":
+				probePosition = call.Pos()
+			case "SetTokenParser":
+				parserPosition = call.Pos()
+			}
+			return true
+		})
+	}
+
+	require.NotZero(t, probePosition, "API startup must exercise the real session read Lua")
+	require.NotZero(t, parserPosition, "API startup must install the canonical token parser")
+	require.Less(t, probePosition, parserPosition, "Lua compatibility must be proven before authentication is installed")
+}
 
 func TestGlobalRateLimitExcludePathsIncludesProbeEndpoints(t *testing.T) {
 	paths := globalRateLimitExcludePaths()

@@ -348,13 +348,18 @@ func TestLoginWithAuthCode_ConsumesBeforeIssuingSession(t *testing.T) {
 
 	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))")
 	consume := strings.Index(fn, "u.scanLoginAuthorizations.Consume(authCode, authInfo)")
-	cacheWrite := strings.Index(fn, "u.ctx.Cache().SetAndExpire")
+	reuseExisting := strings.Index(fn, "u.reuseExistingLoginToken(")
+	issueNew := strings.Index(fn, "u.sessionStore.IssueNew(")
 	imUpdate := strings.Index(fn, "u.ctx.UpdateIMToken")
 	require.NotEqual(t, -1, consume)
-	require.NotEqual(t, -1, cacheWrite)
+	require.NotEqual(t, -1, reuseExisting)
+	require.NotEqual(t, -1, issueNew)
 	require.NotEqual(t, -1, imUpdate)
-	assert.Less(t, consume, cacheWrite, "授权必须先原子消费，再写登录 token")
+	assert.Less(t, consume, reuseExisting, "授权必须先原子消费，再复用已有登录 token")
+	assert.Less(t, consume, issueNew, "授权必须先原子消费，再签发新登录 token")
 	assert.Less(t, consume, imUpdate, "授权必须先原子消费，再产生 IM 登录副作用")
+	assert.NotContains(t, fn, "u.ctx.Cache().SetAndExpire",
+		"扫码登录不得绕过 Session Store 直接写 token cache")
 }
 
 // TestLoginWithAuthCode_ClearsScanLoginState 锁住 P2-3：登录完成后本轮扫码的所有状态

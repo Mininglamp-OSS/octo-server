@@ -23,6 +23,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/tokenlifecycle"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
@@ -103,6 +104,10 @@ func loadConfigFromFile(cfgFile string) *viper.Viper {
 	return vp
 }
 
+func validateTokenExpireConfig(vp *viper.Viper) (time.Duration, error) {
+	return tokenlifecycle.ValidateTokenExpire(vp)
+}
+
 func main() {
 	var CfgFile string //config file
 	flag.StringVar(&CfgFile, "config", "configs/tsdd.yaml", "config file")
@@ -111,12 +116,18 @@ func main() {
 	vp.SetEnvPrefix("TS")
 	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	vp.AutomaticEnv()
+	tokenExpire, err := validateTokenExpireConfig(vp)
+	if err != nil {
+		panic(err)
+	}
 
 	gin.SetMode(gin.ReleaseMode)
 
 	cfg := config.New()
 	cfg.Version = Version
 	cfg.ConfigureWithViper(vp)
+	cfg.Cache.TokenExpire = tokenExpire
+	fmt.Println("Effective access token TTL:", cfg.Cache.TokenExpire)
 
 	// 安全校验：release 模式下禁止配置 smsCode（万能验证码后门）
 	if err := commonapi.ValidateTestCodeConfig(cfg); err != nil {
@@ -174,9 +185,17 @@ func runAPI(ctx *config.Context) {
 	// 角色（user_role:{uid} 热缓存 → DB），把降权生效窗口收敛到缓存 TTL。
 	userLangSvc := user.NewLanguageService(user.NewDB(ctx), ctx.Cache())
 	userRoleSvc := user.NewRoleService(user.NewDB(ctx), ctx.Cache())
+	tokenStore, sessionRedis := auth.SessionStoreAndClientForContext(ctx)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := tokenStore.Probe(probeCtx); err != nil {
+		probeCancel()
+		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
+	}
+	probeCancel()
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
+		auth.WithTokenValidator(auth.NewTokenValidator(tokenStore, ctx.GetConfig().Cache.TokenCachePrefix)),
 		auth.WithLanguageResolver(userLangSvc),
 		auth.WithRoleResolver(userRoleSvc),
 	))
@@ -257,6 +276,8 @@ func runAPI(ctx *config.Context) {
 	// singleflight 合并 / 304。由 modules/user 的 avatarCache 经包级 Observe 函数灌入;
 	// 此处注册即可,未注册前这些 Observe 为 no-op,不影响已构造的 cache。
 	metrics.NewAvatarMetrics(prometheus.DefaultRegisterer)
+	metrics.NewSessionMetrics(prometheus.DefaultRegisterer)
+	metrics.SetSessionEffectiveTTL(ctx.GetConfig().Cache.TokenExpire)
 	// 自定义贴纸 handle 上线观测指标(P0: Sticker Handle Enforcement Rollout):上传签发
 	// handle 次数 / 注册结果分布 / 部署姿态 gauge。由 modules/file(签发) 与
 	// modules/sticker(注册) 经包级 Observe 函数灌入;此处注册即可,未注册前为 no-op。
@@ -376,6 +397,7 @@ func runAPI(ctx *config.Context) {
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit":            rlRedis,
+		"session":              sessionRedis,
 		"card_action_dispatch": cardActionRuntime.redisClient,
 	})
 	// 在所有指标族注册完成后再起 scrape 端点,避免启动窗口内的 scrape 漏掉

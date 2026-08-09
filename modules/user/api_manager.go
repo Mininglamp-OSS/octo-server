@@ -38,6 +38,7 @@ type Manager struct {
 	onlineService IOnlineService
 	commonService common2.IService
 	roleService   *RoleService
+	sessionStore  userSessionStore
 }
 
 // NewManager NewManager
@@ -53,6 +54,7 @@ func NewManager(ctx *config.Context) *Manager {
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
+		sessionStore:  auth.SessionStoreForContext(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -296,16 +298,9 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	err = m.ctx.Cache().SetAndExpire(m.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, m.ctx.GetConfig().Cache.TokenExpire)
+	err = m.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userInfo.UID, int(config.Web))
 	if err != nil {
-		m.Error("设置token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
-	}
-
-	err = m.ctx.Cache().SetAndExpire(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, userInfo.UID), token, m.ctx.GetConfig().Cache.TokenExpire)
-	if err != nil {
-		m.Error("设置uidtoken缓存失败！", zap.Error(err))
+		m.Error("设置管理端token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}

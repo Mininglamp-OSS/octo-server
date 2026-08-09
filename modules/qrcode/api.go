@@ -15,7 +15,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -69,22 +68,9 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 		respondQRCodeTokenRequired(c)
 		return
 	}
-	raw, err := q.ctx.Cache().Get(q.ctx.GetConfig().Cache.TokenCachePrefix + token)
-	if err != nil {
-		q.Error("获取登录信息失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrQRCodeQueryFailed, nil, nil)
-		return
-	}
-	if strings.TrimSpace(raw) == "" {
-		c.String(http.StatusOK, fmt.Sprintf("请下载“%s”APP扫码！", q.ctx.GetConfig().AppName))
-		return
-	}
-	info, decodeErr := auth.Decode(raw)
-	if decodeErr != nil {
-		httperr.ResponseErrorL(c, errcode.ErrQRCodeTokenInvalid, nil, nil)
-		return
-	}
-	loginUID := info.UID
+	// Route 已经过统一 AuthMiddleware；直接复用中间件身份，避免再次走一套
+	// Cache.Get+Decode 而绕过 PTTL/绝对到期校验。
+	loginUID := c.GetLoginUID()
 	code := c.Param("code")
 
 	if strings.HasPrefix(code, "user_") { // 用户资料二维码 格式： user_xxxx
