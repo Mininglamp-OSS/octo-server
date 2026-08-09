@@ -1499,3 +1499,52 @@ func TestBotEditKeepsStaticRefsAnsweringWithoutTheRuntime(t *testing.T) {
 		t.Fatalf("dark-catalog dynamic edit error = %v, want errBotTemplateRequestInvalid", err)
 	}
 }
+
+// TestGrantSpaceRefusesAnAppBotWhoseSpaceIsDisabled is review P2-2 (yujiawei).
+//
+// The App Bot scope=space fast path took the Space straight out of the
+// authenticated context and returned it as grant-readable. Every sibling
+// resolver requires space.status = 1 — queryGroupSpaceID, isBotSpaceAuthorized
+// and isUserSpaceMember all join on it — so this was the one way a disabled
+// Space could still supply an authorization scope. The visible symptom is the
+// P1-1 family again: the profile keeps advertising templates granted in that
+// Space while send, which resolves the Space through a status-checking path,
+// refuses them.
+//
+// Both directions are asserted. Only checking the refusal would also pass if
+// the fast path had simply been deleted.
+func TestGrantSpaceRefusesAnAppBotWhoseSpaceIsDisabled(t *testing.T) {
+	appBot := func(active bool) *fakeSpaceQuerier {
+		return &fakeSpaceQuerier{
+			appBots: map[string]appBotShape{
+				"bot-42": {scopeSpaceID: "space-app", published: true},
+			},
+			activeSpaces: map[string]bool{"space-app": active},
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		active    bool
+		wantSpace string
+		wantState botCatalogSpaceState
+	}{
+		{name: "active Space is used", active: true,
+			wantSpace: "space-app", wantState: botSpaceScoped},
+		{name: "disabled Space authorizes nothing", active: false,
+			wantSpace: "", wantState: botSpaceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ba := newTestBotAPI(appBot(test.active))
+			c := newGrantSpaceContext(t, "")
+			c.Set(CtxKeyAppBotScope, "space")
+			c.Set(CtxKeyAppBotSpaceID, "space-app")
+
+			space, state := ba.resolveBotGrantSpaceID(c, "bot-42")
+			if space != test.wantSpace || state != test.wantState {
+				t.Fatalf("resolveBotGrantSpaceID = (%q, %v), want (%q, %v)",
+					space, state, test.wantSpace, test.wantState)
+			}
+		})
+	}
+}

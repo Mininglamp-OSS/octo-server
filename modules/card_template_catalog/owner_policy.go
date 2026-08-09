@@ -37,8 +37,19 @@ func approvedRuntimeOwnerList() []string {
 }
 
 // approvedOwnerPredicate renders `a.owner IN (?,?)` plus its arguments.
+//
+// An empty allowlist renders a literal false rather than `owner IN ()`, which
+// is a MySQL syntax error (review P2, yujiawei). The allowlist is a code
+// constant today, so this is a guard against a future edit rather than a live
+// defect — but the two failure shapes are very different: `1 = 0` means B1 and
+// B2 answer "nothing is discoverable", which is what emptying an owner
+// allowlist during an incident is *for*, while a syntax error takes the
+// endpoints down with a 5xx and reads like an outage.
 func approvedOwnerPredicate(column string) (string, []any) {
 	owners := approvedRuntimeOwnerList()
+	if len(owners) == 0 {
+		return "1 = 0", nil
+	}
 	placeholders := make([]string, 0, len(owners))
 	args := make([]any, 0, len(owners))
 	for _, owner := range owners {

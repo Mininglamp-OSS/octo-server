@@ -134,16 +134,45 @@ func (ba *BotAPI) resolveBotGrantSpaceID(c *wkhttp.Context, robotID string) (str
 	if c == nil {
 		return "", botSpaceUnavailable
 	}
-	if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
-		if v, ok := c.Get(CtxKeyAppBotSpaceID); ok {
-			if s, _ := v.(string); s != "" {
-				return s, botSpaceScoped
-			}
-		}
-	}
 	querier := ba.spaceQuerierOrDefault()
 	if querier == nil {
 		return "", botSpaceUnavailable
+	}
+	if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
+		if v, ok := c.Get(CtxKeyAppBotSpaceID); ok {
+			if s, _ := v.(string); s != "" {
+				// The Space still has to be active (review P2-2, yujiawei).
+				// Every sibling resolver requires s.status = 1 —
+				// queryGroupSpaceID, isBotSpaceAuthorized, isUserSpaceMember —
+				// and this fast path did not, so a grant scoped to a Space an
+				// operator had disabled stayed advertised by the profile while
+				// send refused it: the same manifest/send divergence as P1-1,
+				// reached a different way.
+				//
+				// isBotSpaceAuthorized is the right check rather than a bare
+				// status lookup: its app_bot branch is exactly "scope=space Bot
+				// whose own SpaceID matches the target, and the target is
+				// active", so it verifies the claim rather than only the Space.
+				//
+				// This is a DB read on what used to be a context-only path, and
+				// it is affordable because it is unreachable with the gates off:
+				// botCatalogPrincipalFor and botSendCatalogPrincipal both return
+				// before calling this when dynamicCatalogEnabled() is false, so
+				// no ungated deployment acquires a query here.
+				authorized, err := querier.isBotSpaceAuthorized(robotID, s)
+				if err != nil {
+					ba.Warn("bot_grant_space_appbot_unverifiable",
+						zap.String("robotID", robotID), zap.String("space", s), zap.Error(err))
+					return "", botSpaceUnavailable
+				}
+				if !authorized {
+					ba.Warn("bot_grant_space_appbot_rejected",
+						zap.String("robotID", robotID), zap.String("space", s))
+					return "", botSpaceUnavailable
+				}
+				return s, botSpaceScoped
+			}
+		}
 	}
 	if c.Request != nil {
 		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {

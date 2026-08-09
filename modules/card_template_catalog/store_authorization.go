@@ -28,7 +28,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"go.uber.org/zap"
 )
 
 // Compile-time proof that the production store really is the indivisible
@@ -594,13 +596,24 @@ func (s *store) ListAuthorizedTemplates(
 		return nil, err
 	}
 	results := make([]cardtmpl.RuntimeAdvertisedTemplate, 0, len(candidates))
-	for _, id := range candidates {
+	for index, id := range candidates {
 		authorization, ok := active[id]
 		if !ok {
 			continue
 		}
 		results = append(results, cardtmpl.RuntimeAdvertisedTemplate{ID: id, Authorization: authorization})
 		if len(results) == limit {
+			// The advertised set is capped, and the cap is reported. A Bot past
+			// the budget gets a manifest that is silently short otherwise, which
+			// reads to a producer exactly like "not granted".
+			if remaining := len(candidates) - (index + 1); remaining > 0 {
+				log.Warn("advertised template set truncated at the budget",
+					zap.Bool("advertised_set_truncated", true),
+					zap.String("principal_type", string(principalType)),
+					zap.String("principal_id", principalID),
+					zap.Int("advertised", len(results)),
+					zap.Int("candidates_remaining", remaining))
+			}
 			break
 		}
 	}
@@ -632,11 +645,23 @@ func loadAdvertisableAuthorizations(
 	for id, pointer := range pointers {
 		version, err := cardtmpl.ActivationVersion(id, pointer.activation)
 		if err != nil || version == "" {
+			// Absent or disabled is an ordinary operator state, not an anomaly,
+			// so it is not worth a line on every poll.
 			continue
 		}
 		meta, err := buildRuntimeArtifactMeta(id, version, pointer.source, pointer.columns, pointer.blocked)
 		if err != nil {
 			if errors.Is(err, cardtmpl.ErrTemplateUnknown) || errors.Is(err, cardtmpl.ErrRuntimeCatalogIntegrity) {
+				// This one is an anomaly: the activation points at a version
+				// whose artifact row will not assemble. skipBrokenRow keeps one
+				// bad row from blanking a Bot's whole manifest, which is the
+				// right policy and exactly why the row would otherwise never be
+				// noticed by anyone.
+				log.Warn("advertisable template dropped by a broken artifact row",
+					zap.Bool("advertisable_row_dropped", true),
+					zap.String("template_id", string(id)),
+					zap.String("version", version),
+					zap.Error(err))
 				continue
 			}
 			return nil, err
@@ -723,6 +748,15 @@ func scanPrincipalGrants(
 		// granted. Every earlier template is complete, since the ordering keeps
 		// a template's rows contiguous.
 		incomplete := order[len(order)-1]
+		// Safe but not silent, for the same reason StaticDiscoverGrants logs its
+		// own truncation: an operator whose grant lands in the table and takes
+		// effect nowhere otherwise has nothing anywhere telling them why.
+		log.Warn("principal grant read truncated at the row budget",
+			zap.Bool("principal_grant_rows_truncated", true),
+			zap.String("principal_type", string(principalType)),
+			zap.String("principal_id", principalID),
+			zap.String("dropped_template", string(incomplete)),
+			zap.Int("row_budget", rowLimit))
 		delete(exact, incomplete)
 		delete(global, incomplete)
 	}

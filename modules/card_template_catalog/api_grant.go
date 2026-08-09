@@ -15,6 +15,7 @@ package card_template_catalog
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -297,6 +298,9 @@ func (a *API) productionGrantPrincipalCheck(ctx context.Context, identity GrantI
 		if !active {
 			return fmt.Errorf("%w: bot principal is not an active bot", ErrGrantRequestInvalid)
 		}
+		if err := a.requireByteExactBot(ctx, identity.PrincipalID); err != nil {
+			return err
+		}
 	case GrantPrincipalInternalProducer:
 		if _, ok := carddispatch.ProducerBindingFromContext(a.ctx, carddispatch.ProducerID(identity.PrincipalID)); !ok {
 			return fmt.Errorf("%w: internal producer is not registered", ErrGrantRequestInvalid)
@@ -314,15 +318,67 @@ func (a *API) productionGrantPrincipalCheck(ctx context.Context, identity GrantI
 	return nil
 }
 
+// Existence checks here run against tables collated utf8mb4_general_ci, while
+// card_template_grant.principal_id / scope_space_id are utf8mb4_bin and the
+// runtime resolver matches them byte-for-byte. Those two facts together made a
+// case-differing identity write successfully and authorize nothing: a
+// `PUT .../grants/space/SPACE-1` against a real `space-1` passed the
+// general_ci existence check, stored `SPACE-1`, returned 200 with a revision,
+// and then never matched a single runtime lookup (review P2, yujiawei).
+//
+// Fail-closed, but expensive to diagnose — the operator sees a successful write
+// and a capability that does nothing, with nothing anywhere connecting the two.
+// So the write path rejects a spelling the read path could not match, and names
+// the canonical one, which is safe to disclose on a super-admin-only route.
+//
+// Rejecting rather than silently canonicalising: the stored identity is part of
+// the grant's CAS/revision contract, and quietly writing a different identity
+// than the caller asked for is its own surprise.
 func (a *API) requireActiveSpace(ctx context.Context, spaceID string) error {
-	var count int
+	var stored string
 	err := a.ctx.DB().DB.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM space WHERE space_id = ? AND status = 1", spaceID).Scan(&count)
+		"SELECT space_id FROM space WHERE space_id = ? AND status = 1 LIMIT 1", spaceID).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: space does not exist or is not active", ErrGrantRequestInvalid)
+	}
 	if err != nil {
 		return fmt.Errorf("card template catalog: resolve space: %w", err)
 	}
-	if count == 0 {
-		return fmt.Errorf("%w: space does not exist or is not active", ErrGrantRequestInvalid)
+	return byteExactIdentity("space id", stored, spaceID)
+}
+
+// byteExactIdentity compares a caller-supplied identity against the canonical
+// one. Split out from its two call sites so the rule is testable without a
+// live server context, which the production principal check needs and the
+// package's tests do not have.
+func byteExactIdentity(what, stored, requested string) error {
+	if stored == requested {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: %s must match the stored identity exactly (%q)",
+		ErrGrantRequestInvalid, what, stored)
+}
+
+// requireByteExactBot is the same guard for Bot principals. botidentity.Active
+// answers through robot / app_bot, both utf8mb4_general_ci, so it accepts a
+// spelling the grant table's utf8mb4_bin lookup will never match. The canonical
+// id is re-read here rather than by changing botidentity, whose other callers
+// resolve identities for delivery and want the forgiving comparison.
+func (a *API) requireByteExactBot(ctx context.Context, botID string) error {
+	var stored string
+	err := a.ctx.DB().DB.QueryRowContext(ctx,
+		"SELECT COALESCE("+
+			"(SELECT robot_id FROM robot WHERE robot_id = ? AND status = 1 LIMIT 1),"+
+			"(SELECT uid FROM app_bot WHERE uid = ? AND status = 1 LIMIT 1), '')",
+		botID, botID).Scan(&stored)
+	if err != nil {
+		return fmt.Errorf("card template catalog: resolve bot identity: %w", err)
+	}
+	if stored == "" {
+		// Active() already said this Bot exists, so an empty answer here means
+		// the two reads disagree — treat it as the same invalid request rather
+		// than writing a grant nothing will match.
+		return fmt.Errorf("%w: bot principal is not an active bot", ErrGrantRequestInvalid)
+	}
+	return byteExactIdentity("bot id", stored, botID)
 }
