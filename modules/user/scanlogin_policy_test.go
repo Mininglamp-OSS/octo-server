@@ -77,6 +77,50 @@ func TestScanLoginStatusReturnsDisabledStateImmediately(t *testing.T) {
 	assert.Less(t, time.Since(started), time.Second, "disabled status must bypass the 10-second long poll")
 }
 
+func TestScanLoginRateLimitsRejectNonFiniteRPSConfig(t *testing.T) {
+	t.Setenv("DM_API_SCANLOGIN_UUID_RATELIMIT_RPS", "NaN")
+	t.Setenv("DM_API_SCANLOGIN_UUID_RATELIMIT_BURST", "1")
+	t.Setenv("DM_API_SCANLOGIN_STATUS_RATELIMIT_RPS", "+Inf")
+	t.Setenv("DM_API_SCANLOGIN_STATUS_RATELIMIT_BURST", "1")
+
+	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	const ip = "9.9.8.21"
+	for _, key := range []string{
+		"ratelimit:strict:scanlogin_uuid:" + ip,
+		"ratelimit:strict:scanlogin_status:" + ip,
+	} {
+		require.NoError(t, ctx.GetRedisConn().Del(key))
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{name: "uuid NaN", path: "/v1/user/loginuuid"},
+		{name: "status positive infinity", path: "/v1/user/loginstatus?uuid=missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for attempt := 1; attempt <= 2; attempt++ {
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest(http.MethodGet, tc.path, nil)
+				setPublicIPForUserTest(req, ip)
+				s.GetRoute().ServeHTTP(w, req)
+
+				if attempt == 1 {
+					require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+					continue
+				}
+				require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), "err.shared.rate.limited")
+			}
+		})
+	}
+}
+
 func TestLoginWithAuthCode_WrongPollSecretDoesNotConsumeAuthorization(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
