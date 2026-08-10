@@ -7,6 +7,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -267,9 +268,24 @@ func (d *DB) QueryUIDsByEmail(email string) ([]string, error) {
 
 // QueryUIDsByPhone 按手机号查 dmwork user 表的 uid 列表(同 QueryUIDsByEmail)。
 // 同样过滤 is_destroy=0 AND status<>0 —— 见 QueryUIDsByEmail godoc。
+//
+// 优先走盲索引(phone_hash)等值检索(见 modules/user/phone_crypto.go 的加密第一阶)，
+// 不命中时退回明文比较兜底 —— 主密钥未配置、或存量行尚未跑回填时都不应让 OIDC
+// 绑定定位账号这条关键路径直接查不到人。
 func (d *DB) QueryUIDsByPhone(zone, phone string) ([]string, error) {
 	if phone == "" {
 		return nil, nil
+	}
+	if hash, err := user.PhoneBlindHash(zone, phone); err == nil {
+		var uids []string
+		if _, err := d.session.Select("uid").From("user").
+			Where("phone_hash=? AND is_destroy=0 AND status<>0", hash).
+			Load(&uids); err != nil {
+			return nil, fmt.Errorf("oidc: query users by phone hash: %w", err)
+		}
+		if len(uids) > 0 {
+			return uids, nil
+		}
 	}
 	var uids []string
 	if _, err := d.session.Select("uid").From("user").

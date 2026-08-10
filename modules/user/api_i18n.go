@@ -1,6 +1,8 @@
 package user
 
 import (
+	"errors"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -33,6 +35,23 @@ func respondUserErrorWithStatus(c *wkhttp.Context, code codes.Code) {
 // surfaced.
 func respondUserAPIKeyInvalid(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrUserAPIKeyInvalid, nil, nil)
+}
+
+// respondPasswordStrengthError maps ValidatePasswordStrength's sentinel errors
+// to the matching localized code. Callers pass the *new* password's
+// validation error; nil is a no-op guard so this can wrap the call directly.
+func respondPasswordStrengthError(c *wkhttp.Context, err error) {
+	if err == nil {
+		return
+	}
+	switch {
+	case errors.Is(err, ErrPasswordTooShort):
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	case errors.Is(err, ErrPasswordTooLong):
+		respondUserError(c, errcode.ErrUserPasswordTooLong)
+	default:
+		respondUserError(c, errcode.ErrUserPasswordTooWeak)
+	}
 }
 
 // respondUserRequestInvalid covers the common "X 不能为空" / "数据格式有误"

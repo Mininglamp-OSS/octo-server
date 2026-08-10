@@ -24,13 +24,23 @@ const (
 type DB struct {
 	session *dbr.Session
 	ctx     *config.Context
+	// phoneEnc 手机号加密器。nil 表示主密钥未配置 —— 此时加密列/盲索引不写入，
+	// 明文 phone 列不受影响（降级而非阻断，见 phone_crypto.go）。
+	// 放在 DB 而不是 handler 上，是为了让 Insert/InsertTx 成为唯一的同步点：
+	// user 表全仓库只有这两个插入口，任何新增建号路径都会自动带上影子列，
+	// 不依赖调用方记得调用（此前手工在 handler 里调，漏掉 update 路径导致过 P0）。
+	phoneEnc *phoneEncryptor
 }
 
 // NewDB NewDB
 func NewDB(ctx *config.Context) *DB {
+	// 主密钥缺失不阻断构造：phoneEnc 保持 nil，写入降级为"只写明文 phone 列"。
+	// 运维可见性由 New(ctx) 处的单条 warn 提供，这里不重复刷日志。
+	enc, _ := newPhoneEncryptor()
 	return &DB{
-		session: ctx.DB(),
-		ctx:     ctx,
+		session:  ctx.DB(),
+		ctx:      ctx,
+		phoneEnc: enc,
 	}
 }
 
@@ -78,8 +88,19 @@ func (d *DB) QueryByEmail(email string) (*Model, error) {
 	return model, err
 }
 
-// QueryByPhone 通过手机号和区号查询用户信息
+// QueryByPhone 通过手机号和区号查询用户信息。优先走盲索引(phone_hash)等值检索,
+// 不需要解密；主密钥未配置或未命中(存量行尚未回填)时退回明文比较兜底，保证第一阶
+// 加密上线过程中查询行为不回归。见 phone_crypto.go。
 func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
+	if hash, err := PhoneBlindHash(zone, phone); err == nil {
+		var model *Model
+		if _, err := d.session.Select("*").From("user").Where("phone_hash=?", hash).Load(&model); err != nil {
+			return nil, err
+		}
+		if model != nil {
+			return model, nil
+		}
+	}
 	var model *Model
 	_, err := d.session.Select("*").From("user").Where("zone=? and phone=?", zone, phone).Load(&model)
 	return model, err
@@ -94,12 +115,14 @@ func (d *DB) QueryByPhones(phones []string) ([]*Model, error) {
 
 // Insert 添加用户
 func (d *DB) Insert(m *Model) error {
+	d.syncPhoneShadow(m)
 	_, err := d.session.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // Insert 添加用户
 func (d *DB) insertTx(m *Model, tx *dbr.Tx) error {
+	d.syncPhoneShadow(m)
 	_, err := tx.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
@@ -312,8 +335,16 @@ func (d *DB) updatePassword(password string, uid string) error {
 // 守卫的核心目的：避免「finalize 选中过期记录 → 用户在窗口内 cancel → finalize 仍把 is_destroy 覆写为 2」吞掉撤销。
 func (d *DB) destroyAccountFromState(uid, username, phone string, expectedState int) error {
 	res, err := d.session.Update("user").SetMap(map[string]interface{}{
-		"phone":             phone,
-		"username":          username,
+		"phone":    phone,
+		"username": username,
+		// 三个手机号影子列必须与 phone 一起清空。phone 在这里被匿名化成
+		// `<原号>@<stamp>@delete` 以释放手机号，若 phone_hash 仍留着原号的盲索引，
+		// QueryByPhone 的盲索引优先路径会把已注销账号当成"该手机号已注册"命中：
+		// sendRegisterCode 会永久拒绝该号码重新注册，pwdforget 更会在号码被新用户
+		// 复用后把重置目标落到已注销的那一行（两行同 hash，Load 取任意一行）。
+		"phone_encrypted":   nil,
+		"phone_hash":        "",
+		"phone_last4":       "",
 		"is_destroy":        2,
 		"destroy_apply_at":  nil,
 		"destroy_expire_at": nil,
@@ -529,6 +560,9 @@ type Model struct {
 	Web3PublicKey     string       // web3公钥
 	MsgExpireSecond   int64        // 消息过期时长
 	Language          string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
+	PhoneEncrypted    []byte       // 手机号密文(AES-256-GCM)，phone 的加密影子列，第一阶双写，phone 明文列暂留
+	PhoneHash         string       // 手机号盲索引 HMAC-SHA256(zone|phone) 十六进制，用于精确检索
+	PhoneLast4        string       // 手机号后4位明文(低敏)，供模糊检索
 	db.BaseModel
 }
 

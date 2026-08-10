@@ -175,6 +175,12 @@ func New(ctx *config.Context) *User {
 	u.pinned = NewPinned(u.pinnedDB, u.friendDB)
 	InitGlobalPinnedDB(ctx) // 初始化全局 PinnedDB 供其他模块调用
 	u.updateSystemUserToken()
+	// 手机号加密器由 NewDB 持有并在 Insert/insertTx 里统一同步影子列；这里只做一次
+	// 运维可见性提示，避免每个 NewDB 都刷同一条 warn。
+	if u.db.phoneEnc == nil {
+		u.Warn("手机号加密主密钥未就绪,新用户的手机号加密列/盲索引将不会写入(明文 phone 列不受影响)",
+			zap.String("env", phoneEncryptionSecretEnv))
+	}
 	source.SetUserProvider(u)
 	// 注入外部 IdP 登录 handler:Service 通过 IService 暴露 LoginByExternalIdentity,
 	// 但实际逻辑落在 *User 上（依赖 execLogin / createUserWithRespAndTx 等私有方法）。
@@ -1521,7 +1527,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return
 		}
-		u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c)
+		u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c, "wechat")
 	} else {
 		// 创建用户
 		uid := util.GenerUUID()
@@ -1587,6 +1593,7 @@ func (u *User) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
+	publicIP := util.GetClientPublicIP(c.Request)
 	loginSpan := u.ctx.Tracer().StartSpan(
 		"login",
 		opentracing.ChildOf(c.GetSpanContext()),
@@ -1604,6 +1611,7 @@ func (u *User) login(c *wkhttp.Context) {
 	// 已注销 / 被禁用账号统一拒绝；与 emailLogin / usernameLogin 行为对齐
 	if userInfo == nil || userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		// 统一错误消息，避免攻击者通过响应差异枚举有效账号
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
@@ -1611,12 +1619,14 @@ func (u *User) login(c *wkhttp.Context) {
 	if userInfo.Password == "" {
 		// 同样走失败计数 + 通用错误消息，避免攻击者区分"账号不允许登录"与"密码错误"
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -1627,11 +1637,11 @@ func (u *User) login(c *wkhttp.Context) {
 			_ = u.db.updatePassword(newHash, userInfo.UID)
 		}
 	}
-	u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c)
+	u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c, "username")
 }
 
 // 验证登录用户信息
-func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context, c *wkhttp.Context) {
+func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context, c *wkhttp.Context, loginType string) {
 
 	result, err := u.execLogin(userInfo, flag, device, loginSpanCtx)
 	if err != nil {
@@ -1643,6 +1653,7 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 
 	publicIP := util.GetClientPublicIP(c.Request)
 	go u.sentWelcomeMsg(publicIP, userInfo.UID)
+	u.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, loginType)
 }
 
 // respondExecLoginError is the single classifier for execLogin's returned error,
@@ -1910,8 +1921,6 @@ func (u *User) sentWelcomeMsg(publicIP, uid string) {
 	if err != nil {
 		u.Error("发送登录消息欢迎消息失败", zap.Error(err))
 	}
-	//保存登录日志
-	u.loginLog.add(uid, publicIP)
 }
 
 // 注册
@@ -1923,9 +1932,9 @@ func (u *User) register(c *wkhttp.Context) {
 	}
 	if err := req.CheckRegister(); err != nil {
 		// CheckRegister returns "用户名不能为空 / 区号不能为空 / 手机号不能为空 /
-		// 验证码不能为空 / 密码不能为空 / 密码长度必须大于6位 / 名字格式错误".
-		// All client-side input failures. Field-level detail left empty for
-		// the same reason as login.Check (TODOS L219 sentinel follow-up).
+		// 验证码不能为空 / 密码不能为空 / 名字格式错误". All client-side input
+		// gaps with no field tagging (TODOS L219 sentinel follow-up). Password
+		// strength has its own dedicated codes, checked after the policy gates.
 		respondUserRequestInvalid(c, "")
 		return
 	}
@@ -1942,6 +1951,14 @@ func (u *User) register(c *wkhttp.Context) {
 	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() &&
 		strings.TrimSpace(req.Zone) != "0086" {
 		respondUserError(c, errcode.ErrUserPhoneRegionUnsupported)
+		return
+	}
+	// 密码强度校验放在两个策略闸门之后：注册通道关闭 / 号码归属地不允许 是比
+	// "密码不够强" 更根本的拒绝理由，先返回它们能让错误语义更稳定，也避免
+	// 弱密码把 only_china 这类安全闸门的响应挡掉（TestPhoneRegisterBlockedByOnlyChina
+	// 断言的就是该闸门必须生效）。
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	appConfig, err := u.commonService.GetAppConfig()
@@ -3641,6 +3658,10 @@ func (u *User) pwdforget(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
+	if err := ValidatePasswordStrength(req.Pwd); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
 	userInfo, err := u.db.QueryByPhone(req.Zone, req.Phone)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))
@@ -3939,6 +3960,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		return nil, err
 	}
 	go u.sentWelcomeMsg(publicIP, createUser.UID)
+	u.loginLog.recordSuccess(createUser.UID, userModel.Username, publicIP, "register")
 
 	if u.ctx.GetConfig().ShortNo.NumOn {
 		err = u.commonService.SetShortnoUsed(userModel.ShortNo, "user")
@@ -4012,9 +4034,6 @@ func (r registerReq) CheckRegister() error {
 	}
 	if strings.TrimSpace(r.Password) == "" {
 		return errors.New("密码不能为空！")
-	}
-	if len(r.Password) < 6 {
-		return errors.New("密码长度必须大于6位！")
 	}
 	return nil
 }

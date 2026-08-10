@@ -260,7 +260,13 @@ other = "设置语言偏好失败。"
 other = "该账号未开通管理权限。"
 
 ["err.server.user.password_too_short"]
-other = "密码长度必须大于 6 位。"
+other = "密码长度至少为 8 位。"
+
+["err.server.user.password_too_weak"]
+other = "密码需同时包含大小写字母、数字、特殊字符中的至少 2 类。"
+
+["err.server.user.password_too_long"]
+other = "密码长度不能超过 72 字节。"
 
 ["err.server.user.password_mismatch"]
 other = "两次输入的密码不一致。"

@@ -1152,8 +1152,14 @@ other = "This account has no password set; identity cannot be verified."
 ["err.server.user.password_process_failed"]
 other = "Failed to process password."
 
+["err.server.user.password_too_long"]
+other = "Password must not exceed 72 bytes."
+
 ["err.server.user.password_too_short"]
-other = "Password must be at least 6 characters."
+other = "Password must be at least 8 characters."
+
+["err.server.user.password_too_weak"]
+other = "Password must contain at least 2 of: uppercase letters, lowercase letters, digits, special characters."
 
 ["err.server.user.phone_region_unsupported"]
 other = "Only mainland China phone numbers are supported."

@@ -1226,6 +1226,9 @@ func (s *Service) UpdateLoginPassword(req UpdateLoginPasswordReq) error {
 	if !matched {
 		return errors.New("原密码不正确！")
 	}
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		return err
+	}
 
 	newHash, hashErr := HashPassword(req.NewPassword)
 	if hashErr != nil {

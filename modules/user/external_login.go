@@ -135,6 +135,7 @@ func (u *User) externalLoginExisting(ctx context.Context, req ExternalLoginReq) 
 		return nil, err
 	}
 	go u.sentWelcomeMsg(req.PublicIP, userInfoM.UID)
+	u.loginLog.recordSuccess(userInfoM.UID, userInfoM.Username, req.PublicIP, "oidc")
 
 	return &ExternalLoginResp{
 		UID:           userInfoM.UID,

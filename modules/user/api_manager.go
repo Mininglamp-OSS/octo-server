@@ -40,6 +40,7 @@ type Manager struct {
 	commonService common2.IService
 	roleService   *RoleService
 	sessionStore  userSessionStore
+	loginLog      *LoginLog
 }
 
 // NewManager NewManager
@@ -56,6 +57,7 @@ func NewManager(ctx *config.Context) *Manager {
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 		sessionStore:  auth.SessionStoreForContext(ctx),
+		loginLog:      NewLoginLog(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -277,14 +279,17 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
+	publicIP := util.GetClientPublicIP(c.Request)
 	// 登录失败统一返回 ErrUserInvalidCredentials，避免攻击者通过"用户不存在"
 	// 与"密码错误"的响应差异枚举有效管理账号（与 /v1/user login 反枚举一致）。
 	if userInfo == nil || userInfo.UID == "" {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -294,7 +299,10 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
+	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪dashboardReader，
+	// 见 575185b0），被拒同样计入登录失败日志。
 	if !auth.IsManagerConsoleRole(userInfo.Role) {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
@@ -324,6 +332,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
+	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
 }
 
 // 重置用户密码
@@ -344,8 +353,8 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "")
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	if req.NewPassword != req.NewPassswordConfirmation {
@@ -700,6 +709,10 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
 	user, err := m.db.queryUserWithNameAndRole(req.LoginName, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("查询用户是否存在错误", zap.String("username", req.LoginName))
@@ -759,6 +772,10 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	}
 	if err := req.checkAddUserReq(); err != nil {
 		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	userInfo, err := m.userDB.QueryByUsername(fmt.Sprintf("%s%s", req.Zone, req.Phone))
@@ -1303,8 +1320,8 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserOldPasswordIncorrect)
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	if req.Password == req.NewPassword {
@@ -1478,6 +1495,19 @@ func (m *Manager) createManagerAccount() {
 	username := string(wkhttp.SuperAdmin)
 	role := string(wkhttp.SuperAdmin)
 	var pwd = m.ctx.GetConfig().AdminPwd
+	// 超管播种密码同样必须过口令复杂度策略。这里 fail-closed（不建账号）而不是降级
+	// 建一个弱口令超管：上面的 early return 保证只有"超管尚不存在"时才会走到这里，
+	// 所以拒绝创建只影响全新部署，不会把已有环境锁在外面；而一个弱口令的超级管理员
+	// 正是审计和真实攻击面上最贵的那个洞。
+	//
+	// 只记错误类型不记密码本身。
+	if err := ValidatePasswordStrength(pwd); err != nil {
+		m.Error("拒绝创建超级管理员：AdminPwd 不满足口令复杂度策略"+
+			"（≥8 个字符、≤72 字节，且含大小写字母/数字/特殊字符中的至少 2 类）。"+
+			"请修正配置后重启以完成超管账号创建。",
+			zap.Error(err))
+		return
+	}
 	hashedPwd, hashErr := HashPassword(pwd)
 	if hashErr != nil {
 		m.Error("密码哈希失败", zap.Error(hashErr))
