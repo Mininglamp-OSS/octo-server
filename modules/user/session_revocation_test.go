@@ -9,6 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -170,6 +174,45 @@ func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestCommittedSessionRevocationIgnoresCanceledRequestContext(t *testing.T) {
+	_, ctx, userAPI, _ := newTokenHTTPTestServer(t)
+	db := userAPI.db
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
+	prefix := "user-revocation-canceled-token:" + util.GenerUUID() + ":"
+	uidPrefix := "user-revocation-canceled-uid:" + util.GenerUUID() + ":"
+	store := auth.NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, auth.WithSessionMode(auth.SessionModeRevoke), auth.WithSessionMaxPerUID(2))
+	uid := "canceled-" + util.GenerUUID()
+	token := "token-" + util.GenerUUID()
+	require.NoError(t, db.Insert(&Model{UID: uid, Name: "canceled user", ShortNo: uid, Password: "before", Status: 1}))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+		keys, _ := client.Keys(prefix + "*").Result()
+		metadata, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNewSession(context.Background(), token, auth.TokenInfo{
+		UID: uid, DeviceFlag: int(config.Web), DeviceID: "web-device",
+	}, fence))
+	intent, err := db.updateUserFieldWithSessionRevocation(context.Background(), uid, "password", "after", "password_reset")
+	require.NoError(t, err)
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, applyAndMarkSessionRevocation(requestCtx, db, store, intent),
+		"a committed intent must use a bounded context detached from the canceled request")
+	_, err = auth.NewTokenValidator(store, prefix).Validate(context.Background(), token)
+	require.Error(t, err)
+}
+
 type logoutFailingSessionStore struct {
 	fakeUserSessionStore
 	err error
@@ -208,6 +251,23 @@ func TestFinishCommittedUserSecurityMutationPreservesCommitBoundary(t *testing.T
 		require.Equal(t, []int{-1}, quitFlags, "a bearer revocation error must not skip independent IM logout")
 	})
 
+	t.Run("committed compatibility mutation ignores request cancellation", func(t *testing.T) {
+		store := &recordingDeviceRevokeStore{
+			tokens: map[int]string{int(config.APP): "app-token"}, failures: make(map[string]error),
+		}
+		requestCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		quitCalls := 0
+		err := finishCommittedUserSecurityMutation(requestCtx, store, "u1", true, nil, func(_ string, flag int) error {
+			quitCalls++
+			require.Equal(t, -1, flag)
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{"app-token"}, store.revoked)
+		require.Equal(t, 1, quitCalls)
+	})
+
 	t.Run("committed durable mutation still quits IM when synchronous apply fails", func(t *testing.T) {
 		store := &flakyRevokeAllSessionStore{}
 		applyErr := errors.New("redis unavailable")
@@ -222,48 +282,103 @@ func TestFinishCommittedUserSecurityMutationPreservesCommitBoundary(t *testing.T
 	})
 }
 
-func TestPasswordAndDisablePathsUseCommittedSecurityMutationHelper(t *testing.T) {
-	tests := []struct {
-		file     string
-		function string
-		calls    []string
-	}{
-		{file: "api.go", function: "pwdforget", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "api_emaillogin.go", function: "emailForgetPwd", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "api_manager.go", function: "resetUserPassword", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "api_manager.go", function: "updatePwd", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "api_usernamelogin.go", function: "updatePwd", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "service.go", function: "UpdateLoginPassword", calls: []string{"updatePasswordAndRevokeSessions"}},
-		{file: "api_manager.go", function: "liftBanUser", calls: []string{"updateUserFieldAndRevokeSessionsWithResult", "finishCommittedUserSecurityMutation"}},
+func TestInvalidateCurrentUserTokenIgnoresCanceledRequestContext(t *testing.T) {
+	store := &recordingDeviceRevokeStore{
+		tokens: map[int]string{int(config.APP): "app-token"}, failures: make(map[string]error),
 	}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, invalidateCurrentUserToken(requestCtx, store, "u1", "app-token"))
+	require.Equal(t, []string{"app-token"}, store.revoked)
+}
 
-	for _, tt := range tests {
-		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
-			fset := gotoken.NewFileSet()
-			file, err := parser.ParseFile(fset, tt.file, nil, 0)
-			require.NoError(t, err)
-			found := make(map[string]bool)
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok || function.Name.Name != tt.function {
-					continue
+func TestPasswordMutationPathsUseCommittedSecurityMutationHelper(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	var mutationPaths []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		fset := gotoken.NewFileSet()
+		file, err := parser.ParseFile(fset, entry.Name(), nil, 0)
+		require.NoError(t, err)
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil || function.Name.Name == "updatePasswordAndRevokeSessions" {
+				continue
+			}
+			mutatesPassword, usesHelper := passwordMutationCalls(function.Body)
+			if !mutatesPassword {
+				continue
+			}
+			path := entry.Name() + "/" + function.Name.Name
+			mutationPaths = append(mutationPaths, path)
+			require.True(t, usesHelper, "%s writes the password credential without updatePasswordAndRevokeSessions", path)
+		}
+	}
+	sort.Strings(mutationPaths)
+	require.Contains(t, mutationPaths, "api_usernamelogin.go/resetPwdWithWeb3PublicKey")
+	require.NotEmpty(t, mutationPaths)
+}
+
+func passwordMutationCalls(body *ast.BlockStmt) (mutatesPassword bool, usesHelper bool) {
+	var hasPasswordLiteral bool
+	var callsGenericUserWriter bool
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.BasicLit:
+			if typed.Kind == gotoken.STRING {
+				value, err := strconv.Unquote(typed.Value)
+				if err == nil && value == "password" {
+					hasPasswordLiteral = true
 				}
-				ast.Inspect(function.Body, func(node ast.Node) bool {
-					call, ok := node.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					if name, ok := call.Fun.(*ast.Ident); ok {
-						found[name.Name] = true
-					}
-					return true
-				})
 			}
-			for _, call := range tt.calls {
-				require.True(t, found[call], "%s must call %s", tt.function, call)
+		case *ast.CallExpr:
+			name := calledFunctionName(typed.Fun)
+			if name == "updatePasswordAndRevokeSessions" {
+				usesHelper = true
 			}
+			if name == "updateUser" || name == "UpdateUsersWithField" {
+				callsGenericUserWriter = true
+			}
+		}
+		return true
+	})
+	return usesHelper || (hasPasswordLiteral && callsGenericUserWriter), usesHelper
+}
+
+func calledFunctionName(expression ast.Expr) string {
+	switch typed := expression.(type) {
+	case *ast.Ident:
+		return typed.Name
+	case *ast.SelectorExpr:
+		return typed.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func TestDisablePathUsesCommittedSecurityMutationHelper(t *testing.T) {
+	fset := gotoken.NewFileSet()
+	file, err := parser.ParseFile(fset, "api_manager.go", nil, 0)
+	require.NoError(t, err)
+	found := make(map[string]bool)
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "liftBanUser" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if ok {
+				found[calledFunctionName(call.Fun)] = true
+			}
+			return true
 		})
 	}
+	require.True(t, found["updateUserFieldAndRevokeSessionsWithResult"])
+	require.True(t, found["finishCommittedUserSecurityMutation"])
 }
 
 func TestPasswordMutationRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
@@ -321,6 +436,44 @@ func TestPasswordMutationRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
 	quitFlagsMu.Unlock()
 }
 
+func TestV3WriteCompatibilityRevocationFreesBoundedIndex(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "user-v3-index-token:" + util.GenerUUID() + ":"
+	uidPrefix := "user-v3-index-uid:" + util.GenerUUID() + ":"
+	store := auth.NewRedisSessionStore(client, prefix, uidPrefix, time.Hour,
+		auth.WithSessionMode(auth.SessionModeV3Write), auth.WithSessionMaxPerUID(3))
+	uid := "v3-index-" + util.GenerUUID()
+	t.Cleanup(func() {
+		keys, _ := client.Keys(prefix + "*").Result()
+		metadata, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		flagName := strconv.Itoa(int(flag))
+		token := "before-" + flagName + "-" + util.GenerUUID()
+		require.NoError(t, store.IssueNewSession(context.Background(), token, auth.TokenInfo{
+			UID: uid, DeviceFlag: int(flag), DeviceID: "device-" + flagName,
+		}, fence))
+	}
+	require.Empty(t, revokeDeviceTokens(context.Background(), store, uid))
+
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		flagName := strconv.Itoa(int(flag))
+		token := "after-" + flagName + "-" + util.GenerUUID()
+		require.NoError(t, store.IssueNewSession(context.Background(), token, auth.TokenInfo{
+			UID: uid, DeviceFlag: int(flag), DeviceID: "replacement-" + flagName,
+		}, fence), "all bounded-index slots must be reusable after compatibility revocation")
+	}
+}
+
 func TestDisableUserStillAppliesIMSideEffectsAfterCommittedRevocationFailure(t *testing.T) {
 	server, ctx, _, managerAPI := newTokenHTTPTestServer(t)
 	wireI18nRendererForUserTest(server)
@@ -332,13 +485,16 @@ func TestDisableUserStillAppliesIMSideEffectsAfterCommittedRevocationFailure(t *
 	var imMu sync.Mutex
 	deviceQuitCalls := 0
 	channelCalls := 0
+	var sideEffectOrder []string
 	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		imMu.Lock()
 		switch r.URL.Path {
 		case "/user/device_quit":
 			deviceQuitCalls++
+			sideEffectOrder = append(sideEffectOrder, "quit")
 		default:
 			channelCalls++
+			sideEffectOrder = append(sideEffectOrder, "channel")
 		}
 		imMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -366,6 +522,18 @@ func TestDisableUserStillAppliesIMSideEffectsAfterCommittedRevocationFailure(t *
 	imMu.Lock()
 	require.Equal(t, 1, deviceQuitCalls, "post-commit Redis failure must not skip independent IM logout")
 	require.Equal(t, 1, channelCalls, "post-commit Redis failure must not skip the IM channel ban")
+	require.Equal(t, []string{"channel", "quit"}, sideEffectOrder, "the channel ban must be visible before disconnecting devices")
+	imMu.Unlock()
+
+	retryRecorder := httptest.NewRecorder()
+	retryRequest := httptest.NewRequest(http.MethodPut, "/test/manager/liftban/"+uid+"/0", nil)
+	server.GetRoute().ServeHTTP(retryRecorder, retryRequest)
+	require.Equal(t, http.StatusOK, retryRecorder.Code, retryRecorder.Body.String())
+	require.Equal(t, 2, store.callCount(), "an already-disabled retry must re-apply the pending revocation intent")
+	imMu.Lock()
+	require.Equal(t, 2, deviceQuitCalls)
+	require.Equal(t, 2, channelCalls)
+	require.Equal(t, []string{"channel", "quit", "channel", "quit"}, sideEffectOrder)
 	imMu.Unlock()
 }
 

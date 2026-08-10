@@ -790,11 +790,17 @@ type recordingDeviceRevokeStore struct {
 	revoked  []string
 }
 
-func (s *recordingDeviceRevokeStore) DeviceToken(_ context.Context, _ string, deviceFlag int) (string, error) {
+func (s *recordingDeviceRevokeStore) DeviceToken(ctx context.Context, _ string, deviceFlag int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	return s.tokens[deviceFlag], nil
 }
 
-func (s *recordingDeviceRevokeStore) InvalidateCurrentToken(_ context.Context, _ string, token string) error {
+func (s *recordingDeviceRevokeStore) InvalidateCurrentToken(ctx context.Context, _ string, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.revoked = append(s.revoked, token)
 	return s.failures[token]
 }
