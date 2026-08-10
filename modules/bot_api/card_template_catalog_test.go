@@ -15,8 +15,8 @@ import (
 // The advertised/new-send version, tracked in one place so a successor bump
 // touches this constant rather than every assertion below.
 const (
-	testReasoningVersionCurrent = aireasoningprocess.TemplateVersionV4
-	testReasoningRootCurrent    = aireasoningprocess.HandoffRootV4
+	testReasoningVersionCurrent = aireasoningprocess.TemplateVersionV5
+	testReasoningRootCurrent    = aireasoningprocess.HandoffRootV5
 )
 
 func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
@@ -25,6 +25,7 @@ func testBotTemplateRegistry(t *testing.T) *cardtmpl.Registry {
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV1)
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
+	r.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV4)
 	r.RegisterJSON(aireasoningprocess.Assets, testReasoningRootCurrent)
 	r.SetDefault(aireasoningprocess.TemplateID, testReasoningVersionCurrent)
 	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
@@ -66,6 +67,7 @@ func TestBotCardTemplateCatalogSeparatesNewSendFromLegacyEdit(t *testing.T) {
 		{aireasoningprocess.TemplateVersionV1, aireasoningprocess.HandoffRootV1},
 		{aireasoningprocess.TemplateVersionV2, aireasoningprocess.HandoffRootV2},
 		{aireasoningprocess.TemplateVersionV3, aireasoningprocess.HandoffRootV3},
+		{aireasoningprocess.TemplateVersionV4, aireasoningprocess.HandoffRootV4},
 	} {
 		t.Run(historical.version, func(t *testing.T) {
 			legacyRef := map[string]any{

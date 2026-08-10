@@ -1,0 +1,273 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "Container",
+      "style": "emphasis",
+      "spacing": "None",
+      "bleed": true,
+      "items": [
+        {
+          "type": "ColumnSet",
+          "id": "reasoning_header",
+          "spacing": "None",
+          "columns": [
+            {
+              "type": "Column",
+              "width": "stretch",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "${title}",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "Image",
+                          "id": "reasoning_toggle_collapsed",
+                          "isVisible": "${traceCollapsed}",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "altText": "展开",
+                          "size": "Small",
+                          "width": "14px",
+                          "spacing": "None",
+                          "selectAction": {
+                            "type": "Action.ToggleVisibility",
+                            "id": "reasoning_toggle",
+                            "targetElements": [
+                              "trace_panel",
+                              "collapsed_panel",
+                              "reasoning_toggle_collapsed",
+                              "reasoning_toggle_expanded"
+                            ]
+                          }
+                        },
+                        {
+                          "type": "Image",
+                          "id": "reasoning_toggle_expanded",
+                          "isVisible": "${traceExpanded}",
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "altText": "收起",
+                          "size": "Small",
+                          "width": "14px",
+                          "spacing": "None",
+                          "selectAction": {
+                            "type": "Action.ToggleVisibility",
+                            "id": "reasoning_toggle_expanded_action",
+                            "targetElements": [
+                              "trace_panel",
+                              "collapsed_panel",
+                              "reasoning_toggle_collapsed",
+                              "reasoning_toggle_expanded"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "${statusLabel}",
+                  "color": "${statusTone}",
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Container",
+          "id": "trace_panel",
+          "isVisible": "${traceExpanded}",
+          "spacing": "Medium",
+          "items": [
+            {
+              "$data": "${phases}",
+              "type": "Container",
+              "id": "reasoning_phase_${$index}",
+              "spacing": "${if($index == 0, 'None', 'Small')}",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "${thought}",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "Image",
+                          "id": "reasoning_tools_toggle_collapsed_${$index}",
+                          "isVisible": true,
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m6%209l6%206l6-6%22%2F%3E%3C%2Fsvg%3E",
+                          "altText": "展开工具",
+                          "size": "Small",
+                          "width": "14px",
+                          "spacing": "None",
+                          "selectAction": {
+                            "type": "Action.ToggleVisibility",
+                            "id": "reasoning_tools_toggle_action_${$index}",
+                            "targetElements": [
+                              "reasoning_tools_panel_${$index}",
+                              "reasoning_tools_toggle_collapsed_${$index}",
+                              "reasoning_tools_toggle_expanded_${$index}"
+                            ]
+                          }
+                        },
+                        {
+                          "type": "Image",
+                          "id": "reasoning_tools_toggle_expanded_${$index}",
+                          "isVisible": false,
+                          "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%221em%22%20height%3D%221em%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%23a1a6ab%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m18%2015l-6-6l-6%206%22%2F%3E%3C%2Fsvg%3E",
+                          "altText": "收起工具",
+                          "size": "Small",
+                          "width": "14px",
+                          "spacing": "None",
+                          "selectAction": {
+                            "type": "Action.ToggleVisibility",
+                            "id": "reasoning_tools_toggle_expanded_action_${$index}",
+                            "targetElements": [
+                              "reasoning_tools_panel_${$index}",
+                              "reasoning_tools_toggle_collapsed_${$index}",
+                              "reasoning_tools_toggle_expanded_${$index}"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "Container",
+                  "id": "reasoning_tools_panel_${$index}",
+                  "isVisible": false,
+                  "spacing": "Small",
+                  "items": [
+                    {
+                      "$data": "${actions}",
+                      "type": "ColumnSet",
+                      "spacing": "${if($index == 0, 'None', 'Small')}",
+                      "columns": [
+                        {
+                          "type": "Column",
+                          "width": "8px",
+                          "items": []
+                        },
+                        {
+                          "type": "Column",
+                          "width": "auto",
+                          "verticalContentAlignment": "Center",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "${statusGlyph}",
+                              "color": "${statusTone}",
+                              "size": "Small",
+                              "spacing": "None"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "Column",
+                          "width": "auto",
+                          "spacing": "Small",
+                          "verticalContentAlignment": "Center",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "${tool}",
+                              "size": "Small",
+                              "wrap": true,
+                              "spacing": "None"
+                            }
+                          ]
+                        },
+                        {
+                          "type": "Column",
+                          "width": "stretch",
+                          "spacing": "Small",
+                          "verticalContentAlignment": "Center",
+                          "items": [
+                            {
+                              "type": "TextBlock",
+                              "text": "${detail}",
+                              "isSubtle": true,
+                              "size": "Small",
+                              "wrap": true,
+                              "spacing": "None"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "TextBlock",
+              "text": "◌  ${progressText}",
+              "color": "Accent",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "Medium"
+            }
+          ]
+        },
+        {
+          "type": "Container",
+          "id": "collapsed_panel",
+          "isVisible": "${traceCollapsed}",
+          "spacing": "Small",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${collapsedSummary}",
+              "size": "Small",
+              "isSubtle": true,
+              "wrap": true,
+              "spacing": "None"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
