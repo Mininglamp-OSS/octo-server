@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -83,6 +84,16 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/updatepassword", m.updatePwd)        // 修改用户密码
 		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
 	}
+	dashboardReader := r.Group(
+		"/v1/manager/user",
+		m.ctx.AuthMiddleware(r),
+		appwkhttp.SharedUIDRateLimiter(r, m.ctx),
+	)
+	{
+		dashboardReader.GET("/dashboard-read", m.listDashboardReaders)
+		dashboardReader.PUT("/:uid/dashboard-read", m.grantDashboardRead)
+		dashboardReader.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
+	}
 }
 
 // managerMeResp 是管理台「我是谁 + 我能做什么」响应。capabilities 是一张后端拥有
@@ -98,10 +109,10 @@ type managerMeResp struct {
 	Capabilities map[string]bool `json:"capabilities"`
 }
 
-// me 返回当前登录管理员的身份与能力图谱。管理台任一已登录管理员（admin∪
-// superAdmin）可读自己的能力；普通用户没有管理台访问，被 CheckLoginRole 挡下。
+// me 返回当前登录管理台账号的身份与能力图谱。dashboardReader 只在这里和 Dashboard
+// 读面被承认；普通管理接口仍走 octo-lib CheckLoginRole，只接受 admin∪superAdmin。
 func (m *Manager) me(c *wkhttp.Context) {
-	if err := c.CheckLoginRole(); err != nil {
+	if !auth.IsManagerConsoleRole(c.GetLoginRole()) {
 		respondManagerForbidden(c)
 		return
 	}
@@ -110,13 +121,13 @@ func (m *Manager) me(c *wkhttp.Context) {
 		UID:          c.GetLoginUID(),
 		Name:         c.GetLoginName(),
 		Role:         role,
-		Capabilities: managerCapabilities(role == string(wkhttp.SuperAdmin)),
+		Capabilities: managerCapabilities(role),
 	})
 }
 
-// managerCapabilities 把当前各管理端点的角色档位映射为 feature→是否放行。调用方
-// 已通过 CheckLoginRole（admin∪superAdmin），故 admin 档位项恒 true；superAdmin
-// 专属项取 isSuper。键名是与前端的稳定约定。
+// managerCapabilities 把当前各管理端点的角色档位映射为 feature→是否放行。
+// admin 档位项只对 admin∪superAdmin 开放；dashboardReader 仅开放 dashboard.read；
+// superAdmin 专属项只对 superAdmin 开放。键名是与前端的稳定约定。
 //
 // 读/写分档：每个能力键按该组操作的真实 gate 取值——admin 可达的读/写恒 true，
 // superAdmin 专属的写/销毁取 isSuper——既避免前端拿单一粗标志去渲染会被后端 403 的
@@ -138,7 +149,9 @@ func (m *Manager) me(c *wkhttp.Context) {
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
-func managerCapabilities(isSuper bool) map[string]bool {
+func managerCapabilities(role string) map[string]bool {
+	isSuper := role == string(wkhttp.SuperAdmin)
+	isAdmin := isSuper || role == string(wkhttp.Admin)
 	return map[string]bool{
 		// superAdmin 专属
 		"system_setting":     isSuper, // 系统配置：读写均超管
@@ -153,13 +166,13 @@ func managerCapabilities(isSuper bool) map[string]bool {
 		"skill.write":        isSuper, // 系统 Skill 创建/编辑/删除/分类管理（marketplace admin surface）
 		"mcp.read":           isSuper, // 系统 MCP 列表/详情（marketplace admin surface 只认共享 X-Admin-Token 不分 role，此处收窄到超管以缩小页面暴露面）
 		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（同上）
-		// admin ∪ superAdmin（此处恒 true，列出供前端统一读取）
-		"appversion.read": true, // 版本列表
-		"dashboard.read":  true, // 运营看板查看
-		"users.read":      true, // 用户列表 / 好友 / 黑名单 / 禁用 / 设备 / 在线
-		"groups.read":     true, // 群组列表 / 禁用群 / 群成员 / 群黑名单
-		"space.read":      true, // 空间查看 / 列表
-		"space.write":     true, // 建空间 / 改资料 / 加成员 / 邀请增改禁用 / 通过拒绝入群申请（requireAdmin）
+		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
+		"appversion.read": isAdmin,                            // 版本列表
+		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
+		"users.read":      isAdmin,                            // 用户列表 / 好友 / 黑名单 / 禁用 / 设备 / 在线
+		"groups.read":     isAdmin,                            // 群组列表 / 禁用群 / 群成员 / 群黑名单
+		"space.read":      isAdmin,                            // 空间查看 / 列表
+		"space.write":     isAdmin,                            // 建空间 / 改资料 / 加成员 / 邀请增改禁用 / 通过拒绝入群申请（requireAdmin）
 	}
 }
 
@@ -281,7 +294,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
-	if userInfo.Role != string(wkhttp.Admin) && userInfo.Role != string(wkhttp.SuperAdmin) {
+	if !auth.IsManagerConsoleRole(userInfo.Role) {
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
@@ -369,6 +382,160 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// grantDashboardRead assigns the temporary dashboardReader role to an existing
+// non-SuperAdmin account. The role is exclusive: assigning it to an admin is a
+// deliberate downgrade to Dashboard-only access.
+func (m *Manager) grantDashboardRead(c *wkhttp.Context) {
+	m.setDashboardReaderRole(c, true)
+}
+
+// revokeDashboardRead removes only the temporary dashboardReader role. It does
+// not remove dashboard access inherited from admin or SuperAdmin.
+func (m *Manager) revokeDashboardRead(c *wkhttp.Context) {
+	m.setDashboardReaderRole(c, false)
+}
+
+func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+
+	target, ok := m.dashboardReaderTarget(c)
+	if !ok {
+		return
+	}
+	nextRole, changed, allowed := dashboardReaderRoleTransition(target.Role, grant)
+	if !allowed {
+		respondManagerForbidden(c)
+		return
+	}
+	if grant && !dashboardReaderGrantEligible(target) {
+		respondUserError(c, errcode.ErrUserDashboardReaderTargetIneligible)
+		return
+	}
+	if !changed {
+		m.finishDashboardReaderRoleRequest(c, target.UID, grant, false)
+		return
+	}
+
+	updated, err := m.db.updateUserRole(target.UID, target.Role, nextRole)
+	if err != nil {
+		m.Error("update dashboard reader role failed",
+			zap.Error(err),
+			zap.String("actor_uid", c.GetLoginUID()),
+			zap.String("target_uid", target.UID),
+			zap.Bool("grant", grant))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !updated {
+		// The role changed after QueryByUID. Fail closed instead of overwriting a
+		// concurrent promotion (especially to SuperAdmin).
+		m.Info("dashboard reader role update lost compare-and-set",
+			zap.String("actor_uid", c.GetLoginUID()),
+			zap.String("target_uid", target.UID),
+			zap.String("expected_role", target.Role),
+			zap.Bool("grant", grant))
+		respondUserError(c, errcode.ErrUserManagerRoleChanged)
+		return
+	}
+	m.finishDashboardReaderRoleRequest(c, target.UID, grant, true)
+}
+
+func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
+	targetUID := strings.TrimSpace(c.Param("uid"))
+	if targetUID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return nil, false
+	}
+	target, err := m.userDB.QueryByUID(targetUID)
+	if err != nil {
+		m.Error("query dashboard reader target failed", zap.Error(err), zap.String("target_uid", targetUID))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return nil, false
+	}
+	if target == nil || target.UID == "" {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return nil, false
+	}
+	return target, true
+}
+
+func dashboardReaderGrantEligible(target *Model) bool {
+	return target != nil && target.Robot == 0 &&
+		target.Status == StatusEnable.Int() && target.IsDestroy == IsDestroyNo
+}
+
+func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
+	if err := m.roleService.Invalidate(targetUID); err != nil {
+		m.Error("invalidate dashboard reader role cache failed",
+			zap.Error(err),
+			zap.String("actor_uid", c.GetLoginUID()),
+			zap.String("target_uid", targetUID),
+			zap.Bool("grant", grant),
+			zap.Bool("role_changed", changed))
+		respondUserError(c, errcode.ErrUserRoleCacheFailed)
+		return
+	}
+	message := "dashboard reader role already in requested state"
+	if changed {
+		message = "dashboard reader role changed"
+	}
+	m.Info(message,
+		zap.String("actor_uid", c.GetLoginUID()),
+		zap.String("target_uid", targetUID),
+		zap.Bool("granted", grant))
+	c.ResponseOK()
+}
+
+func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	users, err := m.db.queryUsersWithRole(auth.ManagerRoleDashboardReader)
+	if err != nil {
+		m.Error("query dashboard reader list failed", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	list := make([]*dashboardReaderResp, 0, len(users))
+	for _, user := range users {
+		list = append(list, &dashboardReaderResp{
+			UID: user.UID, Name: user.Name, Username: user.Username,
+			RegisterTime: user.CreatedAt.String(),
+		})
+	}
+	c.Response(list)
+}
+
+// dashboardReaderRoleTransition is the complete temporary-role policy. The
+// boolean results are (changed, allowed). Admin may be deliberately downgraded
+// to dashboardReader; inherited admin/SuperAdmin dashboard access cannot be
+// revoked through this fixed-role endpoint.
+func dashboardReaderRoleTransition(currentRole string, grant bool) (nextRole string, changed, allowed bool) {
+	if grant {
+		switch currentRole {
+		case "", string(wkhttp.Admin):
+			return auth.ManagerRoleDashboardReader, true, true
+		case auth.ManagerRoleDashboardReader:
+			return auth.ManagerRoleDashboardReader, false, true
+		default:
+			return "", false, false
+		}
+	}
+
+	switch currentRole {
+	case "":
+		return "", false, true
+	case auth.ManagerRoleDashboardReader:
+		return "", true, true
+	default:
+		return "", false, false
+	}
+}
+
 // 删除管理员用户
 func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
@@ -391,7 +558,7 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
-	if user.Role == "" {
+	if user.Role != string(wkhttp.Admin) && user.Role != string(wkhttp.SuperAdmin) {
 		respondUserError(c, errcode.ErrUserNotAdminAccount)
 		return
 	}
@@ -1376,6 +1543,12 @@ type managerBlackUserResp struct {
 	CreateAt string `json:"create_at"`
 }
 type adminUserResp struct {
+	Name         string `json:"name"`
+	UID          string `json:"uid"`
+	Username     string `json:"username"`
+	RegisterTime string `json:"register_time"`
+}
+type dashboardReaderResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`

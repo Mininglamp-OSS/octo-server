@@ -277,11 +277,20 @@ other = "该用户不是管理员账号，无法删除。"
 ["err.server.user.cannot_delete_super_admin"]
 other = "超级管理员账号不能删除。"
 
+["err.server.user.dashboard_reader_target_ineligible"]
+other = "该账号不符合运营看板只读授权条件。"
+
+["err.server.user.manager_role_changed"]
+other = "目标账号角色已变化，请刷新后重试。"
+
 ["err.server.user.list_filter_conflict"]
 other = "用户列表筛选条件互斥。"
 
 ["err.server.user.token_cache_failed"]
 other = "更新登录令牌缓存失败。"
+
+["err.server.user.role_cache_failed"]
+other = "更新用户角色缓存失败。"
 
 ["err.server.user.short_no_gen_failed"]
 other = "生成短编号失败。"
@@ -1210,10 +1219,10 @@ other = "该名称匹配到多个密钥，请进一步指明。"
 ["err.server.usersecret.resolve_failed"]
 other = "密钥解析失败。"
 
-# ---- modules/opanalytics：运营分析看板（管理端 superAdmin 只读） ----
+# ---- modules/opanalytics：运营分析看板 ----
 
 ["err.server.opanalytics.forbidden"]
-other = "仅超级管理员可访问运营看板。"
+other = "无权执行此运营看板操作。"
 
 ["err.server.opanalytics.request_invalid"]
 other = "请求参数无效。"

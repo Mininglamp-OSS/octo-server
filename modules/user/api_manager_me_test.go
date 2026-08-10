@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,8 +18,9 @@ import (
 // features must be false for a plain admin, while admin∪superAdmin features are
 // true for both. Pure function — no server / DB needed.
 func TestManagerCapabilities(t *testing.T) {
-	super := managerCapabilities(true)
-	admin := managerCapabilities(false)
+	super := managerCapabilities(string(wkhttp.SuperAdmin))
+	admin := managerCapabilities(string(wkhttp.Admin))
+	reader := managerCapabilities(appauth.ManagerRoleDashboardReader)
 
 	superOnly := []string{
 		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
@@ -35,10 +37,17 @@ func TestManagerCapabilities(t *testing.T) {
 		if admin[k] {
 			t.Errorf("admin must NOT have superAdmin-only capability %q", k)
 		}
+		if reader[k] {
+			t.Errorf("dashboardReader must NOT have superAdmin-only capability %q", k)
+		}
 	}
 	for _, k := range adminTier {
 		if !super[k] || !admin[k] {
 			t.Errorf("admin-tier capability %q must be true for both admin and superAdmin", k)
+		}
+		wantReader := k == "dashboard.read"
+		if reader[k] != wantReader {
+			t.Errorf("dashboardReader capability %q = %v, want %v", k, reader[k], wantReader)
 		}
 	}
 
@@ -46,6 +55,29 @@ func TestManagerCapabilities(t *testing.T) {
 	if got, want := len(super), len(superOnly)+len(adminTier); got != want {
 		t.Errorf("capability map has %d keys, want %d (update this test if the contract changed)", got, want)
 	}
+}
+
+func TestManagerMe_DashboardReaderGetsOnlyDashboardRead(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	loginAsRole(t, ctx, appauth.ManagerRoleDashboardReader)
+	w := getManagerMe(route)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp meResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, appauth.ManagerRoleDashboardReader, resp.Role)
+	for capability, enabled := range resp.Capabilities {
+		assert.Equalf(t, capability == "dashboard.read", enabled,
+			"dashboardReader capability %q must be least privilege", capability)
+	}
+
+	blocked := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/manager/user/list", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(blocked, req)
+	assert.Equal(t, http.StatusBadRequest, blocked.Code)
+	assert.Contains(t, blocked.Body.String(), "err.shared.auth.forbidden")
 }
 
 // meResponse mirrors managerMeResp for decoding the HTTP body.
@@ -65,8 +97,8 @@ func getManagerMe(h http.Handler) *httptest.ResponseRecorder {
 }
 
 // loginAsRole logs testutil.UID in with the given system role via the token
-// cache (uid@name[@role]). The test server does not wire a RoleResolver (only
-// main.go does), so the token's baked role is authoritative here — matching the
+// cache (uid@name[@role]). The route-only harness does not wire a RoleResolver
+// (only main.go does), so the token's baked role is authoritative here — matching the
 // setPlainUserToken / setAdminToken helpers in the opanalytics tests. role == ""
 // omits the role segment → no system role → CheckLoginRole rejects.
 func loginAsRole(t *testing.T, ctx *config.Context, role string) {
@@ -83,17 +115,16 @@ func loginAsRole(t *testing.T, ctx *config.Context, role string) {
 // Complements the pure-function TestManagerCapabilities, which cannot catch a
 // regression in the handler's role check.
 func TestManagerMe_RejectsPlainUser(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
+	route, ctx, _ := newManagerRouteOnly(t)
 
 	loginAsRole(t, ctx, "") // no system role
-	w := getManagerMe(s.GetRoute())
+	w := getManagerMe(route)
 	// Assert the specific forbidden outcome, not merely "not 200": respondManagerForbidden
 	// renders err.shared.auth.forbidden, pinned to wire 400 (D14) with the shared
 	// permission message. This rejects a 500/panic, 404 (route regression) or 401
 	// masquerading as a passing auth test.
 	assert.Equal(t, http.StatusBadRequest, w.Code, "forbidden is pinned to wire 400 (D14)")
-	assert.Contains(t, w.Body.String(), "permission",
+	assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden",
 		"plain user must be rejected for the role reason (forbidden), not some other failure")
 }
 
@@ -102,11 +133,10 @@ func TestManagerMe_RejectsPlainUser(t *testing.T) {
 // superAdmin-only write tiers false — so the console won't render write buttons
 // that the backend would 403.
 func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
+	route, ctx, _ := newManagerRouteOnly(t)
 
 	loginAsRole(t, ctx, string(wkhttp.Admin))
-	w := getManagerMe(s.GetRoute())
+	w := getManagerMe(route)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var resp meResponse
@@ -129,11 +159,10 @@ func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
 // TestManagerMe_SuperAdminGetsWriteCaps verifies a superAdmin is admitted and the
 // write/destructive tiers come back true.
 func TestManagerMe_SuperAdminGetsWriteCaps(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
+	route, ctx, _ := newManagerRouteOnly(t)
 
 	loginAsRole(t, ctx, string(wkhttp.SuperAdmin))
-	w := getManagerMe(s.GetRoute())
+	w := getManagerMe(route)
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var resp meResponse

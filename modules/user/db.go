@@ -516,7 +516,7 @@ type Model struct {
 	QRVercode         string       // 二维码验证码
 	IsUploadAvatar    int          // 是否上传过头像0:未上传1:已上传
 	AvatarVersion     int64        // 头像对象版本，0 表示旧版稳定路径
-	Role              string       // 角色 admin/superAdmin
+	Role              string       // 系统角色 admin/superAdmin/dashboardReader（临时只读看板角色）
 	Robot             int          // 机器人0.否1.是
 	MuteOfApp         int          // app是否禁音（当pc登录的时候app可以设置禁音，当pc登录后有效）
 	IsDestroy         int          // 注销状态 0.正常 1.注销申请中（冷静期） 2.已注销

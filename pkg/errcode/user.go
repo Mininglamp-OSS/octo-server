@@ -315,7 +315,7 @@ var (
 	// manager-specific guards that had no existing equivalent.
 
 	// ErrUserManagerPermissionRequired fires at /v1/manager/login after the
-	// password check succeeds but the account carries no admin/superAdmin role.
+	// password check succeeds but the account carries no accepted manager-console role.
 	// Distinct from err.shared.auth.forbidden (a route-level role guard) so the
 	// login page can show a login-specific hint.
 	ErrUserManagerPermissionRequired = register(codes.Code{
@@ -355,6 +355,16 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The super administrator account cannot be deleted.",
 	})
+	ErrUserDashboardReaderTargetIneligible = register(codes.Code{
+		ID:             "err.server.user.dashboard_reader_target_ineligible",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This account is not eligible for analytics dashboard access.",
+	})
+	ErrUserManagerRoleChanged = register(codes.Code{
+		ID:             "err.server.user.manager_role_changed",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "The target account role has changed; refresh and try again.",
+	})
 	// ErrUserListFilterConflict reports mutually-exclusive list filters
 	// (bot_only + exclude_bot, system_only + exclude_system). The conflicting
 	// filter names are surfaced so a frontend dev can spot the bad query.
@@ -373,6 +383,12 @@ var (
 		ID:             "err.server.user.token_cache_failed",
 		HTTPStatus:     http.StatusInternalServerError,
 		DefaultMessage: "Failed to update the session token cache.",
+		Internal:       true,
+	})
+	ErrUserRoleCacheFailed = register(codes.Code{
+		ID:             "err.server.user.role_cache_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to invalidate the user role cache.",
 		Internal:       true,
 	})
 	ErrUserShortNoGenFailed = register(codes.Code{
