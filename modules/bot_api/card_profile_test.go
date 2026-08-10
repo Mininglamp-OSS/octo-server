@@ -290,7 +290,7 @@ func assertReasoningCurrentCapability(t *testing.T, capability botTemplatingCapa
 	}
 	template := capability.Templates[0]
 	assert.Equal(t, string(aireasoningprocess.TemplateID), template.ID)
-	assert.Equal(t, aireasoningprocess.TemplateVersionV4, template.Version)
+	assert.Equal(t, aireasoningprocess.TemplateVersionV5, template.Version)
 	assert.Len(t, template.Views, 3)
 	for _, view := range template.Views {
 		assert.Empty(t, view.SubmitActions, "view %s must not advertise server callbacks", view.Name)

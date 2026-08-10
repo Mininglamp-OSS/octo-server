@@ -11,7 +11,8 @@
 //	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV2)
 //	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV3)
 //	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV4)
-//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV4)
+//	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRootV5)
+//	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersionV5)
 //
 // Layering: L1 JSON artifacts live under handoff/. Frozen V1/V2 retain their
 // historical reasoning_stop/reasoning_retry Submit contracts. V3 removes those
@@ -19,6 +20,8 @@
 // V4 keeps V3's action surface and adds the simplified presentation: a slimmed
 // header with chevron toggles and per-phase collapsible tool panels. Across all
 // versions active/error remain octo/v2 and result remains octo/v1.
+// V5 keeps the V4 contract and interaction surface byte-for-byte while allowing
+// that simplified root container to bleed to the chat edge.
 package aireasoningprocess
 
 import (
@@ -54,9 +57,14 @@ const (
 	// 13 is load-bearing rather than incidental.
 	HandoffRootV4     = "handoff/ai.reasoning-process@0.4.0"
 	TemplateVersionV4 = "0.4.0"
+	// HandoffRootV5 and TemplateVersionV5 identify the full-bleed presentation
+	// successor. It intentionally preserves V4's bounded data contract and
+	// client-local action surface; only the root-container presentation changes.
+	HandoffRootV5     = "handoff/ai.reasoning-process@0.4.1"
+	TemplateVersionV5 = "0.4.1"
 
 	// HandoffRoot and TemplateVersion retain the package's current-version
 	// aliases for callers that do not need an explicit historical version.
-	HandoffRoot     = HandoffRootV4
-	TemplateVersion = TemplateVersionV4
+	HandoffRoot     = HandoffRootV5
+	TemplateVersion = TemplateVersionV5
 )

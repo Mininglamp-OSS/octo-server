@@ -1,0 +1,269 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "推理过程卡数据契约",
+  "description": "AI 推理过程附件的展示型 ViewModel。消息作者、头像、时间与最终 Markdown 回答由消息容器负责，不进入卡片契约。",
+  "x-octo-constraints": {
+    "aggregateArrayLimits": [
+      {
+        "parentArray": "phases",
+        "childArray": "actions",
+        "maxTotalItems": 13
+      }
+    ],
+    "truncateStrings": [
+      {
+        "arrayField": "phases",
+        "field": "thought",
+        "maxRunes": 400,
+        "ellipsis": "…"
+      }
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reasoningId",
+    "state",
+    "title",
+    "statusLabel",
+    "statusTone",
+    "traceExpanded",
+    "traceCollapsed",
+    "collapsedSummary",
+    "phases"
+  ],
+  "properties": {
+    "reasoningId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本轮推理的稳定标识。",
+      "examples": [
+        "reasoning-channel-b-001"
+      ],
+      "maxLength": 512
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "reasoning",
+        "answering",
+        "completed",
+        "stopped",
+        "error"
+      ],
+      "description": "卡片当前状态；宿主据此选择 active、result 或 error View。"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "推理卡标题。",
+      "examples": [
+        "深度思考"
+      ],
+      "maxLength": 64
+    },
+    "statusLabel": {
+      "type": "string",
+      "minLength": 1,
+      "description": "面向用户的状态文案。",
+      "maxLength": 32
+    },
+    "statusTone": {
+      "type": "string",
+      "enum": [
+        "Accent",
+        "Good",
+        "Warning",
+        "Attention"
+      ],
+      "description": "Adaptive Cards 标准语义色。"
+    },
+    "timerText": {
+      "type": "string",
+      "minLength": 1,
+      "description": "兼容旧版数据的耗时与阶段摘要；精简版不展示此字段。",
+      "maxLength": 128
+    },
+    "traceExpanded": {
+      "type": "boolean",
+      "description": "初始是否展示推理明细。"
+    },
+    "traceCollapsed": {
+      "type": "boolean",
+      "description": "初始是否展示收起摘要；应与 traceExpanded 互斥。"
+    },
+    "collapsedSummary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "推理明细收起时的摘要。",
+      "maxLength": 160
+    },
+    "progressText": {
+      "type": "string",
+      "minLength": 1,
+      "description": "活动态底部的实时进度提示。",
+      "maxLength": 160
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "description": "按发生顺序排列的推理阶段。仅包含可向用户展示的过程摘要，不承载隐藏的模型内部思维。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "thought",
+          "actions"
+        ],
+        "properties": {
+          "thought": {
+            "type": "string",
+            "minLength": 1,
+            "description": "该阶段面向用户的推理摘要。展示上限 400 码点（见 x-octo-constraints.truncateStrings）；超出部分由服务端截断并追加省略号，不报错。此处的 maxLength 是受理上限，仅用于拒绝病态超长载荷。",
+            "maxLength": 4001
+          },
+          "actions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "tool",
+                "detail",
+                "statusGlyph",
+                "statusTone"
+              ],
+              "properties": {
+                "tool": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "工具或步骤名称。",
+                  "maxLength": 81
+                },
+                "detail": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "已脱敏的调用摘要。",
+                  "maxLength": 192
+                },
+                "statusGlyph": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2,
+                  "description": "调用状态符号，例如 ●。"
+                },
+                "statusTone": {
+                  "type": "string",
+                  "enum": [
+                    "Accent",
+                    "Good",
+                    "Attention"
+                  ],
+                  "description": "工具调用状态的标准语义色。"
+                }
+              }
+            },
+            "maxItems": 12
+          }
+        }
+      },
+      "maxItems": 6
+    },
+    "errorTitle": {
+      "type": "string",
+      "minLength": 1,
+      "description": "失败态标题。",
+      "maxLength": 64
+    },
+    "errorMessage": {
+      "type": "string",
+      "minLength": 1,
+      "description": "失败原因与用户可采取动作。",
+      "maxLength": 121
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "traceExpanded": {
+              "const": true
+            },
+            "traceCollapsed": {
+              "const": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "traceExpanded": {
+              "const": false
+            },
+            "traceCollapsed": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "reasoning",
+              "answering"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "progressText"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "errorTitle",
+          "errorMessage"
+        ]
+      }
+    }
+  ],
+  "examples": [
+    {
+      "reasoningId": "reasoning-channel-b-001",
+      "state": "completed",
+      "title": "深度思考",
+      "statusLabel": "已完成",
+      "statusTone": "Good",
+      "traceExpanded": false,
+      "traceCollapsed": true,
+      "collapsedSummary": "已思考 12 秒",
+      "phases": [
+        {
+          "thought": "先拆解漏斗并核对近 90 天数据。",
+          "actions": [
+            {
+              "tool": "query_metrics",
+              "detail": "channel=B · range=90d",
+              "statusGlyph": "●",
+              "statusTone": "Good"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
