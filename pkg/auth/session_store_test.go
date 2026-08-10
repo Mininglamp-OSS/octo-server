@@ -49,6 +49,20 @@ func TestRedisSessionStoreKeepsTokenDeadline(t *testing.T) {
 	require.Equal(t, "new", got)
 }
 
+func TestRedisSessionStoreWithMaxTTLOnlyNarrowsLifetime(t *testing.T) {
+	client := rd.NewClient(&rd.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = client.Close() })
+	store := NewRedisSessionStore(client, "token:", "uidtoken:", 30*24*time.Hour)
+
+	limited := store.WithMaxTTL(24 * time.Hour)
+	require.Equal(t, 24*time.Hour, limited.maxTTL)
+	require.Same(t, store.client, limited.client, "a scoped lifetime must reuse the existing Redis connection pool")
+
+	notExpanded := limited.WithMaxTTL(48 * time.Hour)
+	require.Equal(t, 24*time.Hour, notExpanded.maxTTL, "a scoped view must never extend its parent lifetime")
+	require.Panics(t, func() { store.WithMaxTTL(0) })
+}
+
 func TestRedisSessionStoreRejectsV3PayloadDowngrade(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
