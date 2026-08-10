@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -210,6 +212,23 @@ func TestLiftBanDisabledManagerRevokesHTTPManagerSessions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLiftBanPersistsDisabledStatusBeforeRevokingManagerSessions(t *testing.T) {
+	source, err := os.ReadFile("api_manager.go")
+	require.NoError(t, err)
+	bodyStart := strings.Index(string(source), "func (m *Manager) liftBanUser")
+	require.NotEqual(t, -1, bodyStart)
+	bodyEnd := strings.Index(string(source)[bodyStart:], "func (m *Manager) revokeManagerSessionsForDisabledAccount")
+	require.NotEqual(t, -1, bodyEnd)
+	body := string(source)[bodyStart : bodyStart+bodyEnd]
+
+	statusWrite := strings.Index(body, `UpdateUsersWithField("status"`)
+	sessionRevoke := strings.Index(body, "revokeManagerSessionsForDisabledAccount")
+	require.NotEqual(t, -1, statusWrite)
+	require.NotEqual(t, -1, sessionRevoke)
+	require.Less(t, statusWrite, sessionRevoke,
+		"status must become disabled before session revocation closes the concurrent-login window")
 }
 
 func TestDashboardReaderRoleTransition(t *testing.T) {
