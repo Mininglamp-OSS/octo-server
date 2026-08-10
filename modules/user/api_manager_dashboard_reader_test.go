@@ -13,9 +13,25 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func resetManagerUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rds := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	t.Cleanup(func() { _ = rds.Close() })
+	keys, err := rds.Keys("ratelimit:uid:*").Result()
+	require.NoError(t, err)
+	if len(keys) > 0 {
+		require.NoError(t, rds.Del(keys...).Err())
+	}
+}
 
 func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manager) {
 	t.Helper()
@@ -26,6 +42,7 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	ctx.SetHttpRoute(route)
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	resetManagerUIDRateLimit(t, ctx)
 	m := NewManager(ctx)
 	m.Route(route)
 	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
@@ -44,6 +61,7 @@ func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 		Name:     "Dashboard Reader",
 		Password: hash,
 		Role:     appauth.ManagerRoleDashboardReader,
+		Status:   StatusEnable.Int(),
 	}))
 
 	body, err := json.Marshal(map[string]string{
@@ -105,6 +123,7 @@ func TestManagerDashboardReaderGrantAndRevoke(t *testing.T) {
 		Username: "dashboard-reader-target",
 		Name:     "Dashboard Reader Target",
 		Role:     string(wkhttp.Admin),
+		Status:   StatusEnable.Int(),
 	}))
 	require.NoError(t, ctx.Cache().Set(RoleCacheKeyPrefix+targetUID, string(wkhttp.Admin)))
 
@@ -176,6 +195,7 @@ func TestManagerDashboardReaderRoleChangeRevokesExistingSessions(t *testing.T) {
 		Username: targetUID,
 		Name:     "Dashboard Reader Session Revoke Target",
 		Role:     string(wkhttp.Admin),
+		Status:   StatusEnable.Int(),
 	}))
 
 	seedTargetSessions := func(stage string) map[config.DeviceFlag]string {
@@ -221,6 +241,162 @@ func TestManagerDashboardReaderRoleChangeRevokesExistingSessions(t *testing.T) {
 	revoked := request(http.MethodDelete)
 	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
 	assertSessionsRevoked(readerSessions)
+}
+
+func TestDeleteAdminRejectsDashboardReaderWithoutRevokingSessions(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const (
+		callerToken = "delete-admin-reader-caller"
+		targetUID   = "delete-admin-reader-target"
+		targetToken = "delete-admin-reader-target-app-token"
+	)
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID:      targetUID,
+		Username: targetUID,
+		Name:     "Dashboard Reader Delete Guard",
+		ShortNo:  "delete-reader",
+		Role:     appauth.ManagerRoleDashboardReader,
+		Status:   StatusEnable.Int(),
+	}))
+	uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, config.APP, targetUID)
+	require.NoError(t, ctx.Cache().Set(uidTokenKey, targetToken))
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+targetToken,
+		targetUID+"@target@"+appauth.ManagerRoleDashboardReader))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/manager/user/admin?uid="+targetUID, nil)
+	req.Header.Set("token", callerToken)
+	route.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.user.not_admin_account")
+	target, err := NewDB(ctx).QueryByUID(targetUID)
+	require.NoError(t, err)
+	require.NotNil(t, target)
+	assert.Equal(t, appauth.ManagerRoleDashboardReader, target.Role)
+	payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + targetToken)
+	require.NoError(t, err)
+	assert.NotEmpty(t, payload, "rejecting delete-admin must not log out a dashboard reader")
+	uidToken, err := ctx.Cache().Get(uidTokenKey)
+	require.NoError(t, err)
+	assert.Equal(t, targetToken, uidToken)
+}
+
+func TestManagerDashboardReaderList(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const callerToken = "dashboard-reader-list-caller"
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: "listed-reader", Username: "listed-reader", Name: "Listed Reader",
+		ShortNo: "listed-reader", Role: appauth.ManagerRoleDashboardReader, Status: StatusEnable.Int(),
+	}))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: "unlisted-admin", Username: "unlisted-admin", Name: "Unlisted Admin",
+		ShortNo: "unlisted-admin", Role: string(wkhttp.Admin), Status: StatusEnable.Int(),
+	}))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/manager/user/dashboard-read", nil)
+	req.Header.Set("token", callerToken)
+	route.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, "uid", w.Header().Get("X-RateLimit-Scope"))
+	var list []struct {
+		UID      string `json:"uid"`
+		Username string `json:"username"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &list))
+	require.Len(t, list, 1)
+	assert.Equal(t, "listed-reader", list[0].UID)
+	assert.Equal(t, "listed-reader", list[0].Username)
+}
+
+func TestManagerDashboardReaderNoopRevokePreservesNormalSessions(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const (
+		callerToken = "dashboard-reader-noop-revoke-caller"
+		targetUID   = "dashboard-reader-noop-revoke-normal"
+		targetToken = "dashboard-reader-noop-revoke-app-token"
+	)
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: targetUID, Username: targetUID, Name: "Normal User", ShortNo: "noop-normal", Status: StatusEnable.Int(),
+	}))
+	uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, config.APP, targetUID)
+	require.NoError(t, ctx.Cache().Set(uidTokenKey, targetToken))
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+targetToken, targetUID+"@normal"))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete,
+		"/v1/manager/user/"+targetUID+"/dashboard-read", nil)
+	req.Header.Set("token", callerToken)
+	route.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + targetToken)
+	require.NoError(t, err)
+	assert.NotEmpty(t, payload, "revoking an absent role must not log out a normal user")
+	uidToken, err := ctx.Cache().Get(uidTokenKey)
+	require.NoError(t, err)
+	assert.Equal(t, targetToken, uidToken)
+}
+
+func TestManagerDashboardReaderGrantRejectsIneligibleAccounts(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const callerToken = "dashboard-reader-ineligible-caller"
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	tests := []struct {
+		name      string
+		status    int
+		robot     int
+		isDestroy int
+	}{
+		{name: "disabled", status: StatusDisable.Int()},
+		{name: "robot", status: StatusEnable.Int(), robot: 1},
+		{name: "destroying", status: StatusEnable.Int(), isDestroy: IsDestroyApplying},
+		{name: "destroyed", status: StatusEnable.Int(), isDestroy: IsDestroyDone},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid := "dashboard-reader-ineligible-" + tt.name
+			require.NoError(t, NewDB(ctx).Insert(&Model{
+				UID: uid, Username: uid, Name: tt.name, ShortNo: fmt.Sprintf("ineligible-%d", i), Status: tt.status,
+				Robot: tt.robot, IsDestroy: tt.isDestroy,
+			}))
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPut,
+				"/v1/manager/user/"+uid+"/dashboard-read", nil)
+			req.Header.Set("token", callerToken)
+			route.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), "err.server.user.dashboard_reader_target_ineligible")
+			role, err := NewDB(ctx).QueryRoleByUID(uid)
+			require.NoError(t, err)
+			assert.Empty(t, role)
+		})
+	}
+}
+
+func TestDashboardReaderRoleConflictCode(t *testing.T) {
+	code, ok := codes.Lookup("err.server.user.dashboard_reader_role_changed")
+	require.True(t, ok)
+	assert.Equal(t, http.StatusConflict, code.HTTPStatus)
 }
 
 func TestManagerDashboardReaderGrantRequiresSuperAdminAndProtectsSuperAdmin(t *testing.T) {
