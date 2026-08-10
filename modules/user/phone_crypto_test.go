@@ -85,6 +85,21 @@ func TestEncryptPhone_NonceRandomized(t *testing.T) {
 	}
 }
 
+func TestEncryptPhoneUsesLengthPrefixedEncodingVersion(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	enc, err := newPhoneEncryptor()
+	if err != nil {
+		t.Fatalf("newPhoneEncryptor: %v", err)
+	}
+	ciphertext, _, _, err := enc.encryptPhone("0086", "13800001234")
+	if err != nil {
+		t.Fatalf("encryptPhone: %v", err)
+	}
+	if !strings.HasPrefix(string(ciphertext), "enc:v2:") {
+		t.Fatalf("ciphertext prefix = %q, want enc:v2 for length-prefixed plaintext", ciphertext[:7])
+	}
+}
+
 func TestPhoneBlindHash_DeterministicAndZoneScoped(t *testing.T) {
 	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
 	h1, err := PhoneBlindHash("0086", "13800001234")
