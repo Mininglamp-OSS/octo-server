@@ -49,20 +49,48 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	return route, ctx, m
 }
 
+type managerTestAccount struct {
+	uid       string
+	username  string
+	name      string
+	shortNo   string
+	password  string
+	role      string
+	status    int
+	robot     int
+	isDestroy int
+}
+
+func insertManagerTestAccount(t *testing.T, ctx *config.Context, account managerTestAccount) {
+	t.Helper()
+	if account.username == "" {
+		account.username = account.uid
+	}
+	if account.name == "" {
+		account.name = account.uid
+	}
+	if account.shortNo == "" {
+		account.shortNo = account.uid
+	}
+	_, err := NewDB(ctx).session.InsertInto("user").Columns(
+		"uid", "username", "name", "short_no", "password", "role", "status", "robot", "is_destroy",
+	).Values(
+		account.uid, account.username, account.name, account.shortNo, account.password,
+		account.role, account.status, account.robot, account.isDestroy,
+	).Exec()
+	require.NoError(t, err)
+}
+
 func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
 	password := "reader-password"
 	hash, err := HashPassword(password)
 	require.NoError(t, err)
-	require.NoError(t, NewDB(ctx).Insert(&Model{
-		UID:      "dashboard-reader-login",
-		Username: "dashboard-reader-login",
-		Name:     "Dashboard Reader",
-		Password: hash,
-		Role:     appauth.ManagerRoleDashboardReader,
-		Status:   StatusEnable.Int(),
-	}))
+	insertManagerTestAccount(t, ctx, managerTestAccount{
+		uid: "dashboard-reader-login", name: "Dashboard Reader", password: hash,
+		role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(),
+	})
 
 	body, err := json.Marshal(map[string]string{
 		"username": "dashboard-reader-login",
@@ -75,6 +103,113 @@ func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), `"role":"`+appauth.ManagerRoleDashboardReader+`"`)
+}
+
+func TestManagerLoginRejectsUnavailableManagerAccounts(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const password = "unavailable-manager-password"
+	hash, err := HashPassword(password)
+	require.NoError(t, err)
+	tests := []struct {
+		name      string
+		role      string
+		status    int
+		robot     int
+		isDestroy int
+	}{
+		{name: "disabled reader", role: appauth.ManagerRoleDashboardReader, status: StatusDisable.Int()},
+		{name: "destroying reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), isDestroy: IsDestroyApplying},
+		{name: "destroyed reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), isDestroy: IsDestroyDone},
+		{name: "robot reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), robot: 1},
+		{name: "disabled admin", role: string(wkhttp.Admin), status: StatusDisable.Int()},
+	}
+
+	for i, tt := range tests {
+		username := fmt.Sprintf("unavailable-manager-%d", i)
+		insertManagerTestAccount(t, ctx, managerTestAccount{
+			uid: username, name: tt.name, shortNo: fmt.Sprintf("unavailable-%d", i), password: hash,
+			role: tt.role, status: tt.status, robot: tt.robot, isDestroy: tt.isDestroy,
+		})
+		body, err := json.Marshal(map[string]string{"username": username, "password": password})
+		require.NoError(t, err)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader(body))
+		route.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, "%s: %s", tt.name, w.Body.String())
+		assert.Contains(t, w.Body.String(), "err.server.user.manager_permission_required")
+	}
+}
+
+func TestLiftBanDisabledManagerRevokesHTTPManagerSessions(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const callerToken = "disable-manager-session-revoke-caller"
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	tests := []struct {
+		name       string
+		role       string
+		status     int
+		wantRevoke bool
+	}{
+		{name: "dashboard reader", role: appauth.ManagerRoleDashboardReader, status: StatusDisable.Int(), wantRevoke: true},
+		{name: "admin", role: string(wkhttp.Admin), status: StatusDisable.Int(), wantRevoke: true},
+		{name: "super admin", role: string(wkhttp.SuperAdmin), status: StatusDisable.Int(), wantRevoke: true},
+		{name: "normal user", status: StatusDisable.Int()},
+		{name: "enabled admin", role: string(wkhttp.Admin), status: StatusEnable.Int()},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid := fmt.Sprintf("disable-manager-session-%d", i)
+			insertManagerTestAccount(t, ctx, managerTestAccount{
+				uid: uid, name: tt.name, shortNo: fmt.Sprintf("disable-manager-%d", i),
+				role: tt.role, status: tt.status,
+			})
+			require.NoError(t, ctx.Cache().Set(RoleCacheKeyPrefix+uid, tt.role))
+			tokens := make(map[config.DeviceFlag]string)
+			for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+				token := fmt.Sprintf("disable-manager-%d-%d", i, flag.Uint8())
+				uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, uid)
+				require.NoError(t, ctx.Cache().Set(uidTokenKey, token))
+				require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+token,
+					uid+"@target@"+tt.role))
+				tokens[flag] = token
+			}
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPut,
+				fmt.Sprintf("/v1/manager/user/liftban/%s/%d", uid, tt.status), nil)
+			req.Header.Set("token", callerToken)
+			route.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			cachedRole, err := ctx.Cache().Get(RoleCacheKeyPrefix + uid)
+			require.NoError(t, err)
+			if tt.wantRevoke {
+				assert.Empty(t, cachedRole)
+			} else {
+				assert.Equal(t, tt.role, cachedRole)
+			}
+			for flag, token := range tokens {
+				uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, uid)
+				uidToken, err := ctx.Cache().Get(uidTokenKey)
+				require.NoError(t, err)
+				payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + token)
+				require.NoError(t, err)
+				if tt.wantRevoke {
+					assert.Empty(t, uidToken, "device reverse mapping must be revoked for flag %d", flag.Uint8())
+					assert.Empty(t, payload, "token payload must be revoked for flag %d", flag.Uint8())
+				} else {
+					assert.Equal(t, token, uidToken)
+					assert.NotEmpty(t, payload)
+				}
+			}
+		})
+	}
 }
 
 func TestDashboardReaderRoleTransition(t *testing.T) {
