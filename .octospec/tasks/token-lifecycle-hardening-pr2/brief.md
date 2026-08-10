@@ -445,8 +445,10 @@ grace 已经过期推断 v1/v2 已清零。
 
 代码使用两个安全默认但仍需上线签字：单 UID cap 必须显式配置且超限时拒绝新登录；主动改密撤销
 包含当前设备在内的全部会话。主动改密/重置与禁用的兼容撤销和 WuKongIM 全设备退出在默认
-`expand` 部署即生效，不等待 floor 推进，因此相应产品签字是合并/部署门禁，不是后续 activation
-门禁。以下环境参数和未接线路径不能由代码自行猜测：
+`expand` 部署即生效，不等待 floor 推进；定时到期注销（`finalizeDestroy`）同样在默认 `expand`
+下撤销残留 bearer 并退出全部 IM 设备——该账号此刻已 `is_destroy=2` 且手机号已匿名化，bearer
+本就不应继续可用。因此相应产品签字是合并/部署门禁，不是后续 activation 门禁。以下环境参数和
+未接线路径不能由代码自行猜测：
 
 - legacy grace 与绝对 `legacy_cutoff_at`：原建议 7 天，需生产 observe 后签字。
 - 两次完整 observe 的最小间隔；工具要求每次 floor 推进时显式给出，硬下界为 `1h`，后续只可
@@ -457,6 +459,12 @@ grace 已经过期推断 v1/v2 已清零。
   到 device flag 还是全部会话。
 - 主动改密是否保留当前设备；本 brief 建议包含当前设备在内全部撤销。
 - 管理员降权/删除仅撤管理会话还是全部会话。
+- 用户主动即时注销（`destroyAccount`）在兼容模式下仍只做 WuKongIM 全设备退出，不撤 HTTP
+  bearer——与定时到期注销（已接入 `finishCommittedUserSecurityMutation`）不对称。该 gap 在
+  merge-base 即存在、非本 PR 引入，且合并当前错误码分流（`ErrUserDestroyFailed` /
+  `ErrUserStoreFailed`）会改变既有客户端可见语义，因此有意留待单独决策：要么接线该 helper 并
+  确认错误码收敛，要么在 `revoke` floor 推进时由 durable intent 覆盖。`Validate` 也始终不查
+  `is_destroy`。
 - OIDC logout 是否继续“当前 HTTP Token + 全部 IdP RT + 全部 IM 设备”，以及 sync worker 的真实
   `invalid_grant` 是否撤销 UID 全部本地会话；本 brief 默认保持/扩大安全语义，不擅自收窄。
 - 生产 Redis 拓扑、proxy/Cluster 命令兼容、迁移 QPS、session pool/`maxclients` 预算，以及 v3
