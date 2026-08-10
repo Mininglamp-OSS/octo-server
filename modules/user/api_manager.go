@@ -294,7 +294,8 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
-	if !auth.IsManagerConsoleRole(userInfo.Role) {
+	if !auth.IsManagerConsoleRole(userInfo.Role) || userInfo.Status != StatusEnable.Int() ||
+		userInfo.Robot != 0 || userInfo.IsDestroy != IsDestroyNo {
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
@@ -1251,6 +1252,11 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	if err := m.revokeManagerSessionsForDisabledAccount(userInfo.UID, userInfo.Role, userStatus); err != nil {
+		m.Error("清除已封禁管理账号token数据错误", zap.Error(err), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
 	if userInfo.Status == userStatus {
 		c.ResponseOK()
 		return
@@ -1284,6 +1290,17 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		return
 	}
 	c.ResponseOK()
+}
+
+// revokeManagerSessionsForDisabledAccount closes the HTTP-session gap left by
+// the IM-only QuitUserDevice path. It runs before the idempotent status return
+// so an operator can retry after a partial token-revocation failure.
+func (m *Manager) revokeManagerSessionsForDisabledAccount(uid, role string, status int) error {
+	if status != int(common.UserDisable) || !auth.IsManagerConsoleRole(role) {
+		return nil
+	}
+	m.roleService.Invalidate(uid)
+	return m.revokeAllDeviceTokens(uid)
 }
 
 // 修改登录密码

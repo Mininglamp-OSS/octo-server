@@ -46,6 +46,8 @@ source: self
 8. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
 9. 这是账号级授权，不是独立管理台 session：RoleResolver 会把当前角色注入该账号后续
    建立的有效 IM 会话，这些 bearer 也能调用 Dashboard 读接口；该取舍在临时方案中明确接受。
+10. 管理台账密登录每次复核账号必须处于启用、未注销且非机器人状态；封禁任一管理台角色
+    时失效角色缓存并撤销 APP/Web/PC HTTP 会话，重复封禁也会重试撤销以修复部分失败。
 
 ## Out of scope
 
@@ -54,10 +56,13 @@ source: self
 - 改造已有 admin/superAdmin 管理接口的角色判断
 - 前端授权管理页面
 - 将 Dashboard 数据收窄到单个 Space；该看板仍是全局运营读面
+- 注销申请/完成等其他账号生命周期入口的集中 HTTP bearer 撤销；本任务禁止这类账号重新
+  登录管理台，但已签发 bearer 的统一吊销留给账号生命周期加固后续处理
 
 ## Acceptance
 
-- [x] `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
+- [x] 启用、未注销且非机器人的 `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
+- [x] 禁用、注销中、已注销或机器人管理角色账号不能通过 `/v1/manager/login`
 - [x] `/me` 仅返回 `dashboard.read=true`，`dashboard.trigger` 和其他能力均为 false
 - [x] 六个 `/v1/manager/dashboard` GET 接口允许 `dashboardReader`
 - [x] `POST /v1/manager/dashboard/etl/run` 拒绝 `dashboardReader`
@@ -67,6 +72,7 @@ source: self
 - [x] 机器人、禁用账号和注销中/已注销账号不能被授予；撤销不受账号状态阻断
 - [x] 授予/撤销（含幂等重试）后清理目标账号角色缓存
 - [x] 实际角色变化及幂等授权后撤销目标账号 APP/Web/PC 现有会话；空撤销不踢用户
+- [x] 封禁 admin/superAdmin/dashboardReader 时撤销 APP/Web/PC HTTP 会话；幂等封禁仍会重试
 - [x] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
 - [x] 聚焦 Go 测试、`go build ./...`、相关包 `go vet` / `golangci-lint`、i18n
       extract/check/lint、错误响应源码守卫与 `git diff --check` 通过
