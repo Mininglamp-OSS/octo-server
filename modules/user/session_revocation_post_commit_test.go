@@ -18,6 +18,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,6 +178,92 @@ func TestDeleteAdminUserRevokesEveryBearerDespiteCanceledRequestContext(t *testi
 		[]string{"admin-app-token", "admin-web-token", "admin-pc-token"},
 		store.revoked,
 		"a committed administrator deletion must revoke every device bearer even if the client disconnected")
+}
+
+// A committed mutation whose revocation intent is already leased by the shared
+// worker has succeeded — the intent is applied within the lease. Reporting that
+// as a failure tells the user their password change failed after it committed,
+// which invites a second change.
+func TestClaimSessionRevocationTreatsForeignLeaseAsDeferredApply(t *testing.T) {
+	_, _, userAPI, _ := newTokenHTTPTestServer(t)
+	uid := "lease-" + util.GenerUUID()[:10]
+	require.NoError(t, userAPI.db.Insert(&Model{
+		UID: uid, Name: "lease user", Username: "ls_" + uid, ShortNo: "ls_" + uid,
+		Password: "before", Status: int(libcommon.UserAvailable),
+	}))
+	intent, err := userAPI.db.updateUserFieldWithSessionRevocation(
+		context.Background(), uid, "password", "after", "password_change")
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+	claimed, err := userAPI.db.claimSessionRevocationByID(context.Background(), intent, "worker-owner", now)
+	require.NoError(t, err)
+	require.True(t, claimed, "the worker takes the lease first")
+
+	// The synchronous request path arrives second. It cannot take the lease, but
+	// the revocation is not lost: the current owner applies it within the lease.
+	contender := *intent
+	claimed, err = userAPI.db.claimSessionRevocationByID(context.Background(), &contender, "sync-owner", now)
+	require.NoError(t, err,
+		"another owner holding a live lease is deferred apply, not a failed revocation")
+	require.False(t, claimed)
+
+	// The lease must still be reclaimable once it expires, or a crashed owner
+	// would strand the intent.
+	claimed, err = userAPI.db.claimSessionRevocationByID(
+		context.Background(), &contender, "sync-later", now.Add(sessionRevocationLease+time.Second))
+	require.NoError(t, err)
+	require.True(t, claimed, "an expired lease must be reclaimable")
+
+	// A genuinely missing intent must still be an error: this must not become a
+	// blanket "any claim failure is fine".
+	missing := *intent
+	missing.ID = intent.ID + 1_000_000
+	_, err = userAPI.db.claimSessionRevocationByID(context.Background(), &missing, "sync-missing", now)
+	require.Error(t, err, "a vanished intent row is a real fault, not deferred apply")
+}
+
+// End-to-end shape of the same failure: the caller gets 200 and the password is
+// changed even though the worker owns the pending intent.
+func TestPasswordChangeSucceedsWhileWorkerOwnsRevocationIntent(t *testing.T) {
+	_, ctx, userAPI, _ := newTokenHTTPTestServer(t)
+	uid := "wlease-" + util.GenerUUID()[:9]
+	require.NoError(t, userAPI.db.Insert(&Model{
+		UID: uid, Name: "worker lease user", Username: "wl_" + uid, ShortNo: "wl_" + uid,
+		Password: "before", Status: int(libcommon.UserAvailable),
+	}))
+
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
+	store := auth.NewRedisSessionStore(
+		client,
+		"post-commit-token:"+util.GenerUUID()+":",
+		"post-commit-uid:"+util.GenerUUID()+":",
+		time.Hour,
+		auth.WithSessionMode(auth.SessionModeRevoke),
+		auth.WithSessionMaxPerUID(4),
+	)
+
+	// Reproduce the race deterministically: commit the intent, let the worker
+	// take its lease, then run the request path's apply step.
+	intent, err := userAPI.db.updateUserFieldWithSessionRevocation(
+		context.Background(), uid, "password", "after", "password_change")
+	require.NoError(t, err)
+	claimed, err := userAPI.db.claimSessionRevocationByID(
+		context.Background(), intent, "worker-owner", time.Now().UTC())
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	require.NoError(t, applyAndMarkSessionRevocation(context.Background(), userAPI.db, store, intent),
+		"a committed change whose intent is being applied by the worker must not report failure")
+
+	changed, err := userAPI.db.QueryByUID(uid)
+	require.NoError(t, err)
+	require.Equal(t, "after", changed.Password)
+	var pending int
+	_, err = ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").
+		Where("uid=? AND status=?", uid, sessionRevocationPending).Load(&pending)
+	require.NoError(t, err)
+	require.Equal(t, 1, pending, "the intent stays pending for its current owner")
 }
 
 // Class guard for the defect above: this is the fourth call site where a

@@ -309,9 +309,29 @@ func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevo
 		intent.LeaseUntil = &leaseUntil
 		return true, nil
 	}
-	var status uint8
-	_, loadErr := d.session.Select("status").From("user_session_revocation_intent").Where("id=?", intent.ID).LoadContext(ctx, &status)
-	if loadErr == nil && status == sessionRevocationApplied {
+	// Losing the claim is not the same as losing the revocation. Distinguish the
+	// two benign outcomes — already applied, or currently owned by someone else
+	// (normally the shared worker, which reserves the intent after the sync
+	// priority window) — from a genuine fault. Reporting a live foreign lease as
+	// an error would tell the caller their committed mutation failed and invite a
+	// second one. The lease comparison runs in SQL so it matches the claim
+	// predicate above exactly and cannot drift on driver time zones.
+	var claimState struct {
+		Status     uint8 `db:"status"`
+		LeaseAlive bool  `db:"lease_alive"`
+	}
+	loadErr := d.session.SelectBySql(
+		"SELECT status, (lease_until IS NOT NULL AND lease_until>?) AS lease_alive "+
+			"FROM user_session_revocation_intent WHERE id=?",
+		now, intent.ID,
+	).LoadOneContext(ctx, &claimState)
+	if loadErr != nil {
+		return false, fmt.Errorf("user: read synchronous revocation claim state: %w", loadErr)
+	}
+	if claimState.Status == sessionRevocationApplied {
+		return false, nil
+	}
+	if claimState.LeaseAlive {
 		return false, nil
 	}
 	return false, errors.New("user: session revocation lease ownership lost")
