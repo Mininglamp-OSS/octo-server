@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
@@ -23,7 +24,7 @@ const maxPageIndex = 1_000_000
 // maxRangeDays 时间范围上限(含两端约 1 年)。
 const maxRangeDays = 366
 
-// Manager 运营分析看板(管理端 superAdmin 跨 space 只读)。
+// Manager 运营分析看板（有 dashboard.read 的管理台账号可跨 Space 只读）。
 type Manager struct {
 	ctx *config.Context
 	log.Log
@@ -50,7 +51,7 @@ func New(ctx *config.Context) *Manager {
 	return m
 }
 
-// Route 配置路由。统一前缀 /v1/manager/dashboard；逐 handler 校验 superAdmin。
+// Route 配置路由。统一前缀 /v1/manager/dashboard；逐 handler 校验读/写权限。
 // SharedUIDRateLimiter 挂在 AuthMiddleware 之后(须先解析出 uid)：这些是跨 Space 聚合的重查询，
 // 防管理端误刷/脚本轮询/token 泄漏把 DB 打满(每登录用户共享桶，见 pkg/wkhttp/ratelimit_helper.go)。
 func (m *Manager) Route(r *wkhttp.WKHttp) {
@@ -68,7 +69,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 
 // overview 模块A 概览(私聊只出活跃数)。
 func (m *Manager) overview(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	start, end, ok := parseDateRange(c)
@@ -87,7 +88,7 @@ func (m *Manager) overview(c *wkhttp.Context) {
 
 // trend 模块C 趋势(day/week，缺桶补 0)。
 func (m *Manager) trend(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	start, end, ok := parseDateRange(c)
@@ -111,7 +112,7 @@ func (m *Manager) trend(c *wkhttp.Context) {
 
 // spaces 表一 Space 列表。
 func (m *Manager) spaces(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	start, end, ok := parseDateRange(c)
@@ -133,7 +134,7 @@ func (m *Manager) spaces(c *wkhttp.Context) {
 
 // spaceChannels 表二 群组列表(仅群组，私聊不进表二)。
 func (m *Manager) spaceChannels(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	spaceID := c.Param("space_id")
@@ -175,7 +176,7 @@ func (m *Manager) spaceChannels(c *wkhttp.Context) {
 
 // channelMembers 表三子表A：会话内成员消息统计汇总。
 func (m *Manager) channelMembers(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	channelID := c.Param("channel_id")
@@ -217,7 +218,7 @@ func (m *Manager) channelMembers(c *wkhttp.Context) {
 
 // globalDirectChats 全局私聊活跃列表(无活跃状态筛选；私聊恒活跃集)。
 func (m *Manager) globalDirectChats(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireDashboardRead(c) {
 		return
 	}
 	start, end, ok := parseDateRange(c)
@@ -272,13 +273,11 @@ func (m *Manager) requireSuperAdmin(c *wkhttp.Context) bool {
 	return true
 }
 
-// requireAdmin 放行 admin∪superAdmin，用于看板只读端点。看板读面不比 admin 已有的
-// 访问更敏感：含私聊元数据的 globalDirectChats 也只是"谁跟谁聊过、几条、何时"，而 admin
-// 经 message 模块的 recordpersonal/record 早已能读任意 (uid,touid) 的私聊正文，元数据
-// 严格更弱；用户/群/空间列表同样早是 admin 读面。故放给 admin 一致；手动触发类写操作
-// （runETL）仍走 requireSuperAdmin。
-func (m *Manager) requireAdmin(c *wkhttp.Context) bool {
-	if err := c.CheckLoginRole(); err != nil {
+// requireDashboardRead 放行 admin∪superAdmin∪dashboardReader，只用于看板只读端点。
+// dashboardReader 是通用 RBAC 前的固定最小权限角色，不能加入 CheckLoginRole，否则会
+// 同时获得其他管理端点。手动 ETL 仍走 requireSuperAdmin。
+func (m *Manager) requireDashboardRead(c *wkhttp.Context) bool {
+	if !appauth.CanReadManagerDashboard(c.GetLoginRole()) {
 		respForbidden(c)
 		return false
 	}

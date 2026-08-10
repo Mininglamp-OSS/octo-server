@@ -1140,6 +1140,11 @@ func TestOpanalyticsDashboardReaderCanOnlyRead(t *testing.T) {
 	rec := opaPost(t, route, "/v1/manager/dashboard/etl/run")
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
 		"dashboardReader must not trigger ETL")
+
+	setPlainUserToken(t, ctx)
+	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
+		"a plain user must not inherit dashboard.read")
 }
 
 func TestETLLockRenewRequiresMatchingToken(t *testing.T) {

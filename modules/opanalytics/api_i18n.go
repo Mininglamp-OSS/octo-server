@@ -7,7 +7,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
-// respForbidden 非超级管理员访问看板 → 403。
+// respForbidden 当前管理台账号无权执行看板操作 → 403。
 func respForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrOpanalyticsForbidden, nil, nil)
 }

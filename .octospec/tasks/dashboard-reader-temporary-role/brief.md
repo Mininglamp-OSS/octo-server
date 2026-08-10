@@ -50,12 +50,18 @@ source: self
 
 ## Acceptance
 
-- [ ] `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
-- [ ] `/me` 仅返回 `dashboard.read=true`，`dashboard.trigger` 和其他能力均为 false
-- [ ] 六个 `/v1/manager/dashboard` GET 接口允许 `dashboardReader`
-- [ ] `POST /v1/manager/dashboard/etl/run` 拒绝 `dashboardReader`
-- [ ] 代表性的其他 manager 接口拒绝 `dashboardReader`
-- [ ] 只有 SuperAdmin 能授予/撤销；不能修改 SuperAdmin；撤销为幂等操作
-- [ ] 授予/撤销后清理目标账号角色缓存
-- [ ] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
-- [ ] 相关 Go 测试、`go test`、`go vet`、`git diff --check` 通过
+- [x] `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
+- [x] `/me` 仅返回 `dashboard.read=true`，`dashboard.trigger` 和其他能力均为 false
+- [x] 六个 `/v1/manager/dashboard` GET 接口允许 `dashboardReader`
+- [x] `POST /v1/manager/dashboard/etl/run` 拒绝 `dashboardReader`
+- [x] 代表性的其他 manager 接口拒绝 `dashboardReader`
+- [x] 只有 SuperAdmin 能授予/撤销；不能修改 SuperAdmin；撤销为幂等操作
+- [x] 授予/撤销（含幂等重试）后清理目标账号角色缓存
+- [x] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
+- [x] 聚焦 Go 测试、`go build ./...`、相关包 `go vet` / `golangci-lint`、i18n
+      extract/check/lint、错误响应源码守卫与 `git diff --check` 通过
+
+全量 `go test ./modules/user/... ./modules/opanalytics/...` 已尝试，但共享测试库包含当前
+checkout 未知的 migration 记录，`testutil.NewTestServer` 在用例执行前拒绝建 migration plan；
+未修改共享测试库。新增测试改用模块级 route-only harness，仍以真实 MySQL/Redis 验证角色
+写入、限流响应和缓存失效。

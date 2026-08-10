@@ -315,7 +315,7 @@ var (
 	// manager-specific guards that had no existing equivalent.
 
 	// ErrUserManagerPermissionRequired fires at /v1/manager/login after the
-	// password check succeeds but the account carries no admin/superAdmin role.
+	// password check succeeds but the account carries no accepted manager-console role.
 	// Distinct from err.shared.auth.forbidden (a route-level role guard) so the
 	// login page can show a login-specific hint.
 	ErrUserManagerPermissionRequired = register(codes.Code{

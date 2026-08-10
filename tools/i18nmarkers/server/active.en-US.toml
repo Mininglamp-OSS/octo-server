@@ -691,7 +691,7 @@ other = "Analytics ETL is already running."
 other = "Failed to trigger analytics ETL."
 
 ["err.server.opanalytics.forbidden"]
-other = "Only a super admin can access the analytics dashboard."
+other = "You do not have permission to perform this analytics operation."
 
 ["err.server.opanalytics.not_found"]
 other = "The space does not exist."
