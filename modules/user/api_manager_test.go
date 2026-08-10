@@ -755,10 +755,8 @@ func TestManager_DeleteAdminUser_RevokesSessionsAndRoleCache(t *testing.T) {
 }
 
 func TestDeleteAdminUserInvalidatesRoleAfterCommittedRevocationFailure(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
-	uid := "admin-revoke-failure-" + util.GenerUUID()
-	m := NewManager(ctx)
+	_, ctx, _, m := newTokenHTTPTestServer(t)
+	uid := "arf-" + util.GenerUUID()
 	m.sessionStore = &flakyRevokeAllSessionStore{}
 	require.NoError(t, m.userDB.Insert(&Model{
 		UID: uid, Name: "admin", Role: string(wkhttp.Admin), Username: "admin_" + uid[len(uid)-12:],

@@ -266,6 +266,61 @@ func TestPasswordAndDisablePathsUseCommittedSecurityMutationHelper(t *testing.T)
 	}
 }
 
+func TestPasswordMutationRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
+	_, ctx, userAPI, _ := newTokenHTTPTestServer(t)
+	uid := "pwd-" + util.GenerUUID()
+	require.NoError(t, userAPI.db.Insert(&Model{
+		UID: uid, Name: "password user", ShortNo: uid, Password: "before", Status: int(libcommon.UserAvailable),
+	}))
+
+	tokens := map[config.DeviceFlag]string{
+		config.APP: "pwd-app-" + util.GenerUUID(),
+		config.Web: "pwd-web-" + util.GenerUUID(),
+		config.PC:  "pwd-pc-" + util.GenerUUID(),
+	}
+	for flag, token := range tokens {
+		payload, err := auth.Encode(auth.TokenInfo{UID: uid, DeviceFlag: int(flag)})
+		require.NoError(t, err)
+		require.NoError(t, userAPI.sessionStore.IssueNew(context.Background(), token, payload, uid, int(flag)))
+	}
+
+	var quitFlagsMu sync.Mutex
+	var quitFlags []int
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/user/device_quit", r.URL.Path)
+		var request struct {
+			DeviceFlag int `json:"device_flag"`
+		}
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, util.ReadJsonByByte(body, &request))
+		quitFlagsMu.Lock()
+		quitFlags = append(quitFlags, request.DeviceFlag)
+		quitFlagsMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(im.Close)
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+	require.NoError(t, updatePasswordAndRevokeSessions(
+		context.Background(), userAPI.db, userAPI.sessionStore, ctx.QuitUserDevice, uid, "after", "password_reset",
+	))
+	updated, err := userAPI.db.QueryByUID(uid)
+	require.NoError(t, err)
+	require.Equal(t, "after", updated.Password)
+	for flag, token := range tokens {
+		indexed, err := userAPI.sessionStore.DeviceToken(context.Background(), uid, int(flag))
+		require.NoError(t, err)
+		require.Empty(t, indexed)
+		record, err := auth.SessionStoreForContext(ctx).ReadToken(context.Background(), ctx.GetConfig().Cache.TokenCachePrefix+token)
+		require.NoError(t, err)
+		require.Equal(t, time.Duration(-2), record.TTL)
+	}
+	quitFlagsMu.Lock()
+	require.Equal(t, []int{-1}, quitFlags)
+	quitFlagsMu.Unlock()
+}
+
 func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {
 	return s.err
 }
