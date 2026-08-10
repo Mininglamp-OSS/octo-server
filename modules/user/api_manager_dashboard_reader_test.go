@@ -3,6 +3,7 @@ package user
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -178,6 +179,55 @@ func TestManagerDashboardReaderGrantAndRevoke(t *testing.T) {
 	role, err = NewDB(ctx).QueryRoleByUID(targetUID)
 	require.NoError(t, err)
 	assert.Equal(t, appauth.ManagerRoleDashboardReader, role)
+}
+
+func TestManagerDashboardReaderRoleCacheInvalidationFailureCanRetry(t *testing.T) {
+	route, ctx, manager := newManagerRouteOnly(t)
+
+	const (
+		callerToken = "dashboard-reader-cache-failure-caller"
+		targetUID   = "dashboard-reader-cache-failure-target"
+	)
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: targetUID, Username: targetUID, Name: "Dashboard Reader Cache Failure",
+		ShortNo: "reader-cache-failure", Status: StatusEnable.Int(),
+	}))
+
+	roleCache := newFakeLangCache()
+	roleCache.store[RoleCacheKeyPrefix+targetUID] = string(wkhttp.Admin)
+	roleCache.delErr = errors.New("redis delete failed")
+	manager.roleService = NewRoleService(NewDB(ctx), roleCache)
+
+	doGrant := func() *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut,
+			"/v1/manager/user/"+targetUID+"/dashboard-read", nil)
+		req.Header.Set("token", callerToken)
+		route.ServeHTTP(w, req)
+		return w
+	}
+
+	failed := doGrant()
+	require.Equal(t, http.StatusBadRequest, failed.Code, failed.Body.String())
+	assert.Contains(t, failed.Body.String(), "err.server.user.role_cache_failed")
+	role, err := NewDB(ctx).QueryRoleByUID(targetUID)
+	require.NoError(t, err)
+	assert.Equal(t, appauth.ManagerRoleDashboardReader, role,
+		"the retry contract must tolerate the DB mutation completing before cache invalidation")
+	assert.Equal(t, string(wkhttp.Admin), roleCache.store[RoleCacheKeyPrefix+targetUID],
+		"a failed delete must leave the stale cache visible")
+
+	roleCache.delErr = nil
+	retried := doGrant()
+	require.Equal(t, http.StatusOK, retried.Code, retried.Body.String())
+	assert.NotContains(t, roleCache.store, RoleCacheKeyPrefix+targetUID,
+		"an idempotent retry must invalidate the stale role cache")
+	assert.Equal(t, []string{RoleCacheKeyPrefix + targetUID, RoleCacheKeyPrefix + targetUID},
+		roleCache.deletes)
 }
 
 func TestDeleteAdminRejectsDashboardReaderWithoutRevokingSessions(t *testing.T) {
