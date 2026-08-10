@@ -79,8 +79,10 @@ source: self
   两次完整 aggregate observe；首次推进 floor 时还会持久化批准的最小观测间隔，后续推进必须
   使用至少 `1h` 且不低于已持久化值的间隔，两份证据必须达到本次批准的新值。旧版 control
   若没有该字段仍可读取，并在下一次单调推进时由 CAS 自动补齐，无需删除或手改 Redis key。
-  缺失、损坏、含读取歧义、间隔不足或计数不达标均 fail closed。上线命令、required-floor
-  配对、Redis/连接预算和回滚边界见 runbook。
+  observation 还带随机 scan ID 和由 Token/UIDToken prefix、`TokenExpire` 计算的作用域指纹；空
+  扫描、重复 scan ID、作用域不匹配、分类计数不守恒、缺失 v3 canary、损坏、含读取歧义、间隔
+  不足或计数不达标均 fail closed。旧版 observation evidence 因缺失新元数据自动失效，必须重扫。
+  上线命令、required-floor 配对、Redis/连接预算和回滚边界见 runbook。
 - 已把主动改密/重置、账号禁用/最终注销、管理员删除与 monotonic revocation intent 放入同一
   MySQL 事务；同步 Redis 应用失败后由带 owner lease 的多副本 worker 幂等重试。当前退出先撤
   HTTP bearer，再执行既有 IM 退出。新 intent 的 `next_attempt_at` 为同步 by-ID claim 保留 5 秒
@@ -283,7 +285,11 @@ legacy bearer 重新有效。
 - 默认 dry-run；apply 必须显式提供 campaign ID、不可变的绝对 `legacy_cutoff_at`、批准的处理策略、
   batch size 和 QPS。续跑时 campaign 参数不一致必须拒绝。
 - 使用带 owner token 和 lease 的单执行者锁；续约失败立即停止新批次，release compare-delete。
-  checkpoint 只保存 cursor/campaign/计数，不保存 Token、完整 key、payload 或 UID。
+  checkpoint 只保存 cursor/campaign/计数和 Redis `run_id` 的 SHA-256 实例指纹，不保存 Token、完整
+  key、payload、UID 或原始 `run_id`。apply 在每个 SCAN page 前后核对实例指纹；主节点重启、
+  failover 或恢复旧 checkpoint 时指纹变化必须在重新确认 lease 后从 cursor 0 幂等重扫，不能把
+  另一 Redis 进程的 cursor 继续解释。completion/checkpoint 必须同属当前 Redis 实例，否则
+  `bounded` 拒绝推进。
 - SCAN 不是快照。一次读失败、锁丢失、取消或游标未归零都必须输出 `complete=false`；不能把部分
   扫描的零计数当作迁移完成。key 在 SCAN 后自然过期计入 missing，不应让整次扫描伪装成功或
   无限失败。
@@ -432,7 +438,8 @@ grace 已经过期推断 v1/v2 已清零。
   v1/v2/v3/concurrent-change/lock-loss。cutoff 在入口已过期或 apply 运行中到期时都必须额外
   显式确认；否则入口校验或单 key Lua 会在删除前拒绝，本轮不能生成 completion evidence。
 - observe/apply 遇到读取错误、取消或未完成游标会输出 `complete=false`；只有两次完整扫描的
-  `persistent=0, over_max=0, v1/v2=0` 且跨过本次批准的间隔才允许 enforce。批准间隔不得低于
+  `total>0, persistent=0, over_max=0, v1/v2=0, v3>0` 且跨过本次批准的间隔才允许 enforce。
+  scan ID 必须不同、作用域指纹必须匹配当前 store、分类计数必须与 total 守恒；批准间隔不得低于
   `1h`，并且只能相对 rollout control 中已持久化的值增大、不能降低。
 - enforce 后 v1/v2、历史报告 Token、deny marker 命中的 legacy Token 全部失败；新 v1/v2 或
   permanent 异常触发告警。

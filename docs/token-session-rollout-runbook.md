@@ -50,9 +50,12 @@ control key，也不能仅靠环境变量声明 floor。
    compare-delete。临时 key 必须有短 TTL，禁止对共享实例执行 `SCRIPT FLUSH`。
 3. 先在隔离前缀验证 `SCAN` cursor，再以获批的低 QPS 运行生产 observe。proxy 若不支持完整
    cursor 语义，不得开始 migration。
-4. 通过 `CONFIG GET maxmemory-policy` 或云厂商控制面确认 `noeviction`。若 proxy 禁止 `CONFIG`，
+4. 验证 migration 使用的账号可执行 `INFO server` 并返回稳定的 `run_id`；在受控主从切换中
+   `run_id` 必须变化。工具只保存其 SHA-256 指纹。若 proxy 禁止、伪造固定值或无法把命令路由到
+   实际执行 SCAN 的 Redis 实例，不得执行 apply，也不得推进 `bounded`。
+5. 通过 `CONFIG GET maxmemory-policy` 或云厂商控制面确认 `noeviction`。若 proxy 禁止 `CONFIG`，
    由 Redis 平台负责人提供可审计配置证据，不能把“命令被拒绝”当作通过。
-5. 验证主从切换后脚本缓存、lease owner 比较和无 TTL key 均保持预期；startup probe 只证明
+6. 验证主从切换后脚本缓存、lease owner 比较和无 TTL key 均保持预期；startup probe 只证明
    启动时刻，不证明 failover 路径。
 
 ### 3.2 连接数与性能
@@ -205,7 +208,11 @@ cleanup，后续清理必须走单独审核的聚合盘点和受控工具。
 ```
 
 若取消、锁丢失或失败，保留原 campaign/cutoff/policy，按 checkpoint 续跑；可降低 batch/QPS。
-只有输出 `complete=true` 才会生成 migration completion evidence。
+checkpoint 绑定 Redis `run_id` 的 SHA-256 指纹；恢复时或运行中检测到实例变化会重新确认 lease、
+把 cursor 归零并幂等重扫，累计统计可能包含重扫记录。只有稳定扫描到 cursor 0 且输出
+`complete=true` 才会生成同实例的 migration completion evidence；Redis 随后再次重启/failover，
+在推进 `bounded` 前必须用同一 campaign/cutoff/policy 重新完成 apply。旧 checkpoint/evidence
+缺失实例指纹时同样从 0 重扫，不得手工补字段。
 
 如果 apply 启动时 cutoff 尚未过期、但在限速扫描中到期，未带确认的任务会在第一条需要立即删除
 的记录上由 Lua 在 `DEL` 前停止，输出 `complete=false` 和明确错误；此前已经执行的 TTL 缩短不会
@@ -246,8 +253,15 @@ apply 完成后执行两次独立完整 observe。两次应跨过一个经批准
 /tmp/token-session-observe --config "$TOKEN_CONFIG" --batch-size 200 --qps 50 --record-rollout-evidence
 ```
 
-两次均须 `complete=true`、`read_errors=invalid_ttl=decode_invalid=0`、`persistent=0`、
-`over_max=0`。工具会在同一安全 key 中原子保留最近两份聚合证据，不保存 credential/UID。
+两次均须 `complete=true`、`total>0`、`read_errors=invalid_ttl=decode_invalid=0`、`persistent=0`、
+`over_max=0`，并核对每次输出的 `scan_id` 不同、`scope_fingerprint` 相同。指纹由
+Token/UIDToken prefix 与 `TokenExpire` 哈希生成，不泄露明文 prefix；同一次扫描结果重复提交会
+被拒绝。工具会在同一安全 key 中原子保留最近两份聚合证据，不保存 credential/UID。
+
+空 keyspace 不可作为“已迁移”的放行证据。若目标环境确实没有在线 Token，应在当前正常登录链路
+创建一个受控测试账号的 v3 canary，确认其 TTL/generation 正常后再执行两次 observe；禁止直接向
+Redis 伪造 token 或 evidence。升级到包含本门禁的工具后，旧 observation evidence 因缺少 scan ID/
+scope fingerprint 自动失效，必须重新扫描两次。
 
 先部署 `MODE=bounded`、`REQUIRED_FLOOR=revoke` 并灰度确认，再推进：
 
@@ -262,7 +276,7 @@ apply 完成后执行两次独立完整 observe。两次应跨过一个经批准
 ### Phase E：`enforce`
 
 等待或继续获批 campaign，直到在 `bounded` floor 下两次新的完整 observe 均满足 Phase D 条件，
-并额外满足 `v1=0`、`v2=0`。旧的 revoke-floor 证据不能复用。
+并额外满足 `v1=0`、`v2=0`、`v3>0`。旧的 revoke-floor 证据不能复用。
 
 以 `MODE=enforce`、`REQUIRED_FLOOR=bounded` 做小流量灰度，验证历史报告 Token、正常登录、退出、
 高风险撤销和 Redis 故障场景。灰度可回到 `bounded`，因为 enforce floor 尚未建立。

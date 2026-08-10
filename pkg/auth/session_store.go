@@ -64,18 +64,20 @@ var (
 // SessionObservation contains low-cardinality migration facts only. It never
 // includes a token, Redis key, UID, or payload.
 type SessionObservation struct {
-	Complete      bool  `json:"complete"`
-	Total         int64 `json:"total"`
-	Missing       int64 `json:"missing"`
-	Persistent    int64 `json:"persistent"`
-	Finite        int64 `json:"finite"`
-	OverMax       int64 `json:"over_max"`
-	InvalidTTL    int64 `json:"invalid_ttl"`
-	DecodeInvalid int64 `json:"decode_invalid"`
-	ReadErrors    int64 `json:"read_errors"`
-	V1            int64 `json:"v1"`
-	V2            int64 `json:"v2"`
-	V3            int64 `json:"v3"`
+	ScanID           string `json:"scan_id"`
+	ScopeFingerprint string `json:"scope_fingerprint"`
+	Complete         bool   `json:"complete"`
+	Total            int64  `json:"total"`
+	Missing          int64  `json:"missing"`
+	Persistent       int64  `json:"persistent"`
+	Finite           int64  `json:"finite"`
+	OverMax          int64  `json:"over_max"`
+	InvalidTTL       int64  `json:"invalid_ttl"`
+	DecodeInvalid    int64  `json:"decode_invalid"`
+	ReadErrors       int64  `json:"read_errors"`
+	V1               int64  `json:"v1"`
+	V2               int64  `json:"v2"`
+	V3               int64  `json:"v3"`
 }
 
 // RedisSessionStore is the sole v2 credential writer in Release A. It owns
@@ -89,6 +91,9 @@ type RedisSessionStore struct {
 	mode           SessionMode
 	maxPerUID      int
 	now            func() time.Time
+	// redisInstanceIDFn resolves the opaque process identity used to keep a
+	// resumable SCAN cursor bound to one Redis process.
+	redisInstanceIDFn func() (string, error)
 }
 
 type SessionStoreOption func(*RedisSessionStore)
@@ -500,6 +505,12 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 	if interval < 0 {
 		return SessionObservation{}, fmt.Errorf("auth: observe interval must not be negative")
 	}
+	scanID, err := newSessionGeneration()
+	if err != nil {
+		return SessionObservation{}, fmt.Errorf("auth: create observation scan id: %w", err)
+	}
+	stats.ScanID = scanID
+	stats.ScopeFingerprint = s.rolloutObservationScopeFingerprint()
 	var throttle <-chan time.Time
 	var ticker *time.Ticker
 	if interval > 0 {

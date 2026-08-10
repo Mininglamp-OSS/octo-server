@@ -293,8 +293,19 @@ func TestLegacyMigrationRestartsSavedCursorAfterRedisInstanceChange(t *testing.T
 	for i := 0; i < 128; i++ {
 		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("redis-restart-%03d", i)), "v2:legacy", 0).Err())
 	}
-	skippedKeys, savedCursor, err := client.Scan(0, store.tokenPrefix+"*", 1).Result()
-	require.NoError(t, err)
+	var skippedKeys []string
+	var savedCursor uint64
+	for cursor := uint64(0); ; {
+		keys, next, err := client.Scan(cursor, store.tokenPrefix+"*", 1).Result()
+		require.NoError(t, err)
+		if len(keys) > 0 && next != 0 {
+			skippedKeys = keys
+			savedCursor = next
+			break
+		}
+		require.NotZero(t, next, "fixture requires a non-empty page before SCAN completion")
+		cursor = next
+	}
 	require.NotEmpty(t, skippedKeys)
 	require.NotZero(t, savedCursor, "fixture requires a resumable non-zero SCAN cursor")
 
@@ -331,6 +342,44 @@ func TestLegacyMigrationRestartsSavedCursorAfterRedisInstanceChange(t *testing.T
 	loaded, err := store.loadMigrationCheckpoint(campaignID)
 	require.NoError(t, err)
 	require.Equal(t, "new-redis-instance", loaded.RedisInstanceID)
+}
+
+func TestLegacyMigrationRestartsWhenRedisInstanceChangesDuringScan(t *testing.T) {
+	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
+	ctx := context.Background()
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutObservationGapForTest))
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutObservationGapForTest))
+	for i := 0; i < 128; i++ {
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("in-flight-restart-%03d", i)), "v2:legacy", 0).Err())
+	}
+
+	var identityReads atomic.Int64
+	store.redisInstanceIDFn = func() (string, error) {
+		if identityReads.Add(1) <= 2 {
+			return "redis-before-failover", nil
+		}
+		return "redis-after-failover", nil
+	}
+	result, err := store.MigrateLegacySessions(ctx, LegacyMigrationOptions{
+		CampaignID:   "redis-change-during-scan",
+		CutoffAt:     time.Now().UTC().Add(time.Hour),
+		FinitePolicy: LegacyFinitePolicyCap,
+		BatchSize:    100,
+		Apply:        true,
+		Lease:        5 * time.Second,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Complete)
+	require.Greater(t, identityReads.Load(), int64(3))
+	for i := 0; i < 128; i++ {
+		require.Positive(t, mustPTTL(t, client, store.tokenKey(fmt.Sprintf("in-flight-restart-%03d", i))))
+	}
+	checkpoint, err := store.loadMigrationCheckpoint("redis-change-during-scan")
+	require.NoError(t, err)
+	require.Equal(t, "redis-after-failover", checkpoint.RedisInstanceID)
+	completion, err := store.loadMigrationCompletionEvidence()
+	require.NoError(t, err)
+	require.Equal(t, checkpoint.RedisInstanceID, completion.RedisInstanceID)
 }
 
 func TestLegacyMigrationCampaignCanRetuneRuntimeRateAndStartAnotherCampaign(t *testing.T) {
@@ -539,25 +588,44 @@ func TestRolloutFloorAdvancesOnlyWithRecordedMigrationAndSpacedObservationEviden
 	require.NoError(t, err)
 	require.True(t, result.Complete)
 
-	boundedObservation := SessionObservation{Complete: true, Finite: 2, V1: 1, V2: 1}
+	boundedObservation := SessionObservation{
+		ScanID:           "bounded-observation-1",
+		ScopeFingerprint: store.rolloutObservationScopeFingerprint(),
+		Complete:         true,
+		Total:            2,
+		Finite:           2,
+		V1:               1,
+		V2:               1,
+	}
 	require.NoError(t, store.RecordRolloutObservation(ctx, boundedObservation))
 	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeBounded, increasedGap), "two complete")
 	now = now.Add(increasedGap - time.Millisecond)
+	boundedObservation.ScanID = "bounded-observation-2"
 	require.NoError(t, store.RecordRolloutObservation(ctx, boundedObservation))
 	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeBounded, increasedGap), "minimum gap")
 	now = now.Add(increasedGap)
+	boundedObservation.ScanID = "bounded-observation-3"
 	require.NoError(t, store.RecordRolloutObservation(ctx, boundedObservation))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeBounded, increasedGap))
 
 	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeEnforce, increasedGap), "two complete")
-	enforceObservation := SessionObservation{Complete: true, Finite: 2, V3: 2}
+	enforceObservation := SessionObservation{
+		ScanID:           "enforce-observation-1",
+		ScopeFingerprint: store.rolloutObservationScopeFingerprint(),
+		Complete:         true,
+		Total:            2,
+		Finite:           2,
+		V3:               2,
+	}
 	now = now.Add(time.Millisecond)
 	require.NoError(t, store.RecordRolloutObservation(ctx, enforceObservation))
 	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeEnforce, increasedGap), "two complete")
 	now = now.Add(increasedGap - time.Millisecond)
+	enforceObservation.ScanID = "enforce-observation-2"
 	require.NoError(t, store.RecordRolloutObservation(ctx, enforceObservation))
 	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeEnforce, increasedGap), "minimum gap")
 	now = now.Add(increasedGap)
+	enforceObservation.ScanID = "enforce-observation-3"
 	require.NoError(t, store.RecordRolloutObservation(ctx, enforceObservation))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeEnforce, increasedGap))
 }

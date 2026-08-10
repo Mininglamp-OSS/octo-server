@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,9 +126,10 @@ type legacyMigrationCampaign struct {
 }
 
 type legacyMigrationCheckpoint struct {
-	CampaignID string                `json:"campaign_id"`
-	Cursor     uint64                `json:"cursor"`
-	Result     LegacyMigrationResult `json:"result"`
+	CampaignID      string                `json:"campaign_id"`
+	RedisInstanceID string                `json:"redis_instance_id"`
+	Cursor          uint64                `json:"cursor"`
+	Result          LegacyMigrationResult `json:"result"`
 }
 
 func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options LegacyMigrationOptions) (result LegacyMigrationResult, err error) {
@@ -147,6 +149,7 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 	}
 
 	owner := ""
+	redisInstanceID := ""
 	var lockErrors <-chan error
 	if options.Apply {
 		if err := s.ensureMigrationCampaign(campaign); err != nil {
@@ -169,6 +172,10 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
 		defer stopKeepalive()
 		lockErrors = s.keepMigrationLockAlive(keepaliveCtx, owner, options.Lease)
+		redisInstanceID, err = s.currentRedisInstanceID()
+		if err != nil {
+			return result, fmt.Errorf("auth: identify migration Redis instance: %w", err)
+		}
 		checkpoint, loadErr := s.loadMigrationCheckpoint(campaign.CampaignID)
 		if loadErr != nil {
 			return result, loadErr
@@ -177,6 +184,9 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			result = checkpoint.Result
 			result.Complete = false
 			result.LockLost = false
+			if checkpoint.RedisInstanceID != redisInstanceID {
+				result.LastCursor = 0
+			}
 		}
 	}
 
@@ -200,6 +210,19 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
+			}
+			currentRedisInstanceID, err := s.currentRedisInstanceID()
+			if err != nil {
+				return result, fmt.Errorf("auth: identify migration Redis instance before scan: %w", err)
+			}
+			if currentRedisInstanceID != redisInstanceID {
+				redisInstanceID = currentRedisInstanceID
+				cursor = 0
+				result.LastCursor = 0
+				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
+				}
 			}
 		}
 		keys, next, err := s.client.Scan(cursor, s.tokenPrefix+"*", options.BatchSize).Result()
@@ -233,21 +256,56 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		cursor = next
 		result.LastCursor = cursor
 		if options.Apply {
+			currentRedisInstanceID, err := s.currentRedisInstanceID()
+			if err != nil {
+				return result, fmt.Errorf("auth: identify migration Redis instance after scan: %w", err)
+			}
+			if currentRedisInstanceID != redisInstanceID {
+				redisInstanceID = currentRedisInstanceID
+				cursor = 0
+				result.LastCursor = 0
+				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
+				}
+				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
+					return result, err
+				}
+				continue
+			}
 			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
 			}
-			if err := s.saveMigrationCheckpoint(campaign.CampaignID, cursor, result); err != nil {
+			if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, cursor, result); err != nil {
 				return result, err
 			}
 		}
 		if cursor == 0 {
+			if options.Apply {
+				currentRedisInstanceID, err := s.currentRedisInstanceID()
+				if err != nil {
+					return result, fmt.Errorf("auth: identify migration Redis instance before completion: %w", err)
+				}
+				if currentRedisInstanceID != redisInstanceID {
+					redisInstanceID = currentRedisInstanceID
+					result.LastCursor = 0
+					if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+						result.LockLost = errors.Is(err, ErrMigrationLockLost)
+						return result, err
+					}
+					if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
+						return result, err
+					}
+					continue
+				}
+			}
 			result.Complete = true
 			if options.Apply {
-				if err := s.saveMigrationCheckpoint(campaign.CampaignID, 0, result); err != nil {
+				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
 					return result, err
 				}
-				if err := s.recordMigrationCompletion(campaign.CampaignID, result); err != nil {
+				if err := s.recordMigrationCompletion(campaign.CampaignID, redisInstanceID, result); err != nil {
 					return result, err
 				}
 			}
@@ -420,11 +478,19 @@ func (s *RedisSessionStore) loadMigrationCheckpoint(campaignID string) (*legacyM
 	if checkpoint.CampaignID != campaignID {
 		return nil, errors.New("auth: migration checkpoint belongs to another campaign")
 	}
+	if checkpoint.Result.CampaignID != campaignID || checkpoint.Cursor != checkpoint.Result.LastCursor {
+		return nil, errors.New("auth: migration checkpoint is internally inconsistent")
+	}
 	return &checkpoint, nil
 }
 
-func (s *RedisSessionStore) saveMigrationCheckpoint(campaignID string, cursor uint64, result LegacyMigrationResult) error {
-	encoded, err := json.Marshal(legacyMigrationCheckpoint{CampaignID: campaignID, Cursor: cursor, Result: result})
+func (s *RedisSessionStore) saveMigrationCheckpoint(campaignID, redisInstanceID string, cursor uint64, result LegacyMigrationResult) error {
+	encoded, err := json.Marshal(legacyMigrationCheckpoint{
+		CampaignID:      campaignID,
+		RedisInstanceID: redisInstanceID,
+		Cursor:          cursor,
+		Result:          result,
+	})
 	if err != nil {
 		return err
 	}
@@ -432,6 +498,36 @@ func (s *RedisSessionStore) saveMigrationCheckpoint(campaignID string, cursor ui
 		return fmt.Errorf("auth: save migration checkpoint: %w", err)
 	}
 	return nil
+}
+
+func (s *RedisSessionStore) currentRedisInstanceID() (string, error) {
+	if s.redisInstanceIDFn != nil {
+		instanceID, err := s.redisInstanceIDFn()
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(instanceID) == "" {
+			return "", errors.New("Redis instance identity must not be empty")
+		}
+		return instanceID, nil
+	}
+	info, err := s.client.Info("server").Result()
+	if err != nil {
+		return "", fmt.Errorf("read Redis INFO server: %w", err)
+	}
+	var runID string
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "run_id:") {
+			runID = strings.TrimSpace(strings.TrimPrefix(line, "run_id:"))
+			break
+		}
+	}
+	if runID == "" {
+		return "", errors.New("Redis INFO server did not return run_id")
+	}
+	sum := sha256.Sum256([]byte("token-session-migration/v1:" + runID))
+	return fmt.Sprintf("%x", sum[:]), nil
 }
 
 func (s *RedisSessionStore) renewMigrationLock(owner string, lease time.Duration) (bool, error) {
