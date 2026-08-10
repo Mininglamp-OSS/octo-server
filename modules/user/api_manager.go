@@ -421,7 +421,12 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 	// 撤销该管理员在所有设备端（APP/Web/PC）的登录态，而不只是 Web。尽力删除每个端
 	// （不在首个错误就中断），最大化吊销面；任一失败仍向调用方报错以便排查。
 	if !sessionRevocationActive(m.sessionStore) {
-		if err := m.revokeAllDeviceTokens(c.Request.Context(), user.UID); err != nil {
+		// user 行已被硬删除，且兼容模式下没有持久化的 revocation intent 兜底：
+		// 这是唯一一次撤销机会。必须脱离请求 context，否则客户端断开即永久跳过，
+		// 运维和 runtime 都没有收敛路径。
+		securityCtx, cancel := postCommitSecurityContext(c.Request.Context())
+		defer cancel()
+		if err := m.revokeAllDeviceTokens(securityCtx, user.UID); err != nil {
 			m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
 			respondUserError(c, errcode.ErrUserTokenCacheFailed)
 			return
