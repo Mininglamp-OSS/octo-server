@@ -3,6 +3,7 @@ package user
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -158,6 +159,68 @@ func TestManagerDashboardReaderGrantAndRevoke(t *testing.T) {
 	role, err = NewDB(ctx).QueryRoleByUID(targetUID)
 	require.NoError(t, err)
 	assert.Equal(t, appauth.ManagerRoleDashboardReader, role)
+}
+
+func TestManagerDashboardReaderRoleChangeRevokesExistingSessions(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	const (
+		callerToken = "dashboard-reader-session-revoke-caller"
+		targetUID   = "dashboard-reader-session-revoke-target"
+	)
+	cacheCfg := ctx.GetConfig().Cache
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID:      targetUID,
+		Username: targetUID,
+		Name:     "Dashboard Reader Session Revoke Target",
+		Role:     string(wkhttp.Admin),
+	}))
+
+	seedTargetSessions := func(stage string) map[config.DeviceFlag]string {
+		t.Helper()
+		tokens := make(map[config.DeviceFlag]string)
+		for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+			token := fmt.Sprintf("%s-%d", stage, flag.Uint8())
+			uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, targetUID)
+			require.NoError(t, ctx.Cache().Set(uidTokenKey, token))
+			require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+token,
+				targetUID+"@target@"+string(wkhttp.Admin)))
+			tokens[flag] = token
+		}
+		return tokens
+	}
+	assertSessionsRevoked := func(tokens map[config.DeviceFlag]string) {
+		t.Helper()
+		for flag, token := range tokens {
+			uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, targetUID)
+			uidToken, err := ctx.Cache().Get(uidTokenKey)
+			require.NoError(t, err)
+			assert.Empty(t, uidToken, "device reverse mapping must be revoked for flag %d", flag.Uint8())
+			payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + token)
+			require.NoError(t, err)
+			assert.Empty(t, payload, "token payload must be revoked for flag %d", flag.Uint8())
+		}
+	}
+	request := func(method string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, "/v1/manager/user/"+targetUID+"/dashboard-read", nil)
+		req.Header.Set("token", callerToken)
+		route.ServeHTTP(w, req)
+		return w
+	}
+
+	adminSessions := seedTargetSessions("before-grant")
+	granted := request(http.MethodPut)
+	require.Equal(t, http.StatusOK, granted.Code, granted.Body.String())
+	assertSessionsRevoked(adminSessions)
+
+	readerSessions := seedTargetSessions("before-revoke")
+	revoked := request(http.MethodDelete)
+	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
+	assertSessionsRevoked(readerSessions)
 }
 
 func TestManagerDashboardReaderGrantRequiresSuperAdminAndProtectsSuperAdmin(t *testing.T) {
