@@ -21,7 +21,8 @@ import (
 //   - 每批之间 sleep 限速，避免长事务和写放大打爆主库；
 //   - 单次调用有上界（批数 / 时间），由调用方拿着返回的游标反复调用推进，
 //     不做长跑请求；
-//   - 只回填 phone<>'' AND phone_hash='' 的行，天然幂等，可以随时中断续跑；
+//   - 只回填 phone<>'' 且 phone_hash 不是当前版本的行，既覆盖空列也能
+//     修复早期分支/旧密钥版本，并保持幂等；
 //   - 逐行 UPDATE 而不是批量 CASE WHEN：每行密文的 nonce 不同，且单行更新
 //     便于失败隔离（一行坏数据不拖垮整批）。
 
@@ -34,16 +35,19 @@ const (
 	maxBackfillBatchesPerCall = 50
 )
 
-// phoneShadowBackfillCAS 回填 UPDATE 的 CAS 条件（占位符顺序：id, zone, phone, is_destroy）。
+// phoneShadowBackfillCAS 回填 UPDATE 的 CAS 条件（占位符顺序：
+// id, 读取时的 phone_hash, zone, phone, is_destroy）。
 //
 // 提成常量是为了让测试能断言同一份谓词，避免"测试里手抄一份 WHERE"随生产代码漂移。
 //
-// 为什么不能只判 id + phone_hash=”：注销会把 phone 改写成墓碑值**并且**把
+// 为什么不能只判 id + phone_hash：注销会把 phone 改写成墓碑值**并且**把
 // phone_hash 清空，于是"读取手机号 → 账号被并发注销 → 把注销前手机号的密文/盲索引
 // 写回去"这条竞态会让已注销账号重新占用原手机号，正是 destroyAccountFromState
 // 要消除的那个 P0。带上读取时的 zone/phone 后，行在读取后发生任何改写都会让 CAS
 // 失配、本行被跳过（下轮扫描按最新值重算）。
-const phoneShadowBackfillCAS = "id=? AND phone_hash='' AND zone=? AND phone=? AND is_destroy<>?"
+// 把读取时的 hash 也带入 CAS，才能安全地把 v1 替换为 v2，同时防止
+// 两个回填 worker 相互覆盖。
+const phoneShadowBackfillCAS = "id=? AND phone_hash=? AND zone=? AND phone=? AND is_destroy<>?"
 
 // PhoneShadowBackfillResult 一次回填调用的进度快照。
 type PhoneShadowBackfillResult struct {
@@ -52,7 +56,7 @@ type PhoneShadowBackfillResult struct {
 	Skipped int64 `json:"skipped"` // CAS 失配（读取后被并发改写）而跳过的行数，非错误
 	Failed  int64 `json:"failed"`  // 加密/更新出错的行数
 	// NextCursor 下次调用应传入的游标。扫描到表尾时归 0，让下一次调用从头重扫，
-	// 从而把本轮 Failed/Skipped 的行捞回来重试（选行条件 phone_hash='' 保证幂等）。
+	// 从而把本轮 Failed/Skipped 的行捞回来重试（当前版本谓词保证幂等）。
 	NextCursor int64 `json:"next_cursor"`
 	// Done 仅当 Remaining==0 时为 true。刻意不用"本批不足 batchSize"来判定完成：
 	// 那样会在存在 Failed/Skipped 行时报告 done=true 而 remaining>0，
@@ -63,9 +67,10 @@ type PhoneShadowBackfillResult struct {
 
 // phoneShadowBackfillRow 回填只需要这几列，避免 SELECT * 把整行拉回来。
 type phoneShadowBackfillRow struct {
-	ID    int64  `db:"id"`
-	Zone  string `db:"zone"`
-	Phone string `db:"phone"`
+	ID        int64  `db:"id"`
+	Zone      string `db:"zone"`
+	Phone     string `db:"phone"`
+	PhoneHash string `db:"phone_hash"`
 }
 
 // CountPhoneShadowPending 返回仍待回填的行数，供运维判断进度与收敛。
@@ -73,7 +78,7 @@ type phoneShadowBackfillRow struct {
 func (d *DB) CountPhoneShadowPending() (int64, error) {
 	var n int64
 	_, err := d.session.Select("count(*)").From("user").
-		Where("phone<>'' AND phone_hash='' AND is_destroy<>?", IsDestroyDone).Load(&n)
+		Where("phone<>'' AND phone_hash NOT LIKE ? AND is_destroy<>?", phoneHashCurrentPattern, IsDestroyDone).Load(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count phone shadow pending: %w", err)
 	}
@@ -86,8 +91,8 @@ func (d *DB) CountPhoneShadowPending() (int64, error) {
 // 直接返回错误而不是空跑一遍留下满地空列。
 //
 // 驱动方式：反复调用并把上次返回的 NextCursor 传回来，直到 Done==true。扫描到表尾时
-// NextCursor 归 0，所以本轮 Failed/Skipped 的行会在下一轮被重新捞起（选行条件
-// phone_hash=” 天然幂等）。ctx 取消会在批次边界干净退出，已提交的行不回滚。
+// NextCursor 归 0，所以本轮 Failed/Skipped 的行会在下一轮被重新捞起（当前
+// hash 版本谓词保证幂等）。ctx 取消会在批次边界干净退出，已提交的行不回滚。
 //
 // 运维注意：若连续多轮出现 Updated==0 而 Remaining>0，说明有行持续失败（脏数据等），
 // 此时应看日志里的 id 人工排查，而不是继续无限重试。
@@ -120,8 +125,8 @@ func (d *DB) BackfillPhoneShadow(ctx context.Context, cursor int64, batchSize in
 		// is_destroy<>2 排除已注销账号：它们的 phone 已被匿名化成
 		// `<原号>@<stamp>@delete`，对这种墓碑值算盲索引既无意义又会污染列。
 		// 冷静期(is_destroy=1)仍持有真实手机号，需要回填。
-		_, err := d.session.Select("id", "zone", "phone").From("user").
-			Where("id>? AND phone<>'' AND phone_hash='' AND is_destroy<>?", scanCursor, IsDestroyDone).
+		_, err := d.session.Select("id", "zone", "phone", "phone_hash").From("user").
+			Where("id>? AND phone<>'' AND phone_hash NOT LIKE ? AND is_destroy<>?", scanCursor, phoneHashCurrentPattern, IsDestroyDone).
 			OrderAsc("id").Limit(uint64(batchSize)).Load(&rows)
 		if err != nil {
 			return result, fmt.Errorf("scan phone shadow batch: %w", err)
@@ -146,7 +151,7 @@ func (d *DB) BackfillPhoneShadow(ctx context.Context, cursor int64, batchSize in
 				"phone_encrypted": encrypted,
 				"phone_hash":      hash,
 				"phone_last4":     last4,
-			}).Where(phoneShadowBackfillCAS, row.ID, row.Zone, row.Phone, IsDestroyDone).Exec()
+			}).Where(phoneShadowBackfillCAS, row.ID, row.PhoneHash, row.Zone, row.Phone, IsDestroyDone).Exec()
 			if updErr != nil {
 				log.Warn("回填手机号影子列更新失败,跳过该行",
 					zap.Int64("id", row.ID), zap.Error(updErr))

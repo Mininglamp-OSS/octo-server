@@ -46,7 +46,7 @@ type LoginLogModel struct {
 	UID           string // 登录成功时的用户 uid；失败时为空(账号不存在场景)
 	Status        int    // 1成功 2失败
 	LoginType     string // 登录方式:username/email/manager/register/github/gitee/oidc/wechat
-	AccountMasked string // 登录尝试账号的掩码形式(如 138****1234 / a***@x.com)，供人读
+	AccountMasked string // 登录尝试账号的双侧受限掩码(如 138****1234 / a***@x***)，供人读
 	AccountHash   string // 登录尝试账号的盲索引，供按账号精确检索(失败记录没有 uid，只能靠它)
 	db.BaseModel
 }

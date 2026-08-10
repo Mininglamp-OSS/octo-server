@@ -32,7 +32,9 @@ import (
 // DB.Insert/insertTx 路径 fail-closed，返回 ErrPhoneEncryptionUnavailable 且不写明文；
 // 无手机号建号不受影响。读路径在存量回填完成前仍保留明文比较兼容。
 const (
-	phoneCipherVersionPrefix = "enc:v1:"
+	// v2 表示密文中的 plaintext 已从 zone+"|"+phone 切换为长度前缀编码。
+	// 不升版会让第二阶段解密无法判断边界规则。
+	phoneCipherVersionPrefix = "enc:v2:"
 	phoneEncryptionSecretEnv = "OCTO_PII_ENCRYPTION_SECRET"
 	phoneEncryptDomain       = "octo-user-phone-cipher-v1"
 	phoneHashDomain          = "octo-user-phone-hash-v1"
@@ -41,7 +43,9 @@ const (
 	// 不同子密钥，密码学上相互独立。
 	loginAccountHashDomain = "octo-login-account-hash-v1"
 
-	// phoneHashKeyVersion 盲索引的密钥版本，写进 phone_hash 值本身（`<版本>:<hex>`）。
+	// phoneHashKeyVersion 标识手机盲索引算法/密钥版本，写进 phone_hash
+	// 值本身（`<版本>:<hex>`）。长度前缀编码取代有歧义的 zone+"|"+phone
+	// 后升到 v2，让回填能识别并修复早期分支产生的 v1 值。
 	//
 	// 为什么现在就带上版本号：盲索引是主密钥确定性派生的，轮换
 	// OCTO_PII_ENCRYPTION_SECRET 会让全部存量 phone_hash 失效。如果值里没有版本标识，
@@ -54,7 +58,11 @@ const (
 	//  3. 跑回填：按新密钥重算 phone_encrypted / phone_hash；
 	//  4. 回填完成后摘掉 PREVIOUS 与读路径的多版本分支。
 	// 密文侧的版本位由 phoneCipherVersionPrefix 承担，同理演进。
-	phoneHashKeyVersion = "1"
+	phoneHashKeyVersion = "2"
+	// loginAccountHashKeyVersion 与手机盲索引分开演进。本轮只改了
+	// zone/phone 的编码，不应让登录审计的精确检索键无故换版。
+	loginAccountHashKeyVersion = "1"
+	phoneHashCurrentPattern    = phoneHashKeyVersion + ":%"
 
 	// login_log.account_masked 是 VARCHAR(100)。掩码必须在写日志和入库前统一截断，
 	// 避免攻击者用超长账号让 STRICT_TRANS_TABLES 拒绝整条审计记录。
@@ -139,7 +147,7 @@ func LoginAccountBlindHash(account string) (string, error) {
 	key := derivePhoneSubkey(master, loginAccountHashDomain)
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(account))
-	return phoneHashKeyVersion + ":" + hex.EncodeToString(mac.Sum(nil)), nil
+	return loginAccountHashKeyVersion + ":" + hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 // maskLoginAccount 把登录标识符掩码成"可读但不含完整 PII"的形式，供登录日志落库与
@@ -155,14 +163,18 @@ func maskLoginAccount(account string) string {
 	if account == "" {
 		return ""
 	}
-	// 邮箱：保留首字符 + 完整域名（域名不是个人标识，保留它对排查有价值）
-	if at := strings.LastIndex(account, "@"); at > 0 {
+	// @ 前后都是攻击者可控输入；即使形式上像邮箱，后缀也可以是他人手机号
+	// 或任意 PII。只保留两侧首 rune 供人读，精确关联交给 account_hash。
+	if at := strings.LastIndex(account, "@"); at > 0 && at < len(account)-1 {
 		local := []rune(account[:at])
-		domain := account[at:]
+		domain := []rune(account[at+1:])
+		maskedLocal := "*"
 		if len(local) <= 1 {
-			return truncateRunes("*"+domain, loginAccountMaskedMaxRunes)
+			maskedLocal = "*"
+		} else {
+			maskedLocal = string(local[0]) + "***"
 		}
-		return truncateRunes(string(local[0])+"***"+domain, loginAccountMaskedMaxRunes)
+		return truncateRunes(maskedLocal+"@"+string(domain[0])+"***", loginAccountMaskedMaxRunes)
 	}
 	r := []rune(account)
 	// 纯数字（手机号 / zone+phone 拼接）：至少 8 位才保留前 3 后 4；恰好 7 位时
@@ -241,7 +253,7 @@ func (e *phoneEncryptor) encryptPhone(zone, phone string) (encrypted []byte, has
 	return out, h, phoneLast4(phone), nil
 }
 
-// decryptPhone 解密 encryptPhone 产生的密文，返回原始的 zone+"|"+phone 拼接串。
+// decryptPhone 解密 encryptPhone 产生的密文，返回原始的长度前缀 zone+phone 编码。
 // 第一阶暂无生产读路径依赖（明文 phone 列仍是权威读源），保留给测试往返校验和
 // 第二阶（停写明文列后按需解密）使用。
 func (e *phoneEncryptor) decryptPhone(cipherText []byte) (string, error) {

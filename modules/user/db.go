@@ -92,24 +92,32 @@ func (d *DB) QueryByEmail(email string) (*Model, error) {
 // 不需要解密；主密钥未配置或未命中(存量行尚未回填)时退回明文比较兜底，保证第一阶
 // 加密上线过程中查询行为不回归。盲索引路径必须排除已完成注销的行：若曾回滚到不认识
 // 影子列的旧版本，旧版本注销账号时会留下 phone_hash，roll-forward 后不能让该墓碑继续
-// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。两条路径都按主键选择最早行，
-// 避免存量重复号码随执行计划变动而命中不同账号。见 phone_crypto.go。
+// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。混合回填期两条路径可能
+// 同时命中不同的存量重复账号，必须分别取最小主键后再比较，不能在盲索引首次
+// 命中时提前返回。见 phone_crypto.go。
 func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
+	var hashModel *Model
 	if hash, err := PhoneBlindHash(zone, phone); err == nil {
-		var model *Model
 		if _, err := d.session.Select("*").From("user").
 			Where("phone_hash=? AND is_destroy<>?", hash, IsDestroyDone).
-			OrderAsc("id").Limit(1).Load(&model); err != nil {
+			OrderAsc("id").Limit(1).Load(&hashModel); err != nil {
 			return nil, err
 		}
-		if model != nil {
-			return model, nil
-		}
 	}
-	var model *Model
-	_, err := d.session.Select("*").From("user").Where("zone=? and phone=?", zone, phone).
-		OrderAsc("id").Limit(1).Load(&model)
-	return model, err
+	var plaintextModel *Model
+	_, err := d.session.Select("*").From("user").
+		Where("zone=? and phone=? AND is_destroy<>?", zone, phone, IsDestroyDone).
+		OrderAsc("id").Limit(1).Load(&plaintextModel)
+	if err != nil {
+		return nil, err
+	}
+	if hashModel == nil {
+		return plaintextModel, nil
+	}
+	if plaintextModel == nil || hashModel.Id <= plaintextModel.Id {
+		return hashModel, nil
+	}
+	return plaintextModel, nil
 }
 
 // 查询多个手机号用户
@@ -571,7 +579,7 @@ type Model struct {
 	MsgExpireSecond   int64        // 消息过期时长
 	Language          string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
 	PhoneEncrypted    []byte       // 手机号密文(AES-256-GCM)，phone 的加密影子列，第一阶双写，phone 明文列暂留
-	PhoneHash         string       // 手机号盲索引 HMAC-SHA256(zone|phone) 十六进制，用于精确检索
+	PhoneHash         string       // 手机号盲索引 HMAC-SHA256(长度前缀 zone + phone) 十六进制，用于精确检索
 	PhoneLast4        string       // 手机号后4位明文(低敏)，供模糊检索
 	db.BaseModel
 }

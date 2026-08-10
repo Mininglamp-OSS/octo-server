@@ -28,11 +28,12 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 	l.recordSuccess("u-1", phoneAccount, "1.2.3.4", "username")
 	l.recordFailure("bob@example.com", "5.6.7.8", "email")
 	l.recordFailure("bob@example.com", "5.6.7.8", "email")
+	l.recordFailure("x@13800001234", strings.Repeat("9", 41), "username")
 
 	var rows []*LoginLogModel
 	_, err := ctx.DB().Select("*").From("login_log").OrderAsc("id").Load(&rows)
 	require.NoError(t, err)
-	require.Len(t, rows, 3)
+	require.Len(t, rows, 4)
 
 	assert.Equal(t, "u-1", rows[0].UID)
 	assert.Equal(t, loginStatusSuccess, rows[0].Status)
@@ -41,12 +42,14 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 	assert.Equal(t, "", rows[1].UID, "failed attempts must not carry a uid")
 	assert.Equal(t, loginStatusFailure, rows[1].Status)
 	assert.Equal(t, loginStatusFailure, rows[2].Status)
+	assert.Equal(t, loginStatusFailure, rows[3].Status)
+	assert.Empty(t, rows[3].LoginIP, "invalid attacker-controlled XFF must not drop the audit row")
 
 	// 关键契约：整张表不得出现账号明文
 	assert.Equal(t, "008****1234", rows[0].AccountMasked)
 	assert.Equal(t, "b***@e***", rows[1].AccountMasked)
 	for i, r := range rows {
-		assert.NotContains(t, r.AccountMasked, "13800001234", "row %d 泄露了手机号明文", i)
+		assert.NotContains(t, r.AccountMasked, "13800001234", "row %d 泄露了手机号/attacker PII 明文", i)
 		assert.NotContains(t, r.AccountMasked, "bob@", "row %d 泄露了邮箱本地部分", i)
 	}
 

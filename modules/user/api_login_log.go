@@ -1,6 +1,9 @@
 package user
 
 import (
+	"net"
+	"strings"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"go.uber.org/zap"
@@ -23,6 +26,18 @@ func NewLoginLog(ctx *config.Context) *LoginLog {
 // 不必依赖对 DB 表做轮询。DB 行仍然保留：getLastLoginIP 依赖它做欢迎语的"上次登录
 // 信息"，审计侧也需要可 SQL 检索的登录历史。
 const loginEventLogMsg = "login_event"
+
+// normalizeLoginIP 把代理头中的候选值收窄为规范 IP 文本。
+// GetClientPublicIP 为兼容现有反向代理会优先返回 X-Forwarded-For，该值在
+// 代理信任边界配错时可由客户端控制。审计入库边界必须再校验：非 IP 存空串，
+// 而不是让超长值撑爆 login_log.login_ip VARCHAR(40) 并丢失整条记录。
+func normalizeLoginIP(value string) string {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
 
 // resolveAccountFields 把原始登录标识符转成"掩码 + 盲索引"。原始值到此为止，
 // 不进 DB、不进日志。主密钥未配置时盲索引为空（只剩掩码，精确检索能力降级），
@@ -63,6 +78,7 @@ func (l *LoginLog) logLoginEvent(status int, uid, maskedAccount, accountHash, pu
 //
 // account 传原始登录标识符即可，本函数负责掩码 + 盲索引，原始值不落库。
 func (l *LoginLog) recordSuccess(uid, account, publicIP, loginType string) {
+	publicIP = normalizeLoginIP(publicIP)
 	masked, hash := resolveAccountFields(account)
 	l.logLoginEvent(loginStatusSuccess, uid, masked, hash, publicIP, loginType)
 	err := l.loginLogDB.insert(&LoginLogModel{
@@ -81,6 +97,7 @@ func (l *LoginLog) recordSuccess(uid, account, publicIP, loginType string) {
 // recordFailure 记录一次登录失败尝试。uid 留空——失败时通常还没有解析出 uid
 // (账号不存在/密码错误都不暴露具体原因，反枚举口径同 errcode)，检索靠 account_hash。
 func (l *LoginLog) recordFailure(account, publicIP, loginType string) {
+	publicIP = normalizeLoginIP(publicIP)
 	masked, hash := resolveAccountFields(account)
 	l.logLoginEvent(loginStatusFailure, "", masked, hash, publicIP, loginType)
 	err := l.loginLogDB.insert(&LoginLogModel{

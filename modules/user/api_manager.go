@@ -1525,8 +1525,6 @@ func (m *Manager) createManagerAccount() {
 		return
 	}
 
-	username := string(wkhttp.SuperAdmin)
-	role := string(wkhttp.SuperAdmin)
 	var pwd = m.ctx.GetConfig().AdminPwd
 	// 超管播种密码同样必须过口令复杂度策略。这里 fail-closed（不建账号）而不是降级
 	// 建一个弱口令超管：上面的 early return 保证只有"超管尚不存在"时才会走到这里，
@@ -1546,23 +1544,30 @@ func (m *Manager) createManagerAccount() {
 		m.Error("密码哈希失败", zap.Error(hashErr))
 		return
 	}
-	err = m.userDB.Insert(&Model{
-		UID:      m.ctx.GetConfig().Account.AdminUID,
-		Name:     "超级管理员",
-		ShortNo:  "30000",
-		Category: "system",
-		Role:     role,
-		Username: username,
-		Zone:     "0086",
-		Phone:    "13000000002",
-		Status:   1,
-		Password: hashedPwd,
-	})
+	err = m.userDB.Insert(newManagerSeedModel(m.ctx.GetConfig().Account.AdminUID, hashedPwd))
 	if err != nil {
 		m.Error("新增系统管理员错误", zap.Error(err))
 		return
 	}
 }
+
+// newManagerSeedModel 构造首次启动的超管账号。超管通过 username 登录，
+// 固定虚构手机号没有业务用途，却会让 bootstrap 不必要地依赖
+// OCTO_PII_ENCRYPTION_SECRET。保持 phone 为空可以在 PII 密钥配置前先建立
+// 管理入口；普通带手机号建号仍由 DB.syncPhoneShadow fail-closed。
+func newManagerSeedModel(adminUID, hashedPwd string) *Model {
+	return &Model{
+		UID:      adminUID,
+		Name:     "超级管理员",
+		ShortNo:  "30000",
+		Category: "system",
+		Role:     string(wkhttp.SuperAdmin),
+		Username: string(wkhttp.SuperAdmin),
+		Status:   1,
+		Password: hashedPwd,
+	}
+}
+
 func getShowPhoneNum(mobile string) string {
 	if len(mobile) <= 3 {
 		return mobile

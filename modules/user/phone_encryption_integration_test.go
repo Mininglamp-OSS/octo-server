@@ -227,6 +227,35 @@ func TestQueryByPhoneIgnoresRollbackStaleDestroyedShadow(t *testing.T) {
 	assert.Nil(t, got, "destroyed account with a rollback-stale blind index must not occupy the phone")
 }
 
+func TestQueryByPhonePrefersEarliestMixedBackfillDuplicate(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	// 先插入尚未回填的存量重复行，再通过新写路径插入带 hash 的后来行。
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) " +
+			"VALUES ('u-duplicate-old','duplicate-old','old','0086','13800008888','sn-dup-old','v-dup-old@1',1,0)").Exec()
+	require.NoError(t, err)
+	require.NoError(t, d.Insert(&Model{
+		UID:      "u-duplicate-new",
+		Username: "duplicate-new",
+		Name:     "new",
+		Zone:     "0086",
+		Phone:    "13800008888",
+		ShortNo:  "sn-dup-new",
+		Vercode:  "v-dup-new@1",
+		Status:   1,
+	}))
+
+	got, err := d.QueryByPhone("0086", "13800008888")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "u-duplicate-old", got.UID,
+		"partial backfill must not let a later hashed duplicate outrank the earliest plaintext row")
+}
+
 // TestRegisterRejectsWeakPassword 覆盖 handler 层的密码强度接入：弱密码必须被
 // 专用错误码拒绝，而不是被放行或塌成通用参数错误。
 //
@@ -310,7 +339,7 @@ func TestBackfillPhoneShadow(t *testing.T) {
 
 	pending, err := d.CountPhoneShadowPending()
 	require.NoError(t, err)
-	assert.EqualValues(t, 5, pending, "只有 phone<>'' 且 phone_hash='' 的行算待回填")
+	assert.EqualValues(t, 5, pending, "只有 phone<>'' 且 hash 不是当前版本的行算待回填")
 
 	// 小批次 + 零间隔，验证游标推进
 	res, err := d.BackfillPhoneShadow(context.Background(), 0, 2, 0)
@@ -497,11 +526,12 @@ func TestPhoneShadowBackfillCASRejectsChangedRow(t *testing.T) {
 	require.NoError(t, err)
 
 	var row struct {
-		ID    int64  `db:"id"`
-		Zone  string `db:"zone"`
-		Phone string `db:"phone"`
+		ID        int64  `db:"id"`
+		Zone      string `db:"zone"`
+		Phone     string `db:"phone"`
+		PhoneHash string `db:"phone_hash"`
 	}
-	_, err = ctx.DB().Select("id", "zone", "phone").From("user").
+	_, err = ctx.DB().Select("id", "zone", "phone", "phone_hash").From("user").
 		Where("uid=?", "u-cas").Load(&row)
 	require.NoError(t, err)
 	require.NotZero(t, row.ID)
@@ -516,7 +546,7 @@ func TestPhoneShadowBackfillCASRejectsChangedRow(t *testing.T) {
 		"phone_encrypted": encrypted,
 		"phone_hash":      hash,
 		"phone_last4":     last4,
-	}).Where(phoneShadowBackfillCAS, row.ID, row.Zone, row.Phone, IsDestroyDone).Exec()
+	}).Where(phoneShadowBackfillCAS, row.ID, row.PhoneHash, row.Zone, row.Phone, IsDestroyDone).Exec()
 	require.NoError(t, err)
 	affected, err := res.RowsAffected()
 	require.NoError(t, err)

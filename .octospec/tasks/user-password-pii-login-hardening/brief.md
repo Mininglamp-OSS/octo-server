@@ -39,24 +39,31 @@ for compatibility and rollback.
   no more than bcrypt's 72-byte input limit, and contain at least two character
   classes. Existing MD5-to-bcrypt migration remains compatible with legacy weak
   passwords after a successful login.
-- `pii-encryption` — phone ciphertext uses AES-256-GCM and equality lookup uses
-  a versioned HMAC-SHA256 blind index derived from the dedicated
+- `pii-encryption` — phone ciphertext uses AES-256-GCM with a versioned,
+  length-prefixed plaintext format and equality lookup uses an independently
+  versioned HMAC-SHA256 blind index derived from the dedicated
   `OCTO_PII_ENCRYPTION_SECRET`.
 - `fail-closed-write` — any new non-empty phone write fails when the PII key is
   missing or invalid; username, email, OAuth, and bot accounts without a phone
   remain writable.
-- `migration` — three additive migrations introduce phone shadow columns,
-  login-audit fields and indexes, and user login/lookup indexes.
+- `migration` — four additive migrations introduce phone shadow columns,
+  login-audit fields and indexes, user login/lookup indexes, and sufficient
+  ciphertext width for the existing utf8mb4 zone/phone column bounds.
 - `backfill` — a superAdmin-only, UID-rate-limited endpoint performs bounded,
-  resumable batches. Compare-and-swap predicates prevent concurrent account
-  destruction from restoring released phone data.
+  resumable batches and rewrites empty or non-current blind-index versions.
+  Compare-and-swap predicates prevent concurrent account destruction or another
+  worker from overwriting the selected row.
 - `lookup-compatibility` — phone lookups merge blind-index and plaintext results
-  during the mixed backfill state so duplicate accounts are not hidden. Completed
-  account destruction is excluded even if rollback through an older binary left
-  stale shadow data behind.
-- `login-audit` — success and failure records contain masked accounts plus a
-  blind index, status, type, and IP. The previous successful login is captured
-  before the current row is inserted so welcome-message content stays correct.
+  during the mixed backfill state so duplicate accounts are not hidden. The user
+  lookup compares the earliest candidate from both paths before returning.
+  Completed account destruction is excluded even if rollback through an older
+  binary left stale shadow data behind.
+- `login-audit` — success and failure records contain fully bounded account
+  masks plus a blind index, status, type, and a canonical parsed IP. Neither an
+  attacker-controlled `@` suffix nor invalid proxy-header text can inject PII
+  or make the audit insert exceed its columns. The previous successful login is
+  captured before the current row is inserted so welcome-message content stays
+  correct.
 - `rate-limit` — unauthenticated manager login uses a dedicated strict per-IP
   bucket before failed attempts can create audit rows.
 - `wire-contract` — password validation and authentication failures use the
@@ -80,18 +87,22 @@ for compatibility and rollback.
   shared length and character-class policy with localized errors.
 - Missing or invalid `OCTO_PII_ENCRYPTION_SECRET` prevents non-empty phone
   writes without silently persisting a new plaintext-only row.
+- Initial superAdmin creation has no synthetic phone and therefore remains
+  available before the PII key is provisioned; its password policy still fails
+  closed.
 - New phone writes populate ciphertext, blind index, and last-four fields; users
   without a phone remain unaffected.
-- The backfill can resume after failed or skipped rows, reports completion only
-  when no eligible rows remain, and cannot resurrect phone data from a destroyed
-  account.
+- The backfill can resume after failed or skipped rows, repairs non-current hash
+  versions, reports completion only when no eligible rows remain, and cannot
+  resurrect phone data from a destroyed account.
 - OIDC and user phone lookups return the union of encrypted-shadow and plaintext
-  matches throughout the rollout.
+  matches throughout the rollout; a single-result lookup returns the globally
+  earliest duplicate across both sources.
 - A completed destroyed account with a stale rollback-era blind index cannot be
   returned by phone lookup or continue occupying its released phone number.
 - Successful and failed login auditing works when welcome messages are disabled,
-  never stores a raw login account, and preserves the actual previous-login
-  welcome message.
+  never stores a raw login account or unparsed IP, and preserves the actual
+  previous-login welcome message.
 - Manager login rejects the sixth immediate request from one IP with HTTP 429
   under the dedicated burst-five strict limiter, before handler or database work.
 - Focused unit, integration, race, source-guard, build, i18n, and lint checks pass,
@@ -100,14 +111,15 @@ for compatibility and rollback.
 ## Deployment and rollback
 
 1. Configure the same 32-byte `OCTO_PII_ENCRYPTION_SECRET` on every replica
-   before deploying. Phone-bearing account creation is intentionally fail-closed
-   without it. On a fresh deployment that seeds a superAdmin, also confirm that
-   `AdminPwd` satisfies the account-password policy; otherwise the seed is
-   intentionally rejected and no administrator is created.
+   before enabling phone-bearing account creation or starting backfill. Those
+   paths intentionally fail closed without it. Initial superAdmin creation no
+   longer carries a synthetic phone and is independent of this key; `AdminPwd`
+   must still satisfy the account-password policy or the seed is rejected.
 2. Apply the additive migrations and allow the user-table index build to finish
    during the planned database change window.
 3. Deploy the application, then repeatedly call the superAdmin phone-shadow
-   backfill endpoint until its status reports `remaining=0`.
+   backfill endpoint until its status reports `remaining=0`. Rows with empty or
+   v1 hashes are selected and rewritten to the current v2 hash/ciphertext format.
 4. Monitor phone-encryption errors, backfill progress, failed login volume,
    rate-limit rejections, database latency, and login-log growth.
 5. For rollback, stop backfill calls and deploy the previous binary. Keep the
