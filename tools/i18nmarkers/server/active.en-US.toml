@@ -1188,6 +1188,9 @@ other = "Registration is currently closed."
 ["err.server.user.request_invalid"]
 other = "Invalid request."
 
+["err.server.user.role_cache_failed"]
+other = "Failed to invalidate the user role cache."
+
 ["err.server.user.scan_login_disabled"]
 other = "Scan login is disabled."
 

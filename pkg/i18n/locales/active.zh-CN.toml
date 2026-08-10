@@ -289,6 +289,9 @@ other = "用户列表筛选条件互斥。"
 ["err.server.user.token_cache_failed"]
 other = "更新登录令牌缓存失败。"
 
+["err.server.user.role_cache_failed"]
+other = "更新用户角色缓存失败。"
+
 ["err.server.user.short_no_gen_failed"]
 other = "生成短编号失败。"
 

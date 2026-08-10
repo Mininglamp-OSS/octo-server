@@ -101,13 +101,16 @@ func (s *RoleService) ResolveRole(ctx context.Context, uid string) (string, erro
 // Invalidate drops the hot-cache entry for a user so the next request re-reads
 // the role from DB. Call after any mutation of user.role (e.g. removing an
 // admin) to make the change take effect within one round-trip instead of
-// waiting out RoleCacheTTL. Best-effort: a Redis error degrades to TTL-bounded
-// staleness, not a failure.
-func (s *RoleService) Invalidate(uid string) {
+// waiting out RoleCacheTTL. The caller decides whether a cache failure may be
+// tolerated; security-sensitive role mutations must fail closed and retry.
+func (s *RoleService) Invalidate(uid string) error {
 	if uid == "" {
-		return
+		return nil
 	}
-	_ = s.cache.Delete(RoleCacheKeyPrefix + uid)
+	if err := s.cache.Delete(RoleCacheKeyPrefix + uid); err != nil {
+		return fmt.Errorf("user: invalidate role cache: %w", err)
+	}
+	return nil
 }
 
 func (s *RoleService) writeCache(key, role string) {

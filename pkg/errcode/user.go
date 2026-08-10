@@ -385,6 +385,12 @@ var (
 		DefaultMessage: "Failed to update the session token cache.",
 		Internal:       true,
 	})
+	ErrUserRoleCacheFailed = register(codes.Code{
+		ID:             "err.server.user.role_cache_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to invalidate the user role cache.",
+		Internal:       true,
+	})
 	ErrUserShortNoGenFailed = register(codes.Code{
 		ID:             "err.server.user.short_no_gen_failed",
 		HTTPStatus:     http.StatusInternalServerError,

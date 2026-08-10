@@ -154,9 +154,27 @@ func TestRoleServiceInvalidateDeletesHotKey(t *testing.T) {
 	c.store[RoleCacheKeyPrefix+"u1"] = "admin"
 	svc := NewRoleService(newFakeRoleDB(), c)
 
-	svc.Invalidate("u1")
+	if err := svc.Invalidate("u1"); err != nil {
+		t.Fatalf("Invalidate: %v", err)
+	}
 	if _, ok := c.store[RoleCacheKeyPrefix+"u1"]; ok {
 		t.Fatalf("Invalidate must delete the hot key")
+	}
+}
+
+func TestRoleServiceInvalidatePropagatesDeleteError(t *testing.T) {
+	c := newFakeLangCache()
+	c.store[RoleCacheKeyPrefix+"u1"] = "admin"
+	wantErr := errors.New("redis delete failed")
+	c.delErr = wantErr
+	svc := NewRoleService(newFakeRoleDB(), c)
+
+	err := svc.Invalidate("u1")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Invalidate error = %v, want wrapped %v", err, wantErr)
+	}
+	if got := c.store[RoleCacheKeyPrefix+"u1"]; got != "admin" {
+		t.Fatalf("failed Invalidate changed cache value to %q", got)
 	}
 }
 

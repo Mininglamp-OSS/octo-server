@@ -468,7 +468,16 @@ func dashboardReaderGrantEligible(target *Model) bool {
 }
 
 func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
-	m.roleService.Invalidate(targetUID)
+	if err := m.roleService.Invalidate(targetUID); err != nil {
+		m.Error("invalidate dashboard reader role cache failed",
+			zap.Error(err),
+			zap.String("actor_uid", c.GetLoginUID()),
+			zap.String("target_uid", targetUID),
+			zap.Bool("grant", grant),
+			zap.Bool("role_changed", changed))
+		respondUserError(c, errcode.ErrUserRoleCacheFailed)
+		return
+	}
 	message := "dashboard reader role already in requested state"
 	if changed {
 		message = "dashboard reader role changed"
