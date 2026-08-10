@@ -51,7 +51,9 @@ for compatibility and rollback.
   resumable batches. Compare-and-swap predicates prevent concurrent account
   destruction from restoring released phone data.
 - `lookup-compatibility` — phone lookups merge blind-index and plaintext results
-  during the mixed backfill state so duplicate accounts are not hidden.
+  during the mixed backfill state so duplicate accounts are not hidden. Completed
+  account destruction is excluded even if rollback through an older binary left
+  stale shadow data behind.
 - `login-audit` — success and failure records contain masked accounts plus a
   blind index, status, type, and IP. The previous successful login is captured
   before the current row is inserted so welcome-message content stays correct.
@@ -85,6 +87,8 @@ for compatibility and rollback.
   account.
 - OIDC and user phone lookups return the union of encrypted-shadow and plaintext
   matches throughout the rollout.
+- A completed destroyed account with a stale rollback-era blind index cannot be
+  returned by phone lookup or continue occupying its released phone number.
 - Successful and failed login auditing works when welcome messages are disabled,
   never stores a raw login account, and preserves the actual previous-login
   welcome message.
@@ -97,7 +101,9 @@ for compatibility and rollback.
 
 1. Configure the same 32-byte `OCTO_PII_ENCRYPTION_SECRET` on every replica
    before deploying. Phone-bearing account creation is intentionally fail-closed
-   without it.
+   without it. On a fresh deployment that seeds a superAdmin, also confirm that
+   `AdminPwd` satisfies the account-password policy; otherwise the seed is
+   intentionally rejected and no administrator is created.
 2. Apply the additive migrations and allow the user-table index build to finish
    during the planned database change window.
 3. Deploy the application, then repeatedly call the superAdmin phone-shadow
@@ -108,3 +114,13 @@ for compatibility and rollback.
    additive columns and indexes in place: the plaintext phone column is retained,
    and the new login-log columns have backward-compatible defaults. Do not run
    destructive down migrations during an application rollback.
+6. Before rolling forward after an older binary has handled account destruction,
+   clear shadow data from completed tombstones. Phone lookup already excludes
+   these rows, so this cleanup is for PII retention rather than availability:
+
+   ```sql
+   UPDATE user
+   SET phone_encrypted = NULL, phone_hash = '', phone_last4 = ''
+   WHERE is_destroy = 2
+     AND (phone_encrypted IS NOT NULL OR phone_hash <> '' OR phone_last4 <> '');
+   ```
