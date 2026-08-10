@@ -1976,6 +1976,9 @@ func revokeCurrentUserSession(ctx context.Context, store userSessionStore, token
 	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
 		return v3Store.RevokeCurrent(ctx, token, uid, deviceFlag)
 	}
+	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
+		return invalidator.InvalidateCurrentToken(ctx, uid, token)
+	}
 	if err := store.DeleteToken(ctx, token); err != nil {
 		return err
 	}

@@ -66,6 +66,9 @@ func (s *RedisSessionStore) ValidateRolloutControl(ctx context.Context, required
 	if s.mode.rank() < control.ModeFloor.rank() {
 		return fmt.Errorf("auth: configured session mode %s is below persisted floor %s", s.mode, control.ModeFloor)
 	}
+	if s.mode.rank() > control.ModeFloor.rank()+1 {
+		return fmt.Errorf("auth: configured session mode %s is more than one phase above persisted floor %s", s.mode, control.ModeFloor)
+	}
 	if requiredFloor.valid() && control.ModeFloor.rank() < requiredFloor.rank() {
 		return fmt.Errorf("auth: persisted session floor %s is below required floor %s", control.ModeFloor, requiredFloor)
 	}

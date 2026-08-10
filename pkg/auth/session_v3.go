@@ -307,7 +307,7 @@ func (s *RedisSessionStore) ReuseSession(ctx context.Context, token string, snap
 			return ok, err
 		}
 	}
-	s.cleanupIndexReservationIfLegacy(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation)
+	_ = s.cleanupIndexReservation(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation)
 	return false, errors.New("auth: reused token changed too frequently")
 }
 
@@ -449,14 +449,21 @@ func (s *RedisSessionStore) promoteLegacySession(ctx context.Context, token stri
 	}
 	ttl, replaced, conflict, err := s.casReplacePayloadKeepDeadline(ctx, token, record.Payload, ownedPayload, capTTL)
 	if err != nil {
-		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID, fence.Generation), member).Err()
+		if cleanupErr := s.cleanupIndexReservation(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation); cleanupErr != nil {
+			return false, false, fmt.Errorf("%w (promotion index cleanup failed: %v)", err, cleanupErr)
+		}
 		return false, false, err
 	}
 	if conflict {
+		if err := s.cleanupIndexReservation(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation); err != nil {
+			return false, false, err
+		}
 		return false, true, nil
 	}
 	if !replaced {
-		_ = s.client.ZRem(s.sessionIndexKey(snapshot.UID, fence.Generation), member).Err()
+		if err := s.cleanupIndexReservation(token, snapshot.UID, snapshot.DeviceFlag, snapshot.DeviceID, fence.Generation); err != nil {
+			return false, false, err
+		}
 		return false, false, nil
 	}
 	cleanup := func(primary error) error {
@@ -529,17 +536,37 @@ func (s *RedisSessionStore) casReplacePayloadKeepDeadline(ctx context.Context, t
 	return time.Duration(ttlMS) * time.Millisecond, true, false, nil
 }
 
-func (s *RedisSessionStore) cleanupIndexReservationIfLegacy(token, uid string, deviceFlag int, deviceID, generation string) {
+// cleanupIndexReservation removes only the caller's speculative bounded-index
+// member. A CAS error is ambiguous: the payload write may have succeeded even
+// though the client saw an error. Re-reading the token prevents compensation
+// from deleting the member currently owned by a successful v3 payload.
+func (s *RedisSessionStore) cleanupIndexReservation(token, uid string, deviceFlag int, deviceID, generation string) error {
+	member, err := encodeSessionIndexMember(token, deviceFlag, deviceID)
+	if err != nil {
+		return err
+	}
 	raw, err := s.client.Get(s.tokenKey(token)).Result()
 	if err == nil {
-		if info, decodeErr := Decode(raw); decodeErr == nil && info.IsV3() {
-			return
+		info, decodeErr := Decode(raw)
+		if decodeErr != nil {
+			return fmt.Errorf("auth: inspect promotion payload for index cleanup: %w", decodeErr)
 		}
+		if info.IsV3() {
+			currentMember, encodeErr := encodeSessionIndexMember(token, info.DeviceFlag, info.DeviceID)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if currentMember == member {
+				return nil
+			}
+		}
+	} else if err != rd.Nil {
+		return fmt.Errorf("auth: inspect promotion payload for index cleanup: %w", err)
 	}
-	member, err := encodeSessionIndexMember(token, deviceFlag, deviceID)
-	if err == nil {
-		_ = s.client.ZRem(s.sessionIndexKey(uid, generation), member).Err()
+	if err := s.client.ZRem(s.sessionIndexKey(uid, generation), member).Err(); err != nil {
+		return fmt.Errorf("auth: remove promotion index reservation: %w", err)
 	}
+	return nil
 }
 
 func (s *RedisSessionStore) IssueNewSession(ctx context.Context, token string, info TokenInfo, fence IssueFence) (err error) {

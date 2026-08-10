@@ -153,7 +153,7 @@ func tokenWriterViolations(fset *gotoken.FileSet, file *ast.File, path string) [
 
 func isCredentialWriteMethod(method string) bool {
 	switch method {
-	case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt":
+	case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt", "Del", "Delete", "Unlink":
 		return true
 	default:
 		return false
