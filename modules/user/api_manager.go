@@ -423,6 +423,9 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 	}
 	if !changed {
 		m.roleService.Invalidate(targetUID)
+		if !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
+			return
+		}
 		m.Info("dashboard reader role already in requested state",
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", targetUID),
@@ -454,11 +457,33 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 	}
 
 	m.roleService.Invalidate(targetUID)
+	if !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
+		return
+	}
 	m.Info("dashboard reader role changed",
 		zap.String("actor_uid", c.GetLoginUID()),
 		zap.String("target_uid", targetUID),
 		zap.Bool("granted", grant))
 	c.ResponseOK()
+}
+
+// revokeDashboardReaderTargetSessions removes every known APP/Web/PC bearer
+// after an accepted role request, including idempotent retries. RoleResolver
+// normally replaces the role embedded in a bearer, but it intentionally falls
+// back to that snapshot when Redis/DB role lookup fails. Keeping a token minted
+// under the previous role would therefore reopen the old privilege during an
+// outage. Retrying is safe and repairs a previous partial cache failure.
+func (m *Manager) revokeDashboardReaderTargetSessions(c *wkhttp.Context, targetUID string, grant bool) bool {
+	if err := m.revokeAllDeviceTokens(targetUID); err != nil {
+		m.Error("revoke dashboard reader target sessions failed",
+			zap.Error(err),
+			zap.String("actor_uid", c.GetLoginUID()),
+			zap.String("target_uid", targetUID),
+			zap.Bool("grant", grant))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return false
+	}
+	return true
 }
 
 // dashboardReaderRoleTransition is the complete temporary-role policy. The

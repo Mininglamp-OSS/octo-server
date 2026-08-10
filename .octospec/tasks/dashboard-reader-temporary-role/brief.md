@@ -38,7 +38,9 @@ source: self
 4. 新增 SuperAdmin-only、幂等的 `PUT` / `DELETE`
    `/v1/manager/user/:uid/dashboard-read`：授予时把非 SuperAdmin 账号 role 设为
    `dashboardReader`，撤销时只清除该固定角色；两者都失效 `user_role:{uid}` 热缓存。
-5. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
+5. 授权/撤销同时撤销目标账号 APP/Web/PC 现有会话，避免 RoleResolver 故障回退到旧
+   token 角色；幂等重试也重做缓存清理和会话撤销，以修复上次可能的部分失败。
+6. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
 
 ## Out of scope
 
@@ -57,6 +59,7 @@ source: self
 - [x] 代表性的其他 manager 接口拒绝 `dashboardReader`
 - [x] 只有 SuperAdmin 能授予/撤销；不能修改 SuperAdmin；撤销为幂等操作
 - [x] 授予/撤销（含幂等重试）后清理目标账号角色缓存
+- [x] 授予/撤销（含幂等重试）后撤销目标账号 APP/Web/PC 现有会话
 - [x] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
 - [x] 聚焦 Go 测试、`go build ./...`、相关包 `go vet` / `golangci-lint`、i18n
       extract/check/lint、错误响应源码守卫与 `git diff --check` 通过
