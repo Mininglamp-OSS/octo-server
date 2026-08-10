@@ -106,6 +106,14 @@ func TestPhoneBlindHash_DeterministicAndZoneScoped(t *testing.T) {
 	}
 }
 
+func TestPhoneCryptoInputIsUnambiguous(t *testing.T) {
+	a := phoneCryptoInput("0086|1", "3800001234")
+	b := phoneCryptoInput("0086", "1|3800001234")
+	if a == b {
+		t.Fatalf("different zone/phone tuples produced the same crypto input %q", a)
+	}
+}
+
 // TestSyncPhoneShadow_FailsClosedAndPopulates 覆盖 DB 层影子列同步的契约。
 // 同步点在 DB.Insert/insertTx 里，所以任何建号路径都会自动带上影子列。
 func TestSyncPhoneShadow_FailsClosedAndPopulates(t *testing.T) {

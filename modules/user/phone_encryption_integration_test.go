@@ -187,6 +187,45 @@ func TestDestroyFreesPhoneForReuse(t *testing.T) {
 	assert.Equal(t, "u-newcomer", reused.UID, "复用号码后必须命中新用户，而不是已注销的旧行")
 }
 
+// TestQueryByPhoneIgnoresRollbackStaleDestroyedShadow simulates the documented
+// rollback sequence: an older binary destroys the account but cannot clear the
+// shadow columns it does not know about. A later roll-forward must not resolve
+// the released phone number to that tombstone row.
+func TestQueryByPhoneIgnoresRollbackStaleDestroyedShadow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	require.NoError(t, d.Insert(&Model{
+		UID:      "u-rollback-destroyed",
+		Username: "008613900003333",
+		Name:     "rollback destroyed",
+		ShortNo:  "sn-rollback-destroyed",
+		Status:   1,
+		Zone:     "0086",
+		Phone:    "13900003333",
+	}))
+
+	// Mirror the pre-shadow binary's destroy update: mutate the plaintext fields
+	// and state only, deliberately leaving phone_hash/ciphertext/last4 stale.
+	_, err := ctx.DB().Update("user").SetMap(map[string]interface{}{
+		"phone":      "13900003333@1700000000000@delete",
+		"username":   "anon-rollback-destroyed",
+		"is_destroy": IsDestroyDone,
+	}).Where("uid=?", "u-rollback-destroyed").Exec()
+	require.NoError(t, err)
+
+	destroyed, err := d.QueryByUID("u-rollback-destroyed")
+	require.NoError(t, err)
+	require.NotNil(t, destroyed)
+	require.NotEmpty(t, destroyed.PhoneHash, "fixture must retain the stale blind index")
+
+	got, err := d.QueryByPhone("0086", "13900003333")
+	require.NoError(t, err)
+	assert.Nil(t, got, "destroyed account with a rollback-stale blind index must not occupy the phone")
+}
+
 // TestRegisterRejectsWeakPassword 覆盖 handler 层的密码强度接入：弱密码必须被
 // 专用错误码拒绝，而不是被放行或塌成通用参数错误。
 //

@@ -1,7 +1,9 @@
 package user
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
@@ -83,6 +85,7 @@ func TestMaskLoginAccount(t *testing.T) {
 		{"ab", "**"},
 		{"x", "*"},
 		{"123456", "1***"},       // 6 位纯数字不足 7，走通用分支
+		{"1234567", "1***"},      // 7 位纯数字不能把 7 位全部暴露
 		{"用户名字", "用***"},         // 多字节按 rune 处理，不产出非法 UTF-8
 		{"13800001234x", "1***"}, // 非纯数字走通用分支
 	}
@@ -90,6 +93,17 @@ func TestMaskLoginAccount(t *testing.T) {
 		if got := maskLoginAccount(c.in); got != c.want {
 			t.Errorf("maskLoginAccount(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestMaskLoginAccountCapsDatabaseValueByRune(t *testing.T) {
+	account := "a@" + strings.Repeat("界", 120) + ".example"
+	masked := maskLoginAccount(account)
+	if !utf8.ValidString(masked) {
+		t.Fatal("masked account must remain valid UTF-8")
+	}
+	if got := len([]rune(masked)); got > 100 {
+		t.Fatalf("masked account has %d runes, exceeds login_log.account_masked VARCHAR(100)", got)
 	}
 }
 
