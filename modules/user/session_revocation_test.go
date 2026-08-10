@@ -172,6 +172,53 @@ type logoutFailingSessionStore struct {
 	err error
 }
 
+func TestFinishCommittedUserSecurityMutationPreservesCommitBoundary(t *testing.T) {
+	t.Run("uncommitted mutation has no external side effects", func(t *testing.T) {
+		store := &recordingDeviceRevokeStore{
+			tokens: map[int]string{int(config.APP): "app-token"}, failures: make(map[string]error),
+		}
+		quitCalls := 0
+		mutationErr := errors.New("database rollback")
+		err := finishCommittedUserSecurityMutation(context.Background(), store, "u1", false, mutationErr, func(string, int) error {
+			quitCalls++
+			return nil
+		})
+		require.ErrorIs(t, err, mutationErr)
+		require.Empty(t, store.revoked)
+		require.Zero(t, quitCalls)
+	})
+
+	t.Run("committed compatibility mutation revokes bearers and always quits IM", func(t *testing.T) {
+		store := &recordingDeviceRevokeStore{
+			tokens: map[int]string{
+				int(config.APP): "app-token", int(config.Web): "web-token", int(config.PC): "pc-token",
+			},
+			failures: map[string]error{"web-token": errors.New("redis unavailable")},
+		}
+		var quitFlags []int
+		err := finishCommittedUserSecurityMutation(context.Background(), store, "u1", true, nil, func(_ string, flag int) error {
+			quitFlags = append(quitFlags, flag)
+			return nil
+		})
+		require.ErrorContains(t, err, "redis unavailable")
+		require.ElementsMatch(t, []string{"app-token", "web-token", "pc-token"}, store.revoked)
+		require.Equal(t, []int{-1}, quitFlags, "a bearer revocation error must not skip independent IM logout")
+	})
+
+	t.Run("committed durable mutation still quits IM when synchronous apply fails", func(t *testing.T) {
+		store := &flakyRevokeAllSessionStore{}
+		applyErr := errors.New("redis unavailable")
+		quitCalls := 0
+		err := finishCommittedUserSecurityMutation(context.Background(), store, "u1", true, applyErr, func(_ string, flag int) error {
+			quitCalls++
+			require.Equal(t, -1, flag)
+			return nil
+		})
+		require.ErrorIs(t, err, applyErr)
+		require.Equal(t, 1, quitCalls)
+	})
+}
+
 func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {
 	return s.err
 }
