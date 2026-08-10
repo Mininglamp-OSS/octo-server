@@ -1087,10 +1087,6 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	}
 	alreadyInState := userInfo.Status == userStatus
 	disabling := userStatus == int(common.UserDisable)
-	if alreadyInState && !disabling {
-		c.ResponseOK()
-		return
-	}
 	var securityErr error
 	var mutationErr error
 	committed := false
@@ -1115,10 +1111,12 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 				return
 			}
 		}
-	} else if err = m.userDB.UpdateUsersWithField("status", status, uid); err != nil {
-		m.Error("修改用户状态错误", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+	} else if !alreadyInState {
+		if err = m.userDB.UpdateUsersWithField("status", status, uid); err != nil {
+			m.Error("修改用户状态错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
 	}
 
 	ban := 0
