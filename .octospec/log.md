@@ -9,10 +9,13 @@ change-log convention (§7). Newest first.
 - **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,
   monotonic v3 session rollout; absolute deadlines, generation/fence validation,
   generation-scoped bounded indexes, durable high-risk revocation intents, and
-  a controlled legacy migration/admin tool. Review follow-up prevented stale
-  revocation replay from erasing post-event index entries and blocked disabled
-  administrators from reissuing sessions. Production activation, device-scope
-  completion, migration, enforce, and security retest remain explicit gates. See
+  a controlled legacy migration/admin tool. Review follow-up closed owned v3
+  compensation/index leaks, disabled scan-code redemption, campaign resume,
+  floor-evidence, lease and post-commit retry gaps; finite migration policy is
+  now explicit rather than hardcoded. The production runbook pins Redis,
+  connection, old-replica, required-floor and irreversible rollback gates.
+  Production activation, device-scope completion, migration, enforce, and
+  security retest remain explicit gates. See
   [journal](journal/shared/token-lifecycle-hardening-pr2.md).
 - **Learning (pending)** —
   [scope-revocation-cleanup-to-generation](learnings/pending/token-lifecycle-hardening-pr2.md):

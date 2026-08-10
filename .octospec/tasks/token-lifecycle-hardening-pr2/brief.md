@@ -70,9 +70,21 @@ source: self
 - 已实现默认 `expand` 的单调 rollout mode、持久 floor、v3 绝对到期、generation/issuance
   fence、按 UID + generation 隔离的有界会话索引、legacy deny、默认 dry-run 的可续跑 migration
   apply，以及独立小连接池的 `token-session-admin`。合并或部署不会自动切到 v3、apply 或 enforce。
+- migration campaign/checkpoint 已按 campaign ID 隔离；batch/QPS 可在续跑时调整，固定 cutoff
+  过期后已有 campaign 仍可续跑，但命中的剩余记录会按既定绝对截止时间立即删除；dry-run 记为
+  `would_delete`，apply 记为 `deleted`，不再误报为 `shortened`。有限 legacy 策略不再硬编码，
+  工具要求显式选择 `natural` 或 `cap`，并把选择纳入不可变 campaign 安全身份；cutoff 已过期
+  或在 apply 运行中到期时，单 key Lua 都会在删除前要求显式确认立即删除影响。
+- `bounded` / `enforce` floor 会机器校验 migration completion/checkpoint 和同一当前 floor 下最近
+  两次完整 aggregate observe；首次推进 floor 时还会持久化批准的最小观测间隔，后续推进必须
+  使用至少 `1h` 且不低于已持久化值的间隔，两份证据必须达到本次批准的新值。旧版 control
+  若没有该字段仍可读取，并在下一次单调推进时由 CAS 自动补齐，无需删除或手改 Redis key。
+  缺失、损坏、含读取歧义、间隔不足或计数不达标均 fail closed。上线命令、required-floor
+  配对、Redis/连接预算和回滚边界见 runbook。
 - 已把主动改密/重置、账号禁用/最终注销、管理员删除与 monotonic revocation intent 放入同一
   MySQL 事务；同步 Redis 应用失败后由带 owner lease 的多副本 worker 幂等重试。当前退出先撤
-  HTTP bearer，再执行既有 IM 退出。
+  HTTP bearer，再执行既有 IM 退出。新 intent 的 `next_attempt_at` 为同步 by-ID claim 保留 5 秒
+  优先窗口；请求进程退出或失败后，共享 worker 再接管，不依赖副本本地锁或状态。
 - 登录 writer 已覆盖普通、username、email、manager、微信、GitHub、Gitee、OIDC/external、扫码、
   设备验证和注册；密码或账号状态在 issuance fence 后重新读取。管理端同时重查 `status` 与
   `is_destroy`，禁用/注销账号不能在撤销后重新登录。
@@ -128,6 +140,9 @@ source: self
 - 滚动升级允许 `expand` 与 `v3-write` 短暂混跑，因为所有 reader 已能安全识别 v3；此时不得
   进入 `revoke`、运行 apply 或创建 legacy deny marker。
 - 使用一个无 TTL、单 key 的 rollout control record 保存最小 writer version 和最小安全 mode；
+  同一 record 还保存显式批准的最小 observe 间隔。该值硬下界为 `1h`，后续阶段可经审批增大但
+  不得降低；证据必须满足本次写入的新值。旧版 record 缺失该字段时允许读取，下一次合法推进
+  以运维传入值原子补齐，不要求生产 Redis 手工删除或改写；
   只能由显式运维命令 CAS 向前推进，不能由公开 HTTP API 修改。所有副本进入 `v3-write` 后才把
   writer floor 设为 3；所有副本进入 `revoke` 后才允许创建 deny marker/运行 apply；apply 完成
   后才把安全 floor 推进到 `bounded`。运行时配置低于 floor 必须启动失败，迁移工具在前置 floor
@@ -271,12 +286,19 @@ legacy bearer 重新有效。
 - 每个 Token 由单 key Lua 重新读取当前 payload/version/PTTL 后决定，保证 TOCTOU 下仍满足：
   missing 或已变 v3 则 no-op；只缩短、不延长、不创建 key；短于目标的 TTL 保持不变；重复执行
   不以“本次运行时间 + grace”续期。
+- 已有 campaign 的绝对 cutoff 若在续跑前或本次限速扫描中已经过去，工具仍不得延长或替换该
+  安全 deadline；
+  命中的剩余目标记录必须删除，并在 dry-run/apply 中分别统计为 `would_delete` / `deleted`，使
+  运维能在 apply 前评估批量重新登录影响。此时 apply 必须额外显式确认 elapsed cutoff；仅传
+  `--apply` 时，每条记录的 Lua 都必须在 `DEL` 前 fail closed，本轮不得生成 completion evidence。
 - 永久 v1/v2 使用固定 `legacy_cutoff_at`；有限 v1/v2 按批准策略选择自然等待，或统一收敛到
   `min(当前 deadline, legacy_cutoff_at)`。超过 `TokenExpire` 的有限值至少压到上限。
 - v3 permanent/过期/generation 缺失本来就被 validator 拒绝；apply 不得把异常 v3“修复”为
   再次有效，只聚合告警并由单独清理动作删除。
-- 迁移使用独立小连接池和独立 latency/error 指标，不与在线 session pool 争抢连接；限速在
-  production 同拓扑压测后确定。
+- 迁移使用独立小连接池，不与在线 session pool 争抢连接；限速在 production 同拓扑压测后
+  确定。当前一次性工具以聚合 JSON、Job exit status/elapsed 和 Redis 平台指标作为运维证据，
+  尚未暴露独立 Prometheus latency/error endpoint；激活前必须把 Job 失败/超时接入告警，不能
+  仅依赖人工查看终端。
 
 进入 enforce 前至少完成两次 `complete=true` 的全前缀扫描，并同时满足
 `persistent=0, over_max=0, v1/v2=0`；两次扫描间隔和 campaign 证据写入 runbook。不能仅按
@@ -345,6 +367,9 @@ grace 已经过期推断 v1/v2 已清零。
 
 ## Rollout
 
+具体命令、配置配对、Kubernetes 旧副本清零证据、Redis 预检和 stop condition 见
+`docs/token-session-rollout-runbook.md`；以下状态机仍是放行依据：
+
 1. 在生产同拓扑预检配置、Redis Lua/SCAN/lease 兼容、non-evicting 安全状态、连接数和 v3/
    legacy 额外读取性能预算。
 2. 以 `expand` 部署 PR 2，清零所有 PR 2 之前副本；确认 v3 仍未签发。
@@ -366,8 +391,10 @@ grace 已经过期推断 v1/v2 已清零。
   PR 2 兼容制品；PR 1 没有运行时 generation resolver，不能作为可用回滚版本。
 - apply 可暂停/续跑，回滚不延长已经缩短的 TTL，不删除 legacy deny marker，也不清除 writer
   floor。已过期 Token 通过重新登录恢复，不能复活。
-- enforce 异常时最多退到 `bounded`，仍拒绝 permanent/over-max legacy、继续写 v3 并遵守 deny
-  marker；退回即意味着漏洞关闭条件暂时不成立，必须记录安全例外。禁止退到 `expand`。
+- enforce 灰度且 enforce floor 尚未建立时，异常最多退到 `bounded`，仍拒绝 permanent/over-max
+  legacy、继续写 v3 并遵守 deny marker；退回即意味着漏洞关闭条件暂时不成立，必须记录安全
+  例外。enforce floor 建立后不可再启动 bounded 实例，只能回滚到遵守 enforce floor 的兼容 v3
+  制品。禁止退到 `expand`。
 - generation/outbox 故障不得通过关闭 generation 校验或恢复 v2 writer 缓解；可暂停新登录/迁移、
   扩容 Redis、回滚到兼容 v3 制品并处理 backlog。
 
@@ -397,9 +424,12 @@ grace 已经过期推断 v1/v2 已清零。
 - 撤销矩阵中每个已签字事件都有 HTTP 集成测试；成功响应后旧 Token 返回统一未认证，IM 失败不
   恢复 bearer。密码 hash opportunistic rehash 不触发全量撤销。
 - migration dry-run 零写入且无秘密输出；apply 单执行者、可取消续跑、固定 cutoff、重复执行不
-  延期，覆盖 missing/persistent/finite-short/over-max/v1/v2/v3/concurrent-change/lock-loss。
+  延期，过期 cutoff 的删除与预删除单独统计；覆盖 missing/persistent/finite-short/over-max/
+  v1/v2/v3/concurrent-change/lock-loss。cutoff 在入口已过期或 apply 运行中到期时都必须额外
+  显式确认；否则入口校验或单 key Lua 会在删除前拒绝，本轮不能生成 completion evidence。
 - observe/apply 遇到读取错误、取消或未完成游标会输出 `complete=false`；只有两次完整扫描的
-  `persistent=0, over_max=0, v1/v2=0` 才允许 enforce。
+  `persistent=0, over_max=0, v1/v2=0` 且跨过本次批准的间隔才允许 enforce。批准间隔不得低于
+  `1h`，并且只能相对 rollout control 中已持久化的值增大、不能降低。
 - enforce 后 v1/v2、历史报告 Token、deny marker 命中的 legacy Token 全部失败；新 v1/v2 或
   permanent 异常触发告警。
 - 运行 focused `pkg/auth`、`modules/user`、`modules/oidc`、migration tests，`go test -race
@@ -413,6 +443,8 @@ grace 已经过期推断 v1/v2 已清零。
 包含当前设备在内的全部会话。以下环境参数和未接线路径不能由代码自行猜测：
 
 - legacy grace 与绝对 `legacy_cutoff_at`：原建议 7 天，需生产 observe 后签字。
+- 两次完整 observe 的最小间隔；工具要求每次 floor 推进时显式给出，硬下界为 `1h`，后续只可
+  经审批增大、不得降低。实际值需结合 Token QPS、Redis 压力和风险窗口签字。
 - finite v1/v2：自然等待最长 TTL，还是全部压到 cutoff；后者重新登录影响更大。
 - 单 UID 会话硬上限及超限策略；Web/PC 显式重登录继续复用剩余寿命，还是签发新 Token。
 - `/v1/user/quit`、`/v1/user/pc/quit`、设备删除的精确产品 scope；缺少稳定 device ID 时允许扩大
