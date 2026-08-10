@@ -180,11 +180,11 @@ func TestDeleteAdminUserRevokesEveryBearerDespiteCanceledRequestContext(t *testi
 		"a committed administrator deletion must revoke every device bearer even if the client disconnected")
 }
 
-// A committed mutation whose revocation intent is already leased by the shared
-// worker has succeeded — the intent is applied within the lease. Reporting that
-// as a failure tells the user their password change failed after it committed,
-// which invites a second change.
-func TestClaimSessionRevocationTreatsForeignLeaseAsDeferredApply(t *testing.T) {
+// A claim that cannot be taken has two very different meanings, and collapsing
+// them is unsafe in both directions: reporting a live foreign lease as a failure
+// tells the user their committed password change failed, while reporting it as
+// success acknowledges a high-risk mutation whose bearer may still be valid.
+func TestClaimSessionRevocationDistinguishesAppliedFromForeignLease(t *testing.T) {
 	_, _, userAPI, _ := newTokenHTTPTestServer(t)
 	uid := "lease-" + util.GenerUUID()[:10]
 	require.NoError(t, userAPI.db.Insert(&Model{
@@ -196,43 +196,45 @@ func TestClaimSessionRevocationTreatsForeignLeaseAsDeferredApply(t *testing.T) {
 	require.NoError(t, err)
 
 	now := time.Now().UTC()
-	claimed, err := userAPI.db.claimSessionRevocationByID(context.Background(), intent, "worker-owner", now)
+	claim, err := userAPI.db.claimSessionRevocationByID(context.Background(), intent, "worker-owner", now)
 	require.NoError(t, err)
-	require.True(t, claimed, "the worker takes the lease first")
+	require.Equal(t, sessionRevocationClaimAcquired, claim, "the worker takes the lease first")
 
-	// The synchronous request path arrives second. It cannot take the lease, but
-	// the revocation is not lost: the current owner applies it within the lease.
+	// The synchronous request path arrives second. The revocation is neither lost
+	// nor complete — it is owned by someone else and still pending.
 	contender := *intent
-	claimed, err = userAPI.db.claimSessionRevocationByID(context.Background(), &contender, "sync-owner", now)
-	require.NoError(t, err,
-		"another owner holding a live lease is deferred apply, not a failed revocation")
-	require.False(t, claimed)
+	claim, err = userAPI.db.claimSessionRevocationByID(context.Background(), &contender, "sync-owner", now)
+	require.NoError(t, err, "a live foreign lease is a distinct state, not a fault")
+	require.Equal(t, sessionRevocationClaimLeasedElsewhere, claim,
+		"a pending intent held by another owner must never be reported as applied")
 
 	// The lease must still be reclaimable once it expires, or a crashed owner
 	// would strand the intent.
-	claimed, err = userAPI.db.claimSessionRevocationByID(
+	claim, err = userAPI.db.claimSessionRevocationByID(
 		context.Background(), &contender, "sync-later", now.Add(sessionRevocationLease+time.Second))
 	require.NoError(t, err)
-	require.True(t, claimed, "an expired lease must be reclaimable")
+	require.Equal(t, sessionRevocationClaimAcquired, claim, "an expired lease must be reclaimable")
+
+	require.NoError(t, userAPI.db.markSessionRevocationApplied(context.Background(), &contender, "sync-later"))
+	claim, err = userAPI.db.claimSessionRevocationByID(
+		context.Background(), &contender, "sync-after-applied", time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, sessionRevocationClaimApplied, claim, "an applied intent is complete")
 
 	// A genuinely missing intent must still be an error: this must not become a
 	// blanket "any claim failure is fine".
 	missing := *intent
 	missing.ID = intent.ID + 1_000_000
-	_, err = userAPI.db.claimSessionRevocationByID(context.Background(), &missing, "sync-missing", now)
-	require.Error(t, err, "a vanished intent row is a real fault, not deferred apply")
+	_, err = userAPI.db.claimSessionRevocationByID(context.Background(), &missing, "sync-missing", time.Now().UTC())
+	require.Error(t, err, "a vanished intent row is a real fault, not a lease state")
 }
 
-// End-to-end shape of the same failure: the caller gets 200 and the password is
-// changed even though the worker owns the pending intent.
-func TestPasswordChangeSucceedsWhileWorkerOwnsRevocationIntent(t *testing.T) {
+// The synchronous path must not acknowledge a high-risk mutation while the
+// bearer revocation is still only promised. It waits inside the post-commit
+// budget for the current owner to finish, and reports a retryable failure if
+// that owner never does.
+func TestApplyRevocationWaitsForForeignOwnerAndFailsIfItNeverApplies(t *testing.T) {
 	_, ctx, userAPI, _ := newTokenHTTPTestServer(t)
-	uid := "wlease-" + util.GenerUUID()[:9]
-	require.NoError(t, userAPI.db.Insert(&Model{
-		UID: uid, Name: "worker lease user", Username: "wl_" + uid, ShortNo: "wl_" + uid,
-		Password: "before", Status: int(libcommon.UserAvailable),
-	}))
-
 	client := octoredis.NewInstrumentedClient(ctx.GetConfig())
 	store := auth.NewRedisSessionStore(
 		client,
@@ -243,27 +245,47 @@ func TestPasswordChangeSucceedsWhileWorkerOwnsRevocationIntent(t *testing.T) {
 		auth.WithSessionMaxPerUID(4),
 	)
 
-	// Reproduce the race deterministically: commit the intent, let the worker
-	// take its lease, then run the request path's apply step.
-	intent, err := userAPI.db.updateUserFieldWithSessionRevocation(
-		context.Background(), uid, "password", "after", "password_change")
-	require.NoError(t, err)
-	claimed, err := userAPI.db.claimSessionRevocationByID(
-		context.Background(), intent, "worker-owner", time.Now().UTC())
-	require.NoError(t, err)
-	require.True(t, claimed)
+	newLeasedIntent := func(t *testing.T, tag string) *sessionRevocationIntent {
+		t.Helper()
+		uid := tag + util.GenerUUID()[:8]
+		require.NoError(t, userAPI.db.Insert(&Model{
+			UID: uid, Name: "worker lease user", Username: "wl_" + uid, ShortNo: "wl_" + uid,
+			Password: "before", Status: int(libcommon.UserAvailable),
+		}))
+		intent, err := userAPI.db.updateUserFieldWithSessionRevocation(
+			context.Background(), uid, "password", "after", "password_change")
+		require.NoError(t, err)
+		claim, err := userAPI.db.claimSessionRevocationByID(
+			context.Background(), intent, "worker-owner", time.Now().UTC())
+		require.NoError(t, err)
+		require.Equal(t, sessionRevocationClaimAcquired, claim)
+		return intent
+	}
 
-	require.NoError(t, applyAndMarkSessionRevocation(context.Background(), userAPI.db, store, intent),
-		"a committed change whose intent is being applied by the worker must not report failure")
+	t.Run("owner never applies", func(t *testing.T) {
+		intent := newLeasedIntent(t, "stuck-")
+		err := applyAndMarkSessionRevocation(context.Background(), userAPI.db, store, intent)
+		require.Error(t, err,
+			"an intent still pending under another owner must not be acknowledged as revoked")
+		var pending int
+		_, loadErr := ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").
+			Where("id=? AND status=?", intent.ID, sessionRevocationPending).Load(&pending)
+		require.NoError(t, loadErr)
+		require.Equal(t, 1, pending, "the intent stays pending for its current owner to retry")
+	})
 
-	changed, err := userAPI.db.QueryByUID(uid)
-	require.NoError(t, err)
-	require.Equal(t, "after", changed.Password)
-	var pending int
-	_, err = ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").
-		Where("uid=? AND status=?", uid, sessionRevocationPending).Load(&pending)
-	require.NoError(t, err)
-	require.Equal(t, 1, pending, "the intent stays pending for its current owner")
+	t.Run("owner applies within the post-commit budget", func(t *testing.T) {
+		intent := newLeasedIntent(t, "conv-")
+		applied := make(chan struct{})
+		go func() {
+			defer close(applied)
+			time.Sleep(200 * time.Millisecond)
+			_ = userAPI.db.markSessionRevocationApplied(context.Background(), intent, "worker-owner")
+		}()
+		require.NoError(t, applyAndMarkSessionRevocation(context.Background(), userAPI.db, store, intent),
+			"a revocation that converges inside the budget is a success, not a failure")
+		<-applied
+	})
 }
 
 // Class guard for the defect above: this is the fourth call site where a
