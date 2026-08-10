@@ -398,3 +398,61 @@ func TestSpaceMembersSearchPaginationClamp(t *testing.T) {
 	assert.EqualValues(t, 205, resp.Count)
 	assert.Len(t, resp.List, 2)
 }
+
+// TestSpaceMembersSearchPhoneLast4TransitionsToShadowColumn 覆盖后 4 位检索的过渡表达式
+// COALESCE(NULLIF(u.phone_last4,”), RIGHT(u.phone,4)) 的两条分支。
+//
+// 背景：手机号加密第一阶引入了低敏列 user.phone_last4，但存量行要等回填任务
+// （POST /v1/manager/user/phone_shadow_backfill）跑完才有值。硬切到 phone_last4 会让
+// 未回填的存量成员搜不到；这个过渡表达式让检索随回填进度逐行切换。
+//
+// 两条分支必须都成立，否则"回填期间检索不回归"这个前提就是空话：
+//   - 已回填行：走 phone_last4（这里故意让它与 RIGHT(phone,4) 不同，以证明读的是新列）；
+//   - 未回填行：phone_last4 为空，回退到 RIGHT(phone,4)。
+//
+// 回填收敛后（GET .../phone_shadow_backfill 的 remaining 归零）应把表达式简化为直接用
+// u.phone_last4，届时本测试的"回退分支"用例即可删除。
+func TestSpaceMembersSearchPhoneLast4TransitionsToShadowColumn(t *testing.T) {
+	srv, _, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "sp-search-last4-transition"
+	seedMemberSearchSpace(t, spaceId, testutil.UID)
+
+	// 已回填行：phone_last4 = 7777，而明文 phone 的后 4 位是 1234
+	seedMemberSearchUser(t, "u-backfilled", "Backfilled", "backfilled", "b@example.com", "13800001234")
+	_, updErr := testCtx.DB().Update("user").Set("phone_last4", "7777").Where("uid=?", "u-backfilled").Exec()
+	assert.NoError(t, updErr)
+	seedMemberSearchMember(t, spaceId, "u-backfilled", 0, 1)
+
+	// 未回填行：phone_last4 保持空，只有明文 phone
+	seedMemberSearchUser(t, "u-legacy", "Legacy", "legacyuser", "l@example.com", "13900005555")
+	seedMemberSearchMember(t, spaceId, "u-legacy", 0, 1)
+
+	doSearch := func(keyword string) spaceMembersSearchResponse {
+		w := getMembersSearch(t, srv, testCtx, spaceId, url.Values{"keyword": {keyword}})
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		return decodeMembersSearchResp(t, w)
+	}
+
+	t.Run("已回填行按 phone_last4 命中", func(t *testing.T) {
+		resp := doSearch("7777")
+		assert.EqualValues(t, 1, resp.Count)
+		if assert.Len(t, resp.List, 1) {
+			assert.Equal(t, "u-backfilled", resp.List[0].UID)
+		}
+	})
+
+	t.Run("已回填行不再按明文后4位命中", func(t *testing.T) {
+		// phone_last4 非空时不应再回退到 RIGHT(phone,4)，否则等于同时暴露两个可检索粒度
+		resp := doSearch("1234")
+		assert.EqualValues(t, 0, resp.Count, "phone_last4 已有值时不应再匹配明文后 4 位")
+	})
+
+	t.Run("未回填行回退到明文后4位", func(t *testing.T) {
+		resp := doSearch("5555")
+		assert.EqualValues(t, 1, resp.Count)
+		if assert.Len(t, resp.List, 1) {
+			assert.Equal(t, "u-legacy", resp.List[0].UID)
+		}
+	})
+}

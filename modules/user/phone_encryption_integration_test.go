@@ -2,6 +2,8 @@ package user
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -83,6 +85,47 @@ func TestInsertUserWithPhoneEncryptionRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, found, "盲索引应命中，即使明文列已被改动")
 	assert.Equal(t, "u-with-phone", found.UID)
+}
+
+// TestInsertUserWithPhoneFailsClosedWithoutKey 锁住 fail-closed 契约：主密钥缺失时
+// 写入"带手机号的用户"必须失败，而不是降级成只写明文 phone。
+//
+// 降级写明文会让 OCTO_PII_ENCRYPTION_SECRET 漏配长期无人发现，明文手机号持续入库，
+// 而"手机号已加密存储"这个结论早已对外声明 —— 宁可注册报 5xx 让运维立刻看到。
+// 无手机号的用户不受影响（见 TestInsertUserWithoutPhoneSucceeds），所以缺密钥不会
+// 阻断 username / email / OAuth / 机器人账号的建号路径。
+func TestInsertUserWithPhoneFailsClosedWithoutKey(t *testing.T) {
+	withPhoneSecretForTest(t, "") // 清掉 TestMain 兜底的密钥
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+	require.Nil(t, d.phoneEnc, "密钥缺失时不应构造出加密器")
+
+	err := d.Insert(&Model{
+		UID:      "u-phone-nokey",
+		Username: "008613800009999",
+		Name:     "缺密钥带手机号",
+		ShortNo:  "sn-nokey",
+		Status:   1,
+		Zone:     "0086",
+		Phone:    "13800009999",
+	})
+	require.Error(t, err, "缺密钥时带手机号的写入必须失败，不得降级写明文")
+	assert.ErrorIs(t, err, ErrPhoneEncryptionUnavailable)
+
+	// 确认没有留下明文手机号
+	got, err := d.QueryByUID("u-phone-nokey")
+	require.NoError(t, err)
+	assert.Nil(t, got, "fail-closed 后不应有任何行落库")
+
+	// 同一个 DB 实例下，无手机号的用户仍可正常建号
+	require.NoError(t, d.Insert(&Model{
+		UID:      "u-nophone-nokey",
+		Username: "nophone_nokey",
+		Name:     "缺密钥无手机号",
+		ShortNo:  "sn-nophone-nokey",
+		Status:   1,
+	}), "缺密钥不得阻断无手机号用户的建号")
 }
 
 // TestDestroyFreesPhoneForReuse 是 CRITICAL-2 的行为回归：
@@ -197,4 +240,75 @@ func resetStrictRateLimitForUserTest(t *testing.T, ctx *config.Context, tag, ip 
 	if err := ctx.GetRedisConn().Del("ratelimit:strict:" + tag + ":" + ip); err != nil {
 		t.Logf("reset strict ratelimit bucket %s/%s failed: %v", tag, ip, err)
 	}
+}
+
+// TestBackfillPhoneShadow 覆盖存量回填：迁移只新增空列，存量行没有密文和盲索引，
+// 而读路径的明文兜底会让这件事看不出异常 —— 回填任务是这一阶真正生效的前提。
+func TestBackfillPhoneShadow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	// 造 5 个"存量"行：绕过 DB.Insert 直接写裸 SQL，模拟迁移前就存在、影子列为空的数据
+	for i := 0; i < 5; i++ {
+		_, err := ctx.DB().InsertBySql(
+			"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) "+
+				"VALUES (?,?,?,?,?,?,?,1,0)",
+			fmt.Sprintf("u-legacy-%d", i), fmt.Sprintf("0086139000000%02d", i),
+			fmt.Sprintf("legacy%d", i), "0086", fmt.Sprintf("139000000%02d", i),
+			fmt.Sprintf("sn-legacy-%d", i), fmt.Sprintf("v-legacy-%d@1", i),
+		).Exec()
+		require.NoError(t, err)
+	}
+	// 一个无手机号的行：不应被回填任务计入
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) " +
+			"VALUES ('u-legacy-nophone','nophone','nophone','','','sn-legacy-np','v-np@1',1,0)").Exec()
+	require.NoError(t, err)
+
+	pending, err := d.CountPhoneShadowPending()
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, pending, "只有 phone<>'' 且 phone_hash='' 的行算待回填")
+
+	// 小批次 + 零间隔，验证游标推进
+	res, err := d.BackfillPhoneShadow(context.Background(), 0, 2, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 5, res.Updated)
+	assert.EqualValues(t, 0, res.Failed)
+	assert.True(t, res.Done)
+	assert.EqualValues(t, 0, res.Remaining, "回填后应无待回填行")
+
+	// 回填后盲索引可用：按手机号查得到，且命中的是正确的行
+	found, err := d.QueryByPhone("0086", "13900000003")
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, "u-legacy-3", found.UID)
+	assert.Equal(t, "0003", found.PhoneLast4)
+	assert.NotEmpty(t, found.PhoneEncrypted)
+
+	// 幂等：再跑一次不应重复更新
+	res2, err := d.BackfillPhoneShadow(context.Background(), 0, 2, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, res2.Updated, "已回填的行不应被再次更新")
+	assert.True(t, res2.Done)
+
+	// 无手机号的行始终不被触碰
+	np, err := d.QueryByUID("u-legacy-nophone")
+	require.NoError(t, err)
+	require.NotNil(t, np)
+	assert.Empty(t, np.PhoneHash)
+}
+
+// TestBackfillPhoneShadowRequiresKey 回填同样 fail-closed：没有主密钥就直接报错，
+// 而不是空跑一遍留下满地空列、让运维误以为回填已完成。
+func TestBackfillPhoneShadowRequiresKey(t *testing.T) {
+	withPhoneSecretForTest(t, "")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	_, err := d.BackfillPhoneShadow(context.Background(), 0, 10, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPhoneEncryptionUnavailable)
 }

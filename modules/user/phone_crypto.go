@@ -12,9 +12,6 @@ import (
 	"io"
 	"os"
 	"strings"
-
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
-	"go.uber.org/zap"
 )
 
 // 手机号(PII)加密说明 —— 第一阶(加密列 + 盲索引 + 后4位检索列,明文 phone 列暂留):
@@ -251,34 +248,45 @@ func (e *phoneEncryptor) decryptPhone(cipherText []byte) (string, error) {
 	return string(plaintext), nil
 }
 
+// ErrPhoneEncryptionUnavailable 有手机号要写、但加密能力不可用（主密钥缺失/非法，
+// 或加密本身失败）。写路径必须把它作为 5xx 传播出去，不能降级成"只写明文"。
+var ErrPhoneEncryptionUnavailable = errors.New("user: phone encryption unavailable")
+
 // syncPhoneShadow 在写入前把三个手机号影子列同步成与 m.Phone 一致。
 //
 // 由 DB.Insert / DB.insertTx 统一调用 —— user 表全仓库只有这两个插入口，所以任何
 // 建号路径（含未来新增的）都会自动带上影子列，不依赖调用方记得手工调用。
 //
-// phoneEnc 未就绪（主密钥缺失）时只清零影子列、保留明文 phone，属于降级而非阻断：
-// 建号流程不应因为运维还没配密钥就整体失败。加密失败同理只 warn。
+// fail-closed：只要 m.Phone 非空而加密能力不可用，就返回 ErrPhoneEncryptionUnavailable
+// 让写入整体失败。**不做"只写明文"的降级** —— 那会让 OCTO_PII_ENCRYPTION_SECRET 漏配
+// 长期无人发现，明文手机号持续入库，而"手机号已加密存储"这个结论早已对外声明。
+// 宁可注册报 5xx（运维立刻看到并补配置），也不要静默积累明文 PII。
+//
+// 无手机号的用户（username / email / OAuth 注册、机器人账号）不受影响：清空影子列后
+// 正常放行，所以缺密钥不会阻断这些建号路径。
 //
 // 注意 update 路径不在这里覆盖：user.phone 目前唯一的改写点是
 // destroyAccountFromState（注销匿名化），它显式清空这三列 —— 影子列若比明文列
 // "活得更久"，已注销账号会继续占用原手机号（见该函数注释与
 // TestDestroyFreesPhoneForReuse）。新增任何改写 phone 的路径都必须同步这三列。
-func (d *DB) syncPhoneShadow(m *Model) {
+func (d *DB) syncPhoneShadow(m *Model) error {
 	if m == nil {
-		return
+		return nil
 	}
-	if d.phoneEnc == nil || m.Phone == "" {
+	if m.Phone == "" {
 		m.PhoneEncrypted, m.PhoneHash, m.PhoneLast4 = nil, "", ""
-		return
+		return nil
+	}
+	if d.phoneEnc == nil {
+		return fmt.Errorf("%w: %s must be configured before writing a phone number",
+			ErrPhoneEncryptionUnavailable, phoneEncryptionSecretEnv)
 	}
 	encrypted, hash, last4, err := d.phoneEnc.encryptPhone(m.Zone, m.Phone)
 	if err != nil {
-		log.Warn("手机号加密失败,本次写入跳过加密列(明文 phone 列不受影响)",
-			zap.String("uid", m.UID), zap.Error(err))
-		m.PhoneEncrypted, m.PhoneHash, m.PhoneLast4 = nil, "", ""
-		return
+		return fmt.Errorf("%w: %v", ErrPhoneEncryptionUnavailable, err)
 	}
 	m.PhoneEncrypted = encrypted
 	m.PhoneHash = hash
 	m.PhoneLast4 = last4
+	return nil
 }

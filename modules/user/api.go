@@ -3839,6 +3839,14 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		userModel.Username = fmt.Sprintf("%s%s", createUser.Zone, createUser.Phone)
 	}
 	if createUser.Password != "" {
+		// 兜底校验：本函数是所有建号路径的共享出口，各 handler 已在入口校验过，
+		// 这里再挡一次，防止将来新增的调用方绕过复杂度策略（Web3 找回密码就曾因
+		// 只在单个 handler 里接校验而漏掉）。现有调用方要么传空密码
+		// （github/gitee/OIDC），要么传已校验过的值，因此这里不改变既有行为。
+		if err := ValidatePasswordStrength(createUser.Password); err != nil {
+			u.Error("建号口令不满足复杂度策略", zap.Error(err))
+			return nil, err
+		}
 		hashedPwd, hashErr := HashPassword(createUser.Password)
 		if hashErr != nil {
 			u.Error("密码哈希失败", zap.Error(hashErr))

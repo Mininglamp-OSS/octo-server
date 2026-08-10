@@ -242,6 +242,13 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "sign_text")
 		return
 	}
+	// Web3 签名只证明"你是这个账号的持有者"，不约束新口令的强度。这里必须与手机号
+	// (pwdforget) / 邮箱 (emailForgetPwd) 两条找回路径同款校验，否则验签通过后可以把
+	// 密码设成 "1"，绕开整套复杂度策略。
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
 	user, err := u.db.QueryByUsername(req.Username)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))

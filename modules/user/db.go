@@ -115,14 +115,18 @@ func (d *DB) QueryByPhones(phones []string) ([]*Model, error) {
 
 // Insert 添加用户
 func (d *DB) Insert(m *Model) error {
-	d.syncPhoneShadow(m)
+	if err := d.syncPhoneShadow(m); err != nil {
+		return err
+	}
 	_, err := d.session.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // Insert 添加用户
 func (d *DB) insertTx(m *Model, tx *dbr.Tx) error {
-	d.syncPhoneShadow(m)
+	if err := d.syncPhoneShadow(m); err != nil {
+		return err
+	}
 	_, err := tx.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }

@@ -1,6 +1,7 @@
 package user
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -105,19 +106,24 @@ func TestPhoneBlindHash_DeterministicAndZoneScoped(t *testing.T) {
 	}
 }
 
-// TestSyncPhoneShadow_DegradesAndPopulates 覆盖 DB 层影子列同步的三种情形。
-// 同步点在 DB.Insert/insertTx 里，所以任何建号路径都会自动带上影子列 —— 这条测试
-// 保护的是"降级不阻断"与"有手机号必填齐"两个性质。
-func TestSyncPhoneShadow_DegradesAndPopulates(t *testing.T) {
-	// 主密钥缺失：清零影子列，明文 Phone 保留（降级而非阻断）
+// TestSyncPhoneShadow_FailsClosedAndPopulates 覆盖 DB 层影子列同步的契约。
+// 同步点在 DB.Insert/insertTx 里，所以任何建号路径都会自动带上影子列。
+func TestSyncPhoneShadow_FailsClosedAndPopulates(t *testing.T) {
+	// 主密钥缺失 + 有手机号：fail-closed，不得降级成"只写明文"
 	d := &DB{}
 	m := &Model{Zone: "0086", Phone: "13800001234"}
-	d.syncPhoneShadow(m)
-	if m.PhoneHash != "" || len(m.PhoneEncrypted) != 0 || m.PhoneLast4 != "" {
-		t.Fatal("主密钥缺失时影子列必须为空")
+	err := d.syncPhoneShadow(m)
+	if !errors.Is(err, ErrPhoneEncryptionUnavailable) {
+		t.Fatalf("缺密钥且有手机号时必须返回 ErrPhoneEncryptionUnavailable，实际=%v", err)
 	}
-	if m.Phone != "13800001234" {
-		t.Fatal("降级不得动明文 phone 列")
+
+	// 主密钥缺失 + 无手机号：放行（否则缺密钥会阻断 username/email/OAuth/机器人建号）
+	noPhone := &Model{Zone: "0086"}
+	if err := d.syncPhoneShadow(noPhone); err != nil {
+		t.Fatalf("缺密钥但无手机号时应放行，实际=%v", err)
+	}
+	if noPhone.PhoneHash != "" || len(noPhone.PhoneEncrypted) != 0 {
+		t.Fatal("无手机号时影子列必须为空")
 	}
 
 	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
@@ -127,16 +133,11 @@ func TestSyncPhoneShadow_DegradesAndPopulates(t *testing.T) {
 	}
 	d.phoneEnc = enc
 
-	// 无手机号：影子列为空
-	empty := &Model{Zone: "0086"}
-	d.syncPhoneShadow(empty)
-	if empty.PhoneHash != "" || len(empty.PhoneEncrypted) != 0 {
-		t.Fatal("无手机号时影子列必须为空")
-	}
-
 	// 有手机号：三列齐备
 	filled := &Model{Zone: "0086", Phone: "13800001234"}
-	d.syncPhoneShadow(filled)
+	if err := d.syncPhoneShadow(filled); err != nil {
+		t.Fatalf("syncPhoneShadow: %v", err)
+	}
 	if filled.PhoneHash == "" || len(filled.PhoneEncrypted) == 0 || filled.PhoneLast4 != "1234" {
 		t.Fatal("有手机号且密钥就绪时三个影子列都应填齐")
 	}
@@ -144,7 +145,9 @@ func TestSyncPhoneShadow_DegradesAndPopulates(t *testing.T) {
 	// 复用同一 Model 但清掉手机号：影子列必须被清零，不能留下陈旧值
 	// （陈旧影子列比明文列活得更久，就是注销后手机号无法复用的那类 P0 根因）
 	filled.Phone = ""
-	d.syncPhoneShadow(filled)
+	if err := d.syncPhoneShadow(filled); err != nil {
+		t.Fatalf("syncPhoneShadow: %v", err)
+	}
 	if filled.PhoneHash != "" || len(filled.PhoneEncrypted) != 0 || filled.PhoneLast4 != "" {
 		t.Fatal("手机号被清空时影子列必须一起清零，不得残留陈旧盲索引")
 	}

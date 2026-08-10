@@ -60,8 +60,12 @@ func TestMain(m *testing.M) {
 		// MySQL 8 无 ADD COLUMN IF NOT EXISTS（MariaDB 语法），故直接重建保证结构最新。
 		// 数据由各测试 setup 的 CleanAllTables 清理，重建只影响结构。
 		// username/phone 对齐生产 user 表（modules/user/sql/20191106000003），管理端成员搜索按这两列做 LIKE 匹配。
+		// phone_last4 对齐 modules/user/sql/20260810000001（手机号加密第一阶的低敏检索列）：
+		// 空间侧成员搜索的后 4 位匹配已改为 COALESCE(NULLIF(u.phone_last4,''), RIGHT(u.phone,4))，
+		// 缺这一列会让搜索 SQL 报 Unknown column。本包不 import modules/user，拿不到它的迁移，
+		// 所以这张 fixture 必须手工跟随被查询到的列。
 		"DROP TABLE IF EXISTS `user`",
-		"CREATE TABLE `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', username VARCHAR(40) DEFAULT '', email VARCHAR(200) DEFAULT '', phone VARCHAR(20) DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', username VARCHAR(40) DEFAULT '', email VARCHAR(200) DEFAULT '', phone VARCHAR(20) DEFAULT '', phone_last4 VARCHAR(4) NOT NULL DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		// user_verification 是 queryMembers 的 name 兜底来源（issue #344）：
 		// u.name 为空时回退 real_name。列对齐 modules/user/sql/20260505000003_user_legacy01.sql。
 		"CREATE TABLE IF NOT EXISTS user_verification (user_id VARCHAR(40) NOT NULL, real_name VARCHAR(128) NOT NULL DEFAULT '', source VARCHAR(32) NOT NULL DEFAULT '', source_sub VARCHAR(128) NOT NULL DEFAULT '', emp_id VARCHAR(64) DEFAULT NULL, dept VARCHAR(255) DEFAULT NULL, email VARCHAR(255) DEFAULT NULL, mobile VARCHAR(32) DEFAULT NULL, verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (user_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",

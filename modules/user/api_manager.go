@@ -85,6 +85,10 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser) // 解禁或封禁用户
 		auth.POST("/user/updatepassword", m.updatePwd)        // 修改用户密码
 		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
+		// 手机号影子列回填：一次性数据迁移任务，带游标反复调用直到 done。
+		// superAdmin 专属；见 db_phone_backfill.go。
+		auth.POST("/user/phone_shadow_backfill", m.phoneShadowBackfill)
+		auth.GET("/user/phone_shadow_backfill", m.phoneShadowBackfillStatus)
 	}
 	dashboardReader := r.Group(
 		"/v1/manager/user",
@@ -1650,4 +1654,58 @@ func newUserOnlineResp(m *onlineStatusWeightModel) *userOnlineResp {
 		LastOffline: m.LastOffline,
 		Online:      m.Online,
 	}
+}
+
+// phoneShadowBackfillReq 回填请求。cursor 由上一次响应的 next_cursor 透传回来，
+// 首次调用传 0。
+type phoneShadowBackfillReq struct {
+	Cursor     int64 `json:"cursor"`
+	BatchSize  int   `json:"batch_size"`
+	IntervalMS int   `json:"interval_ms"`
+}
+
+// phoneShadowBackfill 触发一批手机号影子列回填。
+//
+// 刻意做成"带游标的多次调用"而不是一次长跑请求：单次调用有批数上限（见
+// db_phone_backfill.go），运维按响应里的 next_cursor 反复 POST 直到 done=true，
+// 这样既不会产生长事务/超时，也能随时中断续跑（任务本身幂等）。
+func (m *Manager) phoneShadowBackfill(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	var req phoneShadowBackfillReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.Cursor < 0 {
+		respondUserRequestInvalid(c, "cursor")
+		return
+	}
+	result, err := m.userDB.BackfillPhoneShadow(
+		c.Request.Context(), req.Cursor, req.BatchSize, time.Duration(req.IntervalMS)*time.Millisecond)
+	if err != nil {
+		// 主密钥未配置也走这里：属于部署配置问题，对客户端是内部错误。
+		m.Error("手机号影子列回填失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	c.Response(result)
+}
+
+// phoneShadowBackfillStatus 只读进度：仍待回填的行数。用于确认回填是否收敛，
+// 以及后续把空间成员后四位检索从明文兜底切成纯 phone_last4 的判断依据。
+func (m *Manager) phoneShadowBackfillStatus(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	remaining, err := m.userDB.CountPhoneShadowPending()
+	if err != nil {
+		m.Error("统计手机号影子列待回填行数失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	c.Response(map[string]interface{}{"remaining": remaining})
 }

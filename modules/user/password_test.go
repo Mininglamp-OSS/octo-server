@@ -2,6 +2,7 @@ package user
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -68,5 +69,38 @@ func TestValidatePasswordStrength(t *testing.T) {
 				t.Fatalf("ValidatePasswordStrength(%q) = %v, want %v", tt.password, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestWeb3ResetPasswordEntryPointValidatesStrength 是一条源码守卫：
+// /v1/user/pwdforget_web3 曾经只校验密码非空就直接哈希 —— 签名只证明"你是账号持有者"，
+// 不约束新口令强度，验签通过后可以把密码设成 "1"，绕开整套复杂度策略。
+//
+// 用源码守卫而不是 HTTP 测试：该端点需要构造有效的 web3 签名 + Redis 里的
+// verify_text，成本远高于它保护的这一行；而"这个函数里必须调用
+// ValidatePasswordStrength"这个不变量正是回归时会被破坏的东西。
+func TestWeb3ResetPasswordEntryPointValidatesStrength(t *testing.T) {
+	raw, err := os.ReadFile("api_usernamelogin.go")
+	if err != nil {
+		t.Fatalf("read api_usernamelogin.go: %v", err)
+	}
+	src := string(raw)
+	const fn = "func (u *User) resetPwdWithWeb3PublicKey("
+	start := strings.Index(src, fn)
+	if start < 0 {
+		t.Fatal("resetPwdWithWeb3PublicKey not found; update this guard if it was renamed")
+	}
+	body := src[start:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	hashAt := strings.Index(body, "HashPassword(")
+	if hashAt < 0 {
+		t.Fatal("resetPwdWithWeb3PublicKey no longer hashes a password; update this guard")
+	}
+	validateAt := strings.Index(body, "ValidatePasswordStrength(")
+	if validateAt < 0 || validateAt > hashAt {
+		t.Error("resetPwdWithWeb3PublicKey must call ValidatePasswordStrength before HashPassword: " +
+			"a valid web3 signature proves account ownership, not that the new password meets policy")
 	}
 }
