@@ -111,6 +111,24 @@ func TestSessionRolloutControlBackfillsLegacyObservationGapOnNextAdvance(t *test
 	require.Equal(t, rolloutObservationGapForTest.Milliseconds(), control.ObservationMinGapMS)
 }
 
+func TestSessionRolloutControlRejectsSkippingPastPersistedFloor(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-rollout-skip:" + util.GenerUUID() + ":"
+	uidPrefix := "session-rollout-skip-uid:" + util.GenerUUID() + ":"
+	v3Store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	revokeStore := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeRevoke), WithSessionMaxPerUID(2))
+	enforceStore := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeEnforce), WithSessionMaxPerUID(2))
+	t.Cleanup(func() {
+		_ = client.Del(v3Store.rolloutControlKey()).Err()
+		_ = client.Close()
+	})
+
+	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest))
+	require.NoError(t, revokeStore.ValidateRolloutControl(context.Background(), SessionModeV3Write))
+	require.ErrorContains(t, enforceStore.ValidateRolloutControl(context.Background(), SessionModeV3Write), "more than one phase")
+}
+
 func TestRedisSessionStoreIssuesBoundedV3AndValidatorUsesGeneration(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
@@ -607,6 +625,54 @@ func TestRedisSessionStorePromotesLegacyReuseWithoutExtendingDeadline(t *testing
 	require.Equal(t, fence.Revision, info.SessionRevision)
 	require.Equal(t, now.Unix(), info.IssuedAt)
 	require.LessOrEqual(t, info.ExpiresAt, now.Add(20*time.Minute).Unix())
+}
+
+func TestPromoteLegacySessionConflictCleansOwnIndexReservation(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-promote-conflict:" + util.GenerUUID() + ":"
+	uidPrefix := "session-promote-conflict-uid:" + util.GenerUUID() + ":"
+	now := time.Date(2026, time.August, 10, 10, 0, 0, 0, time.UTC)
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2), WithSessionClock(func() time.Time { return now }))
+	uid := "u-" + util.GenerUUID()
+	token := "t-" + util.GenerUUID()
+	legacy, err := Encode(TokenInfo{UID: uid, Name: "old"})
+	require.NoError(t, err)
+	require.NoError(t, client.Set(prefix+token, legacy, 20*time.Minute).Err())
+	t.Cleanup(func() {
+		keys, _ := client.Keys(prefix + "*").Result()
+		meta, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, meta...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	staleRecord, err := store.ReadToken(context.Background(), prefix+token)
+	require.NoError(t, err)
+
+	ok, conflict, err := store.promoteLegacySession(context.Background(), token, staleRecord, TokenInfo{
+		UID: uid, Name: "winner", DeviceFlag: 1, DeviceID: "winner-device",
+	}, fence)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, conflict)
+
+	ok, conflict, err = store.promoteLegacySession(context.Background(), token, staleRecord, TokenInfo{
+		UID: uid, Name: "loser", DeviceFlag: 1, DeviceID: "loser-device",
+	}, fence)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.True(t, conflict)
+
+	members, err := client.ZRange(store.sessionIndexKey(uid, fence.Generation), 0, -1).Result()
+	require.NoError(t, err)
+	winnerMember, err := encodeSessionIndexMember(token, 1, "winner-device")
+	require.NoError(t, err)
+	require.Equal(t, []string{winnerMember}, members, "losing promotion must not consume a bounded-session slot")
 }
 
 func TestRedisSessionStoreSnapshotUpdatePreservesV3SecurityClaims(t *testing.T) {

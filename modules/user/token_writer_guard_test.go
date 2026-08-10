@@ -77,6 +77,22 @@ func write(ctx Context, renamed string) {
 	}
 }
 
+func TestDirectTokenWriterGuardRejectsCredentialDeletionMethods(t *testing.T) {
+	for _, method := range []string{"Del", "Delete", "Unlink"} {
+		t.Run(method, func(t *testing.T) {
+			source := fmt.Sprintf(`package fixture
+func remove(ctx Context, renamed string) {
+	ctx.Cache().%s(ctx.GetConfig().Cache.TokenCachePrefix + renamed)
+	ctx.Cache().%s(ctx.GetConfig().Cache.UIDTokenCachePrefix + renamed)
+}`, method, method)
+			fset := gotoken.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", source, 0)
+			require.NoError(t, err)
+			require.Len(t, tokenWriterViolations(fset, file, "fixture.go"), 2)
+		})
+	}
+}
+
 func TestDirectTokenWriterGuardRejectsSessionSecurityNamespaceMutations(t *testing.T) {
 	tests := []struct {
 		method string
