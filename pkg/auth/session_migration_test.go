@@ -284,6 +284,55 @@ func TestLegacyMigrationCancellationReportsIncompleteAndCanResume(t *testing.T) 
 	}
 }
 
+func TestLegacyMigrationRestartsSavedCursorAfterRedisInstanceChange(t *testing.T) {
+	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
+	ctx := context.Background()
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutObservationGapForTest))
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutObservationGapForTest))
+
+	for i := 0; i < 128; i++ {
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("redis-restart-%03d", i)), "v2:legacy", 0).Err())
+	}
+	skippedKeys, savedCursor, err := client.Scan(0, store.tokenPrefix+"*", 1).Result()
+	require.NoError(t, err)
+	require.NotEmpty(t, skippedKeys)
+	require.NotZero(t, savedCursor, "fixture requires a resumable non-zero SCAN cursor")
+
+	campaignID := "redis-instance-change"
+	checkpoint := legacyMigrationCheckpoint{
+		CampaignID:      campaignID,
+		RedisInstanceID: "old-redis-instance",
+		Cursor:          savedCursor,
+		Result: LegacyMigrationResult{
+			CampaignID: campaignID,
+			Scanned:    int64(len(skippedKeys)),
+			LastCursor: savedCursor,
+		},
+	}
+	raw, err := json.Marshal(checkpoint)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(store.migrationCheckpointKey(campaignID), string(raw), 0).Err())
+	store.redisInstanceIDFn = func() (string, error) { return "new-redis-instance", nil }
+
+	result, err := store.MigrateLegacySessions(ctx, LegacyMigrationOptions{
+		CampaignID:   campaignID,
+		CutoffAt:     time.Now().UTC().Add(time.Hour),
+		FinitePolicy: LegacyFinitePolicyCap,
+		BatchSize:    1,
+		Apply:        true,
+		Lease:        5 * time.Second,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Complete)
+	for _, key := range skippedKeys {
+		require.Positive(t, mustPTTL(t, client, key), "a cursor from another Redis process must not skip its earlier page")
+	}
+
+	loaded, err := store.loadMigrationCheckpoint(campaignID)
+	require.NoError(t, err)
+	require.Equal(t, "new-redis-instance", loaded.RedisInstanceID)
+}
+
 func TestLegacyMigrationCampaignCanRetuneRuntimeRateAndStartAnotherCampaign(t *testing.T) {
 	t.Run("resume with retuned batch and interval", func(t *testing.T) {
 		store, _ := newLegacyMigrationTestStore(t, SessionModeRevoke)
@@ -521,12 +570,151 @@ func TestRecordRolloutObservationRejectsIncompleteOrAmbiguousEvidence(t *testing
 
 	for _, observation := range []SessionObservation{
 		{},
+		{Complete: true},
 		{Complete: true, ReadErrors: 1},
 		{Complete: true, InvalidTTL: 1},
 		{Complete: true, DecodeInvalid: 1},
 	} {
 		require.Error(t, store.RecordRolloutObservation(ctx, observation))
 	}
+}
+
+func TestRecordRolloutObservationRejectsDuplicateScanAndInconsistentCounts(t *testing.T) {
+	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
+	ctx := context.Background()
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutObservationGapForTest))
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutObservationGapForTest))
+	require.NoError(t, client.Set(store.tokenKey("observed"), "v2:{\"uid\":\"u1\"}", time.Minute).Err())
+
+	observation, err := store.Observe(ctx, 100)
+	require.NoError(t, err)
+	require.NotEmpty(t, observation.ScanID)
+	require.NotEmpty(t, observation.ScopeFingerprint)
+	require.NoError(t, store.RecordRolloutObservation(ctx, observation))
+	require.ErrorContains(t, store.RecordRolloutObservation(ctx, observation), "already recorded")
+
+	inconsistent := observation
+	inconsistent.ScanID = "different-scan"
+	inconsistent.Total++
+	require.ErrorContains(t, store.RecordRolloutObservation(ctx, inconsistent), "counts")
+}
+
+func TestRolloutAdvanceRejectsVacuousLegacyObservationEvidence(t *testing.T) {
+	tests := []struct {
+		name    string
+		current SessionMode
+		next    SessionMode
+	}{
+		{name: "bounded", current: SessionModeRevoke, next: SessionModeBounded},
+		{name: "enforce", current: SessionModeBounded, next: SessionModeEnforce},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			store, client := newLegacyMigrationTestStore(t, tt.current, WithSessionClock(func() time.Time { return now }))
+			ctx := context.Background()
+			require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutObservationGapForTest))
+			require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutObservationGapForTest))
+			if tt.current == SessionModeBounded {
+				control := SessionRolloutControl{
+					ModeFloor:           SessionModeBounded,
+					WriterVersion:       3,
+					ObservationMinGapMS: rolloutObservationGapForTest.Milliseconds(),
+				}
+				raw, err := json.Marshal(control)
+				require.NoError(t, err)
+				require.NoError(t, client.Set(store.rolloutControlKey(), string(raw), 0).Err())
+			} else {
+				result, err := store.MigrateLegacySessions(ctx, LegacyMigrationOptions{
+					CampaignID:   "empty-observation-gate",
+					CutoffAt:     now.Add(time.Hour),
+					FinitePolicy: LegacyFinitePolicyCap,
+					BatchSize:    100,
+					Apply:        true,
+					Lease:        5 * time.Second,
+				})
+				require.NoError(t, err)
+				require.True(t, result.Complete)
+			}
+
+			history := []rolloutObservationEvidence{
+				{ID: "legacy-empty-1", RecordedAtMS: now.Add(time.Millisecond).UnixMilli(), ModeFloor: tt.current, Observation: SessionObservation{Complete: true}},
+				{ID: "legacy-empty-2", RecordedAtMS: now.Add(rolloutObservationGapForTest + time.Millisecond).UnixMilli(), ModeFloor: tt.current, Observation: SessionObservation{Complete: true}},
+			}
+			raw, err := json.Marshal(history)
+			require.NoError(t, err)
+			require.NoError(t, client.Set(store.rolloutObservationEvidenceKey(), string(raw), 0).Err())
+
+			err = store.AdvanceRolloutControl(ctx, tt.next, rolloutObservationGapForTest)
+			require.ErrorContains(t, err, "non-empty")
+		})
+	}
+}
+
+func TestRolloutObservationEvidenceCannotCrossTokenScopes(t *testing.T) {
+	now := time.Now().UTC()
+	store, client := newLegacyMigrationTestStore(t, SessionModeBounded, WithSessionClock(func() time.Time { return now }))
+	ctx := context.Background()
+	control := SessionRolloutControl{
+		ModeFloor:           SessionModeBounded,
+		WriterVersion:       3,
+		ObservationMinGapMS: rolloutObservationGapForTest.Milliseconds(),
+	}
+	raw, err := json.Marshal(control)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(store.rolloutControlKey(), string(raw), 0).Err())
+
+	payload, err := EncodeV3(TokenInfo{
+		UID:               "scope-user",
+		IssuedAt:          now.Add(-time.Minute).Unix(),
+		ExpiresAt:         now.Add(time.Hour).Unix(),
+		SessionGeneration: "scope-generation",
+		SessionRevision:   1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.Set(store.tokenKey("scope-token"), payload, time.Hour).Err())
+	for i := 0; i < 2; i++ {
+		observation, err := store.Observe(ctx, 100)
+		require.NoError(t, err)
+		require.NoError(t, store.RecordRolloutObservation(ctx, observation))
+		now = now.Add(rolloutObservationGapForTest)
+	}
+
+	otherStore := NewRedisSessionStore(
+		client,
+		"another-token-scope:"+util.GenerUUID()+":",
+		store.uidTokenPrefix,
+		store.maxTTL,
+		WithSessionMode(SessionModeBounded),
+		WithSessionMaxPerUID(10),
+		WithSessionClock(func() time.Time { return now }),
+	)
+	err = otherStore.AdvanceRolloutControl(ctx, SessionModeEnforce, rolloutObservationGapForTest)
+	require.ErrorContains(t, err, "scope")
+}
+
+func TestEnforceFloorRequiresObservedV3Session(t *testing.T) {
+	now := time.Now().UTC()
+	store, client := newLegacyMigrationTestStore(t, SessionModeBounded, WithSessionClock(func() time.Time { return now }))
+	ctx := context.Background()
+	control := SessionRolloutControl{
+		ModeFloor:           SessionModeBounded,
+		WriterVersion:       3,
+		ObservationMinGapMS: rolloutObservationGapForTest.Milliseconds(),
+	}
+	raw, err := json.Marshal(control)
+	require.NoError(t, err)
+	require.NoError(t, client.Set(store.rolloutControlKey(), string(raw), 0).Err())
+	require.NoError(t, client.Set(store.tokenKey("legacy-only"), "v2:{\"uid\":\"u1\"}", time.Minute).Err())
+
+	for i := 0; i < 2; i++ {
+		observation, err := store.Observe(ctx, 100)
+		require.NoError(t, err)
+		require.NoError(t, store.RecordRolloutObservation(ctx, observation))
+		now = now.Add(rolloutObservationGapForTest)
+	}
+	err = store.AdvanceRolloutControl(ctx, SessionModeEnforce, rolloutObservationGapForTest)
+	require.ErrorContains(t, err, "v3 > 0")
 }
 
 type legacyTokenSnapshot struct {
