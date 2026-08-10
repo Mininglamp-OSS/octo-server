@@ -3992,7 +3992,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		}
 		return nil, err
 	}
-	u.finishSuccessfulLogin(createUser.UID, userModel.Username, publicIP, "register")
+	u.finishSuccessfulLogin(createUser.UID, userModel.Username, publicIP, createUser.auditLoginType())
 
 	if u.ctx.GetConfig().ShortNo.NumOn {
 		err = u.commonService.SetShortnoUsed(userModel.ShortNo, "user")
@@ -4024,6 +4024,16 @@ type createUserModel struct {
 	IsUploadAvatar int
 	AvatarVersion  int64
 	Device         *deviceReq
+	// LoginType records the external identity source when account creation is
+	// itself the first login. Empty means an ordinary registration.
+	LoginType string
+}
+
+func (m *createUserModel) auditLoginType() string {
+	if m == nil || m.LoginType == "" {
+		return "register"
+	}
+	return m.LoginType
 }
 
 // 重置登录密码

@@ -114,6 +114,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 			Name:      name,
 			GithubUID: userInfo.Login,
 			Flag:      int(deviceFlag.Uint8()),
+			LoginType: "github",
 		}
 		if userInfo.AvatarURL != "" {
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
