@@ -92,12 +92,14 @@ func (d *DB) QueryByEmail(email string) (*Model, error) {
 // 不需要解密；主密钥未配置或未命中(存量行尚未回填)时退回明文比较兜底，保证第一阶
 // 加密上线过程中查询行为不回归。盲索引路径必须排除已完成注销的行：若曾回滚到不认识
 // 影子列的旧版本，旧版本注销账号时会留下 phone_hash，roll-forward 后不能让该墓碑继续
-// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。见 phone_crypto.go。
+// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。两条路径都按主键选择最早行，
+// 避免存量重复号码随执行计划变动而命中不同账号。见 phone_crypto.go。
 func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
 	if hash, err := PhoneBlindHash(zone, phone); err == nil {
 		var model *Model
 		if _, err := d.session.Select("*").From("user").
-			Where("phone_hash=? AND is_destroy<>?", hash, IsDestroyDone).Load(&model); err != nil {
+			Where("phone_hash=? AND is_destroy<>?", hash, IsDestroyDone).
+			OrderAsc("id").Limit(1).Load(&model); err != nil {
 			return nil, err
 		}
 		if model != nil {
@@ -105,7 +107,8 @@ func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
 		}
 	}
 	var model *Model
-	_, err := d.session.Select("*").From("user").Where("zone=? and phone=?", zone, phone).Load(&model)
+	_, err := d.session.Select("*").From("user").Where("zone=? and phone=?", zone, phone).
+		OrderAsc("id").Limit(1).Load(&model)
 	return model, err
 }
 
