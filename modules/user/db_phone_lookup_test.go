@@ -13,9 +13,9 @@ func TestQueryByPhoneFiltersDestroyedRowsFromBlindIndexLookup(t *testing.T) {
 	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
 	d, mock := newPhoneLookupMock(t)
 
-	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\)`).
+	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\) ORDER BY id ASC LIMIT 1$`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	mock.ExpectQuery(`SELECT \* FROM user WHERE \(zone='0086' and phone='13800001234'\)`).
+	mock.ExpectQuery(`SELECT \* FROM user WHERE \(zone='0086' and phone='13800001234'\) ORDER BY id ASC LIMIT 1$`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	got, err := d.QueryByPhone("0086", "13800001234")
@@ -34,7 +34,7 @@ func TestQueryByPhoneReturnsActiveBlindIndexMatch(t *testing.T) {
 	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
 	d, mock := newPhoneLookupMock(t)
 
-	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\)`).
+	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\) ORDER BY id ASC LIMIT 1$`).
 		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("u-active"))
 
 	got, err := d.QueryByPhone("0086", "13800001234")
@@ -54,7 +54,7 @@ func TestQueryByPhonePropagatesBlindIndexQueryError(t *testing.T) {
 	d, mock := newPhoneLookupMock(t)
 	wantErr := errors.New("blind lookup unavailable")
 
-	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\)`).
+	mock.ExpectQuery(`SELECT \* FROM user WHERE \(phone_hash='[^']+' AND is_destroy<>2\) ORDER BY id ASC LIMIT 1$`).
 		WillReturnError(wantErr)
 
 	if _, err := d.QueryByPhone("0086", "13800001234"); !errors.Is(err, wantErr) {
@@ -70,7 +70,7 @@ func TestQueryByPhoneFallsBackWhenEncryptionKeyUnavailable(t *testing.T) {
 	d, mock := newPhoneLookupMock(t)
 	wantErr := errors.New("plaintext lookup unavailable")
 
-	mock.ExpectQuery(`SELECT \* FROM user WHERE \(zone='0086' and phone='13800001234'\)`).
+	mock.ExpectQuery(`SELECT \* FROM user WHERE \(zone='0086' and phone='13800001234'\) ORDER BY id ASC LIMIT 1$`).
 		WillReturnError(wantErr)
 
 	if _, err := d.QueryByPhone("0086", "13800001234"); !errors.Is(err, wantErr) {
