@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -311,4 +312,150 @@ func TestBackfillPhoneShadowRequiresKey(t *testing.T) {
 	_, err := d.BackfillPhoneShadow(context.Background(), 0, 10, 0)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrPhoneEncryptionUnavailable)
+}
+
+// TestBackfillPhoneShadowSkipsAlreadyDestroyedRow 覆盖回填的 CAS 竞态。
+//
+// 回填是"先读 (id, zone, phone) → 再算密文 → 再 UPDATE"。若 UPDATE 条件只判
+// id + phone_hash=”，那么"读取之后账号被并发注销"这条竞态会把注销前手机号的
+// 密文/盲索引写回去 —— 已注销账号又重新占用原手机号，正是
+// destroyAccountFromState 要消除的那个 P0（注销后手机号无法复用）。
+//
+// 这里用"回填前先注销"来确定性地模拟该竞态的结果状态：注销后 phone 变成墓碑值、
+// phone_hash 被清空，若回填仍按旧 phone 写回，就会重现该缺陷。
+func TestBackfillPhoneShadowSkipsAlreadyDestroyedRow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	// 造一个"存量未回填"且带手机号的行
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) " +
+			"VALUES ('u-race','008613900007777','race','0086','13900007777','sn-race','v-race@1',1,0)").Exec()
+	require.NoError(t, err)
+
+	// 注销：phone 匿名化 + 影子列清空（destroyAccountFromState 的真实行为）
+	require.NoError(t, d.destroyAccount("u-race", "anon-race", "13900007777@1700000000000@delete"))
+
+	// 回填不得把注销前手机号的盲索引写回
+	res, err := d.BackfillPhoneShadow(context.Background(), 0, 10, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, res.Updated, "已注销账号不应被回填")
+
+	after, err := d.QueryByUID("u-race")
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Empty(t, after.PhoneHash, "回填不得为已注销账号重建盲索引")
+
+	// 关键断言：原手机号仍然是"未被占用"的，可以被新用户复用
+	byPhone, err := d.QueryByPhone("0086", "13900007777")
+	require.NoError(t, err)
+	assert.Nil(t, byPhone, "注销释放的手机号不得因回填而重新被占用")
+}
+
+// TestBackfillPhoneShadowDoneRequiresRemainingZero 覆盖游标与完成判定：
+// 失败行不能永久落在 next_cursor 之后，也不能在 remaining>0 时报告 done=true。
+func TestBackfillPhoneShadowDoneRequiresRemainingZero(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	for i := 0; i < 3; i++ {
+		_, err := ctx.DB().InsertBySql(
+			"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) "+
+				"VALUES (?,?,?,?,?,?,?,1,0)",
+			fmt.Sprintf("u-cur-%d", i), fmt.Sprintf("0086138000001%02d", i), fmt.Sprintf("cur%d", i),
+			"0086", fmt.Sprintf("138000001%02d", i), fmt.Sprintf("sn-cur-%d", i), fmt.Sprintf("v-cur-%d@1", i),
+		).Exec()
+		require.NoError(t, err)
+	}
+
+	// batchSize=1 让扫描分多批推进，验证游标语义
+	res, err := d.BackfillPhoneShadow(context.Background(), 0, 1, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, res.Updated)
+	assert.True(t, res.Done, "全部回填完成后 done 应为 true")
+	assert.EqualValues(t, 0, res.Remaining)
+	assert.EqualValues(t, 0, res.NextCursor, "扫到表尾后游标应归 0，便于下一轮重试残留行")
+}
+
+// TestBackfillPhoneShadowDefaultIntervalThrottles 请求省略 interval_ms（零值）时
+// 必须落到默认节流，而不是被当成"不限速"。
+func TestBackfillPhoneShadowDefaultIntervalThrottles(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	// 两行 + batchSize=1 → 至少要跨一次批间隔
+	for i := 0; i < 2; i++ {
+		_, err := ctx.DB().InsertBySql(
+			"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) "+
+				"VALUES (?,?,?,?,?,?,?,1,0)",
+			fmt.Sprintf("u-thr-%d", i), fmt.Sprintf("0086137000002%02d", i), fmt.Sprintf("thr%d", i),
+			"0086", fmt.Sprintf("137000002%02d", i), fmt.Sprintf("sn-thr-%d", i), fmt.Sprintf("v-thr-%d@1", i),
+		).Exec()
+		require.NoError(t, err)
+	}
+
+	start := time.Now()
+	// interval 传 0 —— 等价于 HTTP 请求省略 interval_ms
+	res, err := d.BackfillPhoneShadow(context.Background(), 0, 1, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, res.Updated)
+	assert.GreaterOrEqual(t, time.Since(start), defaultBackfillInterval,
+		"interval 零值必须落到默认节流，否则默认请求完全没有限速")
+}
+
+// TestPhoneShadowBackfillCASRejectsChangedRow 直接断言回填 UPDATE 的 CAS 谓词：
+// 行在读取之后被改写（典型场景是并发注销）时，UPDATE 必须影响 0 行。
+//
+// 为什么单独测谓词而不是走 BackfillPhoneShadow：CAS 保护的是"读取后、更新前"这个
+// 窗口，而扫描与更新在同一次函数调用内完成，没有注入点可以确定性地交错；靠并发
+// goroutine 触发会得到一条 flaky 测试。这里复用生产代码同一份
+// phoneShadowBackfillCAS 常量，所以谓词不会与生产实现漂移。
+func TestPhoneShadowBackfillCASRejectsChangedRow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) " +
+			"VALUES ('u-cas','008613900006666','cas','0086','13900006666','sn-cas','v-cas@1',1,0)").Exec()
+	require.NoError(t, err)
+
+	var row struct {
+		ID    int64  `db:"id"`
+		Zone  string `db:"zone"`
+		Phone string `db:"phone"`
+	}
+	_, err = ctx.DB().Select("id", "zone", "phone").From("user").
+		Where("uid=?", "u-cas").Load(&row)
+	require.NoError(t, err)
+	require.NotZero(t, row.ID)
+
+	// 模拟"读取之后账号被并发注销"：phone 改成墓碑值，phone_hash 仍为空
+	require.NoError(t, d.destroyAccount("u-cas", "anon-cas", "13900006666@1700000000000@delete"))
+
+	// 用回填读到的旧 zone/phone 发起 UPDATE —— CAS 必须失配
+	encrypted, hash, last4, err := d.phoneEnc.encryptPhone(row.Zone, row.Phone)
+	require.NoError(t, err)
+	res, err := ctx.DB().Update("user").SetMap(map[string]interface{}{
+		"phone_encrypted": encrypted,
+		"phone_hash":      hash,
+		"phone_last4":     last4,
+	}).Where(phoneShadowBackfillCAS, row.ID, row.Zone, row.Phone, IsDestroyDone).Exec()
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, affected,
+		"行在读取后被改写时 CAS 必须失配；影响 1 行说明注销释放的手机号会被回填重新占用")
+
+	// 手机号确实仍然是可复用的
+	byPhone, err := d.QueryByPhone("0086", "13900006666")
+	require.NoError(t, err)
+	assert.Nil(t, byPhone)
 }

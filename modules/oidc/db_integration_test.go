@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -374,4 +375,47 @@ func TestDB_UkUidIssuer_RejectsDuplicate_Integration(t *testing.T) {
 	rows, err := d.QueryIdentitiesByUID("u-uk")
 	require.NoError(t, err)
 	assert.Len(t, rows, 2)
+}
+
+// TestDB_QueryUIDsByPhone_MergesHashAndPlaintextDuringPartialBackfill 覆盖手机号加密
+// 第一阶的过渡期语义：盲索引与明文两路结果必须合并去重，不能"盲索引命中就提前返回"。
+//
+// 存量回填是渐进的，而 (zone, phone) 不是强唯一约束（历史脏数据可能有重复行）。
+// 若一个重复账号已回填、另一个未回填，提前返回只会给出一个 uid —— 调用方
+// BindLocator 靠 len(uids) 判唯一性，于是"多账号冲突"被误判成"唯一账号"，
+// SMS 绑定会把 OIDC 身份挂到其中一个账号上。
+func TestDB_QueryUIDsByPhone_MergesHashAndPlaintextDuringPartialBackfill(t *testing.T) {
+	t.Setenv("OCTO_PII_ENCRYPTION_SECRET", "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	hash, err := user.PhoneBlindHash("0086", "13900008888")
+	require.NoError(t, err)
+
+	// 已回填的重复账号：有盲索引
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, phone_hash, short_no, vercode, status, is_destroy) "+
+			"VALUES ('u-dup-backfilled','dup1','Dup1','0086','13900008888',?,'sn-dup1','v-dup1@1',1,0)",
+		hash,
+	).Exec()
+	require.NoError(t, err)
+
+	// 未回填的重复账号：同手机号，phone_hash 仍为空
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) " +
+			"VALUES ('u-dup-legacy','dup2','Dup2','0086','13900008888','sn-dup2','v-dup2@1',1,0)").Exec()
+	require.NoError(t, err)
+
+	uids, err := d.QueryUIDsByPhone("0086", "13900008888")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"u-dup-backfilled", "u-dup-legacy"}, uids,
+		"过渡期必须同时返回已回填与未回填的同号账号，否则冲突会被误判为唯一账号")
+
+	// 两路都命中同一行时不得重复返回
+	_, err = ctx.DB().Update("user").Set("phone_hash", hash).Where("uid=?", "u-dup-legacy").Exec()
+	require.NoError(t, err)
+	uids, err = d.QueryUIDsByPhone("0086", "13900008888")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"u-dup-backfilled", "u-dup-legacy"}, uids, "合并结果必须去重")
 }

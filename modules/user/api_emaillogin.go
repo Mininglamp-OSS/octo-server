@@ -331,8 +331,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		return
 	}
 	c.Response(result)
-	go u.sentWelcomeMsg(publicIP, userInfo.UID)
-	u.loginLog.recordSuccess(userInfo.UID, userInfo.Email, publicIP, "email")
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Email, publicIP, "email")
 }
 
 // emailForgetPwd 邮箱忘记密码（重置密码）

@@ -177,8 +177,14 @@ func New(ctx *config.Context) *User {
 	u.updateSystemUserToken()
 	// 手机号加密器由 NewDB 持有并在 Insert/insertTx 里统一同步影子列；这里只做一次
 	// 运维可见性提示，避免每个 NewDB 都刷同一条 warn。
+	//
+	// 用 Error 而不是 Warn，且必须如实描述降级范围：手机号写入是 fail-closed 的
+	// （见 DB.syncPhoneShadow），缺密钥时**任何带手机号的建号都会失败**，不是
+	// "只是不写影子列"。日志说错降级范围会把生产排障带到完全错误的方向。
 	if u.db.phoneEnc == nil {
-		u.Warn("手机号加密主密钥未就绪,新用户的手机号加密列/盲索引将不会写入(明文 phone 列不受影响)",
+		u.Error("手机号加密主密钥未配置：所有带手机号的建号将失败（手机号注册、后台新增用户、"+
+			"全新环境的超管初始化）；不带手机号的建号（用户名/邮箱/OAuth/机器人账号）不受影响。"+
+			"请配置该环境变量（32 字节）后重启。",
 			zap.String("env", phoneEncryptionSecretEnv))
 	}
 	source.SetUserProvider(u)
@@ -1652,8 +1658,7 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 	c.Response(result)
 
 	publicIP := util.GetClientPublicIP(c.Request)
-	go u.sentWelcomeMsg(publicIP, userInfo.UID)
-	u.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, loginType)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, publicIP, loginType)
 }
 
 // respondExecLoginError is the single classifier for execLogin's returned error,
@@ -1879,8 +1884,28 @@ func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) 
 	return nil
 }
 
+// finishSuccessfulLogin 统一处理登录成功后的收尾动作，顺序是有语义的：
+//
+//  1. 先读"上次登录信息"——必须在写入本次登录日志**之前**。否则 sentWelcomeMsg
+//     里的 getLastLoginIP 会读到刚写进去的本次登录，把本次当成上次展示给用户。
+//     （历史上 loginLog.add 写在 sentWelcomeMsg 末尾，顺序天然正确；把日志写入
+//     从欢迎语里解耦出来时就必须显式保住这个顺序。）
+//  2. 异步发欢迎语（含 500ms 等持久化的 sleep，不能占住请求）。
+//  3. 落本次登录日志。
+//
+// 所有登录入口都应调用本函数，而不是各自拼这三步 —— 顺序错了不会报错，只会静默
+// 把欢迎语内容弄错。
+func (u *User) finishSuccessfulLogin(uid, account, publicIP, loginType string) {
+	prevLogin := u.loginLog.getLastLoginIP(uid)
+	go u.sentWelcomeMsg(publicIP, uid, prevLogin)
+	u.loginLog.recordSuccess(uid, account, publicIP, loginType)
+}
+
 // sendWelcomeMsg 发送欢迎语
-func (u *User) sentWelcomeMsg(publicIP, uid string) {
+//
+// prevLogin 由调用方在写入本次登录日志之前取好（见 finishSuccessfulLogin）；
+// 本函数不再自己查询，避免读到刚写入的本次登录。
+func (u *User) sentWelcomeMsg(publicIP, uid string, prevLogin *loginLogResp) {
 	appconfig, err := u.commonService.GetAppConfig()
 	if err != nil {
 		u.Error("获取应用配置错误", zap.Error(err))
@@ -1891,7 +1916,7 @@ func (u *User) sentWelcomeMsg(publicIP, uid string) {
 	// 等待用户数据持久化完成（该函数在 goroutine 中调用）
 	time.Sleep(500 * time.Millisecond)
 	//发送登录欢迎消息
-	lastLoginLog := u.loginLog.getLastLoginIP(uid)
+	lastLoginLog := prevLogin
 	content := u.ctx.GetConfig().WelcomeMessage
 	var sentContent string
 
@@ -3967,8 +3992,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		}
 		return nil, err
 	}
-	go u.sentWelcomeMsg(publicIP, createUser.UID)
-	u.loginLog.recordSuccess(createUser.UID, userModel.Username, publicIP, "register")
+	u.finishSuccessfulLogin(createUser.UID, userModel.Username, publicIP, "register")
 
 	if u.ctx.GetConfig().ShortNo.NumOn {
 		err = u.commonService.SetShortnoUsed(userModel.ShortNo, "user")

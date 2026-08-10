@@ -154,8 +154,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		"data":                      result,
 		"need_upload_web3publickey": needUploadWeb3PublicKey,
 	})
-	go u.sentWelcomeMsg(publicIP, userInfo.UID)
-	u.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "username")
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, publicIP, "username")
 }
 func (u *User) registerWithUsername(username string, name string, password string, flag int, device *deviceReq, c *wkhttp.Context) {
 	registerSpan := u.ctx.Tracer().StartSpan(

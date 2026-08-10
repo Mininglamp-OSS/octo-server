@@ -87,8 +87,13 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
 		// 手机号影子列回填：一次性数据迁移任务，带游标反复调用直到 done。
 		// superAdmin 专属；见 db_phone_backfill.go。
-		auth.POST("/user/phone_shadow_backfill", m.phoneShadowBackfill)
-		auth.GET("/user/phone_shadow_backfill", m.phoneShadowBackfillStatus)
+		//
+		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才能读到 uid）：单次调用最多
+		// maxBackfillBatchesPerCall × batchSize 次 UPDATE，是本模块写放大最大的端点，
+		// 必须有 per-user 频控兜住误用/脚本失控，不能只靠调用方自觉。
+		backfillLimiter := appwkhttp.SharedUIDRateLimiter(r, m.ctx)
+		auth.POST("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfill)
+		auth.GET("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfillStatus)
 	}
 	dashboardReader := r.Group(
 		"/v1/manager/user",

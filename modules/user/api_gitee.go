@@ -148,8 +148,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		}
 		// 发送登录消息
 		publicIP := util.GetClientPublicIP(c.Request)
-		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
-		u.loginLog.recordSuccess(userInfoM.UID, userInfoM.Username, publicIP, "gitee")
+		u.finishSuccessfulLogin(userInfoM.UID, userInfoM.Username, publicIP, "gitee")
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
 			// 必须先把 authcode 标记为登录失败再返回:thirdAuthcode 起手把 Redis
