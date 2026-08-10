@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	rd "github.com/go-redis/redis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,14 +73,42 @@ func TestSessionRolloutControlIsMonotonicAndFailClosed(t *testing.T) {
 
 	require.NoError(t, v3Store.ValidateRolloutControl(context.Background(), ""))
 	require.Error(t, v3Store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write))
+	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, 0), "at least 1h")
+	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest-time.Millisecond), "at least 1h")
+	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest))
 	require.Error(t, expandStore.ValidateRolloutControl(context.Background(), ""))
 	require.NoError(t, v3Store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-	require.Error(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeBounded))
-	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeRevoke))
+	require.Error(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeBounded, rolloutObservationGapForTest))
+	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeRevoke, 2*rolloutObservationGapForTest))
 	control, err := v3Store.RolloutControl(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, SessionModeRevoke, control.ModeFloor)
+	require.Equal(t, (2 * rolloutObservationGapForTest).Milliseconds(), control.ObservationMinGapMS)
+	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeBounded, rolloutObservationGapForTest), "cannot decrease")
+}
+
+func TestSessionRolloutControlBackfillsLegacyObservationGapOnNextAdvance(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-rollout-legacy:" + util.GenerUUID() + ":"
+	uidPrefix := "session-rollout-legacy-uid:" + util.GenerUUID() + ":"
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	t.Cleanup(func() {
+		_ = client.Del(store.rolloutControlKey()).Err()
+		_ = client.Close()
+	})
+
+	require.NoError(t, client.Set(store.rolloutControlKey(), `{"mode_floor":"v3-write","writer_version":3}`, 0).Err())
+	control, err := store.RolloutControl(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, control.ObservationMinGapMS)
+	require.NoError(t, store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
+
+	require.NoError(t, store.AdvanceRolloutControl(context.Background(), SessionModeRevoke, rolloutObservationGapForTest))
+	control, err = store.RolloutControl(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, SessionModeRevoke, control.ModeFloor)
+	require.Equal(t, rolloutObservationGapForTest.Milliseconds(), control.ObservationMinGapMS)
 }
 
 func TestRedisSessionStoreIssuesBoundedV3AndValidatorUsesGeneration(t *testing.T) {
@@ -138,6 +167,125 @@ func TestRedisSessionStoreIssuesBoundedV3AndValidatorUsesGeneration(t *testing.T
 	got, err := validator.Validate(context.Background(), token)
 	require.NoError(t, err)
 	require.Equal(t, uid, got.UID)
+}
+
+func TestTokenValidatorV3SteadyStateUsesExactlyTwoReadsAndNoWrites(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-v3-command-count:" + util.GenerUUID() + ":"
+	uidPrefix := "session-v3-command-count-uid:" + util.GenerUUID() + ":"
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	uid := "u-" + util.GenerUUID()
+	token := "t-" + util.GenerUUID()
+	t.Cleanup(func() {
+		keys, _ := client.Keys(prefix + "*").Result()
+		metadata, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNewSession(context.Background(), token, TokenInfo{UID: uid, DeviceFlag: 1}, fence))
+	require.NoError(t, readTokenScript.Load(client).Err(), "preload the read script so NOSCRIPT fallback is outside the steady-state count")
+
+	var commands []string
+	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
+		return func(cmd rd.Cmder) error {
+			commands = append(commands, cmd.Name())
+			return old(cmd)
+		}
+	})
+
+	_, err = NewTokenValidator(store, prefix).Validate(context.Background(), token)
+	require.NoError(t, err)
+	require.Equal(t, []string{"evalsha", "get"}, commands,
+		"steady-state v3 validation must remain token single-key Lua plus generation GET, with no Redis write")
+}
+
+func TestRedisSessionStoreRevokeIssuedRemovesV3IndexReservation(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-v3-compensation:" + util.GenerUUID() + ":"
+	uidPrefix := "session-v3-compensation-uid:" + util.GenerUUID() + ":"
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	uid := "u-" + util.GenerUUID()
+	t.Cleanup(func() {
+		keys, _ := client.Keys(prefix + "*").Result()
+		metadata, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	fence, err := store.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	for i := 0; i < 2; i++ {
+		token := "failed-" + util.GenerUUID()
+		require.NoError(t, store.IssueNewSession(context.Background(), token, TokenInfo{
+			UID:        uid,
+			DeviceFlag: i,
+			DeviceID:   "failed-device-" + string(rune('a'+i)),
+		}, fence))
+		require.NoError(t, store.RevokeIssued(context.Background(), token, uid, i))
+	}
+
+	count, err := client.ZCard(store.sessionIndexKey(uid, fence.Generation)).Result()
+	require.NoError(t, err)
+	require.Zero(t, count, "downstream login compensation must not consume bounded-session capacity")
+	require.NoError(t, store.IssueNewSession(context.Background(), "recovered-"+util.GenerUUID(), TokenInfo{
+		UID:        uid,
+		DeviceFlag: 1,
+		DeviceID:   "recovered-device",
+	}, fence), "a recovered dependency must be able to issue immediately after compensated failures")
+}
+
+func TestRedisSessionStoreRevokeIssuedPreservesV3SessionAdoptedByAnotherReplica(t *testing.T) {
+	cfg := config.New()
+	clientA := octoredis.NewInstrumentedClient(cfg)
+	clientB := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-v3-adopted:" + util.GenerUUID() + ":"
+	uidPrefix := "session-v3-adopted-uid:" + util.GenerUUID() + ":"
+	storeA := NewRedisSessionStore(clientA, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	storeB := NewRedisSessionStore(clientB, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
+	uid := "u-" + util.GenerUUID()
+	token := "t-" + util.GenerUUID()
+	t.Cleanup(func() {
+		keys, _ := clientA.Keys(prefix + "*").Result()
+		metadata, _ := clientA.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = clientA.Del(keys...).Err()
+		}
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+
+	fence, err := storeA.BeginIssue(context.Background(), uid)
+	require.NoError(t, err)
+	info := TokenInfo{UID: uid, Name: "first", DeviceFlag: 1, DeviceID: "shared-device"}
+	require.NoError(t, storeA.IssueNewSession(context.Background(), token, info, fence))
+	adopted, err := storeB.ReuseSession(context.Background(), token, TokenInfo{
+		UID:        uid,
+		Name:       "adopted",
+		DeviceFlag: 1,
+		DeviceID:   "shared-device",
+	}, fence)
+	require.NoError(t, err)
+	require.True(t, adopted)
+
+	require.NoError(t, storeA.RevokeIssued(context.Background(), token, uid, 1))
+	validated, err := NewTokenValidator(storeB, prefix).Validate(context.Background(), token)
+	require.NoError(t, err)
+	require.Equal(t, "adopted", validated.Name)
+	count, err := clientA.ZCard(storeA.sessionIndexKey(uid, fence.Generation)).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, count, "an old issuer must not erase the adopted replica's bounded-index membership")
 }
 
 func TestRedisSessionStoreV3IndexIsBounded(t *testing.T) {
@@ -386,6 +534,34 @@ func TestTokenValidatorAppliesLegacyRolloutPolicy(t *testing.T) {
 		_, err := NewTokenValidator(store, prefix).Validate(context.Background(), token)
 		require.ErrorIs(t, err, wkhttp.ErrTokenInvalid)
 	})
+}
+
+func TestInvalidateCurrentLegacyTokenCompareDeletesCompatibilityIndex(t *testing.T) {
+	cfg := config.New()
+	client := octoredis.NewInstrumentedClient(cfg)
+	prefix := "session-legacy-logout:" + util.GenerUUID() + ":"
+	uidPrefix := "session-legacy-logout-uid:" + util.GenerUUID() + ":"
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour)
+	uid := "u-" + util.GenerUUID()
+	token := "t-" + util.GenerUUID()
+	t.Cleanup(func() {
+		keys, _ := client.Keys(prefix + "*").Result()
+		metadata, _ := client.Keys(uidPrefix + "*").Result()
+		keys = append(keys, metadata...)
+		if len(keys) > 0 {
+			_ = client.Del(keys...).Err()
+		}
+		_ = client.Close()
+	})
+
+	payload, err := Encode(TokenInfo{UID: uid, Name: "legacy"})
+	require.NoError(t, err)
+	require.NoError(t, store.IssueNew(context.Background(), token, payload, uid, 1))
+	require.NoError(t, store.InvalidateCurrentToken(context.Background(), uid, token))
+
+	indexed, err := store.DeviceToken(context.Background(), uid, 1)
+	require.NoError(t, err)
+	require.Empty(t, indexed, "legacy logout must not leave uidtoken pointing at a revoked bearer")
 }
 
 func TestRedisSessionStorePromotesLegacyReuseWithoutExtendingDeadline(t *testing.T) {

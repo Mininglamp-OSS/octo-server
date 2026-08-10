@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	rd "github.com/go-redis/redis"
 )
@@ -784,7 +785,16 @@ func (s *RedisSessionStore) InvalidateCurrentToken(ctx context.Context, uid, tok
 	if info.IsV3() {
 		return s.RevokeCurrent(ctx, token, uid, info.DeviceFlag)
 	}
-	return s.DeleteToken(ctx, token)
+	if err := s.DeleteToken(ctx, token); err != nil {
+		return err
+	}
+	var cleanupErr error
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		if err := s.compareDeleteDeviceIndex(token, uid, int(flag)); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	return cleanupErr
 }
 
 func (s *RedisSessionStore) requireFence(ctx context.Context, uid string, fence IssueFence) error {

@@ -327,6 +327,22 @@ func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string,
 		// owns the live credential and the original issuer must not revoke it.
 		return nil
 	}
+	var v3IndexKey string
+	var v3IndexMember string
+	if strings.HasPrefix(currentPayload, v3Prefix) {
+		info, err := Decode(currentPayload)
+		if err != nil {
+			return fmt.Errorf("auth: decode issued v3 token for revoke: %w", err)
+		}
+		if info.UID != uid || info.DeviceFlag != deviceFlag {
+			return errors.New("auth: issued v3 token revoke metadata mismatch")
+		}
+		v3IndexMember, err = encodeSessionIndexMember(token, info.DeviceFlag, info.DeviceID)
+		if err != nil {
+			return err
+		}
+		v3IndexKey = s.sessionIndexKey(info.UID, info.SessionGeneration)
+	}
 	result, err := compareDeleteScript.Run(
 		s.client,
 		[]string{s.tokenKey(token)},
@@ -344,7 +360,14 @@ func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string,
 		// concurrent writer may have adopted this credential.
 		return nil
 	}
-	return s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+	deviceErr := s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+	var indexErr error
+	if v3IndexKey != "" {
+		if err := s.client.ZRem(v3IndexKey, v3IndexMember).Err(); err != nil {
+			indexErr = fmt.Errorf("auth: delete issued v3 session index: %w", err)
+		}
+	}
+	return errors.Join(deviceErr, indexErr)
 }
 
 func (s *RedisSessionStore) compareDeleteDeviceIndex(token, uid string, deviceFlag int) error {

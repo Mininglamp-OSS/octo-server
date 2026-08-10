@@ -234,6 +234,46 @@ func TestScanLoginAuthorization_RequiresConfirmationAndRedeemsOnce(t *testing.T)
 	assert.Contains(t, w.Body.String(), "err.server.user.auth_code_not_found")
 }
 
+func TestScanLoginAuthorization_DisabledAccountCannotRedeemLiveCode(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	enableScanLoginForUserTest(t, ctx)
+
+	db := NewDB(ctx)
+	model, err := db.QueryByUID(testutil.UID)
+	require.NoError(t, err)
+	if model == nil {
+		require.NoError(t, db.Insert(&Model{
+			UID:      testutil.UID,
+			Name:     "disabled scan login user",
+			Username: "disabled_scan_login_user",
+			ShortNo:  "scan003",
+			Status:   int(libcommon.UserAvailable),
+		}))
+	}
+
+	authCode := util.GenerUUID()
+	uuid := util.GenerUUID()
+	authInfo, err := encodeScanLoginAuthorization(testutil.UID, uuid)
+	require.NoError(t, err)
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(scanLoginReadyAuthorizationKey(authCode), authInfo, time.Minute))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(scanLoginUUIDClaimKey(uuid), authCode, time.Minute))
+	pollSecret, err := mintScanLoginPollSecret(ctx.GetRedisConn(), uuid)
+	require.NoError(t, err)
+	_, err = db.session.Update("user").Set("status", int(libcommon.UserDisable)).Where("uid=?", testutil.UID).Exec()
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1/user/login_authcode/"+authCode+"?poll_secret="+pollSecret, nil)
+	setPublicIPForUserTest(req, "9.9.8.43")
+	s.GetRoute().ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.user.account_banned")
+}
+
 func TestScanLoginAuthorization_MultipleReplicasRedeemOnce(t *testing.T) {
 	s1, ctx := testutil.NewTestServer()
 	s2, _ := testutil.NewTestServer()

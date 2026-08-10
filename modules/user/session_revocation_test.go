@@ -2,12 +2,20 @@ package user
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	libcommon "github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/stretchr/testify/require"
@@ -96,6 +104,30 @@ func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
 	require.Equal(t, 1, pending)
 }
 
+func TestNewSessionRevocationIntentReservesSynchronousClaimWindow(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	db := NewDB(ctx)
+	uid := util.GenerUUID()
+	require.NoError(t, db.Insert(&Model{UID: uid, Name: "sync-priority-user", ShortNo: uid, Password: "before", Status: 1}))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+	})
+
+	intent, err := db.updateUserFieldWithSessionRevocation(context.Background(), uid, "password", "after", "password_reset")
+	require.NoError(t, err)
+	now := time.Now().UTC()
+
+	workerIntent, err := db.claimSessionRevocation(context.Background(), "worker", now)
+	require.NoError(t, err)
+	require.Nil(t, workerIntent, "a normal worker must not race the synchronous apply immediately after commit")
+
+	claimed, err := db.claimSessionRevocationByID(context.Background(), intent, "sync", now)
+	require.NoError(t, err)
+	require.True(t, claimed, "the synchronous by-ID path must ignore its own worker visibility delay")
+}
+
 func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	db := NewDB(ctx)
@@ -119,6 +151,11 @@ func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {
 	require.NoError(t, store.IssueNewSession(context.Background(), token, auth.TokenInfo{UID: uid, DeviceFlag: int(config.Web)}, fence))
 	intent, err := db.updateUserFieldWithSessionRevocation(context.Background(), uid, "password", "after", "password_reset")
 	require.NoError(t, err)
+	_, err = ctx.DB().Update("user_session_revocation_intent").
+		Set("next_attempt_at", time.Now().UTC().Add(-time.Second)).
+		Where("id=?", intent.ID).
+		Exec()
+	require.NoError(t, err, "simulate a synchronous caller that exited before claiming its intent")
 
 	worker := &User{db: db, sessionStore: store, revocationWorkerOwner: "test-worker"}
 	worker.processPendingSessionRevocations()
@@ -128,4 +165,197 @@ func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {
 	require.Equal(t, 1, applied)
 	_, err = auth.NewTokenValidator(store, prefix).Validate(context.Background(), token)
 	require.Error(t, err)
+}
+
+type logoutFailingSessionStore struct {
+	fakeUserSessionStore
+	err error
+}
+
+func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {
+	return s.err
+}
+
+func TestLogoutStillQuitsIMAndCleansDeviceStateWhenBearerRevokeFails(t *testing.T) {
+	server, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(server)
+	uid := "logout-converge-" + util.GenerUUID()
+	deviceKey := "logout-device:" + uid
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(deviceKey, "present", time.Minute))
+
+	var flagsMu sync.Mutex
+	var flags []int
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/device_quit" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":0}`))
+			return
+		}
+		var request struct {
+			DeviceFlag int `json:"device_flag"`
+		}
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, util.ReadJsonByByte(body, &request))
+		flagsMu.Lock()
+		flags = append(flags, request.DeviceFlag)
+		flagsMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(im.Close)
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+	u := New(ctx)
+	u.sessionStore = &logoutFailingSessionStore{err: errors.New("redis unavailable")}
+	u.userDeviceTokenPrefix = "logout-device:"
+	server.GetRoute().POST("/test/session/logout", func(c *wkhttp.Context) {
+		c.Set("uid", uid)
+		u.quit(c)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/test/session/logout", nil)
+	request.Header.Set("token", "current-token")
+	server.GetRoute().ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	flagsMu.Lock()
+	require.ElementsMatch(t, []int{int(config.Web), int(config.PC)}, flags,
+		"HTTP bearer failure must not skip independent IM logout attempts")
+	flagsMu.Unlock()
+	deviceState, err := ctx.GetRedisConn().GetString(deviceKey)
+	require.NoError(t, err)
+	require.Empty(t, deviceState, "a retryable bearer failure must not skip local device-state cleanup")
+}
+
+type flakyRevokeAllSessionStore struct {
+	fakeUserSessionStore
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *flakyRevokeAllSessionStore) Mode() auth.SessionMode { return auth.SessionModeRevoke }
+
+func (s *flakyRevokeAllSessionStore) BeginIssue(context.Context, string) (auth.IssueFence, error) {
+	return auth.IssueFence{}, nil
+}
+
+func (s *flakyRevokeAllSessionStore) IssueNewSession(context.Context, string, auth.TokenInfo, auth.IssueFence) error {
+	return nil
+}
+
+func (s *flakyRevokeAllSessionStore) ReuseSession(context.Context, string, auth.TokenInfo, auth.IssueFence) (bool, error) {
+	return false, nil
+}
+
+func (s *flakyRevokeAllSessionStore) UpdateSessionSnapshot(context.Context, string, auth.TokenInfo) (bool, error) {
+	return false, nil
+}
+
+func (s *flakyRevokeAllSessionStore) RevokeCurrent(context.Context, string, string, int) error {
+	return nil
+}
+
+func (s *flakyRevokeAllSessionStore) RevokeAll(context.Context, string, auth.RevocationEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 {
+		return errors.New("redis unavailable")
+	}
+	return nil
+}
+
+func (s *flakyRevokeAllSessionStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+type allowDestroySMSService struct{}
+
+func (allowDestroySMSService) SendVerifyCode(context.Context, string, string, commonapi.CodeType) error {
+	return nil
+}
+
+func (allowDestroySMSService) Verify(context.Context, string, string, string, commonapi.CodeType) error {
+	return nil
+}
+
+func TestDestroyAccountRetryConvergesCommittedRevocationAndAlwaysQuitsIM(t *testing.T) {
+	server, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(server)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	ctx.GetConfig().SMSCode = "123456"
+	uid := "d-" + util.GenerUUID()
+	db := NewDB(ctx)
+	require.NoError(t, db.Insert(&Model{
+		UID:       uid,
+		Name:      "destroy converge user",
+		Username:  "destroy_" + uid[len(uid)-12:],
+		ShortNo:   "destroy_" + uid[len(uid)-10:],
+		Phone:     "13800000000",
+		Zone:      "0086",
+		Status:    int(libcommon.UserAvailable),
+		IsDestroy: IsDestroyNo,
+	}))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+	})
+
+	var imMu sync.Mutex
+	imCalls := 0
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/device_quit" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":0}`))
+			return
+		}
+		imMu.Lock()
+		imCalls++
+		imMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(im.Close)
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+	store := &flakyRevokeAllSessionStore{}
+	u := New(ctx)
+	u.sessionStore = store
+	u.smsServie = allowDestroySMSService{}
+	server.GetRoute().Any("/test/session/destroy/:code", func(c *wkhttp.Context) {
+		c.Set("uid", uid)
+		u.destroyAccount(c)
+	})
+
+	requestDestroy := func() *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodDelete, "/test/session/destroy/123456", nil)
+		server.GetRoute().ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	first := requestDestroy()
+	require.Equal(t, http.StatusBadRequest, first.Code, first.Body.String())
+	model, err := db.QueryByUID(uid)
+	require.NoError(t, err)
+	require.Equal(t, IsDestroyDone, model.IsDestroy, "the first response failed after the DB transaction committed")
+	imMu.Lock()
+	require.Equal(t, 1, imCalls, "post-commit Redis failure must not skip the independent IM quit")
+	imMu.Unlock()
+
+	second := requestDestroy()
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	require.Equal(t, 2, store.callCount(), "retry must apply the existing pending revocation intent")
+	imMu.Lock()
+	require.Equal(t, 2, imCalls, "retry must keep IM quit idempotent")
+	imMu.Unlock()
+	var applied int
+	_, err = ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").
+		Where("uid=? AND status=?", uid, sessionRevocationApplied).Load(&applied)
+	require.NoError(t, err)
+	require.Equal(t, 1, applied)
 }

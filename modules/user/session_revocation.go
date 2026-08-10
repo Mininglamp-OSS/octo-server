@@ -20,6 +20,10 @@ const (
 
 	sessionRevocationLease     = 30 * time.Second
 	sessionRevocationBatchSize = 20
+	// Newly committed intents are reserved briefly for their synchronous
+	// by-ID claimant. Shared workers take over after the window if the request
+	// process exits or cannot complete the Redis revocation.
+	sessionRevocationSyncPriorityWindow = 5 * time.Second
 )
 
 var allowedSessionRevocationReasons = map[string]bool{
@@ -158,9 +162,10 @@ func (d *DB) mutateWithSessionRevocation(ctx context.Context, uid, reason string
 		EventVersion: next,
 		Reason:       reason,
 	}
+	workerVisibleAt := time.Now().UTC().Add(sessionRevocationSyncPriorityWindow)
 	result, err := tx.InsertInto("user_session_revocation_intent").
 		Columns("event_id", "uid", "event_version", "reason", "status", "next_attempt_at").
-		Values(intent.EventID, uid, next, reason, sessionRevocationPending, time.Now().UTC()).
+		Values(intent.EventID, uid, next, reason, sessionRevocationPending, workerVisibleAt).
 		ExecContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("user: insert session revocation intent: %w", err)
@@ -218,6 +223,56 @@ func (d *DB) claimSessionRevocation(ctx context.Context, owner string, now time.
 	leaseUntil := now.Add(sessionRevocationLease)
 	intent.LeaseUntil = &leaseUntil
 	return &intent, nil
+}
+
+func (d *DB) pendingSessionRevocation(ctx context.Context, uid, reason string) (*sessionRevocationIntent, error) {
+	if uid == "" || !allowedSessionRevocationReasons[reason] {
+		return nil, errors.New("user: invalid pending session revocation query")
+	}
+	var intent sessionRevocationIntent
+	err := d.session.SelectBySql(
+		"SELECT id,event_id,uid,event_version,reason,attempts,lease_owner,lease_until "+
+			"FROM user_session_revocation_intent WHERE uid=? AND reason=? AND status=? "+
+			"ORDER BY event_version DESC LIMIT 1",
+		uid, reason, sessionRevocationPending,
+	).LoadOneContext(ctx, &intent)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("user: load pending session revocation intent: %w", err)
+	}
+	return &intent, nil
+}
+
+func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevocationIntent, owner string, now time.Time) (bool, error) {
+	if intent == nil || intent.ID == 0 || owner == "" {
+		return false, errors.New("user: synchronous revocation claim requires intent and owner")
+	}
+	result, err := d.session.UpdateBySql(
+		"UPDATE user_session_revocation_intent SET lease_owner=?,lease_until=? "+
+			"WHERE id=? AND status=? AND (lease_until IS NULL OR lease_until<=?)",
+		owner, now.Add(sessionRevocationLease), intent.ID, sessionRevocationPending, now,
+	).ExecContext(ctx)
+	if err != nil {
+		return false, fmt.Errorf("user: claim synchronous session revocation intent: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("user: read synchronous revocation claim result: %w", err)
+	}
+	if affected == 1 {
+		intent.LeaseOwner = owner
+		leaseUntil := now.Add(sessionRevocationLease)
+		intent.LeaseUntil = &leaseUntil
+		return true, nil
+	}
+	var status uint8
+	_, loadErr := d.session.Select("status").From("user_session_revocation_intent").Where("id=?", intent.ID).LoadContext(ctx, &status)
+	if loadErr == nil && status == sessionRevocationApplied {
+		return false, nil
+	}
+	return false, errors.New("user: session revocation lease ownership lost")
 }
 
 func (d *DB) markSessionRevocationApplied(ctx context.Context, intent *sessionRevocationIntent, owner string) error {
@@ -291,10 +346,21 @@ func (u *User) applySessionRevocationIntent(ctx context.Context, intent *session
 }
 
 func applyAndMarkSessionRevocation(ctx context.Context, db *DB, store userSessionStore, intent *sessionRevocationIntent) error {
-	if err := applySessionRevocation(ctx, store, intent); err != nil {
+	owner := "sync-" + util.GenerUUID()
+	claimed, err := db.claimSessionRevocationByID(ctx, intent, owner, time.Now().UTC())
+	if err != nil {
 		return err
 	}
-	return db.markSessionRevocationApplied(ctx, intent, "")
+	if !claimed {
+		return nil
+	}
+	if err := applySessionRevocation(ctx, store, intent); err != nil {
+		if releaseErr := db.releaseSessionRevocation(ctx, intent, owner); releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
+		return err
+	}
+	return db.markSessionRevocationApplied(ctx, intent, owner)
 }
 
 func (u *User) processPendingSessionRevocations() {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	rd "github.com/go-redis/redis"
 )
@@ -37,9 +38,15 @@ return 1
 
 var ErrRolloutControlChanged = errors.New("auth: session rollout control changed concurrently")
 
+// MinimumRolloutObservationGap is the hard safety floor for independent
+// rollout observations. Operators may raise it between phases but cannot
+// lower it once persisted.
+const MinimumRolloutObservationGap = time.Hour
+
 type SessionRolloutControl struct {
-	ModeFloor     SessionMode `json:"mode_floor"`
-	WriterVersion int         `json:"writer_version"`
+	ModeFloor           SessionMode `json:"mode_floor"`
+	WriterVersion       int         `json:"writer_version"`
+	ObservationMinGapMS int64       `json:"observation_min_gap_ms"`
 }
 
 func (s *RedisSessionStore) ValidateRolloutControl(ctx context.Context, requiredFloor SessionMode) error {
@@ -72,9 +79,13 @@ func (s *RedisSessionStore) RolloutControl(ctx context.Context) (*SessionRollout
 
 // AdvanceRolloutControl performs one monotonic CAS transition. It is intended
 // for an explicit operator tool, never an API process startup hook.
-func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next SessionMode) error {
+func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next SessionMode, observationMinGap time.Duration) error {
 	if !next.valid() || next == SessionModeExpand {
 		return errors.New("auth: rollout floor must advance to v3-write or later")
+	}
+	observationMinGapMS := observationMinGap.Milliseconds()
+	if observationMinGap < MinimumRolloutObservationGap {
+		return fmt.Errorf("auth: rollout observation minimum gap must be at least %s", MinimumRolloutObservationGap)
 	}
 	current, raw, err := s.loadRolloutControl(ctx)
 	if err != nil {
@@ -85,11 +96,21 @@ func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next Sess
 			return fmt.Errorf("auth: first rollout floor must be %s", SessionModeV3Write)
 		}
 	} else {
+		if current.ObservationMinGapMS > observationMinGapMS {
+			return fmt.Errorf("auth: rollout observation minimum gap cannot decrease below persisted %dms", current.ObservationMinGapMS)
+		}
 		if next.rank() != current.ModeFloor.rank()+1 {
 			return fmt.Errorf("auth: rollout floor must advance exactly one phase from %s", current.ModeFloor)
 		}
+		if err := s.validateRolloutAdvanceEvidence(ctx, current.ModeFloor, next, observationMinGapMS); err != nil {
+			return err
+		}
 	}
-	nextControl := SessionRolloutControl{ModeFloor: next, WriterVersion: 3}
+	nextControl := SessionRolloutControl{
+		ModeFloor:           next,
+		WriterVersion:       3,
+		ObservationMinGapMS: observationMinGapMS,
+	}
 	encoded, err := json.Marshal(nextControl)
 	if err != nil {
 		return fmt.Errorf("auth: encode rollout control: %w", err)
@@ -143,7 +164,7 @@ func (s *RedisSessionStore) loadRolloutControl(ctx context.Context) (*SessionRol
 	if err := json.Unmarshal([]byte(raw), &control); err != nil {
 		return nil, "", fmt.Errorf("auth: decode rollout control: %w", err)
 	}
-	if !control.ModeFloor.valid() || control.ModeFloor == SessionModeExpand || control.WriterVersion != 3 || strings.TrimSpace(string(control.ModeFloor)) == "" {
+	if !control.ModeFloor.valid() || control.ModeFloor == SessionModeExpand || control.WriterVersion != 3 || control.ObservationMinGapMS < 0 || strings.TrimSpace(string(control.ModeFloor)) == "" {
 		return nil, "", errors.New("auth: invalid rollout control record")
 	}
 	return &control, raw, nil

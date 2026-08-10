@@ -426,28 +426,29 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 // app退出登录
 func (u *User) quit(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
+	failed := false
 	if err := invalidateCurrentUserToken(c.Request.Context(), u.sessionStore, loginUID, c.GetHeader("token")); err != nil {
 		u.Error("撤销当前 HTTP token 失败", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+		failed = true
 	}
 	err := u.ctx.QuitUserDevice(loginUID, int(config.Web)) // 退出web
 	if err != nil {
 		u.Error("退出web设备失败", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+		failed = true
 	}
 
 	err = u.ctx.QuitUserDevice(loginUID, int(config.PC))
 	if err != nil {
 		u.Error("退出PC设备失败", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+		failed = true
 	}
 
 	err = u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID))
 	if err != nil {
 		u.Error("删除设备token失败！", zap.Error(err))
+		failed = true
+	}
+	if failed {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -2629,9 +2630,15 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
-	// 已注销账号拒绝授权登录；冷静期账号允许（与其他登录路径一致）
+	// 已禁用或已注销账号拒绝授权登录；冷静期账号允许（与其他登录路径一致）。
+	// issuance fence 只能阻止安全事件前开始的请求穿越撤销，事件后兑换仍需
+	// 以这里的权威账号状态拒绝，否则 live auth code 会签出新 generation bearer。
 	if userModel == nil || userModel.IsDestroy == IsDestroyDone {
 		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	if userModel.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountBanned)
 		return
 	}
 	// 获取缓存设备
@@ -3569,54 +3576,80 @@ func (u *User) destroyAccount(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
+	var retryIntent *sessionRevocationIntent
 	switch userInfo.IsDestroy {
 	case IsDestroyApplying:
 		respondUserError(c, errcode.ErrUserAccountDestroying)
 		return
 	case IsDestroyDone:
-		respondUserError(c, errcode.ErrUserAccountDestroyed)
-		return
-	}
-	//测试模式（仅非 release 生效）
-	if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
-		if !commonapi.MatchTestCode(u.ctx.GetConfig(), code) {
-			respondUserError(c, errcode.ErrUserCodeInvalid)
+		if sessionRevocationActive(u.sessionStore) {
+			retryIntent, err = u.db.pendingSessionRevocation(c.Request.Context(), loginUID, "account_destroy")
+			if err != nil {
+				u.Error("查询待重试的注销会话撤销任务失败", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+		}
+		if retryIntent == nil {
+			respondUserError(c, errcode.ErrUserAccountDestroyed)
 			return
 		}
-	} else {
-		//线上验证短信验证码
-		// 校验验证码
-		err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
-		if err != nil {
-			u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
-			respondUserError(c, errcode.ErrUserCodeInvalid)
-			return
+	}
+	if retryIntent == nil {
+		//测试模式（仅非 release 生效）
+		if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
+			if !commonapi.MatchTestCode(u.ctx.GetConfig(), code) {
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
+		} else {
+			//线上验证短信验证码
+			// 校验验证码
+			err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
+			if err != nil {
+				u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
 		}
 	}
 
-	// 毫秒时间戳：13 位足够保证唯一（UnixNano 19 位会撑爆 varchar(40)）。
-	// username 通过 anonymizeUsername 兜底防溢出（海外长手机号时回退 hash 形式）。
-	stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, stamp)
-	username := anonymizeUsername(loginUID, userInfo.Zone, phone, stamp)
-	if sessionRevocationActive(u.sessionStore) {
-		intent, mutateErr := u.db.destroyAccountWithSessionRevocation(c.Request.Context(), loginUID, username, phone, IsDestroyNo)
-		if mutateErr == nil {
+	if retryIntent != nil {
+		err = u.applySessionRevocationIntent(c.Request.Context(), retryIntent)
+	} else {
+		// 毫秒时间戳：13 位足够保证唯一（UnixNano 19 位会撑爆 varchar(40)）。
+		// username 通过 anonymizeUsername 兜底防溢出（海外长手机号时回退 hash 形式）。
+		stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, stamp)
+		username := anonymizeUsername(loginUID, userInfo.Zone, phone, stamp)
+		if sessionRevocationActive(u.sessionStore) {
+			intent, mutateErr := u.db.destroyAccountWithSessionRevocation(c.Request.Context(), loginUID, username, phone, IsDestroyNo)
+			if mutateErr != nil {
+				u.Error("注销账号错误", zap.Error(mutateErr))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
 			err = u.applySessionRevocationIntent(c.Request.Context(), intent)
 		} else {
-			err = mutateErr
+			err = u.db.destroyAccount(loginUID, username, phone)
+			if err != nil {
+				u.Error("注销账号错误", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
 		}
-	} else {
-		err = u.db.destroyAccount(loginUID, username, phone)
 	}
-	if err != nil {
-		u.Error("注销账号错误", zap.Error(err))
+	revocationErr := err
+	imErr := u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
+	if imErr != nil {
+		u.Error("退出登陆设备失败", zap.Error(imErr))
+	}
+	if revocationErr != nil {
+		u.Error("注销账号后的会话撤销尚未完成", zap.Error(revocationErr))
 		respondUserError(c, errcode.ErrUserDestroyFailed)
 		return
 	}
-	err = u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
-	if err != nil {
-		u.Error("退出登陆设备失败", zap.Error(err))
+	if imErr != nil {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}

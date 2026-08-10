@@ -29,10 +29,11 @@ const (
 )
 
 type adminCommand struct {
-	kind       adminCommandKind
-	configPath string
-	floor      auth.SessionMode
-	migration  auth.LegacyMigrationOptions
+	kind              adminCommandKind
+	configPath        string
+	floor             auth.SessionMode
+	observationMinGap time.Duration
+	migration         auth.LegacyMigrationOptions
 }
 
 func main() {
@@ -71,7 +72,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 
 	switch command.kind {
 	case adminCommandAdvanceFloor:
-		if err := store.AdvanceRolloutControl(ctx, command.floor); err != nil {
+		if err := store.AdvanceRolloutControl(ctx, command.floor, command.observationMinGap); err != nil {
 			return fmt.Errorf("advance session rollout floor: %w", err)
 		}
 		control, err := store.RolloutControl(ctx)
@@ -118,6 +119,7 @@ func parseAdvanceFloorCommand(args []string) (adminCommand, error) {
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "octo-server config file")
 	target := flags.String("to", "", "next rollout floor")
+	observationMinGap := flags.Duration("observation-min-gap", 0, "approved minimum duration between rollout observations")
 	if err := flags.Parse(args); err != nil {
 		return adminCommand{}, err
 	}
@@ -133,7 +135,15 @@ func parseAdvanceFloorCommand(args []string) (adminCommand, error) {
 	default:
 		return adminCommand{}, errors.New("advance-floor --to must be one of v3-write, revoke, bounded, enforce")
 	}
-	return adminCommand{kind: adminCommandAdvanceFloor, configPath: *configPath, floor: floor}, nil
+	if *observationMinGap < auth.MinimumRolloutObservationGap {
+		return adminCommand{}, fmt.Errorf("advance-floor requires --observation-min-gap of at least %s", auth.MinimumRolloutObservationGap)
+	}
+	return adminCommand{
+		kind:              adminCommandAdvanceFloor,
+		configPath:        *configPath,
+		floor:             floor,
+		observationMinGap: *observationMinGap,
+	}, nil
 }
 
 func parseMigrateCommand(args []string, now func() time.Time) (adminCommand, error) {
@@ -142,10 +152,12 @@ func parseMigrateCommand(args []string, now func() time.Time) (adminCommand, err
 	configPath := flags.String("config", "", "octo-server config file")
 	campaignID := flags.String("campaign", "", "immutable migration campaign identifier")
 	cutoffRaw := flags.String("cutoff", "", "absolute RFC3339 legacy deadline")
+	finitePolicyRaw := flags.String("finite-policy", "", "finite legacy policy: natural or cap")
 	batchSize := flags.Int64("batch-size", 0, "Redis SCAN count hint")
 	qps := flags.Float64("qps", 0, "maximum token records processed per second")
 	lease := flags.Duration("lease", 0, "single-owner migration lease")
 	apply := flags.Bool("apply", false, "apply TTL shortening; omitted means dry-run")
+	confirmElapsedCutoff := flags.Bool("confirm-elapsed-cutoff", false, "confirm immediate deletion when the immutable cutoff has elapsed")
 	if err := flags.Parse(args); err != nil {
 		return adminCommand{}, err
 	}
@@ -165,6 +177,10 @@ func parseMigrateCommand(args []string, now func() time.Time) (adminCommand, err
 	if err != nil {
 		return adminCommand{}, fmt.Errorf("invalid --cutoff %q: %w", *cutoffRaw, err)
 	}
+	finitePolicy := auth.LegacyFinitePolicy(strings.TrimSpace(*finitePolicyRaw))
+	if finitePolicy != auth.LegacyFinitePolicyNatural && finitePolicy != auth.LegacyFinitePolicyCap {
+		return adminCommand{}, errors.New("migrate --finite-policy must be natural or cap")
+	}
 	if *batchSize <= 0 || *batchSize > 10_000 {
 		return adminCommand{}, errors.New("--batch-size must be between 1 and 10000")
 	}
@@ -178,19 +194,21 @@ func parseMigrateCommand(args []string, now func() time.Time) (adminCommand, err
 	if *lease < 5*time.Second || *lease > 5*time.Minute {
 		return adminCommand{}, errors.New("--lease must be between 5s and 5m")
 	}
-	if *apply && !cutoff.After(now()) {
-		return adminCommand{}, errors.New("--cutoff must be in the future when --apply is enabled")
+	if *apply && cutoff.UTC().UnixMilli() <= now().UTC().UnixMilli() && !*confirmElapsedCutoff {
+		return adminCommand{}, errors.New("migrate --apply with elapsed --cutoff requires --confirm-elapsed-cutoff")
 	}
 	return adminCommand{
 		kind:       adminCommandMigrate,
 		configPath: *configPath,
 		migration: auth.LegacyMigrationOptions{
-			CampaignID: strings.TrimSpace(*campaignID),
-			CutoffAt:   cutoff.UTC(),
-			BatchSize:  *batchSize,
-			Interval:   interval,
-			Apply:      *apply,
-			Lease:      *lease,
+			CampaignID:           strings.TrimSpace(*campaignID),
+			CutoffAt:             cutoff.UTC(),
+			FinitePolicy:         finitePolicy,
+			BatchSize:            *batchSize,
+			Interval:             interval,
+			Apply:                *apply,
+			ConfirmElapsedCutoff: *confirmElapsedCutoff,
+			Lease:                *lease,
 		},
 	}, nil
 }

@@ -36,13 +36,25 @@ end
 if ttl ~= -1 and ttl <= 0 then
   return {version, ttl, 2}
 end
-local target = tonumber(ARGV[1])
-local cap_target = tonumber(ARGV[2]) + tonumber(ARGV[3])
-if cap_target < target then
-  target = cap_target
+local max_target = tonumber(ARGV[2]) + tonumber(ARGV[3])
+local target = max_target
+if ttl == -1 or ARGV[5] == "cap" then
+  target = tonumber(ARGV[1])
+  if max_target < target then
+    target = max_target
+  end
 end
 local target_ttl = target - tonumber(ARGV[2])
-local shorten = ttl == -1 or target_ttl <= 0 or ttl > target_ttl
+if target_ttl <= 0 then
+  if ARGV[4] == "1" and ARGV[6] ~= "1" then
+    return {version, ttl, 4}
+  end
+  if ARGV[4] == "1" then
+    redis.call("DEL", KEYS[1])
+  end
+  return {version, ttl, 3}
+end
+local shorten = ttl == -1 or ttl > target_ttl
 if not shorten then
   return {version, ttl, 0}
 end
@@ -60,18 +72,32 @@ return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 )
 
 var (
-	ErrMigrationLockHeld = errors.New("auth: token migration lock is held")
-	ErrMigrationLockLost = errors.New("auth: token migration lock was lost")
+	ErrMigrationLockHeld                          = errors.New("auth: token migration lock is held")
+	ErrMigrationLockLost                          = errors.New("auth: token migration lock was lost")
+	ErrMigrationElapsedCutoffConfirmationRequired = errors.New("auth: migration apply requires confirm elapsed cutoff")
 )
 
 type LegacyMigrationOptions struct {
-	CampaignID string
-	CutoffAt   time.Time
-	BatchSize  int64
-	Interval   time.Duration
-	Apply      bool
-	Lease      time.Duration
+	CampaignID           string
+	CutoffAt             time.Time
+	FinitePolicy         LegacyFinitePolicy
+	BatchSize            int64
+	Interval             time.Duration
+	Apply                bool
+	ConfirmElapsedCutoff bool
+	Lease                time.Duration
 }
+
+type LegacyFinitePolicy string
+
+const (
+	// LegacyFinitePolicyNatural preserves finite legacy deadlines that already
+	// fit within maxTTL. Persistent and over-max records are still bounded.
+	LegacyFinitePolicyNatural LegacyFinitePolicy = "natural"
+	// LegacyFinitePolicyCap also compresses finite legacy deadlines to the
+	// campaign cutoff. This may log users out earlier and requires approval.
+	LegacyFinitePolicyCap LegacyFinitePolicy = "cap"
+)
 
 type LegacyMigrationResult struct {
 	Complete    bool   `json:"complete"`
@@ -82,6 +108,8 @@ type LegacyMigrationResult struct {
 	V2          int64  `json:"v2"`
 	V3          int64  `json:"v3"`
 	Shortened   int64  `json:"shortened"`
+	WouldDelete int64  `json:"would_delete"`
+	Deleted     int64  `json:"deleted"`
 	Unchanged   int64  `json:"unchanged"`
 	Invalid     int64  `json:"invalid"`
 	V3NonFinite int64  `json:"v3_non_finite"`
@@ -93,8 +121,6 @@ type legacyMigrationCampaign struct {
 	CampaignID   string `json:"campaign_id"`
 	CutoffAtMS   int64  `json:"cutoff_at_unix_ms"`
 	MaxTTLMS     int64  `json:"max_ttl_ms"`
-	BatchSize    int64  `json:"batch_size"`
-	IntervalMS   int64  `json:"interval_ms"`
 	FinitePolicy string `json:"finite_policy"`
 }
 
@@ -200,7 +226,7 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 					return result, err
 				}
 			}
-			if err := s.migrateLegacyToken(key, campaign, options.Apply, &result); err != nil {
+			if err := s.migrateLegacyToken(key, campaign, options.Apply, options.ConfirmElapsedCutoff, &result); err != nil {
 				return result, err
 			}
 		}
@@ -221,6 +247,9 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				if err := s.saveMigrationCheckpoint(campaign.CampaignID, 0, result); err != nil {
 					return result, err
 				}
+				if err := s.recordMigrationCompletion(campaign.CampaignID, result); err != nil {
+					return result, err
+				}
 			}
 			return result, nil
 		}
@@ -235,6 +264,9 @@ func (s *RedisSessionStore) validateMigrationOptions(options LegacyMigrationOpti
 	if options.CutoffAt.IsZero() {
 		return legacyMigrationCampaign{}, errors.New("auth: migration cutoff is required")
 	}
+	if options.FinitePolicy != LegacyFinitePolicyNatural && options.FinitePolicy != LegacyFinitePolicyCap {
+		return legacyMigrationCampaign{}, errors.New("auth: migration finite policy must be natural or cap")
+	}
 	if options.BatchSize <= 0 || options.BatchSize > 10_000 {
 		return legacyMigrationCampaign{}, errors.New("auth: migration batch size must be between 1 and 10000")
 	}
@@ -242,28 +274,30 @@ func (s *RedisSessionStore) validateMigrationOptions(options LegacyMigrationOpti
 		return legacyMigrationCampaign{}, errors.New("auth: migration interval must not be negative")
 	}
 	if options.Apply {
+		if options.CutoffAt.UTC().UnixMilli() <= s.now().UTC().UnixMilli() && !options.ConfirmElapsedCutoff {
+			return legacyMigrationCampaign{}, ErrMigrationElapsedCutoffConfirmationRequired
+		}
 		if options.Lease < 5*time.Second || options.Lease > 5*time.Minute {
 			return legacyMigrationCampaign{}, errors.New("auth: migration lease must be between 5s and 5m")
-		}
-		if !options.CutoffAt.After(time.Now()) {
-			return legacyMigrationCampaign{}, errors.New("auth: migration cutoff must be in the future when apply is enabled")
 		}
 	}
 	return legacyMigrationCampaign{
 		CampaignID:   campaignID,
 		CutoffAtMS:   options.CutoffAt.UTC().UnixMilli(),
 		MaxTTLMS:     s.maxTTL.Milliseconds(),
-		BatchSize:    options.BatchSize,
-		IntervalMS:   options.Interval.Milliseconds(),
-		FinitePolicy: "cap",
+		FinitePolicy: string(options.FinitePolicy),
 	}, nil
 }
 
-func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrationCampaign, apply bool, result *LegacyMigrationResult) error {
-	nowMS := time.Now().UTC().UnixMilli()
+func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrationCampaign, apply, confirmElapsedCutoff bool, result *LegacyMigrationResult) error {
+	nowMS := s.now().UTC().UnixMilli()
 	applyArg := "0"
 	if apply {
 		applyArg = "1"
+	}
+	confirmElapsedCutoffArg := "0"
+	if confirmElapsedCutoff {
+		confirmElapsedCutoffArg = "1"
 	}
 	raw, err := migrateLegacyTokenScript.Run(
 		s.client,
@@ -272,6 +306,8 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 		nowMS,
 		campaign.MaxTTLMS,
 		applyArg,
+		campaign.FinitePolicy,
+		confirmElapsedCutoffArg,
 	).Result()
 	if err != nil {
 		return fmt.Errorf("auth: migrate token record: %w", err)
@@ -315,6 +351,14 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 		result.Shortened++
 	case 2:
 		result.Invalid++
+	case 3:
+		if apply {
+			result.Deleted++
+		} else {
+			result.WouldDelete++
+		}
+	case 4:
+		return ErrMigrationElapsedCutoffConfirmationRequired
 	default:
 		return fmt.Errorf("auth: invalid migration action %d", action)
 	}
@@ -326,28 +370,43 @@ func (s *RedisSessionStore) ensureMigrationCampaign(campaign legacyMigrationCamp
 	if err != nil {
 		return err
 	}
-	created, err := s.client.SetNX(s.migrationCampaignKey(), string(encoded), 0).Result()
+	key := s.migrationCampaignKey(campaign.CampaignID)
+	current, err := s.client.Get(key).Result()
+	if err == nil {
+		return s.validatePersistedMigrationCampaign(key, current, string(encoded))
+	}
+	if err != rd.Nil {
+		return fmt.Errorf("auth: load migration campaign: %w", err)
+	}
+	if campaign.CutoffAtMS <= s.now().UTC().UnixMilli() {
+		return errors.New("auth: a new migration campaign cutoff must be in the future")
+	}
+	created, err := s.client.SetNX(key, string(encoded), 0).Result()
 	if err != nil {
 		return fmt.Errorf("auth: initialize migration campaign: %w", err)
 	}
 	if created {
 		return nil
 	}
-	current, err := s.client.Get(s.migrationCampaignKey()).Result()
+	current, err = s.client.Get(key).Result()
 	if err != nil {
 		return fmt.Errorf("auth: load migration campaign: %w", err)
 	}
-	if current != string(encoded) {
+	return s.validatePersistedMigrationCampaign(key, current, string(encoded))
+}
+
+func (s *RedisSessionStore) validatePersistedMigrationCampaign(key, current, expected string) error {
+	if current != expected {
 		return errors.New("auth: migration campaign parameters do not match persisted campaign")
 	}
-	if ttl, err := s.client.PTTL(s.migrationCampaignKey()).Result(); err != nil || ttl != -time.Millisecond {
+	if ttl, err := s.client.PTTL(key).Result(); err != nil || ttl != -time.Millisecond {
 		return errors.New("auth: migration campaign record must not expire")
 	}
 	return nil
 }
 
 func (s *RedisSessionStore) loadMigrationCheckpoint(campaignID string) (*legacyMigrationCheckpoint, error) {
-	raw, err := s.client.Get(s.migrationCheckpointKey()).Result()
+	raw, err := s.client.Get(s.migrationCheckpointKey(campaignID)).Result()
 	if err == rd.Nil {
 		return nil, nil
 	}
@@ -369,7 +428,7 @@ func (s *RedisSessionStore) saveMigrationCheckpoint(campaignID string, cursor ui
 	if err != nil {
 		return err
 	}
-	if err := s.client.Set(s.migrationCheckpointKey(), string(encoded), 0).Err(); err != nil {
+	if err := s.client.Set(s.migrationCheckpointKey(campaignID), string(encoded), 0).Err(); err != nil {
 		return fmt.Errorf("auth: save migration checkpoint: %w", err)
 	}
 	return nil
@@ -435,12 +494,12 @@ func migrationLockError(errorsCh <-chan error) error {
 	}
 }
 
-func (s *RedisSessionStore) migrationCampaignKey() string {
-	return s.uidTokenPrefix + "auth:migration:campaign"
+func (s *RedisSessionStore) migrationCampaignKey(campaignID string) string {
+	return s.uidTokenPrefix + "auth:migration:campaign:" + sessionSubject(campaignID)
 }
 
-func (s *RedisSessionStore) migrationCheckpointKey() string {
-	return s.uidTokenPrefix + "auth:migration:checkpoint"
+func (s *RedisSessionStore) migrationCheckpointKey(campaignID string) string {
+	return s.uidTokenPrefix + "auth:migration:checkpoint:" + sessionSubject(campaignID)
 }
 
 func (s *RedisSessionStore) migrationLockKey() string {

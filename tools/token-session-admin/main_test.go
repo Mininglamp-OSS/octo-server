@@ -15,6 +15,7 @@ func TestParseAdminCommandRequiresExplicitSafeMigrationParameters(t *testing.T) 
 		"--config", "configs/prod.yaml",
 		"--campaign", "legacy-2026-08",
 		"--cutoff", "2026-08-16T16:00:00Z",
+		"--finite-policy", "natural",
 		"--batch-size", "200",
 		"--qps", "50",
 		"--lease", "30s",
@@ -27,6 +28,7 @@ func TestParseAdminCommandRequiresExplicitSafeMigrationParameters(t *testing.T) 
 	require.False(t, command.migration.Apply)
 	require.Equal(t, "legacy-2026-08", command.migration.CampaignID)
 	require.Equal(t, time.Date(2026, time.August, 16, 16, 0, 0, 0, time.UTC), command.migration.CutoffAt)
+	require.Equal(t, auth.LegacyFinitePolicyNatural, command.migration.FinitePolicy)
 	require.Equal(t, int64(200), command.migration.BatchSize)
 	require.Equal(t, 20*time.Millisecond, command.migration.Interval)
 	require.Equal(t, 30*time.Second, command.migration.Lease)
@@ -44,6 +46,7 @@ func TestParseAdminCommandRejectsUnsafeOrAmbiguousMigrationInput(t *testing.T) {
 		"--config", "configs/prod.yaml",
 		"--campaign", "legacy-2026-08",
 		"--cutoff", "2026-08-16T16:00:00Z",
+		"--finite-policy", "natural",
 		"--batch-size", "200",
 		"--qps", "50",
 		"--lease", "30s",
@@ -54,6 +57,8 @@ func TestParseAdminCommandRejectsUnsafeOrAmbiguousMigrationInput(t *testing.T) {
 	}{
 		{name: "missing campaign", args: withoutFlag(valid, "--campaign")},
 		{name: "missing cutoff", args: withoutFlag(valid, "--cutoff")},
+		{name: "missing finite policy", args: withoutFlag(valid, "--finite-policy")},
+		{name: "unknown finite policy", args: replaceFlag(valid, "--finite-policy", "guess")},
 		{name: "missing batch", args: withoutFlag(valid, "--batch-size")},
 		{name: "missing qps", args: withoutFlag(valid, "--qps")},
 		{name: "missing lease", args: withoutFlag(valid, "--lease")},
@@ -75,7 +80,13 @@ func TestParseAdminCommandRejectsUnsafeOrAmbiguousMigrationInput(t *testing.T) {
 
 	pastApply := append(replaceFlag(valid, "--cutoff", "2026-08-09T15:59:59Z"), "--apply")
 	_, err := parseAdminCommand(pastApply, func() time.Time { return now })
-	require.ErrorContains(t, err, "future")
+	require.ErrorContains(t, err, "--confirm-elapsed-cutoff")
+
+	confirmedPastApply := append(pastApply, "--confirm-elapsed-cutoff")
+	command, err := parseAdminCommand(confirmedPastApply, func() time.Time { return now })
+	require.NoError(t, err, "an elapsed resumable campaign must require explicit destructive confirmation")
+	require.True(t, command.migration.Apply)
+	require.True(t, command.migration.ConfirmElapsedCutoff)
 }
 
 func TestParseAdminCommandAcceptsOnlyOneStepRolloutTargets(t *testing.T) {
@@ -87,16 +98,33 @@ func TestParseAdminCommandAcceptsOnlyOneStepRolloutTargets(t *testing.T) {
 	} {
 		command, err := parseAdminCommand([]string{
 			"advance-floor", "--config", "configs/prod.yaml", "--to", string(target),
+			"--observation-min-gap", "1h",
 		}, time.Now)
 		require.NoError(t, err)
 		require.Equal(t, adminCommandAdvanceFloor, command.kind)
 		require.Equal(t, target, command.floor)
+		require.Equal(t, time.Hour, command.observationMinGap)
 	}
 
 	for _, target := range []string{"", "expand", "V3-WRITE", "unknown"} {
 		_, err := parseAdminCommand([]string{
 			"advance-floor", "--config", "configs/prod.yaml", "--to", target,
+			"--observation-min-gap", "1h",
 		}, time.Now)
+		require.Error(t, err)
+	}
+
+	valid := []string{
+		"advance-floor", "--config", "configs/prod.yaml", "--to", "v3-write",
+		"--observation-min-gap", "1h",
+	}
+	for _, args := range [][]string{
+		withoutFlag(valid, "--observation-min-gap"),
+		replaceFlag(valid, "--observation-min-gap", "0s"),
+		replaceFlag(valid, "--observation-min-gap", "-1s"),
+		replaceFlag(valid, "--observation-min-gap", "59m59s"),
+	} {
+		_, err := parseAdminCommand(args, time.Now)
 		require.Error(t, err)
 	}
 }
