@@ -23,8 +23,8 @@ import (
 //     派生互不相同的子密钥，避免同一子密钥同时用于两种密码学原语。
 //   - AEAD:AES-256-GCM，密文 = nonce(12B) || ciphertext || tag(16B)，外层加
 //     版本前缀 phoneCipherVersionPrefix，与 usersecret/crypto.go 同款约定。
-//   - 盲索引:HMAC-SHA256(zone+"|"+phone) 的 hex，确定性、不可逆，用于等值检索
-//     （注册查重/找回密码/OIDC 绑定定位账号），不需要解密即可查询。
+//   - 盲索引:HMAC-SHA256(长度前缀 zone + phone) 的 hex，确定性、不可逆，用于等值
+//     检索（注册查重/找回密码/OIDC 绑定定位账号），不需要解密即可查询。
 //   - 手机号后4位（phoneLast4）是独立的低敏明文字段，只服务"输入后4位模糊检索"
 //     这一种检索语义，盲索引做不到子串匹配。
 //
@@ -55,6 +55,10 @@ const (
 	//  4. 回填完成后摘掉 PREVIOUS 与读路径的多版本分支。
 	// 密文侧的版本位由 phoneCipherVersionPrefix 承担，同理演进。
 	phoneHashKeyVersion = "1"
+
+	// login_log.account_masked 是 VARCHAR(100)。掩码必须在写日志和入库前统一截断，
+	// 避免攻击者用超长账号让 STRICT_TRANS_TABLES 拒绝整条审计记录。
+	loginAccountMaskedMaxRunes = 100
 )
 
 // errPhoneSecretKeyUnset 主密钥缺失/长度非法。与 usersecret 同语义：部署配置问题，
@@ -77,10 +81,11 @@ func derivePhoneSubkey(master []byte, domain string) []byte {
 	return mac.Sum(nil)
 }
 
-// phoneCryptoInput 加密/盲索引统一输入：zone+phone 拼接，避免不同 zone 相同号码
-// 产生相同哈希/密文输入。
+// phoneCryptoInput 加密/盲索引统一输入。区号以十进制字节长度和冒号作前缀，后接
+// zone 与 phone；读取长度即可唯一恢复边界。不能用 zone+"|"+phone：字段未限制
+// 分隔符，("0086|1", "38") 与 ("0086", "1|38") 会产生同一输入和盲索引。
 func phoneCryptoInput(zone, phone string) string {
-	return zone + "|" + phone
+	return fmt.Sprintf("%d:%s%s", len(zone), zone, phone)
 }
 
 // phoneLast4 取手机号后4位供低敏模糊检索。
@@ -155,19 +160,28 @@ func maskLoginAccount(account string) string {
 		local := []rune(account[:at])
 		domain := account[at:]
 		if len(local) <= 1 {
-			return "*" + domain
+			return truncateRunes("*"+domain, loginAccountMaskedMaxRunes)
 		}
-		return string(local[0]) + "***" + domain
+		return truncateRunes(string(local[0])+"***"+domain, loginAccountMaskedMaxRunes)
 	}
 	r := []rune(account)
-	// 纯数字（手机号 / zone+phone 拼接）：保留前 3 后 4
-	if len(r) >= 7 && allDigits(r) {
+	// 纯数字（手机号 / zone+phone 拼接）：至少 8 位才保留前 3 后 4；恰好 7 位时
+	// 这样会暴露全部数字，只是在中间插入星号，因此必须走通用掩码。
+	if len(r) >= 8 && allDigits(r) {
 		return string(r[:3]) + "****" + string(r[len(r)-4:])
 	}
 	if len(r) <= 2 {
 		return strings.Repeat("*", len(r))
 	}
 	return string(r[0]) + "***"
+}
+
+func truncateRunes(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
 }
 
 func allDigits(r []rune) bool {

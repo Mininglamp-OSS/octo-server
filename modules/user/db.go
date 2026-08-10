@@ -90,11 +90,14 @@ func (d *DB) QueryByEmail(email string) (*Model, error) {
 
 // QueryByPhone 通过手机号和区号查询用户信息。优先走盲索引(phone_hash)等值检索,
 // 不需要解密；主密钥未配置或未命中(存量行尚未回填)时退回明文比较兜底，保证第一阶
-// 加密上线过程中查询行为不回归。见 phone_crypto.go。
+// 加密上线过程中查询行为不回归。盲索引路径必须排除已完成注销的行：若曾回滚到不认识
+// 影子列的旧版本，旧版本注销账号时会留下 phone_hash，roll-forward 后不能让该墓碑继续
+// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。见 phone_crypto.go。
 func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
 	if hash, err := PhoneBlindHash(zone, phone); err == nil {
 		var model *Model
-		if _, err := d.session.Select("*").From("user").Where("phone_hash=?", hash).Load(&model); err != nil {
+		if _, err := d.session.Select("*").From("user").
+			Where("phone_hash=? AND is_destroy<>?", hash, IsDestroyDone).Load(&model); err != nil {
 			return nil, err
 		}
 		if model != nil {

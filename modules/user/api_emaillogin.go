@@ -122,7 +122,7 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
-	if err := ValidatePasswordStrength(strings.TrimSpace(req.Password)); err != nil {
+	if err := ValidatePasswordStrength(req.Password); err != nil {
 		respondPasswordStrengthError(c, err)
 		return
 	}
@@ -359,7 +359,7 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "new_password")
 		return
 	}
-	if err := ValidatePasswordStrength(strings.TrimSpace(req.Password)); err != nil {
+	if err := ValidatePasswordStrength(req.Password); err != nil {
 		respondPasswordStrengthError(c, err)
 		return
 	}
