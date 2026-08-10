@@ -436,11 +436,28 @@ func TestLegacyMigrationStopsBeforeUnconfirmedCutoffDeletionDuringApply(t *testi
 	require.Equal(t, int64(2), mustExists(t, client, keys...))
 	require.Equal(t, int64(0), mustExists(t, client, store.latestMigrationCompletionKey()))
 
+	// SCAN may return the two records in one page or separate pages. When the
+	// first page completes, its checkpoint records the key already shortened to
+	// the campaign cutoff; a confirmed resume correctly starts at the saved
+	// cursor instead of rescanning that key. Make the shortened key reach its
+	// Redis deadline so both pagination shapes converge on the production state:
+	// one naturally expired key and one remaining key that requires confirmed
+	// deletion.
+	var shortenedKey string
+	for _, key := range keys {
+		if ttl := mustPTTL(t, client, key); ttl > 0 {
+			shortenedKey = key
+		}
+	}
+	require.NotEmpty(t, shortenedKey)
+	require.NoError(t, client.PExpire(shortenedKey, time.Millisecond).Err())
+	require.Eventually(t, func() bool { return mustExists(t, client, shortenedKey) == 0 }, time.Second, 10*time.Millisecond)
+
 	options.ConfirmElapsedCutoff = true
 	result, err = store.MigrateLegacySessions(ctx, options)
 	require.NoError(t, err)
 	require.True(t, result.Complete)
-	require.Equal(t, int64(2), result.Deleted)
+	require.Equal(t, int64(1), result.Deleted)
 	require.Equal(t, int64(0), mustExists(t, client, keys...))
 }
 
