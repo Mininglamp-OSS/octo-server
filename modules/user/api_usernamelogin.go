@@ -542,7 +542,7 @@ func (u *User) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = updateUserFieldAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, userInfo.UID, "password", newHash, "password_change")
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, newHash, "password_change")
 	if err != nil {
 		u.Error("修改登录密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)

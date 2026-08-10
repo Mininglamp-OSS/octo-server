@@ -3,6 +3,9 @@ package user
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -217,6 +220,50 @@ func TestFinishCommittedUserSecurityMutationPreservesCommitBoundary(t *testing.T
 		require.ErrorIs(t, err, applyErr)
 		require.Equal(t, 1, quitCalls)
 	})
+}
+
+func TestPasswordAndDisablePathsUseCommittedSecurityMutationHelper(t *testing.T) {
+	tests := []struct {
+		file     string
+		function string
+		calls    []string
+	}{
+		{file: "api.go", function: "pwdforget", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "api_emaillogin.go", function: "emailForgetPwd", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "api_manager.go", function: "resetUserPassword", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "api_manager.go", function: "updatePwd", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "api_usernamelogin.go", function: "updatePwd", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "service.go", function: "UpdateLoginPassword", calls: []string{"updatePasswordAndRevokeSessions"}},
+		{file: "api_manager.go", function: "liftBanUser", calls: []string{"updateUserFieldAndRevokeSessionsWithResult", "finishCommittedUserSecurityMutation"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.file+"/"+tt.function, func(t *testing.T) {
+			fset := gotoken.NewFileSet()
+			file, err := parser.ParseFile(fset, tt.file, nil, 0)
+			require.NoError(t, err)
+			found := make(map[string]bool)
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok || function.Name.Name != tt.function {
+					continue
+				}
+				ast.Inspect(function.Body, func(node ast.Node) bool {
+					call, ok := node.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if name, ok := call.Fun.(*ast.Ident); ok {
+						found[name.Name] = true
+					}
+					return true
+				})
+			}
+			for _, call := range tt.calls {
+				require.True(t, found[call], "%s must call %s", tt.function, call)
+			}
+		})
+	}
 }
 
 func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {

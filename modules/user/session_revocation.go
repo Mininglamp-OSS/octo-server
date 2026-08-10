@@ -112,15 +112,47 @@ func (d *DB) deleteAdminWithSessionRevocation(ctx context.Context, uid, role str
 	})
 }
 
-func updateUserFieldAndRevokeSessions(ctx context.Context, db *DB, store userSessionStore, uid, field string, value interface{}, reason string) error {
+func updateUserFieldAndRevokeSessionsWithResult(ctx context.Context, db *DB, store userSessionStore, uid, field string, value interface{}, reason string) (bool, error) {
 	if !sessionRevocationActive(store) {
-		return db.UpdateUsersWithField(field, fmt.Sprintf("%v", value), uid)
+		err := db.UpdateUsersWithField(field, fmt.Sprintf("%v", value), uid)
+		return err == nil, err
 	}
 	intent, err := db.updateUserFieldWithSessionRevocation(ctx, uid, field, value, reason)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return applyAndMarkSessionRevocation(ctx, db, store, intent)
+	return true, applyAndMarkSessionRevocation(ctx, db, store, intent)
+}
+
+type quitUserDevicesFunc func(uid string, deviceFlag int) error
+
+// finishCommittedUserSecurityMutation preserves the database commit boundary:
+// a rolled-back mutation has no external effects, while a committed mutation
+// always attempts HTTP bearer revocation and the independent WuKongIM logout.
+// In revoke/enforce modes the durable intent already owns bearer revocation;
+// earlier rollout modes use the compatibility indexes through Session Store.
+func finishCommittedUserSecurityMutation(ctx context.Context, store userSessionStore, uid string, committed bool, mutationErr error, quit quitUserDevicesFunc) error {
+	if !committed {
+		return mutationErr
+	}
+	result := mutationErr
+	if !sessionRevocationActive(store) {
+		for _, failure := range revokeDeviceTokens(ctx, store, uid) {
+			result = errors.Join(result, fmt.Errorf("user: revoke device %d session: %w", failure.flag, failure.err))
+		}
+	}
+	if quit == nil {
+		return errors.Join(result, errors.New("user: quit user devices callback is required"))
+	}
+	if err := quit(uid, -1); err != nil {
+		result = errors.Join(result, fmt.Errorf("user: quit all IM devices: %w", err))
+	}
+	return result
+}
+
+func updatePasswordAndRevokeSessions(ctx context.Context, db *DB, store userSessionStore, quit quitUserDevicesFunc, uid string, password interface{}, reason string) error {
+	committed, err := updateUserFieldAndRevokeSessionsWithResult(ctx, db, store, uid, "password", password, reason)
+	return finishCommittedUserSecurityMutation(ctx, store, uid, committed, err, quit)
 }
 
 func (d *DB) mutateWithSessionRevocation(ctx context.Context, uid, reason string, mutation sessionRevocationMutation) (*sessionRevocationIntent, error) {

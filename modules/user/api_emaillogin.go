@@ -407,7 +407,7 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	if err := updateUserFieldAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, userInfo.UID, "password", newHash, "password_reset"); err != nil {
+	if err := updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, newHash, "password_reset"); err != nil {
 		u.Error("更新密码失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return

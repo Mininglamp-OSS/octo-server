@@ -1234,7 +1234,7 @@ func (s *Service) UpdateLoginPassword(req UpdateLoginPasswordReq) error {
 	if hashErr != nil {
 		return hashErr
 	}
-	err = updateUserFieldAndRevokeSessions(context.Background(), s.db, s.sessionStore, req.UID, "password", newHash, "password_change")
+	err = updatePasswordAndRevokeSessions(context.Background(), s.db, s.sessionStore, s.ctx.QuitUserDevice, req.UID, newHash, "password_change")
 	if err != nil {
 		return errors.New("更新密码失败！")
 	}

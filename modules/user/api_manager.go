@@ -373,7 +373,7 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, req.Uid, "password", newHash, "password_reset")
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, m.ctx.QuitUserDevice, req.Uid, newHash, "password_reset")
 	if err != nil {
 		m.Error("重置用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
@@ -1089,12 +1089,16 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		c.ResponseOK()
 		return
 	}
+	var securityErr error
 	if userStatus == int(common.UserDisable) {
-		err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
-	} else {
-		err = m.userDB.UpdateUsersWithField("status", status, uid)
-	}
-	if err != nil {
+		committed, mutationErr := updateUserFieldAndRevokeSessionsWithResult(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
+		if !committed {
+			m.Error("修改用户状态错误", zap.Error(mutationErr))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+		securityErr = finishCommittedUserSecurityMutation(c.Request.Context(), m.sessionStore, uid, committed, mutationErr, m.ctx.QuitUserDevice)
+	} else if err = m.userDB.UpdateUsersWithField("status", status, uid); err != nil {
 		m.Error("修改用户状态错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
@@ -1105,19 +1109,27 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		ban = 1
 	}
 
-	err = m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+	channelErr := m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
 		ChannelID:   uid,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		Ban:         ban,
 	})
-	if err != nil {
-		m.Error("更新WebIM的token失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserIMCallFailed)
+	if channelErr != nil {
+		m.Error("更新WebIM的token失败！", zap.Error(channelErr))
+	}
+	var quitErr error
+	if userStatus != int(common.UserDisable) {
+		quitErr = m.ctx.QuitUserDevice(userInfo.UID, -1)
+		if quitErr != nil {
+			m.Error("下线用户所有登录设备错误", zap.Error(quitErr), zap.String("uid", uid))
+		}
+	}
+	if securityErr != nil {
+		m.Error("封禁用户会话撤销未同步完成", zap.Error(securityErr), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	err = m.ctx.QuitUserDevice(userInfo.UID, -1)
-	if err != nil {
-		m.Error("下线用户所有登录设备错误", zap.Error(err), zap.String("uid", uid))
+	if channelErr != nil || quitErr != nil {
 		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
@@ -1174,20 +1186,11 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = updateUserFieldAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, loginUID, "password", newHashedPassword, "password_change")
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, m.ctx.QuitUserDevice, loginUID, newHashedPassword, "password_change")
 	if err != nil {
 		m.Error("修改用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
-	}
-	if !sessionRevocationActive(m.sessionStore) {
-		// expand/v3-write compatibility path; revoke mode already rotated the
-		// generation and persisted a legacy deny marker above.
-		if err := m.revokeAllDeviceTokens(c.Request.Context(), user.UID); err != nil {
-			m.Error("清除旧token数据错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserTokenCacheFailed)
-			return
-		}
 	}
 	c.ResponseOK()
 }
