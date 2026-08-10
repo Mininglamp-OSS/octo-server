@@ -37,6 +37,9 @@ const (
 	// thirdAuthcodeTTL 前端短码轮询拿 LoginRespJSON 的窗口。
 	// 登录响应仅在 callback 成功时落 Redis,容量影响可忽略。
 	thirdAuthcodeTTL = 5 * time.Minute
+	// logoutTokenInvalidationTimeout bounds the security-critical Redis work
+	// independently of the inbound request and the best-effort IM/IdP cleanup.
+	logoutTokenInvalidationTimeout = 3 * time.Second
 	// maxAuditDetail audit 表 reason 列写入的最大长度,防止 IdP 返回的
 	// 任意字段(如 ?error=...)灌爆审计字段或污染下游 dashboard。
 	maxAuditDetail    = 256
@@ -899,18 +902,24 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	kickFailed := false
 	revokeFailed := false
 	tokenFailed := false
-	if o.killer != nil {
-		if err := o.killer.Kick(ctx, uid); err != nil {
-			kickFailed = true
-			o.Error("OIDC logout 踢线失败",
+	if o.tokenKill != nil {
+		// The handler intentionally returns 200 even when cleanup is degraded, so
+		// a client disconnect must not cancel the only HTTP bearer revocation
+		// attempt. Keep its budget independent from IM kick and IdP cleanup.
+		tokenCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutTokenInvalidationTimeout)
+		err := o.tokenKill.InvalidateCurrentToken(tokenCtx, uid, c.GetHeader("token"))
+		cancel()
+		if err != nil {
+			tokenFailed = true
+			o.Error("OIDC logout 作废当前 HTTP token 失败",
 				zap.String("trace_id", traceID),
 				zap.Error(err), zap.String("uid", uid))
 		}
 	}
-	if o.tokenKill != nil {
-		if err := o.tokenKill.InvalidateCurrentToken(ctx, uid, c.GetHeader("token")); err != nil {
-			tokenFailed = true
-			o.Error("OIDC logout 作废当前 HTTP token 失败",
+	if o.killer != nil {
+		if err := o.killer.Kick(ctx, uid); err != nil {
+			kickFailed = true
+			o.Error("OIDC logout 踢线失败",
 				zap.String("trace_id", traceID),
 				zap.Error(err), zap.String("uid", uid))
 		}

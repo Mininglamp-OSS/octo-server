@@ -267,6 +267,8 @@ func TestApplyRevocationWaitsForForeignOwnerAndFailsIfItNeverApplies(t *testing.
 		err := applyAndMarkSessionRevocation(context.Background(), userAPI.db, store, intent)
 		require.Error(t, err,
 			"an intent still pending under another owner must not be acknowledged as revoked")
+		require.ErrorIs(t, err, errSessionRevocationPending,
+			"the caller must be able to distinguish a retryable pending revocation")
 		var pending int
 		_, loadErr := ctx.DB().Select("COUNT(*)").From("user_session_revocation_intent").
 			Where("id=? AND status=?", intent.ID, sessionRevocationPending).Load(&pending)

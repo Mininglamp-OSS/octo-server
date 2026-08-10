@@ -131,9 +131,10 @@ func TestNewSessionRevocationIntentReservesSynchronousClaimWindow(t *testing.T) 
 	require.NoError(t, err)
 	require.Nil(t, workerIntent, "a normal worker must not race the synchronous apply immediately after commit")
 
-	claimed, err := db.claimSessionRevocationByID(context.Background(), intent, "sync", now)
+	claim, err := db.claimSessionRevocationByID(context.Background(), intent, "sync", now)
 	require.NoError(t, err)
-	require.True(t, claimed, "the synchronous by-ID path must ignore its own worker visibility delay")
+	require.Equal(t, sessionRevocationClaimAcquired, claim,
+		"the synchronous by-ID path must ignore its own worker visibility delay")
 }
 
 func TestSessionRevocationWorkerAppliesPendingIntent(t *testing.T) {

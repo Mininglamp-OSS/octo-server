@@ -25,6 +25,17 @@ const (
 	// by-ID claimant. Shared workers take over after the window if the request
 	// process exits or cannot complete the Redis revocation.
 	sessionRevocationSyncPriorityWindow = 5 * time.Second
+
+	sessionRevocationWaitInitial = 100 * time.Millisecond
+	sessionRevocationWaitMaximum = 500 * time.Millisecond
+)
+
+type sessionRevocationClaim uint8
+
+const (
+	sessionRevocationClaimAcquired sessionRevocationClaim = iota + 1
+	sessionRevocationClaimApplied
+	sessionRevocationClaimLeasedElsewhere
 )
 
 var allowedSessionRevocationReasons = map[string]bool{
@@ -34,6 +45,8 @@ var allowedSessionRevocationReasons = map[string]bool{
 	"account_destroy": true,
 	"admin_delete":    true,
 }
+
+var errSessionRevocationPending = errors.New("user: session revocation remains pending under another owner")
 
 type sessionRevocationIntent struct {
 	ID           uint64     `db:"id"`
@@ -287,9 +300,9 @@ func (d *DB) pendingSessionRevocation(ctx context.Context, uid, reason string) (
 	return &intent, nil
 }
 
-func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevocationIntent, owner string, now time.Time) (bool, error) {
+func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevocationIntent, owner string, now time.Time) (sessionRevocationClaim, error) {
 	if intent == nil || intent.ID == 0 || owner == "" {
-		return false, errors.New("user: synchronous revocation claim requires intent and owner")
+		return 0, errors.New("user: synchronous revocation claim requires intent and owner")
 	}
 	result, err := d.session.UpdateBySql(
 		"UPDATE user_session_revocation_intent SET lease_owner=?,lease_until=? "+
@@ -297,25 +310,24 @@ func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevo
 		owner, now.Add(sessionRevocationLease), intent.ID, sessionRevocationPending, now,
 	).ExecContext(ctx)
 	if err != nil {
-		return false, fmt.Errorf("user: claim synchronous session revocation intent: %w", err)
+		return 0, fmt.Errorf("user: claim synchronous session revocation intent: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("user: read synchronous revocation claim result: %w", err)
+		return 0, fmt.Errorf("user: read synchronous revocation claim result: %w", err)
 	}
 	if affected == 1 {
 		intent.LeaseOwner = owner
 		leaseUntil := now.Add(sessionRevocationLease)
 		intent.LeaseUntil = &leaseUntil
-		return true, nil
+		return sessionRevocationClaimAcquired, nil
 	}
-	// Losing the claim is not the same as losing the revocation. Distinguish the
-	// two benign outcomes — already applied, or currently owned by someone else
-	// (normally the shared worker, which reserves the intent after the sync
-	// priority window) — from a genuine fault. Reporting a live foreign lease as
-	// an error would tell the caller their committed mutation failed and invite a
-	// second one. The lease comparison runs in SQL so it matches the claim
-	// predicate above exactly and cannot drift on driver time zones.
+	// Losing the claim is not the same as completing the revocation. Distinguish
+	// already-applied from a pending intent currently owned by another replica,
+	// so the caller can wait within its bounded post-commit budget without
+	// stealing the lease or repeating the Redis mutation. The lease comparison
+	// runs in SQL so it matches the claim predicate above exactly and cannot
+	// drift on driver time zones.
 	var claimState struct {
 		Status     uint8 `db:"status"`
 		LeaseAlive bool  `db:"lease_alive"`
@@ -326,15 +338,58 @@ func (d *DB) claimSessionRevocationByID(ctx context.Context, intent *sessionRevo
 		now, intent.ID,
 	).LoadOneContext(ctx, &claimState)
 	if loadErr != nil {
-		return false, fmt.Errorf("user: read synchronous revocation claim state: %w", loadErr)
+		return 0, fmt.Errorf("user: read synchronous revocation claim state: %w", loadErr)
 	}
 	if claimState.Status == sessionRevocationApplied {
-		return false, nil
+		return sessionRevocationClaimApplied, nil
 	}
-	if claimState.LeaseAlive {
-		return false, nil
+	if claimState.Status == sessionRevocationPending && claimState.LeaseAlive {
+		return sessionRevocationClaimLeasedElsewhere, nil
 	}
-	return false, errors.New("user: session revocation lease ownership lost")
+	return 0, errors.New("user: session revocation lease ownership lost")
+}
+
+func (d *DB) sessionRevocationAppliedByID(ctx context.Context, id uint64) (bool, error) {
+	var status uint8
+	err := d.session.Select("status").From("user_session_revocation_intent").Where("id=?", id).LoadOneContext(ctx, &status)
+	if err != nil {
+		return false, fmt.Errorf("user: read session revocation completion: %w", err)
+	}
+	switch status {
+	case sessionRevocationPending:
+		return false, nil
+	case sessionRevocationApplied:
+		return true, nil
+	default:
+		return false, fmt.Errorf("user: invalid session revocation status %d", status)
+	}
+}
+
+func waitForSessionRevocationApplied(ctx context.Context, db *DB, intent *sessionRevocationIntent) error {
+	delay := sessionRevocationWaitInitial
+	for {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w: %w", errSessionRevocationPending, ctx.Err())
+		case <-timer.C:
+		}
+
+		applied, err := db.sessionRevocationAppliedByID(ctx, intent.ID)
+		if err != nil {
+			return err
+		}
+		if applied {
+			return nil
+		}
+		if delay < sessionRevocationWaitMaximum {
+			delay *= 2
+			if delay > sessionRevocationWaitMaximum {
+				delay = sessionRevocationWaitMaximum
+			}
+		}
+	}
 }
 
 func (d *DB) markSessionRevocationApplied(ctx context.Context, intent *sessionRevocationIntent, owner string) error {
@@ -411,12 +466,19 @@ func applyAndMarkSessionRevocation(ctx context.Context, db *DB, store userSessio
 	securityCtx, cancel := postCommitSecurityContext(ctx)
 	defer cancel()
 	owner := "sync-" + util.GenerUUID()
-	claimed, err := db.claimSessionRevocationByID(securityCtx, intent, owner, time.Now().UTC())
+	claim, err := db.claimSessionRevocationByID(securityCtx, intent, owner, time.Now().UTC())
 	if err != nil {
 		return err
 	}
-	if !claimed {
+	switch claim {
+	case sessionRevocationClaimApplied:
 		return nil
+	case sessionRevocationClaimLeasedElsewhere:
+		return waitForSessionRevocationApplied(securityCtx, db, intent)
+	case sessionRevocationClaimAcquired:
+		// Continue below: this request owns the lease and must apply it.
+	default:
+		return fmt.Errorf("user: invalid session revocation claim %d", claim)
 	}
 	if err := applySessionRevocation(securityCtx, store, intent); err != nil {
 		if releaseErr := db.releaseSessionRevocation(securityCtx, intent, owner); releaseErr != nil {
