@@ -44,6 +44,8 @@ source: self
 7. 实际角色变化及幂等授权会撤销目标账号 APP/Web/PC 现有会话，避免 RoleResolver
    故障回退到旧 token 角色；对从未持有该角色的普通账号撤销是无副作用 no-op。
 8. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
+9. 这是账号级授权，不是独立管理台 session：RoleResolver 会把当前角色注入该账号后续
+   建立的有效 IM 会话，这些 bearer 也能调用 Dashboard 读接口；该取舍在临时方案中明确接受。
 
 ## Out of scope
 
