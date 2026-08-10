@@ -208,6 +208,9 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 	extraMap["allow_view_history_msg"] = groupResp.AllowViewHistoryMsg
 	extraMap["group_type"] = groupResp.GroupType
 	extraMap["allow_member_pinned_message"] = groupResp.AllowMemberPinnedMessage
+	extraMap["is_named"] = groupResp.IsNamed
+	extraMap["avatar_text"] = groupResp.AvatarText
+	extraMap["avatar_color"] = groupResp.AvatarColor
 	// 群级「允许免@回答」总开关：前端 channelInfo.orgData.allow_no_mention 据此回读
 	// 真实 0/1 值，否则开关永远显示「开」且关不掉（refresh 弹回）。默认 1=允许，零回归。
 	extraMap["allow_no_mention"] = groupResp.AllowNoMention

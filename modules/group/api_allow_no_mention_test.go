@@ -122,6 +122,21 @@ func TestNewChannelResp_CarriesAllowNoMention(t *testing.T) {
 	}
 }
 
+func TestNewChannelResp_CarriesAvatarCustomFields(t *testing.T) {
+	avatarColor := 5
+	resp := newChannelRespWithGroupResp(&GroupResp{
+		GroupNo:     "g-avatar-extra",
+		Name:        "avatar group",
+		IsNamed:     1,
+		AvatarText:  "研发",
+		AvatarColor: &avatarColor,
+	})
+
+	assert.Equal(t, 1, resp.Extra["is_named"], "extra 必须透出 is_named，前端据此判断默认头像是否取群名")
+	assert.Equal(t, "研发", resp.Extra["avatar_text"], "extra 必须透出 avatar_text，前端据此预填文字头像弹窗")
+	assert.Equal(t, &avatarColor, resp.Extra["avatar_color"], "extra 必须透出 avatar_color，前端据此预填色板")
+}
+
 // TestGroupSettingUpdate_AllowNoMention_SilentToggleSucceeds pins YUJ-3153 Bug
 // 3: toggling the switch as creator now goes through the silent
 // SendChannelUpdateToGroup path (like mute / allow_view_history_msg) instead of
