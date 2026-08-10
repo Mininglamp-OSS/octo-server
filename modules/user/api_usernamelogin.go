@@ -299,9 +299,7 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	updateMap := map[string]interface{}{}
-	updateMap["password"] = newHash
-	err = u.db.updateUser(updateMap, user.UID)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, user.UID, newHash, "password_reset")
 	if err != nil {
 		u.Error("修改用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)

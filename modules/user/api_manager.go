@@ -1085,19 +1085,36 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
-	if userInfo.Status == userStatus {
+	alreadyInState := userInfo.Status == userStatus
+	disabling := userStatus == int(common.UserDisable)
+	if alreadyInState && !disabling {
 		c.ResponseOK()
 		return
 	}
 	var securityErr error
-	if userStatus == int(common.UserDisable) {
-		committed, mutationErr := updateUserFieldAndRevokeSessionsWithResult(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
-		if !committed {
-			m.Error("修改用户状态错误", zap.Error(mutationErr))
-			respondUserError(c, errcode.ErrUserStoreFailed)
-			return
+	var mutationErr error
+	committed := false
+	if disabling {
+		if alreadyInState {
+			committed = true
+			if sessionRevocationActive(m.sessionStore) {
+				retryCtx, cancel := postCommitSecurityContext(c.Request.Context())
+				pending, pendingErr := m.userDB.pendingSessionRevocation(retryCtx, uid, "account_disable")
+				if pendingErr != nil {
+					mutationErr = pendingErr
+				} else if pending != nil {
+					mutationErr = applyAndMarkSessionRevocation(retryCtx, m.userDB, m.sessionStore, pending)
+				}
+				cancel()
+			}
+		} else {
+			committed, mutationErr = updateUserFieldAndRevokeSessionsWithResult(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
+			if !committed {
+				m.Error("修改用户状态错误", zap.Error(mutationErr))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				return
+			}
 		}
-		securityErr = finishCommittedUserSecurityMutation(c.Request.Context(), m.sessionStore, uid, committed, mutationErr, m.ctx.QuitUserDevice)
 	} else if err = m.userDB.UpdateUsersWithField("status", status, uid); err != nil {
 		m.Error("修改用户状态错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
@@ -1105,7 +1122,7 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	}
 
 	ban := 0
-	if userStatus == int(common.UserDisable) {
+	if disabling {
 		ban = 1
 	}
 
@@ -1118,7 +1135,9 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		m.Error("更新WebIM的token失败！", zap.Error(channelErr))
 	}
 	var quitErr error
-	if userStatus != int(common.UserDisable) {
+	if disabling {
+		securityErr = finishCommittedUserSecurityMutation(c.Request.Context(), m.sessionStore, uid, committed, mutationErr, m.ctx.QuitUserDevice)
+	} else {
 		quitErr = m.ctx.QuitUserDevice(userInfo.UID, -1)
 		if quitErr != nil {
 			m.Error("下线用户所有登录设备错误", zap.Error(quitErr), zap.String("uid", uid))

@@ -13,9 +13,9 @@ import (
 // bound to a disabled space would keep validating.
 //
 // v3.3.6 §P1 (yujiawei R2): also gate user.status=1 to close the
-// account-ban bypass. liftBanUser (modules/user/api_manager.go:909) sets
-// user.status=0 + QuitUserDevice clears redis token cache (handles
-// session-token path), but daemon api_key sits behind no such cache —
+// account-ban bypass. liftBanUser sets user.status=0, separately revokes known
+// HTTP sessions through Session Store, and calls QuitUserDevice for WuKongIM;
+// daemon api_key sits behind neither session mechanism —
 // without this join, a globally banned user's daemon keeps fully valid
 // credentials (verify-api-key 200, botToken mints live bot_token, mintBot
 // 200). execLogin already gates userInfo.Status (api.go:1418); v3 daemon

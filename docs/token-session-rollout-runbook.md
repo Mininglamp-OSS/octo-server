@@ -125,7 +125,9 @@ OBSERVATION_MIN_GAP=1h
 
 ### Phase A：`expand`
 
-1. 部署 PR 2，显式或默认使用 `OCTO_AUTH_SESSION_MODE=expand`。
+1. 在产品确认改密/重置与账号禁用会触发全 IM 设备退出后，部署 PR 2，显式或默认使用
+   `OCTO_AUTH_SESSION_MODE=expand`。这项客户端可见行为随制品立即生效，不等待 v3 floor；此阶段
+   HTTP bearer 仅按 APP/Web/PC 兼容反查撤销各端最新一条已知会话，不能宣称 UID 全部会话已撤销。
 2. 等待 rollout 完成，确认 `desired=current=ready`，所有 PR 2 之前的 ReplicaSet 副本为 0。
 3. 核对每个 Pod 的 build、mode、floor、TTL 和 pool 日志；此时不得产生 v3、不得 apply。
 4. 运行一次限速 observe 做基线盘点，但不要记录 floor 证据：
@@ -166,6 +168,8 @@ OBSERVATION_MIN_GAP=1h
 ```
 
 部署 `REQUIRED_FLOOR=revoke` 后清零旧配置副本。只有完成这一步才允许 apply 和 rollout evidence。
+从该 floor 起，改密/重置和禁用事件才由 generation rotate 保证 UID 全部 HTTP 会话即时失效；
+`v3-write` 阶段只能保证兼容索引中每个 device flag 的最新会话。
 
 legacy deny marker 从本阶段开始按被全量撤销的 UID 写入且无 TTL。上线前按可能被撤销的唯一 UID
 数做容量预算；在所有 legacy reader 退出并进入最终 enforce 前禁止人工删除。本版本不提供自动

@@ -181,7 +181,7 @@ func TestCommittedSessionRevocationIgnoresCanceledRequestContext(t *testing.T) {
 	prefix := "user-revocation-canceled-token:" + util.GenerUUID() + ":"
 	uidPrefix := "user-revocation-canceled-uid:" + util.GenerUUID() + ":"
 	store := auth.NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, auth.WithSessionMode(auth.SessionModeRevoke), auth.WithSessionMaxPerUID(2))
-	uid := "canceled-" + util.GenerUUID()
+	uid := "c-" + util.GenerUUID()
 	token := "token-" + util.GenerUUID()
 	require.NoError(t, db.Insert(&Model{UID: uid, Name: "canceled user", ShortNo: uid, Password: "before", Status: 1}))
 	t.Cleanup(func() {
@@ -293,6 +293,13 @@ func TestInvalidateCurrentUserTokenIgnoresCanceledRequestContext(t *testing.T) {
 }
 
 func TestPasswordMutationPathsUseCommittedSecurityMutationHelper(t *testing.T) {
+	legacyHashMigrations := map[string]bool{
+		"api.go/login":                       true,
+		"api_emaillogin.go/emailLogin":       true,
+		"api_manager.go/login":               true,
+		"api_usernamelogin.go/usernameLogin": true,
+		"oidc_bind.go/VerifyPasswordByUID":   true,
+	}
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
 	var mutationPaths []string
@@ -308,12 +315,15 @@ func TestPasswordMutationPathsUseCommittedSecurityMutationHelper(t *testing.T) {
 			if !ok || function.Body == nil || function.Name.Name == "updatePasswordAndRevokeSessions" {
 				continue
 			}
-			mutatesPassword, usesHelper := passwordMutationCalls(function.Body)
+			mutatesPassword, usesHelper, legacyHashMigration := passwordMutationCalls(function.Body)
 			if !mutatesPassword {
 				continue
 			}
 			path := entry.Name() + "/" + function.Name.Name
 			mutationPaths = append(mutationPaths, path)
+			if legacyHashMigration && legacyHashMigrations[path] {
+				continue
+			}
 			require.True(t, usesHelper, "%s writes the password credential without updatePasswordAndRevokeSessions", path)
 		}
 	}
@@ -322,9 +332,10 @@ func TestPasswordMutationPathsUseCommittedSecurityMutationHelper(t *testing.T) {
 	require.NotEmpty(t, mutationPaths)
 }
 
-func passwordMutationCalls(body *ast.BlockStmt) (mutatesPassword bool, usesHelper bool) {
+func passwordMutationCalls(body *ast.BlockStmt) (mutatesPassword bool, usesHelper bool, legacyHashMigration bool) {
 	var hasPasswordLiteral bool
 	var callsGenericUserWriter bool
+	var callsDirectPasswordWriter bool
 	ast.Inspect(body, func(node ast.Node) bool {
 		switch typed := node.(type) {
 		case *ast.BasicLit:
@@ -342,10 +353,15 @@ func passwordMutationCalls(body *ast.BlockStmt) (mutatesPassword bool, usesHelpe
 			if name == "updateUser" || name == "UpdateUsersWithField" {
 				callsGenericUserWriter = true
 			}
+			if name == "updatePassword" {
+				callsDirectPasswordWriter = true
+			}
 		}
 		return true
 	})
-	return usesHelper || (hasPasswordLiteral && callsGenericUserWriter), usesHelper
+	mutatesPassword = usesHelper || callsDirectPasswordWriter || (hasPasswordLiteral && callsGenericUserWriter)
+	legacyHashMigration = callsDirectPasswordWriter && !callsGenericUserWriter && !usesHelper
+	return mutatesPassword, usesHelper, legacyHashMigration
 }
 
 func calledFunctionName(expression ast.Expr) string {

@@ -20,6 +20,7 @@ const (
 
 	sessionRevocationLease     = 30 * time.Second
 	sessionRevocationBatchSize = 20
+	postCommitSecurityTimeout  = 3 * time.Second
 	// Newly committed intents are reserved briefly for their synchronous
 	// by-ID claimant. Shared workers take over after the window if the request
 	// process exits or cannot complete the Redis revocation.
@@ -126,6 +127,13 @@ func updateUserFieldAndRevokeSessionsWithResult(ctx context.Context, db *DB, sto
 
 type quitUserDevicesFunc func(uid string, deviceFlag int) error
 
+func postCommitSecurityContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), postCommitSecurityTimeout)
+}
+
 // finishCommittedUserSecurityMutation preserves the database commit boundary:
 // a rolled-back mutation has no external effects, while a committed mutation
 // always attempts HTTP bearer revocation and the independent WuKongIM logout.
@@ -135,9 +143,11 @@ func finishCommittedUserSecurityMutation(ctx context.Context, store userSessionS
 	if !committed {
 		return mutationErr
 	}
+	securityCtx, cancel := postCommitSecurityContext(ctx)
+	defer cancel()
 	result := mutationErr
 	if !sessionRevocationActive(store) {
-		for _, failure := range revokeDeviceTokens(ctx, store, uid) {
+		for _, failure := range revokeDeviceTokens(securityCtx, store, uid) {
 			result = errors.Join(result, fmt.Errorf("user: revoke device %d session: %w", failure.flag, failure.err))
 		}
 	}
@@ -378,21 +388,23 @@ func (u *User) applySessionRevocationIntent(ctx context.Context, intent *session
 }
 
 func applyAndMarkSessionRevocation(ctx context.Context, db *DB, store userSessionStore, intent *sessionRevocationIntent) error {
+	securityCtx, cancel := postCommitSecurityContext(ctx)
+	defer cancel()
 	owner := "sync-" + util.GenerUUID()
-	claimed, err := db.claimSessionRevocationByID(ctx, intent, owner, time.Now().UTC())
+	claimed, err := db.claimSessionRevocationByID(securityCtx, intent, owner, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	if !claimed {
 		return nil
 	}
-	if err := applySessionRevocation(ctx, store, intent); err != nil {
-		if releaseErr := db.releaseSessionRevocation(ctx, intent, owner); releaseErr != nil {
+	if err := applySessionRevocation(securityCtx, store, intent); err != nil {
+		if releaseErr := db.releaseSessionRevocation(securityCtx, intent, owner); releaseErr != nil {
 			return errors.Join(err, releaseErr)
 		}
 		return err
 	}
-	return db.markSessionRevocationApplied(ctx, intent, owner)
+	return db.markSessionRevocationApplied(securityCtx, intent, owner)
 }
 
 func (u *User) processPendingSessionRevocations() {

@@ -1337,9 +1337,9 @@ func (r redisAuthcode) SetAuthcode(ctx context.Context, authcode, payload string
 	}
 }
 
-// ctxKiller 生产路径下的 sessionKiller 实现 —— 委托给 dmwork-lib 的
-// QuitUserDevice(uid, -1):内部统一删 token Redis + 用新 token 重签 IM,
-// WuKongIM 老连接的 transport 验证失败后自然断开,达成"踢全部设备"。
+// ctxKiller 生产路径下的 sessionKiller 实现 —— 委托给 octo-lib 的
+// QuitUserDevice(uid, -1) 退出 WuKongIM 全部设备。该调用不撤销 octo-server
+// HTTP bearer；OIDC sync invalid_grant 的本地会话 scope 仍是待签字能力。
 type ctxKiller struct{ ctx *config.Context }
 
 func (k ctxKiller) Kick(_ context.Context, uid string) error {

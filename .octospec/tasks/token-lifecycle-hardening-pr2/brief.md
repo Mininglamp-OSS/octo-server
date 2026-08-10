@@ -226,9 +226,9 @@ generation 隔离使撤销事件只清理自己淘汰的旧索引；事件后新
 
 ### 5. 撤销接口与 durable intent
 
-Session Store 暴露统一的 `RevokeCurrent`、`RevokeByDevice`、`RevokeAll`，业务 handler 不再直接
-拼接 Token/UIDToken key。HTTP Token 撤销与 WuKongIM device quit 是两个独立结果，前者成功
-不能由后者替代。
+Session Store 当前暴露统一的 `RevokeCurrent`、`RevokeAll`，业务 handler 不再直接拼接
+Token/UIDToken key。`RevokeByDevice` 仍属设备精确 scope 的待签字能力，本 PR 不宣称已交付。
+HTTP Token 撤销与 WuKongIM device quit 是两个独立结果，前者成功不能由后者替代。
 
 对密码、账号状态、注销等 DB-backed 高风险事件：
 
@@ -260,6 +260,10 @@ Session Store 暴露统一的 `RevokeCurrent`、`RevokeByDevice`、`RevokeAll`�
 | OIDC logout | 当前 HTTP Token；IdP RT 范围保持现状待签字 | 当前实现踢全部设备 | 保持 RP-Initiated Logout/best-effort wire contract |
 | OIDC sync 确认真实 `invalid_grant` | 建议 UID 全部本地会话 | 全部设备 | 作为 durable event，不只踢 IM |
 | 昵称/语言变化 | 不撤销 | 无 | 版本不降级，deadline 不变 |
+
+`expand`/`v3-write` 的兼容撤销只能通过 APP/Web/PC 的 UIDToken 反查各处理最新一条已知会话；
+只有进入 `revoke` floor 后，generation rotate 才保证“UID 全部会话”即时失效。因此生产不得把
+`v3-write` 阶段的兼容撤销描述为全部会话，也应尽量缩短该过渡窗口。
 
 所有认证失败继续使用现有通用 i18n/anti-enumeration envelope；具体的 expired、generation
 mismatch、deny marker 或 Redis error 只进入低基数内部指标/日志，不泄露给客户端。
@@ -440,7 +444,9 @@ grace 已经过期推断 v1/v2 已清零。
 ## Decisions required before activation / remaining scope
 
 代码使用两个安全默认但仍需上线签字：单 UID cap 必须显式配置且超限时拒绝新登录；主动改密撤销
-包含当前设备在内的全部会话。以下环境参数和未接线路径不能由代码自行猜测：
+包含当前设备在内的全部会话。主动改密/重置与禁用的兼容撤销和 WuKongIM 全设备退出在默认
+`expand` 部署即生效，不等待 floor 推进，因此相应产品签字是合并/部署门禁，不是后续 activation
+门禁。以下环境参数和未接线路径不能由代码自行猜测：
 
 - legacy grace 与绝对 `legacy_cutoff_at`：原建议 7 天，需生产 observe 后签字。
 - 两次完整 observe 的最小间隔；工具要求每次 floor 推进时显式给出，硬下界为 `1h`，后续只可

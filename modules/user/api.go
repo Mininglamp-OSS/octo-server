@@ -1997,10 +1997,12 @@ func updateUserSessionSnapshot(ctx context.Context, store userSessionStore, toke
 }
 
 func invalidateCurrentUserToken(ctx context.Context, store userSessionStore, uid, token string) error {
+	securityCtx, cancel := postCommitSecurityContext(ctx)
+	defer cancel()
 	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
-		return invalidator.InvalidateCurrentToken(ctx, uid, token)
+		return invalidator.InvalidateCurrentToken(securityCtx, uid, token)
 	}
-	return store.DeleteToken(ctx, token)
+	return store.DeleteToken(securityCtx, token)
 }
 
 func (u *User) compensateIssuedToken(token, uid string, deviceFlag int) error {
