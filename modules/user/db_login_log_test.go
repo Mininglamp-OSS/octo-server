@@ -44,7 +44,7 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 
 	// 关键契约：整张表不得出现账号明文
 	assert.Equal(t, "008****1234", rows[0].AccountMasked)
-	assert.Equal(t, "b***@example.com", rows[1].AccountMasked)
+	assert.Equal(t, "b***@e***", rows[1].AccountMasked)
 	for i, r := range rows {
 		assert.NotContains(t, r.AccountMasked, "13800001234", "row %d 泄露了手机号明文", i)
 		assert.NotContains(t, r.AccountMasked, "bob@", "row %d 泄露了邮箱本地部分", i)
@@ -76,9 +76,12 @@ func TestMaskLoginAccount(t *testing.T) {
 		{"", ""},
 		{"13800001234", "138****1234"},
 		{"008613800001234", "008****1234"},
-		{"bob@example.com", "b***@example.com"},
+		{"bob@example.com", "b***@e***"},
 		// 单字符 local part 整体掩掉：保留它等于暴露 100% 的本地部分
-		{"a@example.com", "*@example.com"},
+		{"a@example.com", "*@e***"},
+		// @ 后缀同样是攻击者可控输入，不得作为所谓“域名”原样落库/进日志。
+		{"x@13800001234", "*@1***"},
+		{"1@139-0000-5555 note", "*@1***"},
 		// 没有 local part（LastIndex 为 0）不认为是邮箱，走通用分支（掩得更多，安全侧）
 		{"@example.com", "@***"},
 		{"superAdmin", "s***"},
@@ -107,6 +110,14 @@ func TestMaskLoginAccountCapsDatabaseValueByRune(t *testing.T) {
 	}
 }
 
+func TestMaskLoginAccountNeverRetainsAttackerControlledSuffix(t *testing.T) {
+	const pii = "13800001234"
+	masked := maskLoginAccount("x@" + pii)
+	if strings.Contains(masked, pii) {
+		t.Fatalf("maskLoginAccount leaked attacker-controlled PII: %q", masked)
+	}
+}
+
 func TestLoginAccountBlindHash_NormalizesAndDegrades(t *testing.T) {
 	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
 	a, err := LoginAccountBlindHash("Bob@Example.com")
@@ -124,6 +135,26 @@ func TestLoginAccountBlindHash_NormalizesAndDegrades(t *testing.T) {
 	masked, hash := resolveAccountFields("13800001234")
 	assert.Equal(t, "138****1234", masked)
 	assert.Empty(t, hash, "主密钥缺失时盲索引降级为空")
+}
+
+func TestNormalizeLoginIPRejectsUntrustedHeaderText(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "ipv4", in: " 192.0.2.1 ", want: "192.0.2.1"},
+		{name: "canonical ipv6", in: "2001:0db8:0000:0000:0000:0000:0000:0001", want: "2001:db8::1"},
+		{name: "overlong attacker header", in: strings.Repeat("9", 41), want: ""},
+		{name: "arbitrary text", in: "not-an-ip", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeLoginIP(tt.in); got != tt.want {
+				t.Fatalf("normalizeLoginIP(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestLoginLog_GetLastLoginIP_NoRecordsReturnsNil(t *testing.T) {

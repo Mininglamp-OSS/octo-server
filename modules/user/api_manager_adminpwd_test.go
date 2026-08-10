@@ -3,6 +3,7 @@ package user
 import (
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,4 +45,29 @@ func TestCreateManagerAccountRejectsWeakAdminPwd(t *testing.T) {
 	matched, needsMigration := CheckPassword(strongPwd, created.Password)
 	assert.True(t, matched, "落库的哈希应能校验通过原口令")
 	assert.False(t, needsMigration, "新建账号不应命中 MD5 迁移分支")
+}
+
+func TestManagerSeedModelDoesNotRequirePhoneEncryption(t *testing.T) {
+	seed := newManagerSeedModel("admin-uid", "bcrypt-hash")
+	require.NotNil(t, seed)
+	assert.Empty(t, seed.Zone)
+	assert.Empty(t, seed.Phone, "bootstrap superAdmin must not depend on the PII encryption key")
+	assert.Equal(t, string(wkhttp.SuperAdmin), seed.Username)
+	assert.Equal(t, string(wkhttp.SuperAdmin), seed.Role)
+}
+
+func TestCreateManagerAccountWithoutPIIKey(t *testing.T) {
+	withPhoneSecretForTest(t, "")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	cfg := ctx.GetConfig()
+	cfg.AdminPwd = "Str0ng@Admin"
+	NewManager(ctx)
+
+	created, err := NewDB(ctx).QueryByUID(cfg.Account.AdminUID)
+	require.NoError(t, err)
+	require.NotNil(t, created, "superAdmin bootstrap must work before the PII key is provisioned")
+	assert.Empty(t, created.Phone)
+	assert.Empty(t, created.PhoneHash)
 }

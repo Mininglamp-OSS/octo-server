@@ -3,6 +3,7 @@ package user
 import (
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,25 @@ func TestPhoneBlindHash_DeterministicAndZoneScoped(t *testing.T) {
 	}
 	if h1 == h3 {
 		t.Fatal("PhoneBlindHash must differ across zones for the same phone digits")
+	}
+}
+
+func TestPhoneBlindHashUsesNewEncodingVersionWithoutRotatingLoginAuditHash(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	phoneHash, err := PhoneBlindHash("0086", "13800001234")
+	if err != nil {
+		t.Fatalf("PhoneBlindHash: %v", err)
+	}
+	if !strings.HasPrefix(phoneHash, "2:") {
+		t.Fatalf("PhoneBlindHash = %q, want encoding version 2", phoneHash)
+	}
+
+	loginHash, err := LoginAccountBlindHash("13800001234")
+	if err != nil {
+		t.Fatalf("LoginAccountBlindHash: %v", err)
+	}
+	if !strings.HasPrefix(loginHash, "1:") {
+		t.Fatalf("LoginAccountBlindHash = %q, phone encoding change must not rotate audit hashes", loginHash)
 	}
 }
 

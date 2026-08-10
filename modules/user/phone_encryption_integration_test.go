@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -338,6 +339,35 @@ func TestBackfillPhoneShadow(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, np)
 	assert.Empty(t, np.PhoneHash)
+}
+
+func TestBackfillPhoneShadowRewritesLegacyHashVersion(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy, phone_encrypted, phone_hash, phone_last4) "+
+			"VALUES ('u-v1-hash','008613800006666','legacy-hash','0086','13800006666','sn-v1-hash','v-v1-hash@1',1,0,?,?,'6666')",
+		[]byte("legacy-ciphertext"), "1:legacy-hash",
+	).Exec()
+	require.NoError(t, err)
+
+	pending, err := d.CountPhoneShadowPending()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, pending, "legacy hash versions must remain pending")
+
+	res, err := d.BackfillPhoneShadow(context.Background(), 0, 10, time.Nanosecond)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, res.Updated)
+	assert.True(t, res.Done)
+
+	got, err := d.QueryByUID("u-v1-hash")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, strings.HasPrefix(got.PhoneHash, "2:"), "legacy hash must be rewritten: %q", got.PhoneHash)
+	assert.NotEqual(t, []byte("legacy-ciphertext"), got.PhoneEncrypted)
 }
 
 // TestBackfillPhoneShadowRequiresKey 回填同样 fail-closed：没有主密钥就直接报错，
