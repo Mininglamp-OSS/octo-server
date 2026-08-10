@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -15,6 +16,7 @@ import (
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -23,8 +25,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	rd "github.com/go-redis/redis"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+)
+
+const (
+	managerLoginRateLimitTag      = "manager_login"
+	managerLoginRateLimitRPS      = 10.0 / 60
+	managerLoginRateLimitBurst    = 5
+	managerLoginRateLimitPoolSize = 10
 )
 
 // Manager 用户管理
@@ -65,9 +75,23 @@ func NewManager(ctx *config.Context) *Manager {
 
 // Route 配置路由规则
 func (m *Manager) Route(r *wkhttp.WKHttp) {
+	// manager login is an unauthenticated, high-value endpoint. Every failed
+	// attempt also writes an audit row, so the broad global DDoS floor is not
+	// sufficient protection against brute force or database write amplification.
+	managerLoginRedis := octoredis.NewInstrumentedClient(m.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = managerLoginRateLimitPoolSize
+	})
+	managerLoginLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(),
+		managerLoginRedis,
+		managerLoginRateLimitTag,
+		managerLoginRateLimitRPS,
+		managerLoginRateLimitBurst,
+	)
 	user := r.Group("/v1/manager")
 	{
-		user.POST("/login", m.login) // 账号登录
+		user.POST("/login", managerLoginLimit, m.login) // 账号登录
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{

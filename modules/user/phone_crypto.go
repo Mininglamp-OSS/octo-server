@@ -28,9 +28,9 @@ import (
 //   - 手机号后4位（phoneLast4）是独立的低敏明文字段，只服务"输入后4位模糊检索"
 //     这一种检索语义，盲索引做不到子串匹配。
 //
-// 主密钥缺失时，encryptPhone/PhoneBlindHash 返回 error；调用方按 usersecret 的
-// 降级口径处理：写路径跳过三个新列（明文 phone 列仍照常写入，不阻断注册/建号），
-// 读路径退回明文比较（见 db.go QueryByPhone）。
+// 主密钥缺失时，encryptPhone/PhoneBlindHash 返回 error。写入非空手机号的
+// DB.Insert/insertTx 路径 fail-closed，返回 ErrPhoneEncryptionUnavailable 且不写明文；
+// 无手机号建号不受影响。读路径在存量回填完成前仍保留明文比较兼容。
 const (
 	phoneCipherVersionPrefix = "enc:v1:"
 	phoneEncryptionSecretEnv = "OCTO_PII_ENCRYPTION_SECRET"
@@ -186,8 +186,7 @@ type phoneEncryptor struct {
 }
 
 // newPhoneEncryptor 读取主密钥并构造 AES-256-GCM AEAD。主密钥缺失/长度非法时返回
-// error；调用方（User.New / Manager.NewManager）据此降级：手机号加密列停写，明文
-// phone 列不受影响。
+// error；DB 仍可用于无手机号的读写，但 syncPhoneShadow 会拒绝任何非空手机号写入。
 func newPhoneEncryptor() (*phoneEncryptor, error) {
 	master, err := phoneMasterKey()
 	if err != nil {

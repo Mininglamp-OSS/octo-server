@@ -13,10 +13,7 @@ import (
 )
 
 func TestManagerLoginHasStrictIPRateLimit(t *testing.T) {
-	const (
-		rateLimitTag = "manager_login"
-		clientIP     = "198.51.100.42"
-	)
+	const clientIP = "198.51.100.42"
 
 	cfg := config.New()
 	cfg.Test = true
@@ -24,7 +21,7 @@ func TestManagerLoginHasStrictIPRateLimit(t *testing.T) {
 	route := wkhttp.New()
 	ctx.SetHttpRoute(route)
 
-	rateLimitKey := "ratelimit:strict:" + rateLimitTag + ":" + clientIP
+	rateLimitKey := "ratelimit:strict:" + managerLoginRateLimitTag + ":" + clientIP
 	require.NoError(t, ctx.GetRedisConn().Del(rateLimitKey))
 	t.Cleanup(func() {
 		assert.NoError(t, ctx.GetRedisConn().Del(rateLimitKey))
@@ -43,12 +40,12 @@ func TestManagerLoginHasStrictIPRateLimit(t *testing.T) {
 		return w
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < managerLoginRateLimitBurst; i++ {
 		w := doLogin()
 		require.Equal(t, http.StatusBadRequest, w.Code, "request %d unexpectedly rejected: %s", i+1, w.Body.String())
 	}
 
 	w := doLogin()
 	require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
-	assert.Equal(t, "strict:"+rateLimitTag, w.Header().Get("X-RateLimit-Scope"))
+	assert.Equal(t, "strict:"+managerLoginRateLimitTag, w.Header().Get("X-RateLimit-Scope"))
 }
