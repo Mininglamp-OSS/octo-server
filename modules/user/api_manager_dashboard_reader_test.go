@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -51,48 +49,20 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	return route, ctx, m
 }
 
-type managerTestAccount struct {
-	uid       string
-	username  string
-	name      string
-	shortNo   string
-	password  string
-	role      string
-	status    int
-	robot     int
-	isDestroy int
-}
-
-func insertManagerTestAccount(t *testing.T, ctx *config.Context, account managerTestAccount) {
-	t.Helper()
-	if account.username == "" {
-		account.username = account.uid
-	}
-	if account.name == "" {
-		account.name = account.uid
-	}
-	if account.shortNo == "" {
-		account.shortNo = account.uid
-	}
-	_, err := NewDB(ctx).session.InsertInto("user").Columns(
-		"uid", "username", "name", "short_no", "password", "role", "status", "robot", "is_destroy",
-	).Values(
-		account.uid, account.username, account.name, account.shortNo, account.password,
-		account.role, account.status, account.robot, account.isDestroy,
-	).Exec()
-	require.NoError(t, err)
-}
-
 func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
 	password := "reader-password"
 	hash, err := HashPassword(password)
 	require.NoError(t, err)
-	insertManagerTestAccount(t, ctx, managerTestAccount{
-		uid: "dashboard-reader-login", name: "Dashboard Reader", password: hash,
-		role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(),
-	})
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID:      "dashboard-reader-login",
+		Username: "dashboard-reader-login",
+		Name:     "Dashboard Reader",
+		Password: hash,
+		Role:     appauth.ManagerRoleDashboardReader,
+		Status:   StatusEnable.Int(),
+	}))
 
 	body, err := json.Marshal(map[string]string{
 		"username": "dashboard-reader-login",
@@ -105,130 +75,6 @@ func TestManagerLoginAllowsDashboardReader(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), `"role":"`+appauth.ManagerRoleDashboardReader+`"`)
-}
-
-func TestManagerLoginRejectsUnavailableManagerAccounts(t *testing.T) {
-	route, ctx, _ := newManagerRouteOnly(t)
-
-	const password = "unavailable-manager-password"
-	hash, err := HashPassword(password)
-	require.NoError(t, err)
-	tests := []struct {
-		name      string
-		role      string
-		status    int
-		robot     int
-		isDestroy int
-	}{
-		{name: "disabled reader", role: appauth.ManagerRoleDashboardReader, status: StatusDisable.Int()},
-		{name: "destroying reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), isDestroy: IsDestroyApplying},
-		{name: "destroyed reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), isDestroy: IsDestroyDone},
-		{name: "robot reader", role: appauth.ManagerRoleDashboardReader, status: StatusEnable.Int(), robot: 1},
-		{name: "disabled admin", role: string(wkhttp.Admin), status: StatusDisable.Int()},
-	}
-
-	for i, tt := range tests {
-		username := fmt.Sprintf("unavailable-manager-%d", i)
-		insertManagerTestAccount(t, ctx, managerTestAccount{
-			uid: username, name: tt.name, shortNo: fmt.Sprintf("unavailable-%d", i), password: hash,
-			role: tt.role, status: tt.status, robot: tt.robot, isDestroy: tt.isDestroy,
-		})
-		body, err := json.Marshal(map[string]string{"username": username, "password": password})
-		require.NoError(t, err)
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader(body))
-		route.ServeHTTP(w, req)
-
-		require.Equal(t, http.StatusBadRequest, w.Code, "%s: %s", tt.name, w.Body.String())
-		assert.Contains(t, w.Body.String(), "err.server.user.manager_permission_required")
-	}
-}
-
-func TestLiftBanDisabledManagerRevokesHTTPManagerSessions(t *testing.T) {
-	route, ctx, _ := newManagerRouteOnly(t)
-
-	const callerToken = "disable-manager-session-revoke-caller"
-	cacheCfg := ctx.GetConfig().Cache
-	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
-		"root-uid@root@"+string(wkhttp.SuperAdmin)))
-	tests := []struct {
-		name       string
-		role       string
-		status     int
-		wantRevoke bool
-	}{
-		{name: "dashboard reader", role: appauth.ManagerRoleDashboardReader, status: StatusDisable.Int(), wantRevoke: true},
-		{name: "admin", role: string(wkhttp.Admin), status: StatusDisable.Int(), wantRevoke: true},
-		{name: "super admin", role: string(wkhttp.SuperAdmin), status: StatusDisable.Int(), wantRevoke: true},
-		{name: "normal user", status: StatusDisable.Int()},
-		{name: "enabled admin", role: string(wkhttp.Admin), status: StatusEnable.Int()},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			uid := fmt.Sprintf("disable-manager-session-%d", i)
-			insertManagerTestAccount(t, ctx, managerTestAccount{
-				uid: uid, name: tt.name, shortNo: fmt.Sprintf("disable-manager-%d", i),
-				role: tt.role, status: tt.status,
-			})
-			require.NoError(t, ctx.Cache().Set(RoleCacheKeyPrefix+uid, tt.role))
-			tokens := make(map[config.DeviceFlag]string)
-			for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
-				token := fmt.Sprintf("disable-manager-%d-%d", i, flag.Uint8())
-				uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, uid)
-				require.NoError(t, ctx.Cache().Set(uidTokenKey, token))
-				require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+token,
-					uid+"@target@"+tt.role))
-				tokens[flag] = token
-			}
-
-			w := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPut,
-				fmt.Sprintf("/v1/manager/user/liftban/%s/%d", uid, tt.status), nil)
-			req.Header.Set("token", callerToken)
-			route.ServeHTTP(w, req)
-
-			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-			cachedRole, err := ctx.Cache().Get(RoleCacheKeyPrefix + uid)
-			require.NoError(t, err)
-			if tt.wantRevoke {
-				assert.Empty(t, cachedRole)
-			} else {
-				assert.Equal(t, tt.role, cachedRole)
-			}
-			for flag, token := range tokens {
-				uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, uid)
-				uidToken, err := ctx.Cache().Get(uidTokenKey)
-				require.NoError(t, err)
-				payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + token)
-				require.NoError(t, err)
-				if tt.wantRevoke {
-					assert.Empty(t, uidToken, "device reverse mapping must be revoked for flag %d", flag.Uint8())
-					assert.Empty(t, payload, "token payload must be revoked for flag %d", flag.Uint8())
-				} else {
-					assert.Equal(t, token, uidToken)
-					assert.NotEmpty(t, payload)
-				}
-			}
-		})
-	}
-}
-
-func TestLiftBanPersistsDisabledStatusBeforeRevokingManagerSessions(t *testing.T) {
-	source, err := os.ReadFile("api_manager.go")
-	require.NoError(t, err)
-	bodyStart := strings.Index(string(source), "func (m *Manager) liftBanUser")
-	require.NotEqual(t, -1, bodyStart)
-	bodyEnd := strings.Index(string(source)[bodyStart:], "func (m *Manager) revokeManagerSessionsForDisabledAccount")
-	require.NotEqual(t, -1, bodyEnd)
-	body := string(source)[bodyStart : bodyStart+bodyEnd]
-
-	statusWrite := strings.Index(body, `UpdateUsersWithField("status"`)
-	sessionRevoke := strings.Index(body, "revokeManagerSessionsForDisabledAccount")
-	require.NotEqual(t, -1, statusWrite)
-	require.NotEqual(t, -1, sessionRevoke)
-	require.Less(t, statusWrite, sessionRevoke,
-		"status must become disabled before session revocation closes the concurrent-login window")
 }
 
 func TestDashboardReaderRoleTransition(t *testing.T) {
@@ -334,69 +180,6 @@ func TestManagerDashboardReaderGrantAndRevoke(t *testing.T) {
 	assert.Equal(t, appauth.ManagerRoleDashboardReader, role)
 }
 
-func TestManagerDashboardReaderRoleChangeRevokesExistingSessions(t *testing.T) {
-	route, ctx, _ := newManagerRouteOnly(t)
-
-	const (
-		callerToken = "dashboard-reader-session-revoke-caller"
-		targetUID   = "dashboard-reader-session-revoke-target"
-	)
-	cacheCfg := ctx.GetConfig().Cache
-	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
-		"root-uid@root@"+string(wkhttp.SuperAdmin)))
-	require.NoError(t, NewDB(ctx).Insert(&Model{
-		UID:      targetUID,
-		Username: targetUID,
-		Name:     "Dashboard Reader Session Revoke Target",
-		Role:     string(wkhttp.Admin),
-		Status:   StatusEnable.Int(),
-	}))
-
-	seedTargetSessions := func(stage string) map[config.DeviceFlag]string {
-		t.Helper()
-		tokens := make(map[config.DeviceFlag]string)
-		for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
-			token := fmt.Sprintf("%s-%d", stage, flag.Uint8())
-			uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, targetUID)
-			require.NoError(t, ctx.Cache().Set(uidTokenKey, token))
-			require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+token,
-				targetUID+"@target@"+string(wkhttp.Admin)))
-			tokens[flag] = token
-		}
-		return tokens
-	}
-	assertSessionsRevoked := func(tokens map[config.DeviceFlag]string) {
-		t.Helper()
-		for flag, token := range tokens {
-			uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, targetUID)
-			uidToken, err := ctx.Cache().Get(uidTokenKey)
-			require.NoError(t, err)
-			assert.Empty(t, uidToken, "device reverse mapping must be revoked for flag %d", flag.Uint8())
-			payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + token)
-			require.NoError(t, err)
-			assert.Empty(t, payload, "token payload must be revoked for flag %d", flag.Uint8())
-		}
-	}
-	request := func(method string) *httptest.ResponseRecorder {
-		t.Helper()
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(method, "/v1/manager/user/"+targetUID+"/dashboard-read", nil)
-		req.Header.Set("token", callerToken)
-		route.ServeHTTP(w, req)
-		return w
-	}
-
-	adminSessions := seedTargetSessions("before-grant")
-	granted := request(http.MethodPut)
-	require.Equal(t, http.StatusOK, granted.Code, granted.Body.String())
-	assertSessionsRevoked(adminSessions)
-
-	readerSessions := seedTargetSessions("before-revoke")
-	revoked := request(http.MethodDelete)
-	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
-	assertSessionsRevoked(readerSessions)
-}
-
 func TestDeleteAdminRejectsDashboardReaderWithoutRevokingSessions(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
@@ -438,9 +221,6 @@ func TestDeleteAdminRejectsDashboardReaderWithoutRevokingSessions(t *testing.T) 
 	uidToken, err := ctx.Cache().Get(uidTokenKey)
 	require.NoError(t, err)
 	assert.Equal(t, targetToken, uidToken)
-	deleted, err := newManagerDB(ctx).deleteUserWithUIDAndRole(targetUID, string(wkhttp.Admin))
-	require.NoError(t, err)
-	assert.False(t, deleted, "role-qualified delete must report a zero-row race")
 }
 
 func TestDeleteAdminDeletesAdminAndRevokesSessions(t *testing.T) {
@@ -531,39 +311,6 @@ func TestManagerDashboardReaderListRequiresSuperAdmin(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden")
-}
-
-func TestManagerDashboardReaderNoopRevokePreservesNormalSessions(t *testing.T) {
-	route, ctx, _ := newManagerRouteOnly(t)
-
-	const (
-		callerToken = "dashboard-reader-noop-revoke-caller"
-		targetUID   = "dashboard-reader-noop-revoke-normal"
-		targetToken = "dashboard-reader-noop-revoke-app-token"
-	)
-	cacheCfg := ctx.GetConfig().Cache
-	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerToken,
-		"root-uid@root@"+string(wkhttp.SuperAdmin)))
-	require.NoError(t, NewDB(ctx).Insert(&Model{
-		UID: targetUID, Username: targetUID, Name: "Normal User", ShortNo: "noop-normal", Status: StatusEnable.Int(),
-	}))
-	uidTokenKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, config.APP, targetUID)
-	require.NoError(t, ctx.Cache().Set(uidTokenKey, targetToken))
-	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+targetToken, targetUID+"@normal"))
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete,
-		"/v1/manager/user/"+targetUID+"/dashboard-read", nil)
-	req.Header.Set("token", callerToken)
-	route.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + targetToken)
-	require.NoError(t, err)
-	assert.NotEmpty(t, payload, "revoking an absent role must not log out a normal user")
-	uidToken, err := ctx.Cache().Get(uidTokenKey)
-	require.NoError(t, err)
-	assert.Equal(t, targetToken, uidToken)
 }
 
 func TestManagerDashboardReaderGrantRejectsIneligibleAccounts(t *testing.T) {

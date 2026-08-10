@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
@@ -27,15 +26,15 @@ var tokenHTTPTestDatabases struct {
 
 func TestTokenDeadlineOverHTTP(t *testing.T) {
 	server, ctx := newTokenHTTPTestServer(t)
-	t.Run("manager login reuses a 24-hour token", func(t *testing.T) {
-		testManagerLoginReuses24HourTokenOverHTTP(t, server, ctx)
+	t.Run("manager login issues a finite token", func(t *testing.T) {
+		testManagerLoginIssuesFiniteTokenOverHTTP(t, server, ctx)
 	})
 	t.Run("nickname update preserves the deadline", func(t *testing.T) {
 		testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t, server, ctx)
 	})
 }
 
-func testManagerLoginReuses24HourTokenOverHTTP(t *testing.T, server *libserver.Server, ctx *config.Context) {
+func testManagerLoginIssuesFiniteTokenOverHTTP(t *testing.T, server *libserver.Server, ctx *config.Context) {
 	t.Helper()
 	manager := NewManager(ctx)
 	uid := util.GenerUUID()
@@ -53,42 +52,28 @@ func testManagerLoginReuses24HourTokenOverHTTP(t *testing.T, server *libserver.S
 		Status:   1,
 	}))
 
-	login := func() string {
-		t.Helper()
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-			"username": username,
-			"password": password,
-		}))))
-		request.Header.Set("Content-Type", "application/json")
-		server.GetRoute().ServeHTTP(recorder, request)
-		require.Equal(t, http.StatusOK, recorder.Code, "body=%s", recorder.Body.String())
-		var response struct {
-			Token string `json:"token"`
-		}
-		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
-		require.NotEmpty(t, response.Token)
-		return response.Token
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/manager/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"username": username,
+		"password": password,
+	}))))
+	request.Header.Set("Content-Type", "application/json")
+	server.GetRoute().ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code, "body=%s", recorder.Body.String())
+	var response struct {
+		Token string `json:"token"`
 	}
-
-	firstToken := login()
-	secondToken := login()
-	require.Equal(t, firstToken, secondToken, "repeated manager login must not orphan the prior Web bearer")
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.NotEmpty(t, response.Token)
 
 	_, client := auth.SessionStoreAndClientForContext(ctx)
-	tokenKey := ctx.GetConfig().Cache.TokenCachePrefix + secondToken
+	tokenKey := ctx.GetConfig().Cache.TokenCachePrefix + response.Token
 	uidKey := ctx.GetConfig().Cache.UIDTokenCachePrefix + "1" + uid
-	t.Cleanup(func() {
-		_ = client.Del(
-			ctx.GetConfig().Cache.TokenCachePrefix+firstToken,
-			ctx.GetConfig().Cache.TokenCachePrefix+secondToken,
-			uidKey,
-		).Err()
-	})
+	t.Cleanup(func() { _ = client.Del(tokenKey, uidKey).Err() })
 	ttl, err := client.PTTL(tokenKey).Result()
 	require.NoError(t, err)
 	require.Positive(t, ttl)
-	require.LessOrEqual(t, ttl, 24*time.Hour)
+	require.LessOrEqual(t, ttl, ctx.GetConfig().Cache.TokenExpire)
 }
 
 func testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t *testing.T, server *libserver.Server, ctx *config.Context) {

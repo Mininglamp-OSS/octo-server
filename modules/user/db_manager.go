@@ -154,16 +154,9 @@ func (m *managerDB) queryUsersWithRole(role string) ([]*managerUserModel, error)
 	_, err := m.session.Select("*").From("user").Where("role=?", role).Load(&list)
 	return list, err
 }
-func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) (bool, error) {
-	result, err := m.session.DeleteFrom("user").Where("uid=? and role=?", uid, role).Exec()
-	if err != nil {
-		return false, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return rows == 1, nil
+func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
+	_, err := m.session.DeleteFrom("user").Where("uid=? and role=?", uid, role).Exec()
+	return err
 }
 
 // updateUserRole changes role only if it still equals expectedRole. The
@@ -183,15 +176,12 @@ func (m *managerDB) updateUserRole(uid, expectedRole, nextRole string) (bool, er
 }
 
 type managerLoginModel struct {
-	Username  string
-	UID       string
-	Name      string
-	Password  string
-	Role      string
-	Status    int
-	Robot     int
-	IsDestroy int
-	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
+	Username string
+	UID      string
+	Name     string
+	Password string
+	Role     string
+	Language string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
 }
 
 type managerUserModel struct {

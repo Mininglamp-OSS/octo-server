@@ -41,34 +41,24 @@ source: self
 5. 授权只接受启用中、未注销的真人账号；撤销保持宽松，保证异常账号仍可回收权限。
 6. `GET /v1/manager/user/dashboard-read` 提供 SuperAdmin-only 的授权清单，支持过渡期
    盘点和最终下线，不扩展成通用角色管理。
-7. 实际角色变化及幂等授权会撤销目标账号 APP/Web/PC 现有会话，避免 RoleResolver
-   故障回退到旧 token 角色；对从未持有该角色的普通账号撤销是无副作用 no-op。
-8. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
-9. 这是账号级授权，不是独立管理台 session：RoleResolver 会把当前角色注入该账号后续
+7. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
+8. 这是账号级授权，不是独立管理台 session：RoleResolver 会把当前角色注入该账号后续
    建立的有效 IM 会话，这些 bearer 也能调用 Dashboard 读接口；该取舍在临时方案中明确接受。
-10. 管理台账密登录每次复核账号必须处于启用、未注销且非机器人状态；重复登录复用同一个
-    Web bearer 且剩余 TTL 最长 24 小时。该上限只约束 `/v1/manager/login` 触达的 Web
-    bearer，不改变该账号从其他登录入口获得的 APP/PC 会话期限。
-11. 封禁任一管理台角色时先持久化禁用状态，再失效角色缓存并尽力撤销 APP/Web/PC 设备
-    反向索引当前可达的 HTTP 会话；重复封禁也会重试撤销以修复部分失败。
+9. 本任务不修改 token 签发、TTL、撤销、账号封禁或注销链路；会话生命周期由独立的
+   token 安全改造负责，避免临时角色方案再实现一套并行机制。
 
 ## Out of scope
 
 - 通用 RBAC、角色/权限组合、角色管理 UI
 - capability 数据表或任意 capability 的 CRUD
 - 改造已有 admin/superAdmin 管理接口的角色判断
+- token 生命周期、manager session TTL、账号封禁后的 bearer 失效机制
 - 前端授权管理页面
 - 将 Dashboard 数据收窄到单个 Space；该看板仍是全局运营读面
-- 注销申请/完成等其他账号生命周期入口的集中 HTTP bearer 撤销；本任务禁止这类账号重新
-  登录管理台，但已签发 bearer 的统一吊销留给账号生命周期加固后续处理
-- 历史 v1/v2 orphan bearer 的完整枚举与撤销；现有 `UIDToken` 每类设备只有一个反向索引，
-  完整的 generation、legacy deny marker 和 per-UID 会话索引由 PR #725 跟进
 
 ## Acceptance
 
-- [x] 启用、未注销且非机器人的 `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
-- [x] 禁用、注销中、已注销或机器人管理角色账号不能通过 `/v1/manager/login`
-- [x] `/v1/manager/login` 重复登录复用现有 Web bearer，且该 bearer 剩余 TTL 不超过 24 小时
+- [x] `dashboardReader` 可通过 `/v1/manager/login` 与 `/v1/manager/me`
 - [x] `/me` 仅返回 `dashboard.read=true`，`dashboard.trigger` 和其他能力均为 false
 - [x] 六个 `/v1/manager/dashboard` GET 接口允许 `dashboardReader`
 - [x] `POST /v1/manager/dashboard/etl/run` 拒绝 `dashboardReader`
@@ -77,9 +67,6 @@ source: self
 - [x] 可列出全部 `dashboardReader`，用于权限盘点和过渡方案下线
 - [x] 机器人、禁用账号和注销中/已注销账号不能被授予；撤销不受账号状态阻断
 - [x] 授予/撤销（含幂等重试）后清理目标账号角色缓存
-- [x] 实际角色变化及幂等授权后撤销目标账号 APP/Web/PC 现有会话；空撤销不踢用户
-- [x] 封禁 admin/superAdmin/dashboardReader 时先落禁用状态，再撤销 APP/Web/PC 当前索引
-      可达的 HTTP 会话；幂等封禁仍会重试
 - [x] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
 - [x] 聚焦 Go 测试、`go build ./...`、相关包 `go vet` / `golangci-lint`、i18n
       extract/check/lint、错误响应源码守卫与 `git diff --check` 通过

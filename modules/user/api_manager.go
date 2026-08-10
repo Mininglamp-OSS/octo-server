@@ -1,7 +1,6 @@
 package user
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -43,8 +42,6 @@ type Manager struct {
 	sessionStore  userSessionStore
 }
 
-const managerSessionMaxTTL = 24 * time.Hour
-
 // NewManager NewManager
 func NewManager(ctx *config.Context) *Manager {
 	m := &Manager{
@@ -58,7 +55,7 @@ func NewManager(ctx *config.Context) *Manager {
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
-		sessionStore:  auth.SessionStoreForContext(ctx).WithMaxTTL(managerSessionMaxTTL),
+		sessionStore:  auth.SessionStoreForContext(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -297,8 +294,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
-	if !auth.IsManagerConsoleRole(userInfo.Role) || userInfo.Status != StatusEnable.Int() ||
-		userInfo.Robot != 0 || userInfo.IsDestroy != IsDestroyNo {
+	if !auth.IsManagerConsoleRole(userInfo.Role) {
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
@@ -315,7 +311,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	token, err = m.issueOrReuseLoginToken(c.Request.Context(), token, tokenPayload, userInfo.UID)
+	err = m.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userInfo.UID, int(config.Web))
 	if err != nil {
 		m.Error("设置管理端token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
@@ -328,29 +324,6 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
-}
-
-// issueOrReuseLoginToken keeps one manager-console Web bearer per account.
-// ReuseExisting preserves the remaining deadline and the Manager-scoped store
-// caps both reused and newly issued credentials at managerSessionMaxTTL.
-func (m *Manager) issueOrReuseLoginToken(ctx context.Context, newToken, payload, uid string) (string, error) {
-	existing, err := m.sessionStore.DeviceToken(ctx, uid, int(config.Web))
-	if err != nil {
-		return "", fmt.Errorf("load existing manager token: %w", err)
-	}
-	if existing != "" {
-		reused, err := m.sessionStore.ReuseExisting(ctx, existing, payload, uid, int(config.Web))
-		if err != nil {
-			return "", fmt.Errorf("reuse existing manager token: %w", err)
-		}
-		if reused {
-			return existing, nil
-		}
-	}
-	if err := m.sessionStore.IssueNew(ctx, newToken, payload, uid, int(config.Web)); err != nil {
-		return "", fmt.Errorf("issue manager token: %w", err)
-	}
-	return newToken, nil
 }
 
 // 重置用户密码
@@ -496,12 +469,6 @@ func dashboardReaderGrantEligible(target *Model) bool {
 
 func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
 	m.roleService.Invalidate(targetUID)
-	// A real role transition and an idempotent grant both need old role-bearing
-	// sessions removed. An idempotent revoke of a plain user is a true no-op and
-	// must not become an undocumented force-logout primitive.
-	if (changed || grant) && !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
-		return
-	}
 	message := "dashboard reader role already in requested state"
 	if changed {
 		message = "dashboard reader role changed"
@@ -511,24 +478,6 @@ func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID 
 		zap.String("target_uid", targetUID),
 		zap.Bool("granted", grant))
 	c.ResponseOK()
-}
-
-// revokeDashboardReaderTargetSessions removes every known APP/Web/PC bearer.
-// RoleResolver normally replaces the role embedded in a bearer, but it falls
-// back to that snapshot when Redis/DB role lookup fails. Keeping a token minted
-// under the previous role would therefore reopen the old privilege during an
-// outage.
-func (m *Manager) revokeDashboardReaderTargetSessions(c *wkhttp.Context, targetUID string, grant bool) bool {
-	if err := m.revokeAllDeviceTokens(targetUID); err != nil {
-		m.Error("revoke dashboard reader target sessions failed",
-			zap.Error(err),
-			zap.String("actor_uid", c.GetLoginUID()),
-			zap.String("target_uid", targetUID),
-			zap.Bool("grant", grant))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return false
-	}
-	return true
 }
 
 func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
@@ -600,22 +549,18 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	if user.Role != string(wkhttp.Admin) && user.Role != string(wkhttp.SuperAdmin) {
+		respondUserError(c, errcode.ErrUserNotAdminAccount)
+		return
+	}
 	if user.Role == string(wkhttp.SuperAdmin) {
 		respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin)
 		return
 	}
-	if user.Role != string(wkhttp.Admin) {
-		respondUserError(c, errcode.ErrUserNotAdminAccount)
-		return
-	}
-	deleted, err := m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
+	err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("删除管理员错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
-	}
-	if !deleted {
-		respondUserError(c, errcode.ErrUserManagerRoleChanged)
 		return
 	}
 	// 先失效角色热缓存，再撤销 token。DB 里该 uid 已删（权威源 role 已为空），所以
@@ -1278,22 +1223,14 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
-	statusChanged := userInfo.Status != userStatus
-	if statusChanged {
-		err = m.userDB.UpdateUsersWithField("status", status, uid)
-		if err != nil {
-			m.Error("修改用户状态错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserStoreFailed)
-			return
-		}
-	}
-	if err := m.revokeManagerSessionsForDisabledAccount(userInfo.UID, userInfo.Role, userStatus); err != nil {
-		m.Error("清除已封禁管理账号token数据错误", zap.Error(err), zap.String("uid", uid))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+	if userInfo.Status == userStatus {
+		c.ResponseOK()
 		return
 	}
-	if !statusChanged {
-		c.ResponseOK()
+	err = m.userDB.UpdateUsersWithField("status", status, uid)
+	if err != nil {
+		m.Error("修改用户状态错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
@@ -1319,18 +1256,6 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		return
 	}
 	c.ResponseOK()
-}
-
-// revokeManagerSessionsForDisabledAccount closes the HTTP-session gap left by
-// the IM-only QuitUserDevice path. It runs after the disabled status is durable,
-// and before the idempotent return so a retry repairs partial revocation without
-// reopening a concurrent manager-login window.
-func (m *Manager) revokeManagerSessionsForDisabledAccount(uid, role string, status int) error {
-	if status != int(common.UserDisable) || !auth.IsManagerConsoleRole(role) {
-		return nil
-	}
-	m.roleService.Invalidate(uid)
-	return m.revokeAllDeviceTokens(uid)
 }
 
 // 修改登录密码
