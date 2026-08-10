@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-redis/redis"
@@ -84,6 +85,13 @@ func setAdminToken(t *testing.T, ctx *config.Context) {
 	require.NoError(t, ctx.Cache().Set(
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.Admin)))
+}
+
+func setDashboardReaderToken(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+appauth.ManagerRoleDashboardReader))
 }
 
 func shardTables(ctx *config.Context) []string {
@@ -1106,6 +1114,32 @@ func TestOpanalyticsDashboardReadAdminTriggerSuperAdmin(t *testing.T) {
 	rec = opaPost(t, route, "/v1/manager/dashboard/etl/run")
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
 		"manual ETL trigger must stay superAdmin-only")
+}
+
+func TestOpanalyticsDashboardReaderCanOnlyRead(t *testing.T) {
+	ctx, route := opaRouteOnlySetup(t)
+	rng := "?start_date=2026-06-01&end_date=2026-06-02"
+
+	setDashboardReaderToken(t, ctx)
+	readPaths := []string{
+		"/v1/manager/dashboard/overview" + rng,
+		"/v1/manager/dashboard/trend" + rng,
+		"/v1/manager/dashboard/spaces" + rng,
+		"/v1/manager/dashboard/spaces/missing/channels" + rng,
+		"/v1/manager/dashboard/channels/missing/members" + rng,
+		"/v1/manager/dashboard/global/direct-chats" + rng,
+	}
+	for _, path := range readPaths {
+		t.Run(path, func(t *testing.T) {
+			rec := opaGet(t, route, path)
+			assert.NotEqual(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
+				"dashboardReader must pass every dashboard read gate")
+		})
+	}
+
+	rec := opaPost(t, route, "/v1/manager/dashboard/etl/run")
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
+		"dashboardReader must not trigger ETL")
 }
 
 func TestETLLockRenewRequiresMatchingToken(t *testing.T) {
