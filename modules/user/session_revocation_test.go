@@ -1,6 +1,7 @@
 package user
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"go/ast"
@@ -443,6 +444,73 @@ func TestPasswordMutationRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
 		indexed, err := userAPI.sessionStore.DeviceToken(context.Background(), uid, int(flag))
 		require.NoError(t, err)
 		require.Empty(t, indexed)
+		record, err := auth.SessionStoreForContext(ctx).ReadToken(context.Background(), ctx.GetConfig().Cache.TokenCachePrefix+token)
+		require.NoError(t, err)
+		require.Equal(t, time.Duration(-2), record.TTL)
+	}
+	quitFlagsMu.Lock()
+	require.Equal(t, []int{-1}, quitFlags)
+	quitFlagsMu.Unlock()
+}
+
+func TestWeb3PasswordResetRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
+	server, ctx, userAPI, _ := newTokenHTTPTestServer(t)
+	uid := "w3-" + util.GenerUUID()
+	username := "web3_" + uid[len(uid)-12:]
+	const (
+		verifyText = "hello123"
+		publicKey  = "03af80b90d25145da28c583359beb47b21796b2fe1a23c1511e443e7a64dfdb27d"
+		signature  = "44459fd9146290dcd913350bae6fe79fd48050d39b3c1c315e8f032af3b555d41af6f2c07d4d0f1d8d5dd041af8175e657ae981cf47e58aa5547ab08fc7066e401"
+	)
+	require.NoError(t, userAPI.db.Insert(&Model{
+		UID: uid, Username: username, Name: "web3 user", ShortNo: username,
+		Password: "before", Status: int(libcommon.UserAvailable), Web3PublicKey: publicKey,
+	}))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire("web3_verify:"+uid+"_"+Web3VerifyPassword, verifyText, time.Minute))
+
+	tokens := map[config.DeviceFlag]string{
+		config.APP: "web3-app-" + util.GenerUUID(),
+		config.Web: "web3-web-" + util.GenerUUID(),
+		config.PC:  "web3-pc-" + util.GenerUUID(),
+	}
+	for flag, token := range tokens {
+		payload, err := auth.Encode(auth.TokenInfo{UID: uid, DeviceFlag: int(flag)})
+		require.NoError(t, err)
+		require.NoError(t, userAPI.sessionStore.IssueNew(context.Background(), token, payload, uid, int(flag)))
+	}
+
+	var quitFlagsMu sync.Mutex
+	var quitFlags []int
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/user/device_quit", r.URL.Path)
+		var request struct {
+			DeviceFlag int `json:"device_flag"`
+		}
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, util.ReadJsonByByte(body, &request))
+		quitFlagsMu.Lock()
+		quitFlags = append(quitFlags, request.DeviceFlag)
+		quitFlagsMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(im.Close)
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+	server.GetRoute().POST("/v1/user/pwdforget_web3", userAPI.resetPwdWithWeb3PublicKey)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/user/pwdforget_web3", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"username": username, "password": "after", "verify_text": verifyText, "sign_text": signature,
+	}))))
+	request.Header.Set("Content-Type", "application/json")
+	server.GetRoute().ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+
+	updated, err := userAPI.db.QueryByUID(uid)
+	require.NoError(t, err)
+	matched, _ := CheckPassword("after", updated.Password)
+	require.True(t, matched)
+	for _, token := range tokens {
 		record, err := auth.SessionStoreForContext(ctx).ReadToken(context.Background(), ctx.GetConfig().Cache.TokenCachePrefix+token)
 		require.NoError(t, err)
 		require.Equal(t, time.Duration(-2), record.TTL)
