@@ -621,6 +621,81 @@ func TestDisableUserStillAppliesIMSideEffectsAfterCommittedRevocationFailure(t *
 	imMu.Unlock()
 }
 
+func TestEnableUserRetryConvergesIMSideEffectsAfterCommittedStatusChange(t *testing.T) {
+	tests := []struct {
+		name         string
+		failEndpoint string
+	}{
+		{name: "channel unban fails", failEndpoint: "/channel/info"},
+		{name: "device quit fails", failEndpoint: "/user/device_quit"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, ctx, _, managerAPI := newTokenHTTPTestServer(t)
+			wireI18nRendererForUserTest(server)
+			uid := "enable-" + util.GenerUUID()
+			require.NoError(t, managerAPI.userDB.Insert(&Model{
+				UID: uid, Name: "enable user", ShortNo: uid, Status: int(libcommon.UserDisable),
+			}))
+
+			var imMu sync.Mutex
+			calls := map[string]int{
+				"/channel/info":     0,
+				"/user/device_quit": 0,
+			}
+			var sideEffectOrder []string
+			im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				imMu.Lock()
+				calls[r.URL.Path]++
+				call := calls[r.URL.Path]
+				sideEffectOrder = append(sideEffectOrder, r.URL.Path)
+				imMu.Unlock()
+				if r.URL.Path == tt.failEndpoint && call == 1 {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(im.Close)
+			ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+			server.GetRoute().Any("/test/manager/liftban/:uid/:status", func(c *wkhttp.Context) {
+				c.Set("uid", "root")
+				c.Set("role", string(wkhttp.SuperAdmin))
+				managerAPI.liftBanUser(c)
+			})
+			requestEnable := func() *httptest.ResponseRecorder {
+				t.Helper()
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPut, "/test/manager/liftban/"+uid+"/1", nil)
+				server.GetRoute().ServeHTTP(recorder, request)
+				return recorder
+			}
+
+			first := requestEnable()
+			require.Equal(t, http.StatusBadRequest, first.Code, first.Body.String())
+			updated, err := managerAPI.userDB.QueryByUID(uid)
+			require.NoError(t, err)
+			require.Equal(t, int(libcommon.UserAvailable), updated.Status,
+				"the account enable status change must remain committed")
+
+			second := requestEnable()
+			require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+			imMu.Lock()
+			require.Equal(t, map[string]int{
+				"/channel/info":     2,
+				"/user/device_quit": 2,
+			}, calls, "an already-enabled retry must replay both idempotent IM side effects")
+			require.Equal(t, []string{
+				"/channel/info", "/user/device_quit",
+				"/channel/info", "/user/device_quit",
+			}, sideEffectOrder)
+			imMu.Unlock()
+		})
+	}
+}
+
 func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {
 	return s.err
 }
