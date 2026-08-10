@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -42,6 +43,8 @@ type Manager struct {
 	sessionStore  userSessionStore
 }
 
+const managerSessionMaxTTL = 24 * time.Hour
+
 // NewManager NewManager
 func NewManager(ctx *config.Context) *Manager {
 	m := &Manager{
@@ -55,7 +58,7 @@ func NewManager(ctx *config.Context) *Manager {
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
-		sessionStore:  auth.SessionStoreForContext(ctx),
+		sessionStore:  auth.SessionStoreForContext(ctx).WithMaxTTL(managerSessionMaxTTL),
 	}
 	m.createManagerAccount()
 	return m
@@ -312,7 +315,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	err = m.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userInfo.UID, int(config.Web))
+	token, err = m.issueOrReuseLoginToken(c.Request.Context(), token, tokenPayload, userInfo.UID)
 	if err != nil {
 		m.Error("设置管理端token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
@@ -325,6 +328,29 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
+}
+
+// issueOrReuseLoginToken keeps one manager-console Web bearer per account.
+// ReuseExisting preserves the remaining deadline and the Manager-scoped store
+// caps both reused and newly issued credentials at managerSessionMaxTTL.
+func (m *Manager) issueOrReuseLoginToken(ctx context.Context, newToken, payload, uid string) (string, error) {
+	existing, err := m.sessionStore.DeviceToken(ctx, uid, int(config.Web))
+	if err != nil {
+		return "", fmt.Errorf("load existing manager token: %w", err)
+	}
+	if existing != "" {
+		reused, err := m.sessionStore.ReuseExisting(ctx, existing, payload, uid, int(config.Web))
+		if err != nil {
+			return "", fmt.Errorf("reuse existing manager token: %w", err)
+		}
+		if reused {
+			return existing, nil
+		}
+	}
+	if err := m.sessionStore.IssueNew(ctx, newToken, payload, uid, int(config.Web)); err != nil {
+		return "", fmt.Errorf("issue manager token: %w", err)
+	}
+	return newToken, nil
 }
 
 // 重置用户密码
@@ -1252,19 +1278,22 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	statusChanged := userInfo.Status != userStatus
+	if statusChanged {
+		err = m.userDB.UpdateUsersWithField("status", status, uid)
+		if err != nil {
+			m.Error("修改用户状态错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+	}
 	if err := m.revokeManagerSessionsForDisabledAccount(userInfo.UID, userInfo.Role, userStatus); err != nil {
 		m.Error("清除已封禁管理账号token数据错误", zap.Error(err), zap.String("uid", uid))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	if userInfo.Status == userStatus {
+	if !statusChanged {
 		c.ResponseOK()
-		return
-	}
-	err = m.userDB.UpdateUsersWithField("status", status, uid)
-	if err != nil {
-		m.Error("修改用户状态错误", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
@@ -1293,8 +1322,9 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 }
 
 // revokeManagerSessionsForDisabledAccount closes the HTTP-session gap left by
-// the IM-only QuitUserDevice path. It runs before the idempotent status return
-// so an operator can retry after a partial token-revocation failure.
+// the IM-only QuitUserDevice path. It runs after the disabled status is durable,
+// and before the idempotent return so a retry repairs partial revocation without
+// reopening a concurrent manager-login window.
 func (m *Manager) revokeManagerSessionsForDisabledAccount(uid, role string, status int) error {
 	if status != int(common.UserDisable) || !auth.IsManagerConsoleRole(role) {
 		return nil

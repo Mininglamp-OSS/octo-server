@@ -101,6 +101,24 @@ func NewRedisSessionStore(client *rd.Client, tokenPrefix, uidTokenPrefix string,
 	}
 }
 
+// WithMaxTTL returns a scoped view that shares the same Redis client and key
+// namespace while imposing a shorter maximum credential lifetime. It can only
+// narrow the parent policy; callers cannot use it to extend an existing limit.
+func (s *RedisSessionStore) WithMaxTTL(maxTTL time.Duration) *RedisSessionStore {
+	if s == nil {
+		panic("auth: scope session store requires non-nil store")
+	}
+	if maxTTL <= 0 {
+		panic("auth: scope session store requires positive max TTL")
+	}
+	if maxTTL >= s.maxTTL {
+		return s
+	}
+	limited := *s
+	limited.maxTTL = maxTTL
+	return &limited
+}
+
 func (s *RedisSessionStore) tokenKey(token string) string {
 	return s.tokenPrefix + token
 }
