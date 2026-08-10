@@ -321,6 +321,54 @@ func TestPasswordMutationRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) {
 	quitFlagsMu.Unlock()
 }
 
+func TestDisableUserStillAppliesIMSideEffectsAfterCommittedRevocationFailure(t *testing.T) {
+	server, ctx, _, managerAPI := newTokenHTTPTestServer(t)
+	wireI18nRendererForUserTest(server)
+	uid := "disable-" + util.GenerUUID()
+	require.NoError(t, managerAPI.userDB.Insert(&Model{
+		UID: uid, Name: "disable user", ShortNo: uid, Status: int(libcommon.UserAvailable),
+	}))
+
+	var imMu sync.Mutex
+	deviceQuitCalls := 0
+	channelCalls := 0
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		imMu.Lock()
+		switch r.URL.Path {
+		case "/user/device_quit":
+			deviceQuitCalls++
+		default:
+			channelCalls++
+		}
+		imMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":0}`))
+	}))
+	t.Cleanup(im.Close)
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+	store := &flakyRevokeAllSessionStore{}
+	managerAPI.sessionStore = store
+	server.GetRoute().Any("/test/manager/liftban/:uid/:status", func(c *wkhttp.Context) {
+		c.Set("uid", "root")
+		c.Set("role", string(wkhttp.SuperAdmin))
+		managerAPI.liftBanUser(c)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/test/manager/liftban/"+uid+"/0", nil)
+	server.GetRoute().ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	updated, err := managerAPI.userDB.QueryByUID(uid)
+	require.NoError(t, err)
+	require.Zero(t, updated.Status, "the account disable transaction must remain committed")
+	require.Equal(t, 1, store.callCount())
+	imMu.Lock()
+	require.Equal(t, 1, deviceQuitCalls, "post-commit Redis failure must not skip independent IM logout")
+	require.Equal(t, 1, channelCalls, "post-commit Redis failure must not skip the IM channel ban")
+	imMu.Unlock()
+}
+
 func (s *logoutFailingSessionStore) InvalidateCurrentToken(context.Context, string, string) error {
 	return s.err
 }
