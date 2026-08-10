@@ -19,5 +19,7 @@ func IsManagerConsoleRole(role string) bool {
 // operations dashboard read surface. Mutating operations keep their narrower
 // SuperAdmin checks at the handler.
 func CanReadManagerDashboard(role string) bool {
-	return IsManagerConsoleRole(role)
+	return role == string(wkhttp.Admin) ||
+		role == string(wkhttp.SuperAdmin) ||
+		role == ManagerRoleDashboardReader
 }

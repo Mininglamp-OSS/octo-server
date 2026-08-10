@@ -154,9 +154,16 @@ func (m *managerDB) queryUsersWithRole(role string) ([]*managerUserModel, error)
 	_, err := m.session.Select("*").From("user").Where("role=?", role).Load(&list)
 	return list, err
 }
-func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
-	_, err := m.session.DeleteFrom("user").Where("uid=? and role=?", uid, role).Exec()
-	return err
+func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) (bool, error) {
+	result, err := m.session.DeleteFrom("user").Where("uid=? and role=?", uid, role).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
 }
 
 // updateUserRole changes role only if it still equals expectedRole. The

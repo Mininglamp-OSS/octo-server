@@ -38,9 +38,12 @@ source: self
 4. 新增 SuperAdmin-only、幂等的 `PUT` / `DELETE`
    `/v1/manager/user/:uid/dashboard-read`：授予时把非 SuperAdmin 账号 role 设为
    `dashboardReader`，撤销时只清除该固定角色；两者都失效 `user_role:{uid}` 热缓存。
-5. 授权/撤销同时撤销目标账号 APP/Web/PC 现有会话，避免 RoleResolver 故障回退到旧
-   token 角色；幂等重试也重做缓存清理和会话撤销，以修复上次可能的部分失败。
-6. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
+5. 授权只接受启用中、未注销的真人账号；撤销保持宽松，保证异常账号仍可回收权限。
+6. `GET /v1/manager/user/dashboard-read` 提供 SuperAdmin-only 的授权清单，支持过渡期
+   盘点和最终下线，不扩展成通用角色管理。
+7. 实际角色变化及幂等授权会撤销目标账号 APP/Web/PC 现有会话，避免 RoleResolver
+   故障回退到旧 token 角色；对从未持有该角色的普通账号撤销是无副作用 no-op。
+8. 授权/撤销写审计日志，包含 actor UID 与 target UID；权限查询失败不得放行。
 
 ## Out of scope
 
@@ -58,8 +61,10 @@ source: self
 - [x] `POST /v1/manager/dashboard/etl/run` 拒绝 `dashboardReader`
 - [x] 代表性的其他 manager 接口拒绝 `dashboardReader`
 - [x] 只有 SuperAdmin 能授予/撤销；不能修改 SuperAdmin；撤销为幂等操作
+- [x] 可列出全部 `dashboardReader`，用于权限盘点和过渡方案下线
+- [x] 机器人、禁用账号和注销中/已注销账号不能被授予；撤销不受账号状态阻断
 - [x] 授予/撤销（含幂等重试）后清理目标账号角色缓存
-- [x] 授予/撤销（含幂等重试）后撤销目标账号 APP/Web/PC 现有会话
+- [x] 实际角色变化及幂等授权后撤销目标账号 APP/Web/PC 现有会话；空撤销不踢用户
 - [x] 新授权接口挂 `AuthMiddleware` + `SharedUIDRateLimiter`
 - [x] 聚焦 Go 测试、`go build ./...`、相关包 `go vet` / `golangci-lint`、i18n
       extract/check/lint、错误响应源码守卫与 `git diff --check` 通过

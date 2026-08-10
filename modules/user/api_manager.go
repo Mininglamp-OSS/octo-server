@@ -90,6 +90,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		appwkhttp.SharedUIDRateLimiter(r, m.ctx),
 	)
 	{
+		dashboardReader.GET("/dashboard-read", m.listDashboardReaders)
 		dashboardReader.PUT("/:uid/dashboard-read", m.grantDashboardRead)
 		dashboardReader.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
 	}
@@ -400,46 +401,30 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 		return
 	}
 
-	targetUID := strings.TrimSpace(c.Param("uid"))
-	if targetUID == "" {
-		respondUserRequestInvalid(c, "uid")
+	target, ok := m.dashboardReaderTarget(c)
+	if !ok {
 		return
 	}
-	target, err := m.userDB.QueryByUID(targetUID)
-	if err != nil {
-		m.Error("query dashboard reader target failed", zap.Error(err), zap.String("target_uid", targetUID))
-		respondUserError(c, errcode.ErrUserQueryFailed)
-		return
-	}
-	if target == nil || target.UID == "" {
-		respondUserError(c, errcode.ErrUserNotFound)
-		return
-	}
-
 	nextRole, changed, allowed := dashboardReaderRoleTransition(target.Role, grant)
 	if !allowed {
 		respondManagerForbidden(c)
 		return
 	}
+	if grant && !dashboardReaderGrantEligible(target) {
+		respondUserError(c, errcode.ErrUserDashboardReaderTargetIneligible)
+		return
+	}
 	if !changed {
-		m.roleService.Invalidate(targetUID)
-		if !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
-			return
-		}
-		m.Info("dashboard reader role already in requested state",
-			zap.String("actor_uid", c.GetLoginUID()),
-			zap.String("target_uid", targetUID),
-			zap.Bool("granted", grant))
-		c.ResponseOK()
+		m.finishDashboardReaderRoleRequest(c, target.UID, grant, false)
 		return
 	}
 
-	updated, err := m.db.updateUserRole(targetUID, target.Role, nextRole)
+	updated, err := m.db.updateUserRole(target.UID, target.Role, nextRole)
 	if err != nil {
 		m.Error("update dashboard reader role failed",
 			zap.Error(err),
 			zap.String("actor_uid", c.GetLoginUID()),
-			zap.String("target_uid", targetUID),
+			zap.String("target_uid", target.UID),
 			zap.Bool("grant", grant))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
@@ -449,30 +434,63 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 		// concurrent promotion (especially to SuperAdmin).
 		m.Info("dashboard reader role update lost compare-and-set",
 			zap.String("actor_uid", c.GetLoginUID()),
-			zap.String("target_uid", targetUID),
+			zap.String("target_uid", target.UID),
 			zap.String("expected_role", target.Role),
 			zap.Bool("grant", grant))
-		respondManagerForbidden(c)
+		respondUserError(c, errcode.ErrUserManagerRoleChanged)
 		return
 	}
+	m.finishDashboardReaderRoleRequest(c, target.UID, grant, true)
+}
 
+func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
+	targetUID := strings.TrimSpace(c.Param("uid"))
+	if targetUID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return nil, false
+	}
+	target, err := m.userDB.QueryByUID(targetUID)
+	if err != nil {
+		m.Error("query dashboard reader target failed", zap.Error(err), zap.String("target_uid", targetUID))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return nil, false
+	}
+	if target == nil || target.UID == "" {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return nil, false
+	}
+	return target, true
+}
+
+func dashboardReaderGrantEligible(target *Model) bool {
+	return target != nil && target.Robot == 0 &&
+		target.Status == StatusEnable.Int() && target.IsDestroy == IsDestroyNo
+}
+
+func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
 	m.roleService.Invalidate(targetUID)
-	if !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
+	// A real role transition and an idempotent grant both need old role-bearing
+	// sessions removed. An idempotent revoke of a plain user is a true no-op and
+	// must not become an undocumented force-logout primitive.
+	if (changed || grant) && !m.revokeDashboardReaderTargetSessions(c, targetUID, grant) {
 		return
 	}
-	m.Info("dashboard reader role changed",
+	message := "dashboard reader role already in requested state"
+	if changed {
+		message = "dashboard reader role changed"
+	}
+	m.Info(message,
 		zap.String("actor_uid", c.GetLoginUID()),
 		zap.String("target_uid", targetUID),
 		zap.Bool("granted", grant))
 	c.ResponseOK()
 }
 
-// revokeDashboardReaderTargetSessions removes every known APP/Web/PC bearer
-// after an accepted role request, including idempotent retries. RoleResolver
-// normally replaces the role embedded in a bearer, but it intentionally falls
+// revokeDashboardReaderTargetSessions removes every known APP/Web/PC bearer.
+// RoleResolver normally replaces the role embedded in a bearer, but it falls
 // back to that snapshot when Redis/DB role lookup fails. Keeping a token minted
 // under the previous role would therefore reopen the old privilege during an
-// outage. Retrying is safe and repairs a previous partial cache failure.
+// outage.
 func (m *Manager) revokeDashboardReaderTargetSessions(c *wkhttp.Context, targetUID string, grant bool) bool {
 	if err := m.revokeAllDeviceTokens(targetUID); err != nil {
 		m.Error("revoke dashboard reader target sessions failed",
@@ -484,6 +502,27 @@ func (m *Manager) revokeDashboardReaderTargetSessions(c *wkhttp.Context, targetU
 		return false
 	}
 	return true
+}
+
+func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	users, err := m.db.queryUsersWithRole(auth.ManagerRoleDashboardReader)
+	if err != nil {
+		m.Error("query dashboard reader list failed", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	list := make([]*dashboardReaderResp, 0, len(users))
+	for _, user := range users {
+		list = append(list, &dashboardReaderResp{
+			UID: user.UID, Name: user.Name, Username: user.Username,
+			RegisterTime: user.CreatedAt.String(),
+		})
+	}
+	c.Response(list)
 }
 
 // dashboardReaderRoleTransition is the complete temporary-role policy. The
@@ -534,18 +573,22 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
-	if user.Role == "" {
-		respondUserError(c, errcode.ErrUserNotAdminAccount)
-		return
-	}
 	if user.Role == string(wkhttp.SuperAdmin) {
 		respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin)
 		return
 	}
-	err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
+	if user.Role != string(wkhttp.Admin) {
+		respondUserError(c, errcode.ErrUserNotAdminAccount)
+		return
+	}
+	deleted, err := m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("删除管理员错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !deleted {
+		respondUserError(c, errcode.ErrUserManagerRoleChanged)
 		return
 	}
 	// 先失效角色热缓存，再撤销 token。DB 里该 uid 已删（权威源 role 已为空），所以
@@ -1519,6 +1562,12 @@ type managerBlackUserResp struct {
 	CreateAt string `json:"create_at"`
 }
 type adminUserResp struct {
+	Name         string `json:"name"`
+	UID          string `json:"uid"`
+	Username     string `json:"username"`
+	RegisterTime string `json:"register_time"`
+}
+type dashboardReaderResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`
