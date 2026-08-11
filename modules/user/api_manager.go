@@ -334,6 +334,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 	}
 	if userInfo == nil || userInfo.UID != fencedUID ||
 		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}

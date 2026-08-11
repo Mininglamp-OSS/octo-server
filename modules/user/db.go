@@ -352,21 +352,8 @@ func (d *DB) updatePassword(password string, uid string) error {
 //
 // 守卫的核心目的：避免「finalize 选中过期记录 → 用户在窗口内 cancel → finalize 仍把 is_destroy 覆写为 2」吞掉撤销。
 func (d *DB) destroyAccountFromState(uid, username, phone string, expectedState int) error {
-	res, err := d.session.Update("user").SetMap(map[string]interface{}{
-		"phone":    phone,
-		"username": username,
-		// 三个手机号影子列必须与 phone 一起清空。phone 在这里被匿名化成
-		// `<原号>@<stamp>@delete` 以释放手机号，若 phone_hash 仍留着原号的盲索引，
-		// QueryByPhone 的盲索引优先路径会把已注销账号当成"该手机号已注册"命中：
-		// sendRegisterCode 会永久拒绝该号码重新注册，pwdforget 更会在号码被新用户
-		// 复用后把重置目标落到已注销的那一行（两行同 hash，Load 取任意一行）。
-		"phone_encrypted":   nil,
-		"phone_hash":        "",
-		"phone_last4":       "",
-		"is_destroy":        2,
-		"destroy_apply_at":  nil,
-		"destroy_expire_at": nil,
-	}).Where("uid=? AND is_destroy=?", uid, expectedState).Exec()
+	res, err := d.session.Update("user").SetMap(destroyedAccountFields(username, phone)).
+		Where("uid=? AND is_destroy=?", uid, expectedState).Exec()
 	if err != nil {
 		return fmt.Errorf("destroy account: %w", err)
 	}
@@ -378,6 +365,22 @@ func (d *DB) destroyAccountFromState(uid, username, phone string, expectedState 
 		return ErrDestroyStateConflict
 	}
 	return nil
+}
+
+// destroyedAccountFields is the single phone-anonymisation field set used by
+// both legacy and session-revocation destroy paths. Any future phone rewrite
+// must keep the plaintext tombstone and all three shadow columns in sync.
+func destroyedAccountFields(username, phone string) map[string]interface{} {
+	return map[string]interface{}{
+		"phone":             phone,
+		"username":          username,
+		"phone_encrypted":   nil,
+		"phone_hash":        "",
+		"phone_last4":       "",
+		"is_destroy":        IsDestroyDone,
+		"destroy_apply_at":  nil,
+		"destroy_expire_at": nil,
+	}
 }
 
 // 即时注销（legacy）：要求当前 is_destroy=0。

@@ -1,9 +1,9 @@
 package common
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
-	"crypto/rand"
 	"math/big"
 	"sync"
 	"time"
@@ -53,6 +53,12 @@ func (s *service) GetAppConfig() (*AppConfigResp, error) {
 	appConfigM, err := s.appConfigDB.query()
 	if err != nil {
 		return nil, err
+	}
+	// A freshly migrated database or a maintenance cleanup can temporarily have
+	// no app_config row. Treat that as feature defaults instead of panicking in
+	// asynchronous login follow-up work such as welcome-message delivery.
+	if appConfigM == nil {
+		return &AppConfigResp{}, nil
 	}
 
 	return &AppConfigResp{
@@ -110,7 +116,7 @@ func runGenShortnoTask(ctx *config.Context) {
 
 func generateNums(length int, count int) []string {
 	var nums = make([]string, 0, count)
-	
+
 	for i := count; i > 0; i-- {
 		max := big.NewInt(1e16)
 		n, err := rand.Int(rand.Reader, max)

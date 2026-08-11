@@ -12,7 +12,7 @@
 -- 了多少次"的手段，所以它必须建索引；掩码值多号共享、不具备精确检索能力。
 ALTER TABLE `login_log`
   ADD COLUMN `status` TINYINT NOT NULL DEFAULT 1 COMMENT '1成功 2失败',
-  ADD COLUMN `login_type` VARCHAR(20) NOT NULL DEFAULT '' COMMENT '登录方式:username/email/manager/register/github/gitee/oidc/wechat',
+  ADD COLUMN `login_type` VARCHAR(20) NOT NULL DEFAULT '' COMMENT '登录方式:username/email/manager/register/github/gitee/oidc/wechat/scan_login/phone_verify',
   ADD COLUMN `account_masked` VARCHAR(100) NOT NULL DEFAULT '' COMMENT '登录尝试账号的掩码形式(不含完整PII),供人读',
   ADD COLUMN `account_hash` VARCHAR(72) NOT NULL DEFAULT '' COMMENT '登录尝试账号盲索引,格式 <密钥版本>:<HMAC-SHA256 hex>',
   ADD INDEX `idx_uid_created` (`uid`, `created_at`),

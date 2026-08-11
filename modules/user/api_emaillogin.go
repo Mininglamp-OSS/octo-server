@@ -306,6 +306,9 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	if userInfo == nil || userInfo.UID != fencedUID {
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
+		}
+		u.loginLog.recordFailure(req.Email, publicIP, "email")
+		if req.Password != "" {
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -316,7 +319,9 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		// 密码路径同样泄露账号状态，统一为通用错误 + 计入失败计数
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
-			u.loginLog.recordFailure(req.Email, publicIP, "email")
+		}
+		u.loginLog.recordFailure(req.Email, publicIP, "email")
+		if req.Password != "" {
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -328,6 +333,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	if req.Code != "" {
 		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(loginSpanCtx, req.Email, req.Code, commonapi.CodeTypeEmailLogin); err != nil {
+			u.loginLog.recordFailure(req.Email, publicIP, "email")
 			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}

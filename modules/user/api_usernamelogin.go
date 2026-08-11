@@ -133,6 +133,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 	}
 	if userInfo == nil || userInfo.UID != fencedUID {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}

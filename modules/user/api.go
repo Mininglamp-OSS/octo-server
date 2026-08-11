@@ -1590,6 +1590,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 			WXUnionid: unionid,
 			Flag:      req.Flag,
 			Device:    req.Device,
+			LoginType: "wechat",
 		}
 		// 下载微信用户头像并上传
 		if headimgurl != "" {
@@ -1678,6 +1679,7 @@ func (u *User) login(c *wkhttp.Context) {
 		}
 		if userInfo == nil || userInfo.UID != fencedUID {
 			u.loginGuard.RecordFailureLogged(req.Username)
+			u.loginLog.recordFailure(req.Username, publicIP, "username")
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -2820,6 +2822,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	u.applyRealnameToAuthCodeMap(resp, userModel.UID)
 	redemptionAudit.MarkCompleted()
 	c.Response(resp)
+	u.finishSuccessfulLogin(userModel.UID, userModel.Username, util.GetClientPublicIP(c.Request), "scan_login")
 }
 
 // 获取二维码数据的管道
@@ -3553,6 +3556,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
 	u.applyRealnameToLoginResp(resp, userInfo.UID)
 	c.Response(resp)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, util.GetClientPublicIP(c.Request), "phone_verify")
 }
 
 // customerservices 客服列表
