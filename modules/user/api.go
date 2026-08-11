@@ -2103,6 +2103,14 @@ func (u *User) sentWelcomeMsg(publicIP, uid string, prevLogin *loginLogResp) {
 		u.Error("获取应用配置错误", zap.Error(err))
 		return
 	}
+	// 管理员可以在后台把欢迎语关掉（common 的 app_config.send_welcome_message_on，
+	// 列默认 1）。这个开关必须独立于上面的空配置守卫：两者都 return，但语义不同，
+	// 合并会让"修空指针"顺手删掉一个运维开关 —— 本 PR 上一版正是这么回归的。
+	// 注意 app_config 无行时 GetAppConfig 返回零值 &AppConfigResp{}，也落在这里，
+	// 与旧行为一致（旧代码在零值上同样 return）。
+	if appconfig.SendWelcomeMessageOn == 0 {
+		return
+	}
 	// 等待用户数据持久化完成（该函数在 goroutine 中调用）
 	time.Sleep(500 * time.Millisecond)
 	//发送登录欢迎消息
