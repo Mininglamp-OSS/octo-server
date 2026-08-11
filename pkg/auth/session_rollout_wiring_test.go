@@ -11,6 +11,8 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,10 +47,20 @@ func newBootHarness(t *testing.T, withMarkerTable bool) *bootHarness {
 		t.Skipf("test MySQL unavailable: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.Exec("DROP TABLE IF EXISTS " + rolloutMarkerTable)
-	require.NoError(t, err)
+	// Never DROP: this database is shared with every other package's tests and
+	// the table is created by a real migration. Dropping it makes an unrelated
+	// package fail with Error 1146, order-dependently. "Absent" is simulated by
+	// pointing the store at a table name that does not exist.
+	if !withMarkerTable {
+		rolloutMarkerTable = "octo_session_rollout_marker_absent_" + strings.ReplaceAll(util.GenerUUID(), "-", "")
+		t.Cleanup(func() { rolloutMarkerTable = defaultRolloutMarkerTable })
+	}
+	_, err = db.Exec("DELETE FROM " + defaultRolloutMarkerTable)
+	if err != nil && !isMissingMarkerTable(err) {
+		require.NoError(t, err)
+	}
 	if withMarkerTable {
-		_, err = db.Exec("CREATE TABLE " + rolloutMarkerTable + " (" +
+		_, err = db.Exec("CREATE TABLE IF NOT EXISTS " + rolloutMarkerTable + " (" +
 			"`singleton_id` TINYINT UNSIGNED NOT NULL," +
 			"`initialized_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
 			"`initialized_floor` VARCHAR(16) NOT NULL DEFAULT ''," +
@@ -58,6 +70,7 @@ func newBootHarness(t *testing.T, withMarkerTable bool) *bootHarness {
 	}
 
 	cfg := config.New()
+	cfg.DB.MySQLAddr = rolloutMarkerTestDSN
 	cfg.Cache.TokenCachePrefix = "wiring:" + util.GenerUUID() + ":"
 	cfg.Cache.UIDTokenCachePrefix = "wiring-uid:" + util.GenerUUID() + ":"
 	cfg.Cache.TokenExpire = time.Hour
@@ -79,23 +92,27 @@ func newBootHarness(t *testing.T, withMarkerTable bool) *bootHarness {
 	return h
 }
 
-// boot drives the real resolution the server performs, including the marker
-// store the wiring builds from ctx.DB().
+// boot drives the ACTUAL server wiring, not a re-implementation of it.
+//
+// The earlier version of this helper called ResolveRolloutBoot and
+// ApplyRolloutState directly and hand-copied runtime.go's error fallback. That
+// is why two critical defects in that fallback — enforce with no cap, fencing
+// every login permanently — sat here untested while the file header claimed
+// these tests drove the boot path. A harness that reimplements the thing it
+// tests cannot catch a bug in the thing it tests.
 func (h *bootHarness) boot(t *testing.T, legacyMode SessionMode, legacyCap int) RolloutBoot {
 	t.Helper()
-	store := NewRedisSessionStore(
-		newTestRedisClient(t),
-		h.ctx.GetConfig().Cache.TokenCachePrefix,
-		h.ctx.GetConfig().Cache.UIDTokenCachePrefix,
-		h.ctx.GetConfig().Cache.TokenExpire,
-	)
-	boot, err := ResolveRolloutBoot(context.Background(), store, h.markers, legacyMode, legacyCap)
-	if err != nil {
-		boot = RolloutBoot{Outcome: RolloutBootRecovered, Mode: SessionModeEnforce, MaxPerUID: legacyCap}
-		boot.Warning = err.Error()
+	if legacyMode.valid() {
+		t.Setenv(sessionModeEnv, string(legacyMode))
 	}
-	require.NoError(t, store.ApplyRolloutState(boot.Mode, boot.MaxPerUID))
-	boot.Mode = store.Mode()
+	if legacyCap > 0 {
+		t.Setenv(sessionMaxPerUIDEnv, strconv.Itoa(legacyCap))
+	}
+	// A fresh context per boot: the runtime memoises one store per context.
+	ctx := config.NewContext(h.ctx.GetConfig())
+	store, client := SessionStoreAndClientForContext(ctx)
+	t.Cleanup(func() { _ = client.Close() })
+	boot, _ := SessionBootForContext(ctx)
 	h.store = store
 	return boot
 }
@@ -161,13 +178,16 @@ func TestWiringRecoveryReplacesACorruptRecord(t *testing.T) {
 	boot := h.boot(t, "", 20)
 	require.Equal(t, SessionModeEnforce, boot.Mode)
 
+	// Boot itself repairs it. A SET NX left the corrupt payload in place while
+	// reporting success, and the very next read then crashed startup.
+	control, err := h.store.RolloutControl(ctx)
+	require.NoError(t, err, "the record must be readable after boot, not still corrupt")
+	require.Equal(t, SessionModeEnforce, control.ModeFloor)
+
+	// And a second attempt is a correct no-op now that the floor is readable.
 	recovered, err := h.store.RecoverRolloutControlAtEnforce(ctx, 20)
 	require.NoError(t, err)
-	require.True(t, recovered, "a corrupt record must be replaced")
-
-	control, err := h.store.RolloutControl(ctx)
-	require.NoError(t, err, "the record must be readable afterwards, not still corrupt")
-	require.Equal(t, SessionModeEnforce, control.ModeFloor)
+	require.False(t, recovered, "a readable floor always wins")
 }
 
 // W4 — a floor that reappeared between the read and the write always wins, and

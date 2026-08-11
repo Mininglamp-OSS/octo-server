@@ -20,10 +20,35 @@ if not value then
 end
 local ttl = redis.call("PTTL", KEYS[1])
 local version = 1
-if string.sub(value, 1, 3) == "v3:" then
-  version = 3
-elseif string.sub(value, 1, 3) == "v2:" then
-  version = 2
+local prefix = string.sub(value, 1, 3)
+if prefix == "v3:" or prefix == "v2:" then
+  -- A prefix is not proof of decodability. Observe runs Decode on the body and
+  -- counts a malformed one as decode_invalid, so classifying purely on the
+  -- prefix left the two commands reporting different numbers for the same
+  -- keyspace — the disagreement this is supposed to remove.
+  --
+  -- The mirror is exact for v2: decodeV2 is "unmarshal as JSON, then uid must
+  -- be a non-empty string", which is what the three type checks below are. v2
+  -- is a frozen legacy format and its count feeds the enforce gate, so it has
+  -- to agree to the record.
+  --
+  -- For v3 the mirror stops here on purpose. decodeV3 additionally requires
+  -- issued_at, expires_at > issued_at, session_generation and session_revision,
+  -- and re-implementing five semantic checks in Lua is a standing invitation for
+  -- the two to drift apart in the other direction. The residue is bounded: a v3
+  -- body that parses with a uid but fails those checks would be counted v3 here
+  -- and decode_invalid by observe. No writer can produce one — EncodeV3 enforces
+  -- all five before the value is ever stored — and no gate reads the v3 count.
+  -- TestObserveAndMigrateDivergeOnlyOnUnwritableV3Bodies pins that boundary.
+  local body = string.sub(value, 4)
+  local ok, decoded = pcall(cjson.decode, body)
+  if not ok or type(decoded) ~= "table" or type(decoded.uid) ~= "string" or decoded.uid == "" then
+    version = -1
+  elseif prefix == "v3:" then
+    version = 3
+  else
+    version = 2
+  end
 else
   -- Mirror decodeLegacy: a v1 payload is uid@name[@role], so one or two "@"
   -- with a non-empty uid. Anything else is not a decodable credential and is

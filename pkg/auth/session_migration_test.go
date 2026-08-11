@@ -19,6 +19,36 @@ import (
 // record; AdvanceRolloutControl needs it once the floor writes v3.
 const rolloutMaxPerUIDForTest = 10
 
+// The v2/v3 wire format is a prefix followed by JSON (tokeninfo.go), so a
+// fixture carrying a bare label after the prefix was never a decodable
+// record: Decode rejects it and
+// observe counts it as decode_invalid. Migrate used to classify on the three
+// prefix bytes alone and called the same key a healthy v2 — the disagreement
+// C3 measured in production. Now that the Lua decodes the body the way Decode
+// does, the fixtures have to carry the real shape, so build them with the real
+// encoders rather than by hand.
+func v2Fixture(t *testing.T, uid string) string {
+	t.Helper()
+	payload, err := Encode(TokenInfo{UID: uid, Name: uid})
+	require.NoError(t, err)
+	return payload
+}
+
+func v3Fixture(t *testing.T, uid string) string {
+	t.Helper()
+	now := time.Now().UTC()
+	payload, err := EncodeV3(TokenInfo{
+		UID:               uid,
+		Name:              uid,
+		IssuedAt:          now.Unix(),
+		ExpiresAt:         now.Add(time.Hour).Unix(),
+		SessionGeneration: "fixture-generation",
+		SessionRevision:   1,
+	})
+	require.NoError(t, err)
+	return payload
+}
+
 func TestLegacyMigrationDryRunIsZeroWriteAndClassifiesRecords(t *testing.T) {
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
 	ctx := context.Background()
@@ -27,9 +57,9 @@ func TestLegacyMigrationDryRunIsZeroWriteAndClassifiesRecords(t *testing.T) {
 
 	keys := map[string]string{
 		"persistent-v1": `legacy@Legacy User`,
-		"long-v2":       "v2:long",
-		"short-v2":      "v2:short",
-		"persistent-v3": "v3:invalid-but-must-not-be-repaired",
+		"long-v2":       v2Fixture(t, "long"),
+		"short-v2":      v2Fixture(t, "short"),
+		"persistent-v3": v3Fixture(t, "persistent-v3"),
 	}
 	require.NoError(t, client.Set(store.tokenKey("persistent-v1"), keys["persistent-v1"], 0).Err())
 	require.NoError(t, client.Set(store.tokenKey("long-v2"), keys["long-v2"], 2*time.Hour).Err())
@@ -94,9 +124,9 @@ func TestLegacyMigrationFinitePolicyControlsOnlyFiniteLegacyDeadlines(t *testing
 			require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutMaxPerUIDForTest))
 			require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 			cutoff := time.Now().UTC().Add(15 * time.Minute)
-			require.NoError(t, client.Set(store.tokenKey("finite"), "v2:finite", 30*time.Minute).Err())
-			require.NoError(t, client.Set(store.tokenKey("over-max"), "v2:over-max", 2*time.Hour).Err())
-			require.NoError(t, client.Set(store.tokenKey("persistent"), "v2:persistent", 0).Err())
+			require.NoError(t, client.Set(store.tokenKey("finite"), v2Fixture(t, "finite"), 30*time.Minute).Err())
+			require.NoError(t, client.Set(store.tokenKey("over-max"), v2Fixture(t, "over-max"), 2*time.Hour).Err())
+			require.NoError(t, client.Set(store.tokenKey("persistent"), v2Fixture(t, "persistent"), 0).Err())
 			finiteBefore := mustPTTL(t, client, store.tokenKey("finite"))
 
 			result, err := store.MigrateLegacySessions(ctx, LegacyMigrationOptions{
@@ -152,9 +182,9 @@ func TestLegacyMigrationApplyRequiresFloorAndOnlyShortensLegacy(t *testing.T) {
 
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutMaxPerUIDForTest))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
-	require.NoError(t, client.Set(store.tokenKey("long-v2"), "v2:long", 2*time.Hour).Err())
-	require.NoError(t, client.Set(store.tokenKey("short-v2"), "v2:short", 5*time.Minute).Err())
-	require.NoError(t, client.Set(store.tokenKey("persistent-v3"), "v3:invalid", 0).Err())
+	require.NoError(t, client.Set(store.tokenKey("long-v2"), v2Fixture(t, "long"), 2*time.Hour).Err())
+	require.NoError(t, client.Set(store.tokenKey("short-v2"), v2Fixture(t, "short"), 5*time.Minute).Err())
+	require.NoError(t, client.Set(store.tokenKey("persistent-v3"), v3Fixture(t, "persistent-v3"), 0).Err())
 	shortBefore := mustPTTL(t, client, store.tokenKey("short-v2"))
 
 	result, err := store.MigrateLegacySessions(ctx, options)
@@ -194,7 +224,7 @@ func TestLegacyMigrationApplyIsSingleOwnerAndDetectsLockLossWithinBatch(t *testi
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutMaxPerUIDForTest))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 	for i := 0; i < 8; i++ {
-		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("legacy-%02d", i)), "v2:legacy", 0).Err())
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("legacy-%02d", i)), v2Fixture(t, "legacy"), 0).Err())
 	}
 	options := LegacyMigrationOptions{
 		CampaignID:   "lock-loss",
@@ -245,7 +275,7 @@ func TestLegacyMigrationCancellationReportsIncompleteAndCanResume(t *testing.T) 
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutMaxPerUIDForTest))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 	for i := 0; i < 40; i++ {
-		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("resume-%02d", i)), "v2:legacy", 0).Err())
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("resume-%02d", i)), v2Fixture(t, "legacy"), 0).Err())
 	}
 	options := LegacyMigrationOptions{
 		CampaignID:   "resume",
@@ -293,7 +323,7 @@ func TestLegacyMigrationRestartsSavedCursorAfterRedisInstanceChange(t *testing.T
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 
 	for i := 0; i < 128; i++ {
-		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("redis-restart-%03d", i)), "v2:legacy", 0).Err())
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("redis-restart-%03d", i)), v2Fixture(t, "legacy"), 0).Err())
 	}
 	var skippedKeys []string
 	var savedCursor uint64
@@ -352,7 +382,7 @@ func TestLegacyMigrationRestartsWhenRedisInstanceChangesDuringScan(t *testing.T)
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, rolloutMaxPerUIDForTest))
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 	for i := 0; i < 128; i++ {
-		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("in-flight-restart-%03d", i)), "v2:legacy", 0).Err())
+		require.NoError(t, client.Set(store.tokenKey(fmt.Sprintf("in-flight-restart-%03d", i)), v2Fixture(t, "legacy"), 0).Err())
 	}
 
 	var identityReads atomic.Int64
@@ -480,8 +510,8 @@ func TestLegacyMigrationElapsedCutoffClassifiesDeletionWithoutExtendingDeadline(
 				require.NoError(t, err)
 				require.NoError(t, client.Set(store.migrationCampaignKey(options.CampaignID), string(raw), 0).Err(), "simulate a campaign created before its cutoff elapsed")
 			}
-			require.NoError(t, client.Set(store.tokenKey("finite"), "v2:finite", 30*time.Minute).Err())
-			require.NoError(t, client.Set(store.tokenKey("persistent"), "v2:persistent", 0).Err())
+			require.NoError(t, client.Set(store.tokenKey("finite"), v2Fixture(t, "finite"), 30*time.Minute).Err())
+			require.NoError(t, client.Set(store.tokenKey("persistent"), v2Fixture(t, "persistent"), 0).Err())
 
 			result, err := store.MigrateLegacySessions(ctx, options)
 			if tt.wantErr != "" {
@@ -518,7 +548,7 @@ func TestLegacyMigrationStopsBeforeUnconfirmedCutoffDeletionDuringApply(t *testi
 	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, rolloutMaxPerUIDForTest))
 	keys := []string{store.tokenKey("first"), store.tokenKey("second")}
 	for _, key := range keys {
-		require.NoError(t, client.Set(key, "v2:persistent", 0).Err())
+		require.NoError(t, client.Set(key, v2Fixture(t, "persistent"), 0).Err())
 	}
 	options := LegacyMigrationOptions{
 		CampaignID:   "cutoff-elapses-during-apply",

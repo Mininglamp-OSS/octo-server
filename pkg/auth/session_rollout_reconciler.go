@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -75,6 +76,7 @@ type RolloutReconciler struct {
 	maxPerUID     int
 	scanBatchSize int64
 	scanInterval  time.Duration
+	markerStamped atomic.Bool
 	log           func(format string, args ...interface{})
 }
 
@@ -128,22 +130,48 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 // It is started only from the server wiring, never from NewRedisSessionStore:
 // a background goroutine that advances floors, started by a constructor, would
 // fire in every test that happens to build a store.
+// Run polls the floor and, when enabled, reconciles — in two goroutines.
+//
+// One loop was not enough: a rate-limited full-keyspace scan inside
+// reconcileOnce can run for an hour on a large keyspace, and while it did, the
+// select never reached the poll tick. A floor advance published by another
+// replica would not be applied here for that whole hour, defeating the
+// five-second propagation the poller exists for, and the registry would keep
+// advertising a stale applied state — which is exactly what the convergence
+// gate reads.
+//
+// It is started only from the server wiring, never from NewRedisSessionStore:
+// a background goroutine that advances floors, started by a constructor, would
+// fire in every test that happens to build a store.
 func (r *RolloutReconciler) Run(ctx context.Context) {
-	pollTicker := time.NewTicker(floorPollInterval)
-	defer pollTicker.Stop()
-	reconcileTicker := time.NewTicker(reconcileInterval)
-	defer reconcileTicker.Stop()
+	go r.runPoller(ctx)
+	r.runReconciler(ctx)
+}
 
-	var nextReconcile time.Time
+func (r *RolloutReconciler) runPoller(ctx context.Context) {
+	ticker := time.NewTicker(floorPollInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-pollTicker.C:
+		case <-ticker.C:
 			r.pollFloor(ctx)
-		case <-reconcileTicker.C:
-			if !r.store.now().Before(nextReconcile) {
-				nextReconcile = r.reconcileOnce(ctx)
+		}
+	}
+}
+
+func (r *RolloutReconciler) runReconciler(ctx context.Context) {
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	var next time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !r.store.now().Before(next) {
+				next = r.reconcileOnce(ctx)
 			}
 		}
 	}
@@ -185,8 +213,10 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	if r.registry != nil {
 		// Publish what was APPLIED, never what was resolved. Advertising a mode
 		// this replica is not actually running lets the convergence gate be
-		// satisfied by a replica that has not converged.
-		r.registry.SetAppliedState(string(applied))
+		// satisfied by a replica that has not converged. Only on an actual
+		// change — the heartbeat already refreshes the entry on its own tick,
+		// so rewriting an identical one every poll doubles registry traffic.
+		r.registry.SetAppliedStateIfChanged(string(applied))
 	}
 }
 
@@ -196,16 +226,28 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 // of this artifact cannot stamp it; and until it is stamped, a Redis loss reads
 // as "never initialised" and resolves DOWN to expand.
 func (r *RolloutReconciler) ensureMarker(ctx context.Context, floor SessionMode) {
-	if r.markers == nil {
+	if r.markers == nil || r.markerStamped.Load() {
 		return
 	}
-	marker, err := r.markers.Load(ctx)
-	if err != nil || marker != nil {
+	// Bounded: the rollout context has no deadline, and a stalled MySQL
+	// connection here would otherwise hold the poll loop open indefinitely.
+	loadCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	marker, err := r.markers.Load(loadCtx)
+	if err != nil {
 		return
 	}
-	if stampErr := r.markers.StampOnce(ctx, floor); stampErr != nil {
+	if marker != nil {
+		// Latch it: once stamped it stays stamped, so there is no reason to
+		// query for the rest of the process's life.
+		r.markerStamped.Store(true)
+		return
+	}
+	if stampErr := r.markers.StampOnce(loadCtx, floor); stampErr != nil {
 		r.log("session rollout: cannot stamp initialisation marker: %v", stampErr)
+		return
 	}
+	r.markerStamped.Store(true)
 }
 
 // reconcileOnce evaluates the predicate and returns the earliest time the next
@@ -275,20 +317,7 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 // pre-check rejection, and BOTH are benign no-ops — with several replicas
 // reconciling, treating them as errors would make the fleet alert on itself.
 func (r *RolloutReconciler) advance(ctx context.Context, decision RolloutAdvanceDecision, actor string) error {
-	// The marker is stamped BEFORE the CAS and its failure blocks the advance.
-	// The same ordering argument the evidence snapshot gets — a record with no
-	// advance is harmless, an advance with no record is not — applies here with
-	// more force, because a floor that exists without a marker reads as "never
-	// initialised" after a Redis loss and resolves DOWN to expand.
-	if r.markers != nil {
-		if stampErr := r.markers.StampOnce(ctx, decision.Target); stampErr != nil {
-			return fmt.Errorf("auth: refusing to advance without an initialisation marker: %w", stampErr)
-		}
-	}
-	if err := r.store.recordRolloutAdvance(ctx, decision, actor, r.registry); err != nil {
-		return err
-	}
-	err := r.store.AdvanceRolloutControl(ctx, decision.Target, decision.MaxPerUID)
+	err := r.store.advanceFloor(ctx, decision, actor, r.registry, r.markers)
 	switch {
 	case err == nil:
 		metrics.ObserveSessionFloorAdvance(string(decision.Target), actor)

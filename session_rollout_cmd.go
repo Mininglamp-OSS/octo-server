@@ -41,12 +41,26 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
+	"github.com/gocraft/dbr/v2"
 )
 
 const sessionRolloutCommand = "session-rollout"
+
+// sessionRolloutSubcommands is checked before the config is read and the Redis
+// pool is built, so a typo costs a message rather than a dial timeout against
+// whatever endpoint the config happens to name.
+var sessionRolloutSubcommands = map[string]bool{
+	"status":  true,
+	"observe": true,
+	"migrate": true,
+	"pause":   true,
+	"resume":  true,
+	"advance": true,
+}
 
 // runSessionRolloutCommand handles `app session-rollout <sub> [flags]`. It is
 // dispatched before flag.Parse in main so subcommand flags are not eaten by the
@@ -57,6 +71,9 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	}
 	sub := args[0]
 	rest := args[1:]
+	if !sessionRolloutSubcommands[sub] {
+		return fmt.Errorf("unknown %s subcommand %q", sessionRolloutCommand, sub)
+	}
 
 	flags := flag.NewFlagSet(sessionRolloutCommand+" "+sub, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -79,6 +96,15 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("%s %s does not accept positional arguments", sessionRolloutCommand, sub)
 	}
+	// Validated here, once, for every subcommand that scans. observe and migrate
+	// each checked --qps and status did not, so `status --qps 0` ran an
+	// unthrottled full-keyspace scan against production while the two commands
+	// that say they are dangerous refused the same input. --batch-size advertised
+	// a range in its own help text that nothing enforced.
+	if err := validateScanRate(*qps, *batchSize); err != nil {
+		return err
+	}
+	scanInterval := time.Duration(float64(time.Second) / *qps)
 
 	cfg, err := loadSessionRolloutConfig(*configPath)
 	if err != nil {
@@ -114,16 +140,16 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 
 	switch sub {
 	case "status":
-		return sessionRolloutStatus(ctx, store, out, *batchSize, *qps)
+		return sessionRolloutStatus(ctx, store, out, *batchSize, scanInterval)
 	case "observe":
-		return sessionRolloutObserve(ctx, store, out, *batchSize, *qps)
+		return sessionRolloutObserve(ctx, store, out, *batchSize, scanInterval)
 	case "migrate":
 		return sessionRolloutMigrate(ctx, store, out, sessionRolloutMigrateArgs{
 			campaign:       *campaign,
 			cutoffRaw:      *cutoffRaw,
 			finitePolicy:   *finitePolicy,
 			batchSize:      *batchSize,
-			qps:            *qps,
+			scanInterval:   scanInterval,
 			lease:          *lease,
 			apply:          *apply,
 			confirmElapsed: *confirmElapsed,
@@ -141,10 +167,48 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 		fmt.Fprintln(out, `{"paused":false}`)
 		return nil
 	case "advance":
-		return sessionRolloutAdvance(ctx, store, out, *force, *yes, *expectWriters, *maxPerUID, *batchSize)
+		// A forced advance writes a floor, so it owes the same initialisation
+		// marker the reconciler writes. Without it a later Redis loss reads as
+		// "this deployment never started a rollout" and resolves down to expand.
+		markers := auth.NewRolloutMarkerStore(sessionRolloutMarkerDB(cfg))
+		return sessionRolloutAdvance(ctx, store, markers, out, sessionRolloutAdvanceArgs{
+			force:         *force,
+			yes:           *yes,
+			expectWriters: *expectWriters,
+			maxPerUID:     *maxPerUID,
+			batchSize:     *batchSize,
+			scanInterval:  scanInterval,
+		})
 	default:
-		return fmt.Errorf("unknown %s subcommand %q", sessionRolloutCommand, sub)
+		// Unreachable: sessionRolloutSubcommands gates this above. Kept so
+		// adding a name to that map without a case here fails loudly.
+		return fmt.Errorf("unhandled %s subcommand %q", sessionRolloutCommand, sub)
 	}
+}
+
+// validateScanRate bounds both throttle knobs. The ceiling on --qps is not
+// arbitrary: this scan runs against the shared session pool, and the flag's job
+// is to keep an operator from saturating it by hand.
+func validateScanRate(qps float64, batchSize int64) error {
+	if qps <= 0 || qps > 10_000 {
+		return errors.New("--qps must be greater than zero and no more than 10000")
+	}
+	if batchSize <= 0 || batchSize > 10_000 {
+		return errors.New("--batch-size must be between 1 and 10000")
+	}
+	return nil
+}
+
+// sessionRolloutMarkerDB opens the marker connection lazily: dbr does not dial
+// until the first query, so an unreachable MySQL surfaces as a failed stamp
+// with a real error rather than as a CLI that cannot start.
+func sessionRolloutMarkerDB(cfg *config.Config) *dbr.Session {
+	return db.NewMySQL(
+		cfg.DB.MySQLAddr,
+		cfg.DB.MySQLMaxOpenConns,
+		cfg.DB.MySQLMaxIdleConns,
+		cfg.DB.MySQLConnMaxLifetime,
+	)
 }
 
 func loadSessionRolloutConfig(path string) (*config.Config, error) {
@@ -172,11 +236,7 @@ type sessionRolloutStatusReport struct {
 	Next        *auth.RolloutAdvanceDecision `json:"next,omitempty"`
 }
 
-func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, qps float64) error {
-	interval := time.Duration(0)
-	if qps > 0 {
-		interval = time.Duration(float64(time.Second) / qps)
-	}
+func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, interval time.Duration) error {
 	report := sessionRolloutStatusReport{Floor: "none"}
 	control, err := store.RolloutControl(ctx)
 	if err != nil {
@@ -210,11 +270,8 @@ func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, ou
 	return encoder.Encode(report)
 }
 
-func sessionRolloutObserve(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, qps float64) error {
-	if qps <= 0 || qps > 10_000 {
-		return errors.New("--qps must be greater than zero and no more than 10000")
-	}
-	stats, err := store.ObserveRateLimited(ctx, batchSize, time.Duration(float64(time.Second)/qps))
+func sessionRolloutObserve(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, interval time.Duration) error {
+	stats, err := store.ObserveRateLimited(ctx, batchSize, interval)
 	if encodeErr := json.NewEncoder(out).Encode(stats); encodeErr != nil {
 		return encodeErr
 	}
@@ -226,7 +283,7 @@ type sessionRolloutMigrateArgs struct {
 	cutoffRaw      string
 	finitePolicy   string
 	batchSize      int64
-	qps            float64
+	scanInterval   time.Duration
 	lease          time.Duration
 	apply          bool
 	confirmElapsed bool
@@ -247,9 +304,6 @@ func sessionRolloutMigrate(ctx context.Context, store *auth.RedisSessionStore, o
 	if policy != auth.LegacyFinitePolicyNatural && policy != auth.LegacyFinitePolicyCap {
 		return errors.New("migrate --finite-policy must be natural or cap")
 	}
-	if args.qps <= 0 || args.qps > 10_000 {
-		return errors.New("--qps must be greater than zero and no more than 10000")
-	}
 	if args.apply && cutoff.UTC().UnixMilli() <= time.Now().UTC().UnixMilli() && !args.confirmElapsed {
 		return errors.New("migrate --apply with elapsed --cutoff requires --confirm-elapsed-cutoff")
 	}
@@ -258,7 +312,7 @@ func sessionRolloutMigrate(ctx context.Context, store *auth.RedisSessionStore, o
 		CutoffAt:             cutoff.UTC(),
 		FinitePolicy:         policy,
 		BatchSize:            args.batchSize,
-		Interval:             time.Duration(float64(time.Second) / args.qps),
+		Interval:             args.scanInterval,
 		Apply:                args.apply,
 		ConfirmElapsedCutoff: args.confirmElapsed,
 		Lease:                args.lease,
@@ -272,24 +326,36 @@ func sessionRolloutMigrate(ctx context.Context, store *auth.RedisSessionStore, o
 	return nil
 }
 
+type sessionRolloutAdvanceArgs struct {
+	force         bool
+	yes           bool
+	expectWriters int
+	maxPerUID     int
+	batchSize     int64
+	scanInterval  time.Duration
+}
+
 func sessionRolloutAdvance(
 	ctx context.Context,
 	store *auth.RedisSessionStore,
+	markers *auth.RolloutMarkerStore,
 	out io.Writer,
-	force, yes bool,
-	expectWriters, maxPerUID int,
-	batchSize int64,
+	args sessionRolloutAdvanceArgs,
 ) error {
-	if !force || !yes {
+	if !args.force || !args.yes {
 		return errors.New("advance is the reconciler's job; use --force --yes only when the reconciler itself is broken")
 	}
 	registry := auth.NewWriterRegistry(store.Client(), store.UIDTokenPrefix())
 	decision, err := store.EvaluateRolloutAdvance(ctx, auth.RolloutAdvanceInput{
 		Registry:      registry,
-		ExpectWriters: expectWriters,
-		MaxPerUID:     maxPerUID,
-		ScanBatchSize: batchSize,
-		ScanInterval:  time.Millisecond,
+		ExpectWriters: args.expectWriters,
+		MaxPerUID:     args.maxPerUID,
+		ScanBatchSize: args.batchSize,
+		// Throttled like every other scan. This used to hardcode 1ms — a rate
+		// the --qps ceiling does not permit — so the one subcommand that runs
+		// unattended-grade work on an operator's say-so was also the one that
+		// ignored the throttle.
+		ScanInterval: args.scanInterval,
 	})
 	if err != nil {
 		return err
@@ -302,7 +368,7 @@ func sessionRolloutAdvance(
 		}
 		return fmt.Errorf("refusing to advance to %s: %s", decision.Target, decision.BlockedSummary())
 	}
-	if err := store.ForceAdvanceRollout(ctx, decision, registry); err != nil {
+	if err := store.ForceAdvanceRollout(ctx, decision, registry, markers); err != nil {
 		return err
 	}
 	return json.NewEncoder(out).Encode(decision)

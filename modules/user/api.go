@@ -1839,6 +1839,16 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 	}
 	reuseExistingToken := false
 	if flag == config.APP {
+		// Checked before the revoke, same as replaceAPPToken. This is the
+		// primary login path and it has the same shape: revoking is not
+		// lease-gated (correctly — it is always safe) while issuing is, so
+		// discovering the fence only inside the issue turns a refused login
+		// into a logout.
+		if err := canIssueUserSession(u.sessionStore); err != nil {
+			u.Error("当前副本不可签发会话", zap.Error(err))
+			tokenSpan.Finish()
+			return nil, err
+		}
 		if oldToken != "" {
 			err = revokeCurrentUserSession(loginSpanCtx, u.sessionStore, oldToken, userInfo.UID, int(flag))
 			if err != nil {

@@ -1,10 +1,10 @@
 package user
 
 import (
+	"time"
 	"fmt"
 	"os"
 	"runtime/debug"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"

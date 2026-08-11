@@ -11,13 +11,13 @@ import (
 // without spinning up Redis. The struct also records Set/Delete calls so
 // negative-cache and invalidation assertions can fire without timing tricks.
 type fakeLangCache struct {
-	store    map[string]string
-	expire   map[string]time.Duration
-	getErr   error
-	setErr   error
-	delErr   error
-	deletes  []string
-	setCalls int
+	store     map[string]string
+	expire    map[string]time.Duration
+	getErr    error
+	setErr    error
+	delErr    error
+	deletes   []string
+	setCalls  int
 }
 
 func newFakeLangCache() *fakeLangCache {
@@ -59,10 +59,10 @@ func (c *fakeLangCache) Delete(key string) error {
 // fakeLangDB stubs the read+write surface so the service can be exercised
 // without a real *DB.
 type fakeLangDB struct {
-	lang       map[string]string
-	queryErr   error
-	updates    map[string]string
-	updateErr  error
+	lang    map[string]string
+	queryErr error
+	updates map[string]string
+	updateErr error
 	queryCalls int
 }
 

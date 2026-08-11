@@ -161,6 +161,13 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 		maxPerUID = sessionMaxPerUIDLimit
 	}
 	if mode.rank() < current.mode.rank() {
+		// The mode never moves down, but the CAP still has to land. A process
+		// running above the floor with no usable cap fences every login, and
+		// dropping the cap that arrived alongside a lower mode meant a floor
+		// record that finally carried one could never heal it.
+		if maxPerUID != current.maxPerUID {
+			s.state.Store(&derivedRolloutState{mode: current.mode, maxPerUID: maxPerUID})
+		}
 		return nil
 	}
 	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
@@ -724,19 +731,61 @@ func (s *RedisSessionStore) RedisInstanceFingerprint() (string, error) {
 	return s.currentRedisInstanceID()
 }
 
-// ForceAdvanceRollout is the operator fault channel. It records the same
-// evidence snapshot the reconciler does; the caller must have already
-// evaluated the predicate, which --force does not skip.
-func (s *RedisSessionStore) ForceAdvanceRollout(ctx context.Context, decision RolloutAdvanceDecision, registry *WriterRegistry) error {
-	if !decision.Allowed {
-		return errors.New("auth: refusing to force an advance the predicate did not allow")
-	}
-	if err := s.recordRolloutAdvance(ctx, decision, "operator", registry); err != nil {
-		return err
-	}
-	if err := s.AdvanceRolloutControl(ctx, decision.Target, decision.MaxPerUID); err != nil {
+// ForceAdvanceRollout is the operator fault channel, for when the reconciler
+// itself is broken. The caller must have already evaluated the predicate, which
+// --force does not skip.
+//
+// markers is required for the same reason the reconciler requires it: see
+// advanceFloor. Passing nil here is what the CLI used to do, and it produced a
+// floor with no marker — the one state that resolves DOWNWARD after a Redis
+// loss.
+func (s *RedisSessionStore) ForceAdvanceRollout(
+	ctx context.Context,
+	decision RolloutAdvanceDecision,
+	registry *WriterRegistry,
+	markers *RolloutMarkerStore,
+) error {
+	if err := s.advanceFloor(ctx, decision, "operator", registry, markers); err != nil {
 		return err
 	}
 	metrics.ObserveSessionFloorAdvance(string(decision.Target), "operator")
 	return nil
+}
+
+// advanceFloor is the ONLY path that moves the floor. Both the reconciler and
+// `advance --force` go through it, so the preconditions cannot be lost by a
+// caller that forgets one — which is exactly how the operator path shipped
+// without the marker stamp while the reconciler path had it.
+//
+// Order is the requirement, not atomicity:
+//
+//  1. the marker, because a floor that exists without one reads as "never
+//     initialised" after a Redis loss and resolves DOWN to expand — a marker
+//     with no floor is merely strict, a floor with no marker is a fail-open;
+//  2. the evidence snapshot, because an advance with no record cannot be
+//     audited, while a record with no advance is harmless;
+//  3. the CAS.
+//
+// Each step's failure stops the next, so the two harmless orderings are the
+// only ones reachable.
+func (s *RedisSessionStore) advanceFloor(
+	ctx context.Context,
+	decision RolloutAdvanceDecision,
+	actor string,
+	registry *WriterRegistry,
+	markers *RolloutMarkerStore,
+) error {
+	if !decision.Allowed {
+		return errors.New("auth: refusing to advance a floor the predicate did not allow")
+	}
+	if markers == nil {
+		return errors.New("auth: refusing to advance without an initialisation marker store")
+	}
+	if err := markers.StampOnce(ctx, decision.Target); err != nil {
+		return fmt.Errorf("auth: refusing to advance without an initialisation marker: %w", err)
+	}
+	if err := s.recordRolloutAdvance(ctx, decision, actor, registry); err != nil {
+		return err
+	}
+	return s.AdvanceRolloutControl(ctx, decision.Target, decision.MaxPerUID)
 }

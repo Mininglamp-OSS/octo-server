@@ -209,8 +209,11 @@ func runAPI(ctx *config.Context) {
 	// process from starting, ten lines after the code that exists to prevent
 	// exactly that. The resolved boot state is the authority for the log line.
 	sessionBoot, sessionWarnings := auth.SessionBootForContext(ctx)
+	// expand is a running mode, never a floor — the first floor a deployment can
+	// persist is v3-write, and every floor above it writes v3 too. Testing for it
+	// here was dead and made "none" look like it had a third case.
 	rolloutFloor := "none"
-	if sessionBoot.Floor.WritesV3() || sessionBoot.Floor == auth.SessionModeExpand {
+	if sessionBoot.Floor.WritesV3() {
 		rolloutFloor = string(sessionBoot.Floor)
 	}
 	route.SetTokenParser(auth.NewCacheTokenParser(

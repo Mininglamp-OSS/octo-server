@@ -137,6 +137,19 @@ func (r *WriterRegistry) Join(ctx context.Context, build, pod, appliedState stri
 
 // SetAppliedState records that this process has applied a new rollout state.
 // The gate reads it to prove the fleet has converged before advancing.
+// SetAppliedStateIfChanged skips the Redis round trip when nothing moved. The
+// applied mode changes a handful of times across an entire rollout, while the
+// poller runs every five seconds.
+func (r *WriterRegistry) SetAppliedStateIfChanged(state string) {
+	r.mu.RLock()
+	unchanged := r.self.AppliedState == state
+	r.mu.RUnlock()
+	if unchanged {
+		return
+	}
+	r.SetAppliedState(state)
+}
+
 func (r *WriterRegistry) SetAppliedState(state string) {
 	r.mu.Lock()
 	r.self.AppliedState = state

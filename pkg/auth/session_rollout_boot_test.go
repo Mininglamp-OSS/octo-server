@@ -519,6 +519,14 @@ func TestObserveAndMigrateAgreeOnPayloadVersions(t *testing.T) {
 	require.NoError(t, client.Set(store.tokenKey("real-v1-role"), `u2@Bob@admin`, time.Hour).Err())
 	require.NoError(t, client.Set(store.tokenKey("real-v2"), `v2:{"uid":"u3"}`, time.Hour).Err())
 	require.NoError(t, client.Set(store.tokenKey("corrupt"), "\x00\x01not-a-token", time.Hour).Err())
+	// A prefix is not proof of decodability. Each of these carries a real
+	// version prefix and is still rejected by Decode, which is the case that
+	// classifying on the three prefix bytes alone got wrong.
+	require.NoError(t, client.Set(store.tokenKey("v2-not-json"), `v2:long`, time.Hour).Err())
+	require.NoError(t, client.Set(store.tokenKey("v2-no-uid"), `v2:{"name":"nobody"}`, time.Hour).Err())
+	require.NoError(t, client.Set(store.tokenKey("v2-uid-empty"), `v2:{"uid":""}`, time.Hour).Err())
+	require.NoError(t, client.Set(store.tokenKey("v2-uid-number"), `v2:{"uid":7}`, time.Hour).Err())
+	require.NoError(t, client.Set(store.tokenKey("v3-array"), `v3:[1,2]`, time.Hour).Err())
 
 	observation, err := store.ObserveRateLimited(ctx, 100, 0)
 	require.NoError(t, err)
@@ -536,7 +544,46 @@ func TestObserveAndMigrateAgreeOnPayloadVersions(t *testing.T) {
 	require.Equal(t, observation.DecodeInvalid, result.InvalidPayload,
 		"decode_invalid and invalid_payload must be the same number")
 	require.Equal(t, int64(2), result.V1)
-	require.Equal(t, int64(1), result.InvalidPayload)
+	require.Equal(t, int64(1), result.V2)
+	require.Equal(t, int64(0), result.V3)
+	require.Equal(t, int64(6), result.InvalidPayload,
+		"one unprefixed corruption plus five prefixed-but-undecodable records")
+}
+
+// The parity above is exact for everything a writer can produce. It is not
+// unlimited, and the boundary is worth pinning rather than discovering: migrate
+// mirrors decodeV2 exactly but stops short of decodeV3's lifetime, generation
+// and revision checks, so a v3 body that parses with a uid and fails those is
+// counted v3 by migrate and decode_invalid by observe.
+//
+// This costs nothing today. EncodeV3 enforces all five checks before a value is
+// ever stored, so such a record cannot be written — it can only arrive by
+// corruption — and no rollout gate reads the v3 count. If that ever changes, the
+// fix is to mirror the remaining checks in the Lua, and this test is what will
+// say so.
+func TestObserveAndMigrateDivergeOnlyOnUnwritableV3Bodies(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+
+	_, err := EncodeV3(TokenInfo{UID: "u1", Name: "u1"})
+	require.Error(t, err, "the writer refuses the very shape this test injects")
+	require.NoError(t, client.Set(store.tokenKey("v3-no-lifetime"), `v3:{"uid":"u1"}`, time.Hour).Err())
+
+	observation, err := store.ObserveRateLimited(ctx, 100, 0)
+	require.NoError(t, err)
+	result, err := store.MigrateLegacySessions(ctx, LegacyMigrationOptions{
+		CampaignID:   "v3-divergence",
+		CutoffAt:     time.Now().UTC().Add(time.Hour),
+		FinitePolicy: LegacyFinitePolicyNatural,
+		BatchSize:    100,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, int64(1), observation.DecodeInvalid, "observe applies decodeV3 in full")
+	require.Equal(t, int64(1), result.V3, "migrate stops at prefix + json object + uid")
+	require.Equal(t, int64(0), result.InvalidPayload)
+	require.Equal(t, int64(0), observation.V1+observation.V2, "no gate input is affected")
+	require.Equal(t, int64(0), result.V1+result.V2)
 }
 
 // A16: migrate leaves an undecodable record alone rather than mutating
@@ -563,4 +610,116 @@ func TestMigrateSkipsUndecodablePayloads(t *testing.T) {
 	require.Equal(t, int64(0), result.Deleted)
 	require.Equal(t, -time.Millisecond, mustPTTL(t, client, store.tokenKey("corrupt")),
 		"an undecodable record is left exactly as it was")
+}
+
+// A17: every path that moves the floor stamps the initialisation marker first.
+//
+// The reconciler did this and the operator fault channel did not, which is the
+// worst possible split: --force is used precisely when the reconciler is broken,
+// so the one command an operator reaches for in an incident was the one that
+// left the deployment in the single state that resolves DOWNWARD after a Redis
+// loss — a floor with no marker reads as "never initialised" and boots at
+// expand, which stops checking legacy deny markers.
+func TestEveryFloorAdvancePathStampsTheMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		actor   string
+		advance func(t *testing.T, store *RedisSessionStore, registry *WriterRegistry, markers *RolloutMarkerStore, decision RolloutAdvanceDecision) error
+	}{
+		{
+			name:  "reconciler",
+			actor: "reconciler",
+			advance: func(t *testing.T, store *RedisSessionStore, registry *WriterRegistry, markers *RolloutMarkerStore, decision RolloutAdvanceDecision) error {
+				r := NewRolloutReconciler(store, ReconcilerOptions{Registry: registry, Markers: markers, MaxPerUID: 20})
+				return r.advance(context.Background(), decision, "reconciler")
+			},
+		},
+		{
+			name:  "advance --force",
+			actor: "operator",
+			advance: func(t *testing.T, store *RedisSessionStore, registry *WriterRegistry, markers *RolloutMarkerStore, decision RolloutAdvanceDecision) error {
+				return store.ForceAdvanceRollout(context.Background(), decision, registry, markers)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+			registry := NewWriterRegistry(client, store.uidTokenPrefix)
+			t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+			markers := newMarkerStoreForTest(t)
+
+			before, err := markers.Load(ctx)
+			require.NoError(t, err)
+			require.Nil(t, before, "the fixture starts with no marker")
+
+			decision := RolloutAdvanceDecision{
+				Current: SessionModeExpand, Target: SessionModeV3Write, Allowed: true, MaxPerUID: 20,
+			}
+			require.NoError(t, tc.advance(t, store, registry, markers, decision))
+
+			control, err := store.RolloutControl(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, control)
+			require.Equal(t, SessionModeV3Write, control.ModeFloor)
+
+			marker, err := markers.Load(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, marker, "a floor must never exist without a marker")
+			require.Equal(t, SessionModeV3Write, marker.InitializedFloor)
+
+			record, err := store.LastRolloutAdvance(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, record)
+			require.Equal(t, tc.actor, record.Actor)
+		})
+	}
+}
+
+// A18: with no marker store at all, neither path writes a floor. Skipping the
+// stamp because the store is absent is the fail-open the ordering exists to
+// prevent, so absence has to be refused rather than tolerated.
+func TestFloorAdvanceIsRefusedWithoutAMarkerStore(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+	decision := RolloutAdvanceDecision{
+		Current: SessionModeExpand, Target: SessionModeV3Write, Allowed: true, MaxPerUID: 20,
+	}
+
+	require.ErrorContains(t, store.ForceAdvanceRollout(ctx, decision, registry, nil), "initialisation marker store")
+
+	r := NewRolloutReconciler(store, ReconcilerOptions{Registry: registry, MaxPerUID: 20})
+	require.ErrorContains(t, r.advance(ctx, decision, "reconciler"), "initialisation marker store")
+
+	control, err := store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.Nil(t, control, "a refused advance must leave no floor behind")
+}
+
+// A19: a decision the predicate rejected cannot be written by either path. This
+// is what makes --force a bypass of the RECONCILER and not of the gate.
+func TestFloorAdvanceRefusesADisallowedDecision(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+	markers := newMarkerStoreForTest(t)
+
+	blocked := RolloutAdvanceDecision{
+		Current:   SessionModeExpand,
+		Target:    SessionModeV3Write,
+		Allowed:   false,
+		BlockedBy: []string{"no live writers registered"},
+		MaxPerUID: 20,
+	}
+	require.ErrorContains(t, store.ForceAdvanceRollout(ctx, blocked, registry, markers), "predicate did not allow")
+
+	control, err := store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.Nil(t, control)
+	marker, err := markers.Load(ctx)
+	require.NoError(t, err)
+	require.Nil(t, marker, "a refused advance stamps nothing either")
 }

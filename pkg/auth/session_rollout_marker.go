@@ -27,7 +27,11 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-const rolloutMarkerTable = "octo_session_rollout_marker"
+const defaultRolloutMarkerTable = "octo_session_rollout_marker"
+
+// rolloutMarkerTable is a var only so a test can simulate "the migration has
+// not run yet" without dropping a table the whole test database shares.
+var rolloutMarkerTable = defaultRolloutMarkerTable
 
 // defaultRecoveryMaxPerUID bounds sessions when no cap can be recovered from
 // the floor record or the deprecated environment. A cap is an upper bound: too
@@ -248,12 +252,34 @@ func applyBootOverrides(boot *RolloutBoot, legacyMode SessionMode, legacyMaxPerU
 		}
 		boot.Mode = legacyMode
 	}
+	// Defaulted unconditionally, not just for a mode that already writes v3.
+	// A process that boots at expand has no cap either, and the floor rises
+	// under it minutes later — at which point the reconciler asks for a cap
+	// nobody has and blocks on "max_per_uid is not configured" forever. Boot
+	// cannot know which mode this process will end up running.
 	if boot.MaxPerUID <= 0 {
 		boot.MaxPerUID = legacyMaxPerUID
 	}
-	if boot.MaxPerUID <= 0 && boot.Mode.writesV3() {
+	if boot.MaxPerUID <= 0 {
 		boot.MaxPerUID = defaultRecoveryMaxPerUID
 	}
+}
+
+// StrictRolloutBoot is what a caller uses when resolution itself failed. It
+// goes through the same overrides as every other outcome: hand-building the
+// struct at the call site skipped the cap fallback and produced enforce with no
+// cap, which fences every login permanently and writes no floor to recover
+// from.
+func StrictRolloutBoot(reason error, legacyMode SessionMode, legacyMaxPerUID int) RolloutBoot {
+	boot := RolloutBoot{
+		Outcome: RolloutBootRecovered,
+		Floor:   SessionModeEnforce,
+		Mode:    SessionModeEnforce,
+	}
+	applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
+	boot.Warning = fmt.Sprintf(
+		"session rollout state unresolvable at boot (%v); resolving upward to %s", reason, boot.Mode)
+	return boot
 }
 
 func firstPositive(values ...int) int {

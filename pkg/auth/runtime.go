@@ -98,8 +98,7 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		// floor is resolved inside ResolveRolloutBoot. Without the marker we
 		// cannot tell "never initialised" from "lost it", and guessing the
 		// wrong way re-admits revoked legacy bearers, so take the strict side.
-		boot = RolloutBoot{Outcome: RolloutBootRecovered, Mode: SessionModeEnforce, MaxPerUID: policy.legacyMaxPerUID}
-		boot.Warning = fmt.Sprintf("session rollout marker unreadable at boot (%v); resolving upward to %s", err, boot.Mode)
+		boot = StrictRolloutBoot(err, policy.legacyMode, policy.legacyMaxPerUID)
 	}
 	boot.AutoAdvance = policy.autoAdvance
 	boot.CanaryAhead = policy.canaryAhead
@@ -127,11 +126,29 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 			boot.Warning = strings.TrimSpace(boot.Warning +
 				" the floor reappeared before recovery could write; keeping the persisted value")
 		}
+		// Floor is what the startup log line and `session-rollout status` report,
+		// so it has to say what Redis holds rather than what recovery intended.
+		// Neither non-success branch above leaves enforce persisted: a failed
+		// write leaves no floor at all, and a lost race leaves whatever
+		// reappeared. Reporting enforce in either case tells an operator the
+		// recovery landed when it did not.
+		boot.Floor = persistedFloor(bootCtx, store)
 	}
 
 	runtime := &sessionRuntime{store: store, client: client, boot: boot, policy: policy}
 	ctx.SetValue(runtime, sessionRuntimeContextKey)
 	return store, client
+}
+
+// persistedFloor reports the floor Redis actually holds, with an unreadable or
+// absent record collapsing to the empty mode. Only recovery reporting uses it;
+// the running mode comes from store.Mode() and is never re-derived here.
+func persistedFloor(ctx context.Context, store *RedisSessionStore) SessionMode {
+	control, err := store.RolloutControl(ctx)
+	if err != nil || control == nil {
+		return ""
+	}
+	return control.ModeFloor
 }
 
 // SessionBootForContext exposes what boot resolved, for the startup log line
