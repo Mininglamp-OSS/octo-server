@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -393,12 +393,12 @@ func TestDeleteApply(t *testing.T) {
 // This verifies the fix for issue #542 - unsafe type assertion panic risk
 func TestParseFriendApplyData(t *testing.T) {
 	tests := []struct {
-		name           string
-		data           map[string]interface{}
-		expectFromUID  string
-		expectVercode  string
-		expectRemark   string
-		expectFromOK   bool
+		name            string
+		data            map[string]interface{}
+		expectFromUID   string
+		expectVercode   string
+		expectRemark    string
+		expectFromOK    bool
 		expectVercodeOK bool
 	}{
 		{

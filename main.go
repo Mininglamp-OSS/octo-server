@@ -203,15 +203,15 @@ func runAPI(ctx *config.Context) {
 		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
 	}
 	probeCancel()
-	rolloutCtx, rolloutCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	rolloutControl, err := tokenStore.RolloutControl(rolloutCtx)
-	rolloutCancel()
-	if err != nil {
-		panic(fmt.Errorf("read authentication session rollout floor: %w", err))
-	}
+	// Deliberately NOT re-reading the floor here. This used to panic on any read
+	// error, which defeated the whole point of resolving the boot state without
+	// failing: a corrupt record or a momentary Redis hiccup still stopped the
+	// process from starting, ten lines after the code that exists to prevent
+	// exactly that. The resolved boot state is the authority for the log line.
+	sessionBoot, sessionWarnings := auth.SessionBootForContext(ctx)
 	rolloutFloor := "none"
-	if rolloutControl != nil {
-		rolloutFloor = string(rolloutControl.ModeFloor)
+	if sessionBoot.Floor.WritesV3() || sessionBoot.Floor == auth.SessionModeExpand {
+		rolloutFloor = string(sessionBoot.Floor)
 	}
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
@@ -309,7 +309,6 @@ func runAPI(ctx *config.Context) {
 	// The reconciler is started here and nowhere else. Starting it from the
 	// store constructor would spawn a floor-advancing goroutine in every test
 	// that happens to build a store.
-	sessionBoot, sessionWarnings := auth.SessionBootForContext(ctx)
 	metrics.SetSessionRolloutBootOutcome(string(sessionBoot.Outcome))
 	for _, warning := range sessionWarnings {
 		log.Warn("session rollout config: " + warning)
@@ -317,12 +316,19 @@ func runAPI(ctx *config.Context) {
 	if sessionBoot.Warning != "" {
 		log.Warn("session rollout: " + sessionBoot.Warning)
 	}
+	// Cancelled after svc.Run returns, so the registry drops its roster entry on
+	// a clean shutdown instead of holding a slot for a full lease TTL — during
+	// which the convergence gate would count a terminated pod as a live writer.
+	sessionRolloutCtx, stopSessionRollout := context.WithCancel(context.Background())
 	writerRegistry := auth.NewWriterRegistry(sessionRedis, ctx.GetConfig().Cache.UIDTokenCachePrefix)
 	if err := writerRegistry.Join(
-		context.Background(),
+		sessionRolloutCtx,
 		ctx.GetConfig().Version,
 		os.Getenv("POD_NAME"),
-		string(sessionBoot.Floor),
+		// The APPLIED mode, not the resolved one. Advertising a mode this
+		// replica is not running lets the convergence gate be satisfied by a
+		// replica that has not converged.
+		string(tokenStore.Mode()),
 		nil,
 	); err != nil {
 		// Not fatal: a replica that cannot take a lease refuses to create new
@@ -333,14 +339,14 @@ func runAPI(ctx *config.Context) {
 	tokenStore.UseWriterLease(writerRegistry)
 	reconciler := auth.NewRolloutReconciler(tokenStore, auth.ReconcilerOptions{
 		Registry:      writerRegistry,
-		Markers:       auth.NewRolloutMarkerStore(ctx.DB()),
+		Markers:       sessionMarkerStore(ctx),
 		AutoAdvance:   sessionBoot.AutoAdvance,
 		CanaryAhead:   sessionBoot.CanaryAhead,
 		ExpectWriters: sessionBoot.ExpectWriters,
 		MaxPerUID:     sessionBoot.MaxPerUID,
 		Log:           func(format string, args ...interface{}) { log.Info(fmt.Sprintf(format, args...)) },
 	})
-	go reconciler.Run(context.Background())
+	go reconciler.Run(sessionRolloutCtx)
 
 	fmt.Printf(
 		"Authentication session runtime: mode=%s rollout_floor=%s boot=%s auto_advance=%t redis=%s instance=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
@@ -536,6 +542,7 @@ func runAPI(ctx *config.Context) {
 
 	// 运行: 阻塞直到 go-svc 收到 SIGINT/SIGTERM 并完成业务 Stop。
 	err = svc.Run(s)
+	stopSessionRollout()
 	cardActionRuntime.Stop()
 
 	// 业务停下后再 graceful shutdown metrics scrape 端点 — 时序上避开和 go-svc
@@ -952,6 +959,24 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	return registry
 }
 
+// sessionMarkerStore mirrors the guard the auth runtime already applies, so a
+// nil DB degrades the same way in both places instead of panicking in one.
+func sessionMarkerStore(ctx *config.Context) *auth.RolloutMarkerStore {
+	if db := ctx.DB(); db != nil {
+		return auth.NewRolloutMarkerStore(db)
+	}
+	return nil
+}
+
+// shortFingerprint truncates safely: the production path is 64 hex characters,
+// but an injected identity function need not be.
+func shortFingerprint(id string) string {
+	if len(id) <= 16 {
+		return id
+	}
+	return id[:16]
+}
+
 // sessionRedisInstanceLabel resolves the Redis process identity for the startup
 // line. Config-derived identity cannot distinguish two endpoints, so the
 // startup log states which Redis this replica actually reached.
@@ -960,5 +985,5 @@ func sessionRedisInstanceLabel(store *auth.RedisSessionStore) string {
 	if err != nil {
 		return "unknown"
 	}
-	return id[:16]
+	return shortFingerprint(id)
 }

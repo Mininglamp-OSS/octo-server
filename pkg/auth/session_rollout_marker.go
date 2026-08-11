@@ -21,12 +21,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gocraft/dbr/v2"
 )
 
 const rolloutMarkerTable = "octo_session_rollout_marker"
+
+// defaultRecoveryMaxPerUID bounds sessions when no cap can be recovered from
+// the floor record or the deprecated environment. A cap is an upper bound: too
+// low means a few users hit it, too high means a weaker bound. Neither is the
+// class of regression this path guards against, whereas refusing to apply the
+// recovered mode leaves the process in a LOWER one, which is.
+const defaultRecoveryMaxPerUID = 20
 
 // RolloutMarker records that this deployment has initialised (or adopted) a
 // rollout floor at least once. It is write-once: initialized_floor is the value
@@ -146,66 +154,91 @@ func ResolveRolloutBoot(
 	}
 	control, controlErr := store.RolloutControl(ctx)
 
+	// The marker is consulted ONLY when the floor cannot answer. When the floor
+	// read succeeds there is nothing to disambiguate, and letting a marker error
+	// veto a floor we already read is how the first boot of this artifact ended
+	// up denying every legacy session: the marker table is created by a
+	// modules/user migration that runs several hundred lines after the session
+	// store is built, so on that boot it does not exist yet.
+	if controlErr == nil && control != nil {
+		boot := RolloutBoot{
+			Outcome:   RolloutBootNormal,
+			Floor:     control.ModeFloor,
+			Mode:      control.ModeFloor,
+			MaxPerUID: control.MaxPerUID,
+		}
+		// Best effort, and cosmetic: it only picks the metric label. Stamping is
+		// the reconciler's job so it can be retried once the table exists.
+		if markers != nil {
+			if marker, err := markers.Load(ctx); err != nil || marker == nil {
+				boot.Outcome = RolloutBootAdopted
+			}
+		} else {
+			boot.Outcome = RolloutBootAdopted
+		}
+		applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
+		return boot, nil
+	}
+
 	var marker *RolloutMarker
 	if markers != nil {
-		var markerErr error
-		marker, markerErr = markers.Load(ctx)
-		if markerErr != nil {
+		loaded, markerErr := markers.Load(ctx)
+		switch {
+		case markerErr == nil:
+			marker = loaded
+		case isMissingMarkerTable(markerErr):
+			// Literally true rather than a workaround: with no table, no marker
+			// was ever stamped, so this deployment never recorded an
+			// initialisation.
+			marker = nil
+		default:
+			// The floor could not answer and neither can the marker, so nothing
+			// can be decided safely. MySQL is already a hard boot dependency
+			// (migrations run during startup), so this resolves itself or the
+			// process does not come up at all.
 			return RolloutBoot{}, markerErr
 		}
 	}
 
-	// An unreadable control record is handled exactly like a missing one, and
-	// the marker decides which way it resolves. Falling back to expand here
-	// would be a fail-OPEN: expand does not consult legacy deny markers
-	// (checksLegacyDeny requires v3-write or above), so a transient Redis error
-	// on a revoke-floor deployment would let already-revoked legacy bearers
-	// back in. Resolving upward is invariant 6, and it applies to "cannot read"
-	// just as much as to "not there".
-	if controlErr != nil {
-		if marker == nil {
-			// Never initialised: there is nothing to protect, and expand is the
-			// behaviour this deployment already had.
-			return RolloutBoot{
-				Outcome: RolloutBootFresh,
-				Mode:    SessionModeExpand,
-				Warning: fmt.Sprintf("session rollout floor unreadable (%v) and no floor was ever established; holding at %s", controlErr, SessionModeExpand),
-			}, nil
-		}
-		return RolloutBoot{
-			Outcome:   RolloutBootRecovered,
-			Floor:     SessionModeEnforce,
-			Mode:      SessionModeEnforce,
-			MaxPerUID: legacyMaxPerUID,
-			Warning:   fmt.Sprintf("session rollout floor unreadable (%v) but this deployment established one; resolving upward to enforce rather than loosening", controlErr),
-		}, nil
-	}
-
-	boot := RolloutBoot{Mode: SessionModeExpand}
+	boot := RolloutBoot{}
 	switch {
-	case marker == nil && control == nil:
+	case marker == nil:
+		// Never initialised: nothing to protect, and expand is what this
+		// deployment already had.
 		boot.Outcome = RolloutBootFresh
-	case marker == nil && control != nil:
-		boot.Outcome = RolloutBootAdopted
-		boot.Floor = control.ModeFloor
-		boot.Mode = control.ModeFloor
-		boot.MaxPerUID = control.MaxPerUID
-	case marker != nil && control == nil:
+		boot.Mode = SessionModeExpand
+		if controlErr != nil {
+			boot.Warning = fmt.Sprintf(
+				"session rollout floor unreadable (%v) and no floor was ever established; holding at %s",
+				controlErr, SessionModeExpand)
+		}
+	default:
 		boot.Outcome = RolloutBootRecovered
 		boot.Floor = SessionModeEnforce
 		boot.Mode = SessionModeEnforce
+		// The cap has to survive the loss of the floor that carried it. Falling
+		// back to zero here made recovery unappliable, which left the process at
+		// expand — the fail-open this whole path exists to prevent.
+		boot.MaxPerUID = firstPositive(legacyMaxPerUID, defaultRecoveryMaxPerUID)
+		reason := "is missing"
+		if controlErr != nil {
+			reason = fmt.Sprintf("is unreadable (%v)", controlErr)
+		}
 		boot.Warning = fmt.Sprintf(
-			"session rollout floor is missing but this deployment initialised one at %s; "+
+			"session rollout floor %s but this deployment initialised one at %s; "+
 				"treating it as Redis data loss and resolving upward to enforce",
-			marker.InitializedAt.UTC().Format(time.RFC3339))
-	default:
-		boot.Outcome = RolloutBootNormal
-		boot.Floor = control.ModeFloor
-		boot.Mode = control.ModeFloor
-		boot.MaxPerUID = control.MaxPerUID
+			reason, marker.InitializedAt.UTC().Format(time.RFC3339))
 	}
+	applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
+	return boot, nil
+}
 
-	// §3.5②: never loosen on upgrade.
+// applyBootOverrides carries the deprecated environment forward.
+func applyBootOverrides(boot *RolloutBoot, legacyMode SessionMode, legacyMaxPerUID int) {
+	// §3.5②: never loosen on upgrade. #725 requires running one phase above the
+	// floor and confirming before advancing, so a deployment in Phase D sits at
+	// bounded on a revoke floor; deriving purely from the floor would drop that
+	// reader back to revoke.
 	if legacyMode.valid() && legacyMode.rank() > boot.Mode.rank() {
 		if boot.Warning == "" {
 			boot.Warning = fmt.Sprintf(
@@ -215,12 +248,31 @@ func ResolveRolloutBoot(
 		}
 		boot.Mode = legacyMode
 	}
-
-	// §3.5③: the cap moves from env into the control record. A deployment at
-	// v3-write or above necessarily has the env set, because #725's policy
-	// refused to start without it, so this one-time carry cannot come up empty.
 	if boot.MaxPerUID <= 0 {
 		boot.MaxPerUID = legacyMaxPerUID
 	}
-	return boot, nil
+	if boot.MaxPerUID <= 0 && boot.Mode.writesV3() {
+		boot.MaxPerUID = defaultRecoveryMaxPerUID
+	}
+}
+
+func firstPositive(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// isMissingMarkerTable reports the "table does not exist" case, which is the
+// state of every database on the first boot of this artifact.
+func isMissingMarkerTable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "Error 1146") ||
+		strings.Contains(message, "doesn't exist") ||
+		strings.Contains(message, "does not exist")
 }

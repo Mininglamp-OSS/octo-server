@@ -3,10 +3,10 @@ package auth
 // Characterization of the rollout control-plane rules that MUST SURVIVE the
 // token-session-rollout-simplify redesign (.octospec/tasks/…/brief.md).
 //
-// Deliberately the mirror image of session_rollout_legacy_behavior_test.go:
-// those tripwires pin behaviour the redesign REMOVES and are expected to go red,
-// while everything here must stay green before and after. If a refactor makes
-// one of these fail, the refactor is wrong, not the test.
+// Everything here must stay green before and after the redesign. If a refactor
+// makes one of these fail, the refactor is wrong, not the test. The behaviour
+// the redesign REMOVES is asserted in its inverted form by
+// session_rollout_boot_test.go and session_rollout_wiring_test.go.
 
 import (
 	"context"
@@ -87,7 +87,9 @@ func TestRolloutControlAdvanceIsSingleWinnerUnderConcurrency(t *testing.T) {
 		case errors.Is(err, ErrRolloutControlChanged):
 			casConflicts++
 		default:
-			require.ErrorContains(t, err, "advance exactly one phase",
+			// Sentinels, not message substrings: renaming an error must not turn
+			// a benign race into an alert or mask a real one-phase violation.
+			require.ErrorIs(t, err, ErrRolloutFloorNotNext,
 				"a loser must fail closed, with either the CAS conflict or the pre-check")
 			precheckRejects++
 		}

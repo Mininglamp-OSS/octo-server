@@ -59,7 +59,22 @@ func (s *RedisSessionStore) loadMigrationCompletionEvidence() (migrationCompleti
 	return evidence, nil
 }
 
+// rolloutObservationScopeFingerprint identifies the scope an observation
+// covers. It now includes the Redis instance: without it, two genuinely
+// different endpoints reached with one config produced byte-identical
+// fingerprints, which is how a misplaced config key once sent a tool to the
+// wrong Redis without a word of complaint. Instance identity is best effort —
+// a proxy that hides INFO, or a failover, must degrade rather than break — so
+// an unavailable id falls back to the config-only scope.
 func (s *RedisSessionStore) rolloutObservationScopeFingerprint() string {
+	instance, err := s.currentRedisInstanceID()
+	if err != nil {
+		instance = ""
+	}
+	return s.scopeFingerprintWithInstance(instance)
+}
+
+func (s *RedisSessionStore) scopeFingerprintWithInstance(instance string) string {
 	encoded := strconv.AppendQuote(nil, "token-session-observation/v1")
 	encoded = append(encoded, '\n')
 	encoded = strconv.AppendQuote(encoded, s.tokenPrefix)
@@ -67,6 +82,8 @@ func (s *RedisSessionStore) rolloutObservationScopeFingerprint() string {
 	encoded = strconv.AppendQuote(encoded, s.uidTokenPrefix)
 	encoded = append(encoded, '\n')
 	encoded = strconv.AppendInt(encoded, s.maxTTL.Milliseconds(), 10)
+	encoded = append(encoded, '\n')
+	encoded = strconv.AppendQuote(encoded, instance)
 	sum := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", sum[:])
 }

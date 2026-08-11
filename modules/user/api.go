@@ -1969,6 +1969,16 @@ func (u *User) reloadUserAfterIssueFence(ctx context.Context, uid string) (*Mode
 	return user, nil
 }
 
+// canIssueUserSession lets a caller fail before a destructive step rather than
+// after it. Stores that do not expose the check (test doubles) are permissive,
+// because the real gate still runs inside the issue call.
+func canIssueUserSession(store userSessionStore) error {
+	if gated, ok := store.(interface{ CanIssue() error }); ok {
+		return gated.CanIssue()
+	}
+	return nil
+}
+
 func issueUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) error {
 	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
 		return v3Store.IssueNewSession(ctx, token, info, fence)
@@ -2039,6 +2049,12 @@ func (u *User) compensateIssuedToken(token, uid string, deviceFlag int) error {
 // concurrent-issuance serialization remains part of the v3 generation/CAS
 // release described by the task brief.
 func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) error {
+	// Checked before the delete below, not just inside IssueNew. Revoking first
+	// and discovering afterwards that this replica may not issue turns a
+	// refused login into a logout.
+	if err := canIssueUserSession(u.sessionStore); err != nil {
+		return err
+	}
 	oldToken, err := u.sessionStore.DeviceToken(ctx, uid, int(config.APP))
 	if err != nil {
 		return fmt.Errorf("load previous APP token: %w", err)
@@ -2055,6 +2071,9 @@ func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) 
 }
 
 func (u *User) replaceAPPTokenSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) error {
+	if err := canIssueUserSession(u.sessionStore); err != nil {
+		return err
+	}
 	oldToken, err := u.sessionStore.DeviceToken(ctx, info.UID, int(config.APP))
 	if err != nil {
 		return fmt.Errorf("load previous APP token: %w", err)

@@ -35,7 +35,15 @@ return 1
 `)
 )
 
-var ErrRolloutControlChanged = errors.New("auth: session rollout control changed concurrently")
+var (
+	ErrRolloutControlChanged = errors.New("auth: session rollout control changed concurrently")
+	// ErrRolloutFloorNotNext and ErrRolloutFirstFloor are the pre-check's half of
+	// a lost race: a racer that read AFTER the winner wrote is rejected here
+	// rather than at the CAS. Sentinels rather than error strings, so renaming a
+	// message cannot turn a benign race into an alert or mask a real violation.
+	ErrRolloutFloorNotNext = errors.New("auth: rollout floor must advance exactly one phase")
+	ErrRolloutFirstFloor   = errors.New("auth: first rollout floor must be v3-write")
+)
 
 // SessionRolloutControl is the floor record. It stays in Redis under a Lua CAS
 // (see session_rollout_marker.go for why it is not moved to MySQL).
@@ -53,19 +61,27 @@ type SessionRolloutControl struct {
 	MaxPerUID           int         `json:"max_per_uid,omitempty"`
 }
 
-// RecoverRolloutControlAtEnforce re-establishes a floor record that Redis lost,
-// at enforce. It is guarded by the caller having seen the MySQL marker: without
-// that proof this would be indistinguishable from a fresh install, where the
-// same write would log every user out.
+// RecoverRolloutControlAtEnforce rebuilds a floor record that Redis lost or
+// corrupted, at enforce. The caller must have seen the MySQL marker: without
+// that proof this is indistinguishable from a fresh install, where the same
+// write would log every user out.
 //
-// SET NX, so concurrently booting replicas converge on one record and a floor
-// that reappeared in the meantime always wins.
-func (s *RedisSessionStore) RecoverRolloutControlAtEnforce(ctx context.Context, maxPerUID int) error {
+// A plain SET NX was not enough. A corrupt record still occupies the key, so
+// NX left it in place and "recovery" reported success while the floor stayed
+// unreadable. Read first: an absent or unreadable record is replaced, a valid
+// one that reappeared always wins and is reported as such.
+func (s *RedisSessionStore) RecoverRolloutControlAtEnforce(ctx context.Context, maxPerUID int) (recovered bool, err error) {
 	if maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit {
-		return errors.New("auth: rollout recovery requires a bounded max sessions per UID")
+		return false, errors.New("auth: rollout recovery requires a bounded max sessions per UID")
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
+	}
+	existing, raw, loadErr := s.loadRolloutControl(ctx)
+	if loadErr == nil && existing != nil {
+		// The floor came back on its own. It wins — recovery must never lower a
+		// readable floor, and must not claim to have done anything.
+		return false, nil
 	}
 	encoded, err := json.Marshal(SessionRolloutControl{
 		ModeFloor:     SessionModeEnforce,
@@ -73,10 +89,48 @@ func (s *RedisSessionStore) RecoverRolloutControlAtEnforce(ctx context.Context, 
 		MaxPerUID:     maxPerUID,
 	})
 	if err != nil {
-		return fmt.Errorf("auth: encode recovered rollout control: %w", err)
+		return false, fmt.Errorf("auth: encode recovered rollout control: %w", err)
 	}
-	if err := s.client.SetNX(s.rolloutControlKey(), string(encoded), 0).Err(); err != nil {
-		return fmt.Errorf("auth: recover rollout control: %w", err)
+	if loadErr != nil {
+		// Unreadable: read the byte payload directly so the CAS can replace
+		// exactly what was seen and nothing that arrived since.
+		current, getErr := s.client.Get(s.rolloutControlKey()).Result()
+		if getErr != nil && getErr != rd.Nil {
+			return false, fmt.Errorf("auth: read corrupt rollout control: %w", getErr)
+		}
+		raw = current
+	}
+	result, err := advanceRolloutControlScript.Run(s.client, []string{s.rolloutControlKey()}, raw, string(encoded)).Result()
+	if err != nil {
+		return false, fmt.Errorf("auth: recover rollout control: %w", err)
+	}
+	changed, err := redisInteger(result)
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// EnsureRolloutMaxPerUID writes a cap into a floor record that predates the
+// field. #725 records carry no cap, so without this the value only ever lives
+// in process memory and is lost on the next restart — after which a v3-writing
+// floor has no bound to apply. Idempotent and never lowers an existing cap.
+func (s *RedisSessionStore) EnsureRolloutMaxPerUID(ctx context.Context, maxPerUID int) error {
+	if maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit {
+		return nil
+	}
+	current, raw, err := s.loadRolloutControl(ctx)
+	if err != nil || current == nil || current.MaxPerUID >= maxPerUID {
+		return err
+	}
+	next := *current
+	next.MaxPerUID = maxPerUID
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return fmt.Errorf("auth: encode rollout control cap: %w", err)
+	}
+	if _, err := advanceRolloutControlScript.Run(s.client, []string{s.rolloutControlKey()}, raw, string(encoded)).Result(); err != nil {
+		return fmt.Errorf("auth: persist rollout control cap: %w", err)
 	}
 	return nil
 }
@@ -108,12 +162,12 @@ func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next Sess
 	observationMinGapMS := int64(0)
 	if current == nil {
 		if next != SessionModeV3Write {
-			return fmt.Errorf("auth: first rollout floor must be %s", SessionModeV3Write)
+			return fmt.Errorf("%w (got %s)", ErrRolloutFirstFloor, next)
 		}
 	} else {
 		observationMinGapMS = current.ObservationMinGapMS
 		if next.rank() != current.ModeFloor.rank()+1 {
-			return fmt.Errorf("auth: rollout floor must advance exactly one phase from %s", current.ModeFloor)
+			return fmt.Errorf("%w from %s (got %s)", ErrRolloutFloorNotNext, current.ModeFloor, next)
 		}
 		if maxPerUID <= 0 {
 			maxPerUID = current.MaxPerUID

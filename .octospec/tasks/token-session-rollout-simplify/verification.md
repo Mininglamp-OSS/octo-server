@@ -7,16 +7,18 @@
 | 文件 | 内容 | 改完应当 |
 |---|---|---|
 | `pkg/auth/session_rollout_invariants_test.go` | 必须存活的控制面规则 | **仍绿** |
-| `pkg/auth/session_rollout_legacy_behavior_test.go` | 被移除的缺陷行为（tripwire） | **翻红** |
+| `pkg/auth/session_rollout_boot_test.go` | 缺陷被移除后的行为（tripwire 的取反形式） | **绿** |
+| `pkg/auth/session_rollout_wiring_test.go` | 启动接线路径（review 发现的阻塞项全在这里） | **绿** |
 
-tripwire 默认 skip，编译但不运行——这样签名变更会打断构建而不是悄悄腐烂，
-同时绿色 CI 不依赖缺陷继续存在。
+原先还有一个 `session_rollout_legacy_behavior_test.go` 固定「改动前的缺陷行为」，
+它引用了本次删除的 `ValidateRolloutControl`——「翻红」会变成编译失败并拖垮整包，
+所以按 brief 的说法把断言取反并入上面两个文件，本文件保留原始测量结果。
 
 - 基线：`d68d0ad`（`main` + brief rev2），`pkg/auth` 生产代码未做任何改动
 - 环境：`redis-server` 6379（intended）+ 6380（wrong），`--save "" --appendonly no`；
   MySQL / WuKongIM **本次不需要**——`pkg/auth` 的 `newLegacyMigrationTestStore`
   只用 `config.New()` 的默认 Redis
-- 复现 tripwire：`OCTO_ROLLOUT_LEGACY_TRIPWIRES=1 go test ./pkg/auth/ -run TestTripwire -v -count=1`
+- 复现验收：`go test ./pkg/auth/ -run "TestWiring|TestBootResolves" -v -count=1`
 - 复现不变量：`go test ./pkg/auth/ -run 'TestRolloutFloor|TestRolloutControl|TestMigrationApplyStaysGated' -v -count=1`
 - 全量回归：`go test ./pkg/auth/ -count=1` → `ok`
 

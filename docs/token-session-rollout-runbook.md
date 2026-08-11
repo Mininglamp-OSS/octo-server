@@ -12,8 +12,10 @@
 ## 1. 它自己会做什么
 
 ```
-全新部署        部署制品。结束。floor 自动到达 enforce。
-有存量的部署    部署制品 → 自动推进到 v3 后停住，报告 blocked_by: v2=N
+全新部署        部署制品（配 EXPECT_WRITERS=<副本数>）。结束，floor 自动到 enforce。
+有存量的部署    部署制品 → 自动推进，然后停在第一个有存量的门禁上：
+                  有永久/超上限 legacy → 停在 revoke，报 persistent=N over_max=M
+                  只剩有限 legacy      → 停在 bounded，报 v1=N v2=M
                 → 你决定 cutoff 与 finite policy，跑一次 migrate
                 → 到期后自动推进到 enforce
 ```
@@ -28,7 +30,7 @@ floor 单调不可逆，永远只前进。每次推进前都会写下触发它�
 | 配置 | 说明 |
 |---|---|
 | `OCTO_AUTH_SESSION_AUTO_ADVANCE` | `1` 开启自动推进。**首个引入本能力的 release 请保持关闭**，见 §6 |
-| `OCTO_AUTH_SESSION_EXPECT_WRITERS` | 本部署计划运行的副本数。**只在"有存量 token 的环境首次建立 v3 floor"时需要**，推过之后即可删除 |
+| `OCTO_AUTH_SESSION_EXPECT_WRITERS` | 本部署计划运行的副本数。**首次建立 v3 floor 时必需**（无论 keyspace 是否为空——空只代表*此刻*没有存储，不代表没有未注册的旧副本），推过之后即可删除 |
 | `OCTO_AUTH_SESSION_CANARY_AHEAD` | `1` 让该副本比 floor 高一阶，用于灰度。打在小流量副本上 |
 | `OCTO_AUTH_SESSION_REDIS_POOL_SIZE` / `..._POOL_TIMEOUT` | 同 #725，未变 |
 | `TS_CACHE_TOKENEXPIRE` | 同 #725，未变 |
@@ -55,9 +57,14 @@ Authentication session runtime: mode=... rollout_floor=... boot=... auto_advance
 
 ```bash
 app session-rollout status     # 排查：floor 在哪、谁在跑、卡在什么上
+app session-rollout observe    # 只读盘点，支持 --qps 限速
 app session-rollout migrate    # 唯一的决策：cutoff + finite policy
 app session-rollout pause      # 逃生门：秒级停下自动推进
 app session-rollout resume
+
+# 故障通道：仅当 reconciler 自身坏掉时使用。它绕过 reconciler，
+# 但**不绕过谓词**——谓词不放行照样拒绝。
+app session-rollout advance --force --yes [--expect-writers N] [--max-per-uid N]
 ```
 
 每个子命令执行任何操作**之前**都会先打印它解析到的 Redis 地址和实例指纹：
@@ -83,7 +90,8 @@ redis: <redis-service>:6379  db=0  instance=9f3e11b4a2c7d081  token_ttl=720h0m0s
   "next": {
     "target_floor": "bounded",
     "allowed": false,
-    "blocked_by": ["v1=0 v2=135 (need 0)"]
+    "blocked_by": ["persistent=0 over_max=0 (need 0)"],
+    "options": ["wait: legacy records expire on their own", "migrate --finite-policy natural --cutoff <T>: ..."]
   }
 }
 ```
@@ -124,10 +132,13 @@ campaign ID。
 带着进行中 rollout 的环境（floor 已是 `v3-write`/`revoke`/`bounded`）升级时：
 
 1. 部署新制品。**唯一一次重启。**
-2. 首启自动接管现有 floor，写下 MySQL 标记，`MAX_PER_UID` 从 env 抄入 floor 记录。
+2. 首启自动接管现有 floor；`MAX_PER_UID` 由 reconciler 在数秒内回写进 floor 记录
+   （#725 的记录没有这个字段），MySQL 标记同样由 reconciler 补写——它在
+   `module.Setup` 建表之后才可能成功，所以刻意不放在启动路径上。
    **不需要删除或修改任何 Redis key，也不会登出任何人。**
 3. 确认 `status` 的 `floor` 与升级前一致、`writers` 数量与副本数一致。
-4. 删掉 configmap 里那三个已废弃的 key。
+4. **确认 `status` 的 `max_per_uid` 已经出现在 floor 记录里**，再删掉 configmap 里那三个
+   已废弃的 key。删早了会让下一次重启找不到 cap（此时会退到保守默认值 20 并告警）。
 5. 确认无误后再打开 `AUTO_ADVANCE`（见 §6）。
 
 **注意灰度姿态**：如果升级前处在 #725 的 Phase D/E（`MODE` 比 floor 高一阶），
@@ -162,8 +173,15 @@ campaign ID。
 | `N distinct builds are live` | 混部，等滚动更新完成 |
 | `N of M writers have not applied floor X` | 有副本没跟上，通常几秒内自愈 |
 | `expected N writers, registry has M` | 副本数对不上，多半还有旧制品在跑 |
-| `v1=N v2=M (need 0)` | 还有 legacy，等自然过期或跑 migration |
+| `v1=N v2=M (need 0)` | 还有 legacy，等自然过期或跑 migration（挡 `enforce`） |
+| `persistent=N over_max=M (need 0)` | 有永久/超上限 legacy，进 `bounded` 会立刻登出这批人（挡 `bounded`） |
 | `max_per_uid is not configured` | 首次建立 v3 floor 时缺 cap |
+| `keyspace scan did not complete` | 扫描中断，通常伴随 Redis 异常 |
+
+`blocked_by` 旁边会附 `options`，给出该阻塞的可执行选项（等待 vs 跑 migration）。
+
+**reconciler 自身坏掉时**：`pause` 停掉它，然后用 `advance --force --yes` 人工推进。
+谓词仍会执行——force 绕过的是 reconciler，不是门禁。
 
 **停下自动推进**（按响应速度）：
 
@@ -209,6 +227,7 @@ migration 的回滚语义不变：可暂停续跑；不得删除 campaign/checkp
 | `dmwork_session_reconcile_scan_total` | 增速异常说明退避没生效 |
 | `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 为 1 必须告警 |
 | `dmwork_session_rollout_mode{mode}` | 全体副本应收敛到同一值（灰度副本除外） |
+| `dmwork_session_undecodable_records` | 无法解码的记录数。**不阻塞 floor**（它们从来不是可用凭证），但**没有任何东西会清掉它们**，非 0 需要人看一眼 |
 
 原有的 `validation_rejected_total`、`revocation_backlog`、`redis_pool_timeouts_total`
 等指标保持不变。

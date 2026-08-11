@@ -31,6 +31,12 @@ source: self
 > 摘流会把认证降级放大成 fleet 级中断，比现状更差，而 readiness 那层对门禁毫无贡献
 > （invariant 4）。同时关闭两个伪决策项：floor 丢失取 enforce、fence 下限。
 >
+> **rev 4（review 后）**：三位 reviewer 提出 10 条 blocking，全部复现并修复。
+> 两处改规格而非硬做：① 谓词去掉"指纹匹配"项（§6 说明理由，指纹本身仍纳入实例身份）；
+> ② greenfield 不再宣称"零配置"——`EXPECT_WRITERS` 无条件要求（§3）。
+> 最严重的一条（首启丢弃 floor → 全员登出）是 rev3.1 那次"向上收敛"修复造成的：
+> 把 marker 读取失败当成了 floor 丢失，而"读不到"和"不存在"是两回事。
+>
 > **rev 3.4**：交付形态定为**一个 PR**。前几版都在优化"什么能安全地先合"，
 > 但交付物就是那个行为变更——新 PR 的定义是替换掉繁琐流程，不是零风险地挪一格。
 > 同时发现 C6 被重设计自动消解，Decision #8 不再 gating。
@@ -56,8 +62,9 @@ source: self
    `OCTO_AUTH_SESSION_REQUIRED_FLOOR`，滚动重启次数从 9 次降到 1 次，
    `mode < floor` 的 panic 结构性消失。
 3. **修正证据谓词。** 从 `Total > 0`（`session_rollout_evidence.go:99`）改为
-   `v1 = 0 ∧ v2 = 0 ∧ 实例身份匹配 ∧ registry 已收敛`。greenfield 直通是这个正确谓词的
-   **自然推论**，不需要单独的 greenfield 分支或 `--greenfield` 标志。
+   `v1 = 0 ∧ v2 = 0 ∧ registry 已收敛`（rev4 去掉了"实例身份匹配"一项，理由见 §6）。
+   greenfield 直通是这个正确谓词的**自然推论**，不需要单独的 greenfield 分支或
+   `--greenfield` 标志——但它仍需 `EXPECT_WRITERS`（rev4，见 §3）。
 4. **floor 推进由常驻 reconciler 完成，不由人敲命令。** 谓词里没有需要人判断的部分；
    人的唯一介入点是 migration 的业务参数，而系统会**自动停在**那个位置并说明差什么。
 5. **工具并入 `/home/app`，且只保留三件事**：排查（`status`）、业务决策输入（`migrate`）、
@@ -67,8 +74,9 @@ source: self
 目标终局：
 
 ```
-greenfield ：部署新制品。结束。（0 条命令，floor 自动到 enforce）
-brownfield ：部署新制品 → reconciler 自动推到 v3 并停下，报告 blocked_by: v2=N
+greenfield ：部署新制品（带 EXPECT_WRITERS=<副本数>）。结束。（0 条命令，floor 自动到 enforce）
+brownfield ：部署新制品 → reconciler 自动推进，停在第一个有存量的门禁上
+             （有永久 legacy → 停在 revoke；只剩有限 legacy → 停在 bounded）
              → 人做一次业务决策：migrate --cutoff T --finite-policy P
              → 到期后 reconciler 自动推到 enforce
 ```
@@ -114,8 +122,9 @@ campaign `test-2026-08-11-a`，cutoff `13:00 +08:00`，`--finite-policy natural`
 ### 实操暴露的四个新问题（均不在 #725 的已知风险清单里）
 
 > 以下每条都已在 HEAD 上实测复现，证据与复现步骤见同目录 `verification.md`，
-> tripwire 见 `pkg/auth/session_rollout_legacy_behavior_test.go`（编译但默认 skip）。
-> 断言描述的是缺陷现状，实现后应当翻红。
+> 原 tripwire 文件引用了本次删除的 `ValidateRolloutControl`，「翻红」会变成编译失败并
+> 拖垮整包，因此按 brief 的说法把断言取反，并入 `session_rollout_boot_test.go` 与
+> `session_rollout_wiring_test.go`；原始测量结果保留在 `verification.md`。
 
 **① 观测/迁移目标可被静默错配，且现有指纹无法发现。**
 
@@ -430,7 +439,15 @@ writer 已被 floor + registry 排除，扫描到翻转之间不可能冒出新 
 - `rolloutObservationScopeFingerprint()` 纳入 `currentRedisInstanceID()`，
   修复 Background ① 的静默错配。所有子命令与 reconciler 启动时打印实际连接的 endpoint
   与实例指纹。
-- 放行谓词从 `Total > 0` 改为 `v1 = 0 ∧ v2 = 0 ∧ 指纹匹配 ∧ registry 收敛`。
+- 放行谓词从 `Total > 0` 改为 `v1 = 0 ∧ v2 = 0 ∧ registry 收敛`。
+
+  **rev4 去掉了"指纹匹配"这一项，改为只把实例身份加进指纹本身。**
+  原来的设想是让谓词校验"扫的 keyspace 属于持有 floor 的那个 Redis"，但 reconciler
+  与 CLI 读 floor 和扫 keyspace 用的是**同一个 client**，结构上不可能不一致——这一项
+  在实现里没有可校验的对象。真正会连错实例的是 `migrate --apply`（2026-08-11 那次），
+  而那是另一条路径，由子命令启动时打印 endpoint + 实例指纹来覆盖。
+  指纹本身仍然必须纳入实例身份：不纳入的话，同一份配置指向两个不同 Redis 会得到
+  逐字节相同的指纹，那是真实缺陷（`TestWiringScopeFingerprintSeparatesRedisInstances`）。
   **空扫描成为最强证据而非被拒绝**，greenfield 与迁移完成后的 brownfield 落在同一谓词上。
 - 取消 `bounded` / `enforce` 各自的 2 次观察、rollout observation evidence 整套 key
   与 `MinimumRolloutObservationGap`。
@@ -684,12 +701,14 @@ reconciler 在 floor=enforce 后进入静默（不再扫描）。
 **验证基线**
 
 - 本 brief 对现状的 6 条断言均已在 `d68d0ad` 上实测，结果见 `verification.md`。
-- 两组测试分工明确，PR 必须逐条说明结果：
+- 三组测试分工明确，PR 必须逐条说明结果：
   - `pkg/auth/session_rollout_invariants_test.go` —— **改完必须仍绿**（单调、逐阶、
     首个 floor、CAS 单赢、无 TTL、损坏 fail closed、apply 的 revoke 门禁）。
-  - `pkg/auth/session_rollout_legacy_behavior_test.go` —— **改完应当翻红**，
-    默认 skip，`OCTO_ROLLOUT_LEGACY_TRIPWIRES=1` 开启。T1/T2/T3/T4/T6 各对应一个 brief 项，
-    T5 是成本描述不需要翻转。
+  - `pkg/auth/session_rollout_boot_test.go` —— 缺陷被移除后的行为，即原 tripwire 的
+    取反形式。原 tripwire 文件引用了本次删除的 `ValidateRolloutControl`，保留它会让
+    「翻红」变成编译失败并拖垮整包；原始测量结果保留在 `verification.md`。
+  - `pkg/auth/session_rollout_wiring_test.go` —— **启动接线路径**（rev4 新增）。
+    review 的 10 条 blocking 里有 9 条活在这一层，而当时所有测试都停在纯函数边界。
 
 **不回归**
 

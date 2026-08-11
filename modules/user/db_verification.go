@@ -31,7 +31,8 @@ import (
 // 自 2026-05-10 起（YUJ-382 / Aegis OIDC Phase 1),OIDC callback(modules/oidc/api.go)
 // 首次成为 user_verification 表的写入方,权威源从 dmwork-verify-service 迁移到 Aegis IdP。
 // 历史:此前由 dmwork-verify-service 经 HMAC POST /v1/internal/verification/complete
-//       写入,该链路已随 Aegis OIDC 直切方案废弃;api_verification.go 整个文件被删除。
+//
+//	写入,该链路已随 Aegis OIDC 直切方案废弃;api_verification.go 整个文件被删除。
 //
 // 表 schema 不变:迁移期 OCTO 侧继续基于本表给 profile 着色,前端协议无感知。
 type verificationModel struct {
@@ -97,7 +98,7 @@ func (d *verificationDB) QueryByUIDs(uids []string) (map[string]*verificationMod
 //   - emp_id / dept / mobile(DEFAULT NULL):`COALESCE(VALUES(col), col)` —
 //     新值为 NULL 时保留旧值,新值非 NULL 时正常覆盖。
 //   - source_sub(NOT NULL VARCHAR,空串合法但表示"上游未提供"):
-//     `IF(VALUES(source_sub)='', source_sub, VALUES(source_sub))` — 空串视为
+//     `IF(VALUES(source_sub)=”, source_sub, VALUES(source_sub))` — 空串视为
 //     "保留旧值"。COALESCE 在这里不适用(空串不是 NULL)。
 //   - real_name / source / email / verified_at:继续 VALUES(col) 直接覆盖 —
 //     这些都是每次 OIDC callback 明确给出的权威字段,允许再登录刷新。
@@ -151,16 +152,17 @@ func nullableVerificationString(s string) dbr.NullString {
 // 拒绝写,而非 Delete 旧行)。保留本方法为未来 Aegis webhook 收到明确撤销事件时用。
 //
 // 调用合同(严格限定,任何一点错都会造成误删):
-//   必须在 Aegis **权威确认**用户未实名时才调 —— 例如 Aegis 主动推送的撤销 webhook。
-//   严禁在以下场景调:
-//     - /userinfo 拉取异常 / 5xx / token 拿不到 → 保守保留旧 row
-//     - JSON 解析失败 / 配置错 → 同上
-//     - DB 查询错误 → 不触及
-//   误删代价:某一次 Aegis 短暂抖动,所有 pulled 用户 cache 被清,下次 pull 又 upsert 回来 ——
-//   但中间这段窗口 OCTO 徽章会误显示"未实名",用户发 support ticket。保守是这里的默认。
+//
+//	必须在 Aegis **权威确认**用户未实名时才调 —— 例如 Aegis 主动推送的撤销 webhook。
+//	严禁在以下场景调:
+//	  - /userinfo 拉取异常 / 5xx / token 拿不到 → 保守保留旧 row
+//	  - JSON 解析失败 / 配置错 → 同上
+//	  - DB 查询错误 → 不触及
+//	误删代价:某一次 Aegis 短暂抖动,所有 pulled 用户 cache 被清,下次 pull 又 upsert 回来 ——
+//	但中间这段窗口 OCTO 徽章会误显示"未实名",用户发 support ticket。保守是这里的默认。
 //
 // 语义:
-//   - uid 空串 → no-op + nil err(防御编程错误,不让 DELETE FROM ... WHERE user_id='' 误删)
+//   - uid 空串 → no-op + nil err(防御编程错误,不让 DELETE FROM ... WHERE user_id=” 误删)
 //   - 行不存在 → 仍 nil err(幂等);调用方不依赖"是否删掉了"的返回值
 //   - DB error → 原样返回给调用方记 warn
 func (d *verificationDB) DeleteByUID(uid string) error {

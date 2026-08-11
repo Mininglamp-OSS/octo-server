@@ -142,6 +142,13 @@ func (s *RedisSessionStore) currentMaxPerUID() int { return s.currentState().max
 // It only ever moves upward — a floor that appears to have gone backwards is a
 // stale or rolled-back read, and following it down would re-admit legacy
 // sessions this replica has already stopped accepting.
+//
+// A missing or unusable cap does NOT block the mode. Reader strictness and
+// write capability are separate concerns, and coupling them meant a recovery
+// that could not find a cap silently left the process in a LOWER mode — the
+// fail-open this path exists to prevent. The cap is enforced where it belongs,
+// on the write path (see writableState), so every outcome here is at least as
+// strict as before, never looser.
 func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) error {
 	if !mode.valid() {
 		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
@@ -150,14 +157,29 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 	if maxPerUID <= 0 {
 		maxPerUID = current.maxPerUID
 	}
-	if mode.writesV3() && (maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit) {
-		return fmt.Errorf("auth: session mode %s requires a bounded max sessions per UID", mode)
+	if maxPerUID > sessionMaxPerUIDLimit {
+		maxPerUID = sessionMaxPerUIDLimit
 	}
 	if mode.rank() < current.mode.rank() {
 		return nil
 	}
 	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
 	return nil
+}
+
+// writableState is the single gate every credential-creating path goes
+// through. It fails closed on both halves: no live write lease, or a
+// v3-writing mode with no usable cap, and a bounded index with no bound is not
+// something to guess at.
+func (s *RedisSessionStore) writableState() (derivedRolloutState, error) {
+	if !s.mayWrite() {
+		return derivedRolloutState{}, ErrWriterLeaseLost
+	}
+	state := s.currentState()
+	if state.mode.writesV3() && (state.maxPerUID <= 0 || state.maxPerUID > sessionMaxPerUIDLimit) {
+		return derivedRolloutState{}, ErrSessionCapUnavailable
+	}
+	return state, nil
 }
 
 func WithSessionClock(now func() time.Time) SessionStoreOption {
@@ -216,8 +238,8 @@ func (s *RedisSessionStore) uidTokenKey(uid string, deviceFlag int) string {
 // it through ReuseExisting or UpdatePayloadKeepDeadline. If the index write
 // fails, only the still-owned credential is deleted as compensation.
 func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid string, deviceFlag int) (err error) {
-	if !s.mayWrite() {
-		return ErrWriterLeaseLost
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return stateErr
 	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("issue", started, err) }()
@@ -255,8 +277,8 @@ func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid st
 // ReuseExisting updates a bearer without extending its deadline and aligns
 // the compatibility index to the same TTL. A missing bearer is never recreated.
 func (s *RedisSessionStore) ReuseExisting(ctx context.Context, token, payload, uid string, deviceFlag int) (ok bool, err error) {
-	if !s.mayWrite() {
-		return false, ErrWriterLeaseLost
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return false, stateErr
 	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("reuse", started, err) }()
@@ -676,6 +698,15 @@ func (s *RedisSessionStore) mayWrite() bool {
 	}
 	metrics.ObserveSessionWriterFence()
 	return false
+}
+
+// CanIssue reports whether this replica may create a credential right now. It
+// exists so a caller can check BEFORE a destructive step: paths that revoke an
+// old token and then issue a replacement would otherwise turn a lease loss into
+// a logout rather than a refused login.
+func (s *RedisSessionStore) CanIssue() error {
+	_, err := s.writableState()
+	return err
 }
 
 // Client exposes the shared Redis client for adjacent rollout components (the

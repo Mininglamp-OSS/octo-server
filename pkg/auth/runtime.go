@@ -107,17 +107,25 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	if policy.canaryAhead && boot.Mode.rank() < SessionModeEnforce.rank() {
 		boot.Mode = boot.Mode.next()
 	}
+	// The apply must not be swallowed. Letting it fail into a warning is how a
+	// replica ended up running at expand while boot had resolved enforce — and
+	// while the registry advertised enforce on its behalf.
 	if applyErr := store.ApplyRolloutState(boot.Mode, boot.MaxPerUID); applyErr != nil {
 		boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
 	}
-	if boot.Outcome == RolloutBootAdopted && markers != nil {
-		if stampErr := markers.StampOnce(bootCtx, boot.Floor); stampErr != nil {
-			boot.Warning = strings.TrimSpace(boot.Warning + " " + stampErr.Error())
-		}
-	}
+	// Whatever was actually applied is the truth from here on. Boot's resolved
+	// value is a proposal; the store's mode is what this replica enforces, and
+	// it is what gets published and logged.
+	boot.Mode = store.Mode()
+
 	if boot.Outcome == RolloutBootRecovered {
-		if recoverErr := store.RecoverRolloutControlAtEnforce(bootCtx, boot.MaxPerUID); recoverErr != nil {
+		recovered, recoverErr := store.RecoverRolloutControlAtEnforce(bootCtx, boot.MaxPerUID)
+		switch {
+		case recoverErr != nil:
 			boot.Warning = strings.TrimSpace(boot.Warning + " " + recoverErr.Error())
+		case !recovered:
+			boot.Warning = strings.TrimSpace(boot.Warning +
+				" the floor reappeared before recovery could write; keeping the persisted value")
 		}
 	}
 

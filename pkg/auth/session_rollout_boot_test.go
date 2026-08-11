@@ -158,7 +158,12 @@ func TestUpgradeNeverLoosensAMidCanaryDeployment(t *testing.T) {
 
 // A3 (inverts T4): an empty keyspace is now the strongest evidence rather than
 // a rejected one, so greenfield reaches enforce with no canary login, no empty
-// migration and no waiting — and via the same code path as brownfield.
+// migration and no waiting — via the same code path as brownfield.
+//
+// It still needs the replica count for the first v3 floor. Emptiness proves
+// nothing is stored right now, not that no unregistered writer exists, so that
+// gate is unconditional; the deployment supplies a number it already knows and
+// runs no commands.
 func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 	ctx := context.Background()
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
@@ -171,8 +176,9 @@ func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 	floor := SessionMode("")
 	for i := 0; i < 5; i++ {
 		decision, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
-			Registry:  registry,
-			MaxPerUID: 20,
+			Registry:      registry,
+			MaxPerUID:     20,
+			ExpectWriters: 1,
 		})
 		require.NoError(t, err)
 		if decision.Current == SessionModeEnforce {
@@ -236,9 +242,10 @@ func TestAdvanceGateRefusesUnconvergedFleets(t *testing.T) {
 	})
 }
 
-// A5: over a non-empty keyspace the first v3 floor needs the replica count,
-// because a pre-#725 build never registers and the registry structurally
-// cannot see it. Only this one transition needs it.
+// A5: the first v3 floor needs the replica count, because a pre-#725 build
+// never registers and the registry structurally cannot see it. Only this one
+// transition needs it — and it is required whether or not the keyspace is
+// empty, since empty only means nothing is stored right now.
 func TestFirstV3FloorNeedsTheReplicaCountOnlyWhenTokensExist(t *testing.T) {
 	ctx := context.Background()
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
@@ -254,6 +261,7 @@ func TestFirstV3FloorNeedsTheReplicaCountOnlyWhenTokensExist(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, unset.Allowed)
 	require.Contains(t, unset.BlockedSummary(), sessionExpectWritersEnv)
+	require.Contains(t, unset.BlockedSummary(), "first v3 floor")
 
 	short, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{Registry: registry, MaxPerUID: 20, ExpectWriters: 3})
 	require.NoError(t, err)
@@ -317,8 +325,11 @@ func TestWriterLeaseFencesWritesOnly(t *testing.T) {
 	live, err := registry.Live()
 	require.NoError(t, err)
 	require.Len(t, live, 1)
+	// Simulate the process stalling past the lease TTL: the entry expires in
+	// Redis while this process keeps running. The fence must close on our own
+	// clock, not on the outcome of the last write.
 	registry.mu.Lock()
-	registry.leaseOK = false
+	registry.lastRefreshAt = registry.lastRefreshAt.Add(-writerLeaseTTL)
 	registry.mu.Unlock()
 
 	require.ErrorIs(t, store.IssueNew(ctx, "tok-fenced", `v2:{"uid":"u1"}`, "u1", 1), ErrWriterLeaseLost)
@@ -389,7 +400,10 @@ func TestEveryAdvanceLeavesAnEvidenceSnapshot(t *testing.T) {
 	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
 	t.Cleanup(func() { _ = client.Del(prefix + "writers").Err() })
 
-	reconciler := NewRolloutReconciler(store, ReconcilerOptions{Registry: registry, AutoAdvance: true, MaxPerUID: 20})
+	markers := newMarkerStoreForTest(t)
+	reconciler := NewRolloutReconciler(store, ReconcilerOptions{
+		Registry: registry, Markers: markers, AutoAdvance: true, MaxPerUID: 20, ExpectWriters: 1,
+	})
 	reconciler.reconcileOnce(ctx)
 
 	control, err := store.RolloutControl(ctx)
@@ -402,6 +416,7 @@ func TestEveryAdvanceLeavesAnEvidenceSnapshot(t *testing.T) {
 	require.Equal(t, "reconciler", record.Actor)
 	require.Equal(t, 1, record.LiveWriters)
 	require.Equal(t, []string{"build-a"}, record.Builds)
+	require.NotNil(t, record.RedisID, "the snapshot names the instance it looked at")
 }
 
 // A11: the reconciler goes quiet at enforce rather than rescanning forever.

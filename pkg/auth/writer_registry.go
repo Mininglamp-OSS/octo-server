@@ -50,6 +50,11 @@ const (
 // keep working.
 var ErrWriterLeaseLost = errors.New("auth: writer lease lost; refusing to create a new session")
 
+// ErrSessionCapUnavailable is returned when a v3-writing mode is active with no
+// usable per-UID cap. Reader strictness still applies; only new credentials are
+// refused, so the failure is closed in both directions.
+var ErrSessionCapUnavailable = errors.New("auth: bounded sessions per UID unavailable; refusing to create a new session")
+
 // WriterEntry is one live participant. It carries nothing that could identify a
 // user: build, pod name and applied state only.
 type WriterEntry struct {
@@ -66,10 +71,20 @@ type WriterRegistry struct {
 	rosterKey string
 	entryKey  func(id string) string
 
-	mu      sync.RWMutex
-	self    WriterEntry
-	leaseOK bool
+	mu   sync.RWMutex
+	self WriterEntry
+	// lastRefreshAt is when this process last confirmed its lease. A lease has
+	// to expire on the HOLDER's clock: tracking only "did the last write
+	// succeed" meant a process stalled past the TTL (GC pause, CPU throttling,
+	// SIGSTOP) came back believing it still held one, while the registry had
+	// already stopped seeing it and the gate may have advanced on that basis.
+	lastRefreshAt time.Time
+	now           func() time.Time
 }
+
+// writerLeaseMargin keeps the local expiry strictly ahead of Redis's, so a
+// writer stops writing before the registry stops listing it, never after.
+const writerLeaseMargin = 5 * time.Second
 
 // NewWriterRegistry builds a registry under the given key prefix. The prefix is
 // supplied rather than derived so the type stays independent of auth config.
@@ -81,6 +96,7 @@ func NewWriterRegistry(client *rd.Client, keyPrefix string) *WriterRegistry {
 		client:    client,
 		rosterKey: keyPrefix + "writers",
 		entryKey:  func(id string) string { return keyPrefix + "writer:" + id },
+		now:       time.Now,
 	}
 }
 
@@ -100,6 +116,7 @@ func (r *WriterRegistry) Join(ctx context.Context, build, pod, appliedState stri
 		now = time.Now
 	}
 	r.mu.Lock()
+	r.now = now
 	r.self = WriterEntry{
 		ID:           id,
 		Build:        build,
@@ -109,11 +126,13 @@ func (r *WriterRegistry) Join(ctx context.Context, build, pod, appliedState stri
 	}
 	r.mu.Unlock()
 
-	if err := r.refresh(); err != nil {
-		return err
-	}
+	// Start the heartbeat regardless of the first attempt. Returning here left a
+	// replica that hit a momentary Redis blip during startup fenced for the rest
+	// of its life, with readiness green and login traffic still arriving — the
+	// retry loop was already written, just gated behind success.
+	refreshErr := r.refresh()
 	go r.heartbeat(ctx)
-	return nil
+	return refreshErr
 }
 
 // SetAppliedState records that this process has applied a new rollout state.
@@ -131,7 +150,17 @@ func (r *WriterRegistry) SetAppliedState(state string) {
 func (r *WriterRegistry) MayWrite() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.leaseOK
+	if r.lastRefreshAt.IsZero() {
+		return false
+	}
+	return r.clock().Sub(r.lastRefreshAt) < writerLeaseTTL-writerLeaseMargin
+}
+
+func (r *WriterRegistry) clock() time.Time {
+	if r.now == nil {
+		return time.Now()
+	}
+	return r.now()
 }
 
 func (r *WriterRegistry) heartbeat(ctx context.Context) {
@@ -142,7 +171,7 @@ func (r *WriterRegistry) heartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			r.mu.Lock()
 			entry := r.self
-			r.leaseOK = false
+			r.lastRefreshAt = time.Time{}
 			r.mu.Unlock()
 			// Best effort: drop out of the roster promptly on a clean shutdown
 			// so a rolling update does not have to wait out the lease.
@@ -171,7 +200,9 @@ func (r *WriterRegistry) refresh() error {
 		err = r.client.SAdd(r.rosterKey, entry.ID).Err()
 	}
 	r.mu.Lock()
-	r.leaseOK = err == nil
+	if err == nil {
+		r.lastRefreshAt = r.clock()
+	}
 	r.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("auth: refresh writer lease: %w", err)

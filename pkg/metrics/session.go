@@ -22,6 +22,7 @@ type SessionMetrics struct {
 	ReconcileBlocked   *prometheus.CounterVec
 	ReconcileScans     prometheus.Counter
 	RolloutBootOutcome *prometheus.GaugeVec
+	UndecodableRecords prometheus.Gauge
 	operationOK        map[string]prometheus.Counter
 	operationError     map[string]prometheus.Counter
 	operationLatency   map[string]prometheus.Observer
@@ -110,6 +111,12 @@ func NewSessionMetrics(reg prometheus.Registerer) *SessionMetrics {
 			Name:      "reconcile_scan_total",
 			Help:      "Keyspace scans performed by the rollout reconciler.",
 		}),
+		UndecodableRecords: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "undecodable_records",
+			Help:      "Token records that cannot be decoded as any version; they never block the floor and nothing clears them.",
+		}),
 		RolloutBootOutcome: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricNamespace,
 			Subsystem: "session",
@@ -119,7 +126,8 @@ func NewSessionMetrics(reg prometheus.Registerer) *SessionMetrics {
 	}
 	reg.MustRegister(m.Operations, m.OperationLatency, m.ValidationReject, m.PersistentSeen, m.EffectiveTTL,
 		m.RolloutMode, m.RevocationBacklog, m.RevocationRetries,
-		m.LiveWriters, m.WriterFences, m.FloorAdvances, m.ReconcileBlocked, m.ReconcileScans, m.RolloutBootOutcome)
+		m.LiveWriters, m.WriterFences, m.FloorAdvances, m.ReconcileBlocked, m.ReconcileScans,
+		m.RolloutBootOutcome, m.UndecodableRecords)
 	for _, outcome := range sessionRolloutBootOutcomes {
 		m.RolloutBootOutcome.WithLabelValues(outcome).Set(0)
 	}
@@ -220,6 +228,16 @@ func ObserveSessionReconcileBlocked(reason string) {
 func ObserveSessionReconcileScan() {
 	if m := defaultSessionMetrics.Load(); m != nil {
 		m.ReconcileScans.Inc()
+	}
+}
+
+// SetSessionUndecodableRecords tracks records that cannot be decoded as any
+// token version. They no longer block the floor — they were never usable
+// credentials — but nothing clears them either, so a keyspace can sit at
+// enforce with N of them and this is the only thing that says so.
+func SetSessionUndecodableRecords(count int64) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.UndecodableRecords.Set(float64(count))
 	}
 }
 

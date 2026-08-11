@@ -104,7 +104,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	// misconfiguration above: the endpoint is no longer implicit.
 	instance := "<unreadable>"
 	if id, idErr := store.RedisInstanceFingerprint(); idErr == nil {
-		instance = id[:16]
+		instance = shortFingerprint(id)
 	}
 	fmt.Fprintf(os.Stderr, "redis: %s  db=%d  instance=%s  token_ttl=%s\n",
 		client.Options().Addr, client.Options().DB, instance, cfg.Cache.TokenExpire)
@@ -114,7 +114,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 
 	switch sub {
 	case "status":
-		return sessionRolloutStatus(ctx, store, out, *batchSize)
+		return sessionRolloutStatus(ctx, store, out, *batchSize, *qps)
 	case "observe":
 		return sessionRolloutObserve(ctx, store, out, *batchSize, *qps)
 	case "migrate":
@@ -172,7 +172,11 @@ type sessionRolloutStatusReport struct {
 	Next        *auth.RolloutAdvanceDecision `json:"next,omitempty"`
 }
 
-func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64) error {
+func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, qps float64) error {
+	interval := time.Duration(0)
+	if qps > 0 {
+		interval = time.Duration(float64(time.Second) / qps)
+	}
 	report := sessionRolloutStatusReport{Floor: "none"}
 	control, err := store.RolloutControl(ctx)
 	if err != nil {
@@ -189,18 +193,17 @@ func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, ou
 	if live, err := registry.Live(); err == nil {
 		report.Writers = live
 	}
-	if observation, err := store.ObserveRateLimited(ctx, batchSize, 0); err == nil {
-		report.Tokens = &observation
-	}
+	// One scan, reused. This used to scan here and again inside the predicate,
+	// and ignore its own --qps while doing it.
+	decisionInput := auth.RolloutAdvanceInput{ScanBatchSize: batchSize, ScanInterval: interval}
 	if record, err := store.LastRolloutAdvance(ctx); err == nil {
 		report.LastAdvance = record
 	}
-	decision, err := store.EvaluateRolloutAdvance(ctx, auth.RolloutAdvanceInput{
-		Registry:      registry,
-		ScanBatchSize: batchSize,
-	})
+	decisionInput.Registry = registry
+	decision, err := store.EvaluateRolloutAdvance(ctx, decisionInput)
 	if err == nil {
 		report.Next = &decision
+		report.Tokens = decision.Observation
 	}
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
@@ -286,6 +289,7 @@ func sessionRolloutAdvance(
 		ExpectWriters: expectWriters,
 		MaxPerUID:     maxPerUID,
 		ScanBatchSize: batchSize,
+		ScanInterval:  time.Millisecond,
 	})
 	if err != nil {
 		return err

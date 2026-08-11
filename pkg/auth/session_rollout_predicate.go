@@ -25,6 +25,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 )
 
 // RolloutAdvanceDecision is what the reconciler and `advance --force` both act
@@ -39,22 +42,31 @@ type RolloutAdvanceDecision struct {
 	// can back off rather than rescanning every cycle while waiting out a
 	// deadline measured in days.
 	Scanned bool `json:"scanned"`
+	// Observation is the scan that justified the decision. It is carried here so
+	// the advance snapshot records the counts it claims to audit — a snapshot
+	// reading v1=0 v2=0 because nobody filled it in is indistinguishable from
+	// one that actually looked.
+	Observation *SessionObservation `json:"observation,omitempty"`
+	// Options are operator-actionable next steps for the blockers above.
+	Options []string `json:"options,omitempty"`
 }
 
 // RolloutAdvanceInput carries what the predicate cannot read for itself.
 type RolloutAdvanceInput struct {
 	Registry *WriterRegistry
-	// ExpectWriters is the replica count the deployment intends to run. Only
-	// consulted when establishing the first v3 floor over a non-empty keyspace,
-	// because that is the one transition where a non-participating pre-#725
-	// build could still be writing v2 and the registry structurally cannot see
-	// it. Every later transition is fully machine-gated.
+	// ExpectWriters is the replica count the deployment intends to run. Required
+	// for the first v3 floor and only that one, because it is the single
+	// transition where a non-participating pre-#725 build could still be writing
+	// v2 and the registry structurally cannot see it. Every later transition is
+	// fully machine-gated.
 	ExpectWriters int
 	// MaxPerUID is required when crossing into a v3-writing floor.
 	MaxPerUID int
-	// ScanBatchSize and ScanInterval throttle the keyspace scan.
+	// ScanBatchSize and ScanInterval throttle the keyspace scan. A zero interval
+	// is reserved for tests; production callers pass a positive one, because
+	// this scan runs unattended and on the shared session pool.
 	ScanBatchSize int64
-	ScanInterval  interface{ String() string }
+	ScanInterval  time.Duration
 }
 
 // EvaluateRolloutAdvance decides whether the floor may move one phase.
@@ -120,29 +132,38 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		}
 	}
 
-	needScan := decision.Target == SessionModeEnforce || decision.Target == SessionModeV3Write
+	// bounded is scanned too. It was omitted, and because bounded rejects every
+	// persistent and over-max legacy record at read time, a converged fleet
+	// could be walked into a user-visible denial phase with no scan, no
+	// migration and no cutoff — logging out exactly the population whose fate
+	// is supposed to be the operator's decision.
+	needScan := decision.Target == SessionModeEnforce ||
+		decision.Target == SessionModeV3Write ||
+		decision.Target == SessionModeBounded
 	var observation SessionObservation
 	if needScan {
 		batch := in.ScanBatchSize
 		if batch <= 0 {
 			batch = 200
 		}
-		observation, err = s.ObserveRateLimited(ctx, batch, 0)
+		observation, err = s.ObserveRateLimited(ctx, batch, in.ScanInterval)
 		if err != nil {
 			return RolloutAdvanceDecision{}, err
 		}
 		decision.Scanned = true
+		decision.Observation = &observation
 		if !observation.Complete {
 			decision.BlockedBy = append(decision.BlockedBy, "keyspace scan did not complete")
 		}
 	}
 
-	if decision.Target == SessionModeV3Write && observation.Total > 0 {
-		// Only here does a human-supplied number matter, and it is information
-		// rather than judgement: only #725-or-newer builds register, so a
-		// leftover old replica makes the registry come up short. An empty
-		// keyspace skips this entirely — nothing has ever been written, so no
-		// writer of any vintage can be running.
+	if decision.Target == SessionModeV3Write {
+		// Required unconditionally. It used to be skipped on an empty keyspace,
+		// reasoning that nothing written means no writer exists — but empty only
+		// means nothing is stored RIGHT NOW, which is also true after a TTL
+		// sweep, a flush, or the Redis loss this change handles. An idle
+		// pre-registry replica writes v2 on the next login and registers
+		// nowhere, so neither the roster nor the build check can see it.
 		live := 0
 		if in.Registry != nil {
 			if entries, liveErr := in.Registry.Live(); liveErr == nil {
@@ -152,23 +173,41 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		switch {
 		case in.ExpectWriters <= 0:
 			decision.BlockedBy = append(decision.BlockedBy,
-				fmt.Sprintf("%s is required to establish the first v3 floor over a non-empty keyspace", sessionExpectWritersEnv))
+				fmt.Sprintf("%s is required to establish the first v3 floor", sessionExpectWritersEnv))
 		case live != in.ExpectWriters:
 			decision.BlockedBy = append(decision.BlockedBy,
 				fmt.Sprintf("expected %d writers, registry has %d", in.ExpectWriters, live))
 		}
 	}
 
+	if decision.Target == SessionModeBounded && (observation.Persistent != 0 || observation.OverMax != 0) {
+		// Exactly the set bounded rejects, so the gate mirrors the reader.
+		decision.BlockedBy = append(decision.BlockedBy,
+			fmt.Sprintf("persistent=%d over_max=%d (need 0)", observation.Persistent, observation.OverMax))
+		decision.Options = append(decision.Options,
+			"wait: legacy records expire on their own",
+			"migrate --finite-policy natural --cutoff <T>: converge them on an approved deadline")
+	}
+
 	if decision.Target == SessionModeEnforce {
 		if observation.V1 != 0 || observation.V2 != 0 {
 			decision.BlockedBy = append(decision.BlockedBy,
 				fmt.Sprintf("v1=%d v2=%d (need 0)", observation.V1, observation.V2))
+			decision.Options = append(decision.Options,
+				"wait: active users are promoted on reuse; inactive ones expire at TokenExpire",
+				"migrate --finite-policy cap --cutoff <T>: converge them, at the cost of an early re-login")
 		}
 		// decode_invalid is deliberately NOT a blocker. A record that fails
 		// Decode was never a usable credential — the validator has always
 		// rejected it — so letting it hold the floor was the evidence validator
-		// being stricter than the security requirement, which is what wedged
-		// the floor for up to TokenExpire with no tool able to clear it.
+		// being stricter than the security requirement. It is reported and
+		// alarmed instead, because nothing clears it on its own.
+		if observation.DecodeInvalid != 0 {
+			metrics.SetSessionUndecodableRecords(observation.DecodeInvalid)
+		}
+	}
+	if decision.Scanned {
+		metrics.SetSessionUndecodableRecords(observation.DecodeInvalid)
 	}
 
 	sort.Strings(decision.BlockedBy)

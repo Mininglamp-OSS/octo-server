@@ -38,6 +38,9 @@ const (
 	// blocked. Waiting out a legacy deadline measured in days must not mean
 	// rescanning the keyspace every thirty seconds.
 	reconcileScanBackoff = time.Hour
+	// defaultReconcileScanInterval caps the scan at ~200 records/sec. The scan
+	// is a full SCAN plus a read per key, unattended, on the shared pool.
+	defaultReconcileScanInterval = 5 * time.Millisecond
 )
 
 // RolloutAdvanceRecord is the evidence snapshot written BEFORE each advance.
@@ -71,6 +74,7 @@ type RolloutReconciler struct {
 	// v3-writing phase, when there is no record to carry it forward from.
 	maxPerUID     int
 	scanBatchSize int64
+	scanInterval  time.Duration
 	log           func(format string, args ...interface{})
 }
 
@@ -82,7 +86,11 @@ type ReconcilerOptions struct {
 	ExpectWriters int
 	MaxPerUID     int
 	ScanBatchSize int64
-	Log           func(format string, args ...interface{})
+	// ScanInterval throttles the keyspace scan. This runs unattended, on the
+	// shared session pool, from every replica, so it must not be zero in
+	// production — ObserveRateLimited reserves that for tests.
+	ScanInterval time.Duration
+	Log          func(format string, args ...interface{})
 }
 
 func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *RolloutReconciler {
@@ -97,6 +105,10 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 	if batch <= 0 {
 		batch = 200
 	}
+	interval := opts.ScanInterval
+	if interval <= 0 {
+		interval = defaultReconcileScanInterval
+	}
 	return &RolloutReconciler{
 		store:         store,
 		registry:      opts.Registry,
@@ -106,6 +118,7 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 		expectWriters: opts.ExpectWriters,
 		maxPerUID:     opts.MaxPerUID,
 		scanBatchSize: batch,
+		scanInterval:  interval,
 		log:           log,
 	}
 }
@@ -143,17 +156,55 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	if err != nil || control == nil {
 		return
 	}
+
+	// A #725 record predates the cap field, so without writing it back the cap
+	// only ever lives in this process's memory and is gone on the next restart —
+	// leaving a v3-writing floor with no bound to apply. Retried here rather
+	// than done once at boot so a MySQL or Redis hiccup does not lose it.
+	if control.MaxPerUID <= 0 && r.maxPerUID > 0 {
+		if capErr := r.store.EnsureRolloutMaxPerUID(ctx, r.maxPerUID); capErr != nil {
+			r.log("session rollout: cannot persist max_per_uid: %v", capErr)
+		}
+	}
+	r.ensureMarker(ctx, control.ModeFloor)
+
 	mode := control.ModeFloor
 	if r.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
 		mode = mode.next()
 	}
-	if applyErr := r.store.ApplyRolloutState(mode, control.MaxPerUID); applyErr != nil {
+	cap := control.MaxPerUID
+	if cap <= 0 {
+		cap = r.maxPerUID
+	}
+	if applyErr := r.store.ApplyRolloutState(mode, cap); applyErr != nil {
 		r.log("session rollout: cannot apply floor %s: %v", control.ModeFloor, applyErr)
 		return
 	}
-	metrics.SetSessionRolloutMode(string(r.store.currentMode()))
+	applied := r.store.currentMode()
+	metrics.SetSessionRolloutMode(string(applied))
 	if r.registry != nil {
-		r.registry.SetAppliedState(string(control.ModeFloor))
+		// Publish what was APPLIED, never what was resolved. Advertising a mode
+		// this replica is not actually running lets the convergence gate be
+		// satisfied by a replica that has not converged.
+		r.registry.SetAppliedState(string(applied))
+	}
+}
+
+// ensureMarker stamps the initialisation marker whenever a floor exists without
+// one. It lives here, not at boot, for two reasons: the marker table is created
+// by a migration that runs after the session store is built, so the first boot
+// of this artifact cannot stamp it; and until it is stamped, a Redis loss reads
+// as "never initialised" and resolves DOWN to expand.
+func (r *RolloutReconciler) ensureMarker(ctx context.Context, floor SessionMode) {
+	if r.markers == nil {
+		return
+	}
+	marker, err := r.markers.Load(ctx)
+	if err != nil || marker != nil {
+		return
+	}
+	if stampErr := r.markers.StampOnce(ctx, floor); stampErr != nil {
+		r.log("session rollout: cannot stamp initialisation marker: %v", stampErr)
 	}
 }
 
@@ -181,11 +232,15 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 		ExpectWriters: r.expectWriters,
 		MaxPerUID:     r.maxPerUID,
 		ScanBatchSize: r.scanBatchSize,
+		ScanInterval:  r.scanInterval,
 	})
 	if err != nil {
+		// Back off on errors too. A scan that aborts partway makes this return
+		// early and, without a backoff, retries in thirty seconds — amplifying
+		// load exactly while Redis is unhealthy.
 		r.log("session rollout: cannot evaluate advance: %v", err)
 		metrics.ObserveSessionReconcileBlocked("evaluate-error")
-		return soon
+		return now.Add(reconcileScanBackoff)
 	}
 	if decision.Scanned {
 		metrics.ObserveSessionReconcileScan()
@@ -220,6 +275,16 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 // pre-check rejection, and BOTH are benign no-ops — with several replicas
 // reconciling, treating them as errors would make the fleet alert on itself.
 func (r *RolloutReconciler) advance(ctx context.Context, decision RolloutAdvanceDecision, actor string) error {
+	// The marker is stamped BEFORE the CAS and its failure blocks the advance.
+	// The same ordering argument the evidence snapshot gets — a record with no
+	// advance is harmless, an advance with no record is not — applies here with
+	// more force, because a floor that exists without a marker reads as "never
+	// initialised" after a Redis loss and resolves DOWN to expand.
+	if r.markers != nil {
+		if stampErr := r.markers.StampOnce(ctx, decision.Target); stampErr != nil {
+			return fmt.Errorf("auth: refusing to advance without an initialisation marker: %w", stampErr)
+		}
+	}
 	if err := r.store.recordRolloutAdvance(ctx, decision, actor, r.registry); err != nil {
 		return err
 	}
@@ -227,9 +292,6 @@ func (r *RolloutReconciler) advance(ctx context.Context, decision RolloutAdvance
 	switch {
 	case err == nil:
 		metrics.ObserveSessionFloorAdvance(string(decision.Target), actor)
-		if r.markers != nil {
-			_ = r.markers.StampOnce(ctx, decision.Target)
-		}
 		return nil
 	case errors.Is(err, ErrRolloutControlChanged):
 		return nil
@@ -245,8 +307,7 @@ func (r *RolloutReconciler) advance(ctx context.Context, decision RolloutAdvance
 // when it read after, the optimistic pre-check rejects it here instead. Both
 // mean "someone else already did it".
 func isBenignAdvanceRace(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "advance exactly one phase") ||
-		strings.Contains(err.Error(), "first rollout floor must be"))
+	return errors.Is(err, ErrRolloutFloorNotNext) || errors.Is(err, ErrRolloutFirstFloor)
 }
 
 // blockedReasonLabel keeps the metric label bounded: the human-readable reason
@@ -300,6 +361,10 @@ func (s *RedisSessionStore) recordRolloutAdvance(
 				record.Builds = append(record.Builds, entry.Build)
 			}
 		}
+	}
+	if observation := decision.Observation; observation != nil {
+		record.V1, record.V2, record.V3, record.Total =
+			observation.V1, observation.V2, observation.V3, observation.Total
 	}
 	if id, err := s.currentRedisInstanceID(); err == nil {
 		record.RedisID = id

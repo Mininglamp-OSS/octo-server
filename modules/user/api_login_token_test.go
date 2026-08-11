@@ -102,6 +102,39 @@ type appTokenReplacer interface {
 	replaceAPPToken(context.Context, string, string, string) error
 }
 
+// fencedAPPSessionStore refuses to issue, the way a replica that has lost its
+// write lease does.
+type fencedAPPSessionStore struct {
+	recordingAPPSessionStore
+	issueErr error
+}
+
+func (s *fencedAPPSessionStore) CanIssue() error { return s.issueErr }
+
+func (s *fencedAPPSessionStore) IssueNew(context.Context, string, string, string, int) error {
+	return s.issueErr
+}
+
+// A replica that may not issue must not delete the user's existing bearer
+// first. The revoke is not lease-gated (correctly — revoking is always safe)
+// and the issue is, so checking only inside IssueNew turned a refused login
+// into a logout: the old session gone, the replacement never created.
+func TestReplaceAPPTokenDoesNotDestroyTheOldSessionWhenFenced(t *testing.T) {
+	fenced := errors.New("writer lease lost")
+	store := &fencedAPPSessionStore{
+		recordingAPPSessionStore: recordingAPPSessionStore{oldToken: "old-app-token"},
+		issueErr:                 fenced,
+	}
+	u := &User{sessionStore: store}
+	replacer, ok := interface{}(u).(appTokenReplacer)
+	require.True(t, ok)
+
+	err := replacer.replaceAPPToken(context.Background(), "new-app-token", "payload", "u1")
+	require.ErrorIs(t, err, fenced)
+	require.NotContains(t, store.calls, "delete:old-app-token",
+		"the existing session must survive a refused login")
+}
+
 func TestReplaceAPPTokenRevokesPreviousBearerBeforeIssue(t *testing.T) {
 	store := &recordingAPPSessionStore{oldToken: "old-app-token"}
 	u := &User{sessionStore: store}

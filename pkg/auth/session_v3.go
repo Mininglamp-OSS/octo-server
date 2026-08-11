@@ -268,8 +268,8 @@ func (s *RedisSessionStore) ValidateLegacySession(ctx context.Context, info Toke
 // v3 under the supplied issuance fence; a missing credential returns false so
 // the caller can issue a new random token.
 func (s *RedisSessionStore) ReuseSession(ctx context.Context, token string, snapshot TokenInfo, fence IssueFence) (ok bool, err error) {
-	if !s.mayWrite() {
-		return false, ErrWriterLeaseLost
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return false, stateErr
 	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("reuse_session", started, err) }()
@@ -584,8 +584,8 @@ func (s *RedisSessionStore) IssueNewSession(ctx context.Context, token string, i
 	// makes "absent from the writer registry" prove "not writing", which the
 	// advance gate relies on. Reads and revocation are untouched: fencing new
 	// logins during a Redis outage is the intended degradation.
-	if !s.mayWrite() {
-		return ErrWriterLeaseLost
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return stateErr
 	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("issue_v3", started, err) }()
