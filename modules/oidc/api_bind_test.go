@@ -101,6 +101,19 @@ func newTestBindRouter(o *OIDC) *gin.Engine {
 	return r
 }
 
+func TestStateFromCtxUsesProxyAwareClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/auth/oidc/aegis/bind/confirm", nil)
+	c.Request.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
+
+	sd := stateFromCtx(wrapWk(c))
+	if sd.IP != "198.51.100.24" {
+		t.Fatalf("StateData.IP = %q, want trusted rightmost XFF", sd.IP)
+	}
+}
+
 func defaultBindCfg() BindConfig {
 	return BindConfig{
 		Enabled:        true,
