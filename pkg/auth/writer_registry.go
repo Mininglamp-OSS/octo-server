@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -321,7 +322,14 @@ func (c *WriterConvergence) Observe(entries []WriterEntry, now time.Time) time.D
 // merely changes the mode it advertises has changed the fleet's convergence
 // picture just as much as one that joins.
 func writerSetFingerprint(entries []WriterEntry) string {
-	parts := make([]string, 0, len(entries))
+	// Prefixed with the count so the empty set is not "" — which equals the
+	// struct's zero-value fingerprint, so the very first Observe of an empty
+	// roster skipped the reset and subtracted the zero time, reporting a window
+	// of ~292 years. Not reachable through the gate (an empty roster is refused
+	// independently), but a fail-open-shaped default inside a fail-closed gate is
+	// one refactor away from mattering.
+	parts := make([]string, 0, len(entries)+1)
+	parts = append(parts, strconv.Itoa(len(entries)))
 	for _, entry := range entries {
 		parts = append(parts, entry.ID+"|"+entry.Build+"|"+entry.AppliedState)
 	}

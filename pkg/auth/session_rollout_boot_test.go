@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
@@ -207,8 +208,9 @@ func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 	// command. That is the whole cost, and it is not ceremony: it is the only
 	// transition a pre-registry replica could be invisible across.
 	convergence := NewWriterConvergence()
+	markers := newMarkerStoreForTest(t)
 	priming, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
-		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: convergence,
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: convergence, Markers: markers,
 	})
 	require.NoError(t, err)
 	require.False(t, priming.Allowed)
@@ -221,6 +223,7 @@ func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 			MaxPerUID:     20,
 			ExpectWriters: 1,
 			Convergence:   convergence,
+			Markers:       markers,
 		})
 		require.NoError(t, err)
 		if decision.Current == SessionModeEnforce {
@@ -315,7 +318,8 @@ func TestFirstV3FloorAlwaysNeedsTheReplicaCount(t *testing.T) {
 	// The count alone is not enough any more: the set has to hold still for a
 	// lease TTL as well, so prime the window and let it mature.
 	converged := RolloutAdvanceInput{
-		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: NewWriterConvergence(),
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+		Convergence: NewWriterConvergence(), Markers: newMarkerStoreForTest(t),
 	}
 	priming, err := store.EvaluateRolloutAdvance(ctx, converged)
 	require.NoError(t, err)
@@ -908,7 +912,8 @@ func TestFirstV3FloorRequiresAStableWriterSetForALeaseTTL(t *testing.T) {
 
 	convergence := NewWriterConvergence()
 	input := RolloutAdvanceInput{
-		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: convergence,
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+		Convergence: convergence, Markers: newMarkerStoreForTest(t),
 	}
 
 	first, err := store.EvaluateRolloutAdvance(ctx, input)
@@ -944,7 +949,8 @@ func TestWriterSetChangeRestartsTheConvergenceWindow(t *testing.T) {
 
 	convergence := NewWriterConvergence()
 	input := RolloutAdvanceInput{
-		Registry: registry, MaxPerUID: 20, ExpectWriters: 2, Convergence: convergence,
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 2,
+		Convergence: convergence, Markers: newMarkerStoreForTest(t),
 	}
 	_, err := store.EvaluateRolloutAdvance(ctx, input)
 	require.NoError(t, err)
@@ -984,4 +990,25 @@ func TestLaterFloorsDoNotRequireTheConvergenceWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, SessionModeRevoke, decision.Target)
 	require.True(t, decision.Allowed, "blocked by: %s", decision.BlockedSummary())
+}
+
+// A26: every boot outcome this package defines must have a metric label.
+//
+// The two lists are separate on purpose — pkg/metrics does not import pkg/auth —
+// so nothing but this test stops them drifting. They already did: `unknown` was
+// added here and not there, and because the setter walks the label list, that
+// did not hide one value, it zeroed all of them and made the gauge's "exactly
+// one outcome is 1" contract false for the four boots an operator most needs to
+// see. An alert keyed on that gauge would never have fired.
+func TestEveryBootOutcomeHasAMetricLabel(t *testing.T) {
+	for _, outcome := range []RolloutBootOutcome{
+		RolloutBootFresh,
+		RolloutBootAdopted,
+		RolloutBootRecovered,
+		RolloutBootNormal,
+		RolloutBootUnknown,
+	} {
+		require.True(t, metrics.KnownSessionRolloutBootOutcome(string(outcome)),
+			"outcome %q has no metric label; the setter would zero every series", outcome)
+	}
 }

@@ -50,8 +50,14 @@ Authentication session runtime: mode=... rollout_floor=... boot=... auto_advance
   redis=<addr> instance=<fingerprint> token_ttl=... redis_pool_size=... build=...
 ```
 
-`boot=` 有四个取值，对应四种启动情形：`fresh`（全新）、`adopted`（从 #725 接管）、
-`rollback-recovered`（**Redis 丢过 floor**，见 §7）、`normal`。
+`boot=` 有五个取值，对应五种启动情形：`fresh`（全新）、`adopted`（从 #725 接管）、
+`rollback-recovered`（**Redis 丢过 floor**，见 §7）、`normal`、
+`unknown`（**floor 读不到、marker 也答不了**，见 §7）。
+
+`unknown` 时进程按 `enforce` 运行,但这是一个**猜测**而非观测:它不写 floor 记录,
+并且第一次真正读到 floor 时会被替换掉(可以向下)。它比 `rollback-recovered`
+更需要告警——后者会自愈,前者只说明"当时什么都读不到",若持续出现说明 Redis 或
+MySQL 有持续问题。
 
 ## 3. 唯一的命令
 
@@ -138,7 +144,9 @@ campaign ID。
    **不需要删除或修改任何 Redis key，也不会登出任何人。**
 3. 确认 `status` 的 `floor` 与升级前一致、`writers` 数量与副本数一致。
 4. **确认 `status` 的 `max_per_uid` 已经出现在 floor 记录里**，再删掉 configmap 里那三个
-   已废弃的 key。删早了会让下一次重启找不到 cap（此时会退到保守默认值 20 并告警）。
+   已废弃的 key。删早了会让下一次重启找不到 cap（此时会退到保守默认值 20 **并在启动日志
+   告警**）。**全新部署想自己选这个上界，也是设置 `OCTO_AUTH_SESSION_MAX_PER_UID`**——
+   它会被抄进 floor 记录后即可删除。不设就是 20。
 5. 确认无误后再打开 `AUTO_ADVANCE`（见 §6）。
 
 **注意灰度姿态**：如果升级前处在 #725 的 Phase D/E（`MODE` 比 floor 高一阶），
@@ -198,6 +206,23 @@ floor 但现在读不到了。系统会**向上取 `enforce`** 并重建记录�
 那批用户重新登录。这是刻意的——丢失时"精确恢复"意味着继续接受一批来自不一致快照的
 legacy token，而 session token 本就可丢弃。
 
+运行中丢失（不经过重启）走同一条路：poller 发现 floor 读到了但内容为空，会去问 MySQL
+标记——盖过章就按"丢失"重建到 `enforce`，没盖过就当全新部署。**它不会把一次丢失当成
+全新部署去重建 v3-write floor**，那会让随后重启的副本落回 v3-write，重新接纳 `bounded`
+已经开始拒绝的永久 legacy 会话。
+
+**floor 记录损坏且从未盖过 MySQL 标记**（`boot=unknown` 持续出现）：这是唯一需要人工
+介入 Redis 的情形。系统刻意**不覆盖**这条记录——它无法证明这个部署到底建立过 floor 没有，
+而猜错任一方向都有代价。此时 `status` 与 `advance --force` 都会直接报解码错误。修复步骤：
+
+1. 先确认连的是**正确的实例**（每条子命令开头打印的 `instance=` 指纹）；
+2. `redis-cli --no-auth-warning GET <uidTokenPrefix>auth:rollout-control` 取出内容，留档；
+3. 确认它确实不是合法 floor（合法形态：`{"mode_floor":"...","writer_version":3,...}`）；
+4. `DEL` 该 key。删除后：若 MySQL 标记存在，下一次 poll 会重建到 `enforce`；
+   若不存在，部署按全新处理从 `expand` 起步。
+
+删之前务必走完第 1 步。这一条是唯一没有 in-band 出口的状态。
+
 ## 8. 回滚
 
 | 当前 floor | 可回滚到 |
@@ -225,7 +250,7 @@ migration 的回滚语义不变：可暂停续跑；不得删除 campaign/checkp
 | `dmwork_session_floor_advance_total{to,actor}` | `actor` 区分自动与人工 |
 | `dmwork_session_reconcile_blocked_total{reason}` | 长期卡在非预期原因需要告警 |
 | `dmwork_session_reconcile_scan_total` | 增速异常说明退避没生效 |
-| `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 为 1 必须告警 |
+| `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 或 `unknown` 为 1 必须告警。`unknown` 不会自愈成一个已知状态,只会被下一次成功的 floor 读取纠正 |
 | `dmwork_session_rollout_mode{mode}` | 全体副本应收敛到同一值（灰度副本除外） |
 | `dmwork_session_undecodable_records` | 无法解码的记录数。**不阻塞任何一道 floor 门禁**（它们从来不是可用凭证，`observe` 的形态计数器只统计能解码的记录），但**没有任何东西会清掉它们**——migration 有意跳过,无 TTL 的键也不会自然过期。非 0 需要人看一眼 |
 

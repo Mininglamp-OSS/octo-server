@@ -300,6 +300,14 @@ func applyBootOverrides(boot *RolloutBoot, legacyMode SessionMode, legacyMaxPerU
 	}
 	if boot.MaxPerUID <= 0 {
 		boot.MaxPerUID = defaultRecoveryMaxPerUID
+		// Say so. The per-UID cap is a security control, this picks it without
+		// being asked, and the value then gets persisted into the floor record by
+		// EnsureRolloutMaxPerUID — so "silent" means an operator can end up with a
+		// bound they never chose and no way to notice. The runbook has always
+		// promised this warning; it just was not emitted.
+		boot.Warning = strings.TrimSpace(boot.Warning + fmt.Sprintf(
+			" no bounded sessions-per-UID was configured; falling back to %d — set %s to choose it",
+			defaultRecoveryMaxPerUID, sessionMaxPerUIDEnv))
 	}
 }
 

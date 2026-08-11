@@ -186,7 +186,22 @@ func (r *RolloutReconciler) runReconciler(ctx context.Context) {
 // learns the floor moved instead of being redeployed to be told.
 func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	control, err := r.store.RolloutControl(ctx)
-	if err != nil || control == nil {
+	if err != nil {
+		// Transient and undecidable: keep whatever this replica is running,
+		// including a provisional guess.
+		return
+	}
+	if control == nil {
+		// "Read succeeded, nothing there" is an OBSERVATION, not an absence of
+		// work — and returning here left a provisional enforce pinned for the
+		// life of the process, denying every existing v1/v2 session on that pod
+		// because of a Redis error that lasted two seconds inside the boot
+		// window.
+		//
+		// It is also three-way, exactly as it is at boot, so it needs the marker
+		// for the same reason: clearing the guess to expand unconditionally would
+		// be a fail-open on the RDB-rollback case.
+		r.resolveAbsentFloor(ctx)
 		return
 	}
 
@@ -223,6 +238,71 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 		// so rewriting an identical one every poll doubles registry traffic.
 		r.registry.SetAppliedStateIfChanged(string(applied))
 	}
+}
+
+// resolveAbsentFloor handles rows B2/B3/B4 of the boot-state table: the floor
+// read succeeded and returned nothing.
+//
+// Only the marker can say which of the three absences this is, and getting it
+// wrong costs in both directions — treating a loss as greenfield re-admits the
+// legacy bearers the rollout was retiring, and treating greenfield as a loss
+// pins the replica at enforce.
+//
+// Deliberately NOT gated on the pause flag. Pause stops the floor moving
+// FORWARD; this restores one that already existed, and boot performs the same
+// recovery unconditionally on every replica. Gating it here would only mean a
+// paused deployment recovers via pod restarts instead — the same outcome,
+// arrived at less predictably.
+func (r *RolloutReconciler) resolveAbsentFloor(ctx context.Context) {
+	if r.markers == nil {
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	marker, err := r.markers.Load(loadCtx)
+	switch {
+	case err != nil && !isMissingMarkerTable(err):
+		// B4: cannot decide. Keep the current mode, guess included.
+		return
+	case err == nil && marker != nil:
+		// B2: this deployment established a floor and Redis no longer has it.
+		// Recovery writes enforce with the marker as its evidence.
+		recovered, recoverErr := r.store.RecoverRolloutControlAtEnforce(ctx, r.recoveryMaxPerUID())
+		if recoverErr != nil {
+			r.log("session rollout: cannot recover lost floor: %v", recoverErr)
+			return
+		}
+		if !recovered {
+			// A valid floor reappeared between the read and the CAS — another
+			// replica's recovery, or an operator restoring a backup. Whatever it
+			// says is authoritative, and forcing enforce over it would raise this
+			// replica above a floor that is readable right now. The next poll
+			// reads it through the normal path.
+			return
+		}
+		if applyErr := r.store.ApplyRolloutState(SessionModeEnforce, r.recoveryMaxPerUID()); applyErr != nil {
+			r.log("session rollout: cannot apply recovered floor: %v", applyErr)
+			return
+		}
+		r.log("session rollout: floor was missing but this deployment initialised one at %s; "+
+			"restored at enforce", marker.InitializedAt.UTC().Format(time.RFC3339))
+	default:
+		// B3: genuinely never established. Applying expand is a no-op for an
+		// observed mode — the no-lowering rule still holds — and clears a
+		// provisional guess, which is the asymmetry `provisional` exists for.
+		if applyErr := r.store.ApplyRolloutState(SessionModeExpand, r.maxPerUID); applyErr != nil {
+			r.log("session rollout: cannot clear provisional mode: %v", applyErr)
+		}
+	}
+}
+
+// recoveryMaxPerUID keeps recovery appliable when no cap was configured: a
+// v3-writing mode with no bound fences every login.
+func (r *RolloutReconciler) recoveryMaxPerUID() int {
+	if r.maxPerUID > 0 {
+		return r.maxPerUID
+	}
+	return defaultRecoveryMaxPerUID
 }
 
 // ensureMarker stamps the initialisation marker whenever a floor exists without
@@ -281,6 +361,7 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 		ScanBatchSize: r.scanBatchSize,
 		ScanInterval:  r.scanInterval,
 		Convergence:   r.convergence,
+		Markers:       r.markers,
 	})
 	if err != nil {
 		// Back off on errors too. A scan that aborts partway makes this return
@@ -302,7 +383,15 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 			metrics.ObserveSessionReconcileBlocked(blockedReasonLabel(reason))
 		}
 		r.log("session rollout: holding at %s, blocked by %s", decision.Current, decision.BlockedSummary())
-		if decision.Scanned {
+		// The scan backoff is for blockers that need the keyspace to change —
+		// waiting out a legacy deadline measured in days must not mean rescanning
+		// every thirty seconds. The convergence window is not one of those: it is
+		// a statement about elapsed time that clears in one lease TTL, and the
+		// first evaluation is ALWAYS blocked on it because Observe has nothing to
+		// compare against yet. Backing off an hour for it made the first v3 floor
+		// take an hour of unattended wall clock on every deployment, greenfield
+		// included.
+		if decision.Scanned && !blockedOnlyOnConvergence(decision) {
 			return now.Add(reconcileScanBackoff)
 		}
 		return soon

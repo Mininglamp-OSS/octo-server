@@ -363,7 +363,7 @@ func sessionRolloutObserveUntilConverged(
 		if err != nil {
 			return decision, err
 		}
-		if decision.Allowed || !blockedOnlyOnConvergence(decision) || !time.Now().Before(deadline) {
+		if decision.Allowed || !decision.BlockedOnlyOnConvergence() || !time.Now().Before(deadline) {
 			return decision, nil
 		}
 		if attempt == 0 {
@@ -376,18 +376,6 @@ func sessionRolloutObserveUntilConverged(
 		case <-time.After(2 * time.Second):
 		}
 	}
-}
-
-func blockedOnlyOnConvergence(decision auth.RolloutAdvanceDecision) bool {
-	if len(decision.BlockedBy) == 0 {
-		return false
-	}
-	for _, reason := range decision.BlockedBy {
-		if !strings.Contains(reason, "stable for") && !strings.Contains(reason, "convergence has not been observed") {
-			return false
-		}
-	}
-	return true
 }
 
 func sessionRolloutAdvance(
@@ -411,6 +399,8 @@ func sessionRolloutAdvance(
 		// unattended-grade work on an operator's say-so was also the one that
 		// ignored the throttle.
 		ScanInterval: args.scanInterval,
+		// Rows C4/C5: an absent floor is only greenfield if the marker agrees.
+		Markers: markers,
 		// The first v3 floor requires the writer set to hold still for a lease
 		// TTL, which a single evaluation cannot establish. Rather than making
 		// break-glass structurally impossible for that one transition, watch for

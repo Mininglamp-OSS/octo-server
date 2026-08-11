@@ -190,7 +190,29 @@ var sessionRolloutModes = []string{"expand", "v3-write", "revoke", "bounded", "e
 
 // sessionRolloutBootOutcomes mirrors auth.RolloutBootOutcome. Kept as literals
 // so pkg/metrics does not import pkg/auth.
-var sessionRolloutBootOutcomes = []string{"fresh", "adopted", "rollback-recovered", "normal"}
+// "unknown" is the outcome for a boot that could not read the floor and could
+// not consult the marker. Omitting it did not merely hide one value: the setter
+// walks this list, so a call with an unlisted outcome set EVERY series to 0 and
+// falsified the gauge's own "exactly one outcome is 1" contract — for precisely
+// the boot an operator most needs to see, since unlike a recovery it does not
+// resolve itself.
+var sessionRolloutBootOutcomes = []string{"fresh", "adopted", "rollback-recovered", "normal", "unknown"}
+
+// KnownSessionRolloutBootOutcome reports whether an outcome has a label.
+//
+// Exported so pkg/auth can assert that every outcome it defines is listed here.
+// This list is hand-maintained because pkg/metrics deliberately does not import
+// pkg/auth, and a hand-maintained mirror drifts: `unknown` was added to auth and
+// not here, which did not merely hide one value — the setter walks this list, so
+// an unlisted outcome zeroed EVERY series and falsified the gauge's own contract.
+func KnownSessionRolloutBootOutcome(outcome string) bool {
+	for _, known := range sessionRolloutBootOutcomes {
+		if known == outcome {
+			return true
+		}
+	}
+	return false
+}
 
 // SetSessionLiveWriters records how many writers hold a live lease.
 func SetSessionLiveWriters(count int) {

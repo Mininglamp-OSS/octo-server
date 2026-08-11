@@ -30,6 +30,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 )
 
+// The two convergence blockers are named constants because three places must
+// agree on them: the predicate that emits them, the reconciler's backoff, and
+// the CLI's watch loop. Two of those matched them with a hand-written substring.
+const (
+	convergenceBlockedPrefix    = "writer set stable for "
+	convergenceUnobservedReason = "writer convergence has not been observed over time"
+)
+
 // RolloutAdvanceDecision is what the reconciler and `advance --force` both act
 // on. BlockedBy entries are operator-facing and low cardinality.
 type RolloutAdvanceDecision struct {
@@ -62,6 +70,11 @@ type RolloutAdvanceInput struct {
 	ExpectWriters int
 	// MaxPerUID is required when crossing into a v3-writing floor.
 	MaxPerUID int
+	// Markers answers the one question a missing floor cannot answer about
+	// itself: was one ever established here? Required whenever the floor reads
+	// as absent, because "never created" and "created and lost" need opposite
+	// reactions — see .octospec/tasks/.../boot-state-table.md rows C3/C4.
+	Markers *RolloutMarkerStore
 	// Convergence carries the caller's observation window across evaluations.
 	// Required for the first v3 floor, where a count taken at one instant is not
 	// enough — see WriterConvergence. A caller that cannot observe over time
@@ -93,6 +106,37 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 			// reconciler goes quiet from here.
 			decision.BlockedBy = []string{"floor is already enforce"}
 			return decision, nil
+		}
+	}
+
+	if control == nil {
+		// A floor that reads as absent is three states, not one: never created,
+		// created and lost, or not created yet. Only the marker separates them,
+		// and this path had no marker at all — so an in-flight loss (RDB
+		// rollback, an accidental DEL) read as greenfield and the reconciler
+		// re-created the ladder at v3-write OVER a stamped marker. Any replica
+		// restarting in that window boots at v3-write, which accepts exactly the
+		// persistent and over-max legacy bearers bounded had begun rejecting.
+		//
+		// Recovery, not advancement, is the answer to a lost floor: it restores
+		// enforce in one write with the marker as its evidence. So refuse here
+		// and let the poller's recovery path do it — one writer for that job.
+		switch {
+		case in.Markers == nil:
+			decision.BlockedBy = append(decision.BlockedBy,
+				"cannot determine whether a floor was ever initialised here")
+		default:
+			marker, markerErr := in.Markers.Load(ctx)
+			switch {
+			case markerErr != nil && !isMissingMarkerTable(markerErr):
+				decision.BlockedBy = append(decision.BlockedBy,
+					"initialisation marker is unreadable")
+			case markerErr == nil && marker != nil:
+				decision.BlockedBy = append(decision.BlockedBy,
+					fmt.Sprintf("floor is missing but this deployment initialised one at %s; "+
+						"it must be recovered, not re-created",
+						marker.InitializedAt.UTC().Format(time.RFC3339)))
+			}
 		}
 	}
 
@@ -197,12 +241,12 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		switch {
 		case in.Convergence == nil:
 			decision.BlockedBy = append(decision.BlockedBy,
-				"writer convergence has not been observed over time")
+				convergenceUnobservedReason)
 		default:
 			stable := in.Convergence.Observe(entries, s.now())
 			if stable < writerLeaseTTL {
 				decision.BlockedBy = append(decision.BlockedBy,
-					fmt.Sprintf("writer set stable for %s, need %s", stable.Truncate(time.Second), writerLeaseTTL))
+					fmt.Sprintf("%s%s, need %s", convergenceBlockedPrefix, stable.Truncate(time.Second), writerLeaseTTL))
 			}
 		}
 	}
@@ -249,3 +293,28 @@ func (d RolloutAdvanceDecision) BlockedSummary() string {
 	}
 	return strings.Join(d.BlockedBy, "; ")
 }
+
+// blockedOnlyOnConvergence reports whether the sole thing standing in the way is
+// the passage of time. Those blockers resolve by re-asking; every other one
+// describes the fleet or the keyspace and will not change because a caller asked
+// twice, so waiting on them is just a slower refusal.
+//
+// Both the reconciler's backoff and the CLI's watch loop key off this, and they
+// must agree: a divergence would mean the command an operator runs and the loop
+// it is diagnosing disagree about whether waiting can help.
+func blockedOnlyOnConvergence(decision RolloutAdvanceDecision) bool {
+	if len(decision.BlockedBy) == 0 {
+		return false
+	}
+	for _, reason := range decision.BlockedBy {
+		if !strings.Contains(reason, convergenceBlockedPrefix) &&
+			!strings.Contains(reason, convergenceUnobservedReason) {
+			return false
+		}
+	}
+	return true
+}
+
+// BlockedOnlyOnConvergence is the exported form, for callers outside this
+// package that poll the predicate.
+func (d RolloutAdvanceDecision) BlockedOnlyOnConvergence() bool { return blockedOnlyOnConvergence(d) }

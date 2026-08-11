@@ -658,3 +658,206 @@ func TestRecoveryStillReplacesAnAbsentOrUnparseableFloor(t *testing.T) {
 		})
 	}
 }
+
+// newUnreadableMarkerStore returns a store whose Load fails with something that
+// is NOT "table does not exist" — the one marker error that must not be read as
+// "nothing was ever stamped".
+func newUnreadableMarkerStore(t *testing.T) *RolloutMarkerStore {
+	t.Helper()
+	db, err := sql.Open("mysql", rolloutMarkerTestDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &dbr.NullEventReceiver{}}
+	return NewRolloutMarkerStore(conn.NewSession(nil))
+}
+
+// Gap 1 (rows A5/A9): an unreadable marker leaves boot undecidable, and the
+// caller's fallback must resolve strict WITHOUT writing a floor.
+//
+// ResolveRolloutBoot surfaces the error rather than guessing — with neither the
+// floor nor the marker readable there is nothing to decide from. runtime.go then
+// applies StrictRolloutBoot, and the property that matters is that it reports
+// `unknown` rather than `rollback-recovered`: Recovered makes runtime WRITE an
+// enforce floor, which on a greenfield deployment would jump the entire ladder
+// irreversibly on the strength of a MySQL timeout.
+func TestBootWithUnreadableMarkerIsUndecidableAndWritesNoFloor(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name     string
+		failRead bool
+	}{
+		{name: "A5: floor absent, marker unreadable"},
+		{name: "A9: floor unreadable, marker unreadable", failRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+			markers := newUnreadableMarkerStore(t)
+			if tc.failRead {
+				require.NoError(t, client.Set(store.rolloutControlKey(), "{not json", 0).Err())
+			}
+
+			_, err := ResolveRolloutBoot(ctx, store, markers, "", 0)
+			require.Error(t, err, "neither source can answer, so boot must not invent one")
+
+			boot := StrictRolloutBoot(err, "", 0)
+			require.Equal(t, RolloutBootUnknown, boot.Outcome,
+				"Recovered would make runtime write an enforce floor on a MySQL timeout")
+			require.Equal(t, SessionModeEnforce, boot.Mode)
+			require.True(t, boot.Provisional)
+			require.Positive(t, boot.MaxPerUID,
+				"enforce with no cap fences every login permanently")
+		})
+	}
+}
+
+// Gap 2 (rows B2/B3/B4): the poller's absent-floor row.
+//
+// "The floor read succeeded and returned nothing" is an OBSERVATION, not an
+// absence of work — and it is three-way. Treating it as nothing to do is what
+// left a provisional enforce pinned for the life of the process; treating it as
+// greenfield unconditionally would be a fail-open on the RDB-rollback case the
+// marker exists to catch.
+func TestPollerResolvesAnAbsentFloorAgainstTheMarker(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("B3: no marker -> the guess is cleared to expand", func(t *testing.T) {
+		h := newBootHarness(t, true)
+		withFailingFloorRead(t)
+		boot := h.boot(t, "", 0)
+		require.Equal(t, RolloutBootUnknown, boot.Outcome)
+		require.Equal(t, SessionModeEnforce, h.store.Mode())
+
+		restoreRolloutRead(t)
+		r := NewRolloutReconciler(h.store, ReconcilerOptions{Markers: h.markers, MaxPerUID: 20})
+		r.pollFloor(ctx)
+
+		require.Equal(t, SessionModeExpand, h.store.Mode(),
+			"a greenfield deployment must not stay pinned at enforce by a transient boot error")
+	})
+
+	t.Run("B2: marker present -> recover upward, never expand", func(t *testing.T) {
+		// The loss happens to a RUNNING process, after a clean boot. Seeding it
+		// through a failed boot read instead would prove nothing: boot's own
+		// recovery writes the floor, so the poller would find one and never
+		// reach this row at all.
+		h := newBootHarness(t, true)
+		boot := h.boot(t, "", 0)
+		require.Equal(t, RolloutBootFresh, boot.Outcome)
+		require.Equal(t, SessionModeExpand, h.store.Mode())
+
+		// This deployment did establish a floor, and Redis has since lost it.
+		require.NoError(t, h.markers.StampOnce(ctx, SessionModeBounded))
+		require.NoError(t, h.store.client.Del(h.store.rolloutControlKey()).Err())
+
+		r := NewRolloutReconciler(h.store, ReconcilerOptions{Markers: h.markers, MaxPerUID: 20})
+		r.pollFloor(ctx)
+
+		require.Equal(t, SessionModeEnforce, h.store.Mode(),
+			"a lost floor must resolve upward, never be re-read as greenfield")
+		control, err := h.store.RolloutControl(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, control, "the lost floor must be restored, not left absent")
+		require.Equal(t, SessionModeEnforce, control.ModeFloor)
+	})
+
+	t.Run("B1: an observed floor is never lowered by the guess-clearing path", func(t *testing.T) {
+		h := newBootHarness(t, true)
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+		boot := h.boot(t, "", 0)
+		require.False(t, boot.Provisional)
+		require.Equal(t, SessionModeRevoke, h.store.Mode())
+
+		// Floor deleted under a running, non-provisional process.
+		require.NoError(t, h.store.client.Del(h.store.rolloutControlKey()).Err())
+		r := NewRolloutReconciler(h.store, ReconcilerOptions{Markers: h.markers, MaxPerUID: 20})
+		r.pollFloor(ctx)
+
+		require.Equal(t, SessionModeRevoke, h.store.Mode(),
+			"an observed mode must never be lowered, marker or not")
+	})
+}
+
+// Gap 3 (rows C4/C5): the predicate must not treat a LOST floor as a fresh one.
+//
+// This is row B2 seen from the other path. An in-flight loss leaves the
+// predicate looking at control == nil, and without the marker it targets
+// v3-write as a first floor — re-creating the ladder over a stamped marker.
+// Any replica restarting in that window boots at v3-write, which accepts
+// exactly the persistent and over-max legacy bearers bounded had started to
+// reject.
+func TestPredicateRefusesToRecreateALostFloor(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("C4: marker present -> refuse, recovery restores it", func(t *testing.T) {
+		h := newBootHarness(t, true)
+		require.NoError(t, h.markers.StampOnce(ctx, SessionModeBounded))
+		registry := NewWriterRegistry(h.store.client, h.store.uidTokenPrefix)
+		regCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeBounded), nil))
+		t.Cleanup(func() { _ = h.store.client.Del(h.store.uidTokenPrefix + "writers").Err() })
+
+		decision, err := h.store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+			Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+			Convergence: NewWriterConvergence(), Markers: h.markers,
+		})
+		require.NoError(t, err)
+		require.False(t, decision.Allowed,
+			"a floor that was lost must be recovered, not re-created one phase at a time")
+		require.Contains(t, decision.BlockedSummary(), "initialised")
+	})
+
+	t.Run("C5: no marker store -> refuse, the two cases are indistinguishable", func(t *testing.T) {
+		store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+		registry := NewWriterRegistry(client, store.uidTokenPrefix)
+		regCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
+		t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+		// Satisfy the convergence window first, so the only thing left standing
+		// in the way is the question this row is about. Asserting merely
+		// "not allowed" would pass on the convergence blocker alone and pin
+		// nothing.
+		clock := time.Now().UTC()
+		store.now = func() time.Time { return clock }
+		input := RolloutAdvanceInput{
+			Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: NewWriterConvergence(),
+		}
+		_, err := store.EvaluateRolloutAdvance(ctx, input)
+		require.NoError(t, err)
+		clock = clock.Add(writerLeaseTTL + time.Second)
+
+		decision, err := store.EvaluateRolloutAdvance(ctx, input)
+		require.NoError(t, err)
+		require.False(t, decision.Allowed)
+		require.Contains(t, decision.BlockedSummary(), "ever initialised",
+			"the refusal must be about the unanswerable question, not about the window")
+	})
+
+	t.Run("C3: genuinely fresh still establishes the first floor", func(t *testing.T) {
+		h := newBootHarness(t, true)
+		clock := time.Now().UTC()
+		h.store.now = func() time.Time { return clock }
+		registry := NewWriterRegistry(h.store.client, h.store.uidTokenPrefix)
+		regCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
+		t.Cleanup(func() { _ = h.store.client.Del(h.store.uidTokenPrefix + "writers").Err() })
+
+		input := RolloutAdvanceInput{
+			Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+			Convergence: NewWriterConvergence(), Markers: h.markers,
+		}
+		_, err := h.store.EvaluateRolloutAdvance(ctx, input)
+		require.NoError(t, err)
+		clock = clock.Add(writerLeaseTTL + time.Second)
+
+		decision, err := h.store.EvaluateRolloutAdvance(ctx, input)
+		require.NoError(t, err)
+		require.True(t, decision.Allowed, "blocked by: %s", decision.BlockedSummary())
+		require.Equal(t, SessionModeV3Write, decision.Target)
+	})
+}
