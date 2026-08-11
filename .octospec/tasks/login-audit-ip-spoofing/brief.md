@@ -103,7 +103,9 @@ only the 15 user call sites would leave OIDC login audit spoofable.
 - `oidc-callback-guard` — the existing failure-only callback guard keeps its
   thresholds, reset behavior, Redis key prefix, and error contract; source-IP
   key derivation changes from spoofable leftmost XFF to the validated,
-  canonical value returned by `wkhttp.ClientIP`.
+  canonical value returned by `wkhttp.ClientIP`. A malformed or ambiguous
+  header returns an empty value from that selector and must use the guard's
+  stable unknown-IP bucket, never bypass the failure counter.
 - `audit-data-contract` — `login_log.login_ip` and `oidc_audit_log.ip` schemas
   do not change. `normalizeLoginIP` remains at the user audit insertion boundary
   to enforce valid, canonical IP text and protect the `VARCHAR(40)` field.
@@ -128,18 +130,25 @@ only the 15 user call sites would leave OIDC login audit spoofable.
 - Globally changing either octo-lib or octo-server
   `util.GetClientPublicIP`; non-security display and geolocation consumers keep
   their existing behavior.
-- Configuring Gin `SetTrustedProxies`. A complete implementation first requires
-  octo-lib to expose the private Gin engine's proxy configuration and operations
-  to provide the actual direct-proxy CIDRs. This remains a follow-up hardening
-  item.
+- Configuring Gin `SetTrustedProxies` or consolidating every local client-IP
+  parser. The repository already has `OCTO_TRUSTED_PROXY_CIDRS` for i18n caller
+  resolution, but wiring that policy into wkhttp/Gin and reconciling all parser
+  consumers is a separate rollout with its own topology validation.
 - Supporting an unverified CDN or multi-proxy topology. The rightmost-XFF rule
   is deliberately tied to the current single-CLB deployment contract.
 - Changing the QR login confirmation UI to display IP/device evidence. The
   current qrcode code only documents why this evidence is not shown.
 - Fixing the separate live `c.ClientIP()` uses in `modules/messages_search` and
   `modules/usersecret`; track and assess those independently.
+- Replacing the independent `modules/incomingwebhook/ratelimit.go` client-IP
+  parser. It has different XFF/X-Real-IP precedence and multi-header handling;
+  move it to `wkhttp.ClientIP` with dedicated delivery-rate-limit tests in a
+  follow-up rather than expanding this login-audit PR.
 - Changing OIDC callback guard quotas, introducing a new rate-limit middleware,
   or altering login/account lockout policy.
+- Changing empty-IP welcome-message rendering or the stale QR-code IP
+  commentary. They are user-experience/documentation follow-ups, not part of
+  audit attribution or callback-guard enforcement.
 - Database migrations, historical audit-row repair, IP geolocation changes, or
   retroactive attribution of already-spoofed rows.
 
@@ -172,8 +181,11 @@ only the 15 user call sites would leave OIDC login audit spoofable.
   focused tests have passed against it.
 - All 15 user-module and four OIDC direct
   `util.GetClientPublicIP(c.Request)` calls in scope use `wkhttp.ClientIP`.
-- A source guard fails if `util.GetClientPublicIP(c.Request)` is reintroduced
-  under `modules/user` or `modules/oidc` without an explicit test exemption.
+- Directory-level source guards scan every production `.go` file under
+  `modules/user` and `modules/oidc` (excluding `_test.go`), detect
+  `util.GetClientPublicIP` even when imported with an alias, retain the 15/4
+  `wkhttp.ClientIP` call inventory, and require a named, justified exemption
+  for any intentional legacy use.
 - `normalizeLoginIP` remains in both `recordSuccess` and `recordFailure`; its
   tests continue to cover canonical IPv4/IPv6 and rejection of malformed or
   overlong text. Its comments describe validation as defense in depth rather
@@ -181,8 +193,13 @@ only the 15 user call sites would leave OIDC login audit spoofable.
 - A representative successful login and failed login test send a forged
   leftmost XFF plus an actual rightmost value and assert that `login_log` stores
   only the actual rightmost IP.
+- At least one user `/v1/user/login` router test drives `ServeHTTP` and queries
+  `login_log`, proving handler wiring (rather than only the audit DB boundary)
+  stores the rightmost XFF value.
 - OIDC tests prove that the same header shape supplies the actual rightmost IP
   to `StateData`/audit/session issuance and to the callback failure guard key.
+- OIDC callback tests prove an invalid final XFF value still increments the
+  stable unknown-IP bucket and reaches the existing callback threshold.
 - No user/OIDC error response, login response, route, database schema, or i18n
   catalog changes.
 - Focused tests pass in each repository:
@@ -268,3 +285,19 @@ only the 15 user call sites would leave OIDC login audit spoofable.
   `modules/user/sql/20210204000001_user_legacy01.sql`. This is an isolated-schema
   fixture gap, not a login-audit assertion failure; a clean full user/repo run
   remains a pre-merge CI gate.
+- Review follow-up RED checkpoint `662383a5` demonstrates the newly reachable
+  empty-IP path: three invalid-final-XFF callback failures returned 400 and the
+  fourth was incorrectly still 400 instead of 429. It also adds AST-backed
+  directory source guards and a real `/v1/user/login` failure-route audit test.
+  GREEN checkpoint `0cc82cf9` maps empty selector output to the guard's stable
+  `__unknown_ip__` bucket without changing thresholds, window, Redis prefix, or
+  reset semantics. The focused OIDC reproducer and user route/source-guard test
+  pass; the complete OIDC package passes in
+  `octo_login_audit_oidc_lusaka_20260811`.
+- The review follow-up also passes focused `-race` runs for those OIDC and user
+  targets, `GOWORK=off go vet ./...`, `GOWORK=off golangci-lint run ./...`
+  (0 issues), `GOWORK=off go mod verify`, and `git diff --check`.
+- The same complete OIDC command against the shared default `test` database is
+  not counted green: setup panics at `unknown migration in database` for
+  `20191106000001_event_legacy01.sql`. The isolated-schema pass above is the
+  relevant package evidence; a clean CI database remains the merge gate.

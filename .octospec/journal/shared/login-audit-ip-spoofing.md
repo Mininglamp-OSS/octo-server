@@ -25,6 +25,17 @@ source: self
 - `normalizeLoginIP` remains at the user audit insertion boundary as defense in
   depth. No route, response, error envelope, schema, quota, or welcome-message
   ordering changed; non-security `util.GetClientPublicIP` callers are untouched.
+- Review follow-up closes the malformed-header bypass: when `wkhttp.ClientIP`
+  deliberately returns empty for an invalid or ambiguous final header,
+  `CallbackGuard` now uses its stable `__unknown_ip__` bucket for check,
+  failure-recording, and reset instead of silently treating the request as
+  unidentifiable. Its existing threshold/window/prefix and Redis fail-open
+  contract remain intact.
+- User and OIDC source guards now scan all production Go files in each package
+  with AST import-alias handling, preserve the 15/4 `wkhttp.ClientIP` inventory,
+  and reserve named exemptions for any intentional legacy use. A real
+  `/v1/user/login` `ServeHTTP` test now verifies the persisted failed-login
+  audit IP is the proxy-appended rightmost XFF value.
 
 ## Load-bearing decisions
 
@@ -51,6 +62,16 @@ source: self
 - The complete user-package run is not claimed green: its filtered failures are
   pre-existing dashboard-reader tests whose isolated schema lacks legacy column
   `user.app_id`. A clean CI run remains the pre-merge full-suite gate.
+- Review TDD evidence: `662383a5` is RED — three malformed-final-XFF callback
+  failures did not consume the callback budget and a fourth request still got
+  400. `0cc82cf9` is GREEN — the fourth request receives the established 429
+  path. The focused user route/source-guard target passes, and the complete
+  OIDC package passes in its independent isolated schema. The equivalent
+  default-database OIDC run remains blocked before assertions by stale shared
+  migration state (`unknown migration ... 20191106000001_event_legacy01.sql`).
+- Focused race runs for the new user and OIDC coverage pass, as do
+  `GOWORK=off go vet ./...`, `GOWORK=off golangci-lint run ./...` (0 issues),
+  `GOWORK=off go mod verify`, and `git diff --check`.
 
 ## Rollout and rollback
 
@@ -60,3 +81,7 @@ source: self
   broken topology assumption.
 - Roll back the octo-server binary/dependency set. No schema rollback or
   historical audit rewrite is required or safe.
+- The independent incoming-webhook IP parser, global Gin trusted-proxy wiring,
+  empty-IP welcome-message formatting, and the QR-code commentary remain
+  explicitly out of scope for this PR and are documented as follow-ups in the
+  task brief.
