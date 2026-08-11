@@ -482,6 +482,42 @@ func TestAPI_Callback_RateLimited(t *testing.T) {
 	}
 }
 
+// ClientIP 对畸形最终 XFF 返回空串；callback guard 必须把这种请求归入稳定的
+// unknown-IP 桶，而不是因为没有可用 IP 就跳过失败计数。
+func TestAPI_Callback_InvalidFinalXFFUsesUnknownBucket(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.cbGuard = NewCallbackGuard(newCallbackGuardRedis(t), 3, 5*time.Minute)
+
+	const unknownIP = "__unknown_ip__"
+	unknownKey := o.cbGuard.key(unknownIP)
+	if err := o.cbGuard.redis.Del(unknownKey); err != nil {
+		t.Fatalf("clear unknown-IP callback bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = o.cbGuard.redis.Del(unknownKey) })
+
+	r := newTestRouter(o)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest("GET",
+			"/v1/auth/oidc/aegis/callback?state=never-saved&code=x", nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.10, not-an-ip")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d status = %d, want 400; body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state=never-saved&code=x", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, not-an-ip")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status after unknown-IP threshold = %d, want 429; body=%s", w.Code, w.Body.String())
+	}
+}
+
 // 成功 callback 应落 EventCallbackOK 审计;IdP 错误应落 EventCallbackFail。
 func TestAPI_Callback_AuditTrail(t *testing.T) {
 	mp := NewMockProvider(t)

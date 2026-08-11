@@ -60,12 +60,18 @@ func TestCallbackGuard_Reset_ClearsCounter(t *testing.T) {
 	assert.NoError(t, g.Check(ip))
 }
 
-func TestCallbackGuard_EmptyIPIsNoop(t *testing.T) {
+func TestCallbackGuard_EmptyIPUsesUnknownBucket(t *testing.T) {
 	g := NewCallbackGuard(newCallbackGuardRedis(t), 3, 5*time.Minute)
-	assert.NoError(t, g.RecordFailure(""))
-	assert.NoError(t, g.RecordFailure("   "))
-	assert.NoError(t, g.Check(""))
+	const unknownIP = "__unknown_ip__"
+	assert.NoError(t, g.redis.Del(g.key(unknownIP)))
+	t.Cleanup(func() { _ = g.redis.Del(g.key(unknownIP)) })
+
+	for i := 0; i < 3; i++ {
+		assert.NoError(t, g.RecordFailure(""))
+	}
+	assert.ErrorIs(t, g.Check("   "), ErrCallbackBlocked)
 	assert.NoError(t, g.Reset(""))
+	assert.NoError(t, g.Check(""))
 }
 
 func TestCallbackGuard_DefaultThresholdAndWindow(t *testing.T) {
