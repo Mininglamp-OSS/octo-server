@@ -77,7 +77,11 @@ type RolloutReconciler struct {
 	scanBatchSize int64
 	scanInterval  time.Duration
 	markerStamped atomic.Bool
-	log           func(format string, args ...interface{})
+	// convergence carries the writer-set observation window across cycles. It
+	// belongs to the reconciler rather than the predicate because the predicate
+	// is evaluated per decision and the window spans several.
+	convergence *WriterConvergence
+	log         func(format string, args ...interface{})
 }
 
 type ReconcilerOptions struct {
@@ -121,6 +125,7 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 		maxPerUID:     opts.MaxPerUID,
 		scanBatchSize: batch,
 		scanInterval:  interval,
+		convergence:   NewWriterConvergence(),
 		log:           log,
 	}
 }
@@ -275,6 +280,7 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 		MaxPerUID:     r.maxPerUID,
 		ScanBatchSize: r.scanBatchSize,
 		ScanInterval:  r.scanInterval,
+		Convergence:   r.convergence,
 	})
 	if err != nil {
 		// Back off on errors too. A scan that aborts partway makes this return
@@ -351,6 +357,8 @@ func blockedReasonLabel(reason string) string {
 		return "not-converged"
 	case strings.Contains(reason, "expected"):
 		return "writer-count-mismatch"
+	case strings.Contains(reason, "stable for"), strings.Contains(reason, "convergence has not been observed"):
+		return "not-converged-long-enough"
 	case strings.Contains(reason, sessionExpectWritersEnv):
 		return "expect-writers-unset"
 	case strings.Contains(reason, "v1="):

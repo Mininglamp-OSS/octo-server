@@ -113,6 +113,11 @@ const (
 	// RolloutBootRecovered: marker present, floor missing. Redis lost the
 	// floor. Resolve upward to enforce and shout.
 	RolloutBootRecovered RolloutBootOutcome = "rollback-recovered"
+	// RolloutBootUnknown: floor unreadable and the marker cannot say whether one
+	// ever existed. Distinct from Recovered because there is no proof of a floor
+	// to recover, so this writes nothing — and distinct from Fresh because the
+	// absence of proof is not proof of absence.
+	RolloutBootUnknown RolloutBootOutcome = "unknown"
 	// RolloutBootNormal: marker and floor both present.
 	RolloutBootNormal RolloutBootOutcome = "normal"
 )
@@ -127,6 +132,10 @@ type RolloutBoot struct {
 	// Warning is non-empty when an operator needs to know something: a
 	// recovered rollback, or a legacy env mode still sitting above the floor.
 	Warning string
+	// Provisional marks a Mode that was guessed from a failed read rather than
+	// derived from an observed floor. A provisional mode may be replaced
+	// downward by the first floor that actually reads; an observed one may not.
+	Provisional bool
 
 	// Deployment-side knobs, echoed here so the server wiring reads one struct
 	// rather than re-parsing the environment.
@@ -204,19 +213,21 @@ func ResolveRolloutBoot(
 		}
 	}
 
+	// Order matters, and it is the order of what each branch can PROVE.
+	//
+	// The marker proves "a floor was established here at least once" and nothing
+	// else. It cannot prove the negative: its absence also covers the whole
+	// window before some replica's poller stamps the row, and the boot on which
+	// the table does not exist yet. So the absence of a marker only means
+	// "unproven", never "never".
+	//
+	// That distinction is the bug this ordering fixes. An unreadable floor with
+	// no marker used to be classified fresh and run at expand — and expand stops
+	// consulting legacy deny markers, so every bearer revoked at revoke, bounded
+	// or enforce was admitted again. "Could not read" is not "is not there".
 	boot := RolloutBoot{}
 	switch {
-	case marker == nil:
-		// Never initialised: nothing to protect, and expand is what this
-		// deployment already had.
-		boot.Outcome = RolloutBootFresh
-		boot.Mode = SessionModeExpand
-		if controlErr != nil {
-			boot.Warning = fmt.Sprintf(
-				"session rollout floor unreadable (%v) and no floor was ever established; holding at %s",
-				controlErr, SessionModeExpand)
-		}
-	default:
+	case marker != nil:
 		boot.Outcome = RolloutBootRecovered
 		boot.Floor = SessionModeEnforce
 		boot.Mode = SessionModeEnforce
@@ -232,6 +243,33 @@ func ResolveRolloutBoot(
 			"session rollout floor %s but this deployment initialised one at %s; "+
 				"treating it as Redis data loss and resolving upward to enforce",
 			reason, marker.InitializedAt.UTC().Format(time.RFC3339))
+
+	case controlErr != nil:
+		// Unknown, not fresh. Nothing here proves a floor was never established,
+		// so the only safe reading posture is the strictest one.
+		//
+		// Provisional, though — and that distinction is load-bearing. This is a
+		// guess made from a failed read, not an observed floor, so it must not
+		// behave like one: it writes no recovery record (there is no proof of a
+		// floor to recover) and the first successful read is allowed to replace
+		// it downward. Without that, a single slow EVAL during a rolling upgrade
+		// would pin every replica at enforce for the rest of its life and log
+		// out the entire user base over a transient error.
+		boot.Outcome = RolloutBootUnknown
+		boot.Mode = SessionModeEnforce
+		boot.Provisional = true
+		boot.MaxPerUID = firstPositive(legacyMaxPerUID, defaultRecoveryMaxPerUID)
+		boot.Warning = fmt.Sprintf(
+			"session rollout floor unreadable (%v) and no marker is available to say whether one exists; "+
+				"holding at %s provisionally until a floor can be read",
+			controlErr, SessionModeEnforce)
+
+	default:
+		// controlErr == nil AND control == nil AND no marker: the floor is
+		// genuinely absent and was genuinely never established. Nothing to
+		// protect, and expand is what this deployment already had.
+		boot.Outcome = RolloutBootFresh
+		boot.Mode = SessionModeExpand
 	}
 	applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
 	return boot, nil
@@ -270,15 +308,20 @@ func applyBootOverrides(boot *RolloutBoot, legacyMode SessionMode, legacyMaxPerU
 // struct at the call site skipped the cap fallback and produced enforce with no
 // cap, which fences every login permanently and writes no floor to recover
 // from.
+// It is deliberately Unknown rather than Recovered. This is reached when the
+// floor could not answer AND the marker could not be read, so nothing has
+// established that a floor ever existed — and Recovered would make runtime WRITE
+// an enforce floor on that non-evidence, jumping a greenfield deployment's whole
+// ladder because MySQL blipped for two seconds.
 func StrictRolloutBoot(reason error, legacyMode SessionMode, legacyMaxPerUID int) RolloutBoot {
 	boot := RolloutBoot{
-		Outcome: RolloutBootRecovered,
-		Floor:   SessionModeEnforce,
-		Mode:    SessionModeEnforce,
+		Outcome:     RolloutBootUnknown,
+		Mode:        SessionModeEnforce,
+		Provisional: true,
 	}
 	applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
 	boot.Warning = fmt.Sprintf(
-		"session rollout state unresolvable at boot (%v); resolving upward to %s", reason, boot.Mode)
+		"session rollout state unresolvable at boot (%v); holding at %s provisionally", reason, boot.Mode)
 	return boot
 }
 

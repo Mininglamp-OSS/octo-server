@@ -90,6 +90,8 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	yes := flags.Bool("yes", false, "advance --force: confirm")
 	expectWriters := flags.Int("expect-writers", 0, "advance: replica count the deployment intends to run")
 	maxPerUID := flags.Int("max-per-uid", 0, "advance: bounded sessions per UID to carry into the floor record")
+	observeWindow := flags.Duration("observe-window", 90*time.Second,
+		"advance: how long to watch the writer set hold still before the first v3 floor")
 	if err := flags.Parse(rest); err != nil {
 		return err
 	}
@@ -178,6 +180,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 			maxPerUID:     *maxPerUID,
 			batchSize:     *batchSize,
 			scanInterval:  scanInterval,
+			observeWindow: *observeWindow,
 		})
 	default:
 		// Unreachable: sessionRolloutSubcommands gates this above. Kept so
@@ -333,6 +336,58 @@ type sessionRolloutAdvanceArgs struct {
 	maxPerUID     int
 	batchSize     int64
 	scanInterval  time.Duration
+	// observeWindow bounds how long to watch the writer set settle. Zero means
+	// evaluate once and report — used by tests and by anyone who wants the
+	// current verdict without waiting.
+	observeWindow time.Duration
+}
+
+// sessionRolloutObserveUntilConverged re-evaluates until the decision stops
+// being blocked purely on the convergence window, or the window budget runs out.
+//
+// Only that one blocker is worth waiting on: it is a statement about elapsed
+// time and nothing else, so re-asking is what resolves it. Every other blocker
+// describes the state of the fleet or the keyspace, which will not change
+// because this process asked twice — waiting on those would just be a slower
+// refusal.
+func sessionRolloutObserveUntilConverged(
+	ctx context.Context,
+	store *auth.RedisSessionStore,
+	input auth.RolloutAdvanceInput,
+	window time.Duration,
+	out io.Writer,
+) (auth.RolloutAdvanceDecision, error) {
+	deadline := time.Now().Add(window)
+	for attempt := 0; ; attempt++ {
+		decision, err := store.EvaluateRolloutAdvance(ctx, input)
+		if err != nil {
+			return decision, err
+		}
+		if decision.Allowed || !blockedOnlyOnConvergence(decision) || !time.Now().Before(deadline) {
+			return decision, nil
+		}
+		if attempt == 0 {
+			fmt.Fprintf(os.Stderr, "waiting up to %s for the writer set to hold still: %s\n",
+				window, decision.BlockedSummary())
+		}
+		select {
+		case <-ctx.Done():
+			return decision, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func blockedOnlyOnConvergence(decision auth.RolloutAdvanceDecision) bool {
+	if len(decision.BlockedBy) == 0 {
+		return false
+	}
+	for _, reason := range decision.BlockedBy {
+		if !strings.Contains(reason, "stable for") && !strings.Contains(reason, "convergence has not been observed") {
+			return false
+		}
+	}
+	return true
 }
 
 func sessionRolloutAdvance(
@@ -346,7 +401,7 @@ func sessionRolloutAdvance(
 		return errors.New("advance is the reconciler's job; use --force --yes only when the reconciler itself is broken")
 	}
 	registry := auth.NewWriterRegistry(store.Client(), store.UIDTokenPrefix())
-	decision, err := store.EvaluateRolloutAdvance(ctx, auth.RolloutAdvanceInput{
+	input := auth.RolloutAdvanceInput{
 		Registry:      registry,
 		ExpectWriters: args.expectWriters,
 		MaxPerUID:     args.maxPerUID,
@@ -356,7 +411,13 @@ func sessionRolloutAdvance(
 		// unattended-grade work on an operator's say-so was also the one that
 		// ignored the throttle.
 		ScanInterval: args.scanInterval,
-	})
+		// The first v3 floor requires the writer set to hold still for a lease
+		// TTL, which a single evaluation cannot establish. Rather than making
+		// break-glass structurally impossible for that one transition, watch for
+		// real: evaluate repeatedly and let the window mature.
+		Convergence: auth.NewWriterConvergence(),
+	}
+	decision, err := sessionRolloutObserveUntilConverged(ctx, store, input, args.observeWindow, out)
 	if err != nil {
 		return err
 	}

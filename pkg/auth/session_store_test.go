@@ -281,7 +281,16 @@ func TestRedisSessionStoreObserveAggregatesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(5), stats.Total)
 	require.Equal(t, int64(1), stats.Persistent)
-	require.Equal(t, int64(4), stats.Finite)
+	// Three, not four: the shape counters describe legacy CREDENTIALS, not keys,
+	// so the undecodable "not-a-token" is reported once as DecodeInvalid and
+	// counted in no TTL bucket. Total still counts every key scanned.
+	//
+	// The distinction is load-bearing rather than cosmetic. These counters feed
+	// the bounded gate, and while they described the keyspace a single permanent
+	// undecodable record held Persistent at 1 forever — bounded refused, bounded
+	// is the only route to enforce, migration skips undecodable records by
+	// design, and nothing expires a key with no TTL.
+	require.Equal(t, int64(3), stats.Finite)
 	require.Equal(t, int64(1), stats.OverMax)
 	require.Equal(t, int64(1), stats.DecodeInvalid)
 	require.Equal(t, int64(1), stats.V1)

@@ -109,7 +109,15 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	// The apply must not be swallowed. Letting it fail into a warning is how a
 	// replica ended up running at expand while boot had resolved enforce — and
 	// while the registry advertised enforce on its behalf.
-	if applyErr := store.ApplyRolloutState(boot.Mode, boot.MaxPerUID); applyErr != nil {
+	//
+	// Provisional boots go through the other door: their mode is a guess made
+	// because the floor could not be read, and the first floor that actually
+	// reads has to be able to replace it downward.
+	apply := store.ApplyRolloutState
+	if boot.Provisional {
+		apply = store.ApplyProvisionalRolloutState
+	}
+	if applyErr := apply(boot.Mode, boot.MaxPerUID); applyErr != nil {
 		boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
 	}
 	// Whatever was actually applied is the truth from here on. Boot's resolved

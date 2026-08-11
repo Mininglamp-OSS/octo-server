@@ -52,8 +52,22 @@ func newBootHarness(t *testing.T, withMarkerTable bool) *bootHarness {
 	// package fail with Error 1146, order-dependently. "Absent" is simulated by
 	// pointing the store at a table name that does not exist.
 	if !withMarkerTable {
-		rolloutMarkerTable = "octo_session_rollout_marker_absent_" + strings.ReplaceAll(util.GenerUUID(), "-", "")
+		// The name must stay within MySQL's 64-character identifier limit. The
+		// first version of this concatenated a full UUID onto a 35-character
+		// prefix for 67 characters, so every query returned Error 1059
+		// ("Identifier name is too long") instead of Error 1146 ("table doesn't
+		// exist"). isMissingMarkerTable does not match 1059, so the branch this
+		// harness exists to reach was never once executed — and the fail-open
+		// living in that branch shipped.
+		rolloutMarkerTable = "octo_rollout_marker_absent_" + strings.ReplaceAll(util.GenerUUID(), "-", "")[:16]
 		t.Cleanup(func() { rolloutMarkerTable = defaultRolloutMarkerTable })
+		require.LessOrEqual(t, len(rolloutMarkerTable), 64, "MySQL identifier limit")
+		// And assert the simulation actually simulates. A harness that silently
+		// produces the wrong error is worse than no harness: it reports green.
+		_, probeErr := db.Query("SELECT 1 FROM " + rolloutMarkerTable + " LIMIT 1") //nolint:rowserrcheck // probe only
+		require.Error(t, probeErr)
+		require.True(t, isMissingMarkerTable(probeErr),
+			"the absent-table simulation must produce the error the production code recognises, got: %v", probeErr)
 	}
 	_, err = db.Exec("DELETE FROM " + defaultRolloutMarkerTable)
 	if err != nil && !isMissingMarkerTable(err) {
@@ -419,4 +433,228 @@ func TestWiringBoundedIsGatedOnPersistentLegacy(t *testing.T) {
 	allowed, err := h.store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{Registry: registry, MaxPerUID: 20})
 	require.NoError(t, err)
 	require.True(t, allowed.Allowed, allowed.BlockedSummary())
+}
+
+// withFailingFloorRead makes the scripted floor read fail the way a Redis blip,
+// a LOADING replica or a slow EVAL against the 2s ReadTimeout does. It is a
+// real error from a real Redis, not a double: the point is that
+// loadRolloutControl's error path is reachable without corrupting anything, so
+// the record on disk stays perfectly valid throughout.
+func withFailingFloorRead(t *testing.T) {
+	t.Helper()
+	savedRolloutReadScript = readRolloutControlScript
+	readRolloutControlScript = rd.NewScript(`return redis.error_reply("LOADING simulated transient failure")`)
+	t.Cleanup(func() { readRolloutControlScript = savedRolloutReadScript })
+}
+
+var savedRolloutReadScript *rd.Script
+
+// W14 (P0-2): an unreadable floor is UNKNOWN state, not a fresh install.
+//
+// The marker answers "was a floor ever established here?" and nothing else. It
+// cannot answer "is there one right now", and when the floor read failed that
+// is the question being asked. Collapsing the two means an initialised
+// deployment whose floor read blipped is classified fresh and runs at expand —
+// and expand stops consulting legacy deny markers, so every bearer revoked at
+// revoke/bounded/enforce is admitted again.
+//
+// The window is wider than the very first pod: the marker ROW is absent until
+// some replica's poller stamps it, so `markers.Load` returns (nil, nil) for the
+// whole initial rollout, which is exactly when Redis churn is most likely.
+func TestWiringUnreadableFloorIsNotAFreshInstall(t *testing.T) {
+	t.Run("marker table absent", func(t *testing.T) {
+		h := newBootHarness(t, false)
+		ctx := context.Background()
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+		withFailingFloorRead(t)
+
+		// No deprecated env: OCTO_AUTH_SESSION_MODE would mask this by raising
+		// the mode, and it is the very thing this release tells operators to
+		// remove.
+		boot := h.boot(t, "", 0)
+		require.NotEqual(t, SessionModeExpand, boot.Mode,
+			"an unreadable floor must not be read as 'never initialised'; expand re-admits revoked bearers")
+		require.NotEqual(t, RolloutBootFresh, boot.Outcome)
+	})
+
+	t.Run("table present, marker row not yet stamped", func(t *testing.T) {
+		h := newBootHarness(t, true)
+		ctx := context.Background()
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+		require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+		marker, err := h.markers.Load(ctx)
+		require.NoError(t, err)
+		require.Nil(t, marker, "this is the un-stamped window every replica boots through")
+		withFailingFloorRead(t)
+
+		boot := h.boot(t, "", 0)
+		require.NotEqual(t, SessionModeExpand, boot.Mode)
+		require.NotEqual(t, RolloutBootFresh, boot.Outcome)
+	})
+}
+
+// W15: a deployment that genuinely never had a floor still starts at expand.
+// The fix must separate "unreadable" from "absent", not collapse them the other
+// way — resolving a true greenfield install upward to enforce would deny
+// nothing (there is nothing there) but would write an enforce floor nobody
+// asked for.
+func TestWiringGenuinelyFreshInstallStillStartsAtExpand(t *testing.T) {
+	h := newBootHarness(t, false)
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootFresh, boot.Outcome)
+	require.Equal(t, SessionModeExpand, boot.Mode)
+}
+
+// W16: a provisional enforce is replaced by the first floor that actually
+// reads, even though that is downward.
+//
+// ApplyRolloutState refuses to lower the mode, which is right for an OBSERVED
+// floor — that rule is what stops an advance being walked back. Applied to a
+// GUESS it is a different thing entirely: a single slow EVAL during a rolling
+// upgrade would pin every replica at enforce for the rest of its life, logging
+// out the entire user base over an error that lasted two seconds. The
+// distinction is provenance, not rank.
+func TestWiringProvisionalEnforceHealsDownwardOnceTheFloorReads(t *testing.T) {
+	ctx := context.Background()
+	h := newBootHarness(t, true)
+	require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+	require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+
+	withFailingFloorRead(t)
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootUnknown, boot.Outcome)
+	require.Equal(t, SessionModeEnforce, h.store.Mode(), "boots strict while it cannot see")
+
+	// Redis comes back. The poller reads the real floor.
+	restoreRolloutRead(t)
+	reconciler := NewRolloutReconciler(h.store, ReconcilerOptions{Markers: h.markers, MaxPerUID: 20})
+	reconciler.pollFloor(ctx)
+
+	require.Equal(t, SessionModeRevoke, h.store.Mode(),
+		"the observed floor must replace the guess, downward")
+
+	// And once healed it is no longer provisional: a genuine floor cannot be
+	// walked back by anything.
+	require.NoError(t, h.store.ApplyRolloutState(SessionModeExpand, 20))
+	require.Equal(t, SessionModeRevoke, h.store.Mode(),
+		"an observed floor must never be lowered")
+}
+
+// W17: an unknown boot writes NO floor record. Recovery exists to restore a
+// floor that provably existed; here nothing proves one did, and writing enforce
+// on a guess would jump a greenfield deployment's entire ladder irreversibly.
+func TestWiringUnknownBootWritesNoFloor(t *testing.T) {
+	h := newBootHarness(t, false)
+	require.NoError(t, h.store.client.Set(h.store.rolloutControlKey(), "{not json", 0).Err())
+
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootUnknown, boot.Outcome)
+
+	raw, err := h.store.client.Get(h.store.rolloutControlKey()).Result()
+	require.NoError(t, err)
+	require.Equal(t, "{not json", raw,
+		"an unproven floor must be left exactly as found, not overwritten with enforce")
+}
+
+// restoreRolloutRead puts the real script back mid-test, standing in for Redis
+// recovering while the process keeps running.
+func restoreRolloutRead(t *testing.T) {
+	t.Helper()
+	require.NotNil(t, savedRolloutReadScript, "withFailingFloorRead must run first")
+	readRolloutControlScript = savedRolloutReadScript
+}
+
+// W18 (P0-1): recovery replaces a floor it could not READ only when the bytes
+// on the key are genuinely not a floor.
+//
+// The contract in the doc comment — "a valid one that reappeared always wins" —
+// was enforced only on the success path. On the error path the fallback GET
+// captured whatever bytes were there and CASed over them without asking whether
+// they decoded, so a perfectly good floor was rewritten to enforce.
+//
+// That matters more than a lost value. It reaches enforce from revoke in ONE
+// write, skipping bounded, so it bypasses the one-phase monotonic rule that
+// AdvanceRolloutControl enforces — the invariant tests stay green because this
+// path does not go through AdvanceRolloutControl at all. It writes no evidence
+// snapshot. And it runs from boot, on any replica, unattended, irreversibly.
+//
+// loadRolloutControl returns an error for four unrelated conditions; only two
+// of them mean the record is bad.
+func TestRecoveryKeepsAValidFloorTheReadCouldNotSee(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("valid record carrying a TTL", func(t *testing.T) {
+		// The guarded invariant "the floor must not expire" is expressed as a
+		// read error — and that error was the trigger for the unpredicated jump.
+		store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+		require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+		require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+		require.NoError(t, client.Expire(store.rolloutControlKey(), time.Hour).Err())
+
+		recovered, err := store.RecoverRolloutControlAtEnforce(ctx, 20)
+		require.NoError(t, err)
+		require.False(t, recovered, "a valid floor must never be replaced")
+
+		control, err := store.RolloutControl(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, control)
+		require.Equal(t, SessionModeRevoke, control.ModeFloor, "revoke must not become enforce")
+		require.Equal(t, -time.Millisecond, mustPTTL(t, client, store.rolloutControlKey()),
+			"and the TTL that made it unreadable must be cleared, or the floor still vanishes later")
+	})
+
+	t.Run("scripted read fails while the record is intact", func(t *testing.T) {
+		// The shape a Redis blip between the two calls produces, and the shape a
+		// slow EVAL against the 2s ReadTimeout produces.
+		store, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
+		require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+		require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+		withFailingFloorRead(t)
+
+		recovered, err := store.RecoverRolloutControlAtEnforce(ctx, 20)
+		require.NoError(t, err)
+		require.False(t, recovered)
+
+		restoreRolloutRead(t)
+		control, err := store.RolloutControl(ctx)
+		require.NoError(t, err)
+		require.Equal(t, SessionModeRevoke, control.ModeFloor)
+	})
+}
+
+// W19: the cases recovery IS for still work. Narrowing the replacement rule must
+// not turn a genuine Redis loss into a no-op — that direction is the fail-open
+// the marker mechanism exists to prevent.
+func TestRecoveryStillReplacesAnAbsentOrUnparseableFloor(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("absent", func(t *testing.T) {
+		store, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
+		recovered, err := store.RecoverRolloutControlAtEnforce(ctx, 20)
+		require.NoError(t, err)
+		require.True(t, recovered)
+		control, err := store.RolloutControl(ctx)
+		require.NoError(t, err)
+		require.Equal(t, SessionModeEnforce, control.ModeFloor)
+	})
+
+	for name, payload := range map[string]string{
+		"not json":       "{not json",
+		"unknown floor":  `{"mode_floor":"banana","writer_version":3}`,
+		"expand floor":   `{"mode_floor":"expand","writer_version":3}`,
+		"writer version": `{"mode_floor":"revoke","writer_version":2}`,
+	} {
+		t.Run("unparseable: "+name, func(t *testing.T) {
+			store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+			require.NoError(t, client.Set(store.rolloutControlKey(), payload, 0).Err())
+
+			recovered, err := store.RecoverRolloutControlAtEnforce(ctx, 20)
+			require.NoError(t, err)
+			require.True(t, recovered, "a record that is not a floor must be replaced")
+			control, err := store.RolloutControl(ctx)
+			require.NoError(t, err)
+			require.Equal(t, SessionModeEnforce, control.ModeFloor)
+		})
+	}
 }

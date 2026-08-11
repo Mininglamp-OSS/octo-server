@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -265,4 +266,65 @@ func (r *WriterRegistry) Live() ([]WriterEntry, error) {
 		_ = r.client.SRem(r.rosterKey, stale...).Err()
 	}
 	return live, nil
+}
+
+// WriterConvergence answers "how long has the live writer set looked exactly
+// like this?".
+//
+// It exists because a count is not a convergence proof. `live == ExpectWriters`
+// holds at the single instant during a maxSurge:1 rollout when the new replicas
+// are all up and the last old one — which predates the registry and therefore
+// registers nowhere — has not yet terminated. That replica can still mint v2
+// credentials on the next login, which is the one thing the first v3 floor must
+// rule out.
+//
+// Stability of the SET, held across at least one lease TTL, is a much stronger
+// statement than the count, and it is sound for a specific reason: writer
+// identities are per-incarnation. An entry present at both ends of a window
+// longer than the lease TTL cannot have expired and been recreated in between —
+// a restart mints a new id — and any pod joining or leaving changes the set. So
+// an unchanged set across that window proves no membership change occurred,
+// i.e. the rollout has stopped moving.
+//
+// It is a mitigation and not a proof of the absent replica itself, which is
+// unobservable by construction; that residual risk is why EXPECT_WRITERS is a
+// deployment-supplied number rather than something derived.
+type WriterConvergence struct {
+	mu          sync.Mutex
+	fingerprint string
+	since       time.Time
+}
+
+func NewWriterConvergence() *WriterConvergence { return &WriterConvergence{} }
+
+// Observe records the roster and returns how long the CURRENT set has held.
+// A set that differs from the previous observation restarts the window and
+// returns zero.
+func (c *WriterConvergence) Observe(entries []WriterEntry, now time.Time) time.Duration {
+	fingerprint := writerSetFingerprint(entries)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fingerprint != c.fingerprint {
+		c.fingerprint = fingerprint
+		c.since = now
+		return 0
+	}
+	if now.Before(c.since) {
+		// A clock that went backwards must not manufacture a long window.
+		c.since = now
+		return 0
+	}
+	return now.Sub(c.since)
+}
+
+// writerSetFingerprint covers identity, build and applied state: a replica that
+// merely changes the mode it advertises has changed the fleet's convergence
+// picture just as much as one that joins.
+func writerSetFingerprint(entries []WriterEntry) string {
+	parts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		parts = append(parts, entry.ID+"|"+entry.Build+"|"+entry.AppliedState)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }

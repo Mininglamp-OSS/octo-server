@@ -98,6 +98,34 @@ func (s *RedisSessionStore) RecoverRolloutControlAtEnforce(ctx context.Context, 
 		if getErr != nil && getErr != rd.Nil {
 			return false, fmt.Errorf("auth: read corrupt rollout control: %w", getErr)
 		}
+		// "Could not read it" is not "it is not a floor". loadRolloutControl
+		// returns an error for four unrelated conditions — a Redis transport
+		// failure, a TTL on the key, a JSON decode failure, and a semantic
+		// validity failure — and only the last two mean the bytes are not a
+		// floor. Replacing on the first two destroyed a perfectly good record:
+		// revoke became enforce in ONE write, skipping bounded, bypassing the
+		// one-phase rule (this path does not go through AdvanceRolloutControl,
+		// which is why the invariant tests stayed green) and writing no evidence
+		// snapshot. From boot. Unattended. Irreversibly.
+		//
+		// So decode the bytes and let them answer for themselves, rather than
+		// inferring the record's health from the health of the read.
+		if _, decodeErr := decodeRolloutControl(current); decodeErr == nil {
+			// A valid floor that the scripted read merely could not see. It
+			// wins, exactly as it does on the success path.
+			//
+			// One thing still has to be repaired: if the read failed *because*
+			// the key carries a TTL, leaving it alone means this valid floor
+			// silently disappears later — the very data loss the marker exists
+			// to detect. PERSIST removes the deadline without touching the
+			// value, so it cannot lower or race a concurrent advance.
+			if ttl, ttlErr := s.client.PTTL(s.rolloutControlKey()).Result(); ttlErr == nil && ttl > 0 {
+				if persistErr := s.client.Persist(s.rolloutControlKey()).Err(); persistErr != nil {
+					return false, fmt.Errorf("auth: clear rollout control expiry: %w", persistErr)
+				}
+			}
+			return false, nil
+		}
 		raw = current
 	}
 	result, err := advanceRolloutControlScript.Run(s.client, []string{s.rolloutControlKey()}, raw, string(encoded)).Result()
@@ -231,14 +259,30 @@ func (s *RedisSessionStore) loadRolloutControl(ctx context.Context) (*SessionRol
 	default:
 		return nil, "", fmt.Errorf("auth: invalid rollout control payload %T", parts[0])
 	}
+	control, err := decodeRolloutControl(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	return control, raw, nil
+}
+
+// decodeRolloutControl is the single definition of "these bytes are a floor".
+//
+// It is shared by the read path and by recovery deliberately. Recovery has to
+// answer "is what is on the key actually a floor?" and answering it with a
+// second, hand-written copy of these checks is how the two drift until one of
+// them decides a valid record is garbage and overwrites it.
+func decodeRolloutControl(raw string) (*SessionRolloutControl, error) {
 	var control SessionRolloutControl
 	if err := json.Unmarshal([]byte(raw), &control); err != nil {
-		return nil, "", fmt.Errorf("auth: decode rollout control: %w", err)
+		return nil, fmt.Errorf("auth: decode rollout control: %w", err)
 	}
-	if !control.ModeFloor.valid() || control.ModeFloor == SessionModeExpand || control.WriterVersion != 3 || control.ObservationMinGapMS < 0 || strings.TrimSpace(string(control.ModeFloor)) == "" {
-		return nil, "", errors.New("auth: invalid rollout control record")
+	if !control.ModeFloor.valid() || control.ModeFloor == SessionModeExpand ||
+		control.WriterVersion != 3 || control.ObservationMinGapMS < 0 ||
+		strings.TrimSpace(string(control.ModeFloor)) == "" {
+		return nil, errors.New("auth: invalid rollout control record")
 	}
-	return &control, raw, nil
+	return &control, nil
 }
 
 func (s *RedisSessionStore) rolloutControlKey() string {

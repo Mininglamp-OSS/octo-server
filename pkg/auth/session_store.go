@@ -111,6 +111,12 @@ type SessionStoreOption func(*RedisSessionStore)
 type derivedRolloutState struct {
 	mode      SessionMode
 	maxPerUID int
+	// provisional marks a mode that was GUESSED at boot because the floor could
+	// not be read, as opposed to one derived from a floor that was actually
+	// observed. The monotonic no-lowering rule protects observed floors from
+	// being walked back; applying it to a guess would let a two-second Redis
+	// error pin a replica at enforce for the rest of its life.
+	provisional bool
 }
 
 func WithSessionMode(mode SessionMode) SessionStoreOption {
@@ -160,7 +166,7 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 	if maxPerUID > sessionMaxPerUIDLimit {
 		maxPerUID = sessionMaxPerUIDLimit
 	}
-	if mode.rank() < current.mode.rank() {
+	if mode.rank() < current.mode.rank() && !current.provisional {
 		// The mode never moves down, but the CAP still has to land. A process
 		// running above the floor with no usable cap fences every login, and
 		// dropping the cap that arrived alongside a lower mode meant a floor
@@ -170,7 +176,37 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 		}
 		return nil
 	}
+	// An observed floor always wins over a provisional one, in either direction,
+	// and clears the provisional flag: from here on the no-lowering rule applies
+	// normally.
 	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
+	return nil
+}
+
+// ApplyProvisionalRolloutState installs a mode that boot GUESSED because the
+// floor could not be read. It still only raises — a guess must never loosen a
+// mode this replica already reached — but it marks the state so the first floor
+// that actually reads can replace it in either direction.
+func (s *RedisSessionStore) ApplyProvisionalRolloutState(mode SessionMode, maxPerUID int) error {
+	if !mode.valid() {
+		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
+	}
+	current := s.currentState()
+	if maxPerUID <= 0 {
+		maxPerUID = current.maxPerUID
+	}
+	if maxPerUID > sessionMaxPerUIDLimit {
+		maxPerUID = sessionMaxPerUIDLimit
+	}
+	if mode.rank() < current.mode.rank() {
+		if maxPerUID != current.maxPerUID {
+			s.state.Store(&derivedRolloutState{
+				mode: current.mode, maxPerUID: maxPerUID, provisional: current.provisional,
+			})
+		}
+		return nil
+	}
+	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID, provisional: true})
 	return nil
 }
 
@@ -631,10 +667,27 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 				stats.ReadErrors++
 				return stats, fmt.Errorf("auth: observe token record: %w", err)
 			}
-			switch {
-			case record.TTL == -2:
+			if record.TTL == -2 {
 				stats.Missing++
 				continue
+			}
+			// Decode BEFORE the shape counters, not after.
+			//
+			// These counters feed the bounded gate, whose job is to mirror what
+			// the bounded reader rejects — and the reader only ever reaches its
+			// TTL rules for a session that decoded far enough to be validated at
+			// all. Counting undecodable keys as Persistent/OverMax made the gate
+			// describe the KEYSPACE instead of the credentials in it, and that
+			// difference wedged the whole ladder: one permanent undecodable
+			// record held Persistent at 1, bounded refused, bounded is the only
+			// route to enforce, migration skips undecodable records by design and
+			// nothing expires a key with no TTL. Permanently stuck, with no tool
+			// able to clear it.
+			if _, err := Decode(record.Payload); err != nil {
+				stats.DecodeInvalid++
+				continue
+			}
+			switch {
 			case record.TTL == -1:
 				stats.Persistent++
 			case record.TTL > 0:
@@ -644,11 +697,6 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 				}
 			default:
 				stats.InvalidTTL++
-			}
-
-			if _, err := Decode(record.Payload); err != nil {
-				stats.DecodeInvalid++
-				continue
 			}
 			switch {
 			case strings.HasPrefix(record.Payload, v3Prefix):

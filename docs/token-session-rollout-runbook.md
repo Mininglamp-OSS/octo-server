@@ -227,7 +227,7 @@ migration 的回滚语义不变：可暂停续跑；不得删除 campaign/checkp
 | `dmwork_session_reconcile_scan_total` | 增速异常说明退避没生效 |
 | `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 为 1 必须告警 |
 | `dmwork_session_rollout_mode{mode}` | 全体副本应收敛到同一值（灰度副本除外） |
-| `dmwork_session_undecodable_records` | 无法解码的记录数。**不阻塞 floor**（它们从来不是可用凭证），但**没有任何东西会清掉它们**，非 0 需要人看一眼 |
+| `dmwork_session_undecodable_records` | 无法解码的记录数。**不阻塞任何一道 floor 门禁**（它们从来不是可用凭证，`observe` 的形态计数器只统计能解码的记录），但**没有任何东西会清掉它们**——migration 有意跳过,无 TTL 的键也不会自然过期。非 0 需要人看一眼 |
 
 原有的 `validation_rejected_total`、`revocation_backlog`、`redis_pool_timeouts_total`
 等指标保持不变。

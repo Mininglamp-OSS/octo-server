@@ -116,10 +116,20 @@ func TestUnreadableFloorResolvesUpwardNotToExpand(t *testing.T) {
 	require.NotEmpty(t, boot.Warning)
 }
 
-// A1c: the same unreadable floor on a deployment that never established one
-// stays at expand — there is nothing to protect, and expand is what it already
-// had.
-func TestUnreadableFloorOnFreshDeploymentStaysAtExpand(t *testing.T) {
+// A1c: an unreadable floor with no marker is UNKNOWN, not fresh.
+//
+// This assertion is inverted from what it originally claimed. It used to read
+// "the same unreadable floor on a deployment that never established one stays
+// at expand — there is nothing to protect", and that reasoning has a hole big
+// enough to drive the whole finding through: the absence of a marker does not
+// establish that no floor was ever created. It also covers the boot before the
+// marker table's migration has run and the entire window before some replica's
+// poller stamps the row. Concluding "fresh" from it put an initialised
+// deployment at expand, which stops consulting legacy deny markers.
+//
+// Note the setup is itself evidence: a *genuinely* fresh deployment has no
+// floor key at all. A corrupt one means something wrote it.
+func TestUnreadableFloorWithNoMarkerIsUnknownNotFresh(t *testing.T) {
 	ctx := context.Background()
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
 	markers := newMarkerStoreForTest(t)
@@ -127,9 +137,26 @@ func TestUnreadableFloorOnFreshDeploymentStaysAtExpand(t *testing.T) {
 
 	boot, err := ResolveRolloutBoot(ctx, store, markers, "", 0)
 	require.NoError(t, err)
+	require.Equal(t, RolloutBootUnknown, boot.Outcome)
+	require.Equal(t, SessionModeEnforce, boot.Mode)
+	require.True(t, boot.Provisional,
+		"a mode guessed from a failed read must be replaceable by one that was actually read")
+	require.NotEmpty(t, boot.Warning)
+}
+
+// A1d: and the genuinely fresh case — no floor, no error, no marker — still
+// starts at expand. The fix has to separate "unreadable" from "absent", not
+// collapse them in the other direction.
+func TestGenuinelyAbsentFloorWithNoMarkerStaysAtExpand(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
+	markers := newMarkerStoreForTest(t)
+
+	boot, err := ResolveRolloutBoot(ctx, store, markers, "", 0)
+	require.NoError(t, err)
 	require.Equal(t, RolloutBootFresh, boot.Outcome)
 	require.Equal(t, SessionModeExpand, boot.Mode)
-	require.NotEmpty(t, boot.Warning)
+	require.False(t, boot.Provisional)
 }
 
 // A2 (§3.5②): the naive `mode = floor` would silently loosen a deployment that
@@ -166,12 +193,26 @@ func TestUpgradeNeverLoosensAMidCanaryDeployment(t *testing.T) {
 // runs no commands.
 func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 	ctx := context.Background()
+	clock := time.Now().UTC()
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	store.now = func() time.Time { return clock }
 	registry := NewWriterRegistry(client, store.uidTokenPrefix)
 	registryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	require.NoError(t, registry.Join(registryCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
 	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+	// Greenfield still pays for the first v3 floor's convergence window — one
+	// lease TTL of the writer set holding still, unattended and with no operator
+	// command. That is the whole cost, and it is not ceremony: it is the only
+	// transition a pre-registry replica could be invisible across.
+	convergence := NewWriterConvergence()
+	priming, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: convergence,
+	})
+	require.NoError(t, err)
+	require.False(t, priming.Allowed)
+	clock = clock.Add(writerLeaseTTL + time.Second)
 
 	floor := SessionMode("")
 	for i := 0; i < 5; i++ {
@@ -179,6 +220,7 @@ func TestGreenfieldReachesEnforceWithoutCeremony(t *testing.T) {
 			Registry:      registry,
 			MaxPerUID:     20,
 			ExpectWriters: 1,
+			Convergence:   convergence,
 		})
 		require.NoError(t, err)
 		if decision.Current == SessionModeEnforce {
@@ -246,9 +288,11 @@ func TestAdvanceGateRefusesUnconvergedFleets(t *testing.T) {
 // never registers and the registry structurally cannot see it. Only this one
 // transition needs it — and it is required whether or not the keyspace is
 // empty, since empty only means nothing is stored right now.
-func TestFirstV3FloorNeedsTheReplicaCountOnlyWhenTokensExist(t *testing.T) {
+func TestFirstV3FloorAlwaysNeedsTheReplicaCount(t *testing.T) {
 	ctx := context.Background()
+	clock := time.Now().UTC()
 	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	store.now = func() time.Time { return clock }
 	prefix := store.uidTokenPrefix
 	registry := NewWriterRegistry(client, prefix)
 	regCtx, cancel := context.WithCancel(ctx)
@@ -268,7 +312,17 @@ func TestFirstV3FloorNeedsTheReplicaCountOnlyWhenTokensExist(t *testing.T) {
 	require.False(t, short.Allowed, "a leftover pre-#725 replica makes the count come up short")
 	require.Contains(t, short.BlockedSummary(), "expected 3 writers, registry has 1")
 
-	matched, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{Registry: registry, MaxPerUID: 20, ExpectWriters: 1})
+	// The count alone is not enough any more: the set has to hold still for a
+	// lease TTL as well, so prime the window and let it mature.
+	converged := RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: NewWriterConvergence(),
+	}
+	priming, err := store.EvaluateRolloutAdvance(ctx, converged)
+	require.NoError(t, err)
+	require.False(t, priming.Allowed, "the count matches, but nothing has been observed over time yet")
+
+	clock = clock.Add(writerLeaseTTL + time.Second)
+	matched, err := store.EvaluateRolloutAdvance(ctx, converged)
 	require.NoError(t, err)
 	require.True(t, matched.Allowed, matched.BlockedSummary())
 }
@@ -401,9 +455,16 @@ func TestEveryAdvanceLeavesAnEvidenceSnapshot(t *testing.T) {
 	t.Cleanup(func() { _ = client.Del(prefix + "writers").Err() })
 
 	markers := newMarkerStoreForTest(t)
+	clock := time.Now().UTC()
+	store.now = func() time.Time { return clock }
 	reconciler := NewRolloutReconciler(store, ReconcilerOptions{
 		Registry: registry, Markers: markers, AutoAdvance: true, MaxPerUID: 20, ExpectWriters: 1,
 	})
+	// Two cycles: the first only starts the convergence window, the second
+	// crosses it. The reconciler owns the window precisely because it spans more
+	// than one evaluation.
+	reconciler.reconcileOnce(ctx)
+	clock = clock.Add(writerLeaseTTL + time.Second)
 	reconciler.reconcileOnce(ctx)
 
 	control, err := store.RolloutControl(ctx)
@@ -722,4 +783,205 @@ func TestFloorAdvanceRefusesADisallowedDecision(t *testing.T) {
 	marker, err := markers.Load(ctx)
 	require.NoError(t, err)
 	require.Nil(t, marker, "a refused advance stamps nothing either")
+}
+
+// A20 (P1): a single undecodable PERMANENT record must not wedge the ladder.
+//
+// This is C6, which the redesign was supposed to dissolve and instead relocated.
+// The enforce gate stopped treating decode_invalid as a blocker — but nothing
+// changed one step earlier, where bounded rejects on Persistent != 0, and
+// ObserveRateLimited increments Persistent from the TTL BEFORE it tries to
+// decode. So an undecodable permanent record lands in Persistent, bounded
+// refuses, and bounded is the only path to enforce.
+//
+// What makes it unrecoverable rather than merely slow is that the redesign also
+// removed the cleanup path: migration now deliberately skips undecodable records
+// and `advance --force` re-evaluates the same predicate and refuses. Nothing
+// clears a key with no TTL. The floor stops at revoke forever.
+//
+// The existing TestCorruptPayloadDoesNotBlockEnforce misses this twice: it
+// starts the ladder already at bounded, and its corrupt record has a finite
+// within-maxTTL deadline. The test environment's one decode_invalid record was
+// permanent — the blocking shape.
+func TestUndecodablePermanentRecordDoesNotWedgeTheBoundedGate(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeRevoke), nil))
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+	// Permanent and undecodable: never a usable credential, and nothing expires
+	// it.
+	require.NoError(t, client.Set(store.tokenKey("corrupt"), "\x00\x01garbage", 0).Err())
+
+	observation, err := store.ObserveRateLimited(ctx, 100, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), observation.DecodeInvalid)
+	require.Equal(t, int64(0), observation.Persistent,
+		"an undecodable key is not a legacy credential, so it must not be counted as a persistent one")
+
+	decision, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, SessionModeBounded, decision.Target)
+	require.True(t, decision.Allowed,
+		"a record no reader can decode must not hold the ladder: %s", decision.BlockedSummary())
+}
+
+// A21: and the gate still blocks on the records bounded actually rejects. The
+// fix must narrow the counter to decodable records, not disable the gate — a
+// real persistent legacy session is exactly what bounded logs out, and that
+// remains the operator's decision to take deliberately.
+func TestBoundedGateStillBlocksOnRealPersistentLegacy(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeRevoke), nil))
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+	require.NoError(t, client.Set(store.tokenKey("real"), "u1@Alice", 0).Err())
+
+	observation, err := store.ObserveRateLimited(ctx, 100, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), observation.Persistent)
+	require.Equal(t, int64(1), observation.V1)
+
+	decision, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1,
+	})
+	require.NoError(t, err)
+	require.False(t, decision.Allowed)
+	require.Contains(t, decision.BlockedSummary(), "persistent=1")
+}
+
+// A22: an undecodable OVER-MAX record is the same case. Counting it in OverMax
+// blocks the same gate for the same wrong reason.
+func TestUndecodableOverMaxRecordDoesNotWedgeTheBoundedGate(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	require.NoError(t, client.Set(store.tokenKey("corrupt"), "\x00\x01garbage", 3*store.maxTTL).Err())
+
+	observation, err := store.ObserveRateLimited(ctx, 100, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), observation.DecodeInvalid)
+	require.Equal(t, int64(0), observation.OverMax)
+	require.Equal(t, int64(0), observation.Finite,
+		"the shape counters describe legacy credentials, not keys")
+}
+
+// A23 (P1): the first v3 floor requires the writer set to have held STILL for a
+// full lease TTL, not merely to have the right count at one instant.
+//
+// Count equality alone cannot distinguish "N new replicas" from "N new replicas
+// plus one invisible pre-#725 one". Under maxSurge:1 the moment live == N is
+// reachable while an old, unregistered replica is still up and still able to
+// issue v2 on the next login — and that replica is exactly what EXPECT_WRITERS
+// was introduced to exclude.
+//
+// Requiring the SET (not the count) to be identical across a window of at least
+// writerLeaseTTL closes it, because writer identities are per-incarnation: an
+// entry present at both ends of a TTL-long window cannot have expired and been
+// recreated in between, and a joining pod changes the set. So an unchanged set
+// across that window proves the rollout has stopped moving.
+//
+// brief §2 specified this and it never landed; both lease-window findings name
+// it as their mitigation.
+func TestFirstV3FloorRequiresAStableWriterSetForALeaseTTL(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Now().UTC()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	store.now = func() time.Time { return clock }
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+	convergence := NewWriterConvergence()
+	input := RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 1, Convergence: convergence,
+	}
+
+	first, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	require.Equal(t, SessionModeV3Write, first.Target)
+	require.False(t, first.Allowed, "one instant of the right count is not convergence")
+	require.Contains(t, first.BlockedSummary(), "stable")
+
+	// Not yet: one second short of the lease TTL.
+	clock = clock.Add(writerLeaseTTL - time.Second)
+	short, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	require.False(t, short.Allowed)
+
+	clock = clock.Add(2 * time.Second)
+	settled, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	require.True(t, settled.Allowed, "blocked by: %s", settled.BlockedSummary())
+}
+
+// A24: any change to the set restarts the window. A pod joining mid-rollout is
+// precisely the signal that the fleet has not settled.
+func TestWriterSetChangeRestartsTheConvergenceWindow(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Now().UTC()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	store.now = func() time.Time { return clock }
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeExpand), nil))
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+
+	convergence := NewWriterConvergence()
+	input := RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, ExpectWriters: 2, Convergence: convergence,
+	}
+	_, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	clock = clock.Add(writerLeaseTTL + time.Second)
+
+	// A second replica appears — the count now matches, but the set just moved.
+	second := NewWriterRegistry(client, store.uidTokenPrefix)
+	require.NoError(t, second.Join(regCtx, "build-a", "pod-b", string(SessionModeExpand), nil))
+
+	joined, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	require.False(t, joined.Allowed,
+		"the count matched only because a pod just joined; the window must restart")
+
+	clock = clock.Add(writerLeaseTTL + time.Second)
+	settled, err := store.EvaluateRolloutAdvance(ctx, input)
+	require.NoError(t, err)
+	require.True(t, settled.Allowed, "blocked by: %s", settled.BlockedSummary())
+}
+
+// A25: only the first v3 floor pays for this. Every later transition is fully
+// machine-gated by the keyspace itself, so charging each one an extra lease TTL
+// would be ceremony of exactly the kind this change exists to delete.
+func TestLaterFloorsDoNotRequireTheConvergenceWindow(t *testing.T) {
+	ctx := context.Background()
+	store, client := newLegacyMigrationTestStore(t, SessionModeExpand)
+	registry := NewWriterRegistry(client, store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeV3Write), nil))
+	t.Cleanup(func() { _ = client.Del(store.uidTokenPrefix + "writers").Err() })
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+
+	decision, err := store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+		Registry: registry, MaxPerUID: 20, Convergence: NewWriterConvergence(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, SessionModeRevoke, decision.Target)
+	require.True(t, decision.Allowed, "blocked by: %s", decision.BlockedSummary())
 }

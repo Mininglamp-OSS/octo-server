@@ -62,6 +62,11 @@ type RolloutAdvanceInput struct {
 	ExpectWriters int
 	// MaxPerUID is required when crossing into a v3-writing floor.
 	MaxPerUID int
+	// Convergence carries the caller's observation window across evaluations.
+	// Required for the first v3 floor, where a count taken at one instant is not
+	// enough — see WriterConvergence. A caller that cannot observe over time
+	// (a one-shot command) supplies one and evaluates repeatedly.
+	Convergence *WriterConvergence
 	// ScanBatchSize and ScanInterval throttle the keyspace scan. A zero interval
 	// is reserved for tests; production callers pass a positive one, because
 	// this scan runs unattended and on the shared session pool.
@@ -164,12 +169,13 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		// sweep, a flush, or the Redis loss this change handles. An idle
 		// pre-registry replica writes v2 on the next login and registers
 		// nowhere, so neither the roster nor the build check can see it.
-		live := 0
+		var entries []WriterEntry
 		if in.Registry != nil {
-			if entries, liveErr := in.Registry.Live(); liveErr == nil {
-				live = len(entries)
+			if observed, liveErr := in.Registry.Live(); liveErr == nil {
+				entries = observed
 			}
 		}
+		live := len(entries)
 		switch {
 		case in.ExpectWriters <= 0:
 			decision.BlockedBy = append(decision.BlockedBy,
@@ -177,6 +183,27 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		case live != in.ExpectWriters:
 			decision.BlockedBy = append(decision.BlockedBy,
 				fmt.Sprintf("expected %d writers, registry has %d", in.ExpectWriters, live))
+		}
+
+		// The count above is a snapshot, and a snapshot is satisfiable during a
+		// maxSurge:1 rollout at the instant the new replicas are all up and the
+		// last pre-registry one has not yet exited — the exact replica this gate
+		// exists to exclude. Require the SET to have held still for a full lease
+		// TTL, which (identities being per-incarnation) proves no membership
+		// change occurred and therefore that the rollout has stopped moving.
+		//
+		// brief §2 specified this alongside the 5s/30s numbers; it is also the
+		// stated mitigation for the check-then-write window in writableState.
+		switch {
+		case in.Convergence == nil:
+			decision.BlockedBy = append(decision.BlockedBy,
+				"writer convergence has not been observed over time")
+		default:
+			stable := in.Convergence.Observe(entries, s.now())
+			if stable < writerLeaseTTL {
+				decision.BlockedBy = append(decision.BlockedBy,
+					fmt.Sprintf("writer set stable for %s, need %s", stable.Truncate(time.Second), writerLeaseTTL))
+			}
 		}
 	}
 
