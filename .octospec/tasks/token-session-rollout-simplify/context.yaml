@@ -1,0 +1,19 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: brief load-bearing tag `auth`; touches pkg/auth + main.go wiring
+  - id: error-handling
+    source: repo
+    why: brief load-bearing tag `wire-contract`; 401 envelope must stay unchanged
+  - id: testing
+    source: repo
+    why: brief load-bearing tag `testing`; migration layout + Redis-not-cleaned-by-CleanAllTables
+  - id: commit-style
+    source: octo-spec@1.1.0
+    why: brief load-bearing tag `commit`
+not_injected:
+  - id: rate-limit
+    why: no request-frequency limiting touched; registry heartbeat is a background lease, not an HTTP limiter
+  - id: trust-boundary
+    why: no external content parsing/rendering in scope
+brief: .octospec/tasks/token-session-rollout-simplify/brief.md

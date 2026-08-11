@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Frozen from <cluster> / ns <namespace> / deploy <deployment>",
+    "on 2026-08-11, after the operator run that advanced the floor to revoke.",
+    "",
+    "This is the upgrade-compatibility fixture: the new artifact MUST boot against",
+    "a deployment in exactly this state, adopt the existing Redis floor, and stamp",
+    "the MySQL rollout_initialized_at marker WITHOUT requiring any Redis key to be",
+    "deleted or hand-edited, and WITHOUT logging anyone out.",
+    "",
+    "Captured now on purpose: by the time the change is implemented this floor may",
+    "have moved, and the record would have to be reconstructed from memory."
+  ],
+  "environment": {
+    "cluster": "<cluster>",
+    "namespace": "<namespace>",
+    "deployment": "<deployment>",
+    "image_commit": "<commit>",
+    "_redis_note": "Identifiers redacted; only the property the design depends on is kept.",
+    "redis": { "appendonly": "no" }
+  },
+  "rollout_control": {
+    "_key": "{uidTokenCachePrefix}auth:rollout-control",
+    "_ttl": "none (-1)",
+    "mode_floor": "revoke",
+    "writer_version": 3,
+    "observation_min_gap_ms": 3600000
+  },
+  "configmap_env": {
+    "_comment": "<configmap>. All three keys are removed by the redesign.",
+    "OCTO_AUTH_SESSION_MODE": "revoke",
+    "OCTO_AUTH_SESSION_MAX_PER_UID": "20",
+    "OCTO_AUTH_SESSION_REQUIRED_FLOOR": null
+  },
+  "migration_campaign": {
+    "campaign_id": "test-2026-08-11-a",
+    "cutoff": "2026-08-11T13:00:00+08:00",
+    "finite_policy": "natural",
+    "result": { "scanned": 194, "shortened": 57, "deleted": 0, "complete": true }
+  },
+  "observation_after_cutoff": {
+    "total": 137,
+    "persistent": 0,
+    "finite": 137,
+    "over_max": 0,
+    "decode_invalid": 0,
+    "v1": 0,
+    "v2": 137,
+    "v3": 2,
+    "_note": "the 2 v3 came from promoteLegacySession on the ReuseSession path, not new logins"
+  },
+  "observation_before_migration": {
+    "total": 194,
+    "persistent": 57,
+    "finite": 137,
+    "over_max": 0,
+    "decode_invalid": 1,
+    "v1": 53,
+    "v2": 140,
+    "v3": 0,
+    "_note": "migrate reported v1=54 for the same keyspace; see verification.md T3"
+  },
+  "sessions_per_uid": {
+    "distinct_uids": 115,
+    "median": 1,
+    "p95": 2,
+    "max": 64,
+    "max_uid": "管理台账号 (64 sessions, all deviceFlag=0, admin console re-login)",
+    "max_excluding_admin": 3
+  }
+}
