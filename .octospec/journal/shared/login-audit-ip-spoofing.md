@@ -13,10 +13,11 @@ source: self
 
 ## What was done
 
-- octo-lib PR #119 exports `wkhttp.ClientIP`, makes both shared IP limiters use
-  it, selects the proxy-appended rightmost XFF entry, validates and canonicalizes
-  candidates, fails malformed or ambiguous input into the existing unknown-IP
-  bucket, and bounds suffix parsing without splitting an attacker-sized header.
+- octo-lib PR #119, squash-merged as `233dd6f`, exports `wkhttp.ClientIP`, makes
+  both shared IP limiters use it, selects the proxy-appended rightmost XFF entry,
+  validates and canonicalizes candidates, fails malformed or ambiguous input
+  into the existing unknown-IP bucket, and bounds suffix parsing without
+  splitting an attacker-sized header.
 - octo-server replaces all 15 user-module and four OIDC security-sensitive
   `util.GetClientPublicIP(c.Request)` sources with `wkhttp.ClientIP`. This covers
   successful and failed login audit, account creation, logout, OIDC state and
@@ -34,18 +35,19 @@ source: self
 - Parsing a syntactically valid IP is not a proxy trust decision. The retained
   database normalizer protects field integrity, while CLB header ownership and
   network reachability remain deployment gates.
-- This is a stacked change. The server PR may be reviewed while octo-lib #119 is
-  open, but it must not merge until the library is squash-merged and `go.mod` is
-  updated from the temporary PR-head pseudo-version to the final merge revision.
+- This was developed as a stacked change. The server PR opened while octo-lib
+  #119 was under review; after the library squash merge, `go.mod` was updated to
+  final merge revision `233dd6f` and the focused gates were rerun.
 
 ## Verification
 
 - TDD RED: server commit `1274394a` fails in a detached worktree because the old
   octo-lib has no `wkhttp.ClientIP`; GREEN: `e68a52d7` passes the same focused
   user/OIDC targets and the user audit database integration case.
-- The complete OIDC package passes against octo-lib head `d1184f6` in an isolated
-  schema. Focused user/OIDC tests also pass with the race detector; full-repo
-  `go vet ./...`, `golangci-lint run ./...`, `go mod verify`, and diff checks pass.
+- The complete OIDC package passes against octo-lib merge commit `233dd6f` in an
+  isolated schema. Focused user/OIDC tests also pass with the race detector;
+  full-repo `go vet ./...`, `golangci-lint run ./...`, `go mod verify`, and diff
+  checks pass.
 - The complete user-package run is not claimed green: its filtered failures are
   pre-existing dashboard-reader tests whose isolated schema lacks legacy column
   `user.app_id`. A clean CI run remains the pre-merge full-suite gate.

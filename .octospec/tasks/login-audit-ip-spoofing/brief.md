@@ -34,11 +34,11 @@ Before this task, octo-server pinned octo-lib at
 
 The octo-lib export and selector hardening are tracked by
 [`Mininglamp-OSS/octo-lib#119`](https://github.com/Mininglamp-OSS/octo-lib/pull/119).
-Its current PR head is `d1184f63703cb88b9a863e77adcb176c69f19b87` and may be
-used as a temporary pseudo-version while the two repositories are developed and
-tested together. octo-lib uses squash merge, so before octo-server merges, its
-dependency must be updated from this temporary PR-head revision to the final
-octo-lib merge commit and the focused tests must be rerun with that revision.
+It was squash-merged as `233dd6fcdda60ccf347811d1e7a069f1e9703bf8` after stacked
+development against PR head `d1184f63703cb88b9a863e77adcb176c69f19b87`.
+octo-server now pins the final merge revision through pseudo-version
+`v0.0.0-20260811160929-233dd6fcdda6`, and the focused tests have been rerun
+against that revision.
 
 The exported selector deliberately tightens the former private helper. The
 rightmost XFF entry is authoritative even when the proxy appends a separate
@@ -116,11 +116,10 @@ only the 15 user call sites would leave OIDC login audit spoofable.
   Redis-error behavior. Valid IPs become canonical bucket keys; malformed,
   ambiguous, or oversized candidates use the existing unknown-IP bucket. This
   task does not introduce a new generic limiter.
-- `dependency-rollout` — stacked development may temporarily pin octo-lib PR
-  #119 head `d1184f63703cb88b9a863e77adcb176c69f19b87`. The octo-lib
-  export must be merged and resolvable before octo-server merges, and
-  `go.mod`/`go.sum` must then point to the final squash-merge commit rather than
-  the superseded PR-head commit.
+- `dependency-rollout` — stacked development used octo-lib PR #119 head
+  `d1184f63703cb88b9a863e77adcb176c69f19b87`; the final server dependency must
+  resolve to squash-merge commit `233dd6fcdda60ccf347811d1e7a069f1e9703bf8`,
+  not the superseded PR-head commit.
 - `wire-contract` — no HTTP route, response body, status code, localized error,
   authentication decision, or client-visible field changes.
 
@@ -168,10 +167,9 @@ only the 15 user call sites would leave OIDC login audit spoofable.
 
 ### octo-server
 
-- During stacked development, `go.mod` and `go.sum` may point to octo-lib PR
-  #119 head `d1184f63703cb88b9a863e77adcb176c69f19b87`. Before the
-  octo-server PR merges, they point to the final octo-lib squash-merge revision
-  containing `wkhttp.ClientIP`, and focused tests have passed against it.
+- `go.mod` and `go.sum` point to octo-lib squash-merge revision
+  `233dd6fcdda60ccf347811d1e7a069f1e9703bf8` containing `wkhttp.ClientIP`, and
+  focused tests have passed against it.
 - All 15 user-module and four OIDC direct
   `util.GetClientPublicIP(c.Request)` calls in scope use `wkhttp.ClientIP`.
 - A source guard fails if `util.GetClientPublicIP(c.Request)` is reintroduced
@@ -236,33 +234,32 @@ only the 15 user call sites would leave OIDC login audit spoofable.
 
 ## Validation record (2026-08-12)
 
-- octo-lib PR #119 is open at head
-  `d1184f63703cb88b9a863e77adcb176c69f19b87`, approved, and all required CI
-  checks are green while it awaits squash merge. The latest blocking review
-  finding was reproduced RED: a 64 KiB comma-dense XFF allocated 1,056,788
-  bytes per `ClientIP` call before rate limiting. Commit `0878bb2` pins the
-  allocation bound and rightmost-IP behavior; commit `d1184f6` replaces the
-  full `strings.Split` with suffix-only `strings.LastIndexByte` parsing and is
-  GREEN. Both commits are pushed and rereview is approved; no explanatory
-  review comment was added.
+- octo-lib PR #119 was approved with all required CI green and squash-merged as
+  `233dd6fcdda60ccf347811d1e7a069f1e9703bf8`. Its latest blocking review finding
+  was reproduced RED: a 64 KiB comma-dense XFF allocated 1,056,788 bytes per
+  `ClientIP` call before rate limiting. Commit `0878bb2` pins the allocation
+  bound and rightmost-IP behavior; commit `d1184f6` replaces the full
+  `strings.Split` with suffix-only `strings.LastIndexByte` parsing and is GREEN.
+  No explanatory review comment was added.
 - octo-lib passes `go test ./...`, the focused `TestClientIP` race run,
   `go vet ./...`, `golangci-lint run ./...`, and `git diff --check` at
   `d1184f6`.
-- The octo-server stacked branch temporarily pins the resolvable pseudo-version
-  `v0.0.0-20260811154526-d1184f63703c`. Commit `1274394a` is the RED checkpoint:
+- The octo-server branch pins final pseudo-version
+  `v0.0.0-20260811160929-233dd6fcdda6`. Commit `1274394a` is the RED checkpoint:
   in a detached worktree at that commit, the focused user target fails to build
   because the old octo-lib has no `wkhttp.ClientIP`. Commit `e68a52d7` is the
   GREEN production change. With `GOWORK=off`, focused user and OIDC client-IP
   tests pass, including source guards, OIDC state storage, session issuance,
   audit attribution, callback failure limiting, and bind context attribution.
   The focused race run, `go mod verify`, full-repo `go vet ./...`, full-repo
-  `golangci-lint run ./...`, and `git diff --check` also pass.
+  `golangci-lint run ./...`, and `git diff --check` also pass after switching to
+  final merge commit `233dd6f`.
 - In isolated schema `octo_login_audit_ip_lusaka_20260811`,
   `TestLoginLog_RecordSuccessAndFailure_Integration` passes against octo-lib
-  `d1184f6` and proves successful and failed login rows retain the rightmost XFF
+  `233dd6f` and proves successful and failed login rows retain the rightmost XFF
   value. In independent schema `octo_login_audit_oidc_lusaka_20260811`, the
   complete `go test ./modules/oidc/... -count=1` run passes against the same
-  octo-lib head.
+  octo-lib merge commit.
 - The complete user package run is not counted as green. Its filtered failure
   list contains only pre-existing dashboard-reader manager tests; a focused
   rerun fails at test setup with `Error 1054 (42S22): Unknown column 'app_id'

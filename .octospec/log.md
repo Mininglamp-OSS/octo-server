@@ -9,9 +9,9 @@ change-log convention (§7). Newest first.
 - **Fix** — Task `login-audit-ip-spoofing`: login, account-creation, logout, and
   OIDC audit/guard paths now use the same validated proxy-aware client-IP source
   as shared rate limiting. The stacked server change covers all 15 user and four
-  OIDC sources, preserves the audit/wire/quota contracts, and depends on approved
-  octo-lib PR #119. The final library squash SHA and production CLB/direct-access
-  checks remain merge and rollout gates. See
+  OIDC sources, preserves the audit/wire/quota contracts, and now pins merged
+  octo-lib #119 commit `233dd6f`. Production CLB/direct-access checks remain
+  rollout gates. See
   [journal](journal/shared/login-audit-ip-spoofing.md).
 
 ## 2026-08-10 (token-lifecycle-hardening PR 2)
