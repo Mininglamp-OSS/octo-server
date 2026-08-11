@@ -4,6 +4,32 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-11 (token-session-rollout-simplify)
+
+- **Task** — `token-session-rollout-simplify`: collapsed the #725 five-phase
+  session rollout into a self-driving loop. Boot no longer panics on a missing
+  Redis floor — a write-once MySQL marker separates "never initialised" from
+  "lost to an RDB rollback" and a lost floor resolves upward to enforce. The
+  mode is derived from the floor and polled, removing eight of nine rolling
+  restarts and the ordering trap that made a pod restart fatal between an
+  advance and its deploy. A writer registry modelled as a write lease turns
+  "no pre-fix replica remains" from a kubectl template into a machine gate,
+  which retires the two-observation / one-hour ritual; the predicate is now
+  evaluated at decision time, so an empty keyspace is the strongest evidence
+  rather than a rejected one and greenfield reaches enforce with no commands.
+  A reconciler advances the floor and ships disabled. Tooling moved into
+  `app session-rollout` and prints the Redis endpoint it resolved. Migration
+  correctness and the floor's monotonic CAS are unchanged. See
+  [journal](journal/shared/token-session-rollout-simplify.md) and
+  [verification](tasks/token-session-rollout-simplify/verification.md). PR #733.
+- **Learning (pending)** —
+  [characterize-before-you-design](learnings/pending/characterize-before-you-design.md):
+  the brief was written from code reading and verified afterwards; the
+  verification found a defect that changed a design decision, so it landed as a
+  patch. A runnable characterization of current behaviour belongs in Plan as an
+  input, split into invariants that must stay green and tripwires that must go
+  red.
+
 ## 2026-08-10 (token-lifecycle-hardening PR 2)
 
 - **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,
