@@ -532,6 +532,9 @@ paths:
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；空串或 -1 清除→回退按 group_no 派生"
+              clear_uploaded_avatar:
+                type: string
+                description: "确认切回服务端生成头像并清除上传图优先级；仅接受字符串 '1'/'true'（'0'/'false'/空串视为未设置）；当当前头像来源为上传图时仅群主可用"
 
       responses:
         200:

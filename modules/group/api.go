@@ -1168,7 +1168,8 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	}
 	// 群存在性 + 状态检查（不缓存整行：下方 invite 分支改用列级写，避免用旧快照全列回写
 	// 覆盖掉 name 分支刚提交的 name/is_named，见 DB.UpdateInviteTx 注释）。
-	if _, err := g.getGroupInfo(groupNo); err != nil {
+	groupInfo, err := g.getGroupInfo(groupNo)
+	if err != nil {
 		respondGroupInfoError(c, err)
 		return
 	}
@@ -1180,6 +1181,19 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
 	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
 	clearUploadedAvatarValue, hasClearUploadedAvatar := groupMap[attrKeyClearUploadedAvatar]
+	clearUploadedAvatar := false
+	if hasClearUploadedAvatar {
+		raw := strings.TrimSpace(strings.ToLower(clearUploadedAvatarValue))
+		switch raw {
+		case "", "0", "false":
+			hasClearUploadedAvatar = false
+		case "1", "true":
+			clearUploadedAvatar = true
+		default:
+			respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
+			return
+		}
+	}
 
 	// 权限分档：
 	//   高级字段（notice/invite/avatar_text/avatar_color/clear_uploaded_avatar）——仍需管理员/群主。
@@ -1196,6 +1210,18 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		if !isManager {
 			httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 			return
+		}
+		if clearUploadedAvatar && groupInfo.IsUploadAvatar == 1 {
+			isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
+			if err != nil {
+				g.Error("查询群创建者失败！", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			if !isCreator {
+				httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOnly, nil, nil)
+				return
+			}
 		}
 	} else {
 		// 仅改名：低风险写，内部活跃人类成员即可，龙虾(robot)不是普通成员，禁止其改名。
@@ -1237,16 +1263,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 			OperatorName: loginName,
 		}
 		if hasClearUploadedAvatar {
-			raw := strings.TrimSpace(strings.ToLower(clearUploadedAvatarValue))
-			if raw != "1" && raw != "true" {
-				respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
-				return
-			}
-			if !hasAvatarText && !hasAvatarColor {
-				respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
-				return
-			}
-			avatarReq.ClearUploadedAvatar = true
+			avatarReq.ClearUploadedAvatar = clearUploadedAvatar
 		}
 		if hasAvatarText {
 			if avatarrender.VisibleRuneCount(avatarTextValue) > 4 {

@@ -414,12 +414,10 @@ func (d *DB) updateAvatar(avatar string, avatarVersion int64, groupNo string) er
 	return err
 }
 
-// updateAvatarCustom 更新自定义群头像文字/颜色与群版本（不触碰 is_upload_avatar：
-// 自定义文字/色仍是「默认头像」范畴，渲染时实时出图，不同于上传图片）。color 为
-// *int，nil → NULL（清除自定义色，回退按 group_no 派生）。text 为空串表示清除自定义
-// 文字（回退：老群取群名前 2 字，新群双人图标）。
-// updateAvatarCustom 只更新本次实际提供的列：text 非 nil 时写 avatar_text，setColor
-// 为 true 时写 avatar_color（*int，nil → NULL 清除自定义色）；始终 bump version。
+// updateAvatarCustom 更新自定义群头像文字/颜色与群版本：text 非 nil 时写
+// avatar_text（空串表示清除自定义文字），setColor 为 true 时写 avatar_color（*int，
+// nil → NULL 清除自定义色），clearUploadedAvatar 为 true 时同一条 UPDATE 清除上传图
+// 优先级（is_upload_avatar=0）；始终 bump version。
 // 列级更新避免「读-改-写」竞态——并发只改文字 / 只改色不会互相覆盖对方的列。
 func (d *DB) updateAvatarCustom(groupNo string, text *string, setColor bool, color *int, clearUploadedAvatar bool, version int64) (int64, error) {
 	// updated_at 列是 DEFAULT CURRENT_TIMESTAMP 但**无** ON UPDATE，列级 UPDATE 不会自动

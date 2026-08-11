@@ -1998,9 +1998,6 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	if req.AvatarText == nil && !req.SetAvatarColor && !req.ClearUploadedAvatar {
 		return errors.New("nothing to update")
 	}
-	if req.ClearUploadedAvatar && req.AvatarText == nil && !req.SetAvatarColor {
-		return errors.New("clear_uploaded_avatar requires avatar_text or avatar_color")
-	}
 
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
 	if err != nil {
@@ -2032,6 +2029,18 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 
 	// 通知客户端刷新频道信息 → 重新拉取头像。
 	s.ctx.SendChannelUpdateToGroup(req.GroupNo)
+	if req.ClearUploadedAvatar {
+		if err := s.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   req.GroupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			CMD:         common.CMDGroupAvatarUpdate,
+			Param: map[string]interface{}{
+				"group_no": req.GroupNo,
+			},
+		}); err != nil {
+			s.Error("send group avatar update cmd failed", zap.String("group_no", req.GroupNo), zap.Error(err))
+		}
+	}
 
 	return nil
 }
