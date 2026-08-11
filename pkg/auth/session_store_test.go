@@ -302,17 +302,19 @@ func TestRedisSessionStoreObserveCountsZeroTTLAsInvalid(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
 	prefix := "observe-zero-ttl:" + util.GenerUUID() + ":"
+	uidPrefix := "observe-zero-ttl-uid:" + util.GenerUUID() + ":"
 	key := prefix + "token"
-	store := NewRedisSessionStore(client, prefix, "observe-zero-ttl-uid:", time.Minute)
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Minute)
 	require.NoError(t, client.Set(key, "u1@legacy", time.Minute).Err())
+	require.NoError(t, readTokenScript.Load(client).Err())
 	t.Cleanup(func() {
-		_ = client.Del(key).Err()
+		_ = client.Del(key, store.rolloutScanLeaseKey()).Err()
 		_ = client.Close()
 	})
 	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
 		return func(cmd rd.Cmder) error {
-			if cmd.Name() == "evalsha" {
-				args := cmd.Args()
+			args := cmd.Args()
+			if cmd.Name() == "evalsha" && len(args) > 1 && fmt.Sprint(args[1]) == readTokenScript.Hash() {
 				args[0] = "eval"
 				args[1] = `return {"u1@legacy", 0}`
 				args[2] = 0

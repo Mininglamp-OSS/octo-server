@@ -649,10 +649,9 @@ func TestSessionPolicyFromEnvIsAdvisoryAndNeverFatal(t *testing.T) {
 	})
 }
 
-// The cap moves from the environment into the floor record. A #725 record
-// predates the field, so reading one must work and the next advance must be
-// able to supply it.
-func TestSessionRolloutControlCarriesMaxPerUIDAndReadsLegacyRecords(t *testing.T) {
+// The #725 Redis record remains readable for one-time MySQL takeover, but no
+// runtime API can update it after authority moves to MySQL.
+func TestLegacySessionRolloutControlRemainsReadableForTakeover(t *testing.T) {
 	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
 	ctx := context.Background()
 
@@ -662,26 +661,6 @@ func TestSessionRolloutControlCarriesMaxPerUIDAndReadsLegacyRecords(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, SessionModeV3Write, control.ModeFloor)
 	require.Zero(t, control.MaxPerUID, "a #725 record has no cap field")
-
-	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
-	control, err = store.RolloutControl(ctx)
-	require.NoError(t, err)
-	require.Equal(t, SessionModeRevoke, control.ModeFloor)
-	require.Equal(t, 20, control.MaxPerUID)
 	require.Equal(t, int64(3600000), control.ObservationMinGapMS,
-		"the unused gap is carried forward so a #725 artifact can still parse the record")
-
-	// Omitting the cap on a later advance keeps the persisted one.
-	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeBounded, 0))
-	control, err = store.RolloutControl(ctx)
-	require.NoError(t, err)
-	require.Equal(t, 20, control.MaxPerUID)
-}
-
-// A v3-writing floor without a cap would be a bounded index with no bound.
-func TestSessionRolloutControlRefusesV3FloorWithoutCap(t *testing.T) {
-	store, _ := newLegacyMigrationTestStore(t, SessionModeRevoke)
-	ctx := context.Background()
-	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 0),
-		"bounded max sessions per UID")
+		"the unused gap remains decodable during takeover")
 }

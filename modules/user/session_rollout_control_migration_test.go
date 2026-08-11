@@ -41,10 +41,17 @@ func TestSessionRolloutMarkerMigrationRemainsAvailableForUpgradeCompatibility(t 
 	require.Contains(t, string(raw), "CREATE TABLE IF NOT EXISTS `octo_session_rollout_marker`")
 }
 
+func TestSessionRolloutOldControlMigrationRemainsANoopCompatibilityTombstone(t *testing.T) {
+	raw, err := os.ReadFile("sql/20260811000001_session_rollout_control.sql")
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "Compatibility tombstone")
+	require.NotContains(t, string(raw), "CREATE TABLE")
+}
+
 func TestSessionRolloutMigrationsUpgradeDatabaseWithAppliedMarker(t *testing.T) {
 	db := newSessionRolloutMigrationTestDatabase(t)
 	legacy := migrate.MemoryMigrationSource{Migrations: []*migrate.Migration{{
-		Id: "20260811000001_session_rollout_marker",
+		Id: "20260811000001_session_rollout_marker.sql",
 		Up: []string{`CREATE TABLE octo_session_rollout_marker (
 			singleton_id TINYINT UNSIGNED NOT NULL,
 			initialized_floor VARCHAR(16) NOT NULL DEFAULT '',
@@ -58,8 +65,37 @@ func TestSessionRolloutMigrationsUpgradeDatabaseWithAppliedMarker(t *testing.T) 
 	current := currentSessionRolloutMigrationSource(t)
 	applied, err = migrate.Exec(db, "mysql", current, migrate.Up)
 	require.NoError(t, err)
-	require.Equal(t, 1, applied, "the control migration must run after the already-applied marker migration")
+	require.Equal(t, 2, applied, "the compatibility tombstone and control migration must run after the marker")
+	assertSessionRolloutMigrationTables(t, db)
+}
 
+func TestSessionRolloutMigrationsUpgradeDatabaseWithAppliedPRControl(t *testing.T) {
+	db := newSessionRolloutMigrationTestDatabase(t)
+	legacyControl := parseSessionRolloutMigration(t, "20260812000001_session_rollout_control.sql")
+	legacyControl.Id = "20260811000001_session_rollout_control.sql"
+	legacy := migrate.MemoryMigrationSource{Migrations: []*migrate.Migration{
+		legacyControl,
+		{
+			Id: "20260811000001_session_rollout_marker.sql",
+			Up: []string{`CREATE TABLE octo_session_rollout_marker (
+				singleton_id TINYINT UNSIGNED NOT NULL,
+				PRIMARY KEY (singleton_id)
+			) ENGINE=InnoDB`},
+		},
+	}}
+	applied, err := migrate.Exec(db, "mysql", legacy, migrate.Up)
+	require.NoError(t, err)
+	require.Equal(t, 2, applied)
+
+	current := currentSessionRolloutMigrationSource(t)
+	applied, err = migrate.Exec(db, "mysql", current, migrate.Up)
+	require.NoError(t, err)
+	require.Equal(t, 1, applied, "only the new control migration should remain pending")
+	assertSessionRolloutMigrationTables(t, db)
+}
+
+func assertSessionRolloutMigrationTables(t *testing.T, db *sql.DB) {
+	t.Helper()
 	for _, table := range []string{
 		"octo_session_rollout_marker",
 		"octo_session_rollout_state",
@@ -86,13 +122,27 @@ func currentSessionRolloutMigrationSource(t *testing.T) migrate.MemoryMigrationS
 		}
 		file, err := sqlFS.Open("sql/" + entry.Name())
 		require.NoError(t, err)
-		migration, err := migrate.ParseMigration(entry.Name(), file.(io.ReadSeeker))
+		reader, ok := file.(io.ReadSeeker)
+		require.True(t, ok, "%s must be seekable", entry.Name())
+		migration, err := migrate.ParseMigration(entry.Name(), reader)
 		require.NoError(t, err)
 		require.NoError(t, file.Close())
 		migrations = append(migrations, migration)
 	}
 	require.NotEmpty(t, migrations)
 	return migrate.MemoryMigrationSource{Migrations: migrations}
+}
+
+func parseSessionRolloutMigration(t *testing.T, name string) *migrate.Migration {
+	t.Helper()
+	file, err := sqlFS.Open("sql/" + name)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+	reader, ok := file.(io.ReadSeeker)
+	require.True(t, ok, "%s must be seekable", name)
+	migration, err := migrate.ParseMigration(name, reader)
+	require.NoError(t, err)
+	return migration
 }
 
 func newSessionRolloutMigrationTestDatabase(t *testing.T) *sql.DB {

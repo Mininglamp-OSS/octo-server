@@ -1,275 +1,254 @@
 # Token session v3 rollout runbook
 
-这份 runbook 取代了 #725 的九步阶梯。旧流程要求 9 次滚动重启、11 次 CLI 调用、
-两段各 ≥1h 的观察窗，以及一次对零存量环境也必须执行的空迁移——**而那整套仪式唯一的保护
-对象是存量 legacy session**。没有存量时它保护不了任何东西。
+本版本把 session rollout control 收敛为一个 MySQL 权威状态，删除 Redis floor + MySQL marker
+恢复状态机的运行时路径。Redis 只承载 session 数据、writer lease、scan-owner lease 与 `run_id`
+证据。历史 marker migration/table 仅为 `sql-migrate` 账本兼容保留，服务不再读写它。
 
-现在 floor 由服务自己推进。**你只需要做一个决定：迁移的 cutoff 和策略，
-也就是愿意让多少人提前重新登录。** 系统会自动走到那个决定面前停下来并说明差什么。
+默认 `OCTO_AUTH_SESSION_AUTO_ADVANCE=0`。首次部署先验证接管、registry、扫描和 migration，
+再显式开启自动推进。
 
----
+## 1. 权威状态与启动顺序
 
-## 1. 它自己会做什么
+MySQL migration 创建：
 
-```
-全新部署        部署制品（配 EXPECT_WRITERS=<副本数>）。结束，floor 自动到 enforce。
-                首个 v3 floor 前会先确认 writer 集合已静止一个 lease TTL（30s），
-                实际约 1 分钟——无人值守，不需要任何命令。
-有存量的部署    部署制品 → 自动推进，然后停在第一个有存量的门禁上：
-                  有永久/超上限 legacy → 停在 revoke，报 persistent=N over_max=M
-                  只剩有限 legacy      → 停在 bounded，报 v1=N v2=M
-                → 你决定 cutoff 与 finite policy，跑一次 migrate
-                → 到期后自动推进到 enforce
-```
+- `octo_session_rollout_state`：单例 floor、`max_per_uid`、version、paused；
+- `octo_session_rollout_advance`：append-only 推进 evidence/audit。
 
-floor 单调不可逆，永远只前进。每次推进前都会写下触发它的证据快照
-（存活 writer 数、build、扫描计数、Redis 实例指纹、时刻），用 `status` 可查。
+升级不会删除或改名已记录的 `20260811000001_session_rollout_marker.sql`；这样旧库的
+`gorp_migrations` 仍可校验通过。真正的 control 表由更晚 migration 创建。
 
-**唯一的强制等待**是第一个 v3 floor 前那一个 lease TTL:要求 writer **集合**（不是数量）
-逐字节不变地维持 30s。数量相同在 maxSurge 滚动的某一瞬间也成立——那一刻新副本已全部就绪、
-最后一个不注册的旧副本尚未退出,而它正是这道门禁要排除的对象。身份是 per-incarnation 的,
-所以集合在超过 TTL 的窗口两端一致即证明期间没有成员变动。后续每一跳都没有这个等待。
+服务启动顺序：
+
+1. 构造共享 Redis session store，立即 fence 新 credential；
+2. `module.Setup` 执行 MySQL migration；
+3. 加载 MySQL singleton；
+4. singleton 不存在时，一次性读取 #725 Redis floor 与遗留 MODE，取较严格 floor；cap 优先
+   保留 Redis 记录，其次遗留 `MAX_PER_UID`，最后默认 20；
+5. MySQL transaction 写 singleton + bootstrap/takeover audit；
+6. 应用本地 mode，加入 writer registry，并原子发布 applied state + lease；
+7. 发布成功才解除 issuance fence，然后启动 poller/reconciler 和 HTTP serve。
+
+singleton 已存在时，后续启动不再读取 Redis floor。Redis 恢复旧快照、清空或 failover 都不能
+改变 rollout mode。
+
+首次接管若 MySQL 或 legacy Redis floor 不可读，服务启动失败并保持 fenced。不要手工 seed
+`expand` 或 `enforce`；两种猜测分别可能 fail-open 或无证据登出用户。
 
 ## 2. 配置
 
-只剩一个必须的开关，其余都可选：
-
 | 配置 | 说明 |
 |---|---|
-| `OCTO_AUTH_SESSION_AUTO_ADVANCE` | `1` 开启自动推进。**首个引入本能力的 release 请保持关闭**，见 §6 |
-| `OCTO_AUTH_SESSION_EXPECT_WRITERS` | 本部署计划运行的副本数。**首次建立 v3 floor 时必需**（无论 keyspace 是否为空——空只代表*此刻*没有存储，不代表没有未注册的旧副本），推过之后即可删除 |
-| `OCTO_AUTH_SESSION_CANARY_AHEAD` | `1` 让该副本比 floor 高一阶，用于灰度。打在小流量副本上 |
-| `OCTO_AUTH_SESSION_REDIS_POOL_SIZE` / `..._POOL_TIMEOUT` | 同 #725，未变 |
-| `TS_CACHE_TOKENEXPIRE` | 同 #725，未变 |
+| `OCTO_AUTH_SESSION_AUTO_ADVANCE` | `1` 开启自动推进；本版本首次部署必须先保持 `0` |
+| `OCTO_AUTH_SESSION_EXPECT_WRITERS` | 首次 `expand → v3-write` 所需计划副本数；通过后可删除 |
+| `OCTO_AUTH_SESSION_CANARY_AHEAD` | `1` 让该副本比 MySQL floor 高一阶；只用于受控灰度 |
+| `OCTO_AUTH_SESSION_REDIS_POOL_SIZE` / `..._POOL_TIMEOUT` | session 共享 Redis pool 参数 |
+| `TS_CACHE_TOKENEXPIRE` | session 最大 TTL，沿用 #725 |
 
-**已废弃**（读到会告警，不会导致启动失败）：
+仅在首次接管兼容读取：
 
-- `OCTO_AUTH_SESSION_MODE` —— mode 现在由 floor 派生。为兼容保留一个 release：
-  如果它高于 floor（#725 Phase D/E 的灰度姿态就是这样），会被继续尊重，
-  否则升级会把 reader 从 `bounded` 悄悄放松回 `revoke`。floor 追上后即可删除。
-- `OCTO_AUTH_SESSION_MAX_PER_UID` —— cap 已并入 floor 记录，首次启动时抄一次，之后可删。
-- `OCTO_AUTH_SESSION_REQUIRED_FLOOR` —— **已完全失效**，可以直接删。
+- `OCTO_AUTH_SESSION_MODE`：若高于 Redis floor，会作为 MySQL seed 下限；
+- `OCTO_AUTH_SESSION_MAX_PER_UID`：legacy Redis control 未带 cap 时作为 seed；
+- `OCTO_AUTH_SESSION_REQUIRED_FLOOR`：无效，启动只告警。
 
-启动日志包含实际连接的 Redis 与实例指纹：
+确认 MySQL singleton 已正确 seed 后，删除这些遗留项。之后更改它们不会改变 floor。
+
+启动日志示例：
 
 ```text
-Authentication session runtime: mode=... rollout_floor=... boot=... auto_advance=...
-  redis=<addr> instance=<fingerprint> token_ttl=... redis_pool_size=... build=...
+Authentication session runtime: mode=revoke rollout_floor=revoke boot=adopted
+  auto_advance=false mysql_versioned=true redis=<addr> instance=<fingerprint>
+  token_ttl=720h0m0s redis_pool_size=... redis_pool_timeout=... build=<commit>
 ```
 
-`boot=` 有五个取值，对应五种启动情形：`fresh`（全新）、`adopted`（从 #725 接管）、
-`rollback-recovered`（**Redis 丢过 floor**，见 §7）、`normal`、
-`unknown`（**floor 读不到、marker 也答不了**，见 §7）。
+`boot` 只有：`fresh`、`adopted`、`normal`。旧的 `rollback-recovered` / `unknown` 已删除。
 
-`unknown` 时进程按 `enforce` 运行,但这是一个**猜测**而非观测:它不写 floor 记录,
-并且第一次真正读到 floor 时会被替换掉(可以向下)。它比 `rollback-recovered`
-更需要告警——后者会自愈,前者只说明"当时什么都读不到",若持续出现说明 Redis 或
-MySQL 有持续问题。
-
-## 3. 唯一的命令
+## 3. Operator 命令
 
 ```bash
-app session-rollout status     # 排查：floor 在哪、谁在跑、卡在什么上
-app session-rollout observe    # 只读盘点，支持 --qps 限速
-app session-rollout migrate    # 唯一的决策：cutoff + finite policy
-app session-rollout pause      # 逃生门：秒级停下自动推进
-app session-rollout resume
+/home/app session-rollout status
+/home/app session-rollout observe --batch-size 200 --qps 100
+/home/app session-rollout migrate --campaign <id> --cutoff <RFC3339> \
+  --finite-policy natural --batch-size 200 --qps 100 --lease 30s
+/home/app session-rollout pause
+/home/app session-rollout resume
 
-# 故障通道：仅当 reconciler 自身坏掉时使用。它绕过 reconciler，
-# 但**不绕过谓词**——谓词不放行照样拒绝。
-app session-rollout advance --force --yes [--expect-writers N] [--max-per-uid N]
+# 仅 reconciler 故障时使用；仍执行完整 predicate 与 MySQL CAS。
+/home/app session-rollout advance --force --yes \
+  [--expect-writers N] [--observe-window 90s]
 ```
 
-每个子命令执行任何操作**之前**都会先打印它解析到的 Redis 地址和实例指纹：
+每个命令都会先打印 Redis endpoint、DB、实例指纹和 Token TTL。命令同时直连 MySQL control，
+所以 config 必须同时指向正确的 Redis 与 MySQL。
 
-```text
-redis: <redis-service>:6379  db=0  instance=9f3e11b4a2c7d081  token_ttl=720h0m0s
-```
+`advance` 不再接受 `--max-per-uid`；cap 来自 MySQL authority。
 
-> 这一行是有来历的。2026-08-11 一次实操把配置键写在了顶层 `redisAddr`（octo-lib 实际读
-> `db.redisAddr`），键未命中导致工具回落到 `127.0.0.1:6379`，扫到本机测试残留并报
-> `complete: true`。当时若带了 `--apply`，改的就是错误的 keyspace，而输出里没有任何线索。
-
-`status` 的输出形如：
+`status` 关键字段：
 
 ```json
 {
   "floor": "revoke",
+  "version": 3,
   "max_per_uid": 20,
   "reconciler_paused": false,
-  "writers": [{"build": "<commit>", "applied_state": "revoke", "pod": "...<pod>"}],
-  "tokens": {"total": 137, "v1": 0, "v2": 135, "v3": 2, "persistent": 0},
-  "last_advance": {"from": "v3-write", "to": "revoke", "actor": "reconciler", "live_writers": 1},
-  "next": {
-    "target_floor": "bounded",
-    "allowed": false,
-    "blocked_by": ["persistent=0 over_max=0 (need 0)"],
-    "options": ["wait: legacy records expire on their own", "migrate --finite-policy natural --cutoff <T>: ..."]
-  }
+  "writers": [{"build": "<commit>", "applied_state": "revoke", "pod": "<pod>"}],
+  "tokens": {"complete": true, "redis_instance_id": "...", "persistent": 0, "v2": 12},
+  "last_advance": {
+    "from": "v3-write",
+    "to": "revoke",
+    "actor": "reconciler",
+    "transition_kind": "advance",
+    "writer_fingerprint": "...",
+    "redis_instance_id": "..."
+  },
+  "next": {"target_floor": "bounded", "allowed": true}
 }
 ```
 
-**`blocked_by` 是排查的起点。** 卡住时读它，不要绕过去。
+`blocked_by` 是排障起点，禁止绕过。`status` 本身可能触发一次限速全量扫描；若另一个
+observe/migrate/reconciler 已持有 scan-owner，命令会明确报错，等待当前扫描结束后重试。
 
-## 4. 那个决定：migration
+## 4. 推进门禁
 
-只有 legacy token 还在时才需要。两条路：
+floor 只允许：
 
-| 做法 | 代价 |
+```text
+expand -> v3-write -> revoke -> bounded -> enforce
+```
+
+| 目标 | 门禁 |
 |---|---|
-| 什么都不做 | 最长等到 `TokenExpire`。活跃用户会被 `ReuseSession` 逐步提升为 v3，只有不活跃用户的 token 会拖满 |
-| 跑一次 migration | 命中的用户下次访问需重新登录，换取立刻收口 |
+| `v3-write` | live writer 非空、同一 build、均应用 current floor、数量等于 `EXPECT_WRITERS`、集合稳定 30s、完整扫描 |
+| `revoke` | writer 非空、同一 build、均应用 current floor |
+| `bounded` | 上述 writer 条件；完整扫描；`persistent=0 && over_max=0` |
+| `enforce` | 上述 writer 条件；完整扫描；`v1=0 && v2=0` |
+
+任何需要扫描的 decision 都绑定：
+
+- 扫描完成时的 Redis `run_id` 指纹；
+- 扫描前后完全一致的 writer fingerprint；
+- scan-owner lease。
+
+Redis 实例在扫描中变化时，cursor 和累计计数全部丢弃，从 0 重扫。scan-owner 丢失、续租失败
+或 Redis 读错误均不会生成 complete evidence。
+
+推进在一个 MySQL transaction 中插入 evidence 并执行 `version + floor + paused=0` CAS。
+多副本并发只有一个 winner，loser 的 evidence 会 rollback。
+
+## 5. 首次部署与启用
+
+1. 部署本制品，保持 `AUTO_ADVANCE=0`；不要同时删除 legacy 配置。
+2. 确认 migration 成功，所有副本启动，启动日志没有 MySQL/registry publication 错误。
+3. 执行 `status`，核对：
+   - MySQL floor/cap 等于升级前 Redis floor、legacy MODE 中较严格的姿态；
+   - `version >= 1`，`paused=false`；
+   - writers 数量等于计划副本数，build 一致，applied state 不低于 floor；
+   - Redis endpoint 与 instance fingerprint 正确。
+4. 执行一次 `observe`，确认 complete、`run_id`、计数和 scan-owner 行为。
+5. 对 migration 做 dry-run；核对 `shortened` / `would_delete` 与业务影响。
+6. 固定副本数或暂停 HPA，设置 `EXPECT_WRITERS`。
+7. 显式设置 `AUTO_ADVANCE=1` 并滚动；观察 MySQL audit、writers 与 blocked reason。
+8. floor 通过 `v3-write` 后可删除 `EXPECT_WRITERS`；确认 seed 后可删除 legacy MODE/MAX 配置。
+
+首个带 registry 的版本不能在自身滚动过程中自动推进：旧制品不会注册，只有部署系统提供的
+预期副本数与稳定窗口能排除尚未退出的旧 writer。
+
+## 6. Migration
+
+只有 legacy token 仍存在时才需要：
 
 ```bash
-# 先 dry-run，人工复核 shortened / would_delete
-app session-rollout migrate --campaign prod-2026-09-01-a \
+# dry-run
+/home/app session-rollout migrate --campaign prod-2026-09-01-a \
   --cutoff 2026-09-08T00:00:00Z --finite-policy natural \
   --batch-size 500 --qps 200 --lease 30s
 
-# 参数完全一致，加 --apply
-app session-rollout migrate ... --apply
+# 参数完全一致后 apply
+/home/app session-rollout migrate ... --apply
 ```
 
-`--finite-policy`：
+`natural` 只收敛永久与超上限 legacy；`cap` 还会把有限 legacy 压到 cutoff，影响面更大，
+需要业务批准。cutoff/policy 对同一 campaign 不可变；cutoff 已过时必须显式
+`--confirm-elapsed-cutoff`。
 
-- `natural` —— 只收敛永久与超上限记录，不动仍在 `TokenExpire` 内的有限 token；
-- `cap` —— 有限 token 也压到 cutoff，重新登录面更大，需要批准。
+migrate apply 只有本副本已应用 `revoke` 或更高 mode 才允许，并同时持有：
 
-migration 的全部正确性机制**与 #725 完全一致，未作任何改动**：不可变 cutoff、单占租约、
-checkpoint 绑定 Redis `run_id`、只缩短不延长、cutoff 已过期时必须显式
-`--confirm-elapsed-cutoff`。同一 campaign 的 cutoff/policy 永久锁定；新决策要用新的
-campaign ID。
+- scan-owner：避免多个全量扫描叠加；
+- migration mutation lock：保证单 writer；
+- `run_id`-bound checkpoint：failover 后从 0 重扫。
 
-## 5. 从 #725 升级
+迁移只缩短 TTL，绝不延长 deadline；可安全重跑。不要删除 campaign/checkpoint 或换 campaign
+复活已过期 Token。
 
-带着进行中 rollout 的环境（floor 已是 `v3-write`/`revoke`/`bounded`）升级时：
+## 7. 故障处理
 
-1. 部署新制品。**唯一一次重启。**
-2. 首启自动接管现有 floor；`MAX_PER_UID` 由 reconciler 在数秒内回写进 floor 记录
-   （#725 的记录没有这个字段），MySQL 标记同样由 reconciler 补写——它在
-   `module.Setup` 建表之后才可能成功，所以刻意不放在启动路径上。
-   **不需要删除或修改任何 Redis key，也不会登出任何人。**
-3. 确认 `status` 的 `floor` 与升级前一致、`writers` 数量与副本数一致。
-4. **确认 `status` 的 `max_per_uid` 已经出现在 floor 记录里**，再删掉 configmap 里那三个
-   已废弃的 key。删早了会让下一次重启找不到 cap（此时会退到保守默认值 20 **并在启动日志
-   告警**）。**全新部署想自己选这个上界，也是设置 `OCTO_AUTH_SESSION_MAX_PER_UID`**——
-   它会被抄进 floor 记录后即可删除。不设就是 20。
-5. 确认无误后再打开 `AUTO_ADVANCE`（见 §6）。
+常见 blocker：
 
-**注意灰度姿态**：如果升级前处在 #725 的 Phase D/E（`MODE` 比 floor 高一阶），
-先保留 `OCTO_AUTH_SESSION_MODE` 直到 floor 追上；删早了 reader 会放松一阶。
-启动日志会就此告警。
-
-## 6. 首次开启自动推进
-
-**首个引入本能力的 release 必须以 `AUTO_ADVANCE=0` 上线。**
-
-原因是这套设计对自身的第一次升级有个盲区：writer registry 的作用正是发现"还有旧副本
-在跑"，但升级到**带 registry 的版本**这一次，旧副本（#725 制品）根本不注册，registry
-只看得见新副本。等到全部副本都是新制品、`status` 的 `writers` 数与副本数吻合之后，
-再打开自动推进。
-
-打开后：
-
-- 全新环境：直接一路到 `enforce`；
-- 有存量环境：自动到 `v3` 后停住，等你的 migration 决策。
-
-首次为有存量环境建立 v3 floor 时需要 `OCTO_AUTH_SESSION_EXPECT_WRITERS=<副本数>`。
-这不是判断题，是部署系统已经知道的一个数字：**只有新制品会注册，所以旧副本还在的话，
-注册数就会不足**。它是过渡期配置，推过之后删掉即可；HPA 环境在这个窗口内临时固定副本数。
-
-## 7. 出问题时
-
-**先看 `status` 的 `blocked_by`。** 常见原因：
-
-| blocked_by | 含义 |
+| blocker | 处理 |
 |---|---|
-| `no live writers registered` | 看不见任何副本。**空 registry 判失败，不是放行** |
-| `N distinct builds are live` | 混部，等滚动更新完成 |
-| `N of M writers have not applied floor X` | 有副本没跟上，通常几秒内自愈 |
-| `expected N writers, registry has M` | 副本数对不上，多半还有旧制品在跑 |
-| `v1=N v2=M (need 0)` | 还有 legacy，等自然过期或跑 migration（挡 `enforce`） |
-| `persistent=N over_max=M (need 0)` | 有永久/超上限 legacy，进 `bounded` 会立刻登出这批人（挡 `bounded`） |
-| `max_per_uid is not configured` | 首次建立 v3 floor 时缺 cap |
-| `keyspace scan did not complete` | 扫描中断，通常伴随 Redis 异常 |
+| `rollout is paused` | 确认事故已处理后 `resume` |
+| `no live writers registered` | 查 Redis、registry lease 与启动 publication |
+| `N distinct builds are live` | 等滚动完成，不推进 |
+| `N of M writers have not applied floor X` | 查 DB poller/registry publish，失败副本会保持 fenced |
+| `expected N writers, registry has M` | 查旧制品、HPA/maxSurge、计划副本数 |
+| `writer set changed during evaluation` | 等滚动/重启完成后重试 |
+| `persistent=N over_max=M` | 等自然过期或审批 migration |
+| `v1=N v2=M` | 等 promotion/过期或审批 migration |
+| `keyspace scan did not complete` | 查 Redis、run_id 变化、scan-owner/lock |
 
-`blocked_by` 旁边会附 `options`，给出该阻塞的可执行选项（等待 vs 跑 migration）。
+故障时先执行：
 
-**reconciler 自身坏掉时**：`pause` 停掉它，然后用 `advance --force --yes` 人工推进。
-谓词仍会执行——force 绕过的是 reconciler，不是门禁。
+```bash
+/home/app session-rollout pause
+/home/app session-rollout status
+```
 
-**停下自动推进**（按响应速度）：
+`pause` 只阻止推进，不阻止副本应用已经存在的更高 floor。
 
-1. `app session-rollout pause` —— 秒级，写持久标志，所有副本下一轮生效。**首选。**
-2. `AUTO_ADVANCE=0` + 滚动 —— 分钟级，用于确认长期关闭。
-3. 回滚制品 —— 仅当 reconciler 之外也出问题，且受 §8 的下界约束。
+- MySQL 短暂不可读：保留当前 mode，不推进，不从 Redis/env 猜测；
+- registry 发布失败：保持新 credential fenced，已有 session 验证继续；
+- Redis 不可达：新登录/签发失败，已有 session 在可读范围内继续；不要同时摘除所有副本；
+- scan-owner 被占：等待当前 scan 完成，不要删除 lease key；
+- run_id 变化：当前扫描自动丢弃并重扫；反复变化时先稳定 Redis 拓扑。
 
-**Redis 不可达时**：副本会停止签发新 token（登录失败），但**保留在 LB 中、
-已登录用户不受影响**。这是有意的——Redis 是全体副本同时失联，摘流会把一次认证降级
-放大成整体不可用。
+## 8. 回滚与 roll-forward
 
-**Redis 丢了 floor**：启动日志出现 `boot=rollback-recovered`，说明这个部署曾经建立过
-floor 但现在读不到了。系统会**向上取 `enforce`** 并重建记录：相关 legacy token 被拒绝，
-那批用户重新登录。这是刻意的——丢失时"精确恢复"意味着继续接受一批来自不一致快照的
-legacy token，而 session token 本就可丢弃。
+先读取 MySQL state 与最后 audit，按以下下界处理：
 
-运行中丢失（不经过重启）走同一条路：poller 发现 floor 读到了但内容为空，会去问 MySQL
-标记——盖过章就按"丢失"重建到 `enforce`，没盖过就当全新部署。**它不会把一次丢失当成
-全新部署去重建 v3-write floor**，那会让随后重启的副本落回 v3-write，重新接纳 `bounded`
-已经开始拒绝的永久 legacy 会话。
-
-**floor 记录损坏且从未盖过 MySQL 标记**（`boot=unknown` 持续出现）：这是唯一需要人工
-介入 Redis 的情形。系统刻意**不覆盖**这条记录——它无法证明这个部署到底建立过 floor 没有，
-而猜错任一方向都有代价。此时 `status` 与 `advance --force` 都会直接报解码错误。修复步骤：
-
-1. 先确认连的是**正确的实例**（每条子命令开头打印的 `instance=` 指纹）；
-2. `redis-cli --no-auth-warning GET <uidTokenPrefix>auth:rollout-control` 取出内容，留档；
-3. 确认它确实不是合法 floor（合法形态：`{"mode_floor":"...","writer_version":3,...}`）；
-4. `DEL` 该 key。删除后：若 MySQL 标记存在，下一次 poll 会重建到 `enforce`；
-   若不存在，部署按全新处理从 `expand` 起步。
-
-删之前务必走完第 1 步。这一条是唯一没有 in-band 出口的状态。
-
-## 8. 回滚
-
-| 当前 floor | 可回滚到 |
+| 状态 | 允许动作 |
 |---|---|
-| 未建立 | #723 或 #725 制品 |
-| `v3-write` ~ `revoke` | 仅 #725 制品或更新（需能解析 v3 + generation） |
-| `bounded` ~ `enforce` | 仅遵守该 floor 的兼容制品 |
+| singleton 仅完成接管、MySQL floor 未高于原 #725 posture | 可回滚 #725；恢复 #725 所需 MODE/REQUIRED_FLOOR，并确认旧 Redis floor 仍在 |
+| MySQL floor 已推进 | 禁止回滚到只认 Redis floor 的制品；`pause` 后 roll forward |
+| migration 已 apply | 可暂停/续跑；不得延长 TTL、删除 deny marker 或恢复旧 checkpoint |
 
-**回滚到 #725 制品时，必须把 `OCTO_AUTH_SESSION_MODE` 与
-`OCTO_AUTH_SESSION_REQUIRED_FLOOR` 加回 configmap**——#725 需要它们，而本 release 已
-不再要求。Redis floor 记录在本 release 内保持 #725 可读（只增字段、不改名不删字段）。
+本版本不写、不修复、不删除 #725 Redis floor，以保留“尚未推进”阶段的回滚窗口。MySQL floor
+一旦高于旧 Redis floor，回写 Redis 作为“同步”会重新引入双状态源，禁止操作。
 
-**已经推进的 floor 不能撤。** 这是设计意图而非缺陷：它意味着"谓词有 bug"这一风险没有
-事后补救，只能靠事前——所以谓词的每条分支都有独立测试，且首个 release 默认关闭自动推进。
-
-migration 的回滚语义不变：可暂停续跑；不得删除 campaign/checkpoint、
-不得延长已缩短的 TTL、不得删除 deny marker、不得换 campaign 复活已过期 token。
+SQL migration 的 Down 仅用于未启用、无推进的开发环境，不是生产回滚 SOP。
 
 ## 9. 监控
 
-| 指标 | 关注点 |
+| 指标 | 告警方向 |
 |---|---|
-| `dmwork_session_live_writers` | 与副本数不符 = 有副本失去租约或旧制品在跑 |
-| `dmwork_session_writer_fence_total` | 持续增长 = 副本在拒绝新登录 |
-| `dmwork_session_floor_advance_total{to,actor}` | `actor` 区分自动与人工 |
-| `dmwork_session_reconcile_blocked_total{reason}` | 长期卡在非预期原因需要告警 |
-| `dmwork_session_reconcile_scan_total` | 增速异常说明退避没生效 |
-| `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 或 `unknown` 为 1 必须告警。`unknown` 不会自愈成一个已知状态,只会被下一次成功的 floor 读取纠正 |
-| `dmwork_session_rollout_mode{mode}` | 全体副本应收敛到同一值（灰度副本除外） |
-| `dmwork_session_undecodable_records` | 无法解码的记录数。**不阻塞任何一道 floor 门禁**（它们从来不是可用凭证，`observe` 的形态计数器只统计能解码的记录），但**没有任何东西会清掉它们**——migration 有意跳过,无 TTL 的键也不会自然过期。非 0 需要人看一眼 |
+| `dmwork_session_live_writers` | 与副本数不符或持续波动 |
+| `dmwork_session_writer_fence_total` | 持续增长表示登录签发被 fence |
+| `dmwork_session_floor_advance_total{to,actor}` | 与 MySQL audit 对账 |
+| `dmwork_session_reconcile_blocked_total{reason}` | 非预期 blocker 长期增长 |
+| `dmwork_session_reconcile_scan_total` | 增速异常表示退避/scan-owner 未生效 |
+| `dmwork_session_rollout_boot_outcome{outcome}` | 仅应见 fresh/adopted/normal |
+| `dmwork_session_rollout_mode{mode}` | 除 canary 外全副本应收敛 |
+| `dmwork_session_undecodable_records` | 非 0 需调查；不阻塞 floor，但不会由 migration 清理 |
 
-原有的 `validation_rejected_total`、`revocation_backlog`、`redis_pool_timeouts_total`
-等指标保持不变。
+额外对 MySQL 建议监控：control Load/Advance 错误率、singleton version 变化、paused 持续时间、
+advance audit 与 floor version 是否一致。
 
-## 10. Redis 预检
+## 10. Redis / MySQL 预检
 
-以下与 #725 一致，仍需在生产同型号/同版本/同 proxy 路径上验证：`EVALSHA` 与脚本缓存、
-lease 所需的 `SET NX PX` / `PTTL` / compare-delete、`SCAN` cursor 语义、
-`INFO server` 可返回稳定 `run_id`、主从切换后的行为。
+在生产同型号、同版本、同 proxy 路径验证：
 
-**`noeviction` 仍然必须确认**：floor、generation、legacy deny marker 都是无 TTL 的安全
-状态。floor 丢失现在可以自愈（§7），但 deny marker 丢失是**静默的安全回退**——
-已撤销的 legacy token 会重新可用，且没有任何告警。
+- Redis：`EVALSHA`、`SET NX PX`、compare-renew/delete、`SCAN` cursor、稳定 `INFO server run_id`、
+  failover 后 lease/checkpoint 行为；
+- MySQL：migration 权限、InnoDB transaction、JSON 列、CHECK 兼容性、连接池与读写超时；
+- 容量：全量扫描 QPS、writer/scan lease key 数、advance audit 增长。
+
+Redis 仍建议 `noeviction`：generation、legacy deny marker、migration campaign/checkpoint 与 lease
+是安全状态。Redis 不再保存权威 floor，但 deny marker 被驱逐仍会静默重新接受已撤销 legacy token。

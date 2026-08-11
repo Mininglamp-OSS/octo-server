@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -31,10 +32,11 @@ type sessionRedisOptions struct {
 }
 
 type sessionRuntime struct {
-	store  *RedisSessionStore
-	client *rd.Client
-	boot   RolloutBoot
-	policy sessionPolicy
+	store   *RedisSessionStore
+	client  *rd.Client
+	control *RolloutControlStore
+	boot    RolloutBoot
+	policy  sessionPolicy
 }
 
 var sessionRuntimeMu sync.Mutex
@@ -82,108 +84,96 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		ctx.GetConfig().Cache.UIDTokenCachePrefix,
 		ctx.GetConfig().Cache.TokenExpire,
 	)
-
-	// Boot resolution replaces the old startup validation, which panicked when
-	// the Redis floor key was missing at mode >= revoke and so turned one lost
-	// key into a fleet that could not start. Nothing below is fatal.
-	bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var markers *RolloutMarkerStore
-	if db := ctx.DB(); db != nil {
-		markers = NewRolloutMarkerStore(db)
-	}
-	boot, err := ResolveRolloutBoot(bootCtx, store, markers, policy.legacyMode, policy.legacyMaxPerUID)
-	if err != nil {
-		// Only a MySQL marker read failure reaches here; an unreadable Redis
-		// floor is resolved inside ResolveRolloutBoot. Without the marker we
-		// cannot tell "never initialised" from "lost it", and guessing the
-		// wrong way re-admits revoked legacy bearers, so take the strict side.
-		boot = StrictRolloutBoot(err, policy.legacyMode, policy.legacyMaxPerUID)
-	}
-	boot.AutoAdvance = policy.autoAdvance
-	boot.CanaryAhead = policy.canaryAhead
-	boot.ExpectWriters = policy.expectWriters
-	// At most one phase above the floor, ever. The deprecated MODE override is
-	// itself a canary — applyBootOverrides' own warning says it is "equivalent to
-	// CANARY_AHEAD=1" — so setting both used to stack two increments and put a
-	// revoke-floor deployment at enforce, denying every legacy session the floor
-	// still intends to honour for the length of the canary. Over-strict rather
-	// than a loosening, and the poller recomputes from the floor on its next
-	// tick, but the replica serves traffic in the wrong mode until then.
-	alreadyAhead := boot.Floor.valid() && boot.Mode.rank() > boot.Floor.rank()
-	if policy.canaryAhead && !alreadyAhead && boot.Mode.rank() < SessionModeEnforce.rank() {
-		boot.Mode = boot.Mode.next()
-	}
-	// The apply must not be swallowed. Letting it fail into a warning is how a
-	// replica ended up running at expand while boot had resolved enforce — and
-	// while the registry advertised enforce on its behalf.
-	//
-	// Provisional boots go through the other door: their mode is a guess made
-	// because the floor could not be read, and the first floor that actually
-	// reads has to be able to replace it downward.
-	apply := store.ApplyRolloutState
-	if boot.Provisional {
-		apply = store.ApplyProvisionalRolloutState
-	}
-	if applyErr := apply(boot.Mode, boot.MaxPerUID); applyErr != nil {
-		boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
-	}
-	// Whatever was actually applied is the truth from here on. Boot's resolved
-	// value is a proposal; the store's mode is what this replica enforces, and
-	// it is what gets published and logged.
-	boot.Mode = store.Mode()
-
-	if boot.Outcome == RolloutBootRecovered {
-		recovered, recoverErr := store.RecoverRolloutControlAtEnforce(bootCtx, boot.MaxPerUID)
-		switch {
-		case recoverErr != nil:
-			// Still provisional, so the poller can correct it either way.
-			boot.Warning = strings.TrimSpace(boot.Warning + " " + recoverErr.Error())
-		case !recovered:
-			// Recovery declined, which means a VALID floor is on the key — the
-			// read that failed at the top of boot was the only thing wrong. That
-			// floor is the observed truth and this enforce was only ever a guess,
-			// so adopt the floor instead of keeping the guess. Applying it also
-			// clears the provisional flag, which is what stops a later poll from
-			// being needed to undo a mode this process should never have run.
-			boot.Warning = strings.TrimSpace(boot.Warning +
-				" the floor is readable after all; adopting it instead of the recovered value")
-			if observed := persistedFloor(bootCtx, store); observed.valid() {
-				if applyErr := store.ApplyRolloutState(observed, boot.MaxPerUID); applyErr != nil {
-					boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
-				}
-			}
-		default:
-			// Recovery wrote enforce. It is an observed floor from here on, and
-			// re-applying it non-provisionally is what makes it unlowerable.
-			if applyErr := store.ApplyRolloutState(SessionModeEnforce, boot.MaxPerUID); applyErr != nil {
-				boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
-			}
-		}
-		boot.Mode = store.Mode()
-		// Floor is what the startup log line and `session-rollout status` report,
-		// so it has to say what Redis holds rather than what recovery intended.
-		// Neither non-success branch above leaves enforce persisted: a failed
-		// write leaves no floor at all, and a lost race leaves whatever
-		// reappeared. Reporting enforce in either case tells an operator the
-		// recovery landed when it did not.
-		boot.Floor = persistedFloor(bootCtx, store)
-	}
-
-	runtime := &sessionRuntime{store: store, client: client, boot: boot, policy: policy}
+	// The module migration that creates the MySQL authority has not run yet.
+	// Keep issuance fenced until InitializeSessionRollout is called after
+	// module.Setup and before the server starts accepting traffic.
+	store.issuanceFenced.Store(true)
+	runtime := &sessionRuntime{store: store, client: client, policy: policy}
 	ctx.SetValue(runtime, sessionRuntimeContextKey)
 	return store, client
 }
 
-// persistedFloor reports the floor Redis actually holds, with an unreadable or
-// absent record collapsing to the empty mode. Only recovery reporting uses it;
-// the running mode comes from store.Mode() and is never re-derived here.
-func persistedFloor(ctx context.Context, store *RedisSessionStore) SessionMode {
-	control, err := store.RolloutControl(ctx)
-	if err != nil || control == nil {
-		return ""
+// InitializeSessionRollout runs after module migrations and before HTTP serve.
+// The #725 Redis floor and deprecated MODE are consulted only if the MySQL
+// singleton does not exist yet; every later boot reads MySQL exclusively.
+func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControlStore, error) {
+	if ctx == nil {
+		return RolloutBoot{}, nil, errors.New("auth: initialize session rollout requires non-nil context")
 	}
-	return control.ModeFloor
+	runtime, ok := ctx.Value(sessionRuntimeContextKey).(*sessionRuntime)
+	if !ok || runtime == nil {
+		return RolloutBoot{}, nil, errors.New("auth: session store must be constructed before rollout initialization")
+	}
+	if runtime.control != nil {
+		return runtime.boot, runtime.control, nil
+	}
+	if ctx.DB() == nil {
+		return RolloutBoot{}, nil, errors.New("auth: session rollout requires MySQL")
+	}
+	control := NewRolloutControlStore(ctx.DB())
+	state, err := control.Load(context.Background())
+	outcome := RolloutBootNormal
+	if errors.Is(err, ErrRolloutStateUninitialized) {
+		bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		legacy, legacyErr := runtime.store.RolloutControl(bootCtx)
+		if legacyErr != nil {
+			return RolloutBoot{}, nil, fmt.Errorf("auth: read #725 rollout floor for MySQL takeover: %w", legacyErr)
+		}
+		legacyFloor := SessionMode("")
+		legacyMaxPerUID := 0
+		if legacy != nil {
+			legacyFloor = legacy.ModeFloor
+			legacyMaxPerUID = legacy.MaxPerUID
+		}
+		seed, seedErr := ResolveRolloutSeed(
+			legacyFloor,
+			runtime.policy.legacyMode,
+			legacyMaxPerUID,
+			runtime.policy.legacyMaxPerUID,
+		)
+		if seedErr != nil {
+			return RolloutBoot{}, nil, seedErr
+		}
+		seed.Actor = "startup"
+		switch {
+		case legacyFloor.valid():
+			seed.Source = "legacy-redis"
+			outcome = RolloutBootAdopted
+		case runtime.policy.legacyMode.valid() && runtime.policy.legacyMode != SessionModeExpand:
+			seed.Source = "legacy-env"
+			outcome = RolloutBootAdopted
+		default:
+			seed.Source = "bootstrap"
+			outcome = RolloutBootFresh
+		}
+		if redisID, idErr := runtime.store.currentRedisInstanceID(); idErr == nil {
+			seed.RedisID = redisID
+		}
+		state, err = control.Initialize(bootCtx, seed)
+	}
+	if err != nil {
+		return RolloutBoot{}, nil, err
+	}
+	mode := state.Floor
+	if runtime.policy.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
+		mode = mode.next()
+	}
+	if err := runtime.store.ApplyRolloutState(mode, state.MaxPerUID); err != nil {
+		return RolloutBoot{}, nil, err
+	}
+	boot := RolloutBoot{
+		Outcome:       outcome,
+		Floor:         state.Floor,
+		Mode:          runtime.store.Mode(),
+		MaxPerUID:     state.MaxPerUID,
+		AutoAdvance:   runtime.policy.autoAdvance,
+		CanaryAhead:   runtime.policy.canaryAhead,
+		ExpectWriters: runtime.policy.expectWriters,
+	}
+	runtime.control = control
+	runtime.boot = boot
+	return boot, control, nil
 }
 
 // SessionBootForContext exposes what boot resolved, for the startup log line

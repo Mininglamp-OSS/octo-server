@@ -67,6 +67,7 @@ var (
 type SessionObservation struct {
 	ScanID           string `json:"scan_id"`
 	ScopeFingerprint string `json:"scope_fingerprint"`
+	RedisInstanceID  string `json:"redis_instance_id"`
 	Complete         bool   `json:"complete"`
 	Total            int64  `json:"total"`
 	Missing          int64  `json:"missing"`
@@ -97,7 +98,12 @@ type RedisSessionStore struct {
 	// one. Nil in tests and in the operator subcommands, which do not create
 	// credentials.
 	lease atomic.Pointer[WriterRegistry]
-	now   func() time.Time
+	// issuanceFenced closes the write path while a mode change is being
+	// published. It is deliberately independent of the registry lease: a
+	// registry publication failure must stay fenced even if an older lease is
+	// still locally fresh.
+	issuanceFenced atomic.Bool
+	now            func() time.Time
 	// redisInstanceIDFn resolves the opaque process identity used to keep a
 	// resumable SCAN cursor bound to one Redis process.
 	redisInstanceIDFn func() (string, error)
@@ -111,12 +117,6 @@ type SessionStoreOption func(*RedisSessionStore)
 type derivedRolloutState struct {
 	mode      SessionMode
 	maxPerUID int
-	// provisional marks a mode that was GUESSED at boot because the floor could
-	// not be read, as opposed to one derived from a floor that was actually
-	// observed. The monotonic no-lowering rule protects observed floors from
-	// being walked back; applying it to a guess would let a two-second Redis
-	// error pin a replica at enforce for the rest of its life.
-	provisional bool
 }
 
 func WithSessionMode(mode SessionMode) SessionStoreOption {
@@ -144,17 +144,13 @@ func (s *RedisSessionStore) currentMode() SessionMode { return s.currentState().
 
 func (s *RedisSessionStore) currentMaxPerUID() int { return s.currentState().maxPerUID }
 
-// ApplyRolloutState raises the derived state to match a newly observed floor.
-// It only ever moves upward — a floor that appears to have gone backwards is a
-// stale or rolled-back read, and following it down would re-admit legacy
-// sessions this replica has already stopped accepting.
+// ApplyRolloutState raises the derived state to match a newly observed MySQL
+// floor. It only ever moves upward: a stale snapshot or operator rollback must
+// not re-admit sessions this replica has already stopped accepting.
 //
-// A missing or unusable cap does NOT block the mode. Reader strictness and
-// write capability are separate concerns, and coupling them meant a recovery
-// that could not find a cap silently left the process in a LOWER mode — the
-// fail-open this path exists to prevent. The cap is enforced where it belongs,
-// on the write path (see writableState), so every outcome here is at least as
-// strict as before, never looser.
+// A missing or unusable cap does NOT block reader strictness. The cap is
+// enforced on the write path (see writableState), so a malformed control row
+// cannot loosen validation and credential issuance still fails closed.
 func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) error {
 	if !mode.valid() {
 		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
@@ -166,7 +162,7 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 	if maxPerUID > sessionMaxPerUIDLimit {
 		maxPerUID = sessionMaxPerUIDLimit
 	}
-	if mode.rank() < current.mode.rank() && !current.provisional {
+	if mode.rank() < current.mode.rank() {
 		// The mode never moves down, but the CAP still has to land. A process
 		// running above the floor with no usable cap fences every login, and
 		// dropping the cap that arrived alongside a lower mode meant a floor
@@ -176,37 +172,7 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 		}
 		return nil
 	}
-	// An observed floor always wins over a provisional one, in either direction,
-	// and clears the provisional flag: from here on the no-lowering rule applies
-	// normally.
 	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
-	return nil
-}
-
-// ApplyProvisionalRolloutState installs a mode that boot GUESSED because the
-// floor could not be read. It still only raises — a guess must never loosen a
-// mode this replica already reached — but it marks the state so the first floor
-// that actually reads can replace it in either direction.
-func (s *RedisSessionStore) ApplyProvisionalRolloutState(mode SessionMode, maxPerUID int) error {
-	if !mode.valid() {
-		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
-	}
-	current := s.currentState()
-	if maxPerUID <= 0 {
-		maxPerUID = current.maxPerUID
-	}
-	if maxPerUID > sessionMaxPerUIDLimit {
-		maxPerUID = sessionMaxPerUIDLimit
-	}
-	if mode.rank() < current.mode.rank() {
-		if maxPerUID != current.maxPerUID {
-			s.state.Store(&derivedRolloutState{
-				mode: current.mode, maxPerUID: maxPerUID, provisional: current.provisional,
-			})
-		}
-		return nil
-	}
-	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID, provisional: true})
 	return nil
 }
 
@@ -627,12 +593,22 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 	if interval < 0 {
 		return SessionObservation{}, fmt.Errorf("auth: observe interval must not be negative")
 	}
+	lease, err := s.acquireRolloutScanLease(ctx, rolloutScanLeaseTTL)
+	if err != nil {
+		return SessionObservation{}, err
+	}
+	defer lease.Release()
 	scanID, err := newSessionGeneration()
 	if err != nil {
 		return SessionObservation{}, fmt.Errorf("auth: create observation scan id: %w", err)
 	}
 	stats.ScanID = scanID
 	stats.ScopeFingerprint = s.rolloutObservationScopeFingerprint()
+	scanner, err := newInstanceBoundScanner(s)
+	if err != nil {
+		return stats, fmt.Errorf("auth: identify observation Redis instance: %w", err)
+	}
+	stats.RedisInstanceID = scanner.InstanceID()
 	var throttle <-chan time.Time
 	var ticker *time.Ticker
 	if interval > 0 {
@@ -646,11 +622,28 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		keys, next, err := s.client.Scan(cursor, pattern, batchSize).Result()
+		if err := lease.Err(); err != nil {
+			return stats, err
+		}
+		keys, next, restarted, err := scanner.Scan(ctx, cursor, pattern, batchSize)
 		if err != nil {
 			return stats, fmt.Errorf("auth: observe scan: %w", err)
 		}
+		if restarted {
+			if err := lease.Confirm(); err != nil {
+				return stats, err
+			}
+			stats, err = s.restartObservation(scanner.InstanceID())
+			if err != nil {
+				return stats, err
+			}
+			cursor = 0
+			continue
+		}
 		for _, key := range keys {
+			if err := lease.Err(); err != nil {
+				return stats, err
+			}
 			if throttle != nil {
 				select {
 				case <-ctx.Done():
@@ -707,12 +700,60 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 				stats.V1++
 			}
 		}
+		restarted, err = scanner.Check(ctx)
+		if err != nil {
+			return stats, fmt.Errorf("auth: identify Redis instance after observation batch: %w", err)
+		}
+		if restarted {
+			if err := lease.Confirm(); err != nil {
+				return stats, err
+			}
+			stats, err = s.restartObservation(scanner.InstanceID())
+			if err != nil {
+				return stats, err
+			}
+			cursor = 0
+			continue
+		}
+		if err := lease.Confirm(); err != nil {
+			return stats, err
+		}
 		cursor = next
 		if cursor == 0 {
+			restarted, err = scanner.Check(ctx)
+			if err != nil {
+				return stats, fmt.Errorf("auth: identify Redis instance before observation completion: %w", err)
+			}
+			if restarted {
+				if err := lease.Confirm(); err != nil {
+					return stats, err
+				}
+				stats, err = s.restartObservation(scanner.InstanceID())
+				if err != nil {
+					return stats, err
+				}
+				cursor = 0
+				continue
+			}
+			if err := lease.Confirm(); err != nil {
+				return stats, err
+			}
 			stats.Complete = true
 			return stats, nil
 		}
 	}
+}
+
+func (s *RedisSessionStore) restartObservation(redisInstanceID string) (SessionObservation, error) {
+	scanID, err := newSessionGeneration()
+	if err != nil {
+		return SessionObservation{}, fmt.Errorf("auth: restart observation scan id: %w", err)
+	}
+	return SessionObservation{
+		ScanID:           scanID,
+		ScopeFingerprint: s.rolloutObservationScopeFingerprint(),
+		RedisInstanceID:  redisInstanceID,
+	}, nil
 }
 
 func redisInteger(value interface{}) (int64, error) {
@@ -744,6 +785,10 @@ func (s *RedisSessionStore) UseWriterLease(registry *WriterRegistry) {
 // mayWrite reports whether this process is allowed to create new credentials.
 // With no registry bound (tests, operator subcommands) it is always true.
 func (s *RedisSessionStore) mayWrite() bool {
+	if s.issuanceFenced.Load() {
+		metrics.ObserveSessionWriterFence()
+		return false
+	}
 	registry := s.lease.Load()
 	if registry == nil {
 		return true
@@ -753,6 +798,31 @@ func (s *RedisSessionStore) mayWrite() bool {
 	}
 	metrics.ObserveSessionWriterFence()
 	return false
+}
+
+// ApplyAndPublishRolloutState is the sole runtime mode transition. Issuance is
+// fenced before the local reader changes; the registry state and lease are
+// then published atomically. Any failure keeps the fence closed until a later
+// poll successfully republishes the same applied state.
+func (s *RedisSessionStore) ApplyAndPublishRolloutState(registry *WriterRegistry, mode SessionMode, maxPerUID int) error {
+	current := s.currentState()
+	if !s.issuanceFenced.Load() && current.mode == mode && current.maxPerUID == maxPerUID {
+		return nil
+	}
+	s.issuanceFenced.Store(true)
+	if err := s.ApplyRolloutState(mode, maxPerUID); err != nil {
+		return err
+	}
+	applied := s.currentMode()
+	if registry == nil {
+		return errors.New("auth: cannot publish rollout state without writer registry")
+	}
+	if err := registry.PublishAppliedState(string(applied)); err != nil {
+		return fmt.Errorf("auth: publish applied rollout state: %w", err)
+	}
+	metrics.SetSessionRolloutMode(string(applied))
+	s.issuanceFenced.Store(false)
+	return nil
 }
 
 // CanIssue reports whether this replica may create a credential right now. It
@@ -783,57 +853,25 @@ func (s *RedisSessionStore) RedisInstanceFingerprint() (string, error) {
 // itself is broken. The caller must have already evaluated the predicate, which
 // --force does not skip.
 //
-// markers is required for the same reason the reconciler requires it: see
-// advanceFloor. Passing nil here is what the CLI used to do, and it produced a
-// floor with no marker — the one state that resolves DOWNWARD after a Redis
-// loss.
+// The MySQL controller performs the evidence insert and versioned floor CAS in
+// one transaction, so this path cannot bypass pause, ordering, or audit rules.
 func (s *RedisSessionStore) ForceAdvanceRollout(
 	ctx context.Context,
 	decision RolloutAdvanceDecision,
-	registry *WriterRegistry,
-	markers *RolloutMarkerStore,
-) error {
-	if err := s.advanceFloor(ctx, decision, "operator", registry, markers); err != nil {
-		return err
-	}
-	metrics.ObserveSessionFloorAdvance(string(decision.Target), "operator")
-	return nil
-}
-
-// advanceFloor is the ONLY path that moves the floor. Both the reconciler and
-// `advance --force` go through it, so the preconditions cannot be lost by a
-// caller that forgets one — which is exactly how the operator path shipped
-// without the marker stamp while the reconciler path had it.
-//
-// Order is the requirement, not atomicity:
-//
-//  1. the marker, because a floor that exists without one reads as "never
-//     initialised" after a Redis loss and resolves DOWN to expand — a marker
-//     with no floor is merely strict, a floor with no marker is a fail-open;
-//  2. the evidence snapshot, because an advance with no record cannot be
-//     audited, while a record with no advance is harmless;
-//  3. the CAS.
-//
-// Each step's failure stops the next, so the two harmless orderings are the
-// only ones reachable.
-func (s *RedisSessionStore) advanceFloor(
-	ctx context.Context,
-	decision RolloutAdvanceDecision,
-	actor string,
-	registry *WriterRegistry,
-	markers *RolloutMarkerStore,
+	control RolloutStateController,
 ) error {
 	if !decision.Allowed {
 		return errors.New("auth: refusing to advance a floor the predicate did not allow")
 	}
-	if markers == nil {
-		return errors.New("auth: refusing to advance without an initialisation marker store")
+	if control == nil {
+		return errors.New("auth: refusing to advance without MySQL rollout control")
 	}
-	if err := markers.StampOnce(ctx, decision.Target); err != nil {
-		return fmt.Errorf("auth: refusing to advance without an initialisation marker: %w", err)
-	}
-	if err := s.recordRolloutAdvance(ctx, decision, actor, registry); err != nil {
+	_, err := control.Advance(ctx, RolloutState{
+		Floor: decision.Current, MaxPerUID: decision.MaxPerUID, Version: decision.StateVersion,
+	}, rolloutAdvanceRecord(decision, "operator"))
+	if err != nil {
 		return err
 	}
-	return s.AdvanceRolloutControl(ctx, decision.Target, decision.MaxPerUID)
+	metrics.ObserveSessionFloorAdvance(string(decision.Target), "operator")
+	return nil
 }

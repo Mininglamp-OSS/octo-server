@@ -203,19 +203,6 @@ func runAPI(ctx *config.Context) {
 		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
 	}
 	probeCancel()
-	// Deliberately NOT re-reading the floor here. This used to panic on any read
-	// error, which defeated the whole point of resolving the boot state without
-	// failing: a corrupt record or a momentary Redis hiccup still stopped the
-	// process from starting, ten lines after the code that exists to prevent
-	// exactly that. The resolved boot state is the authority for the log line.
-	sessionBoot, sessionWarnings := auth.SessionBootForContext(ctx)
-	// expand is a running mode, never a floor — the first floor a deployment can
-	// persist is v3-write, and every floor above it writes v3 too. Testing for it
-	// here was dead and made "none" look like it had a third case.
-	rolloutFloor := "none"
-	if sessionBoot.Floor.WritesV3() {
-		rolloutFloor = string(sessionBoot.Floor)
-	}
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
@@ -304,59 +291,10 @@ func runAPI(ctx *config.Context) {
 	metrics.SetSessionEffectiveTTL(ctx.GetConfig().Cache.TokenExpire)
 	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
 
-	// Session rollout control plane. The mode is no longer a fixed startup
-	// value read from the environment: the registry publishes this replica's
-	// write lease and applied floor, and the reconciler polls the floor so a
-	// floor advance propagates without a rolling restart.
-	//
-	// The reconciler is started here and nowhere else. Starting it from the
-	// store constructor would spawn a floor-advancing goroutine in every test
-	// that happens to build a store.
-	metrics.SetSessionRolloutBootOutcome(string(sessionBoot.Outcome))
-	for _, warning := range sessionWarnings {
-		log.Warn("session rollout config: " + warning)
-	}
-	if sessionBoot.Warning != "" {
-		log.Warn("session rollout: " + sessionBoot.Warning)
-	}
-	// Cancelled after svc.Run returns, so the registry drops its roster entry on
-	// a clean shutdown instead of holding a slot for a full lease TTL — during
-	// which the convergence gate would count a terminated pod as a live writer.
-	sessionRolloutCtx, stopSessionRollout := context.WithCancel(context.Background())
-	writerRegistry := auth.NewWriterRegistry(sessionRedis, ctx.GetConfig().Cache.UIDTokenCachePrefix)
-	if err := writerRegistry.Join(
-		sessionRolloutCtx,
-		ctx.GetConfig().Version,
-		os.Getenv("POD_NAME"),
-		// The APPLIED mode, not the resolved one. Advertising a mode this
-		// replica is not running lets the convergence gate be satisfied by a
-		// replica that has not converged.
-		string(tokenStore.Mode()),
-		nil,
-	); err != nil {
-		// Not fatal: a replica that cannot take a lease refuses to create new
-		// tokens (see the store's write path) but keeps serving existing
-		// sessions. Refusing to start would be the defect this replaces.
-		log.Warn("session rollout: writer lease unavailable: " + err.Error())
-	}
-	tokenStore.UseWriterLease(writerRegistry)
-	reconciler := auth.NewRolloutReconciler(tokenStore, auth.ReconcilerOptions{
-		Registry:      writerRegistry,
-		Markers:       sessionMarkerStore(ctx),
-		AutoAdvance:   sessionBoot.AutoAdvance,
-		CanaryAhead:   sessionBoot.CanaryAhead,
-		ExpectWriters: sessionBoot.ExpectWriters,
-		MaxPerUID:     sessionBoot.MaxPerUID,
-		Log:           func(format string, args ...interface{}) { log.Info(fmt.Sprintf(format, args...)) },
-	})
-	go reconciler.Run(sessionRolloutCtx)
-
-	fmt.Printf(
-		"Authentication session runtime: mode=%s rollout_floor=%s boot=%s auto_advance=%t redis=%s instance=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
-		tokenStore.Mode(), rolloutFloor, sessionBoot.Outcome, sessionBoot.AutoAdvance,
-		sessionRedis.Options().Addr, sessionRedisInstanceLabel(tokenStore), ctx.GetConfig().Cache.TokenExpire,
-		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
-	)
+	// Constructed now, started only after module.Setup has created the MySQL
+	// rollout control tables. Until then SessionStoreAndClientForContext keeps
+	// issuance fenced, and the server is not accepting traffic.
+	stopSessionRollout := func() {}
 	// 自定义贴纸 handle 上线观测指标(P0: Sticker Handle Enforcement Rollout):上传签发
 	// handle 次数 / 注册结果分布 / 部署姿态 gauge。由 modules/file(签发) 与
 	// modules/sticker(注册) 经包级 Observe 函数灌入;此处注册即可,未注册前为 no-op。
@@ -517,6 +455,11 @@ func runAPI(ctx *config.Context) {
 
 	// 模块安装
 	err = module.Setup(ctx)
+	if err != nil {
+		cardActionRuntime.Stop()
+		panic(err)
+	}
+	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
 	if err != nil {
 		cardActionRuntime.Stop()
 		panic(err)
@@ -962,13 +905,69 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	return registry
 }
 
-// sessionMarkerStore mirrors the guard the auth runtime already applies, so a
-// nil DB degrades the same way in both places instead of panicking in one.
-func sessionMarkerStore(ctx *config.Context) *auth.RolloutMarkerStore {
-	if db := ctx.DB(); db != nil {
-		return auth.NewRolloutMarkerStore(db)
+// startSessionRolloutControl runs after module migrations and before serve.
+// MySQL is the only floor authority; Redis supplies the writer lease and
+// run_id-bound scan evidence. A publication failure leaves issuance fenced but
+// does not fail readiness or existing-session reads.
+func startSessionRolloutControl(
+	ctx *config.Context,
+	tokenStore *auth.RedisSessionStore,
+	sessionRedis *rd.Client,
+) (context.CancelFunc, error) {
+	sessionBoot, control, err := auth.InitializeSessionRollout(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("initialize MySQL session rollout control: %w", err)
 	}
-	return nil
+	_, sessionWarnings := auth.SessionBootForContext(ctx)
+	metrics.SetSessionRolloutBootOutcome(string(sessionBoot.Outcome))
+	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
+	for _, warning := range sessionWarnings {
+		log.Warn("session rollout config: " + warning)
+	}
+	if sessionBoot.Warning != "" {
+		log.Warn("session rollout: " + sessionBoot.Warning)
+	}
+
+	rolloutCtx, stop := context.WithCancel(context.Background())
+	writerRegistry := auth.NewWriterRegistry(sessionRedis, ctx.GetConfig().Cache.UIDTokenCachePrefix)
+	// Bind first so every path is fail-closed before the first lease attempt.
+	tokenStore.UseWriterLease(writerRegistry)
+	joinErr := writerRegistry.Join(
+		rolloutCtx,
+		ctx.GetConfig().Version,
+		os.Getenv("POD_NAME"),
+		string(tokenStore.Mode()),
+		nil,
+	)
+	if joinErr != nil {
+		log.Warn("session rollout: writer lease unavailable: " + joinErr.Error())
+	}
+	// Retry publication immediately even when Join's first Redis attempt failed:
+	// Join has already created the local identity and started its heartbeat, so
+	// a transient first failure need not hold issuance fenced until the poll tick.
+	if publishErr := tokenStore.ApplyAndPublishRolloutState(
+		writerRegistry, tokenStore.Mode(), sessionBoot.MaxPerUID,
+	); publishErr != nil {
+		log.Warn("session rollout: initial state publication failed; issuance remains fenced: " + publishErr.Error())
+	}
+
+	reconciler := auth.NewRolloutReconciler(tokenStore, auth.ReconcilerOptions{
+		Registry:      writerRegistry,
+		Control:       control,
+		AutoAdvance:   sessionBoot.AutoAdvance,
+		CanaryAhead:   sessionBoot.CanaryAhead,
+		ExpectWriters: sessionBoot.ExpectWriters,
+		Log:           func(format string, args ...interface{}) { log.Info(fmt.Sprintf(format, args...)) },
+	})
+	go reconciler.Run(rolloutCtx)
+
+	fmt.Printf(
+		"Authentication session runtime: mode=%s rollout_floor=%s boot=%s auto_advance=%t mysql_versioned=true redis=%s instance=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
+		tokenStore.Mode(), sessionBoot.Floor, sessionBoot.Outcome, sessionBoot.AutoAdvance,
+		sessionRedis.Options().Addr, sessionRedisInstanceLabel(tokenStore), ctx.GetConfig().Cache.TokenExpire,
+		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
+	)
+	return stop, nil
 }
 
 // shortFingerprint truncates safely: the production path is 64 hex characters,

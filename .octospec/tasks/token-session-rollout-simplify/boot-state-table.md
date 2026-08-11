@@ -1,196 +1,103 @@
-# Boot / apply state-transition table
+# Session rollout control state table
 
-Requested in review round 5. Every round so far found a new P0/P1 inside the code
-written to fix the previous round's, which is the signature of a state machine
-being patched cell by cell rather than enumerated. This is the enumeration.
+本表覆盖所有会决定副本运行 mode、是否允许签发、以及是否推进 floor 的路径。当前设计只有一个
+持久权威：MySQL `octo_session_rollout_state`。#725 Redis floor 只在 MySQL singleton 尚未建立时
+读取一次；marker、provisional mode 与 Redis floor recovery 的运行时路径均已删除。历史 marker
+migration/table 仅为 `sql-migrate` 账本兼容保留，不参与任何判定。
 
-Scope: every path that decides **which session mode this replica runs at** and
-**what gets written to the floor key**.
+## A. 启动与首次接管
 
----
+启动顺序固定为：构造 session store（issuance fenced）→ module migration → 初始化 control →
+应用本地 mode → writer registry 发布成功 → 解除 fence → 启动 poller/reconciler → HTTP serve。
 
-## The inputs
+| # | MySQL singleton | #725 Redis floor | legacy MODE | 结果 | 是否可签发 |
+|---|---|---|---|---|---|
+| A1 | present | 不读取 | 不再覆盖 | `normal`，应用 MySQL floor/cap | registry 发布成功后是 |
+| A2 | absent | present | ≤ Redis floor | `adopted`，事务写入 Redis floor/cap | 同上 |
+| A3 | absent | present | > Redis floor | `adopted`，事务写入较严格 MODE；优先保留 Redis cap | 同上 |
+| A4 | absent | absent | absent/`expand` | `fresh`，事务 seed `expand` + 默认/legacy cap | 同上 |
+| A5 | absent | absent | > `expand` | `adopted`，把 legacy MODE 持久化为兼容下限 | 同上 |
+| A6 | absent | unreadable | 任意 | 启动失败，不猜测 floor | 否，保持 fenced |
+| A7 | unreadable/invalid | 不读取 | 任意 | 启动失败，保持已存在数据不变 | 否，保持 fenced |
 
-Two reads, each with three outcomes that must not be collapsed:
+接管事务同时写 singleton 与一条 `bootstrap` / `legacy-redis` / `legacy-env` audit。并发首启若
+都先读到 absent，只有一个 insert winner；duplicate-key loser rollback 后重新锁行，并在自己的 seed
+更严格时单调抬高 floor。不会因为正常的多副本首启竞争让某个副本永久启动失败。
 
-| read | outcomes |
+Redis `run_id` 只作为接管 audit 的辅助字段。读取不到该指纹不会改变已成功读取的 legacy floor；
+读取 legacy floor 本身失败则必须停止接管。
+
+## B. 本地应用与 registry 发布
+
+所有运行期 mode 变化都走 `ApplyAndPublishRolloutState`：
+
+1. 设置 `issuanceFenced=true`；
+2. 原子替换本地 `{mode,max_per_uid}`，mode 不允许降低；
+3. 用一个 Redis Lua 原子执行 `SADD roster` + `PSETEX writer entry`，发布 applied state 并续租；
+4. 仅发布成功后解除 fence。
+
+| # | MySQL load | 本地状态 | registry publish | 结果 |
+|---|---|---|---|---|
+| B1 | 更高 floor | 较低 | success | 抬高本地 mode，发布，解除 fence |
+| B2 | 同 floor/cap | 相同 | 已 unfenced | no-op，heartbeat 负责续租 |
+| B3 | 更低 floor | 较高 | success | 保持较高本地 mode，按实际 applied mode 发布 |
+| B4 | 任意有效状态 | 任意 | error | reader strictness 保留，issuance 持续 fenced |
+| B5 | DB read error | 当前已应用状态 | 不发布新状态 | 保持 mode；不从 Redis/env 推导，不推进 |
+
+heartbeat 与 applied-state publication 共用 registry write mutex，旧 heartbeat 不能覆盖新状态。fence
+只影响 credential create/reuse/promotion；既有 session 验证和 readiness 不受影响。
+
+## C. Predicate
+
+predicate 每次接收一个 MySQL `{floor,version,max_per_uid,paused}` 快照。
+
+| current → target | 必须满足 |
 |---|---|
-| floor (`RolloutControl`) | `error` (unreadable) · `nil,nil` (**absent**) · `present` |
-| marker (`markers.Load`) | `error` (unreadable) · `1146` (table not migrated yet) · `nil,nil` (row absent) · `present` |
+| `expand → v3-write` | registry 非空；单一 build；所有 writer ≥ current；`EXPECT_WRITERS` 相等；writer set 稳定一个 lease TTL；完整 instance-bound scan |
+| `v3-write → revoke` | registry 非空；单一 build；所有 writer ≥ current |
+| `revoke → bounded` | 上述 writer 条件；完整扫描；`persistent=0 && over_max=0` |
+| `bounded → enforce` | 上述 writer 条件；完整扫描；`v1=0 && v2=0` |
+| `enforce` | terminal，不扫描 |
 
-The recurring defect in this change has one shape, and it is visible in that
-first column: **`absent` is not one state.** A floor that reads as absent is
-either *never created*, *created and lost*, or *not created yet on a deployment
-that will create one*. Only the marker separates them. Every finding in rounds
-4 and 5 is a path that read `absent` and picked one meaning without asking.
+通用规则：
 
-`provisional` is the fourth input: a mode **guessed** from a failed read, as
-opposed to one derived from a floor that was observed. It is what allows a
-later observation to correct a guess downward, which the no-lowering rule
-otherwise forbids.
+- `paused=true` 立即拒绝，不读取 registry、不扫描；
+- 扫描前后 writer fingerprint 必须一致；
+- complete evidence 必须绑定最后一个稳定 Redis `run_id`；
+- 空 token keyspace 是有效的“没有 legacy”证据，但不能替代 writer presence；
+- scan-owner lease 丢失、Redis failover、读错误均不生成 complete evidence。
 
----
+## D. 推进事务
 
-## A. Boot — `ResolveRolloutBoot` + `runtime.go`
+允许的 decision 通过 `RolloutControlStore.Advance` 执行：
 
-Runs once per process. `W?` = does this branch write the floor key.
+1. 同一 MySQL transaction 插入 append-only evidence；
+2. `UPDATE state ... WHERE version=? AND floor=? AND paused=0`；
+3. affected rows 必须为 1；
+4. commit。
 
-| # | floor | marker | outcome | mode | W? | prov | pinned by |
-|---|---|---|---|---|---|---|---|
-| A1 | present | *(not consulted for the mode)* | `normal` / `adopted` | **= floor** | no | no | `TestWiringFirstBootBeforeMarkerMigration` |
-| A2 | absent | present | `rollback-recovered` | **enforce** | **yes** | until written | `TestRecoveredEnforceBecomesObservedOnceItIsWritten` |
-| A3 | absent | absent | `fresh` | **expand** | no | no | `TestGenuinelyAbsentFloorWithNoMarkerStaysAtExpand` |
-| A4 | absent | 1146 | `fresh` | **expand** | no | no | same branch as A3 |
-| A5 | absent | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | `TestBootWithUnreadableMarkerIsUndecidableAndWritesNoFloor` |
-| A6 | error | present | `rollback-recovered` | **enforce** | attempted | **until written** | `TestTransientReadWithAValidFloorDoesNotPinEnforce` |
-| A7 | error | absent | `unknown` | **enforce** | no | yes | `TestUnreadableFloorWithNoMarkerIsUnknownNotFresh` |
-| A8 | error | 1146 | `unknown` | **enforce** | no | yes | `TestWiringUnreadableFloorIsNotAFreshInstall/marker table absent` |
-| A9 | error | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | `TestBootWithUnreadableMarkerIsUndecidableAndWritesNoFloor` |
+| 竞争/故障 | 结果 |
+|---|---|
+| 单 winner | evidence + 新 floor 一起 commit |
+| version/floor 变化 | `ErrRolloutControlChanged`，evidence rollback |
+| pause 抢先提交 | version/paused CAS miss，evidence rollback |
+| evidence insert / update / commit error | transaction rollback，不推进 |
+| force advance | 只绕过 reconciler；仍需 predicate allowed，仍走同一 transaction |
 
-Notes:
+## E. Redis failover 与 scan owner
 
-- **A1 consults the marker only to pick a metric label.** A floor that read
-  successfully is never discarded because the marker is unreadable — that was
-  the round-3 regression, and it is why the marker load in this branch is
-  deliberately best-effort.
-- **A2/A6 are the only boot branches that write.** They write because the marker
-  *proves* a floor existed. A5/A7/A8/A9 do not, because nothing proves it, and
-  writing enforce on a guess would jump a greenfield ladder irreversibly.
-- **A2/A6 stay provisional until recovery actually writes.** A6 in particular
-  ATTEMPTS a write and may decline: recovery refuses to overwrite a valid floor it
-  merely could not read, so the enforce this row proposes may never become real.
-  Committing it as observed made one failed EVAL pin the replica at enforce for
-  its lifetime — the mode is only promoted to observed once the CAS lands, and if
-  recovery declines, the floor that *is* readable is adopted instead.
+observe、migrate、reconciler 共用 `<uidTokenPrefix>auth:rollout-scan-owner`：
 
-### Correction to review round 5, P2-7
+- 每个 SCAN 前后、每批 key 处理后、complete 前读取 `INFO server run_id` 指纹；
+- 指纹变化时丢弃 cursor 与累计计数，从 0 重扫；
+- 每批与 complete 前同步确认 scan-owner；owner 不匹配立即失败；
+- migrate apply 另持有 mutation lock。scan-owner 控制全量扫描并发与成本，mutation lock 保证只有
+  一个 writer 修改 legacy token，二者不能互相替代。
 
-Round 5 states that a #725 deployment with *a floor and no marker* "resolves
-downward to `expand` (`session_rollout_marker.go:267-273`)". It does not. Lines
-267-273 are the `default:` branch, which requires `control == nil`; a deployment
-with a floor takes the early return at :176 (row **A1**) and runs at its floor.
-`TestWiringFirstBootBeforeMarkerMigration` pins exactly that, legacy session and
-all. The window described in P2-7 is real — the marker row is absent until a
-poller stamps it — but its consequence is the metric label reading `adopted`
-rather than `normal`, not a mode change. No fix; the table is the answer.
+## F. 回滚下界
 
----
-
-## B. Poller — `pollFloor`, every 5s on a running process
-
-| # | floor | marker | action | effect on a **provisional** state |
-|---|---|---|---|---|
-| B1 | present | — | `ApplyRolloutState(floor)` | corrected, in either direction; `provisional` cleared |
-| B2 | absent | present | **recover at enforce** | corrected upward |
-| B3 | absent | absent / 1146 | `ApplyRolloutState(expand)` | guess cleared → **expand** |
-| B4 | absent | error | nothing | guess retained (cannot decide) |
-| B5 | error | present | **attempt recovery** | corrected upward if the record is truly unparseable |
-| B6 | error | absent / error | nothing | guess retained (the bytes might be a floor this build cannot read) |
-
-**Before this round the whole `absent` row did not exist**: `pollFloor` returned
-immediately on `err != nil || control == nil`, so B2/B3/B4 were one dead branch.
-That is review round 5's P1-1 — a provisional `enforce` on a deployment with no
-floor record was never revisited, so a two-second Redis error inside the 5s boot
-window pinned that pod at `enforce` for its whole life and denied every existing
-v1/v2 session on it.
-
-B2 matters as much as B3 and is not in the review's suggested fix: applying
-`expand` unconditionally on an absent floor would be a **fail-open** on exactly
-the RDB-rollback case the marker exists to catch. The poller needs the same
-three-way distinction boot uses.
-
-**B5 was also a wedge.** Returning on every read error meant a permanently
-malformed floor stopped the self-driving loop until every pod was restarted.
-Recovery decides by decoding what is on the key and is a no-op for a valid floor,
-so attempting it on any read error is safe — a transient fault changes nothing, a
-genuinely unparseable record is replaced. B6 remains the one state with no
-in-band exit, and the runbook now names the manual repair.
-
-**Every row that changes the mode goes through one helper.** `applyAndPublish`
-applies, records the metric and republishes the registry entry together, because
-they are not separable: the convergence gate only rejects writers advertising a
-mode BELOW the floor, so a replica advertising one ABOVE what it runs is
-invisible to it and can satisfy convergence for the first v3 floor while still
-writing v2. That hole opened the moment a second caller applied state directly.
-The canary offset lives there too — it is a property of the replica's posture,
-not of where the mode came from.
-
----
-
-## C. Predicate — `EvaluateRolloutAdvance`, decides whether to advance
-
-| # | floor | marker | target | allowed? |
-|---|---|---|---|---|
-| C1 | present, `< enforce` | — | `floor.next()` | per gates |
-| C2 | present, `enforce` | — | — | terminal, no scan |
-| C3 | absent | absent / 1146 | `v3-write` (first floor) | per gates |
-| C4 | absent | present | **must refuse** | floor was lost, not never-created — recovery restores it, an advance must not re-create it |
-| C5 | absent | error / no store | **must refuse** | cannot tell C3 from C4 |
-| C6 | error | — | — | returns the error |
-
-**C4 is review round 5's second P1** (found only by the automated reviewer).
-The predicate has no marker at all — `RolloutAdvanceInput` never carried one —
-so an in-flight floor loss reads as greenfield and the reconciler re-creates the
-ladder at `v3-write` **over a stamped marker**. Any replica that restarts in that
-window boots at `v3-write` (row A1), and `v3-write` accepts precisely the
-persistent and over-max legacy bearers `bounded` had begun rejecting.
-
-Note this is the *same cell* as B2 seen from the other path: both are "floor
-reads absent while a marker says one existed". Boot got it right in round 4; the
-poller and the predicate did not. That is the interaction the review asked to
-have written down, and it is why patching one of them would have left the other.
-
----
-
-## D. Who may change the mode after boot
-
-| writer | may lower? | condition |
-|---|---|---|
-| `ApplyRolloutState` | only when current is **provisional** | otherwise monotonic; clears provisional on landing |
-| `ApplyProvisionalRolloutState` | never | raises only, marks provisional |
-| `advanceFloor` | n/a — writes the floor, not the mode | marker → snapshot → CAS, single path |
-| `RecoverRolloutControlAtEnforce` | n/a | replaces only an absent or genuinely unparseable record |
-
-One more bound belongs here: **the running mode is never more than one phase
-above the floor.** The deprecated `MODE` override is itself a canary — its own
-warning says "equivalent to `CANARY_AHEAD=1`" — so applying the `CANARY_AHEAD`
-increment on top stacked two and put a `revoke`-floor deployment at `enforce`,
-denying legacy sessions the floor still intends to honour. Pinned by
-`TestCanaryNeverStacksMoreThanOnePhaseAboveTheFloor`.
-
-The monotonic rule protects **observed** floors. Applying it to a guess is what
-produced P1-1; exempting an observed floor from it would re-open round 4's
-downgrade. `provisional` is the one bit that separates the two, and rows B1–B3
-are the only places it is cleared.
-
----
-
-## Gaps this table exposed (all now closed)
-
-1. **A5 / A9 untested** — boot with an unreadable marker. Both route through
-   `StrictRolloutBoot`, which round 4 changed from `Recovered` to `Unknown`; no
-   test pinned that it no longer writes a floor.
-2. **B2 / B3 / B4 unimplemented** — the poller's entire absent-floor row.
-3. **C4 / C5 unimplemented** — the predicate's marker consultation.
-4. **`unknown` is not a metric label** — `sessionRolloutBootOutcomes` lists four
-   values, so rows A5 and A7–A9 set every series to 0 and the gauge's "exactly
-   one outcome is 1" contract is false for the four rows an operator most needs
-   to see.
-
-Gaps 2 and 3 were the two P1s of round 5. Gaps 1 and 4 are what would have made
-them visible: the first as a test, the second as an alert.
-
-### What round 6 then found in these same rows
-
-Writing the table located the missing **cells** and stopped there — it did not
-check that each cell's **exit** was complete. Three of the four round-6 findings
-are that omission:
-
-- A2/A6 gained a cell but not the provisional qualifier, so recovery declining
-  (which the round-4 fix made possible) left a guess committed as observed.
-- B2/B3 gained cells but bypassed the publication path, so the registry
-  advertised a mode the replica was not running.
-- B3 bypassed the canary offset for the same reason.
-
-The table now records, per row, both what the mode resolves to AND who may change
-it afterwards. That second column is the one that was missing.
+- MySQL floor 尚未高于接管 seed：可回滚到 #725，但必须恢复 #725 所需配置，并确认旧 Redis floor
+  仍在；本版本从不修改它。
+- MySQL floor 已推进：禁止回滚到只认 Redis floor 的制品。先 `pause`，保存 state/audit，修复后
+  roll forward。
+- migration 只缩短 TTL；制品回滚不得延长 deadline、删除 deny marker 或复活 token。

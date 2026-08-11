@@ -25,8 +25,8 @@ const (
 	sessionCanaryAheadEnv = "OCTO_AUTH_SESSION_CANARY_AHEAD"
 	// sessionExpectWritersEnv is the replica count the deployment intends to run.
 	// It is information the deployer already has and the process does not, not a
-	// judgement call. Only consulted when first establishing a v3 floor over a
-	// non-empty keyspace, and removable afterwards.
+	// judgement call. Only consulted when first establishing a v3 floor, and
+	// removable afterwards.
 	sessionExpectWritersEnv = "OCTO_AUTH_SESSION_EXPECT_WRITERS"
 	// sessionAutoAdvanceEnv is the deployment-side initial value for the
 	// reconciler. The runtime pause flag wins over it, and the more conservative
@@ -110,7 +110,7 @@ func sessionPolicyFromEnv() sessionPolicy {
 		parsed, err := strconv.ParseInt(value, 10, 32)
 		if err != nil || parsed <= 0 {
 			policy.warnings = append(policy.warnings, fmt.Sprintf(
-				"ignoring unparseable %s=%q; the first v3 floor over a non-empty keyspace will stay blocked",
+				"ignoring unparseable %s=%q; the first v3 floor will stay blocked",
 				sessionExpectWritersEnv, value))
 		} else {
 			policy.expectWriters = int(parsed)

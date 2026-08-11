@@ -7,19 +7,18 @@ change-log convention (§7). Newest first.
 ## 2026-08-11 (token-session-rollout-simplify)
 
 - **Task** — `token-session-rollout-simplify`: collapsed the #725 five-phase
-  session rollout into a self-driving loop. Boot no longer panics on a missing
-  Redis floor — a write-once MySQL marker separates "never initialised" from
-  "lost to an RDB rollback" and a lost floor resolves upward to enforce. The
-  mode is derived from the floor and polled, removing eight of nine rolling
-  restarts and the ordering trap that made a pod restart fatal between an
-  advance and its deploy. A writer registry modelled as a write lease turns
-  "no pre-fix replica remains" from a kubectl template into a machine gate,
-  which retires the two-observation / one-hour ritual; the predicate is now
-  evaluated at decision time, so an empty keyspace is the strongest evidence
-  rather than a rejected one and greenfield reaches enforce with no commands.
-  A reconciler advances the floor and ships disabled. Tooling moved into
-  `app session-rollout` and prints the Redis endpoint it resolved. Migration
-  correctness and the floor's monotonic CAS are unchanged. See
+  session rollout into a MySQL-authoritative control plane. A singleton owns
+  floor/cap/version/pause, and append-only evidence commits in the same
+  transaction as each floor CAS; #725 Redis floor and legacy MODE/MAX are
+  one-time takeover inputs only. Runtime mode publication fences issuance,
+  applies local state, then atomically publishes writer state + lease; failure
+  stays fenced without breaking existing-session reads. Observe, migrate and
+  reconciler share a scan-owner lease and `run_id`-bound scanner that discards
+  counters on failover. The writer registry still proves fleet convergence;
+  empty token keyspace is valid absence evidence, while an empty writer set is
+  a blocker. The reconciler ships disabled, and rollback to a Redis-floor-only
+  artifact is forbidden after the MySQL floor advances. Tooling remains in
+  `app session-rollout` and now reads MySQL state directly. See
   [journal](journal/shared/token-session-rollout-simplify.md) and
   [verification](tasks/token-session-rollout-simplify/verification.md). PR #733.
 - **Learning (pending)** —

@@ -24,6 +24,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,12 @@ import (
 
 	rd "github.com/go-redis/redis"
 )
+
+var publishWriterLeaseScript = rd.NewScript(`
+redis.call("SADD", KEYS[1], ARGV[1])
+redis.call("PSETEX", KEYS[2], ARGV[2], ARGV[3])
+return 1
+`)
 
 const (
 	// writerLeaseTTL bounds how long a dead process stays visible. Liveness is
@@ -82,6 +89,13 @@ type WriterRegistry struct {
 	// already stopped seeing it and the gate may have advanced on that basis.
 	lastRefreshAt time.Time
 	now           func() time.Time
+	// writeMu serializes heartbeat refreshes with applied-state publication. A
+	// stale heartbeat captured before a mode change must never overwrite the new
+	// registry state after it was published.
+	writeMu sync.Mutex
+	// publishFn is a test seam for publication failure. Production uses the Lua
+	// publisher below.
+	publishFn func(WriterEntry) error
 }
 
 // writerLeaseMargin keeps the local expiry strictly ahead of Redis's, so a
@@ -142,21 +156,45 @@ func (r *WriterRegistry) Join(ctx context.Context, build, pod, appliedState stri
 // SetAppliedStateIfChanged skips the Redis round trip when nothing moved. The
 // applied mode changes a handful of times across an entire rollout, while the
 // poller runs every five seconds.
-func (r *WriterRegistry) SetAppliedStateIfChanged(state string) {
+func (r *WriterRegistry) SetAppliedStateIfChanged(state string) error {
 	r.mu.RLock()
 	unchanged := r.self.AppliedState == state
 	r.mu.RUnlock()
 	if unchanged {
-		return
+		return nil
 	}
-	r.SetAppliedState(state)
+	return r.PublishAppliedState(state)
 }
 
-func (r *WriterRegistry) SetAppliedState(state string) {
+func (r *WriterRegistry) SetAppliedState(state string) error {
+	return r.PublishAppliedState(state)
+}
+
+// PublishAppliedState atomically renews this process's write lease and changes
+// its advertised state. The in-memory entry is committed only after Redis
+// accepts the candidate, so a failed publication cannot be refreshed later by
+// the heartbeat as though it succeeded.
+func (r *WriterRegistry) PublishAppliedState(state string) error {
+	if strings.TrimSpace(state) == "" {
+		return errors.New("auth: writer applied state is required")
+	}
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	r.mu.RLock()
+	candidate := r.self
+	r.mu.RUnlock()
+	if candidate.ID == "" {
+		return errors.New("auth: writer registry has not joined")
+	}
+	candidate.AppliedState = state
+	if err := r.publish(candidate); err != nil {
+		return err
+	}
 	r.mu.Lock()
-	r.self.AppliedState = state
+	r.self = candidate
+	r.lastRefreshAt = r.clock()
 	r.mu.Unlock()
-	_ = r.refresh()
+	return nil
 }
 
 // MayWrite reports whether this process still holds its lease. A writer without
@@ -200,27 +238,43 @@ func (r *WriterRegistry) heartbeat(ctx context.Context) {
 }
 
 func (r *WriterRegistry) refresh() error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.RLock()
 	entry := r.self
 	r.mu.RUnlock()
 	if entry.ID == "" {
 		return errors.New("auth: writer registry has not joined")
 	}
+	if err := r.publish(entry); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.lastRefreshAt = r.clock()
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *WriterRegistry) publish(entry WriterEntry) error {
+	if r.publishFn != nil {
+		return r.publishFn(entry)
+	}
+	if r.client == nil {
+		return errors.New("auth: writer registry Redis client is unavailable")
+	}
 	encoded, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("auth: encode writer registry entry: %w", err)
 	}
-	err = r.client.Set(r.entryKey(entry.ID), string(encoded), writerLeaseTTL).Err()
-	if err == nil {
-		err = r.client.SAdd(r.rosterKey, entry.ID).Err()
-	}
-	r.mu.Lock()
-	if err == nil {
-		r.lastRefreshAt = r.clock()
-	}
-	r.mu.Unlock()
+	_, err = publishWriterLeaseScript.Run(
+		r.client,
+		[]string{r.rosterKey, r.entryKey(entry.ID)},
+		entry.ID,
+		writerLeaseTTL.Milliseconds(),
+		string(encoded),
+	).Result()
 	if err != nil {
-		return fmt.Errorf("auth: refresh writer lease: %w", err)
+		return fmt.Errorf("auth: publish writer lease: %w", err)
 	}
 	return nil
 }
@@ -334,5 +388,6 @@ func writerSetFingerprint(entries []WriterEntry) string {
 		parts = append(parts, entry.ID+"|"+entry.Build+"|"+entry.AppliedState)
 	}
 	sort.Strings(parts)
-	return strings.Join(parts, ",")
+	sum := sha256.Sum256([]byte(strings.Join(parts, ",")))
+	return fmt.Sprintf("%x", sum[:])
 }

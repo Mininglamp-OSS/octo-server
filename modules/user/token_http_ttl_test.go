@@ -338,6 +338,9 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	server.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(server.GetRoute())
 	store, client := auth.SessionStoreAndClientForContext(ctx)
+	stopRollout, err := startSessionRolloutForTest(ctx, "token-http-test")
+	require.NoError(t, err)
+	t.Cleanup(stopRollout)
 	server.GetRoute().SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		cfg.Cache.TokenCachePrefix,

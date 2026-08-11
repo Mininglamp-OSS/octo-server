@@ -41,11 +41,12 @@ const (
 // RolloutAdvanceDecision is what the reconciler and `advance --force` both act
 // on. BlockedBy entries are operator-facing and low cardinality.
 type RolloutAdvanceDecision struct {
-	Current   SessionMode `json:"current_floor"`
-	Target    SessionMode `json:"target_floor"`
-	Allowed   bool        `json:"allowed"`
-	BlockedBy []string    `json:"blocked_by,omitempty"`
-	MaxPerUID int         `json:"max_per_uid,omitempty"`
+	Current      SessionMode `json:"current_floor"`
+	Target       SessionMode `json:"target_floor"`
+	StateVersion int64       `json:"state_version"`
+	Allowed      bool        `json:"allowed"`
+	BlockedBy    []string    `json:"blocked_by,omitempty"`
+	MaxPerUID    int         `json:"max_per_uid,omitempty"`
 	// Scanned reports whether this evaluation ran a keyspace scan, so a caller
 	// can back off rather than rescanning every cycle while waiting out a
 	// deadline measured in days.
@@ -57,10 +58,17 @@ type RolloutAdvanceDecision struct {
 	Observation *SessionObservation `json:"observation,omitempty"`
 	// Options are operator-actionable next steps for the blockers above.
 	Options []string `json:"options,omitempty"`
+	// These bind the decision to the exact fleet and Redis process observed.
+	// They are persisted in the same MySQL transaction as the floor CAS.
+	WriterFingerprint string `json:"writer_fingerprint,omitempty"`
+	RedisInstanceID   string `json:"redis_instance_id,omitempty"`
 }
 
 // RolloutAdvanceInput carries what the predicate cannot read for itself.
 type RolloutAdvanceInput struct {
+	// State is the MySQL-authoritative snapshot whose version will be used by
+	// the advance CAS. Redis never supplies a floor after takeover.
+	State    RolloutState
 	Registry *WriterRegistry
 	// ExpectWriters is the replica count the deployment intends to run. Required
 	// for the first v3 floor and only that one, because it is the single
@@ -68,13 +76,6 @@ type RolloutAdvanceInput struct {
 	// v2 and the registry structurally cannot see it. Every later transition is
 	// fully machine-gated.
 	ExpectWriters int
-	// MaxPerUID is required when crossing into a v3-writing floor.
-	MaxPerUID int
-	// Markers answers the one question a missing floor cannot answer about
-	// itself: was one ever established here? Required whenever the floor reads
-	// as absent, because "never created" and "created and lost" need opposite
-	// reactions — see .octospec/tasks/.../boot-state-table.md rows C3/C4.
-	Markers *RolloutMarkerStore
 	// Convergence carries the caller's observation window across evaluations.
 	// Required for the first v3 floor, where a count taken at one instant is not
 	// enough — see WriterConvergence. A caller that cannot observe over time
@@ -89,64 +90,28 @@ type RolloutAdvanceInput struct {
 
 // EvaluateRolloutAdvance decides whether the floor may move one phase.
 func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in RolloutAdvanceInput) (RolloutAdvanceDecision, error) {
-	control, err := s.RolloutControl(ctx)
-	if err != nil {
+	if err := validateRolloutState(in.State); err != nil {
 		return RolloutAdvanceDecision{}, err
 	}
-
-	decision := RolloutAdvanceDecision{Target: SessionModeV3Write, MaxPerUID: in.MaxPerUID}
-	if control != nil {
-		decision.Current = control.ModeFloor
-		decision.Target = control.ModeFloor.next()
-		if decision.MaxPerUID <= 0 {
-			decision.MaxPerUID = control.MaxPerUID
-		}
-		if control.ModeFloor == SessionModeEnforce {
-			// Terminal. Nothing to evaluate and nothing to scan — the
-			// reconciler goes quiet from here.
-			decision.BlockedBy = []string{"floor is already enforce"}
-			return decision, nil
-		}
+	decision := RolloutAdvanceDecision{
+		Current: in.State.Floor, Target: in.State.Floor.next(), StateVersion: in.State.Version,
+		MaxPerUID: in.State.MaxPerUID,
 	}
-
-	if control == nil {
-		// A floor that reads as absent is three states, not one: never created,
-		// created and lost, or not created yet. Only the marker separates them,
-		// and this path had no marker at all — so an in-flight loss (RDB
-		// rollback, an accidental DEL) read as greenfield and the reconciler
-		// re-created the ladder at v3-write OVER a stamped marker. Any replica
-		// restarting in that window boots at v3-write, which accepts exactly the
-		// persistent and over-max legacy bearers bounded had begun rejecting.
-		//
-		// Recovery, not advancement, is the answer to a lost floor: it restores
-		// enforce in one write with the marker as its evidence. So refuse here
-		// and let the poller's recovery path do it — one writer for that job.
-		switch {
-		case in.Markers == nil:
-			decision.BlockedBy = append(decision.BlockedBy,
-				"cannot determine whether a floor was ever initialised here")
-		default:
-			marker, markerErr := in.Markers.Load(ctx)
-			switch {
-			case markerErr != nil && !isMissingMarkerTable(markerErr):
-				decision.BlockedBy = append(decision.BlockedBy,
-					"initialisation marker is unreadable")
-			case markerErr == nil && marker != nil:
-				decision.BlockedBy = append(decision.BlockedBy,
-					fmt.Sprintf("floor is missing but this deployment initialised one at %s; "+
-						"it must be recovered, not re-created",
-						marker.InitializedAt.UTC().Format(time.RFC3339)))
-			}
-		}
+	if in.State.Floor == SessionModeEnforce {
+		// Terminal. Nothing to evaluate and nothing to scan — the reconciler
+		// goes quiet from here.
+		decision.BlockedBy = []string{"floor is already enforce"}
+		return decision, nil
 	}
-
-	if decision.Target.writesV3() && (decision.MaxPerUID <= 0 || decision.MaxPerUID > sessionMaxPerUIDLimit) {
-		decision.BlockedBy = append(decision.BlockedBy, "max_per_uid is not configured")
+	if in.State.Paused {
+		decision.BlockedBy = []string{"rollout is paused"}
+		return decision, nil
 	}
 
 	// Fleet convergence. Every live writer must already be running at the
 	// current floor, or advancing would put the floor two phases ahead of a
 	// replica that has not caught up.
+	var initialWriters []WriterEntry
 	if in.Registry == nil {
 		decision.BlockedBy = append(decision.BlockedBy, "writer registry unavailable")
 	} else {
@@ -154,6 +119,8 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		if liveErr != nil {
 			return RolloutAdvanceDecision{}, liveErr
 		}
+		initialWriters = live
+		decision.WriterFingerprint = writerSetFingerprint(live)
 		switch {
 		case len(live) == 0:
 			// An empty registry is a FAILURE, not a pass. Note this is the
@@ -190,6 +157,7 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		decision.Target == SessionModeV3Write ||
 		decision.Target == SessionModeBounded
 	var observation SessionObservation
+	var err error
 	if needScan {
 		batch := in.ScanBatchSize
 		if batch <= 0 {
@@ -213,12 +181,7 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 		// sweep, a flush, or the Redis loss this change handles. An idle
 		// pre-registry replica writes v2 on the next login and registers
 		// nowhere, so neither the roster nor the build check can see it.
-		var entries []WriterEntry
-		if in.Registry != nil {
-			if observed, liveErr := in.Registry.Live(); liveErr == nil {
-				entries = observed
-			}
-		}
+		entries := initialWriters
 		live := len(entries)
 		switch {
 		case in.ExpectWriters <= 0:
@@ -279,6 +242,20 @@ func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in Rollo
 	}
 	if decision.Scanned {
 		metrics.SetSessionUndecodableRecords(observation.DecodeInvalid)
+		decision.RedisInstanceID = observation.RedisInstanceID
+	}
+
+	// The scan can take minutes. A writer joining, leaving, changing build, or
+	// applying another state during it invalidates the decision even when token
+	// counts are green. Re-read once and require the exact fingerprint.
+	if in.Registry != nil {
+		finalWriters, liveErr := in.Registry.Live()
+		if liveErr != nil {
+			return RolloutAdvanceDecision{}, liveErr
+		}
+		if finalFingerprint := writerSetFingerprint(finalWriters); finalFingerprint != decision.WriterFingerprint {
+			decision.BlockedBy = append(decision.BlockedBy, "writer set changed during evaluation")
+		}
 	}
 
 	sort.Strings(decision.BlockedBy)

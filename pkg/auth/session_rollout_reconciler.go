@@ -18,15 +18,11 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
-	rd "github.com/go-redis/redis"
 )
 
 const (
@@ -44,39 +40,30 @@ const (
 	defaultReconcileScanInterval = 5 * time.Millisecond
 )
 
-// RolloutAdvanceRecord is the evidence snapshot written BEFORE each advance.
-// The ordering is the requirement, not atomicity: a snapshot with no advance is
-// harmless, an advance with no snapshot is not. Writing it first gets that with
-// two Redis writes and no transaction.
+// RolloutAdvanceRecord is the audit payload inserted in the same MySQL
+// transaction as the versioned floor CAS.
 type RolloutAdvanceRecord struct {
-	From        SessionMode `json:"from"`
-	To          SessionMode `json:"to"`
-	Actor       string      `json:"actor"`
-	AtMS        int64       `json:"at_unix_ms"`
-	LiveWriters int         `json:"live_writers"`
-	Builds      []string    `json:"builds"`
-	V1          int64       `json:"v1"`
-	V2          int64       `json:"v2"`
-	V3          int64       `json:"v3"`
-	Total       int64       `json:"total"`
-	RedisID     string      `json:"redis_instance_id,omitempty"`
+	From              SessionMode         `json:"from"`
+	To                SessionMode         `json:"to"`
+	Actor             string              `json:"actor"`
+	AtMS              int64               `json:"at_unix_ms"`
+	Kind              string              `json:"transition_kind"`
+	RedisID           string              `json:"redis_instance_id,omitempty"`
+	WriterFingerprint string              `json:"writer_fingerprint,omitempty"`
+	Observation       *SessionObservation `json:"observation,omitempty"`
 }
 
 // RolloutReconciler polls the floor and, when enabled, advances it.
 type RolloutReconciler struct {
 	store    *RedisSessionStore
 	registry *WriterRegistry
-	markers  *RolloutMarkerStore
+	control  RolloutStateController
 
 	autoAdvance   bool
 	canaryAhead   bool
 	expectWriters int
-	// maxPerUID seeds the floor record the first time the floor crosses into a
-	// v3-writing phase, when there is no record to carry it forward from.
-	maxPerUID     int
 	scanBatchSize int64
 	scanInterval  time.Duration
-	markerStamped atomic.Bool
 	// convergence carries the writer-set observation window across cycles. It
 	// belongs to the reconciler rather than the predicate because the predicate
 	// is evaluated per decision and the window spans several.
@@ -84,13 +71,17 @@ type RolloutReconciler struct {
 	log         func(format string, args ...interface{})
 }
 
+type RolloutStateController interface {
+	Load(context.Context) (RolloutState, error)
+	Advance(context.Context, RolloutState, RolloutAdvanceRecord) (RolloutState, error)
+}
+
 type ReconcilerOptions struct {
 	Registry      *WriterRegistry
-	Markers       *RolloutMarkerStore
+	Control       RolloutStateController
 	AutoAdvance   bool
 	CanaryAhead   bool
 	ExpectWriters int
-	MaxPerUID     int
 	ScanBatchSize int64
 	// ScanInterval throttles the keyspace scan. This runs unattended, on the
 	// shared session pool, from every replica, so it must not be zero in
@@ -118,11 +109,10 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 	return &RolloutReconciler{
 		store:         store,
 		registry:      opts.Registry,
-		markers:       opts.Markers,
+		control:       opts.Control,
 		autoAdvance:   opts.AutoAdvance,
 		canaryAhead:   opts.CanaryAhead,
 		expectWriters: opts.ExpectWriters,
-		maxPerUID:     opts.MaxPerUID,
 		scanBatchSize: batch,
 		scanInterval:  interval,
 		convergence:   NewWriterConvergence(),
@@ -130,11 +120,6 @@ func NewRolloutReconciler(store *RedisSessionStore, opts ReconcilerOptions) *Rol
 	}
 }
 
-// Run polls the floor forever and reconciles when enabled.
-//
-// It is started only from the server wiring, never from NewRedisSessionStore:
-// a background goroutine that advances floors, started by a constructor, would
-// fire in every test that happens to build a store.
 // Run polls the floor and, when enabled, reconciles — in two goroutines.
 //
 // One loop was not enough: a rate-limited full-keyspace scan inside
@@ -185,51 +170,19 @@ func (r *RolloutReconciler) runReconciler(ctx context.Context) {
 // pollFloor is what replaces eight of the nine rolling restarts: a replica
 // learns the floor moved instead of being redeployed to be told.
 func (r *RolloutReconciler) pollFloor(ctx context.Context) {
-	control, err := r.store.RolloutControl(ctx)
+	if r.control == nil {
+		return
+	}
+	state, err := r.control.Load(ctx)
 	if err != nil {
-		// Could be a transient read fault, could be a permanently malformed
-		// record — and this path used to return either way, so a corrupt floor
-		// wedged the self-driving loop until someone restarted every pod.
-		//
-		// Recovery decides by decoding what is actually on the key and is a no-op
-		// for a valid floor, so attempting it on every read error is safe: a
-		// transient fault changes nothing, a genuinely unparseable record gets
-		// replaced. It still requires the marker, so a deployment that never
-		// established a floor is never handed one.
-		r.resolveFloorlessState(ctx, true)
+		// Keep the last applied state and leave issuance fenced if publication was
+		// already in progress. A DB read failure is never permission to derive a
+		// mode from Redis or environment.
+		r.log("session rollout: cannot read MySQL control state: %v", err)
 		return
 	}
-	if control == nil {
-		// "Read succeeded, nothing there" is an OBSERVATION, not an absence of
-		// work — and returning here left a provisional enforce pinned for the
-		// life of the process, denying every existing v1/v2 session on that pod
-		// because of a Redis error that lasted two seconds inside the boot
-		// window.
-		//
-		// It is also three-way, exactly as it is at boot, so it needs the marker
-		// for the same reason: clearing the guess to expand unconditionally would
-		// be a fail-open on the RDB-rollback case.
-		r.resolveFloorlessState(ctx, false)
-		return
-	}
-
-	// A #725 record predates the cap field, so without writing it back the cap
-	// only ever lives in this process's memory and is gone on the next restart —
-	// leaving a v3-writing floor with no bound to apply. Retried here rather
-	// than done once at boot so a MySQL or Redis hiccup does not lose it.
-	if control.MaxPerUID <= 0 && r.maxPerUID > 0 {
-		if capErr := r.store.EnsureRolloutMaxPerUID(ctx, r.maxPerUID); capErr != nil {
-			r.log("session rollout: cannot persist max_per_uid: %v", capErr)
-		}
-	}
-	r.ensureMarker(ctx, control.ModeFloor)
-
-	cap := control.MaxPerUID
-	if cap <= 0 {
-		cap = r.maxPerUID
-	}
-	if applyErr := r.applyAndPublish(control.ModeFloor, cap); applyErr != nil {
-		r.log("session rollout: cannot apply floor %s: %v", control.ModeFloor, applyErr)
+	if applyErr := r.applyAndPublish(state.Floor, state.MaxPerUID); applyErr != nil {
+		r.log("session rollout: cannot apply floor %s: %v", state.Floor, applyErr)
 	}
 }
 
@@ -250,122 +203,7 @@ func (r *RolloutReconciler) applyAndPublish(mode SessionMode, maxPerUID int) err
 	if r.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
 		mode = mode.next()
 	}
-	if err := r.store.ApplyRolloutState(mode, maxPerUID); err != nil {
-		return err
-	}
-	// Publish what was APPLIED, never what was requested: ApplyRolloutState may
-	// legitimately refuse to lower an observed mode. Only on an actual change —
-	// the heartbeat refreshes the entry on its own tick, so rewriting an
-	// identical one every poll doubles registry traffic.
-	applied := r.store.currentMode()
-	metrics.SetSessionRolloutMode(string(applied))
-	if r.registry != nil {
-		r.registry.SetAppliedStateIfChanged(string(applied))
-	}
-	return nil
-}
-
-// resolveFloorlessState handles every row of the boot-state table where this
-// replica has no usable floor: the read returned nothing (B2/B3/B4) or failed
-// outright (B5).
-//
-// Only the marker can say which of the three absences this is, and getting it
-// wrong costs in both directions — treating a loss as greenfield re-admits the
-// legacy bearers the rollout was retiring, and treating greenfield as a loss
-// pins the replica at enforce.
-//
-// Deliberately NOT gated on the pause flag. Pause stops the floor moving
-// FORWARD; this restores one that already existed, and boot performs the same
-// recovery unconditionally on every replica. Gating it here would only mean a
-// paused deployment recovers via pod restarts instead — the same outcome,
-// arrived at less predictably.
-func (r *RolloutReconciler) resolveFloorlessState(ctx context.Context, unreadable bool) {
-	if r.markers == nil {
-		return
-	}
-	loadCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	marker, err := r.markers.Load(loadCtx)
-	switch {
-	case err != nil && !isMissingMarkerTable(err):
-		// B4: cannot decide. Keep the current mode, guess included.
-		return
-	case err == nil && marker != nil:
-		// B2: this deployment established a floor and Redis no longer has it.
-		// Recovery writes enforce with the marker as its evidence.
-		recovered, recoverErr := r.store.RecoverRolloutControlAtEnforce(ctx, r.recoveryMaxPerUID())
-		if recoverErr != nil {
-			r.log("session rollout: cannot recover lost floor: %v", recoverErr)
-			return
-		}
-		if !recovered {
-			// A valid floor reappeared between the read and the CAS — another
-			// replica's recovery, or an operator restoring a backup. Whatever it
-			// says is authoritative, and forcing enforce over it would raise this
-			// replica above a floor that is readable right now. The next poll
-			// reads it through the normal path.
-			return
-		}
-		if applyErr := r.applyAndPublish(SessionModeEnforce, r.recoveryMaxPerUID()); applyErr != nil {
-			r.log("session rollout: cannot apply recovered floor: %v", applyErr)
-			return
-		}
-		r.log("session rollout: floor was missing but this deployment initialised one at %s; "+
-			"restored at enforce", marker.InitializedAt.UTC().Format(time.RFC3339))
-	case unreadable:
-		// B5: no marker AND the record could not be parsed. "Never established"
-		// is not available as a conclusion here — the bytes on the key might be a
-		// real floor this build cannot read — so hold the current mode, guess
-		// included. This is the one state with no in-band exit; the runbook names
-		// the manual repair.
-		return
-	default:
-		// B3: genuinely never established. Applying expand is a no-op for an
-		// observed mode — the no-lowering rule still holds — and clears a
-		// provisional guess, which is the asymmetry `provisional` exists for.
-		if applyErr := r.applyAndPublish(SessionModeExpand, r.maxPerUID); applyErr != nil {
-			r.log("session rollout: cannot clear provisional mode: %v", applyErr)
-		}
-	}
-}
-
-// recoveryMaxPerUID keeps recovery appliable when no cap was configured: a
-// v3-writing mode with no bound fences every login.
-func (r *RolloutReconciler) recoveryMaxPerUID() int {
-	if r.maxPerUID > 0 {
-		return r.maxPerUID
-	}
-	return defaultRecoveryMaxPerUID
-}
-
-// ensureMarker stamps the initialisation marker whenever a floor exists without
-// one. It lives here, not at boot, for two reasons: the marker table is created
-// by a migration that runs after the session store is built, so the first boot
-// of this artifact cannot stamp it; and until it is stamped, a Redis loss reads
-// as "never initialised" and resolves DOWN to expand.
-func (r *RolloutReconciler) ensureMarker(ctx context.Context, floor SessionMode) {
-	if r.markers == nil || r.markerStamped.Load() {
-		return
-	}
-	// Bounded: the rollout context has no deadline, and a stalled MySQL
-	// connection here would otherwise hold the poll loop open indefinitely.
-	loadCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	marker, err := r.markers.Load(loadCtx)
-	if err != nil {
-		return
-	}
-	if marker != nil {
-		// Latch it: once stamped it stays stamped, so there is no reason to
-		// query for the rest of the process's life.
-		r.markerStamped.Store(true)
-		return
-	}
-	if stampErr := r.markers.StampOnce(loadCtx, floor); stampErr != nil {
-		r.log("session rollout: cannot stamp initialisation marker: %v", stampErr)
-		return
-	}
-	r.markerStamped.Store(true)
+	return r.store.ApplyAndPublishRolloutState(r.registry, mode, maxPerUID)
 }
 
 // reconcileOnce evaluates the predicate and returns the earliest time the next
@@ -379,22 +217,26 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 			metrics.SetSessionLiveWriters(len(live))
 		}
 	}
-	paused, err := r.store.RolloutPaused(ctx)
-	if err != nil {
+	if r.control == nil {
 		return soon
 	}
-	if paused || !r.autoAdvance {
+	state, err := r.control.Load(ctx)
+	if err != nil {
+		r.log("session rollout: cannot read MySQL control state for advance: %v", err)
+		metrics.ObserveSessionReconcileBlocked("control-read-error")
+		return soon
+	}
+	if state.Paused || !r.autoAdvance {
 		return soon
 	}
 
 	decision, err := r.store.EvaluateRolloutAdvance(ctx, RolloutAdvanceInput{
+		State:         state,
 		Registry:      r.registry,
 		ExpectWriters: r.expectWriters,
-		MaxPerUID:     r.maxPerUID,
 		ScanBatchSize: r.scanBatchSize,
 		ScanInterval:  r.scanInterval,
 		Convergence:   r.convergence,
-		Markers:       r.markers,
 	})
 	if err != nil {
 		// Back off on errors too. A scan that aborts partway makes this return
@@ -439,32 +281,39 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 	return now
 }
 
-// advance writes the evidence snapshot and then performs the CAS.
+// advance commits the evidence snapshot and CAS in one MySQL transaction.
 //
-// A loser in a race surfaces either ErrRolloutControlChanged or the one-phase
-// pre-check rejection, and BOTH are benign no-ops — with several replicas
-// reconciling, treating them as errors would make the fleet alert on itself.
+// A losing replica sees the versioned MySQL CAS miss. That is a benign no-op:
+// another replica committed the same transition first.
 func (r *RolloutReconciler) advance(ctx context.Context, decision RolloutAdvanceDecision, actor string) error {
-	err := r.store.advanceFloor(ctx, decision, actor, r.registry, r.markers)
+	if r.control == nil {
+		return errors.New("auth: rollout control store unavailable")
+	}
+	record := rolloutAdvanceRecord(decision, actor)
+	_, err := r.control.Advance(ctx, RolloutState{
+		Floor: decision.Current, MaxPerUID: decision.MaxPerUID, Version: decision.StateVersion,
+	}, record)
 	switch {
 	case err == nil:
 		metrics.ObserveSessionFloorAdvance(string(decision.Target), actor)
 		return nil
 	case errors.Is(err, ErrRolloutControlChanged):
 		return nil
-	case isBenignAdvanceRace(err):
-		return nil
 	default:
 		return err
 	}
 }
 
-// isBenignAdvanceRace covers the second shape a losing racer takes. The CAS
-// returns ErrRolloutControlChanged when the racer read before the winner wrote;
-// when it read after, the optimistic pre-check rejects it here instead. Both
-// mean "someone else already did it".
-func isBenignAdvanceRace(err error) bool {
-	return errors.Is(err, ErrRolloutFloorNotNext) || errors.Is(err, ErrRolloutFirstFloor)
+func rolloutAdvanceRecord(decision RolloutAdvanceDecision, actor string) RolloutAdvanceRecord {
+	return RolloutAdvanceRecord{
+		From:              decision.Current,
+		To:                decision.Target,
+		Actor:             actor,
+		AtMS:              time.Now().UTC().UnixMilli(),
+		RedisID:           decision.RedisInstanceID,
+		WriterFingerprint: decision.WriterFingerprint,
+		Observation:       decision.Observation,
+	}
 }
 
 // blockedReasonLabel keeps the metric label bounded: the human-readable reason
@@ -485,8 +334,6 @@ func blockedReasonLabel(reason string) string {
 		return "expect-writers-unset"
 	case strings.Contains(reason, "v1="):
 		return "legacy-remaining"
-	case strings.Contains(reason, "max_per_uid"):
-		return "cap-unset"
 	case strings.Contains(reason, "did not complete"):
 		return "scan-incomplete"
 	case strings.Contains(reason, "already enforce"):
@@ -494,107 +341,4 @@ func blockedReasonLabel(reason string) string {
 	default:
 		return "other"
 	}
-}
-
-func (s *RedisSessionStore) recordRolloutAdvance(
-	ctx context.Context,
-	decision RolloutAdvanceDecision,
-	actor string,
-	registry *WriterRegistry,
-) error {
-	record := RolloutAdvanceRecord{
-		From:  decision.Current,
-		To:    decision.Target,
-		Actor: actor,
-		AtMS:  s.now().UTC().UnixMilli(),
-	}
-	if registry != nil {
-		if live, err := registry.Live(); err == nil {
-			record.LiveWriters = len(live)
-			seen := map[string]struct{}{}
-			for _, entry := range live {
-				if _, ok := seen[entry.Build]; ok {
-					continue
-				}
-				seen[entry.Build] = struct{}{}
-				record.Builds = append(record.Builds, entry.Build)
-			}
-		}
-	}
-	if observation := decision.Observation; observation != nil {
-		record.V1, record.V2, record.V3, record.Total =
-			observation.V1, observation.V2, observation.V3, observation.Total
-	}
-	if id, err := s.currentRedisInstanceID(); err == nil {
-		record.RedisID = id
-	}
-	encoded, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("auth: encode rollout advance record: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := s.client.Set(s.rolloutAdvanceRecordKey(), string(encoded), 0).Err(); err != nil {
-		return fmt.Errorf("auth: record rollout advance: %w", err)
-	}
-	return nil
-}
-
-// LastRolloutAdvance returns the most recent advance snapshot, for `status`.
-func (s *RedisSessionStore) LastRolloutAdvance(ctx context.Context) (*RolloutAdvanceRecord, error) {
-	raw, err := s.client.Get(s.rolloutAdvanceRecordKey()).Result()
-	if err == rd.Nil {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("auth: read rollout advance record: %w", err)
-	}
-	var record RolloutAdvanceRecord
-	if err := json.Unmarshal([]byte(raw), &record); err != nil {
-		return nil, fmt.Errorf("auth: decode rollout advance record: %w", err)
-	}
-	return &record, nil
-}
-
-// RolloutPaused reports the runtime pause flag. It is read at the top of every
-// cycle so `pause` takes effect within one interval: stopping a misbehaving
-// reconciler must not require a rollout, which would be both too slow during an
-// incident and at odds with the point of this change.
-func (s *RedisSessionStore) RolloutPaused(ctx context.Context) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	count, err := s.client.Exists(s.rolloutPauseKey()).Result()
-	if err != nil {
-		// Fail safe: an unreadable pause flag is treated as paused, because the
-		// conservative side of "should I advance an irreversible switch" is no.
-		return true, nil
-	}
-	return count != 0, nil
-}
-
-// SetRolloutPaused sets or clears the pause flag.
-func (s *RedisSessionStore) SetRolloutPaused(ctx context.Context, paused bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if paused {
-		if err := s.client.Set(s.rolloutPauseKey(), "1", 0).Err(); err != nil {
-			return fmt.Errorf("auth: pause rollout: %w", err)
-		}
-		return nil
-	}
-	if err := s.client.Del(s.rolloutPauseKey()).Err(); err != nil {
-		return fmt.Errorf("auth: resume rollout: %w", err)
-	}
-	return nil
-}
-
-func (s *RedisSessionStore) rolloutPauseKey() string {
-	return s.uidTokenPrefix + "auth:rollout-paused"
-}
-
-func (s *RedisSessionStore) rolloutAdvanceRecordKey() string {
-	return s.uidTokenPrefix + "auth:rollout-last-advance"
 }

@@ -1,112 +1,93 @@
 ---
 type: Journal
 title: "Journal: token-session-rollout-simplify"
-description: Record of collapsing the #725 five-phase session rollout into a self-driving loop, and the measured defects that shaped it.
-tags: ["auth", "security", "redis", "mysql", "session", "rollout", "operability"]
-timestamp: 2026-08-11T09:10:00+08:00
-# --- octospec extension fields ---
+description: Record of replacing the #725 rollout controls with one MySQL authority and bounded Redis evidence
+tags: [auth, security, redis, mysql, session, rollout, operability]
+timestamp: 2026-08-12T00:00:00+08:00
 task: token-session-rollout-simplify
 source: self
 ---
 
 # Journal: token-session-rollout-simplify
 
-## What was done
+## Current design
 
-- Boot no longer panics. #725 paired an environment mode against the persisted
-  floor and panicked on a mismatch or a missing record, so one lost Redis key
-  stopped the fleet from starting. A single write-once MySQL marker row now
-  separates "never initialised" from "initialised then lost to an RDB
-  rollback", and a lost floor resolves **upward** to enforce.
-- The mode is derived from the floor and polled, removing eight of nine rolling
-  restarts and the ordering trap where advancing the floor before deploying the
-  matching mode made every pod restart fatal.
-- Added a writer registry modelled as a write **lease**. Losing it refuses new
-  credentials only — it does not fail readiness and does not panic.
-- Replaced the two-observation / one-hour-gap evidence ritual with a predicate
-  evaluated at decision time, and added a reconciler that advances the floor
-  when the predicate holds. Ships disabled.
-- Folded the two standalone tools into `app session-rollout`, which prints the
-  resolved Redis endpoint and instance fingerprint before acting.
-- Rewrote the runbook; deleted the nine-step ladder.
+- `octo_session_rollout_state` is the only durable floor/cap/pause authority.
+- `octo_session_rollout_advance` stores append-only evidence in the same MySQL transaction as the
+  versioned floor CAS.
+- #725 Redis floor and legacy MODE/MAX are read only while the singleton is absent. The stricter
+  floor and the existing Redis cap are adopted; Redis floor is never changed by this release.
+- Session issuance is fenced before module migrations finish. A runtime mode change fences first,
+  applies local reader state, atomically publishes registry state + lease, and only then unfences.
+- Observe, migrate and reconciler share an instance-bound scanner and one scan-owner lease. A
+  `run_id` change discards cursor and counters; lease loss cannot produce complete evidence.
+- The reconciler ships disabled. Operators first validate takeover and shadow scans, then explicitly
+  enable it. Migration cutoff and finite policy remain business decisions.
 
-Migration correctness is untouched: immutable cutoff, single-owner lease,
-`run_id`-bound checkpoints, shorten-never-extend, elapsed-cutoff confirmation.
-So are the floor's monotonicity, one-phase and single-winner rules —
-`AdvanceRolloutControl` stayed a bare CAS with the predicate split out, and the
-invariant tests covering it needed no edits.
+This replaces the earlier PR #733 revisions that combined a Redis floor with a MySQL write-once
+marker and provisional recovery state. That state machine had separate interpretations in boot,
+poller, predicate and registry paths; fixing one cell repeatedly opened another exit-path defect.
+
+## Why one MySQL authority
+
+The session floor does not sit on a latency-critical request write. Keeping a Redis mirror therefore
+provided no data-plane benefit, while creating cross-store order, rollback and recovery questions.
+MySQL already gates startup migrations and can atomically bind audit evidence to a versioned CAS.
+
+Redis remains appropriate for short-lived writer/scan leases and for the session data being scanned.
+Those facts are evidence, not authority: losing or restoring them can abort work, but cannot change
+the floor.
+
+## Load-bearing details
+
+- Concurrent first starters may both observe an absent singleton. Duplicate-key losers rollback,
+  reload under lock and monotonically adopt a stricter seed; normal startup contention is not fatal.
+- `ApplyAndPublishRolloutState` publishes the state the process actually applied. Publication error
+  keeps new credential creation fenced while existing-session reads remain available.
+- The writer fingerprint is checked before and after each decision. A build/state/member change
+  invalidates the scan even when token counters are green.
+- `instanceBoundScanner` checks `run_id` before/after SCAN, after per-key work and before completion.
+  The final checks matter: failover during the last returned batch otherwise has no next cursor on
+  which to discover the change.
+- Scan-owner and migration mutation lock have different jobs. The former bounds aggregate Redis
+  load across status/observe/migrate/reconciler; the latter prevents concurrent token mutation.
+- `paused=true` blocks predicate work before registry reads or a full scan, and the MySQL CAS still
+  includes `paused=0` to close the race after evaluation.
 
 ## Structural learnings
 
-**Measure before designing, not after.** The brief was drafted from code
-reading and verified afterwards. The verification found a defect (a corrupt
-payload wedging the floor) that changed a design decision, so that decision
-arrived as a patch instead of being designed in. For a load-bearing change to a
-live system, a characterization of current behaviour belongs in the Plan phase
-as an input. Candidate rule filed.
+**Enumerate ownership before enumerating states.** The old table listed Redis/marker/provisional
+cells but still allowed several modules to interpret effective mode. Declaring one owner and one
+publication path removed more risk than filling additional cells.
 
-**Enforcement was inverted relative to risk.** #725 machine-enforced the
-*least* critical check — that two scans were an hour apart — while the *most*
-critical one, that no pre-fix replica remained, was a kubectl template a human
-copied. This is the third subsystem in this repo to stall on exactly that
-question: `internal/msgextraseq` (#627) documents that its lock "is not a
-substitute" for an operator drain, and `pkg/botevent` (#697) states the flip's
-precondition is that operations confirmed no old replica remains. The registry
-is the shared shape of an answer; it was kept auth-local but written to be
-extractable (opaque applied-state string, caller-supplied comparison, injected
-key prefix).
+**Evidence should fail closed without becoming authority.** A missing writer lease, lost scan lease,
+changed `run_id` or DB read error stops issuance/scan/advance as appropriate. None is converted into
+a guessed floor.
 
-**Empirical evidence where a deductive argument exists.** "No legacy remains"
-was proved by scanning twice an hour apart. It follows deductively from: no
-legacy writer can exist, every legacy record has a bounded deadline, that
-deadline has passed. The floor already enforced the first term for new
-processes; the hole was processes already running, which is precisely what the
-wall clock was standing in for. Answering it by query rather than by waiting
-removed two hours and four commands.
+**A completed SCAN needs a final-instance proof.** Checking only around `SCAN` is insufficient because
+the returned keys are read or mutated afterwards. If failover occurs during the final batch, there is
+no next iteration to detect it. Recheck after key work and immediately before recording completion.
 
-**Ask what a borrowed pattern is for before copying it.** The first revision
-copied "MySQL authority + Redis mirror" from `octo_bot_event_seq_state` without
-checking why that shape exists — the bot event allocator runs inside a msgSem
-slot and cannot afford a DB round trip, so its gate must share a Lua script
-with the INCR. The session floor has no such constraint, and copying it
-introduced a two-phase write whose Redis half cannot be rolled back, because
-the floor is monotonic and has no undo.
+**Characterize before designing.** Production-shaped fixtures exposed the incorrect v1 test format,
+observe/migrate classification drift and per-UID distribution. Those facts belong before control-plane
+design, not as post-implementation patches.
 
-**The safe direction on lost state is not always "restore".** Session tokens
-are disposable, so a lost floor does not need its old value, only a safe one —
-and the safest is the strictest. Resolving upward is strictly better than
-restoring exactly in every rollback shape.
+## Operational boundaries
 
-## Gotchas worth remembering
+- Before MySQL floor advances beyond the adopted #725 posture, rollback to #725 remains possible if
+  its required env is restored and the untouched Redis floor is present.
+- After MySQL floor advances, rollback to a Redis-floor-only artifact is forbidden. Pause and roll
+  forward; writing the MySQL value back to Redis would recreate dual authority.
+- Migration remains shorten-only and resumable. It must never extend TTLs, delete deny markers or
+  revive expired sessions.
+- A non-zero undecodable-record metric needs investigation but does not block floor movement: those
+  records have never been valid credentials and migration deliberately leaves them untouched.
 
-- **`gofmt -w .` reformatted ~120 unrelated files.** The repo contains files
-  that were already non-gofmt-clean, and a repo-wide format pulls them all into
-  the diff. Use `gofmt -w <file>`.
-- **A tripwire that pins a defect must still compile.** The pre-change harness
-  referenced a method the change deletes, so "going red" would have been a
-  build failure taking the whole package with it. Tripwires belong as
-  compiled-but-skipped tests, and their inverted forms become the acceptance
-  suite.
-- **The v1 fixtures in `pkg/auth` were wrong.** They used JSON, but the v1 wire
-  format is `uid@name[@role]`. The old migration Lua hid it by treating
-  anything without a v2/v3 prefix as v1. Production corroborates the real
-  format: observe parsed all 53 v1 records in the test environment with
-  `decodeLegacy`.
-- **A losing racer on `AdvanceRolloutControl` surfaces two different errors.**
-  It reaches the CAS if it read before the winner's write, and the optimistic
-  pre-check if it read after. A multi-replica reconciler must treat both as
-  benign or it will alert on itself.
-- **"Conservative" is not the same as "stricter".** Falling back to `expand`
-  when the floor is unreadable reads as cautious and is a fail-open, because
-  `expand` stops consulting legacy deny markers.
+## Process notes
 
-## Not done / still open
-
-- The reconciler ships with `AUTO_ADVANCE` off. The bootstrap rule requires it:
-  the registry cannot see pre-registry replicas, so the release that introduces
-  it must not act on its own view during its own upgrade.
-- `ErrWriterLeaseLost` joins the existing internal-error path at the handlers.
-  Whether it deserves a dedicated i18n code is an open product question.
-- The per-UID cap still collides with clients that re-login without reusing a
-  session; 管理台账号 held 64 sessions in the test environment. Separate task,
-  and a prerequisite for taking production past `bounded`.
+- Use `gofmt -w <specific files>`; repository-wide gofmt pulls unrelated legacy formatting into the
+  diff.
+- Keep RED and GREEN checkpoints distinct. A new test must execute and fail for the intended safety
+  gap before production code changes.
+- Report package/race/integration/E2E evidence separately; local Redis-only tests do not prove MySQL
+  transaction or full login/revocation behavior.

@@ -28,6 +28,7 @@ func seedDestroyTestUser(t *testing.T, u *User, password string) {
 		Status:   1,
 	})
 	assert.NoError(t, err)
+	assert.NoError(t, u.loginGuard.Reset("destroy:"+testutil.UID), "shared Redis must not carry destroy-confirmation failures across test cases or package runs")
 }
 
 func TestDestroyApply_OK(t *testing.T) {

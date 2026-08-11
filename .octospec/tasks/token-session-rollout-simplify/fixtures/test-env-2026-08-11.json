@@ -4,9 +4,9 @@
     "on 2026-08-11, after the operator run that advanced the floor to revoke.",
     "",
     "This is the upgrade-compatibility fixture: the new artifact MUST boot against",
-    "a deployment in exactly this state, adopt the existing Redis floor, and stamp",
-    "the MySQL rollout_initialized_at marker WITHOUT requiring any Redis key to be",
-    "deleted or hand-edited, and WITHOUT logging anyone out.",
+    "a deployment in exactly this state, adopt the existing Redis floor and cap into",
+    "the MySQL rollout singleton plus takeover audit WITHOUT requiring any Redis key",
+    "to be deleted or hand-edited, and WITHOUT logging anyone out.",
     "",
     "Captured now on purpose: by the time the change is implemented this floor may",
     "have moved, and the record would have to be reconstructed from memory."
@@ -27,7 +27,7 @@
     "observation_min_gap_ms": 3600000
   },
   "configmap_env": {
-    "_comment": "<configmap>. All three keys are removed by the redesign.",
+    "_comment": "<configmap>. MODE/MAX are one-time takeover inputs; REQUIRED_FLOOR is removed.",
     "OCTO_AUTH_SESSION_MODE": "revoke",
     "OCTO_AUTH_SESSION_MAX_PER_UID": "20",
     "OCTO_AUTH_SESSION_REQUIRED_FLOOR": null

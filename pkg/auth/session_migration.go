@@ -185,17 +185,22 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 	}
 	result.CampaignID = campaign.CampaignID
 	if options.Apply {
-		control, err := s.RolloutControl(ctx)
-		if err != nil {
-			return result, err
+		if s.currentMode().rank() < SessionModeRevoke.rank() {
+			return result, errors.New("auth: migration apply requires MySQL rollout floor revoke or later")
 		}
-		if control == nil || control.ModeFloor.rank() < SessionModeRevoke.rank() {
-			return result, errors.New("auth: migration apply requires persisted revoke rollout floor")
-		}
+	}
+	scanLease, err := s.acquireRolloutScanLease(ctx, options.Lease)
+	if err != nil {
+		return result, err
+	}
+	defer scanLease.Release()
+	scanner, err := newInstanceBoundScanner(s)
+	if err != nil {
+		return result, fmt.Errorf("auth: identify migration Redis instance: %w", err)
 	}
 
 	owner := ""
-	redisInstanceID := ""
+	redisInstanceID := scanner.InstanceID()
 	var lockErrors <-chan error
 	if options.Apply {
 		if err := s.ensureMigrationCampaign(campaign); err != nil {
@@ -218,10 +223,6 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
 		defer stopKeepalive()
 		lockErrors = s.keepMigrationLockAlive(keepaliveCtx, owner, options.Lease)
-		redisInstanceID, err = s.currentRedisInstanceID()
-		if err != nil {
-			return result, fmt.Errorf("auth: identify migration Redis instance: %w", err)
-		}
 		checkpoint, loadErr := s.loadMigrationCheckpoint(campaign.CampaignID)
 		if loadErr != nil {
 			return result, loadErr
@@ -231,7 +232,7 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			result.Complete = false
 			result.LockLost = false
 			if checkpoint.RedisInstanceID != redisInstanceID {
-				result.LastCursor = 0
+				result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
 			}
 		}
 	}
@@ -248,6 +249,9 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+		if err := scanLease.Err(); err != nil {
+			return result, err
+		}
 		if options.Apply {
 			if err := migrationLockError(lockErrors); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
@@ -257,25 +261,33 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
 			}
-			currentRedisInstanceID, err := s.currentRedisInstanceID()
-			if err != nil {
-				return result, fmt.Errorf("auth: identify migration Redis instance before scan: %w", err)
+		}
+		keys, next, restarted, err := scanner.Scan(ctx, cursor, s.tokenPrefix+"*", options.BatchSize)
+		if err != nil {
+			return result, fmt.Errorf("auth: migration scan: %w", err)
+		}
+		if restarted {
+			redisInstanceID = scanner.InstanceID()
+			cursor = 0
+			result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
 			}
-			if currentRedisInstanceID != redisInstanceID {
-				redisInstanceID = currentRedisInstanceID
-				cursor = 0
-				result.LastCursor = 0
+			if options.Apply {
 				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
 					return result, err
 				}
+				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
+					return result, err
+				}
 			}
-		}
-		keys, next, err := s.client.Scan(cursor, s.tokenPrefix+"*", options.BatchSize).Result()
-		if err != nil {
-			return result, fmt.Errorf("auth: migration scan: %w", err)
+			continue
 		}
 		for _, key := range keys {
+			if err := scanLease.Err(); err != nil {
+				return result, err
+			}
 			if options.Apply {
 				if err := migrationLockError(lockErrors); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
@@ -299,17 +311,18 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				return result, err
 			}
 		}
-		cursor = next
-		result.LastCursor = cursor
-		if options.Apply {
-			currentRedisInstanceID, err := s.currentRedisInstanceID()
-			if err != nil {
-				return result, fmt.Errorf("auth: identify migration Redis instance after scan: %w", err)
+		restarted, err = scanner.Check(ctx)
+		if err != nil {
+			return result, fmt.Errorf("auth: identify Redis instance after migration batch: %w", err)
+		}
+		if restarted {
+			redisInstanceID = scanner.InstanceID()
+			cursor = 0
+			result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
 			}
-			if currentRedisInstanceID != redisInstanceID {
-				redisInstanceID = currentRedisInstanceID
-				cursor = 0
-				result.LastCursor = 0
+			if options.Apply {
 				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
 					return result, err
@@ -317,8 +330,15 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
 					return result, err
 				}
-				continue
 			}
+			continue
+		}
+		if err := scanLease.Confirm(); err != nil {
+			return result, err
+		}
+		cursor = next
+		result.LastCursor = cursor
+		if options.Apply {
 			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
@@ -328,14 +348,17 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			}
 		}
 		if cursor == 0 {
-			if options.Apply {
-				currentRedisInstanceID, err := s.currentRedisInstanceID()
-				if err != nil {
-					return result, fmt.Errorf("auth: identify migration Redis instance before completion: %w", err)
+			restarted, err = scanner.Check(ctx)
+			if err != nil {
+				return result, fmt.Errorf("auth: identify Redis instance before migration completion: %w", err)
+			}
+			if restarted {
+				redisInstanceID = scanner.InstanceID()
+				result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+				if err := scanLease.Confirm(); err != nil {
+					return result, err
 				}
-				if currentRedisInstanceID != redisInstanceID {
-					redisInstanceID = currentRedisInstanceID
-					result.LastCursor = 0
+				if options.Apply {
 					if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 						result.LockLost = errors.Is(err, ErrMigrationLockLost)
 						return result, err
@@ -343,7 +366,16 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 					if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
 						return result, err
 					}
-					continue
+				}
+				continue
+			}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
+			}
+			if options.Apply {
+				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
 				}
 			}
 			result.Complete = true

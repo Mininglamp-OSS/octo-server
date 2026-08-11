@@ -45,6 +45,9 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	resetManagerUIDRateLimit(t, ctx)
 	m := NewManager(ctx)
+	stopRollout, err := startSessionRolloutForTest(ctx, "manager-route-test")
+	require.NoError(t, err)
+	t.Cleanup(stopRollout)
 	m.Route(route)
 	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
 	return route, ctx, m

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,7 +83,7 @@ func TestSessionRolloutAdvanceRequiresBothForceAndYes(t *testing.T) {
 			var out bytes.Buffer
 			// A nil store and nil markers are safe: refusal happens before
 			// either is touched, which is the property being pinned.
-			err := sessionRolloutAdvance(ctx, nil, nil, &out, sessionRolloutAdvanceArgs{
+			err := sessionRolloutAdvance(ctx, nil, nil, auth.RolloutState{}, &out, sessionRolloutAdvanceArgs{
 				force: tc.force, yes: tc.yes, batchSize: 200, scanInterval: 10 * time.Millisecond,
 			})
 			require.ErrorContains(t, err, "advance is the reconciler's job")
