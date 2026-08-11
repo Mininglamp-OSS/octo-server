@@ -847,6 +847,7 @@ type GroupResp struct {
 	IsNamed                  int       `json:"is_named"`                    // 1=改版前老群(默认渲染群名文字)/0=新群(默认双人图标)；由 #500 迁移回填，新群恒为 0；客户端可据此本地预判默认头像取群名文字 vs 双人图标
 	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor              *int      `json:"avatar_color"`                // 自定义群头像色板下标（null=按 group_no 派生）
+	IsUploadAvatar           int       `json:"is_upload_avatar"`            // 1=当前群头像使用上传图片；0=使用文字/颜色/默认合成头像
 	Remark                   string    `json:"remark"`                      // 群备注
 	Notice                   string    `json:"notice"`                      // 群公告
 	Mute                     int       `json:"mute"`                        // 免打扰
@@ -894,6 +895,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
+		IsUploadAvatar:           model.IsUploadAvatar,
 		Notice:                   model.Notice,
 		Mute:                     model.Mute,
 		Top:                      model.Top,
@@ -939,6 +941,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
+		IsUploadAvatar:           model.IsUploadAvatar,
 		Notice:                   model.Notice,
 		Forbidden:                model.Forbidden,
 		Invite:                   model.Invite,

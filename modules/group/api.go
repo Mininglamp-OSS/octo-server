@@ -1168,8 +1168,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	}
 	// 群存在性 + 状态检查（不缓存整行：下方 invite 分支改用列级写，避免用旧快照全列回写
 	// 覆盖掉 name 分支刚提交的 name/is_named，见 DB.UpdateInviteTx 注释）。
-	groupInfo, err := g.getGroupInfo(groupNo)
-	if err != nil {
+	if _, err := g.getGroupInfo(groupNo); err != nil {
 		respondGroupInfoError(c, err)
 		return
 	}

@@ -13,15 +13,23 @@ func intPtr(v int) *int { return &v }
 // TestGroupRespExposesAvatarFields 回归 Fix4:GroupResp 暴露 avatar_text/avatar_color,
 // 客户端 reload 后能读回已存的自定义值。
 func TestGroupRespExposesAvatarFields(t *testing.T) {
-	resp := (&GroupResp{}).fromModel(&Model{GroupNo: "g1", Name: "n", AvatarText: "研发", AvatarColor: intPtr(3)})
+	resp := (&GroupResp{}).fromModel(&Model{
+		GroupNo:        "g1",
+		Name:           "n",
+		IsUploadAvatar: 1,
+		AvatarText:     "研发",
+		AvatarColor:    intPtr(3),
+	})
 	require.Equal(t, "研发", resp.AvatarText)
 	require.NotNil(t, resp.AvatarColor)
 	require.Equal(t, 3, *resp.AvatarColor)
+	require.Equal(t, 1, resp.IsUploadAvatar)
 
 	// 未自定义 → 空串 / nil。
 	plain := (&GroupResp{}).fromModel(&Model{GroupNo: "g2", Name: "n"})
 	require.Equal(t, "", plain.AvatarText)
 	require.Nil(t, plain.AvatarColor)
+	require.Equal(t, 0, plain.IsUploadAvatar)
 }
 
 // TestGroupReqCheckAvatar 覆盖二次弹窗自定义头像参数的纯校验：avatar_text 去不可见
