@@ -4,6 +4,16 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-12 (login-audit-ip-spoofing)
+
+- **Fix** — Task `login-audit-ip-spoofing`: login, account-creation, logout, and
+  OIDC audit/guard paths now use the same validated proxy-aware client-IP source
+  as shared rate limiting. The stacked server change covers all 15 user and four
+  OIDC sources, preserves the audit/wire/quota contracts, and depends on approved
+  octo-lib PR #119. The final library squash SHA and production CLB/direct-access
+  checks remain merge and rollout gates. See
+  [journal](journal/shared/login-audit-ip-spoofing.md).
+
 ## 2026-08-10 (token-lifecycle-hardening PR 2)
 
 - **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,
