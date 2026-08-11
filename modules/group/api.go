@@ -1211,7 +1211,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 			return
 		}
-		if clearUploadedAvatar && groupInfo.IsUploadAvatar == 1 {
+		if clearUploadedAvatar {
 			isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
 			if err != nil {
 				g.Error("查询群创建者失败！", zap.Error(err))
