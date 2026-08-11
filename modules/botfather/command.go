@@ -3,6 +3,7 @@ package botfather
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -799,7 +800,8 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 // ========== 辅助方法 ==========
 
 // createBotCoreWithRetry 生成 Bot ID 并创建 App + robot + user，碰撞时自动重试。
-// 返回 (robotID, error)。
+// 非碰撞错误会返回本次生成的 robotID，供调用方补偿 commit 结果不确定的
+// App/robot/user；碰撞重试耗尽时不返回 ID，避免误删已有 Bot。
 func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken string) (string, error) {
 	const maxRetries = 3
 	var robotID string
@@ -818,14 +820,27 @@ func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken strin
 				zap.String("robotID", robotID), zap.Int("attempt", attempt+1))
 			continue
 		}
-		return "", lastErr
+		return robotID, lastErr
 	}
 	return "", lastErr
 }
 
 func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken string) (retErr error) {
+	// The payload/channel Space ID is only a selector. Resolve it against
+	// authoritative active user, Space, and membership rows before creating any
+	// durable Bot artifact. A missing selector is accepted only when the server
+	// can derive exactly one active creator Space.
+	targetSpaceID, err := h.db.resolveAuthorizedCreationSpace(creatorUID, h.resolveSpaceID(fromUID))
+	if err != nil {
+		reason := "space_authorization_lookup_failed"
+		if errors.Is(err, errCreateBotSpaceDenied) {
+			reason = "space_authorization_denied"
+		}
+		h.Warn("Bot Space授权失败", zap.String("reason", reason))
+		return errCreateBotSpaceBindingFailed
+	}
+
 	var robotID string
-	var err error
 	if username == "" {
 		robotID, err = h.createBotCoreWithRetry(creatorUID, name, botToken)
 	} else {
@@ -833,32 +848,37 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 		robotID = username
 	}
 	if err != nil {
-		return err
+		// Conversational creation always uses a server-generated ID, so it is
+		// safe to compensate even when the core transaction's Commit result was
+		// ambiguous. Explicit usernames are used only by non-conversational
+		// callers and are intentionally not cleaned here.
+		if username == "" && robotID != "" {
+			if cleanupErr := h.db.deleteCreatedBotArtifacts(robotID); cleanupErr != nil {
+				h.Error("Bot核心创建补偿失败",
+					zap.String("reason", "core_creation_cleanup_failed"))
+			}
+		}
+		return errCreateBotPersistenceFailed
 	}
 
-	// 后续步骤：加入 Space、好友关系等
-	targetSpaceID := h.resolveSpaceID(fromUID)
-	if targetSpaceID == "" {
-		// 无 Space 信息（legacy），回退到创建者的第一个 Space
-		h.Warn("createBot: no space_id from client, falling back to creator's first Space",
-			zap.String("fromUID", fromUID), zap.String("creatorUID", creatorUID))
-		creatorSpaces, err := h.getCreatorSpaceIDs(creatorUID)
-		if err != nil {
-			h.Warn("查询创建者Space失败", zap.Error(err))
+	// Re-check under row locks and write the Bot membership in the same
+	// transaction. This is the authorization linearization point: a concurrent
+	// disable/removal that commits first is observed and denied; one that waits
+	// for these locks occurs after a valid binding commit.
+	if err = h.db.bindCreatedBotToSpace(creatorUID, robotID, targetSpaceID); err != nil {
+		reason := "space_binding_persistence_failed"
+		if errors.Is(err, errCreateBotSpaceDenied) {
+			reason = "space_authorization_changed"
 		}
-		if len(creatorSpaces) > 0 {
-			targetSpaceID = creatorSpaces[0]
+		h.Warn("Bot Space绑定失败", zap.String("reason", reason))
+		cleanupErr := h.db.deleteCreatedBotArtifacts(robotID)
+		if cleanupErr != nil {
+			h.Error("Bot创建补偿失败",
+				zap.String("reason", "space_binding_cleanup_failed"))
 		}
+		return errCreateBotSpaceBindingFailed
 	}
-	if targetSpaceID != "" {
-		_, err = h.ctx.DB().InsertBySql(
-			"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
-			targetSpaceID, robotID,
-		).Exec()
-		if err != nil {
-			h.Warn("Bot加入Space失败", zap.Error(err), zap.String("space_id", targetSpaceID))
-		}
-	}
+
 	// 兼容：仍添加好友关系（过渡期）
 	err = h.userService.AddFriend(creatorUID, &user.FriendReq{
 		UID:   creatorUID,
@@ -1051,15 +1071,6 @@ func (h *commandHandler) resolveSpaceID(fromUID string) string {
 }
 
 // fixFriendVersion 修复好友 version=0 的问题（WKSDK 增量同步需要 version > 0）
-// getCreatorSpaceIDs returns all active Space IDs the creator belongs to
-func (h *commandHandler) getCreatorSpaceIDs(uid string) ([]string, error) {
-	var ids []string
-	_, err := h.db.session.SelectBySql(
-		"SELECT space_id FROM space_member WHERE uid=? AND status=1", uid,
-	).Load(&ids)
-	return ids, err
-}
-
 func (h *commandHandler) fixFriendVersion(uid, toUID string) {
 	var maxVer int64
 	err := h.db.session.SelectBySql("SELECT IFNULL(MAX(version),0) FROM friend WHERE uid=?", uid).LoadOne(&maxVer)

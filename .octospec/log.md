@@ -4,6 +4,19 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-12 (botfather-space-binding-hardening)
+
+- **Task** — `botfather-space-binding-hardening`: made the server authoritative
+  for conversational Bot-to-Space binding. Payload/channel Space IDs are now
+  selectors only; active creator, Space, and membership are checked fail-closed
+  before creation and again under row locks in the membership transaction.
+  Missing selectors require exactly one active creator Space. Binding or core
+  persistence failures compensate created artifacts and revoke credentials,
+  while external failures remain generic and logs remain identifier-free.
+  MySQL-backed regression, end-to-end Space-isolation, race, coverage, vet,
+  lint, i18n, cleanup, and redaction checks passed. See
+  [journal](journal/shared/botfather-space-binding-hardening.md).
+
 ## 2026-08-10 (token-lifecycle-hardening PR 2)
 
 - **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,
