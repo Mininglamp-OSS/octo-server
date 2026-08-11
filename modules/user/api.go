@@ -2093,10 +2093,14 @@ func (u *User) finishSuccessfulLogin(uid, account, publicIP, loginType string) {
 // 本函数不再自己查询，避免读到刚写入的本次登录。
 func (u *User) sentWelcomeMsg(publicIP, uid string, prevLogin *loginLogResp) {
 	appconfig, err := u.commonService.GetAppConfig()
-	if err != nil {
+	if err != nil || appconfig == nil {
+		// 必须 return：本函数只以 `go u.sentWelcomeMsg(...)` 调用，裸 goroutine 里的
+		// panic 逃不出 gin 的 recovery，会带走整个进程而不是单个请求。GetAppConfig
+		// 查询失败时返回 (nil, err)，只打日志不返回就会在下一行解引用空指针 ——
+		// 数据库抖动期间每次成功登录都触发一次，正好在数据库已经不健康时把服务打成
+		// 崩溃循环。配置读不出来就跳过欢迎语是正确的降级：审计行由调用方 goroutine 上
+		// 的 recordSuccess 写，不依赖这里。
 		u.Error("获取应用配置错误", zap.Error(err))
-	}
-	if appconfig.SendWelcomeMessageOn == 0 {
 		return
 	}
 	// 等待用户数据持久化完成（该函数在 goroutine 中调用）
@@ -2106,7 +2110,7 @@ func (u *User) sentWelcomeMsg(publicIP, uid string, prevLogin *loginLogResp) {
 	content := u.ctx.GetConfig().WelcomeMessage
 	var sentContent string
 
-	if appconfig != nil && appconfig.WelcomeMessage != "" {
+	if appconfig.WelcomeMessage != "" {
 		content = appconfig.WelcomeMessage
 	}
 	if lastLoginLog != nil {
