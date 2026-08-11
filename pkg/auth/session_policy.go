@@ -8,16 +8,36 @@ import (
 )
 
 const (
-	sessionModeEnv          = "OCTO_AUTH_SESSION_MODE"
-	sessionMaxPerUIDEnv     = "OCTO_AUTH_SESSION_MAX_PER_UID"
+	// sessionModeEnv and sessionMaxPerUIDEnv are DEPRECATED. The rollout mode is
+	// derived from the persisted floor; the cap lives in the floor record. Both
+	// are still read for one release so an upgrade from #725 cannot silently
+	// loosen a deployment that is mid-canary (see ResolveRolloutBoot).
+	sessionModeEnv      = "OCTO_AUTH_SESSION_MODE"
+	sessionMaxPerUIDEnv = "OCTO_AUTH_SESSION_MAX_PER_UID"
+	// sessionRequiredFloorEnv is REMOVED. The floor is its own authority; having
+	// the environment restate it was the second half of the pairing that made a
+	// lost Redis key fatal.
 	sessionRequiredFloorEnv = "OCTO_AUTH_SESSION_REQUIRED_FLOOR"
+
+	// sessionCanaryAheadEnv is the only remaining mode knob: run this replica one
+	// phase above the floor. It replaces "deploy a higher MODE to a subset",
+	// which is the same thing minus the ordering trap.
+	sessionCanaryAheadEnv = "OCTO_AUTH_SESSION_CANARY_AHEAD"
+	// sessionExpectWritersEnv is the replica count the deployment intends to run.
+	// It is information the deployer already has and the process does not, not a
+	// judgement call. Only consulted when first establishing a v3 floor over a
+	// non-empty keyspace, and removable afterwards.
+	sessionExpectWritersEnv = "OCTO_AUTH_SESSION_EXPECT_WRITERS"
+	// sessionAutoAdvanceEnv is the deployment-side initial value for the
+	// reconciler. The runtime pause flag wins over it, and the more conservative
+	// of the two applies.
+	sessionAutoAdvanceEnv = "OCTO_AUTH_SESSION_AUTO_ADVANCE"
 
 	sessionMaxPerUIDLimit = 10_000
 )
 
-// SessionMode is the monotonic deployment phase for user HTTP sessions.
-// Its zero value is deliberately invalid; runtime configuration defaults to
-// expand only when the environment variable is absent.
+// SessionMode is the deployment phase for user HTTP sessions. Its zero value is
+// deliberately invalid.
 type SessionMode string
 
 const (
@@ -29,48 +49,89 @@ const (
 )
 
 type sessionPolicy struct {
-	mode          SessionMode
-	maxPerUID     int
-	requiredFloor SessionMode
+	legacyMode      SessionMode
+	legacyMaxPerUID int
+	canaryAhead     bool
+	expectWriters   int
+	autoAdvance     bool
+	// warnings are operator-facing configuration notes. They are logged, never
+	// fatal: taking a deployment down over a stale environment variable is the
+	// failure class this change exists to remove.
+	warnings []string
 }
 
-func sessionPolicyFromEnv() (sessionPolicy, error) {
-	mode := SessionModeExpand
+func sessionPolicyFromEnv() sessionPolicy {
+	policy := sessionPolicy{}
+
 	if raw, ok := os.LookupEnv(sessionModeEnv); ok {
 		value := strings.TrimSpace(raw)
-		mode = SessionMode(value)
-		if !mode.valid() {
-			return sessionPolicy{}, fmt.Errorf("invalid %s %q", sessionModeEnv, value)
+		mode := SessionMode(value)
+		switch {
+		case mode.valid():
+			policy.legacyMode = mode
+			policy.warnings = append(policy.warnings, fmt.Sprintf(
+				"%s is deprecated; the rollout mode is derived from the persisted floor. "+
+					"It is honoured for this release so an upgrade cannot loosen a mid-canary deployment. "+
+					"Remove it once the floor has caught up, or use %s=1 for a canary replica.",
+				sessionModeEnv, sessionCanaryAheadEnv))
+		default:
+			policy.warnings = append(policy.warnings, fmt.Sprintf(
+				"ignoring unparseable %s=%q; the rollout mode is derived from the persisted floor",
+				sessionModeEnv, value))
 		}
 	}
 
-	maxPerUID := 0
 	if raw, ok := os.LookupEnv(sessionMaxPerUIDEnv); ok {
 		value := strings.TrimSpace(raw)
 		parsed, err := strconv.ParseInt(value, 10, 32)
-		if err != nil || parsed <= 0 {
-			return sessionPolicy{}, fmt.Errorf("%s must be a positive integer", sessionMaxPerUIDEnv)
+		switch {
+		case err == nil && parsed > 0 && parsed <= sessionMaxPerUIDLimit:
+			policy.legacyMaxPerUID = int(parsed)
+			policy.warnings = append(policy.warnings, fmt.Sprintf(
+				"%s is deprecated; the cap is carried in the rollout floor record. "+
+					"It is copied across once and can then be removed.", sessionMaxPerUIDEnv))
+		default:
+			policy.warnings = append(policy.warnings, fmt.Sprintf(
+				"ignoring out-of-range %s=%q (want 1..%d)", sessionMaxPerUIDEnv, value, sessionMaxPerUIDLimit))
 		}
-		if parsed > sessionMaxPerUIDLimit {
-			return sessionPolicy{}, fmt.Errorf("%s must not exceed %d", sessionMaxPerUIDEnv, sessionMaxPerUIDLimit)
-		}
-		maxPerUID = int(parsed)
 	}
-	if mode.writesV3() && maxPerUID == 0 {
-		return sessionPolicy{}, fmt.Errorf("%s must be explicitly configured when %s=%s", sessionMaxPerUIDEnv, sessionModeEnv, mode)
+
+	if _, ok := os.LookupEnv(sessionRequiredFloorEnv); ok {
+		policy.warnings = append(policy.warnings, fmt.Sprintf(
+			"%s has no effect and can be deleted; the persisted floor is its own authority",
+			sessionRequiredFloorEnv))
 	}
-	var requiredFloor SessionMode
-	if raw, ok := os.LookupEnv(sessionRequiredFloorEnv); ok {
+
+	policy.canaryAhead = envFlag(sessionCanaryAheadEnv, false)
+	policy.autoAdvance = envFlag(sessionAutoAdvanceEnv, false)
+
+	if raw, ok := os.LookupEnv(sessionExpectWritersEnv); ok {
 		value := strings.TrimSpace(raw)
-		requiredFloor = SessionMode(value)
-		if !requiredFloor.valid() {
-			return sessionPolicy{}, fmt.Errorf("invalid %s %q", sessionRequiredFloorEnv, value)
-		}
-		if mode.rank() < requiredFloor.rank() {
-			return sessionPolicy{}, fmt.Errorf("%s=%s is below %s=%s", sessionModeEnv, mode, sessionRequiredFloorEnv, requiredFloor)
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || parsed <= 0 {
+			policy.warnings = append(policy.warnings, fmt.Sprintf(
+				"ignoring unparseable %s=%q; the first v3 floor over a non-empty keyspace will stay blocked",
+				sessionExpectWritersEnv, value))
+		} else {
+			policy.expectWriters = int(parsed)
 		}
 	}
-	return sessionPolicy{mode: mode, maxPerUID: maxPerUID, requiredFloor: requiredFloor}, nil
+	return policy
+}
+
+func envFlag(name string, fallback bool) bool {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off", "":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func (m SessionMode) valid() bool {
@@ -116,5 +177,21 @@ func (m SessionMode) rank() int {
 		return 5
 	default:
 		return 0
+	}
+}
+
+// next returns the phase one step above m, or m itself at the top.
+func (m SessionMode) next() SessionMode {
+	switch m {
+	case SessionModeExpand:
+		return SessionModeV3Write
+	case SessionModeV3Write:
+		return SessionModeRevoke
+	case SessionModeRevoke:
+		return SessionModeBounded
+	case SessionModeBounded:
+		return SessionModeEnforce
+	default:
+		return SessionModeEnforce
 	}
 }

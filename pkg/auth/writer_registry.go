@@ -1,0 +1,224 @@
+package auth
+
+// Writer registry: a write LEASE, not a status report.
+//
+// The distinction decides whether this can gate anything. A registry can only
+// enumerate participants, and the dangerous process is the one that does not
+// participate — so "absent from the registry" cannot prove "not running".
+// Inverting the causality fixes that: a process may only create tokens while it
+// holds a live lease, which makes "absent from the registry" prove "not
+// writing", and that is the property the gate actually needs.
+//
+// Losing the lease therefore refuses new token creation. It does NOT fail
+// readiness: Redis being unreachable is a fleet-wide event, so draining every
+// replica at once would turn an authentication degradation into a total outage,
+// and readiness contributes nothing to the gate, which only asks whether
+// registrations exist. It also does not panic — a startup panic on missing
+// Redis state is the defect this whole change exists to remove.
+//
+// Deliberately free of auth types so it can be lifted into a shared package
+// later: applied state is an opaque string and the caller supplies the
+// comparison, the key prefix is passed in, and nothing here imports a
+// SessionMode. #627 and #697 both stall on the same unanswered question —
+// "has every pre-fix replica gone?" — and both currently push it to a human.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	rd "github.com/go-redis/redis"
+)
+
+const (
+	// writerLeaseTTL bounds how long a dead process stays visible. Liveness is
+	// Redis's own key expiry, so no timestamp is written and cross-pod clock
+	// skew cannot poison the gate — unlike the migration Lua, which is handed a
+	// client clock.
+	writerLeaseTTL = 30 * time.Second
+	// writerHeartbeatInterval leaves room for five consecutive failures.
+	writerHeartbeatInterval = 5 * time.Second
+)
+
+// ErrWriterLeaseLost is returned when this process may not create credentials
+// because its write lease has expired. It is a degradation, not a crash: the
+// caller surfaces the existing unauthenticated envelope and existing sessions
+// keep working.
+var ErrWriterLeaseLost = errors.New("auth: writer lease lost; refusing to create a new session")
+
+// WriterEntry is one live participant. It carries nothing that could identify a
+// user: build, pod name and applied state only.
+type WriterEntry struct {
+	ID           string `json:"id"`
+	Build        string `json:"build"`
+	AppliedState string `json:"applied_state"`
+	Pod          string `json:"pod,omitempty"`
+	StartedAtMS  int64  `json:"started_at_unix_ms"`
+}
+
+// WriterRegistry tracks which processes currently hold a write lease.
+type WriterRegistry struct {
+	client    *rd.Client
+	rosterKey string
+	entryKey  func(id string) string
+
+	mu      sync.RWMutex
+	self    WriterEntry
+	leaseOK bool
+}
+
+// NewWriterRegistry builds a registry under the given key prefix. The prefix is
+// supplied rather than derived so the type stays independent of auth config.
+func NewWriterRegistry(client *rd.Client, keyPrefix string) *WriterRegistry {
+	if client == nil {
+		panic("auth: NewWriterRegistry requires a non-nil redis client")
+	}
+	return &WriterRegistry{
+		client:    client,
+		rosterKey: keyPrefix + "writers",
+		entryKey:  func(id string) string { return keyPrefix + "writer:" + id },
+	}
+}
+
+// Join registers this process and starts refreshing its lease until ctx ends.
+// The identity is a fresh random value per process incarnation, not the pod UID:
+// private deployments are not always Kubernetes, and an in-place container
+// restart keeps its pod UID, so keying on it would let a new process silently
+// overwrite the old entry and hide the restart. The pod name rides along as a
+// label so a crash-looping pod shows up as several live registrations rather
+// than as confusion.
+func (r *WriterRegistry) Join(ctx context.Context, build, pod, appliedState string, now func() time.Time) error {
+	id, err := newSessionGeneration()
+	if err != nil {
+		return fmt.Errorf("auth: create writer registry identity: %w", err)
+	}
+	if now == nil {
+		now = time.Now
+	}
+	r.mu.Lock()
+	r.self = WriterEntry{
+		ID:           id,
+		Build:        build,
+		AppliedState: appliedState,
+		Pod:          pod,
+		StartedAtMS:  now().UTC().UnixMilli(),
+	}
+	r.mu.Unlock()
+
+	if err := r.refresh(); err != nil {
+		return err
+	}
+	go r.heartbeat(ctx)
+	return nil
+}
+
+// SetAppliedState records that this process has applied a new rollout state.
+// The gate reads it to prove the fleet has converged before advancing.
+func (r *WriterRegistry) SetAppliedState(state string) {
+	r.mu.Lock()
+	r.self.AppliedState = state
+	r.mu.Unlock()
+	_ = r.refresh()
+}
+
+// MayWrite reports whether this process still holds its lease. A writer without
+// one must refuse to create new tokens, or "absent from the registry" stops
+// meaning "not writing" and the gate becomes fail-open.
+func (r *WriterRegistry) MayWrite() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.leaseOK
+}
+
+func (r *WriterRegistry) heartbeat(ctx context.Context) {
+	ticker := time.NewTicker(writerHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			entry := r.self
+			r.leaseOK = false
+			r.mu.Unlock()
+			// Best effort: drop out of the roster promptly on a clean shutdown
+			// so a rolling update does not have to wait out the lease.
+			_ = r.client.Del(r.entryKey(entry.ID)).Err()
+			_ = r.client.SRem(r.rosterKey, entry.ID).Err()
+			return
+		case <-ticker.C:
+			_ = r.refresh()
+		}
+	}
+}
+
+func (r *WriterRegistry) refresh() error {
+	r.mu.RLock()
+	entry := r.self
+	r.mu.RUnlock()
+	if entry.ID == "" {
+		return errors.New("auth: writer registry has not joined")
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("auth: encode writer registry entry: %w", err)
+	}
+	err = r.client.Set(r.entryKey(entry.ID), string(encoded), writerLeaseTTL).Err()
+	if err == nil {
+		err = r.client.SAdd(r.rosterKey, entry.ID).Err()
+	}
+	r.mu.Lock()
+	r.leaseOK = err == nil
+	r.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("auth: refresh writer lease: %w", err)
+	}
+	return nil
+}
+
+// Live enumerates writers whose lease has not expired, and prunes roster
+// members whose entry is gone.
+//
+// SMEMBERS + MGET rather than SCAN: the runbook's Redis preflight already flags
+// proxies with incomplete cursor semantics, and there is no reason to take that
+// dependency for a set this small. Liveness comes from each entry key's own TTL,
+// so Redis's clock is the only clock involved.
+func (r *WriterRegistry) Live() ([]WriterEntry, error) {
+	ids, err := r.client.SMembers(r.rosterKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("auth: read writer roster: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, r.entryKey(id))
+	}
+	values, err := r.client.MGet(keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("auth: read writer entries: %w", err)
+	}
+	live := make([]WriterEntry, 0, len(values))
+	stale := make([]interface{}, 0)
+	for i, value := range values {
+		raw, ok := value.(string)
+		if !ok || strings.TrimSpace(raw) == "" {
+			stale = append(stale, ids[i])
+			continue
+		}
+		var entry WriterEntry
+		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+			stale = append(stale, ids[i])
+			continue
+		}
+		live = append(live, entry)
+	}
+	if len(stale) > 0 {
+		_ = r.client.SRem(r.rosterKey, stale...).Err()
+	}
+	return live, nil
+}

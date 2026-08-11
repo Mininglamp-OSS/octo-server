@@ -1,340 +1,224 @@
 # Token session v3 rollout runbook
 
-本 runbook 只描述 PR 2 的受控启用。合并或以默认 `expand` 部署不会关闭历史 Token 漏洞；
-只有完成 migration、两次完整观察、`enforce` 灰度和安全复测后才能关闭漏洞。
+这份 runbook 取代了 #725 的九步阶梯。旧流程要求 9 次滚动重启、11 次 CLI 调用、
+两段各 ≥1h 的观察窗，以及一次对零存量环境也必须执行的空迁移——**而那整套仪式唯一的保护
+对象是存量 legacy session**。没有存量时它保护不了任何东西。
 
-## 1. 安全边界
+现在 floor 由服务自己推进。**你只需要做一个决定：迁移的 cutoff 和策略，
+也就是愿意让多少人提前重新登录。** 系统会自动走到那个决定面前停下来并说明差什么。
 
-- 运维工具必须使用与目标 API 制品相同的 commit 构建，并读取同一 Redis endpoint、DB、TLS
-  配置和 `tokenCachePrefix` / `uidTokenCachePrefix`。不要用本地 standalone Redis 结果替代生产
-  proxy/Cluster 结论。
-- 所有阶段按环境独立执行。命令中的配置路径、namespace、Deployment 和 selector 必须替换为
-  该环境的真实值。
-- 不得并行运行 migration apply。observe、apply 也应错峰，避免两个独立的两连接池同时给 Redis
-  增压。
-- 不得输出或采集 Token、完整 Redis key、payload、generation、索引成员或 UID。工具的标准输出
-  只保留聚合 JSON；原始 `SCAN` 结果不得进入工单或日志。
-- rollout floor、migration campaign/checkpoint/evidence 和 legacy deny marker 均为无 TTL 安全状态。
-  它们所在 Redis namespace 必须 `noeviction`；本版本没有可替代的 durable ledger。
+---
 
-## 2. 配置清单
+## 1. 它自己会做什么
 
-| 配置 | 约束 |
-| --- | --- |
-| `TS_CACHE_TOKENEXPIRE` | 可缺失；显式配置必须是正数 Go duration，最大 `720h`。空值、`30d`、非正数或超过上限会启动失败。 |
-| `OCTO_AUTH_SESSION_MODE` | 缺失时为 `expand`；合法值依次为 `expand`、`v3-write`、`revoke`、`bounded`、`enforce`。显式空值非法。 |
-| `OCTO_AUTH_SESSION_MAX_PER_UID` | `v3-write` 及之后必须显式配置为 `1..10000`。数值和“满额拒绝新登录”行为须经产品/容量签字。 |
-| `OCTO_AUTH_SESSION_REQUIRED_FLOOR` | floor 建立后必须设置为当前已批准 floor。control key 缺失、损坏或低于该值时实例拒绝启动。 |
-| `OCTO_AUTH_SESSION_REDIS_POOL_SIZE` | 可选；默认 `10 * GOMAXPROCS`，最大通常为 4096。必须按副本数和 `maxSurge` 做连接预算。 |
-| `OCTO_AUTH_SESSION_REDIS_POOL_TIMEOUT` | 可选；默认 `3s`，必须为 `(0,30s]`。 |
+```
+全新部署        部署制品。结束。floor 自动到达 enforce。
+有存量的部署    部署制品 → 自动推进到 v3 后停住，报告 blocked_by: v2=N
+                → 你决定 cutoff 与 finite policy，跑一次 migrate
+                → 到期后自动推进到 enforce
+```
 
-每次部署先检查最终渲染后的 Pod env，特别是 ConfigMap/Secret 中是否存在空字符串。启动日志必须
-包含且符合预期：
+floor 单调不可逆，永远只前进。每次推进前都会写下触发它的证据快照
+（存活 writer 数、build、扫描计数、Redis 实例指纹、时刻），用 `status` 可查。
+
+## 2. 配置
+
+只剩一个必须的开关，其余都可选：
+
+| 配置 | 说明 |
+|---|---|
+| `OCTO_AUTH_SESSION_AUTO_ADVANCE` | `1` 开启自动推进。**首个引入本能力的 release 请保持关闭**，见 §6 |
+| `OCTO_AUTH_SESSION_EXPECT_WRITERS` | 本部署计划运行的副本数。**只在"有存量 token 的环境首次建立 v3 floor"时需要**，推过之后即可删除 |
+| `OCTO_AUTH_SESSION_CANARY_AHEAD` | `1` 让该副本比 floor 高一阶，用于灰度。打在小流量副本上 |
+| `OCTO_AUTH_SESSION_REDIS_POOL_SIZE` / `..._POOL_TIMEOUT` | 同 #725，未变 |
+| `TS_CACHE_TOKENEXPIRE` | 同 #725，未变 |
+
+**已废弃**（读到会告警，不会导致启动失败）：
+
+- `OCTO_AUTH_SESSION_MODE` —— mode 现在由 floor 派生。为兼容保留一个 release：
+  如果它高于 floor（#725 Phase D/E 的灰度姿态就是这样），会被继续尊重，
+  否则升级会把 reader 从 `bounded` 悄悄放松回 `revoke`。floor 追上后即可删除。
+- `OCTO_AUTH_SESSION_MAX_PER_UID` —— cap 已并入 floor 记录，首次启动时抄一次，之后可删。
+- `OCTO_AUTH_SESSION_REQUIRED_FLOOR` —— **已完全失效**，可以直接删。
+
+启动日志包含实际连接的 Redis 与实例指纹：
 
 ```text
-Authentication session runtime: mode=... rollout_floor=... token_ttl=... redis_pool_size=... redis_pool_timeout=... build=...
+Authentication session runtime: mode=... rollout_floor=... boot=... auto_advance=...
+  redis=<addr> instance=<fingerprint> token_ttl=... redis_pool_size=... build=...
 ```
 
-从第一个 `v3-write` floor 建立后，Deployment 配置与 Redis control record 是双重防线：不能只保留
-control key，也不能仅靠环境变量声明 floor。
+`boot=` 有四个取值，对应四种启动情形：`fresh`（全新）、`adopted`（从 #725 接管）、
+`rollback-recovered`（**Redis 丢过 floor**，见 §7）、`normal`。
 
-## 3. 发布前预检
+## 3. 唯一的命令
 
-### 3.1 Redis 命令与持久性
+```bash
+app session-rollout status     # 排查：floor 在哪、谁在跑、卡在什么上
+app session-rollout migrate    # 唯一的决策：cutoff + finite policy
+app session-rollout pause      # 逃生门：秒级停下自动推进
+app session-rollout resume
+```
 
-在生产同型号、同版本、同 TLS/proxy/故障切换路径执行以下检查：
-
-1. 候选 API Pod 以 `expand` 启动并通过真实认证读取脚本的只读 startup probe。它验证
-   `EVALSHA`，脚本未缓存时由客户端回退 `EVAL`；失败会阻止 Pod 服务流量。
-2. 使用受控临时单 key 验证 lease 所需的 `SET NX PX`、`PTTL`、单 key `EVALSHA/EVAL` 续约和
-   compare-delete。临时 key 必须有短 TTL，禁止对共享实例执行 `SCRIPT FLUSH`。
-3. 先在隔离前缀验证 `SCAN` cursor，再以获批的低 QPS 运行生产 observe。proxy 若不支持完整
-   cursor 语义，不得开始 migration。
-4. 验证 migration 使用的账号可执行 `INFO server` 并返回稳定的 `run_id`；在受控主从切换中
-   `run_id` 必须变化。工具只保存其 SHA-256 指纹。若 proxy 禁止、伪造固定值或无法把命令路由到
-   实际执行 SCAN 的 Redis 实例，不得执行 apply，也不得推进 `bounded`。
-5. 通过 `CONFIG GET maxmemory-policy` 或云厂商控制面确认 `noeviction`。若 proxy 禁止 `CONFIG`，
-   由 Redis 平台负责人提供可审计配置证据，不能把“命令被拒绝”当作通过。
-6. 验证主从切换后脚本缓存、lease owner 比较和无 TTL key 均保持预期；startup probe 只证明
-   启动时刻，不证明 failover 路径。
-
-### 3.2 连接数与性能
-
-最坏连接预算至少包含：
+每个子命令执行任何操作**之前**都会先打印它解析到的 Redis 地址和实例指纹：
 
 ```text
-session_pool_size * (stable_replicas + maxSurge)
-+ 2 * concurrent_observe_jobs
-+ 2 * concurrent_migration_jobs
-+ 现有 API/worker/限流/运维客户端峰值
-+ Redis 平台要求的保留余量
+redis: <redis-service>:6379  db=0  instance=9f3e11b4a2c7d081  token_ttl=720h0m0s
 ```
 
-用 `INFO clients` / 平台监控核对 `connected_clients`、`maxclients` 和历史峰值。实际 Pod 的 pool
-size 以启动日志为准；只有 CPU request、没有 CPU limit 时，也要核实容器内 `GOMAXPROCS`，不能
-按 request 值猜默认池大小。
+> 这一行是有来历的。2026-08-11 一次实操把配置键写在了顶层 `redisAddr`（octo-lib 实际读
+> `db.redisAddr`），键未命中导致工具回落到 `127.0.0.1:6379`，扫到本机测试残留并报
+> `complete: true`。当时若带了 `--apply`，改的就是错误的 keyspace，而输出里没有任何线索。
 
-在同拓扑压测中，v3 稳态认证为串行 `EVALSHA`（Token payload + PTTL）再 `GET` generation，零
-写入；legacy 在迁移窗口还会读取 deny marker。按生产峰值认证 QPS 评估 Redis command rate、
-CPU/network、auth p95/p99、pool wait/timeout 和 401 增幅，确认后再批准 pool 和 migration QPS。
+`status` 的输出形如：
 
-至少监控：
+```json
+{
+  "floor": "revoke",
+  "max_per_uid": 20,
+  "reconciler_paused": false,
+  "writers": [{"build": "<commit>", "applied_state": "revoke", "pod": "...<pod>"}],
+  "tokens": {"total": 137, "v1": 0, "v2": 135, "v3": 2, "persistent": 0},
+  "last_advance": {"from": "v3-write", "to": "revoke", "actor": "reconciler", "live_writers": 1},
+  "next": {
+    "target_floor": "bounded",
+    "allowed": false,
+    "blocked_by": ["v1=0 v2=135 (need 0)"]
+  }
+}
+```
 
-- `dmwork_redis_pool_timeouts_total{client="session"}`、`total_connections`、`idle_connections`；
-- `dmwork_session_validation_rejected_total{reason=...}`；
-- `dmwork_session_operation_duration_seconds` / `operations_total`；
-- `dmwork_session_rollout_mode{mode=...}`；
-- `dmwork_session_revocation_backlog` / `revocation_retries_total`；
-- `dmwork_dependency_duration_seconds{dependency="redis",op=...,status=...}`；
-- HTTP 401、登录 QPS/失败率、Pod restart/readiness 和 Redis CPU/network/latency。
+**`blocked_by` 是排查的起点。** 卡住时读它，不要绕过去。
 
-## 4. 工具准备
+## 4. 那个决定：migration
 
-从已审核 commit 构建，记录二进制 SHA256；不要从开发机未提交工作区直接复制到生产：
+只有 legacy token 还在时才需要。两条路：
+
+| 做法 | 代价 |
+|---|---|
+| 什么都不做 | 最长等到 `TokenExpire`。活跃用户会被 `ReuseSession` 逐步提升为 v3，只有不活跃用户的 token 会拖满 |
+| 跑一次 migration | 命中的用户下次访问需重新登录，换取立刻收口 |
 
 ```bash
-go build -trimpath -o /tmp/token-session-admin ./tools/token-session-admin
-go build -trimpath -o /tmp/token-session-observe ./tools/token-session-observe
-shasum -a 256 /tmp/token-session-admin /tmp/token-session-observe
+# 先 dry-run，人工复核 shortened / would_delete
+app session-rollout migrate --campaign prod-2026-09-01-a \
+  --cutoff 2026-09-08T00:00:00Z --finite-policy natural \
+  --batch-size 500 --qps 200 --lease 30s
+
+# 参数完全一致，加 --apply
+app session-rollout migrate ... --apply
 ```
 
-下文使用：
+`--finite-policy`：
 
-```bash
-TOKEN_CONFIG=/etc/octo-server/tsdd.yaml
-MIGRATION_CAMPAIGN=legacy-token-YYYYMMDD
-MIGRATION_CUTOFF=YYYY-MM-DDTHH:MM:SSZ
-OBSERVATION_MIN_GAP=1h
-```
+- `natural` —— 只收敛永久与超上限记录，不动仍在 `TokenExpire` 内的有限 token；
+- `cap` —— 有限 token 也压到 cutoff，重新登录面更大，需要批准。
 
-`MIGRATION_CUTOFF` 是不可变的绝对 UTC deadline。`--finite-policy` 必须经批准后显式选择：
+migration 的全部正确性机制**与 #725 完全一致，未作任何改动**：不可变 cutoff、单占租约、
+checkpoint 绑定 Redis `run_id`、只缩短不延长、cutoff 已过期时必须显式
+`--confirm-elapsed-cutoff`。同一 campaign 的 cutoff/policy 永久锁定；新决策要用新的
+campaign ID。
 
-- `natural`：已在 `TokenExpire` 内的有限 v1/v2 自然过期；永久和超过上限的记录仍被收敛。
-- `cap`：有限 v1/v2 也压到 cutoff，可能使更多在线用户提前重新登录。
+## 5. 从 #725 升级
 
-同一 campaign 的 cutoff、finite policy 和生效 `TokenExpire` 不可改变；续跑时可以下调
-`--batch-size` / `--qps`。新的 campaign 使用新的 ID，不会复用旧 checkpoint。
+带着进行中 rollout 的环境（floor 已是 `v3-write`/`revoke`/`bounded`）升级时：
 
-`OBSERVATION_MIN_GAP` 必须由发布审批显式确定且不得低于 `1h`。首次推进 `v3-write` floor 时写入
-无 TTL rollout control；后续阶段可经审批增大，但不得低于已持久化值，两次 observe 必须达到
-本次传入的新间隔，否则命令 fail closed。若目标环境已有旧版 rollout control 且没有该字段，
-不要删除或手改 key；读取仍兼容，下一次合法 `advance-floor` 会用本次传入值原子补齐。
+1. 部署新制品。**唯一一次重启。**
+2. 首启自动接管现有 floor，写下 MySQL 标记，`MAX_PER_UID` 从 env 抄入 floor 记录。
+   **不需要删除或修改任何 Redis key，也不会登出任何人。**
+3. 确认 `status` 的 `floor` 与升级前一致、`writers` 数量与副本数一致。
+4. 删掉 configmap 里那三个已废弃的 key。
+5. 确认无误后再打开 `AUTO_ADVANCE`（见 §6）。
 
-完整演练要为证据窗口预留时间：进入 `bounded` 前的两次 observe 至少间隔 `1h`，进入
-`enforce` 前还需要 bounded floor 下两次新的 observe，最短约 `2h`，且不含扫描、部署和审批耗时。
-不要把这两段等待压进不足的生产变更窗口，也不要为缩短演练降低安全下界。
+**注意灰度姿态**：如果升级前处在 #725 的 Phase D/E（`MODE` 比 floor 高一阶），
+先保留 `OCTO_AUTH_SESSION_MODE` 直到 floor 追上；删早了 reader 会放松一阶。
+启动日志会就此告警。
 
-## 5. 分阶段启用
+## 6. 首次开启自动推进
 
-### Phase A：`expand`
+**首个引入本能力的 release 必须以 `AUTO_ADVANCE=0` 上线。**
 
-1. 在产品确认改密/重置与账号禁用会触发全 IM 设备退出后，部署 PR 2，显式或默认使用
-   `OCTO_AUTH_SESSION_MODE=expand`。这项客户端可见行为随制品立即生效，不等待 v3 floor；此阶段
-   HTTP bearer 仅按 APP/Web/PC 兼容反查撤销各端最新一条已知会话，不能宣称 UID 全部会话已撤销。
-2. 等待 rollout 完成，确认 `desired=current=ready`，所有 PR 2 之前的 ReplicaSet 副本为 0。
-3. 核对每个 Pod 的 build、mode、floor、TTL 和 pool 日志；此时不得产生 v3、不得 apply。
-4. 运行一次限速 observe 做基线盘点，但不要记录 floor 证据：
+原因是这套设计对自身的第一次升级有个盲区：writer registry 的作用正是发现"还有旧副本
+在跑"，但升级到**带 registry 的版本**这一次，旧副本（#725 制品）根本不注册，registry
+只看得见新副本。等到全部副本都是新制品、`status` 的 `writers` 数与副本数吻合之后，
+再打开自动推进。
 
-```bash
-/tmp/token-session-observe --config "$TOKEN_CONFIG" --batch-size 200 --qps 50
-```
+打开后：
 
-结果必须检查 `complete`、`read_errors`、`invalid_ttl`、`decode_invalid`、`persistent`、
-`over_max`、`v1/v2/v3`。任何不完整或歧义统计都不是放行证据。
+- 全新环境：直接一路到 `enforce`；
+- 有存量环境：自动到 `v3` 后停住，等你的 migration 决策。
 
-### Phase B：`v3-write`
+首次为有存量环境建立 v3 floor 时需要 `OCTO_AUTH_SESSION_EXPECT_WRITERS=<副本数>`。
+这不是判断题，是部署系统已经知道的一个数字：**只有新制品会注册，所以旧副本还在的话，
+注册数就会不足**。它是过渡期配置，推过之后删掉即可；HPA 环境在这个窗口内临时固定副本数。
 
-1. 产品/容量签字 session cap；部署 `MODE=v3-write` + `MAX_PER_UID=<approved>`。此时 floor 尚未
-   建立，暂不设置 `REQUIRED_FLOOR`。
-2. 清零所有 `expand` 副本，确认所有 Pod 只写 v3，验证登录、复用、资料更新和 session cap。
-3. 推进不可逆 writer floor：
+## 7. 出问题时
 
-```bash
-/tmp/token-session-admin advance-floor --config "$TOKEN_CONFIG" --to v3-write \
-  --observation-min-gap "$OBSERVATION_MIN_GAP"
-```
+**先看 `status` 的 `blocked_by`。** 常见原因：
 
-4. 立即把 Deployment 增加 `OCTO_AUTH_SESSION_REQUIRED_FLOOR=v3-write` 并完成一次同制品滚动，
-   清零未带 required-floor 的副本。之后 control key 丢失会使新实例 fail closed。
+| blocked_by | 含义 |
+|---|---|
+| `no live writers registered` | 看不见任何副本。**空 registry 判失败，不是放行** |
+| `N distinct builds are live` | 混部，等滚动更新完成 |
+| `N of M writers have not applied floor X` | 有副本没跟上，通常几秒内自愈 |
+| `expected N writers, registry has M` | 副本数对不上，多半还有旧制品在跑 |
+| `v1=N v2=M (need 0)` | 还有 legacy，等自然过期或跑 migration |
+| `max_per_uid is not configured` | 首次建立 v3 floor 时缺 cap |
 
-不得在仍有 `expand` writer 时提前建立 v3-write floor；已运行的旧进程不会动态重读 floor。
+**停下自动推进**（按响应速度）：
 
-### Phase C：`revoke`
+1. `app session-rollout pause` —— 秒级，写持久标志，所有副本下一轮生效。**首选。**
+2. `AUTO_ADVANCE=0` + 滚动 —— 分钟级，用于确认长期关闭。
+3. 回滚制品 —— 仅当 reconciler 之外也出问题，且受 §8 的下界约束。
 
-1. 部署 `MODE=revoke`、`REQUIRED_FLOOR=v3-write`，清零 `v3-write` 副本。
-2. 验证退出、改密/重置、禁用/注销、管理员删除的同步撤销和 durable retry；确认 backlog 收敛。
-3. 推进 floor，再滚动更新 required floor：
+**Redis 不可达时**：副本会停止签发新 token（登录失败），但**保留在 LB 中、
+已登录用户不受影响**。这是有意的——Redis 是全体副本同时失联，摘流会把一次认证降级
+放大成整体不可用。
 
-```bash
-/tmp/token-session-admin advance-floor --config "$TOKEN_CONFIG" --to revoke \
-  --observation-min-gap "$OBSERVATION_MIN_GAP"
-```
+**Redis 丢了 floor**：启动日志出现 `boot=rollback-recovered`，说明这个部署曾经建立过
+floor 但现在读不到了。系统会**向上取 `enforce`** 并重建记录：相关 legacy token 被拒绝，
+那批用户重新登录。这是刻意的——丢失时"精确恢复"意味着继续接受一批来自不一致快照的
+legacy token，而 session token 本就可丢弃。
 
-部署 `REQUIRED_FLOOR=revoke` 后清零旧配置副本。只有完成这一步才允许 apply 和 rollout evidence。
-从该 floor 起，改密/重置和禁用事件才由 generation rotate 保证 UID 全部 HTTP 会话即时失效；
-`v3-write` 阶段只能保证兼容索引中每个 device flag 的最新会话。
+## 8. 回滚
 
-legacy deny marker 从本阶段开始按被全量撤销的 UID 写入且无 TTL。上线前按可能被撤销的唯一 UID
-数做容量预算；在所有 legacy reader 退出并进入最终 enforce 前禁止人工删除。本版本不提供自动
-cleanup，后续清理必须走单独审核的聚合盘点和受控工具。
+| 当前 floor | 可回滚到 |
+|---|---|
+| 未建立 | #723 或 #725 制品 |
+| `v3-write` ~ `revoke` | 仅 #725 制品或更新（需能解析 v3 + generation） |
+| `bounded` ~ `enforce` | 仅遵守该 floor 的兼容制品 |
 
-### Phase D：migration 与 `bounded`
+**回滚到 #725 制品时，必须把 `OCTO_AUTH_SESSION_MODE` 与
+`OCTO_AUTH_SESSION_REQUIRED_FLOOR` 加回 configmap**——#725 需要它们，而本 release 已
+不再要求。Redis floor 记录在本 release 内保持 #725 可读（只增字段、不改名不删字段）。
 
-先 dry-run，人工复核聚合结果和预计提前失效量：
+**已经推进的 floor 不能撤。** 这是设计意图而非缺陷：它意味着"谓词有 bug"这一风险没有
+事后补救，只能靠事前——所以谓词的每条分支都有独立测试，且首个 release 默认关闭自动推进。
 
-```bash
-/tmp/token-session-admin migrate \
-  --config "$TOKEN_CONFIG" \
-  --campaign "$MIGRATION_CAMPAIGN" \
-  --cutoff "$MIGRATION_CUTOFF" \
-  --finite-policy natural \
-  --batch-size 200 \
-  --qps 50 \
-  --lease 30s
-```
+migration 的回滚语义不变：可暂停续跑；不得删除 campaign/checkpoint、
+不得延长已缩短的 TTL、不得删除 deny marker、不得换 campaign 复活已过期 token。
 
-批准后使用完全相同的 campaign/cutoff/policy 加 `--apply`：
+## 9. 监控
 
-```bash
-/tmp/token-session-admin migrate \
-  --config "$TOKEN_CONFIG" \
-  --campaign "$MIGRATION_CAMPAIGN" \
-  --cutoff "$MIGRATION_CUTOFF" \
-  --finite-policy natural \
-  --batch-size 200 \
-  --qps 50 \
-  --lease 30s \
-  --apply
-```
+| 指标 | 关注点 |
+|---|---|
+| `dmwork_session_live_writers` | 与副本数不符 = 有副本失去租约或旧制品在跑 |
+| `dmwork_session_writer_fence_total` | 持续增长 = 副本在拒绝新登录 |
+| `dmwork_session_floor_advance_total{to,actor}` | `actor` 区分自动与人工 |
+| `dmwork_session_reconcile_blocked_total{reason}` | 长期卡在非预期原因需要告警 |
+| `dmwork_session_reconcile_scan_total` | 增速异常说明退避没生效 |
+| `dmwork_session_rollout_boot_outcome{outcome}` | `rollback-recovered` 为 1 必须告警 |
+| `dmwork_session_rollout_mode{mode}` | 全体副本应收敛到同一值（灰度副本除外） |
 
-若取消、锁丢失或失败，保留原 campaign/cutoff/policy，按 checkpoint 续跑；可降低 batch/QPS。
-checkpoint 绑定 Redis `run_id` 的 SHA-256 指纹；恢复时或运行中检测到实例变化会重新确认 lease、
-把 cursor 归零并幂等重扫，累计统计可能包含重扫记录。只有稳定扫描到 cursor 0 且输出
-`complete=true` 才会生成同实例的 migration completion evidence；Redis 随后再次重启/failover，
-在推进 `bounded` 前必须用同一 campaign/cutoff/policy 重新完成 apply。旧 checkpoint/evidence
-缺失实例指纹时同样从 0 重扫，不得手工补字段。
+原有的 `validation_rejected_total`、`revocation_backlog`、`redis_pool_timeouts_total`
+等指标保持不变。
 
-如果 apply 启动时 cutoff 尚未过期、但在限速扫描中到期，未带确认的任务会在第一条需要立即删除
-的记录上由 Lua 在 `DEL` 前停止，输出 `complete=false` 和明确错误；此前已经执行的 TTL 缩短不会
-回滚，也不会生成 completion evidence。当前批次可能尚未写入 checkpoint，续跑会从最近已保存
-的 cursor（没有则从 0）幂等重放。此时先以同一 campaign/cutoff/policy 重新 dry-run 评估
-`would_delete`，获批后再加 `--confirm-elapsed-cutoff` 续跑；不得通过延后 cutoff 或更换 campaign
-绕过确认。
+## 10. Redis 预检
 
-若启动或恢复时 `MIGRATION_CUTOFF` 已经过期，不得改 cutoff 或换 campaign 来延长原安全
-deadline。先用相同 cutoff/policy 再跑 dry-run：命中的剩余记录会计入 `would_delete`；获批 apply
-后会立即删除并计入 `deleted`，可能触发批量重新登录。该行为是遵守已批准绝对截止时间，不得把
-它解释成普通
-`shortened`。过期 cutoff 的 apply 还必须显式传入 `--confirm-elapsed-cutoff`，仅传 `--apply` 会被
-工具和 store 双重拒绝：
+以下与 #725 一致，仍需在生产同型号/同版本/同 proxy 路径上验证：`EVALSHA` 与脚本缓存、
+lease 所需的 `SET NX PX` / `PTTL` / compare-delete、`SCAN` cursor 语义、
+`INFO server` 可返回稳定 `run_id`、主从切换后的行为。
 
-```bash
-/tmp/token-session-admin migrate \
-  --config "$TOKEN_CONFIG" \
-  --campaign "$MIGRATION_CAMPAIGN" \
-  --cutoff "$MIGRATION_CUTOFF" \
-  --finite-policy natural \
-  --batch-size 200 \
-  --qps 50 \
-  --lease 30s \
-  --apply \
-  --confirm-elapsed-cutoff
-```
-
-若影响不可接受，应停止 apply 并升级安全审批，不能由运维自行延后 deadline。
-
-每次 apply 结束都必须同时核对 exit status、`complete`、`deleted` 和 `shortened`；`deleted>0`
-表示本轮执行了经显式确认的立即删除，必须与审批中的预计重新登录影响一致。
-
-apply 完成后执行两次独立完整 observe。两次应跨过一个经批准的间隔，并分别保存聚合输出：
-
-```bash
-/tmp/token-session-observe --config "$TOKEN_CONFIG" --batch-size 200 --qps 50 --record-rollout-evidence
-/tmp/token-session-observe --config "$TOKEN_CONFIG" --batch-size 200 --qps 50 --record-rollout-evidence
-```
-
-两次均须 `complete=true`、`total>0`、`read_errors=invalid_ttl=decode_invalid=0`、`persistent=0`、
-`over_max=0`，并核对每次输出的 `scan_id` 不同、`scope_fingerprint` 相同。指纹由
-Token/UIDToken prefix 与 `TokenExpire` 哈希生成，不泄露明文 prefix；同一次扫描结果重复提交会
-被拒绝。工具会在同一安全 key 中原子保留最近两份聚合证据，不保存 credential/UID。
-
-空 keyspace 不可作为“已迁移”的放行证据。若目标环境确实没有在线 Token，应在当前正常登录链路
-创建一个受控测试账号的 v3 canary，确认其 TTL/generation 正常后再执行两次 observe；禁止直接向
-Redis 伪造 token 或 evidence。升级到包含本门禁的工具后，旧 observation evidence 因缺少 scan ID/
-scope fingerprint 自动失效，必须重新扫描两次。
-
-先部署 `MODE=bounded`、`REQUIRED_FLOOR=revoke` 并灰度确认，再推进：
-
-```bash
-/tmp/token-session-admin advance-floor --config "$TOKEN_CONFIG" --to bounded \
-  --observation-min-gap "$OBSERVATION_MIN_GAP"
-```
-
-命令会机器校验 apply completion/checkpoint 和两次 observe；缺失、过期、损坏或不达标均拒绝。
-成功后部署 `REQUIRED_FLOOR=bounded` 并清零旧配置副本。
-
-### Phase E：`enforce`
-
-等待或继续获批 campaign，直到在 `bounded` floor 下两次新的完整 observe 均满足 Phase D 条件，
-并额外满足 `v1=0`、`v2=0`、`v3>0`。旧的 revoke-floor 证据不能复用。
-
-以 `MODE=enforce`、`REQUIRED_FLOOR=bounded` 做小流量灰度，验证历史报告 Token、正常登录、退出、
-高风险撤销和 Redis 故障场景。灰度可回到 `bounded`，因为 enforce floor 尚未建立。
-
-所有副本稳定为 enforce、旧副本为 0 且复测通过后，才执行不可逆推进：
-
-```bash
-/tmp/token-session-admin advance-floor --config "$TOKEN_CONFIG" --to enforce \
-  --observation-min-gap "$OBSERVATION_MIN_GAP"
-```
-
-然后部署 `REQUIRED_FLOOR=enforce` 并清零旧配置副本。enforce floor 建立后不能再启动 bounded
-实例；只能回滚到仍支持 v3 generation 且遵守 enforce floor 的兼容制品。
-
-## 6. Kubernetes 核对模板
-
-不要只看一次 readiness。按实际 label 替换以下变量，并保存每阶段证据：
-
-```bash
-K8S_NAMESPACE=<namespace>
-K8S_DEPLOYMENT=<deployment>
-K8S_SELECTOR=<label-selector>
-
-kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$K8S_DEPLOYMENT" --timeout=10m
-kubectl -n "$K8S_NAMESPACE" get deployment "$K8S_DEPLOYMENT" -o wide
-kubectl -n "$K8S_NAMESPACE" get rs -l "$K8S_SELECTOR" \
-  -o custom-columns='NAME:.metadata.name,DESIRED:.spec.replicas,CURRENT:.status.replicas,READY:.status.readyReplicas,IMAGE:.spec.template.spec.containers[*].image'
-kubectl -n "$K8S_NAMESPACE" get pods -l "$K8S_SELECTOR" -o wide
-```
-
-门禁是目标副本全部 ready、上一阶段/旧 build ReplicaSet 的 desired/current/ready 均为 0，并且每个
-新 Pod 的启动日志和 rollout-mode 指标一致。若 Pod 只有 CPU request 没有 limit，同时记录容器内
-实际 `GOMAXPROCS` 与启动日志 pool size。
-
-## 7. 中止与回滚
-
-- `expand` 尚未签发 v3 且未建立 v3-write floor：可回滚 PR 1 制品。
-- v3 已签发或 v3-write floor 已建立：不得回滚 PR 1，也不得恢复 v2 writer。回滚制品必须支持
-  v3、generation、deny marker 和当前 floor。
-- migration 可停止并按原 campaign 续跑；不得删除 campaign/checkpoint、延长已缩短 TTL、删除
-  deny marker，或通过更换 campaign 恢复已过期 Token。
-- rollout control 缺少 observation gap 的旧记录不需要 Redis 手术；保留原 key，由下一次合法
-  floor 推进补齐。已持久化的 gap 可提高但不得降低。
-- enforce 灰度期间、enforce floor 建立前可退到 bounded；enforce floor 建立后不可降级 floor。
-- generation/outbox/Redis 故障时暂停新阶段和 migration，扩容或回滚兼容 v3 制品；禁止关闭
-  generation 校验或临时恢复 v2 writer。
-
-任何阶段的 Redis error、pool timeout、认证拒绝突增、revocation backlog 不收敛、observe 不完整、
-旧副本未清零或客户端重登录风暴，均为 stop condition。中止不等于漏洞关闭。
-
-## 8. 最终关闭条件
-
-以下全部有证据后，才可把“认证 Token 生命周期过长”标记为已修复：
-
-1. enforce floor 与所有副本 mode/build 一致，旧副本为 0；
-2. migration apply 完成，最近两次完整 observe 为 `persistent=0, over_max=0, v1=0, v2=0`；
-3. Redis non-eviction、连接容量、两读性能和告警门禁已签字；
-4. 报告中的历史 Token 以及退出、改密/重置、禁用/注销、多设备、多副本竞态和 Redis 故障场景
-   已在目标环境复测；
-5. `/v1/user/pc/quit`、设备删除、OIDC sync `invalid_grant` 等未接线 scope 已有明确产品决定，
-   未完成项不得被 PR 合并状态掩盖。
+**`noeviction` 仍然必须确认**：floor、generation、legacy deny marker 都是无 TTL 的安全
+状态。floor 丢失现在可以自愈（§7），但 deny marker 丢失是**静默的安全回退**——
+已撤销的 legacy token 会重新可用，且没有任何告警。

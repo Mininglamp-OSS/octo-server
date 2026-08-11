@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -88,9 +89,15 @@ type RedisSessionStore struct {
 	tokenPrefix    string
 	uidTokenPrefix string
 	maxTTL         time.Duration
-	mode           SessionMode
-	maxPerUID      int
-	now            func() time.Time
+	// state is the derived rollout state. It is atomic because the floor poller
+	// raises it while requests are in flight: the mode is no longer a fixed
+	// startup value read from the environment.
+	state atomic.Pointer[derivedRolloutState]
+	// lease is the write lease this process holds, once the server wiring binds
+	// one. Nil in tests and in the operator subcommands, which do not create
+	// credentials.
+	lease atomic.Pointer[WriterRegistry]
+	now   func() time.Time
 	// redisInstanceIDFn resolves the opaque process identity used to keep a
 	// resumable SCAN cursor bound to one Redis process.
 	redisInstanceIDFn func() (string, error)
@@ -98,16 +105,59 @@ type RedisSessionStore struct {
 
 type SessionStoreOption func(*RedisSessionStore)
 
+// derivedRolloutState is swapped wholesale so mode and cap can never be read
+// as a torn pair: raising the mode into a v3 phase without its cap would be a
+// bounded-index write with no bound.
+type derivedRolloutState struct {
+	mode      SessionMode
+	maxPerUID int
+}
+
 func WithSessionMode(mode SessionMode) SessionStoreOption {
 	return func(store *RedisSessionStore) {
-		store.mode = mode
+		current := store.currentState()
+		store.state.Store(&derivedRolloutState{mode: mode, maxPerUID: current.maxPerUID})
 	}
 }
 
 func WithSessionMaxPerUID(max int) SessionStoreOption {
 	return func(store *RedisSessionStore) {
-		store.maxPerUID = max
+		current := store.currentState()
+		store.state.Store(&derivedRolloutState{mode: current.mode, maxPerUID: max})
 	}
+}
+
+func (s *RedisSessionStore) currentState() derivedRolloutState {
+	if state := s.state.Load(); state != nil {
+		return *state
+	}
+	return derivedRolloutState{mode: SessionModeExpand}
+}
+
+func (s *RedisSessionStore) currentMode() SessionMode { return s.currentState().mode }
+
+func (s *RedisSessionStore) currentMaxPerUID() int { return s.currentState().maxPerUID }
+
+// ApplyRolloutState raises the derived state to match a newly observed floor.
+// It only ever moves upward — a floor that appears to have gone backwards is a
+// stale or rolled-back read, and following it down would re-admit legacy
+// sessions this replica has already stopped accepting.
+func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) error {
+	if !mode.valid() {
+		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
+	}
+	current := s.currentState()
+	if maxPerUID <= 0 {
+		maxPerUID = current.maxPerUID
+	}
+	if mode.writesV3() && (maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit) {
+		return fmt.Errorf("auth: session mode %s requires a bounded max sessions per UID", mode)
+	}
+	if mode.rank() < current.mode.rank() {
+		return nil
+	}
+	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
+	return nil
 }
 
 func WithSessionClock(now func() time.Time) SessionStoreOption {
@@ -130,19 +180,20 @@ func NewRedisSessionStore(client *rd.Client, tokenPrefix, uidTokenPrefix string,
 		tokenPrefix:    tokenPrefix,
 		uidTokenPrefix: uidTokenPrefix,
 		maxTTL:         maxTTL,
-		mode:           SessionModeExpand,
 		now:            time.Now,
 	}
+	store.state.Store(&derivedRolloutState{mode: SessionModeExpand})
 	for _, opt := range opts {
 		if opt != nil {
 			opt(store)
 		}
 	}
-	if !store.mode.valid() {
+	initial := store.currentState()
+	if !initial.mode.valid() {
 		panic("auth: NewRedisSessionStore requires a valid session mode")
 	}
-	if store.mode.writesV3() {
-		if store.maxPerUID <= 0 || store.maxPerUID > sessionMaxPerUIDLimit {
+	if initial.mode.writesV3() {
+		if initial.maxPerUID <= 0 || initial.maxPerUID > sessionMaxPerUIDLimit {
 			panic("auth: NewRedisSessionStore requires a bounded max sessions per UID in v3 modes")
 		}
 		if store.maxTTL < time.Second {
@@ -165,6 +216,9 @@ func (s *RedisSessionStore) uidTokenKey(uid string, deviceFlag int) string {
 // it through ReuseExisting or UpdatePayloadKeepDeadline. If the index write
 // fails, only the still-owned credential is deleted as compensation.
 func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid string, deviceFlag int) (err error) {
+	if !s.mayWrite() {
+		return ErrWriterLeaseLost
+	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("issue", started, err) }()
 	if strings.TrimSpace(token) == "" || strings.TrimSpace(payload) == "" || strings.TrimSpace(uid) == "" || deviceFlag < 0 {
@@ -201,6 +255,9 @@ func (s *RedisSessionStore) IssueNew(ctx context.Context, token, payload, uid st
 // ReuseExisting updates a bearer without extending its deadline and aligns
 // the compatibility index to the same TTL. A missing bearer is never recreated.
 func (s *RedisSessionStore) ReuseExisting(ctx context.Context, token, payload, uid string, deviceFlag int) (ok bool, err error) {
+	if !s.mayWrite() {
+		return false, ErrWriterLeaseLost
+	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("reuse", started, err) }()
 	if strings.TrimSpace(token) == "" || strings.TrimSpace(payload) == "" || strings.TrimSpace(uid) == "" || deviceFlag < 0 {
@@ -596,4 +653,59 @@ func redisInteger(value interface{}) (int64, error) {
 	default:
 		return 0, fmt.Errorf("auth: invalid redis integer result %T", value)
 	}
+}
+
+// UseWriterLease binds the write lease. Once set, creating a new credential
+// requires a live lease: that is what makes "absent from the registry" prove
+// "not writing", which the advance gate depends on. Validation reads are
+// deliberately unaffected — fencing new logins during a Redis outage is the
+// intended degradation, logging everyone out is not.
+func (s *RedisSessionStore) UseWriterLease(registry *WriterRegistry) {
+	s.lease.Store(registry)
+}
+
+// mayWrite reports whether this process is allowed to create new credentials.
+// With no registry bound (tests, operator subcommands) it is always true.
+func (s *RedisSessionStore) mayWrite() bool {
+	registry := s.lease.Load()
+	if registry == nil {
+		return true
+	}
+	if registry.MayWrite() {
+		return true
+	}
+	metrics.ObserveSessionWriterFence()
+	return false
+}
+
+// Client exposes the shared Redis client for adjacent rollout components (the
+// writer registry, the operator subcommands) that must not open a second pool.
+func (s *RedisSessionStore) Client() *rd.Client { return s.client }
+
+// UIDTokenPrefix is the namespace all rollout safety state lives under.
+func (s *RedisSessionStore) UIDTokenPrefix() string { return s.uidTokenPrefix }
+
+// RedisInstanceFingerprint identifies the Redis process this store is talking
+// to. It is printed by every operator subcommand: identity derived purely from
+// config cannot tell two endpoints apart, which is how a misplaced config key
+// once pointed a tool at the wrong Redis without a word of complaint.
+func (s *RedisSessionStore) RedisInstanceFingerprint() (string, error) {
+	return s.currentRedisInstanceID()
+}
+
+// ForceAdvanceRollout is the operator fault channel. It records the same
+// evidence snapshot the reconciler does; the caller must have already
+// evaluated the predicate, which --force does not skip.
+func (s *RedisSessionStore) ForceAdvanceRollout(ctx context.Context, decision RolloutAdvanceDecision, registry *WriterRegistry) error {
+	if !decision.Allowed {
+		return errors.New("auth: refusing to force an advance the predicate did not allow")
+	}
+	if err := s.recordRolloutAdvance(ctx, decision, "operator", registry); err != nil {
+		return err
+	}
+	if err := s.AdvanceRolloutControl(ctx, decision.Target, decision.MaxPerUID); err != nil {
+		return err
+	}
+	metrics.ObserveSessionFloorAdvance(string(decision.Target), "operator")
+	return nil
 }

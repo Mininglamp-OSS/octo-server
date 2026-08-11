@@ -1,0 +1,185 @@
+package auth
+
+// The rollout advance predicate.
+//
+// This replaces the two-observation, one-hour-apart evidence ritual. That
+// ritual proved "no legacy remains" EMPIRICALLY — scan twice and hope the gap
+// caught a straggler writer. A deductive proof was available all along:
+//
+//	no legacy remains  ⟸  no legacy writer can exist
+//	                   ∧  every legacy record has a bounded deadline
+//	                   ∧  that deadline has passed
+//
+// The floor already machine-enforces the first term for NEW processes; the hole
+// was processes already running, which is exactly what the wall clock was
+// standing in for. A writer registry answers it by query instead of by waiting,
+// so the ritual — and its two hours — go away.
+//
+// The predicate is evaluated fresh at decision time rather than read from
+// persisted evidence, which is why an empty keyspace is now the STRONGEST
+// evidence rather than a rejected one, and why greenfield needs no special
+// branch: v1=0 ∧ v2=0 holds trivially when there is nothing there.
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// RolloutAdvanceDecision is what the reconciler and `advance --force` both act
+// on. BlockedBy entries are operator-facing and low cardinality.
+type RolloutAdvanceDecision struct {
+	Current   SessionMode `json:"current_floor"`
+	Target    SessionMode `json:"target_floor"`
+	Allowed   bool        `json:"allowed"`
+	BlockedBy []string    `json:"blocked_by,omitempty"`
+	MaxPerUID int         `json:"max_per_uid,omitempty"`
+	// Scanned reports whether this evaluation ran a keyspace scan, so a caller
+	// can back off rather than rescanning every cycle while waiting out a
+	// deadline measured in days.
+	Scanned bool `json:"scanned"`
+}
+
+// RolloutAdvanceInput carries what the predicate cannot read for itself.
+type RolloutAdvanceInput struct {
+	Registry *WriterRegistry
+	// ExpectWriters is the replica count the deployment intends to run. Only
+	// consulted when establishing the first v3 floor over a non-empty keyspace,
+	// because that is the one transition where a non-participating pre-#725
+	// build could still be writing v2 and the registry structurally cannot see
+	// it. Every later transition is fully machine-gated.
+	ExpectWriters int
+	// MaxPerUID is required when crossing into a v3-writing floor.
+	MaxPerUID int
+	// ScanBatchSize and ScanInterval throttle the keyspace scan.
+	ScanBatchSize int64
+	ScanInterval  interface{ String() string }
+}
+
+// EvaluateRolloutAdvance decides whether the floor may move one phase.
+func (s *RedisSessionStore) EvaluateRolloutAdvance(ctx context.Context, in RolloutAdvanceInput) (RolloutAdvanceDecision, error) {
+	control, err := s.RolloutControl(ctx)
+	if err != nil {
+		return RolloutAdvanceDecision{}, err
+	}
+
+	decision := RolloutAdvanceDecision{Target: SessionModeV3Write, MaxPerUID: in.MaxPerUID}
+	if control != nil {
+		decision.Current = control.ModeFloor
+		decision.Target = control.ModeFloor.next()
+		if decision.MaxPerUID <= 0 {
+			decision.MaxPerUID = control.MaxPerUID
+		}
+		if control.ModeFloor == SessionModeEnforce {
+			// Terminal. Nothing to evaluate and nothing to scan — the
+			// reconciler goes quiet from here.
+			decision.BlockedBy = []string{"floor is already enforce"}
+			return decision, nil
+		}
+	}
+
+	if decision.Target.writesV3() && (decision.MaxPerUID <= 0 || decision.MaxPerUID > sessionMaxPerUIDLimit) {
+		decision.BlockedBy = append(decision.BlockedBy, "max_per_uid is not configured")
+	}
+
+	// Fleet convergence. Every live writer must already be running at the
+	// current floor, or advancing would put the floor two phases ahead of a
+	// replica that has not caught up.
+	if in.Registry == nil {
+		decision.BlockedBy = append(decision.BlockedBy, "writer registry unavailable")
+	} else {
+		live, liveErr := in.Registry.Live()
+		if liveErr != nil {
+			return RolloutAdvanceDecision{}, liveErr
+		}
+		switch {
+		case len(live) == 0:
+			// An empty registry is a FAILURE, not a pass. Note this is the
+			// mirror of the token scan: there, emptiness proves absence and is
+			// the strongest evidence; here we are proving presence and
+			// convergence, so emptiness only means we cannot see.
+			decision.BlockedBy = append(decision.BlockedBy, "no live writers registered")
+		default:
+			builds := map[string]struct{}{}
+			behind := 0
+			for _, entry := range live {
+				builds[entry.Build] = struct{}{}
+				if SessionMode(entry.AppliedState).rank() < decision.Current.rank() {
+					behind++
+				}
+			}
+			if len(builds) > 1 {
+				decision.BlockedBy = append(decision.BlockedBy,
+					fmt.Sprintf("%d distinct builds are live", len(builds)))
+			}
+			if behind > 0 {
+				decision.BlockedBy = append(decision.BlockedBy,
+					fmt.Sprintf("%d of %d writers have not applied floor %s", behind, len(live), decision.Current))
+			}
+		}
+	}
+
+	needScan := decision.Target == SessionModeEnforce || decision.Target == SessionModeV3Write
+	var observation SessionObservation
+	if needScan {
+		batch := in.ScanBatchSize
+		if batch <= 0 {
+			batch = 200
+		}
+		observation, err = s.ObserveRateLimited(ctx, batch, 0)
+		if err != nil {
+			return RolloutAdvanceDecision{}, err
+		}
+		decision.Scanned = true
+		if !observation.Complete {
+			decision.BlockedBy = append(decision.BlockedBy, "keyspace scan did not complete")
+		}
+	}
+
+	if decision.Target == SessionModeV3Write && observation.Total > 0 {
+		// Only here does a human-supplied number matter, and it is information
+		// rather than judgement: only #725-or-newer builds register, so a
+		// leftover old replica makes the registry come up short. An empty
+		// keyspace skips this entirely — nothing has ever been written, so no
+		// writer of any vintage can be running.
+		live := 0
+		if in.Registry != nil {
+			if entries, liveErr := in.Registry.Live(); liveErr == nil {
+				live = len(entries)
+			}
+		}
+		switch {
+		case in.ExpectWriters <= 0:
+			decision.BlockedBy = append(decision.BlockedBy,
+				fmt.Sprintf("%s is required to establish the first v3 floor over a non-empty keyspace", sessionExpectWritersEnv))
+		case live != in.ExpectWriters:
+			decision.BlockedBy = append(decision.BlockedBy,
+				fmt.Sprintf("expected %d writers, registry has %d", in.ExpectWriters, live))
+		}
+	}
+
+	if decision.Target == SessionModeEnforce {
+		if observation.V1 != 0 || observation.V2 != 0 {
+			decision.BlockedBy = append(decision.BlockedBy,
+				fmt.Sprintf("v1=%d v2=%d (need 0)", observation.V1, observation.V2))
+		}
+		// decode_invalid is deliberately NOT a blocker. A record that fails
+		// Decode was never a usable credential — the validator has always
+		// rejected it — so letting it hold the floor was the evidence validator
+		// being stricter than the security requirement, which is what wedged
+		// the floor for up to TokenExpire with no tool able to clear it.
+	}
+
+	sort.Strings(decision.BlockedBy)
+	decision.Allowed = len(decision.BlockedBy) == 0
+	return decision, nil
+}
+
+// BlockedSummary renders BlockedBy for a log line or status output.
+func (d RolloutAdvanceDecision) BlockedSummary() string {
+	if len(d.BlockedBy) == 0 {
+		return ""
+	}
+	return strings.Join(d.BlockedBy, "; ")
+}

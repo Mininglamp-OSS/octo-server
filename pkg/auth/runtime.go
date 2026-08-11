@@ -33,6 +33,8 @@ type sessionRedisOptions struct {
 type sessionRuntime struct {
 	store  *RedisSessionStore
 	client *rd.Client
+	boot   RolloutBoot
+	policy sessionPolicy
 }
 
 var sessionRuntimeMu sync.Mutex
@@ -65,10 +67,7 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	if err != nil {
 		panic(err)
 	}
-	policy, err := sessionPolicyFromEnv()
-	if err != nil {
-		panic(err)
-	}
+	policy := sessionPolicyFromEnv()
 	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = options.poolSize
@@ -82,17 +81,58 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		ctx.GetConfig().Cache.TokenCachePrefix,
 		ctx.GetConfig().Cache.UIDTokenCachePrefix,
 		ctx.GetConfig().Cache.TokenExpire,
-		WithSessionMode(policy.mode),
-		WithSessionMaxPerUID(policy.maxPerUID),
 	)
-	validationCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+	// Boot resolution replaces the old startup validation, which panicked when
+	// the Redis floor key was missing at mode >= revoke and so turned one lost
+	// key into a fleet that could not start. Nothing below is fatal.
+	bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := store.ValidateRolloutControl(validationCtx, policy.requiredFloor); err != nil {
-		_ = client.Close()
-		panic(err)
+	var markers *RolloutMarkerStore
+	if db := ctx.DB(); db != nil {
+		markers = NewRolloutMarkerStore(db)
 	}
-	ctx.SetValue(&sessionRuntime{store: store, client: client}, sessionRuntimeContextKey)
+	boot, err := ResolveRolloutBoot(bootCtx, store, markers, policy.legacyMode, policy.legacyMaxPerUID)
+	if err != nil {
+		// Only a MySQL marker read failure reaches here; an unreadable Redis
+		// floor is resolved inside ResolveRolloutBoot. Without the marker we
+		// cannot tell "never initialised" from "lost it", and guessing the
+		// wrong way re-admits revoked legacy bearers, so take the strict side.
+		boot = RolloutBoot{Outcome: RolloutBootRecovered, Mode: SessionModeEnforce, MaxPerUID: policy.legacyMaxPerUID}
+		boot.Warning = fmt.Sprintf("session rollout marker unreadable at boot (%v); resolving upward to %s", err, boot.Mode)
+	}
+	boot.AutoAdvance = policy.autoAdvance
+	boot.CanaryAhead = policy.canaryAhead
+	boot.ExpectWriters = policy.expectWriters
+	if policy.canaryAhead && boot.Mode.rank() < SessionModeEnforce.rank() {
+		boot.Mode = boot.Mode.next()
+	}
+	if applyErr := store.ApplyRolloutState(boot.Mode, boot.MaxPerUID); applyErr != nil {
+		boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
+	}
+	if boot.Outcome == RolloutBootAdopted && markers != nil {
+		if stampErr := markers.StampOnce(bootCtx, boot.Floor); stampErr != nil {
+			boot.Warning = strings.TrimSpace(boot.Warning + " " + stampErr.Error())
+		}
+	}
+	if boot.Outcome == RolloutBootRecovered {
+		if recoverErr := store.RecoverRolloutControlAtEnforce(bootCtx, boot.MaxPerUID); recoverErr != nil {
+			boot.Warning = strings.TrimSpace(boot.Warning + " " + recoverErr.Error())
+		}
+	}
+
+	runtime := &sessionRuntime{store: store, client: client, boot: boot, policy: policy}
+	ctx.SetValue(runtime, sessionRuntimeContextKey)
 	return store, client
+}
+
+// SessionBootForContext exposes what boot resolved, for the startup log line
+// and the rollout status subcommand.
+func SessionBootForContext(ctx *config.Context) (RolloutBoot, []string) {
+	if existing, ok := ctx.Value(sessionRuntimeContextKey).(*sessionRuntime); ok {
+		return existing.boot, existing.policy.warnings
+	}
+	return RolloutBoot{}, nil
 }
 
 func sessionRedisOptionsFromEnv() (sessionRedisOptions, error) {

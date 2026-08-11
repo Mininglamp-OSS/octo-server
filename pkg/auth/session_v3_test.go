@@ -16,119 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSessionPolicyFromEnvDefaultsClosedAndValidatesActivation(t *testing.T) {
-	t.Run("expand default", func(t *testing.T) {
-		unsetSessionRuntimeEnv(t)
-		policy, err := sessionPolicyFromEnv()
-		require.NoError(t, err)
-		require.Equal(t, SessionModeExpand, policy.mode)
-		require.Zero(t, policy.maxPerUID)
-	})
-
-	t.Run("v3 requires explicit bound", func(t *testing.T) {
-		unsetSessionRuntimeEnv(t)
-		t.Setenv(sessionModeEnv, string(SessionModeV3Write))
-		_, err := sessionPolicyFromEnv()
-		require.ErrorContains(t, err, sessionMaxPerUIDEnv)
-	})
-
-	t.Run("v3 accepts explicit bound", func(t *testing.T) {
-		unsetSessionRuntimeEnv(t)
-		t.Setenv(sessionModeEnv, string(SessionModeV3Write))
-		t.Setenv(sessionMaxPerUIDEnv, "2")
-		policy, err := sessionPolicyFromEnv()
-		require.NoError(t, err)
-		require.Equal(t, SessionModeV3Write, policy.mode)
-		require.Equal(t, 2, policy.maxPerUID)
-	})
-
-	t.Run("required floor rejects lower configured mode", func(t *testing.T) {
-		unsetSessionRuntimeEnv(t)
-		t.Setenv(sessionRequiredFloorEnv, string(SessionModeV3Write))
-		_, err := sessionPolicyFromEnv()
-		require.ErrorContains(t, err, sessionRequiredFloorEnv)
-	})
-
-	for _, value := range []string{"", "unknown", "V3-WRITE"} {
-		t.Run("invalid mode "+value, func(t *testing.T) {
-			unsetSessionRuntimeEnv(t)
-			t.Setenv(sessionModeEnv, value)
-			_, err := sessionPolicyFromEnv()
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestSessionRolloutControlIsMonotonicAndFailClosed(t *testing.T) {
-	cfg := config.New()
-	client := octoredis.NewInstrumentedClient(cfg)
-	prefix := "session-rollout:" + util.GenerUUID() + ":"
-	uidPrefix := "session-rollout-uid:" + util.GenerUUID() + ":"
-	v3Store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
-	expandStore := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour)
-	t.Cleanup(func() {
-		_ = client.Del(v3Store.rolloutControlKey()).Err()
-		_ = client.Close()
-	})
-
-	require.NoError(t, v3Store.ValidateRolloutControl(context.Background(), ""))
-	require.Error(t, v3Store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, 0), "at least 1h")
-	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest-time.Millisecond), "at least 1h")
-	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest))
-	require.Error(t, expandStore.ValidateRolloutControl(context.Background(), ""))
-	require.NoError(t, v3Store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-	require.Error(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeBounded, rolloutObservationGapForTest))
-	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeRevoke, 2*rolloutObservationGapForTest))
-	control, err := v3Store.RolloutControl(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, SessionModeRevoke, control.ModeFloor)
-	require.Equal(t, (2 * rolloutObservationGapForTest).Milliseconds(), control.ObservationMinGapMS)
-	require.ErrorContains(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeBounded, rolloutObservationGapForTest), "cannot decrease")
-}
-
-func TestSessionRolloutControlBackfillsLegacyObservationGapOnNextAdvance(t *testing.T) {
-	cfg := config.New()
-	client := octoredis.NewInstrumentedClient(cfg)
-	prefix := "session-rollout-legacy:" + util.GenerUUID() + ":"
-	uidPrefix := "session-rollout-legacy-uid:" + util.GenerUUID() + ":"
-	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
-	t.Cleanup(func() {
-		_ = client.Del(store.rolloutControlKey()).Err()
-		_ = client.Close()
-	})
-
-	require.NoError(t, client.Set(store.rolloutControlKey(), `{"mode_floor":"v3-write","writer_version":3}`, 0).Err())
-	control, err := store.RolloutControl(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, control.ObservationMinGapMS)
-	require.NoError(t, store.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-
-	require.NoError(t, store.AdvanceRolloutControl(context.Background(), SessionModeRevoke, rolloutObservationGapForTest))
-	control, err = store.RolloutControl(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, SessionModeRevoke, control.ModeFloor)
-	require.Equal(t, rolloutObservationGapForTest.Milliseconds(), control.ObservationMinGapMS)
-}
-
-func TestSessionRolloutControlRejectsSkippingPastPersistedFloor(t *testing.T) {
-	cfg := config.New()
-	client := octoredis.NewInstrumentedClient(cfg)
-	prefix := "session-rollout-skip:" + util.GenerUUID() + ":"
-	uidPrefix := "session-rollout-skip-uid:" + util.GenerUUID() + ":"
-	v3Store := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeV3Write), WithSessionMaxPerUID(2))
-	revokeStore := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeRevoke), WithSessionMaxPerUID(2))
-	enforceStore := NewRedisSessionStore(client, prefix, uidPrefix, time.Hour, WithSessionMode(SessionModeEnforce), WithSessionMaxPerUID(2))
-	t.Cleanup(func() {
-		_ = client.Del(v3Store.rolloutControlKey()).Err()
-		_ = client.Close()
-	})
-
-	require.NoError(t, v3Store.AdvanceRolloutControl(context.Background(), SessionModeV3Write, rolloutObservationGapForTest))
-	require.NoError(t, revokeStore.ValidateRolloutControl(context.Background(), SessionModeV3Write))
-	require.ErrorContains(t, enforceStore.ValidateRolloutControl(context.Background(), SessionModeV3Write), "more than one phase")
-}
-
 func TestRedisSessionStoreIssuesBoundedV3AndValidatorUsesGeneration(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
@@ -719,4 +606,82 @@ func TestRedisSessionStoreSnapshotUpdatePreservesV3SecurityClaims(t *testing.T) 
 	require.Equal(t, beforeInfo.SessionGeneration, afterInfo.SessionGeneration)
 	require.Equal(t, beforeInfo.SessionRevision, afterInfo.SessionRevision)
 	require.LessOrEqual(t, afterRecord.TTL, beforeRecord.TTL)
+}
+
+// Configuration is advisory now. The deprecated variables are honoured for one
+// release but a stale or malformed one must never take the process down: a
+// deployment failing to start over an environment variable is the failure class
+// this redesign removes.
+func TestSessionPolicyFromEnvIsAdvisoryAndNeverFatal(t *testing.T) {
+	t.Run("no env at all", func(t *testing.T) {
+		unsetSessionRuntimeEnv(t)
+		policy := sessionPolicyFromEnv()
+		require.Empty(t, policy.legacyMode)
+		require.Zero(t, policy.legacyMaxPerUID)
+		require.Empty(t, policy.warnings)
+	})
+
+	t.Run("deprecated mode is carried and flagged", func(t *testing.T) {
+		unsetSessionRuntimeEnv(t)
+		t.Setenv(sessionModeEnv, string(SessionModeBounded))
+		t.Setenv(sessionMaxPerUIDEnv, "20")
+		policy := sessionPolicyFromEnv()
+		require.Equal(t, SessionModeBounded, policy.legacyMode)
+		require.Equal(t, 20, policy.legacyMaxPerUID)
+		require.Len(t, policy.warnings, 2)
+	})
+
+	for _, value := range []string{"", "unknown", "V3-WRITE"} {
+		t.Run("unparseable mode "+value+" is ignored, not fatal", func(t *testing.T) {
+			unsetSessionRuntimeEnv(t)
+			t.Setenv(sessionModeEnv, value)
+			policy := sessionPolicyFromEnv()
+			require.Empty(t, policy.legacyMode)
+			require.NotEmpty(t, policy.warnings)
+		})
+	}
+
+	t.Run("removed required-floor is reported, not honoured", func(t *testing.T) {
+		unsetSessionRuntimeEnv(t)
+		t.Setenv(sessionRequiredFloorEnv, string(SessionModeV3Write))
+		policy := sessionPolicyFromEnv()
+		require.NotEmpty(t, policy.warnings)
+	})
+}
+
+// The cap moves from the environment into the floor record. A #725 record
+// predates the field, so reading one must work and the next advance must be
+// able to supply it.
+func TestSessionRolloutControlCarriesMaxPerUIDAndReadsLegacyRecords(t *testing.T) {
+	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
+	ctx := context.Background()
+
+	require.NoError(t, client.Set(store.rolloutControlKey(),
+		`{"mode_floor":"v3-write","writer_version":3,"observation_min_gap_ms":3600000}`, 0).Err())
+	control, err := store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.Equal(t, SessionModeV3Write, control.ModeFloor)
+	require.Zero(t, control.MaxPerUID, "a #725 record has no cap field")
+
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+	control, err = store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.Equal(t, SessionModeRevoke, control.ModeFloor)
+	require.Equal(t, 20, control.MaxPerUID)
+	require.Equal(t, int64(3600000), control.ObservationMinGapMS,
+		"the unused gap is carried forward so a #725 artifact can still parse the record")
+
+	// Omitting the cap on a later advance keeps the persisted one.
+	require.NoError(t, store.AdvanceRolloutControl(ctx, SessionModeBounded, 0))
+	control, err = store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 20, control.MaxPerUID)
+}
+
+// A v3-writing floor without a cap would be a bounded index with no bound.
+func TestSessionRolloutControlRefusesV3FloorWithoutCap(t *testing.T) {
+	store, _ := newLegacyMigrationTestStore(t, SessionModeRevoke)
+	ctx := context.Background()
+	require.ErrorContains(t, store.AdvanceRolloutControl(ctx, SessionModeV3Write, 0),
+		"bounded max sessions per UID")
 }

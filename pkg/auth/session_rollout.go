@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	rd "github.com/go-redis/redis"
 )
@@ -38,39 +37,46 @@ return 1
 
 var ErrRolloutControlChanged = errors.New("auth: session rollout control changed concurrently")
 
-// MinimumRolloutObservationGap is the hard safety floor for independent
-// rollout observations. Operators may raise it between phases but cannot
-// lower it once persisted.
-const MinimumRolloutObservationGap = time.Hour
-
+// SessionRolloutControl is the floor record. It stays in Redis under a Lua CAS
+// (see session_rollout_marker.go for why it is not moved to MySQL).
+//
+// ObservationMinGapMS is no longer used — the two-observation ritual it paced
+// is gone — but it is still read and carried forward so an existing #725
+// record needs no surgery, and still WRITTEN so a #725 artifact can parse the
+// record during the rollback window. MaxPerUID is new; #725 unmarshals into a
+// struct and ignores unknown fields, so adding it is backward compatible.
+// Nothing in this struct may be renamed or removed this release.
 type SessionRolloutControl struct {
 	ModeFloor           SessionMode `json:"mode_floor"`
 	WriterVersion       int         `json:"writer_version"`
 	ObservationMinGapMS int64       `json:"observation_min_gap_ms"`
+	MaxPerUID           int         `json:"max_per_uid,omitempty"`
 }
 
-func (s *RedisSessionStore) ValidateRolloutControl(ctx context.Context, requiredFloor SessionMode) error {
-	control, _, err := s.loadRolloutControl(ctx)
-	if err != nil {
+// RecoverRolloutControlAtEnforce re-establishes a floor record that Redis lost,
+// at enforce. It is guarded by the caller having seen the MySQL marker: without
+// that proof this would be indistinguishable from a fresh install, where the
+// same write would log every user out.
+//
+// SET NX, so concurrently booting replicas converge on one record and a floor
+// that reappeared in the meantime always wins.
+func (s *RedisSessionStore) RecoverRolloutControlAtEnforce(ctx context.Context, maxPerUID int) error {
+	if maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit {
+		return errors.New("auth: rollout recovery requires a bounded max sessions per UID")
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if control == nil {
-		if requiredFloor.valid() {
-			return fmt.Errorf("auth: session rollout control is required at floor %s", requiredFloor)
-		}
-		if s.mode.rank() >= SessionModeRevoke.rank() {
-			return fmt.Errorf("auth: session rollout control is required for mode %s", s.mode)
-		}
-		return nil
+	encoded, err := json.Marshal(SessionRolloutControl{
+		ModeFloor:     SessionModeEnforce,
+		WriterVersion: 3,
+		MaxPerUID:     maxPerUID,
+	})
+	if err != nil {
+		return fmt.Errorf("auth: encode recovered rollout control: %w", err)
 	}
-	if s.mode.rank() < control.ModeFloor.rank() {
-		return fmt.Errorf("auth: configured session mode %s is below persisted floor %s", s.mode, control.ModeFloor)
-	}
-	if s.mode.rank() > control.ModeFloor.rank()+1 {
-		return fmt.Errorf("auth: configured session mode %s is more than one phase above persisted floor %s", s.mode, control.ModeFloor)
-	}
-	if requiredFloor.valid() && control.ModeFloor.rank() < requiredFloor.rank() {
-		return fmt.Errorf("auth: persisted session floor %s is below required floor %s", control.ModeFloor, requiredFloor)
+	if err := s.client.SetNX(s.rolloutControlKey(), string(encoded), 0).Err(); err != nil {
+		return fmt.Errorf("auth: recover rollout control: %w", err)
 	}
 	return nil
 }
@@ -80,39 +86,47 @@ func (s *RedisSessionStore) RolloutControl(ctx context.Context) (*SessionRollout
 	return control, err
 }
 
-// AdvanceRolloutControl performs one monotonic CAS transition. It is intended
-// for an explicit operator tool, never an API process startup hook.
-func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next SessionMode, observationMinGap time.Duration) error {
+// AdvanceRolloutControl performs one monotonic CAS transition.
+//
+// maxPerUID sets the bounded-session cap carried in the record; pass 0 to keep
+// the persisted value. It is required when crossing into a v3-writing floor,
+// because from that point the cap is no longer supplied by the environment.
+//
+// A loser in a race surfaces one of two errors and BOTH are benign: a racer
+// that read before the winner's write reaches the CAS and gets
+// ErrRolloutControlChanged, while one that read after is rejected here by the
+// pre-check. Anything racing this (notably a multi-replica reconciler) must
+// treat both as a no-op rather than an error worth alerting on.
+func (s *RedisSessionStore) AdvanceRolloutControl(ctx context.Context, next SessionMode, maxPerUID int) error {
 	if !next.valid() || next == SessionModeExpand {
 		return errors.New("auth: rollout floor must advance to v3-write or later")
-	}
-	observationMinGapMS := observationMinGap.Milliseconds()
-	if observationMinGap < MinimumRolloutObservationGap {
-		return fmt.Errorf("auth: rollout observation minimum gap must be at least %s", MinimumRolloutObservationGap)
 	}
 	current, raw, err := s.loadRolloutControl(ctx)
 	if err != nil {
 		return err
 	}
+	observationMinGapMS := int64(0)
 	if current == nil {
 		if next != SessionModeV3Write {
 			return fmt.Errorf("auth: first rollout floor must be %s", SessionModeV3Write)
 		}
 	} else {
-		if current.ObservationMinGapMS > observationMinGapMS {
-			return fmt.Errorf("auth: rollout observation minimum gap cannot decrease below persisted %dms", current.ObservationMinGapMS)
-		}
+		observationMinGapMS = current.ObservationMinGapMS
 		if next.rank() != current.ModeFloor.rank()+1 {
 			return fmt.Errorf("auth: rollout floor must advance exactly one phase from %s", current.ModeFloor)
 		}
-		if err := s.validateRolloutAdvanceEvidence(ctx, current.ModeFloor, next, observationMinGapMS); err != nil {
-			return err
+		if maxPerUID <= 0 {
+			maxPerUID = current.MaxPerUID
 		}
+	}
+	if next.writesV3() && (maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit) {
+		return fmt.Errorf("auth: rollout floor %s requires a bounded max sessions per UID", next)
 	}
 	nextControl := SessionRolloutControl{
 		ModeFloor:           next,
 		WriterVersion:       3,
 		ObservationMinGapMS: observationMinGapMS,
+		MaxPerUID:           maxPerUID,
 	}
 	encoded, err := json.Marshal(nextControl)
 	if err != nil {

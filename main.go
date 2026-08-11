@@ -109,6 +109,17 @@ func validateTokenExpireConfig(vp *viper.Viper) (time.Duration, error) {
 }
 
 func main() {
+	// `app session-rollout ...` is dispatched before flag.Parse: the server's
+	// own -config flag would otherwise swallow the subcommand's flags, since
+	// flag.Parse stops at the first non-flag argument.
+	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == sessionRolloutCommand {
+		if err := runSessionRolloutCommand(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var CfgFile string //config file
 	flag.StringVar(&CfgFile, "config", "configs/tsdd.yaml", "config file")
 	flag.Parse()
@@ -289,9 +300,52 @@ func runAPI(ctx *config.Context) {
 	metrics.NewSessionMetrics(prometheus.DefaultRegisterer)
 	metrics.SetSessionEffectiveTTL(ctx.GetConfig().Cache.TokenExpire)
 	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
+
+	// Session rollout control plane. The mode is no longer a fixed startup
+	// value read from the environment: the registry publishes this replica's
+	// write lease and applied floor, and the reconciler polls the floor so a
+	// floor advance propagates without a rolling restart.
+	//
+	// The reconciler is started here and nowhere else. Starting it from the
+	// store constructor would spawn a floor-advancing goroutine in every test
+	// that happens to build a store.
+	sessionBoot, sessionWarnings := auth.SessionBootForContext(ctx)
+	metrics.SetSessionRolloutBootOutcome(string(sessionBoot.Outcome))
+	for _, warning := range sessionWarnings {
+		log.Warn("session rollout config: " + warning)
+	}
+	if sessionBoot.Warning != "" {
+		log.Warn("session rollout: " + sessionBoot.Warning)
+	}
+	writerRegistry := auth.NewWriterRegistry(sessionRedis, ctx.GetConfig().Cache.UIDTokenCachePrefix)
+	if err := writerRegistry.Join(
+		context.Background(),
+		ctx.GetConfig().Version,
+		os.Getenv("POD_NAME"),
+		string(sessionBoot.Floor),
+		nil,
+	); err != nil {
+		// Not fatal: a replica that cannot take a lease refuses to create new
+		// tokens (see the store's write path) but keeps serving existing
+		// sessions. Refusing to start would be the defect this replaces.
+		log.Warn("session rollout: writer lease unavailable: " + err.Error())
+	}
+	tokenStore.UseWriterLease(writerRegistry)
+	reconciler := auth.NewRolloutReconciler(tokenStore, auth.ReconcilerOptions{
+		Registry:      writerRegistry,
+		Markers:       auth.NewRolloutMarkerStore(ctx.DB()),
+		AutoAdvance:   sessionBoot.AutoAdvance,
+		CanaryAhead:   sessionBoot.CanaryAhead,
+		ExpectWriters: sessionBoot.ExpectWriters,
+		MaxPerUID:     sessionBoot.MaxPerUID,
+		Log:           func(format string, args ...interface{}) { log.Info(fmt.Sprintf(format, args...)) },
+	})
+	go reconciler.Run(context.Background())
+
 	fmt.Printf(
-		"Authentication session runtime: mode=%s rollout_floor=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
-		tokenStore.Mode(), rolloutFloor, ctx.GetConfig().Cache.TokenExpire,
+		"Authentication session runtime: mode=%s rollout_floor=%s boot=%s auto_advance=%t redis=%s instance=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
+		tokenStore.Mode(), rolloutFloor, sessionBoot.Outcome, sessionBoot.AutoAdvance,
+		sessionRedis.Options().Addr, sessionRedisInstanceLabel(tokenStore), ctx.GetConfig().Cache.TokenExpire,
 		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
 	)
 	// 自定义贴纸 handle 上线观测指标(P0: Sticker Handle Enforcement Rollout):上传签发
@@ -896,4 +950,15 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
 	return registry
+}
+
+// sessionRedisInstanceLabel resolves the Redis process identity for the startup
+// line. Config-derived identity cannot distinguish two endpoints, so the
+// startup log states which Redis this replica actually reached.
+func sessionRedisInstanceLabel(store *auth.RedisSessionStore) string {
+	id, err := store.RedisInstanceFingerprint()
+	if err != nil {
+		return "unknown"
+	}
+	return id[:16]
 }

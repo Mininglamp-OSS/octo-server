@@ -8,17 +8,23 @@ import (
 )
 
 type SessionMetrics struct {
-	Operations        *prometheus.CounterVec
-	OperationLatency  *prometheus.HistogramVec
-	ValidationReject  *prometheus.CounterVec
-	PersistentSeen    prometheus.Counter
-	EffectiveTTL      prometheus.Gauge
-	RolloutMode       *prometheus.GaugeVec
-	RevocationBacklog prometheus.Gauge
-	RevocationRetries *prometheus.CounterVec
-	operationOK       map[string]prometheus.Counter
-	operationError    map[string]prometheus.Counter
-	operationLatency  map[string]prometheus.Observer
+	Operations         *prometheus.CounterVec
+	OperationLatency   *prometheus.HistogramVec
+	ValidationReject   *prometheus.CounterVec
+	PersistentSeen     prometheus.Counter
+	EffectiveTTL       prometheus.Gauge
+	RolloutMode        *prometheus.GaugeVec
+	RevocationBacklog  prometheus.Gauge
+	RevocationRetries  *prometheus.CounterVec
+	LiveWriters        prometheus.Gauge
+	WriterFences       prometheus.Counter
+	FloorAdvances      *prometheus.CounterVec
+	ReconcileBlocked   *prometheus.CounterVec
+	ReconcileScans     prometheus.Counter
+	RolloutBootOutcome *prometheus.GaugeVec
+	operationOK        map[string]prometheus.Counter
+	operationError     map[string]prometheus.Counter
+	operationLatency   map[string]prometheus.Observer
 }
 
 var defaultSessionMetrics atomic.Pointer[SessionMetrics]
@@ -74,8 +80,49 @@ func NewSessionMetrics(reg prometheus.Registerer) *SessionMetrics {
 			Name:      "revocation_retries_total",
 			Help:      "Durable session revocation retry failures by bounded reason.",
 		}, []string{"reason"}),
+		LiveWriters: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "live_writers",
+			Help:      "Writers holding a live write lease, as seen by this process.",
+		}),
+		WriterFences: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "writer_fence_total",
+			Help:      "Times this process lost its write lease and refused to create new tokens.",
+		}),
+		FloorAdvances: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "floor_advance_total",
+			Help:      "Rollout floor advances by resulting floor and who performed them.",
+		}, []string{"to", "actor"}),
+		ReconcileBlocked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "reconcile_blocked_total",
+			Help:      "Reconciler cycles that could not advance, by bounded reason.",
+		}, []string{"reason"}),
+		ReconcileScans: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "reconcile_scan_total",
+			Help:      "Keyspace scans performed by the rollout reconciler.",
+		}),
+		RolloutBootOutcome: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "rollout_boot_outcome",
+			Help:      "How this process resolved its rollout mode at boot; exactly one outcome is 1.",
+		}, []string{"outcome"}),
 	}
-	reg.MustRegister(m.Operations, m.OperationLatency, m.ValidationReject, m.PersistentSeen, m.EffectiveTTL, m.RolloutMode, m.RevocationBacklog, m.RevocationRetries)
+	reg.MustRegister(m.Operations, m.OperationLatency, m.ValidationReject, m.PersistentSeen, m.EffectiveTTL,
+		m.RolloutMode, m.RevocationBacklog, m.RevocationRetries,
+		m.LiveWriters, m.WriterFences, m.FloorAdvances, m.ReconcileBlocked, m.ReconcileScans, m.RolloutBootOutcome)
+	for _, outcome := range sessionRolloutBootOutcomes {
+		m.RolloutBootOutcome.WithLabelValues(outcome).Set(0)
+	}
 	for _, mode := range sessionRolloutModes {
 		m.RolloutMode.WithLabelValues(mode).Set(0)
 	}
@@ -132,6 +179,64 @@ func SetSessionEffectiveTTL(ttl time.Duration) {
 }
 
 var sessionRolloutModes = []string{"expand", "v3-write", "revoke", "bounded", "enforce"}
+
+// sessionRolloutBootOutcomes mirrors auth.RolloutBootOutcome. Kept as literals
+// so pkg/metrics does not import pkg/auth.
+var sessionRolloutBootOutcomes = []string{"fresh", "adopted", "rollback-recovered", "normal"}
+
+// SetSessionLiveWriters records how many writers hold a live lease.
+func SetSessionLiveWriters(count int) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.LiveWriters.Set(float64(count))
+	}
+}
+
+// ObserveSessionWriterFence counts a lost write lease. A sustained non-zero
+// rate means replicas are refusing new logins, which is the intended
+// degradation but still wants an alert.
+func ObserveSessionWriterFence() {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.WriterFences.Inc()
+	}
+}
+
+// ObserveSessionFloorAdvance records a floor transition. actor is "reconciler"
+// or "operator" so an automatic advance is distinguishable during an incident.
+func ObserveSessionFloorAdvance(to, actor string) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.FloorAdvances.WithLabelValues(to, actor).Inc()
+	}
+}
+
+// ObserveSessionReconcileBlocked counts a cycle that could not advance.
+func ObserveSessionReconcileBlocked(reason string) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.ReconcileBlocked.WithLabelValues(reason).Inc()
+	}
+}
+
+// ObserveSessionReconcileScan counts a keyspace scan by the reconciler, so the
+// backoff can be verified from metrics rather than trusted.
+func ObserveSessionReconcileScan() {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.ReconcileScans.Inc()
+	}
+}
+
+// SetSessionRolloutBootOutcome records how boot resolved the mode.
+func SetSessionRolloutBootOutcome(current string) {
+	m := defaultSessionMetrics.Load()
+	if m == nil {
+		return
+	}
+	for _, outcome := range sessionRolloutBootOutcomes {
+		value := 0.0
+		if outcome == current {
+			value = 1
+		}
+		m.RolloutBootOutcome.WithLabelValues(outcome).Set(value)
+	}
+}
 
 func SetSessionRolloutMode(current string) {
 	if m := defaultSessionMetrics.Load(); m != nil {

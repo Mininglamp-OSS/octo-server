@@ -24,6 +24,23 @@ if string.sub(value, 1, 3) == "v3:" then
   version = 3
 elseif string.sub(value, 1, 3) == "v2:" then
   version = 2
+else
+  -- Mirror decodeLegacy: a v1 payload is uid@name[@role], so one or two "@"
+  -- with a non-empty uid. Anything else is not a decodable credential and is
+  -- reported separately instead of being silently processed as v1 — observe
+  -- has always counted these as decode_invalid, and having the two commands
+  -- disagree meant the enforce gate and the thing that converges it were
+  -- measuring with different rulers.
+  local _, at_count = string.gsub(value, "@", "")
+  if at_count < 1 or at_count > 2 or string.sub(value, 1, 1) == "@" then
+    version = -1
+  end
+end
+if version == -1 then
+  -- Left untouched on purpose. It is not a usable credential (the validator
+  -- has always rejected it) and it no longer blocks the floor, so there is
+  -- nothing to gain from a migration mutating a record it cannot parse.
+  return {version, ttl, 5}
 end
 if version == 3 then
   if ttl <= 0 then
@@ -101,21 +118,25 @@ const (
 )
 
 type LegacyMigrationResult struct {
-	Complete    bool   `json:"complete"`
-	CampaignID  string `json:"campaign_id"`
-	Scanned     int64  `json:"scanned"`
-	Missing     int64  `json:"missing"`
-	V1          int64  `json:"v1"`
-	V2          int64  `json:"v2"`
-	V3          int64  `json:"v3"`
-	Shortened   int64  `json:"shortened"`
-	WouldDelete int64  `json:"would_delete"`
-	Deleted     int64  `json:"deleted"`
-	Unchanged   int64  `json:"unchanged"`
-	Invalid     int64  `json:"invalid"`
-	V3NonFinite int64  `json:"v3_non_finite"`
-	LastCursor  uint64 `json:"last_cursor"`
-	LockLost    bool   `json:"lock_lost"`
+	Complete   bool   `json:"complete"`
+	CampaignID string `json:"campaign_id"`
+	Scanned    int64  `json:"scanned"`
+	// InvalidPayload counts records that cannot be decoded as any token
+	// version. It mirrors SessionObservation.DecodeInvalid so observe and
+	// migrate report the same number for the same keyspace.
+	InvalidPayload int64  `json:"invalid_payload"`
+	Missing        int64  `json:"missing"`
+	V1             int64  `json:"v1"`
+	V2             int64  `json:"v2"`
+	V3             int64  `json:"v3"`
+	Shortened      int64  `json:"shortened"`
+	WouldDelete    int64  `json:"would_delete"`
+	Deleted        int64  `json:"deleted"`
+	Unchanged      int64  `json:"unchanged"`
+	Invalid        int64  `json:"invalid"`
+	V3NonFinite    int64  `json:"v3_non_finite"`
+	LastCursor     uint64 `json:"last_cursor"`
+	LockLost       bool   `json:"lock_lost"`
 }
 
 type legacyMigrationCampaign struct {
@@ -388,6 +409,8 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 	}
 	result.Scanned++
 	switch version {
+	case -1:
+		result.InvalidPayload++
 	case 0:
 		result.Missing++
 	case 1:
@@ -417,6 +440,8 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 		}
 	case 4:
 		return ErrMigrationElapsedCutoffConfirmationRequired
+	case 5:
+		// Undecodable payload, deliberately skipped; already counted above.
 	default:
 		return fmt.Errorf("auth: invalid migration action %d", action)
 	}
