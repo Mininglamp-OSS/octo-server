@@ -290,6 +290,28 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	fencedUID := userInfo.UID
+	loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化邮箱登录会话栅栏失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	userInfo, err = u.db.QueryByEmail(req.Email)
+	if err != nil {
+		u.Error("会话栅栏后复核邮箱登录用户失败", zap.String("email", req.Email), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil || userInfo.UID != fencedUID {
+		if req.Password != "" {
+			u.loginGuard.RecordFailureLogged(req.Email)
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
+			return
+		}
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		// 密码路径同样泄露账号状态，统一为通用错误 + 计入失败计数
 		if req.Password != "" {
@@ -388,7 +410,7 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	if err := u.db.updatePassword(newHash, userInfo.UID); err != nil {
+	if err := updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, newHash, "password_reset"); err != nil {
 		u.Error("更新密码失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return

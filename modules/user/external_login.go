@@ -104,6 +104,14 @@ func (u *User) externalLoginExisting(ctx context.Context, req ExternalLoginReq) 
 	if userInfoM == nil {
 		return nil, errors.New("用户不存在")
 	}
+	ctx, err = withUserSessionIssueFence(ctx, u.sessionStore, userInfoM.UID)
+	if err != nil {
+		return nil, fmt.Errorf("user: initialize external login session fence: %w", err)
+	}
+	userInfoM, err = u.reloadUserAfterIssueFence(ctx, userInfoM.UID)
+	if err != nil {
+		return nil, err
+	}
 	// IsDestroy 三态(db.go:15):0=正常 1=冷静期(可撤销) 2=已注销(终态)。
 	// 冷静期用户允许登录,登录动作即撤销注销;已注销用户拒绝。
 	// 与 api_emaillogin.go:245 / api.go:1012 等其他登录入口对齐。

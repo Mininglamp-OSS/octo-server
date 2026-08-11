@@ -30,6 +30,7 @@ func run() error {
 	configPath := flag.String("config", "configs/tsdd.yaml", "octo-server config file")
 	batchSize := flag.Int64("batch-size", 200, "Redis SCAN count hint (1-10000)")
 	qps := flag.Float64("qps", 100, "maximum token records read per second")
+	recordRolloutEvidence := flag.Bool("record-rollout-evidence", false, "persist this complete aggregate scan as rollout evidence")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -59,11 +60,18 @@ func run() error {
 	}
 	interval := time.Duration(float64(time.Second) / *qps)
 	stats, err := store.ObserveRateLimited(ctx, *batchSize, interval)
-	if err != nil {
-		return fmt.Errorf("observe token sessions: %w", err)
+	var evidenceErr error
+	if err == nil && *recordRolloutEvidence {
+		evidenceErr = store.RecordRolloutObservation(ctx, stats)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(stats); err != nil {
 		return fmt.Errorf("encode aggregate observation: %w", err)
+	}
+	if err != nil {
+		return fmt.Errorf("observe token sessions: %w", err)
+	}
+	if evidenceErr != nil {
+		return fmt.Errorf("record rollout observation evidence: %w", evidenceErr)
 	}
 	return nil
 }

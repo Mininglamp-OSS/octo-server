@@ -11,7 +11,6 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/cache"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -320,6 +319,24 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
+	if err != nil {
+		m.Error("初始化管理端登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	fencedUID := userInfo.UID
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(req.Username)
+	if err != nil {
+		m.Error("会话栅栏后复核管理端用户失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil || userInfo.UID != fencedUID ||
+		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		m.loginLog.recordFailure(req.Username, publicIP, "manager")
@@ -340,19 +357,14 @@ func (m *Manager) login(c *wkhttp.Context) {
 		return
 	}
 	token := util.GenerUUID()
-	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userInfo.UID,
-		Name:     userInfo.Name,
-		Role:     userInfo.Role,
-		Language: userInfo.Language,
-	})
-	if err != nil {
-		m.Error("编码token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(config.Web),
 	}
-	err = m.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userInfo.UID, int(config.Web))
+	err = issueUserSession(c.Request.Context(), m.sessionStore, token, sessionInfo, issueFence)
 	if err != nil {
 		m.Error("设置管理端token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
@@ -415,7 +427,7 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = m.userDB.UpdateUsersWithField("password", newHash, req.Uid)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, m.ctx.QuitUserDevice, req.Uid, newHash, "password_reset")
 	if err != nil {
 		m.Error("重置用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
@@ -608,26 +620,46 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin)
 		return
 	}
-	err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
+	err = m.deleteAdminUser(c.Request.Context(), user.UID)
 	if err != nil {
 		m.Error("删除管理员错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	// 先失效角色热缓存，再撤销 token。DB 里该 uid 已删（权威源 role 已为空），所以
-	// 只要这里清掉 user_role:{uid} 热缓存，即便下面的 token 撤销失败、某个 token 残
-	// 留，下一请求经 RoleResolver 也会从 DB 解析出"无系统角色"而被拒。顺序反过来
-	// （先撤 token，失败就 return）会跳过 Invalidate，让旧 role 缓存存活到 TTL，
-	// 与残留 token 叠加成提权窗口——正是本 PR 要消除的（PR #364 review）。
-	m.roleService.Invalidate(user.UID)
 	// 撤销该管理员在所有设备端（APP/Web/PC）的登录态，而不只是 Web。尽力删除每个端
 	// （不在首个错误就中断），最大化吊销面；任一失败仍向调用方报错以便排查。
-	if err := m.revokeAllDeviceTokens(user.UID); err != nil {
-		m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
+	if !sessionRevocationActive(m.sessionStore) {
+		// user 行已被硬删除，且兼容模式下没有持久化的 revocation intent 兜底：
+		// 这是唯一一次撤销机会。必须脱离请求 context，否则客户端断开即永久跳过，
+		// 运维和 runtime 都没有收敛路径。
+		securityCtx, cancel := postCommitSecurityContext(c.Request.Context())
+		defer cancel()
+		if err := m.revokeAllDeviceTokens(securityCtx, user.UID); err != nil {
+			m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
+			respondUserError(c, errcode.ErrUserTokenCacheFailed)
+			return
+		}
 	}
 	c.ResponseOK()
+}
+
+func (m *Manager) deleteAdminUser(ctx context.Context, uid string) error {
+	if sessionRevocationActive(m.sessionStore) {
+		intent, err := m.userDB.deleteAdminWithSessionRevocation(ctx, uid, string(wkhttp.Admin))
+		if err != nil {
+			return err
+		}
+		// The transaction has committed: invalidate authorization state before
+		// attempting Redis revocation so an apply failure cannot preserve an
+		// admin role cache alongside a residual bearer.
+		m.roleService.Invalidate(uid)
+		return applyAndMarkSessionRevocation(ctx, m.userDB, m.sessionStore, intent)
+	}
+	if err := m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin)); err != nil {
+		return err
+	}
+	m.roleService.Invalidate(uid)
+	return nil
 }
 
 // deviceTokenRevokeFailure pairs a device flag with the error from trying to
@@ -637,17 +669,14 @@ type deviceTokenRevokeFailure struct {
 	err  error
 }
 
-// revokeDeviceTokensInCache is the cache-only, injectable core of
-// revokeAllDeviceTokens (factored out so it can be unit-tested with a fake
-// cache). It removes uid's token payload + UIDToken reverse mapping for every
-// device flag. best-effort: it does NOT abort on the first error — it attempts
-// every flag and returns one failure entry per error, so a Redis hiccup on one
-// device cannot strand the others.
-func revokeDeviceTokensInCache(c cache.Cache, uidTokenPrefix, tokenPrefix, uid string) []deviceTokenRevokeFailure {
+// revokeDeviceTokens routes every credential mutation through Session Store,
+// which owns compare-delete and v3 bounded-index cleanup. It remains
+// best-effort across device flags so one Redis error does not strand all other
+// known sessions.
+func revokeDeviceTokens(ctx context.Context, store userSessionStore, uid string) []deviceTokenRevokeFailure {
 	var failures []deviceTokenRevokeFailure
 	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
-		uidKey := fmt.Sprintf("%s%d%s", uidTokenPrefix, flag, uid)
-		token, err := c.Get(uidKey)
+		token, err := store.DeviceToken(ctx, uid, int(flag))
 		if err != nil {
 			failures = append(failures, deviceTokenRevokeFailure{flag, err})
 			continue
@@ -655,11 +684,7 @@ func revokeDeviceTokensInCache(c cache.Cache, uidTokenPrefix, tokenPrefix, uid s
 		if token == "" {
 			continue
 		}
-		if err := c.Delete(tokenPrefix + token); err != nil {
-			failures = append(failures, deviceTokenRevokeFailure{flag, err})
-			continue
-		}
-		if err := c.Delete(uidKey); err != nil {
+		if err := revokeCurrentUserSession(ctx, store, token, uid, int(flag)); err != nil {
 			failures = append(failures, deviceTokenRevokeFailure{flag, err})
 		}
 	}
@@ -668,10 +693,9 @@ func revokeDeviceTokensInCache(c cache.Cache, uidTokenPrefix, tokenPrefix, uid s
 
 // revokeAllDeviceTokens 清除某 uid 在所有设备端（APP/Web/PC）的登录态：既删
 // token:{token} 让旧 token 立即失效，也删 UIDToken:{flag}{uid} 反查映射。
-// best-effort（见 revokeDeviceTokensInCache），逐端记日志，返回首个错误供调用方报错。
-func (m *Manager) revokeAllDeviceTokens(uid string) error {
-	cacheCfg := m.ctx.GetConfig().Cache
-	failures := revokeDeviceTokensInCache(m.ctx.Cache(), cacheCfg.UIDTokenCachePrefix, cacheCfg.TokenCachePrefix, uid)
+// best-effort（见 revokeDeviceTokens），逐端记日志，返回首个错误供调用方报错。
+func (m *Manager) revokeAllDeviceTokens(ctx context.Context, uid string) error {
+	failures := revokeDeviceTokens(ctx, m.sessionStore, uid)
 	var firstErr error
 	for _, f := range failures {
 		m.Error("撤销设备token失败", zap.Error(f.err), zap.String("uid", uid), zap.Uint8("device_flag", f.flag.Uint8()))
@@ -1282,35 +1306,68 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
-	if userInfo.Status == userStatus {
-		c.ResponseOK()
-		return
-	}
-	err = m.userDB.UpdateUsersWithField("status", status, uid)
-	if err != nil {
-		m.Error("修改用户状态错误", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+	alreadyInState := userInfo.Status == userStatus
+	disabling := userStatus == int(common.UserDisable)
+	var securityErr error
+	var mutationErr error
+	committed := false
+	if disabling {
+		if alreadyInState {
+			committed = true
+			if sessionRevocationActive(m.sessionStore) {
+				retryCtx, cancel := postCommitSecurityContext(c.Request.Context())
+				pending, pendingErr := m.userDB.pendingSessionRevocation(retryCtx, uid, "account_disable")
+				if pendingErr != nil {
+					mutationErr = pendingErr
+				} else if pending != nil {
+					mutationErr = applyAndMarkSessionRevocation(retryCtx, m.userDB, m.sessionStore, pending)
+				}
+				cancel()
+			}
+		} else {
+			committed, mutationErr = updateUserFieldAndRevokeSessionsWithResult(c.Request.Context(), m.userDB, m.sessionStore, uid, "status", status, "account_disable")
+			if !committed {
+				m.Error("修改用户状态错误", zap.Error(mutationErr))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				return
+			}
+		}
+	} else if !alreadyInState {
+		if err = m.userDB.UpdateUsersWithField("status", status, uid); err != nil {
+			m.Error("修改用户状态错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
 	}
 
 	ban := 0
-	if userStatus == int(common.UserDisable) {
+	if disabling {
 		ban = 1
 	}
 
-	err = m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+	channelErr := m.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
 		ChannelID:   uid,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		Ban:         ban,
 	})
-	if err != nil {
-		m.Error("更新WebIM的token失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserIMCallFailed)
+	if channelErr != nil {
+		m.Error("更新WebIM的token失败！", zap.Error(channelErr))
+	}
+	var quitErr error
+	if disabling {
+		securityErr = finishCommittedUserSecurityMutation(c.Request.Context(), m.sessionStore, uid, committed, mutationErr, m.ctx.QuitUserDevice)
+	} else {
+		quitErr = m.ctx.QuitUserDevice(userInfo.UID, -1)
+		if quitErr != nil {
+			m.Error("下线用户所有登录设备错误", zap.Error(quitErr), zap.String("uid", uid))
+		}
+	}
+	if securityErr != nil {
+		m.Error("封禁用户会话撤销未同步完成", zap.Error(securityErr), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	err = m.ctx.QuitUserDevice(userInfo.UID, -1)
-	if err != nil {
-		m.Error("下线用户所有登录设备错误", zap.Error(err), zap.String("uid", uid))
+	if channelErr != nil || quitErr != nil {
 		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
@@ -1367,26 +1424,11 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = m.userDB.UpdateUsersWithField("password", newHashedPassword, loginUID)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), m.userDB, m.sessionStore, m.ctx.QuitUserDevice, loginUID, newHashedPassword, "password_change")
 	if err != nil {
 		m.Error("修改用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
-	}
-	// 清除token缓存
-	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
-	if err != nil {
-		m.Error("获取旧token错误", zap.Error(err))
-		respondUserError(c, errcode.ErrUserTokenCacheFailed)
-		return
-	}
-	if oldToken != "" {
-		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
-		if err != nil {
-			m.Error("清除旧token数据错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserTokenCacheFailed)
-			return
-		}
 	}
 	c.ResponseOK()
 }

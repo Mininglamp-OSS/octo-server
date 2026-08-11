@@ -64,16 +64,20 @@ var (
 // SessionObservation contains low-cardinality migration facts only. It never
 // includes a token, Redis key, UID, or payload.
 type SessionObservation struct {
-	Total         int64 `json:"total"`
-	Missing       int64 `json:"missing"`
-	Persistent    int64 `json:"persistent"`
-	Finite        int64 `json:"finite"`
-	OverMax       int64 `json:"over_max"`
-	InvalidTTL    int64 `json:"invalid_ttl"`
-	DecodeInvalid int64 `json:"decode_invalid"`
-	V1            int64 `json:"v1"`
-	V2            int64 `json:"v2"`
-	V3            int64 `json:"v3"`
+	ScanID           string `json:"scan_id"`
+	ScopeFingerprint string `json:"scope_fingerprint"`
+	Complete         bool   `json:"complete"`
+	Total            int64  `json:"total"`
+	Missing          int64  `json:"missing"`
+	Persistent       int64  `json:"persistent"`
+	Finite           int64  `json:"finite"`
+	OverMax          int64  `json:"over_max"`
+	InvalidTTL       int64  `json:"invalid_ttl"`
+	DecodeInvalid    int64  `json:"decode_invalid"`
+	ReadErrors       int64  `json:"read_errors"`
+	V1               int64  `json:"v1"`
+	V2               int64  `json:"v2"`
+	V3               int64  `json:"v3"`
 }
 
 // RedisSessionStore is the sole v2 credential writer in Release A. It owns
@@ -84,21 +88,68 @@ type RedisSessionStore struct {
 	tokenPrefix    string
 	uidTokenPrefix string
 	maxTTL         time.Duration
+	mode           SessionMode
+	maxPerUID      int
+	now            func() time.Time
+	// redisInstanceIDFn resolves the opaque process identity used to keep a
+	// resumable SCAN cursor bound to one Redis process.
+	redisInstanceIDFn func() (string, error)
 }
 
-func NewRedisSessionStore(client *rd.Client, tokenPrefix, uidTokenPrefix string, maxTTL time.Duration) *RedisSessionStore {
+type SessionStoreOption func(*RedisSessionStore)
+
+func WithSessionMode(mode SessionMode) SessionStoreOption {
+	return func(store *RedisSessionStore) {
+		store.mode = mode
+	}
+}
+
+func WithSessionMaxPerUID(max int) SessionStoreOption {
+	return func(store *RedisSessionStore) {
+		store.maxPerUID = max
+	}
+}
+
+func WithSessionClock(now func() time.Time) SessionStoreOption {
+	return func(store *RedisSessionStore) {
+		if now != nil {
+			store.now = now
+		}
+	}
+}
+
+func NewRedisSessionStore(client *rd.Client, tokenPrefix, uidTokenPrefix string, maxTTL time.Duration, opts ...SessionStoreOption) *RedisSessionStore {
 	if client == nil {
 		panic("auth: NewRedisSessionStore requires non-nil redis client")
 	}
 	if maxTTL <= 0 {
 		panic("auth: NewRedisSessionStore requires positive max TTL")
 	}
-	return &RedisSessionStore{
+	store := &RedisSessionStore{
 		client:         client,
 		tokenPrefix:    tokenPrefix,
 		uidTokenPrefix: uidTokenPrefix,
 		maxTTL:         maxTTL,
+		mode:           SessionModeExpand,
+		now:            time.Now,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(store)
+		}
+	}
+	if !store.mode.valid() {
+		panic("auth: NewRedisSessionStore requires a valid session mode")
+	}
+	if store.mode.writesV3() {
+		if store.maxPerUID <= 0 || store.maxPerUID > sessionMaxPerUIDLimit {
+			panic("auth: NewRedisSessionStore requires a bounded max sessions per UID in v3 modes")
+		}
+		if store.maxTTL < time.Second {
+			panic("auth: NewRedisSessionStore requires at least one second max TTL in v3 modes")
+		}
+	}
+	return store
 }
 
 func (s *RedisSessionStore) tokenKey(token string) string {
@@ -281,6 +332,22 @@ func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string,
 		// owns the live credential and the original issuer must not revoke it.
 		return nil
 	}
+	var v3IndexKey string
+	var v3IndexMember string
+	if strings.HasPrefix(currentPayload, v3Prefix) {
+		info, err := Decode(currentPayload)
+		if err != nil {
+			return fmt.Errorf("auth: decode issued v3 token for revoke: %w", err)
+		}
+		if info.UID != uid || info.DeviceFlag != deviceFlag {
+			return errors.New("auth: issued v3 token revoke metadata mismatch")
+		}
+		v3IndexMember, err = encodeSessionIndexMember(token, info.DeviceFlag, info.DeviceID)
+		if err != nil {
+			return err
+		}
+		v3IndexKey = s.sessionIndexKey(info.UID, info.SessionGeneration)
+	}
 	result, err := compareDeleteScript.Run(
 		s.client,
 		[]string{s.tokenKey(token)},
@@ -298,7 +365,14 @@ func (s *RedisSessionStore) RevokeIssued(ctx context.Context, token, uid string,
 		// concurrent writer may have adopted this credential.
 		return nil
 	}
-	return s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+	deviceErr := s.compareDeleteDeviceIndex(token, uid, deviceFlag)
+	var indexErr error
+	if v3IndexKey != "" {
+		if err := s.client.ZRem(v3IndexKey, v3IndexMember).Err(); err != nil {
+			indexErr = fmt.Errorf("auth: delete issued v3 session index: %w", err)
+		}
+	}
+	return errors.Join(deviceErr, indexErr)
 }
 
 func (s *RedisSessionStore) compareDeleteDeviceIndex(token, uid string, deviceFlag int) error {
@@ -431,6 +505,12 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 	if interval < 0 {
 		return SessionObservation{}, fmt.Errorf("auth: observe interval must not be negative")
 	}
+	scanID, err := newSessionGeneration()
+	if err != nil {
+		return SessionObservation{}, fmt.Errorf("auth: create observation scan id: %w", err)
+	}
+	stats.ScanID = scanID
+	stats.ScopeFingerprint = s.rolloutObservationScopeFingerprint()
 	var throttle <-chan time.Time
 	var ticker *time.Ticker
 	if interval > 0 {
@@ -442,27 +522,28 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 	pattern := s.tokenPrefix + "*"
 	for {
 		if err := ctx.Err(); err != nil {
-			return SessionObservation{}, err
+			return stats, err
 		}
 		keys, next, err := s.client.Scan(cursor, pattern, batchSize).Result()
 		if err != nil {
-			return SessionObservation{}, fmt.Errorf("auth: observe scan: %w", err)
+			return stats, fmt.Errorf("auth: observe scan: %w", err)
 		}
 		for _, key := range keys {
 			if throttle != nil {
 				select {
 				case <-ctx.Done():
-					return SessionObservation{}, ctx.Err()
+					return stats, ctx.Err()
 				case <-throttle:
 				}
 			}
 			if err := ctx.Err(); err != nil {
-				return SessionObservation{}, err
+				return stats, err
 			}
 			stats.Total++
 			record, err := s.ReadToken(ctx, key)
 			if err != nil {
-				return SessionObservation{}, fmt.Errorf("auth: observe token record: %w", err)
+				stats.ReadErrors++
+				return stats, fmt.Errorf("auth: observe token record: %w", err)
 			}
 			switch {
 			case record.TTL == -2:
@@ -494,6 +575,7 @@ func (s *RedisSessionStore) ObserveRateLimited(ctx context.Context, batchSize in
 		}
 		cursor = next
 		if cursor == 0 {
+			stats.Complete = true
 			return stats, nil
 		}
 	}

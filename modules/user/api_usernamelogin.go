@@ -118,6 +118,24 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	fencedUID := userInfo.UID
+	loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化用户名登录会话栅栏失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	userInfo, err = u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+	if err != nil {
+		u.Error("会话栅栏后复核用户名登录用户失败", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil || userInfo.UID != fencedUID {
+		u.loginGuard.RecordFailureLogged(req.Username)
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
 	// 已注销账号拒绝登录；冷静期账号允许登录（响应中附带注销状态提示）
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
@@ -291,9 +309,7 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	updateMap := map[string]interface{}{}
-	updateMap["password"] = newHash
-	err = u.db.updateUser(updateMap, user.UID)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, user.UID, newHash, "password_reset")
 	if err != nil {
 		u.Error("修改用户密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
@@ -538,7 +554,7 @@ func (u *User) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = u.db.UpdateUsersWithField("password", newHash, userInfo.UID)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, newHash, "password_change")
 	if err != nil {
 		u.Error("修改登录密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)

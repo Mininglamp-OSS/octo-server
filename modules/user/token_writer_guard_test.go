@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -76,6 +77,47 @@ func write(ctx Context, renamed string) {
 	}
 }
 
+func TestDirectTokenWriterGuardRejectsCredentialDeletionMethods(t *testing.T) {
+	for _, method := range []string{"Del", "Delete", "Unlink"} {
+		t.Run(method, func(t *testing.T) {
+			source := fmt.Sprintf(`package fixture
+func remove(ctx Context, renamed string) {
+	ctx.Cache().%s(ctx.GetConfig().Cache.TokenCachePrefix + renamed)
+	ctx.Cache().%s(ctx.GetConfig().Cache.UIDTokenCachePrefix + renamed)
+}`, method, method)
+			fset := gotoken.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", source, 0)
+			require.NoError(t, err)
+			require.Len(t, tokenWriterViolations(fset, file, "fixture.go"), 2)
+		})
+	}
+}
+
+func TestDirectTokenWriterGuardRejectsSessionSecurityNamespaceMutations(t *testing.T) {
+	tests := []struct {
+		method string
+		key    string
+	}{
+		{method: "Set", key: `"opaque-prefix:auth:generation:" + subject`},
+		{method: "ZAdd", key: `"opaque-prefix:auth:sessions:" + subject`},
+		{method: "Del", key: `"opaque-prefix:auth:legacy-deny:" + subject`},
+		{method: "Expire", key: `"opaque-prefix:auth:rollout-control"`},
+		{method: "SetNX", key: `"opaque-prefix:auth:migration:lock"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+"_"+tt.key, func(t *testing.T) {
+			source := fmt.Sprintf(`package fixture
+func mutate(client Client, subject string) {
+	client.%s(%s, value)
+}`, tt.method, tt.key)
+			fset := gotoken.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", source, 0)
+			require.NoError(t, err)
+			require.Len(t, tokenWriterViolations(fset, file, "fixture.go"), 1)
+		})
+	}
+}
+
 func directTokenWriterViolations(path string) ([]string, error) {
 	fset := gotoken.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, 0)
@@ -96,18 +138,37 @@ func tokenWriterViolations(fset *gotoken.FileSet, file *ast.File, path string) [
 		if !ok {
 			return true
 		}
-		switch selector.Sel.Name {
-		case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt":
-		default:
+		method := selector.Sel.Name
+		credentialWrite := isCredentialWriteMethod(method) && expressionContainsTokenPrefix(call.Args[0])
+		securityStateMutation := isSecurityStateMutationMethod(method) && expressionContainsSessionSecurityNamespace(call.Args[0])
+		if !credentialWrite && !securityStateMutation {
 			return true
 		}
-		if expressionContainsTokenPrefix(call.Args[0]) {
-			position := fset.Position(call.Pos())
-			violations = append(violations, fmt.Sprintf("%s:%d calls %s with a token cache prefix", path, position.Line, selector.Sel.Name))
-		}
+		position := fset.Position(call.Pos())
+		violations = append(violations, fmt.Sprintf("%s:%d calls %s with a token session security key", path, position.Line, method))
 		return true
 	})
 	return violations
+}
+
+func isCredentialWriteMethod(method string) bool {
+	switch method {
+	case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt", "Del", "Delete", "Unlink":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSecurityStateMutationMethod(method string) bool {
+	switch method {
+	case "Set", "SetAndExpire", "SetNX", "Persist", "Expire", "ExpireAt",
+		"Del", "Delete", "Unlink", "Rename", "Move", "Copy",
+		"ZAdd", "ZRem", "ZRemRangeByScore", "HSet", "HDel":
+		return true
+	default:
+		return false
+	}
 }
 
 func tokenWriterRepoRoot(t *testing.T) string {
@@ -133,6 +194,34 @@ func expressionContainsTokenPrefix(expression ast.Expr) bool {
 		if ok && (selector.Sel.Name == "TokenCachePrefix" || selector.Sel.Name == "UIDTokenCachePrefix") {
 			found = true
 			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func expressionContainsSessionSecurityNamespace(expression ast.Expr) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != gotoken.STRING {
+			return !found
+		}
+		value, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			return !found
+		}
+		for _, namespace := range []string{
+			"auth:generation:",
+			"auth:sessions:",
+			"auth:legacy-deny:",
+			"auth:rollout-control",
+			"auth:migration:",
+		} {
+			if strings.Contains(value, namespace) {
+				found = true
+				return false
+			}
 		}
 		return !found
 	})

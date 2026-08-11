@@ -33,6 +33,7 @@ type TokenInfo struct {
 	DeviceFlag        int
 	DeviceID          string
 	SessionGeneration string
+	SessionRevision   uint64
 }
 
 // ErrEmptyToken indicates an empty cache value (missing or evicted token).
@@ -59,6 +60,7 @@ type tokenInfoV3 struct {
 	DeviceFlag        int    `json:"device_flag"`
 	DeviceID          string `json:"device_id,omitempty"`
 	SessionGeneration string `json:"session_generation"`
+	SessionRevision   uint64 `json:"session_revision"`
 }
 
 // Encode serializes a TokenInfo as the versioned JSON envelope. The UID is
@@ -96,6 +98,9 @@ func EncodeV3(info TokenInfo) (string, error) {
 	if strings.TrimSpace(info.SessionGeneration) == "" {
 		return "", fmt.Errorf("%w: session_generation required", ErrInvalidToken)
 	}
+	if info.SessionRevision == 0 {
+		return "", fmt.Errorf("%w: session_revision required", ErrInvalidToken)
+	}
 	payload, err := json.Marshal(tokenInfoV3{
 		UID:               info.UID,
 		Name:              info.Name,
@@ -106,6 +111,7 @@ func EncodeV3(info TokenInfo) (string, error) {
 		DeviceFlag:        info.DeviceFlag,
 		DeviceID:          info.DeviceID,
 		SessionGeneration: info.SessionGeneration,
+		SessionRevision:   info.SessionRevision,
 	})
 	if err != nil {
 		return "", fmt.Errorf("auth: marshal v3 token payload: %w", err)
@@ -157,6 +163,7 @@ func decodeV3(payload string) (TokenInfo, error) {
 		DeviceFlag:        v.DeviceFlag,
 		DeviceID:          v.DeviceID,
 		SessionGeneration: v.SessionGeneration,
+		SessionRevision:   v.SessionRevision,
 	}
 	if info.UID == "" {
 		return TokenInfo{}, fmt.Errorf("%w: uid missing", ErrInvalidToken)
@@ -170,12 +177,15 @@ func decodeV3(payload string) (TokenInfo, error) {
 	if strings.TrimSpace(info.SessionGeneration) == "" {
 		return TokenInfo{}, fmt.Errorf("%w: session_generation missing", ErrInvalidToken)
 	}
+	if info.SessionRevision == 0 {
+		return TokenInfo{}, fmt.Errorf("%w: session_revision missing", ErrInvalidToken)
+	}
 	return info, nil
 }
 
 // IsV3 reports whether Decode returned the v3 envelope.
 func (i TokenInfo) IsV3() bool {
-	return i.IssuedAt > 0 && i.ExpiresAt > 0 && i.SessionGeneration != ""
+	return i.IssuedAt > 0 && i.ExpiresAt > 0 && i.SessionGeneration != "" && i.SessionRevision > 0
 }
 
 func decodeLegacy(raw string) (TokenInfo, error) {

@@ -2,6 +2,7 @@ package user
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAddUser(t *testing.T) {
@@ -752,27 +754,75 @@ func TestManager_DeleteAdminUser_RevokesSessionsAndRoleCache(t *testing.T) {
 	}
 }
 
+func TestDeleteAdminUserInvalidatesRoleAfterCommittedRevocationFailure(t *testing.T) {
+	_, ctx, _, m := newTokenHTTPTestServer(t)
+	uid := "arf-" + util.GenerUUID()
+	m.sessionStore = &flakyRevokeAllSessionStore{}
+	require.NoError(t, m.userDB.Insert(&Model{
+		UID: uid, Name: "admin", Role: string(wkhttp.Admin), Username: "admin_" + uid[len(uid)-12:],
+	}))
+	require.NoError(t, ctx.Cache().Set(RoleCacheKeyPrefix+uid, string(wkhttp.Admin)))
+	t.Cleanup(func() {
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_intent").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user_session_revocation_version").Where("uid=?", uid).Exec()
+		_, _ = ctx.DB().DeleteFrom("user").Where("uid=?", uid).Exec()
+		_ = ctx.Cache().Delete(RoleCacheKeyPrefix + uid)
+	})
+
+	err := m.deleteAdminUser(context.Background(), uid)
+	require.ErrorContains(t, err, "redis unavailable")
+	deleted, queryErr := m.userDB.QueryByUID(uid)
+	require.NoError(t, queryErr)
+	require.Nil(t, deleted, "the database mutation must already be committed")
+	cachedRole, cacheErr := ctx.Cache().Get(RoleCacheKeyPrefix + uid)
+	require.NoError(t, cacheErr)
+	require.Empty(t, cachedRole, "a committed delete must invalidate the role cache even when Redis revocation fails")
+}
+
 // TestRevokeDeviceTokensInCache_BestEffort pins that a Redis error on one device
 // flag does not abort revocation of the others (PR #364 review F2): the loop
 // attempts all three flags and reports a failure per error rather than bailing
 // on the first. Uses the shared fakeLangCache (implements cache.Cache).
-func TestRevokeDeviceTokensInCache_BestEffort(t *testing.T) {
-	c := newFakeLangCache()
-	const uidTokenPrefix, tokenPrefix, uid = "UIDTOKEN:", "TOKEN:", "u1"
+type recordingDeviceRevokeStore struct {
+	fakeUserSessionStore
+	tokens   map[int]string
+	failures map[string]error
+	revoked  []string
+}
+
+func (s *recordingDeviceRevokeStore) DeviceToken(ctx context.Context, _ string, deviceFlag int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return s.tokens[deviceFlag], nil
+}
+
+func (s *recordingDeviceRevokeStore) InvalidateCurrentToken(ctx context.Context, _ string, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.revoked = append(s.revoked, token)
+	return s.failures[token]
+}
+
+func TestRevokeDeviceTokens_BestEffort(t *testing.T) {
+	const uid = "u1"
+	store := &recordingDeviceRevokeStore{
+		tokens:   make(map[int]string),
+		failures: make(map[string]error),
+	}
 	for _, fl := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
 		tok := fmt.Sprintf("tok-%d", fl)
-		c.store[fmt.Sprintf("%s%d%s", uidTokenPrefix, fl, uid)] = tok
-		c.store[tokenPrefix+tok] = uid + "@x@admin"
+		store.tokens[int(fl)] = tok
+		store.failures[tok] = errors.New("redis down")
 	}
-	// Every Delete fails: a fail-fast loop would stop after flag 0; best-effort
+	// Every revocation fails: a fail-fast loop would stop after flag 0; best-effort
 	// must still attempt all three.
-	c.delErr = errors.New("redis down")
-
-	failures := revokeDeviceTokensInCache(c, uidTokenPrefix, tokenPrefix, uid)
+	failures := revokeDeviceTokens(context.Background(), store, uid)
 	if len(failures) != 3 {
 		t.Fatalf("best-effort revoke must attempt all 3 device flags despite errors, got %d failures", len(failures))
 	}
-	if len(c.deletes) < 3 {
-		t.Fatalf("expected a Delete attempt per device flag, got %d", len(c.deletes))
+	if len(store.revoked) != 3 {
+		t.Fatalf("expected a Session Store revoke attempt per device flag, got %d", len(store.revoked))
 	}
 }

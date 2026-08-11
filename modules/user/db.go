@@ -247,7 +247,7 @@ var allowedUpdateFields = map[string]bool{
 	"msg_show_detail": true, "voice_on": true, "shock_on": true,
 	"msg_expire_second": true, "is_upload_avatar": true,
 	"chat_pwd": true, "lock_after_minute": true, "lock_screen_pwd": true,
-	"password": true,
+	"password": true, "status": true,
 }
 
 // UpdateUsersWithField 修改用户基本资料

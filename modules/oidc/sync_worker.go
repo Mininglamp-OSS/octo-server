@@ -14,10 +14,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// sessionKiller 中止某个 UID 的所有会话(Web/PC/APP)并踢 WuKongIM 长连接。
-//
-// 生产实现包 *config.Context.QuitUserDevice(uid, -1):清 token Redis +
-// 重签 IM token 触发 WuKongIM 端 transport 失效。
+// sessionKiller 踢掉某个 UID 的 WuKongIM 全部设备连接。生产实现包装
+// *config.Context.QuitUserDevice(uid, -1)，它不撤销 octo-server HTTP bearer。
 type sessionKiller interface {
 	Kick(ctx context.Context, uid string) error
 }
@@ -94,10 +92,10 @@ type SyncWorkerConfig struct {
 
 // SyncWorker 周期性 refresh active RT,失败即吊销 + 踢线 + 审计。
 type SyncWorker struct {
-	cfg    SyncWorkerConfig
-	store  syncStore
-	enc    *Encryptor
-	rfsh   refresher
+	cfg   SyncWorkerConfig
+	store syncStore
+	enc   *Encryptor
+	rfsh  refresher
 	// ui / verif 都必须非 nil 才做实名同步。任一为 nil → sync_worker 保持
 	// YUJ-405 之前的原行为(纯 RT 轮转),向后兼容。生产路径在 OIDC.Init 中
 	// 同时注入(c.client + userSvc),只会一起 nil / 一起就位。

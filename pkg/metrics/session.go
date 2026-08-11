@@ -8,14 +8,17 @@ import (
 )
 
 type SessionMetrics struct {
-	Operations       *prometheus.CounterVec
-	OperationLatency *prometheus.HistogramVec
-	ValidationReject *prometheus.CounterVec
-	PersistentSeen   prometheus.Counter
-	EffectiveTTL     prometheus.Gauge
-	operationOK      map[string]prometheus.Counter
-	operationError   map[string]prometheus.Counter
-	operationLatency map[string]prometheus.Observer
+	Operations        *prometheus.CounterVec
+	OperationLatency  *prometheus.HistogramVec
+	ValidationReject  *prometheus.CounterVec
+	PersistentSeen    prometheus.Counter
+	EffectiveTTL      prometheus.Gauge
+	RolloutMode       *prometheus.GaugeVec
+	RevocationBacklog prometheus.Gauge
+	RevocationRetries *prometheus.CounterVec
+	operationOK       map[string]prometheus.Counter
+	operationError    map[string]prometheus.Counter
+	operationLatency  map[string]prometheus.Observer
 }
 
 var defaultSessionMetrics atomic.Pointer[SessionMetrics]
@@ -53,8 +56,29 @@ func NewSessionMetrics(reg prometheus.Registerer) *SessionMetrics {
 			Name:      "effective_ttl_seconds",
 			Help:      "Configured access-token TTL effective in this process.",
 		}),
+		RolloutMode: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "rollout_mode",
+			Help:      "Current session rollout mode; exactly one known mode is 1 per process.",
+		}, []string{"mode"}),
+		RevocationBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "revocation_backlog",
+			Help:      "Pending durable session revocation intents visible to this process.",
+		}),
+		RevocationRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: "session",
+			Name:      "revocation_retries_total",
+			Help:      "Durable session revocation retry failures by bounded reason.",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(m.Operations, m.OperationLatency, m.ValidationReject, m.PersistentSeen, m.EffectiveTTL)
+	reg.MustRegister(m.Operations, m.OperationLatency, m.ValidationReject, m.PersistentSeen, m.EffectiveTTL, m.RolloutMode, m.RevocationBacklog, m.RevocationRetries)
+	for _, mode := range sessionRolloutModes {
+		m.RolloutMode.WithLabelValues(mode).Set(0)
+	}
 	m.operationOK = make(map[string]prometheus.Counter, 5)
 	m.operationError = make(map[string]prometheus.Counter, 5)
 	m.operationLatency = make(map[string]prometheus.Observer, 5)
@@ -104,5 +128,39 @@ func ObservePersistentSession() {
 func SetSessionEffectiveTTL(ttl time.Duration) {
 	if m := defaultSessionMetrics.Load(); m != nil {
 		m.EffectiveTTL.Set(ttl.Seconds())
+	}
+}
+
+var sessionRolloutModes = []string{"expand", "v3-write", "revoke", "bounded", "enforce"}
+
+func SetSessionRolloutMode(current string) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		for _, mode := range sessionRolloutModes {
+			value := float64(0)
+			if mode == current {
+				value = 1
+			}
+			m.RolloutMode.WithLabelValues(mode).Set(value)
+		}
+	}
+}
+
+func SetSessionRevocationBacklog(count int64) {
+	if m := defaultSessionMetrics.Load(); m != nil {
+		if count < 0 {
+			count = 0
+		}
+		m.RevocationBacklog.Set(float64(count))
+	}
+}
+
+func ObserveSessionRevocationRetry(reason string) {
+	switch reason {
+	case "claim", "redis_apply", "mark_applied", "release":
+	default:
+		reason = "other"
+	}
+	if m := defaultSessionMetrics.Load(); m != nil {
+		m.RevocationRetries.WithLabelValues(reason).Inc()
 	}
 }

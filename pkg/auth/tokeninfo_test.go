@@ -20,6 +20,7 @@ func TestEncodeV3RoundTrip(t *testing.T) {
 		DeviceFlag:        1,
 		DeviceID:          "device-1",
 		SessionGeneration: "generation-1",
+		SessionRevision:   7,
 	}
 
 	encoded, err := EncodeV3(in)
@@ -61,7 +62,11 @@ func TestEncodeV3RejectsIncompleteSecurityClaims(t *testing.T) {
 		},
 		{
 			name: "blank generation",
-			info: TokenInfo{UID: "u1", IssuedAt: 1, ExpiresAt: 2, SessionGeneration: "  "},
+			info: TokenInfo{UID: "u1", IssuedAt: 1, ExpiresAt: 2, SessionGeneration: "  ", SessionRevision: 1},
+		},
+		{
+			name: "missing revision",
+			info: TokenInfo{UID: "u1", IssuedAt: 1, ExpiresAt: 2, SessionGeneration: "g1"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,11 +85,12 @@ func TestDecodeV3RejectsInvalidLifetime(t *testing.T) {
 		name string
 		raw  string
 	}{
-		{name: "missing issued at", raw: "v3:{\"uid\":\"u1\",\"expires_at\":2,\"session_generation\":\"g\"}"},
-		{name: "missing expires at", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"session_generation\":\"g\"}"},
-		{name: "deadline not after issue", raw: "v3:{\"uid\":\"u1\",\"issued_at\":2,\"expires_at\":2,\"session_generation\":\"g\"}"},
-		{name: "missing generation", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"expires_at\":2}"},
-		{name: "missing uid", raw: "v3:{\"issued_at\":1,\"expires_at\":2,\"session_generation\":\"g\"}"},
+		{name: "missing issued at", raw: "v3:{\"uid\":\"u1\",\"expires_at\":2,\"session_generation\":\"g\",\"session_revision\":1}"},
+		{name: "missing expires at", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"session_generation\":\"g\",\"session_revision\":1}"},
+		{name: "deadline not after issue", raw: "v3:{\"uid\":\"u1\",\"issued_at\":2,\"expires_at\":2,\"session_generation\":\"g\",\"session_revision\":1}"},
+		{name: "missing generation", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"expires_at\":2,\"session_revision\":1}"},
+		{name: "missing revision", raw: "v3:{\"uid\":\"u1\",\"issued_at\":1,\"expires_at\":2,\"session_generation\":\"g\"}"},
+		{name: "missing uid", raw: "v3:{\"issued_at\":1,\"expires_at\":2,\"session_generation\":\"g\",\"session_revision\":1}"},
 		{name: "bad json", raw: "v3:{not-json}"},
 	}
 	for _, tt := range tests {
