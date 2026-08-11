@@ -34,6 +34,29 @@ func parsePayloadContent(payload []byte) string {
 	return m.Content
 }
 
+// parsePayloadType 从消息 payload 中提取 type（content type）字段。
+// 解析失败或缺省返回 0（普通文本消息的 type 落在 1~99，缺省视为普通消息）。
+func parsePayloadType(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	var m struct {
+		Type int `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return 0
+	}
+	return m.Type
+}
+
+// isSystemContentType 判断是否为系统通知类 content type（Tip=2000 / 群通知 1000+ / 客服 1200+ /
+// 通话结果 9989 等，均 >= 1000）。这类消息不是用户聊天正文：不应触发子区解档、message_count
+// 自增、thread-list preview 覆盖，也不应把 operator 自动加入子区。普通用户消息 content type 均 < 1000
+// （文本 1、图片 2……富文本 14），由 sendSourceMessage 拷贝到子区的源消息也落在该区间。
+func isSystemContentType(contentType int) bool {
+	return contentType >= int(common.FriendApply)
+}
+
 // IService 子区服务接口
 type IService interface {
 	// CreateThread 创建子区
@@ -527,6 +550,77 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 	}
 }
 
+// buildThreadRenamedPayload 构建子区改名 Tip 系统消息的 payload。
+// schema 采用「Tip + {0} 占位符 + extra」这套系统 tip 格式（与群解散 group/event.go、
+// 置顶消息 message/api_pinned.go 一致）：content 以 "{0}" 开头，客户端渲染时用 extra[0] 的
+// 用户名替换成 operator 显示名。注意这不是群改名 SendGroupUpdate 的 schema——群改名用的是
+// type=GroupUpdate(1005) + data，客户端按 GroupUpdate 处理；#663 明确要求 Tip，故走 tip 系。
+func buildThreadRenamedPayload(operatorUID, operatorName, name string) map[string]interface{} {
+	return map[string]interface{}{
+		"from_uid":  operatorUID,
+		"from_name": operatorName,
+		"content":   fmt.Sprintf(`{0}修改子区名为"%s"`, name),
+		"extra": []config.UserBaseVo{
+			{UID: operatorUID, Name: operatorName},
+		},
+		"type": common.Tip,
+	}
+}
+
+// sendThreadRenamedMessage 子区改名成功后向子区 channel 发一条 Tip 系统消息（防滥用 + 可追溯）。
+// best-effort：失败仅告警，改名已落库不回滚，推送标题缓存失效 + TTL 兜底。
+// 若 operator 用户名解析为空（用户服务瞬时故障等），跳过发送而非发一条匿名 tip——
+// 匿名 tip 会渲染成「(空){0}...修改子区名为...」这种没有操作者的历史记录，不如不发。
+func (s *Service) sendThreadRenamedMessage(groupNo, shortID, operatorUID, name string) {
+	operatorName := s.getUserName(operatorUID)
+	if operatorName == "" {
+		s.Warn("跳过子区改名 tip：operator 用户名解析为空", zap.String("operator_uid", operatorUID), zap.String("short_id", shortID))
+		return
+	}
+
+	channelID := BuildChannelID(groupNo, shortID)
+	payload := buildThreadRenamedPayload(operatorUID, operatorName, name)
+
+	// 注入父群权威 space_id：COMMUNITY_TOPIC 消息必须携带父群 SpaceID，客户端 SpaceFilter
+	// 据此归类 Space。裸 s.ctx.SendMessage 绕过了 message 模块的 enrichPayloadWithSpaceID，
+	// 缺失 space_id 会让冷缓存客户端回退到 channelInfo cache 推导 Space 并命中 fail-open，
+	// 把改名 tip 落到错误 Space。契约与 enrichPayloadWithSpaceIDCore 的 COMMUNITY_TOPIC
+	// 分支一致：父群 SpaceID 非空覆盖，空（老群 / 非 Space 部署）删除。
+	s.enrichThreadTipSpaceID(groupNo, payload)
+
+	err := s.ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    1,
+			SyncOnce:  0,
+		},
+		FromUID:     operatorUID,
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+		Payload:     []byte(util.ToJson(payload)),
+	})
+	if err != nil {
+		s.Warn("发送子区改名消息失败", zap.Error(err), zap.String("channel_id", channelID))
+	}
+}
+
+// enrichThreadTipSpaceID 按父群权威 SpaceID 注入 payload["space_id"]，与 message 模块
+// enrichPayloadWithSpaceIDCore 的 COMMUNITY_TOPIC 分支保持同一契约：父群 SpaceID 非空则覆盖，
+// 空（老群 / 非 Space 部署）则删除任何既有值，避免跨 Space 污染。查父群失败仅告警并跳过注入
+// （best-effort，不阻断发送）。
+func (s *Service) enrichThreadTipSpaceID(groupNo string, payload map[string]interface{}) {
+	g, err := s.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil {
+		s.Warn("查父群失败，跳过子区 tip space_id 注入", zap.String("group_no", groupNo), zap.Error(err))
+		return
+	}
+	if g != nil && g.SpaceID != "" {
+		payload["space_id"] = g.SpaceID
+	} else {
+		delete(payload, "space_id")
+	}
+}
+
 // sendSourceMessage 将源消息拷贝到子区频道作为首条消息
 // fromUID 应该是经过服务端验证的原始消息发送者
 // sendSourceMessage returns the send error so the caller can tell whether the
@@ -594,6 +688,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 		return errors.New("no permission to update")
 	}
 
+	// 同名 no-op 短路：db.UpdateName 无条件 bump version 且总报成功，若不拦截，重试或
+	// save-on-blur 式 UI 会重复发 tip。名字没变就直接返回，符合 #663「只发一次，不重复」。
+	// 必须放在上面两道权限门（ExistMemberActiveInternal + IsRobot）之后：否则无权者提交
+	// 当前名会拿到 200 而非拒绝，且成为「猜名=当前名」的探测 oracle（越权读子区名）。
+	if thread.Name == name {
+		return nil
+	}
+
 	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {
 		switch {
 		case errors.Is(err, ErrThreadNotFound):
@@ -610,6 +712,9 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	if err := pushcache.InvalidateThreadName(s.ctx.GetRedisConn(), channelID); err != nil {
 		s.Warn("失效子区名推送缓存失败", zap.String("channel_id", channelID), zap.Error(err))
 	}
+
+	// 子区改名补发 Tip 系统消息，与群改名对称（防滥用 + 可追溯）。best-effort：失败不回滚改名。
+	s.sendThreadRenamedMessage(groupNo, shortID, operatorUID, name)
 	return nil
 }
 

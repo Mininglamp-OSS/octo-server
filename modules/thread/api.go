@@ -47,8 +47,10 @@ func New(ctx *config.Context) *Thread {
 // onMessages 消息监听器
 func (t *Thread) onMessages(messages []*config.MessageResp) {
 	for _, msg := range messages {
-		// 只处理子区频道类型
-		if msg.ChannelType != common.ChannelTypeCommunityTopic.Uint8() {
+		// 只对子区频道里的「用户聊天正文」做「解档 + 统计 + 自动加入」。非子区频道、
+		// 或系统通知类消息（Tip / 群通知等）都跳过——判定逻辑收敛到 shouldProcessThreadMessage
+		// 以便在无 DB 环境下单测覆盖。
+		if !shouldProcessThreadMessage(msg) {
 			continue
 		}
 
@@ -83,6 +85,25 @@ func (t *Thread) onMessages(messages []*config.MessageResp) {
 			}
 		}
 	}
+}
+
+// shouldProcessThreadMessage 判定一条监听到的消息是否应触发子区「解档 + message_count 统计 +
+// preview 覆盖 + operator 自动加入」这套副作用。仅接受子区频道（ChannelTypeCommunityTopic）里
+// 的用户聊天正文；非子区频道、或系统通知类消息（Tip / 群通知等，content type >= 1000）一律跳过。
+// 这样子区改名 tip（发到本 channel）、置顶 tip（message/api_pinned.go）等系统消息不会静默解档
+// 归档子区、把 message_count 永久 +1、用未渲染的 {0} 占位符覆盖 thread-list preview，或把
+// operator 自动加入子区。payload 解析失败 → type 0 → 视为普通消息（fail-safe，不误跳真实消息）。
+func shouldProcessThreadMessage(msg *config.MessageResp) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.ChannelType != common.ChannelTypeCommunityTopic.Uint8() {
+		return false
+	}
+	if isSystemContentType(parsePayloadType(msg.Payload)) {
+		return false
+	}
+	return true
 }
 
 func respondThreadError(c *wkhttp.Context, code codes.Code, details i18n.Details) {

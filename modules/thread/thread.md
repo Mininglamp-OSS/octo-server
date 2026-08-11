@@ -222,9 +222,13 @@ Content-Type: application/json
 ```
 1. WuKongIM 调用 IMDatasource.Subscribers
 2. 返回父群所有成员 → 允许发送
-3. 消息监听器 onMessages → 自动加入 thread_member
-4. 如果子区已归档 → 自动解档为活跃状态
+3. 消息监听器 onMessages → 自动加入 thread_member（仅用户聊天正文）
+4. 如果子区已归档 → 自动解档为活跃状态（仅用户聊天正文）
 ```
+
+> 注：上述自动加入 / 自动解档只对**用户聊天正文**成立。系统通知类消息（`type >= 1000`，
+> 如子区改名 / 置顶 Tip）由 `shouldProcessThreadMessage` 跳过，不会触发自动加入、解档、
+> `message_count` 自增或 thread-list preview 覆盖。
 
 ### 接收消息
 
