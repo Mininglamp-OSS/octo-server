@@ -13,6 +13,8 @@
 
 ```
 全新部署        部署制品（配 EXPECT_WRITERS=<副本数>）。结束，floor 自动到 enforce。
+                首个 v3 floor 前会先确认 writer 集合已静止一个 lease TTL（30s），
+                实际约 1 分钟——无人值守，不需要任何命令。
 有存量的部署    部署制品 → 自动推进，然后停在第一个有存量的门禁上：
                   有永久/超上限 legacy → 停在 revoke，报 persistent=N over_max=M
                   只剩有限 legacy      → 停在 bounded，报 v1=N v2=M
@@ -22,6 +24,11 @@
 
 floor 单调不可逆，永远只前进。每次推进前都会写下触发它的证据快照
 （存活 writer 数、build、扫描计数、Redis 实例指纹、时刻），用 `status` 可查。
+
+**唯一的强制等待**是第一个 v3 floor 前那一个 lease TTL:要求 writer **集合**（不是数量）
+逐字节不变地维持 30s。数量相同在 maxSurge 滚动的某一瞬间也成立——那一刻新副本已全部就绪、
+最后一个不注册的旧副本尚未退出,而它正是这道门禁要排除的对象。身份是 per-incarnation 的,
+所以集合在超过 TTL 的窗口两端一致即证明期间没有成员变动。后续每一跳都没有这个等待。
 
 ## 2. 配置
 
