@@ -24,11 +24,22 @@ const (
 	internalTokenEnv           = "OCTO_DOCS_BOT_MENTION_TOKEN"
 	internalTokenHeader        = "X-Internal-Token"
 	docCommentMentionEventType = "doc_comment_mention"
+
+	// docKindHTML 标记 doc_id 是 octo-doc 的 slug(HTML 文档),而不是 docs-backend 的 docId。
+	docKindHTML = "html"
 )
 
 type mentionRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	DocID          string `json:"doc_id"`
+	// DocKind 说明 DocID 是哪一类文档的标识,决定消费端该走哪套 API。
+	//
+	// 为什么必须显式传而不是让消费端自己判:HTML 文档的 DocID 是 octo-doc 的 slug,
+	// 而 docs-backend 的接口按 docId 寻址 —— 拿 slug 去查必然 404。而「404」和
+	// 「文档真的不存在」无法区分,靠试错回退会把后者误判成 HTML 再失败一次。
+	//
+	// 空 = 默认 docs-backend 文档(doc/sheet/board),与加这个字段之前的行为一致。
+	DocKind        string `json:"doc_kind,omitempty"`
 	CommentID      string `json:"comment_id"`
 	ParentID       string `json:"parent_id,omitempty"`
 	FromUID        string `json:"from_uid"`
@@ -41,6 +52,7 @@ type mentionRequest struct {
 type normalizedMention struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	DocID          string `json:"doc_id"`
+	DocKind        string `json:"doc_kind,omitempty"`
 	CommentID      string `json:"comment_id"`
 	ThreadID       string `json:"thread_id"`
 	ParentID       string `json:"parent_id,omitempty"`
@@ -71,6 +83,7 @@ func normalizeMentionRequest(req mentionRequest) (normalizedMention, error) {
 	normalized := normalizedMention{
 		IdempotencyKey: strings.TrimSpace(req.IdempotencyKey),
 		DocID:          strings.TrimSpace(req.DocID),
+		DocKind:        strings.ToLower(strings.TrimSpace(req.DocKind)),
 		CommentID:      strings.TrimSpace(req.CommentID),
 		ParentID:       strings.TrimSpace(req.ParentID),
 		FromUID:        strings.TrimSpace(req.FromUID),
@@ -78,6 +91,14 @@ func normalizeMentionRequest(req mentionRequest) (normalizedMention, error) {
 		Text:           req.Text,
 		URL:            strings.TrimSpace(req.URL),
 		SpaceID:        strings.TrimSpace(req.SpaceID),
+	}
+
+	// 白名单,未知值直接拒而不是当成空。
+	//
+	// 静默降级成「普通文档」的代价是消费端拿 slug 去打 docs-backend 的 docId 接口,
+	// 报出来的是一个看不出根因的 404;拒在入口,调用方拼错立刻知道。
+	if normalized.DocKind != "" && normalized.DocKind != docKindHTML {
+		return normalizedMention{}, &requestValidationError{field: "doc_kind"}
 	}
 
 	for _, field := range []struct {

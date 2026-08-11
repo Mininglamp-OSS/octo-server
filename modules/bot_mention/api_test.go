@@ -23,6 +23,11 @@ import (
 type stubRobotService struct {
 	mu sync.Mutex
 
+	// ownerUID / ownerErr 供 /v1/internal/bot-owner 用例设置。
+	ownerUID   string
+	ownerErr   error
+	ownerCalls int
+
 	exists     bool
 	existErr   error
 	enqueueErr error
@@ -50,6 +55,10 @@ type leaseRaceRobotService struct {
 
 func (s *leaseRaceRobotService) ExistRobot(string) (bool, error) {
 	return true, nil
+}
+
+func (s *leaseRaceRobotService) GetCreatorUID(string) (string, error) {
+	return "", nil
 }
 
 func (s *leaseRaceRobotService) PrepareBotTypedEvent(robotID string, _ string, _ map[string]interface{}) (robot.PreparedBotTypedEvent, error) {
@@ -134,6 +143,13 @@ func (s *stubRobotService) ExistRobot(uid string) (bool, error) {
 	defer s.mu.Unlock()
 	s.existCalls++
 	return s.exists, s.existErr
+}
+
+func (s *stubRobotService) GetCreatorUID(string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ownerCalls++
+	return s.ownerUID, s.ownerErr
 }
 
 func (s *stubRobotService) PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (robot.PreparedBotTypedEvent, error) {
@@ -835,5 +851,112 @@ func TestBotMentionRecoversAmbiguousAtomicCommitAsReplay(t *testing.T) {
 	}
 	if notifications != 1 {
 		t.Fatalf("doorbell notifications = %d, want 1 after ambiguous commit recovery", notifications)
+	}
+}
+
+const ownerProbeToken = "owner-probe-token"
+
+// ── POST /v1/internal/bot-owner ────────────────────────────────────────────────
+// 回答「某个 Bot 的主人是谁」。存在的理由:HTML 文档的权限判定要的是 Bot 的主人,而
+// octo-doc 只拿到一个 bot_uid —— 它换 OwnerUID 的唯一途径 VerifyBot 需要 Bot 的 token,
+// 服务间调用没有。归属数据(robot.creator_uid)只在这一侧。
+//
+// 最该钉住的是**判不出时不能装作判出来**:调用方拿这个答案决定放不放行,
+// 空串对它就是「不知道」⇒ 拒绝。所以查不到给空串 + 200,查错了必须报错而不是给空串。
+
+func postBotOwner(t *testing.T, r *wkhttp.WKHttp, token, botUID string) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(map[string]string{"bot_uid": botUID})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/internal/bot-owner", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set(internalTokenHeader, token)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func ownerUIDFromResponse(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		OwnerUID string `json:"owner_uid"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode owner response: %v (body=%s)", err, w.Body.String())
+	}
+	return body.OwnerUID
+}
+
+func TestBotOwnerReturnsCreatorUID(t *testing.T) {
+	robots := &stubRobotService{exists: true, ownerUID: "human-1"}
+	module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.internalToken = ownerProbeToken
+	w := postBotOwner(t, newMentionRouter(module), ownerProbeToken, "bot-1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200,得到 %d (%s)", w.Code, w.Body.String())
+	}
+	if got := ownerUIDFromResponse(t, w); got != "human-1" {
+		t.Fatalf("owner_uid = %q, want human-1", got)
+	}
+}
+
+func TestBotOwnerUnknownBotIsEmptyNotError(t *testing.T) {
+	// ★ 查不到给空串 + 200,而不是 404。调用方对空串的处理是「判不出 ⇒ 拒绝」;
+	// 用 404 会被它当成「服务不可用」而重试,那是另一种语义。
+	robots := &stubRobotService{exists: true, ownerUID: ""}
+	module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.internalToken = ownerProbeToken
+	w := postBotOwner(t, newMentionRouter(module), ownerProbeToken, "bot-unknown")
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200,得到 %d", w.Code)
+	}
+	if got := ownerUIDFromResponse(t, w); got != "" {
+		t.Fatalf("owner_uid = %q, want 空串", got)
+	}
+}
+
+func TestBotOwnerLookupFailureIsAnError(t *testing.T) {
+	// 查询本身失败**不能**降级成空串:那会让调用方把「数据库抖了一下」当成
+	// 「这个 Bot 没有主人」,并据此永久拒绝。必须让它看到 5xx 并重试。
+	robots := &stubRobotService{exists: true, ownerErr: errors.New("db down")}
+	module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.internalToken = ownerProbeToken
+	w := postBotOwner(t, newMentionRouter(module), ownerProbeToken, "bot-1")
+	if w.Code < 400 {
+		t.Fatalf("查询失败应当是错误响应,得到 %d", w.Code)
+	}
+	if got := ownerUIDFromResponse(t, w); got != "" {
+		t.Fatalf("失败时不该带 owner_uid,得到 %q", got)
+	}
+}
+
+func TestBotOwnerRequiresInternalToken(t *testing.T) {
+	robots := &stubRobotService{exists: true, ownerUID: "human-1"}
+	module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.internalToken = ownerProbeToken
+	for _, tok := range []string{"", "wrong-token"} {
+		w := postBotOwner(t, newMentionRouter(module), tok, "bot-1")
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("token=%q 应当 401,得到 %d", tok, w.Code)
+		}
+		if robots.ownerCalls != 0 {
+			t.Fatal("鉴权失败时不该去查归属")
+		}
+	}
+}
+
+func TestBotOwnerValidatesBotUID(t *testing.T) {
+	robots := &stubRobotService{exists: true, ownerUID: "human-1"}
+	module := newTestBotMention(robots, &scriptedClaimStore{}, newFeatureGate(true, "", "*"), &fakeMetricRecorder{})
+	module.internalToken = ownerProbeToken
+	for _, uid := range []string{"", "   "} {
+		w := postBotOwner(t, newMentionRouter(module), ownerProbeToken, uid)
+		if w.Code < 400 {
+			t.Fatalf("bot_uid=%q 应当 4xx,得到 %d", uid, w.Code)
+		}
 	}
 }
