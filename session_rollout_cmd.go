@@ -142,7 +142,9 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 
 	switch sub {
 	case "status":
-		return sessionRolloutStatus(ctx, store, out, *batchSize, scanInterval)
+		return sessionRolloutStatus(ctx, store,
+			auth.NewRolloutMarkerStore(sessionRolloutMarkerDB(cfg)),
+			out, *batchSize, scanInterval, *expectWriters, *maxPerUID)
 	case "observe":
 		return sessionRolloutObserve(ctx, store, out, *batchSize, scanInterval)
 	case "migrate":
@@ -237,9 +239,24 @@ type sessionRolloutStatusReport struct {
 	Tokens      *auth.SessionObservation     `json:"tokens,omitempty"`
 	LastAdvance *auth.RolloutAdvanceRecord   `json:"last_advance,omitempty"`
 	Next        *auth.RolloutAdvanceDecision `json:"next,omitempty"`
+	// NotDeterminableHere lists blockers this one-shot command cannot evaluate,
+	// moved out of next.blocked_by so they are not read as real obstacles. The
+	// convergence window is a statement about a set holding still over a lease
+	// TTL, which a single invocation has no way to have observed — reporting it
+	// alongside genuine blockers made status disagree with the reconciler it is
+	// meant to diagnose.
+	NotDeterminableHere []string `json:"not_determinable_here,omitempty"`
 }
 
-func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, out io.Writer, batchSize int64, interval time.Duration) error {
+func sessionRolloutStatus(
+	ctx context.Context,
+	store *auth.RedisSessionStore,
+	markers *auth.RolloutMarkerStore,
+	out io.Writer,
+	batchSize int64,
+	interval time.Duration,
+	expectWriters, maxPerUID int,
+) error {
 	report := sessionRolloutStatusReport{Floor: "none"}
 	control, err := store.RolloutControl(ctx)
 	if err != nil {
@@ -258,13 +275,26 @@ func sessionRolloutStatus(ctx context.Context, store *auth.RedisSessionStore, ou
 	}
 	// One scan, reused. This used to scan here and again inside the predicate,
 	// and ignore its own --qps while doing it.
-	decisionInput := auth.RolloutAdvanceInput{ScanBatchSize: batchSize, ScanInterval: interval}
+	//
+	// The predicate gets the same inputs the server's reconciler passes, or the
+	// blocker list here describes a different question than the loop an operator
+	// is trying to diagnose — and the runbook makes blocked_by the starting point
+	// for everything.
+	decisionInput := auth.RolloutAdvanceInput{
+		ScanBatchSize: batchSize,
+		ScanInterval:  interval,
+		Markers:       markers,
+		ExpectWriters: expectWriters,
+		MaxPerUID:     maxPerUID,
+	}
 	if record, err := store.LastRolloutAdvance(ctx); err == nil {
 		report.LastAdvance = record
 	}
 	decisionInput.Registry = registry
 	decision, err := store.EvaluateRolloutAdvance(ctx, decisionInput)
 	if err == nil {
+		report.NotDeterminableHere, decision.BlockedBy = auth.SplitUndeterminableBlockers(decision.BlockedBy)
+		decision.Allowed = len(decision.BlockedBy) == 0 && len(report.NotDeterminableHere) == 0
 		report.Next = &decision
 		report.Tokens = decision.Observation
 	}

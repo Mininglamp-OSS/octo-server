@@ -73,6 +73,10 @@ func newBootHarness(t *testing.T, withMarkerTable bool) *bootHarness {
 	if err != nil && !isMissingMarkerTable(err) {
 		require.NoError(t, err)
 	}
+	// And on the way out: see newMarkerStoreForTest. A surviving marker row makes
+	// the next package's server boot as "floor lost" and write an enforce floor
+	// under the shared default prefix.
+	t.Cleanup(func() { _, _ = db.Exec("DELETE FROM " + defaultRolloutMarkerTable) })
 	if withMarkerTable {
 		_, err = db.Exec("CREATE TABLE IF NOT EXISTS " + rolloutMarkerTable + " (" +
 			"`singleton_id` TINYINT UNSIGNED NOT NULL," +
@@ -860,4 +864,184 @@ func TestPredicateRefusesToRecreateALostFloor(t *testing.T) {
 		require.True(t, decision.Allowed, "blocked by: %s", decision.BlockedSummary())
 		require.Equal(t, SessionModeV3Write, decision.Target)
 	})
+}
+
+// W20 (P1): every mode change publishes what was applied.
+//
+// The registry entry is the fleet-convergence gate's only input, and the gate
+// only rejects writers advertising a mode BELOW the floor. A replica advertising
+// one ABOVE what it runs is therefore invisible to it: this process joined as
+// enforce, was dropped to expand, and kept heartbeating enforce — so it could
+// satisfy convergence for the first v3 floor while still writing v2, which is
+// the single thing the gate exists to rule out.
+//
+// The defect was structural rather than local: resolveAbsentFloor called
+// ApplyRolloutState directly instead of going through the publication the normal
+// floor path uses. The fix is one helper both paths share.
+func TestEveryReconcilerModeChangePublishesTheAppliedState(t *testing.T) {
+	ctx := context.Background()
+	h := newBootHarness(t, true)
+	withFailingFloorRead(t)
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootUnknown, boot.Outcome)
+	require.Equal(t, SessionModeEnforce, h.store.Mode())
+
+	registry := NewWriterRegistry(h.store.client, h.store.uidTokenPrefix)
+	regCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	require.NoError(t, registry.Join(regCtx, "build-a", "pod-a", string(SessionModeEnforce), nil))
+	t.Cleanup(func() { _ = h.store.client.Del(h.store.uidTokenPrefix + "writers").Err() })
+
+	restoreRolloutRead(t)
+	r := NewRolloutReconciler(h.store, ReconcilerOptions{
+		Registry: registry, Markers: h.markers, MaxPerUID: 20,
+	})
+	r.pollFloor(ctx)
+
+	require.Equal(t, SessionModeExpand, h.store.Mode(), "the guess is cleared")
+	live, err := registry.Live()
+	require.NoError(t, err)
+	require.Len(t, live, 1)
+	require.Equal(t, string(SessionModeExpand), live[0].AppliedState,
+		"a replica must never advertise a mode it is not running; advertising one ABOVE "+
+			"what it runs is invisible to the convergence gate")
+}
+
+// W21 (P2, same root cause): the canary posture applies to every mode this
+// reconciler installs, not only the one read from a floor record.
+func TestGuessClearingHonoursTheCanaryPosture(t *testing.T) {
+	ctx := context.Background()
+	h := newBootHarness(t, true)
+	withFailingFloorRead(t)
+	h.boot(t, "", 0)
+	require.Equal(t, SessionModeEnforce, h.store.Mode())
+
+	restoreRolloutRead(t)
+	r := NewRolloutReconciler(h.store, ReconcilerOptions{
+		Markers: h.markers, MaxPerUID: 20, CanaryAhead: true,
+	})
+	r.pollFloor(ctx)
+
+	require.Equal(t, SessionModeV3Write, h.store.Mode(),
+		"a canary replica heals to one phase above, not to a bare expand it then sits on")
+}
+
+// W22 (P1): a transient floor read failure must not pin a replica at enforce
+// when the floor was fine all along.
+//
+// This is the interaction between two earlier fixes. Recovery no longer
+// overwrites a valid floor it merely could not read (P0-1), so it now returns
+// recovered=false in exactly this case — but the Recovered branch was not marked
+// provisional, and runtime applies the mode BEFORE running recovery. So enforce
+// was already committed as an observed value, and no later poll can lower it.
+//
+// One failed EVAL during a rolling restart therefore left the pod denying every
+// legacy session for its lifetime, with no predicate decision and no evidence
+// snapshot behind it.
+func TestTransientReadWithAValidFloorDoesNotPinEnforce(t *testing.T) {
+	ctx := context.Background()
+	h := newBootHarness(t, true)
+	require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeV3Write, 20))
+	require.NoError(t, h.store.AdvanceRolloutControl(ctx, SessionModeRevoke, 20))
+	require.NoError(t, h.markers.StampOnce(ctx, SessionModeRevoke))
+	require.NoError(t, h.store.client.Set(h.store.tokenKey("legacyuser"), "u1@Alice", time.Hour).Err())
+
+	// The scripted read fails; the record itself is untouched and valid.
+	withFailingFloorRead(t)
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootRecovered, boot.Outcome)
+
+	// Recovery declined to replace a valid floor, so the floor is still revoke.
+	restoreRolloutRead(t)
+	control, err := h.store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, control)
+	require.Equal(t, SessionModeRevoke, control.ModeFloor, "the floor was never actually lost")
+
+	r := NewRolloutReconciler(h.store, ReconcilerOptions{Markers: h.markers, MaxPerUID: 20})
+	r.pollFloor(ctx)
+
+	require.Equal(t, SessionModeRevoke, h.store.Mode(),
+		"an enforce that recovery never wrote is a guess, and must yield to the floor that reads")
+
+	record, err := h.store.ReadToken(ctx, h.store.tokenKey("legacyuser"))
+	require.NoError(t, err)
+	info, err := Decode(record.Payload)
+	require.NoError(t, err)
+	require.NoError(t, h.store.ValidateLegacySession(ctx, info, record),
+		"a two-second read fault must not log this user out for the pod's lifetime")
+}
+
+// W23: when the floor really is gone, recovery writes enforce and that IS an
+// observed value — nothing may lower it afterwards.
+func TestRecoveredEnforceBecomesObservedOnceItIsWritten(t *testing.T) {
+	ctx := context.Background()
+	h := newBootHarness(t, true)
+	require.NoError(t, h.markers.StampOnce(ctx, SessionModeRevoke))
+
+	boot := h.boot(t, "", 0)
+	require.Equal(t, RolloutBootRecovered, boot.Outcome)
+	require.Equal(t, SessionModeEnforce, h.store.Mode())
+
+	control, err := h.store.RolloutControl(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, control, "recovery must have written the floor")
+	require.Equal(t, SessionModeEnforce, control.ModeFloor)
+
+	// Not provisional any more: an applied floor cannot be walked back.
+	require.NoError(t, h.store.ApplyRolloutState(SessionModeExpand, 20))
+	require.Equal(t, SessionModeEnforce, h.store.Mode())
+}
+
+// W24 (P1): the canary is one phase above the floor — never two.
+//
+// The deprecated MODE override is itself a canary; its own warning says
+// "equivalent to CANARY_AHEAD=1". Setting both therefore stacked two increments:
+// floor=revoke with MODE=bounded gave bounded, and the runtime increment made it
+// enforce — floor+2, denying every legacy session the floor still intends to
+// honour during the canary.
+//
+// The failure is over-strict rather than a loosening, and the poller recomputes
+// from the floor on its next tick, but the replica has already served traffic in
+// the wrong mode. TestUpgradeNeverLoosensAMidCanaryDeployment cannot see it: it
+// calls ResolveRolloutBoot directly and never reaches the runtime increment.
+func TestCanaryNeverStacksMoreThanOnePhaseAboveTheFloor(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		floors []SessionMode
+		legacy SessionMode
+		want   SessionMode
+	}{
+		{
+			name:   "revoke floor, MODE=bounded, CANARY_AHEAD=1",
+			floors: []SessionMode{SessionModeV3Write, SessionModeRevoke},
+			legacy: SessionModeBounded,
+			want:   SessionModeBounded,
+		},
+		{
+			name:   "v3-write floor, MODE=revoke, CANARY_AHEAD=1",
+			floors: []SessionMode{SessionModeV3Write},
+			legacy: SessionModeRevoke,
+			want:   SessionModeRevoke,
+		},
+		{
+			name:   "canary alone still raises exactly one phase",
+			floors: []SessionMode{SessionModeV3Write, SessionModeRevoke},
+			want:   SessionModeBounded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBootHarness(t, true)
+			for _, floor := range tc.floors {
+				require.NoError(t, h.store.AdvanceRolloutControl(ctx, floor, 20))
+			}
+			t.Setenv(sessionCanaryAheadEnv, "1")
+
+			boot := h.boot(t, tc.legacy, 20)
+			require.Equal(t, tc.want, boot.Mode,
+				"floor %s must not be exceeded by more than one phase", tc.floors[len(tc.floors)-1])
+			require.Equal(t, tc.want, h.store.Mode())
+		})
+	}
 }

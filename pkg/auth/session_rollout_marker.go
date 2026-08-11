@@ -231,6 +231,14 @@ func ResolveRolloutBoot(
 		boot.Outcome = RolloutBootRecovered
 		boot.Floor = SessionModeEnforce
 		boot.Mode = SessionModeEnforce
+		// Provisional until recovery actually writes it, and that qualifier is
+		// load-bearing now that recovery refuses to overwrite a valid floor it
+		// merely could not read: the read may have failed while the record was
+		// perfectly good, in which case recovery declines and this enforce was
+		// never anything but a guess. Committing it as observed made a single
+		// failed EVAL pin the replica at enforce for its lifetime, denying every
+		// legacy session with no predicate decision behind it.
+		boot.Provisional = true
 		// The cap has to survive the loss of the floor that carried it. Falling
 		// back to zero here made recovery unappliable, which left the process at
 		// expand — the fail-open this whole path exists to prevent.
@@ -328,8 +336,12 @@ func StrictRolloutBoot(reason error, legacyMode SessionMode, legacyMaxPerUID int
 		Provisional: true,
 	}
 	applyBootOverrides(&boot, legacyMode, legacyMaxPerUID)
-	boot.Warning = fmt.Sprintf(
-		"session rollout state unresolvable at boot (%v); holding at %s provisionally", reason, boot.Mode)
+	// Prepend rather than assign: applyBootOverrides may have added its own
+	// warning (the security cap defaulting to a value nobody chose), and
+	// overwriting silently dropped exactly the notice this round added.
+	boot.Warning = strings.TrimSpace(fmt.Sprintf(
+		"session rollout state unresolvable at boot (%v); holding at %s provisionally",
+		reason, boot.Mode) + " " + boot.Warning)
 	return boot
 }
 

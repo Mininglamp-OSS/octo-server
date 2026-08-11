@@ -51,7 +51,16 @@ func newMarkerStoreForTest(t *testing.T) *RolloutMarkerStore {
 	_, err = db.Exec("DELETE FROM " + rolloutMarkerTable)
 	require.NoError(t, err)
 	conn := &dbr.Connection{DB: db, Dialect: dialect.MySQL, EventReceiver: &dbr.NullEventReceiver{}}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		// Clear on the way OUT as well, not only on the way in. The marker table
+		// is real and shared with every other package's tests, and a row left
+		// behind means "this deployment initialised a floor" for whoever boots a
+		// server next: their floor is absent, so boot resolves rollback-recovered
+		// and writes an enforce floor under the DEFAULT key prefix. That record
+		// outlives the run and 401s every v2 session in the suite afterwards.
+		_, _ = db.Exec("DELETE FROM " + rolloutMarkerTable)
+		_ = db.Close()
+	})
 	return NewRolloutMarkerStore(conn.NewSession(nil))
 }
 

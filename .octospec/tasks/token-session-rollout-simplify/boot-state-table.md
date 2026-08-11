@@ -38,14 +38,14 @@ Runs once per process. `W?` = does this branch write the floor key.
 | # | floor | marker | outcome | mode | W? | prov | pinned by |
 |---|---|---|---|---|---|---|---|
 | A1 | present | *(not consulted for the mode)* | `normal` / `adopted` | **= floor** | no | no | `TestWiringFirstBootBeforeMarkerMigration` |
-| A2 | absent | present | `rollback-recovered` | **enforce** | **yes** | no | `TestBootResolvesMissingFloorWithoutFailing/recovered` |
+| A2 | absent | present | `rollback-recovered` | **enforce** | **yes** | until written | `TestRecoveredEnforceBecomesObservedOnceItIsWritten` |
 | A3 | absent | absent | `fresh` | **expand** | no | no | `TestGenuinelyAbsentFloorWithNoMarkerStaysAtExpand` |
 | A4 | absent | 1146 | `fresh` | **expand** | no | no | same branch as A3 |
-| A5 | absent | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | — |
-| A6 | error | present | `rollback-recovered` | **enforce** | **yes** | no | `TestUnreadableFloorResolvesUpwardNotToExpand` |
+| A5 | absent | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | `TestBootWithUnreadableMarkerIsUndecidableAndWritesNoFloor` |
+| A6 | error | present | `rollback-recovered` | **enforce** | attempted | **until written** | `TestTransientReadWithAValidFloorDoesNotPinEnforce` |
 | A7 | error | absent | `unknown` | **enforce** | no | yes | `TestUnreadableFloorWithNoMarkerIsUnknownNotFresh` |
 | A8 | error | 1146 | `unknown` | **enforce** | no | yes | `TestWiringUnreadableFloorIsNotAFreshInstall/marker table absent` |
-| A9 | error | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | — |
+| A9 | error | error | `unknown` (via `StrictRolloutBoot`) | **enforce** | no | yes | `TestBootWithUnreadableMarkerIsUndecidableAndWritesNoFloor` |
 
 Notes:
 
@@ -56,7 +56,12 @@ Notes:
 - **A2/A6 are the only boot branches that write.** They write because the marker
   *proves* a floor existed. A5/A7/A8/A9 do not, because nothing proves it, and
   writing enforce on a guess would jump a greenfield ladder irreversibly.
-- A5 and A9 have no test. **Gap 1.**
+- **A2/A6 stay provisional until recovery actually writes.** A6 in particular
+  ATTEMPTS a write and may decline: recovery refuses to overwrite a valid floor it
+  merely could not read, so the enforce this row proposes may never become real.
+  Committing it as observed made one failed EVAL pin the replica at enforce for
+  its lifetime — the mode is only promoted to observed once the CAS lands, and if
+  recovery declines, the floor that *is* readable is adopted instead.
 
 ### Correction to review round 5, P2-7
 
@@ -79,7 +84,8 @@ rather than `normal`, not a mode change. No fix; the table is the answer.
 | B2 | absent | present | **recover at enforce** | corrected upward |
 | B3 | absent | absent / 1146 | `ApplyRolloutState(expand)` | guess cleared → **expand** |
 | B4 | absent | error | nothing | guess retained (cannot decide) |
-| B5 | error | — | nothing | guess retained (transient) |
+| B5 | error | present | **attempt recovery** | corrected upward if the record is truly unparseable |
+| B6 | error | absent / error | nothing | guess retained (the bytes might be a floor this build cannot read) |
 
 **Before this round the whole `absent` row did not exist**: `pollFloor` returned
 immediately on `err != nil || control == nil`, so B2/B3/B4 were one dead branch.
@@ -93,6 +99,22 @@ B2 matters as much as B3 and is not in the review's suggested fix: applying
 the RDB-rollback case the marker exists to catch. The poller needs the same
 three-way distinction boot uses.
 
+**B5 was also a wedge.** Returning on every read error meant a permanently
+malformed floor stopped the self-driving loop until every pod was restarted.
+Recovery decides by decoding what is on the key and is a no-op for a valid floor,
+so attempting it on any read error is safe — a transient fault changes nothing, a
+genuinely unparseable record is replaced. B6 remains the one state with no
+in-band exit, and the runbook now names the manual repair.
+
+**Every row that changes the mode goes through one helper.** `applyAndPublish`
+applies, records the metric and republishes the registry entry together, because
+they are not separable: the convergence gate only rejects writers advertising a
+mode BELOW the floor, so a replica advertising one ABOVE what it runs is
+invisible to it and can satisfy convergence for the first v3 floor while still
+writing v2. That hole opened the moment a second caller applied state directly.
+The canary offset lives there too — it is a property of the replica's posture,
+not of where the mode came from.
+
 ---
 
 ## C. Predicate — `EvaluateRolloutAdvance`, decides whether to advance
@@ -102,7 +124,7 @@ three-way distinction boot uses.
 | C1 | present, `< enforce` | — | `floor.next()` | per gates |
 | C2 | present, `enforce` | — | — | terminal, no scan |
 | C3 | absent | absent / 1146 | `v3-write` (first floor) | per gates |
-| C4 | absent | present | **must refuse** | floor was lost, not never-created — recovery restores it, an advance must not re-create it | 
+| C4 | absent | present | **must refuse** | floor was lost, not never-created — recovery restores it, an advance must not re-create it |
 | C5 | absent | error / no store | **must refuse** | cannot tell C3 from C4 |
 | C6 | error | — | — | returns the error |
 
@@ -124,10 +146,17 @@ have written down, and it is why patching one of them would have left the other.
 
 | writer | may lower? | condition |
 |---|---|---|
-| `ApplyRolloutState` | only when current is **provisional** | otherwise monotonic |
+| `ApplyRolloutState` | only when current is **provisional** | otherwise monotonic; clears provisional on landing |
 | `ApplyProvisionalRolloutState` | never | raises only, marks provisional |
 | `advanceFloor` | n/a — writes the floor, not the mode | marker → snapshot → CAS, single path |
 | `RecoverRolloutControlAtEnforce` | n/a | replaces only an absent or genuinely unparseable record |
+
+One more bound belongs here: **the running mode is never more than one phase
+above the floor.** The deprecated `MODE` override is itself a canary — its own
+warning says "equivalent to `CANARY_AHEAD=1`" — so applying the `CANARY_AHEAD`
+increment on top stacked two and put a `revoke`-floor deployment at `enforce`,
+denying legacy sessions the floor still intends to honour. Pinned by
+`TestCanaryNeverStacksMoreThanOnePhaseAboveTheFloor`.
 
 The monotonic rule protects **observed** floors. Applying it to a guess is what
 produced P1-1; exempting an observed floor from it would re-open round 4's
@@ -136,11 +165,11 @@ are the only places it is cleared.
 
 ---
 
-## Gaps this table exposes
+## Gaps this table exposed (all now closed)
 
 1. **A5 / A9 untested** — boot with an unreadable marker. Both route through
    `StrictRolloutBoot`, which round 4 changed from `Recovered` to `Unknown`; no
-   test pins that it no longer writes a floor.
+   test pinned that it no longer writes a floor.
 2. **B2 / B3 / B4 unimplemented** — the poller's entire absent-floor row.
 3. **C4 / C5 unimplemented** — the predicate's marker consultation.
 4. **`unknown` is not a metric label** — `sessionRolloutBootOutcomes` lists four
@@ -148,5 +177,20 @@ are the only places it is cleared.
    one outcome is 1" contract is false for the four rows an operator most needs
    to see.
 
-Gaps 2 and 3 are the two P1s. Gaps 1 and 4 are what would have made them
-visible: the first as a test, the second as an alert.
+Gaps 2 and 3 were the two P1s of round 5. Gaps 1 and 4 are what would have made
+them visible: the first as a test, the second as an alert.
+
+### What round 6 then found in these same rows
+
+Writing the table located the missing **cells** and stopped there — it did not
+check that each cell's **exit** was complete. Three of the four round-6 findings
+are that omission:
+
+- A2/A6 gained a cell but not the provisional qualifier, so recovery declining
+  (which the round-4 fix made possible) left a guess committed as observed.
+- B2/B3 gained cells but bypassed the publication path, so the registry
+  advertised a mode the replica was not running.
+- B3 bypassed the canary offset for the same reason.
+
+The table now records, per row, both what the mode resolves to AND who may change
+it afterwards. That second column is the one that was missing.

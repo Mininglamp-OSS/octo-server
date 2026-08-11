@@ -315,6 +315,23 @@ func blockedOnlyOnConvergence(decision RolloutAdvanceDecision) bool {
 	return true
 }
 
+// SplitUndeterminableBlockers separates blockers a one-shot caller cannot
+// evaluate from ones it can. Only the convergence window qualifies: it asserts
+// that a set held still across a lease TTL, and a single invocation has no
+// window to have observed. Reporting it next to real obstacles made `status`
+// contradict the reconciler it exists to diagnose.
+func SplitUndeterminableBlockers(blockedBy []string) (undeterminable, remaining []string) {
+	for _, reason := range blockedBy {
+		if strings.Contains(reason, convergenceBlockedPrefix) ||
+			strings.Contains(reason, convergenceUnobservedReason) {
+			undeterminable = append(undeterminable, reason)
+			continue
+		}
+		remaining = append(remaining, reason)
+	}
+	return undeterminable, remaining
+}
+
 // BlockedOnlyOnConvergence is the exported form, for callers outside this
 // package that poll the predicate.
 func (d RolloutAdvanceDecision) BlockedOnlyOnConvergence() bool { return blockedOnlyOnConvergence(d) }

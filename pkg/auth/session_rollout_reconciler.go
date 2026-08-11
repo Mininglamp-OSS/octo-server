@@ -187,8 +187,16 @@ func (r *RolloutReconciler) runReconciler(ctx context.Context) {
 func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	control, err := r.store.RolloutControl(ctx)
 	if err != nil {
-		// Transient and undecidable: keep whatever this replica is running,
-		// including a provisional guess.
+		// Could be a transient read fault, could be a permanently malformed
+		// record — and this path used to return either way, so a corrupt floor
+		// wedged the self-driving loop until someone restarted every pod.
+		//
+		// Recovery decides by decoding what is actually on the key and is a no-op
+		// for a valid floor, so attempting it on every read error is safe: a
+		// transient fault changes nothing, a genuinely unparseable record gets
+		// replaced. It still requires the marker, so a deployment that never
+		// established a floor is never handed one.
+		r.resolveFloorlessState(ctx, true)
 		return
 	}
 	if control == nil {
@@ -201,7 +209,7 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 		// It is also three-way, exactly as it is at boot, so it needs the marker
 		// for the same reason: clearing the guess to expand unconditionally would
 		// be a fail-open on the RDB-rollback case.
-		r.resolveAbsentFloor(ctx)
+		r.resolveFloorlessState(ctx, false)
 		return
 	}
 
@@ -216,32 +224,50 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	}
 	r.ensureMarker(ctx, control.ModeFloor)
 
-	mode := control.ModeFloor
-	if r.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
-		mode = mode.next()
-	}
 	cap := control.MaxPerUID
 	if cap <= 0 {
 		cap = r.maxPerUID
 	}
-	if applyErr := r.store.ApplyRolloutState(mode, cap); applyErr != nil {
+	if applyErr := r.applyAndPublish(control.ModeFloor, cap); applyErr != nil {
 		r.log("session rollout: cannot apply floor %s: %v", control.ModeFloor, applyErr)
-		return
-	}
-	applied := r.store.currentMode()
-	metrics.SetSessionRolloutMode(string(applied))
-	if r.registry != nil {
-		// Publish what was APPLIED, never what was resolved. Advertising a mode
-		// this replica is not actually running lets the convergence gate be
-		// satisfied by a replica that has not converged. Only on an actual
-		// change — the heartbeat already refreshes the entry on its own tick,
-		// so rewriting an identical one every poll doubles registry traffic.
-		r.registry.SetAppliedStateIfChanged(string(applied))
 	}
 }
 
-// resolveAbsentFloor handles rows B2/B3/B4 of the boot-state table: the floor
-// read succeeded and returned nothing.
+// applyAndPublish is the ONLY way this reconciler changes the mode it runs at.
+//
+// It exists because the three steps are not separable. Applying without
+// publishing leaves the registry advertising a mode this replica is not running,
+// and the convergence gate only rejects writers advertising a mode BELOW the
+// floor — so a replica advertising one ABOVE what it runs is invisible to it and
+// can satisfy convergence for the first v3 floor while still writing v2. That is
+// precisely the hole the gate exists to close, and it opened because a second
+// caller (resolveAbsentFloor) called ApplyRolloutState on its own.
+//
+// The canary offset belongs here too: it is a property of this replica's
+// posture, not of where the mode came from, so a mode installed by
+// guess-clearing has to carry it exactly like one read from a floor record.
+func (r *RolloutReconciler) applyAndPublish(mode SessionMode, maxPerUID int) error {
+	if r.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
+		mode = mode.next()
+	}
+	if err := r.store.ApplyRolloutState(mode, maxPerUID); err != nil {
+		return err
+	}
+	// Publish what was APPLIED, never what was requested: ApplyRolloutState may
+	// legitimately refuse to lower an observed mode. Only on an actual change —
+	// the heartbeat refreshes the entry on its own tick, so rewriting an
+	// identical one every poll doubles registry traffic.
+	applied := r.store.currentMode()
+	metrics.SetSessionRolloutMode(string(applied))
+	if r.registry != nil {
+		r.registry.SetAppliedStateIfChanged(string(applied))
+	}
+	return nil
+}
+
+// resolveFloorlessState handles every row of the boot-state table where this
+// replica has no usable floor: the read returned nothing (B2/B3/B4) or failed
+// outright (B5).
 //
 // Only the marker can say which of the three absences this is, and getting it
 // wrong costs in both directions — treating a loss as greenfield re-admits the
@@ -253,7 +279,7 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 // recovery unconditionally on every replica. Gating it here would only mean a
 // paused deployment recovers via pod restarts instead — the same outcome,
 // arrived at less predictably.
-func (r *RolloutReconciler) resolveAbsentFloor(ctx context.Context) {
+func (r *RolloutReconciler) resolveFloorlessState(ctx context.Context, unreadable bool) {
 	if r.markers == nil {
 		return
 	}
@@ -280,17 +306,24 @@ func (r *RolloutReconciler) resolveAbsentFloor(ctx context.Context) {
 			// reads it through the normal path.
 			return
 		}
-		if applyErr := r.store.ApplyRolloutState(SessionModeEnforce, r.recoveryMaxPerUID()); applyErr != nil {
+		if applyErr := r.applyAndPublish(SessionModeEnforce, r.recoveryMaxPerUID()); applyErr != nil {
 			r.log("session rollout: cannot apply recovered floor: %v", applyErr)
 			return
 		}
 		r.log("session rollout: floor was missing but this deployment initialised one at %s; "+
 			"restored at enforce", marker.InitializedAt.UTC().Format(time.RFC3339))
+	case unreadable:
+		// B5: no marker AND the record could not be parsed. "Never established"
+		// is not available as a conclusion here — the bytes on the key might be a
+		// real floor this build cannot read — so hold the current mode, guess
+		// included. This is the one state with no in-band exit; the runbook names
+		// the manual repair.
+		return
 	default:
 		// B3: genuinely never established. Applying expand is a no-op for an
 		// observed mode — the no-lowering rule still holds — and clears a
 		// provisional guess, which is the asymmetry `provisional` exists for.
-		if applyErr := r.store.ApplyRolloutState(SessionModeExpand, r.maxPerUID); applyErr != nil {
+		if applyErr := r.applyAndPublish(SessionModeExpand, r.maxPerUID); applyErr != nil {
 			r.log("session rollout: cannot clear provisional mode: %v", applyErr)
 		}
 	}

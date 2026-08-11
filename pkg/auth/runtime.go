@@ -103,7 +103,15 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	boot.AutoAdvance = policy.autoAdvance
 	boot.CanaryAhead = policy.canaryAhead
 	boot.ExpectWriters = policy.expectWriters
-	if policy.canaryAhead && boot.Mode.rank() < SessionModeEnforce.rank() {
+	// At most one phase above the floor, ever. The deprecated MODE override is
+	// itself a canary — applyBootOverrides' own warning says it is "equivalent to
+	// CANARY_AHEAD=1" — so setting both used to stack two increments and put a
+	// revoke-floor deployment at enforce, denying every legacy session the floor
+	// still intends to honour for the length of the canary. Over-strict rather
+	// than a loosening, and the poller recomputes from the floor on its next
+	// tick, but the replica serves traffic in the wrong mode until then.
+	alreadyAhead := boot.Floor.valid() && boot.Mode.rank() > boot.Floor.rank()
+	if policy.canaryAhead && !alreadyAhead && boot.Mode.rank() < SessionModeEnforce.rank() {
 		boot.Mode = boot.Mode.next()
 	}
 	// The apply must not be swallowed. Letting it fail into a warning is how a
@@ -129,11 +137,30 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		recovered, recoverErr := store.RecoverRolloutControlAtEnforce(bootCtx, boot.MaxPerUID)
 		switch {
 		case recoverErr != nil:
+			// Still provisional, so the poller can correct it either way.
 			boot.Warning = strings.TrimSpace(boot.Warning + " " + recoverErr.Error())
 		case !recovered:
+			// Recovery declined, which means a VALID floor is on the key — the
+			// read that failed at the top of boot was the only thing wrong. That
+			// floor is the observed truth and this enforce was only ever a guess,
+			// so adopt the floor instead of keeping the guess. Applying it also
+			// clears the provisional flag, which is what stops a later poll from
+			// being needed to undo a mode this process should never have run.
 			boot.Warning = strings.TrimSpace(boot.Warning +
-				" the floor reappeared before recovery could write; keeping the persisted value")
+				" the floor is readable after all; adopting it instead of the recovered value")
+			if observed := persistedFloor(bootCtx, store); observed.valid() {
+				if applyErr := store.ApplyRolloutState(observed, boot.MaxPerUID); applyErr != nil {
+					boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
+				}
+			}
+		default:
+			// Recovery wrote enforce. It is an observed floor from here on, and
+			// re-applying it non-provisionally is what makes it unlowerable.
+			if applyErr := store.ApplyRolloutState(SessionModeEnforce, boot.MaxPerUID); applyErr != nil {
+				boot.Warning = strings.TrimSpace(boot.Warning + " " + applyErr.Error())
+			}
 		}
+		boot.Mode = store.Mode()
 		// Floor is what the startup log line and `session-rollout status` report,
 		// so it has to say what Redis holds rather than what recovery intended.
 		// Neither non-success branch above leaves enforce persisted: a failed
