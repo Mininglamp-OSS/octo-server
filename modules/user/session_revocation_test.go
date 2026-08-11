@@ -112,6 +112,56 @@ func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
 	require.Equal(t, 1, pending)
 }
 
+func TestDestroyAccountWithSessionRevocationClearsPhoneShadow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+
+	tests := []struct {
+		name          string
+		expectedState int
+		phone         string
+	}{
+		{name: "immediate destroy", expectedState: IsDestroyNo, phone: "13900004101"},
+		{name: "cooling-off finalize", expectedState: IsDestroyApplying, phone: "13900004102"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid := util.GenerUUID()
+			require.NoError(t, db.Insert(&Model{
+				UID:       uid,
+				Username:  "0086" + tt.phone,
+				Name:      tt.name,
+				ShortNo:   uid,
+				Zone:      "0086",
+				Phone:     tt.phone,
+				Status:    1,
+				IsDestroy: tt.expectedState,
+			}))
+
+			before, err := db.QueryByUID(uid)
+			require.NoError(t, err)
+			require.NotEmpty(t, before.PhoneEncrypted)
+			require.NotEmpty(t, before.PhoneHash)
+			require.NotEmpty(t, before.PhoneLast4)
+
+			intent, err := db.destroyAccountWithSessionRevocation(
+				context.Background(), uid, "anon-"+uid, tt.phone+"@1700000000000@delete", tt.expectedState,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, intent)
+
+			destroyed, err := db.QueryByUID(uid)
+			require.NoError(t, err)
+			require.Equal(t, IsDestroyDone, destroyed.IsDestroy)
+			require.Empty(t, destroyed.PhoneEncrypted)
+			require.Empty(t, destroyed.PhoneHash)
+			require.Empty(t, destroyed.PhoneLast4)
+		})
+	}
+}
+
 func TestNewSessionRevocationIntentReservesSynchronousClaimWindow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	db := NewDB(ctx)

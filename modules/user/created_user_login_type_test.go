@@ -12,6 +12,7 @@ func TestCreateUserModelAuditLoginType(t *testing.T) {
 		{name: "first github login", model: createUserModel{LoginType: "github"}, want: "github"},
 		{name: "first gitee login", model: createUserModel{LoginType: "gitee"}, want: "gitee"},
 		{name: "first oidc login", model: createUserModel{LoginType: "oidc"}, want: "oidc"},
+		{name: "first wechat login", model: createUserModel{LoginType: "wechat"}, want: "wechat"},
 	}
 
 	for _, tt := range tests {
