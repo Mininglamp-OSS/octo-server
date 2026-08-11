@@ -142,7 +142,7 @@ func (u *User) externalLoginExisting(ctx context.Context, req ExternalLoginReq) 
 	if err != nil {
 		return nil, err
 	}
-	go u.sentWelcomeMsg(req.PublicIP, userInfoM.UID)
+	u.finishSuccessfulLogin(userInfoM.UID, userInfoM.Username, req.PublicIP, "oidc")
 
 	return &ExternalLoginResp{
 		UID:           userInfoM.UID,
@@ -176,13 +176,14 @@ func (u *User) externalLoginCreate(ctx context.Context, req ExternalLoginReq) (*
 	}()
 
 	createUser := &createUserModel{
-		UID:    req.UID,
-		Name:   sanitizeExternalName(req.Name), // 消毒同 externalLoginExisting,防 token cache key 注入
-		Email:  req.Email,
-		Phone:  req.Phone,
-		Zone:   req.Zone,
-		Flag:   int(req.DeviceFlag.Uint8()),
-		Device: toDeviceReq(req.Device),
+		UID:       req.UID,
+		Name:      sanitizeExternalName(req.Name), // 消毒同 externalLoginExisting,防 token cache key 注入
+		Email:     req.Email,
+		Phone:     req.Phone,
+		Zone:      req.Zone,
+		Flag:      int(req.DeviceFlag.Uint8()),
+		Device:    toDeviceReq(req.Device),
+		LoginType: "oidc",
 	}
 
 	loginResp, err := u.createUserWithRespAndTx(ctx, createUser, req.PublicIP, nil, tx, func() error {

@@ -98,7 +98,11 @@ func TestRegisterReq_CheckRegister(t *testing.T) {
 			errMsg:  "密码不能为空",
 		},
 		{
-			name: "password too short",
+			// 长度/复杂度不再由 CheckRegister 负责：它已收窄为"必填项非空 + 名字格式"，
+			// 密码强度移到 register handler 里的 ValidatePasswordStrength（策略闸门之后）。
+			// 强度规则本身由 TestValidatePasswordStrength 覆盖，handler 侧由
+			// TestRegisterRejectsWeakPassword 覆盖。
+			name: "short password is no longer CheckRegister's concern",
 			req: registerReq{
 				Name:     "张三",
 				Zone:     "0086",
@@ -106,11 +110,10 @@ func TestRegisterReq_CheckRegister(t *testing.T) {
 				Code:     "1234",
 				Password: "12345",
 			},
-			wantErr: true,
-			errMsg:  "密码长度必须大于6位",
+			wantErr: false,
 		},
 		{
-			name: "password exactly 6 chars",
+			name: "non-empty password passes the non-empty check",
 			req: registerReq{
 				Name:     "张三",
 				Zone:     "0086",

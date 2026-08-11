@@ -225,6 +225,12 @@ func TestScanLoginAuthorization_RequiresConfirmationAndRedeemsOnce(t *testing.T)
 	s.GetRoute().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), `"token"`)
+	var loginAudit LoginLogModel
+	err = ctx.DB().Select("*").From("login_log").
+		Where("uid=? AND status=? AND login_type=?", testutil.UID, loginStatusSuccess, "scan_login").
+		LoadOne(&loginAudit)
+	require.NoError(t, err)
+	assert.Equal(t, "9.9.8.41", loginAudit.LoginIP)
 
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodPost,

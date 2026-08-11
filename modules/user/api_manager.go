@@ -15,6 +15,7 @@ import (
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -23,8 +24,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	rd "github.com/go-redis/redis"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+)
+
+const (
+	managerLoginRateLimitTag      = "manager_login"
+	managerLoginRateLimitRPS      = 10.0 / 60
+	managerLoginRateLimitBurst    = 5
+	managerLoginRateLimitPoolSize = 10
 )
 
 // Manager 用户管理
@@ -40,6 +49,7 @@ type Manager struct {
 	commonService common2.IService
 	roleService   *RoleService
 	sessionStore  userSessionStore
+	loginLog      *LoginLog
 }
 
 // NewManager NewManager
@@ -56,6 +66,7 @@ func NewManager(ctx *config.Context) *Manager {
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 		sessionStore:  auth.SessionStoreForContext(ctx),
+		loginLog:      NewLoginLog(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -63,9 +74,23 @@ func NewManager(ctx *config.Context) *Manager {
 
 // Route 配置路由规则
 func (m *Manager) Route(r *wkhttp.WKHttp) {
+	// manager login is an unauthenticated, high-value endpoint. Every failed
+	// attempt also writes an audit row, so the broad global DDoS floor is not
+	// sufficient protection against brute force or database write amplification.
+	managerLoginRedis := octoredis.NewInstrumentedClient(m.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = managerLoginRateLimitPoolSize
+	})
+	managerLoginLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(),
+		managerLoginRedis,
+		managerLoginRateLimitTag,
+		managerLoginRateLimitRPS,
+		managerLoginRateLimitBurst,
+	)
 	user := r.Group("/v1/manager")
 	{
-		user.POST("/login", m.login) // 账号登录
+		user.POST("/login", managerLoginLimit, m.login) // 账号登录
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{
@@ -83,6 +108,15 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser) // 解禁或封禁用户
 		auth.POST("/user/updatepassword", m.updatePwd)        // 修改用户密码
 		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
+		// 手机号影子列回填：一次性数据迁移任务，带游标反复调用直到 done。
+		// superAdmin 专属；见 db_phone_backfill.go。
+		//
+		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才能读到 uid）：单次调用最多
+		// maxBackfillBatchesPerCall × batchSize 次 UPDATE，是本模块写放大最大的端点，
+		// 必须有 per-user 频控兜住误用/脚本失控，不能只靠调用方自觉。
+		backfillLimiter := appwkhttp.SharedUIDRateLimiter(r, m.ctx)
+		auth.POST("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfill)
+		auth.GET("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfillStatus)
 	}
 	dashboardReader := r.Group(
 		"/v1/manager/user",
@@ -277,9 +311,11 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
+	publicIP := util.GetClientPublicIP(c.Request)
 	// 登录失败统一返回 ErrUserInvalidCredentials，避免攻击者通过"用户不存在"
 	// 与"密码错误"的响应差异枚举有效管理账号（与 /v1/user login 反枚举一致）。
 	if userInfo == nil || userInfo.UID == "" {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -298,11 +334,13 @@ func (m *Manager) login(c *wkhttp.Context) {
 	}
 	if userInfo == nil || userInfo.UID != fencedUID ||
 		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -312,7 +350,10 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
+	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪dashboardReader，
+	// 见 575185b0），被拒同样计入登录失败日志。
 	if !auth.IsManagerConsoleRole(userInfo.Role) {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
@@ -337,6 +378,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
+	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
 }
 
 // 重置用户密码
@@ -357,8 +399,8 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "")
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	if req.NewPassword != req.NewPassswordConfirmation {
@@ -725,6 +767,10 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
 	user, err := m.db.queryUserWithNameAndRole(req.LoginName, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("查询用户是否存在错误", zap.String("username", req.LoginName))
@@ -784,6 +830,10 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	}
 	if err := req.checkAddUserReq(); err != nil {
 		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	userInfo, err := m.userDB.QueryByUsername(fmt.Sprintf("%s%s", req.Zone, req.Phone))
@@ -1361,8 +1411,8 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserOldPasswordIncorrect)
 		return
 	}
-	if len(req.NewPassword) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	if req.Password == req.NewPassword {
@@ -1518,31 +1568,50 @@ func (m *Manager) createManagerAccount() {
 		return
 	}
 
-	username := string(wkhttp.SuperAdmin)
-	role := string(wkhttp.SuperAdmin)
 	var pwd = m.ctx.GetConfig().AdminPwd
+	// 超管播种密码同样必须过口令复杂度策略。这里 fail-closed（不建账号）而不是降级
+	// 建一个弱口令超管：上面的 early return 保证只有"超管尚不存在"时才会走到这里，
+	// 所以拒绝创建只影响全新部署，不会把已有环境锁在外面；而一个弱口令的超级管理员
+	// 正是审计和真实攻击面上最贵的那个洞。
+	//
+	// 只记错误类型不记密码本身。
+	if err := ValidatePasswordStrength(pwd); err != nil {
+		m.Error("拒绝创建超级管理员：AdminPwd 不满足口令复杂度策略"+
+			"（≥8 个字符、≤72 字节，且含大小写字母/数字/特殊字符中的至少 2 类）。"+
+			"请修正配置后重启以完成超管账号创建。",
+			zap.Error(err))
+		return
+	}
 	hashedPwd, hashErr := HashPassword(pwd)
 	if hashErr != nil {
 		m.Error("密码哈希失败", zap.Error(hashErr))
 		return
 	}
-	err = m.userDB.Insert(&Model{
-		UID:      m.ctx.GetConfig().Account.AdminUID,
-		Name:     "超级管理员",
-		ShortNo:  "30000",
-		Category: "system",
-		Role:     role,
-		Username: username,
-		Zone:     "0086",
-		Phone:    "13000000002",
-		Status:   1,
-		Password: hashedPwd,
-	})
+	err = m.userDB.Insert(newManagerSeedModel(m.ctx.GetConfig().Account.AdminUID, hashedPwd))
 	if err != nil {
 		m.Error("新增系统管理员错误", zap.Error(err))
 		return
 	}
 }
+
+// newManagerSeedModel 构造首次启动的超管账号。超管通过 username 登录，
+// 固定虚构手机号没有业务用途，却会让 bootstrap 不必要地依赖
+// OCTO_PII_ENCRYPTION_SECRET。保持 phone 为空可以在 PII 密钥配置前先建立
+// 管理入口，且不会因降级而在超管行上留下一个明文的虚构号码
+// （缺密钥时的降级行为见 DB.syncPhoneShadow）。
+func newManagerSeedModel(adminUID, hashedPwd string) *Model {
+	return &Model{
+		UID:      adminUID,
+		Name:     "超级管理员",
+		ShortNo:  "30000",
+		Category: "system",
+		Role:     string(wkhttp.SuperAdmin),
+		Username: string(wkhttp.SuperAdmin),
+		Status:   1,
+		Password: hashedPwd,
+	}
+}
+
 func getShowPhoneNum(mobile string) string {
 	if len(mobile) <= 3 {
 		return mobile
@@ -1663,4 +1732,58 @@ func newUserOnlineResp(m *onlineStatusWeightModel) *userOnlineResp {
 		LastOffline: m.LastOffline,
 		Online:      m.Online,
 	}
+}
+
+// phoneShadowBackfillReq 回填请求。cursor 由上一次响应的 next_cursor 透传回来，
+// 首次调用传 0。
+type phoneShadowBackfillReq struct {
+	Cursor     int64 `json:"cursor"`
+	BatchSize  int   `json:"batch_size"`
+	IntervalMS int   `json:"interval_ms"`
+}
+
+// phoneShadowBackfill 触发一批手机号影子列回填。
+//
+// 刻意做成"带游标的多次调用"而不是一次长跑请求：单次调用有批数上限（见
+// db_phone_backfill.go），运维按响应里的 next_cursor 反复 POST 直到 done=true，
+// 这样既不会产生长事务/超时，也能随时中断续跑（任务本身幂等）。
+func (m *Manager) phoneShadowBackfill(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	var req phoneShadowBackfillReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.Cursor < 0 {
+		respondUserRequestInvalid(c, "cursor")
+		return
+	}
+	result, err := m.userDB.BackfillPhoneShadow(
+		c.Request.Context(), req.Cursor, req.BatchSize, time.Duration(req.IntervalMS)*time.Millisecond)
+	if err != nil {
+		// 主密钥未配置也走这里：属于部署配置问题，对客户端是内部错误。
+		m.Error("手机号影子列回填失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	c.Response(result)
+}
+
+// phoneShadowBackfillStatus 只读进度：仍待回填的行数。用于确认回填是否收敛，
+// 以及后续把空间成员后四位检索从明文兜底切成纯 phone_last4 的判断依据。
+func (m *Manager) phoneShadowBackfillStatus(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	remaining, err := m.userDB.CountPhoneShadowPending()
+	if err != nil {
+		m.Error("统计手机号影子列待回填行数失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	c.Response(map[string]interface{}{"remaining": remaining})
 }

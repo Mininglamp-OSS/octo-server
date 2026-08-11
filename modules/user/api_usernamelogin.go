@@ -46,8 +46,8 @@ func (u *User) usernameRegister(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
-	if len(req.Password) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	if len(req.Username) < 8 || len(req.Username) > 22 {
@@ -96,6 +96,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
+	publicIP := util.GetClientPublicIP(c.Request)
 	loginSpan := u.ctx.Tracer().StartSpan(
 		"login",
 		opentracing.ChildOf(c.GetSpanContext()),
@@ -112,6 +113,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 	}
 	if userInfo == nil {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		// 统一错误消息，避免枚举账号
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
@@ -131,12 +133,14 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 	}
 	if userInfo == nil || userInfo.UID != fencedUID {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	// 已注销账号拒绝登录；冷静期账号允许登录（响应中附带注销状态提示）
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -144,6 +148,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -168,8 +173,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		"data":                      result,
 		"need_upload_web3publickey": needUploadWeb3PublicKey,
 	})
-	publicIP := util.GetClientPublicIP(c.Request)
-	go u.sentWelcomeMsg(publicIP, userInfo.UID)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, publicIP, "username")
 }
 func (u *User) registerWithUsername(username string, name string, password string, flag int, device *deviceReq, c *wkhttp.Context) {
 	registerSpan := u.ctx.Tracer().StartSpan(
@@ -254,6 +258,13 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 	}
 	if req.SignText == "" {
 		respondUserRequestInvalid(c, "sign_text")
+		return
+	}
+	// Web3 签名只证明"你是这个账号的持有者"，不约束新口令的强度。这里必须与手机号
+	// (pwdforget) / 邮箱 (emailForgetPwd) 两条找回路径同款校验，否则验签通过后可以把
+	// 密码设成 "1"，绕开整套复杂度策略。
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	user, err := u.db.QueryByUsername(req.Username)
@@ -517,6 +528,10 @@ func (u *User) updatePwd(c *wkhttp.Context) {
 	}
 	if req.Password == req.NewPassword {
 		respondUserError(c, errcode.ErrUserNewPasswordSameAsOld)
+		return
+	}
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 	userInfo, err := u.db.QueryByUID(loginUID)

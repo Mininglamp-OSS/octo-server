@@ -100,7 +100,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		}
 		// 发送登录消息
 		publicIP := util.GetClientPublicIP(c.Request)
-		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
+		u.finishSuccessfulLogin(userInfoM.UID, userInfoM.Username, publicIP, "github")
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
 			// 必须先把 authcode 标记为登录失败再返回,详见 api_gitee.go 同位
@@ -130,6 +130,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 			Name:      name,
 			GithubUID: userInfo.Login,
 			Flag:      int(deviceFlag.Uint8()),
+			LoginType: "github",
 		}
 		if userInfo.AvatarURL != "" {
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

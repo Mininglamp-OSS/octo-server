@@ -164,7 +164,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		}
 		// 发送登录消息
 		publicIP := util.GetClientPublicIP(c.Request)
-		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
+		u.finishSuccessfulLogin(userInfoM.UID, userInfoM.Username, publicIP, "gitee")
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
 			// 必须先把 authcode 标记为登录失败再返回:thirdAuthcode 起手把 Redis
@@ -188,13 +188,14 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		}
 		name = strings.ReplaceAll(name, "@", "_")
 		var model = &createUserModel{
-			UID:      uid,
-			Zone:     "",
-			Phone:    "",
-			Password: "",
-			Name:     name,
-			GiteeUID: userInfo.Login,
-			Flag:     int(deviceFlag.Uint8()),
+			UID:       uid,
+			Zone:      "",
+			Phone:     "",
+			Password:  "",
+			Name:      name,
+			GiteeUID:  userInfo.Login,
+			Flag:      int(deviceFlag.Uint8()),
+			LoginType: "gitee",
 		}
 		if userInfo.AvatarURL != "" && !strings.HasSuffix(userInfo.AvatarURL, "no_portrait.png") {
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

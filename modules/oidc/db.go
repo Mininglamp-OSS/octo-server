@@ -7,6 +7,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -189,9 +190,10 @@ func insertRefreshRow(insert insertBySql, m *RefreshModel) error {
 //
 // 索引提示:`COALESCE(...)` 上无 B-tree 索引,filesort 在小数据量(P0 上线初期
 // 预计 < 1k active RT)可接受。RT 量明显增长(>10k)后,按需:
-//   1. 加复合索引 `(revoked_at, last_refreshed_at, created_at)` 让 WHERE +
-//      ORDER BY 局部覆盖;或
-//   2. 改成应用层维护"下次该刷新时间"列(避免 COALESCE),用单列索引兜住。
+//  1. 加复合索引 `(revoked_at, last_refreshed_at, created_at)` 让 WHERE +
+//     ORDER BY 局部覆盖;或
+//  2. 改成应用层维护"下次该刷新时间"列(避免 COALESCE),用单列索引兜住。
+//
 // JOIN 到 identity 走主键,负担可忽略。
 func (d *DB) DueRefreshes(limit int) ([]*DueRefresh, error) {
 	if limit <= 0 {
@@ -267,15 +269,49 @@ func (d *DB) QueryUIDsByEmail(email string) ([]string, error) {
 
 // QueryUIDsByPhone 按手机号查 dmwork user 表的 uid 列表(同 QueryUIDsByEmail)。
 // 同样过滤 is_destroy=0 AND status<>0 —— 见 QueryUIDsByEmail godoc。
+//
+// 过渡期必须**合并**盲索引与明文两路结果再去重，不能"盲索引命中就提前返回"：
+// 手机号加密第一阶的存量回填是渐进的，(zone, phone) 又不是强唯一约束（历史脏数据可能
+// 有重复行，见 bind_service.go 的注释）。若一个重复账号已回填、另一个未回填，
+// 提前返回会只给出一个 uid —— 调用方 (BindLocator) 靠 len(uids) 判唯一性，
+// 于是"多账号冲突"被误判成"唯一账号"，SMS 绑定会把 OIDC 身份挂到其中一个账号上。
+// 回填收敛后（remaining 归零）可以去掉明文那一路。
 func (d *DB) QueryUIDsByPhone(zone, phone string) ([]string, error) {
 	if phone == "" {
 		return nil, nil
 	}
-	var uids []string
+	seen := make(map[string]struct{})
+	uids := make([]string, 0, 2)
+	appendUnique := func(found []string) {
+		for _, uid := range found {
+			if _, dup := seen[uid]; dup {
+				continue
+			}
+			seen[uid] = struct{}{}
+			uids = append(uids, uid)
+		}
+	}
+
+	if hash, err := user.PhoneBlindHash(zone, phone); err == nil {
+		var byHash []string
+		if _, err := d.session.Select("uid").From("user").
+			Where("phone_hash=? AND is_destroy=0 AND status<>0", hash).
+			Load(&byHash); err != nil {
+			return nil, fmt.Errorf("oidc: query users by phone hash: %w", err)
+		}
+		appendUnique(byHash)
+	}
+
+	var byPlaintext []string
 	if _, err := d.session.Select("uid").From("user").
 		Where("zone=? AND phone=? AND phone<>'' AND is_destroy=0 AND status<>0", zone, phone).
-		Load(&uids); err != nil {
+		Load(&byPlaintext); err != nil {
 		return nil, fmt.Errorf("oidc: query users by phone: %w", err)
+	}
+	appendUnique(byPlaintext)
+
+	if len(uids) == 0 {
+		return nil, nil
 	}
 	return uids, nil
 }

@@ -122,8 +122,8 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "password")
 		return
 	}
-	if len(strings.TrimSpace(req.Password)) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 
@@ -256,6 +256,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "")
 		return
 	}
+	publicIP := util.GetClientPublicIP(c.Request)
 	// 仅密码登录走 guard；验证码登录有独立的发送频控 + 验证次数限制，不纳入 guard 计数。
 	if req.Password != "" {
 		if err := u.loginGuard.Check(req.Email); err != nil {
@@ -282,6 +283,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		// 密码登录路径统一返回通用错误消息避免枚举；验证码登录路径不涉及密码，保留原提示。
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
+			u.loginLog.recordFailure(req.Email, publicIP, "email")
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -304,6 +306,9 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	if userInfo == nil || userInfo.UID != fencedUID {
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
+		}
+		u.loginLog.recordFailure(req.Email, publicIP, "email")
+		if req.Password != "" {
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -314,6 +319,9 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		// 密码路径同样泄露账号状态，统一为通用错误 + 计入失败计数
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
+		}
+		u.loginLog.recordFailure(req.Email, publicIP, "email")
+		if req.Password != "" {
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -325,6 +333,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	if req.Code != "" {
 		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(loginSpanCtx, req.Email, req.Code, commonapi.CodeTypeEmailLogin); err != nil {
+			u.loginLog.recordFailure(req.Email, publicIP, "email")
 			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
@@ -332,6 +341,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 		if !matched {
 			u.loginGuard.RecordFailureLogged(req.Email)
+			u.loginLog.recordFailure(req.Email, publicIP, "email")
 			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
@@ -349,8 +359,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		return
 	}
 	c.Response(result)
-	publicIP := util.GetClientPublicIP(c.Request)
-	go u.sentWelcomeMsg(publicIP, userInfo.UID)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Email, publicIP, "email")
 }
 
 // emailForgetPwd 邮箱忘记密码（重置密码）
@@ -378,8 +387,8 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "new_password")
 		return
 	}
-	if len(strings.TrimSpace(req.Password)) < 6 {
-		respondUserError(c, errcode.ErrUserPasswordTooShort)
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
 		return
 	}
 

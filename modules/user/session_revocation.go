@@ -88,13 +88,8 @@ func (d *DB) updateUserFieldWithSessionRevocation(ctx context.Context, uid, fiel
 
 func (d *DB) destroyAccountWithSessionRevocation(ctx context.Context, uid, username, phone string, expectedState int) (*sessionRevocationIntent, error) {
 	return d.mutateWithSessionRevocation(ctx, uid, "account_destroy", func(ctx context.Context, tx *dbr.Tx) error {
-		result, err := tx.Update("user").SetMap(map[string]interface{}{
-			"phone":             phone,
-			"username":          username,
-			"is_destroy":        IsDestroyDone,
-			"destroy_apply_at":  nil,
-			"destroy_expire_at": nil,
-		}).Where("uid=? AND is_destroy=?", uid, expectedState).ExecContext(ctx)
+		result, err := tx.Update("user").SetMap(destroyedAccountFields(username, phone)).
+			Where("uid=? AND is_destroy=?", uid, expectedState).ExecContext(ctx)
 		if err != nil {
 			return fmt.Errorf("destroy account with session revocation: %w", err)
 		}

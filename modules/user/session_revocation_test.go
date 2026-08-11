@@ -112,6 +112,56 @@ func TestAccountDisableAndRevocationIntentCommitTogether(t *testing.T) {
 	require.Equal(t, 1, pending)
 }
 
+func TestDestroyAccountWithSessionRevocationClearsPhoneShadow(t *testing.T) {
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+
+	tests := []struct {
+		name          string
+		expectedState int
+		phone         string
+	}{
+		{name: "immediate destroy", expectedState: IsDestroyNo, phone: "13900004101"},
+		{name: "cooling-off finalize", expectedState: IsDestroyApplying, phone: "13900004102"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid := util.GenerUUID()
+			require.NoError(t, db.Insert(&Model{
+				UID:       uid,
+				Username:  "0086" + tt.phone,
+				Name:      tt.name,
+				ShortNo:   uid,
+				Zone:      "0086",
+				Phone:     tt.phone,
+				Status:    1,
+				IsDestroy: tt.expectedState,
+			}))
+
+			before, err := db.QueryByUID(uid)
+			require.NoError(t, err)
+			require.NotEmpty(t, before.PhoneEncrypted)
+			require.NotEmpty(t, before.PhoneHash)
+			require.NotEmpty(t, before.PhoneLast4)
+
+			intent, err := db.destroyAccountWithSessionRevocation(
+				context.Background(), uid, "anon-"+uid, tt.phone+"@1700000000000@delete", tt.expectedState,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, intent)
+
+			destroyed, err := db.QueryByUID(uid)
+			require.NoError(t, err)
+			require.Equal(t, IsDestroyDone, destroyed.IsDestroy)
+			require.Empty(t, destroyed.PhoneEncrypted)
+			require.Empty(t, destroyed.PhoneHash)
+			require.Empty(t, destroyed.PhoneLast4)
+		})
+	}
+}
+
 func TestNewSessionRevocationIntentReservesSynchronousClaimWindow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	db := NewDB(ctx)
@@ -459,9 +509,10 @@ func TestWeb3PasswordResetRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) 
 	uid := "w3-" + util.GenerUUID()
 	username := "web3_" + uid[len(uid)-12:]
 	const (
-		verifyText = "hello123"
-		publicKey  = "03af80b90d25145da28c583359beb47b21796b2fe1a23c1511e443e7a64dfdb27d"
-		signature  = "44459fd9146290dcd913350bae6fe79fd48050d39b3c1c315e8f032af3b555d41af6f2c07d4d0f1d8d5dd041af8175e657ae981cf47e58aa5547ab08fc7066e401"
+		verifyText  = "hello123"
+		publicKey   = "03af80b90d25145da28c583359beb47b21796b2fe1a23c1511e443e7a64dfdb27d"
+		signature   = "44459fd9146290dcd913350bae6fe79fd48050d39b3c1c315e8f032af3b555d41af6f2c07d4d0f1d8d5dd041af8175e657ae981cf47e58aa5547ab08fc7066e401"
+		newPassword = "After123!"
 	)
 	require.NoError(t, userAPI.db.Insert(&Model{
 		UID: uid, Username: username, Name: "web3 user", ShortNo: username,
@@ -501,7 +552,7 @@ func TestWeb3PasswordResetRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) 
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/user/pwdforget_web3", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-		"username": username, "password": "after", "verify_text": verifyText, "sign_text": signature,
+		"username": username, "password": newPassword, "verify_text": verifyText, "sign_text": signature,
 	}))))
 	request.Header.Set("Content-Type", "application/json")
 	server.GetRoute().ServeHTTP(recorder, request)
@@ -509,7 +560,7 @@ func TestWeb3PasswordResetRevokesKnownBearersAndQuitsAllIMDevices(t *testing.T) 
 
 	updated, err := userAPI.db.QueryByUID(uid)
 	require.NoError(t, err)
-	matched, _ := CheckPassword("after", updated.Password)
+	matched, _ := CheckPassword(newPassword, updated.Password)
 	require.True(t, matched)
 	for _, token := range tokens {
 		record, err := auth.SessionStoreForContext(ctx).ReadToken(context.Background(), ctx.GetConfig().Cache.TokenCachePrefix+token)

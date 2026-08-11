@@ -326,7 +326,23 @@ var (
 	ErrUserPasswordTooShort = register(codes.Code{
 		ID:             "err.server.user.password_too_short",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "Password must be at least 6 characters.",
+		DefaultMessage: "Password must be at least 8 characters.",
+	})
+	// ErrUserPasswordTooWeak fires when a password meets the minimum length
+	// but doesn't mix at least 2 of {uppercase, lowercase, digit, special}.
+	// See modules/user/password.go ValidatePasswordStrength.
+	ErrUserPasswordTooWeak = register(codes.Code{
+		ID:             "err.server.user.password_too_weak",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Password must contain at least 2 of: uppercase letters, lowercase letters, digits, special characters.",
+	})
+	// ErrUserPasswordTooLong guards bcrypt's hard 72-byte input limit. Without
+	// it an over-long password surfaces as a generic "password processing
+	// failed" internal error instead of an actionable input error.
+	ErrUserPasswordTooLong = register(codes.Code{
+		ID:             "err.server.user.password_too_long",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Password must not exceed 72 bytes.",
 	})
 	ErrUserPasswordMismatch = register(codes.Code{
 		ID:             "err.server.user.password_mismatch",

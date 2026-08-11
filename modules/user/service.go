@@ -909,6 +909,12 @@ func (s *Service) AddUser(user *AddUserReq) error {
 		Robot:     user.Robot,
 	}
 	if user.Password != "" {
+		// 兜底校验，同 createUserWithRespAndTx：AddUser 是跨模块的建号入口
+		// （notify / app_bot / botfather），当前调用方都不传密码，这里挡住将来
+		// 新增调用方绕过复杂度策略的可能。
+		if err := ValidatePasswordStrength(user.Password); err != nil {
+			return err
+		}
 		hashedPwd, hashErr := HashPassword(user.Password)
 		if hashErr != nil {
 			return hashErr
@@ -1228,6 +1234,9 @@ func (s *Service) UpdateLoginPassword(req UpdateLoginPasswordReq) error {
 	matched, _ := CheckPassword(req.Password, userM.Password)
 	if !matched {
 		return errors.New("原密码不正确！")
+	}
+	if err := ValidatePasswordStrength(req.NewPassword); err != nil {
+		return err
 	}
 
 	newHash, hashErr := HashPassword(req.NewPassword)

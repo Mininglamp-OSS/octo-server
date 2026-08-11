@@ -50,11 +50,21 @@ func memberSearchWhere(keyword string) (string, []interface{}) {
 // memberSearchActiveColumns 空间侧 members/search 端点的检索列。与管理端
 // memberSearchColumns 的区别：
 //   - email 明文匹配、明文返回（工作邮箱，无需掩码）；
-//   - phone 仅匹配后 4 位（RIGHT(u.phone,4)），使「可检索粒度 == 可见粒度」
+//   - phone 仅匹配后 4 位，使「可检索粒度 == 可见粒度」
 //     （响应仅显示 138****5678），admin 无法通过子串查询逐位探测/重建完整号码。
 //
+// 后 4 位的取值优先用 user.phone_last4（手机号加密第一阶新增的低敏列，
+// 见 modules/user/phone_crypto.go），未回填的存量行回退到 RIGHT(u.phone,4)。
+// 这个过渡表达式让检索随回填进度逐行切换，不必等回填全部跑完才敢改；回填收敛后
+// （GET /v1/manager/user/phone_shadow_backfill 的 remaining 归零）应简化成直接用
+// u.phone_last4，届时 RIGHT(u.phone,4) 这个明文读取方即可彻底移除。
+//
 // 前端注意：phone 检索只匹配后 4 位，传完整号码不会命中——按手机号查找请用后 4 位。
-var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
+var memberSearchActiveColumns = []string{
+	"u.name", "u.username", "u.email",
+	"COALESCE(NULLIF(u.phone_last4,''), RIGHT(u.phone,4))",
+	"sm.uid",
+}
 
 // memberSearchActiveWhere 为空间侧 members/search 组装跨列 OR LIKE 条件。
 // list / count 共用同一条件，避免搜索范围漂移导致分页错位。

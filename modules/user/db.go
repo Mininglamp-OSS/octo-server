@@ -24,13 +24,23 @@ const (
 type DB struct {
 	session *dbr.Session
 	ctx     *config.Context
+	// phoneEnc 手机号加密器。nil 表示主密钥未配置；此时非空手机号写入降级成
+	// 只写明文、影子列留空，交由后续回填补齐（见 phone_crypto.go）。
+	// 放在 DB 而不是 handler 上，是为了让 Insert/InsertTx 成为唯一的同步点：
+	// user 表全仓库只有这两个插入口，任何新增建号路径都会自动带上影子列，
+	// 不依赖调用方记得调用（此前手工在 handler 里调，漏掉 update 路径导致过 P0）。
+	phoneEnc *phoneEncryptor
 }
 
 // NewDB NewDB
 func NewDB(ctx *config.Context) *DB {
+	// 主密钥缺失不阻断构造：phoneEnc 保持 nil，后续的非空手机号写入
+	// 由 syncPhoneShadow 降级处理。运维可见性由 New(ctx) 处的单条错误日志提供。
+	enc, _ := newPhoneEncryptor()
 	return &DB{
-		session: ctx.DB(),
-		ctx:     ctx,
+		session:  ctx.DB(),
+		ctx:      ctx,
+		phoneEnc: enc,
 	}
 }
 
@@ -78,11 +88,36 @@ func (d *DB) QueryByEmail(email string) (*Model, error) {
 	return model, err
 }
 
-// QueryByPhone 通过手机号和区号查询用户信息
+// QueryByPhone 通过手机号和区号查询用户信息。优先走盲索引(phone_hash)等值检索,
+// 不需要解密；主密钥未配置或未命中(存量行尚未回填)时退回明文比较兜底，保证第一阶
+// 加密上线过程中查询行为不回归。盲索引路径必须排除已完成注销的行：若曾回滚到不认识
+// 影子列的旧版本，旧版本注销账号时会留下 phone_hash，roll-forward 后不能让该墓碑继续
+// 占用已释放号码。冷静期中的账号(is_destroy=1)仍保留占用。混合回填期两条路径可能
+// 同时命中不同的存量重复账号，必须分别取最小主键后再比较，不能在盲索引首次
+// 命中时提前返回。见 phone_crypto.go。
 func (d *DB) QueryByPhone(zone string, phone string) (*Model, error) {
-	var model *Model
-	_, err := d.session.Select("*").From("user").Where("zone=? and phone=?", zone, phone).Load(&model)
-	return model, err
+	var hashModel *Model
+	if hash, err := PhoneBlindHash(zone, phone); err == nil {
+		if _, err := d.session.Select("*").From("user").
+			Where("phone_hash=? AND is_destroy<>?", hash, IsDestroyDone).
+			OrderAsc("id").Limit(1).Load(&hashModel); err != nil {
+			return nil, err
+		}
+	}
+	var plaintextModel *Model
+	_, err := d.session.Select("*").From("user").
+		Where("zone=? and phone=? AND is_destroy<>?", zone, phone, IsDestroyDone).
+		OrderAsc("id").Limit(1).Load(&plaintextModel)
+	if err != nil {
+		return nil, err
+	}
+	if hashModel == nil {
+		return plaintextModel, nil
+	}
+	if plaintextModel == nil || hashModel.Id <= plaintextModel.Id {
+		return hashModel, nil
+	}
+	return plaintextModel, nil
 }
 
 // 查询多个手机号用户
@@ -94,12 +129,18 @@ func (d *DB) QueryByPhones(phones []string) ([]*Model, error) {
 
 // Insert 添加用户
 func (d *DB) Insert(m *Model) error {
+	if err := d.syncPhoneShadow(m); err != nil {
+		return err
+	}
 	_, err := d.session.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
 
 // Insert 添加用户
 func (d *DB) insertTx(m *Model, tx *dbr.Tx) error {
+	if err := d.syncPhoneShadow(m); err != nil {
+		return err
+	}
 	_, err := tx.InsertInto("user").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
 }
@@ -311,13 +352,8 @@ func (d *DB) updatePassword(password string, uid string) error {
 //
 // 守卫的核心目的：避免「finalize 选中过期记录 → 用户在窗口内 cancel → finalize 仍把 is_destroy 覆写为 2」吞掉撤销。
 func (d *DB) destroyAccountFromState(uid, username, phone string, expectedState int) error {
-	res, err := d.session.Update("user").SetMap(map[string]interface{}{
-		"phone":             phone,
-		"username":          username,
-		"is_destroy":        2,
-		"destroy_apply_at":  nil,
-		"destroy_expire_at": nil,
-	}).Where("uid=? AND is_destroy=?", uid, expectedState).Exec()
+	res, err := d.session.Update("user").SetMap(destroyedAccountFields(username, phone)).
+		Where("uid=? AND is_destroy=?", uid, expectedState).Exec()
 	if err != nil {
 		return fmt.Errorf("destroy account: %w", err)
 	}
@@ -329,6 +365,22 @@ func (d *DB) destroyAccountFromState(uid, username, phone string, expectedState 
 		return ErrDestroyStateConflict
 	}
 	return nil
+}
+
+// destroyedAccountFields is the single phone-anonymisation field set used by
+// both legacy and session-revocation destroy paths. Any future phone rewrite
+// must keep the plaintext tombstone and all three shadow columns in sync.
+func destroyedAccountFields(username, phone string) map[string]interface{} {
+	return map[string]interface{}{
+		"phone":             phone,
+		"username":          username,
+		"phone_encrypted":   nil,
+		"phone_hash":        "",
+		"phone_last4":       "",
+		"is_destroy":        IsDestroyDone,
+		"destroy_apply_at":  nil,
+		"destroy_expire_at": nil,
+	}
 }
 
 // 即时注销（legacy）：要求当前 is_destroy=0。
@@ -529,6 +581,9 @@ type Model struct {
 	Web3PublicKey     string       // web3公钥
 	MsgExpireSecond   int64        // 消息过期时长
 	Language          string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
+	PhoneEncrypted    []byte       // 手机号密文(AES-256-GCM)，phone 的加密影子列，第一阶双写，phone 明文列暂留
+	PhoneHash         string       // 手机号盲索引 HMAC-SHA256(长度前缀 zone + phone) 十六进制，用于精确检索
+	PhoneLast4        string       // 手机号后4位明文(低敏)，供模糊检索
 	db.BaseModel
 }
 
