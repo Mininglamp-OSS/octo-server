@@ -1066,6 +1066,8 @@ type UpdateGroupAvatarCustomServiceReq struct {
 	// 非 nil 为色板下标。为 false 时不动颜色。
 	SetAvatarColor bool
 	AvatarColor    *int
+	// ClearUploadedAvatar：同一次保存确认使用生成头像，清除上传图片头像优先级。
+	ClearUploadedAvatar bool
 }
 
 // ---------- Service method implementations ----------
@@ -1993,8 +1995,11 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	if req.GroupNo == "" {
 		return errors.New("group_no is required")
 	}
-	if req.AvatarText == nil && !req.SetAvatarColor {
+	if req.AvatarText == nil && !req.SetAvatarColor && !req.ClearUploadedAvatar {
 		return errors.New("nothing to update")
+	}
+	if req.ClearUploadedAvatar && req.AvatarText == nil && !req.SetAvatarColor {
+		return errors.New("clear_uploaded_avatar requires avatar_text or avatar_color")
 	}
 
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
@@ -2016,7 +2021,7 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	// updateAvatarCustom 的 WHERE 带 status<>disband：若读到未解散之后、写入之前群被并发
 	// 解散，则命中 0 行——据此返回 not-found/disbanded，不把 version/通知误发到死行（关闭
 	// 上面 read-check 与本次 write 之间的 TOCTOU）。
-	affected, err := s.db.updateAvatarCustom(req.GroupNo, req.AvatarText, req.SetAvatarColor, req.AvatarColor, version)
+	affected, err := s.db.updateAvatarCustom(req.GroupNo, req.AvatarText, req.SetAvatarColor, req.AvatarColor, req.ClearUploadedAvatar, version)
 	if err != nil {
 		s.Error("update group avatar custom failed", zap.Error(err))
 		return errors.New("failed to update group avatar")

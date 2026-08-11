@@ -1179,12 +1179,13 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	noticeValue, hasNotice := groupMap[common.GroupAttrKeyNotice]
 	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
 	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
+	clearUploadedAvatarValue, hasClearUploadedAvatar := groupMap[attrKeyClearUploadedAvatar]
 
 	// 权限分档：
-	//   高级字段（notice/invite/avatar_text/avatar_color）——仍需管理员/群主。
+	//   高级字段（notice/invite/avatar_text/avatar_color/clear_uploaded_avatar）——仍需管理员/群主。
 	//   仅改名（只含 name、不含任何高级字段）——任何活跃人类成员即可，龙虾除外。
 	//   其它（既无 name 也无高级字段）——保守走管理员校验兜底。
-	hasAdvanced := hasNotice || hasInvite || hasAvatarText || hasAvatarColor
+	hasAdvanced := hasNotice || hasInvite || hasAvatarText || hasAvatarColor || hasClearUploadedAvatar
 	if hasAdvanced || !hasName {
 		isManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 		if err != nil {
@@ -1229,11 +1230,23 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	// 「返回 400 却已部分写入群名」的非原子部分写入。avatar_text 空串清除自定义文字（回退
 	// is_named 规则:老群群名/新群双人图标），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
 	var avatarReq *UpdateGroupAvatarCustomServiceReq
-	if hasAvatarText || hasAvatarColor {
+	if hasAvatarText || hasAvatarColor || hasClearUploadedAvatar {
 		avatarReq = &UpdateGroupAvatarCustomServiceReq{
 			GroupNo:      groupNo,
 			OperatorUID:  loginUID,
 			OperatorName: loginName,
+		}
+		if hasClearUploadedAvatar {
+			raw := strings.TrimSpace(strings.ToLower(clearUploadedAvatarValue))
+			if raw != "1" && raw != "true" {
+				respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
+				return
+			}
+			if !hasAvatarText && !hasAvatarColor {
+				respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
+				return
+			}
+			avatarReq.ClearUploadedAvatar = true
 		}
 		if hasAvatarText {
 			if avatarrender.VisibleRuneCount(avatarTextValue) > 4 {

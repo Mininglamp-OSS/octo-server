@@ -91,6 +91,8 @@ func TestGroupUpdateAvatarCustomValidation(t *testing.T) {
 		{"text over 4 visible runes", map[string]string{attrKeyAvatarText: "一二三四五"}},
 		{"color out of range", map[string]string{attrKeyAvatarColor: "99"}},
 		{"color non-numeric", map[string]string{attrKeyAvatarColor: "abc"}},
+		{"clear uploaded invalid", map[string]string{attrKeyAvatarText: "研发", attrKeyClearUploadedAvatar: "yes"}},
+		{"clear uploaded alone", map[string]string{attrKeyClearUploadedAvatar: "1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,6 +107,67 @@ func TestGroupUpdateAvatarCustomValidation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "", got.AvatarText)
 	require.Nil(t, got.AvatarColor)
+}
+
+// TestGroupUpdateAvatarCustomClearsUploadedAvatar 覆盖从上传图片头像切回服务端生成
+// 文字/颜色头像的原子切换语义：同一次 PUT 写 avatar_text/avatar_color 并清除上传图优先级。
+func TestGroupUpdateAvatarCustomClearsUploadedAvatar(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	g := New(ctx)
+
+	const groupNo = "avatar_upd_clear_upload_1"
+	oldColor := 2
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "上传头像群", Creator: testutil.UID, Status: 1,
+		Version: 100, IsUploadAvatar: 1, AvatarText: "旧字", AvatarColor: &oldColor,
+	}))
+	require.NoError(t, g.db.InsertMember(&MemberModel{
+		GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCreator, Status: 1,
+	}))
+
+	w := putGroupUpdate(t, s.GetRoute(), groupNo, map[string]string{
+		attrKeyAvatarText:          "研发",
+		attrKeyAvatarColor:         "5",
+		attrKeyClearUploadedAvatar: "1",
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got, err := g.db.QueryWithGroupNo(groupNo)
+	require.NoError(t, err)
+	require.Equal(t, "研发", got.AvatarText)
+	require.NotNil(t, got.AvatarColor)
+	require.Equal(t, 5, *got.AvatarColor)
+	require.Equal(t, 0, got.IsUploadAvatar, "clear_uploaded_avatar=1 应清除上传图优先级")
+	require.NotEqual(t, int64(100), got.Version, "切换头像来源应 bump version")
+
+	// 只改文字 + clear：颜色保持；clear_uploaded_avatar 也接受 true。
+	require.NoError(t, g.db.updateAvatar("uploaded/path-1.png", 1, groupNo))
+	w = putGroupUpdate(t, s.GetRoute(), groupNo, map[string]string{
+		attrKeyAvatarText:          "产品",
+		attrKeyClearUploadedAvatar: "true",
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	got, err = g.db.QueryWithGroupNo(groupNo)
+	require.NoError(t, err)
+	require.Equal(t, "产品", got.AvatarText)
+	require.NotNil(t, got.AvatarColor)
+	require.Equal(t, 5, *got.AvatarColor, "只改文字 + clear 时颜色保持")
+	require.Equal(t, 0, got.IsUploadAvatar)
+
+	// 只改颜色 + clear：文字保持。
+	require.NoError(t, g.db.updateAvatar("uploaded/path-2.png", 2, groupNo))
+	w = putGroupUpdate(t, s.GetRoute(), groupNo, map[string]string{
+		attrKeyAvatarColor:         "7",
+		attrKeyClearUploadedAvatar: "1",
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	got, err = g.db.QueryWithGroupNo(groupNo)
+	require.NoError(t, err)
+	require.Equal(t, "产品", got.AvatarText, "只改颜色 + clear 时文字保持")
+	require.NotNil(t, got.AvatarColor)
+	require.Equal(t, 7, *got.AvatarColor)
+	require.Equal(t, 0, got.IsUploadAvatar)
 }
 
 // TestGroupUpdatePartialWriteRejected 回归:混合 payload(合法 name + 非法 avatar)
@@ -188,7 +251,7 @@ func TestGroupUpdateAvatarCustomSkipsDisbanded(t *testing.T) {
 	}))
 
 	text := "研发"
-	affected, err := g.db.updateAvatarCustom(groupNo, &text, true, intPtr(3), 200)
+	affected, err := g.db.updateAvatarCustom(groupNo, &text, true, intPtr(3), false, 200)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), affected, "已解散群必须命中 0 行")
 
@@ -206,7 +269,7 @@ func TestGroupUpdateAvatarCustomSkipsDisbanded(t *testing.T) {
 		GroupNo: liveNo, Name: "正常群", Creator: "c1",
 		Status: GroupStatusNormal, Version: 100,
 	}))
-	affected, err = g.db.updateAvatarCustom(liveNo, &text, true, intPtr(3), 200)
+	affected, err = g.db.updateAvatarCustom(liveNo, &text, true, intPtr(3), false, 200)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), affected, "未解散群应命中 1 行")
 	got, err = g.db.QueryWithGroupNo(liveNo)
