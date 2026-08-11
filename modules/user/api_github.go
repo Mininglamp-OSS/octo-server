@@ -99,7 +99,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 			return
 		}
 		// 发送登录消息
-		publicIP := util.GetClientPublicIP(c.Request)
+		publicIP := wkhttp.ClientIP(c.Request)
 		u.finishSuccessfulLogin(userInfoM.UID, userInfoM.Username, publicIP, "github")
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
@@ -170,7 +170,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 			return
 		}
 		// 发送登录消息
-		publicIP := util.GetClientPublicIP(c.Request)
+		publicIP := wkhttp.ClientIP(c.Request)
 		loginResp, err = u.createUserWithRespAndTx(loginSpanCtx, model, publicIP, nil, tx, func() error {
 			err := tx.Commit()
 			if err != nil {

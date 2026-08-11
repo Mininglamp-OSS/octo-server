@@ -16,7 +16,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/cache"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -380,7 +379,7 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 		Provider:       o.cfg.Provider.ID,
 		CodeVerifier:   verifier,
 		Nonce:          nonce,
-		IP:             util.GetClientPublicIP(c.Request),
+		IP:             wkhttp.ClientIP(c.Request),
 		UserAgent:      c.Request.UserAgent(),
 		ReturnTo:       cleanReturnTo,
 		ClientAuthcode: authcode,
@@ -410,7 +409,7 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 // 与 api_github.go:161 保持一致,前端无需新代码。
 func (o *OIDC) callback(c *wkhttp.Context) {
 	traceID := newTraceID()
-	clientIP := util.GetClientPublicIP(c.Request)
+	clientIP := wkhttp.ClientIP(c.Request)
 	start := time.Now()
 
 	// result 在每个分支显式置位,defer 集中上报 callback 计数 + duration。
@@ -950,7 +949,7 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 		metricLogoutTotal.WithLabelValues("ok").Inc()
 	}
 	o.writeAudit(uid, EventLogout, &StateData{
-		IP:        util.GetClientPublicIP(c.Request),
+		IP:        wkhttp.ClientIP(c.Request),
 		UserAgent: c.Request.UserAgent(),
 	}, "")
 
