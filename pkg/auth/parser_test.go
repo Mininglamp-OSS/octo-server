@@ -348,6 +348,7 @@ func TestTokenValidatorV3LifetimeAndRedisTTL(t *testing.T) {
 		IssuedAt:          now.Add(-time.Hour).Unix(),
 		ExpiresAt:         now.Add(time.Hour).Unix(),
 		SessionGeneration: "g1",
+		SessionRevision:   1,
 	})
 	if err != nil {
 		t.Fatalf("EncodeV3: %v", err)
@@ -357,6 +358,7 @@ func TestTokenValidatorV3LifetimeAndRedisTTL(t *testing.T) {
 		IssuedAt:          now.Add(-2 * time.Hour).Unix(),
 		ExpiresAt:         now.Unix(),
 		SessionGeneration: "g1",
+		SessionRevision:   1,
 	})
 	if err != nil {
 		t.Fatalf("EncodeV3 expired: %v", err)
@@ -420,6 +422,7 @@ func TestCacheTokenParserUsesTokenValidator(t *testing.T) {
 		IssuedAt:          now.Add(-2 * time.Hour).Unix(),
 		ExpiresAt:         now.Unix(),
 		SessionGeneration: "g1",
+		SessionRevision:   1,
 	})
 	if err != nil {
 		t.Fatalf("EncodeV3: %v", err)

@@ -74,6 +74,9 @@ func unsetSessionRuntimeEnv(t *testing.T) {
 	for _, key := range []string{
 		"OCTO_AUTH_SESSION_REDIS_POOL_SIZE",
 		"OCTO_AUTH_SESSION_REDIS_POOL_TIMEOUT",
+		sessionModeEnv,
+		sessionMaxPerUIDEnv,
+		sessionRequiredFloorEnv,
 	} {
 		old, existed := os.LookupEnv(key)
 		require.NoError(t, os.Unsetenv(key))

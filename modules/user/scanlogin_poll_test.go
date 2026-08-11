@@ -348,8 +348,8 @@ func TestLoginWithAuthCode_ConsumesBeforeIssuingSession(t *testing.T) {
 
 	assert.Contains(t, fn, "u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))")
 	consume := strings.Index(fn, "u.scanLoginAuthorizations.Consume(authCode, authInfo)")
-	reuseExisting := strings.Index(fn, "u.reuseExistingLoginToken(")
-	issueNew := strings.Index(fn, "u.sessionStore.IssueNew(")
+	reuseExisting := strings.Index(fn, "reuseUserSession(")
+	issueNew := strings.Index(fn, "issueUserSession(")
 	imUpdate := strings.Index(fn, "u.ctx.UpdateIMToken")
 	require.NotEqual(t, -1, consume)
 	require.NotEqual(t, -1, reuseExisting)

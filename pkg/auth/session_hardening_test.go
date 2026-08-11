@@ -209,6 +209,7 @@ func TestTokenValidatorFailsClosedAcrossStoreAndGenerationErrors(t *testing.T) {
 		IssuedAt:          now.Add(-time.Minute).Unix(),
 		ExpiresAt:         now.Add(time.Minute).Unix(),
 		SessionGeneration: "g1",
+		SessionRevision:   1,
 	})
 	require.NoError(t, err)
 	v2, err := Encode(TokenInfo{UID: "u1"})

@@ -560,6 +560,29 @@ func (r *fakeRevoker) RevokeRefreshByUID(uid string) (int64, error) {
 	return r.count, nil
 }
 
+type contextRecordingTokenInvalidator struct {
+	mu          sync.Mutex
+	called      bool
+	contextErr  error
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (i *contextRecordingTokenInvalidator) InvalidateCurrentToken(ctx context.Context, _, _ string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.called = true
+	i.contextErr = ctx.Err()
+	i.deadline, i.hasDeadline = ctx.Deadline()
+	return i.contextErr
+}
+
+func (i *contextRecordingTokenInvalidator) snapshot() (bool, error, time.Time, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.called, i.contextErr, i.deadline, i.hasDeadline
+}
+
 // authorize 成功 → audit EventAuthorize 落库,带 IP/UA。
 // 用于风控数据面追溯 state 数 / 异常 IP 起步等指标。
 func TestAPI_Authorize_AuditsEventAuthorize(t *testing.T) {
@@ -688,6 +711,50 @@ func TestAPI_Logout_InvalidatesCurrentHTTPTokenOnly(t *testing.T) {
 	}
 	if got, _ := c.Get("uidtoken:1" + uid); got != otherToken {
 		t.Fatalf("other uidtoken index = %q, want %q", got, otherToken)
+	}
+}
+
+// A client disconnect must not cancel the security-critical bearer revocation.
+// OIDC logout is intentionally best-effort and still returns 200, so there is
+// no client retry or outbox path that could converge a skipped invalidation.
+func TestAPI_Logout_InvalidatesCurrentHTTPTokenAfterRequestCancellation(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	invalidator := &contextRecordingTokenInvalidator{}
+	o.tokenKill = invalidator
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/v1/auth/oidc/aegis/logout", func(gc *gin.Context) {
+		gc.Set("uid", "u-canceled-logout")
+		o.logout(wrapWk(gc))
+	})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/oidc/aegis/logout", nil).
+		WithContext(canceled)
+	req.Header.Set("token", "tok-canceled-logout")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	called, contextErr, deadline, hasDeadline := invalidator.snapshot()
+	if !called {
+		t.Fatal("current HTTP token invalidator was not called")
+	}
+	if contextErr != nil {
+		t.Fatalf("bearer revocation inherited canceled request context: %v", contextErr)
+	}
+	if !hasDeadline {
+		t.Fatal("bearer revocation context must have a bounded deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > 4*time.Second {
+		t.Fatalf("bearer revocation deadline remaining = %s, want (0, 4s]", remaining)
 	}
 }
 

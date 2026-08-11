@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	mysql "github.com/go-sql-driver/mysql"
@@ -36,6 +37,9 @@ const (
 	// thirdAuthcodeTTL 前端短码轮询拿 LoginRespJSON 的窗口。
 	// 登录响应仅在 callback 成功时落 Redis,容量影响可忽略。
 	thirdAuthcodeTTL = 5 * time.Minute
+	// logoutTokenInvalidationTimeout bounds the security-critical Redis work
+	// independently of the inbound request and the best-effort IM/IdP cleanup.
+	logoutTokenInvalidationTimeout = 3 * time.Second
 	// maxAuditDetail audit 表 reason 列写入的最大长度,防止 IdP 返回的
 	// 任意字段(如 ?error=...)灌爆审计字段或污染下游 dashboard。
 	maxAuditDetail    = 256
@@ -159,12 +163,7 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
-	o.tokenKill = cacheCurrentTokenInvalidator{
-		cache:          ctx.Cache(),
-		tokenPrefix:    ctx.GetConfig().Cache.TokenCachePrefix,
-		uidTokenPrefix: ctx.GetConfig().Cache.UIDTokenCachePrefix,
-		indexDel:       newRedisCompareDeleter(ctx),
-	}
+	o.tokenKill = auth.SessionStoreForContext(ctx)
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
 		callbackGuardThresholdFromEnv(),
@@ -903,18 +902,24 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	kickFailed := false
 	revokeFailed := false
 	tokenFailed := false
-	if o.killer != nil {
-		if err := o.killer.Kick(ctx, uid); err != nil {
-			kickFailed = true
-			o.Error("OIDC logout 踢线失败",
+	if o.tokenKill != nil {
+		// The handler intentionally returns 200 even when cleanup is degraded, so
+		// a client disconnect must not cancel the only HTTP bearer revocation
+		// attempt. Keep its budget independent from IM kick and IdP cleanup.
+		tokenCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutTokenInvalidationTimeout)
+		err := o.tokenKill.InvalidateCurrentToken(tokenCtx, uid, c.GetHeader("token"))
+		cancel()
+		if err != nil {
+			tokenFailed = true
+			o.Error("OIDC logout 作废当前 HTTP token 失败",
 				zap.String("trace_id", traceID),
 				zap.Error(err), zap.String("uid", uid))
 		}
 	}
-	if o.tokenKill != nil {
-		if err := o.tokenKill.InvalidateCurrentToken(ctx, uid, c.GetHeader("token")); err != nil {
-			tokenFailed = true
-			o.Error("OIDC logout 作废当前 HTTP token 失败",
+	if o.killer != nil {
+		if err := o.killer.Kick(ctx, uid); err != nil {
+			kickFailed = true
+			o.Error("OIDC logout 踢线失败",
 				zap.String("trace_id", traceID),
 				zap.Error(err), zap.String("uid", uid))
 		}
@@ -1341,9 +1346,9 @@ func (r redisAuthcode) SetAuthcode(ctx context.Context, authcode, payload string
 	}
 }
 
-// ctxKiller 生产路径下的 sessionKiller 实现 —— 委托给 dmwork-lib 的
-// QuitUserDevice(uid, -1):内部统一删 token Redis + 用新 token 重签 IM,
-// WuKongIM 老连接的 transport 验证失败后自然断开,达成"踢全部设备"。
+// ctxKiller 生产路径下的 sessionKiller 实现 —— 委托给 octo-lib 的
+// QuitUserDevice(uid, -1) 退出 WuKongIM 全部设备。该调用不撤销 octo-server
+// HTTP bearer；OIDC sync invalid_grant 的本地会话 scope 仍是待签字能力。
 type ctxKiller struct{ ctx *config.Context }
 
 func (k ctxKiller) Kick(_ context.Context, uid string) error {

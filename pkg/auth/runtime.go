@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -64,6 +65,10 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	if err != nil {
 		panic(err)
 	}
+	policy, err := sessionPolicyFromEnv()
+	if err != nil {
+		panic(err)
+	}
 	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = options.poolSize
@@ -77,7 +82,15 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		ctx.GetConfig().Cache.TokenCachePrefix,
 		ctx.GetConfig().Cache.UIDTokenCachePrefix,
 		ctx.GetConfig().Cache.TokenExpire,
+		WithSessionMode(policy.mode),
+		WithSessionMaxPerUID(policy.maxPerUID),
 	)
+	validationCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := store.ValidateRolloutControl(validationCtx, policy.requiredFloor); err != nil {
+		_ = client.Close()
+		panic(err)
+	}
 	ctx.SetValue(&sessionRuntime{store: store, client: client}, sessionRuntimeContextKey)
 	return store, client
 }

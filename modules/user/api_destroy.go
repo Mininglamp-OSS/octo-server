@@ -1,8 +1,10 @@
 package user
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -195,20 +197,41 @@ func (u *User) finalizeDestroy(m *Model) error {
 	stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	phone := fmt.Sprintf("%s@%s@delete", m.Phone, stamp)
 	username := anonymizeUsername(m.UID, m.Zone, phone, stamp)
-	switch err := u.db.finalizeDestroyAccount(m.UID, username, phone); err {
-	case nil:
-		// 写入成功
-	case ErrDestroyStateConflict:
-		// 用户在我们选中后、写入前撤销了注销。直接跳过，下一轮扫描不会再选中（is_destroy 已经回到 0）。
-		u.Info("用户已撤销注销，跳过 finalize", zap.String("uid", m.UID))
-		return nil
-	default:
-		return fmt.Errorf("update user destroy: %w", err)
+	// DB 事务错误和提交后的 Redis 撤销错误必须分开：一旦事务提交（is_destroy=2），
+	// checkDestroyExpired 不会再选中本账号，提交后的 side effect 没有第二次机会。
+	// 把两者合成一个 error 会让 Redis 故障吞掉独立的 WuKongIM 全端登出——HTTP 撤销
+	// 有 outbox worker 兜底，IM 登出没有。
+	committed := false
+	var mutationErr, revocationErr error
+	if sessionRevocationActive(u.sessionStore) {
+		intent, err := u.db.destroyAccountWithSessionRevocation(context.Background(), m.UID, username, phone, IsDestroyApplying)
+		if err != nil {
+			mutationErr = err
+		} else {
+			committed = true
+			revocationErr = u.applySessionRevocationIntent(context.Background(), intent)
+		}
+	} else {
+		mutationErr = u.db.finalizeDestroyAccount(m.UID, username, phone)
+		committed = mutationErr == nil
 	}
-	if err := u.ctx.QuitUserDevice(m.UID, -1); err != nil {
-		// 设备踢出失败不阻塞 DB 状态更新——一旦写入 is_destroy=2，下次扫描不会再处理本账号。
-		// 已知遗留风险：device 在 token 过期前仍能短暂访问；需要单独的 device-evict 重试任务（见 PR2）。
-		u.Error("踢出登录设备失败", zap.String("uid", m.UID), zap.Error(err))
+	if !committed {
+		if errors.Is(mutationErr, ErrDestroyStateConflict) {
+			// 用户在我们选中后、写入前撤销了注销。直接跳过，下一轮扫描不会再选中（is_destroy 已经回到 0）。
+			u.Info("用户已撤销注销，跳过 finalize", zap.String("uid", m.UID))
+			return nil
+		}
+		return fmt.Errorf("update user destroy: %w", mutationErr)
+	}
+	// 已提交：撤销残留 bearer 并踢出全部 IM 设备，两者互不阻塞。
+	// 定时任务没有调用方可以重试，且 is_destroy=2 后本账号不会再被扫描到，
+	// 所以这里只记录错误而不上抛——否则批次日志会把「DB 已成功、撤销待收敛」
+	// 误报成 finalize 失败。HTTP 撤销由 revocation worker 收敛；IM 登出失败
+	// 仍是已知遗留风险（device 在 token 过期前仍能短暂访问）。
+	if err := finishCommittedUserSecurityMutation(
+		context.Background(), u.sessionStore, m.UID, true, revocationErr, u.ctx.QuitUserDevice,
+	); err != nil {
+		u.Error("到期注销后清理登录态未完成", zap.String("uid", m.UID), zap.Error(err))
 	}
 	u.Info("已执行到期注销", zap.String("uid", m.UID))
 	return nil

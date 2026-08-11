@@ -120,6 +120,7 @@ type User struct {
 	sessionStore             userSessionStore
 	tokenValidator           *auth.TokenValidator
 	scanLoginAuthorizations  *scanLoginAuthorizationStore
+	revocationWorkerOwner    string
 }
 
 type userSessionStore interface {
@@ -129,6 +130,27 @@ type userSessionStore interface {
 	DeviceToken(ctx context.Context, uid string, deviceFlag int) (string, error)
 	DeleteToken(ctx context.Context, token string) error
 	RevokeIssued(ctx context.Context, token, uid string, deviceFlag int) error
+}
+
+type v3UserSessionStore interface {
+	Mode() auth.SessionMode
+	BeginIssue(ctx context.Context, uid string) (auth.IssueFence, error)
+	IssueNewSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) error
+	ReuseSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) (bool, error)
+	UpdateSessionSnapshot(ctx context.Context, token string, info auth.TokenInfo) (bool, error)
+	RevokeCurrent(ctx context.Context, token, uid string, deviceFlag int) error
+	RevokeAll(ctx context.Context, uid string, event auth.RevocationEvent) error
+}
+
+type userSessionIssueContextKey struct{}
+
+type userSessionIssueContext struct {
+	uid   string
+	fence auth.IssueFence
+}
+
+type currentUserTokenInvalidator interface {
+	InvalidateCurrentToken(ctx context.Context, uid, token string) error
 }
 
 // New New
@@ -167,6 +189,7 @@ func New(ctx *config.Context) *User {
 		sessionStore:             sessionStore,
 		tokenValidator:           auth.NewTokenValidator(sessionStore, ctx.GetConfig().Cache.TokenCachePrefix),
 		scanLoginAuthorizations:  newScanLoginAuthorizationStore(loginRedisClient),
+		revocationWorkerOwner:    util.GenerUUID(),
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
 	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
@@ -392,33 +415,40 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		internal.POST("/verify-token", u.verifyTokenAegisRedirect)
 	}
 
-	u.ctx.AddOnlineStatusListener(u.onlineService.listenOnlineStatus) // 监听在线状态
-	u.ctx.AddOnlineStatusListener(u.handleOnlineStatus)               // 需要放在listenOnlineStatus之后
-	u.ctx.Schedule(time.Minute*5, u.onlineStatusCheck)                // 在线状态定时检查
-	u.ctx.Schedule(time.Minute*5, u.checkDestroyExpired)              // 注销冷静期到期扫描
+	u.ctx.AddOnlineStatusListener(u.onlineService.listenOnlineStatus)  // 监听在线状态
+	u.ctx.AddOnlineStatusListener(u.handleOnlineStatus)                // 需要放在listenOnlineStatus之后
+	u.ctx.Schedule(time.Minute*5, u.onlineStatusCheck)                 // 在线状态定时检查
+	u.ctx.Schedule(time.Minute*5, u.checkDestroyExpired)               // 注销冷静期到期扫描
+	u.ctx.Schedule(10*time.Second, u.processPendingSessionRevocations) // durable HTTP session revocation
 
 }
 
 // app退出登录
 func (u *User) quit(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
+	failed := false
+	if err := invalidateCurrentUserToken(c.Request.Context(), u.sessionStore, loginUID, c.GetHeader("token")); err != nil {
+		u.Error("撤销当前 HTTP token 失败", zap.Error(err))
+		failed = true
+	}
 	err := u.ctx.QuitUserDevice(loginUID, int(config.Web)) // 退出web
 	if err != nil {
 		u.Error("退出web设备失败", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+		failed = true
 	}
 
 	err = u.ctx.QuitUserDevice(loginUID, int(config.PC))
 	if err != nil {
 		u.Error("退出PC设备失败", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+		failed = true
 	}
 
 	err = u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID))
 	if err != nil {
 		u.Error("删除设备token失败！", zap.Error(err))
+		failed = true
+	}
+	if failed {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -1113,22 +1143,18 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 					preservedLang = ""
 				}
 			}
-			payload, encErr := auth.Encode(auth.TokenInfo{
+			snapshot := auth.TokenInfo{
 				UID:      loginUID,
 				Name:     fmt.Sprintf("%v", value),
 				Role:     c.GetLoginRole(),
 				Language: preservedLang,
-			})
-			if encErr != nil {
-				u.Error("编码token缓存失败！", zap.Error(encErr))
-				respondUserError(c, errcode.ErrUserStoreFailed)
-				return
 			}
-			_, err = u.sessionStore.UpdatePayloadKeepDeadline(c.Request.Context(), loginToken, payload)
+			_, err = updateUserSessionSnapshot(c.Request.Context(), u.sessionStore, loginToken, snapshot)
 			if err != nil {
-				u.Error("重新设置token缓存失败！", zap.Error(err))
-				respondUserError(c, errcode.ErrUserStoreFailed)
-				return
+				// The DB update above is already authoritative. A cache snapshot
+				// failure must not turn that committed mutation into a misleading
+				// API failure; the bearer keeps its old non-security display fields.
+				u.Warn("更新token展示快照失败", zap.Error(err))
 			}
 		}
 	}
@@ -1517,6 +1543,22 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 		return
 	}
 	if userInfo != nil {
+		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			u.Error("初始化微信登录会话栅栏失败", zap.Error(err))
+			respondUserServiceError(c)
+			return
+		}
+		userInfo, err = u.reloadUserAfterIssueFence(loginSpanCtx, userInfo.UID)
+		if err != nil {
+			if errors.Is(err, ErrorUserNotExist) {
+				respondUserError(c, errcode.ErrUserNotFound)
+				return
+			}
+			u.Error("会话栅栏后复核微信登录用户失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
 		if userInfo.IsDestroy == IsDestroyDone {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return
@@ -1601,6 +1643,32 @@ func (u *User) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
+	if userInfo != nil {
+		fencedUID := userInfo.UID
+		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			u.Error("初始化登录会话栅栏失败", zap.Error(err))
+			respondUserServiceError(c)
+			return
+		}
+		// BeginIssue must precede the authoritative credential read. If a
+		// password reset commits after the first lookup but before the fence,
+		// validating that stale in-memory hash would issue a session under the
+		// post-reset generation. Re-read the same login identity and require it
+		// to still resolve to the fenced UID; a later reset is stopped by the
+		// final fence CAS in IssueNewSession.
+		userInfo, err = u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+		if err != nil {
+			u.Error("会话栅栏后复核用户信息失败", zap.String("username", req.Username), zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if userInfo == nil || userInfo.UID != fencedUID {
+			u.loginGuard.RecordFailureLogged(req.Username)
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
+			return
+		}
+	}
 	// 已注销 / 被禁用账号统一拒绝；与 emailLogin / usernameLogin 行为对齐
 	if userInfo == nil || userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
@@ -1680,6 +1748,14 @@ func (u *User) respondExecLoginError(c *wkhttp.Context, err error, userInfo *Mod
 }
 
 func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context) (*loginUserDetailResp, error) {
+	issueFence, ok := userSessionIssueFenceFromContext(loginSpanCtx, userInfo.UID)
+	if !ok {
+		var err error
+		issueFence, err = beginUserSessionIssue(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			return nil, fmt.Errorf("begin token issuance: %w", err)
+		}
+	}
 	if userInfo.Status == int(common.UserDisable) {
 		return nil, ErrUserDisabled
 	}
@@ -1745,7 +1821,7 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 	reuseExistingToken := false
 	if flag == config.APP {
 		if oldToken != "" {
-			err = u.sessionStore.DeleteToken(loginSpanCtx, oldToken)
+			err = revokeCurrentUserSession(loginSpanCtx, u.sessionStore, oldToken, userInfo.UID, int(flag))
 			if err != nil {
 				u.Error("清除旧token数据错误", zap.Error(err))
 				tokenSpan.Finish()
@@ -1759,20 +1835,21 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 	}
 
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userInfo.UID,
-		Name:     userInfo.Name,
-		Role:     userInfo.Role,
-		Language: userInfo.Language,
-	})
-	if err != nil {
-		u.Error("编码token缓存失败！", zap.Error(err))
-		tokenSpan.Finish()
-		return nil, errors.New("设置token缓存失败！")
+	deviceID := ""
+	if device != nil {
+		deviceID = device.DeviceID
+	}
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(flag),
+		DeviceID:   deviceID,
 	}
 	if reuseExistingToken {
 		var refreshed bool
-		refreshed, err = u.reuseExistingLoginToken(loginSpanCtx, token, tokenPayload, userInfo.UID, int(flag))
+		refreshed, err = reuseUserSession(loginSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
 		if err != nil {
 			u.Error("刷新旧token缓存失败！", zap.Error(err))
 			tokenSpan.Finish()
@@ -1785,7 +1862,7 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 	}
 	issuedNew := false
 	if !reuseExistingToken {
-		err = u.sessionStore.IssueNew(loginSpanCtx, token, tokenPayload, userInfo.UID, int(flag))
+		err = issueUserSession(loginSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
 		if err != nil {
 			u.Error("设置token缓存失败！", zap.Error(err))
 			tokenSpan.Finish()
@@ -1838,6 +1915,96 @@ func (u *User) reuseExistingLoginToken(ctx context.Context, token, payload, uid 
 	return u.sessionStore.ReuseExisting(ctx, token, payload, uid, deviceFlag)
 }
 
+func beginUserSessionIssue(ctx context.Context, store userSessionStore, uid string) (auth.IssueFence, error) {
+	v3Store, ok := store.(v3UserSessionStore)
+	if !ok || !v3Store.Mode().WritesV3() {
+		return auth.IssueFence{}, nil
+	}
+	return v3Store.BeginIssue(ctx, uid)
+}
+
+func withUserSessionIssueFence(ctx context.Context, store userSessionStore, uid string) (context.Context, error) {
+	fence, err := beginUserSessionIssue(ctx, store, uid)
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, userSessionIssueContextKey{}, userSessionIssueContext{uid: uid, fence: fence}), nil
+}
+
+func userSessionIssueFenceFromContext(ctx context.Context, uid string) (auth.IssueFence, bool) {
+	value, ok := ctx.Value(userSessionIssueContextKey{}).(userSessionIssueContext)
+	if !ok || value.uid != uid {
+		return auth.IssueFence{}, false
+	}
+	return value.fence, true
+}
+
+func (u *User) reloadUserAfterIssueFence(ctx context.Context, uid string) (*Model, error) {
+	user, err := u.db.QueryByUID(uid)
+	if err != nil {
+		return nil, fmt.Errorf("reload fenced user: %w", err)
+	}
+	if user == nil || user.UID != uid {
+		return nil, ErrorUserNotExist
+	}
+	return user, nil
+}
+
+func issueUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) error {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.IssueNewSession(ctx, token, info, fence)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return err
+	}
+	return store.IssueNew(ctx, token, payload, info.UID, info.DeviceFlag)
+}
+
+func reuseUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) (bool, error) {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.ReuseSession(ctx, token, info, fence)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return false, err
+	}
+	return store.ReuseExisting(ctx, token, payload, info.UID, info.DeviceFlag)
+}
+
+func revokeCurrentUserSession(ctx context.Context, store userSessionStore, token, uid string, deviceFlag int) error {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.RevokeCurrent(ctx, token, uid, deviceFlag)
+	}
+	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
+		return invalidator.InvalidateCurrentToken(ctx, uid, token)
+	}
+	if err := store.DeleteToken(ctx, token); err != nil {
+		return err
+	}
+	return nil
+}
+
+func updateUserSessionSnapshot(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo) (bool, error) {
+	if v3Store, ok := store.(v3UserSessionStore); ok {
+		return v3Store.UpdateSessionSnapshot(ctx, token, info)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return false, err
+	}
+	return store.UpdatePayloadKeepDeadline(ctx, token, payload)
+}
+
+func invalidateCurrentUserToken(ctx context.Context, store userSessionStore, uid, token string) error {
+	securityCtx, cancel := postCommitSecurityContext(ctx)
+	defer cancel()
+	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
+		return invalidator.InvalidateCurrentToken(securityCtx, uid, token)
+	}
+	return store.DeleteToken(securityCtx, token)
+}
+
 func (u *User) compensateIssuedToken(token, uid string, deviceFlag int) error {
 	// 请求取消不能跳过 credential 补偿；Redis client 自身另有严格超时，
 	// 这里再给整个清理动作一个总 deadline，避免失败路径无限占用 goroutine。
@@ -1863,6 +2030,22 @@ func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) 
 		}
 	}
 	if err := u.sessionStore.IssueNew(ctx, token, payload, uid, int(config.APP)); err != nil {
+		return fmt.Errorf("issue APP token: %w", err)
+	}
+	return nil
+}
+
+func (u *User) replaceAPPTokenSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) error {
+	oldToken, err := u.sessionStore.DeviceToken(ctx, info.UID, int(config.APP))
+	if err != nil {
+		return fmt.Errorf("load previous APP token: %w", err)
+	}
+	if strings.TrimSpace(oldToken) != "" {
+		if err := revokeCurrentUserSession(ctx, u.sessionStore, oldToken, info.UID, int(config.APP)); err != nil {
+			return fmt.Errorf("revoke previous APP token: %w", err)
+		}
+	}
+	if err := issueUserSession(ctx, u.sessionStore, token, info, fence); err != nil {
 		return fmt.Errorf("issue APP token: %w", err)
 	}
 	return nil
@@ -2410,6 +2593,12 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
 		return
 	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), u.sessionStore, scaner)
+	if err != nil {
+		u.Error("初始化扫码登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
 	consumed, err := u.scanLoginAuthorizations.Consume(authCode, authInfo)
 	if err != nil {
 		u.Error("原子消费扫码授权码失败！", zap.Error(err))
@@ -2446,12 +2635,19 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
-	// 已注销账号拒绝授权登录；冷静期账号允许（与其他登录路径一致）
+	// 已禁用或已注销账号拒绝授权登录；冷静期账号允许（与其他登录路径一致）。
+	// issuance fence 只能阻止安全事件前开始的请求穿越撤销，事件后兑换仍需
+	// 以这里的权威账号状态拒绝，否则 live auth code 会签出新 generation bearer。
 	if userModel == nil || userModel.IsDestroy == IsDestroyDone {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	if userModel.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountBanned)
+		return
+	}
 	// 获取缓存设备
+	sessionDeviceID := ""
 	if uuid != "" {
 		deviceCache, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid))
 		if err != nil {
@@ -2468,6 +2664,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 				return
 			}
 			deviceId, _ := deviceInfoMap["device_id"].(string)
+			sessionDeviceID = deviceId
 			deviceName, _ := deviceInfoMap["device_name"].(string)
 			dmodel, _ := deviceInfoMap["device_model"].(string)
 			if deviceId != "" && deviceName != "" && dmodel != "" {
@@ -2496,18 +2693,16 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	// 在调用 IM 之前确定最终 token 并写入缓存。
 	// 复用旧 token 时用 SET XX(SetIfExists):仅当 token:<oldToken> 仍存在才刷新;
 	// 若已被并发 logout 删除,则回退到新 UUID,避免复活已登出的 token。
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userModel.UID,
-		Name:     userModel.Name,
-		Language: userModel.Language,
-	})
-	if err != nil {
-		u.Error("编码token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+	sessionInfo := auth.TokenInfo{
+		UID:        userModel.UID,
+		Name:       userModel.Name,
+		Role:       userModel.Role,
+		Language:   userModel.Language,
+		DeviceFlag: int(flag),
+		DeviceID:   sessionDeviceID,
 	}
 	if reuseExistingToken {
-		refreshed, err := u.reuseExistingLoginToken(c.Request.Context(), token, tokenPayload, userModel.UID, int(flag))
+		refreshed, err := reuseUserSession(c.Request.Context(), u.sessionStore, token, sessionInfo, issueFence)
 		if err != nil {
 			u.Error("刷新旧token缓存失败！", zap.Error(err))
 			respondUserError(c, errcode.ErrUserStoreFailed)
@@ -2520,7 +2715,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	}
 	issuedNew := false
 	if !reuseExistingToken {
-		err = u.sessionStore.IssueNew(c.Request.Context(), token, tokenPayload, userModel.UID, int(flag))
+		err = issueUserSession(c.Request.Context(), u.sessionStore, token, sessionInfo, issueFence)
 		if err != nil {
 			u.Error("设置token缓存失败！", zap.Error(err))
 			respondUserError(c, errcode.ErrUserStoreFailed)
@@ -3216,6 +3411,30 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
+	issueFence, err := beginUserSessionIssue(spanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化设备验证登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	userInfo, err = u.reloadUserAfterIssueFence(spanCtx, userInfo.UID)
+	if err != nil {
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		u.Error("会话栅栏后复核设备验证用户失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	if userInfo.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountUnavailable)
+		return
+	}
 	err = u.smsServie.Verify(spanCtx, userInfo.Zone, userInfo.Phone, req.Code, commonapi.CodeTypeCheckMobile)
 	if err != nil {
 		u.Error("验证短信失败", zap.Error(err))
@@ -3253,18 +3472,15 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 		return
 	}
 	token := util.GenerUUID()
-	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userInfo.UID,
-		Name:     userInfo.Name,
-		Language: userInfo.Language,
-	})
-	if err != nil {
-		u.Error("编码token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(config.APP),
+		DeviceID:   loginDeivce.DeviceID,
 	}
-	err = u.replaceAPPToken(spanCtx, token, tokenPayload, userInfo.UID)
+	err = u.replaceAPPTokenSession(spanCtx, token, sessionInfo, issueFence)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
@@ -3365,45 +3581,80 @@ func (u *User) destroyAccount(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
+	var retryIntent *sessionRevocationIntent
 	switch userInfo.IsDestroy {
 	case IsDestroyApplying:
 		respondUserError(c, errcode.ErrUserAccountDestroying)
 		return
 	case IsDestroyDone:
-		respondUserError(c, errcode.ErrUserAccountDestroyed)
-		return
-	}
-	//测试模式（仅非 release 生效）
-	if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
-		if !commonapi.MatchTestCode(u.ctx.GetConfig(), code) {
-			respondUserError(c, errcode.ErrUserCodeInvalid)
+		if sessionRevocationActive(u.sessionStore) {
+			retryIntent, err = u.db.pendingSessionRevocation(c.Request.Context(), loginUID, "account_destroy")
+			if err != nil {
+				u.Error("查询待重试的注销会话撤销任务失败", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+		}
+		if retryIntent == nil {
+			respondUserError(c, errcode.ErrUserAccountDestroyed)
 			return
 		}
-	} else {
-		//线上验证短信验证码
-		// 校验验证码
-		err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
-		if err != nil {
-			u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
-			respondUserError(c, errcode.ErrUserCodeInvalid)
-			return
+	}
+	if retryIntent == nil {
+		//测试模式（仅非 release 生效）
+		if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
+			if !commonapi.MatchTestCode(u.ctx.GetConfig(), code) {
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
+		} else {
+			//线上验证短信验证码
+			// 校验验证码
+			err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
+			if err != nil {
+				u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
 		}
 	}
 
-	// 毫秒时间戳：13 位足够保证唯一（UnixNano 19 位会撑爆 varchar(40)）。
-	// username 通过 anonymizeUsername 兜底防溢出（海外长手机号时回退 hash 形式）。
-	stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, stamp)
-	username := anonymizeUsername(loginUID, userInfo.Zone, phone, stamp)
-	err = u.db.destroyAccount(loginUID, username, phone)
-	if err != nil {
-		u.Error("注销账号错误", zap.Error(err))
+	if retryIntent != nil {
+		err = u.applySessionRevocationIntent(c.Request.Context(), retryIntent)
+	} else {
+		// 毫秒时间戳：13 位足够保证唯一（UnixNano 19 位会撑爆 varchar(40)）。
+		// username 通过 anonymizeUsername 兜底防溢出（海外长手机号时回退 hash 形式）。
+		stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, stamp)
+		username := anonymizeUsername(loginUID, userInfo.Zone, phone, stamp)
+		if sessionRevocationActive(u.sessionStore) {
+			intent, mutateErr := u.db.destroyAccountWithSessionRevocation(c.Request.Context(), loginUID, username, phone, IsDestroyNo)
+			if mutateErr != nil {
+				u.Error("注销账号错误", zap.Error(mutateErr))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+			err = u.applySessionRevocationIntent(c.Request.Context(), intent)
+		} else {
+			err = u.db.destroyAccount(loginUID, username, phone)
+			if err != nil {
+				u.Error("注销账号错误", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+		}
+	}
+	revocationErr := err
+	imErr := u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
+	if imErr != nil {
+		u.Error("退出登陆设备失败", zap.Error(imErr))
+	}
+	if revocationErr != nil {
+		u.Error("注销账号后的会话撤销尚未完成", zap.Error(revocationErr))
 		respondUserError(c, errcode.ErrUserDestroyFailed)
 		return
 	}
-	err = u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
-	if err != nil {
-		u.Error("退出登陆设备失败", zap.Error(err))
+	if imErr != nil {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -3673,7 +3924,7 @@ func (u *User) pwdforget(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
-	err = u.db.UpdateUsersWithField("password", hashedPassword, userInfo.UID)
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, hashedPassword, "password_reset")
 	if err != nil {
 		u.Error("修改登录密码错误", zap.Error(err))
 		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
@@ -3909,18 +4160,24 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	}
 	u.ctx.EventCommit(eventID)
 	token := util.GenerUUID()
-	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userModel.UID,
-		Name:     userModel.Name,
-		Role:     userModel.Role,
-		Language: userModel.Language,
-	})
+	issueFence, err := beginUserSessionIssue(registerSpanCtx, u.sessionStore, userModel.UID)
 	if err != nil {
-		u.Error("编码token缓存失败！", zap.Error(err))
+		u.Error("初始化注册登录会话栅栏失败", zap.Error(err))
 		return nil, err
 	}
-	err = u.sessionStore.IssueNew(registerSpanCtx, token, tokenPayload, userModel.UID, createUser.Flag)
+	deviceID := ""
+	if createUser.Device != nil {
+		deviceID = createUser.Device.DeviceID
+	}
+	sessionInfo := auth.TokenInfo{
+		UID:        userModel.UID,
+		Name:       userModel.Name,
+		Role:       userModel.Role,
+		Language:   userModel.Language,
+		DeviceFlag: createUser.Flag,
+		DeviceID:   deviceID,
+	}
+	err = issueUserSession(registerSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		return nil, err

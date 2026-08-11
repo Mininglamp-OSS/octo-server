@@ -26,11 +26,16 @@ type SessionGenerationResolver interface {
 	CurrentGeneration(ctx context.Context, uid string) (string, error)
 }
 
+type LegacySessionPolicy interface {
+	ValidateLegacySession(ctx context.Context, info TokenInfo, record TokenRecord) error
+}
+
 type TokenValidator struct {
 	reader             TokenRecordReader
 	prefix             string
 	now                func() time.Time
 	generationResolver SessionGenerationResolver
+	legacyPolicy       LegacySessionPolicy
 }
 
 func WithSessionGenerationResolver(resolver SessionGenerationResolver) ValidatorOption {
@@ -56,6 +61,12 @@ func NewTokenValidator(reader TokenRecordReader, prefix string, opts ...Validato
 		panic("auth: NewTokenValidator requires non-nil reader")
 	}
 	v := &TokenValidator{reader: reader, prefix: prefix, now: time.Now}
+	if resolver, ok := reader.(SessionGenerationResolver); ok {
+		v.generationResolver = resolver
+	}
+	if policy, ok := reader.(LegacySessionPolicy); ok {
+		v.legacyPolicy = policy
+	}
 	for _, opt := range opts {
 		opt(v)
 	}
@@ -117,6 +128,16 @@ func (v *TokenValidator) Validate(ctx context.Context, token string) (TokenInfo,
 	}
 	if record.TTL == -1 {
 		metrics.ObservePersistentSession()
+	}
+	if v.legacyPolicy != nil {
+		if err := v.legacyPolicy.ValidateLegacySession(ctx, info, record); err != nil {
+			if errors.Is(err, ErrLegacySessionDenied) {
+				metrics.ObserveSessionValidationReject("legacy_policy")
+				return TokenInfo{}, fmt.Errorf("%w: legacy session rejected by rollout policy", wkhttp.ErrTokenInvalid)
+			}
+			metrics.ObserveSessionValidationReject("legacy_policy_store_error")
+			return TokenInfo{}, fmt.Errorf("auth: validate legacy session policy: %w", err)
+		}
 	}
 	return info, nil
 }

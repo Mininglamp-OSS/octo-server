@@ -192,6 +192,16 @@ func runAPI(ctx *config.Context) {
 		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
 	}
 	probeCancel()
+	rolloutCtx, rolloutCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	rolloutControl, err := tokenStore.RolloutControl(rolloutCtx)
+	rolloutCancel()
+	if err != nil {
+		panic(fmt.Errorf("read authentication session rollout floor: %w", err))
+	}
+	rolloutFloor := "none"
+	if rolloutControl != nil {
+		rolloutFloor = string(rolloutControl.ModeFloor)
+	}
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
@@ -278,6 +288,12 @@ func runAPI(ctx *config.Context) {
 	metrics.NewAvatarMetrics(prometheus.DefaultRegisterer)
 	metrics.NewSessionMetrics(prometheus.DefaultRegisterer)
 	metrics.SetSessionEffectiveTTL(ctx.GetConfig().Cache.TokenExpire)
+	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
+	fmt.Printf(
+		"Authentication session runtime: mode=%s rollout_floor=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
+		tokenStore.Mode(), rolloutFloor, ctx.GetConfig().Cache.TokenExpire,
+		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
+	)
 	// 自定义贴纸 handle 上线观测指标(P0: Sticker Handle Enforcement Rollout):上传签发
 	// handle 次数 / 注册结果分布 / 部署姿态 gauge。由 modules/file(签发) 与
 	// modules/sticker(注册) 经包级 Observe 函数灌入;此处注册即可,未注册前为 no-op。

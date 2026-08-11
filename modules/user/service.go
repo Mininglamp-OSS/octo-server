@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
@@ -237,8 +238,9 @@ type oidcBindHandler interface {
 
 // Service Service
 type Service struct {
-	ctx *config.Context
-	db  *DB
+	ctx          *config.Context
+	db           *DB
+	sessionStore userSessionStore
 	log.Log
 	friendDB         *friendDB
 	onlineDB         *onlineDB
@@ -399,6 +401,7 @@ func NewService(ctx *config.Context) IService {
 	return &Service{
 		ctx:              ctx,
 		db:               NewDB(ctx),
+		sessionStore:     auth.SessionStoreForContext(ctx),
 		friendDB:         newFriendDB(ctx),
 		settingDB:        NewSettingDB(ctx.DB()),
 		onetimePrekeysDB: newOnetimePrekeysDB(ctx),
@@ -1231,7 +1234,7 @@ func (s *Service) UpdateLoginPassword(req UpdateLoginPasswordReq) error {
 	if hashErr != nil {
 		return hashErr
 	}
-	err = s.db.updatePassword(newHash, req.UID)
+	err = updatePasswordAndRevokeSessions(context.Background(), s.db, s.sessionStore, s.ctx.QuitUserDevice, req.UID, newHash, "password_change")
 	if err != nil {
 		return errors.New("更新密码失败！")
 	}
