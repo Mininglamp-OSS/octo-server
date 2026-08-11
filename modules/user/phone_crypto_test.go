@@ -1,7 +1,6 @@
 package user
 
 import (
-	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -149,15 +148,23 @@ func TestPhoneCryptoInputIsUnambiguous(t *testing.T) {
 	}
 }
 
-// TestSyncPhoneShadow_FailsClosedAndPopulates 覆盖 DB 层影子列同步的契约。
+// TestSyncPhoneShadow_DegradesAndPopulates 覆盖 DB 层影子列同步的契约。
 // 同步点在 DB.Insert/insertTx 里，所以任何建号路径都会自动带上影子列。
-func TestSyncPhoneShadow_FailsClosedAndPopulates(t *testing.T) {
-	// 主密钥缺失 + 有手机号：fail-closed，不得降级成"只写明文"
+func TestSyncPhoneShadow_DegradesAndPopulates(t *testing.T) {
+	// 主密钥缺失 + 有手机号：降级为只写明文，影子列留空且不报错。
+	// 留空这一点是契约的一半 —— 影子列必须与「存量未回填行」同形，回填的 pending
+	// 谓词（phone<>'' AND phone_hash 非当前版本）才能把这批行一起收进去。
 	d := &DB{}
 	m := &Model{Zone: "0086", Phone: "13800001234"}
-	err := d.syncPhoneShadow(m)
-	if !errors.Is(err, ErrPhoneEncryptionUnavailable) {
-		t.Fatalf("缺密钥且有手机号时必须返回 ErrPhoneEncryptionUnavailable，实际=%v", err)
+	if err := d.syncPhoneShadow(m); err != nil {
+		t.Fatalf("缺密钥且有手机号时应降级放行，实际=%v", err)
+	}
+	if m.Phone != "13800001234" {
+		t.Fatalf("降级时明文手机号必须保留，实际=%q", m.Phone)
+	}
+	if m.PhoneHash != "" || len(m.PhoneEncrypted) != 0 || m.PhoneLast4 != "" {
+		t.Fatalf("降级时三个影子列都必须留空，实际 hash=%q enc=%d last4=%q",
+			m.PhoneHash, len(m.PhoneEncrypted), m.PhoneLast4)
 	}
 
 	// 主密钥缺失 + 无手机号：放行（否则缺密钥会阻断 username/email/OAuth/机器人建号）

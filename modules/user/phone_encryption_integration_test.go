@@ -89,21 +89,25 @@ func TestInsertUserWithPhoneEncryptionRoundTrip(t *testing.T) {
 	assert.Equal(t, "u-with-phone", found.UID)
 }
 
-// TestInsertUserWithPhoneFailsClosedWithoutKey 锁住 fail-closed 契约：主密钥缺失时
-// 写入"带手机号的用户"必须失败，而不是降级成只写明文 phone。
+// TestInsertUserWithPhoneDegradesToPlaintextWithoutKey 锁住降级契约：主密钥缺失时
+// 写入"带手机号的用户"不失败，而是只写明文 phone、三个影子列留空。
 //
-// 降级写明文会让 OCTO_PII_ENCRYPTION_SECRET 漏配长期无人发现，明文手机号持续入库，
-// 而"手机号已加密存储"这个结论早已对外声明 —— 宁可注册报 5xx 让运维立刻看到。
-// 无手机号的用户不受影响（见 TestInsertUserWithoutPhoneSucceeds），所以缺密钥不会
-// 阻断 username / email / OAuth / 机器人账号的建号路径。
-func TestInsertUserWithPhoneFailsClosedWithoutKey(t *testing.T) {
+// 选择降级而不是 fail-closed 的理由见 DB.syncPhoneShadow 的注释：手机号注册是主
+// 注册路径，而该环境变量在部署侧尚无接通路径，fail-closed 会让标准升级直接打断它。
+//
+// 这个取舍成立的前提是「降级可收敛」，所以本测试不止断言写入成功，还断言：
+//   - 降级行与存量未回填行同形（phone 非空 + 影子列全空），因此被 remaining 计入；
+//   - 补配密钥后跑回填，这批行会被补齐并可经盲索引命中。
+//
+// 少了后半段，这个测试就只是在给"明文入库"背书，而不是在锁住它能被修回来。
+func TestInsertUserWithPhoneDegradesToPlaintextWithoutKey(t *testing.T) {
 	withPhoneSecretForTest(t, "") // 清掉 TestMain 兜底的密钥
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	d := NewDB(ctx)
 	require.Nil(t, d.phoneEnc, "密钥缺失时不应构造出加密器")
 
-	err := d.Insert(&Model{
+	require.NoError(t, d.Insert(&Model{
 		UID:      "u-phone-nokey",
 		Username: "008613800009999",
 		Name:     "缺密钥带手机号",
@@ -111,14 +115,21 @@ func TestInsertUserWithPhoneFailsClosedWithoutKey(t *testing.T) {
 		Status:   1,
 		Zone:     "0086",
 		Phone:    "13800009999",
-	})
-	require.Error(t, err, "缺密钥时带手机号的写入必须失败，不得降级写明文")
-	assert.ErrorIs(t, err, ErrPhoneEncryptionUnavailable)
+	}), "缺密钥时带手机号的写入应降级放行，不得阻断建号")
 
-	// 确认没有留下明文手机号
 	got, err := d.QueryByUID("u-phone-nokey")
 	require.NoError(t, err)
-	assert.Nil(t, got, "fail-closed 后不应有任何行落库")
+	require.NotNil(t, got, "降级写入的行必须落库")
+	assert.Equal(t, "13800009999", got.Phone, "降级时明文手机号照常写入")
+	assert.Empty(t, got.PhoneHash, "降级时盲索引必须留空")
+	assert.Empty(t, got.PhoneEncrypted, "降级时密文列必须留空")
+	assert.Empty(t, got.PhoneLast4, "降级时后4位列必须留空")
+
+	// 降级期的行仍可被明文腿检索到（查重 / 找回密码 / OIDC 绑定定位都依赖这条）
+	byPhone, err := d.QueryByPhone("0086", "13800009999")
+	require.NoError(t, err)
+	require.NotNil(t, byPhone, "降级写入的手机号必须仍能被 QueryByPhone 命中")
+	assert.Equal(t, "u-phone-nokey", byPhone.UID)
 
 	// 同一个 DB 实例下，无手机号的用户仍可正常建号
 	require.NoError(t, d.Insert(&Model{
@@ -128,6 +139,34 @@ func TestInsertUserWithPhoneFailsClosedWithoutKey(t *testing.T) {
 		ShortNo:  "sn-nophone-nokey",
 		Status:   1,
 	}), "缺密钥不得阻断无手机号用户的建号")
+
+	// 补配密钥后回填：降级行必须被 remaining 计入并补齐
+	withPhoneSecretForTest(t, "0123456789abcdef0123456789abcdef")
+	repaired := NewDB(ctx)
+	require.NotNil(t, repaired.phoneEnc)
+
+	pending, err := repaired.CountPhoneShadowPending()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, pending, "降级行必须与存量未回填行一样计入 remaining")
+
+	result, err := repaired.BackfillPhoneShadow(context.Background(), 0, 10, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, result.Updated)
+	assert.EqualValues(t, 0, result.Remaining)
+	assert.True(t, result.Done, "补齐降级行后回填应收敛")
+
+	healed, err := repaired.QueryByUID("u-phone-nokey")
+	require.NoError(t, err)
+	require.NotNil(t, healed)
+	assert.NotEmpty(t, healed.PhoneHash, "回填后盲索引应补齐")
+	assert.NotEmpty(t, healed.PhoneEncrypted, "回填后密文列应补齐")
+	assert.Equal(t, "9999", healed.PhoneLast4)
+
+	// 补齐后必须能走盲索引腿命中，否则"可收敛"只是形式上的
+	byHash, err := repaired.QueryByPhone("0086", "13800009999")
+	require.NoError(t, err)
+	require.NotNil(t, byHash)
+	assert.Equal(t, "u-phone-nokey", byHash.UID)
 }
 
 // TestDestroyFreesPhoneForReuse 是 CRITICAL-2 的行为回归：

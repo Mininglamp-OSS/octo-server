@@ -12,9 +12,10 @@ import (
 //
 //   - OCTO_MASTER_KEY: testutil.NewTestServer → module.Setup → common.Setup 在
 //     2026-05 后强制要求该 env 非空才能加密 IM 私钥写 app_config。
-//   - OCTO_PII_ENCRYPTION_SECRET: 手机号影子列是 fail-closed 的（见
-//     DB.syncPhoneShadow）——任何创建"带手机号用户"的写入在缺密钥时都会失败，
-//     这与生产要求一致。包内多处 DB-backed 测试会建带手机号的用户，同样集中兜底。
+//   - OCTO_PII_ENCRYPTION_SECRET: 缺密钥时带手机号的写入会降级成只写明文（见
+//     DB.syncPhoneShadow），影子列留空。包内多处 DB-backed 测试断言影子列已填齐，
+//     所以这里集中兜底注入密钥；需要覆盖降级行为的用例用 withPhoneSecretForTest
+//     显式清掉它。
 //
 // user package 下已有若干 DB-backed 测试(external_login_test.go /
 // api_manager_test.go / db_verification_test.go 等)都依赖 NewTestServer,集中在

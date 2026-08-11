@@ -24,8 +24,8 @@ const (
 type DB struct {
 	session *dbr.Session
 	ctx     *config.Context
-	// phoneEnc 手机号加密器。nil 表示主密钥未配置；此时非空手机号写入
-	// fail-closed，无手机号建号与存量明文兼容读取仍可用（见 phone_crypto.go）。
+	// phoneEnc 手机号加密器。nil 表示主密钥未配置；此时非空手机号写入降级成
+	// 只写明文、影子列留空，交由后续回填补齐（见 phone_crypto.go）。
 	// 放在 DB 而不是 handler 上，是为了让 Insert/InsertTx 成为唯一的同步点：
 	// user 表全仓库只有这两个插入口，任何新增建号路径都会自动带上影子列，
 	// 不依赖调用方记得调用（此前手工在 handler 里调，漏掉 update 路径导致过 P0）。
@@ -35,7 +35,7 @@ type DB struct {
 // NewDB NewDB
 func NewDB(ctx *config.Context) *DB {
 	// 主密钥缺失不阻断构造：phoneEnc 保持 nil，后续的非空手机号写入
-	// 由 syncPhoneShadow fail-closed。运维可见性由 New(ctx) 处的单条错误日志提供。
+	// 由 syncPhoneShadow 降级处理。运维可见性由 New(ctx) 处的单条错误日志提供。
 	enc, _ := newPhoneEncryptor()
 	return &DB{
 		session:  ctx.DB(),

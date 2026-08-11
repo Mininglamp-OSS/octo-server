@@ -1597,7 +1597,8 @@ func (m *Manager) createManagerAccount() {
 // newManagerSeedModel 构造首次启动的超管账号。超管通过 username 登录，
 // 固定虚构手机号没有业务用途，却会让 bootstrap 不必要地依赖
 // OCTO_PII_ENCRYPTION_SECRET。保持 phone 为空可以在 PII 密钥配置前先建立
-// 管理入口；普通带手机号建号仍由 DB.syncPhoneShadow fail-closed。
+// 管理入口，且不会因降级而在超管行上留下一个明文的虚构号码
+// （缺密钥时的降级行为见 DB.syncPhoneShadow）。
 func newManagerSeedModel(adminUID, hashedPwd string) *Model {
 	return &Model{
 		UID:      adminUID,

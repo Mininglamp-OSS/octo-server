@@ -87,8 +87,9 @@ func (d *DB) CountPhoneShadowPending() (int64, error) {
 
 // BackfillPhoneShadow 从 cursor 之后开始，分批回填手机号影子列。
 //
-// 主密钥必须就绪（与 syncPhoneShadow 的 fail-closed 一致）：没有密钥就没有回填的意义，
-// 直接返回错误而不是空跑一遍留下满地空列。
+// 主密钥必须就绪：没有密钥就没有回填的意义，直接返回错误而不是空跑一遍留下满地空列。
+// 注意这里与 syncPhoneShadow 的取舍相反 —— 写路径缺密钥时降级放行（不能让主注册
+// 路径挂掉），回填缺密钥时 fail-closed（它的全部意义就是产出影子列，没有可降级的语义）。
 //
 // 驱动方式：反复调用并把上次返回的 NextCursor 传回来，直到 Done==true。扫描到表尾时
 // NextCursor 归 0，所以本轮 Failed/Skipped 的行会在下一轮被重新捞起（当前

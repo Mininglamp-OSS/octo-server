@@ -43,9 +43,14 @@ for compatibility and rollback.
   length-prefixed plaintext format and equality lookup uses an independently
   versioned HMAC-SHA256 blind index derived from the dedicated
   `OCTO_PII_ENCRYPTION_SECRET`.
-- `fail-closed-write` — any new non-empty phone write fails when the PII key is
-  missing or invalid; username, email, OAuth, and bot accounts without a phone
-  remain writable.
+- `degraded-write` — when the PII key is missing or invalid, a non-empty phone
+  write stores the plaintext column and leaves the three shadow columns empty
+  rather than failing the request, so phone registration — the product's primary
+  registration path — survives a deployment that has not provisioned the key yet.
+  A degraded row is shape-identical to a legacy un-backfilled row, so the pending
+  count includes it and the backfill repairs it once the key is configured.
+  A write that fails while the key *is* present remains fail-closed: that is an
+  internal error, not a configuration gap.
 - `migration` — four additive migrations introduce phone shadow columns,
   login-audit fields and indexes, user login/lookup indexes, and sufficient
   ciphertext width for the existing utf8mb4 zone/phone column bounds.
@@ -85,8 +90,10 @@ for compatibility and rollback.
 
 - Every account-password creation and reset path rejects passwords outside the
   shared length and character-class policy with localized errors.
-- Missing or invalid `OCTO_PII_ENCRYPTION_SECRET` prevents non-empty phone
-  writes without silently persisting a new plaintext-only row.
+- Missing or invalid `OCTO_PII_ENCRYPTION_SECRET` degrades a non-empty phone
+  write to plaintext with empty shadow columns instead of failing it, logs one
+  process-level error at startup, keeps the row retrievable through the plaintext
+  lookup leg, and lets a later backfill repair it to the current hash version.
 - Initial superAdmin creation has no synthetic phone and therefore remains
   available before the PII key is provisioned; its password policy still fails
   closed.
@@ -111,10 +118,14 @@ for compatibility and rollback.
 ## Deployment and rollback
 
 1. Configure the same 32-byte `OCTO_PII_ENCRYPTION_SECRET` on every replica
-   before enabling phone-bearing account creation or starting backfill. Those
-   paths intentionally fail closed without it. Initial superAdmin creation no
-   longer carries a synthetic phone and is independent of this key; `AdminPwd`
-   must still satisfy the account-password policy or the seed is rejected.
+   before enabling phone-bearing account creation or starting backfill. Without
+   it, account creation still succeeds but every new phone is stored in plaintext
+   with empty shadow columns, and the backfill endpoint refuses to run — a
+   backfill with no key would be meaningless. The startup error log naming the
+   variable is the only signal, so treat it as a deployment blocker even though
+   it is not a request-path failure. Initial superAdmin creation no longer
+   carries a synthetic phone and is independent of this key; `AdminPwd` must
+   still satisfy the account-password policy or the seed is rejected.
 2. Apply the additive migrations and allow the user-table index build to finish
    during the planned database change window.
 3. Deploy the application, then repeatedly call the superAdmin phone-shadow

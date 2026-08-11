@@ -28,9 +28,10 @@ import (
 //   - 手机号后4位（phoneLast4）是独立的低敏明文字段，只服务"输入后4位模糊检索"
 //     这一种检索语义，盲索引做不到子串匹配。
 //
-// 主密钥缺失时，encryptPhone/PhoneBlindHash 返回 error。写入非空手机号的
-// DB.Insert/insertTx 路径 fail-closed，返回 ErrPhoneEncryptionUnavailable 且不写明文；
-// 无手机号建号不受影响。读路径在存量回填完成前仍保留明文比较兼容。
+// 主密钥缺失时，encryptPhone/PhoneBlindHash 返回 error。此时写入非空手机号的
+// DB.Insert/insertTx 路径**降级为只写明文 phone**（三个影子列留空），不阻断建号；
+// 读路径本来就在存量回填完成前保留明文比较兼容，所以降级期的行仍能被正常检索。
+// 降级的可见性与收敛见 syncPhoneShadow 的注释。
 const (
 	// v2 表示密文中的 plaintext 已从 zone+"|"+phone 切换为长度前缀编码。
 	// 不升版会让第二阶段解密无法判断边界规则。
@@ -212,7 +213,7 @@ type phoneEncryptor struct {
 }
 
 // newPhoneEncryptor 读取主密钥并构造 AES-256-GCM AEAD。主密钥缺失/长度非法时返回
-// error；DB 仍可用于无手机号的读写，但 syncPhoneShadow 会拒绝任何非空手机号写入。
+// error；DB 仍完全可用，syncPhoneShadow 会把非空手机号降级成只写明文（见其注释）。
 func newPhoneEncryptor() (*phoneEncryptor, error) {
 	master, err := phoneMasterKey()
 	if err != nil {
@@ -273,8 +274,11 @@ func (e *phoneEncryptor) decryptPhone(cipherText []byte) (string, error) {
 	return string(plaintext), nil
 }
 
-// ErrPhoneEncryptionUnavailable 有手机号要写、但加密能力不可用（主密钥缺失/非法，
-// 或加密本身失败）。写路径必须把它作为 5xx 传播出去，不能降级成"只写明文"。
+// ErrPhoneEncryptionUnavailable 加密能力不可用。两种成因必须区别对待：
+//
+//   - 主密钥缺失/非法：部署配置问题。写路径降级（见 syncPhoneShadow），只有
+//     BackfillPhoneShadow 仍用它拒绝执行 —— 没有密钥的回填没有任何意义。
+//   - 密钥在场但加密本身失败：内部错误，写路径按 5xx 传播，不降级。
 var ErrPhoneEncryptionUnavailable = errors.New("user: phone encryption unavailable")
 
 // syncPhoneShadow 在写入前把三个手机号影子列同步成与 m.Phone 一致。
@@ -282,13 +286,28 @@ var ErrPhoneEncryptionUnavailable = errors.New("user: phone encryption unavailab
 // 由 DB.Insert / DB.insertTx 统一调用 —— user 表全仓库只有这两个插入口，所以任何
 // 建号路径（含未来新增的）都会自动带上影子列，不依赖调用方记得手工调用。
 //
-// fail-closed：只要 m.Phone 非空而加密能力不可用，就返回 ErrPhoneEncryptionUnavailable
-// 让写入整体失败。**不做"只写明文"的降级** —— 那会让 OCTO_PII_ENCRYPTION_SECRET 漏配
-// 长期无人发现，明文手机号持续入库，而"手机号已加密存储"这个结论早已对外声明。
-// 宁可注册报 5xx（运维立刻看到并补配置），也不要静默积累明文 PII。
+// 主密钥缺失时降级为「只写明文 phone、三个影子列留空」，不阻断建号。
 //
-// 无手机号的用户（username / email / OAuth 注册、机器人账号）不受影响：清空影子列后
-// 正常放行，所以缺密钥不会阻断这些建号路径。
+// 为什么不 fail-closed：手机号注册是本产品的主注册路径，而 OCTO_PII_ENCRYPTION_SECRET
+// 在 octo-deployment 侧尚无接通路径（helm 逐个 secretKeyRef 声明 env，没有 envFrom
+// 逃生口），运维即使发现问题也无法自行补配。让主注册路径在标准升级后直接 5xx，
+// 代价高于「暂时多存一批明文」，而后者是可收敛的：
+//
+//   - 降级写出的行形状与「存量未回填行」完全一致（phone 非空 + phone_hash 为空），
+//     BackfillPhoneShadow 在密钥配好后会把它们和存量行一起补齐，无需单独处理；
+//   - CountPhoneShadowPending 的 remaining 同时计入这两类行，所以「还有多少明文
+//     没加密」本身就是可观测的，不需要额外埋点；
+//   - 读路径（QueryByPhone / oidc QueryUIDsByPhone）本就同时走盲索引和明文两条腿，
+//     降级期的行走明文腿命中，查重、找回密码、OIDC 绑定定位都不受影响。
+//
+// 漏配本身的可见性由 New(ctx) 的启动期 Error 日志承担（api.go），一次性、不刷屏；
+// 这里不再逐行打日志。
+//
+// 仍然 fail-closed 的那一半：密钥在场但 encryptPhone 失败属于内部错误而非配置问题，
+// 继续返回 ErrPhoneEncryptionUnavailable 让写入整体失败 —— 那种情况下写明文既不是
+// 运维能修的，也可能掩盖真正的故障。
+//
+// 无手机号的用户（username / email / OAuth 注册、机器人账号）本来就不受影响。
 //
 // 注意 update 路径不在这里覆盖：user.phone 目前唯一的改写点是
 // destroyAccountFromState（注销匿名化），它显式清空这三列 —— 影子列若比明文列
@@ -303,8 +322,9 @@ func (d *DB) syncPhoneShadow(m *Model) error {
 		return nil
 	}
 	if d.phoneEnc == nil {
-		return fmt.Errorf("%w: %s must be configured before writing a phone number",
-			ErrPhoneEncryptionUnavailable, phoneEncryptionSecretEnv)
+		// 降级：明文照写，影子列留空等回填。等价于一行「存量未回填行」。
+		m.PhoneEncrypted, m.PhoneHash, m.PhoneLast4 = nil, "", ""
+		return nil
 	}
 	encrypted, hash, last4, err := d.phoneEnc.encryptPhone(m.Zone, m.Phone)
 	if err != nil {
