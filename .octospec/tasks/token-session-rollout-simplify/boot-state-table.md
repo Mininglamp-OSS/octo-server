@@ -32,7 +32,8 @@ Redis `run_id` 只作为接管 audit 的辅助字段。读取不到该指纹不�
 所有运行期 mode 变化都走 `ApplyAndPublishRolloutState`：
 
 1. 设置 `issuanceFenced=true`；
-2. CAS loop 原子替换本地 `{mode,max_per_uid}`，并发调用也不允许降低；
+2. CAS loop 原子替换本地 `{mode,max_per_uid,version}`；mode 并发调用也不允许降低，cap 只接受
+   更新 MySQL version 的值，陈旧 snapshot 只能修复缺失/越界的本地 cap；
 3. 用一个 Redis Lua 原子执行 `SADD roster` + `PSETEX writer entry`，发布 applied state 并续租；
 4. 仅发布成功后解除 fence。
 
@@ -43,6 +44,10 @@ Redis `run_id` 只作为接管 audit 的辅助字段。读取不到该指纹不�
 | B3 | 更低 floor | 较高 | success | 保持较高本地 mode，按实际 applied mode 发布 |
 | B4 | 任意有效状态 | 任意 | error | reader strictness 保留，issuance 持续 fenced |
 | B5 | DB read error | 当前已应用状态 | 不发布新状态 | 保持 mode；不从 Redis/env 推导，不推进 |
+
+cap-only update 由 `set-cap` 对 MySQL state 执行 version/floor/旧 cap CAS，并在同一 transaction
+写 `transition_kind=set-cap` 的旧/新值 audit。副本由 5 秒 poller 获取新 version；降低 cap
+只影响后续 session index 添加，不删除已经存在的 session。
 
 heartbeat 与 applied-state publication 共用 registry write mutex，旧 heartbeat 不能覆盖新状态。fence
 只影响 credential create/reuse/promotion；既有 session 验证和 readiness 不受影响。
@@ -83,6 +88,10 @@ predicate 每次接收一个 MySQL `{floor,version,max_per_uid,paused}` 快照�
 | pause 抢先提交 | version/paused CAS miss，evidence rollback |
 | evidence insert / update / commit error | transaction rollback，不推进 |
 | force advance | 只绕过 reconciler；仍需 predicate allowed，仍走同一 transaction |
+
+同一 state version 也串行化 cap update。cap CAS 抢先提交时，使用旧 version 的 floor advance
+会成为 benign loser；floor advance 抢先提交时，旧 snapshot 的 `set-cap` 同样回滚 audit 并要求
+operator 重新读取 `status` 后重试。
 
 ## E. Redis failover 与 scan owner
 

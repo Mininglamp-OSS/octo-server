@@ -41,7 +41,7 @@ const (
 )
 
 // RolloutAdvanceRecord is the audit payload inserted in the same MySQL
-// transaction as the versioned floor CAS.
+// transaction as the versioned floor or cap CAS.
 type RolloutAdvanceRecord struct {
 	From              SessionMode         `json:"from"`
 	To                SessionMode         `json:"to"`

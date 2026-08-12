@@ -50,7 +50,8 @@ singleton 已存在时，后续启动不再读取 Redis floor。Redis 恢复旧�
 - `OCTO_AUTH_SESSION_MAX_PER_UID`：legacy Redis control 未带 cap 时作为 seed；
 - `OCTO_AUTH_SESSION_REQUIRED_FLOOR`：无效，启动只告警。
 
-确认 MySQL singleton 已正确 seed 后，删除这些遗留项。之后更改它们不会改变 floor。
+确认 MySQL singleton 已正确 seed 后，删除这些遗留项。之后更改它们不会改变 floor 或 cap；
+takeover 后修改 cap 必须使用下方 `set-cap`。
 
 启动日志示例：
 
@@ -69,6 +70,7 @@ Authentication session runtime: mode=revoke rollout_floor=revoke boot=adopted
 /home/app session-rollout observe --batch-size 200 --qps 100
 /home/app session-rollout migrate --campaign <id> --cutoff <RFC3339> \
   --finite-policy natural --batch-size 200 --qps 100 --lease 30s
+/home/app session-rollout set-cap --max-per-uid <1..10000> --yes
 /home/app session-rollout pause
 /home/app session-rollout resume
 
@@ -80,7 +82,14 @@ Authentication session runtime: mode=revoke rollout_floor=revoke boot=adopted
 每个命令都会先打印 Redis endpoint、DB、实例指纹和 Token TTL。命令同时直连 MySQL control，
 所以 config 必须同时指向正确的 Redis 与 MySQL。
 
-`advance` 不再接受 `--max-per-uid`；cap 来自 MySQL authority。
+`advance` 不再接受 `--max-per-uid`；cap 来自 MySQL authority。`set-cap` 在一个 transaction
+内写 `transition_kind=set-cap` 的旧/新 cap audit，并执行 version/floor/旧 cap CAS。CAS loser
+不会留下 audit，重新执行 `status` 后再重试。
+
+cap 可收紧或提高。副本通过 5 秒 poller 应用新 version，不需要滚动重启；传播窗口内仍可能有
+副本短暂使用旧 cap。降低 cap 是 create-gate：它不会踢出已经存在的 session，只会在当前有效
+session 数不低于新 cap 时拒绝后续签发，因此不能把 `set-cap` 当作紧急全量撤销命令。
+`status.last_advance` 沿用历史字段名，最近一次 transition 是 cap 修改时会显示 `set-cap`。
 
 `status` 关键字段：
 
@@ -93,12 +102,11 @@ Authentication session runtime: mode=revoke rollout_floor=revoke boot=adopted
   "writers": [{"build": "<commit>", "applied_state": "revoke", "pod": "<pod>"}],
   "tokens": {"complete": true, "redis_instance_id": "...", "persistent": 0, "v2": 12},
   "last_advance": {
-    "from": "v3-write",
+    "from": "revoke",
     "to": "revoke",
-    "actor": "reconciler",
-    "transition_kind": "advance",
-    "writer_fingerprint": "...",
-    "redis_instance_id": "..."
+    "actor": "operator",
+    "transition_kind": "set-cap",
+    "cap_change": {"from_max_per_uid": 20, "to_max_per_uid": 5}
   },
   "next": {"target_floor": "bounded", "allowed": true}
 }
@@ -217,12 +225,12 @@ migrate apply 只有本副本已应用 `revoke` 或更高 mode 才允许，并�
 
 | 状态 | 允许动作 |
 |---|---|
-| singleton 仅完成接管、MySQL floor 未高于原 #725 posture | 可回滚 #725；恢复 #725 所需 MODE/REQUIRED_FLOOR，并确认旧 Redis floor 仍在 |
-| MySQL floor 已推进 | 禁止回滚到只认 Redis floor 的制品；`pause` 后 roll forward |
+| singleton 仅完成接管、MySQL floor/cap 均未偏离原 #725 posture | 可回滚 #725；恢复 #725 所需 MODE/REQUIRED_FLOOR，并确认旧 Redis floor 仍在 |
+| MySQL floor 已推进或 cap 已通过 `set-cap` 修改 | 禁止回滚到只认 Redis floor/cap 的制品；`pause` 后 roll forward |
 | migration 已 apply | 可暂停/续跑；不得延长 TTL、删除 deny marker 或恢复旧 checkpoint |
 
-本版本不写、不修复、不删除 #725 Redis floor，以保留“尚未推进”阶段的回滚窗口。MySQL floor
-一旦高于旧 Redis floor，回写 Redis 作为“同步”会重新引入双状态源，禁止操作。
+本版本不写、不修复、不删除 #725 Redis floor，以保留“floor/cap 均未偏离接管值”阶段的回滚窗口。
+MySQL floor 或 cap 一旦改变，回写 Redis 作为“同步”会重新引入双状态源，禁止操作。
 
 SQL migration 的 Down 仅用于未启用、无推进的开发环境，不是生产回滚 SOP。
 

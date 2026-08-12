@@ -7,8 +7,8 @@ package main
 // never built: the image ships only /home/app, so a private deployment was
 // guaranteed to arrive without them. Nothing referenced them from CI either.
 //
-// Only three things are left here, because the advance predicate needs no human
-// judgement and the reconciler runs it:
+// The operator surface stays deliberately small because the advance predicate
+// needs no human judgement and the reconciler runs it:
 //
 //	status          diagnosis — where the floor is and what is blocking it
 //	migrate         the one real decision: cutoff and finite policy, i.e. how
@@ -89,7 +89,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	apply := flags.Bool("apply", false, "apply TTL shortening; omitted means dry-run")
 	confirmElapsed := flags.Bool("confirm-elapsed-cutoff", false, "confirm immediate deletion when the cutoff has elapsed")
 	force := flags.Bool("force", false, "advance: fault channel for when the reconciler is broken")
-	yes := flags.Bool("yes", false, "advance --force: confirm")
+	yes := flags.Bool("yes", false, "confirm advance --force or set-cap")
 	maxPerUID := flags.Int("max-per-uid", 0, "set-cap: durable per-UID session limit (1-10000)")
 	expectWriters := flags.Int("expect-writers", 0, "advance: replica count the deployment intends to run")
 	observeWindow := flags.Duration("observe-window", 90*time.Second,

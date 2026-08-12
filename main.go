@@ -906,7 +906,7 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 }
 
 // startSessionRolloutControl runs after module migrations and before serve.
-// MySQL is the only floor authority; Redis supplies the writer lease and
+// MySQL is the only floor/cap authority; Redis supplies the writer lease and
 // run_id-bound scan evidence. A publication failure leaves issuance fenced but
 // does not fail readiness or existing-session reads.
 func startSessionRolloutControl(

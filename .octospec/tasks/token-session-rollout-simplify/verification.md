@@ -10,7 +10,7 @@
 实现没有恢复旧的 Redis floor + MySQL marker 运行时状态机：
 
 - `octo_session_rollout_state` 是唯一 floor/cap/paused/version 权威；
-- `octo_session_rollout_advance` 与 floor CAS 在同一 transaction；
+- `octo_session_rollout_advance` 与 floor CAS 或 cap CAS 在同一 transaction；
 - Redis 只保留 session、writer/scan lease、migration checkpoint 与 `run_id` 证据；
 - 历史 marker migration/table 仅为 `sql-migrate` 账本兼容保留，运行时无读写路径；
 - PR 过程中曾执行的旧 control migration ID 保留为 no-op tombstone，真正建表由更晚 ID 完成。
@@ -81,12 +81,37 @@ state 非原子 `Load -> decide -> Store` 以及 control read 无 deadline 的�
 的兼容兜底。`TestResolveRolloutSeedPreservesPersistedCapAndStrictestFloor` 覆盖了 Redis
 cap=50、env cap=5 仍保留 50 的升级语义。
 
+### 5. takeover 后 cap 可维护性、写超时与并发行为覆盖
+
+RED checkpoint `4b5b404e` 复现了三个缺口：MySQL cap 没有受支持的更新入口，control write
+没有内部 deadline，并发 CAS 只有源码断言、没有行为级不变量。
+
+GREEN checkpoint `e2253ceb` 保持 #733 的单一权威边界并补齐：
+
+- `session-rollout set-cap --max-per-uid N --yes` 只更新 MySQL singleton；旧/新 cap audit 与
+  version/floor/旧 cap CAS 在一个 transaction，CAS loser 的 audit rollback；
+- 本地 atomic snapshot 增加 MySQL version；新 version 可显式收紧或提高 cap，陈旧同 floor
+  snapshot 不能覆盖新 cap，mode 仍只升不降；
+- Initialize/Advance/SetPaused/SetMaxPerUID 共用 5 秒 write deadline，并保留 caller 更早的
+  cancel/deadline；
+- 256 个同步起跑 caller 的行为测试断言完成后的 mode 观测非递减，最终 cap 来自最高 version；
+- 降低 cap 只拒绝后续超限签发，不删除现有 session；Redis/env 未恢复为运行时权威。
+
+对应覆盖：
+
+- `TestRolloutControlSetMaxPerUIDCommitsAuditAndCASAtomically`；
+- `TestRolloutControlSetMaxPerUIDRollsBackAuditWhenCASLoses`；
+- `TestRolloutControlAdvanceHonorsItsWriteDeadline`；
+- `TestApplyRolloutStateConcurrentCallersNeverRegressModeOrCapVersion`；
+- `TestInitializeSessionRolloutUsesMySQLAuthorityAcrossBoots`；
+- `TestSessionRolloutSetCapRequiresConfirmationAndValidBound`。
+
 ## 核心行为覆盖
 
 `pkg/auth` 的测试覆盖以下安全边界：
 
 - takeover seed、单调初始化、并发 winner、事务化 audit；
-- floor 逐阶段 CAS、pause、CAS loser evidence rollback；
+- floor 逐阶段 CAS、cap-only CAS、pause、CAS loser evidence rollback；
 - registry state + lease 原子发布、publish failure issuance fence；
 - scanner run_id 变化重扫、final batch 复核、scan-owner 丢失；
 - observe/migrate/reconciler 共用 owner lease；
@@ -120,11 +145,11 @@ GIN_MODE=release go test ./modules/user \
 
 | 验证 | 结果 |
 |---|---|
-| `GIN_MODE=release go test ./modules/user -count=1` | PASS，143.185s |
+| `GIN_MODE=release go test ./modules/user -count=1` | PASS，200.648s |
 | migration upgrade/source tests | PASS，marker-only 与旧 PR control 两条路径 |
-| `go test ./pkg/auth -coverprofile=.context/pkg-auth-cover-final.out -count=1` | PASS，statements 80.3% |
-| `go test -race ./pkg/auth -count=1` | PASS，5.590s |
-| 核心 E2E `-count=3` | PASS，3/3，1.682s |
+| `go test -race -coverprofile=.context/pkg-auth-cover-cap.out ./pkg/auth -count=1` | PASS，race clean，statements 80.4%，4.959s |
+| 核心 E2E `-count=3` | PASS，3/3，1.648s |
+| `go build ./...` | PASS |
 | `go test ./pkg/metrics . -count=1` | PASS |
 | `go vet ./pkg/auth .` | PASS |
 | `git diff --check` | PASS |

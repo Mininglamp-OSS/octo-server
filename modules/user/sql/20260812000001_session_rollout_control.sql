@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS `octo_session_rollout_advance` (
   `evidence_json` JSON NULL COMMENT '完整扫描聚合证据，不含 token/UID/key',
   `redis_run_id` VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Redis run_id 的 SHA-256 指纹',
   `writer_fingerprint` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '推进前后相同的 writer roster 指纹',
-  `transition_kind` VARCHAR(32) NOT NULL DEFAULT 'advance' COMMENT 'bootstrap|legacy-takeover|advance',
+  `transition_kind` VARCHAR(32) NOT NULL DEFAULT 'advance' COMMENT 'bootstrap|legacy-takeover|advance|set-cap',
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_session_rollout_advance_created` (`created_at`)

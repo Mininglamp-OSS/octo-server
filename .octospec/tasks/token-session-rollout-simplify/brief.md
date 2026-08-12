@@ -59,6 +59,10 @@ provisional 降级、registry 发布错误被吞、Redis failover cursor 复用�
 append-only evidence：`from_floor`、`to_floor`、`actor`、`evidence_json`、
 `redis_run_id`、`writer_fingerprint`、`transition_kind`、`created_at`。
 
+floor advance 与 cap-only update 共用该审计流：`transition_kind=advance` 保存扫描/写副本证据；
+`transition_kind=set-cap` 保持 `from_floor=to_floor`，在 `evidence_json` 保存旧/新 cap。两者都与
+对应的 versioned state CAS 在同一个 MySQL transaction 中提交。
+
 推进 transaction：
 
 1. 插入 evidence；
@@ -146,20 +150,25 @@ campaign lock 保证写迁移单 owner。
 - `advance --force --yes`：只绕过 reconciler，不绕过 predicate，最终仍走 MySQL CAS。
 
 `max_per_uid` 已是 MySQL authority，不再由 advance 命令临时传入。
+`set-cap --max-per-uid N --yes` 是 takeover 后唯一受支持的 cap 修改通路；它不修改 floor，
+也不写回 Redis/env。降低 cap 只拒绝后续超限签发，不主动撤销已经存在的 session。
 
 ## Rollout
 
 1. 部署本制品，保持 `OCTO_AUTH_SESSION_AUTO_ADVANCE=0`。
-2. 确认 migration 成功、所有副本 registry lease 正常、MySQL seed 与原 #725 floor/legacy
-   MODE 的较严格值一致。
+2. 确认 migration 成功、所有副本 registry lease 正常；MySQL floor seed 取原 #725 floor 与
+   legacy MODE 中更严格者，cap 优先保留 #725 Redis 已持久化值，仅在旧记录缺 cap 时使用
+   legacy `MAX_PER_UID`。
 3. 运行 `status`/`observe` 做 shadow 验证；核对 run_id、writer fingerprint 和 scan owner。
 4. 确认业务 cutoff/finite policy，必要时执行 migrate。
 5. 显式开启 auto advance；任何异常先 `pause`，再看 MySQL state/audit 与 Redis roster。
 
 ## Rollback
 
-- **MySQL floor 尚未推进时**：可回滚到 #725 兼容制品；旧 Redis floor 仍保留且未被本版修改。
-- **MySQL floor 已推进后**：不得回滚到只认 Redis floor 的旧制品。先 `pause`，保留 MySQL
+- **MySQL floor/cap 均未偏离接管值时**：可回滚到 #725 兼容制品；旧 Redis floor 仍保留且
+  未被本版修改。
+- **MySQL floor 已推进或 cap 已通过 `set-cap` 修改后**：不得回滚到只认 Redis floor/cap 的
+  旧制品。先 `pause`，保留 MySQL
   state/audit，修复后 roll forward。回写 Redis floor 会重新引入双状态源，禁止作为回滚手段。
 - 数据 migration 仍只缩短 TTL、不延长；不得删除 deny marker 或复活过期 token。
 - MySQL control migration 的 Down 只用于未启用/无推进的开发环境，不是生产 rollback SOP。
@@ -174,6 +183,8 @@ campaign lock 保证写迁移单 owner。
 5. scan failover 或 scan lease loss 不得生成 complete evidence。
 6. migration apply 只在当前已应用 mode 至少为 `revoke` 时允许。
 7. pause/read failure 一律阻止推进。
+8. cap 修改必须走 MySQL version CAS，并与旧/新 cap audit 同 transaction；陈旧 snapshot 不得
+   覆盖本地已应用的新版本 cap。
 
 ## Out of scope
 
@@ -189,8 +200,11 @@ campaign lock 保证写迁移单 owner。
 - 新 control migration 定义 MySQL state + append-only advance 两张权威表；历史 marker migration
   与 PR 旧 control ID 保留为兼容 artifact，且运行时无 marker 读写路径。
 - 已记录 marker migration 的旧库可直接前滚并创建两张 control 表，不出现 unknown migration。
-- fresh、#725 Redis floor、遗留 MODE 三种接管路径有测试，且取严格下限。
+- fresh、#725 Redis floor、遗留 MODE 三种接管路径有测试；floor 取 Redis floor 与遗留 MODE
+  中更严格者，cap 保留 Redis 已持久化值，仅在旧记录缺 cap 时使用遗留 `MAX_PER_UID`。
 - MySQL CAS loser 回滚 evidence；单调与逐阶段检查有测试。
+- `set-cap` 通过 version/floor/旧 cap CAS 与 append-only audit 原子提交；旧版本 snapshot 不能
+  覆盖新 cap，降低 cap 不被描述为主动 session revoke。
 - 删除/回滚 Redis floor 后，poller 仍保持 MySQL mode。
 - MySQL read failure 保持当前 mode 且不调用 advance。
 - registry publish error 后 `CanIssue()` 返回 fence error，成功重试后可恢复。

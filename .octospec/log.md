@@ -9,7 +9,7 @@ change-log convention (§7). Newest first.
 - **Task** — `token-session-rollout-simplify`: collapsed the #725 five-phase
   session rollout into a MySQL-authoritative control plane. A singleton owns
   floor/cap/version/pause, and append-only evidence commits in the same
-  transaction as each floor CAS; #725 Redis floor and legacy MODE/MAX are
+  transaction as each floor or cap CAS; #725 Redis floor and legacy MODE/MAX are
   one-time takeover inputs only. Runtime mode publication fences issuance,
   applies local state, then atomically publishes writer state + lease; failure
   stays fenced without breaking existing-session reads. Observe, migrate and
@@ -17,8 +17,9 @@ change-log convention (§7). Newest first.
   counters on failover. The writer registry still proves fleet convergence;
   empty token keyspace is valid absence evidence, while an empty writer set is
   a blocker. The reconciler ships disabled, and rollback to a Redis-floor-only
-  artifact is forbidden after the MySQL floor advances. Tooling remains in
-  `app session-rollout` and now reads MySQL state directly. See
+  artifact is forbidden after the MySQL floor or cap changes. Tooling remains in
+  `app session-rollout`, reads MySQL state directly, and exposes an audited
+  `set-cap` path rather than restoring env/Redis authority. See
   [journal](journal/shared/token-session-rollout-simplify.md) and
   [verification](tasks/token-session-rollout-simplify/verification.md). PR #733.
 - **Learning (pending)** —

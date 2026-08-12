@@ -14,7 +14,8 @@ source: self
 
 - `octo_session_rollout_state` is the only durable floor/cap/pause authority.
 - `octo_session_rollout_advance` stores append-only evidence in the same MySQL transaction as the
-  versioned floor CAS.
+  versioned floor CAS. Cap-only changes use the same stream with `transition_kind=set-cap` and
+  old/new cap evidence.
 - #725 Redis floor and legacy MODE/MAX are read only while the singleton is absent. The stricter
   floor and the existing Redis cap are adopted; Redis floor is never changed by this release.
 - Session issuance is fenced before module migrations finish. A runtime mode change fences first,
@@ -44,6 +45,12 @@ the floor.
   reload under lock and monotonically adopt a stricter seed; normal startup contention is not fatal.
 - `ApplyAndPublishRolloutState` publishes the state the process actually applied. Publication error
   keeps new credential creation fenced while existing-session reads remain available.
+- `session-rollout set-cap --max-per-uid N --yes` is the only post-takeover cap mutation path. It
+  performs a version/floor/old-cap CAS and audit insert in one transaction; Redis and deprecated env
+  never regain authority. Runtime snapshots carry the MySQL version so a stale same-floor poll
+  cannot undo a newer cap.
+- Control writes have a five-second internal deadline. A blocked singleton update cannot hold an
+  application goroutine until the database's much longer lock-wait timeout.
 - The writer fingerprint is checked before and after each decision. A build/state/member change
   invalidates the scan even when token counters are green.
 - `instanceBoundScanner` checks `run_id` before/after SCAN, after per-key work and before completion.
@@ -74,9 +81,9 @@ design, not as post-implementation patches.
 
 ## Operational boundaries
 
-- Before MySQL floor advances beyond the adopted #725 posture, rollback to #725 remains possible if
-  its required env is restored and the untouched Redis floor is present.
-- After MySQL floor advances, rollback to a Redis-floor-only artifact is forbidden. Pause and roll
+- Before MySQL floor or cap changes beyond the adopted #725 posture, rollback to #725 remains
+  possible if its required env is restored and the untouched Redis floor is present.
+- After MySQL floor advances or cap changes, rollback to a Redis-floor-only artifact is forbidden. Pause and roll
   forward; writing the MySQL value back to Redis would recreate dual authority.
 - Migration remains shorten-only and resumable. It must never extend TTLs, delete deny markers or
   revive expired sessions.

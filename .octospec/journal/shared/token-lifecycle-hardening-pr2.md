@@ -11,6 +11,13 @@ source: self
 
 # Journal: token-lifecycle-hardening PR 2
 
+> [!IMPORTANT]
+> **Historical #725 record; rollout control was superseded by PR #733.** Redis floor, startup-fixed
+> MODE, REQUIRED_FLOOR and the old standalone tools below are no longer the active design. The
+> current implementation uses one MySQL `floor/max_per_uid/version/paused` authority; see
+> [`token-session-rollout-simplify`](../../tasks/token-session-rollout-simplify/brief.md) and the
+> [current runbook](../../../docs/token-session-rollout-runbook.md).
+
 ## What was done
 
 - Added a startup-fixed, default-`expand` rollout mode and an operator-only,
