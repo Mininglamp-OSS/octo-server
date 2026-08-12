@@ -297,6 +297,13 @@ var systemSettingSchema = []settingDef{
 	{Category: "dmpersonal", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示「我的/运行时」模块入口（默认关闭；与 dmloop 分开以便独立放量）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DmpersonalEnabled()) }},
 
+	// 前端埋点(octo-dap)采集总开关。默认关闭，埋点层随发布上线但静默(fail-closed)：
+	// octo-web 只有在 appconfig 下发 tracking_enabled 为真时才开始采集。采集器 collector
+	// 与 TRACK_API_URL egress 在集群内验证通过前，运维保持此开关为关。仅表达采集策略，
+	// 不承担服务端鉴权(collector 自身鉴权)。经 GET /v1/common/appconfig 的 tracking_enabled 下发给客户端。
+	{Category: "tracking", Key: "enabled", Type: settingTypeBool, Description: "是否开启前端埋点(octo-dap)采集（collector 与 egress 在集群内验证通过前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.TrackingEnabled()) }},
+
 	// 自定义贴纸上传限制（sticker-upload-compression 任务）。原先硬编码在
 	// modules/file/const.go；挪进 system_setting 后可灰度/回滚，且每键都有
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
