@@ -401,6 +401,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DriveOn:                cn.systemSettings.DriveEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
 			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
 			// 也能立刻拿到最新值。
@@ -453,6 +454,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DriveOn:                cn.systemSettings.DriveEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
 		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
@@ -856,6 +858,14 @@ type appConfigResp struct {
 	// 解耦(同 DocsOn):运维切策略后老客户端命中 version 短路分支也须拿到最新值,故两分支都下发。
 	DmloopOn     bool `json:"dmloop_on"`
 	DmpersonalOn bool `json:"dmpersonal_on"`
+
+	// TrackingEnabled 告知客户端是否开启前端埋点(octo-dap)采集。值来源于 system_setting
+	// tracking.enabled；默认 false —— 埋点层随发布上线但静默(fail-closed)，octo-web 只有拿到
+	// 此字段为真才开始采集。collector 与 TRACK_API_URL egress 在集群内验证通过前运维保持关闭。
+	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
+	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
+	TrackingEnabled bool `json:"tracking_enabled"`
+
 
 	// MessageReaction is the deployment-wide default capability for ordinary
 	// Web/iOS/Android clients. It is intentionally identity-agnostic because

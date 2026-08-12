@@ -1373,6 +1373,18 @@ func (s *SystemSettings) DmpersonalEnabled() bool {
 	return s.getBool("dmpersonal", "enabled", false)
 }
 
+// TrackingEnabled reports whether the frontend event-tracking layer (octo-dap)
+// should collect. Default false — the tracker ships dark (fail-closed): octo-web
+// only starts collecting when appconfig delivers tracking_enabled truthy, so ops
+// keeps this off until the octo-dap collector is deployed and the TRACK_API_URL
+// egress is verified in-cluster. Display/behaviour policy only; the collector
+// enforces its own auth. Value source: system_setting tracking.enabled
+// (DB, hot-reloaded — flip in the admin console, 60s multi-instance converge,
+// no restart). Delivered via GET /v1/common/appconfig as tracking_enabled.
+func (s *SystemSettings) TrackingEnabled() bool {
+	return s.getBool("tracking", "enabled", false)
+}
+
 // ---------------------------------------------------------------------------
 // Custom-sticker upload constraints + optional server-side compression
 // (sticker-upload-compression task).
