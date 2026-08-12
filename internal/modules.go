@@ -39,6 +39,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/integration"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/notification"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/notify"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/opanalytics"
