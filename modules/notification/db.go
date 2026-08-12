@@ -38,22 +38,12 @@ func (s *dbStore) upsert(uid string, pausedUntil time.Time, now time.Time) (*pau
 		_ = tx.Rollback()
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return s.get(uid)
-}
-
-func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
-	tx, err := s.session.Begin()
-	if err != nil {
-		return nil, err
-	}
-	_, err = tx.InsertBySql(
-		"INSERT INTO user_notification_pause (uid, paused_until, revision, updated_at) VALUES (?, NULL, 1, ?) "+
-			"ON DUPLICATE KEY UPDATE paused_until=NULL, revision=revision+1, updated_at=VALUES(updated_at)",
-		uid, now.UTC(),
-	).Exec()
+	var record *pauseRecord
+	_, err = tx.Select("uid", "paused_until", "revision", "updated_at").
+		From("user_notification_pause").
+		Where("uid=?", uid).
+		Suffix("FOR UPDATE").
+		Load(&record)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err
@@ -61,7 +51,38 @@ func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return s.get(uid)
+	return record, nil
+}
+
+func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
+	tx, err := s.session.Begin()
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Update("user_notification_pause").
+		Set("paused_until", nil).
+		Set("updated_at", now.UTC()).
+		Set("revision", dbr.Expr("revision+1")).
+		Where("uid=? AND paused_until IS NOT NULL", uid).
+		Exec()
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	var record *pauseRecord
+	_, err = tx.Select("uid", "paused_until", "revision", "updated_at").
+		From("user_notification_pause").
+		Where("uid=?", uid).
+		Suffix("FOR UPDATE").
+		Load(&record)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]struct{}, error) {
@@ -69,17 +90,24 @@ func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]stru
 	if len(uids) == 0 {
 		return active, nil
 	}
-	var records []*pauseRecord
-	_, err := s.session.Select("uid", "paused_until", "revision", "updated_at").
-		From("user_notification_pause").
-		Where("uid IN ? AND paused_until IS NOT NULL AND paused_until > ?", uids, now.UTC()).
-		Load(&records)
-	if err != nil {
-		return nil, err
-	}
-	for _, record := range records {
-		if record != nil {
-			active[record.UID] = struct{}{}
+	const batchSize = 1000
+	for start := 0; start < len(uids); start += batchSize {
+		end := start + batchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		var records []*pauseRecord
+		_, err := s.session.Select("uid", "paused_until", "revision", "updated_at").
+			From("user_notification_pause").
+			Where("uid IN ? AND paused_until IS NOT NULL AND paused_until > ?", uids[start:end], now.UTC()).
+			Load(&records)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			if record != nil {
+				active[record.UID] = struct{}{}
+			}
 		}
 	}
 	return active, nil

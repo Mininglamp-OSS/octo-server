@@ -93,34 +93,71 @@ components:
         paused_until: '2026-08-12T12:30:00.000Z'
         revision: 42
         server_time: '2026-08-12T11:30:00.125Z'
-    Error:
+    ErrorDetail:
       type: object
-      required: [code]
+      required: [code, message, details, http_status]
       properties:
         code:
           type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        http_status:
+          type: integer
+          format: int32
+    ErrorEnvelope:
+      type: object
+      required: [error, msg, status]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+        msg:
+          type: string
+        status:
+          type: integer
+          format: int32
   responses:
     Unauthorized:
       description: Authentication required
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/ErrorEnvelope'
           example:
-            code: unauthorized
+            error:
+              code: unauthorized
+              message: Authentication required
+              details: {}
+              http_status: 401
+            msg: Authentication required
+            status: 401
     InvalidTime:
       description: Invalid or non-future pause time
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/ErrorEnvelope'
           example:
-            code: err.server.notification.pause.invalid_time
+            error:
+              code: err.server.notification.pause.invalid_time
+              message: invalid pause time
+              details: {}
+              http_status: 400
+            msg: invalid pause time
+            status: 400
     UpdateFailed:
       description: Database update failed
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/ErrorEnvelope'
           example:
-            code: err.server.notification.pause.update_failed
+            error:
+              code: err.server.notification.pause.update_failed
+              message: update failed
+              details: {}
+              http_status: 500
+            msg: update failed
+            status: 500

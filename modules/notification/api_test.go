@@ -40,3 +40,16 @@ func TestResponseUsesUTCAbsolutePauseTime(t *testing.T) {
 		t.Fatalf("server_time should be UTC, got %s", response.ServerTime.Location())
 	}
 }
+
+func TestValidPauseUntilCapsThePauseWindow(t *testing.T) {
+	now := time.Date(2026, 8, 12, 11, 30, 0, 0, time.UTC)
+	if !validPauseUntil(now, now.Add(time.Minute)) {
+		t.Fatal("future pause should be accepted")
+	}
+	if validPauseUntil(now, now) || validPauseUntil(now, now.Add(-time.Minute)) {
+		t.Fatal("current and past pause times should be rejected")
+	}
+	if validPauseUntil(now, now.Add(maxPauseDuration+time.Nanosecond)) {
+		t.Fatal("pause window beyond the cap should be rejected")
+	}
+}

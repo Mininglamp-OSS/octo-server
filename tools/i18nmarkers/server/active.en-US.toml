@@ -612,6 +612,12 @@ other = "Message search failed."
 ["err.server.message.store_failed"]
 other = "Failed to persist message data."
 
+["err.server.notification.pause.invalid_time"]
+other = "Notification pause time is invalid."
+
+["err.server.notification.pause.update_failed"]
+other = "Failed to update notification pause state."
+
 ["err.server.messages_search.depth_exceeded"]
 other = "Search pagination depth limit reached; narrow your query."
 

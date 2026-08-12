@@ -17,6 +17,12 @@ type Service struct {
 	log.Log
 }
 
+const maxPauseDuration = 30 * 24 * time.Hour
+
+func validPauseUntil(now, pausedUntil time.Time) bool {
+	return pausedUntil.After(now) && !pausedUntil.After(now.Add(maxPauseDuration))
+}
+
 func New(ctx *config.Context) *Service {
 	return &Service{ctx: ctx, db: newDBStore(ctx), Log: log.NewTLog("Notification")}
 }
@@ -48,7 +54,7 @@ func (s *Service) putPause(c *wkhttp.Context) {
 	}
 	now := time.Now().UTC()
 	pausedUntil := req.PausedUntil.UTC()
-	if !pausedUntil.After(now) {
+	if !validPauseUntil(now, pausedUntil) {
 		s.writeInvalidTime(c)
 		return
 	}
