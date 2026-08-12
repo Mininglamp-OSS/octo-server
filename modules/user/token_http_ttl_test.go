@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	libserver "github.com/Mininglamp-OSS/octo-lib/server"
+	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/stretchr/testify/require"
 )
@@ -338,7 +339,7 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	server.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(server.GetRoute())
 	store, client := auth.SessionStoreAndClientForContext(ctx)
-	stopRollout, err := startSessionRolloutForTest(ctx, "token-http-test")
+	stopRollout, err := testsession.StartRollout(ctx, "token-http-test")
 	require.NoError(t, err)
 	t.Cleanup(stopRollout)
 	server.GetRoute().SetTokenParser(auth.NewCacheTokenParser(

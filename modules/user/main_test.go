@@ -1,16 +1,13 @@
 package user
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
 )
 
 // TestMain 确保集成测试启动前必需的加密 env 已就位。
@@ -40,26 +37,7 @@ func TestMain(m *testing.M) {
 		_, _ = rand.Read(key)
 		_ = os.Setenv(phoneEncryptionSecretEnv, hex.EncodeToString(key))
 	}
-	// register.GetModules caches module objects from the first Context for the
-	// whole process. Make that Context deterministic and run the same rollout
-	// startup sequence as main.go so every cached login handler has a live write
-	// lease instead of inheriting a pre-migration issuance fence.
-	legacyMode, hadLegacyMode := os.LookupEnv("OCTO_AUTH_SESSION_MODE")
-	legacyCap, hadLegacyCap := os.LookupEnv("OCTO_AUTH_SESSION_MAX_PER_UID")
-	_ = os.Unsetenv("OCTO_AUTH_SESSION_MODE")
-	_ = os.Unsetenv("OCTO_AUTH_SESSION_MAX_PER_UID")
-	_, rolloutTestContext := testutil.NewTestServer()
-	stopRollout, err := startSessionRolloutForTest(rolloutTestContext, "user-package-tests")
-	if hadLegacyMode {
-		_ = os.Setenv("OCTO_AUTH_SESSION_MODE", legacyMode)
-	} else {
-		_ = os.Unsetenv("OCTO_AUTH_SESSION_MODE")
-	}
-	if hadLegacyCap {
-		_ = os.Setenv("OCTO_AUTH_SESSION_MAX_PER_UID", legacyCap)
-	} else {
-		_ = os.Unsetenv("OCTO_AUTH_SESSION_MAX_PER_UID")
-	}
+	stopRollout, err := testsession.StartPackageRollout("user-package-tests")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -71,26 +49,4 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	os.Exit(code)
-}
-
-func startSessionRolloutForTest(ctx *config.Context, build string) (context.CancelFunc, error) {
-	store, client := auth.SessionStoreAndClientForContext(ctx)
-	boot, _, err := auth.InitializeSessionRollout(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("initialize test session rollout: %w", err)
-	}
-	rolloutCtx, stop := context.WithCancel(context.Background())
-	registry := auth.NewWriterRegistry(client, ctx.GetConfig().Cache.UIDTokenCachePrefix)
-	store.UseWriterLease(registry)
-	if err := registry.Join(rolloutCtx, build, build, string(store.Mode()), nil); err != nil {
-		stop()
-		return nil, fmt.Errorf("join test writer registry: %w", err)
-	}
-	if err := store.ApplyAndPublishRolloutState(registry, auth.RolloutState{
-		Floor: boot.Floor, MaxPerUID: boot.MaxPerUID, Version: boot.Version,
-	}, store.Mode()); err != nil {
-		stop()
-		return nil, fmt.Errorf("publish test rollout state: %w", err)
-	}
-	return stop, nil
 }
