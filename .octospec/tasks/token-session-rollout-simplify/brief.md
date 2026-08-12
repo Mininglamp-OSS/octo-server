@@ -83,7 +83,8 @@ marker 仍是状态源，唯一权威仍是 `octo_session_rollout_state`。
 1. 构造共享 Redis session store，但保持 issuance fenced；
 2. `module.Setup` 执行 migration，创建 MySQL control tables；
 3. 读取 MySQL singleton；
-4. 仅当 singleton 不存在时，读取一次 #725 Redis floor 和遗留 MODE，取更严格者作为 seed；
+4. 仅当 singleton 不存在时，读取一次 #725 Redis floor 和遗留 MODE，floor 取更严格者；cap
+   优先保留 Redis 已持久化值，仅在旧记录未带 cap 时使用遗留 `MAX_PER_UID`；
 5. MySQL transaction 内写 singleton + bootstrap/takeover audit；
 6. 应用本地 mode，绑定 writer registry，成功发布 state + lease 后解除 fence；
 7. 启动 poller/reconciler，最后才进入 HTTP serve。
@@ -99,7 +100,7 @@ MySQL singleton 一旦存在，后续启动不再读取 Redis floor。Redis roll
 `ApplyAndPublishRolloutState` 是唯一运行期变更入口：
 
 1. `issuanceFenced=true`；
-2. 单次 atomic pointer 更新 `{mode,max_per_uid}`，且不允许降低；
+2. CAS loop 原子更新 `{mode,max_per_uid}`，并发调用也不允许降低；
 3. registry Lua 在一个原子执行中 `SADD roster` + `PSETEX entry`，同时发布 applied state
    和续租；
 4. 成功才清 fence；失败返回 error 且保持 fenced。

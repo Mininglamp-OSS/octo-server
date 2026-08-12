@@ -32,7 +32,7 @@ Redis `run_id` 只作为接管 audit 的辅助字段。读取不到该指纹不�
 所有运行期 mode 变化都走 `ApplyAndPublishRolloutState`：
 
 1. 设置 `issuanceFenced=true`；
-2. 原子替换本地 `{mode,max_per_uid}`，mode 不允许降低；
+2. CAS loop 原子替换本地 `{mode,max_per_uid}`，并发调用也不允许降低；
 3. 用一个 Redis Lua 原子执行 `SADD roster` + `PSETEX writer entry`，发布 applied state 并续租；
 4. 仅发布成功后解除 fence。
 

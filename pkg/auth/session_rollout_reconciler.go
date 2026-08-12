@@ -173,7 +173,7 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 	if r.control == nil {
 		return
 	}
-	state, err := r.control.Load(ctx)
+	state, err := loadRolloutStateWithTimeout(ctx, r.control)
 	if err != nil {
 		// Keep the last applied state and leave issuance fenced if publication was
 		// already in progress. A DB read failure is never permission to derive a
@@ -220,7 +220,7 @@ func (r *RolloutReconciler) reconcileOnce(ctx context.Context) time.Time {
 	if r.control == nil {
 		return soon
 	}
-	state, err := r.control.Load(ctx)
+	state, err := loadRolloutStateWithTimeout(ctx, r.control)
 	if err != nil {
 		r.log("session rollout: cannot read MySQL control state for advance: %v", err)
 		metrics.ObserveSessionReconcileBlocked("control-read-error")

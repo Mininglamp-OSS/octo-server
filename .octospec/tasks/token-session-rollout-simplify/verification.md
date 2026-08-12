@@ -55,6 +55,32 @@ RED checkpoint `d0f1e80f` 用隔离 MySQL 复现：数据库已记录
 
 两条路径都不改写 `gorp_migrations`，且最终三张历史/现行表均存在。
 
+### 4. 并发应用、初始化与 MySQL 读取边界
+
+RED checkpoint `90e9af7d` 复现了并发初始化的 data race，并锁定了本地 rollout
+state 非原子 `Load -> decide -> Store` 以及 control read 无 deadline 的结构性缺口。
+
+修复后：
+
+- `ApplyRolloutState` 用 atomic pointer CAS loop 实现 mode 单调；陈旧 floor 只能修复缺失
+  cap，不能覆盖与更新 floor 配对的有效 cap；
+- `sessionRuntime` 的初始化和 boot 读取共用实例级 mutex，并发 caller 返回同一
+  control 实例和 boot snapshot；
+- boot、poller 与 reconciler 的 MySQL control read 统一有 5 秒 deadline，同时保留
+  caller 的更早取消/截止时间。
+
+对应覆盖：
+
+- `TestInitializeSessionRolloutSerializesConcurrentCallers`；
+- `TestApplyRolloutStateIsMonotonicAndCarriesTheCap`；
+- `TestRolloutStateSafetyMechanismsAreStructural`；
+- `TestRolloutControlReadHelperAddsDeadlineAndPreservesCancellation`。
+
+重审建议将 Redis cap 与废弃 env cap 取最小值，本实现不采用：#725 Redis control
+中已持久化的 cap 是接管时的权威值，废弃 env 只用于旧 Redis 记录缺失 cap
+的兼容兜底。`TestResolveRolloutSeedPreservesPersistedCapAndStrictestFloor` 覆盖了 Redis
+cap=50、env cap=5 仍保留 50 的升级语义。
+
 ## 核心行为覆盖
 
 `pkg/auth` 的测试覆盖以下安全边界：
@@ -79,7 +105,7 @@ GIN_MODE=release go test ./modules/user \
   -count=3 -v
 ```
 
-结果：连续 3 次 PASS，package `ok`（1.320s）。每次实际覆盖：
+结果：连续 3 次 PASS，package `ok`（1.682s）。每次实际覆盖：
 
 1. 隔离 MySQL 执行模块 migration；
 2. Redis 写入 legacy rollout floor 并由 MySQL 一次性接管；
@@ -94,11 +120,11 @@ GIN_MODE=release go test ./modules/user \
 
 | 验证 | 结果 |
 |---|---|
-| `GIN_MODE=release go test ./modules/user -count=1` | PASS，118.951s |
+| `GIN_MODE=release go test ./modules/user -count=1` | PASS，143.185s |
 | migration upgrade/source tests | PASS，marker-only 与旧 PR control 两条路径 |
-| `go test ./pkg/auth -coverprofile=.context/pkg-auth-cover.out -count=1` | PASS，statements 80.1% |
-| `go test -race ./pkg/auth -count=1` | PASS，4.648s |
-| 核心 E2E `-count=3` | PASS，3/3 |
+| `go test ./pkg/auth -coverprofile=.context/pkg-auth-cover-final.out -count=1` | PASS，statements 80.3% |
+| `go test -race ./pkg/auth -count=1` | PASS，5.590s |
+| 核心 E2E `-count=3` | PASS，3/3，1.682s |
 | `go test ./pkg/metrics . -count=1` | PASS |
 | `go vet ./pkg/auth .` | PASS |
 | `git diff --check` | PASS |

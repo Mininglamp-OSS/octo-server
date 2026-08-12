@@ -155,25 +155,38 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 	if !mode.valid() {
 		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
 	}
-	current := s.currentState()
-	if maxPerUID <= 0 {
-		maxPerUID = current.maxPerUID
-	}
-	if maxPerUID > sessionMaxPerUIDLimit {
-		maxPerUID = sessionMaxPerUIDLimit
-	}
-	if mode.rank() < current.mode.rank() {
-		// The mode never moves down, but the CAP still has to land. A process
-		// running above the floor with no usable cap fences every login, and
-		// dropping the cap that arrived alongside a lower mode meant a floor
-		// record that finally carried one could never heal it.
-		if maxPerUID != current.maxPerUID {
-			s.state.Store(&derivedRolloutState{mode: current.mode, maxPerUID: maxPerUID})
+	for {
+		currentPointer := s.state.Load()
+		current := derivedRolloutState{mode: SessionModeExpand}
+		if currentPointer != nil {
+			current = *currentPointer
 		}
-		return nil
+
+		nextMode := mode
+		if nextMode.rank() < current.mode.rank() {
+			nextMode = current.mode
+		}
+		nextMaxPerUID := maxPerUID
+		if nextMaxPerUID <= 0 {
+			nextMaxPerUID = current.maxPerUID
+		}
+		if nextMaxPerUID > sessionMaxPerUIDLimit {
+			nextMaxPerUID = sessionMaxPerUIDLimit
+		}
+		if mode.rank() < current.mode.rank() &&
+			current.maxPerUID > 0 && current.maxPerUID <= sessionMaxPerUIDLimit {
+			// A stale floor may heal a missing cap, but must not overwrite a
+			// usable cap that arrived with a newer floor snapshot.
+			nextMaxPerUID = current.maxPerUID
+		}
+		if nextMode == current.mode && nextMaxPerUID == current.maxPerUID {
+			return nil
+		}
+		next := &derivedRolloutState{mode: nextMode, maxPerUID: nextMaxPerUID}
+		if s.state.CompareAndSwap(currentPointer, next) {
+			return nil
+		}
 	}
-	s.state.Store(&derivedRolloutState{mode: mode, maxPerUID: maxPerUID})
-	return nil
 }
 
 // writableState is the single gate every credential-creating path goes

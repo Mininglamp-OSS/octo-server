@@ -24,6 +24,7 @@ const (
 	sessionRedisPoolSizeMax        = 4096
 	sessionRedisPoolTimeoutMax     = 30 * time.Second
 	sessionRedisPoolTimeoutDefault = 3 * time.Second
+	rolloutControlReadTimeout      = 5 * time.Second
 )
 
 type sessionRedisOptions struct {
@@ -32,6 +33,7 @@ type sessionRedisOptions struct {
 }
 
 type sessionRuntime struct {
+	mu      sync.Mutex
 	store   *RedisSessionStore
 	client  *rd.Client
 	control *RolloutControlStore
@@ -104,6 +106,8 @@ func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControl
 	if !ok || runtime == nil {
 		return RolloutBoot{}, nil, errors.New("auth: session store must be constructed before rollout initialization")
 	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
 	if runtime.control != nil {
 		return runtime.boot, runtime.control, nil
 	}
@@ -111,7 +115,7 @@ func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControl
 		return RolloutBoot{}, nil, errors.New("auth: session rollout requires MySQL")
 	}
 	control := NewRolloutControlStore(ctx.DB())
-	state, err := control.Load(context.Background())
+	state, err := loadRolloutStateWithTimeout(context.Background(), control)
 	outcome := RolloutBootNormal
 	if errors.Is(err, ErrRolloutStateUninitialized) {
 		bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -180,9 +184,21 @@ func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControl
 // and the rollout status subcommand.
 func SessionBootForContext(ctx *config.Context) (RolloutBoot, []string) {
 	if existing, ok := ctx.Value(sessionRuntimeContextKey).(*sessionRuntime); ok {
-		return existing.boot, existing.policy.warnings
+		existing.mu.Lock()
+		defer existing.mu.Unlock()
+		return existing.boot, append([]string(nil), existing.policy.warnings...)
 	}
 	return RolloutBoot{}, nil
+}
+
+type rolloutStateLoader interface {
+	Load(context.Context) (RolloutState, error)
+}
+
+func loadRolloutStateWithTimeout(ctx context.Context, loader rolloutStateLoader) (RolloutState, error) {
+	readCtx, cancel := context.WithTimeout(ctx, rolloutControlReadTimeout)
+	defer cancel()
+	return loader.Load(readCtx)
 }
 
 func sessionRedisOptionsFromEnv() (sessionRedisOptions, error) {

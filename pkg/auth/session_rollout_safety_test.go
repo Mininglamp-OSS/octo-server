@@ -115,7 +115,11 @@ func TestApplyRolloutStateIsMonotonicAndCarriesTheCap(t *testing.T) {
 
 	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 7))
 	require.Equal(t, SessionModeBounded, store.Mode(), "a stale floor must not lower reader strictness")
-	require.Equal(t, 7, store.currentMaxPerUID(), "a usable cap from a stale floor must still heal issuance")
+	require.Equal(t, sessionMaxPerUIDLimit, store.currentMaxPerUID(),
+		"a stale floor must not replace the cap paired with a newer floor")
+	store.state.Store(&derivedRolloutState{mode: SessionModeBounded})
+	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 7))
+	require.Equal(t, 7, store.currentMaxPerUID(), "a usable cap from a stale floor may heal missing cap state")
 	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 0))
 	require.Equal(t, 7, store.currentMaxPerUID())
 
@@ -148,6 +152,32 @@ func TestRolloutStateSafetyMechanismsAreStructural(t *testing.T) {
 		require.GreaterOrEqual(t, strings.Count(string(reconcilerSource), "loadRolloutStateWithTimeout("), 2,
 			"both floor polling and advance evaluation must bound MySQL control reads")
 	})
+}
+
+type rolloutStateLoaderFunc func(context.Context) (RolloutState, error)
+
+func (f rolloutStateLoaderFunc) Load(ctx context.Context) (RolloutState, error) { return f(ctx) }
+
+func TestRolloutControlReadHelperAddsDeadlineAndPreservesCancellation(t *testing.T) {
+	var deadline time.Time
+	state, err := loadRolloutStateWithTimeout(context.Background(), rolloutStateLoaderFunc(
+		func(ctx context.Context) (RolloutState, error) {
+			var ok bool
+			deadline, ok = ctx.Deadline()
+			require.True(t, ok)
+			return RolloutState{Floor: SessionModeRevoke}, nil
+		},
+	))
+	require.NoError(t, err)
+	require.Equal(t, SessionModeRevoke, state.Floor)
+	require.WithinDuration(t, time.Now().Add(rolloutControlReadTimeout), deadline, time.Second)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = loadRolloutStateWithTimeout(canceled, rolloutStateLoaderFunc(
+		func(ctx context.Context) (RolloutState, error) { return RolloutState{}, ctx.Err() },
+	))
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestRolloutControlRetryClassificationAndConstructorGuards(t *testing.T) {

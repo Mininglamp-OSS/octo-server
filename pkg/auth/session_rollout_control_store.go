@@ -44,9 +44,9 @@ type RolloutSeed struct {
 	RedisID   string
 }
 
-// ResolveRolloutSeed persists the strictest posture already in effect during
-// takeover. This makes the deprecated MODE a one-time compatibility lower
-// bound instead of a process-local override that disappears on the next poll.
+// ResolveRolloutSeed persists the strictest floor already in effect during
+// takeover. A cap already carried by the #725 Redis record remains authoritative;
+// the deprecated environment cap is only a fallback for older records without one.
 func ResolveRolloutSeed(
 	redisFloor, legacyMode SessionMode,
 	redisMaxPerUID, legacyMaxPerUID int,

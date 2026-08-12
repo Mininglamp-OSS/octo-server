@@ -139,7 +139,8 @@ Redis 实例在扫描中变化时，cursor 和累计计数全部丢弃，从 0 �
 1. 部署本制品，保持 `AUTO_ADVANCE=0`；不要同时删除 legacy 配置。
 2. 确认 migration 成功，所有副本启动，启动日志没有 MySQL/registry publication 错误。
 3. 执行 `status`，核对：
-   - MySQL floor/cap 等于升级前 Redis floor、legacy MODE 中较严格的姿态；
+   - MySQL floor 等于升级前 Redis floor 与 legacy MODE 中较严格的姿态；cap 优先保留 Redis
+     已持久化值，仅在旧记录未带 cap 时使用 legacy `MAX_PER_UID`；
    - `version >= 1`，`paused=false`；
    - writers 数量等于计划副本数，build 一致，applied state 不低于 floor；
    - Redis endpoint 与 instance fingerprint 正确。
