@@ -43,6 +43,18 @@ redis.call("PSETEX", KEYS[2], ARGV[2], ARGV[3])
 return 1
 `)
 
+var pruneWriterLeaseScript = rd.NewScript(`
+local current = redis.call("GET", KEYS[2])
+if ARGV[2] == "missing" then
+  if current then
+    return 0
+  end
+elseif current ~= ARGV[3] then
+  return 0
+end
+return redis.call("SREM", KEYS[1], ARGV[1])
+`)
+
 const (
 	// writerLeaseTTL bounds how long a dead process stays visible. Liveness is
 	// Redis's own key expiry, so no timestamp is written and cross-pod clock
@@ -279,8 +291,10 @@ func (r *WriterRegistry) publish(entry WriterEntry) error {
 	return nil
 }
 
-// Live enumerates writers whose lease has not expired, and prunes roster
-// members whose entry is gone.
+// Live enumerates writers whose lease has not expired, and conditionally
+// prunes roster members whose entry is still missing or malformed. Cleanup is
+// a compare-and-remove operation: a writer that refreshes after MGET must stay
+// registered because that refresh also makes MayWrite true.
 //
 // SMEMBERS + MGET rather than SCAN: the runbook's Redis preflight already flags
 // proxies with incomplete cursor semantics, and there is no reason to take that
@@ -302,23 +316,53 @@ func (r *WriterRegistry) Live() ([]WriterEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("auth: read writer entries: %w", err)
 	}
+	type staleWriter struct {
+		id       string
+		key      string
+		missing  bool
+		expected string
+	}
 	live := make([]WriterEntry, 0, len(values))
-	stale := make([]interface{}, 0)
+	stale := make([]staleWriter, 0)
 	for i, value := range values {
-		raw, ok := value.(string)
-		if !ok || strings.TrimSpace(raw) == "" {
-			stale = append(stale, ids[i])
+		if value == nil {
+			stale = append(stale, staleWriter{id: ids[i], key: keys[i], missing: true})
+			continue
+		}
+		var raw string
+		switch typed := value.(type) {
+		case string:
+			raw = typed
+		case []byte:
+			raw = string(typed)
+		default:
+			// An unknown client reply cannot be compared safely in Redis. Leave
+			// the roster member in place so cleanup fails closed.
+			continue
+		}
+		if strings.TrimSpace(raw) == "" {
+			stale = append(stale, staleWriter{id: ids[i], key: keys[i], expected: raw})
 			continue
 		}
 		var entry WriterEntry
 		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
-			stale = append(stale, ids[i])
+			stale = append(stale, staleWriter{id: ids[i], key: keys[i], expected: raw})
 			continue
 		}
 		live = append(live, entry)
 	}
-	if len(stale) > 0 {
-		_ = r.client.SRem(r.rosterKey, stale...).Err()
+	for _, candidate := range stale {
+		kind := "value"
+		if candidate.missing {
+			kind = "missing"
+		}
+		_, _ = pruneWriterLeaseScript.Run(
+			r.client,
+			[]string{r.rosterKey, candidate.key},
+			candidate.id,
+			kind,
+			candidate.expected,
+		).Result()
 	}
 	return live, nil
 }

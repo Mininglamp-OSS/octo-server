@@ -394,6 +394,58 @@ func TestWriterRegistryLiveDoesNotPruneWriterRefreshedAfterSnapshot(t *testing.T
 	}
 }
 
+func TestRolloutAdvanceBlocksWhenBehindWriterRefreshesAfterRosterSnapshot(t *testing.T) {
+	store, publisherClient := newLegacyMigrationTestStore(t, SessionModeV3Write)
+	newWriter := func(state SessionMode) *WriterRegistry {
+		writer := NewWriterRegistry(publisherClient, store.UIDTokenPrefix())
+		writer.mu.Lock()
+		writer.self = WriterEntry{
+			ID:           "writer-" + util.GenerUUID(),
+			Build:        "build-a",
+			AppliedState: string(state),
+			StartedAtMS:  time.Now().UTC().UnixMilli(),
+		}
+		writer.mu.Unlock()
+		require.NoError(t, writer.refresh())
+		return writer
+	}
+	current := newWriter(SessionModeV3Write)
+	behind := newWriter(SessionModeExpand)
+	require.NoError(t, publisherClient.Del(behind.entryKey(behind.self.ID)).Err())
+
+	readerClient := octoredis.NewInstrumentedClient(config.New())
+	t.Cleanup(func() { _ = readerClient.Close() })
+	reader := NewWriterRegistry(readerClient, store.UIDTokenPrefix())
+	var refreshed atomic.Bool
+	var refreshErr error
+	readerClient.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
+		return func(cmd rd.Cmder) error {
+			err := old(cmd)
+			if cmd.Name() == "mget" && refreshed.CompareAndSwap(false, true) {
+				refreshErr = behind.refresh()
+			}
+			return err
+		}
+	})
+
+	decision, err := store.EvaluateRolloutAdvance(context.Background(), RolloutAdvanceInput{
+		State: RolloutState{
+			Floor: SessionModeV3Write, MaxPerUID: 10, Version: 2,
+		},
+		Registry: reader,
+	})
+	require.NoError(t, err)
+	require.NoError(t, refreshErr)
+	require.True(t, refreshed.Load(), "the test must refresh after the initial MGET snapshot")
+	require.False(t, decision.Allowed)
+	require.Contains(t, decision.BlockedBy, "writer set changed during evaluation")
+
+	live, err := reader.Live()
+	require.NoError(t, err)
+	require.Len(t, live, 2)
+	require.ElementsMatch(t, []string{current.self.ID, behind.self.ID}, []string{live[0].ID, live[1].ID})
+}
+
 func TestRolloutAuditAndLegacyTakeoverRejectInvalidRedisState(t *testing.T) {
 	store, client := newLegacyMigrationTestStore(t, SessionModeRevoke)
 	ctx := context.Background()
