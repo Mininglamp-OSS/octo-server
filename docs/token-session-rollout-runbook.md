@@ -82,13 +82,16 @@ Authentication session runtime: mode=revoke rollout_floor=revoke boot=adopted
 每个命令都会先打印 Redis endpoint、DB、实例指纹和 Token TTL。命令同时直连 MySQL control，
 所以 config 必须同时指向正确的 Redis 与 MySQL。
 
-`advance` 不再接受 `--max-per-uid`；cap 来自 MySQL authority。`set-cap` 在一个 transaction
-内写 `transition_kind=set-cap` 的旧/新 cap audit，并执行 version/floor/旧 cap CAS。CAS loser
-不会留下 audit，重新执行 `status` 后再重试。
+`--max-per-uid` 只对 `set-cap` 生效；`advance` 不会修改 cap。cap 来自 MySQL authority。
+`set-cap` 在一个 transaction 内写 `transition_kind=set-cap` 的旧/新 cap audit，并执行
+version/floor/旧 cap CAS。CAS loser 不会留下 audit，重新执行 `status` 后再重试。
 
 cap 可收紧或提高。副本通过 5 秒 poller 应用新 version，不需要滚动重启；传播窗口内仍可能有
 副本短暂使用旧 cap。降低 cap 是 create-gate：它不会踢出已经存在的 session，只会在当前有效
 session 数不低于新 cap 时拒绝后续签发，因此不能把 `set-cap` 当作紧急全量撤销命令。
+副本应用 cap 变化时会先 fence 新 credential，成功发布本地 applied state 后解除；若 registry
+发布失败，该副本保持 fenced，并在后续 5 秒 poll 中继续重试，Redis 持续异常时不会自动放开。
+既有 session 验证不受该 fence 影响。
 `status.last_advance` 沿用历史字段名，最近一次 transition 是 cap 修改时会显示 `set-cap`。
 
 `status` 关键字段：

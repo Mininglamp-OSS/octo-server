@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS `octo_session_rollout_advance` (
   `from_floor` VARCHAR(16) NOT NULL DEFAULT '' COMMENT '空串仅表示首次接管',
   `to_floor` VARCHAR(16) NOT NULL,
   `actor` VARCHAR(128) NOT NULL,
-  `evidence_json` JSON NULL COMMENT '完整扫描聚合证据，不含 token/UID/key',
+  `evidence_json` JSON NULL COMMENT '扫描聚合或 cap 变更证据，不含 token/UID/key',
   `redis_run_id` VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Redis run_id 的 SHA-256 指纹',
   `writer_fingerprint` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '推进前后相同的 writer roster 指纹',
   `transition_kind` VARCHAR(32) NOT NULL DEFAULT 'advance' COMMENT 'bootstrap|legacy-takeover|advance|set-cap',
