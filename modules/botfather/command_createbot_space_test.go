@@ -468,6 +468,61 @@ func TestDeleteCreatedBotArtifactsDeletesOnlyCreatorFriendPairs(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestBindCreatedBotToSpaceRejectsUnexpectedInsertRows(t *testing.T) {
+	rawDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer rawDB.Close()
+	conn := &dbr.Connection{
+		DB:            rawDB,
+		EventReceiver: &dbr.NullEventReceiver{},
+		Dialect:       dialect.MySQL,
+	}
+	db := &botfatherDB{session: conn.NewSession(nil)}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT status, is_destroy FROM user.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "is_destroy"}).AddRow(1, 0))
+	mock.ExpectQuery("SELECT status FROM space.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(1))
+	mock.ExpectQuery("SELECT status FROM space_member.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(1))
+	mock.ExpectExec("INSERT INTO space_member.*NOW\\(\\), NOW\\(\\)").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectRollback()
+
+	err = db.bindCreatedBotToSpace(
+		"user_synthetic_bind",
+		"bot_synthetic_bind",
+		"space_synthetic_bind",
+	)
+
+	require.EqualError(t, err, "insert Bot Space membership: unexpected affected rows")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestBindCreatedBotToSpaceReturnsBeginFailure(t *testing.T) {
+	rawDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer rawDB.Close()
+	conn := &dbr.Connection{
+		DB:            rawDB,
+		EventReceiver: &dbr.NullEventReceiver{},
+		Dialect:       dialect.MySQL,
+	}
+	db := &botfatherDB{session: conn.NewSession(nil)}
+	beginErr := errors.New("synthetic transaction begin failure")
+	mock.ExpectBegin().WillReturnError(beginErr)
+
+	err = db.bindCreatedBotToSpace(
+		"user_synthetic_bind",
+		"bot_synthetic_bind",
+		"space_synthetic_bind",
+	)
+
+	assert.ErrorIs(t, err, beginErr)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 type blockingCreateAppService struct {
 	app.IService
 	created chan struct{}
