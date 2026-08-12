@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestResolveRolloutSeedPersistsTheHighestLegacyPosture(t *testing.T) {
+func TestResolveRolloutSeedPreservesPersistedCapAndStrictestFloor(t *testing.T) {
 	tests := []struct {
 		name         string
 		redisFloor   SessionMode
@@ -58,6 +58,14 @@ func TestResolveRolloutSeedPersistsTheHighestLegacyPosture(t *testing.T) {
 			legacyMax:    20,
 			wantFloor:    SessionModeEnforce,
 			wantMaxPerID: 8,
+		},
+		{
+			name:         "persisted redis cap is not tightened by deprecated env",
+			redisFloor:   SessionModeRevoke,
+			redisMax:     50,
+			legacyMax:    5,
+			wantFloor:    SessionModeRevoke,
+			wantMaxPerID: 50,
 		},
 	}
 

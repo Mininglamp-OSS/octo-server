@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -83,6 +84,41 @@ func TestInitializeSessionRolloutAdoptsLegacyRedisOnlyOnce(t *testing.T) {
 	require.Equal(t, RolloutBootNormal, normal.Outcome)
 	require.Equal(t, SessionModeRevoke, normal.Floor)
 	require.Equal(t, 7, normal.MaxPerUID)
+}
+
+func TestInitializeSessionRolloutSerializesConcurrentCallers(t *testing.T) {
+	configureRolloutIntegrationEnv(t)
+	dsn := newRolloutIntegrationDatabase(t)
+	ctx := newRolloutIntegrationContext(t, dsn,
+		"auth-concurrent-token:"+util.GenerUUID()+":",
+		"auth-concurrent-uid:"+util.GenerUUID()+":",
+	)
+	SessionStoreForContext(ctx)
+
+	const callers = 32
+	start := make(chan struct{})
+	boots := make([]RolloutBoot, callers)
+	controls := make([]*RolloutControlStore, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			boots[index], controls[index], errs[index] = InitializeSessionRollout(ctx)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < callers; i++ {
+		require.NoError(t, errs[i], "caller %d", i)
+		require.Equal(t, boots[0], boots[i], "caller %d", i)
+		require.Same(t, controls[0], controls[i], "caller %d", i)
+	}
+	recorded, _ := SessionBootForContext(ctx)
+	require.Equal(t, boots[0], recorded)
 }
 
 func configureRolloutIntegrationEnv(t *testing.T) {

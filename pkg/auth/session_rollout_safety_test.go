@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -121,6 +123,31 @@ func TestApplyRolloutStateIsMonotonicAndCarriesTheCap(t *testing.T) {
 	require.True(t, SessionModeV3Write.WritesV3())
 	require.False(t, SessionModeV3Write.RevokesSessions())
 	require.True(t, SessionModeRevoke.RevokesSessions())
+}
+
+func TestRolloutStateSafetyMechanismsAreStructural(t *testing.T) {
+	t.Run("monotonic apply uses CAS", func(t *testing.T) {
+		storeSource, err := os.ReadFile("session_store.go")
+		require.NoError(t, err)
+		applyStart := strings.Index(string(storeSource), "func (s *RedisSessionStore) ApplyRolloutState(")
+		require.NotEqual(t, -1, applyStart)
+		applyEnd := strings.Index(string(storeSource)[applyStart:], "\n}\n")
+		require.NotEqual(t, -1, applyEnd)
+		applyBody := string(storeSource)[applyStart : applyStart+applyEnd]
+		require.Contains(t, applyBody, ".CompareAndSwap(",
+			"mode monotonicity must survive concurrent callers, not rely on a single-caller convention")
+	})
+
+	t.Run("control reads are bounded", func(t *testing.T) {
+		runtimeSource, err := os.ReadFile("runtime.go")
+		require.NoError(t, err)
+		require.Contains(t, string(runtimeSource), "loadRolloutStateWithTimeout(",
+			"normal boot must bound a MySQL control read")
+		reconcilerSource, err := os.ReadFile("session_rollout_reconciler.go")
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, strings.Count(string(reconcilerSource), "loadRolloutStateWithTimeout("), 2,
+			"both floor polling and advance evaluation must bound MySQL control reads")
+	})
 }
 
 func TestRolloutControlRetryClassificationAndConstructorGuards(t *testing.T) {
