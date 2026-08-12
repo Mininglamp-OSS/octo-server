@@ -1643,7 +1643,7 @@ func (u *User) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	loginSpan := u.ctx.Tracer().StartSpan(
 		"login",
 		opentracing.ChildOf(c.GetSpanContext()),
@@ -1728,7 +1728,7 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 
 	c.Response(result)
 
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, publicIP, loginType)
 }
 
@@ -2864,7 +2864,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	u.applyRealnameToAuthCodeMap(resp, userModel.UID)
 	redemptionAudit.MarkCompleted()
 	c.Response(resp)
-	u.finishSuccessfulLogin(userModel.UID, userModel.Username, util.GetClientPublicIP(c.Request), "scan_login")
+	u.finishSuccessfulLogin(userModel.UID, userModel.Username, wkhttp.ClientIP(c.Request), "scan_login")
 }
 
 // 获取二维码数据的管道
@@ -3598,7 +3598,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
 	u.applyRealnameToLoginResp(resp, userInfo.UID)
 	c.Response(resp)
-	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, util.GetClientPublicIP(c.Request), "phone_verify")
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, wkhttp.ClientIP(c.Request), "phone_verify")
 }
 
 // customerservices 客服列表
@@ -4091,7 +4091,7 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, func() error {
 		err := tx.Commit()
 		if err != nil {
@@ -4111,7 +4111,7 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 }
 
 func (u *User) createUserTx(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, commitCallback func() error, invite *model.Invite, tx *dbr.Tx) {
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, commitCallback)
 	if err != nil {
 		respondUserError(c, errcode.ErrUserRegisterFailed)

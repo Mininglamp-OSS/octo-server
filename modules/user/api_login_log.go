@@ -27,10 +27,10 @@ func NewLoginLog(ctx *config.Context) *LoginLog {
 // 信息"，审计侧也需要可 SQL 检索的登录历史。
 const loginEventLogMsg = "login_event"
 
-// normalizeLoginIP 把代理头中的候选值收窄为规范 IP 文本。
-// GetClientPublicIP 为兼容现有反向代理会优先返回 X-Forwarded-For，该值在
-// 代理信任边界配错时可由客户端控制。审计入库边界必须再校验：非 IP 存空串，
-// 而不是让超长值撑爆 login_log.login_ip VARCHAR(40) 并丢失整条记录。
+// normalizeLoginIP 把代理层选出的候选值收窄为规范 IP 文本。
+// 代理信任边界由 wkhttp.ClientIP 与部署配置负责；这里保留入库前的纵深校验：
+// 非 IP 存空串，而不是让异常或超长值撑爆 login_log.login_ip VARCHAR(40)
+// 并丢失整条记录。
 func normalizeLoginIP(value string) string {
 	ip := net.ParseIP(strings.TrimSpace(value))
 	if ip == nil {

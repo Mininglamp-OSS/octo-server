@@ -49,6 +49,17 @@ func (f *fakeAudit) events() []AuditEvent {
 	return out
 }
 
+func (f *fakeAudit) ipForEvent(event AuditEvent) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, entry := range f.entries {
+		if entry.Event == event {
+			return entry.IP
+		}
+	}
+	return ""
+}
+
 // fakeAuthcode 内存版 ThirdAuthcode 写入,用于 handler 测试。
 // failNext > 0 时下一次 Set 调用会返错(模拟 Redis 抖动),用完自减。
 type fakeAuthcode struct {
@@ -172,6 +183,33 @@ func TestAPI_Authorize_RedirectsToIdP(t *testing.T) {
 	}
 }
 
+func TestAPI_Authorize_StoresProxyAwareClientIP(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=ac-ip", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	loc, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse location: %v", err)
+	}
+	state := loc.Query().Get("state")
+	if state == "" {
+		t.Fatal("missing state in authorize redirect")
+	}
+	sd, err := o.stateStore.Consume(context.Background(), state)
+	if err != nil {
+		t.Fatalf("consume state: %v", err)
+	}
+	if sd.IP != "198.51.100.24" {
+		t.Fatalf("StateData.IP = %q, want trusted rightmost XFF", sd.IP)
+	}
+}
+
 // authorize 缺 authcode 应 400。
 func TestAPI_Authorize_MissingAuthcode(t *testing.T) {
 	mp := NewMockProvider(t)
@@ -254,6 +292,7 @@ func TestAPI_Callback_E2E_ExistingUser(t *testing.T) {
 
 	// Step 1: authorize → 拿到 state
 	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=front-ac&return_to=/home", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusFound {
@@ -284,7 +323,7 @@ func TestAPI_Callback_E2E_ExistingUser(t *testing.T) {
 	if len(users.loginCalls) != 1 {
 		t.Fatalf("expected 1 IssueSession call, got %d", len(users.loginCalls))
 	}
-	if c := users.loginCalls[0]; c.UID != "u-existing" || c.CreateUser {
+	if c := users.loginCalls[0]; c.UID != "u-existing" || c.CreateUser || c.PublicIP != "198.51.100.24" {
 		t.Errorf("IssueSession call wrong: %+v", c)
 	}
 }
@@ -420,9 +459,9 @@ func TestAPI_Callback_RateLimited(t *testing.T) {
 	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
 	o.cbGuard = NewCallbackGuard(newCallbackGuardRedis(t), 3, 5*time.Minute)
 
-	// 直接把计数顶到阈值。GetClientPublicIP 在无 X-Forwarded-For 时
-	// 会返回 RemoteAddr 的 IP,httptest 默认 192.0.2.1。
-	const testIP = "192.0.2.1"
+	// 直接把真实来源计数顶到阈值。请求随后携带一个伪造的最左 XFF；callback
+	// 必须仍命中最右侧真实来源的桶，而不是让攻击者靠改最左项绕过阈值。
+	const testIP = "198.51.100.24"
 	o.cbGuard.Reset(testIP)
 	t.Cleanup(func() { o.cbGuard.Reset(testIP) })
 	for i := 0; i < 3; i++ {
@@ -434,11 +473,48 @@ func TestAPI_Callback_RateLimited(t *testing.T) {
 	r := newTestRouter(o)
 	req := httptest.NewRequest("GET",
 		"/v1/auth/oidc/aegis/callback?state=any&code=x", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, "+testIP)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// ClientIP 对畸形最终 XFF 返回空串；callback guard 必须把这种请求归入稳定的
+// unknown-IP 桶，而不是因为没有可用 IP 就跳过失败计数。
+func TestAPI_Callback_InvalidFinalXFFUsesUnknownBucket(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.cbGuard = NewCallbackGuard(newCallbackGuardRedis(t), 3, 5*time.Minute)
+
+	const unknownIP = "__unknown_ip__"
+	unknownKey := o.cbGuard.key(unknownIP)
+	if err := o.cbGuard.redis.Del(unknownKey); err != nil {
+		t.Fatalf("clear unknown-IP callback bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = o.cbGuard.redis.Del(unknownKey) })
+
+	r := newTestRouter(o)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest("GET",
+			"/v1/auth/oidc/aegis/callback?state=never-saved&code=x", nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.10, not-an-ip")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d status = %d, want 400; body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state=never-saved&code=x", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, not-an-ip")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status after unknown-IP threshold = %d, want 429; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -462,6 +538,7 @@ func TestAPI_Callback_AuditTrail(t *testing.T) {
 
 	// 成功路径
 	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=ac-ok&return_to=/", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	authURL, _ := url.Parse(w.Header().Get("Location"))
@@ -482,6 +559,9 @@ func TestAPI_Callback_AuditTrail(t *testing.T) {
 	}
 	if !foundOK {
 		t.Errorf("expected EventCallbackOK in audit, got %v", events)
+	}
+	if got := audit.ipForEvent(EventCallbackOK); got != "198.51.100.24" {
+		t.Errorf("EventCallbackOK IP = %q, want trusted rightmost XFF", got)
 	}
 }
 

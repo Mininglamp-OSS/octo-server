@@ -17,6 +17,7 @@ const (
 	defaultCallbackFailThreshold = 10
 	defaultCallbackFailWindow    = 5 * time.Minute
 	callbackFailKeyPrefix        = "oidc:cb:fail:"
+	callbackUnknownIPKey         = "__unknown_ip__"
 )
 
 // ErrCallbackBlocked /callback 同 IP 失败次数过多,临时锁定。
@@ -50,11 +51,20 @@ func NewCallbackGuard(r *redis.Conn, threshold int64, window time.Duration) *Cal
 	return &CallbackGuard{redis: r, threshold: threshold, window: window}
 }
 
-func normalizeIP(ip string) string { return strings.TrimSpace(ip) }
+func normalizeIP(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		// wkhttp.ClientIP 对畸形或歧义的代理头 fail-closed 返回空串。与共享
+		// IP limiter 保持同一语义：归入稳定的 unknown-IP 桶，不能跳过保护。
+		return callbackUnknownIPKey
+	}
+	return ip
+}
 
 func (g *CallbackGuard) key(ip string) string { return callbackFailKeyPrefix + ip }
 
-// Check 失败计数已达阈值返回 ErrCallbackBlocked,否则放行。空 IP 视为无效标识直接放行。
+// Check 失败计数已达阈值返回 ErrCallbackBlocked,否则放行。空 IP 归入共享的
+// unknown-IP 桶，避免畸形代理头绕过保护。
 //
 // fail-open:Redis 抖动时不锁,与 LoginGuard 一致。基础设施层网关 cap 兜底 DoS。
 //
@@ -64,9 +74,6 @@ func (g *CallbackGuard) Check(ip string) error {
 		return nil
 	}
 	ip = normalizeIP(ip)
-	if ip == "" {
-		return nil
-	}
 	s, err := g.redis.GetString(g.key(ip))
 	if err != nil {
 		log.Warn("CallbackGuard Check 读取失败,fail-open", zap.String("ip", ip), zap.Error(err))
@@ -92,9 +99,6 @@ func (g *CallbackGuard) RecordFailure(ip string) error {
 		return nil
 	}
 	ip = normalizeIP(ip)
-	if ip == "" {
-		return nil
-	}
 	key := g.key(ip)
 	if _, err := g.redis.Incr(key); err != nil {
 		return fmt.Errorf("incr callback failure: %w", err)
@@ -112,9 +116,6 @@ func (g *CallbackGuard) Reset(ip string) error {
 		return nil
 	}
 	ip = normalizeIP(ip)
-	if ip == "" {
-		return nil
-	}
 	if err := g.redis.Del(g.key(ip)); err != nil {
 		return fmt.Errorf("del callback failure: %w", err)
 	}
