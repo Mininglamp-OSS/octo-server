@@ -3,6 +3,7 @@ package botfather
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -417,18 +418,57 @@ func TestDeleteCreatedBotArtifactsFallsBackToCredentialRevocation(t *testing.T) 
 	}
 	db := &botfatherDB{session: conn.NewSession(nil)}
 	deleteErr := errors.New("synthetic cleanup delete failure")
+	const (
+		creatorUID = "user_synthetic_cleanup_creator"
+		botID      = "bot_synthetic_cleanup"
+	)
 
 	mock.ExpectBegin()
-	mock.ExpectExec("DELETE FROM .*friend.*").WillReturnError(deleteErr)
+	mock.ExpectExec(regexp.QuoteMeta(
+		"DELETE FROM friend WHERE (uid=? AND to_uid=?) OR (uid=? AND to_uid=?)",
+	)).
+		WithArgs(creatorUID, botID, botID, creatorUID).
+		WillReturnError(deleteErr)
 	mock.ExpectRollback()
 	mock.ExpectExec("UPDATE robot SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE user SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE space_member SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE app SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
 
-	cleanupErr := db.deleteCreatedBotArtifacts("bot_synthetic_cleanup")
+	cleanupErr := db.deleteCreatedBotArtifacts(creatorUID, botID)
 
 	assert.ErrorIs(t, cleanupErr, deleteErr)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDeleteCreatedBotArtifactsDeletesOnlyCreatorFriendPairs(t *testing.T) {
+	rawDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer rawDB.Close()
+	conn := &dbr.Connection{
+		DB:            rawDB,
+		EventReceiver: &dbr.NullEventReceiver{},
+		Dialect:       dialect.MySQL,
+	}
+	db := &botfatherDB{session: conn.NewSession(nil)}
+	const (
+		creatorUID = "user_synthetic_cleanup_creator"
+		botID      = "bot_synthetic_cleanup"
+	)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(
+		"DELETE FROM friend WHERE (uid=? AND to_uid=?) OR (uid=? AND to_uid=?)",
+	)).
+		WithArgs(creatorUID, botID, botID, creatorUID).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("DELETE FROM .*space_member.*").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("DELETE FROM .*user.*").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("DELETE FROM .*robot.*").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("DELETE FROM .*app.*").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, db.deleteCreatedBotArtifacts(creatorUID, botID))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
