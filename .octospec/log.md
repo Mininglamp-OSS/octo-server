@@ -4,6 +4,32 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-12 (profile-visibility-system-bot-whitelist)
+
+- **Task** — `profile-visibility-system-bot-whitelist`: took the public-bot
+  exemption in the shared person-profile visibility decision off the writable
+  `user.category` column and put it on the `pkg/space.SystemBots` whitelist, so a
+  `category=system` row that is not a system bot — the superuser account, which
+  has a fixed guessable UID — no longer skips the Space, friend, and common-group
+  legs. The input field was renamed `SystemAccount` to `SystemBot` to close the
+  wiring that caused the defect, and both endpoints moved together. Recorded as a
+  narrowing of the authorization input, not an incident fix: no material
+  disclosure was reproduced. The two endpoints differ, and the record states them
+  separately — `/v1/users/:uid` withheld the short number via the `Follow` gate at
+  `modules/user/api.go:1431-1436`, while `/v1/channels/:id/:type` has no such gate
+  and did hand a stranger the superuser's `extra.short_no` plus online state. That
+  value is a public seed constant in this repository and carries no PII and no
+  capability; `username` and `vercode` were checked and never reached a stranger.
+  Two inherited tests had asserted the defective behavior and were rewritten, with
+  reverse regressions added on both endpoints for `system` and `customerService`.
+  **Operators upgrading**: any human support account sitting on
+  `category=customerService` with `robot=0` degrades to the minimal profile set on
+  deploy; `SystemBots` is a compile-time literal, so the supported remedies are
+  adding the UID to that whitelist, marking the account `robot=1`, or relying on a
+  normal relationship path. Focused MySQL-backed runs and the prior authorization
+  matrix pass, before and after rebase. See
+  [journal](journal/shared/profile-visibility-system-bot-whitelist.md).
+
 ## 2026-08-12 (botfather-space-binding-hardening)
 
 - **Task** — `botfather-space-binding-hardening`: made the server authoritative

@@ -1299,13 +1299,15 @@ func (u *User) get(c *wkhttp.Context) {
 	// 判定与 /v1/channels/:id/:type 共用 channel/service，两端口径不会漂移。
 	// 与 channelGet 最小集的差异：这里**保留** follow —— 资料页要靠它渲染加好友入口，
 	// 省略会让"陌生人可加好友"这个正常入口消失（channelGet 是发送者渲染，不需要）。
-	// 身份类放行（本人 / bot / 系统账号）先判定，不命中才付关系查询的代价。
+	// 身份类放行（本人 / bot / 系统 Bot）先判定，不命中才付关系查询的代价。
 	// SyntheticIdentity 恒为 false：iwh_ 前缀在上方已提前 return，走不到这里。
+	// SystemBot 走 pkg/space.SystemBots 白名单，不看 category 字段——category=system 的
+	// 非白名单账号（如 admin 超管号）必须回落到关系检查，否则整份身份被任意用户读走。
 	fastPath := chservice.PersonProfileInput{
-		LoginUID:      loginUID,
-		PeerUID:       uid,
-		SystemAccount: userDetailResp.Category == CategorySystem || userDetailResp.Category == CategoryCustomerService,
-		Robot:         userDetailResp.Robot == 1,
+		LoginUID:  loginUID,
+		PeerUID:   uid,
+		SystemBot: spacepkg.IsSystemBot(uid),
+		Robot:     userDetailResp.Robot == 1,
 	}
 	visible, err := chservice.PersonProfileVisible(fastPath, nil)
 	if err == nil && !visible {

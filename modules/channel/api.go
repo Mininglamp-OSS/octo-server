@@ -317,13 +317,14 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 // modules/channel/service（与 /v1/users/:uid 共用，避免两端口径漂移）；这里只负责把
 // 本模块能看到的目标属性翻译成该函数的输入。
 func (ch *Channel) personProfileVisible(loginUID string, peerID string, resp *model.ChannelResp) (bool, error) {
-	// 身份类放行（本人 / webhook / bot / 系统账号）不需要查关系，先判定；只有都不命中
-	// 才付出 HasAuthzRelation 的查询代价。
+	// 身份类放行（本人 / webhook / bot / 系统 Bot）不需要查关系，先判定；只有都不命中
+	// 才付出 HasAuthzRelation 的查询代价。系统 Bot 走 pkg/space.SystemBots 白名单，不看
+	// category 字段——category=system 的非白名单账号必须回落到关系检查，避免整份身份泄露。
 	fastPath := chservice.PersonProfileInput{
 		LoginUID:          loginUID,
 		PeerUID:           peerID,
 		SyntheticIdentity: strings.HasPrefix(peerID, user.WebhookUIDPrefix),
-		SystemAccount:     resp.Category == user.CategorySystem || resp.Category == user.CategoryCustomerService,
+		SystemBot:         spacepkg.IsSystemBot(peerID),
 		Robot:             resp.Robot == 1,
 	}
 	if visible, err := chservice.PersonProfileVisible(fastPath, nil); err != nil || visible {
