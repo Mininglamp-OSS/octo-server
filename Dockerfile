@@ -29,7 +29,7 @@ RUN GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) && \
     GIT_TREE_STATE=$(test -n "`git status --porcelain 2>/dev/null`" && echo "dirty" || echo "clean") && \
     CGO_ENABLED=0 GOOS=linux go build \
       -ldflags="-w -extldflags '-static' -X main.Commit=$GIT_COMMIT -X main.CommitDate=$GIT_COMMIT_DATE -X main.Version=$GIT_VERSION -X main.TreeState=$GIT_TREE_STATE" \
-      -installsuffix cgo -o app ./main.go
+      -installsuffix cgo -o app .
 
 
 FROM alpine:3.21 AS prod
