@@ -1,6 +1,8 @@
 package botfather
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -12,6 +14,10 @@ type botfatherDB struct {
 	session *dbr.Session
 	ctx     *config.Context
 }
+
+var errCreateBotSpaceDenied = errors.New("bot creation Space authorization denied")
+var errCreateBotSpaceBindingFailed = errors.New("bot creation Space binding failed")
+var errCreateBotPersistenceFailed = errors.New("bot creation persistence failed")
 
 func newBotfatherDB(ctx *config.Context) *botfatherDB {
 	return &botfatherDB{
@@ -79,6 +85,189 @@ func (d *botfatherDB) queryRobotsByCreatorUIDAndSpaceID(creatorUID, spaceID stri
 		spaceID, creatorUID,
 	).Load(&list)
 	return list, err
+}
+
+// resolveAuthorizedCreationSpace treats selectedSpaceID as an untrusted
+// selector. An explicit selector must identify an active Space in which the
+// active creator is an active member. Without a selector, exactly one such
+// Space must exist; LIMIT 2 distinguishes unique from ambiguous without
+// relying on row order.
+func (d *botfatherDB) resolveAuthorizedCreationSpace(creatorUID, selectedSpaceID string) (string, error) {
+	// Bot provisioning intentionally treats an account in the deletion cooling-off
+	// period as inactive, even though ordinary messaging remains available.
+	const activeMembershipSQL = `
+		SELECT sm.space_id
+		FROM user u
+		INNER JOIN space_member sm ON sm.uid = u.uid
+		INNER JOIN space s ON s.space_id = sm.space_id
+		WHERE u.uid = ? AND u.status = 1 AND u.is_destroy = 0
+		  AND sm.status = 1 AND s.status = 1`
+
+	if selectedSpaceID != "" {
+		var authorizedSpaceID string
+		err := d.session.SelectBySql(
+			activeMembershipSQL+" AND sm.space_id = ?",
+			creatorUID,
+			selectedSpaceID,
+		).LoadOne(&authorizedSpaceID)
+		if errors.Is(err, dbr.ErrNotFound) {
+			return "", errCreateBotSpaceDenied
+		}
+		if err != nil {
+			return "", fmt.Errorf("resolve Bot creation Space: %w", err)
+		}
+		return authorizedSpaceID, nil
+	}
+
+	var activeSpaceIDs []string
+	_, err := d.session.SelectBySql(activeMembershipSQL+" LIMIT 2", creatorUID).Load(&activeSpaceIDs)
+	if err != nil {
+		return "", fmt.Errorf("derive Bot creation Space: %w", err)
+	}
+	if len(activeSpaceIDs) != 1 {
+		return "", errCreateBotSpaceDenied
+	}
+	return activeSpaceIDs[0], nil
+}
+
+// bindCreatedBotToSpace is the final authorization check and membership write.
+// Lock in user -> space -> space_member order; future transactions must not lock
+// a Space member before its parent Space. Locking the authority rows before the
+// INSERT prevents a stale preflight decision from authorizing the commit after a
+// concurrent disable/removal.
+func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return fmt.Errorf("begin Bot Space binding: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var creator struct {
+		Status    int
+		IsDestroy int
+	}
+	err = tx.SelectBySql(
+		"SELECT status, is_destroy FROM user WHERE uid=? FOR UPDATE",
+		creatorUID,
+	).LoadOne(&creator)
+	if errors.Is(err, dbr.ErrNotFound) || (err == nil && (creator.Status != 1 || creator.IsDestroy != 0)) {
+		return errCreateBotSpaceDenied
+	}
+	if err != nil {
+		return fmt.Errorf("lock Bot creator: %w", err)
+	}
+
+	var spaceStatus int
+	err = tx.SelectBySql(
+		"SELECT status FROM space WHERE space_id=? FOR UPDATE",
+		spaceID,
+	).LoadOne(&spaceStatus)
+	if errors.Is(err, dbr.ErrNotFound) || (err == nil && spaceStatus != 1) {
+		return errCreateBotSpaceDenied
+	}
+	if err != nil {
+		return fmt.Errorf("lock Bot target Space: %w", err)
+	}
+
+	var membershipStatus int
+	err = tx.SelectBySql(
+		"SELECT status FROM space_member WHERE space_id=? AND uid=? FOR UPDATE",
+		spaceID,
+		creatorUID,
+	).LoadOne(&membershipStatus)
+	if errors.Is(err, dbr.ErrNotFound) || (err == nil && membershipStatus != 1) {
+		return errCreateBotSpaceDenied
+	}
+	if err != nil {
+		return fmt.Errorf("lock Bot creator membership: %w", err)
+	}
+
+	result, err := tx.InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceID,
+		robotID,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("insert Bot Space membership: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check Bot Space membership insert: %w", err)
+	}
+	if affected != 1 {
+		return errors.New("insert Bot Space membership: unexpected affected rows")
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit Bot Space binding: %w", err)
+	}
+	return nil
+}
+
+// deleteCreatedBotArtifacts compensates a failed post-core Space binding. The
+// hard delete clears every newly-created credential-bearing row atomically. The
+// creator UID confines friendship cleanup to the two newly-created pair rows,
+// preserving the friend table's (uid, to_uid) index access path.
+// If that transaction fails, best-effort fail-closed updates disable the Bot
+// and blank credentials so cleanup failure cannot leave a usable active Bot.
+func (d *botfatherDB) deleteCreatedBotArtifacts(creatorUID, robotID string) error {
+	tx, err := d.session.Begin()
+	if err == nil {
+		steps := []func() error{
+			func() error {
+				_, stepErr := tx.DeleteFrom("friend").
+					Where("(uid=? AND to_uid=?) OR (uid=? AND to_uid=?)", creatorUID, robotID, robotID, creatorUID).
+					Exec()
+				return stepErr
+			},
+			func() error {
+				_, stepErr := tx.DeleteFrom("space_member").Where("uid=?", robotID).Exec()
+				return stepErr
+			},
+			func() error {
+				_, stepErr := tx.DeleteFrom("user").Where("uid=? AND robot=1", robotID).Exec()
+				return stepErr
+			},
+			func() error {
+				_, stepErr := tx.DeleteFrom("robot").Where("robot_id=?", robotID).Exec()
+				return stepErr
+			},
+			func() error {
+				_, stepErr := tx.DeleteFrom("app").Where("app_id=?", robotID).Exec()
+				return stepErr
+			},
+		}
+		for _, step := range steps {
+			if err = step(); err != nil {
+				_ = tx.Rollback()
+				break
+			}
+		}
+		if err == nil {
+			if err = tx.Commit(); err == nil {
+				return nil
+			}
+		}
+	}
+
+	cleanupErr := err
+	failClosedStatements := []struct {
+		query string
+		args  []interface{}
+	}{
+		{
+			query: "UPDATE robot SET status=0, username='', token='', bot_token='' WHERE robot_id=?",
+			args:  []interface{}{robotID},
+		},
+		{query: "UPDATE user SET status=0 WHERE uid=? AND robot=1", args: []interface{}{robotID}},
+		{query: "UPDATE space_member SET status=0 WHERE uid=?", args: []interface{}{robotID}},
+		{query: "UPDATE app SET status=0, app_key='' WHERE app_id=?", args: []interface{}{robotID}},
+	}
+	for _, statement := range failClosedStatements {
+		if _, updateErr := d.session.UpdateBySql(statement.query, statement.args...).Exec(); updateErr != nil {
+			cleanupErr = errors.Join(cleanupErr, updateErr)
+		}
+	}
+	return cleanupErr
 }
 
 func (d *botfatherDB) queryUserNamesByUsernames(usernames []string) (map[string]string, error) {

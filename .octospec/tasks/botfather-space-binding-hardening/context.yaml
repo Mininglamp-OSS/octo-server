@@ -1,0 +1,50 @@
+schema_version: 1
+task: botfather-space-binding-hardening
+brief: .octospec/tasks/botfather-space-binding-hardening/brief.md
+resolved_at: 2026-08-12T00:40:00+08:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      BotFather creation writes a Bot membership into space_member. The inbound
+      Space ID is only an untrusted selector; active creator, Space, and creator
+      membership must be checked fail-closed again at the binding commit.
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    why: >
+      space_id originates in a WuKongIM payload or legacy channel prefix and
+      cannot authorize a cross-Space write. Missing selectors may be derived
+      only from exactly one server-verified active creator Space.
+  - id: error-handling
+    source: repo
+    load_bearing: true
+    why: >
+      Rejections retain the existing localized generic BotFather creation
+      failure and must not reveal whether a submitted Space exists or why the
+      authorization check failed.
+  - id: rate-limit
+    source: repo
+    load_bearing: false
+    why: >
+      No HTTP route or request-frequency policy changes. The existing message
+      ingestion limits remain unchanged and no custom Redis limiter is added.
+  - id: testing
+    source: repo
+    load_bearing: true
+    why: >
+      The P0 regression tests exercise the real createBot persistence boundary
+      with synthetic users and Spaces, including negative authorization,
+      ambiguous fallback, compensation, and authorized creation paths.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Implement records sanitized RED and GREEN evidence but creates no commit;
+      a later Finish phase will use an English Conventional Commit subject.
+
+security_notes:
+  - Production identifiers, domains, Bot tokens, and message bodies are excluded.
+  - Logs and tests use bounded reason values or synthetic identifiers only.
