@@ -28,13 +28,27 @@ source: user
 - Keep the existing generic localized creation-failure reply. New security logs
   contain only bounded reason values and no identifiers, payloads, or tokens.
 
+## Review hardening
+
+- Scoped friendship compensation to the two creator/Bot directions instead of
+  scanning every row that mentions the newly-created Bot. The predicate uses
+  the existing paired friendship index; a local `EXPLAIN` confirmed indexed
+  range access rather than a full-table scan.
+- Made the final binding transaction use the normal deferred rollback guard,
+  documented its `user -> space -> space_member` lock order, and keep
+  membership timestamps database-authoritative with `NOW()`.
+- Added focused SQL-mock coverage for a zero-row membership insert and for a
+  failed transaction begin. Both outcomes return failure and do not reach a
+  success commit.
+
 ## Verification
 
 - `go test ./modules/botfather/... -count=1 -coverprofile=...`: PASS with a
-  synthetic test-only master key. The BotFather package reports 40.4% statement
+  synthetic test-only master key and branch-isolated MySQL/Redis. The BotFather
+  package reports 40.4% statement
   coverage (legacy package-wide baseline); the changed authorization/binding
   functions report 88.6% (`createBot`), 100.0%
-  (`resolveAuthorizedCreationSpace`), 80.6% (`bindCreatedBotToSpace`), and 96.2%
+  (`resolveAuthorizedCreationSpace`), 84.8% (`bindCreatedBotToSpace`), and 96.2%
   (`deleteCreatedBotArtifacts`).
 - The regression suite includes real MySQL persistence tests for forged,
   missing, inactive, removed, ambiguous, authorized, concurrent-change, query
@@ -42,11 +56,16 @@ source: user
 - The end-to-end test drives the actual BotFather message state machine for a
   rejected forged selector and an authorized creation, then verifies `/mybots`
   Space isolation from persisted rows.
-- Focused `go test -race`, `go vet ./modules/botfather/...`,
-  `golangci-lint run ./modules/botfather/...`, `make i18n-extract-check`, and
-  `make i18n-lint`: PASS.
-- Local MySQL, Redis, and WuKongIM checks passed. Cleanup verification found no
-  residual test trigger, synthetic Bot/user rows, or BotFather state keys.
+- Focused real-message-flow E2E re-ran in the branch-isolated MySQL/Redis and
+  WuKongIM environment: a forged selector was rejected; an authorized
+  selector created exactly one persisted membership and remained isolated in
+  `/mybots`. The relevant `go test -race` target, `go build`, `go vet
+  ./modules/botfather/...`, `golangci-lint run ./modules/botfather/...`,
+  `make i18n-extract-check`, and `make i18n-lint`: PASS.
+- Local MySQL, Redis, and WuKongIM checks passed. The branch-isolated schema
+  had no residual synthetic rows or triggers after validation; that schema and
+  its dedicated Redis container were then removed without touching shared test
+  infrastructure.
 - Diff scan found no incident identifiers, production domains, message bodies,
   or credentials. Standalone `octospec-lint` is not installed; the task YAML
   parses and the brief/context/diff were checked manually against injected

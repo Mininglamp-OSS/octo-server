@@ -13,6 +13,9 @@ change-log convention (§7). Newest first.
   Missing selectors require exactly one active creator Space. Binding or core
   persistence failures compensate created artifacts and revoke credentials,
   while external failures remain generic and logs remain identifier-free.
+  Review hardening scopes friendship compensation to the newly-created
+  creator/Bot pair (indexed range access, not a full-table scan), documents the
+  binding lock order, and covers zero-row insert and begin-failure paths.
   MySQL-backed regression, end-to-end Space-isolation, race, coverage, vet,
   lint, i18n, cleanup, and redaction checks passed. See
   [journal](journal/shared/botfather-space-binding-hardening.md).
