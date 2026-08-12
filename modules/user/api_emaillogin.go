@@ -195,7 +195,7 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 		}
 	}()
 
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	registerSpan := u.ctx.Tracer().StartSpan(
 		"user.emailRegister",
 		opentracing.ChildOf(c.GetSpanContext()),
@@ -256,7 +256,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "")
 		return
 	}
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	// 仅密码登录走 guard；验证码登录有独立的发送频控 + 验证次数限制，不纳入 guard 计数。
 	if req.Password != "" {
 		if err := u.loginGuard.Check(req.Email); err != nil {

@@ -96,7 +96,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	loginSpan := u.ctx.Tracer().StartSpan(
 		"login",
 		opentracing.ChildOf(c.GetSpanContext()),
@@ -209,7 +209,7 @@ func (u *User) registerWithUsername(username string, name string, password strin
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	result, err := u.createUserWithRespAndTx(registerSpanCtx, model, publicIP, nil, tx, func() error {
 		err := tx.Commit()
 		if err != nil {

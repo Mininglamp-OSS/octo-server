@@ -35,6 +35,30 @@ func TestTokenDeadlineOverHTTP(t *testing.T) {
 	})
 }
 
+func TestLoginFailureAuditUsesProxyAwareIPOverHTTP(t *testing.T) {
+	server, ctx, _, _ := newTokenHTTPTestServer(t)
+	username := "missing-login-" + util.GenerUUID()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/user/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"username": username,
+		"password": "wrong-password",
+		"flag":     int(config.Web),
+	}))))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
+	server.GetRoute().ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusBadRequest, recorder.Code, "body=%s", recorder.Body.String())
+
+	var rows []*LoginLogModel
+	_, err := ctx.DB().Select("*").From("login_log").
+		Where("login_type=?", "username").OrderAsc("id").Load(&rows)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, loginStatusFailure, rows[0].Status)
+	require.Equal(t, "198.51.100.24", rows[0].LoginIP)
+}
+
 func TestLocalCredentialCannotCrossPasswordChangeBeforeIssueFence(t *testing.T) {
 	t.Setenv("OCTO_AUTH_SESSION_MODE", string(auth.SessionModeV3Write))
 	t.Setenv("OCTO_AUTH_SESSION_MAX_PER_UID", "10")

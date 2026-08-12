@@ -311,7 +311,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
-	publicIP := util.GetClientPublicIP(c.Request)
+	publicIP := wkhttp.ClientIP(c.Request)
 	// 登录失败统一返回 ErrUserInvalidCredentials，避免攻击者通过"用户不存在"
 	// 与"密码错误"的响应差异枚举有效管理账号（与 /v1/user login 反枚举一致）。
 	if userInfo == nil || userInfo.UID == "" {

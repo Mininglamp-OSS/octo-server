@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
@@ -409,13 +408,10 @@ func stateFromCtx(c *wkhttp.Context) *StateData {
 	}
 }
 
-// clientIP 抽出来避免对 util 包的多余依赖;直接读 Request.RemoteAddr 兜底。
-// 生产路径前置代理时由 util.GetClientPublicIP 透 X-Forwarded-For,这里测试
-// 走 httptest 不会有代理,RemoteAddr 即真实 IP。
+// clientIP 与共享限流复用同一代理感知取值路径，避免审计和限流对同一请求记录
+// 不同来源。测试走 httptest 时没有代理，wkhttp.ClientIP 会回退到 RemoteAddr。
 func clientIP(c *wkhttp.Context) string {
-	// 透 util 而非 net.SplitHostPort:与 callback 路径行为对齐,避免反向代理头
-	// 解析差异引入审计字段不一致。
-	return util.GetClientPublicIP(c.Request)
+	return wkhttp.ClientIP(c.Request)
 }
 
 // bindResultFromErr 把 BindService 返回的 error 翻译成 metric result label。

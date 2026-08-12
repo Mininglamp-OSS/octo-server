@@ -1,10 +1,13 @@
 package user
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,12 +25,16 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 
 	l := NewLoginLog(ctx)
 	logDB := NewLoginLogDB(ctx.DB())
+	successReq := httptest.NewRequest(http.MethodPost, "/v1/user/login", nil)
+	successReq.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.24")
+	failureReq := httptest.NewRequest(http.MethodPost, "/v1/user/login", nil)
+	failureReq.Header.Set("X-Forwarded-For", "203.0.113.11, 198.51.100.25")
 
 	// 手机号注册用户的 username 就是 zone+phone，正是不能落明文的那种输入
 	const phoneAccount = "008613800001234"
-	l.recordSuccess("u-1", phoneAccount, "1.2.3.4", "username")
-	l.recordFailure("bob@example.com", "5.6.7.8", "email")
-	l.recordFailure("bob@example.com", "5.6.7.8", "email")
+	l.recordSuccess("u-1", phoneAccount, wkhttp.ClientIP(successReq), "username")
+	l.recordFailure("bob@example.com", wkhttp.ClientIP(failureReq), "email")
+	l.recordFailure("bob@example.com", wkhttp.ClientIP(failureReq), "email")
 	l.recordFailure("x@13800001234", strings.Repeat("9", 41), "username")
 
 	var rows []*LoginLogModel
@@ -38,11 +45,14 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 	assert.Equal(t, "u-1", rows[0].UID)
 	assert.Equal(t, loginStatusSuccess, rows[0].Status)
 	assert.Equal(t, "username", rows[0].LoginType)
+	assert.Equal(t, "198.51.100.24", rows[0].LoginIP, "success audit must ignore forged leftmost XFF")
 
 	assert.Equal(t, "", rows[1].UID, "failed attempts must not carry a uid")
 	assert.Equal(t, loginStatusFailure, rows[1].Status)
 	assert.Equal(t, loginStatusFailure, rows[2].Status)
 	assert.Equal(t, loginStatusFailure, rows[3].Status)
+	assert.Equal(t, "198.51.100.25", rows[1].LoginIP, "failure audit must ignore forged leftmost XFF")
+	assert.Equal(t, "198.51.100.25", rows[2].LoginIP, "repeated failure must retain the trusted source")
 	assert.Empty(t, rows[3].LoginIP, "invalid attacker-controlled XFF must not drop the audit row")
 
 	// 关键契约：整张表不得出现账号明文
@@ -71,7 +81,7 @@ func TestLoginLog_RecordSuccessAndFailure_Integration(t *testing.T) {
 	last, err := logDB.queryLastLoginIP("u-1")
 	require.NoError(t, err)
 	require.NotNil(t, last)
-	assert.Equal(t, "1.2.3.4", last.LoginIP)
+	assert.Equal(t, "198.51.100.24", last.LoginIP)
 }
 
 func TestMaskLoginAccount(t *testing.T) {
