@@ -33,6 +33,7 @@ func TestInitializeSessionRolloutUsesMySQLAuthorityAcrossBoots(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, SessionModeExpand, state.Floor)
 	require.EqualValues(t, 1, state.Version)
+	require.Equal(t, state.Version, boot.Version)
 
 	cachedBoot, cachedControl, err := InitializeSessionRollout(first)
 	require.NoError(t, err)
@@ -42,19 +43,29 @@ func TestInitializeSessionRolloutUsesMySQLAuthorityAcrossBoots(t *testing.T) {
 	require.Equal(t, boot, recordedBoot)
 	require.NotEmpty(t, warnings, "explicitly empty legacy env values are reported instead of silently guessed")
 
+	updated, err := control.SetMaxPerUID(context.Background(), state, 7, "integration-test")
+	require.NoError(t, err)
+	require.Equal(t, 7, updated.MaxPerUID)
+	require.EqualValues(t, 2, updated.Version)
+	last, err := control.LastAdvance(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "set-cap", last.Kind)
+	require.Equal(t, &RolloutCapChange{FromMaxPerUID: 20, ToMaxPerUID: 7}, last.CapChange)
+
 	second := newRolloutIntegrationContext(t, dsn, tokenPrefix, uidPrefix)
 	secondStore := SessionStoreForContext(second)
 	normal, secondControl, err := InitializeSessionRollout(second)
 	require.NoError(t, err)
 	require.Equal(t, RolloutBootNormal, normal.Outcome)
 	require.Equal(t, state.Floor, normal.Floor)
-	require.Equal(t, state.MaxPerUID, normal.MaxPerUID)
+	require.Equal(t, updated.MaxPerUID, normal.MaxPerUID)
+	require.Equal(t, updated.Version, normal.Version)
 	require.ErrorIs(t, secondStore.CanIssue(), ErrWriterLeaseLost)
 
 	secondState, err := secondControl.Load(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, state.Floor, secondState.Floor)
-	require.Equal(t, state.Version, secondState.Version)
+	require.Equal(t, updated.Floor, secondState.Floor)
+	require.Equal(t, updated.Version, secondState.Version)
 }
 
 func TestInitializeSessionRolloutAdoptsLegacyRedisOnlyOnce(t *testing.T) {

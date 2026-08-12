@@ -276,6 +276,78 @@ func TestRolloutControlAdvanceRejectsInvalidTransitionBeforeTransaction(t *testi
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestRolloutControlSetMaxPerUIDCommitsAuditAndCASAtomically(t *testing.T) {
+	store, mock, cleanup := newMockRolloutControlStore(t)
+	defer cleanup()
+
+	current := RolloutState{Floor: SessionModeRevoke, MaxPerUID: 20, Version: 7}
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO octo_session_rollout_advance")).
+		WithArgs("revoke", "revoke", "operator", `{"from_max_per_uid":20,"to_max_per_uid":5}`, "", "", "set-cap").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE octo_session_rollout_state SET max_per_uid = ?, version = version + 1")).
+		WithArgs(5, int64(7), "revoke", 20).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	next, err := store.SetMaxPerUID(context.Background(), current, 5, "operator")
+	require.NoError(t, err)
+	require.Equal(t, SessionModeRevoke, next.Floor)
+	require.Equal(t, 5, next.MaxPerUID)
+	require.EqualValues(t, 8, next.Version)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRolloutControlSetMaxPerUIDRollsBackAuditWhenCASLoses(t *testing.T) {
+	store, mock, cleanup := newMockRolloutControlStore(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO octo_session_rollout_advance")).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE octo_session_rollout_state SET max_per_uid = ?, version = version + 1")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectRollback()
+
+	_, err := store.SetMaxPerUID(context.Background(), RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 20, Version: 7,
+	}, 5, "operator")
+	require.ErrorIs(t, err, ErrRolloutControlChanged)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRolloutControlSetMaxPerUIDRejectsUnsafeValuesBeforeTransaction(t *testing.T) {
+	store, mock, cleanup := newMockRolloutControlStore(t)
+	defer cleanup()
+	current := RolloutState{Floor: SessionModeRevoke, MaxPerUID: 20, Version: 7}
+
+	for _, value := range []int{0, -1, sessionMaxPerUIDLimit + 1} {
+		_, err := store.SetMaxPerUID(context.Background(), current, value, "operator")
+		require.Error(t, err, value)
+	}
+	unchanged, err := store.SetMaxPerUID(context.Background(), current, current.MaxPerUID, "operator")
+	require.NoError(t, err)
+	require.Equal(t, current, unchanged)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRolloutControlAdvanceHonorsItsWriteDeadline(t *testing.T) {
+	store, mock, cleanup := newMockRolloutControlStore(t)
+	defer cleanup()
+	store.writeTimeout = 20 * time.Millisecond
+	mock.ExpectBegin().WillDelayFor(500 * time.Millisecond)
+
+	started := time.Now()
+	_, err := store.Advance(context.Background(), RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 20, Version: 7,
+	}, RolloutAdvanceRecord{
+		From: SessionModeRevoke, To: SessionModeBounded, Actor: "reconciler",
+	})
+	require.Error(t, err)
+	require.Less(t, time.Since(started), 250*time.Millisecond,
+		"a blocked control write must not wait for the driver's full delay")
+}
+
 func TestRolloutControlPauseAndLastAdvance(t *testing.T) {
 	t.Run("pause increments control version", func(t *testing.T) {
 		store, mock, cleanup := newMockRolloutControlStore(t)
@@ -317,6 +389,22 @@ func TestRolloutControlPauseAndLastAdvance(t *testing.T) {
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 
+	t.Run("last transition decodes cap audit", func(t *testing.T) {
+		store, mock, cleanup := newMockRolloutControlStore(t)
+		defer cleanup()
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT from_floor, to_floor, actor, evidence_json, redis_run_id, writer_fingerprint, transition_kind")).
+			WillReturnRows(sqlmock.NewRows([]string{
+				"from_floor", "to_floor", "actor", "evidence_json", "redis_run_id", "writer_fingerprint", "transition_kind", "created_ms",
+			}).AddRow("revoke", "revoke", "operator", `{"from_max_per_uid":20,"to_max_per_uid":5}`, "", "", "set-cap", int64(123000)))
+
+		record, err := store.LastAdvance(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, "set-cap", record.Kind)
+		require.Equal(t, &RolloutCapChange{FromMaxPerUID: 20, ToMaxPerUID: 5}, record.CapChange)
+		require.Nil(t, record.Observation)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
 	t.Run("no advance is nil", func(t *testing.T) {
 		store, mock, cleanup := newMockRolloutControlStore(t)
 		defer cleanup()
@@ -349,7 +437,9 @@ func TestApplyAndPublishFailureKeepsIssuanceFenced(t *testing.T) {
 	store.UseWriterLease(registry)
 	require.NoError(t, store.CanIssue())
 
-	err := store.ApplyAndPublishRolloutState(registry, SessionModeBounded, 20)
+	err := store.ApplyAndPublishRolloutState(registry, RolloutState{
+		Floor: SessionModeBounded, MaxPerUID: 20, Version: 2,
+	}, SessionModeBounded)
 	require.ErrorContains(t, err, "registry unavailable")
 	require.Equal(t, SessionModeBounded, store.Mode(), "reader strictness must still apply")
 	require.ErrorIs(t, store.CanIssue(), ErrWriterLeaseLost,

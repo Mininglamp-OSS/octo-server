@@ -92,6 +92,68 @@ func TestSessionRolloutAdvanceRequiresBothForceAndYes(t *testing.T) {
 	}
 }
 
+type recordingRolloutCapSetter struct {
+	current auth.RolloutState
+	cap     int
+	actor   string
+}
+
+func (s *recordingRolloutCapSetter) SetMaxPerUID(
+	_ context.Context,
+	current auth.RolloutState,
+	maxPerUID int,
+	actor string,
+) (auth.RolloutState, error) {
+	s.current = current
+	s.cap = maxPerUID
+	s.actor = actor
+	current.MaxPerUID = maxPerUID
+	current.Version++
+	return current, nil
+}
+
+func TestSessionRolloutSetCapRequiresConfirmationAndValidBound(t *testing.T) {
+	ctx := context.Background()
+	current := auth.RolloutState{Floor: auth.SessionModeRevoke, MaxPerUID: 20, Version: 7}
+	for _, tc := range []struct {
+		name string
+		args sessionRolloutSetCapArgs
+		want string
+	}{
+		{name: "missing confirmation", args: sessionRolloutSetCapArgs{maxPerUID: 5}, want: "--yes"},
+		{name: "zero", args: sessionRolloutSetCapArgs{maxPerUID: 0, yes: true}, want: "between 1 and 10000"},
+		{name: "above bound", args: sessionRolloutSetCapArgs{maxPerUID: 10001, yes: true}, want: "between 1 and 10000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := sessionRolloutSetCap(ctx, nil, current, &out, tc.args)
+			require.ErrorContains(t, err, tc.want)
+			require.Empty(t, out.String())
+		})
+	}
+}
+
+func TestSessionRolloutSetCapReportsAuditedTransition(t *testing.T) {
+	ctx := context.Background()
+	current := auth.RolloutState{Floor: auth.SessionModeRevoke, MaxPerUID: 20, Version: 7}
+	setter := &recordingRolloutCapSetter{}
+	var out bytes.Buffer
+
+	require.NoError(t, sessionRolloutSetCap(ctx, setter, current, &out, sessionRolloutSetCapArgs{
+		maxPerUID: 5,
+		yes:       true,
+	}))
+	require.Equal(t, current, setter.current)
+	require.Equal(t, 5, setter.cap)
+	require.Equal(t, "operator", setter.actor)
+	require.JSONEq(t, `{
+		"floor":"revoke",
+		"from_max_per_uid":20,
+		"to_max_per_uid":5,
+		"version":8
+	}`, out.String())
+}
+
 // migrate carries the one decision nothing can make automatically — how many
 // people get logged out early — so each input that shapes it is required
 // explicitly rather than defaulted.

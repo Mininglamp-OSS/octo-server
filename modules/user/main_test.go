@@ -86,7 +86,9 @@ func startSessionRolloutForTest(ctx *config.Context, build string) (context.Canc
 		stop()
 		return nil, fmt.Errorf("join test writer registry: %w", err)
 	}
-	if err := store.ApplyAndPublishRolloutState(registry, store.Mode(), boot.MaxPerUID); err != nil {
+	if err := store.ApplyAndPublishRolloutState(registry, auth.RolloutState{
+		Floor: boot.Floor, MaxPerUID: boot.MaxPerUID, Version: boot.Version,
+	}, store.Mode()); err != nil {
 		stop()
 		return nil, fmt.Errorf("publish test rollout state: %w", err)
 	}

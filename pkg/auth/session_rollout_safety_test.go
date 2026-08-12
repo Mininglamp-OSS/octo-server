@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,26 +108,92 @@ func TestRolloutScanLeaseConfirmsOwnershipAndReportsKeepaliveLoss(t *testing.T) 
 
 func TestApplyRolloutStateIsMonotonicAndCarriesTheCap(t *testing.T) {
 	store, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
-	require.Error(t, store.ApplyRolloutState(SessionMode("invalid"), 10))
+	require.Error(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeBounded, MaxPerUID: 10, Version: 1,
+	}, SessionMode("invalid")))
+	require.Error(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeBounded, MaxPerUID: sessionMaxPerUIDLimit + 1, Version: 2,
+	}, SessionModeBounded))
 
-	require.NoError(t, store.ApplyRolloutState(SessionModeBounded, sessionMaxPerUIDLimit+1))
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeBounded, MaxPerUID: 10, Version: 3,
+	}, SessionModeBounded))
 	require.Equal(t, SessionModeBounded, store.Mode())
-	require.Equal(t, sessionMaxPerUIDLimit, store.currentMaxPerUID())
+	require.Equal(t, 10, store.currentMaxPerUID())
 
-	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 7))
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 7, Version: 2,
+	}, SessionModeRevoke))
 	require.Equal(t, SessionModeBounded, store.Mode(), "a stale floor must not lower reader strictness")
-	require.Equal(t, sessionMaxPerUIDLimit, store.currentMaxPerUID(),
-		"a stale floor must not replace the cap paired with a newer floor")
-	store.state.Store(&derivedRolloutState{mode: SessionModeBounded})
-	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 7))
+	require.Equal(t, 10, store.currentMaxPerUID(),
+		"an older control version must not replace a newer cap")
+	store.state.Store(&derivedRolloutState{mode: SessionModeBounded, version: 3})
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 7, Version: 2,
+	}, SessionModeRevoke))
 	require.Equal(t, 7, store.currentMaxPerUID(), "a usable cap from a stale floor may heal missing cap state")
-	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 0))
-	require.Equal(t, 7, store.currentMaxPerUID())
+
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 5, Version: 4,
+	}, SessionModeRevoke))
+	require.Equal(t, SessionModeBounded, store.Mode())
+	require.Equal(t, 5, store.currentMaxPerUID(), "a newer version may tighten the cap without lowering mode")
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 20, Version: 3,
+	}, SessionModeRevoke))
+	require.Equal(t, 5, store.currentMaxPerUID(), "an older version cannot undo a cap change")
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 20, Version: 5,
+	}, SessionModeRevoke))
+	require.Equal(t, 20, store.currentMaxPerUID(), "a newer version may deliberately raise the cap")
 
 	require.False(t, SessionModeExpand.WritesV3())
 	require.True(t, SessionModeV3Write.WritesV3())
 	require.False(t, SessionModeV3Write.RevokesSessions())
 	require.True(t, SessionModeRevoke.RevokesSessions())
+}
+
+func TestApplyRolloutStateConcurrentCallersNeverRegressModeOrCapVersion(t *testing.T) {
+	store, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
+	modes := []SessionMode{
+		SessionModeExpand, SessionModeV3Write, SessionModeRevoke, SessionModeBounded, SessionModeEnforce,
+	}
+	const callers = 256
+	start := make(chan struct{})
+	observed := make([]SessionMode, 0, callers)
+	errs := make([]error, callers)
+	var observedMu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 1; i <= callers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			mode := modes[i%len(modes)]
+			errs[i-1] = store.ApplyRolloutState(RolloutState{
+				Floor: mode, MaxPerUID: i, Version: int64(i),
+			}, mode)
+			observedMu.Lock()
+			observed = append(observed, store.Mode())
+			observedMu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "caller %d", i+1)
+	}
+	for i := 1; i < len(observed); i++ {
+		require.GreaterOrEqual(t, observed[i].rank(), observed[i-1].rank(),
+			"completed concurrent applies must never observe a mode regression")
+	}
+	state := store.currentState()
+	require.Equal(t, SessionModeEnforce, state.mode)
+	require.EqualValues(t, callers, state.version)
+	require.Equal(t, callers, state.maxPerUID,
+		"the cap must come from the newest MySQL control version")
 }
 
 func TestRolloutStateSafetyMechanismsAreStructural(t *testing.T) {

@@ -195,7 +195,9 @@ func TestSessionRolloutAdoptedV3LoginAndAuthenticatedReadE2E(t *testing.T) {
 	registry := auth.NewWriterRegistry(client, uidPrefix)
 	store.UseWriterLease(registry)
 	require.NoError(t, registry.Join(rolloutCtx, "integration-build", "integration-pod", string(store.Mode()), nil))
-	require.NoError(t, store.ApplyAndPublishRolloutState(registry, store.Mode(), boot.MaxPerUID))
+	require.NoError(t, store.ApplyAndPublishRolloutState(registry, auth.RolloutState{
+		Floor: boot.Floor, MaxPerUID: boot.MaxPerUID, Version: boot.Version,
+	}, store.Mode()))
 	require.NoError(t, store.CanIssue())
 
 	password := "Pwd@12345"
