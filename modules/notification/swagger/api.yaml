@@ -17,6 +17,8 @@ paths:
                 $ref: '#/components/schemas/NotificationPause'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/UpdateFailed'
     put:
@@ -40,6 +42,8 @@ paths:
           $ref: '#/components/responses/InvalidTime'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/UpdateFailed'
     delete:
@@ -55,6 +59,8 @@ paths:
                 $ref: '#/components/schemas/NotificationPause'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/UpdateFailed'
 components:
@@ -125,14 +131,6 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
-          example:
-            error:
-              code: unauthorized
-              message: Authentication required
-              details: {}
-              http_status: 401
-            msg: Authentication required
-            status: 401
     InvalidTime:
       description: Invalid or non-future pause time
       content:
@@ -147,6 +145,25 @@ components:
               http_status: 400
             msg: invalid pause time
             status: 400
+    RateLimited:
+      description: Too many requests for this account
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: err.shared.rate.limited
+              message: Too many requests
+              details: {}
+              http_status: 429
+            msg: Too many requests
+            status: 429
     UpdateFailed:
       description: Database update failed
       content:
