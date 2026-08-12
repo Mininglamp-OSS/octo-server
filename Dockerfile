@@ -10,8 +10,9 @@
 
 FROM golang:1.25 AS build
 
-ENV GOPROXY https://goproxy.cn,direct
-ENV GO111MODULE on
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=sum.golang.google.cn \
+    GO111MODULE=on
 
 WORKDIR /go/cache
 
