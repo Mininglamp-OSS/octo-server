@@ -22,8 +22,11 @@ func TestExcludePausedUIDs(t *testing.T) {
 func TestExcludePausedUIDsKeepsInputWhenNoPausedUID(t *testing.T) {
 	uids := []string{"u1", "u2"}
 	got := excludePausedUIDs(uids, nil)
-	if len(got) != len(uids) || &got[0] != &uids[0] {
-		t.Fatalf("no-op filtering should preserve the input slice")
+	if len(got) != len(uids) || got[0] != uids[0] || got[1] != uids[1] {
+		t.Fatalf("no-op filtering should preserve the recipients, got %v", got)
+	}
+	if &got[0] == &uids[0] {
+		t.Fatalf("no-op filtering should not alias the input slice")
 	}
 }
 

@@ -612,7 +612,6 @@ other = "Message search failed."
 ["err.server.message.store_failed"]
 other = "Failed to persist message data."
 
-
 ["err.server.messages_search.depth_exceeded"]
 other = "Search pagination depth limit reached; narrow your query."
 

@@ -12,7 +12,7 @@ func filterPausedUIDs(uids []string, paused map[string]struct{}, lookupErr error
 
 func excludePausedUIDs(uids []string, paused map[string]struct{}) []string {
 	if len(paused) == 0 {
-		return uids
+		return append([]string(nil), uids...)
 	}
 	filtered := make([]string, 0, len(uids))
 	for _, uid := range uids {

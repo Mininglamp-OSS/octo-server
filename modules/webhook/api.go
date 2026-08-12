@@ -547,12 +547,6 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 			// 快捷静音是 best-effort 的通知偏好，不是安全边界。查询失败时
 			// 必须继续原有 Push，避免一次 DB 故障静默丢弃整批离线通知。
 			w.Error("查询账号级通知暂停状态失败，继续发送原始 Push", zap.Error(err), zap.Int("toUidsCount", len(toUids)))
-		} else if len(pausedUIDs) > 0 {
-			for _, uid := range toUids {
-				if _, paused := pausedUIDs[uid]; paused {
-					w.Debug("因账号级通知暂停抑制 Push", zap.String("uid", uid))
-				}
-			}
 		}
 		toUids = filterPausedUIDs(toUids, pausedUIDs, err)
 		if err == nil && len(toUids) == 0 {

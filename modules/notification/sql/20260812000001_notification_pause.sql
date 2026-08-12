@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS `user_notification_pause` (
   `revision` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `updated_at` DATETIME(3) NOT NULL,
   PRIMARY KEY (`uid`),
-  KEY `idx_user_notification_pause_until` (`paused_until`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- +migrate Down
