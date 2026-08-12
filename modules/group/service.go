@@ -847,6 +847,7 @@ type GroupResp struct {
 	IsNamed                  int       `json:"is_named"`                    // 1=改版前老群(默认渲染群名文字)/0=新群(默认双人图标)；由 #500 迁移回填，新群恒为 0；客户端可据此本地预判默认头像取群名文字 vs 双人图标
 	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor              *int      `json:"avatar_color"`                // 自定义群头像色板下标（null=按 group_no 派生）
+	IsUploadAvatar           int       `json:"is_upload_avatar"`            // 1=当前群头像使用上传图片；0=使用文字/颜色/默认合成头像
 	Remark                   string    `json:"remark"`                      // 群备注
 	Notice                   string    `json:"notice"`                      // 群公告
 	Mute                     int       `json:"mute"`                        // 免打扰
@@ -894,6 +895,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
+		IsUploadAvatar:           model.IsUploadAvatar,
 		Notice:                   model.Notice,
 		Mute:                     model.Mute,
 		Top:                      model.Top,
@@ -939,6 +941,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
+		IsUploadAvatar:           model.IsUploadAvatar,
 		Notice:                   model.Notice,
 		Forbidden:                model.Forbidden,
 		Invite:                   model.Invite,
@@ -1066,6 +1069,8 @@ type UpdateGroupAvatarCustomServiceReq struct {
 	// 非 nil 为色板下标。为 false 时不动颜色。
 	SetAvatarColor bool
 	AvatarColor    *int
+	// ClearUploadedAvatar：同一次保存确认使用生成头像，清除上传图片头像优先级。
+	ClearUploadedAvatar bool
 }
 
 // ---------- Service method implementations ----------
@@ -1993,7 +1998,7 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	if req.GroupNo == "" {
 		return errors.New("group_no is required")
 	}
-	if req.AvatarText == nil && !req.SetAvatarColor {
+	if req.AvatarText == nil && !req.SetAvatarColor && !req.ClearUploadedAvatar {
 		return errors.New("nothing to update")
 	}
 
@@ -2016,7 +2021,7 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	// updateAvatarCustom 的 WHERE 带 status<>disband：若读到未解散之后、写入之前群被并发
 	// 解散，则命中 0 行——据此返回 not-found/disbanded，不把 version/通知误发到死行（关闭
 	// 上面 read-check 与本次 write 之间的 TOCTOU）。
-	affected, err := s.db.updateAvatarCustom(req.GroupNo, req.AvatarText, req.SetAvatarColor, req.AvatarColor, version)
+	affected, err := s.db.updateAvatarCustom(req.GroupNo, req.AvatarText, req.SetAvatarColor, req.AvatarColor, req.ClearUploadedAvatar, version)
 	if err != nil {
 		s.Error("update group avatar custom failed", zap.Error(err))
 		return errors.New("failed to update group avatar")
@@ -2027,6 +2032,18 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 
 	// 通知客户端刷新频道信息 → 重新拉取头像。
 	s.ctx.SendChannelUpdateToGroup(req.GroupNo)
+	if req.ClearUploadedAvatar {
+		if err := s.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   req.GroupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			CMD:         common.CMDGroupAvatarUpdate,
+			Param: map[string]interface{}{
+				"group_no": req.GroupNo,
+			},
+		}); err != nil {
+			s.Error("send group avatar update cmd failed", zap.String("group_no", req.GroupNo), zap.Error(err))
+		}
+	}
 
 	return nil
 }

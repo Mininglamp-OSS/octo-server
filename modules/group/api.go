@@ -1179,12 +1179,26 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	noticeValue, hasNotice := groupMap[common.GroupAttrKeyNotice]
 	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
 	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
+	clearUploadedAvatarValue, hasClearUploadedAvatar := groupMap[attrKeyClearUploadedAvatar]
+	clearUploadedAvatar := false
+	if hasClearUploadedAvatar {
+		raw := strings.TrimSpace(strings.ToLower(clearUploadedAvatarValue))
+		switch raw {
+		case "", "0", "false":
+			hasClearUploadedAvatar = false
+		case "1", "true":
+			clearUploadedAvatar = true
+		default:
+			respondGroupRequestInvalid(c, attrKeyClearUploadedAvatar)
+			return
+		}
+	}
 
 	// 权限分档：
-	//   高级字段（notice/invite/avatar_text/avatar_color）——仍需管理员/群主。
+	//   高级字段（notice/invite/avatar_text/avatar_color/clear_uploaded_avatar）——仍需管理员/群主。
 	//   仅改名（只含 name、不含任何高级字段）——任何活跃人类成员即可，龙虾除外。
 	//   其它（既无 name 也无高级字段）——保守走管理员校验兜底。
-	hasAdvanced := hasNotice || hasInvite || hasAvatarText || hasAvatarColor
+	hasAdvanced := hasNotice || hasInvite || hasAvatarText || hasAvatarColor || hasClearUploadedAvatar
 	if hasAdvanced || !hasName {
 		isManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 		if err != nil {
@@ -1195,6 +1209,18 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		if !isManager {
 			httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
 			return
+		}
+		if clearUploadedAvatar {
+			isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
+			if err != nil {
+				g.Error("查询群创建者失败！", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			if !isCreator {
+				httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOnly, nil, nil)
+				return
+			}
 		}
 	} else {
 		// 仅改名：低风险写，内部活跃人类成员即可，龙虾(robot)不是普通成员，禁止其改名。
@@ -1229,11 +1255,14 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	// 「返回 400 却已部分写入群名」的非原子部分写入。avatar_text 空串清除自定义文字（回退
 	// is_named 规则:老群群名/新群双人图标），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
 	var avatarReq *UpdateGroupAvatarCustomServiceReq
-	if hasAvatarText || hasAvatarColor {
+	if hasAvatarText || hasAvatarColor || hasClearUploadedAvatar {
 		avatarReq = &UpdateGroupAvatarCustomServiceReq{
 			GroupNo:      groupNo,
 			OperatorUID:  loginUID,
 			OperatorName: loginName,
+		}
+		if hasClearUploadedAvatar {
+			avatarReq.ClearUploadedAvatar = clearUploadedAvatar
 		}
 		if hasAvatarText {
 			if avatarrender.VisibleRuneCount(avatarTextValue) > 4 {

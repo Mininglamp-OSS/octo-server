@@ -49,6 +49,7 @@ const (
 // 表示清除自定义色（回退按 group_no 派生）；avatar_text 为空字符串表示清除自定义
 // 文字（回退：老群取群名前 2 字，新群双人图标）。
 const (
-	attrKeyAvatarText  = "avatar_text"
-	attrKeyAvatarColor = "avatar_color"
+	attrKeyAvatarText          = "avatar_text"
+	attrKeyAvatarColor         = "avatar_color"
+	attrKeyClearUploadedAvatar = "clear_uploaded_avatar"
 )
