@@ -684,6 +684,12 @@ other = "The binding session has expired or is invalid. Please start over."
 ["err.server.oidc.bind_verify_required"]
 other = "Please complete verification before confirming."
 
+["err.server.notification.pause.invalid_time"]
+other = "Notification pause time is invalid."
+
+["err.server.notification.pause.update_failed"]
+other = "Failed to update notification pause state."
+
 ["err.server.opanalytics.etl_already_running"]
 other = "Analytics ETL is already running."
 
@@ -1286,9 +1292,3 @@ other = "Invalid request."
 
 ["err.server.workplace.store_failed"]
 other = "Failed to update workplace data."
-
-["err.server.notification.pause.invalid_time"]
-other = "Notification pause time is invalid."
-
-["err.server.notification.pause.update_failed"]
-other = "Failed to update notification pause state."
