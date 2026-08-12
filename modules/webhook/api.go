@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -22,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhook"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/notification"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -36,14 +38,15 @@ import (
 // Webhook Webhook
 type Webhook struct {
 	log.Log
-	ctx          *config.Context
-	supportTypes []common.ContentType
-	db           *DB
-	messageDB    *messageDB
-	pushMap      map[common.DeviceType]map[string]Push
-	groupService group.IService
-	userService  user.IService
-	secretKey    string // Webhook HMAC-SHA256 签名密钥
+	ctx                 *config.Context
+	supportTypes        []common.ContentType
+	db                  *DB
+	messageDB           *messageDB
+	pushMap             map[common.DeviceType]map[string]Push
+	groupService        group.IService
+	userService         user.IService
+	notificationService *notification.Service
+	secretKey           string // Webhook HMAC-SHA256 签名密钥
 	wkhook.UnimplementedWebhookServiceServer
 	grpcServer *grpc.Server
 }
@@ -117,15 +120,16 @@ func New(ctx *config.Context) *Webhook {
 		}
 	}
 	return &Webhook{
-		db:           NewDB(ctx.DB()),
-		supportTypes: supportTypes,
-		ctx:          ctx,
-		Log:          log.NewTLog("Webhook"),
-		pushMap:      pushMap,
-		messageDB:    newMessageDB(ctx),
-		groupService: group.NewService(ctx),
-		userService:  user.NewService(ctx),
-		secretKey:    os.Getenv("TS_WEBHOOK_SECRET_KEY"),
+		db:                  NewDB(ctx.DB()),
+		supportTypes:        supportTypes,
+		ctx:                 ctx,
+		Log:                 log.NewTLog("Webhook"),
+		pushMap:             pushMap,
+		messageDB:           newMessageDB(ctx),
+		groupService:        group.NewService(ctx),
+		userService:         user.NewService(ctx),
+		notificationService: notification.New(ctx),
+		secretKey:           os.Getenv("TS_WEBHOOK_SECRET_KEY"),
 	}
 }
 func getSupportTypes() []common.ContentType {
@@ -533,6 +537,28 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	if !w.containSupportType(common.ContentType(msgResp.ContentType)) && !isVideoCall {
 		w.Debug("不推送：不支持的消息类型！", zap.Int("contentType", msgResp.ContentType), zap.Bool("signal", setting.Signal))
 		return nil
+	}
+
+	// 账号级快捷静音只抑制消息离线 Push，不影响 RTC/来电推送。
+	// 在进入 PushPool 前一次性查询全部接收 UID，避免每个设备任务产生 N+1 查询。
+	if !isVideoCall && w.notificationService != nil {
+		pausedUIDs, err := w.notificationService.ActiveUIDs(toUids, time.Now().UTC())
+		if err != nil {
+			// 静音状态查询失败时 fail closed，避免在用户已选择静音时发送本次 Push。
+			w.Error("查询账号级通知暂停状态失败，本次 Push 跳过", zap.Error(err), zap.Int("toUidsCount", len(toUids)))
+			return nil
+		}
+		if len(pausedUIDs) > 0 {
+			for _, uid := range toUids {
+				if _, paused := pausedUIDs[uid]; paused {
+					w.Debug("因账号级通知暂停抑制 Push", zap.String("uid", uid))
+				}
+			}
+			toUids = excludePausedUIDs(toUids, pausedUIDs)
+			if len(toUids) == 0 {
+				return nil
+			}
+		}
 	}
 
 	// 解析消息来源的 space_id

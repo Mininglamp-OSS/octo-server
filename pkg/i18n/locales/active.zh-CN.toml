@@ -1345,3 +1345,11 @@ other = "该幂等键已用于不同的请求。"
 
 ["err.server.bot_mention.store_failed"]
 other = "文档评论机器人事件处理失败。"
+
+# ---- modules/notification：账号级快捷静音 ----
+
+["err.server.notification.pause.invalid_time"]
+other = "通知暂停时间无效。"
+
+["err.server.notification.pause.update_failed"]
+other = "更新通知暂停状态失败。"

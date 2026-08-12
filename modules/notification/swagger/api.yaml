@@ -1,0 +1,126 @@
+openapi: 3.0.3
+info:
+  title: Octo Notification Pause API
+  version: 1.0.0
+paths:
+  /v1/user/notification-pause:
+    get:
+      operationId: getNotificationPause
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current account notification pause state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPause'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/UpdateFailed'
+    put:
+      operationId: setNotificationPause
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetNotificationPause'
+      responses:
+        '200':
+          description: Saved authoritative state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPause'
+        '400':
+          $ref: '#/components/responses/InvalidTime'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/UpdateFailed'
+    delete:
+      operationId: clearNotificationPause
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Restored authoritative state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPause'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/UpdateFailed'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    SetNotificationPause:
+      type: object
+      required: [paused_until]
+      properties:
+        paused_until:
+          type: string
+          format: date-time
+          description: UTC absolute time later than server time
+    NotificationPause:
+      type: object
+      required: [paused, paused_until, revision, server_time]
+      properties:
+        paused:
+          type: boolean
+        paused_until:
+          type: string
+          format: date-time
+          nullable: true
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        server_time:
+          type: string
+          format: date-time
+      example:
+        paused: true
+        paused_until: '2026-08-12T12:30:00.000Z'
+        revision: 42
+        server_time: '2026-08-12T11:30:00.125Z'
+    Error:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: unauthorized
+    InvalidTime:
+      description: Invalid or non-future pause time
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: err.server.notification.pause.invalid_time
+    UpdateFailed:
+      description: Database update failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: err.server.notification.pause.update_failed

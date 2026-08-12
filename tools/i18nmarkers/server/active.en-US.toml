@@ -1286,3 +1286,9 @@ other = "Invalid request."
 
 ["err.server.workplace.store_failed"]
 other = "Failed to update workplace data."
+
+["err.server.notification.pause.invalid_time"]
+other = "Notification pause time is invalid."
+
+["err.server.notification.pause.update_failed"]
+other = "Failed to update notification pause state."
