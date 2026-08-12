@@ -12,6 +12,14 @@ source: self
 
 # Task: token-lifecycle-hardening-pr2
 
+> [!IMPORTANT]
+> **Rollout control 已被 PR #733 的
+> [`token-session-rollout-simplify`](../token-session-rollout-simplify/brief.md) 取代。**
+> 本文保留 #725/PR2 的历史设计与验收背景，其中 Redis floor、启动固定 MODE、
+> REQUIRED_FLOOR、旧 admin/observe 工具和分阶段重启流程均不是当前运维依据。当前实现以 MySQL
+> singleton 为 floor/cap/paused/version 唯一权威；请使用
+> [`docs/token-session-rollout-runbook.md`](../../../docs/token-session-rollout-runbook.md)。
+
 > 本 brief 是 `token-lifecycle-hardening` 的 PR 2 交付规格，只定义代码能力和受控启用流程，
 > 不代表生产迁移已经执行，也不因 PR 合并就关闭漏洞。
 

@@ -145,3 +145,38 @@ func gaugeWithLabels(t *testing.T, reg *prometheus.Registry, name string, want m
 	}
 	return 0
 }
+
+// Exactly one boot outcome must read 1 and the rest 0 — the gauge's own help
+// text says so, and an alert keys off it. The setter walks the label list, so an
+// outcome missing from that list silently zeroes every series instead of
+// failing, which is how `unknown` — the outcome that signals a replica pinned by
+// an unreadable floor — became invisible.
+func TestSessionRolloutBootOutcomeSetsExactlyOne(t *testing.T) {
+	prev := defaultSessionMetrics.Load()
+	t.Cleanup(func() { defaultSessionMetrics.Store(prev) })
+
+	for _, current := range sessionRolloutBootOutcomes {
+		reg := prometheus.NewRegistry()
+		NewSessionMetrics(reg)
+		SetSessionRolloutBootOutcome(current)
+
+		ones := 0
+		for _, outcome := range sessionRolloutBootOutcomes {
+			got := gaugeWithLabels(t, reg, "dmwork_session_rollout_boot_outcome", map[string]string{"outcome": outcome})
+			switch outcome {
+			case current:
+				if got != 1 {
+					t.Fatalf("outcome %q = %v, want 1", outcome, got)
+				}
+				ones++
+			default:
+				if got != 0 {
+					t.Fatalf("outcome %q = %v, want 0 while %q is current", outcome, got, current)
+				}
+			}
+		}
+		if ones != 1 {
+			t.Fatalf("exactly one outcome must be 1, got %d for %q", ones, current)
+		}
+	}
+}

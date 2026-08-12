@@ -281,7 +281,16 @@ func TestRedisSessionStoreObserveAggregatesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(5), stats.Total)
 	require.Equal(t, int64(1), stats.Persistent)
-	require.Equal(t, int64(4), stats.Finite)
+	// Three, not four: the shape counters describe legacy CREDENTIALS, not keys,
+	// so the undecodable "not-a-token" is reported once as DecodeInvalid and
+	// counted in no TTL bucket. Total still counts every key scanned.
+	//
+	// The distinction is load-bearing rather than cosmetic. These counters feed
+	// the bounded gate, and while they described the keyspace a single permanent
+	// undecodable record held Persistent at 1 forever — bounded refused, bounded
+	// is the only route to enforce, migration skips undecodable records by
+	// design, and nothing expires a key with no TTL.
+	require.Equal(t, int64(3), stats.Finite)
 	require.Equal(t, int64(1), stats.OverMax)
 	require.Equal(t, int64(1), stats.DecodeInvalid)
 	require.Equal(t, int64(1), stats.V1)
@@ -293,17 +302,19 @@ func TestRedisSessionStoreObserveCountsZeroTTLAsInvalid(t *testing.T) {
 	cfg := config.New()
 	client := octoredis.NewInstrumentedClient(cfg)
 	prefix := "observe-zero-ttl:" + util.GenerUUID() + ":"
+	uidPrefix := "observe-zero-ttl-uid:" + util.GenerUUID() + ":"
 	key := prefix + "token"
-	store := NewRedisSessionStore(client, prefix, "observe-zero-ttl-uid:", time.Minute)
+	store := NewRedisSessionStore(client, prefix, uidPrefix, time.Minute)
 	require.NoError(t, client.Set(key, "u1@legacy", time.Minute).Err())
+	require.NoError(t, readTokenScript.Load(client).Err())
 	t.Cleanup(func() {
-		_ = client.Del(key).Err()
+		_ = client.Del(key, store.rolloutScanLeaseKey()).Err()
 		_ = client.Close()
 	})
 	client.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
 		return func(cmd rd.Cmder) error {
-			if cmd.Name() == "evalsha" {
-				args := cmd.Args()
+			args := cmd.Args()
+			if cmd.Name() == "evalsha" && len(args) > 1 && fmt.Sprint(args[1]) == readTokenScript.Hash() {
 				args[0] = "eval"
 				args[1] = `return {"u1@legacy", 0}`
 				args[2] = 0

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
 )
 
 // TestMain 确保集成测试启动前必需的加密 env 已就位。
@@ -35,7 +37,13 @@ func TestMain(m *testing.M) {
 		_, _ = rand.Read(key)
 		_ = os.Setenv(phoneEncryptionSecretEnv, hex.EncodeToString(key))
 	}
+	stopRollout, err := testsession.StartPackageRollout("user-package-tests")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	code := m.Run()
+	stopRollout()
 	if err := cleanupTokenHTTPTestDatabases(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		code = 1

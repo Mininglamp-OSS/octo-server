@@ -161,14 +161,17 @@ type sessionIndexMember struct {
 	DeviceID   string `json:"device_id,omitempty"`
 }
 
+// Mode is the phase this replica is currently running at. It can change
+// underneath a caller when the floor advances, so read it once per decision
+// rather than caching it.
 func (s *RedisSessionStore) Mode() SessionMode {
-	return s.mode
+	return s.currentMode()
 }
 
 func (s *RedisSessionStore) BeginIssue(ctx context.Context, uid string) (fence IssueFence, err error) {
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("begin_issue", started, err) }()
-	if !s.mode.writesV3() {
+	if !s.currentMode().writesV3() {
 		return IssueFence{}, ErrV3SessionsDisabled
 	}
 	if strings.TrimSpace(uid) == "" {
@@ -234,13 +237,17 @@ func (s *RedisSessionStore) CurrentGeneration(ctx context.Context, uid string) (
 }
 
 func (s *RedisSessionStore) ValidateLegacySession(ctx context.Context, info TokenInfo, record TokenRecord) error {
-	if s.mode == SessionModeEnforce {
+	// One atomic read for the whole decision: the floor poller may raise the
+	// mode mid-request, and a torn read could apply enforce's rejection with
+	// bounded's TTL rule (or neither).
+	mode := s.currentMode()
+	if mode == SessionModeEnforce {
 		return ErrLegacySessionDenied
 	}
-	if s.mode == SessionModeBounded && (record.TTL <= 0 || record.TTL > s.maxTTL) {
+	if mode == SessionModeBounded && (record.TTL <= 0 || record.TTL > s.maxTTL) {
 		return ErrLegacySessionDenied
 	}
-	if !s.mode.checksLegacyDeny() {
+	if !mode.checksLegacyDeny() {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -261,12 +268,15 @@ func (s *RedisSessionStore) ValidateLegacySession(ctx context.Context, info Toke
 // v3 under the supplied issuance fence; a missing credential returns false so
 // the caller can issue a new random token.
 func (s *RedisSessionStore) ReuseSession(ctx context.Context, token string, snapshot TokenInfo, fence IssueFence) (ok bool, err error) {
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return false, stateErr
+	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("reuse_session", started, err) }()
 	if strings.TrimSpace(token) == "" || strings.TrimSpace(snapshot.UID) == "" || snapshot.DeviceFlag < 0 {
 		return false, errors.New("auth: reuse session requires token, uid, and non-negative device flag")
 	}
-	if !s.mode.writesV3() {
+	if !s.currentMode().writesV3() {
 		payload, err := Encode(snapshot)
 		if err != nil {
 			return false, err
@@ -570,9 +580,16 @@ func (s *RedisSessionStore) cleanupIndexReservation(token, uid string, deviceFla
 }
 
 func (s *RedisSessionStore) IssueNewSession(ctx context.Context, token string, info TokenInfo, fence IssueFence) (err error) {
+	// A writer without a live lease must not create a credential. That is what
+	// makes "absent from the writer registry" prove "not writing", which the
+	// advance gate relies on. Reads and revocation are untouched: fencing new
+	// logins during a Redis outage is the intended degradation.
+	if _, stateErr := s.writableState(); stateErr != nil {
+		return stateErr
+	}
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("issue_v3", started, err) }()
-	if !s.mode.writesV3() {
+	if !s.currentMode().writesV3() {
 		return ErrV3SessionsDisabled
 	}
 	if strings.TrimSpace(token) == "" || strings.TrimSpace(info.UID) == "" || info.DeviceFlag < 0 {
@@ -674,7 +691,7 @@ func (s *RedisSessionStore) extendFenceDeadline(ctx context.Context, uid string,
 func (s *RedisSessionStore) RevokeAll(ctx context.Context, uid string, event RevocationEvent) (err error) {
 	started := time.Now()
 	defer func() { metrics.ObserveSessionOperation("revoke_all", started, err) }()
-	if !s.mode.writesV3() {
+	if !s.currentMode().writesV3() {
 		return ErrV3SessionsDisabled
 	}
 	if strings.TrimSpace(uid) == "" || event.Version == 0 || strings.TrimSpace(event.ID) == "" {
@@ -716,7 +733,7 @@ func (s *RedisSessionStore) RevokeAll(ctx context.Context, uid string, event Rev
 	if code != 0 && code != 1 {
 		return fmt.Errorf("auth: unexpected session generation rotation result %d", code)
 	}
-	if s.mode.rank() >= SessionModeRevoke.rank() {
+	if s.currentMode().rank() >= SessionModeRevoke.rank() {
 		if err := s.client.Set(s.legacyDenyKey(uid), strconv.FormatUint(event.Version, 10), 0).Err(); err != nil {
 			return fmt.Errorf("auth: persist legacy session deny marker: %w", err)
 		}
@@ -855,7 +872,7 @@ func (s *RedisSessionStore) addSessionIndex(uid, generation, member string, expi
 		s.now().UTC().Unix(),
 		member,
 		expiresAt,
-		s.maxPerUID,
+		s.currentMaxPerUID(),
 		ttl.Milliseconds(),
 	).Result()
 	if err != nil {

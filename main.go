@@ -109,6 +109,17 @@ func validateTokenExpireConfig(vp *viper.Viper) (time.Duration, error) {
 }
 
 func main() {
+	// `app session-rollout ...` is dispatched before flag.Parse: the server's
+	// own -config flag would otherwise swallow the subcommand's flags, since
+	// flag.Parse stops at the first non-flag argument.
+	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == sessionRolloutCommand {
+		if err := runSessionRolloutCommand(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var CfgFile string //config file
 	flag.StringVar(&CfgFile, "config", "configs/tsdd.yaml", "config file")
 	flag.Parse()
@@ -192,16 +203,6 @@ func runAPI(ctx *config.Context) {
 		panic(fmt.Errorf("verify authentication session Redis Lua support: %w", err))
 	}
 	probeCancel()
-	rolloutCtx, rolloutCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	rolloutControl, err := tokenStore.RolloutControl(rolloutCtx)
-	rolloutCancel()
-	if err != nil {
-		panic(fmt.Errorf("read authentication session rollout floor: %w", err))
-	}
-	rolloutFloor := "none"
-	if rolloutControl != nil {
-		rolloutFloor = string(rolloutControl.ModeFloor)
-	}
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
@@ -289,11 +290,11 @@ func runAPI(ctx *config.Context) {
 	metrics.NewSessionMetrics(prometheus.DefaultRegisterer)
 	metrics.SetSessionEffectiveTTL(ctx.GetConfig().Cache.TokenExpire)
 	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
-	fmt.Printf(
-		"Authentication session runtime: mode=%s rollout_floor=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
-		tokenStore.Mode(), rolloutFloor, ctx.GetConfig().Cache.TokenExpire,
-		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
-	)
+
+	// Constructed now, started only after module.Setup has created the MySQL
+	// rollout control tables. Until then SessionStoreAndClientForContext keeps
+	// issuance fenced, and the server is not accepting traffic.
+	stopSessionRollout := func() {}
 	// 自定义贴纸 handle 上线观测指标(P0: Sticker Handle Enforcement Rollout):上传签发
 	// handle 次数 / 注册结果分布 / 部署姿态 gauge。由 modules/file(签发) 与
 	// modules/sticker(注册) 经包级 Observe 函数灌入;此处注册即可,未注册前为 no-op。
@@ -458,6 +459,11 @@ func runAPI(ctx *config.Context) {
 		cardActionRuntime.Stop()
 		panic(err)
 	}
+	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
+	if err != nil {
+		cardActionRuntime.Stop()
+		panic(err)
+	}
 	if err := cardActionRuntime.Start(context.Background()); err != nil {
 		cardActionRuntime.Stop()
 		panic(fmt.Errorf("start card action callback dispatcher: %w", err))
@@ -482,6 +488,7 @@ func runAPI(ctx *config.Context) {
 
 	// 运行: 阻塞直到 go-svc 收到 SIGINT/SIGTERM 并完成业务 Stop。
 	err = svc.Run(s)
+	stopSessionRollout()
 	cardActionRuntime.Stop()
 
 	// 业务停下后再 graceful shutdown metrics scrape 端点 — 时序上避开和 go-svc
@@ -896,4 +903,93 @@ func installCardTmplRegistry() *cardtmpl.Registry {
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
 	return registry
+}
+
+// startSessionRolloutControl runs after module migrations and before serve.
+// MySQL is the only floor/cap authority; Redis supplies the writer lease and
+// run_id-bound scan evidence. A publication failure leaves issuance fenced but
+// does not fail readiness or existing-session reads.
+func startSessionRolloutControl(
+	ctx *config.Context,
+	tokenStore *auth.RedisSessionStore,
+	sessionRedis *rd.Client,
+) (context.CancelFunc, error) {
+	sessionBoot, control, err := auth.InitializeSessionRollout(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("initialize MySQL session rollout control: %w", err)
+	}
+	_, sessionWarnings := auth.SessionBootForContext(ctx)
+	metrics.SetSessionRolloutBootOutcome(string(sessionBoot.Outcome))
+	metrics.SetSessionRolloutMode(string(tokenStore.Mode()))
+	for _, warning := range sessionWarnings {
+		log.Warn("session rollout config: " + warning)
+	}
+	if sessionBoot.Warning != "" {
+		log.Warn("session rollout: " + sessionBoot.Warning)
+	}
+
+	rolloutCtx, stop := context.WithCancel(context.Background())
+	writerRegistry := auth.NewWriterRegistry(sessionRedis, ctx.GetConfig().Cache.UIDTokenCachePrefix)
+	// Bind first so every path is fail-closed before the first lease attempt.
+	tokenStore.UseWriterLease(writerRegistry)
+	joinErr := writerRegistry.Join(
+		rolloutCtx,
+		ctx.GetConfig().Version,
+		os.Getenv("POD_NAME"),
+		string(tokenStore.Mode()),
+		nil,
+	)
+	if joinErr != nil {
+		log.Warn("session rollout: writer lease unavailable: " + joinErr.Error())
+	}
+	// Retry publication immediately even when Join's first Redis attempt failed:
+	// Join has already created the local identity and started its heartbeat, so
+	// a transient first failure need not hold issuance fenced until the poll tick.
+	if publishErr := tokenStore.ApplyAndPublishRolloutState(
+		writerRegistry,
+		auth.RolloutState{
+			Floor: sessionBoot.Floor, MaxPerUID: sessionBoot.MaxPerUID, Version: sessionBoot.Version,
+		},
+		tokenStore.Mode(),
+	); publishErr != nil {
+		log.Warn("session rollout: initial state publication failed; issuance remains fenced: " + publishErr.Error())
+	}
+
+	reconciler := auth.NewRolloutReconciler(tokenStore, auth.ReconcilerOptions{
+		Registry:      writerRegistry,
+		Control:       control,
+		AutoAdvance:   sessionBoot.AutoAdvance,
+		CanaryAhead:   sessionBoot.CanaryAhead,
+		ExpectWriters: sessionBoot.ExpectWriters,
+		Log:           func(format string, args ...interface{}) { log.Info(fmt.Sprintf(format, args...)) },
+	})
+	go reconciler.Run(rolloutCtx)
+
+	fmt.Printf(
+		"Authentication session runtime: mode=%s rollout_floor=%s boot=%s auto_advance=%t mysql_versioned=true redis=%s instance=%s token_ttl=%s redis_pool_size=%d redis_pool_timeout=%s build=%s\n",
+		tokenStore.Mode(), sessionBoot.Floor, sessionBoot.Outcome, sessionBoot.AutoAdvance,
+		sessionRedis.Options().Addr, sessionRedisInstanceLabel(tokenStore), ctx.GetConfig().Cache.TokenExpire,
+		sessionRedis.Options().PoolSize, sessionRedis.Options().PoolTimeout, ctx.GetConfig().Version,
+	)
+	return stop, nil
+}
+
+// shortFingerprint truncates safely: the production path is 64 hex characters,
+// but an injected identity function need not be.
+func shortFingerprint(id string) string {
+	if len(id) <= 16 {
+		return id
+	}
+	return id[:16]
+}
+
+// sessionRedisInstanceLabel resolves the Redis process identity for the startup
+// line. Config-derived identity cannot distinguish two endpoints, so the
+// startup log states which Redis this replica actually reached.
+func sessionRedisInstanceLabel(store *auth.RedisSessionStore) string {
+	id, err := store.RedisInstanceFingerprint()
+	if err != nil {
+		return "unknown"
+	}
+	return shortFingerprint(id)
 }

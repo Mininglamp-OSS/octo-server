@@ -20,10 +20,52 @@ if not value then
 end
 local ttl = redis.call("PTTL", KEYS[1])
 local version = 1
-if string.sub(value, 1, 3) == "v3:" then
-  version = 3
-elseif string.sub(value, 1, 3) == "v2:" then
-  version = 2
+local prefix = string.sub(value, 1, 3)
+if prefix == "v3:" or prefix == "v2:" then
+  -- A prefix is not proof of decodability. Observe runs Decode on the body and
+  -- counts a malformed one as decode_invalid, so classifying purely on the
+  -- prefix left the two commands reporting different numbers for the same
+  -- keyspace — the disagreement this is supposed to remove.
+  --
+  -- The mirror is exact for v2: decodeV2 is "unmarshal as JSON, then uid must
+  -- be a non-empty string", which is what the three type checks below are. v2
+  -- is a frozen legacy format and its count feeds the enforce gate, so it has
+  -- to agree to the record.
+  --
+  -- For v3 the mirror stops here on purpose. decodeV3 additionally requires
+  -- issued_at, expires_at > issued_at, session_generation and session_revision,
+  -- and re-implementing five semantic checks in Lua is a standing invitation for
+  -- the two to drift apart in the other direction. The residue is bounded: a v3
+  -- body that parses with a uid but fails those checks would be counted v3 here
+  -- and decode_invalid by observe. No writer can produce one — EncodeV3 enforces
+  -- all five before the value is ever stored — and no gate reads the v3 count.
+  -- TestObserveAndMigrateDivergeOnlyOnUnwritableV3Bodies pins that boundary.
+  local body = string.sub(value, 4)
+  local ok, decoded = pcall(cjson.decode, body)
+  if not ok or type(decoded) ~= "table" or type(decoded.uid) ~= "string" or decoded.uid == "" then
+    version = -1
+  elseif prefix == "v3:" then
+    version = 3
+  else
+    version = 2
+  end
+else
+  -- Mirror decodeLegacy: a v1 payload is uid@name[@role], so one or two "@"
+  -- with a non-empty uid. Anything else is not a decodable credential and is
+  -- reported separately instead of being silently processed as v1 — observe
+  -- has always counted these as decode_invalid, and having the two commands
+  -- disagree meant the enforce gate and the thing that converges it were
+  -- measuring with different rulers.
+  local _, at_count = string.gsub(value, "@", "")
+  if at_count < 1 or at_count > 2 or string.sub(value, 1, 1) == "@" then
+    version = -1
+  end
+end
+if version == -1 then
+  -- Left untouched on purpose. It is not a usable credential (the validator
+  -- has always rejected it) and it no longer blocks the floor, so there is
+  -- nothing to gain from a migration mutating a record it cannot parse.
+  return {version, ttl, 5}
 end
 if version == 3 then
   if ttl <= 0 then
@@ -101,21 +143,25 @@ const (
 )
 
 type LegacyMigrationResult struct {
-	Complete    bool   `json:"complete"`
-	CampaignID  string `json:"campaign_id"`
-	Scanned     int64  `json:"scanned"`
-	Missing     int64  `json:"missing"`
-	V1          int64  `json:"v1"`
-	V2          int64  `json:"v2"`
-	V3          int64  `json:"v3"`
-	Shortened   int64  `json:"shortened"`
-	WouldDelete int64  `json:"would_delete"`
-	Deleted     int64  `json:"deleted"`
-	Unchanged   int64  `json:"unchanged"`
-	Invalid     int64  `json:"invalid"`
-	V3NonFinite int64  `json:"v3_non_finite"`
-	LastCursor  uint64 `json:"last_cursor"`
-	LockLost    bool   `json:"lock_lost"`
+	Complete   bool   `json:"complete"`
+	CampaignID string `json:"campaign_id"`
+	Scanned    int64  `json:"scanned"`
+	// InvalidPayload counts records that cannot be decoded as any token
+	// version. It mirrors SessionObservation.DecodeInvalid so observe and
+	// migrate report the same number for the same keyspace.
+	InvalidPayload int64  `json:"invalid_payload"`
+	Missing        int64  `json:"missing"`
+	V1             int64  `json:"v1"`
+	V2             int64  `json:"v2"`
+	V3             int64  `json:"v3"`
+	Shortened      int64  `json:"shortened"`
+	WouldDelete    int64  `json:"would_delete"`
+	Deleted        int64  `json:"deleted"`
+	Unchanged      int64  `json:"unchanged"`
+	Invalid        int64  `json:"invalid"`
+	V3NonFinite    int64  `json:"v3_non_finite"`
+	LastCursor     uint64 `json:"last_cursor"`
+	LockLost       bool   `json:"lock_lost"`
 }
 
 type legacyMigrationCampaign struct {
@@ -139,17 +185,22 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 	}
 	result.CampaignID = campaign.CampaignID
 	if options.Apply {
-		control, err := s.RolloutControl(ctx)
-		if err != nil {
-			return result, err
+		if s.currentMode().rank() < SessionModeRevoke.rank() {
+			return result, errors.New("auth: migration apply requires MySQL rollout floor revoke or later")
 		}
-		if control == nil || control.ModeFloor.rank() < SessionModeRevoke.rank() {
-			return result, errors.New("auth: migration apply requires persisted revoke rollout floor")
-		}
+	}
+	scanLease, err := s.acquireRolloutScanLease(ctx, options.Lease)
+	if err != nil {
+		return result, err
+	}
+	defer scanLease.Release()
+	scanner, err := newInstanceBoundScanner(s)
+	if err != nil {
+		return result, fmt.Errorf("auth: identify migration Redis instance: %w", err)
 	}
 
 	owner := ""
-	redisInstanceID := ""
+	redisInstanceID := scanner.InstanceID()
 	var lockErrors <-chan error
 	if options.Apply {
 		if err := s.ensureMigrationCampaign(campaign); err != nil {
@@ -172,10 +223,6 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		keepaliveCtx, stopKeepalive := context.WithCancel(ctx)
 		defer stopKeepalive()
 		lockErrors = s.keepMigrationLockAlive(keepaliveCtx, owner, options.Lease)
-		redisInstanceID, err = s.currentRedisInstanceID()
-		if err != nil {
-			return result, fmt.Errorf("auth: identify migration Redis instance: %w", err)
-		}
 		checkpoint, loadErr := s.loadMigrationCheckpoint(campaign.CampaignID)
 		if loadErr != nil {
 			return result, loadErr
@@ -185,7 +232,7 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			result.Complete = false
 			result.LockLost = false
 			if checkpoint.RedisInstanceID != redisInstanceID {
-				result.LastCursor = 0
+				result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
 			}
 		}
 	}
@@ -202,6 +249,9 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+		if err := scanLease.Err(); err != nil {
+			return result, err
+		}
 		if options.Apply {
 			if err := migrationLockError(lockErrors); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
@@ -211,25 +261,33 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
 			}
-			currentRedisInstanceID, err := s.currentRedisInstanceID()
-			if err != nil {
-				return result, fmt.Errorf("auth: identify migration Redis instance before scan: %w", err)
+		}
+		keys, next, restarted, err := scanner.Scan(ctx, cursor, s.tokenPrefix+"*", options.BatchSize)
+		if err != nil {
+			return result, fmt.Errorf("auth: migration scan: %w", err)
+		}
+		if restarted {
+			redisInstanceID = scanner.InstanceID()
+			cursor = 0
+			result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
 			}
-			if currentRedisInstanceID != redisInstanceID {
-				redisInstanceID = currentRedisInstanceID
-				cursor = 0
-				result.LastCursor = 0
+			if options.Apply {
 				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
 					return result, err
 				}
+				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
+					return result, err
+				}
 			}
-		}
-		keys, next, err := s.client.Scan(cursor, s.tokenPrefix+"*", options.BatchSize).Result()
-		if err != nil {
-			return result, fmt.Errorf("auth: migration scan: %w", err)
+			continue
 		}
 		for _, key := range keys {
+			if err := scanLease.Err(); err != nil {
+				return result, err
+			}
 			if options.Apply {
 				if err := migrationLockError(lockErrors); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
@@ -253,17 +311,18 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				return result, err
 			}
 		}
-		cursor = next
-		result.LastCursor = cursor
-		if options.Apply {
-			currentRedisInstanceID, err := s.currentRedisInstanceID()
-			if err != nil {
-				return result, fmt.Errorf("auth: identify migration Redis instance after scan: %w", err)
+		restarted, err = scanner.Check(ctx)
+		if err != nil {
+			return result, fmt.Errorf("auth: identify Redis instance after migration batch: %w", err)
+		}
+		if restarted {
+			redisInstanceID = scanner.InstanceID()
+			cursor = 0
+			result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
 			}
-			if currentRedisInstanceID != redisInstanceID {
-				redisInstanceID = currentRedisInstanceID
-				cursor = 0
-				result.LastCursor = 0
+			if options.Apply {
 				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 					result.LockLost = errors.Is(err, ErrMigrationLockLost)
 					return result, err
@@ -271,8 +330,15 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 				if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
 					return result, err
 				}
-				continue
 			}
+			continue
+		}
+		if err := scanLease.Confirm(); err != nil {
+			return result, err
+		}
+		cursor = next
+		result.LastCursor = cursor
+		if options.Apply {
 			if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 				result.LockLost = errors.Is(err, ErrMigrationLockLost)
 				return result, err
@@ -282,14 +348,17 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 			}
 		}
 		if cursor == 0 {
-			if options.Apply {
-				currentRedisInstanceID, err := s.currentRedisInstanceID()
-				if err != nil {
-					return result, fmt.Errorf("auth: identify migration Redis instance before completion: %w", err)
+			restarted, err = scanner.Check(ctx)
+			if err != nil {
+				return result, fmt.Errorf("auth: identify Redis instance before migration completion: %w", err)
+			}
+			if restarted {
+				redisInstanceID = scanner.InstanceID()
+				result = LegacyMigrationResult{CampaignID: campaign.CampaignID}
+				if err := scanLease.Confirm(); err != nil {
+					return result, err
 				}
-				if currentRedisInstanceID != redisInstanceID {
-					redisInstanceID = currentRedisInstanceID
-					result.LastCursor = 0
+				if options.Apply {
 					if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
 						result.LockLost = errors.Is(err, ErrMigrationLockLost)
 						return result, err
@@ -297,7 +366,16 @@ func (s *RedisSessionStore) MigrateLegacySessions(ctx context.Context, options L
 					if err := s.saveMigrationCheckpoint(campaign.CampaignID, redisInstanceID, 0, result); err != nil {
 						return result, err
 					}
-					continue
+				}
+				continue
+			}
+			if err := scanLease.Confirm(); err != nil {
+				return result, err
+			}
+			if options.Apply {
+				if err := s.confirmMigrationLock(owner, options.Lease); err != nil {
+					result.LockLost = errors.Is(err, ErrMigrationLockLost)
+					return result, err
 				}
 			}
 			result.Complete = true
@@ -388,6 +466,8 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 	}
 	result.Scanned++
 	switch version {
+	case -1:
+		result.InvalidPayload++
 	case 0:
 		result.Missing++
 	case 1:
@@ -417,6 +497,8 @@ func (s *RedisSessionStore) migrateLegacyToken(key string, campaign legacyMigrat
 		}
 	case 4:
 		return ErrMigrationElapsedCutoffConfirmationRequired
+	case 5:
+		// Undecodable payload, deliberately skipped; already counted above.
 	default:
 		return fmt.Errorf("auth: invalid migration action %d", action)
 	}

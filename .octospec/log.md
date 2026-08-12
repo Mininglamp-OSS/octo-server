@@ -32,6 +32,32 @@ change-log convention (§7). Newest first.
   rollout gates; independent incoming-webhook parsing is a follow-up. See
   [journal](journal/shared/login-audit-ip-spoofing.md).
 
+## 2026-08-11 (token-session-rollout-simplify)
+
+- **Task** — `token-session-rollout-simplify`: collapsed the #725 five-phase
+  session rollout into a MySQL-authoritative control plane. A singleton owns
+  floor/cap/version/pause, and append-only evidence commits in the same
+  transaction as each floor or cap CAS; #725 Redis floor and legacy MODE/MAX are
+  one-time takeover inputs only. Runtime mode publication fences issuance,
+  applies local state, then atomically publishes writer state + lease; failure
+  stays fenced without breaking existing-session reads. Observe, migrate and
+  reconciler share a scan-owner lease and `run_id`-bound scanner that discards
+  counters on failover. The writer registry still proves fleet convergence;
+  empty token keyspace is valid absence evidence, while an empty writer set is
+  a blocker. The reconciler ships disabled, and rollback to a Redis-floor-only
+  artifact is forbidden after the MySQL floor or cap changes. Tooling remains in
+  `app session-rollout`, reads MySQL state directly, and exposes an audited
+  `set-cap` path rather than restoring env/Redis authority. See
+  [journal](journal/shared/token-session-rollout-simplify.md) and
+  [verification](tasks/token-session-rollout-simplify/verification.md). PR #733.
+- **Learning (pending)** —
+  [characterize-before-you-design](learnings/pending/characterize-before-you-design.md):
+  the brief was written from code reading and verified afterwards; the
+  verification found a defect that changed a design decision, so it landed as a
+  patch. A runnable characterization of current behaviour belongs in Plan as an
+  input, split into invariants that must stay green and tripwires that must go
+  red.
+
 ## 2026-08-10 (token-lifecycle-hardening PR 2)
 
 - **Task** — `token-lifecycle-hardening-pr2`: added an inert-by-default,

@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -45,6 +46,9 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	resetManagerUIDRateLimit(t, ctx)
 	m := NewManager(ctx)
+	stopRollout, err := testsession.StartRollout(ctx, "manager-route-test")
+	require.NoError(t, err)
+	t.Cleanup(stopRollout)
 	m.Route(route)
 	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
 	return route, ctx, m

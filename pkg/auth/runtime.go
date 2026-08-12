@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -23,6 +24,7 @@ const (
 	sessionRedisPoolSizeMax        = 4096
 	sessionRedisPoolTimeoutMax     = 30 * time.Second
 	sessionRedisPoolTimeoutDefault = 3 * time.Second
+	rolloutControlReadTimeout      = 5 * time.Second
 )
 
 type sessionRedisOptions struct {
@@ -31,8 +33,12 @@ type sessionRedisOptions struct {
 }
 
 type sessionRuntime struct {
-	store  *RedisSessionStore
-	client *rd.Client
+	mu      sync.Mutex
+	store   *RedisSessionStore
+	client  *rd.Client
+	control *RolloutControlStore
+	boot    RolloutBoot
+	policy  sessionPolicy
 }
 
 var sessionRuntimeMu sync.Mutex
@@ -65,10 +71,7 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 	if err != nil {
 		panic(err)
 	}
-	policy, err := sessionPolicyFromEnv()
-	if err != nil {
-		panic(err)
-	}
+	policy := sessionPolicyFromEnv()
 	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = options.poolSize
@@ -82,17 +85,121 @@ func SessionStoreAndClientForContext(ctx *config.Context) (*RedisSessionStore, *
 		ctx.GetConfig().Cache.TokenCachePrefix,
 		ctx.GetConfig().Cache.UIDTokenCachePrefix,
 		ctx.GetConfig().Cache.TokenExpire,
-		WithSessionMode(policy.mode),
-		WithSessionMaxPerUID(policy.maxPerUID),
 	)
-	validationCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := store.ValidateRolloutControl(validationCtx, policy.requiredFloor); err != nil {
-		_ = client.Close()
-		panic(err)
-	}
-	ctx.SetValue(&sessionRuntime{store: store, client: client}, sessionRuntimeContextKey)
+	// The module migration that creates the MySQL authority has not run yet.
+	// Keep issuance fenced until InitializeSessionRollout is called after
+	// module.Setup and before the server starts accepting traffic.
+	store.issuanceFenced.Store(true)
+	runtime := &sessionRuntime{store: store, client: client, policy: policy}
+	ctx.SetValue(runtime, sessionRuntimeContextKey)
 	return store, client
+}
+
+// InitializeSessionRollout runs after module migrations and before HTTP serve.
+// The #725 Redis floor and deprecated MODE are consulted only if the MySQL
+// singleton does not exist yet; every later boot reads MySQL exclusively.
+func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControlStore, error) {
+	if ctx == nil {
+		return RolloutBoot{}, nil, errors.New("auth: initialize session rollout requires non-nil context")
+	}
+	runtime, ok := ctx.Value(sessionRuntimeContextKey).(*sessionRuntime)
+	if !ok || runtime == nil {
+		return RolloutBoot{}, nil, errors.New("auth: session store must be constructed before rollout initialization")
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.control != nil {
+		return runtime.boot, runtime.control, nil
+	}
+	if ctx.DB() == nil {
+		return RolloutBoot{}, nil, errors.New("auth: session rollout requires MySQL")
+	}
+	control := NewRolloutControlStore(ctx.DB())
+	state, err := loadRolloutStateWithTimeout(context.Background(), control)
+	outcome := RolloutBootNormal
+	if errors.Is(err, ErrRolloutStateUninitialized) {
+		bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		legacy, legacyErr := runtime.store.RolloutControl(bootCtx)
+		if legacyErr != nil {
+			return RolloutBoot{}, nil, fmt.Errorf("auth: read #725 rollout floor for MySQL takeover: %w", legacyErr)
+		}
+		legacyFloor := SessionMode("")
+		legacyMaxPerUID := 0
+		if legacy != nil {
+			legacyFloor = legacy.ModeFloor
+			legacyMaxPerUID = legacy.MaxPerUID
+		}
+		seed, seedErr := ResolveRolloutSeed(
+			legacyFloor,
+			runtime.policy.legacyMode,
+			legacyMaxPerUID,
+			runtime.policy.legacyMaxPerUID,
+		)
+		if seedErr != nil {
+			return RolloutBoot{}, nil, seedErr
+		}
+		seed.Actor = "startup"
+		switch {
+		case legacyFloor.valid():
+			seed.Source = "legacy-redis"
+			outcome = RolloutBootAdopted
+		case runtime.policy.legacyMode.valid() && runtime.policy.legacyMode != SessionModeExpand:
+			seed.Source = "legacy-env"
+			outcome = RolloutBootAdopted
+		default:
+			seed.Source = "bootstrap"
+			outcome = RolloutBootFresh
+		}
+		if redisID, idErr := runtime.store.currentRedisInstanceID(); idErr == nil {
+			seed.RedisID = redisID
+		}
+		state, err = control.Initialize(bootCtx, seed)
+	}
+	if err != nil {
+		return RolloutBoot{}, nil, err
+	}
+	mode := state.Floor
+	if runtime.policy.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
+		mode = mode.next()
+	}
+	if err := runtime.store.ApplyRolloutState(state, mode); err != nil {
+		return RolloutBoot{}, nil, err
+	}
+	boot := RolloutBoot{
+		Outcome:       outcome,
+		Floor:         state.Floor,
+		Mode:          runtime.store.Mode(),
+		MaxPerUID:     state.MaxPerUID,
+		Version:       state.Version,
+		AutoAdvance:   runtime.policy.autoAdvance,
+		CanaryAhead:   runtime.policy.canaryAhead,
+		ExpectWriters: runtime.policy.expectWriters,
+	}
+	runtime.control = control
+	runtime.boot = boot
+	return boot, control, nil
+}
+
+// SessionBootForContext exposes what boot resolved, for the startup log line
+// and the rollout status subcommand.
+func SessionBootForContext(ctx *config.Context) (RolloutBoot, []string) {
+	if existing, ok := ctx.Value(sessionRuntimeContextKey).(*sessionRuntime); ok {
+		existing.mu.Lock()
+		defer existing.mu.Unlock()
+		return existing.boot, append([]string(nil), existing.policy.warnings...)
+	}
+	return RolloutBoot{}, nil
+}
+
+type rolloutStateLoader interface {
+	Load(context.Context) (RolloutState, error)
+}
+
+func loadRolloutStateWithTimeout(ctx context.Context, loader rolloutStateLoader) (RolloutState, error) {
+	readCtx, cancel := context.WithTimeout(ctx, rolloutControlReadTimeout)
+	defer cancel()
+	return loader.Load(readCtx)
 }
 
 func sessionRedisOptionsFromEnv() (sessionRedisOptions, error) {
