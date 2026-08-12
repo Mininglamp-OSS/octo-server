@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -94,6 +93,8 @@ func (d *botfatherDB) queryRobotsByCreatorUIDAndSpaceID(creatorUID, spaceID stri
 // Space must exist; LIMIT 2 distinguishes unique from ambiguous without
 // relying on row order.
 func (d *botfatherDB) resolveAuthorizedCreationSpace(creatorUID, selectedSpaceID string) (string, error) {
+	// Bot provisioning intentionally treats an account in the deletion cooling-off
+	// period as inactive, even though ordinary messaging remains available.
 	const activeMembershipSQL = `
 		SELECT sm.space_id
 		FROM user u
@@ -130,18 +131,16 @@ func (d *botfatherDB) resolveAuthorizedCreationSpace(creatorUID, selectedSpaceID
 }
 
 // bindCreatedBotToSpace is the final authorization check and membership write.
-// Locking the three authority rows before the INSERT prevents a stale preflight
-// decision from authorizing the commit after a concurrent disable/removal.
-func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string) (retErr error) {
+// Lock in user -> space -> space_member order; future transactions must not lock
+// a Space member before its parent Space. Locking the authority rows before the
+// INSERT prevents a stale preflight decision from authorizing the commit after a
+// concurrent disable/removal.
+func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string) error {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin Bot Space binding: %w", err)
 	}
-	defer func() {
-		if retErr != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer tx.RollbackUnlessCommitted()
 
 	var creator struct {
 		Status    int
@@ -183,11 +182,11 @@ func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string)
 		return fmt.Errorf("lock Bot creator membership: %w", err)
 	}
 
-	now := time.Now()
-	result, err := tx.InsertInto("space_member").
-		Columns("space_id", "uid", "role", "status", "created_at", "updated_at").
-		Values(spaceID, robotID, 0, 1, now, now).
-		Exec()
+	result, err := tx.InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceID,
+		robotID,
+	).Exec()
 	if err != nil {
 		return fmt.Errorf("insert Bot Space membership: %w", err)
 	}
@@ -205,15 +204,19 @@ func (d *botfatherDB) bindCreatedBotToSpace(creatorUID, robotID, spaceID string)
 }
 
 // deleteCreatedBotArtifacts compensates a failed post-core Space binding. The
-// hard delete clears every newly-created credential-bearing row atomically.
+// hard delete clears every newly-created credential-bearing row atomically. The
+// creator UID confines friendship cleanup to the two newly-created pair rows,
+// preserving the friend table's (uid, to_uid) index access path.
 // If that transaction fails, best-effort fail-closed updates disable the Bot
 // and blank credentials so cleanup failure cannot leave a usable active Bot.
-func (d *botfatherDB) deleteCreatedBotArtifacts(robotID string) error {
+func (d *botfatherDB) deleteCreatedBotArtifacts(creatorUID, robotID string) error {
 	tx, err := d.session.Begin()
 	if err == nil {
 		steps := []func() error{
 			func() error {
-				_, stepErr := tx.DeleteFrom("friend").Where("uid=? OR to_uid=?", robotID, robotID).Exec()
+				_, stepErr := tx.DeleteFrom("friend").
+					Where("(uid=? AND to_uid=?) OR (uid=? AND to_uid=?)", creatorUID, robotID, robotID, creatorUID).
+					Exec()
 				return stepErr
 			},
 			func() error {

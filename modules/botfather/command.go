@@ -848,12 +848,13 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 		robotID = username
 	}
 	if err != nil {
-		// Conversational creation always uses a server-generated ID, so it is
-		// safe to compensate even when the core transaction's Commit result was
-		// ambiguous. Explicit usernames are used only by non-conversational
-		// callers and are intentionally not cleaned here.
+		// Production conversational creation always uses a server-generated ID,
+		// so it is safe to compensate even when the core transaction's Commit
+		// result was ambiguous. The non-empty username branch is retained only as
+		// a deterministic internal test seam: its ID might pre-exist after an
+		// ambiguous or collision-like core failure, so do not delete it here.
 		if username == "" && robotID != "" {
-			if cleanupErr := h.db.deleteCreatedBotArtifacts(robotID); cleanupErr != nil {
+			if cleanupErr := h.db.deleteCreatedBotArtifacts(creatorUID, robotID); cleanupErr != nil {
 				h.Error("Bot核心创建补偿失败",
 					zap.String("reason", "core_creation_cleanup_failed"))
 			}
@@ -871,7 +872,7 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 			reason = "space_authorization_changed"
 		}
 		h.Warn("Bot Space绑定失败", zap.String("reason", reason))
-		cleanupErr := h.db.deleteCreatedBotArtifacts(robotID)
+		cleanupErr := h.db.deleteCreatedBotArtifacts(creatorUID, robotID)
 		if cleanupErr != nil {
 			h.Error("Bot创建补偿失败",
 				zap.String("reason", "space_binding_cleanup_failed"))

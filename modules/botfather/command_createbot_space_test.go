@@ -425,10 +425,8 @@ func TestDeleteCreatedBotArtifactsFallsBackToCredentialRevocation(t *testing.T) 
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"DELETE FROM friend WHERE (uid=? AND to_uid=?) OR (uid=? AND to_uid=?)",
-	)).
-		WithArgs(creatorUID, botID, botID, creatorUID).
-		WillReturnError(deleteErr)
+		"DELETE FROM `friend` WHERE ((uid='user_synthetic_cleanup_creator' AND to_uid='bot_synthetic_cleanup') OR (uid='bot_synthetic_cleanup' AND to_uid='user_synthetic_cleanup_creator'))",
+	)).WillReturnError(deleteErr)
 	mock.ExpectRollback()
 	mock.ExpectExec("UPDATE robot SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE user SET status=0").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -458,10 +456,8 @@ func TestDeleteCreatedBotArtifactsDeletesOnlyCreatorFriendPairs(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(
-		"DELETE FROM friend WHERE (uid=? AND to_uid=?) OR (uid=? AND to_uid=?)",
-	)).
-		WithArgs(creatorUID, botID, botID, creatorUID).
-		WillReturnResult(sqlmock.NewResult(0, 2))
+		"DELETE FROM `friend` WHERE ((uid='user_synthetic_cleanup_creator' AND to_uid='bot_synthetic_cleanup') OR (uid='bot_synthetic_cleanup' AND to_uid='user_synthetic_cleanup_creator'))",
+	)).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec("DELETE FROM .*space_member.*").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("DELETE FROM .*user.*").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("DELETE FROM .*robot.*").WillReturnResult(sqlmock.NewResult(0, 1))
