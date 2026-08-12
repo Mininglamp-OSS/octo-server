@@ -25,6 +25,7 @@ func TestManagerCapabilities(t *testing.T) {
 	superOnly := []string{
 		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
 		"users.write", "users.manage_admin", "groups.write", "skill.write", "skill.read", "mcp.write", "mcp.read",
+		"expert.write", "expert.read",
 	}
 	adminTier := []string{
 		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",

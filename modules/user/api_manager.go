@@ -180,6 +180,8 @@ func (m *Manager) me(c *wkhttp.Context) {
 //   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（requireSuperAdmin）
 //   - mcp.read          = 系统 MCP 列表/详情查看（requireSuperAdmin）
 //   - mcp.write         = 系统 MCP 创建/编辑/删除（requireSuperAdmin）
+//   - expert.read       = 专家市场 专家/专家团 列表/详情查看（requireSuperAdmin）
+//   - expert.write      = 专家市场 上传新建/编辑/删除 + 分类管理（requireSuperAdmin）
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
@@ -200,6 +202,8 @@ func managerCapabilities(role string) map[string]bool {
 		"skill.write":        isSuper, // 系统 Skill 创建/编辑/删除/分类管理（marketplace admin surface）
 		"mcp.read":           isSuper, // 系统 MCP 列表/详情（marketplace admin surface 只认共享 X-Admin-Token 不分 role，此处收窄到超管以缩小页面暴露面）
 		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（同上）
+		"expert.read":        isSuper, // 专家市场 专家/专家团 列表/详情（marketplace admin surface 收窄到超管）
+		"expert.write":       isSuper, // 专家市场 创建(上传)/编辑/删除 + 分类管理（同上）
 		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
 		"appversion.read": isAdmin,                            // 版本列表
 		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
