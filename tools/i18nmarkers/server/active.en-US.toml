@@ -450,6 +450,12 @@ other = "Message search failed."
 ["err.server.message.store_failed"]
 other = "Failed to persist message data."
 
+["err.server.notification.pause.invalid_time"]
+other = "Notification pause time is invalid."
+
+["err.server.notification.pause.update_failed"]
+other = "Failed to update notification pause state."
+
 ["err.server.oidc.bind_already_bound"]
 other = "This identity is already bound. Please sign in via OIDC to continue."
 

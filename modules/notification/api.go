@@ -1,13 +1,13 @@
 package notification
 
 import (
-	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -22,7 +22,7 @@ func New(ctx *config.Context) *Service {
 }
 
 func (s *Service) Route(r *wkhttp.WKHttp) {
-	user := r.Group("/v1/user", s.ctx.AuthMiddleware(r))
+	user := r.Group("/v1/user", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
 	{
 		user.GET("/notification-pause", s.getPause)
 		user.PUT("/notification-pause", s.putPause)
@@ -108,12 +108,12 @@ func (s *Service) sendChangedCMD(uid string, response pauseResponse) error {
 }
 
 func (s *Service) writeInvalidTime(c *wkhttp.Context) {
-	c.JSON(http.StatusBadRequest, errorResponse{Code: "notification_pause_invalid_time"})
+	respondInvalidPauseTime(c)
 }
 
 func (s *Service) writeStoreError(c *wkhttp.Context, err error) {
 	s.Error("通知暂停状态存储失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
-	c.JSON(http.StatusInternalServerError, errorResponse{Code: "notification_pause_update_failed"})
+	respondPauseUpdateFailed(c)
 }
 
 // ActiveUIDs returns the account-level pause state for a batch of recipients.

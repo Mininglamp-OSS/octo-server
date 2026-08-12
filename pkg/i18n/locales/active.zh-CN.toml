@@ -1090,3 +1090,11 @@ other = "运营看板 ETL 正在运行，请稍后再试。"
 
 ["err.server.opanalytics.etl_trigger_failed"]
 other = "触发运营看板 ETL 失败。"
+
+# ---- modules/notification：账号级快捷静音 ----
+
+["err.server.notification.pause.invalid_time"]
+other = "通知暂停时间无效。"
+
+["err.server.notification.pause.update_failed"]
+other = "更新通知暂停状态失败。"

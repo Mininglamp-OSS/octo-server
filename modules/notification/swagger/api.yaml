@@ -115,7 +115,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
           example:
-            code: notification_pause_invalid_time
+            code: err.server.notification.pause.invalid_time
     UpdateFailed:
       description: Database update failed
       content:
@@ -123,4 +123,4 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
           example:
-            code: notification_pause_update_failed
+            code: err.server.notification.pause.update_failed

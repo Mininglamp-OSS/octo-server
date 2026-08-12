@@ -21,7 +21,3 @@ type pauseResponse struct {
 type updatePauseRequest struct {
 	PausedUntil time.Time `json:"paused_until"`
 }
-
-type errorResponse struct {
-	Code string `json:"code"`
-}
