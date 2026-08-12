@@ -946,7 +946,11 @@ func startSessionRolloutControl(
 	// Join has already created the local identity and started its heartbeat, so
 	// a transient first failure need not hold issuance fenced until the poll tick.
 	if publishErr := tokenStore.ApplyAndPublishRolloutState(
-		writerRegistry, tokenStore.Mode(), sessionBoot.MaxPerUID,
+		writerRegistry,
+		auth.RolloutState{
+			Floor: sessionBoot.Floor, MaxPerUID: sessionBoot.MaxPerUID, Version: sessionBoot.Version,
+		},
+		tokenStore.Mode(),
 	); publishErr != nil {
 		log.Warn("session rollout: initial state publication failed; issuance remains fenced: " + publishErr.Error())
 	}

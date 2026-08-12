@@ -117,19 +117,20 @@ type SessionStoreOption func(*RedisSessionStore)
 type derivedRolloutState struct {
 	mode      SessionMode
 	maxPerUID int
+	version   int64
 }
 
 func WithSessionMode(mode SessionMode) SessionStoreOption {
 	return func(store *RedisSessionStore) {
 		current := store.currentState()
-		store.state.Store(&derivedRolloutState{mode: mode, maxPerUID: current.maxPerUID})
+		store.state.Store(&derivedRolloutState{mode: mode, maxPerUID: current.maxPerUID, version: current.version})
 	}
 }
 
 func WithSessionMaxPerUID(max int) SessionStoreOption {
 	return func(store *RedisSessionStore) {
 		current := store.currentState()
-		store.state.Store(&derivedRolloutState{mode: current.mode, maxPerUID: max})
+		store.state.Store(&derivedRolloutState{mode: current.mode, maxPerUID: max, version: current.version})
 	}
 }
 
@@ -151,9 +152,15 @@ func (s *RedisSessionStore) currentMaxPerUID() int { return s.currentState().max
 // A missing or unusable cap does NOT block reader strictness. The cap is
 // enforced on the write path (see writableState), so a malformed control row
 // cannot loosen validation and credential issuance still fails closed.
-func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) error {
+func (s *RedisSessionStore) ApplyRolloutState(state RolloutState, mode SessionMode) error {
+	if err := validateRolloutState(state); err != nil {
+		return err
+	}
 	if !mode.valid() {
 		return fmt.Errorf("auth: cannot apply invalid session mode %q", mode)
+	}
+	if mode.rank() < state.Floor.rank() {
+		return fmt.Errorf("auth: cannot apply session mode %q below control floor %q", mode, state.Floor)
 	}
 	for {
 		currentPointer := s.state.Load()
@@ -166,23 +173,23 @@ func (s *RedisSessionStore) ApplyRolloutState(mode SessionMode, maxPerUID int) e
 		if nextMode.rank() < current.mode.rank() {
 			nextMode = current.mode
 		}
-		nextMaxPerUID := maxPerUID
-		if nextMaxPerUID <= 0 {
-			nextMaxPerUID = current.maxPerUID
+		nextVersion := current.version
+		nextMaxPerUID := current.maxPerUID
+		switch {
+		case state.Version > current.version:
+			// Version identifies the MySQL snapshot, so a newer snapshot may
+			// deliberately tighten or raise the cap.
+			nextVersion = state.Version
+			nextMaxPerUID = state.MaxPerUID
+		case current.maxPerUID <= 0 || current.maxPerUID > sessionMaxPerUIDLimit:
+			// A stale snapshot may heal unusable local cap state, but cannot
+			// overwrite a valid cap paired with a newer control version.
+			nextMaxPerUID = state.MaxPerUID
 		}
-		if nextMaxPerUID > sessionMaxPerUIDLimit {
-			nextMaxPerUID = sessionMaxPerUIDLimit
-		}
-		if mode.rank() < current.mode.rank() &&
-			current.maxPerUID > 0 && current.maxPerUID <= sessionMaxPerUIDLimit {
-			// A stale floor may heal a missing cap, but must not overwrite a
-			// usable cap that arrived with a newer floor snapshot.
-			nextMaxPerUID = current.maxPerUID
-		}
-		if nextMode == current.mode && nextMaxPerUID == current.maxPerUID {
+		if nextMode == current.mode && nextMaxPerUID == current.maxPerUID && nextVersion == current.version {
 			return nil
 		}
-		next := &derivedRolloutState{mode: nextMode, maxPerUID: nextMaxPerUID}
+		next := &derivedRolloutState{mode: nextMode, maxPerUID: nextMaxPerUID, version: nextVersion}
 		if s.state.CompareAndSwap(currentPointer, next) {
 			return nil
 		}
@@ -817,13 +824,20 @@ func (s *RedisSessionStore) mayWrite() bool {
 // fenced before the local reader changes; the registry state and lease are
 // then published atomically. Any failure keeps the fence closed until a later
 // poll successfully republishes the same applied state.
-func (s *RedisSessionStore) ApplyAndPublishRolloutState(registry *WriterRegistry, mode SessionMode, maxPerUID int) error {
+func (s *RedisSessionStore) ApplyAndPublishRolloutState(
+	registry *WriterRegistry,
+	state RolloutState,
+	mode SessionMode,
+) error {
 	current := s.currentState()
-	if !s.issuanceFenced.Load() && current.mode == mode && current.maxPerUID == maxPerUID {
-		return nil
+	if !s.issuanceFenced.Load() && current.mode == mode && current.maxPerUID == state.MaxPerUID {
+		// Pause/resume also increments the durable version. Record that newer
+		// snapshot locally without fencing or republishing an unchanged runtime
+		// mode/cap pair.
+		return s.ApplyRolloutState(state, mode)
 	}
 	s.issuanceFenced.Store(true)
-	if err := s.ApplyRolloutState(mode, maxPerUID); err != nil {
+	if err := s.ApplyRolloutState(state, mode); err != nil {
 		return err
 	}
 	applied := s.currentMode()

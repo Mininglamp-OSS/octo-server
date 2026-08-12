@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	rolloutStateTable        = "octo_session_rollout_state"
-	rolloutAdvanceTable      = "octo_session_rollout_advance"
-	defaultRecoveryMaxPerUID = 20
-	rolloutInitializeRetries = 8
+	rolloutStateTable          = "octo_session_rollout_state"
+	rolloutAdvanceTable        = "octo_session_rollout_advance"
+	defaultRecoveryMaxPerUID   = 20
+	rolloutInitializeRetries   = 8
+	defaultRolloutWriteTimeout = 5 * time.Second
 )
 
 var ErrRolloutStateUninitialized = errors.New("auth: session rollout state is not initialized")
@@ -81,14 +82,15 @@ func ResolveRolloutSeed(
 // RolloutControlStore owns the singleton state and its append-only advance
 // evidence. All irreversible changes happen in one MySQL transaction.
 type RolloutControlStore struct {
-	db *dbr.Session
+	db           *dbr.Session
+	writeTimeout time.Duration
 }
 
 func NewRolloutControlStore(db *dbr.Session) *RolloutControlStore {
 	if db == nil {
 		panic("auth: NewRolloutControlStore requires a non-nil session")
 	}
-	return &RolloutControlStore{db: db}
+	return &RolloutControlStore{db: db, writeTimeout: defaultRolloutWriteTimeout}
 }
 
 func (s *RolloutControlStore) Load(ctx context.Context) (RolloutState, error) {
@@ -112,6 +114,9 @@ func (s *RolloutControlStore) Load(ctx context.Context) (RolloutState, error) {
 // Initialize creates or monotonically adopts a takeover seed under a row lock.
 // Concurrent starters serialize here; the strictest seed eventually wins.
 func (s *RolloutControlStore) Initialize(ctx context.Context, seed RolloutSeed) (RolloutState, error) {
+	writeCtx, cancel := s.writeContext(ctx)
+	defer cancel()
+	ctx = writeCtx
 	var lastErr error
 	for attempt := 0; attempt < rolloutInitializeRetries; attempt++ {
 		state, err := s.initializeOnce(ctx, seed)
@@ -227,6 +232,9 @@ func (s *RolloutControlStore) Advance(ctx context.Context, current RolloutState,
 	if maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit {
 		return RolloutState{}, ErrSessionCapUnavailable
 	}
+	writeCtx, cancel := s.writeContext(ctx)
+	defer cancel()
+	ctx = writeCtx
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return RolloutState{}, fmt.Errorf("auth: begin rollout advance: %w", err)
@@ -257,7 +265,70 @@ func (s *RolloutControlStore) Advance(ctx context.Context, current RolloutState,
 	return current, nil
 }
 
+// SetMaxPerUID atomically updates the durable cap and appends the old/new value
+// to the same audit stream. It does not move the rollout floor and it does not
+// evict existing sessions; a lower cap gates subsequent index additions.
+func (s *RolloutControlStore) SetMaxPerUID(
+	ctx context.Context,
+	current RolloutState,
+	maxPerUID int,
+	actor string,
+) (RolloutState, error) {
+	if err := validateRolloutState(current); err != nil {
+		return RolloutState{}, err
+	}
+	if maxPerUID <= 0 || maxPerUID > sessionMaxPerUIDLimit {
+		return RolloutState{}, fmt.Errorf("auth: max_per_uid must be between 1 and %d", sessionMaxPerUIDLimit)
+	}
+	if maxPerUID == current.MaxPerUID {
+		return current, nil
+	}
+	writeCtx, cancel := s.writeContext(ctx)
+	defer cancel()
+	ctx = writeCtx
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RolloutState{}, fmt.Errorf("auth: begin rollout cap update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	record := RolloutAdvanceRecord{
+		From:  current.Floor,
+		To:    current.Floor,
+		Actor: firstNonEmpty(actor, "operator"),
+		CapChange: &RolloutCapChange{
+			FromMaxPerUID: current.MaxPerUID,
+			ToMaxPerUID:   maxPerUID,
+		},
+	}
+	if err := insertRolloutAdvance(ctx, tx, record, "set-cap"); err != nil {
+		return RolloutState{}, err
+	}
+	result, err := tx.ExecContext(ctx,
+		"UPDATE "+rolloutStateTable+" SET max_per_uid = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE singleton_id = 1 AND version = ? AND floor = ? AND max_per_uid = ?",
+		maxPerUID, current.Version, string(current.Floor), current.MaxPerUID,
+	)
+	if err != nil {
+		return RolloutState{}, fmt.Errorf("auth: update session rollout cap: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return RolloutState{}, fmt.Errorf("auth: inspect session rollout cap update: %w", err)
+	}
+	if changed != 1 {
+		return RolloutState{}, ErrRolloutControlChanged
+	}
+	if err := tx.Commit(); err != nil {
+		return RolloutState{}, fmt.Errorf("auth: commit session rollout cap update: %w", err)
+	}
+	current.MaxPerUID = maxPerUID
+	current.Version++
+	return current, nil
+}
+
 func (s *RolloutControlStore) SetPaused(ctx context.Context, paused bool) error {
+	writeCtx, cancel := s.writeContext(ctx)
+	defer cancel()
+	ctx = writeCtx
 	result, err := s.db.ExecContext(ctx,
 		"UPDATE "+rolloutStateTable+" SET paused = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE singleton_id = 1",
 		paused,
@@ -297,11 +368,19 @@ func (s *RolloutControlStore) LastAdvance(ctx context.Context) (*RolloutAdvanceR
 		return nil, fmt.Errorf("auth: load last rollout advance: %w", err)
 	}
 	if len(evidence) > 0 && string(evidence) != "null" {
-		var observation SessionObservation
-		if err := json.Unmarshal(evidence, &observation); err != nil {
-			return nil, fmt.Errorf("auth: decode rollout advance evidence: %w", err)
+		if record.Kind == "set-cap" {
+			var capChange RolloutCapChange
+			if err := json.Unmarshal(evidence, &capChange); err != nil {
+				return nil, fmt.Errorf("auth: decode rollout cap audit: %w", err)
+			}
+			record.CapChange = &capChange
+		} else {
+			var observation SessionObservation
+			if err := json.Unmarshal(evidence, &observation); err != nil {
+				return nil, fmt.Errorf("auth: decode rollout advance evidence: %w", err)
+			}
+			record.Observation = &observation
 		}
-		record.Observation = &observation
 	}
 	return &record, nil
 }
@@ -324,7 +403,14 @@ func loadRolloutStateForUpdate(ctx context.Context, tx *dbr.Tx) (RolloutState, b
 }
 
 func insertRolloutAdvance(ctx context.Context, tx *dbr.Tx, record RolloutAdvanceRecord, kind string) error {
-	evidence, err := json.Marshal(record.Observation)
+	var payload interface{} = record.Observation
+	if kind == "set-cap" {
+		if record.CapChange == nil {
+			return errors.New("auth: set-cap audit requires old and new cap")
+		}
+		payload = record.CapChange
+	}
+	evidence, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("auth: encode rollout advance evidence: %w", err)
 	}
@@ -337,6 +423,14 @@ func insertRolloutAdvance(ctx context.Context, tx *dbr.Tx, record RolloutAdvance
 		return fmt.Errorf("auth: insert rollout advance evidence: %w", err)
 	}
 	return nil
+}
+
+func (s *RolloutControlStore) writeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.writeTimeout
+	if timeout <= 0 {
+		timeout = defaultRolloutWriteTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func validateRolloutState(state RolloutState) error {

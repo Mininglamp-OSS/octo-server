@@ -283,7 +283,7 @@ func TestRolloutControlSetMaxPerUIDCommitsAuditAndCASAtomically(t *testing.T) {
 	current := RolloutState{Floor: SessionModeRevoke, MaxPerUID: 20, Version: 7}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO octo_session_rollout_advance")).
-		WithArgs("revoke", "revoke", "operator", `{"from_max_per_uid":20,"to_max_per_uid":5}`, "", "", "set-cap").
+		WithArgs("revoke", "revoke", "operator", []byte(`{"from_max_per_uid":20,"to_max_per_uid":5}`), "", "", "set-cap").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE octo_session_rollout_state SET max_per_uid = ?, version = version + 1")).
 		WithArgs(5, int64(7), "revoke", 20).

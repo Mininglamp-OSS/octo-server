@@ -173,7 +173,9 @@ func TestLegacyMigrationApplyRequiresFloorAndOnlyShortensLegacy(t *testing.T) {
 	require.ErrorContains(t, err, "MySQL rollout floor revoke")
 	require.Equal(t, -time.Millisecond, mustPTTL(t, client, store.tokenKey("persistent-v1")))
 	require.Equal(t, int64(0), mustExists(t, client, store.migrationCampaignKey("apply"), store.migrationCheckpointKey("apply"), store.migrationLockKey()))
-	require.NoError(t, store.ApplyRolloutState(SessionModeRevoke, 10))
+	require.NoError(t, store.ApplyRolloutState(RolloutState{
+		Floor: SessionModeRevoke, MaxPerUID: 10, Version: 1,
+	}, SessionModeRevoke))
 
 	require.NoError(t, client.Set(store.tokenKey("long-v2"), v2Fixture(t, "long"), 2*time.Hour).Err())
 	require.NoError(t, client.Set(store.tokenKey("short-v2"), v2Fixture(t, "short"), 5*time.Minute).Err())

@@ -496,7 +496,9 @@ func TestRolloutReconcilerFailClosedBranchesAndBackoff(t *testing.T) {
 	}
 	canaryStore, _ := newLegacyMigrationTestStore(t, SessionModeExpand)
 	canary := NewRolloutReconciler(canaryStore, ReconcilerOptions{Registry: canaryRegistry, CanaryAhead: true})
-	require.NoError(t, canary.applyAndPublish(SessionModeExpand, 20))
+	require.NoError(t, canary.applyAndPublish(RolloutState{
+		Floor: SessionModeExpand, MaxPerUID: 20, Version: 1,
+	}))
 	require.Equal(t, SessionModeV3Write, canaryStore.Mode())
 	require.Error(t, canary.advance(ctx, RolloutAdvanceDecision{}, "reconciler"))
 }

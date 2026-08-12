@@ -13,6 +13,7 @@ package main
 //	status          diagnosis — where the floor is and what is blocking it
 //	migrate         the one real decision: cutoff and finite policy, i.e. how
 //	                many people get logged out early
+//	set-cap         versioned, audited update of the durable session cap
 //	pause / resume  the escape hatch
 //	advance --force fault channel for when the reconciler itself is broken
 //
@@ -57,6 +58,7 @@ var sessionRolloutSubcommands = map[string]bool{
 	"status":  true,
 	"observe": true,
 	"migrate": true,
+	"set-cap": true,
 	"pause":   true,
 	"resume":  true,
 	"advance": true,
@@ -67,7 +69,7 @@ var sessionRolloutSubcommands = map[string]bool{
 // server's own -config flag.
 func runSessionRolloutCommand(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: app session-rollout <status|observe|migrate|pause|resume|advance> [flags]")
+		return errors.New("usage: app session-rollout <status|observe|migrate|set-cap|pause|resume|advance> [flags]")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -88,6 +90,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	confirmElapsed := flags.Bool("confirm-elapsed-cutoff", false, "confirm immediate deletion when the cutoff has elapsed")
 	force := flags.Bool("force", false, "advance: fault channel for when the reconciler is broken")
 	yes := flags.Bool("yes", false, "advance --force: confirm")
+	maxPerUID := flags.Int("max-per-uid", 0, "set-cap: durable per-UID session limit (1-10000)")
 	expectWriters := flags.Int("expect-writers", 0, "advance: replica count the deployment intends to run")
 	observeWindow := flags.Duration("observe-window", 90*time.Second,
 		"advance: how long to watch the writer set hold still before the first v3 floor")
@@ -96,6 +99,14 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("%s %s does not accept positional arguments", sessionRolloutCommand, sub)
+	}
+	if sub == "set-cap" {
+		if !*yes {
+			return errors.New("set-cap requires --yes")
+		}
+		if *maxPerUID <= 0 || *maxPerUID > auth.SessionMaxPerUIDLimit {
+			return fmt.Errorf("set-cap --max-per-uid must be between 1 and %d", auth.SessionMaxPerUIDLimit)
+		}
 	}
 	// Validated here, once, for every subcommand that scans. observe and migrate
 	// each checked --qps and status did not, so `status --qps 0` ran an
@@ -145,7 +156,7 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := store.ApplyRolloutState(state.Floor, state.MaxPerUID); err != nil {
+	if err := store.ApplyRolloutState(state, state.Floor); err != nil {
 		return err
 	}
 
@@ -165,6 +176,11 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 			lease:          *lease,
 			apply:          *apply,
 			confirmElapsed: *confirmElapsed,
+		})
+	case "set-cap":
+		return sessionRolloutSetCap(ctx, control, state, out, sessionRolloutSetCapArgs{
+			maxPerUID: *maxPerUID,
+			yes:       *yes,
 		})
 	case "pause":
 		if err := control.SetPaused(ctx, true); err != nil {
@@ -192,6 +208,50 @@ func runSessionRolloutCommand(args []string, out io.Writer) error {
 		// adding a name to that map without a case here fails loudly.
 		return fmt.Errorf("unhandled %s subcommand %q", sessionRolloutCommand, sub)
 	}
+}
+
+type rolloutCapSetter interface {
+	SetMaxPerUID(context.Context, auth.RolloutState, int, string) (auth.RolloutState, error)
+}
+
+type sessionRolloutSetCapArgs struct {
+	maxPerUID int
+	yes       bool
+}
+
+type sessionRolloutSetCapReport struct {
+	Floor         string `json:"floor"`
+	FromMaxPerUID int    `json:"from_max_per_uid"`
+	ToMaxPerUID   int    `json:"to_max_per_uid"`
+	Version       int64  `json:"version"`
+}
+
+func sessionRolloutSetCap(
+	ctx context.Context,
+	control rolloutCapSetter,
+	current auth.RolloutState,
+	out io.Writer,
+	args sessionRolloutSetCapArgs,
+) error {
+	if !args.yes {
+		return errors.New("set-cap requires --yes")
+	}
+	if args.maxPerUID <= 0 || args.maxPerUID > auth.SessionMaxPerUIDLimit {
+		return fmt.Errorf("set-cap --max-per-uid must be between 1 and %d", auth.SessionMaxPerUIDLimit)
+	}
+	if control == nil {
+		return errors.New("set-cap requires MySQL rollout control")
+	}
+	next, err := control.SetMaxPerUID(ctx, current, args.maxPerUID, "operator")
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(out).Encode(sessionRolloutSetCapReport{
+		Floor:         string(next.Floor),
+		FromMaxPerUID: current.MaxPerUID,
+		ToMaxPerUID:   next.MaxPerUID,
+		Version:       next.Version,
+	})
 }
 
 // validateScanRate bounds both throttle knobs. The ceiling on --qps is not

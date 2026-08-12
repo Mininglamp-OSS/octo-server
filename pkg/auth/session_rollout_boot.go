@@ -16,6 +16,7 @@ type RolloutBoot struct {
 	Floor         SessionMode
 	Mode          SessionMode
 	MaxPerUID     int
+	Version       int64
 	Warning       string
 	AutoAdvance   bool
 	CanaryAhead   bool

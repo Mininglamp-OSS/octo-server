@@ -33,7 +33,10 @@ const (
 	// of the two applies.
 	sessionAutoAdvanceEnv = "OCTO_AUTH_SESSION_AUTO_ADVANCE"
 
-	sessionMaxPerUIDLimit = 10_000
+	// SessionMaxPerUIDLimit is shared by the persisted authority and the operator
+	// command so they cannot drift on the accepted control range.
+	SessionMaxPerUIDLimit = 10_000
+	sessionMaxPerUIDLimit = SessionMaxPerUIDLimit
 )
 
 // SessionMode is the deployment phase for user HTTP sessions. Its zero value is

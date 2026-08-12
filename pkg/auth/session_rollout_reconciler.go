@@ -51,6 +51,14 @@ type RolloutAdvanceRecord struct {
 	RedisID           string              `json:"redis_instance_id,omitempty"`
 	WriterFingerprint string              `json:"writer_fingerprint,omitempty"`
 	Observation       *SessionObservation `json:"observation,omitempty"`
+	CapChange         *RolloutCapChange   `json:"cap_change,omitempty"`
+}
+
+// RolloutCapChange is stored in the append-only audit row for a cap-only
+// control transition. The floor remains unchanged for this transition.
+type RolloutCapChange struct {
+	FromMaxPerUID int `json:"from_max_per_uid"`
+	ToMaxPerUID   int `json:"to_max_per_uid"`
 }
 
 // RolloutReconciler polls the floor and, when enabled, advances it.
@@ -181,7 +189,7 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 		r.log("session rollout: cannot read MySQL control state: %v", err)
 		return
 	}
-	if applyErr := r.applyAndPublish(state.Floor, state.MaxPerUID); applyErr != nil {
+	if applyErr := r.applyAndPublish(state); applyErr != nil {
 		r.log("session rollout: cannot apply floor %s: %v", state.Floor, applyErr)
 	}
 }
@@ -199,11 +207,13 @@ func (r *RolloutReconciler) pollFloor(ctx context.Context) {
 // The canary offset belongs here too: it is a property of this replica's
 // posture, not of where the mode came from, so a mode installed by
 // guess-clearing has to carry it exactly like one read from a floor record.
-func (r *RolloutReconciler) applyAndPublish(mode SessionMode, maxPerUID int) error {
+
+func (r *RolloutReconciler) applyAndPublish(state RolloutState) error {
+	mode := state.Floor
 	if r.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
 		mode = mode.next()
 	}
-	return r.store.ApplyAndPublishRolloutState(r.registry, mode, maxPerUID)
+	return r.store.ApplyAndPublishRolloutState(r.registry, state, mode)
 }
 
 // reconcileOnce evaluates the predicate and returns the earliest time the next

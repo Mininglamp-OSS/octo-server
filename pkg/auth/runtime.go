@@ -163,7 +163,7 @@ func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControl
 	if runtime.policy.canaryAhead && mode.rank() < SessionModeEnforce.rank() {
 		mode = mode.next()
 	}
-	if err := runtime.store.ApplyRolloutState(mode, state.MaxPerUID); err != nil {
+	if err := runtime.store.ApplyRolloutState(state, mode); err != nil {
 		return RolloutBoot{}, nil, err
 	}
 	boot := RolloutBoot{
@@ -171,6 +171,7 @@ func InitializeSessionRollout(ctx *config.Context) (RolloutBoot, *RolloutControl
 		Floor:         state.Floor,
 		Mode:          runtime.store.Mode(),
 		MaxPerUID:     state.MaxPerUID,
+		Version:       state.Version,
 		AutoAdvance:   runtime.policy.autoAdvance,
 		CanaryAhead:   runtime.policy.canaryAhead,
 		ExpectWriters: runtime.policy.expectWriters,
