@@ -10,21 +10,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestMain(m *testing.M) {
 	key := make([]byte, 16)
-	rand.Read(key)
-	os.Setenv("OCTO_MASTER_KEY", hex.EncodeToString(key)) // 32 hex chars = 32 bytes
-	os.Exit(m.Run())
+	_, _ = rand.Read(key)
+	_ = os.Setenv("OCTO_MASTER_KEY", hex.EncodeToString(key)) // 32 hex chars = 32 bytes
+	stopRollout, err := testsession.StartPackageRollout("qrcode-package-tests")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	stopRollout()
+	os.Exit(code)
 }
-
 
 func TestHandleJoinGroup_GroupNotFound(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
