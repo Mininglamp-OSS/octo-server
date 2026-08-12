@@ -13,6 +13,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	rd "github.com/go-redis/redis"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
@@ -321,6 +323,75 @@ func TestWriterRegistryStatePublicationAndShutdownAreFenced(t *testing.T) {
 		count, countErr := client.SCard(registry.rosterKey).Result()
 		return countErr == nil && count == 0
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestWriterRegistryLiveDoesNotPruneWriterRefreshedAfterSnapshot(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		stale func(*testing.T, *rd.Client, string)
+	}{
+		{
+			name: "missing entry",
+			stale: func(t *testing.T, client *rd.Client, key string) {
+				t.Helper()
+				require.NoError(t, client.Del(key).Err())
+			},
+		},
+		{
+			name: "malformed entry",
+			stale: func(t *testing.T, client *rd.Client, key string) {
+				t.Helper()
+				require.NoError(t, client.Set(key, "not-json", time.Minute).Err())
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store, publisherClient := newLegacyMigrationTestStore(t, SessionModeRevoke)
+			writer := NewWriterRegistry(publisherClient, store.UIDTokenPrefix())
+			writerID := "writer-" + util.GenerUUID()
+			writer.mu.Lock()
+			writer.self = WriterEntry{
+				ID:           writerID,
+				Build:        "build-a",
+				AppliedState: string(SessionModeRevoke),
+				StartedAtMS:  time.Now().UTC().UnixMilli(),
+			}
+			writer.mu.Unlock()
+			require.NoError(t, writer.refresh())
+			tt.stale(t, publisherClient, writer.entryKey(writerID))
+
+			readerClient := octoredis.NewInstrumentedClient(config.New())
+			t.Cleanup(func() { _ = readerClient.Close() })
+			reader := NewWriterRegistry(readerClient, store.UIDTokenPrefix())
+			var refreshed atomic.Bool
+			var refreshErr error
+			readerClient.WrapProcess(func(old func(rd.Cmder) error) func(rd.Cmder) error {
+				return func(cmd rd.Cmder) error {
+					err := old(cmd)
+					if cmd.Name() == "mget" && refreshed.CompareAndSwap(false, true) {
+						refreshErr = writer.refresh()
+					}
+					return err
+				}
+			})
+
+			live, err := reader.Live()
+			require.NoError(t, err)
+			require.NoError(t, refreshErr)
+			require.True(t, refreshed.Load(), "the test must refresh after the MGET snapshot")
+			require.Empty(t, live, "the completed snapshot may still report the old entry state")
+			require.True(t, writer.MayWrite(), "the refreshed writer is allowed to issue credentials")
+
+			member, err := readerClient.SIsMember(reader.rosterKey, writerID).Result()
+			require.NoError(t, err)
+			require.True(t, member, "cleanup from an older snapshot must not hide a refreshed writer")
+
+			live, err = reader.Live()
+			require.NoError(t, err)
+			require.Len(t, live, 1)
+			require.Equal(t, writerID, live[0].ID)
+		})
+	}
 }
 
 func TestRolloutAuditAndLegacyTakeoverRejectInvalidRedisState(t *testing.T) {
