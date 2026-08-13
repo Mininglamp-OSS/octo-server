@@ -30,6 +30,15 @@
         .btn[disabled], .btn.disabled { opacity: 0.5; pointer-events: none; }
         .btn-primary { background: #07c160; color: #fff; }
         .btn-secondary { background: #f0f0f0; color: #333; }
+        /* 下载行 = 下载按钮 + 复制链接。整行由 JS 在解析到合法地址后才显示。 */
+        .btn-row { gap: 8px; align-items: stretch; }
+        .btn-row .btn { flex: 1; min-width: 0; }
+        .btn-copy {
+            flex: 0 0 auto; padding: 0 16px; height: 44px;
+            border: none; border-radius: 22px; background: #f0f0f0; color: #666;
+            font-size: 14px; cursor: pointer; white-space: nowrap;
+        }
+        .btn-copy:active { opacity: 0.7; }
         .badge {
             display: inline-block; padding: 2px 10px; border-radius: 10px;
             font-size: 12px; line-height: 18px; margin-top: 8px;
@@ -66,8 +75,14 @@
             </div>
             <div class="btn-group">
                 <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
-                <a class="btn btn-secondary" id="btn-download-android" href="#" target="_blank" rel="noopener" style="display:none">下载 Android 版</a>
-                <a class="btn btn-secondary" id="btn-download-ios" href="#" target="_blank" rel="noopener" style="display:none">下载 iOS 版</a>
+                <div class="btn-row" id="row-download-android" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-android" href="#" target="_blank" rel="noopener">下载 Android 版</a>
+                    <button class="btn-copy" id="btn-copy-android" type="button">复制链接</button>
+                </div>
+                <div class="btn-row" id="row-download-ios" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-ios" href="#" target="_blank" rel="noopener">下载 iOS 版</a>
+                    <button class="btn-copy" id="btn-copy-ios" type="button">复制链接</button>
+                </div>
             </div>
         </div>
 
@@ -214,9 +229,34 @@ function findTokenAndSid() {
 // 递错平台的安装包，而猜对也只省下一个按钮。顺带这样桌面端也有了入口（扫码 / 转发
 // 到手机上打开），不必再单独接一个「去官网」的兜底。
 var DOWNLOADS = [
-    { id: "btn-download-android", path: "/v1/common/updater/android/1.0" },
-    { id: "btn-download-ios", path: "/v1/common/updater/ios/1.0.0" }
+    { path: "/v1/common/updater/android/1.0", row: "row-download-android", link: "btn-download-android", copy: "btn-copy-android" },
+    { path: "/v1/common/updater/ios/1.0.0", row: "row-download-ios", link: "btn-download-ios", copy: "btn-copy-ios" }
 ];
+
+// copyText 优先用 Clipboard API，失败/不可用时退回 execCommand。Clipboard API 要求
+// 安全上下文，而邀请链接大量在各家 IM 的内嵌浏览器里打开，能力参差；execCommand
+// 虽已废弃，但仍是这类环境里唯一稳定可用的路径。两条路都失败时由调用方提示手动复制。
+function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        // 放到视口内但不可见：iOS Safari 对 display:none / 视口外的元素不给选中。
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        if (ok) { resolve(); } else { reject(new Error("copy failed")); }
+    });
+}
 
 // safeDownloadURL 收口 updater 返回的地址：只放行 http/https。updater 直接吐库里的
 // 裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 / 相对 / 畸形，而这个值
@@ -245,11 +285,12 @@ function safeDownloadURL(value) {
 
 // setupDownloadButtons 为每个平台各解析一次安装包地址。两个请求互相独立：
 // 一个平台没记录不影响另一个显示。库里没有版本记录、地址非法、网络失败 ——
-// 该平台的按钮保持隐藏。没有入口好过一个死链。
+// 该平台整行保持隐藏。没有入口好过一个死链。
 function setupDownloadButtons() {
     DOWNLOADS.forEach(function (item) {
-        var btn = document.getElementById(item.id);
-        if (!btn) return;
+        var row = document.getElementById(item.row);
+        var link = document.getElementById(item.link);
+        if (!row || !link) return;
         fetch(API_BASE + item.path).then(function (r) {
             // updater 在没有版本记录时返回 204：状态码是 2xx（r.ok 为真）但没有 body。
             // 下面的 r.json() 兜底也能把它吞成 null，这里显式列出来是为了把 updater
@@ -259,9 +300,26 @@ function setupDownloadButtons() {
         }).then(function (d) {
             var url = safeDownloadURL(d && d.url);
             if (!url) return;
-            btn.href = url;
-            btn.style.display = "flex";
-        }).catch(function () { /* 网络异常：按钮保持隐藏 */ });
+            link.href = url;
+            bindCopyButton(document.getElementById(item.copy), url);
+            row.style.display = "flex";
+        }).catch(function () { /* 网络异常：整行保持隐藏 */ });
+    });
+}
+
+// bindCopyButton 把「复制链接」绑到已解析出的地址上。桌面端看到的是安装包，装
+// 却要在手机上装，复制link转过去是主路径；移动端内嵌浏览器拦下载时也用得上。
+// 复制的是安装包地址本身，不是当前邀请页地址——后者用户直接分享地址栏即可。
+function bindCopyButton(btn, url) {
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+        copyText(url).then(function () {
+            toast("下载链接已复制");
+        }, function () {
+            // 两条复制路径都不可用（老 webview / 权限被拒）：不假装成功，
+            // 告诉用户可以长按左边的按钮走浏览器自带的「复制链接地址」。
+            toast("复制失败，请长按左侧按钮复制链接");
+        });
     });
 }
 

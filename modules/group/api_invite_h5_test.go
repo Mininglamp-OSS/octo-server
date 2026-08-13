@@ -461,14 +461,27 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
 		"只放行 http/https，挡掉 javascript: 之类的 scheme")
 
-	// 两个平台各有一个按钮，且都默认隐藏：无安装包 / 解析失败都不该露出一个点不动
-	// 的入口。用正则匹配整个标签，属性顺序、新增 class 之类的排版改动不该挂 CI。
-	for _, id := range []string{"btn-download-android", "btn-download-ios"} {
-		tag := regexp.MustCompile(`<a[^>]*id="` + id + `"[^>]*>`).FindString(body)
-		assert.NotEmpty(t, tag, "落地页必须有 %s 锚点", id)
-		assert.Contains(t, tag, `style="display:none"`,
-			"%s 必须默认隐藏，解析到合法地址后才显示", id)
+	// 两个平台各一行（下载按钮 + 复制链接），整行默认隐藏：无安装包 / 解析失败都不该
+	// 露出一个点不动的入口。用正则匹配整个标签，属性顺序、新增 class 之类的排版改动
+	// 不该挂 CI。
+	for _, p := range []string{"android", "ios"} {
+		row := regexp.MustCompile(`<div[^>]*id="row-download-` + p + `"[^>]*>`).FindString(body)
+		assert.NotEmpty(t, row, "落地页必须有 %s 的下载行", p)
+		assert.Contains(t, row, `style="display:none"`,
+			"%s 下载行必须默认隐藏，解析到合法地址后才显示", p)
+
+		assert.True(t, strings.Contains(body, `id="btn-download-`+p+`"`),
+			"%s 必须有下载按钮", p)
+		assert.True(t, strings.Contains(body, `id="btn-copy-`+p+`"`),
+			"%s 必须有复制链接按钮", p)
 	}
+
+	// 复制走 Clipboard API，但它要求安全上下文，而邀请链接大量在各家 IM 的内嵌
+	// 浏览器里打开。没有 execCommand 兜底时，那些环境里点复制会静默无反应。
+	assert.True(t, strings.Contains(body, "navigator.clipboard"),
+		"复制优先走 Clipboard API")
+	assert.True(t, strings.Contains(body, `execCommand("copy")`),
+		"必须保留 execCommand 兜底——内嵌浏览器里 Clipboard API 常不可用")
 }
 
 // 落地页把 modules/common 的 updater 路由硬编码成字符串，Go 这边没有任何符号引用能
