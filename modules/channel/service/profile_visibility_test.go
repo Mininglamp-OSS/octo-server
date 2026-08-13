@@ -27,7 +27,7 @@ func TestPersonProfileVisible_EarlyAllowIdentities(t *testing.T) {
 		{"self", PersonProfileInput{LoginUID: "u1", PeerUID: "u1"}},
 		{"synthetic_identity", PersonProfileInput{LoginUID: "u1", PeerUID: "iwh_abc", SyntheticIdentity: true}},
 		{"bot", PersonProfileInput{LoginUID: "u1", PeerUID: "u2", Robot: true}},
-		{"system_account", PersonProfileInput{LoginUID: "u1", PeerUID: "u2", SystemAccount: true}},
+		{"system_bot", PersonProfileInput{LoginUID: "u1", PeerUID: "u2", SystemBot: true}},
 		{"followed", PersonProfileInput{LoginUID: "u1", PeerUID: "u2", Followed: true}},
 	}
 	for _, c := range cases {

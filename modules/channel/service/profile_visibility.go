@@ -12,8 +12,12 @@ import "github.com/Mininglamp-OSS/octo-lib/model"
 // 静默重开同一个越权面。
 //
 // 本包是**零依赖叶子包**（modules/user 反向引用它，见 modules/user/api_friend.go），
-// 因此这里不 import modules/user / modules/incomingwebhook：合成身份前缀（iwh_）与
-// 系统/客服分类常量归那些上层模块所有，由调用方判定后以布尔传入。
+// 因此这里不 import modules/user / modules/incomingwebhook / pkg/space：合成身份前缀
+// （iwh_）与系统 Bot 白名单归那些包所有，由调用方判定后以布尔传入。
+//
+// 注意「系统账号」的判定来源：调用方必须传 pkg/space.SystemBots 的白名单结果，
+// **不是** user 表的 category 分类常量（后者曾是本判定的输入，正是被收紧掉的越权面，
+// 详见 SystemBot 字段注释）。
 
 // CommonGroupChecker 判定两个用户是否至少同属一个未解散的群。
 // 由 group 模块提供实现（channel 直接注入 groupService，user 走注册钩子）。
@@ -26,8 +30,14 @@ type PersonProfileInput struct {
 	// SyntheticIdentity：目标是展示专用合成身份（如 incoming webhook 的 iwh_ 前缀）。
 	// 这类身份没有隐私字段，保持完整以免展示层裂图。
 	SyntheticIdentity bool
-	// SystemAccount：系统 / 客服账号。
-	SystemAccount bool
+	// SystemBot：目标是 pkg/space.SystemBots 白名单里的系统 Bot（botfather / u_10000 /
+	// fileHelper / notification）——这些账号与 Space 无关，须对所有登录用户公开可见。
+	//
+	// 必须由调用方用**白名单**判定（spacepkg.IsSystemBot(uid)），**不要**用 user 表的
+	// category 字段（== "system" / "customerService"）：category 是可被运维/迁移写入的
+	// 普通字段（如固定可猜 UID 的 admin 超管号就是 category=system），用它放行会把非系统
+	// Bot 的账号整份身份泄露给任意登录用户——这正是本字段收紧前的越权面。
+	SystemBot bool
 	// Robot：目标是 bot。资料公开可查——用户要先看到 bot 才能决定是否添加；
 	// "查看资料" != "已可交互"，未加好友仍不能与 bot 对话。
 	Robot bool
@@ -41,7 +51,7 @@ type PersonProfileInput struct {
 }
 
 // PersonProfileVisible 判定调用方是否可见目标的完整资料。可见关系：
-// 本人 / 合成身份 / bot / 系统账号 / 已关注（好友或同 Space） / 共同群。
+// 本人 / 合成身份 / bot / 系统 Bot / 已关注（好友或同 Space） / 共同群。
 //
 // 共同群是最后一道判定，因为它是唯一需要查库的一项——外部群里跨 Space 的非好友成员
 // 既非好友也无共同 Space，仅靠共同群可达；不放行会让群内成员名/头像裂图。
@@ -55,7 +65,7 @@ func PersonProfileVisible(in PersonProfileInput, hasCommonGroup CommonGroupCheck
 	if in.LoginUID != "" && in.LoginUID == in.PeerUID {
 		return true, nil
 	}
-	if in.SyntheticIdentity || in.Robot || in.SystemAccount || in.Followed {
+	if in.SyntheticIdentity || in.Robot || in.SystemBot || in.Followed {
 		return true, nil
 	}
 	if hasCommonGroup == nil || in.LoginUID == "" {
