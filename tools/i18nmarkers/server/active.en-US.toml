@@ -633,6 +633,12 @@ other = "Search service is temporarily unavailable."
 ["err.server.messages_search.validation_failed"]
 other = "Invalid search request."
 
+["err.server.notification.pause.invalid_time"]
+other = "Notification pause time is invalid."
+
+["err.server.notification.pause.update_failed"]
+other = "Failed to update notification pause state."
+
 ["err.server.notify.card_invalid"]
 other = "The card notification request is invalid."
 
