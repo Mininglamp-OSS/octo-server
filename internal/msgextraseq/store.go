@@ -107,15 +107,27 @@ type Store struct {
 	guard cutover.ExpectedMode
 }
 
+// ExpectedModeSpellings is the authoritative set of values ExpectedModeEnv
+// accepts, and the mode each one asserts. Anything else is malformed and fails
+// closed.
+//
+// Exported so the operator command reports the guard using the same table the
+// allocator enforces it with. A second hand-written copy in the CLI could
+// disagree with the running server about whether a value is valid — the guard
+// readout would then contradict the thing it is describing.
+func ExpectedModeSpellings() map[string]int {
+	return map[string]int{
+		"legacy":        ModeLegacy,
+		"transactional": ModeTransactional,
+	}
+}
+
 // New builds a Store bound to the given octo-lib context.
 func New(ctx *config.Context) *Store {
 	return &Store{
 		ctx:    ctx,
 		logger: liblog.NewTLog("MsgExtraSeq"),
-		guard: cutover.ParseExpectedMode(os.Getenv(ExpectedModeEnv), map[string]int{
-			"legacy":        ModeLegacy,
-			"transactional": ModeTransactional,
-		}),
+		guard:  cutover.ParseExpectedMode(os.Getenv(ExpectedModeEnv), ExpectedModeSpellings()),
 	}
 }
 

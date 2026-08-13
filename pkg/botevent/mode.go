@@ -302,11 +302,22 @@ var expectedMode atomic.Pointer[cutover.ExpectedMode]
 
 func init() { expectedMode.Store(parseExpectedMode(os.Getenv(ExpectedModeEnv))) }
 
-func parseExpectedMode(raw string) *cutover.ExpectedMode {
-	g := cutover.ParseExpectedMode(raw, map[string]int{
+// ExpectedModeSpellings is the authoritative set of values ExpectedModeEnv
+// accepts, and the mode each one asserts. Anything else is malformed and fails
+// closed.
+//
+// Exported so the operator command reports the guard using the same table the
+// allocator enforces it with, rather than a second hand-written copy that could
+// disagree with the running server about whether a value is valid.
+func ExpectedModeSpellings() map[string]int {
+	return map[string]int{
 		ModeLegacy: StateModeLegacy,
 		ModeIncr:   StateModeIncr,
-	})
+	}
+}
+
+func parseExpectedMode(raw string) *cutover.ExpectedMode {
+	g := cutover.ParseExpectedMode(raw, ExpectedModeSpellings())
 	return &g
 }
 

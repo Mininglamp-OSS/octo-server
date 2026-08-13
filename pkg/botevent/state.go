@@ -128,16 +128,25 @@ func ReadStateContext(deadline context.Context, ctx *config.Context) (State, err
 // activated ids under cursors clients already hold. Returns flipped=false with a
 // nil error when the row is already activated, so the operator command is
 // idempotent.
-func Activate(ctx *config.Context, floor, observedMax int64) (bool, uint64, error) {
+// deadline bounds the flip: a wedged MySQL must not hang the operator command
+// mid-procedure, with bot-event writes paused.
+func Activate(deadline context.Context, ctx *config.Context, floor, observedMax int64) (bool, uint64, error) {
 	if ctx == nil {
 		return false, 0, errors.New("botevent: nil ctx, cannot activate")
 	}
-	flipped, epoch, err := cutover.Flip(ctx.DB(), cutover.FlipSpec{
+	flipped, epoch, err := cutover.Flip(deadline, ctx.DB(), cutover.FlipSpec{
 		Table:                   stateTable,
 		Floor:                   floor,
 		FloorMustExceedObserved: true,
 		Observe:                 func(*dbr.Tx) (int64, error) { return observedMax, nil },
 	})
+	// flipped before err: a post-commit connection-cleanup failure is joined
+	// into err by Flip, and reporting "not activated" there would send the
+	// operator down the "activation failed" path for a committed flip — with a
+	// Redis mirror still unpublished. See cutover.Flip's contract.
+	if flipped {
+		return true, epoch, err
+	}
 	if err != nil {
 		var floorErr *cutover.FloorError
 		switch {
@@ -149,5 +158,5 @@ func Activate(ctx *config.Context, floor, observedMax int64) (bool, uint64, erro
 			return false, 0, fmt.Errorf("botevent: activate: %w", err)
 		}
 	}
-	return flipped, epoch, nil
+	return false, epoch, nil
 }

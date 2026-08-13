@@ -202,7 +202,16 @@ above them.
 
 - The command connects to MySQL and Redis via the normal DB config. Redis is
   required for cursor evidence; WuKongIM is not used. Every invocation prints
-  the MySQL endpoint it resolved before doing anything.
+  the MySQL endpoint it resolved before doing anything, and `preflight` /
+  `activate` also print the Redis endpoint they are about to scan — check both
+  against the environment you mean to act on. The printed MySQL endpoint is
+  host:port/schema only; the DSN's credential is deliberately not echoed.
+- `status` reports the expected-mode guard from **the environment of the
+  process running the command**, which is not the fleet's unless you are on a
+  replica. Confirm the fleet's guard where it is actually set (deployment
+  manifest / a replica's env), not from a laptop run.
+- Interrupting the command (Ctrl-C / SIGTERM) aborts the database work rather
+  than leaving it wedged against an unresponsive server mid-procedure.
 - All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
   on the shared `pkg/cutover` flip primitives) and is covered by
   `activation_test.go` against live MySQL; the command here is a thin wrapper.

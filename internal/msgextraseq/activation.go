@@ -96,15 +96,19 @@ type PreflightResult struct {
 // CurrentState reads the live allocator state row — no locks, no evidence
 // scans, no writes. It is the cheap read behind `app cutover msgextra status`;
 // Preflight is the full-evidence version.
-func (s *Store) CurrentState() (cutover.State, error) {
-	st, err := cutover.ReadState(context.Background(), s.ctx.DB(), stateTable)
+//
+// It returns this package's State, not pkg/cutover's: the shared control plane
+// is an implementation detail of the flip, and callers already spell this
+// package's field names (CutoverFloor, not Floor).
+func (s *Store) CurrentState(ctx context.Context) (State, error) {
+	st, err := cutover.ReadState(ctx, s.ctx.DB(), stateTable)
 	if err != nil {
 		if errors.Is(err, cutover.ErrStateMissing) {
-			return cutover.State{}, ErrStateRowMissing
+			return State{}, ErrStateRowMissing
 		}
-		return cutover.State{}, fmt.Errorf("msgextraseq: read state: %w", err)
+		return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
 	}
-	return st, nil
+	return State{Mode: st.Mode, Epoch: st.Epoch, CutoverFloor: st.Floor}, nil
 }
 
 // Preflight reads (no locks, no writes) the maxima that bound already-issued
@@ -159,8 +163,8 @@ func (s *Store) Preflight() (PreflightResult, error) {
 // maxima it recomputes under the lock are final. floor must be >= that max or the
 // flip is refused (ErrFloorTooLow). Returns flipped=false with a nil error when
 // the allocator is already transactional (idempotent).
-func (s *Store) Activate(floor int64) (bool, error) {
-	flipped, newEpoch, err := cutover.Flip(s.ctx.DB(), cutover.FlipSpec{
+func (s *Store) Activate(ctx context.Context, floor int64) (bool, error) {
+	flipped, newEpoch, err := cutover.Flip(ctx, s.ctx.DB(), cutover.FlipSpec{
 		Table:    stateTable,
 		Floor:    floor,
 		MaxFloor: MaxCutoverFloor,
@@ -172,6 +176,17 @@ func (s *Store) Activate(floor int64) (bool, error) {
 		Observe:                s.observeUnderDrainBarrier,
 		LockWaitTimeoutSeconds: activationLockWaitTimeoutSeconds,
 	})
+	// flipped is checked BEFORE err on purpose. Releasing the pinned connection
+	// can fail after the row is committed, and Flip joins that failure into err;
+	// reporting flipped=false there would tell the operator the cutover did not
+	// happen while the database says it did, and would skip the metric updates
+	// that describe the allocator now in force. See cutover.Flip's contract.
+	if flipped {
+		setAllocatorModeGauge(ModeTransactional)
+		metricCutoverFloor.Set(float64(floor))
+		metricAllocatorEpoch.Set(float64(newEpoch))
+		return true, err
+	}
 	if err != nil {
 		var floorErr *cutover.FloorError
 		switch {
@@ -194,13 +209,7 @@ func (s *Store) Activate(floor int64) (bool, error) {
 			return false, err
 		}
 	}
-	if !flipped {
-		return false, nil // already transactional — idempotent
-	}
-	setAllocatorModeGauge(ModeTransactional)
-	metricCutoverFloor.Set(float64(floor))
-	metricAllocatorEpoch.Set(float64(newEpoch))
-	return true, nil
+	return false, nil // already transactional — idempotent
 }
 
 // observeUnderDrainBarrier recomputes the issued ceiling with the state row

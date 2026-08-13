@@ -92,6 +92,50 @@ source: self
 - CI carries the MySQL-backed proof: `internal/msgextraseq` activation/store
   suites, `pkg/botevent` integration suite, new `pkg/cutover` flip/state tests.
 
+## Review round (12 findings, all fixed)
+
+A review pass over the first commit found twelve issues; none touched the
+architecture, four were operationally material:
+
+- **The endpoint print leaked the DB password.** `cfg.DB.MySQLAddr` is a full
+  DSN, so the "say where we are before doing anything" line — copied from
+  session-rollout, which prints a bare `host:port` — put the credential into
+  operator scrollback, `kubectl logs`, and any audit capture. Now redacted to
+  `host:port/schema` via `mysql.ParseDSN`, with an unparseable DSN yielding a
+  placeholder rather than falling back to the raw string. Pinned by
+  `TestRedactedMySQLEndpointNeverLeaksTheCredential`.
+- **A committed flip could be reported as a failure.** `Flip` returns
+  `flipped=true` alongside a joined connection-cleanup error, and both domains
+  checked `err` first — so a post-commit cleanup failure produced
+  "not flipped", no metrics, and (for botevent) a skipped mirror publication on
+  a committed authority. The contract is now documented on `Flip` and both
+  wrappers check `flipped` before mapping errors, restoring pre-refactor
+  behavior.
+- **msgextra never printed the Redis endpoint** even though its floor evidence
+  comes from a `messageExtraVersion:*` scan — the same failure mode the design
+  cites as its reason for printing endpoints at all. Added for
+  preflight/activate, and for `botevent status` which reads the mirror.
+- **`msgextra status` hard-failed on a missing state row**, returning before the
+  guard readout — precisely the missing-row + armed-guard combination that fails
+  every write closed. It now reports MISSING and continues, matching botevent.
+
+The rest: `flag.ErrHelp` handling and `SetOutput(io.Discard)` (so `-h` exits 0
+and a typo prints once); guard readout scoped to "this process's env" (the
+runbooks endorse off-replica runs, where the local env says nothing about the
+fleet); guard spellings exported from each domain via `ExpectedModeSpellings()`
+so the CLI cannot disagree with the allocator; `CurrentState` returns
+`msgextraseq.State` instead of leaking `cutover.State`; `Flip` takes a context
+(a wedged MySQL previously hung the activation with writes drained) and the CLI
+supplies a signal-aware one; `gatherBoteventEvidence` writes collisions to `out`
+instead of stdout; and the genseq guard's file exemption narrowed from "skip the
+file" to "waive the key-name check only", verified by injecting a GenSeq call
+and watching the guard fail.
+
+`cutover_cmd_test.go` covers the dispatch guards the file's own comment calls
+load-bearing — unknown domain/action rejected before the config is read,
+positional args, `-h`, every registered domain fully wired, plus the redaction
+and guard-scope assertions.
+
 ## Learning
 
 Operator surfaces that live in `tools/` do not ship: the image builds only the
@@ -100,3 +144,11 @@ needed (production, private deployments). #733 learned this for
 session-rollout; this task applies it to the remaining two and records the rule
 in docs/cutover-framework.md — `tools/` is for dev-only utilities (repro
 harnesses, linters), operator surfaces mount on the server binary.
+
+A second, sharper one from the review: **copying a precedent copies its shape,
+not its safety.** The endpoint print, the `flag.ContinueOnError` setup and the
+"validate the subcommand before dialing" ordering all came from
+`session_rollout_cmd.go` — but the credential-free data source, the
+`SetOutput(io.Discard)` line, and the tests pinning the guards did not come with
+them. When lifting a pattern from a sibling, diff against the original rather
+than re-deriving from memory.

@@ -15,6 +15,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/gocraft/dbr/v2"
 )
@@ -96,11 +97,28 @@ type FlipSpec struct {
 // outside its bounds (*FloorError), then executes a mode-conditional UPDATE
 // setting mode/epoch+1/cutover_floor and verifies it matched exactly one row
 // (ErrFlipInvariant otherwise). On success it returns the new epoch.
-func Flip(db *dbr.Session, spec FlipSpec) (flipped bool, newEpoch uint64, retErr error) {
+//
+// # flipped is authoritative; err alone is not
+//
+// flipped reports whether the state row was COMMITTED, and callers must consult
+// it before concluding from a non-nil error that nothing happened. Releasing the
+// pinned connection can fail after the commit (restoring the session lock-wait
+// timeout, closing the connection), and that failure is joined into the returned
+// error — so `(true, non-nil)` is a real and reachable outcome meaning "the
+// cutover happened, and the connection could not be returned to the pool
+// cleanly". A caller that checks err first and reports "not flipped" tells the
+// operator the opposite of what the database now says, and skips whatever it
+// does on success (metrics, the ACTIVATED banner). Check flipped, then err.
+//
+// ctx bounds every statement, including acquiring the pinned connection and the
+// session SET/restore around it. innodb_lock_wait_timeout bounds lock waits, not
+// an unresponsive server, so without a deadline here an operator running the
+// activation mid-procedure — with writes drained — has no way to abort it.
+func Flip(ctx context.Context, db *dbr.Session, spec FlipSpec) (flipped bool, newEpoch uint64, retErr error) {
 	if db == nil {
 		return false, 0, errors.New("cutover: nil db session, cannot flip")
 	}
-	tx, cleanup, err := beginFlipTx(db, spec.LockWaitTimeoutSeconds)
+	tx, cleanup, err := beginFlipTx(ctx, db, spec.LockWaitTimeoutSeconds)
 	if err != nil {
 		return false, 0, fmt.Errorf("cutover: begin flip: %w", err)
 	}
@@ -117,7 +135,7 @@ func Flip(db *dbr.Session, spec FlipSpec) (flipped bool, newEpoch uint64, retErr
 	count, err := tx.tx.SelectBySql(
 		"SELECT `mode`, `epoch` FROM `"+spec.Table+"` WHERE `singleton_id`=? FOR UPDATE",
 		SingletonID,
-	).Load(&locked)
+	).LoadContext(ctx, &locked)
 	if err != nil {
 		return false, 0, fmt.Errorf("cutover: lock %s: %w", spec.Table, err)
 	}
@@ -153,7 +171,7 @@ func Flip(db *dbr.Session, spec FlipSpec) (flipped bool, newEpoch uint64, retErr
 	res, err := tx.tx.UpdateBySql(
 		"UPDATE `"+spec.Table+"` SET `mode`=?, `epoch`=?, `cutover_floor`=? WHERE `singleton_id`=? AND `mode`=?",
 		ModeActive, locked.Epoch+1, spec.Floor, SingletonID, ModeInactive,
-	).Exec()
+	).ExecContext(ctx)
 	if err != nil {
 		return false, 0, fmt.Errorf("cutover: flip %s: %w", spec.Table, err)
 	}
@@ -182,15 +200,21 @@ func Flip(db *dbr.Session, spec FlipSpec) (flipped bool, newEpoch uint64, retErr
 type flipTx struct {
 	tx                      *dbr.Tx
 	conn                    *sql.Conn
+	ctx                     context.Context
 	previousLockWaitTimeout int64
 	restored                bool
 }
 
+// cleanupRestoreTimeout bounds the compensating restore in cleanup. It is short
+// because by then the outcome is already decided and the only question is
+// whether this connection can go back in the pool.
+const cleanupRestoreTimeout = 2 * time.Second
+
 // beginFlipTx starts the flip transaction. With no lock-wait override it is a
 // plain Begin; cleanup only rolls back if not committed.
-func beginFlipTx(db *dbr.Session, lockWaitSeconds int) (*flipTx, func() error, error) {
+func beginFlipTx(ctx context.Context, db *dbr.Session, lockWaitSeconds int) (*flipTx, func() error, error) {
 	if lockWaitSeconds <= 0 {
-		tx, err := db.Begin()
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -198,7 +222,6 @@ func beginFlipTx(db *dbr.Session, lockWaitSeconds int) (*flipTx, func() error, e
 		return wrapped, func() error { tx.RollbackUnlessCommitted(); return nil }, nil
 	}
 
-	ctx := context.Background()
 	conn, err := db.DB.Conn(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -214,7 +237,7 @@ func beginFlipTx(db *dbr.Session, lockWaitSeconds int) (*flipTx, func() error, e
 	}
 	sqlTx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		restoreErr := restoreLockWaitTimeout(conn, previous)
+		restoreErr := restoreLockWaitTimeout(ctx, conn, previous)
 		closeErr := closeFlipConnection(conn, restoreErr != nil)
 		return nil, nil, errors.Join(err, restoreErr, closeErr)
 	}
@@ -226,6 +249,7 @@ func beginFlipTx(db *dbr.Session, lockWaitSeconds int) (*flipTx, func() error, e
 			Timeout:       db.GetTimeout(),
 		},
 		conn:                    conn,
+		ctx:                     ctx,
 		previousLockWaitTimeout: previous,
 	}
 	return wrapped, wrapped.cleanup, nil
@@ -239,7 +263,7 @@ func (f *flipTx) restoreBeforeCommit() error {
 	if f.restored {
 		return nil
 	}
-	if err := restoreLockWaitTimeout(f.tx, f.previousLockWaitTimeout); err != nil {
+	if err := restoreLockWaitTimeout(f.ctx, f.tx, f.previousLockWaitTimeout); err != nil {
 		return err
 	}
 	f.restored = true
@@ -250,7 +274,13 @@ func (f *flipTx) cleanup() error {
 	f.tx.RollbackUnlessCommitted()
 	var restoreErr error
 	if !f.restored {
-		restoreErr = restoreLockWaitTimeout(f.conn, f.previousLockWaitTimeout)
+		// Detach from the caller's context: cleanup is a compensating action,
+		// and inheriting a context that was just cancelled (or that expired and
+		// is why we are here) would fail the restore every time and discard an
+		// otherwise healthy connection.
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(f.ctx), cleanupRestoreTimeout)
+		defer cancel()
+		restoreErr = restoreLockWaitTimeout(restoreCtx, f.conn, f.previousLockWaitTimeout)
 	}
 	closeErr := closeFlipConnection(f.conn, restoreErr != nil)
 	return errors.Join(restoreErr, closeErr)
@@ -260,9 +290,9 @@ type contextExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-func restoreLockWaitTimeout(execer contextExecer, previous int64) error {
+func restoreLockWaitTimeout(ctx context.Context, execer contextExecer, previous int64) error {
 	if _, err := execer.ExecContext(
-		context.Background(),
+		ctx,
 		"SET SESSION innodb_lock_wait_timeout = ?",
 		previous,
 	); err != nil {

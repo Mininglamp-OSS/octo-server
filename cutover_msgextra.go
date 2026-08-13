@@ -22,6 +22,7 @@ package main
 // preflight first, verify the numbers, then activate.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -39,6 +40,9 @@ func msgextraCutoverDomain() *cutoverDomain {
 }
 
 func msgextraCutoverPreflight(rt *cutoverRuntime, out io.Writer) error {
+	// The floor evidence includes a scan of the messageExtraVersion:* keyspace,
+	// so the Redis this run resolved is part of what the operator is judging.
+	fprintRedisEndpoint(rt.cfg)
 	res, err := msgextraseq.New(rt.ctx).Preflight()
 	if err != nil {
 		return err
@@ -48,6 +52,7 @@ func msgextraCutoverPreflight(rt *cutoverRuntime, out io.Writer) error {
 }
 
 func msgextraCutoverActivate(rt *cutoverRuntime, out io.Writer) error {
+	fprintRedisEndpoint(rt.cfg)
 	store := msgextraseq.New(rt.ctx)
 	// Always show the preflight first so the operator sees what they are acting on.
 	res, err := store.Preflight()
@@ -73,28 +78,39 @@ func msgextraCutoverActivate(rt *cutoverRuntime, out io.Writer) error {
 	if !rt.yes {
 		return fmt.Errorf("activate is a state change across all replicas — re-run with -yes to confirm (floor=%d)", floor)
 	}
-	flipped, err := store.Activate(floor)
+	flipped, err := store.Activate(rt.deadline, floor)
+	// flipped first: a post-commit connection-cleanup failure comes back as
+	// (true, err), and reporting "activation failed" for a committed flip would
+	// send the operator down the wrong branch of the runbook.
+	if flipped {
+		fmt.Fprintf(out, "\nACTIVATED: allocator is now transactional (cutover_floor=%d). Verify versions are monotonic and rerun preflight to confirm mode=transactional.\n", floor)
+		if err != nil {
+			return fmt.Errorf("the flip COMMITTED, but releasing the database connection failed: %w", err)
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if !flipped {
-		fmt.Fprintln(out, "\nno change — allocator was already transactional")
-		return nil
-	}
-	fmt.Fprintf(out, "\nACTIVATED: allocator is now transactional (cutover_floor=%d). Verify versions are monotonic and rerun preflight to confirm mode=transactional.\n", floor)
+	fmt.Fprintln(out, "\nno change — allocator was already transactional")
 	return nil
 }
 
 func msgextraCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
-	st, err := msgextraseq.New(rt.ctx).CurrentState()
-	if err != nil {
+	st, err := msgextraseq.New(rt.ctx).CurrentState(rt.deadline)
+	switch {
+	case errors.Is(err, msgextraseq.ErrStateRowMissing):
+		// Report and keep going rather than exiting here. Missing row + armed
+		// guard is precisely the combination that fails every message_extra
+		// write closed, so the guard line below is the one an operator most
+		// needs in this state.
+		fmt.Fprintln(out, "state: MISSING — the migration has not run. Readers treat this as legacy.")
+	case err != nil:
 		return err
+	default:
+		fmt.Fprintf(out, "state: mode=%s epoch=%d cutover_floor=%d\n", msgextraModeName(st.Mode), st.Epoch, st.CutoverFloor)
 	}
-	fmt.Fprintf(out, "state: mode=%s epoch=%d cutover_floor=%d\n", msgextraModeName(st.Mode), st.Epoch, st.Floor)
-	fprintCutoverGuard(out, msgextraseq.ExpectedModeEnv, map[string]int{
-		"legacy":        msgextraseq.ModeLegacy,
-		"transactional": msgextraseq.ModeTransactional,
-	}, msgextraModeName)
+	fprintCutoverGuard(out, msgextraseq.ExpectedModeEnv, msgextraseq.ExpectedModeSpellings(), msgextraModeName)
 	return nil
 }
 
@@ -105,13 +121,8 @@ func fprintMsgextraPreflight(out io.Writer, res msgextraseq.PreflightResult) {
 	fmt.Fprintf(out, "recommended cutover_floor=%d\n", res.RecommendedFloor)
 }
 
+// msgextraModeName renders a mode with the domain's own spelling table, so the
+// name shown here and the guard values the allocator accepts have one source.
 func msgextraModeName(mode int) string {
-	switch mode {
-	case msgextraseq.ModeLegacy:
-		return "legacy"
-	case msgextraseq.ModeTransactional:
-		return "transactional"
-	default:
-		return fmt.Sprintf("unknown(%d)", mode)
-	}
+	return cutoverModeName(msgextraseq.ExpectedModeSpellings(), mode)
 }

@@ -20,8 +20,14 @@ change-log convention (§7). Newest first.
   documented conventions (`docs/cutover-framework.md`: state-table template,
   `OCTO_<DOMAIN>_EXPECTED_MODE` naming, the flip-then-arm ordering invariant,
   evidence discipline, Down 3819 pattern). Runbooks now live in `docs/`
-  (msgextra moved, botevent written for the first time). See
-  [journal](journal/shared/cutover-framework.md).
+  (msgextra moved, botevent written for the first time). A review round fixed
+  twelve findings on top, four of them operationally material: the endpoint
+  print echoed the full MySQL DSN (password included) and is now redacted; a
+  committed flip could be reported as a failure when releasing the pinned
+  connection failed; msgextra never named the Redis instance whose scan sets its
+  cutover floor; and `msgextra status` hard-failed on a missing state row,
+  hiding the guard readout in exactly the state that fails every write closed.
+  See [journal](journal/shared/cutover-framework.md).
 
 ## 2026-08-12 (profile-visibility-system-bot-whitelist)
 

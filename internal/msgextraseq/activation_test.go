@@ -6,6 +6,7 @@ package msgextraseq_test
 // deactivate to test — rollback is a documented coordinated procedure (README §6).
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -44,7 +45,7 @@ func TestRolloutOrdering_ActivateBeforeExpectedMode(t *testing.T) {
 
 	// Flip the DB to transactional. Activate does NOT consult the expected-mode
 	// guard, so the operator can always run it first (runbook §3).
-	flipped, err := s.Activate(0)
+	flipped, err := s.Activate(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
@@ -169,7 +170,7 @@ func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *test
 		t.Fatalf("RecommendedFloor=%d want authoritative issued max 1000", res.RecommendedFloor)
 	}
 
-	flipped, err := s.Activate(res.RecommendedFloor)
+	flipped, err := s.Activate(context.Background(), res.RecommendedFloor)
 	if err != nil || !flipped {
 		t.Fatalf("Activate with poisoned Redis cursor=(%v,%v), want (true,nil)", flipped, err)
 	}
@@ -192,7 +193,7 @@ func TestActivateFlipsAndIsIdempotent(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	flipped, err := s.Activate(200)
+	flipped, err := s.Activate(context.Background(), 200)
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestActivateFlipsAndIsIdempotent(t *testing.T) {
 	}
 
 	// Second activate is a no-op (idempotent), epoch unchanged.
-	flipped, err = s.Activate(200)
+	flipped, err = s.Activate(context.Background(), 200)
 	if err != nil {
 		t.Fatalf("Activate (again): %v", err)
 	}
@@ -231,7 +232,7 @@ func TestActivateRejectsFloorBelowObservedMax(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// Floor 999 is below the observed max 1000 → refused, state unchanged.
-	if _, err := s.Activate(999); err == nil {
+	if _, err := s.Activate(context.Background(), 999); err == nil {
 		t.Fatal("Activate: expected ErrFloorTooLow for a floor below the observed max")
 	}
 	res, _ := s.Preflight()
@@ -245,7 +246,7 @@ func TestActivateRejectsFloorAboveMax(t *testing.T) {
 	s := msgextraseq.New(ctx)
 	// A floor above MaxCutoverFloor would leave no headroom below 2^53-1 and make
 	// every reservation fail ErrOverflow → refused, state unchanged.
-	if _, err := s.Activate(msgextraseq.MaxCutoverFloor + 1); err == nil {
+	if _, err := s.Activate(context.Background(), msgextraseq.MaxCutoverFloor+1); err == nil {
 		t.Fatal("Activate: expected ErrFloorTooHigh for a floor above MaxCutoverFloor")
 	}
 	res, _ := s.Preflight()
@@ -253,7 +254,7 @@ func TestActivateRejectsFloorAboveMax(t *testing.T) {
 		t.Fatalf("state changed despite refused activate: %+v", res)
 	}
 	// The maximum floor itself is accepted.
-	if flipped, err := s.Activate(msgextraseq.MaxCutoverFloor); err != nil || !flipped {
+	if flipped, err := s.Activate(context.Background(), msgextraseq.MaxCutoverFloor); err != nil || !flipped {
 		t.Fatalf("Activate(MaxCutoverFloor) = (%v, %v), want (true, nil)", flipped, err)
 	}
 }
@@ -268,7 +269,7 @@ func TestPreflightAndActivateRejectMissingStateRow(t *testing.T) {
 	if _, err := s.Preflight(); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
 		t.Fatalf("Preflight error=%v want ErrStateRowMissing", err)
 	}
-	if _, err := s.Activate(0); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
+	if _, err := s.Activate(context.Background(), 0); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
 		t.Fatalf("Activate error=%v want ErrStateRowMissing", err)
 	}
 }
@@ -283,7 +284,7 @@ func TestActivateRejectsUnknownMode(t *testing.T) {
 		t.Fatalf("seed unknown mode: %v", err)
 	}
 
-	if _, err := s.Activate(0); !errors.Is(err, msgextraseq.ErrUnknownMode) {
+	if _, err := s.Activate(context.Background(), 0); !errors.Is(err, msgextraseq.ErrUnknownMode) {
 		t.Fatalf("Activate error=%v want ErrUnknownMode", err)
 	}
 }
@@ -310,7 +311,7 @@ func TestLegacyToTransactionalRolloutOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
-	flipped, err := preCutoverStore.Activate(preflight.RecommendedFloor)
+	flipped, err := preCutoverStore.Activate(context.Background(), preflight.RecommendedFloor)
 	if err != nil || !flipped {
 		t.Fatalf("Activate = (%v, %v), want (true, nil)", flipped, err)
 	}
@@ -353,7 +354,7 @@ func TestActivateFailsFastWhenWriterDrainIncomplete(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.Activate(0)
+		_, err := s.Activate(context.Background(), 0)
 		done <- err
 	}()
 
@@ -406,7 +407,7 @@ func TestActivateRestoresSessionLockWaitTimeout(t *testing.T) {
 	})
 
 	s := msgextraseq.New(ctx)
-	if flipped, err := s.Activate(0); err != nil || !flipped {
+	if flipped, err := s.Activate(context.Background(), 0); err != nil || !flipped {
 		t.Fatalf("Activate = (%v, %v), want (true, nil)", flipped, err)
 	}
 

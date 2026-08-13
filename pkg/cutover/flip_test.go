@@ -104,7 +104,7 @@ func TestFlipHappyPathAndIdempotency(t *testing.T) {
 	seedState(t, db, cutover.ModeInactive, 0, 0)
 
 	observed := func(*dbr.Tx) (int64, error) { return 100, nil }
-	flipped, epoch, err := cutover.Flip(db, cutover.FlipSpec{
+	flipped, epoch, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 100, Observe: observed,
 	})
 	if err != nil || !flipped || epoch != 1 {
@@ -115,7 +115,7 @@ func TestFlipHappyPathAndIdempotency(t *testing.T) {
 	}
 
 	// Idempotent re-run: no change, current epoch reported, no error.
-	flipped, epoch, err = cutover.Flip(db, cutover.FlipSpec{
+	flipped, epoch, err = cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 999, Observe: observed,
 	})
 	if err != nil || flipped || epoch != 1 {
@@ -128,12 +128,12 @@ func TestFlipHappyPathAndIdempotency(t *testing.T) {
 
 func TestFlipRefusesMissingRowAndUnknownMode(t *testing.T) {
 	db := setupDB(t)
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{Table: testStateTable, Floor: 1}); !errors.Is(err, cutover.ErrStateMissing) {
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{Table: testStateTable, Floor: 1}); !errors.Is(err, cutover.ErrStateMissing) {
 		t.Fatalf("missing row: err=%v want ErrStateMissing", err)
 	}
 
 	seedState(t, db, 7, 0, 0)
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{Table: testStateTable, Floor: 1}); !errors.Is(err, cutover.ErrUnknownMode) {
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{Table: testStateTable, Floor: 1}); !errors.Is(err, cutover.ErrUnknownMode) {
 		t.Fatalf("unknown mode: err=%v want ErrUnknownMode", err)
 	}
 }
@@ -145,21 +145,21 @@ func TestFlipFloorBounds(t *testing.T) {
 
 	// Inclusive policy (#627): floor < observed refused, floor == observed ok.
 	var fe *cutover.FloorError
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 99, Observe: observed,
 	}); !errors.As(err, &fe) || fe.TooHigh || fe.Observed != 100 || fe.Floor != 99 {
 		t.Fatalf("floor 99 vs observed 100: err=%v want FloorError{99,100}", err)
 	}
 
 	// Exclusive policy (#697): floor == observed refused too.
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 100, Observe: observed, FloorMustExceedObserved: true,
 	}); !errors.As(err, &fe) || fe.TooHigh {
 		t.Fatalf("exclusive floor == observed: err=%v want FloorError", err)
 	}
 
 	// Upper bound: floor above MaxFloor refused before any mutation.
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 501, MaxFloor: 500, Observe: observed,
 	}); !errors.As(err, &fe) || !fe.TooHigh || fe.Max != 500 {
 		t.Fatalf("floor above max: err=%v want FloorError{TooHigh,Max:500}", err)
@@ -171,7 +171,7 @@ func TestFlipFloorBounds(t *testing.T) {
 	}
 
 	// Inclusive floor == observed proceeds.
-	if flipped, _, err := cutover.Flip(db, cutover.FlipSpec{
+	if flipped, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 100, Observe: observed,
 	}); err != nil || !flipped {
 		t.Fatalf("floor == observed (inclusive) = (%v,%v), want success", flipped, err)
@@ -182,7 +182,7 @@ func TestFlipObserveErrorAborts(t *testing.T) {
 	db := setupDB(t)
 	seedState(t, db, cutover.ModeInactive, 0, 0)
 	boom := errors.New("evidence unreadable")
-	if _, _, err := cutover.Flip(db, cutover.FlipSpec{
+	if _, _, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 1,
 		Observe: func(*dbr.Tx) (int64, error) { return 0, boom },
 	}); !errors.Is(err, boom) {
@@ -196,7 +196,7 @@ func TestFlipObserveErrorAborts(t *testing.T) {
 func TestFlipWithSessionLockWaitTimeout(t *testing.T) {
 	db := setupDB(t)
 	seedState(t, db, cutover.ModeInactive, 0, 0)
-	flipped, epoch, err := cutover.Flip(db, cutover.FlipSpec{
+	flipped, epoch, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 10,
 		Observe:                func(*dbr.Tx) (int64, error) { return 10, nil },
 		LockWaitTimeoutSeconds: 3,

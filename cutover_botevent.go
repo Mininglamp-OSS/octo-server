@@ -84,7 +84,7 @@ func boteventRedisClient(cfg *config.Config) *rd.Client {
 func boteventCutoverPreflight(rt *cutoverRuntime, out io.Writer, sample int) error {
 	client := boteventRedisClient(rt.cfg)
 	defer client.Close()
-	ev, err := gatherBoteventEvidence(rt.ctx, client, sample)
+	ev, err := gatherBoteventEvidence(rt.ctx, client, out, sample)
 	if err != nil {
 		return err
 	}
@@ -93,6 +93,9 @@ func boteventCutoverPreflight(rt *cutoverRuntime, out io.Writer, sample int) err
 }
 
 func boteventCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
+	// The mirror is read from Redis, so name the server first — a status that
+	// silently reads the wrong instance reports the wrong activation state.
+	fprintRedisEndpoint(rt.cfg)
 	if err := fprintBoteventState(rt.ctx, out); err != nil {
 		return err
 	}
@@ -101,22 +104,14 @@ func boteventCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
 	if mErr != nil {
 		fmt.Fprintf(os.Stderr, "note: %v\n", mErr)
 	}
-	fprintCutoverGuard(out, botevent.ExpectedModeEnv, map[string]int{
-		botevent.ModeLegacy: botevent.StateModeLegacy,
-		botevent.ModeIncr:   botevent.StateModeIncr,
-	}, boteventModeName)
+	fprintCutoverGuard(out, botevent.ExpectedModeEnv, botevent.ExpectedModeSpellings(), boteventModeName)
 	return nil
 }
 
+// boteventModeName renders a mode with the domain's own spelling table, so the
+// name shown here and the guard values the allocator accepts have one source.
 func boteventModeName(mode int) string {
-	switch mode {
-	case botevent.StateModeLegacy:
-		return botevent.ModeLegacy
-	case botevent.StateModeIncr:
-		return botevent.ModeIncr
-	default:
-		return fmt.Sprintf("unknown(%d)", mode)
-	}
+	return cutoverModeName(botevent.ExpectedModeSpellings(), mode)
 }
 
 // boteventEvidence is everything the floor has to clear, gathered from all three
@@ -167,7 +162,10 @@ func (e boteventEvidence) observedMax() int64 {
 	return m
 }
 
-func gatherBoteventEvidence(ctx *config.Context, client *rd.Client, sample int) (boteventEvidence, error) {
+// out receives the per-queue collision diagnostics so one activation's evidence
+// lands in one place; read failures still go to stderr alongside the other
+// warnings.
+func gatherBoteventEvidence(ctx *config.Context, client *rd.Client, out io.Writer, sample int) (boteventEvidence, error) {
 	var ev boteventEvidence
 
 	// Table-wide first, so the floor covers bots the queue scan cannot see at all.
@@ -222,7 +220,7 @@ func gatherBoteventEvidence(ctx *config.Context, client *rd.Client, sample int) 
 		if stats.duplicates > 0 {
 			ev.dupQueues++
 			ev.dupMembers += stats.duplicates
-			fmt.Printf("  COLLISIONS %s: members=%d distinct=%d dup=%d\n",
+			fmt.Fprintf(out, "  COLLISIONS %s: members=%d distinct=%d dup=%d\n",
 				k, stats.members, stats.members-stats.duplicates, stats.duplicates)
 		}
 	}
@@ -370,7 +368,7 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 	client := boteventRedisClient(rt.cfg)
 	defer client.Close()
 
-	ev, err := gatherBoteventEvidence(rt.ctx, client, sample)
+	ev, err := gatherBoteventEvidence(rt.ctx, client, out, sample)
 	if err != nil {
 		return err
 	}
@@ -400,20 +398,29 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 	}
 	fmt.Fprintf(out, "\nactivating with floor=%d (observed max=%d)\n", floor, ev.observedMax())
 
-	flipped, epoch, err := botevent.Activate(rt.ctx, floor, ev.observedMax())
-	if err != nil {
-		return fmt.Errorf("activate: %w", err)
-	}
+	flipped, epoch, err := botevent.Activate(rt.deadline, rt.ctx, floor, ev.observedMax())
+	// flipped before err: Flip joins a post-commit connection-cleanup failure
+	// into err, and treating that as "activate failed" would skip the mirror
+	// publication below for an authority that is already committed — the exact
+	// half-done state this command exists to prevent.
 	if !flipped {
+		if err != nil {
+			return fmt.Errorf("activate: %w", err)
+		}
 		fmt.Fprintf(out, "already activated at epoch %d; nothing to do\n", epoch)
 		// Still reconcile the mirror. Failure is operationally incomplete even though
 		// the authority was already committed, so preserve the write pause and exit non-zero.
 		return writeMirror(client, epoch)
 	}
+	if err != nil {
+		// The row is committed; the mirror still must be published, and the
+		// operator must know the connection released badly.
+		fmt.Fprintf(os.Stderr, "note: the flip COMMITTED, but releasing the database connection failed: %v\n", err)
+	}
 	// Mirror second: the authority is committed. A failure here leaves cached negative
 	// beliefs able to use GenSeq temporarily, so it is not a successful activation.
-	if err := writeMirror(client, epoch); err != nil {
-		return err
+	if mirrorErr := writeMirror(client, epoch); mirrorErr != nil {
+		return mirrorErr
 	}
 	fmt.Fprintf(out, "activated at epoch %d. Replicas switch on their next allocation.\n\n", epoch)
 	fmt.Fprintf(out, "Verify now:\n")

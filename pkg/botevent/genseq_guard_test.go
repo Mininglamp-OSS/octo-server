@@ -54,7 +54,14 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	// cutover_botevent.go is the `app cutover botevent` operator command. It
 	// names the key only to sweep the legacy `seq` rows table-wide for cutover
 	// floor evidence — the read its standalone predecessor (tools/botevent-seq)
-	// did under the tools/ exemption below. It allocates nothing.
+	// did under the tools/ exemption below.
+	//
+	// The exemption is deliberately narrow: it waives the key-NAME check only,
+	// and the allocation check below still applies to the file. Waiving the
+	// whole file would let a future edit — "bump the legacy boundary before
+	// flipping", say, during a rollback attempt — add a real GenSeq call to the
+	// one command an operator runs by hand at the cutover, with the guard
+	// staying green while a second live id source appears on the queue.
 	allowlistedReaders := map[string]bool{"cutover_botevent.go": true}
 
 	var violations []string
@@ -75,15 +82,22 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
-		if filepath.ToSlash(rel) == allowlisted || allowlistedReaders[filepath.ToSlash(rel)] {
+		relPosix := filepath.ToSlash(rel)
+		if relPosix == allowlisted {
 			return nil
 		}
 		content, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
 		}
+		// A reader may name the key; nobody outside the allowlisted file may
+		// allocate from it.
+		pattern := legacyKey
+		if allowlistedReaders[relPosix] {
+			pattern = legacyAlloc
+		}
 		for i, line := range strings.Split(string(content), "\n") {
-			if legacyKey.MatchString(line) {
+			if pattern.MatchString(line) {
 				violations = append(violations, rel+":"+itoaGuard(i+1))
 			}
 		}

@@ -30,15 +30,20 @@ package main
 // complete — nothing in the output said so).
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/viper"
 )
 
@@ -47,10 +52,14 @@ const cutoverCommand = "cutover"
 // cutoverRuntime is what a domain action gets to work with: the resolved
 // config/context plus the shared flag values.
 type cutoverRuntime struct {
-	cfg   *config.Config
-	ctx   *config.Context
-	floor int64
-	yes   bool
+	cfg *config.Config
+	ctx *config.Context
+	// deadline carries operator interrupts (SIGINT/SIGTERM) into the DB calls,
+	// so a wedged MySQL during an activation can be aborted rather than hanging
+	// the procedure with writes drained.
+	deadline context.Context
+	floor    int64
+	yes      bool
 }
 
 // cutoverDomain is one registered cutover. The three actions own their whole
@@ -113,6 +122,9 @@ func runCutoverCommand(args []string, out io.Writer) error {
 	}
 
 	flags := flag.NewFlagSet(cutoverCommand+" "+domain.name+" "+action, flag.ContinueOnError)
+	// The flag package would otherwise print usage and the parse error itself,
+	// and main.go prints the returned error too — one typo, two messages.
+	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "configs/tsdd.yaml", "octo-server config file")
 	floor := flags.Int64("floor", 0, "explicit cutover floor for activate (0 = use the preflight recommendation)")
 	yes := flags.Bool("yes", false, "confirm a state-changing action (activate)")
@@ -120,6 +132,12 @@ func runCutoverCommand(args []string, out io.Writer) error {
 		domain.registerFlags(flags)
 	}
 	if err := flags.Parse(args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// Asking for help is not a failure: print usage and exit 0.
+			flags.SetOutput(out)
+			flags.Usage()
+			return nil
+		}
 		return err
 	}
 	if flags.NArg() != 0 {
@@ -131,10 +149,21 @@ func runCutoverCommand(args []string, out io.Writer) error {
 		return err
 	}
 	// Say where we are before doing anything (see the file header). Domains
-	// that open a Redis connection print its endpoint the same way.
-	fmt.Fprintf(os.Stderr, "mysql: %s\n", cfg.DB.MySQLAddr)
+	// that open their own Redis connection print its endpoint the same way.
+	fmt.Fprintf(os.Stderr, "mysql: %s\n", redactedMySQLEndpoint(cfg.DB.MySQLAddr))
 
-	rt := &cutoverRuntime{cfg: cfg, ctx: config.NewContext(cfg), floor: *floor, yes: *yes}
+	// Operator interrupts abort the DB work instead of leaving the command
+	// wedged against an unresponsive server mid-procedure.
+	deadline, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rt := &cutoverRuntime{
+		cfg:      cfg,
+		ctx:      config.NewContext(cfg),
+		deadline: deadline,
+		floor:    *floor,
+		yes:      *yes,
+	}
 	switch action {
 	case "preflight":
 		return domain.preflight(rt, out)
@@ -143,6 +172,46 @@ func runCutoverCommand(args []string, out io.Writer) error {
 	default:
 		return domain.status(rt, out)
 	}
+}
+
+// redactedMySQLEndpoint renders a DSN as just the server and schema it points
+// at.
+//
+// cfg.DB.MySQLAddr is a full go-sql-driver DSN — `user:password@tcp(host:port)
+// /schema?params` — so echoing it verbatim would put the database password in
+// the operator's scrollback, in `kubectl logs`, and in any audit capture of the
+// cutover procedure. The endpoint is what the operator needs to see (that is
+// the whole point of printing it); the credential is not.
+//
+// An unparseable DSN yields a fixed placeholder rather than the raw string:
+// falling back to the input would put the password back exactly when the format
+// is unexpected.
+func redactedMySQLEndpoint(dsn string) string {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "(unparseable DSN; endpoint hidden to avoid leaking credentials)"
+	}
+	if cfg.Addr == "" {
+		return cfg.DBName
+	}
+	return cfg.Addr + "/" + cfg.DBName
+}
+
+// fprintRedisEndpoint echoes the Redis server a domain is about to read,
+// resolved the same way the scanning code resolves it.
+//
+// Not cosmetic: on 2026-08-11 a misplaced config key (top-level `redisAddr`,
+// which octo-lib ignores in favour of `db.redisAddr`) pointed a tool at
+// 127.0.0.1:6379, where it scanned local test leftovers and reported a complete
+// result. Cutover floors are computed from a Redis scan, so the same mistake
+// here yields a floor that ignores every real client cursor.
+func fprintRedisEndpoint(cfg *config.Config) {
+	opts, err := octoredis.BuildOptions(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "redis: <unresolvable: %v>\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "redis: %s  db=%d\n", opts.Addr, opts.DB)
 }
 
 // loadCutoverConfig resolves the config file plus the same TS_* environment
@@ -166,16 +235,37 @@ func loadCutoverConfig(path string) (*config.Config, error) {
 // state in `status` output: the guard is half of every cutover's safety story
 // (a lost state row fails closed only while the guard is armed), and its
 // malformed-fails-closed behavior is invisible until it bites.
+//
+// It reports THIS PROCESS's environment, and says so. The guard is process-local
+// configuration that no control plane can observe remotely, while both runbooks
+// document running these commands from any machine with DB access — so a run
+// from a laptop against an armed fleet would otherwise print "unset" and tell
+// the operator the durable safety net is off when it is on.
+//
+// values comes from the domain package (its ExpectedModeSpellings), so this
+// readout cannot disagree with the allocator about which values are valid.
 func fprintCutoverGuard(out io.Writer, envName string, values map[string]int, modeName func(int) string) {
 	raw := os.Getenv(envName)
 	guard := cutover.ParseExpectedMode(raw, values)
+	const scope = "in this process's env"
 	switch {
 	case !guard.IsSet():
-		fmt.Fprintf(out, "guard %s: unset (no assertion; arm it only after the flip is verified)\n", envName)
+		fmt.Fprintf(out, "guard %s: unset %s (no assertion here; arm it fleet-wide only after the flip is verified, and check a replica to confirm what the fleet has)\n", envName, scope)
 	case guard.IsMalformed():
-		fmt.Fprintf(out, "guard %s: MALFORMED value %q — allocations fail closed until it is fixed or unset\n", envName, raw)
+		fmt.Fprintf(out, "guard %s: MALFORMED value %q %s — a replica carrying this fails every allocation closed until it is fixed or unset\n", envName, raw, scope)
 	default:
 		expected, _ := guard.Expected()
-		fmt.Fprintf(out, "guard %s: expects %s\n", envName, modeName(expected))
+		fmt.Fprintf(out, "guard %s: expects %s %s\n", envName, modeName(expected), scope)
 	}
+}
+
+// cutoverModeName renders a mode using a domain's own spelling table, so the
+// display name and the guard's accepted values cannot drift apart.
+func cutoverModeName(spellings map[string]int, mode int) string {
+	for name, value := range spellings {
+		if value == mode {
+			return name
+		}
+	}
+	return fmt.Sprintf("unknown(%d)", mode)
 }

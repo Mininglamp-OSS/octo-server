@@ -1,6 +1,7 @@
 package botevent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -1138,14 +1139,14 @@ func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
 
 	// A floor at or below what has already been issued would put the first activated
 	// ids under cursors clients already hold.
-	if _, _, err := Activate(ctx, 5000, 5000); !errors.Is(err, ErrFloorTooLow) {
+	if _, _, err := Activate(context.Background(), ctx, 5000, 5000); !errors.Is(err, ErrFloorTooLow) {
 		t.Fatalf("expected ErrFloorTooLow for floor == observed max, got %v", err)
 	}
-	if _, _, err := Activate(ctx, 4999, 5000); !errors.Is(err, ErrFloorTooLow) {
+	if _, _, err := Activate(context.Background(), ctx, 4999, 5000); !errors.Is(err, ErrFloorTooLow) {
 		t.Fatalf("expected ErrFloorTooLow for floor < observed max, got %v", err)
 	}
 
-	flipped, epoch, err := Activate(ctx, 7001, 5000)
+	flipped, epoch, err := Activate(context.Background(), ctx, 7001, 5000)
 	if err != nil || !flipped {
 		t.Fatalf("activate: flipped=%v epoch=%d err=%v", flipped, epoch, err)
 	}
@@ -1155,7 +1156,7 @@ func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
 	}
 
 	// Idempotent: a second run reports no flip and no error.
-	again, sameEpoch, err := Activate(ctx, 9001, 5000)
+	again, sameEpoch, err := Activate(context.Background(), ctx, 9001, 5000)
 	if err != nil || again {
 		t.Fatalf("second activate should be a no-op: again=%v err=%v", again, err)
 	}
