@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -401,12 +402,20 @@ func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
 // 修法是改用公开免登录的 updater 接口拿真实安装包地址（与 Web 登录页下载浮层同源），
 // 拿不到就保持按钮隐藏。这个测试断言的是**最终 href 的来源**，而不是「占位符已被替换」——
 // 后者在旧实现下同样成立，正是它让这个 bug 一路漏到线上。
+// 这些断言只能确认落地页「长得对」，确认不了它「跑得对」——它们是对一个静态资源做
+// grep。把 bug 换个写法重新引入（先取元素再赋值）就能绕过第一条钉子。真正的行为覆盖
+// 要么把这段逻辑挪回服务端用 Go 测，要么给仓库引一套 JS 测试环境；在那之前，这里的
+// 定位是烟雾报警器，不是行为契约。所以断言尽量绑「必须存在的结构」，不绑具体排版。
 func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T) {
 	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	wd, err := os.Getwd()
-	assert.NoError(t, err)
+	if err != nil {
+		// 不能只 assert：wd 为空会让 Cleanup 的 Chdir("") 静默失败，
+		// 把整个进程留在 repo 根目录，污染本包后面所有按相对路径找文件的测试。
+		t.Fatalf("getwd: %v", err)
+	}
 	if err := os.Chdir("../.."); err != nil {
 		t.Fatalf("chdir to repo root: %v", err)
 	}
@@ -428,19 +437,52 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, "/v1/common/updater/ios/1.0.0"),
 		"iOS 安装包地址必须来自公开 updater 接口")
 
-	// updater 在库里没有版本记录时返回 204 且无 body，直接 .json() 会抛异常。
-	assert.True(t, strings.Contains(body, "r.status === 204"),
-		"必须特判 updater 的 204（无版本记录，响应无 body）")
+	// 最容易的静默失效方式是删掉调用点：函数定义、两条路径、scheme 校验全都还在，
+	// 上面每一条断言照样绿，而下载按钮在线上永远不显示。所以调用点必须单独钉住。
+	assert.True(t, strings.Contains(body, "setupDownloadButton()"),
+		"setupDownloadButton 必须真的被调用，只定义不调用会让按钮永远不显示")
+
+	// updater 没有版本记录时返回 204（2xx 但无 body）。断言到 204 出现即可，
+	// 不绑具体写法——换成 204 === r.status 或抽成命名函数都不该挂 CI。
+	assert.True(t, strings.Contains(body, "204"),
+		"必须处理 updater 的 204（无版本记录，响应无 body）")
 
 	// href 落地前必须过 scheme 白名单：updater 吐的是库里的裸 download_url。
+	// 只断言校验点和两个放行的 scheme 存在，不绑比较表达式的排列顺序。
 	assert.True(t, strings.Contains(body, "safeDownloadURL"),
 		"updater 返回的地址必须经过 scheme 校验后才能写进 a.href")
-	assert.True(t, strings.Contains(body, `u.protocol === "http:" || u.protocol === "https:"`),
+	assert.True(t, strings.Contains(body, ".protocol"), "必须检查 scheme")
+	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
 		"只放行 http/https，挡掉 javascript: 之类的 scheme")
 
 	// 按钮默认隐藏：桌面端 / 无安装包 / 解析失败都不该露出一个点不动的入口。
-	assert.True(t, strings.Contains(body, `id="btn-download" href="#" target="_blank" rel="noopener" style="display:none"`),
+	// 用正则匹配整个标签，属性顺序、新增 class 之类的排版改动不该挂 CI。
+	downloadAnchor := regexp.MustCompile(`<a[^>]*id="btn-download"[^>]*>`)
+	tag := downloadAnchor.FindString(body)
+	assert.NotEmpty(t, tag, "落地页必须有 btn-download 锚点")
+	assert.Contains(t, tag, `style="display:none"`,
 		"下载按钮必须默认隐藏，解析到合法地址后才显示")
+}
+
+// 落地页把 modules/common 的 updater 路由硬编码成字符串，Go 这边没有任何符号引用能
+// 在它被改名时报错。上面的测试只 grep HTML 里有没有这个字面量——路由改名后字面量还在，
+// 全仓测试照样绿，而线上每个移动端访客的 fetch 都 404、下载按钮永远不出现。
+// 这条测试用一次真实请求确认该路由确实由服务端提供。
+func TestGroupInvitePage_UpdaterRoutesAreServed(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	for _, path := range []string{
+		"/v1/common/updater/android/1.0",
+		"/v1/common/updater/ios/1.0.0",
+	} {
+		w := httptest.NewRecorder()
+		s.GetRoute().ServeHTTP(w, newInviteRequest(t, path))
+		// 库里没有版本记录时返回 204，有则 200；唯独不能是 404 —— 那意味着落地页
+		// 硬编码的路径已经和实际路由表对不上了。
+		assert.NotEqual(t, http.StatusNotFound, w.Code,
+			"落地页硬编码的 updater 路径 %s 必须能被服务端路由到", path)
+	}
 }
 
 // Mininglamp-OSS/octo-server#1246: 移动端两端均未注册 dmwork:// scheme，

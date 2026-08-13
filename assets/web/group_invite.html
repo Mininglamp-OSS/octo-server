@@ -206,14 +206,20 @@ function findTokenAndSid() {
 // External.BaseURL 在生产就是 API 前缀（.../api），点击必然落到 404 —— 语义和实现
 // 不一致。这里改为解析真实安装包地址；解析不出来就隐藏按钮，绝不回退到 API_BASE：
 // 没有入口好过一个死链。
-var ANDROID_UPDATER_PATH = "/v1/common/updater/android/1.0";
-var IOS_UPDATER_PATH = "/v1/common/updater/ios/1.0.0";
+// 按平台查表，而不是 android/ios 二选一的三元表达式：将来给 detectMobileOS
+// 加第三个平台（HarmonyOS NEXT 的 UA 就不带 Android 标记）时，三元式会把它
+// 静默归到 ios 分支、给用户递一个 iOS 安装地址；查表则是查不到就退出。
+var UPDATER_PATHS = {
+    android: "/v1/common/updater/android/1.0",
+    ios: "/v1/common/updater/ios/1.0.0"
+};
 
 function detectMobileOS() {
     var ua = navigator.userAgent || "";
     if (/android/i.test(ua)) return "android";
-    // iPadOS 13+ 的 UA 伪装成 Macintosh，靠 maxTouchPoints 才能区分出触屏 iPad。
     if (/iPad|iPhone|iPod/.test(ua)) return "ios";
+    // iPadOS 13+ 的 UA 伪装成 Macintosh，只能靠 maxTouchPoints 把触屏 iPad 认出来。
+    // 这一行不是上一行的冗余，删掉就会丢掉整个 iPad 平台。
     if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return "ios";
     return "";
 }
@@ -221,28 +227,40 @@ function detectMobileOS() {
 // safeDownloadURL 收口 updater 返回的地址：只放行 http/https。updater 直接吐库里的
 // 裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 / 相对 / 畸形，而这个值
 // 最终要塞进 a.href —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
-// 相对地址按 API_BASE 解析，与 Web 端 resolveSafeDownloadUrl 保持同策略。
+//
+// 先按绝对地址解析，再回退到相对解析：new URL(x, base) 会**先解析 base**，base
+// 不是绝对地址时，即使 x 本身是完整的 https 地址也照样抛 TypeError。绝对优先能让
+// 下载地址不受 BaseURL 配置形态的牵连。
+//
+// 相对地址按 API_BASE 解析——注意这与 Web 登录页的 resolveSafeDownloadUrl 并不等价，
+// 那边用的是 window.location.origin。两者只在 BaseURL 带多级路径时分叉
+// （base=".../api/v2" + "files/x" → ".../api/files/x"，末段总是被替换掉）。
+// 生产库里存的是绝对地址，走不到这条分支；真要存相对地址时这里得先对齐两端。
 function safeDownloadURL(value) {
     if (typeof value !== "string") return "";
     var trimmed = value.trim();
     if (!trimmed) return "";
-    try {
-        var u = new URL(trimmed, API_BASE);
-        if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
-    } catch (e) { /* 畸形地址一律按解析失败处理 */ }
+    var u = null;
+    try { u = new URL(trimmed); } catch (e) { u = null; }
+    if (!u) {
+        try { u = new URL(trimmed, API_BASE); } catch (e) { return ""; }
+    }
+    if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
     return "";
 }
 
 // setupDownloadButton 按 UA 取当前平台的安装包地址并显示按钮。
-// 桌面端（无移动安装包可给）、updater 返回 204（库里没有该平台的版本记录，
-// 且响应无 body 不能 .json()）、地址非法、网络失败 —— 一律保持按钮隐藏。
+// 桌面端（无移动安装包可给）、库里没有该平台的版本记录、地址非法、网络失败 ——
+// 一律保持按钮隐藏。没有入口好过一个死链。
 function setupDownloadButton() {
     var btn = document.getElementById("btn-download");
     if (!btn) return;
-    var os = detectMobileOS();
-    if (!os) return;
-    var path = os === "android" ? ANDROID_UPDATER_PATH : IOS_UPDATER_PATH;
+    var path = UPDATER_PATHS[detectMobileOS()];
+    if (!path) return;
     fetch(API_BASE + path).then(function (r) {
+        // updater 在没有版本记录时返回 204：状态码是 2xx（r.ok 为真）但没有 body。
+        // 下面的 r.json() 兜底也能把它吞成 null，这里显式列出来是为了把 updater
+        // 的这条契约写在代码里，而不是让它藏在一个泛化的 catch 背后。
         if (r.status === 204 || !r.ok) return null;
         return r.json().catch(function () { return null; });
     }).then(function (d) {
@@ -277,8 +295,6 @@ function renderInfo(data) {
         tip.textContent = "该群已开启邀请确认，请在 App 内由管理员审批后入群。";
         tip.style.display = "block";
     }
-    setupDownloadButton();
-
     // Web 已登录 & 群可直接入群 → 显示「加入群聊」按钮
     // invite_required 场景仍交由 App 内审批，不在落地页直接入群
     if (data.status === "joinable" && findTokenAndSid().token) {
@@ -436,6 +452,11 @@ function showNeedSpaceState(sid) {
         btn.addEventListener("click", function () { redirectHome(sid); });
     }
 }
+
+// 下载地址和邀请详情是两个互不依赖的公开 GET，并行发起。按钮本身在 #content 里，
+// 容器显示之前把它标成可见是安全的；串在 renderInfo 里只会让弱网下的下载入口
+// 白等一个 RTT 才浮出来，还会造成一次迟到的布局跳动。
+setupDownloadButton();
 
 if (!code) {
     showState("state-expired");
