@@ -11,6 +11,19 @@ type dbStore struct {
 	session *dbr.Session
 }
 
+// dbr interpolates MySQL time arguments as UTC text. Rebuild values read from
+// DATETIME using their wall-clock components so a connection configured with
+// loc=Local does not shift the persisted UTC value on read-back.
+func normalizePauseRecord(record *pauseRecord) *pauseRecord {
+	if record == nil || record.PausedUntil == nil {
+		return record
+	}
+	value := *record.PausedUntil
+	utc := time.Date(value.Year(), value.Month(), value.Day(), value.Hour(), value.Minute(), value.Second(), value.Nanosecond(), time.UTC)
+	record.PausedUntil = &utc
+	return record
+}
+
 func newDBStore(ctx *config.Context) *dbStore {
 	return &dbStore{session: ctx.DB()}
 }
@@ -21,7 +34,7 @@ func (s *dbStore) get(uid string) (*pauseRecord, error) {
 		From("user_notification_pause").
 		Where("uid=?", uid).
 		Load(&record)
-	return record, err
+	return normalizePauseRecord(record), err
 }
 
 func (s *dbStore) upsert(uid string, pausedUntil time.Time, now time.Time) (*pauseRecord, error) {
@@ -51,7 +64,7 @@ func (s *dbStore) upsert(uid string, pausedUntil time.Time, now time.Time) (*pau
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return record, nil
+	return normalizePauseRecord(record), nil
 }
 
 func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
@@ -82,7 +95,7 @@ func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return record, nil
+	return normalizePauseRecord(record), nil
 }
 
 func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]struct{}, error) {

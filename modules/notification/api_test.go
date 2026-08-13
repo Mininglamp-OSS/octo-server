@@ -41,6 +41,19 @@ func TestResponseUsesUTCAbsolutePauseTime(t *testing.T) {
 	}
 }
 
+func TestNormalizePauseRecordPreservesDatabaseUTCWallClock(t *testing.T) {
+	stored := time.Date(2026, 8, 15, 8, 20, 30, 123000000, time.FixedZone("CST", 8*60*60))
+	record := normalizePauseRecord(&pauseRecord{PausedUntil: &stored})
+
+	if record.PausedUntil == nil {
+		t.Fatal("paused_until should remain present")
+	}
+	want := time.Date(2026, 8, 15, 8, 20, 30, 123000000, time.UTC)
+	if !record.PausedUntil.Equal(want) || record.PausedUntil.Location() != time.UTC {
+		t.Fatalf("paused_until should preserve UTC wall-clock value, got %s", record.PausedUntil)
+	}
+}
+
 func TestValidPauseUntilCapsThePauseWindow(t *testing.T) {
 	now := time.Date(2026, 8, 12, 11, 30, 0, 0, time.UTC)
 	if !validPauseUntil(now, now.Add(time.Minute)) {
