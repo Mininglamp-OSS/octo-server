@@ -5,9 +5,10 @@ package main
 //
 // It replaces two standalone commands under tools/ (tools/msgextra-version for
 // #627, tools/botevent-seq for #697) which the Dockerfile never built: the
-// image ships only /home/app, so running either against production meant
-// cross-compiling and copying a binary into a pod by hand, and a private
-// deployment was guaranteed to arrive without them. `app session-rollout` had
+// image carries the root-package binary plus assets/ and configs/ and nothing
+// from tools/, so running either against production meant cross-compiling and
+// copying a binary into a pod by hand, and a private deployment was guaranteed
+// to arrive without them. `app session-rollout` had
 // already made the same move for #733; this generalizes it.
 //
 // The three verbs mean the same thing in every domain:

@@ -4,8 +4,9 @@ package main
 // rollout, folded into the server binary.
 //
 // It used to be two standalone commands under tools/, which the Dockerfile
-// never built: the image ships only /home/app, so a private deployment was
-// guaranteed to arrive without them. Nothing referenced them from CI either.
+// never built: the image carries the root-package binary plus assets/ and
+// configs/ and nothing from tools/, so a private deployment was guaranteed to
+// arrive without them. Nothing referenced them from CI either.
 //
 // The operator surface stays deliberately small because the advance predicate
 // needs no human judgement and the reconciler runs it:
