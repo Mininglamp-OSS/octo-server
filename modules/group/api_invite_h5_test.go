@@ -561,6 +561,21 @@ func TestGroupInvitePage_UpdaterRoutesAreServed(t *testing.T) {
 	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
+	// updater 在库里没有版本记录时返回 204，而 CleanAllTables 会把 app_version 清空 ——
+	// 不种数据的话两条 updater 路径在 CI 里恒为 204，下面那条「字段名必须存在」的断言
+	// 永远不会执行，看起来已经覆盖、实际是空的。版本号要与落地页发的哨兵值不同，
+	// 否则 handler 走 model.AppVersion == oldVersion 的相等分支同样返回 204。
+	for _, seed := range []struct{ os, version, url string }{
+		{"android", "9.9.9", "https://dl.example.com/dmwork-9.9.9.apk"},
+		{"ios", "9.9.9", "https://apps.apple.com/cn/app/dmwork/id999"},
+	} {
+		_, err := ctx.DB().InsertInto("app_version").
+			Columns("app_version", "os", "is_force", "update_desc", "download_url").
+			Values(seed.version, seed.os, 0, "seed for route contract test", seed.url).
+			Exec()
+		assert.NoError(t, err, "seed app_version for %s", seed.os)
+	}
+
 	// appconfig 也是落地页硬编码的 modules/common 路由，同样没有符号引用兜底，
 	// 所以和两条 updater 路径一起验。
 	for _, tc := range []struct {

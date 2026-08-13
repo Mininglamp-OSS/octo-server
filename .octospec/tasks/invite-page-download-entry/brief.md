@@ -70,8 +70,11 @@ that. No "open in app" button may be reintroduced.
 
 - `octo-web`: no shared download component, no download entry in the logged-in
   shell. The invite page is self-contained instead.
-- `appconfig.web_url` as a desktop fallback — unnecessary once both buttons render
-  on desktop.
+- A **desktop-triggered** `web_url` entry. Both platform rows render on desktop, so
+  nothing needs to key off the platform. Note this is not a blanket exclusion of
+  `web_url`: a fallback gated on *neither platform resolving* is in scope and
+  implemented — see Background. Do not read this line as permission to delete
+  `setupWebFallback`.
 - The other landing pages (`space_email_invite.html`, `space_join_approve.html`) —
   they have no download button and are unaffected.
 - The pre-existing `t.Skip` on `TestGroupInvitePage_NoDmworkScheme` (OCTO migration
