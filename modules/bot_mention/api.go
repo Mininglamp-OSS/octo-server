@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -19,6 +20,9 @@ import (
 
 type botMentionRobotService interface {
 	ExistRobot(uid string) (bool, error)
+	// GetCreatorUID 查 Bot 的创建者(主人)uid。带缓存;Bot 不存在或无 creator_uid 时
+	// 返回空串 + nil error(见 modules/robot/api.go 的契约)。
+	GetCreatorUID(robotID string) (string, error)
 	PrepareBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (robot.PreparedBotTypedEvent, error)
 }
 
@@ -70,6 +74,41 @@ func New(ctx *config.Context) *BotMention {
 func (m *BotMention) Route(r *wkhttp.WKHttp) {
 	internal := r.Group("/v1/internal", m.internalAuthMiddleware())
 	internal.POST("/bot-mentions", m.create)
+	internal.POST("/bot-owner", m.botOwner)
+}
+
+// botOwner 回答「某个 Bot 的主人(创建者)是谁」。
+//
+// 为什么需要这个:HTML 文档的权限判定要的是 **Bot 的主人**,不是 Bot 自己 —— octo-doc 的
+// creator_uid 按设计存的永远是人的 uid(Bot 发布时存它主人的 uid,"bot and owner share
+// author")。octo-doc 判权限时只拿到一个 bot_uid,而它换 OwnerUID 的唯一途径 VerifyBot 需要
+// Bot 的 **token**,服务间调用没有。归属数据只在这边(robot.creator_uid),所以由这边回答。
+//
+// 只回一个 uid,不回 Bot 的其它信息:调用方需要的就是这一个字段,回得多只会让它长出别的依赖。
+// Bot 不存在 / 没有 creator_uid ⇒ owner_uid 为空串 + 200。空串对调用方就是「判不出」,
+// 而它对判不出的处理是拒绝(fail closed)—— 用 404 反而会被误当成「服务不可用」而重试。
+func (m *BotMention) botOwner(c *wkhttp.Context) {
+	var body struct {
+		BotUID string `json:"bot_uid"`
+	}
+	// 错误响应一律走 respondBotMention* 那几个 helper(内部是 httperr.ResponseErrorLWithStatus)。
+	// 本模块有条 lint 测试禁止裸 c.ResponseError —— i18n 要求错误码可翻译。
+	if err := c.BindJSON(&body); err != nil {
+		respondBotMentionInvalid(c, "body")
+		return
+	}
+	botUID := strings.TrimSpace(body.BotUID)
+	if botUID == "" {
+		respondBotMentionInvalid(c, "bot_uid")
+		return
+	}
+	ownerUID, err := m.robots.GetCreatorUID(botUID)
+	if err != nil {
+		m.Error("bot owner lookup failed", zap.String("bot_uid", botUID), zap.Error(err))
+		respondBotMentionStoreFailed(c)
+		return
+	}
+	c.Response(map[string]string{"owner_uid": strings.TrimSpace(ownerUID)})
 }
 
 func (m *BotMention) internalAuthMiddleware() wkhttp.HandlerFunc {
@@ -294,6 +333,11 @@ func mentionEventData(mention normalizedMention, enqueuedAt int64) map[string]in
 	}
 	if mention.ParentID != "" {
 		data["parent_id"] = mention.ParentID
+	}
+	// 只在非默认类型时出现:普通文档的事件载荷保持和加这个字段之前逐字节一致,
+	// 免得既有消费者的字段集断言(插件那份签进仓库的快照)无端变红。
+	if mention.DocKind != "" {
+		data["doc_kind"] = mention.DocKind
 	}
 	if mention.URL != "" {
 		data["url"] = mention.URL
