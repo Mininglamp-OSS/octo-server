@@ -221,8 +221,26 @@ func TestUserGet_Bot_Viewable(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "short_no", "bot 资料应完整可查")
 }
 
-// 系统账号：同上。
-func TestUserGet_SystemAccount_Viewable(t *testing.T) {
+// 系统 Bot：pkg/space.SystemBots 白名单里的账号无需任何关系即可查看完整资料。
+// 用 robot=0 的 fileHelper（而非 robot=1 的 u_10000），确保命中的是 SystemBot 分支而
+// 不是 Robot 分支——CleanAllTables 已清掉迁移预置的 fileHelper，这里重新建号无冲突。
+func TestUserGet_SystemBot_Viewable(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "fileHelper", Name: "SystemBotU", ShortNo: "SNSYSBOTU",
+	}))
+
+	w := getUser(s, "fileHelper")
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"short_no":`, "白名单系统 Bot 资料应完整可查")
+}
+
+// 回归（本次收紧的核心）：category=system 但**不在** SystemBots 白名单的账号——例如固定
+// 可猜 UID 的 admin 超管号——不再享受系统放行。无可见关系时必须降级为最小集，不得把短号、
+// 在线态等身份字段整份下发给任意登录用户。
+func TestUserGet_SystemCategoryNotWhitelisted_Minimal(t *testing.T) {
 	s, ctx := newUserAuthzServer(t)
 	defer testutil.CleanAllTables(ctx)
 
@@ -234,7 +252,28 @@ func TestUserGet_SystemAccount_Viewable(t *testing.T) {
 
 	w := getUser(s, "ut_sys")
 	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), "short_no", "系统账号资料应完整可查")
+	assert.NotContains(t, w.Body.String(), `"short_no":`,
+		"非白名单的 category=system 账号无关系时必须降级为最小集，不得泄露身份字段")
+}
+
+// 同上，锁住被移除判定的另一半：`customerService` 也不再享受身份放行。仓库里没有任何
+// 代码路径写这个 category（只有 QueryByCategory / GetUsersWithCategories 读它），所以
+// 这类账号只可能来自人工改库或遗留系统——正因为没有种子可依赖，这条断言是唯一能防止
+// 它被悄悄加回放行集的保险。
+func TestUserGet_CustomerServiceCategoryNotWhitelisted_Minimal(t *testing.T) {
+	s, ctx := newUserAuthzServer(t)
+	defer testutil.CleanAllTables(ctx)
+
+	assert.NoError(t, NewService(ctx).AddUser(&AddUserReq{
+		UID: "ut_cs", Name: "CustomerServiceU", ShortNo: "SNCSU",
+	}))
+	_, err := ctx.DB().UpdateBySql("UPDATE `user` SET category=? WHERE uid=?", CategoryCustomerService, "ut_cs").Exec()
+	assert.NoError(t, err)
+
+	w := getUser(s, "ut_cs")
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"short_no":`,
+		"customerService 账号无关系时同样必须降级为最小集")
 }
 
 // 本人：完整资料（含仅自己可见的手机号字段路径）。

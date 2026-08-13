@@ -1,0 +1,57 @@
+schema_version: 1
+task: profile-visibility-system-bot-whitelist
+brief: .octospec/tasks/profile-visibility-system-bot-whitelist/brief.md
+resolved_at: 2026-08-12T12:10:00+08:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      The change is the object-level read boundary itself. The person-profile
+      fast path decided visibility from a writable user column, letting a
+      guessable UID bypass the Space, friend, and common-group legs. Both
+      endpoints now derive the public-bot exemption from an explicit whitelist.
+  - id: error-handling
+    source: repo
+    load_bearing: false
+    why: >
+      No new error code, envelope, or status. Unrelated callers keep receiving a
+      200 with the established minimal profile set rather than a rejection, so
+      client rendering of historical senders does not break.
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    why: >
+      user.category is an operator- and seed-writable display attribute. Treating
+      it as an authorization signal made the superuser row publicly readable;
+      pkg/space.SystemBots is the only enumerable definition of a publicly
+      visible bot.
+  - id: rate-limit
+    source: repo
+    load_bearing: false
+    why: >
+      No route or limiter change. Both endpoints keep the SharedUIDRateLimiter
+      mounted by the prior object-authz task; tests reset ratelimit:uid:* in
+      setup as that task established.
+  - id: testing
+    source: repo
+    load_bearing: true
+    why: >
+      Two existing cases had encoded the defective behavior as assertions and had
+      to be rewritten rather than kept green. The reverse regression pins the
+      narrowing: a category=system row outside the whitelist degrades to the
+      minimal set on both endpoints.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      Single English Conventional Commit subject with a prose body, matching the
+      surrounding history.
+
+security_notes:
+  - No production identifier, hostname, credential, or token appears in the
+    brief, journal, tests, or commit message.
+  - The superuser account is referred to by its fixed public UID only; no
+    password, role grant, or session material is described.
+  - Tests use synthetic UIDs plus the migration-seeded fileHelper bot.

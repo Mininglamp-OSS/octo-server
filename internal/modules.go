@@ -44,6 +44,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/messages_search"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/notification"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/notify"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/opanalytics"
