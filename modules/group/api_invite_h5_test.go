@@ -427,8 +427,9 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.Equal(t, http.StatusOK, w.Code)
 	body := w.Body.String()
 
-	// 回归钉子：任何把按钮 href 直接绑到 API_BASE 的写法都必须挂 CI。
-	assert.NotContains(t, body, `getElementById("btn-download").href = API_BASE`,
+	// 回归钉子：任何把按钮 href 绑到 API_BASE 的写法都必须挂 CI。不绑具体元素 id，
+	// 这样换个 id 或先取元素再赋值也一样会被拦下。
+	assert.NotContains(t, body, "href = API_BASE",
 		"下载按钮不能回退到 API_BASE —— 生产的 BaseURL 是 API 前缀，点击会 404")
 
 	// 安装包地址必须来自公开的 updater 接口，两个平台都要覆盖。
@@ -437,10 +438,15 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, "/v1/common/updater/ios/1.0.0"),
 		"iOS 安装包地址必须来自公开 updater 接口")
 
+	// 不做 UA 嗅探：邀请链接主要在微信 / 企业 IM 的内嵌浏览器里打开，UA 被各家改写，
+	// 猜错就是给用户递错平台的安装包。两个平台各给一个按钮，各自独立显示。
+	assert.NotContains(t, body, "navigator.userAgent",
+		"落地页不应按 UA 分流下载入口——内嵌浏览器的 UA 不可靠")
+
 	// 最容易的静默失效方式是删掉调用点：函数定义、两条路径、scheme 校验全都还在，
 	// 上面每一条断言照样绿，而下载按钮在线上永远不显示。所以调用点必须单独钉住。
-	assert.True(t, strings.Contains(body, "setupDownloadButton()"),
-		"setupDownloadButton 必须真的被调用，只定义不调用会让按钮永远不显示")
+	assert.True(t, strings.Contains(body, "setupDownloadButtons()"),
+		"setupDownloadButtons 必须真的被调用，只定义不调用会让按钮永远不显示")
 
 	// updater 没有版本记录时返回 204（2xx 但无 body）。断言到 204 出现即可，
 	// 不绑具体写法——换成 204 === r.status 或抽成命名函数都不该挂 CI。
@@ -455,13 +461,14 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
 		"只放行 http/https，挡掉 javascript: 之类的 scheme")
 
-	// 按钮默认隐藏：桌面端 / 无安装包 / 解析失败都不该露出一个点不动的入口。
-	// 用正则匹配整个标签，属性顺序、新增 class 之类的排版改动不该挂 CI。
-	downloadAnchor := regexp.MustCompile(`<a[^>]*id="btn-download"[^>]*>`)
-	tag := downloadAnchor.FindString(body)
-	assert.NotEmpty(t, tag, "落地页必须有 btn-download 锚点")
-	assert.Contains(t, tag, `style="display:none"`,
-		"下载按钮必须默认隐藏，解析到合法地址后才显示")
+	// 两个平台各有一个按钮，且都默认隐藏：无安装包 / 解析失败都不该露出一个点不动
+	// 的入口。用正则匹配整个标签，属性顺序、新增 class 之类的排版改动不该挂 CI。
+	for _, id := range []string{"btn-download-android", "btn-download-ios"} {
+		tag := regexp.MustCompile(`<a[^>]*id="` + id + `"[^>]*>`).FindString(body)
+		assert.NotEmpty(t, tag, "落地页必须有 %s 锚点", id)
+		assert.Contains(t, tag, `style="display:none"`,
+			"%s 必须默认隐藏，解析到合法地址后才显示", id)
+	}
 }
 
 // 落地页把 modules/common 的 updater 路由硬编码成字符串，Go 这边没有任何符号引用能

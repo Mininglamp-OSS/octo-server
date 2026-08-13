@@ -66,7 +66,8 @@
             </div>
             <div class="btn-group">
                 <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
-                <a class="btn btn-secondary" id="btn-download" href="#" target="_blank" rel="noopener" style="display:none">下载 App</a>
+                <a class="btn btn-secondary" id="btn-download-android" href="#" target="_blank" rel="noopener" style="display:none">下载 Android 版</a>
+                <a class="btn btn-secondary" id="btn-download-ios" href="#" target="_blank" rel="noopener" style="display:none">下载 iOS 版</a>
             </div>
         </div>
 
@@ -206,23 +207,16 @@ function findTokenAndSid() {
 // External.BaseURL 在生产就是 API 前缀（.../api），点击必然落到 404 —— 语义和实现
 // 不一致。这里改为解析真实安装包地址；解析不出来就隐藏按钮，绝不回退到 API_BASE：
 // 没有入口好过一个死链。
-// 按平台查表，而不是 android/ios 二选一的三元表达式：将来给 detectMobileOS
-// 加第三个平台（HarmonyOS NEXT 的 UA 就不带 Android 标记）时，三元式会把它
-// 静默归到 ios 分支、给用户递一个 iOS 安装地址；查表则是查不到就退出。
-var UPDATER_PATHS = {
-    android: "/v1/common/updater/android/1.0",
-    ios: "/v1/common/updater/ios/1.0.0"
-};
-
-function detectMobileOS() {
-    var ua = navigator.userAgent || "";
-    if (/android/i.test(ua)) return "android";
-    if (/iPad|iPhone|iPod/.test(ua)) return "ios";
-    // iPadOS 13+ 的 UA 伪装成 Macintosh，只能靠 maxTouchPoints 把触屏 iPad 认出来。
-    // 这一行不是上一行的冗余，删掉就会丢掉整个 iPad 平台。
-    if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return "ios";
-    return "";
-}
+// 不做 UA 嗅探：两个平台各给一个按钮，各自按 updater 有没有版本记录独立显示。
+//
+// UA 分流在这个页面上尤其不可靠——邀请链接的主要打开方式是微信 / 企业 IM 的内嵌
+// 浏览器，UA 被各家改写；iPadOS 13+ 干脆把自己报成 Macintosh。猜错的代价是给用户
+// 递错平台的安装包，而猜对也只省下一个按钮。顺带这样桌面端也有了入口（扫码 / 转发
+// 到手机上打开），不必再单独接一个「去官网」的兜底。
+var DOWNLOADS = [
+    { id: "btn-download-android", path: "/v1/common/updater/android/1.0" },
+    { id: "btn-download-ios", path: "/v1/common/updater/ios/1.0.0" }
+];
 
 // safeDownloadURL 收口 updater 返回的地址：只放行 http/https。updater 直接吐库里的
 // 裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 / 相对 / 畸形，而这个值
@@ -249,26 +243,26 @@ function safeDownloadURL(value) {
     return "";
 }
 
-// setupDownloadButton 按 UA 取当前平台的安装包地址并显示按钮。
-// 桌面端（无移动安装包可给）、库里没有该平台的版本记录、地址非法、网络失败 ——
-// 一律保持按钮隐藏。没有入口好过一个死链。
-function setupDownloadButton() {
-    var btn = document.getElementById("btn-download");
-    if (!btn) return;
-    var path = UPDATER_PATHS[detectMobileOS()];
-    if (!path) return;
-    fetch(API_BASE + path).then(function (r) {
-        // updater 在没有版本记录时返回 204：状态码是 2xx（r.ok 为真）但没有 body。
-        // 下面的 r.json() 兜底也能把它吞成 null，这里显式列出来是为了把 updater
-        // 的这条契约写在代码里，而不是让它藏在一个泛化的 catch 背后。
-        if (r.status === 204 || !r.ok) return null;
-        return r.json().catch(function () { return null; });
-    }).then(function (d) {
-        var url = safeDownloadURL(d && d.url);
-        if (!url) return;
-        btn.href = url;
-        btn.style.display = "flex";
-    }).catch(function () { /* 网络异常：按钮保持隐藏 */ });
+// setupDownloadButtons 为每个平台各解析一次安装包地址。两个请求互相独立：
+// 一个平台没记录不影响另一个显示。库里没有版本记录、地址非法、网络失败 ——
+// 该平台的按钮保持隐藏。没有入口好过一个死链。
+function setupDownloadButtons() {
+    DOWNLOADS.forEach(function (item) {
+        var btn = document.getElementById(item.id);
+        if (!btn) return;
+        fetch(API_BASE + item.path).then(function (r) {
+            // updater 在没有版本记录时返回 204：状态码是 2xx（r.ok 为真）但没有 body。
+            // 下面的 r.json() 兜底也能把它吞成 null，这里显式列出来是为了把 updater
+            // 的这条契约写在代码里，而不是让它藏在一个泛化的 catch 背后。
+            if (r.status === 204 || !r.ok) return null;
+            return r.json().catch(function () { return null; });
+        }).then(function (d) {
+            var url = safeDownloadURL(d && d.url);
+            if (!url) return;
+            btn.href = url;
+            btn.style.display = "flex";
+        }).catch(function () { /* 网络异常：按钮保持隐藏 */ });
+    });
 }
 
 function renderInfo(data) {
@@ -453,10 +447,10 @@ function showNeedSpaceState(sid) {
     }
 }
 
-// 下载地址和邀请详情是两个互不依赖的公开 GET，并行发起。按钮本身在 #content 里，
+// 下载地址和邀请详情是互不依赖的公开 GET，并行发起。按钮本身在 #content 里，
 // 容器显示之前把它标成可见是安全的；串在 renderInfo 里只会让弱网下的下载入口
 // 白等一个 RTT 才浮出来，还会造成一次迟到的布局跳动。
-setupDownloadButton();
+setupDownloadButtons();
 
 if (!code) {
     showState("state-expired");
