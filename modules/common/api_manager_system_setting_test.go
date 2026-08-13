@@ -429,6 +429,14 @@ func TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// 出口清理：这个用例把 sidebar.recent_filter_thread_days 顶到上界 3650，
+	// 而写路径同时更新进程级 SystemSettings 单例 —— CleanAllTables 清不掉它。
+	// 不复位的话，后面任何校验「归档窗口 >= 最近会话子区窗口」的用例都会拿 3650
+	// 当存量而误判违规（见 thread_archive_setting_test.go 的 newSuperAdminServer）。
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = EnsureSystemSettings(ctx).Reload()
+	})
 	require.NoError(t, ctx.Cache().Set(
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),

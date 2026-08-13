@@ -203,6 +203,15 @@ func newSuperAdminServer(t *testing.T) (*wkhttp.WKHttp, *config.Context) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// 入口也要 Reload：管理 handler 读的是进程级 SystemSettings 单例
+	// （EnsureSystemSettings 把它存在包级变量里，见 system_settings.go），
+	// CleanAllTables 只清 DB 行、碰不到那份快照。前面任何用例通过 POST
+	// /v1/manager/common/system_setting 写进去的值都会留在单例里，于是本用例
+	// 建立的「合法存量」会被上一个用例的残留值判违规 —— -shuffle=on 下就是
+	// 间歇性红（TestManagerSystemSetting_OrderingRejectsFromSidebarSide 在
+	// run 31566358696 / 31571974333 各失败一次，details 里的 recent_days=3650
+	// 正是 TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries 写的值）。
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 	require.NoError(t, ctx.Cache().Set(
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
 		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
