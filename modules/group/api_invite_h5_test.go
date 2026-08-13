@@ -484,6 +484,38 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 		"必须保留 execCommand 兜底——内嵌浏览器里 Clipboard API 常不可用")
 }
 
+// 落地页必须零外部资源：不引 CDN 脚本、外链样式表、图标字体或远程图片。
+// 这个页面是用户接触产品的第一屏，且经常在内网、弱网、以及被墙的网络环境里打开——
+// 任何外部依赖失败都会让它退化成空白方块或裸样式。图标一律内联 SVG。
+func TestGroupInvitePage_NoExternalResources(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir("../.."); err != nil {
+		t.Fatalf("chdir to repo root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite?code=no-external-check"))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+
+	assert.NotContains(t, body, "<script src=", "不允许外链脚本")
+	assert.NotContains(t, body, "<link ", "不允许外链样式表 / 图标字体 / preconnect")
+	assert.NotContains(t, body, "@import", "CSS 不允许 @import 外部样式")
+	assert.NotContains(t, body, "url(http", "CSS 不允许引用远程资源")
+	assert.NotContains(t, body, `<img src="http`, "不允许远程图片")
+
+	// 图标必须是内联 SVG —— 上面几条只挡住了外链，没有内联图标的话按钮会秃。
+	assert.True(t, strings.Contains(body, "<svg"), "按钮图标必须内联 SVG")
+}
+
 // 落地页把 modules/common 的 updater 路由硬编码成字符串，Go 这边没有任何符号引用能
 // 在它被改名时报错。上面的测试只 grep HTML 里有没有这个字面量——路由改名后字面量还在，
 // 全仓测试照样绿，而线上每个移动端访客的 fetch 都 404、下载按钮永远不出现。
