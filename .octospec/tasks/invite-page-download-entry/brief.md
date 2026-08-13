@@ -91,12 +91,11 @@ that. No "open in app" button may be reintroduced.
       itself as Macintosh, so a wrong guess hands over the wrong platform's installer.
 - [x] A platform with no version record (updater 204), a malformed address, or a
       failed request hides only its own row. Nothing falls back to `API_BASE`.
-- [x] Installer addresses must be absolute http/https **and carry a file suffix**.
-      Relative values are rejected rather than resolved: this page and the web login
-      page would resolve them against different bases (`API_BASE` vs
-      `location.origin`), so at most one could be right. A suffix-less address is a
-      landing page, not a package — a download button that opens a web page is the
-      same broken promise this task exists to remove.
+- [x] Installer addresses must be absolute http/https. Relative values are rejected
+      rather than resolved: this page and the web login page would resolve them
+      against different bases (`API_BASE` vs `location.origin`), so at most one could
+      be right. **No further local rule is added on top of the scheme allowlist** —
+      see the rejected-alternative note below.
 - [x] When neither platform yields an installer, fall back to `appconfig.web_url`
       (absolute http/https, no suffix requirement — a portal is not a package).
       If that is unavailable too, still show nothing; never `API_BASE`.
@@ -109,6 +108,33 @@ that. No "open in app" button may be reintroduced.
       (`TestGroupInvitePage_NoExternalResources`).
 - [x] `modules/group` passes under the CI recipe (fresh database, `-race`,
       `-shuffle=on`).
+
+## Rejected alternative: requiring a file suffix on installer addresses
+
+A revision of this task briefly required the installer address's last path segment
+to carry a file extension, on the theory that a suffix-less address is a landing
+page rather than a package. Review rejected it and the rejection is correct:
+
+- **It does not discriminate.** It accepts `…/download/ios.html` — exactly the
+  landing page it was meant to exclude — while rejecting App Store and TestFlight
+  addresses and any signed download URL that carries its filename in the query.
+- **It is unsatisfiable for iOS.** Installing an iOS app from a browser requires the
+  `itms-services:` scheme, which the (correct) scheme allowlist rejects. Every
+  address that actually installs the app from a mobile browser is therefore a store
+  or TestFlight page, and every one of those is suffix-less. No iOS value could both
+  pass validation and work.
+- **It contradicts this task's own reasoning.** Relative addresses are rejected here
+  precisely because this page and the web login page would disagree about the same
+  stored value. A suffix rule creates that same disagreement — `octo-web`'s
+  `resolveSafeDownloadUrl` validates only the scheme, and `addAppVersion` imposes no
+  format constraint at all — so one page would show a working button where the other
+  hides it.
+- **The `web_url` fallback does not cover it.** The fallback requires *both*
+  platforms to fail, so a deployment with a suffixed Android APK and an App Store
+  iOS address would leave an iPhone visitor with an Android-only page.
+
+A download address pointing at a web page is a data-quality problem whose owner is
+the admin console's validation. A landing page cannot detect it from a URL string.
 
 ## Known verification gap
 

@@ -262,6 +262,22 @@ var DOWNLOADS = [
     { path: "/v1/common/updater/ios/1.0.0", row: "row-download-ios", link: "btn-download-ios", copy: "btn-copy-ios" }
 ];
 var APPCONFIG_PATH = "/v1/common/appconfig";
+var FETCH_TIMEOUT_MS = 8000;
+
+// fetchWithTimeout 给下载相关的请求加超时。fetch 本身没有默认超时，而
+// setupWebFallback 要等 Promise.all 全部 settle 才可能触发 —— 只要有一个平台的
+// 请求被中间层吞掉不返回，兜底就永远不会出现，页面停在改动前那个空白状态。
+// 没有 AbortController 的老 webview 退回裸 fetch：拿不到超时也不该拿不到功能。
+function fetchWithTimeout(url) {
+    if (typeof AbortController === "undefined") return fetch(url);
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
+    var done = function () { clearTimeout(timer); };
+    return fetch(url, { signal: controller.signal }).then(
+        function (r) { done(); return r; },
+        function (e) { done(); throw e; }
+    );
+}
 
 // copyText 优先用 Clipboard API，失败或不可用时都退回 execCommand。
 //
@@ -287,6 +303,7 @@ function legacyCopyText(text) {
         // 放到视口内但不可见：iOS Safari 对 display:none / 视口外的元素不给选中。
         ta.style.position = "fixed";
         ta.style.top = "0";
+        ta.style.left = "0";
         ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.select();
@@ -298,11 +315,11 @@ function legacyCopyText(text) {
     });
 }
 
-// safeDownloadURL 收口 updater 返回的地址：只放行 http/https。updater 直接吐库里的
-// 裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 / 相对 / 畸形，而这个值
-// 最终要塞进 a.href —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
+// safeAbsoluteURL 收口所有要写进 a.href 的地址：只放行绝对 http/https。
+// updater 直接吐库里的裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 /
+// 相对 / 畸形 —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
 //
-// safeAbsoluteURL 只接受绝对 http/https 地址，相对地址一律拒绝。
+// 相对地址一律拒绝，不做解析。
 //
 // 曾经的实现把相对地址按 API_BASE 解析，但 Web 登录页的 resolveSafeDownloadUrl 用的
 // 是 window.location.origin —— 同一个 app_version.download_url 字段两个消费方能算出
@@ -325,20 +342,20 @@ function safeAbsoluteURL(value) {
     return "";
 }
 
-// safeDownloadURL 在 safeAbsoluteURL 之上，再要求路径末段带文件后缀。
+// 安装包地址和 web_url 共用 safeAbsoluteURL，不再额外要求文件后缀。
 //
-// download_url 由管理台自由填写，填成一个下载引导页（无后缀）时，「下载 Android 版」
-// 会把用户送到一个网页而不是安装包 —— 按钮承诺的动作没有发生，正是本 PR 要根除的
-// 那类「说一套做一套」。无后缀一律判为「不是安装包」，让它退到 web_url 兜底，
-// 而不是伪装成一次下载。
-function safeDownloadURL(value) {
-    var url = safeAbsoluteURL(value);
-    if (!url) return "";
-    var lastSegment = new URL(url).pathname.split("/").pop();
-    // indexOf > 0：要求后缀前面有文件名，".apk" 这种纯后缀不算。
-    if (lastSegment.indexOf(".") <= 0) return "";
-    return url;
-}
+// 曾经加过一条「路径末段必须带后缀」的规则，想拦住把下载按钮指向落地页的情况。
+// 它做不到，而且反向伤害更大：
+//   - 判不准 —— 接受 ".../download/ios.html"（正是要拦的落地页），却拒绝
+//     App Store / TestFlight 地址和带查询参数的签名下载地址。
+//   - 对 iOS 是死局 —— 浏览器安装 iOS 应用必须走 itms-services:，而该 scheme 被
+//     白名单挡掉（正确）。于是任何真能装上 App 的 iOS 地址都是商店页，全都无后缀：
+//     不存在既通过校验又可用的取值。
+//   - 与写入侧和另一个消费方都不一致 —— addAppVersion 只要求 android 非空、不校验
+//     格式，octo-web 登录页也只校验 scheme。加了它，同一个存储值在两个页面上
+//     「能不能用」结论相反，正是本页拒绝相对地址时所反对的那种分歧。
+// 下载地址指向网页是数据质量问题，归管理台校验管；落地页从 URL 字符串判断不了。
+
 
 // setupDownloadButtons 为每个平台各解析一次安装包地址。两个请求互相独立：
 // 一个平台没记录不影响另一个显示。库里没有版本记录、地址非法、网络失败 ——
@@ -348,14 +365,14 @@ function setupDownloadButtons() {
         var row = document.getElementById(item.row);
         var link = document.getElementById(item.link);
         if (!row || !link) return Promise.resolve(false);
-        return fetch(API_BASE + item.path).then(function (r) {
+        return fetchWithTimeout(API_BASE + item.path).then(function (r) {
             // updater 在没有版本记录时返回 204：状态码是 2xx（r.ok 为真）但没有 body。
             // 下面的 r.json() 兜底也能把它吞成 null，这里显式列出来是为了把 updater
             // 的这条契约写在代码里，而不是让它藏在一个泛化的 catch 背后。
             if (r.status === 204 || !r.ok) return null;
             return r.json().catch(function () { return null; });
         }).then(function (d) {
-            var url = safeDownloadURL(d && d.url);
+            var url = safeAbsoluteURL(d && d.url);
             if (!url) return false;
             link.href = url;
             bindCopyButton(document.getElementById(item.copy), url, "下载链接");
@@ -372,19 +389,21 @@ function setupDownloadButtons() {
 
 // setupWebFallback 在两个平台都没有可用安装包时给出「打开网页版」。
 //
-// 触发条件覆盖了所有失败形态：都没有版本记录（updater 204）、updater 5xx、网络不通、
-// 地址非法或没有安装包后缀。此前这些情况下页面是一张群卡片加一片空白，用户无从判断
-// 是「没有 App 可下」还是「页面坏了」—— 而 detail 请求是独立的，它成功时页面看起来
-// 完全正常，只是没有任何可操作项。
+// 触发条件：两个平台都没有版本记录（updater 204）、updater 5xx、updater 请求失败或
+// 超时、地址非法。此前这些情况下页面是一张群卡片加一片空白，而 detail 请求是独立的、
+// 它成功时页面看起来完全正常，用户无从判断是「没有 App 可下」还是「页面坏了」。
 //
-// 地址取自公开的 appconfig.web_url（= External.WebLoginURL，产品门户）。它是门户不是
-// 安装包，所以走 safeAbsoluteURL 而不是 safeDownloadURL —— 门户地址本就不该有后缀。
-// 取不到就仍然什么都不显示：依旧不回退到 API_BASE。
+// 注意它覆盖不到整体断网：那时 detail 也会失败，走 showState("state-network-error")，
+// 而 showState 会 hide("content") —— 兜底行就在 #content 里，一并被藏掉。把三行移出
+// #content 才能覆盖那种情况（以及「链接过期且还没装 App」），那是独立的布局改动。
+//
+// 地址取自公开的 appconfig.web_url（= External.WebLoginURL，产品门户），与安装包地址
+// 走同一套 safeAbsoluteURL 校验。取不到就仍然什么都不显示：依旧不回退到 API_BASE。
 function setupWebFallback() {
     var row = document.getElementById("row-web-fallback");
     var link = document.getElementById("btn-web-fallback");
     if (!row || !link) return;
-    fetch(API_BASE + APPCONFIG_PATH).then(function (r) {
+    fetchWithTimeout(API_BASE + APPCONFIG_PATH).then(function (r) {
         if (!r.ok) return null;
         return r.json().catch(function () { return null; });
     }).then(function (d) {

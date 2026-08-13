@@ -445,8 +445,12 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 
 	// 最容易的静默失效方式是删掉调用点：函数定义、两条路径、scheme 校验全都还在，
 	// 上面每一条断言照样绿，而下载按钮在线上永远不显示。所以调用点必须单独钉住。
-	assert.True(t, strings.Contains(body, "setupDownloadButtons()"),
-		"setupDownloadButtons 必须真的被调用，只定义不调用会让按钮永远不显示")
+	//
+	// 必须锚在「行首的调用语句」上：裸子串 setupDownloadButtons() 会被函数声明
+	// `function setupDownloadButtons() {` 满足，删掉真实调用后断言照样绿 ——
+	// 那正是这条断言自称要拦的静默失效。
+	assert.Regexp(t, `(?m)^setupDownloadButtons\(\);$`, body,
+		"setupDownloadButtons 必须真的在顶层被调用，只定义不调用会让按钮永远不显示")
 
 	// updater 没有版本记录时返回 204（2xx 但无 body）。锚在 r.status === 204 上：
 	// 裸 "204" 子串今天不空转，但任何 SVG 坐标 / 色值 / padding 里出现 204 就会。
@@ -455,7 +459,7 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 
 	// href 落地前必须过 scheme 白名单：updater 吐的是库里的裸 download_url。
 	// 只断言校验点和两个放行的 scheme 存在，不绑比较表达式的排列顺序。
-	assert.True(t, strings.Contains(body, "safeDownloadURL"),
+	assert.True(t, strings.Contains(body, "safeAbsoluteURL"),
 		"updater 返回的地址必须经过 scheme 校验后才能写进 a.href")
 	assert.True(t, strings.Contains(body, ".protocol"), "必须检查 scheme")
 	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
@@ -473,17 +477,20 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, "writeText(text).catch("),
 		"Clipboard API 被拒时必须继续走 execCommand 兜底，不能只判能力是否存在")
 
-	// 安装包地址必须带文件后缀。download_url 由管理台自由填写，填成一个下载引导页
-	// 时「下载 Android 版」会把用户送到网页而不是安装包 —— 按钮承诺的动作没发生。
-	assert.True(t, strings.Contains(body, "lastSegment.indexOf(\".\")"),
-		"无文件后缀的地址不是安装包，必须剔除并退到 web_url 兜底")
+	// 不得再引入「路径必须带文件后缀」之类的本地规则：写入侧 addAppVersion 不校验
+	// 格式，octo-web 登录页也只校验 scheme。多加一条规则会让同一个存储值在两个页面上
+	// 「能不能用」结论相反 —— 正是本页拒绝相对地址时所反对的那种分歧。而且对 iOS 是
+	// 死局：能在浏览器里装上 App 的地址必然是商店 / TestFlight 页，全部无后缀。
+	assert.NotContains(t, body, `lastSegment.indexOf(".")`,
+		"不得对安装包地址施加文件后缀要求——与写入侧和 octo-web 消费方的契约都不一致")
 
 	// 两个平台都拿不出安装包时（都 204 / updater 5xx / 网络失败 / 地址非法），
 	// 页面不能只剩一张卡片加一片空白 —— 用户无从判断是没 App 可下还是页面坏了。
 	assert.True(t, strings.Contains(body, "/v1/common/appconfig"),
 		"兜底入口地址必须取自公开的 appconfig.web_url")
-	assert.True(t, strings.Contains(body, "setupWebFallback"),
-		"必须有 web_url 兜底路径")
+	// 同上：裸 setupWebFallback 会被函数声明和 HTML 注释满足，必须锚在调用表达式上。
+	assert.Regexp(t, `results\.indexOf\(true\) === -1\) setupWebFallback\(\);`, body,
+		"web_url 兜底必须真的在两个平台都失败时被调用")
 	assert.True(t, strings.Contains(body, "d.web_url"),
 		"兜底必须读 appconfig 的 web_url 字段")
 	fallbackRow := regexp.MustCompile(`<div[^>]*id="row-web-fallback"[^>]*>`).FindString(body)
@@ -554,17 +561,34 @@ func TestGroupInvitePage_UpdaterRoutesAreServed(t *testing.T) {
 	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
-	for _, path := range []string{
-		"/v1/common/updater/android/1.0",
-		"/v1/common/updater/ios/1.0.0",
+	// appconfig 也是落地页硬编码的 modules/common 路由，同样没有符号引用兜底，
+	// 所以和两条 updater 路径一起验。
+	for _, tc := range []struct {
+		path      string
+		jsonField string // 200 响应里落地页真正读的字段；空串表示该路径不强制校验
+	}{
+		{"/v1/common/updater/android/1.0", "url"},
+		{"/v1/common/updater/ios/1.0.0", "url"},
+		{"/v1/common/appconfig", "web_url"},
 	} {
 		w := httptest.NewRecorder()
-		s.GetRoute().ServeHTTP(w, newInviteRequest(t, path))
+		s.GetRoute().ServeHTTP(w, newInviteRequest(t, tc.path))
 		// 库里没有版本记录时返回 204，有则 200 —— 只接受这两个。
 		// 仅排除 404 是不够的：401 / 500 同样会让落地页拿不到地址，而 401 恰好是
 		// 「有人给这条公开路由加了鉴权」的信号，那对未登录访客等同于路由消失。
 		assert.Contains(t, []int{http.StatusOK, http.StatusNoContent}, w.Code,
-			"落地页硬编码的 updater 路径 %s 必须可路由且保持公开（期望 200/204，实得 %d）", path, w.Code)
+			"落地页硬编码的路径 %s 必须可路由且保持公开（期望 200/204，实得 %d）", tc.path, w.Code)
+
+		// 状态码对不代表字段名对：把 JSON 里的 url 改名成 download_url，上面的断言和
+		// 所有 grep 断言照样绿，而落地页读到的 d.url 是 undefined，所有行永远不显示。
+		if w.Code == http.StatusOK && tc.jsonField != "" {
+			var payload map[string]interface{}
+			if assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload), "%s 必须返回 JSON", tc.path) {
+				_, ok := payload[tc.jsonField]
+				assert.True(t, ok,
+					"%s 的 200 响应必须含落地页读取的 %q 字段（字段改名会让页面静默失效）", tc.path, tc.jsonField)
+			}
+		}
 	}
 }
 
