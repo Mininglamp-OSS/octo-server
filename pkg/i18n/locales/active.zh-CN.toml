@@ -746,6 +746,26 @@ other = "Webhook 消息投递失败。"
 ["err.server.incomingwebhook.push_disabled"]
 other = "未找到。"
 
+# ---- err.server.agent_mail_gateway.* ----
+
+["err.server.agent_mail_gateway.unauthorized"]
+other = "请先登录。"
+
+["err.server.agent_mail_gateway.space_required"]
+other = "请先选择 Space，再打开 Agent Mail。"
+
+["err.server.agent_mail_gateway.request_invalid"]
+other = "Agent Mail 请求无效。"
+
+["err.server.agent_mail_gateway.payload_too_large"]
+other = "Agent Mail 请求内容过大。"
+
+["err.server.agent_mail_gateway.unavailable"]
+other = "Agent Mail 暂时不可用。"
+
+["err.server.agent_mail_gateway.bad_response"]
+other = "Agent Mail 返回了无效响应。"
+
 # ---- err.server.incomingwebhook.mgmt_* (management endpoints, #246 follow-up) ----
 
 ["err.server.incomingwebhook.mgmt_forbidden"]

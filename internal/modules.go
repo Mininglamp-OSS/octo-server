@@ -21,6 +21,7 @@ package modules
 
 // 引入模块
 import (
+	_ "github.com/Mininglamp-OSS/octo-server/modules/agentmailgateway"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 
