@@ -26,6 +26,51 @@ var tokenHTTPTestDatabases struct {
 	names []string
 }
 
+// tokenHTTPSharedDatabase memoises the one isolated schema every
+// newTokenHTTPTestServer caller shares.
+var tokenHTTPSharedDatabase struct {
+	sync.Once
+	name string
+	err  error
+}
+
+// tokenHTTPTestDatabase creates — once per process — the isolated database this
+// file's HTTP tests run against, and returns its name.
+//
+// It used to be one fresh database per call, each paying a full replay of the
+// migration set inside module.Setup. Measured in a CI-equivalent local
+// environment, one replay costs 13–25s (194 migrations, most of the cost in
+// ALTER steps that rebuild tables the earlier migrations just created), and this
+// helper has 14 call sites — which accounted for the bulk of modules/user's
+// 250–400s and is the direct reason the package tripped CI's 5m per-package
+// -timeout on run 31591952470. Nothing here needs a *pristine* database, only
+// one separate from the shared `test` schema that the rest of the package
+// mutates; newTokenHTTPTestServer resets the rows on every call instead.
+func tokenHTTPTestDatabase(t *testing.T) string {
+	t.Helper()
+	tokenHTTPSharedDatabase.Do(func() {
+		name := "octo_user_token_ttl_" + util.GenerUUID()[:12]
+		bootstrapConfig := config.New()
+		bootstrapConfig.Test = true
+		bootstrapConfig.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/information_schema?charset=utf8mb4&parseTime=true"
+		bootstrap := config.NewContext(bootstrapConfig)
+		defer func() { _ = bootstrap.DB().DB.Close() }()
+		if _, err := bootstrap.DB().Exec("CREATE DATABASE `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"); err != nil {
+			tokenHTTPSharedDatabase.err = err
+			return
+		}
+		// Register for TestMain's teardown before returning the name, so a
+		// failure later in this test binary still drops the schema.
+		tokenHTTPTestDatabases.Lock()
+		tokenHTTPTestDatabases.names = append(tokenHTTPTestDatabases.names, name)
+		tokenHTTPTestDatabases.Unlock()
+		tokenHTTPSharedDatabase.name = name
+	})
+	require.NoError(t, tokenHTTPSharedDatabase.err, "create isolated token TTL test database")
+	require.NotEmpty(t, tokenHTTPSharedDatabase.name, "isolated token TTL database name")
+	return tokenHTTPSharedDatabase.name
+}
+
 func TestTokenDeadlineOverHTTP(t *testing.T) {
 	server, ctx, _, _ := newTokenHTTPTestServer(t)
 	t.Run("manager login issues a finite token", func(t *testing.T) {
@@ -327,17 +372,7 @@ func testNicknameUpdatePreservesFiniteTokenDeadlineOverHTTP(t *testing.T, server
 
 func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *User, *Manager) {
 	t.Helper()
-	databaseName := "octo_user_token_ttl_" + util.GenerUUID()[:12]
-	bootstrapConfig := config.New()
-	bootstrapConfig.Test = true
-	bootstrapConfig.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/information_schema?charset=utf8mb4&parseTime=true"
-	bootstrap := config.NewContext(bootstrapConfig)
-	_, err := bootstrap.DB().Exec("CREATE DATABASE `" + databaseName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
-	require.NoError(t, err, "create isolated token TTL test database")
-	require.NoError(t, bootstrap.DB().DB.Close())
-	tokenHTTPTestDatabases.Lock()
-	tokenHTTPTestDatabases.names = append(tokenHTTPTestDatabases.names, databaseName)
-	tokenHTTPTestDatabases.Unlock()
+	databaseName := tokenHTTPTestDatabase(t)
 
 	cfg := config.New()
 	cfg.Test = true
@@ -354,6 +389,11 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 	migrationServer.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(migrationServer.GetRoute())
 	require.NoError(t, module.Setup(ctx), "set up modules in isolated token TTL database")
+
+	// The schema is shared across this helper's call sites, so drop the rows the
+	// previous test left behind now that the tables exist. Redis stays isolated
+	// per call through the cache prefixes above.
+	resetTokenHTTPDatabase(t, ctx)
 
 	// Register only the handlers exercised here from objects constructed with
 	// this test's context. This keeps handler reads and fixture writes on the
@@ -385,6 +425,29 @@ func newTokenHTTPTestServer(t *testing.T) (*libserver.Server, *config.Context, *
 		}
 	})
 	return server, ctx, userAPI, managerAPI
+}
+
+// resetTokenHTTPDatabase clears rows left by an earlier caller of
+// newTokenHTTPTestServer from the shared isolated schema.
+//
+// Deliberately not testutil.CleanAllTables: that helper hardcodes
+// table_schema = 'test', so against any other database it lists the `test`
+// schema's table names and then deletes from the connected one, failing with
+// 1146 on every name that does not exist there.
+func resetTokenHTTPDatabase(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	var tables []string
+	_, err := ctx.DB().SelectBySql(
+		"SELECT table_name FROM information_schema.tables " +
+			"WHERE table_schema = DATABASE() " +
+			"AND table_type = 'BASE TABLE' " +
+			"AND table_name <> 'gorp_migrations'",
+	).Load(&tables)
+	require.NoError(t, err, "list tables in isolated token TTL database")
+	for _, table := range tables {
+		_, err := ctx.DB().UpdateBySql("DELETE FROM `" + table + "`").Exec()
+		require.NoError(t, err, "reset table %s in isolated token TTL database", table)
+	}
 }
 
 func cleanupTokenHTTPTestDatabases() error {
