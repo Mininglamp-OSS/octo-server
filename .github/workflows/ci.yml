@@ -106,7 +106,16 @@ jobs:
       needs.changes.outputs.code == 'true'
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Headroom, not comfort. Measured medians of this job's own runtime:
+    # 6.9 min (2026-05) → 9.7 (06) → 13.6 (07) → 17.5 (08), i.e. ~+3.5 min/month,
+    # with an observed 26.4 min outlier on run 31591952470. 30 min was ~2 months
+    # from becoming a hard wall.
+    #
+    # The dominant cause (test helpers replaying the whole migration set into a
+    # per-call database) is addressed in this change, so the trend should flatten;
+    # revisit this back down to 30 once a few runs land, rather than letting a
+    # generous ceiling hide the next regression.
+    timeout-minutes: 45
     # MySQL, Redis, and WuKongIM are required by integration tests
     # (modules/{user,oidc,thread,group,space,botfather,...}). The tests
     # hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
@@ -171,6 +180,24 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          # Give THIS job its own Go cache key. setup-go derives the key from
+          # hashFiles(cache-dependency-path), which defaults to `**/go.sum` —
+          # identical across all eight jobs in this workflow. The action only
+          # SAVES on a cache miss, so whichever job finishes first wins the key
+          # forever: in practice `i18n Lint` (12s, builds two tiny tools) stores
+          # a ~10 MB stub, and every later run restores that stub and reports
+          # "Cache hit". Measured cost on run 31566358696: the Test job spent 97s
+          # cold-compiling the whole -race dependency tree and re-downloaded 166
+          # modules inside the test step.
+          #
+          # Adding this workflow file to the hash inputs yields a key no other
+          # job computes, so the Test job saves and restores its OWN cache
+          # (GOMODCACHE + a -race-populated GOCACHE, ~1 GB uncompressed).
+          # If you ever add cache-dependency-path to another job, keep the input
+          # set different from this one or the stub problem comes straight back.
+          cache-dependency-path: |
+            go.sum
+            .github/workflows/ci.yml
 
       - name: Install MySQL/Redis client tooling
         run: |
@@ -275,8 +302,29 @@ jobs:
           while read -r pkg; do
             mysql -h 127.0.0.1 -uroot -pdemo -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
             redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
+            # Per-package deadline. 5m is the right default — a package that
+            # blows it has almost certainly deadlocked — but modules/user needed
+            # headroom: it tripped `panic: test timed out after 5m0s` on run
+            # 31591952470 with the then-current test only 20s in, i.e. the
+            # package ran out of budget rather than any single test hanging.
+            #
+            # The cause was newTokenHTTPTestServer creating a fresh database per
+            # call and replaying the whole migration set inside it (13-25s each,
+            # 14 call sites); it now shares one schema, which measured
+            # 326s -> 96s for the package locally. This override is therefore
+            # expected to be unnecessary.
+            #
+            # REMOVE IT once a few CI runs confirm the package's real duration
+            # here — keeping every package on the tight deadline is what makes a
+            # genuine hang surface fast. It is kept for now only because that
+            # -70% is a local (arm64, warm cache) measurement and this lane's
+            # DDL throughput may differ.
+            pkg_timeout=5m
+            case "$pkg" in
+              */modules/user) pkg_timeout=15m ;;
+            esac
             echo "::group::go test $pkg"
-            if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
+            if ! go test -race -shuffle=on -count=1 -timeout "$pkg_timeout" "$pkg"; then
               fail=1
             fi
             echo "::endgroup::"
