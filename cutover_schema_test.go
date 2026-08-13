@@ -34,6 +34,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -111,40 +113,25 @@ func TestCutoverDomainTablesMatchTheFrameworkTemplate(t *testing.T) {
 			assertCutoverTableShape(t, db, schema, d.stateTable)
 			assertSingletonCheckConstraint(t, db, schema, d.stateTable)
 			assertMigrationSeedsInertRow(t, root, d.stateTable)
-		})
-	}
-}
 
-// TestCutoverSchemaConformanceDoesNotDependOnSeededRows is the regression for
-// the defect this test shipped with: it asserted the seeded row from the live
-// table, which `testutil.NewTestServer` has already deleted by the time any
-// assertion runs.
-//
-// NewTestServer clears every table except `gorp_migrations` and only then calls
-// module.Setup, whose migrations are ledger-gated — so on any schema that has
-// run these migrations before, the seed INSERT does not re-apply and the row is
-// simply gone. It fails on entry, not on a second run, and removing the test's
-// own t.Cleanup does not help.
-//
-// The invariant is about the migration anyway: "deploying the schema must not
-// activate anything" is a property of what the migration seeds, not of what the
-// row currently holds — an activated production database legitimately holds
-// mode=1. So the seed is asserted from the migration source, and this test pins
-// that the rest of the conformance check survives an empty table.
-func TestCutoverSchemaConformanceDoesNotDependOnSeededRows(t *testing.T) {
-	db := cutoverSchemaTestDB(t)
-	schema := currentSchemaName(t, db)
-	root := repoRootForSchemaTest(t)
-
-	for _, d := range cutoverDomainList() {
-		t.Run(d.name, func(t *testing.T) {
-			// Reproduce exactly what NewTestServer leaves behind.
-			_, err := db.UpdateBySql("DELETE FROM `" + d.stateTable + "`").Exec()
-			require.NoError(t, err)
-
-			assertCutoverTableShape(t, db, schema, d.stateTable)
-			assertSingletonCheckConstraint(t, db, schema, d.stateTable)
-			assertMigrationSeedsInertRow(t, root, d.stateTable)
+			// Re-run with the table emptied. This is the regression for the
+			// defect this check shipped with: it asserted the seeded row from
+			// the live table, which testutil.NewTestServer has already deleted
+			// by the time any assertion runs (it clears every table except
+			// gorp_migrations on ENTRY, and the ledger-gated migration does not
+			// re-seed). It failed on entry, not on a second run, so removing
+			// the harness's own cleanup would not have helped.
+			//
+			// A subtest rather than a separate top-level test: the assertions
+			// are the same three, and a duplicate test would pay for a second
+			// full module.Setup to pin nothing extra.
+			t.Run("without the seeded row", func(t *testing.T) {
+				_, err := db.UpdateBySql("DELETE FROM `" + d.stateTable + "`").Exec()
+				require.NoError(t, err)
+				assertCutoverTableShape(t, db, schema, d.stateTable)
+				assertSingletonCheckConstraint(t, db, schema, d.stateTable)
+				assertMigrationSeedsInertRow(t, root, d.stateTable)
+			})
 		})
 	}
 }
@@ -266,9 +253,14 @@ func assertMigrationSeedsInertRow(t *testing.T, root, table string) {
 	t.Helper()
 	path, up := findCreatingMigration(t, root, table)
 
-	// Normalize whitespace so the assertion does not depend on how the DDL is
-	// wrapped across lines.
-	flat := strings.Join(strings.Fields(up), " ")
+	// Strip line comments BEFORE flattening. Without this a seed that was
+	// commented out — during a debugging pass, say — still satisfies the
+	// assertion, and the test would report an inert seed for a deployed table
+	// that has no singleton at all.
+	//
+	// Then normalize whitespace, so the assertion does not depend on how the
+	// DDL is wrapped across lines.
+	flat := strings.Join(strings.Fields(stripSQLLineComments(up)), " ")
 	insert := regexp.MustCompile(
 		"INSERT INTO `" + regexp.QuoteMeta(table) + "` " +
 			"\\( *`singleton_id` *, *`mode` *, *`epoch` *, *`cutover_floor` *\\) " +
@@ -297,28 +289,95 @@ func findCreatingMigration(t *testing.T, root, table string) (string, string) {
 	create := regexp.MustCompile("CREATE TABLE (IF NOT EXISTS )?`" + regexp.QuoteMeta(table) + "`")
 
 	var foundPath, foundUp string
-	err := filepath.WalkDir(filepath.Join(root, "modules"), func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() || !strings.HasSuffix(path, ".sql") {
-			return walkErr
+	for _, file := range migrationCorpus(t, root) {
+		if !create.MatchString(file.content) {
+			continue
 		}
-		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		if !create.Match(content) {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
 		require.Empty(t, foundPath,
 			"two migrations create %s (%s and %s); the conformance check cannot tell which seeds it",
-			table, foundPath, rel)
-		foundPath, foundUp = rel, migrationUpSection(string(content))
-		return nil
-	})
-	require.NoError(t, err)
+			table, foundPath, file.rel)
+		foundPath, foundUp = file.rel, migrationUpSection(file.content)
+	}
 	require.NotEmpty(t, foundPath,
 		"no migration under modules/*/sql/ creates %s — a registered cutover domain must ship one", table)
 	return foundPath, foundUp
+}
+
+type migrationSource struct {
+	rel     string
+	content string
+}
+
+var (
+	migrationCorpusOnce  sync.Once
+	migrationCorpusFiles []migrationSource
+	migrationCorpusErr   error
+	// migrationCorpusWalks exists so TestMigrationCorpusIsWalkedOnce can assert
+	// the memoization rather than trust it.
+	migrationCorpusWalks atomic.Int64
+)
+
+// migrationCorpus reads every modules/**/*.sql file, once per test binary.
+//
+// The alternative — walking on each lookup — reads all 27 modules' migrations
+// four times over to answer four questions about two files. Memoizing on
+// nothing but the once is safe because root comes from repoRootForSchemaTest,
+// which resolves the one module root the test binary runs in, and migrations on
+// disk do not change mid-run.
+func migrationCorpus(t *testing.T, root string) []migrationSource {
+	t.Helper()
+	migrationCorpusOnce.Do(func() {
+		migrationCorpusWalks.Add(1)
+		migrationCorpusErr = filepath.WalkDir(filepath.Join(root, "modules"), func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() || !strings.HasSuffix(path, ".sql") {
+				return walkErr
+			}
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				rel = path
+			}
+			migrationCorpusFiles = append(migrationCorpusFiles, migrationSource{rel: rel, content: string(content)})
+			return nil
+		})
+	})
+	require.NoError(t, migrationCorpusErr, "reading the migration tree under %s", root)
+	return migrationCorpusFiles
+}
+
+// TestMigrationCorpusIsWalkedOnce pins the memoization.
+//
+// The conformance test calls findCreatingMigration once per domain and again
+// inside each "without the seeded row" subtest, so an un-memoized lookup walks
+// modules/ — every .sql file under 27 modules, read whole — four times to
+// answer four questions about two files. The count is process-global and the
+// corpus is immutable within a run, so this assertion holds no matter which
+// other test loaded it first.
+func TestMigrationCorpusIsWalkedOnce(t *testing.T) {
+	root := repoRootForSchemaTest(t)
+	for _, d := range cutoverDomainList() {
+		findCreatingMigration(t, root, d.stateTable)
+		findCreatingMigration(t, root, d.stateTable)
+	}
+	require.EqualValues(t, 1, migrationCorpusWalks.Load(),
+		"the migration tree must be read once per test binary, not once per lookup")
+}
+
+// stripSQLLineComments removes `-- …` to end of line. Enough for the migration
+// files in this repo, which use line comments only; it deliberately does not
+// try to parse string literals, because a `--` inside one would make the seed
+// assertion stricter, never looser.
+func stripSQLLineComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	for i, line := range lines {
+		if idx := strings.Index(line, "--"); idx >= 0 {
+			lines[i] = line[:idx]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // migrationUpSection returns everything between `-- +migrate Up` and

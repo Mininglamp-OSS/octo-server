@@ -103,40 +103,32 @@ type PreflightResult struct {
 func (s *Store) CurrentState(ctx context.Context) (State, error) {
 	st, err := cutover.ReadState(ctx, s.ctx.DB(), StateTable)
 	if err != nil {
-		if errors.Is(err, cutover.ErrStateMissing) {
+		switch {
+		case errors.Is(err, cutover.ErrStateTableMissing):
+			return State{}, ErrStateTableMissing
+		case errors.Is(err, cutover.ErrStateMissing):
 			return State{}, ErrStateRowMissing
+		default:
+			return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
 		}
-		return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
 	}
 	return State{Mode: st.Mode, Epoch: st.Epoch, CutoverFloor: st.Floor}, nil
 }
 
-// StateTableExists reports whether the allocator's state table is present.
+// ErrStateTableMissing is the subset of ErrStateRowMissing where the table
+// itself is absent, and it matters here more than in the sibling domain.
 //
-// It exists because `ErrStateRowMissing` covers two situations that this
-// domain's runtime treats OPPOSITELY, and an operator diagnosing an outage has
-// to be told which one they are in:
+// This allocator's runtime treats the two OPPOSITELY:
 //
 //   - missing ROW: readStateForShare maps dbr.ErrNotFound to legacy, so writes
 //     keep flowing on the pre-cutover allocator.
-//   - missing TABLE (MySQL 1146): readStateForShare has no case for it, so the
-//     error propagates and EVERY message_extra write fails closed.
+//   - missing TABLE (MySQL 1146): readStateForShare has no case for it, the
+//     error propagates, and EVERY message_extra write fails closed.
 //
-// pkg/cutover collapses the two because for a domain whose reader defaults to
-// legacy either way — botevent — they mean the same thing. This one's
-// FOR SHARE reader does not, so the operator surface asks separately rather
-// than reporting the friendlier of the two.
-func (s *Store) StateTableExists(ctx context.Context) (bool, error) {
-	var name string
-	count, err := s.ctx.DB().SelectBySql(
-		"SELECT `TABLE_NAME` FROM information_schema.TABLES WHERE `TABLE_SCHEMA`=DATABASE() AND `TABLE_NAME`=?",
-		StateTable,
-	).LoadContext(ctx, &name)
-	if err != nil {
-		return false, fmt.Errorf("msgextraseq: probe state table: %w", err)
-	}
-	return count > 0, nil
-}
+// So an operator surface must be able to say which one it found. It wraps
+// ErrStateRowMissing, so callers that only care that the authority is absent
+// keep matching on that.
+var ErrStateTableMissing = fmt.Errorf("%w: the table itself does not exist", ErrStateRowMissing)
 
 // Preflight reads (no locks, no writes) the maxima that bound already-issued
 // versions and reports a safe cutover floor plus the current state. It never

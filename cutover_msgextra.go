@@ -98,30 +98,20 @@ func msgextraCutoverActivate(rt *cutoverRuntime, out io.Writer) error {
 }
 
 func msgextraCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
-	store := msgextraseq.New(rt.ctx)
-	st, err := store.CurrentState(rt.deadline)
+	st, err := msgextraseq.New(rt.ctx).CurrentState(rt.deadline)
 	switch {
+	// Which kind of missing decides what the writers are doing right now, and
+	// the two answers are opposites — so they are reported separately rather
+	// than collapsed into the friendlier one. Both keep going to the guard line
+	// below: a missing authority plus an armed guard is precisely the
+	// combination that fails every message_extra write closed, so that line is
+	// the one an operator most needs in this state.
+	case errors.Is(err, msgextraseq.ErrStateTableMissing):
+		fmt.Fprintln(out, "state: MISSING TABLE — the migration has not run. "+
+			"Writers do NOT fall back here: every message_extra write is failing closed until it does.")
 	case errors.Is(err, msgextraseq.ErrStateRowMissing):
-		// Report and keep going rather than exiting here. A missing authority
-		// plus an armed guard is precisely the combination that fails every
-		// message_extra write closed, so the guard line below is the one an
-		// operator most needs in this state.
-		//
-		// Which kind of missing it is decides what the writers are doing right
-		// now, and the two answers are opposites — so ask, rather than print
-		// the friendlier one. See Store.StateTableExists.
-		exists, probeErr := store.StateTableExists(rt.deadline)
-		switch {
-		case probeErr != nil:
-			fmt.Fprintf(out, "state: MISSING — could not determine whether the table exists (%v). "+
-				"If the table is absent, every message_extra write is failing closed.\n", probeErr)
-		case exists:
-			fmt.Fprintln(out, "state: MISSING ROW — the table exists but holds no singleton. "+
-				"Writers default to the legacy allocator and keep flowing.")
-		default:
-			fmt.Fprintln(out, "state: MISSING TABLE — the migration has not run. "+
-				"Writers do NOT fall back here: every message_extra write is failing closed until it does.")
-		}
+		fmt.Fprintln(out, "state: MISSING ROW — the table exists but holds no singleton. "+
+			"Writers default to the legacy allocator and keep flowing.")
 	case err != nil:
 		return err
 	default:

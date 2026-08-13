@@ -89,7 +89,7 @@ func boteventCutoverPreflight(rt *cutoverRuntime, out io.Writer, sample int) err
 	if err != nil {
 		return err
 	}
-	_, err = reportBoteventEvidence(rt.ctx, out, ev)
+	_, err = reportBoteventEvidence(rt.deadline, rt.ctx, out, ev)
 	return err
 }
 
@@ -97,7 +97,7 @@ func boteventCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
 	// The mirror is read from Redis, so name the server first — a status that
 	// silently reads the wrong instance reports the wrong activation state.
 	fprintRedisEndpoint(rt.cfg)
-	if err := fprintBoteventState(rt.ctx, out); err != nil {
+	if err := fprintBoteventState(rt.deadline, rt.ctx, out); err != nil {
 		return err
 	}
 	mirror, mErr := readBoteventMirror(rt.ctx)
@@ -171,22 +171,54 @@ func gatherBoteventEvidence(deadline context.Context, ctx *config.Context, clien
 
 	// Table-wide first, so the floor covers bots the queue scan cannot see at all.
 	// One query per namespace, no per-bot lookups.
+	//
+	// An operator interrupt is NOT an unreadable evidence source. Counting it
+	// into ev.failures would tell them the database failed — preflight would
+	// print a full report and exit 0, activate would refuse with "Fix the read
+	// errors above and rerun" — and neither would reach the interrupt exit
+	// code. So a cancellation aborts here instead.
 	if v, err := maxSeqByPrefix(deadline, ctx, botevent.LegacySeqSweepPrefix()); err != nil {
+		if isCancellation(err) {
+			return boteventEvidence{}, err
+		}
 		fmt.Fprintf(os.Stderr, "  sweep legacy seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
 		ev.maxLegacyMinSeq = v
 	}
 	if v, err := maxSeqByPrefix(deadline, ctx, botevent.HighWaterSeqKey("")); err != nil {
+		if isCancellation(err) {
+			return boteventEvidence{}, err
+		}
 		fmt.Fprintf(os.Stderr, "  sweep high-water seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
 		ev.maxHighWater = v
 	}
 
+	// Last chance to bail: the queue walk below takes no per-command deadline,
+	// so entering it after an interrupt commits the operator to however long it
+	// runs — the uncancellable stretch the two-stage design exists to avoid.
+	if err := deadline.Err(); err != nil {
+		return boteventEvidence{}, err
+	}
+
+	// SCAN guarantees only that keys present throughout the iteration are
+	// returned AT LEAST once — duplicates are normal when the keyspace rehashes.
+	// Left undeduplicated they inflate ev.queues and get inspected twice, which
+	// double-counts into the duplicate-score totals. The runbook tells operators
+	// to compare those totals across two preflights ("the duplicate count must
+	// stop increasing"), so a number that moves on its own reads as ongoing id
+	// collisions after a correct activation. observedMax is unaffected — this is
+	// a reporting defect, not a floor-safety one.
+	seen := make(map[string]struct{})
 	var keys []string
 	iter := client.Scan(0, botevent.QueueKeyPrefix+"*", 500).Iterator()
 	for iter.Next() {
+		if _, dup := seen[iter.Val()]; dup {
+			continue
+		}
+		seen[iter.Val()] = struct{}{}
 		keys = append(keys, iter.Val())
 	}
 	if err := iter.Err(); err != nil {
@@ -305,8 +337,8 @@ func maxSeqByPrefix(deadline context.Context, ctx *config.Context, prefix string
 	return max.Int64, nil
 }
 
-func fprintBoteventState(ctx *config.Context, out io.Writer) error {
-	st, err := botevent.ReadState(ctx)
+func fprintBoteventState(deadline context.Context, ctx *config.Context, out io.Writer) error {
+	st, err := botevent.ReadStateContext(deadline, ctx)
 	switch {
 	case errors.Is(err, botevent.ErrStateMissing):
 		fmt.Fprintf(out, "state: MISSING — the migration has not run. Readers treat this as legacy.\n")
@@ -322,8 +354,8 @@ func fprintBoteventState(ctx *config.Context, out io.Writer) error {
 	return nil
 }
 
-func reportBoteventEvidence(ctx *config.Context, out io.Writer, ev boteventEvidence) (int64, error) {
-	if err := fprintBoteventState(ctx, out); err != nil {
+func reportBoteventEvidence(deadline context.Context, ctx *config.Context, out io.Writer, ev boteventEvidence) (int64, error) {
+	if err := fprintBoteventState(deadline, ctx, out); err != nil {
 		return 0, err
 	}
 	mirror, mErr := readBoteventMirror(ctx)
@@ -379,7 +411,7 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 			"still land beneath a live consumer cursor, which is the loss this flip exists to stop. "+
 			"Fix the read errors above and rerun.", ev.failures)
 	}
-	recommended, err := reportBoteventEvidence(rt.ctx, out, ev)
+	recommended, err := reportBoteventEvidence(rt.deadline, rt.ctx, out, ev)
 	if err != nil {
 		return err
 	}
@@ -391,7 +423,7 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 		return fmt.Errorf("refusing floor=%d: it must be positive and at most %d, above which int64 ids no "+
 			"longer have distinct float64 sorted-set scores", floor, int64(maxSafeFloor))
 	}
-	if err := refuseUnauthorizedBoteventMirror(rt.ctx, client); err != nil {
+	if err := refuseUnauthorizedBoteventMirror(rt.deadline, rt.ctx, client); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "\nactivating with floor=%d (observed max=%d)\n", floor, ev.observedMax())
@@ -509,7 +541,7 @@ func judgeMirror(activated bool, mirror string, absent bool) (mirrorVerdict, str
 // checking it here is where that window gets closed in practice.
 //
 // Runs after the floor checks so the operator sees every other problem in one pass.
-func refuseUnauthorizedBoteventMirror(ctx *config.Context, client *rd.Client) error {
+func refuseUnauthorizedBoteventMirror(deadline context.Context, ctx *config.Context, client *rd.Client) error {
 	v, err := client.Get(botevent.ModeKey).Result()
 	absent := err == rd.Nil
 	if err != nil && !absent {
@@ -520,7 +552,7 @@ func refuseUnauthorizedBoteventMirror(ctx *config.Context, client *rd.Client) er
 	// Read the authority before judging the mirror. Skipping this is what made a correct
 	// mirror look like a forged one.
 	activated := false
-	switch st, sErr := botevent.ReadState(ctx); {
+	switch st, sErr := botevent.ReadStateContext(deadline, ctx); {
 	case sErr == nil:
 		activated = st.Activated()
 	case errors.Is(sErr, botevent.ErrStateMissing):

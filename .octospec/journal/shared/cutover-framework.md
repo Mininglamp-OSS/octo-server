@@ -275,7 +275,8 @@ table fails every `message_extra` write closed. So the state where `status`
 matters most was the state where it reported "readers treat this as legacy".
 Added `StateTableExists` and made the two cases say opposite things, and
 corrected the `pkg/cutover` doc, which had promised a contract only one of its
-two domains honors.
+two domains honors. (`StateTableExists` was itself replaced in the fourth round
+by `cutover.ErrStateTableMissing` — see below.)
 
 Also: post-commit cleanup failure now exits non-zero in both domains (botevent
 publishes the mirror first, then reports); the `Commit`-ack edge where a
@@ -283,6 +284,65 @@ committed flip reports `flipped=false` is documented in the docstring and both
 runbooks' verify steps; `flip_test`'s comment about `Conn.Close()` keeping the
 pool clean was simply wrong and now asserts the round trip instead; plus exit
 130 on interrupt, `.gitignore`, and the duplicate error wrap.
+
+## Fourth review round (13 findings, all fixed, TDD)
+
+Every fix below went RED first — the failing assertion was recorded before the
+production change existed.
+
+**An interrupt was being laundered into "unreadable evidence".** With the
+deadline threaded into the botevent sweeps, a Ctrl-C came back as two failed
+evidence sources: preflight then printed a full report and exited 0, and
+activate refused with "Fix the read errors above and rerun". Both blamed the
+database for what the operator had just done, and neither reached the interrupt
+exit path. `gatherBoteventEvidence` now aborts on a cancellation, and re-checks
+the deadline before entering the Redis queue walk — the uncancellable stretch
+the two-stage design exists to avoid.
+
+**The interrupt notice raced process exit.** Cancelling releases the main
+goroutine, which returns to `main` and calls `os.Exit`, which does not wait for
+goroutines — so the line telling the operator that a second Ctrl-C terminates
+could simply be lost. It is now written before `cancel()`, pinned by a writer
+that records `ctx.Err()` at write time rather than racing it from the test.
+
+**Two botevent MySQL reads still ignored the deadline** — `status` and the
+pre-flip mirror check, the latter running with bot-event writes already paused.
+Both went through `ReadState`, which hardcodes `context.Background`. The
+previous round's claim that "the MySQL reads observe the deadline in every
+domain" was therefore not yet true; it is now.
+
+**`StateTableExists` was the wrong shape** (added last round). The distinction
+already exists at the point the driver returns MySQL 1146; probing
+`information_schema` afterwards re-derives a fact that was thrown away.
+Replaced with `cutover.ErrStateTableMissing`, which *wraps* `ErrStateMissing`,
+so no caller has to handle it and the ones that care can. One query fewer, and
+the msgextra `status` output now distinguishes MISSING TABLE ("every write is
+failing closed") from MISSING ROW ("writers default to legacy and keep
+flowing"). botevent deliberately keeps one message: its reader treats both the
+same, which the code says explicitly.
+
+**Exit code 143 for SIGTERM.** The command reported 130 for any interruption,
+which is the SIGINT convention. But these are as likely to be stopped by
+`kubectl delete pod` or a rolling deploy — and after an interrupted one-way
+flip, "a human stopped this" and "the platform reclaimed the pod" call for
+different next steps. The watcher now remembers which signal it received and
+`cutoverExitCode` returns 128+signum; a refusal stays 1. Verified end-to-end
+against a wedged MySQL: SIGTERM → 143, SIGINT → 130.
+
+**The operator commands stopped saying which config they resolved.** Factoring
+out `operatorConfigViper` dropped the server's `Using config file:` echo. It is
+back, on **stderr** — `session-rollout status` emits JSON that runbooks pipe
+into jq, and this is the one line tying a cutover's output to the endpoints it
+acted on.
+
+Also: SCAN results are deduplicated (SCAN promises *at least* once, and the
+duplicates were double-counting into the very totals the runbook tells operators
+to compare across two preflights); a commented-out seed no longer satisfies the
+migration-seed assertion (line comments are stripped before the regex); the
+migration tree is walked once per test binary instead of four times;
+`seqCeilings` uses `LegacySeqSweepPrefix()` like every other caller; and the
+lock-wait test skips rather than fails when the server default collides with the
+value under test.
 
 ## Learning
 

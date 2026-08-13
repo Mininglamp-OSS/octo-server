@@ -79,15 +79,30 @@ func seedState(t *testing.T, db *dbr.Session, mode int, epoch uint64, floor int6
 func TestReadState(t *testing.T) {
 	db := setupDB(t)
 
-	// Missing row → ErrStateMissing.
-	if _, err := cutover.ReadState(context.Background(), db, testStateTable); !errors.Is(err, cutover.ErrStateMissing) {
-		t.Fatalf("missing row: err=%v want ErrStateMissing", err)
+	// Missing table → still satisfies ErrStateMissing (so every existing caller
+	// is unaffected), but is ALSO distinguishable as ErrStateTableMissing.
+	//
+	// The distinction is not cosmetic: a domain whose runtime reader defaults to
+	// legacy for a missing row may fail every write closed on a missing table —
+	// msgextraseq does exactly that — so an operator surface reporting the
+	// friendlier of the two states tells them writes are flowing while they are
+	// erroring. Deriving it here, where MySQL 1146 is already in hand, saves
+	// every domain from re-querying information_schema to recover it.
+	_, tableErr := cutover.ReadState(context.Background(), db, "octo_cutover_test_absent")
+	if !errors.Is(tableErr, cutover.ErrStateMissing) {
+		t.Fatalf("missing table: err=%v must still satisfy ErrStateMissing", tableErr)
+	}
+	if !errors.Is(tableErr, cutover.ErrStateTableMissing) {
+		t.Fatalf("missing table: err=%v want ErrStateTableMissing", tableErr)
 	}
 
-	// Missing table → also ErrStateMissing (MySQL 1146), never a raw error:
-	// "not migrated yet" and "authority unreachable" must stay distinguishable.
-	if _, err := cutover.ReadState(context.Background(), db, "octo_cutover_test_absent"); !errors.Is(err, cutover.ErrStateMissing) {
-		t.Fatalf("missing table: err=%v want ErrStateMissing", err)
+	// A missing ROW is ErrStateMissing and must NOT look like a missing table.
+	_, rowErr := cutover.ReadState(context.Background(), db, testStateTable)
+	if !errors.Is(rowErr, cutover.ErrStateMissing) {
+		t.Fatalf("missing row: err=%v want ErrStateMissing", rowErr)
+	}
+	if errors.Is(rowErr, cutover.ErrStateTableMissing) {
+		t.Fatalf("missing row reported as a missing table: %v", rowErr)
 	}
 
 	seedState(t, db, cutover.ModeActive, 3, 4200)
@@ -230,14 +245,18 @@ func TestFlipWithSessionLockWaitTimeout(t *testing.T) {
 	var baseline int64
 	_, err := db.SelectBySql("SELECT @@SESSION.innodb_lock_wait_timeout").Load(&baseline)
 	require.NoError(t, err)
-	require.NotEqualValues(t, flipTimeout, baseline,
-		"the server default equals the flip's timeout, so this test could not tell a "+
-			"restored connection from a leaked one")
+	if baseline == flipTimeout {
+		// Not a failure: a legitimately-configured server can sit on this value,
+		// and the test simply cannot distinguish a restored connection from a
+		// leaked one when it does.
+		t.Skipf("server default innodb_lock_wait_timeout is %d, the same value the flip "+
+			"sets — a leak would be indistinguishable from a restore", baseline)
+	}
 
 	flipped, epoch, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 10,
 		Observe:                func(*dbr.Tx) (int64, error) { return 10, nil },
-		LockWaitTimeoutSeconds: 3,
+		LockWaitTimeoutSeconds: flipTimeout,
 	})
 	if err != nil || !flipped || epoch != 1 {
 		t.Fatalf("flip with lock-wait timeout = (%v,%d,%v), want (true,1,nil)", flipped, epoch, err)
@@ -261,15 +280,18 @@ func TestFlipWithSessionLockWaitTimeout(t *testing.T) {
 	}
 }
 
-// TestFlipDiscardsTheConnectionWhenTheRestoreFails covers the fallback: if the
-// session value cannot be put back, the connection must not return to the pool
-// carrying it.
+// TestFlipRestoresThroughACancelledContext pins that cleanup detaches from the
+// caller's context.
 //
-// The failure is induced by cancelling the context after the flip has taken the
-// connection, so the deferred restore runs against a dead deadline — except
-// that restoreDetached deliberately detaches from it, which is what this test
-// pins. A regression that dropped the detach would surface here as a discarded
-// connection plus a joined restore error on an otherwise clean flip.
+// Cancelling mid-flip means the deferred restore would run against a dead
+// deadline if it inherited it — failing instantly and discarding a connection a
+// fresh two-second attempt returns to the pool cleanly. restoreDetached exists
+// for that, and a regression dropping it surfaces here as a restore error
+// joined onto an otherwise ordinary cancellation.
+//
+// Note what this does NOT cover: the driver.ErrBadConn discard branch, which
+// only runs when the restore itself fails. That branch has no test in either
+// package.
 func TestFlipRestoresThroughACancelledContext(t *testing.T) {
 	db := setupDB(t)
 	seedState(t, db, cutover.ModeInactive, 0, 0)

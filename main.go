@@ -126,13 +126,10 @@ func main() {
 	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == cutoverCommand {
 		if err := runCutoverCommand(os.Args[2:], os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			// An interrupt exits 130 (the shell's SIGINT convention) rather
-			// than 1, so anything scripting a runbook can tell "the operator
-			// stopped this" apart from "the activation was refused".
-			if errors.Is(err, context.Canceled) {
-				os.Exit(130)
-			}
-			os.Exit(1)
+			// 128+signum for an interrupt, 1 for everything else, so anything
+			// scripting a runbook can tell an operator's Ctrl-C (130) from the
+			// platform terminating the pod (143) from a refused activation.
+			os.Exit(cutoverExitCode(err))
 		}
 		return
 	}

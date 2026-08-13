@@ -59,12 +59,21 @@ const (
 // What the collapse does NOT promise is that a domain's runtime reader treats
 // the two alike. Each domain owns that: pkg/botevent maps both to its legacy
 // path, while internal/msgextraseq's FOR SHARE reader defaults to legacy only
-// for a missing row and lets a missing table fail every write closed. A domain
-// whose operator surface reports "missing" therefore has to decide whether its
-// two cases need distinguishing for the human reading it — msgextra's `status`
-// probes, because there the difference is "writes are flowing" versus "every
-// write is erroring".
+// for a missing row and lets a missing table fail every write closed. Where the
+// difference is "writes are flowing" versus "every write is erroring", an
+// operator surface has to be able to say which — so ErrStateTableMissing
+// carries it, rather than each domain re-deriving it with another query.
 var ErrStateMissing = errors.New("cutover: state row is missing")
+
+// ErrStateTableMissing is the subset of ErrStateMissing where the TABLE itself
+// is absent (MySQL 1146) rather than merely unseeded.
+//
+// It wraps ErrStateMissing, so every `errors.Is(err, ErrStateMissing)` caller
+// keeps working and no domain has to handle it — but the fact is preserved for
+// the ones that care instead of being detected here and thrown away. Deriving
+// it at the point where the driver error is already in hand is what stops each
+// domain from bolting on its own information_schema probe to recover it.
+var ErrStateTableMissing = fmt.Errorf("%w: the table itself does not exist", ErrStateMissing)
 
 // State is a domain's decoded singleton state row.
 type State struct {
@@ -105,7 +114,7 @@ func ReadState(deadline context.Context, db *dbr.Session, table string) (State, 
 	).LoadContext(deadline, &row)
 	if err != nil {
 		if isMissingTable(err) {
-			return State{}, ErrStateMissing
+			return State{}, ErrStateTableMissing
 		}
 		return State{}, fmt.Errorf("cutover: read %s: %w", table, err)
 	}

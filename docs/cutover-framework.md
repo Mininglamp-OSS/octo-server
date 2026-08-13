@@ -66,6 +66,10 @@ cutover 是 **fail-closed、单向、带水位校验**的数据面迁移：切�
     提示语要挂在**信号本身**上，不能挂在 ctx 取消上：`signal.NotifyContext` 的
     stop 会先 cancel，正常返回路径上的 defer 会把 watcher 叫醒，于是成功的 activate
     可能在 "ACTIVATED" 下面紧跟一句"中断已收到"。
+  - **退出码要能区分"谁停的"**：`0` 成功、`1` 拒绝、`130` Ctrl-C、`143` SIGTERM
+    （即 128+signum）。把两种信号都报成 130，包在 runbook 外面的脚本就会把"平台把
+    pod 回收了"读成"有人按了 Ctrl-C"——一次性翻转被打断之后，这两件事的下一步动作
+    并不一样。
 
 **留在各域的**：floor 证据从哪些来源算、翻转前后的域特定步骤（#697 的 mirror
 判定与发布）、以及全部运行时读路径（#627 的 FOR SHARE + ReserveTx、#697 的

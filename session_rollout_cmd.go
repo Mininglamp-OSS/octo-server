@@ -290,12 +290,16 @@ func sessionRolloutDB(cfg *config.Config) *dbr.Session {
 //
 // It returns an error where the server's own loader panics: an operator typo in
 // -config should be a one-line message, not a stack trace.
-func operatorConfigViper(path string) (*viper.Viper, error) {
+func operatorConfigViper(path string, notice io.Writer) (*viper.Viper, error) {
 	vp := viper.New()
 	vp.SetConfigFile(path)
 	if err := vp.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
+	// The server prints this on startup and the operator commands inherited it
+	// until the loader was factored out. It belongs on stderr, not stdout:
+	// `session-rollout status` emits JSON that runbooks pipe into jq.
+	fmt.Fprintln(notice, "config:", vp.ConfigFileUsed())
 	vp.SetEnvPrefix("TS")
 	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	vp.AutomaticEnv()
@@ -303,7 +307,7 @@ func operatorConfigViper(path string) (*viper.Viper, error) {
 }
 
 func loadSessionRolloutConfig(path string) (*config.Config, error) {
-	vp, err := operatorConfigViper(path)
+	vp, err := operatorConfigViper(path, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

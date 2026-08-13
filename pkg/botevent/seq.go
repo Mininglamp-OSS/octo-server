@@ -1159,7 +1159,7 @@ func seqCeilings(ctx *config.Context, robotID string) (legacy, durable int64, er
 	}
 	deadline, cancel := context.WithTimeout(context.Background(), authorityTimeout)
 	defer cancel()
-	legacyKey := fmt.Sprintf("seq:%s%s", common.RobotEventSeqKey, robotID)
+	legacyKey := LegacySeqSweepPrefix() + robotID
 	durableKey := HighWaterSeqKey(robotID)
 	var row struct {
 		Legacy  int64 `db:"legacy_ceiling"`

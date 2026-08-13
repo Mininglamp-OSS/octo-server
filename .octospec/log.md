@@ -34,6 +34,14 @@ change-log convention (§7). Newest first.
   two-stage (cancel, then restore default handling so a second signal
   terminates), the botevent score ceiling moved into the domain, and the
   msgextra mode constants alias the shared ones rather than restating them.
+  A third round added a schema conformance test for every registered domain's
+  state table (asserting the DDL from the live migrated schema and the inert
+  seed from the migration source), and a fourth closed thirteen more: an
+  operator interrupt was being reported as unreadable evidence, the interrupt
+  notice raced process exit, two botevent MySQL reads still ignored the
+  deadline, SIGTERM now exits 143 rather than sharing SIGINT's 130, and the
+  operator commands say which config file they resolved again (on stderr, so
+  `session-rollout status` stays parseable).
   See [journal](journal/shared/cutover-framework.md).
 
 ## 2026-08-12 (profile-visibility-system-bot-whitelist)

@@ -157,29 +157,83 @@ func runCutoverCommand(args []string, out io.Writer) error {
 	// that open their own Redis connection print its endpoint the same way.
 	fmt.Fprintf(os.Stderr, "mysql: %s\n", redactedMySQLEndpoint(cfg.DB.MySQLAddr))
 
-	deadline, stopWatching := watchInterrupt(os.Stderr)
-	defer stopWatching()
+	watcher := watchInterrupt(os.Stderr)
+	defer watcher.Stop()
 
 	rt := &cutoverRuntime{
 		cfg:      cfg,
 		ctx:      config.NewContext(cfg),
-		deadline: deadline,
+		deadline: watcher.Context(),
 		floor:    *floor,
 		yes:      *yes,
 	}
 	switch action {
 	case "preflight":
-		return domain.preflight(rt, out)
+		err = domain.preflight(rt, out)
 	case "activate":
-		return domain.activate(rt, out)
+		err = domain.activate(rt, out)
 	default:
-		return domain.status(rt, out)
+		err = domain.status(rt, out)
 	}
+	// Tag a cancellation with the signal behind it on the way out, so main can
+	// exit 128+signum instead of guessing.
+	return watcher.attributeInterrupt(err)
+}
+
+// interruptWatcher is a command's interrupt handling: the context its
+// cancellable work runs under, and which signal (if any) stopped it.
+//
+// The signal is remembered rather than collapsed into "cancelled" because it is
+// the only thing that distinguishes an operator's Ctrl-C from the platform
+// terminating the pod — see cutoverExitCode.
+type interruptWatcher struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	signals  chan os.Signal
+	finished chan struct{}
+	once     sync.Once
+
+	mu       sync.Mutex
+	received os.Signal
+}
+
+// Context is what every cancellable phase of the command runs under.
+func (w *interruptWatcher) Context() context.Context { return w.ctx }
+
+// Stop detaches the handler and releases the context. The caller must defer it;
+// it is safe to call more than once, since an early return may also call it.
+func (w *interruptWatcher) Stop() {
+	w.once.Do(func() {
+		close(w.finished)
+		signal.Stop(w.signals)
+		w.cancel()
+	})
+}
+
+// attributeInterrupt tags a cancellation with the signal that caused it, and
+// leaves every other error exactly as it is.
+//
+// Only a cancellation is tagged: a refusal that happens to land in the same
+// moment as a signal is still a refusal, and reporting it as an interrupt would
+// tell a runbook wrapper the operator stopped a flip the command declined to
+// perform.
+func (w *interruptWatcher) attributeInterrupt(err error) error {
+	if err == nil || !isCancellation(err) {
+		return err
+	}
+	w.mu.Lock()
+	sig := w.received
+	w.mu.Unlock()
+	if sig == nil {
+		// Cancelled by something other than a signal — a deadline of the caller's
+		// own, say. Nothing to attribute.
+		return err
+	}
+	return &cutoverInterrupted{signal: sig, err: err}
 }
 
 // watchInterrupt installs the two-stage interrupt handling and returns the
-// context the command's cancellable work runs under, plus a stop function the
-// caller must defer.
+// watcher; the caller must defer its Stop.
 //
 // Two-stage, and it has to be: installing a handler at all disables default
 // termination for the whole command, but not every phase can observe a context.
@@ -203,33 +257,97 @@ func runCutoverCommand(args []string, out io.Writer) error {
 // process exit to announce an interrupt that never happened — landing directly
 // under "ACTIVATED: allocator is now transactional", on the one surface whose
 // entire design argument is that its output stays readable mid-incident.
-func watchInterrupt(notice io.Writer) (context.Context, func()) {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-
+func watchInterrupt(notice io.Writer) *interruptWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan struct{})
+	w := &interruptWatcher{
+		ctx:      ctx,
+		cancel:   cancel,
+		signals:  make(chan os.Signal, 1),
+		finished: make(chan struct{}),
+	}
+	signal.Notify(w.signals, os.Interrupt, syscall.SIGTERM)
+
 	go func() {
 		select {
-		case <-signals:
+		case sig := <-w.signals:
 			// Detach first: from here a second signal terminates by default,
 			// which is the only way out of a phase that cannot be cancelled.
-			signal.Stop(signals)
-			cancel()
+			signal.Stop(w.signals)
+			// Record before cancelling, for the same reason the notice is
+			// written before cancelling: cancel releases the main goroutine,
+			// which asks which signal this was on its way to the exit code.
+			w.mu.Lock()
+			w.received = sig
+			w.mu.Unlock()
+			// Notice BEFORE cancel, and the order is load-bearing. Cancelling
+			// releases the main goroutine, which returns the cancellation up to
+			// main and calls os.Exit — which does not wait for goroutines. A
+			// notice printed after the cancel is in a race with process exit,
+			// and the line at stake is the one telling the operator that a
+			// second Ctrl-C will terminate.
 			fmt.Fprintln(notice, "\ninterrupt received: cancelling what can be cancelled; "+
 				"press Ctrl-C again to terminate (an in-flight Redis scan cannot be interrupted)")
-		case <-finished:
+			cancel()
+		case <-w.finished:
 		}
 	}()
+	return w
+}
 
-	var once sync.Once
-	return ctx, func() {
-		once.Do(func() {
-			close(finished)
-			signal.Stop(signals)
-			cancel()
-		})
+// cutoverInterrupted is a run that ended because the process was signalled. It
+// carries the signal so the exit code can name it.
+type cutoverInterrupted struct {
+	signal os.Signal
+	err    error
+}
+
+func (e *cutoverInterrupted) Error() string {
+	return fmt.Sprintf("stopped by signal %v: %v", e.signal, e.err)
+}
+
+func (e *cutoverInterrupted) Unwrap() error { return e.err }
+
+// cutoverExitCode maps a finished run to a process exit code.
+//
+// 128+signum is the shell convention, and the distinction it buys is real: a
+// runbook wrapper reading 130 concludes an operator pressed Ctrl-C, while 143
+// says the platform terminated the pod — `kubectl delete pod`, a job deadline,
+// a deploy rolling the pod out from under an activation. After an interrupted
+// one-way flip those call for different next steps, and the command previously
+// reported 130 for both.
+//
+// Everything else is 1, including a refusal: "the activation was declined" must
+// not read as "someone stopped it".
+func cutoverExitCode(err error) int {
+	if err == nil {
+		return 0
 	}
+	var interrupted *cutoverInterrupted
+	if errors.As(err, &interrupted) {
+		if sig, ok := interrupted.signal.(syscall.Signal); ok && sig > 0 {
+			return 128 + int(sig)
+		}
+		return 130
+	}
+	// A cancellation nobody could attribute to a signal. Still an interruption
+	// from the caller's point of view, so keep the interrupt code rather than
+	// reporting it as a refusal.
+	if errors.Is(err, context.Canceled) {
+		return 130
+	}
+	return 1
+}
+
+// isCancellation reports whether err is the operator's interrupt (or a deadline
+// running out) rather than something the database or Redis did wrong.
+//
+// The distinction decides what the operator is told: an evidence source that
+// genuinely could not be read makes the totals a lower bound and must block an
+// irreversible flip, while a cancellation means they asked to stop and should
+// be answered as such — with the interrupt exit code, not a refusal citing
+// unreadable evidence.
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // redactedMySQLEndpoint renders a DSN as just the server and schema it points
@@ -275,7 +393,7 @@ func fprintRedisEndpoint(cfg *config.Config) {
 // loadCutoverConfig resolves the config file plus the same TS_* environment
 // overrides the server applies.
 func loadCutoverConfig(path string) (*config.Config, error) {
-	vp, err := operatorConfigViper(path)
+	vp, err := operatorConfigViper(path, os.Stderr)
 	if err != nil {
 		return nil, err
 	}

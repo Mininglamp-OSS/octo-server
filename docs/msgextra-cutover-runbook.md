@@ -223,6 +223,11 @@ above them.
   **second** Ctrl-C terminates the command outright. If you interrupt during
   `activate`, re-run `preflight` before retrying: an aborted flip commits
   nothing, but the evidence you were shown is stale.
+- Exit codes: `0` success, `1` a refusal (bad floor, unreadable evidence),
+  `130` interrupted by Ctrl-C, `143` terminated by SIGTERM. The last two are
+  worth separating in any wrapper — `143` on an activation usually means the
+  platform reclaimed the pod (`kubectl delete pod`, a rolling deploy), not that
+  anyone decided to stop.
 - All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
   on the shared `pkg/cutover` flip primitives) and is covered by
   `activation_test.go` against live MySQL; the command here is a thin wrapper.

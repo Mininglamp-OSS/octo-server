@@ -163,6 +163,9 @@ succeeds while the allocator has never been activated.
   in-flight Redis queue scan takes no per-command deadline and runs to
   completion. Interrupting `activate` before the flip commits leaves nothing
   behind; re-run `preflight` before retrying.
+- Exit codes: `0` success, `1` a refusal, `130` interrupted by Ctrl-C, `143`
+  terminated by SIGTERM — the last usually means the platform reclaimed the pod
+  rather than an operator deciding to stop.
 - The flip primitives live in `pkg/cutover` (shared with #627); the state row
   and allocator semantics live in `pkg/botevent` (`state.go`, `seq.go`,
   `mode.go`); the evidence gathering and mirror judgement live in

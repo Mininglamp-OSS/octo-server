@@ -81,9 +81,9 @@ func TestCutoverUnknownFlagIsReportedOnce(t *testing.T) {
 func TestInterruptNoticeNeverPrintsOnACleanRun(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		var notice bytes.Buffer
-		ctx, stop := watchInterrupt(&notice)
-		stop()
-		<-ctx.Done() // the command's work is over and the context is released
+		watcher := watchInterrupt(&notice)
+		watcher.Stop()
+		<-watcher.Context().Done() // the work is over and the context is released
 		require.Empty(t, notice.String(),
 			"iteration %d: a run that was never signalled announced an interrupt", i)
 	}
@@ -93,9 +93,9 @@ func TestInterruptNoticeNeverPrintsOnACleanRun(t *testing.T) {
 // return path may call it explicitly.
 func TestInterruptWatcherStopIsIdempotent(t *testing.T) {
 	var notice bytes.Buffer
-	_, stop := watchInterrupt(&notice)
-	stop()
-	require.NotPanics(t, stop)
+	watcher := watchInterrupt(&notice)
+	watcher.Stop()
+	require.NotPanics(t, watcher.Stop)
 	require.Empty(t, notice.String())
 }
 
