@@ -57,11 +57,15 @@ cutover 是 **fail-closed、单向、带水位校验**的数据面迁移：切�
   - **guard 读的是本进程 env，措辞必须说清楚**：guard 是进程本地配置，控制面无法
     远程观测，而 runbook 明确允许在跳板机上跑这些命令——不加限定词就会在已武装的
     机群上打出 "unset"，把最关键的安全网报成关闭。
-  - **中断要两阶段**：装了信号 handler 就等于关闭了默认终止行为，而证据阶段
-    （go-redis v6 的 SCAN 没有 per-command context）根本观测不到 ctx。所以第一次
-    信号取消能取消的（flip 的 DB 语句），并**立刻恢复默认处理**，让第二次 Ctrl-C
-    能终止取消不掉的扫描。只做第一阶段会让命令比它取代的旧工具更难中断——而
-    msgextra 的证据扫描是在状态行 `FOR UPDATE` 持锁、所有写入被挡住的窗口里跑的。
+  - **中断要两阶段**：装了信号 handler 就等于关闭了默认终止行为，而不是每个阶段都
+    能观测 ctx——MySQL 侧（证据读 + flip 语句）能，Redis 扫描不能（go-redis v6 无
+    per-command context，已在飞的扫描必然跑完）。所以第一次信号取消能取消的，并
+    **立刻恢复默认处理**，让第二次 Ctrl-C 能终止取消不掉的那段。只做第一阶段会让
+    命令比它取代的旧工具更难中断——而 msgextra 的证据是在状态行 `FOR UPDATE` 持锁、
+    所有写入被挡住的窗口里算的。
+    提示语要挂在**信号本身**上，不能挂在 ctx 取消上：`signal.NotifyContext` 的
+    stop 会先 cancel，正常返回路径上的 defer 会把 watcher 叫醒，于是成功的 activate
+    可能在 "ACTIVATED" 下面紧跟一句"中断已收到"。
 
 **留在各域的**：floor 证据从哪些来源算、翻转前后的域特定步骤（#697 的 mirror
 判定与发布）、以及全部运行时读路径（#627 的 FOR SHARE + ReserveTx、#697 的

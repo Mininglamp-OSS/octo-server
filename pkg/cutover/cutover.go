@@ -51,12 +51,19 @@ const (
 
 // ErrStateMissing means the domain's singleton state row does not exist —
 // either the row is absent or the table itself has not been migrated yet
-// (MySQL 1146). The two cases are collapsed on purpose: both mean "the
-// migration has not seeded the authority here". Callers choose what that
-// means: runtime readers treat it as the pre-cutover legacy default, while
-// operator flips refuse to act on it. It must never be confused with an
-// unreachable database, whose safe answer is the opposite once the new
-// allocator has issued ids.
+// (MySQL 1146). The two are collapsed on purpose: both mean "the migration has
+// not seeded the authority here", and an operator flip refuses either way. It
+// must never be confused with an unreachable database, whose safe answer is the
+// opposite once the new allocator has issued ids.
+//
+// What the collapse does NOT promise is that a domain's runtime reader treats
+// the two alike. Each domain owns that: pkg/botevent maps both to its legacy
+// path, while internal/msgextraseq's FOR SHARE reader defaults to legacy only
+// for a missing row and lets a missing table fail every write closed. A domain
+// whose operator surface reports "missing" therefore has to decide whether its
+// two cases need distinguishing for the human reading it — msgextra's `status`
+// probes, because there the difference is "writes are flowing" versus "every
+// write is erroring".
 var ErrStateMissing = errors.New("cutover: state row is missing")
 
 // State is a domain's decoded singleton state row.
@@ -75,6 +82,11 @@ type State struct {
 func (s State) Active() bool { return s.Mode == ModeActive }
 
 // ReadState reads a domain's singleton state row under the caller's deadline.
+//
+// table is interpolated into the statement, so it must be a compile-time
+// constant owned by the domain package (msgextraseq.StateTable,
+// botevent.StateTable) — never a value derived from configuration or input.
+// The same applies to FlipSpec.Table.
 // A missing row and a missing table both return ErrStateMissing (see its doc);
 // any other failure is surfaced as-is so callers can distinguish "not migrated
 // yet" from "authority unreachable" — opposite safe answers post-cutover.

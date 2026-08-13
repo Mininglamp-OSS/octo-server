@@ -69,6 +69,36 @@ func TestCutoverUnknownFlagIsReportedOnce(t *testing.T) {
 	require.Empty(t, out.String(), "the flag package must not also print usage to the report writer")
 }
 
+// A clean run must never claim an interrupt happened. The notice tells an
+// operator that an irreversible cutover was interrupted, and it would print
+// directly under "ACTIVATED: allocator is now transactional".
+//
+// The defect this pins was a race, so the loop is the assertion: the previous
+// shape (signal.NotifyContext + printing on <-ctx.Done(), where the stop
+// function cancels before detaching the handler) let the deferred stop on the
+// success path wake the watcher. Reverting to that shape makes this test fail;
+// gating the notice on the signal channel makes it structurally impossible.
+func TestInterruptNoticeNeverPrintsOnACleanRun(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		var notice bytes.Buffer
+		ctx, stop := watchInterrupt(&notice)
+		stop()
+		<-ctx.Done() // the command's work is over and the context is released
+		require.Empty(t, notice.String(),
+			"iteration %d: a run that was never signalled announced an interrupt", i)
+	}
+}
+
+// stop must be safe to call more than once — it is deferred, and an early
+// return path may call it explicitly.
+func TestInterruptWatcherStopIsIdempotent(t *testing.T) {
+	var notice bytes.Buffer
+	_, stop := watchInterrupt(&notice)
+	stop()
+	require.NotPanics(t, stop)
+	require.Empty(t, notice.String())
+}
+
 // A domain registered without one of its three actions would panic at dispatch,
 // during the procedure it exists to run. docs/cutover-framework.md makes
 // registering a domain here a standing instruction, so the wiring is checked

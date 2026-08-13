@@ -107,6 +107,13 @@ Then, in this order:
 
 ## 4. Verify, then arm the guard
 
+**If `activate` reported a failure, re-run it before believing that.** A
+connection dropped between the server's commit and the client's ack is
+indistinguishable from a commit that never landed, so a flip that happened can
+be reported as failed — and in that case the Redis mirror was not published
+either. The re-run is idempotent: it finds the authority already activated,
+publishes the mirror, and exits zero.
+
 Immediately after a successful activate:
 
 - no `botevent: seed event id counter` errors in logs (a failed seed refuses
@@ -151,10 +158,11 @@ succeeds while the allocator has never been activated.
 - `status` reports the expected-mode guard from **the environment of the process
   running the command**, not the fleet's. Confirm the fleet's guard where it is
   set.
-- Interrupting is two-stage: the first Ctrl-C / SIGTERM cancels the cancellable
-  database work, and a second terminates the command (an in-flight Redis queue
-  scan takes no per-command deadline). Interrupting `activate` before the flip
-  commits leaves nothing behind; re-run `preflight` before retrying.
+- Interrupting is two-stage: the first Ctrl-C / SIGTERM cancels the MySQL work
+  (the `seq` sweeps and the flip), and a second terminates the command — an
+  in-flight Redis queue scan takes no per-command deadline and runs to
+  completion. Interrupting `activate` before the flip commits leaves nothing
+  behind; re-run `preflight` before retrying.
 - The flip primitives live in `pkg/cutover` (shared with #627); the state row
   and allocator semantics live in `pkg/botevent` (`state.go`, `seq.go`,
   `mode.go`); the evidence gathering and mirror judgement live in

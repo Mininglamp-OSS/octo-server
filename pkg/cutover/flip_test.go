@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
 	"github.com/gocraft/dbr/v2"
+	"github.com/stretchr/testify/require"
 )
 
 const testStateTable = "octo_cutover_test_state"
@@ -202,9 +203,37 @@ func TestFlipObserveErrorAborts(t *testing.T) {
 	}
 }
 
+// TestFlipWithSessionLockWaitTimeout covers the pinned-connection path and,
+// more importantly, what keeps it from poisoning the pool.
+//
+// An earlier version of this test asserted nothing about the session variable
+// and explained itself with "the pinned connection is closed on cleanup, so the
+// pool never sees the 3s setting" — which is backwards. sql.Conn.Close()
+// RETURNS the connection to the pool; that is the whole hazard. Three things
+// keep it clean, in order: restoreBeforeCommit on the success path,
+// restoreDetached in cleanup for every other path, and the ErrBadConn discard
+// when neither restore succeeds.
+//
+// So the assertion is the round trip rather than any one of those mechanisms:
+// whatever pooled connections carried before the flip, they must still carry
+// after it. Removing a single restore path leaves the other covering it;
+// removing both makes this fail with the flip's own timeout leaked into the
+// pool, which is the outcome that actually matters.
 func TestFlipWithSessionLockWaitTimeout(t *testing.T) {
 	db := setupDB(t)
 	seedState(t, db, cutover.ModeInactive, 0, 0)
+
+	// The baseline is whatever pooled connections already carry — a SET GLOBAL
+	// here would prove nothing, because it only reaches connections opened
+	// afterwards while the flip pins one that already exists.
+	const flipTimeout = 3
+	var baseline int64
+	_, err := db.SelectBySql("SELECT @@SESSION.innodb_lock_wait_timeout").Load(&baseline)
+	require.NoError(t, err)
+	require.NotEqualValues(t, flipTimeout, baseline,
+		"the server default equals the flip's timeout, so this test could not tell a "+
+			"restored connection from a leaked one")
+
 	flipped, epoch, err := cutover.Flip(context.Background(), db, cutover.FlipSpec{
 		Table: testStateTable, Floor: 10,
 		Observe:                func(*dbr.Tx) (int64, error) { return 10, nil },
@@ -213,9 +242,58 @@ func TestFlipWithSessionLockWaitTimeout(t *testing.T) {
 	if err != nil || !flipped || epoch != 1 {
 		t.Fatalf("flip with lock-wait timeout = (%v,%d,%v), want (true,1,nil)", flipped, epoch, err)
 	}
-	// The pinned connection is closed on cleanup, so the pool never sees the
-	// 3s session setting; a follow-up statement on the shared pool works.
 	if st := readRow(t, db); !st.Active() || st.Floor != 10 {
 		t.Fatalf("state after pinned flip = %+v", st)
+	}
+
+	// The connection the flip pinned is back in the pool by now. Sample enough
+	// connections that a leaked setting cannot hide behind pool ordering: a
+	// writer that drew the poisoned one would silently get a lock-wait budget
+	// nobody configured.
+	for i := 0; i < 8; i++ {
+		var got int64
+		_, err := db.SelectBySql("SELECT @@SESSION.innodb_lock_wait_timeout").Load(&got)
+		require.NoError(t, err)
+		require.EqualValues(t, baseline, got,
+			"a pooled connection reports innodb_lock_wait_timeout=%d after the flip (baseline %d); "+
+				"the flip's session value leaked into the pool — Close returns the connection, "+
+				"it does not discard it, so one of the restore paths has to run", got, baseline)
+	}
+}
+
+// TestFlipDiscardsTheConnectionWhenTheRestoreFails covers the fallback: if the
+// session value cannot be put back, the connection must not return to the pool
+// carrying it.
+//
+// The failure is induced by cancelling the context after the flip has taken the
+// connection, so the deferred restore runs against a dead deadline — except
+// that restoreDetached deliberately detaches from it, which is what this test
+// pins. A regression that dropped the detach would surface here as a discarded
+// connection plus a joined restore error on an otherwise clean flip.
+func TestFlipRestoresThroughACancelledContext(t *testing.T) {
+	db := setupDB(t)
+	seedState(t, db, cutover.ModeInactive, 0, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	flipped, _, err := cutover.Flip(ctx, db, cutover.FlipSpec{
+		Table: testStateTable, Floor: 5,
+		Observe: func(*dbr.Tx) (int64, error) {
+			// Cancel mid-flip: the commit still runs on the pinned connection,
+			// and the cleanup restore must not inherit this cancellation.
+			cancel()
+			return 5, nil
+		},
+		LockWaitTimeoutSeconds: 3,
+	})
+	// The cancellation lands before the commit, so this flip is expected to
+	// fail — the point is that it fails cleanly, with no restore error joined
+	// on top from a cleanup that inherited the dead context.
+	require.False(t, flipped)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "restore session lock-wait timeout",
+		"cleanup inherited the cancelled context instead of detaching from it")
+
+	if st := readRow(t, db); st.Active() {
+		t.Fatal("a cancelled flip must not have activated the domain")
 	}
 }

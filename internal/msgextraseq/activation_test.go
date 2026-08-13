@@ -78,12 +78,31 @@ func TestLegacySeqKeyFormatMatchesRunbook(t *testing.T) {
 	}
 }
 
+// TestPreflightHonorsContextCancellation pins that the operator's deadline
+// reaches the evidence reads.
+//
+// It matters most where it is least visible: on the activate path the same
+// reads run inside Flip's Observe closure, with the state row held FOR UPDATE
+// and every message_extra writer blocked behind it. A deadline that stops at
+// the lock acquisition would leave that window uninterruptible, which is the
+// opposite of what the command's interrupt handling advertises.
+func TestPreflightHonorsContextCancellation(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	s := msgextraseq.New(ctx)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Preflight(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Preflight on a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
 func TestPreflightRecommendsMaxOfEvidence(t *testing.T) {
 	ctx := setup(t, msgextraseq.ModeLegacy, 0)
 	s := msgextraseq.New(ctx)
 
 	// No rows yet: recommended floor is 0, mode legacy.
-	res, err := s.Preflight()
+	res, err := s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight (empty): %v", err)
 	}
@@ -104,7 +123,7 @@ func TestPreflightRecommendsMaxOfEvidence(t *testing.T) {
 	).Exec(); err != nil {
 		t.Fatalf("seed seq: %v", err)
 	}
-	res, err = s.Preflight()
+	res, err = s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -153,7 +172,7 @@ func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *test
 	}
 	t.Cleanup(func() { _ = redis.Del(key) })
 
-	res, err := s.Preflight()
+	res, err := s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -174,7 +193,7 @@ func TestPreflightClassifiesPoisonedRedisCursorWithoutBlockingActivation(t *test
 	if err != nil || !flipped {
 		t.Fatalf("Activate with poisoned Redis cursor=(%v,%v), want (true,nil)", flipped, err)
 	}
-	state, err := s.Preflight()
+	state, err := s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight after activation: %v", err)
 	}
@@ -200,7 +219,7 @@ func TestActivateFlipsAndIsIdempotent(t *testing.T) {
 	if !flipped {
 		t.Fatal("Activate: expected flipped=true from legacy")
 	}
-	res, err := s.Preflight()
+	res, err := s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight after activate: %v", err)
 	}
@@ -216,7 +235,7 @@ func TestActivateFlipsAndIsIdempotent(t *testing.T) {
 	if flipped {
 		t.Fatal("Activate: second call must be a no-op (flipped=false)")
 	}
-	res, _ = s.Preflight()
+	res, _ = s.Preflight(context.Background())
 	if res.CurrentEpoch != 1 {
 		t.Fatalf("epoch bumped on idempotent activate: %d", res.CurrentEpoch)
 	}
@@ -235,7 +254,7 @@ func TestActivateRejectsFloorBelowObservedMax(t *testing.T) {
 	if _, err := s.Activate(context.Background(), 999); err == nil {
 		t.Fatal("Activate: expected ErrFloorTooLow for a floor below the observed max")
 	}
-	res, _ := s.Preflight()
+	res, _ := s.Preflight(context.Background())
 	if res.CurrentMode != msgextraseq.ModeLegacy {
 		t.Fatalf("state changed despite refused activate: %+v", res)
 	}
@@ -249,7 +268,7 @@ func TestActivateRejectsFloorAboveMax(t *testing.T) {
 	if _, err := s.Activate(context.Background(), msgextraseq.MaxCutoverFloor+1); err == nil {
 		t.Fatal("Activate: expected ErrFloorTooHigh for a floor above MaxCutoverFloor")
 	}
-	res, _ := s.Preflight()
+	res, _ := s.Preflight(context.Background())
 	if res.CurrentMode != msgextraseq.ModeLegacy {
 		t.Fatalf("state changed despite refused activate: %+v", res)
 	}
@@ -266,7 +285,7 @@ func TestPreflightAndActivateRejectMissingStateRow(t *testing.T) {
 		t.Fatalf("delete state row: %v", err)
 	}
 
-	if _, err := s.Preflight(); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
+	if _, err := s.Preflight(context.Background()); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
 		t.Fatalf("Preflight error=%v want ErrStateRowMissing", err)
 	}
 	if _, err := s.Activate(context.Background(), 0); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
@@ -307,7 +326,7 @@ func TestLegacyToTransactionalRolloutOrdering(t *testing.T) {
 		t.Fatalf("legacy write touched transactional sequence row: last_version=%d", got)
 	}
 
-	preflight, err := preCutoverStore.Preflight()
+	preflight, err := preCutoverStore.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -377,7 +396,7 @@ func TestActivateFailsFastWhenWriterDrainIncomplete(t *testing.T) {
 	}
 
 	_ = writerTx.Rollback()
-	state, err := s.Preflight()
+	state, err := s.Preflight(context.Background())
 	if err != nil {
 		t.Fatalf("Preflight after timeout: %v", err)
 	}

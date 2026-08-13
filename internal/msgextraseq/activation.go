@@ -111,13 +111,45 @@ func (s *Store) CurrentState(ctx context.Context) (State, error) {
 	return State{Mode: st.Mode, Epoch: st.Epoch, CutoverFloor: st.Floor}, nil
 }
 
+// StateTableExists reports whether the allocator's state table is present.
+//
+// It exists because `ErrStateRowMissing` covers two situations that this
+// domain's runtime treats OPPOSITELY, and an operator diagnosing an outage has
+// to be told which one they are in:
+//
+//   - missing ROW: readStateForShare maps dbr.ErrNotFound to legacy, so writes
+//     keep flowing on the pre-cutover allocator.
+//   - missing TABLE (MySQL 1146): readStateForShare has no case for it, so the
+//     error propagates and EVERY message_extra write fails closed.
+//
+// pkg/cutover collapses the two because for a domain whose reader defaults to
+// legacy either way — botevent — they mean the same thing. This one's
+// FOR SHARE reader does not, so the operator surface asks separately rather
+// than reporting the friendlier of the two.
+func (s *Store) StateTableExists(ctx context.Context) (bool, error) {
+	var name string
+	count, err := s.ctx.DB().SelectBySql(
+		"SELECT `TABLE_NAME` FROM information_schema.TABLES WHERE `TABLE_SCHEMA`=DATABASE() AND `TABLE_NAME`=?",
+		StateTable,
+	).LoadContext(ctx, &name)
+	if err != nil {
+		return false, fmt.Errorf("msgextraseq: probe state table: %w", err)
+	}
+	return count > 0, nil
+}
+
 // Preflight reads (no locks, no writes) the maxima that bound already-issued
 // versions and reports a safe cutover floor plus the current state. It never
 // mutates anything, so it is safe to run against production at any time.
-func (s *Store) Preflight() (PreflightResult, error) {
+//
+// ctx bounds the MySQL reads. It does NOT bound the Redis cursor scan: the
+// client library takes no per-command context, so a scan already in flight runs
+// to completion. That residue is why the operator command's interrupt handling
+// has a second stage.
+func (s *Store) Preflight(ctx context.Context) (PreflightResult, error) {
 	var res PreflightResult
 
-	state, err := cutover.ReadState(context.Background(), s.ctx.DB(), StateTable)
+	state, err := cutover.ReadState(ctx, s.ctx.DB(), StateTable)
 	if err != nil {
 		if errors.Is(err, cutover.ErrStateMissing) {
 			return PreflightResult{}, ErrStateRowMissing
@@ -128,7 +160,7 @@ func (s *Store) Preflight() (PreflightResult, error) {
 	res.CurrentEpoch = state.Epoch
 	res.CurrentFloor = state.Floor
 
-	maxVersion, maxSeq, err := s.observedMaxima(s.ctx.DB())
+	maxVersion, maxSeq, err := s.observedMaxima(ctx, s.ctx.DB())
 	if err != nil {
 		return PreflightResult{}, err
 	}
@@ -173,7 +205,9 @@ func (s *Store) Activate(ctx context.Context, floor int64) (bool, error) {
 		// caller's Preflight. The runbook also drains /message/extra/sync while
 		// this Redis scan runs; unlike writers, cursor updates do not take the
 		// MySQL state-row lock.
-		Observe:                s.observeUnderDrainBarrier,
+		Observe: func(tx *dbr.Tx) (int64, error) {
+			return s.observeUnderDrainBarrier(ctx, tx)
+		},
 		LockWaitTimeoutSeconds: activationLockWaitTimeoutSeconds,
 	})
 	// flipped is checked BEFORE err on purpose. Releasing the pinned connection
@@ -216,8 +250,8 @@ func (s *Store) Activate(ctx context.Context, floor int64) (bool, error) {
 // held FOR UPDATE: the MySQL maxima are final because every writer holds the
 // row FOR SHARE until commit, and the Redis cursor scan is authoritative only
 // under the runbook's /message/extra/sync drain.
-func (s *Store) observeUnderDrainBarrier(tx *dbr.Tx) (int64, error) {
-	maxVersion, maxSeq, err := s.observedMaxima(tx)
+func (s *Store) observeUnderDrainBarrier(ctx context.Context, tx *dbr.Tx) (int64, error) {
+	maxVersion, maxSeq, err := s.observedMaxima(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
@@ -240,17 +274,17 @@ func (s *Store) observeUnderDrainBarrier(tx *dbr.Tx) (int64, error) {
 // always return one row, so a missing row is impossible; any driver error other
 // than that is surfaced. The querier is the caller's tx (under the drain barrier)
 // or a plain session (read-only Preflight).
-func (s *Store) observedMaxima(q dbr.SessionRunner) (maxVersion, maxSeq int64, err error) {
+func (s *Store) observedMaxima(ctx context.Context, q dbr.SessionRunner) (maxVersion, maxSeq int64, err error) {
 	if err = q.SelectBySql(
 		"SELECT COALESCE(MAX(`version`),0) FROM `message_extra`",
-	).LoadOne(&maxVersion); err != nil {
+	).LoadOneContext(ctx, &maxVersion); err != nil {
 		return 0, 0, fmt.Errorf("msgextraseq: observe max message_extra version: %w", err)
 	}
 	legacyPrefix := fmt.Sprintf("seq:%s:%%", common.MessageExtraSeqKey)
 	if err = q.SelectBySql(
 		"SELECT COALESCE(MAX(`min_seq`),0) FROM `seq` WHERE `key` LIKE ?",
 		legacyPrefix,
-	).LoadOne(&maxSeq); err != nil {
+	).LoadOneContext(ctx, &maxSeq); err != nil {
 		return 0, 0, fmt.Errorf("msgextraseq: observe max legacy seq: %w", err)
 	}
 	return maxVersion, maxSeq, nil

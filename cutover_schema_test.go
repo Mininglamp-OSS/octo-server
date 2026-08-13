@@ -9,10 +9,18 @@ package main
 // consolidation). The cost of that decision is that every new domain COPIES the
 // DDL template, and copied schema drifts exactly the way copied code does.
 //
-// This test is what makes copying safe. It reads the real migrated schema out
-// of information_schema and checks it against the template, so a domain that
-// mistypes a column type, forgets the singleton CHECK, or ships without a
-// seeded legacy row fails here rather than during a cutover.
+// This test is what makes copying safe. A domain that mistypes a column type,
+// forgets the singleton CHECK, or ships without a seeded legacy row fails here
+// rather than during a cutover.
+//
+// Note what is asserted from where. The DDL — columns, types, defaults,
+// collation, primary key, CHECK — is read from the LIVE migrated schema via
+// information_schema, because that is what the migration actually produced. The
+// seeded row is asserted from the MIGRATION SOURCE, because the live row is both
+// unavailable (testutil.NewTestServer clears every table on entry and the
+// ledger-gated migration does not re-seed) and the wrong subject (an activated
+// database holds an active mode legitimately, so "the current row is inactive"
+// is not an invariant — "the migration seeds inactive" is).
 //
 // Deviations that already shipped are recorded in knownTemplateDeviations with
 // the reason they are not being fixed — the list is the documentation, and a
@@ -20,7 +28,11 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -90,6 +102,7 @@ func TestCutoverDomainTablesMatchTheFrameworkTemplate(t *testing.T) {
 	db := cutoverSchemaTestDB(t)
 	schema := currentSchemaName(t, db)
 
+	root := repoRootForSchemaTest(t)
 	domains := cutoverDomainList()
 	require.NotEmpty(t, domains)
 	for _, d := range domains {
@@ -97,7 +110,41 @@ func TestCutoverDomainTablesMatchTheFrameworkTemplate(t *testing.T) {
 			require.NotEmpty(t, d.stateTable, "domain %s registered no state table", d.name)
 			assertCutoverTableShape(t, db, schema, d.stateTable)
 			assertSingletonCheckConstraint(t, db, schema, d.stateTable)
-			assertSeededInertRow(t, db, d.stateTable)
+			assertMigrationSeedsInertRow(t, root, d.stateTable)
+		})
+	}
+}
+
+// TestCutoverSchemaConformanceDoesNotDependOnSeededRows is the regression for
+// the defect this test shipped with: it asserted the seeded row from the live
+// table, which `testutil.NewTestServer` has already deleted by the time any
+// assertion runs.
+//
+// NewTestServer clears every table except `gorp_migrations` and only then calls
+// module.Setup, whose migrations are ledger-gated — so on any schema that has
+// run these migrations before, the seed INSERT does not re-apply and the row is
+// simply gone. It fails on entry, not on a second run, and removing the test's
+// own t.Cleanup does not help.
+//
+// The invariant is about the migration anyway: "deploying the schema must not
+// activate anything" is a property of what the migration seeds, not of what the
+// row currently holds — an activated production database legitimately holds
+// mode=1. So the seed is asserted from the migration source, and this test pins
+// that the rest of the conformance check survives an empty table.
+func TestCutoverSchemaConformanceDoesNotDependOnSeededRows(t *testing.T) {
+	db := cutoverSchemaTestDB(t)
+	schema := currentSchemaName(t, db)
+	root := repoRootForSchemaTest(t)
+
+	for _, d := range cutoverDomainList() {
+		t.Run(d.name, func(t *testing.T) {
+			// Reproduce exactly what NewTestServer leaves behind.
+			_, err := db.UpdateBySql("DELETE FROM `" + d.stateTable + "`").Exec()
+			require.NoError(t, err)
+
+			assertCutoverTableShape(t, db, schema, d.stateTable)
+			assertSingletonCheckConstraint(t, db, schema, d.stateTable)
+			assertMigrationSeedsInertRow(t, root, d.stateTable)
 		})
 	}
 }
@@ -201,33 +248,102 @@ func assertSingletonCheckConstraint(t *testing.T, db *dbr.Session, schema, table
 		"to drop an activated authority has nothing to trip on.", table, clauses)
 }
 
-// assertSeededInertRow checks the migration left exactly one row, in the
-// inactive mode. Deploying the schema must never activate anything: the flip is
-// an operator action, separate from the deploy.
-func assertSeededInertRow(t *testing.T, db *dbr.Session, table string) {
+// assertMigrationSeedsInertRow checks that the migration which creates the
+// table seeds it inactive. Deploying the schema must never activate anything:
+// the flip is an operator action, separate from the deploy.
+//
+// The subject is the migration, NOT the live row, for two independent reasons.
+// The live row is deleted before any assertion can see it (see
+// TestCutoverSchemaConformanceDoesNotDependOnSeededRows). And it would be the
+// wrong subject even if it survived: an activated production database holds
+// mode=1 legitimately, so "the current row is inactive" is not an invariant,
+// while "the migration seeds inactive" is.
+//
+// Only the `-- +migrate Up` section is considered. botevent's Down deliberately
+// contains an INSERT of its own — the singleton-CHECK trip that refuses to drop
+// an activated authority — and reading that as a seed would be nonsense.
+func assertMigrationSeedsInertRow(t *testing.T, root, table string) {
 	t.Helper()
-	var count int
-	_, err := db.SelectBySql("SELECT COUNT(*) FROM `" + table + "`").Load(&count)
-	require.NoError(t, err)
-	require.Equal(t, 1, count, "%s must hold exactly one seeded row", table)
+	path, up := findCreatingMigration(t, root, table)
 
-	var row struct {
-		SingletonID int   `db:"singleton_id"`
-		Mode        int   `db:"mode"`
-		Epoch       int64 `db:"epoch"`
-		Floor       int64 `db:"cutover_floor"`
-	}
-	_, err = db.SelectBySql(
-		"SELECT `singleton_id`, `mode`, `epoch`, `cutover_floor` FROM `"+table+"` WHERE `singleton_id`=?",
-		cutover.SingletonID,
-	).Load(&row)
+	// Normalize whitespace so the assertion does not depend on how the DDL is
+	// wrapped across lines.
+	flat := strings.Join(strings.Fields(up), " ")
+	insert := regexp.MustCompile(
+		"INSERT INTO `" + regexp.QuoteMeta(table) + "` " +
+			"\\( *`singleton_id` *, *`mode` *, *`epoch` *, *`cutover_floor` *\\) " +
+			"VALUES *\\( *([0-9]+) *, *([0-9]+) *, *([0-9]+) *, *([0-9]+) *\\)",
+	).FindStringSubmatch(flat)
+	require.NotNil(t, insert,
+		"%s: no seed INSERT for %s with the template's column list "+
+			"(`singleton_id`,`mode`,`epoch`,`cutover_floor`) found in the Up section.\n"+
+			"Every cutover domain must seed its singleton so a deploy is inert; see "+
+			"docs/cutover-framework.md.", path, table)
+
+	require.Equal(t, strconv.Itoa(cutover.SingletonID), insert[1],
+		"%s: seed must use singleton_id=%d", path, cutover.SingletonID)
+	require.Equal(t, strconv.Itoa(cutover.ModeInactive), insert[2],
+		"%s: seed must use mode=%d — a migration that seeds an active mode performs "+
+			"the cutover at deploy time", path, cutover.ModeInactive)
+	require.Equal(t, "0", insert[3], "%s: seed must use epoch=0; Flip owns the generation counter", path)
+	require.Equal(t, "0", insert[4],
+		"%s: seed must use cutover_floor=0; the floor is set by an activation, not a migration", path)
+}
+
+// findCreatingMigration returns the migration file that creates the table, and
+// its `-- +migrate Up` section.
+func findCreatingMigration(t *testing.T, root, table string) (string, string) {
+	t.Helper()
+	create := regexp.MustCompile("CREATE TABLE (IF NOT EXISTS )?`" + regexp.QuoteMeta(table) + "`")
+
+	var foundPath, foundUp string
+	err := filepath.WalkDir(filepath.Join(root, "modules"), func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || !strings.HasSuffix(path, ".sql") {
+			return walkErr
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if !create.Match(content) {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		require.Empty(t, foundPath,
+			"two migrations create %s (%s and %s); the conformance check cannot tell which seeds it",
+			table, foundPath, rel)
+		foundPath, foundUp = rel, migrationUpSection(string(content))
+		return nil
+	})
 	require.NoError(t, err)
-	require.Equal(t, cutover.SingletonID, row.SingletonID)
-	require.Equal(t, cutover.ModeInactive, row.Mode,
-		"%s seeds mode=%d: a fresh migration must leave the domain on its legacy path, "+
-			"or deploying the schema performs the cutover", table, row.Mode)
-	require.Zero(t, row.Epoch, "%s must seed epoch=0; Flip owns the generation counter", table)
-	require.Zero(t, row.Floor, "%s must seed cutover_floor=0; the floor is set by an activation, not a migration", table)
+	require.NotEmpty(t, foundPath,
+		"no migration under modules/*/sql/ creates %s — a registered cutover domain must ship one", table)
+	return foundPath, foundUp
+}
+
+// migrationUpSection returns everything between `-- +migrate Up` and
+// `-- +migrate Down` (or the end of the file when there is no Down).
+func migrationUpSection(content string) string {
+	const upMarker, downMarker = "-- +migrate Up", "-- +migrate Down"
+	if i := strings.Index(content, upMarker); i >= 0 {
+		content = content[i+len(upMarker):]
+	}
+	if i := strings.Index(content, downMarker); i >= 0 {
+		content = content[:i]
+	}
+	return content
+}
+
+// repoRootForSchemaTest locates the module root; the root package's tests run
+// there, and go.mod is the sanity check that the walk below is not pointed at
+// some other tree.
+func repoRootForSchemaTest(t *testing.T) string {
+	t.Helper()
+	root, err := os.Getwd()
+	require.NoError(t, err)
+	_, err = os.Stat(filepath.Join(root, "go.mod"))
+	require.NoError(t, err, "expected go.mod at the module root %q", root)
+	return root
 }
 
 // cutoverSchemaTestDB brings up the real migrated schema.

@@ -104,6 +104,12 @@ the expected-mode guard after a failed activation.
 
 Run these steps in order:
 
+0. **If `activate` reported a failure, re-run it before believing that.** A
+   connection dropped between the server's commit and the client's ack is
+   indistinguishable from a commit that never landed, so a flip that happened
+   can be reported as failed. The re-run is idempotent: it prints "already
+   transactional — nothing to do" if the flip did land, and retries cleanly if
+   it did not.
 1. Confirm `preflight` shows `mode=transactional` at the new epoch.
 2. Confirm `message_extra.version` is strictly increasing per channel and
    delta-sync no longer skips terminal card frames. Verify metrics:
@@ -211,11 +217,12 @@ above them.
   replica. Confirm the fleet's guard where it is actually set (deployment
   manifest / a replica's env), not from a laptop run.
 - Interrupting the command is two-stage. The first Ctrl-C / SIGTERM cancels the
-  database work — including a flip waiting on an unresponsive server — and says
-  so. It cannot cancel an in-flight Redis SCAN (the client library takes no
-  per-command deadline), so a **second** Ctrl-C terminates the command outright.
-  If you interrupt during `activate`, re-run `preflight` before retrying: an
-  aborted flip commits nothing, but the evidence you were shown is stale.
+  MySQL work — the evidence reads and a flip waiting on an unresponsive server —
+  and says so. It cannot cancel an in-flight Redis `SCAN`/`HSCAN` (the client
+  library takes no per-command deadline), so that sweep runs to completion and a
+  **second** Ctrl-C terminates the command outright. If you interrupt during
+  `activate`, re-run `preflight` before retrying: an aborted flip commits
+  nothing, but the evidence you were shown is stale.
 - All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
   on the shared `pkg/cutover` flip primitives) and is covered by
   `activation_test.go` against live MySQL; the command here is a thin wrapper.

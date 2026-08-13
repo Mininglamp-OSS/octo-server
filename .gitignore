@@ -95,8 +95,6 @@ octo-server-prev*
 
 # Operator tools compiled into the repo root by `go build ./tools/<name>`.
 # Build them to /tmp instead; a committed 40MB+ binary is not a source artifact.
-/botevent-seq
-/msgextra-version
 /card-action-dlq
 /genseq-repro
 /i18nmarkers

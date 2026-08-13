@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -156,26 +157,8 @@ func runCutoverCommand(args []string, out io.Writer) error {
 	// that open their own Redis connection print its endpoint the same way.
 	fmt.Fprintf(os.Stderr, "mysql: %s\n", redactedMySQLEndpoint(cfg.DB.MySQLAddr))
 
-	// Interrupt handling is two-stage, and it has to be: installing a handler at
-	// all disables default termination for the whole command, but not every
-	// phase can observe a context. The flip's statements can (Flip threads it),
-	// and so can the MySQL evidence reads — the Redis SCAN/HSCAN sweep cannot,
-	// because go-redis v6 has no per-command context.
-	//
-	// So the first signal cancels what is cancellable, and immediately restores
-	// default handling so a SECOND Ctrl-C terminates a scan that is not. Without
-	// that second stage, an operator who interrupts during a large keyspace scan
-	// — which for msgextra runs while the state row is held FOR UPDATE and every
-	// writer is blocked — would find the command ignoring every Ctrl-C and would
-	// have to go find the pod and SIGKILL it, with writes drained.
-	deadline, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go func() {
-		<-deadline.Done()
-		stop()
-		fmt.Fprintln(os.Stderr, "\ninterrupt received: cancelling what can be cancelled; "+
-			"press Ctrl-C again to terminate (an in-flight Redis scan cannot be interrupted)")
-	}()
+	deadline, stopWatching := watchInterrupt(os.Stderr)
+	defer stopWatching()
 
 	rt := &cutoverRuntime{
 		cfg:      cfg,
@@ -191,6 +174,61 @@ func runCutoverCommand(args []string, out io.Writer) error {
 		return domain.activate(rt, out)
 	default:
 		return domain.status(rt, out)
+	}
+}
+
+// watchInterrupt installs the two-stage interrupt handling and returns the
+// context the command's cancellable work runs under, plus a stop function the
+// caller must defer.
+//
+// Two-stage, and it has to be: installing a handler at all disables default
+// termination for the whole command, but not every phase can observe a context.
+// What does: the flip's own statements, and the MySQL evidence reads (both
+// domains thread the deadline into them). What does not: the Redis sweeps —
+// msgextra's messageExtraVersion:* SCAN/HSCAN and botevent's queue walk —
+// because go-redis v6 takes no per-command context, so a sweep already in
+// flight runs to completion whatever the operator presses.
+//
+// So the first signal cancels what is cancellable and immediately restores
+// default handling, so a SECOND Ctrl-C terminates a scan that is not. Without
+// that second stage, an operator interrupting a large keyspace scan — which for
+// msgextra runs while the state row is held FOR UPDATE and every writer is
+// blocked — would find the command ignoring every Ctrl-C and would have to go
+// find the pod and SIGKILL it, with writes drained.
+//
+// The notice is gated on the signal channel rather than on the context being
+// cancelled. An earlier revision used signal.NotifyContext and printed on
+// <-ctx.Done(); since that stop function cancels before it detaches the
+// handler, the deferred stop on the SUCCESS path woke the watcher and raced the
+// process exit to announce an interrupt that never happened — landing directly
+// under "ACTIVATED: allocator is now transactional", on the one surface whose
+// entire design argument is that its output stays readable mid-incident.
+func watchInterrupt(notice io.Writer) (context.Context, func()) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		select {
+		case <-signals:
+			// Detach first: from here a second signal terminates by default,
+			// which is the only way out of a phase that cannot be cancelled.
+			signal.Stop(signals)
+			cancel()
+			fmt.Fprintln(notice, "\ninterrupt received: cancelling what can be cancelled; "+
+				"press Ctrl-C again to terminate (an in-flight Redis scan cannot be interrupted)")
+		case <-finished:
+		}
+	}()
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			close(finished)
+			signal.Stop(signals)
+			cancel()
+		})
 	}
 }
 

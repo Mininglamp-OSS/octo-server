@@ -29,9 +29,11 @@ source: self
   shared parser (env name and error text unchanged). Added `CurrentState()` for
   the status verb. Runtime paths (`ReserveTx`, `readStateForShare`, `Mode`)
   untouched.
-- **`pkg/botevent/state.go`**: `ReadStateContext`/`Activate` delegate to the
-  framework; strict floor (`>`) semantics and sentinels preserved; `mode.go`,
-  `seq.go` untouched.
+- **`pkg/botevent`**: `state.go`'s `ReadStateContext`/`Activate` delegate to the
+  framework; strict floor (`>`) semantics and sentinels preserved. `mode.go`'s
+  guard internals moved onto `cutover.ExpectedMode` (wording unchanged); `seq.go`
+  gained `LegacySeqSweepPrefix` and a constant rename. The allocation logic —
+  `NextEventID`, the belief cache, the gate, the seed — is untouched.
 - **`app cutover <domain> {preflight,activate,status}`** (root package,
   pre-flag.Parse dispatch like `app session-rollout`): domains `msgextra` and
   `botevent`. Ships in the image — no more cross-compiling and `kubectl cp`ing
@@ -225,6 +227,63 @@ Mutation-tested rather than assumed: seeding botevent at `mode=1` fails the
 inert-deploy assertion, and removing msgextra's CHECK constraint fails with
 "no CHECK constraint pinning singleton_id = 1". Both migrations restored after.
 
+## Third review round (P1 + five P2s)
+
+Two reviewers converged on one blocker and the same P2 set at head `21e56f5a`.
+
+**P1 — the schema conformance test could not survive the harness.** Not the
+`t.Cleanup` I would have blamed: `testutil.NewTestServer` clears every table
+except `gorp_migrations` on ENTRY and only then runs ledger-gated migrations, so
+the seeded row is gone before any assertion runs, on any schema that has these
+migrations recorded. Removing the cleanup would not have helped. Verified
+against octo-lib's source rather than inferred.
+
+The reviewer offered clearing the two ledger rows as one fix; that one does not
+work here — #627's migration is `CREATE TABLE` without `IF NOT EXISTS` and a
+plain `INSERT`, so re-running it hits error 1050. Took the other direction and
+sharpened it: the inert-seed invariant is a property of the MIGRATION, not of
+the current row (an activated production database holds mode=1 legitimately), so
+it is asserted from the migration's `-- +migrate Up` section. The DDL assertions
+stay on the live schema, where they belong and are idempotent. Mutation-tested
+both ways (seed `mode=1`, seed deleted) and pinned with a regression that
+deletes the rows and re-runs the whole check.
+
+**The genseq exemption was worse than "narrow".** Rather than tightening it,
+removed the need for it: `botevent.LegacySeqSweepPrefix()` lets the operator
+command sweep the legacy rows without naming the key, so the repo-wide ban is
+unconditional again. RED/GREEN was real here — injecting the two-line
+`key := …RobotEventSeqKey…; GenSeq(key)` form passed the guard with the
+exemption and is caught at the exact line without it.
+
+**The interrupt notice could fire on a clean exit.** `signal.NotifyContext`'s
+stop cancels before detaching, so the deferred stop woke the watcher. Replaced
+with an explicit `signal.Notify` watcher gated on the signal itself. The old
+shape fails the new 500-iteration test at around iteration 15; the new one is
+structurally immune.
+
+**The interrupt comment overstated what observes the context** — three
+reviewers, independently. Threaded the deadline into the MySQL evidence reads
+(`Preflight(ctx)`, `observedMaxima` via `LoadOneContext`, botevent's
+`maxSeqByPrefix`), which are the ones that run under `FOR UPDATE`, and stated
+plainly that the Redis sweeps cannot be cancelled. New test: a cancelled
+context aborts `Preflight`.
+
+**`status` told the operator the opposite of the truth in one state.**
+`ErrStateRowMissing` covers both a missing row and a missing table, but
+msgextraseq's `FOR SHARE` reader defaults to legacy only for the row — a missing
+table fails every `message_extra` write closed. So the state where `status`
+matters most was the state where it reported "readers treat this as legacy".
+Added `StateTableExists` and made the two cases say opposite things, and
+corrected the `pkg/cutover` doc, which had promised a contract only one of its
+two domains honors.
+
+Also: post-commit cleanup failure now exits non-zero in both domains (botevent
+publishes the mirror first, then reports); the `Commit`-ack edge where a
+committed flip reports `flipped=false` is documented in the docstring and both
+runbooks' verify steps; `flip_test`'s comment about `Conn.Close()` keeping the
+pool clean was simply wrong and now asserts the round trip instead; plus exit
+130 on interrupt, `.gitignore`, and the duplicate error wrap.
+
 ## Learning
 
 Operator surfaces that live in `tools/` do not ship: the image builds only the
@@ -233,6 +292,19 @@ needed (production, private deployments). #733 learned this for
 session-rollout; this task applies it to the remaining two and records the rule
 in docs/cutover-framework.md — `tools/` is for dev-only utilities (repro
 harnesses, linters), operator surfaces mount on the server binary.
+
+From the third round: **a guard is only as strong as its weakest exemption, and
+the honest fix is usually to remove the need for the exemption rather than to
+narrow it.** Narrowing the genseq waiver from "skip the file" to "check the
+allocation shape" felt like tightening; it swapped an unconditional key-name ban
+for a line-anchored pattern the file's own header documents as insufficient.
+Giving the caller a helper so it never names the key restored the strong rule.
+The same question is worth asking of any allowlist: can the entry be deleted
+instead of qualified?
+
+And a process one: **rebasing is not pushing.** Force-pushing a rebase to a
+branch under review cost a full review round — a reviewer byte-compared blob
+hashes across both heads to establish that nothing had changed.
 
 From the second round: **a safety mechanism that only half-works can be worse
 than none.** Installing a signal handler is not the same as being

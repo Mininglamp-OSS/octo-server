@@ -25,6 +25,7 @@ package main
 // activate.
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"flag"
@@ -33,7 +34,6 @@ import (
 	"os"
 	"sort"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -85,7 +85,7 @@ func boteventRedisClient(cfg *config.Config) *rd.Client {
 func boteventCutoverPreflight(rt *cutoverRuntime, out io.Writer, sample int) error {
 	client := boteventRedisClient(rt.cfg)
 	defer client.Close()
-	ev, err := gatherBoteventEvidence(rt.ctx, client, out, sample)
+	ev, err := gatherBoteventEvidence(rt.deadline, rt.ctx, client, out, sample)
 	if err != nil {
 		return err
 	}
@@ -166,18 +166,18 @@ func (e boteventEvidence) observedMax() int64 {
 // out receives the per-queue collision diagnostics so one activation's evidence
 // lands in one place; read failures still go to stderr alongside the other
 // warnings.
-func gatherBoteventEvidence(ctx *config.Context, client *rd.Client, out io.Writer, sample int) (boteventEvidence, error) {
+func gatherBoteventEvidence(deadline context.Context, ctx *config.Context, client *rd.Client, out io.Writer, sample int) (boteventEvidence, error) {
 	var ev boteventEvidence
 
 	// Table-wide first, so the floor covers bots the queue scan cannot see at all.
 	// One query per namespace, no per-bot lookups.
-	if v, err := maxSeqByPrefix(ctx, "seq:"+common.RobotEventSeqKey); err != nil {
+	if v, err := maxSeqByPrefix(deadline, ctx, botevent.LegacySeqSweepPrefix()); err != nil {
 		fmt.Fprintf(os.Stderr, "  sweep legacy seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
 		ev.maxLegacyMinSeq = v
 	}
-	if v, err := maxSeqByPrefix(ctx, botevent.HighWaterSeqKey("")); err != nil {
+	if v, err := maxSeqByPrefix(deadline, ctx, botevent.HighWaterSeqKey("")); err != nil {
 		fmt.Fprintf(os.Stderr, "  sweep high-water seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
@@ -293,10 +293,10 @@ func scanQueueScores(fetch func(start, stop int64) ([]rd.Z, error)) (queueScoreS
 // know which bots exist, so a drained queue cannot hide one. `_` and `%` are not
 // special in either namespace (both end in `:` after a fixed identifier), so the LIKE
 // pattern needs no escaping beyond the appended wildcard.
-func maxSeqByPrefix(ctx *config.Context, prefix string) (int64, error) {
+func maxSeqByPrefix(deadline context.Context, ctx *config.Context, prefix string) (int64, error) {
 	var max sql.NullInt64
 	if _, err := ctx.DB().SelectBySql(
-		"SELECT MAX(min_seq) FROM `seq` WHERE `key` LIKE ?", prefix+"%").Load(&max); err != nil {
+		"SELECT MAX(min_seq) FROM `seq` WHERE `key` LIKE ?", prefix+"%").LoadContext(deadline, &max); err != nil {
 		return 0, err
 	}
 	if !max.Valid {
@@ -366,7 +366,7 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 	client := boteventRedisClient(rt.cfg)
 	defer client.Close()
 
-	ev, err := gatherBoteventEvidence(rt.ctx, client, out, sample)
+	ev, err := gatherBoteventEvidence(rt.deadline, rt.ctx, client, out, sample)
 	if err != nil {
 		return err
 	}
@@ -403,22 +403,29 @@ func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) erro
 	// half-done state this command exists to prevent.
 	if !flipped {
 		if err != nil {
-			return fmt.Errorf("activate: %w", err)
+			return err // botevent.Activate already prefixes its own errors
 		}
 		fmt.Fprintf(out, "already activated at epoch %d; nothing to do\n", epoch)
 		// Still reconcile the mirror. Failure is operationally incomplete even though
 		// the authority was already committed, so preserve the write pause and exit non-zero.
 		return writeMirror(client, epoch)
 	}
-	if err != nil {
-		// The row is committed; the mirror still must be published, and the
-		// operator must know the connection released badly.
-		fmt.Fprintf(os.Stderr, "note: the flip COMMITTED, but releasing the database connection failed: %v\n", err)
-	}
-	// Mirror second: the authority is committed. A failure here leaves cached negative
-	// beliefs able to use GenSeq temporarily, so it is not a successful activation.
+	// Mirror first, then report: the authority is committed either way, and a
+	// missing mirror is the more urgent of the two problems. A mirror failure
+	// leaves cached negative beliefs able to use GenSeq temporarily, so it is
+	// not a successful activation.
 	if mirrorErr := writeMirror(client, epoch); mirrorErr != nil {
 		return mirrorErr
+	}
+	if err != nil {
+		// Non-zero, matching msgextra. Today this branch is unreachable for
+		// botevent — its FlipSpec sets no LockWaitTimeoutSeconds, so the plain
+		// path's cleanup cannot fail — but that is an accident of configuration,
+		// and the two domains disagreeing about what a post-commit cleanup
+		// failure means is exactly the kind of thing a third domain would
+		// inherit at random.
+		return fmt.Errorf("the flip COMMITTED and the mirror was published, but releasing "+
+			"the database connection failed: %w", err)
 	}
 	fmt.Fprintf(out, "activated at epoch %d. Replicas switch on their next allocation.\n\n", epoch)
 	fmt.Fprintf(out, "Verify now:\n")

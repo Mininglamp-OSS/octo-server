@@ -110,6 +110,15 @@ type FlipSpec struct {
 // operator the opposite of what the database now says, and skips whatever it
 // does on success (metrics, the ACTIVATED banner). Check flipped, then err.
 //
+// The converse has one unavoidable case: if the connection drops between the
+// server committing and the client seeing the ack, Commit returns an error for
+// a flip that DID happen, and this reports flipped=false. Nothing here can tell
+// that apart from a commit that never landed. The recovery is the idempotent
+// re-run — a second activate finds the row already active, returns
+// flipped=false with no error, and the domain's post-flip steps (botevent's
+// mirror publication) still run. Both runbooks say to re-run before concluding
+// an activation failed.
+//
 // ctx bounds every statement, including acquiring the pinned connection and the
 // session SET/restore around it. innodb_lock_wait_timeout bounds lock waits, not
 // an unresponsive server, so without a deadline here an operator running the

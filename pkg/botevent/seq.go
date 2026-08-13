@@ -272,6 +272,18 @@ func QueueKey(robotID string) string { return QueueKeyPrefix + robotID }
 // high-water mark. The `seq:` prefix matches how GenSeq namespaces its own rows.
 func HighWaterSeqKey(robotID string) string { return "seq:" + HighWaterKeyPrefix + robotID }
 
+// LegacySeqSweepPrefix is the `seq` table prefix under which the retired GenSeq
+// allocator kept its rows, for the operator command that computes a cutover
+// floor by sweeping them table-wide.
+//
+// It exists so that command does not have to name common.RobotEventSeqKey
+// itself. TestNoGenSeqForBotEventIDs forbids that key everywhere outside this
+// file, and the ban is only strong while it is unconditional: an exemption for
+// a "reader" has to fall back to matching the allocation call shape, which a
+// two-line `key := …; GenSeq(key)` walks straight past. Handing out the prefix
+// keeps the reader honest and the guard absolute.
+func LegacySeqSweepPrefix() string { return "seq:" + common.RobotEventSeqKey }
+
 // seedSource raises the counter to floor if it is currently lower or unset, and
 // returns the resulting value.
 //
