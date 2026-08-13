@@ -448,9 +448,9 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, "setupDownloadButtons()"),
 		"setupDownloadButtons 必须真的被调用，只定义不调用会让按钮永远不显示")
 
-	// updater 没有版本记录时返回 204（2xx 但无 body）。断言到 204 出现即可，
-	// 不绑具体写法——换成 204 === r.status 或抽成命名函数都不该挂 CI。
-	assert.True(t, strings.Contains(body, "204"),
+	// updater 没有版本记录时返回 204（2xx 但无 body）。锚在 r.status === 204 上：
+	// 裸 "204" 子串今天不空转，但任何 SVG 坐标 / 色值 / padding 里出现 204 就会。
+	assert.True(t, strings.Contains(body, "r.status === 204"),
 		"必须处理 updater 的 204（无版本记录，响应无 body）")
 
 	// href 落地前必须过 scheme 白名单：updater 吐的是库里的裸 download_url。
@@ -460,6 +460,36 @@ func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T)
 	assert.True(t, strings.Contains(body, ".protocol"), "必须检查 scheme")
 	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
 		"只放行 http/https，挡掉 javascript: 之类的 scheme")
+
+	// 安装包地址必须是绝对的。相对地址按哪个 base 解析，本页与 Web 登录页
+	// （location.origin）无法达成一致，两端算出的地址会分叉，至多一处正确 ——
+	// 所以契约是拒绝，而不是各自猜一个 base。
+	assert.NotContains(t, body, "new URL(trimmed, API_BASE)",
+		"不得把相对安装包地址按 API_BASE 解析——与 Web 端 location.origin 的口径冲突")
+
+	// 复制必须把 execCommand 兜底挂在 writeText 的 rejection 上，而不是写成
+	// else 分支：内嵌 webview 常常暴露了 clipboard 且满足安全上下文，却拒绝
+	// writeText —— 只判能力存在会让兜底恰好在最需要它的环境里永不执行。
+	assert.True(t, strings.Contains(body, "writeText(text).catch("),
+		"Clipboard API 被拒时必须继续走 execCommand 兜底，不能只判能力是否存在")
+
+	// 安装包地址必须带文件后缀。download_url 由管理台自由填写，填成一个下载引导页
+	// 时「下载 Android 版」会把用户送到网页而不是安装包 —— 按钮承诺的动作没发生。
+	assert.True(t, strings.Contains(body, "lastSegment.indexOf(\".\")"),
+		"无文件后缀的地址不是安装包，必须剔除并退到 web_url 兜底")
+
+	// 两个平台都拿不出安装包时（都 204 / updater 5xx / 网络失败 / 地址非法），
+	// 页面不能只剩一张卡片加一片空白 —— 用户无从判断是没 App 可下还是页面坏了。
+	assert.True(t, strings.Contains(body, "/v1/common/appconfig"),
+		"兜底入口地址必须取自公开的 appconfig.web_url")
+	assert.True(t, strings.Contains(body, "setupWebFallback"),
+		"必须有 web_url 兜底路径")
+	assert.True(t, strings.Contains(body, "d.web_url"),
+		"兜底必须读 appconfig 的 web_url 字段")
+	fallbackRow := regexp.MustCompile(`<div[^>]*id="row-web-fallback"[^>]*>`).FindString(body)
+	assert.NotEmpty(t, fallbackRow, "落地页必须有 web_url 兜底行")
+	assert.Contains(t, fallbackRow, `style="display:none"`,
+		"兜底行必须默认隐藏——只在两个平台都无安装包时才出现")
 
 	// 两个平台各一行（下载按钮 + 复制链接），整行默认隐藏：无安装包 / 解析失败都不该
 	// 露出一个点不动的入口。用正则匹配整个标签，属性顺序、新增 class 之类的排版改动
@@ -530,10 +560,11 @@ func TestGroupInvitePage_UpdaterRoutesAreServed(t *testing.T) {
 	} {
 		w := httptest.NewRecorder()
 		s.GetRoute().ServeHTTP(w, newInviteRequest(t, path))
-		// 库里没有版本记录时返回 204，有则 200；唯独不能是 404 —— 那意味着落地页
-		// 硬编码的路径已经和实际路由表对不上了。
-		assert.NotEqual(t, http.StatusNotFound, w.Code,
-			"落地页硬编码的 updater 路径 %s 必须能被服务端路由到", path)
+		// 库里没有版本记录时返回 204，有则 200 —— 只接受这两个。
+		// 仅排除 404 是不够的：401 / 500 同样会让落地页拿不到地址，而 401 恰好是
+		// 「有人给这条公开路由加了鉴权」的信号，那对未登录访客等同于路由消失。
+		assert.Contains(t, []int{http.StatusOK, http.StatusNoContent}, w.Code,
+			"落地页硬编码的 updater 路径 %s 必须可路由且保持公开（期望 200/204，实得 %d）", path, w.Code)
 	}
 }
 

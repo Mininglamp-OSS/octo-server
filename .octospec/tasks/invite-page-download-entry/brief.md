@@ -38,9 +38,14 @@ so no new configuration is required:
 the updater endpoint (`common/updater/android/1.0`, `common/updater/ios/1.0.0`).
 The invite page was simply never wired to it.
 
-Deliberately **not** used: `appconfig.web_url`. With both platform buttons
-rendering everywhere, there is no case left that needs a "go to the web app"
-fallback.
+`appconfig.web_url` is used as a last resort, but only when **neither** platform
+yields a usable installer. That case is reachable in practice — both platforms
+lacking a version record, the updater returning 5xx, the network failing, or every
+address failing validation — and without a fallback the page renders a group card
+above an unexplained blank, with the invite-detail request succeeding so nothing
+looks wrong. An earlier revision ruled `web_url` out on the grounds that both
+buttons render everywhere; that reasoning assumed at least one row resolves, which
+is exactly the assumption this case violates.
 
 Prior art constraining the design: `octo-server#1246` removed the `dmwork://`
 deep link because neither mobile client registers the scheme; a grep test pins
@@ -86,7 +91,19 @@ that. No "open in app" button may be reintroduced.
       itself as Macintosh, so a wrong guess hands over the wrong platform's installer.
 - [x] A platform with no version record (updater 204), a malformed address, or a
       failed request hides only its own row. Nothing falls back to `API_BASE`.
-- [x] The address passes a scheme allowlist (http/https) before reaching `a.href`.
+- [x] Installer addresses must be absolute http/https **and carry a file suffix**.
+      Relative values are rejected rather than resolved: this page and the web login
+      page would resolve them against different bases (`API_BASE` vs
+      `location.origin`), so at most one could be right. A suffix-less address is a
+      landing page, not a package — a download button that opens a web page is the
+      same broken promise this task exists to remove.
+- [x] When neither platform yields an installer, fall back to `appconfig.web_url`
+      (absolute http/https, no suffix requirement — a portal is not a package).
+      If that is unavailable too, still show nothing; never `API_BASE`.
+- [x] Copying chains the `execCommand` fallback onto a **rejected** `writeText`,
+      not merely onto the Clipboard API being absent. Embedded IM webviews commonly
+      expose `navigator.clipboard` under HTTPS and then deny the write, which is
+      precisely the environment the fallback exists for.
 - [x] Zero external resources: no CDN script, external stylesheet, `@import`,
       `url(http…)` or remote image; icons are inline SVG
       (`TestGroupInvitePage_NoExternalResources`).
