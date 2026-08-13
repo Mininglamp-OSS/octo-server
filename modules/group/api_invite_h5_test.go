@@ -395,6 +395,54 @@ func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
 	assert.True(t, strings.Contains(body, "/scanjoin"))
 }
 
+// 「下载 App」按钮曾经把 href 直接设成注入的 API_BASE，而生产的 External.BaseURL
+// 就是 API 前缀（https://<host>/api），点击必然 404 —— 邀请页上唯一的下载入口是死链。
+//
+// 修法是改用公开免登录的 updater 接口拿真实安装包地址（与 Web 登录页下载浮层同源），
+// 拿不到就保持按钮隐藏。这个测试断言的是**最终 href 的来源**，而不是「占位符已被替换」——
+// 后者在旧实现下同样成立，正是它让这个 bug 一路漏到线上。
+func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	wd, err := os.Getwd()
+	assert.NoError(t, err)
+	if err := os.Chdir("../.."); err != nil {
+		t.Fatalf("chdir to repo root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite?code=download-url-check"))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+
+	// 回归钉子：任何把按钮 href 直接绑到 API_BASE 的写法都必须挂 CI。
+	assert.NotContains(t, body, `getElementById("btn-download").href = API_BASE`,
+		"下载按钮不能回退到 API_BASE —— 生产的 BaseURL 是 API 前缀，点击会 404")
+
+	// 安装包地址必须来自公开的 updater 接口，两个平台都要覆盖。
+	assert.True(t, strings.Contains(body, "/v1/common/updater/android/1.0"),
+		"Android 安装包地址必须来自公开 updater 接口")
+	assert.True(t, strings.Contains(body, "/v1/common/updater/ios/1.0.0"),
+		"iOS 安装包地址必须来自公开 updater 接口")
+
+	// updater 在库里没有版本记录时返回 204 且无 body，直接 .json() 会抛异常。
+	assert.True(t, strings.Contains(body, "r.status === 204"),
+		"必须特判 updater 的 204（无版本记录，响应无 body）")
+
+	// href 落地前必须过 scheme 白名单：updater 吐的是库里的裸 download_url。
+	assert.True(t, strings.Contains(body, "safeDownloadURL"),
+		"updater 返回的地址必须经过 scheme 校验后才能写进 a.href")
+	assert.True(t, strings.Contains(body, `u.protocol === "http:" || u.protocol === "https:"`),
+		"只放行 http/https，挡掉 javascript: 之类的 scheme")
+
+	// 按钮默认隐藏：桌面端 / 无安装包 / 解析失败都不该露出一个点不动的入口。
+	assert.True(t, strings.Contains(body, `id="btn-download" href="#" target="_blank" rel="noopener" style="display:none"`),
+		"下载按钮必须默认隐藏，解析到合法地址后才显示")
+}
+
 // Mininglamp-OSS/octo-server#1246: 移动端两端均未注册 dmwork:// scheme，
 // H5 落地页上的「打开 App」深链按钮是死链，点击会弹错 / 被微信 block。
 // 方案 C 是最小改动——删按钮 + 删绑定 href 的 JS，所以用 grep 测试把

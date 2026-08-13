@@ -66,7 +66,7 @@
             </div>
             <div class="btn-group">
                 <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
-                <a class="btn btn-secondary" id="btn-download" href="#" target="_blank" rel="noopener">下载 App</a>
+                <a class="btn btn-secondary" id="btn-download" href="#" target="_blank" rel="noopener" style="display:none">下载 App</a>
             </div>
         </div>
 
@@ -198,6 +198,61 @@ function findTokenAndSid() {
     return { token: "", sid: "" };
 }
 
+// 「下载 App」的安装包地址来自公开免登录的 updater 接口，与 Web 登录页的下载浮层
+// 同一个数据源（dmworklogin/AndroidDownloadButton.tsx / IOSDownloadButton.tsx 用的
+// 就是这两条路径）。版本号是「足够老」的哨兵值，让 updater 永远判定有新版可下。
+//
+// 历史实现把按钮 href 直接设成 API_BASE，注释写的是「回退到产品官网」，但注入的
+// External.BaseURL 在生产就是 API 前缀（.../api），点击必然落到 404 —— 语义和实现
+// 不一致。这里改为解析真实安装包地址；解析不出来就隐藏按钮，绝不回退到 API_BASE：
+// 没有入口好过一个死链。
+var ANDROID_UPDATER_PATH = "/v1/common/updater/android/1.0";
+var IOS_UPDATER_PATH = "/v1/common/updater/ios/1.0.0";
+
+function detectMobileOS() {
+    var ua = navigator.userAgent || "";
+    if (/android/i.test(ua)) return "android";
+    // iPadOS 13+ 的 UA 伪装成 Macintosh，靠 maxTouchPoints 才能区分出触屏 iPad。
+    if (/iPad|iPhone|iPod/.test(ua)) return "ios";
+    if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return "ios";
+    return "";
+}
+
+// safeDownloadURL 收口 updater 返回的地址：只放行 http/https。updater 直接吐库里的
+// 裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 / 相对 / 畸形，而这个值
+// 最终要塞进 a.href —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
+// 相对地址按 API_BASE 解析，与 Web 端 resolveSafeDownloadUrl 保持同策略。
+function safeDownloadURL(value) {
+    if (typeof value !== "string") return "";
+    var trimmed = value.trim();
+    if (!trimmed) return "";
+    try {
+        var u = new URL(trimmed, API_BASE);
+        if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
+    } catch (e) { /* 畸形地址一律按解析失败处理 */ }
+    return "";
+}
+
+// setupDownloadButton 按 UA 取当前平台的安装包地址并显示按钮。
+// 桌面端（无移动安装包可给）、updater 返回 204（库里没有该平台的版本记录，
+// 且响应无 body 不能 .json()）、地址非法、网络失败 —— 一律保持按钮隐藏。
+function setupDownloadButton() {
+    var btn = document.getElementById("btn-download");
+    if (!btn) return;
+    var os = detectMobileOS();
+    if (!os) return;
+    var path = os === "android" ? ANDROID_UPDATER_PATH : IOS_UPDATER_PATH;
+    fetch(API_BASE + path).then(function (r) {
+        if (r.status === 204 || !r.ok) return null;
+        return r.json().catch(function () { return null; });
+    }).then(function (d) {
+        var url = safeDownloadURL(d && d.url);
+        if (!url) return;
+        btn.href = url;
+        btn.style.display = "flex";
+    }).catch(function () { /* 网络异常：按钮保持隐藏 */ });
+}
+
 function renderInfo(data) {
     document.getElementById("v-name").textContent = data.group_name || "群聊";
     if (typeof data.member_count === "number") {
@@ -222,8 +277,7 @@ function renderInfo(data) {
         tip.textContent = "该群已开启邀请确认，请在 App 内由管理员审批后入群。";
         tip.style.display = "block";
     }
-    // 「下载 App」回退到产品官网（无独立配置时复用 BaseURL）
-    document.getElementById("btn-download").href = API_BASE;
+    setupDownloadButton();
 
     // Web 已登录 & 群可直接入群 → 显示「加入群聊」按钮
     // invite_required 场景仍交由 App 内审批，不在落地页直接入群
