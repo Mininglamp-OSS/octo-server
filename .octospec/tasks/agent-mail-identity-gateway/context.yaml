@@ -1,0 +1,31 @@
+brief: .octospec/tasks/agent-mail-identity-gateway/brief.md
+injected:
+  - id: space-isolation
+    source: repo
+    reason: "The gateway handles user mailbox data and must bind every request to an authenticated UID and validated Space."
+  - id: trust-boundary
+    source: repo
+    reason: "The browser proxy replaces caller credentials with a request-bound identity assertion at the OCTO/octo-mail boundary."
+  - id: error-handling
+    source: repo
+    reason: "The new authenticated API must preserve the localized OCTO error envelope."
+  - id: rate-limit
+    source: repo
+    reason: "The authenticated proxy route must use the shared per-UID limiter."
+  - id: testing
+    source: repo
+    reason: "Identity and proxy trust-boundary changes require negative tests."
+  - id: commit-style
+    source: repo
+    reason: "Repository convention; no commit is created in this local phase."
+files_expected:
+  - modules/agentmailgateway/**
+  - internal/modules.go
+  - pkg/errcode/agent_mail_gateway.go
+  - pkg/i18n/response_writer.go
+  - pkg/i18n/locales/active.zh-CN.toml
+  - pkg/metrics/http.go
+  - tools/i18nmarkers/server/active.en-US.toml
+  - .octospec/journal/shared/agent-mail-identity-gateway.md
+  - .octospec/tasks/agent-mail-identity-gateway/verification.md
+updated_at: 2026-08-13T06:34:59Z

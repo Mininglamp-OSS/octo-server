@@ -6,6 +6,24 @@
 #
 # CI rejects PRs that change codes.Register input without re-running extract.
 
+["err.server.agent_mail_gateway.bad_response"]
+other = "Agent Mail returned an invalid response."
+
+["err.server.agent_mail_gateway.payload_too_large"]
+other = "The Agent Mail request is too large."
+
+["err.server.agent_mail_gateway.request_invalid"]
+other = "Invalid Agent Mail request."
+
+["err.server.agent_mail_gateway.space_required"]
+other = "Select a Space before opening Agent Mail."
+
+["err.server.agent_mail_gateway.unauthorized"]
+other = "Authentication is required."
+
+["err.server.agent_mail_gateway.unavailable"]
+other = "Agent Mail is temporarily unavailable."
+
 ["err.server.app_bot.id_conflict"]
 other = "The bot id is already in use."
 
