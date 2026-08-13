@@ -44,7 +44,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/go-sql-driver/mysql"
-	"github.com/spf13/viper"
 )
 
 const cutoverCommand = "cutover"
@@ -152,10 +151,26 @@ func runCutoverCommand(args []string, out io.Writer) error {
 	// that open their own Redis connection print its endpoint the same way.
 	fmt.Fprintf(os.Stderr, "mysql: %s\n", redactedMySQLEndpoint(cfg.DB.MySQLAddr))
 
-	// Operator interrupts abort the DB work instead of leaving the command
-	// wedged against an unresponsive server mid-procedure.
+	// Interrupt handling is two-stage, and it has to be: installing a handler at
+	// all disables default termination for the whole command, but not every
+	// phase can observe a context. The flip's statements can (Flip threads it),
+	// and so can the MySQL evidence reads — the Redis SCAN/HSCAN sweep cannot,
+	// because go-redis v6 has no per-command context.
+	//
+	// So the first signal cancels what is cancellable, and immediately restores
+	// default handling so a SECOND Ctrl-C terminates a scan that is not. Without
+	// that second stage, an operator who interrupts during a large keyspace scan
+	// — which for msgextra runs while the state row is held FOR UPDATE and every
+	// writer is blocked — would find the command ignoring every Ctrl-C and would
+	// have to go find the pod and SIGKILL it, with writes drained.
 	deadline, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-deadline.Done()
+		stop()
+		fmt.Fprintln(os.Stderr, "\ninterrupt received: cancelling what can be cancelled; "+
+			"press Ctrl-C again to terminate (an in-flight Redis scan cannot be interrupted)")
+	}()
 
 	rt := &cutoverRuntime{
 		cfg:      cfg,
@@ -191,9 +206,9 @@ func redactedMySQLEndpoint(dsn string) string {
 	if err != nil {
 		return "(unparseable DSN; endpoint hidden to avoid leaking credentials)"
 	}
-	if cfg.Addr == "" {
-		return cfg.DBName
-	}
+	// ParseDSN normalizes before returning, so a successful parse always carries
+	// an Addr (the tcp/unix default when the DSN omits one) — no empty-Addr case
+	// to handle here.
 	return cfg.Addr + "/" + cfg.DBName
 }
 
@@ -215,17 +230,12 @@ func fprintRedisEndpoint(cfg *config.Config) {
 }
 
 // loadCutoverConfig resolves the config file plus the same TS_* environment
-// overrides the server applies, returning an error instead of panicking so a
-// bad path is an exit-1 message, not a stack trace.
+// overrides the server applies.
 func loadCutoverConfig(path string) (*config.Config, error) {
-	vp := viper.New()
-	vp.SetConfigFile(path)
-	if err := vp.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
+	vp, err := operatorConfigViper(path)
+	if err != nil {
+		return nil, err
 	}
-	vp.SetEnvPrefix("TS")
-	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	vp.AutomaticEnv()
 	cfg := config.New()
 	cfg.ConfigureWithViper(vp)
 	return cfg, nil
@@ -261,11 +271,24 @@ func fprintCutoverGuard(out io.Writer, envName string, values map[string]int, mo
 
 // cutoverModeName renders a mode using a domain's own spelling table, so the
 // display name and the guard's accepted values cannot drift apart.
+//
+// The match is the lexicographically smallest spelling rather than the first
+// one map iteration happens to yield: ParseExpectedMode accepts aliases (two
+// spellings mapping to one mode is legal), and with Go's randomized map order
+// an aliased domain would print a different name on successive runs of the same
+// status command.
 func cutoverModeName(spellings map[string]int, mode int) string {
+	best := ""
 	for name, value := range spellings {
-		if value == mode {
-			return name
+		if value != mode {
+			continue
+		}
+		if best == "" || name < best {
+			best = name
 		}
 	}
-	return fmt.Sprintf("unknown(%d)", mode)
+	if best == "" {
+		return fmt.Sprintf("unknown(%d)", mode)
+	}
+	return best
 }

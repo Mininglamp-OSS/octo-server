@@ -47,6 +47,7 @@ import (
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
+	"github.com/spf13/viper"
 )
 
 const sessionRolloutCommand = "session-rollout"
@@ -279,11 +280,33 @@ func sessionRolloutDB(cfg *config.Config) *dbr.Session {
 	)
 }
 
-func loadSessionRolloutConfig(path string) (*config.Config, error) {
-	vp := loadConfigFromFile(path)
+// operatorConfigViper resolves an operator subcommand's config file plus the
+// same TS_* environment overrides the server applies.
+//
+// Shared by `app session-rollout` and `app cutover` so the rules for how a
+// config path and its env overrides are resolved have one definition: two
+// copies means a change (a new override, a required post-load validation)
+// silently lands on one operator command and not the other.
+//
+// It returns an error where the server's own loader panics: an operator typo in
+// -config should be a one-line message, not a stack trace.
+func operatorConfigViper(path string) (*viper.Viper, error) {
+	vp := viper.New()
+	vp.SetConfigFile(path)
+	if err := vp.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
 	vp.SetEnvPrefix("TS")
 	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	vp.AutomaticEnv()
+	return vp, nil
+}
+
+func loadSessionRolloutConfig(path string) (*config.Config, error) {
+	vp, err := operatorConfigViper(path)
+	if err != nil {
+		return nil, err
+	}
 	tokenExpire, err := validateTokenExpireConfig(vp)
 	if err != nil {
 		return nil, err

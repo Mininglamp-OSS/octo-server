@@ -37,13 +37,19 @@ import (
 )
 
 // Allocator modes, mirroring octo_message_extra_version_state.mode.
+//
+// Aliases of the shared constants rather than independent literals: cutover.Flip
+// is what writes this column (`SET mode=cutover.ModeActive`), so declaring 0/1
+// separately here would let the two drift. If they ever did, a flip would
+// succeed and then readStateForShare — comparing against these — would see a
+// mode matching neither and fail every message_extra write closed.
 const (
-	ModeLegacy        = 0
-	ModeTransactional = 1
+	ModeLegacy        = cutover.ModeInactive
+	ModeTransactional = cutover.ModeActive
 )
 
 // stateSingletonID is the fixed primary key of the single allocator-state row.
-const stateSingletonID = 1
+const stateSingletonID = cutover.SingletonID
 
 // stateTable is the DB-authoritative allocator-state table (pkg/cutover shape:
 // singleton_id / mode / epoch / cutover_floor).
@@ -227,7 +233,7 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 		CutoverFloor int64  `db:"cutover_floor"`
 	}
 	err := tx.SelectBySql(
-		"SELECT `mode`, `epoch`, `cutover_floor` FROM `octo_message_extra_version_state` WHERE `singleton_id`=? FOR SHARE",
+		"SELECT `mode`, `epoch`, `cutover_floor` FROM `"+stateTable+"` WHERE `singleton_id`=? FOR SHARE",
 		stateSingletonID,
 	).LoadOne(&row)
 	metricStateLockWaitSeconds.Observe(time.Since(lockStart).Seconds())

@@ -146,7 +146,15 @@ succeeds while the allocator has never been activated.
 ## Notes
 
 - The command connects to MySQL and Redis via the normal DB config, and prints
-  both endpoints it resolved before doing anything.
+  both endpoints it resolved before doing anything. The MySQL line is
+  host:port/schema — the DSN's credential is deliberately not echoed.
+- `status` reports the expected-mode guard from **the environment of the process
+  running the command**, not the fleet's. Confirm the fleet's guard where it is
+  set.
+- Interrupting is two-stage: the first Ctrl-C / SIGTERM cancels the cancellable
+  database work, and a second terminates the command (an in-flight Redis queue
+  scan takes no per-command deadline). Interrupting `activate` before the flip
+  commits leaves nothing behind; re-run `preflight` before retrying.
 - The flip primitives live in `pkg/cutover` (shared with #627); the state row
   and allocator semantics live in `pkg/botevent` (`state.go`, `seq.go`,
   `mode.go`); the evidence gathering and mirror judgement live in

@@ -1146,6 +1146,17 @@ func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
 		t.Fatalf("expected ErrFloorTooLow for floor < observed max, got %v", err)
 	}
 
+	// The upper bound is enforced by the domain, not only by the operator
+	// command: above 2^53 int64 ids stop having distinct float64 sorted-set
+	// scores, which is the defect #697 removes. Any caller must be refused, not
+	// just the one CLI that remembers to check.
+	if _, _, err := Activate(context.Background(), ctx, MaxCutoverFloor+1, 5000); !errors.Is(err, ErrFloorTooHigh) {
+		t.Fatalf("expected ErrFloorTooHigh above MaxCutoverFloor, got %v", err)
+	}
+	if st, _ := ReadState(ctx); st.Activated() {
+		t.Fatal("a refused floor must not have flipped the allocator")
+	}
+
 	flipped, epoch, err := Activate(context.Background(), ctx, 7001, 5000)
 	if err != nil || !flipped {
 		t.Fatalf("activate: flipped=%v epoch=%d err=%v", flipped, epoch, err)

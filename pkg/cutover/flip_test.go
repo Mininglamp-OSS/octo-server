@@ -53,6 +53,15 @@ func setupDB(t *testing.T) *dbr.Session {
 	if _, err := db.UpdateBySql("DELETE FROM `" + testStateTable + "`").Exec(); err != nil {
 		t.Fatalf("clean state table: %v", err)
 	}
+	// Drop the scratch table when the test finishes rather than leaving it in
+	// the shared `test` schema: a leftover table is one more thing a concurrent
+	// package's CleanAllTables sweeps, and it would otherwise persist with the
+	// last test's mode still set.
+	t.Cleanup(func() {
+		if _, err := db.UpdateBySql("DROP TABLE IF EXISTS `" + testStateTable + "`").Exec(); err != nil {
+			t.Logf("drop scratch state table: %v", err)
+		}
+	})
 	return db
 }
 

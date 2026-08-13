@@ -136,6 +136,56 @@ load-bearing — unknown domain/action rejected before the config is read,
 positional args, `-h`, every registered domain fully wired, plus the redaction
 and guard-scope assertions.
 
+## Second review round (12 more findings, all fixed)
+
+The headline is a **regression introduced by the previous round's own fix**. To
+make a wedged activation abortable, that round added
+`signal.NotifyContext(...)` — which disables default SIGINT/SIGTERM termination
+for the whole command. But the evidence phases cannot observe a context
+(go-redis v6 has no per-command deadline, and the MySQL aggregates were
+context-free), so Ctrl-C neither aborted the work nor killed the process: the
+command became strictly *less* interruptible than the standalone tools it
+replaced, precisely while msgextra holds the state row `FOR UPDATE` and blocks
+every writer. The runbook had been updated to promise the opposite.
+
+Interrupts are now two-stage: the first signal cancels what is cancellable and
+immediately calls `stop()` to restore default handling, so a second Ctrl-C
+terminates a scan that cannot be cancelled. Verified end-to-end against a TCP
+listener that accepts and never responds — the command hangs, one SIGINT
+produces `context canceled` and exit, and the notice prints (which is itself
+proof `stop()` ran). Both runbooks now describe the real behavior.
+
+Also fixed:
+
+- `closeFlipConnection(discard=true)` reported a fabricated close failure every
+  time: `conn.Raw` returning `driver.ErrBadConn` closes the Conn as a side
+  effect, so the following `Close()` always returns `sql.ErrConnDone`. Verified
+  against a live MySQL before changing it. That noise was being appended to the
+  half-done-cutover message, the one an operator must read correctly.
+- The `BeginTx`-failure path restored the session timeout on the caller's
+  (usually just-cancelled) context — the hazard `cleanup()` had been fixed for.
+  Both now share `restoreDetached`.
+- `botevent.Activate` did not pass `MaxFloor`, leaving the 2^50 float64-score
+  ceiling enforced only in the CLI. The bound moved to
+  `botevent.MaxCutoverFloor` (it is a property of how ids are stored, not of how
+  the flip is invoked) and is enforced inside `Activate`, with a test.
+- `msgextraseq.ModeLegacy/ModeTransactional` were independent literals while
+  `cutover.Flip` writes `cutover.ModeActive`; they are now aliases, as botevent
+  already had. Renumbering the shared constants can no longer flip successfully
+  and then fail every write closed.
+- The hot path's `FOR SHARE` read still inlined the table name and its own
+  singleton const; both now come from `stateTable` / `cutover.SingletonID` (same
+  SQL text).
+- `cutoverModeName` picked a name by map iteration — nondeterministic the moment
+  a domain adds an alias, which `ParseExpectedMode` supports. Now deterministic.
+- Dead `cfg.Addr == ""` branch removed from the redaction helper (`ParseDSN`
+  normalizes, verified empirically).
+- `loadCutoverConfig` and `loadSessionRolloutConfig` now share
+  `operatorConfigViper`.
+- Test hygiene: the scratch state table is dropped in `t.Cleanup`; the guard
+  test clears the env var it asserts on instead of trusting the ambient
+  environment; the framework doc's `Flip` signature updated.
+
 ## Learning
 
 Operator surfaces that live in `tools/` do not ship: the image builds only the
@@ -145,8 +195,17 @@ session-rollout; this task applies it to the remaining two and records the rule
 in docs/cutover-framework.md — `tools/` is for dev-only utilities (repro
 harnesses, linters), operator surfaces mount on the server binary.
 
-A second, sharper one from the review: **copying a precedent copies its shape,
-not its safety.** The endpoint print, the `flag.ContinueOnError` setup and the
+From the second round: **a safety mechanism that only half-works can be worse
+than none.** Installing a signal handler is not the same as being
+interruptible — it *takes over* termination, so unless every phase honors the
+context it hands out, it converts "Ctrl-C kills this" into "nothing kills this".
+Before adding one, enumerate the phases that cannot observe a context and decide
+what happens to them; here that answer had to be a second stage. The same shape
+applies to any capability that replaces a default: check what the default was
+doing for you first.
+
+A second, sharper one from the first review round: **copying a precedent copies
+its shape, not its safety.** The endpoint print, the `flag.ContinueOnError` setup and the
 "validate the subcommand before dialing" ordering all came from
 `session_rollout_cmd.go` — but the credential-free data source, the
 `SetOutput(io.Discard)` line, and the tests pinning the guards did not come with

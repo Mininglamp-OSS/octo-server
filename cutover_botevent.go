@@ -350,14 +350,11 @@ func reportBoteventEvidence(ctx *config.Context, out io.Writer, ev boteventEvide
 	return recommended, nil
 }
 
-// maxSafeFloor is the highest cutover floor this command will accept.
-//
-// Sorted-set scores are float64, so above 2^53 distinct int64 ids stop having distinct
-// scores — which recreates the pagination skip and the multi-member ack this whole
-// change removes, from the one command meant to prevent them (review P2-3). 2^50 leaves
-// three orders of magnitude of headroom above any plausible id and is still nowhere
-// near the precision boundary.
-const maxSafeFloor = 1 << 50
+// maxSafeFloor is the highest cutover floor this command will accept. The bound
+// itself lives in the domain (botevent.MaxCutoverFloor) and is enforced inside
+// Activate as well, so a caller that is not this command is bounded too; the
+// check here exists to refuse before gathering evidence and to say why.
+const maxSafeFloor = botevent.MaxCutoverFloor
 
 func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) error {
 	// -yes confirms these conditions; it must not hide them from the audit log.

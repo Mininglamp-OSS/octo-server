@@ -143,6 +143,10 @@ func TestCutoverGuardReadoutIsScopedToThisProcess(t *testing.T) {
 	spellings := msgextraseq.ExpectedModeSpellings()
 	env := msgextraseq.ExpectedModeEnv
 
+	// Clear it explicitly: this reads the ambient environment, and a runner
+	// that exports the guard (a replica shell, a container mirroring prod)
+	// would otherwise fail the unset case for the wrong reason.
+	t.Setenv(env, "")
 	var unset bytes.Buffer
 	fprintCutoverGuard(&unset, env, spellings, msgextraModeName)
 	require.Contains(t, unset.String(), "this process")

@@ -210,8 +210,12 @@ above them.
   process running the command**, which is not the fleet's unless you are on a
   replica. Confirm the fleet's guard where it is actually set (deployment
   manifest / a replica's env), not from a laptop run.
-- Interrupting the command (Ctrl-C / SIGTERM) aborts the database work rather
-  than leaving it wedged against an unresponsive server mid-procedure.
+- Interrupting the command is two-stage. The first Ctrl-C / SIGTERM cancels the
+  database work — including a flip waiting on an unresponsive server — and says
+  so. It cannot cancel an in-flight Redis SCAN (the client library takes no
+  per-command deadline), so a **second** Ctrl-C terminates the command outright.
+  If you interrupt during `activate`, re-run `preflight` before retrying: an
+  aborted flip commits nothing, but the evidence you were shown is stale.
 - All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
   on the shared `pkg/cutover` flip primitives) and is covered by
   `activation_test.go` against live MySQL; the command here is a thin wrapper.

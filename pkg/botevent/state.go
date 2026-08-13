@@ -64,9 +64,25 @@ const (
 	StateModeIncr = cutover.ModeActive
 )
 
+// MaxCutoverFloor is the highest floor this allocator may be activated with.
+//
+// Queue membership is a Redis sorted set, whose scores are float64: above 2^53
+// distinct int64 ids stop having distinct scores, which recreates the pagination
+// skip and multi-member ack #697 exists to remove. 2^50 leaves three orders of
+// magnitude above any plausible id and is still nowhere near the boundary.
+//
+// It lives here, not in the operator command, because it is a property of how
+// ids are stored rather than of how the flip is invoked: Activate passes it to
+// the shared primitive so any caller — a future admin path, a recovery script,
+// a test helper — is bounded by it, not just the one CLI that remembers to ask.
+const MaxCutoverFloor int64 = 1 << 50
+
 // ErrFloorTooLow mirrors msgextraseq: a cutover floor at or below what has already
 // been issued would let post-activation ids land under a live consumer cursor.
 var ErrFloorTooLow = errors.New("botevent: cutover floor is below the observed maximum")
+
+// ErrFloorTooHigh is returned when the requested floor exceeds MaxCutoverFloor.
+var ErrFloorTooHigh = errors.New("botevent: cutover floor exceeds the float64-distinct score ceiling")
 
 // ErrStateMissing means the migration has not run. Treated as legacy by readers so
 // a pre-migration deploy behaves like the old binary, and as a hard error by the
@@ -137,6 +153,7 @@ func Activate(deadline context.Context, ctx *config.Context, floor, observedMax 
 	flipped, epoch, err := cutover.Flip(deadline, ctx.DB(), cutover.FlipSpec{
 		Table:                   stateTable,
 		Floor:                   floor,
+		MaxFloor:                MaxCutoverFloor,
 		FloorMustExceedObserved: true,
 		Observe:                 func(*dbr.Tx) (int64, error) { return observedMax, nil },
 	})
@@ -152,6 +169,8 @@ func Activate(deadline context.Context, ctx *config.Context, floor, observedMax 
 		switch {
 		case errors.Is(err, cutover.ErrStateMissing):
 			return false, 0, ErrStateMissing
+		case errors.As(err, &floorErr) && floorErr.TooHigh:
+			return false, 0, fmt.Errorf("%w: floor=%d max=%d", ErrFloorTooHigh, floorErr.Floor, floorErr.Max)
 		case errors.As(err, &floorErr):
 			return false, 0, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floorErr.Floor, floorErr.Observed)
 		default:

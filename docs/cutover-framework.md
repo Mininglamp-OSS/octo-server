@@ -36,7 +36,7 @@ cutover 是 **fail-closed、单向、带水位校验**的数据面迁移：切�
   把它当作 pre-cutover 的 legacy 默认值，operator 翻转则拒绝执行。它必须与
   "权威不可达"（其它错误原样上抛）区分开——cutover 之后这两种情况的安全答案
   相反。
-- `Flip(db, FlipSpec)` — 单向 CAS 翻转：`FOR UPDATE` 锁单例行 → 已激活则幂等
+- `Flip(ctx, db, FlipSpec)` — 单向 CAS 翻转：`FOR UPDATE` 锁单例行 → 已激活则幂等
   返回 → 锁内重算证据（可选闭包）→ floor 上下界校验 → mode 条件 UPDATE +
   affected==1 不变量 → epoch+1。可选 pinned-connection 的会话级
   `innodb_lock_wait_timeout`（fail-fast 后备，恢复失败则弃连不入池）。
@@ -57,6 +57,11 @@ cutover 是 **fail-closed、单向、带水位校验**的数据面迁移：切�
   - **guard 读的是本进程 env，措辞必须说清楚**：guard 是进程本地配置，控制面无法
     远程观测，而 runbook 明确允许在跳板机上跑这些命令——不加限定词就会在已武装的
     机群上打出 "unset"，把最关键的安全网报成关闭。
+  - **中断要两阶段**：装了信号 handler 就等于关闭了默认终止行为，而证据阶段
+    （go-redis v6 的 SCAN 没有 per-command context）根本观测不到 ctx。所以第一次
+    信号取消能取消的（flip 的 DB 语句），并**立刻恢复默认处理**，让第二次 Ctrl-C
+    能终止取消不掉的扫描。只做第一阶段会让命令比它取代的旧工具更难中断——而
+    msgextra 的证据扫描是在状态行 `FOR UPDATE` 持锁、所有写入被挡住的窗口里跑的。
 
 **留在各域的**：floor 证据从哪些来源算、翻转前后的域特定步骤（#697 的 mirror
 判定与发布）、以及全部运行时读路径（#627 的 FOR SHARE + ReserveTx、#697 的

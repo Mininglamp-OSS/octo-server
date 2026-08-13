@@ -27,6 +27,13 @@ change-log convention (§7). Newest first.
   connection failed; msgextra never named the Redis instance whose scan sets its
   cutover floor; and `msgextra status` hard-failed on a missing state row,
   hiding the guard readout in exactly the state that fails every write closed.
+  A second review round fixed twelve more, led by a regression from the first
+  round's own fix: the signal handler added to make a wedged activation
+  abortable had disabled default termination while no evidence phase could
+  observe the context, so the command ignored every Ctrl-C. Interrupts are now
+  two-stage (cancel, then restore default handling so a second signal
+  terminates), the botevent score ceiling moved into the domain, and the
+  msgextra mode constants alias the shared ones rather than restating them.
   See [journal](journal/shared/cutover-framework.md).
 
 ## 2026-08-12 (profile-visibility-system-bot-whitelist)

@@ -237,7 +237,11 @@ func beginFlipTx(ctx context.Context, db *dbr.Session, lockWaitSeconds int) (*fl
 	}
 	sqlTx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		restoreErr := restoreLockWaitTimeout(ctx, conn, previous)
+		// Detached like cleanup's restore, and for the same reason: the most
+		// likely way to arrive here is ctx being cancelled or expiring, and
+		// restoring on that dead context would discard a connection a fresh
+		// two-second attempt returns to the pool cleanly.
+		restoreErr := restoreDetached(ctx, conn, previous)
 		closeErr := closeFlipConnection(conn, restoreErr != nil)
 		return nil, nil, errors.Join(err, restoreErr, closeErr)
 	}
@@ -274,16 +278,22 @@ func (f *flipTx) cleanup() error {
 	f.tx.RollbackUnlessCommitted()
 	var restoreErr error
 	if !f.restored {
-		// Detach from the caller's context: cleanup is a compensating action,
-		// and inheriting a context that was just cancelled (or that expired and
-		// is why we are here) would fail the restore every time and discard an
-		// otherwise healthy connection.
-		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(f.ctx), cleanupRestoreTimeout)
-		defer cancel()
-		restoreErr = restoreLockWaitTimeout(restoreCtx, f.conn, f.previousLockWaitTimeout)
+		restoreErr = restoreDetached(f.ctx, f.conn, f.previousLockWaitTimeout)
 	}
 	closeErr := closeFlipConnection(f.conn, restoreErr != nil)
 	return errors.Join(restoreErr, closeErr)
+}
+
+// restoreDetached runs the compensating restore on a context detached from the
+// caller's.
+//
+// Cleanup must not inherit a cancellation that is frequently the reason it is
+// running: restoring on a dead context fails instantly, which discards a
+// connection that a fresh short attempt would have returned to the pool.
+func restoreDetached(ctx context.Context, execer contextExecer, previous int64) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupRestoreTimeout)
+	defer cancel()
+	return restoreLockWaitTimeout(restoreCtx, execer, previous)
 }
 
 type contextExecer interface {
@@ -305,7 +315,18 @@ func closeFlipConnection(conn *sql.Conn, discard bool) error {
 	if discard {
 		// Returning driver.ErrBadConn prevents database/sql from putting a
 		// connection with an unknown session setting back into the pool.
+		//
+		// It also CLOSES the Conn as a side effect (database/sql calls
+		// c.close(err) when the Raw callback returns ErrBadConn), so the Close
+		// below always reports sql.ErrConnDone. That is the expected outcome
+		// here, not a failure: reporting it would append a fabricated
+		// "close failed" line to the one message an operator has to read
+		// correctly — the half-done cutover.
 		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		if err := conn.Close(); err != nil && !errors.Is(err, sql.ErrConnDone) {
+			return fmt.Errorf("cutover: close flip connection: %w", err)
+		}
+		return nil
 	}
 	if err := conn.Close(); err != nil {
 		return fmt.Errorf("cutover: close flip connection: %w", err)
