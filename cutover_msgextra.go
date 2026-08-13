@@ -1,0 +1,117 @@
+package main
+
+// `app cutover msgextra` — the #627 operator surface for the transactional
+// message_extra version allocator, moved here from tools/msgextra-version so
+// it ships inside the image.
+//
+//	preflight   read-only: current allocator state and the safe cutover floor
+//	            (max already-issued version across MySQL and cached Redis sync
+//	            cursors).
+//	activate    flip legacy→transactional under the drain barrier; needs -yes.
+//	            Uses -floor if given, else the preflight recommendation.
+//	            Refuses a floor below the observed max or above MaxCutoverFloor.
+//	status      state row + expected-mode guard only; no evidence scan.
+//
+// There is no "deactivate" action: rolling back to legacy cannot be done safely
+// online (octo-lib's in-memory GenSeq HiLo cache would resume below the
+// transactional high-water), so rollback is a documented maintenance-window
+// coordinated procedure — see docs/msgextra-cutover-runbook.md §6.
+//
+// Activation is a runtime state-row flip, NOT a code deploy: it takes effect
+// immediately across all replicas via the DB-authoritative state row. Run
+// preflight first, verify the numbers, then activate.
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
+)
+
+func msgextraCutoverDomain() *cutoverDomain {
+	return &cutoverDomain{
+		name:      "msgextra",
+		summary:   "#627 message_extra version allocator (legacy GenSeq → transactional per-channel sequence)",
+		preflight: msgextraCutoverPreflight,
+		activate:  msgextraCutoverActivate,
+		status:    msgextraCutoverStatus,
+	}
+}
+
+func msgextraCutoverPreflight(rt *cutoverRuntime, out io.Writer) error {
+	res, err := msgextraseq.New(rt.ctx).Preflight()
+	if err != nil {
+		return err
+	}
+	fprintMsgextraPreflight(out, res)
+	return nil
+}
+
+func msgextraCutoverActivate(rt *cutoverRuntime, out io.Writer) error {
+	store := msgextraseq.New(rt.ctx)
+	// Always show the preflight first so the operator sees what they are acting on.
+	res, err := store.Preflight()
+	if err != nil {
+		return err
+	}
+	fprintMsgextraPreflight(out, res)
+	if res.CurrentMode == msgextraseq.ModeTransactional {
+		fmt.Fprintln(out, "\nalready transactional — nothing to do")
+		return nil
+	}
+	floor := rt.floor
+	if floor == 0 {
+		floor = res.RecommendedFloor
+		fmt.Fprintf(out, "\n-floor not set: using preflight recommendation %d\n", floor)
+	}
+	if floor < res.RecommendedFloor {
+		return fmt.Errorf("refusing: -floor=%d is below the recommended floor %d (would risk reissuing an existing version)", floor, res.RecommendedFloor)
+	}
+	if floor > msgextraseq.MaxCutoverFloor {
+		return fmt.Errorf("refusing: -floor=%d exceeds the maximum %d (would make every reservation fail ErrOverflow)", floor, msgextraseq.MaxCutoverFloor)
+	}
+	if !rt.yes {
+		return fmt.Errorf("activate is a state change across all replicas — re-run with -yes to confirm (floor=%d)", floor)
+	}
+	flipped, err := store.Activate(floor)
+	if err != nil {
+		return err
+	}
+	if !flipped {
+		fmt.Fprintln(out, "\nno change — allocator was already transactional")
+		return nil
+	}
+	fmt.Fprintf(out, "\nACTIVATED: allocator is now transactional (cutover_floor=%d). Verify versions are monotonic and rerun preflight to confirm mode=transactional.\n", floor)
+	return nil
+}
+
+func msgextraCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
+	st, err := msgextraseq.New(rt.ctx).CurrentState()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "state: mode=%s epoch=%d cutover_floor=%d\n", msgextraModeName(st.Mode), st.Epoch, st.Floor)
+	fprintCutoverGuard(out, msgextraseq.ExpectedModeEnv, map[string]int{
+		"legacy":        msgextraseq.ModeLegacy,
+		"transactional": msgextraseq.ModeTransactional,
+	}, msgextraModeName)
+	return nil
+}
+
+func fprintMsgextraPreflight(out io.Writer, res msgextraseq.PreflightResult) {
+	fmt.Fprintf(out, "current: mode=%s epoch=%d cutover_floor=%d\n", msgextraModeName(res.CurrentMode), res.CurrentEpoch, res.CurrentFloor)
+	fmt.Fprintf(out, "evidence: max(message_extra.version)=%d max(legacy seq boundary)=%d max(Redis cursor)=%d\n", res.MaxMessageExtraVersion, res.MaxLegacySeqBoundary, res.MaxRedisCursor)
+	fmt.Fprintf(out, "redis scan visits: keys=%d fields=%d invalid_or_poisoned=%d (identifiers omitted)\n", res.RedisCursorKeyCount, res.RedisCursorFieldCount, res.InvalidRedisCursorFieldCount)
+	fmt.Fprintf(out, "recommended cutover_floor=%d\n", res.RecommendedFloor)
+}
+
+func msgextraModeName(mode int) string {
+	switch mode {
+	case msgextraseq.ModeLegacy:
+		return "legacy"
+	case msgextraseq.ModeTransactional:
+		return "transactional"
+	default:
+		return fmt.Sprintf("unknown(%d)", mode)
+	}
+}

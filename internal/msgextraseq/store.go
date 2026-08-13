@@ -2,9 +2,10 @@ package msgextraseq
 
 // Package msgextraseq is the shared, transactional message_extra version
 // allocator for octo-server (#627). It is a leaf package: it depends only on
-// octo-lib (config.Context / GenSeq / DB) and common, and imports no modules/*
-// package, so modules/message, modules/bot_api, modules/robot and
-// internal/carddispatch can all import it without an import cycle.
+// octo-lib (config.Context / GenSeq / DB), common and the pkg/cutover control
+// plane (itself a leaf), and imports no modules/* package, so modules/message,
+// modules/bot_api, modules/robot and internal/carddispatch can all import it
+// without an import cycle.
 //
 // The allocator is selected at runtime by the DB-authoritative state row
 // octo_message_extra_version_state (brief D2/D9). In mode=legacy it delegates to
@@ -29,6 +30,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	liblog "github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -43,10 +45,15 @@ const (
 // stateSingletonID is the fixed primary key of the single allocator-state row.
 const stateSingletonID = 1
 
-// envExpectedMode optionally declares the allocator mode a deployment expects.
+// stateTable is the DB-authoritative allocator-state table (pkg/cutover shape:
+// singleton_id / mode / epoch / cutover_floor).
+const stateTable = "octo_message_extra_version_state"
+
+// ExpectedModeEnv optionally declares the allocator mode a deployment expects.
 // Unset makes no assertion; "legacy"/"transactional" fail closed on mismatch
-// (brief D9 read-side guard).
-const envExpectedMode = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
+// (brief D9 read-side guard). Exported for the `app cutover msgextra status`
+// operator command, which reports the guard alongside the state row.
+const ExpectedModeEnv = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
 
 // MaxReserveCount bounds a single reservation (brief D3). It matches this
 // module's existing chunk magnitude (api_manager.go). Callers that exceed it
@@ -94,26 +101,22 @@ type Store struct {
 		Error(string, ...zap.Field)
 		Warn(string, ...zap.Field)
 	}
-	// expected-mode guard, parsed once from envExpectedMode at construction.
-	expectedModeSet       bool
-	expectedMode          int
-	expectedModeMalformed bool
+	// guard is the expected-mode deployment guard, parsed once from
+	// ExpectedModeEnv at construction (pkg/cutover semantics: unset asserts
+	// nothing, malformed fails closed).
+	guard cutover.ExpectedMode
 }
 
 // New builds a Store bound to the given octo-lib context.
 func New(ctx *config.Context) *Store {
-	s := &Store{ctx: ctx, logger: liblog.NewTLog("MsgExtraSeq")}
-	switch os.Getenv(envExpectedMode) {
-	case "":
-		// no assertion
-	case "legacy":
-		s.expectedModeSet, s.expectedMode = true, ModeLegacy
-	case "transactional":
-		s.expectedModeSet, s.expectedMode = true, ModeTransactional
-	default:
-		s.expectedModeSet, s.expectedModeMalformed = true, true
+	return &Store{
+		ctx:    ctx,
+		logger: liblog.NewTLog("MsgExtraSeq"),
+		guard: cutover.ParseExpectedMode(os.Getenv(ExpectedModeEnv), map[string]int{
+			"legacy":        ModeLegacy,
+			"transactional": ModeTransactional,
+		}),
 	}
-	return s
 }
 
 // ReserveTx reserves count message_extra versions for the given storage channel
@@ -255,16 +258,15 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 // deployment guard. Unset → no assertion. A malformed value, or a resolved mode
 // that differs from the expectation, fails closed.
 func (s *Store) assertExpectedMode(mode int) error {
-	if !s.expectedModeSet {
+	switch s.guard.Check(mode) {
+	case cutover.GuardMalformed:
+		return fmt.Errorf("%w: malformed %s", ErrExpectedModeMismatch, ExpectedModeEnv)
+	case cutover.GuardMismatch:
+		expected, _ := s.guard.Expected()
+		return fmt.Errorf("%w: expected %d, resolved %d", ErrExpectedModeMismatch, expected, mode)
+	default:
 		return nil
 	}
-	if s.expectedModeMalformed {
-		return fmt.Errorf("%w: malformed %s", ErrExpectedModeMismatch, envExpectedMode)
-	}
-	if mode != s.expectedMode {
-		return fmt.Errorf("%w: expected %d, resolved %d", ErrExpectedModeMismatch, s.expectedMode, mode)
-	}
-	return nil
 }
 
 // reserveLegacy delegates to the process-local octo-lib GenSeq allocator. After

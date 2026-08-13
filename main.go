@@ -120,6 +120,17 @@ func main() {
 		return
 	}
 
+	// `app cutover <domain> ...` — the shared one-way cutover operator surface
+	// (#627 msgextra, #697 botevent) — is dispatched the same way and for the
+	// same reason.
+	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == cutoverCommand {
+		if err := runCutoverCommand(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var CfgFile string //config file
 	flag.StringVar(&CfgFile, "config", "configs/tsdd.yaml", "config file")
 	flag.Parse()

@@ -177,7 +177,7 @@ func (ba *BotAPI) ackEvent(key string, eventID string) error {
 // (`Min: "(cursor"`). The two are the same number by construction at every
 // producer — each does `ZAdd(key, float64(seq), payload{EventID: seq})` — and
 // both id sources return integers well inside float64's exact range, which
-// `tools/botevent-seq` keeps true by refusing a cutover floor near 2^53. (The
+// `app cutover botevent` keeps true by refusing a cutover floor near 2^53. (The
 // count was "five" until `addInlineQuery` was found to be a sixth; naming a
 // number here just invites the next one to be missed.) A future
 // writer that scored by, say, timestamp while keeping a separate `event_id`

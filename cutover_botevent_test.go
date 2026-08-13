@@ -10,10 +10,11 @@ import (
 	rd "github.com/go-redis/redis"
 )
 
-// This is the first test file in tools/botevent-seq, and the reason it exists is that the
-// tool carries the entire activation procedure, is the only component a human runs by hand
-// at the cutover, and had produced two review findings across two rounds with no tests at
-// all (#697 review round 7).
+// These tests moved with the code from tools/botevent-seq, where they were the
+// first test file: the command carries the entire #697 activation procedure,
+// is the only component a human runs by hand at the cutover, and had produced
+// two review findings across two rounds with no tests at all (#697 review
+// round 7).
 //
 // judgeMirror is split out from the Redis/MySQL plumbing precisely so this matrix can be
 // covered without either.
@@ -189,13 +190,13 @@ func TestActivationPreconditionsRemainVisibleWithYes(t *testing.T) {
 	}
 }
 
-// TestPreflightPagesQueueMembers guards the operator tool's production footprint.
+// TestPreflightPagesQueueMembers guards the operator command's production footprint.
 // ZRANGE 0 -1 returns one unbounded Redis response and the previous implementation then
 // retained a score-sized map. Rank pagination plus adjacent-score accounting bounds both.
 func TestPreflightPagesQueueMembers(t *testing.T) {
-	source, err := os.ReadFile("main.go")
+	source, err := os.ReadFile("cutover_botevent.go")
 	if err != nil {
-		t.Fatalf("read main.go: %v", err)
+		t.Fatalf("read cutover_botevent.go: %v", err)
 	}
 	text := string(source)
 	for _, forbidden := range []string{

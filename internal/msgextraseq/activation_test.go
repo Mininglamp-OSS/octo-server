@@ -62,7 +62,7 @@ func TestRolloutOrdering_ActivateBeforeExpectedMode(t *testing.T) {
 // TestLegacySeqKeyFormatMatchesRunbook locks the legacy GenSeq key scheme that
 // two out-of-band consumers depend on: Preflight/Activate's observedMaxima keys
 // the legacy boundary by the `seq:messageExtra:%` LIKE prefix, and the coordinated
-// rollback runbook (tools/msgextra-version/README.md §6) raises those same
+// rollback runbook (docs/msgextra-cutover-runbook.md §6) raises those same
 // `seq:messageExtra:<channel>` rows above the transactional high-water. Since
 // rollback correctness now lives only in docs (there is no online Deactivate),
 // this guards the runbook SQL against silently drifting from the allocator's key
@@ -289,7 +289,7 @@ func TestActivateRejectsUnknownMode(t *testing.T) {
 }
 
 // TestLegacyToTransactionalRolloutOrdering exercises the production order in
-// tools/msgextra-version/README.md: upgraded replicas first run with no expected
+// docs/msgextra-cutover-runbook.md: upgraded replicas first run with no expected
 // mode assertion, the DB-authoritative state flips, existing processes observe
 // transactional mode immediately, and only then do restarted replicas enable
 // the durable transactional guard.

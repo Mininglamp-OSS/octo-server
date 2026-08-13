@@ -4,6 +4,25 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-13 (cutover-framework)
+
+- **Refactor** — Task `cutover-framework`: extracted the control plane the three
+  one-way cutover mechanisms (#627 msgextra, #697 botevent, #733 token session)
+  had hand-written separately into the new leaf package `pkg/cutover` —
+  singleton state read, FOR UPDATE CAS flip with under-lock evidence and floor
+  bounds, and the malformed-fails-closed expected-mode guard — and folded the
+  two standalone operator tools into the server binary as
+  `app cutover <domain> {preflight,activate,status}` so they finally ship in
+  the image (the #733 precedent, generalized). Refusal conditions, floor
+  semantics (#627 inclusive vs #697 strict), sentinel errors, and runtime hot
+  paths are unchanged; the characterization tests moved with the code. The
+  session rollout stays on its own five-phase surface and shares only the
+  documented conventions (`docs/cutover-framework.md`: state-table template,
+  `OCTO_<DOMAIN>_EXPECTED_MODE` naming, the flip-then-arm ordering invariant,
+  evidence discipline, Down 3819 pattern). Runbooks now live in `docs/`
+  (msgextra moved, botevent written for the first time). See
+  [journal](journal/shared/cutover-framework.md).
+
 ## 2026-08-12 (profile-visibility-system-bot-whitelist)
 
 - **Task** — `profile-visibility-system-bot-whitelist`: took the public-bot

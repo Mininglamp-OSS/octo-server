@@ -51,6 +51,12 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 	// an operator flips the mode. Every OTHER caller is a second live id source.
 	const allowlisted = "pkg/botevent/seq.go"
 
+	// cutover_botevent.go is the `app cutover botevent` operator command. It
+	// names the key only to sweep the legacy `seq` rows table-wide for cutover
+	// floor evidence — the read its standalone predecessor (tools/botevent-seq)
+	// did under the tools/ exemption below. It allocates nothing.
+	allowlistedReaders := map[string]bool{"cutover_botevent.go": true}
+
 	var violations []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -60,8 +66,7 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			switch d.Name() {
 			case ".git", "vendor", "node_modules", ".octospec", "tools":
 				// tools/ is exempt: tools/genseq-repro exists precisely to call the
-				// legacy allocator and demonstrate that it collides, and
-				// tools/botevent-seq reads the legacy rows to compute the cutover floor.
+				// legacy allocator and demonstrate that it collides.
 				return filepath.SkipDir
 			}
 			return nil
@@ -70,7 +75,7 @@ func TestNoGenSeqForBotEventIDs(t *testing.T) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
-		if filepath.ToSlash(rel) == allowlisted {
+		if filepath.ToSlash(rel) == allowlisted || allowlistedReaders[filepath.ToSlash(rel)] {
 			return nil
 		}
 		content, readErr := os.ReadFile(path)

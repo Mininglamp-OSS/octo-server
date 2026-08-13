@@ -1,25 +1,32 @@
-# msgextra-version — #627 activation runbook
+# msgextra cutover — #627 activation runbook
 
 The transactional `message_extra` version allocator (#627) ships **inert**: the
 schema (PR #644) and the writer cutover (PR-2) are behavior-neutral because the
 DB-authoritative state row is seeded `mode=legacy`, so `ReserveTx` delegates to
-the existing process-local `GenSeq`. This tool performs the one remaining step —
-flipping the state row to `mode=transactional` — which is what actually fixes the
-bug (commit-ordered, per-channel-unique versions across replicas).
+the existing process-local `GenSeq`. The `app cutover msgextra` operator command
+performs the one remaining step — flipping the state row to `mode=transactional`
+— which is what actually fixes the bug (commit-ordered, per-channel-unique
+versions across replicas).
 
 Activation is a **runtime state-row flip, not a code deploy**: it takes effect
 immediately on every replica the moment the `UPDATE` commits.
 
-## Build
+The command is part of the server binary and ships inside the image — run it
+from any pod (or any machine with the config file and DB/Redis access):
 
 ```
-go build -o /tmp/msgextra-version ./tools/msgextra-version
+/home/app cutover msgextra <preflight|activate|status> [flags]
 ```
+
+There is nothing to build or copy into the pod. (Its predecessor,
+`tools/msgextra-version`, was a standalone command the image never contained.)
+Shared conventions — the state-table shape, the guard-env ordering invariant,
+the evidence discipline — are documented in [cutover-framework.md](cutover-framework.md).
 
 ## 1. Preflight (read-only, safe anytime)
 
 ```
-/tmp/msgextra-version -config configs/tsdd.yaml -action preflight
+/home/app cutover msgextra preflight -config configs/tsdd.yaml
 ```
 
 Reports the current mode/epoch/floor and the recommended `cutover_floor` — the
@@ -38,6 +45,10 @@ upgraded `/message/extra/sync` handler independently constrains every request an
 cached cursor to that storage channel's persisted `MAX(message_extra.version)`,
 so old poisoned fields self-heal when their client/source next syncs. This avoids
 both an activation DoS and unsafe manual Redis deletion.
+
+`app cutover msgextra status` is the lightweight variant: the state row and the
+expected-mode guard only, no evidence scan — for "which mode is prod in" checks
+that should not pay for a keyspace walk.
 
 ## 2. Prepare
 
@@ -70,9 +81,9 @@ both an activation DoS and unsafe manual Redis deletion.
 3. Activate while the write drain remains in place:
 
 ```
-/tmp/msgextra-version -config configs/tsdd.yaml -action activate -yes
+/home/app cutover msgextra activate -config configs/tsdd.yaml -yes
 # or pin an explicit floor at/above the recommendation:
-/tmp/msgextra-version -config configs/tsdd.yaml -action activate -floor <N> -yes
+/home/app cutover msgextra activate -config configs/tsdd.yaml -floor <N> -yes
 ```
 
 `activate` takes the state row `FOR UPDATE` — the **writer drain barrier**: it
@@ -189,8 +200,9 @@ above them.
 
 ## Notes
 
-- The tool connects to MySQL and Redis via the normal DB config. Redis is required
-  for cursor evidence; WuKongIM is not used.
-- All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`) and is
-  covered by `activation_test.go` against live MySQL; the command here is a thin
-  wrapper.
+- The command connects to MySQL and Redis via the normal DB config. Redis is
+  required for cursor evidence; WuKongIM is not used. Every invocation prints
+  the MySQL endpoint it resolved before doing anything.
+- All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
+  on the shared `pkg/cutover` flip primitives) and is covered by
+  `activation_test.go` against live MySQL; the command here is a thin wrapper.

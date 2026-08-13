@@ -20,12 +20,15 @@ package botevent
 // allocator reads this row and, if activated, rebuilds the mirror and re-seeds
 // rather than degrading.
 //
-// # Deliberately aligned with #627, deliberately not a copy
+// # Deliberately aligned with #627, now literally shared
 //
 // Same shape as `octo_message_extra_version_state`: mode / epoch / cutover_floor, a
 // `FOR UPDATE` compare-and-set flip, and a floor validated against observed maxima.
+// That shared shape now lives in pkg/cutover; this file keeps only what is
+// specific to this domain — the strict floor comparison, the sentinel errors
+// callers match on, and the missing-row semantics.
 //
-// What is **not** reused is that design's `FOR SHARE` drain barrier. It works there
+// What is **not** shared is #627's `FOR SHARE` drain barrier. It works there
 // because every `message_extra` writer is already inside a DB transaction and can
 // hold the state row until it commits. A `robotEvent` writer is `INCR` + `ZADD` with
 // no transaction at all, so there is nothing to hold a lock until — and wrapping
@@ -35,7 +38,7 @@ package botevent
 // The consequence is honest and must stay documented: this design cannot drain
 // in-flight writers at the flip. It relies on the operator having confirmed that no
 // pre-fix replica is running, plus a brief write pause around the flip. See
-// tools/botevent-seq.
+// docs/botevent-cutover-runbook.md and `app cutover botevent`.
 
 import (
 	"context"
@@ -43,7 +46,8 @@ import (
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/go-sql-driver/mysql"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
+	"github.com/gocraft/dbr/v2"
 )
 
 const (
@@ -54,10 +58,10 @@ const (
 	stateSingletonID = 1
 
 	// StateModeLegacy delegates to GenSeq. Seeded value, so a deploy is inert.
-	StateModeLegacy = 0
+	StateModeLegacy = cutover.ModeInactive
 
 	// StateModeIncr allocates from the Redis counter.
-	StateModeIncr = 1
+	StateModeIncr = cutover.ModeActive
 )
 
 // ErrFloorTooLow mirrors msgextraseq: a cutover floor at or below what has already
@@ -97,97 +101,53 @@ func ReadStateContext(deadline context.Context, ctx *config.Context) (State, err
 	if ctx == nil {
 		return State{}, errors.New("botevent: nil ctx, cannot read allocator state")
 	}
-	var row struct {
-		Mode         int    `db:"mode"`
-		Epoch        uint64 `db:"epoch"`
-		CutoverFloor int64  `db:"cutover_floor"`
-	}
-	count, err := ctx.DB().SelectBySql(
-		"SELECT `mode`, `epoch`, `cutover_floor` FROM `"+stateTable+"` WHERE `singleton_id`=?",
-		stateSingletonID).LoadContext(deadline, &row)
+	st, err := cutover.ReadState(deadline, ctx.DB(), stateTable)
 	if err != nil {
-		if isMissingTable(err) {
-			// A pre-migration deploy: the same answer as a missing row, and it must not
-			// be confused with an unreachable authority.
+		if errors.Is(err, cutover.ErrStateMissing) {
+			// A pre-migration deploy (missing row or missing table, MySQL 1146):
+			// the same answer either way, and it must not be confused with an
+			// unreachable authority — a deploy that has not run the migration
+			// yet is legitimately legacy, while an unreachable DB is unknown
+			// and must not downgrade a process that has already issued counter
+			// ids.
 			return State{}, ErrStateMissing
 		}
 		return State{}, fmt.Errorf("botevent: read allocator state: %w", err)
 	}
-	if count == 0 {
-		return State{}, ErrStateMissing
-	}
-	return State{Mode: row.Mode, Epoch: row.Epoch, CutoverFloor: row.CutoverFloor}, nil
-}
-
-// isMissingTable reports whether err is MySQL's "table doesn't exist" (1146).
-//
-// Matched on the driver's error number rather than the message so it survives a
-// server locale change. It matters because a deploy that has not run the migration
-// yet, and a deploy whose DB is unreachable, are the same *error* to dbr and
-// opposite *states* to the allocator: one is legitimately legacy, the other is
-// unknown and must not downgrade a process that has already issued counter ids.
-func isMissingTable(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1146
+	return State{Mode: st.Mode, Epoch: st.Epoch, CutoverFloor: st.Floor}, nil
 }
 
 // Activate flips the state row from legacy to incr under a row lock, validating the
 // floor first.
 //
-// The `FOR UPDATE` here is **not** a drain barrier — see the file header. It only
-// serialises concurrent operators and makes the read-validate-write atomic. Returns
-// flipped=false with a nil error when the row is already activated, so the tool is
+// The `FOR UPDATE` (inside cutover.Flip) is **not** a drain barrier — see the file
+// header. It only serialises concurrent operators and makes the read-validate-write
+// atomic. observedMax is gathered by the operator command BEFORE the lock — with no
+// drain barrier there is nothing a locked recompute could pin down — and the floor
+// must clear it strictly: a floor at or below the observed maximum puts the first
+// activated ids under cursors clients already hold. Returns flipped=false with a
+// nil error when the row is already activated, so the operator command is
 // idempotent.
 func Activate(ctx *config.Context, floor, observedMax int64) (bool, uint64, error) {
 	if ctx == nil {
 		return false, 0, errors.New("botevent: nil ctx, cannot activate")
 	}
-	tx, err := ctx.DB().Begin()
+	flipped, epoch, err := cutover.Flip(ctx.DB(), cutover.FlipSpec{
+		Table:                   stateTable,
+		Floor:                   floor,
+		FloorMustExceedObserved: true,
+		Observe:                 func(*dbr.Tx) (int64, error) { return observedMax, nil },
+	})
 	if err != nil {
-		return false, 0, fmt.Errorf("botevent: begin activation tx: %w", err)
+		var floorErr *cutover.FloorError
+		switch {
+		case errors.Is(err, cutover.ErrStateMissing):
+			return false, 0, ErrStateMissing
+		case errors.As(err, &floorErr):
+			return false, 0, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floorErr.Floor, floorErr.Observed)
+		default:
+			return false, 0, fmt.Errorf("botevent: activate: %w", err)
+		}
 	}
-	defer tx.RollbackUnlessCommitted()
-
-	var locked struct {
-		Mode  int    `db:"mode"`
-		Epoch uint64 `db:"epoch"`
-	}
-	count, err := tx.SelectBySql(
-		"SELECT `mode`, `epoch` FROM `"+stateTable+"` WHERE `singleton_id`=? FOR UPDATE",
-		stateSingletonID).Load(&locked)
-	if err != nil {
-		return false, 0, fmt.Errorf("botevent: lock allocator state: %w", err)
-	}
-	if count == 0 {
-		return false, 0, ErrStateMissing
-	}
-	if locked.Mode == StateModeIncr {
-		return false, locked.Epoch, nil
-	}
-	// The floor must clear everything legacy could still hand out. Refusing here is
-	// the difference between an activation and an outage: a floor below the observed
-	// maximum puts the first activated ids under cursors clients already hold.
-	if floor <= observedMax {
-		return false, 0, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floor, observedMax)
-	}
-	res, err := tx.UpdateBySql(
-		"UPDATE `"+stateTable+"` SET `mode`=?, `epoch`=?, `cutover_floor`=? "+
-			"WHERE `singleton_id`=? AND `mode`=?",
-		StateModeIncr, locked.Epoch+1, floor, stateSingletonID, StateModeLegacy).Exec()
-	if err != nil {
-		return false, 0, fmt.Errorf("botevent: flip allocator state: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, 0, fmt.Errorf("botevent: flip allocator state rows: %w", err)
-	}
-	if affected != 1 {
-		// The row was locked FOR UPDATE, so a mode-conditional UPDATE must match
-		// exactly one row. Anything else means the row changed underneath the lock.
-		return false, 0, fmt.Errorf("botevent: flip matched %d rows, expected 1", affected)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, 0, fmt.Errorf("botevent: commit activation: %w", err)
-	}
-	return true, locked.Epoch + 1, nil
+	return flipped, epoch, nil
 }
