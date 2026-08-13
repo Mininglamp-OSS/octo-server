@@ -55,8 +55,9 @@ const activationPreconditions = `activate preconditions this tool CANNOT check:
 
 func boteventCutoverDomain() *cutoverDomain {
 	d := &cutoverDomain{
-		name:    "botevent",
-		summary: "#697 bot event id allocator (legacy GenSeq → monotonic Redis counter)",
+		name:       "botevent",
+		summary:    "#697 bot event id allocator (legacy GenSeq → monotonic Redis counter)",
+		stateTable: botevent.StateTable,
 	}
 	// Defaults to every queue: the rollout treats these totals as the activation
 	// floor evidence, so a sampled default would be a validation that silently

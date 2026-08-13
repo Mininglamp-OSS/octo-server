@@ -186,6 +186,45 @@ Also fixed:
   test clears the env var it asserts on instead of trusting the ambient
   environment; the framework doc's `Flip` signature updated.
 
+## Schema: three tables kept separate, plus a conformance test
+
+Asked whether the two `mode/epoch/cutover_floor` tables should be merged into
+one `octo_cutover_state(domain, ...)`. Decided **no**, recorded in
+docs/cutover-framework.md: migrations are per-module `//go:embed sql` so a
+shared table forces a cross-module ordering dependency into a ledger that is
+already fragile; msgextra's state row is read `FOR SHARE` on every
+`message_extra` write and should not share an InnoDB page with an unrelated
+domain's flip; botevent's Down guard (`CHECK(singleton_id=1)` → 3819 when
+activated) is per-table and would degrade to a documentation-only rule; and
+#733's table has a different shape entirely, so the idea covers two of three
+mechanisms at best. Against that, the only benefit is not copying eight lines
+of DDL.
+
+Worth noting the window: both domains are deployed but unactivated, so their
+rows hold only the seeded legacy value. That is the one moment when changing
+this schema would be cheap — it closes permanently the first time either flips.
+The decision is a judgement about future domain count, not a constraint.
+
+The cost of not merging is copied DDL, which drifts like copied code. So
+`TestCutoverDomainTablesMatchTheFrameworkTemplate` (root package) reads the real
+migrated schema from `information_schema` and checks every registered domain:
+column names/types/nullability/defaults, `utf8mb4_general_ci`, PK exactly
+`(singleton_id)`, the singleton CHECK, and a seeded `mode=0 epoch=0 floor=0` row
+(a migration must never activate anything). Shipped deviations live in
+`knownTemplateDeviations` with the reason — `#627` has no `updated_at`, and
+adding one means an ALTER on a table every write reads `FOR SHARE` for a purely
+observational column. Listed deviations are reported; unlisted ones fail, so a
+new domain inherits the whole template.
+
+The test needed the real migration output rather than the domain packages'
+`CREATE TABLE IF NOT EXISTS` fallbacks, so it uses `testutil.NewTestServer` (the
+root package pulls in every module through `internal/`) with pkg/botevent's
+CI-hard-fail / local-skip posture.
+
+Mutation-tested rather than assumed: seeding botevent at `mode=1` fails the
+inert-deploy assertion, and removing msgextra's CHECK constraint fails with
+"no CHECK constraint pinning singleton_id = 1". Both migrations restored after.
+
 ## Learning
 
 Operator surfaces that live in `tools/` do not ship: the image builds only the

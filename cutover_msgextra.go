@@ -31,11 +31,12 @@ import (
 
 func msgextraCutoverDomain() *cutoverDomain {
 	return &cutoverDomain{
-		name:      "msgextra",
-		summary:   "#627 message_extra version allocator (legacy GenSeq → transactional per-channel sequence)",
-		preflight: msgextraCutoverPreflight,
-		activate:  msgextraCutoverActivate,
-		status:    msgextraCutoverStatus,
+		name:       "msgextra",
+		summary:    "#627 message_extra version allocator (legacy GenSeq → transactional per-channel sequence)",
+		stateTable: msgextraseq.StateTable,
+		preflight:  msgextraCutoverPreflight,
+		activate:   msgextraCutoverActivate,
+		status:     msgextraCutoverStatus,
 	}
 }
 

@@ -754,7 +754,7 @@ func legacyDelegate(ctx *config.Context, robotID string, counterExists bool) (in
 			"cutover_floor it had. Setting %s=%s does NOT let this replica proceed — it is a "+
 			"fail-closed assertion, so it only makes every replica refuse loudly instead of some "+
 			"of them degrading",
-			SeqKey(robotID), stateTable, ExpectedModeEnv, ModeIncr)
+			SeqKey(robotID), StateTable, ExpectedModeEnv, ModeIncr)
 	}
 	return legacyEventID(ctx, robotID)
 }

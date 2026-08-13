@@ -101,7 +101,7 @@ type PreflightResult struct {
 // is an implementation detail of the flip, and callers already spell this
 // package's field names (CutoverFloor, not Floor).
 func (s *Store) CurrentState(ctx context.Context) (State, error) {
-	st, err := cutover.ReadState(ctx, s.ctx.DB(), stateTable)
+	st, err := cutover.ReadState(ctx, s.ctx.DB(), StateTable)
 	if err != nil {
 		if errors.Is(err, cutover.ErrStateMissing) {
 			return State{}, ErrStateRowMissing
@@ -117,7 +117,7 @@ func (s *Store) CurrentState(ctx context.Context) (State, error) {
 func (s *Store) Preflight() (PreflightResult, error) {
 	var res PreflightResult
 
-	state, err := cutover.ReadState(context.Background(), s.ctx.DB(), stateTable)
+	state, err := cutover.ReadState(context.Background(), s.ctx.DB(), StateTable)
 	if err != nil {
 		if errors.Is(err, cutover.ErrStateMissing) {
 			return PreflightResult{}, ErrStateRowMissing
@@ -165,7 +165,7 @@ func (s *Store) Preflight() (PreflightResult, error) {
 // the allocator is already transactional (idempotent).
 func (s *Store) Activate(ctx context.Context, floor int64) (bool, error) {
 	flipped, newEpoch, err := cutover.Flip(ctx, s.ctx.DB(), cutover.FlipSpec{
-		Table:    stateTable,
+		Table:    StateTable,
 		Floor:    floor,
 		MaxFloor: MaxCutoverFloor,
 		// Recompute every source under the drain barrier so a concurrently-

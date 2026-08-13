@@ -80,7 +80,7 @@ const seqTableDDL = "CREATE TABLE IF NOT EXISTS `seq` (" +
 // including the singleton CHECK and the ON UPDATE clause. An abbreviated copy would mean
 // the tests never exercise the shipped schema — and the CHECK is what the migration's Down
 // relies on to refuse dropping an activated authority (review P2-11).
-const stateTableDDL = "CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
+const stateTableDDL = "CREATE TABLE IF NOT EXISTS `" + StateTable + "` (" +
 	"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
 	"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
 	"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, " +
@@ -100,7 +100,7 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
 	if _, err := ctx.DB().Exec(stateTableDDL); err != nil {
-		t.Skipf("cannot create %s at %s: %v", stateTable, mysqlAddr, err)
+		t.Skipf("cannot create %s at %s: %v", StateTable, mysqlAddr, err)
 	}
 
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})
@@ -144,7 +144,7 @@ func setStateMode(t *testing.T, ctx *config.Context, mode int, floor int64) {
 	// Without resetting it, a test that ran the real Activate leaves epoch=1 behind and
 	// the next fixture's mirror would be a stale generation.
 	if _, err := ctx.DB().InsertBySql(
-		"insert into `"+stateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
+		"insert into `"+StateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
 			"on duplicate key update `mode`=VALUES(`mode`), `epoch`=0, `cutover_floor`=VALUES(`cutover_floor`)",
 		stateSingletonID, mode, floor).Exec(); err != nil {
 		t.Fatalf("set state mode: %v", err)
@@ -279,7 +279,7 @@ func TestValidatedBeliefRetainsTheCutoverFloor(t *testing.T) {
 		"seq:robotEventSeq:" + newBot,
 		HighWaterSeqKey(newBot),
 	}).Exec()
-	if _, err := ctx.DB().DeleteFrom(stateTable).Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
+	if _, err := ctx.DB().DeleteFrom(StateTable).Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
 		t.Fatalf("remove authority after positive resolution: %v", err)
 	}
 
@@ -1085,7 +1085,7 @@ func TestHigherMirrorEpochForcesAuthorityRefresh(t *testing.T) {
 	robotID := "seqtest_higher_epoch_bot"
 	fixture(t, ctx, client, robotID)
 
-	if _, err := ctx.DB().Update(stateTable).
+	if _, err := ctx.DB().Update(StateTable).
 		Set("mode", StateModeIncr).
 		Set("epoch", 2).
 		Set("cutover_floor", 9000).

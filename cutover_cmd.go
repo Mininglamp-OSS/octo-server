@@ -67,6 +67,11 @@ type cutoverRuntime struct {
 type cutoverDomain struct {
 	name    string
 	summary string
+	// stateTable is the domain's singleton authority table. Registered here so
+	// the schema conformance test can check every domain's DDL against the
+	// framework template from one list, rather than each domain remembering to
+	// write its own check.
+	stateTable string
 	// registerFlags adds domain-specific flags (e.g. botevent's -sample).
 	registerFlags func(fs *flag.FlagSet)
 	preflight     func(rt *cutoverRuntime, out io.Writer) error

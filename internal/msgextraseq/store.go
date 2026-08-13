@@ -51,9 +51,9 @@ const (
 // stateSingletonID is the fixed primary key of the single allocator-state row.
 const stateSingletonID = cutover.SingletonID
 
-// stateTable is the DB-authoritative allocator-state table (pkg/cutover shape:
+// StateTable is the DB-authoritative allocator-state table (pkg/cutover shape:
 // singleton_id / mode / epoch / cutover_floor).
-const stateTable = "octo_message_extra_version_state"
+const StateTable = "octo_message_extra_version_state"
 
 // ExpectedModeEnv optionally declares the allocator mode a deployment expects.
 // Unset makes no assertion; "legacy"/"transactional" fail closed on mismatch
@@ -233,7 +233,7 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 		CutoverFloor int64  `db:"cutover_floor"`
 	}
 	err := tx.SelectBySql(
-		"SELECT `mode`, `epoch`, `cutover_floor` FROM `"+stateTable+"` WHERE `singleton_id`=? FOR SHARE",
+		"SELECT `mode`, `epoch`, `cutover_floor` FROM `"+StateTable+"` WHERE `singleton_id`=? FOR SHARE",
 		stateSingletonID,
 	).LoadOne(&row)
 	metricStateLockWaitSeconds.Observe(time.Since(lockStart).Seconds())

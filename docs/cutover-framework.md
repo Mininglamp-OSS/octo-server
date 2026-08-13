@@ -130,13 +130,44 @@ forward（botevent）。"再切回去"的诱惑正是这类 bug 的第二次发�
 已经发出的 id 全在 legacy 下一个号段之上，回退后 legacy 发的 id 落在活跃游标
 之下——同样的丢失，方向相反。
 
+## 为什么是三张表而不是一张
+
+`mode/epoch/cutover_floor` 三张表同形，很自然会想合并成
+`octo_cutover_state(domain, ...)`。**刻意不合并**，理由按重要性排：
+
+1. **模块归属无解。** migration 是 per-module `//go:embed sql`，两张表分属
+   `modules/message/sql/` 和 `modules/robot/sql/`。共享表放进任一模块都会制造跨
+   模块的 migration 顺序依赖，而本仓库的 ledger 已有跨包脆弱性（CI 必须每包
+   drop 库）。
+2. **热路径不该与无关域共页。** msgextra 的状态行在**每次 `message_extra` 写入**
+   里被 `FOR SHARE` 读。两行塞进一张小表大概率同页；PK 精确匹配拿的是 record
+   lock 不会直接冲突，但让最热的共享读与另一个域的翻转共享页闩是零收益的风险。
+3. **Down 自杀保险是 per-table 的。** botevent 靠 `CHECK(singleton_id=1)` 在已激活
+   时触发 3819 中止 Down。表一旦不属于单一域，这个机器强制就没地方挂，只能退回
+   成文档约定——正好丢掉三种回滚等级里唯一被强制的那个。
+4. **三选二不成立。** #733 的表是五态字符串 floor + `max_per_uid` + `paused` +
+   version CAS，形状完全不同，进不来。
+
+代价是**每个新域都要抄一遍 DDL**，而抄来的 schema 会像抄来的代码一样漂移。所以
+不合并的前提是有 `TestCutoverDomainTablesMatchTheFrameworkTemplate`（根包）：它
+从 `information_schema` 读真实迁移出来的 schema，逐域核对列名/类型/可空/默认值、
+`utf8mb4_general_ci`、PK 是否为 `(singleton_id)`、singleton CHECK 是否存在、以及
+种子行是否为 `mode=0 epoch=0 floor=0`（部署必须惰性）。已发布的偏差登记在
+`knownTemplateDeviations` 里连同不修的理由——**登记的只报告，没登记的直接失败**，
+所以新域拿到的是完整模板，漏抄哪一项都会红。
+
+> 注：改 schema 的窗口只在**激活之前**。一旦某个域翻转，它的状态行就是不可逆
+> cutover 的权威，迁移它是最不该做的那类 migration。
+
 ## 新域接入清单
 
-1. 迁移：照模板建状态表 + 种子 legacy 行（+ 可选 Down 自杀保险）。
+1. 迁移：照模板建状态表 + 种子 legacy 行（+ 可选 Down 自杀保险）。新域必须带
+   `updated_at`；跑一遍上面那个 conformance test 确认模板抄全了。
 2. 运行时：读态用 `cutover.ReadState`（缺行=legacy 默认），写路径按域实现；
    guard 用 `cutover.ParseExpectedMode` + 域内错误文案。
 3. 翻转：`cutover.Flip`，证据闭包按域实现；决定 floor 比较语义与上界。
-4. CLI：在 `cutover_cmd.go` 的 `cutoverDomainList` 注册域，实现
-   preflight/activate/status 三个动作（-yes 门、拒绝条件文案随域）。
+4. CLI：在 `cutover_cmd.go` 的 `cutoverDomainList` 注册域（含 `stateTable`，
+   conformance test 由此枚举），实现 preflight/activate/status 三个动作
+   （-yes 门、拒绝条件文案随域）。
 5. runbook：docs/ 下成文，含 prepare / drain(或写暂停) / activate / verify /
    guard / rollback 六段，并链接回本文档。

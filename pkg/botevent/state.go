@@ -51,8 +51,8 @@ import (
 )
 
 const (
-	// stateTable is the singleton state row's table.
-	stateTable = "octo_bot_event_seq_state"
+	// StateTable is the singleton state row's table.
+	StateTable = "octo_bot_event_seq_state"
 
 	// stateSingletonID is the only permitted primary key.
 	stateSingletonID = 1
@@ -117,7 +117,7 @@ func ReadStateContext(deadline context.Context, ctx *config.Context) (State, err
 	if ctx == nil {
 		return State{}, errors.New("botevent: nil ctx, cannot read allocator state")
 	}
-	st, err := cutover.ReadState(deadline, ctx.DB(), stateTable)
+	st, err := cutover.ReadState(deadline, ctx.DB(), StateTable)
 	if err != nil {
 		if errors.Is(err, cutover.ErrStateMissing) {
 			// A pre-migration deploy (missing row or missing table, MySQL 1146):
@@ -151,7 +151,7 @@ func Activate(deadline context.Context, ctx *config.Context, floor, observedMax 
 		return false, 0, errors.New("botevent: nil ctx, cannot activate")
 	}
 	flipped, epoch, err := cutover.Flip(deadline, ctx.DB(), cutover.FlipSpec{
-		Table:                   stateTable,
+		Table:                   StateTable,
 		Floor:                   floor,
 		MaxFloor:                MaxCutoverFloor,
 		FloorMustExceedObserved: true,
