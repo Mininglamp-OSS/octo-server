@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -393,6 +394,217 @@ func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
 	assert.True(t, strings.Contains(body, "加入群聊"))
 	assert.True(t, strings.Contains(body, "/v1/group/invite/authorize"))
 	assert.True(t, strings.Contains(body, "/scanjoin"))
+}
+
+// 「下载 App」按钮曾经把 href 直接设成注入的 API_BASE，而生产的 External.BaseURL
+// 就是 API 前缀（https://<host>/api），点击必然 404 —— 邀请页上唯一的下载入口是死链。
+//
+// 修法是改用公开免登录的 updater 接口拿真实安装包地址（与 Web 登录页下载浮层同源），
+// 拿不到就保持按钮隐藏。这个测试断言的是**最终 href 的来源**，而不是「占位符已被替换」——
+// 后者在旧实现下同样成立，正是它让这个 bug 一路漏到线上。
+// 这些断言只能确认落地页「长得对」，确认不了它「跑得对」——它们是对一个静态资源做
+// grep。把 bug 换个写法重新引入（先取元素再赋值）就能绕过第一条钉子。真正的行为覆盖
+// 要么把这段逻辑挪回服务端用 Go 测，要么给仓库引一套 JS 测试环境；在那之前，这里的
+// 定位是烟雾报警器，不是行为契约。所以断言尽量绑「必须存在的结构」，不绑具体排版。
+func TestGroupInvitePage_DownloadButtonResolvesInstallerNotAPIBase(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		// 不能只 assert：wd 为空会让 Cleanup 的 Chdir("") 静默失败，
+		// 把整个进程留在 repo 根目录，污染本包后面所有按相对路径找文件的测试。
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir("../.."); err != nil {
+		t.Fatalf("chdir to repo root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite?code=download-url-check"))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+
+	// 回归钉子：任何把按钮 href 绑到 API_BASE 的写法都必须挂 CI。不绑具体元素 id，
+	// 这样换个 id 或先取元素再赋值也一样会被拦下。
+	assert.NotContains(t, body, "href = API_BASE",
+		"下载按钮不能回退到 API_BASE —— 生产的 BaseURL 是 API 前缀，点击会 404")
+
+	// 安装包地址必须来自公开的 updater 接口，两个平台都要覆盖。
+	assert.True(t, strings.Contains(body, "/v1/common/updater/android/1.0"),
+		"Android 安装包地址必须来自公开 updater 接口")
+	assert.True(t, strings.Contains(body, "/v1/common/updater/ios/1.0.0"),
+		"iOS 安装包地址必须来自公开 updater 接口")
+
+	// 不做 UA 嗅探：邀请链接主要在微信 / 企业 IM 的内嵌浏览器里打开，UA 被各家改写，
+	// 猜错就是给用户递错平台的安装包。两个平台各给一个按钮，各自独立显示。
+	assert.NotContains(t, body, "navigator.userAgent",
+		"落地页不应按 UA 分流下载入口——内嵌浏览器的 UA 不可靠")
+
+	// 最容易的静默失效方式是删掉调用点：函数定义、两条路径、scheme 校验全都还在，
+	// 上面每一条断言照样绿，而下载按钮在线上永远不显示。所以调用点必须单独钉住。
+	//
+	// 必须锚在「行首的调用语句」上：裸子串 setupDownloadButtons() 会被函数声明
+	// `function setupDownloadButtons() {` 满足，删掉真实调用后断言照样绿 ——
+	// 那正是这条断言自称要拦的静默失效。
+	assert.Regexp(t, `(?m)^setupDownloadButtons\(\);$`, body,
+		"setupDownloadButtons 必须真的在顶层被调用，只定义不调用会让按钮永远不显示")
+
+	// updater 没有版本记录时返回 204（2xx 但无 body）。锚在 r.status === 204 上：
+	// 裸 "204" 子串今天不空转，但任何 SVG 坐标 / 色值 / padding 里出现 204 就会。
+	assert.True(t, strings.Contains(body, "r.status === 204"),
+		"必须处理 updater 的 204（无版本记录，响应无 body）")
+
+	// href 落地前必须过 scheme 白名单：updater 吐的是库里的裸 download_url。
+	// 只断言校验点和两个放行的 scheme 存在，不绑比较表达式的排列顺序。
+	assert.True(t, strings.Contains(body, "safeAbsoluteURL"),
+		"updater 返回的地址必须经过 scheme 校验后才能写进 a.href")
+	assert.True(t, strings.Contains(body, ".protocol"), "必须检查 scheme")
+	assert.True(t, strings.Contains(body, `"https:"`) && strings.Contains(body, `"http:"`),
+		"只放行 http/https，挡掉 javascript: 之类的 scheme")
+
+	// 安装包地址必须是绝对的。相对地址按哪个 base 解析，本页与 Web 登录页
+	// （location.origin）无法达成一致，两端算出的地址会分叉，至多一处正确 ——
+	// 所以契约是拒绝，而不是各自猜一个 base。
+	assert.NotContains(t, body, "new URL(trimmed, API_BASE)",
+		"不得把相对安装包地址按 API_BASE 解析——与 Web 端 location.origin 的口径冲突")
+
+	// 复制必须把 execCommand 兜底挂在 writeText 的 rejection 上，而不是写成
+	// else 分支：内嵌 webview 常常暴露了 clipboard 且满足安全上下文，却拒绝
+	// writeText —— 只判能力存在会让兜底恰好在最需要它的环境里永不执行。
+	assert.True(t, strings.Contains(body, "writeText(text).catch("),
+		"Clipboard API 被拒时必须继续走 execCommand 兜底，不能只判能力是否存在")
+
+	// 不得再引入「路径必须带文件后缀」之类的本地规则：写入侧 addAppVersion 不校验
+	// 格式，octo-web 登录页也只校验 scheme。多加一条规则会让同一个存储值在两个页面上
+	// 「能不能用」结论相反 —— 正是本页拒绝相对地址时所反对的那种分歧。而且对 iOS 是
+	// 死局：能在浏览器里装上 App 的地址必然是商店 / TestFlight 页，全部无后缀。
+	assert.NotContains(t, body, `lastSegment.indexOf(".")`,
+		"不得对安装包地址施加文件后缀要求——与写入侧和 octo-web 消费方的契约都不一致")
+
+	// 两个平台都拿不出安装包时（都 204 / updater 5xx / 网络失败 / 地址非法），
+	// 页面不能只剩一张卡片加一片空白 —— 用户无从判断是没 App 可下还是页面坏了。
+	assert.True(t, strings.Contains(body, "/v1/common/appconfig"),
+		"兜底入口地址必须取自公开的 appconfig.web_url")
+	// 同上：裸 setupWebFallback 会被函数声明和 HTML 注释满足，必须锚在调用表达式上。
+	assert.Regexp(t, `results\.indexOf\(true\) === -1\) setupWebFallback\(\);`, body,
+		"web_url 兜底必须真的在两个平台都失败时被调用")
+	assert.True(t, strings.Contains(body, "d.web_url"),
+		"兜底必须读 appconfig 的 web_url 字段")
+	fallbackRow := regexp.MustCompile(`<div[^>]*id="row-web-fallback"[^>]*>`).FindString(body)
+	assert.NotEmpty(t, fallbackRow, "落地页必须有 web_url 兜底行")
+	assert.Contains(t, fallbackRow, `style="display:none"`,
+		"兜底行必须默认隐藏——只在两个平台都无安装包时才出现")
+
+	// 两个平台各一行（下载按钮 + 复制链接），整行默认隐藏：无安装包 / 解析失败都不该
+	// 露出一个点不动的入口。用正则匹配整个标签，属性顺序、新增 class 之类的排版改动
+	// 不该挂 CI。
+	for _, p := range []string{"android", "ios"} {
+		row := regexp.MustCompile(`<div[^>]*id="row-download-` + p + `"[^>]*>`).FindString(body)
+		assert.NotEmpty(t, row, "落地页必须有 %s 的下载行", p)
+		assert.Contains(t, row, `style="display:none"`,
+			"%s 下载行必须默认隐藏，解析到合法地址后才显示", p)
+
+		assert.True(t, strings.Contains(body, `id="btn-download-`+p+`"`),
+			"%s 必须有下载按钮", p)
+		assert.True(t, strings.Contains(body, `id="btn-copy-`+p+`"`),
+			"%s 必须有复制链接按钮", p)
+	}
+
+	// 复制走 Clipboard API，但它要求安全上下文，而邀请链接大量在各家 IM 的内嵌
+	// 浏览器里打开。没有 execCommand 兜底时，那些环境里点复制会静默无反应。
+	assert.True(t, strings.Contains(body, "navigator.clipboard"),
+		"复制优先走 Clipboard API")
+	assert.True(t, strings.Contains(body, `execCommand("copy")`),
+		"必须保留 execCommand 兜底——内嵌浏览器里 Clipboard API 常不可用")
+}
+
+// 落地页必须零外部资源：不引 CDN 脚本、外链样式表、图标字体或远程图片。
+// 这个页面是用户接触产品的第一屏，且经常在内网、弱网、以及被墙的网络环境里打开——
+// 任何外部依赖失败都会让它退化成空白方块或裸样式。图标一律内联 SVG。
+func TestGroupInvitePage_NoExternalResources(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir("../.."); err != nil {
+		t.Fatalf("chdir to repo root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite?code=no-external-check"))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+
+	assert.NotContains(t, body, "<script src=", "不允许外链脚本")
+	assert.NotContains(t, body, "<link ", "不允许外链样式表 / 图标字体 / preconnect")
+	assert.NotContains(t, body, "@import", "CSS 不允许 @import 外部样式")
+	assert.NotContains(t, body, "url(http", "CSS 不允许引用远程资源")
+	assert.NotContains(t, body, `<img src="http`, "不允许远程图片")
+
+	// 图标必须是内联 SVG —— 上面几条只挡住了外链，没有内联图标的话按钮会秃。
+	assert.True(t, strings.Contains(body, "<svg"), "按钮图标必须内联 SVG")
+}
+
+// 落地页把 modules/common 的 updater 路由硬编码成字符串，Go 这边没有任何符号引用能
+// 在它被改名时报错。上面的测试只 grep HTML 里有没有这个字面量——路由改名后字面量还在，
+// 全仓测试照样绿，而线上每个移动端访客的 fetch 都 404、下载按钮永远不出现。
+// 这条测试用一次真实请求确认该路由确实由服务端提供。
+func TestGroupInvitePage_UpdaterRoutesAreServed(t *testing.T) {
+	s, ctx := newTestServer(t)
+	_ = New(ctx)
+
+	// updater 在库里没有版本记录时返回 204，而 CleanAllTables 会把 app_version 清空 ——
+	// 不种数据的话两条 updater 路径在 CI 里恒为 204，下面那条「字段名必须存在」的断言
+	// 永远不会执行，看起来已经覆盖、实际是空的。版本号要与落地页发的哨兵值不同，
+	// 否则 handler 走 model.AppVersion == oldVersion 的相等分支同样返回 204。
+	for _, seed := range []struct{ os, version, url string }{
+		{"android", "9.9.9", "https://dl.example.com/dmwork-9.9.9.apk"},
+		{"ios", "9.9.9", "https://apps.apple.com/cn/app/dmwork/id999"},
+	} {
+		_, err := ctx.DB().InsertInto("app_version").
+			Columns("app_version", "os", "is_force", "update_desc", "download_url").
+			Values(seed.version, seed.os, 0, "seed for route contract test", seed.url).
+			Exec()
+		assert.NoError(t, err, "seed app_version for %s", seed.os)
+	}
+
+	// appconfig 也是落地页硬编码的 modules/common 路由，同样没有符号引用兜底，
+	// 所以和两条 updater 路径一起验。
+	for _, tc := range []struct {
+		path      string
+		jsonField string // 200 响应里落地页真正读的字段；空串表示该路径不强制校验
+	}{
+		{"/v1/common/updater/android/1.0", "url"},
+		{"/v1/common/updater/ios/1.0.0", "url"},
+		{"/v1/common/appconfig", "web_url"},
+	} {
+		w := httptest.NewRecorder()
+		s.GetRoute().ServeHTTP(w, newInviteRequest(t, tc.path))
+		// 库里没有版本记录时返回 204，有则 200 —— 只接受这两个。
+		// 仅排除 404 是不够的：401 / 500 同样会让落地页拿不到地址，而 401 恰好是
+		// 「有人给这条公开路由加了鉴权」的信号，那对未登录访客等同于路由消失。
+		assert.Contains(t, []int{http.StatusOK, http.StatusNoContent}, w.Code,
+			"落地页硬编码的路径 %s 必须可路由且保持公开（期望 200/204，实得 %d）", tc.path, w.Code)
+
+		// 状态码对不代表字段名对：把 JSON 里的 url 改名成 download_url，上面的断言和
+		// 所有 grep 断言照样绿，而落地页读到的 d.url 是 undefined，所有行永远不显示。
+		if w.Code == http.StatusOK && tc.jsonField != "" {
+			var payload map[string]interface{}
+			if assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload), "%s 必须返回 JSON", tc.path) {
+				_, ok := payload[tc.jsonField]
+				assert.True(t, ok,
+					"%s 的 200 响应必须含落地页读取的 %q 字段（字段改名会让页面静默失效）", tc.path, tc.jsonField)
+			}
+		}
+	}
 }
 
 // Mininglamp-OSS/octo-server#1246: 移动端两端均未注册 dmwork:// scheme，

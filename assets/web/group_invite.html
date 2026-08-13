@@ -30,6 +30,16 @@
         .btn[disabled], .btn.disabled { opacity: 0.5; pointer-events: none; }
         .btn-primary { background: #07c160; color: #fff; }
         .btn-secondary { background: #f0f0f0; color: #333; }
+        .btn svg { flex: 0 0 auto; }
+        /* 下载行 = 下载按钮 + 复制链接。整行由 JS 在解析到合法地址后才显示。 */
+        .btn-row { gap: 8px; align-items: stretch; }
+        .btn-row .btn { flex: 1; min-width: 0; gap: 8px; }
+        .btn-copy {
+            flex: 0 0 auto; width: 44px; height: 44px; padding: 0;
+            border: none; border-radius: 22px; background: #f0f0f0; color: #666;
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+        }
+        .btn-copy:active { opacity: 0.7; }
         .badge {
             display: inline-block; padding: 2px 10px; border-radius: 10px;
             font-size: 12px; line-height: 18px; margin-top: 8px;
@@ -66,7 +76,38 @@
             </div>
             <div class="btn-group">
                 <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
-                <a class="btn btn-secondary" id="btn-download" href="#" target="_blank" rel="noopener">下载 App</a>
+                <!-- 图标一律内联 SVG：落地页不引任何外部资源（无 CDN / 图标字体 /
+                     远程图片），离线、内网与被墙环境下都不会退化成空白方块。
+                     Android / Apple 两个路径与 octo-web 登录页的下载按钮同源，保持两端一致。 -->
+                <div class="btn-row" id="row-download-android" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-android" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 18c0 .55.45 1 1 1h1v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h2v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h1c.55 0 1-.45 1-1V8H6v10zM3.5 8C2.67 8 2 8.67 2 9.5v7c0 .83.67 1.5 1.5 1.5S5 17.33 5 16.5v-7C5 8.67 4.33 8 3.5 8zm17 0c-.83 0-1.5.67-1.5 1.5v7c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5v-7c0-.83-.67-1.5-1.5-1.5zm-4.97-5.84 1.3-1.3c.2-.2.2-.51 0-.71-.2-.2-.51-.2-.71 0l-1.48 1.48A7.4 7.4 0 0 0 12 1c-1.1 0-2.15.23-3.12.63L7.4.15c-.2-.2-.51-.2-.71 0-.2.2-.2.51 0 .71L8 2.17A6.83 6.83 0 0 0 6 7h12c0-1.99-.97-3.75-2.47-4.84zM10 5H9V4h1v1zm5 0h-1V4h1v1z"/></svg>
+                        <span>下载 Android 版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-android" type="button" title="复制下载链接" aria-label="复制 Android 下载链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
+                <div class="btn-row" id="row-download-ios" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-ios" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
+                        <span>下载 iOS 版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-ios" type="button" title="复制下载链接" aria-label="复制 iOS 下载链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
+                <!-- 两个平台都没有可用安装包时的兜底入口，见 setupWebFallback。
+                     与上面两行互斥：有任一安装包可下时不显示。 -->
+                <div class="btn-row" id="row-web-fallback" style="display:none">
+                    <a class="btn btn-secondary" id="btn-web-fallback" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.91 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.65-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z"/></svg>
+                        <span>打开网页版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-web" type="button" title="复制网页版链接" aria-label="复制网页版链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -198,6 +239,208 @@ function findTokenAndSid() {
     return { token: "", sid: "" };
 }
 
+// 「下载 App」的安装包地址来自公开免登录的 updater 接口，与 Web 登录页的下载浮层
+// 同一个数据源（dmworklogin/AndroidDownloadButton.tsx / IOSDownloadButton.tsx 用的
+// 就是这两条路径）。版本号是「足够老」的哨兵值，让 updater 永远判定有新版可下。
+//
+// 历史实现把按钮 href 直接设成 API_BASE，注释写的是「回退到产品官网」，但注入的
+// External.BaseURL 在生产就是 API 前缀（.../api），点击必然落到 404 —— 语义和实现
+// 不一致。这里改为解析真实安装包地址；解析不出来就隐藏按钮，绝不回退到 API_BASE：
+// 没有入口好过一个死链。
+// 不做 UA 嗅探：两个平台各给一个按钮，各自按 updater 有没有版本记录独立显示。
+//
+// UA 分流在这个页面上尤其不可靠——邀请链接的主要打开方式是微信 / 企业 IM 的内嵌
+// 浏览器，UA 被各家改写；iPadOS 13+ 干脆把自己报成 Macintosh。猜错的代价是给用户
+// 递错平台的安装包，而猜对也只省下一个按钮。顺带这样桌面端也有了入口（扫码 / 转发
+// 到手机上打开），不必再单独接一个「去官网」的兜底。
+// 版本号是「足够老」的哨兵值：updater 在 model.AppVersion == 传入版本时返回 204，
+// 所以这里必须传一个不会与真实发行版本相等的值。这两个值不是随手取的 —— Web 登录页
+// 的下载浮层在生产就一直发这两条路径，真实发行版是 1.x.y / 2.x，碰撞会先打挂那个
+// 面向全体用户的入口。沿用它们等于复用一个已被线上验证过的约定。
+var DOWNLOADS = [
+    { path: "/v1/common/updater/android/1.0", row: "row-download-android", link: "btn-download-android", copy: "btn-copy-android" },
+    { path: "/v1/common/updater/ios/1.0.0", row: "row-download-ios", link: "btn-download-ios", copy: "btn-copy-ios" }
+];
+var APPCONFIG_PATH = "/v1/common/appconfig";
+var FETCH_TIMEOUT_MS = 8000;
+
+// 下载相关请求必须有超时：fetch 没有默认超时，而 setupWebFallback 要等 Promise.all
+// 全部 settle 才可能触发 —— 只要有一个平台的请求被中间层吞掉不返回，兜底就永远不会
+// 出现，页面停在改动前那个空白状态。没有 AbortController 的老 webview 退回裸 fetch：
+// 拿不到超时也不该拿不到功能。
+// 超时必须罩住 **body 读取**，不能只罩 fetch：fetch 的 promise 在响应头到达时就
+// resolve，body 还没读。若在那一刻清掉定时器，一个「先回 200 头、再把 body 挂住」的
+// 中间层仍然能让这个 job 永远不 settle，Promise.all 卡死、兜底永不出现 —— 正好是本
+// 函数要防的那个失效。所以 fetchJSON 把整条链（fetch + json）一起纳入同一个 signal，
+// 并且只在链终结时清定时器。
+function fetchJSONWithTimeout(url) {
+    if (typeof AbortController === "undefined") {
+        return fetch(url).then(readJSONBody);
+    }
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
+    return fetch(url, { signal: controller.signal })
+        .then(readJSONBody)
+        .then(
+            function (d) { clearTimeout(timer); return d; },
+            function (e) { clearTimeout(timer); throw e; }
+        );
+}
+
+// readJSONBody 统一处理 updater / appconfig 的响应形态：
+// 204（updater 在没有版本记录时返回，是 2xx 但无 body，直接 .json() 会抛）、
+// 非 2xx、以及 body 不是合法 JSON —— 一律收敛成 null，由调用方按「没拿到」处理。
+function readJSONBody(r) {
+    if (r.status === 204 || !r.ok) return null;
+    return r.json().catch(function () { return null; });
+}
+
+// copyText 优先用 Clipboard API，失败或不可用时都退回 execCommand。
+//
+// 兜底挂在 rejection 上而不是写成 else 分支：内嵌 webview 常常既暴露了
+// navigator.clipboard、又满足安全上下文，却被权限策略拒绝 writeText。只判「能力
+// 是否存在」会让兜底恰好在最需要它的环境里永远不执行——而 IM 内嵌浏览器正是这个
+// 页面的主战场。execCommand 虽已废弃，但仍是那类环境里唯一稳定可用的路径。
+// 两条路都失败时由调用方提示手动复制，不谎报成功。
+function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text).catch(function () {
+            return legacyCopyText(text);
+        });
+    }
+    return legacyCopyText(text);
+}
+
+function legacyCopyText(text) {
+    return new Promise(function (resolve, reject) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        // 放到视口内但不可见：iOS Safari 对 display:none / 视口外的元素不给选中。
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "0";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        if (ok) { resolve(); } else { reject(new Error("copy failed")); }
+    });
+}
+
+// safeAbsoluteURL 收口所有要写进 a.href 的地址：只放行绝对 http/https。
+// updater 直接吐库里的裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 /
+// 相对 / 畸形 —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
+//
+// 相对地址一律拒绝，不做解析。
+//
+// 曾经的实现把相对地址按 API_BASE 解析，但 Web 登录页的 resolveSafeDownloadUrl 用的
+// 是 window.location.origin —— 同一个 app_version.download_url 字段两个消费方能算出
+// 不同的地址（new URL 会替换 base 的末段：".../api/v2" + "files/x" → ".../api/files/x"），
+// 至多一处是对的。与其让两端各自猜一个 base，不如把契约钉死：安装包地址必须是绝对的。
+// 这和本页「没有入口好过一个死链」的取舍一致 —— 猜出来的地址就是死链的另一种写法。
+//
+// 副作用是协议相对地址（//host/x.apk）也会被拒，这是想要的：它绝对解析失败，
+// 只有靠相对分支才能通过，而那正是被删掉的分支。
+//
+// 若将来确实需要支持相对存储，正确做法是先和 Web 端对齐 base，再两边同时放开，
+// 而不是在这里单独恢复一个分支。
+function safeAbsoluteURL(value) {
+    if (typeof value !== "string") return "";
+    var trimmed = value.trim();
+    if (!trimmed) return "";
+    var u;
+    try { u = new URL(trimmed); } catch (e) { return ""; }
+    if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
+    return "";
+}
+
+// 安装包地址和 web_url 共用 safeAbsoluteURL，不再额外要求文件后缀。
+//
+// 曾经加过一条「路径末段必须带后缀」的规则，想拦住把下载按钮指向落地页的情况。
+// 它做不到，而且反向伤害更大：
+//   - 判不准 —— 接受 ".../download/ios.html"（正是要拦的落地页），却拒绝
+//     App Store / TestFlight 地址和带查询参数的签名下载地址。
+//   - 对 iOS 是死局 —— 浏览器安装 iOS 应用必须走 itms-services:，而该 scheme 被
+//     白名单挡掉（正确）。于是任何真能装上 App 的 iOS 地址都是商店页，全都无后缀：
+//     不存在既通过校验又可用的取值。
+//   - 与写入侧和另一个消费方都不一致 —— addAppVersion 只要求 android 非空、不校验
+//     格式，octo-web 登录页也只校验 scheme。加了它，同一个存储值在两个页面上
+//     「能不能用」结论相反，正是本页拒绝相对地址时所反对的那种分歧。
+// 下载地址指向网页是数据质量问题，归管理台校验管；落地页从 URL 字符串判断不了。
+
+
+// setupDownloadButtons 为每个平台各解析一次安装包地址。两个请求互相独立：
+// 一个平台没记录不影响另一个显示。库里没有版本记录、地址非法、网络失败 ——
+// 该平台整行保持隐藏。没有入口好过一个死链。
+function setupDownloadButtons() {
+    var jobs = DOWNLOADS.map(function (item) {
+        var row = document.getElementById(item.row);
+        var link = document.getElementById(item.link);
+        if (!row || !link) return Promise.resolve(false);
+        return fetchJSONWithTimeout(API_BASE + item.path).then(function (d) {
+            var url = safeAbsoluteURL(d && d.url);
+            if (!url) return false;
+            link.href = url;
+            bindCopyButton(document.getElementById(item.copy), url, "下载链接");
+            row.style.display = "flex";
+            return true;
+        }).catch(function () { return false; });
+    });
+    // 只有当两个平台都拿不出可用安装包时才去取 web_url 兜底：否则页面上会同时
+    // 出现「下载 X 版」和「打开网页版」，把主路径稀释掉。
+    Promise.all(jobs).then(function (results) {
+        if (results.indexOf(true) === -1) setupWebFallback();
+    });
+}
+
+// setupWebFallback 在两个平台都没有可用安装包时给出「打开网页版」。
+//
+// 触发条件：两个平台都没有版本记录（updater 204）、updater 5xx、updater 请求失败或
+// 超时、地址非法。此前这些情况下页面是一张群卡片加一片空白，而 detail 请求是独立的、
+// 它成功时页面看起来完全正常，用户无从判断是「没有 App 可下」还是「页面坏了」。
+//
+// 注意它覆盖不到整体断网：那时 detail 也会失败，走 showState("state-network-error")，
+// 而 showState 会 hide("content") —— 兜底行就在 #content 里，一并被藏掉。把三行移出
+// #content 才能覆盖那种情况（以及「链接过期且还没装 App」），那是独立的布局改动。
+//
+// 地址取自公开的 appconfig.web_url（= External.WebLoginURL，产品门户），与安装包地址
+// 走同一套 safeAbsoluteURL 校验。取不到就仍然什么都不显示：依旧不回退到 API_BASE。
+function setupWebFallback() {
+    var row = document.getElementById("row-web-fallback");
+    var link = document.getElementById("btn-web-fallback");
+    if (!row || !link) return;
+    fetchJSONWithTimeout(API_BASE + APPCONFIG_PATH).then(function (d) {
+        var url = safeAbsoluteURL(d && d.web_url);
+        if (!url) return;
+        link.href = url;
+        bindCopyButton(document.getElementById("btn-copy-web"), url, "网页版链接");
+        row.style.display = "flex";
+    }).catch(function () { /* 兜底也拿不到：保持隐藏，不猜 */ });
+}
+
+// bindCopyButton 把「复制链接」绑到已解析出的地址上。桌面端看到的是安装包，装
+// 却要在手机上装，复制link转过去是主路径；移动端内嵌浏览器拦下载时也用得上。
+// 复制的是目标地址本身，不是当前邀请页地址——后者用户直接分享地址栏即可。
+//
+// label 区分「下载链接」和「网页版链接」：兜底行复制的是门户地址，提示成「下载链接
+// 已复制」会和用户刚点的按钮对不上。
+function bindCopyButton(btn, url, label) {
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+        copyText(url).then(function () {
+            toast((label || "链接") + "已复制");
+        }, function () {
+            // 两条复制路径都不可用（老 webview / 权限被拒）：不假装成功，
+            // 告诉用户可以长按左边的按钮走浏览器自带的「复制链接地址」。
+            toast("复制失败，请长按左侧按钮复制链接");
+        });
+    });
+}
+
 function renderInfo(data) {
     document.getElementById("v-name").textContent = data.group_name || "群聊";
     if (typeof data.member_count === "number") {
@@ -222,9 +465,6 @@ function renderInfo(data) {
         tip.textContent = "该群已开启邀请确认，请在 App 内由管理员审批后入群。";
         tip.style.display = "block";
     }
-    // 「下载 App」回退到产品官网（无独立配置时复用 BaseURL）
-    document.getElementById("btn-download").href = API_BASE;
-
     // Web 已登录 & 群可直接入群 → 显示「加入群聊」按钮
     // invite_required 场景仍交由 App 内审批，不在落地页直接入群
     if (data.status === "joinable" && findTokenAndSid().token) {
@@ -382,6 +622,11 @@ function showNeedSpaceState(sid) {
         btn.addEventListener("click", function () { redirectHome(sid); });
     }
 }
+
+// 下载地址和邀请详情是互不依赖的公开 GET，并行发起。按钮本身在 #content 里，
+// 容器显示之前把它标成可见是安全的；串在 renderInfo 里只会让弱网下的下载入口
+// 白等一个 RTT 才浮出来，还会造成一次迟到的布局跳动。
+setupDownloadButtons();
 
 if (!code) {
     showState("state-expired");
