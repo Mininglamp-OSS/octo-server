@@ -221,6 +221,7 @@ func (bf *BotFather) initBotFatherUser() {
 			UID:      BotFatherUID,
 			Username: BotFatherUID,
 			Name:     BotFatherName,
+			Robot:    1,
 		})
 		if err != nil {
 			bf.Error("创建BotFather用户失败", zap.Error(err))
@@ -287,6 +288,9 @@ func (bf *BotFather) initBotFatherUser() {
 
 	// 确保 BotFather auto_approve=1（修复已有部署）
 	_, _ = bf.db.session.UpdateBySql("UPDATE robot SET auto_approve=1 WHERE robot_id=? AND auto_approve=0", BotFatherUID).Exec()
+
+	// 确保 BotFather user.robot=1（修复早期私有化部署遗留的 robot=0，否则 slash 命令不返回）
+	_, _ = bf.db.session.UpdateBySql("UPDATE user SET robot=1 WHERE uid=? AND robot=0", BotFatherUID).Exec()
 
 	// 修复孤儿 Bot — user 表有 robot=1 但 robot 表无记录（#234 遗留数据）
 	bf.repairOrphanBots()
