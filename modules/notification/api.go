@@ -63,7 +63,7 @@ func (s *Service) putPause(c *wkhttp.Context) {
 		s.writeStoreError(c, err)
 		return
 	}
-	response := s.response(record, time.Now().UTC())
+	response := s.response(record, now)
 	if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
 		s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
 	}
@@ -77,7 +77,7 @@ func (s *Service) deletePause(c *wkhttp.Context) {
 		s.writeStoreError(c, err)
 		return
 	}
-	response := s.response(record, time.Now().UTC())
+	response := s.response(record, now)
 	if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
 		s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
 	}
