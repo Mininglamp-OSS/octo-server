@@ -1184,6 +1184,8 @@ func newTestGateway(t *testing.T, upstreamURL string, secret []byte, now time.Ti
 		largeRequestSlots:    make(chan struct{}, maxConcurrentLargeRequests),
 		largeRequestSlotWait: defaultLargeRequestSlotWait,
 		requestBodyBudget:    semaphore.NewWeighted(maxInFlightRequestBodyBytes),
+		provisionIdentity:    func(context.Context, string, string) error { return nil },
+		resolveLocalpart:     func(context.Context, string) (string, error) { return "test-user", nil },
 	}
 }
 

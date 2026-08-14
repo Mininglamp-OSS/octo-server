@@ -22,8 +22,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -40,6 +42,7 @@ const (
 	maxInFlightRequestBodyBytes = maxConcurrentLargeRequests * maxRequestBytes
 	defaultLargeRequestSlotWait = 5 * time.Second
 	defaultTimeout              = 30 * time.Second
+	provisioningCacheEntries    = 4096
 )
 
 var allowedMethods = map[string]struct{}{
@@ -76,6 +79,10 @@ type Gateway struct {
 	largeRequestSlots    chan struct{}
 	largeRequestSlotWait time.Duration
 	requestBodyBudget    *semaphore.Weighted
+	provisionIdentity    func(context.Context, string, string) error
+	resolveLocalpart     func(context.Context, string) (string, error)
+	provisioned          *lru.Cache[string, struct{}]
+	provisioningFlights  singleflight.Group
 }
 
 func New(ctx *config.Context) *Gateway {
@@ -98,6 +105,13 @@ func New(ctx *config.Context) *Gateway {
 		}
 	}
 	g.client = newGatewayHTTPClient(cfg.timeout)
+	if cache, cacheErr := lru.New[string, struct{}](provisioningCacheEntries); cacheErr == nil {
+		g.provisioned = cache
+	} else {
+		g.Error("Agent Mail provisioning cache is unavailable", zap.Error(cacheErr))
+	}
+	g.provisionIdentity = g.provisionGatewayIdentity
+	g.resolveLocalpart = g.gatewayLocalpart
 	return g
 }
 
@@ -197,6 +211,11 @@ func (g *Gateway) proxy(c *wkhttp.Context) {
 	}
 	if c.Request.ContentLength > maxRequestBytes {
 		respondGatewayError(c, errcode.ErrAgentMailGatewayPayloadTooLarge)
+		return
+	}
+	if err := g.ensureProvisioned(c.Request.Context(), uid, spaceID); err != nil {
+		g.Warn("Failed to provision Agent Mail gateway identity", zap.String("uid", uid), zap.String("space_id", spaceID), zap.Error(err))
+		respondGatewayError(c, errcode.ErrAgentMailGatewayUnavailable)
 		return
 	}
 	releaseLargeRequest, err := g.acquireLargeRequestSlot(c.Request)
