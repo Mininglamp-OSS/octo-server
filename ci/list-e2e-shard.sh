@@ -16,6 +16,7 @@ if [ "$shard" -lt 1 ] || [ "$total" -lt 1 ] || [ "$shard" -gt "$total" ]; then
   echo "invalid shard $shard/$total" >&2
   exit 2
 fi
+export LC_ALL=C
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -32,7 +33,14 @@ go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... |
   sort -u > "$all_tests"
 
 ci/list-unit-packages.sh > "$unit"
-grep -vxF -f "$unit" "$all_tests" > "$e2e" || true
+set +e
+grep -vxF -f "$unit" "$all_tests" > "$e2e"
+grep_status="$?"
+set -e
+if [ "$grep_status" -ne 0 ] && [ "$grep_status" -ne 1 ]; then
+  echo "failed to subtract unit packages from test package list" >&2
+  exit "$grep_status"
+fi
 
 if [ ! -s "$e2e" ]; then
   exit 0

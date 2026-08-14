@@ -6,7 +6,8 @@ unit_file="${1:-ci/unit-packages.txt}"
 patterns=()
 while IFS= read -r line || [ -n "$line" ]; do
   line="${line%%#*}"
-  line="$(printf '%s' "$line" | xargs)"
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
   if [ -n "$line" ]; then
     patterns+=("$line")
   fi

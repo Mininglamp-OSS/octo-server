@@ -2,8 +2,11 @@ package workflowguards
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -87,14 +90,53 @@ func TestCITestJobAggregatesSplitLanes(t *testing.T) {
 	}
 }
 
+func TestCIE2EShardRunnerRejectsInvalidShard(t *testing.T) {
+	root := repoRoot(t)
+	cmd := exec.Command("bash", "ci/run-e2e-shard.sh", "5", "4")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("ci/run-e2e-shard.sh 5 4 succeeded, want failure; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "invalid shard 5/4") {
+		t.Fatalf("ci/run-e2e-shard.sh 5 4 output = %q, want invalid shard diagnostic", out)
+	}
+}
+
+func TestCITestPackagePartitionCoversEveryTestPackageOnce(t *testing.T) {
+	root := repoRoot(t)
+	all := commandLines(t, root, "go", "list", "-f", "{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}", "./...")
+	unit := commandLines(t, root, "bash", "ci/list-unit-packages.sh")
+
+	assignments := make(map[string]string, len(all))
+	for _, pkg := range unit {
+		assignments[pkg] = "unit"
+	}
+	for shard := 1; shard <= 4; shard++ {
+		shardPackages := commandLines(t, root, "bash", "ci/list-e2e-shard.sh", strconv.Itoa(shard), "4")
+		for _, pkg := range shardPackages {
+			if lane, ok := assignments[pkg]; ok {
+				t.Fatalf("package %s assigned to both %s and e2e shard %d", pkg, lane, shard)
+			}
+			assignments[pkg] = "e2e"
+		}
+	}
+
+	for _, pkg := range all {
+		if _, ok := assignments[pkg]; !ok {
+			t.Fatalf("test package %s was not assigned to unit or e2e lanes", pkg)
+		}
+	}
+	for pkg, lane := range assignments {
+		if !contains(all, pkg) {
+			t.Fatalf("%s lane assigned non-test package %s", lane, pkg)
+		}
+	}
+}
+
 func readWorkflow(t *testing.T, rel string) workflow {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
-	b, err := os.ReadFile(filepath.Join(root, rel))
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), rel))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +145,34 @@ func readWorkflow(t *testing.T, rel string) workflow {
 		t.Fatal(err)
 	}
 	return wf
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
+}
+
+func commandLines(t *testing.T, dir string, name string, args ...string) []string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %s failed: %v\n%s", name, strings.Join(args, " "), err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			filtered = append(filtered, line)
+		}
+	}
+	return filtered
 }
 
 func contains(values []string, want string) bool {

@@ -116,7 +116,6 @@ jobs:
           cache-dependency-path: |
             go.sum
             .github/go-cache-key/unit-test
-            ci/unit-packages.txt
 
       - name: Run unit tests
         run: ci/run-unit-tests.sh
@@ -199,7 +198,6 @@ jobs:
           cache-dependency-path: |
             go.sum
             .github/go-cache-key/e2e-test
-            ci/e2e-package-weights.tsv
 
       - name: Install MySQL/Redis client tooling
         run: |

@@ -8,14 +8,24 @@ fi
 
 shard="$1"
 total="$2"
+
+if ! listing="$(ci/list-e2e-shard.sh "$shard" "$total")"; then
+  echo "::error title=E2E shard listing failed::ci/list-e2e-shard.sh $shard $total exited non-zero" >&2
+  exit 1
+fi
+
 packages=()
 while IFS= read -r pkg; do
-  packages+=("$pkg")
-done < <(ci/list-e2e-shard.sh "$shard" "$total")
+  if [ -n "$pkg" ]; then
+    packages+=("$pkg")
+  fi
+done <<EOF
+$listing
+EOF
 
 if [ "${#packages[@]}" -eq 0 ]; then
-  echo "No E2E packages assigned to shard $shard/$total"
-  exit 0
+  echo "::error title=E2E shard has no packages::No E2E packages assigned to shard $shard/$total" >&2
+  exit 1
 fi
 
 printf 'E2E packages for shard %s/%s (%d):\n' "$shard" "$total" "${#packages[@]}"
