@@ -132,6 +132,15 @@ read-side guard: if the state row is ever lost or reset to `legacy`, a replica
 that expects `transactional` fails closed (`ErrExpectedModeMismatch`) instead of
 silently reverting to the process-local `GenSeq` and re-opening the skip window.
 
+**What counts as a value.** Only a completely absent (or empty) variable means
+"no assertion". The value is whitespace-trimmed *before it is matched*, so
+`transactional\n` from a YAML block scalar is accepted — but a value that is
+nothing but whitespace is **malformed, not unset**, and fails every write closed
+until it is fixed or removed. That is deliberate: a template that renders the
+guard blank must be loud, because the alternative is a fleet that believes the
+net is armed while it asserts nothing. The same holds for
+`OCTO_BOTEVENT_EXPECTED_MODE`.
+
 **Ordering is mandatory and one-directional.** The DB flip (§3) must commit and be
 confirmed (§4) *before* any replica boots with this env. Never ship the env in the
 same rollout wave that performs the flip — an un-flipped replica that picks up

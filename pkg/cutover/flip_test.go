@@ -105,6 +105,26 @@ func TestReadState(t *testing.T) {
 		t.Fatalf("missing row reported as a missing table: %v", rowErr)
 	}
 
+	// Flip must classify a missing table the same way, or the distinction only
+	// exists on the read path. Both domains switch on these sentinels, so an
+	// unclassified 1146 out of the FOR UPDATE falls through to their raw-error
+	// default and reports "the authority is unreachable" for "the migration has
+	// not run" — opposite safe answers, per this package's own doc.
+	_, _, flipErr := cutover.Flip(context.Background(), db, cutover.FlipSpec{
+		Table: "octo_cutover_test_absent",
+		Floor: 1,
+		Observe: func(*dbr.Tx) (int64, error) {
+			t.Fatal("Observe must not run: the table is not there to lock")
+			return 0, nil
+		},
+	})
+	if !errors.Is(flipErr, cutover.ErrStateTableMissing) {
+		t.Fatalf("Flip against a missing table: err=%v want ErrStateTableMissing", flipErr)
+	}
+	if !errors.Is(flipErr, cutover.ErrStateMissing) {
+		t.Fatalf("Flip against a missing table: err=%v must still satisfy ErrStateMissing", flipErr)
+	}
+
 	seedState(t, db, cutover.ModeActive, 3, 4200)
 	st, err := cutover.ReadState(context.Background(), db, testStateTable)
 	if err != nil {

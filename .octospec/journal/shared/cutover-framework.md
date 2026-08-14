@@ -62,9 +62,17 @@ source: self
 
 ## Accepted small semantic deltas (all fail-closed-preserving)
 
-- Guard env values are now whitespace-trimmed in both domains (botevent already
-  trimmed; msgextra previously treated `"legacy\n"` as malformed → fail closed;
-  now it is a valid assertion — same assertion, fewer ConfigMap surprises).
+- Guard env values are whitespace-trimmed **when matched** in both domains
+  (botevent already trimmed; msgextra previously treated `"legacy\n"` as
+  malformed → fail closed; now it is a valid assertion — same assertion, fewer
+  ConfigMap surprises). A whitespace-**only** value stays malformed and fails
+  closed in both domains, which tightens botevent.
+  > This entry originally claimed the trim was fail-closed-preserving without
+  > qualification, and the first implementation trimmed before the emptiness
+  > test — which made a blank value equal to unset, i.e. fail-**open**. Caught
+  > as a P1 in the fifth review round; see that section. The table below is
+  > meant to be the thing that catches this class, so it is worth noting that
+  > here it vouched for the defect instead.
 - msgextra `Preflight`/`CurrentState` on a missing *table* now report
   `ErrStateRowMissing` ("run the migration first") instead of a raw MySQL 1146.
 - botevent `Activate` on a corrupt mode value (neither 0 nor 1) now fails with
@@ -392,6 +400,41 @@ Two dead ends recorded so the next person does not repeat them:
   step (issue #419), so CI never runs at 151. Two rounds of measurement were
   spent modelling a condition CI does not have; read the whole job, not just
   the services block and the run script.
+
+## Fifth review round — the guard regressed, and the journal said it hadn't
+
+A reviewer filed P1 at head `e8ae3212`: `ParseExpectedMode` trimmed **before**
+the emptiness test, so `OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=" "` became
+indistinguishable from unset. msgextra's predecessor switched on the raw value,
+so whitespace-only hit `default` → malformed → every `message_extra` write
+failed closed, loudly. The new behaviour is fail-closed → **fail-open**, on the
+one net that catches a lost or reset state row after a cutover.
+
+Two things are worth keeping from this beyond the fix.
+
+First, **the entry above listed it under "accepted small semantic deltas (all
+fail-closed-preserving)", and the PR description said "all three refuse in both
+the old and new code".** Both were written about the trailing-newline case and
+neither was re-checked against the whitespace-only case they also covered. The
+delta table was the artifact that should have caught this and instead vouched
+for it.
+
+Second, **the fix is one line of ordering**: test emptiness on the raw value,
+trim only when matching. That keeps the ConfigMap-newline improvement the trim
+was added for and restores the loud failure. It also tightens botevent, whose
+predecessor trimmed first — accepted deliberately, since the shared contract in
+`guard.go` is the one both domains should hold, and a blank guard is a
+misconfiguration in either. The maintainer signed off on that widening.
+
+Also fixed in the same round: `Flip` now classifies MySQL 1146 as
+`ErrStateTableMissing` like `ReadState` does (three reviewers converged on it —
+the sentinel is what both domains switch on, and an unclassified 1146 reads
+"authority unreachable" for "migration has not run"); and
+`cutoverSchemaDepsAvailable` probes `OCTO_MASTER_KEY` and Redis, not just MySQL,
+because `testutil.NewTestServer` *panics* without the key and a panic takes the
+whole root-package binary down — the ~50 pure CLI tests that need no
+infrastructure never reported. Verified: without the key the package now runs 57
+tests and skips one, instead of reporting nothing.
 
 ## Learning
 

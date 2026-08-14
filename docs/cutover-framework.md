@@ -112,6 +112,12 @@ INSERT INTO `octo_<domain>_state` (`singleton_id`,`mode`,`epoch`,`cutover_floor`
 命名：`OCTO_<DOMAIN>_EXPECTED_MODE`（现有两个历史名字保留不改；约定约束新域）。
 取值：该域的 mode 拼写（如 `legacy` / `transactional` / `incr`）。
 
+**"未设置"只有一种：变量完全不存在（或为空串）。** 值在**匹配时**做 trim，所以
+YAML block scalar 带出来的 `transactional\n` 仍然是合法断言；但**只含空白的值算
+malformed，不算 unset**，会把写入全部 fail closed。顺序是这条规则的全部要害:先
+trim 再判空,会让 `EXPECTED_MODE=" "` 和未设置完全等价——机群以为持久防线已武装,
+实际什么都没断言,正好是 guard 存在的理由本身。模板渲染出空值必须吵,不能沉默。
+
 **顺序不变量（两套现网 runbook 各自独立写过同一条，这是本模式最高频的陷阱）：**
 
 1. 翻转前**必须不设**：一个期望 active 而状态行还是 legacy 的副本会把所有

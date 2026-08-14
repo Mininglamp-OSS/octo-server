@@ -27,6 +27,7 @@ package main
 // new domain cannot join it by accident.
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -429,16 +430,47 @@ func cutoverSchemaTestDB(t *testing.T) *dbr.Session {
 	return ctx.DB()
 }
 
+// TestSchemaConformanceProbeCoversWhatTheHarnessNeeds keeps the probe honest.
+//
+// The probe decides between "skip" and "run testutil.NewTestServer", and
+// NewTestServer does not fail politely: modules/common's Route panics without
+// a master key. A panic takes the whole test binary down, so an incomplete
+// probe costs not this test but the ~50 pure CLI, interrupt, redaction and
+// dispatcher tests in this package that need no infrastructure at all — the
+// ones whose entire value is being runnable on a laptop.
+func TestSchemaConformanceProbeCoversWhatTheHarnessNeeds(t *testing.T) {
+	t.Setenv("OCTO_MASTER_KEY", "")
+	err := cutoverSchemaDepsAvailable()
+	require.Error(t, err, "the probe must reject a missing master key rather than let NewTestServer panic")
+	require.Contains(t, err.Error(), "OCTO_MASTER_KEY")
+}
+
+// cutoverSchemaDepsAvailable reports whether testutil.NewTestServer can run.
+//
+// It probes what NewTestServer actually needs, not just MySQL: module.Setup
+// panics without OCTO_MASTER_KEY and several modules resolve Redis during
+// setup. Cheapest check first, so the returned error names the thing that is
+// actually missing even when more than one is.
 func cutoverSchemaDepsAvailable() error {
+	if key := os.Getenv("OCTO_MASTER_KEY"); key == "" {
+		return errors.New("OCTO_MASTER_KEY is not set — testutil.NewTestServer panics " +
+			"in modules/common without it (see ci.yml, which sets a fixed CI-only value)")
+	}
 	addr := os.Getenv("OCTO_TEST_MYSQL_ADDR")
 	if addr == "" {
 		addr = "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true"
 	}
 	cfg := config.New()
 	cfg.DB.MySQLAddr = addr
+	if redisAddr := os.Getenv("OCTO_TEST_REDIS_ADDR"); redisAddr != "" {
+		cfg.DB.RedisAddr = redisAddr
+	}
 	probe := config.NewContext(cfg)
 	if _, err := probe.DB().Exec("SELECT 1"); err != nil {
-		return fmt.Errorf("no usable MySQL at %s: %w", addr, err)
+		return fmt.Errorf("no usable MySQL at %s: %w", redactedMySQLEndpoint(addr), err)
+	}
+	if _, err := probe.GetRedisConn().Ping(); err != nil {
+		return fmt.Errorf("no usable Redis at %s: %w", cfg.DB.RedisAddr, err)
 	}
 	return nil
 }

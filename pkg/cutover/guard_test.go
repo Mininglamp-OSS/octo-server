@@ -16,7 +16,15 @@ func TestParseExpectedMode(t *testing.T) {
 		mode      int
 	}{
 		{name: "unset makes no assertion", raw: "", set: false},
-		{name: "whitespace-only is unset", raw: "  \n", set: false},
+		// Set-but-blank is NOT unset. os.Getenv cannot tell an unset variable
+		// from one set to "", so "" has to mean no assertion — but anything
+		// with characters in it was written by someone, and a value that was
+		// written and is not recognized must fail closed. A ConfigMap template
+		// rendering the guard to a lone newline used to leave msgextra failing
+		// every write closed and loudly; trimming first turned that into
+		// silence, which is the one direction this guard must never move.
+		{name: "whitespace-only is malformed, not unset", raw: "  \n", set: true, malformed: true},
+		{name: "a single space is malformed", raw: " ", set: true, malformed: true},
 		{name: "valid inactive spelling", raw: "legacy", set: true, mode: ModeInactive},
 		{name: "valid active spelling", raw: "incr", set: true, mode: ModeActive},
 		{name: "trailing newline from a ConfigMap is trimmed", raw: "incr\n", set: true, mode: ModeActive},

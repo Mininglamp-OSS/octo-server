@@ -146,6 +146,15 @@ func Flip(ctx context.Context, db *dbr.Session, spec FlipSpec) (flipped bool, ne
 		SingletonID,
 	).LoadContext(ctx, &locked)
 	if err != nil {
+		// Classify exactly as ReadState does. Both domains switch on these
+		// sentinels, so an unclassified 1146 falls through to their raw-error
+		// default and tells the operator the authority is unreachable when the
+		// truth is that the migration has not run — opposite safe answers once
+		// the new era has begun. The shipped commands preflight first and do not
+		// reach this today; the primitive is what a third domain copies.
+		if isMissingTable(err) {
+			return false, 0, ErrStateTableMissing
+		}
 		return false, 0, fmt.Errorf("cutover: lock %s: %w", spec.Table, err)
 	}
 	if count == 0 {

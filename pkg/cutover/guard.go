@@ -55,15 +55,29 @@ const (
 
 // ParseExpectedMode parses a raw guard value against the domain's recognized
 // spellings (e.g. {"legacy": ModeInactive, "transactional": ModeActive}).
-// Whitespace is trimmed so a trailing newline from a ConfigMap does not turn
-// a valid assertion into a malformed one. Empty means no assertion; any other
-// unrecognized value is malformed and fails closed at Check time.
+//
+// Only the EXACTLY empty string means "no assertion". os.Getenv cannot
+// distinguish an unset variable from one set to "", so "" has to be the
+// no-assertion case — but everything else was typed by someone, and an
+// unrecognized value that someone typed must fail closed.
+//
+// Whitespace is trimmed when MATCHING, not before the emptiness test, and the
+// order is the whole point. Trimming first makes `EXPECTED_MODE=" "` identical
+// to unset: the fleet believes the durable read-side net is armed while it
+// asserts nothing, which is precisely the silent-downgrade failure the guard
+// exists to catch. Matching on the trimmed value still accepts
+// `transactional\n` from a ConfigMap block scalar, which is the surprise this
+// trim was added for.
+//
+// Note for #697: botevent's predecessor trimmed first, so whitespace-only was
+// unset there. This tightens it to malformed. Deliberate — the shared contract
+// above is the one both domains should hold, and a blank guard is a
+// misconfiguration in either.
 func ParseExpectedMode(raw string, values map[string]int) ExpectedMode {
-	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ExpectedMode{}
 	}
-	if mode, ok := values[raw]; ok {
+	if mode, ok := values[strings.TrimSpace(raw)]; ok {
 		return ExpectedMode{set: true, mode: mode}
 	}
 	return ExpectedMode{set: true, malformed: true}
