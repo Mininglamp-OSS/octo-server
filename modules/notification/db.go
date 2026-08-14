@@ -49,6 +49,8 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 	result, err := tx.InsertBySql(
 		"INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, ?, ?, 1, ?) "+
 			"ON DUPLICATE KEY UPDATE "+
+			// Keep revision and updated_at before mode/paused_until: MySQL evaluates
+			// assignments left-to-right and these expressions compare old values.
 			"revision=revision+IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), 0, 1), "+
 			"updated_at=IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), updated_at, VALUES(updated_at)), "+
 			"mode=VALUES(mode), paused_until=VALUES(paused_until)",
@@ -132,7 +134,7 @@ func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]stru
 		var records []*pauseRecord
 		_, err := s.session.Select("uid", "mode", "paused_until", "revision", "updated_at").
 			From("user_notification_pause").
-			Where("uid IN ? AND (mode=? OR ((mode=? OR mode IS NULL) AND paused_until IS NOT NULL AND paused_until > ?))", uids[start:end], pauseModeManual, pauseModeTimed, now.UTC()).
+			Where("uid IN ? AND (BINARY mode = BINARY ? OR ((BINARY mode = BINARY ? OR mode IS NULL) AND paused_until IS NOT NULL AND paused_until > ?))", uids[start:end], pauseModeManual, pauseModeTimed, now.UTC()).
 			Load(&records)
 		if err != nil {
 			return nil, err

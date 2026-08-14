@@ -40,6 +40,9 @@ type updatePauseRequest struct {
 
 func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 	*r = updatePauseRequest{}
+	if err := rejectDuplicatePauseKeys(data); err != nil {
+		return err
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
@@ -99,6 +102,35 @@ func pauseField(fields map[string]json.RawMessage, name string) (json.RawMessage
 	return value, found == 1, nil
 }
 
-func pauseModeMatches(value *string, want string) bool {
-	return value != nil && strings.EqualFold(strings.TrimSpace(*value), want)
+func rejectDuplicatePauseKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("invalid object key")
+		}
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("duplicate %s field", key)
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
 }

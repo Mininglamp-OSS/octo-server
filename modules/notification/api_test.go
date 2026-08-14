@@ -77,6 +77,9 @@ func TestUpdatePauseRequestRequiresRFC3339TimestampAndAcceptsUnknownExtensionFie
 	if err := json.Unmarshal([]byte(`{"duration":null}`), &request); err == nil {
 		t.Fatal("null duration should be rejected")
 	}
+	if err := json.Unmarshal([]byte(`{"mode":"manual","mode":"timed"}`), &request); err == nil {
+		t.Fatal("duplicate mode fields should be rejected")
+	}
 }
 
 func TestPauseIntentRejectsAmbiguousAndInvalidRequests(t *testing.T) {
@@ -111,12 +114,12 @@ func TestResponseDoesNotTreatUnknownModeAsTimed(t *testing.T) {
 	}
 }
 
-func TestResponseNormalizesStoredModeWhitespace(t *testing.T) {
+func TestResponseDoesNotTreatNonCanonicalStoredModeAsActive(t *testing.T) {
 	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
 	mode := " manual "
 	response := (&Service{}).response(&pauseRecord{Mode: &mode}, now)
-	if !response.Paused || response.Mode == nil || *response.Mode != pauseModeManual {
-		t.Fatalf("padded manual mode should remain active: %+v", response)
+	if response.Paused || response.Mode != nil {
+		t.Fatalf("non-canonical manual mode should be inactive: %+v", response)
 	}
 }
 

@@ -75,7 +75,7 @@ func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
 	// relative to the fixed query instant.
 	future := "2026-08-14 06:00:00"
 	past := "2026-08-14 04:00:00"
-	uidPrefix := fmt.Sprintf("notification-active-%d-", time.Now().UnixNano())
+	uidPrefix := fmt.Sprintf("np-active-%d-", time.Now().UnixNano())
 	rows := []struct {
 		uid, mode string
 		until     interface{}
@@ -87,6 +87,9 @@ func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
 		{uidPrefix + "cleared", "", nil},
 	}
 	for _, row := range rows {
+		if len(row.uid) > 40 {
+			t.Fatalf("test uid %q exceeds VARCHAR(40)", row.uid)
+		}
 		_, err := ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", row.uid)
 		if err != nil {
 			t.Fatal(err)

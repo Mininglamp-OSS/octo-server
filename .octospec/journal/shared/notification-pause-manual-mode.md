@@ -17,8 +17,8 @@ source: self
   `mode: manual`, strict mutually exclusive request validation, and the mode
   migration.
 - Unified GET/PUT/DELETE and notification-pause CMD state fields, including
-  `mode`, `revision`, and `server_time`; DELETE is idempotent and only emits a
-  CMD when it actually clears an active row.
+  `mode`, `revision`, and `server_time`; DELETE is idempotent and emits a CMD
+  only when it clears persisted pause state, including stale expired rows.
 - Preserved legacy rows with a future `paused_until` as timed pauses and made
   manual rows active in webhook recipient filtering.
 

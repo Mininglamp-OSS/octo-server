@@ -96,13 +96,13 @@ func (s *Service) response(record *pauseRecord, now time.Time) pauseResponse {
 		return response
 	}
 	response.Revision = record.Revision
-	if pauseModeMatches(record.Mode, pauseModeManual) {
+	if record.Mode != nil && *record.Mode == pauseModeManual {
 		mode := pauseModeManual
 		response.Paused = true
 		response.Mode = &mode
 		return response
 	}
-	if (record.Mode == nil || pauseModeMatches(record.Mode, pauseModeTimed)) && record.PausedUntil != nil && record.PausedUntil.After(now) {
+	if (record.Mode == nil || (record.Mode != nil && *record.Mode == pauseModeTimed)) && record.PausedUntil != nil && record.PausedUntil.After(now) {
 		response.Paused = true
 		mode := pauseModeTimed
 		response.Mode = &mode
