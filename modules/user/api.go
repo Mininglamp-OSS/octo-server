@@ -268,6 +268,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// 对象级资料读取面，UID 虽是 32 位 hex 高熵，但认证用户批量探测不应只受全局
 		// per-IP 桶约束。与 channelGet 对齐（modules/channel/api.go）。
 		auth.GET("/users/:uid", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.get) // 根据uid查询用户信息
+		// 批量解析用户最小身份信息（无 PII），供大群转发授权等场景一次拉取，替代
+		// 逐个 GET /v1/users/:uid 打满端点限流。静态 /users/batch 与上面的
+		// /users/:uid 同层共存（gin 1.9 支持 static+param）。
+		auth.POST("/users/batch", u.batchGet)
 		// 获取用户的会话信息
 		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
 

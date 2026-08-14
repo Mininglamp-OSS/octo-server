@@ -400,6 +400,9 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/messages/sync", ba.syncMessages)
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/resolve/targets", ba.botResolveTargets)
+		// 批量解析用户最小身份信息（无 PII），供大群转发授权等场景一次拉取，替代逐个
+		// 单查打满限流；复用本组的 bot 鉴权 / 身份断言 / business 限流。
+		botAPI.POST("/users/batch", ba.batchUsers)
 		botAPI.GET("/groups/:group_no", ba.getGroupInfo)
 		botAPI.GET("/groups/:group_no/members", ba.getGroupMembers)
 		botAPI.GET("/groups/:group_no/mention_pref", ba.getMentionPref) // 群级免@偏好读（octo-server#237）
