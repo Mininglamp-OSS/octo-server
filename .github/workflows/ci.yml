@@ -106,7 +106,17 @@ jobs:
       needs.changes.outputs.code == 'true'
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45, not 30. The suite had grown to the point of deciding its own verdict
+    # by runner speed: run 31763498216 was cancelled at exactly 30m (the "Run
+    # tests" step still going after 28m32s), while the same commit's earlier
+    # run finished in 26m32s. A ceiling that close to the honest runtime turns
+    # every slow runner into a red PR and buries whatever the real result was.
+    #
+    # This buys headroom, it does not fix the cost: the loop reruns
+    # DROP/CREATE + full sql-migrate per package across ~113 packages under
+    # -race. Cutting that (a shared migrated template database, or -race only
+    # on the packages that need it) is the actual fix and wants its own change.
+    timeout-minutes: 45
     # MySQL, Redis, and WuKongIM are required by integration tests
     # (modules/{user,oidc,thread,group,space,botfather,...}). The tests
     # hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
@@ -272,15 +282,27 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
+          failed=()
           while read -r pkg; do
             mysql -h 127.0.0.1 -uroot -pdemo -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
             redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
             echo "::group::go test $pkg"
             if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
               fail=1
+              failed+=("$pkg")
+              # An annotation, not just a log line. Everything this step prints
+              # is unreachable afterwards: the job-log API returns only the tail,
+              # and the WuKongIM service container's teardown dump is larger than
+              # the whole window it will hand back — so three consecutive red runs
+              # were diagnosed without ever learning which package failed.
+              # Annotations survive on the check run itself.
+              echo "::error title=Package failed::$pkg"
             fi
             echo "::endgroup::"
           done < <(go list ./...)
+          if [ "$fail" -ne 0 ]; then
+            echo "::error title=Test summary::${#failed[@]} package(s) failed: ${failed[*]}"
+          fi
           exit $fail
 
   vet:

@@ -366,6 +366,18 @@ on the handler still being installed. A guard scans the package's `_test.go`
 files so it cannot come back, and one source assertion keeps the registration
 line honest.
 
+Then the next run came back **cancelled**, not failed: the job hit
+`timeout-minutes: 30` with the test step still running at 28m32s, while the
+same commit's earlier run had finished in 26m32s. The suite had grown to where
+runner speed decided the verdict. Raised the ceiling to 45 and wrote down what
+the real fix is (the per-package DROP + full sql-migrate across ~113 packages
+under `-race`), because raising a timeout is buying time, not paying the bill.
+
+The other half of that change is an `::error::` annotation per failing package.
+Three consecutive red runs were diagnosed without ever learning which package
+failed — see the first dead end below. Annotations live on the check run, which
+is reachable when the log is not.
+
 Two dead ends recorded so the next person does not repeat them:
 
 - **The failing package is not visible.** GitHub's job-log API returns only the
