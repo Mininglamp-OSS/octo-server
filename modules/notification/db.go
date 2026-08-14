@@ -30,72 +30,94 @@ func newDBStore(ctx *config.Context) *dbStore {
 
 func (s *dbStore) get(uid string) (*pauseRecord, error) {
 	var record *pauseRecord
-	_, err := s.session.Select("uid", "paused_until", "revision", "updated_at").
+	_, err := s.session.Select("uid", "mode", "paused_until", "revision", "updated_at").
 		From("user_notification_pause").
 		Where("uid=?", uid).
 		Load(&record)
 	return normalizePauseRecord(record), err
 }
 
-func (s *dbStore) upsert(uid string, pausedUntil time.Time, now time.Time) (*pauseRecord, error) {
+func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time) (*pauseRecord, bool, error) {
 	tx, err := s.session.Begin()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	_, err = tx.InsertBySql(
-		"INSERT INTO user_notification_pause (uid, paused_until, revision, updated_at) VALUES (?, ?, 1, ?) "+
-			"ON DUPLICATE KEY UPDATE paused_until=VALUES(paused_until), revision=revision+1, updated_at=VALUES(updated_at)",
-		uid, pausedUntil.UTC(), now.UTC(),
+	var until interface{}
+	if pausedUntil != nil {
+		until = pausedUntil.UTC().Truncate(time.Millisecond)
+	}
+	result, err := tx.InsertBySql(
+		"INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, ?, ?, 1, ?) "+
+			"ON DUPLICATE KEY UPDATE "+
+			// Keep revision and updated_at before mode/paused_until: MySQL evaluates
+			// assignments left-to-right and these expressions compare old values.
+			"revision=revision+IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), 0, 1), "+
+			"updated_at=IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), updated_at, VALUES(updated_at)), "+
+			"mode=VALUES(mode), paused_until=VALUES(paused_until)",
+		uid, mode, until, now.UTC(),
 	).Exec()
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, false, err
 	}
 	var record *pauseRecord
-	_, err = tx.Select("uid", "paused_until", "revision", "updated_at").
+	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
 		From("user_notification_pause").
 		Where("uid=?", uid).
 		Suffix("FOR UPDATE").
 		Load(&record)
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return normalizePauseRecord(record), nil
+	return normalizePauseRecord(record), rowsAffected > 0, nil
 }
 
-func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
+func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, bool, error) {
 	tx, err := s.session.Begin()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	_, err = tx.Update("user_notification_pause").
+	// Expired timed rows are inactive on the wire but still persisted state;
+	// clearing them is a real cleanup transition and advances the revision.
+	result, err := tx.Update("user_notification_pause").
+		Set("mode", nil).
 		Set("paused_until", nil).
 		Set("updated_at", now.UTC()).
 		Set("revision", dbr.Expr("revision+1")).
-		Where("uid=? AND paused_until IS NOT NULL", uid).
+		Where("uid=? AND (mode IS NOT NULL OR paused_until IS NOT NULL)", uid).
 		Exec()
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, false, err
 	}
 	var record *pauseRecord
-	_, err = tx.Select("uid", "paused_until", "revision", "updated_at").
+	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
 		From("user_notification_pause").
 		Where("uid=?", uid).
 		Suffix("FOR UPDATE").
 		Load(&record)
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return normalizePauseRecord(record), nil
+	return normalizePauseRecord(record), rows > 0, nil
 }
 
 func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]struct{}, error) {
@@ -110,9 +132,9 @@ func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]stru
 			end = len(uids)
 		}
 		var records []*pauseRecord
-		_, err := s.session.Select("uid", "paused_until", "revision", "updated_at").
+		_, err := s.session.Select("uid", "mode", "paused_until", "revision", "updated_at").
 			From("user_notification_pause").
-			Where("uid IN ? AND paused_until IS NOT NULL AND paused_until > ?", uids[start:end], now.UTC()).
+			Where("uid IN ? AND (BINARY mode = BINARY ? OR ((BINARY mode = BINARY ? OR mode IS NULL) AND paused_until IS NOT NULL AND paused_until > ?))", uids[start:end], pauseModeManual, pauseModeTimed, now.UTC()).
 			Load(&records)
 		if err != nil {
 			return nil, err

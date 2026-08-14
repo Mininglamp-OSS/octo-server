@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -26,7 +27,7 @@ func TestResponseUsesUTCAbsolutePauseTime(t *testing.T) {
 	until := now.Add(30 * time.Minute)
 	service := &Service{}
 
-	response := service.response(&pauseRecord{PausedUntil: &until, Revision: 42}, now)
+	response := service.response(&pauseRecord{Mode: strptr(pauseModeTimed), PausedUntil: &until, Revision: 42}, now)
 	if !response.Paused || response.PausedUntil == nil {
 		t.Fatalf("future record should be active: %+v", response)
 	}
@@ -40,6 +41,89 @@ func TestResponseUsesUTCAbsolutePauseTime(t *testing.T) {
 		t.Fatalf("server_time should be UTC, got %s", response.ServerTime.Location())
 	}
 }
+
+func TestPauseIntentSupportsManualAndDurations(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	manual, until, ok := (updatePauseRequest{Mode: strptr(pauseModeManual)}).intent(now)
+	if !ok || manual != pauseModeManual || until != nil {
+		t.Fatalf("manual intent = %q, %v, %v", manual, until, ok)
+	}
+	mode, until, ok := (updatePauseRequest{Duration: strptr("30m")}).intent(now)
+	if !ok || mode != pauseModeTimed || until == nil || !until.Equal(now.Add(30*time.Minute)) {
+		t.Fatalf("duration intent = %q, %v, %v", mode, until, ok)
+	}
+}
+
+func TestUpdatePauseRequestRequiresRFC3339TimestampAndAcceptsUnknownExtensionFields(t *testing.T) {
+	var request updatePauseRequest
+	if err := json.Unmarshal([]byte(`{"paused_until":"2026-08-16T09:00:00.000Z"}`), &request); err != nil {
+		t.Fatalf("valid UTC timestamp rejected: %v", err)
+	}
+	if request.PausedUntil == nil || !request.hasPausedUntil {
+		t.Fatalf("paused_until was not decoded: %+v", request)
+	}
+	if err := json.Unmarshal([]byte(`{"paused_until":"2026-08-16T09:00:00"}`), &request); err == nil {
+		t.Fatal("timezone-less timestamp should be rejected")
+	}
+	if err := json.Unmarshal([]byte(`{"scope":"sound","duration":"30m"}`), &request); err != nil {
+		t.Fatalf("unknown extension field should remain forward-compatible: %v", err)
+	}
+	if _, _, ok := request.intent(time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)); !ok {
+		t.Fatal("valid request with an unknown extension field should be accepted")
+	}
+	if err := json.Unmarshal([]byte(`{"mode":null}`), &request); err == nil {
+		t.Fatal("null mode should be rejected")
+	}
+	if err := json.Unmarshal([]byte(`{"duration":null}`), &request); err == nil {
+		t.Fatal("null duration should be rejected")
+	}
+	if err := json.Unmarshal([]byte(`{"mode":"manual","mode":"timed"}`), &request); err == nil {
+		t.Fatal("duplicate mode fields should be rejected")
+	}
+}
+
+func TestPauseIntentRejectsAmbiguousAndInvalidRequests(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	cases := []updatePauseRequest{
+		{Mode: strptr(pauseModeManual), Duration: strptr("30m")},
+		{Duration: strptr("2h")},
+		{Mode: strptr("timed")},
+		{PausedUntil: &now, hasPausedUntil: true},
+	}
+	for _, request := range cases {
+		if _, _, ok := request.intent(now); ok {
+			t.Fatalf("invalid request accepted: %+v", request)
+		}
+	}
+}
+
+func TestManualResponseStaysActiveWithoutAnExpiry(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	response := (&Service{}).response(&pauseRecord{Mode: strptr(pauseModeManual), Revision: 9}, now.Add(7*24*time.Hour))
+	if !response.Paused || response.Mode == nil || *response.Mode != pauseModeManual || response.PausedUntil != nil {
+		t.Fatalf("manual response = %+v", response)
+	}
+}
+
+func TestResponseDoesNotTreatUnknownModeAsTimed(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	response := (&Service{}).response(&pauseRecord{Mode: strptr("future-mode"), PausedUntil: &future}, now)
+	if response.Paused || response.Mode != nil || response.PausedUntil != nil {
+		t.Fatalf("unknown mode should not activate a pause: %+v", response)
+	}
+}
+
+func TestResponseDoesNotTreatNonCanonicalStoredModeAsActive(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	mode := " manual "
+	response := (&Service{}).response(&pauseRecord{Mode: &mode}, now)
+	if response.Paused || response.Mode != nil {
+		t.Fatalf("non-canonical manual mode should be inactive: %+v", response)
+	}
+}
+
+func strptr(value string) *string { return &value }
 
 func TestNormalizePauseRecordPreservesDatabaseUTCWallClock(t *testing.T) {
 	stored := time.Date(2026, 8, 15, 8, 20, 30, 123000000, time.FixedZone("CST", 8*60*60))

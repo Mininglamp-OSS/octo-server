@@ -1464,3 +1464,8 @@ change-log convention (§7). Newest first.
 
 - **Update** — Synced OKF-aware slash commands, workflow skill, and task brief
   template from octo-spec 1.1.0 so generated briefs/journals stay conformant.
+
+## 2026-08-14 (notification-pause-manual-mode)
+
+- **Implemented** — Added explicit manual/timed pause state, server-side fixed
+  durations, unified REST/CMD responses, migration, validation, and tests.
