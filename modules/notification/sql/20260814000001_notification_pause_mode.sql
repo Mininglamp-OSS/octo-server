@@ -5,5 +5,7 @@ ALTER TABLE `user_notification_pause`
 
 -- +migrate Down
 
+-- Dropping this column irreversibly loses active manual pauses. Roll back only
+-- with a state backup and an explicit customer-impact decision.
 ALTER TABLE `user_notification_pause`
   DROP COLUMN `mode`;

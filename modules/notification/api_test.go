@@ -65,8 +65,17 @@ func TestUpdatePauseRequestRequiresRFC3339TimestampAndRejectsUnknownFields(t *te
 	if err := json.Unmarshal([]byte(`{"paused_until":"2026-08-16T09:00:00"}`), &request); err == nil {
 		t.Fatal("timezone-less timestamp should be rejected")
 	}
-	if err := json.Unmarshal([]byte(`{"scope":"sound"}`), &request); err == nil {
-		t.Fatal("unknown request field should be rejected")
+	if err := json.Unmarshal([]byte(`{"scope":"sound","duration":"30m"}`), &request); err != nil {
+		t.Fatalf("unknown extension field should remain forward-compatible: %v", err)
+	}
+	if _, _, ok := request.intent(time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)); !ok {
+		t.Fatal("valid request with an unknown extension field should be accepted")
+	}
+	if err := json.Unmarshal([]byte(`{"mode":null}`), &request); err == nil {
+		t.Fatal("null mode should be rejected")
+	}
+	if err := json.Unmarshal([]byte(`{"duration":null}`), &request); err == nil {
+		t.Fatal("null duration should be rejected")
 	}
 }
 
@@ -90,6 +99,15 @@ func TestManualResponseStaysActiveWithoutAnExpiry(t *testing.T) {
 	response := (&Service{}).response(&pauseRecord{Mode: strptr(pauseModeManual), Revision: 9}, now.Add(7*24*time.Hour))
 	if !response.Paused || response.Mode == nil || *response.Mode != pauseModeManual || response.PausedUntil != nil {
 		t.Fatalf("manual response = %+v", response)
+	}
+}
+
+func TestResponseDoesNotTreatUnknownModeAsTimed(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	response := (&Service{}).response(&pauseRecord{Mode: strptr("future-mode"), PausedUntil: &future}, now)
+	if response.Paused || response.Mode != nil || response.PausedUntil != nil {
+		t.Fatalf("unknown mode should not activate a pause: %+v", response)
 	}
 }
 

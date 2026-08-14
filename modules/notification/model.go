@@ -38,16 +38,15 @@ type updatePauseRequest struct {
 }
 
 func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
+	*r = updatePauseRequest{}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	for name := range fields {
-		if name != "duration" && name != "mode" && name != "paused_until" {
-			return fmt.Errorf("unknown notification pause field %q", name)
-		}
-	}
 	if raw, ok := fields["duration"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("duration must be a string")
+		}
 		var value string
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err
@@ -55,6 +54,9 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		r.Duration = &value
 	}
 	if raw, ok := fields["mode"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("mode must be a string")
+		}
 		var value string
 		if err := json.Unmarshal(raw, &value); err != nil {
 			return err

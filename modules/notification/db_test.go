@@ -10,6 +10,28 @@ import (
 )
 
 func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
+	store, ctx := newPauseTestStore(t)
+	uid := fmt.Sprintf("notification-tz-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	want := now.Add(2 * time.Hour)
+	if _, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.get(uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record == nil || record.PausedUntil == nil || !record.PausedUntil.Equal(want) {
+		t.Fatalf("paused_until round trip = %v, want %v", record, want)
+	}
+	if response := (&Service{}).response(record, now); !response.Paused || response.PausedUntil == nil || !response.PausedUntil.Equal(want) {
+		t.Fatalf("response = %+v, want active pause until %s", response, want)
+	}
+}
+
+func newPauseTestStore(t *testing.T) (*dbStore, *config.Context) {
+	t.Helper()
 	cfg := config.New()
 	cfg.Test = true
 	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai"
@@ -29,23 +51,82 @@ func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return newDBStore(ctx), ctx
+}
 
-	uid := fmt.Sprintf("notification-tz-%d", time.Now().UnixNano())
-	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
-	store := newDBStore(ctx)
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	want := now.Add(2 * time.Hour)
-	if _, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil {
-		t.Fatal(err)
+func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
+	store, ctx := newPauseTestStore(t)
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	past := now.Add(-time.Hour)
+	rows := []struct {
+		uid, mode string
+		until     *time.Time
+	}{
+		{"notification-active-manual", pauseModeManual, nil},
+		{"notification-active-timed", pauseModeTimed, &future},
+		{"notification-active-legacy", "", &future},
+		{"notification-expired-timed", pauseModeTimed, &past},
+		{"notification-cleared", "", nil},
 	}
-	record, err := store.get(uid)
+	for _, row := range rows {
+		_, err := ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", row.uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ctx.DB().DB.Exec("INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, NULLIF(?, ''), ?, 1, ?)", row.uid, row.mode, row.until, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", row.uid) })
+	}
+
+	uids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		uids = append(uids, row.uid)
+	}
+	active, err := store.getActiveByUIDs(uids, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record == nil || record.PausedUntil == nil || !record.PausedUntil.Equal(want) {
-		t.Fatalf("paused_until round trip = %v, want %v", record, want)
+	for _, uid := range []string{"notification-active-manual", "notification-active-timed", "notification-active-legacy"} {
+		if _, ok := active[uid]; !ok {
+			t.Fatalf("%s should be active, got %v", uid, active)
+		}
 	}
-	if response := (&Service{}).response(record, now); !response.Paused || response.PausedUntil == nil || !response.PausedUntil.Equal(want) {
-		t.Fatalf("response = %+v, want active pause until %s", response, want)
+	for _, uid := range []string{"notification-expired-timed", "notification-cleared"} {
+		if _, ok := active[uid]; ok {
+			t.Fatalf("%s should be inactive, got %v", uid, active)
+		}
+	}
+}
+
+func TestClearIsIdempotentAndDoesNotCreateRows(t *testing.T) {
+	store, ctx := newPauseTestStore(t)
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	uid := fmt.Sprintf("notification-clear-%d", time.Now().UnixNano())
+	future := now.Add(time.Hour)
+	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
+	if _, err := store.upsert(uid, pauseModeManual, &future, now); err != nil {
+		t.Fatal(err)
+	}
+	first, firstChanged, err := store.clear(uid, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondChanged, err := store.clear(uid, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || second == nil || !firstChanged || secondChanged || first.Revision != 2 || second.Revision != first.Revision {
+		t.Fatalf("clear should update once and then be a no-op: first=%+v changed=%v second=%+v changed=%v", first, firstChanged, second, secondChanged)
+	}
+	missingUID := fmt.Sprintf("notification-clear-missing-%d", time.Now().UnixNano())
+	missing, missingChanged, err := store.clear(missingUID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing != nil || missingChanged {
+		t.Fatalf("clear of a missing row should not create state: %+v changed=%v", missing, missingChanged)
 	}
 }

@@ -71,19 +71,26 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 	return normalizePauseRecord(record), nil
 }
 
-func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
+func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, bool, error) {
 	tx, err := s.session.Begin()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	_, err = tx.InsertBySql(
-		"INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, NULL, NULL, 1, ?) "+
-			"ON DUPLICATE KEY UPDATE mode=NULL, paused_until=NULL, revision=revision+1, updated_at=VALUES(updated_at)",
-		uid, now.UTC(),
-	).Exec()
+	result, err := tx.Update("user_notification_pause").
+		Set("mode", nil).
+		Set("paused_until", nil).
+		Set("updated_at", now.UTC()).
+		Set("revision", dbr.Expr("revision+1")).
+		Where("uid=? AND (mode IS NOT NULL OR paused_until IS NOT NULL)", uid).
+		Exec()
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, false, err
 	}
 	var record *pauseRecord
 	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
@@ -93,12 +100,12 @@ func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, error) {
 		Load(&record)
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return normalizePauseRecord(record), nil
+	return normalizePauseRecord(record), rows > 0, nil
 }
 
 func (s *dbStore) getActiveByUIDs(uids []string, now time.Time) (map[string]struct{}, error) {

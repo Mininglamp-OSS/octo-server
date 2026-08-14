@@ -72,14 +72,16 @@ func (s *Service) putPause(c *wkhttp.Context) {
 
 func (s *Service) deletePause(c *wkhttp.Context) {
 	now := time.Now().UTC()
-	record, err := s.db.clear(c.GetLoginUID(), now)
+	record, changed, err := s.db.clear(c.GetLoginUID(), now)
 	if err != nil {
 		s.writeStoreError(c, err)
 		return
 	}
 	response := s.response(record, now)
-	if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
-		s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+	if changed {
+		if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
+			s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+		}
 	}
 	c.Response(response)
 }
@@ -96,7 +98,7 @@ func (s *Service) response(record *pauseRecord, now time.Time) pauseResponse {
 		response.Mode = &mode
 		return response
 	}
-	if record.PausedUntil != nil && record.PausedUntil.After(now) {
+	if (record.Mode == nil || *record.Mode == pauseModeTimed) && record.PausedUntil != nil && record.PausedUntil.After(now) {
 		response.Paused = true
 		mode := pauseModeTimed
 		response.Mode = &mode
