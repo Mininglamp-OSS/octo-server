@@ -344,6 +344,43 @@ migration tree is walked once per test binary instead of four times;
 lock-wait test skips rather than fails when the server default collides with the
 value under test.
 
+## CI went red, and the tests were the reason
+
+`21e56f5a` was fully green. `c2e53118` turned CI's Test job red and it stayed red
+across a re-run — while every local run passed.
+
+The delta that matters: `c2e53118` added the first tests in this repo that send
+a real signal to the test binary (`syscall.Kill(os.Getpid(), SIGINT)` and
+`… SIGTERM`). `watchInterrupt` detaches the instant it receives one — that is
+the second stage the design needs — so a signal arriving in that window is
+handled by the **default disposition** and takes the whole process down. For
+SIGTERM that is silent: the package reports `[signal: terminated]` with no
+`--- FAIL` line naming a test, which is exactly what made the CI log
+uninformative.
+
+Fixed by splitting the constructor: `newDetachedInterruptWatcher` builds and
+starts the watcher without touching signal disposition, `watchInterrupt` adds
+the `signal.Notify` wiring, and tests call `deliver(sig)` on the channel. Same
+assertions — notice-before-cancel, the recorded signal, 130 vs 143 — with no bet
+on the handler still being installed. A guard scans the package's `_test.go`
+files so it cannot come back, and one source assertion keeps the registration
+line honest.
+
+Two dead ends recorded so the next person does not repeat them:
+
+- **The failing package is not visible.** GitHub's job-log API returns only the
+  final step, and the WuKongIM service container's teardown dump fills the
+  entire 1.3 MB the tool will return — zero `go test` lines. `output.text` on
+  the check run is empty, re-running the workflow is 403, and the direct log
+  endpoint is blocked by the agent proxy.
+- **The `max_connections` trail was a false lead.** `modules/user` (peak 197)
+  and `modules/common` (peak 162) really do exceed the `mysql:8.0` default of
+  151, and both really do panic with `Error 1040` — on `origin/main` exactly as
+  on this branch. But ci.yml already raises the limit to 1000 in a dedicated
+  step (issue #419), so CI never runs at 151. Two rounds of measurement were
+  spent modelling a condition CI does not have; read the whole job, not just
+  the services block and the run script.
+
 ## Learning
 
 Operator surfaces that live in `tools/` do not ship: the image builds only the

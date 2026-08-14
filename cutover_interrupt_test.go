@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
@@ -80,12 +81,12 @@ func (w *orderRecordingWriter) result() (text string, cancelledAtWrite bool) {
 // released, so the notice must already be there by then.
 func TestInterruptNoticeIsWrittenBeforeTheContextIsCancelled(t *testing.T) {
 	notice := newOrderRecordingWriter()
-	watcher := watchInterrupt(notice)
+	watcher := newDetachedInterruptWatcher(notice)
 	defer watcher.Stop()
 	ctx := watcher.Context()
 	notice.setContext(ctx)
 
-	require.NoError(t, syscall.Kill(syscall.Getpid(), syscall.SIGINT))
+	watcher.deliver(syscall.SIGINT)
 
 	select {
 	case <-notice.wrote:
@@ -185,10 +186,10 @@ func TestInterruptExitCodeCarriesTheSignalTheOperatorSent(t *testing.T) {
 		{name: "SIGTERM", sig: syscall.SIGTERM, want: 143},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			watcher := watchInterrupt(io.Discard)
+			watcher := newDetachedInterruptWatcher(io.Discard)
 			defer watcher.Stop()
 
-			require.NoError(t, syscall.Kill(syscall.Getpid(), tc.sig))
+			watcher.deliver(tc.sig)
 			select {
 			case <-watcher.Context().Done():
 			case <-time.After(5 * time.Second):
@@ -201,6 +202,44 @@ func TestInterruptExitCodeCarriesTheSignalTheOperatorSent(t *testing.T) {
 					"Ctrl-C apart from the platform terminating the pod mid-cutover",
 				tc.sig, tc.want, int(tc.sig))
 		})
+	}
+}
+
+// TestWatchInterruptRegistersBothSignals is the one thing the detached watcher
+// cannot cover: that the production entry point actually asks the OS for
+// SIGINT and SIGTERM.
+//
+// It reads the source rather than sending signals. Delivering a real signal to
+// the test binary is how this file used to assert interrupt behaviour, and it
+// is a hazard rather than a test: watchInterrupt detaches the moment it
+// receives one, so any signal arriving in that window is handled by the default
+// disposition and takes the whole test binary down — SIGTERM silently, with no
+// `--- FAIL` line to explain it. The behaviour is covered above through the
+// channel; only the registration is left, and one line of stdlib wiring is
+// better checked than paid for in flakes.
+func TestWatchInterruptRegistersBothSignals(t *testing.T) {
+	source, err := os.ReadFile("cutover_cmd.go")
+	require.NoError(t, err)
+	require.Contains(t, string(source), "signal.Notify(w.signals, os.Interrupt, syscall.SIGTERM)",
+		"watchInterrupt must register for both the operator's Ctrl-C and the platform's SIGTERM")
+
+	// And the guard that matters: no test in this package may signal the test
+	// binary again. Reintroducing it is how CI went red with nothing to read —
+	// a SIGTERM landing after the watcher detaches kills the process outright,
+	// so the package reports `[signal: terminated]` and not one line about
+	// which test was running.
+	// Assembled at runtime so this guard does not match its own source.
+	banned := "syscall." + "Kill("
+	tests, err := filepath.Glob("*_test.go")
+	require.NoError(t, err)
+	require.NotEmpty(t, tests)
+	for _, path := range tests {
+		body, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.NotContains(t, string(body), banned,
+			"%s signals the test binary. Drive the watcher with "+
+				"newDetachedInterruptWatcher(...).deliver(sig) instead — same coverage, "+
+				"no bet on the handler still being installed.", path)
 	}
 }
 

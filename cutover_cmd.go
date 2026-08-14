@@ -211,6 +211,10 @@ func (w *interruptWatcher) Stop() {
 	})
 }
 
+// deliver hands the watcher a signal as if the OS had. Test-only: production
+// code lets signal.Notify fill the channel.
+func (w *interruptWatcher) deliver(sig os.Signal) { w.signals <- sig }
+
 // attributeInterrupt tags a cancellation with the signal that caused it, and
 // leaves every other error exactly as it is.
 //
@@ -259,6 +263,23 @@ func (w *interruptWatcher) attributeInterrupt(err error) error {
 // under "ACTIVATED: allocator is now transactional", on the one surface whose
 // entire design argument is that its output stays readable mid-incident.
 func watchInterrupt(notice io.Writer) *interruptWatcher {
+	w := newDetachedInterruptWatcher(notice)
+	signal.Notify(w.signals, os.Interrupt, syscall.SIGTERM)
+	return w
+}
+
+// newDetachedInterruptWatcher builds the watcher and starts it, but does not
+// touch the process's signal disposition — the caller decides whether to wire
+// it to the OS.
+//
+// The split exists for the tests. Asserting this watcher's behaviour by sending
+// a real signal to the test binary is not a test but a hazard: the watcher
+// detaches the instant it receives one, so a signal arriving in that window
+// meets the default disposition and kills the process — and for SIGTERM that is
+// silent, with no `--- FAIL` line to explain the dead package. Feeding the
+// channel exercises every line that matters (the notice, the ordering, the
+// recorded signal, the exit code) without betting the test binary on a race.
+func newDetachedInterruptWatcher(notice io.Writer) *interruptWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &interruptWatcher{
 		ctx:      ctx,
@@ -266,7 +287,6 @@ func watchInterrupt(notice io.Writer) *interruptWatcher {
 		signals:  make(chan os.Signal, 1),
 		finished: make(chan struct{}),
 	}
-	signal.Notify(w.signals, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		select {
