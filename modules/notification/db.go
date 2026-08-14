@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -37,10 +38,27 @@ func (s *dbStore) get(uid string) (*pauseRecord, error) {
 	return normalizePauseRecord(record), err
 }
 
-func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time) (*pauseRecord, error) {
+func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time) (*pauseRecord, bool, error) {
 	tx, err := s.session.Begin()
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	var current *pauseRecord
+	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
+		From("user_notification_pause").
+		Where("uid=?", uid).
+		Suffix("FOR UPDATE").
+		Load(&current)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, false, err
+	}
+	current = normalizePauseRecord(current)
+	if samePauseState(current, mode, pausedUntil) {
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return normalizePauseRecord(current), false, nil
 	}
 	var until interface{}
 	if pausedUntil != nil {
@@ -53,7 +71,7 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 	).Exec()
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
 	}
 	var record *pauseRecord
 	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
@@ -63,12 +81,22 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 		Load(&record)
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, err
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return normalizePauseRecord(record), nil
+	return normalizePauseRecord(record), true, nil
+}
+
+func samePauseState(record *pauseRecord, mode string, pausedUntil *time.Time) bool {
+	if record == nil || record.Mode == nil || !strings.EqualFold(*record.Mode, mode) {
+		return false
+	}
+	if record.PausedUntil == nil || pausedUntil == nil {
+		return record.PausedUntil == nil && pausedUntil == nil
+	}
+	return record.PausedUntil.Equal(*pausedUntil)
 }
 
 func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, bool, error) {

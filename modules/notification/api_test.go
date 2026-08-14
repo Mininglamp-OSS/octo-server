@@ -54,7 +54,7 @@ func TestPauseIntentSupportsManualAndDurations(t *testing.T) {
 	}
 }
 
-func TestUpdatePauseRequestRequiresRFC3339TimestampAndRejectsUnknownFields(t *testing.T) {
+func TestUpdatePauseRequestRequiresRFC3339TimestampAndAcceptsUnknownExtensionFields(t *testing.T) {
 	var request updatePauseRequest
 	if err := json.Unmarshal([]byte(`{"paused_until":"2026-08-16T09:00:00.000Z"}`), &request); err != nil {
 		t.Fatalf("valid UTC timestamp rejected: %v", err)

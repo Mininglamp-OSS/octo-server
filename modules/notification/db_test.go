@@ -15,7 +15,7 @@ func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
 	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	want := now.Add(2 * time.Hour)
-	if _, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil {
+	if _, changed, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil || !changed {
 		t.Fatal(err)
 	}
 	record, err := store.get(uid)
@@ -51,6 +51,10 @@ func newPauseTestStore(t *testing.T) (*dbStore, *config.Context) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = ctx.DB().DB.Close() })
+	if _, err := ctx.DB().DB.Exec("ALTER TABLE user_notification_pause ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NULL AFTER uid"); err != nil {
+		t.Fatal(err)
+	}
 	return newDBStore(ctx), ctx
 }
 
@@ -63,15 +67,16 @@ func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
 	// relative to the fixed query instant.
 	future := "2026-08-14 06:00:00"
 	past := "2026-08-14 04:00:00"
+	uidPrefix := fmt.Sprintf("notification-active-%d-", time.Now().UnixNano())
 	rows := []struct {
 		uid, mode string
 		until     interface{}
 	}{
-		{"notification-active-manual", pauseModeManual, nil},
-		{"notification-active-timed", pauseModeTimed, future},
-		{"notification-active-legacy", "", future},
-		{"notification-expired-timed", pauseModeTimed, past},
-		{"notification-cleared", "", nil},
+		{uidPrefix + "manual", pauseModeManual, nil},
+		{uidPrefix + "timed", pauseModeTimed, future},
+		{uidPrefix + "legacy", "", future},
+		{uidPrefix + "expired", pauseModeTimed, past},
+		{uidPrefix + "cleared", "", nil},
 	}
 	for _, row := range rows {
 		_, err := ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", row.uid)
@@ -93,12 +98,12 @@ func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, uid := range []string{"notification-active-manual", "notification-active-timed", "notification-active-legacy"} {
+	for _, uid := range []string{uidPrefix + "manual", uidPrefix + "timed", uidPrefix + "legacy"} {
 		if _, ok := active[uid]; !ok {
 			t.Fatalf("%s should be active, got %v", uid, active)
 		}
 	}
-	for _, uid := range []string{"notification-expired-timed", "notification-cleared"} {
+	for _, uid := range []string{uidPrefix + "expired", uidPrefix + "cleared"} {
 		if _, ok := active[uid]; ok {
 			t.Fatalf("%s should be inactive, got %v", uid, active)
 		}
@@ -109,10 +114,19 @@ func TestClearIsIdempotentAndDoesNotCreateRows(t *testing.T) {
 	store, ctx := newPauseTestStore(t)
 	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
 	uid := fmt.Sprintf("notification-clear-%d", time.Now().UnixNano())
-	future := now.Add(time.Hour)
 	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
-	if _, err := store.upsert(uid, pauseModeManual, &future, now); err != nil {
+	if _, changed, err := store.upsert(uid, pauseModeManual, nil, now); err != nil || !changed {
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("initial upsert should change the row")
+	}
+	repeated, repeatedChanged, err := store.upsert(uid, pauseModeManual, nil, now.Add(time.Minute))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if repeatedChanged || repeated == nil || repeated.Revision != 1 {
+		t.Fatalf("repeated identical upsert should be a no-op: record=%+v changed=%v", repeated, repeatedChanged)
 	}
 	first, firstChanged, err := store.clear(uid, now.Add(time.Minute))
 	if err != nil {

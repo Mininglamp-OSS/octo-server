@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -48,7 +49,7 @@ func (s *Service) getPause(c *wkhttp.Context) {
 
 func (s *Service) putPause(c *wkhttp.Context) {
 	var req updatePauseRequest
-	if err := c.BindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil {
 		s.writeInvalidTime(c)
 		return
 	}
@@ -58,14 +59,16 @@ func (s *Service) putPause(c *wkhttp.Context) {
 		s.writeInvalidTime(c)
 		return
 	}
-	record, err := s.db.upsert(c.GetLoginUID(), mode, pausedUntil, now)
+	record, changed, err := s.db.upsert(c.GetLoginUID(), mode, pausedUntil, now)
 	if err != nil {
 		s.writeStoreError(c, err)
 		return
 	}
 	response := s.response(record, now)
-	if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
-		s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+	if changed {
+		if err := s.sendChangedCMD(c.GetLoginUID(), response); err != nil {
+			s.Warn("发送通知暂停状态 CMD 失败", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+		}
 	}
 	c.Response(response)
 }
@@ -92,13 +95,13 @@ func (s *Service) response(record *pauseRecord, now time.Time) pauseResponse {
 		return response
 	}
 	response.Revision = record.Revision
-	if record.Mode != nil && *record.Mode == pauseModeManual {
+	if record.Mode != nil && strings.EqualFold(*record.Mode, pauseModeManual) {
 		mode := pauseModeManual
 		response.Paused = true
 		response.Mode = &mode
 		return response
 	}
-	if (record.Mode == nil || *record.Mode == pauseModeTimed) && record.PausedUntil != nil && record.PausedUntil.After(now) {
+	if (record.Mode == nil || strings.EqualFold(*record.Mode, pauseModeTimed)) && record.PausedUntil != nil && record.PausedUntil.After(now) {
 		response.Paused = true
 		mode := pauseModeTimed
 		response.Mode = &mode

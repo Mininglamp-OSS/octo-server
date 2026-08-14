@@ -1,7 +1,7 @@
 -- +migrate Up
 
 ALTER TABLE `user_notification_pause`
-  ADD COLUMN `mode` VARCHAR(16) NULL AFTER `uid`;
+  ADD COLUMN IF NOT EXISTS `mode` VARCHAR(16) NULL AFTER `uid`;
 
 -- +migrate Down
 

@@ -71,22 +71,26 @@ components:
   schemas:
     SetNotificationPause:
       type: object
-      minProperties: 1
-      maxProperties: 1
-      additionalProperties: false
-      properties:
-        duration:
-          type: string
-          enum: [30m, 1h]
-          description: Fixed duration calculated by the server
-        mode:
-          type: string
-          enum: [manual]
-          description: Pause until the user explicitly restores notifications
-        paused_until:
-          type: string
-          format: date-time
-          description: UTC absolute time later than server time; mutually exclusive with duration and mode
+      oneOf:
+        - required: [duration]
+          properties:
+            duration:
+              type: string
+              enum: [30m, 1h]
+              description: Fixed duration calculated by the server
+        - required: [mode]
+          properties:
+            mode:
+              type: string
+              enum: [manual]
+              description: Pause until the user explicitly restores notifications
+        - required: [paused_until]
+          properties:
+            paused_until:
+              type: string
+              format: date-time
+              description: UTC absolute time later than server time; mutually exclusive with duration and mode
+      description: Exactly one pause intent; unknown extension fields are accepted for forward compatibility
     NotificationPause:
       type: object
       required: [paused, mode, paused_until, revision, server_time]

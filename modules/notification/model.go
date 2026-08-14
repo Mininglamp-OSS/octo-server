@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -43,7 +44,7 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	if raw, ok := fields["duration"]; ok {
+	if raw, ok := pauseField(fields, "duration"); ok {
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("duration must be a string")
 		}
@@ -53,7 +54,7 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.Duration = &value
 	}
-	if raw, ok := fields["mode"]; ok {
+	if raw, ok := pauseField(fields, "mode"); ok {
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("mode must be a string")
 		}
@@ -63,7 +64,7 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.Mode = &value
 	}
-	if raw, ok := fields["paused_until"]; ok {
+	if raw, ok := pauseField(fields, "paused_until"); ok {
 		r.hasPausedUntil = true
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("paused_until must be an RFC3339 timestamp")
@@ -75,4 +76,16 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		r.PausedUntil = &value
 	}
 	return nil
+}
+
+func pauseField(fields map[string]json.RawMessage, name string) (json.RawMessage, bool) {
+	if value, ok := fields[name]; ok {
+		return value, true
+	}
+	for key, value := range fields {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
 }
