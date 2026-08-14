@@ -1,6 +1,7 @@
 package botevent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -79,7 +80,7 @@ const seqTableDDL = "CREATE TABLE IF NOT EXISTS `seq` (" +
 // including the singleton CHECK and the ON UPDATE clause. An abbreviated copy would mean
 // the tests never exercise the shipped schema — and the CHECK is what the migration's Down
 // relies on to refuse dropping an activated authority (review P2-11).
-const stateTableDDL = "CREATE TABLE IF NOT EXISTS `" + stateTable + "` (" +
+const stateTableDDL = "CREATE TABLE IF NOT EXISTS `" + StateTable + "` (" +
 	"`singleton_id` tinyint unsigned NOT NULL, `mode` tinyint NOT NULL DEFAULT 0, " +
 	"`epoch` bigint unsigned NOT NULL DEFAULT 0, `cutover_floor` bigint NOT NULL DEFAULT 0, " +
 	"`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, " +
@@ -99,7 +100,7 @@ func seqTestCtx(t *testing.T) (*config.Context, *rd.Client) {
 		t.Skipf("no usable MySQL at %s: %v", mysqlAddr, err)
 	}
 	if _, err := ctx.DB().Exec(stateTableDDL); err != nil {
-		t.Skipf("cannot create %s at %s: %v", stateTable, mysqlAddr, err)
+		t.Skipf("cannot create %s at %s: %v", StateTable, mysqlAddr, err)
 	}
 
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})
@@ -143,7 +144,7 @@ func setStateMode(t *testing.T, ctx *config.Context, mode int, floor int64) {
 	// Without resetting it, a test that ran the real Activate leaves epoch=1 behind and
 	// the next fixture's mirror would be a stale generation.
 	if _, err := ctx.DB().InsertBySql(
-		"insert into `"+stateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
+		"insert into `"+StateTable+"`(`singleton_id`,`mode`,`epoch`,`cutover_floor`) values(?,?,0,?) "+
 			"on duplicate key update `mode`=VALUES(`mode`), `epoch`=0, `cutover_floor`=VALUES(`cutover_floor`)",
 		stateSingletonID, mode, floor).Exec(); err != nil {
 		t.Fatalf("set state mode: %v", err)
@@ -278,7 +279,7 @@ func TestValidatedBeliefRetainsTheCutoverFloor(t *testing.T) {
 		"seq:robotEventSeq:" + newBot,
 		HighWaterSeqKey(newBot),
 	}).Exec()
-	if _, err := ctx.DB().DeleteFrom(stateTable).Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
+	if _, err := ctx.DB().DeleteFrom(StateTable).Where("singleton_id=?", stateSingletonID).Exec(); err != nil {
 		t.Fatalf("remove authority after positive resolution: %v", err)
 	}
 
@@ -1084,7 +1085,7 @@ func TestHigherMirrorEpochForcesAuthorityRefresh(t *testing.T) {
 	robotID := "seqtest_higher_epoch_bot"
 	fixture(t, ctx, client, robotID)
 
-	if _, err := ctx.DB().Update(stateTable).
+	if _, err := ctx.DB().Update(StateTable).
 		Set("mode", StateModeIncr).
 		Set("epoch", 2).
 		Set("cutover_floor", 9000).
@@ -1138,14 +1139,25 @@ func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
 
 	// A floor at or below what has already been issued would put the first activated
 	// ids under cursors clients already hold.
-	if _, _, err := Activate(ctx, 5000, 5000); !errors.Is(err, ErrFloorTooLow) {
+	if _, _, err := Activate(context.Background(), ctx, 5000, 5000); !errors.Is(err, ErrFloorTooLow) {
 		t.Fatalf("expected ErrFloorTooLow for floor == observed max, got %v", err)
 	}
-	if _, _, err := Activate(ctx, 4999, 5000); !errors.Is(err, ErrFloorTooLow) {
+	if _, _, err := Activate(context.Background(), ctx, 4999, 5000); !errors.Is(err, ErrFloorTooLow) {
 		t.Fatalf("expected ErrFloorTooLow for floor < observed max, got %v", err)
 	}
 
-	flipped, epoch, err := Activate(ctx, 7001, 5000)
+	// The upper bound is enforced by the domain, not only by the operator
+	// command: above 2^53 int64 ids stop having distinct float64 sorted-set
+	// scores, which is the defect #697 removes. Any caller must be refused, not
+	// just the one CLI that remembers to check.
+	if _, _, err := Activate(context.Background(), ctx, MaxCutoverFloor+1, 5000); !errors.Is(err, ErrFloorTooHigh) {
+		t.Fatalf("expected ErrFloorTooHigh above MaxCutoverFloor, got %v", err)
+	}
+	if st, _ := ReadState(ctx); st.Activated() {
+		t.Fatal("a refused floor must not have flipped the allocator")
+	}
+
+	flipped, epoch, err := Activate(context.Background(), ctx, 7001, 5000)
 	if err != nil || !flipped {
 		t.Fatalf("activate: flipped=%v epoch=%d err=%v", flipped, epoch, err)
 	}
@@ -1155,7 +1167,7 @@ func TestActivateValidatesFloorAndIsIdempotent(t *testing.T) {
 	}
 
 	// Idempotent: a second run reports no flip and no error.
-	again, sameEpoch, err := Activate(ctx, 9001, 5000)
+	again, sameEpoch, err := Activate(context.Background(), ctx, 9001, 5000)
 	if err != nil || again {
 		t.Fatalf("second activate should be a no-op: again=%v err=%v", again, err)
 	}

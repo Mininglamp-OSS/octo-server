@@ -62,7 +62,7 @@ func probeTestDependencies() error {
 		return fmt.Errorf("cannot create the `seq` table at %s: %w", mysqlAddr, err)
 	}
 	if _, err := ctx.DB().Exec(stateTableDDL); err != nil {
-		return fmt.Errorf("cannot create %s at %s: %w", stateTable, mysqlAddr, err)
+		return fmt.Errorf("cannot create %s at %s: %w", StateTable, mysqlAddr, err)
 	}
 
 	client := rd.NewClient(&rd.Options{Addr: redisAddr})

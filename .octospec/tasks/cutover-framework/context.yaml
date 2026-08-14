@@ -1,0 +1,17 @@
+injected:
+  - id: testing
+    source: repo
+    why: brief load-bearing tag `testing`; moved characterization tests must stay green, new pkg/cutover tests follow the NewTestContext + ensure-schema pattern
+  - id: commit-style
+    source: octo-spec@1.1.0
+    why: paths glob `**`; English Conventional Commits
+not_injected:
+  - id: rate-limit
+    why: paths glob matched (internal/**), but no request-frequency limiting touched — operator-only control plane, no HTTP handlers
+  - id: space-isolation
+    why: paths glob matched (internal/**), but no user-data access or handler changes; runtime allocation paths untouched
+  - id: error-handling
+    why: no HTTP error responses — CLI writes to stdout/stderr, no errcode/i18n changes (lint tools re-run clean)
+  - id: trust-boundary
+    why: no external content parsing/rendering in scope
+brief: .octospec/tasks/cutover-framework/brief.md

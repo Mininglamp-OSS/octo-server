@@ -1,5 +1,8 @@
-// Command botevent-seq is the operator side of the #697 fix: it reports the
-// allocator's authoritative state and flips it on.
+package main
+
+// `app cutover botevent` — the operator side of the #697 fix, moved here from
+// tools/botevent-seq so it ships inside the image. It reports the allocator's
+// authoritative state and flips it on.
 //
 // The authority is the `octo_bot_event_seq_state` row in MySQL, not the Redis key.
 // The Redis key is a mirror that lets the hot path check the mode inside the same Lua
@@ -20,23 +23,21 @@
 // robotEvent writer is INCR + ZADD with no transaction, so there is nothing to hold a
 // lock until. Confirm every replica runs the new image, pause writes briefly, then
 // activate.
-package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"sort"
-	"strings"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
-	"github.com/spf13/viper"
 )
 
 const activationPreconditions = `activate preconditions this tool CANNOT check:
@@ -52,51 +53,82 @@ const activationPreconditions = `activate preconditions this tool CANNOT check:
 
 `
 
-func main() {
-	configFile := flag.String("config", "configs/tsdd.yaml", "octo-server config file")
-	action := flag.String("action", "preflight", "preflight | activate")
-	yes := flag.Bool("yes", false, "required for activate")
+func boteventCutoverDomain() *cutoverDomain {
+	d := &cutoverDomain{
+		name:       "botevent",
+		summary:    "#697 bot event id allocator (legacy GenSeq → monotonic Redis counter)",
+		stateTable: botevent.StateTable,
+	}
 	// Defaults to every queue: the rollout treats these totals as the activation
 	// floor evidence, so a sampled default would be a validation that silently
 	// checked 1% of production. Sampling stays available for a quick look.
-	sample := flag.Int("sample", 0, "inspect only the first N queues (0 = all; sampled output is NOT activation evidence)")
-	floor := flag.Int64("floor", 0, "explicit cutover floor (0 = use the computed recommendation)")
-	flag.Parse()
-
-	cfg, err := loadConfig(*configFile)
-	if err != nil {
-		fatal("%v", err)
+	var sample int
+	d.registerFlags = func(fs *flag.FlagSet) {
+		fs.IntVar(&sample, "sample", 0, "inspect only the first N queues (0 = all; sampled output is NOT activation evidence)")
 	}
-	ctx := config.NewContext(cfg)
-	client := octoredis.NewInstrumentedClient(cfg, func(o *rd.Options) { o.MaxRetries = 2 })
-
-	switch *action {
-	case "preflight":
-		preflight(ctx, client, *sample)
-	case "activate":
-		// -yes confirms these conditions; it must not hide them from the audit log.
-		fmt.Fprint(os.Stderr, activationPreconditions)
-		if !*yes {
-			fatal("activate requires -yes after every precondition above has been verified")
-		}
-		activate(ctx, client, *floor, *sample)
-	default:
-		fatal("unsupported -action %q", *action)
+	d.preflight = func(rt *cutoverRuntime, out io.Writer) error {
+		return boteventCutoverPreflight(rt, out, sample)
 	}
+	d.activate = func(rt *cutoverRuntime, out io.Writer) error {
+		return boteventCutoverActivate(rt, out, sample)
+	}
+	d.status = boteventCutoverStatus
+	return d
 }
 
-// evidence is everything the floor has to clear, gathered from all three sources the
-// brief requires: the queues, the legacy GenSeq rows, and the durable high-water marks.
+func boteventRedisClient(cfg *config.Config) *rd.Client {
+	client := octoredis.NewInstrumentedClient(cfg, func(o *rd.Options) { o.MaxRetries = 2 })
+	fmt.Fprintf(os.Stderr, "redis: %s  db=%d\n", client.Options().Addr, client.Options().DB)
+	return client
+}
+
+func boteventCutoverPreflight(rt *cutoverRuntime, out io.Writer, sample int) error {
+	client := boteventRedisClient(rt.cfg)
+	defer client.Close()
+	ev, err := gatherBoteventEvidence(rt.deadline, rt.ctx, client, out, sample)
+	if err != nil {
+		return err
+	}
+	_, err = reportBoteventEvidence(rt.deadline, rt.ctx, out, ev)
+	return err
+}
+
+func boteventCutoverStatus(rt *cutoverRuntime, out io.Writer) error {
+	// The mirror is read from Redis, so name the server first — a status that
+	// silently reads the wrong instance reports the wrong activation state.
+	fprintRedisEndpoint(rt.cfg)
+	if err := fprintBoteventState(rt.deadline, rt.ctx, out); err != nil {
+		return err
+	}
+	mirror, mErr := readBoteventMirror(rt.ctx)
+	fmt.Fprintf(out, "mirror (%s): %s\n", botevent.ModeKey, mirror)
+	if mErr != nil {
+		fmt.Fprintf(os.Stderr, "note: %v\n", mErr)
+	}
+	fprintCutoverGuard(out, botevent.ExpectedModeEnv, botevent.ExpectedModeSpellings(), boteventModeName)
+	return nil
+}
+
+// boteventModeName renders a mode with the domain's own spelling table, so the
+// name shown here and the guard values the allocator accepts have one source.
+func boteventModeName(mode int) string {
+	return cutoverModeName(botevent.ExpectedModeSpellings(), mode)
+}
+
+// boteventEvidence is everything the floor has to clear, gathered from all three
+// sources the brief requires: the queues, the legacy GenSeq rows, and the durable
+// high-water marks.
 //
-// The queue scan alone is NOT enough, and an earlier revision of this tool made
-// exactly that mistake (review P1-8). Bots are discovered by `SCAN robotEvent:*`, so a
-// bot whose queue has fully drained — acked, or expired — has no key, contributes
-// nothing, and its `seq` rows were never read. Such a bot can still have clients
-// holding a high cursor and a `min_seq` that a lagging replica dragged backwards, so
-// the global floor would land below its live cursor while its own per-bot seed, reading
-// that same regressed row, could not catch it either. Both `seq` namespaces are
-// therefore also swept table-wide, independently of Redis.
-type evidence struct {
+// The queue scan alone is NOT enough, and an earlier revision of the standalone
+// tool made exactly that mistake (review P1-8). Bots are discovered by
+// `SCAN robotEvent:*`, so a bot whose queue has fully drained — acked, or expired —
+// has no key, contributes nothing, and its `seq` rows were never read. Such a bot
+// can still have clients holding a high cursor and a `min_seq` that a lagging
+// replica dragged backwards, so the global floor would land below its live cursor
+// while its own per-bot seed, reading that same regressed row, could not catch it
+// either. Both `seq` namespaces are therefore also swept table-wide, independently
+// of Redis.
+type boteventEvidence struct {
 	queues          int
 	inspected       int
 	sampled         bool
@@ -120,7 +152,7 @@ type queueScoreStats struct {
 	maxScore   int64
 }
 
-func (e evidence) observedMax() int64 {
+func (e boteventEvidence) observedMax() int64 {
 	m := e.maxQueueScore
 	if e.maxLegacyMinSeq > m {
 		m = e.maxLegacyMinSeq
@@ -131,31 +163,66 @@ func (e evidence) observedMax() int64 {
 	return m
 }
 
-func gather(ctx *config.Context, client *rd.Client, sample int) evidence {
-	var ev evidence
+// out receives the per-queue collision diagnostics so one activation's evidence
+// lands in one place; read failures still go to stderr alongside the other
+// warnings.
+func gatherBoteventEvidence(deadline context.Context, ctx *config.Context, client *rd.Client, out io.Writer, sample int) (boteventEvidence, error) {
+	var ev boteventEvidence
 
 	// Table-wide first, so the floor covers bots the queue scan cannot see at all.
 	// One query per namespace, no per-bot lookups.
-	if v, err := maxSeqByPrefix(ctx, "seq:"+common.RobotEventSeqKey); err != nil {
+	//
+	// An operator interrupt is NOT an unreadable evidence source. Counting it
+	// into ev.failures would tell them the database failed — preflight would
+	// print a full report and exit 0, activate would refuse with "Fix the read
+	// errors above and rerun" — and neither would reach the interrupt exit
+	// code. So a cancellation aborts here instead.
+	if v, err := maxSeqByPrefix(deadline, ctx, botevent.LegacySeqSweepPrefix()); err != nil {
+		if isCancellation(err) {
+			return boteventEvidence{}, err
+		}
 		fmt.Fprintf(os.Stderr, "  sweep legacy seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
 		ev.maxLegacyMinSeq = v
 	}
-	if v, err := maxSeqByPrefix(ctx, botevent.HighWaterSeqKey("")); err != nil {
+	if v, err := maxSeqByPrefix(deadline, ctx, botevent.HighWaterSeqKey("")); err != nil {
+		if isCancellation(err) {
+			return boteventEvidence{}, err
+		}
 		fmt.Fprintf(os.Stderr, "  sweep high-water seq rows failed: %v\n", err)
 		ev.failures++
 	} else {
 		ev.maxHighWater = v
 	}
 
+	// Last chance to bail: the queue walk below takes no per-command deadline,
+	// so entering it after an interrupt commits the operator to however long it
+	// runs — the uncancellable stretch the two-stage design exists to avoid.
+	if err := deadline.Err(); err != nil {
+		return boteventEvidence{}, err
+	}
+
+	// SCAN guarantees only that keys present throughout the iteration are
+	// returned AT LEAST once — duplicates are normal when the keyspace rehashes.
+	// Left undeduplicated they inflate ev.queues and get inspected twice, which
+	// double-counts into the duplicate-score totals. The runbook tells operators
+	// to compare those totals across two preflights ("the duplicate count must
+	// stop increasing"), so a number that moves on its own reads as ongoing id
+	// collisions after a correct activation. observedMax is unaffected — this is
+	// a reporting defect, not a floor-safety one.
+	seen := make(map[string]struct{})
 	var keys []string
 	iter := client.Scan(0, botevent.QueueKeyPrefix+"*", 500).Iterator()
 	for iter.Next() {
+		if _, dup := seen[iter.Val()]; dup {
+			continue
+		}
+		seen[iter.Val()] = struct{}{}
 		keys = append(keys, iter.Val())
 	}
 	if err := iter.Err(); err != nil {
-		fatal("scan queues: %v", err)
+		return boteventEvidence{}, fmt.Errorf("scan queues: %w", err)
 	}
 	sort.Strings(keys)
 	ev.queues = len(keys)
@@ -186,11 +253,11 @@ func gather(ctx *config.Context, client *rd.Client, sample int) evidence {
 		if stats.duplicates > 0 {
 			ev.dupQueues++
 			ev.dupMembers += stats.duplicates
-			fmt.Printf("  COLLISIONS %s: members=%d distinct=%d dup=%d\n",
+			fmt.Fprintf(out, "  COLLISIONS %s: members=%d distinct=%d dup=%d\n",
 				k, stats.members, stats.members-stats.duplicates, stats.duplicates)
 		}
 	}
-	return ev
+	return ev, nil
 }
 
 // inspectQueueScores captures the load-bearing maximum with one atomic Redis command,
@@ -258,10 +325,10 @@ func scanQueueScores(fetch func(start, stop int64) ([]rd.Z, error)) (queueScoreS
 // know which bots exist, so a drained queue cannot hide one. `_` and `%` are not
 // special in either namespace (both end in `:` after a fixed identifier), so the LIKE
 // pattern needs no escaping beyond the appended wildcard.
-func maxSeqByPrefix(ctx *config.Context, prefix string) (int64, error) {
+func maxSeqByPrefix(deadline context.Context, ctx *config.Context, prefix string) (int64, error) {
 	var max sql.NullInt64
 	if _, err := ctx.DB().SelectBySql(
-		"SELECT MAX(min_seq) FROM `seq` WHERE `key` LIKE ?", prefix+"%").Load(&max); err != nil {
+		"SELECT MAX(min_seq) FROM `seq` WHERE `key` LIKE ?", prefix+"%").LoadContext(deadline, &max); err != nil {
 		return 0, err
 	}
 	if !max.Valid {
@@ -270,113 +337,142 @@ func maxSeqByPrefix(ctx *config.Context, prefix string) (int64, error) {
 	return max.Int64, nil
 }
 
-func report(ctx *config.Context, ev evidence) int64 {
-	st, err := botevent.ReadState(ctx)
+func fprintBoteventState(deadline context.Context, ctx *config.Context, out io.Writer) error {
+	st, err := botevent.ReadStateContext(deadline, ctx)
 	switch {
 	case errors.Is(err, botevent.ErrStateMissing):
-		fmt.Printf("state: MISSING — the migration has not run. Readers treat this as legacy.\n")
+		fmt.Fprintf(out, "state: MISSING — the migration has not run. Readers treat this as legacy.\n")
 	case err != nil:
-		fatal("read state: %v", err)
+		return fmt.Errorf("read state: %w", err)
 	default:
-		mode := "legacy"
+		mode := botevent.ModeLegacy
 		if st.Activated() {
-			mode = "incr (ACTIVATED)"
+			mode = botevent.ModeIncr + " (ACTIVATED)"
 		}
-		fmt.Printf("state: mode=%s epoch=%d cutover_floor=%d\n", mode, st.Epoch, st.CutoverFloor)
+		fmt.Fprintf(out, "state: mode=%s epoch=%d cutover_floor=%d\n", mode, st.Epoch, st.CutoverFloor)
 	}
+	return nil
+}
 
-	mirror, mErr := readMirror(ctx)
-	fmt.Printf("mirror (%s): %s\n\n", botevent.ModeKey, mirror)
+func reportBoteventEvidence(deadline context.Context, ctx *config.Context, out io.Writer, ev boteventEvidence) (int64, error) {
+	if err := fprintBoteventState(deadline, ctx, out); err != nil {
+		return 0, err
+	}
+	mirror, mErr := readBoteventMirror(ctx)
+	fmt.Fprintf(out, "mirror (%s): %s\n\n", botevent.ModeKey, mirror)
 	if mErr != nil {
 		fmt.Fprintf(os.Stderr, "note: %v\n", mErr)
 	}
 
-	fmt.Printf("queues: %d   inspected: %d%s\n", ev.queues, ev.inspected,
+	fmt.Fprintf(out, "queues: %d   inspected: %d%s\n", ev.queues, ev.inspected,
 		map[bool]string{true: "  ** SAMPLED — not activation evidence, rerun with -sample 0 **"}[ev.sampled])
-	fmt.Printf("max queue score:      %d\n", ev.maxQueueScore)
-	fmt.Printf("max legacy min_seq:   %d  (whole `seq` namespace, not just bots with a live queue)\n", ev.maxLegacyMinSeq)
-	fmt.Printf("max durable high-water: %d  (whole `seq` namespace)\n", ev.maxHighWater)
-	fmt.Printf("observed max (all three): %d\n", ev.observedMax())
-	fmt.Printf("queues with duplicate scores: %d   duplicate members: %d\n", ev.dupQueues, ev.dupMembers)
+	fmt.Fprintf(out, "max queue score:      %d\n", ev.maxQueueScore)
+	fmt.Fprintf(out, "max legacy min_seq:   %d  (whole `seq` namespace, not just bots with a live queue)\n", ev.maxLegacyMinSeq)
+	fmt.Fprintf(out, "max durable high-water: %d  (whole `seq` namespace)\n", ev.maxHighWater)
+	fmt.Fprintf(out, "observed max (all three): %d\n", ev.observedMax())
+	fmt.Fprintf(out, "queues with duplicate scores: %d   duplicate members: %d\n", ev.dupQueues, ev.dupMembers)
 	if ev.failures > 0 {
-		fmt.Printf("\n** %d evidence source(s) could not be read — every total above is a LOWER BOUND **\n", ev.failures)
+		fmt.Fprintf(out, "\n** %d evidence source(s) could not be read — every total above is a LOWER BOUND **\n", ev.failures)
 	}
 
 	recommended := ev.observedMax() + 2000
-	fmt.Printf("\nrecommended cutover floor: %d  (observed max + one reserved block + margin)\n", recommended)
-	fmt.Printf("\nAfter activation the duplicate count must stop increasing. It will not drop:\n")
-	fmt.Printf("existing duplicates are deliberately left alone — an ack deletes every member\n")
-	fmt.Printf("sharing a score, and there is no record of which of a pair was ever delivered.\n")
-	return recommended
+	fmt.Fprintf(out, "\nrecommended cutover floor: %d  (observed max + one reserved block + margin)\n", recommended)
+	fmt.Fprintf(out, "\nAfter activation the duplicate count must stop increasing. It will not drop:\n")
+	fmt.Fprintf(out, "existing duplicates are deliberately left alone — an ack deletes every member\n")
+	fmt.Fprintf(out, "sharing a score, and there is no record of which of a pair was ever delivered.\n")
+	return recommended, nil
 }
 
-func preflight(ctx *config.Context, client *rd.Client, sample int) {
-	ev := gather(ctx, client, sample)
-	report(ctx, ev)
-}
+// maxSafeFloor is the highest cutover floor this command will accept. The bound
+// itself lives in the domain (botevent.MaxCutoverFloor) and is enforced inside
+// Activate as well, so a caller that is not this command is bounded too; the
+// check here exists to refuse before gathering evidence and to say why.
+const maxSafeFloor = botevent.MaxCutoverFloor
 
-// maxSafeFloor is the highest cutover floor this tool will accept.
-//
-// Sorted-set scores are float64, so above 2^53 distinct int64 ids stop having distinct
-// scores — which recreates the pagination skip and the multi-member ack this whole
-// change removes, from the one command meant to prevent them (review P2-3). 2^50 leaves
-// three orders of magnitude of headroom above any plausible id and is still nowhere
-// near the precision boundary.
-const maxSafeFloor = 1 << 50
+func boteventCutoverActivate(rt *cutoverRuntime, out io.Writer, sample int) error {
+	// -yes confirms these conditions; it must not hide them from the audit log.
+	fmt.Fprint(os.Stderr, activationPreconditions)
+	if !rt.yes {
+		return errors.New("activate requires -yes after every precondition above has been verified")
+	}
+	client := boteventRedisClient(rt.cfg)
+	defer client.Close()
 
-func activate(ctx *config.Context, client *rd.Client, floor int64, sample int) {
-	ev := gather(ctx, client, sample)
+	ev, err := gatherBoteventEvidence(rt.deadline, rt.ctx, client, out, sample)
+	if err != nil {
+		return err
+	}
 	if ev.sampled {
-		fatal("refusing to activate from sampled evidence; rerun without -sample")
+		return errors.New("refusing to activate from sampled evidence; rerun without -sample")
 	}
 	if ev.failures > 0 {
-		fatal("refusing to activate from incomplete evidence: %d source(s) could not be read, so "+
+		return fmt.Errorf("refusing to activate from incomplete evidence: %d source(s) could not be read, so "+
 			"the observed maximum is a lower bound. A floor validated against a lower bound can "+
 			"still land beneath a live consumer cursor, which is the loss this flip exists to stop. "+
 			"Fix the read errors above and rerun.", ev.failures)
 	}
-	recommended := report(ctx, ev)
+	recommended, err := reportBoteventEvidence(rt.deadline, rt.ctx, out, ev)
+	if err != nil {
+		return err
+	}
+	floor := rt.floor
 	if floor == 0 {
 		floor = recommended
 	}
 	if floor <= 0 || floor > maxSafeFloor {
-		fatal("refusing floor=%d: it must be positive and at most %d, above which int64 ids no "+
+		return fmt.Errorf("refusing floor=%d: it must be positive and at most %d, above which int64 ids no "+
 			"longer have distinct float64 sorted-set scores", floor, int64(maxSafeFloor))
 	}
-	refuseUnauthorizedMirror(ctx, client)
-	fmt.Printf("\nactivating with floor=%d (observed max=%d)\n", floor, ev.observedMax())
-
-	flipped, epoch, err := botevent.Activate(ctx, floor, ev.observedMax())
-	if err != nil {
-		fatal("activate: %v", err)
+	if err := refuseUnauthorizedBoteventMirror(rt.deadline, rt.ctx, client); err != nil {
+		return err
 	}
+	fmt.Fprintf(out, "\nactivating with floor=%d (observed max=%d)\n", floor, ev.observedMax())
+
+	flipped, epoch, err := botevent.Activate(rt.deadline, rt.ctx, floor, ev.observedMax())
+	// flipped before err: Flip joins a post-commit connection-cleanup failure
+	// into err, and treating that as "activate failed" would skip the mirror
+	// publication below for an authority that is already committed — the exact
+	// half-done state this command exists to prevent.
 	if !flipped {
-		fmt.Printf("already activated at epoch %d; nothing to do\n", epoch)
+		if err != nil {
+			return err // botevent.Activate already prefixes its own errors
+		}
+		fmt.Fprintf(out, "already activated at epoch %d; nothing to do\n", epoch)
 		// Still reconcile the mirror. Failure is operationally incomplete even though
 		// the authority was already committed, so preserve the write pause and exit non-zero.
-		if err := writeMirror(client, epoch); err != nil {
-			fatal("%v", err)
-		}
-		return
+		return writeMirror(client, epoch)
 	}
-	// Mirror second: the authority is committed. A failure here leaves cached negative
-	// beliefs able to use GenSeq temporarily, so it is not a successful activation.
-	if err := writeMirror(client, epoch); err != nil {
-		fatal("%v", err)
+	// Mirror first, then report: the authority is committed either way, and a
+	// missing mirror is the more urgent of the two problems. A mirror failure
+	// leaves cached negative beliefs able to use GenSeq temporarily, so it is
+	// not a successful activation.
+	if mirrorErr := writeMirror(client, epoch); mirrorErr != nil {
+		return mirrorErr
 	}
-	fmt.Printf("activated at epoch %d. Replicas switch on their next allocation.\n\n", epoch)
-	fmt.Printf("Verify now:\n")
-	fmt.Printf("  - no `botevent: seed event id counter` errors in logs (a failed seed refuses\n")
-	fmt.Printf("    the enqueue rather than issuing an unsafe id)\n")
-	fmt.Printf("  - rerun preflight: the duplicate count must stop growing\n")
-	fmt.Printf("  - bot events still flowing (POST /v1/bot/events returning results)\n")
-	fmt.Printf("  - dmwork_bot_event_seq_mirror_unauthorized_total stays 0 (non-zero means some\n")
-	fmt.Printf("    replica saw a mode mirror the authority did not confirm)\n")
-	fmt.Printf("  - then roll out OCTO_BOTEVENT_EXPECTED_MODE=incr so a lost mirror AND a lost\n")
-	fmt.Printf("    authority row fail closed instead of degrading\n\n")
-	fmt.Printf("There is no online deactivate. Going back means every counter-issued id is above\n")
-	fmt.Printf("what GenSeq would hand out next, so legacy ids would land below consumer cursors —\n")
-	fmt.Printf("the same loss, in reverse. Roll forward.\n")
+	if err != nil {
+		// Non-zero, matching msgextra. Today this branch is unreachable for
+		// botevent — its FlipSpec sets no LockWaitTimeoutSeconds, so the plain
+		// path's cleanup cannot fail — but that is an accident of configuration,
+		// and the two domains disagreeing about what a post-commit cleanup
+		// failure means is exactly the kind of thing a third domain would
+		// inherit at random.
+		return fmt.Errorf("the flip COMMITTED and the mirror was published, but releasing "+
+			"the database connection failed: %w", err)
+	}
+	fmt.Fprintf(out, "activated at epoch %d. Replicas switch on their next allocation.\n\n", epoch)
+	fmt.Fprintf(out, "Verify now:\n")
+	fmt.Fprintf(out, "  - no `botevent: seed event id counter` errors in logs (a failed seed refuses\n")
+	fmt.Fprintf(out, "    the enqueue rather than issuing an unsafe id)\n")
+	fmt.Fprintf(out, "  - rerun preflight: the duplicate count must stop growing\n")
+	fmt.Fprintf(out, "  - bot events still flowing (POST /v1/bot/events returning results)\n")
+	fmt.Fprintf(out, "  - dmwork_bot_event_seq_mirror_unauthorized_total stays 0 (non-zero means some\n")
+	fmt.Fprintf(out, "    replica saw a mode mirror the authority did not confirm)\n")
+	fmt.Fprintf(out, "  - then roll out OCTO_BOTEVENT_EXPECTED_MODE=incr so a lost mirror AND a lost\n")
+	fmt.Fprintf(out, "    authority row fail closed instead of degrading\n\n")
+	fmt.Fprintf(out, "There is no online deactivate. Going back means every counter-issued id is above\n")
+	fmt.Fprintf(out, "what GenSeq would hand out next, so legacy ids would land below consumer cursors —\n")
+	fmt.Fprintf(out, "the same loss, in reverse. Roll forward.\n")
+	return nil
 }
 
 // mirrorVerdict is what the pre-flip mirror check decided.
@@ -395,8 +491,9 @@ const (
 // the allocator is already activated.
 //
 // Split out from the Redis/MySQL plumbing so the matrix is testable without either — this
-// tool carries the whole activation procedure and had no tests at all, which is how the bug
-// below shipped (review round 7 P2-1, found independently by two reviewers).
+// command carries the whole activation procedure and its standalone predecessor had no
+// tests at all, which is how the bug below shipped (review round 7 P2-1, found
+// independently by two reviewers).
 //
 // `activated` is the authority's answer, and reading it first is the entire fix. The previous
 // revision refused on *any* parseable mirror claim without consulting the state row, so
@@ -434,8 +531,8 @@ func judgeMirror(activated bool, mirror string, absent bool) (mirrorVerdict, str
 		botevent.ModeKey, mirror)
 }
 
-// refuseUnauthorizedMirror stops an activation while a mirror claiming activation sits
-// against an authority that says otherwise.
+// refuseUnauthorizedBoteventMirror stops an activation while a mirror claiming activation
+// sits against an authority that says otherwise.
 //
 // That state means this Redis is not what the operator believes: someone wrote the key, it is
 // shared with another environment, or a snapshot from an activated era was restored. Any of
@@ -444,35 +541,36 @@ func judgeMirror(activated bool, mirror string, absent bool) (mirrorVerdict, str
 // checking it here is where that window gets closed in practice.
 //
 // Runs after the floor checks so the operator sees every other problem in one pass.
-func refuseUnauthorizedMirror(ctx *config.Context, client *rd.Client) {
+func refuseUnauthorizedBoteventMirror(deadline context.Context, ctx *config.Context, client *rd.Client) error {
 	v, err := client.Get(botevent.ModeKey).Result()
 	absent := err == rd.Nil
 	if err != nil && !absent {
-		fatal("cannot read the mode mirror (%v); refusing to activate without knowing whether a "+
+		return fmt.Errorf("cannot read the mode mirror (%w); refusing to activate without knowing whether a "+
 			"stale one is present", err)
 	}
 
 	// Read the authority before judging the mirror. Skipping this is what made a correct
 	// mirror look like a forged one.
 	activated := false
-	switch st, sErr := botevent.ReadState(ctx); {
+	switch st, sErr := botevent.ReadStateContext(deadline, ctx); {
 	case sErr == nil:
 		activated = st.Activated()
 	case errors.Is(sErr, botevent.ErrStateMissing):
 		// The migration has not run. Not activated, and a mirror claiming otherwise is
 		// exactly the case worth refusing on.
 	default:
-		fatal("cannot read the allocator state (%v); refusing to judge the mirror without it — "+
+		return fmt.Errorf("cannot read the allocator state (%w); refusing to judge the mirror without it — "+
 			"that is the mistake this check was added to fix", sErr)
 	}
 
 	verdict, msg := judgeMirror(activated, v, absent)
 	switch verdict {
 	case mirrorRefuse:
-		fatal("%s", msg)
+		return errors.New(msg)
 	case mirrorNote:
 		fmt.Fprint(os.Stderr, msg)
 	}
+	return nil
 }
 
 // writeMirror publishes the generation-stamped mirror value.
@@ -492,7 +590,7 @@ func writeMirror(client *rd.Client, epoch uint64) error {
 	return nil
 }
 
-func readMirror(ctx *config.Context) (string, error) {
+func readBoteventMirror(ctx *config.Context) (string, error) {
 	v, err := ctx.GetRedisConn().GetString(botevent.ModeKey)
 	if err != nil {
 		return "(unreadable)", fmt.Errorf("read mirror: %w", err)
@@ -501,25 +599,4 @@ func readMirror(ctx *config.Context) (string, error) {
 		return "(absent — allocators will rebuild it from the authority)", nil
 	}
 	return v, nil
-}
-
-// loadConfig mirrors tools/msgextra-version so both operator tools resolve the same
-// file plus the same TS_* environment overrides.
-func loadConfig(path string) (*config.Config, error) {
-	vp := viper.New()
-	vp.SetConfigFile(path)
-	if err := vp.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
-	}
-	vp.SetEnvPrefix("TS")
-	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	vp.AutomaticEnv()
-	cfg := config.New()
-	cfg.ConfigureWithViper(vp)
-	return cfg, nil
-}
-
-func fatal(f string, a ...interface{}) {
-	fmt.Fprintf(os.Stderr, "botevent-seq: "+f+"\n", a...)
-	os.Exit(1)
 }

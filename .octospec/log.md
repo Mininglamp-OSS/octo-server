@@ -4,6 +4,46 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-13 (cutover-framework)
+
+- **Refactor** — Task `cutover-framework`: extracted the control plane the three
+  one-way cutover mechanisms (#627 msgextra, #697 botevent, #733 token session)
+  had hand-written separately into the new leaf package `pkg/cutover` —
+  singleton state read, FOR UPDATE CAS flip with under-lock evidence and floor
+  bounds, and the malformed-fails-closed expected-mode guard — and folded the
+  two standalone operator tools into the server binary as
+  `app cutover <domain> {preflight,activate,status}` so they finally ship in
+  the image (the #733 precedent, generalized). Refusal conditions, floor
+  semantics (#627 inclusive vs #697 strict), sentinel errors, and runtime hot
+  paths are unchanged; the characterization tests moved with the code. The
+  session rollout stays on its own five-phase surface and shares only the
+  documented conventions (`docs/cutover-framework.md`: state-table template,
+  `OCTO_<DOMAIN>_EXPECTED_MODE` naming, the flip-then-arm ordering invariant,
+  evidence discipline, Down 3819 pattern). Runbooks now live in `docs/`
+  (msgextra moved, botevent written for the first time). A review round fixed
+  twelve findings on top, four of them operationally material: the endpoint
+  print echoed the full MySQL DSN (password included) and is now redacted; a
+  committed flip could be reported as a failure when releasing the pinned
+  connection failed; msgextra never named the Redis instance whose scan sets its
+  cutover floor; and `msgextra status` hard-failed on a missing state row,
+  hiding the guard readout in exactly the state that fails every write closed.
+  A second review round fixed twelve more, led by a regression from the first
+  round's own fix: the signal handler added to make a wedged activation
+  abortable had disabled default termination while no evidence phase could
+  observe the context, so the command ignored every Ctrl-C. Interrupts are now
+  two-stage (cancel, then restore default handling so a second signal
+  terminates), the botevent score ceiling moved into the domain, and the
+  msgextra mode constants alias the shared ones rather than restating them.
+  A third round added a schema conformance test for every registered domain's
+  state table (asserting the DDL from the live migrated schema and the inert
+  seed from the migration source), and a fourth closed thirteen more: an
+  operator interrupt was being reported as unreadable evidence, the interrupt
+  notice raced process exit, two botevent MySQL reads still ignored the
+  deadline, SIGTERM now exits 143 rather than sharing SIGINT's 130, and the
+  operator commands say which config file they resolved again (on stderr, so
+  `session-rollout status` stays parseable).
+  See [journal](journal/shared/cutover-framework.md).
+
 ## 2026-08-12 (profile-visibility-system-bot-whitelist)
 
 - **Task** — `profile-visibility-system-bot-whitelist`: took the public-bot

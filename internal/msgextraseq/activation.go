@@ -3,8 +3,15 @@ package msgextraseq
 // Operator activation surface for #627 (PR-3). Preflight is read-only and
 // recommends a safe cutover floor; Activate flips the DB-authoritative state row
 // legacy→transactional under an exclusive lock that drains in-flight writers.
-// Neither runs in a request path — they are invoked by the tools/msgextra-version
-// operator command.
+// Neither runs in a request path — they are invoked by the `app cutover
+// msgextra` operator command.
+//
+// The transactional scaffolding of the flip (FOR UPDATE CAS, idempotency,
+// floor bounds, pinned-connection lock-wait timeout) lives in pkg/cutover,
+// shared with #697. What stays here is what is specific to this domain: which
+// evidence bounds the floor (message_extra maxima, legacy GenSeq boundaries,
+// Redis sync cursors), that the evidence is recomputed UNDER the drain
+// barrier, and the sentinel errors this package's callers already match on.
 //
 // There is deliberately no online "deactivate": rolling back to legacy cannot be
 // done safely by a single DB flip. octo-lib's GenSeq HiLo allocator caches its
@@ -14,7 +21,7 @@ package msgextraseq
 // change cannot invalidate that in-memory cache. Rollback is therefore a
 // documented, maintenance-window coordinated procedure (drain writes → raise the
 // legacy seq boundaries above the transactional max → restart every replica →
-// flip mode); see tools/msgextra-version/README.md §6.
+// flip mode); see docs/msgextra-cutover-runbook.md §6.
 //
 // The cutover floor must be at least every version already handed out or validly
 // cached as a client sync cursor (otherwise post-cutover writes could remain
@@ -29,12 +36,11 @@ package msgextraseq
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cutover"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -87,32 +93,66 @@ type PreflightResult struct {
 	RecommendedFloor int64
 }
 
+// CurrentState reads the live allocator state row — no locks, no evidence
+// scans, no writes. It is the cheap read behind `app cutover msgextra status`;
+// Preflight is the full-evidence version.
+//
+// It returns this package's State, not pkg/cutover's: the shared control plane
+// is an implementation detail of the flip, and callers already spell this
+// package's field names (CutoverFloor, not Floor).
+func (s *Store) CurrentState(ctx context.Context) (State, error) {
+	st, err := cutover.ReadState(ctx, s.ctx.DB(), StateTable)
+	if err != nil {
+		switch {
+		case errors.Is(err, cutover.ErrStateTableMissing):
+			return State{}, ErrStateTableMissing
+		case errors.Is(err, cutover.ErrStateMissing):
+			return State{}, ErrStateRowMissing
+		default:
+			return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
+		}
+	}
+	return State{Mode: st.Mode, Epoch: st.Epoch, CutoverFloor: st.Floor}, nil
+}
+
+// ErrStateTableMissing is the subset of ErrStateRowMissing where the table
+// itself is absent, and it matters here more than in the sibling domain.
+//
+// This allocator's runtime treats the two OPPOSITELY:
+//
+//   - missing ROW: readStateForShare maps dbr.ErrNotFound to legacy, so writes
+//     keep flowing on the pre-cutover allocator.
+//   - missing TABLE (MySQL 1146): readStateForShare has no case for it, the
+//     error propagates, and EVERY message_extra write fails closed.
+//
+// So an operator surface must be able to say which one it found. It wraps
+// ErrStateRowMissing, so callers that only care that the authority is absent
+// keep matching on that.
+var ErrStateTableMissing = fmt.Errorf("%w: the table itself does not exist", ErrStateRowMissing)
+
 // Preflight reads (no locks, no writes) the maxima that bound already-issued
 // versions and reports a safe cutover floor plus the current state. It never
 // mutates anything, so it is safe to run against production at any time.
-func (s *Store) Preflight() (PreflightResult, error) {
+//
+// ctx bounds the MySQL reads. It does NOT bound the Redis cursor scan: the
+// client library takes no per-command context, so a scan already in flight runs
+// to completion. That residue is why the operator command's interrupt handling
+// has a second stage.
+func (s *Store) Preflight(ctx context.Context) (PreflightResult, error) {
 	var res PreflightResult
 
-	var state struct {
-		Mode         int    `db:"mode"`
-		Epoch        uint64 `db:"epoch"`
-		CutoverFloor int64  `db:"cutover_floor"`
-	}
-	err := s.ctx.DB().SelectBySql(
-		"SELECT `mode`, `epoch`, `cutover_floor` FROM `octo_message_extra_version_state` WHERE `singleton_id`=?",
-		stateSingletonID,
-	).LoadOne(&state)
+	state, err := cutover.ReadState(ctx, s.ctx.DB(), StateTable)
 	if err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
+		if errors.Is(err, cutover.ErrStateMissing) {
 			return PreflightResult{}, ErrStateRowMissing
 		}
 		return PreflightResult{}, fmt.Errorf("msgextraseq: preflight read state: %w", err)
 	}
 	res.CurrentMode = state.Mode
 	res.CurrentEpoch = state.Epoch
-	res.CurrentFloor = state.CutoverFloor
+	res.CurrentFloor = state.Floor
 
-	maxVersion, maxSeq, err := s.observedMaxima(s.ctx.DB())
+	maxVersion, maxSeq, err := s.observedMaxima(ctx, s.ctx.DB())
 	if err != nil {
 		return PreflightResult{}, err
 	}
@@ -147,38 +187,65 @@ func (s *Store) Preflight() (PreflightResult, error) {
 // maxima it recomputes under the lock are final. floor must be >= that max or the
 // flip is refused (ErrFloorTooLow). Returns flipped=false with a nil error when
 // the allocator is already transactional (idempotent).
-func (s *Store) Activate(floor int64) (flipped bool, retErr error) {
-	activationTx, err := s.beginActivationTransaction()
-	if err != nil {
-		return false, fmt.Errorf("msgextraseq: activate begin: %w", err)
+func (s *Store) Activate(ctx context.Context, floor int64) (bool, error) {
+	flipped, newEpoch, err := cutover.Flip(ctx, s.ctx.DB(), cutover.FlipSpec{
+		Table:    StateTable,
+		Floor:    floor,
+		MaxFloor: MaxCutoverFloor,
+		// Recompute every source under the drain barrier so a concurrently-
+		// committing legacy writer cannot have raised the DB maxima after the
+		// caller's Preflight. The runbook also drains /message/extra/sync while
+		// this Redis scan runs; unlike writers, cursor updates do not take the
+		// MySQL state-row lock.
+		Observe: func(tx *dbr.Tx) (int64, error) {
+			return s.observeUnderDrainBarrier(ctx, tx)
+		},
+		LockWaitTimeoutSeconds: activationLockWaitTimeoutSeconds,
+	})
+	// flipped is checked BEFORE err on purpose. Releasing the pinned connection
+	// can fail after the row is committed, and Flip joins that failure into err;
+	// reporting flipped=false there would tell the operator the cutover did not
+	// happen while the database says it did, and would skip the metric updates
+	// that describe the allocator now in force. See cutover.Flip's contract.
+	if flipped {
+		setAllocatorModeGauge(ModeTransactional)
+		metricCutoverFloor.Set(float64(floor))
+		metricAllocatorEpoch.Set(float64(newEpoch))
+		return true, err
 	}
-	defer func() {
-		if cleanupErr := activationTx.cleanup(); cleanupErr != nil {
-			retErr = errors.Join(retErr, cleanupErr)
+	if err != nil {
+		var floorErr *cutover.FloorError
+		switch {
+		case errors.Is(err, cutover.ErrStateMissing):
+			return false, ErrStateRowMissing
+		case errors.Is(err, cutover.ErrUnknownMode):
+			return false, fmt.Errorf("%w: %v", ErrUnknownMode, err)
+		case errors.As(err, &floorErr) && floorErr.TooHigh:
+			// Upper bound: reserveTransactional rejects cur > maxSafeInteger-count,
+			// so a floor without at least one full batch of headroom would activate
+			// cleanly and then fail every reservation with ErrOverflow (a write
+			// outage). Rejected before any state change.
+			return false, fmt.Errorf("%w: floor=%d max=%d", ErrFloorTooHigh, floorErr.Floor, floorErr.Max)
+		case errors.As(err, &floorErr):
+			return false, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floorErr.Floor, floorErr.Observed)
+		case errors.Is(err, cutover.ErrFlipInvariant):
+			metricInvariantViolationTotal.Inc()
+			return false, ErrInvariantViolation
+		default:
+			return false, err
 		}
-	}()
-	tx := activationTx.tx
-
-	mode, epoch, err := s.lockStateForUpdate(tx)
-	if err != nil {
-		return false, err
 	}
-	switch mode {
-	case ModeTransactional:
-		return false, nil // already active — idempotent
-	case ModeLegacy:
-		// proceed
-	default:
-		return false, fmt.Errorf("%w: %d", ErrUnknownMode, mode)
-	}
+	return false, nil // already transactional — idempotent
+}
 
-	// Recompute every source under the drain barrier so a concurrently-committing
-	// legacy writer cannot have raised the DB maxima after the caller's Preflight.
-	// The runbook also drains /message/extra/sync while this Redis scan runs;
-	// unlike writers, cursor updates do not take the MySQL state-row lock.
-	maxVersion, maxSeq, err := s.observedMaxima(tx)
+// observeUnderDrainBarrier recomputes the issued ceiling with the state row
+// held FOR UPDATE: the MySQL maxima are final because every writer holds the
+// row FOR SHARE until commit, and the Redis cursor scan is authoritative only
+// under the runbook's /message/extra/sync drain.
+func (s *Store) observeUnderDrainBarrier(ctx context.Context, tx *dbr.Tx) (int64, error) {
+	maxVersion, maxSeq, err := s.observedMaxima(ctx, tx)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	observed := maxVersion
 	if maxSeq > observed {
@@ -186,166 +253,12 @@ func (s *Store) Activate(floor int64) (flipped bool, retErr error) {
 	}
 	redisEvidence, err := s.observeRedisCursorEvidence(observed)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	if redisEvidence.maxCursor > observed {
 		observed = redisEvidence.maxCursor
 	}
-	if floor < observed {
-		return false, fmt.Errorf("%w: floor=%d observed max=%d", ErrFloorTooLow, floor, observed)
-	}
-	// Upper bound: reserveTransactional rejects cur > maxSafeInteger-count, so a
-	// floor without at least one full batch of headroom would activate cleanly and
-	// then fail every reservation with ErrOverflow (a write outage). Reject it
-	// before changing state.
-	if floor > MaxCutoverFloor {
-		return false, fmt.Errorf("%w: floor=%d max=%d", ErrFloorTooHigh, floor, int64(MaxCutoverFloor))
-	}
-
-	res, err := tx.UpdateBySql(
-		"UPDATE `octo_message_extra_version_state` SET `mode`=?, `cutover_floor`=?, `epoch`=? WHERE `singleton_id`=? AND `mode`=?",
-		ModeTransactional, floor, epoch+1, stateSingletonID, ModeLegacy,
-	).Exec()
-	if err != nil {
-		return false, fmt.Errorf("msgextraseq: activate update: %w", err)
-	}
-	// Defense-in-depth: we read mode==ModeLegacy while holding the state row
-	// FOR UPDATE, so the mode-conditional UPDATE must match exactly one row. A
-	// zero-row result means the drain barrier was lost (e.g. a future refactor drops
-	// lockStateForUpdate) and a concurrent flip slipped in — surface it instead of
-	// committing and reporting a phantom flipped=true. Mirrors reserveTransactional's
-	// post-write invariant guard.
-	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
-		metricInvariantViolationTotal.Inc()
-		return false, ErrInvariantViolation
-	}
-	// Restore the pooled connection's session setting before commit. A restore
-	// failure rolls the mode change back; cleanup retries after rollback and
-	// discards the connection if the session cannot be restored safely.
-	if err := activationTx.restoreBeforeCommit(); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("msgextraseq: activate commit: %w", err)
-	}
-	setAllocatorModeGauge(ModeTransactional)
-	metricCutoverFloor.Set(float64(floor))
-	metricAllocatorEpoch.Set(float64(epoch + 1))
-	return true, nil
-}
-
-// activationTransaction pins one SQL connection so the operator-only lock-wait
-// timeout can be restored before that connection returns to the shared pool.
-type activationTransaction struct {
-	tx                      *dbr.Tx
-	conn                    *sql.Conn
-	previousLockWaitTimeout int64
-	restored                bool
-}
-
-func (s *Store) beginActivationTransaction() (*activationTransaction, error) {
-	ctx := context.Background()
-	session := s.ctx.DB()
-	conn, err := session.DB.Conn(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var previous int64
-	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&previous); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("read session lock-wait timeout: %w", err)
-	}
-	if _, err := conn.ExecContext(
-		ctx,
-		"SET SESSION innodb_lock_wait_timeout = ?",
-		activationLockWaitTimeoutSeconds,
-	); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("set session lock-wait timeout: %w", err)
-	}
-
-	sqlTx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		restoreErr := restoreActivationLockWaitTimeout(conn, previous)
-		closeErr := closeActivationConnection(conn, restoreErr != nil)
-		return nil, errors.Join(err, restoreErr, closeErr)
-	}
-	return &activationTransaction{
-		tx: &dbr.Tx{
-			EventReceiver: session.EventReceiver,
-			Dialect:       session.Dialect,
-			Tx:            sqlTx,
-			Timeout:       session.GetTimeout(),
-		},
-		conn:                    conn,
-		previousLockWaitTimeout: previous,
-	}, nil
-}
-
-func (a *activationTransaction) restoreBeforeCommit() error {
-	if err := restoreActivationLockWaitTimeout(a.tx, a.previousLockWaitTimeout); err != nil {
-		return err
-	}
-	a.restored = true
-	return nil
-}
-
-func (a *activationTransaction) cleanup() error {
-	a.tx.RollbackUnlessCommitted()
-	var restoreErr error
-	if !a.restored {
-		restoreErr = restoreActivationLockWaitTimeout(a.conn, a.previousLockWaitTimeout)
-	}
-	closeErr := closeActivationConnection(a.conn, restoreErr != nil)
-	return errors.Join(restoreErr, closeErr)
-}
-
-type contextExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
-
-func restoreActivationLockWaitTimeout(execer contextExecer, previous int64) error {
-	if _, err := execer.ExecContext(
-		context.Background(),
-		"SET SESSION innodb_lock_wait_timeout = ?",
-		previous,
-	); err != nil {
-		return fmt.Errorf("msgextraseq: restore session lock-wait timeout: %w", err)
-	}
-	return nil
-}
-
-func closeActivationConnection(conn *sql.Conn, discard bool) error {
-	if discard {
-		// Returning driver.ErrBadConn prevents database/sql from putting a
-		// connection with an unknown session setting back into the pool.
-		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-	}
-	if err := conn.Close(); err != nil {
-		return fmt.Errorf("msgextraseq: close activation connection: %w", err)
-	}
-	return nil
-}
-
-// lockStateForUpdate takes the exclusive drain-barrier lock on the singleton
-// state row and returns its mode and epoch.
-func (s *Store) lockStateForUpdate(tx *dbr.Tx) (mode int, epoch uint64, err error) {
-	var row struct {
-		Mode  int    `db:"mode"`
-		Epoch uint64 `db:"epoch"`
-	}
-	err = tx.SelectBySql(
-		"SELECT `mode`, `epoch` FROM `octo_message_extra_version_state` WHERE `singleton_id`=? FOR UPDATE",
-		stateSingletonID,
-	).LoadOne(&row)
-	if err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
-			return 0, 0, ErrStateRowMissing
-		}
-		return 0, 0, fmt.Errorf("msgextraseq: lock state: %w", err)
-	}
-	return row.Mode, row.Epoch, nil
+	return observed, nil
 }
 
 // observedMaxima returns MAX(message_extra.version) and the max legacy GenSeq
@@ -353,17 +266,17 @@ func (s *Store) lockStateForUpdate(tx *dbr.Tx) (mode int, epoch uint64, err erro
 // always return one row, so a missing row is impossible; any driver error other
 // than that is surfaced. The querier is the caller's tx (under the drain barrier)
 // or a plain session (read-only Preflight).
-func (s *Store) observedMaxima(q dbr.SessionRunner) (maxVersion, maxSeq int64, err error) {
+func (s *Store) observedMaxima(ctx context.Context, q dbr.SessionRunner) (maxVersion, maxSeq int64, err error) {
 	if err = q.SelectBySql(
 		"SELECT COALESCE(MAX(`version`),0) FROM `message_extra`",
-	).LoadOne(&maxVersion); err != nil {
+	).LoadOneContext(ctx, &maxVersion); err != nil {
 		return 0, 0, fmt.Errorf("msgextraseq: observe max message_extra version: %w", err)
 	}
 	legacyPrefix := fmt.Sprintf("seq:%s:%%", common.MessageExtraSeqKey)
 	if err = q.SelectBySql(
 		"SELECT COALESCE(MAX(`min_seq`),0) FROM `seq` WHERE `key` LIKE ?",
 		legacyPrefix,
-	).LoadOne(&maxSeq); err != nil {
+	).LoadOneContext(ctx, &maxSeq); err != nil {
 		return 0, 0, fmt.Errorf("msgextraseq: observe max legacy seq: %w", err)
 	}
 	return maxVersion, maxSeq, nil

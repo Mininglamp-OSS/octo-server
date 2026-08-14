@@ -4,8 +4,9 @@ package main
 // rollout, folded into the server binary.
 //
 // It used to be two standalone commands under tools/, which the Dockerfile
-// never built: the image ships only /home/app, so a private deployment was
-// guaranteed to arrive without them. Nothing referenced them from CI either.
+// never built: the image carries the root-package binary plus assets/ and
+// configs/ and nothing from tools/, so a private deployment was guaranteed to
+// arrive without them. Nothing referenced them from CI either.
 //
 // The operator surface stays deliberately small because the advance predicate
 // needs no human judgement and the reconciler runs it:
@@ -47,6 +48,7 @@ import (
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
+	"github.com/spf13/viper"
 )
 
 const sessionRolloutCommand = "session-rollout"
@@ -279,11 +281,37 @@ func sessionRolloutDB(cfg *config.Config) *dbr.Session {
 	)
 }
 
-func loadSessionRolloutConfig(path string) (*config.Config, error) {
-	vp := loadConfigFromFile(path)
+// operatorConfigViper resolves an operator subcommand's config file plus the
+// same TS_* environment overrides the server applies.
+//
+// Shared by `app session-rollout` and `app cutover` so the rules for how a
+// config path and its env overrides are resolved have one definition: two
+// copies means a change (a new override, a required post-load validation)
+// silently lands on one operator command and not the other.
+//
+// It returns an error where the server's own loader panics: an operator typo in
+// -config should be a one-line message, not a stack trace.
+func operatorConfigViper(path string, notice io.Writer) (*viper.Viper, error) {
+	vp := viper.New()
+	vp.SetConfigFile(path)
+	if err := vp.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	// The server prints this on startup and the operator commands inherited it
+	// until the loader was factored out. It belongs on stderr, not stdout:
+	// `session-rollout status` emits JSON that runbooks pipe into jq.
+	fmt.Fprintln(notice, "config:", vp.ConfigFileUsed())
 	vp.SetEnvPrefix("TS")
 	vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	vp.AutomaticEnv()
+	return vp, nil
+}
+
+func loadSessionRolloutConfig(path string) (*config.Config, error) {
+	vp, err := operatorConfigViper(path, os.Stderr)
+	if err != nil {
+		return nil, err
+	}
 	tokenExpire, err := validateTokenExpireConfig(vp)
 	if err != nil {
 		return nil, err

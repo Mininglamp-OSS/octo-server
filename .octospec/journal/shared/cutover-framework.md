@@ -1,0 +1,476 @@
+---
+type: Journal
+title: "Journal: cutover-framework"
+description: Record of extracting the shared control plane of the three one-way cutover mechanisms into pkg/cutover and folding the two standalone operator tools into the server binary
+tags: [cutover, operability, refactor, cli, botevent, msgextra]
+timestamp: 2026-08-13T00:00:00+08:00
+task: cutover-framework
+source: self
+---
+
+# Journal: cutover-framework
+
+## What was done
+
+- **`pkg/cutover`** (new leaf package): the control plane the three cutovers had
+  hand-written separately — `ReadState` (missing row and missing table both →
+  `ErrStateMissing`; anything else surfaced so "not migrated" stays
+  distinguishable from "authority unreachable"), `Flip` (FOR UPDATE CAS,
+  idempotent re-run, observe-under-lock closure, inclusive/strict floor policy,
+  optional MaxFloor, optional pinned-connection `innodb_lock_wait_timeout` with
+  restore-or-discard — #627's activationTransaction machinery, generalized), and
+  `ExpectedMode` (guard env parse/assert: unset asserts nothing, malformed fails
+  closed). Error *wording* deliberately stays in the domains: those messages
+  explain domain consequences and are read mid-incident.
+- **`internal/msgextraseq`**: `Activate` now calls `cutover.Flip` with the
+  evidence recompute as the under-lock closure; drain-barrier semantics, floor
+  bounds, sentinel errors (`ErrFloorTooLow/TooHigh/StateRowMissing/
+  ErrInvariantViolation`) and messages preserved. Guard parse swapped to the
+  shared parser (env name and error text unchanged). Added `CurrentState()` for
+  the status verb. Runtime paths (`ReserveTx`, `readStateForShare`, `Mode`)
+  untouched.
+- **`pkg/botevent`**: `state.go`'s `ReadStateContext`/`Activate` delegate to the
+  framework; strict floor (`>`) semantics and sentinels preserved. `mode.go`'s
+  guard internals moved onto `cutover.ExpectedMode` (wording unchanged); `seq.go`
+  gained `LegacySeqSweepPrefix` and a constant rename. The allocation logic —
+  `NextEventID`, the belief cache, the gate, the seed — is untouched.
+- **`app cutover <domain> {preflight,activate,status}`** (root package,
+  pre-flag.Parse dispatch like `app session-rollout`): domains `msgextra` and
+  `botevent`. Ships in the image — no more cross-compiling and `kubectl cp`ing
+  a 43MB binary into a prod pod. `status` is new: state row + guard env, no
+  evidence scan. Every invocation prints the MySQL (and Redis, where used)
+  endpoint first. `tools/msgextra-version` and `tools/botevent-seq` deleted;
+  the botevent CLI's tests (judgeMirror matrix, mirror-write-failure contract,
+  scan-paging guards) moved to `cutover_botevent_test.go`.
+- **Docs**: `docs/cutover-framework.md` (state-table template, guard-env naming
+  `OCTO_<DOMAIN>_EXPECTED_MODE`, the flip-then-arm ordering invariant, evidence
+  discipline, Down 3819 pattern, no-online-deactivate, new-domain checklist),
+  `docs/msgextra-cutover-runbook.md` (moved from the tool README, commands
+  updated), `docs/botevent-cutover-runbook.md` (first standalone runbook — it
+  previously lived in source comments and CLI output), cross-reference in the
+  token-session runbook.
+
+## What deliberately did NOT move
+
+- **#733 session rollout**: five-phase evidence ladder with a reconciler, not a
+  two-state flip; already in-image with its own 7-verb surface. It shares the
+  documented conventions, not the code.
+- Floor evidence gathering (per-domain by nature), #697's mirror
+  judgement/publication, and every runtime read path.
+- Existing guard env names (deployments may already reference them); the naming
+  convention binds new domains only.
+
+## Accepted small semantic deltas (all fail-closed-preserving)
+
+- Guard env values are whitespace-trimmed **when matched** in both domains
+  (botevent already trimmed; msgextra previously treated `"legacy\n"` as
+  malformed → fail closed; now it is a valid assertion — same assertion, fewer
+  ConfigMap surprises). A whitespace-**only** value stays malformed and fails
+  closed in both domains, which tightens botevent.
+  > This entry originally claimed the trim was fail-closed-preserving without
+  > qualification, and the first implementation trimmed before the emptiness
+  > test — which made a blank value equal to unset, i.e. fail-**open**. Caught
+  > as a P1 in the fifth review round; see that section. The table below is
+  > meant to be the thing that catches this class, so it is worth noting that
+  > here it vouched for the defect instead.
+- msgextra `Preflight`/`CurrentState` on a missing *table* now report
+  `ErrStateRowMissing` ("run the migration first") instead of a raw MySQL 1146.
+- botevent `Activate` on a corrupt mode value (neither 0 nor 1) now fails with
+  the framework's `ErrUnknownMode` instead of "flip matched 0 rows"; both
+  refuse, the new message names the cause.
+
+## Load-bearing details
+
+- `pkg/botevent/genseq_guard_test.go` forbids naming `RobotEventSeqKey` outside
+  `pkg/botevent/seq.go` and exempted `tools/`. The evidence sweep moving to the
+  root package would have tripped it; the guard now allowlists
+  `cutover_botevent.go` explicitly (reader, not allocator) instead of relying
+  on a directory exemption. The delegation assertion still targets seq.go only.
+- The moved source guard `TestPreflightPagesQueueMembers` reads its own file;
+  its target changed from `main.go` to `cutover_botevent.go` with the move.
+- `cutover.Flip` returns a typed `*FloorError` rather than formatted sentinel
+  errors so each domain re-renders the numbers with its own sentinel and
+  wording — existing `errors.Is` contracts in tests and callers survive.
+
+## Verification
+
+- Local (no MySQL/Redis in this sandbox): `go build ./...`, `go vet ./...`,
+  gofmt on touched files, `lint-direct-error-response`, `lint-unregistered-code`
+  all clean; pure-source tests pass (both genseq/source guards, the moved
+  judgeMirror matrix + paging + precondition-text tests, mirror-write-failure
+  against a dead Redis, `pkg/cutover` guard parser).
+- CI carries the MySQL-backed proof: `internal/msgextraseq` activation/store
+  suites, `pkg/botevent` integration suite, new `pkg/cutover` flip/state tests.
+
+## Review round (12 findings, all fixed)
+
+A review pass over the first commit found twelve issues; none touched the
+architecture, four were operationally material:
+
+- **The endpoint print leaked the DB password.** `cfg.DB.MySQLAddr` is a full
+  DSN, so the "say where we are before doing anything" line — copied from
+  session-rollout, which prints a bare `host:port` — put the credential into
+  operator scrollback, `kubectl logs`, and any audit capture. Now redacted to
+  `host:port/schema` via `mysql.ParseDSN`, with an unparseable DSN yielding a
+  placeholder rather than falling back to the raw string. Pinned by
+  `TestRedactedMySQLEndpointNeverLeaksTheCredential`.
+- **A committed flip could be reported as a failure.** `Flip` returns
+  `flipped=true` alongside a joined connection-cleanup error, and both domains
+  checked `err` first — so a post-commit cleanup failure produced
+  "not flipped", no metrics, and (for botevent) a skipped mirror publication on
+  a committed authority. The contract is now documented on `Flip` and both
+  wrappers check `flipped` before mapping errors, restoring pre-refactor
+  behavior.
+- **msgextra never printed the Redis endpoint** even though its floor evidence
+  comes from a `messageExtraVersion:*` scan — the same failure mode the design
+  cites as its reason for printing endpoints at all. Added for
+  preflight/activate, and for `botevent status` which reads the mirror.
+- **`msgextra status` hard-failed on a missing state row**, returning before the
+  guard readout — precisely the missing-row + armed-guard combination that fails
+  every write closed. It now reports MISSING and continues, matching botevent.
+
+The rest: `flag.ErrHelp` handling and `SetOutput(io.Discard)` (so `-h` exits 0
+and a typo prints once); guard readout scoped to "this process's env" (the
+runbooks endorse off-replica runs, where the local env says nothing about the
+fleet); guard spellings exported from each domain via `ExpectedModeSpellings()`
+so the CLI cannot disagree with the allocator; `CurrentState` returns
+`msgextraseq.State` instead of leaking `cutover.State`; `Flip` takes a context
+(a wedged MySQL previously hung the activation with writes drained) and the CLI
+supplies a signal-aware one; `gatherBoteventEvidence` writes collisions to `out`
+instead of stdout; and the genseq guard's file exemption narrowed from "skip the
+file" to "waive the key-name check only", verified by injecting a GenSeq call
+and watching the guard fail.
+
+`cutover_cmd_test.go` covers the dispatch guards the file's own comment calls
+load-bearing — unknown domain/action rejected before the config is read,
+positional args, `-h`, every registered domain fully wired, plus the redaction
+and guard-scope assertions.
+
+## Second review round (12 more findings, all fixed)
+
+The headline is a **regression introduced by the previous round's own fix**. To
+make a wedged activation abortable, that round added
+`signal.NotifyContext(...)` — which disables default SIGINT/SIGTERM termination
+for the whole command. But the evidence phases cannot observe a context
+(go-redis v6 has no per-command deadline, and the MySQL aggregates were
+context-free), so Ctrl-C neither aborted the work nor killed the process: the
+command became strictly *less* interruptible than the standalone tools it
+replaced, precisely while msgextra holds the state row `FOR UPDATE` and blocks
+every writer. The runbook had been updated to promise the opposite.
+
+Interrupts are now two-stage: the first signal cancels what is cancellable and
+immediately calls `stop()` to restore default handling, so a second Ctrl-C
+terminates a scan that cannot be cancelled. Verified end-to-end against a TCP
+listener that accepts and never responds — the command hangs, one SIGINT
+produces `context canceled` and exit, and the notice prints (which is itself
+proof `stop()` ran). Both runbooks now describe the real behavior.
+
+Also fixed:
+
+- `closeFlipConnection(discard=true)` reported a fabricated close failure every
+  time: `conn.Raw` returning `driver.ErrBadConn` closes the Conn as a side
+  effect, so the following `Close()` always returns `sql.ErrConnDone`. Verified
+  against a live MySQL before changing it. That noise was being appended to the
+  half-done-cutover message, the one an operator must read correctly.
+- The `BeginTx`-failure path restored the session timeout on the caller's
+  (usually just-cancelled) context — the hazard `cleanup()` had been fixed for.
+  Both now share `restoreDetached`.
+- `botevent.Activate` did not pass `MaxFloor`, leaving the 2^50 float64-score
+  ceiling enforced only in the CLI. The bound moved to
+  `botevent.MaxCutoverFloor` (it is a property of how ids are stored, not of how
+  the flip is invoked) and is enforced inside `Activate`, with a test.
+- `msgextraseq.ModeLegacy/ModeTransactional` were independent literals while
+  `cutover.Flip` writes `cutover.ModeActive`; they are now aliases, as botevent
+  already had. Renumbering the shared constants can no longer flip successfully
+  and then fail every write closed.
+- The hot path's `FOR SHARE` read still inlined the table name and its own
+  singleton const; both now come from `stateTable` / `cutover.SingletonID` (same
+  SQL text).
+- `cutoverModeName` picked a name by map iteration — nondeterministic the moment
+  a domain adds an alias, which `ParseExpectedMode` supports. Now deterministic.
+- Dead `cfg.Addr == ""` branch removed from the redaction helper (`ParseDSN`
+  normalizes, verified empirically).
+- `loadCutoverConfig` and `loadSessionRolloutConfig` now share
+  `operatorConfigViper`.
+- Test hygiene: the scratch state table is dropped in `t.Cleanup`; the guard
+  test clears the env var it asserts on instead of trusting the ambient
+  environment; the framework doc's `Flip` signature updated.
+
+## Schema: three tables kept separate, plus a conformance test
+
+Asked whether the two `mode/epoch/cutover_floor` tables should be merged into
+one `octo_cutover_state(domain, ...)`. Decided **no**, recorded in
+docs/cutover-framework.md: migrations are per-module `//go:embed sql` so a
+shared table forces a cross-module ordering dependency into a ledger that is
+already fragile; msgextra's state row is read `FOR SHARE` on every
+`message_extra` write and should not share an InnoDB page with an unrelated
+domain's flip; botevent's Down guard (`CHECK(singleton_id=1)` → 3819 when
+activated) is per-table and would degrade to a documentation-only rule; and
+#733's table has a different shape entirely, so the idea covers two of three
+mechanisms at best. Against that, the only benefit is not copying eight lines
+of DDL.
+
+Worth noting the window: both domains are deployed but unactivated, so their
+rows hold only the seeded legacy value. That is the one moment when changing
+this schema would be cheap — it closes permanently the first time either flips.
+The decision is a judgement about future domain count, not a constraint.
+
+The cost of not merging is copied DDL, which drifts like copied code. So
+`TestCutoverDomainTablesMatchTheFrameworkTemplate` (root package) reads the real
+migrated schema from `information_schema` and checks every registered domain:
+column names/types/nullability/defaults, `utf8mb4_general_ci`, PK exactly
+`(singleton_id)`, the singleton CHECK, and a seeded `mode=0 epoch=0 floor=0` row
+(a migration must never activate anything). Shipped deviations live in
+`knownTemplateDeviations` with the reason — `#627` has no `updated_at`, and
+adding one means an ALTER on a table every write reads `FOR SHARE` for a purely
+observational column. Listed deviations are reported; unlisted ones fail, so a
+new domain inherits the whole template.
+
+The test needed the real migration output rather than the domain packages'
+`CREATE TABLE IF NOT EXISTS` fallbacks, so it uses `testutil.NewTestServer` (the
+root package pulls in every module through `internal/`) with pkg/botevent's
+CI-hard-fail / local-skip posture.
+
+Mutation-tested rather than assumed: seeding botevent at `mode=1` fails the
+inert-deploy assertion, and removing msgextra's CHECK constraint fails with
+"no CHECK constraint pinning singleton_id = 1". Both migrations restored after.
+
+## Third review round (P1 + five P2s)
+
+Two reviewers converged on one blocker and the same P2 set at head `21e56f5a`.
+
+**P1 — the schema conformance test could not survive the harness.** Not the
+`t.Cleanup` I would have blamed: `testutil.NewTestServer` clears every table
+except `gorp_migrations` on ENTRY and only then runs ledger-gated migrations, so
+the seeded row is gone before any assertion runs, on any schema that has these
+migrations recorded. Removing the cleanup would not have helped. Verified
+against octo-lib's source rather than inferred.
+
+The reviewer offered clearing the two ledger rows as one fix; that one does not
+work here — #627's migration is `CREATE TABLE` without `IF NOT EXISTS` and a
+plain `INSERT`, so re-running it hits error 1050. Took the other direction and
+sharpened it: the inert-seed invariant is a property of the MIGRATION, not of
+the current row (an activated production database holds mode=1 legitimately), so
+it is asserted from the migration's `-- +migrate Up` section. The DDL assertions
+stay on the live schema, where they belong and are idempotent. Mutation-tested
+both ways (seed `mode=1`, seed deleted) and pinned with a regression that
+deletes the rows and re-runs the whole check.
+
+**The genseq exemption was worse than "narrow".** Rather than tightening it,
+removed the need for it: `botevent.LegacySeqSweepPrefix()` lets the operator
+command sweep the legacy rows without naming the key, so the repo-wide ban is
+unconditional again. RED/GREEN was real here — injecting the two-line
+`key := …RobotEventSeqKey…; GenSeq(key)` form passed the guard with the
+exemption and is caught at the exact line without it.
+
+**The interrupt notice could fire on a clean exit.** `signal.NotifyContext`'s
+stop cancels before detaching, so the deferred stop woke the watcher. Replaced
+with an explicit `signal.Notify` watcher gated on the signal itself. The old
+shape fails the new 500-iteration test at around iteration 15; the new one is
+structurally immune.
+
+**The interrupt comment overstated what observes the context** — three
+reviewers, independently. Threaded the deadline into the MySQL evidence reads
+(`Preflight(ctx)`, `observedMaxima` via `LoadOneContext`, botevent's
+`maxSeqByPrefix`), which are the ones that run under `FOR UPDATE`, and stated
+plainly that the Redis sweeps cannot be cancelled. New test: a cancelled
+context aborts `Preflight`.
+
+**`status` told the operator the opposite of the truth in one state.**
+`ErrStateRowMissing` covers both a missing row and a missing table, but
+msgextraseq's `FOR SHARE` reader defaults to legacy only for the row — a missing
+table fails every `message_extra` write closed. So the state where `status`
+matters most was the state where it reported "readers treat this as legacy".
+Added `StateTableExists` and made the two cases say opposite things, and
+corrected the `pkg/cutover` doc, which had promised a contract only one of its
+two domains honors. (`StateTableExists` was itself replaced in the fourth round
+by `cutover.ErrStateTableMissing` — see below.)
+
+Also: post-commit cleanup failure now exits non-zero in both domains (botevent
+publishes the mirror first, then reports); the `Commit`-ack edge where a
+committed flip reports `flipped=false` is documented in the docstring and both
+runbooks' verify steps; `flip_test`'s comment about `Conn.Close()` keeping the
+pool clean was simply wrong and now asserts the round trip instead; plus exit
+130 on interrupt, `.gitignore`, and the duplicate error wrap.
+
+## Fourth review round (13 findings, all fixed, TDD)
+
+Every fix below went RED first — the failing assertion was recorded before the
+production change existed.
+
+**An interrupt was being laundered into "unreadable evidence".** With the
+deadline threaded into the botevent sweeps, a Ctrl-C came back as two failed
+evidence sources: preflight then printed a full report and exited 0, and
+activate refused with "Fix the read errors above and rerun". Both blamed the
+database for what the operator had just done, and neither reached the interrupt
+exit path. `gatherBoteventEvidence` now aborts on a cancellation, and re-checks
+the deadline before entering the Redis queue walk — the uncancellable stretch
+the two-stage design exists to avoid.
+
+**The interrupt notice raced process exit.** Cancelling releases the main
+goroutine, which returns to `main` and calls `os.Exit`, which does not wait for
+goroutines — so the line telling the operator that a second Ctrl-C terminates
+could simply be lost. It is now written before `cancel()`, pinned by a writer
+that records `ctx.Err()` at write time rather than racing it from the test.
+
+**Two botevent MySQL reads still ignored the deadline** — `status` and the
+pre-flip mirror check, the latter running with bot-event writes already paused.
+Both went through `ReadState`, which hardcodes `context.Background`. The
+previous round's claim that "the MySQL reads observe the deadline in every
+domain" was therefore not yet true; it is now.
+
+**`StateTableExists` was the wrong shape** (added last round). The distinction
+already exists at the point the driver returns MySQL 1146; probing
+`information_schema` afterwards re-derives a fact that was thrown away.
+Replaced with `cutover.ErrStateTableMissing`, which *wraps* `ErrStateMissing`,
+so no caller has to handle it and the ones that care can. One query fewer, and
+the msgextra `status` output now distinguishes MISSING TABLE ("every write is
+failing closed") from MISSING ROW ("writers default to legacy and keep
+flowing"). botevent deliberately keeps one message: its reader treats both the
+same, which the code says explicitly.
+
+**Exit code 143 for SIGTERM.** The command reported 130 for any interruption,
+which is the SIGINT convention. But these are as likely to be stopped by
+`kubectl delete pod` or a rolling deploy — and after an interrupted one-way
+flip, "a human stopped this" and "the platform reclaimed the pod" call for
+different next steps. The watcher now remembers which signal it received and
+`cutoverExitCode` returns 128+signum; a refusal stays 1. Verified end-to-end
+against a wedged MySQL: SIGTERM → 143, SIGINT → 130.
+
+**The operator commands stopped saying which config they resolved.** Factoring
+out `operatorConfigViper` dropped the server's `Using config file:` echo. It is
+back, on **stderr** — `session-rollout status` emits JSON that runbooks pipe
+into jq, and this is the one line tying a cutover's output to the endpoints it
+acted on.
+
+Also: SCAN results are deduplicated (SCAN promises *at least* once, and the
+duplicates were double-counting into the very totals the runbook tells operators
+to compare across two preflights); a commented-out seed no longer satisfies the
+migration-seed assertion (line comments are stripped before the regex); the
+migration tree is walked once per test binary instead of four times;
+`seqCeilings` uses `LegacySeqSweepPrefix()` like every other caller; and the
+lock-wait test skips rather than fails when the server default collides with the
+value under test.
+
+## CI went red, and the tests were the reason
+
+`21e56f5a` was fully green. `c2e53118` turned CI's Test job red and it stayed red
+across a re-run — while every local run passed.
+
+The delta that matters: `c2e53118` added the first tests in this repo that send
+a real signal to the test binary (`syscall.Kill(os.Getpid(), SIGINT)` and
+`… SIGTERM`). `watchInterrupt` detaches the instant it receives one — that is
+the second stage the design needs — so a signal arriving in that window is
+handled by the **default disposition** and takes the whole process down. For
+SIGTERM that is silent: the package reports `[signal: terminated]` with no
+`--- FAIL` line naming a test, which is exactly what made the CI log
+uninformative.
+
+Fixed by splitting the constructor: `newDetachedInterruptWatcher` builds and
+starts the watcher without touching signal disposition, `watchInterrupt` adds
+the `signal.Notify` wiring, and tests call `deliver(sig)` on the channel. Same
+assertions — notice-before-cancel, the recorded signal, 130 vs 143 — with no bet
+on the handler still being installed. A guard scans the package's `_test.go`
+files so it cannot come back, and one source assertion keeps the registration
+line honest.
+
+Then the next run came back **cancelled**, not failed: the job hit
+`timeout-minutes: 30` with the test step still running at 28m32s, while the
+same commit's earlier run had finished in 26m32s. The suite had grown to where
+runner speed decided the verdict. Raised the ceiling to 45 and wrote down what
+the real fix is (the per-package DROP + full sql-migrate across ~113 packages
+under `-race`), because raising a timeout is buying time, not paying the bill.
+
+The other half of that change is an `::error::` annotation per failing package.
+Three consecutive red runs were diagnosed without ever learning which package
+failed — see the first dead end below. Annotations live on the check run, which
+is reachable when the log is not.
+
+Two dead ends recorded so the next person does not repeat them:
+
+- **The failing package is not visible.** GitHub's job-log API returns only the
+  final step, and the WuKongIM service container's teardown dump fills the
+  entire 1.3 MB the tool will return — zero `go test` lines. `output.text` on
+  the check run is empty, re-running the workflow is 403, and the direct log
+  endpoint is blocked by the agent proxy.
+- **The `max_connections` trail was a false lead.** `modules/user` (peak 197)
+  and `modules/common` (peak 162) really do exceed the `mysql:8.0` default of
+  151, and both really do panic with `Error 1040` — on `origin/main` exactly as
+  on this branch. But ci.yml already raises the limit to 1000 in a dedicated
+  step (issue #419), so CI never runs at 151. Two rounds of measurement were
+  spent modelling a condition CI does not have; read the whole job, not just
+  the services block and the run script.
+
+## Fifth review round — the guard regressed, and the journal said it hadn't
+
+A reviewer filed P1 at head `e8ae3212`: `ParseExpectedMode` trimmed **before**
+the emptiness test, so `OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=" "` became
+indistinguishable from unset. msgextra's predecessor switched on the raw value,
+so whitespace-only hit `default` → malformed → every `message_extra` write
+failed closed, loudly. The new behaviour is fail-closed → **fail-open**, on the
+one net that catches a lost or reset state row after a cutover.
+
+Two things are worth keeping from this beyond the fix.
+
+First, **the entry above listed it under "accepted small semantic deltas (all
+fail-closed-preserving)", and the PR description said "all three refuse in both
+the old and new code".** Both were written about the trailing-newline case and
+neither was re-checked against the whitespace-only case they also covered. The
+delta table was the artifact that should have caught this and instead vouched
+for it.
+
+Second, **the fix is one line of ordering**: test emptiness on the raw value,
+trim only when matching. That keeps the ConfigMap-newline improvement the trim
+was added for and restores the loud failure. It also tightens botevent, whose
+predecessor trimmed first — accepted deliberately, since the shared contract in
+`guard.go` is the one both domains should hold, and a blank guard is a
+misconfiguration in either. The maintainer signed off on that widening.
+
+Also fixed in the same round: `Flip` now classifies MySQL 1146 as
+`ErrStateTableMissing` like `ReadState` does (three reviewers converged on it —
+the sentinel is what both domains switch on, and an unclassified 1146 reads
+"authority unreachable" for "migration has not run"); and
+`cutoverSchemaDepsAvailable` probes `OCTO_MASTER_KEY` and Redis, not just MySQL,
+because `testutil.NewTestServer` *panics* without the key and a panic takes the
+whole root-package binary down — the ~50 pure CLI tests that need no
+infrastructure never reported. Verified: without the key the package now runs 57
+tests and skips one, instead of reporting nothing.
+
+## Learning
+
+Operator surfaces that live in `tools/` do not ship: the image builds only the
+root package, so a standalone cutover tool is undeliverable exactly where it is
+needed (production, private deployments). #733 learned this for
+session-rollout; this task applies it to the remaining two and records the rule
+in docs/cutover-framework.md — `tools/` is for dev-only utilities (repro
+harnesses, linters), operator surfaces mount on the server binary.
+
+From the third round: **a guard is only as strong as its weakest exemption, and
+the honest fix is usually to remove the need for the exemption rather than to
+narrow it.** Narrowing the genseq waiver from "skip the file" to "check the
+allocation shape" felt like tightening; it swapped an unconditional key-name ban
+for a line-anchored pattern the file's own header documents as insufficient.
+Giving the caller a helper so it never names the key restored the strong rule.
+The same question is worth asking of any allowlist: can the entry be deleted
+instead of qualified?
+
+And a process one: **rebasing is not pushing.** Force-pushing a rebase to a
+branch under review cost a full review round — a reviewer byte-compared blob
+hashes across both heads to establish that nothing had changed.
+
+From the second round: **a safety mechanism that only half-works can be worse
+than none.** Installing a signal handler is not the same as being
+interruptible — it *takes over* termination, so unless every phase honors the
+context it hands out, it converts "Ctrl-C kills this" into "nothing kills this".
+Before adding one, enumerate the phases that cannot observe a context and decide
+what happens to them; here that answer had to be a second stage. The same shape
+applies to any capability that replaces a default: check what the default was
+doing for you first.
+
+A second, sharper one from the first review round: **copying a precedent copies
+its shape, not its safety.** The endpoint print, the `flag.ContinueOnError` setup and the
+"validate the subcommand before dialing" ordering all came from
+`session_rollout_cmd.go` — but the credential-free data source, the
+`SetOutput(io.Discard)` line, and the tests pinning the guards did not come with
+them. When lifting a pattern from a sibling, diff against the original rather
+than re-deriving from memory.

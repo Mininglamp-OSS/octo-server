@@ -1,25 +1,32 @@
-# msgextra-version — #627 activation runbook
+# msgextra cutover — #627 activation runbook
 
 The transactional `message_extra` version allocator (#627) ships **inert**: the
 schema (PR #644) and the writer cutover (PR-2) are behavior-neutral because the
 DB-authoritative state row is seeded `mode=legacy`, so `ReserveTx` delegates to
-the existing process-local `GenSeq`. This tool performs the one remaining step —
-flipping the state row to `mode=transactional` — which is what actually fixes the
-bug (commit-ordered, per-channel-unique versions across replicas).
+the existing process-local `GenSeq`. The `app cutover msgextra` operator command
+performs the one remaining step — flipping the state row to `mode=transactional`
+— which is what actually fixes the bug (commit-ordered, per-channel-unique
+versions across replicas).
 
 Activation is a **runtime state-row flip, not a code deploy**: it takes effect
 immediately on every replica the moment the `UPDATE` commits.
 
-## Build
+The command is part of the server binary and ships inside the image — run it
+from any pod (or any machine with the config file and DB/Redis access):
 
 ```
-go build -o /tmp/msgextra-version ./tools/msgextra-version
+/home/app cutover msgextra <preflight|activate|status> [flags]
 ```
+
+There is nothing to build or copy into the pod. (Its predecessor,
+`tools/msgextra-version`, was a standalone command the image never contained.)
+Shared conventions — the state-table shape, the guard-env ordering invariant,
+the evidence discipline — are documented in [cutover-framework.md](cutover-framework.md).
 
 ## 1. Preflight (read-only, safe anytime)
 
 ```
-/tmp/msgextra-version -config configs/tsdd.yaml -action preflight
+/home/app cutover msgextra preflight -config configs/tsdd.yaml
 ```
 
 Reports the current mode/epoch/floor and the recommended `cutover_floor` — the
@@ -38,6 +45,10 @@ upgraded `/message/extra/sync` handler independently constrains every request an
 cached cursor to that storage channel's persisted `MAX(message_extra.version)`,
 so old poisoned fields self-heal when their client/source next syncs. This avoids
 both an activation DoS and unsafe manual Redis deletion.
+
+`app cutover msgextra status` is the lightweight variant: the state row and the
+expected-mode guard only, no evidence scan — for "which mode is prod in" checks
+that should not pay for a keyspace walk.
 
 ## 2. Prepare
 
@@ -70,9 +81,9 @@ both an activation DoS and unsafe manual Redis deletion.
 3. Activate while the write drain remains in place:
 
 ```
-/tmp/msgextra-version -config configs/tsdd.yaml -action activate -yes
+/home/app cutover msgextra activate -config configs/tsdd.yaml -yes
 # or pin an explicit floor at/above the recommendation:
-/tmp/msgextra-version -config configs/tsdd.yaml -action activate -floor <N> -yes
+/home/app cutover msgextra activate -config configs/tsdd.yaml -floor <N> -yes
 ```
 
 `activate` takes the state row `FOR UPDATE` — the **writer drain barrier**: it
@@ -93,6 +104,12 @@ the expected-mode guard after a failed activation.
 
 Run these steps in order:
 
+0. **If `activate` reported a failure, re-run it before believing that.** A
+   connection dropped between the server's commit and the client's ack is
+   indistinguishable from a commit that never landed, so a flip that happened
+   can be reported as failed. The re-run is idempotent: it prints "already
+   transactional — nothing to do" if the flip did land, and retries cleanly if
+   it did not.
 1. Confirm `preflight` shows `mode=transactional` at the new epoch.
 2. Confirm `message_extra.version` is strictly increasing per channel and
    delta-sync no longer skips terminal card frames. Verify metrics:
@@ -114,6 +131,15 @@ on every replica (a normal config rollout / restart). This is the durable
 read-side guard: if the state row is ever lost or reset to `legacy`, a replica
 that expects `transactional` fails closed (`ErrExpectedModeMismatch`) instead of
 silently reverting to the process-local `GenSeq` and re-opening the skip window.
+
+**What counts as a value.** Only a completely absent (or empty) variable means
+"no assertion". The value is whitespace-trimmed *before it is matched*, so
+`transactional\n` from a YAML block scalar is accepted — but a value that is
+nothing but whitespace is **malformed, not unset**, and fails every write closed
+until it is fixed or removed. That is deliberate: a template that renders the
+guard blank must be loud, because the alternative is a fleet that believes the
+net is armed while it asserts nothing. The same holds for
+`OCTO_BOTEVENT_EXPECTED_MODE`.
 
 **Ordering is mandatory and one-directional.** The DB flip (§3) must commit and be
 confirmed (§4) *before* any replica boots with this env. Never ship the env in the
@@ -189,8 +215,28 @@ above them.
 
 ## Notes
 
-- The tool connects to MySQL and Redis via the normal DB config. Redis is required
-  for cursor evidence; WuKongIM is not used.
-- All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`) and is
-  covered by `activation_test.go` against live MySQL; the command here is a thin
-  wrapper.
+- The command connects to MySQL and Redis via the normal DB config. Redis is
+  required for cursor evidence; WuKongIM is not used. Every invocation prints
+  the MySQL endpoint it resolved before doing anything, and `preflight` /
+  `activate` also print the Redis endpoint they are about to scan — check both
+  against the environment you mean to act on. The printed MySQL endpoint is
+  host:port/schema only; the DSN's credential is deliberately not echoed.
+- `status` reports the expected-mode guard from **the environment of the
+  process running the command**, which is not the fleet's unless you are on a
+  replica. Confirm the fleet's guard where it is actually set (deployment
+  manifest / a replica's env), not from a laptop run.
+- Interrupting the command is two-stage. The first Ctrl-C / SIGTERM cancels the
+  MySQL work — the evidence reads and a flip waiting on an unresponsive server —
+  and says so. It cannot cancel an in-flight Redis `SCAN`/`HSCAN` (the client
+  library takes no per-command deadline), so that sweep runs to completion and a
+  **second** Ctrl-C terminates the command outright. If you interrupt during
+  `activate`, re-run `preflight` before retrying: an aborted flip commits
+  nothing, but the evidence you were shown is stale.
+- Exit codes: `0` success, `1` a refusal (bad floor, unreadable evidence),
+  `130` interrupted by Ctrl-C, `143` terminated by SIGTERM. The last two are
+  worth separating in any wrapper — `143` on an activation usually means the
+  platform reclaimed the pod (`kubectl delete pod`, a rolling deploy), not that
+  anyone decided to stop.
+- All DB logic lives in `internal/msgextraseq` (`Preflight` / `Activate`, built
+  on the shared `pkg/cutover` flip primitives) and is covered by
+  `activation_test.go` against live MySQL; the command here is a thin wrapper.
