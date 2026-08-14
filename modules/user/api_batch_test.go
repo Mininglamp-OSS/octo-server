@@ -37,8 +37,28 @@ func newBatchUserServer(t *testing.T) (*server.Server, *config.Context) {
 	t.Helper()
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// POST /v1/users/batch now mounts the process-level SharedUIDRateLimiter, whose
+	// per-uid bucket (ratelimit:uid:{uid}) persists in Redis and is NOT cleared by
+	// CleanAllTables. Reset testutil.UID's bucket so earlier tests in this binary
+	// (and TestBatchUsersHuman_RequestValidation's 7 back-to-back requests against
+	// the singleton) start from a full bucket. See rate-limit.md testing note.
+	resetUserUIDRateLimit(t, ctx)
 	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	return s, ctx
+}
+
+// seedBatchUserFull inserts a user row with an explicit is_destroy value so the
+// liveness gate (Status == enable AND IsDestroy == IsDestroyNo) can be exercised.
+// status: 0 disabled, 1 enabled, 2 blacklist. robot: 0 human, 1 bot. isDestroy:
+// 0 normal, 1 applying (cooling-off), 2 destroyed.
+func seedBatchUserFull(t *testing.T, ctx *config.Context, uid, name string, status, robot, isDestroy int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, username, short_no, vercode, zone, phone, email, status, robot, is_destroy) "+
+			"VALUES (?, ?, ?, ?, ?, '0086', '13800008888', ?, ?, ?, ?)",
+		uid, name, "un_"+uid, "sn_"+uid, "vc_"+uid, uid+"@example.com", status, robot, isDestroy,
+	).Exec()
+	require.NoError(t, err)
 }
 
 // seedBatchUser inserts a user row carrying contact PII (zone/phone/email) so the
@@ -135,7 +155,6 @@ func TestBatchUsersHuman_OrderMissingAndPIIStripped(t *testing.T) {
 	assert.Equal(t, "u_bravo", batchUserUID(t, b.Users[0]))
 	assert.Equal(t, "u_alpha", batchUserUID(t, b.Users[1]))
 	assert.Equal(t, []string{"u_ghost"}, b.MissingUIDs)
-
 	// Minimal DTO: identity fields present, contact PII never emitted.
 	for _, u := range b.Users {
 		_, hasUID := u["uid"]
@@ -165,4 +184,49 @@ func TestBatchUsersHuman_DisabledAndBlacklistedTreatedAsMissing(t *testing.T) {
 
 	joined := strings.Join(b.MissingUIDs, ",")
 	assert.NotContains(t, joined, "u_ok")
+}
+
+// TestBatchUsersHuman_DestroyedTreatedAsMissing pins the second half of the
+// liveness predicate: an account with status=1 (enabled) but is_destroy != 0 is
+// mid/post-teardown and must be reported missing, never present.
+func TestBatchUsersHuman_DestroyedTreatedAsMissing(t *testing.T) {
+	s, ctx := newBatchUserServer(t)
+	seedBatchUserFull(t, ctx, "u_live", "Live", 1, 0, IsDestroyNo)
+	seedBatchUserFull(t, ctx, "u_destroyed", "Destroyed", 1, 0, IsDestroyDone)
+	seedBatchUserFull(t, ctx, "u_destroying", "Destroying", 1, 0, IsDestroyApplying)
+
+	body := `{"uids":["u_destroyed","u_live","u_destroying"]}`
+	b := decodeBatchResp(t, postBatchUsers(s, testutil.Token, body))
+
+	require.Len(t, b.Users, 1)
+	assert.Equal(t, "u_live", batchUserUID(t, b.Users[0]))
+	// status=1 but is_destroy!=0 must be reported missing even though status alone
+	// would pass.
+	assert.ElementsMatch(t, []string{"u_destroyed", "u_destroying"}, b.MissingUIDs)
+}
+
+// TestBatchUsersHuman_MissingOrderPreserved pins the request-order contract on
+// missing_uids with a multi-element assert.Equal (ElementsMatch elsewhere does not
+// catch reordering).
+func TestBatchUsersHuman_MissingOrderPreserved(t *testing.T) {
+	s, ctx := newBatchUserServer(t)
+	seedBatchUser(t, ctx, "u_present", "Present", 1, 0)
+
+	body := `{"uids":["u_m3","u_present","u_m1","u_m2"]}`
+	b := decodeBatchResp(t, postBatchUsers(s, testutil.Token, body))
+
+	require.Len(t, b.Users, 1)
+	assert.Equal(t, "u_present", batchUserUID(t, b.Users[0]))
+	// Missing uids echo the request order exactly, present uid filtered out.
+	assert.Equal(t, []string{"u_m3", "u_m1", "u_m2"}, b.MissingUIDs)
+}
+
+// TestBatchUsersHuman_UIDTooLong rejects an over-length uid (defense-in-depth
+// bound in ValidateBatchUIDs).
+func TestBatchUsersHuman_UIDTooLong(t *testing.T) {
+	s, _ := newBatchUserServer(t)
+	long := strings.Repeat("a", MaxBatchUIDLength+1)
+	payload, _ := json.Marshal(map[string][]string{"uids": {long}})
+	w := postBatchUsers(s, testutil.Token, string(payload))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
 }

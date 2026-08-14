@@ -160,3 +160,34 @@ func TestBotBatchUsers_OrderMissingDisabledAndPIIStripped(t *testing.T) {
 	require.NoError(t, json.Unmarshal(b.Users[0]["robot"], &robot))
 	assert.Equal(t, 1, robot)
 }
+
+// TestBotBatchUsers_SpacePrefixStripped pins the space-prefix normalization: a
+// space-scoped uid (s<digits>_<baseUID>) resolves against its base user row, the
+// resolved user carries the base uid, and a missing space-scoped uid echoes the
+// caller's ORIGINAL string in missing_uids.
+func TestBotBatchUsers_SpacePrefixStripped(t *testing.T) {
+	handler, ctx := setupBotBatchUsers(t)
+	seedBotBatchUser(t, ctx, "bu_scoped", "Scoped", 1, 0)
+
+	body := `{"uids":["s1_bu_scoped","s42_bu_ghost"]}`
+	b := decodeBotBatchResp(t, postBotBatchUsers(handler, buBotToken, body))
+
+	// Space-prefixed uid resolved via its base row; response carries the base uid.
+	require.Len(t, b.Users, 1)
+	assert.Equal(t, "bu_scoped", botBatchUserUID(t, b.Users[0]))
+	// Missing uid echoes exactly what the caller sent (the space-prefixed form).
+	assert.Equal(t, []string{"s42_bu_ghost"}, b.MissingUIDs)
+}
+
+// TestBotBatchUsers_StripCreatesDuplicateRejected pins that stripping which
+// collapses two distinct originals onto the same base surfaces as a 400 on the
+// re-validated stripped list rather than silently coalescing.
+func TestBotBatchUsers_StripCreatesDuplicateRejected(t *testing.T) {
+	handler, ctx := setupBotBatchUsers(t)
+	seedBotBatchUser(t, ctx, "bu_dup", "Dup", 1, 0)
+
+	// "s1_bu_dup" and "bu_dup" both strip to "bu_dup".
+	body := `{"uids":["s1_bu_dup","bu_dup"]}`
+	w := postBotBatchUsers(handler, buBotToken, body)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+}
