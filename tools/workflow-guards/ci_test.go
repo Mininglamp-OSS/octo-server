@@ -1,6 +1,7 @@
 package workflowguards
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -160,9 +161,11 @@ func commandLines(t *testing.T, dir string, name string, args ...string) []strin
 	t.Helper()
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("%s %s failed: %v\n%s", name, strings.Join(args, " "), err, out)
+		t.Fatalf("%s %s failed: %v\nstdout:\n%s\nstderr:\n%s", name, strings.Join(args, " "), err, out, stderr.String())
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	filtered := lines[:0]
