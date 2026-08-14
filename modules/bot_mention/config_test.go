@@ -133,6 +133,80 @@ func TestNormalizeMentionRequest(t *testing.T) {
 	}
 }
 
+// doc_kind 决定消费端走哪套 API。HTML 文档的 doc_id 是 octo-doc 的 slug,拿它去打
+// docs-backend 的 docId 接口必然 404 —— 所以这个字段错一次,任务就静默打不中目标。
+func TestNormalizeMentionRequestDocKind(t *testing.T) {
+	base := mentionRequest{
+		IdempotencyKey: "idem-1",
+		DocID:          "doc-1",
+		CommentID:      "comment-1",
+		FromUID:        "user-1",
+		BotUID:         "bot-1",
+		Text:           "update it",
+	}
+
+	t.Run("默认为空:普通文档的行为不变", func(t *testing.T) {
+		got, err := normalizeMentionRequest(base)
+		if err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		if got.DocKind != "" {
+			t.Fatalf("DocKind = %q, want empty", got.DocKind)
+		}
+	})
+
+	t.Run("html 大小写与空格都规范化", func(t *testing.T) {
+		for _, in := range []string{"html", " HTML ", "Html"} {
+			req := base
+			req.DocKind = in
+			got, err := normalizeMentionRequest(req)
+			if err != nil {
+				t.Fatalf("doc_kind=%q: %v", in, err)
+			}
+			if got.DocKind != docKindHTML {
+				t.Fatalf("doc_kind=%q → %q, want %q", in, got.DocKind, docKindHTML)
+			}
+		}
+	})
+
+	t.Run("未知值被拒,不静默降级成普通文档", func(t *testing.T) {
+		// ★ 这条是这个字段的要害。降级放过去的话,消费端会拿 slug 去查 docId 接口,
+		// 用户看到的是一个「文档不存在」的 404,根因(类型标错)完全看不出来。
+		for _, bad := range []string{"sheet", "htm", "html_ppt", "doc"} {
+			req := base
+			req.DocKind = bad
+			if _, err := normalizeMentionRequest(req); err == nil {
+				t.Fatalf("doc_kind=%q 应当被拒", bad)
+			} else if invalidField(err) != "doc_kind" {
+				t.Fatalf("doc_kind=%q 报的字段是 %q,want doc_kind", bad, invalidField(err))
+			}
+		}
+	})
+}
+
+// 事件载荷:doc_kind 为空时**一个字节都不该多**。
+// 既有消费者(插件)对 event_data 的字段集有精确断言,凭空多一个 key 会让它无端变红。
+func TestMentionEventDataOmitsEmptyDocKind(t *testing.T) {
+	base := normalizedMention{
+		IdempotencyKey: "idem-1",
+		DocID:          "doc-1",
+		CommentID:      "comment-1",
+		ThreadID:       "comment-1",
+		FromUID:        "user-1",
+		BotUID:         "bot-1",
+		Text:           "update it",
+	}
+
+	if _, ok := mentionEventData(base, 100)["doc_kind"]; ok {
+		t.Fatal("doc_kind 为空时不该出现在事件载荷里")
+	}
+
+	base.DocKind = docKindHTML
+	if got := mentionEventData(base, 100)["doc_kind"]; got != docKindHTML {
+		t.Fatalf("doc_kind = %v, want %q", got, docKindHTML)
+	}
+}
+
 func TestNormalizeMentionRequestRejectsInvalidFields(t *testing.T) {
 	base := mentionRequest{
 		IdempotencyKey: "idem-1",
