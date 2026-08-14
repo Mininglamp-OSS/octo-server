@@ -176,9 +176,17 @@ type cardMutationBackend interface {
 	Sync(cardMutationWrite) error
 }
 
+// cardMutationFanoutMaxAttempts bounds the in-process CMD retry. The fanout is
+// the ONLY place a lost signal can be recovered without failing the mutation, so
+// a transient IM blip must not consume the single attempt it used to get; the
+// bound keeps a hard IM outage from holding the dispatcher worker.
+const cardMutationFanoutMaxAttempts = 3
+
 type CardMutator struct {
 	backend cardMutationBackend
 	logger  interface{ Error(string, ...zap.Field) }
+	// sleep is injectable so tests exercise the retry loop without real delay.
+	sleep func(time.Duration)
 }
 
 func NewCardMutator(ctx *config.Context) *CardMutator {
@@ -341,17 +349,31 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 		return CardMutationResult{}, ErrCardMutationInvalid
 	}
 	hash := util.MD5(normalized)
+	write := cardMutationWrite{
+		SenderUID: request.SenderUID, MessageID: request.MessageID, MessageSeq: message.MessageSeq,
+		ChannelID: request.ChannelID, ChannelType: request.ChannelType, ContentEdit: normalized,
+		ContentHash: hash, EditedAt: int(time.Now().Unix()), CardSeq: cardSeq,
+	}
 	exists, err := m.backend.ContentHashExists(request.MessageID, hash)
 	if err != nil {
 		return CardMutationResult{}, fmt.Errorf("carddispatch: query mutation hash: %w", err)
 	}
 	if exists {
+		// Re-fan-out the CMD on replay. An identical stored frame proves the CONTENT
+		// landed, never that any client was told about it: a first attempt that
+		// committed content_edit and then lost its fanout (a crash or a lease expiry
+		// mid-finalize) is re-driven here by the at-least-once card-action
+		// dispatcher, and skipping the signal leaves the card actionable on every
+		// online client until a full conversation re-fetch. A plain Sync error does
+		// NOT reach this branch — it is swallowed in fanout and the dispatcher Acks
+		// the successful Finalize, which is why fanout retries in-process instead.
+		// Safe because the CMD carries no frame bytes — Sync sends a bare
+		// syncMessageExtra signal and the client then pulls the NEWEST extra — so a
+		// re-send is idempotent and can never surface a stale frame. The CAS write
+		// and revision append stay skipped on this path precisely because those two
+		// DO have real side effects.
+		m.fanout(write)
 		return CardMutationResult{Replay: true}, nil
-	}
-	write := cardMutationWrite{
-		SenderUID: request.SenderUID, MessageID: request.MessageID, MessageSeq: message.MessageSeq,
-		ChannelID: request.ChannelID, ChannelType: request.ChannelType, ContentEdit: normalized,
-		ContentHash: hash, EditedAt: int(time.Now().Unix()), CardSeq: cardSeq,
 	}
 	conflict, replay, err := m.backend.CASWrite(write)
 	if err != nil {
@@ -361,6 +383,12 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 		return CardMutationResult{}, ErrCardMutationConflict
 	}
 	if replay {
+		// Same reasoning as the hash-exists branch: a concurrent writer won the CAS
+		// with byte-identical content, but ITS CMD may still be in flight or already
+		// lost. The signal is contentless and idempotent, so re-sending costs one
+		// extra client-side extra-pull and closes the window where neither writer's
+		// fanout reached the client.
+		m.fanout(write)
 		return CardMutationResult{Replay: true}, nil
 	}
 	// Revision history and CMD fanout are secondary to the authoritative
@@ -370,10 +398,50 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 			m.logger.Error("card mutation revision append failed", zap.Error(err), zap.String("message_id", request.MessageID))
 		}
 	}
-	if err := m.backend.Sync(write); err != nil && m.logger != nil {
-		m.logger.Error("card mutation CMD sync failed", zap.Error(err), zap.String("message_id", request.MessageID))
-	}
+	m.fanout(write)
 	return CardMutationResult{Applied: true}, nil
+}
+
+// fanout sends the contentless syncMessageExtra CMD that tells online clients to
+// pull the freshest message extra, retrying a bounded number of times before
+// giving up.
+//
+// The retry exists because a swallowed Sync error is NOT re-driven by anything: a
+// successful Finalize makes the dispatcher Ack the event outright
+// (cardactiondispatch/dispatcher.go), so the replay branches above never see this
+// failure and the client keeps an actionable card until a full conversation
+// re-fetch. Retrying here is the only recovery that does not fail the mutation.
+//
+// The final failure is still logged and swallowed, keeping the CMD secondary to
+// the authoritative content_edit: the frame is already committed, and a client
+// that misses the signal still resolves the terminal card on its next
+// conversation fetch, so a broken fanout must not fail an otherwise-successful
+// mutation — nor push the card action toward the dispatcher's DLQ, where its
+// Redis idempotency claim would strand the card for the whole retention window.
+//
+// NOTE this cannot recover the case where SendCMD SUCCEEDS but the recipient is
+// offline or mid-reconnect: the CMD is NoPersist + SyncOnce (realtime-only, no
+// offline replay), so that delivery is silently dropped downstream with nothing
+// to retry here. Closing that gap needs the client to re-pull extras after a
+// socket reconnect, not a server-side change.
+func (m *CardMutator) fanout(write cardMutationWrite) {
+	sleep := m.sleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	var err error
+	for attempt := 0; attempt < cardMutationFanoutMaxAttempts; attempt++ {
+		if err = m.backend.Sync(write); err == nil {
+			return
+		}
+		if attempt+1 < cardMutationFanoutMaxAttempts {
+			sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+		}
+	}
+	if m.logger != nil {
+		m.logger.Error("card mutation CMD sync failed", zap.Error(err),
+			zap.String("message_id", write.MessageID), zap.Int("attempts", cardMutationFanoutMaxAttempts))
+	}
 }
 
 func (m *CardMutator) WriteCAS(request CardMutationCASRequest) (bool, error) {

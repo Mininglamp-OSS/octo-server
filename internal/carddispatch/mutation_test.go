@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 )
@@ -20,6 +21,8 @@ type fakeMutationBackend struct {
 	writeConflict bool
 	writeReplay   bool
 	writeErr      error
+	syncErr       error
+	syncFailUntil int
 	writes        []cardMutationWrite
 	revisions     []cardMutationWrite
 	syncs         []cardMutationWrite
@@ -57,7 +60,24 @@ func (b *fakeMutationBackend) AppendRevision(write cardMutationWrite) error {
 
 func (b *fakeMutationBackend) Sync(write cardMutationWrite) error {
 	b.syncs = append(b.syncs, write)
-	return nil
+	// syncFailUntil models a TRANSIENT IM blip: the first N attempts fail and the
+	// next one succeeds, so a retry loop is observably distinguishable from a
+	// single-shot fanout.
+	if b.syncFailUntil > 0 {
+		if len(b.syncs) <= b.syncFailUntil {
+			return errors.New("im blip")
+		}
+		return nil
+	}
+	return b.syncErr
+}
+
+// noSleepMutator builds a mutator whose fanout retry does not actually wait, so
+// the bounded-retry tests stay instant.
+func noSleepMutator(backend cardMutationBackend) *CardMutator {
+	mutator := newCardMutator(backend)
+	mutator.sleep = func(time.Duration) {}
+	return mutator
 }
 
 func TestCardMutatorPreservesOwnershipLifecycleCASAndReplay(t *testing.T) {
@@ -128,8 +148,17 @@ func TestCardMutatorPreservesOwnershipLifecycleCASAndReplay(t *testing.T) {
 		if err != nil || !result.Replay || result.Applied {
 			t.Fatalf("Mutate(replay) = (%+v, %v)", result, err)
 		}
-		if len(backend.writes)+len(backend.revisions)+len(backend.syncs) != 0 {
-			t.Fatal("idempotent replay must not write CAS, revision, or CMD")
+		if len(backend.writes) != 0 || len(backend.revisions) != 0 {
+			t.Fatal("idempotent replay must not repeat the side-effecting CAS write or revision append")
+		}
+		// The contentless CMD IS re-sent. An identical stored frame proves the content
+		// landed, never that a client was told: a prior attempt may have committed
+		// content_edit and lost its fanout (Sync error, crash, lease expiry), and the
+		// at-least-once card-action dispatcher replays it here. Skipping the signal
+		// leaves the card actionable on every online client until a full conversation
+		// re-fetch.
+		if len(backend.syncs) != 1 {
+			t.Fatalf("idempotent replay must re-fan-out the CMD, syncs = %d, want 1", len(backend.syncs))
 		}
 	})
 
@@ -145,8 +174,80 @@ func TestCardMutatorPreservesOwnershipLifecycleCASAndReplay(t *testing.T) {
 		if err != nil || !result.Replay || result.Applied {
 			t.Fatalf("Mutate(concurrent replay) = (%+v, %v)", result, err)
 		}
-		if len(backend.revisions)+len(backend.syncs) != 0 {
-			t.Fatal("concurrent replay must not append a duplicate revision or CMD")
+		if len(backend.revisions) != 0 {
+			t.Fatal("concurrent replay must not append a duplicate revision")
+		}
+		// Contentless, idempotent signal: the CAS winner's own CMD may still be in
+		// flight or already lost, so re-sending closes the window where neither
+		// writer's fanout reached the client.
+		if len(backend.syncs) != 1 {
+			t.Fatalf("concurrent replay must re-fan-out the CMD, syncs = %d, want 1", len(backend.syncs))
+		}
+	})
+
+	t.Run("transient fanout failure is retried until it lands", func(t *testing.T) {
+		backend := &fakeMutationBackend{
+			message:       storedCardMessage{MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: original},
+			syncFailUntil: 1,
+		}
+		result, err := noSleepMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(terminal),
+		})
+		// A swallowed Sync error is re-driven by NOTHING: a successful Finalize makes
+		// the dispatcher Ack the event outright, so the replay branches above never
+		// see this failure. The in-process retry is therefore the ONLY recovery for a
+		// transient IM blip that does not fail the mutation.
+		if err != nil || !result.Applied {
+			t.Fatalf("Mutate(transient sync failure) = (%+v, %v), want applied with nil error", result, err)
+		}
+		if len(backend.syncs) != 2 {
+			t.Fatalf("transient fanout failure must be retried, syncs = %d, want 2", len(backend.syncs))
+		}
+		if len(backend.writes) != 1 {
+			t.Fatalf("fanout retry must not re-write the CAS, writes = %d, want 1", len(backend.writes))
+		}
+	})
+
+	t.Run("fanout failure keeps the committed mutation successful", func(t *testing.T) {
+		backend := &fakeMutationBackend{
+			message: storedCardMessage{MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: original},
+			syncErr: errors.New("im unavailable"),
+		}
+		result, err := noSleepMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(terminal),
+		})
+		// The CMD stays SECONDARY to the authoritative content_edit: the frame is
+		// already committed and a client that misses the signal still resolves the
+		// terminal card on its next conversation fetch, so a dead IM must not fail an
+		// otherwise-successful mutation — and must not push the card action toward the
+		// dispatcher's DLQ, where its Redis idempotency claim would strand the card.
+		if err != nil || !result.Applied {
+			t.Fatalf("Mutate(sync failure) = (%+v, %v), want applied with nil error", result, err)
+		}
+		// The retry is BOUNDED: a hard IM outage must not hold the dispatcher worker.
+		if len(backend.writes) != 1 || len(backend.syncs) != cardMutationFanoutMaxAttempts {
+			t.Fatalf("writes/syncs = %d/%d, want 1/%d", len(backend.writes), len(backend.syncs), cardMutationFanoutMaxAttempts)
+		}
+	})
+
+	t.Run("stale card seq conflict must not fan out", func(t *testing.T) {
+		backend := &fakeMutationBackend{
+			message:       storedCardMessage{MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: original},
+			writeConflict: true,
+		}
+		_, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(terminal),
+		})
+		// A conflict means a NEWER frame already won; this stale attempt committed
+		// nothing, so it announces nothing and lets the caller surface the conflict.
+		if !errors.Is(err, ErrCardMutationConflict) {
+			t.Fatalf("Mutate(conflict) error = %v, want %v", err, ErrCardMutationConflict)
+		}
+		if len(backend.syncs) != 0 {
+			t.Fatalf("conflicting stale write must not fan out, syncs = %d", len(backend.syncs))
 		}
 	})
 
