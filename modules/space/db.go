@@ -3,6 +3,7 @@ package space
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -176,12 +177,33 @@ func (d *DB) queryMemberIncludeRemoved(spaceId string, uid string) (*MemberModel
 	return &m, nil
 }
 
-func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit uint64) ([]*MemberDetailModel, error) {
+func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit uint64, keyword string) ([]*MemberDetailModel, error) {
 	var models []*MemberDetailModel
 	// name 兜底链（issue #344）：u.name 为空时回退 user_verification.real_name，
 	// 二者皆空时由 mapping 层（MemberDetailModel.DisplayName）给稳定占位符。
 	// 这里只多挂一个只读 LEFT JOIN uv；Space + bot 归属过滤（WHERE 子句）保持不变，
 	// 不放宽任何隔离边界。禁止用 short_no / username 兜底（privacy-gated）。
+	//
+	// keyword（可选）跨列检索 name/real_name/uid：检索列必须与展示兜底链一致，否则
+	// u.name 为空、靠 real_name 显示的成员「看得见却搜不到」。文档成员选择器改为
+	// 服务端搜索后调用此参数——前端全量拉取+本地过滤在超大空间会被分页上限截断
+	// （5760 人空间实证：靠后加入的成员搜不到）。email/phone 不在本端点返回、也不参与
+	// 检索（privacy）。
+	//
+	// real_name 匹配必须 gate 到 IFNULL(u.name,'')=''：real_name 仅在 u.name 为空时才
+	// 展示（DisplayName 兜底链），若无条件检索，有昵称用户的隐藏实名会「搜得到却看不见」，
+	// 构成「猜实名→反查昵称用户」的身份 oracle（可检索粒度 > 可见粒度）。gate 后使二者
+	// 严格对齐（PR #618 review：Jerry-Xin / lml2468）。
+	kwClause := ""
+	args := []interface{}{spaceId, loginUID}
+	if kw := strings.TrimSpace(keyword); kw != "" {
+		like := buildLikePattern(kw)
+		kwClause = ` AND (u.name LIKE ?` + likeEscapeClause +
+			` OR (IFNULL(u.name,'')='' AND uv.real_name LIKE ?` + likeEscapeClause + `)` +
+			` OR sm.uid LIKE ?` + likeEscapeClause + `)`
+		args = append(args, like, like, like)
+	}
+	args = append(args, limit, (page-1)*limit)
 	_, err := d.session.SelectBySql(`
 		SELECT sm.*, IFNULL(u.name,'') as name,
 			IFNULL(uv.real_name,'') as real_name,
@@ -193,10 +215,10 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 		WHERE sm.space_id=? AND sm.status=1 AND (
 			r.robot_id IS NULL
 			OR r.creator_uid = ?
-		)
-		ORDER BY sm.role DESC, sm.created_at ASC
+		)`+kwClause+`
+		ORDER BY sm.role DESC, sm.created_at ASC, sm.uid ASC
 		LIMIT ? OFFSET ?
-	`, spaceId, loginUID, limit, (page-1)*limit).Load(&models)
+	`, args...).Load(&models)
 	return models, err
 }
 

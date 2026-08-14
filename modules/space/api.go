@@ -684,6 +684,9 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 	c.Response(resps)
 }
 
+// maxMemberKeywordRunes 限制成员列表检索关键词长度，防止超长 keyword 驱动无索引 LIKE 扫描。
+const maxMemberKeywordRunes = 64
+
 // listMembers 获取空间成员列表
 func (s *Space) listMembers(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
@@ -713,7 +716,17 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 		limit = 10000
 	}
 
-	members, err := s.db.queryMembers(spaceId, loginUID, page, limit)
+	// keyword（可选）：非空时按 name/real_name/uid 服务端检索。文档成员选择器改为
+	// 服务端搜索后走此参数——避免前端全量拉取+本地过滤在超大空间被分页上限截断
+	// （5760 人空间：靠后成员搜不到）。任意成员可调，权限与列表一致。
+	keyword := c.Query("keyword")
+	// 关键词长度封顶：防止用户驱动的超长 %kw% 无索引扫描（与 members/search 的加固口径靠拢）。
+	// 用 rune 截断，避免把多字节字符切成无效 UTF-8。
+	if r := []rune(keyword); len(r) > maxMemberKeywordRunes {
+		keyword = string(r[:maxMemberKeywordRunes])
+	}
+
+	members, err := s.db.queryMembers(spaceId, loginUID, page, limit, keyword)
 	if err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
