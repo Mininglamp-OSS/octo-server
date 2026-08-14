@@ -53,12 +53,12 @@ func (s *Service) putPause(c *wkhttp.Context) {
 		return
 	}
 	now := time.Now().UTC()
-	pausedUntil := req.PausedUntil.UTC()
-	if !validPauseUntil(now, pausedUntil) {
+	mode, pausedUntil, ok := req.intent(now)
+	if !ok {
 		s.writeInvalidTime(c)
 		return
 	}
-	record, err := s.db.upsert(c.GetLoginUID(), pausedUntil, now)
+	record, err := s.db.upsert(c.GetLoginUID(), mode, pausedUntil, now)
 	if err != nil {
 		s.writeStoreError(c, err)
 		return
@@ -90,8 +90,16 @@ func (s *Service) response(record *pauseRecord, now time.Time) pauseResponse {
 		return response
 	}
 	response.Revision = record.Revision
+	if record.Mode != nil && *record.Mode == pauseModeManual {
+		mode := pauseModeManual
+		response.Paused = true
+		response.Mode = &mode
+		return response
+	}
 	if record.PausedUntil != nil && record.PausedUntil.After(now) {
 		response.Paused = true
+		mode := pauseModeTimed
+		response.Mode = &mode
 		until := record.PausedUntil.UTC()
 		response.PausedUntil = &until
 	}
@@ -106,11 +114,49 @@ func (s *Service) sendChangedCMD(uid string, response pauseResponse) error {
 		CMD:         notificationPauseCMD,
 		Param: map[string]interface{}{
 			"paused":       response.Paused,
+			"mode":         response.Mode,
 			"paused_until": response.PausedUntil,
 			"revision":     response.Revision,
 			"server_time":  response.ServerTime,
 		},
 	})
+}
+
+func (r updatePauseRequest) intent(now time.Time) (string, *time.Time, bool) {
+	count := 0
+	if r.Duration != nil {
+		count++
+	}
+	if r.Mode != nil {
+		count++
+	}
+	if r.hasPausedUntil {
+		count++
+	}
+	if count != 1 {
+		return "", nil, false
+	}
+	if r.Mode != nil {
+		return pauseModeManual, nil, *r.Mode == pauseModeManual
+	}
+	if r.Duration != nil {
+		var duration time.Duration
+		switch *r.Duration {
+		case "30m":
+			duration = 30 * time.Minute
+		case "1h":
+			duration = time.Hour
+		default:
+			return "", nil, false
+		}
+		until := now.Add(duration)
+		return pauseModeTimed, &until, true
+	}
+	if r.PausedUntil == nil {
+		return "", nil, false
+	}
+	until := r.PausedUntil.UTC()
+	return pauseModeTimed, &until, validPauseUntil(now, until)
 }
 
 func (s *Service) writeInvalidTime(c *wkhttp.Context) {

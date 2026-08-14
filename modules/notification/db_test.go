@@ -20,6 +20,7 @@ func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
 	}
 	_, err := ctx.DB().DB.Exec(`CREATE TABLE IF NOT EXISTS user_notification_pause (
 		uid VARCHAR(40) NOT NULL,
+		mode VARCHAR(16) NULL,
 		paused_until DATETIME(3) NULL,
 		revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
 		updated_at DATETIME(3) NOT NULL,
@@ -34,7 +35,7 @@ func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
 	store := newDBStore(ctx)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	want := now.Add(2 * time.Hour)
-	if _, err := store.upsert(uid, want, now); err != nil {
+	if _, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil {
 		t.Fatal(err)
 	}
 	record, err := store.get(uid)

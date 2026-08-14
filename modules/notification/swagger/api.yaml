@@ -71,18 +71,29 @@ components:
   schemas:
     SetNotificationPause:
       type: object
-      required: [paused_until]
       properties:
+        duration:
+          type: string
+          enum: [30m, 1h]
+          description: Fixed duration calculated by the server
+        mode:
+          type: string
+          enum: [manual]
+          description: Pause until the user explicitly restores notifications
         paused_until:
           type: string
           format: date-time
-          description: UTC absolute time later than server time
+          description: UTC absolute time later than server time; mutually exclusive with duration and mode
     NotificationPause:
       type: object
-      required: [paused, paused_until, revision, server_time]
+      required: [paused, mode, paused_until, revision, server_time]
       properties:
         paused:
           type: boolean
+        mode:
+          type: string
+          enum: [timed, manual]
+          nullable: true
         paused_until:
           type: string
           format: date-time
@@ -96,6 +107,7 @@ components:
           format: date-time
       example:
         paused: true
+        mode: timed
         paused_until: '2026-08-12T12:30:00.000Z'
         revision: 42
         server_time: '2026-08-12T11:30:00.125Z'
