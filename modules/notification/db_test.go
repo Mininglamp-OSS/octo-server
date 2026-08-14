@@ -57,16 +57,20 @@ func newPauseTestStore(t *testing.T) (*dbStore, *config.Context) {
 func TestGetActiveByUIDsCoversManualTimedLegacyAndExpiredRows(t *testing.T) {
 	store, ctx := newPauseTestStore(t)
 	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
-	future := now.Add(time.Hour)
-	past := now.Add(-time.Hour)
+	// Use SQL wall-clock strings here. This test deliberately uses a
+	// non-UTC DSN, and passing time.Time values through database/sql would
+	// convert the fixture before MySQL stores it, making the "past" row future
+	// relative to the fixed query instant.
+	future := "2026-08-14 06:00:00"
+	past := "2026-08-14 04:00:00"
 	rows := []struct {
 		uid, mode string
-		until     *time.Time
+		until     interface{}
 	}{
 		{"notification-active-manual", pauseModeManual, nil},
-		{"notification-active-timed", pauseModeTimed, &future},
-		{"notification-active-legacy", "", &future},
-		{"notification-expired-timed", pauseModeTimed, &past},
+		{"notification-active-timed", pauseModeTimed, future},
+		{"notification-active-legacy", "", future},
+		{"notification-expired-timed", pauseModeTimed, past},
 		{"notification-cleared", "", nil},
 	}
 	for _, row := range rows {
