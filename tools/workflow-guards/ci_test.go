@@ -16,6 +16,7 @@ type workflow struct {
 type job struct {
 	Services map[string]service `yaml:"services"`
 	Steps    []step             `yaml:"steps"`
+	Needs    []string           `yaml:"needs"`
 }
 
 type service struct {
@@ -29,16 +30,16 @@ type step struct {
 	Name string `yaml:"name"`
 }
 
-func TestCITestJobProvidesWuKongIM(t *testing.T) {
+func TestCIE2EJobProvidesWuKongIM(t *testing.T) {
 	wf := readWorkflow(t, ".github/workflows/ci.yml")
-	testJob, ok := wf.Jobs["test"]
+	testJob, ok := wf.Jobs["e2e-test"]
 	if !ok {
-		t.Fatal("ci.yml must define the test job")
+		t.Fatal("ci.yml must define the e2e-test job")
 	}
 
 	wk, ok := testJob.Services["wukongim"]
 	if !ok {
-		t.Fatal("CI test job must provision a wukongim service for IM-channel integration tests")
+		t.Fatal("CI e2e-test job must provision a wukongim service for IM-channel integration tests")
 	}
 	if wk.Image != "wukongim/wukongim:v2.2.4-20260313" {
 		t.Fatalf("wukongim service image = %q, want pinned wukongim/wukongim:v2.2.4-20260313", wk.Image)
@@ -54,15 +55,35 @@ func TestCITestJobProvidesWuKongIM(t *testing.T) {
 	}
 
 	waitIdx := stepIndex(testJob.Steps, "Wait for WuKongIM")
-	runIdx := stepIndex(testJob.Steps, "Run tests")
+	runIdx := stepIndex(testJob.Steps, "Run E2E shard")
 	if waitIdx < 0 {
-		t.Fatal("CI test job must wait for WuKongIM before running Go tests")
+		t.Fatal("CI e2e-test job must wait for WuKongIM before running Go tests")
 	}
 	if runIdx < 0 {
-		t.Fatal("CI test job must define the Run tests step")
+		t.Fatal("CI e2e-test job must define the Run E2E shard step")
 	}
 	if waitIdx > runIdx {
-		t.Fatal("Wait for WuKongIM must run before Run tests")
+		t.Fatal("Wait for WuKongIM must run before Run E2E shard")
+	}
+}
+
+func TestCITestJobAggregatesSplitLanes(t *testing.T) {
+	wf := readWorkflow(t, ".github/workflows/ci.yml")
+	testJob, ok := wf.Jobs["test"]
+	if !ok {
+		t.Fatal("ci.yml must define the aggregate test job")
+	}
+
+	for _, need := range []string{"changes", "unit-test", "e2e-test"} {
+		if !contains(testJob.Needs, need) {
+			t.Fatalf("aggregate test job needs = %v, want %q", testJob.Needs, need)
+		}
+	}
+	if len(testJob.Services) != 0 {
+		t.Fatal("aggregate test job must not provision services; e2e-test owns MySQL/Redis/WuKongIM")
+	}
+	if stepIndex(testJob.Steps, "Aggregate split test results") < 0 {
+		t.Fatal("aggregate test job must define the Aggregate split test results step")
 	}
 }
 

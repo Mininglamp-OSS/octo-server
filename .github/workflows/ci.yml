@@ -99,31 +99,46 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -v ./...
 
-  test:
+  unit-test:
     needs: [changes]
     if: |
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
       needs.changes.outputs.code == 'true'
-    name: Test
+    name: Unit Test
     runs-on: ubuntu-latest
-    # 45, not 30. The suite had grown to the point of deciding its own verdict
-    # by runner speed: run 31763498216 was cancelled at exactly 30m (the "Run
-    # tests" step still going after 28m32s), while the same commit's earlier
-    # run finished in 26m32s. A ceiling that close to the honest runtime turns
-    # every slow runner into a red PR and buries whatever the real result was.
-    #
-    # This buys headroom, it does not fix the cost: the loop reruns
-    # DROP/CREATE + full sql-migrate per package across ~113 packages under
-    # -race. Cutting that (a shared migrated template database, or -race only
-    # on the packages that need it) is the actual fix and wants its own change.
-    timeout-minutes: 45
-    # MySQL, Redis, and WuKongIM are required by integration tests
-    # (modules/{user,oidc,thread,group,space,botfather,...}). The tests
-    # hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/unit-test
+            ci/unit-packages.txt
+
+      - name: Run unit tests
+        run: ci/run-unit-tests.sh
+
+  e2e-test:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: E2E Test (${{ matrix.shard }}/${{ matrix.total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        total: [4]
+    # MySQL, Redis, and WuKongIM are required by E2E/integration-style tests.
+    # Tests hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
     # octo-lib's default WuKongIM API URL http://127.0.0.1:5001 — see
-    # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and
-    # config.New. Ports are mapped to the host so jobs running in the
-    # runner VM can reach them via 127.0.0.1.
+    # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and config.New.
+    # Each matrix shard gets an independent runner and service set.
     services:
       mysql:
         image: mysql:8.0
@@ -181,6 +196,10 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/e2e-test
+            ci/e2e-package-weights.tsv
 
       - name: Install MySQL/Redis client tooling
         run: |
@@ -242,7 +261,7 @@ jobs:
           echo "wukongim did not become ready" >&2
           exit 1
 
-      - name: Run tests
+      - name: Run E2E shard
         # NOTE (issue #557 / integration build tag): this lane runs the DEFAULT
         # build (NO `-tags integration`). It intentionally does NOT enable the
         # `//go:build integration` suite, and here is the load-bearing reason —
@@ -279,31 +298,37 @@ jobs:
         # `t.Skip("OCTO migration TODO: ...issues/17")` marker in-source
         # — see issue #17 for the cleanup tracker. Grep for `OCTO migration
         # TODO` to find the suppressed tests.
+        run: ci/run-e2e-shard.sh "${{ matrix.shard }}" "${{ matrix.total }}"
+
+  test:
+    needs: [changes, unit-test, e2e-test]
+    if: always()
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      CODE_CHANGED: ${{ needs.changes.outputs.code }}
+      IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft || false }}
+      UNIT_RESULT: ${{ needs.unit-test.result }}
+      E2E_RESULT: ${{ needs.e2e-test.result }}
+    steps:
+      - name: Aggregate split test results
         run: |
           set -euo pipefail
-          fail=0
-          failed=()
-          while read -r pkg; do
-            mysql -h 127.0.0.1 -uroot -pdemo -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-            redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
-            echo "::group::go test $pkg"
-            if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
-              fail=1
-              failed+=("$pkg")
-              # An annotation, not just a log line. Everything this step prints
-              # is unreachable afterwards: the job-log API returns only the tail,
-              # and the WuKongIM service container's teardown dump is larger than
-              # the whole window it will hand back — so three consecutive red runs
-              # were diagnosed without ever learning which package failed.
-              # Annotations survive on the check run itself.
-              echo "::error title=Package failed::$pkg"
-            fi
-            echo "::endgroup::"
-          done < <(go list ./...)
-          if [ "$fail" -ne 0 ]; then
-            echo "::error title=Test summary::${#failed[@]} package(s) failed: ${failed[*]}"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error title=Test preflight failed::changes job result was $CHANGES_RESULT"
+            exit 1
           fi
-          exit $fail
+          if [ "$IS_DRAFT" = "true" ] || [ "$CODE_CHANGED" != "true" ]; then
+            echo "Split tests intentionally skipped: draft=$IS_DRAFT code_changed=$CODE_CHANGED"
+            exit 0
+          fi
+          if [ "$UNIT_RESULT" != "success" ] || [ "$E2E_RESULT" != "success" ]; then
+            echo "::error title=Split tests failed::Unit Test=$UNIT_RESULT E2E Test=$E2E_RESULT"
+            exit 1
+          fi
+          echo "Unit Test and E2E Test passed"
 
   vet:
     needs: [changes]
