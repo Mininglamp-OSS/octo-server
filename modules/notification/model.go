@@ -44,7 +44,9 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	if raw, ok := pauseField(fields, "duration"); ok {
+	if raw, ok, err := pauseField(fields, "duration"); err != nil {
+		return err
+	} else if ok {
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("duration must be a string")
 		}
@@ -54,7 +56,9 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.Duration = &value
 	}
-	if raw, ok := pauseField(fields, "mode"); ok {
+	if raw, ok, err := pauseField(fields, "mode"); err != nil {
+		return err
+	} else if ok {
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("mode must be a string")
 		}
@@ -64,7 +68,9 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.Mode = &value
 	}
-	if raw, ok := pauseField(fields, "paused_until"); ok {
+	if raw, ok, err := pauseField(fields, "paused_until"); err != nil {
+		return err
+	} else if ok {
 		r.hasPausedUntil = true
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return fmt.Errorf("paused_until must be an RFC3339 timestamp")
@@ -78,14 +84,21 @@ func (r *updatePauseRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func pauseField(fields map[string]json.RawMessage, name string) (json.RawMessage, bool) {
-	if value, ok := fields[name]; ok {
-		return value, true
-	}
-	for key, value := range fields {
+func pauseField(fields map[string]json.RawMessage, name string) (json.RawMessage, bool, error) {
+	var value json.RawMessage
+	found := 0
+	for key, candidate := range fields {
 		if strings.EqualFold(key, name) {
-			return value, true
+			value = candidate
+			found++
 		}
 	}
-	return nil, false
+	if found > 1 {
+		return nil, false, fmt.Errorf("duplicate %s field", name)
+	}
+	return value, found == 1, nil
+}
+
+func pauseModeMatches(value *string, want string) bool {
+	return value != nil && strings.EqualFold(strings.TrimSpace(*value), want)
 }

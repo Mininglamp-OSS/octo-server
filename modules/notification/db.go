@@ -1,7 +1,6 @@
 package notification
 
 import (
-	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -43,32 +42,23 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 	if err != nil {
 		return nil, false, err
 	}
-	var current *pauseRecord
-	_, err = tx.Select("uid", "mode", "paused_until", "revision", "updated_at").
-		From("user_notification_pause").
-		Where("uid=?", uid).
-		Suffix("FOR UPDATE").
-		Load(&current)
+	var until interface{}
+	if pausedUntil != nil {
+		until = pausedUntil.UTC().Truncate(time.Millisecond)
+	}
+	result, err := tx.InsertBySql(
+		"INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, ?, ?, 1, ?) "+
+			"ON DUPLICATE KEY UPDATE "+
+			"revision=revision+IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), 0, 1), "+
+			"updated_at=IF(mode <=> VALUES(mode) AND paused_until <=> VALUES(paused_until), updated_at, VALUES(updated_at)), "+
+			"mode=VALUES(mode), paused_until=VALUES(paused_until)",
+		uid, mode, until, now.UTC(),
+	).Exec()
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, false, err
 	}
-	current = normalizePauseRecord(current)
-	if samePauseState(current, mode, pausedUntil) {
-		if err := tx.Commit(); err != nil {
-			return nil, false, err
-		}
-		return normalizePauseRecord(current), false, nil
-	}
-	var until interface{}
-	if pausedUntil != nil {
-		until = pausedUntil.UTC()
-	}
-	_, err = tx.InsertBySql(
-		"INSERT INTO user_notification_pause (uid, mode, paused_until, revision, updated_at) VALUES (?, ?, ?, 1, ?) "+
-			"ON DUPLICATE KEY UPDATE mode=VALUES(mode), paused_until=VALUES(paused_until), revision=revision+1, updated_at=VALUES(updated_at)",
-		uid, mode, until, now.UTC(),
-	).Exec()
+	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, false, err
@@ -86,17 +76,7 @@ func (s *dbStore) upsert(uid, mode string, pausedUntil *time.Time, now time.Time
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
-	return normalizePauseRecord(record), true, nil
-}
-
-func samePauseState(record *pauseRecord, mode string, pausedUntil *time.Time) bool {
-	if record == nil || record.Mode == nil || !strings.EqualFold(*record.Mode, mode) {
-		return false
-	}
-	if record.PausedUntil == nil || pausedUntil == nil {
-		return record.PausedUntil == nil && pausedUntil == nil
-	}
-	return record.PausedUntil.Equal(*pausedUntil)
+	return normalizePauseRecord(record), rowsAffected > 0, nil
 }
 
 func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, bool, error) {
@@ -104,6 +84,8 @@ func (s *dbStore) clear(uid string, now time.Time) (*pauseRecord, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	// Expired timed rows are inactive on the wire but still persisted state;
+	// clearing them is a real cleanup transition and advances the revision.
 	result, err := tx.Update("user_notification_pause").
 		Set("mode", nil).
 		Set("paused_until", nil).

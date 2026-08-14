@@ -16,7 +16,10 @@ func TestPauseTimeSurvivesNonUTCLocRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	want := now.Add(2 * time.Hour)
 	if _, changed, err := store.upsert(uid, pauseModeTimed, &want, now); err != nil || !changed {
-		t.Fatal(err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("initial upsert should change the row")
 	}
 	record, err := store.get(uid)
 	if err != nil {
@@ -42,7 +45,6 @@ func newPauseTestStore(t *testing.T) (*dbStore, *config.Context) {
 	}
 	_, err := ctx.DB().DB.Exec(`CREATE TABLE IF NOT EXISTS user_notification_pause (
 		uid VARCHAR(40) NOT NULL,
-		mode VARCHAR(16) NULL,
 		paused_until DATETIME(3) NULL,
 		revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
 		updated_at DATETIME(3) NOT NULL,
@@ -52,8 +54,14 @@ func newPauseTestStore(t *testing.T) (*dbStore, *config.Context) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ctx.DB().DB.Close() })
-	if _, err := ctx.DB().DB.Exec("ALTER TABLE user_notification_pause ADD COLUMN IF NOT EXISTS mode VARCHAR(16) NULL AFTER uid"); err != nil {
+	var modeColumns int
+	if err := ctx.DB().DB.QueryRow("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='user_notification_pause' AND column_name='mode'").Scan(&modeColumns); err != nil {
 		t.Fatal(err)
+	}
+	if modeColumns == 0 {
+		if _, err := ctx.DB().DB.Exec("ALTER TABLE user_notification_pause ADD COLUMN mode VARCHAR(16) NULL AFTER uid"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return newDBStore(ctx), ctx
 }
@@ -121,13 +129,6 @@ func TestClearIsIdempotentAndDoesNotCreateRows(t *testing.T) {
 		}
 		t.Fatal("initial upsert should change the row")
 	}
-	repeated, repeatedChanged, err := store.upsert(uid, pauseModeManual, nil, now.Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repeatedChanged || repeated == nil || repeated.Revision != 1 {
-		t.Fatalf("repeated identical upsert should be a no-op: record=%+v changed=%v", repeated, repeatedChanged)
-	}
 	first, firstChanged, err := store.clear(uid, now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -146,5 +147,24 @@ func TestClearIsIdempotentAndDoesNotCreateRows(t *testing.T) {
 	}
 	if missing != nil || missingChanged {
 		t.Fatalf("clear of a missing row should not create state: %+v changed=%v", missing, missingChanged)
+	}
+}
+
+func TestUpsertIsIdempotentAndTruncatesDatabasePrecision(t *testing.T) {
+	store, ctx := newPauseTestStore(t)
+	now := time.Date(2026, 8, 14, 5, 0, 0, 123456789, time.UTC)
+	uid := fmt.Sprintf("notification-upsert-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _, _ = ctx.DB().DB.Exec("DELETE FROM user_notification_pause WHERE uid=?", uid) })
+	want := now.Add(time.Hour)
+	first, changed, err := store.upsert(uid, pauseModeTimed, &want, now)
+	if err != nil || !changed {
+		t.Fatalf("initial upsert = record=%+v changed=%v err=%v", first, changed, err)
+	}
+	second, changed, err := store.upsert(uid, pauseModeTimed, &want, now.Add(time.Minute))
+	if err != nil || changed || second == nil || second.Revision != first.Revision {
+		t.Fatalf("repeated upsert should be a no-op: first=%+v second=%+v changed=%v err=%v", first, second, changed, err)
+	}
+	if second.PausedUntil == nil || second.PausedUntil.Nanosecond()%int(time.Millisecond) != 0 {
+		t.Fatalf("paused_until should use DATETIME(3) precision: %+v", second.PausedUntil)
 	}
 }

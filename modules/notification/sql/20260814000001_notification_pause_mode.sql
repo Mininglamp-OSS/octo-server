@@ -1,7 +1,16 @@
 -- +migrate Up
 
-ALTER TABLE `user_notification_pause`
-  ADD COLUMN IF NOT EXISTS `mode` VARCHAR(16) NULL AFTER `uid`;
+-- MySQL 8 has no ADD COLUMN IF NOT EXISTS. The migration runner normally
+-- applies this once, while this guard also handles a reused database whose
+-- schema already contains the column but whose migration ledger does not.
+SET @mode_col_exists = (SELECT COUNT(*) FROM information_schema.columns
+  WHERE table_schema = DATABASE() AND table_name = 'user_notification_pause' AND column_name = 'mode');
+SET @mode_add_sql = IF(@mode_col_exists = 0,
+  'ALTER TABLE `user_notification_pause` ADD COLUMN `mode` VARCHAR(16) NULL AFTER `uid`',
+  'SELECT 1');
+PREPARE mode_add_stmt FROM @mode_add_sql;
+EXECUTE mode_add_stmt;
+DEALLOCATE PREPARE mode_add_stmt;
 
 -- +migrate Down
 

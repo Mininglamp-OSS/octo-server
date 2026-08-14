@@ -111,6 +111,15 @@ func TestResponseDoesNotTreatUnknownModeAsTimed(t *testing.T) {
 	}
 }
 
+func TestResponseNormalizesStoredModeWhitespace(t *testing.T) {
+	now := time.Date(2026, 8, 14, 5, 0, 0, 0, time.UTC)
+	mode := " manual "
+	response := (&Service{}).response(&pauseRecord{Mode: &mode}, now)
+	if !response.Paused || response.Mode == nil || *response.Mode != pauseModeManual {
+		t.Fatalf("padded manual mode should remain active: %+v", response)
+	}
+}
+
 func strptr(value string) *string { return &value }
 
 func TestNormalizePauseRecordPreservesDatabaseUTCWallClock(t *testing.T) {

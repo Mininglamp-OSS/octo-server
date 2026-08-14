@@ -1,7 +1,7 @@
 package notification
 
 import (
-	"strings"
+	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -48,6 +48,7 @@ func (s *Service) getPause(c *wkhttp.Context) {
 }
 
 func (s *Service) putPause(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var req updatePauseRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		s.writeInvalidTime(c)
@@ -95,13 +96,13 @@ func (s *Service) response(record *pauseRecord, now time.Time) pauseResponse {
 		return response
 	}
 	response.Revision = record.Revision
-	if record.Mode != nil && strings.EqualFold(*record.Mode, pauseModeManual) {
+	if pauseModeMatches(record.Mode, pauseModeManual) {
 		mode := pauseModeManual
 		response.Paused = true
 		response.Mode = &mode
 		return response
 	}
-	if (record.Mode == nil || strings.EqualFold(*record.Mode, pauseModeTimed)) && record.PausedUntil != nil && record.PausedUntil.After(now) {
+	if (record.Mode == nil || pauseModeMatches(record.Mode, pauseModeTimed)) && record.PausedUntil != nil && record.PausedUntil.After(now) {
 		response.Paused = true
 		mode := pauseModeTimed
 		response.Mode = &mode
@@ -160,7 +161,7 @@ func (r updatePauseRequest) intent(now time.Time) (string, *time.Time, bool) {
 	if r.PausedUntil == nil {
 		return "", nil, false
 	}
-	until := r.PausedUntil.UTC()
+	until := r.PausedUntil.UTC().Truncate(time.Millisecond)
 	return pauseModeTimed, &until, validPauseUntil(now, until)
 }
 
