@@ -59,22 +59,46 @@ Both are follow-ups from the PR #621 review at head `d0b0a879`:
   attempt 2).
 - **`route_missing_since` marker lifecycle** (set by `RouteMissingSeenAt`, HDEL'd on
   `ack`/terminal `nack`/`replay`): reused here as the "in the defer loop" discriminator.
+- **Dispatch ordering around the marker clear** (`dispatcher.go`, review-driven): once
+  `Route()` resolves, `ClearRouteMissing` (token-protected) runs BEFORE the `MaxAttempts`
+  gate and `Deliver`, so a delivery lease is markerless and its reclaim is not refunded. The
+  route-absent branch returns earlier and never reaches it, keeping the marker the defer loop
+  needs. The `!cleared` result means the lease was reclaimed + re-leased, so the dispatcher
+  bails with `ack_lost` before `Deliver`/`Finalize` rather than doing a delivery whose terminal
+  `Ack` would fail — mirroring the existing `!deferred` lease-loss handling.
 - **`NewRedisQueue` construction contract** (boot-time; `main.go` returns its error): the
   new floor rejects only a pathological `LiveTTL`; all real/test configs (7d, 1h, 10m) clear it.
 - `touches: testing` — Redis-backed package unit tests.
 - `touches: commit` — Conventional Commits, English, `Fixes #62x` footer.
 
 ## Out of scope
-- The **capacity-defer** path's identical claim→Defer shape: pre-existing, its window is a
-  purely in-memory channel check (no I/O between claim and Defer), so exposure is negligible;
-  it carries no durable marker so the reclaim refund does not (and need not) cover it.
+- The **capacity-defer** path's identical claim→Defer shape (`dispatcher.go`): pre-existing
+  and NOT covered by this change. The marker-gated refund cannot reach it — `ClearRouteMissing`
+  runs before the capacity check, so a capacity-deferred lease is always markerless — and a
+  crash or lease expiry between claim and that `Defer` still leaks the `+1`. Note the window is
+  no longer the purely in-memory channel check it was when this task was drafted: the
+  `ClearRouteMissing` round-trip now sits between claim and the capacity `Defer`. Exposure is
+  still bounded (worst case a recoverable `attempts_exhausted` DLQ entry, replayable), but the
+  honest framing is deferred-to-follow-up, not negligible-by-construction. Closing it properly
+  means moving the speculative `+1` off `claim` — see the note below.
+- Relocating the attempt increment from `claimScript` to just before `Deliver`, which would
+  make BOTH defer paths net-zero without a discriminator and retire the marker's accounting
+  role entirely (subsuming this refund, the capacity-path gap above, and #680). It is the
+  cleaner shape but it moves a load-bearing off-by-one — the `lease.Attempt > MaxAttempts`
+  pre-delivery gate, `nackScript`'s `attempt >= maxAttempts` DLQ gate, and the replay reset all
+  shift together — so it needs its own review round rather than riding along with this P2.
 - Folding `RouteMissingSeenAt` + `Defer` into one atomic Lua transition (the other option
   the issue lists): it does not improve leak coverage over the marker-gated reclaim refund
   (the `+1` is at *claim*, before either call), so it was not pursued for this P2.
-- A route-level `MaxBackoff` vs `LiveTTL` guard: `NewRedisQueue` does not know per-route
-  backoff; the floor covers only the queue-level `routeMissingDeferInterval` constant.
-- Anything in `dispatcher.go`, the delivery-error retry path, enqueue resolution, or the
-  DLQ-retention/replay logic — all untouched.
+- A cross-config `LiveTTL` guard covering route-level `MaxBackoff` (up to 10m), the
+  dispatcher's `PollInterval` (no upper bound) and `LeaseDuration` (30s default). Each can
+  exceed `minLiveTTL`, so the floor does not make deferred-key expiry impossible in general —
+  only for the route-missing defer interval it is derived from. The values live on
+  `DispatcherConfig`, not `QueueConfig`, so the check belongs at dispatcher construction; the
+  `minLiveTTL` doc comment and the constructor error now state only what they enforce.
+- The delivery-error retry path, enqueue resolution, and the DLQ-retention/replay logic —
+  all untouched. `dispatcher.go` IS touched (see Load-bearing list) for the review-driven
+  marker clear and the pre-delivery lease-loss bail.
 
 ## Acceptance
 - #623: a reclaimed lease that carries a `route_missing_since` marker has its attempt

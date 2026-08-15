@@ -219,11 +219,16 @@ return #expired
 // first miss stamps now, later misses read the stored stamp, so the bounded route-missing
 // window is measured from the FIRST miss (not from Event.ActedAt). The marker is explicitly
 // removed on every exit transition — ackScript, nackScript (both requeue and dead-letter),
-// and replayDLQScript all HDEL the field — so the hash only ever holds markers for events
-// currently waiting in the route-missing defer loop and CANNOT grow unbounded under sustained
-// route-missing traffic (a whole-hash PEXPIRE cannot expire individual fields, so relying on
-// TTL alone would leak). The hash-level TTL refreshed here to liveTTL is only a backstop that
-// reaps the whole key once misses stop.
+// and replayDLQScript all HDEL the field — so in the normal case the hash only holds markers
+// for events currently waiting in the route-missing defer loop. That is not a guarantee: this
+// write is NOT fenced by the lease token, so a stalled call that lands after its event already
+// terminated re-plants a field no exit transition will ever run to reap again, while the
+// PEXPIRE below keeps pushing the whole key's expiry out under sustained traffic. Orphan
+// accumulation is slow and needs an in-flight write reordered past a lease loss, but it is
+// possible — tracked together with the related refund corner in #680. Absent that corner the
+// hash-level TTL refreshed here to liveTTL is only a backstop that reaps the whole key once
+// misses stop (a whole-hash PEXPIRE cannot expire individual fields, so relying on TTL alone
+// would leak).
 var routeMissingSinceScript = rd.NewScript(`
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then
@@ -245,15 +250,24 @@ redis.call('HDEL', KEYS[9], ARGV[1])
 return 1
 `)
 
-// minLiveTTL is the smallest LiveTTL NewRedisQueue accepts. A deferred event (a route-missing
-// re-check, or capacity backpressure) is re-scheduled up to routeMissingDeferInterval into the
-// future, and every queue operation PEXPIREs the event's ready/payload keys to LiveTTL. If LiveTTL
-// did not comfortably exceed that defer interval, a deferred key could expire BEFORE the event
-// became claimable — silently dropping the event instead of delivering it. The margin (4×) leaves
-// room to actually claim and process the event after it becomes due, not merely to survive to the
-// due instant. LiveTTL is Robot.MessageExpire, which defaults to 7 days and can never sensibly sit
-// in the seconds range (no user acts on a card that fast), so this only rejects a pathological
-// config — failing fast at construction (server boot) rather than dropping events at runtime.
+// minLiveTTL is the smallest LiveTTL NewRedisQueue accepts. It bounds exactly ONE window: a
+// route-missing re-check is re-scheduled routeMissingDeferInterval ahead while every queue
+// operation PEXPIREs the event's ready/payload keys to LiveTTL, so a LiveTTL at or below that
+// interval could let the deferred key expire BEFORE the event became claimable — silently
+// dropping it instead of delivering it. The margin (4×) leaves room to actually claim and
+// process the event after it becomes due, not merely to survive to the due instant.
+//
+// It deliberately does NOT establish that invariant for every schedule-ahead window in this
+// subsystem, and must not be read as doing so. Three others can exceed it: nackScript requeues
+// at now+retryBackoff (bounded by route.MaxBackoff — 1m by default, accepted up to 10m by
+// registry.go), the capacity-defer path re-schedules at now+DispatcherConfig.PollInterval (only
+// validated > 0, no upper bound), and DispatcherConfig.LeaseDuration defaults to 30s. Covering
+// those belongs in a cross-config check at dispatcher construction, where the values are known —
+// widening this constant to their ceiling would instead reject otherwise-valid
+// seconds-to-minutes configs. LiveTTL is Robot.MessageExpire, which defaults to 7 days and can
+// never sensibly sit in the seconds range (no user acts on a card that fast), so in practice
+// every real config clears all four; this floor only fails a pathological one fast at
+// construction (server boot) rather than dropping events at runtime.
 const minLiveTTL = 4 * routeMissingDeferInterval
 
 func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
@@ -267,7 +281,7 @@ func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 		return nil, errors.New("cardactiondispatch: queue retention must be positive")
 	}
 	if cfg.LiveTTL < minLiveTTL {
-		return nil, fmt.Errorf("cardactiondispatch: LiveTTL %s is below the %s floor required to outlast the route-missing defer interval (%s); a deferred event could expire before it becomes claimable",
+		return nil, fmt.Errorf("cardactiondispatch: LiveTTL %s is below the %s floor required to outlast the route-missing defer interval (%s); a route-missing deferred event could expire before it becomes claimable",
 			cfg.LiveTTL, minLiveTTL, routeMissingDeferInterval)
 	}
 	base := cfg.Prefix + ":{queue}:"
