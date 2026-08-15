@@ -3,6 +3,7 @@ package user
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // MaxBatchUserUIDs caps the number of uids a single batch user-info request may
@@ -120,20 +121,34 @@ func ValidateBatchUIDs(uids []string) error {
 // order and drops any uid that has no row or whose account is not live,
 // reporting those in MissingUIDs.
 //
-// Liveness is the repo's two-part predicate — Status == StatusEnable AND
-// IsDestroy == IsDestroyNo (mirrors dashboardReaderGrantEligible in
-// api_manager.go and IsBindable in oidc_bind.go). A destroyed account can still
-// carry status=1 mid-teardown, so gating on Status alone would surface it as
-// present; the IsDestroy check closes that so a destroyed uid always lands in
-// MissingUIDs.
+// Liveness is the repo's "account still occupies its identity" predicate —
+// Status == StatusEnable AND is_destroy is NOT the terminal IsDestroyDone. This
+// mirrors the DB-level predicate the rest of the repo uses for "is this account
+// live" (`is_destroy <> IsDestroyDone`; see db.go QueryByPhone and IsBindable in
+// oidc_bind.go). Crucially, a cooling-off account (is_destroy == IsDestroyApplying,
+// a destroy *request* still in its reversible grace window) can still send and
+// receive messages and therefore is a live group member: it must be reported
+// PRESENT, never missing. Only the terminal IsDestroyDone (teardown complete)
+// counts as gone. Gating on Status alone would surface a fully destroyed account
+// mid-teardown (it can still carry status=1), so the is_destroy check closes that
+// while leaving cooling-off members visible.
 //
 // This liveness gate is STRICTER than the human single-user read
 // (GET /v1/users/:uid → GetUserDetail), which applies no status/destroy filter
 // and will return a disabled or destroyed account. It matches the bot
 // single-user read (GET /v1/bot/user/info → GetUser), which rejects any
-// non-enabled account. Treating non-live accounts as missing is intentional:
-// these batch endpoints must never let a caller confirm a ghost/destroyed
-// member's identity.
+// non-enabled account. Treating fully destroyed / disabled accounts as missing is
+// intentional: these batch endpoints must never let a caller confirm a
+// ghost/destroyed member's identity — while never misjudging a cooling-off member
+// as a ghost, which is exactly the failure this feature exists to prevent.
+//
+// uid matching is case-insensitive to stay consistent with the DB, whose
+// `uid IN (...)` lookup runs under the case-insensitive `utf8mb4_general_ci`
+// collation. Matching case-sensitively here (Go map keys are case-sensitive)
+// would false-miss a case-variant request even though the row resolved in SQL —
+// another way to misjudge a live member as a ghost. Each resolved row echoes the
+// caller's requested key verbatim (case/form preserved) so every request uid
+// appears in exactly one of Users / MissingUIDs keyed by what was sent.
 //
 // DB-only resolution (deliberate, see P2 decisions): GetUsers reads the user
 // table directly and does NOT replicate the single-read synthetic fast paths —
@@ -147,23 +162,23 @@ func ValidateBatchUIDs(uids []string) error {
 func BuildBatchUsersResponse(uids []string, resps []*Resp) *BatchUsersResponse {
 	enabled := make(map[string]*Resp, len(resps))
 	for _, r := range resps {
-		if r == nil || r.Status != StatusEnable.Int() || r.IsDestroy != IsDestroyNo {
+		if r == nil || r.Status != StatusEnable.Int() || r.IsDestroy == IsDestroyDone {
 			continue
 		}
-		enabled[r.UID] = r
+		enabled[strings.ToLower(r.UID)] = r
 	}
 	out := &BatchUsersResponse{
 		Users:       make([]BatchUserDTO, 0, len(uids)),
 		MissingUIDs: make([]string, 0),
 	}
 	for _, uid := range uids {
-		r, ok := enabled[uid]
+		r, ok := enabled[strings.ToLower(uid)]
 		if !ok {
 			out.MissingUIDs = append(out.MissingUIDs, uid)
 			continue
 		}
 		out.Users = append(out.Users, BatchUserDTO{
-			UID:    r.UID,
+			UID:    uid,
 			Status: r.Status,
 			Name:   r.Name,
 			Robot:  r.Robot,

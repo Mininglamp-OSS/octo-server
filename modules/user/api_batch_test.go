@@ -48,9 +48,9 @@ func newBatchUserServer(t *testing.T) (*server.Server, *config.Context) {
 }
 
 // seedBatchUserFull inserts a user row with an explicit is_destroy value so the
-// liveness gate (Status == enable AND IsDestroy == IsDestroyNo) can be exercised.
-// status: 0 disabled, 1 enabled, 2 blacklist. robot: 0 human, 1 bot. isDestroy:
-// 0 normal, 1 applying (cooling-off), 2 destroyed.
+// liveness gate (Status == enable AND is_destroy != terminal IsDestroyDone) can be
+// exercised. status: 0 disabled, 1 enabled, 2 blacklist. robot: 0 human, 1 bot.
+// isDestroy: 0 normal, 1 applying (cooling-off, still live), 2 destroyed (terminal).
 func seedBatchUserFull(t *testing.T, ctx *config.Context, uid, name string, status, robot, isDestroy int) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
@@ -132,13 +132,27 @@ func TestBatchUsersHuman_RequestValidation(t *testing.T) {
 	}
 
 	t.Run("cap overflow", func(t *testing.T) {
-		uids := make([]string, 1001)
+		uids := make([]string, MaxBatchUserUIDs+1)
 		for i := range uids {
 			uids[i] = fmt.Sprintf("u%d", i)
 		}
 		payload, _ := json.Marshal(map[string][]string{"uids": uids})
 		w := postBatchUsers(s, testutil.Token, string(payload))
 		assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+	})
+
+	t.Run("at cap boundary accepted", func(t *testing.T) {
+		// Exactly MaxBatchUserUIDs unseeded uids: within the cap, so the request is
+		// accepted (200) and every uid is reported missing. Pins the boundary that a
+		// hardcoded 1001 could not (200/1000 both passed the old assertion).
+		uids := make([]string, MaxBatchUserUIDs)
+		for i := range uids {
+			uids[i] = fmt.Sprintf("cap%d", i)
+		}
+		payload, _ := json.Marshal(map[string][]string{"uids": uids})
+		b := decodeBatchResp(t, postBatchUsers(s, testutil.Token, string(payload)))
+		assert.Len(t, b.MissingUIDs, MaxBatchUserUIDs)
+		assert.Empty(t, b.Users)
 	})
 }
 
@@ -186,9 +200,12 @@ func TestBatchUsersHuman_DisabledAndBlacklistedTreatedAsMissing(t *testing.T) {
 	assert.NotContains(t, joined, "u_ok")
 }
 
-// TestBatchUsersHuman_DestroyedTreatedAsMissing pins the second half of the
-// liveness predicate: an account with status=1 (enabled) but is_destroy != 0 is
-// mid/post-teardown and must be reported missing, never present.
+// TestBatchUsersHuman_DestroyedTreatedAsMissing pins the liveness predicate's
+// is_destroy half: only the TERMINAL IsDestroyDone (teardown complete) is treated
+// as missing. An account still in its reversible cooling-off window
+// (IsDestroyApplying) can still send/receive and is a live member, so it must be
+// reported PRESENT — misjudging it as a ghost is exactly the failure this feature
+// prevents.
 func TestBatchUsersHuman_DestroyedTreatedAsMissing(t *testing.T) {
 	s, ctx := newBatchUserServer(t)
 	seedBatchUserFull(t, ctx, "u_live", "Live", 1, 0, IsDestroyNo)
@@ -198,11 +215,29 @@ func TestBatchUsersHuman_DestroyedTreatedAsMissing(t *testing.T) {
 	body := `{"uids":["u_destroyed","u_live","u_destroying"]}`
 	b := decodeBatchResp(t, postBatchUsers(s, testutil.Token, body))
 
-	require.Len(t, b.Users, 1)
+	// u_live (is_destroy=0) and u_destroying (is_destroy=1, cooling-off) are both
+	// live and present, in request order; only the terminally destroyed uid is missing.
+	require.Len(t, b.Users, 2)
 	assert.Equal(t, "u_live", batchUserUID(t, b.Users[0]))
-	// status=1 but is_destroy!=0 must be reported missing even though status alone
-	// would pass.
-	assert.ElementsMatch(t, []string{"u_destroyed", "u_destroying"}, b.MissingUIDs)
+	assert.Equal(t, "u_destroying", batchUserUID(t, b.Users[1]))
+	assert.Equal(t, []string{"u_destroyed"}, b.MissingUIDs)
+}
+
+// TestBatchUsersHuman_CaseInsensitiveResolve pins that a case-variant request
+// resolves against its DB row (the `uid IN (...)` lookup runs under the
+// case-insensitive utf8mb4_general_ci collation) instead of false-missing, and
+// echoes the caller's requested key verbatim.
+func TestBatchUsersHuman_CaseInsensitiveResolve(t *testing.T) {
+	s, ctx := newBatchUserServer(t)
+	seedBatchUser(t, ctx, "u_case_lower", "Case", 1, 0)
+
+	body := `{"uids":["U_CASE_LOWER"]}`
+	b := decodeBatchResp(t, postBatchUsers(s, testutil.Token, body))
+
+	require.Len(t, b.Users, 1)
+	// Resolved (not missing), and the response echoes the caller's exact key.
+	assert.Equal(t, "U_CASE_LOWER", batchUserUID(t, b.Users[0]))
+	assert.Empty(t, b.MissingUIDs)
 }
 
 // TestBatchUsersHuman_MissingOrderPreserved pins the request-order contract on

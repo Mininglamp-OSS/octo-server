@@ -20,12 +20,14 @@ const maxBatchRequestBodyBytes = 32 * 1024
 // fan-out callers used for bulk identity resolution (anti-ghost-member checks),
 // which otherwise saturates the per-endpoint rate limit on large groups.
 //
-// Liveness filtering (Status == StatusEnable AND IsDestroy == IsDestroyNo) and
-// request-order preservation live in BuildBatchUsersResponse; a non-live
-// (disabled / blacklisted / destroyed) account is reported in missing_uids. Note
-// this gate is STRICTER than the human single-user read GET /v1/users/:uid
-// (u.get → GetUserDetail), which applies no status/destroy filter — see
-// BuildBatchUsersResponse for the full rationale.
+// Liveness filtering (Status == StatusEnable AND is_destroy != terminal
+// IsDestroyDone) and request-order preservation live in BuildBatchUsersResponse;
+// a non-live (disabled / blacklisted / fully destroyed) account is reported in
+// missing_uids, while a cooling-off account (is_destroy == IsDestroyApplying,
+// still able to send/receive) stays present. Note this gate is STRICTER than the
+// human single-user read GET /v1/users/:uid (u.get → GetUserDetail), which
+// applies no status/destroy filter — see BuildBatchUsersResponse for the full
+// rationale.
 //
 // Error taxonomy (deliberate, see P2 decision): every request-validation failure
 // — malformed body, empty/too-many/duplicate/over-length uids — collapses to a
