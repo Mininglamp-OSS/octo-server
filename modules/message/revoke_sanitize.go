@@ -75,6 +75,12 @@ func sanitizeRevokedMsgSyncResp(m *MsgSyncResp) {
 //
 // fail-closed：payload 解析失败（截断 / 非 JSON）时绝不能原样透传撤回原文，退化为
 // 空 original，revokedPayload 会 fallback 到 ContentError 占位。
+//
+// 注意：本函数只处理 payload 字节，不触碰 MessageExtra/ContentEdit。当前 bot 拉历史
+// 路径的 config.MessageResp 结构本身不含 MessageExtra，故无泄漏面。若响应结构未来
+// 引入 MessageExtra/ContentEdit（如为对齐 web 端），调用方必须自行剥离 content_edit
+// ——参见 sanitizeRevokedMsgSyncResp 对 m.MessageExtra.ContentEdit/EditedAt 的清理，
+// content_edit 是「编辑后的正文」，同样是原文载体，撤回后必须一并剥离。
 func SanitizeRevokedPayloadBytes(payload []byte) []byte {
 	var original map[string]interface{}
 	if err := util.ReadJsonByByte(payload, &original); err != nil {
