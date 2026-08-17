@@ -22,6 +22,10 @@ type dispatchQueue interface {
 	// observed missing at dispatch, so the bounded route-missing window is measured from
 	// that point rather than from Event.ActedAt.
 	RouteMissingSeenAt(eventID int64, now time.Time) (time.Time, error)
+	// ClearRouteMissing removes the route-missing first-seen marker once the route has
+	// resolved, so a lease that proceeds to delivery is reclaimed as a delivery attempt
+	// (preserving the MaxAttempts bound) rather than refunded as a defer.
+	ClearRouteMissing(eventID int64, token string) (bool, error)
 }
 
 type callbackDeliverer interface {
@@ -176,6 +180,27 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 		resultLabel = "deferred"
 		d.refreshDepthMetrics()
 		return true, nil
+	}
+	// The route resolved: this event is no longer route-missing, so drop its first-seen marker
+	// (token-protected) before delivery. Otherwise a once-route-missing event that reaches Deliver
+	// still carries the marker, and a hard crash during delivery (no Ack/Nack) would be reclaimed as
+	// a refunded defer — asymmetrically exempting it from the MaxAttempts bound. Clearing it here makes
+	// a delivery-phase crash advance the attempt like any delivery lease. A miss (route absent) never
+	// reaches this line, so the marker it needs for the defer loop is untouched.
+	cleared, clearErr := d.queue.ClearRouteMissing(lease.Event.EventID, lease.Token)
+	if clearErr != nil {
+		d.metrics.observeError(owner, "queue_error")
+		d.refreshDepthMetrics()
+		return true, clearErr
+	}
+	if !cleared {
+		// The token no longer matches: this lease expired and was reclaimed + re-leased to another
+		// worker (or already terminated). Bail before doing a wasted Deliver/Finalize whose terminal
+		// Ack would fail as ack_lost anyway; the current owner will process the event. This mirrors the
+		// lease-ownership-lost handling on the Defer paths above.
+		d.metrics.observeError(owner, "ack_lost")
+		d.refreshDepthMetrics()
+		return true, errors.New("cardactiondispatch: lease ownership lost before delivery")
 	}
 	if lease.Attempt > route.MaxAttempts {
 		const category = "attempts_exhausted"

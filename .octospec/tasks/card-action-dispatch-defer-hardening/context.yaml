@@ -1,0 +1,116 @@
+# Rules resolved for this task (octospec Implement phase).
+slug: card-action-dispatch-defer-hardening
+resolved_at: 2026-07-24T13:15:45+00:00
+
+# Files touched: internal/cardactiondispatch/queue.go,
+#                internal/cardactiondispatch/route_missing_queue_test.go,
+#                internal/cardactiondispatch/coverage_test.go
+# Path-glob matches: rate-limit (internal/**/*.go), space-isolation (internal/**/*.go),
+#                    testing (**/*_test.go), commit-style (**).
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches. Checked for cross-space leakage.
+    applied:
+      - N/A — no data access and no Space boundary is crossed. Both changes are internal to
+        the Redis queue mechanics: reclaimScript decrements an integer attempt counter for an
+        event already space-validated at enqueue time, and NewRedisQueue adds a construction
+        pre-condition. No user data is read and nothing is granted.
+      - The refund does not widen access or re-target anything: it only adjusts the retry
+        budget of the exact same event; re-delivery still re-checks the consumer's own authz.
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches; #623 touches the queue's attempt/reclaim path.
+    applied:
+      - N/A — not request-frequency limiting. The change refunds an attempt counter inside the
+        EXISTING reclaim Lua (reusing the route_missing_since marker the defer path already
+        maintains); no hand-rolled Redis INCR/TTL counter and no HTTP throttling is introduced.
+        #624 only adds a lower-bound assertion on a configured duration.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    applied:
+      - Risk-proportional Redis-backed package unit tests added. #623:
+        TestReclaimRefundsRouteMissingDeferAttemptLeak with a positive case (marker → refund →
+        next claim attempt 1) AND a negative control (no marker → keep → next claim attempt 2),
+        so the test proves the gate, not just the happy path. #624:
+        TestNewRedisQueueRejectsLiveTTLBelowDeferFloor (boundary + reject/accept tables).
+      - The Redis-backed tests skip when no local Redis is reachable (t.Skipf), matching the
+        package's existing newRedisTestQueue / TestRedisQueue* pattern; they need no MySQL/IM.
+      - Verified against a live stack: go test -tags integration ./internal/cardactiondispatch/
+        (unit + the 3 e2e orchestration tests) green against real MySQL 8 + Redis + WuKongIM
+        (built from source at tag v2.2.4-20260313). The pinned TestRedisQueueLeaseTokenRetryDLQAndReplay
+        (markerless reclaim → attempt 2) still passes, confirming delivery accounting is untouched.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    applied:
+      - Two Conventional Commits, English bodies, one per issue:
+        fix(cardaction): refund leaked attempt on reclaim of route-missing deferred lease (Fixes #623)
+        fix(cardaction): reject a LiveTTL below the route-missing defer floor (Fixes #624)
+      - Each issue linked in its commit footer (Fixes #62x); one PR for both (same file,
+        same subsystem), each fix independently reviewable as its own commit.
+
+notes:
+  - error-handling / i18n rule does NOT match: its paths are modules/**, pkg/errcode/**,
+    pkg/**/httperr/** — internal/** is excluded, and NewRedisQueue returns a plain Go error
+    surfaced at server boot (main.go), not a user-facing HTTP response. No error codes, no
+    make i18n-* required.
+  - trust-boundary rule does NOT match (adapter/webhook/richtext paths only).
+  - Design choice #623 (marker-gated reclaim refund vs atomic Lua transition): the issue lists
+    both. The refund is the option that actually addresses the leak — the speculative +1 happens
+    at CLAIM, before any transition, so folding RouteMissingSeenAt+Defer would only narrow a
+    sub-window while leaving the claim→transition window open. Gating the refund on the durable
+    route_missing_since marker is a faithful implementation of the issue's "undo the increment for
+    non-delivery (deferred) leases" — the marker is the only durable discriminator between a
+    deferred lease and a delivery lease.
+  - Residual (documented, accepted): a crash in the first-cycle window BEFORE the first marker is
+    written (claim → first RouteMissingSeenAt) can still leak at most ONE increment per
+    route-missing episode. The marker persists for the rest of the episode (cleared only on
+    Ack/terminal-Nack/replay), so subsequent cycles are protected. One increment is far below
+    MaxAttempts (typically 3–5) over a minutes-long, rare episode — acceptable for a P2.
+  - PR #662 review round (Jerry-Xin, BLOCKING) — FIXED. The route_missing_since marker is cleared
+    only on Ack/Nack/replay, so a once-route-missing event whose route RETURNS still carried the
+    marker while it delivered; a repeated hard crash during delivery (OOM / Redis connectivity loss —
+    not a poison callback) would have reclaimScript refund the attempt every time, pinning the counter
+    and asymmetrically exempting that event from the MaxAttempts bound. The PR had disclosed this as a
+    "benign edge"; the reviewer correctly argued it is a real bound bypass, not just a fresh start.
+    Fix: new token-protected clearRouteMissingScript / RedisQueue.ClearRouteMissing, called by the
+    dispatcher the moment Route() resolves (ok==true), BEFORE the attempt gate and Deliver — so a
+    delivery-phase reclaim advances the attempt like any delivery lease. Chose "clear the marker on
+    route resolution" over the reviewer's alternative "persist an explicit per-lease deferred state":
+    it reuses the existing marker + token machinery, adds one HDEL to the (low-QPS, human-click) route-
+    present path, and is semantically exact — the marker means "currently route-missing", which stops
+    being true the instant the route resolves. New tests: TestClearRouteMissingRestoresDeliveryReclaimBound
+    (Redis; token-mismatch cannot clear + cleared marker → reclaim advances attempt to 2) and
+    TestRoutePresentClearsRouteMissingMarkerBeforeDelivery (dispatcher wiring: route-present dispatch
+    clears the marker, then delivers + acks). The two other reviewers (lml2468, Octo-Q) APPROVED; the
+    lml2468 review ran a negative control (removing the refund block fails the #623 reproducer).
+  - PR #662 re-review at fe386b40: all four reviewers (lml2468, Jerry-Xin, Octo-Q, yujiawei) APPROVED
+    the marker-clear fix. Three non-blocking P2 hardening notes were left; handling:
+    (a) FOLDED IN — ClearRouteMissing's bool return was discarded, so a token-mismatch (lease
+    reclaimed + re-leased before delivery) let a stale worker run a wasted Deliver/Finalize whose
+    terminal Ack fails as ack_lost. ProcessOne now bails on !cleared with a lease-ownership-lost error,
+    mirroring the Defer paths. Test: TestRoutePresentLeaseLostBeforeDeliveryDoesNotDeliver.
+    (b) FOLDED IN — reworded the reclaim comment: the pre-first-marker leak is "that cycle's +1", not
+    strictly "one per episode" (a pathological loop that dies before every marker write leaks per such
+    cycle; worst case still a recoverable DLQ entry, never silent loss).
+    (c) FOLLOW-UP ISSUE — token-guard the RouteMissingSeenAt marker WRITE too (routeMissingSinceScript),
+    symmetric to the token-guarded clear, closing an astronomically narrow re-plant corner (in-flight
+    marker write reordered past a lease expiry + reclaim + re-claim + route recovery + delivery crash).
+    Deferred per the reviewers' own "follow-up issue, not a merge blocker" framing; it is a signature
+    change (RouteMissingSeenAt gains a token param + interface + fakes + Lua).
+  - Design choice #624: floor = 4 × routeMissingDeferInterval (20s). The bare-correctness floor is
+    1× (survive to the due instant); 4× is a comfort margin so the event can actually be claimed and
+    processed after becoming due, not merely survive. Only rejects seconds-scale configs, which are
+    already broken for card messaging. queue.go references routeMissingDeferInterval (dispatcher.go,
+    same package) — a minor layering coupling, justified because the queue's TTL must accommodate the
+    dispatcher's defer cadence.
+  - The coverage bounds test (TestDecisionAndQueueInputBounds) constructed its "bounds" queue with
+    LiveTTL: time.Second; bumped to time.Minute to respect the new floor (that value was an
+    artificially small TTL the new invariant forbids, not a behavior the test was asserting).

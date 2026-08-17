@@ -26,6 +26,12 @@ type concurrentLeaseQueue struct {
 	// entry to simulate an event that has already waited (→ past the window); otherwise the
 	// first RouteMissingSeenAt call stamps `now`, mirroring the real HSETNX-then-read.
 	routeMissingSince map[int64]time.Time
+	// cleared receives an event id each time ClearRouteMissing is called, so a test can assert the
+	// dispatcher drops the marker on the route-present path before delivery.
+	cleared chan int64
+	// clearRouteMissingLost makes ClearRouteMissing report lease loss (false) so a test can drive the
+	// token-mismatch path in ProcessOne (lease reclaimed + re-leased before delivery).
+	clearRouteMissingLost bool
 }
 
 type nackCall struct {
@@ -100,6 +106,18 @@ func (q *concurrentLeaseQueue) RouteMissingSeenAt(eventID int64, now time.Time) 
 	}
 	q.routeMissingSince[eventID] = now
 	return now, nil
+}
+func (q *concurrentLeaseQueue) ClearRouteMissing(eventID int64, _ string) (bool, error) {
+	if q.clearRouteMissingLost {
+		return false, nil
+	}
+	q.mu.Lock()
+	delete(q.routeMissingSince, eventID)
+	q.mu.Unlock()
+	if q.cleared != nil {
+		q.cleared <- eventID
+	}
+	return true, nil
 }
 
 type capturingDeliverer struct {
