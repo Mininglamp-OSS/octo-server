@@ -59,15 +59,16 @@ func TestManagerCapabilities(t *testing.T) {
 }
 
 // TestManagerCapabilities_MarketAdmin pins the whole point of the marketAdmin
-// role: exactly the four platform-catalog keys and nothing else. In particular
-// expert.* stays false — curating the Expert Market remains SuperAdmin-only,
-// and octo-marketplace gates that route group separately.
+// role: exactly the six platform-market keys and nothing else. Iterating the
+// whole map rather than spot-checking is deliberate — any capability that leaks
+// into this role fails here rather than shipping.
 func TestManagerCapabilities_MarketAdmin(t *testing.T) {
 	market := managerCapabilities(appauth.ManagerRoleMarketAdmin)
 
 	granted := map[string]bool{
 		"mcp.read": true, "mcp.write": true,
 		"skill.read": true, "skill.write": true,
+		"expert.read": true, "expert.write": true,
 	}
 	for k, v := range market {
 		if want := granted[k]; v != want {

@@ -51,11 +51,11 @@ func TestManagerLoginAllowsMarketAdmin(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"role":"`+appauth.ManagerRoleMarketAdmin+`"`)
 }
 
-// TestManagerMe_MarketAdminGetsOnlyCatalogCaps is the wire-level counterpart to
+// TestManagerMe_MarketAdminGetsOnlyMarketCaps is the wire-level counterpart to
 // TestManagerCapabilities_MarketAdmin: the pure function cannot catch a
 // regression in the handler's own role gate, and the capability map is the
 // contract octo-admin renders from.
-func TestManagerMe_MarketAdminGetsOnlyCatalogCaps(t *testing.T) {
+func TestManagerMe_MarketAdminGetsOnlyMarketCaps(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
 	loginAsRole(t, ctx, appauth.ManagerRoleMarketAdmin)
@@ -69,13 +69,15 @@ func TestManagerMe_MarketAdminGetsOnlyCatalogCaps(t *testing.T) {
 	granted := map[string]bool{
 		"mcp.read": true, "mcp.write": true,
 		"skill.read": true, "skill.write": true,
+		"expert.read": true, "expert.write": true,
 	}
 	for capability, enabled := range resp.Capabilities {
 		assert.Equalf(t, granted[capability], enabled,
 			"marketAdmin capability %q over the wire", capability)
 	}
-	assert.False(t, resp.Capabilities["expert.read"], "expert market stays superAdmin-only")
 	assert.False(t, resp.Capabilities["dashboard.read"], "marketAdmin is not a dashboard reader")
+	assert.False(t, resp.Capabilities["users.read"], "marketAdmin holds no console power outside the market")
+	assert.False(t, resp.Capabilities["system_setting"], "marketAdmin holds no console power outside the market")
 }
 
 func TestManagerMarketAdminGrantAndRevoke(t *testing.T) {
