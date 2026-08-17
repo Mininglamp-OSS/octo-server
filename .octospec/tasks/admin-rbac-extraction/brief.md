@@ -43,7 +43,7 @@ route→capability 的映射变成一张表，`managerCapabilities` 由它派生
   role 不再活到过期。改 role 必须 `Invalidate(uid)`。
 - 管理台闸门：`auth.IsManagerConsoleRole` 控登录（`api_manager.go:359`）与 `/me`
   （`api_manager.go:149`）；各端点 62 处 `CheckLoginRoleIsSuperAdmin()` + 38 处
-  `CheckLoginRole()`，散在 24 个文件。`modules/space`、`modules/common`、
+  `CheckLoginRole()`，散在 18 个文件。`modules/space`、`modules/common`、
   `modules/opanalytics`、`modules/card_template_catalog` 已有本地
   `requireAdmin(c) bool` / `requireSuperAdmin(c) bool` 包装。
 - 前端：`octo-admin/src/auth/capabilities.ts` 的 `MANAGER_CAPABILITY_KEYS` 与后端
@@ -84,12 +84,16 @@ route→capability 的映射变成一张表，`managerCapabilities` 由它派生
 
 ```sql
 admin_role            (role_key PK, name, is_builtin, created_at)   -- 角色定义
-admin_role_capability (role_key, capability)                        -- 角色 → 能力（仅自定义角色）
+admin_role_capability (role_key, capability)                        -- 角色 → 能力（内建与自定义同表）
 user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 → 角色（多对多）
 ```
 
 - capability 字符串**直接复用前端 `MANAGER_CAPABILITY_KEYS` 的同名同义键**
   （`mcp.read` / `skill.write` / …），前端零改动。
+- **迁移文件放 `modules/user/sql/`，不放 `pkg/authz/sql/`。** 迁移是按模块收集的
+  （`register.AddModule{SQLDir: register.NewSQLFS(sqlFS)}`，`sqlFS` 来自模块自己的
+  `//go:embed sql`，见 `modules/user/1module.go:17-18`），`pkg/` 下没有嵌入点，放那里
+  **不会被迁移器发现**。角色表与 user 同生命周期，回填也要 join user 表。
 
 #### 扩展性决定（这几条会长期锁住表结构）
 
@@ -113,6 +117,11 @@ user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 �
 - **角色扁平，不做继承**。NIST 将 hierarchical RBAC 单列一层自有其代价：菱形继承
   使权限来源无法回溯。多角色并集已覆盖绝大部分场景。
 - **`role_key` 不可变**（显示名 `name` 可改），因此可安全地做自然主键。
+- **`role_key` 与 `user.role` 的投影值解耦**：`role_key` 是受
+  `^[a-z][a-z0-9_]{0,63}$` 约束的内部标识（`super_admin` / `dashboard_reader`），
+  投影到 `user.role` 时输出历史契约值（`superAdmin` / `dashboardReader`）。两者本就
+  是不同层的东西——投影值要喂给 octo-lib 与 marketplace，不能被内部命名规范绑架；
+  混用则内建 key 的 camelCase 会直接违反该正则。
 - **未注册的 capability 必须被忽略，不是报错**：DB 里可能存在代码里已不存在的
   capability（版本回滚、capability 改名）。resolver 遇到未注册键跳过并打 debug 日志；
   若改成报错，一次回滚就会让所有自定义角色全部失效。
@@ -128,13 +137,29 @@ user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 �
   `user_admin_role`（仓内 199 个迁移中仅 3 个使用外键，与既有风格一致）。
 - `role_key` VARCHAR(64)，约束 `^[a-z][a-z0-9_]{0,63}$`；内建 key 保留，自定义角色
   不得占用。
+- **写 `user.role` 的三条路径必须在 Phase 0 就改成双写**（详见"过渡期双写"）。
 - **`user.role` 列保留不动**，改由 RBAC **反写的派生投影**维护：持有内建
   `superAdmin` 角色 → `'superAdmin'`；持有任何含 admin 档能力的角色 → `'admin'`；
   否则 `''`。这是能在**不改 octo-lib**（`CheckLoginRole*` 是 octo-lib 的
   `wkhttp.Context` 方法）、不动老 token、不动 marketplace 的前提下平滑迁移的关键，
   同时也是 admin 权限与业务权限之间的隔离带（见 Out of scope）。投影只降不升。
-- 内建角色 seed：`superAdmin`（全集，不可编辑/不可删）、`admin`、`dashboardReader`。
-  **`dashboardReader` 由代码常量降级为一行数据**——这正是本任务要消除的那类硬编码。
+- 内建角色（启动时 reconcile 到定义态）：`super_admin`（持通配 `*`，不可编辑/不可删）、
+  `admin`、`dashboard_reader`。**`dashboardReader` 由代码常量降级为一行数据**——这正是
+  本任务要消除的那类硬编码。
+
+### 过渡期双写（Phase 0 必含，否则 Phase 1 上线即锁死）
+
+迁移回填**只覆盖存量行**，而写 `user.role` 的路径有三条且都不写新表。Phase 0 起这
+三条必须同时写 `user_admin_role`：
+
+1. `createManagerAccount` → `newManagerSeedModel`（`api_manager.go:1610-1620`）——
+   **全新部署**时在启动阶段直插一行 `role='superAdmin'`。此时迁移早已跑完，回填不会
+   再执行 → 无 `user_admin_role` 行 → Phase 1 之后**全新部署的超管零能力，管理台锁死**。
+   这是本任务最容易被忽略、后果最严重的一处。
+2. `addAdminUser`（`api_manager.go:796`，硬编码写 `role='admin'`）。
+3. `setDashboardReaderRole` → `updateUserRole`（`db_manager.go:166`）。
+
+回填是一次性的，双写才是整个过渡期（Phase 0→2）的正确性保证。
 
 ### 新增包 `pkg/authz/`
 
@@ -143,7 +168,9 @@ user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 �
 | `capability.go` | capability 常量注册表（唯一真源）+ `Register()` 防拼写漂移；导出 `All()` 供契约测试与前端键对齐 |
 | `policy.go` | route→capability 映射表 + `Guard(c, cap) bool` |
 | `resolver.go` | `Resolve(ctx, uid) (Set, error)`，Redis 热缓存，仿 `RoleService` |
-| `sql/` | 建表 + seed + 从 `user.role` 回填 `user_admin_role` |
+| `reconcile.go` | 内建角色定义 + 启动时对账；失败拒绝启动 |
+
+迁移 SQL 不在本包内，见"数据模型"。
 
 `Guard` 刻意做成 `bool` 返回，与现有 `requireSuperAdmin(c) bool`
 （`modules/space/api_manager.go:174`）形状一致，call-site 改动是一行替换：
@@ -162,6 +189,10 @@ if !authz.Guard(c, authz.McpWrite) { return }  // 新
 - **失效面比 role 大**：改一个角色的能力集会影响所有持有该角色的用户，不能遍历
   用户删 key。做法是缓存值里带一个全局 `role_version`，角色定义变更时 bump，所有
   用户缓存自然失效。
+- **`role_version` 自身不得再加一次 Redis 往返**：它落在 Redis 上（`authz:role_version`），
+  但进程内以极短 TTL（≤5s）缓存，否则每次 resolve 都要多读一个 key，等于把 auth
+  热路径的 Redis 往返翻倍（该热路径已有慢日志观测，`pkg/auth/parser.go` 的
+  `authSlowLog`）。代价是角色定义变更的生效再多至多 5s，可接受。
 
 ### 失败模式：fail-closed（已确认）
 
@@ -189,8 +220,8 @@ false 的 capability 图——全 false 会被 `firstManagerPath` 判成 `/no-ac
 
 | Phase | 内容 | 行为变更 |
 |---|---|---|
-| **0**（本 task 首个 PR） | 建表 + seed + 回填；`pkg/authz` 骨架；`managerCapabilities()` 改为 authz 派生，同时用旧逻辑算一遍做 **shadow 对比**，不一致打 warn | **零** |
-| **1**（逐模块，10+ PR） | 把 `CheckLoginRole*` / `require*Admin` 换成 `authz.Guard`；每个端点登记进 `policy.go`；每模块配源码守卫测试 | 无（等价替换） |
+| **0**（本 task 首个 PR） | 建表 + 内建角色 reconcile + 回填；**三条 `user.role` 写路径改双写**；`pkg/authz` 骨架；`managerCapabilities()` 用 authz 算一遍与旧逻辑做 **shadow 对比**，不一致打 warn 并**以旧结果为准** | **零** |
+| **1**（按 call-site 清单分批） | 把 `CheckLoginRole*` / `require*Admin` 换成 `authz.Guard`；每条 call-site 登记进 `policy.go`；每模块配源码守卫测试。**fail-closed 自本阶段起生效**（Phase 0 旧结果为准，尚未生效） | 无（等价替换） |
 | **2** | 角色管理 API（建角色 / 勾 capability / 授予撤销）；`dashboardReader` 端点降级为兼容 shim。**只做端点，不做 UI**（已确认） | 新增面 |
 | **3**（跨仓） | `/v1/auth/verify` 加 `capabilities []string`；marketplace 按资源组挂 capability 门 + 契约钉死 | 跨仓 |
 
@@ -261,11 +292,27 @@ workplace / statistics / integration / app_bot）。
   UI 另起 task。目标账号的**使用**面不受影响（见"交付阶段"）。
 - **作用域化角色**（管理台角色绑定到某个 Space / 租户）与多租户维度——见"扩展性决定"。
 
-### 单模块内的文件级边界（Phase 1 必须遵守）
+### 边界按 call-site 判定，不是按文件（Phase 1 必须遵守）
 
-`modules/space`、`modules/group`、`modules/message` 在同一模块内混有两种权限：
-`api_manager*.go` 是跨空间的**管理台**权限（in scope），`api.go` 里的成员校验是
-**业务**权限（out of scope）。Phase 1 只能按文件切，不能按模块切。
+`api_manager*.go` 是**强信号但不是规则**。实测有 6 处管理台闸门落在该命名之外：
+
+- `modules/statistics/api.go`（该模块没有 `api_manager.go`）
+- `modules/integration/api.go:233` `upsertManagerClient`
+- `modules/app_bot/app_bot.go:310,443` `createPlatformBot` / `listPlatformBots`
+- `modules/card_template_catalog/api.go:252`（`requireSuperAdmin` helper 本体）
+- `modules/group/api.go:3048`、`modules/user/api.go:791-805`（见下）
+
+**第三类 call-site：admin 与业务权限在同一 handler 内交织。Phase 1 一律不动。**
+改它们必然触及业务权限语义，已越出本任务边界，留到最后逐个评审：
+
+- `modules/group/api.go:3048` — 注释"这里要兼容后台管理系统的删除操作"，用
+  `c.CheckLoginRole() != nil` 决定是否跳过群成员校验。
+- `modules/user/api.go:791-805` — 改头像端点里 `CheckLoginRoleIsSuperAdmin()` 是个
+  **提权分支**，失败则 fallback 到 `space_member.role` 业务校验；两套权限焊在一个
+  if/else 内。
+
+因此 Phase 1 的推进单位是 **call-site 清单**（在 `policy.go` 中逐条登记），文件与模块
+只用于排期分组。
 
 ## Acceptance
 
@@ -274,13 +321,17 @@ workplace / statistics / integration / app_bot）。
 - `managerCapabilities()` 对 `""` / `admin` / `superAdmin` / `dashboardReader`
   四种角色的输出与旧实现**逐键相等**（表驱动测试，扩展
   `modules/user/api_manager_me_test.go`）。
-- shadow 对比：新旧结果不一致时打 warn 日志并**以旧结果为准**返回；灰度期
-  mismatch 计数为 0 方可进入 Phase 1。
+- shadow 对比：新旧结果不一致时打 warn 日志并**以旧结果为准**返回；mismatch 经
+  `pkg/metrics` 暴露为 counter（不靠人 grep 日志），灰度期计数为 0 方可进入 Phase 1。
 - 回填正确性：对每个现存 `user.role != ''` 的 uid，`user_admin_role` 有对应行，且
   派生投影回算出的 `user.role` 与原值相等（迁移测试）。
+- **双写覆盖三条路径**（`createManagerAccount` / `addAdminUser` /
+  `setDashboardReaderRole`）：各配一条测试，断言写完 `user.role` 后 `user_admin_role`
+  有对应行。其中**全新部署**场景（空库 → 迁移 → `createManagerAccount` 建超管）必须
+  有独立用例，断言该超管解析出全量 capability——这是 Phase 1 之后最致命的锁死路径。
 - `user.role` 的取值集合不变；octo-lib `CheckLoginRole*` 行为不变。
 
-### 贯穿全程
+### 贯穿全程（fail-closed 自 Phase 1 起生效；Phase 0 以旧结果为准）
 
 - capability 解析失败 → **拒绝**请求（fail-closed），有测试覆盖；与 `RoleResolver`
   的 fail-open 行为区分开，两者各有断言。
@@ -309,7 +360,8 @@ workplace / statistics / integration / app_bot）。
 - 非 superAdmin **不能**创建或授予一个自己不持有的 capability 集合（测试覆盖自我
   提权尝试）。
 - 内建 `superAdmin` 角色不可编辑、不可删除。
-- 撤销操作不得使系统中 superAdmin 数量归零（fail-closed，有测试）。
+- 撤销操作不得使系统中 superAdmin 数量归零（fail-closed，有测试）。**该保护须同时
+  覆盖现存的 `deleteAdminUsers`（删账号）**，否则绕开角色撤销一样能删掉最后一个超管。
 - 角色定义 / 授权变更写审计日志，含 `actor_uid` + `target_uid`（沿用
   `finishDashboardReaderRoleRequest`，`api_manager.go:529-549` 的形状）。
 - 角色能力集变更后，`role_version` bump 使受影响用户的 `user_caps:{uid}` 在一个
