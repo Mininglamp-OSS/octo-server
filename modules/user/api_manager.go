@@ -466,6 +466,13 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 // 两者的授予/撤销流程逐字相同——CAS 改 user.role、失效角色热缓存、幂等、目标资格
 // 校验——因此共用下面这套按角色参数化的代码，而不是复制一份。
 //
+// 两个运维陷阱，源于 user.role 是单值列（运维手册里应写明）：
+//
+//   - 授予是**单向降级**：给一个 admin 授予固定角色会覆盖掉 admin，而撤销只会回到
+//     ""，不会还原成 admin。要恢复得重新走加管理员流程。
+//   - 持有固定角色的账号**删不掉**：deleteAdminUsers 只接受 admin / superAdmin，
+//     对固定角色返回 not_admin_account，必须先撤销角色再删。
+//
 // 过渡性质：通用 admin RBAC 落地后（见 .octospec/tasks/admin-rbac-extraction/），
 // 这两个角色将变成角色表里的两行数据，本节连同 pkg/auth/manager_roles.go 一并删除。
 
@@ -495,11 +502,32 @@ func (m *Manager) revokeMarketAdmin(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, false)
 }
 
+// isFixedManagerRole reports whether role is one this section is allowed to
+// write. The set is closed on purpose: setFixedManagerRole is the write side of
+// a privilege boundary, and fixedManagerRoleTransition will persist whatever
+// role string it is handed. Without this guard a future caller passing
+// wkhttp.SuperAdmin would have the CAS commit a promotion, and passing "" would
+// silently demote an admin to a plain user — neither reachable today (both
+// callers pass a constant), both cheap to make unreachable by construction.
+func isFixedManagerRole(role string) bool {
+	return role == auth.ManagerRoleDashboardReader ||
+		role == auth.ManagerRoleMarketAdmin
+}
+
 // setFixedManagerRole grants or revokes one fixed manager role on a target
 // account. ineligibleCode is the role-specific 4xx returned when the target is
 // not a grantable account (bot / banned / destroyed).
 func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligibleCode codes.Code, grant bool) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	if !isFixedManagerRole(role) {
+		// Programmer error, not a client one: no request shape can reach this.
+		// Fail closed and log loudly rather than writing an arbitrary role.
+		m.Error("refusing to write a role that is not a fixed manager role",
+			zap.String("role", role),
+			zap.String("actor_uid", c.GetLoginUID()))
 		respondManagerForbidden(c)
 		return
 	}

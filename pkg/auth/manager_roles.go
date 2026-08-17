@@ -22,6 +22,24 @@ const ManagerRoleDashboardReader = "dashboardReader"
 // the catalog groups (mcps, skills, skill_categories, skill uploads) admit this
 // role and the Expert Market groups keep the superAdmin-only gate — which is why
 // expert.* is excluded from the capabilities below.
+//
+// Before granting this to anyone, four things are worth knowing:
+//
+//   - It is a publishing authority, not a read-mostly editor. A holder can
+//     create, edit and delete the public Skills and system MCPs that every user
+//     on the platform installs, and restructure the catalog taxonomy. It is
+//     genuinely narrower than superAdmin, but pick people at a supply-chain bar,
+//     not at a "content editor" one.
+//   - Do not grant it before octo-marketplace has the paired change deployed.
+//     Until then octo-admin renders the MCP / Skill pages for the holder and
+//     every call behind them 403s.
+//   - Revocation is not instant across the boundary: octo-marketplace caches the
+//     resolved identity per token (AUTH_CACHE_TTL, 30s default) on top of this
+//     service's own role cache, so catalog access can survive a revoke by up to
+//     the sum of the two. Revoke the session too when it must be immediate.
+//   - See the fixed-role section in modules/user/api_manager.go for the two
+//     lifecycle traps both fixed roles share (one-way downgrade, and accounts
+//     that cannot be deleted until the role is revoked).
 const ManagerRoleMarketAdmin = "marketAdmin"
 
 // IsManagerConsoleRole reports whether a role may establish a manager-console
