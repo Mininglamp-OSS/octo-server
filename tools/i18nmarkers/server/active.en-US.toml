@@ -1140,6 +1140,9 @@ other = "This account does not have management permission."
 ["err.server.user.manager_role_changed"]
 other = "The target account role has changed; refresh and try again."
 
+["err.server.user.manager_role_target_ineligible"]
+other = "This account is not eligible for the requested management role."
+
 ["err.server.user.new_password_same_as_old"]
 other = "The new password must be different from the current one."
 

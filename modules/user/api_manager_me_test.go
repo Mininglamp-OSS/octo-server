@@ -58,6 +58,29 @@ func TestManagerCapabilities(t *testing.T) {
 	}
 }
 
+// TestManagerCapabilities_MarketAdmin pins the whole point of the marketAdmin
+// role: exactly the four platform-catalog keys and nothing else. In particular
+// expert.* stays false — curating the Expert Market remains SuperAdmin-only,
+// and octo-marketplace gates that route group separately.
+func TestManagerCapabilities_MarketAdmin(t *testing.T) {
+	market := managerCapabilities(appauth.ManagerRoleMarketAdmin)
+
+	granted := map[string]bool{
+		"mcp.read": true, "mcp.write": true,
+		"skill.read": true, "skill.write": true,
+	}
+	for k, v := range market {
+		if want := granted[k]; v != want {
+			t.Errorf("marketAdmin capability %q = %v, want %v", k, v, want)
+		}
+	}
+	for k := range granted {
+		if _, ok := market[k]; !ok {
+			t.Errorf("capability map is missing key %q", k)
+		}
+	}
+}
+
 func TestManagerMe_DashboardReaderGetsOnlyDashboardRead(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
