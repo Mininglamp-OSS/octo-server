@@ -78,14 +78,42 @@ route→capability 的映射变成一张表，`managerCapabilities` 由它派生
 
 ### 数据模型
 
+**三张表全部新增，仓内无可复用者。** 现存的 `space_member.role`（smallint 0/1/2）、
+`group_member.role` 是**业务**角色（Out of scope，明确不得复用）；`user.role` 是唯一
+的管理台角色存储，而它就是本任务要取代的那个单值列。
+
 ```sql
 admin_role            (role_key PK, name, is_builtin, created_at)   -- 角色定义
-admin_role_capability (role_key, capability)                        -- 角色 → 能力
-user_admin_role       (uid, role_key)                               -- 用户 → 角色（多对多）
+admin_role_capability (role_key, capability)                        -- 角色 → 能力（仅自定义角色）
+user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 → 角色（多对多）
 ```
 
 - capability 字符串**直接复用前端 `MANAGER_CAPABILITY_KEYS` 的同名同义键**
   （`mcp.read` / `skill.write` / …），前端零改动。
+
+#### 扩展性决定（这几条会长期锁住表结构，需显式确认）
+
+- **内建角色的能力集由代码定义，DB 只存其存在性。** `admin_role_capability`
+  只承载**自定义角色**的行。理由：内建角色若把能力集展开成数据行，每次版本升级
+  新增 capability 都要写一次 data migration，且用户改过内建角色时无法幂等收敛。
+  内建角色一律禁止编辑。
+- **`superAdmin` 是动态全集**：resolver 特判 `role_key='superAdmin'` 直接返回
+  `authz.All()`，不查 `admin_role_capability`。否则新增一个 capability 后**超管反而
+  没有它**，是个静默的权限黑洞。
+- **未注册的 capability 必须被忽略，不是报错**：DB 里可能存在代码里已不存在的
+  capability（版本回滚、capability 改名）。resolver 遇到未注册键跳过并打 debug 日志；
+  若改成报错，一次回滚就会让所有自定义角色全部失效。
+- **行式存储而非 JSON 数组列**：`(role_key, capability)` 一行一能力，才能反查
+  "谁有 `mcp.write`"、加索引、将来挂 per-grant 元数据。
+- **`granted_by` / `granted_at` 直接进表**，不依赖事后翻日志。
+- **不预留 `scope_type` / `scope_id`（不做作用域化角色）**：管理台角色目前是全局的，
+  而"某人只管某个 Space"属于业务权限边界（`space_member.role`），现在没有正确的
+  设计依据。表行数量级是几十到几百（管理员），将来真要加，`ALTER TABLE` + 重建
+  唯一索引的代价可以忽略。同理不预留多租户维度。
+- **不用外键**，角色删除时在应用层事务里级联清理 `admin_role_capability` +
+  `user_admin_role`（仓内 199 个迁移中仅 3 个使用外键，与既有风格一致）。
+- `role_key` VARCHAR(64)，约束 `^[a-z][a-z0-9_]{0,63}$`；内建 key 保留，自定义角色
+  不得占用。
 - **`user.role` 列保留不动**，改由 RBAC **反写的派生投影**维护：持有内建
   `superAdmin` 角色 → `'superAdmin'`；持有任何含 admin 档能力的角色 → `'admin'`；
   否则 `''`。这是能在**不改 octo-lib**（`CheckLoginRole*` 是 octo-lib 的
@@ -120,9 +148,26 @@ if !authz.Guard(c, authz.McpWrite) { return }  // 新
 - **失效面比 role 大**：改一个角色的能力集会影响所有持有该角色的用户，不能遍历
   用户删 key。做法是缓存值里带一个全局 `role_version`，角色定义变更时 bump，所有
   用户缓存自然失效。
-- **失败模式与 role 相反**：`RoleResolver` 出错是 fail-open（保留 token 快照），
-  对"降级延迟"可接受；capability 作为授权判定必须 **fail-closed**。两者不能共用
-  同一套错误处理。
+
+### 失败模式：fail-closed（已确认）
+
+`RoleResolver` 出错是 fail-open（保留 token 快照），保的是**认证**——DB 抖动不该把
+所有人踢下线。capability 判的是**授权**，风险方向相反，取 **fail-closed**。
+
+分层定义"失败"，可用性代价才≈0：
+
+- **Redis 不可用不算失败**：穿透到 MySQL，与 `RoleService` 同构（`role_service.go:93`）。
+  这是最常见的单点故障，必须保持完全可用。
+- **只有 Redis + MySQL 都取不到**才是 resolve error → 拒绝。而此时 handler 自身的
+  业务查询同样会失败，所以 fail-closed 的实际代价只存在于"角色查询失败但同一
+  handler 的业务查询成功"这个几乎不可达的窗口里；fail-open 的代价则是实打实的
+  **被撤销的管理员在可诱发 DB 错误时保住 superAdmin**。
+
+**Carve-out**：`/v1/manager/me` 在 resolve error 时必须**返回错误**，不得返回全
+false 的 capability 图——全 false 会被 `firstManagerPath` 判成 `/no-access`
+（`octo-admin/src/auth/capabilities.ts:73`），把一次故障呈现成"你的权限被收了"。
+前端已有正确的失败态（`MainLayout.tsx:360` `managerProfileFailed` → "加载失败"），
+`/me` 老实报错即可落进去。
 
 ### 交付阶段
 
@@ -132,8 +177,13 @@ if !authz.Guard(c, authz.McpWrite) { return }  // 新
 |---|---|---|
 | **0**（本 task 首个 PR） | 建表 + seed + 回填；`pkg/authz` 骨架；`managerCapabilities()` 改为 authz 派生，同时用旧逻辑算一遍做 **shadow 对比**，不一致打 warn | **零** |
 | **1**（逐模块，10+ PR） | 把 `CheckLoginRole*` / `require*Admin` 换成 `authz.Guard`；每个端点登记进 `policy.go`；每模块配源码守卫测试 | 无（等价替换） |
-| **2** | 角色管理 API（建角色 / 勾 capability / 授予撤销）+ octo-admin 管理 UI；`dashboardReader` 端点降级为兼容 shim | 新增面 |
-| **3**（跨仓） | `/v1/auth/verify` 加 `capabilities []string`；marketplace 按资源组挂 capability 门 | 跨仓 |
+| **2** | 角色管理 API（建角色 / 勾 capability / 授予撤销）；`dashboardReader` 端点降级为兼容 shim。**只做端点，不做 UI**（已确认） | 新增面 |
+| **3**（跨仓） | `/v1/auth/verify` 加 `capabilities []string`；marketplace 按资源组挂 capability 门 + 契约钉死 | 跨仓 |
+
+Phase 2 不做 UI 的后果已评估：**目标账号本身零前端改动即可用**——`mcp.read` /
+`skill.read` 的菜单项（`MainLayout.tsx:126-131`）、路由（`App.tsx:212-227`）、落地页
+（`capabilities.ts:70` → `/system-mcp`）都已接好。缺 UI 的只是**授予流程**，需调
+API 完成，与今天的 `dashboardReader` 现状一致。
 
 Phase 1 先啃已有本地 helper 的模块（space / common / opanalytics /
 card_template_catalog，改 helper 内部即可，call site 不动），再啃直接调
@@ -159,7 +209,14 @@ workplace / statistics / integration / app_bot）。
 - 角色缓存链路 `RoleService` + Redis `user_role:{uid}` TTL 60s，以及"改 role 必须
   Invalidate"这条不变量（`role_service.go:29-34`）。
 - marketplace `AdminAuthenticator` 与 octo-server 之间**靠约定而非 import 的耦合**
-  （`internal/middleware/admin.go:11-17` 自述：octo-server 改名即静默 403）。
+  （`internal/middleware/admin.go:11-17` 自述：octo-server 改名即静默 403）。Phase 3
+  会把待对齐的字符串从 1 个（`superAdmin`）扩大到 10+ 个 capability 键，每个对应
+  一组路由，写错即该组静默 403。因此**契约钉死是 Phase 3 的前置条件，不是可选项**：
+  octo-server 暴露 `authz.All()` 的只读契约，marketplace 启动时断言自己用到的每个
+  capability 都在其中，缺失则拒绝启动——把运行时静默 403 变成启动期/CI 期的响亮失败。
+- marketplace `AdminAuthenticator` 的 dev bypass（`admin.go:68-72`，`AUTH_ENABLED=false`）
+  今天完全跳过角色检查；换成 capability 门后 dev identity 必须被 stamp 上全量
+  capability，否则本地开发全线 403。
 - `error-response` / `i18n` — 新增端点与新错误码走 `httperr.ResponseErrorL` +
   `pkg/errcode`；403 沿用通用 `ErrSharedForbidden`，**不得**按"缺哪个 capability"
   分化错误码（反枚举）。
@@ -186,6 +243,9 @@ workplace / statistics / integration / app_bot）。
 - App Bots 菜单的可见性（`MainLayout.tsx:119` 走 `GET /v1/app_bot/available` 数据探测，
   `modules/app_bot/app_bot.go:147` 只校验登录不校验角色）——现状保留，另行决定。
 - 现有 ~90s 吊销窗口的**改造**（本任务只记录并断言其不变差）。
+- **角色管理 UI**（建角色 / 勾 capability / 授予撤销的前端界面）——Phase 2 只做端点，
+  UI 另起 task。目标账号的**使用**面不受影响（见"交付阶段"）。
+- **作用域化角色**（管理台角色绑定到某个 Space / 租户）与多租户维度——见"扩展性决定"。
 
 ### 单模块内的文件级边界（Phase 1 必须遵守）
 
@@ -210,6 +270,13 @@ workplace / statistics / integration / app_bot）。
 
 - capability 解析失败 → **拒绝**请求（fail-closed），有测试覆盖；与 `RoleResolver`
   的 fail-open 行为区分开，两者各有断言。
+- **Redis 单独不可用不得触发 fail-closed**：穿透 MySQL 后请求正常完成（测试覆盖）。
+- `/v1/manager/me` 在 resolve error 时返回**错误**而非全 false 的 capability 图
+  （测试断言响应不是 `{}`/全 false），使前端落进 `managerProfileFailed` 而非 `/no-access`。
+- `superAdmin` 的能力集是**动态全集**：新注册一个 capability 后，超管**无需任何
+  data migration** 即拥有它（测试：注册一个测试用 capability，断言超管为 true）。
+- DB 中存在**未注册**的 capability 时，resolver 跳过该键且其余能力正常解析
+  （回滚安全性测试），不得整体报错。
 - Phase 1 每替换一个端点，其**现有档位不变**：原 `CheckLoginRoleIsSuperAdmin` 的
   端点替换后仍只有 superAdmin 能过（逐端点回归测试）。
 - Phase 1 每个模块配一条"本模块无裸 `CheckLoginRole*`"的源码守卫测试
