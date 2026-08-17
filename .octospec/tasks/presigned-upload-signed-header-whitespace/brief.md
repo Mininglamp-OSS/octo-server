@@ -49,10 +49,17 @@ MinIO 后端从不暴露该缺陷：MinIO server 自带同一份 `signV4TrimAll`
 
 ## Load-bearing list
 
-- `BuildContentDisposition` 的输出形状——被 4 个模块 5 处调用（`file`、`robot` ×2、
-  `bot_api` ×2），同时用于预签名 PUT 与服务端 multipart `UploadFile`。
+- `BuildContentDisposition` 的输出形状——被 **3 个模块 6 处**调用：
+  `modules/file/api.go:626`（multipart `uploadFile`）与 `:945`（`getUploadCredentials`）、
+  `modules/robot/api.go:2085` 与 `:2233`、`modules/bot_api/file.go:90` 与 `:285`。
+  同时用于预签名 PUT 与服务端 multipart `UploadFile`。
 - `/v1/file/upload/credentials` 的 wire contract：`contentDisposition` 与
   `contentType` 均由客户端**逐字节回传**，任何一侧变动都会改变 PUT 成败。
+  `contentType` 的默认值改为在**折叠之后**兜底（原先在折叠之前），且带非法
+  header 字节时回退默认值而非替换为 `_`——mangle 出一个调用方没要过的 MIME
+  类型，比给个诚实的 `application/octet-stream` 更糟。副作用：纯空白
+  `contentType` 这条边路上，`Content-Type` 从「不进签名头集合」变成「进」，
+  客户端必须按契约回传（octo-web 已经如此）。
 - 三个 SigV4 后端（COS / MinIO / S3）的签名头集合。
 - 存储对象上的 `Content-Disposition` 元数据（影响裸 `downloadUrl` 的下载名）。
 - `modules/bot_api`、`modules/robot` 的调用点**不做 `sanitizeFilename`**，原始
@@ -77,6 +84,11 @@ MinIO 后端从不暴露该缺陷：MinIO server 自带同一份 `signV4TrimAll`
 
 - `TestIssue760_SignedHeaderInvariant`：`BuildContentDisposition` 的输出必须是
   `signV4TrimAll` 的**不动点**（比枚举文件名严格）。
+- `TestGetUploadCredentials_ContentTypeContract`：**驱动 handler 本身**，断言
+  `resp["contentType"]` 是 Trimall 不动点、是合法 header 值、且与交给 service 的
+  值相等。用 `.ini`（白名单内且无 MIME 映射）承载调用方原值，否则
+  `mime.TypeByExtension` 会覆盖掉它、测试沦为空转。经变异验证：摘掉
+  `normalizeUploadContentType` 该测试变红。
 - `TestIssue760_EchoedContentTypeMatchesSigned`：回显给客户端的 `contentType`
   必须与最终被签名的值**相等**，且对两套 Trimall 规则稳定。
 - `TestIssue760_Sweep*`：全部 128 个 ASCII 码位 × 4 个位置 × 长度 1–3 的连续串、

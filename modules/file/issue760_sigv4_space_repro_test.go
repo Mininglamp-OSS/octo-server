@@ -213,14 +213,12 @@ func repro760Presign(t *testing.T, host string, contentType, contentDisposition 
 	})
 	require.NoError(t, err)
 
-	headers := http.Header{}
-	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))
-	if contentType != "" {
-		headers.Set("Content-Type", contentType)
-	}
-	if contentDisposition != "" {
-		headers.Set("Content-Disposition", contentDisposition)
-	}
+	// Build the signed header set through the production helper rather than a
+	// hand-written copy, so this harness keeps matching ServiceCOS as the
+	// header set evolves. The independent-oracle property is not lost:
+	// naiveContentDisposition below is the pre-fix counter-example, and the
+	// sweeps assert BuildContentDisposition's output directly.
+	headers := presignPutHeaders(contentType, contentDisposition, fileSize)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -454,8 +452,10 @@ func TestIssue760_EchoedContentTypeMatchesSigned(t *testing.T) {
 	}
 	for _, raw := range contentTypes {
 		t.Run(raw, func(t *testing.T) {
-			// What getUploadCredentials puts in resp["contentType"].
-			echoed := collapseSignableWhitespace(raw)
+			// The production normalizer, not a copy of it. The handler-level
+			// guard that this is actually wired into getUploadCredentials is
+			// TestGetUploadCredentials_ContentTypeContract.
+			echoed := normalizeUploadContentType(raw)
 			// What ends up in the SigV4 canonical headers for that value.
 			signed := trimAllMinIO(presignPutHeaders(echoed, "", 4096).Get("Content-Type"))
 

@@ -894,20 +894,19 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 			contentType = inferred
 		}
 	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
 	// GH#760: this value is BOTH signed into the presigned PUT and echoed to
 	// the client, which is contractually required to send it back verbatim —
-	// so it has to survive SigV4 Trimall unchanged for the same reason
-	// Content-Disposition does. The caller's raw query value reaches here
-	// whenever mime.TypeByExtension cannot resolve the extension, which is
-	// the norm in production: the prod image is alpine with no
-	// /etc/mime.types, so Go falls back to its small builtin table and
-	// .docx / .xlsx / .pptx / .zip all return "". A parameter such as
-	// `; name="a  b"` would then be signed collapsed and sent uncollapsed →
-	// 403 SignatureDoesNotMatch. Normalizing here keeps signed == echoed.
-	contentType = collapseSignableWhitespace(contentType)
+	// so it has to survive SigV4 Trimall unchanged, and be a legal header
+	// value, for the same reasons Content-Disposition does. The caller's raw
+	// query value reaches here whenever mime.TypeByExtension cannot resolve
+	// the extension, which is the norm in production: the prod image is
+	// alpine with no /etc/mime.types, so Go falls back to its small builtin
+	// table and .docx / .xlsx / .pptx / .zip all return "". A parameter such
+	// as `; name="a  b"` would then be signed collapsed and sent uncollapsed
+	// → 403 SignatureDoesNotMatch. normalizeUploadContentType also owns the
+	// empty/whitespace-only default, which is why no `== ""` check precedes
+	// it — see that function for the ordering rationale.
+	contentType = normalizeUploadContentType(contentType)
 
 	// When both path and filename are provided, path determines the objectKey
 	// while filename is used for Content-Disposition (friendly download name).
@@ -1153,7 +1152,7 @@ func quotedFilenameFallback(safe string) string {
 	var b strings.Builder
 	b.Grow(len(collapsed))
 	for i := 0; i < len(collapsed); i++ {
-		if c := collapsed[i]; c < 0x20 || c == 0x7F {
+		if isInvalidHeaderByte(collapsed[i]) {
 			b.WriteByte('_')
 			continue
 		}

@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,7 @@ type mockService struct {
 	composeErr         error
 	lastObjectPath     string
 	lastGetObjectPath  string
+	lastContentType    string
 	lastContentDisp    string
 	lastFileSize       int64
 	presignedGetErr    error
@@ -240,6 +242,7 @@ func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
 
 func (m *mockService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
+	m.lastContentType = contentType
 	m.lastContentDisp = contentDisposition
 	m.lastFileSize = fileSize
 	return "https://example.com/upload?" + objectPath, "https://example.com/download/" + objectPath, nil
@@ -1616,4 +1619,75 @@ func TestUploadFile_StickerAcceptsWebp(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	_, has := resp["sticker_handle"]
 	require.True(t, has, "accepted webp sticker should mint a handle")
+}
+
+// TestGetUploadCredentials_ContentTypeContract drives the handler itself,
+// which is the only way to guard the GH#760 content-type half.
+//
+// Asserting `echoed == signed` through the mock cannot catch a regression:
+// the mock records whatever the handler passes it, so dropping the
+// normalization makes both sides equally dirty and the equality still holds.
+// The property that actually bites is on the emitted value — it must be a
+// SigV4 Trimall fixed point and a legal header value — so that is what is
+// asserted here, on the response body and the value handed to the service.
+//
+// The caller-supplied contentType only survives when mime.TypeByExtension
+// cannot resolve the extension, so these cases use `.ini`, which is
+// allow-listed and unmapped even in images that ship /etc/mime.types. The
+// require below fails loudly rather than silently passing if that ever
+// changes in some environment.
+func TestGetUploadCredentials_ContentTypeContract(t *testing.T) {
+	require.Empty(t, mime.TypeByExtension(".ini"),
+		"this test needs an allow-listed extension with no MIME mapping so the caller's contentType survives")
+
+	tests := []struct {
+		name        string
+		contentType string
+		want        string
+	}{
+		{"clean value passes through", "text/plain", "text/plain"},
+		{"whitespace run is collapsed", `text/plain;  charset=utf-8`, "text/plain; charset=utf-8"},
+		{"tab run is collapsed", "text/plain;\t\tcharset=utf-8", "text/plain; charset=utf-8"},
+		{"surrounding whitespace is trimmed", "  text/plain  ", "text/plain"},
+		// GH#760 review P2-2: "  " is not "" so a default applied before the
+		// collapse would never fire, and the collapsed "" would drop out of
+		// the signed header set entirely.
+		{"whitespace-only falls back to the default", "   ", "application/octet-stream"},
+		{"empty falls back to the default", "", "application/octet-stream"},
+		// GH#760 review P2-1: a control byte makes the header unsendable, so
+		// the value degrades to the default rather than being mangled.
+		{"control byte falls back to the default", "application/x\x01y", "application/octet-stream"},
+		{"DEL falls back to the default", "application/x\x7fy", "application/octet-stream"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSvc := &mockService{}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet,
+				"/v1/file/upload/credentials?type=chat&fileSize=1024&filename=notes.ini&contentType="+
+					url.QueryEscape(tt.contentType), nil)
+
+			f.getUploadCredentials(&wkhttp.Context{Context: c})
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+			var resp map[string]interface{}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			echoed, ok := resp["contentType"].(string)
+			require.True(t, ok, "response must carry contentType; body: %s", w.Body.String())
+
+			assert.Equal(t, tt.want, echoed)
+			assert.Equal(t, echoed, mockSvc.lastContentType,
+				"the client is told to echo %q but %q was handed to the signer", echoed, mockSvc.lastContentType)
+
+			// The two properties the 403 actually depends on.
+			assert.Equal(t, echoed, strings.Join(strings.Fields(echoed), " "),
+				"echoed contentType must be a SigV4 Trimall fixed point")
+			assert.False(t, containsInvalidHeaderByte(echoed),
+				"echoed contentType must be a legal header value, got %q", echoed)
+		})
+	}
 }

@@ -135,6 +135,51 @@ func collapseSignableWhitespace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// defaultUploadContentType is what an upload falls back to when the caller
+// gives us nothing usable.
+const defaultUploadContentType = "application/octet-stream"
+
+// isInvalidHeaderByte reports whether c may not appear in an HTTP header value.
+// Go's transport refuses to send a request carrying one ("invalid header field
+// value"), so a header we hand a client is unusable if it contains any —
+// regardless of what the signature says about it.
+func isInvalidHeaderByte(c byte) bool { return c < 0x20 || c == 0x7F }
+
+func containsInvalidHeaderByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if isInvalidHeaderByte(s[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeUploadContentType prepares a caller-supplied content type to be
+// both signed into a presigned PUT and echoed to the client, which must send
+// it back verbatim.
+//
+// Whitespace runs are collapsed for the GH#760 reason (see
+// collapseSignableWhitespace). Two further shapes degrade to the default
+// rather than being passed through:
+//
+//   - empty, or whitespace-only: collapsing "  " yields "", and an empty
+//     content type would silently drop out of the signed header set and be
+//     echoed as "", leaving the stored object with no declared type. Note the
+//     ordering this implies — the default has to be applied AFTER the
+//     collapse, not before, or a whitespace-only value slips past it.
+//   - carrying a byte that cannot appear in a header value: mangling those to
+//     '_' would invent a MIME type the caller never asked for, so an honest
+//     default beats a corrupted value here. (The filename fallback does
+//     substitute, because there the goal is to preserve as much of the name
+//     as possible.)
+func normalizeUploadContentType(raw string) string {
+	ct := collapseSignableWhitespace(raw)
+	if ct == "" || containsInvalidHeaderByte(ct) {
+		return defaultUploadContentType
+	}
+	return ct
+}
+
 // presignPutHeaders builds the header set signed into a presigned PUT URL.
 // Content-Length is signed so the gateway bounds the upload size;
 // Content-Type and Content-Disposition are signed so the stored object
