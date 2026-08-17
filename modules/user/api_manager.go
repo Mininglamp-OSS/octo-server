@@ -150,8 +150,9 @@ type managerMeResp struct {
 	Capabilities map[string]bool `json:"capabilities"`
 }
 
-// me 返回当前登录管理台账号的身份与能力图谱。dashboardReader 只在这里和 Dashboard
-// 读面被承认；普通管理接口仍走 octo-lib CheckLoginRole，只接受 admin∪superAdmin。
+// me 返回当前登录管理台账号的身份与能力图谱。两个固定角色都只在这里被承认——
+// dashboardReader 另加 Dashboard 读面，marketAdmin 另加 octo-marketplace 的目录面；
+// 普通管理接口仍走 octo-lib CheckLoginRole，只接受 admin∪superAdmin。
 func (m *Manager) me(c *wkhttp.Context) {
 	if !auth.IsManagerConsoleRole(c.GetLoginRole()) {
 		respondManagerForbidden(c)
@@ -209,8 +210,12 @@ func managerCapabilities(role string) map[string]bool {
 		"expert.write":       isSuper, // 专家市场 创建(上传)/编辑/删除 + 分类管理（同上）
 		// superAdmin ∪ marketAdmin —— 平台 MCP / Skill 目录的运营面。marketAdmin 是
 		// 与 dashboardReader 同形状的固定角色：octo-lib 不认识它，所以它过不了任何
-		// admin/superAdmin 端点，只有这四个键为真。真正的放行在 octo-marketplace 的
-		// /api/v1/admin/{mcps,skills,skill_categories} 上，见 auth.CanAdminMarketplace。
+		// admin/superAdmin 端点，只有这四个键为真。
+		//
+		// 注意这四个键只驱动前端渲染；真正的放行在 octo-marketplace，且要等
+		// Mininglamp-OSS/octo-marketplace#55 上线之后——在那之前 marketplace 的
+		// /api/v1/admin/* 是一道只认 superAdmin 的门，marketAdmin 会拿到 403。
+		// 见 auth.CanAdminMarketplace。
 		"skill.read":  auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
 		"skill.write": auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
 		"mcp.read":    auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
@@ -365,8 +370,8 @@ func (m *Manager) login(c *wkhttp.Context) {
 			_ = m.userDB.updatePassword(newHash, userInfo.UID)
 		}
 	}
-	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪dashboardReader，
-	// 见 575185b0），被拒同样计入登录失败日志。
+	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
+	// dashboardReader/marketAdmin，见 575185b0），被拒同样计入登录失败日志。
 	if !auth.IsManagerConsoleRole(userInfo.Role) {
 		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)

@@ -12,12 +12,16 @@ const ManagerRoleDashboardReader = "dashboardReader"
 //
 // Same shape and same rationale as ManagerRoleDashboardReader: it is deliberately
 // NOT known to octo-lib's CheckLoginRole, so an account holding it passes zero
-// admin/superAdmin endpoint gates in octo-server. Its only effect is the
-// mcp.*/skill.* capabilities below, which octo-marketplace honours on its
-// /api/v1/admin/{mcps,skills,skill_categories} groups.
+// admin/superAdmin endpoint gates in octo-server. Its only effect here is the
+// mcp.*/skill.* capabilities in managerCapabilities.
 //
-// Note expert.* is intentionally excluded — curating the Expert Market stays
-// SuperAdmin-only, and octo-marketplace gates that group separately.
+// Enforcement lives in octo-marketplace, and only once
+// Mininglamp-OSS/octo-marketplace#55 has shipped: before that PR a single gate
+// guards every /api/v1/admin/* group and admits superAdmin alone, so a holder of
+// this role gets 403 on the catalog surface rather than access to it. After it,
+// the catalog groups (mcps, skills, skill_categories, skill uploads) admit this
+// role and the Expert Market groups keep the superAdmin-only gate — which is why
+// expert.* is excluded from the capabilities below.
 const ManagerRoleMarketAdmin = "marketAdmin"
 
 // IsManagerConsoleRole reports whether a role may establish a manager-console

@@ -98,3 +98,9 @@ octo-server-prev*
 /card-action-dlq
 /genseq-repro
 /i18nmarkers
+
+# Redis snapshots. `redis-server` writes dump.rdb into its working directory, so
+# running one from the repo root while executing the test suite drops a snapshot
+# of the test fixtures here — session tokens included. Never a source artifact.
+*.rdb
+dump.rdb
