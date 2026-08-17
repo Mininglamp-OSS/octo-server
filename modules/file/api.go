@@ -897,6 +897,17 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	// GH#760: this value is BOTH signed into the presigned PUT and echoed to
+	// the client, which is contractually required to send it back verbatim —
+	// so it has to survive SigV4 Trimall unchanged for the same reason
+	// Content-Disposition does. The caller's raw query value reaches here
+	// whenever mime.TypeByExtension cannot resolve the extension, which is
+	// the norm in production: the prod image is alpine with no
+	// /etc/mime.types, so Go falls back to its small builtin table and
+	// .docx / .xlsx / .pptx / .zip all return "". A parameter such as
+	// `; name="a  b"` would then be signed collapsed and sent uncollapsed →
+	// 403 SignatureDoesNotMatch. Normalizing here keeps signed == echoed.
+	contentType = collapseSignableWhitespace(contentType)
 
 	// When both path and filename are provided, path determines the objectKey
 	// while filename is used for Content-Disposition (friendly download name).
@@ -1124,10 +1135,31 @@ func BuildContentDisposition(filename string) string {
 // %20 and is what every modern browser prefers; only the legacy fallback is
 // normalized.
 //
+// Remaining C0 controls and DEL are replaced with '_'. Collapsing only
+// removes the whitespace ones (`\t\n\v\f\r`); bytes like 0x01 or 0x7F would
+// otherwise reach the emitted header and make it an invalid HTTP header
+// value, which Go's transport rejects outright with "invalid header field
+// value" — so the credentials response would hand the client a
+// Content-Disposition it cannot send. Most callers never hit this because
+// they pre-sanitize, but modules/bot_api and modules/robot pass the raw
+// multipart filename / query parameter straight in, so the guarantee has to
+// live here. `filename*` is unaffected: percent-encoding already renders
+// those bytes as %XX.
+//
 // A name that collapses to nothing (all-whitespace) degrades to "file" rather
 // than emitting an empty `filename=""`.
 func quotedFilenameFallback(safe string) string {
 	collapsed := collapseSignableWhitespace(safe)
+	var b strings.Builder
+	b.Grow(len(collapsed))
+	for i := 0; i < len(collapsed); i++ {
+		if c := collapsed[i]; c < 0x20 || c == 0x7F {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteByte(collapsed[i])
+	}
+	collapsed = b.String()
 	if collapsed == "" {
 		return "file"
 	}

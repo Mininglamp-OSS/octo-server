@@ -11,8 +11,21 @@
 //	                                  applying the AWS/COS quoted-string
 //	                                  Trimall rule, one applying minio-go's.
 //
-// Not part of either repo — throwaway rig so the octo-web upload path can be
-// exercised end to end without cloud credentials.
+// Consumed by octo-web packages/dmworkdatasource/src/issue760.upload.e2e.test.ts,
+// which skips unless OCTO_REPRO_GATEWAY_API points here.
+//
+// Fidelity limits — this is an external package, so the unexported parts of
+// the handler cannot be reused. It mirrors production for the signing
+// boundary only:
+//
+//	mirrored  — BuildContentDisposition (the real exported function), the
+//	            signed header set, minio-go PresignHeader, the response shape,
+//	            and the same whitespace normalization getUploadCredentials
+//	            applies to contentType.
+//	NOT mirrored — sanitizeFilename, the extension allowlist, fileSize bounds,
+//	            auth, and the sticker keyspace guard (all unexported or
+//	            request-scoped). Feed it names that are already sanitize-clean,
+//	            and do not read a result here as a statement about validation.
 package main
 
 import (
@@ -211,6 +224,9 @@ func serveCredentials(w http.ResponseWriter, r *http.Request, gateways map[strin
 
 	// The production line under test.
 	contentDisposition := file.BuildContentDisposition(filename)
+	// Mirrors the normalization getUploadCredentials applies before it both
+	// signs contentType and echoes it to the client (GH#760).
+	contentType = strings.Join(strings.Fields(contentType), " ")
 
 	client, err := minio.New(gw.addr, &minio.Options{
 		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),

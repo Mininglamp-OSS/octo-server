@@ -136,16 +136,25 @@ func collapseSignableWhitespace(s string) string {
 }
 
 // presignPutHeaders builds the header set signed into a presigned PUT URL.
+// Content-Length is signed so the gateway bounds the upload size;
+// Content-Type and Content-Disposition are signed so the stored object
+// carries the right metadata.
 //
-// Every value goes through collapseSignableWhitespace so the signed canonical
-// form matches whatever the storage gateway derives (see that function for
-// the failure this prevents). Content-Length is signed so the gateway bounds
-// the upload size; Content-Type and Content-Disposition are signed so the
-// stored object carries the right metadata.
+// The collapseSignableWhitespace calls here are defence in depth, NOT the
+// GH#760 fix: minio-go runs signV4TrimAll over every value it signs, so
+// passing "a  b" or "a b" produces the identical signature. What actually
+// has to be collapsed is the value handed to the client, because the client
+// echoes it verbatim and the gateway canonicalizes what arrives — that is
+// done at each value's source (BuildContentDisposition for the disposition,
+// getUploadCredentials for the content type). Normalizing again here keeps
+// this map identical to those values, so a backend that ever signs verbatim
+// cannot silently reintroduce the mismatch.
 //
 // Shared by the three SigV4 backends (COS / MinIO / S3) so the invariant
-// cannot drift between copies. Aliyun OSS V1 signs neither Content-Type nor
-// Content-Disposition and builds its options separately.
+// cannot drift between copies. Aliyun OSS builds its options separately and
+// does not come through here; note its V1 string-to-sign DOES cover
+// Content-Type (verbatim, with no Trimall step) and does NOT cover
+// Content-Disposition — see the operator matrix on getUploadCredentials.
 func presignPutHeaders(contentType, contentDisposition string, fileSize int64) http.Header {
 	headers := http.Header{}
 	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))

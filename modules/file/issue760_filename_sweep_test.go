@@ -62,12 +62,19 @@ func assertHeaderIsSignable(t *testing.T, label, filename string) {
 				label, filename, cd, got)
 		}
 
-		// 3. No bare CR/LF: those would be header injection, not merely a
-		// signature mismatch. (Property 1 already implies it — Fields splits
-		// on them — but assert it explicitly so the intent survives a
-		// refactor of the collapse helper.)
-		if strings.ContainsAny(cd, "\r\n") {
-			t.Fatalf("%s: header carries a bare CR/LF\n filename=%q\n emitted=%q", label, filename, cd)
+		// 3. The value must be a legal HTTP header value, i.e. no C0 controls
+		// and no DEL. This is stricter than "no CR/LF" and it is not implied
+		// by property 1: collapsing only folds the whitespace controls, so a
+		// 0x01 would survive and Go's transport would refuse to send the
+		// request at all ("invalid header field value") — the credentials
+		// response would be handing the client a header it cannot use. Only
+		// callers that skip sanitizeFilename can get here (bot_api, robot),
+		// which is exactly why this is checked on the raw shape too.
+		for i := 0; i < len(cd); i++ {
+			if c := cd[i]; c < 0x20 || c == 0x7F {
+				t.Fatalf("%s: header carries byte 0x%02X, not a valid header value\n filename=%q\n emitted=%q",
+					label, c, filename, cd)
+			}
 		}
 
 		// 4. Quotes stay balanced, so "inside a quoted string" means the same
@@ -102,6 +109,18 @@ func TestIssue760_SweepIsNotVacuous(t *testing.T) {
 	post := BuildContentDisposition(sanitizeFilename("Octo  upload test.pdf"))
 	assert.Equal(t, post, trimAllMinIO(post))
 	assert.Contains(t, post, "%20%20", "filename* must still carry the user's original spacing")
+
+	// Same for the header-validity property: the unsanitized shape used by
+	// bot_api / robot really can carry a C0 control, so property 3 is not
+	// decoration either.
+	preCtl := naiveContentDisposition("a\x01b.pdf")
+	assert.Contains(t, preCtl, "\x01",
+		"pre-fix header must carry the raw control byte, else property 3 proves nothing")
+
+	postCtl := BuildContentDisposition("a\x01b.pdf")
+	assert.NotContains(t, postCtl, "\x01")
+	assert.Equal(t, `inline; filename="a_b.pdf"; filename*=UTF-8''a%01b.pdf`, postCtl,
+		"control byte is scrubbed from the quoted fallback but preserved, percent-encoded, in filename*")
 }
 
 // TestIssue760_SweepASCII places every ASCII code point — control characters,

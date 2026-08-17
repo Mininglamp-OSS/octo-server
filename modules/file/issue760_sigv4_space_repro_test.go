@@ -430,25 +430,39 @@ func TestIssue760_SignedHeaderInvariant(t *testing.T) {
 	}
 }
 
-// TestIssue760_SignedContentTypeInvariant covers the second signed header that
-// can carry a client-controlled whitespace run. getUploadCredentials only
-// overrides the caller's contentType when mime.TypeByExtension resolves the
-// extension; when it does not, the query value is signed as-is, so a
-// `application/pdf;  charset=x` would reproduce the same 403 through
-// Content-Type instead of Content-Disposition.
-func TestIssue760_SignedContentTypeInvariant(t *testing.T) {
+// TestIssue760_EchoedContentTypeMatchesSigned covers the second header that
+// can carry a client-controlled whitespace run.
+//
+// The property that matters is NOT "the signed value is collapsed" — minio-go
+// runs signV4TrimAll over whatever it is given, so the signature is identical
+// either way and asserting on presignPutHeaders' output proves nothing. What
+// breaks uploads is the client echoing a value the gateway canonicalizes
+// differently, so the assertion is: the value handed to the client must equal
+// the value that ends up signed, and both must be Trimall-stable.
+//
+// getUploadCredentials only overrides the caller's contentType when
+// mime.TypeByExtension resolves the extension; the prod image is alpine with
+// no /etc/mime.types, so .docx / .xlsx / .zip fall through to the raw query
+// value and this is reachable in production.
+func TestIssue760_EchoedContentTypeMatchesSigned(t *testing.T) {
 	contentTypes := []string{
 		"application/octet-stream",
+		`application/vnd.openxmlformats-officedocument.wordprocessingml.document; name="a  b.docx"`,
 		"application/pdf;  charset=utf-8",
 		"text/plain;\t\tcharset=utf-8",
 		"  application/json  ",
 	}
-	for _, ct := range contentTypes {
-		t.Run(ct, func(t *testing.T) {
-			headers := presignPutHeaders(ct, "", 4096)
-			got := headers.Get("Content-Type")
-			assert.Equal(t, got, trimAllMinIO(got),
-				"signed Content-Type must be stable under SigV4 Trimall; got %q", got)
+	for _, raw := range contentTypes {
+		t.Run(raw, func(t *testing.T) {
+			// What getUploadCredentials puts in resp["contentType"].
+			echoed := collapseSignableWhitespace(raw)
+			// What ends up in the SigV4 canonical headers for that value.
+			signed := trimAllMinIO(presignPutHeaders(echoed, "", 4096).Get("Content-Type"))
+
+			assert.Equal(t, echoed, signed,
+				"client echoes %q but the signature covers %q", echoed, signed)
+			assert.Equal(t, echoed, trimAllQuotedAware(echoed),
+				"echoed Content-Type must also be stable under the COS/AWS rule")
 		})
 	}
 }
