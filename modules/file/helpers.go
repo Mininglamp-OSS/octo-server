@@ -1,6 +1,10 @@
 package file
 
-import "strings"
+import (
+	"net/http"
+	"strconv"
+	"strings"
+)
 
 // allowedMinioBuckets is the whitelist of bucket prefixes the MinIO backend
 // will auto-create and accept on upload. Keeping it in one place lets every
@@ -102,4 +106,54 @@ func violatesStickerKeyspace(fileType Type, objectPath string) bool {
 		return false
 	}
 	return strings.HasPrefix(strings.TrimPrefix(objectPath, "/"), "sticker/")
+}
+
+// collapseSignableWhitespace rewrites a string so that it survives SigV4
+// canonicalization unchanged: leading/trailing whitespace is trimmed and every
+// run of whitespace becomes a single space.
+//
+// Why this has to exist (GH#760): SigV4 hashes a *canonical* form of each
+// signed header value, and the two sides of the handshake canonicalize
+// differently.
+//
+//   - minio-go (pkg/signer/utils.go signV4TrimAll) does
+//     `strings.Join(strings.Fields(v), " ")`, collapsing whitespace runs
+//     ANYWHERE in the value — including inside a quoted string.
+//   - AWS SigV4 (and Tencent COS, which enforces it) says "Do not trim excess
+//     white space in a header value if it appears within a quoted string", so
+//     the gateway keeps the run.
+//
+// A `Content-Disposition: inline; filename="a  b.pdf"` therefore gets signed
+// as `filename="a b.pdf"` but verified as `filename="a  b.pdf"` — different
+// canonical requests, different signatures, and the browser PUT dies with
+// 403 SignatureDoesNotMatch. Emitting a value that is already collapsed makes
+// both derivations agree, whichever rule the gateway applies.
+//
+// The behaviour is deliberately identical to minio-go's signV4TrimAll: this
+// is the fixed point of that function, not a different normalization.
+func collapseSignableWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// presignPutHeaders builds the header set signed into a presigned PUT URL.
+//
+// Every value goes through collapseSignableWhitespace so the signed canonical
+// form matches whatever the storage gateway derives (see that function for
+// the failure this prevents). Content-Length is signed so the gateway bounds
+// the upload size; Content-Type and Content-Disposition are signed so the
+// stored object carries the right metadata.
+//
+// Shared by the three SigV4 backends (COS / MinIO / S3) so the invariant
+// cannot drift between copies. Aliyun OSS V1 signs neither Content-Type nor
+// Content-Disposition and builds its options separately.
+func presignPutHeaders(contentType, contentDisposition string, fileSize int64) http.Header {
+	headers := http.Header{}
+	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))
+	if v := collapseSignableWhitespace(contentType); v != "" {
+		headers.Set("Content-Type", v)
+	}
+	if v := collapseSignableWhitespace(contentDisposition); v != "" {
+		headers.Set("Content-Disposition", v)
+	}
+	return headers
 }

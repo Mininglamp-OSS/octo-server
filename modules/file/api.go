@@ -1096,7 +1096,7 @@ func BuildContentDisposition(filename string) string {
 		// ASCII 文件名：转义反斜杠和双引号以确保安全
 		safe := strings.ReplaceAll(filename, `\`, `\\`)
 		safe = strings.ReplaceAll(safe, `"`, `\"`)
-		return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+		return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", quotedFilenameFallback(safe), encoded)
 	}
 	// 非 ASCII 文件名：filename 使用下划线替换非 ASCII 字符作为回退
 	var asciiFallback strings.Builder
@@ -1109,7 +1109,29 @@ func BuildContentDisposition(filename string) string {
 	}
 	safe := strings.ReplaceAll(asciiFallback.String(), `\`, `\\`)
 	safe = strings.ReplaceAll(safe, `"`, `\"`)
-	return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+	return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", quotedFilenameFallback(safe), encoded)
+}
+
+// quotedFilenameFallback prepares the ASCII fallback that goes inside
+// `filename="…"`.
+//
+// Runs of whitespace are collapsed to a single space (GH#760): this header is
+// signed into presigned PUT URLs, and a whitespace run inside the quoted
+// string makes minio-go and the storage gateway derive different canonical
+// requests — see collapseSignableWhitespace for the full mechanism. The
+// user's exact filename, spaces and all, is still carried losslessly by the
+// adjacent RFC 5987 `filename*` parameter, which percent-encodes spaces as
+// %20 and is what every modern browser prefers; only the legacy fallback is
+// normalized.
+//
+// A name that collapses to nothing (all-whitespace) degrades to "file" rather
+// than emitting an empty `filename=""`.
+func quotedFilenameFallback(safe string) string {
+	collapsed := collapseSignableWhitespace(safe)
+	if collapsed == "" {
+		return "file"
+	}
+	return collapsed
 }
 
 // isASCII 检查字符串是否全部为 ASCII 字符

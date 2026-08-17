@@ -406,22 +406,20 @@ func TestIssue760_CharacterMatrix(t *testing.T) {
 // must already be Trimall-stable, i.e. collapsing its whitespace runs must be
 // a no-op.
 //
-// This is the acceptance assertion for the GH#760 fix and it FAILS on the
-// current code — BuildContentDisposition emits `filename="Octo  upload
-// test.pdf"` verbatim. It is skipped so the reproduction can land without
-// turning CI red; drop the Skip in the commit that fixes
-// BuildContentDisposition, and it becomes the permanent regression guard
-// (stricter than enumerating filenames: anything that puts a whitespace run
-// into a signed header trips it).
+// This is the acceptance assertion for the GH#760 fix, and now its permanent
+// regression guard: it is stricter than enumerating filenames, because
+// anything that puts a whitespace run into a signed header trips it.
 func TestIssue760_SignedHeaderInvariant(t *testing.T) {
-	t.Skip("expected to fail until GH#760 is fixed; unskip together with the BuildContentDisposition fix")
-
 	filenames := []string{
 		"Octo upload test.pdf",
 		"Octo  upload test.pdf",
 		"Octo   upload  test.pdf",
+		"  leading.pdf",
+		"trailing  .pdf",
 		"report.pdf",
 		"报告 文档.pdf",
+		"报告  文档.pdf",
+		"photo\U0001F600  x.jpg",
 	}
 	for _, raw := range filenames {
 		t.Run(raw, func(t *testing.T) {
@@ -432,22 +430,83 @@ func TestIssue760_SignedHeaderInvariant(t *testing.T) {
 	}
 }
 
+// TestIssue760_SignedContentTypeInvariant covers the second signed header that
+// can carry a client-controlled whitespace run. getUploadCredentials only
+// overrides the caller's contentType when mime.TypeByExtension resolves the
+// extension; when it does not, the query value is signed as-is, so a
+// `application/pdf;  charset=x` would reproduce the same 403 through
+// Content-Type instead of Content-Disposition.
+func TestIssue760_SignedContentTypeInvariant(t *testing.T) {
+	contentTypes := []string{
+		"application/octet-stream",
+		"application/pdf;  charset=utf-8",
+		"text/plain;\t\tcharset=utf-8",
+		"  application/json  ",
+	}
+	for _, ct := range contentTypes {
+		t.Run(ct, func(t *testing.T) {
+			headers := presignPutHeaders(ct, "", 4096)
+			got := headers.Get("Content-Type")
+			assert.Equal(t, got, trimAllMinIO(got),
+				"signed Content-Type must be stable under SigV4 Trimall; got %q", got)
+		})
+	}
+}
+
 // triggers760 reports whether a filename, once put through the production
 // handler path, yields a Content-Disposition that SigV4 Trimall would rewrite
-// — the exact predicate for the 403. No gateway needed.
+// — the exact predicate for the 403. No gateway needed. Post-fix this is
+// false for every input; that is what the tables below assert.
 func triggers760(rawFilename string) (bool, string) {
 	cd := BuildContentDisposition(sanitizeFilename(rawFilename))
 	return trimAllMinIO(cd) != cd, cd
 }
 
+// naiveContentDisposition reconstructs the pre-fix header exactly as
+// BuildContentDisposition emitted it before GH#760 was closed: the quoted
+// ASCII fallback keeps whatever whitespace the filename carried.
+//
+// Keeping it in the test file lets the tables below assert BOTH halves of the
+// fix — that the shipped code is now Trimall-stable, and that each "trigger"
+// row really was a defect rather than a case that never reproduced. Without
+// it, a regression that quietly stopped exercising these names would still
+// look green.
+func naiveContentDisposition(filename string) string {
+	if filename == "" {
+		return ""
+	}
+	encoded := rfc5987Encode(filename)
+	var fallback strings.Builder
+	for _, r := range filename {
+		if r > 127 {
+			fallback.WriteRune('_')
+		} else {
+			fallback.WriteRune(r)
+		}
+	}
+	safe := strings.ReplaceAll(fallback.String(), `\`, `\\`)
+	safe = strings.ReplaceAll(safe, `"`, `\"`)
+	return "inline; filename=\"" + safe + "\"; filename*=UTF-8''" + encoded
+}
+
+func triggersPreFix(rawFilename string) bool {
+	cd := naiveContentDisposition(sanitizeFilename(rawFilename))
+	return trimAllMinIO(cd) != cd
+}
+
 // TestIssue760_TriggerRule pins the trigger down to one rule: the quoted
 // ASCII fallback must carry a run of two or more literal spaces. Everything
-// else about the name — length, script, punctuation, extension — is irrelevant.
+// else about the name — length, script, punctuation, extension — is
+// irrelevant.
+//
+// `wasTrigger` is the pre-fix outcome. Every row must now be stable under
+// Trimall (no 403 possible), and every `wasTrigger` row must still be a case
+// the pre-fix construction would have broken on.
 func TestIssue760_TriggerRule(t *testing.T) {
 	cases := []struct {
-		name string
-		want bool
-		why  string
+		name       string
+		wasTrigger bool
+		why        string
 	}{
 		// --- triggers ---
 		{"Octo  upload test.pdf", true, "two U+0020"},
@@ -474,8 +533,10 @@ func TestIssue760_TriggerRule(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, cd := triggers760(tc.name)
-			t.Logf("trigger=%-5v cd=%q  (%s)", got, cd, tc.why)
-			assert.Equal(t, tc.want, got)
+			t.Logf("trigger=%-5v (pre-fix %-5v) cd=%q  (%s)", got, tc.wasTrigger, cd, tc.why)
+			assert.False(t, got, "shipped header must be Trimall-stable")
+			assert.Equal(t, tc.wasTrigger, triggersPreFix(tc.name),
+				"pre-fix classification of this row changed — the table no longer describes the defect")
 		})
 	}
 }
@@ -491,9 +552,9 @@ func TestIssue760_TriggerRule(t *testing.T) {
 // the trigger.
 func TestIssue760_ReportedFilenames(t *testing.T) {
 	reported := []struct {
-		source   string
-		filename string
-		want     bool
+		source     string
+		filename   string
+		wasTrigger bool
 	}{
 		{"#760 fixture 02-FAIL", "02-FAIL-Octo  upload test.pdf", true},
 		{"#760 fixture 01-PASS", "01-PASS-Octo upload test.pdf", false},
@@ -507,8 +568,10 @@ func TestIssue760_ReportedFilenames(t *testing.T) {
 	for _, r := range reported {
 		t.Run(r.source, func(t *testing.T) {
 			got, cd := triggers760(r.filename)
-			t.Logf("trigger=%-5v %q\n           cd=%q", got, r.filename, cd)
-			assert.Equal(t, r.want, got)
+			t.Logf("trigger=%-5v (pre-fix %-5v) %q\n           cd=%q",
+				got, r.wasTrigger, r.filename, cd)
+			assert.False(t, got, "shipped header must be Trimall-stable")
+			assert.Equal(t, r.wasTrigger, triggersPreFix(r.filename))
 		})
 	}
 }

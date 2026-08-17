@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -400,14 +399,7 @@ func (sm *ServiceMinio) PresignedPutURL(objectPath string, contentType string, c
 	// PUT of any size against the URL. Content-Type / Content-Disposition
 	// piggy-back on the same path so the per-header behaviour stays
 	// consistent with the rest of the file module.
-	headers := http.Header{}
-	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))
-	if contentType != "" {
-		headers.Set("Content-Type", contentType)
-	}
-	if contentDisposition != "" {
-		headers.Set("Content-Disposition", contentDisposition)
-	}
+	headers := presignPutHeaders(contentType, contentDisposition, fileSize)
 	presigned, err := publicClient.PresignHeader(ctx, http.MethodPut, bucketName, objectKey, expires, nil, headers)
 	if err != nil {
 		return "", "", fmt.Errorf("生成预签名URL失败: %w", err)

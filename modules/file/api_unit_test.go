@@ -277,6 +277,17 @@ func TestBuildContentDisposition(t *testing.T) {
 			`inline; filename="report\\2024.pdf"; filename*=UTF-8''report%5C2024.pdf`},
 		{"ascii with semicolon", "report;final.pdf",
 			`inline; filename="report;final.pdf"; filename*=UTF-8''report%3Bfinal.pdf`},
+		// GH#760: consecutive spaces are collapsed in the quoted ASCII
+		// fallback (it is a signed header value and must survive SigV4
+		// Trimall unchanged), while filename* keeps the user's name exactly.
+		{"ascii with consecutive spaces", "my  file.pdf",
+			`inline; filename="my file.pdf"; filename*=UTF-8''my%20%20file.pdf`},
+		{"unicode with consecutive spaces", "报告  文档.pdf",
+			`inline; filename="__ __.pdf"; filename*=UTF-8''` + url.PathEscape("报告  文档.pdf")},
+		{"leading and trailing spaces", "  spaced.pdf  ",
+			`inline; filename="spaced.pdf"; filename*=UTF-8''` + url.PathEscape("  spaced.pdf  ")},
+		{"all whitespace degrades to file", "   ",
+			`inline; filename="file"; filename*=UTF-8''%20%20%20`},
 	}
 
 	for _, tt := range tests {
