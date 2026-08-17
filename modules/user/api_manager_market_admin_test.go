@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -303,6 +304,63 @@ func TestManagerMarketAdminCannotReachAdminEndpoints(t *testing.T) {
 
 			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden")
+		})
+	}
+}
+
+// TestSetFixedManagerRoleRejectsRoleOutsideClosedSet drives the write path with a
+// role outside the closed set. TestIsFixedManagerRole below pins the predicate's
+// return value; this pins that setFixedManagerRole actually *acts* on it.
+//
+// That distinction is not academic. The guard shipped disabled once (`if false &&
+// !isFixedManagerRole(role)`, restored here): build, vet, golangci-lint and the
+// entire modules/user suite stayed green, because the only test touching the guard
+// asserted the predicate in isolation and never the handler that consumes it.
+//
+// Both production callers pass constants, so no real route can reach this. The
+// synthetic route is the point — it stands in for the next caller that forwards a
+// role it did not hard-code, which is the case the guard exists to fail closed on.
+func TestSetFixedManagerRoleRejectsRoleOutsideClosedSet(t *testing.T) {
+	route, ctx, m := newManagerRouteOnly(t)
+
+	const (
+		callerToken = "closed-set-guard-caller"
+		targetUID   = "closed-set-guard-target"
+	)
+	require.NoError(t, ctx.Cache().Set(ctx.GetConfig().Cache.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID:      targetUID,
+		Username: targetUID,
+		Name:     "Closed Set Guard Target",
+		ShortNo:  targetUID,
+		Status:   StatusEnable.Int(),
+	}))
+
+	synthetic := route.Group("/v1/manager/test", m.ctx.AuthMiddleware(route))
+	synthetic.PUT("/:uid/fixed-role", func(c *wkhttp.Context) {
+		m.setFixedManagerRole(c, c.Query("role"), errcode.ErrUserManagerRoleTargetIneligible, true)
+	})
+
+	// superAdmin is a promotion and "" a silent demotion — the two the guard's own
+	// doc comment names. The other two cover a neighbouring tier and a role string
+	// that does not exist yet.
+	for _, role := range []string{string(wkhttp.SuperAdmin), string(wkhttp.Admin), "", "future-role"} {
+		t.Run("role="+role, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPut,
+				"/v1/manager/test/"+targetUID+"/fixed-role?role="+role, nil)
+			req.Header.Set("token", callerToken)
+			route.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code,
+				"forbidden is pinned to wire 400 (D14); body=%s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden",
+				"must be refused for the role reason, not some other failure")
+
+			stored, err := NewDB(ctx).QueryRoleByUID(targetUID)
+			require.NoError(t, err)
+			assert.Emptyf(t, stored, "guard must not let %q reach user.role", role)
 		})
 	}
 }

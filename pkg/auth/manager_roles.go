@@ -30,7 +30,11 @@ const ManagerRoleDashboardReader = "dashboardReader"
 //     catalog taxonomy. It is genuinely narrower than superAdmin — no system
 //     settings, backups, user/group writes or space destruction — but pick people
 //     at a supply-chain bar, not at a "content editor" one.
-//   - Do not grant it before octo-marketplace has the matching gate deployed.
+//   - Do not DEPLOY this service before octo-marketplace has the matching gate
+//     live. The capabilities are computed per request from CanAdminMarketplace,
+//     so every account already holding the role picks up the advertised surface
+//     at deploy — withholding new grants does not narrow the blast radius. The
+//     affected population is fixed at release time, not at grant time.
 //   - REVOKING THE ROLE DOES NOT CUT OFF MARKET ACCESS. Revoke the session too.
 //     Marketplace resolves callers through /v1/auth/verify, which answers from
 //     tokenValidator.Validate — the role snapshotted into the session token at

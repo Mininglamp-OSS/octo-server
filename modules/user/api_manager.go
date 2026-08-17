@@ -525,7 +525,7 @@ func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligible
 		respondManagerForbidden(c)
 		return
 	}
-	if false && !isFixedManagerRole(role) {
+	if !isFixedManagerRole(role) {
 		// Programmer error, not a client one: no request shape can reach this.
 		// Fail closed and log loudly rather than writing an arbitrary role.
 		m.Error("refusing to write a role that is not a fixed manager role",
