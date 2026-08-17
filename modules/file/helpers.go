@@ -1,6 +1,10 @@
 package file
 
-import "strings"
+import (
+	"net/http"
+	"strconv"
+	"strings"
+)
 
 // allowedMinioBuckets is the whitelist of bucket prefixes the MinIO backend
 // will auto-create and accept on upload. Keeping it in one place lets every
@@ -102,4 +106,108 @@ func violatesStickerKeyspace(fileType Type, objectPath string) bool {
 		return false
 	}
 	return strings.HasPrefix(strings.TrimPrefix(objectPath, "/"), "sticker/")
+}
+
+// collapseSignableWhitespace rewrites a string so that it survives SigV4
+// canonicalization unchanged: leading/trailing whitespace is trimmed and every
+// run of whitespace becomes a single space.
+//
+// Why this has to exist (GH#760): SigV4 hashes a *canonical* form of each
+// signed header value, and the two sides of the handshake canonicalize
+// differently.
+//
+//   - minio-go (pkg/signer/utils.go signV4TrimAll) does
+//     `strings.Join(strings.Fields(v), " ")`, collapsing whitespace runs
+//     ANYWHERE in the value — including inside a quoted string.
+//   - AWS SigV4 (and Tencent COS, which enforces it) says "Do not trim excess
+//     white space in a header value if it appears within a quoted string", so
+//     the gateway keeps the run.
+//
+// A `Content-Disposition: inline; filename="a  b.pdf"` therefore gets signed
+// as `filename="a b.pdf"` but verified as `filename="a  b.pdf"` — different
+// canonical requests, different signatures, and the browser PUT dies with
+// 403 SignatureDoesNotMatch. Emitting a value that is already collapsed makes
+// both derivations agree, whichever rule the gateway applies.
+//
+// The behaviour is deliberately identical to minio-go's signV4TrimAll: this
+// is the fixed point of that function, not a different normalization.
+func collapseSignableWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// defaultUploadContentType is what an upload falls back to when the caller
+// gives us nothing usable.
+const defaultUploadContentType = "application/octet-stream"
+
+// isInvalidHeaderByte reports whether c may not appear in an HTTP header value.
+// Go's transport refuses to send a request carrying one ("invalid header field
+// value"), so a header we hand a client is unusable if it contains any —
+// regardless of what the signature says about it.
+func isInvalidHeaderByte(c byte) bool { return c < 0x20 || c == 0x7F }
+
+func containsInvalidHeaderByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if isInvalidHeaderByte(s[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeUploadContentType prepares a caller-supplied content type to be
+// both signed into a presigned PUT and echoed to the client, which must send
+// it back verbatim.
+//
+// Whitespace runs are collapsed for the GH#760 reason (see
+// collapseSignableWhitespace). Two further shapes degrade to the default
+// rather than being passed through:
+//
+//   - empty, or whitespace-only: collapsing "  " yields "", and an empty
+//     content type would silently drop out of the signed header set and be
+//     echoed as "", leaving the stored object with no declared type. Note the
+//     ordering this implies — the default has to be applied AFTER the
+//     collapse, not before, or a whitespace-only value slips past it.
+//   - carrying a byte that cannot appear in a header value: mangling those to
+//     '_' would invent a MIME type the caller never asked for, so an honest
+//     default beats a corrupted value here. (The filename fallback does
+//     substitute, because there the goal is to preserve as much of the name
+//     as possible.)
+func normalizeUploadContentType(raw string) string {
+	ct := collapseSignableWhitespace(raw)
+	if ct == "" || containsInvalidHeaderByte(ct) {
+		return defaultUploadContentType
+	}
+	return ct
+}
+
+// presignPutHeaders builds the header set signed into a presigned PUT URL.
+// Content-Length is signed so the gateway bounds the upload size;
+// Content-Type and Content-Disposition are signed so the stored object
+// carries the right metadata.
+//
+// The collapseSignableWhitespace calls here are defence in depth, NOT the
+// GH#760 fix: minio-go runs signV4TrimAll over every value it signs, so
+// passing "a  b" or "a b" produces the identical signature. What actually
+// has to be collapsed is the value handed to the client, because the client
+// echoes it verbatim and the gateway canonicalizes what arrives — that is
+// done at each value's source (BuildContentDisposition for the disposition,
+// getUploadCredentials for the content type). Normalizing again here keeps
+// this map identical to those values, so a backend that ever signs verbatim
+// cannot silently reintroduce the mismatch.
+//
+// Shared by the three SigV4 backends (COS / MinIO / S3) so the invariant
+// cannot drift between copies. Aliyun OSS builds its options separately and
+// does not come through here; note its V1 string-to-sign DOES cover
+// Content-Type (verbatim, with no Trimall step) and does NOT cover
+// Content-Disposition — see the operator matrix on getUploadCredentials.
+func presignPutHeaders(contentType, contentDisposition string, fileSize int64) http.Header {
+	headers := http.Header{}
+	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))
+	if v := collapseSignableWhitespace(contentType); v != "" {
+		headers.Set("Content-Type", v)
+	}
+	if v := collapseSignableWhitespace(contentDisposition); v != "" {
+		headers.Set("Content-Disposition", v)
+	}
+	return headers
 }

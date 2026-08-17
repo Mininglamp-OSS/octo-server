@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
@@ -348,14 +347,7 @@ func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, con
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	headers := http.Header{}
-	headers.Set("Content-Length", strconv.FormatInt(fileSize, 10))
-	if contentType != "" {
-		headers.Set("Content-Type", contentType)
-	}
-	if contentDisposition != "" {
-		headers.Set("Content-Disposition", contentDisposition)
-	}
+	headers := presignPutHeaders(contentType, contentDisposition, fileSize)
 	presigned, err := client.PresignHeader(ctx, http.MethodPut, cosConfig.Bucket, key, expires, nil, headers)
 	if err != nil {
 		return "", "", fmt.Errorf("生成预签名URL失败: %w", err)
