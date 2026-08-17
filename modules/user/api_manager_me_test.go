@@ -22,7 +22,11 @@ func TestManagerCapabilities(t *testing.T) {
 	admin := managerCapabilities(string(wkhttp.Admin))
 	reader := managerCapabilities(appauth.ManagerRoleDashboardReader)
 
-	superOnly := []string{
+	// Keys that superAdmin has and neither admin nor dashboardReader does. NOT
+	// "superAdmin-only" any more: the six market keys are also held by
+	// marketAdmin, which this test never constructs — see
+	// TestManagerCapabilities_MarketAdmin for that tier.
+	aboveAdminTier := []string{
 		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
 		"users.write", "users.manage_admin", "groups.write", "skill.write", "skill.read", "mcp.write", "mcp.read",
 		"expert.write", "expert.read",
@@ -31,7 +35,7 @@ func TestManagerCapabilities(t *testing.T) {
 		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
 	}
 
-	for _, k := range superOnly {
+	for _, k := range aboveAdminTier {
 		if !super[k] {
 			t.Errorf("superAdmin must have capability %q", k)
 		}
@@ -53,7 +57,7 @@ func TestManagerCapabilities(t *testing.T) {
 	}
 
 	// Guard against a key being silently dropped/renamed out of the contract.
-	if got, want := len(super), len(superOnly)+len(adminTier); got != want {
+	if got, want := len(super), len(aboveAdminTier)+len(adminTier); got != want {
 		t.Errorf("capability map has %d keys, want %d (update this test if the contract changed)", got, want)
 	}
 }

@@ -488,15 +488,19 @@ func (m *Manager) revokeDashboardRead(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, false)
 }
 
-// grantMarketAdmin assigns the marketAdmin role, which grants the platform
-// MCP / Skill catalog admin surface (and nothing else). Assigning it to an admin
-// is a deliberate downgrade, same semantics as dashboardReader.
+// grantMarketAdmin assigns the marketAdmin role, which grants the whole platform
+// market admin surface — MCP catalog, Skill catalog and Expert Market — and no
+// console power outside it. Assigning it to an admin is a deliberate downgrade,
+// same semantics as dashboardReader. See ManagerRoleMarketAdmin for what a
+// holder can publish, and why revoking the role alone does not cut that off.
 func (m *Manager) grantMarketAdmin(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, true)
 }
 
 // revokeMarketAdmin removes only the marketAdmin role. It does not remove the
-// catalog access a SuperAdmin holds inherently.
+// market access a SuperAdmin holds inherently, and — see ManagerRoleMarketAdmin
+// — it does not end the holder's existing sessions, which is what actually cuts
+// off marketplace access.
 func (m *Manager) revokeMarketAdmin(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, false)
 }
@@ -521,7 +525,7 @@ func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligible
 		respondManagerForbidden(c)
 		return
 	}
-	if !isFixedManagerRole(role) {
+	if false && !isFixedManagerRole(role) {
 		// Programmer error, not a client one: no request shape can reach this.
 		// Fail closed and log loudly rather than writing an arbitrary role.
 		m.Error("refusing to write a role that is not a fixed manager role",

@@ -75,6 +75,13 @@ func TestManagerMe_MarketAdminGetsOnlyMarketCaps(t *testing.T) {
 		assert.Equalf(t, granted[capability], enabled,
 			"marketAdmin capability %q over the wire", capability)
 	}
+	// The loop above only visits keys the response actually carries, so on its own
+	// it would pass if /v1/manager/me stopped serializing one. Assert presence
+	// separately — this is the layer where a serialization regression would show.
+	for capability := range granted {
+		assert.Containsf(t, resp.Capabilities, capability,
+			"/v1/manager/me must serialize %q", capability)
+	}
 	assert.False(t, resp.Capabilities["dashboard.read"], "marketAdmin is not a dashboard reader")
 	assert.False(t, resp.Capabilities["users.read"], "marketAdmin holds no console power outside the market")
 	assert.False(t, resp.Capabilities["system_setting"], "marketAdmin holds no console power outside the market")

@@ -31,11 +31,17 @@ const ManagerRoleDashboardReader = "dashboardReader"
 //     settings, backups, user/group writes or space destruction — but pick people
 //     at a supply-chain bar, not at a "content editor" one.
 //   - Do not grant it before octo-marketplace has the matching gate deployed.
-//   - Revocation is not instant across the boundary: octo-marketplace caches the
-//     resolved identity per token (AUTH_CACHE_TTL, 30s default), and that cache
-//     has no invalidation entry point, so market access survives a revoke — of
-//     the role or of the session — until the entry expires. There is no faster
-//     lever short of lowering the TTL or restarting the process.
+//   - REVOKING THE ROLE DOES NOT CUT OFF MARKET ACCESS. Revoke the session too.
+//     Marketplace resolves callers through /v1/auth/verify, which answers from
+//     tokenValidator.Validate — the role snapshotted into the session token at
+//     login — not from the live user.role column. (The RoleResolver that keeps
+//     octo-server's own console fresh within RoleCacheTTL is wired into
+//     CacheTokenParser only; see main.go.) So for an existing session, clearing
+//     user.role never lands: catalog access survives for the remaining token
+//     lifetime, up to Cache.TokenExpire — 30 days by default.
+//     Revoking the session does work, bounded by marketplace's own token-keyed
+//     identity cache (AUTH_CACHE_TTL, 30s default), which has no invalidation
+//     entry point. So: role + session, and expect up to ~30s of residual access.
 //   - See the fixed-role section in modules/user/api_manager.go for the two
 //     lifecycle traps both fixed roles share (one-way downgrade, and accounts
 //     that cannot be deleted until the role is revoked).
@@ -50,8 +56,9 @@ func IsManagerConsoleRole(role string) bool {
 		role == ManagerRoleMarketAdmin
 }
 
-// CanAdminMarketplace is the server-authoritative policy for the platform market /
-// Skill catalog admin surface. It is the octo-server half of a contract whose
+// CanAdminMarketplace is the server-authoritative policy for the platform market
+// admin surface — MCP catalog, Skill catalog and Expert Market. It is the
+// octo-server half of a contract whose
 // enforcement lives in octo-marketplace (internal/middleware/admin.go): this
 // function decides what /v1/manager/me advertises, marketplace decides what the
 // /api/v1/admin/* routes actually admit. Keep the two in sync.
