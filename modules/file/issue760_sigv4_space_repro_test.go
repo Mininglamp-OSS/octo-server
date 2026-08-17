@@ -431,3 +431,84 @@ func TestIssue760_SignedHeaderInvariant(t *testing.T) {
 		})
 	}
 }
+
+// triggers760 reports whether a filename, once put through the production
+// handler path, yields a Content-Disposition that SigV4 Trimall would rewrite
+// — the exact predicate for the 403. No gateway needed.
+func triggers760(rawFilename string) (bool, string) {
+	cd := BuildContentDisposition(sanitizeFilename(rawFilename))
+	return trimAllMinIO(cd) != cd, cd
+}
+
+// TestIssue760_TriggerRule pins the trigger down to one rule: the quoted
+// ASCII fallback must carry a run of two or more literal spaces. Everything
+// else about the name — length, script, punctuation, extension — is irrelevant.
+func TestIssue760_TriggerRule(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+		why  string
+	}{
+		// --- triggers ---
+		{"Octo  upload test.pdf", true, "two U+0020"},
+		{"Octo   upload test.pdf", true, "three U+0020"},
+		{"  leading.pdf", true, "run at the start of the name"},
+		{"trailing  .pdf", true, "run before the extension"},
+		{"报告  文档.pdf", true, "CJK is irrelevant; the ASCII spaces survive"},
+		{"photo\U0001F600  x.jpg", true, "emoji is irrelevant"},
+		{"a  b.pdf", true, "shortest possible trigger"},
+
+		// --- does not trigger ---
+		{"Octo upload test.pdf", false, "single space"},
+		{" leading.pdf", false, "single leading space"},
+		{"a\tb.pdf", false, "tab is replaced by '_' in sanitizeFilename"},
+		{"a\t\tb.pdf", false, "even a tab run never reaches the header"},
+		{"a　　b.pdf", false, "U+3000 replaced by '_' in the quoted fallback"},
+		{"a  b.pdf", false, "U+00A0 likewise"},
+		{"a  b.pdf", false, "U+202F likewise"},
+		{"a​​b.pdf", false, "U+200B likewise"},
+		{"报告 文档.pdf", false, "CJK with a single space"},
+		{"very-long-name-without-any-spaces-at-all-0123456789.xlsx", false, "length alone is not a trigger"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, cd := triggers760(tc.name)
+			t.Logf("trigger=%-5v cd=%q  (%s)", got, cd, tc.why)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestIssue760_ReportedFilenames runs the names actually reported across
+// octo-server#760 and octo-web#348 / #1312 through the same predicate.
+//
+// Only the #760 fixtures — the one reporter who stated space counts
+// explicitly — trigger. Every other reported name, as transcribed in the
+// issue text, does NOT reproduce. That is expected rather than
+// contradictory: rendered Markdown collapses runs of spaces, and several of
+// those names are visibly truncated, so the transcriptions cannot preserve
+// the trigger.
+func TestIssue760_ReportedFilenames(t *testing.T) {
+	reported := []struct {
+		source   string
+		filename string
+		want     bool
+	}{
+		{"#760 fixture 02-FAIL", "02-FAIL-Octo  upload test.pdf", true},
+		{"#760 fixture 01-PASS", "01-PASS-Octo upload test.pdf", false},
+		{"#348 as transcribed (xlsx)", "Lincoln 2026 Q2 Lincoln Z Launch Campaign Jun Autohome.xlsx", false},
+		{"#348 as transcribed (pdf)", "Miaozhen Onboarding.pdf", false},
+		{"#348 as transcribed (docx)", "中考体育跑鞋推荐 推荐榜单 中考体育跑鞋推荐清单，柔态碳板更适配青少年体测.docx", false},
+		{"#348 truncated in report (pptx)", "【结案报告-更新2】2.pptx", false},
+		{"#1312 truncated in report (zip)", "0807 设置中心 - 设计.zip", false},
+	}
+
+	for _, r := range reported {
+		t.Run(r.source, func(t *testing.T) {
+			got, cd := triggers760(r.filename)
+			t.Logf("trigger=%-5v %q\n           cd=%q", got, r.filename, cd)
+			assert.Equal(t, r.want, got)
+		})
+	}
+}
