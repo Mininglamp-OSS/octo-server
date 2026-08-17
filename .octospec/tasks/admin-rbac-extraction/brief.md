@@ -91,15 +91,28 @@ user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 �
 - capability 字符串**直接复用前端 `MANAGER_CAPABILITY_KEYS` 的同名同义键**
   （`mcp.read` / `skill.write` / …），前端零改动。
 
-#### 扩展性决定（这几条会长期锁住表结构，需显式确认）
+#### 扩展性决定（这几条会长期锁住表结构）
 
-- **内建角色的能力集由代码定义，DB 只存其存在性。** `admin_role_capability`
-  只承载**自定义角色**的行。理由：内建角色若把能力集展开成数据行，每次版本升级
-  新增 capability 都要写一次 data migration，且用户改过内建角色时无法幂等收敛。
-  内建角色一律禁止编辑。
-- **`superAdmin` 是动态全集**：resolver 特判 `role_key='superAdmin'` 直接返回
-  `authz.All()`，不查 `admin_role_capability`。否则新增一个 capability 后**超管反而
-  没有它**，是个静默的权限黑洞。
+对照 NIST RBAC 分层定义、Kubernetes RBAC、AWS IAM 的已知陷阱后定稿。
+
+- **内建角色存成数据，启动时 reconcile**（k8s 对内建 ClusterRole 的做法）。不采用
+  "代码定义能力集、DB 只存存在性"的变体：那会让 resolver 分叉成两条路径（内建走
+  代码 map、自定义走 DB），行为迟早漂移，且内建角色无法被同一个 list 端点查出来。
+  reconcile 同时解决"用户改过内建角色"的收敛问题。**reconcile 失败必须拒绝启动**，
+  与 `createManagerAccount`（`api_manager.go:1576-1582`）宁可不建超管也不建弱口令
+  超管的 fail-closed 姿态一致。
+- **`superAdmin` 的全集用一行通配 `capability='*'` 表达**，而不是在 resolver 里特判
+  `role_key`。"动态全集"因此落在数据模型内，resolver 只需在展开时认识 `*`。
+  否则新增 capability 后**超管反而没有它**，是个静默的权限黑洞。
+- **只允许全通配 `*`，明确拒绝前缀通配（`mcp.*`）**。前缀通配是 AWS IAM 的已知
+  陷阱：会把下个版本新增的同前缀权限静默吸收，授权时无人同意过。自定义角色创建
+  校验直接拒 `*`。
+- **只有 allow，没有 deny**：多角色取并集，不支持"某角色但排除 X"。NIST RBAC 与
+  k8s 均为纯 additive；引入 deny 会让求值变成顺序相关，"这个人能干什么"从一个并集
+  变成一段需调试的逻辑。后续此类需求一律以"新建角色"满足。
+- **角色扁平，不做继承**。NIST 将 hierarchical RBAC 单列一层自有其代价：菱形继承
+  使权限来源无法回溯。多角色并集已覆盖绝大部分场景。
+- **`role_key` 不可变**（显示名 `name` 可改），因此可安全地做自然主键。
 - **未注册的 capability 必须被忽略，不是报错**：DB 里可能存在代码里已不存在的
   capability（版本回滚、capability 改名）。resolver 遇到未注册键跳过并打 debug 日志；
   若改成报错，一次回滚就会让所有自定义角色全部失效。
@@ -108,8 +121,9 @@ user_admin_role       (uid, role_key, granted_by, granted_at)       -- 用户 �
 - **`granted_by` / `granted_at` 直接进表**，不依赖事后翻日志。
 - **不预留 `scope_type` / `scope_id`（不做作用域化角色）**：管理台角色目前是全局的，
   而"某人只管某个 Space"属于业务权限边界（`space_member.role`），现在没有正确的
-  设计依据。表行数量级是几十到几百（管理员），将来真要加，`ALTER TABLE` + 重建
-  唯一索引的代价可以忽略。同理不预留多租户维度。
+  设计依据。k8s 对此的解法是 Role/ClusterRole **两套绑定表**（RoleBinding vs
+  ClusterRoleBinding），不是一张表加一个可空 scope 列——将来真要做，正确的迁移本来
+  就不是加列，预留亦无用。同理不预留多租户维度。
 - **不用外键**，角色删除时在应用层事务里级联清理 `admin_role_capability` +
   `user_admin_role`（仓内 199 个迁移中仅 3 个使用外键，与既有风格一致）。
 - `role_key` VARCHAR(64)，约束 `^[a-z][a-z0-9_]{0,63}$`；内建 key 保留，自定义角色
@@ -273,8 +287,13 @@ workplace / statistics / integration / app_bot）。
 - **Redis 单独不可用不得触发 fail-closed**：穿透 MySQL 后请求正常完成（测试覆盖）。
 - `/v1/manager/me` 在 resolve error 时返回**错误**而非全 false 的 capability 图
   （测试断言响应不是 `{}`/全 false），使前端落进 `managerProfileFailed` 而非 `/no-access`。
-- `superAdmin` 的能力集是**动态全集**：新注册一个 capability 后，超管**无需任何
-  data migration** 即拥有它（测试：注册一个测试用 capability，断言超管为 true）。
+- `superAdmin` 的能力集是**动态全集**（经 `capability='*'` 通配行）：新注册一个
+  capability 后，超管**无需任何 data migration** 即拥有它（测试：注册一个测试用
+  capability，断言超管为 true）。
+- 自定义角色**不得**持有 `*`，且前缀通配（`mcp.*`）在创建/更新时被拒（测试覆盖）。
+- 内建角色被人为改动后，重启 reconcile 将其恢复到定义态（测试）；reconcile 失败时
+  进程**拒绝启动**而非降级。
+- 多角色取并集，无 deny 语义（测试：两个角色的能力集合并后逐键断言）。
 - DB 中存在**未注册**的 capability 时，resolver 跳过该键且其余能力正常解析
   （回滚安全性测试），不得整体报错。
 - Phase 1 每替换一个端点，其**现有档位不变**：原 `CheckLoginRoleIsSuperAdmin` 的
