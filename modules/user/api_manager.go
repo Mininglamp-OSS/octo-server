@@ -15,6 +15,7 @@ import (
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -118,15 +119,21 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfill)
 		auth.GET("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfillStatus)
 	}
-	dashboardReader := r.Group(
+	// 固定管理角色的授予/撤销面（pre-RBAC，见 setFixedManagerRole 上方说明）。
+	// SharedUIDRateLimiter 必须挂在 AuthMiddleware 之后才读得到 uid。
+	fixedRole := r.Group(
 		"/v1/manager/user",
 		m.ctx.AuthMiddleware(r),
 		appwkhttp.SharedUIDRateLimiter(r, m.ctx),
 	)
 	{
-		dashboardReader.GET("/dashboard-read", m.listDashboardReaders)
-		dashboardReader.PUT("/:uid/dashboard-read", m.grantDashboardRead)
-		dashboardReader.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
+		fixedRole.GET("/dashboard-read", m.listDashboardReaders)
+		fixedRole.PUT("/:uid/dashboard-read", m.grantDashboardRead)
+		fixedRole.DELETE("/:uid/dashboard-read", m.revokeDashboardRead)
+
+		fixedRole.GET("/market-admin", m.listMarketAdmins)
+		fixedRole.PUT("/:uid/market-admin", m.grantMarketAdmin)
+		fixedRole.DELETE("/:uid/market-admin", m.revokeMarketAdmin)
 	}
 }
 
@@ -176,10 +183,10 @@ func (m *Manager) me(c *wkhttp.Context) {
 //   - space.read        = 空间/成员/邀请/入群申请 列表查询（requireAdmin）
 //   - space.write       = 建空间/改资料/加成员/邀请增改禁用/通过拒绝入群申请（requireAdmin，故恒 true）
 //   - space.destructive = 强制解散/封禁/强制移除/改成员角色（requireSuperAdmin）
-//   - skill.read        = 系统 Skill 列表/详情查看（requireSuperAdmin）
-//   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（requireSuperAdmin）
-//   - mcp.read          = 系统 MCP 列表/详情查看（requireSuperAdmin）
-//   - mcp.write         = 系统 MCP 创建/编辑/删除（requireSuperAdmin）
+//   - skill.read        = 系统 Skill 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（superAdmin ∪ marketAdmin）
+//   - mcp.read          = 系统 MCP 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - mcp.write         = 系统 MCP 创建/编辑/删除（superAdmin ∪ marketAdmin）
 //   - expert.read       = 专家市场 专家/专家团 列表/详情查看（requireSuperAdmin）
 //   - expert.write      = 专家市场 上传新建/编辑/删除 + 分类管理（requireSuperAdmin）
 //
@@ -198,12 +205,16 @@ func managerCapabilities(role string) map[string]bool {
 		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
 		"users.manage_admin": isSuper, // 管理员账号 增/查/删
 		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
-		"skill.read":         isSuper, // 系统 Skill 列表/详情（marketplace admin surface）
-		"skill.write":        isSuper, // 系统 Skill 创建/编辑/删除/分类管理（marketplace admin surface）
-		"mcp.read":           isSuper, // 系统 MCP 列表/详情（marketplace admin surface 只认共享 X-Admin-Token 不分 role，此处收窄到超管以缩小页面暴露面）
-		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（同上）
 		"expert.read":        isSuper, // 专家市场 专家/专家团 列表/详情（marketplace admin surface 收窄到超管）
 		"expert.write":       isSuper, // 专家市场 创建(上传)/编辑/删除 + 分类管理（同上）
+		// superAdmin ∪ marketAdmin —— 平台 MCP / Skill 目录的运营面。marketAdmin 是
+		// 与 dashboardReader 同形状的固定角色：octo-lib 不认识它，所以它过不了任何
+		// admin/superAdmin 端点，只有这四个键为真。真正的放行在 octo-marketplace 的
+		// /api/v1/admin/{mcps,skills,skill_categories} 上，见 auth.CanAdminMarketplace。
+		"skill.read":  auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
+		"skill.write": auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
+		"mcp.read":    auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
+		"mcp.write":   auth.CanAdminMarketplace(role), // 系统 MCP 创建/编辑/删除
 		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
 		"appversion.read": isAdmin,                            // 版本列表
 		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
@@ -441,47 +452,76 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// ── 固定管理角色（pre-RBAC） ─────────────────────────────────────────────────
+//
+// dashboardReader 与 marketAdmin 都是「既非 admin 也非 superAdmin」的固定角色：
+// octo-lib 的 CheckLoginRole* 不认识它们，所以持有者过不了任何 admin/superAdmin
+// 端点，能力完全由 managerCapabilities 那张图（以及下游服务对该角色的承认）决定。
+//
+// 两者的授予/撤销流程逐字相同——CAS 改 user.role、失效角色热缓存、幂等、目标资格
+// 校验——因此共用下面这套按角色参数化的代码，而不是复制一份。
+//
+// 过渡性质：通用 admin RBAC 落地后（见 .octospec/tasks/admin-rbac-extraction/），
+// 这两个角色将变成角色表里的两行数据，本节连同 pkg/auth/manager_roles.go 一并删除。
+
 // grantDashboardRead assigns the temporary dashboardReader role to an existing
 // non-SuperAdmin account. The role is exclusive: assigning it to an admin is a
 // deliberate downgrade to Dashboard-only access.
 func (m *Manager) grantDashboardRead(c *wkhttp.Context) {
-	m.setDashboardReaderRole(c, true)
+	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, true)
 }
 
 // revokeDashboardRead removes only the temporary dashboardReader role. It does
 // not remove dashboard access inherited from admin or SuperAdmin.
 func (m *Manager) revokeDashboardRead(c *wkhttp.Context) {
-	m.setDashboardReaderRole(c, false)
+	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, false)
 }
 
-func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
+// grantMarketAdmin assigns the marketAdmin role, which grants the platform
+// MCP / Skill catalog admin surface (and nothing else). Assigning it to an admin
+// is a deliberate downgrade, same semantics as dashboardReader.
+func (m *Manager) grantMarketAdmin(c *wkhttp.Context) {
+	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, true)
+}
+
+// revokeMarketAdmin removes only the marketAdmin role. It does not remove the
+// catalog access a SuperAdmin holds inherently.
+func (m *Manager) revokeMarketAdmin(c *wkhttp.Context) {
+	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, false)
+}
+
+// setFixedManagerRole grants or revokes one fixed manager role on a target
+// account. ineligibleCode is the role-specific 4xx returned when the target is
+// not a grantable account (bot / banned / destroyed).
+func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligibleCode codes.Code, grant bool) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondManagerForbidden(c)
 		return
 	}
 
-	target, ok := m.dashboardReaderTarget(c)
+	target, ok := m.fixedManagerRoleTarget(c, role)
 	if !ok {
 		return
 	}
-	nextRole, changed, allowed := dashboardReaderRoleTransition(target.Role, grant)
+	nextRole, changed, allowed := fixedManagerRoleTransition(target.Role, role, grant)
 	if !allowed {
 		respondManagerForbidden(c)
 		return
 	}
-	if grant && !dashboardReaderGrantEligible(target) {
-		respondUserError(c, errcode.ErrUserDashboardReaderTargetIneligible)
+	if grant && !fixedManagerRoleGrantEligible(target) {
+		respondUserError(c, ineligibleCode)
 		return
 	}
 	if !changed {
-		m.finishDashboardReaderRoleRequest(c, target.UID, grant, false)
+		m.finishFixedManagerRoleRequest(c, role, target.UID, grant, false)
 		return
 	}
 
 	updated, err := m.db.updateUserRole(target.UID, target.Role, nextRole)
 	if err != nil {
-		m.Error("update dashboard reader role failed",
+		m.Error("update fixed manager role failed",
 			zap.Error(err),
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", target.UID),
 			zap.Bool("grant", grant))
@@ -491,7 +531,8 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 	if !updated {
 		// The role changed after QueryByUID. Fail closed instead of overwriting a
 		// concurrent promotion (especially to SuperAdmin).
-		m.Info("dashboard reader role update lost compare-and-set",
+		m.Info("fixed manager role update lost compare-and-set",
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", target.UID),
 			zap.String("expected_role", target.Role),
@@ -499,10 +540,10 @@ func (m *Manager) setDashboardReaderRole(c *wkhttp.Context, grant bool) {
 		respondUserError(c, errcode.ErrUserManagerRoleChanged)
 		return
 	}
-	m.finishDashboardReaderRoleRequest(c, target.UID, grant, true)
+	m.finishFixedManagerRoleRequest(c, role, target.UID, grant, true)
 }
 
-func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
+func (m *Manager) fixedManagerRoleTarget(c *wkhttp.Context, role string) (*Model, bool) {
 	targetUID := strings.TrimSpace(c.Param("uid"))
 	if targetUID == "" {
 		respondUserRequestInvalid(c, "uid")
@@ -510,7 +551,8 @@ func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
 	}
 	target, err := m.userDB.QueryByUID(targetUID)
 	if err != nil {
-		m.Error("query dashboard reader target failed", zap.Error(err), zap.String("target_uid", targetUID))
+		m.Error("query fixed manager role target failed",
+			zap.Error(err), zap.String("role", role), zap.String("target_uid", targetUID))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return nil, false
 	}
@@ -521,15 +563,16 @@ func (m *Manager) dashboardReaderTarget(c *wkhttp.Context) (*Model, bool) {
 	return target, true
 }
 
-func dashboardReaderGrantEligible(target *Model) bool {
+func fixedManagerRoleGrantEligible(target *Model) bool {
 	return target != nil && target.Robot == 0 &&
 		target.Status == StatusEnable.Int() && target.IsDestroy == IsDestroyNo
 }
 
-func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID string, grant, changed bool) {
+func (m *Manager) finishFixedManagerRoleRequest(c *wkhttp.Context, role, targetUID string, grant, changed bool) {
 	if err := m.roleService.Invalidate(targetUID); err != nil {
-		m.Error("invalidate dashboard reader role cache failed",
+		m.Error("invalidate fixed manager role cache failed",
 			zap.Error(err),
+			zap.String("role", role),
 			zap.String("actor_uid", c.GetLoginUID()),
 			zap.String("target_uid", targetUID),
 			zap.Bool("grant", grant),
@@ -537,11 +580,12 @@ func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID 
 		respondUserError(c, errcode.ErrUserRoleCacheFailed)
 		return
 	}
-	message := "dashboard reader role already in requested state"
+	message := "fixed manager role already in requested state"
 	if changed {
-		message = "dashboard reader role changed"
+		message = "fixed manager role changed"
 	}
 	m.Info(message,
+		zap.String("role", role),
 		zap.String("actor_uid", c.GetLoginUID()),
 		zap.String("target_uid", targetUID),
 		zap.Bool("granted", grant))
@@ -549,13 +593,21 @@ func (m *Manager) finishDashboardReaderRoleRequest(c *wkhttp.Context, targetUID 
 }
 
 func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
+	m.listUsersWithFixedManagerRole(c, auth.ManagerRoleDashboardReader)
+}
+
+func (m *Manager) listMarketAdmins(c *wkhttp.Context) {
+	m.listUsersWithFixedManagerRole(c, auth.ManagerRoleMarketAdmin)
+}
+
+func (m *Manager) listUsersWithFixedManagerRole(c *wkhttp.Context, role string) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondManagerForbidden(c)
 		return
 	}
-	users, err := m.db.queryUsersWithRole(auth.ManagerRoleDashboardReader)
+	users, err := m.db.queryUsersWithRole(role)
 	if err != nil {
-		m.Error("query dashboard reader list failed", zap.Error(err))
+		m.Error("query fixed manager role list failed", zap.Error(err), zap.String("role", role))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
@@ -569,17 +621,21 @@ func (m *Manager) listDashboardReaders(c *wkhttp.Context) {
 	c.Response(list)
 }
 
-// dashboardReaderRoleTransition is the complete temporary-role policy. The
-// boolean results are (changed, allowed). Admin may be deliberately downgraded
-// to dashboardReader; inherited admin/SuperAdmin dashboard access cannot be
-// revoked through this fixed-role endpoint.
-func dashboardReaderRoleTransition(currentRole string, grant bool) (nextRole string, changed, allowed bool) {
+// fixedManagerRoleTransition is the complete fixed-role policy, shared by every
+// role in this section. The boolean results are (changed, allowed).
+//
+// Admin may be deliberately downgraded to a fixed role. Everything else is
+// rejected rather than silently rewritten: user.role is single-valued, so the
+// fixed roles are mutually exclusive, and swapping one for another must be an
+// explicit revoke-then-grant instead of an implicit side effect of a grant.
+// Access a SuperAdmin (or an admin) holds inherently cannot be revoked here.
+func fixedManagerRoleTransition(currentRole, role string, grant bool) (nextRole string, changed, allowed bool) {
 	if grant {
 		switch currentRole {
 		case "", string(wkhttp.Admin):
-			return auth.ManagerRoleDashboardReader, true, true
-		case auth.ManagerRoleDashboardReader:
-			return auth.ManagerRoleDashboardReader, false, true
+			return role, true, true
+		case role:
+			return role, false, true
 		default:
 			return "", false, false
 		}
@@ -588,7 +644,7 @@ func dashboardReaderRoleTransition(currentRole string, grant bool) (nextRole str
 	switch currentRole {
 	case "":
 		return "", false, true
-	case auth.ManagerRoleDashboardReader:
+	case role:
 		return "", true, true
 	default:
 		return "", false, false

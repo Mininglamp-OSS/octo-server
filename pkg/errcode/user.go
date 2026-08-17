@@ -376,6 +376,15 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "This account is not eligible for analytics dashboard access.",
 	})
+	// ErrUserManagerRoleTargetIneligible is the role-agnostic counterpart used by
+	// fixed manager roles added after dashboardReader (marketAdmin, ...). The
+	// dashboard-specific code above is kept so that endpoint's message does not
+	// change for existing clients.
+	ErrUserManagerRoleTargetIneligible = register(codes.Code{
+		ID:             "err.server.user.manager_role_target_ineligible",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This account is not eligible for the requested management role.",
+	})
 	ErrUserManagerRoleChanged = register(codes.Code{
 		ID:             "err.server.user.manager_role_changed",
 		HTTPStatus:     http.StatusConflict,
