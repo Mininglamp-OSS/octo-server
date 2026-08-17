@@ -18,7 +18,7 @@ func TestManagerRolePolicy(t *testing.T) {
 		{name: "admin", role: string(wkhttp.Admin), wantConsole: true, wantDashboardRead: true},
 		{name: "dashboard reader", role: ManagerRoleDashboardReader, wantConsole: true, wantDashboardRead: true},
 		// marketAdmin may enter the console, but holds neither dashboard read nor
-		// any admin-tier power — its only privilege is the platform catalog surface.
+		// any admin-tier power — its only privilege is the platform market surface.
 		{name: "market admin", role: ManagerRoleMarketAdmin, wantConsole: true, wantMarketplace: true},
 		{name: "plain user", role: "", wantConsole: false, wantDashboardRead: false},
 		{name: "unknown role", role: "unknown", wantConsole: false, wantDashboardRead: false},

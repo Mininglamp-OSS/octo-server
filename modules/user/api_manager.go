@@ -188,8 +188,8 @@ func (m *Manager) me(c *wkhttp.Context) {
 //   - skill.write       = 系统 Skill 创建/编辑/删除/分类管理（superAdmin ∪ marketAdmin）
 //   - mcp.read          = 系统 MCP 列表/详情查看（superAdmin ∪ marketAdmin）
 //   - mcp.write         = 系统 MCP 创建/编辑/删除（superAdmin ∪ marketAdmin）
-//   - expert.read       = 专家市场 专家/专家团 列表/详情查看（requireSuperAdmin）
-//   - expert.write      = 专家市场 上传新建/编辑/删除 + 分类管理（requireSuperAdmin）
+//   - expert.read       = 专家市场 专家/专家团 列表/详情查看（superAdmin ∪ marketAdmin）
+//   - expert.write      = 专家市场 上传新建/编辑/删除 + 分类管理（superAdmin ∪ marketAdmin）
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
@@ -206,20 +206,19 @@ func managerCapabilities(role string) map[string]bool {
 		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
 		"users.manage_admin": isSuper, // 管理员账号 增/查/删
 		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
-		"expert.read":        isSuper, // 专家市场 专家/专家团 列表/详情（marketplace admin surface 收窄到超管）
-		"expert.write":       isSuper, // 专家市场 创建(上传)/编辑/删除 + 分类管理（同上）
-		// superAdmin ∪ marketAdmin —— 平台 MCP / Skill 目录的运营面。marketAdmin 是
-		// 与 dashboardReader 同形状的固定角色：octo-lib 不认识它，所以它过不了任何
-		// admin/superAdmin 端点，只有这四个键为真。
+		// superAdmin ∪ marketAdmin —— 整个平台市场的运营面：MCP 目录、Skill 目录、
+		// 专家市场。marketAdmin 是与 dashboardReader 同形状的固定角色：octo-lib 不
+		// 认识它，所以它过不了任何 admin/superAdmin 端点，只有这六个键为真。
 		//
-		// 注意这四个键只驱动前端渲染；真正的放行在 octo-marketplace，且要等
-		// Mininglamp-OSS/octo-marketplace#55 上线之后——在那之前 marketplace 的
-		// /api/v1/admin/* 是一道只认 superAdmin 的门，marketAdmin 会拿到 403。
-		// 见 auth.CanAdminMarketplace。
-		"skill.read":  auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
-		"skill.write": auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
-		"mcp.read":    auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
-		"mcp.write":   auth.CanAdminMarketplace(role), // 系统 MCP 创建/编辑/删除
+		// 这六个键只驱动前端渲染；真正的放行在 octo-marketplace 的 /api/v1/admin/*，
+		// 见 auth.CanAdminMarketplace。两侧必须同时放开——marketplace 侧仍按资源分组
+		// 挂门，所以只改这里不改那边，页面会渲染出来但每个请求 403。
+		"skill.read":   auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
+		"skill.write":  auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
+		"mcp.read":     auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
+		"mcp.write":    auth.CanAdminMarketplace(role), // 系统 MCP 创建/编辑/删除
+		"expert.read":  auth.CanAdminMarketplace(role), // 专家市场 专家/专家团 列表/详情
+		"expert.write": auth.CanAdminMarketplace(role), // 专家市场 上传新建/编辑/删除 + 分类管理
 		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
 		"appversion.read": isAdmin,                            // 版本列表
 		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
@@ -489,15 +488,19 @@ func (m *Manager) revokeDashboardRead(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleDashboardReader, errcode.ErrUserDashboardReaderTargetIneligible, false)
 }
 
-// grantMarketAdmin assigns the marketAdmin role, which grants the platform
-// MCP / Skill catalog admin surface (and nothing else). Assigning it to an admin
-// is a deliberate downgrade, same semantics as dashboardReader.
+// grantMarketAdmin assigns the marketAdmin role, which grants the whole platform
+// market admin surface — MCP catalog, Skill catalog and Expert Market — and no
+// console power outside it. Assigning it to an admin is a deliberate downgrade,
+// same semantics as dashboardReader. See ManagerRoleMarketAdmin for what a
+// holder can publish, and why revoking the role alone does not cut that off.
 func (m *Manager) grantMarketAdmin(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, true)
 }
 
 // revokeMarketAdmin removes only the marketAdmin role. It does not remove the
-// catalog access a SuperAdmin holds inherently.
+// market access a SuperAdmin holds inherently, and — see ManagerRoleMarketAdmin
+// — it does not end the holder's existing sessions, which is what actually cuts
+// off marketplace access.
 func (m *Manager) revokeMarketAdmin(c *wkhttp.Context) {
 	m.setFixedManagerRole(c, auth.ManagerRoleMarketAdmin, errcode.ErrUserManagerRoleTargetIneligible, false)
 }

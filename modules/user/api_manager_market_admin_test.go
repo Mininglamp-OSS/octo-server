@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,11 +52,11 @@ func TestManagerLoginAllowsMarketAdmin(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"role":"`+appauth.ManagerRoleMarketAdmin+`"`)
 }
 
-// TestManagerMe_MarketAdminGetsOnlyCatalogCaps is the wire-level counterpart to
+// TestManagerMe_MarketAdminGetsOnlyMarketCaps is the wire-level counterpart to
 // TestManagerCapabilities_MarketAdmin: the pure function cannot catch a
 // regression in the handler's own role gate, and the capability map is the
 // contract octo-admin renders from.
-func TestManagerMe_MarketAdminGetsOnlyCatalogCaps(t *testing.T) {
+func TestManagerMe_MarketAdminGetsOnlyMarketCaps(t *testing.T) {
 	route, ctx, _ := newManagerRouteOnly(t)
 
 	loginAsRole(t, ctx, appauth.ManagerRoleMarketAdmin)
@@ -69,13 +70,22 @@ func TestManagerMe_MarketAdminGetsOnlyCatalogCaps(t *testing.T) {
 	granted := map[string]bool{
 		"mcp.read": true, "mcp.write": true,
 		"skill.read": true, "skill.write": true,
+		"expert.read": true, "expert.write": true,
 	}
 	for capability, enabled := range resp.Capabilities {
 		assert.Equalf(t, granted[capability], enabled,
 			"marketAdmin capability %q over the wire", capability)
 	}
-	assert.False(t, resp.Capabilities["expert.read"], "expert market stays superAdmin-only")
+	// The loop above only visits keys the response actually carries, so on its own
+	// it would pass if /v1/manager/me stopped serializing one. Assert presence
+	// separately — this is the layer where a serialization regression would show.
+	for capability := range granted {
+		assert.Containsf(t, resp.Capabilities, capability,
+			"/v1/manager/me must serialize %q", capability)
+	}
 	assert.False(t, resp.Capabilities["dashboard.read"], "marketAdmin is not a dashboard reader")
+	assert.False(t, resp.Capabilities["users.read"], "marketAdmin holds no console power outside the market")
+	assert.False(t, resp.Capabilities["system_setting"], "marketAdmin holds no console power outside the market")
 }
 
 func TestManagerMarketAdminGrantAndRevoke(t *testing.T) {
@@ -294,6 +304,95 @@ func TestManagerMarketAdminCannotReachAdminEndpoints(t *testing.T) {
 
 			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden")
+		})
+	}
+}
+
+// TestSetFixedManagerRoleRejectsRoleOutsideClosedSet drives the write path with a
+// role outside the closed set. TestIsFixedManagerRole below pins the predicate's
+// return value; this pins that setFixedManagerRole actually *acts* on it.
+//
+// That distinction is not academic. The guard shipped disabled once (`if false &&
+// !isFixedManagerRole(role)`, restored here): build, vet, golangci-lint and the
+// entire modules/user suite stayed green, because the only test touching the guard
+// asserted the predicate in isolation and never the handler that consumes it.
+//
+// Both production callers pass constants, so no real route can reach this. The
+// synthetic route is the point — it stands in for the next caller that forwards a
+// role it did not hard-code, which is the case the guard exists to fail closed on.
+//
+// The positive control is load-bearing, not decoration. The superAdmin gate at
+// setFixedManagerRole's top and the closed-set guard below it both end in
+// respondManagerForbidden, so they are indistinguishable on the wire: if the
+// caller token ever stopped resolving to superAdmin, every negative case would
+// still see 400 + err.shared.auth.forbidden and stay green while asserting
+// nothing — and the empty-role check could not tell either, because the target
+// starts with an empty role. The control proves the request actually reaches the
+// guard before any of that means anything.
+func TestSetFixedManagerRoleRejectsRoleOutsideClosedSet(t *testing.T) {
+	route, ctx, m := newManagerRouteOnly(t)
+
+	const (
+		callerToken  = "closed-set-guard-caller"
+		targetUID    = "closed-set-guard-target"
+		controlUID   = "closed-set-guard-control"
+		syntheticURL = "/v1/manager/test/%s/fixed-role?role=%s"
+	)
+	require.NoError(t, ctx.Cache().Set(ctx.GetConfig().Cache.TokenCachePrefix+callerToken,
+		"root-uid@root@"+string(wkhttp.SuperAdmin)))
+	for _, uid := range []string{targetUID, controlUID} {
+		require.NoError(t, NewDB(ctx).Insert(&Model{
+			UID:      uid,
+			Username: uid,
+			Name:     "Closed Set Guard " + uid,
+			ShortNo:  uid,
+			Status:   StatusEnable.Int(),
+		}))
+	}
+
+	synthetic := route.Group("/v1/manager/test", m.ctx.AuthMiddleware(route))
+	synthetic.PUT("/:uid/fixed-role", func(c *wkhttp.Context) {
+		m.setFixedManagerRole(c, c.Query("role"), errcode.ErrUserManagerRoleTargetIneligible, true)
+	})
+
+	doRequest := func(uid, role string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, fmt.Sprintf(syntheticURL, uid, role), nil)
+		req.Header.Set("token", callerToken)
+		route.ServeHTTP(w, req)
+		return w
+	}
+
+	// Positive control — an in-set role on the same route must get all the way
+	// through and persist. If this fails, the negative cases below prove nothing.
+	t.Run("control/in-set role reaches the write path", func(t *testing.T) {
+		w := doRequest(controlUID, appauth.ManagerRoleMarketAdmin)
+		require.Equal(t, http.StatusOK, w.Code,
+			"the harness must reach setFixedManagerRole's write path; body=%s", w.Body.String())
+
+		stored, err := NewDB(ctx).QueryRoleByUID(controlUID)
+		require.NoError(t, err)
+		require.Equal(t, appauth.ManagerRoleMarketAdmin, stored,
+			"an in-set role must actually be persisted")
+	})
+
+	// superAdmin is a promotion and "" a silent demotion — the two the guard's own
+	// doc comment names. The other two cover a neighbouring tier and a role string
+	// that does not exist yet. Each runs against a target whose role is still empty,
+	// so the guard is the only thing that can refuse them.
+	for _, role := range []string{string(wkhttp.SuperAdmin), string(wkhttp.Admin), "", "future-role"} {
+		t.Run("role="+role, func(t *testing.T) {
+			w := doRequest(targetUID, role)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code,
+				"forbidden is pinned to wire 400 (D14); body=%s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden",
+				"must be refused for the role reason, not some other failure")
+
+			stored, err := NewDB(ctx).QueryRoleByUID(targetUID)
+			require.NoError(t, err)
+			assert.Emptyf(t, stored, "guard must not let %q reach user.role", role)
 		})
 	}
 }
