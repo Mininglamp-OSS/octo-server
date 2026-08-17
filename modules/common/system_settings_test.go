@@ -767,6 +767,20 @@ func TestSystemSettings_DocsEnabled_DBTrueWins(t *testing.T) {
 	assert.True(t, s.DocsEnabled(), "DB true -> docs module shown")
 }
 
+func TestSystemSettings_MailEnabled_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.False(t, s.MailEnabled(), "DB empty -> Agent Mail module hidden by default")
+}
+
+func TestSystemSettings_MailEnabled_DBTrueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("mail", "enabled", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.True(t, s.MailEnabled(), "DB true -> Agent Mail module shown")
+}
+
 func TestSystemSettings_DriveEnabled_DefaultsFalse(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 

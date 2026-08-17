@@ -130,6 +130,13 @@ func TestManagerSystemSetting_GetReturnsEffectiveValues(t *testing.T) {
 	assert.Equal(t, "", got.Value)
 	assert.Equal(t, "0", got.EffectiveValue, "yaml false → effective_value=\"0\"")
 
+	// Agent Mail display gate is part of the manager-configurable schema and
+	// stays off until explicitly enabled.
+	got = byKey["mail.enabled"]
+	assert.False(t, got.Configured)
+	assert.Equal(t, "", got.Value)
+	assert.Equal(t, "0", got.EffectiveValue)
+
 	// Unconfigured string: yaml default surfaces in effective_value.
 	got = byKey["support.email"]
 	assert.False(t, got.Configured)

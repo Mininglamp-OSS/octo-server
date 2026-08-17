@@ -1336,6 +1336,14 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// MailEnabled reports whether clients should surface the Agent Mail module.
+// This is a presentation toggle only: Agent Mail authorization and access
+// control remain enforced by octo-server and octo-mail. Default false so the
+// entry is exposed only after an operator enables system_setting mail.enabled.
+func (s *SystemSettings) MailEnabled() bool {
+	return s.getBool("mail", "enabled", false)
+}
+
 // DocsSearchEnabled reports whether clients should surface cloud-doc full-text
 // search. Decoupled from DocsEnabled: the search endpoint is provided
 // independently by octo-docs-backend and may land later than the docs module
