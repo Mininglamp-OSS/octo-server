@@ -40,10 +40,10 @@ func TestManagerCapabilities(t *testing.T) {
 			t.Errorf("superAdmin must have capability %q", k)
 		}
 		if admin[k] {
-			t.Errorf("admin must NOT have superAdmin-only capability %q", k)
+			t.Errorf("admin must NOT have above-admin-tier capability %q", k)
 		}
 		if reader[k] {
-			t.Errorf("dashboardReader must NOT have superAdmin-only capability %q", k)
+			t.Errorf("dashboardReader must NOT have above-admin-tier capability %q", k)
 		}
 	}
 	for _, k := range adminTier {

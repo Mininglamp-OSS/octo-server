@@ -20,9 +20,10 @@ const ManagerRoleDashboardReader = "dashboardReader"
 // per resource; each group that admits this role opts into it explicitly, and a
 // group registered without it stays superAdmin-only. Both sides must agree: a
 // capability advertised here that marketplace does not admit renders the page
-// and then 403s every call behind it.
+// and then 403s every call behind it. The marketplace half is octo-marketplace#55
+// (per-resource gating) and #56 (admitting this role on the Expert Market groups).
 //
-// Before granting this to anyone, four things are worth knowing:
+// Before granting this to anyone, five things are worth knowing:
 //
 //   - It is a publishing authority, not a read-mostly editor. A holder can
 //     create, edit and delete the public Skills, system MCPs and experts that
@@ -33,8 +34,16 @@ const ManagerRoleDashboardReader = "dashboardReader"
 //   - Do not DEPLOY this service before octo-marketplace has the matching gate
 //     live. The capabilities are computed per request from CanAdminMarketplace,
 //     so every account already holding the role picks up the advertised surface
-//     at deploy — withholding new grants does not narrow the blast radius. The
-//     affected population is fixed at release time, not at grant time.
+//     at deploy — withholding new grants does not narrow the blast radius, and
+//     the population that gains it at deploy is fixed at release time. (Later
+//     grants do of course extend it; the point is that deploy order, not grant
+//     policy, is the lever for the accounts that already hold the role.)
+//   - A GRANT DOES NOT REACH MARKETPLACE UNTIL THE HOLDER RE-AUTHENTICATES.
+//     Mirror image of the revoke trap below, same cause: /v1/manager/me reads the
+//     live role through the parser's RoleResolver, while marketplace reads the
+//     token snapshot through /v1/auth/verify. So granting this to someone with an
+//     open console session makes the menu appear immediately and every call
+//     behind it 403 until they log out and back in. Have them re-login.
 //   - REVOKING THE ROLE DOES NOT CUT OFF MARKET ACCESS. Revoke the session too.
 //     Marketplace resolves callers through /v1/auth/verify, which answers from
 //     tokenValidator.Validate — the role snapshotted into the session token at
