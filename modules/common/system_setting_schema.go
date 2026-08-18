@@ -273,6 +273,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
 
+	// Agent Mail 模块展示开关。默认关闭；部署完成 octo-mail 与网关配置后由管理台切
+	// mail.enabled 放量。仅控制客户端入口展示，不替代 Agent Mail 既有鉴权。
+	// 经 GET /v1/common/appconfig 的 mail_on 下发给客户端。
+	{Category: "mail", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示 Agent Mail 模块入口（默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MailEnabled()) }},
+
 	// docs 全文搜索展示开关，与 docs.enabled 解耦：搜索端点由 octo-docs-backend #131
 	// 独立提供，可晚于 docs 模块本体上线。默认关闭；上线且索引灰度完成后由管理台
 	// 切 docs.search_enabled 放量。仅表达展示策略，不承担任何服务端鉴权（搜索鉴权在

@@ -399,6 +399,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
 			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 			DriveOn:                cn.systemSettings.DriveEnabled(),
+			MailOn:                 cn.systemSettings.MailEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
@@ -452,6 +453,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
 		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 		DriveOn:                cn.systemSettings.DriveEnabled(),
+		MailOn:                 cn.systemSettings.MailEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
@@ -852,6 +854,12 @@ type appConfigResp struct {
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DriveOn bool `json:"drive_on"`
 
+	// MailOn 告知客户端是否展示 Agent Mail 模块入口。值来源于 system_setting
+	// mail.enabled，默认 false。该字段只表达展示策略，不替代 octo-server 网关及
+	// octo-mail 的身份、Space 和邮箱权限校验。两个 appconfig 分支均下发该字段，
+	// 避免 app_config.version 缓存阻止开关及时生效。
+	MailOn bool `json:"mail_on"`
+
 	// dmloop.enabled / dmpersonal.enabled；默认 false —— loop(回路)与「我的/运行时」入口在
 	// 后端服务就绪前先隐藏,上线后由管理台切对应 system_setting 灰度放开。两者分开:
 	// 「我的」将重设计脱离 loop、可独立放量。只表达展示策略,不承担服务端鉴权。与 app_config.version
@@ -865,7 +873,6 @@ type appConfigResp struct {
 	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
 	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
 	TrackingEnabled bool `json:"tracking_enabled"`
-
 
 	// MessageReaction is the deployment-wide default capability for ordinary
 	// Web/iOS/Android clients. It is intentionally identity-agnostic because

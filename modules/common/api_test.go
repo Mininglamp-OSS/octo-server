@@ -937,6 +937,7 @@ func TestGetAppConfig_DocsSearchOn_OnVersionShortCircuit(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
 }
+
 // reloads the shared snapshot. Generic sibling of setDocsEnabledSetting for the
 // dmloop / dmpersonal launch flags. Call AFTER cleanAllTablesAndReloadSettings.
 func setModuleEnabledSetting(t *testing.T, ctx *config.Context, category string, enabled bool) {
@@ -1071,7 +1072,6 @@ func TestGetAppConfig_TrackingEnabled_OnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"tracking_enabled":true`)
 }
 
-
 // 客户端据此隐藏网盘(drive)模块入口（独立部署的 octo-drive 上线前）。
 func TestGetAppConfig_DriveOn_DefaultFalse(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
@@ -1120,6 +1120,53 @@ func TestGetAppConfig_DriveOn_OnVersionShortCircuit(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"drive_on":true`)
+}
+
+// Agent Mail 展示开关默认关闭，客户端据此隐藏邮件入口。
+func TestGetAppConfig_MailOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":false`)
+}
+
+// system_setting mail.enabled=true 后，appconfig 下发 mail_on=true。
+func TestGetAppConfig_MailOn_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "mail", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":true`)
+}
+
+// version 短路分支也必须下发实时 mail_on，避免 app_config.version 缓存阻止开关生效。
+func TestGetAppConfig_MailOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "mail", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":true`)
 }
 
 // setStickerUploadLimitsSettings upserts the three sticker upload knobs
