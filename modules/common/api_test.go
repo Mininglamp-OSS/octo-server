@@ -1256,3 +1256,71 @@ func TestGetAppConfig_StickerUploadLimits_OnVersionShortCircuit(t *testing.T) {
 	body := w.Body.String()
 	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":3072,"max_dimension":900,"allowed_formats":[".png",".jpg"]}`)
 }
+
+// appconfig 必须下发 octo_assistant_uids:env 未设时返回空数组(不是 null,前端
+// Array.isArray 判断一致)。前端据此判别 octo_assistant_opened vs app_opened。
+func TestGetAppConfig_OctoAssistantUIDs_DefaultEmpty(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"octo_assistant_uids":[]`)
+}
+
+// env DM_OCTO_ASSISTANT_UIDS 设值后 appconfig 下发解析后的 UID 数组。
+func TestGetAppConfig_OctoAssistantUIDs_EnvSet(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-octo-1,uid-octo-2")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"octo_assistant_uids":["uid-octo-1","uid-octo-2"]`)
+}
+
+// env 含空串(连续逗号/前后空格)时过滤掉空串,只下发有效 UID。
+func TestGetAppConfig_OctoAssistantUIDs_FiltersEmpty(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-1,, uid-2 ,")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"octo_assistant_uids":["uid-1","uid-2"]`)
+}
+
+// version 短路分支同样要下发 octo_assistant_uids:UID 列表需与 app_config.version
+// 解耦,避免运维调整后老客户端命中版本短路而继续用旧值(同 tracking_enabled)。
+func TestGetAppConfig_OctoAssistantUIDs_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-octo-1")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"octo_assistant_uids":["uid-octo-1"]`)
+}
