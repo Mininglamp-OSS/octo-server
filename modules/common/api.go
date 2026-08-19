@@ -381,6 +381,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 	// 后者是收敛后的真源 key（与 octo-web ChannelSearch、octo-admin messages_search
 	// 命名一致）。两个分支共用同一计算结果，避免 Resolve 被调用多次。
 	searchEnabled := searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled()
+	octoAssistantUIDs := parseOctoAssistantUIDs()
 	messageReaction := buildMessageReactionCapability(
 		cn.systemSettings.MessageReactionReadEnabled(),
 		cn.systemSettings.MessageReactionWriteEnabled(),
@@ -403,6 +404,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+			OctoAssistantUIDs:      octoAssistantUIDs,
 			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
 			// 也能立刻拿到最新值。
@@ -457,6 +459,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+		OctoAssistantUIDs:      octoAssistantUIDs,
 		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
@@ -477,6 +480,29 @@ func buildStickerUploadLimitsResp(s *SystemSettings) stickerUploadLimitsResp {
 		MaxDimension:   s.StickerUploadMaxDimension(),
 		AllowedFormats: s.StickerUploadAllowedFormats(),
 	}
+}
+
+// parseOctoAssistantUIDs 从 env DM_OCTO_ASSISTANT_UIDS 解析 Octo Assistant UID
+// 列表。逗号分隔,过滤空串。env 未设或为空时返回空切片(不是 nil,保证 JSON
+// 序列化为 [] 而非 null,前端 Array.isArray 判断一致)。
+//
+// 与 DM_OIDC_* 系列 env 同形态:运维在部署清单里配 UID 列表,后端作为单一真源
+// 通过 appconfig 下发,前端据此判别 octo_assistant_opened vs app_opened 事件。
+func parseOctoAssistantUIDs() []string {
+	raw := os.Getenv("DM_OCTO_ASSISTANT_UIDS")
+	if raw == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // oidcProviders 返回 OIDC provider 元数据数组,让前端不再硬编码 provider id/name/authorize_path。
@@ -873,6 +899,16 @@ type appConfigResp struct {
 	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
 	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
 	TrackingEnabled bool `json:"tracking_enabled"`
+
+	// OctoAssistantUIDs 下发 Octo Assistant 的 UID 列表，供前端判别当前打开的
+	// 应用 bot 是否为 Octo Assistant（YUJ-277 / octo-dap S3 埋点）。前端根据此
+	// 列表决定发 octo_assistant_opened 还是 app_opened 事件。
+	//
+	// 来源：env DM_OCTO_ASSISTANT_UIDS（逗号分隔），解析时过滤空串。默认 []
+	// （env 未设或为空）。与 app_config.version 解耦的原因同 TrackingEnabled：
+	// 运维调整 UID 列表后老客户端命中 version 短路分支也必须拿到最新值，故两个
+	// 分支都下发。
+	OctoAssistantUIDs []string `json:"octo_assistant_uids"`
 
 	// MessageReaction is the deployment-wide default capability for ordinary
 	// Web/iOS/Android clients. It is intentionally identity-agnostic because
