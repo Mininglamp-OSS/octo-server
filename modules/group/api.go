@@ -707,6 +707,7 @@ func (g *Group) avatarPalette(c *wkhttp.Context) {
 
 func (g *Group) avatarUpload(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
+	loginName := c.GetLoginName()
 	groupNo := c.Param("group_no")
 	if groupNo == "" {
 		respondGroupRequestInvalid(c, "group_no")
@@ -763,21 +764,19 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	// 发送群头像更新命令
-	err = g.ctx.SendCMD(config.MsgCMDReq{
+	// 落库已成功：系统消息与 CMD 都是 best-effort，失败不能让客户端重传已成功的上传。
+	if err := sendGroupAvatarChangedMessage(g.ctx, groupNo, loginUID, loginName); err != nil {
+		g.Error("发送群头像变更系统消息失败！", zap.String("groupNo", groupNo), zap.Error(err))
+	}
+	if err := g.ctx.SendCMD(config.MsgCMDReq{
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		CMD:         common.CMDGroupAvatarUpdate,
 		Param: map[string]interface{}{
 			"group_no": groupNo,
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		g.Error("发送群头像更新命令失败！", zap.String("groupNo", groupNo), zap.Error(err))
-		// The avatar object and DB version are already committed; the IM
-		// notification is best-effort so clients do not retry a successful upload.
-		c.ResponseOK()
-		return
 	}
 	c.ResponseOK()
 }
