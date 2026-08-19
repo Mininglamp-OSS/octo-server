@@ -76,6 +76,10 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 		strings.TrimSpace(result.RequesterUID) == "" {
 		return errors.New("notify: terminal docs decision is missing requester_uid")
 	}
+	// The mutator addresses a DM by the sender's peer, which is what the ingress
+	// now stamps into event.ChannelID. This substitution is therefore a no-op for
+	// freshly enqueued events and is kept for events that were queued before the
+	// ingress was corrected, which still name the sending bot itself.
 	channelID := event.ChannelID
 	if event.ChannelType == common.ChannelTypePerson.Uint8() {
 		if strings.TrimSpace(event.OperatorUID) == "" {

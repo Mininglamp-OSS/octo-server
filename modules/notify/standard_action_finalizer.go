@@ -62,6 +62,10 @@ func (f *StandardActionFinalizer) Finalize(ctx context.Context, event cardaction
 	if err != nil {
 		return err
 	}
+	// The mutator addresses a DM by the sender's peer, which is what the ingress
+	// now stamps into event.ChannelID. This substitution is therefore a no-op for
+	// freshly enqueued events and is kept for events that were queued before the
+	// ingress was corrected, which still name the sending bot itself.
 	channelID := event.ChannelID
 	if event.ChannelType == common.ChannelTypePerson.Uint8() {
 		if strings.TrimSpace(event.OperatorUID) == "" {

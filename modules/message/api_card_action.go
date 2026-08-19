@@ -252,16 +252,33 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
+	// D5 频道语义：event 里的 channel_id 是**消费方（卡片 sender）视角**的 API 层
+	// 频道标识，与 /v1/bot/sendMessage 的 channel_id 同义 —— DM 取对端用户 UID。
+	// 请求里的 channel_id 是**操作者视角**的对端（= bot 自己），直接回显会把 bot
+	// 自己的 UID 当成会话标识发回给 bot，令按 channel_id 认卡的消费方判定 mismatch
+	// 而丢弃点击。group/community topic 的标识与视角无关，原样透传。存储行沿用 fake
+	// id 编码，此处不泄漏。
+	eventChannelID, resolved := cardActionConsumerChannelID(msgM, req.ChannelID, loginUID)
+	if !resolved {
+		// 存储行自相矛盾（person 频道的 sender 不是会话双方之一）：没有正确的对端可
+		// 报，宁可拒绝也不编一个。归并到单一 invalid（防枚举），真实原因只进日志。
+		m.releaseCardClaim(idemKey)
+		m.Error("person 卡片存储行的 sender 不属于会话双方,无法解析对端",
+			zap.String("messageID", req.MessageID), zap.String("fromUID", msgM.FromUID),
+			zap.String("channelID", req.ChannelID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
 	// D5 投递 card_action（event_data 形状由 brief 冻结：只许增字段）。
 	//   - data：匹配 Action.Submit 的作者静态对象，从生效帧提取（D11，仅当声明了
 	//     data 才置键）—— trusted-as-authored，不可伪造。
 	//   - inputs：D11 已 shape-checked 的用户输入（内容仍不可信）。
 	//   - client_token：D4 关联 ID —— 消费方不得当作幂等身份，bot 侧幂等按 event_id。
-	//   - channel 字段回显请求值 —— D3 ①已证明与存储行一致，且这是 API 层频道
-	//     标识（person 频道 = 对端 uid），不泄漏内部 fake id 编码。
+	//   - channel_type 回显请求值 —— D3 ①已证明与存储行一致。
 	eventData := map[string]interface{}{
 		"message_id":   req.MessageID,
-		"channel_id":   req.ChannelID,
+		"channel_id":   eventChannelID,
 		"channel_type": req.ChannelType,
 		"action_id":    req.ActionID,
 		"inputs":       req.Inputs,
@@ -286,7 +303,7 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		Owner:       owner,
 		ActionType:  actionType,
 		MessageID:   req.MessageID,
-		ChannelID:   req.ChannelID,
+		ChannelID:   eventChannelID,
 		ChannelType: req.ChannelType,
 		SpaceID:     stringEventField(eventData, "space_id"),
 		ActionID:    req.ActionID,
@@ -563,6 +580,48 @@ func (m *Message) releaseCardClaim(idemKey string) {
 func fakeChannelContainsUID(fakeChannelID, uid string) bool {
 	parts := strings.SplitN(fakeChannelID, "@", 2)
 	return len(parts) == 2 && (parts[0] == uid || parts[1] == uid)
+}
+
+// cardActionConsumerChannelID projects the click's channel identity into the
+// frame of reference of the event's consumer — the bot that sent the card.
+//
+// `channel_id` on the wire always names "the other end of this conversation, as
+// the holder of this identifier sees it". In a DM the two ends disagree about
+// what that string is: the clicking user sends the bot's UID because the bot is
+// *their* peer, while the bot needs the user's UID — the very value it passed to
+// `/v1/bot/sendMessage` when it sent the card. Echoing the request value shipped
+// the bot its own UID, so a consumer that recognizes its card by channel (the
+// OpenClaw plugin compares the callback against the channel it registered the
+// card session under) saw a mismatch and dropped every DM click.
+//
+// Group and community-topic ids name the channel itself rather than a peer, so
+// both ends already agree and the request value passes through untouched.
+//
+// The person branch reads only facts authorizeCardChannelMember already
+// established: the stored row was located by
+// GetFakeChannelIDWith(operatorUID, requestChannelID), so the conversation is
+// exactly that pair of UIDs, and the card's sender is one of the two. A sender
+// outside the pair means the stored row contradicts its own channel — there is
+// no correct peer to report, so it fails closed rather than inventing one
+// (`ok=false`). Deriving the peer from the pair rather than parsing the stored
+// fake id also keeps the internal `a@b` encoding out of the wire contract.
+func cardActionConsumerChannelID(msgM *messageModel, requestChannelID, operatorUID string) (string, bool) {
+	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
+		return requestChannelID, true
+	}
+	switch msgM.FromUID {
+	case requestChannelID:
+		// The ordinary DM: the operator clicked a card the bot they are talking
+		// to had sent, so the bot's peer is the operator.
+		return operatorUID, true
+	case operatorUID:
+		// A self-note DM (both ends are the same UID) also lands here, and
+		// returning the request value is right for it: the peer of the sender
+		// is the sender.
+		return requestChannelID, true
+	default:
+		return "", false
+	}
 }
 
 // authorizeCardChannelMember 执行卡片消息端点共享的 D3 ①②：anti-IDOR 频道绑定
