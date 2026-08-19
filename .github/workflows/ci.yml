@@ -212,12 +212,20 @@ jobs:
         # The client runs inside the service container rather than on the
         # runner. mysql:8.0 ships mysqladmin, so there is nothing to install
         # and no network dependency between the runner and a package mirror.
+        #
+        # Two probes, because the in-container ping alone would be a weaker gate
+        # than the runner-side client it replaced: it proves mysqld is up, but
+        # the Go tests connect from the runner to the published 127.0.0.1:3306,
+        # and a ping on the container's own loopback can pass while that mapping
+        # is not serving yet. The bash /dev/tcp probe covers the published port
+        # without reintroducing a client on the runner.
         env:
           MYSQL_CID: ${{ job.services.mysql.id }}
         run: |
           for _ in $(seq 1 30); do
-            if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent; then
-              echo "mysql ready"
+            if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent \
+              && timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306'; then
+              echo "mysql ready (server up, published port reachable)"
               exit 0
             fi
             sleep 2

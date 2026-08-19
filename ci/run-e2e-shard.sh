@@ -41,6 +41,21 @@ printf '  %s\n' "${packages[@]}"
 # MYSQL_CID / REDIS_CID are set by the workflow from `job.services.<name>.id`.
 # When they are absent the script falls back to local binaries, so running it
 # outside CI against a hand-started MySQL/Redis still works.
+#
+# In Actions that fallback would be a trap rather than a convenience: an absent
+# context property renders as the empty string with no error, so a service
+# rename or a step that forgets its `env:` block would silently select the
+# branch whose binaries CI no longer installs. Fail there instead, naming the
+# cause, rather than surfacing later as `redis-cli: command not found`.
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  for var in MYSQL_CID REDIS_CID; do
+    if [ -z "$(eval "printf '%s' \"\${$var:-}\"")" ]; then
+      echo "::error title=Missing service container id::$var is empty; the workflow must pass job.services.<name>.id" >&2
+      exit 1
+    fi
+  done
+fi
+
 mysql_exec() {
   if [ -n "${MYSQL_CID:-}" ]; then
     docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "$1"
@@ -49,11 +64,19 @@ mysql_exec() {
   fi
 }
 
+# `-e` is load-bearing, not decoration: redis-cli writes server error replies to
+# *stdout* and still exits 0, so the previous `redis-cli FLUSHALL >/dev/null`
+# swallowed the message and returned success. A write-blocking reply such as
+# MISCONF under runner disk pressure would have left the next package running
+# against un-flushed Redis, surfacing as an unrelated flaky failure. Verified on
+# redis 7.0.15: an error reply gives exit 0 bare and exit 1 with `-e`. The output
+# is kept (one `OK` per package) for the same reason -- a fully silenced step can
+# only be diagnosed by noticing a missing timestamp.
 redis_flush() {
   if [ -n "${REDIS_CID:-}" ]; then
-    docker exec "$REDIS_CID" redis-cli FLUSHALL >/dev/null
+    docker exec "$REDIS_CID" redis-cli -e FLUSHALL
   else
-    redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
+    redis-cli -h 127.0.0.1 -p 6379 -e FLUSHALL
   fi
 }
 
