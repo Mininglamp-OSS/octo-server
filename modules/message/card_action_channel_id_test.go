@@ -10,9 +10,10 @@ import (
 // sender uses. The DM row is the whole point: the two ends of a person channel
 // name each other, so echoing what the operator sent hands the bot its own UID.
 func TestCardActionConsumerChannelID(t *testing.T) {
+	// 合成 UID：不使用任何来自线上工单的真实 bot / 用户标识。
 	const (
-		botUID  = "ultraman_tiga_bot"
-		userUID = "825a777b"
+		botUID  = "bot_under_test"
+		userUID = "user_under_test"
 		other   = "another_user"
 	)
 	cases := []struct {
