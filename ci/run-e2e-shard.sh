@@ -49,7 +49,7 @@ printf '  %s\n' "${packages[@]}"
 # cause, rather than surfacing later as `redis-cli: command not found`.
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   for var in MYSQL_CID REDIS_CID; do
-    if [ -z "$(eval "printf '%s' \"\${$var:-}\"")" ]; then
+    if [ -z "${!var:-}" ]; then
       echo "::error title=Missing service container id::$var is empty; the workflow must pass job.services.<name>.id" >&2
       exit 1
     fi

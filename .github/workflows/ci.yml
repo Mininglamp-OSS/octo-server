@@ -222,9 +222,19 @@ jobs:
         env:
           MYSQL_CID: ${{ job.services.mysql.id }}
         run: |
+          # This is the first consumer of the id, so it has to be the one that
+          # names an unresolved one. A service rename empties the context
+          # property silently, and `docker exec "" ...` fails instantly, so
+          # without this the loop would burn its full 60s and then report
+          # "mysql did not become ready" — the wrong cause, which is the exact
+          # diagnose-the-symptom failure this lane was cleaned up to stop.
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
           for _ in $(seq 1 30); do
             if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent \
-              && timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306'; then
+              && timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306' 2>/dev/null; then
               echo "mysql ready (server up, published port reachable)"
               exit 0
             fi
@@ -253,7 +263,12 @@ jobs:
         # tracked upstream.
         env:
           MYSQL_CID: ${{ job.services.mysql.id }}
-        run: docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
+        run: |
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
+          docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
 
       - name: Wait for WuKongIM
         run: |
