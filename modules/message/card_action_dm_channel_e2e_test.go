@@ -74,6 +74,38 @@ func dmPeerCardResetRedis(t *testing.T, ctx *config.Context) *redis.Client {
 	return rds
 }
 
+// dmPeerCardEnsureAppBotTable 建出 card/action 的 sender 身份解析所依赖的 app_bot 表。
+//
+// botidentity.Resolver 用一条 SQL 同时 EXISTS 查 robot 和 app_bot（见
+// modules/botidentity/resolver.go），表缺失即整条查询报错、端点 fail-closed 回
+// "Failed to query message data."。而 app_bot 模块的迁移只在该模块被链接进测试
+// 二进制时才跑 —— 本包默认构建没有它（`_ "modules/app_bot"` 会形成
+// app_bot → bot_api → messages_search → message 的导入环），所以这里手建。
+//
+// 语句逐字取自 modules/app_bot/sql/20260505000001_app_bot_legacy01.sql（本身就带
+// IF NOT EXISTS）；解析器只读 uid/status/scope/space_id 四列。
+func dmPeerCardEnsureAppBotTable(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(`
+		CREATE TABLE IF NOT EXISTS app_bot (
+		  id           VARCHAR(40) PRIMARY KEY,
+		  uid          VARCHAR(40) UNIQUE NOT NULL,
+		  display_name VARCHAR(100) NOT NULL,
+		  description  VARCHAR(500) DEFAULT '',
+		  avatar       VARCHAR(200) DEFAULT '',
+		  scope        VARCHAR(20) NOT NULL DEFAULT 'platform' COMMENT 'platform or space',
+		  space_id     VARCHAR(40) DEFAULT NULL,
+		  status       TINYINT NOT NULL DEFAULT 0 COMMENT '0=draft 1=published 2=unpublished',
+		  token        VARCHAR(100) UNIQUE NOT NULL,
+		  created_by   VARCHAR(40) NOT NULL,
+		  created_at   DATETIME NOT NULL DEFAULT NOW(),
+		  updated_at   DATETIME NOT NULL DEFAULT NOW() ON UPDATE NOW(),
+		  INDEX idx_scope_status (scope, status),
+		  INDEX idx_space_status (space_id, status)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`).Exec()
+	require.NoError(t, err)
+}
+
 func dmPeerCardSeedBot(t *testing.T, ctx *config.Context, robotID string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql("insert into robot(robot_id,status) values(?,1)", robotID).Exec()
@@ -106,10 +138,15 @@ func dmPeerCardSeedMessage(t *testing.T, ctx *config.Context, messageID int64, f
 // 无关，保持原样回显。
 func TestCardActionDMChannelIDIsPeerUID(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
+	// modules/common 的 Route 在 module.Setup 里就要落加密私钥，缺 key 直接 panic。
+	// CI 在 job env 里给了同一个值；这里显式设置让本地 `go test ./modules/message/`
+	// 也能直接跑（t.Setenv 用例结束即还原）。
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 	rds := dmPeerCardResetRedis(t, ctx)
 
+	dmPeerCardEnsureAppBotTable(t, ctx)
 	dmPeerCardSeedBot(t, ctx, dmPeerCardBotUID)
 
 	click := func(body map[string]interface{}) *httptest.ResponseRecorder {
