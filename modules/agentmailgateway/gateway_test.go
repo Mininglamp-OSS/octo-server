@@ -239,6 +239,24 @@ func TestReadBoundedBodyRejectsOverflow(t *testing.T) {
 	}
 }
 
+func TestReadBoundedResponseBodyPreservesChunkedPayloadAndLimit(t *testing.T) {
+	payload := bytes.Repeat([]byte("r"), responseBufferChunkBytes+17)
+	buffered, length, err := readBoundedResponseBody(bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(buffered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if length != int64(len(payload)) || !bytes.Equal(got, payload) {
+		t.Fatalf("length=%d body length=%d", length, len(got))
+	}
+	if _, _, err := readBoundedResponseBody(bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, errBodyTooLarge) {
+		t.Fatalf("overflow error=%v", err)
+	}
+}
+
 func TestCopyBoundedBodyStreamsWithoutExceedingLimit(t *testing.T) {
 	var dst bytes.Buffer
 	if err := copyBoundedBody(&dst, strings.NewReader("123"), 3); err != nil {
@@ -315,8 +333,10 @@ func TestProxyStreamsSelfDelimitedUnknownLengthResponses(t *testing.T) {
 	}
 }
 
-func TestProxyRejectsUnknownLengthResponseForRealHTTP2Client(t *testing.T) {
+func TestProxyBuffersUnknownLengthResponseForRealHTTP2Client(t *testing.T) {
 	gateway := newTestGateway(t, "http://octo-mail.test", []byte(strings.Repeat("g", 32)), time.Now())
+	gateway.responseBodyBudget = semaphore.NewWeighted(maxResponseBytes)
+	gateway.responseBodyBudgetWait = 100 * time.Millisecond
 	gateway.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode:       http.StatusOK,
@@ -340,10 +360,126 @@ func TestProxyRejectsUnknownLengthResponseForRealHTTP2Client(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if response.ProtoMajor != 2 || response.StatusCode != http.StatusOK || string(body) != "complete" {
+		t.Fatalf("proto=%s status=%d body=%s", response.Proto, response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Length"); got != strconv.Itoa(len("complete")) {
+		t.Fatalf("Content-Length=%q", got)
+	}
+	release, err := gateway.acquireResponseBodyBudget(context.Background())
+	if err != nil {
+		t.Fatalf("successful response retained its buffering budget: %v", err)
+	}
+	release()
+}
+
+func TestProxyRejectsTruncatedUnknownLengthResponseForRealHTTP2Client(t *testing.T) {
+	gateway := newTestGateway(t, "http://octo-mail.test", []byte(strings.Repeat("g", 32)), time.Now())
+	gateway.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ProtoMajor:    2,
+			ContentLength: -1,
+			Body: &partialFailingReadCloser{
+				data: []byte("partial upstream body"),
+				err:  errors.New("truncated response"),
+			},
+		}, nil
+	})}
+	server := httptest.NewUnstartedServer(newProxyRouter(gateway, "user-a", "space-a"))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	response, err := server.Client().Get(server.URL + "/v1/mail-gateway/webapi/v0/mailboxes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if response.ProtoMajor != 2 || response.StatusCode != http.StatusBadGateway {
 		t.Fatalf("proto=%s status=%d body=%s", response.Proto, response.StatusCode, body)
 	}
 	assertErrorCode(t, body, "err.server.agent_mail_gateway.bad_response")
+	if bytes.Contains(body, []byte("partial upstream body")) {
+		t.Fatalf("partial upstream body leaked in error response: %s", body)
+	}
+}
+
+func TestProxyRejectsOversizedUnknownLengthResponseForRealHTTP2Client(t *testing.T) {
+	gateway := newTestGateway(t, "http://octo-mail.test", []byte(strings.Repeat("g", 32)), time.Now())
+	gateway.responseBodyBudget = semaphore.NewWeighted(maxResponseBytes)
+	gateway.responseBodyBudgetWait = 100 * time.Millisecond
+	gateway.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ProtoMajor:    2,
+			ContentLength: -1,
+			Body:          io.NopCloser(io.LimitReader(zeroReader{}, maxResponseBytes+1)),
+		}, nil
+	})}
+	server := httptest.NewUnstartedServer(newProxyRouter(gateway, "user-a", "space-a"))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	response, err := server.Client().Get(server.URL + "/v1/mail-gateway/webapi/v0/mailboxes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.ProtoMajor != 2 || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("proto=%s status=%d body=%s", response.Proto, response.StatusCode, body)
+	}
+	assertErrorCode(t, body, "err.server.agent_mail_gateway.bad_response")
+	release, err := gateway.acquireResponseBodyBudget(context.Background())
+	if err != nil {
+		t.Fatalf("failed response retained its buffering budget: %v", err)
+	}
+	release()
+}
+
+func TestProxyRejectsHTTP2BufferingWhenResponseBudgetIsUnavailable(t *testing.T) {
+	gateway := newTestGateway(t, "http://octo-mail.test", []byte(strings.Repeat("g", 32)), time.Now())
+	gateway.responseBodyBudget = semaphore.NewWeighted(maxResponseBytes)
+	gateway.responseBodyBudgetWait = 10 * time.Millisecond
+	if err := gateway.responseBodyBudget.Acquire(context.Background(), maxResponseBytes); err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.responseBodyBudget.Release(maxResponseBytes)
+	gateway.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ProtoMajor:    2,
+			ContentLength: -1,
+			Body:          failingReadCloser{err: errors.New("body must not be read without a budget")},
+		}, nil
+	})}
+	server := httptest.NewUnstartedServer(newProxyRouter(gateway, "user-a", "space-a"))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	response, err := server.Client().Get(server.URL + "/v1/mail-gateway/webapi/v0/mailboxes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.ProtoMajor != 2 || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("proto=%s status=%d body=%s", response.Proto, response.StatusCode, body)
+	}
+	assertErrorCode(t, body, "err.server.agent_mail_gateway.unavailable")
 }
 
 func TestProxyForwardsGzipResponseToHTTP2WithoutTransparentDecompression(t *testing.T) {
@@ -1142,6 +1278,33 @@ func TestUnknownLengthRequestReservesMaximumBodyBudget(t *testing.T) {
 	}
 }
 
+func TestResponseBufferingHasAggregateBudget(t *testing.T) {
+	gateway := &Gateway{
+		responseBodyBudget:     semaphore.NewWeighted(maxResponseBytes),
+		responseBodyBudgetWait: 10 * time.Millisecond,
+	}
+	release, err := gateway.acquireResponseBodyBudget(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := gateway.acquireResponseBodyBudget(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled acquire error=%v, want context.Canceled", err)
+	}
+	if _, err := gateway.acquireResponseBodyBudget(context.Background()); !errors.Is(err, errResponseBodyBudgetWait) {
+		t.Fatalf("bounded acquire error=%v, want errResponseBodyBudgetWait", err)
+	}
+
+	release()
+	releaseAfterWait, err := gateway.acquireResponseBodyBudget(context.Background())
+	if err != nil {
+		t.Fatalf("released response budget remained unavailable: %v", err)
+	}
+	releaseAfterWait()
+}
+
 func TestConnectionNominatedHeadersAreNotForwarded(t *testing.T) {
 	requestSource := http.Header{
 		"Connection":        []string{"Content-Type, X-Octo-Mailbox-ID"},
@@ -1176,16 +1339,18 @@ func newTestGateway(t *testing.T, upstreamURL string, secret []byte, now time.Ti
 		t.Fatal(err)
 	}
 	return &Gateway{
-		Log:                  log.NewTLog("AgentMailGatewayTest"),
-		cfg:                  gatewayConfig{upstream: parsed, secret: secret, timeout: 5 * time.Second},
-		client:               newGatewayHTTPClient(5 * time.Second),
-		now:                  func() time.Time { return now },
-		nonceSource:          bytes.NewReader(make([]byte, 16)),
-		largeRequestSlots:    make(chan struct{}, maxConcurrentLargeRequests),
-		largeRequestSlotWait: defaultLargeRequestSlotWait,
-		requestBodyBudget:    semaphore.NewWeighted(maxInFlightRequestBodyBytes),
-		provisionIdentity:    func(context.Context, string, string) error { return nil },
-		resolveLocalpart:     func(context.Context, string) (string, error) { return "test-user", nil },
+		Log:                    log.NewTLog("AgentMailGatewayTest"),
+		cfg:                    gatewayConfig{upstream: parsed, secret: secret, timeout: 5 * time.Second},
+		client:                 newGatewayHTTPClient(5 * time.Second),
+		now:                    func() time.Time { return now },
+		nonceSource:            bytes.NewReader(make([]byte, 16)),
+		largeRequestSlots:      make(chan struct{}, maxConcurrentLargeRequests),
+		largeRequestSlotWait:   defaultLargeRequestSlotWait,
+		requestBodyBudget:      semaphore.NewWeighted(maxInFlightRequestBodyBytes),
+		responseBodyBudget:     semaphore.NewWeighted(maxInFlightResponseBodyBytes),
+		responseBodyBudgetWait: defaultResponseBodyBudgetWait,
+		provisionIdentity:      func(context.Context, string, string) error { return nil },
+		resolveLocalpart:       func(context.Context, string) (string, error) { return "test-user", nil },
 	}
 }
 
