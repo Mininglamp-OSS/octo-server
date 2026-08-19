@@ -2030,6 +2030,12 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 		return errors.New("group not found or disbanded")
 	}
 
+	if avatarVisibleChange(groupModel, req) {
+		if err := sendGroupAvatarChangedMessage(s.ctx, req.GroupNo, req.OperatorUID, req.OperatorName); err != nil {
+			s.Error("send group avatar changed message failed", zap.String("group_no", req.GroupNo), zap.Error(err))
+		}
+	}
+
 	// 通知客户端刷新频道信息 → 重新拉取头像。
 	s.ctx.SendChannelUpdateToGroup(req.GroupNo)
 	if req.ClearUploadedAvatar {
@@ -2046,6 +2052,37 @@ func (s *Service) UpdateGroupAvatarCustom(req *UpdateGroupAvatarCustomServiceReq
 	}
 
 	return nil
+}
+
+func avatarVisibleChange(before *Model, req *UpdateGroupAvatarCustomServiceReq) bool {
+	if before == nil {
+		return false
+	}
+	uploadedBefore := before.IsUploadAvatar == 1
+	uploadedAfter := uploadedBefore && !req.ClearUploadedAvatar
+	if uploadedBefore != uploadedAfter {
+		return true
+	}
+	if uploadedAfter {
+		return false
+	}
+
+	textAfter := before.AvatarText
+	if req.AvatarText != nil {
+		textAfter = *req.AvatarText
+	}
+	colorAfter := before.AvatarColor
+	if req.SetAvatarColor {
+		colorAfter = req.AvatarColor
+	}
+	return textAfter != before.AvatarText || !avatarColorEqual(colorAfter, before.AvatarColor)
+}
+
+func avatarColorEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // ---------- Service internal helpers (thread sync, no thread package import) ----------
