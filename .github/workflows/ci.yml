@@ -199,41 +199,6 @@ jobs:
             go.sum
             .github/go-cache-key/e2e-test
 
-      - name: Install MySQL/Redis client tooling
-        # Bounded so a stuck apt cannot silently eat the job. Unbounded, this
-        # step consumed the full 30-minute budget of two shards on 2026-08-19
-        # while `Run E2E shard` never started, costing the whole matrix with
-        # zero tests executed. Five minutes is ~3x the observed healthy time
-        # (69-104s on the shards that completed that day).
-        timeout-minutes: 5
-        run: |
-          # mysql + redis-cli are needed below to reset the shared `test`
-          # database between Go packages; ubuntu-latest's preinstall set
-          # is not stable across runner image rolls so install fresh.
-          #
-          # Three guards, each for a failure this step hit unprotected:
-          #   - DPkg::Lock::Timeout: apt waits for the dpkg/apt lock *forever*
-          #     by default, and the hosted image runs unattended-upgrades on
-          #     boot. Losing that race is a hang, not an error, so it has to be
-          #     given a deadline rather than left to the step timeout.
-          #   - the retry loop: a lost lock or a mirror hiccup is transient and
-          #     self-heals in seconds; failing the shard for it wastes a full
-          #     re-run of the matrix.
-          #   - -q instead of -qq: the quieter form printed nothing at all, so
-          #     a stalled run gave no evidence of *which* half was stuck. Keep
-          #     enough output to tell update from install next time.
-          export DEBIAN_FRONTEND=noninteractive
-          for attempt in 1 2 3; do
-            if sudo apt-get -o DPkg::Lock::Timeout=60 update -q \
-              && sudo apt-get -o DPkg::Lock::Timeout=60 install -y -q mysql-client redis-tools; then
-              exit 0
-            fi
-            echo "::warning title=apt attempt ${attempt} failed::retrying" >&2
-            sleep $((attempt * 10))
-          done
-          echo "::error title=apt install failed::mysql-client/redis-tools unavailable after 3 attempts" >&2
-          exit 1
-
       - name: Wait for MySQL
         # mysql:8.0 defaults the server collation to utf8mb4_0900_ai_ci, but
         # we recreate the `test` database with utf8mb4_general_ci before
@@ -243,9 +208,15 @@ jobs:
         # the 8.0 default). Tables created without explicit COLLATE inherit
         # the database default; using general_ci keeps them aligned with
         # the rest of the schema and avoids "Illegal mix of collations".
+        #
+        # The client runs inside the service container rather than on the
+        # runner. mysql:8.0 ships mysqladmin, so there is nothing to install
+        # and no network dependency between the runner and a package mirror.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
         run: |
           for _ in $(seq 1 30); do
-            if mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent; then
+            if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent; then
               echo "mysql ready"
               exit 0
             fi
@@ -269,10 +240,12 @@ jobs:
         # plateaus near the observed peak (~300) and stays green.
         #
         # max_connections is a dynamic GLOBAL, so set it at runtime (root is
-        # available and mysql-client is installed above). This unblocks every
-        # package at once; the proper O(1) fix — idle-reap in octo-lib testutil
-        # — is tracked upstream.
-        run: mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
+        # available inside the service container). This unblocks every package
+        # at once; the proper O(1) fix — idle-reap in octo-lib testutil — is
+        # tracked upstream.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+        run: docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
 
       - name: Wait for WuKongIM
         run: |
@@ -323,6 +296,12 @@ jobs:
         # `t.Skip("OCTO migration TODO: ...issues/17")` marker in-source
         # — see issue #17 for the cleanup tracker. Grep for `OCTO migration
         # TODO` to find the suppressed tests.
+        #
+        # The per-package reset reaches mysql/redis through these container
+        # ids instead of runner-local clients; see ci/run-e2e-shard.sh.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+          REDIS_CID: ${{ job.services.redis.id }}
         run: ci/run-e2e-shard.sh "${{ matrix.shard }}" "${{ matrix.total }}"
 
   test:
