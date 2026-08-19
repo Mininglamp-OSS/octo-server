@@ -507,18 +507,28 @@ func readBoundedResponseBody(reader io.Reader, limit int64) (io.Reader, int64, e
 			chunkSize = remaining
 		}
 		chunk := make([]byte, int(chunkSize))
-		n, err := io.ReadFull(reader, chunk)
-		if n > 0 {
-			total += int64(n)
-			chunks = append(chunks, bytes.NewReader(chunk[:n]))
+		filled := 0
+		cleanEOF := false
+		for filled < len(chunk) {
+			n, err := reader.Read(chunk[filled:])
+			filled += n
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				return nil, 0, err
+			}
+			cleanEOF = true
+			break
 		}
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, 0, err
+		if filled > 0 {
+			total += int64(filled)
+			chunks = append(chunks, bytes.NewReader(chunk[:filled]))
 		}
 		if total > limit {
 			return nil, 0, errBodyTooLarge
 		}
-		if err != nil {
+		if cleanEOF {
 			return io.MultiReader(chunks...), total, nil
 		}
 	}

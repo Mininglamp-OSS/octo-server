@@ -1,6 +1,7 @@
 package agentmailgateway
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -255,6 +257,12 @@ func TestReadBoundedResponseBodyPreservesChunkedPayloadAndLimit(t *testing.T) {
 	if _, _, err := readBoundedResponseBody(bytes.NewReader(payload), int64(len(payload)-1)); !errors.Is(err, errBodyTooLarge) {
 		t.Fatalf("overflow error=%v", err)
 	}
+	if _, _, err := readBoundedResponseBody(&partialFailingReadCloser{
+		data: []byte("partial"),
+		err:  io.ErrUnexpectedEOF,
+	}, int64(len(payload))); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncation error=%v", err)
+	}
 }
 
 func TestCopyBoundedBodyStreamsWithoutExceedingLimit(t *testing.T) {
@@ -406,6 +414,67 @@ func TestProxyRejectsTruncatedUnknownLengthResponseForRealHTTP2Client(t *testing
 	assertErrorCode(t, body, "err.server.agent_mail_gateway.bad_response")
 	if bytes.Contains(body, []byte("partial upstream body")) {
 		t.Fatalf("partial upstream body leaked in error response: %s", body)
+	}
+}
+
+func TestProxyRejectsTruncatedChunkedUpstreamForRealHTTP2Client(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	upstreamDone := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			upstreamDone <- acceptErr
+			return
+		}
+		defer connection.Close()
+		reader := bufio.NewReader(connection)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				upstreamDone <- readErr
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, writeErr := io.WriteString(connection,
+			"HTTP/1.1 200 OK\r\n"+
+				"Content-Type: text/plain\r\n"+
+				"Transfer-Encoding: chunked\r\n"+
+				"Connection: close\r\n\r\n"+
+				"10\r\npartial upstream\r\n")
+		upstreamDone <- writeErr
+	}()
+
+	gateway := newTestGateway(t, "http://"+listener.Addr().String(), []byte(strings.Repeat("g", 32)), time.Now())
+	server := httptest.NewUnstartedServer(newProxyRouter(gateway, "user-a", "space-a"))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	response, err := server.Client().Get(server.URL + "/v1/mail-gateway/webapi/v0/mailboxes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.ProtoMajor != 2 || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("proto=%s status=%d body=%s", response.Proto, response.StatusCode, body)
+	}
+	assertErrorCode(t, body, "err.server.agent_mail_gateway.bad_response")
+	if bytes.Contains(body, []byte("partial upstream")) {
+		t.Fatalf("partial upstream body leaked in error response: %s", body)
+	}
+	if err := <-upstreamDone; err != nil {
+		t.Fatalf("truncated upstream: %v", err)
 	}
 }
 
