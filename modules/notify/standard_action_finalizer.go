@@ -62,10 +62,16 @@ func (f *StandardActionFinalizer) Finalize(ctx context.Context, event cardaction
 	if err != nil {
 		return err
 	}
-	// The mutator addresses a DM by the sender's peer, which is what the ingress
-	// now stamps into event.ChannelID. This substitution is therefore a no-op for
-	// freshly enqueued events and is kept for events that were queued before the
-	// ingress was corrected, which still name the sending bot itself.
+	// The mutator addresses a DM by the sender's peer. The ingress now stamps that
+	// same peer into event.ChannelID, so for a freshly enqueued event this rewrite
+	// lands on the value already there — but only while the clicker *is* the
+	// sender's peer, which is every reachable click today (a card's sender is a
+	// bot, and this endpoint needs a user login token). The projection also
+	// answers the inverse shape, sender-clicks-own-card, and there ChannelID is
+	// the other peer while OperatorUID is the sender: this rewrite would pick the
+	// wrong one. Do not read it as an unconditional no-op and delete it on that
+	// basis — it is still the fixup for events queued before the ingress was
+	// corrected, which name the sending bot itself.
 	channelID := event.ChannelID
 	if event.ChannelType == common.ChannelTypePerson.Uint8() {
 		if strings.TrimSpace(event.OperatorUID) == "" {

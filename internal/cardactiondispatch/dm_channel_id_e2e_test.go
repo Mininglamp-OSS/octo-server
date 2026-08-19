@@ -54,7 +54,51 @@ const (
 
 	dmPeerDMMessageID    int64 = 9601
 	dmPeerGroupMessageID int64 = 9602
+
+	// 内部路由那条用例自己的一套身份：注册的 (sender_uid, owner, action_type) 三元组
+	// 决定这次点击走可靠队列而不是 bot 拉取队列。刻意与上面的 bot 分开 —— 注册过路由的
+	// sender 提交未知 owner/action 会被 fail-closed 拒绝，共用会污染 DM/群两个子用例。
+	dmPeerRouteBotUID           = "bot_dm_peer_route"
+	dmPeerRouteActionID         = "approve"
+	dmPeerRouteOwner            = "docs"
+	dmPeerRouteActionType       = "access_request.decision"
+	dmPeerRouteMessageID  int64 = 9603
+
+	dmPeerQueuePrefix = "test:cardaction:dm_peer_channel_id"
+	dmPeerRouteSecret = "0123456789abcdef0123456789abcdef"
 )
+
+// dmPeerQueueSuffixes 是 RedisQueue 的固定 key 后缀（见 queue.go 的 queueKeys 构造）。
+// 前缀本用例独占，所以可以逐个精确删除，不必扫 keyspace。
+var dmPeerQueueSuffixes = []string{
+	"ready", "leased", "payload", "attempts", "tokens",
+	"dlq", "dlq_payload", "dlq_meta", "route_missing_since",
+}
+
+// dmPeerRoutedCardEnvelope 的 Submit.data 带 owner/action_type，用来命中注册的路由。
+func dmPeerRoutedCardEnvelope(t *testing.T) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]interface{}{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"profile":      cardmsg.ProfileV2,
+		"plain":        "文档访问申请",
+		"space_id":     "space-dm-peer",
+		"card": map[string]interface{}{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []interface{}{map[string]interface{}{"type": "TextBlock", "text": "文档访问申请"}},
+			"actions": []interface{}{map[string]interface{}{
+				"type": "Action.Submit", "id": dmPeerRouteActionID, "title": dmPeerRouteActionID,
+				"data": map[string]interface{}{
+					"owner": dmPeerRouteOwner, "action_type": dmPeerRouteActionType,
+					"decision": "approve", "doc_id": "doc-1", "request_id": "request-1",
+				},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	return raw
+}
 
 // dmPeerCardEnvelope 一张最小 octo/v2 交互卡：单个 Action.Submit，无 Input。
 func dmPeerCardEnvelope(t *testing.T) []byte {
@@ -105,9 +149,15 @@ func dmPeerResetRedis(t *testing.T, rds *redis.Client) {
 	keys := []string{
 		"ratelimit:uid:" + testutil.UID,
 		"robotEvent:" + dmPeerBotUID,
+		"robotEvent:" + dmPeerRouteBotUID,
+		fmt.Sprintf("cardaction:%d:%s:%s", dmPeerRouteMessageID, dmPeerRouteActionID, testutil.UID),
 	}
 	for _, messageID := range []int64{dmPeerDMMessageID, dmPeerGroupMessageID} {
 		keys = append(keys, fmt.Sprintf("cardaction:%d:%s:%s", messageID, dmPeerActionID, testutil.UID))
+	}
+	// 上一轮跑剩的队列残留会让 Claim 认领到别的事件。
+	for _, suffix := range dmPeerQueueSuffixes {
+		keys = append(keys, dmPeerQueuePrefix+":{queue}:"+suffix)
 	}
 	require.NoError(t, rds.Del(keys...).Err())
 }
@@ -131,7 +181,8 @@ func TestCardActionDMChannelIDIsPeerUID(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	// modules/common 的 Route 在 module.Setup 里就要落加密私钥，缺 key 直接 panic。
 	// CI 在 job env 里给了同一个值；这里显式设置让本地也能直接跑。
-	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("OCTO_MASTER_KEY", dmPeerRouteSecret)
+	t.Setenv("OCTO_DM_PEER_CARD_ACTION_SECRET", dmPeerRouteSecret)
 	s, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 
@@ -142,8 +193,32 @@ func TestCardActionDMChannelIDIsPeerUID(t *testing.T) {
 	defer func() { _ = rds.Close() }()
 	dmPeerResetRedis(t, rds)
 
-	_, err := ctx.DB().InsertBySql("INSERT IGNORE INTO robot(robot_id,status) VALUES(?,1)", dmPeerBotUID).Exec()
+	for _, robotID := range []string{dmPeerBotUID, dmPeerRouteBotUID} {
+		_, err := ctx.DB().InsertBySql("INSERT IGNORE INTO robot(robot_id,status) VALUES(?,1)", robotID).Exec()
+		require.NoError(t, err)
+	}
+
+	// 注册一条内部 callback 路由，让最后那个子用例走可靠队列而不是 bot 拉取队列。
+	//
+	// Install 是按 ctx 存的，而 register.GetModules 用 sync.Once 把模块绑在**进程里第一次**
+	// NewTestServer 的那个 ctx 上。本包默认构建里这是唯一一个 NewTestServer 用例（其余
+	// e2e 都挂着 //go:build integration），所以这次 Install 一定落到 message 模块看得见的
+	// 那个 ctx。⚠️ 将来若给本包默认构建再加一个 NewTestServer 用例，两者会争这个 sync.Once，
+	// 到时得把服务安装挪到共享的 TestMain 里。
+	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
+		SenderUID: dmPeerRouteBotUID, Owner: dmPeerRouteOwner, ActionType: dmPeerRouteActionType,
+		URL: "https://internal.invalid/v1/card-actions/decide", SecretEnv: "OCTO_DM_PEER_CARD_ACTION_SECRET",
+	}}, func(string) string { return dmPeerRouteSecret })
 	require.NoError(t, err)
+	queue, err := cardactiondispatch.NewRedisQueue(rds, cardactiondispatch.QueueConfig{
+		Prefix:       dmPeerQueuePrefix,
+		LiveTTL:      ctx.GetConfig().Robot.MessageExpire,
+		DLQRetention: 30 * 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	service, err := cardactiondispatch.NewService(registry, queue, ctx)
+	require.NoError(t, err)
+	require.NoError(t, cardactiondispatch.Install(ctx, service))
 
 	// 两个助手都显式收 *testing.T：闭包捕获外层 t、却在 t.Run 子用例里调用时，require
 	// 失败会对**父** t 调 FailNow → 在子用例 goroutine 上 runtime.Goexit，子用例随即以
@@ -220,13 +295,42 @@ func TestCardActionDMChannelIDIsPeerUID(t *testing.T) {
 		assert.Equal(t, testutil.UID, event["operator_uid"])
 	})
 
-	// 内部 HMAC 回调那条出口：Event.ChannelID 由同一个 event_data 派生，这里把它钉死，
-	// 免得将来有人把两个出口拆回各自赋值、只改一处。
-	t.Run("internal dispatch event carries the same channel id", func(t *testing.T) {
-		event := cardactiondispatch.Event{
-			ChannelID: testutil.UID, ChannelType: common.ChannelTypePerson.Uint8(),
-		}
-		assert.Equal(t, testutil.UID, cardactiondispatch.DecisionRequestFromEvent(event).ChannelID,
-			"legacy DecisionRequest.channel_id 直通 Event.ChannelID")
+	// 内部 HMAC 回调那条出口。命中已注册路由的点击不进 bot 拉取队列，而是进
+	// cardactiondispatch 的可靠队列，legacy DecisionRequest.channel_id 与
+	// octo-card@1.0 的 card.channel_id 都由 Event.ChannelID 派生。这里断的是**真正
+	// 入队**的那个 Event —— 构造一个已经正确的 Event 字面量再断言字段被拷贝，是测不
+	// 到 ingress 的：把 api_card_action.go 的赋值改回 req.ChannelID，那种写法照样绿。
+	t.Run("internal dispatch route carries the peer uid", func(t *testing.T) {
+		dmChannel := common.GetFakeChannelIDWith(testutil.UID, dmPeerRouteBotUID)
+		dmPeerSeedCardMessage(t, ctx, dmPeerRouteMessageID, dmPeerRouteBotUID, dmChannel,
+			common.ChannelTypePerson.Uint8(), dmPeerRoutedCardEnvelope(t))
+
+		w := click(t, map[string]interface{}{
+			"message_id": fmt.Sprintf("%d", dmPeerRouteMessageID),
+			// 同样是操作者视角：对端 = bot 自己。
+			"channel_id":   dmPeerRouteBotUID,
+			"channel_type": common.ChannelTypePerson.Uint8(),
+			"action_id":    dmPeerRouteActionID, "client_token": "tok-dm-route",
+		})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		// 命中内部路由就不该同时进 bot 队列，否则同一次点击会被消费两遍。
+		botDepth, depthErr := rds.ZCard("robotEvent:" + dmPeerRouteBotUID).Result()
+		require.NoError(t, depthErr)
+		assert.Zero(t, botDepth, "命中内部路由的点击不应进 bot 事件队列")
+
+		lease, claimErr := queue.Claim(time.Now().Add(time.Second), time.Minute)
+		require.NoError(t, claimErr)
+		require.NotNil(t, lease, "内部队列应恰好收到这次点击")
+		assert.Equal(t, dmPeerRouteBotUID, lease.Event.SenderUID)
+		assert.Equal(t, testutil.UID, lease.Event.ChannelID,
+			"内部回调的 DM channel_id 同样是对端用户 UID，而不是 sender %s", dmPeerRouteBotUID)
+		assert.Equal(t, testutil.UID, lease.Event.OperatorUID)
+		// 两种 callback 线格式都由 Event.ChannelID 派生。
+		assert.Equal(t, testutil.UID, cardactiondispatch.DecisionRequestFromEvent(lease.Event).ChannelID,
+			"legacy DecisionRequest.channel_id")
+
+		_, ackErr := queue.Ack(lease.Event.EventID, lease.Token)
+		require.NoError(t, ackErr)
 	})
 }

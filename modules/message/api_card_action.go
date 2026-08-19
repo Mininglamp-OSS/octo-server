@@ -307,14 +307,16 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		Owner:      owner,
 		ActionType: actionType,
 		MessageID:  req.MessageID,
-		// channel_id / space_id 都从上面那张 event_data 里取,而不是各自再赋一次值。
 		// 两个出口（bot 拉取队列的 event_data、内部 HMAC 回调的 Event）必须报同一个
-		// 频道标识;写成两处独立赋值,改了一处漏另一处就会让两条投递路径悄悄分叉,而
-		// 内部编排的 e2e 挂着 //go:build integration、CI 从不执行,分叉不会被发现。
-		// 让内部事件从 event_data 派生,一次改动同时作用于两条路径,默认构建里那条
-		// DM 契约用例（internal/cardactiondispatch/dm_channel_id_e2e_test.go）也就
-		// 同时守住了两边。
-		ChannelID:   stringEventField(eventData, "channel_id"),
+		// 频道标识。这里直接用上面那个已定型的 eventChannelID,而不是从 event_data
+		// 里回捞:同一个变量、编译期有类型,改 key 名或改类型都不会静默变成空串——
+		// RedisQueue.Enqueue 只校验 EventID/SenderUID/Owner/ActionType,空 channel
+		// 会一路送进 HMAC 回调。两条路径不分叉由测试来保:
+		// internal/cardactiondispatch/dm_channel_id_e2e_test.go 里 DM 断的是 bot
+		// 队列的 event_data,内部路由那条断的是真正入队的 Event.ChannelID,任一处
+		// 改回 req.ChannelID 都会红。
+		// （space_id 仍走 event_data,因为那个键是有条件写入的。）
+		ChannelID:   eventChannelID,
 		ChannelType: req.ChannelType,
 		SpaceID:     stringEventField(eventData, "space_id"),
 		ActionID:    req.ActionID,
