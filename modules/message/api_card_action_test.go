@@ -290,7 +290,6 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 	// DM 的 channel_id 是**消费方（bot）视角**的对端 = 操作者 UID，与 bot 发这张卡时
 	// /v1/bot/sendMessage 用的 channel_id 同义；绝不是 bot 自己的 UID。
 	assert.Equal(t, testutil.UID, ev.EventData["channel_id"])
-	assert.NotEqual(t, cardActionBotUID, ev.EventData["channel_id"])
 	assert.Equal(t, float64(common.ChannelTypePerson.Uint8()), ev.EventData["channel_type"])
 	assert.Equal(t, "approve_btn", ev.EventData["action_id"])
 	assert.Equal(t, testutil.UID, ev.EventData["operator_uid"])

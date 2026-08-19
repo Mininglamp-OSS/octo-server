@@ -93,6 +93,28 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
+	// D5 频道语义：event 里的 channel_id 是**消费方（卡片 sender）视角**的 API 层
+	// 频道标识，与 /v1/bot/sendMessage 的 channel_id 同义 —— DM 取对端用户 UID。
+	// 请求里的 channel_id 是**操作者视角**的对端（= bot 自己），直接回显会把 bot
+	// 自己的 UID 当成会话标识发回给 bot，令按 channel_id 认卡的消费方判定 mismatch
+	// 而丢弃点击。group/community topic 的标识与视角无关，原样透传。存储行沿用 fake
+	// id 编码，此处不泄漏。
+	//
+	// 位置：紧跟 ①②（频道绑定 + 成员资格）—— 这是纯投影而非校验，输入只有存储行、
+	// 请求频道、操作者，三者到此已全部定型。放在 D4 claim 之前，是因为它的拒绝完全
+	// 由请求决定（重试必然同样拒），压在 claim 后会让每次重试白付一次 Redis
+	// claim + 补偿释放。
+	eventChannelID, resolved := cardActionConsumerChannelID(msgM, req.ChannelID, loginUID)
+	if !resolved {
+		// 存储行自相矛盾（person 频道的 sender 不是会话双方之一）：没有正确的对端可
+		// 报，宁可拒绝也不编一个。归并到单一 invalid（防枚举），真实原因只进日志。
+		m.Error("person 卡片存储行的 sender 不属于会话双方,无法解析对端",
+			zap.String("messageID", req.MessageID), zap.String("fromUID", msgM.FromUID),
+			zap.String("channelID", req.ChannelID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
 	// D3 ③sender 必须是当前有效 bot 身份（layer (c)）：robot.status=1 或
 	// app_bot.status=1。这里每次首击都实时解析，不使用展示缓存，确保 App Bot
 	// unpublish/revoke 立即阻止副作用。iwh_ webhook 没有事件消费端、人类发送者也
@@ -252,24 +274,6 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
-	// D5 频道语义：event 里的 channel_id 是**消费方（卡片 sender）视角**的 API 层
-	// 频道标识，与 /v1/bot/sendMessage 的 channel_id 同义 —— DM 取对端用户 UID。
-	// 请求里的 channel_id 是**操作者视角**的对端（= bot 自己），直接回显会把 bot
-	// 自己的 UID 当成会话标识发回给 bot，令按 channel_id 认卡的消费方判定 mismatch
-	// 而丢弃点击。group/community topic 的标识与视角无关，原样透传。存储行沿用 fake
-	// id 编码，此处不泄漏。
-	eventChannelID, resolved := cardActionConsumerChannelID(msgM, req.ChannelID, loginUID)
-	if !resolved {
-		// 存储行自相矛盾（person 频道的 sender 不是会话双方之一）：没有正确的对端可
-		// 报，宁可拒绝也不编一个。归并到单一 invalid（防枚举），真实原因只进日志。
-		m.releaseCardClaim(idemKey)
-		m.Error("person 卡片存储行的 sender 不属于会话双方,无法解析对端",
-			zap.String("messageID", req.MessageID), zap.String("fromUID", msgM.FromUID),
-			zap.String("channelID", req.ChannelID), zap.String("uid", loginUID))
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-		return
-	}
-
 	// D5 投递 card_action（event_data 形状由 brief 冻结：只许增字段）。
 	//   - data：匹配 Action.Submit 的作者静态对象，从生效帧提取（D11，仅当声明了
 	//     data 才置键）—— trusted-as-authored，不可伪造。
@@ -299,11 +303,18 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	}
 	owner, actionType := cardActionRouteMetadata(actionData)
 	eventID, err := m.enqueueCardAction(msgM.FromUID, owner, actionType, eventData, cardactiondispatch.Event{
-		SenderUID:   msgM.FromUID,
-		Owner:       owner,
-		ActionType:  actionType,
-		MessageID:   req.MessageID,
-		ChannelID:   eventChannelID,
+		SenderUID:  msgM.FromUID,
+		Owner:      owner,
+		ActionType: actionType,
+		MessageID:  req.MessageID,
+		// channel_id / space_id 都从上面那张 event_data 里取,而不是各自再赋一次值。
+		// 两个出口（bot 拉取队列的 event_data、内部 HMAC 回调的 Event）必须报同一个
+		// 频道标识;写成两处独立赋值,改了一处漏另一处就会让两条投递路径悄悄分叉,而
+		// 内部编排的 e2e 挂着 //go:build integration、CI 从不执行,分叉不会被发现。
+		// 让内部事件从 event_data 派生,一次改动同时作用于两条路径,默认构建里那条
+		// DM 契约用例（internal/cardactiondispatch/dm_channel_id_e2e_test.go）也就
+		// 同时守住了两边。
+		ChannelID:   stringEventField(eventData, "channel_id"),
 		ChannelType: req.ChannelType,
 		SpaceID:     stringEventField(eventData, "space_id"),
 		ActionID:    req.ActionID,
@@ -605,6 +616,15 @@ func fakeChannelContainsUID(fakeChannelID, uid string) bool {
 // no correct peer to report, so it fails closed rather than inventing one
 // (`ok=false`). Deriving the peer from the pair rather than parsing the stored
 // fake id also keeps the internal `a@b` encoding out of the wire contract.
+//
+// This deliberately does not reuse common.GetToChannelIDWithFakeChannelID, the
+// flip used on the read paths. That helper fails open twice over: a uid outside
+// the pair returns the *first* half regardless, and a fake id that does not
+// split returns the whole `a@b` string. Both outcomes are acceptable when the
+// answer only decorates a response, and neither is here — the first would hand
+// a bot a conversation partner it never addressed, and the second would publish
+// the internal encoding as a channel id. What the wire contract needs is a
+// refusal, which only an (id, ok) shape can express.
 func cardActionConsumerChannelID(msgM *messageModel, requestChannelID, operatorUID string) (string, bool) {
 	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
 		return requestChannelID, true
