@@ -295,6 +295,11 @@ fail-closed，不会落入无人消费的 Bot 队列。传输、队列与运维�
   校验为有限数、`Input.Date`（YYYY-MM-DD）/`Input.Time`（HH:MM）校验格式，三者 `""`
   均视为未填放行；`min`/`max` 区间与 `isRequired`/`regex` 一样**不服务端强制**（AC 规范
   定义 min/max 为可忽略 hint，区间校验交 bot 业务逻辑，PR#556 定稿）。
+- **`event_data.channel_id` 是消费方视角**：与 `/v1/bot/sendMessage` 的 `channel_id`
+  同义 —— DM 取**对端用户 UID**（= `operator_uid`），不是卡片 sender（bot）自己的
+  UID；group / community topic 的标识指频道自身、与视角无关，原样回显请求值。
+  客户端点击时提交的仍是**操作者视角**的对端（即 bot），服务端负责投影，二者不是
+  同一个值。存储行的 fake id（`a@b`）编码始终不上线。
 - **`event_data.space_id`**（PR#548 P1-3）：卡片**来源 Space**，服务端从存储行
   解析（群/子区取群 SpaceID；DM 取发送时注入 payload 的 `space_id`），**非**操作者
   请求上下文 Space；无权威值时省略该键（fail-closed），消费方按可选字段处理。

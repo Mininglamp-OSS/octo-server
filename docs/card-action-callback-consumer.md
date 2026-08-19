@@ -136,12 +136,25 @@ Example request body:
     "task_id": "task-1"
   },
   "message_id": "190001234567890",
-  "channel_id": "notification",
+  "channel_id": "user-b",
   "channel_type": 1,
   "space_id": "space-1",
   "acted_at": 1784073600
 }
 ```
+
+`channel_id` names the channel from the **card sender's** point of view, exactly
+as the sender addressed it when it sent the card. For a DM (`channel_type: 1`)
+that is the **peer user's UID** — not the sending bot's own UID, and not the
+value the clicking client submitted (the client names *its* peer, which is the
+bot). Group and community-topic ids name the channel itself, so both sides
+already agree on them.
+
+In the ordinary DM the clicker is the sender's peer, so `channel_id` and
+`operator_uid` carry the same value. Do not turn that into an equality check:
+they answer different questions — which conversation this is, and who acted —
+and they diverge whenever the sender is also the clicker. Match on
+`channel_id` alone, the way the card was addressed.
 
 `operator_uid` is an authenticated identity assertion from octo-server, not an
 authorization grant. The consumer must still verify that this user can decide
@@ -173,7 +186,9 @@ before verification changes the signature.
 ### Language-neutral test vector
 
 Use this fixed non-production vector to verify any implementation. The body is
-the single UTF-8 line shown below with no trailing newline.
+the single UTF-8 line shown below with no trailing newline. Its field values are
+arbitrary filler pinned to these exact bytes — do not "correct" them to match the
+example above, or the published digest and signature stop matching.
 
 ```text
 secret:    0123456789abcdef0123456789abcdef

@@ -93,6 +93,28 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
+	// D5 频道语义：event 里的 channel_id 是**消费方（卡片 sender）视角**的 API 层
+	// 频道标识，与 /v1/bot/sendMessage 的 channel_id 同义 —— DM 取对端用户 UID。
+	// 请求里的 channel_id 是**操作者视角**的对端（= bot 自己），直接回显会把 bot
+	// 自己的 UID 当成会话标识发回给 bot，令按 channel_id 认卡的消费方判定 mismatch
+	// 而丢弃点击。group/community topic 的标识与视角无关，原样透传。存储行沿用 fake
+	// id 编码，此处不泄漏。
+	//
+	// 位置：紧跟 ①②（频道绑定 + 成员资格）—— 这是纯投影而非校验，输入只有存储行、
+	// 请求频道、操作者，三者到此已全部定型。放在 D4 claim 之前，是因为它的拒绝完全
+	// 由请求决定（重试必然同样拒），压在 claim 后会让每次重试白付一次 Redis
+	// claim + 补偿释放。
+	eventChannelID, resolved := cardActionConsumerChannelID(msgM, req.ChannelID, loginUID)
+	if !resolved {
+		// 存储行自相矛盾（person 频道的 sender 不是会话双方之一）：没有正确的对端可
+		// 报，宁可拒绝也不编一个。归并到单一 invalid（防枚举），真实原因只进日志。
+		m.Error("person 卡片存储行的 sender 不属于会话双方,无法解析对端",
+			zap.String("messageID", req.MessageID), zap.String("fromUID", msgM.FromUID),
+			zap.String("channelID", req.ChannelID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
 	// D3 ③sender 必须是当前有效 bot 身份（layer (c)）：robot.status=1 或
 	// app_bot.status=1。这里每次首击都实时解析，不使用展示缓存，确保 App Bot
 	// unpublish/revoke 立即阻止副作用。iwh_ webhook 没有事件消费端、人类发送者也
@@ -257,11 +279,10 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	//     data 才置键）—— trusted-as-authored，不可伪造。
 	//   - inputs：D11 已 shape-checked 的用户输入（内容仍不可信）。
 	//   - client_token：D4 关联 ID —— 消费方不得当作幂等身份，bot 侧幂等按 event_id。
-	//   - channel 字段回显请求值 —— D3 ①已证明与存储行一致，且这是 API 层频道
-	//     标识（person 频道 = 对端 uid），不泄漏内部 fake id 编码。
+	//   - channel_type 回显请求值 —— D3 ①已证明与存储行一致。
 	eventData := map[string]interface{}{
 		"message_id":   req.MessageID,
-		"channel_id":   req.ChannelID,
+		"channel_id":   eventChannelID,
 		"channel_type": req.ChannelType,
 		"action_id":    req.ActionID,
 		"inputs":       req.Inputs,
@@ -282,11 +303,20 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	}
 	owner, actionType := cardActionRouteMetadata(actionData)
 	eventID, err := m.enqueueCardAction(msgM.FromUID, owner, actionType, eventData, cardactiondispatch.Event{
-		SenderUID:   msgM.FromUID,
-		Owner:       owner,
-		ActionType:  actionType,
-		MessageID:   req.MessageID,
-		ChannelID:   req.ChannelID,
+		SenderUID:  msgM.FromUID,
+		Owner:      owner,
+		ActionType: actionType,
+		MessageID:  req.MessageID,
+		// 两个出口（bot 拉取队列的 event_data、内部 HMAC 回调的 Event）必须报同一个
+		// 频道标识。这里直接用上面那个已定型的 eventChannelID,而不是从 event_data
+		// 里回捞:同一个变量、编译期有类型,改 key 名或改类型都不会静默变成空串——
+		// RedisQueue.Enqueue 只校验 EventID/SenderUID/Owner/ActionType,空 channel
+		// 会一路送进 HMAC 回调。两条路径不分叉由测试来保:
+		// internal/cardactiondispatch/dm_channel_id_e2e_test.go 里 DM 断的是 bot
+		// 队列的 event_data,内部路由那条断的是真正入队的 Event.ChannelID,任一处
+		// 改回 req.ChannelID 都会红。
+		// （space_id 仍走 event_data,因为那个键是有条件写入的。）
+		ChannelID:   eventChannelID,
 		ChannelType: req.ChannelType,
 		SpaceID:     stringEventField(eventData, "space_id"),
 		ActionID:    req.ActionID,
@@ -563,6 +593,57 @@ func (m *Message) releaseCardClaim(idemKey string) {
 func fakeChannelContainsUID(fakeChannelID, uid string) bool {
 	parts := strings.SplitN(fakeChannelID, "@", 2)
 	return len(parts) == 2 && (parts[0] == uid || parts[1] == uid)
+}
+
+// cardActionConsumerChannelID projects the click's channel identity into the
+// frame of reference of the event's consumer — the bot that sent the card.
+//
+// `channel_id` on the wire always names "the other end of this conversation, as
+// the holder of this identifier sees it". In a DM the two ends disagree about
+// what that string is: the clicking user sends the bot's UID because the bot is
+// *their* peer, while the bot needs the user's UID — the very value it passed to
+// `/v1/bot/sendMessage` when it sent the card. Echoing the request value shipped
+// the bot its own UID, so a consumer that recognizes its card by channel (the
+// OpenClaw plugin compares the callback against the channel it registered the
+// card session under) saw a mismatch and dropped every DM click.
+//
+// Group and community-topic ids name the channel itself rather than a peer, so
+// both ends already agree and the request value passes through untouched.
+//
+// The person branch reads only facts authorizeCardChannelMember already
+// established: the stored row was located by
+// GetFakeChannelIDWith(operatorUID, requestChannelID), so the conversation is
+// exactly that pair of UIDs, and the card's sender is one of the two. A sender
+// outside the pair means the stored row contradicts its own channel — there is
+// no correct peer to report, so it fails closed rather than inventing one
+// (`ok=false`). Deriving the peer from the pair rather than parsing the stored
+// fake id also keeps the internal `a@b` encoding out of the wire contract.
+//
+// This deliberately does not reuse common.GetToChannelIDWithFakeChannelID, the
+// flip used on the read paths. That helper fails open twice over: a uid outside
+// the pair returns the *first* half regardless, and a fake id that does not
+// split returns the whole `a@b` string. Both outcomes are acceptable when the
+// answer only decorates a response, and neither is here — the first would hand
+// a bot a conversation partner it never addressed, and the second would publish
+// the internal encoding as a channel id. What the wire contract needs is a
+// refusal, which only an (id, ok) shape can express.
+func cardActionConsumerChannelID(msgM *messageModel, requestChannelID, operatorUID string) (string, bool) {
+	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
+		return requestChannelID, true
+	}
+	switch msgM.FromUID {
+	case requestChannelID:
+		// The ordinary DM: the operator clicked a card the bot they are talking
+		// to had sent, so the bot's peer is the operator.
+		return operatorUID, true
+	case operatorUID:
+		// A self-note DM (both ends are the same UID) also lands here, and
+		// returning the request value is right for it: the peer of the sender
+		// is the sender.
+		return requestChannelID, true
+	default:
+		return "", false
+	}
 }
 
 // authorizeCardChannelMember 执行卡片消息端点共享的 D3 ①②：anti-IDOR 频道绑定

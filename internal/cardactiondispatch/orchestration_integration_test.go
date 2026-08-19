@@ -179,7 +179,10 @@ func TestCardActionCallbackOrchestrationWithMockDocs(t *testing.T) {
 	assert.Equal(t, "doc-1", callback.request.DocID)
 	assert.Equal(t, "request-1", callback.request.RequestID)
 	assert.Equal(t, messageID, callback.request.MessageID)
-	assert.Equal(t, "notification", callback.request.ChannelID)
+	// The DM channel_id reaches the consumer in the *sender's* frame of reference
+	// — the peer user, which is the clicking operator — not the sending bot the
+	// operator named in the request.
+	assert.Equal(t, testutil.UID, callback.request.ChannelID)
 	assert.Equal(t, common.ChannelTypePerson.Uint8(), callback.request.ChannelType)
 	assert.Equal(t, "space-1", callback.request.SpaceID)
 	assert.NotZero(t, callback.request.ActedAt)
