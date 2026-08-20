@@ -1,0 +1,23 @@
+brief: .octospec/tasks/agent-mail-http2-response/brief.md
+injected:
+  - id: space-isolation
+    source: repo
+    reason: "The existing authenticated, Space-scoped gateway must remain unchanged."
+  - id: error-handling
+    source: repo
+    reason: "Upstream failures must keep the localized gateway error envelope."
+  - id: rate-limit
+    source: repo
+    reason: "The existing authenticated route middleware must remain unchanged."
+  - id: testing
+    source: repo
+    reason: "The HTTP/2 success and truncated-response failure paths need regression coverage."
+  - id: commit-style
+    source: repo
+    reason: "Repository-wide change convention."
+files_expected:
+  - modules/agentmailgateway/README.md
+  - modules/agentmailgateway/gateway.go
+  - modules/agentmailgateway/gateway_test.go
+  - .octospec/tasks/agent-mail-identity-gateway/verification.md
+updated_at: 2026-08-19T10:48:23Z
