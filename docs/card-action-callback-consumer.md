@@ -103,7 +103,9 @@ docs-only `doc_id` and `request_id` top-level conveniences may be absent. For a
 standard approval result, `display.title` is optional but recommended; octo
 uses only that reviewed display field, removes all actions, renders the status,
 and sends a v1 requester outcome. It ignores callback-authored URLs, card JSON,
-reasons, and arbitrary display fields.
+reasons, and arbitrary display fields. The Docs specialized finalizer is the
+exception: it terminalizes approver cards in place and sends no second applicant
+terminal IM card.
 
 Docs uses the same callback transport contract but keeps its existing
 `DocsCard`/`OCTO_DOCS_NOTIFY_TOKEN` ingress and specialized deep-link/template
@@ -457,8 +459,10 @@ states or the standard terminal wording cannot represent the result, the
 consumer needs a separately reviewed finalizer/template rather than inventing
 callback response fields.
 
-`requester_uid` is required whenever `state` is `approved` or `denied`, because
-octo-server must notify the applicant. It must be the consumer-authoritative
+`requester_uid` remains required by the shared typed response whenever `state`
+is `approved` or `denied`. Generic standard approval finalizers consume it to
+send a requester outcome; the Docs specialized finalizer ignores it and sends
+no second applicant terminal IM card. It must be the consumer-authoritative
 request initiator, not the operator or an unverified callback field. Responses
 are limited to 64 KiB and the current decoder rejects unknown top-level fields.
 `display` accepts at most 32 string fields; keys are non-empty and at most 64
@@ -473,7 +477,7 @@ For standard approval routes, the originating card must carry an authoritative
 
 | Consumer response                             | octo-server behavior                               |
 | --------------------------------------------- | -------------------------------------------------- |
-| `2xx` + valid typed body                      | Finalize card; approved/denied also notify requester; then ACK |
+| `2xx` + valid typed body                      | Finalize card; generic standard approved/denied also notify requester; Docs does not; then ACK |
 | `408`, `429`, or `5xx`                        | Retry with bounded exponential backoff             |
 | Other `4xx`                                   | Permanent rejection; move to DLQ                   |
 | `3xx`                                         | Redirect rejected; move to DLQ                     |
@@ -493,5 +497,5 @@ Do not return HTTP 403/404 for normal domain outcomes; use the typed
 - an unknown `decision` is rejected without a domain transition;
 - concurrent decisions produce one domain winner;
 - operator removed from ACL before click returns `forbidden`;
-- terminal `approved`/`denied` always includes `requester_uid`;
+- terminal `approved`/`denied` always includes `requester_uid`; Docs accepts but does not consume it;
 - transient `5xx` can be retried safely.

@@ -62,7 +62,7 @@ func TestBuildDocsAccessRequestCardProducesValidOctoV2(t *testing.T) {
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	n := newTestNotify(ctx, nil, nil, nil, "legacy-token")
 
-	document, err := n.buildDocsAccessRequestCard(context.Background(), "space-1", validAccessRequestDocsCard(), "zh-CN")
+	document, err := n.buildDocsAccessRequestCard(context.Background(), validAccessRequestDocsCard(), "zh-CN")
 	require.NoError(t, err)
 	var card map[string]interface{}
 	require.NoError(t, json.Unmarshal(document, &card))

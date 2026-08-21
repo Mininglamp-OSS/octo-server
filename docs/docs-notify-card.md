@@ -93,7 +93,7 @@ brief），发送方为分享用户本人，与本 producer 无关。docs-notify
   "type": "AdaptiveCard",
   "version": "1.5",
   "metadata": {
-    "webUrl": "https://im.example.com/d/d_20260713_abcd?sp=spc_xxx",
+    "webUrl": "https://im.example.com/d/d_20260713_abcd",
     "octo": {
       "variant": "docs.shared",
       "source": { "label": "文档" }
@@ -111,7 +111,7 @@ brief），发送方为分享用户本人，与本 producer 无关。docs-notify
     ]},
     { "type": "ActionSet", "actions": [
       { "type": "Action.OpenUrl", "title": "查看详情",
-        "url": "https://im.example.com/d/d_20260713_abcd?sp=spc_xxx" }
+        "url": "https://im.example.com/d/d_20260713_abcd" }
     ]}
   ]
 }
@@ -156,8 +156,9 @@ WuKongIM wire 信封（`plain` 由服务端权威派生）：
 - `kind: "access_requested"` + `actor_name: "Bob"` → attribution =
   `"Bob 请求访问文档"`，`metadata.octo.variant = "docs.access_requested"`
 
-`access_requested` 的交互卡、终态和申请人结果通知不在本文重复，统一引用
-[`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md)。
+`access_requested` 的交互卡和终态不在本文重复，统一引用
+[`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md)。Docs 只原地
+终态化审批人卡片，不再给申请人发送第二张终态 IM 卡。
 
 **约定** `docs-backend` 端预格式化 `actor_name`（可含姓+称谓、显示名等，逐字符
 `escapeMarkdown` 后落入 attribution）。octo-server 不做二次身份解析（避免 card 路径
@@ -207,16 +208,16 @@ WuKongIM wire 信封（`plain` 由服务端权威派生）：
 按钮文案由 `pkg/cardtmpl.labelsForLanguage` 提供（同 summary）：
 `viewDetails=查看详情/View details`、`copy=复制/Copy`（docs-notify 未使用后者）。
 
-## 6. Deep-link（`/d/{doc_id}?sp={space_id}`）
+## 6. Deep-link（`/d/{doc_id}`）
 
 `cardtmpl.docsDeepLink`：从 `External.WebLoginURL` 取 origin（`scheme://host`），拼
-`/d/` + `PathEscape(doc_id)` + `?sp=` + `QueryEscape(space_id)`。origin 必须是
-**绝对 https**；否则 `BuildDocsResourceCard` 返回错误 → 请求级降级为纯文本 DM。
+`/d/` + `PathEscape(doc_id)`。origin 必须是**绝对 https**；否则
+`BuildDocsResourceCard` 返回错误 → 请求级降级为纯文本 DM。
 
-**前置**：octo-web `/d/:docId` 路由**已在线**（`packages/dmworkbase` 走的是既有
-standalone doc 通路，含冷加载 → 登录跳转 → 多会话 sid 恢复的 XIN-398 测试套件）。
-这是 docs-notify 与 summary-notify 的关键差异——docs 侧「查看详情」按钮开箱可用；
-summary 侧仍在等 octo-web `/s/:taskId` 上线。
+Docs 链接不携带 `?sp=`。octo-web 的 standalone `/d/:docId` 打开链路从其
+服务端确认的持久化打开上下文恢复 viewer Space；旧 `sp` 查询参数不再是权限或
+路由依据。该路径覆盖冷加载、登录跳转和多会话 sid 恢复。summary 仍使用独立的
+`/s/:taskId?sp=...` 契约，两者不要求保持相同链接形状。
 
 ## 7. 降级与错误分类
 

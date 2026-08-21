@@ -25,7 +25,6 @@ type DocsActionFinalizer struct {
 	ctx     *config.Context
 	mutator cardActionMutator
 	updater cardtmpl.CardUpdater
-	sender  carddispatch.Sender
 }
 
 type actionFinalizeError struct {
@@ -37,31 +36,27 @@ func (e *actionFinalizeError) Error() string    { return "notify: " + e.category
 func (e *actionFinalizeError) Unwrap() error    { return e.err }
 func (e *actionFinalizeError) Category() string { return e.category }
 
-func NewDocsActionFinalizer(ctx *config.Context, mutator cardActionMutator, sender carddispatch.Sender) (*DocsActionFinalizer, error) {
-	if ctx == nil || mutator == nil || sender == nil {
+func NewDocsActionFinalizer(ctx *config.Context, mutator cardActionMutator) (*DocsActionFinalizer, error) {
+	if ctx == nil || mutator == nil {
 		return nil, errors.New("notify: docs action finalizer dependencies are required")
 	}
-	return &DocsActionFinalizer{ctx: ctx, mutator: mutator, sender: sender}, nil
+	return &DocsActionFinalizer{ctx: ctx, mutator: mutator}, nil
 }
 
-func NewDocsActionFinalizerWithUpdater(ctx *config.Context, updater cardtmpl.CardUpdater, mutator cardActionMutator, sender carddispatch.Sender) (*DocsActionFinalizer, error) {
-	if ctx == nil || updater == nil || mutator == nil || sender == nil {
+func NewDocsActionFinalizerWithUpdater(ctx *config.Context, updater cardtmpl.CardUpdater, mutator cardActionMutator) (*DocsActionFinalizer, error) {
+	if ctx == nil || updater == nil || mutator == nil {
 		return nil, errors.New("notify: docs action finalizer dependencies are required")
 	}
-	return &DocsActionFinalizer{ctx: ctx, updater: updater, mutator: mutator, sender: sender}, nil
+	return &DocsActionFinalizer{ctx: ctx, updater: updater, mutator: mutator}, nil
 }
 
 func NewDocsActionFinalizerFromContext(ctx *config.Context) (*DocsActionFinalizer, error) {
-	sender, err := carddispatch.SenderFromContext(ctx, docsNotifyProducerID)
-	if err != nil {
-		return nil, err
-	}
 	mutator := carddispatch.NewCardMutator(ctx)
 	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultCatalog(), mutator)
 	if err != nil {
 		return nil, err
 	}
-	return NewDocsActionFinalizerWithUpdater(ctx, updater, mutator, sender)
+	return NewDocsActionFinalizerWithUpdater(ctx, updater, mutator)
 }
 
 func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondispatch.Event, result cardactiondispatch.DecisionResult) error {
@@ -71,10 +66,6 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	docID, _ := event.Data["doc_id"].(string)
 	if strings.TrimSpace(docID) == "" || strings.TrimSpace(event.SpaceID) == "" {
 		return errors.New("notify: docs action result is missing authoritative context")
-	}
-	if (result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied) &&
-		strings.TrimSpace(result.RequesterUID) == "" {
-		return errors.New("notify: terminal docs decision is missing requester_uid")
 	}
 	// The mutator addresses a DM by the sender's peer. The ingress now stamps that
 	// same peer into event.ChannelID, so for a freshly enqueued event this rewrite
@@ -107,7 +98,6 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if v, ok := event.Inputs[cardtmpl.DocsDenyReasonInputID].(string); ok {
 		denyReason = strings.TrimSpace(v)
 	}
-	terminal := result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied
 	// Every state renders through the Registry when an updater is present, not
 	// just the decided ones. The pending card is a Registry render and so
 	// carries the server-authored catalog markers; the fallback below rebuilds
@@ -126,7 +116,7 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 			return err
 		}
 	} else {
-		terminalDocument, err := f.buildTerminalDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result)
+		terminalDocument, err := f.buildTerminalDocument(ctx, lang, event, title, denyReason, result)
 		if err != nil {
 			return err
 		}
@@ -141,27 +131,16 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 			return err
 		}
 	}
-	if !terminal {
-		return nil
-	}
-	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result.State)
-	if err != nil {
-		return err
-	}
-	_, err = f.sender.Send(ctx, carddispatch.Target{
-		SpaceID: event.SpaceID, ChannelID: result.RequesterUID, ChannelType: common.ChannelTypePerson.Uint8(),
-	}, carddispatch.Card{Profile: cardmsg.ProfileV1, Document: outcomeDocument})
-	if err != nil {
-		return &actionFinalizeError{category: "applicant_notify_failed", err: err}
-	}
+	// The original request card is the sole terminal surface. Do not send a
+	// second "access granted/denied" card to the requester.
 	return nil
 }
 
 // 0.3.0 result view schema 的各字段 rune 上限(见
-// handoff/docs.access-request@0.3.0/contract/data.schema.json)。回调 Display 与
-// event.Data 的值合法可达 500 runes(cardactiondispatch 契约),必须在渲染前截断
+// handoff/docs.access-request@0.3.0/contract/data.schema.json)。回调 Display
+// 的值合法可达 500 runes，而 event.Data 只受卡片信封总大小约束；必须在渲染前截断
 // 到各自 schema cap —— 否则 RenderCard 的 InputSchema 校验返回 ErrFieldsInvalid,
-// ReplaceView 确定性失败,审批卡永远停在 pending 且申请人漏通知(PR#641 review P1)。
+// ReplaceView 确定性失败,审批卡永远停在 pending，审批人看不到终态(PR#641 review P1)。
 // 截断而非编造,与 denyReason 既有做法一致。
 const (
 	capResultTitle      = 200                      // document.title / document.sourceName
@@ -194,14 +173,15 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 	if err != nil {
 		return err
 	}
-	fields, state, err := buildDocsAccessResultFields(lang, docsResultRenderInput{
-		Data:             event.Data,
-		Title:            title,
-		OperatorName:     result.Display["operator_name"],
-		DecidedAtDisplay: result.Display["decided_at"],
-		DenyReason:       denyReason,
-		Denied:           result.State == cardactiondispatch.StateDenied,
-		Cancelled:        result.State == cardactiondispatch.StateCancelled,
+	fields, state, err := buildDocsAccessResultFields(lang, version, docsResultRenderInput{
+		Data:              event.Data,
+		Title:             title,
+		OperatorName:      result.Display["operator_name"],
+		OperatorSpaceName: result.Display["operator_space_name"],
+		DecidedAtDisplay:  result.Display["decided_at"],
+		DenyReason:        denyReason,
+		Denied:            result.State == cardactiondispatch.StateDenied,
+		Cancelled:         result.State == cardactiondispatch.StateCancelled,
 		// Anything that is not a decision and not an explicit cancellation —
 		// `pending` today, whatever a later contract adds — renders as
 		// unavailable, which is what the pre-Registry fallback already showed
@@ -232,17 +212,18 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 // from the stored server-authored Action.Submit payload, never caller display
 // JSON, so request/document identity cannot be rewritten during a mutation.
 type docsResultRenderInput struct {
-	Data             map[string]interface{}
-	Title            string
-	OperatorName     string
-	DecidedAtDisplay string
-	DenyReason       string
-	Denied           bool
-	Cancelled        bool
-	Unavailable      bool
+	Data              map[string]interface{}
+	Title             string
+	OperatorName      string
+	OperatorSpaceName string
+	DecidedAtDisplay  string
+	DenyReason        string
+	Denied            bool
+	Cancelled         bool
+	Unavailable       bool
 }
 
-func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
+func buildDocsAccessResultFields(lang, version string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
 	requestID := strings.TrimSpace(stringEventData(input.Data, "request_id"))
 	docID := strings.TrimSpace(stringEventData(input.Data, "doc_id"))
 	if requestID == "" || docID == "" {
@@ -281,6 +262,11 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 		"title": truncRunes(strings.TrimSpace(title), capResultTitle),
 	}
 	requester := map[string]any{"name": truncRunes(strings.TrimSpace(actor), capResultName)}
+	if version == docsaccessrequest.TemplateVersionV3 {
+		if value := strings.TrimSpace(stringEventData(input.Data, "requester_space_name")); value != "" {
+			requester["sourceSpaceName"] = truncRunes(value, capResultTitle)
+		}
+	}
 	if value := strings.TrimSpace(stringEventData(input.Data, "source_name")); value != "" {
 		document["sourceName"] = truncRunes(value, capResultTitle)
 	}
@@ -299,10 +285,14 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	// approved/rejected; emitting one here would put the generic operator
 	// placeholder on a card nobody acted on.
 	if !input.Cancelled && !input.Unavailable {
-		fields["decision"] = map[string]any{
+		decision := map[string]any{
 			"operatorName":     truncRunes(operatorName, capResultName),
 			"decidedAtDisplay": truncRunes(strings.TrimSpace(input.DecidedAtDisplay), capResultShortLabel),
 		}
+		if version == docsaccessrequest.TemplateVersionV3 {
+			decision["operatorSpaceName"] = truncRunes(strings.TrimSpace(input.OperatorSpaceName), capResultTitle)
+		}
+		fields["decision"] = decision
 	}
 	dataCaps := map[string]int{
 		"requestReason":      capResultReason,
@@ -327,6 +317,19 @@ func buildDocsAccessResultFields(lang string, input docsResultRenderInput) (json
 	if len(permission) > 0 {
 		fields["permission"] = permission
 	}
+	if version == docsaccessrequest.TemplateVersionV3 {
+		if names := stringSliceEventData(input.Data, "requested_bot_names"); len(names) > 0 {
+			bounded := make([]string, 0, len(names))
+			for _, name := range names[:min(len(names), 50)] {
+				if value := strings.TrimSpace(name); value != "" {
+					bounded = append(bounded, truncRunes(value, capResultName))
+				}
+			}
+			if len(bounded) > 0 {
+				fields["requestedBotNames"] = bounded
+			}
+		}
+	}
 	if wireState == "rejected" && denyReason != "" {
 		fields["decision"].(map[string]any)["rejectionReason"] = denyReason
 	}
@@ -342,16 +345,35 @@ func stringEventData(data map[string]interface{}, key string) string {
 	return value
 }
 
-func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
+func stringSliceEventData(data map[string]interface{}, key string) []string {
+	switch values := data[key].(type) {
+	case []string:
+		return values
+	case []interface{}:
+		out := make([]string, 0, len(values))
+		for _, raw := range values {
+			if value, ok := raw.(string); ok {
+				out = append(out, value)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang string, event cardactiondispatch.Event, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
+	docID := stringEventData(event.Data, "doc_id")
+	spaceID := event.SpaceID
 	webLoginURL := f.ctx.GetConfig().External.WebLoginURL
 	// The legacy/no-updater fallback still emits the enriched outcome card; the
 	// normal finalizer and sibling mutation paths render V3 through the Registry.
 	switch result.State {
 	case cardactiondispatch.StateApproved:
-		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, false)
+		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, false, event.Data, result.Display)
 	case cardactiondispatch.StateDenied:
-		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, true)
+		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, true, event.Data, result.Display)
 	}
 	// Cancelled / unavailable are transient states without an enriched design —
 	// keep the prior plain resource-card rebuild.
@@ -359,54 +381,34 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	if result.State == cardactiondispatch.StateCancelled {
 		attribution, variant = labels.accessCancelledBanner, "docs.access_cancelled"
 	}
-	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, docID, spaceID, cardtmpl.ResourceCard{
+	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, docID, cardtmpl.ResourceCard{
 		Title: title, Attribution: attribution, Variant: variant, Source: cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
 // buildDocsDecisionTerminalDocument renders the legacy/no-updater fallback for
 // approved/denied outcomes. Production result updates use CardUpdater at the card's stored version.
-func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
+func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool, data map[string]interface{}, display map[string]string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
+	content := cardtmpl.DocsOutcomeContent{
+		Title: title, Source: cardtmpl.Source{Label: labels.sourceLabel},
+		HeaderLabel:               labels.approvalHeader,
+		RequestedAtDisplay:        stringEventData(data, "requested_at_display"),
+		MessageTimeDisplay:        display["decided_at"],
+		DecisionOperatorName:      display["operator_name"],
+		DecisionOperatorSpaceName: display["operator_space_name"],
+	}
 	if denied {
-		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
-			Title: title, Variant: "docs.access_denied", Source: cardtmpl.Source{Label: labels.sourceLabel},
-			Denied: true, HeaderLabel: labels.approvalHeader, StatusLabel: labels.deniedStatus,
-			ResultText: labels.deniedResult, ReasonLabel: labels.denyReasonLabel, Reason: denyReason,
-		})
+		content.Variant = "docs.access_denied"
+		content.Denied = true
+		content.StatusLabel = labels.deniedStatus
+		content.ReasonLabel = labels.denyReasonLabel
+		content.Reason = denyReason
+	} else {
+		content.Variant = "docs.access_approved"
+		content.StatusLabel = labels.approvedStatus
 	}
-	return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
-		Title: title, Variant: "docs.access_approved", Source: cardtmpl.Source{Label: labels.sourceLabel},
-		Denied: false, HeaderLabel: labels.approvalHeader, StatusLabel: labels.approvedStatus,
-		ResultText: labels.approvedResult,
-	})
-}
-
-func (f *DocsActionFinalizer) buildOutcomeDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, state cardactiondispatch.State) (json.RawMessage, error) {
-	labels := docsLabelsFor(lang)
-	attribution := labels.accessGrantedBanner
-	variant := "docs.access_granted"
-	var facts []cardtmpl.Fact
-	if state == cardactiondispatch.StateDenied {
-		attribution, variant = labels.accessDeniedBanner, "docs.access_denied"
-		// Surface the reviewer's reason to the applicant — a denial is useless to
-		// them without it. Rides as a labeled FactSet row on the same resource
-		// card (no profile/card-type change); omitted when no reason was typed.
-		if reason := strings.TrimSpace(denyReason); reason != "" {
-			// cardtmpl caps FactSet values at maxFactRunes; an over-long reason
-			// fails the whole card build and drops the denial notification
-			// entirely (retries included). Truncate to MaxExcerptRunes — the
-			// same bound the terminal card's reason box uses — so a long reason
-			// is trimmed, never silently lost.
-			if r := []rune(reason); len(r) > cardtmpl.MaxExcerptRunes {
-				reason = string(r[:cardtmpl.MaxExcerptRunes])
-			}
-			facts = append(facts, cardtmpl.Fact{Title: labels.denyReasonLabel, Value: reason})
-		}
-	}
-	return cardtmpl.BuildDocsResourceCard(ctx, f.ctx.GetConfig().External.WebLoginURL, docID, spaceID, cardtmpl.ResourceCard{
-		Title: title, Attribution: attribution, Variant: variant, Facts: facts, Source: cardtmpl.Source{Label: labels.sourceLabel},
-	})
+	return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, content)
 }
 
 func buildTerminalEnvelope(document json.RawMessage, spaceID string, cardSeq int64) (string, error) {

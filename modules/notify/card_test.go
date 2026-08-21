@@ -274,8 +274,8 @@ func TestBuildDocsCard_ProducesValidOctoV1(t *testing.T) {
 				"card":         cardObj,
 			}
 			require.NoError(t, cardmsg.Validate(envelope), "docs template output must pass octo/v1 Validate")
-			// Deep link built from WebLoginURL origin only, /d/{doc_id}?sp={space}.
-			assert.Contains(t, string(doc), "https://im.example.com/d/doc_abcd?sp=spc_1")
+			// Deep link built from WebLoginURL origin only, /d/{doc_id}.
+			assert.Contains(t, string(doc), "https://im.example.com/d/doc_abcd")
 			assert.NotContains(t, string(doc), "/login")
 			// Variant identifier is embedded in metadata.octo.variant.
 			metadata, _ := cardObj["metadata"].(map[string]interface{})

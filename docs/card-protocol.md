@@ -259,7 +259,7 @@ Bot API 的服务端视觉默认值；错误形状仍是该 API 的单一 conten
 客户端点按钮 → POST /v1/message/card/action     （鉴权/防伪造/幂等,即时 ack）
             → 服务端按 stored sender + data.owner/action_type 分支：
               - 注册的一方 sender/route：内部可靠队列 → HMAC callback
-                → octo-server 写终态卡并通知申请人
+                → octo-server 写终态卡；通用审批再通知申请人，Docs 专用路由不发第二张终态卡
               - 其它 Bot：bot 事件队列 event_type="card_action"
                 （/v1/bot/events 轮询,至少一次）→ Bot 调 /v1/bot/message/edit
             → message_extra + CMD /v1/message/extra/sync

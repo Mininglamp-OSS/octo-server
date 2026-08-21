@@ -17,6 +17,23 @@ func TestDocsCardMutateSeqKeyCompatibility(t *testing.T) {
 	}
 }
 
+func TestCardMutateReqParsesResolvedOperatorDisplay(t *testing.T) {
+	var req CardMutateReq
+	if err := json.Unmarshal([]byte(`{
+		"space_id":"card-space-a",
+		"operator_uid":"reviewer-1",
+		"operator_space_id":"operator-space-b",
+		"operator_name":"Reviewer B",
+		"operator_space_name":"Operator Space B"
+	}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.SpaceID != "card-space-a" || req.OperatorSpaceID != "operator-space-b" ||
+		req.OperatorName != "Reviewer B" || req.OperatorSpaceName != "Operator Space B" {
+		t.Fatalf("parsed request = %+v", req)
+	}
+}
+
 // TestDocsAccessCardVariant is the capability-containment guard for the docs
 // card-mutate endpoint (PR review P0): the shared `notification` bot sends docs,
 // summary, and action-outcome cards, so the mutate endpoint must gate on the

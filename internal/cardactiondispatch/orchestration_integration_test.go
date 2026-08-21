@@ -139,7 +139,7 @@ func TestCardActionCallbackOrchestrationWithMockDocs(t *testing.T) {
 	require.NoError(t, cardactiondispatch.Install(ctx, service))
 
 	sender := &callbackE2ESender{}
-	docsFinalizer, err := notify.NewDocsActionFinalizer(ctx, carddispatch.NewCardMutator(ctx), sender)
+	docsFinalizer, err := notify.NewDocsActionFinalizer(ctx, carddispatch.NewCardMutator(ctx))
 	require.NoError(t, err)
 	finalizer := &callbackE2EFinalizer{delegate: docsFinalizer}
 	dispatcher, err := cardactiondispatch.NewDispatcher(

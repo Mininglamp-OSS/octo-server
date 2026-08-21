@@ -41,13 +41,13 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	updater := &captureViewUpdater{}
 	legacyMutator := &captureCardMutator{}
-	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator)
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
 	}
 	event := cardactiondispatch.Event{
 		EventID: 42, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
-		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "card-space-a", OperatorUID: "reviewer-1",
 		Inputs: map[string]any{cardtmpl.DocsDenyReasonInputID: "scope mismatch"},
 		Data: map[string]any{
 			"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
@@ -58,7 +58,10 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 	}
 	result := cardactiondispatch.DecisionResult{
 		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateDenied,
-		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+		RequesterUID: "user-a", Display: map[string]string{
+			"title": "Roadmap", "operator_name": "林澈", "operator_space_id": "operator-space-b",
+			"operator_space_name": "Operator Space B", "decided_at": "2026-08-20 19:01",
+		},
 	}
 	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
 		t.Fatalf("Finalize: %v", err)
@@ -80,8 +83,24 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 		t.Fatalf("result fields = %+v", fields)
 	}
 	decision := fields["decision"].(map[string]any)
-	if decision["operatorName"] != "审批人" || decision["rejectionReason"] != "scope mismatch" {
+	if decision["operatorName"] != "林澈" || decision["operatorSpaceName"] != "Operator Space B" ||
+		decision["decidedAtDisplay"] != "2026-08-20 19:01" || decision["rejectionReason"] != "scope mismatch" {
 		t.Fatalf("decision fields = %+v", decision)
+	}
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	rendered, err := r.Render(context.Background(), updater.id, updater.version, updater.state, updater.fields, updater.env)
+	if err != nil {
+		t.Fatalf("render terminal fields: %v", err)
+	}
+	renderedJSON, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(renderedJSON), "Operator Space B") || strings.Contains(string(renderedJSON), "card-space-a") {
+		t.Fatalf("terminal display must identify operator Space B, never card Space A: %s", renderedJSON)
 	}
 	if strings.Contains(string(updater.fields), event.OperatorUID) {
 		t.Fatalf("result fields exposed raw operator uid: %s", updater.fields)
@@ -99,6 +118,40 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 		t.Fatalf("BuildEnv = %+v", updater.env)
 	}
 	_ = carddispatch.CardMutationResult{}
+}
+
+func TestDocsActionFinalizerUsesConsumerResolvedOperatorDisplay(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	updater := &captureViewUpdater{}
+	finalizer := &DocsActionFinalizer{ctx: ctx, updater: updater}
+	event := cardactiondispatch.Event{
+		EventID: 42, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "card-space-a", OperatorUID: "reviewer-1",
+		Data: map[string]any{"doc_id": "doc-1", "request_id": "request-1"},
+	}
+	result := cardactiondispatch.DecisionResult{
+		State: cardactiondispatch.StateApproved,
+		Display: map[string]string{
+			"operator_name": "林澈", "operator_space_name": "产品中心", "operator_space_id": "untrusted-space-id",
+		},
+	}
+	if err := finalizer.replaceWithRegistryResult(context.Background(), event, result,
+		NotifyBotUIDValue, "zh-CN", "Roadmap", ""); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(updater.fields, &fields); err != nil {
+		t.Fatal(err)
+	}
+	decision := fields["decision"].(map[string]any)
+	if decision["operatorName"] != "林澈" || decision["operatorSpaceName"] != "产品中心" {
+		t.Fatalf("decision display = %+v", decision)
+	}
+	if strings.Contains(string(updater.fields), "untrusted-space-id") {
+		t.Fatalf("operator ids must not enter display fields: %s", updater.fields)
+	}
 }
 
 func TestDocsActionFinalizerV3OmitsUnavailableV2Decoration(t *testing.T) {
@@ -215,7 +268,7 @@ func storedVersionFinalizerFixture(t *testing.T) (*captureViewUpdater, *DocsActi
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	updater := &captureViewUpdater{}
-	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, &captureCardMutator{}, &capturingCardSender{})
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, &captureCardMutator{})
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
 	}
@@ -310,7 +363,7 @@ func TestDocsActionFinalizerRoutesEveryStateThroughTheRegistry(t *testing.T) {
 			ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 			updater := &captureViewUpdater{}
 			legacyMutator := &captureCardMutator{}
-			finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator, &capturingCardSender{})
+			finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, legacyMutator)
 			if err != nil {
 				t.Fatalf("NewDocsActionFinalizerWithUpdater: %v", err)
 			}
@@ -360,6 +413,40 @@ func TestDocsActionFinalizerRoutesEveryStateThroughTheRegistry(t *testing.T) {
 // which would turn the routing fix into a runtime error instead of a card. The
 // finalizer tests above drive a capturing fake and never reach ViewFor, so this
 // is the only thing that witnesses the manifest declaration.
+func TestBuildDocsAccessResultFieldsGatesV3OnlyFieldsByVersion(t *testing.T) {
+	input := docsResultRenderInput{
+		Data: map[string]any{
+			"request_id": "request-1", "doc_id": "doc-1", "requester_space_name": "Space B",
+			"requested_bot_names": []string{"Bot A"},
+		},
+		Title: "Roadmap", OperatorName: "Reviewer", OperatorSpaceName: "Operator Space",
+	}
+	for _, test := range []struct {
+		version string
+		wantV3  bool
+	}{
+		{version: docsaccessrequest.TemplateVersionV3, wantV3: true},
+		{version: "0.4.0", wantV3: false},
+	} {
+		raw, _, err := buildDocsAccessResultFields("en", test.version, input)
+		if err != nil {
+			t.Fatalf("version %s: %v", test.version, err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		requester := fields["requester"].(map[string]any)
+		decision := fields["decision"].(map[string]any)
+		_, hasSpace := requester["sourceSpaceName"]
+		_, hasOperatorSpace := decision["operatorSpaceName"]
+		_, hasBots := fields["requestedBotNames"]
+		if hasSpace != test.wantV3 || hasOperatorSpace != test.wantV3 || hasBots != test.wantV3 {
+			t.Fatalf("version %s fields = %+v", test.version, fields)
+		}
+	}
+}
+
 func TestDocsAccessRequestV3RendersTheNonDecisionStates(t *testing.T) {
 	registry := cardtmpl.NewRegistry()
 	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
@@ -388,7 +475,7 @@ func TestDocsAccessRequestV3RendersTheNonDecisionStates(t *testing.T) {
 			input := test.input
 			input.Data = map[string]any{"request_id": "request-1", "doc_id": "doc-1"}
 			input.Title = "Roadmap"
-			fields, state, err := buildDocsAccessResultFields("zh-CN", input)
+			fields, state, err := buildDocsAccessResultFields("zh-CN", docsaccessrequest.TemplateVersionV3, input)
 			if err != nil {
 				t.Fatalf("buildDocsAccessResultFields: %v", err)
 			}

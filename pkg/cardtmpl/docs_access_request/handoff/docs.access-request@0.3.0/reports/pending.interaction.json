@@ -1,19 +1,70 @@
 {
   "actions": [
-    {"id": "view_document", "type": "Action.OpenUrl", "dataKeys": [], "inputIds": []},
     {
-      "id": "docs-access-deny", "type": "Action.Submit", "associatedInputs": "auto",
-      "dataKeys": ["owner", "action_type", "doc_id", "request_id", "doc_title", "actor", "decision", "actor_avatar_url", "request_reason", "requested_at_display", "message_time_display", "permission_label", "permission_role_label", "source_name"],
-      "inputIds": ["deny_reason"]
+      "id": "view_document",
+      "type": "Action.OpenUrl",
+      "dataKeys": [],
+      "inputIds": []
     },
     {
-      "id": "docs-access-approve", "type": "Action.Submit", "associatedInputs": "auto",
-      "dataKeys": ["owner", "action_type", "doc_id", "request_id", "doc_title", "actor", "decision", "actor_avatar_url", "request_reason", "requested_at_display", "message_time_display", "permission_label", "permission_role_label", "source_name"],
+      "id": "docs-access-deny",
+      "type": "Action.Submit",
+      "associatedInputs": "auto",
+      "dataKeys": [
+        "owner",
+        "action_type",
+        "doc_id",
+        "request_id",
+        "doc_title",
+        "actor",
+        "decision",
+        "actor_avatar_url",
+        "request_reason",
+        "requested_at_display",
+        "message_time_display",
+        "permission_label",
+        "permission_role_label",
+        "source_name",
+        "requester_space_name",
+        "requested_bot_names"
+      ],
+      "inputIds": [
+        "deny_reason"
+      ]
+    },
+    {
+      "id": "docs-access-approve",
+      "type": "Action.Submit",
+      "associatedInputs": "auto",
+      "dataKeys": [
+        "owner",
+        "action_type",
+        "doc_id",
+        "request_id",
+        "doc_title",
+        "actor",
+        "decision",
+        "actor_avatar_url",
+        "request_reason",
+        "requested_at_display",
+        "message_time_display",
+        "permission_label",
+        "permission_role_label",
+        "source_name",
+        "requester_space_name",
+        "requested_bot_names"
+      ],
       "inputIds": []
     }
   ],
   "inputs": [
-    {"id": "deny_reason", "type": "Input.Text", "isRequired": false, "isVisible": false, "maxLength": 300}
+    {
+      "id": "deny_reason",
+      "type": "Input.Text",
+      "isRequired": false,
+      "isVisible": false,
+      "maxLength": 300
+    }
   ],
   "toggles": []
 }

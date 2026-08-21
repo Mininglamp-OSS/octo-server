@@ -366,7 +366,7 @@ type summaryLabels struct {
 // deliverDocsCardNotification is the docs-notify card path. Structurally it
 // mirrors deliverCardNotification (dedup -> actor exclusion -> live member
 // verification -> bounded fan-out) but binds to the docs-notify producer and
-// uses BuildDocsResourceCard for the /d/{doc_id}?sp={space_id} deep link. A
+// uses BuildDocsResourceCard for the /d/{doc_id} deep link. A
 // build failure degrades the whole request to a plain-text DM so a docs
 // notification is never silently lost. Runtime-catalog safety rejections are
 // excluded from that fallback and fail closed so an emergency block cannot be
@@ -677,7 +677,7 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 	attribution, variant := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
 
 	webLoginURL := n.ctx.GetConfig().External.WebLoginURL
-	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, card.DocID, spaceID, cardtmpl.ResourceCard{
+	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, card.DocID, cardtmpl.ResourceCard{
 		Title:       card.Title,
 		Attribution: attribution,
 		Excerpt:     docsSafeExcerpt(card),
@@ -694,7 +694,7 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 // 断言与 Registry.Render 字节等价;card_action_test.go 也引用它。请勿把它误当成
 // 第二条活的生产渲染路径;真要改 access-request 卡的生产行为,改 pilot Template
 // (pkg/cardtmpl/docs_access_request) 或 Registry.Render。
-func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
+func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, card *DocsCardFields, lang string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	actor := strings.TrimSpace(card.ActorName)
 	bannerSuffix := labels.requestBannerSuffix
@@ -706,7 +706,6 @@ func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string,
 		n.ctx.GetConfig().External.WebLoginURL,
 		card.DocID,
 		card.RequestID,
-		spaceID,
 		cardtmpl.DocsApprovalContent{
 			Title:        card.Title,
 			Actor:        actor,
@@ -841,8 +840,6 @@ type docsLabels struct {
 	roleRequester       string // "申请人" / "Requester"
 	reasonLabel         string // "申请原因" / "Reason"
 	denyReasonLabel     string // "拒绝原因" / "Reason for denial"
-	approvedResult      string // result-box copy on approval
-	deniedResult        string // result-box copy on denial
 	decisionActor       string // safe generic when callback omits operator display name
 }
 
@@ -875,8 +872,6 @@ func docsLabelsFor(lang string) docsLabels {
 			roleRequester:             "申请人",
 			reasonLabel:               "申请原因",
 			denyReasonLabel:           "拒绝原因",
-			approvedResult:            "申请人已获得所申请的文档权限。",
-			deniedResult:              "申请已被拒绝。",
 			decisionActor:             "审批人",
 		}
 	}
@@ -907,8 +902,6 @@ func docsLabelsFor(lang string) docsLabels {
 		roleRequester:             "Requester",
 		reasonLabel:               "Reason",
 		denyReasonLabel:           "Reason for denial",
-		approvedResult:            "The requester now has the requested document access.",
-		deniedResult:              "The access request was denied.",
 		decisionActor:             "Reviewer",
 	}
 }

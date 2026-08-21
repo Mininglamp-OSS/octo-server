@@ -125,13 +125,12 @@ func BuildDocsResourceCard(
 	ctx context.Context,
 	webLoginURL string,
 	docID string,
-	spaceID string,
 	resource ResourceCard,
 ) (json.RawMessage, error) {
-	if strings.TrimSpace(docID) == "" || strings.TrimSpace(spaceID) == "" {
-		return nil, errors.New("cardtmpl: doc ID and space ID are required")
+	if strings.TrimSpace(docID) == "" {
+		return nil, errors.New("cardtmpl: doc ID is required")
 	}
-	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	deepLink, err := docsDeepLink(webLoginURL, docID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,13 +179,12 @@ func BuildDocsResourceCardBodyWithLang(
 	lang string,
 	webLoginURL string,
 	docID string,
-	spaceID string,
 	resource ResourceCard,
 ) (body []interface{}, deepLink string, err error) {
-	if strings.TrimSpace(docID) == "" || strings.TrimSpace(spaceID) == "" {
-		return nil, "", errors.New("cardtmpl: doc ID and space ID are required")
+	if strings.TrimSpace(docID) == "" {
+		return nil, "", errors.New("cardtmpl: doc ID is required")
 	}
-	deepLink, err = docsDeepLink(webLoginURL, docID, spaceID)
+	deepLink, err = docsDeepLink(webLoginURL, docID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -322,16 +320,16 @@ func summaryDeepLink(webLoginURL, taskID, spaceID string) (string, error) {
 	return origin + "/s/" + url.PathEscape(taskID) + "?sp=" + url.QueryEscape(spaceID), nil
 }
 
-// docsDeepLink mirrors summaryDeepLink but targets octo-web's already-live
-// standalone doc route /d/:docId (cold-load → login bounce → multi-session
-// sid recovery, XIN-398 suite). The origin comes from External.WebLoginURL
-// (positive-allowlisted absolute https).
-func docsDeepLink(webLoginURL, docID, spaceID string) (string, error) {
+// docsDeepLink targets octo-web's standalone /d/:docId route. Unlike summary
+// links, Docs links intentionally carry no Space query: octo-web restores the
+// authoritative viewer Space from its persisted open context. The origin comes
+// from External.WebLoginURL (positive-allowlisted absolute https).
+func docsDeepLink(webLoginURL, docID string) (string, error) {
 	origin, err := webOrigin(webLoginURL)
 	if err != nil {
 		return "", err
 	}
-	return origin + "/d/" + url.PathEscape(docID) + "?sp=" + url.QueryEscape(spaceID), nil
+	return origin + "/d/" + url.PathEscape(docID), nil
 }
 
 // buildMetadata assembles the AdaptiveCard 1.5 `metadata` object. The standard

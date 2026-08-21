@@ -54,10 +54,12 @@ type v3Fields struct {
 		SourceName string `json:"sourceName"`
 	} `json:"document"`
 	Requester struct {
-		Name      string `json:"name"`
-		AvatarURL string `json:"avatarUrl"`
+		Name            string `json:"name"`
+		AvatarURL       string `json:"avatarUrl"`
+		SourceSpaceName string `json:"sourceSpaceName"`
 	} `json:"requester"`
-	Permission struct {
+	RequestedBotNames []string `json:"requestedBotNames"`
+	Permission        struct {
 		Label     string `json:"label"`
 		RoleLabel string `json:"roleLabel"`
 	} `json:"permission"`
@@ -65,9 +67,10 @@ type v3Fields struct {
 	RequestedAtDisplay string `json:"requestedAtDisplay"`
 	MessageTimeDisplay string `json:"messageTimeDisplay"`
 	Decision           struct {
-		OperatorName     string `json:"operatorName"`
-		DecidedAtDisplay string `json:"decidedAtDisplay"`
-		RejectionReason  string `json:"rejectionReason"`
+		OperatorName      string `json:"operatorName"`
+		OperatorSpaceName string `json:"operatorSpaceName"`
+		DecidedAtDisplay  string `json:"decidedAtDisplay"`
+		RejectionReason   string `json:"rejectionReason"`
 	} `json:"decision"`
 }
 
@@ -86,7 +89,7 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 			docID = input.RequestID
 		}
 		body, deepLink, err := cardtmpl.BuildDocsAccessRequestV3BodyWithLang(
-			env.Lang, env.WebLoginURL, docID, input.RequestID, env.SpaceID,
+			env.Lang, env.WebLoginURL, docID, input.RequestID,
 			cardtmpl.DocsAccessRequestV3Content{
 				DocsApprovalContent: docsApprovalContentFromFields(input, labels),
 				SourceName:          input.Document.SourceName,
@@ -117,6 +120,10 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 		docID = input.RequestID
 	}
 	labels := resultLabels(env.Lang, state == StateRejected)
+	decidedAtDisplay := strings.TrimSpace(input.Decision.DecidedAtDisplay)
+	if decidedAtDisplay == "" {
+		decidedAtDisplay = input.MessageTimeDisplay // compatibility for older callers
+	}
 	variant := VariantApproved
 	switch state {
 	case StateRejected:
@@ -126,7 +133,7 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 	case StateUnavailable:
 		labels, variant = unavailableLabels(env.Lang), VariantUnavailable
 	}
-	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeV3BodyWithLang(env.Lang, env.WebLoginURL, docID, env.SpaceID, cardtmpl.DocsOutcomeContent{
+	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeV3BodyWithLang(env.Lang, env.WebLoginURL, docID, cardtmpl.DocsOutcomeContent{
 		// Denied selects the L0 "not granted" treatment rather than the green
 		// approved one. Cancelled is not a denial, but the outcome builder
 		// carries a two-way flag and the honest half of it is that access was
@@ -135,14 +142,17 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 		// display nuance, which does not belong in this fix.
 		Title: input.Document.Title, Variant: variant, Denied: state != StateApproved,
 		HeaderLabel: labels.header, SourceName: input.Document.SourceName,
-		StatusLabel: labels.status, PermissionLabel: input.Permission.Label, ResultText: labels.result,
-		ReasonLabel: labels.reason, Reason: input.Decision.RejectionReason,
+		StatusLabel: labels.status, PermissionLabel: input.Permission.Label,
+		PermissionRoleLabel: input.Permission.RoleLabel,
+		ReasonLabel:         labels.reason, Reason: input.Decision.RejectionReason,
 		Actor: input.Requester.Name, ActorAvatar: input.Requester.AvatarURL,
+		RequesterSpaceName: input.Requester.SourceSpaceName, RequestedBotNames: input.RequestedBotNames,
 		RequestedAtDisplay: input.RequestedAtDisplay, RequestReason: input.RequestReason,
 		BannerSuffix: labels.banner(input.Permission.RoleLabel), RoleLabel: labels.role,
-		RequestReasonLabel: labels.requestReason, MessageTimeLabel: labels.processedAt,
-		MessageTimeDisplay: input.MessageTimeDisplay,
-		DecisionSummary:    strings.Trim(strings.TrimSpace(input.Decision.OperatorName)+" · "+strings.TrimSpace(input.Decision.DecidedAtDisplay), " ·"),
+		RequestReasonLabel:        labels.requestReason,
+		MessageTimeDisplay:        decidedAtDisplay,
+		DecisionOperatorName:      input.Decision.OperatorName,
+		DecisionOperatorSpaceName: input.Decision.OperatorSpaceName,
 	})
 	if err != nil {
 		return cardtmpl.BuildResult{}, err
