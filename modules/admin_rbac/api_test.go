@@ -105,6 +105,66 @@ func TestRBACHandlersEnforceManagerAndSuperAdminAllowlist(t *testing.T) {
 	}
 }
 
+func TestRBACHandlersRejectNonManagerRolesAcrossAllRoutes(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		set    func(*wkhttp.Context)
+	}{
+		{name: "list roles", method: http.MethodGet, path: "/v1/manager/rbac/roles", set: func(*wkhttp.Context) {}},
+		{name: "create role", method: http.MethodPost, path: "/v1/manager/rbac/roles", set: func(*wkhttp.Context) {}},
+		{name: "update role", method: http.MethodPut, path: "/v1/manager/rbac/roles/reader", set: func(c *wkhttp.Context) { setRouteParams(c, "role_key", "reader") }},
+		{name: "list role permissions", method: http.MethodGet, path: "/v1/manager/rbac/roles/reader/permissions", set: func(c *wkhttp.Context) { setRouteParams(c, "role_key", "reader") }},
+		{name: "grant role permission", method: http.MethodPut, path: "/v1/manager/rbac/roles/reader/permissions/user.read", set: func(c *wkhttp.Context) { setRouteParams(c, "role_key", "reader", "permission_key", "user.read") }},
+		{name: "revoke role permission", method: http.MethodDelete, path: "/v1/manager/rbac/roles/reader/permissions/user.read", set: func(c *wkhttp.Context) { setRouteParams(c, "role_key", "reader", "permission_key", "user.read") }},
+		{name: "list user roles", method: http.MethodGet, path: "/v1/manager/rbac/users/u1/roles", set: func(c *wkhttp.Context) { setRouteParams(c, "uid", "u1") }},
+		{name: "grant user role", method: http.MethodPut, path: "/v1/manager/rbac/users/u1/roles/reader", set: func(c *wkhttp.Context) { setRouteParams(c, "uid", "u1", "role_key", "reader") }},
+		{name: "revoke user role", method: http.MethodDelete, path: "/v1/manager/rbac/users/u1/roles/reader", set: func(c *wkhttp.Context) { setRouteParams(c, "uid", "u1", "role_key", "reader") }},
+		{name: "effective permissions", method: http.MethodGet, path: "/v1/manager/rbac/users/u1/effective-permissions", set: func(c *wkhttp.Context) { setRouteParams(c, "uid", "u1") }},
+	}
+	for _, role := range []string{"", "dashboardReader", "marketAdmin"} {
+		for _, tc := range cases {
+			t.Run(role+"/"+tc.name, func(t *testing.T) {
+				api, _, cleanup := newMockAPI(t)
+				defer cleanup()
+				c, recorder := testWKContextWithRecorder(t, tc.method, tc.path, "")
+				setRole(c, role)
+				tc.set(c)
+				invokeRBACRouteForTest(api, tc.name, c)
+				if recorder.Code != http.StatusForbidden {
+					t.Fatalf("role %q route %s status = %d, want %d", role, tc.name, recorder.Code, http.StatusForbidden)
+				}
+			})
+		}
+	}
+}
+
+func invokeRBACRouteForTest(api *API, name string, c *wkhttp.Context) {
+	switch name {
+	case "list roles":
+		api.listRoles(c)
+	case "create role":
+		api.createRole(c)
+	case "update role":
+		api.updateRole(c)
+	case "list role permissions":
+		api.listRolePermissions(c)
+	case "grant role permission":
+		api.grantRolePermission(c)
+	case "revoke role permission":
+		api.revokeRolePermission(c)
+	case "list user roles":
+		api.listUserRoles(c)
+	case "grant user role":
+		api.grantUserRole(c)
+	case "revoke user role":
+		api.revokeUserRole(c)
+	case "effective permissions":
+		api.effectivePermissions(c)
+	}
+}
+
 func TestCreateRoleReturnsOnlyAfterDatabaseCommit(t *testing.T) {
 	api, mock, cleanup := newMockAPI(t)
 	defer cleanup()
@@ -132,7 +192,6 @@ func TestUpdateRoleReturnsCommittedState(t *testing.T) {
 		return sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
 			AddRow(7, "reader", name, "", activeStatus, 3, now, now)
 	}
-	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE .*role_key='reader'").WillReturnRows(roleRows("Reader"))
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE role_key='reader' FOR UPDATE").WillReturnRows(roleRows("Reader"))
 	mock.ExpectExec("UPDATE .*admin_rbac_role").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -237,6 +296,8 @@ func TestEffectivePermissionsReturnsRoleVersions(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='u1'").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT .*authorization_version.*FROM .*admin_rbac_user_role.*").
+		WillReturnRows(sqlmock.NewRows([]string{"role_key", "authorization_version"}).AddRow("reader", 4))
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_user_role.*").
 		WillReturnRows(sqlmock.NewRows([]string{"role_id", "role_key", "role_status", "authorization_version", "permission_key"}).
 			AddRow(7, "reader", activeStatus, 4, "user.read"))

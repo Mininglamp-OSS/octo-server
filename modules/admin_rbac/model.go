@@ -25,8 +25,8 @@ type Role struct {
 }
 
 type RoleVersion struct {
-	RoleKey              string `json:"role_key"`
-	AuthorizationVersion int64  `json:"authorization_version"`
+	RoleKey              string `db:"role_key" json:"role_key"`
+	AuthorizationVersion int64  `db:"authorization_version" json:"authorization_version"`
 }
 
 type RoleSnapshot struct {

@@ -18,6 +18,7 @@ import (
 const (
 	unresolvedRoutePrefix         = "\x00"
 	unresolvedPlatformRoutePrefix = "\x01"
+	adminRBACModuleDirectory      = "modules/admin_rbac"
 )
 
 // ScannedRoute is a statically registered HTTP route whose handler reaches one
@@ -35,10 +36,11 @@ type ScannedRoute struct {
 // RouteBoundaryExclusion classifies a route that reaches a legacy gate through
 // a mixed handler but remains governed by a business ACL branch.
 type RouteBoundaryExclusion struct {
-	Method  string
-	Path    string
-	Handler string
-	Reason  string
+	Method    string
+	Path      string
+	Handler   string
+	GateSites []string
+	Reason    string
 }
 
 type scannedFunction struct {
@@ -59,10 +61,18 @@ func ScanManagerRoutes(repositoryRoot string, gates []ScannedGate) ([]ScannedRou
 		directory := filepath.Dir(filepath.FromSlash(sourceFile(gate.Source)))
 		gatesByDirectory[directory] = append(gatesByDirectory[directory], gate)
 	}
+	// RBAC is a bootstrap meta-surface. It must be scanned even if a future
+	// edit removes every recognized gate, so the contract fails closed instead
+	// of silently losing the whole directory from the inventory.
+	if _, err := os.Stat(filepath.Join(repositoryRoot, adminRBACModuleDirectory)); err == nil {
+		if _, exists := gatesByDirectory[adminRBACModuleDirectory]; !exists {
+			gatesByDirectory[adminRBACModuleDirectory] = nil
+		}
+	}
 
 	var routes []ScannedRoute
 	for directory, directoryGates := range gatesByDirectory {
-		scanned, err := scanRouteDirectory(repositoryRoot, directory, directoryGates)
+		scanned, err := scanRouteDirectory(repositoryRoot, directory, directoryGates, directory == adminRBACModuleDirectory)
 		if err != nil {
 			return nil, err
 		}
@@ -85,6 +95,31 @@ func ScanManagerRoutes(repositoryRoot string, gates []ScannedGate) ([]ScannedRou
 // they become scanned routes, so the repository contract has no exclusions.
 func ManagerRouteBoundaryExclusions() []RouteBoundaryExclusion {
 	return nil
+}
+
+// ManagerRBACMetaSurfaceExclusions lists the bootstrap management routes that
+// are intentionally not permission operations. They still require a
+// recognized legacy gate and are checked bidirectionally against source.
+func ManagerRBACMetaSurfaceExclusions() []RouteBoundaryExclusion {
+	managerGate := "modules/admin_rbac/api.go::API.requireManager#1"
+	superAdminGate := "modules/admin_rbac/api.go::API.requireSuperAdmin#1"
+	reason := "RBAC bootstrap meta-surface; not a business ACL or permission operation"
+	return []RouteBoundaryExclusion{
+		{Method: http.MethodGet, Path: "/v1/manager/rbac/roles", Handler: "API.listRoles", GateSites: []string{managerGate}, Reason: reason},
+		{Method: http.MethodPost, Path: "/v1/manager/rbac/roles", Handler: "API.createRole", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodPut, Path: "/v1/manager/rbac/roles/:role_key", Handler: "API.updateRole", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodGet, Path: "/v1/manager/rbac/roles/:role_key/permissions", Handler: "API.listRolePermissions", GateSites: []string{managerGate}, Reason: reason},
+		{Method: http.MethodPut, Path: "/v1/manager/rbac/roles/:role_key/permissions/:permission_key", Handler: "API.grantRolePermission", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodDelete, Path: "/v1/manager/rbac/roles/:role_key/permissions/:permission_key", Handler: "API.revokeRolePermission", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodGet, Path: "/v1/manager/rbac/users/:uid/roles", Handler: "API.listUserRoles", GateSites: []string{managerGate}, Reason: reason},
+		{Method: http.MethodPut, Path: "/v1/manager/rbac/users/:uid/roles/:role_key", Handler: "API.grantUserRole", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodDelete, Path: "/v1/manager/rbac/users/:uid/roles/:role_key", Handler: "API.revokeUserRole", GateSites: []string{superAdminGate}, Reason: reason},
+		{Method: http.MethodGet, Path: "/v1/manager/rbac/users/:uid/effective-permissions", Handler: "API.effectivePermissions", GateSites: []string{managerGate}, Reason: reason},
+	}
+}
+
+func isRBACMetaSurfaceRoute(routePath string) bool {
+	return routePath == "/v1/manager/rbac" || strings.HasPrefix(routePath, "/v1/manager/rbac/")
 }
 
 func isPlatformOperationRoute(method, routePath, handler string) bool {
@@ -173,7 +208,10 @@ func ValidateRouteCoverage(routes []ScannedRoute, operations []Operation, exclus
 				return fmt.Errorf("route boundary %s %s handler drift: source=%q fixture=%q", route.Method, route.Path, route.Handler, exclusion.Handler)
 			}
 			if _, declared := operationsByKey[key]; declared {
-				return fmt.Errorf("business ACL route %s %s must not be declared as a global operation", route.Method, route.Path)
+				return fmt.Errorf("excluded route %s %s must not be declared as a global operation", route.Method, route.Path)
+			}
+			if len(exclusion.GateSites) > 0 && !equalStringSets(route.GateSites, exclusion.GateSites) {
+				return fmt.Errorf("excluded route %s %s gate-site drift: source=%v fixture=%v", route.Method, route.Path, route.GateSites, exclusion.GateSites)
 			}
 			matchedExclusions[key] = struct{}{}
 			continue
@@ -229,7 +267,7 @@ func equalStringSets(left, right []string) bool {
 	return true
 }
 
-func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []ScannedGate) ([]ScannedRoute, error) {
+func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []ScannedGate, requireGatedPlatformRoutes bool) ([]ScannedRoute, error) {
 	directory := filepath.Join(repositoryRoot, relativeDirectory)
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -323,7 +361,7 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 	var routes []ScannedRoute
 	for _, function := range routeFunctions {
 		routeSymbols[function.symbol] = struct{}{}
-		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true, false)
+		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true, false, requireGatedPlatformRoutes)
 		if err != nil {
 			return nil, err
 		}
@@ -339,7 +377,7 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 			continue
 		}
 		_, platformContext := platformDelegates[symbol]
-		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false, platformContext); err != nil {
+		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false, platformContext, requireGatedPlatformRoutes); err != nil {
 			return nil, err
 		}
 	}
@@ -452,7 +490,7 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 	return edges
 }
 
-func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration, platformContext bool) ([]ScannedRoute, error) {
+func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration, platformContext, requireGatedPlatformRoutes bool) ([]ScannedRoute, error) {
 	prefixes := make(map[string]string)
 	receiverAliases := receiverAliasSet(function)
 	for _, field := range function.parameters {
@@ -540,6 +578,10 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 		}
 		gateSites := reachable[handler]
 		if len(gateSites) == 0 {
+			if requireGatedPlatformRoutes && platformCandidate {
+				scanErr = fmt.Errorf("%s:%d: RBAC meta route %s %s has no recognized gate", function.file, position.Line, selector.Sel.Name, fullPath)
+				return false
+			}
 			return true
 		}
 		if !allowRegistration {

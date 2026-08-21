@@ -106,6 +106,59 @@ func TestScanManagerRoutesRejectsUnresolvedGatedHandler(t *testing.T) {
 	}
 }
 
+func TestScanManagerRoutesRejectsUngatedRBACMetaRoute(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "modules/admin_rbac/api.go", `package adminrbac
+type API struct{}
+type Context struct{}
+type Router struct{}
+type Group struct{}
+func (r *Router) Group(string) *Group { return nil }
+func (g *Group) GET(string, ...interface{}) {}
+func (a *API) Route(r *Router) {
+	auth := r.Group("/v1/manager/rbac")
+	auth.GET("/roles", a.listRoles)
+}
+func (a *API) listRoles(c *Context) {}
+`)
+
+	gates, err := ScanDirectGates(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ScanManagerRoutes(root, gates)
+	if err == nil || !strings.Contains(err.Error(), "RBAC meta route") || !strings.Contains(err.Error(), "has no recognized gate") {
+		t.Fatalf("ScanManagerRoutes() error = %v, want ungated RBAC meta route failure", err)
+	}
+}
+
+func TestScanManagerRoutesRejectsUngatedRBACMetaRouteWithDynamicPath(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "modules/admin_rbac/api.go", `package adminrbac
+type API struct{}
+type Context struct{}
+type Router struct{}
+type Group struct{}
+func (r *Router) Group(string) *Group { return nil }
+func (g *Group) GET(string, ...interface{}) {}
+func routePath() string { return "/roles" }
+func (a *API) Route(r *Router) {
+	auth := r.Group("/v1/manager/rbac")
+	auth.GET(routePath(), a.listRoles)
+}
+func (a *API) listRoles(c *Context) {}
+`)
+
+	gates, err := ScanDirectGates(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ScanManagerRoutes(root, gates)
+	if err == nil || !strings.Contains(err.Error(), "RBAC meta route") || !strings.Contains(err.Error(), "has no recognized gate") {
+		t.Fatalf("ScanManagerRoutes() error = %v, want ungated dynamic RBAC meta route failure", err)
+	}
+}
+
 func TestScanManagerRoutesRejectsUnresolvedGatedPrefix(t *testing.T) {
 	root := t.TempDir()
 	contents := strings.Replace(routeFixtureSource(false), `auth := r.Group("/v1/manager")`, `auth := unknown.Group("/v1/manager")`, 1)
@@ -391,6 +444,19 @@ func TestValidateRouteCoverage(t *testing.T) {
 				t.Fatalf("ValidateRouteCoverage() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateRouteCoverageChecksMetaSurfaceGateSites(t *testing.T) {
+	gate := "modules/admin_rbac/api.go::API.requireManager#1"
+	route := ScannedRoute{Method: "GET", Path: "/v1/manager/rbac/roles", Handler: "API.listRoles", GateSites: []string{gate}, Source: "modules/admin_rbac/api.go", Line: 10}
+	exclusion := RouteBoundaryExclusion{Method: "GET", Path: "/v1/manager/rbac/roles", Handler: "API.listRoles", GateSites: []string{gate}, Reason: "RBAC meta-surface"}
+	if err := ValidateRouteCoverage([]ScannedRoute{route}, nil, []RouteBoundaryExclusion{exclusion}); err != nil {
+		t.Fatalf("ValidateRouteCoverage() error = %v", err)
+	}
+	exclusion.GateSites = []string{"other"}
+	if err := ValidateRouteCoverage([]ScannedRoute{route}, nil, []RouteBoundaryExclusion{exclusion}); err == nil || !strings.Contains(err.Error(), "gate-site drift") {
+		t.Fatalf("ValidateRouteCoverage() error = %v, want meta gate-site drift", err)
 	}
 }
 

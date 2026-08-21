@@ -41,7 +41,8 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if err := ValidateGateInventory(platformGates, manifest.GateSites); err != nil {
 		t.Fatalf("ValidateGateInventory() error = %v", err)
 	}
-	if err := ValidateRouteCoverage(routes, manifest.Operations, ManagerRouteBoundaryExclusions()); err != nil {
+	exclusions := append(ManagerRouteBoundaryExclusions(), ManagerRBACMetaSurfaceExclusions()...)
+	if err := ValidateRouteCoverage(routes, manifest.Operations, exclusions); err != nil {
 		t.Fatalf("ValidateRouteCoverage() error = %v", err)
 	}
 	if got, want := len(manifest.Permissions), 90; got != want {
@@ -53,8 +54,8 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if got, want := len(manifest.Operations), 130; got != want {
 		t.Fatalf("global operation count = %d, want %d", got, want)
 	}
-	if got, want := len(routes), len(manifest.Operations); got != want {
-		t.Fatalf("source platform route count = %d, want %d global operations", got, want)
+	if got, want := len(routes), len(manifest.Operations)+len(exclusions); got != want {
+		t.Fatalf("source platform route count = %d, want %d global operations and meta exclusions", got, want)
 	}
 	assertSourceRouteBoundaries(t, routes)
 	if got, want := len(platformGates), 96; got != want {
@@ -63,8 +64,8 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if got, want := len(manifest.GateSites), 96; got != want {
 		t.Fatalf("manifest gate count = %d, want %d", got, want)
 	}
-	if got, want := len(scanned), 101; got != want {
-		t.Fatalf("recognized source gate count = %d, want %d including 5 excluded business gates", got, want)
+	if got, want := len(scanned), 103; got != want {
+		t.Fatalf("recognized source gate count = %d, want %d including RBAC meta gates and 5 excluded business gates", got, want)
 	}
 	moduleCounts := make(map[string]int)
 	for _, gate := range platformGates {

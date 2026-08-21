@@ -38,7 +38,7 @@ func (c *PermissionCache) roleKey(roleKey string) string {
 	return fmt.Sprintf("%s:role:%d:%s", permissionCacheNamespace, authz.PermissionContractSchemaVersion, roleKey)
 }
 
-func (c *PermissionCache) Get(uid string, snapshots []RoleSnapshot) (EffectivePermissions, bool, error) {
+func (c *PermissionCache) Get(uid string, roleVersions []RoleVersion) (EffectivePermissions, bool, error) {
 	if c == nil || c.cache == nil || uid == "" {
 		return EffectivePermissions{}, false, nil
 	}
@@ -50,13 +50,9 @@ func (c *PermissionCache) Get(uid string, snapshots []RoleSnapshot) (EffectivePe
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
 		return EffectivePermissions{}, false, nil
 	}
-	expected, err := Evaluate(uid, snapshots)
-	if err != nil {
-		return EffectivePermissions{}, false, err
-	}
 	if envelope.SchemaVersion != authz.PermissionContractSchemaVersion || envelope.UID != uid ||
 		envelope.ExpiresAt <= time.Now().Unix() ||
-		!roleVersionsEqual(envelope.RoleVersions, expected.RoleVersions) {
+		!roleVersionsEqual(envelope.RoleVersions, roleVersions) {
 		return EffectivePermissions{}, false, nil
 	}
 	if !sort.StringsAreSorted(envelope.Permissions) {

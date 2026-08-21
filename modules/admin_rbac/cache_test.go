@@ -54,7 +54,8 @@ func TestPermissionCacheUsesRoleVersionsAndContractNamespace(t *testing.T) {
 	if err := permissionCache.Set(result); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	cached, ok, err := permissionCache.Get("u1", snapshots)
+	versions := []RoleVersion{{RoleKey: "reader", AuthorizationVersion: 3}}
+	cached, ok, err := permissionCache.Get("u1", versions)
 	if err != nil || !ok {
 		t.Fatalf("Get = (%+v, %v, %v), want hit", cached, ok, err)
 	}
@@ -70,7 +71,7 @@ func TestPermissionCacheUsesRoleVersionsAndContractNamespace(t *testing.T) {
 	if envelope.ExpiresAt <= time.Now().Unix() {
 		t.Fatalf("cache expires_at = %d, want future timestamp", envelope.ExpiresAt)
 	}
-	changed, ok, err := permissionCache.Get("u1", []RoleSnapshot{{RoleKey: "reader", AuthorizationVersion: 4, Status: activeStatus, Permissions: []string{"user.read"}}})
+	changed, ok, err := permissionCache.Get("u1", []RoleVersion{{RoleKey: "reader", AuthorizationVersion: 4}})
 	if err != nil || ok || !reflectEffectiveEmpty(changed) {
 		t.Fatalf("changed-version Get = (%+v, %v, %v), want miss", changed, ok, err)
 	}

@@ -69,8 +69,8 @@ func TestChangeUserRoleRollsBackOnBindingWriteFailure(t *testing.T) {
 	now := time.Now()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid.*'u1'").
-		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT uid,robot,status,is_destroy FROM user WHERE uid='u1' FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"uid", "robot", "status", "is_destroy"}).AddRow("u1", 0, activeStatus, 0))
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE role_key='writer' FOR UPDATE").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
 			AddRow(7, "writer", "Writer", "", activeStatus, 3, now, now))
@@ -120,8 +120,8 @@ func TestChangeUserRoleRejectsInactiveUser(t *testing.T) {
 	service, mock, _ := newMockService(t)
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='disabled'.*status=1.*is_destroy").
-		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
+	mock.ExpectQuery("SELECT uid,robot,status,is_destroy FROM user WHERE uid='disabled' FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"uid", "robot", "status", "is_destroy"}).AddRow("disabled", 0, 0, 0))
 	mock.ExpectRollback()
 
 	if err := service.ChangeUserRole("disabled", "writer", true); !errors.Is(err, ErrUserNotFound) {
@@ -135,7 +135,7 @@ func TestChangeUserRoleRejectsInactiveUser(t *testing.T) {
 func TestEffectivePermissionsRejectsInactiveUser(t *testing.T) {
 	service, mock, _ := newMockService(t)
 
-	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='disabled'.*status=1.*is_destroy").
+	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='disabled'.*robot=0.*status=1.*is_destroy=0").
 		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
 
 	if _, err := service.EffectivePermissions("disabled"); !errors.Is(err, ErrUserNotFound) {
@@ -143,6 +143,71 @@ func TestEffectivePermissionsRejectsInactiveUser(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
+func TestChangeUserRoleRejectsBotUser(t *testing.T) {
+	service, mock, _ := newMockService(t)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT uid,robot,status,is_destroy FROM user WHERE uid='bot' FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"uid", "robot", "status", "is_destroy"}).AddRow("bot", 1, activeStatus, 0))
+	mock.ExpectRollback()
+
+	if err := service.ChangeUserRole("bot", "writer", true); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("ChangeUserRole error = %v, want ErrUserNotFound", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
+func TestEffectivePermissionsRejectsBotUser(t *testing.T) {
+	service, mock, _ := newMockService(t)
+
+	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='bot'.*robot=0.*status=1.*is_destroy=0").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(0))
+
+	if _, err := service.EffectivePermissions("bot"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("EffectivePermissions error = %v, want ErrUserNotFound", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
+func TestEffectivePermissionsCacheHitSkipsPermissionJoin(t *testing.T) {
+	service, mock, backend := newMockService(t)
+	result, err := Evaluate("u1", []RoleSnapshot{{
+		RoleKey:              "reader",
+		AuthorizationVersion: 4,
+		Status:               activeStatus,
+		Permissions:          []string{"user.read"},
+	}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if err := service.cache.Set(result); err != nil {
+		t.Fatalf("cache.Set: %v", err)
+	}
+
+	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='u1'").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT .*authorization_version.*FROM .*admin_rbac_user_role.*").
+		WillReturnRows(sqlmock.NewRows([]string{"role_key", "authorization_version"}).AddRow("reader", 4))
+
+	got, err := service.EffectivePermissions("u1")
+	if err != nil {
+		t.Fatalf("EffectivePermissions: %v", err)
+	}
+	if len(got.Permissions) != 1 || got.Permissions[0] != "user.read" {
+		t.Fatalf("permissions = %v, want cache hit", got.Permissions)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+	if len(backend.values) != 1 {
+		t.Fatalf("cache entries = %d, want one user envelope", len(backend.values))
 	}
 }
 
@@ -159,11 +224,38 @@ func TestUpdateRoleInvalidatesBeforeReadback(t *testing.T) {
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE .*role_key='reader'").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}))
 
-	if _, err := service.UpdateRole("reader", "Reader", "", 0); !errors.Is(err, ErrRoleNotFound) {
+	disabled := 0
+	if _, err := service.UpdateRole("reader", "Reader", "", &disabled); !errors.Is(err, ErrRoleNotFound) {
 		t.Fatalf("UpdateRole error = %v, want post-commit readback error", err)
 	}
 	if len(backend.deleted) != 1 || backend.deleted[0] != service.cache.roleKey("reader") {
 		t.Fatalf("deleted cache keys = %v, want role cache invalidated before readback", backend.deleted)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
+func TestNameOnlyRoleUpdatePreservesLockedDisabledStatus(t *testing.T) {
+	service, mock, _ := newMockService(t)
+	now := time.Now()
+	roleRows := sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
+		AddRow(7, "reader", "Reader", "", 0, 3, now, now)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE role_key='reader' FOR UPDATE").WillReturnRows(roleRows)
+	mock.ExpectExec("UPDATE .*admin_rbac_role").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE .*role_key='reader'").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
+			AddRow(7, "reader", "Renamed", "", 0, 3, now, now))
+
+	updated, err := service.UpdateRole("reader", "Renamed", "", nil)
+	if err != nil {
+		t.Fatalf("UpdateRole: %v", err)
+	}
+	if updated.Status != 0 {
+		t.Fatalf("updated role status = %d, want locked disabled status preserved", updated.Status)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("SQL expectations: %v", err)

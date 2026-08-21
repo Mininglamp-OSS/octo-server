@@ -58,7 +58,8 @@ func checkContract(repositoryRoot, manifestPath, goOutputPath, jsonOutputPath st
 	if err := authz.ValidateGateInventory(platformGates, manifest.GateSites); err != nil {
 		return err
 	}
-	if err := authz.ValidateRouteCoverage(routes, manifest.Operations, authz.ManagerRouteBoundaryExclusions()); err != nil {
+	exclusions := append(authz.ManagerRouteBoundaryExclusions(), authz.ManagerRBACMetaSurfaceExclusions()...)
+	if err := authz.ValidateRouteCoverage(routes, manifest.Operations, exclusions); err != nil {
 		return err
 	}
 	return authz.CheckGeneratedFiles(manifestPath, goOutputPath, jsonOutputPath)

@@ -198,6 +198,9 @@ func PlatformGates(scanned []ScannedGate, routes []ScannedRoute) ([]ScannedGate,
 	}
 	referenced := make(map[string]struct{})
 	for _, route := range routes {
+		if isRBACMetaSurfaceRoute(route.Path) {
+			continue
+		}
 		for _, source := range route.GateSites {
 			if _, exists := bySource[source]; !exists {
 				return nil, fmt.Errorf("route %s %s references unscanned gate %q", route.Method, route.Path, source)

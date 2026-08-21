@@ -59,8 +59,7 @@ type rolePermissionsResponse struct {
 }
 
 func (a *API) requireManager(c *wkhttp.Context) bool {
-	role := c.GetLoginRole()
-	if role != string(wkhttp.Admin) && role != string(wkhttp.SuperAdmin) {
+	if err := c.CheckLoginRole(); err != nil {
 		respondRBACError(c, errcode.ErrSharedForbidden)
 		return false
 	}
@@ -68,7 +67,7 @@ func (a *API) requireManager(c *wkhttp.Context) bool {
 }
 
 func (a *API) requireSuperAdmin(c *wkhttp.Context) bool {
-	if c.GetLoginRole() != string(wkhttp.SuperAdmin) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondRBACError(c, errcode.ErrSharedForbidden)
 		return false
 	}
@@ -126,16 +125,7 @@ func (a *API) updateRole(c *wkhttp.Context) {
 		respondRBACError(c, errcode.ErrSharedParamInvalid)
 		return
 	}
-	current, err := a.svc.GetRole(roleKey)
-	if err != nil {
-		respondRBACFailure(c, err)
-		return
-	}
-	status := current.Status
-	if req.Status != nil {
-		status = *req.Status
-	}
-	role, err := a.svc.UpdateRole(roleKey, req.Name, req.Description, status)
+	role, err := a.svc.UpdateRole(roleKey, req.Name, req.Description, req.Status)
 	if err != nil {
 		respondRBACFailure(c, err)
 		return

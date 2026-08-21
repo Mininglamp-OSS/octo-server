@@ -44,7 +44,7 @@ func (s *Service) CreateRole(roleKey, name, description string) (*Role, error) {
 	return s.store.createRole(roleKey, strings.TrimSpace(name), strings.TrimSpace(description))
 }
 
-func (s *Service) UpdateRole(roleKey, name, description string, status int) (*Role, error) {
+func (s *Service) UpdateRole(roleKey, name, description string, status *int) (*Role, error) {
 	roleKey = strings.TrimSpace(roleKey)
 	if err := validateRoleKey(roleKey); err != nil {
 		return nil, err
@@ -53,7 +53,7 @@ func (s *Service) UpdateRole(roleKey, name, description string, status int) (*Ro
 	if name == "" {
 		return nil, ErrInvalidRequest
 	}
-	if status != 0 && status != activeStatus {
+	if status != nil && *status != 0 && *status != activeStatus {
 		return nil, ErrInvalidRequest
 	}
 	tx, err := s.store.session.Begin()
@@ -65,12 +65,17 @@ func (s *Service) UpdateRole(roleKey, name, description string, status int) (*Ro
 	if err != nil {
 		return nil, err
 	}
-	if status == role.Status {
+	effectiveStatus := role.Status
+	if status != nil {
+		effectiveStatus = *status
+	}
+	statusChanged := effectiveStatus != role.Status
+	if !statusChanged {
 		_, err = tx.Update("admin_rbac_role").Set("name", name).
 			Set("description", strings.TrimSpace(description)).Where("id=?", role.ID).Exec()
 	} else {
 		_, err = tx.Update("admin_rbac_role").Set("name", name).
-			Set("description", strings.TrimSpace(description)).Set("status", status).
+			Set("description", strings.TrimSpace(description)).Set("status", effectiveStatus).
 			Set("authorization_version", dbr.Expr("authorization_version + 1")).Where("id=?", role.ID).Exec()
 	}
 	if err != nil {
@@ -79,7 +84,7 @@ func (s *Service) UpdateRole(roleKey, name, description string, status int) (*Ro
 	if err := tx.Commit(); err != nil {
 		return nil, wrapStoreError("commit role update", err)
 	}
-	if status != role.Status {
+	if statusChanged {
 		if err := s.invalidateRole(roleKey); err != nil {
 			return nil, err
 		}
@@ -241,14 +246,18 @@ func (s *Service) EffectivePermissions(uid string) (EffectivePermissions, error)
 	} else if !exists {
 		return EffectivePermissions{}, ErrUserNotFound
 	}
-	snapshots, err := s.store.loadEffectiveSnapshot(uid)
+	roleVersions, err := s.store.loadRoleVersions(uid)
 	if err != nil {
-		return EffectivePermissions{}, wrapStoreError("load effective permission snapshot", err)
+		return EffectivePermissions{}, wrapStoreError("load effective role versions", err)
 	}
-	if cached, ok, err := s.cache.Get(uid, snapshots); err != nil {
+	if cached, ok, err := s.cache.Get(uid, roleVersions); err != nil {
 		return EffectivePermissions{}, err
 	} else if ok {
 		return cached, nil
+	}
+	snapshots, err := s.store.loadEffectiveSnapshot(uid)
+	if err != nil {
+		return EffectivePermissions{}, wrapStoreError("load effective permission snapshot", err)
 	}
 	result, err := Evaluate(uid, snapshots)
 	if err != nil {

@@ -1,6 +1,7 @@
 package adminrbac
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -37,7 +38,7 @@ func (s *Store) GetRole(roleKey string) (*Role, error) {
 
 func (s *Store) UserExists(uid string) (bool, error) {
 	var count int64
-	_, err := s.session.Select("COUNT(*)").From("user").Where("uid=? AND status=? AND IFNULL(is_destroy,0)<>2", uid, activeStatus).Load(&count)
+	_, err := s.session.Select("COUNT(*)").From("user").Where("uid=? AND robot=0 AND status=? AND is_destroy=0", uid, activeStatus).Load(&count)
 	return count > 0, err
 }
 
@@ -92,9 +93,20 @@ func (s *Store) roleByKeyTx(tx *dbr.Tx, roleKey string, forUpdate bool) (*Role, 
 }
 
 func (s *Store) userExistsTx(tx *dbr.Tx, uid string) (bool, error) {
-	var count int64
-	_, err := tx.Select("COUNT(*)").From("user").Where("uid=? AND status=? AND IFNULL(is_destroy,0)<>2", uid, activeStatus).Load(&count)
-	return count > 0, err
+	var principal struct {
+		UID       string `db:"uid"`
+		Robot     int    `db:"robot"`
+		Status    int    `db:"status"`
+		IsDestroy int    `db:"is_destroy"`
+	}
+	err := tx.SelectBySql("SELECT uid,robot,status,is_destroy FROM user WHERE uid=? FOR UPDATE", uid).LoadOne(&principal)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return principal.Robot == 0 && principal.Status == activeStatus && principal.IsDestroy == 0, nil
 }
 
 func (s *Store) listRolePermissions(roleKey string) ([]string, error) {
@@ -110,7 +122,7 @@ func (s *Store) listUserRoles(uid string) ([]UserRole, error) {
 	_, err := s.session.Select("ur.uid,r.role_key,r.name role_name,r.status role_status,ur.status,ur.created_at").
 		From("admin_rbac_user_role ur").
 		Join("admin_rbac_role r", "r.id=ur.role_id").
-		Join("user u", "u.uid=ur.uid AND u.status=1 AND IFNULL(u.is_destroy,0)<>2").
+		Join("user u", "u.uid=ur.uid AND u.robot=0 AND u.status=1 AND u.is_destroy=0").
 		Where("ur.uid=?", uid).OrderAsc("r.role_key").Load(&roles)
 	return roles, err
 }
@@ -120,7 +132,7 @@ func (s *Store) loadEffectiveSnapshot(uid string) ([]RoleSnapshot, error) {
 	_, err := s.session.Select("r.id role_id,r.role_key,r.status role_status,r.authorization_version,COALESCE(rp.permission_key,'') permission_key").
 		From("admin_rbac_user_role ur").
 		Join("admin_rbac_role r", "r.id=ur.role_id").
-		Join("user u", "u.uid=ur.uid AND u.status=1 AND IFNULL(u.is_destroy,0)<>2").
+		Join("user u", "u.uid=ur.uid AND u.robot=0 AND u.status=1 AND u.is_destroy=0").
 		LeftJoin("admin_rbac_role_permission rp", "rp.role_id=r.id").
 		Where("ur.uid=? AND ur.status=?", uid, activeStatus).
 		OrderAsc("r.role_key").OrderAsc("rp.permission_key").Load(&rows)
@@ -143,6 +155,17 @@ func (s *Store) loadEffectiveSnapshot(uid string) ([]RoleSnapshot, error) {
 		result = append(result, *snapshot)
 	}
 	return sortRoleSnapshots(result), nil
+}
+
+func (s *Store) loadRoleVersions(uid string) ([]RoleVersion, error) {
+	var versions []RoleVersion
+	_, err := s.session.Select("r.role_key,r.authorization_version").
+		From("admin_rbac_user_role ur").
+		Join("admin_rbac_role r", "r.id=ur.role_id").
+		Join("user u", "u.uid=ur.uid AND u.robot=0 AND u.status=1 AND u.is_destroy=0").
+		Where("ur.uid=? AND ur.status=?", uid, activeStatus).
+		OrderAsc("r.role_key").Load(&versions)
+	return versions, err
 }
 
 func sortRoleSnapshots(snapshots []RoleSnapshot) []RoleSnapshot {
