@@ -502,6 +502,33 @@ Recorded so the diff can be read against the spec rather than against memory.
   function propagates it. For the overwrite caller that is mandatory (a truncated
   set *is* a mis-revocation); for the broker callback, which the pinned broker
   never invokes, returning a partial whitelist was never better than erroring.
+- **`restoreDM`'s guard moved to the write it actually guards.** Round 9 moved the
+  three authorization reads inside `restoreDM`, after `CheckMembership`. That fixed
+  the peer-direction window but shifted rather than closed the problem: bare
+  Person-channel grants are authorized by `friends ∪ coMembers(any active Space)` —
+  `CheckMembership` was never their guard — while the `s{spaceID}_` bot-channel
+  grants are Space-scoped and `CheckMembership` is the *only* thing tying them to
+  this Space. After round 9 those sat four queries and two broker round trips
+  downstream of it. The order is now: peer reads → bare writes → `CheckMembership`
+  → `isRobot` → Space-scoped writes. Peer-side window 0, joiner-side window 0 for
+  the only membership-dependent write, and both extra queries are skipped entirely
+  when neither direction grants. Consequence worth stating: `restoreDM` no longer
+  refuses a bare-channel grant merely because the joiner left *this* Space — if the
+  pair is still friends or still shares another Space the grant is correct, and the
+  cutoff would not have cut them either. Not zero-window; membership epochs (#797)
+  remain the real close.
+- **`dmPeerCandidates` uses the job's Space id as a fallback, not a fast path.**
+  Round 9 stripped the job's own prefix first. Space ids may contain `_`, so one id
+  can be a `_`-delimited prefix of another — which is exactly why `knownSpaceIDs` is
+  sorted length-descending. Stripping unconditionally makes the shorter id win: with
+  `minglue` and `minglue_default` both live and the job on `minglue`,
+  `sminglue_default_botfather` strips to `default_botfather` instead of `botfather`,
+  the peer fails `MembersEverInSpace`, and the bot DM is silently skipped with the
+  job marked `done` — the same failure the round-9 change set out to remove, and this
+  variant hits **active** Spaces. `ParseChannelID` now runs first and the job's id
+  applies only when it resolves nothing, which still covers the disbanded non-hex
+  case it was added for. Latent rather than live in this tree (no colliding pair
+  exists today), fixed anyway because the cost is one line.
 - **The overwrite can lose a concurrent grant, and that is accepted.** Between the
   derive (a DB read) and the `whitelist_set` POST, another module may
   `whitelist_add` to the same channel — a friend approval or a bot approval. That

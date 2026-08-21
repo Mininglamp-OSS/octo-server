@@ -3,7 +3,7 @@
 --
 -- A row is inserted in the SAME transaction that flips space_member.status to 0,
 -- so a crash between the membership commit and the cascade cannot lose the work.
--- The worker (modules/space/member_removal_worker.go) claims rows with
+-- The worker (modules/space/member_removal.go) claims rows with
 -- FOR UPDATE SKIP LOCKED under a lease, runs every registered cleanup step, and
 -- retries with exponential backoff until the steps succeed or attempts are
 -- exhausted.

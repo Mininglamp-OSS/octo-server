@@ -452,8 +452,13 @@ func TestDMPeerCandidatesFiltering(t *testing.T) {
 // space_member.uid，那条 bot 私聊被静默跳过而工单仍标 done。
 //
 // 这里刻意**不**预热缓存：用例要钉住的正是「缓存里没有也照样剥得掉」。
+// 而且必须**主动清空**——knownSpaceIDs 是包级全局，整包跑的时候 dmTestSetup 起的
+// server 会在 Route() 里 loadKnownSpaceIDs()。只靠「本包没 seed 这个 Space」是
+// 靠运气：别处 seed 一个同名 Space，这条用例就会在快路径被删掉之后依然通过。
 func TestDMPeerCandidatesStripsNonHexSpacePrefix(t *testing.T) {
 	const spaceID, self = "minglue_default", "me"
+	spacepkg.RegisterSpaceIDs(nil)
+	t.Cleanup(func() { spacepkg.RegisterSpaceIDs(nil) })
 	convs := []*config.SyncUserConversationResp{
 		{ChannelID: "s" + spaceID + "_botfather", ChannelType: common.ChannelTypePerson.Uint8()},
 		{ChannelID: "peer-plain", ChannelType: common.ChannelTypePerson.Uint8()},
@@ -971,4 +976,60 @@ func TestDMCutoffOverwriteDoesNotGuessSpacePrefixOnUID(t *testing.T) {
 	guessed, err := f.derivePersonWhitelist(ctx, removed)
 	require.NoError(t, err)
 	assert.Empty(t, guessed, "带剥离的入口对这个 uid 就是会算错——这正是两个入口必须分开的理由")
+}
+
+// TestDMPeerCandidatesPrefersLongestKnownSpacePrefix 工单自带的 spaceID 只能兜底，
+// 不能凌驾于最长前缀匹配之上。
+//
+// Space id 允许含 "_"，所以一个 id 可能是另一个的 "_" 分隔前缀——knownSpaceIDs
+// 按长度倒序排正是为了这个。若无条件先剥工单自己的前缀，清理 minglue 时会把
+// "sminglue_default_botfather" 剥成 "default_botfather"（正确答案是 "botfather"），
+// 于是 MembersEverInSpace 匹配不上，那条 bot 私聊被静默跳过而工单标 done。
+// 与非 hex 那条的区别：这次连**活跃** Space 都会中招。
+func TestDMPeerCandidatesPrefersLongestKnownSpacePrefix(t *testing.T) {
+	spacepkg.RegisterSpaceIDs([]string{"minglue", "minglue_default"})
+	t.Cleanup(func() { spacepkg.RegisterSpaceIDs(nil) })
+
+	convs := []*config.SyncUserConversationResp{
+		{ChannelID: "sminglue_default_botfather", ChannelType: common.ChannelTypePerson.Uint8()},
+	}
+	assert.Equal(t, []string{"botfather"},
+		dmPeerCandidates(convs, "me", "minglue"),
+		"缓存认得出更长的那个 Space，就该用它，而不是先剥本次工单的短前缀")
+}
+
+// TestDMRestoreSkipsSpaceScopedWhenMembershipLostMidFlight Q4 的回归：
+// 成员身份判断必须紧挨着它真正守护的那两个写。
+//
+// 裸 Person 频道的授权是 friends ∪ coMembers(任一活跃 Space)，跟「是不是本 Space
+// 成员」无关；只有 s{spaceID}_ 前缀频道是本 Space 作用域的。所以正确的形状是
+// 「裸频道照补，前缀频道在成员身份没了之后不补」。判断若留在函数开头，它离那两个
+// 写隔着四次查询和两次 broker 往返，这段中途失去成员身份的情形就会补出一对
+// 该 Space 已经不该有的前缀频道白名单，而该 Space 自己的清理工单早已 done。
+func TestDMRestoreSkipsSpaceScopedWhenMembershipLostMidFlight(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceX, spaceY = "0123456789abcdef0123456789abcdef", "dm-q4-y"
+	const uid, bot = "u-rejoin", "bot-q4"
+
+	// 加入者与 bot 同处 X（前缀频道用得上 X），也同处 Y（裸频道仍然被授权）。
+	seedSpaceMember(t, ctx, spaceX, uid, bot)
+	seedSpaceMember(t, ctx, spaceY, uid, bot)
+	_, err := ctx.DB().Exec(
+		"INSERT INTO robot (robot_id, status, created_at, updated_at) VALUES (?, 1, NOW(), NOW())", bot)
+	require.NoError(t, err)
+
+	// 中途失去 X 的成员身份：裸频道该照补（Y 还在），X 的前缀频道不该补。
+	removeSpaceMember(t, ctx, spaceX, uid)
+
+	stub := newIMStub(t, ctx, []string{bot})
+	_, err = f.restoreDM(ctx, spaceX, uid, bot, false)
+	require.NoError(t, err)
+
+	added := stub.addedChannels()
+	assert.Contains(t, added, uid, "裸频道仍被 Y 的共处关系授权，必须照补")
+	assert.Contains(t, added, bot)
+	assert.NotContains(t, added, spacepkg.BuildChannelID(spaceX, uid),
+		"已经不是 X 的成员，X 作用域的前缀频道不该被补回")
+	assert.NotContains(t, added, spacepkg.BuildChannelID(spaceX, bot),
+		"已经不是 X 的成员，X 作用域的前缀频道不该被补回")
 }
