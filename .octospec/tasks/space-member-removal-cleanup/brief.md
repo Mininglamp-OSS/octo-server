@@ -529,6 +529,14 @@ Recorded so the diff can be read against the spec rather than against memory.
   applies only when it resolves nothing, which still covers the disbanded non-hex
   case it was added for. Latent rather than live in this tree (no colliding pair
   exists today), fixed anyway because the cost is one line.
+- **`modules/botfather`'s delete path is weaker than its command path.** Both zero
+  `space_member` outside this task's outbox (already recorded as a follow-up), but
+  the asymmetry is worth writing down for whoever picks that up: `command.go` calls
+  `IMRemoveSubscriber` and soft-deletes `group_member` before zeroing the membership,
+  while `deleteUserBot` (`api_user.go:513`) goes straight from the friend rows to
+  `space_member` and `deleteRobot` with neither step — so the API path leaves the bot
+  in the Space's groups with live IM subscriptions. Untouched here; raised in review
+  against this branch and recorded so the follow-up covers both paths.
 - **The overwrite can lose a concurrent grant, and that is accepted.** Between the
   derive (a DB read) and the `whitelist_set` POST, another module may
   `whitelist_add` to the same channel — a friend approval or a bot approval. That
@@ -671,6 +679,16 @@ Recorded so the diff can be read against the spec rather than against memory.
 - The join side performs the same overwrite, so a rejoiner regains what the
   cutoff's wider revocation removed.
 - The derivation resolves `s{spaceID}_{uid}` to the same set as the bare `uid`.
+
+**The `dm_forbidden` delivery chain (round 10c)**
+
+- Driving the real `GET /v1/channels/:id/:type` for a no-relation pair returns
+  `dm_forbidden` **through the minimal-response strip**, and a co-member pair does
+  not. Both wiring links are covered: deleting the `annotateDMSendability` call in
+  `modules/user/1module.go`'s `BussDataSource.ChannelGet`, or removing the two keys
+  from `callerOwnedExtraKeys`, each turns the test red. Before this test both could
+  be deleted with the whole suite staying green — the derivation was well covered
+  and the delivery was not covered at all.
 
 **Repo gates**
 
