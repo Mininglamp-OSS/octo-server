@@ -100,6 +100,9 @@ func TestCIValidatesManagerPermissionContract(t *testing.T) {
 	if !contains(contractJob.Needs, "changes") {
 		t.Fatalf("manager permission contract needs = %v, want changes", contractJob.Needs)
 	}
+	if len(contractJob.Services) != 0 {
+		t.Fatal("manager permission contract must remain service-free")
+	}
 	if stepIndex(contractJob.Steps, "Validate manager permission contract") < 0 {
 		t.Fatal("manager permission contract job must run the strict validation step")
 	}

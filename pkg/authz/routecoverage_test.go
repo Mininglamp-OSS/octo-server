@@ -69,6 +69,26 @@ func TestScanManagerRoutesIgnoresFormatting(t *testing.T) {
 	}
 }
 
+func TestScanManagerRoutesFollowsReceiverAliases(t *testing.T) {
+	root := t.TempDir()
+	source := routeFixtureSource(false)
+	source = strings.Replace(source, `auth := r.Group("/v1/manager")`, "self := m\n\tauth := r.Group(\"/v1/manager\")", 1)
+	source = strings.Replace(source, `auth.GET("/one", m.one)`, `auth.GET("/one", self.one)`, 1)
+	source = strings.Replace(source, `func (m *Manager) one(c *Context) { m.requireAdmin(c) }`, `func (m *Manager) one(c *Context) { self := m; self.requireAdmin(c) }`, 1)
+	writeFixture(t, root, "modules/example/api.go", source)
+	gates, err := ScanDirectGates(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := ScanManagerRoutes(root, gates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 3 {
+		t.Fatalf("ScanManagerRoutes() got %d routes, want 3: %#v", len(routes), routes)
+	}
+}
+
 func TestScanManagerRoutesRejectsUnresolvedGatedHandler(t *testing.T) {
 	root := t.TempDir()
 	writeRouteFixture(t, root, false)
@@ -100,6 +120,70 @@ func TestScanManagerRoutesRejectsUnresolvedGatedPrefix(t *testing.T) {
 	}
 }
 
+func TestScanManagerRoutesRejectsUnsupportedGatedShapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(string) string
+		want   string
+	}{
+		{"dynamic path", func(source string) string {
+			return strings.Replace(source, `auth.GET("/one", m.one)`, `auth.GET(routePath(), m.one)`, 1)
+		}, "cannot resolve route path"},
+		{"non-identifier router", func(source string) string {
+			return strings.Replace(source, `auth.GET("/one", m.one)`, `r.Group("/v1/manager").GET("/one", m.one)`, 1)
+		}, "cannot resolve route base"},
+		{"inline gate", func(source string) string {
+			return strings.Replace(source, `auth.GET("/one", m.one)`, `auth.GET("/one", func(c *Context) { _ = c.CheckLoginRole() })`, 1)
+		}, "cannot resolve route handler"},
+		{"gated route middleware", func(source string) string {
+			return strings.Replace(source, `auth.GET("/one", m.one)`, `auth.GET("/one", m.requireAdmin, m.one)`, 1)
+		}, "gated middleware before route handler"},
+		{"gated group middleware", func(source string) string {
+			return strings.Replace(source, `auth := r.Group("/v1/manager")`, `auth := r.Group("/v1/manager", m.requireAdmin)`, 1)
+		}, "gated group middleware"},
+		{"delegated registration", func(source string) string {
+			source = strings.Replace(source, `auth.GET("/one", m.one)`, `m.mount(auth)`, 1)
+			return source + "\nfunc (m *Manager) mount(auth *Group) { auth.GET(\"/one\", m.one) }\n"
+		}, "gated route registration outside Route"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFixture(t, root, "modules/example/api.go", test.mutate(routeFixtureSource(false)))
+			gates, err := ScanDirectGates(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ScanManagerRoutes(root, gates)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ScanManagerRoutes() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestScanManagerRoutesHonorsBuildConstraints(t *testing.T) {
+	root := t.TempDir()
+	writeRouteFixture(t, root, false)
+	writeFixture(t, root, "modules/example/excluded.go", `//go:build never
+
+package example
+
+func (m *Manager) Route(r *Router) {}
+`)
+	gates, err := ScanDirectGates(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := ScanManagerRoutes(root, gates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 3 {
+		t.Fatalf("ScanManagerRoutes() got %d routes, want 3", len(routes))
+	}
+}
+
 func TestValidateRouteCoverage(t *testing.T) {
 	gate := "modules/example/api.go::Manager.requireAdmin#1"
 	routes := []ScannedRoute{
@@ -124,6 +208,7 @@ func TestValidateRouteCoverage(t *testing.T) {
 		{"method drift", routes, []Operation{{ID: "example.one", Method: "POST", Path: "/v1/manager/one", Handler: "Manager.one", GateSites: []string{gate}}}, exclusions, "unregistered global route"},
 		{"path drift", routes, []Operation{{ID: "example.one", Method: "GET", Path: "/v1/manager/other", Handler: "Manager.one", GateSites: []string{gate}}}, exclusions, "unregistered global route"},
 		{"handler drift", routes, []Operation{{ID: "example.one", Method: "GET", Path: "/v1/manager/one", Handler: "Manager.other", GateSites: []string{gate}}}, exclusions, "handler drift"},
+		{"module drift", routes, []Operation{{ID: "example.one", Method: "GET", Path: "/v1/manager/one", Module: "wrong", Handler: "Manager.one", GateSites: []string{gate}}}, exclusions, `operation "example.one" module drift for GET /v1/manager/one: source="" manifest="wrong"`},
 		{"gate drift", routes, []Operation{{ID: "example.one", Method: "GET", Path: "/v1/manager/one", Handler: "Manager.one", GateSites: []string{"other"}}}, exclusions, "gate-site drift"},
 		{"missing boundary classification", routes, operations, nil, "unregistered global route"},
 		{"stale boundary", routes[:1], operations, exclusions, "fixture has no matching source route"},

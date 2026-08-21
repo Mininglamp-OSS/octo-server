@@ -20,23 +20,29 @@ func (m *Manager) handle(c *Context) {
 	_ = c.CheckLoginRole()
 	_ = c.CheckLoginRoleSimilar()
 	_ = c.CheckLoginRoleIsSuperAdmin()
+	_ = auth.CanReadManagerDashboard("dashboardReader")
 }
 `)
 	writeFixture(t, root, "modules/example/api_test.go", `package example
 func ignored(c *Context) { _ = c.CheckLoginRole() }
+`)
+	writeFixture(t, root, "modules/example/excluded.go", `//go:build never
+
+package example
+func excluded(c *Context) { _ = c.CheckLoginRole() }
 `)
 
 	gates, err := ScanDirectGates(root)
 	if err != nil {
 		t.Fatalf("ScanDirectGates() error = %v", err)
 	}
-	if len(gates) != 2 {
-		t.Fatalf("ScanDirectGates() got %d gates, want 2: %#v", len(gates), gates)
+	if len(gates) != 3 {
+		t.Fatalf("ScanDirectGates() got %d gates, want 3: %#v", len(gates), gates)
 	}
-	if gates[0].Source != "modules/example/api.go::Manager.handle#1" || gates[1].Source != "modules/example/api.go::Manager.handle#2" {
+	if gates[0].Source != "modules/example/api.go::Manager.handle#1" || gates[1].Source != "modules/example/api.go::Manager.handle#2" || gates[2].Source != "modules/example/api.go::Manager.handle#3" {
 		t.Fatalf("unexpected identities: %#v", gates)
 	}
-	if gates[0].LegacyGate != LegacyGateAdmin || gates[1].LegacyGate != LegacyGateSuperAdmin {
+	if gates[0].LegacyGate != LegacyGateAdmin || gates[1].LegacyGate != LegacyGateSuperAdmin || gates[2].LegacyGate != LegacyGateManagerConsoleRole {
 		t.Fatalf("unexpected legacy gates: %#v", gates)
 	}
 }

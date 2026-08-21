@@ -40,9 +40,13 @@ func ValidateManifest(manifest *Manifest) error {
 	if err != nil {
 		return err
 	}
-	permissionRefs, gateRefs, err := validateOperations(manifest.Operations, permissions, gates)
+	operationPermissionRefs, gateRefs, err := validateOperations(manifest.Operations, permissions, gates)
 	if err != nil {
 		return err
+	}
+	permissionRefs := make(map[string]int, len(operationPermissionRefs))
+	for key, count := range operationPermissionRefs {
+		permissionRefs[key] = count
 	}
 	if err := validateLegacyCapabilities(manifest.LegacyCapabilities, permissions, permissionRefs); err != nil {
 		return err
@@ -52,7 +56,13 @@ func ValidateManifest(manifest *Manifest) error {
 			return fmt.Errorf("gate_sites[%q]: is not referenced by any operation", source)
 		}
 	}
-	for key := range permissions {
+	for key, permission := range permissions {
+		if operationPermissionRefs[key] == 0 && permission.ExternalEnforcement == nil {
+			return fmt.Errorf("permissions[%q].external_enforcement: required when permission has no local operation", key)
+		}
+		if operationPermissionRefs[key] > 0 && permission.ExternalEnforcement != nil {
+			return fmt.Errorf("permissions[%q].external_enforcement: must be absent when permission has a local operation", key)
+		}
 		if permissionRefs[key] == 0 {
 			return fmt.Errorf("permissions[%q]: is not referenced by any operation or legacy capability", key)
 		}
@@ -95,6 +105,14 @@ func validatePermissions(items []Permission) (map[string]Permission, error) {
 		}
 		if strings.TrimSpace(permission.Description) == "" {
 			return nil, fmt.Errorf("%s.description: must not be empty", path)
+		}
+		if permission.ExternalEnforcement != nil {
+			if strings.TrimSpace(permission.ExternalEnforcement.Service) == "" {
+				return nil, fmt.Errorf("%s.external_enforcement.service: must not be empty", path)
+			}
+			if strings.TrimSpace(permission.ExternalEnforcement.Description) == "" {
+				return nil, fmt.Errorf("%s.external_enforcement.description: must not be empty", path)
+			}
 		}
 		result[permission.Key] = permission
 	}

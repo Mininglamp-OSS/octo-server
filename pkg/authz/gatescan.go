@@ -3,6 +3,7 @@ package authz
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -31,6 +32,13 @@ func ScanDirectGates(repositoryRoot string) ([]ScannedGate, error) {
 			return nil
 		}
 		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		matches, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if err != nil {
+			return fmt.Errorf("match build constraints for %s: %w", path, err)
+		}
+		if !matches {
 			return nil
 		}
 		file, err := parser.ParseFile(fset, path, nil, 0)
@@ -119,6 +127,8 @@ func directGate(name string) (LegacyGate, bool) {
 		return LegacyGateAdmin, true
 	case "CheckLoginRoleIsSuperAdmin":
 		return LegacyGateSuperAdmin, true
+	case "CanReadManagerDashboard":
+		return LegacyGateManagerConsoleRole, true
 	default:
 		return "", false
 	}

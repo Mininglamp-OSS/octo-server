@@ -72,7 +72,11 @@ func TestValidateReferences(t *testing.T) {
 			m.Operations[0].GateSites = m.Operations[0].GateSites[:1]
 			m.Operations[1].GateSites = m.Operations[1].GateSites[:1]
 		}, "is not referenced by any operation"},
-		{"unreferenced permission", func(m *Manifest) { m.LegacyCapabilities = nil; m.Operations[1].Permission = m.Operations[0].Permission }, "is not referenced by any operation or legacy capability"},
+		{"unreferenced permission", func(m *Manifest) {
+			m.LegacyCapabilities = nil
+			m.Operations[1].Permission = m.Operations[0].Permission
+			m.Permissions[1].ExternalEnforcement = &ExternalEnforcement{Service: "external", Description: "classified but unused"}
+		}, "is not referenced by any operation or legacy capability"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -124,6 +128,43 @@ func TestValidateCriticalPermissions(t *testing.T) {
 	wrongSensitivity.Permissions[0].Sensitivity = SensitivityElevated
 	if err := ValidateCriticalPermissions(&wrongSensitivity); err == nil || !strings.Contains(err.Error(), "sensitivity") {
 		t.Fatalf("wrong critical sensitivity error = %v", err)
+	}
+}
+
+func TestValidateExternalEnforcement(t *testing.T) {
+	externalOnly := referenceManifest()
+	externalOnly.Operations = externalOnly.Operations[:1]
+	externalOnly.LegacyCapabilities[0].Permissions = append(externalOnly.LegacyCapabilities[0].Permissions, "user.write")
+	externalOnly.Permissions[1].ExternalEnforcement = &ExternalEnforcement{Service: "octo-marketplace", Description: "external policy"}
+	if err := ValidateManifest(&externalOnly); err != nil {
+		t.Fatalf("ValidateManifest() external-only permission error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Manifest)
+		wantErr string
+	}{
+		{"missing classification", func(m *Manifest) {
+			m.Operations = m.Operations[:1]
+			m.LegacyCapabilities[0].Permissions = append(m.LegacyCapabilities[0].Permissions, "user.write")
+		}, "external_enforcement: required"},
+		{"local operation marked external", func(m *Manifest) {
+			m.Permissions[0].ExternalEnforcement = &ExternalEnforcement{Service: "other", Description: "wrong classification"}
+		}, "must be absent"},
+		{"missing service", func(m *Manifest) {
+			m.Permissions[0].ExternalEnforcement = &ExternalEnforcement{Description: "missing service"}
+		}, "external_enforcement.service"},
+		{"missing description", func(m *Manifest) {
+			m.Permissions[0].ExternalEnforcement = &ExternalEnforcement{Service: "other"}
+		}, "external_enforcement.description"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := referenceManifest()
+			test.mutate(&manifest)
+			assertValidationErrorContains(t, &manifest, test.wantErr)
+		})
 	}
 }
 

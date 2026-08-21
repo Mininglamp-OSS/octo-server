@@ -36,15 +36,15 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if err := ValidateRouteCoverage(routes, manifest.Operations, ManagerRouteBoundaryExclusions()); err != nil {
 		t.Fatalf("ValidateRouteCoverage() error = %v", err)
 	}
-	if got, want := len(manifest.Operations), 129; got != want {
+	if got, want := len(manifest.Operations), 135; got != want {
 		t.Fatalf("global operation count = %d, want %d", got, want)
 	}
 	if got, want := len(routes), len(manifest.Operations)+len(ManagerRouteBoundaryExclusions()); got != want {
 		t.Fatalf("source gated route count = %d, want %d global operations + %d boundary exclusions", got, len(manifest.Operations), len(ManagerRouteBoundaryExclusions()))
 	}
 	assertSourceRouteBoundaries(t, routes)
-	if got, want := len(scanned), 100; got != want {
-		t.Fatalf("direct gate count = %d, want %d", got, want)
+	if got, want := len(scanned), 101; got != want {
+		t.Fatalf("recognized manager gate count = %d, want %d", got, want)
 	}
 	files := make(map[string]struct{})
 	moduleCounts := make(map[string]int)
@@ -59,6 +59,13 @@ func TestRepositoryPermissionContract(t *testing.T) {
 		if got := moduleCounts[module]; got != want {
 			t.Errorf("%s direct gate count = %d, want %d", module, got, want)
 		}
+	}
+	gateKinds := make(map[LegacyGate]int)
+	for _, gate := range scanned {
+		gateKinds[gate.LegacyGate]++
+	}
+	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 100 || gateKinds[LegacyGateManagerConsoleRole] != 1 {
+		t.Fatalf("manager gate kinds = %#v, want 100 direct legacy and 1 manager-console gate", gateKinds)
 	}
 	assertGlobalOperationBoundary(t, manifest)
 	assertSensitiveTaxonomy(t, manifest)
@@ -137,6 +144,14 @@ func assertGlobalOperationBoundary(t *testing.T, manifest *Manifest) {
 	if operationByID["app_bot.token.reveal"].Scope != ScopeGlobalAdmin {
 		t.Errorf("platform token reveal must not inherit Space ACL scope")
 	}
+	if got := operationByID["group.member.force_remove"].Permission; got != "group.member.remove" {
+		t.Errorf("manager force-remove permission = %q, want group.member.remove", got)
+	}
+	avatar := operationByID["app_bot.avatar.update"]
+	if avatar.BusinessACL == nil || avatar.BusinessACL.Type != "self_or_user_bot_creator_or_bot_owner_or_space_admin" ||
+		!strings.Contains(avatar.BusinessACL.Description, "human self-service") || !strings.Contains(avatar.BusinessACL.Description, "User Bot creator") {
+		t.Errorf("App Bot avatar business ACL fallback is incomplete: %#v", avatar.BusinessACL)
+	}
 }
 
 func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
@@ -146,13 +161,14 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 		operationByID[operation.ID] = operation
 	}
 	want := map[string]string{
-		"user.password.reset":          "user.password.reset",
-		"user.admin.create":            "user.admin.manage",
-		"backup.download":              "backup.download",
-		"message.direct_history.list":  "message.direct_history.read",
-		"app_bot.token.reveal":         "app_bot.token.reveal",
-		"common.system_setting.update": "system_setting.write",
-		"space.destroy":                "space.destroy",
+		"user.password.reset":                 "user.password.reset",
+		"user.admin.create":                   "user.admin.manage",
+		"backup.download":                     "backup.download",
+		"message.direct_history.list":         "message.direct_history.read",
+		"app_bot.token.reveal":                "app_bot.token.reveal",
+		"common.system_setting.update":        "system_setting.write",
+		"space.destroy":                       "space.destroy",
+		"dashboard.direct_chat_activity.read": "dashboard.direct_chat_activity.read",
 	}
 	for operationID, permission := range want {
 		if got := operationByID[operationID].Permission; got != permission {
@@ -166,6 +182,7 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 		{"app_bot.detail", "app_bot.token.reveal"},
 		{"common.system_setting.list", "common.system_setting.update"},
 		{"space.detail", "space.destroy"},
+		{"dashboard.overview.read", "dashboard.direct_chat_activity.read"},
 	}
 	for _, pair := range pairs {
 		if operationByID[pair[0]].Permission == operationByID[pair[1]].Permission {

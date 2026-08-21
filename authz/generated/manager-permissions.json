@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "content_hash": "b233710e3f66198b10ff1d618a38a24be237e903edb21a345b160d39119fea20",
+  "content_hash": "0d7a7074a4ad4b9c90d566fcacd7e398832310b0c0a7e38a442de27a49f89fc1",
   "permissions": [
     {
       "key": "app_bot.avatar.update",
@@ -213,6 +213,13 @@
       "sensitivity": "standard"
     },
     {
+      "key": "dashboard.direct_chat_activity.read",
+      "resource": "dashboard_direct_chat_activity",
+      "action": "read",
+      "description": "查看全局私聊活跃元数据",
+      "sensitivity": "elevated"
+    },
+    {
       "key": "dashboard.etl.trigger",
       "resource": "dashboard_etl",
       "action": "trigger",
@@ -231,14 +238,22 @@
       "resource": "expert",
       "action": "read",
       "description": "查看专家市场",
-      "sensitivity": "standard"
+      "sensitivity": "standard",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的专家市场管理路由执法"
+      }
     },
     {
       "key": "expert.write",
       "resource": "expert",
       "action": "write",
       "description": "维护专家市场",
-      "sensitivity": "elevated"
+      "sensitivity": "elevated",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的专家市场管理路由执法"
+      }
     },
     {
       "key": "group.member.remove",
@@ -273,14 +288,22 @@
       "resource": "mcp",
       "action": "read",
       "description": "查看系统 MCP",
-      "sensitivity": "standard"
+      "sensitivity": "standard",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的平台 MCP 管理路由执法"
+      }
     },
     {
       "key": "mcp.write",
       "resource": "mcp",
       "action": "write",
       "description": "维护系统 MCP",
-      "sensitivity": "elevated"
+      "sensitivity": "elevated",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的平台 MCP 管理路由执法"
+      }
     },
     {
       "key": "message.broadcast.send",
@@ -406,14 +429,22 @@
       "resource": "skill",
       "action": "read",
       "description": "查看系统 Skill",
-      "sensitivity": "standard"
+      "sensitivity": "standard",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的平台 Skill 管理路由执法"
+      }
     },
     {
       "key": "skill.write",
       "resource": "skill",
       "action": "write",
       "description": "维护系统 Skill",
-      "sensitivity": "elevated"
+      "sensitivity": "elevated",
+      "external_enforcement": {
+        "service": "octo-marketplace",
+        "description": "由 octo-marketplace 的平台 Skill 管理路由执法"
+      }
     },
     {
       "key": "space.create",
@@ -661,9 +692,10 @@
     {
       "key": "dashboard.read",
       "permissions": [
+        "dashboard.direct_chat_activity.read",
         "dashboard.read"
       ],
-      "mode": "any",
+      "mode": "all",
       "description": "运营看板读取兼容能力"
     },
     {
@@ -1100,6 +1132,12 @@
       "legacy_gate": "super_admin"
     },
     {
+      "source": "modules/opanalytics/api.go::Manager.requireDashboardRead#1",
+      "module": "opanalytics",
+      "symbol": "Manager.requireDashboardRead",
+      "legacy_gate": "manager_console_role"
+    },
+    {
       "source": "modules/opanalytics/api.go::Manager.requireSuperAdmin#1",
       "module": "opanalytics",
       "symbol": "Manager.requireSuperAdmin",
@@ -1426,8 +1464,8 @@
       ],
       "scope": "global_admin_with_business_acl",
       "business_acl": {
-        "type": "bot_owner_or_space_admin",
-        "description": "非全局管理员时继续执行 Bot owner 或 Space admin 业务 ACL"
+        "type": "self_or_user_bot_creator_or_bot_owner_or_space_admin",
+        "description": "非全局管理员时继续执行 human self-service、User Bot creator、Bot owner 或 Space admin 业务 ACL"
       }
     },
     {
@@ -1851,6 +1889,30 @@
       "scope": "global_admin"
     },
     {
+      "id": "dashboard.channel_members.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/channels/:channel_id/members",
+      "module": "opanalytics",
+      "handler": "Manager.channelMembers",
+      "permission": "dashboard.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.direct_chat_activity.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/global/direct-chats",
+      "module": "opanalytics",
+      "handler": "Manager.globalDirectChats",
+      "permission": "dashboard.direct_chat_activity.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
       "id": "dashboard.etl.run",
       "method": "POST",
       "path": "/v1/manager/dashboard/etl/run",
@@ -1859,6 +1921,54 @@
       "permission": "dashboard.etl.trigger",
       "gate_sites": [
         "modules/opanalytics/api.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.overview.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/overview",
+      "module": "opanalytics",
+      "handler": "Manager.overview",
+      "permission": "dashboard.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.space_channels.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/spaces/:space_id/channels",
+      "module": "opanalytics",
+      "handler": "Manager.spaceChannels",
+      "permission": "dashboard.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.spaces.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/spaces",
+      "module": "opanalytics",
+      "handler": "Manager.spaces",
+      "permission": "dashboard.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.trend.read",
+      "method": "GET",
+      "path": "/v1/manager/dashboard/trend",
+      "module": "opanalytics",
+      "handler": "Manager.trend",
+      "permission": "dashboard.read",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireDashboardRead#1"
       ],
       "scope": "global_admin"
     },
@@ -1916,7 +2026,7 @@
       "path": "/v1/manager/groups/:group_no/members",
       "module": "group",
       "handler": "Manager.removeMember",
-      "permission": "group.write",
+      "permission": "group.member.remove",
       "gate_sites": [
         "modules/group/api_manager.go::Manager.removeMember#1"
       ],

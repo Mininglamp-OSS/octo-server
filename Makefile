@@ -69,7 +69,8 @@ manager-permission-generate:
 
 manager-permission-check:
 	go run ./tools/manager-permission-gen -check
-	go test ./modules/user -run '^(TestManagerPermissionContractPreservesLegacyCapabilityMatrix|TestManagerPermissionContractRejectsLegacyAliasDrift)$$' -count=1
+	go test ./pkg/authz -count=1
+	go test ./pkg/auth -run '^(TestManagerPermissionContractPreservesLegacyCapabilityMatrix|TestManagerPermissionContractRejectsLegacyAliasDrift)$$' -count=1
 
 i18n-merge: i18n-extract
 	@command -v goi18n >/dev/null 2>&1 || { \

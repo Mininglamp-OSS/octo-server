@@ -88,3 +88,33 @@ func CanReadManagerDashboard(role string) bool {
 		role == string(wkhttp.SuperAdmin) ||
 		role == ManagerRoleDashboardReader
 }
+
+// ManagerCapabilities returns the stable manager-console capability view for a
+// role. It is intentionally service-free so compatibility checks do not need to
+// initialize the user module or its database-backed test environment.
+func ManagerCapabilities(role string) map[string]bool {
+	isSuper := role == string(wkhttp.SuperAdmin)
+	isAdmin := isSuper || role == string(wkhttp.Admin)
+	return map[string]bool{
+		"system_setting":     isSuper,
+		"backup":             isSuper,
+		"appversion.write":   isSuper,
+		"dashboard.trigger":  isSuper,
+		"space.destructive":  isSuper,
+		"users.write":        isSuper,
+		"users.manage_admin": isSuper,
+		"groups.write":       isSuper,
+		"skill.read":         CanAdminMarketplace(role),
+		"skill.write":        CanAdminMarketplace(role),
+		"mcp.read":           CanAdminMarketplace(role),
+		"mcp.write":          CanAdminMarketplace(role),
+		"expert.read":        CanAdminMarketplace(role),
+		"expert.write":       CanAdminMarketplace(role),
+		"appversion.read":    isAdmin,
+		"dashboard.read":     CanReadManagerDashboard(role),
+		"users.read":         isAdmin,
+		"groups.read":        isAdmin,
+		"space.read":         isAdmin,
+		"space.write":        isAdmin,
+	}
+}

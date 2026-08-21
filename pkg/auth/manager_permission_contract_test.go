@@ -1,4 +1,4 @@
-package user
+package auth
 
 import (
 	"fmt"
@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	contract "github.com/Mininglamp-OSS/octo-server/pkg/authz"
 )
 
@@ -60,14 +59,14 @@ func validateManagerPermissionCompatibility(manifest *contract.Manifest) error {
 	}
 	sort.Strings(manifestKeys)
 
-	current := managerCapabilities(string(wkhttp.SuperAdmin))
+	current := ManagerCapabilities(string(wkhttp.SuperAdmin))
 	currentKeys := make([]string, 0, len(current))
 	for key := range current {
 		currentKeys = append(currentKeys, key)
 	}
 	sort.Strings(currentKeys)
 	if !equalStrings(manifestKeys, currentKeys) {
-		return fmt.Errorf("legacy capability keys differ: manifest=%v managerCapabilities=%v", manifestKeys, currentKeys)
+		return fmt.Errorf("legacy capability keys differ: manifest=%v ManagerCapabilities=%v", manifestKeys, currentKeys)
 	}
 
 	roles := map[string]map[string]bool{
@@ -75,13 +74,13 @@ func validateManagerPermissionCompatibility(manifest *contract.Manifest) error {
 		string(wkhttp.Admin): enabledOnly(
 			"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
 		),
-		appauth.ManagerRoleDashboardReader: enabledOnly("dashboard.read"),
-		appauth.ManagerRoleMarketAdmin: enabledOnly(
+		ManagerRoleDashboardReader: enabledOnly("dashboard.read"),
+		ManagerRoleMarketAdmin: enabledOnly(
 			"skill.read", "skill.write", "mcp.read", "mcp.write", "expert.read", "expert.write",
 		),
 	}
 	for role, expected := range roles {
-		actual := managerCapabilities(role)
+		actual := ManagerCapabilities(role)
 		for _, key := range manifestKeys {
 			if actual[key] != expected[key] {
 				return fmt.Errorf("role %q capability %q = %v, want %v", role, key, actual[key], expected[key])

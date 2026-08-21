@@ -11,6 +11,8 @@
 ./modules/channel/service
 ./modules/search
 ./pkg/accesslog
+./pkg/auth
+./pkg/authz
 ./pkg/authtree
 ./pkg/avatarrender
 ./pkg/avatarversion
@@ -51,4 +53,5 @@
 ./tools/lint-direct-error-response
 ./tools/lint-personal-msgsendreq
 ./tools/lint-unregistered-code
+./tools/manager-permission-gen
 ./tools/workflow-guards

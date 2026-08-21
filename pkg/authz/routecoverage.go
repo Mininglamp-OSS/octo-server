@@ -3,6 +3,7 @@ package authz
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"net/http"
@@ -145,6 +146,9 @@ func ValidateRouteCoverage(routes []ScannedRoute, operations []Operation, exclus
 		if route.Handler != operation.Handler {
 			return fmt.Errorf("operation %q handler drift for %s %s: source=%q manifest=%q", operation.ID, route.Method, route.Path, route.Handler, operation.Handler)
 		}
+		if route.Module != operation.Module {
+			return fmt.Errorf("operation %q module drift for %s %s: source=%q manifest=%q", operation.ID, route.Method, route.Path, route.Module, operation.Module)
+		}
 		if !equalStringSets(route.GateSites, operation.GateSites) {
 			return fmt.Errorf("operation %q gate-site drift for %s %s: source=%v manifest=%v", operation.ID, route.Method, route.Path, route.GateSites, operation.GateSites)
 		}
@@ -197,6 +201,13 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 	var routeFunctions []scannedFunction
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		matches, err := build.Default.MatchFile(directory, entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("match build constraints for %s: %w", filepath.Join(relativeDirectory, entry.Name()), err)
+		}
+		if !matches {
 			continue
 		}
 		path := filepath.Join(directory, entry.Name())
@@ -267,13 +278,28 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 	}
 
 	module := moduleFromRelativePath(filepath.ToSlash(relativeDirectory) + "/placeholder.go")
+	routeSymbols := make(map[string]struct{}, len(routeFunctions))
 	var routes []ScannedRoute
 	for _, function := range routeFunctions {
-		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable)
+		routeSymbols[function.symbol] = struct{}{}
+		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true)
 		if err != nil {
 			return nil, err
 		}
 		routes = append(routes, functionRoutes...)
+	}
+	var symbols []string
+	for symbol := range functions {
+		symbols = append(symbols, symbol)
+	}
+	sort.Strings(symbols)
+	for _, symbol := range symbols {
+		if _, isRoute := routeSymbols[symbol]; isRoute {
+			continue
+		}
+		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false); err != nil {
+			return nil, err
+		}
 	}
 	return routes, nil
 }
@@ -282,6 +308,7 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 	edges := make(map[string][]string, len(functions))
 	for symbol, function := range functions {
 		seen := make(map[string]struct{})
+		aliases := receiverAliasSet(function)
 		ast.Inspect(function.body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
@@ -291,7 +318,10 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 			switch called := call.Fun.(type) {
 			case *ast.SelectorExpr:
 				identifier, ok := called.X.(*ast.Ident)
-				if ok && identifier.Name == function.receiverName {
+				if ok {
+					_, ok = aliases[identifier.Name]
+				}
+				if ok {
 					target = function.receiverType + "." + called.Sel.Name
 				}
 			case *ast.Ident:
@@ -310,8 +340,9 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 	return edges
 }
 
-func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string) ([]ScannedRoute, error) {
+func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration bool) ([]ScannedRoute, error) {
 	prefixes := make(map[string]string)
+	receiverAliases := receiverAliasSet(function)
 	for _, field := range function.parameters {
 		for _, name := range field.Names {
 			prefixes[name.Name] = ""
@@ -325,6 +356,11 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 			return false
 		}
 		if assignment, ok := node.(*ast.AssignStmt); ok {
+			if assignmentHasGatedGroupMiddleware(assignment, receiverAliases, function.receiverType, functions, reachable) {
+				position := fset.Position(assignment.Pos())
+				scanErr = fmt.Errorf("%s:%d: gated group middleware is not supported", function.file, position.Line)
+				return false
+			}
 			registerGroupPrefixes(assignment, prefixes)
 		}
 		call, ok := node.(*ast.CallExpr)
@@ -335,22 +371,17 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 		if !ok || !isHTTPMethod(selector.Sel.Name) || len(call.Args) < 2 {
 			return true
 		}
-		base, ok := selector.X.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		prefix, ok := prefixes[base.Name]
-		if !ok {
-			return true
-		}
-		routePath, ok := stringLiteral(call.Args[0])
-		if !ok {
-			return true
+		for _, middlewareExpression := range call.Args[1 : len(call.Args)-1] {
+			if expressionMentionsGatedHandler(middlewareExpression, receiverAliases, function.receiverType, functions, reachable) || expressionContainsRecognizedGate(middlewareExpression) {
+				position := fset.Position(call.Pos())
+				scanErr = fmt.Errorf("%s:%d: gated middleware before route handler is not supported", function.file, position.Line)
+				return false
+			}
 		}
 		handlerExpression := call.Args[len(call.Args)-1]
-		handler, ok := routeHandlerSymbol(handlerExpression, function.receiverName, function.receiverType, functions)
+		handler, ok := routeHandlerSymbol(handlerExpression, receiverAliases, function.receiverType, functions)
 		if !ok {
-			if expressionMentionsGatedHandler(handlerExpression, function.receiverName, function.receiverType, functions, reachable) {
+			if expressionMentionsGatedHandler(handlerExpression, receiverAliases, function.receiverType, functions, reachable) || expressionContainsRecognizedGate(handlerExpression) {
 				position := fset.Position(call.Pos())
 				scanErr = fmt.Errorf("%s:%d: cannot resolve route handler that may reach a direct gate", function.file, position.Line)
 				return false
@@ -362,6 +393,25 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 			return true
 		}
 		position := fset.Position(call.Pos())
+		if !allowRegistration {
+			scanErr = fmt.Errorf("%s:%d: gated route registration outside Route is not supported", function.file, position.Line)
+			return false
+		}
+		base, ok := selector.X.(*ast.Ident)
+		if !ok {
+			scanErr = fmt.Errorf("%s:%d: cannot resolve route base for gated handler %s", function.file, position.Line, handler)
+			return false
+		}
+		prefix, ok := prefixes[base.Name]
+		if !ok {
+			scanErr = fmt.Errorf("%s:%d: cannot resolve route prefix variable %s for gated handler %s", function.file, position.Line, base.Name, handler)
+			return false
+		}
+		routePath, ok := stringLiteral(call.Args[0])
+		if !ok {
+			scanErr = fmt.Errorf("%s:%d: cannot resolve route path for gated handler %s", function.file, position.Line, handler)
+			return false
+		}
 		if prefix == unresolvedRoutePrefix {
 			scanErr = fmt.Errorf("%s:%d: cannot resolve route group prefix for gated handler %s", function.file, position.Line, handler)
 			return false
@@ -373,6 +423,25 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 		return true
 	})
 	return routes, scanErr
+}
+
+func assignmentHasGatedGroupMiddleware(assignment *ast.AssignStmt, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction, reachable map[string][]string) bool {
+	for _, expression := range assignment.Rhs {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			continue
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "Group" {
+			continue
+		}
+		for _, middleware := range call.Args[1:] {
+			if expressionMentionsGatedHandler(middleware, receiverAliases, receiverType, functions, reachable) || expressionContainsRecognizedGate(middleware) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func registerGroupPrefixes(assignment *ast.AssignStmt, prefixes map[string]string) {
@@ -410,11 +479,14 @@ func registerGroupPrefixes(assignment *ast.AssignStmt, prefixes map[string]strin
 	}
 }
 
-func routeHandlerSymbol(expression ast.Expr, receiverName, receiverType string, functions map[string]scannedFunction) (string, bool) {
+func routeHandlerSymbol(expression ast.Expr, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction) (string, bool) {
 	switch value := expression.(type) {
 	case *ast.SelectorExpr:
 		identifier, ok := value.X.(*ast.Ident)
-		if !ok || identifier.Name != receiverName {
+		if !ok {
+			return "", false
+		}
+		if _, ok := receiverAliases[identifier.Name]; !ok {
 			return "", false
 		}
 		symbol := receiverType + "." + value.Sel.Name
@@ -428,14 +500,73 @@ func routeHandlerSymbol(expression ast.Expr, receiverName, receiverType string, 
 	}
 }
 
-func expressionMentionsGatedHandler(expression ast.Expr, receiverName, receiverType string, functions map[string]scannedFunction, reachable map[string][]string) bool {
+func expressionMentionsGatedHandler(expression ast.Expr, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction, reachable map[string][]string) bool {
 	found := false
 	ast.Inspect(expression, func(node ast.Node) bool {
 		value, ok := node.(ast.Expr)
 		if !ok {
 			return true
 		}
-		if symbol, ok := routeHandlerSymbol(value, receiverName, receiverType, functions); ok && len(reachable[symbol]) > 0 {
+		if symbol, ok := routeHandlerSymbol(value, receiverAliases, receiverType, functions); ok && len(reachable[symbol]) > 0 {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func receiverAliasSet(function scannedFunction) map[string]struct{} {
+	aliases := make(map[string]struct{})
+	if function.receiverName == "" {
+		return aliases
+	}
+	aliases[function.receiverName] = struct{}{}
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(function.body, func(node ast.Node) bool {
+			assignment, ok := node.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for i, right := range assignment.Rhs {
+				if i >= len(assignment.Lhs) {
+					break
+				}
+				rightName, ok := right.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if _, ok := aliases[rightName.Name]; !ok {
+					continue
+				}
+				leftName, ok := assignment.Lhs[i].(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if _, exists := aliases[leftName.Name]; !exists {
+					aliases[leftName.Name] = struct{}{}
+					changed = true
+				}
+			}
+			return true
+		})
+	}
+	return aliases
+}
+
+func expressionContainsRecognizedGate(expression ast.Expr) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if _, ok := directGate(selector.Sel.Name); ok {
 			found = true
 			return false
 		}

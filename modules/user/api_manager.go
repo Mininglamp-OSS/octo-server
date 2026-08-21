@@ -194,39 +194,7 @@ func (m *Manager) me(c *wkhttp.Context) {
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
 func managerCapabilities(role string) map[string]bool {
-	isSuper := role == string(wkhttp.SuperAdmin)
-	isAdmin := isSuper || role == string(wkhttp.Admin)
-	return map[string]bool{
-		// superAdmin 专属
-		"system_setting":     isSuper, // 系统配置：读写均超管
-		"backup":             isSuper, // 备份管理：读写均超管
-		"appversion.write":   isSuper, // 版本发布 / 下载源设置
-		"dashboard.trigger":  isSuper, // 手动触发 ETL
-		"space.destructive":  isSuper, // 强制解散/封禁/强制移除/改成员角色
-		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
-		"users.manage_admin": isSuper, // 管理员账号 增/查/删
-		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
-		// superAdmin ∪ marketAdmin —— 整个平台市场的运营面：MCP 目录、Skill 目录、
-		// 专家市场。marketAdmin 是与 dashboardReader 同形状的固定角色：octo-lib 不
-		// 认识它，所以它过不了任何 admin/superAdmin 端点，只有这六个键为真。
-		//
-		// 这六个键只驱动前端渲染；真正的放行在 octo-marketplace 的 /api/v1/admin/*，
-		// 见 auth.CanAdminMarketplace。两侧必须同时放开——marketplace 侧仍按资源分组
-		// 挂门，所以只改这里不改那边，页面会渲染出来但每个请求 403。
-		"skill.read":   auth.CanAdminMarketplace(role), // 系统 Skill 列表/详情
-		"skill.write":  auth.CanAdminMarketplace(role), // 系统 Skill 创建/编辑/删除/分类管理
-		"mcp.read":     auth.CanAdminMarketplace(role), // 系统 MCP 列表/详情
-		"mcp.write":    auth.CanAdminMarketplace(role), // 系统 MCP 创建/编辑/删除
-		"expert.read":  auth.CanAdminMarketplace(role), // 专家市场 专家/专家团 列表/详情
-		"expert.write": auth.CanAdminMarketplace(role), // 专家市场 上传新建/编辑/删除 + 分类管理
-		// admin ∪ superAdmin；dashboardReader 仅有 dashboard.read。
-		"appversion.read": isAdmin,                            // 版本列表
-		"dashboard.read":  auth.CanReadManagerDashboard(role), // 运营看板查看
-		"users.read":      isAdmin,                            // 用户列表 / 好友 / 黑名单 / 禁用 / 设备 / 在线
-		"groups.read":     isAdmin,                            // 群组列表 / 禁用群 / 群成员 / 群黑名单
-		"space.read":      isAdmin,                            // 空间查看 / 列表
-		"space.write":     isAdmin,                            // 建空间 / 改资料 / 加成员 / 邀请增改禁用 / 通过拒绝入群申请（requireAdmin）
-	}
+	return auth.ManagerCapabilities(role)
 }
 
 func (m *Manager) devices(c *wkhttp.Context) {

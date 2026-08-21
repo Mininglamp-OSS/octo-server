@@ -25,8 +25,6 @@ const (
 	LegacyGateAdmin              LegacyGate = "admin"
 	LegacyGateSuperAdmin         LegacyGate = "super_admin"
 	LegacyGateManagerConsoleRole LegacyGate = "manager_console_role"
-	LegacyGateFixedRolePolicy    LegacyGate = "fixed_role_policy"
-	LegacyGateMixed              LegacyGate = "mixed"
 )
 
 type Scope string
@@ -52,11 +50,17 @@ type Manifest struct {
 }
 
 type Permission struct {
-	Key         string      `yaml:"key" json:"key"`
-	Resource    string      `yaml:"resource" json:"resource"`
-	Action      string      `yaml:"action" json:"action"`
-	Description string      `yaml:"description" json:"description"`
-	Sensitivity Sensitivity `yaml:"sensitivity" json:"sensitivity"`
+	Key                 string               `yaml:"key" json:"key"`
+	Resource            string               `yaml:"resource" json:"resource"`
+	Action              string               `yaml:"action" json:"action"`
+	Description         string               `yaml:"description" json:"description"`
+	Sensitivity         Sensitivity          `yaml:"sensitivity" json:"sensitivity"`
+	ExternalEnforcement *ExternalEnforcement `yaml:"external_enforcement,omitempty" json:"external_enforcement,omitempty"`
+}
+
+type ExternalEnforcement struct {
+	Service     string `yaml:"service" json:"service"`
+	Description string `yaml:"description" json:"description"`
 }
 
 type LegacyCapability struct {
@@ -149,6 +153,17 @@ func validateManifestShape(document *yaml.Node) error {
 	if err := validateSequence(fields["permissions"], "permissions", []string{"key", "resource", "action", "description", "sensitivity"}, nil); err != nil {
 		return err
 	}
+	for i, item := range fields["permissions"].Content {
+		itemFields, err := mappingFields(item, fmt.Sprintf("permissions[%d]", i))
+		if err != nil {
+			return err
+		}
+		if external := itemFields["external_enforcement"]; external != nil {
+			if _, err := requireMappingFields(external, fmt.Sprintf("permissions[%d].external_enforcement", i), []string{"service", "description"}, nil); err != nil {
+				return err
+			}
+		}
+	}
 	if err := validateSequence(fields["legacy_capabilities"], "legacy_capabilities", []string{"key", "permissions", "mode", "description"}, map[string]yaml.Kind{"permissions": yaml.SequenceNode}); err != nil {
 		return err
 	}
@@ -232,7 +247,7 @@ func validateEnums(manifest *Manifest) error {
 		}
 	}
 	for i, gate := range manifest.GateSites {
-		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateManagerConsoleRole), string(LegacyGateFixedRolePolicy), string(LegacyGateMixed)) {
+		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateManagerConsoleRole)) {
 			return fmt.Errorf("gate_sites[%d].legacy_gate: invalid value %q", i, gate.LegacyGate)
 		}
 	}
