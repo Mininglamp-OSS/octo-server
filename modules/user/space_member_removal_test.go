@@ -1033,3 +1033,46 @@ func TestDMRestoreSkipsSpaceScopedWhenMembershipLostMidFlight(t *testing.T) {
 	assert.NotContains(t, added, spacepkg.BuildChannelID(spaceX, bot),
 		"已经不是 X 的成员，X 作用域的前缀频道不该被补回")
 }
+
+// TestDMCutoffLeavesBotPrefixedChannelWhenConversationDeleted 钉住一个**已知缺口**，
+// 不是钉住期望行为 —— 名字里的 Leaves 是故意的。
+//
+// 覆写只写裸 Person 频道；s{spaceID}_{uid} 前缀频道上的条目只由 cutOffDM 的 if bot
+// 分支摘，而那条路要先枚举到对端。于是「bot 对端 + 会话被本地删掉」这一组合里，
+// 裸频道被修好、前缀频道没人管：这正是 PR 里声明为 open 的那一半，此前没有任何用例
+// 同时覆盖 bot 对端与空会话列表（既有的 bot 用例都把会话喂进去了，走的是枚举路径）。
+//
+// 为什么值得写：这个缺口目前只活在注释和 brief 里。有了这条用例，将来谁把覆写扩到
+// 前缀频道，它会立刻变红，从而**必须**回来改掉「已关闭」的措辞，而不是让文档和代码
+// 悄悄分叉——本 PR 已经在这上面栽过一次。
+func TestDMCutoffLeavesBotPrefixedChannelWhenConversationDeleted(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, bot = "0123456789abcdef0123456789abcdef", "u-removed", "bot-gap"
+
+	// 共处 Space、且**不是**好友 —— 移除之后这一对本该两个方向都断掉。
+	seedSpaceMember(t, ctx, spaceID, removed, bot)
+	_, err := ctx.DB().Exec(
+		"INSERT INTO robot (robot_id, status, created_at, updated_at) VALUES (?, 1, NOW(), NOW())", bot)
+	require.NoError(t, err)
+	removeSpaceMember(t, ctx, spaceID, removed)
+
+	// 关键：会话列表空 —— 他把与 bot 的会话本地删了。
+	stub := newIMStub(t, ctx, nil)
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	// 修好的那一半：裸频道被覆写，bot 不在里面了。
+	uids, ok := stub.setWhitelistOf(removed)
+	require.True(t, ok, "裸频道必须被覆写")
+	assert.NotContains(t, uids, bot, "覆写之后 bot 不能再在裸频道上发给他")
+
+	// 仍然缺的那一半：前缀频道一个字都没动。
+	prefixed := spacepkg.BuildChannelID(spaceID, removed)
+	_, setOnPrefixed := stub.setWhitelistOf(prefixed)
+	assert.False(t, setOnPrefixed, "当前实现不覆写前缀频道——这是记录在案的缺口，不是期望")
+	assert.NotContains(t, stub.removedChannels(), prefixed,
+		"枚举不到对端，前缀频道上的 whitelist_remove 也不会发生")
+	assert.NotContains(t, stub.removedChannels(), spacepkg.BuildChannelID(spaceID, bot),
+		"对端一侧的前缀频道同理")
+}

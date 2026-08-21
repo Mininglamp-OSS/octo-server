@@ -731,6 +731,14 @@ Recorded so the diff can be read against the spec rather than against memory.
 - The join side performs the same overwrite, so a rejoiner regains what the
   cutoff's wider revocation removed.
 - The derivation resolves `s{spaceID}_{uid}` to the same set as the bare `uid`.
+- **The prefixed-channel gap is pinned as a gap.** A bot peer combined with an empty
+  conversation list — the one combination no earlier test covered, since the existing
+  bot cases feed the conversation in and therefore exercise the enumerated path —
+  asserts that the bare channel is overwritten *and* that the `s{spaceID}_` channels
+  are not touched at all. It is a characterization test, named `...LeavesBot...` on
+  purpose: extending the overwrite to prefixed channels turns it red, which forces
+  whoever does that to come back and correct the "closed" wording rather than letting
+  the docs and the code drift apart. This PR has already made that mistake once.
 
 **The `dm_forbidden` delivery chain (round 10c)**
 
