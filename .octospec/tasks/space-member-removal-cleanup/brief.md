@@ -359,7 +359,8 @@ Consequently:
   chain unfriend → rejoin (restore re-grants on co-membership) → delete the
   conversation → get removed is newly constructible.
 
-  **Half of it is now closed in this task** (round 10). `dm_cutoff` starts by
+  **Part of it is now closed in this task** (round 10) — the **bare** Person channel
+  only; see the scope note below. `dm_cutoff` starts by
   overwriting the removed member's own bare Person channel with the derived set
   `friends(uid, is_deleted=0, is_alone=0) ∪ coMembers(uid)`
   (`/channel/whitelist_set`, `reconcileRemovedMemberChannel`). The broker's
@@ -377,7 +378,26 @@ Consequently:
   BLOCKED and removed→peer is still ALLOWED; after the rejoin overwrite both are
   ALLOWED again.
 
-  **The residual is the other direction** — "who may the removed member send to".
+  **Scope of what the overwrite closes.** It writes exactly one channel — the bare
+  `uid` form. Space-prefixed `s{spaceID}_{uid}` channels are **not** touched; entries
+  there are removed only by `removeSpaceScopedWhitelist`, reachable only from
+  `cutOffDM`'s `if bot` branch, i.e. still enumeration-bound. Reviewed and corrected
+  after review pointed out the original claim read as covering the whole inbound
+  direction.
+
+  How big that prefixed residual is, checked rather than assumed: every site that
+  writes a prefixed Person-channel whitelist entry (`app_bot` ×1, `botfather` ×3)
+  writes bidirectional friend rows first, so an entry surviving a Space removal
+  usually belongs to a pair the friendship still authorizes — nothing that should
+  have been revoked. The exception is real, though, and **pre-dates this task**:
+  `handleDeleteFriend` clears only the two bare channels, never the prefixed ones,
+  and the `IMBlacklistAdd` it adds for bots lands on the **bot's** channel
+  (blocking user→bot), so it does not stop bot→user. Deleting a Space-scoped bot
+  friend therefore leaves `s{spaceID}_{user}` authorizing that bot inbound. A defect
+  in the friend-delete path rather than the removal path; the overwrite does not
+  reach it either. #797, together with the channel-form decision below.
+
+  **The other direction is also open** — "who may the removed member send to".
   Those entries live on each *peer's* channel, which a single-sided overwrite
   cannot reach, and enumerating the peers is exactly what the conversation view
   fails to do. That still needs an authoritative or bilateral pair index this repo
@@ -537,6 +557,38 @@ Recorded so the diff can be read against the spec rather than against memory.
   `space_member` and `deleteRobot` with neither step — so the API path leaves the bot
   in the Space's groups with live IM subscriptions. Untouched here; raised in review
   against this branch and recorded so the follow-up covers both paths.
+- **The overwrite resolves an inconsistency the repo already had, in the widening
+  direction — recorded as a decision, not left silent.** `derivePersonWhitelistOfUID`
+  is channel-form-agnostic (the broker callback strips any prefix and applies the same
+  rule), but bot onboarding writes the whitelist entry **only** to the prefixed channel
+  when a common Space exists. So a Space-scoped bot friend has no bare-channel entry
+  today, and the overwrite adds one: the bot gains an unscoped DM route it never had,
+  and keeps it after the user leaves that Space, because removal does not touch friend
+  rows. This task treats the declared rule as authoritative — the overwrite makes the
+  broker agree with the rule the repo states — but that is a judgement call between two
+  inconsistent things, and the alternative reading (the prefixed-only write was
+  deliberate Space scoping, and the rule should become channel-form-aware) is equally
+  available. Inert while `whitelistOffOfPerson` holds its default `true`. **This must be
+  decided before whitelist enforcement is enabled**, alongside join-time provisioning.
+  #797.
+- **A failed `dm_restore` overwrite now costs more than it used to.** The restore is
+  deliberately best-effort with no retry, calibrated when a failure cost the enumerated
+  peers. The overwrite replaces the joiner's whole own-channel set, so a failure now
+  leaves them unable to receive from **every** co-member of the Space they just joined,
+  not a handful. Still loss-of-function rather than over-permission, still the safe side
+  of the asymmetry, and it self-heals on the next removal or join — but the enlargement
+  is real and is recorded here rather than discovered later. Whether this one call
+  deserves a bounded retry, unlike the per-peer half, is open.
+- **The removal cascade's per-member lock loop now sorts by uid.** `RemoveGroupMembers`
+  takes `FOR UPDATE` on each member row inside one transaction, in the order the caller's
+  list produced — the ABBA precondition against `handOverGroupCreator`, which locks the
+  leaver and then its successor. Same group, different orders, and MySQL aborts one:
+  the cleanup job retries and converges, but the manager batch-kick path surfaces a 500.
+  Sorting `removableMembers` (the iteration order, which comes from
+  `QueryMembersWithUids`, not from the request slice) fixes the ordering for one sort's
+  cost. Not reproduced as a deadlock — derived from the two lock orders; the successor
+  scan additionally has no usable index for its `ORDER BY created_at`, so it locks more
+  rows than it returns. That index is a follow-up.
 - **The overwrite can lose a concurrent grant, and that is accepted.** Between the
   derive (a DB read) and the `whitelist_set` POST, another module may
   `whitelist_add` to the same channel — a friend approval or a bot approval. That

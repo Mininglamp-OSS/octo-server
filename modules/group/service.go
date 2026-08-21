@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1773,6 +1774,18 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		LeaverName string
 		Bots       []*user.Model
 	}
+	// 按 uid 排序后再进锁循环：本函数在**同一个事务**里逐个 FOR UPDATE 锁成员行
+	// （LockRemovableMemberTx），持锁顺序由调用方传进来的名单顺序决定，是典型的
+	// ABBA 前提。同群上并发跑一次批量移除和一次群主交接
+	// （handOverGroupCreator 也锁 group_member 行），两边顺序不同就会死锁，
+	// 其中一方被 MySQL 回滚：清理工单会重试收敛，管理端批量踢人则直接 500。
+	// 固定成全局一致的 uid 升序，代价是一次排序，换掉整类顺序不一致。
+	//
+	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
+	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。
+	sort.Slice(removableMembers, func(i, j int) bool {
+		return removableMembers[i].UID < removableMembers[j].UID
+	})
 	var cascadedPerLeaver []cascadedLeaver
 	alreadyCascadedBotUIDs := make(map[string]struct{})
 	for _, m := range removableMembers {

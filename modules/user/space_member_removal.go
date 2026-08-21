@@ -33,8 +33,9 @@ func (f *Friend) registerSpaceMemberRemovalCleanup() {
 // 所以这里做的不是「重新定义规则」，而是把已经失效的缓存条目摘掉。
 //
 // 分两半，用的是同一条规则：
-//  1. 覆写他**自己的**频道（reconcileRemovedMemberChannel）—— 关掉「谁能发给他」。
-//     无条件执行，不依赖枚举。
+//  1. 覆写他**自己的裸**频道（reconcileRemovedMemberChannel）—— 关掉「谁还能在裸频道上
+//     发给他」。无条件执行，不依赖枚举。注意只是裸频道：Space 前缀频道不在内，
+//     范围与残余见该函数的说明。
 //  2. 逐个对端摘**对端的**频道 —— 关掉「他能发给谁」。这一半只能靠枚举，
 //     因此继承了枚举的盲区（会话被本地删掉的对端够不到，见 #797）。
 //
@@ -138,9 +139,28 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 
 // reconcileRemovedMemberChannel 把「被移除者自己的裸 Person 频道」白名单整个覆写为推导值。
 //
-// 只关一个方向：**谁能发给他**。broker 的 allowSend(from, to) 查的是 to 的频道
-// （internal/service/permission.go），所以覆写他的频道 = 决定谁还能发给他。
-// 反方向（他还能发给谁）在别人的频道上，那一半仍然只能靠逐对端枚举。
+// 覆盖范围要说准，别读成「谁能发给他」这一整个方向都关掉了：
+//
+//   - 只写**裸** Person 频道 `uid`。broker 的 allowSend(from, to) 查的是 to 的频道
+//     （internal/service/permission.go），所以这一次覆写决定的是「谁还能在裸频道上
+//     发给他」。
+//   - **不碰** Space 前缀频道 `s{spaceID}_{uid}`。那上面的条目只由 cutOffDM 的
+//     if bot 分支里的 removeSpaceScopedWhitelist 摘，而那条路径是要先枚举到对端的
+//     —— 也就是说，前缀频道这一半仍然带着枚举的盲区。
+//   - 反方向（他还能发给谁）在**别人的**频道上，覆写够不到，也只能靠枚举。
+//
+// 前缀频道这个残余有多大，说准确（核对过，不要凭印象读）：
+// 全仓库往前缀 Person 频道写白名单的只有 bot 上线那四处（app_bot 一处、botfather 三处），
+// 每一处都先写了双向好友行。所以「Space 移除后还留在 s{spaceID}_{uid} 上的条目」
+// 对应的一对通常仍被好友关系授权，本来就不该摘 —— 这一类不是逃逸。
+//
+// 但**有**一类是真的：好友被删之后。handleDeleteFriend 只摘两个**裸**频道，
+// 前缀频道从头到尾没人摘；它对 bot 追加的 IMBlacklistAdd 写在 **bot 自己的频道**上
+// （ChannelID=bot, UIDs=[user]），挡的是 user→bot，**挡不住 bot→user**。
+// 于是「删掉一个 Space 作用域的 bot 好友」之后，s{spaceID}_{user} 上那条授权仍然有效，
+// bot 还能发进来。这条先于本 PR 存在（friend 删除路径的洞，不是移除路径的），
+// 本次覆写也没有覆盖到它 —— 覆写只写裸频道。
+// 一并记进 #797，与「白名单规则以哪种频道形态为准」同一个决定。
 //
 // 为什么需要它 —— 逐对端枚举有一个够不到的洞：
 // dmPeersInSpace 的范围来自 IMSyncUserConversation，也就是**被移除者自己的会话列表**。
@@ -180,8 +200,21 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 //
 // 总之：收敛，但不是零延迟、也不是零代价，别把它当成不变量。
 //
-// 仍然开着的残余（#797）：他能发给谁 —— 那些条目在对端的频道上，
-// 单边覆写够不到，需要一份「谁授权过谁」的双边索引才能不枚举地收敛。
+// 仍然开着的残余（#797）：
+//   - 他能发给谁 —— 那些条目在对端的频道上，单边覆写够不到，
+//     需要一份「谁授权过谁」的双边索引才能不枚举地收敛；
+//   - 前缀频道那一半仍然受枚举盲区约束（见上）。
+//
+// 还有一个**扩权**方向的取舍，写在这里而不是留给下一轮发现：推导集合按
+// derivePersonWhitelistOfUID 是不分频道形态的（1module.go 注册给 broker 的
+// IMDatasource.Whitelist 也是先剥前缀再按同一条规则算），而 bot 上线在有共同 Space
+// 时**只**往前缀频道写。于是一个「Space 作用域的 bot 好友」本来没有裸频道条目，
+// 这次覆写会把它写进去 —— bot 拿到了一条它原先没有的、不受 Space 约束的私聊通路，
+// 而且移除不动好友行，这条通路在他离开该 Space 之后还在。
+// 这里按「声明的规则为准」处理（规则不分频道形态，覆写只是让 broker 与规则一致），
+// 但这等于替一个仓库内部本就不自洽的地方做了裁决：要么规则该变成分频道形态的，
+// 要么 bot 上线那四处该同时写裸频道。在 whitelistOffOfPerson 仍为默认 true 的部署里
+// 两者都不生效；**开启白名单校验之前必须先定这件事**，见 #797。
 func (f *Friend) reconcileRemovedMemberChannel(ctx *config.Context, uid string) error {
 	// 走 OfUID 而不是 derivePersonWhitelist：后者会对 "s" 开头的入参做前缀剥离，
 	// 而这里传的是一个确定的 uid，不是 channel_id。
