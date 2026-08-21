@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -79,10 +80,15 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		}
 	}
 
-	// 自助退出 Space 时操作者就是本人，默认的「被 X 移出群聊」会渲染成
-	// 「X 被 X 移出群聊」。这种情况下抑制默认文案，改发与既有 groupExit 一致的
-	// 退群提示；其余清理动作完全不变。
+	// 何时抑制默认的「被 X 移出群聊」系统消息：
+	//   - reason=left：操作者就是本人，默认文案会渲染成「X 被 X 移出群聊」；
+	//     改发与既有 groupExit 一致的退群提示。
+	//   - reason=space_disbanded：解散不会解散群，于是每个成员在每个群里各触发一次。
+	//     N 个成员 × M 个群就是 N×M 条系统消息（1000 人 × 50 群 = 五万条），
+	//     全都堆给最后被移除的那个人看。空间已经没了，逐个通告没有意义。
 	selfExit := removal.Reason == spacemod.MemberRemoveReasonLeft
+	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
+	suppressNotice := selfExit || spaceGone
 
 	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo: groupNo,
@@ -91,7 +97,7 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		// 不依赖群内身份。
 		OperatorUID:          removal.OperatorUID,
 		OperatorName:         operatorName,
-		SuppressRemoveNotice: selfExit,
+		SuppressRemoveNotice: suppressNotice,
 	})
 	if err != nil {
 		return fmt.Errorf("remove group member: %w", err)
@@ -139,16 +145,33 @@ func (g *Group) sendGroupExitTip(groupNo, uid string) {
 // RemoveGroupMembers 会跳过 creator，人就永远留在群里了。此时群成为无主空群，
 // 与既有 groupExit 在同样情形下的终局一致。
 func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
-	successor, err := g.db.QuerySecondOldestMemberExcludingBotsOf(groupNo, leaverUID)
-	if err != nil {
-		return fmt.Errorf("query successor: %w", err)
-	}
-
 	tx, err := g.db.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin creator handover: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
+
+	// 事务内、行锁下重读离开者的角色。调用方那次 QueryMemberWithUID 是无锁读，
+	// 而租约到期后同一条工单可能被另一个 worker 并发重跑：两边都读到 creator，
+	// 就会各自提升一个继任者，群里留下两个 role=creator 的行。而
+	// RemoveGroupMembers 会静默跳过 creator，于是那个成员被永久卡在群里。
+	// 锁内重读后若已不是 creator，说明别人刚交接过，直接当成功返回。
+	var roles []int
+	if _, err = tx.SelectBySql(
+		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		groupNo, leaverUID,
+	).Load(&roles); err != nil {
+		return fmt.Errorf("re-read leaver role: %w", err)
+	}
+	if len(roles) == 0 || roles[0] != MemberRoleCreator {
+		return nil // 已经不是群主（并发交接已完成 / 人已不在群）
+	}
+
+	// 继任者也在同一事务内查，避免用事务外的陈旧快照
+	successor, err := querySecondOldestNonBotMemberTx(tx, groupNo, leaverUID)
+	if err != nil {
+		return fmt.Errorf("query successor: %w", err)
+	}
 
 	if successor != nil {
 		version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
@@ -197,4 +220,21 @@ func (g *Group) resolveOperatorName(operatorUID string) string {
 		return operatorUID
 	}
 	return operator.Name
+}
+
+// querySecondOldestNonBotMemberTx 是 DB.QuerySecondOldestMemberExcludingBotsOf 的
+// 事务内版本，语义完全一致（含「他人的 bot 仍可继任」这条被
+// TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 钉住的既有契约）。
+// 单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
+func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
+	var member *MemberModel
+	_, err := tx.SelectBySql(
+		"SELECT gm.* FROM group_member gm "+
+			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
+			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
+			"AND r.robot_id IS NULL "+
+			"ORDER BY gm.created_at ASC LIMIT 1",
+		leaverUID, groupNo, MemberRoleCreator,
+	).Load(&member)
+	return member, err
 }

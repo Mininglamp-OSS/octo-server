@@ -239,13 +239,20 @@ func TestDMCutoffIgnoresOneSidedFriend(t *testing.T) {
 	assert.Len(t, stub.removedChannels(), 2, "单向好友不构成授权，私聊仍要断")
 }
 
-// TestDMCutoffSkipsPeerWithoutPresenceInSpace 只处理"在本 Space 下真的聊过"的对端。
-func TestDMCutoffSkipsPeerWithoutPresenceInSpace(t *testing.T) {
+// TestDMCutoffDoesNotRequireDMPresenceRow 回归（code review 第二轮）：
+// dm_space_presence 不再是硬门槛。
+//
+// 那张表是 message webhook 上尽力而为写的增量索引：不回填、只覆盖带 space_id 的
+// 非加密 Person 消息、写失败只记日志。把它当唯一门槛，等于让任何在该表上线前聊过、
+// 或用加密私聊、或那次 upsert 恰好失败的一对，静默跳过整个隔离清理。
+// 现在的范围由「他自己的会话列表 ∩ 在本 Space 有过成员行」圈定，
+// 切不切仍由逐对端的授权判定决定。
+func TestDMCutoffDoesNotRequireDMPresenceRow(t *testing.T) {
 	ctx, f := dmTestSetup(t)
 	const spaceID, removed, peer = "dm-nopresence", "u-removed", "u-peer"
 
 	seedSpaceMember(t, ctx, spaceID, removed, peer)
-	// 刻意不写 dm_space_presence
+	// 刻意不写 dm_space_presence —— 会话列表本身已经是"有过私聊"的证据
 	removeSpaceMember(t, ctx, spaceID, removed)
 
 	stub := newIMStub(t, ctx, []string{peer})
@@ -253,7 +260,9 @@ func TestDMCutoffSkipsPeerWithoutPresenceInSpace(t *testing.T) {
 		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
 	}))
 
-	assert.Empty(t, stub.removedChannels())
+	removedCalls := stub.removedChannels()
+	assert.Equal(t, []string{removed}, removedCalls[peer])
+	assert.Equal(t, []string{peer}, removedCalls[removed])
 }
 
 // TestDMCutoffSkipsNonSpaceMember 会话列表里的外部对端（不是本 Space 成员）不该被牵连。

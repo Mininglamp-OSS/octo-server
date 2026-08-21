@@ -236,13 +236,43 @@ func newRemovalClaimOwner() string {
 // processPendingSessionRevocations 的接法一致。
 func (s *Space) startMemberRemovalCleanupWorker() {
 	s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
+	s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
 }
+
+// purgeFinishedMemberRemovalCleanups 定期清掉超过保留期的终态工单。
+// 工单只翻状态不删除，不清理的话这张表会随每一次踢人 / 退出 / 解散无限增长，
+// 把每 10s 一次的 pending 扫描越拖越慢。
+func (s *Space) purgeFinishedMemberRemovalCleanups() {
+	const purgeLimit = 1000
+	deleted, err := s.db.purgeFinishedMemberRemovalCleanups(
+		time.Now().UTC().Add(-removalCleanupRetention), purgeLimit)
+	if err != nil {
+		s.Warn("清理过期成员移除工单失败", zap.Error(err))
+		return
+	}
+	if deleted > 0 {
+		s.Info("清理过期成员移除工单", zap.Int64("deleted", deleted))
+	}
+}
+
+// removalCleanupRunning 进程内重入保护。
+//
+// 触发源有两个：afterMembersRemoved 起的 goroutine，和每 10s 一次的定时器；而定时器
+// 是「先安排下一次、再执行本次」（timingwheel 每次 firing 都 `go task()`），并不会等
+// 上一轮跑完。一次大解散后队列里堆着成千条工单，一轮 20 条的批次可能跑几分钟，
+// 期间会叠起几十个并发批次，各自占着 DB 连接猛打 WuKongIM。同一时刻只允许一轮。
+var removalCleanupRunning atomic.Bool
 
 // processMemberRemovalCleanups 认领并执行一批清理工单。
 //
 // 单次最多处理 removalCleanupBatchSize 条；认领失败 / 无可认领工单即返回。
-// 并发安全由 DB 侧的 SKIP LOCKED + 租约保证，多副本可同时跑。
+// 跨副本的并发安全由 DB 侧的 SKIP LOCKED + 租约保证；进程内由上面的 running 标志
+// 保证只有一轮在跑。
 func (s *Space) processMemberRemovalCleanups() {
+	if !removalCleanupRunning.CompareAndSwap(false, true) {
+		return // 已有一轮在跑，本次直接让位
+	}
+	defer removalCleanupRunning.Store(false)
 	defer func() {
 		if r := recover(); r != nil {
 			s.Error("处理成员移除清理工单 panic", zap.Any("recover", r))
@@ -287,7 +317,7 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 	if member != nil {
 		s.Info("被移除成员已重新加入，跳过会话面清理",
 			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
-		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined")
+		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined", false)
 		return
 	}
 
@@ -303,7 +333,7 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 			return
 		}
 	}
-	s.finishCleanupJob(job, owner, removalCleanupDone, "")
+	s.finishCleanupJob(job, owner, removalCleanupDone, "", false)
 }
 
 // releaseCleanupJob 记一次失败并安排重试；attempts 用尽则置为 abandoned 并高声报错。
@@ -313,7 +343,7 @@ func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName 
 			zap.Uint64("jobId", job.ID), zap.String("spaceId", job.SpaceID),
 			zap.String("uid", job.UID), zap.String("step", stepName),
 			zap.Uint32("attempts", job.Attempts+1), zap.Error(cause))
-		s.finishCleanupJob(job, owner, removalCleanupAbandoned, stepName+": retries exhausted")
+		s.finishCleanupJob(job, owner, removalCleanupAbandoned, stepName+": retries exhausted", true)
 		return
 	}
 	s.Warn("成员移除清理步骤失败，稍后重试",
@@ -328,8 +358,8 @@ func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName 
 
 // finishCleanupJob 写终态。租约易主（affected=0）只记日志：另一个 worker 已接手，
 // 重复执行是安全的（步骤契约要求幂等）。
-func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, status uint8, note string) {
-	ok, err := s.db.finishMemberRemovalCleanup(job.ID, owner, status, note)
+func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, status uint8, note string, countAttempt bool) {
+	ok, err := s.db.finishMemberRemovalCleanup(job.ID, owner, status, note, countAttempt)
 	if err != nil {
 		s.Warn("更新成员移除清理工单终态失败", zap.Uint64("jobId", job.ID), zap.Error(err))
 		return

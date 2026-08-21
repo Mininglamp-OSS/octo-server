@@ -596,11 +596,15 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 		return
 	}
 
-	err = s.db.disbandSpace(spaceId)
+	removed, err := s.db.disbandSpace(spaceId, loginUID)
 	if err != nil {
+		s.Error("解散空间失败", zap.Error(err), zap.String("spaceId", spaceId))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 刷新 ParseChannelID 缓存，与管理端强制解散一致
+	go s.loadKnownSpaceIDs()
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonSpaceDisbanded)
 	c.ResponseOK()
 }
 

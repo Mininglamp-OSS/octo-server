@@ -1,10 +1,13 @@
 package group
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -24,6 +27,7 @@ type groupIMStub struct {
 
 	mu                sync.Mutex
 	subscriberRemoves []subscriberRemoveCall
+	sentMessages      []map[string]interface{}
 }
 
 type subscriberRemoveCall struct {
@@ -45,6 +49,17 @@ func newGroupIMStub(t *testing.T, ctx *config.Context) *groupIMStub {
 		stub.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
+	// 必须单独记录 /message/send：系统 Tip 走的是它，若落进下面的 catch-all，
+	// 「解散 / 自助退出时抑制被移出文案」这条行为就完全没有断言，改回去也不会红。
+	mux.HandleFunc("/message/send", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		_ = json.Unmarshal(body, &payload)
+		stub.mu.Lock()
+		stub.sentMessages = append(stub.sentMessages, payload)
+		stub.mu.Unlock()
+		_, _ = w.Write([]byte(`{}`))
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
 	})
@@ -58,6 +73,16 @@ func newGroupIMStub(t *testing.T, ctx *config.Context) *groupIMStub {
 		stub.server.Close()
 	})
 	return stub
+}
+
+// sentContentTypes 返回所有被发出的系统消息的 content type。
+// 群成员移除提示是 MessageContentTypeRemoveMembers(1003)，退群提示是 GroupExit。
+func (s *groupIMStub) sentPayloads() []map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]map[string]interface{}, len(s.sentMessages))
+	copy(out, s.sentMessages)
+	return out
 }
 
 func (s *groupIMStub) unsubscribed(groupNo string) []string {
@@ -265,4 +290,75 @@ func TestGroupCascadeSelfExitSuppressesRemovedNotice(t *testing.T) {
 	_, stillIn := liveMemberRole(t, ctx, "g-selfexit", leaver)
 	assert.False(t, stillIn)
 	assert.Contains(t, stub.unsubscribed("g-selfexit"), leaver)
+
+	// 关键断言：不得出现「被移出」文案，而应出现「退出群聊」文案。
+	// 少了这一条，把 SuppressRemoveNotice 改回 false 测试照样绿。
+	assert.False(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
+		"自助退出不得渲染成「你被 X 移除群聊」")
+	assert.True(t, payloadsContain(stub.sentPayloads(), "退出群聊"),
+		"应改发退群提示")
+}
+
+// TestGroupCascadeDisbandSuppressesPerMemberNotice 解散不会解散群，
+// 于是每个成员在每个群里各触发一次移除。N 成员 × M 群条系统消息全堆给最后
+// 被移除的人看，且空间已经没了，逐个通告毫无意义——必须抑制。
+func TestGroupCascadeDisbandSuppressesPerMemberNotice(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-disbandnotice", "u-victim"
+
+	seedGroupInSpace(t, ctx, "g-disbandnotice", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-disbandnotice", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-disbandnotice", victim, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonSpaceDisbanded,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-disbandnotice", victim)
+	assert.False(t, stillIn, "清理本身照做")
+	assert.False(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
+		"解散场景不得逐成员逐群发被移出消息")
+}
+
+// TestGroupCascadeKickStillNotifies 反向保证：正常踢人仍要发被移出消息，
+// 抑制逻辑不能把它一并关掉。
+func TestGroupCascadeKickStillNotifies(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-kicknotice", "u-victim"
+
+	seedGroupInSpace(t, ctx, "g-kicknotice", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-kicknotice", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-kicknotice", victim, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "u-owner",
+		Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	assert.True(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
+		"被踢出 Space 导致的退群仍要在群里告知")
+}
+
+// payloadsContain 在录到的系统消息里找文案片段。
+// SendGroupMemberBeRemove 的 content 是「你被{0}移除群聊」，
+// SendGroupExit 的是「“{0}“退出群聊」。
+func payloadsContain(payloads []map[string]interface{}, fragment string) bool {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		if decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw)); err == nil {
+			if strings.Contains(string(decoded), fragment) {
+				return true
+			}
+		}
+		if strings.Contains(fmt.Sprint(raw), fragment) {
+			return true
+		}
+	}
+	return false
 }

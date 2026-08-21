@@ -68,14 +68,14 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 		// A 删了）只有 A 的频道仍授权 B，B 的频道并不授权 A。若任一方向有好友行就整个
 		// 跳过，B 频道上那条早已失效的白名单就没人摘 —— A 还能继续发给 B，而 B 的
 		// 客户端（annotateDMSendability 只查正确的那个方向）显示的是"不可发送"。
-		cutInbound, err := f.dmDirectionRevoked(peer, removal.UID) // 被移除者 -> 对端
+		cutInbound, err := f.dmDirectionRevoked(ctx, peer, removal.UID) // 被移除者 -> 对端
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		cutOutbound, err := f.dmDirectionRevoked(removal.UID, peer) // 对端 -> 被移除者
+		cutOutbound, err := f.dmDirectionRevoked(ctx, removal.UID, peer) // 对端 -> 被移除者
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -99,16 +99,20 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 	return firstErr
 }
 
-// dmPeersInSpace 找出「被移除者在本 Space 下真的聊过的私聊对端」。
+// dmPeersInSpace 找出「与被移除者有私聊、且属于本 Space 范畴」的对端。
 //
-// 三步收窄，每一步都有界：
-//  1. 从 IM 拉他自己的会话列表 —— 上界是他的会话数，不是 Space 的人数；
-//  2. 收窄到本 Space 的活跃成员（一次 IN 查询）；
-//  3. 用 dm_space_presence 确认这一对确实在本 Space 下产生过消息。
+// 两步收窄，都有界：
+//  1. 从 IM 拉他自己的会话列表 —— 上界是他的会话数，不是 Space 的人数。
+//     这一步本身就是「有过私聊」的证据。
+//  2. 收窄到在本 Space 有过成员行的人（一次 IN 查询，不看状态，理由见
+//     MembersEverInSpace）。
 //
-// 刻意不对 dm_space_presence.fake_channel_id 做 LIKE 反查：它是
-// common.GetFakeChannelIDWith 生成的 "{a}@{b}"（顺序由 CRC32 决定），是主键前缀，
-// 没有子串索引，且拼接格式不是稳定契约。这里始终用「已知对端 -> 正向构造 key」。
+// 刻意**不**再拿 dm_space_presence 当硬门槛。那张表是 message webhook 上尽力而为地
+// 写入的增量索引：不回填、只覆盖带 space_id 的非加密 Person 消息、写失败只记日志
+// （见 pkg/space/dm_presence.go 的说明，连它自己都强调读侧要 OR 上兜底，
+// 「缺一行绝不能让一个会话消失」）。把它当唯一门槛，等于让任何在该表上线前聊过、
+// 或用加密私聊、或那次 upsert 恰好失败的一对，静默地跳过整个隔离清理。
+// 真正决定切不切的是后面逐对端的授权判定，这一步只负责圈定范围。
 func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval) ([]string, error) {
 	conversations, err := ctx.IMSyncUserConversation(removal.UID, 0, 1, "", nil)
 	if err != nil {
@@ -131,27 +135,11 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 		return nil, nil
 	}
 
-	fakeToPeer := make(map[string]string, len(memberSet))
-	fakeIDs := make([]string, 0, len(memberSet))
+	peers := make([]string, 0, len(memberSet))
 	for _, peer := range candidates {
-		if !memberSet[peer] {
-			continue
+		if memberSet[peer] {
+			peers = append(peers, peer)
 		}
-		fake := common.GetFakeChannelIDWith(removal.UID, peer)
-		if _, dup := fakeToPeer[fake]; dup {
-			continue
-		}
-		fakeToPeer[fake] = peer
-		fakeIDs = append(fakeIDs, fake)
-	}
-
-	present, err := spacepkg.DMSpacePresenceSet(ctx.DB(), fakeIDs, removal.SpaceID)
-	if err != nil {
-		return nil, fmt.Errorf("query dm space presence: %w", err)
-	}
-	peers := make([]string, 0, len(present))
-	for fake := range present {
-		peers = append(peers, fakeToPeer[fake])
 	}
 	return peers, nil
 }
@@ -163,8 +151,8 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 // ∪ coMembers(channelUID)。调用方已经确认两人不再共处任一活跃 Space，所以这里
 // 只剩好友这一条依据，且**方向敏感**：看的是 channelUID 是否持有指向 sender 的
 // 有效双向好友行。
-func (f *Friend) dmDirectionRevoked(channelUID, sender string) (bool, error) {
-	friend, err := f.db.isMutualFriend(channelUID, sender)
+func (f *Friend) dmDirectionRevoked(ctx *config.Context, channelUID, sender string) (bool, error) {
+	friend, err := newFriendDB(ctx).isMutualFriend(channelUID, sender)
 	if err != nil {
 		return false, fmt.Errorf("query friendship (%s -> %s): %w", channelUID, sender, err)
 	}
@@ -192,7 +180,7 @@ func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string,
 
 	// Bot 私聊用的是 Space 前缀频道（见 app_bot / botfather 的 IMWhitelistAdd），
 	// 只摘裸 uid 频道会把 bot 私聊漏在开着的状态。
-	if bot, err := f.eitherSideIsBot(removedUID, peer); err != nil {
+	if bot, err := f.eitherSideIsBot(ctx, removedUID, peer); err != nil {
 		f.Warn("判定是否 bot 私聊失败，跳过 Space 前缀频道白名单清理",
 			zap.Error(err), zap.String("uid", removedUID), zap.String("peer", peer))
 	} else if bot {
@@ -264,15 +252,16 @@ func (f *Friend) notifyDMChannelUpdate(ctx *config.Context, recipient, peer stri
 }
 
 // eitherSideIsBot 判断这对私聊里是否有 bot。
-func (f *Friend) eitherSideIsBot(uid, peer string) (bool, error) {
-	isBot, err := f.db.isRobot(peer)
+func (f *Friend) eitherSideIsBot(ctx *config.Context, uid, peer string) (bool, error) {
+	db := newFriendDB(ctx)
+	isBot, err := db.isRobot(peer)
 	if err != nil {
 		return false, err
 	}
 	if isBot {
 		return true, nil
 	}
-	return f.db.isRobot(uid)
+	return db.isRobot(uid)
 }
 
 // DM 可发送性下发给客户端的 extra key。

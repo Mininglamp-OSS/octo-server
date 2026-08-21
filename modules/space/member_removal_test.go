@@ -328,7 +328,7 @@ func TestClaimCleanupRespectsLeaseAndSchedule(t *testing.T) {
 	assert.Equal(t, first.ID, takeover.ID)
 
 	// 非租约持有者写终态必须落空，避免覆盖接手方的结果
-	ok, err := f.db.finishMemberRemovalCleanup(first.ID, "worker-a", removalCleanupDone, "")
+	ok, err := f.db.finishMemberRemovalCleanup(first.ID, "worker-a", removalCleanupDone, "", false)
 	require.NoError(t, err)
 	assert.False(t, ok, "租约已易主，旧 owner 不得写终态")
 }
@@ -563,4 +563,123 @@ func TestClaimCleanupOwnerIsPerClaim(t *testing.T) {
 	// 必须放得进 lease_owner VARCHAR(64)：超长会被 MySQL 以 "Data too long"
 	// 拒掉整条认领，worker 于是一条工单都处理不了。
 	assert.LessOrEqual(t, len(a), 64, "租约标识不得超过 lease_owner 列宽")
+}
+
+// TestOwnerDisbandSpaceEnqueuesCleanup 群主解散自己的空间（用户侧 DELETE /v1/space/:id）
+// 必须和管理端强制解散走同一条级联。
+//
+// 此前这个 handler 只翻 space.status，成员行原样留着 status=1：解散后成员仍在该
+// 空间的所有群里、私聊白名单原封不动，而 SharesActiveSpace 因为 space.status=0
+// 已判定为"无共同空间"——服务端说不该能发，WuKongIM 的缓存却还允许发。
+// 用户侧解散比管理端强制解散常见得多，不能只接后者。
+func TestOwnerDisbandSpaceEnqueuesCleanup(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "owner-disband"
+	seedMember(t, f, spaceID, testutil.UID, 2) // testutil.UID 是 owner
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "m-other", Role: 0, Status: 1,
+	}))
+
+	conn := testCtx.GetRedisConn()
+	cacheKey := "space:member:" + spaceID + ":m-other"
+	require.NoError(t, conn.SetAndExpire(cacheKey, "1", time.Minute))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/v1/space/"+spaceID, nil)
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// 空间与成员行都要置 0
+	var spaceStatus, activeMembers int
+	_, err = testCtx.DB().SelectBySql("SELECT status FROM space WHERE space_id=?", spaceID).Load(&spaceStatus)
+	require.NoError(t, err)
+	assert.Equal(t, 0, spaceStatus)
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceID).Load(&activeMembers)
+	require.NoError(t, err)
+	assert.Zero(t, activeMembers, "解散必须把成员行一并置 0")
+
+	// 每个成员一条清理工单
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 2)
+	for _, job := range jobs {
+		assert.Equal(t, MemberRemoveReasonSpaceDisbanded, job.Reason)
+	}
+
+	// 鉴权缓存同步失效
+	after, err := conn.GetString(cacheKey)
+	require.NoError(t, err)
+	assert.Empty(t, after, "解散后成员的 Space 鉴权缓存必须立即失效")
+}
+
+// TestCleanupWorkerAbandonRecordsAttempts 被放弃的工单必须把最后一次尝试计入 attempts，
+// 否则运维按 `attempts >= removalCleanupMaxAttempts` 查不出任何被放弃的工单，
+// 也无法与「改了常量之后提前放弃」的行区分开。
+func TestCleanupWorkerAbandonRecordsAttempts(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-abandon-attempts"
+	seedMember(t, f, spaceID, "owner-a", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-a", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-a", 1, "owner-a", MemberRemoveReasonKicked)
+	_, err = testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET attempts=? WHERE space_id=?",
+		removalCleanupMaxAttempts-1, spaceID)
+	require.NoError(t, err)
+
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "always-fails",
+		fn:   func(*config.Context, MemberRemoval) error { return errors.New("down") },
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupAbandoned, jobs[0].Status)
+	assert.EqualValues(t, removalCleanupMaxAttempts, jobs[0].Attempts,
+		"放弃时必须把最后一次尝试计进去")
+}
+
+// TestTruncateCleanupErrorKeepsPrefixWithInvalidByte 原串中间本来就带非法字节时，
+// 只应裁掉末尾被切断的那个 rune，而不是一路把消息裁没。
+func TestTruncateCleanupErrorKeepsPrefixWithInvalidByte(t *testing.T) {
+	// 第 4 个字节是裸的 0xff（上游代理错误页里很常见），后面接足够长的内容
+	input := "dm_" + string([]byte{0xff}) + strings.Repeat("a", 400)
+	got := truncateCleanupError(input)
+	assert.LessOrEqual(t, len(got), 255)
+	assert.Greater(t, len(got), 200,
+		"中间的非法字节不该把整条摘要裁没——那是 O(n²) 全串校验循环的后果")
+}
+
+// TestProcessMemberRemovalCleanupsIsNotReentrant 同一进程内只允许一轮在跑。
+// 定时器是「先安排下一次、再执行本次」，慢批次会把并发轮数越堆越多。
+func TestProcessMemberRemovalCleanupsIsNotReentrant(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-reentrant"
+	seedMember(t, f, spaceID, "owner-r", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-r", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-r", 1, "owner-r", MemberRemoveReasonKicked)
+
+	var inner int
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "reenter",
+		fn: func(*config.Context, MemberRemoval) error {
+			// 步骤内部再调一次：必须直接让位，不能又跑一轮
+			f.processMemberRemovalCleanups()
+			inner++
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+	assert.Equal(t, 1, inner, "重入的那次必须直接返回，不得再执行一轮")
 }

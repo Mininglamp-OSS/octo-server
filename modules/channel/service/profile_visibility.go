@@ -132,6 +132,13 @@ var callerOwnedExtraKeys = []string{
 	"screenshot",      // 截屏通知
 	"revoke_remind",   // 撤回提醒
 	"msg_auto_delete", // 消息定时删除——缺失会让 iOS 新消息不再自动删除
+	// 「我还能不能给这个人发消息」是调用方自身的授权状态，不是对方身份：它由
+	// 调用方自己的好友关系与 Space 归属推导，对方看不出任何东西，而调用方试着
+	// 发一条就会知道。必须留在最小集里——不可见关系（非好友 + 无共同群）恰恰
+	// 就是它被置位的场景，剥掉等于这个信号永远送不到客户端，输入框照常可写、
+	// 消息被 WuKongIM 静默拒收。
+	"dm_forbidden",
+	"dm_forbidden_reason",
 }
 
 // NewMinimalChannelResp 按「调用方自身状态全留、对方身份全剥」构造最小集。

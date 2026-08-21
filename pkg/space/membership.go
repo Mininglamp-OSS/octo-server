@@ -66,33 +66,6 @@ func CheckBothMembers(session *dbr.Session, spaceID string, uid1, uid2 string) (
 	return count == 2, nil
 }
 
-// ActiveMemberSet 批量判定一组 uid 是否是 spaceID 的活跃成员，返回命中集合。
-//
-// 与 CheckMembership 同口径（sm.status=1 且 s.status=1），只是把 N 次单点查询
-// 折成一次 IN 查询。给「拿着一批候选 uid 收窄到本 Space 成员」的场景用，
-// 避免为此把整个 Space 的成员名单拉进内存。
-// 空输入或空 spaceID 直接返回空集合，不查库。
-func ActiveMemberSet(session *dbr.Session, spaceID string, uids []string) (map[string]bool, error) {
-	set := make(map[string]bool, len(uids))
-	if spaceID == "" || len(uids) == 0 {
-		return set, nil
-	}
-	var found []string
-	_, err := session.SelectBySql(
-		"SELECT sm.uid FROM space_member sm "+
-			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
-			"WHERE sm.space_id = ? AND sm.status = 1 AND sm.uid IN ?",
-		spaceID, uids,
-	).Load(&found)
-	if err != nil {
-		return nil, err
-	}
-	for _, uid := range found {
-		set[uid] = true
-	}
-	return set, nil
-}
-
 // SharesActiveSpace 判断两个 uid 是否至少同处一个**活跃** Space。
 //
 // 谓词与 modules/space 的 queryCoMemberUIDs 完全一致（两侧 sm.status=1 且
@@ -123,11 +96,11 @@ func SharesActiveSpace(session *dbr.Session, uidA, uidB string) (bool, error) {
 
 // MembersEverInSpace 返回这批 uid 中「在该 Space 有过成员行」的子集，**不看状态**。
 //
-// 与 ActiveMemberSet 的区别是刻意的，用来回答一个不同的问题：「这个人是否属于
-// 本 Space 的范畴」，而不是「他现在还是不是成员」。成员移除后的会话面清理必须用
-// 前者——用后者会在两种情况下静默地什么都不做：
+// **不看状态**是刻意的：它回答的是「这个人是否属于本 Space 的范畴」，而不是
+// 「他现在还是不是成员」。成员移除后的会话面清理必须用前者——按活跃口径筛会在
+// 两种情况下静默地什么都不做：
 //
-//   - 空间被解散：forceDisbandSpace 先把 space.status 置 0，ActiveMemberSet 的
+//   - 空间被解散：forceDisbandSpace 先把 space.status 置 0，按活跃口径的
 //     `INNER JOIN space ... AND s.status = 1` 于是永远返回空集；
 //   - 同一批移除多人：A、B 一起被移除后各自的清理工单里，对方的 sm.status 已经是 0，
 //     互相被过滤掉，两人之间的私聊永远切不断。
