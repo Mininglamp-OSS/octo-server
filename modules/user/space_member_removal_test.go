@@ -31,6 +31,9 @@ type imStub struct {
 	conversations   []map[string]interface{}
 	whitelistRemove []whitelistRemoveCall
 	cmds            []map[string]interface{}
+	// failChannels 里的 channel_id 上，whitelist_remove 返回 500，用来断言
+	// 摘白名单失败会被上抛而不是吞掉。
+	failChannels map[string]bool
 }
 
 type whitelistRemoveCall struct {
@@ -61,7 +64,12 @@ func newIMStub(t *testing.T, ctx *config.Context, conversationPeers []string) *i
 		_ = json.Unmarshal(body, &call)
 		stub.mu.Lock()
 		stub.whitelistRemove = append(stub.whitelistRemove, call)
+		shouldFail := stub.failChannels[call.ChannelID]
 		stub.mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/message/send", func(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +97,25 @@ func newIMStub(t *testing.T, ctx *config.Context, conversationPeers []string) *i
 	return stub
 }
 
+// failWhitelistRemove 让指定频道上的 whitelist_remove 返回 500。
+func (s *imStub) failWhitelistRemove(channelIDs ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failChannels == nil {
+		s.failChannels = make(map[string]bool, len(channelIDs))
+	}
+	for _, id := range channelIDs {
+		s.failChannels[id] = true
+	}
+}
+
+// clearWhitelistRemoveFailures 恢复所有被打故障的频道。
+func (s *imStub) clearWhitelistRemoveFailures() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failChannels = nil
+}
+
 // removedChannels 返回所有被摘白名单的 (channel_id, uid) 组合。
 func (s *imStub) removedChannels() map[string][]string {
 	s.mu.Lock()
@@ -108,11 +135,24 @@ func (s *imStub) cmdCount() int {
 
 // ---------- fixture ----------
 
+// dmTestCtx 本文件共用一个测试服务器。
+//
+// testutil.NewTestServer 每次约 0.42s（本机实测），而 modules/user 整个包已经建了
+// 186 个，在 CI 的 5 分钟 per-package 预算里长期贴着上限跑（E2E Test (1/4) 就是
+// 这么被 kill 的）。本文件十几个用例没有任何理由各建一个：隔离靠每个用例开头的
+// CleanAllTables，而不是靠换一个 server。
+var (
+	dmTestCtxOnce sync.Once
+	dmTestCtx     *config.Context
+)
+
 func dmTestSetup(t *testing.T) (*config.Context, *Friend) {
 	t.Helper()
-	_, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
-	return ctx, NewFriend(ctx)
+	dmTestCtxOnce.Do(func() {
+		_, dmTestCtx = testutil.NewTestServer()
+	})
+	require.NoError(t, testutil.CleanAllTables(dmTestCtx))
+	return dmTestCtx, NewFriend(dmTestCtx)
 }
 
 // seedSpaceMember 直接写 space / space_member，不经 modules/space 的 handler。
@@ -458,4 +498,42 @@ func TestDMCutoffSingleDirectionFriend(t *testing.T) {
 	assert.NotContains(t, removedCalls, a, "a 仍授权 b 发给自己，该方向必须保留")
 	// b 的频道白名单已不含 a：这条陈旧条目必须摘掉
 	assert.Equal(t, []string{a}, removedCalls[b], "b 已不授权 a，该方向必须切断")
+}
+
+// TestDMCutoffPropagatesSpacePrefixedWhitelistFailure bot 私聊的 Space 前缀频道
+// 摘白名单失败必须上抛，让工单重试。
+//
+// 这条曾经是 best-effort，理由是「频道未必存在」。实测（WuKongIM v2.2.4-20260313）
+// 对不存在的频道 whitelist_remove 返回 HTTP 200，所以走到错误分支的一定是真故障：
+// 吞掉的话工单会被标成 done，bot 私聊的白名单就永远留在那儿——被移出 Space 的人
+// 还能继续给 bot 发消息，而这正是本任务要堵的洞。
+func TestDMCutoffPropagatesSpacePrefixedWhitelistFailure(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, bot = "0123456789abcdef0123456789abcdef", "u-removed", "bot-1"
+
+	seedSpaceMember(t, ctx, spaceID, removed, bot)
+	_, err := ctx.DB().Exec(
+		"INSERT INTO robot (robot_id, status, created_at, updated_at) VALUES (?, 1, NOW(), NOW())", bot)
+	require.NoError(t, err)
+	removeSpaceMember(t, ctx, spaceID, removed)
+
+	stub := newIMStub(t, ctx, []string{bot})
+	// 只让前缀频道失败，裸频道照常成功：断言失败确实来自这一步，
+	// 而不是把两条路径混在一起。
+	stub.failWhitelistRemove(spacepkg.BuildChannelID(spaceID, bot))
+
+	err = f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	})
+	require.Error(t, err, "前缀频道摘白名单失败必须上抛，否则工单会被误标 done")
+	assert.Contains(t, err.Error(), spacepkg.BuildChannelID(spaceID, bot),
+		"错误信息要带上失败的频道，last_error 才有诊断价值")
+
+	// 重跑必须能收敛：范围（MembersEverInSpace）不看成员状态，IM 恢复之后
+	// 同一批对端会被重新枚举到，重试才不是空转。
+	stub.clearWhitelistRemoveFailures()
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}), "IM 恢复后重跑应当成功——重试才有意义")
+	assert.Contains(t, stub.removedChannels(), spacepkg.BuildChannelID(spaceID, bot))
 }

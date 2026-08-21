@@ -232,11 +232,26 @@ func newRemovalClaimOwner() string {
 	return removalWorkerPrefix + "-" + strconv.FormatUint(removalClaimSeq.Add(1), 10)
 }
 
+// removalCleanupWorkerOnce 保证整个进程只挂一次定时器。
+//
+// Route() 在生产里只跑一次，但测试里每建一个 testutil.NewTestServer 就跑一次：
+// modules/user 一个包就建 196 个，于是同一个进程里堆起近 400 个永不停止的
+// timingwheel 定时器（Schedule 没有取消入口，测试服务器也从不关闭）。它们
+// 全都指向同一套 MySQL/Redis/WuKongIM，每 10s 集体醒一次，把 5 分钟的
+// per-package 预算耗在与被测用例无关的后台工作上。
+//
+// 定时器只是「兜底扫描」——真正的即时触发在 afterMembersRemoved 里，工单的
+// 跨副本安全由 DB 租约保证，所以挂一次就够；用例需要立即推进时一律直接调
+// processMemberRemovalCleanups，不依赖调度。
+var removalCleanupWorkerOnce sync.Once
+
 // startMemberRemovalCleanupWorker 挂上定时调度。由 Route() 调用，与 user 侧
 // processPendingSessionRevocations 的接法一致。
 func (s *Space) startMemberRemovalCleanupWorker() {
-	s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
-	s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
+	removalCleanupWorkerOnce.Do(func() {
+		s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
+		s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
+	})
 }
 
 // purgeFinishedMemberRemovalCleanups 定期清掉超过保留期的终态工单。
@@ -294,10 +309,13 @@ func (s *Space) processMemberRemovalCleanups() {
 
 // runMemberRemovalCleanupJob 执行单条工单。
 //
-// panic 必须在**这一层**兜住：清理步骤是别的模块注册进来的，一次 panic 若穿到
-// 批次层，就会绕过 releaseCleanupJob —— attempts 不增、状态还是 pending、租约
-// 60s 后自然到期，于是同一条工单被反复认领、反复 panic，永远到不了 abandoned；
-// 而且它按 `ORDER BY id` 一直排在队首，把后面所有工单都饿死。
+// panic 必须在**这一层**兜住：清理步骤是别的模块注册进来的，一次 panic 若只被
+// 批次层的 recover 接住，就会绕过 releaseCleanupJob —— 工单停在 running 上，
+// 既没有 last_error 也没有退避，只能干等 removalCleanupLease（10 分钟）到期才
+// 重新可认领；然后被再次认领、再次 panic，如此循环。attempts 虽然在认领时就已
+// 自增（见 claimMemberRemovalCleanup），所以最终仍会走到 abandoned，但每一轮都
+// 要白烧一个租约周期，而它按 `ORDER BY id` 排在队首，整批后续工单一起陪跑。
+// 在这一层 recover 并显式 release，才能立刻记下原因、按退避重排。
 func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner string) {
 	defer func() {
 		if r := recover(); r != nil {

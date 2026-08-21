@@ -351,13 +351,13 @@ Consequently:
   Closing it needs an authoritative pair index this repo does not have
   (`dm_space_presence` is best-effort, which is why it was demoted from a gate).
   Follow-up.
-- **Rejoin during a single job run.** The membership re-check happens once per
-  claim; a member who rejoins after the check but before the cascade finishes can
-  still have freshly re-acquired group memberships torn down. The window is
-  narrow, the per-attempt re-check already covers rejoin during backoff, and the
-  DM step self-protects because `SharesActiveSpace` is re-derived per peer at cut
-  time — but the group step has no such re-derivation. A membership epoch on
-  `space_member`, re-checked inside each step, is the standard fix. Follow-up.
+- **Closing the rejoin window completely.** The group step now re-checks live
+  membership itself (`CheckMembership`, immediately before it computes the group
+  set), so the exposure shrank from "the whole duration of the DM step" to the
+  gap between two adjacent queries. It is not zero: a rejoin committing inside
+  that gap still gets its fresh `group_member` rows torn down. Closing it fully
+  needs a membership epoch on `space_member` re-checked inside each step, which
+  the join path must also stamp. Follow-up.
 - **Lock-order documentation across `space` / `space_member`.** Both disband
   paths now take `space_member FOR UPDATE` before updating `space`, inverting the
   parent-then-child order the old `forceDisbandSpace` used. Every transaction in
@@ -378,6 +378,30 @@ Consequently:
   `version_lock` affect every event in the repo; this task works within them
   (own retry record, `commit(nil)`) and does not change the shared bus. Worth a
   separate task.
+
+- **Group-side IM unsubscribe stays best-effort.** A review round asked for the
+  same error propagation the DM step now has. It was deliberately not applied:
+  the authoritative subscriber source for a group channel is the
+  `IMDatasource.Subscribers` callback, which re-reads `group_member`. Moving
+  `IMRemoveSubscriber` before the delete would be undone by the next reload
+  (the documented YUJ-4185 root cause); propagating after the delete buys
+  nothing because the retry scope (`queryGroupsWithMemberUIDAndSpaceID`) no
+  longer contains that group. The DM step differs only because its scope
+  (`MembersEverInSpace`) is status-agnostic, so a retry really does re-run.
+  Reasoning is recorded at the call site.
+- **Per-package CI budget for `modules/user`.** The package sits at roughly 90%
+  of its 5-minute budget before this change (248s locally with `-race
+  -shuffle=on`, more on a CI runner) across 186 `testutil.NewTestServer` calls at
+  ~0.42s each. This task shrinks its own footprint (one shared server for the DM
+  test file, one process-wide cleanup scheduler instead of one per `Route()`) but
+  cannot move the package off the ceiling. Splitting `modules/user` across shards
+  or raising its timeout is a CI-config follow-up.
+- **Remaining P2 review findings.** `LockRemovableMemberTx` conflating "became
+  creator" with "already left"; no supporting index on the purge query; the
+  locking successor query locking more rows than it returns; `attempts` counted
+  but with nothing acting on the ceiling; a transient DB error in the bot check
+  skipping the prefixed-channel cleanup. All advisory, none new in this change's
+  behavior. Follow-up.
 
 ## Deviations from the original plan
 

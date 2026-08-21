@@ -189,13 +189,25 @@ func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string,
 		return fmt.Errorf("check bot dm (%s/%s): %w", removedUID, peer, err)
 	}
 	if bot {
-		// 这两个频道未必存在（这一对可能从没在本 Space 下建过前缀频道），
-		// 因此按 best-effort 处理：失败只告警，不让整条工单一直重试到 abandoned。
+		// 与裸频道一样上抛失败，不再 best-effort。
+		//
+		// 之前吞掉的理由是「这两个频道未必存在」。实测（WuKongIM v2.2.4-20260313，
+		// 与 CI 同 tag）对完全不存在的频道调 /channel/whitelist_remove 返回
+		// HTTP 200 {"status":200}，所以「频道不存在」根本不会走到错误分支——非 200
+		// 一律是真故障（网络、鉴权、broker 不可用），正是该重试的那一类。
+		//
+		// 重试也确实能生效：本步骤的范围 dmPeersInSpace 走 MembersEverInSpace，
+		// 不看成员状态，所以下一次尝试仍会枚举到同一批对端并重跑到这里；
+		// IMWhitelistRemove 本身幂等，重跑没有副作用。
 		if cutInbound {
-			f.removeSpaceScopedWhitelist(ctx, spaceID, peer, removedUID)
+			if err := f.removeSpaceScopedWhitelist(ctx, spaceID, peer, removedUID); err != nil {
+				return err
+			}
 		}
 		if cutOutbound {
-			f.removeSpaceScopedWhitelist(ctx, spaceID, removedUID, peer)
+			if err := f.removeSpaceScopedWhitelist(ctx, spaceID, removedUID, peer); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -221,11 +233,12 @@ func (f *Friend) removePersonWhitelist(ctx *config.Context, channelUID, uid stri
 	return nil
 }
 
-// removeSpaceScopedWhitelist 摘 Space 前缀频道的白名单，best-effort。
-func (f *Friend) removeSpaceScopedWhitelist(ctx *config.Context, spaceID, channelUID, uid string) {
+// removeSpaceScopedWhitelist 摘 Space 前缀频道（bot 私聊）的白名单。
+// 失败上抛，交由工单重试——理由见 cutOffDM 里的调用点。
+func (f *Friend) removeSpaceScopedWhitelist(ctx *config.Context, spaceID, channelUID, uid string) error {
 	channelID := spacepkg.BuildChannelID(spaceID, channelUID)
 	if channelID == channelUID {
-		return // 没有 Space 前缀可加，裸频道上面已经处理过了
+		return nil // 没有 Space 前缀可加，裸频道上面已经处理过了
 	}
 	if err := ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
 		ChannelReq: config.ChannelReq{
@@ -234,9 +247,9 @@ func (f *Friend) removeSpaceScopedWhitelist(ctx *config.Context, spaceID, channe
 		},
 		UIDs: []string{uid},
 	}); err != nil {
-		f.Warn("摘除 Space 前缀频道白名单失败（best-effort）",
-			zap.Error(err), zap.String("channelId", channelID), zap.String("uid", uid))
+		return fmt.Errorf("remove space-scoped whitelist (%s): %w", channelID, err)
 	}
+	return nil
 }
 
 // notifyDMChannelUpdate 给 recipient 推一条 channelUpdate，让其客户端重拉 peer 的频道信息。

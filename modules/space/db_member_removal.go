@@ -278,8 +278,18 @@ func truncateCleanupError(s string) string {
 		return cleaned
 	}
 	truncated := cleaned[:max]
-	if r, size := utf8.DecodeLastRuneInString(truncated); r == utf8.RuneError && size <= 1 {
-		truncated = truncated[:len(truncated)-size]
+	// 退到最近的 rune 边界。必须是循环而不是「削一个字节」：cleaned 已是合法
+	// UTF-8，但在 max 处切开可能砍掉一个 4 字节 rune 的后 1~3 字节，而
+	// DecodeLastRuneInString 对悬空序列每次只报 (RuneError, 1)，削一次仍会留下
+	// 半个 rune（实测 "a"*252 + 😀 截断后尾部残留 f0 9f）。非法字节写进
+	// last_error 会被 MySQL 以 Incorrect string value 拒掉整条 release，
+	// 工单就卡在 running 上白等一轮租约。cleaned 合法 ⇒ 最多转 3 次。
+	for len(truncated) > 0 {
+		r, size := utf8.DecodeLastRuneInString(truncated)
+		if r != utf8.RuneError || size > 1 {
+			break // 收在完整 rune 上（U+FFFD 本身合法，size=3，不该被削）
+		}
+		truncated = truncated[:len(truncated)-1]
 	}
 	return truncated
 }

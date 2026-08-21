@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -389,13 +390,27 @@ func TestRemoveMembersInvalidatesMembershipCache(t *testing.T) {
 // TestFireSpaceMemberRemoveEventWritesEvent 观察者事件的名字与载荷是下游模块的契约，
 // 写错了没人会报错，只会静默没人监听。
 func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
-	_, f, err := setup(t)
+	_, _, err := setup(t)
 	require.NoError(t, err)
+
+	// 事件装在**专属 ctx** 上，绝不写 testCtx.Event。
+	//
+	// config.Context.Event 是个没有任何同步的普通字段，而这个包里随时可能有上一条
+	// 用例留下的后台 goroutine 正在读它：afterMembersRemoved 是 `go` 出去的，
+	// 里面第一件事就是 s.ctx.Event == nil 判空。测试之间顺序执行，goroutine 不会，
+	// 于是「本用例写 / 上条用例的 goroutine 读」构成 -race 能抓到的数据竞争
+	// （-shuffle=on 下相邻用例会变，所以时有时无）。
+	// 换成专属 ctx 后这个字段只有本 goroutine 碰得到，竞争从根上消失。
+	//
+	// 监听方注册表（config 包的 eventListeners）本来就是进程级全局且带锁，
+	// 不随 ctx 走，所以拆 ctx 不影响下面的注册/投递断言。
+	evtCtx := newEventTestContext(t)
+	f := New(evtCtx)
 
 	// 本包不 import modules/base，拿不到它的迁移，event 表要手工建
 	// （与 TestMain 为 group / robot / user 建夹具表同一套路）。列跟随
 	// modules/base/sql/20191106000001_event_legacy01.sql + 20250423000001。
-	_, err = testCtx.DB().Exec("CREATE TABLE IF NOT EXISTS `event` (" +
+	_, err = evtCtx.DB().Exec("CREATE TABLE IF NOT EXISTS `event` (" +
 		"id INTEGER NOT NULL PRIMARY KEY AUTO_INCREMENT, " +
 		"event VARCHAR(40) NOT NULL DEFAULT '', `type` SMALLINT NOT NULL DEFAULT 0, " +
 		"data VARCHAR(10000) NOT NULL DEFAULT '', status SMALLINT NOT NULL DEFAULT 0, " +
@@ -403,25 +418,20 @@ func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
 		"created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
 		"updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)")
 	require.NoError(t, err)
-	_, err = testCtx.DB().Exec("DELETE FROM `event`")
+	_, err = evtCtx.DB().Exec("DELETE FROM `event`")
 	require.NoError(t, err)
-
-	// testutil 默认不装 ctx.Event（fire 会直接 return），这里显式装上。
-	previous := testCtx.Event
-	testCtx.Event = event.New(testCtx)
-	defer func() { testCtx.Event = previous }()
 
 	// 先断「无监听方不落库」，再注册监听方断投递 —— 两件事必须在同一个用例里做：
 	// AddEventListener 是全局注册且没有注销 API，拆成两个用例的话，先跑的那个会把
 	// 监听方漏给后跑的，后者永远测不到"无监听"这一支。
 	f.fireSpaceMemberRemoveEvent("nolistener-space", "u", "op", MemberRemoveReasonKicked)
 	var pre int
-	_, err = testCtx.DB().SelectBySql(
+	_, err = evtCtx.DB().SelectBySql(
 		"SELECT COUNT(*) FROM `event` WHERE event=?", event.SpaceMemberRemove).Load(&pre)
 	require.NoError(t, err)
 	require.Zero(t, pre, "无监听方时不该写事件行（解散大空间会逐成员触发，写了就是纯浪费）")
 
-	testCtx.AddEventListener(event.SpaceMemberRemove, func(data []byte, commit config.EventCommit) {
+	evtCtx.AddEventListener(event.SpaceMemberRemove, func(data []byte, commit config.EventCommit) {
 		commit(nil)
 	})
 
@@ -431,7 +441,7 @@ func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
 		Event string `db:"event"`
 		Data  string `db:"data"`
 	}
-	_, err = testCtx.DB().SelectBySql("SELECT event, data FROM event ORDER BY id DESC LIMIT 1").Load(&rows)
+	_, err = evtCtx.DB().SelectBySql("SELECT event, data FROM event ORDER BY id DESC LIMIT 1").Load(&rows)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, event.SpaceMemberRemove, rows[0].Event)
@@ -439,6 +449,22 @@ func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
 	assert.Contains(t, rows[0].Data, "evt-uid")
 	assert.Contains(t, rows[0].Data, "evt-op")
 	assert.Contains(t, rows[0].Data, MemberRemoveReasonForceRemoved)
+}
+
+// newEventTestContext 造一个只服务于事件用例的 config.Context。
+//
+// 指向同一个 test 库（断言仍然读得到 event 行），但 Event 字段独立，
+// 从而不用去写共享的 testCtx.Event。config.NewContext 不跑迁移、不注册路由，
+// 只起 pool 和 timingwheel，代价是一份连接池；整个包只建这一个。
+func newEventTestContext(t *testing.T) *config.Context {
+	t.Helper()
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.MySQLAddr = testCtx.GetConfig().DB.MySQLAddr
+	cfg.DB.Migration = false
+	ctx := config.NewContext(cfg)
+	ctx.Event = event.New(ctx)
+	return ctx
 }
 
 // mustRemoveMember 移除成员并断言这次调用确实改动了成员行。
@@ -661,6 +687,66 @@ func TestTruncateCleanupErrorSanitizesInteriorInvalidByte(t *testing.T) {
 	assert.LessOrEqual(t, len(got), 255)
 	assert.Greater(t, len(got), 200, "不该因为一个非法字节把整条摘要裁没")
 	assert.True(t, strings.HasPrefix(got, "dm_"), "有效前缀必须保留")
+}
+
+// TestRemoveMembersRejectsOversizedBatch 用户侧 members/remove 的批量上限。
+//
+// 这个上限是新加的、且**对线上可见**：每个 uid 要跑一个独立事务 + 一次 Redis DEL
+// + 一条工单插入，不设限就是一个拒绝服务杠杆。没有回归用例的话，谁把这段挪走
+// 都不会有人发现，而超限请求会安静地退化回逐个处理。
+// 同时钉住「刚好等于上限」仍然放行，避免把边界改成 >= 而悄悄收紧一个。
+func TestRemoveMembersRejectsOversizedBatch(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "batch-cap"
+	seedMember(t, f, spaceID, testutil.UID, 2) // 操作者：owner
+
+	post := func(n int) *httptest.ResponseRecorder {
+		uids := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			uids = append(uids, "cap-"+strconv.Itoa(i))
+		}
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/remove",
+			bytes.NewReader([]byte(util.ToJson(map[string]interface{}{"uids": uids}))))
+		req.Header.Set("token", testutil.Token)
+		testSrv.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	over := post(managerMaxBatchUIDs + 1)
+	assert.NotEqual(t, http.StatusOK, over.Code, "超过上限必须被拒，不能静默逐个处理")
+	assert.Contains(t, over.Body.String(), "batch",
+		"错误体要能看出是批量上限，否则客户端不知道该分片")
+
+	assert.Equal(t, http.StatusOK, post(managerMaxBatchUIDs).Code,
+		"刚好等于上限必须放行——边界写成 >= 会悄悄少收一个")
+}
+
+// TestTruncateCleanupErrorCutsOnRuneBoundary 截断点落在**任意宽度**的 rune 中间
+// 时都必须退回完整边界。
+//
+// 之前只削一个字节，对 3 字节的「中」够用，对 4 字节的 emoji 不够：
+// DecodeLastRuneInString 面对悬空序列每次只报 (RuneError, 1)，砍掉 1 字节后
+// 仍留着 f0 9f 这样的半个 rune。写进 utf8mb4 的 last_error 会被 strict 模式
+// 以 Incorrect string value 拒掉整条 release，工单卡在 running 上白等一轮租约。
+// 逐个宽度铺开，是因为这个 bug 只在特定宽度上现形。
+func TestTruncateCleanupErrorCutsOnRuneBoundary(t *testing.T) {
+	for _, r := range []string{"a", "é", "中", "😀"} {
+		width := len(r)
+		// 让这个 rune 恰好跨过第 255 字节：前缀填到 256-width，
+		// 于是它的第一个字节落在界内、剩余字节落在界外。
+		for pad := 256 - width; pad < 256; pad++ {
+			input := strings.Repeat("x", pad) + r + strings.Repeat("y", 400)
+			got := truncateCleanupError(input)
+			require.Truef(t, utf8.ValidString(got),
+				"width=%d pad=%d 截断结果必须是合法 UTF-8，实际尾部 %x", width, pad, got[max(0, len(got)-4):])
+			require.LessOrEqualf(t, len(got), 255, "width=%d pad=%d 不能超列宽", width, pad)
+			// 最多只该为对齐边界退掉 width-1 个字节
+			require.Greaterf(t, len(got), 255-width, "width=%d pad=%d 退得太多", width, pad)
+		}
+	}
 }
 
 // TestProcessMemberRemovalCleanupsIsNotReentrant 同一进程内只允许一轮在跑。

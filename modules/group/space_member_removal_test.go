@@ -122,6 +122,19 @@ func seedGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string, rol
 	require.NoError(t, err)
 }
 
+// seedActiveSpaceMember 写一个活跃的 space + space_member，模拟「人已经回来了」。
+func seedActiveSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT INTO space (space_id, name, creator, status, max_users, created_at, updated_at) "+
+			"VALUES (?, ?, ?, 1, 1000, NOW(), NOW())", spaceID, spaceID, uid)
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) "+
+			"VALUES (?, ?, 0, 1, NOW(), NOW())", spaceID, uid)
+	require.NoError(t, err)
+}
+
 func liveMemberRole(t *testing.T, ctx *config.Context, groupNo, uid string) (int, bool) {
 	t.Helper()
 	var roles []int
@@ -453,4 +466,59 @@ func TestGroupCascadeRetriesWhenTargetBecameCreator(t *testing.T) {
 
 	_, stillIn := liveMemberRole(t, ctx, "g-became", victim)
 	assert.False(t, stillIn, "已成为群主的目标也必须被清出去，不能静默跳过")
+}
+
+// TestGroupCascadeSkipsRejoinedMember 工单跑到群级联这一步时，如果人已经重新
+// 加入 Space，就必须什么都不做。
+//
+// worker 只在认领工单时查过一次成员身份，之后还要跑完 dm_cutoff；那段时间里
+// 重新加入的人会被 joinPresetGroups 写进各个预置群，而这一步若照旧执行，
+// 就把那些刚写好的行全删了——留下一个「Space 活跃成员、却不在任何群里」的人，
+// 没有任何东西会补回来。
+func TestGroupCascadeSkipsRejoinedMember(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-rejoin", "u-rejoined"
+
+	seedGroupInSpace(t, ctx, "g-rejoin", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-rejoin", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-rejoin", victim, MemberRoleCommon)
+
+	// 已经重新加入：Space 活跃 + 成员行活跃，正是 CheckMembership 的口径。
+	seedActiveSpaceMember(t, ctx, spaceID, victim)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "u-owner", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-rejoin", victim)
+	assert.True(t, stillIn, "重新入群的成员不能被上一轮的清理工单清掉")
+}
+
+// TestGroupCascadeStillRunsAfterSpaceDisbanded 解散场景下 space.status 已经是 0，
+// 上面那个重新加入的判定必须判成「不是活跃成员」，级联照常进行。
+//
+// 单独钉住是因为这两条走的是同一个谓词：把它写成只看 space_member.status
+// 就会让解散时成员行还没置 0 的那一刻误判成「已重新加入」，整条清理静默跳过。
+func TestGroupCascadeStillRunsAfterSpaceDisbanded(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-disbanded", "u-victim"
+
+	seedGroupInSpace(t, ctx, "g-disbanded", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-disbanded", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-disbanded", victim, MemberRoleCommon)
+
+	seedActiveSpaceMember(t, ctx, spaceID, victim)
+	// Space 被解散：成员行可能还没来得及置 0，但空间本身已经没了。
+	_, err := ctx.DB().Exec("UPDATE space SET status=0 WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "u-owner",
+		Reason: spacemod.MemberRemoveReasonSpaceDisbanded,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-disbanded", victim)
+	assert.False(t, stillIn, "空间已解散，级联必须照常把人清出群")
 }

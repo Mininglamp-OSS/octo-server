@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -29,6 +30,31 @@ func (g *Group) registerSpaceMemberRemovalCleanup() {
 // 单个群失败不中断其余群——部分完成是持久的（退掉的群不会再出现在下一轮的集合里），
 // 最后返回首个错误让整条工单重试剩下的部分。
 func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.MemberRemoval) error {
+	// 动手前**在这一步内**再确认一次他确实不在 Space 里了。
+	//
+	// worker 在认领工单时已经查过一次成员身份，但那次之后还要跑完 dm_cutoff
+	// （逐个对端查库 + 打 IM），可能是秒级的。窗口里他若重新加入，
+	// joinPresetGroups 刚写好的 group_member 行就会被下面这段全部删掉，
+	// 留下一个「是 Space 活跃成员、却不在任何群里」的人，而且没有任何东西会补回来。
+	// dm_cutoff 不需要这一层是因为它本来就逐个对端重算 SharesActiveSpace，
+	// 重新入群后自然一个都判不出该切；群级联没有等价的重算，只能显式再查一次。
+	//
+	// 这不能把窗口缩到零（这次查询和下面那次群集合查询之间仍有间隙），但把它从
+	// 「整个 dm_cutoff 的时长」压到了一次查询的间隔。彻底关闭要给 space_member
+	// 加成员纪元并在每一步里校验，记在 brief 的 follow-up 里。
+	//
+	// 谓词用 CheckMembership（sm.status=1 且 space.status=1）：解散场景下
+	// space.status 已经是 0，判定为「不是活跃成员」，清理照常进行——正是所需。
+	stillMember, err := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+	if err != nil {
+		return fmt.Errorf("re-check space membership before group cascade: %w", err)
+	}
+	if stillMember {
+		g.Info("被移除成员已重新加入 Space，跳过群级联",
+			zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID))
+		return nil
+	}
+
 	groups, err := g.db.queryGroupsWithMemberUIDAndSpaceID(removal.UID, removal.SpaceID)
 	if err != nil {
 		return fmt.Errorf("query groups of removed space member: %w", err)
@@ -65,6 +91,21 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // 按 Space 隔离的置顶与会话扩展清理、外部群标记回收。自己写一遍必然漏项。
 //
 // RemoveGroupMembers 会静默跳过 role=creator 的成员，所以群主必须先交接、再走移除。
+//
+// 关于「IM 退订失败只记日志、逃出了工单的重试」：这里刻意不改，也刻意不把
+// IMRemoveSubscriber 提到删行之前。群频道的权威订阅源是 1module.go 的
+// IMDatasource.Subscribers 回调，它现查 group_member（is_deleted=0 且
+// status=normal）——DB 才是真相，IMRemoveSubscriber 只是提前把 WuKongIM 的缓存
+// 捅掉一次。
+//   - 提到删行之前是错的：那一刻成员行还在，回调仍会把他算进订阅者，
+//     WuKongIM 下一次重载就把人加回来（YUJ-4185 P0-2 的既有根因，见
+//     db.go querySubscribableMemberUIDsWithGroupNo 的说明）。
+//   - 删行之后上抛也没有意义：重试时 queryGroupsWithMemberUIDAndSpaceID
+//     已经查不到这个群，重跑等于空转，只会把一次真实故障洗成 done。
+//
+// 与 dm_cutoff 侧的取舍不同是因为两边的权威位置不同：Person 频道白名单同样由
+// 回调推导，但 dm_cutoff 的范围（MembersEverInSpace）不看成员状态，重试确实会
+// 重跑到同一批对端，所以那边上抛是有效的。
 func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
