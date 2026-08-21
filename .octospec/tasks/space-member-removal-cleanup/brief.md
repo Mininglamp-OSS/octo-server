@@ -447,6 +447,15 @@ Recorded so the diff can be read against the spec rather than against memory.
   paths. It is deliberately best-effort rather than outbox-backed: failing to
   revoke is an authorization leak and must converge, failing to re-grant is a
   visible, user-recoverable loss of function.
+- **The `isRobot(self)` hoist changed error semantics.** Moving the "is this member
+  a bot" lookup out of the per-peer loop removes a query that was invariant across
+  peers, but it is not behaviour-preserving: the lookup used to run inside
+  `cutOffDM` *after* the bare-channel writes, so an error cost one peer its
+  prefixed channel and later peers still ran. It now runs before any peer is
+  touched, so a persistent `robot`-table error fails the whole step with nothing
+  cut at all. The returned value is unchanged and retries are idempotent, so this
+  is slower convergence rather than a leak — but it is a change in the losing
+  direction, made by a refactor no review asked for.
 - **Four join paths, not three.** `modules/space/api.go` `addMembers` and the
   manager endpoint both bypass `afterJoinSpace`; only join-by-code and approved
   applications go through it.

@@ -384,7 +384,39 @@ func TestDMPeerCandidatesFiltering(t *testing.T) {
 			ChannelType: common.ChannelTypePerson.Uint8()}, // Space 前缀要剥掉
 		nil,
 	}
-	assert.Equal(t, []string{"peer-a", "peer-b"}, dmPeerCandidates(convs, self))
+	assert.Equal(t, []string{"peer-a", "peer-b"},
+		dmPeerCandidates(convs, self, "0123456789abcdef0123456789abcdef"))
+}
+
+// TestDMPeerCandidatesStripsNonHexSpacePrefix Space id 不是 32 位 hex 时，前缀
+// 同样必须剥掉——**而且不能依赖全局 knownSpaceIDs 缓存**。
+//
+// ParseChannelID 先查那份缓存，不中才回落到 `^s[0-9a-f]{32}_` 正则；而
+// loadKnownSpaceIDs 只装 status=1 的 Space，解散/封禁路径又恰好在跑清理之前刷新
+// 缓存。于是对 minglue_default 这类老 id，解散之后 "sminglue_default_botfather"
+// 既不中缓存也不中正则，整条 channel_id 被当成对端返回，永远匹配不上
+// space_member.uid，那条 bot 私聊被静默跳过而工单仍标 done。
+//
+// 这里刻意**不**预热缓存：用例要钉住的正是「缓存里没有也照样剥得掉」。
+func TestDMPeerCandidatesStripsNonHexSpacePrefix(t *testing.T) {
+	const spaceID, self = "minglue_default", "me"
+	convs := []*config.SyncUserConversationResp{
+		{ChannelID: "s" + spaceID + "_botfather", ChannelType: common.ChannelTypePerson.Uint8()},
+		{ChannelID: "peer-plain", ChannelType: common.ChannelTypePerson.Uint8()},
+	}
+	assert.Equal(t, []string{"botfather", "peer-plain"},
+		dmPeerCandidates(convs, self, spaceID),
+		"非 32-hex 的 Space 前缀必须靠工单自带的 spaceID 剥掉，不能指望全局缓存")
+}
+
+// TestDMPeerCandidatesFallsBackWithoutSpaceID spaceID 缺失时仍走原来的
+// ParseChannelID 回落，不能因为新增的快路径把老行为弄丢。
+func TestDMPeerCandidatesFallsBackWithoutSpaceID(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		{ChannelID: "s0123456789abcdef0123456789abcdef_peer-b",
+			ChannelType: common.ChannelTypePerson.Uint8()},
+	}
+	assert.Equal(t, []string{"peer-b"}, dmPeerCandidates(convs, "me", ""))
 }
 
 // TestAnnotateDMSendability 下发给客户端的「能否发消息」标记。
@@ -675,7 +707,9 @@ func TestDMRestoreSkipsWhenMemberAlreadyRemovedAgain(t *testing.T) {
 	// 模拟「判定时是活跃成员，写之前已被再次移除」：restoreDM 自己会重查。
 	removeSpaceMember(t, ctx, spaceID, rejoiner)
 
-	require.NoError(t, f.restoreDM(ctx, spaceID, rejoiner, peer, true, true, false))
+	granted, err := f.restoreDM(ctx, spaceID, rejoiner, peer, false)
+	require.NoError(t, err)
+	assert.False(t, granted, "已失效的加入不该被判成「补过了」")
 
 	assert.Empty(t, stub.addedChannels(),
 		"成员已不再活跃时，陈旧的回补一条白名单都不许写——否则会永久复活越权私聊")
@@ -689,9 +723,34 @@ func TestDMRestoreStillGrantsWhileMemberActive(t *testing.T) {
 	seedSpaceMember(t, ctx, spaceID, uid, peer)
 	stub := newIMStub(t, ctx, []string{peer})
 
-	require.NoError(t, f.restoreDM(ctx, spaceID, uid, peer, true, true, false))
+	granted, err := f.restoreDM(ctx, spaceID, uid, peer, false)
+	require.NoError(t, err)
+	assert.True(t, granted)
 
 	added := stub.addedChannels()
 	assert.Contains(t, added[peer], uid)
 	assert.Contains(t, added[uid], peer)
+}
+
+// TestDMRestoreSkipsWhenPeerLostAuthorization 守卫必须覆盖**对端**方向。
+//
+// 上一版把 shared / grantInbound / grantOutbound 全在调用方循环里算好再传给
+// restoreDM，于是只有加入者那一侧被重查。对端被移除、它自己的 dm_cutoff 跑完标
+// done、加入者仍是活跃成员——陈旧的 add 照写不误，两个方向的白名单被永久复活。
+// 判定移进 restoreDM 之后，这里读到的就是对端已经不在了。
+func TestDMRestoreSkipsWhenPeerLostAuthorization(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, joiner, peer = "sp-peer-lost", "u-joiner", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, joiner, peer)
+	stub := newIMStub(t, ctx, []string{peer})
+
+	// 加入者仍活跃，**对端**已被移除，且两人不是好友 —— 谁都不再被授权。
+	removeSpaceMember(t, ctx, spaceID, peer)
+
+	granted, err := f.restoreDM(ctx, spaceID, joiner, peer, false)
+	require.NoError(t, err)
+	assert.False(t, granted, "对端已失去授权时不该判成补过了")
+	assert.Empty(t, stub.addedChannels(),
+		"对端已不在本 Space 且非好友，一条白名单都不许写——否则凭空造出越权私聊")
 }

@@ -2,6 +2,7 @@ package user
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -46,6 +47,12 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 	}
 
 	// 「他自己是不是 bot」与对端无关，循环外查一次即可（见 eitherSideIsBot）。
+	//
+	// 注意这不是纯粹的提取：以前这次查询在 cutOffDM 里、裸频道写完之后，一次失败
+	// 只影响那一个对端的前缀频道，后面的对端照跑；现在它在任何对端被处理之前，
+	// 所以 robot 表持续报错会让整步失败、20 次尝试一个裸频道都没摘。方向是变差的，
+	// 但结果值不变（isRobot(uid) OR isRobot(peer)），重试幂等，属于收敛变慢而非泄漏。
+	// 记在 brief 的 Deviations 里。
 	selfIsBot, err := newFriendDB(ctx).isRobot(removal.UID)
 	if err != nil {
 		return fmt.Errorf("check whether removed member is a bot: %w", err)
@@ -128,7 +135,7 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 		return nil, fmt.Errorf("sync conversations of removed member: %w", err)
 	}
 
-	candidates := dmPeerCandidates(conversations, removal.UID)
+	candidates := dmPeerCandidates(conversations, removal.UID, removal.SpaceID)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -350,15 +357,36 @@ func annotateDMSendability(ctx *config.Context, friendDB *friendDB, resp *model.
 //     否则会拿着 "s...._uid" 去查成员表，永远查不到，bot 私聊就被静默漏掉；
 //   - 自己的频道和重复项都要去掉。
 //
+// **先用本次清理已知的 spaceID 直接剥前缀，再回落到 ParseChannelID。**
+// 只靠后者是不行的：它先查全局的 knownSpaceIDs 缓存，缓存不中才回落到
+// `^s[0-9a-f]{32}_` 的正则。而 loadKnownSpaceIDs 只装 status=1 的 Space，解散/封禁
+// 路径又恰恰在跑清理**之前**刷新那份缓存（见 modules/space/api.go 的 disbandSpace
+// 与管理端强制解散）。于是对一个 id 不是 32 位 hex 的老 Space（例如 minglue_default，
+// 见 pkg/space/channel_test.go），解散之后 "sminglue_default_botfather" 既不中缓存
+// 也不中正则，整条 channel_id 被当成对端返回，永远匹配不上 space_member.uid，
+// 那条 bot 私聊就被静默跳过、工单还标 done——正是这条链路要消灭的那种失败。
+//
+// 传进来的 spaceID 是工单自己的字段，不随全局缓存变化，所以隔离路径不该再依赖
+// 那份可变全局状态。
+//
 // 保持入参顺序输出，方便调用方的日志和测试断言稳定。
-func dmPeerCandidates(conversations []*config.SyncUserConversationResp, selfUID string) []string {
+func dmPeerCandidates(conversations []*config.SyncUserConversationResp, selfUID, spaceID string) []string {
+	prefix := ""
+	if spaceID != "" {
+		prefix = spacepkg.SpaceChannelPrefix + spaceID + "_"
+	}
 	candidates := make([]string, 0, len(conversations))
 	seen := make(map[string]bool, len(conversations))
 	for _, conv := range conversations {
 		if conv == nil || conv.ChannelType != common.ChannelTypePerson.Uint8() {
 			continue
 		}
-		_, peer := spacepkg.ParseChannelID(conv.ChannelID)
+		peer := conv.ChannelID
+		if prefix != "" && strings.HasPrefix(peer, prefix) {
+			peer = peer[len(prefix):]
+		} else {
+			_, peer = spacepkg.ParseChannelID(peer)
+		}
 		if peer == "" || peer == selfUID || seen[peer] {
 			continue
 		}
@@ -407,34 +435,11 @@ func (f *Friend) restoreSpaceMemberDMs(ctx *config.Context, rejoin space.MemberR
 
 	var firstErr error
 	for _, peer := range peers {
-		// 逐个对端重新判定，口径与 dm_cutoff 一致：现在是否**应该**有授权。
-		// 不能因为「他刚加入了这个 Space」就无条件补——对端可能早已不在本
-		// Space（比如他自己也被移除过），那样补回去就是凭空授权。
-		shared, err := spacepkg.SharesActiveSpace(ctx.DB(), rejoin.UID, peer)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("check shared space: %w", err)
-			}
-			continue
-		}
-		grantInbound, err := f.dmDirectionAuthorized(ctx, peer, rejoin.UID, shared) // 加入者 -> 对端
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		grantOutbound, err := f.dmDirectionAuthorized(ctx, rejoin.UID, peer, shared) // 对端 -> 加入者
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if !grantInbound && !grantOutbound {
-			continue
-		}
-		if err := f.restoreDM(ctx, rejoin.SpaceID, rejoin.UID, peer, grantInbound, grantOutbound, selfIsBot); err != nil {
+		// 授权判定不在这里做——它整个搬进了 restoreDM，紧挨着写。
+		// 在这里算好再传进去，等于给「读到的授权已经失效、却照样写下去」留出一段
+		// 窗口，而且那段窗口**只有加入者一侧**能被 restoreDM 的守卫看见，
+		// 对端一侧在任何窗口尺寸下都没有覆盖。理由详见 restoreDM 的说明。
+		if _, err := f.restoreDM(ctx, rejoin.SpaceID, rejoin.UID, peer, selfIsBot); err != nil {
 			f.Warn("恢复私聊白名单失败",
 				zap.Error(err), zap.String("spaceId", rejoin.SpaceID),
 				zap.String("uid", rejoin.UID), zap.String("peer", peer))
@@ -464,57 +469,81 @@ func (f *Friend) dmDirectionAuthorized(ctx *config.Context, channelUID, sender s
 
 // restoreDM 按方向把 Person 频道白名单补回去，形状对称于 cutOffDM。
 //
-// 写之前**再确认一次**加入者当前仍是活跃成员。恢复是在加入路径上异步发出的
-// （见 modules/space 的 restoreAfterRejoin），读授权和写 IM 之间隔着整个
-// dmPeersInSpace 的前置查询；这中间他若被重新移除，移除工单的 dm_cutoff 会
-// 正确地摘掉白名单，而这条陈旧的恢复随后把它**加回去**——工单已标 done，
-// 再没有任何东西会来摘第二次，于是留下一对永久越权的私聊。
+// **授权判定就在这里做，紧挨着写。** 恢复是在加入路径上异步发出的（见
+// modules/space 的 restoreAfterRejoin），判定与写 IM 之间每多隔一次查询，
+// 就多一段「读到的授权已经失效、却照样写下去」的窗口：这中间任一方若被移除，
+// 对应的 dm_cutoff 会正确摘掉白名单，而这条陈旧的恢复随后把它**加回去**——
+// 工单已标 done，再没有任何东西会来摘第二次，于是留下一对永久越权的私聊。
 //
-// 注意这个方向与 cutOffDM 那侧的间隙不同：切断侧的交错是自相矛盾的（若加入
-// 早到，切断自己的读就会看到 shared=true 而整对跳过），恢复侧不是——恢复的读
-// 合法地看到了活跃成员，之后全是延迟，goroutine 一被调度器压住窗口就任意放大。
+// 早先的写法把 shared / grantInbound / grantOutbound 全在调用方循环里算好再传进来，
+// 于是**只有加入者那一侧**被重查，对端一侧在任何窗口尺寸下都得不到覆盖：对端被
+// 移除、它自己的 dm_cutoff 跑完标 done，加入者仍是活跃成员，陈旧的 add 照写不误。
+// 三次读移进来之后两个方向对称，窗口都是「这几次查询到紧随其后的 IM 调用」。
 //
-// 这不能把窗口缩到零（这次查询到下面几次 IM 调用之间仍有间隙），但把它从
-// 「整个前置查询的时长」压到一次查询的间隔，并且写死了一条不变量：
-// 绝不代表一次已经失效的加入去授权。彻底关闭要靠成员纪元，见 issue #797。
-func (f *Friend) restoreDM(ctx *config.Context, spaceID, uid, peer string, grantInbound, grantOutbound, selfIsBot bool) error {
+// 与 cutOffDM 那侧的间隙不同：切断侧的交错是自相矛盾的（若加入早到，切断自己的
+// 读就会看到 shared=true 而整对跳过），恢复侧不是——恢复的读合法地看到了活跃
+// 成员，之后全是延迟，goroutine 一被调度器压住窗口就任意放大。
+//
+// **窗口不是零**，这里不声称任何不变量：这几次读和下面几次 IM 调用之间仍有间隙，
+// 落进去依然会写出一条已经失效的授权。彻底关闭要靠成员纪元（读时取纪元、写时
+// 带纪元条件），见 issue #797。
+//
+// 返回 (false, nil) 表示「判定下来无事可做或已失效」，调用方据此跳过。
+func (f *Friend) restoreDM(ctx *config.Context, spaceID, uid, peer string, selfIsBot bool) (bool, error) {
 	stillMember, err := spacepkg.CheckMembership(ctx.DB(), spaceID, uid)
 	if err != nil {
-		return fmt.Errorf("re-check membership before dm restore: %w", err)
+		return false, fmt.Errorf("re-check membership before dm restore: %w", err)
 	}
 	if !stillMember {
 		f.Info("加入者已不再是活跃成员，跳过私聊白名单回补",
 			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.String("peer", peer))
-		return nil
+		return false, nil
+	}
+
+	// 共处判定与逐方向判定都在守卫之后、写之前，这样对端侧的失效也能被看到。
+	shared, err := spacepkg.SharesActiveSpace(ctx.DB(), uid, peer)
+	if err != nil {
+		return false, fmt.Errorf("check shared space: %w", err)
+	}
+	grantInbound, err := f.dmDirectionAuthorized(ctx, peer, uid, shared) // 加入者 -> 对端
+	if err != nil {
+		return false, err
+	}
+	grantOutbound, err := f.dmDirectionAuthorized(ctx, uid, peer, shared) // 对端 -> 加入者
+	if err != nil {
+		return false, err
+	}
+	if !grantInbound && !grantOutbound {
+		return false, nil
 	}
 
 	if grantInbound {
 		// 加入者 -> 对端：把 uid 加回对端频道
 		if err := f.addPersonWhitelist(ctx, peer, uid); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if grantOutbound {
 		// 对端 -> 加入者：把 peer 加回加入者频道
 		if err := f.addPersonWhitelist(ctx, uid, peer); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	// bot 私聊走 Space 前缀频道，与 cutOffDM 一致地一并处理。
 	bot, err := f.eitherSideIsBot(ctx, selfIsBot, peer)
 	if err != nil {
-		return fmt.Errorf("check bot dm (%s/%s): %w", uid, peer, err)
+		return false, fmt.Errorf("check bot dm (%s/%s): %w", uid, peer, err)
 	}
 	if bot {
 		if grantInbound {
 			if err := f.addSpaceScopedWhitelist(ctx, spaceID, peer, uid); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if grantOutbound {
 			if err := f.addSpaceScopedWhitelist(ctx, spaceID, uid, peer); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
@@ -523,7 +552,7 @@ func (f *Friend) restoreDM(ctx *config.Context, spaceID, uid, peer string, grant
 	// （dm_forbidden 是按请求现算的，客户端重拉即可）。
 	f.notifyDMChannelUpdate(ctx, uid, peer)
 	f.notifyDMChannelUpdate(ctx, peer, uid)
-	return nil
+	return true, nil
 }
 
 // addPersonWhitelist 把 uid 加进 channelUID 的 Person 频道白名单。
