@@ -162,6 +162,31 @@ func TestChangeUserRoleRejectsBotUser(t *testing.T) {
 	}
 }
 
+func TestChangeUserRoleAllowsRevocationForInactiveUser(t *testing.T) {
+	service, mock, backend := newMockService(t)
+	now := time.Now()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE role_key='writer' FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
+			AddRow(7, "writer", "Writer", "", activeStatus, 3, now, now))
+	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_user_role.*uid='disabled'.*role_id=7").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(11, activeStatus))
+	mock.ExpectExec("DELETE FROM .*admin_rbac_user_role.*WHERE \\(id=11\\)").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := service.ChangeUserRole("disabled", "writer", false); err != nil {
+		t.Fatalf("ChangeUserRole revoke: %v", err)
+	}
+	if len(backend.deleted) != 1 || backend.deleted[0] != service.cache.userKey("disabled") {
+		t.Fatalf("deleted cache keys = %v, want disabled user's cache invalidated", backend.deleted)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
 func TestEffectivePermissionsRejectsBotUser(t *testing.T) {
 	service, mock, _ := newMockService(t)
 
@@ -237,14 +262,15 @@ func TestUpdateRoleInvalidatesBeforeReadback(t *testing.T) {
 }
 
 func TestNameOnlyRoleUpdatePreservesLockedDisabledStatus(t *testing.T) {
-	service, mock, _ := newMockService(t)
+	service, mock, backend := newMockService(t)
 	now := time.Now()
 	roleRows := sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
 		AddRow(7, "reader", "Reader", "", 0, 3, now, now)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE role_key='reader' FOR UPDATE").WillReturnRows(roleRows)
-	mock.ExpectExec("UPDATE .*admin_rbac_role").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE .*admin_rbac_role.*SET (`?name`? = 'Renamed', `?description`? = ''|`?description`? = '', `?name`? = 'Renamed') WHERE .*id[[:space:]]*=[[:space:]]*7").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectQuery("SELECT .*FROM .*admin_rbac_role WHERE .*role_key='reader'").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "role_key", "name", "description", "status", "authorization_version", "created_at", "updated_at"}).
@@ -256,6 +282,9 @@ func TestNameOnlyRoleUpdatePreservesLockedDisabledStatus(t *testing.T) {
 	}
 	if updated.Status != 0 {
 		t.Fatalf("updated role status = %d, want locked disabled status preserved", updated.Status)
+	}
+	if len(backend.deleted) != 0 {
+		t.Fatalf("deleted cache keys = %v, want no invalidation for name-only update", backend.deleted)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("SQL expectations: %v", err)

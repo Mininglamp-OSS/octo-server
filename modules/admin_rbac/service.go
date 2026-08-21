@@ -121,12 +121,14 @@ func (s *Service) ChangeUserRole(uid, roleKey string, bind bool) error {
 		return wrapStoreError("begin user role change", err)
 	}
 	defer tx.RollbackUnlessCommitted()
-	exists, err := s.store.userExistsTx(tx, uid)
-	if err != nil {
-		return wrapStoreError("check user", err)
-	}
-	if !exists {
-		return ErrUserNotFound
+	if bind {
+		exists, err := s.store.userExistsTx(tx, uid)
+		if err != nil {
+			return wrapStoreError("check user", err)
+		}
+		if !exists {
+			return ErrUserNotFound
+		}
 	}
 	role, err := s.store.roleByKeyTx(tx, roleKey, true)
 	if err != nil {
