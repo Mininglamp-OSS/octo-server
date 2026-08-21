@@ -15,12 +15,18 @@ import (
 )
 
 type generatedContract struct {
-	SchemaVersion      int                `json:"schema_version"`
-	ContentHash        string             `json:"content_hash,omitempty"`
-	Permissions        []Permission       `json:"permissions"`
-	LegacyCapabilities []LegacyCapability `json:"legacy_capabilities"`
-	GateSites          []GateSite         `json:"gate_sites"`
-	Operations         []Operation        `json:"operations"`
+	SchemaVersion          int                             `json:"schema_version"`
+	ContentHash            string                          `json:"content_hash,omitempty"`
+	AggregateModeSemantics generatedAggregateModeSemantics `json:"aggregate_mode_semantics"`
+	Permissions            []Permission                    `json:"permissions"`
+	LegacyCapabilities     []LegacyCapability              `json:"legacy_capabilities"`
+	GateSites              []GateSite                      `json:"gate_sites"`
+	Operations             []Operation                     `json:"operations"`
+}
+
+type generatedAggregateModeSemantics struct {
+	Any string `json:"any"`
+	All string `json:"all"`
 }
 
 func GenerateArtifacts(manifest *Manifest) ([]byte, []byte, error) {
@@ -91,7 +97,11 @@ func CheckGeneratedFiles(manifestPath, goOutputPath, jsonOutputPath string) erro
 
 func normalizedContract(manifest *Manifest) generatedContract {
 	result := generatedContract{
-		SchemaVersion:      manifest.SchemaVersion,
+		SchemaVersion: manifest.SchemaVersion,
+		AggregateModeSemantics: generatedAggregateModeSemantics{
+			Any: AggregateAnySemantics,
+			All: AggregateAllSemantics,
+		},
 		Permissions:        append([]Permission(nil), manifest.Permissions...),
 		LegacyCapabilities: append([]LegacyCapability(nil), manifest.LegacyCapabilities...),
 		GateSites:          append([]GateSite(nil), manifest.GateSites...),

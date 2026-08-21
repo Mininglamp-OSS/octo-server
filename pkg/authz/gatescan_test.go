@@ -42,7 +42,7 @@ func excluded(c *Context) { _ = c.CheckLoginRole() }
 	if gates[0].Source != "modules/example/api.go::Manager.handle#1" || gates[1].Source != "modules/example/api.go::Manager.handle#2" || gates[2].Source != "modules/example/api.go::Manager.handle#3" {
 		t.Fatalf("unexpected identities: %#v", gates)
 	}
-	if gates[0].LegacyGate != LegacyGateAdmin || gates[1].LegacyGate != LegacyGateSuperAdmin || gates[2].LegacyGate != LegacyGateManagerConsoleRole {
+	if gates[0].LegacyGate != LegacyGateAdmin || gates[1].LegacyGate != LegacyGateSuperAdmin || gates[2].LegacyGate != LegacyGateDashboardReadPolicy {
 		t.Fatalf("unexpected legacy gates: %#v", gates)
 	}
 }

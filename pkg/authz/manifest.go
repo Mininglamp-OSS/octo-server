@@ -22,9 +22,9 @@ const (
 type LegacyGate string
 
 const (
-	LegacyGateAdmin              LegacyGate = "admin"
-	LegacyGateSuperAdmin         LegacyGate = "super_admin"
-	LegacyGateManagerConsoleRole LegacyGate = "manager_console_role"
+	LegacyGateAdmin               LegacyGate = "admin"
+	LegacyGateSuperAdmin          LegacyGate = "super_admin"
+	LegacyGateDashboardReadPolicy LegacyGate = "dashboard_read_policy"
 )
 
 type Scope string
@@ -37,8 +37,17 @@ const (
 type AggregateMode string
 
 const (
+	// AggregateAny means a legacy capability is satisfied when at least one
+	// referenced permission is granted.
 	AggregateAny AggregateMode = "any"
+	// AggregateAll means a legacy capability is satisfied only when every
+	// referenced permission is granted.
 	AggregateAll AggregateMode = "all"
+
+	// AggregateAnySemantics is emitted in the generated JSON contract.
+	AggregateAnySemantics = "satisfied when at least one referenced permission is granted"
+	// AggregateAllSemantics is emitted in the generated JSON contract.
+	AggregateAllSemantics = "satisfied only when every referenced permission is granted"
 )
 
 type Manifest struct {
@@ -247,7 +256,7 @@ func validateEnums(manifest *Manifest) error {
 		}
 	}
 	for i, gate := range manifest.GateSites {
-		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateManagerConsoleRole)) {
+		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateDashboardReadPolicy)) {
 			return fmt.Errorf("gate_sites[%d].legacy_gate: invalid value %q", i, gate.LegacyGate)
 		}
 	}

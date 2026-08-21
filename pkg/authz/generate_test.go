@@ -54,6 +54,24 @@ func TestGeneratedContractCollectionsAreSorted(t *testing.T) {
 	}
 }
 
+func TestGeneratedContractDefinesAggregateModeSemantics(t *testing.T) {
+	manifest := repositoryManifest(t)
+	_, output, err := GenerateArtifacts(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract generatedContract
+	if err := json.Unmarshal(output, &contract); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := contract.AggregateModeSemantics.Any, AggregateAnySemantics; got != want {
+		t.Fatalf("aggregate any semantics = %q, want %q", got, want)
+	}
+	if got, want := contract.AggregateModeSemantics.All, AggregateAllSemantics; got != want {
+		t.Fatalf("aggregate all semantics = %q, want %q", got, want)
+	}
+}
+
 func TestGeneratedJSONHashExcludesItselfAndDynamicAuthorizationState(t *testing.T) {
 	manifest := repositoryManifest(t)
 	_, output, err := GenerateArtifacts(manifest)

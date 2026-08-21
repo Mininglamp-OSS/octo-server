@@ -58,6 +58,17 @@ func validateManagerPermissionCompatibility(manifest *contract.Manifest) error {
 		manifestKeys = append(manifestKeys, capability.Key)
 	}
 	sort.Strings(manifestKeys)
+	if got, want := len(manifestKeys), 20; got != want {
+		return fmt.Errorf("legacy capability count = %d, want %d", got, want)
+	}
+	if !IsManagerConsoleRole(ManagerRoleMarketAdmin) || CanReadManagerDashboard(ManagerRoleMarketAdmin) {
+		return fmt.Errorf("marketAdmin must retain manager-console access without dashboard-read access")
+	}
+	for _, role := range []string{string(wkhttp.Admin), string(wkhttp.SuperAdmin), ManagerRoleDashboardReader} {
+		if !IsManagerConsoleRole(role) || !CanReadManagerDashboard(role) {
+			return fmt.Errorf("role %q must retain manager-console and dashboard-read access", role)
+		}
+	}
 
 	current := ManagerCapabilities(string(wkhttp.SuperAdmin))
 	currentKeys := make([]string, 0, len(current))

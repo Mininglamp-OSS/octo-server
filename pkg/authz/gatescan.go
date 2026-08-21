@@ -128,7 +128,7 @@ func directGate(name string) (LegacyGate, bool) {
 	case "CheckLoginRoleIsSuperAdmin":
 		return LegacyGateSuperAdmin, true
 	case "CanReadManagerDashboard":
-		return LegacyGateManagerConsoleRole, true
+		return LegacyGateDashboardReadPolicy, true
 	default:
 		return "", false
 	}

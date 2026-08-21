@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,12 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if err := ValidateRouteCoverage(routes, manifest.Operations, ManagerRouteBoundaryExclusions()); err != nil {
 		t.Fatalf("ValidateRouteCoverage() error = %v", err)
 	}
+	if got, want := len(manifest.Permissions), 90; got != want {
+		t.Fatalf("permission count = %d, want %d", got, want)
+	}
+	if got, want := len(manifest.LegacyCapabilities), 20; got != want {
+		t.Fatalf("legacy capability count = %d, want %d", got, want)
+	}
 	if got, want := len(manifest.Operations), 135; got != want {
 		t.Fatalf("global operation count = %d, want %d", got, want)
 	}
@@ -64,11 +71,12 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	for _, gate := range scanned {
 		gateKinds[gate.LegacyGate]++
 	}
-	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 100 || gateKinds[LegacyGateManagerConsoleRole] != 1 {
-		t.Fatalf("manager gate kinds = %#v, want 100 direct legacy and 1 manager-console gate", gateKinds)
+	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 100 || gateKinds[LegacyGateDashboardReadPolicy] != 1 {
+		t.Fatalf("manager gate kinds = %#v, want 100 direct legacy and 1 dashboard-read-policy gate", gateKinds)
 	}
 	assertGlobalOperationBoundary(t, manifest)
 	assertSensitiveTaxonomy(t, manifest)
+	assertLegacyCapabilitySemantics(t, manifest)
 	assertProductionDoesNotConsumeRegistry(t, root)
 }
 
@@ -114,6 +122,9 @@ func assertGlobalOperationBoundary(t *testing.T, manifest *Manifest) {
 	platformAppBotCount := 0
 	for _, operation := range manifest.Operations {
 		operationByID[operation.ID] = operation
+		if operation.Path == "/v1/manager/me" {
+			t.Errorf("legacy manager capability projection entered global operation inventory: %s", operation.ID)
+		}
 		if strings.HasPrefix(operation.Path, "/v1/space/") {
 			t.Errorf("pure Space ACL route entered global contract: %s", operation.Path)
 		}
@@ -191,15 +202,67 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 	}
 }
 
+func assertLegacyCapabilitySemantics(t *testing.T, manifest *Manifest) {
+	t.Helper()
+	for _, capability := range manifest.LegacyCapabilities {
+		if capability.Key != "dashboard.read" {
+			continue
+		}
+		if capability.Mode != AggregateAll {
+			t.Fatalf("dashboard.read aggregate mode = %q, want %q", capability.Mode, AggregateAll)
+		}
+		want := map[string]bool{
+			"dashboard.read":                      true,
+			"dashboard.direct_chat_activity.read": true,
+		}
+		if len(capability.Permissions) != len(want) {
+			t.Fatalf("dashboard.read permissions = %v, want exactly %v", capability.Permissions, want)
+		}
+		for _, permission := range capability.Permissions {
+			if !want[permission] {
+				t.Fatalf("dashboard.read includes unexpected permission %q", permission)
+			}
+		}
+		return
+	}
+	t.Fatal("missing dashboard.read legacy capability")
+}
+
 func assertProductionDoesNotConsumeRegistry(t *testing.T, root string) {
 	t.Helper()
+	consumers, err := productionRegistryConsumers(root)
+	if err != nil {
+		t.Fatalf("scan production imports: %v", err)
+	}
+	if len(consumers) != 0 {
+		t.Errorf("production code imports generated permission registry: %v", consumers)
+	}
+}
+
+func productionRegistryConsumers(root string) ([]string, error) {
 	wantImport := "github.com/Mininglamp-OSS/octo-server/pkg/authz"
 	fset := token.NewFileSet()
-	err := filepath.WalkDir(filepath.Join(root, "modules"), func(path string, entry fs.DirEntry, walkErr error) error {
+	var consumers []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.IsDir() {
+			switch relative {
+			case ".git", "vendor", "pkg/authz", "tools/manager-permission-gen":
+				return fs.SkipDir
+			}
+			if entry.Name() == "testdata" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		file, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
@@ -208,13 +271,48 @@ func assertProductionDoesNotConsumeRegistry(t *testing.T, root string) {
 		}
 		for _, imported := range file.Imports {
 			if strings.Trim(imported.Path.Value, "\"") == wantImport {
-				t.Errorf("production handler imports generated permission registry: %s", path)
+				consumers = append(consumers, relative)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scan production imports: %v", err)
+		return nil, err
+	}
+	sort.Strings(consumers)
+	return consumers, nil
+}
+
+func TestProductionRegistryConsumersScanAllProductionRoots(t *testing.T) {
+	root := t.TempDir()
+	consumer := "package fixture\nimport _ \"github.com/Mininglamp-OSS/octo-server/pkg/authz\"\n"
+	for _, path := range []string{
+		"pkg/example/consumer.go",
+		"internal/example/consumer.go",
+		"cmd/example/consumer.go",
+	} {
+		writeFixture(t, root, path, consumer)
+	}
+	writeFixture(t, root, "pkg/example/consumer_test.go", consumer)
+	writeFixture(t, root, "pkg/authz/registry.go", "package authz\n")
+	writeFixture(t, root, "tools/manager-permission-gen/main.go", consumer)
+
+	got, err := productionRegistryConsumers(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"cmd/example/consumer.go",
+		"internal/example/consumer.go",
+		"pkg/example/consumer.go",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("production registry consumers = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("production registry consumers = %v, want %v", got, want)
+		}
 	}
 }
 

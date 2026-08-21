@@ -11,7 +11,6 @@
 ./modules/channel/service
 ./modules/search
 ./pkg/accesslog
-./pkg/auth
 ./pkg/authz
 ./pkg/authtree
 ./pkg/avatarrender

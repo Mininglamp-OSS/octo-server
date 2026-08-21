@@ -1,6 +1,13 @@
 # Coverage boundary: this contract verifies routes that reach a recognized
-# manager gate. It does not discover a brand-new route that contains no gate.
+# manager gate: CheckLoginRole, CheckLoginRoleIsSuperAdmin, or
+# CanReadManagerDashboard. It does not discover a brand-new route that contains
+# no recognized gate.
 # Pure Space/Group/Robot business ACL routes remain outside this contract.
+# GET /v1/manager/me is a legacy identity/capability projection guarded by
+# IsManagerConsoleRole, not a fine-grained global-management operation. Its
+# admission policy and capability keys are covered by compatibility tests.
+# Legacy capability aggregation: any means at least one referenced permission
+# is granted; all means every referenced permission is granted.
 schema_version: 1
 permissions:
   - key: app_bot.create
@@ -791,7 +798,7 @@ gate_sites:
   - source: modules/opanalytics/api.go::Manager.requireDashboardRead#1
     module: opanalytics
     symbol: Manager.requireDashboardRead
-    legacy_gate: manager_console_role
+    legacy_gate: dashboard_read_policy
   - source: modules/opanalytics/api.go::Manager.requireSuperAdmin#1
     module: opanalytics
     symbol: Manager.requireSuperAdmin

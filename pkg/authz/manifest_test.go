@@ -82,6 +82,7 @@ func TestParseManifestRejectsInvalidEnums(t *testing.T) {
 		{"sensitivity: critical", "sensitivity: severe", "permissions[0].sensitivity"},
 		{"mode: any", "mode: some", "legacy_capabilities[0].mode"},
 		{"legacy_gate: super_admin", "legacy_gate: root", "gate_sites[0].legacy_gate"},
+		{"legacy_gate: super_admin", "legacy_gate: manager_console_role", "gate_sites[0].legacy_gate"},
 		{"scope: global_admin", "scope: global", "operations[0].scope"},
 	}
 	for _, test := range tests {

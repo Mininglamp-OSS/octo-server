@@ -1,6 +1,10 @@
 {
   "schema_version": 1,
-  "content_hash": "0d7a7074a4ad4b9c90d566fcacd7e398832310b0c0a7e38a442de27a49f89fc1",
+  "content_hash": "069a02336e14ed6911b156f3b73fc0adabe59ce8c07ab6fee78b7bf74eaedbb0",
+  "aggregate_mode_semantics": {
+    "any": "satisfied when at least one referenced permission is granted",
+    "all": "satisfied only when every referenced permission is granted"
+  },
   "permissions": [
     {
       "key": "app_bot.avatar.update",
@@ -1135,7 +1139,7 @@
       "source": "modules/opanalytics/api.go::Manager.requireDashboardRead#1",
       "module": "opanalytics",
       "symbol": "Manager.requireDashboardRead",
-      "legacy_gate": "manager_console_role"
+      "legacy_gate": "dashboard_read_policy"
     },
     {
       "source": "modules/opanalytics/api.go::Manager.requireSuperAdmin#1",
