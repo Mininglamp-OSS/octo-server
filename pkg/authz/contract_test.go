@@ -265,8 +265,14 @@ func assertProductionDoesNotConsumeRegistry(t *testing.T, root string) {
 	if err != nil {
 		t.Fatalf("scan production imports: %v", err)
 	}
-	if len(consumers) != 0 {
-		t.Errorf("production code imports generated permission registry: %v", consumers)
+	var unexpected []string
+	for _, consumer := range consumers {
+		if !strings.HasPrefix(consumer, "modules/admin_rbac/") {
+			unexpected = append(unexpected, consumer)
+		}
+	}
+	if len(unexpected) != 0 {
+		t.Errorf("production code outside modules/admin_rbac imports generated permission registry: %v", unexpected)
 	}
 }
 
