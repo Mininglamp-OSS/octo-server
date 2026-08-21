@@ -96,21 +96,28 @@ func snapshotCleanupSteps() []namedCleanupStep {
 	return out
 }
 
-// invalidateMemberCaches 移除成员后同步失效两处成员缓存。
+// invalidateMembershipCache 清掉某个成员在某个 Space 的 SpaceMiddleware 正向缓存。
 //
-//   - Redis `space:member:{spaceID}:{uid}`：SpaceMiddleware 的正向缓存，TTL 60s。
-//     不清它，被移除的人还能带着这个 space_id 正常访问接口最长 60 秒。这是隔离
-//     边界，必须在请求内同步完成。
-//   - notify 的进程内成员缓存：仅清本进程那一份，其它副本要等自己的 TTL 到期。
-//     这一层只影响卡片/通知的投递目标，不是隔离手段，故接受最终一致。
-func (s *Space) invalidateMemberCaches(spaceID, uid string) {
-	if spaceID == "" {
+// Redis key `space:member:{spaceID}:{uid}`，TTL 60s。不清它，被移除的人还能带着
+// 这个 space_id 正常访问接口最长 60 秒。这是隔离边界，必须在请求内同步完成，
+// 不能丢给后台。
+func (s *Space) invalidateMembershipCache(spaceID, uid string) {
+	if spaceID == "" || uid == "" {
 		return
 	}
-	if uid != "" {
-		if conn := s.ctx.GetRedisConn(); conn != nil {
-			spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
-		}
+	if conn := s.ctx.GetRedisConn(); conn != nil {
+		spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
+	}
+}
+
+// invalidateSpaceMemberCache 清掉 notify 的进程内成员缓存。
+//
+// 粒度是整个 Space，所以批量移除时调一次就够，不必逐个成员重复调。
+// 只清本进程那一份，其它副本要等自己的 TTL（60s）到期；这一层只影响卡片/通知的
+// 投递目标，不是隔离手段，故接受最终一致。
+func (s *Space) invalidateSpaceMemberCache(spaceID string) {
+	if spaceID == "" {
+		return
 	}
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceID)
@@ -155,13 +162,40 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	s.ctx.EventCommit(eventID)
 }
 
-// afterMemberRemoved 成员行提交之后的同步收尾：失效缓存 + 广播事件 + 立刻推一次
-// worker。清理工单本身已经在移除事务里写好了（见 enqueueMemberRemovalCleanupTx），
-// 这里失败不影响最终一致性，定时调度会兜底。
+// afterMembersRemoved 成员行提交之后的收尾。清理工单本身已经在移除事务里写好了
+// （见 enqueueMemberRemovalCleanupTx），这里失败不影响最终一致性，定时调度会兜底。
+//
+// 分成两段是有意的：
+//   - 鉴权缓存逐个**同步**清掉。这是隔离边界，必须在 HTTP 响应之前完成，
+//     否则被移除的人还有最长 60s 的访问窗口。
+//   - 事件广播与 worker 触发放进**单个**后台 goroutine 串行做。早先的写法是每个
+//     uid 各起一个 goroutine，解散一个几千人的 Space 就会瞬间起几千个 goroutine，
+//     每个都开事务写事件、抢清理工单——把一次管理操作变成一场自我 DDoS。
+func (s *Space) afterMembersRemoved(spaceID string, uids []string, operatorUID, reason string) {
+	if spaceID == "" || len(uids) == 0 {
+		return
+	}
+	for _, uid := range uids {
+		s.invalidateMembershipCache(spaceID, uid)
+	}
+	s.invalidateSpaceMemberCache(spaceID)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.Error("成员移除收尾 panic", zap.Any("recover", r), zap.String("spaceId", spaceID))
+			}
+		}()
+		for _, uid := range uids {
+			s.fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason)
+		}
+		s.processMemberRemovalCleanups()
+	}()
+}
+
+// afterMemberRemoved 单成员收尾，afterMembersRemoved 的便捷包装。
 func (s *Space) afterMemberRemoved(spaceID, uid, operatorUID, reason string) {
-	s.invalidateMemberCaches(spaceID, uid)
-	go s.fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason)
-	go s.processMemberRemovalCleanups()
+	s.afterMembersRemoved(spaceID, []string{uid}, operatorUID, reason)
 }
 
 // ---------- worker ----------

@@ -2824,7 +2824,8 @@ func TestResetApprovedApplyForRejoin_NoOpWhenMemberActive(t *testing.T) {
 	// 其余状态一律不受影响。成员必须先置回非活跃，否则 NOT EXISTS 子句单独就会让
 	// 每个 status 都返回 0 行，这个循环就变成了空转——删掉 SQL 里的 AND ja.status=1
 	// 它照样会绿（第一版正是如此，由推送前的对抗性审查发现）。
-	assert.NoError(t, f.db.removeMemberLocked(spaceId, uid, 99, testutil.UID, MemberRemoveReasonKicked))
+	_, removeErr := f.db.removeMemberLocked(spaceId, uid, 99, testutil.UID, MemberRemoveReasonKicked)
+	assert.NoError(t, removeErr)
 	inactive, err := f.db.queryMember(spaceId, uid)
 	assert.NoError(t, err)
 	assert.Nil(t, inactive, "前提：成员此刻不活跃，status 谓词才是唯一变量")

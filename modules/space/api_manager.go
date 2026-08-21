@@ -356,9 +356,7 @@ func (m *Manager) forceDisband(c *wkhttp.Context) {
 		zap.Int("removedMembers", len(removed)))
 	// 刷新 ParseChannelID 缓存，避免已解散的 spaceId 继续被前缀路由认为有效
 	go m.space.loadKnownSpaceIDs()
-	for _, uid := range removed {
-		m.space.afterMemberRemoved(spaceId, uid, operator, MemberRemoveReasonSpaceDisbanded)
-	}
+	m.space.afterMembersRemoved(spaceId, removed, operator, MemberRemoveReasonSpaceDisbanded)
 	c.ResponseOK()
 }
 
@@ -707,7 +705,8 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 		return
 	}
 	operator := c.GetLoginUID()
-	if err := m.managerDB.removeMembersForce(spaceId, uids, operator); err != nil {
+	removed, err := m.managerDB.removeMembersForce(spaceId, uids, operator)
+	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
 			return
@@ -719,9 +718,7 @@ func (m *Manager) removeMembers(c *wkhttp.Context) {
 	m.Info("管理员移除空间成员", zap.String("spaceId", spaceId), zap.String("operator", operator), zap.Strings("uids", uids))
 	// 管理端此前完全没有做缓存失效，被移除的人还能带着 space_id 正常访问最长 60s，
 	// 且 notify 仍把他当成员投递。与用户侧走同一条收尾路径。
-	for _, uid := range uids {
-		m.space.afterMemberRemoved(spaceId, uid, operator, MemberRemoveReasonForceRemoved)
-	}
+	m.space.afterMembersRemoved(spaceId, removed, operator, MemberRemoveReasonForceRemoved)
 	c.ResponseOK()
 }
 

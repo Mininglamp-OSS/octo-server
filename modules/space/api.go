@@ -853,11 +853,15 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		return
 	}
 
+	// 只收集**真的被移除**的成员：removeMemberLocked 对「行本来就不存在」也返回
+	// nil error，拿它去清缓存 / 发事件会对着非成员空跑一整套收尾。
+	removed := make([]string, 0, len(req.UIDs))
 	for _, uid := range req.UIDs {
 		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
 		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
 		// 防止 pre-check 后目标被并发转让升为 owner 仍被移除（PR #339 review）。
-		if err = s.db.removeMemberLocked(spaceId, uid, member.Role, loginUID, MemberRemoveReasonKicked); err != nil {
+		ok, err := s.db.removeMemberLocked(spaceId, uid, member.Role, loginUID, MemberRemoveReasonKicked)
+		if err != nil {
 			if errors.Is(err, ErrCannotRemoveOwner) || errors.Is(err, ErrRemoveHierarchy) {
 				continue
 			}
@@ -865,10 +869,12 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
-		// 逐个收尾：失效该成员的 Space 鉴权缓存、广播事件、推一次清理 worker。
-		// 单个成员的收尾失败不能影响批次里的其他人，故不在此中断循环。
-		s.afterMemberRemoved(spaceId, uid, loginUID, MemberRemoveReasonKicked)
+		if ok {
+			removed = append(removed, uid)
+		}
 	}
+	// 整批一次收尾：鉴权缓存逐个同步失效，事件与清理 worker 合并到一个后台 goroutine。
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
 	c.ResponseOK()
 }
 
@@ -896,7 +902,7 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 	}
 
 	// 锁内重读角色：pre-check 与移除之间可能被并发转让升为 owner（PR #339 review）
-	err = s.db.removeMemberLocked(spaceId, loginUID, 2, loginUID, MemberRemoveReasonLeft)
+	removed, err := s.db.removeMemberLocked(spaceId, loginUID, 2, loginUID, MemberRemoveReasonLeft)
 	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
@@ -906,7 +912,9 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	s.afterMemberRemoved(spaceId, loginUID, loginUID, MemberRemoveReasonLeft)
+	if removed {
+		s.afterMemberRemoved(spaceId, loginUID, loginUID, MemberRemoveReasonLeft)
+	}
 	c.ResponseOK()
 }
 

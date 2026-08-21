@@ -67,7 +67,7 @@ func TestRemoveMemberLockedEnqueuesCleanup(t *testing.T) {
 		SpaceId: spaceID, UID: "victim-1", Role: 0, Status: 1,
 	}))
 
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-1", 1, "owner-1", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-1", 1, "owner-1", MemberRemoveReasonKicked)
 
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1)
@@ -90,12 +90,18 @@ func TestRemoveMemberLockedSkipsEnqueueWhenNothingRemoved(t *testing.T) {
 		SpaceId: spaceID, UID: "admin-2", Role: 1, Status: 1,
 	}))
 
-	// 成员行不存在 → 幂等 nil
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "ghost", 2, "owner-2", MemberRemoveReasonKicked))
+	// 成员行不存在 → 幂等 nil，且必须报告「没有移除」
+	ghostRemoved, err := f.db.removeMemberLocked(spaceID, "ghost", 2, "owner-2", MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	assert.False(t, ghostRemoved, "成员行不存在时不能报告成移除，否则调用方会对着非成员空跑一整套收尾")
 	// owner 不可移除
-	assert.ErrorIs(t, f.db.removeMemberLocked(spaceID, "owner-2", 2, "admin-2", MemberRemoveReasonKicked), ErrCannotRemoveOwner)
+	ownerRemoved, err := f.db.removeMemberLocked(spaceID, "owner-2", 2, "admin-2", MemberRemoveReasonKicked)
+	assert.ErrorIs(t, err, ErrCannotRemoveOwner)
+	assert.False(t, ownerRemoved)
 	// 同级不可移除
-	assert.ErrorIs(t, f.db.removeMemberLocked(spaceID, "admin-2", 1, "admin-2", MemberRemoveReasonKicked), ErrRemoveHierarchy)
+	peerRemoved, err := f.db.removeMemberLocked(spaceID, "admin-2", 1, "admin-2", MemberRemoveReasonKicked)
+	assert.ErrorIs(t, err, ErrRemoveHierarchy)
+	assert.False(t, peerRemoved)
 
 	assert.Empty(t, cleanupJobs(t, spaceID), "没有真正移除任何人时不得留下工单")
 }
@@ -112,7 +118,9 @@ func TestRemoveMembersForceEnqueuesOnlyActuallyRemoved(t *testing.T) {
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "active-3", Role: 0, Status: 1}))
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "gone-3", Role: 0, Status: 0}))
 
-	require.NoError(t, mgr.removeMembersForce(spaceID, []string{"active-3", "gone-3", "stranger-3"}, "su-3"))
+	forced, err := mgr.removeMembersForce(spaceID, []string{"active-3", "gone-3", "stranger-3"}, "su-3")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"active-3"}, forced, "只返回真正被改动的成员行")
 
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1, "已移除的成员和非成员都不该入队")
@@ -169,7 +177,7 @@ func TestCleanupWorkerRunsStepsAndCompletes(t *testing.T) {
 	const spaceID = "wk-ok"
 	seedMember(t, f, spaceID, "owner-5", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-5", Role: 0, Status: 1}))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-5", 1, "owner-5", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-5", 1, "owner-5", MemberRemoveReasonKicked)
 
 	var seen []MemberRemoval
 	restore := swapCleanupStepsForTest([]namedCleanupStep{{
@@ -204,7 +212,7 @@ func TestCleanupWorkerSkipsRejoinedMember(t *testing.T) {
 	const spaceID = "wk-rejoin"
 	seedMember(t, f, spaceID, "owner-6", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "boomerang", Role: 0, Status: 1}))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "boomerang", 1, "owner-6", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "boomerang", 1, "owner-6", MemberRemoveReasonKicked)
 
 	// 工单还没执行，人已经回来了
 	require.NoError(t, f.db.reactivateMember(spaceID, "boomerang", 0))
@@ -236,7 +244,7 @@ func TestCleanupWorkerRetriesFailedStep(t *testing.T) {
 	const spaceID = "wk-retry"
 	seedMember(t, f, spaceID, "owner-7", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-7", Role: 0, Status: 1}))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-7", 1, "owner-7", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-7", 1, "owner-7", MemberRemoveReasonKicked)
 
 	restore := swapCleanupStepsForTest([]namedCleanupStep{{
 		name: "always-fails",
@@ -266,7 +274,7 @@ func TestCleanupWorkerAbandonsAfterMaxAttempts(t *testing.T) {
 	const spaceID = "wk-abandon"
 	seedMember(t, f, spaceID, "owner-8", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-8", Role: 0, Status: 1}))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-8", 1, "owner-8", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-8", 1, "owner-8", MemberRemoveReasonKicked)
 
 	// 直接把 attempts 顶到上限前一次，避免真的跑十轮退避
 	_, err = testCtx.DB().Exec(
@@ -299,7 +307,7 @@ func TestClaimCleanupRespectsLeaseAndSchedule(t *testing.T) {
 	const spaceID = "wk-lease"
 	seedMember(t, f, spaceID, "owner-9", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-9", Role: 0, Status: 1}))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-9", 1, "owner-9", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-9", 1, "owner-9", MemberRemoveReasonKicked)
 
 	now := time.Now()
 	first, err := f.db.claimMemberRemovalCleanup("worker-a", now)
@@ -333,9 +341,9 @@ func TestCleanupJobSurvivesRemoveRejoinRemove(t *testing.T) {
 	seedMember(t, f, spaceID, "owner-10", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-10", Role: 0, Status: 1}))
 
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-10", 1, "owner-10", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-10", 1, "owner-10", MemberRemoveReasonKicked)
 	require.NoError(t, f.db.reactivateMember(spaceID, "victim-10", 0))
-	require.NoError(t, f.db.removeMemberLocked(spaceID, "victim-10", 1, "owner-10", MemberRemoveReasonKicked))
+	mustRemoveMember(t, f, spaceID, "victim-10", 1, "owner-10", MemberRemoveReasonKicked)
 
 	assert.Len(t, cleanupJobs(t, spaceID), 2, "第二次移除必须能再入队")
 }
@@ -415,4 +423,60 @@ func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
 	assert.Contains(t, rows[0].Data, "evt-uid")
 	assert.Contains(t, rows[0].Data, "evt-op")
 	assert.Contains(t, rows[0].Data, MemberRemoveReasonForceRemoved)
+}
+
+// mustRemoveMember 移除成员并断言这次调用确实改动了成员行。
+// removeMemberLocked 对「行本来就不存在」也返回 nil error，只查 error 会让
+// 「什么都没做」的用例悄悄变绿。
+func mustRemoveMember(t *testing.T, f *Space, spaceID, uid string, reject int, operator, reason string) {
+	t.Helper()
+	removed, err := f.db.removeMemberLocked(spaceID, uid, reject, operator, reason)
+	require.NoError(t, err)
+	require.True(t, removed, "这一步必须真的移除了成员行")
+}
+
+// TestRemoveMembersOnlyWrapsUpActuallyRemoved 批量移除里被静默跳过的成员
+// （owner / 同级管理员）不能被当成"已移除"收尾：给他们清鉴权缓存会把在职成员
+// 的缓存打掉（下次访问要多查一次库），发事件则会让下游以为人已经走了。
+func TestRemoveMembersOnlyWrapsUpActuallyRemoved(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "batch-precision"
+	seedMember(t, f, spaceID, testutil.UID, 1) // 操作者：admin
+	for uid, role := range map[string]int{"b-owner": 2, "b-peer": 1, "b-low": 0} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: role, Status: 1,
+		}))
+	}
+
+	conn := testCtx.GetRedisConn()
+	keyOf := func(uid string) string { return "space:member:" + spaceID + ":" + uid }
+	for _, uid := range []string{"b-owner", "b-peer", "b-low"} {
+		require.NoError(t, conn.SetAndExpire(keyOf(uid), "1", time.Minute))
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/remove",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"uids": []string{"b-owner", "b-peer", "b-low"},
+		}))))
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	low, err := conn.GetString(keyOf("b-low"))
+	require.NoError(t, err)
+	assert.Empty(t, low, "真正被移除的成员，缓存必须失效")
+
+	for _, uid := range []string{"b-owner", "b-peer"} {
+		v, err := conn.GetString(keyOf(uid))
+		require.NoError(t, err)
+		assert.Equal(t, "1", v, "%s 被静默跳过、仍是成员，缓存不该被动", uid)
+	}
+
+	// 也不该给他们留下清理工单
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, "b-low", jobs[0].UID)
 }

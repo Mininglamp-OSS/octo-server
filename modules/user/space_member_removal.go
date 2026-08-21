@@ -42,20 +42,23 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 		return nil
 	}
 
-	// 被移除者在「剩余 Space」里的共同成员。此刻他的 space_member 行已经置 0，
-	// 所以这个集合天然不含仅因本 Space 而同处的人 —— 与白名单的推导同源。
-	coMembers, err := space.GetCoMemberUIDs(ctx, removal.UID)
-	if err != nil {
-		return fmt.Errorf("query remaining co-members: %w", err)
-	}
-	stillCoMember := make(map[string]bool, len(coMembers))
-	for _, uid := range coMembers {
-		stillCoMember[uid] = true
-	}
-
 	var firstErr error
 	for _, peer := range peers {
-		if stillCoMember[peer] {
+		// 逐个对端判定，而不是一次性拉出「他所有剩余共同成员」：对端集合的上界是
+		// 他自己的私聊数（很小），而共同成员集合的上界是所有剩余 Space 的人数
+		// （可能上万），后者会为了几个判断把整张名单拉进内存。
+		//
+		// 谓词与 queryCoMemberUIDs 完全一致（两侧 status=1 且 space.status=1），
+		// 也就是与 Person 频道白名单的推导同源。此刻他的 space_member 行已经置 0，
+		// 所以「仅因本 Space 而同处」的人自然判不出共处。
+		shared, err := spacepkg.SharesActiveSpace(ctx.DB(), removal.UID, peer)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("check remaining shared space: %w", err)
+			}
+			continue
+		}
+		if shared {
 			continue // 还有别的共同 Space，白名单本来就该留着
 		}
 		keep, err := f.dmStillAuthorizedByFriendship(removal.UID, peer)
