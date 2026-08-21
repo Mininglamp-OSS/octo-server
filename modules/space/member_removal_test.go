@@ -837,15 +837,11 @@ func TestClaimIncrementsAttempts(t *testing.T) {
 
 // ---------- 加入侧：恢复步骤的接线 ----------
 
-// TestRejoinRestoreStepRunsOnJoinPaths 加入路径必须触发恢复步骤。
-//
-// 摘白名单是移除侧做的，补回来只可能发生在加入侧；这条钉住的是「接线存在」。
-// 曾经的实现只注册了摘那一半，四条加入路径没有一条会调恢复步骤，于是
-// 「踢出 → 重新加入」在开启 Person 白名单校验的部署里永久断掉私聊。
-func TestRejoinRestoreStepRunsOnJoinPaths(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
+// probeRejoinSteps 注册一个记录调用的恢复步骤，返回读取已记录调用的函数。
+// 用完自动换回 no-op —— RegisterMemberRejoinRestoreStep 没有注销入口，
+// 不换回去会把探针漏给后面的用例。
+func probeRejoinSteps(t *testing.T) func() []MemberRejoin {
+	t.Helper()
 	var mu sync.Mutex
 	var seen []MemberRejoin
 	RegisterMemberRejoinRestoreStep("test_restore", func(_ *config.Context, r MemberRejoin) error {
@@ -857,17 +853,86 @@ func TestRejoinRestoreStepRunsOnJoinPaths(t *testing.T) {
 	t.Cleanup(func() {
 		RegisterMemberRejoinRestoreStep("test_restore", func(*config.Context, MemberRejoin) error { return nil })
 	})
+	return func() []MemberRejoin {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]MemberRejoin, len(seen))
+		copy(out, seen)
+		return out
+	}
+}
+
+// awaitRejoin 等待恢复步骤被调用到指定次数。加入路径把恢复丢到后台
+// goroutine（理由见 restoreAfterRejoin 的调用点），所以不能读完就断言。
+func awaitRejoin(t *testing.T, read func() []MemberRejoin, want int) []MemberRejoin {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := read()
+		if len(got) >= want {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("恢复步骤没有被加入路径调用：want %d, got %d —— 接线断了", want, len(got))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRejoinRestoreStepRunsOnJoinPath 加入路径必须触发恢复步骤——**走真实 handler**。
+//
+// 摘白名单是移除侧做的，补回来只可能发生在加入侧；这条钉住的是「接线存在」。
+// 早先的版本直接调 f.restoreAfterRejoin 断言分发器本身，那样把三处
+// `restoreAfterRejoin(...)` 调用全删掉，整个包依然全绿——正好漏掉本轮要修的
+// 那个缺陷。这里改成 POST 真实路由，删掉接线就会红。
+func TestRejoinRestoreStepRunsOnJoinPath(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	read := probeRejoinSteps(t)
 
 	const spaceID = "rejoin-wire"
-	seedMember(t, f, spaceID, "owner-j", 2)
+	seedMember(t, f, spaceID, testutil.UID, 2) // 操作者：owner
 
-	f.restoreAfterRejoin(spaceID, "u-joined")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/add",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{"uids": []string{"u-joined"}}))))
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-	mu.Lock()
-	defer mu.Unlock()
-	require.Len(t, seen, 1)
-	assert.Equal(t, spaceID, seen[0].SpaceID)
-	assert.Equal(t, "u-joined", seen[0].UID)
+	got := awaitRejoin(t, read, 1)
+	assert.Equal(t, spaceID, got[0].SpaceID)
+	assert.Equal(t, "u-joined", got[0].UID)
+}
+
+// TestRejoinRestoreStepRunsForEveryMemberInBatch 批量加入时每个成员都要恢复，
+// 不能只处理第一个——批量路径把整批放进**一个** goroutine 串行跑，
+// 循环写错就会静默只补一个人。
+func TestRejoinRestoreStepRunsForEveryMemberInBatch(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	read := probeRejoinSteps(t)
+
+	const spaceID = "rejoin-batch"
+	seedMember(t, f, spaceID, testutil.UID, 2)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/add",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"uids": []string{"u-b1", "u-b2", "u-b3"},
+		}))))
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := awaitRejoin(t, read, 3)
+	uids := make([]string, 0, len(got))
+	for _, r := range got {
+		uids = append(uids, r.UID)
+	}
+	assert.ElementsMatch(t, []string{"u-b1", "u-b2", "u-b3"}, uids)
 }
 
 // TestRejoinRestoreContainsStepPanic 恢复步骤由别的模块注册，一次 panic 不能

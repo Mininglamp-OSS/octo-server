@@ -427,6 +427,20 @@ Consequently:
 
 Recorded so the diff can be read against the spec rather than against memory.
 
+- **A join-side restore was added.** The plan only covered revocation. Removing a
+  member drops Person-channel whitelist entries, and nothing granted them back —
+  the broker's whitelist store is mutated only by the proactive
+  `whitelist_add` / `whitelist_remove` APIs, so `kick → re-add` left the pair
+  permanently unable to DM wherever whitelist enforcement is on. A `dm_restore`
+  step now mirrors `dm_cutoff` (same scope, same per-direction predicate, same
+  bot prefixed channels), registered next to it and wired into all four join
+  paths. It is deliberately best-effort rather than outbox-backed: failing to
+  revoke is an authorization leak and must converge, failing to re-grant is a
+  visible, user-recoverable loss of function.
+- **Four join paths, not three.** `modules/space/api.go` `addMembers` and the
+  manager endpoint both bypass `afterJoinSpace`; only join-by-code and approved
+  applications go through it.
+
 - **A fifth removal path.** The owner-initiated disband was not in the original
   survey (see the path table). It now runs the same cascade.
 - **`dm_space_presence` demoted from gate to nothing.** The plan used it to

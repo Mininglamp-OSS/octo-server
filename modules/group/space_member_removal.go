@@ -122,6 +122,13 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 //
 // dm_cutoff 侧之所以能直接上抛，是因为它的范围 MembersEverInSpace 不看成员状态，
 // 重试确实会重新枚举到同一批对端。
+//
+// 顺带澄清一处容易读岔的地方：dm_cutoff 逐对端重算 SharesActiveSpace，覆盖的是
+// 「重新加入发生在那次读之前」——也就是真正宽的那个窗口。它并不覆盖那次读到
+// 随后 whitelist_remove 之间的间隙（两次查询加一次 IM 往返）。那段间隙在实践中
+// 构造不出来（要落进去，回补必须早于切断的读就开始跑完自己的前置查询，可那样
+// 切断读到的就是 shared=true，整对会被跳过），但别据此认为 DM 侧是结构上无竞态的。
+// 彻底关闭同样要靠成员纪元，见 issue #797。
 func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
