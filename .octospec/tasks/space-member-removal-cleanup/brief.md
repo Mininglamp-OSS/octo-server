@@ -126,9 +126,15 @@ survive; `created_at` is deliberately never reset on rejoin
 - One event, fired by all four removal paths, carrying `(space_id, uid,
   operator_uid, reason)` where reason distinguishes kicked / left / force-removed
   / space-disbanded.
-- The event is durable (`wkevent` table + `EventCommit`, following
-  `fireSpaceMemberJoinEvent` at `modules/space/api.go:2207`), because every
-  consequence below is an external call that must survive a crash and be retried.
+- The event is persisted (`wkevent` table + `EventCommit`, following
+  `fireSpaceMemberJoinEvent` at `modules/space/api.go:2207`) so a crash between
+  the membership commit and the dispatch does not lose the cascade. **The event
+  table is crash recovery, not a retry queue** — see *Failure semantics*.
+- The event must be fired off the request goroutine (`go s.fire...`, as the join
+  path does). In the listener branch, `handleEvent`
+  (`modules/base/event/handler.go:36`) runs every listener **synchronously on the
+  caller's goroutine** with no `EventPool` hand-off, so a slow cascade would
+  otherwise block the HTTP handler.
 - Fired **after** the membership transaction commits. A rolled-back removal must
   not emit externally visible side effects.
 - Batch removal fires one event per removed uid; one uid's failure must not
@@ -182,17 +188,53 @@ survive; `created_at` is deliberately never reset on rejoin
   `SpaceMiddleware` in the interim.
 - `event.SpaceMemberCacheInvalidator(spaceID)` on **all four** paths, closing the
   current manager-path gap.
-- Cache invalidation is per-process for notify; the durable event, not the
-  in-process hook, is what makes the outcome eventually consistent across
-  replicas.
+- `event.SpaceMemberCacheInvalidator` clears only the calling process's notify
+  cache; other replicas keep a stale entry until their own 60s TTL expires. That
+  is accepted (notify only gates card/notification targeting, and the DB is
+  re-read on expiry) — but it means the in-process hook is not the isolation
+  mechanism. The Redis invalidation plus the group/DM cascade are.
 
 ### Failure semantics
 
+The event bus does **not** provide retry. Verified behavior:
+
+- `updateEventStatus` (`modules/base/event/api.go:128`) marks a failed listener's
+  event `Fail`, and `QueryAllWait` (`modules/base/event/db.go:49`) selects only
+  `status = Wait`. A `Fail` row is therefore never re-dispatched. The timer
+  (`main.go:488`, every 59s, with a `created_at < now-60s` guard) recovers only
+  events that were never dispatched at all — i.e. a process crash between insert
+  and `EventCommit`.
+- `UpdateStatus` (`modules/base/event/db.go:34`) matches `version_lock` in its
+  `WHERE` but never increments it, so with multiple listeners on one event every
+  write succeeds and **last writer wins**: one listener's success can overwrite
+  another's failure on the shared row. The repo's existing convention for
+  multi-listener events is therefore `commit(nil)` plus module-owned
+  compensation (`modules/notify/api.go:252` and the comment at `:257`).
+
+Consequently:
+
+- Listeners for this event call `commit(nil)` and **own their own retry**. Do not
+  rely on the event timer, and do not report cascade failure through
+  `updateEventStatus` — with two listeners it is not a reliable signal.
+- The cascade needs a durable per-`(space_id, uid)` work record with `status`,
+  `attempts`, `next_attempt_at` and a lease, modeled on
+  `user_session_revocation_intent`
+  (`modules/user/sql/20260809000001_user_session_revocation_intent.sql`,
+  driver in `modules/user/session_revocation.go`, scheduled at
+  `modules/user/api.go:445`). This is the repo's established pattern for
+  "external call that must survive a crash and be retried", and it is what makes
+  the group cascade and DM cutoff eventually consistent. Alternatively a
+  reconciler-scan may substitute for the ledger where a cheap authoritative
+  re-derivation exists (notify's `spaceWelcome` reconciler is the precedent), but
+  "the event will be retried" is not an option.
 - The HTTP removal response must not depend on IM or group cascade success. The
-  membership write and cache invalidation are synchronous; the cascade is driven
-  by the durable event and retried by the existing event timer.
+  membership write and both cache invalidations are synchronous and inside the
+  request; everything else is driven by the record above.
 - Every step is idempotent under retry: re-running a completed cascade produces
   no duplicate tips, no duplicate CMDs that change state, and no error.
+- The work record must be reconciled against live state at execution time, not
+  trusted blindly: a member who was removed and has since rejoined must not have
+  their groups and DMs torn down by a late-arriving retry.
 
 ## Load-bearing list
 
@@ -211,6 +253,13 @@ survive; `created_at` is deliberately never reset on rejoin
   must not reintroduce a check-then-act window: DM authorization is re-evaluated
   post-commit, and a concurrent rejoin must not be undone by a late-arriving
   cascade.
+- **event-bus semantics** — `modules/base/event` is a fire-once dispatcher, not
+  a retry queue: a failed listener is marked `Fail` and never re-selected
+  (`modules/base/event/api.go:128`, `db.go:49`), and multiple listeners share one
+  status row whose `version_lock` is never incremented (`db.go:34`), so
+  last-writer-wins. Any design that assumes at-least-once delivery to a listener
+  is wrong. This change adds a second listener to a fan-out event and must not
+  make the existing `SpaceMemberJoin`/`GroupMemberAdd` listeners' behavior worse.
 - **data-integrity** — the cascade spans MySQL (`group_member`, `thread_member`,
   `user_pinned_channel`, `conversation_extra`), the event table, and WuKongIM.
   Partial completion must be retryable and idempotent, never leave a member
@@ -265,6 +314,11 @@ survive; `created_at` is deliberately never reset on rejoin
   exported but not mounted, so this is latent. Tracked separately.
 - **Reworking `SpaceMiddleware`'s TTL model** or making it a global mount. Only
   the missing invalidation call is added.
+- **Fixing `modules/base/event`'s retry and multi-listener status semantics
+  globally.** The `Fail`-is-terminal behavior and the non-incrementing
+  `version_lock` affect every event in the repo; this task works within them
+  (own retry record, `commit(nil)`) and does not change the shared bus. Worth a
+  separate task.
 
 ## Acceptance
 
@@ -317,7 +371,13 @@ survive; `created_at` is deliberately never reset on rejoin
 **Batch and robustness**
 
 - In a batch removal where one uid's cascade fails, the other uids are fully
-  processed and the failed one is retried by the event timer.
+  processed and the failed one is retried by this task's own durable work record
+  — asserted by driving the retry, not by asserting on `event.status`.
+- A listener failure does not leave the cascade permanently dropped: a test that
+  fails the first attempt and then runs the retry driver reaches the same final
+  state as a clean run.
+- A member removed and then rejoined before a pending retry executes keeps their
+  groups and DMs: the retry re-checks live membership and becomes a no-op.
 - The HTTP response of every removal path is unchanged in shape and is not
   affected by IM or cascade failure.
 
@@ -330,5 +390,10 @@ survive; `created_at` is deliberately never reset on rejoin
   infrastructure-only blocker is recorded with its exact command and output.
 - Any new handler file is added to the module's
   `Test<Module>NoLegacyResponseError` guard list.
+- The cascade work-record migration follows the in-repo file convention
+  `modules/<name>/sql/<yyyyMMdd><seq>_<name>.sql` (as in
+  `modules/space/sql/20260627000001_dm_space_presence.sql`) and is embedded via
+  the module's existing `//go:embed sql`. It applies cleanly on a fresh database
+  and is a no-op on re-run.
 - No production UID, Space ID, group number, or domain appears in the diff,
   tests, fixtures, or commit text.

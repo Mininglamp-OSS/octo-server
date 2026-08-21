@@ -32,6 +32,17 @@ injected_rules:
       cascade boundary with synthetic identifiers, including the multi-Space and
       friendship carve-outs (the primary regression risk), the Space-prefixed
       bot DM channel form, batch partial failure, and idempotent event replay.
+  - id: data-integrity-note
+    source: task
+    load_bearing: true
+    why: >
+      Not a rule file — recorded here because Plan review overturned a load-bearing
+      assumption. modules/base/event is a fire-once dispatcher: a failed listener
+      is marked Fail and never re-selected (api.go:128 + db.go:49), and multiple
+      listeners share one status row whose version_lock is never incremented
+      (db.go:34), so last-writer-wins. The cascade therefore owns its own durable
+      retry record (user_session_revocation_intent pattern) and listeners call
+      commit(nil); no design may assume the event timer will retry.
   - id: rate-limit
     source: repo
     load_bearing: false
