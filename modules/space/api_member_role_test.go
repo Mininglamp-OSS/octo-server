@@ -162,7 +162,7 @@ func TestTransferOwnerAdminTargetRemoved(t *testing.T) {
 	memberRoleFixture(t, f, spaceId, 2, 1)
 
 	// 目标被移除（status=0），等价于 pre-check 与事务之间被并发踢出
-	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2, testutil.UID, MemberRemoveReasonKicked)
 	assert.NoError(t, err)
 
 	err = f.db.transferOwnerAdmin(spaceId, "m-target")
@@ -186,25 +186,25 @@ func TestRemoveMemberLockedGuards(t *testing.T) {
 	memberRoleFixture(t, f, spaceId, 2, 1) // testutil.UID=owner, m-target=admin
 
 	// owner 不可移除，无论调用方上限是多少
-	err = f.db.removeMemberLocked(spaceId, testutil.UID, 2)
+	err = f.db.removeMemberLocked(spaceId, testutil.UID, 2, testutil.UID, MemberRemoveReasonLeft)
 	assert.ErrorIs(t, err, ErrCannotRemoveOwner)
 	owner, _ := f.db.queryMember(spaceId, testutil.UID)
 	assert.Equal(t, 2, owner.Role)
 
 	// 操作者 admin(1) 移除 admin(1)：同级拒绝
-	err = f.db.removeMemberLocked(spaceId, "m-target", 1)
+	err = f.db.removeMemberLocked(spaceId, "m-target", 1, testutil.UID, MemberRemoveReasonKicked)
 	assert.ErrorIs(t, err, ErrRemoveHierarchy)
 	target, _ := f.db.queryMember(spaceId, "m-target")
 	assert.NotNil(t, target)
 
 	// 操作者 owner(2) 移除 admin(1)：成功
-	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2, testutil.UID, MemberRemoveReasonKicked)
 	assert.NoError(t, err)
 	target, _ = f.db.queryMember(spaceId, "m-target")
 	assert.Nil(t, target)
 
 	// 目标已不存在：幂等 nil
-	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2, testutil.UID, MemberRemoveReasonKicked)
 	assert.NoError(t, err)
 }
 

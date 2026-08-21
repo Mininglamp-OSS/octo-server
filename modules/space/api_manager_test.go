@@ -403,7 +403,7 @@ func TestManager_AddMembers(t *testing.T) {
 	assert.Equal(t, 3, count) // owner + 2 new
 
 	t.Run("reactivate removed member", func(t *testing.T) {
-		err := testSpaceDB.removeMemberLocked("mgr-addmem", "new-u-1", 2)
+		err := testSpaceDB.removeMemberLocked("mgr-addmem", "new-u-1", 2, testutil.UID, MemberRemoveReasonKicked)
 		assert.NoError(t, err)
 
 		body2 := util.ToJson(map[string]interface{}{"uids": []string{"new-u-1"}})
@@ -1089,7 +1089,7 @@ func TestManager_RemoveOwnerBlockedInTx(t *testing.T) {
 	seedSpace(t, "mgr-rm-tx", "tx guard", "u-owner-tx", SpaceStatusNormal)
 
 	mgrDB := newManagerDB(testCtx.DB())
-	err = mgrDB.removeMembersForce("mgr-rm-tx", []string{"u-owner-tx"})
+	err = mgrDB.removeMembersForce("mgr-rm-tx", []string{"u-owner-tx"}, testutil.UID)
 	assert.ErrorIs(t, err, ErrCannotRemoveOwner)
 
 	owner, err := testSpaceDB.queryMember("mgr-rm-tx", "u-owner-tx")

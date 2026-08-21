@@ -243,8 +243,8 @@ func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
 
 // removeMemberLocked 锁内重读角色后移除成员，防并发转让产生无主空间，
 // 见 db_manager.go removeMemberLocked。
-func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int) error {
-	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove)
+func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) error {
+	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
 }
 
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {

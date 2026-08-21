@@ -1,0 +1,329 @@
+package user
+
+import (
+	"fmt"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/model"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"go.uber.org/zap"
+)
+
+// spaceMemberDMCutoffStepName 清理步骤名，同时作为工单 last_error 的前缀。
+const spaceMemberDMCutoffStepName = "dm_cutoff"
+
+// registerSpaceMemberRemovalCleanup 把「断掉失去授权的私聊」注册为成员移除清理步骤。
+// 由 1module.go 在 friend 模块构造时调用（modules/user 已 import modules/space，
+// 反向注册避免成环）。
+func (f *Friend) registerSpaceMemberRemovalCleanup() {
+	space.RegisterMemberRemovalCleanupStep(spaceMemberDMCutoffStepName, f.cleanupSpaceMemberDMs)
+}
+
+// cleanupSpaceMemberDMs 把被移出 Space 的成员与「因此失去私聊授权」的对端断开。
+//
+// 私聊授权来自 Person 频道白名单，而白名单的推导（modules/user/1module.go 的
+// IMDatasource.Whitelist）本来就是 friends(uid) ∪ GetCoMemberUIDs(uid) —— 推导侧
+// 在成员行置 0 的那一刻就已经正确了。坏的是 WuKongIM 缓存着旧白名单，没人去摘。
+// 所以这里做的不是「重新定义规则」，而是把已经失效的缓存条目摘掉。
+//
+// 关键边界：两个人可能同时在多个 Space，也可能是好友。从 X 移除后如果他们还共处
+// Y，或者仍是双向好友，私聊必须照常可用 —— 所以每个对端都要重新判定，
+// 不能因为「离开了这个 Space」就一刀切。
+// 所有 DB / IM 访问一律走**传入的 ctx**，不混用 f.ctx：两者在生产里是同一个
+// 单例，但混用会让「换一个 ctx 调用」静默读到另一套连接，测试也测不出真实路径。
+func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.MemberRemoval) error {
+	peers, err := f.dmPeersInSpace(ctx, removal)
+	if err != nil {
+		return err
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+
+	// 被移除者在「剩余 Space」里的共同成员。此刻他的 space_member 行已经置 0，
+	// 所以这个集合天然不含仅因本 Space 而同处的人 —— 与白名单的推导同源。
+	coMembers, err := space.GetCoMemberUIDs(ctx, removal.UID)
+	if err != nil {
+		return fmt.Errorf("query remaining co-members: %w", err)
+	}
+	stillCoMember := make(map[string]bool, len(coMembers))
+	for _, uid := range coMembers {
+		stillCoMember[uid] = true
+	}
+
+	var firstErr error
+	for _, peer := range peers {
+		if stillCoMember[peer] {
+			continue // 还有别的共同 Space，白名单本来就该留着
+		}
+		keep, err := f.dmStillAuthorizedByFriendship(removal.UID, peer)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if keep {
+			continue // 是好友，与 Space 无关
+		}
+		if err := f.cutOffDM(ctx, removal.SpaceID, removal.UID, peer); err != nil {
+			f.Error("断开被移除成员的私聊失败",
+				zap.Error(err),
+				zap.String("spaceId", removal.SpaceID),
+				zap.String("uid", removal.UID),
+				zap.String("peer", peer))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// dmPeersInSpace 找出「被移除者在本 Space 下真的聊过的私聊对端」。
+//
+// 三步收窄，每一步都有界：
+//  1. 从 IM 拉他自己的会话列表 —— 上界是他的会话数，不是 Space 的人数；
+//  2. 收窄到本 Space 的活跃成员（一次 IN 查询）；
+//  3. 用 dm_space_presence 确认这一对确实在本 Space 下产生过消息。
+//
+// 刻意不对 dm_space_presence.fake_channel_id 做 LIKE 反查：它是
+// common.GetFakeChannelIDWith 生成的 "{a}@{b}"（顺序由 CRC32 决定），是主键前缀，
+// 没有子串索引，且拼接格式不是稳定契约。这里始终用「已知对端 -> 正向构造 key」。
+func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval) ([]string, error) {
+	conversations, err := ctx.IMSyncUserConversation(removal.UID, 0, 1, "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("sync conversations of removed member: %w", err)
+	}
+
+	candidates := dmPeerCandidates(conversations, removal.UID)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	memberSet, err := spacepkg.ActiveMemberSet(ctx.DB(), removal.SpaceID, candidates)
+	if err != nil {
+		return nil, fmt.Errorf("narrow dm peers to space members: %w", err)
+	}
+	if len(memberSet) == 0 {
+		return nil, nil
+	}
+
+	fakeToPeer := make(map[string]string, len(memberSet))
+	fakeIDs := make([]string, 0, len(memberSet))
+	for _, peer := range candidates {
+		if !memberSet[peer] {
+			continue
+		}
+		fake := common.GetFakeChannelIDWith(removal.UID, peer)
+		if _, dup := fakeToPeer[fake]; dup {
+			continue
+		}
+		fakeToPeer[fake] = peer
+		fakeIDs = append(fakeIDs, fake)
+	}
+
+	present, err := spacepkg.DMSpacePresenceSet(ctx.DB(), fakeIDs, removal.SpaceID)
+	if err != nil {
+		return nil, fmt.Errorf("query dm space presence: %w", err)
+	}
+	peers := make([]string, 0, len(present))
+	for fake := range present {
+		peers = append(peers, fakeToPeer[fake])
+	}
+	return peers, nil
+}
+
+// dmStillAuthorizedByFriendship 判断好友关系是否仍单独授权这对私聊。
+//
+// 与白名单推导对齐：Whitelist 取 GetFriends(uid) 中 IsAlone == 0 的那些，
+// 即单向好友（对方已把你删掉）不算数。任意一侧持有有效的双向好友行即保留私聊。
+func (f *Friend) dmStillAuthorizedByFriendship(uid, peer string) (bool, error) {
+	forward, err := f.db.isMutualFriend(uid, peer)
+	if err != nil {
+		return false, fmt.Errorf("query friendship: %w", err)
+	}
+	if forward {
+		return true, nil
+	}
+	backward, err := f.db.isMutualFriend(peer, uid)
+	if err != nil {
+		return false, fmt.Errorf("query reverse friendship: %w", err)
+	}
+	return backward, nil
+}
+
+// cutOffDM 双向摘掉 Person 频道白名单，并给两端推 channelUpdate。
+//
+// 形状照搬 event_friend.go 的 handleDeleteFriend：要挡住 A→B，必须把 A 从 B 的
+// Person 频道白名单里摘掉（反之亦然），单摘一边只会断一个方向。
+func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string) error {
+	if err := f.removePersonWhitelist(ctx, peer, removedUID); err != nil {
+		return err
+	}
+	if err := f.removePersonWhitelist(ctx, removedUID, peer); err != nil {
+		return err
+	}
+
+	// Bot 私聊用的是 Space 前缀频道（见 app_bot / botfather 的 IMWhitelistAdd），
+	// 只摘裸 uid 频道会把 bot 私聊漏在开着的状态。
+	if bot, err := f.eitherSideIsBot(removedUID, peer); err != nil {
+		f.Warn("判定是否 bot 私聊失败，跳过 Space 前缀频道白名单清理",
+			zap.Error(err), zap.String("uid", removedUID), zap.String("peer", peer))
+	} else if bot {
+		// 这两个频道未必存在（这一对可能从没在本 Space 下建过前缀频道），
+		// 因此按 best-effort 处理：失败只告警，不让整条工单一直重试到 abandoned。
+		f.removeSpaceScopedWhitelist(ctx, spaceID, peer, removedUID)
+		f.removeSpaceScopedWhitelist(ctx, spaceID, removedUID, peer)
+	}
+
+	// 两端各推一条 channelUpdate：客户端据此重拉对端频道信息，把发送框置灰。
+	// 推送失败不回滚白名单 —— 服务端的拦截已经生效，客户端下次拉取也会自愈。
+	f.notifyDMChannelUpdate(ctx, removedUID, peer)
+	f.notifyDMChannelUpdate(ctx, peer, removedUID)
+	return nil
+}
+
+// removePersonWhitelist 把 uid 从 channelUID 的 Person 频道白名单里摘掉。
+func (f *Friend) removePersonWhitelist(ctx *config.Context, channelUID, uid string) error {
+	err := ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   channelUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	})
+	if err != nil {
+		return fmt.Errorf("remove person whitelist (%s): %w", channelUID, err)
+	}
+	return nil
+}
+
+// removeSpaceScopedWhitelist 摘 Space 前缀频道的白名单，best-effort。
+func (f *Friend) removeSpaceScopedWhitelist(ctx *config.Context, spaceID, channelUID, uid string) {
+	channelID := spacepkg.BuildChannelID(spaceID, channelUID)
+	if channelID == channelUID {
+		return // 没有 Space 前缀可加，裸频道上面已经处理过了
+	}
+	if err := ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   channelID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	}); err != nil {
+		f.Warn("摘除 Space 前缀频道白名单失败（best-effort）",
+			zap.Error(err), zap.String("channelId", channelID), zap.String("uid", uid))
+	}
+}
+
+// notifyDMChannelUpdate 给 recipient 推一条 channelUpdate，让其客户端重拉 peer 的频道信息。
+// 形状对齐 api_setting.go 里既有的 Person 频道 channelUpdate 推送。
+func (f *Friend) notifyDMChannelUpdate(ctx *config.Context, recipient, peer string) {
+	if err := ctx.SendCMD(config.MsgCMDReq{
+		ChannelID:   recipient,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		CMD:         common.CMDChannelUpdate,
+		Param: map[string]interface{}{
+			"channel_id":   peer,
+			"channel_type": common.ChannelTypePerson.Uint8(),
+		},
+	}); err != nil {
+		f.Warn("推送私聊频道更新失败",
+			zap.Error(err), zap.String("recipient", recipient), zap.String("peer", peer))
+	}
+}
+
+// eitherSideIsBot 判断这对私聊里是否有 bot。
+func (f *Friend) eitherSideIsBot(uid, peer string) (bool, error) {
+	isBot, err := f.db.isRobot(peer)
+	if err != nil {
+		return false, err
+	}
+	if isBot {
+		return true, nil
+	}
+	return f.db.isRobot(uid)
+}
+
+// DM 可发送性下发给客户端的 extra key。
+//
+// 只在**不可发送**时下发，可发送时整个 key 不出现：老客户端读不到就当没有，
+// 行为与今天一致；新客户端据此把发送框置灰（参照 octo-web 对已解散群的只读处理）。
+//
+// 刻意不复用 be_deleted / be_blacklist：前者是「对方把你删了好友」（源自
+// friend.is_alone），后者是黑名单，客户端已按各自语义在用，挤进第三种含义会让
+// 三者都失真。
+const (
+	dmForbiddenExtraKey       = "dm_forbidden"
+	dmForbiddenReasonExtraKey = "dm_forbidden_reason"
+	// dmForbiddenReasonNoSharedSpace 双方既非好友、也不再同处任一活跃 Space。
+	dmForbiddenReasonNoSharedSpace = "no_shared_space"
+)
+
+// annotateDMSendability 给 Person 频道信息补一个「当前登录用户能否给该对端发消息」的标记。
+//
+// 判定必须与 Person 频道白名单的推导同源（modules/user/1module.go 的
+// IMDatasource.Whitelist = friends(peer, is_alone=0) ∪ coMembers(peer)）：
+// loginUID 能发给 peer，当且仅当 loginUID 落在 peer 频道的白名单里。口径不一致的话，
+// 前端可能展示成可发但被 WuKongIM 拒收，或反过来无谓置灰。
+//
+// 只读判定，任何一步失败都按「可发送」放行（不下发 key）：这里是展示层提示，
+// 真正的拦截在 WuKongIM 白名单上，fail-open 不会造成越权。
+func annotateDMSendability(ctx *config.Context, resp *model.ChannelResp, peerUID, loginUID string) {
+	if resp == nil || loginUID == "" || peerUID == "" || peerUID == loginUID {
+		return // 自己的频道永远可写
+	}
+	shared, err := spacepkg.SharesActiveSpace(ctx.DB(), loginUID, peerUID)
+	if err != nil {
+		ctx.Warn("判定共同 Space 失败，DM 可发送性按可发送处理",
+			zap.String("loginUID", loginUID), zap.String("peer", peerUID), zap.Error(err))
+		return
+	}
+	if shared {
+		return
+	}
+	friendDB := newFriendDB(ctx)
+	mutual, err := friendDB.isMutualFriend(peerUID, loginUID)
+	if err != nil {
+		ctx.Warn("判定好友关系失败，DM 可发送性按可发送处理",
+			zap.String("loginUID", loginUID), zap.String("peer", peerUID), zap.Error(err))
+		return
+	}
+	if mutual {
+		return
+	}
+	if resp.Extra == nil {
+		resp.Extra = make(map[string]interface{})
+	}
+	resp.Extra[dmForbiddenExtraKey] = 1
+	resp.Extra[dmForbiddenReasonExtraKey] = dmForbiddenReasonNoSharedSpace
+}
+
+// dmPeerCandidates 从会话列表里抽出去重后的私聊对端 UID。
+//
+// 单独拆出来是因为它的边界都在这一层，且不需要任何 DB / IM 就能验证：
+//   - 只认 Person 频道，群 / 子区一律跳过；
+//   - bot 私聊的 channel_id 带 Space 前缀（s{spaceID}_{uid}），必须剥掉才是真实对端，
+//     否则会拿着 "s...._uid" 去查成员表，永远查不到，bot 私聊就被静默漏掉；
+//   - 自己的频道和重复项都要去掉。
+//
+// 保持入参顺序输出，方便调用方的日志和测试断言稳定。
+func dmPeerCandidates(conversations []*config.SyncUserConversationResp, selfUID string) []string {
+	candidates := make([]string, 0, len(conversations))
+	seen := make(map[string]bool, len(conversations))
+	for _, conv := range conversations {
+		if conv == nil || conv.ChannelType != common.ChannelTypePerson.Uint8() {
+			continue
+		}
+		_, peer := spacepkg.ParseChannelID(conv.ChannelID)
+		if peer == "" || peer == selfUID || seen[peer] {
+			continue
+		}
+		seen[peer] = true
+		candidates = append(candidates, peer)
+	}
+	return candidates
+}

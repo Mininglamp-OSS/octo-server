@@ -75,7 +75,9 @@ func init() {
 						api.Error("用户不存在！", zap.String("channel_id", channelID))
 						return nil, register.ErrDatasourceNotProcess
 					}
-					return newChannelRespWithUserDetailResp(userDetailResp), nil
+					resp := newChannelRespWithUserDetailResp(userDetailResp)
+					annotateDMSendability(api.ctx, resp, channelID, loginUID)
+					return resp, nil
 				},
 				GetDevice: func(ids []int64) ([]*model.DeviceResp, error) {
 					list, err := api.deviceDB.queryDevicesWithIds(ids)
@@ -105,6 +107,9 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		friendCtx := ctx.(*config.Context)
 		api := NewFriend(friendCtx)
+		// Space 成员被移除后，断掉因此失去授权的私聊
+		// （task space-member-removal-cleanup）。反向注册避免 space -> user 成环。
+		api.registerSpaceMemberRemovalCleanup()
 		return register.Module{
 			Name: "friend",
 			SetupAPI: func() register.APIRouter {

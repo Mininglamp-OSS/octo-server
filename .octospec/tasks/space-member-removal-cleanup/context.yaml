@@ -68,3 +68,25 @@ security_notes:
   - Tests and examples use synthetic UIDs, Space IDs, and group numbers only.
   - Removal does not revoke sessions or erase message history; both are out of
     scope by design and must not be added opportunistically.
+
+# --- Implement phase: rules actually injected and read in full ---
+injected:
+  - id: space-isolation
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+  - id: trust-boundary
+    source: repo
+    applied: false
+    note: >
+      Matched via the wire-contract touches tag, read in full, and found not to
+      apply: the rule governs adapter/external-content escaping (markdown
+      injection, URL-destination breakout, adapter parity). This change adds no
+      adapter and renders no external content. Recorded rather than silently
+      dropped.
