@@ -30,9 +30,8 @@ co-member.
 
 After this change, a removal must:
 
-1. **Emit a durable removal event** — one event fired identically by all four
-   removal paths, so downstream modules can react without `modules/space`
-   importing them.
+1. **Emit a removal event** — one event fired identically by every removal path,
+   so downstream modules can react without `modules/space` importing them.
 2. **Invalidate membership caches immediately** — both the Redis
    `SpaceMiddleware` cache and the notify member cache, on every path.
 3. **Cascade the member out of every group in that Space** — full group-exit
@@ -58,6 +57,12 @@ still authorizes.
 | `POST /v1/space/:space_id/leave` | `modules/space/api.go:875` | same primitive, `rejectRoleAtOrAbove=2` |
 | `DELETE /v1/manager/spaces/:space_id/members` | `modules/space/api_manager.go:670` | `removeMembersForce` (`modules/space/db_manager.go:412`) |
 | `DELETE /v1/manager/spaces/:space_id` (force disband) | `modules/space/api_manager.go:325` | `forceDisbandSpace` (`modules/space/db_manager.go:201`) |
+| `DELETE /v1/space/:space_id` (owner disband) | `modules/space/api.go:583` | `disbandSpace` (`modules/space/db.go:62`) |
+
+The last row was missed in the original survey: `DB.disbandSpace` was a single
+`UPDATE space SET status=0` that left every `space_member` row active, so it did
+not even register as a removal path. It is the route an ordinary Space owner
+takes, and therefore the common one.
 
 All four write `space_member.status=0` and nothing else. `role` and `created_at`
 survive; `created_at` is deliberately never reset on rejoin
@@ -123,9 +128,16 @@ survive; `created_at` is deliberately never reset on rejoin
 
 ### Trigger
 
-- One event, fired by all four removal paths, carrying `(space_id, uid,
+- One event, fired by every removal path, carrying `(space_id, uid,
   operator_uid, reason)` where reason distinguishes kicked / left / force-removed
-  / space-disbanded.
+  / space-disbanded. There are **five** such paths, not four: the owner-initiated
+  `DELETE /v1/space/:space_id` was originally overlooked (it only flipped
+  `space.status`) and is the most common disband route, not the super-admin one.
+- The event is only persisted when a listener is registered. Writing a row costs
+  a transaction plus two more round-trips, and `handleEvent` marks it Success
+  even with no listeners; disbanding a large Space would spend tens of thousands
+  of DB operations on nobody. The extension point stays: registering a listener
+  starts delivery with no further change.
 - The event is persisted (`wkevent` table + `EventCommit`, following
   `fireSpaceMemberJoinEvent` at `modules/space/api.go:2207`) so a crash between
   the membership commit and the dispatch does not lose the cascade. **The event
@@ -156,18 +168,29 @@ survive; `created_at` is deliberately never reset on rejoin
 ### DM cutoff
 
 - **Peer set** = peers of the removed member's Person conversations
-  (`ctx.IMSyncUserConversation`) ∩ active members of the Space, narrowed by
-  `DMSpacePresenceSet(fakeIDs, spaceID)` to pairs that actually exchanged
-  messages in this Space. Build fake IDs with `common.GetFakeChannelIDWith`;
-  a `LIKE` scan over `dm_space_presence.fake_channel_id` is forbidden — the
-  column is a primary-key prefix with no index for substring search and the id
-  format is not a stable contract.
+  (`ctx.IMSyncUserConversation`) ∩ everyone who has **ever** had a
+  `space_member` row for this Space (`MembersEverInSpace`, deliberately
+  status-agnostic). The conversation list is itself the evidence that a DM
+  exists; the membership term only scopes it to this Space.
+  - Membership must **not** be filtered on `status=1`: cleanup always runs after
+    the member row is zeroed, and disband zeroes the Space row too, so an
+    "active member" predicate returns the empty set after a disband and whenever
+    two peers are removed in the same batch — the cutoff silently does nothing.
+  - `dm_space_presence` is **not** a gate. It is a best-effort, never-backfilled
+    index, written only for non-encrypted Person messages carrying a space id and
+    dropped on write failure; its own documentation tells readers to OR it with a
+    fallback so a missing row never hides a DM. As the sole gate it would let any
+    pair it missed escape the cleanup entirely.
 - **Condition**: for each peer, re-evaluate authorization *after* the removal
-  commits. Drop the whitelist entries only when the pair shares no remaining
-  active Space (`queryCoMemberUIDs`) **and** is not a friend pair. Peers who
-  still share another Space, or who are friends, keep their DM.
-- **Action**: symmetric `IMWhitelistRemove` on both Person channels, mirroring
-  `handleDeleteFriend`.
+  commits, **per direction**. X's Person-channel whitelist is
+  `friends(X, is_alone=0) ∪ coMembers(X)` — who may send *to* X — so the two
+  directions can differ under a one-sided friendship and must be judged
+  separately. A direction is cut only when the pair shares no remaining active
+  Space (`SharesActiveSpace`, same predicate as `queryCoMemberUIDs`) **and** that
+  side's whitelist no longer authorizes the sender. ORing the two directions
+  leaves a stale entry that nothing removes.
+- **Action**: `IMWhitelistRemove` on each Person channel whose direction was
+  revoked, mirroring `handleDeleteFriend`.
 - **Bot DMs** use the Space-prefixed channel form `s{spaceID}_{uid}`
   (`pkg/space/channel.go` `BuildChannelID`; see `modules/app_bot/app_bot.go:1139`)
   rather than the bare-uid channel used by human DMs. Both forms must be handled;
@@ -186,8 +209,9 @@ survive; `created_at` is deliberately never reset on rejoin
 - `pkg/space.InvalidateMembershipCache(redis, spaceID, uid)` on every removal
   path, before the event is emitted, so the removed member cannot slip through
   `SpaceMiddleware` in the interim.
-- `event.SpaceMemberCacheInvalidator(spaceID)` on **all four** paths, closing the
-  current manager-path gap.
+- `event.SpaceMemberCacheInvalidator(spaceID)` on **every** path, closing the
+  current manager-path gap. It is per-Space, so a batch invalidates once, not
+  once per member.
 - `event.SpaceMemberCacheInvalidator` clears only the calling process's notify
   cache; other replicas keep a stale entry until their own 60s TTL expires. That
   is accepted (notify only gates card/notification targeting, and the DB is
@@ -314,19 +338,51 @@ Consequently:
   exported but not mounted, so this is latent. Tracked separately.
 - **Reworking `SpaceMiddleware`'s TTL model** or making it a global mount. Only
   the missing invalidation call is added.
+- **Promoting a non-owner's bot to group creator.** A review round flagged
+  `QuerySecondOldestMemberExcludingBotsOf` for allowing it, but
+  `TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft` pins that as
+  deliberate ("他人的 bot 不在排除范围内"). Changing it would alter `groupExit`;
+  out of scope here.
 - **Fixing `modules/base/event`'s retry and multi-listener status semantics
   globally.** The `Fail`-is-terminal behavior and the non-incrementing
   `version_lock` affect every event in the repo; this task works within them
   (own retry record, `commit(nil)`) and does not change the shared bus. Worth a
   separate task.
 
+## Deviations from the original plan
+
+Recorded so the diff can be read against the spec rather than against memory.
+
+- **A fifth removal path.** The owner-initiated disband was not in the original
+  survey (see the path table). It now runs the same cascade.
+- **`dm_space_presence` demoted from gate to nothing.** The plan used it to
+  narrow the peer set; two review rounds showed that as the sole gate it lets any
+  pair the index missed escape the cleanup. Scoping is now conversation list ∩
+  ever-a-member.
+- **A batch cap on the user-facing endpoint (wire-visible).**
+  `POST /v1/space/:space_id/members/remove` had no limit while the manager
+  endpoint enforced `managerMaxBatchUIDs=200`; each uid costs a transaction, a
+  Redis DEL and an outbox row, so an unbounded list is a denial-of-service lever.
+  The same 200 cap now applies. **A client that previously sent more than 200
+  uids in one call will start receiving a batch-too-large error.**
+- **Retry envelope widened.** The plan said "attempts / next_attempt_at / lease"
+  without numbers. Shipped: 5-minute backoff cap, 20 attempts (~70 minutes),
+  10-minute lease. The lease is long because the group cascade genuinely runs for
+  minutes and an expired lease means concurrent re-execution, not just a lost
+  write.
+- **Terminal rows are purged.** Not in the plan; an hourly bounded delete keeps
+  the outbox and its pending index from growing without limit.
+
 ## Acceptance
 
 **Event and cache**
 
-- All four removal paths emit exactly one removal event per removed uid, after
-  the membership transaction commits, with the reason distinguishing kicked /
-  left / force-removed / space-disbanded.
+- Every removal path — including the owner-initiated
+  `DELETE /v1/space/:space_id` — zeroes the member rows, enqueues exactly one
+  cleanup job per removed uid inside the same transaction, and emits one removal
+  event per uid after commit, with the reason distinguishing kicked / left /
+  force-removed / space-disbanded.
+- With no listener registered, no event row is written at all.
 - A removal transaction that rolls back emits no event and performs no IM call.
 - After any removal path returns, a request from the removed member carrying
   that `space_id` is rejected by `SpaceMiddleware` on the next call — no 60s
@@ -362,8 +418,15 @@ Consequently:
   working.
 - Given a **bot** peer whose DM uses the `s{spaceID}_{uid}` channel form: the
   Space-prefixed channels are handled, not silently skipped.
-- Only peers with a `dm_space_presence` row for this Space are touched; the
-  implementation issues no `LIKE` query against `fake_channel_id`.
+- A peer with **no** `dm_space_presence` row is still cut when the relationship
+  no longer authorizes the DM: the presence index is best-effort and must not
+  gate the isolation cleanup. Peer scoping uses "ever a member of this Space",
+  and the implementation issues no `LIKE` query against `fake_channel_id`.
+- Cutting is per direction: under a one-sided friendship only the unauthorized
+  direction's whitelist entry is removed, and the authorized one is left intact.
+- After a force-disband, and when two peers are removed in the same batch, the
+  cutoff still runs — an "active member" predicate would return the empty set in
+  both cases and silently do nothing.
 - The Person `ChannelResp` reports the not-sendable state for a cut peer and the
   sendable state for a retained peer; the field is additive and `be_deleted` /
   `be_blacklist` keep their current meanings.
