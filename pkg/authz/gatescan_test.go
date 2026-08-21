@@ -73,6 +73,52 @@ func (m *Manager) handle(c interface{ CheckLoginRole() error }) { _ = c.CheckLog
 	}
 }
 
+func TestValidateRecognizedGateLocations(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "modules/example/api.go", `package example
+func allowed(c interface{ CheckLoginRole() error }) { _ = c.CheckLoginRole() }
+`)
+	writeFixture(t, root, "pkg/example/api_test.go", `package example
+func ignored(c interface{ CheckLoginRole() error }) { _ = c.CheckLoginRole() }
+`)
+	writeFixture(t, root, "internal/example/excluded.go", `//go:build never
+
+package example
+func excluded(c interface{ CheckLoginRole() error }) { _ = c.CheckLoginRole() }
+`)
+	for _, relative := range []string{".git/ignored.go", "vendor/ignored.go", "testdata/ignored.go"} {
+		writeFixture(t, root, relative, `package ignored
+func ignored(c interface{ CheckLoginRole() error }) { _ = c.CheckLoginRole() }
+`)
+	}
+	if err := ValidateRecognizedGateLocations(root); err != nil {
+		t.Fatalf("ValidateRecognizedGateLocations() error = %v", err)
+	}
+
+	tests := []struct {
+		name, relative, call string
+	}{
+		{"pkg admin", "pkg/example/api.go", "c.CheckLoginRole()"},
+		{"internal super admin", "internal/example/api.go", "c.CheckLoginRoleIsSuperAdmin()"},
+		{"cmd dashboard", "cmd/example/main.go", `auth.CanReadManagerDashboard("dashboardReader")`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixtureRoot := t.TempDir()
+			writeFixture(t, fixtureRoot, test.relative, "package example\nfunc rejected(c interface{}) { _ = "+test.call+" }\n")
+			err := ValidateRecognizedGateLocations(fixtureRoot)
+			if err == nil {
+				t.Fatal("ValidateRecognizedGateLocations() error = nil, want unsupported location")
+			}
+			for _, want := range []string{test.relative + ":2", "recognized gate", "outside modules"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("ValidateRecognizedGateLocations() error = %v, want %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateGateInventory(t *testing.T) {
 	scanned := []ScannedGate{{
 		Source: "modules/example/api.go::Manager.handle#1", Module: "example", Symbol: "Manager.handle", LegacyGate: LegacyGateAdmin, Line: 10,
@@ -102,6 +148,23 @@ func TestValidateGateInventory(t *testing.T) {
 				t.Fatalf("ValidateGateInventory() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestPlatformGatesFiltersBusinessOnlySources(t *testing.T) {
+	scanned := []ScannedGate{
+		{Source: "modules/example/api.go::Manager.platform#1"},
+		{Source: "modules/example/api.go::Manager.business#1"},
+	}
+	routes := []ScannedRoute{{
+		Method: "GET", Path: "/v1/manager/example", GateSites: []string{scanned[0].Source},
+	}}
+	got, err := PlatformGates(scanned, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Source != scanned[0].Source {
+		t.Fatalf("PlatformGates() = %#v, want only %s", got, scanned[0].Source)
 	}
 }
 

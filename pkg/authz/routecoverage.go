@@ -15,7 +15,10 @@ import (
 	"strings"
 )
 
-const unresolvedRoutePrefix = "\x00"
+const (
+	unresolvedRoutePrefix         = "\x00"
+	unresolvedPlatformRoutePrefix = "\x01"
+)
 
 // ScannedRoute is a statically registered HTTP route whose handler reaches one
 // or more direct legacy gates in the same package.
@@ -77,19 +80,56 @@ func ScanManagerRoutes(repositoryRoot string, gates []ScannedGate) ([]ScannedRou
 	return routes, nil
 }
 
-// ManagerRouteBoundaryExclusions returns the business-ACL routes that share an
-// App Bot handler with a platform route. Keeping the exact registrations here
-// makes a newly shared route fail until its boundary is reviewed explicitly.
+// ManagerRouteBoundaryExclusions is retained for callers of the original
+// coverage API. Business routes are now rejected by platform admission before
+// they become scanned routes, so the repository contract has no exclusions.
 func ManagerRouteBoundaryExclusions() []RouteBoundaryExclusion {
-	return []RouteBoundaryExclusion{
-		{Method: http.MethodGet, Path: "/v1/space/:space_id/app_bot/:id", Handler: "AppBot.getBotDetail", Reason: "Space-scoped App Bot read uses Space ACL"},
-		{Method: http.MethodPut, Path: "/v1/space/:space_id/app_bot/:id", Handler: "AppBot.updateBot", Reason: "Space-scoped App Bot update uses Space ACL"},
-		{Method: http.MethodDelete, Path: "/v1/space/:space_id/app_bot/:id", Handler: "AppBot.deleteBot", Reason: "Space-scoped App Bot delete uses Space ACL"},
-		{Method: http.MethodPost, Path: "/v1/space/:space_id/app_bot/:id/token", Handler: "AppBot.rotateToken", Reason: "Space-scoped App Bot token rotation uses Space ACL"},
-		{Method: http.MethodPost, Path: "/v1/space/:space_id/app_bot/:id/token/reveal", Handler: "AppBot.revealToken", Reason: "Space-scoped App Bot token reveal uses Space ACL"},
-		{Method: http.MethodPost, Path: "/v1/space/:space_id/app_bot/:id/publish", Handler: "AppBot.publishBot", Reason: "Space-scoped App Bot publishing uses Space ACL"},
-		{Method: http.MethodPost, Path: "/v1/space/:space_id/app_bot/:id/unpublish", Handler: "AppBot.unpublishBot", Reason: "Space-scoped App Bot unpublishing uses Space ACL"},
+	return nil
+}
+
+func isPlatformOperationRoute(method, routePath, handler string) bool {
+	if routePath == "/v1/manager/me" || routePath == "/v1/manager/secrets" || strings.HasPrefix(routePath, "/v1/manager/secrets/") {
+		return false
 	}
+	if routePath == "/v1/manager" || strings.HasPrefix(routePath, "/v1/manager/") {
+		return true
+	}
+	if routePath == "/v1/admin/app_bot" || strings.HasPrefix(routePath, "/v1/admin/app_bot/") {
+		return true
+	}
+	if routePath == "/v1/common/appversion" || strings.HasPrefix(routePath, "/v1/common/appversion/") {
+		return true
+	}
+	return method == http.MethodPost && routePath == "/v1/users/:uid/avatar" && handler == "User.uploadAvatar"
+}
+
+func platformCandidatePrefix(prefix string) bool {
+	if prefix == unresolvedPlatformRoutePrefix {
+		return true
+	}
+	if prefix == unresolvedRoutePrefix {
+		return false
+	}
+	if prefix == "/v1/manager/secrets" || strings.HasPrefix(prefix, "/v1/manager/secrets/") {
+		return false
+	}
+	return prefix == "/v1/manager" || strings.HasPrefix(prefix, "/v1/manager/") ||
+		prefix == "/v1/admin/app_bot" || strings.HasPrefix(prefix, "/v1/admin/app_bot/") ||
+		prefix == "/v1/common/appversion" || strings.HasPrefix(prefix, "/v1/common/appversion/")
+}
+
+func platformGateSites(method, routePath, handler string, gateSites []string) []string {
+	result := append([]string(nil), gateSites...)
+	if method != http.MethodPost || routePath != "/v1/users/:uid/avatar" || handler != "User.uploadAvatar" {
+		return result
+	}
+	result = result[:0]
+	for _, source := range gateSites {
+		if source == "modules/user/api.go::User.uploadAvatar#1" {
+			result = append(result, source)
+		}
+	}
+	return result
 }
 
 // ValidateRouteCoverage compares source-derived gated routes with the global
@@ -278,11 +318,12 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 	}
 
 	module := moduleFromRelativePath(filepath.ToSlash(relativeDirectory) + "/placeholder.go")
+	platformDelegates := platformDelegatedFunctions(routeFunctions, functions)
 	routeSymbols := make(map[string]struct{}, len(routeFunctions))
 	var routes []ScannedRoute
 	for _, function := range routeFunctions {
 		routeSymbols[function.symbol] = struct{}{}
-		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true)
+		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true, false)
 		if err != nil {
 			return nil, err
 		}
@@ -297,11 +338,82 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 		if _, isRoute := routeSymbols[symbol]; isRoute {
 			continue
 		}
-		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false); err != nil {
+		_, platformContext := platformDelegates[symbol]
+		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false, platformContext); err != nil {
 			return nil, err
 		}
 	}
 	return routes, nil
+}
+
+func platformDelegatedFunctions(routeFunctions []scannedFunction, functions map[string]scannedFunction) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, function := range routeFunctions {
+		prefixes := make(map[string]string)
+		for _, field := range function.parameters {
+			for _, name := range field.Names {
+				prefixes[name.Name] = ""
+			}
+		}
+		aliases := receiverAliasSet(function)
+		ast.Inspect(function.body, func(node ast.Node) bool {
+			if assignment, ok := node.(*ast.AssignStmt); ok {
+				registerGroupPrefixes(assignment, prefixes)
+			}
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			target := calledFunctionSymbol(call.Fun, aliases, function.receiverType, functions)
+			if target == "" {
+				return true
+			}
+			for _, argument := range call.Args {
+				identifier, ok := argument.(*ast.Ident)
+				if ok && platformCandidatePrefix(prefixes[identifier.Name]) {
+					result[target] = struct{}{}
+					break
+				}
+			}
+			return true
+		})
+	}
+
+	edges := buildPackageCallGraph(functions)
+	for changed := true; changed; {
+		changed = false
+		for source := range result {
+			for _, target := range edges[source] {
+				if _, exists := result[target]; !exists {
+					result[target] = struct{}{}
+					changed = true
+				}
+			}
+		}
+	}
+	return result
+}
+
+func calledFunctionSymbol(expression ast.Expr, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction) string {
+	switch called := expression.(type) {
+	case *ast.SelectorExpr:
+		identifier, ok := called.X.(*ast.Ident)
+		if !ok {
+			return ""
+		}
+		if _, ok := receiverAliases[identifier.Name]; !ok {
+			return ""
+		}
+		target := receiverType + "." + called.Sel.Name
+		if _, exists := functions[target]; exists {
+			return target
+		}
+	case *ast.Ident:
+		if _, exists := functions[called.Name]; exists {
+			return called.Name
+		}
+	}
+	return ""
 }
 
 func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]string {
@@ -340,7 +452,7 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 	return edges
 }
 
-func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration bool) ([]ScannedRoute, error) {
+func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration, platformContext bool) ([]ScannedRoute, error) {
 	prefixes := make(map[string]string)
 	receiverAliases := receiverAliasSet(function)
 	for _, field := range function.parameters {
@@ -356,34 +468,72 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 			return false
 		}
 		if assignment, ok := node.(*ast.AssignStmt); ok {
-			if assignmentHasGatedGroupMiddleware(assignment, receiverAliases, function.receiverType, functions, reachable) {
+			gatedPlatformGroup := assignmentHasGatedGroupMiddleware(assignment, prefixes, receiverAliases, function.receiverType, functions, reachable)
+			registerGroupPrefixes(assignment, prefixes)
+			if gatedPlatformGroup {
 				position := fset.Position(assignment.Pos())
 				scanErr = fmt.Errorf("%s:%d: gated group middleware is not supported", function.file, position.Line)
 				return false
 			}
-			registerGroupPrefixes(assignment, prefixes)
 		}
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || !isHTTPMethod(selector.Sel.Name) || len(call.Args) < 2 {
+		if !ok {
+			return true
+		}
+		position := fset.Position(call.Pos())
+		base, baseOK := selector.X.(*ast.Ident)
+		prefix := unresolvedRoutePrefix
+		prefixOK := false
+		if baseOK {
+			prefix, prefixOK = prefixes[base.Name]
+		}
+		routePath := ""
+		pathOK := false
+		if len(call.Args) > 0 {
+			routePath, pathOK = stringLiteral(call.Args[0])
+		}
+		fullPath := ""
+		if prefixOK && prefix != unresolvedRoutePrefix && prefix != unresolvedPlatformRoutePrefix && pathOK {
+			fullPath = joinRoutePath(prefix, routePath)
+		}
+		platformCandidate := platformContext || platformCandidatePrefix(prefix) || expressionContainsPlatformPrefix(selector.X)
+		platformShape := platformCandidate
+		if fullPath != "" {
+			platformShape = isPlatformOperationRoute(selector.Sel.Name, fullPath, "")
+		}
+		if !isHTTPMethod(selector.Sel.Name) {
+			if selector.Sel.Name != "Group" && len(call.Args) >= 2 && platformShape {
+				scanErr = fmt.Errorf("%s:%d: unsupported route registration verb %s", function.file, position.Line, selector.Sel.Name)
+				return false
+			}
+			return true
+		}
+		if len(call.Args) < 2 {
+			return true
+		}
+
+		handlerExpression := call.Args[len(call.Args)-1]
+		handler, handlerOK := routeHandlerSymbol(handlerExpression, receiverAliases, function.receiverType, functions)
+		platformRoute := handlerOK && fullPath != "" && isPlatformOperationRoute(selector.Sel.Name, fullPath, handler)
+		if handlerOK && fullPath != "" && !platformRoute && !platformContext {
 			return true
 		}
 		for _, middlewareExpression := range call.Args[1 : len(call.Args)-1] {
 			if expressionMentionsGatedHandler(middlewareExpression, receiverAliases, function.receiverType, functions, reachable) || expressionContainsRecognizedGate(middlewareExpression) {
-				position := fset.Position(call.Pos())
-				scanErr = fmt.Errorf("%s:%d: gated middleware before route handler is not supported", function.file, position.Line)
-				return false
+				if platformRoute || platformCandidate {
+					scanErr = fmt.Errorf("%s:%d: gated middleware before route handler is not supported", function.file, position.Line)
+					return false
+				}
+				return true
 			}
 		}
-		handlerExpression := call.Args[len(call.Args)-1]
-		handler, ok := routeHandlerSymbol(handlerExpression, receiverAliases, function.receiverType, functions)
-		if !ok {
-			if expressionMentionsGatedHandler(handlerExpression, receiverAliases, function.receiverType, functions, reachable) || expressionContainsRecognizedGate(handlerExpression) {
-				position := fset.Position(call.Pos())
-				scanErr = fmt.Errorf("%s:%d: cannot resolve route handler that may reach a direct gate", function.file, position.Line)
+		if !handlerOK {
+			if platformShape {
+				scanErr = fmt.Errorf("%s:%d: cannot resolve route handler for platform route", function.file, position.Line)
 				return false
 			}
 			return true
@@ -392,40 +542,54 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 		if len(gateSites) == 0 {
 			return true
 		}
-		position := fset.Position(call.Pos())
 		if !allowRegistration {
-			scanErr = fmt.Errorf("%s:%d: gated route registration outside Route is not supported", function.file, position.Line)
-			return false
+			if platformContext || platformRoute {
+				scanErr = fmt.Errorf("%s:%d: gated route registration outside Route is not supported", function.file, position.Line)
+				return false
+			}
+			return true
 		}
-		base, ok := selector.X.(*ast.Ident)
-		if !ok {
-			scanErr = fmt.Errorf("%s:%d: cannot resolve route base for gated handler %s", function.file, position.Line, handler)
-			return false
+		if !baseOK {
+			if platformCandidate {
+				scanErr = fmt.Errorf("%s:%d: cannot resolve route base for gated handler %s", function.file, position.Line, handler)
+				return false
+			}
+			return true
 		}
-		prefix, ok := prefixes[base.Name]
-		if !ok {
-			scanErr = fmt.Errorf("%s:%d: cannot resolve route prefix variable %s for gated handler %s", function.file, position.Line, base.Name, handler)
-			return false
+		if !prefixOK {
+			if platformCandidate {
+				scanErr = fmt.Errorf("%s:%d: cannot resolve route prefix variable %s for gated handler %s", function.file, position.Line, base.Name, handler)
+				return false
+			}
+			return true
 		}
-		routePath, ok := stringLiteral(call.Args[0])
-		if !ok {
-			scanErr = fmt.Errorf("%s:%d: cannot resolve route path for gated handler %s", function.file, position.Line, handler)
-			return false
+		if !pathOK {
+			if platformCandidate {
+				scanErr = fmt.Errorf("%s:%d: cannot resolve route path for gated handler %s", function.file, position.Line, handler)
+				return false
+			}
+			return true
 		}
-		if prefix == unresolvedRoutePrefix {
-			scanErr = fmt.Errorf("%s:%d: cannot resolve route group prefix for gated handler %s", function.file, position.Line, handler)
-			return false
+		if prefix == unresolvedRoutePrefix || prefix == unresolvedPlatformRoutePrefix {
+			if platformCandidate {
+				scanErr = fmt.Errorf("%s:%d: cannot resolve route group prefix for gated handler %s", function.file, position.Line, handler)
+				return false
+			}
+			return true
+		}
+		if !platformRoute {
+			return true
 		}
 		routes = append(routes, ScannedRoute{
-			Method: selector.Sel.Name, Path: joinRoutePath(prefix, routePath), Module: module,
-			Handler: handler, GateSites: append([]string(nil), gateSites...), Source: function.file, Line: position.Line,
+			Method: selector.Sel.Name, Path: fullPath, Module: module,
+			Handler: handler, GateSites: platformGateSites(selector.Sel.Name, fullPath, handler, gateSites), Source: function.file, Line: position.Line,
 		})
 		return true
 	})
 	return routes, scanErr
 }
 
-func assignmentHasGatedGroupMiddleware(assignment *ast.AssignStmt, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction, reachable map[string][]string) bool {
+func assignmentHasGatedGroupMiddleware(assignment *ast.AssignStmt, prefixes map[string]string, receiverAliases map[string]struct{}, receiverType string, functions map[string]scannedFunction, reachable map[string][]string) bool {
 	for _, expression := range assignment.Rhs {
 		call, ok := expression.(*ast.CallExpr)
 		if !ok || len(call.Args) < 2 {
@@ -435,13 +599,40 @@ func assignmentHasGatedGroupMiddleware(assignment *ast.AssignStmt, receiverAlias
 		if !ok || selector.Sel.Name != "Group" {
 			continue
 		}
+		base, baseOK := selector.X.(*ast.Ident)
+		prefix := unresolvedRoutePrefix
+		if baseOK {
+			prefix = prefixes[base.Name]
+		}
+		part, partOK := stringLiteral(call.Args[0])
+		platformGroup := platformCandidatePrefix(prefix) || expressionContainsPlatformPrefix(selector.X)
+		if partOK && prefix != unresolvedRoutePrefix && prefix != unresolvedPlatformRoutePrefix {
+			platformGroup = platformCandidatePrefix(joinRoutePath(prefix, part))
+		}
 		for _, middleware := range call.Args[1:] {
-			if expressionMentionsGatedHandler(middleware, receiverAliases, receiverType, functions, reachable) || expressionContainsRecognizedGate(middleware) {
+			if platformGroup && (expressionMentionsGatedHandler(middleware, receiverAliases, receiverType, functions, reachable) || expressionContainsRecognizedGate(middleware)) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func expressionContainsPlatformPrefix(expression ast.Expr) bool {
+	found := false
+	ast.Inspect(expression, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		value, err := strconv.Unquote(literal.Value)
+		if err == nil && platformCandidatePrefix(pathpkg.Clean(value)) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func registerGroupPrefixes(assignment *ast.AssignStmt, prefixes map[string]string) {
@@ -466,13 +657,21 @@ func registerGroupPrefixes(assignment *ast.AssignStmt, prefixes map[string]strin
 			continue
 		}
 		prefix, exists := prefixes[base.Name]
+		part, partOK := stringLiteral(call.Args[0])
 		if !exists {
-			prefixes[name.Name] = unresolvedRoutePrefix
+			if partOK && platformCandidatePrefix(pathpkg.Clean(part)) {
+				prefixes[name.Name] = unresolvedPlatformRoutePrefix
+			} else {
+				prefixes[name.Name] = unresolvedRoutePrefix
+			}
 			continue
 		}
-		part, ok := stringLiteral(call.Args[0])
-		if !ok || prefix == unresolvedRoutePrefix {
-			prefixes[name.Name] = unresolvedRoutePrefix
+		if !partOK || prefix == unresolvedRoutePrefix || prefix == unresolvedPlatformRoutePrefix {
+			if platformCandidatePrefix(prefix) {
+				prefixes[name.Name] = unresolvedPlatformRoutePrefix
+			} else {
+				prefixes[name.Name] = unresolvedRoutePrefix
+			}
 			continue
 		}
 		prefixes[name.Name] = joinRoutePath(prefix, part)

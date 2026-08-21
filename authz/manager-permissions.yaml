@@ -1,8 +1,9 @@
-# Coverage boundary: this contract verifies routes that reach a recognized
-# manager gate: CheckLoginRole, CheckLoginRoleIsSuperAdmin, or
-# CanReadManagerDashboard. It does not discover a brand-new route that contains
-# no recognized gate.
-# Pure Space/Group/Robot business ACL routes remain outside this contract.
+# Coverage boundary: this contract starts from reviewed octo-admin platform
+# operations, then traces their CheckLoginRole, CheckLoginRoleIsSuperAdmin, or
+# CanReadManagerDashboard gate sites. A matching gate shape alone never admits a
+# route. Pure Space/Group/Robot business ACL routes, user-owned
+# /v1/manager/secrets/** routes, and legacy /v1/statistics/** routes remain
+# outside this contract.
 # GET /v1/manager/me is a legacy identity/capability projection guarded by
 # IsManagerConsoleRole, not a fine-grained global-management operation. Its
 # admission policy and capability keys are covered by compatibility tests.
@@ -345,11 +346,6 @@ permissions:
     action: write
     description: "审批 Space 加入申请"
     sensitivity: elevated
-  - key: statistics.read
-    resource: statistics
-    action: read
-    description: "查看全局统计数据"
-    sensitivity: standard
   - key: user.read
     resource: user
     action: read
@@ -419,6 +415,11 @@ permissions:
     resource: workplace_app
     action: write
     description: "维护工作台应用"
+    sensitivity: elevated
+  - key: workplace.category_app.reorder
+    resource: workplace_category_app
+    action: reorder
+    description: "调整工作台分类应用顺序"
     sensitivity: elevated
   - key: workplace.banner.read
     resource: workplace_banner
@@ -719,10 +720,6 @@ gate_sites:
     module: common
     symbol: Manager.updateSystemSettings
     legacy_gate: super_admin
-  - source: modules/group/api.go::Group.memberRemove#1
-    module: group
-    symbol: Group.memberRemove
-    legacy_gate: admin
   - source: modules/group/api_manager.go::Manager.blacklist#1
     module: group
     symbol: Manager.blacklist
@@ -847,23 +844,7 @@ gate_sites:
     module: space
     symbol: Manager.requireSuperAdmin
     legacy_gate: super_admin
-  - source: modules/statistics/api.go::Statistics.countNum#1
-    module: statistics
-    symbol: Statistics.countNum
-    legacy_gate: admin
-  - source: modules/statistics/api.go::Statistics.createGroupWithDateSpace#1
-    module: statistics
-    symbol: Statistics.createGroupWithDateSpace
-    legacy_gate: admin
-  - source: modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1
-    module: statistics
-    symbol: Statistics.registerUserListWithDateSpace
-    legacy_gate: admin
   - source: modules/user/api.go::User.uploadAvatar#1
-    module: user
-    symbol: User.uploadAvatar
-    legacy_gate: super_admin
-  - source: modules/user/api.go::User.uploadAvatar#2
     module: user
     symbol: User.uploadAvatar
     legacy_gate: super_admin
@@ -1386,30 +1367,6 @@ operations:
     gate_sites:
       - modules/group/api_manager.go::Manager.removeMember#1
     scope: global_admin
-  - id: group.member.remove
-    method: DELETE
-    path: /v1/groups/:group_no/members
-    module: group
-    handler: Group.memberRemove
-    permission: group.member.remove
-    gate_sites:
-      - modules/group/api.go::Group.memberRemove#1
-    scope: global_admin_with_business_acl
-    business_acl:
-      type: group_owner_or_manager
-      description: "非全局管理员时继续执行群主或群管理员业务 ACL"
-  - id: group.member.remove_legacy
-    method: POST
-    path: /v1/groups/:group_no/members_delete
-    module: group
-    handler: Group.memberRemove
-    permission: group.member.remove
-    gate_sites:
-      - modules/group/api.go::Group.memberRemove#1
-    scope: global_admin_with_business_acl
-    business_acl:
-      type: group_owner_or_manager
-      description: "非全局管理员时继续执行群主或群管理员业务 ACL"
   - id: integration.oidc_client.update
     method: PUT
     path: /v1/manager/integrations/oidc/client
@@ -1842,33 +1799,6 @@ operations:
     gate_sites:
       - modules/space/api_manager.go::Manager.requireAdmin#1
     scope: global_admin
-  - id: statistics.overview
-    method: GET
-    path: /v1/statistics/countnum
-    module: statistics
-    handler: Statistics.countNum
-    permission: statistics.read
-    gate_sites:
-      - modules/statistics/api.go::Statistics.countNum#1
-    scope: global_admin
-  - id: statistics.user_registration
-    method: GET
-    path: /v1/statistics/registeruser/:start_date/:end_date
-    module: statistics
-    handler: Statistics.registerUserListWithDateSpace
-    permission: statistics.read
-    gate_sites:
-      - modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1
-    scope: global_admin
-  - id: statistics.group_creation
-    method: GET
-    path: /v1/statistics/createdgroup/:start_date/:end_date
-    module: statistics
-    handler: Statistics.createGroupWithDateSpace
-    permission: statistics.read
-    gate_sites:
-      - modules/statistics/api.go::Statistics.createGroupWithDateSpace#1
-    scope: global_admin
   - id: user.admin.create
     method: POST
     path: /v1/manager/user/admin
@@ -2066,7 +1996,6 @@ operations:
     permission: app_bot.avatar.update
     gate_sites:
       - modules/user/api.go::User.uploadAvatar#1
-      - modules/user/api.go::User.uploadAvatar#2
     scope: global_admin_with_business_acl
     business_acl:
       type: self_or_user_bot_creator_or_bot_owner_or_space_admin
@@ -2130,7 +2059,7 @@ operations:
     path: /v1/manager/workplace/categorys/:category_no/app/reorder
     module: workplace
     handler: manager.reorderCategoryApp
-    permission: workplace.app.write
+    permission: workplace.category_app.reorder
     gate_sites:
       - modules/workplace/api_manager.go::manager.reorderCategoryApp#1
     scope: global_admin

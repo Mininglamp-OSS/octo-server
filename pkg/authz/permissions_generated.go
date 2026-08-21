@@ -76,7 +76,6 @@ const (
 	PermissionSpaceRead                       = "space.read"
 	PermissionSpaceStatusWrite                = "space.status.write"
 	PermissionSpaceUpdate                     = "space.update"
-	PermissionStatisticsRead                  = "statistics.read"
 	PermissionSystemSettingRead               = "system_setting.read"
 	PermissionSystemSettingWrite              = "system_setting.write"
 	PermissionUserAdminManage                 = "user.admin.manage"
@@ -95,6 +94,7 @@ const (
 	PermissionWorkplaceBannerWrite            = "workplace.banner.write"
 	PermissionWorkplaceCategoryRead           = "workplace.category.read"
 	PermissionWorkplaceCategoryWrite          = "workplace.category.write"
+	PermissionWorkplaceCategoryAppReorder     = "workplace.category_app.reorder"
 )
 
 type GeneratedPermissionMetadata struct {
@@ -176,7 +176,6 @@ var GeneratedPermissions = map[string]GeneratedPermissionMetadata{
 	"space.read":                          {Resource: "space", Action: "read", Description: "查看全局 Space 信息", Sensitivity: "standard"},
 	"space.status.write":                  {Resource: "space", Action: "status_write", Description: "封禁或解禁 Space", Sensitivity: "critical"},
 	"space.update":                        {Resource: "space", Action: "update", Description: "修改 Space 基础信息", Sensitivity: "elevated"},
-	"statistics.read":                     {Resource: "statistics", Action: "read", Description: "查看全局统计数据", Sensitivity: "standard"},
 	"system_setting.read":                 {Resource: "system_setting", Action: "read", Description: "查看系统设置", Sensitivity: "elevated"},
 	"system_setting.write":                {Resource: "system_setting", Action: "write", Description: "修改或测试系统设置", Sensitivity: "critical"},
 	"user.admin.manage":                   {Resource: "admin_user", Action: "manage", Description: "管理管理员账号", Sensitivity: "critical"},
@@ -195,6 +194,7 @@ var GeneratedPermissions = map[string]GeneratedPermissionMetadata{
 	"workplace.banner.write":              {Resource: "workplace_banner", Action: "write", Description: "维护工作台横幅", Sensitivity: "elevated"},
 	"workplace.category.read":             {Resource: "workplace_category", Action: "read", Description: "查看工作台分类", Sensitivity: "standard"},
 	"workplace.category.write":            {Resource: "workplace_category", Action: "write", Description: "维护工作台分类", Sensitivity: "elevated"},
+	"workplace.category_app.reorder":      {Resource: "workplace_category_app", Action: "reorder", Description: "调整工作台分类应用顺序", Sensitivity: "elevated"},
 }
 
 func IsKnownPermission(key string) bool {

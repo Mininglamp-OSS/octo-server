@@ -20,6 +20,73 @@ type ScannedGate struct {
 	Line       int
 }
 
+// ValidateRecognizedGateLocations rejects gate calls outside the top-level
+// modules directory. Such calls are not added to the platform inventory because
+// the route scanner cannot prove their operation relationships.
+func ValidateRecognizedGateLocations(repositoryRoot string) error {
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "vendor", "testdata":
+				if path != repositoryRoot {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		matches, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if err != nil {
+			return fmt.Errorf("match build constraints for %s: %w", path, err)
+		}
+		if !matches {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return fmt.Errorf("relative path for %s: %w", path, err)
+		}
+		relative = filepath.ToSlash(relative)
+		if strings.HasPrefix(relative, "modules/") {
+			return nil
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		var locationErr error
+		ast.Inspect(file, func(node ast.Node) bool {
+			if locationErr != nil {
+				return false
+			}
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if _, ok := directGate(selector.Sel.Name); !ok {
+				return true
+			}
+			locationErr = fmt.Errorf("%s:%d: recognized gate %s is outside modules/", relative, fset.Position(call.Pos()).Line, selector.Sel.Name)
+			return false
+		})
+		return locationErr
+	})
+	if err != nil {
+		return fmt.Errorf("validate recognized gate locations: %w", err)
+	}
+	return nil
+}
+
 func ScanDirectGates(repositoryRoot string) ([]ScannedGate, error) {
 	modulesRoot := filepath.Join(repositoryRoot, "modules")
 	fset := token.NewFileSet()
@@ -119,6 +186,32 @@ func ValidateGateInventory(scanned []ScannedGate, declared []GateSite) error {
 		}
 	}
 	return nil
+}
+
+// PlatformGates returns only source gates reached by admitted octo-admin
+// operations. Direct gates that serve business ACL routes remain visible to the
+// source scanner but are outside this contract.
+func PlatformGates(scanned []ScannedGate, routes []ScannedRoute) ([]ScannedGate, error) {
+	bySource := make(map[string]ScannedGate, len(scanned))
+	for _, gate := range scanned {
+		bySource[gate.Source] = gate
+	}
+	referenced := make(map[string]struct{})
+	for _, route := range routes {
+		for _, source := range route.GateSites {
+			if _, exists := bySource[source]; !exists {
+				return nil, fmt.Errorf("route %s %s references unscanned gate %q", route.Method, route.Path, source)
+			}
+			referenced[source] = struct{}{}
+		}
+	}
+	result := make([]ScannedGate, 0, len(referenced))
+	for _, gate := range scanned {
+		if _, exists := referenced[gate.Source]; exists {
+			result = append(result, gate)
+		}
+	}
+	return result, nil
 }
 
 func directGate(name string) (LegacyGate, bool) {

@@ -23,16 +23,23 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if err := ValidateCriticalPermissions(manifest); err != nil {
 		t.Fatalf("ValidateCriticalPermissions() error = %v", err)
 	}
+	if err := ValidateRecognizedGateLocations(root); err != nil {
+		t.Fatalf("ValidateRecognizedGateLocations() error = %v", err)
+	}
 	scanned, err := ScanDirectGates(root)
 	if err != nil {
 		t.Fatalf("ScanDirectGates() error = %v", err)
 	}
-	if err := ValidateGateInventory(scanned, manifest.GateSites); err != nil {
-		t.Fatalf("ValidateGateInventory() error = %v", err)
-	}
 	routes, err := ScanManagerRoutes(root, scanned)
 	if err != nil {
 		t.Fatalf("ScanManagerRoutes() error = %v", err)
+	}
+	platformGates, err := PlatformGates(scanned, routes)
+	if err != nil {
+		t.Fatalf("PlatformGates() error = %v", err)
+	}
+	if err := ValidateGateInventory(platformGates, manifest.GateSites); err != nil {
+		t.Fatalf("ValidateGateInventory() error = %v", err)
 	}
 	if err := ValidateRouteCoverage(routes, manifest.Operations, ManagerRouteBoundaryExclusions()); err != nil {
 		t.Fatalf("ValidateRouteCoverage() error = %v", err)
@@ -43,24 +50,25 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	if got, want := len(manifest.LegacyCapabilities), 20; got != want {
 		t.Fatalf("legacy capability count = %d, want %d", got, want)
 	}
-	if got, want := len(manifest.Operations), 135; got != want {
+	if got, want := len(manifest.Operations), 130; got != want {
 		t.Fatalf("global operation count = %d, want %d", got, want)
 	}
-	if got, want := len(routes), len(manifest.Operations)+len(ManagerRouteBoundaryExclusions()); got != want {
-		t.Fatalf("source gated route count = %d, want %d global operations + %d boundary exclusions", got, len(manifest.Operations), len(ManagerRouteBoundaryExclusions()))
+	if got, want := len(routes), len(manifest.Operations); got != want {
+		t.Fatalf("source platform route count = %d, want %d global operations", got, want)
 	}
 	assertSourceRouteBoundaries(t, routes)
+	if got, want := len(platformGates), 96; got != want {
+		t.Fatalf("platform gate count = %d, want %d", got, want)
+	}
+	if got, want := len(manifest.GateSites), 96; got != want {
+		t.Fatalf("manifest gate count = %d, want %d", got, want)
+	}
 	if got, want := len(scanned), 101; got != want {
-		t.Fatalf("recognized manager gate count = %d, want %d", got, want)
+		t.Fatalf("recognized source gate count = %d, want %d including 5 excluded business gates", got, want)
 	}
-	files := make(map[string]struct{})
 	moduleCounts := make(map[string]int)
-	for _, gate := range scanned {
-		files[sourceFile(gate.Source)] = struct{}{}
+	for _, gate := range platformGates {
 		moduleCounts[gate.Module]++
-	}
-	if got, want := len(files), 18; got != want {
-		t.Fatalf("direct gate file count = %d, want %d", got, want)
 	}
 	for module, want := range map[string]int{"workplace": 18, "message": 10, "app_bot": 9, "robot": 8} {
 		if got := moduleCounts[module]; got != want {
@@ -68,11 +76,11 @@ func TestRepositoryPermissionContract(t *testing.T) {
 		}
 	}
 	gateKinds := make(map[LegacyGate]int)
-	for _, gate := range scanned {
+	for _, gate := range platformGates {
 		gateKinds[gate.LegacyGate]++
 	}
-	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 100 || gateKinds[LegacyGateDashboardReadPolicy] != 1 {
-		t.Fatalf("manager gate kinds = %#v, want 100 direct legacy and 1 dashboard-read-policy gate", gateKinds)
+	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 95 || gateKinds[LegacyGateDashboardReadPolicy] != 1 {
+		t.Fatalf("platform gate kinds = %#v, want 95 direct legacy and 1 dashboard-read-policy gate", gateKinds)
 	}
 	assertGlobalOperationBoundary(t, manifest)
 	assertSensitiveTaxonomy(t, manifest)
@@ -84,35 +92,22 @@ func assertSourceRouteBoundaries(t *testing.T, routes []ScannedRoute) {
 	t.Helper()
 	routeByKey := make(map[string]ScannedRoute, len(routes))
 	platformAppBot := 0
-	spaceAppBot := 0
 	for _, route := range routes {
 		routeByKey[httpRouteKey(route.Method, route.Path)] = route
 		if strings.HasPrefix(route.Path, "/v1/admin/app_bot") {
 			platformAppBot++
 		}
-		if strings.HasPrefix(route.Path, "/v1/space/:space_id/app_bot/") {
-			spaceAppBot++
+		if strings.HasPrefix(route.Path, "/v1/groups/") || strings.HasPrefix(route.Path, "/v1/space/") ||
+			strings.HasPrefix(route.Path, "/v1/statistics/") || strings.HasPrefix(route.Path, "/v1/manager/secrets/") {
+			t.Errorf("non-platform route entered source inventory: %s %s", route.Method, route.Path)
 		}
 	}
-	if platformAppBot != 9 || spaceAppBot != 7 {
-		t.Fatalf("App Bot gated source routes: platform=%d space-boundary=%d, want 9 and 7", platformAppBot, spaceAppBot)
-	}
-	for key, handler := range map[string]string{
-		httpRouteKey("DELETE", "/v1/groups/:group_no/members"):      "Group.memberRemove",
-		httpRouteKey("POST", "/v1/groups/:group_no/members_delete"): "Group.memberRemove",
-	} {
-		if route, ok := routeByKey[key]; !ok || route.Handler != handler {
-			t.Errorf("mixed Group route %q = %#v, want handler %s", key, route, handler)
-		}
+	if platformAppBot != 9 {
+		t.Fatalf("platform App Bot gated source routes = %d, want 9", platformAppBot)
 	}
 	avatar, ok := routeByKey[httpRouteKey("POST", "/v1/users/:uid/avatar")]
-	if !ok || avatar.Handler != "User.uploadAvatar" || len(avatar.GateSites) != 2 {
-		t.Errorf("mixed App Bot avatar route = %#v, want User.uploadAvatar with two gate sites", avatar)
-	}
-	for _, exclusion := range ManagerRouteBoundaryExclusions() {
-		if route, ok := routeByKey[httpRouteKey(exclusion.Method, exclusion.Path)]; !ok || route.Handler != exclusion.Handler {
-			t.Errorf("boundary exclusion has no exact source route: %#v", exclusion)
-		}
+	if !ok || avatar.Handler != "User.uploadAvatar" || len(avatar.GateSites) != 1 || avatar.GateSites[0] != "modules/user/api.go::User.uploadAvatar#1" {
+		t.Errorf("platform App Bot avatar route = %#v, want only User.uploadAvatar#1", avatar)
 	}
 }
 
@@ -131,9 +126,11 @@ func assertGlobalOperationBoundary(t *testing.T, manifest *Manifest) {
 		if strings.HasPrefix(operation.Path, "/v1/robot/") {
 			t.Errorf("pure Robot business route entered global contract: %s", operation.Path)
 		}
-		if strings.HasPrefix(operation.Path, "/v1/groups/") &&
-			operation.ID != "group.member.remove" && operation.ID != "group.member.remove_legacy" {
+		if strings.HasPrefix(operation.Path, "/v1/groups/") {
 			t.Errorf("pure Group ACL route entered global contract: %s", operation.Path)
+		}
+		if strings.HasPrefix(operation.Path, "/v1/statistics/") || strings.HasPrefix(operation.Path, "/v1/manager/secrets/") {
+			t.Errorf("excluded route entered global contract: %s", operation.Path)
 		}
 		if strings.HasPrefix(operation.Path, "/v1/admin/app_bot") {
 			platformAppBotCount++
@@ -142,15 +139,14 @@ func assertGlobalOperationBoundary(t *testing.T, manifest *Manifest) {
 	if platformAppBotCount != 9 {
 		t.Errorf("platform App Bot operation count = %d, want 9", platformAppBotCount)
 	}
-	for _, id := range []string{"group.member.remove", "group.member.remove_legacy", "app_bot.avatar.update"} {
-		operation, ok := operationByID[id]
-		if !ok {
-			t.Errorf("missing mixed global operation %q", id)
-			continue
+	for _, id := range []string{"group.member.remove", "group.member.remove_legacy", "statistics.overview", "statistics.user_registration", "statistics.group_creation"} {
+		if _, exists := operationByID[id]; exists {
+			t.Errorf("excluded operation %q remains in global inventory", id)
 		}
-		if operation.Scope != ScopeGlobalAdminWithBusinessACL || operation.BusinessACL == nil {
-			t.Errorf("operation %q must declare business ACL fallback metadata", id)
-		}
+	}
+	avatar := operationByID["app_bot.avatar.update"]
+	if avatar.Scope != ScopeGlobalAdminWithBusinessACL || avatar.BusinessACL == nil {
+		t.Errorf("operation app_bot.avatar.update must declare business ACL fallback metadata")
 	}
 	if operationByID["app_bot.token.reveal"].Scope != ScopeGlobalAdmin {
 		t.Errorf("platform token reveal must not inherit Space ACL scope")
@@ -158,7 +154,6 @@ func assertGlobalOperationBoundary(t *testing.T, manifest *Manifest) {
 	if got := operationByID["group.member.force_remove"].Permission; got != "group.member.remove" {
 		t.Errorf("manager force-remove permission = %q, want group.member.remove", got)
 	}
-	avatar := operationByID["app_bot.avatar.update"]
 	if avatar.BusinessACL == nil || avatar.BusinessACL.Type != "self_or_user_bot_creator_or_bot_owner_or_space_admin" ||
 		!strings.Contains(avatar.BusinessACL.Description, "human self-service") || !strings.Contains(avatar.BusinessACL.Description, "User Bot creator") {
 		t.Errorf("App Bot avatar business ACL fallback is incomplete: %#v", avatar.BusinessACL)
@@ -180,6 +175,7 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 		"common.system_setting.update":        "system_setting.write",
 		"space.destroy":                       "space.destroy",
 		"dashboard.direct_chat_activity.read": "dashboard.direct_chat_activity.read",
+		"workplace.category_app.reorder":      "workplace.category_app.reorder",
 	}
 	for operationID, permission := range want {
 		if got := operationByID[operationID].Permission; got != permission {
@@ -199,6 +195,41 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 		if operationByID[pair[0]].Permission == operationByID[pair[1]].Permission {
 			t.Errorf("risk-distinct operations %q and %q share permission %q", pair[0], pair[1], operationByID[pair[0]].Permission)
 		}
+	}
+	permissionByKey := make(map[string]Permission, len(manifest.Permissions))
+	for _, permission := range manifest.Permissions {
+		permissionByKey[permission.Key] = permission
+	}
+	for _, key := range []string{"workplace.category_app.reorder", "workplace.app.write"} {
+		if got := permissionByKey[key].Sensitivity; got != SensitivityElevated {
+			t.Errorf("permission %q sensitivity = %q, want elevated", key, got)
+		}
+	}
+	gateBySource := make(map[string]GateSite, len(manifest.GateSites))
+	for _, gate := range manifest.GateSites {
+		gateBySource[gate.Source] = gate
+	}
+	tiersByPermission := make(map[string]map[LegacyGate]struct{})
+	for _, operation := range manifest.Operations {
+		if operation.Permission != "workplace.category_app.reorder" && operation.Permission != "workplace.app.write" {
+			continue
+		}
+		if tiersByPermission[operation.Permission] == nil {
+			tiersByPermission[operation.Permission] = make(map[LegacyGate]struct{})
+		}
+		for _, source := range operation.GateSites {
+			tiersByPermission[operation.Permission][gateBySource[source].LegacyGate] = struct{}{}
+		}
+	}
+	if tiers := tiersByPermission["workplace.category_app.reorder"]; len(tiers) != 1 {
+		t.Errorf("workplace.category_app.reorder gate tiers = %v, want admin only", tiers)
+	} else if _, ok := tiers[LegacyGateAdmin]; !ok {
+		t.Errorf("workplace.category_app.reorder gate tiers = %v, want admin only", tiers)
+	}
+	if tiers := tiersByPermission["workplace.app.write"]; len(tiers) != 1 {
+		t.Errorf("workplace.app.write gate tiers = %v, want super_admin only", tiers)
+	} else if _, ok := tiers[LegacyGateSuperAdmin]; !ok {
+		t.Errorf("workplace.app.write gate tiers = %v, want super_admin only", tiers)
 	}
 }
 

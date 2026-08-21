@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "content_hash": "069a02336e14ed6911b156f3b73fc0adabe59ce8c07ab6fee78b7bf74eaedbb0",
+  "content_hash": "480ffa09f3866bdca315cbfd90a2d0122385ad35a007b8e9ddb5431cd2ebe2ab",
   "aggregate_mode_semantics": {
     "any": "satisfied when at least one referenced permission is granted",
     "all": "satisfied only when every referenced permission is granted"
@@ -528,13 +528,6 @@
       "sensitivity": "elevated"
     },
     {
-      "key": "statistics.read",
-      "resource": "statistics",
-      "action": "read",
-      "description": "查看全局统计数据",
-      "sensitivity": "standard"
-    },
-    {
       "key": "system_setting.read",
       "resource": "system_setting",
       "action": "read",
@@ -658,6 +651,13 @@
       "resource": "workplace_category",
       "action": "write",
       "description": "维护工作台分类",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "workplace.category_app.reorder",
+      "resource": "workplace_category_app",
+      "action": "reorder",
+      "description": "调整工作台分类应用顺序",
       "sensitivity": "elevated"
     }
   ],
@@ -1022,12 +1022,6 @@
       "legacy_gate": "super_admin"
     },
     {
-      "source": "modules/group/api.go::Group.memberRemove#1",
-      "module": "group",
-      "symbol": "Group.memberRemove",
-      "legacy_gate": "admin"
-    },
-    {
       "source": "modules/group/api_manager.go::Manager.blacklist#1",
       "module": "group",
       "symbol": "Manager.blacklist",
@@ -1214,31 +1208,7 @@
       "legacy_gate": "super_admin"
     },
     {
-      "source": "modules/statistics/api.go::Statistics.countNum#1",
-      "module": "statistics",
-      "symbol": "Statistics.countNum",
-      "legacy_gate": "admin"
-    },
-    {
-      "source": "modules/statistics/api.go::Statistics.createGroupWithDateSpace#1",
-      "module": "statistics",
-      "symbol": "Statistics.createGroupWithDateSpace",
-      "legacy_gate": "admin"
-    },
-    {
-      "source": "modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1",
-      "module": "statistics",
-      "symbol": "Statistics.registerUserListWithDateSpace",
-      "legacy_gate": "admin"
-    },
-    {
       "source": "modules/user/api.go::User.uploadAvatar#1",
-      "module": "user",
-      "symbol": "User.uploadAvatar",
-      "legacy_gate": "super_admin"
-    },
-    {
-      "source": "modules/user/api.go::User.uploadAvatar#2",
       "module": "user",
       "symbol": "User.uploadAvatar",
       "legacy_gate": "super_admin"
@@ -1463,8 +1433,7 @@
       "handler": "User.uploadAvatar",
       "permission": "app_bot.avatar.update",
       "gate_sites": [
-        "modules/user/api.go::User.uploadAvatar#1",
-        "modules/user/api.go::User.uploadAvatar#2"
+        "modules/user/api.go::User.uploadAvatar#1"
       ],
       "scope": "global_admin_with_business_acl",
       "business_acl": {
@@ -2049,38 +2018,6 @@
       "scope": "global_admin"
     },
     {
-      "id": "group.member.remove",
-      "method": "DELETE",
-      "path": "/v1/groups/:group_no/members",
-      "module": "group",
-      "handler": "Group.memberRemove",
-      "permission": "group.member.remove",
-      "gate_sites": [
-        "modules/group/api.go::Group.memberRemove#1"
-      ],
-      "scope": "global_admin_with_business_acl",
-      "business_acl": {
-        "type": "group_owner_or_manager",
-        "description": "非全局管理员时继续执行群主或群管理员业务 ACL"
-      }
-    },
-    {
-      "id": "group.member.remove_legacy",
-      "method": "POST",
-      "path": "/v1/groups/:group_no/members_delete",
-      "module": "group",
-      "handler": "Group.memberRemove",
-      "permission": "group.member.remove",
-      "gate_sites": [
-        "modules/group/api.go::Group.memberRemove#1"
-      ],
-      "scope": "global_admin_with_business_acl",
-      "business_acl": {
-        "type": "group_owner_or_manager",
-        "description": "非全局管理员时继续执行群主或群管理员业务 ACL"
-      }
-    },
-    {
       "id": "group.status.update",
       "method": "PUT",
       "path": "/v1/manager/group/liftban/:groupNo/:status",
@@ -2585,42 +2522,6 @@
       "scope": "global_admin"
     },
     {
-      "id": "statistics.group_creation",
-      "method": "GET",
-      "path": "/v1/statistics/createdgroup/:start_date/:end_date",
-      "module": "statistics",
-      "handler": "Statistics.createGroupWithDateSpace",
-      "permission": "statistics.read",
-      "gate_sites": [
-        "modules/statistics/api.go::Statistics.createGroupWithDateSpace#1"
-      ],
-      "scope": "global_admin"
-    },
-    {
-      "id": "statistics.overview",
-      "method": "GET",
-      "path": "/v1/statistics/countnum",
-      "module": "statistics",
-      "handler": "Statistics.countNum",
-      "permission": "statistics.read",
-      "gate_sites": [
-        "modules/statistics/api.go::Statistics.countNum#1"
-      ],
-      "scope": "global_admin"
-    },
-    {
-      "id": "statistics.user_registration",
-      "method": "GET",
-      "path": "/v1/statistics/registeruser/:start_date/:end_date",
-      "module": "statistics",
-      "handler": "Statistics.registerUserListWithDateSpace",
-      "permission": "statistics.read",
-      "gate_sites": [
-        "modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1"
-      ],
-      "scope": "global_admin"
-    },
-    {
       "id": "user.admin.create",
       "method": "POST",
       "path": "/v1/manager/user/admin",
@@ -3082,7 +2983,7 @@
       "path": "/v1/manager/workplace/categorys/:category_no/app/reorder",
       "module": "workplace",
       "handler": "manager.reorderCategoryApp",
-      "permission": "workplace.app.write",
+      "permission": "workplace.category_app.reorder",
       "gate_sites": [
         "modules/workplace/api_manager.go::manager.reorderCategoryApp#1"
       ],

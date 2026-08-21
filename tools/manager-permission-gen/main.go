@@ -40,15 +40,22 @@ func checkContract(repositoryRoot, manifestPath, goOutputPath, jsonOutputPath st
 	if err := authz.ValidateCriticalPermissions(manifest); err != nil {
 		return err
 	}
+	if err := authz.ValidateRecognizedGateLocations(repositoryRoot); err != nil {
+		return err
+	}
 	gates, err := authz.ScanDirectGates(repositoryRoot)
 	if err != nil {
 		return err
 	}
-	if err := authz.ValidateGateInventory(gates, manifest.GateSites); err != nil {
-		return err
-	}
 	routes, err := authz.ScanManagerRoutes(repositoryRoot, gates)
 	if err != nil {
+		return err
+	}
+	platformGates, err := authz.PlatformGates(gates, routes)
+	if err != nil {
+		return err
+	}
+	if err := authz.ValidateGateInventory(platformGates, manifest.GateSites); err != nil {
 		return err
 	}
 	if err := authz.ValidateRouteCoverage(routes, manifest.Operations, authz.ManagerRouteBoundaryExclusions()); err != nil {
