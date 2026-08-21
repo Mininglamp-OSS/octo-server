@@ -180,10 +180,15 @@ func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string,
 
 	// Bot 私聊用的是 Space 前缀频道（见 app_bot / botfather 的 IMWhitelistAdd），
 	// 只摘裸 uid 频道会把 bot 私聊漏在开着的状态。
-	if bot, err := f.eitherSideIsBot(ctx, removedUID, peer); err != nil {
-		f.Warn("判定是否 bot 私聊失败，跳过 Space 前缀频道白名单清理",
-			zap.Error(err), zap.String("uid", removedUID), zap.String("peer", peer))
-	} else if bot {
+	//
+	// 这里的查库失败必须上抛而不是吞掉：吞掉的话 cutOffDM 返回 nil、工单标 done，
+	// 前缀频道的白名单就永远没人摘了，而 brief 的验收明确要求 bot 私聊「被处理，
+	// 不能静默跳过」。步骤契约本来就带重试，重试也是幂等的，上抛不花任何代价。
+	bot, err := f.eitherSideIsBot(ctx, removedUID, peer)
+	if err != nil {
+		return fmt.Errorf("check bot dm (%s/%s): %w", removedUID, peer, err)
+	}
+	if bot {
 		// 这两个频道未必存在（这一对可能从没在本 Space 下建过前缀频道），
 		// 因此按 best-effort 处理：失败只告警，不让整条工单一直重试到 abandoned。
 		if cutInbound {

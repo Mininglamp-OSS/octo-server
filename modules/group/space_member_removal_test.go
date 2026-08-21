@@ -362,3 +362,95 @@ func payloadsContain(payloads []map[string]interface{}, fragment string) bool {
 	}
 	return false
 }
+
+// TestGroupCascadeConcurrentCreatorAndSuccessor 阻塞项回归（PR #795 review）：
+// 群主 C 与第二元老 S2 同批被移出 Space，两条工单可能在不同副本上并发执行。
+//
+// 两个失败分支都出自同一个无锁读窗口：
+//   - 读落在交接提交**前** → S2 被当成普通成员通过过滤，而 DeleteMemberTx 没有
+//     角色守卫 → 刚上任的群主被删掉，群里还剩着人却无主，且无人重新选主；
+//   - 读落在交接提交**后** → S2 被识别为 creator 被静默跳过、返回 nil error →
+//     工单标 done，人却永久留在群里。
+//
+// 修复后：删除前在事务内行锁重读角色，且调用方检查 Removed 计数并让工单重试。
+// 断言最终态：C 和 S2 都不在群里，剩下的 C3 是唯一群主。
+func TestGroupCascadeConcurrentCreatorAndSuccessor(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	newGroupIMStub(t, ctx)
+	const spaceID, creator, second, third = "sp-concurrent", "u-creator", "u-second", "u-third"
+
+	seedGroupInSpace(t, ctx, "g-concurrent", spaceID, creator)
+	seedGroupMember(t, ctx, "g-concurrent", creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-concurrent", second, MemberRoleCommon)
+	seedGroupMember(t, ctx, "g-concurrent", third, MemberRoleCommon)
+
+	run := func(uid string) error {
+		return g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+			SpaceID: spaceID, UID: uid, OperatorUID: "su",
+			Reason: spacemod.MemberRemoveReasonSpaceDisbanded,
+		})
+	}
+
+	// 并发跑两条工单，模拟两个副本同时认领
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = run(creator) }()
+	go func() { defer wg.Done(); errs[1] = run(second) }()
+	wg.Wait()
+
+	// 任一条失败都代表「并发导致这次没removed」，工单会重试——重跑一遍即可收敛。
+	for i, uid := range []string{creator, second} {
+		if errs[i] != nil {
+			require.NoError(t, run(uid), "重试必须收敛：%s", uid)
+		}
+	}
+
+	_, creatorIn := liveMemberRole(t, ctx, "g-concurrent", creator)
+	assert.False(t, creatorIn, "群主必须被清出去")
+	_, secondIn := liveMemberRole(t, ctx, "g-concurrent", second)
+	assert.False(t, secondIn, "第二元老也被移出 Space，不得被留在群里")
+
+	// 剩下的成员必须恰好有一个群主——既不能无主，也不能出现两个
+	var creatorCount int
+	_, err := ctx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND is_deleted=0 AND role=?",
+		"g-concurrent", MemberRoleCreator).Load(&creatorCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, creatorCount, "群里必须恰好一个群主，不能无主也不能双主")
+
+	role, thirdIn := liveMemberRole(t, ctx, "g-concurrent", third)
+	require.True(t, thirdIn, "留下来的成员必须还在群里")
+	assert.Equal(t, MemberRoleCreator, role, "群主应落到唯一剩下的成员身上")
+}
+
+// TestGroupCascadeRetriesWhenTargetBecameCreator 单副本也能触发：
+// 群主转让接口在「无锁读角色」和「调用 RemoveGroupMembers」之间把目标提升为群主。
+// RemoveGroupMembers 对群主是静默跳过 + nil error，不检查 Removed 就会把工单
+// 标成 done，人却永久留在群里。这里直接构造那个中间态。
+func TestGroupCascadeRetriesWhenTargetBecameCreator(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-became-creator", "u-victim"
+
+	seedGroupInSpace(t, ctx, "g-became", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-became", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-became", victim, MemberRoleCommon)
+	// 让群里出现两个 creator 是不可能的中间态，所以改成：原群主先离场，
+	// victim 被提升为 creator —— 这正是并发交接后 victim 的状态。
+	_, err := ctx.DB().Exec(
+		"UPDATE group_member SET is_deleted=1 WHERE group_no=? AND uid=?", "g-became", "u-owner")
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
+		"UPDATE group_member SET role=? WHERE group_no=? AND uid=?",
+		MemberRoleCreator, "g-became", victim)
+	require.NoError(t, err)
+
+	// 此时 victim 是群主：级联必须先交接（无继任者则降级）再移除，最终人不在群里
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "su", Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-became", victim)
+	assert.False(t, stillIn, "已成为群主的目标也必须被清出去，不能静默跳过")
+}

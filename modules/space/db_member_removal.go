@@ -151,8 +151,14 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 		return nil, fmt.Errorf("space: select removal cleanup job: %w", err)
 	}
 
+	// attempts 在**认领时**自增，而不是等到失败释放时。
+	//
+	// 释放路径只覆盖「作业跑完并返回了错误」。进程在作业中途被杀（OOM、Pod 驱逐）
+	// 时谁也没机会写 attempts：租约到期后同一行被重新认领，计数原地不动，
+	// 一条必然打死进程的作业就能无限循环、永远到不了 abandoned。
+	// 认领即计数让这种情况自我收敛，也让 attempts 真实反映「试过几次」。
 	result, err := tx.UpdateBySql(
-		"UPDATE space_member_removal_cleanup SET lease_owner=?, lease_until=? WHERE id=? AND status=?",
+		"UPDATE space_member_removal_cleanup SET lease_owner=?, lease_until=?, attempts=attempts+1 WHERE id=? AND status=?",
 		owner, now.Add(removalCleanupLease), job.ID, removalCleanupPending,
 	).Exec()
 	if err != nil {
@@ -165,21 +171,21 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("space: commit removal cleanup claim: %w", err)
 	}
+	// SELECT 读到的是自增前的值，这里对齐成库里的值，让调用方的
+	// 「已经试到第几次」判断不必再去猜偏移量。
+	job.Attempts++
 	return &job, nil
 }
 
 // finishMemberRemovalCleanup 把工单置为终态（done / abandoned），要求仍持有租约。
 // 租约易主时返回 false，调用方据此放弃写入——另一个 worker 已经接手。
-// countAttempt 为 true 时把本次尝试计入 attempts（走 abandoned 终态时必须计），
-// 否则运维按 `attempts >= removalCleanupMaxAttempts` 根本查不出被放弃的工单。
-func (d *DB) finishMemberRemovalCleanup(id uint64, owner string, status uint8, lastError string, countAttempt bool) (bool, error) {
-	attemptsExpr := "attempts"
-	if countAttempt {
-		attemptsExpr = "attempts+1"
-	}
+// attempts 不在这里动：认领时已经计过（见 claimMemberRemovalCleanup），
+// 所以一条 abandoned 行的 attempts 天然等于 removalCleanupMaxAttempts，
+// 运维可以直接按这个阈值查出被放弃的工单。
+func (d *DB) finishMemberRemovalCleanup(id uint64, owner string, status uint8, lastError string) (bool, error) {
 	result, err := d.session.UpdateBySql(
 		"UPDATE space_member_removal_cleanup "+
-			"SET status=?, attempts="+attemptsExpr+", finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"SET status=?, finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
 			"WHERE id=? AND status=? AND lease_owner=?",
 		status, time.Now().UTC(), truncateCleanupError(lastError), id, removalCleanupPending, owner,
 	).Exec()
@@ -194,11 +200,14 @@ func (d *DB) finishMemberRemovalCleanup(id uint64, owner string, status uint8, l
 }
 
 // releaseMemberRemovalCleanup 执行失败后释放租约并按指数退避安排下次尝试。
+//
+// 不再自增 attempts —— 认领时已经计过了（见 claimMemberRemovalCleanup）。
+// 两处都加会让计数翻倍，退避和放弃阈值一起提前一半。
 func (d *DB) releaseMemberRemovalCleanup(id uint64, owner string, attempts uint32, lastError string) error {
-	next := time.Now().UTC().Add(memberRemovalRetryDelay(attempts + 1))
+	next := time.Now().UTC().Add(memberRemovalRetryDelay(attempts))
 	result, err := d.session.UpdateBySql(
 		"UPDATE space_member_removal_cleanup "+
-			"SET attempts=attempts+1, next_attempt_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"SET next_attempt_at=?, lease_owner='', lease_until=NULL, last_error=? "+
 			"WHERE id=? AND status=? AND lease_owner=?",
 		next, truncateCleanupError(lastError), id, removalCleanupPending, owner,
 	).Exec()
@@ -219,12 +228,15 @@ func (d *DB) releaseMemberRemovalCleanup(id uint64, owner string, attempts uint3
 // 把每 10s 一次的认领扫描越拖越慢。
 const removalCleanupRetention = 14 * 24 * time.Hour
 
-// purgeFinishedMemberRemovalCleanups 删除超过保留期的终态工单，返回删除行数。
+// purgeFinishedMemberRemovalCleanups 删除超过保留期的**已完成**工单，返回删除行数。
 // 单次有上限，避免一条 DELETE 锁住大量行。
+//
+// 只删 done，abandoned 一律保留：那是「隔离性清理最终放弃了」的唯一持久记录，
+// 除了一条 error 日志之外没有别的东西记得它，删掉就再也查不出来了。
 func (d *DB) purgeFinishedMemberRemovalCleanups(before time.Time, limit int) (int64, error) {
 	result, err := d.session.UpdateBySql(
-		"DELETE FROM space_member_removal_cleanup WHERE status<>? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
-		removalCleanupPending, before, limit,
+		"DELETE FROM space_member_removal_cleanup WHERE status=? AND finished_at IS NOT NULL AND finished_at < ? LIMIT ?",
+		removalCleanupDone, before, limit,
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("space: purge finished removal cleanups: %w", err)
@@ -248,22 +260,24 @@ func memberRemovalRetryDelay(attempt uint32) time.Duration {
 	return delay
 }
 
-// truncateCleanupError 把失败摘要截到 last_error 列宽以内。
+// truncateCleanupError 把失败摘要收敛成可安全写入 last_error 的合法 UTF-8。
 //
-// 必须按 rune 边界切：错误串常带中文（上游 helper 的消息、IM 返回体），按字节切
-// 会切出半个字符，utf8mb4 列在 strict 模式下直接拒写。那条 UPDATE 一失败，
-// attempts 不增、next_attempt_at 不推进——本来用来保护重试的函数反而把退避弄断，
-// 工单每 60s（租约到期）重试一次且永远到不了 abandoned。
+// 两件事都必须做，缺一不可 —— 任何非法字节写进 utf8mb4 列，strict 模式都会
+// 拒掉整条 UPDATE，于是 attempts 不增、next_attempt_at 不推进：本来用来保护重试的
+// 函数反而把退避弄断，工单在租约到期后被反复认领且永远到不了 abandoned。
+//
+//  1. **先清洗**：错误串里可能夹着任意位置的非法字节（上游代理的错误页、IM 返回体
+//     的裸字节）。只修末尾被截断的那个 rune 挡不住中间的非法字节；只有整串清洗才行。
+//  2. **再按 rune 边界截断**：清洗后再切，切点自然落在合法边界上。
+//
+// 列宽 255 是字符数，这里按字节截断，因此永远不会超列。
 func truncateCleanupError(s string) string {
 	const max = 255
-	if len(s) <= max {
-		return s
+	cleaned := strings.ToValidUTF8(s, "")
+	if len(cleaned) <= max {
+		return cleaned
 	}
-	truncated := s[:max]
-	// 只裁掉末尾被切断的那一个 rune。此前的写法是「整串不合法就退一个字节」循环，
-	// 一旦原串中间本来就带一个非法字节（上游代理错误页里的裸字节很常见），
-	// 每个后缀都不合法，会一路把消息裁回那个字节，last_error 只剩几个字符甚至空串；
-	// 而且那是 O(n²) 次全串校验。
+	truncated := cleaned[:max]
 	if r, size := utf8.DecodeLastRuneInString(truncated); r == utf8.RuneError && size <= 1 {
 		truncated = truncated[:len(truncated)-size]
 	}

@@ -1064,3 +1064,25 @@ func (d *DB) QueryCategoryByID(categoryID string) (*CategoryRow, error) {
 		From("group_category").Where("category_id=?", categoryID).Load(&row)
 	return row, err
 }
+
+// LockRemovableMemberTx 事务内锁定成员行并确认它现在仍然可被移除
+// （存在、未删除、且不是群主）。
+//
+// 存在的理由是 RemoveGroupMembers 的 creator 过滤读的是事务外快照：目标可能在
+// 快照与删除之间被提升为群主（群主转让接口，或并发的清理工单交接）。
+// DeleteMemberTx 的 WHERE 没有角色守卫，不锁内复核就会把新群主删掉，
+// 留下一个有成员却无群主、也无人重新选主的群。
+func (d *DB) LockRemovableMemberTx(groupNo string, uid string, tx *dbr.Tx) (bool, error) {
+	var roles []int
+	_, err := tx.SelectBySql(
+		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		groupNo, uid,
+	).Load(&roles)
+	if err != nil {
+		return false, err
+	}
+	if len(roles) == 0 {
+		return false, nil // 已离群
+	}
+	return roles[0] != MemberRoleCreator, nil
+}

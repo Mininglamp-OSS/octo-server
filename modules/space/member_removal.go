@@ -223,7 +223,7 @@ var removalClaimSeq atomic.Uint64
 //
 // 不能用进程级常量：afterMembersRemoved 起的那个 goroutine 与 10s 定时器会同时
 // 调 processMemberRemovalCleanups。群级联要逐个群调 RemoveGroupMembers（每个群都
-// 有 IM 退订 + 发 Tip + 子区清理），很容易超过 60s 租约；租约一过期，另一个
+// 有 IM 退订 + 发 Tip + 子区清理），大空间下仍可能跑满 removalCleanupLease；一过期，另一个
 // goroutine 就能重新认领同一条工单。若两者 owner 相同，finish/release 上的
 // `AND lease_owner=?` 对双方都成立——先跑完的把工单标成终态，另一个还在半路，
 // 群里于是出现重复的「被移出」系统消息，慢的那个再 release 还会把已完成的工单
@@ -317,7 +317,7 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 	if member != nil {
 		s.Info("被移除成员已重新加入，跳过会话面清理",
 			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
-		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined", false)
+		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined")
 		return
 	}
 
@@ -333,17 +333,17 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 			return
 		}
 	}
-	s.finishCleanupJob(job, owner, removalCleanupDone, "", false)
+	s.finishCleanupJob(job, owner, removalCleanupDone, "")
 }
 
 // releaseCleanupJob 记一次失败并安排重试；attempts 用尽则置为 abandoned 并高声报错。
 func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName string, cause error) {
-	if job.Attempts+1 >= removalCleanupMaxAttempts {
+	if job.Attempts >= removalCleanupMaxAttempts {
 		s.Error("成员移除清理工单重试耗尽，置为 abandoned",
 			zap.Uint64("jobId", job.ID), zap.String("spaceId", job.SpaceID),
 			zap.String("uid", job.UID), zap.String("step", stepName),
-			zap.Uint32("attempts", job.Attempts+1), zap.Error(cause))
-		s.finishCleanupJob(job, owner, removalCleanupAbandoned, stepName+": retries exhausted", true)
+			zap.Uint32("attempts", job.Attempts), zap.Error(cause))
+		s.finishCleanupJob(job, owner, removalCleanupAbandoned, stepName+": retries exhausted")
 		return
 	}
 	s.Warn("成员移除清理步骤失败，稍后重试",
@@ -358,8 +358,8 @@ func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName 
 
 // finishCleanupJob 写终态。租约易主（affected=0）只记日志：另一个 worker 已接手，
 // 重复执行是安全的（步骤契约要求幂等）。
-func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, status uint8, note string, countAttempt bool) {
-	ok, err := s.db.finishMemberRemovalCleanup(job.ID, owner, status, note, countAttempt)
+func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, status uint8, note string) {
+	ok, err := s.db.finishMemberRemovalCleanup(job.ID, owner, status, note)
 	if err != nil {
 		s.Warn("更新成员移除清理工单终态失败", zap.Uint64("jobId", job.ID), zap.Error(err))
 		return

@@ -90,7 +90,7 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
 	suppressNotice := selfExit || spaceGone
 
-	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo: groupNo,
 		Members: []string{removal.UID},
 		// 操作者取 Space 侧的操作者。他可能并不是本群成员——系统 Tip 只用其展示名，
@@ -101,6 +101,18 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	})
 	if err != nil {
 		return fmt.Errorf("remove group member: %w", err)
+	}
+	// 必须检查 Removed，不能只看 error。
+	//
+	// RemoveGroupMembers 对群主是**静默跳过 + 返回 nil**。上面那次
+	// QueryMemberWithUID 是无锁读，目标可能在读到调用之间被提升为群主
+	// （群主转让接口，或另一条清理工单为它做的交接）——那样这次移除就是一次
+	// 无声的空操作，而工单会被标成 done：人永久留在群里、IM 订阅还在，
+	// 却再没有任何东西会回来看一眼。
+	// 返回错误让工单重试：下一次尝试读到 role=creator，先交接再移除，收敛。
+	if resp == nil || resp.Removed == 0 {
+		return fmt.Errorf("group member not removed, role changed concurrently: group=%s uid=%s",
+			groupNo, removal.UID)
 	}
 	if selfExit {
 		g.sendGroupExitTip(groupNo, removal.UID)
@@ -228,12 +240,15 @@ func (g *Group) resolveOperatorName(operatorUID string) string {
 // 单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
 func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
 	var member *MemberModel
+	// FOR UPDATE 锁住选中的继任者：不锁的话它可能正被另一条清理工单删除，
+	// UpdateMemberRoleTx 的 WHERE 带 is_deleted=0，会静默影响 0 行，
+	// 群就此无主。
 	_, err := tx.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
 			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
 			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
 			"AND r.robot_id IS NULL "+
-			"ORDER BY gm.created_at ASC LIMIT 1",
+			"ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE",
 		leaverUID, groupNo, MemberRoleCreator,
 	).Load(&member)
 	return member, err

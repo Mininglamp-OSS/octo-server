@@ -1048,7 +1048,11 @@ type RemoveGroupMembersServiceReq struct {
 	SuppressRemoveNotice bool
 }
 
-// RemoveGroupMembersServiceResp 移除群成员响应
+// RemoveGroupMembersServiceResp 移除群成员响应。
+//
+// Removed 是**实际**移除数量，可能小于请求的成员数：群主会被静默跳过，
+// 且锁内重读发现目标刚被提升为群主时也会跳过。调用方若依赖「这个人一定被移除」，
+// 必须检查 Removed 而不是只看 error —— 两种跳过都返回 nil error。
 type RemoveGroupMembersServiceResp struct {
 	Removed     int      // 实际移除数量
 	RemovedUIDs []string // 实际移除的 UID 列表
@@ -1772,6 +1776,24 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	var cascadedPerLeaver []cascadedLeaver
 	alreadyCascadedBotUIDs := make(map[string]struct{})
 	for _, m := range removableMembers {
+		// 事务内、行锁下重读角色再删。
+		//
+		// 上面那次 creator 过滤读的是事务外的快照，两者之间目标可能刚好被提升为
+		// 群主（群主转让接口，或另一条清理工单的交接），而 DeleteMemberTx 的
+		// WHERE 只有 group_no + uid、没有角色守卫 —— 于是新群主被直接删掉，
+		// 群里还剩着人却没有群主，且没有任何东西会重新选主。
+		// 锁内确认仍非 creator 才删；已经变成 creator 的跳过，让调用方按
+		// Removed 计数发现并重试（见 RemoveGroupMembersServiceResp）。
+		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, tx)
+		if err != nil {
+			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
+			return nil, errors.New("failed to re-read member role")
+		}
+		if !stillRemovable {
+			s.Warn("成员在锁外读取后变成群主或已离群，跳过删除",
+				zap.String("groupNo", req.GroupNo), zap.String("uid", m.UID))
+			continue
+		}
 		memberVersion, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
 		if err != nil {
 			s.Error("generate member version failed", zap.Error(err))

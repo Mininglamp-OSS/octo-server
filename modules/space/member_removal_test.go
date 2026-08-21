@@ -261,7 +261,7 @@ func TestCleanupWorkerRetriesFailedStep(t *testing.T) {
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, removalCleanupPending, jobs[0].Status, "失败的工单必须留在 pending 等待重试")
-	assert.EqualValues(t, 1, jobs[0].Attempts)
+	assert.EqualValues(t, 1, jobs[0].Attempts, "认领时已自增，失败释放不再重复计数")
 	assert.Empty(t, jobs[0].LeaseOwner, "失败后必须释放租约，否则别的副本接不了手")
 	assert.Contains(t, jobs[0].LastError, "always-fails")
 	assert.True(t, jobs[0].NextAttemptAt.After(time.Now()), "下次尝试时间必须被推到未来")
@@ -328,7 +328,7 @@ func TestClaimCleanupRespectsLeaseAndSchedule(t *testing.T) {
 	assert.Equal(t, first.ID, takeover.ID)
 
 	// 非租约持有者写终态必须落空，避免覆盖接手方的结果
-	ok, err := f.db.finishMemberRemovalCleanup(first.ID, "worker-a", removalCleanupDone, "", false)
+	ok, err := f.db.finishMemberRemovalCleanup(first.ID, "worker-a", removalCleanupDone, "")
 	require.NoError(t, err)
 	assert.False(t, ok, "租约已易主，旧 owner 不得写终态")
 }
@@ -646,15 +646,21 @@ func TestCleanupWorkerAbandonRecordsAttempts(t *testing.T) {
 		"放弃时必须把最后一次尝试计进去")
 }
 
-// TestTruncateCleanupErrorKeepsPrefixWithInvalidByte 原串中间本来就带非法字节时，
-// 只应裁掉末尾被切断的那个 rune，而不是一路把消息裁没。
-func TestTruncateCleanupErrorKeepsPrefixWithInvalidByte(t *testing.T) {
+// TestTruncateCleanupErrorSanitizesInteriorInvalidByte 原串中间带非法字节时，
+// 必须把它清掉而不是原样放行。
+//
+// 只修「末尾被截断的那个 rune」是不够的：中间的裸字节照样写不进 utf8mb4 列，
+// strict 模式会拒掉整条 UPDATE，attempts 与 next_attempt_at 都不会推进，
+// 工单在租约到期后被反复认领、永远到不了 abandoned —— 用来保护重试的函数
+// 反倒把退避弄断了。同时也不能因为一个中间非法字节就把整条摘要裁没。
+func TestTruncateCleanupErrorSanitizesInteriorInvalidByte(t *testing.T) {
 	// 第 4 个字节是裸的 0xff（上游代理错误页里很常见），后面接足够长的内容
 	input := "dm_" + string([]byte{0xff}) + strings.Repeat("a", 400)
 	got := truncateCleanupError(input)
+	assert.True(t, utf8.ValidString(got), "中间的非法字节必须被清掉")
 	assert.LessOrEqual(t, len(got), 255)
-	assert.Greater(t, len(got), 200,
-		"中间的非法字节不该把整条摘要裁没——那是 O(n²) 全串校验循环的后果")
+	assert.Greater(t, len(got), 200, "不该因为一个非法字节把整条摘要裁没")
+	assert.True(t, strings.HasPrefix(got, "dm_"), "有效前缀必须保留")
 }
 
 // TestProcessMemberRemovalCleanupsIsNotReentrant 同一进程内只允许一轮在跑。
@@ -682,4 +688,61 @@ func TestProcessMemberRemovalCleanupsIsNotReentrant(t *testing.T) {
 
 	f.processMemberRemovalCleanups()
 	assert.Equal(t, 1, inner, "重入的那次必须直接返回，不得再执行一轮")
+}
+
+// TestPurgeKeepsAbandonedJobs 保留期清理只删 done。abandoned 是「隔离性清理最终
+// 放弃了」的唯一持久记录——除了一条 error 日志之外没别的东西记得它，删掉就查不出来了。
+func TestPurgeKeepsAbandonedJobs(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "purge-keep"
+	seedMember(t, f, spaceID, "owner-pk", 2)
+	for _, uid := range []string{"done-1", "abandoned-1"} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+		mustRemoveMember(t, f, spaceID, uid, 1, "owner-pk", MemberRemoveReasonKicked)
+	}
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	_, err = testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET status=?, finished_at=? WHERE space_id=? AND uid=?",
+		removalCleanupDone, old, spaceID, "done-1")
+	require.NoError(t, err)
+	_, err = testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET status=?, finished_at=? WHERE space_id=? AND uid=?",
+		removalCleanupAbandoned, old, spaceID, "abandoned-1")
+	require.NoError(t, err)
+
+	deleted, err := f.db.purgeFinishedMemberRemovalCleanups(time.Now().UTC(), 100)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, deleted)
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, "abandoned-1", jobs[0].UID, "abandoned 必须保留")
+}
+
+// TestClaimIncrementsAttempts 认领即计数。只在失败释放时计数的话，进程在作业中途
+// 被杀（OOM / 驱逐）就没人写 attempts，租约到期后重认领计数原地不动，
+// 一条必然打死进程的作业能无限循环、永远到不了 abandoned。
+func TestClaimIncrementsAttempts(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "claim-attempts"
+	seedMember(t, f, spaceID, "owner-ca", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-ca", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-ca", 1, "owner-ca", MemberRemoveReasonKicked)
+
+	now := time.Now().UTC()
+	_, err = f.db.claimMemberRemovalCleanup("worker-x", now)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, cleanupJobs(t, spaceID)[0].Attempts, "认领即计数")
+
+	// 模拟进程被杀：既不 finish 也不 release，等租约过期后被接管
+	_, err = f.db.claimMemberRemovalCleanup("worker-y", now.Add(removalCleanupLease+time.Second))
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, cleanupJobs(t, spaceID)[0].Attempts,
+		"崩溃后被接管也必须计数，否则永远到不了 abandoned")
 }

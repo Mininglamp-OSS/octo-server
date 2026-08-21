@@ -338,6 +338,36 @@ Consequently:
   exported but not mounted, so this is latent. Tracked separately.
 - **Reworking `SpaceMiddleware`'s TTL model** or making it a global mount. Only
   the missing invalidation call is added.
+- **Observability for the cascade queue.** The worker is single-flight per
+  process and drains at most 20 jobs per 10s tick, each walking every group in
+  the Space, so a large disband takes a long time to converge and the removed
+  members hold group access for that whole window. The design converges, but
+  there is no gauge on pending rows or oldest pending `created_at` — nothing
+  shows how far behind it is. Follow-up.
+- **A peer whose conversation the removed member deleted.** Peer scope comes
+  from `IMSyncUserConversation` on the removed member. If they cleared that
+  conversation, the peer never enters the candidate set and **both** whitelist
+  entries survive — the one remaining way a pair escapes the cutoff entirely.
+  Closing it needs an authoritative pair index this repo does not have
+  (`dm_space_presence` is best-effort, which is why it was demoted from a gate).
+  Follow-up.
+- **Rejoin during a single job run.** The membership re-check happens once per
+  claim; a member who rejoins after the check but before the cascade finishes can
+  still have freshly re-acquired group memberships torn down. The window is
+  narrow, the per-attempt re-check already covers rejoin during backoff, and the
+  DM step self-protects because `SharesActiveSpace` is re-derived per peer at cut
+  time — but the group step has no such re-derivation. A membership epoch on
+  `space_member`, re-checked inside each step, is the standard fix. Follow-up.
+- **Lock-order documentation across `space` / `space_member`.** Both disband
+  paths now take `space_member FOR UPDATE` before updating `space`, inverting the
+  parent-then-child order the old `forceDisbandSpace` used. Every transaction in
+  `modules/space` that touches both was checked and no ABBA deadlock is reachable
+  today, but the inversion is real and deserves a written ordering note next to
+  the other lock-order comments. Follow-up.
+- **Bot deletion paths.** `modules/botfather` flips `space_member` rows to
+  `status=0` without enqueueing cleanup; they predate this change and handle
+  group exit inline. They are the remaining "membership ends, surface stays"
+  paths after this lands. Follow-up.
 - **Promoting a non-owner's bot to group creator.** A review round flagged
   `QuerySecondOldestMemberExcludingBotsOf` for allowing it, but
   `TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft` pins that as
@@ -371,7 +401,14 @@ Recorded so the diff can be read against the spec rather than against memory.
   minutes and an expired lease means concurrent re-execution, not just a lost
   write.
 - **Terminal rows are purged.** Not in the plan; an hourly bounded delete keeps
-  the outbox and its pending index from growing without limit.
+  the outbox and its pending index from growing without limit. Only `done` rows
+  are removed — `abandoned` is the only durable record that a cleanup gave up.
+- **The per-member group tip is suppressed on disband.** The acceptance list says
+  each affected group receives one system tip. For `space_disbanded` that would be
+  N members × M groups of "removed by <admin>" messages in a Space that no longer
+  exists, all landing on whoever is removed last. Suppressed for that reason and
+  for `left` (where the operator is the member themselves); ordinary kicks still
+  notify, pinned by `TestGroupCascadeKickStillNotifies`.
 
 ## Acceptance
 

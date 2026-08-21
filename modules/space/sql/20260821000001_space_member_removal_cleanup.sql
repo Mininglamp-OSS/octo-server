@@ -34,7 +34,11 @@ CREATE TABLE IF NOT EXISTS `space_member_removal_cleanup` (
   `finished_at`     DATETIME(3)     NULL,
   PRIMARY KEY (`id`),
   KEY `idx_space_member_removal_cleanup_pending` (`status`, `next_attempt_at`, `lease_until`),
-  KEY `idx_space_member_removal_cleanup_target` (`space_id`, `uid`)
+  KEY `idx_space_member_removal_cleanup_target` (`space_id`, `uid`),
+  -- 保留期清理按 (status, finished_at) 扫。pending 索引的首列虽然也是 status，
+  -- 但第二列是 next_attempt_at，帮不上 finished_at 的范围条件；没有这条索引，
+  -- 每小时一次的 purge 会全表扫一张随每次移除增长的表。
+  KEY `idx_space_member_removal_cleanup_finished` (`status`, `finished_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Space 成员移除后的会话面清理工单';
 
 -- +migrate Down
