@@ -79,18 +79,55 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		}
 	}
 
+	// 自助退出 Space 时操作者就是本人，默认的「被 X 移出群聊」会渲染成
+	// 「X 被 X 移出群聊」。这种情况下抑制默认文案，改发与既有 groupExit 一致的
+	// 退群提示；其余清理动作完全不变。
+	selfExit := removal.Reason == spacemod.MemberRemoveReasonLeft
+
 	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo: groupNo,
 		Members: []string{removal.UID},
 		// 操作者取 Space 侧的操作者。他可能并不是本群成员——系统 Tip 只用其展示名，
-		// 不依赖群内身份。自助退出（reason=left）时 OperatorUID 等于被移除者本人。
-		OperatorUID:  removal.OperatorUID,
-		OperatorName: operatorName,
+		// 不依赖群内身份。
+		OperatorUID:          removal.OperatorUID,
+		OperatorName:         operatorName,
+		SuppressRemoveNotice: selfExit,
 	})
 	if err != nil {
 		return fmt.Errorf("remove group member: %w", err)
 	}
+	if selfExit {
+		g.sendGroupExitTip(groupNo, removal.UID)
+	}
 	return nil
+}
+
+// sendGroupExitTip 发「主动退群」提示，可见范围与既有 groupExit 一致：
+// 只给一位管理员/群主看，不打扰全群。best-effort，失败只记日志——文案发不出去
+// 不该让整条清理工单重试。
+func (g *Group) sendGroupExitTip(groupNo, uid string) {
+	adminUIDs, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
+	if err != nil {
+		g.Warn("查询群管理员失败，跳过退群提示", zap.Error(err), zap.String("groupNo", groupNo))
+		return
+	}
+	visibles := make([]string, 0, 1)
+	for _, admin := range adminUIDs {
+		if admin != uid {
+			visibles = append(visibles, admin)
+			break
+		}
+	}
+	if len(visibles) == 0 {
+		return
+	}
+	showName := uid
+	if member, err := g.userDB.QueryByUID(uid); err == nil && member != nil && member.Name != "" {
+		showName = member.Name
+	}
+	if err := g.ctx.SendGroupExit(groupNo, uid, showName, visibles); err != nil {
+		g.Warn("发送退群提示失败", zap.Error(err), zap.String("groupNo", groupNo))
+	}
 }
 
 // handOverGroupCreator 把群主交接给第二元老（排除 bot），并把离开者降为普通成员。

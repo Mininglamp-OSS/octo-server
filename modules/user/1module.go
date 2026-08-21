@@ -76,7 +76,7 @@ func init() {
 						return nil, register.ErrDatasourceNotProcess
 					}
 					resp := newChannelRespWithUserDetailResp(userDetailResp)
-					annotateDMSendability(api.ctx, resp, channelID, loginUID)
+					annotateDMSendability(api.ctx, api.friendDB, resp, channelID, loginUID)
 					return resp, nil
 				},
 				GetDevice: func(ids []int64) ([]*model.DeviceResp, error) {

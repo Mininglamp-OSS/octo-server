@@ -242,3 +242,27 @@ func TestGroupCascadeNoGroupsIsNoop(t *testing.T) {
 		SpaceID: "sp-empty", UID: "nobody", OperatorUID: "op", Reason: spacemod.MemberRemoveReasonLeft,
 	}))
 }
+
+// TestGroupCascadeSelfExitSuppressesRemovedNotice 自助退出 Space（reason=left）时
+// 操作者就是本人，默认的「被 X 移出群聊」会渲染成「X 被 X 移出群聊」。
+// 断言此时不发被移出消息（改发退群提示），其余清理照常。
+func TestGroupCascadeSelfExitSuppressesRemovedNotice(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, leaver = "sp-selfexit", "u-leaver"
+
+	seedGroupInSpace(t, ctx, "g-selfexit", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-selfexit", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-selfexit", leaver, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: leaver,
+		OperatorUID: leaver, // 自助退出：操作者就是本人
+		Reason:      spacemod.MemberRemoveReasonLeft,
+	}))
+
+	// 清理照做
+	_, stillIn := liveMemberRole(t, ctx, "g-selfexit", leaver)
+	assert.False(t, stillIn)
+	assert.Contains(t, stub.unsubscribed("g-selfexit"), leaver)
+}

@@ -105,17 +105,49 @@ func SharesActiveSpace(session *dbr.Session, uidA, uidB string) (bool, error) {
 	if uidA == "" || uidB == "" || uidA == uidB {
 		return false, nil
 	}
-	var count int
+	// EXISTS 而不是 COUNT(*)：LIMIT 对无 GROUP BY 的聚合是无效的（聚合本来就只出
+	// 一行），COUNT 会把所有共同 Space 的行数完；EXISTS 命中第一行即短路。
+	var found int
 	err := session.SelectBySql(
-		"SELECT COUNT(*) FROM space_member sm1 "+
+		"SELECT EXISTS(SELECT 1 FROM space_member sm1 "+
 			"INNER JOIN space_member sm2 ON sm1.space_id = sm2.space_id "+
 			"INNER JOIN space s ON s.space_id = sm1.space_id AND s.status = 1 "+
-			"WHERE sm1.uid = ? AND sm2.uid = ? AND sm1.status = 1 AND sm2.status = 1 "+
-			"LIMIT 1",
+			"WHERE sm1.uid = ? AND sm2.uid = ? AND sm1.status = 1 AND sm2.status = 1)",
 		uidA, uidB,
-	).LoadOne(&count)
+	).LoadOne(&found)
 	if err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	return found > 0, nil
+}
+
+// MembersEverInSpace 返回这批 uid 中「在该 Space 有过成员行」的子集，**不看状态**。
+//
+// 与 ActiveMemberSet 的区别是刻意的，用来回答一个不同的问题：「这个人是否属于
+// 本 Space 的范畴」，而不是「他现在还是不是成员」。成员移除后的会话面清理必须用
+// 前者——用后者会在两种情况下静默地什么都不做：
+//
+//   - 空间被解散：forceDisbandSpace 先把 space.status 置 0，ActiveMemberSet 的
+//     `INNER JOIN space ... AND s.status = 1` 于是永远返回空集；
+//   - 同一批移除多人：A、B 一起被移除后各自的清理工单里，对方的 sm.status 已经是 0，
+//     互相被过滤掉，两人之间的私聊永远切不断。
+//
+// 两种情况下"该清理却没清理"都是隔离失效，所以这里不能带任何 status 谓词。
+func MembersEverInSpace(session *dbr.Session, spaceID string, uids []string) (map[string]bool, error) {
+	set := make(map[string]bool, len(uids))
+	if spaceID == "" || len(uids) == 0 {
+		return set, nil
+	}
+	var found []string
+	_, err := session.SelectBySql(
+		"SELECT uid FROM space_member WHERE space_id = ? AND uid IN ?",
+		spaceID, uids,
+	).Load(&found)
+	if err != nil {
+		return nil, err
+	}
+	for _, uid := range found {
+		set[uid] = true
+	}
+	return set, nil
 }

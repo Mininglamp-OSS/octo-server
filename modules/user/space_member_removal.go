@@ -61,17 +61,31 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 		if shared {
 			continue // 还有别的共同 Space，白名单本来就该留着
 		}
-		keep, err := f.dmStillAuthorizedByFriendship(removal.UID, peer)
+		// 两个方向**各自**判定，不能用 OR 短路。
+		//
+		// 白名单是按频道推导的：X 的 Person 频道白名单 = friends(X, is_alone=0) ∪
+		// coMembers(X)，也就是「谁能发给 X」。单向好友时（A 留着 A→B 的好友行，B 早把
+		// A 删了）只有 A 的频道仍授权 B，B 的频道并不授权 A。若任一方向有好友行就整个
+		// 跳过，B 频道上那条早已失效的白名单就没人摘 —— A 还能继续发给 B，而 B 的
+		// 客户端（annotateDMSendability 只查正确的那个方向）显示的是"不可发送"。
+		cutInbound, err := f.dmDirectionRevoked(peer, removal.UID) // 被移除者 -> 对端
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		if keep {
-			continue // 是好友，与 Space 无关
+		cutOutbound, err := f.dmDirectionRevoked(removal.UID, peer) // 对端 -> 被移除者
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
-		if err := f.cutOffDM(ctx, removal.SpaceID, removal.UID, peer); err != nil {
+		if !cutInbound && !cutOutbound {
+			continue
+		}
+		if err := f.cutOffDM(ctx, removal.SpaceID, removal.UID, peer, cutInbound, cutOutbound); err != nil {
 			f.Error("断开被移除成员的私聊失败",
 				zap.Error(err),
 				zap.String("spaceId", removal.SpaceID),
@@ -106,7 +120,10 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 		return nil, nil
 	}
 
-	memberSet, err := spacepkg.ActiveMemberSet(ctx.DB(), removal.SpaceID, candidates)
+	// 用「有过成员行」而不是「当前仍是活跃成员」来收窄：清理总是在成员行已经置 0
+	// 之后才跑，解散时连 space.status 也已经是 0。按活跃口径筛会让这一步在
+	// 「空间被解散」和「同批移除多人」两种情况下静默返回空集，一条私聊都切不掉。
+	memberSet, err := spacepkg.MembersEverInSpace(ctx.DB(), removal.SpaceID, candidates)
 	if err != nil {
 		return nil, fmt.Errorf("narrow dm peers to space members: %w", err)
 	}
@@ -139,35 +156,38 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 	return peers, nil
 }
 
-// dmStillAuthorizedByFriendship 判断好友关系是否仍单独授权这对私聊。
+// dmDirectionRevoked 判断「sender 是否已经不再被允许发给 channelUID」。
 //
-// 与白名单推导对齐：Whitelist 取 GetFriends(uid) 中 IsAlone == 0 的那些，
-// 即单向好友（对方已把你删掉）不算数。任意一侧持有有效的双向好友行即保留私聊。
-func (f *Friend) dmStillAuthorizedByFriendship(uid, peer string) (bool, error) {
-	forward, err := f.db.isMutualFriend(uid, peer)
+// 口径直接对齐白名单推导（modules/user/1module.go 的 IMDatasource.Whitelist）：
+// channelUID 的 Person 频道白名单 = GetFriends(channelUID) 中 is_alone=0 的那些
+// ∪ coMembers(channelUID)。调用方已经确认两人不再共处任一活跃 Space，所以这里
+// 只剩好友这一条依据，且**方向敏感**：看的是 channelUID 是否持有指向 sender 的
+// 有效双向好友行。
+func (f *Friend) dmDirectionRevoked(channelUID, sender string) (bool, error) {
+	friend, err := f.db.isMutualFriend(channelUID, sender)
 	if err != nil {
-		return false, fmt.Errorf("query friendship: %w", err)
+		return false, fmt.Errorf("query friendship (%s -> %s): %w", channelUID, sender, err)
 	}
-	if forward {
-		return true, nil
-	}
-	backward, err := f.db.isMutualFriend(peer, uid)
-	if err != nil {
-		return false, fmt.Errorf("query reverse friendship: %w", err)
-	}
-	return backward, nil
+	return !friend, nil
 }
 
-// cutOffDM 双向摘掉 Person 频道白名单，并给两端推 channelUpdate。
+// cutOffDM 按方向摘掉 Person 频道白名单，并给两端推 channelUpdate。
 //
 // 形状照搬 event_friend.go 的 handleDeleteFriend：要挡住 A→B，必须把 A 从 B 的
-// Person 频道白名单里摘掉（反之亦然），单摘一边只会断一个方向。
-func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string) error {
-	if err := f.removePersonWhitelist(ctx, peer, removedUID); err != nil {
-		return err
+// Person 频道白名单里摘掉。两个方向由调用方独立判定后传进来——单向好友时只有
+// 一个方向该被切，一刀切两边会误伤仍被好友关系授权的那个方向。
+func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string, cutInbound, cutOutbound bool) error {
+	if cutInbound {
+		// 被移除者 -> 对端：摘对端频道上的 removedUID
+		if err := f.removePersonWhitelist(ctx, peer, removedUID); err != nil {
+			return err
+		}
 	}
-	if err := f.removePersonWhitelist(ctx, removedUID, peer); err != nil {
-		return err
+	if cutOutbound {
+		// 对端 -> 被移除者：摘被移除者频道上的 peer
+		if err := f.removePersonWhitelist(ctx, removedUID, peer); err != nil {
+			return err
+		}
 	}
 
 	// Bot 私聊用的是 Space 前缀频道（见 app_bot / botfather 的 IMWhitelistAdd），
@@ -178,8 +198,12 @@ func (f *Friend) cutOffDM(ctx *config.Context, spaceID, removedUID, peer string)
 	} else if bot {
 		// 这两个频道未必存在（这一对可能从没在本 Space 下建过前缀频道），
 		// 因此按 best-effort 处理：失败只告警，不让整条工单一直重试到 abandoned。
-		f.removeSpaceScopedWhitelist(ctx, spaceID, peer, removedUID)
-		f.removeSpaceScopedWhitelist(ctx, spaceID, removedUID, peer)
+		if cutInbound {
+			f.removeSpaceScopedWhitelist(ctx, spaceID, peer, removedUID)
+		}
+		if cutOutbound {
+			f.removeSpaceScopedWhitelist(ctx, spaceID, removedUID, peer)
+		}
 	}
 
 	// 两端各推一条 channelUpdate：客户端据此重拉对端频道信息，把发送框置灰。
@@ -275,7 +299,7 @@ const (
 //
 // 只读判定，任何一步失败都按「可发送」放行（不下发 key）：这里是展示层提示，
 // 真正的拦截在 WuKongIM 白名单上，fail-open 不会造成越权。
-func annotateDMSendability(ctx *config.Context, resp *model.ChannelResp, peerUID, loginUID string) {
+func annotateDMSendability(ctx *config.Context, friendDB *friendDB, resp *model.ChannelResp, peerUID, loginUID string) {
 	if resp == nil || loginUID == "" || peerUID == "" || peerUID == loginUID {
 		return // 自己的频道永远可写
 	}
@@ -288,7 +312,6 @@ func annotateDMSendability(ctx *config.Context, resp *model.ChannelResp, peerUID
 	if shared {
 		return
 	}
-	friendDB := newFriendDB(ctx)
 	mutual, err := friendDB.isMutualFriend(peerUID, loginUID)
 	if err != nil {
 		ctx.Warn("判定好友关系失败，DM 可发送性按可发送处理",

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -409,6 +411,20 @@ func TestFireSpaceMemberRemoveEventWritesEvent(t *testing.T) {
 	testCtx.Event = event.New(testCtx)
 	defer func() { testCtx.Event = previous }()
 
+	// 先断「无监听方不落库」，再注册监听方断投递 —— 两件事必须在同一个用例里做：
+	// AddEventListener 是全局注册且没有注销 API，拆成两个用例的话，先跑的那个会把
+	// 监听方漏给后跑的，后者永远测不到"无监听"这一支。
+	f.fireSpaceMemberRemoveEvent("nolistener-space", "u", "op", MemberRemoveReasonKicked)
+	var pre int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM `event` WHERE event=?", event.SpaceMemberRemove).Load(&pre)
+	require.NoError(t, err)
+	require.Zero(t, pre, "无监听方时不该写事件行（解散大空间会逐成员触发，写了就是纯浪费）")
+
+	testCtx.AddEventListener(event.SpaceMemberRemove, func(data []byte, commit config.EventCommit) {
+		commit(nil)
+	})
+
 	f.fireSpaceMemberRemoveEvent("evt-space", "evt-uid", "evt-op", MemberRemoveReasonForceRemoved)
 
 	var rows []struct {
@@ -479,4 +495,72 @@ func TestRemoveMembersOnlyWrapsUpActuallyRemoved(t *testing.T) {
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, "b-low", jobs[0].UID)
+}
+
+// TestMemberRemovalRetryDelayReachesCap 退避必须真的能取到 5 分钟上限。
+// 先把 attempt 夹到 8 再算 1<<attempt 会让上限永远取不到（2^8=256s < 300s），
+// 整个重试预算跟着缩水到约 12 分钟。
+func TestMemberRemovalRetryDelayReachesCap(t *testing.T) {
+	assert.Equal(t, 256*time.Second, memberRemovalRetryDelay(8))
+	assert.Equal(t, 5*time.Minute, memberRemovalRetryDelay(9), "2^9=512s 必须被夹到 5 分钟")
+	assert.Equal(t, 5*time.Minute, memberRemovalRetryDelay(64), "超大 attempt 不得移位溢出")
+
+	total := time.Duration(0)
+	for i := uint32(1); i <= removalCleanupMaxAttempts; i++ {
+		total += memberRemovalRetryDelay(i)
+	}
+	assert.Greater(t, total, time.Hour,
+		"隔离性清理的重试窗口要能扛过一次像样的下游故障，否则工单会被打成 abandoned 且无人重驱")
+}
+
+// TestTruncateCleanupErrorKeepsValidUTF8 按字节切会切出半个字符，
+// utf8mb4 列在 strict 模式下拒写，那条 UPDATE 一失败 attempts 就不增、
+// next_attempt_at 也不推进——保护重试的函数反而把退避弄断。
+func TestTruncateCleanupErrorKeepsValidUTF8(t *testing.T) {
+	long := "dm_cutoff: " + strings.Repeat("中", 200)
+	got := truncateCleanupError(long)
+	assert.True(t, utf8.ValidString(got), "截断结果必须是合法 UTF-8")
+	assert.LessOrEqual(t, len(got), 255)
+	assert.Greater(t, len(got), 240, "不该为了对齐边界丢掉过多内容")
+}
+
+// TestCleanupWorkerContainsStepPanic panic 必须在单条工单这一层兜住并走正常的
+// 失败路径，否则 attempts 不增、状态留 pending，工单被反复认领反复 panic，
+// 永远到不了 abandoned，还会按 ORDER BY id 卡在队首把后面的工单饿死。
+func TestCleanupWorkerContainsStepPanic(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-panic"
+	seedMember(t, f, spaceID, "owner-p", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-p", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-p", 1, "owner-p", MemberRemoveReasonKicked)
+
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "panics",
+		fn: func(*config.Context, MemberRemoval) error {
+			panic("boom")
+		},
+	}})
+	defer restore()
+
+	assert.NotPanics(t, func() { f.processMemberRemovalCleanups() })
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status)
+	assert.EqualValues(t, 1, jobs[0].Attempts, "panic 也必须计入 attempts，否则永远到不了 abandoned")
+	assert.Empty(t, jobs[0].LeaseOwner, "panic 后必须释放租约")
+	assert.Contains(t, jobs[0].LastError, "panic")
+}
+
+// TestClaimCleanupOwnerIsPerClaim 租约持有者必须每次认领都不同。
+// 若是进程级常量，同进程内两个 goroutine 的 `AND lease_owner=?` 守卫会同时成立，
+// 先跑完的把工单标终态，另一个还在半路——群里出现重复的「被移出」系统消息。
+func TestClaimCleanupOwnerIsPerClaim(t *testing.T) {
+	a, b := newRemovalClaimOwner(), newRemovalClaimOwner()
+	assert.NotEqual(t, a, b)
+	// 必须放得进 lease_owner VARCHAR(64)：超长会被 MySQL 以 "Data too long"
+	// 拒掉整条认领，worker 于是一条工单都处理不了。
+	assert.LessOrEqual(t, len(a), 64, "租约标识不得超过 lease_owner 列宽")
 }

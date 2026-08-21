@@ -1041,6 +1041,11 @@ type RemoveGroupMembersServiceReq struct {
 	Members      []string // 待移除成员 UID 列表
 	OperatorUID  string   // 操作者 UID
 	OperatorName string   // 操作者名称
+	// SuppressRemoveNotice 抑制「被 X 移出群聊」系统消息，由调用方自行发更贴切的文案。
+	// 用于成员**自愿**离开却要走同一套移除流程的场景（如退出 Space 触发的级联退群）：
+	// 那里 Operator 就是本人，默认文案会渲染成「X 被 X 移出群聊」。
+	// 其余清理（IM 退订、CMD、子区/置顶/会话扩展、bot 级联）不受影响。
+	SuppressRemoveNotice bool
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应
@@ -1855,14 +1860,16 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 
 		// 发送被踢消息
-		removeReq := &config.MsgGroupMemberRemoveReq{
-			Operator:     req.OperatorUID,
-			OperatorName: req.OperatorName,
-			GroupNo:      req.GroupNo,
-			Members:      removedVos,
-		}
-		if err := s.ctx.SendGroupMemberBeRemove(removeReq); err != nil {
-			s.Error("send group member remove notification failed", zap.Error(err))
+		if !req.SuppressRemoveNotice {
+			removeReq := &config.MsgGroupMemberRemoveReq{
+				Operator:     req.OperatorUID,
+				OperatorName: req.OperatorName,
+				GroupNo:      req.GroupNo,
+				Members:      removedVos,
+			}
+			if err := s.ctx.SendGroupMemberBeRemove(removeReq); err != nil {
+				s.Error("send group member remove notification failed", zap.Error(err))
+			}
 		}
 
 		// 发送群成员更新 CMD

@@ -327,14 +327,14 @@ func TestAnnotateDMSendability(t *testing.T) {
 	t.Run("同处活跃 Space 时不下发标记", func(t *testing.T) {
 		seedSpaceMember(t, ctx, "ann-shared", "viewer", "peer")
 		resp := &model.ChannelResp{}
-		annotateDMSendability(ctx, resp, "peer", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "peer", "viewer")
 		assert.NotContains(t, resp.Extra, dmForbiddenExtraKey, "可发送时整个 key 都不该出现")
 	})
 
 	t.Run("无共同 Space 且非好友时标记不可发送", func(t *testing.T) {
 		require.NoError(t, testutil.CleanAllTables(ctx))
 		resp := &model.ChannelResp{}
-		annotateDMSendability(ctx, resp, "stranger", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "stranger", "viewer")
 		require.Contains(t, resp.Extra, dmForbiddenExtraKey)
 		assert.Equal(t, 1, resp.Extra[dmForbiddenExtraKey])
 		assert.Equal(t, dmForbiddenReasonNoSharedSpace, resp.Extra[dmForbiddenReasonExtraKey])
@@ -344,21 +344,21 @@ func TestAnnotateDMSendability(t *testing.T) {
 		require.NoError(t, testutil.CleanAllTables(ctx))
 		seedMutualFriend(t, ctx, "viewer", "buddy")
 		resp := &model.ChannelResp{}
-		annotateDMSendability(ctx, resp, "buddy", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "buddy", "viewer")
 		assert.NotContains(t, resp.Extra, dmForbiddenExtraKey)
 	})
 
 	t.Run("自己的频道永远可写", func(t *testing.T) {
 		require.NoError(t, testutil.CleanAllTables(ctx))
 		resp := &model.ChannelResp{}
-		annotateDMSendability(ctx, resp, "viewer", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "viewer", "viewer")
 		assert.NotContains(t, resp.Extra, dmForbiddenExtraKey)
 	})
 
 	t.Run("不覆盖既有 extra 字段", func(t *testing.T) {
 		require.NoError(t, testutil.CleanAllTables(ctx))
 		resp := &model.ChannelResp{Extra: map[string]interface{}{"sex": 1}}
-		annotateDMSendability(ctx, resp, "stranger", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "stranger", "viewer")
 		assert.Equal(t, 1, resp.Extra["sex"], "既有 extra 必须保留")
 		assert.Contains(t, resp.Extra, dmForbiddenExtraKey)
 	})
@@ -369,8 +369,84 @@ func TestAnnotateDMSendability(t *testing.T) {
 		_, err := ctx.DB().Exec("UPDATE space SET status=0 WHERE space_id=?", "ann-dead")
 		require.NoError(t, err)
 		resp := &model.ChannelResp{}
-		annotateDMSendability(ctx, resp, "peer", "viewer")
+		annotateDMSendability(ctx, newFriendDB(ctx), resp, "peer", "viewer")
 		assert.Contains(t, resp.Extra, dmForbiddenExtraKey,
 			"已解散 Space 不构成授权（GetCommonSpaceID 不校验 status，故不能用它判定）")
 	})
+}
+
+// TestDMCutoffAfterSpaceDisbanded 回归（code review P0）：解散会先把 space.status 置 0，
+// 若对端筛选按「活跃成员」口径走，整个私聊切断会静默空转——一条白名单都不摘。
+func TestDMCutoffAfterSpaceDisbanded(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, peer = "dm-disbanded", "u-removed", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, removed, peer)
+	seedDMPresence(t, ctx, removed, peer, spaceID)
+	// 复刻 forceDisbandSpace 的终态：空间置 0 + 全员置 0
+	_, err := ctx.DB().Exec("UPDATE space SET status=0 WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec("UPDATE space_member SET status=0 WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+
+	stub := newIMStub(t, ctx, []string{peer})
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "su", Reason: spacemod.MemberRemoveReasonSpaceDisbanded,
+	}))
+
+	removedCalls := stub.removedChannels()
+	assert.Equal(t, []string{removed}, removedCalls[peer])
+	assert.Equal(t, []string{peer}, removedCalls[removed])
+}
+
+// TestDMCutoffWhenBothPeersRemovedTogether 回归（code review P0）：A、B 同批被移除时
+// 各自工单里对方的 sm.status 都已是 0，按活跃口径筛会互相过滤掉，
+// 两人之间的私聊永远切不断。
+func TestDMCutoffWhenBothPeersRemovedTogether(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, a, b = "dm-both-removed", "u-a", "u-b"
+
+	seedSpaceMember(t, ctx, spaceID, a, b)
+	seedDMPresence(t, ctx, a, b, spaceID)
+	removeSpaceMember(t, ctx, spaceID, a)
+	removeSpaceMember(t, ctx, spaceID, b)
+
+	stub := newIMStub(t, ctx, []string{b})
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: a, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	removedCalls := stub.removedChannels()
+	assert.Equal(t, []string{a}, removedCalls[b])
+	assert.Equal(t, []string{b}, removedCalls[a])
+}
+
+// TestDMCutoffSingleDirectionFriend 单向好友：A 留着 A→B 的好友行，B 早把 A 删了。
+//
+// 白名单是按频道推导的（X 的频道白名单 = 谁能发给 X）：A 的频道仍因这条好友行授权 B，
+// 但 B 的频道并不授权 A。若任一方向有好友行就整个跳过，B 频道上那条早已失效的
+// 白名单就没人摘 —— A 还能继续发给 B。两个方向必须独立判定。
+func TestDMCutoffSingleDirectionFriend(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, a, b = "dm-one-direction", "u-a", "u-b"
+
+	seedSpaceMember(t, ctx, spaceID, a, b)
+	seedDMPresence(t, ctx, a, b, spaceID)
+	// 只有 a -> b 这一条有效好友行
+	_, err := ctx.DB().Exec(
+		"INSERT INTO friend (uid, to_uid, flag, version, is_deleted, is_alone, created_at, updated_at) VALUES (?, ?, 0, 1, 0, 0, NOW(), NOW())",
+		a, b)
+	require.NoError(t, err)
+	removeSpaceMember(t, ctx, spaceID, a)
+
+	stub := newIMStub(t, ctx, []string{b})
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: a, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	removedCalls := stub.removedChannels()
+	// a 的频道白名单仍因 a->b 的好友行包含 b：这个方向不该动
+	assert.NotContains(t, removedCalls, a, "a 仍授权 b 发给自己，该方向必须保留")
+	// b 的频道白名单已不含 a：这条陈旧条目必须摘掉
+	assert.Equal(t, []string{a}, removedCalls[b], "b 已不授权 a，该方向必须切断")
 }

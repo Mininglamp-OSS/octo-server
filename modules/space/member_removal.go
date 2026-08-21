@@ -2,7 +2,9 @@ package space
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -134,6 +136,14 @@ func (s *Space) fireSpaceMemberRemoveEvent(spaceID, uid, operatorUID, reason str
 	if s.ctx.Event == nil {
 		return
 	}
+	// 没有任何监听方时不落库。事件行的代价是一次事务 + 后续 QueryWithID 与一条
+	// UPDATE（handleEvent 在 listeners == nil 分支上仍会把行标成 Success），
+	// 解散一个几千人的空间就是上万次纯浪费的 DB 操作，还会持续撑大 event 表。
+	// 保留这条事件是为了给下游留扩展点：一旦有人 AddEventListener，这里自动开始投递。
+	// 会话面清理的可靠投递由 space_member_removal_cleanup 工单承担，不依赖本事件。
+	if len(s.ctx.GetEventListeners(event.SpaceMemberRemove)) == 0 {
+		return
+	}
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("开启SpaceMemberRemove事件事务失败", zap.Error(err))
@@ -200,9 +210,27 @@ func (s *Space) afterMemberRemoved(spaceID, uid, operatorUID, reason string) {
 
 // ---------- worker ----------
 
-// removalWorkerOwner 本进程的租约持有者标识。进程级唯一即可：租约只用来防止
-// 同一工单被两个 worker 并发执行，不承担身份语义。
-var removalWorkerOwner = "space-removal-" + util.GenerUUID()
+// removalWorkerPrefix 本进程标识，只用于让日志里能看出是哪个副本在跑。
+// 刻意保持短：租约标识要连同下面的计数器一起塞进 lease_owner VARCHAR(64)。
+var removalWorkerPrefix = "sr-" + util.GenerUUID()
+
+// removalClaimSeq 进程内单调计数器，给每次认领配一个唯一后缀。
+// 用计数器而不是再拼一个 UUID：两个 32 位 UUID 加前缀是 78 字符，超过
+// lease_owner 的列宽，MySQL 会直接以 "Data too long" 拒掉整条认领。
+var removalClaimSeq atomic.Uint64
+
+// newRemovalClaimOwner 为**每一次认领**生成唯一的租约持有者标识。
+//
+// 不能用进程级常量：afterMembersRemoved 起的那个 goroutine 与 10s 定时器会同时
+// 调 processMemberRemovalCleanups。群级联要逐个群调 RemoveGroupMembers（每个群都
+// 有 IM 退订 + 发 Tip + 子区清理），很容易超过 60s 租约；租约一过期，另一个
+// goroutine 就能重新认领同一条工单。若两者 owner 相同，finish/release 上的
+// `AND lease_owner=?` 对双方都成立——先跑完的把工单标成终态，另一个还在半路，
+// 群里于是出现重复的「被移出」系统消息，慢的那个再 release 还会把已完成的工单
+// 复活。每次认领一个新 owner，就能让晚到的那个写入落空并被察觉。
+func newRemovalClaimOwner() string {
+	return removalWorkerPrefix + "-" + strconv.FormatUint(removalClaimSeq.Add(1), 10)
+}
 
 // startMemberRemovalCleanupWorker 挂上定时调度。由 Route() 调用，与 user 侧
 // processPendingSessionRevocations 的接法一致。
@@ -221,7 +249,8 @@ func (s *Space) processMemberRemovalCleanups() {
 		}
 	}()
 	for processed := 0; processed < removalCleanupBatchSize; processed++ {
-		job, err := s.db.claimMemberRemovalCleanup(removalWorkerOwner, time.Now())
+		owner := newRemovalClaimOwner()
+		job, err := s.db.claimMemberRemovalCleanup(owner, time.Now().UTC())
 		if err != nil {
 			s.Error("认领成员移除清理工单失败", zap.Error(err))
 			return
@@ -229,23 +258,36 @@ func (s *Space) processMemberRemovalCleanups() {
 		if job == nil {
 			return
 		}
-		s.runMemberRemovalCleanupJob(job)
+		s.runMemberRemovalCleanupJob(job, owner)
 	}
 }
 
 // runMemberRemovalCleanupJob 执行单条工单。
-func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob) {
+//
+// panic 必须在**这一层**兜住：清理步骤是别的模块注册进来的，一次 panic 若穿到
+// 批次层，就会绕过 releaseCleanupJob —— attempts 不增、状态还是 pending、租约
+// 60s 后自然到期，于是同一条工单被反复认领、反复 panic，永远到不了 abandoned；
+// 而且它按 `ORDER BY id` 一直排在队首，把后面所有工单都饿死。
+func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Error("成员移除清理步骤 panic",
+				zap.Any("recover", r), zap.Uint64("jobId", job.ID),
+				zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
+			s.releaseCleanupJob(job, owner, "panic", fmt.Errorf("cleanup step panicked: %v", r))
+		}
+	}()
 	// 先对齐当前真实成员身份再动手。工单可能在退避期间变陈旧：成员被移除后又重新
 	// 加入，这时把他的群和私聊拆掉才是真正的故障。活跃成员 → 工单直接作废。
 	member, err := s.db.queryMember(job.SpaceID, job.UID)
 	if err != nil {
-		s.releaseCleanupJob(job, "membership_recheck_failed", err)
+		s.releaseCleanupJob(job, owner, "membership_recheck_failed", err)
 		return
 	}
 	if member != nil {
 		s.Info("被移除成员已重新加入，跳过会话面清理",
 			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
-		s.finishCleanupJob(job, removalCleanupDone, "skipped_rejoined")
+		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined")
 		return
 	}
 
@@ -257,28 +299,28 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob) {
 	}
 	for _, step := range snapshotCleanupSteps() {
 		if err := step.fn(s.ctx, removal); err != nil {
-			s.releaseCleanupJob(job, step.name, err)
+			s.releaseCleanupJob(job, owner, step.name, err)
 			return
 		}
 	}
-	s.finishCleanupJob(job, removalCleanupDone, "")
+	s.finishCleanupJob(job, owner, removalCleanupDone, "")
 }
 
 // releaseCleanupJob 记一次失败并安排重试；attempts 用尽则置为 abandoned 并高声报错。
-func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, stepName string, cause error) {
+func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, owner, stepName string, cause error) {
 	if job.Attempts+1 >= removalCleanupMaxAttempts {
 		s.Error("成员移除清理工单重试耗尽，置为 abandoned",
 			zap.Uint64("jobId", job.ID), zap.String("spaceId", job.SpaceID),
 			zap.String("uid", job.UID), zap.String("step", stepName),
 			zap.Uint32("attempts", job.Attempts+1), zap.Error(cause))
-		s.finishCleanupJob(job, removalCleanupAbandoned, stepName+": retries exhausted")
+		s.finishCleanupJob(job, owner, removalCleanupAbandoned, stepName+": retries exhausted")
 		return
 	}
 	s.Warn("成员移除清理步骤失败，稍后重试",
 		zap.Uint64("jobId", job.ID), zap.String("spaceId", job.SpaceID),
 		zap.String("uid", job.UID), zap.String("step", stepName),
 		zap.Uint32("attempts", job.Attempts), zap.Error(cause))
-	if err := s.db.releaseMemberRemovalCleanup(job.ID, removalWorkerOwner, job.Attempts,
+	if err := s.db.releaseMemberRemovalCleanup(job.ID, owner, job.Attempts,
 		fmt.Sprintf("%s: %v", stepName, cause)); err != nil {
 		s.Warn("释放成员移除清理工单失败", zap.Uint64("jobId", job.ID), zap.Error(err))
 	}
@@ -286,8 +328,8 @@ func (s *Space) releaseCleanupJob(job *memberRemovalCleanupJob, stepName string,
 
 // finishCleanupJob 写终态。租约易主（affected=0）只记日志：另一个 worker 已接手，
 // 重复执行是安全的（步骤契约要求幂等）。
-func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, status uint8, note string) {
-	ok, err := s.db.finishMemberRemovalCleanup(job.ID, removalWorkerOwner, status, note)
+func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, status uint8, note string) {
+	ok, err := s.db.finishMemberRemovalCleanup(job.ID, owner, status, note)
 	if err != nil {
 		s.Warn("更新成员移除清理工单终态失败", zap.Uint64("jobId", job.ID), zap.Error(err))
 		return
