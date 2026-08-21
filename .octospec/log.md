@@ -4,6 +4,24 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-21 (space-member-removal-cleanup)
+
+- **Implemented** — Space member removal now ends the member's participation in
+  the Space's conversations instead of only soft-deleting `space_member`. A
+  transactional outbox (`space_member_removal_cleanup`) drives a leased, retried
+  cascade that exits every group in the Space and drops the Person-channel
+  whitelist entries whose authorization is gone (per direction, keeping DMs a
+  second shared Space or a friendship still authorizes); the `SpaceMiddleware`
+  and notify membership caches are invalidated inside the request. Covers all
+  five removal paths — the owner-initiated `DELETE /v1/space/:space_id` was not
+  in the original survey because it only flipped `space.status`. Adds an additive
+  `dm_forbidden` Person-channel extra so clients can render the composer
+  read-only. See [journal](journal/shared/space-member-removal-cleanup.md).
+- **Learning (pending)** — Deferred cleanup must be scoped with was-ever
+  predicates: an is-currently predicate observes the state the trigger already
+  destroyed and turns the job into a silent no-op. See
+  [learning](learnings/pending/cleanup-predicate-tense.md).
+
 ## 2026-08-13 (cutover-framework)
 
 - **Refactor** — Task `cutover-framework`: extracted the control plane the three
