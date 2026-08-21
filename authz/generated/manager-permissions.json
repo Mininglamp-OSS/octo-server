@@ -1,0 +1,2978 @@
+{
+  "schema_version": 1,
+  "content_hash": "b233710e3f66198b10ff1d618a38a24be237e903edb21a345b160d39119fea20",
+  "permissions": [
+    {
+      "key": "app_bot.avatar.update",
+      "resource": "app_bot_avatar",
+      "action": "update",
+      "description": "以全局管理员身份修改 App Bot 头像",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_bot.create",
+      "resource": "app_bot",
+      "action": "create",
+      "description": "创建平台 App Bot",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_bot.delete",
+      "resource": "app_bot",
+      "action": "delete",
+      "description": "删除平台 App Bot",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "app_bot.publish",
+      "resource": "app_bot",
+      "action": "publish",
+      "description": "发布平台 App Bot",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_bot.read",
+      "resource": "app_bot",
+      "action": "read",
+      "description": "查看平台 App Bot",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "app_bot.token.reveal",
+      "resource": "app_bot_token",
+      "action": "reveal",
+      "description": "查看平台 App Bot 明文 token",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "app_bot.token.rotate",
+      "resource": "app_bot_token",
+      "action": "rotate",
+      "description": "轮换平台 App Bot token",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "app_bot.unpublish",
+      "resource": "app_bot",
+      "action": "unpublish",
+      "description": "下架平台 App Bot",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_bot.update",
+      "resource": "app_bot",
+      "action": "update",
+      "description": "修改平台 App Bot",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_config.read",
+      "resource": "app_config",
+      "action": "read",
+      "description": "查看应用配置",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "app_config.write",
+      "resource": "app_config",
+      "action": "write",
+      "description": "修改应用配置",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_module.read",
+      "resource": "app_module",
+      "action": "read",
+      "description": "查看应用模块",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "app_module.write",
+      "resource": "app_module",
+      "action": "write",
+      "description": "维护应用模块",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "app_version.read",
+      "resource": "app_version",
+      "action": "read",
+      "description": "查看应用版本",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "app_version.write",
+      "resource": "app_version",
+      "action": "write",
+      "description": "发布应用版本",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "backup.config.read",
+      "resource": "backup_config",
+      "action": "read",
+      "description": "查看备份配置",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "backup.config.test",
+      "resource": "backup_config",
+      "action": "test",
+      "description": "测试备份存储连接",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "backup.config.write",
+      "resource": "backup_config",
+      "action": "write",
+      "description": "修改备份配置",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "backup.download",
+      "resource": "backup",
+      "action": "download",
+      "description": "下载备份文件",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "backup.history.delete",
+      "resource": "backup_history",
+      "action": "delete",
+      "description": "删除备份历史",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "backup.history.read",
+      "resource": "backup_history",
+      "action": "read",
+      "description": "查看备份历史",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "backup.status.read",
+      "resource": "backup_status",
+      "action": "read",
+      "description": "查看备份状态",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "backup.trigger",
+      "resource": "backup",
+      "action": "trigger",
+      "description": "手动触发备份",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "card_template.activate",
+      "resource": "card_template",
+      "action": "activate",
+      "description": "切换卡片模板活动版本",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "card_template.audit.read",
+      "resource": "card_template_audit",
+      "action": "read",
+      "description": "查看卡片模板审计记录",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "card_template.block",
+      "resource": "card_template",
+      "action": "block",
+      "description": "封禁卡片模板",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "card_template.publish",
+      "resource": "card_template",
+      "action": "publish",
+      "description": "发布卡片模板",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "card_template.read",
+      "resource": "card_template",
+      "action": "read",
+      "description": "查看卡片模板",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "card_template.rollback",
+      "resource": "card_template",
+      "action": "rollback",
+      "description": "回滚卡片模板",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "card_template.validate",
+      "resource": "card_template",
+      "action": "validate",
+      "description": "验证卡片模板",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "dashboard.etl.trigger",
+      "resource": "dashboard_etl",
+      "action": "trigger",
+      "description": "手动触发看板 ETL",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "dashboard.read",
+      "resource": "dashboard",
+      "action": "read",
+      "description": "查看运营看板",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "expert.read",
+      "resource": "expert",
+      "action": "read",
+      "description": "查看专家市场",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "expert.write",
+      "resource": "expert",
+      "action": "write",
+      "description": "维护专家市场",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "group.member.remove",
+      "resource": "group_member",
+      "action": "remove",
+      "description": "以全局管理员身份移除群成员",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "group.read",
+      "resource": "group",
+      "action": "read",
+      "description": "查看全局群组信息",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "group.write",
+      "resource": "group",
+      "action": "write",
+      "description": "执行全局群组管理",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "integration.oidc_client.write",
+      "resource": "oidc_client",
+      "action": "write",
+      "description": "修改 OIDC 客户端配置",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "mcp.read",
+      "resource": "mcp",
+      "action": "read",
+      "description": "查看系统 MCP",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "mcp.write",
+      "resource": "mcp",
+      "action": "write",
+      "description": "维护系统 MCP",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "message.broadcast.send",
+      "resource": "message",
+      "action": "broadcast",
+      "description": "向全部用户广播消息",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "message.delete",
+      "resource": "message",
+      "action": "delete",
+      "description": "删除消息",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "message.direct_history.read",
+      "resource": "direct_message_history",
+      "action": "read",
+      "description": "查看任意私聊历史",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "message.history.read",
+      "resource": "message_history",
+      "action": "read",
+      "description": "查看全局消息历史",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "message.impersonated.send",
+      "resource": "message",
+      "action": "impersonated_send",
+      "description": "代用户向好友发送消息",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "message.outbound.read",
+      "resource": "message",
+      "action": "read",
+      "description": "查看管理消息发送记录",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "message.prohibited_word.read",
+      "resource": "prohibited_word",
+      "action": "read",
+      "description": "查看违禁词",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "message.prohibited_word.write",
+      "resource": "prohibited_word",
+      "action": "write",
+      "description": "维护违禁词",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "message.send",
+      "resource": "message",
+      "action": "send",
+      "description": "发送管理消息",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "report.read",
+      "resource": "report",
+      "action": "read",
+      "description": "查看举报列表",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "robot.delete",
+      "resource": "robot",
+      "action": "delete",
+      "description": "删除平台机器人",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "robot.menu.read",
+      "resource": "robot_menu",
+      "action": "read",
+      "description": "查看机器人菜单",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "robot.menu.write",
+      "resource": "robot_menu",
+      "action": "write",
+      "description": "删除机器人菜单",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "robot.read",
+      "resource": "robot",
+      "action": "read",
+      "description": "查看平台机器人",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "robot.status.write",
+      "resource": "robot",
+      "action": "status_write",
+      "description": "修改机器人状态",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "robot.token.revoke",
+      "resource": "robot_token",
+      "action": "revoke",
+      "description": "吊销机器人 token",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "robot.update",
+      "resource": "robot",
+      "action": "update",
+      "description": "修改平台机器人",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "skill.read",
+      "resource": "skill",
+      "action": "read",
+      "description": "查看系统 Skill",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "skill.write",
+      "resource": "skill",
+      "action": "write",
+      "description": "维护系统 Skill",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "space.create",
+      "resource": "space",
+      "action": "create",
+      "description": "代建 Space",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "space.destroy",
+      "resource": "space",
+      "action": "destroy",
+      "description": "强制解散 Space",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "space.invite.write",
+      "resource": "space_invite",
+      "action": "write",
+      "description": "维护 Space 邀请码",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "space.join_request.write",
+      "resource": "space_join_request",
+      "action": "write",
+      "description": "审批 Space 加入申请",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "space.member.add",
+      "resource": "space_member",
+      "action": "add",
+      "description": "强制添加 Space 成员",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "space.member.remove",
+      "resource": "space_member",
+      "action": "remove",
+      "description": "强制移除 Space 成员",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "space.member.role.write",
+      "resource": "space_member",
+      "action": "role_write",
+      "description": "修改 Space 成员角色",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "space.owner_invite.write",
+      "resource": "space_owner_invite",
+      "action": "write",
+      "description": "维护 Space owner 邮件邀请",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "space.read",
+      "resource": "space",
+      "action": "read",
+      "description": "查看全局 Space 信息",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "space.status.write",
+      "resource": "space",
+      "action": "status_write",
+      "description": "封禁或解禁 Space",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "space.update",
+      "resource": "space",
+      "action": "update",
+      "description": "修改 Space 基础信息",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "statistics.read",
+      "resource": "statistics",
+      "action": "read",
+      "description": "查看全局统计数据",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "system_setting.read",
+      "resource": "system_setting",
+      "action": "read",
+      "description": "查看系统设置",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "system_setting.write",
+      "resource": "system_setting",
+      "action": "write",
+      "description": "修改或测试系统设置",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.admin.manage",
+      "resource": "admin_user",
+      "action": "manage",
+      "description": "管理管理员账号",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.create",
+      "resource": "user",
+      "action": "create",
+      "description": "创建用户",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "user.fixed_role.read",
+      "resource": "fixed_manager_role",
+      "action": "read",
+      "description": "查看固定管理角色成员",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.fixed_role.write",
+      "resource": "fixed_manager_role",
+      "action": "write",
+      "description": "授予或撤销固定管理角色",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.password.reset",
+      "resource": "user_password",
+      "action": "reset",
+      "description": "重置用户密码",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.password.update",
+      "resource": "user_password",
+      "action": "update",
+      "description": "修改用户密码",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.phone_shadow.backfill",
+      "resource": "phone_shadow",
+      "action": "backfill",
+      "description": "执行手机号影子列回填",
+      "sensitivity": "critical"
+    },
+    {
+      "key": "user.phone_shadow.read",
+      "resource": "phone_shadow",
+      "action": "read",
+      "description": "查看手机号影子列回填状态",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "user.read",
+      "resource": "user",
+      "action": "read",
+      "description": "查看全局用户信息",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "user.status.write",
+      "resource": "user",
+      "action": "status_write",
+      "description": "封禁或解禁用户",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "workplace.app.read",
+      "resource": "workplace_app",
+      "action": "read",
+      "description": "查看工作台应用",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "workplace.app.write",
+      "resource": "workplace_app",
+      "action": "write",
+      "description": "维护工作台应用",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "workplace.banner.read",
+      "resource": "workplace_banner",
+      "action": "read",
+      "description": "查看工作台横幅",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "workplace.banner.write",
+      "resource": "workplace_banner",
+      "action": "write",
+      "description": "维护工作台横幅",
+      "sensitivity": "elevated"
+    },
+    {
+      "key": "workplace.category.read",
+      "resource": "workplace_category",
+      "action": "read",
+      "description": "查看工作台分类",
+      "sensitivity": "standard"
+    },
+    {
+      "key": "workplace.category.write",
+      "resource": "workplace_category",
+      "action": "write",
+      "description": "维护工作台分类",
+      "sensitivity": "elevated"
+    }
+  ],
+  "legacy_capabilities": [
+    {
+      "key": "appversion.read",
+      "permissions": [
+        "app_version.read"
+      ],
+      "mode": "any",
+      "description": "应用版本读取兼容能力"
+    },
+    {
+      "key": "appversion.write",
+      "permissions": [
+        "app_version.write"
+      ],
+      "mode": "any",
+      "description": "应用版本写入兼容能力"
+    },
+    {
+      "key": "backup",
+      "permissions": [
+        "backup.config.read",
+        "backup.config.test",
+        "backup.config.write",
+        "backup.download",
+        "backup.history.delete",
+        "backup.history.read",
+        "backup.status.read",
+        "backup.trigger"
+      ],
+      "mode": "any",
+      "description": "备份管理入口兼容能力"
+    },
+    {
+      "key": "dashboard.read",
+      "permissions": [
+        "dashboard.read"
+      ],
+      "mode": "any",
+      "description": "运营看板读取兼容能力"
+    },
+    {
+      "key": "dashboard.trigger",
+      "permissions": [
+        "dashboard.etl.trigger"
+      ],
+      "mode": "any",
+      "description": "手动触发看板 ETL 兼容能力"
+    },
+    {
+      "key": "expert.read",
+      "permissions": [
+        "expert.read"
+      ],
+      "mode": "any",
+      "description": "专家市场读取兼容能力"
+    },
+    {
+      "key": "expert.write",
+      "permissions": [
+        "expert.write"
+      ],
+      "mode": "any",
+      "description": "专家市场写入兼容能力"
+    },
+    {
+      "key": "groups.read",
+      "permissions": [
+        "group.read"
+      ],
+      "mode": "any",
+      "description": "群组读取兼容能力"
+    },
+    {
+      "key": "groups.write",
+      "permissions": [
+        "group.member.remove",
+        "group.write"
+      ],
+      "mode": "any",
+      "description": "群组写入兼容能力"
+    },
+    {
+      "key": "mcp.read",
+      "permissions": [
+        "mcp.read"
+      ],
+      "mode": "any",
+      "description": "系统 MCP 读取兼容能力"
+    },
+    {
+      "key": "mcp.write",
+      "permissions": [
+        "mcp.write"
+      ],
+      "mode": "any",
+      "description": "系统 MCP 写入兼容能力"
+    },
+    {
+      "key": "skill.read",
+      "permissions": [
+        "skill.read"
+      ],
+      "mode": "any",
+      "description": "系统 Skill 读取兼容能力"
+    },
+    {
+      "key": "skill.write",
+      "permissions": [
+        "skill.write"
+      ],
+      "mode": "any",
+      "description": "系统 Skill 写入兼容能力"
+    },
+    {
+      "key": "space.destructive",
+      "permissions": [
+        "space.destroy",
+        "space.member.remove",
+        "space.member.role.write",
+        "space.status.write"
+      ],
+      "mode": "any",
+      "description": "Space 高危操作兼容能力"
+    },
+    {
+      "key": "space.read",
+      "permissions": [
+        "space.read"
+      ],
+      "mode": "any",
+      "description": "Space 读取兼容能力"
+    },
+    {
+      "key": "space.write",
+      "permissions": [
+        "space.create",
+        "space.invite.write",
+        "space.join_request.write",
+        "space.member.add",
+        "space.owner_invite.write",
+        "space.update"
+      ],
+      "mode": "any",
+      "description": "Space 普通写入兼容能力"
+    },
+    {
+      "key": "system_setting",
+      "permissions": [
+        "system_setting.read",
+        "system_setting.write"
+      ],
+      "mode": "any",
+      "description": "系统设置入口兼容能力"
+    },
+    {
+      "key": "users.manage_admin",
+      "permissions": [
+        "user.admin.manage",
+        "user.fixed_role.read",
+        "user.fixed_role.write"
+      ],
+      "mode": "any",
+      "description": "管理员账号控制面兼容能力"
+    },
+    {
+      "key": "users.read",
+      "permissions": [
+        "user.read"
+      ],
+      "mode": "any",
+      "description": "用户读取兼容能力"
+    },
+    {
+      "key": "users.write",
+      "permissions": [
+        "user.create",
+        "user.password.reset",
+        "user.password.update",
+        "user.status.write"
+      ],
+      "mode": "any",
+      "description": "用户写入兼容能力"
+    }
+  ],
+  "gate_sites": [
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.createPlatformBot#1",
+      "module": "app_bot",
+      "symbol": "AppBot.createPlatformBot",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.deleteBot#1",
+      "module": "app_bot",
+      "symbol": "AppBot.deleteBot",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.getBotDetail#1",
+      "module": "app_bot",
+      "symbol": "AppBot.getBotDetail",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.listPlatformBots#1",
+      "module": "app_bot",
+      "symbol": "AppBot.listPlatformBots",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.publishBot#1",
+      "module": "app_bot",
+      "symbol": "AppBot.publishBot",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.revealToken#1",
+      "module": "app_bot",
+      "symbol": "AppBot.revealToken",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.rotateToken#1",
+      "module": "app_bot",
+      "symbol": "AppBot.rotateToken",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.unpublishBot#1",
+      "module": "app_bot",
+      "symbol": "AppBot.unpublishBot",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/app_bot/app_bot.go::AppBot.updateBot#1",
+      "module": "app_bot",
+      "symbol": "AppBot.updateBot",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.deleteHistory#1",
+      "module": "backup",
+      "symbol": "Manager.deleteHistory",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.getConfig#1",
+      "module": "backup",
+      "symbol": "Manager.getConfig",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.getDownloadURL#1",
+      "module": "backup",
+      "symbol": "Manager.getDownloadURL",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.getHistory#1",
+      "module": "backup",
+      "symbol": "Manager.getHistory",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.getStatus#1",
+      "module": "backup",
+      "symbol": "Manager.getStatus",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.testConnection#1",
+      "module": "backup",
+      "symbol": "Manager.testConnection",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.triggerBackup#1",
+      "module": "backup",
+      "symbol": "Manager.triggerBackup",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/backup/api_manager.go::Manager.updateConfig#1",
+      "module": "backup",
+      "symbol": "Manager.updateConfig",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/card_template_catalog/api.go::API.requireSuperAdmin#1",
+      "module": "card_template_catalog",
+      "symbol": "API.requireSuperAdmin",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api.go::Common.addAppVersion#1",
+      "module": "common",
+      "symbol": "Common.addAppVersion",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api.go::Common.appVersionList#1",
+      "module": "common",
+      "symbol": "Common.appVersionList",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.addAppModule#1",
+      "module": "common",
+      "symbol": "Manager.addAppModule",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.appconfig#1",
+      "module": "common",
+      "symbol": "Manager.appconfig",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.deleteAppModule#1",
+      "module": "common",
+      "symbol": "Manager.deleteAppModule",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.getAppModule#1",
+      "module": "common",
+      "symbol": "Manager.getAppModule",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.updateAppModule#1",
+      "module": "common",
+      "symbol": "Manager.updateAppModule",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager.go::Manager.updateConfig#1",
+      "module": "common",
+      "symbol": "Manager.updateConfig",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager_system_setting.go::Manager.listSystemSettings#1",
+      "module": "common",
+      "symbol": "Manager.listSystemSettings",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager_system_setting.go::Manager.testSystemSettingEmail#1",
+      "module": "common",
+      "symbol": "Manager.testSystemSettingEmail",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/common/api_manager_system_setting.go::Manager.updateSystemSettings#1",
+      "module": "common",
+      "symbol": "Manager.updateSystemSettings",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/group/api.go::Group.memberRemove#1",
+      "module": "group",
+      "symbol": "Group.memberRemove",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.blacklist#1",
+      "module": "group",
+      "symbol": "Manager.blacklist",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.disablelist#1",
+      "module": "group",
+      "symbol": "Manager.disablelist",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.forbidden#1",
+      "module": "group",
+      "symbol": "Manager.forbidden",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.leftbangroup#1",
+      "module": "group",
+      "symbol": "Manager.leftbangroup",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.list#1",
+      "module": "group",
+      "symbol": "Manager.list",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.members#1",
+      "module": "group",
+      "symbol": "Manager.members",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/group/api_manager.go::Manager.removeMember#1",
+      "module": "group",
+      "symbol": "Manager.removeMember",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/integration/api.go::Integration.upsertManagerClient#1",
+      "module": "integration",
+      "symbol": "Integration.upsertManagerClient",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.addProhibitWords#1",
+      "module": "message",
+      "symbol": "Manager.addProhibitWords",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.delete#1",
+      "module": "message",
+      "symbol": "Manager.delete",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.deleteProhibitWords#1",
+      "module": "message",
+      "symbol": "Manager.deleteProhibitWords",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.list#1",
+      "module": "message",
+      "symbol": "Manager.list",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.prohibitWords#1",
+      "module": "message",
+      "symbol": "Manager.prohibitWords",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.record#1",
+      "module": "message",
+      "symbol": "Manager.record",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.recordpersonal#1",
+      "module": "message",
+      "symbol": "Manager.recordpersonal",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.sendMsg#1",
+      "module": "message",
+      "symbol": "Manager.sendMsg",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.sendMsgToAllUsers#1",
+      "module": "message",
+      "symbol": "Manager.sendMsgToAllUsers",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/message/api_manager.go::Manager.sendMsgToFriends#1",
+      "module": "message",
+      "symbol": "Manager.sendMsgToFriends",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/opanalytics/api.go::Manager.requireSuperAdmin#1",
+      "module": "opanalytics",
+      "symbol": "Manager.requireSuperAdmin",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/report/api_manager.go::Manager.reportList#1",
+      "module": "report",
+      "symbol": "Manager.reportList",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.delete#1",
+      "module": "robot",
+      "symbol": "Manager.delete",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.list#1",
+      "module": "robot",
+      "symbol": "Manager.list",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.robotDelete#1",
+      "module": "robot",
+      "symbol": "Manager.robotDelete",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.robotDetail#1",
+      "module": "robot",
+      "symbol": "Manager.robotDetail",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.robotList#1",
+      "module": "robot",
+      "symbol": "Manager.robotList",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.robotRevokeToken#1",
+      "module": "robot",
+      "symbol": "Manager.robotRevokeToken",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.robotUpdate#1",
+      "module": "robot",
+      "symbol": "Manager.robotUpdate",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/robot/api_manager.go::Manager.updateRobotStatus#1",
+      "module": "robot",
+      "symbol": "Manager.updateRobotStatus",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/space/api_manager.go::Manager.requireAdmin#1",
+      "module": "space",
+      "symbol": "Manager.requireAdmin",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/space/api_manager.go::Manager.requireSuperAdmin#1",
+      "module": "space",
+      "symbol": "Manager.requireSuperAdmin",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/statistics/api.go::Statistics.countNum#1",
+      "module": "statistics",
+      "symbol": "Statistics.countNum",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/statistics/api.go::Statistics.createGroupWithDateSpace#1",
+      "module": "statistics",
+      "symbol": "Statistics.createGroupWithDateSpace",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1",
+      "module": "statistics",
+      "symbol": "Statistics.registerUserListWithDateSpace",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api.go::User.uploadAvatar#1",
+      "module": "user",
+      "symbol": "User.uploadAvatar",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api.go::User.uploadAvatar#2",
+      "module": "user",
+      "symbol": "User.uploadAvatar",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.addAdminUser#1",
+      "module": "user",
+      "symbol": "Manager.addAdminUser",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.addUser#1",
+      "module": "user",
+      "symbol": "Manager.addUser",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.blacklist#1",
+      "module": "user",
+      "symbol": "Manager.blacklist",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.deleteAdminUsers#1",
+      "module": "user",
+      "symbol": "Manager.deleteAdminUsers",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.devices#1",
+      "module": "user",
+      "symbol": "Manager.devices",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.disableUsers#1",
+      "module": "user",
+      "symbol": "Manager.disableUsers",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.friends#1",
+      "module": "user",
+      "symbol": "Manager.friends",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.getAdminUsers#1",
+      "module": "user",
+      "symbol": "Manager.getAdminUsers",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.liftBanUser#1",
+      "module": "user",
+      "symbol": "Manager.liftBanUser",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.list#1",
+      "module": "user",
+      "symbol": "Manager.list",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.listUsersWithFixedManagerRole#1",
+      "module": "user",
+      "symbol": "Manager.listUsersWithFixedManagerRole",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.online#1",
+      "module": "user",
+      "symbol": "Manager.online",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.phoneShadowBackfill#1",
+      "module": "user",
+      "symbol": "Manager.phoneShadowBackfill",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.phoneShadowBackfillStatus#1",
+      "module": "user",
+      "symbol": "Manager.phoneShadowBackfillStatus",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.resetUserPassword#1",
+      "module": "user",
+      "symbol": "Manager.resetUserPassword",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.setFixedManagerRole#1",
+      "module": "user",
+      "symbol": "Manager.setFixedManagerRole",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/user/api_manager.go::Manager.updatePwd#1",
+      "module": "user",
+      "symbol": "Manager.updatePwd",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.addApp#1",
+      "module": "workplace",
+      "symbol": "manager.addApp",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.addBanner#1",
+      "module": "workplace",
+      "symbol": "manager.addBanner",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.addCategory#1",
+      "module": "workplace",
+      "symbol": "manager.addCategory",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.addCategoryApp#1",
+      "module": "workplace",
+      "symbol": "manager.addCategoryApp",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.deleteApp#1",
+      "module": "workplace",
+      "symbol": "manager.deleteApp",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.deleteBanner#1",
+      "module": "workplace",
+      "symbol": "manager.deleteBanner",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.deleteCategory#1",
+      "module": "workplace",
+      "symbol": "manager.deleteCategory",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.deleteCategoryApp#1",
+      "module": "workplace",
+      "symbol": "manager.deleteCategoryApp",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.getApps#1",
+      "module": "workplace",
+      "symbol": "manager.getApps",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.getBanners#1",
+      "module": "workplace",
+      "symbol": "manager.getBanners",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.getCategory#1",
+      "module": "workplace",
+      "symbol": "manager.getCategory",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.getCategoryApps#1",
+      "module": "workplace",
+      "symbol": "manager.getCategoryApps",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.reorderBanner#1",
+      "module": "workplace",
+      "symbol": "manager.reorderBanner",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.reorderCategory#1",
+      "module": "workplace",
+      "symbol": "manager.reorderCategory",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.reorderCategoryApp#1",
+      "module": "workplace",
+      "symbol": "manager.reorderCategoryApp",
+      "legacy_gate": "admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.updateApp#1",
+      "module": "workplace",
+      "symbol": "manager.updateApp",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.updateBanner#1",
+      "module": "workplace",
+      "symbol": "manager.updateBanner",
+      "legacy_gate": "super_admin"
+    },
+    {
+      "source": "modules/workplace/api_manager.go::manager.updateCategory#1",
+      "module": "workplace",
+      "symbol": "manager.updateCategory",
+      "legacy_gate": "super_admin"
+    }
+  ],
+  "operations": [
+    {
+      "id": "app_bot.avatar.update",
+      "method": "POST",
+      "path": "/v1/users/:uid/avatar",
+      "module": "user",
+      "handler": "User.uploadAvatar",
+      "permission": "app_bot.avatar.update",
+      "gate_sites": [
+        "modules/user/api.go::User.uploadAvatar#1",
+        "modules/user/api.go::User.uploadAvatar#2"
+      ],
+      "scope": "global_admin_with_business_acl",
+      "business_acl": {
+        "type": "bot_owner_or_space_admin",
+        "description": "非全局管理员时继续执行 Bot owner 或 Space admin 业务 ACL"
+      }
+    },
+    {
+      "id": "app_bot.create",
+      "method": "POST",
+      "path": "/v1/admin/app_bot",
+      "module": "app_bot",
+      "handler": "AppBot.createPlatformBot",
+      "permission": "app_bot.create",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.createPlatformBot#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.delete",
+      "method": "DELETE",
+      "path": "/v1/admin/app_bot/:id",
+      "module": "app_bot",
+      "handler": "AppBot.deleteBot",
+      "permission": "app_bot.delete",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.deleteBot#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.detail",
+      "method": "GET",
+      "path": "/v1/admin/app_bot/:id",
+      "module": "app_bot",
+      "handler": "AppBot.getBotDetail",
+      "permission": "app_bot.read",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.getBotDetail#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.list",
+      "method": "GET",
+      "path": "/v1/admin/app_bot",
+      "module": "app_bot",
+      "handler": "AppBot.listPlatformBots",
+      "permission": "app_bot.read",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.listPlatformBots#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.publish",
+      "method": "POST",
+      "path": "/v1/admin/app_bot/:id/publish",
+      "module": "app_bot",
+      "handler": "AppBot.publishBot",
+      "permission": "app_bot.publish",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.publishBot#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.token.reveal",
+      "method": "POST",
+      "path": "/v1/admin/app_bot/:id/token/reveal",
+      "module": "app_bot",
+      "handler": "AppBot.revealToken",
+      "permission": "app_bot.token.reveal",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.revealToken#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.token.rotate",
+      "method": "POST",
+      "path": "/v1/admin/app_bot/:id/token",
+      "module": "app_bot",
+      "handler": "AppBot.rotateToken",
+      "permission": "app_bot.token.rotate",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.rotateToken#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.unpublish",
+      "method": "POST",
+      "path": "/v1/admin/app_bot/:id/unpublish",
+      "module": "app_bot",
+      "handler": "AppBot.unpublishBot",
+      "permission": "app_bot.unpublish",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.unpublishBot#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "app_bot.update",
+      "method": "PUT",
+      "path": "/v1/admin/app_bot/:id",
+      "module": "app_bot",
+      "handler": "AppBot.updateBot",
+      "permission": "app_bot.update",
+      "gate_sites": [
+        "modules/app_bot/app_bot.go::AppBot.updateBot#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.config.get",
+      "method": "GET",
+      "path": "/v1/manager/backup/config",
+      "module": "backup",
+      "handler": "Manager.getConfig",
+      "permission": "backup.config.read",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.getConfig#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.config.test",
+      "method": "POST",
+      "path": "/v1/manager/backup/config/test",
+      "module": "backup",
+      "handler": "Manager.testConnection",
+      "permission": "backup.config.test",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.testConnection#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.config.update",
+      "method": "PUT",
+      "path": "/v1/manager/backup/config",
+      "module": "backup",
+      "handler": "Manager.updateConfig",
+      "permission": "backup.config.write",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.updateConfig#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.download",
+      "method": "GET",
+      "path": "/v1/manager/backup/history/:id/download",
+      "module": "backup",
+      "handler": "Manager.getDownloadURL",
+      "permission": "backup.download",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.getDownloadURL#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.history.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/backup/history/:id",
+      "module": "backup",
+      "handler": "Manager.deleteHistory",
+      "permission": "backup.history.delete",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.deleteHistory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.history.list",
+      "method": "GET",
+      "path": "/v1/manager/backup/history",
+      "module": "backup",
+      "handler": "Manager.getHistory",
+      "permission": "backup.history.read",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.getHistory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.status.get",
+      "method": "GET",
+      "path": "/v1/manager/backup/status",
+      "module": "backup",
+      "handler": "Manager.getStatus",
+      "permission": "backup.status.read",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.getStatus#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "backup.trigger",
+      "method": "POST",
+      "path": "/v1/manager/backup/trigger",
+      "module": "backup",
+      "handler": "Manager.triggerBackup",
+      "permission": "backup.trigger",
+      "gate_sites": [
+        "modules/backup/api_manager.go::Manager.triggerBackup#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.activate",
+      "method": "PUT",
+      "path": "/v1/manager/card-templates/:id/active",
+      "module": "card_template_catalog",
+      "handler": "API.activate",
+      "permission": "card_template.activate",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.audit",
+      "method": "GET",
+      "path": "/v1/manager/card-templates/:id/audit",
+      "module": "card_template_catalog",
+      "handler": "API.audit",
+      "permission": "card_template.audit.read",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.block",
+      "method": "POST",
+      "path": "/v1/manager/card-templates/:id/block",
+      "module": "card_template_catalog",
+      "handler": "API.block",
+      "permission": "card_template.block",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.detail",
+      "method": "GET",
+      "path": "/v1/manager/card-templates/:id",
+      "module": "card_template_catalog",
+      "handler": "API.detail",
+      "permission": "card_template.read",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.publish",
+      "method": "POST",
+      "path": "/v1/manager/card-templates/publish",
+      "module": "card_template_catalog",
+      "handler": "API.publish",
+      "permission": "card_template.publish",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.rollback",
+      "method": "POST",
+      "path": "/v1/manager/card-templates/:id/rollback",
+      "module": "card_template_catalog",
+      "handler": "API.rollback",
+      "permission": "card_template.rollback",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "card_template.validate",
+      "method": "POST",
+      "path": "/v1/manager/card-templates/validate",
+      "module": "card_template_catalog",
+      "handler": "API.validate",
+      "permission": "card_template.validate",
+      "gate_sites": [
+        "modules/card_template_catalog/api.go::API.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_config.get",
+      "method": "GET",
+      "path": "/v1/manager/common/appconfig",
+      "module": "common",
+      "handler": "Manager.appconfig",
+      "permission": "app_config.read",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.appconfig#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_config.update",
+      "method": "POST",
+      "path": "/v1/manager/common/appconfig",
+      "module": "common",
+      "handler": "Manager.updateConfig",
+      "permission": "app_config.write",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.updateConfig#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_module.create",
+      "method": "POST",
+      "path": "/v1/manager/common/appmodule",
+      "module": "common",
+      "handler": "Manager.addAppModule",
+      "permission": "app_module.write",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.addAppModule#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_module.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/common/:sid/appmodule",
+      "module": "common",
+      "handler": "Manager.deleteAppModule",
+      "permission": "app_module.write",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.deleteAppModule#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_module.get",
+      "method": "GET",
+      "path": "/v1/manager/common/appmodule",
+      "module": "common",
+      "handler": "Manager.getAppModule",
+      "permission": "app_module.read",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.getAppModule#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_module.update",
+      "method": "PUT",
+      "path": "/v1/manager/common/appmodule",
+      "module": "common",
+      "handler": "Manager.updateAppModule",
+      "permission": "app_module.write",
+      "gate_sites": [
+        "modules/common/api_manager.go::Manager.updateAppModule#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_version.create",
+      "method": "POST",
+      "path": "/v1/common/appversion",
+      "module": "common",
+      "handler": "Common.addAppVersion",
+      "permission": "app_version.write",
+      "gate_sites": [
+        "modules/common/api.go::Common.addAppVersion#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.app_version.list",
+      "method": "GET",
+      "path": "/v1/common/appversion/list",
+      "module": "common",
+      "handler": "Common.appVersionList",
+      "permission": "app_version.read",
+      "gate_sites": [
+        "modules/common/api.go::Common.appVersionList#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.system_setting.list",
+      "method": "GET",
+      "path": "/v1/manager/common/system_setting",
+      "module": "common",
+      "handler": "Manager.listSystemSettings",
+      "permission": "system_setting.read",
+      "gate_sites": [
+        "modules/common/api_manager_system_setting.go::Manager.listSystemSettings#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.system_setting.test_email",
+      "method": "POST",
+      "path": "/v1/manager/common/system_setting/test_email",
+      "module": "common",
+      "handler": "Manager.testSystemSettingEmail",
+      "permission": "system_setting.write",
+      "gate_sites": [
+        "modules/common/api_manager_system_setting.go::Manager.testSystemSettingEmail#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "common.system_setting.update",
+      "method": "POST",
+      "path": "/v1/manager/common/system_setting",
+      "module": "common",
+      "handler": "Manager.updateSystemSettings",
+      "permission": "system_setting.write",
+      "gate_sites": [
+        "modules/common/api_manager_system_setting.go::Manager.updateSystemSettings#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "dashboard.etl.run",
+      "method": "POST",
+      "path": "/v1/manager/dashboard/etl/run",
+      "module": "opanalytics",
+      "handler": "Manager.runETL",
+      "permission": "dashboard.etl.trigger",
+      "gate_sites": [
+        "modules/opanalytics/api.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.blacklist.list",
+      "method": "GET",
+      "path": "/v1/manager/groups/:group_no/members/blacklist",
+      "module": "group",
+      "handler": "Manager.blacklist",
+      "permission": "group.read",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.blacklist#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.disabled.list",
+      "method": "GET",
+      "path": "/v1/manager/group/disablelist",
+      "module": "group",
+      "handler": "Manager.disablelist",
+      "permission": "group.read",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.disablelist#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.forbidden.update",
+      "method": "PUT",
+      "path": "/v1/manager/groups/:group_no/forbidden/:on",
+      "module": "group",
+      "handler": "Manager.forbidden",
+      "permission": "group.write",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.forbidden#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.list",
+      "method": "GET",
+      "path": "/v1/manager/group/list",
+      "module": "group",
+      "handler": "Manager.list",
+      "permission": "group.read",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.list#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.member.force_remove",
+      "method": "DELETE",
+      "path": "/v1/manager/groups/:group_no/members",
+      "module": "group",
+      "handler": "Manager.removeMember",
+      "permission": "group.write",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.removeMember#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.member.list",
+      "method": "GET",
+      "path": "/v1/manager/groups/:group_no/members",
+      "module": "group",
+      "handler": "Manager.members",
+      "permission": "group.read",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.members#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "group.member.remove",
+      "method": "DELETE",
+      "path": "/v1/groups/:group_no/members",
+      "module": "group",
+      "handler": "Group.memberRemove",
+      "permission": "group.member.remove",
+      "gate_sites": [
+        "modules/group/api.go::Group.memberRemove#1"
+      ],
+      "scope": "global_admin_with_business_acl",
+      "business_acl": {
+        "type": "group_owner_or_manager",
+        "description": "非全局管理员时继续执行群主或群管理员业务 ACL"
+      }
+    },
+    {
+      "id": "group.member.remove_legacy",
+      "method": "POST",
+      "path": "/v1/groups/:group_no/members_delete",
+      "module": "group",
+      "handler": "Group.memberRemove",
+      "permission": "group.member.remove",
+      "gate_sites": [
+        "modules/group/api.go::Group.memberRemove#1"
+      ],
+      "scope": "global_admin_with_business_acl",
+      "business_acl": {
+        "type": "group_owner_or_manager",
+        "description": "非全局管理员时继续执行群主或群管理员业务 ACL"
+      }
+    },
+    {
+      "id": "group.status.update",
+      "method": "PUT",
+      "path": "/v1/manager/group/liftban/:groupNo/:status",
+      "module": "group",
+      "handler": "Manager.leftbangroup",
+      "permission": "group.write",
+      "gate_sites": [
+        "modules/group/api_manager.go::Manager.leftbangroup#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "integration.oidc_client.update",
+      "method": "PUT",
+      "path": "/v1/manager/integrations/oidc/client",
+      "module": "integration",
+      "handler": "Integration.upsertManagerClient",
+      "permission": "integration.oidc_client.write",
+      "gate_sites": [
+        "modules/integration/api.go::Integration.upsertManagerClient#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.broadcast",
+      "method": "POST",
+      "path": "/v1/manager/message/sendall",
+      "module": "message",
+      "handler": "Manager.sendMsgToAllUsers",
+      "permission": "message.broadcast.send",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.sendMsgToAllUsers#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/message",
+      "module": "message",
+      "handler": "Manager.delete",
+      "permission": "message.delete",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.delete#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.direct_history.list",
+      "method": "GET",
+      "path": "/v1/manager/message/recordpersonal",
+      "module": "message",
+      "handler": "Manager.recordpersonal",
+      "permission": "message.direct_history.read",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.recordpersonal#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.history.list",
+      "method": "GET",
+      "path": "/v1/manager/message/record",
+      "module": "message",
+      "handler": "Manager.record",
+      "permission": "message.history.read",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.record#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.outbound.list",
+      "method": "GET",
+      "path": "/v1/manager/message",
+      "module": "message",
+      "handler": "Manager.list",
+      "permission": "message.outbound.read",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.list#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.prohibited_word.create",
+      "method": "POST",
+      "path": "/v1/manager/message/prohibit_words",
+      "module": "message",
+      "handler": "Manager.addProhibitWords",
+      "permission": "message.prohibited_word.write",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.addProhibitWords#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.prohibited_word.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/message/prohibit_words",
+      "module": "message",
+      "handler": "Manager.deleteProhibitWords",
+      "permission": "message.prohibited_word.write",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.deleteProhibitWords#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.prohibited_word.list",
+      "method": "GET",
+      "path": "/v1/manager/message/prohibit_words",
+      "module": "message",
+      "handler": "Manager.prohibitWords",
+      "permission": "message.prohibited_word.read",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.prohibitWords#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.send",
+      "method": "POST",
+      "path": "/v1/manager/message/send",
+      "module": "message",
+      "handler": "Manager.sendMsg",
+      "permission": "message.send",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.sendMsg#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "message.send_friends",
+      "method": "POST",
+      "path": "/v1/manager/message/sendfriends",
+      "module": "message",
+      "handler": "Manager.sendMsgToFriends",
+      "permission": "message.impersonated.send",
+      "gate_sites": [
+        "modules/message/api_manager.go::Manager.sendMsgToFriends#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "report.list",
+      "method": "GET",
+      "path": "/v1/manager/report/list",
+      "module": "report",
+      "handler": "Manager.reportList",
+      "permission": "report.read",
+      "gate_sites": [
+        "modules/report/api_manager.go::Manager.reportList#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/robots/:robot_id",
+      "module": "robot",
+      "handler": "Manager.robotDelete",
+      "permission": "robot.delete",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.robotDelete#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.detail",
+      "method": "GET",
+      "path": "/v1/manager/robots/:robot_id",
+      "module": "robot",
+      "handler": "Manager.robotDetail",
+      "permission": "robot.read",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.robotDetail#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.list",
+      "method": "GET",
+      "path": "/v1/manager/robots",
+      "module": "robot",
+      "handler": "Manager.robotList",
+      "permission": "robot.read",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.robotList#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.menu.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/robot/:robot_id/:id",
+      "module": "robot",
+      "handler": "Manager.delete",
+      "permission": "robot.menu.write",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.delete#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.menu.list",
+      "method": "GET",
+      "path": "/v1/manager/robot/menus",
+      "module": "robot",
+      "handler": "Manager.list",
+      "permission": "robot.menu.read",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.list#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.status.update",
+      "method": "PUT",
+      "path": "/v1/manager/robot/status/:robot_id/:status",
+      "module": "robot",
+      "handler": "Manager.updateRobotStatus",
+      "permission": "robot.status.write",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.updateRobotStatus#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.token.revoke",
+      "method": "POST",
+      "path": "/v1/manager/robots/:robot_id/revoke_token",
+      "module": "robot",
+      "handler": "Manager.robotRevokeToken",
+      "permission": "robot.token.revoke",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.robotRevokeToken#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "robot.update",
+      "method": "PUT",
+      "path": "/v1/manager/robots/:robot_id",
+      "module": "robot",
+      "handler": "Manager.robotUpdate",
+      "permission": "robot.update",
+      "gate_sites": [
+        "modules/robot/api_manager.go::Manager.robotUpdate#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.create",
+      "method": "POST",
+      "path": "/v1/manager/spaces",
+      "module": "space",
+      "handler": "Manager.create",
+      "permission": "space.create",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.destroy",
+      "method": "DELETE",
+      "path": "/v1/manager/spaces/:space_id",
+      "module": "space",
+      "handler": "Manager.forceDisband",
+      "permission": "space.destroy",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.detail",
+      "method": "GET",
+      "path": "/v1/manager/spaces/:space_id",
+      "module": "space",
+      "handler": "Manager.detail",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.disabled.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces/disabled",
+      "module": "space",
+      "handler": "Manager.disableList",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.invite.create",
+      "method": "POST",
+      "path": "/v1/manager/spaces/:space_id/invites",
+      "module": "space",
+      "handler": "Manager.createInvite",
+      "permission": "space.invite.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.invite.disable",
+      "method": "DELETE",
+      "path": "/v1/manager/spaces/:space_id/invites/:code",
+      "module": "space",
+      "handler": "Manager.disableInvite",
+      "permission": "space.invite.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.invite.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces/:space_id/invites",
+      "module": "space",
+      "handler": "Manager.listInvites",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.invite.update",
+      "method": "PUT",
+      "path": "/v1/manager/spaces/:space_id/invites/:code",
+      "module": "space",
+      "handler": "Manager.updateInvite",
+      "permission": "space.invite.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.join_request.approve",
+      "method": "POST",
+      "path": "/v1/manager/spaces/:space_id/join-applies/:id/approve",
+      "module": "space",
+      "handler": "Manager.approveJoinApply",
+      "permission": "space.join_request.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.join_request.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces/:space_id/join-applies",
+      "module": "space",
+      "handler": "Manager.listJoinApplies",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.join_request.reject",
+      "method": "POST",
+      "path": "/v1/manager/spaces/:space_id/join-applies/:id/reject",
+      "module": "space",
+      "handler": "Manager.rejectJoinApply",
+      "permission": "space.join_request.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces",
+      "module": "space",
+      "handler": "Manager.list",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.member.add",
+      "method": "POST",
+      "path": "/v1/manager/spaces/:space_id/members",
+      "module": "space",
+      "handler": "Manager.addMembers",
+      "permission": "space.member.add",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.member.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces/:space_id/members",
+      "module": "space",
+      "handler": "Manager.members",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.member.remove",
+      "method": "DELETE",
+      "path": "/v1/manager/spaces/:space_id/members",
+      "module": "space",
+      "handler": "Manager.removeMembers",
+      "permission": "space.member.remove",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.member.role_update",
+      "method": "PUT",
+      "path": "/v1/manager/spaces/:space_id/members/:uid/role",
+      "module": "space",
+      "handler": "Manager.updateMemberRole",
+      "permission": "space.member.role.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.owner_invite.create",
+      "method": "POST",
+      "path": "/v1/manager/spaces/invites",
+      "module": "space",
+      "handler": "Manager.createSpaceOwnerEmailInvite",
+      "permission": "space.owner_invite.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.owner_invite.list",
+      "method": "GET",
+      "path": "/v1/manager/spaces/invites",
+      "module": "space",
+      "handler": "Manager.listSpaceOwnerEmailInvites",
+      "permission": "space.read",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.owner_invite.revoke",
+      "method": "DELETE",
+      "path": "/v1/manager/spaces/invites/:id",
+      "module": "space",
+      "handler": "Manager.revokeSpaceOwnerEmailInvite",
+      "permission": "space.owner_invite.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.status.update",
+      "method": "PUT",
+      "path": "/v1/manager/spaces/:space_id/status/:status",
+      "module": "space",
+      "handler": "Manager.liftBan",
+      "permission": "space.status.write",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireSuperAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "space.update",
+      "method": "PUT",
+      "path": "/v1/manager/spaces/:space_id",
+      "module": "space",
+      "handler": "Manager.updateSpaceProfile",
+      "permission": "space.update",
+      "gate_sites": [
+        "modules/space/api_manager.go::Manager.requireAdmin#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "statistics.group_creation",
+      "method": "GET",
+      "path": "/v1/statistics/createdgroup/:start_date/:end_date",
+      "module": "statistics",
+      "handler": "Statistics.createGroupWithDateSpace",
+      "permission": "statistics.read",
+      "gate_sites": [
+        "modules/statistics/api.go::Statistics.createGroupWithDateSpace#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "statistics.overview",
+      "method": "GET",
+      "path": "/v1/statistics/countnum",
+      "module": "statistics",
+      "handler": "Statistics.countNum",
+      "permission": "statistics.read",
+      "gate_sites": [
+        "modules/statistics/api.go::Statistics.countNum#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "statistics.user_registration",
+      "method": "GET",
+      "path": "/v1/statistics/registeruser/:start_date/:end_date",
+      "module": "statistics",
+      "handler": "Statistics.registerUserListWithDateSpace",
+      "permission": "statistics.read",
+      "gate_sites": [
+        "modules/statistics/api.go::Statistics.registerUserListWithDateSpace#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.admin.create",
+      "method": "POST",
+      "path": "/v1/manager/user/admin",
+      "module": "user",
+      "handler": "Manager.addAdminUser",
+      "permission": "user.admin.manage",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.addAdminUser#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.admin.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/user/admin",
+      "module": "user",
+      "handler": "Manager.deleteAdminUsers",
+      "permission": "user.admin.manage",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.deleteAdminUsers#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.admin.list",
+      "method": "GET",
+      "path": "/v1/manager/user/admin",
+      "module": "user",
+      "handler": "Manager.getAdminUsers",
+      "permission": "user.admin.manage",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.getAdminUsers#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.blacklist.list",
+      "method": "GET",
+      "path": "/v1/manager/user/blacklist",
+      "module": "user",
+      "handler": "Manager.blacklist",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.blacklist#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.create",
+      "method": "POST",
+      "path": "/v1/manager/user/add",
+      "module": "user",
+      "handler": "Manager.addUser",
+      "permission": "user.create",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.addUser#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.dashboard_reader.grant",
+      "method": "PUT",
+      "path": "/v1/manager/user/:uid/dashboard-read",
+      "module": "user",
+      "handler": "Manager.grantDashboardRead",
+      "permission": "user.fixed_role.write",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.setFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.dashboard_reader.list",
+      "method": "GET",
+      "path": "/v1/manager/user/dashboard-read",
+      "module": "user",
+      "handler": "Manager.listDashboardReaders",
+      "permission": "user.fixed_role.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.listUsersWithFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.dashboard_reader.revoke",
+      "method": "DELETE",
+      "path": "/v1/manager/user/:uid/dashboard-read",
+      "module": "user",
+      "handler": "Manager.revokeDashboardRead",
+      "permission": "user.fixed_role.write",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.setFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.device.list",
+      "method": "GET",
+      "path": "/v1/manager/user/devices",
+      "module": "user",
+      "handler": "Manager.devices",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.devices#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.disabled.list",
+      "method": "GET",
+      "path": "/v1/manager/user/disablelist",
+      "module": "user",
+      "handler": "Manager.disableUsers",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.disableUsers#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.friend.list",
+      "method": "GET",
+      "path": "/v1/manager/user/friends",
+      "module": "user",
+      "handler": "Manager.friends",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.friends#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.list",
+      "method": "GET",
+      "path": "/v1/manager/user/list",
+      "module": "user",
+      "handler": "Manager.list",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.list#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.market_admin.grant",
+      "method": "PUT",
+      "path": "/v1/manager/user/:uid/market-admin",
+      "module": "user",
+      "handler": "Manager.grantMarketAdmin",
+      "permission": "user.fixed_role.write",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.setFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.market_admin.list",
+      "method": "GET",
+      "path": "/v1/manager/user/market-admin",
+      "module": "user",
+      "handler": "Manager.listMarketAdmins",
+      "permission": "user.fixed_role.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.listUsersWithFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.market_admin.revoke",
+      "method": "DELETE",
+      "path": "/v1/manager/user/:uid/market-admin",
+      "module": "user",
+      "handler": "Manager.revokeMarketAdmin",
+      "permission": "user.fixed_role.write",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.setFixedManagerRole#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.online.list",
+      "method": "GET",
+      "path": "/v1/manager/user/online",
+      "module": "user",
+      "handler": "Manager.online",
+      "permission": "user.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.online#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.password.reset",
+      "method": "POST",
+      "path": "/v1/manager/user/resetpassword",
+      "module": "user",
+      "handler": "Manager.resetUserPassword",
+      "permission": "user.password.reset",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.resetUserPassword#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.password.update",
+      "method": "POST",
+      "path": "/v1/manager/user/updatepassword",
+      "module": "user",
+      "handler": "Manager.updatePwd",
+      "permission": "user.password.update",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.updatePwd#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.phone_shadow.backfill",
+      "method": "POST",
+      "path": "/v1/manager/user/phone_shadow_backfill",
+      "module": "user",
+      "handler": "Manager.phoneShadowBackfill",
+      "permission": "user.phone_shadow.backfill",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.phoneShadowBackfill#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.phone_shadow.status",
+      "method": "GET",
+      "path": "/v1/manager/user/phone_shadow_backfill",
+      "module": "user",
+      "handler": "Manager.phoneShadowBackfillStatus",
+      "permission": "user.phone_shadow.read",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.phoneShadowBackfillStatus#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "user.status.update",
+      "method": "PUT",
+      "path": "/v1/manager/user/liftban/:uid/:status",
+      "module": "user",
+      "handler": "Manager.liftBanUser",
+      "permission": "user.status.write",
+      "gate_sites": [
+        "modules/user/api_manager.go::Manager.liftBanUser#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.app.create",
+      "method": "POST",
+      "path": "/v1/manager/workplace/app",
+      "module": "workplace",
+      "handler": "manager.addApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.addApp#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.app.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/workplace/apps/:app_id",
+      "module": "workplace",
+      "handler": "manager.deleteApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.deleteApp#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.app.list",
+      "method": "GET",
+      "path": "/v1/manager/workplace/app",
+      "module": "workplace",
+      "handler": "manager.getApps",
+      "permission": "workplace.app.read",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.getApps#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.app.update",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/apps/:app_id",
+      "module": "workplace",
+      "handler": "manager.updateApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.updateApp#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.banner.create",
+      "method": "POST",
+      "path": "/v1/manager/workplace/banner",
+      "module": "workplace",
+      "handler": "manager.addBanner",
+      "permission": "workplace.banner.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.addBanner#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.banner.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/workplace/banners/:banner_no",
+      "module": "workplace",
+      "handler": "manager.deleteBanner",
+      "permission": "workplace.banner.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.deleteBanner#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.banner.list",
+      "method": "GET",
+      "path": "/v1/manager/workplace/banner",
+      "module": "workplace",
+      "handler": "manager.getBanners",
+      "permission": "workplace.banner.read",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.getBanners#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.banner.reorder",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/banner/reorder",
+      "module": "workplace",
+      "handler": "manager.reorderBanner",
+      "permission": "workplace.banner.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.reorderBanner#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.banner.update",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/banners/:banner_no",
+      "module": "workplace",
+      "handler": "manager.updateBanner",
+      "permission": "workplace.banner.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.updateBanner#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category.create",
+      "method": "POST",
+      "path": "/v1/manager/workplace/category",
+      "module": "workplace",
+      "handler": "manager.addCategory",
+      "permission": "workplace.category.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.addCategory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/workplace/categorys/:category_no",
+      "module": "workplace",
+      "handler": "manager.deleteCategory",
+      "permission": "workplace.category.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.deleteCategory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category.list",
+      "method": "GET",
+      "path": "/v1/manager/workplace/category",
+      "module": "workplace",
+      "handler": "manager.getCategory",
+      "permission": "workplace.category.read",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.getCategory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category.reorder",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/category/reorder",
+      "module": "workplace",
+      "handler": "manager.reorderCategory",
+      "permission": "workplace.category.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.reorderCategory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category.update",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/categorys/:category_no",
+      "module": "workplace",
+      "handler": "manager.updateCategory",
+      "permission": "workplace.category.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.updateCategory#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category_app.create",
+      "method": "POST",
+      "path": "/v1/manager/workplace/categorys/:category_no/app",
+      "module": "workplace",
+      "handler": "manager.addCategoryApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.addCategoryApp#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category_app.delete",
+      "method": "DELETE",
+      "path": "/v1/manager/workplace/categorys/:category_no/apps/:app_id",
+      "module": "workplace",
+      "handler": "manager.deleteCategoryApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.deleteCategoryApp#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category_app.list",
+      "method": "GET",
+      "path": "/v1/manager/workplace/categorys/:category_no/app",
+      "module": "workplace",
+      "handler": "manager.getCategoryApps",
+      "permission": "workplace.app.read",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.getCategoryApps#1"
+      ],
+      "scope": "global_admin"
+    },
+    {
+      "id": "workplace.category_app.reorder",
+      "method": "PUT",
+      "path": "/v1/manager/workplace/categorys/:category_no/app/reorder",
+      "module": "workplace",
+      "handler": "manager.reorderCategoryApp",
+      "permission": "workplace.app.write",
+      "gate_sites": [
+        "modules/workplace/api_manager.go::manager.reorderCategoryApp#1"
+      ],
+      "scope": "global_admin"
+    }
+  ]
+}

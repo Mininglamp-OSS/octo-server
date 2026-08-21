@@ -99,6 +99,24 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -v ./...
 
+  manager-permission-contract:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Manager Permission Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Validate manager permission contract
+        run: make manager-permission-check
+
   unit-test:
     needs: [changes]
     if: |

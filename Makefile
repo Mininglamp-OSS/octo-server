@@ -49,7 +49,7 @@ env-test:
 #                   - lint-unregistered-code: no inline codes.Code{} literals
 #                     passed to httperr.ResponseErrorL (registry bypass)
 
-.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint card-dispatch-lint
+.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint card-dispatch-lint manager-permission-generate manager-permission-check
 
 i18n-extract:
 	go run ./pkg/i18n/cmd/octo-i18n-extract
@@ -63,6 +63,13 @@ i18n-extract-check:
 
 card-dispatch-lint:
 	go run ./tools/lint-card-dispatch ./modules ./internal
+
+manager-permission-generate:
+	go run ./tools/manager-permission-gen
+
+manager-permission-check:
+	go run ./tools/manager-permission-gen -check
+	go test ./modules/user -run '^(TestManagerPermissionContractPreservesLegacyCapabilityMatrix|TestManagerPermissionContractRejectsLegacyAliasDrift)$$' -count=1
 
 i18n-merge: i18n-extract
 	@command -v goi18n >/dev/null 2>&1 || { \

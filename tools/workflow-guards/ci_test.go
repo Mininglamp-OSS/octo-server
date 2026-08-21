@@ -91,6 +91,20 @@ func TestCITestJobAggregatesSplitLanes(t *testing.T) {
 	}
 }
 
+func TestCIValidatesManagerPermissionContract(t *testing.T) {
+	wf := readWorkflow(t, ".github/workflows/ci.yml")
+	contractJob, ok := wf.Jobs["manager-permission-contract"]
+	if !ok {
+		t.Fatal("ci.yml must define the manager-permission-contract job")
+	}
+	if !contains(contractJob.Needs, "changes") {
+		t.Fatalf("manager permission contract needs = %v, want changes", contractJob.Needs)
+	}
+	if stepIndex(contractJob.Steps, "Validate manager permission contract") < 0 {
+		t.Fatal("manager permission contract job must run the strict validation step")
+	}
+}
+
 func TestCIE2EShardRunnerRejectsInvalidShard(t *testing.T) {
 	root := repoRoot(t)
 	cmd := exec.Command("bash", "ci/run-e2e-shard.sh", "5", "4")
