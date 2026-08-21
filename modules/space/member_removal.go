@@ -329,7 +329,7 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		}
 	}()
 	// 先对齐当前真实成员身份再动手。工单可能在退避期间变陈旧：成员被移除后又重新
-	// 加入，这时把他的群和私聊拆掉才是真正的故障。活跃成员 → 工单直接作废。
+	// 加入，这时把他的群拆掉才是真正的故障。活跃成员 → 工单直接作废。
 	member, err := s.db.queryMember(job.SpaceID, job.UID)
 	if err != nil {
 		s.releaseCleanupJob(job, owner, "membership_recheck_failed", err)
@@ -350,12 +350,15 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 	}
 	// 一个步骤失败**不中断**其余步骤。
 	//
-	// 之前是 fail-fast，而步骤顺序是注册顺序 —— dm_cutoff 排在 group_cascade 前面，
-	// 仅仅因为 modules/group import 了 modules/user，没有任何地方声明过这件事。
-	// 于是 WuKongIM 持续故障时，dm_cutoff 每一轮都在第一步失败，20 次尝试
-	// （约 70 分钟退避）全部烧在它身上，工单走到 abandoned 时**群级联一次都没跑过**：
-	// 被移除的人保留着全部群权限和 IM 订阅。那正是这条链路要消灭的隔离失败，
-	// 却发生在最需要它生效的场景里。
+	// 今天只注册了 group_cascade 一个步骤，所以这一层是**防御性**的：它保护的是
+	// 注册表这个扩展点，而不是当前的某个具体失败。
+	//
+	// 之所以一开始就这么写，是因为 fail-fast 的版本在两个步骤并存时真的出过问题：
+	// 步骤顺序就是注册顺序，而注册顺序由 import 方向决定，没有任何地方声明过。
+	// 排在前面的那个步骤一旦持续失败（例如 WuKongIM 故障），20 次尝试
+	// （约 70 分钟退避）会全部烧在它身上，工单走到 abandoned 时后面的步骤
+	// **一次都没跑过**。那正是这条链路要消灭的隔离失败，却发生在最需要它生效的场景里。
+	// 后续 PR 把私聊清理步骤加回来时，这个性质必须仍然成立。
 	//
 	// 步骤契约本来就要求幂等（见 MemberRemovalCleanupStep），所以「已经成功的步骤
 	// 在重试时再跑一遍」是允许的，那也正是 fail-fast 唯一换来的东西——它并没有
@@ -372,10 +375,9 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		// panic 也必须**在这一层**兜住，不能只靠函数级的那个 recover。
 		//
 		// 上面那个 defer 在整个函数的作用域上，一次 panic 会直接跳出这个循环——
-		// 于是 dm_cutoff panic 时 group_cascade 本轮一次都不会跑，而 attempts 在
-		// 认领时就已自增，工单照样一路走到 abandoned：被移除的人保留着全部群权限。
-		// 那正是上面那段注释说要消灭的失败，只是换成 panic 这条路径进来。
-		// restoreAfterRejoin 早就是逐步 recover 的；两侧必须对称。
+		// 于是一个步骤 panic 时，排在它后面的步骤本轮一次都不会跑，而 attempts 在
+		// 认领时就已自增，工单照样一路走到 abandoned。那正是上面那段注释说要消灭的
+		// 失败，只是换成 panic 这条路径进来。同样是为多步骤准备的防御。
 		err := func() (err error) {
 			defer func() {
 				if r := recover(); r != nil {

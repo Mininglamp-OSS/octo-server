@@ -471,7 +471,7 @@ func TestGroupCascadeRetriesWhenTargetBecameCreator(t *testing.T) {
 // TestGroupCascadeSkipsRejoinedMember 工单跑到群级联这一步时，如果人已经重新
 // 加入 Space，就必须什么都不做。
 //
-// worker 只在认领工单时查过一次成员身份，之后还要跑完 dm_cutoff；那段时间里
+// worker 只在认领工单时查过一次成员身份，之后还要排队和跑完其它步骤；那段时间里
 // 重新加入的人会被 joinPresetGroups 写进各个预置群，而这一步若照旧执行，
 // 就把那些刚写好的行全删了——留下一个「Space 活跃成员、却不在任何群里」的人，
 // 没有任何东西会补回来。

@@ -412,22 +412,3 @@ type FriendApplyModel struct {
 	Status int // 状态 0.未处理 1.通过 2.拒绝
 	db.BaseModel
 }
-
-// isMutualFriend 判断 uid 是否持有一条对 toUID 的**双向**有效好友行。
-//
-// 与 IsFriend 的区别在 is_alone：单向好友（对方已把你删掉，is_alone=1）不进
-// Person 频道白名单（见 1module.go 的 IMDatasource.Whitelist 用 IsAlone == 0 过滤），
-// 因此判断「好友关系是否仍在授权这对私聊」必须排掉它，否则会把已经无权的私聊留着。
-func (d *friendDB) isMutualFriend(uid, toUID string) (bool, error) {
-	if uid == "" || toUID == "" {
-		return false, nil
-	}
-	var count int
-	err := d.session.Select("count(*)").From("friend").
-		Where("uid=? and to_uid=? and is_deleted=0 and is_alone=0", uid, toUID).
-		LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}

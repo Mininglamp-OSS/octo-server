@@ -65,8 +65,7 @@ func (d *DB) querySpaceByID(spaceId string) (*SpaceModel, error) {
 // 为每个成员写出会话面清理工单，返回本次真正被移除的成员供调用方做缓存失效。
 //
 // 此前这里只翻 space.status，成员行原样留着 status=1 —— 于是解散后成员仍留在该
-// 空间的所有群里、私聊白名单原封不动，而 SharesActiveSpace 已经因为 space.status=0
-// 判定为"无共同空间"：服务端的推导说不该能发，WuKongIM 的缓存却还允许发。
+// 空间的所有群里，WuKongIM 的群订阅也原样保留：空间已经"不存在"了，群消息却照收照发。
 // 用户侧解散是比管理端强制解散常见得多的路径，不能只接后者。
 func (d *DB) disbandSpace(spaceId, operatorUID string) ([]string, error) {
 	tx, err := d.session.Begin()

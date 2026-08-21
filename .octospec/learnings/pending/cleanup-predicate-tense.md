@@ -75,3 +75,10 @@ A cleanup job that completes successfully while doing nothing leaves no trace.
 Worth asserting positively in tests ("N whitelist removals were issued"), not
 just negatively ("no error"). A silent-success path deserves the same scrutiny as
 an error path.
+
+---
+
+**Where the example lives now.** The DM half of that work was split out of PR #795
+into `space-member-dm-isolation`; this learning is kept here because the rule is
+about cleanup-scope tense, not about DMs, and the group cascade in the shipped half
+follows the same rule.

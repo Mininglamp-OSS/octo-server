@@ -9,12 +9,11 @@ injected_rules:
     load_bearing: true
     why: >
       This task is the enforcement half of Space membership. A removed member
-      currently keeps group message access and DM access inside a Space they no
-      longer belong to. The fix must close that boundary without overshooting:
-      DM permission derives from ANY shared active Space or a friendship, so
-      removal from one Space must not cut a DM that another Space still
-      authorizes. The group cascade also reaches sub-thread membership and
-      per-Space pinned rows.
+      currently keeps group message access and a live WuKongIM group
+      subscription inside a Space they no longer belong to. The fix must close
+      that boundary without overshooting. The group cascade also reaches
+      sub-thread membership and per-Space pinned rows. Person-channel whitelist
+      isolation was split out to space-member-dm-isolation after review.
   - id: error-handling
     source: repo
     load_bearing: true

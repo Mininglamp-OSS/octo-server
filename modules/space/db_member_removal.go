@@ -29,7 +29,7 @@ const (
 	// removalCleanupMaxAttempts 超过后置为 abandoned，不再无限重试。
 	// 配合下面的退避，总窗口约 70 分钟：这是隔离性清理，短窗口下一次稍长的 IM /
 	// DB 故障就会把所有待处理工单打成 abandoned，而 abandoned 没有任何东西会重新
-	// 驱动，被移除的人就留在群里、私聊白名单也还在。到达上限只打 error 日志，
+	// 驱动，被移除的人就一直留在群里、IM 群订阅也还在。到达上限只打 error 日志，
 	// 需要人工介入——目前没有自动 reconcile。
 	removalCleanupMaxAttempts uint32 = 20
 	// removalCleanupBatchSize 单次调度最多处理的工单数，避免一次占满 DB 连接。

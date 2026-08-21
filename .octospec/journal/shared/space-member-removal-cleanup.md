@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: space-member-removal-cleanup"
-description: Removing a member from a Space now ends their participation in its conversations — a transactional outbox drives a retried cascade that exits every group in the Space and drops the Person-channel whitelist entries that lost their authorization, while the membership caches are invalidated inside the request. Five removal paths, not the four the plan assumed.
+description: Removing a member from a Space now takes them out of its groups and sub-threads — a transactional outbox drives a leased, retried cascade that exits every group in the Space, while the membership caches are invalidated inside the request. Five removal paths, not the four the plan assumed. The DM half was split out to space-member-dm-isolation after review found it inert in every current deployment.
 tags: ["space", "isolation", "auth", "acl", "thread", "concurrency", "data-integrity", "wire-contract", "error-response", "testing"]
 timestamp: 2026-08-21T05:30:00Z
 # --- octospec extension fields ---
@@ -34,13 +34,19 @@ Removal now:
   sub-threads, per-Space pinned/conversation extras, member-update CMD, tip),
   handing the group creator over first because that primitive silently skips a
   creator;
-- drops the Person-channel whitelist entries whose authorization is gone, **per
-  direction**, plus a `channelUpdate` CMD to both sides;
-- exposes an additive `dm_forbidden` / `dm_forbidden_reason` on the Person
-  `ChannelResp` so clients can render the composer read-only.
 
 Wiring uses init-time reverse registration (`RegisterMemberRemovalCleanupStep`)
-because `modules/group` and `modules/user` already import `modules/space`.
+because `modules/group` already imports `modules/space`. That registry is also the
+extension point the DM step plugs back into — see
+`.octospec/tasks/space-member-dm-isolation/brief.md`.
+
+**Scope note.** Person-channel (DM) cutoff and restore were implemented and reviewed
+as part of this task, then split out. Measured reasons: WuKongIM's
+`options.WhitelistOffOfPerson` defaults to `true`, so that half changes no delivery
+behaviour in any current deployment; and it produced a new escape in six consecutive
+review rounds from structural causes (peer scope from a mutable conversation view,
+authorization-read freshness, channel form) that need a membership epoch and a
+bilateral pair index. The findings are preserved in the follow-up brief.
 
 ## Structural learnings
 
@@ -54,18 +60,18 @@ lease) is the in-repo reference. `SpaceMemberRemove` is emitted as an observer
 event only, and is not even persisted when no listener is registered.
 
 **A cleanup predicate must not be written in the tense of the thing it is
-cleaning up after.** The first implementation scoped DM peers with
-`ActiveMemberSet` (`space_member.status=1 AND space.status=1`). Cleanup always
-runs *after* the member row is zeroed, and disband zeroes the Space row too, so
-the peer set came back empty and the entire DM half silently did nothing — after
-a disband, and whenever two peers were removed in the same batch. The fix is a
-deliberately status-agnostic `MembersEverInSpace`.
+cleaning up after.** An implementation scoped its targets with an *is-currently*
+predicate (`space_member.status=1 AND space.status=1`). Cleanup always runs *after*
+the member row is zeroed, and disband zeroes the Space row too, so the set came back
+empty and the job silently did nothing — after a disband, and whenever two peers were
+removed in the same batch. The fix is a deliberately status-agnostic scope. Observed
+in the DM half (now split out), but the lesson is the scope rule, not the DM code.
 
-**Whitelist derivation is per channel, so revocation is per direction.** X's
-Person-channel whitelist answers "who may send *to* X". Under a one-sided
-friendship the two directions differ, and ORing them leaves a stale entry that
-nothing removes while the other side's client already renders the channel as
-forbidden.
+**A half that changes nothing in production should not gate a half that does.**
+This was discovered late, and only by measurement: probing the broker showed the DM
+cutoff was inert under its default configuration. By then it had absorbed six review
+rounds. The signal to act on is "this code path is verifiably not reached in any
+deployment" — that is a scoping decision, not a footnote for the PR body.
 
 ## Gotchas worth remembering
 

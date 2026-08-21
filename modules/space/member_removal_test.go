@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -61,7 +60,7 @@ func seedMember(t *testing.T, f *Space, spaceID, uid string, role int) {
 }
 
 // TestRemoveMemberLockedEnqueuesCleanup 移除成员必须在同一事务内写出清理工单。
-// 这是整条链路的入口：没有工单，后面的退群 / 断私聊全都不会发生。
+// 这是整条链路的入口：没有工单，后面的退群清理全都不会发生。
 func TestRemoveMemberLockedEnqueuesCleanup(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -209,7 +208,7 @@ func TestCleanupWorkerRunsStepsAndCompletes(t *testing.T) {
 }
 
 // TestCleanupWorkerSkipsRejoinedMember 关键回归：成员被移除后又重新加入，
-// 迟到的重试绝不能把他的群和私聊拆掉。
+// 迟到的重试绝不能把他的群拆掉。
 func TestCleanupWorkerSkipsRejoinedMember(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -545,7 +544,7 @@ func TestMemberRemovalRetryDelayReachesCap(t *testing.T) {
 // utf8mb4 列在 strict 模式下拒写，那条 UPDATE 一失败 attempts 就不增、
 // next_attempt_at 也不推进——保护重试的函数反而把退避弄断。
 func TestTruncateCleanupErrorKeepsValidUTF8(t *testing.T) {
-	long := "dm_cutoff: " + strings.Repeat("中", 200)
+	long := "group_cascade: " + strings.Repeat("中", 200)
 	got := truncateCleanupError(long)
 	assert.True(t, utf8.ValidString(got), "截断结果必须是合法 UTF-8")
 	assert.LessOrEqual(t, len(got), 255)
@@ -597,7 +596,7 @@ func TestClaimCleanupOwnerIsPerClaim(t *testing.T) {
 // 必须和管理端强制解散走同一条级联。
 //
 // 此前这个 handler 只翻 space.status，成员行原样留着 status=1：解散后成员仍在该
-// 空间的所有群里、私聊白名单原封不动，而 SharesActiveSpace 因为 space.status=0
+// 空间的所有群里、WuKongIM 群订阅原样保留，而 space.status=0
 // 已判定为"无共同空间"——服务端说不该能发，WuKongIM 的缓存却还允许发。
 // 用户侧解散比管理端强制解散常见得多，不能只接后者。
 func TestOwnerDisbandSpaceEnqueuesCleanup(t *testing.T) {
@@ -837,192 +836,12 @@ func TestClaimIncrementsAttempts(t *testing.T) {
 
 // ---------- 加入侧：恢复步骤的接线 ----------
 
-// probeRejoinSteps 注册一个记录调用的恢复步骤，返回读取已记录调用的函数。
-// 用完自动换回 no-op —— RegisterMemberRejoinRestoreStep 没有注销入口，
-// 不换回去会把探针漏给后面的用例。
-//
-// **按 spaceID 过滤**，不是照单全收：注册表没有注销入口，t.Cleanup 只能换回
-// no-op，而每条加入路径的恢复都跑在后台 goroutine 里。用例 A 起的 goroutine
-// 完全可能在 A 清理之后才触发，落进 B 刚注册的探针里——`-shuffle=on` 下
-// TestRejoinRestoreStepRunsForEveryMemberInBatch 的 ElementsMatch 就会因为多出
-// 一个元素而红。只收本用例自己那个 spaceID，这条串扰就不存在。
-func probeRejoinSteps(t *testing.T, spaceID string) func() []MemberRejoin {
-	t.Helper()
-	var mu sync.Mutex
-	var seen []MemberRejoin
-	RegisterMemberRejoinRestoreStep("test_restore", func(_ *config.Context, r MemberRejoin) error {
-		if r.SpaceID != spaceID {
-			return nil
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		seen = append(seen, r)
-		return nil
-	})
-	t.Cleanup(func() {
-		RegisterMemberRejoinRestoreStep("test_restore", func(*config.Context, MemberRejoin) error { return nil })
-	})
-	return func() []MemberRejoin {
-		mu.Lock()
-		defer mu.Unlock()
-		out := make([]MemberRejoin, len(seen))
-		copy(out, seen)
-		return out
-	}
-}
-
-// awaitRejoin 等待恢复步骤被调用到指定次数。加入路径把恢复丢到后台
-// goroutine（理由见 restoreAfterRejoin 的调用点），所以不能读完就断言。
-func awaitRejoin(t *testing.T, read func() []MemberRejoin, want int) []MemberRejoin {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got := read()
-		if len(got) >= want {
-			return got
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("恢复步骤没有被加入路径调用：want %d, got %d —— 接线断了", want, len(got))
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// TestRejoinRestoreStepRunsOnJoinPath 加入路径必须触发恢复步骤——**走真实 handler**。
-//
-// 摘白名单是移除侧做的，补回来只可能发生在加入侧；这条钉住的是「接线存在」。
-// 早先的版本直接调 f.restoreAfterRejoin 断言分发器本身，那样把三处
-// `restoreAfterRejoin(...)` 调用全删掉，整个包依然全绿——正好漏掉本轮要修的
-// 那个缺陷。这里改成 POST 真实路由，删掉接线就会红。
-func TestRejoinRestoreStepRunsOnJoinPath(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	const spaceID = "rejoin-wire"
-	read := probeRejoinSteps(t, spaceID)
-
-	seedMember(t, f, spaceID, testutil.UID, 2) // 操作者：owner
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/add",
-		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{"uids": []string{"u-joined"}}))))
-	req.Header.Set("token", testutil.Token)
-	testSrv.GetRoute().ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-
-	got := awaitRejoin(t, read, 1)
-	assert.Equal(t, spaceID, got[0].SpaceID)
-	assert.Equal(t, "u-joined", got[0].UID)
-}
-
-// TestRejoinRestoreStepRunsForEveryMemberInBatch 批量加入时每个成员都要恢复，
-// 不能只处理第一个——批量路径把整批放进**一个** goroutine 串行跑，
-// 循环写错就会静默只补一个人。
-func TestRejoinRestoreStepRunsForEveryMemberInBatch(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	const spaceID = "rejoin-batch"
-	read := probeRejoinSteps(t, spaceID)
-
-	seedMember(t, f, spaceID, testutil.UID, 2)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/space/"+spaceID+"/members/add",
-		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-			"uids": []string{"u-b1", "u-b2", "u-b3"},
-		}))))
-	req.Header.Set("token", testutil.Token)
-	testSrv.GetRoute().ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-
-	got := awaitRejoin(t, read, 3)
-	uids := make([]string, 0, len(got))
-	for _, r := range got {
-		uids = append(uids, r.UID)
-	}
-	assert.ElementsMatch(t, []string{"u-b1", "u-b2", "u-b3"}, uids)
-}
-
-// TestRejoinRestoreStepRunsOnManagerAddPath 管理端加人也必须触发恢复步骤。
-//
-// 与用户侧 members/add 是**另一处**调用点（api_manager.go），不走 afterJoinSpace。
-// 上一版只钉住了用户侧那一处，把这两处删掉整个包依然全绿——正是被修的那个缺陷
-// 还能原样落在没被覆盖的调用点上（实测确认过）。
-func TestRejoinRestoreStepRunsOnManagerAddPath(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	const spaceID = "rejoin-mgr"
-	read := probeRejoinSteps(t, spaceID)
-	seedMember(t, f, spaceID, "owner-mgr", 2)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/manager/spaces/"+spaceID+"/members",
-		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{"uids": []string{"u-mgr-added"}}))))
-	req.Header.Set("token", adminToken(t))
-	testSrv.GetRoute().ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-
-	got := awaitRejoin(t, read, 1)
-	assert.Equal(t, "u-mgr-added", got[0].UID)
-}
-
-// TestRejoinRestoreStepRunsOnJoinByCodePath 邀请码加入也必须触发恢复步骤。
-//
-// 这一处走的是 afterJoinSpace，与前两条又不同——同一个 helper 同时服务
-// 「邀请码加入」和「申请通过」，所以覆盖它就同时覆盖了那两条路径。
-func TestRejoinRestoreStepRunsOnJoinByCodePath(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	const spaceID = "rejoin-code"
-	read := probeRejoinSteps(t, spaceID)
-	seedMember(t, f, spaceID, "owner-code", 2)
-
-	// afterJoinSpace 由 executeJoinSpace 调用，成员行写入之后。直接驱动它，
-	// 保证断言的是「加入之后恢复会被触发」这条接线本身，而不是邀请码解析。
-	space, err := f.db.querySpaceByID(spaceID)
-	require.NoError(t, err)
-	require.NotNil(t, space)
-	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
-		SpaceId: spaceID, UID: "u-code-joined", Role: 0, Status: 1,
-	}))
-	f.afterJoinSpace("u-code-joined", spaceID, space)
-
-	got := awaitRejoin(t, read, 1)
-	assert.Equal(t, "u-code-joined", got[0].UID)
-}
-
-// TestRejoinRestoreContainsStepPanic 恢复步骤由别的模块注册，一次 panic 不能
-// 掀掉加入请求，也不能让后面的步骤被跳过。
-func TestRejoinRestoreContainsStepPanic(t *testing.T) {
-	_, f, err := setup(t)
-	require.NoError(t, err)
-
-	var ran atomic.Bool
-	RegisterMemberRejoinRestoreStep("test_panic", func(*config.Context, MemberRejoin) error {
-		panic("boom")
-	})
-	RegisterMemberRejoinRestoreStep("test_after_panic", func(*config.Context, MemberRejoin) error {
-		ran.Store(true)
-		return nil
-	})
-	t.Cleanup(func() {
-		RegisterMemberRejoinRestoreStep("test_panic", func(*config.Context, MemberRejoin) error { return nil })
-		RegisterMemberRejoinRestoreStep("test_after_panic", func(*config.Context, MemberRejoin) error { return nil })
-	})
-
-	assert.NotPanics(t, func() { f.restoreAfterRejoin("sp-panic", "u-panic") })
-	assert.True(t, ran.Load(), "前一个步骤 panic 不能让后面的步骤被跳过")
-}
-
 // TestCleanupRunsEveryStepDespiteFailure 一个步骤失败不能让同一轮里的其余步骤
 // 被跳过。
 //
-// 之前是 fail-fast，而步骤顺序是注册顺序（dm_cutoff 在 group_cascade 之前，
+// 之前是 fail-fast，而步骤顺序就是注册顺序（由 import 方向决定，
 // 仅仅因为 modules/group import 了 modules/user）。WuKongIM 持续故障时
-// dm_cutoff 每轮都在第一步失败，20 次尝试全烧在它身上，工单走到 abandoned 时
+// 排在前面的步骤每轮都失败时，20 次尝试全烧在它身上，工单走到 abandoned 时
 // **群级联一次都没跑过**——被移除的人保留着全部群权限。那正是这条链路要消灭的
 // 隔离失败，却发生在最需要它生效的场景里。
 func TestCleanupRunsEveryStepDespiteFailure(t *testing.T) {
@@ -1063,7 +882,7 @@ func TestCleanupRunsEveryStepDespiteFailure(t *testing.T) {
 // 其余步骤被跳过。
 //
 // 这是 TestCleanupRunsEveryStepDespiteFailure 的姊妹用例，走的是另一条路径：
-// 之前只有函数级 recover，panic 会直接跳出步骤循环，于是 dm_cutoff panic 时
+// 之前只有函数级 recover，panic 会直接跳出步骤循环，于是一个步骤 panic 时
 // group_cascade 本轮一次都不跑，而 attempts 在认领时已自增，工单照样走到
 // abandoned——被移除的人保留着全部群权限。恰恰是 error 那条路径刚修好的那个失败。
 func TestCleanupRunsRemainingStepsAfterStepPanic(t *testing.T) {

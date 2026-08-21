@@ -212,7 +212,7 @@ func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]str
 	// 顺序和锁都是必要的：普通 SELECT 在 REPEATABLE READ 下建立的是快照读，而后面
 	// 的 UPDATE 是当前读。两者之间若有成员并发加入，UPDATE 会把他一并置 0，但他不在
 	// 快照名单里 —— 于是没有清理工单、没有缓存失效，人被移出了一个已解散的空间，
-	// 却还留在该空间的所有群里、私聊白名单也原封不动。加锁读把这个窗口关掉。
+	// 却还留在该空间的所有群里、IM 群订阅也原封不动。加锁读把这个窗口关掉。
 	uids, err := lockActiveMemberUIDsTx(tx, spaceId)
 	if err != nil {
 		return nil, err

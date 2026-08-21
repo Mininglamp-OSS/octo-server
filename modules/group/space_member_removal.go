@@ -32,15 +32,13 @@ func (g *Group) registerSpaceMemberRemovalCleanup() {
 func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.MemberRemoval) error {
 	// 动手前**在这一步内**再确认一次他确实不在 Space 里了。
 	//
-	// worker 在认领工单时已经查过一次成员身份，但那次之后还要跑完 dm_cutoff
-	// （逐个对端查库 + 打 IM），可能是秒级的。窗口里他若重新加入，
+	// worker 在认领工单时已经查过一次成员身份，但认领与本步骤真正动手之间隔着
+	// 排队和其它已注册步骤的执行时间，可能是秒级的。窗口里他若重新加入，
 	// joinPresetGroups 刚写好的 group_member 行就会被下面这段全部删掉，
 	// 留下一个「是 Space 活跃成员、却不在任何群里」的人，而且没有任何东西会补回来。
-	// dm_cutoff 不需要这一层是因为它本来就逐个对端重算 SharesActiveSpace，
-	// 重新入群后自然一个都判不出该切；群级联没有等价的重算，只能显式再查一次。
 	//
 	// 这不能把窗口缩到零（这次查询和下面那次群集合查询之间仍有间隙），但把它从
-	// 「整个 dm_cutoff 的时长」压到了一次查询的间隔。彻底关闭要给 space_member
+	// 「认领到动手的整段时长」压到了一次查询的间隔。彻底关闭要给 space_member
 	// 加成员纪元并在每一步里校验，记在 brief 的 follow-up 里。
 	//
 	// 谓词用 CheckMembership（sm.status=1 且 space.status=1）：解散场景下
@@ -116,19 +114,12 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // queryGroupsWithMemberUIDAndSpaceID 已经查不到这个群，重跑是空转，只会把一次
 // 真实故障洗成 done；把 IMRemoveSubscriber 提到删行之前也没用，那只是换一个
 // 时刻失败。真正的修法是在删行的同一个事务里写一条持久化的 IM-pending 记录
-// （范围不依赖 group_member 活跃行），由本 worker 消费——形状与 dm_cutoff 侧
-// 相同，但它修的是 RemoveGroupMembers 这个既有原语的所有调用方，不只是本步骤，
-// 因此单独立项。见 issue #797。
+// （范围不依赖 group_member 活跃行），由本 worker 消费。但它修的是
+// RemoveGroupMembers 这个既有原语的所有调用方，不只是本步骤，因此单独立项。
+// 见 issue #797。
 //
-// dm_cutoff 侧之所以能直接上抛，是因为它的范围 MembersEverInSpace 不看成员状态，
-// 重试确实会重新枚举到同一批对端。
-//
-// 顺带澄清一处容易读岔的地方：dm_cutoff 逐对端重算 SharesActiveSpace，覆盖的是
-// 「重新加入发生在那次读之前」——也就是真正宽的那个窗口。它并不覆盖那次读到
-// 随后 whitelist_remove 之间的间隙（两次查询加一次 IM 往返）。那段间隙在实践中
-// 构造不出来（要落进去，回补必须早于切断的读就开始跑完自己的前置查询，可那样
-// 切断读到的就是 shared=true，整对会被跳过），但别据此认为 DM 侧是结构上无竞态的。
-// 彻底关闭同样要靠成员纪元，见 issue #797。
+// 上面那次 CheckMembership 覆盖的是「重新加入发生在读之前」，也就是真正宽的那个
+// 窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 issue #797。
 func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
