@@ -440,9 +440,29 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 }
 
 // listPlatformBots handles GET /v1/admin/app_bot.
+//
+// The optional `scope` query parameter widens the listing for the super admin who owns
+// this route: "platform" (the default, and the historical behaviour) / "space" (further
+// narrowed by an optional space_id) / "all". Without it, a bot that moves into a space
+// drops out of the only list the admin console has, with nothing on screen to say where
+// it went. This widening is deliberately read-only: every mutation still runs through
+// botInRouteScope, so the platform route continues to refuse to touch a space's bot.
 func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
 	if err := c.CheckLoginRole(); err != nil {
 		respondAppBotForbidden(c)
+		return
+	}
+	scope := c.Query("scope")
+	spaceID := ""
+	switch scope {
+	case "", "platform":
+		scope = "platform"
+	case "all":
+		scope = "" // no scope predicate
+	case "space":
+		spaceID = c.Query("space_id")
+	default:
+		respondAppBotRequestInvalid(c, "scope")
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -455,13 +475,13 @@ func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
 			statusFilter = &s
 		}
 	}
-	bots, total, err := ab.db.queryBotsByScope("platform", "", pageIndex, pageSize, keyword, statusFilter)
+	bots, total, err := ab.db.queryBotsByScope(scope, spaceID, pageIndex, pageSize, keyword, statusFilter)
 	if err != nil {
 		ab.Error("query platform bots failed", zap.Error(err))
 		respondAppBotQueryFailed(c)
 		return
 	}
-	c.Response(gin.H{"count": total, "list": ab.toBotListResp(bots)})
+	c.Response(gin.H{"count": total, "list": ab.toBotListRespWithSpaceNames(bots)})
 }
 
 // listSpaceBots handles GET /v1/space/:space_id/app_bot.
@@ -1022,10 +1042,45 @@ func (ab *AppBot) toBotListResp(bots []*appBotModel) []gin.H {
 			"avatar":       ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			"status":       bot.Status,
 			"scope":        bot.Scope,
+			"space_id":     bot.SpaceID,
 			"created_at":   bot.CreatedAt,
 		})
 	}
 	return result
+}
+
+// toBotListRespWithSpaceNames is toBotListResp plus a `space_name` per row, so a mixed
+// listing can show which space owns a bot instead of a bare id. A lookup failure is not
+// worth failing the listing over — the rows still carry space_id, so the name is dropped
+// and the list renders.
+func (ab *AppBot) toBotListRespWithSpaceNames(bots []*appBotModel) []gin.H {
+	rows := ab.toBotListResp(bots)
+	ids := make([]string, 0, len(bots))
+	seen := make(map[string]struct{}, len(bots))
+	for _, bot := range bots {
+		if bot.SpaceID == "" {
+			continue
+		}
+		if _, ok := seen[bot.SpaceID]; ok {
+			continue
+		}
+		seen[bot.SpaceID] = struct{}{}
+		ids = append(ids, bot.SpaceID)
+	}
+	if len(ids) == 0 {
+		return rows
+	}
+	names, err := ab.db.querySpaceNames(ids)
+	if err != nil {
+		ab.Error("query space names failed", zap.Error(err))
+		return rows
+	}
+	for i, bot := range bots {
+		if name, ok := names[bot.SpaceID]; ok {
+			rows[i]["space_name"] = name
+		}
+	}
+	return rows
 }
 
 // applyBot handles POST /v1/app_bot/apply — user opt-in to establish friend relationship with an App Bot.
