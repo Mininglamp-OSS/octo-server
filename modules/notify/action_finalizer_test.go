@@ -22,14 +22,14 @@ func (m *captureCardMutator) Mutate(_ context.Context, request carddispatch.Card
 	return carddispatch.CardMutationResult{Applied: true}, nil
 }
 
-func TestDocsActionFinalizerUsesEventIDAsCardSeqAndNotifiesRequester(t *testing.T) {
+func TestDocsActionFinalizerUsesEventIDAsCardSeqWithoutSecondOutcomeCard(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	mutator := &captureCardMutator{}
 	sender := &capturingCardSender{}
-	finalizer, err := NewDocsActionFinalizer(ctx, mutator, sender)
+	finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 	}
@@ -70,24 +70,20 @@ func TestDocsActionFinalizerUsesEventIDAsCardSeqAndNotifiesRequester(t *testing.
 		t.Fatal("terminal card leaked unreviewed callback display fields")
 	}
 
-	outcome := sender.last()
-	if target := sender.lastTarget(); target.ChannelID != result.RequesterUID || target.SpaceID != event.SpaceID {
-		t.Fatalf("applicant outcome target = %+v, want requester %q in space %q", target, result.RequesterUID, event.SpaceID)
-	}
-	if outcome.Profile != cardmsg.ProfileV1 {
-		t.Fatalf("applicant outcome profile = %q, want octo/v1", outcome.Profile)
-	}
-	if strings.Contains(string(outcome.Document), "must-not-render") {
-		t.Fatal("applicant outcome leaked approver/reason")
+	if len(sender.cards) != 0 {
+		t.Fatalf("second outcome card count = %d, want 0", len(sender.cards))
 	}
 
-	// Replayed callbacks render byte-identical content. The second applicant
-	// notification is explicitly allowed by the at-least-once boundary.
+	// Replayed callbacks render byte-identical content and still do not create
+	// a second outcome card.
 	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
 		t.Fatalf("Finalize(replay) error = %v", err)
 	}
 	if len(mutator.requests) != 2 || mutator.requests[0].ContentEdit != mutator.requests[1].ContentEdit {
 		t.Fatal("replay did not produce a byte-identical deterministic terminal frame")
+	}
+	if len(sender.cards) != 0 {
+		t.Fatalf("replay created second outcome cards: %d", len(sender.cards))
 	}
 }
 
@@ -99,7 +95,7 @@ func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
 
 	build := func(state cardactiondispatch.State, inputs map[string]interface{}) string {
 		mutator := &captureCardMutator{}
-		finalizer, err := NewDocsActionFinalizer(ctx, mutator, &capturingCardSender{})
+		finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 		if err != nil {
 			t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 		}
@@ -124,8 +120,9 @@ func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
 	}
 
 	approved := build(cardactiondispatch.StateApproved, nil)
-	if !strings.Contains(approved, "已允许") || !strings.Contains(approved, "申请人已获得所申请的文档权限。") {
-		t.Fatalf("approved terminal card missing enriched result box: %s", approved)
+	if !strings.Contains(approved, "已允许") || strings.Contains(approved, "申请人已获得所申请的文档权限。") ||
+		strings.Contains(approved, `"style":"good"`) {
+		t.Fatalf("approved terminal card retained duplicate result block: %s", approved)
 	}
 
 	// The reviewer deny reason rides in via event.Inputs and is surfaced on the
@@ -138,17 +135,15 @@ func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
 	}
 }
 
-// The applicant's outcome notification (a fresh resource card sent to the
-// requester, distinct from the reviewer's in-place terminal rewrite) must also
-// carry the deny reason — a denial is useless to the applicant without it.
-func TestDocsActionFinalizerApplicantNotifyCarriesDenyReason(t *testing.T) {
+// Docs terminalization updates only the original request card. It must not send
+// a second approved/denied resource card to the requester.
+func TestDocsActionFinalizerDoesNotSendSecondOutcomeCard(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
-
 	sender := &capturingCardSender{}
-	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{})
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 	}
@@ -166,25 +161,24 @@ func TestDocsActionFinalizerApplicantNotifyCarriesDenyReason(t *testing.T) {
 	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
 		t.Fatalf("Finalize() error = %v", err)
 	}
-	outcome := sender.last()
-	if !strings.Contains(string(outcome.Document), "范围不符，请缩小到 Q3") {
-		t.Fatalf("applicant outcome card missing deny reason: %s", outcome.Document)
+	if len(sender.cards) != 0 {
+		t.Fatalf("second outcome card count = %d, want 0", len(sender.cards))
 	}
 }
 
-func TestDocsActionFinalizerRejectsTerminalResultWithoutRequesterBeforeMutation(t *testing.T) {
+func TestDocsActionFinalizerDoesNotRequireRequesterForTerminalMutation(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
 	mutator := &captureCardMutator{}
-	finalizer, err := NewDocsActionFinalizer(ctx, mutator, &capturingCardSender{})
+	finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 	}
 	event := cardactiondispatch.Event{
 		EventID: 42, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
-		MessageID: "1001", ChannelID: "user-b", ChannelType: 1, SpaceID: "space-1",
+		MessageID: "1001", ChannelID: "user-b", ChannelType: 1, SpaceID: "space-1", OperatorUID: "user-b",
 		Data: map[string]interface{}{"doc_id": "doc-1", "request_id": "request-1"},
 	}
 	result := cardactiondispatch.DecisionResult{
@@ -192,11 +186,11 @@ func TestDocsActionFinalizerRejectsTerminalResultWithoutRequesterBeforeMutation(
 		State:       cardactiondispatch.StateApproved,
 		Display:     map[string]string{"title": "Roadmap"},
 	}
-	if err := finalizer.Finalize(context.Background(), event, result); err == nil {
-		t.Fatal("Finalize() error = nil for terminal result without requester_uid")
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
 	}
-	if len(mutator.requests) != 0 {
-		t.Fatalf("mutation count = %d, want 0 before requester validation", len(mutator.requests))
+	if len(mutator.requests) != 1 {
+		t.Fatalf("mutation count = %d, want 1", len(mutator.requests))
 	}
 }
 
@@ -225,7 +219,7 @@ func TestDocsActionFinalizerUsesAuthoritativeMutationChannel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mutator := &captureCardMutator{}
-			finalizer, err := NewDocsActionFinalizer(ctx, mutator, &capturingCardSender{})
+			finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 			if err != nil {
 				t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 			}
@@ -360,18 +354,16 @@ func TestStandardActionFinalizerUsesAuthoritativeGroupChannel(t *testing.T) {
 	}
 }
 
-// A reviewer reason over cardtmpl's per-fact limit (the input allows up to 4 KiB,
-// only byte-capped by ValidateInputs, not maxLength) must be truncated, not
-// dropped — an over-long FactSet value fails the applicant card build and loses
-// the denial notification entirely, retries included.
-func TestDocsActionFinalizerLongDenyReasonTruncatedNotDropped(t *testing.T) {
+// A reviewer reason over the card limit must be truncated on the original
+// terminal card rather than causing terminalization to fail.
+func TestDocsActionFinalizerLongDenyReasonTruncatedInPlace(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
-
+	mutator := &captureCardMutator{}
 	sender := &capturingCardSender{}
-	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+	finalizer, err := NewDocsActionFinalizer(ctx, mutator)
 	if err != nil {
 		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
 	}
@@ -386,19 +378,21 @@ func TestDocsActionFinalizerLongDenyReasonTruncatedNotDropped(t *testing.T) {
 		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateDenied,
 		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
 	}
-	// Must NOT error — before the fix a 600-rune reason failed the card build.
 	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
 		t.Fatalf("Finalize() with a 600-rune reason must not fail: %v", err)
 	}
-	doc := string(sender.last().Document)
-	if len(doc) == 0 {
-		t.Fatal("applicant outcome card was dropped for a long deny reason")
+	if len(mutator.requests) != 1 {
+		t.Fatalf("mutation count = %d, want 1", len(mutator.requests))
 	}
-	// Truncated to MaxExcerptRunes(300): 300 consecutive runes survive, 301 do not.
-	if !strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes)) {
-		t.Fatalf("expected reason truncated to %d runes to appear", cardtmpl.MaxExcerptRunes)
+	doc := mutator.requests[0].ContentEdit
+	// Card text truncation reserves the final rune for an ellipsis.
+	if !strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes-1)+"…") {
+		t.Fatalf("expected bounded reason with ellipsis: %s", doc)
 	}
-	if strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes+1)) {
-		t.Fatalf("reason exceeded %d runes — not truncated", cardtmpl.MaxExcerptRunes)
+	if strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes)) {
+		t.Fatalf("reason exceeded the %d-rune visual bound", cardtmpl.MaxExcerptRunes)
+	}
+	if len(sender.cards) != 0 {
+		t.Fatalf("second outcome card count = %d, want 0", len(sender.cards))
 	}
 }

@@ -46,7 +46,7 @@ func main() {
 	))
 
 	docsShared := mustCard(cardtmpl.BuildDocsResourceCard(
-		ctx, base, "d_20260713_abcd", "spc_xxx",
+		ctx, base, "d_20260713_abcd",
 		cardtmpl.ResourceCard{
 			Title:       "产品设计方案",
 			Attribution: "Alice 分享了文档",
@@ -61,7 +61,7 @@ func main() {
 	))
 
 	docsAccessRequested := mustCard(cardtmpl.BuildDocsAccessRequestCard(
-		ctx, base, "d_20260716_q3", "DOC-REQ-025", "spc_xxx",
+		ctx, base, "d_20260716_q3", "DOC-REQ-025",
 		cardtmpl.DocsApprovalContent{
 			Title:        "2026 Q3 产品路线图",
 			Actor:        "李四",
@@ -80,20 +80,19 @@ func main() {
 	))
 
 	docsAccessApproved := mustCard(cardtmpl.BuildDocsApprovalOutcomeCard(
-		ctx, base, "d_20260716_q3", "spc_xxx",
+		ctx, base, "d_20260716_q3",
 		cardtmpl.DocsOutcomeContent{
 			Title: "2026 Q3 产品路线图", Variant: "docs.access_approved", Source: cardtmpl.Source{Label: "文档"},
 			Denied: false, HeaderLabel: "文档申请", StatusLabel: "已允许",
-			ResultText: "申请人已获得所申请的文档权限。",
 		},
 	))
 
 	docsAccessDenied := mustCard(cardtmpl.BuildDocsApprovalOutcomeCard(
-		ctx, base, "d_20260716_q3", "spc_xxx",
+		ctx, base, "d_20260716_q3",
 		cardtmpl.DocsOutcomeContent{
 			Title: "2026 Q3 产品路线图", Variant: "docs.access_denied", Source: cardtmpl.Source{Label: "文档"},
 			Denied: true, HeaderLabel: "文档申请", StatusLabel: "已拒绝",
-			ResultText: "申请已被拒绝。", ReasonLabel: "拒绝原因", Reason: "当前版本范围未覆盖该文档，请对齐范围后再申请。",
+			ReasonLabel: "拒绝原因", Reason: "当前版本范围未覆盖该文档，请对齐范围后再申请。",
 		},
 	))
 

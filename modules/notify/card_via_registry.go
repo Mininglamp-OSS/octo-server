@@ -88,16 +88,22 @@ func templateFallbackText(card *DocsCardFields, lang, spaceID string) (string, b
 	if catalog == nil {
 		return "", false
 	}
-	fields, err := mapDocsCardFieldsToJSON(card, lang)
+	metaCtx, cancelMeta := boundedNotifyCatalogContext(context.Background())
+	access := notifyCatalogAccess(docsNotifyProducerID, spaceID)
+	meta, err := catalog.MetaDefault(metaCtx, cardtmpl.CatalogDefaultRequest{Access: access, ID: docsaccessrequest.TemplateID})
+	cancelMeta()
 	if err != nil {
 		return "", false
 	}
-	ctx, cancel := boundedNotifyCatalogContext(context.Background())
-	defer cancel()
-	text, err := catalog.FallbackText(ctx, cardtmpl.CatalogFallbackRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
-		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending,
-		Fields: fields, Lang: lang,
+	fields, err := mapDocsCardFieldsToJSON(card, lang, meta.Version)
+	if err != nil {
+		return "", false
+	}
+	fallbackCtx, cancelFallback := boundedNotifyCatalogContext(context.Background())
+	defer cancelFallback()
+	text, err := catalog.FallbackText(fallbackCtx, cardtmpl.CatalogFallbackRequest{
+		Access: access, ID: docsaccessrequest.TemplateID, Version: meta.Version,
+		State: docsaccessrequest.StatePending, Fields: fields, Lang: lang,
 	})
 	if err != nil || strings.TrimSpace(text) == "" {
 		return "", false
@@ -134,7 +140,7 @@ func preflightDocsAccessRequestSchema(parent context.Context, spaceID string, ca
 	if err != nil {
 		return notifyCatalogLookupError(docsaccessrequest.TemplateID, err)
 	}
-	fields, err := mapDocsCardFieldsToJSON(card, "zh-CN") // preflight 只关心 schema shape,lang 无差异
+	fields, err := mapDocsCardFieldsToJSON(card, "zh-CN", meta.Version) // preflight 只关心 schema shape,lang 无差异
 	if err != nil {
 		return fmt.Errorf("%w: map: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
@@ -190,7 +196,14 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 		return nil, "", fmt.Errorf("%w: default catalog not wired", errCardTmplUnavailable)
 	}
 
-	fields, err := mapDocsCardFieldsToJSON(card, lang)
+	metaCtx, cancelMeta := boundedNotifyCatalogContext(ctx)
+	access := notifyCatalogAccess(docsNotifyProducerID, spaceID)
+	meta, err := catalog.MetaDefault(metaCtx, cardtmpl.CatalogDefaultRequest{Access: access, ID: docsaccessrequest.TemplateID})
+	cancelMeta()
+	if err != nil {
+		return nil, "", notifyCatalogLookupError(docsaccessrequest.TemplateID, err)
+	}
+	fields, err := mapDocsCardFieldsToJSON(card, lang, meta.Version)
 	if err != nil {
 		return nil, "", fmt.Errorf("notify: map DocsCardFields to schema JSON: %w", err)
 	}
@@ -200,11 +213,11 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 		Lang:        lang,
 		SpaceID:     spaceID,
 	}
-	catalogCtx, cancel := boundedNotifyCatalogContext(ctx)
-	defer cancel()
-	cardDoc, _, renderProfile, err := cardtmpl.RenderCatalogCardWithProfiles(catalogCtx, catalog, cardtmpl.CatalogRenderRequest{
-		Access: notifyCatalogAccess(docsNotifyProducerID, spaceID),
-		ID:     docsaccessrequest.TemplateID, State: docsaccessrequest.StatePending, Fields: fields, Env: env,
+	renderCtx, cancelRender := boundedNotifyCatalogContext(ctx)
+	defer cancelRender()
+	cardDoc, _, renderProfile, err := cardtmpl.RenderCatalogCardWithProfiles(renderCtx, catalog, cardtmpl.CatalogRenderRequest{
+		Access: access, ID: docsaccessrequest.TemplateID, Version: meta.Version,
+		State: docsaccessrequest.StatePending, Fields: fields, Env: env,
 	})
 	if err != nil {
 		return nil, "", err
@@ -332,7 +345,7 @@ func preflightDocsDisplaySchema(
 //
 // state 恒 "pending" (本 PR pilot 只注册 pending view;approved/rejected 由
 // standard_action_finalizer 生成,不走 ingress)。
-func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage, error) {
+func mapDocsCardFieldsToJSON(card *DocsCardFields, lang, version string) (json.RawMessage, error) {
 	if card == nil {
 		return nil, errors.New("mapDocsCardFieldsToJSON: nil card")
 	}
@@ -357,6 +370,25 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 		"requestedAtDisplay": strings.TrimSpace(card.UpdatedAt),
 		"messageTimeDisplay": strings.TrimSpace(card.UpdatedAt),
 	}
+	if version == docsaccessrequest.TemplateVersionV3 {
+		m["requester"].(map[string]any)["sourceSpaceName"] = cardtmpl.TruncateRunes(strings.TrimSpace(card.RequesterSpaceName), 200)
+	}
+	requestedBotNames := make([]string, 0, min(len(card.RequestedBotNames), 50))
+	for _, name := range card.RequestedBotNames[:min(len(card.RequestedBotNames), 50)] {
+		if value := strings.TrimSpace(name); value != "" {
+			requestedBotNames = append(requestedBotNames, cardtmpl.TruncateRunes(value, 120))
+		}
+	}
+	if version == docsaccessrequest.TemplateVersionV3 && len(requestedBotNames) > 0 {
+		m["requestedBotNames"] = requestedBotNames
+	}
+	if version == docsaccessrequest.TemplateVersionV3 {
+		roleLabel, err := docsRequestedRoleLabel(card.RequestedRole, lang)
+		if err != nil {
+			return nil, err
+		}
+		m["permission"] = map[string]any{"roleLabel": roleLabel}
+	}
 	// document.url 由服务端拼接 (docsDeepLink 在 cardtmpl 内做),这里留空,
 	// schema 允许空;pilot Template Build 内部不读它,读的是 requestId + WebLoginURL。
 	raw, err := json.Marshal(m)
@@ -364,6 +396,26 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 		return nil, fmt.Errorf("marshal mapped fields: %w", err)
 	}
 	return json.RawMessage(raw), nil
+}
+
+func docsRequestedRoleLabel(role, lang string) (string, error) {
+	zh := strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh")
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		role = "reader" // legacy callers omitted requested_role and requested viewer access
+	}
+	labels := map[string][2]string{
+		"reader": {"viewer", "只读"}, "commenter": {"commenter", "可评论"},
+		"writer": {"editor", "可编辑"}, "admin": {"administrator", "管理员"},
+	}
+	label, ok := labels[role]
+	if !ok {
+		return "", fmt.Errorf("unsupported requested_role %q", role)
+	}
+	if zh {
+		return label[1], nil
+	}
+	return label[0], nil
 }
 
 // summaryTimeRangeMaxRunes / summaryGeneratedAtMaxRunes mirror the summary card

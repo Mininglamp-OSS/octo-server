@@ -50,7 +50,7 @@
    smart-summary 的 dedup / retry / sweep 状态机。
 5. **模板/文案/链接归属 octo-server**:docs-backend **只发原始字段**;卡片布局、
    按钮文案(查看详情)、FactSet 标签(操作人 / 时间)、attribution
-   (「Alice 分享了文档」)、`/d/{doc_id}?sp={space_id}` deep-link、
+   (「Alice 分享了文档」)、`/d/{doc_id}` deep-link、
    `metadata.octo.variant` / `metadata.octo.source` 全部由 octo-server
    `pkg/cardtmpl` + `modules/notify.buildDocsCard` + `i18n.OutboundLanguage`
    生成。docs-backend 不再拼「XX 分享了 <link>」这类降级文本(旧字段作废;
@@ -74,6 +74,9 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
     "kind":       "shared",            // "shared" | "commented" | "access_requested"
     "title":      "产品设计方案",         // 原始标题(server 负责转义/截断)
     "actor_name": "Alice",             // 预格式化的操作人显示名;空则用「有人」/「Someone」兜底
+    "requester_space_name": "产品空间",  // access_requested 可选;申请人来源 Space 展示名
+    "requested_bot_names": ["助手 A"],   // access_requested 可选;最多 50 项,每项最多 120 runes
+    "requested_role": "reader",         // access_requested: reader | commenter | writer | admin
     "excerpt":    "Q3 上线计划已确认",    // 可选预览/评论/申请说明;≤ 300 runes 截断
     "updated_at": "2026-07-13 15:04"   // 已格式化的时间字符串;空则省略「时间」行
   }
@@ -85,7 +88,7 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
 
 ## 三个约定（对齐 summary-notify）
 
-- **标识 `doc_id`(不是自增 `id`)**:deep-link `/d/{doc_id}?sp={space_id}` 用
+- **标识 `doc_id`(不是自增 `id`)**:deep-link `/d/{doc_id}` 用
   docs-backend 侧不可枚举的文档标识 —— 与 octo-web `/d/:docId` 独立路由
   (已在线;冷加载 + 登录跳转 + XIN-398 多会话 sid 恢复)对齐。**这是 docs-notify
   与 summary-notify 的关键差异:docs 侧「查看详情」按钮开箱可用**,
@@ -108,6 +111,9 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
 | `kind` | 触发场景:分享 = `shared`;评论 = `commented`;访问申请 = `access_requested` |
 | `title` | 文档 `title` 字段(空则用「无标题」兜底 —— docs-backend 侧决策) |
 | `actor_name` | 触发者的显示名(docs-backend 已 resolve;匿名场景可留空) |
+| `requester_space_name` | 访问申请人的来源 Space 展示名；可空，octo-server 截断到 200 runes |
+| `requested_bot_names` | 同时申请权限的 AI 助手展示名；可空，最多 50 项，每项截断到 120 runes |
+| `requested_role` | 访问申请角色；允许 `reader | commenter | writer | admin`（大小写不敏感）；空值兼容旧调用并按 `reader` 展示；未知非空值按契约错误拒绝，整次通知零投递 |
 | `excerpt` | 分享:留空 / 简短介绍;评论:评论内容摘要;访问申请:申请理由 |
 | `updated_at` | 触发事件的时间戳格式化字符串(docs-backend 时区) |
 

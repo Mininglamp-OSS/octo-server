@@ -42,7 +42,7 @@ func TestBuildDocsAccessRequestCard_MigrationBaseline(t *testing.T) {
 	card := validAccessRequestDocsCard()
 
 	// pre-migration baseline (legacy path)
-	legacyRaw, err := n.buildDocsAccessRequestCard(context.Background(), "space-1", card, "zh-CN")
+	legacyRaw, err := n.buildDocsAccessRequestCard(context.Background(), card, "zh-CN")
 	if err != nil {
 		t.Fatalf("legacy build: %v", err)
 	}

@@ -64,7 +64,6 @@ func TestBuildDocsAccessRequestCardEnrichedLayoutAndActions(t *testing.T) {
 		"https://im.example.com/login",
 		"doc-1",
 		"request-1",
-		"space-1",
 		exampleDocsApprovalContent(),
 		ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
 	)
@@ -139,7 +138,7 @@ func cardHasText(nodes []map[string]interface{}, want string) bool {
 // accepts a submitted inputs[deny_reason] and fail-closes on undeclared keys.
 func TestDocsAccessRequestCardDenyReasonSubmitContract(t *testing.T) {
 	document, err := BuildDocsAccessRequestCard(
-		localizedContext("zh-CN"), "https://im.example.com/login", "doc-1", "request-1", "space-1",
+		localizedContext("zh-CN"), "https://im.example.com/login", "doc-1", "request-1",
 		exampleDocsApprovalContent(), ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
 	)
 	require.NoError(t, err)
@@ -169,7 +168,6 @@ func TestBuildDocsAccessRequestCardRejectsMissingRequestID(t *testing.T) {
 		"https://im.example.com/login",
 		"doc-1",
 		"",
-		"space-1",
 		exampleDocsApprovalContent(),
 		ApprovalActions{ApproveTitle: "Allow", DenyTitle: "Deny"},
 	)
@@ -182,7 +180,7 @@ func TestBuildDocsAccessRequestCardAvatarHTTPSOnly(t *testing.T) {
 
 	// Empty avatar => no Image element.
 	noAvatar := exampleDocsApprovalContent()
-	doc, err := BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", "s", noAvatar, actions)
+	doc, err := BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", noAvatar, actions)
 	require.NoError(t, err)
 	var card map[string]interface{}
 	require.NoError(t, json.Unmarshal(doc, &card))
@@ -191,7 +189,7 @@ func TestBuildDocsAccessRequestCardAvatarHTTPSOnly(t *testing.T) {
 	// https avatar => one Person Image.
 	withAvatar := exampleDocsApprovalContent()
 	withAvatar.ActorAvatar = "https://cdn.example.com/a/lisi.png"
-	doc, err = BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", "s", withAvatar, actions)
+	doc, err = BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", withAvatar, actions)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(doc, &card))
 	images := nodesOfType(flattenCardNodes(card["body"]), "Image")
@@ -203,7 +201,7 @@ func TestBuildDocsAccessRequestCardAvatarHTTPSOnly(t *testing.T) {
 	for _, bad := range []string{"http://cdn.example.com/a.png", "data:image/png;base64,AAAA", "//cdn/a.png"} {
 		c := exampleDocsApprovalContent()
 		c.ActorAvatar = bad
-		_, err := BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", "s", c, actions)
+		_, err := BuildDocsAccessRequestCard(localizedContext("zh-CN"), base, "d", "r", c, actions)
 		require.Error(t, err, "avatar %q must be rejected", bad)
 	}
 }
@@ -215,7 +213,7 @@ func TestBuildDocsAccessRequestCardEscapesCallerText(t *testing.T) {
 	c.Title = "Road_map_"
 	doc, err := BuildDocsAccessRequestCard(
 		localizedContext("zh-CN"),
-		"https://im.example.com/login", "d", "r", "s", c,
+		"https://im.example.com/login", "d", "r", c,
 		ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
 	)
 	require.NoError(t, err)
@@ -250,7 +248,7 @@ func TestBuildDocsAccessRequestCardBannerTextRunNotEscaped(t *testing.T) {
 	c.Actor = "Wang (FE)_lead"
 	c.BannerSuffix = "requested access."
 	doc, err := BuildDocsAccessRequestCard(
-		localizedContext("en-US"), "https://im.example.com/login", "d", "r", "s", c,
+		localizedContext("en-US"), "https://im.example.com/login", "d", "r", c,
 		ApprovalActions{ApproveTitle: "Allow", DenyTitle: "Deny"},
 	)
 	require.NoError(t, err)
@@ -278,7 +276,7 @@ func TestBuildDocsAccessRequestCardAnonymous(t *testing.T) {
 	c.ActorAvatar = ""
 	c.BannerSuffix = "Someone requested access to this document."
 	doc, err := BuildDocsAccessRequestCard(
-		localizedContext("en-US"), "https://im.example.com/login", "d", "r", "s", c,
+		localizedContext("en-US"), "https://im.example.com/login", "d", "r", c,
 		ApprovalActions{ApproveTitle: "Allow", DenyTitle: "Deny"},
 	)
 	require.NoError(t, err)
@@ -299,7 +297,7 @@ func TestBuildDocsAccessRequestCardBoundsActorInData(t *testing.T) {
 	c := exampleDocsApprovalContent()
 	c.Actor = strings.Repeat("名", maxActorRunes+50)
 	doc, err := BuildDocsAccessRequestCard(
-		localizedContext("zh-CN"), "https://im.example.com/login", "d", "r", "s", c,
+		localizedContext("zh-CN"), "https://im.example.com/login", "d", "r", c,
 		ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
 	)
 	require.NoError(t, err)
@@ -319,24 +317,23 @@ func TestBuildDocsAccessRequestCardBoundsActorInData(t *testing.T) {
 func TestBuildDocsApprovalOutcomeCard(t *testing.T) {
 	base := "https://im.example.com/login"
 
-	// Approved: good box, no reason, validates.
-	approved, err := BuildDocsApprovalOutcomeCard(localizedContext("zh-CN"), base, "d", "s", DocsOutcomeContent{
+	// Approved: status appears only in the header; no duplicate result box.
+	approved, err := BuildDocsApprovalOutcomeCard(localizedContext("zh-CN"), base, "d", DocsOutcomeContent{
 		Title: "2026 Q3 产品路线图", Variant: "docs.access_approved", Source: Source{Label: "文档"},
 		Denied: false, HeaderLabel: "文档申请", StatusLabel: "已允许",
-		ResultText: "申请人已获得所申请的文档权限。",
 	})
 	require.NoError(t, err)
 	card := mustCardMap(t, approved)
 	nodes := flattenCardNodes(card["body"])
 	assert.True(t, cardHasText(nodes, "已允许"))
-	assert.True(t, cardHasText(nodes, "申请人已获得所申请的文档权限。"))
+	assert.False(t, cardHasText(nodes, "申请人已获得所申请的文档权限。"))
 	requireOutcomeValidates(t, card)
 
 	// Denied: attention box surfaces the reviewer reason (escaped), validates.
-	denied, err := BuildDocsApprovalOutcomeCard(localizedContext("zh-CN"), base, "d", "s", DocsOutcomeContent{
+	denied, err := BuildDocsApprovalOutcomeCard(localizedContext("zh-CN"), base, "d", DocsOutcomeContent{
 		Title: "2026 Q3 产品路线图", Variant: "docs.access_denied", Source: Source{Label: "文档"},
 		Denied: true, HeaderLabel: "文档申请", StatusLabel: "已拒绝",
-		ResultText: "申请已被拒绝。", ReasonLabel: "拒绝原因", Reason: "权限范围*不符*",
+		ReasonLabel: "拒绝原因", Reason: "权限范围*不符*",
 	})
 	require.NoError(t, err)
 	card = mustCardMap(t, denied)

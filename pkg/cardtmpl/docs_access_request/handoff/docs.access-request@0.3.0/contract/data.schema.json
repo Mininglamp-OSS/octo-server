@@ -3,55 +3,153 @@
   "title": "文档访问申请卡数据契约 0.3.0",
   "type": "object",
   "additionalProperties": false,
-  "required": ["requestId", "state", "document"],
+  "required": [
+    "requestId",
+    "state",
+    "document"
+  ],
   "properties": {
-    "requestId": {"type": "string", "minLength": 1, "maxLength": 200},
-    "state": {"type": "string", "enum": ["pending", "approved", "rejected", "cancelled", "unavailable"]},
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "cancelled",
+        "unavailable"
+      ]
+    },
     "document": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["title"],
+      "required": [
+        "title"
+      ],
       "properties": {
-        "docId": {"type": "string", "maxLength": 200},
-        "title": {"type": "string", "minLength": 1, "maxLength": 200},
-        "url": {"type": "string", "maxLength": 2048},
-        "sourceName": {"type": "string", "maxLength": 200}
+        "docId": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "sourceName": {
+          "type": "string",
+          "maxLength": 200
+        }
       }
     },
     "requester": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "name": {"type": "string", "maxLength": 120},
-        "avatarUrl": {"type": "string", "maxLength": 2048, "pattern": "^(|https://[^/].*)$"}
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^(|https://[^/].*)$"
+        },
+        "sourceSpaceName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "申请人的来源 Space 展示名称（可空）"
+        }
       }
     },
     "permission": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "label": {"type": "string", "maxLength": 80},
-        "roleLabel": {"type": "string", "maxLength": 80}
+        "label": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "roleLabel": {
+          "type": "string",
+          "maxLength": 80
+        }
       }
     },
-    "requestReason": {"type": "string", "maxLength": 300},
-    "requestedAtDisplay": {"type": "string", "maxLength": 80},
-    "messageTimeDisplay": {"type": "string", "maxLength": 80},
+    "requestReason": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "requestedAtDisplay": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "messageTimeDisplay": {
+      "type": "string",
+      "maxLength": 80
+    },
     "decision": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operatorName"],
+      "required": [
+        "operatorName"
+      ],
       "properties": {
-        "operatorName": {"type": "string", "minLength": 1, "maxLength": 120},
-        "decidedAtDisplay": {"type": "string", "maxLength": 80},
-        "rejectionReason": {"type": "string", "maxLength": 300}
+        "operatorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "decidedAtDisplay": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "rejectionReason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "operatorSpaceName": {
+          "type": "string",
+          "maxLength": 200
+        }
       }
+    },
+    "requestedBotNames": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120
+      },
+      "description": "同时申请权限的 AI 助手展示名称"
     }
   },
   "allOf": [
     {
-      "if": {"properties": {"state": {"enum": ["approved", "rejected"]}}},
-      "then": {"required": ["decision"]}
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "approved",
+              "rejected"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "decision"
+        ]
+      }
     }
   ]
 }

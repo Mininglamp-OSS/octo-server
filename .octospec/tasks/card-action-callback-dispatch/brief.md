@@ -23,7 +23,8 @@ service via a **signed, config-registered HTTP callback** carrying a typed
 decision request. The consumer service implements **one authenticated HTTP
 endpoint** that returns a decision result; octo-server owns everything else —
 queue consumption, retry/backoff/DLQ, callback signing, and rendering the final
-card state + applicant notification.
+card state. Standard approval routes also send a requester outcome; the Docs
+pilot intentionally uses only the in-place approver-card terminal state.
 
 This replaces the rejected **pull model** (where each new consumer would have to
 implement bot-event polling + ack + cursor + a bot token + card-edit + notify
@@ -51,7 +52,9 @@ unrecognized owner must never run a callback and only then fail finalization.
 **Pilot consumer — docs access-request approve/deny.** The docs
 `access_requested` notification is upgraded from an `octo/v1` display card to an
 `octo/v2` approve/deny card; the click is dispatched to docs-backend's decide
-endpoint; octo-server renders the finalized card + notifies the applicant.
+endpoint; octo-server renders the approver card in place. The Docs pilot does
+not send a second terminal IM card to the applicant; Docs remains the
+authoritative access-status surface.
 
 End-to-end (pilot):
 
@@ -68,8 +71,8 @@ A 申请文档 (docs-backend 创建 pending)
           request_id, inputs, data, channel/message ids, space_id, acted_at}
 → docs-backend 验签 → 幂等(event_id) → 重校验 B 仍为 admin → CAS pending→approved/denied
    返回: {disposition, state, requester_uid, display fields}
-→ octo-server 按返回结果: 编辑 B 的卡为最终态 (走卡片信任边界 + card_seq CAS)
-   + 给 A 发 v1 展示卡通知 (已获权 / 已拒绝)
+→ octo-server 按返回结果编辑 B 的卡为最终态 (走卡片信任边界 + card_seq CAS)
+→ 不给 A 再发第二张终态 IM 卡；申请状态以 Docs 权威状态为准
 → 全部完成后 ack (从分发队列移除)
 ```
 
@@ -264,10 +267,10 @@ injection anchor here:
 - **Custom outcome templates for future owners** — this task ships docs plus a
   generic standard-approval template. New custom visual families remain a code
   review, but standard approval consumers do not.
-- **Exactly-once applicant notification** — business decisions and terminal
-  edits are idempotent, but the applicant notification remains at-least-once.
-  A crash after transport success and before queue ack may produce a rare
-  duplicate, consistent with the existing notify contract; no outbox is added.
+- **Exactly-once requester outcome for standard routes** — business decisions
+  and terminal edits are idempotent, but a generic standard route's requester
+  outcome remains at-least-once. The Docs specialized route sends no second
+  applicant terminal IM card. No outbox is added.
 - **General circuit-breaker framework** — bounded concurrency and scheduled
   retry already protect dependencies in v1.
 
@@ -284,9 +287,10 @@ Machine-checkable on the octo-server side:
   POSTs a signed HTTPS request (valid versioned HMAC over method/path/timestamp/
   event_id/body hash, redirects disabled) to the
   registered URL with the typed-decision fields, then renders the final card
-  (via the carddispatch boundary, `card_seq` incremented) and sends the
-  applicant notification. Test asserts signature validity, request shape, card
-  finalized, notify sent, event ack'd. Oversized or malformed callback
+  (via the carddispatch boundary, `card_seq` incremented). The generic standard
+  route also sends its requester outcome; the Docs route does not. Tests assert
+  signature validity, request shape, finalization, route-specific delivery, and
+  ACK. Oversized or malformed callback
   responses are rejected before rendering.
 - **Retry + DLQ**: consumer 5xx/timeout → dispatcher retries with backoff and
   does NOT ack; after configured attempts → event lands in DLQ + an alert
@@ -298,9 +302,9 @@ Machine-checkable on the octo-server side:
 - **Idempotency / replay**: re-delivering the same `event_id` (dispatcher crash
   before ack) re-calls decide (consumer returns the same stored typed result)
   and re-renders the byte-identical terminal frame (`card_seq=event_id`, CAS
-  no-op). The applicant notification is at-least-once; tests assert no duplicate
-  domain transition or card revision and explicitly allow transport duplication
-  at the crash boundary.
+  no-op). Generic standard requester outcomes are at-least-once; tests assert no
+  duplicate domain transition or card revision and explicitly allow standard-route
+  transport duplication at the crash boundary. Docs sends no requester outcome.
 - **SSRF guard**: non-HTTPS, credential-bearing, fragment-bearing, or
   non-allowlisted exact URLs are rejected at config load; redirects are never
   followed and proxy environment variables are ignored. Cards never carry a
@@ -353,12 +357,13 @@ The **entire** docs-side work is one endpoint:
   and replay the same typed response for one `event_id`:
   - `disposition`: `applied|replayed|forbidden|conflict|not_found`.
   - `state`: `pending|approved|denied|cancelled`.
-  - bounded `requester_uid` is required for `approved` / `denied` (octo must
-    notify the applicant); it may be omitted for other states. Display fields
-    remain optional and are consumed only by reviewed octo templates.
-- No polling, no bot token, no card/IM/notify code. Grant is source-of-truth;
-  the applicant notification is octo's best-effort render (retry independent of
-  the grant).
+  - bounded `requester_uid` remains required by the shared typed response for
+    `approved` / `denied`. Generic standard finalizers consume it to send a
+    requester outcome; the Docs specialized finalizer ignores it and sends no
+    second applicant terminal IM card. Display fields remain optional and are
+    consumed only by reviewed octo templates.
+- No polling, no bot token, and no card/IM construction. The grant and request
+  state are authoritative in Docs; octo only terminalizes the approver card.
 
 ## Locked implementation decisions (maintainer-confirmed 2026-07-15)
 
@@ -373,7 +378,8 @@ The **entire** docs-side work is one endpoint:
 4. **Standard card lifecycle** — octo owns the generic initial approval
    template, final template, requester outcome, and shared mutation primitive.
    A route-bound notify token provides the only generic ingress. Docs binds a
-   specialized template; all other routes use the standard fallback. A new
+   specialized template and intentionally omits the requester outcome; all other
+   routes use the standard fallback. A new
    standard consumer needs only secrets + route + decide endpoint; a genuinely
    new visual template still requires an octo-server code review.
 5. **DLQ** — bounded retries, then DLQ retained 30 days; alert + manual replay
@@ -383,4 +389,5 @@ The **entire** docs-side work is one endpoint:
 7. **Retention** — live queue TTL equals `Robot.MessageExpire` (default 7 days),
    keeping D4 idempotency and actionable event windows aligned.
 8. **Delivery semantics** — callback decision and terminal card mutation are
-   idempotent; applicant notification is explicitly at-least-once.
+   idempotent; generic standard requester outcomes are explicitly at-least-once,
+   while Docs emits no second applicant terminal IM card.

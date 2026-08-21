@@ -85,11 +85,14 @@ type CardMutateReq struct {
 	DocID       string `json:"doc_id"`
 	Title       string `json:"title"`
 	DenyReason  string `json:"deny_reason"` // surfaced on the denied terminal card; empty on approve
-	// OperatorName / DecidedAtDisplay are optional additive display fields.
-	// Older callers omit them and receive localized generic operator copy; raw
-	// UIDs are never derived as display copy by this endpoint.
-	OperatorName     string `json:"operator_name"`
-	DecidedAtDisplay string `json:"decided_at_display"`
+	// Operator display fields are optional and are resolved once by the trusted
+	// Docs decision service. IDs are retained as bounded audit context only;
+	// octo-server never uses unbound caller-supplied IDs for display lookup.
+	OperatorUID       string `json:"operator_uid"`
+	OperatorName      string `json:"operator_name"`
+	OperatorSpaceID   string `json:"operator_space_id"`
+	OperatorSpaceName string `json:"operator_space_name"`
+	DecidedAtDisplay  string `json:"decided_at_display"`
 }
 
 // CardMutateResp reports whether the card is now terminal.
@@ -250,13 +253,14 @@ func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.Card
 		return fmt.Errorf("%w: %v", errDocsSiblingContextInvalid, err)
 	}
 	denied := req.Kind == DocsCardKindAccessDenied
-	fields, state, err := buildDocsAccessResultFields(env.Lang, docsResultRenderInput{
-		Data:             data,
-		Title:            req.Title,
-		OperatorName:     req.OperatorName,
-		DecidedAtDisplay: req.DecidedAtDisplay,
-		DenyReason:       req.DenyReason,
-		Denied:           denied,
+	fields, state, err := buildDocsAccessResultFields(env.Lang, version, docsResultRenderInput{
+		Data:              data,
+		Title:             req.Title,
+		OperatorName:      req.OperatorName,
+		OperatorSpaceName: req.OperatorSpaceName,
+		DecidedAtDisplay:  req.DecidedAtDisplay,
+		DenyReason:        req.DenyReason,
+		Denied:            denied,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", errDocsSiblingContextInvalid, err)

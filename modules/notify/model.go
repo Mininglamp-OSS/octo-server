@@ -66,12 +66,12 @@ const (
 // DocsCardFields is the docs-notify structured card input (cross-repo contract,
 // see .octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md).
 // Fields carry raw values only; attribution/label copy, layout, and the
-// /d/{doc_id}?sp={space_id} deep-link are owned by the server (pkg/cardtmpl +
+// /d/{doc_id} deep-link are owned by the server (pkg/cardtmpl +
 // modules/notify.buildDocsCard + i18n.OutboundLanguage). The docs backend
 // pre-formats display strings it wants surfaced verbatim (ActorName, UpdatedAt)
 // so octo-server does not resolve secondary identities on the card path.
 type DocsCardFields struct {
-	DocID     string `json:"doc_id"`     // maps to /d/{doc_id}?sp={space_id}
+	DocID     string `json:"doc_id"`     // maps to /d/{doc_id}
 	RequestID string `json:"request_id"` // required by access_requested v2; docs domain idempotency/CAS key
 	Kind      string `json:"kind"`       // "shared" | "commented" | "access_requested"
 	Title     string `json:"title"`      // document title
@@ -86,8 +86,13 @@ type DocsCardFields struct {
 	// the card build (same positive allowlist as any rendered image URL). The
 	// docs backend owns population; octo-server does not resolve it.
 	ActorAvatarURL string `json:"actor_avatar_url"`
-	Excerpt        string `json:"excerpt"`    // optional preview / comment / access reason
-	UpdatedAt      string `json:"updated_at"` // pre-formatted timestamp; empty allowed
+	Excerpt        string `json:"excerpt"` // optional preview / comment / access reason
+	// RequesterSpaceName and RequestedBotNames enrich access-request cards only.
+	// They are display values resolved by Docs Backend in the requester's Space.
+	RequesterSpaceName string   `json:"requester_space_name"`
+	RequestedBotNames  []string `json:"requested_bot_names"`
+	RequestedRole      string   `json:"requested_role"` // reader | commenter | writer | admin
+	UpdatedAt          string   `json:"updated_at"`     // pre-formatted timestamp; empty allowed
 }
 
 // Docs card notification kinds.
