@@ -225,10 +225,10 @@ func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]str
 		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
 		return nil, err
 	}
-	for _, uid := range uids {
-		if err := enqueueMemberRemovalCleanupTx(tx, spaceId, uid, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
-			return nil, err
-		}
+	// 批量入队：本事务正握着 space_member 的 FOR UPDATE 范围锁，逐条 INSERT 会把
+	// 上万次往返都压在锁内，期间所有并发加入路径全部阻塞。
+	if err := enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
