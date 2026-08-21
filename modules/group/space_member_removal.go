@@ -92,20 +92,36 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 //
 // RemoveGroupMembers 会静默跳过 role=creator 的成员，所以群主必须先交接、再走移除。
 //
-// 关于「IM 退订失败只记日志、逃出了工单的重试」：这里刻意不改，也刻意不把
-// IMRemoveSubscriber 提到删行之前。群频道的权威订阅源是 1module.go 的
-// IMDatasource.Subscribers 回调，它现查 group_member（is_deleted=0 且
-// status=normal）——DB 才是真相，IMRemoveSubscriber 只是提前把 WuKongIM 的缓存
-// 捅掉一次。
-//   - 提到删行之前是错的：那一刻成员行还在，回调仍会把他算进订阅者，
-//     WuKongIM 下一次重载就把人加回来（YUJ-4185 P0-2 的既有根因，见
-//     db.go querySubscribableMemberUIDsWithGroupNo 的说明）。
-//   - 删行之后上抛也没有意义：重试时 queryGroupsWithMemberUIDAndSpaceID
-//     已经查不到这个群，重跑等于空转，只会把一次真实故障洗成 done。
+// ⚠️ 已知缺口：IM 退订失败会永久泄漏，且**没有**任何东西兜底。
 //
-// 与 dm_cutoff 侧的取舍不同是因为两边的权威位置不同：Person 频道白名单同样由
-// 回调推导，但 dm_cutoff 的范围（MembersEverInSpace）不看成员状态，重试确实会
-// 重跑到同一批对端，所以那边上抛是有效的。
+// RemoveGroupMembers 内部那次 IMRemoveSubscriber（service.go）失败时只记日志。
+// 早先这里写过一段注释，说 1module.go 的 IMDatasource.Subscribers 回调是权威
+// 订阅源、WuKongIM 下次重载会自愈——**那是错的**，已按 CI pin 的 broker 版本
+// wukongim v2.2.4-20260313 逐条核实：
+//   - internal/server/server.go 里 `s.datasource = NewDatasource(s)` 是全树
+//     唯一一处 `.datasource`，赋值之后再没有任何地方读它；
+//     datasource.GetSubscribers / GetWhitelist 零调用者，HasDatasource() 只在
+//     manager_systemaccount.go 里为 getSystemUIDs 服务。
+//   - 发送侧走 broker 自己的存储：internal/service/permission.go 的
+//     hasPermissionForCommChannel 查 Store.ExistSubscriber，不通过就是
+//     ReasonSubscriberNotExist。
+//   - 本仓库 CI 与部署都没有配置 datasource。
+//
+// 也就是说这个回调根本不会被调用，订阅存储只被 subscriber_add / subscriber_remove
+// 两个主动 API 改动。退订失败一次，人就**永久**留在群频道里：照收推送、照能发言，
+// 而工单被标成 done。db.go querySubscribableMemberUIDsWithGroupNo 上那条
+// 「下次重载会把他加回来」的 YUJ-4185 注释，在这个版本同样不成立。
+//
+// 为什么这里没有顺手修掉：光把错误上抛没用——删行之后
+// queryGroupsWithMemberUIDAndSpaceID 已经查不到这个群，重跑是空转，只会把一次
+// 真实故障洗成 done；把 IMRemoveSubscriber 提到删行之前也没用，那只是换一个
+// 时刻失败。真正的修法是在删行的同一个事务里写一条持久化的 IM-pending 记录
+// （范围不依赖 group_member 活跃行），由本 worker 消费——形状与 dm_cutoff 侧
+// 相同，但它修的是 RemoveGroupMembers 这个既有原语的所有调用方，不只是本步骤，
+// 因此单独立项。见 issue #797。
+//
+// dm_cutoff 侧之所以能直接上抛，是因为它的范围 MembersEverInSpace 不看成员状态，
+// 重试确实会重新枚举到同一批对端。
 func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {

@@ -830,6 +830,18 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)
 	}
+
+	// 补回上一次移除摘掉的 Person 频道白名单（见 restoreAfterRejoin）。
+	// 这条路径不走 afterJoinSpace，所以必须自己调；响应已经发出，放后台执行。
+	//
+	// **一个** goroutine 串行跑完整批，不是每人一个：每个成员都要拉一次会话列表
+	// 并逐对端打 IM，200 人一起放出去就是 200 条并发链路同时压 WuKongIM 和连接池。
+	// 这与 afterMembersRemoved 当初从「每 uid 一个 goroutine」收敛成单个的理由完全相同。
+	go func(uids []string) {
+		for _, uid := range uids {
+			s.restoreAfterRejoin(spaceId, uid)
+		}
+	}(newMembers)
 }
 
 // removeMembers 移除成员
@@ -1323,6 +1335,16 @@ func (s *Space) afterJoinSpace(uid, spaceId string, space *SpaceModel) {
 	if event.SpaceMemberCacheInvalidator != nil {
 		event.SpaceMemberCacheInvalidator(spaceId)
 	}
+
+	// 补回上一次移除摘掉的 Person 频道白名单（见 restoreAfterRejoin）。
+	//
+	// 放后台跑，不能挂在加入请求上：这一步要先 IMSyncUserConversation 拉一遍
+	// 加入者的会话列表，再对每个对端做两次判定查询和最多四次 IM 调用。会话多的
+	// 人可能是秒级，而这里还没有响应调用方——那正是移除侧当初把整条清理丢进
+	// worker 的原因，也是本任务给批量移除加 200 上限时防的同一件事。
+	// 代价是重新加入后有一个很短的窗口私聊还没恢复；比起把加入请求卡住，这个
+	// 取舍更好，而且步骤本身幂等，重复触发无害。
+	go s.restoreAfterRejoin(spaceId, uid)
 }
 
 // joinPresetGroups 将用户加入预设群组（通过直接DB操作避免循环依赖）

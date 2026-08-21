@@ -30,6 +30,7 @@ type imStub struct {
 	mu              sync.Mutex
 	conversations   []map[string]interface{}
 	whitelistRemove []whitelistRemoveCall
+	whitelistAdd    []whitelistRemoveCall
 	cmds            []map[string]interface{}
 	// failChannels 里的 channel_id 上，whitelist_remove 返回 500，用来断言
 	// 摘白名单失败会被上抛而不是吞掉。
@@ -57,6 +58,15 @@ func newIMStub(t *testing.T, ctx *config.Context, conversationPeers []string) *i
 		stub.mu.Lock()
 		defer stub.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(stub.conversations)
+	})
+	mux.HandleFunc("/channel/whitelist_add", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var call whitelistRemoveCall
+		_ = json.Unmarshal(body, &call)
+		stub.mu.Lock()
+		stub.whitelistAdd = append(stub.whitelistAdd, call)
+		stub.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/channel/whitelist_remove", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -107,6 +117,17 @@ func (s *imStub) failWhitelistRemove(channelIDs ...string) {
 	for _, id := range channelIDs {
 		s.failChannels[id] = true
 	}
+}
+
+// addedChannels 返回所有被补白名单的 (channel_id, uid) 组合。
+func (s *imStub) addedChannels() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]string, len(s.whitelistAdd))
+	for _, call := range s.whitelistAdd {
+		out[call.ChannelID] = append(out[call.ChannelID], call.UIDs...)
+	}
+	return out
 }
 
 // clearWhitelistRemoveFailures 恢复所有被打故障的频道。
@@ -536,4 +557,104 @@ func TestDMCutoffPropagatesSpacePrefixedWhitelistFailure(t *testing.T) {
 		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
 	}), "IM 恢复后重跑应当成功——重试才有意义")
 	assert.Contains(t, stub.removedChannels(), spacepkg.BuildChannelID(spaceID, bot))
+}
+
+// ---------- 加入侧：白名单回补 ----------
+
+// TestDMRestoreAfterRejoin 摘和补必须成对：踢出后重新加入，两侧白名单都要回来。
+//
+// 这条是本轮的核心回归。之前只实现了摘那一半，于是「踢出 → 重新加入」在开启
+// Person 白名单校验的部署里会让两个人永久发不了私聊，而服务端推导侧
+// （SharesActiveSpace）已经恢复成 true、annotateDMSendability 还告诉客户端「可以发」。
+func TestDMRestoreAfterRejoin(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, peer = "sp-restore", "u-removed", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, removed, peer)
+	stub := newIMStub(t, ctx, []string{peer})
+
+	// 1. 移除 + 切断
+	removeSpaceMember(t, ctx, spaceID, removed)
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+	cut := stub.removedChannels()
+	require.Contains(t, cut, peer, "前提：对端频道上的白名单被摘掉了")
+	require.Contains(t, cut, removed, "前提：被移除者频道上的白名单被摘掉了")
+
+	// 2. 重新加入
+	_, err := ctx.DB().Exec(
+		"UPDATE space_member SET status=1 WHERE space_id=? AND uid=?", spaceID, removed)
+	require.NoError(t, err)
+
+	require.NoError(t, f.restoreSpaceMemberDMs(ctx, spacemod.MemberRejoin{
+		SpaceID: spaceID, UID: removed,
+	}))
+
+	added := stub.addedChannels()
+	assert.Contains(t, added[peer], removed, "对端频道上必须把被移除者加回来")
+	assert.Contains(t, added[removed], peer, "被移除者频道上必须把对端加回来")
+}
+
+// TestDMRestoreSkipsUnauthorizedPeer 回补不能凭空授权：对端自己已经不在这个
+// Space 了（也不是好友），加入者回来也不该恢复这一对。
+//
+// 没有这条约束，回补就成了一个「谁加入谁就能给所有聊过的人发消息」的提权口子。
+func TestDMRestoreSkipsUnauthorizedPeer(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, rejoiner, goneP = "sp-restore-skip", "u-rejoin", "u-gone"
+
+	seedSpaceMember(t, ctx, spaceID, rejoiner, goneP)
+	// 对端也被移除了，且两人不是好友 —— 现在谁都不该被授权
+	removeSpaceMember(t, ctx, spaceID, goneP)
+
+	stub := newIMStub(t, ctx, []string{goneP})
+	require.NoError(t, f.restoreSpaceMemberDMs(ctx, spacemod.MemberRejoin{
+		SpaceID: spaceID, UID: rejoiner,
+	}))
+
+	assert.Empty(t, stub.addedChannels(), "对端已不在本 Space 且非好友，一条白名单都不该补")
+}
+
+// TestDMRestoreHandlesBotSpacePrefixedChannel bot 私聊的 Space 前缀频道也要回补，
+// 与 cutOffDM 对称——只补裸频道会把 bot 私聊永久留在断开状态。
+func TestDMRestoreHandlesBotSpacePrefixedChannel(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, uid, bot = "0123456789abcdef0123456789abcdef", "u-rejoin", "bot-1"
+
+	seedSpaceMember(t, ctx, spaceID, uid, bot)
+	_, err := ctx.DB().Exec(
+		"INSERT INTO robot (robot_id, status, created_at, updated_at) VALUES (?, 1, NOW(), NOW())", bot)
+	require.NoError(t, err)
+
+	stub := newIMStub(t, ctx, []string{spacepkg.BuildChannelID(spaceID, bot)})
+	require.NoError(t, f.restoreSpaceMemberDMs(ctx, spacemod.MemberRejoin{
+		SpaceID: spaceID, UID: uid,
+	}))
+
+	added := stub.addedChannels()
+	assert.Contains(t, added, bot, "bot 裸频道要补")
+	assert.Contains(t, added, uid, "用户裸频道要补")
+	assert.Contains(t, added, spacepkg.BuildChannelID(spaceID, bot), "bot 的 Space 前缀频道要补")
+	assert.Contains(t, added, spacepkg.BuildChannelID(spaceID, uid), "用户侧 Space 前缀频道要补")
+}
+
+// TestDMRestoreKeepsFriendPeerWhenNotInSpace 好友关系单独就足以授权：
+// 对端不在本 Space，但双方是双向好友，回补必须照做。
+func TestDMRestoreKeepsFriendPeerWhenNotInSpace(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, rejoiner, friend = "sp-restore-friend", "u-rejoin", "u-friend"
+
+	seedSpaceMember(t, ctx, spaceID, rejoiner, friend)
+	removeSpaceMember(t, ctx, spaceID, friend) // 对端不在本 Space
+	seedMutualFriend(t, ctx, rejoiner, friend) // 但是好友
+
+	stub := newIMStub(t, ctx, []string{friend})
+	require.NoError(t, f.restoreSpaceMemberDMs(ctx, spacemod.MemberRejoin{
+		SpaceID: spaceID, UID: rejoiner,
+	}))
+
+	added := stub.addedChannels()
+	assert.Contains(t, added[friend], rejoiner, "好友关系授权的方向必须补回来")
+	assert.Contains(t, added[rejoiner], friend, "好友关系授权的方向必须补回来")
 }

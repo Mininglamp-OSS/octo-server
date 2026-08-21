@@ -19,6 +19,9 @@ const spaceMemberDMCutoffStepName = "dm_cutoff"
 // 反向注册避免成环）。
 func (f *Friend) registerSpaceMemberRemovalCleanup() {
 	space.RegisterMemberRemovalCleanupStep(spaceMemberDMCutoffStepName, f.cleanupSpaceMemberDMs)
+	// 摘和补必须成对注册：只注册前者会让「踢出 → 重新加入」永久断掉私聊
+	// （在开启 Person 白名单校验的部署里）。见 restoreSpaceMemberDMs。
+	space.RegisterMemberRejoinRestoreStep(spaceMemberDMRestoreStepName, f.restoreSpaceMemberDMs)
 }
 
 // cleanupSpaceMemberDMs 把被移出 Space 的成员与「因此失去私聊授权」的对端断开。
@@ -359,4 +362,166 @@ func dmPeerCandidates(conversations []*config.SyncUserConversationResp, selfUID 
 		candidates = append(candidates, peer)
 	}
 	return candidates
+}
+
+// ---------- 加入侧：把 dm_cutoff 摘掉的白名单补回来 ----------
+
+// spaceMemberDMRestoreStepName 恢复步骤名，用于日志。
+const spaceMemberDMRestoreStepName = "dm_restore"
+
+// restoreSpaceMemberDMs 是 cleanupSpaceMemberDMs 的逆操作：成员（重新）加入
+// Space 之后，把因为上一次移除而被摘掉、如今又重新获得授权的 Person 频道
+// 白名单补回去。
+//
+// 为什么必须有这一步：WuKongIM 的白名单存储只被 whitelist_add / whitelist_remove
+// 两个主动 API 改动，注册给它的 IMDatasource.Whitelist 回调在 CI pin 的版本
+// （v2.2.4-20260313）里从不被调用。实测确认过这条链路：
+//   - whitelistOffOfPerson=false 时，没有白名单条目的发送被拒
+//     （ReasonNotInWhitelist=13），whitelist_add 之后被接受，whitelist_remove
+//     之后再次被拒；
+//   - 该开关默认为 true，此时白名单完全不参与判定，摘和补都不影响发送。
+//
+// 换句话说：开着白名单校验的部署里，只摘不补 = 踢出再加回来的两个人**永久**
+// 发不了私聊；关着的部署里，这一步和 dm_cutoff 一样是空转。两种情况下补回来
+// 都是正确且无害的。
+//
+// 范围与 dm_cutoff 完全同源（dmPeersInSpace：会话列表 ∩ 曾是本 Space 成员），
+// 所以补回来的集合正好覆盖当初可能被摘掉的集合，不会顺手给从没聊过的人开口子。
+func (f *Friend) restoreSpaceMemberDMs(ctx *config.Context, rejoin space.MemberRejoin) error {
+	peers, err := f.dmPeersInSpace(ctx, space.MemberRemoval{SpaceID: rejoin.SpaceID, UID: rejoin.UID})
+	if err != nil {
+		return err
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+
+	var firstErr error
+	for _, peer := range peers {
+		// 逐个对端重新判定，口径与 dm_cutoff 一致：现在是否**应该**有授权。
+		// 不能因为「他刚加入了这个 Space」就无条件补——对端可能早已不在本
+		// Space（比如他自己也被移除过），那样补回去就是凭空授权。
+		shared, err := spacepkg.SharesActiveSpace(ctx.DB(), rejoin.UID, peer)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("check shared space: %w", err)
+			}
+			continue
+		}
+		grantInbound, err := f.dmDirectionAuthorized(ctx, peer, rejoin.UID, shared) // 加入者 -> 对端
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		grantOutbound, err := f.dmDirectionAuthorized(ctx, rejoin.UID, peer, shared) // 对端 -> 加入者
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !grantInbound && !grantOutbound {
+			continue
+		}
+		if err := f.restoreDM(ctx, rejoin.SpaceID, rejoin.UID, peer, grantInbound, grantOutbound); err != nil {
+			f.Warn("恢复私聊白名单失败",
+				zap.Error(err), zap.String("spaceId", rejoin.SpaceID),
+				zap.String("uid", rejoin.UID), zap.String("peer", peer))
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// dmDirectionAuthorized 判断「sender 现在是否被允许发给 channelUID」。
+//
+// 恰好是 dmDirectionRevoked 的反面，口径同源：channelUID 的 Person 频道白名单 =
+// friends(channelUID, is_alone=0) ∪ coMembers(channelUID)。共处 Space 已由
+// 调用方算好传进来（对两个方向都成立），所以这里只需再看好友这一条。
+func (f *Friend) dmDirectionAuthorized(ctx *config.Context, channelUID, sender string, shared bool) (bool, error) {
+	if shared {
+		return true, nil
+	}
+	friend, err := newFriendDB(ctx).isMutualFriend(channelUID, sender)
+	if err != nil {
+		return false, fmt.Errorf("query friendship (%s -> %s): %w", channelUID, sender, err)
+	}
+	return friend, nil
+}
+
+// restoreDM 按方向把 Person 频道白名单补回去，形状对称于 cutOffDM。
+func (f *Friend) restoreDM(ctx *config.Context, spaceID, uid, peer string, grantInbound, grantOutbound bool) error {
+	if grantInbound {
+		// 加入者 -> 对端：把 uid 加回对端频道
+		if err := f.addPersonWhitelist(ctx, peer, uid); err != nil {
+			return err
+		}
+	}
+	if grantOutbound {
+		// 对端 -> 加入者：把 peer 加回加入者频道
+		if err := f.addPersonWhitelist(ctx, uid, peer); err != nil {
+			return err
+		}
+	}
+
+	// bot 私聊走 Space 前缀频道，与 cutOffDM 一致地一并处理。
+	bot, err := f.eitherSideIsBot(ctx, uid, peer)
+	if err != nil {
+		return fmt.Errorf("check bot dm (%s/%s): %w", uid, peer, err)
+	}
+	if bot {
+		if grantInbound {
+			if err := f.addSpaceScopedWhitelist(ctx, spaceID, peer, uid); err != nil {
+				return err
+			}
+		}
+		if grantOutbound {
+			if err := f.addSpaceScopedWhitelist(ctx, spaceID, uid, peer); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 两端各推一条 channelUpdate，让客户端把发送框重新点亮
+	// （dm_forbidden 是按请求现算的，客户端重拉即可）。
+	f.notifyDMChannelUpdate(ctx, uid, peer)
+	f.notifyDMChannelUpdate(ctx, peer, uid)
+	return nil
+}
+
+// addPersonWhitelist 把 uid 加进 channelUID 的 Person 频道白名单。
+func (f *Friend) addPersonWhitelist(ctx *config.Context, channelUID, uid string) error {
+	err := ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   channelUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	})
+	if err != nil {
+		return fmt.Errorf("add person whitelist (%s): %w", channelUID, err)
+	}
+	return nil
+}
+
+// addSpaceScopedWhitelist 补 Space 前缀频道（bot 私聊）的白名单。
+func (f *Friend) addSpaceScopedWhitelist(ctx *config.Context, spaceID, channelUID, uid string) error {
+	channelID := spacepkg.BuildChannelID(spaceID, channelUID)
+	if channelID == channelUID {
+		return nil // 没有 Space 前缀可加，裸频道上面已经处理过了
+	}
+	if err := ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   channelID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	}); err != nil {
+		return fmt.Errorf("add space-scoped whitelist (%s): %w", channelID, err)
+	}
+	return nil
 }

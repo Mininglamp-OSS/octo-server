@@ -403,6 +403,26 @@ Consequently:
   skipping the prefixed-channel cleanup. All advisory, none new in this change's
   behavior. Follow-up.
 
+- **Person-channel whitelist enforcement is off by default in WuKongIM.** Verified
+  end to end against `v2.2.4-20260313` (the CI-pinned tag) with a real client:
+  `options.WhitelistOffOfPerson` defaults to **true**, and when it is true
+  `PermissionService.allowSend` never consults the whitelist — a send with no
+  whitelist entry is ACCEPTED. With `whitelistOffOfPerson=false` the same probe
+  gets `ReasonNotInWhitelist` with no entry, ACCEPTED after `whitelist_add`, and
+  rejected again after `whitelist_remove`. This repo's CI sets only `WK_MODE` /
+  `WK_TOKENAUTHON` / `WK_EXTERNAL_*`, so **in the CI configuration the DM cutoff
+  is a no-op**. The cutoff and the restore are both correct and harmless either
+  way, but whether removal actually blocks DMs depends entirely on the deployed
+  broker's `whitelistOffOfPerson`. That value lives in octo-deployment and must be
+  confirmed before this task's DM guarantee can be claimed in production.
+- **The datasource callbacks are dead code in the shipped broker.** `s.datasource`
+  is assigned once in `internal/server/server.go` and never read;
+  `datasource.GetSubscribers` / `GetWhitelist` have zero callers. So the
+  `IMDatasource` callbacks registered in `modules/group/1module.go` and
+  `modules/user/1module.go` are never consulted, and there is no "next reload
+  self-heals" backstop anywhere. An earlier round of this task argued from that
+  backstop; the argument was wrong and has been retracted in the code comments.
+
 ## Deviations from the original plan
 
 Recorded so the diff can be read against the spec rather than against memory.

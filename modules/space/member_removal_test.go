@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -831,4 +833,134 @@ func TestClaimIncrementsAttempts(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, cleanupJobs(t, spaceID)[0].Attempts,
 		"崩溃后被接管也必须计数，否则永远到不了 abandoned")
+}
+
+// ---------- 加入侧：恢复步骤的接线 ----------
+
+// TestRejoinRestoreStepRunsOnJoinPaths 加入路径必须触发恢复步骤。
+//
+// 摘白名单是移除侧做的，补回来只可能发生在加入侧；这条钉住的是「接线存在」。
+// 曾经的实现只注册了摘那一半，四条加入路径没有一条会调恢复步骤，于是
+// 「踢出 → 重新加入」在开启 Person 白名单校验的部署里永久断掉私聊。
+func TestRejoinRestoreStepRunsOnJoinPaths(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var seen []MemberRejoin
+	RegisterMemberRejoinRestoreStep("test_restore", func(_ *config.Context, r MemberRejoin) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, r)
+		return nil
+	})
+	t.Cleanup(func() {
+		RegisterMemberRejoinRestoreStep("test_restore", func(*config.Context, MemberRejoin) error { return nil })
+	})
+
+	const spaceID = "rejoin-wire"
+	seedMember(t, f, spaceID, "owner-j", 2)
+
+	f.restoreAfterRejoin(spaceID, "u-joined")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, seen, 1)
+	assert.Equal(t, spaceID, seen[0].SpaceID)
+	assert.Equal(t, "u-joined", seen[0].UID)
+}
+
+// TestRejoinRestoreContainsStepPanic 恢复步骤由别的模块注册，一次 panic 不能
+// 掀掉加入请求，也不能让后面的步骤被跳过。
+func TestRejoinRestoreContainsStepPanic(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	var ran atomic.Bool
+	RegisterMemberRejoinRestoreStep("test_panic", func(*config.Context, MemberRejoin) error {
+		panic("boom")
+	})
+	RegisterMemberRejoinRestoreStep("test_after_panic", func(*config.Context, MemberRejoin) error {
+		ran.Store(true)
+		return nil
+	})
+	t.Cleanup(func() {
+		RegisterMemberRejoinRestoreStep("test_panic", func(*config.Context, MemberRejoin) error { return nil })
+		RegisterMemberRejoinRestoreStep("test_after_panic", func(*config.Context, MemberRejoin) error { return nil })
+	})
+
+	assert.NotPanics(t, func() { f.restoreAfterRejoin("sp-panic", "u-panic") })
+	assert.True(t, ran.Load(), "前一个步骤 panic 不能让后面的步骤被跳过")
+}
+
+// TestCleanupRunsEveryStepDespiteFailure 一个步骤失败不能让同一轮里的其余步骤
+// 被跳过。
+//
+// 之前是 fail-fast，而步骤顺序是注册顺序（dm_cutoff 在 group_cascade 之前，
+// 仅仅因为 modules/group import 了 modules/user）。WuKongIM 持续故障时
+// dm_cutoff 每轮都在第一步失败，20 次尝试全烧在它身上，工单走到 abandoned 时
+// **群级联一次都没跑过**——被移除的人保留着全部群权限。那正是这条链路要消灭的
+// 隔离失败，却发生在最需要它生效的场景里。
+func TestCleanupRunsEveryStepDespiteFailure(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	var secondRan atomic.Bool
+	RegisterMemberRemovalCleanupStep("test_failing_first", func(*config.Context, MemberRemoval) error {
+		return errors.New("IM unavailable")
+	})
+	RegisterMemberRemovalCleanupStep("test_second", func(*config.Context, MemberRemoval) error {
+		secondRan.Store(true)
+		return nil
+	})
+	t.Cleanup(func() {
+		RegisterMemberRemovalCleanupStep("test_failing_first", func(*config.Context, MemberRemoval) error { return nil })
+		RegisterMemberRemovalCleanupStep("test_second", func(*config.Context, MemberRemoval) error { return nil })
+	})
+
+	const spaceID = "step-starvation"
+	seedMember(t, f, spaceID, "owner-s", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-s", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-s", 1, "owner-s", MemberRemoveReasonKicked)
+
+	f.processMemberRemovalCleanups()
+
+	assert.True(t, secondRan.Load(),
+		"第一个步骤失败之后，后面的步骤仍然必须跑——否则它会独占整个重试预算")
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status, "有步骤失败，工单要留着重试")
+	assert.Contains(t, jobs[0].LastError, "test_failing_first",
+		"last_error 要指向真正失败的那个步骤")
+}
+
+// TestCleanupErrorNamesAllFailedSteps 多个步骤同时失败时，last_error 要能看出
+// 「不止一个」，否则运维只会去查第一个。
+func TestCleanupErrorNamesAllFailedSteps(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	RegisterMemberRemovalCleanupStep("test_fail_a", func(*config.Context, MemberRemoval) error {
+		return errors.New("a down")
+	})
+	RegisterMemberRemovalCleanupStep("test_fail_b", func(*config.Context, MemberRemoval) error {
+		return errors.New("b down")
+	})
+	t.Cleanup(func() {
+		RegisterMemberRemovalCleanupStep("test_fail_a", func(*config.Context, MemberRemoval) error { return nil })
+		RegisterMemberRemovalCleanupStep("test_fail_b", func(*config.Context, MemberRemoval) error { return nil })
+	})
+
+	const spaceID = "step-multifail"
+	seedMember(t, f, spaceID, "owner-m", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-m", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-m", 1, "owner-m", MemberRemoveReasonKicked)
+
+	f.processMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Contains(t, jobs[0].LastError, "(+1)",
+		"多个步骤失败时要在 last_error 里标出还有几个，否则只会去查第一个")
 }

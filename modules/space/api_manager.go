@@ -665,6 +665,17 @@ func (m *Manager) addMembers(c *wkhttp.Context) {
 		uid := uid
 		go ensureDefaultCategoryProvisioned(m.space.ctx, uid, spaceId, m)
 	}
+	// 补回上一次移除摘掉的 Person 频道白名单（见 restoreAfterRejoin）。
+	// 管理端这条路径不走 afterJoinSpace，必须自己调。upsert 不区分新旧成员，
+	// 对本来就在的人重跑一次是幂等的（白名单 add 幂等，且授权判定同源）。
+	//
+	// 与用户侧 addMembers 一样用**单个** goroutine 串行跑完整批：每人一个会把
+	// 一次 200 人的批量添加变成 200 条并发 IM 链路。
+	go func(uids []string) {
+		for _, uid := range uids {
+			m.space.restoreAfterRejoin(spaceId, uid)
+		}
+	}(uids)
 	c.ResponseOK()
 }
 

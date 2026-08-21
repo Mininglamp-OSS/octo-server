@@ -52,9 +52,12 @@ type MemberRemoval struct {
 // MemberRemovalCleanupStep 是一次「把被移除成员从会话面清出去」的可重试步骤。
 //
 // 契约：
-//   - 必须幂等。失败时整条工单会被重跑，已完成的步骤会再执行一次。
+//   - 必须幂等。失败时整条工单会被重跑，已成功的步骤会再执行一次。
 //   - 必须自行判断「无事可做」并返回 nil，而不是报错。
 //   - 返回 error 表示这次没做完，需要重试；整条工单（含已成功的其它步骤）都会重跑。
+//   - 步骤之间**互不阻塞**：一个步骤返回 error 不会让同一轮里的其余步骤被跳过
+//     （见 runMemberRemovalCleanupJob）。所以不要把「前一个步骤已经成功」当作
+//     前置条件——每个步骤都要能独立地从当前 DB 状态判断自己该做什么。
 type MemberRemovalCleanupStep func(ctx *config.Context, removal MemberRemoval) error
 
 var (
@@ -345,11 +348,46 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		OperatorUID: job.OperatorUID,
 		Reason:      job.Reason,
 	}
+	// 一个步骤失败**不中断**其余步骤。
+	//
+	// 之前是 fail-fast，而步骤顺序是注册顺序 —— dm_cutoff 排在 group_cascade 前面，
+	// 仅仅因为 modules/group import 了 modules/user，没有任何地方声明过这件事。
+	// 于是 WuKongIM 持续故障时，dm_cutoff 每一轮都在第一步失败，20 次尝试
+	// （约 70 分钟退避）全部烧在它身上，工单走到 abandoned 时**群级联一次都没跑过**：
+	// 被移除的人保留着全部群权限和 IM 订阅。那正是这条链路要消灭的隔离失败，
+	// 却发生在最需要它生效的场景里。
+	//
+	// 步骤契约本来就要求幂等（见 MemberRemovalCleanupStep），所以「已经成功的步骤
+	// 在重试时再跑一遍」是允许的，那也正是 fail-fast 唯一换来的东西——它并没有
+	// 保护任何不变量，只是让排在前面的步骤独占了整个预算。
+	//
+	// 仍然只保留首个错误上报：last_error 是 VARCHAR(255) 的低基数摘要，
+	// 把 N 个步骤的错误拼进去只会互相截断；每个失败步骤各自有自己的日志行。
+	var (
+		firstFailedStep string
+		firstErr        error
+		failedSteps     int
+	)
 	for _, step := range snapshotCleanupSteps() {
-		if err := step.fn(s.ctx, removal); err != nil {
-			s.releaseCleanupJob(job, owner, step.name, err)
-			return
+		err := step.fn(s.ctx, removal)
+		if err == nil {
+			continue
 		}
+		failedSteps++
+		s.Warn("成员移除清理步骤失败，继续执行其余步骤",
+			zap.Uint64("jobId", job.ID), zap.String("step", step.name),
+			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID),
+			zap.Error(err))
+		if firstErr == nil {
+			firstFailedStep, firstErr = step.name, err
+		}
+	}
+	if firstErr != nil {
+		if failedSteps > 1 {
+			firstFailedStep = fmt.Sprintf("%s(+%d)", firstFailedStep, failedSteps-1)
+		}
+		s.releaseCleanupJob(job, owner, firstFailedStep, firstErr)
+		return
 	}
 	s.finishCleanupJob(job, owner, removalCleanupDone, "")
 }
