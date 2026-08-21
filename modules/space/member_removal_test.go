@@ -840,11 +840,20 @@ func TestClaimIncrementsAttempts(t *testing.T) {
 // probeRejoinSteps 注册一个记录调用的恢复步骤，返回读取已记录调用的函数。
 // 用完自动换回 no-op —— RegisterMemberRejoinRestoreStep 没有注销入口，
 // 不换回去会把探针漏给后面的用例。
-func probeRejoinSteps(t *testing.T) func() []MemberRejoin {
+//
+// **按 spaceID 过滤**，不是照单全收：注册表没有注销入口，t.Cleanup 只能换回
+// no-op，而每条加入路径的恢复都跑在后台 goroutine 里。用例 A 起的 goroutine
+// 完全可能在 A 清理之后才触发，落进 B 刚注册的探针里——`-shuffle=on` 下
+// TestRejoinRestoreStepRunsForEveryMemberInBatch 的 ElementsMatch 就会因为多出
+// 一个元素而红。只收本用例自己那个 spaceID，这条串扰就不存在。
+func probeRejoinSteps(t *testing.T, spaceID string) func() []MemberRejoin {
 	t.Helper()
 	var mu sync.Mutex
 	var seen []MemberRejoin
 	RegisterMemberRejoinRestoreStep("test_restore", func(_ *config.Context, r MemberRejoin) error {
+		if r.SpaceID != spaceID {
+			return nil
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		seen = append(seen, r)
@@ -889,9 +898,9 @@ func TestRejoinRestoreStepRunsOnJoinPath(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
 
-	read := probeRejoinSteps(t)
-
 	const spaceID = "rejoin-wire"
+	read := probeRejoinSteps(t, spaceID)
+
 	seedMember(t, f, spaceID, testutil.UID, 2) // 操作者：owner
 
 	w := httptest.NewRecorder()
@@ -913,9 +922,9 @@ func TestRejoinRestoreStepRunsForEveryMemberInBatch(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
 
-	read := probeRejoinSteps(t)
-
 	const spaceID = "rejoin-batch"
+	read := probeRejoinSteps(t, spaceID)
+
 	seedMember(t, f, spaceID, testutil.UID, 2)
 
 	w := httptest.NewRecorder()
@@ -933,6 +942,56 @@ func TestRejoinRestoreStepRunsForEveryMemberInBatch(t *testing.T) {
 		uids = append(uids, r.UID)
 	}
 	assert.ElementsMatch(t, []string{"u-b1", "u-b2", "u-b3"}, uids)
+}
+
+// TestRejoinRestoreStepRunsOnManagerAddPath 管理端加人也必须触发恢复步骤。
+//
+// 与用户侧 members/add 是**另一处**调用点（api_manager.go），不走 afterJoinSpace。
+// 上一版只钉住了用户侧那一处，把这两处删掉整个包依然全绿——正是被修的那个缺陷
+// 还能原样落在没被覆盖的调用点上（实测确认过）。
+func TestRejoinRestoreStepRunsOnManagerAddPath(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rejoin-mgr"
+	read := probeRejoinSteps(t, spaceID)
+	seedMember(t, f, spaceID, "owner-mgr", 2)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/"+spaceID+"/members",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{"uids": []string{"u-mgr-added"}}))))
+	req.Header.Set("token", adminToken(t))
+	testSrv.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	got := awaitRejoin(t, read, 1)
+	assert.Equal(t, "u-mgr-added", got[0].UID)
+}
+
+// TestRejoinRestoreStepRunsOnJoinByCodePath 邀请码加入也必须触发恢复步骤。
+//
+// 这一处走的是 afterJoinSpace，与前两条又不同——同一个 helper 同时服务
+// 「邀请码加入」和「申请通过」，所以覆盖它就同时覆盖了那两条路径。
+func TestRejoinRestoreStepRunsOnJoinByCodePath(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rejoin-code"
+	read := probeRejoinSteps(t, spaceID)
+	seedMember(t, f, spaceID, "owner-code", 2)
+
+	// afterJoinSpace 由 executeJoinSpace 调用，成员行写入之后。直接驱动它，
+	// 保证断言的是「加入之后恢复会被触发」这条接线本身，而不是邀请码解析。
+	space, err := f.db.querySpaceByID(spaceID)
+	require.NoError(t, err)
+	require.NotNil(t, space)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "u-code-joined", Role: 0, Status: 1,
+	}))
+	f.afterJoinSpace("u-code-joined", spaceID, space)
+
+	got := awaitRejoin(t, read, 1)
+	assert.Equal(t, "u-code-joined", got[0].UID)
 }
 
 // TestRejoinRestoreContainsStepPanic 恢复步骤由别的模块注册，一次 panic 不能
@@ -998,6 +1057,48 @@ func TestCleanupRunsEveryStepDespiteFailure(t *testing.T) {
 	assert.Equal(t, removalCleanupPending, jobs[0].Status, "有步骤失败，工单要留着重试")
 	assert.Contains(t, jobs[0].LastError, "test_failing_first",
 		"last_error 要指向真正失败的那个步骤")
+}
+
+// TestCleanupRunsRemainingStepsAfterStepPanic 一个步骤 **panic** 也不能让同一轮里
+// 其余步骤被跳过。
+//
+// 这是 TestCleanupRunsEveryStepDespiteFailure 的姊妹用例，走的是另一条路径：
+// 之前只有函数级 recover，panic 会直接跳出步骤循环，于是 dm_cutoff panic 时
+// group_cascade 本轮一次都不跑，而 attempts 在认领时已自增，工单照样走到
+// abandoned——被移除的人保留着全部群权限。恰恰是 error 那条路径刚修好的那个失败。
+func TestCleanupRunsRemainingStepsAfterStepPanic(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	var secondRan atomic.Bool
+	RegisterMemberRemovalCleanupStep("test_panicking_first", func(*config.Context, MemberRemoval) error {
+		panic("step boom")
+	})
+	RegisterMemberRemovalCleanupStep("test_second_after_panic", func(*config.Context, MemberRemoval) error {
+		secondRan.Store(true)
+		return nil
+	})
+	t.Cleanup(func() {
+		RegisterMemberRemovalCleanupStep("test_panicking_first", func(*config.Context, MemberRemoval) error { return nil })
+		RegisterMemberRemovalCleanupStep("test_second_after_panic", func(*config.Context, MemberRemoval) error { return nil })
+	})
+
+	const spaceID = "step-panic-starve"
+	seedMember(t, f, spaceID, "owner-sp", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "victim-sp", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "victim-sp", 1, "owner-sp", MemberRemoveReasonKicked)
+
+	require.NotPanics(t, func() { f.processMemberRemovalCleanups() })
+
+	assert.True(t, secondRan.Load(),
+		"前一个步骤 panic 之后，后面的步骤仍然必须跑——否则它独占整个重试预算，"+
+			"工单到 abandoned 时群级联一次都没跑过")
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status, "有步骤失败，工单要留着重试")
+	assert.Contains(t, jobs[0].LastError, "test_panicking_first",
+		"last_error 要指向 panic 的那个步骤")
 }
 
 // TestCleanupErrorNamesAllFailedSteps 多个步骤同时失败时，last_error 要能看出

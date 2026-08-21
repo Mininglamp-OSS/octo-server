@@ -658,3 +658,40 @@ func TestDMRestoreKeepsFriendPeerWhenNotInSpace(t *testing.T) {
 	assert.Contains(t, added[friend], rejoiner, "好友关系授权的方向必须补回来")
 	assert.Contains(t, added[rejoiner], friend, "好友关系授权的方向必须补回来")
 }
+
+// TestDMRestoreSkipsWhenMemberAlreadyRemovedAgain 陈旧的回补绝不能把授权复活。
+//
+// 回补是在加入路径上异步发出的，读授权和写 IM 之间隔着整个前置查询。这中间他
+// 若被重新移除，移除工单的 dm_cutoff 会正确摘掉白名单，而这条陈旧的回补随后
+// 把它加回去——工单已标 done，再没有任何东西会来摘第二次，留下一对永久越权的
+// 私聊。用例直接构造那个终局：判定完成之后成员行已经置 0，此时不许再写 IM。
+func TestDMRestoreSkipsWhenMemberAlreadyRemovedAgain(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, rejoiner, peer = "sp-stale-restore", "u-stale", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, rejoiner, peer)
+	stub := newIMStub(t, ctx, []string{peer})
+
+	// 模拟「判定时是活跃成员，写之前已被再次移除」：restoreDM 自己会重查。
+	removeSpaceMember(t, ctx, spaceID, rejoiner)
+
+	require.NoError(t, f.restoreDM(ctx, spaceID, rejoiner, peer, true, true, false))
+
+	assert.Empty(t, stub.addedChannels(),
+		"成员已不再活跃时，陈旧的回补一条白名单都不许写——否则会永久复活越权私聊")
+}
+
+// TestDMRestoreStillGrantsWhileMemberActive 上面那条守卫不能把正常回补也挡掉。
+func TestDMRestoreStillGrantsWhileMemberActive(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, uid, peer = "sp-active-restore", "u-active", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, uid, peer)
+	stub := newIMStub(t, ctx, []string{peer})
+
+	require.NoError(t, f.restoreDM(ctx, spaceID, uid, peer, true, true, false))
+
+	added := stub.addedChannels()
+	assert.Contains(t, added[peer], uid)
+	assert.Contains(t, added[uid], peer)
+}

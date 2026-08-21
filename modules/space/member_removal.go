@@ -369,7 +369,25 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		failedSteps     int
 	)
 	for _, step := range snapshotCleanupSteps() {
-		err := step.fn(s.ctx, removal)
+		// panic 也必须**在这一层**兜住，不能只靠函数级的那个 recover。
+		//
+		// 上面那个 defer 在整个函数的作用域上，一次 panic 会直接跳出这个循环——
+		// 于是 dm_cutoff panic 时 group_cascade 本轮一次都不会跑，而 attempts 在
+		// 认领时就已自增，工单照样一路走到 abandoned：被移除的人保留着全部群权限。
+		// 那正是上面那段注释说要消灭的失败，只是换成 panic 这条路径进来。
+		// restoreAfterRejoin 早就是逐步 recover 的；两侧必须对称。
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.Error("成员移除清理步骤 panic",
+						zap.Any("recover", r), zap.Uint64("jobId", job.ID),
+						zap.String("step", step.name),
+						zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
+					err = fmt.Errorf("cleanup step panicked: %v", r)
+				}
+			}()
+			return step.fn(s.ctx, removal)
+		}()
 		if err == nil {
 			continue
 		}

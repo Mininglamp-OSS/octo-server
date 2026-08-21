@@ -345,10 +345,20 @@ Consequently:
   there is no gauge on pending rows or oldest pending `created_at` — nothing
   shows how far behind it is. Follow-up.
 - **A peer whose conversation the removed member deleted.** Peer scope comes
-  from `IMSyncUserConversation` on the removed member. If they cleared that
-  conversation, the peer never enters the candidate set and **both** whitelist
-  entries survive — the one remaining way a pair escapes the cutoff entirely.
-  Closing it needs an authoritative pair index this repo does not have
+  from `IMSyncUserConversation` on the removed member. Verified against the
+  pinned broker: `/conversation/sync` appends a conversation only when its
+  recent-message window is non-empty, and after a delete it fetches only
+  messages past `DeletedAtMsgSeq` — so a conversation the member deleted with
+  nothing sent since is simply absent, that peer never enters the candidate set,
+  and **both** whitelist entries survive. `GetLastConversations` is also capped
+  at `conversation.userMaxCount` (default 1000). This is the one remaining way a
+  pair escapes the cutoff entirely.
+
+  The restore step **widened** this rather than merely inheriting it: before this
+  task nothing granted whitelist entries to non-friend co-members at all, so the
+  chain unfriend → rejoin (restore re-grants on co-membership) → delete the
+  conversation → get removed is newly constructible. Closing it needs an
+  authoritative or bilateral pair index this repo does not have
   (`dm_space_presence` is best-effort, which is why it was demoted from a gate).
   Follow-up.
 - **Closing the rejoin window completely.** The group step now re-checks live
