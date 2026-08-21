@@ -9,7 +9,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -123,39 +122,11 @@ func init() {
 					}
 					return register.IMDatasourceTypeNone
 				},
+				// 规则本体见 person_whitelist.go。这里不再内联一份：
+				// dm_cutoff 用**覆写**语义应用同一条规则，两份实现一旦漂移，
+				// 漂移的那一侧会变成误摘授权。
 				Whitelist: func(channelID string, channelType uint8) ([]string, error) {
-					// Space channel_id 格式: s{spaceId}_{uid}，提取真实 uid
-					// 用 LastIndex("_") 避免 spaceId 含下划线时 ParseChannelID 解析错误
-					realUID := channelID
-					if strings.HasPrefix(channelID, "s") {
-						if idx := strings.LastIndex(channelID, "_"); idx >= 0 {
-							realUID = channelID[idx+1:]
-						}
-					}
-					friends, err := api.userService.GetFriends(realUID)
-					if err != nil {
-						return nil, err
-					}
-					uidSet := make(map[string]struct{})
-					if len(friends) > 0 {
-						for _, friend := range friends {
-							if friend.IsAlone == 0 {
-								uidSet[friend.UID] = struct{}{}
-							}
-						}
-					}
-					// 合并空间共同成员到白名单
-					coMembers, err := space.GetCoMemberUIDs(friendCtx, realUID)
-					if err == nil && len(coMembers) > 0 {
-						for _, uid := range coMembers {
-							uidSet[uid] = struct{}{}
-						}
-					}
-					result := make([]string, 0, len(uidSet))
-					for uid := range uidSet {
-						result = append(result, uid)
-					}
-					return result, nil
+					return api.derivePersonWhitelist(friendCtx, channelID)
 				},
 			},
 			BussDataSource: register.BussDataSource{

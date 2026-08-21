@@ -31,10 +31,14 @@ type imStub struct {
 	conversations   []map[string]interface{}
 	whitelistRemove []whitelistRemoveCall
 	whitelistAdd    []whitelistRemoveCall
+	whitelistSet    []whitelistRemoveCall
 	cmds            []map[string]interface{}
 	// failChannels 里的 channel_id 上，whitelist_remove 返回 500，用来断言
 	// 摘白名单失败会被上抛而不是吞掉。
 	failChannels map[string]bool
+	// failSetChannels 同理，但作用在 whitelist_set 上。与 failChannels 分开：
+	// 一个频道可能同时收到两种调用，共用一张表就没法只让其中一种失败。
+	failSetChannels map[string]bool
 }
 
 type whitelistRemoveCall struct {
@@ -66,6 +70,20 @@ func newIMStub(t *testing.T, ctx *config.Context, conversationPeers []string) *i
 		stub.mu.Lock()
 		stub.whitelistAdd = append(stub.whitelistAdd, call)
 		stub.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/channel/whitelist_set", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var call whitelistRemoveCall
+		_ = json.Unmarshal(body, &call)
+		stub.mu.Lock()
+		stub.whitelistSet = append(stub.whitelistSet, call)
+		shouldFail := stub.failSetChannels[call.ChannelID]
+		stub.mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/channel/whitelist_remove", func(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +146,42 @@ func (s *imStub) addedChannels() map[string][]string {
 		out[call.ChannelID] = append(out[call.ChannelID], call.UIDs...)
 	}
 	return out
+}
+
+// failWhitelistSet 让指定频道上的 whitelist_set 返回 500。
+func (s *imStub) failWhitelistSet(channelIDs ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failSetChannels == nil {
+		s.failSetChannels = make(map[string]bool, len(channelIDs))
+	}
+	for _, id := range channelIDs {
+		s.failSetChannels[id] = true
+	}
+}
+
+// setWhitelistOf 返回该频道最后一次 whitelist_set 写入的 uid 集合，
+// 以及这个频道到底有没有被 set 过。覆写是「最后一次说了算」，所以只看最后一次。
+func (s *imStub) setWhitelistOf(channelID string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		uids  []string
+		found bool
+	)
+	for _, call := range s.whitelistSet {
+		if call.ChannelID == channelID {
+			uids, found = call.UIDs, true
+		}
+	}
+	return uids, found
+}
+
+// setCallCount 返回 whitelist_set 的总次数。
+func (s *imStub) setCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.whitelistSet)
 }
 
 // clearWhitelistRemoveFailures 恢复所有被打故障的频道。
@@ -753,4 +807,168 @@ func TestDMRestoreSkipsWhenPeerLostAuthorization(t *testing.T) {
 	assert.False(t, granted, "对端已失去授权时不该判成补过了")
 	assert.Empty(t, stub.addedChannels(),
 		"对端已不在本 Space 且非好友，一条白名单都不许写——否则凭空造出越权私聊")
+}
+
+// ---------- C1：会话被本地删掉造成的逃逸 ----------
+
+// TestDMCutoffClosesDeletedConversationEscape 是 C1 的回归用例。
+//
+// 逐对端枚举的范围来自 IMSyncUserConversation —— 被移除者**自己的**会话列表。
+// 他本地删过这个会话（/conversation/sync 在 DeletedAtMsgSeq 之后无新消息时不返回），
+// 或者会话数超出 Conversation.UserMaxCount 的截断，这个对端就枚举不到，
+// 两个方向的白名单都没人摘：他离开 Space 之后对端仍能发给他。
+//
+// 覆写他自己的频道按构造关掉这一半，不需要先枚举出对端。
+// 删掉 cleanupSpaceMemberDMs 里的 reconcileRemovedMemberChannel 调用，本用例变红。
+func TestDMCutoffClosesDeletedConversationEscape(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, peer = "dm-escape", "u-removed", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, removed, peer)
+	seedDMPresence(t, ctx, removed, peer, spaceID)
+	removeSpaceMember(t, ctx, spaceID, removed)
+
+	// 关键：会话列表是**空的**，模拟他把这个会话本地删了。
+	stub := newIMStub(t, ctx, nil)
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	assert.Empty(t, stub.removedChannels(),
+		"枚举不到对端，逐对端那条路本来就摘不掉任何东西——这正是洞的成因，不是用例写错了")
+
+	uids, ok := stub.setWhitelistOf(removed)
+	require.True(t, ok, "被移除者自己的 Person 频道必须被覆写一次")
+	assert.NotContains(t, uids, peer, "覆写之后，前同事不再能发消息给他")
+}
+
+// TestDMCutoffOverwriteKeepsStillAuthorizedSenders 覆写的另一面：不能误伤。
+//
+// 覆写是「整个频道换成推导值」，推导集合少算一个人就等于误摘他的授权。
+// 这里同时放三种人进去：只因本 Space 才有授权的（该摘）、仍共处另一个 Space 的、
+// 以及双向好友（都该留）。
+func TestDMCutoffOverwriteKeepsStillAuthorizedSenders(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const (
+		spaceA  = "dm-ovr-a"
+		spaceB  = "dm-ovr-b"
+		removed = "u-removed"
+		peer    = "u-peer"  // 只在 spaceA —— 该摘
+		other   = "u-other" // 也在 spaceB —— 该留
+		buddy   = "u-buddy" // 双向好友 —— 该留
+	)
+
+	seedSpaceMember(t, ctx, spaceA, removed, peer)
+	seedSpaceMember(t, ctx, spaceB, removed, other)
+	seedMutualFriend(t, ctx, removed, buddy)
+	removeSpaceMember(t, ctx, spaceA, removed)
+
+	stub := newIMStub(t, ctx, nil)
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceA, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	uids, ok := stub.setWhitelistOf(removed)
+	require.True(t, ok)
+	assert.ElementsMatch(t, []string{other, buddy}, uids,
+		"仍有授权的两个人必须留下，只因 spaceA 才有授权的那个必须消失")
+}
+
+// TestDMCutoffOverwriteFailureStillCutsEnumeratedPeers 两半互不饿死。
+//
+// 覆写失败会上抛（工单重试），但不能因此跳过逐对端那一半——那一半是唯一能处理
+// 「他还能发给谁」的路径。反过来同理，顺序在实现里是覆写在前。
+func TestDMCutoffOverwriteFailureStillCutsEnumeratedPeers(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, removed, peer = "dm-ovr-fail", "u-removed", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, removed, peer)
+	seedDMPresence(t, ctx, removed, peer, spaceID)
+	removeSpaceMember(t, ctx, spaceID, removed)
+
+	stub := newIMStub(t, ctx, []string{peer})
+	stub.failWhitelistSet(removed)
+
+	err := f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	})
+	require.Error(t, err, "覆写失败必须上抛，否则工单标 done、这一半永远不再重试")
+
+	cut := stub.removedChannels()
+	assert.Equal(t, []string{removed}, cut[peer], "覆写失败不该让逐对端那一半被跳过")
+	assert.Equal(t, []string{peer}, cut[removed])
+}
+
+// TestDMRestoreReconcilesOwnChannel 恢复侧必须与移除侧同样完整。
+//
+// 移除侧现在整个覆写他的频道，摘掉的范围严格大于逐对端枚举能摘的范围；
+// 恢复侧若只补枚举到的对端，就会补不回覆写摘掉的那些人——加入者会永久收不到
+// 一部分同事的消息。这里刻意把会话列表留空：只有覆写能救回这一对。
+func TestDMRestoreReconcilesOwnChannel(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, rejoiner, peer = "dm-restore-ovr", "u-rejoin", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, rejoiner, peer) // 他已经重新是活跃成员
+
+	stub := newIMStub(t, ctx, nil)
+	require.NoError(t, f.restoreSpaceMemberDMs(ctx, spacemod.MemberRejoin{
+		SpaceID: spaceID, UID: rejoiner,
+	}))
+
+	uids, ok := stub.setWhitelistOf(rejoiner)
+	require.True(t, ok, "加入者自己的频道必须被覆写一次")
+	assert.Contains(t, uids, peer, "重新成为共同成员，对端要能重新发给他")
+}
+
+// TestDerivePersonWhitelistStripsSpacePrefix 推导对 Space 前缀频道也要认得出真实 uid，
+// 否则 s{spaceId}_{uid} 会被当成一个不存在的用户，推导出空集。
+func TestDerivePersonWhitelistStripsSpacePrefix(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	const spaceID, uid, peer = "0123456789abcdef0123456789abcdef", "u-self", "u-peer"
+
+	seedSpaceMember(t, ctx, spaceID, uid, peer)
+
+	bare, err := f.derivePersonWhitelist(ctx, uid)
+	require.NoError(t, err)
+	prefixed, err := f.derivePersonWhitelist(ctx, spacepkg.BuildChannelID(spaceID, uid))
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{peer}, bare)
+	assert.ElementsMatch(t, bare, prefixed, "裸频道与 Space 前缀频道推导出同一个集合")
+}
+
+// TestDMCutoffOverwriteDoesNotGuessSpacePrefixOnUID 覆写路径不能对 uid 做前缀猜测。
+//
+// derivePersonWhitelist 的前缀剥离是启发式的（"s" 开头 + 含 "_" 就当成
+// s{spaceId}_{uid}）。工单里带的是**确定的 uid**，不是 channel_id；如果这里图省事
+// 复用带剥离的那个入口，一个形如 s..._... 的真实 uid 会被剥成另一个人，
+// 于是把**别人的**白名单覆写到他的频道上——一次静默的误摘。
+// 覆写路径必须走 derivePersonWhitelistOfUID。
+func TestDMCutoffOverwriteDoesNotGuessSpacePrefixOnUID(t *testing.T) {
+	ctx, f := dmTestSetup(t)
+	// 这个 uid 恰好落进启发式：以 "s" 开头，且含 "_"。剥离后会变成 "me"。
+	const spaceID, removed, peer, buddy = "dm-uid-guess", "s_kick_me", "u-peer", "u-buddy"
+
+	seedSpaceMember(t, ctx, spaceID, removed, peer)
+	seedMutualFriend(t, ctx, removed, buddy)
+	removeSpaceMember(t, ctx, spaceID, removed)
+
+	stub := newIMStub(t, ctx, nil)
+	require.NoError(t, f.cleanupSpaceMemberDMs(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: removed, OperatorUID: "op", Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	uids, ok := stub.setWhitelistOf(removed)
+	require.True(t, ok, "覆写要发生在这个 uid 自己的频道上")
+	assert.ElementsMatch(t, []string{buddy}, uids,
+		"写的必须是 s_kick_me 自己的推导集合；若被剥成 \"me\" 会得到一个空集，好友就被误摘了")
+
+	// 顺带把两个入口的差别本身钉住，免得以后有人把它们合并回去。
+	ofUID, err := f.derivePersonWhitelistOfUID(ctx, removed)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{buddy}, ofUID)
+
+	guessed, err := f.derivePersonWhitelist(ctx, removed)
+	require.NoError(t, err)
+	assert.Empty(t, guessed, "带剥离的入口对这个 uid 就是会算错——这正是两个入口必须分开的理由")
 }

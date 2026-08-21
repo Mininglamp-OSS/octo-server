@@ -357,10 +357,41 @@ Consequently:
   The restore step **widened** this rather than merely inheriting it: before this
   task nothing granted whitelist entries to non-friend co-members at all, so the
   chain unfriend → rejoin (restore re-grants on co-membership) → delete the
-  conversation → get removed is newly constructible. Closing it needs an
-  authoritative or bilateral pair index this repo does not have
-  (`dm_space_presence` is best-effort, which is why it was demoted from a gate).
-  Follow-up.
+  conversation → get removed is newly constructible.
+
+  **Half of it is now closed in this task** (round 10). `dm_cutoff` starts by
+  overwriting the removed member's own bare Person channel with the derived set
+  `friends(uid, is_deleted=0, is_alone=0) ∪ coMembers(uid)`
+  (`/channel/whitelist_set`, `reconcileRemovedMemberChannel`). The broker's
+  `allowSend(from, to)` consults the allowlist of **`to`'s** channel
+  (`internal/service/permission.go:252`), so overwriting the removed member's own
+  channel closes "who may send **to** him" by construction — with no peer
+  enumeration, and therefore no dependence on his conversation view.
+  `dm_restore` applies the identical call on the join side, because the cutoff
+  now removes strictly more than per-peer enumeration ever could and an
+  asymmetric restore would leave the rejoiner unable to receive.
+
+  Measured end-to-end against the pinned broker with `whitelistOffOfPerson=false`
+  (probe in the task journal): removal-with-deleted-conversation leaves both
+  directions ALLOWED (the escape reproduced); after the overwrite peer→removed is
+  BLOCKED and removed→peer is still ALLOWED; after the rejoin overwrite both are
+  ALLOWED again.
+
+  **The residual is the other direction** — "who may the removed member send to".
+  Those entries live on each *peer's* channel, which a single-sided overwrite
+  cannot reach, and enumerating the peers is exactly what the conversation view
+  fails to do. That still needs an authoritative or bilateral pair index this repo
+  does not have (`dm_space_presence` is best-effort, which is why it was demoted
+  from a gate). Follow-up, #797.
+
+  Safety of the overwrite (this is what makes it usable at all): all seven call
+  sites in the repo that write a bare Person-channel whitelist entry —
+  `modules/user` friend-approve ×2 and botfather-on-register, `modules/app_bot`,
+  `modules/botfather` ×3 — write a **bidirectional friend row** before granting
+  (bots included, via `AddFriend`), and the only other grant basis is
+  co-membership. So the derived set is a superset of everything this codebase has
+  ever put there, and the overwrite cannot drop a grant the model does not know
+  about.
 - **Closing the rejoin window completely.** The group step now re-checks live
   membership itself (`CheckMembership`, immediately before it computes the group
   set), so the exposure shrank from "the whole duration of the DM step" to the
@@ -459,6 +490,46 @@ Recorded so the diff can be read against the spec rather than against memory.
 - **Four join paths, not three.** `modules/space/api.go` `addMembers` and the
   manager endpoint both bypass `afterJoinSpace`; only join-by-code and approved
   applications go through it.
+- **The Person-whitelist derivation was de-duplicated, and its error handling
+  tightened.** The rule lived inline in `modules/user/1module.go`'s
+  `IMDatasource.Whitelist`; it now lives once in
+  `modules/user/person_whitelist.go` (`derivePersonWhitelist`) and both callers
+  share it. This is required, not cosmetic: `reconcileRemovedMemberChannel`
+  applies the same rule with **overwrite** semantics, so two implementations
+  drifting apart would turn into wrongly-revoked authorization on whichever side
+  drifted. One behaviour change came with the move — the old inline version
+  swallowed a `GetCoMemberUIDs` error and returned a friends-only set; the shared
+  function propagates it. For the overwrite caller that is mandatory (a truncated
+  set *is* a mis-revocation); for the broker callback, which the pinned broker
+  never invokes, returning a partial whitelist was never better than erroring.
+- **The overwrite can lose a concurrent grant, and that is accepted.** Between the
+  derive (a DB read) and the `whitelist_set` POST, another module may
+  `whitelist_add` to the same channel — a friend approval or a bot approval. That
+  grant is then overwritten away, and nothing re-adds it, because the granting side
+  does not re-run. Per-uid `whitelist_remove` does not have this failure mode: it
+  only names the people who should not be there. It is accepted on the same
+  asymmetry the rest of this task uses — a missed revocation is **over-permission**
+  and must converge, whereas a wrongly-dropped grant is **loss of function**: visible,
+  affecting one direction of one pair, and recoverable by the user (re-friend,
+  rejoin) or by operations. Removing the window entirely requires read-then-diff,
+  and octo-lib exposes no whitelist read. Follow-up, #797.
+- **The derivation now has two entry points, deliberately.** The prefix strip it
+  inherited (`HasPrefix("s")` + `LastIndex("_")` ⇒ treat as `s{spaceId}_{uid}`) is a
+  heuristic, and it had only ever been fed channel IDs coming from the broker. The
+  overwrite feeds it a **uid** taken from the work record, where the same heuristic
+  turns a real uid shaped like `s..._...` into a different user — deriving someone
+  else's whitelist and writing it onto this member's channel, i.e. a silent
+  mis-revocation. `derivePersonWhitelistOfUID` (no guessing) is therefore the entry
+  point every write path uses; `derivePersonWhitelist` (strip, then delegate) stays
+  for the channel-ID caller. Pinned by
+  `TestDMCutoffOverwriteDoesNotGuessSpacePrefixOnUID`, which asserts both entry
+  points' differing results so they cannot be merged back together by accident.
+- **A cost the overwrite carries.** The derived set contains `coMembers(uid)`,
+  bounded by the total membership of every Space the member still belongs to, so
+  a removal from a very large Space produces one POST carrying that many uids.
+  It is once per removal job (not once per peer) and removals are low-frequency,
+  which is the trade accepted here — and it is precisely why the per-peer loop was
+  **not** switched to this set.
 
 - **A fifth removal path.** The owner-initiated disband was not in the original
   survey (see the path table). It now runs the same cascade.
@@ -557,6 +628,22 @@ Recorded so the diff can be read against the spec rather than against memory.
   groups and DMs: the retry re-checks live membership and becomes a no-op.
 - The HTTP response of every removal path is unchanged in shape and is not
   affected by IM or cascade failure.
+
+**C1 — the deleted-conversation escape (round 10)**
+
+- Given a removed member whose conversation with a peer is absent from
+  `/conversation/sync`: the per-peer loop issues nothing (that is the escape), and
+  the member's own Person channel is still overwritten with the derived set, with
+  the peer absent from it.
+- The overwrite does not over-revoke: a double-sided friend and a peer sharing
+  another active Space both remain in the written set.
+- An empty derived set is still written, rather than skipped — skipping would
+  leave every stale grant in place for exactly the member who lost all of them.
+- A failing `whitelist_set` is propagated (so the work record retries) and does
+  **not** cause the per-peer half to be skipped.
+- The join side performs the same overwrite, so a rejoiner regains what the
+  cutoff's wider revocation removed.
+- The derivation resolves `s{spaceID}_{uid}` to the same set as the bare `uid`.
 
 **Repo gates**
 

@@ -27,10 +27,16 @@ func (f *Friend) registerSpaceMemberRemovalCleanup() {
 
 // cleanupSpaceMemberDMs 把被移出 Space 的成员与「因此失去私聊授权」的对端断开。
 //
-// 私聊授权来自 Person 频道白名单，而白名单的推导（modules/user/1module.go 的
-// IMDatasource.Whitelist）本来就是 friends(uid) ∪ GetCoMemberUIDs(uid) —— 推导侧
-// 在成员行置 0 的那一刻就已经正确了。坏的是 WuKongIM 缓存着旧白名单，没人去摘。
+// 私聊授权来自 Person 频道白名单，而白名单的推导（person_whitelist.go 的
+// derivePersonWhitelist）本来就是 friends(uid) ∪ coMembers(uid) —— 推导侧在成员行
+// 置 0 的那一刻就已经正确了。坏的是 WuKongIM 缓存着旧白名单，没人去摘。
 // 所以这里做的不是「重新定义规则」，而是把已经失效的缓存条目摘掉。
+//
+// 分两半，用的是同一条规则：
+//  1. 覆写他**自己的**频道（reconcileRemovedMemberChannel）—— 关掉「谁能发给他」。
+//     无条件执行，不依赖枚举。
+//  2. 逐个对端摘**对端的**频道 —— 关掉「他能发给谁」。这一半只能靠枚举，
+//     因此继承了枚举的盲区（会话被本地删掉的对端够不到，见 #797）。
 //
 // 关键边界：两个人可能同时在多个 Space，也可能是好友。从 X 移除后如果他们还共处
 // Y，或者仍是双向好友，私聊必须照常可用 —— 所以每个对端都要重新判定，
@@ -38,12 +44,25 @@ func (f *Friend) registerSpaceMemberRemovalCleanup() {
 // 所有 DB / IM 访问一律走**传入的 ctx**，不混用 f.ctx：两者在生产里是同一个
 // 单例，但混用会让「换一个 ctx 调用」静默读到另一套连接，测试也测不出真实路径。
 func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.MemberRemoval) error {
+	var firstErr error
+
+	// 第一件事，且**无条件**做：把「谁能发给被移除者」整个频道按推导值覆写一次。
+	// 不依赖下面枚举出的对端集合，正是因为那个集合会漏（见 reconcileRemovedMemberChannel）。
+	if err := f.reconcileRemovedMemberChannel(ctx, removal.UID); err != nil {
+		f.Error("覆写被移除成员的 Person 频道白名单失败",
+			zap.Error(err), zap.String("spaceId", removal.SpaceID), zap.String("uid", removal.UID))
+		firstErr = err
+	}
+
 	peers, err := f.dmPeersInSpace(ctx, removal)
 	if err != nil {
-		return err
+		if firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
 	}
 	if len(peers) == 0 {
-		return nil
+		return firstErr
 	}
 
 	// 「他自己是不是 bot」与对端无关，循环外查一次即可（见 eitherSideIsBot）。
@@ -55,10 +74,12 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 	// 记在 brief 的 Deviations 里。
 	selfIsBot, err := newFriendDB(ctx).isRobot(removal.UID)
 	if err != nil {
-		return fmt.Errorf("check whether removed member is a bot: %w", err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("check whether removed member is a bot: %w", err)
+		}
+		return firstErr
 	}
 
-	var firstErr error
 	for _, peer := range peers {
 		// 逐个对端判定，而不是一次性拉出「他所有剩余共同成员」：对端集合的上界是
 		// 他自己的私聊数（很小），而共同成员集合的上界是所有剩余 Space 的人数
@@ -115,6 +136,72 @@ func (f *Friend) cleanupSpaceMemberDMs(ctx *config.Context, removal space.Member
 	return firstErr
 }
 
+// reconcileRemovedMemberChannel 把「被移除者自己的裸 Person 频道」白名单整个覆写为推导值。
+//
+// 只关一个方向：**谁能发给他**。broker 的 allowSend(from, to) 查的是 to 的频道
+// （internal/service/permission.go），所以覆写他的频道 = 决定谁还能发给他。
+// 反方向（他还能发给谁）在别人的频道上，那一半仍然只能靠逐对端枚举。
+//
+// 为什么需要它 —— 逐对端枚举有一个够不到的洞：
+// dmPeersInSpace 的范围来自 IMSyncUserConversation，也就是**被移除者自己的会话列表**。
+// 会话被他本地删过（/conversation/sync 在 DeletedAtMsgSeq 之后没有新消息时不返回该会话）、
+// 或者超出 Conversation.UserMaxCount(默认 1000) 的截断范围，这个对端就枚举不到，
+// 两个方向的白名单都没人摘 —— 他离开 Space 之后，对端仍然能发给他。
+// 这一半现在由覆写按构造关掉：推导集合里根本不含「只因这个 Space 才有授权」的人，
+// 不需要先把他们枚举出来。
+//
+// 为什么是覆写而不是「读出来做差集」：octo-lib 没有读白名单的封装
+// （config/msg.go 只有 whitelist_add / whitelist_set / whitelist_remove）。
+// 覆写的安全性取决于推导集合是否完备 —— 这一点在 derivePersonWhitelist 的注释里
+// 逐个调用点核对过，两处共用同一个函数正是为了它不漂移。
+//
+// 代价，说清楚：推导集合含 coMembers(uid)，上界是他剩余所有 Space 的人数之和，
+// 万人 Space 会产生一次万级 uid 的 POST。每个移除工单只发生一次（不是每个对端一次），
+// 且移除本身低频，可以接受；这也正是逐对端判定那段循环**没有**改用这个集合的原因。
+//
+// 幂等：纯覆写，重跑得到同一个集合。工单重试安全。
+//
+// 关于窗口，这里**不**声称零窗口，两种都写清楚：
+//
+//  1. 「读到的授权已经失效、却照样写下去」：推导（DB 读）与 POST 之间仍有间隙。
+//     但这一步没有 restoreDM 那种「先算再传进来」的放大——写下去的值就是刚读到的值，
+//     而且两个方向的触发都会重跑它（再次移除会入新工单并重试，再次加入走恢复步骤），
+//     所以是收敛的。
+//
+//  2. **覆写独有的一种：并发授予被盖掉。** 别的模块在这段间隙里给同一个频道
+//     whitelist_add（好友通过、bot 通过），那条刚加的授权会被这次覆写抹掉，
+//     而且没人会再补——加那一侧不会重跑。逐条 whitelist_remove 没有这个问题，
+//     因为它只点名摘不该在的人。
+//     接受它的理由是本 PR 一贯的那条不对称：漏摘是**越权**，必须收敛；
+//     被误摘是**失能**，用户可见、可自行恢复（重新加好友 / 再次触发加入 / 运维补一次），
+//     而且只影响这一对的一个方向。窗口是一次 DB 查询加一次 HTTP 往返。
+//     真要消掉它，需要的是「读出当前值再做差集」，而 octo-lib 没有读白名单的封装。
+//     记在 #797。
+//
+// 总之：收敛，但不是零延迟、也不是零代价，别把它当成不变量。
+//
+// 仍然开着的残余（#797）：他能发给谁 —— 那些条目在对端的频道上，
+// 单边覆写够不到，需要一份「谁授权过谁」的双边索引才能不枚举地收敛。
+func (f *Friend) reconcileRemovedMemberChannel(ctx *config.Context, uid string) error {
+	// 走 OfUID 而不是 derivePersonWhitelist：后者会对 "s" 开头的入参做前缀剥离，
+	// 而这里传的是一个确定的 uid，不是 channel_id。
+	authorized, err := f.derivePersonWhitelistOfUID(ctx, uid)
+	if err != nil {
+		return fmt.Errorf("derive person whitelist (%s): %w", uid, err)
+	}
+	// 空集也照发：那正是「他谁都不认识了」的正确结果，跳过等于把旧条目留着。
+	if err := ctx.IMWhitelistSet(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   uid,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: authorized,
+	}); err != nil {
+		return fmt.Errorf("set person whitelist (%s): %w", uid, err)
+	}
+	return nil
+}
+
 // dmPeersInSpace 找出「与被移除者有私聊、且属于本 Space 范畴」的对端。
 //
 // 两步收窄，都有界：
@@ -162,7 +249,7 @@ func (f *Friend) dmPeersInSpace(ctx *config.Context, removal space.MemberRemoval
 
 // dmDirectionRevoked 判断「sender 是否已经不再被允许发给 channelUID」。
 //
-// 口径直接对齐白名单推导（modules/user/1module.go 的 IMDatasource.Whitelist）：
+// 口径直接对齐白名单推导（person_whitelist.go 的 derivePersonWhitelist）：
 // channelUID 的 Person 频道白名单 = GetFriends(channelUID) 中 is_alone=0 的那些
 // ∪ coMembers(channelUID)。调用方已经确认两人不再共处任一活跃 Space，所以这里
 // 只剩好友这一条依据，且**方向敏感**：看的是 channelUID 是否持有指向 sender 的
@@ -313,7 +400,7 @@ const (
 
 // annotateDMSendability 给 Person 频道信息补一个「当前登录用户能否给该对端发消息」的标记。
 //
-// 判定必须与 Person 频道白名单的推导同源（modules/user/1module.go 的
+// 判定必须与 Person 频道白名单的推导同源（person_whitelist.go 的
 // IMDatasource.Whitelist = friends(peer, is_alone=0) ∪ coMembers(peer)）：
 // loginUID 能发给 peer，当且仅当 loginUID 落在 peer 频道的白名单里。口径不一致的话，
 // 前端可能展示成可发但被 WuKongIM 拒收，或反过来无谓置灰。
@@ -417,23 +504,48 @@ const spaceMemberDMRestoreStepName = "dm_restore"
 // 发不了私聊；关着的部署里，这一步和 dm_cutoff 一样是空转。两种情况下补回来
 // 都是正确且无害的。
 //
-// 范围与 dm_cutoff 完全同源（dmPeersInSpace：会话列表 ∩ 曾是本 Space 成员），
-// 所以补回来的集合正好覆盖当初可能被摘掉的集合，不会顺手给从没聊过的人开口子。
+// 范围与 dm_cutoff 逐一对应，两半各自同源 —— 但两半的范围**不**一样，
+// 不要把它读成「补回来的正好等于摘掉的那些人」：
+//   - 覆写那一半（reconcileRemovedMemberChannel）两侧调的是同一个函数、同一条规则，
+//     所以他自己频道上的集合确实是精确还原的；代价是它会把**所有**共同成员写进去，
+//     包括从没聊过的人 —— 那是推导规则本来就规定的授权，不是这一步开的口子。
+//   - 逐对端那一半仍然走 dmPeersInSpace（会话列表 ∩ 曾是本 Space 成员），
+//     范围小于覆写那一半。它补的是对端频道，而对端频道上的条目是覆写够不到的。
+//
+// 换句话说：这里不声称「摘和补严格互逆」。严格互逆的只有覆写那一半。
 func (f *Friend) restoreSpaceMemberDMs(ctx *config.Context, rejoin space.MemberRejoin) error {
+	var firstErr error
+
+	// 与 dm_cutoff 对称，且**必须**对称：移除侧现在会把他自己的频道整个覆写
+	// （reconcileRemovedMemberChannel），摘掉的范围严格大于逐对端枚举能摘的范围。
+	// 恢复侧若只补枚举得到的那几个对端，就会补不回覆写摘掉的那些人——
+	// 这正是这个 PR 反复踩到的「守卫只落在镜像的一半」。
+	// 同一个函数、同一条推导规则：他重新成为成员之后，coMembers 里又有那些人了。
+	if err := f.reconcileRemovedMemberChannel(ctx, rejoin.UID); err != nil {
+		f.Warn("覆写加入成员的 Person 频道白名单失败（best-effort）",
+			zap.Error(err), zap.String("spaceId", rejoin.SpaceID), zap.String("uid", rejoin.UID))
+		firstErr = err
+	}
+
 	peers, err := f.dmPeersInSpace(ctx, space.MemberRemoval{SpaceID: rejoin.SpaceID, UID: rejoin.UID})
 	if err != nil {
-		return err
+		if firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
 	}
 	if len(peers) == 0 {
-		return nil
+		return firstErr
 	}
 
 	selfIsBot, err := newFriendDB(ctx).isRobot(rejoin.UID)
 	if err != nil {
-		return fmt.Errorf("check whether joining member is a bot: %w", err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("check whether joining member is a bot: %w", err)
+		}
+		return firstErr
 	}
 
-	var firstErr error
 	for _, peer := range peers {
 		// 授权判定不在这里做——它整个搬进了 restoreDM，紧挨着写。
 		// 在这里算好再传进去，等于给「读到的授权已经失效、却照样写下去」留出一段
