@@ -10,18 +10,56 @@ import (
 	"fmt"
 	"mime"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/common/emailtmpl"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
 
 const CacheKeyEmailCode = "emailcode:"
+
+const (
+	emailCodeStatusPending = "pending"
+	emailCodeStatusSent    = "sent"
+	emailCodeStatusFailed  = "failed"
+	emailCodeTTL           = 5 * time.Minute
+)
+
+// The key helpers are shared by the manager MFA flow and the ordinary email
+// login flow. CodeType is part of every control key so a public-user code
+// cannot consume or lock a manager-console code for the same mailbox.
+func EmailCodeKey(email string, codeType CodeType) string {
+	return fmt.Sprintf("%s%d@%s", CacheKeyEmailCode, codeType, email)
+}
+
+func EmailCodeStatusKey(email string, codeType CodeType) string {
+	return fmt.Sprintf("emailcode-status:%d@%s", codeType, email)
+}
+
+func EmailRateLimitKey(email string, codeType CodeType) string {
+	return fmt.Sprintf("email_rate_limit:%d:%s", codeType, email)
+}
+
+func EmailVerifyFailKey(email string, codeType CodeType) string {
+	return fmt.Sprintf("email_verify_fail:%d:%s", codeType, email)
+}
+
+func EmailVerifyLockKey(email string, codeType CodeType) string {
+	return fmt.Sprintf("email_verify_lock:%d:%s", codeType, email)
+}
+
+func emailCodeRequiresSentStatus(codeType CodeType) bool {
+	return codeType == CodeTypeManagerLogin
+}
 
 // IEmailService 邮件服务接口
 type IEmailService interface {
@@ -57,6 +95,12 @@ type EmailService struct {
 	log.Log
 }
 
+// rawRedisClients is only used for the manager-code atomic consume path.
+// The legacy pkg/redis Conn intentionally does not expose Eval; cache one
+// instrumented go-redis client per process Context rather than creating a
+// connection pool per HTTP request.
+var rawRedisClients sync.Map // map[*config.Context]*rd.Client
+
 // NewEmailService 创建邮件服务。
 //
 // settings 为 nil 时退化到读取 cfg.Support.*（yaml 静态值）。生产路径
@@ -77,14 +121,43 @@ func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailS
 // errors.Is rather than collapsing it onto a generic send-failure code.
 var ErrEmailSendRateLimited = errors.New("email resend cooldown active, retry in 1 minute")
 
+var (
+	ErrManagerCodeInvalid = errors.New("invalid manager verification code")
+	ErrManagerCodeLocked  = errors.New("too many failed attempts, locked for 10 minutes")
+)
+
 // SendVerifyCode 发送验证码。
 //
 // 主题/正文由 emailtmpl 按 lang 渲染（外置 per-lang 模板，issue #221）；走
 // SendTransactionalHTML 而非极简 sendEmail —— 验证码是高价值事务邮件，带
 // plaintext 兜底 + 标准事务邮件 header 可显著降低被反垃圾静默丢弃的概率。
 func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string) error {
-	// 检查发送频率限制
-	rateLimitKey := fmt.Sprintf("email_rate_limit:%s", email)
+	return s.sendVerifyCode(ctx, email, codeType, lang, false, "")
+}
+
+// SendVerifyCodeTracked is the delivery-confirmed variant used by manager MFA.
+// It writes a pending status before SMTP, changes it to sent only after the
+// SMTP transaction returns nil, and removes the code on every failure path.
+// Ordinary user flows continue through SendVerifyCode and retain the legacy
+// missing-status compatibility behavior.
+func (s *EmailService) SendVerifyCodeTracked(ctx context.Context, email string, codeType CodeType, lang string) error {
+	return s.sendVerifyCode(ctx, email, codeType, lang, true, "")
+}
+
+// SendVerifyCodeTrackedWithAttempt is the manager-console variant whose Redis
+// status is bound to a caller-owned attempt ID. A slow SMTP request that
+// returns after its 120s send lock has been replaced cannot mark a newer
+// attempt as sent, nor can its cleanup delete the newer code.
+func (s *EmailService) SendVerifyCodeTrackedWithAttempt(ctx context.Context, email string, codeType CodeType, lang, attemptID string) error {
+	if strings.TrimSpace(attemptID) == "" {
+		return errors.New("send attempt id must not be empty")
+	}
+	return s.sendVerifyCode(ctx, email, codeType, lang, true, attemptID)
+}
+
+func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string, tracked bool, attemptID string) error {
+	// 检查发送频率限制。额度按邮箱 + CodeType 隔离。
+	rateLimitKey := EmailRateLimitKey(email, codeType)
 	exists, err := s.ctx.GetRedisConn().GetString(rateLimitKey)
 	if err != nil {
 		return err
@@ -109,19 +182,121 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 		return errors.New("internal error, please retry")
 	}
 
-	cacheKey := fmt.Sprintf("%s%d@%s", CacheKeyEmailCode, codeType, email)
-	err = s.ctx.GetRedisConn().SetAndExpire(cacheKey, code, time.Minute*5)
+	cacheKey := EmailCodeKey(email, codeType)
+	statusKey := EmailCodeStatusKey(email, codeType)
+	statusPending := emailCodeStatusPending
+	if attemptID != "" {
+		statusPending += ":" + attemptID
+	}
+	if tracked {
+		// A new attempt invalidates an older code before any SMTP I/O starts.
+		if err = s.ctx.GetRedisConn().Del(cacheKey); err != nil {
+			return err
+		}
+		if err = s.ctx.GetRedisConn().SetAndExpire(statusKey, statusPending, emailCodeTTL); err != nil {
+			return err
+		}
+	}
+	err = s.ctx.GetRedisConn().SetAndExpire(cacheKey, code, emailCodeTTL)
 	if err != nil {
+		if tracked {
+			_ = s.ctx.GetRedisConn().Del(statusKey)
+		}
 		return err
 	}
 
 	// 设置发送频率限制（1分钟）
 	err = s.ctx.GetRedisConn().SetAndExpire(rateLimitKey, "1", time.Minute)
 	if err != nil {
+		if tracked {
+			_ = s.ctx.GetRedisConn().Del(cacheKey)
+			_ = s.ctx.GetRedisConn().Del(statusKey)
+		}
 		return err
 	}
 
-	return s.SendTransactionalHTML(ctx, email, rendered.Subject, rendered.HTML, rendered.Text)
+	if err := s.SendTransactionalHTML(ctx, email, rendered.Subject, rendered.HTML, rendered.Text); err != nil {
+		if tracked {
+			if attemptID != "" {
+				_, _ = s.clearTrackedCode(ctx, email, codeType, statusPending)
+			} else {
+				_ = s.ctx.GetRedisConn().Del(cacheKey)
+				_ = s.ctx.GetRedisConn().SetAndExpire(statusKey, emailCodeStatusFailed, time.Minute)
+			}
+		}
+		return err
+	}
+	if tracked {
+		if attemptID != "" {
+			committed, err := s.commitTrackedCode(ctx, statusKey, statusPending, emailCodeStatusSent+":"+attemptID)
+			if err != nil {
+				_, _ = s.clearTrackedCode(ctx, email, codeType, statusPending)
+				return err
+			}
+			if !committed {
+				_, _ = s.clearTrackedCode(ctx, email, codeType, statusPending)
+				return errors.New("email verification status was superseded")
+			}
+		} else if err := s.ctx.GetRedisConn().SetAndExpire(statusKey, emailCodeStatusSent, emailCodeTTL); err != nil {
+			_ = s.ctx.GetRedisConn().Del(cacheKey)
+			_ = s.ctx.GetRedisConn().SetAndExpire(statusKey, emailCodeStatusFailed, time.Minute)
+			return err
+		}
+	}
+	return nil
+}
+
+// commitTrackedCode changes pending:<attempt> to sent:<attempt> only when the
+// status still belongs to that attempt. The Lua compare-and-set is necessary
+// because SMTP can complete after a newer challenge has already started.
+func (s *EmailService) commitTrackedCode(ctx context.Context, statusKey, pending, sent string) (bool, error) {
+	result, err := s.verifyRedis().WithContext(ctx).Eval(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+`, []string{statusKey}, pending, sent, int(emailCodeTTL.Seconds())).Result()
+	if err != nil {
+		return false, err
+	}
+	value, ok := result.(int64)
+	return ok && value == 1, nil
+}
+
+// clearTrackedCode removes the code and its status only if the status still
+// belongs to the pending attempt. It prevents a late SMTP failure from
+// deleting a code created by a newer attempt for the same mailbox.
+func (s *EmailService) clearTrackedCode(ctx context.Context, email string, codeType CodeType, pending string) (bool, error) {
+	result, err := s.verifyRedis().WithContext(ctx).Eval(`
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+`, []string{EmailCodeKey(email, codeType), EmailCodeStatusKey(email, codeType)}, pending).Result()
+	if err != nil {
+		return false, err
+	}
+	value, ok := result.(int64)
+	return ok && value == 1, nil
+}
+
+// InvalidateManagerCode atomically removes the shared manager-code/status
+// pair. Challenge creation and send claiming use this to make an older code
+// unusable before any new SMTP operation begins.
+func (s *EmailService) InvalidateManagerCode(ctx context.Context, email string) error {
+	return s.verifyRedis().WithContext(ctx).Del(
+		EmailCodeKey(email, CodeTypeManagerLogin),
+		EmailCodeStatusKey(email, CodeTypeManagerLogin),
+	).Err()
+}
+
+// ClearManagerCodeIfAttempt removes a code only when its status still carries
+// the supplied attempt ID. It is used when an asynchronous SMTP operation
+// loses ownership of its challenge state.
+func (s *EmailService) ClearManagerCodeIfAttempt(ctx context.Context, email, attemptID string) error {
+	_, err := s.clearTrackedCode(ctx, email, CodeTypeManagerLogin, emailCodeStatusSent+":"+attemptID)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // SendHTMLEmail 直接发送一封 HTML 邮件。subject/body 由调用方负责，本方法
@@ -162,8 +337,8 @@ func (s *EmailService) SendTransactionalHTML(ctx context.Context, to, subject, h
 		return errors.New("recipient must not be empty")
 	}
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
-	if smtpAddr == "" || fromAddr == "" || pwd == "" {
-		return errors.New("email service not configured")
+	if err := ValidateSMTPConfiguration(smtpAddr, fromAddr, pwd); err != nil {
+		return err
 	}
 	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
 	msg, err := buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody)
@@ -178,8 +353,8 @@ func (s *EmailService) SendTransactionalHTML(ctx context.Context, to, subject, h
 func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) error {
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
 
-	if smtpAddr == "" || fromAddr == "" || pwd == "" {
-		return errors.New("email service not configured")
+	if err := ValidateSMTPConfiguration(smtpAddr, fromAddr, pwd); err != nil {
+		return err
 	}
 
 	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
@@ -193,6 +368,58 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 		body + "\r\n"
 
 	return s.dispatchSMTP(ctx, smtpAddr, fromSan, pwd, toSan, []byte(msg))
+}
+
+// ValidateSMTPConfiguration validates the complete effective configuration
+// before any network operation. In particular, accepting a syntactically
+// non-empty but invalid MAIL FROM would let an SMTP server reject MFA mail
+// after the policy had already been enabled.
+func ValidateSMTPConfiguration(smtpAddr, fromAddr, password string) error {
+	smtpAddr = strings.TrimSpace(smtpAddr)
+	fromAddr = strings.TrimSpace(fromAddr)
+	if smtpAddr == "" || fromAddr == "" || password == "" {
+		return errors.New("email service not configured")
+	}
+	if err := ValidateEmailAddress(fromAddr); err != nil {
+		return err
+	}
+	host, port, err := net.SplitHostPort(smtpAddr)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return errors.New("smtp address format is invalid")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return errors.New("smtp port is invalid")
+	}
+	return nil
+}
+
+// ValidateEmailAddress accepts only a bare RFC-style mailbox. Display-name
+// forms are valid in a message header but are not a safe SMTP envelope sender
+// for this configuration field.
+func ValidateEmailAddress(email string) error {
+	email = strings.TrimSpace(email)
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email || parsed.Name != "" {
+		return errors.New("email address is invalid")
+	}
+	return nil
+}
+
+// PreflightSMTP exercises the same SMTP transaction used for real mail. The
+// sender address is used as the recipient because no new deployment setting
+// is introduced for a probe mailbox. This deliberately sends a real probe;
+// callers invoke it only when enabling/validating manager MFA or during the
+// startup warning check.
+func (s *EmailService) PreflightSMTP(ctx context.Context) error {
+	smtpAddr, fromAddr, pwd := s.resolveSMTP()
+	if err := ValidateSMTPConfiguration(smtpAddr, fromAddr, pwd); err != nil {
+		return err
+	}
+	return s.SendTransactionalHTML(ctx, fromAddr,
+		"[Octo] 管理控制台 MFA SMTP 自检",
+		"<p>Octo 管理控制台 MFA SMTP configuration preflight.</p>",
+		"Octo 管理控制台 MFA SMTP configuration preflight.")
 }
 
 // sanitizeHeader 清除 \r / \n,防止 CRLF 注入攻击者构造 "Bcc: hacker@evil.com"
@@ -380,7 +607,7 @@ func (s *EmailService) resolveSMTP() (smtpAddr, from, pwd string) {
 // Verify 验证验证码（验证成功后销毁缓存）
 func (s *EmailService) Verify(ctx context.Context, email, code string, codeType CodeType) error {
 	// 检查是否被锁定
-	lockKey := fmt.Sprintf("email_verify_lock:%s", email)
+	lockKey := EmailVerifyLockKey(email, codeType)
 	locked, err := s.ctx.GetRedisConn().GetString(lockKey)
 	if err != nil {
 		return err
@@ -395,22 +622,32 @@ func (s *EmailService) Verify(ctx context.Context, email, code string, codeType 
 		return nil
 	}
 
-	cacheKey := fmt.Sprintf("%s%d@%s", CacheKeyEmailCode, codeType, email)
+	cacheKey := EmailCodeKey(email, codeType)
+	statusKey := EmailCodeStatusKey(email, codeType)
 	sysCode, err := s.ctx.GetRedisConn().GetString(cacheKey)
 	if err != nil {
 		return err
 	}
-	if sysCode != "" && subtle.ConstantTimeCompare([]byte(sysCode), []byte(code)) == 1 {
+	status := ""
+	if emailCodeRequiresSentStatus(codeType) {
+		status, err = s.ctx.GetRedisConn().GetString(statusKey)
+		if err != nil {
+			return err
+		}
+	}
+	if sysCode != "" && subtle.ConstantTimeCompare([]byte(sysCode), []byte(code)) == 1 &&
+		(!emailCodeRequiresSentStatus(codeType) || status == emailCodeStatusSent) {
 		s.ctx.GetRedisConn().Del(cacheKey)
+		s.ctx.GetRedisConn().Del(statusKey)
 		// 验证成功，清除失败计数
-		failCountKey := fmt.Sprintf("email_verify_fail:%s", email)
+		failCountKey := EmailVerifyFailKey(email, codeType)
 		s.ctx.GetRedisConn().Del(failCountKey)
 		s.ctx.GetRedisConn().Del(lockKey)
 		return nil
 	}
 
 	// 验证失败，增加失败计数
-	failCountKey := fmt.Sprintf("email_verify_fail:%s", email)
+	failCountKey := EmailVerifyFailKey(email, codeType)
 	failCountStr, _ := s.ctx.GetRedisConn().GetString(failCountKey)
 	failCount := 0
 	if failCountStr != "" {
@@ -428,4 +665,81 @@ func (s *EmailService) Verify(ctx context.Context, email, code string, codeType 
 
 	s.Info("邮箱验证码错误", zap.String("email", email))
 	return errors.New("invalid verification code")
+}
+
+// verifyRedis returns the raw client used for the manager-only atomic Lua
+// consume. It is intentionally kept private so ordinary email callers keep
+// their established Conn behavior.
+func (s *EmailService) verifyRedis() *rd.Client {
+	if client, ok := rawRedisClients.Load(s.ctx); ok {
+		return client.(*rd.Client)
+	}
+	client := octoredis.NewInstrumentedClient(s.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	})
+	actual, loaded := rawRedisClients.LoadOrStore(s.ctx, client)
+	if loaded {
+		_ = client.Close()
+		return actual.(*rd.Client)
+	}
+	return client
+}
+
+// VerifyManagerCodeAtomically verifies and consumes a manager OTP in one Redis
+// script. The script also binds the email status to the active challenge's
+// sent attempt, so a code from an older challenge cannot be reused by a newer
+// challenge for the same mailbox. A successful consume also removes the
+// challenge and UID active index before the caller proceeds to token issuance;
+// this makes the password-validated challenge single-use even if token
+// issuance later fails.
+func (s *EmailService) VerifyManagerCodeAtomically(ctx context.Context, email, code, challengeID string, activeKey, sendStateKey, challengeKey string) error {
+	const script = `
+local lock = redis.call('GET', KEYS[4])
+if lock then return 2 end
+if redis.call('GET', KEYS[5]) ~= ARGV[2] then return 0 end
+local expected = redis.call('GET', KEYS[1])
+local status = redis.call('GET', KEYS[2])
+local sendStatus = redis.call('HGET', KEYS[6], 'status')
+local attemptID = redis.call('HGET', KEYS[6], 'attempt_id')
+if expected and sendStatus == 'sent' and attemptID and status == ('sent:' .. attemptID) and expected == ARGV[1] then
+	redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[6])
+	if redis.call('GET', KEYS[5]) == ARGV[2] then
+	  redis.call('DEL', KEYS[5], KEYS[7])
+	end
+	return 1
+end
+local count = tonumber(redis.call('GET', KEYS[3]) or '0') + 1
+if count >= 3 then
+  redis.call('SET', KEYS[4], '1', 'EX', ARGV[3])
+  redis.call('DEL', KEYS[3])
+  return 2
+end
+redis.call('SET', KEYS[3], tostring(count), 'EX', ARGV[4])
+return 0
+`
+	result, err := s.verifyRedis().WithContext(ctx).Eval(script, []string{
+		EmailCodeKey(email, CodeTypeManagerLogin),
+		EmailCodeStatusKey(email, CodeTypeManagerLogin),
+		EmailVerifyFailKey(email, CodeTypeManagerLogin),
+		EmailVerifyLockKey(email, CodeTypeManagerLogin),
+		activeKey,
+		sendStateKey,
+		challengeKey,
+	}, code, challengeID, int((10 * time.Minute).Seconds()), int((10 * time.Minute).Seconds())).Result()
+	if err != nil {
+		return err
+	}
+	value, ok := result.(int64)
+	if !ok {
+		return errors.New("invalid manager verification result")
+	}
+	switch value {
+	case 1:
+		return nil
+	case 2:
+		return ErrManagerCodeLocked
+	default:
+		return ErrManagerCodeInvalid
+	}
 }

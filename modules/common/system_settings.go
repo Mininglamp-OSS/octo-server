@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"go.uber.org/zap"
 )
 
@@ -72,6 +73,17 @@ func EnsureSystemSettings(ctx *config.Context) *SystemSettings {
 // drift: an admin-side change becomes visible on every server within one TTL.
 const defaultReloadTTL = 60 * time.Second
 
+// ManagerEmailMFAState is deliberately tri-state. A nil snapshot means the
+// database settings have never loaded successfully and must not be treated as
+// the safe-looking "off" default by a manager login gate.
+type ManagerEmailMFAState uint8
+
+const (
+	ManagerEmailMFAUnavailable ManagerEmailMFAState = iota
+	ManagerEmailMFAOff
+	ManagerEmailMFAOn
+)
+
 // SystemSettings is the read path for admin-tunable global config.
 //
 // Lookup model:
@@ -86,10 +98,19 @@ const defaultReloadTTL = 60 * time.Second
 //     the cipher. Decryption failure logs an error and skips the entry, so
 //     the getter falls back to yaml rather than serving a corrupt value.
 type SystemSettings struct {
-	ctx       *config.Context
-	db        *systemSettingDB
-	snapshot  atomic.Pointer[map[string]string]
-	reloadTTL time.Duration
+	ctx      *config.Context
+	db       *systemSettingDB
+	snapshot atomic.Pointer[map[string]string]
+	// managerMFAProbe* records the last real SMTP preflight for the effective
+	// manager-console MFA configuration.  A syntactically valid configuration
+	// is not enough for the login gate: startup may have observed a real SMTP
+	// failure and must keep management login fail-closed until a later probe
+	// succeeds.  The pair is reset only when one of the relevant snapshot
+	// values changes, so the 60s ordinary settings reload does not create a
+	// needless login outage on every tick.
+	managerMFAProbeKnown atomic.Bool
+	managerMFAProbeReady atomic.Bool
+	reloadTTL            time.Duration
 	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
 	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
 	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
@@ -119,6 +140,7 @@ func (s *SystemSettings) Load() error {
 	if err != nil {
 		return err
 	}
+	previous := s.snapshot.Load()
 	next := make(map[string]string, len(rows))
 	for _, row := range rows {
 		if row.ValueType == settingTypeEncrypted {
@@ -139,7 +161,28 @@ func (s *SystemSettings) Load() error {
 		next[schemaKey(row.Category, row.KeyName)] = row.Value
 	}
 	s.snapshot.Store(&next)
+	if previous == nil || managerMFASettingsChanged(previous, &next) {
+		s.managerMFAProbeKnown.Store(false)
+		s.managerMFAProbeReady.Store(false)
+	}
 	return nil
+}
+
+func managerMFASettingsChanged(previous, next *map[string]string) bool {
+	if previous == nil || next == nil {
+		return true
+	}
+	for _, key := range []string{
+		"login.manager_email_mfa_on",
+		"support.email",
+		"support.email_smtp",
+		"support.email_pwd",
+	} {
+		if (*previous)[key] != (*next)[key] {
+			return true
+		}
+	}
+	return false
 }
 
 // Reload is the admin-write hook: after the manager API upserts new values
@@ -767,6 +810,83 @@ func (s *SystemSettings) SupportEmailSmtp() string {
 // this getter returns the yaml fallback.
 func (s *SystemSettings) SupportEmailPwd() string {
 	return s.getEncrypted("support", "email_pwd", s.ctx.GetConfig().Support.EmailPwd)
+}
+
+// ManagerEmailMFAState returns the security state used only by management
+// console login. A successfully loaded snapshot with no row means the
+// feature's documented default-off state; an uninitialized snapshot is
+// unavailable and therefore fail-closed.
+func (s *SystemSettings) ManagerEmailMFAState() ManagerEmailMFAState {
+	if s.snapshot.Load() == nil {
+		return ManagerEmailMFAUnavailable
+	}
+	v, configured := s.lookup("login", "manager_email_mfa_on")
+	if !configured {
+		return ManagerEmailMFAOff
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
+		return ManagerEmailMFAOn
+	case "0", "false", "":
+		return ManagerEmailMFAOff
+	default:
+		return ManagerEmailMFAUnavailable
+	}
+}
+
+// ManagerEmailMFAOn is the convenient boolean view for schema/appconfig
+// rendering. Security-sensitive handlers must use ManagerEmailMFAState so an
+// unavailable snapshot cannot collapse into false.
+func (s *SystemSettings) ManagerEmailMFAOn() bool {
+	return s.ManagerEmailMFAState() == ManagerEmailMFAOn
+}
+
+// ValidateManagerEmailMFASMTP checks the effective SMTP values without doing
+// network I/O. Callers that are about to enable the policy must follow it with
+// PreflightManagerEmailMFA so the actual delivery path is exercised too.
+func (s *SystemSettings) ValidateManagerEmailMFASMTP() error {
+	return commonbase.ValidateSMTPConfiguration(
+		s.SupportEmailSmtp(), s.SupportEmail(), s.SupportEmailPwd(),
+	)
+}
+
+// PreflightManagerEmailMFA sends a real probe through the same SMTP path used
+// for OTP mail. It never changes the policy value and never panics; startup
+// callers log the returned error and leave the login gate fail-closed.
+func (s *SystemSettings) PreflightManagerEmailMFA(ctx context.Context) error {
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		s.managerMFAProbeKnown.Store(false)
+		s.managerMFAProbeReady.Store(false)
+		return nil
+	}
+	if err := s.ValidateManagerEmailMFASMTP(); err != nil {
+		s.managerMFAProbeKnown.Store(true)
+		s.managerMFAProbeReady.Store(false)
+		return err
+	}
+	err := commonbase.NewEmailService(s.ctx, s).PreflightSMTP(ctx)
+	s.managerMFAProbeKnown.Store(true)
+	s.managerMFAProbeReady.Store(err == nil)
+	return err
+}
+
+// RecordManagerEmailMFAPreflight lets a system-setting write path publish the
+// result of a probe performed against the prospective (not-yet-reloaded)
+// SMTP values.  It is intentionally tiny: callers still own the actual probe
+// and this method never changes the MFA policy or snapshot.
+func (s *SystemSettings) RecordManagerEmailMFAPreflight(ok bool) {
+	s.managerMFAProbeKnown.Store(true)
+	s.managerMFAProbeReady.Store(ok)
+}
+
+// ManagerEmailMFAReady is the login gate's fail-closed view.  It requires an
+// enabled policy, a complete effective configuration, and a successful real
+// SMTP preflight for that exact snapshot.
+func (s *SystemSettings) ManagerEmailMFAReady() bool {
+	return s.ManagerEmailMFAState() == ManagerEmailMFAOn &&
+		s.managerMFAProbeKnown.Load() &&
+		s.managerMFAProbeReady.Load() &&
+		s.ValidateManagerEmailMFASMTP() == nil
 }
 
 // ----- incomingwebhook settings (总开关 + 核心阈值) -----

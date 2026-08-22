@@ -1,6 +1,8 @@
 package user
 
 import (
+	"fmt"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -159,6 +161,25 @@ func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
 	return err
 }
 
+// updateManagerEmail updates only the role observed by the handler. The
+// affected-row check is intentional: a concurrent role change or a missing
+// target must never be reported as a successful second-factor repair.
+func (m *managerDB) updateManagerEmail(uid, role, email string) (bool, error) {
+	result, err := m.session.Update("user").Set("email", email).
+		Where("uid=? and role=?", uid, role).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows != 1 {
+		return false, fmt.Errorf("manager email update affected %d rows", rows)
+	}
+	return true, nil
+}
+
 // updateUserRole changes role only if it still equals expectedRole. The
 // compare-and-set prevents a concurrent promotion to SuperAdmin from being
 // overwritten by the temporary dashboardReader grant/revoke path.
@@ -179,6 +200,7 @@ type managerLoginModel struct {
 	Username  string
 	UID       string
 	Name      string
+	Email     string
 	Password  string
 	Role      string
 	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值

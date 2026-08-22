@@ -41,4 +41,9 @@ var (
 		DefaultMessage: "Thread auto-archive window must not be shorter than the recent-tab thread window.",
 		SafeDetailKeys: []string{"archive_days", "recent_days"},
 	})
+	ErrManagerMFASmtpInvalid = register(codes.Code{
+		ID:             "err.server.common.manager_mfa_smtp_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The SMTP configuration required by management-console MFA is invalid.",
+	})
 )

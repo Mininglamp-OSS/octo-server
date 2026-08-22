@@ -119,6 +119,8 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.LocalLoginOff()) }},
 	{Category: "login", Key: "scan_enabled", Type: settingTypeBool, Description: "是否开启扫码登录（默认关闭，客户端适配后显式开启）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ScanLoginEnabled()) }},
+	{Category: "login", Key: "manager_email_mfa_on", Type: settingTypeBool, Description: "是否开启管理控制台登录邮箱二次验证（仅保护管理控制台登录端点，默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ManagerEmailMFAOn()) }},
 
 	// Space user-facing creation toggle — admin 关闭后客户端隐藏创建入口,
 	// 后端 POST /v1/space/create 直接 403。env DM_SPACE_DISABLE_USER_CREATE
