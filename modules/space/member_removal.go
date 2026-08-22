@@ -329,14 +329,21 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		}
 	}()
 	// 先对齐当前真实成员身份再动手。工单可能在退避期间变陈旧：成员被移除后又重新
-	// 加入，这时把他的群拆掉才是真正的故障。活跃成员 → 工单直接作废。
-	member, err := s.db.queryMember(job.SpaceID, job.UID)
+	// 加入，这时把他的群拆掉才是真正的故障。仍持有席位 → 工单直接作废。
+	//
+	// 谓词必须与级联步骤里那道门完全一致（CheckMembershipForCleanup），否则外层门
+	// 先跑、先短路，内层那个谓词根本没机会执行。这里以前用 queryMember，只看
+	// space_member.status=1、不问 Space 死没死：join-vs-disband 竞态造出的孤儿行
+	//（Space 已 status=0，成员行被并发 join 写回 status=1）会被误判成「人已重新
+	// 加入」，工单当场作废，那个人的 group_member 行和 IM 群订阅就永远留在一个
+	// 已解散的空间里，再没有任何东西会回来看一眼。
+	stillMember, err := spacepkg.CheckMembershipForCleanup(s.ctx.DB(), job.SpaceID, job.UID)
 	if err != nil {
 		s.releaseCleanupJob(job, owner, "membership_recheck_failed", err)
 		return
 	}
-	if member != nil {
-		s.Info("被移除成员已重新加入，跳过会话面清理",
+	if stillMember {
+		s.Info("被移除成员仍持有 Space 席位，跳过会话面清理",
 			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
 		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined")
 		return

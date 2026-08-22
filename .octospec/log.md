@@ -1492,3 +1492,14 @@ change-log convention (§7). Newest first.
 
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
+
+## 2026-08-22 (cleanup-membership-predicate)
+
+- **Fixed** — The two removal-cleanup rejoin guards were asking one question
+  with two different predicates: a disbanded Space silently voided cleanup
+  (orphan `space_member` row), a banned Space wrongly triggered it. Both now use
+  `CheckMembershipForCleanup` (`sm.status=1 AND s.status <> 0`).
+  `CheckMembership` is deliberately **unchanged** — #797's original proposal to
+  relax it would have admitted banned Spaces through `SpaceMiddleware` and 36
+  other call sites — and a source guard now pins the two apart. Closes two #797
+  items. See [journal](journal/shared/cleanup-membership-predicate.md).

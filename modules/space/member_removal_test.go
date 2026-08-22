@@ -949,3 +949,89 @@ func TestCleanupErrorNamesAllFailedSteps(t *testing.T) {
 	assert.Contains(t, jobs[0].LastError, "(+1)",
 		"多个步骤失败时要在 last_error 里标出还有几个，否则只会去查第一个")
 }
+
+// TestCleanupRunsWhenSpaceDisbandedDespiteActiveMemberRow 是本次修复的核心回归。
+//
+// worker 的外层门以前用 queryMember，只看 space_member.status=1，完全不问 Space
+// 本身死没死。join-vs-disband 竞态会造出正是这种状态：Space 已经 status=0，成员行
+// 却被一次并发 join 写回 status=1。外层门看见 status=1 就把工单当成「人已重新加入」
+// 直接作废（done/skipped_rejoined），于是这个人的 group_member 行和 IM 群订阅
+// 永远留在一个已解散的空间里，而且再没有任何工单会回来看一眼。
+//
+// 内层的级联步骤本来判得对（它用 CheckMembership，要求 space.status=1，解散场景
+// 判定为「不是成员」→ 照常清理），但外层门先跑、先短路，内层那个精心挑过的谓词
+// 根本没机会执行。
+func TestCleanupRunsWhenSpaceDisbandedDespiteActiveMemberRow(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-disband-orphan"
+	seedMember(t, f, spaceID, "owner-orphan", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "orphan", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "orphan", 1, "owner-orphan", MemberRemoveReasonKicked)
+
+	// 造出 join-vs-disband 孤儿：成员行被并发 join 写回 status=1，Space 已解散。
+	require.NoError(t, f.db.reactivateMember(spaceID, "orphan", 0))
+	_, err = testCtx.DB().Exec(
+		"UPDATE space SET status=? WHERE space_id=?", SpaceStatusDisbanded, spaceID)
+	require.NoError(t, err)
+
+	called := 0
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "must-run",
+		fn: func(*config.Context, MemberRemoval) error {
+			called++
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	assert.Equal(t, 1, called, "Space 已解散，成员行只是 join-vs-disband 孤儿，清理必须照常执行")
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupDone, jobs[0].Status)
+	assert.NotEqual(t, "skipped_rejoined", jobs[0].LastError,
+		"外层门不得把已解散空间里的孤儿成员行当成『已重新加入』")
+}
+
+// TestCleanupSkipsMemberInBannedSpace 封禁不是解散：成员资格仍然有效，
+// Manager.addMembers 也仍允许往封禁空间加人（只挡 SpaceStatusDisbanded）。
+// 所以在职成员绝不能因为空间被封禁就被清理管线拆出所有群。
+func TestCleanupSkipsMemberInBannedSpace(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-banned"
+	seedMember(t, f, spaceID, "owner-banned", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "banned-member", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "banned-member", 1, "owner-banned", MemberRemoveReasonKicked)
+
+	// 人被加了回来，随后整个 Space 被封禁。
+	require.NoError(t, f.db.reactivateMember(spaceID, "banned-member", 0))
+	_, err = testCtx.DB().Exec(
+		"UPDATE space SET status=? WHERE space_id=?", SpaceStatusBanned, spaceID)
+	require.NoError(t, err)
+
+	called := 0
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "must-not-run",
+		fn: func(*config.Context, MemberRemoval) error {
+			called++
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	assert.Zero(t, called, "空间只是被封禁、人还是成员，不得触发任何清理步骤")
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, "skipped_rejoined", jobs[0].LastError)
+}

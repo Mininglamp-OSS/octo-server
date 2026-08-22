@@ -41,9 +41,14 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 	// 「认领到动手的整段时长」压到了一次查询的间隔。彻底关闭要给 space_member
 	// 加成员纪元并在每一步里校验，记在 brief 的 follow-up 里。
 	//
-	// 谓词用 CheckMembership（sm.status=1 且 space.status=1）：解散场景下
-	// space.status 已经是 0，判定为「不是活跃成员」，清理照常进行——正是所需。
-	stillMember, err := spacepkg.CheckMembership(ctx.DB(), removal.SpaceID, removal.UID)
+	// 谓词用 CheckMembershipForCleanup（sm.status=1 且 space.status <> 0），
+	// 与 worker 外层那道门是同一个，两层必须回答同一个问题。
+	//
+	// 解散（status=0）判定为「席位已失效」，清理照常进行——正是所需；封禁
+	// （status=2）判定为「席位仍在」，跳过清理。以前这里用 CheckMembership，
+	// 它要求 space.status=1，于是一名完全在职的成员会因为空间被封禁而被拆出
+	// 所有群，而 Manager.addMembers 只挡解散、往封禁空间加人是允许的。
+	stillMember, err := spacepkg.CheckMembershipForCleanup(ctx.DB(), removal.SpaceID, removal.UID)
 	if err != nil {
 		return fmt.Errorf("re-check space membership before group cascade: %w", err)
 	}

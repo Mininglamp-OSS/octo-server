@@ -639,3 +639,33 @@ func TestGroupCascadeKickStillSendsBotTip(t *testing.T) {
 	assert.True(t, payloadsContain(payloads, "被移出群聊"),
 		"普通踢出的动作词仍是「被移出」, payloads=%v", payloads)
 }
+
+// TestGroupCascadeSkipsMemberInBannedSpace 封禁 ≠ 解散。
+//
+// 级联步骤原本用 CheckMembership 做 rejoin 门，而它要求 space.status=1。封禁空间
+// 的 status 是 2，于是一名完全在职的成员会被判成「不是活跃成员」，级联照常执行、
+// 把他从该空间的每一个群里拆出去。Manager.addMembers 只挡 SpaceStatusDisbanded
+// （modules/space/api_manager.go:638），往封禁空间加人是允许的，所以这个状态是
+// 正常可达的，不是异常态。
+func TestGroupCascadeSkipsMemberInBannedSpace(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-banned", "u-banned-victim"
+
+	seedGroupInSpace(t, ctx, "g-banned", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-banned", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-banned", victim, MemberRoleCommon)
+
+	seedActiveSpaceMember(t, ctx, spaceID, victim)
+	_, err := ctx.DB().Exec("UPDATE space SET status=2 WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "u-owner",
+		Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	role, stillIn := liveMemberRole(t, ctx, "g-banned", victim)
+	assert.True(t, stillIn, "空间只是被封禁、人还是成员，级联不得把他清出群")
+	assert.Equal(t, MemberRoleCommon, role, "角色也不应被改动")
+}
