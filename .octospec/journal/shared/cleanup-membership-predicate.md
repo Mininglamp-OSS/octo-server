@@ -87,8 +87,10 @@ No-regression proof: `TestCleanupWorkerSkipsRejoinedMember` and
 `TestGroupCascadeStillRunsAfterSpaceDisbanded` both stay green — the new
 predicate preserves them by construction.
 
-Gates: full `modules/space` (11.3s) and `modules/group` (38.2s) suites,
-`pkg/space`, `golangci-lint` 0 issues, `i18n-extract-check`, `i18n-lint`.
+Gates: the **full CI E2E lane** (`ci/run-e2e-shard.sh 1 1`) — all 44 packages
+against real MySQL 8 / Redis / WuKongIM v2.2.4-20260313 — **44/44 pass**.
+`modules/space` and `modules/group` additionally under `-race -shuffle=on`, no
+data races. `golangci-lint` 0 issues, `i18n-extract-check`, `i18n-lint`.
 
 ## Environment gotchas worth remembering
 
@@ -106,7 +108,15 @@ is visible from CI config:
   the stack trace.
 - Packages share one `test` database but register different migration sets, so
   it must be dropped and recreated between package runs or the next package
-  panics with `unknown migration in database`.
+  panics with `unknown migration in database`. **`ci/run-e2e-shard.sh` already
+  handles this and falls back to local mysql/redis binaries outside CI** — run
+  that rather than `go test ./...`, which cannot reset between packages.
+- `OCTO_MASTER_KEY` must be exported (CI pins a fixed 32-char value at
+  `ci.yml:191`). Without it `common.Setup` refuses to boot and
+  `modules/botfather`, `modules/robot` and `modules/channel` each panic during
+  `module.Setup` — three package failures from one unset variable, and the panic
+  text talks about an unencrypted private key rather than the missing env var.
+  This was the entire delta between a 41/44 and a 44/44 local run.
 
 ## Follow-ups (unchanged, still open in #797)
 

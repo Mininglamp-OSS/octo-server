@@ -56,17 +56,35 @@ injected_rules:
       Conventional Commits, English subject line.
 
 gates_run:
-  - "go test ./pkg/space/ — pass"
-  - "go test ./modules/space/ — pass (full package, 11.3s)"
-  - "go test ./modules/group/ — pass (full package, 38.2s)"
+  - "ci/run-e2e-shard.sh 1 1 — the full CI E2E lane, all 44 packages, against real
+     MySQL 8 / Redis / WuKongIM v2.2.4-20260313: 44/44 pass"
+  - "go test ./modules/space/ -race -shuffle=on — pass, no data races"
+  - "go test ./modules/group/ -race -shuffle=on — pass, no data races (95s)"
   - "golangci-lint run ./pkg/space/... ./modules/space/... ./modules/group/... — 0 issues"
   - "make i18n-extract-check — pass"
   - "make i18n-lint — pass"
 
 notes: >
-  Local test services had to be brought up by hand (MySQL, Redis, WuKongIM
-  v2.2.4-20260313). Two environment gotchas worth remembering: the `test`
-  database must be created with COLLATE utf8mb4_general_ci or migration
-  20260308000002 dies with Error 1267 on MySQL 8's utf8mb4_0900_ai_ci default;
-  and modules/group tests that create real IM channels fail with a nil-pointer
-  panic rather than a clean skip when the broker is down.
+  Local test services were brought up by hand. Four environment gotchas, none of
+  them visible from the code and all of them costly to rediscover:
+
+  (1) OCTO_MASTER_KEY must be exported (CI pins
+  0123456789abcdef0123456789abcdef at ci.yml:191). Without it common.Setup
+  refuses to boot and modules/botfather, modules/robot and modules/channel each
+  panic during module.Setup — three package-level failures from one unset
+  variable, and the panic text names a private key rather than the missing env.
+
+  (2) The `test` database must be created COLLATE utf8mb4_general_ci. MySQL 8
+  defaults a fresh schema to utf8mb4_0900_ai_ci and migration
+  20260308000002_space_legacy01.sql then dies with Error 1267.
+
+  (3) Packages share one `test` database but register different migration sets,
+  so it must be dropped and recreated between package runs or the next package
+  panics with `unknown migration in database`. ci/run-e2e-shard.sh already does
+  this and falls back to local mysql/redis binaries outside CI — use it rather
+  than `go test ./...`.
+
+  (4) modules/group tests that create real IM channels panic with a nil-pointer
+  dereference when the WuKongIM broker is down instead of failing cleanly; the
+  real cause (dial tcp 127.0.0.1:5001: connection refused) is buried above the
+  stack trace.
