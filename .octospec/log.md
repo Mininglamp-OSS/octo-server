@@ -4,6 +4,29 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-21 (space-member-removal-cleanup)
+
+- **Implemented** — Space member removal now takes the member out of the Space's
+  groups and sub-threads instead of only soft-deleting `space_member`. A
+  transactional outbox (`space_member_removal_cleanup`) drives a leased, retried
+  cascade that exits every group in the Space (full group-exit semantics, with
+  creator handover first); the `SpaceMiddleware` and notify membership caches are
+  invalidated inside the request. Covers all five removal paths — the
+  owner-initiated `DELETE /v1/space/:space_id` was not in the original survey
+  because it only flipped `space.status`.
+  See [journal](journal/shared/space-member-removal-cleanup.md).
+- **Split** — Person-channel (DM) isolation was originally part of this task and
+  was moved to `space-member-dm-isolation` after eleven review rounds. Two
+  measured reasons: WuKongIM's `whitelistOffOfPerson` defaults to `true`, so the
+  DM half changes no delivery behaviour in any current deployment; and it did not
+  converge by point fixes (a new escape in six consecutive rounds, with
+  structural root causes). Keeping it would have blocked a group cascade that is
+  live behaviour today behind a half that is inert.
+- **Learning (pending)** — Deferred cleanup must be scoped with was-ever
+  predicates: an is-currently predicate observes the state the trigger already
+  destroyed and turns the job into a silent no-op. See
+  [learning](learnings/pending/cleanup-predicate-tense.md).
+
 ## 2026-08-13 (cutover-framework)
 
 - **Refactor** — Task `cutover-framework`: extracted the control plane the three

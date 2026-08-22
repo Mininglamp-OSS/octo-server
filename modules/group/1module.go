@@ -37,6 +37,9 @@ func init() {
 		// 与 RegisterGroupMemberChecker（ExistMember，服务置顶等既有路径）分开，避免
 		// 收紧一处波及另一处。
 		user.RegisterActiveGroupMemberChecker(api.groupService.ExistMemberActive)
+		// 成员被移出 Space 时，把他从该 Space 下的所有群里清出去
+		// （task space-member-removal-cleanup）。反向注册避免 space -> group 成环。
+		api.registerSpaceMemberRemovalCleanup()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

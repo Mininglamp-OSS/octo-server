@@ -55,6 +55,14 @@ const (
 	EventUpdateSearchMessage string = "message.update.search.data"
 	// SpaceMemberJoin 用户加入空间
 	SpaceMemberJoin string = "space.member.join"
+	// SpaceMemberRemove 用户被移出空间（踢出 / 自助退出 / 管理端强制移除 / 空间解散）。
+	//
+	// 这是一个"观察者"事件：监听方必须 commit(nil) 并自行兜底，不得依赖事件表重投。
+	// 原因见 handleEvent —— 监听方报错只会把事件行置为 Fail，而 QueryAllWait 只捞
+	// Wait，Fail 行永不重投；多监听方还共用同一行状态且 version_lock 不自增，
+	// 后写覆盖先写。会话面清理的重试由 space_member_removal_cleanup 工单承担，
+	// 不走这条事件。
+	SpaceMemberRemove string = "space.member.remove"
 )
 
 // Event 事件

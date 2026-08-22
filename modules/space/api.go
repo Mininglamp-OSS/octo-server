@@ -75,6 +75,8 @@ func (s *Space) checkSpaceActive(c *wkhttp.Context, spaceId string) bool {
 func (s *Space) Route(r *wkhttp.WKHttp) {
 	// 启动时加载已知 spaceId 到 ParseChannelID 缓存
 	s.loadKnownSpaceIDs()
+	// 成员移除后的会话面清理 worker（当前：退出该 Space 下的全部群），按工单重试
+	s.startMemberRemovalCleanupWorker()
 
 	auth := r.Group("/v1/space", s.ctx.AuthMiddleware(r))
 	{
@@ -594,11 +596,15 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 		return
 	}
 
-	err = s.db.disbandSpace(spaceId)
+	removed, err := s.db.disbandSpace(spaceId, loginUID)
 	if err != nil {
+		s.Error("解散空间失败", zap.Error(err), zap.String("spaceId", spaceId))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
+	// 刷新 ParseChannelID 缓存，与管理端强制解散一致
+	go s.loadKnownSpaceIDs()
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonSpaceDisbanded)
 	c.ResponseOK()
 }
 
@@ -850,24 +856,41 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		respondSpaceRequestInvalid(c, "")
 		return
 	}
+	// 与管理端同一个上限。此前用户侧完全没有上限：一次请求里每个 uid 都要跑一个
+	// 独立事务 + 一次 Redis DEL + 一条工单插入，几万个 uid 就能把一个连接和
+	// worker 队列压满。
+	if len(req.UIDs) > managerMaxBatchUIDs {
+		respondSpaceBatchTooLarge(c, managerMaxBatchUIDs)
+		return
+	}
 
+	// 只收集**真的被移除**的成员：removeMemberLocked 对「行本来就不存在」也返回
+	// nil error，拿它去清缓存 / 发事件会对着非成员空跑一整套收尾。
+	removed := make([]string, 0, len(req.UIDs))
 	for _, uid := range req.UIDs {
 		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
 		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
 		// 防止 pre-check 后目标被并发转让升为 owner 仍被移除（PR #339 review）。
-		if err = s.db.removeMemberLocked(spaceId, uid, member.Role); err != nil {
+		ok, err := s.db.removeMemberLocked(spaceId, uid, member.Role, loginUID, MemberRemoveReasonKicked)
+		if err != nil {
 			if errors.Is(err, ErrCannotRemoveOwner) || errors.Is(err, ErrRemoveHierarchy) {
 				continue
 			}
 			s.Error("移除空间成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("uid", uid))
+			// 前面几个已经各自提交了（removeMemberLocked 一人一事务），中途失败
+			// 直接 return 会把他们的收尾整个丢掉——鉴权缓存留着 "1" 最长 60s，
+			// 人已被移除却还能通过 SpaceMiddleware。而且客户端重试整批时，
+			// 这些人的 removeMemberLocked 返回 ok=false，缓存也补不回来。
+			s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
+		if ok {
+			removed = append(removed, uid)
+		}
 	}
-	// 失效通知成员缓存
-	if event.SpaceMemberCacheInvalidator != nil {
-		event.SpaceMemberCacheInvalidator(spaceId)
-	}
+	// 整批一次收尾：鉴权缓存逐个同步失效，事件与清理 worker 合并到一个后台 goroutine。
+	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
 	c.ResponseOK()
 }
 
@@ -895,7 +918,7 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 	}
 
 	// 锁内重读角色：pre-check 与移除之间可能被并发转让升为 owner（PR #339 review）
-	err = s.db.removeMemberLocked(spaceId, loginUID, 2)
+	removed, err := s.db.removeMemberLocked(spaceId, loginUID, 2, loginUID, MemberRemoveReasonLeft)
 	if err != nil {
 		if errors.Is(err, ErrCannotRemoveOwner) {
 			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
@@ -905,9 +928,8 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	// 失效通知成员缓存
-	if event.SpaceMemberCacheInvalidator != nil {
-		event.SpaceMemberCacheInvalidator(spaceId)
+	if removed {
+		s.afterMemberRemoved(spaceId, loginUID, loginUID, MemberRemoveReasonLeft)
 	}
 	c.ResponseOK()
 }

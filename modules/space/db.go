@@ -59,9 +59,45 @@ func (d *DB) querySpaceByID(spaceId string) (*SpaceModel, error) {
 // 该 helper 提供事务 + SELECT ... FOR UPDATE + sentinel error 的 TOCTOU 安全语义，
 // 用户侧 handler 通过 Space.mdb 直接调用，无需在 DB 层另起一份。
 
-func (d *DB) disbandSpace(spaceId string) error {
-	_, err := d.session.Update("space").Set("status", 0).Set("updated_at", time.Now()).Where("space_id=?", spaceId).Exec()
-	return err
+// disbandSpace 群主解散自己的空间。
+//
+// 与管理端 forceDisbandSpace 同语义：把空间与全部活跃成员一起置 0，并在同一事务内
+// 为每个成员写出会话面清理工单，返回本次真正被移除的成员供调用方做缓存失效。
+//
+// 此前这里只翻 space.status，成员行原样留着 status=1 —— 于是解散后成员仍留在该
+// 空间的所有群里，WuKongIM 的群订阅也原样保留：空间已经"不存在"了，群消息却照收照发。
+// 用户侧解散是比管理端强制解散常见得多的路径，不能只接后者。
+func (d *DB) disbandSpace(spaceId, operatorUID string) ([]string, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 加锁读在两条 UPDATE 之前：普通 SELECT 是快照读，与随后的当前读 UPDATE
+	// 之间并发加入的成员会被置 0 却拿不到清理工单。
+	// 与 forceDisbandSpace 同样的边界：这只挡住「被置 0 却无工单」，挡不住
+	// 「等本事务提交后再插入、于是没被置 0 也无工单」的孤儿。详见那里的说明。
+	uids, err := lockActiveMemberUIDsTx(tx, spaceId)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	if _, err = tx.Update("space").Set("status", 0).Set("updated_at", now).
+		Where("space_id=?", spaceId).Exec(); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Update("space_member").Set("status", 0).Set("updated_at", now).
+		Where("space_id=? AND status=1", spaceId).Exec(); err != nil {
+		return nil, err
+	}
+	if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceId, uids, operatorUID, MemberRemoveReasonSpaceDisbanded); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return uids, nil
 }
 
 // queryMySpaces 查询用户加入的所有空间（带角色和成员数）
@@ -243,8 +279,8 @@ func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
 
 // removeMemberLocked 锁内重读角色后移除成员，防并发转让产生无主空间，
 // 见 db_manager.go removeMemberLocked。
-func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int) error {
-	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove)
+func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, operatorUID, reason string) (bool, error) {
+	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
 }
 
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
