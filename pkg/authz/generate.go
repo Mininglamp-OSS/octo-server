@@ -147,6 +147,53 @@ func generateGo(contract generatedContract) ([]byte, error) {
 	}
 	output.WriteString("}\n\n")
 	output.WriteString("func IsKnownPermission(key string) bool {\n\t_, ok := GeneratedPermissions[key]\n\treturn ok\n}\n")
+	output.WriteString("\nconst (\n")
+	operationIdentifiers := make(map[string]string, len(contract.Operations))
+	for _, operation := range contract.Operations {
+		identifier := "Operation" + permissionIdentifier(operation.ID)
+		if previous, exists := operationIdentifiers[identifier]; exists {
+			return nil, fmt.Errorf("operation IDs %q and %q generate duplicate Go identifier %q", previous, operation.ID, identifier)
+		}
+		operationIdentifiers[identifier] = operation.ID
+		fmt.Fprintf(&output, "\t%s = %q\n", identifier, operation.ID)
+	}
+	output.WriteString(")\n\n")
+	output.WriteString("type GeneratedOperationMetadata struct {\n")
+	output.WriteString("\tMethod string\n\tPath string\n\tModule string\n\tHandler string\n\tPermission string\n\tGateSites []string\n\tScope Scope\n\tBusinessACL *BusinessACL\n")
+	output.WriteString("}\n\n")
+	output.WriteString("var generatedOperations = map[string]GeneratedOperationMetadata{\n")
+	for _, operation := range contract.Operations {
+		fmt.Fprintf(&output, "\t%q: {Method: %q, Path: %q, Module: %q, Handler: %q, Permission: %q, GateSites: []string{",
+			operation.ID, operation.Method, operation.Path, operation.Module, operation.Handler, operation.Permission)
+		for i, gateSite := range operation.GateSites {
+			if i > 0 {
+				output.WriteString(", ")
+			}
+			fmt.Fprintf(&output, "%q", gateSite)
+		}
+		output.WriteString("}, Scope: ")
+		fmt.Fprintf(&output, "%q", operation.Scope)
+		if operation.BusinessACL == nil {
+			output.WriteString("},\n")
+			continue
+		}
+		fmt.Fprintf(&output, ", BusinessACL: &BusinessACL{Type: %q, Description: %q}},\n",
+			operation.BusinessACL.Type, operation.BusinessACL.Description)
+	}
+	output.WriteString("}\n\n")
+	output.WriteString(`func LookupOperation(id string) (GeneratedOperationMetadata, bool) {
+	metadata, ok := generatedOperations[id]
+	if !ok {
+		return GeneratedOperationMetadata{}, false
+	}
+	metadata.GateSites = append([]string(nil), metadata.GateSites...)
+	if metadata.BusinessACL != nil {
+		acl := *metadata.BusinessACL
+		metadata.BusinessACL = &acl
+	}
+	return metadata, true
+}
+`)
 	formatted, err := format.Source([]byte(output.String()))
 	if err != nil {
 		return nil, fmt.Errorf("format generated Go: %w", err)

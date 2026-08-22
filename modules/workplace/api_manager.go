@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	adminrbac "github.com/Mininglamp-OSS/octo-server/modules/admin_rbac"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/log"
@@ -21,17 +22,51 @@ import (
 type manager struct {
 	ctx *config.Context
 	log.Log
-	db   *managerDB
-	wpDB *db
+	db     *managerDB
+	wpDB   *db
+	shadow workplaceShadowObserver
 }
+
+type workplaceShadowObserver interface {
+	Observe(uid, operationID string, legacyAllowed bool)
+}
+
+const (
+	workplaceOperationCategoryCreate     = "workplace.category.create"
+	workplaceOperationCategoryList       = "workplace.category.list"
+	workplaceOperationCategoryReorder    = "workplace.category.reorder"
+	workplaceOperationCategoryDelete     = "workplace.category.delete"
+	workplaceOperationCategoryUpdate     = "workplace.category.update"
+	workplaceOperationCategoryAppList    = "workplace.category_app.list"
+	workplaceOperationCategoryAppReorder = "workplace.category_app.reorder"
+	workplaceOperationCategoryAppCreate  = "workplace.category_app.create"
+	workplaceOperationCategoryAppDelete  = "workplace.category_app.delete"
+	workplaceOperationAppCreate          = "workplace.app.create"
+	workplaceOperationAppList            = "workplace.app.list"
+	workplaceOperationAppUpdate          = "workplace.app.update"
+	workplaceOperationAppDelete          = "workplace.app.delete"
+	workplaceOperationBannerCreate       = "workplace.banner.create"
+	workplaceOperationBannerList         = "workplace.banner.list"
+	workplaceOperationBannerDelete       = "workplace.banner.delete"
+	workplaceOperationBannerUpdate       = "workplace.banner.update"
+	workplaceOperationBannerReorder      = "workplace.banner.reorder"
+)
 
 func NewManager(ctx *config.Context) *manager {
 	return &manager{
-		ctx:  ctx,
-		Log:  log.NewTLog("Workplace_manager"),
-		db:   newManagerDB(ctx),
-		wpDB: newDB(ctx),
+		ctx:    ctx,
+		Log:    log.NewTLog("Workplace_manager"),
+		db:     newManagerDB(ctx),
+		wpDB:   newDB(ctx),
+		shadow: adminrbac.NewWorkplaceShadowObserver(ctx),
 	}
+}
+
+func (m *manager) observeWorkplaceShadow(c *wkhttp.Context, operationID string, legacyErr error) {
+	if m.shadow == nil || c == nil {
+		return
+	}
+	m.shadow.Observe(c.GetLoginUID(), operationID, legacyErr == nil)
 }
 
 // Route 路由配置
@@ -62,6 +97,7 @@ func (m *manager) Route(r *wkhttp.WKHttp) {
 // 排序横幅
 func (m *manager) reorderBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationBannerReorder, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -111,6 +147,7 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 // 编辑分类
 func (m *manager) updateCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryUpdate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -152,6 +189,7 @@ func (m *manager) updateCategory(c *wkhttp.Context) {
 // 删除分类
 func (m *manager) deleteCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryDelete, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -172,6 +210,7 @@ func (m *manager) deleteCategory(c *wkhttp.Context) {
 
 func (m *manager) getApps(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
+	m.observeWorkplaceShadow(c, workplaceOperationAppList, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -236,6 +275,7 @@ func (m *manager) getApps(c *wkhttp.Context) {
 
 func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppDelete, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -261,6 +301,7 @@ func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 
 func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppCreate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -366,6 +407,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 }
 func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppReorder, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -423,6 +465,7 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 
 func (m *manager) getCategoryApps(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppList, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -462,6 +505,7 @@ func (m *manager) getCategoryApps(c *wkhttp.Context) {
 
 func (m *manager) updateBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationBannerUpdate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -503,6 +547,7 @@ func (m *manager) updateBanner(c *wkhttp.Context) {
 
 func (m *manager) getBanners(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
+	m.observeWorkplaceShadow(c, workplaceOperationBannerList, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -533,6 +578,7 @@ func (m *manager) getBanners(c *wkhttp.Context) {
 
 func (m *manager) deleteBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationBannerDelete, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -553,6 +599,7 @@ func (m *manager) deleteBanner(c *wkhttp.Context) {
 
 func (m *manager) getCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryList, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -578,6 +625,7 @@ func (m *manager) getCategory(c *wkhttp.Context) {
 
 func (m *manager) addBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationBannerCreate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -613,6 +661,7 @@ func (m *manager) addBanner(c *wkhttp.Context) {
 }
 func (m *manager) updateApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationAppUpdate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -662,6 +711,7 @@ func (m *manager) updateApp(c *wkhttp.Context) {
 
 func (m *manager) deleteApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationAppDelete, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -732,6 +782,7 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 
 func (m *manager) reorderCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryReorder, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -780,6 +831,7 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 
 func (m *manager) addApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationAppCreate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return
@@ -827,6 +879,7 @@ func (m *manager) addApp(c *wkhttp.Context) {
 
 func (m *manager) addCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
+	m.observeWorkplaceShadow(c, workplaceOperationCategoryCreate, err)
 	if err != nil {
 		respondWorkplaceForbidden(c)
 		return

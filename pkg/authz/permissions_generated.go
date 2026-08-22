@@ -201,3 +201,293 @@ func IsKnownPermission(key string) bool {
 	_, ok := GeneratedPermissions[key]
 	return ok
 }
+
+const (
+	OperationAppBotAvatarUpdate              = "app_bot.avatar.update"
+	OperationAppBotCreate                    = "app_bot.create"
+	OperationAppBotDelete                    = "app_bot.delete"
+	OperationAppBotDetail                    = "app_bot.detail"
+	OperationAppBotList                      = "app_bot.list"
+	OperationAppBotPublish                   = "app_bot.publish"
+	OperationAppBotTokenReveal               = "app_bot.token.reveal"
+	OperationAppBotTokenRotate               = "app_bot.token.rotate"
+	OperationAppBotUnpublish                 = "app_bot.unpublish"
+	OperationAppBotUpdate                    = "app_bot.update"
+	OperationBackupConfigGet                 = "backup.config.get"
+	OperationBackupConfigTest                = "backup.config.test"
+	OperationBackupConfigUpdate              = "backup.config.update"
+	OperationBackupDownload                  = "backup.download"
+	OperationBackupHistoryDelete             = "backup.history.delete"
+	OperationBackupHistoryList               = "backup.history.list"
+	OperationBackupStatusGet                 = "backup.status.get"
+	OperationBackupTrigger                   = "backup.trigger"
+	OperationCardTemplateActivate            = "card_template.activate"
+	OperationCardTemplateAudit               = "card_template.audit"
+	OperationCardTemplateBlock               = "card_template.block"
+	OperationCardTemplateDetail              = "card_template.detail"
+	OperationCardTemplatePublish             = "card_template.publish"
+	OperationCardTemplateRollback            = "card_template.rollback"
+	OperationCardTemplateValidate            = "card_template.validate"
+	OperationCommonAppConfigGet              = "common.app_config.get"
+	OperationCommonAppConfigUpdate           = "common.app_config.update"
+	OperationCommonAppModuleCreate           = "common.app_module.create"
+	OperationCommonAppModuleDelete           = "common.app_module.delete"
+	OperationCommonAppModuleGet              = "common.app_module.get"
+	OperationCommonAppModuleUpdate           = "common.app_module.update"
+	OperationCommonAppVersionCreate          = "common.app_version.create"
+	OperationCommonAppVersionList            = "common.app_version.list"
+	OperationCommonSystemSettingList         = "common.system_setting.list"
+	OperationCommonSystemSettingTestEmail    = "common.system_setting.test_email"
+	OperationCommonSystemSettingUpdate       = "common.system_setting.update"
+	OperationDashboardChannelMembersRead     = "dashboard.channel_members.read"
+	OperationDashboardDirectChatActivityRead = "dashboard.direct_chat_activity.read"
+	OperationDashboardEtlRun                 = "dashboard.etl.run"
+	OperationDashboardOverviewRead           = "dashboard.overview.read"
+	OperationDashboardSpaceChannelsRead      = "dashboard.space_channels.read"
+	OperationDashboardSpacesRead             = "dashboard.spaces.read"
+	OperationDashboardTrendRead              = "dashboard.trend.read"
+	OperationGroupBlacklistList              = "group.blacklist.list"
+	OperationGroupDisabledList               = "group.disabled.list"
+	OperationGroupForbiddenUpdate            = "group.forbidden.update"
+	OperationGroupList                       = "group.list"
+	OperationGroupMemberForceRemove          = "group.member.force_remove"
+	OperationGroupMemberList                 = "group.member.list"
+	OperationGroupStatusUpdate               = "group.status.update"
+	OperationIntegrationOidcClientUpdate     = "integration.oidc_client.update"
+	OperationMessageBroadcast                = "message.broadcast"
+	OperationMessageDelete                   = "message.delete"
+	OperationMessageDirectHistoryList        = "message.direct_history.list"
+	OperationMessageHistoryList              = "message.history.list"
+	OperationMessageOutboundList             = "message.outbound.list"
+	OperationMessageProhibitedWordCreate     = "message.prohibited_word.create"
+	OperationMessageProhibitedWordDelete     = "message.prohibited_word.delete"
+	OperationMessageProhibitedWordList       = "message.prohibited_word.list"
+	OperationMessageSend                     = "message.send"
+	OperationMessageSendFriends              = "message.send_friends"
+	OperationReportList                      = "report.list"
+	OperationRobotDelete                     = "robot.delete"
+	OperationRobotDetail                     = "robot.detail"
+	OperationRobotList                       = "robot.list"
+	OperationRobotMenuDelete                 = "robot.menu.delete"
+	OperationRobotMenuList                   = "robot.menu.list"
+	OperationRobotStatusUpdate               = "robot.status.update"
+	OperationRobotTokenRevoke                = "robot.token.revoke"
+	OperationRobotUpdate                     = "robot.update"
+	OperationSpaceCreate                     = "space.create"
+	OperationSpaceDestroy                    = "space.destroy"
+	OperationSpaceDetail                     = "space.detail"
+	OperationSpaceDisabledList               = "space.disabled.list"
+	OperationSpaceInviteCreate               = "space.invite.create"
+	OperationSpaceInviteDisable              = "space.invite.disable"
+	OperationSpaceInviteList                 = "space.invite.list"
+	OperationSpaceInviteUpdate               = "space.invite.update"
+	OperationSpaceJoinRequestApprove         = "space.join_request.approve"
+	OperationSpaceJoinRequestList            = "space.join_request.list"
+	OperationSpaceJoinRequestReject          = "space.join_request.reject"
+	OperationSpaceList                       = "space.list"
+	OperationSpaceMemberAdd                  = "space.member.add"
+	OperationSpaceMemberList                 = "space.member.list"
+	OperationSpaceMemberRemove               = "space.member.remove"
+	OperationSpaceMemberRoleUpdate           = "space.member.role_update"
+	OperationSpaceOwnerInviteCreate          = "space.owner_invite.create"
+	OperationSpaceOwnerInviteList            = "space.owner_invite.list"
+	OperationSpaceOwnerInviteRevoke          = "space.owner_invite.revoke"
+	OperationSpaceStatusUpdate               = "space.status.update"
+	OperationSpaceUpdate                     = "space.update"
+	OperationUserAdminCreate                 = "user.admin.create"
+	OperationUserAdminDelete                 = "user.admin.delete"
+	OperationUserAdminList                   = "user.admin.list"
+	OperationUserBlacklistList               = "user.blacklist.list"
+	OperationUserCreate                      = "user.create"
+	OperationUserDashboardReaderGrant        = "user.dashboard_reader.grant"
+	OperationUserDashboardReaderList         = "user.dashboard_reader.list"
+	OperationUserDashboardReaderRevoke       = "user.dashboard_reader.revoke"
+	OperationUserDeviceList                  = "user.device.list"
+	OperationUserDisabledList                = "user.disabled.list"
+	OperationUserFriendList                  = "user.friend.list"
+	OperationUserList                        = "user.list"
+	OperationUserMarketAdminGrant            = "user.market_admin.grant"
+	OperationUserMarketAdminList             = "user.market_admin.list"
+	OperationUserMarketAdminRevoke           = "user.market_admin.revoke"
+	OperationUserOnlineList                  = "user.online.list"
+	OperationUserPasswordReset               = "user.password.reset"
+	OperationUserPasswordUpdate              = "user.password.update"
+	OperationUserPhoneShadowBackfill         = "user.phone_shadow.backfill"
+	OperationUserPhoneShadowStatus           = "user.phone_shadow.status"
+	OperationUserStatusUpdate                = "user.status.update"
+	OperationWorkplaceAppCreate              = "workplace.app.create"
+	OperationWorkplaceAppDelete              = "workplace.app.delete"
+	OperationWorkplaceAppList                = "workplace.app.list"
+	OperationWorkplaceAppUpdate              = "workplace.app.update"
+	OperationWorkplaceBannerCreate           = "workplace.banner.create"
+	OperationWorkplaceBannerDelete           = "workplace.banner.delete"
+	OperationWorkplaceBannerList             = "workplace.banner.list"
+	OperationWorkplaceBannerReorder          = "workplace.banner.reorder"
+	OperationWorkplaceBannerUpdate           = "workplace.banner.update"
+	OperationWorkplaceCategoryCreate         = "workplace.category.create"
+	OperationWorkplaceCategoryDelete         = "workplace.category.delete"
+	OperationWorkplaceCategoryList           = "workplace.category.list"
+	OperationWorkplaceCategoryReorder        = "workplace.category.reorder"
+	OperationWorkplaceCategoryUpdate         = "workplace.category.update"
+	OperationWorkplaceCategoryAppCreate      = "workplace.category_app.create"
+	OperationWorkplaceCategoryAppDelete      = "workplace.category_app.delete"
+	OperationWorkplaceCategoryAppList        = "workplace.category_app.list"
+	OperationWorkplaceCategoryAppReorder     = "workplace.category_app.reorder"
+)
+
+type GeneratedOperationMetadata struct {
+	Method      string
+	Path        string
+	Module      string
+	Handler     string
+	Permission  string
+	GateSites   []string
+	Scope       Scope
+	BusinessACL *BusinessACL
+}
+
+var generatedOperations = map[string]GeneratedOperationMetadata{
+	"app_bot.avatar.update":               {Method: "POST", Path: "/v1/users/:uid/avatar", Module: "user", Handler: "User.uploadAvatar", Permission: "app_bot.avatar.update", GateSites: []string{"modules/user/api.go::User.uploadAvatar#1"}, Scope: "global_admin_with_business_acl", BusinessACL: &BusinessACL{Type: "self_or_user_bot_creator_or_bot_owner_or_space_admin", Description: "非全局管理员时继续执行 human self-service、User Bot creator、Bot owner 或 Space admin 业务 ACL"}},
+	"app_bot.create":                      {Method: "POST", Path: "/v1/admin/app_bot", Module: "app_bot", Handler: "AppBot.createPlatformBot", Permission: "app_bot.create", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.createPlatformBot#1"}, Scope: "global_admin"},
+	"app_bot.delete":                      {Method: "DELETE", Path: "/v1/admin/app_bot/:id", Module: "app_bot", Handler: "AppBot.deleteBot", Permission: "app_bot.delete", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.deleteBot#1"}, Scope: "global_admin"},
+	"app_bot.detail":                      {Method: "GET", Path: "/v1/admin/app_bot/:id", Module: "app_bot", Handler: "AppBot.getBotDetail", Permission: "app_bot.read", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.getBotDetail#1"}, Scope: "global_admin"},
+	"app_bot.list":                        {Method: "GET", Path: "/v1/admin/app_bot", Module: "app_bot", Handler: "AppBot.listPlatformBots", Permission: "app_bot.read", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.listPlatformBots#1"}, Scope: "global_admin"},
+	"app_bot.publish":                     {Method: "POST", Path: "/v1/admin/app_bot/:id/publish", Module: "app_bot", Handler: "AppBot.publishBot", Permission: "app_bot.publish", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.publishBot#1"}, Scope: "global_admin"},
+	"app_bot.token.reveal":                {Method: "POST", Path: "/v1/admin/app_bot/:id/token/reveal", Module: "app_bot", Handler: "AppBot.revealToken", Permission: "app_bot.token.reveal", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.revealToken#1"}, Scope: "global_admin"},
+	"app_bot.token.rotate":                {Method: "POST", Path: "/v1/admin/app_bot/:id/token", Module: "app_bot", Handler: "AppBot.rotateToken", Permission: "app_bot.token.rotate", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.rotateToken#1"}, Scope: "global_admin"},
+	"app_bot.unpublish":                   {Method: "POST", Path: "/v1/admin/app_bot/:id/unpublish", Module: "app_bot", Handler: "AppBot.unpublishBot", Permission: "app_bot.unpublish", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.unpublishBot#1"}, Scope: "global_admin"},
+	"app_bot.update":                      {Method: "PUT", Path: "/v1/admin/app_bot/:id", Module: "app_bot", Handler: "AppBot.updateBot", Permission: "app_bot.update", GateSites: []string{"modules/app_bot/app_bot.go::AppBot.updateBot#1"}, Scope: "global_admin"},
+	"backup.config.get":                   {Method: "GET", Path: "/v1/manager/backup/config", Module: "backup", Handler: "Manager.getConfig", Permission: "backup.config.read", GateSites: []string{"modules/backup/api_manager.go::Manager.getConfig#1"}, Scope: "global_admin"},
+	"backup.config.test":                  {Method: "POST", Path: "/v1/manager/backup/config/test", Module: "backup", Handler: "Manager.testConnection", Permission: "backup.config.test", GateSites: []string{"modules/backup/api_manager.go::Manager.testConnection#1"}, Scope: "global_admin"},
+	"backup.config.update":                {Method: "PUT", Path: "/v1/manager/backup/config", Module: "backup", Handler: "Manager.updateConfig", Permission: "backup.config.write", GateSites: []string{"modules/backup/api_manager.go::Manager.updateConfig#1"}, Scope: "global_admin"},
+	"backup.download":                     {Method: "GET", Path: "/v1/manager/backup/history/:id/download", Module: "backup", Handler: "Manager.getDownloadURL", Permission: "backup.download", GateSites: []string{"modules/backup/api_manager.go::Manager.getDownloadURL#1"}, Scope: "global_admin"},
+	"backup.history.delete":               {Method: "DELETE", Path: "/v1/manager/backup/history/:id", Module: "backup", Handler: "Manager.deleteHistory", Permission: "backup.history.delete", GateSites: []string{"modules/backup/api_manager.go::Manager.deleteHistory#1"}, Scope: "global_admin"},
+	"backup.history.list":                 {Method: "GET", Path: "/v1/manager/backup/history", Module: "backup", Handler: "Manager.getHistory", Permission: "backup.history.read", GateSites: []string{"modules/backup/api_manager.go::Manager.getHistory#1"}, Scope: "global_admin"},
+	"backup.status.get":                   {Method: "GET", Path: "/v1/manager/backup/status", Module: "backup", Handler: "Manager.getStatus", Permission: "backup.status.read", GateSites: []string{"modules/backup/api_manager.go::Manager.getStatus#1"}, Scope: "global_admin"},
+	"backup.trigger":                      {Method: "POST", Path: "/v1/manager/backup/trigger", Module: "backup", Handler: "Manager.triggerBackup", Permission: "backup.trigger", GateSites: []string{"modules/backup/api_manager.go::Manager.triggerBackup#1"}, Scope: "global_admin"},
+	"card_template.activate":              {Method: "PUT", Path: "/v1/manager/card-templates/:id/active", Module: "card_template_catalog", Handler: "API.activate", Permission: "card_template.activate", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.audit":                 {Method: "GET", Path: "/v1/manager/card-templates/:id/audit", Module: "card_template_catalog", Handler: "API.audit", Permission: "card_template.audit.read", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.block":                 {Method: "POST", Path: "/v1/manager/card-templates/:id/block", Module: "card_template_catalog", Handler: "API.block", Permission: "card_template.block", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.detail":                {Method: "GET", Path: "/v1/manager/card-templates/:id", Module: "card_template_catalog", Handler: "API.detail", Permission: "card_template.read", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.publish":               {Method: "POST", Path: "/v1/manager/card-templates/publish", Module: "card_template_catalog", Handler: "API.publish", Permission: "card_template.publish", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.rollback":              {Method: "POST", Path: "/v1/manager/card-templates/:id/rollback", Module: "card_template_catalog", Handler: "API.rollback", Permission: "card_template.rollback", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"card_template.validate":              {Method: "POST", Path: "/v1/manager/card-templates/validate", Module: "card_template_catalog", Handler: "API.validate", Permission: "card_template.validate", GateSites: []string{"modules/card_template_catalog/api.go::API.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"common.app_config.get":               {Method: "GET", Path: "/v1/manager/common/appconfig", Module: "common", Handler: "Manager.appconfig", Permission: "app_config.read", GateSites: []string{"modules/common/api_manager.go::Manager.appconfig#1"}, Scope: "global_admin"},
+	"common.app_config.update":            {Method: "POST", Path: "/v1/manager/common/appconfig", Module: "common", Handler: "Manager.updateConfig", Permission: "app_config.write", GateSites: []string{"modules/common/api_manager.go::Manager.updateConfig#1"}, Scope: "global_admin"},
+	"common.app_module.create":            {Method: "POST", Path: "/v1/manager/common/appmodule", Module: "common", Handler: "Manager.addAppModule", Permission: "app_module.write", GateSites: []string{"modules/common/api_manager.go::Manager.addAppModule#1"}, Scope: "global_admin"},
+	"common.app_module.delete":            {Method: "DELETE", Path: "/v1/manager/common/:sid/appmodule", Module: "common", Handler: "Manager.deleteAppModule", Permission: "app_module.write", GateSites: []string{"modules/common/api_manager.go::Manager.deleteAppModule#1"}, Scope: "global_admin"},
+	"common.app_module.get":               {Method: "GET", Path: "/v1/manager/common/appmodule", Module: "common", Handler: "Manager.getAppModule", Permission: "app_module.read", GateSites: []string{"modules/common/api_manager.go::Manager.getAppModule#1"}, Scope: "global_admin"},
+	"common.app_module.update":            {Method: "PUT", Path: "/v1/manager/common/appmodule", Module: "common", Handler: "Manager.updateAppModule", Permission: "app_module.write", GateSites: []string{"modules/common/api_manager.go::Manager.updateAppModule#1"}, Scope: "global_admin"},
+	"common.app_version.create":           {Method: "POST", Path: "/v1/common/appversion", Module: "common", Handler: "Common.addAppVersion", Permission: "app_version.write", GateSites: []string{"modules/common/api.go::Common.addAppVersion#1"}, Scope: "global_admin"},
+	"common.app_version.list":             {Method: "GET", Path: "/v1/common/appversion/list", Module: "common", Handler: "Common.appVersionList", Permission: "app_version.read", GateSites: []string{"modules/common/api.go::Common.appVersionList#1"}, Scope: "global_admin"},
+	"common.system_setting.list":          {Method: "GET", Path: "/v1/manager/common/system_setting", Module: "common", Handler: "Manager.listSystemSettings", Permission: "system_setting.read", GateSites: []string{"modules/common/api_manager_system_setting.go::Manager.listSystemSettings#1"}, Scope: "global_admin"},
+	"common.system_setting.test_email":    {Method: "POST", Path: "/v1/manager/common/system_setting/test_email", Module: "common", Handler: "Manager.testSystemSettingEmail", Permission: "system_setting.write", GateSites: []string{"modules/common/api_manager_system_setting.go::Manager.testSystemSettingEmail#1"}, Scope: "global_admin"},
+	"common.system_setting.update":        {Method: "POST", Path: "/v1/manager/common/system_setting", Module: "common", Handler: "Manager.updateSystemSettings", Permission: "system_setting.write", GateSites: []string{"modules/common/api_manager_system_setting.go::Manager.updateSystemSettings#1"}, Scope: "global_admin"},
+	"dashboard.channel_members.read":      {Method: "GET", Path: "/v1/manager/dashboard/channels/:channel_id/members", Module: "opanalytics", Handler: "Manager.channelMembers", Permission: "dashboard.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"dashboard.direct_chat_activity.read": {Method: "GET", Path: "/v1/manager/dashboard/global/direct-chats", Module: "opanalytics", Handler: "Manager.globalDirectChats", Permission: "dashboard.direct_chat_activity.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"dashboard.etl.run":                   {Method: "POST", Path: "/v1/manager/dashboard/etl/run", Module: "opanalytics", Handler: "Manager.runETL", Permission: "dashboard.etl.trigger", GateSites: []string{"modules/opanalytics/api.go::Manager.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"dashboard.overview.read":             {Method: "GET", Path: "/v1/manager/dashboard/overview", Module: "opanalytics", Handler: "Manager.overview", Permission: "dashboard.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"dashboard.space_channels.read":       {Method: "GET", Path: "/v1/manager/dashboard/spaces/:space_id/channels", Module: "opanalytics", Handler: "Manager.spaceChannels", Permission: "dashboard.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"dashboard.spaces.read":               {Method: "GET", Path: "/v1/manager/dashboard/spaces", Module: "opanalytics", Handler: "Manager.spaces", Permission: "dashboard.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"dashboard.trend.read":                {Method: "GET", Path: "/v1/manager/dashboard/trend", Module: "opanalytics", Handler: "Manager.trend", Permission: "dashboard.read", GateSites: []string{"modules/opanalytics/api.go::Manager.requireDashboardRead#1"}, Scope: "global_admin"},
+	"group.blacklist.list":                {Method: "GET", Path: "/v1/manager/groups/:group_no/members/blacklist", Module: "group", Handler: "Manager.blacklist", Permission: "group.read", GateSites: []string{"modules/group/api_manager.go::Manager.blacklist#1"}, Scope: "global_admin"},
+	"group.disabled.list":                 {Method: "GET", Path: "/v1/manager/group/disablelist", Module: "group", Handler: "Manager.disablelist", Permission: "group.read", GateSites: []string{"modules/group/api_manager.go::Manager.disablelist#1"}, Scope: "global_admin"},
+	"group.forbidden.update":              {Method: "PUT", Path: "/v1/manager/groups/:group_no/forbidden/:on", Module: "group", Handler: "Manager.forbidden", Permission: "group.write", GateSites: []string{"modules/group/api_manager.go::Manager.forbidden#1"}, Scope: "global_admin"},
+	"group.list":                          {Method: "GET", Path: "/v1/manager/group/list", Module: "group", Handler: "Manager.list", Permission: "group.read", GateSites: []string{"modules/group/api_manager.go::Manager.list#1"}, Scope: "global_admin"},
+	"group.member.force_remove":           {Method: "DELETE", Path: "/v1/manager/groups/:group_no/members", Module: "group", Handler: "Manager.removeMember", Permission: "group.member.remove", GateSites: []string{"modules/group/api_manager.go::Manager.removeMember#1"}, Scope: "global_admin"},
+	"group.member.list":                   {Method: "GET", Path: "/v1/manager/groups/:group_no/members", Module: "group", Handler: "Manager.members", Permission: "group.read", GateSites: []string{"modules/group/api_manager.go::Manager.members#1"}, Scope: "global_admin"},
+	"group.status.update":                 {Method: "PUT", Path: "/v1/manager/group/liftban/:groupNo/:status", Module: "group", Handler: "Manager.leftbangroup", Permission: "group.write", GateSites: []string{"modules/group/api_manager.go::Manager.leftbangroup#1"}, Scope: "global_admin"},
+	"integration.oidc_client.update":      {Method: "PUT", Path: "/v1/manager/integrations/oidc/client", Module: "integration", Handler: "Integration.upsertManagerClient", Permission: "integration.oidc_client.write", GateSites: []string{"modules/integration/api.go::Integration.upsertManagerClient#1"}, Scope: "global_admin"},
+	"message.broadcast":                   {Method: "POST", Path: "/v1/manager/message/sendall", Module: "message", Handler: "Manager.sendMsgToAllUsers", Permission: "message.broadcast.send", GateSites: []string{"modules/message/api_manager.go::Manager.sendMsgToAllUsers#1"}, Scope: "global_admin"},
+	"message.delete":                      {Method: "DELETE", Path: "/v1/manager/message", Module: "message", Handler: "Manager.delete", Permission: "message.delete", GateSites: []string{"modules/message/api_manager.go::Manager.delete#1"}, Scope: "global_admin"},
+	"message.direct_history.list":         {Method: "GET", Path: "/v1/manager/message/recordpersonal", Module: "message", Handler: "Manager.recordpersonal", Permission: "message.direct_history.read", GateSites: []string{"modules/message/api_manager.go::Manager.recordpersonal#1"}, Scope: "global_admin"},
+	"message.history.list":                {Method: "GET", Path: "/v1/manager/message/record", Module: "message", Handler: "Manager.record", Permission: "message.history.read", GateSites: []string{"modules/message/api_manager.go::Manager.record#1"}, Scope: "global_admin"},
+	"message.outbound.list":               {Method: "GET", Path: "/v1/manager/message", Module: "message", Handler: "Manager.list", Permission: "message.outbound.read", GateSites: []string{"modules/message/api_manager.go::Manager.list#1"}, Scope: "global_admin"},
+	"message.prohibited_word.create":      {Method: "POST", Path: "/v1/manager/message/prohibit_words", Module: "message", Handler: "Manager.addProhibitWords", Permission: "message.prohibited_word.write", GateSites: []string{"modules/message/api_manager.go::Manager.addProhibitWords#1"}, Scope: "global_admin"},
+	"message.prohibited_word.delete":      {Method: "DELETE", Path: "/v1/manager/message/prohibit_words", Module: "message", Handler: "Manager.deleteProhibitWords", Permission: "message.prohibited_word.write", GateSites: []string{"modules/message/api_manager.go::Manager.deleteProhibitWords#1"}, Scope: "global_admin"},
+	"message.prohibited_word.list":        {Method: "GET", Path: "/v1/manager/message/prohibit_words", Module: "message", Handler: "Manager.prohibitWords", Permission: "message.prohibited_word.read", GateSites: []string{"modules/message/api_manager.go::Manager.prohibitWords#1"}, Scope: "global_admin"},
+	"message.send":                        {Method: "POST", Path: "/v1/manager/message/send", Module: "message", Handler: "Manager.sendMsg", Permission: "message.send", GateSites: []string{"modules/message/api_manager.go::Manager.sendMsg#1"}, Scope: "global_admin"},
+	"message.send_friends":                {Method: "POST", Path: "/v1/manager/message/sendfriends", Module: "message", Handler: "Manager.sendMsgToFriends", Permission: "message.impersonated.send", GateSites: []string{"modules/message/api_manager.go::Manager.sendMsgToFriends#1"}, Scope: "global_admin"},
+	"report.list":                         {Method: "GET", Path: "/v1/manager/report/list", Module: "report", Handler: "Manager.reportList", Permission: "report.read", GateSites: []string{"modules/report/api_manager.go::Manager.reportList#1"}, Scope: "global_admin"},
+	"robot.delete":                        {Method: "DELETE", Path: "/v1/manager/robots/:robot_id", Module: "robot", Handler: "Manager.robotDelete", Permission: "robot.delete", GateSites: []string{"modules/robot/api_manager.go::Manager.robotDelete#1"}, Scope: "global_admin"},
+	"robot.detail":                        {Method: "GET", Path: "/v1/manager/robots/:robot_id", Module: "robot", Handler: "Manager.robotDetail", Permission: "robot.read", GateSites: []string{"modules/robot/api_manager.go::Manager.robotDetail#1"}, Scope: "global_admin"},
+	"robot.list":                          {Method: "GET", Path: "/v1/manager/robots", Module: "robot", Handler: "Manager.robotList", Permission: "robot.read", GateSites: []string{"modules/robot/api_manager.go::Manager.robotList#1"}, Scope: "global_admin"},
+	"robot.menu.delete":                   {Method: "DELETE", Path: "/v1/manager/robot/:robot_id/:id", Module: "robot", Handler: "Manager.delete", Permission: "robot.menu.write", GateSites: []string{"modules/robot/api_manager.go::Manager.delete#1"}, Scope: "global_admin"},
+	"robot.menu.list":                     {Method: "GET", Path: "/v1/manager/robot/menus", Module: "robot", Handler: "Manager.list", Permission: "robot.menu.read", GateSites: []string{"modules/robot/api_manager.go::Manager.list#1"}, Scope: "global_admin"},
+	"robot.status.update":                 {Method: "PUT", Path: "/v1/manager/robot/status/:robot_id/:status", Module: "robot", Handler: "Manager.updateRobotStatus", Permission: "robot.status.write", GateSites: []string{"modules/robot/api_manager.go::Manager.updateRobotStatus#1"}, Scope: "global_admin"},
+	"robot.token.revoke":                  {Method: "POST", Path: "/v1/manager/robots/:robot_id/revoke_token", Module: "robot", Handler: "Manager.robotRevokeToken", Permission: "robot.token.revoke", GateSites: []string{"modules/robot/api_manager.go::Manager.robotRevokeToken#1"}, Scope: "global_admin"},
+	"robot.update":                        {Method: "PUT", Path: "/v1/manager/robots/:robot_id", Module: "robot", Handler: "Manager.robotUpdate", Permission: "robot.update", GateSites: []string{"modules/robot/api_manager.go::Manager.robotUpdate#1"}, Scope: "global_admin"},
+	"space.create":                        {Method: "POST", Path: "/v1/manager/spaces", Module: "space", Handler: "Manager.create", Permission: "space.create", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.destroy":                       {Method: "DELETE", Path: "/v1/manager/spaces/:space_id", Module: "space", Handler: "Manager.forceDisband", Permission: "space.destroy", GateSites: []string{"modules/space/api_manager.go::Manager.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"space.detail":                        {Method: "GET", Path: "/v1/manager/spaces/:space_id", Module: "space", Handler: "Manager.detail", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.disabled.list":                 {Method: "GET", Path: "/v1/manager/spaces/disabled", Module: "space", Handler: "Manager.disableList", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.invite.create":                 {Method: "POST", Path: "/v1/manager/spaces/:space_id/invites", Module: "space", Handler: "Manager.createInvite", Permission: "space.invite.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.invite.disable":                {Method: "DELETE", Path: "/v1/manager/spaces/:space_id/invites/:code", Module: "space", Handler: "Manager.disableInvite", Permission: "space.invite.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.invite.list":                   {Method: "GET", Path: "/v1/manager/spaces/:space_id/invites", Module: "space", Handler: "Manager.listInvites", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.invite.update":                 {Method: "PUT", Path: "/v1/manager/spaces/:space_id/invites/:code", Module: "space", Handler: "Manager.updateInvite", Permission: "space.invite.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.join_request.approve":          {Method: "POST", Path: "/v1/manager/spaces/:space_id/join-applies/:id/approve", Module: "space", Handler: "Manager.approveJoinApply", Permission: "space.join_request.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.join_request.list":             {Method: "GET", Path: "/v1/manager/spaces/:space_id/join-applies", Module: "space", Handler: "Manager.listJoinApplies", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.join_request.reject":           {Method: "POST", Path: "/v1/manager/spaces/:space_id/join-applies/:id/reject", Module: "space", Handler: "Manager.rejectJoinApply", Permission: "space.join_request.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.list":                          {Method: "GET", Path: "/v1/manager/spaces", Module: "space", Handler: "Manager.list", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.member.add":                    {Method: "POST", Path: "/v1/manager/spaces/:space_id/members", Module: "space", Handler: "Manager.addMembers", Permission: "space.member.add", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.member.list":                   {Method: "GET", Path: "/v1/manager/spaces/:space_id/members", Module: "space", Handler: "Manager.members", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.member.remove":                 {Method: "DELETE", Path: "/v1/manager/spaces/:space_id/members", Module: "space", Handler: "Manager.removeMembers", Permission: "space.member.remove", GateSites: []string{"modules/space/api_manager.go::Manager.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"space.member.role_update":            {Method: "PUT", Path: "/v1/manager/spaces/:space_id/members/:uid/role", Module: "space", Handler: "Manager.updateMemberRole", Permission: "space.member.role.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"space.owner_invite.create":           {Method: "POST", Path: "/v1/manager/spaces/invites", Module: "space", Handler: "Manager.createSpaceOwnerEmailInvite", Permission: "space.owner_invite.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.owner_invite.list":             {Method: "GET", Path: "/v1/manager/spaces/invites", Module: "space", Handler: "Manager.listSpaceOwnerEmailInvites", Permission: "space.read", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.owner_invite.revoke":           {Method: "DELETE", Path: "/v1/manager/spaces/invites/:id", Module: "space", Handler: "Manager.revokeSpaceOwnerEmailInvite", Permission: "space.owner_invite.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"space.status.update":                 {Method: "PUT", Path: "/v1/manager/spaces/:space_id/status/:status", Module: "space", Handler: "Manager.liftBan", Permission: "space.status.write", GateSites: []string{"modules/space/api_manager.go::Manager.requireSuperAdmin#1"}, Scope: "global_admin"},
+	"space.update":                        {Method: "PUT", Path: "/v1/manager/spaces/:space_id", Module: "space", Handler: "Manager.updateSpaceProfile", Permission: "space.update", GateSites: []string{"modules/space/api_manager.go::Manager.requireAdmin#1"}, Scope: "global_admin"},
+	"user.admin.create":                   {Method: "POST", Path: "/v1/manager/user/admin", Module: "user", Handler: "Manager.addAdminUser", Permission: "user.admin.manage", GateSites: []string{"modules/user/api_manager.go::Manager.addAdminUser#1"}, Scope: "global_admin"},
+	"user.admin.delete":                   {Method: "DELETE", Path: "/v1/manager/user/admin", Module: "user", Handler: "Manager.deleteAdminUsers", Permission: "user.admin.manage", GateSites: []string{"modules/user/api_manager.go::Manager.deleteAdminUsers#1"}, Scope: "global_admin"},
+	"user.admin.list":                     {Method: "GET", Path: "/v1/manager/user/admin", Module: "user", Handler: "Manager.getAdminUsers", Permission: "user.admin.manage", GateSites: []string{"modules/user/api_manager.go::Manager.getAdminUsers#1"}, Scope: "global_admin"},
+	"user.blacklist.list":                 {Method: "GET", Path: "/v1/manager/user/blacklist", Module: "user", Handler: "Manager.blacklist", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.blacklist#1"}, Scope: "global_admin"},
+	"user.create":                         {Method: "POST", Path: "/v1/manager/user/add", Module: "user", Handler: "Manager.addUser", Permission: "user.create", GateSites: []string{"modules/user/api_manager.go::Manager.addUser#1"}, Scope: "global_admin"},
+	"user.dashboard_reader.grant":         {Method: "PUT", Path: "/v1/manager/user/:uid/dashboard-read", Module: "user", Handler: "Manager.grantDashboardRead", Permission: "user.fixed_role.write", GateSites: []string{"modules/user/api_manager.go::Manager.setFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.dashboard_reader.list":          {Method: "GET", Path: "/v1/manager/user/dashboard-read", Module: "user", Handler: "Manager.listDashboardReaders", Permission: "user.fixed_role.read", GateSites: []string{"modules/user/api_manager.go::Manager.listUsersWithFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.dashboard_reader.revoke":        {Method: "DELETE", Path: "/v1/manager/user/:uid/dashboard-read", Module: "user", Handler: "Manager.revokeDashboardRead", Permission: "user.fixed_role.write", GateSites: []string{"modules/user/api_manager.go::Manager.setFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.device.list":                    {Method: "GET", Path: "/v1/manager/user/devices", Module: "user", Handler: "Manager.devices", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.devices#1"}, Scope: "global_admin"},
+	"user.disabled.list":                  {Method: "GET", Path: "/v1/manager/user/disablelist", Module: "user", Handler: "Manager.disableUsers", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.disableUsers#1"}, Scope: "global_admin"},
+	"user.friend.list":                    {Method: "GET", Path: "/v1/manager/user/friends", Module: "user", Handler: "Manager.friends", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.friends#1"}, Scope: "global_admin"},
+	"user.list":                           {Method: "GET", Path: "/v1/manager/user/list", Module: "user", Handler: "Manager.list", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.list#1"}, Scope: "global_admin"},
+	"user.market_admin.grant":             {Method: "PUT", Path: "/v1/manager/user/:uid/market-admin", Module: "user", Handler: "Manager.grantMarketAdmin", Permission: "user.fixed_role.write", GateSites: []string{"modules/user/api_manager.go::Manager.setFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.market_admin.list":              {Method: "GET", Path: "/v1/manager/user/market-admin", Module: "user", Handler: "Manager.listMarketAdmins", Permission: "user.fixed_role.read", GateSites: []string{"modules/user/api_manager.go::Manager.listUsersWithFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.market_admin.revoke":            {Method: "DELETE", Path: "/v1/manager/user/:uid/market-admin", Module: "user", Handler: "Manager.revokeMarketAdmin", Permission: "user.fixed_role.write", GateSites: []string{"modules/user/api_manager.go::Manager.setFixedManagerRole#1"}, Scope: "global_admin"},
+	"user.online.list":                    {Method: "GET", Path: "/v1/manager/user/online", Module: "user", Handler: "Manager.online", Permission: "user.read", GateSites: []string{"modules/user/api_manager.go::Manager.online#1"}, Scope: "global_admin"},
+	"user.password.reset":                 {Method: "POST", Path: "/v1/manager/user/resetpassword", Module: "user", Handler: "Manager.resetUserPassword", Permission: "user.password.reset", GateSites: []string{"modules/user/api_manager.go::Manager.resetUserPassword#1"}, Scope: "global_admin"},
+	"user.password.update":                {Method: "POST", Path: "/v1/manager/user/updatepassword", Module: "user", Handler: "Manager.updatePwd", Permission: "user.password.update", GateSites: []string{"modules/user/api_manager.go::Manager.updatePwd#1"}, Scope: "global_admin"},
+	"user.phone_shadow.backfill":          {Method: "POST", Path: "/v1/manager/user/phone_shadow_backfill", Module: "user", Handler: "Manager.phoneShadowBackfill", Permission: "user.phone_shadow.backfill", GateSites: []string{"modules/user/api_manager.go::Manager.phoneShadowBackfill#1"}, Scope: "global_admin"},
+	"user.phone_shadow.status":            {Method: "GET", Path: "/v1/manager/user/phone_shadow_backfill", Module: "user", Handler: "Manager.phoneShadowBackfillStatus", Permission: "user.phone_shadow.read", GateSites: []string{"modules/user/api_manager.go::Manager.phoneShadowBackfillStatus#1"}, Scope: "global_admin"},
+	"user.status.update":                  {Method: "PUT", Path: "/v1/manager/user/liftban/:uid/:status", Module: "user", Handler: "Manager.liftBanUser", Permission: "user.status.write", GateSites: []string{"modules/user/api_manager.go::Manager.liftBanUser#1"}, Scope: "global_admin"},
+	"workplace.app.create":                {Method: "POST", Path: "/v1/manager/workplace/app", Module: "workplace", Handler: "manager.addApp", Permission: "workplace.app.write", GateSites: []string{"modules/workplace/api_manager.go::manager.addApp#1"}, Scope: "global_admin"},
+	"workplace.app.delete":                {Method: "DELETE", Path: "/v1/manager/workplace/apps/:app_id", Module: "workplace", Handler: "manager.deleteApp", Permission: "workplace.app.write", GateSites: []string{"modules/workplace/api_manager.go::manager.deleteApp#1"}, Scope: "global_admin"},
+	"workplace.app.list":                  {Method: "GET", Path: "/v1/manager/workplace/app", Module: "workplace", Handler: "manager.getApps", Permission: "workplace.app.read", GateSites: []string{"modules/workplace/api_manager.go::manager.getApps#1"}, Scope: "global_admin"},
+	"workplace.app.update":                {Method: "PUT", Path: "/v1/manager/workplace/apps/:app_id", Module: "workplace", Handler: "manager.updateApp", Permission: "workplace.app.write", GateSites: []string{"modules/workplace/api_manager.go::manager.updateApp#1"}, Scope: "global_admin"},
+	"workplace.banner.create":             {Method: "POST", Path: "/v1/manager/workplace/banner", Module: "workplace", Handler: "manager.addBanner", Permission: "workplace.banner.write", GateSites: []string{"modules/workplace/api_manager.go::manager.addBanner#1"}, Scope: "global_admin"},
+	"workplace.banner.delete":             {Method: "DELETE", Path: "/v1/manager/workplace/banners/:banner_no", Module: "workplace", Handler: "manager.deleteBanner", Permission: "workplace.banner.write", GateSites: []string{"modules/workplace/api_manager.go::manager.deleteBanner#1"}, Scope: "global_admin"},
+	"workplace.banner.list":               {Method: "GET", Path: "/v1/manager/workplace/banner", Module: "workplace", Handler: "manager.getBanners", Permission: "workplace.banner.read", GateSites: []string{"modules/workplace/api_manager.go::manager.getBanners#1"}, Scope: "global_admin"},
+	"workplace.banner.reorder":            {Method: "PUT", Path: "/v1/manager/workplace/banner/reorder", Module: "workplace", Handler: "manager.reorderBanner", Permission: "workplace.banner.write", GateSites: []string{"modules/workplace/api_manager.go::manager.reorderBanner#1"}, Scope: "global_admin"},
+	"workplace.banner.update":             {Method: "PUT", Path: "/v1/manager/workplace/banners/:banner_no", Module: "workplace", Handler: "manager.updateBanner", Permission: "workplace.banner.write", GateSites: []string{"modules/workplace/api_manager.go::manager.updateBanner#1"}, Scope: "global_admin"},
+	"workplace.category.create":           {Method: "POST", Path: "/v1/manager/workplace/category", Module: "workplace", Handler: "manager.addCategory", Permission: "workplace.category.write", GateSites: []string{"modules/workplace/api_manager.go::manager.addCategory#1"}, Scope: "global_admin"},
+	"workplace.category.delete":           {Method: "DELETE", Path: "/v1/manager/workplace/categorys/:category_no", Module: "workplace", Handler: "manager.deleteCategory", Permission: "workplace.category.write", GateSites: []string{"modules/workplace/api_manager.go::manager.deleteCategory#1"}, Scope: "global_admin"},
+	"workplace.category.list":             {Method: "GET", Path: "/v1/manager/workplace/category", Module: "workplace", Handler: "manager.getCategory", Permission: "workplace.category.read", GateSites: []string{"modules/workplace/api_manager.go::manager.getCategory#1"}, Scope: "global_admin"},
+	"workplace.category.reorder":          {Method: "PUT", Path: "/v1/manager/workplace/category/reorder", Module: "workplace", Handler: "manager.reorderCategory", Permission: "workplace.category.write", GateSites: []string{"modules/workplace/api_manager.go::manager.reorderCategory#1"}, Scope: "global_admin"},
+	"workplace.category.update":           {Method: "PUT", Path: "/v1/manager/workplace/categorys/:category_no", Module: "workplace", Handler: "manager.updateCategory", Permission: "workplace.category.write", GateSites: []string{"modules/workplace/api_manager.go::manager.updateCategory#1"}, Scope: "global_admin"},
+	"workplace.category_app.create":       {Method: "POST", Path: "/v1/manager/workplace/categorys/:category_no/app", Module: "workplace", Handler: "manager.addCategoryApp", Permission: "workplace.app.write", GateSites: []string{"modules/workplace/api_manager.go::manager.addCategoryApp#1"}, Scope: "global_admin"},
+	"workplace.category_app.delete":       {Method: "DELETE", Path: "/v1/manager/workplace/categorys/:category_no/apps/:app_id", Module: "workplace", Handler: "manager.deleteCategoryApp", Permission: "workplace.app.write", GateSites: []string{"modules/workplace/api_manager.go::manager.deleteCategoryApp#1"}, Scope: "global_admin"},
+	"workplace.category_app.list":         {Method: "GET", Path: "/v1/manager/workplace/categorys/:category_no/app", Module: "workplace", Handler: "manager.getCategoryApps", Permission: "workplace.app.read", GateSites: []string{"modules/workplace/api_manager.go::manager.getCategoryApps#1"}, Scope: "global_admin"},
+	"workplace.category_app.reorder":      {Method: "PUT", Path: "/v1/manager/workplace/categorys/:category_no/app/reorder", Module: "workplace", Handler: "manager.reorderCategoryApp", Permission: "workplace.category_app.reorder", GateSites: []string{"modules/workplace/api_manager.go::manager.reorderCategoryApp#1"}, Scope: "global_admin"},
+}
+
+func LookupOperation(id string) (GeneratedOperationMetadata, bool) {
+	metadata, ok := generatedOperations[id]
+	if !ok {
+		return GeneratedOperationMetadata{}, false
+	}
+	metadata.GateSites = append([]string(nil), metadata.GateSites...)
+	if metadata.BusinessACL != nil {
+		acl := *metadata.BusinessACL
+		metadata.BusinessACL = &acl
+	}
+	return metadata, true
+}
