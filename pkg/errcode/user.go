@@ -582,6 +582,42 @@ var (
 		DefaultMessage: "Verification codes are being sent too frequently, please try again in a minute.",
 	})
 
+	// Management-console email MFA. The two 503 codes are internal so SMTP
+	// details and settings-load failures never reach the client.
+	ErrUserManagerMFASettingsUnavailable = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_settings_unavailable",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Management-console MFA settings are not ready.",
+		Internal:       true,
+	})
+	ErrUserManagerMFAMisconfigured = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_misconfigured",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Management-console MFA is temporarily unavailable.",
+		Internal:       true,
+	})
+	ErrUserManagerMFAChallengeInvalid = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_challenge_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The management-console MFA challenge is invalid or expired.",
+	})
+	ErrUserManagerMFACodeInvalid = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_code_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The management-console verification code is invalid.",
+	})
+	ErrUserManagerMFARateLimited = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_rate_limited",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "The management-console verification code cannot be sent yet. Please try again later.",
+		SafeDetailKeys: []string{"retry_after"},
+	})
+	ErrUserManagerMFAEmailRequired = register(codes.Code{
+		ID:             "err.server.user.manager_email_mfa_enable_email_required",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The operator must have a valid email address before enabling management-console MFA.",
+	})
+
 	// Username / Web3 signature login (modules/user/api_usernamelogin.go) codes.
 	// Reuse registration_closed / local_login_disabled / invalid_credentials /
 	// already_exists / not_found / current_not_found / login_locked /

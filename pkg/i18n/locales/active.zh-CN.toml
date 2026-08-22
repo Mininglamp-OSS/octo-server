@@ -48,6 +48,9 @@ other = "空间欢迎语配置无效，请检查目标空间是否存在且未�
 ["err.server.common.thread_archive_window_ordering"]
 other = "子区自动归档窗口不能短于最近会话的子区活跃窗口，否则子区会在活跃窗口生效前就被归档、导致该窗口的配置不起作用。请同时提交这两项，或先调大归档窗口。"
 
+["err.server.common.manager_mfa_smtp_invalid"]
+other = "管理控制台 MFA 所需的 SMTP 配置无效。"
+
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
 
@@ -383,6 +386,24 @@ other = "发送邮箱验证码失败。"
 
 ["err.server.user.email_rate_limited"]
 other = "验证码发送过于频繁，请 1 分钟后再试。"
+
+["err.server.user.manager_mfa_settings_unavailable"]
+other = "管理控制台 MFA 配置尚未就绪。"
+
+["err.server.user.manager_mfa_misconfigured"]
+other = "管理控制台 MFA 当前不可用。"
+
+["err.server.user.manager_mfa_challenge_invalid"]
+other = "管理控制台 MFA Challenge 无效或已过期。"
+
+["err.server.user.manager_mfa_code_invalid"]
+other = "管理控制台验证码无效。"
+
+["err.server.user.manager_mfa_rate_limited"]
+other = "管理控制台验证码发送过于频繁，请稍后再试。"
+
+["err.server.user.manager_email_mfa_enable_email_required"]
+other = "开启管理控制台 MFA 前，当前超管必须配置有效邮箱。"
 
 # ---- err.server.user.* (Phase 2.1 modules/user/api_usernamelogin.go migration) ----
 
