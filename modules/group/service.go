@@ -1045,8 +1045,23 @@ type RemoveGroupMembersServiceReq struct {
 	// SuppressRemoveNotice 抑制「被 X 移出群聊」系统消息，由调用方自行发更贴切的文案。
 	// 用于成员**自愿**离开却要走同一套移除流程的场景（如退出 Space 触发的级联退群）：
 	// 那里 Operator 就是本人，默认文案会渲染成「X 被 X 移出群聊」。
-	// 其余清理（IM 退订、CMD、子区/置顶/会话扩展、bot 级联）不受影响。
+	// 其余清理（IM 退订、CMD、子区/置顶/会话扩展、bot 连带移除本身）不受影响。
+	//
+	// **它不管 bot 连带移除的那条 Tip** —— 那是另一条群可见的持久化系统消息，
+	// 用下面两个字段单独控制。早先只有这一个开关时，主动退出和解散两种被抑制的
+	// 场景都仍然会发出「X 被移出群聊，其机器人 Y 已一并移除」，把这个开关要挡的
+	// 措辞又写进了群历史。
 	SuppressRemoveNotice bool
+
+	// BotCascadeTipAction 覆盖 bot 连带移除 Tip 里的动作词。
+	// 空串沿用默认的「被移出」，所以既有调用方行为不变；自愿离开的场景传「退出了」。
+	BotCascadeTipAction string
+
+	// SuppressBotCascadeTip 完全不发 bot 连带移除 Tip。
+	// 只在「通告本身已无意义」时用（Space 解散：群还在，但每个成员每个群各发一条，
+	// N×M 条堆给最后一个人看）。普通移除和自愿退出都**应该**发——群成员看见 bot
+	// 凭空消失，有权知道原因，这与「谁移出了谁」是两件事。
+	SuppressBotCascadeTip bool
 }
 
 // RemoveGroupMembersServiceResp 移除群成员响应。
@@ -1775,11 +1790,19 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		Bots       []*user.Model
 	}
 	// 按 uid 排序后再进锁循环：本函数在**同一个事务**里逐个 FOR UPDATE 锁成员行
-	// （LockRemovableMemberTx），持锁顺序由调用方传进来的名单顺序决定，是典型的
-	// ABBA 前提。同群上并发跑一次批量移除和一次群主交接
-	// （handOverGroupCreator 也锁 group_member 行），两边顺序不同就会死锁，
-	// 其中一方被 MySQL 回滚：清理工单会重试收敛，管理端批量踢人则直接 500。
-	// 固定成全局一致的 uid 升序，代价是一次排序，换掉整类顺序不一致。
+	// （LockRemovableMemberTx），持锁顺序由调用方传进来的名单顺序决定。
+	//
+	// 排序**只**让本函数的多次并发调用之间锁序一致（RGM ↔ RGM），
+	// **并没有关掉整类 ABBA**：handOverGroupCreator 也锁 group_member 行，
+	// 但它是「先锁离开者，再锁继任者扫描命中的行」，而那次扫描是
+	// `ORDER BY created_at LIMIT 1 FOR UPDATE`、group_member 上没有服务该排序的索引，
+	// 于是按存储序锁行，不是 uid 序。所以「同群上并发跑一次批量移除和一次群主交接」
+	// 这一对**仍然可能死锁**：T1 持 A 等 B，T2 扫描先锁到 B 再等 A。
+	// 后果有界（MySQL 回滚一方；清理工单重试收敛，管理端批量踢人得到可重试的 500），
+	// 但别把这次排序读成「这类问题已解决」。
+	//
+	// 真正关掉它需要让 handOverGroupCreator 也按 uid 序取那两把锁，并给
+	// (group_no, created_at) 补索引让继任者扫描不再锁全群 —— 都记在 follow-up。
 	//
 	// 注意排的是 removableMembers 而不是 req.Members —— 真正决定持锁顺序的是
 	// 这个循环的迭代顺序，而它来自 QueryMembersWithUids 的返回顺序，不是入参顺序。
@@ -1919,9 +1942,19 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 
 		// D-2 · 级联透明度：bot 被连带移除时发系统 Tip，避免"神秘消失"。
 		// 每个 leaver 单独发一条；若 leaver 没有 bot 则跳过。
-		for _, cl := range cascadedPerLeaver {
-			if err := sendBotCascadeRemovedTip(s.ctx, req.GroupNo, cl.LeaverName, "被移出", cl.Bots); err != nil {
-				s.Error("send bot cascade removed tip failed", zap.Error(err), zap.String("leaver", cl.LeaverName))
+		//
+		// 动作词跟着**离开方式**走，不能硬编码：这条 Tip 是 NoPersist=0 的群可见消息，
+		// 把一个自愿退出的人写成「被移出」会永久留在群历史里。空串沿用「被移出」，
+		// 既有调用方（管理端踢人、bot API）行为不变。
+		if !req.SuppressBotCascadeTip {
+			cascadeAction := req.BotCascadeTipAction
+			if cascadeAction == "" {
+				cascadeAction = "被移出"
+			}
+			for _, cl := range cascadedPerLeaver {
+				if err := sendBotCascadeRemovedTip(s.ctx, req.GroupNo, cl.LeaverName, cascadeAction, cl.Bots); err != nil {
+					s.Error("send bot cascade removed tip failed", zap.Error(err), zap.String("leaver", cl.LeaverName))
+				}
 			}
 		}
 

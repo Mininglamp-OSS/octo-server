@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: space-member-removal-cleanup"
-description: Make Space member removal actually close the conversation surface — emit a removal event, invalidate membership caches, cascade the member out of the Space's groups, and cut off DMs with peers who no longer share any Space.
+description: Make Space member removal actually take the member out of the Space's groups and sub-threads — a transactional outbox drives a leased, retried cascade, membership caches are invalidated in-request, and a removal event is emitted. The DM half was split out to space-member-dm-isolation.
 tags: [space, isolation, auth, acl, thread, concurrency, data-integrity, wire-contract, error-response, testing, commit]
 timestamp: 2026-08-21T01:56:05+00:00
 # --- octospec extension fields ---
@@ -251,10 +251,6 @@ Consequently:
   Partial completion must be retryable and idempotent, never leave a member
   half-removed from a group, and never emit side effects for a rolled-back
   removal.
-- **wire-contract** — a new Person-channel `ChannelResp` field and a new CMD
-  delivery to Person channels are additive client-facing contract changes. Older
-  clients must keep working: no existing field's meaning changes, and server-side
-  enforcement does not depend on the client honoring anything new.
 - **error-response** — removal handlers keep the existing localized envelope
   (`httperr.ResponseErrorL` + `pkg/errcode`); cascade failures are logged, not
   surfaced as new user-facing error codes. No raw `c.ResponseError` / `c.JSON`
@@ -380,10 +376,16 @@ Recorded so the diff can be read against the spec rather than against memory.
   leaver and then its successor. Same group, different orders, and MySQL aborts one:
   the cleanup job retries and converges, but the manager batch-kick path surfaces a 500.
   Sorting `removableMembers` (the iteration order, which comes from
-  `QueryMembersWithUids`, not from the request slice) fixes the ordering for one sort's
-  cost. Not reproduced as a deadlock — derived from the two lock orders; the successor
-  scan additionally has no usable index for its `ORDER BY created_at`, so it locks more
-  rows than it returns. That index is a follow-up.
+  `QueryMembersWithUids`, not from the request slice) makes `RemoveGroupMembers`
+  deterministic **with respect to itself**. It does **not** close the class: the
+  motivating pair — a batch removal against a concurrent `handOverGroupCreator` — is
+  still reachable, because the handover locks leaver-then-scan-order and its successor
+  scan (`ORDER BY created_at LIMIT 1 FOR UPDATE`) has no serving index, so it locks in
+  storage order rather than uid order, and locks more rows than it returns. Bounded
+  (MySQL aborts one side; the job retries to convergence, the manager path returns a
+  retryable 500). Closing it needs the same uid ordering in `handOverGroupCreator` plus
+  a `(group_no, created_at)` index — both follow-ups. Not reproduced as a deadlock:
+  derived from the two lock orders.
 - **A fifth removal path.** The owner-initiated disband was not in the original
   survey (see the path table). It now runs the same cascade.
 - **A batch cap on the user-facing endpoint (wire-visible).**

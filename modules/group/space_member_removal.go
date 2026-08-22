@@ -145,6 +145,12 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
 	suppressNotice := selfExit || spaceGone
 
+	// bot 连带移除的 Tip 动作词：自助退出说「退出了」，其余沿用默认的「被移出」。
+	cascadeAction := ""
+	if selfExit {
+		cascadeAction = "退出了"
+	}
+
 	resp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo: groupNo,
 		Members: []string{removal.UID},
@@ -153,6 +159,12 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		OperatorUID:          removal.OperatorUID,
 		OperatorName:         operatorName,
 		SuppressRemoveNotice: suppressNotice,
+		// bot 连带移除的 Tip 是另一条群可见持久化消息，单独控制：
+		//   - 自助退出：照发（群里看见 bot 消失，有权知道原因），但动作词换成「退出了」，
+		//     否则群历史里会留下一句「X 被移出群聊」，正是上面要抑制的那个措辞。
+		//   - 解散：整条不发，与上面同一个 N×M 理由。
+		BotCascadeTipAction:   cascadeAction,
+		SuppressBotCascadeTip: spaceGone,
 	})
 	if err != nil {
 		return fmt.Errorf("remove group member: %w", err)

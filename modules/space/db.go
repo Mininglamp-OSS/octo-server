@@ -76,6 +76,8 @@ func (d *DB) disbandSpace(spaceId, operatorUID string) ([]string, error) {
 
 	// 加锁读在两条 UPDATE 之前：普通 SELECT 是快照读，与随后的当前读 UPDATE
 	// 之间并发加入的成员会被置 0 却拿不到清理工单。
+	// 与 forceDisbandSpace 同样的边界：这只挡住「被置 0 却无工单」，挡不住
+	// 「等本事务提交后再插入、于是没被置 0 也无工单」的孤儿。详见那里的说明。
 	uids, err := lockActiveMemberUIDsTx(tx, spaceId)
 	if err != nil {
 		return nil, err

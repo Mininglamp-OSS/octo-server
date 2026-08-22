@@ -522,3 +522,120 @@ func TestGroupCascadeStillRunsAfterSpaceDisbanded(t *testing.T) {
 	_, stillIn := liveMemberRole(t, ctx, "g-disbanded", victim)
 	assert.False(t, stillIn, "空间已解散，级联必须照常把人清出群")
 }
+
+// seedInvitedBot 造一个「由 inviter 拉进群的 bot」，满足 QueryBotsInvitedByUIDTx 的三个条件：
+// group_member.robot=1 且未删除，robot 行 status=1，且 robot.creator_uid=inviter。
+func seedInvitedBot(t *testing.T, ctx *config.Context, groupNo, botUID, inviter, botName string) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT INTO group_member (group_no, uid, role, robot, invite_uid, is_deleted, version, created_at, updated_at) "+
+			"VALUES (?, ?, 0, 1, ?, 0, 1, NOW(), NOW())",
+		groupNo, botUID, inviter)
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
+		"INSERT INTO robot (robot_id, status, creator_uid, created_at, updated_at) VALUES (?, 1, ?, NOW(), NOW())",
+		botUID, inviter)
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
+		"INSERT INTO `user` (uid, name, created_at, updated_at) VALUES (?, ?, NOW(), NOW())",
+		botUID, botName)
+	require.NoError(t, err)
+}
+
+// TestGroupCascadeSelfExitBotTipSaysLeftNotRemoved 自助退出时，bot 连带移除的 Tip
+// 必须说「退出了」，不能说「被移出」。
+//
+// 这条 Tip 与被 SuppressRemoveNotice 抑制的那条是**不同**的消息，走不同的分支，
+// 而且是 NoPersist=0 的群可见持久化消息 —— 措辞错了会永久留在群历史里。
+// 早先 SuppressRemoveNotice 只包住了前一条，这条在门外、动作词还硬编码成「被移出」，
+// 于是主动退出的人在群历史里被写成「被移出群聊」，正是那个开关要挡的措辞。
+//
+// 既有的自助退出用例接不住这个：它断言的子串是「移除群聊」，而这条 Tip 发的是
+// 「被移出群聊」；而且整个级联测试里一个 bot 都没种过。
+func TestGroupCascadeSelfExitBotTipSaysLeftNotRemoved(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, leaver, bot = "sp-selfexit-bot", "u-leaver-bot", "bot-selfexit"
+
+	seedGroupInSpace(t, ctx, "g-selfexit-bot", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-selfexit-bot", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-selfexit-bot", leaver, MemberRoleCommon)
+	seedInvitedBot(t, ctx, "g-selfexit-bot", bot, leaver, "助手A")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: leaver,
+		OperatorUID: leaver, // 自助退出：操作者就是本人
+		Reason:      spacemod.MemberRemoveReasonLeft,
+	}))
+
+	// 前提：bot 确实被连带移除了，否则下面的断言是空转的。
+	_, botStillIn := liveMemberRole(t, ctx, "g-selfexit-bot", bot)
+	require.False(t, botStillIn, "前提：bot 应被连带移除")
+
+	payloads := stub.sentPayloads()
+	require.True(t, payloadsContain(payloads, "助手A"),
+		"前提：应发出 bot 连带移除 Tip，否则本用例什么都没验证, payloads=%v", payloads)
+	assert.False(t, payloadsContain(payloads, "被移出"),
+		"自助退出不得在群历史里写成「被移出」, payloads=%v", payloads)
+	assert.True(t, payloadsContain(payloads, "退出了群聊"),
+		"应说「退出了群聊」, payloads=%v", payloads)
+}
+
+// TestGroupCascadeDisbandSuppressesBotTip 解散时，bot 连带移除的 Tip 也要一并抑制。
+//
+// 抑制默认移除通告的理由是 N 成员 × M 群的消息风暴；这条 Tip 走的是另一个分支，
+// 早先不受抑制，于是同一场风暴照样发生，而且这条是持久化的。
+func TestGroupCascadeDisbandSuppressesBotTip(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, leaver, bot = "sp-disband-bot", "u-leaver-db", "bot-disband"
+
+	seedGroupInSpace(t, ctx, "g-disband-bot", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-disband-bot", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-disband-bot", leaver, MemberRoleCommon)
+	seedInvitedBot(t, ctx, "g-disband-bot", bot, leaver, "助手B")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: leaver,
+		OperatorUID: "u-admin",
+		Reason:      spacemod.MemberRemoveReasonSpaceDisbanded,
+	}))
+
+	// 清理照做：人和 bot 都出群。
+	_, stillIn := liveMemberRole(t, ctx, "g-disband-bot", leaver)
+	assert.False(t, stillIn)
+	_, botStillIn := liveMemberRole(t, ctx, "g-disband-bot", bot)
+	require.False(t, botStillIn, "前提：bot 应被连带移除")
+
+	// 但一条群消息都不该发。
+	payloads := stub.sentPayloads()
+	assert.False(t, payloadsContain(payloads, "助手B"),
+		"解散时不得发 bot 连带移除 Tip, payloads=%v", payloads)
+	assert.False(t, payloadsContain(payloads, "一并移除"),
+		"解散时不得发 bot 连带移除 Tip, payloads=%v", payloads)
+}
+
+// TestGroupCascadeKickStillSendsBotTip 反面：普通踢出仍然要发，且说「被移出」。
+// 没有这一条，把整个 Tip 删掉上面两个用例也会绿。
+func TestGroupCascadeKickStillSendsBotTip(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, kicked, bot = "sp-kick-bot", "u-kicked-bot", "bot-kick"
+
+	seedGroupInSpace(t, ctx, "g-kick-bot", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-kick-bot", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-kick-bot", kicked, MemberRoleCommon)
+	seedInvitedBot(t, ctx, "g-kick-bot", bot, kicked, "助手C")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: kicked,
+		OperatorUID: "u-owner",
+		Reason:      spacemod.MemberRemoveReasonKicked,
+	}))
+
+	payloads := stub.sentPayloads()
+	assert.True(t, payloadsContain(payloads, "助手C"),
+		"普通踢出仍要告知群里 bot 为何消失, payloads=%v", payloads)
+	assert.True(t, payloadsContain(payloads, "被移出群聊"),
+		"普通踢出的动作词仍是「被移出」, payloads=%v", payloads)
+}

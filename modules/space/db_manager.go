@@ -212,7 +212,13 @@ func (d *managerDB) forceDisbandSpace(spaceId string, operatorUID string) ([]str
 	// 顺序和锁都是必要的：普通 SELECT 在 REPEATABLE READ 下建立的是快照读，而后面
 	// 的 UPDATE 是当前读。两者之间若有成员并发加入，UPDATE 会把他一并置 0，但他不在
 	// 快照名单里 —— 于是没有清理工单、没有缓存失效，人被移出了一个已解散的空间，
-	// 却还留在该空间的所有群里、IM 群订阅也原封不动。加锁读把这个窗口关掉。
+	// 却还留在该空间的所有群里、IM 群订阅也原封不动。加锁读挡住的是这一种。
+	//
+	// 它**没有**关掉整个「解散期间并发加入」窗口：gap lock 只是让那次插入等到本事务
+	// 提交，之后它照样往一个 status=0 的空间里写一行 status=1，而且没有清理工单
+	// （joinPresetGroups 也不复核成员身份，人还可能落进已解散空间的预设群）。
+	// 那个孤儿过不了 SpaceMiddleware（谓词带 space.status），所以影响限于群内。
+	// 彻底关闭要让加入侧的事务在锁内复核 space.status，记在 follow-up。
 	uids, err := lockActiveMemberUIDsTx(tx, spaceId)
 	if err != nil {
 		return nil, err
