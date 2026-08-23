@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -509,4 +510,34 @@ func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, sta
 	if !ok {
 		s.Warn("成员移除清理工单租约已易主，放弃写入终态", zap.Uint64("jobId", job.ID))
 	}
+}
+
+// HasPendingRemovalCleanup 报告 (spaceID, uid) 是否还有未完成的移除清理工单。
+//
+// 给 group 侧的群主交接通告用：批量移除按 uid 逐条建工单
+// （enqueueMemberRemovalCleanupBatchTx），若被移除的几个人正好是同一个群里连续的元老，
+// 交接会沿元老顺序连锁 C→S2、S2→S3……每一环都想发一条「已成为新群主」，而前面那些
+// 在写下时就已作废。动手通告前先问一句「这位继任者自己是不是也在待移除队列里」，
+// 是就不发，链条自然只剩最后一环——那一环的继任者不在队列里，通告的是最终结果。
+//
+// 只看 pending（status=0）：
+//   - done 表示那条工单已跑完，人已经不在群里，本来也不会被选为继任者；
+//   - abandoned 表示重试耗尽、放弃了，这个人**不会**再被移除，所以该照常通告。
+//
+// 已知的保守失败方向：继任者若挂着一条更早的、卡住不动的 pending 工单，这里会误判成
+// 「他也要走」而少发一条通告。相比反过来（通告一个马上就作废的群主）这个方向更可接受，
+// 记在 brief 的 out-of-scope 里。
+func HasPendingRemovalCleanup(session *dbr.Session, spaceID, uid string) (bool, error) {
+	if spaceID == "" || uid == "" {
+		return false, nil
+	}
+	var count int
+	err := session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member_removal_cleanup WHERE space_id=? AND uid=? AND status=?",
+		spaceID, uid, removalCleanupPending,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

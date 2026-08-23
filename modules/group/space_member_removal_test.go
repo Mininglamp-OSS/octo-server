@@ -3,6 +3,7 @@ package group
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -28,6 +30,14 @@ type groupIMStub struct {
 	mu                sync.Mutex
 	subscriberRemoves []subscriberRemoveCall
 	sentMessages      []map[string]interface{}
+	failFragment      string // 非空时，content 含该片段的下一条 /message/send 返回 500
+}
+
+// failSendOnce 让 content 含 fragment 的下一条消息发送失败一次，用于验证 best-effort。
+func (s *groupIMStub) failSendOnce(fragment string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failFragment = fragment
 }
 
 type subscriberRemoveCall struct {
@@ -56,8 +66,24 @@ func newGroupIMStub(t *testing.T, ctx *config.Context) *groupIMStub {
 		var payload map[string]interface{}
 		_ = json.Unmarshal(body, &payload)
 		stub.mu.Lock()
-		stub.sentMessages = append(stub.sentMessages, payload)
+		shouldFail := false
+		if stub.failFragment != "" {
+			if raw, ok := payload["payload"]; ok {
+				if decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw)); err == nil &&
+					strings.Contains(string(decoded), stub.failFragment) {
+					shouldFail = true
+					stub.failFragment = "" // 只失败一次
+				}
+			}
+		}
+		if !shouldFail {
+			stub.sentMessages = append(stub.sentMessages, payload)
+		}
 		stub.mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		_, _ = w.Write([]byte(`{}`))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +256,33 @@ func payloadExtraField(payloads []map[string]interface{}, fragment, field, want 
 	return false
 }
 
+// payloadContentType 取含指定文案那条消息的 content type。
+// 「与手动转让同一个 content type」是本改动明确主张的契约，此前无任何测试钉住它——
+// 改成别的类型，所有断言照样绿（PR #804 review 指出）。
+func payloadContentType(payloads []map[string]interface{}, fragment string) int {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(inner["content"]), fragment) {
+			continue
+		}
+		if f, ok := inner["type"].(float64); ok {
+			return int(f)
+		}
+	}
+	return 0
+}
+
 func payloadExtraHasUID(payloads []map[string]interface{}, fragment, uid string) bool {
 	return payloadExtraField(payloads, fragment, "uid", uid)
 }
@@ -267,6 +320,28 @@ func payloadExtraUIDAt(payloads []map[string]interface{}, fragment string, idx i
 
 func payloadExtraHasName(payloads []map[string]interface{}, fragment, name string) bool {
 	return payloadExtraField(payloads, fragment, "name", name)
+}
+
+// seedPendingRemovals 写真实的 pending 清理工单，模拟「这些人同属一次批量移除」。
+// 交接通告要靠这张表判断继任者是不是也在待移除队列里，所以测试必须写真表，
+// 不能只调 cleanupSpaceMemberGroups 了事。
+func seedPendingRemovals(t *testing.T, ctx *config.Context, spaceID string, uids []string, reason string) {
+	t.Helper()
+	for _, uid := range uids {
+		_, err := ctx.DB().Exec(
+			"INSERT INTO space_member_removal_cleanup (space_id, uid, operator_uid, reason, status, created_at) "+
+				"VALUES (?, ?, 'su', ?, 0, NOW(3))", spaceID, uid, reason)
+		require.NoError(t, err)
+	}
+}
+
+// markRemovalDone 把某人的工单置为终态，模拟 worker 跑完了这一条。
+func markRemovalDone(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET status=1, finished_at=NOW(3) WHERE space_id=? AND uid=?",
+		spaceID, uid)
+	require.NoError(t, err)
 }
 
 // seedActiveSpaceMember 写一个活跃的 space + space_member，模拟「人已经回来了」。
@@ -584,16 +659,42 @@ func TestGroupCascadeCreatorHandoverIsAnnounced(t *testing.T) {
 		"extra[1] 必须是继任者")
 	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
 		"每群只发一条交接通告")
+	// 与手动转让同一个 content type —— 这是本改动明确主张的契约
+	assert.Equal(t, int(common.GroupTransferGrouper), payloadContentType(stub.sentPayloads(), "已成为新群主"),
+		"必须与手动转让路径用同一个 content type，否则同一件事会渲染成两种样子")
 }
 
-// TestGroupCascadeHandoverAnnouncedOncePerRetry 交接通告在工单重试下既不丢也不重发。
+// failingRemoveService 让 RemoveGroupMembers 前 N 次调用失败，其余透传给真实实现。
+// 内嵌 IService 拿到全部方法，只覆盖要注入故障的那一个。
+type failingRemoveService struct {
+	IService
+	failures int
+}
+
+func (f *failingRemoveService) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*RemoveGroupMembersServiceResp, error) {
+	if f.failures > 0 {
+		f.failures--
+		return nil, errors.New("injected failure after handover commit")
+	}
+	return f.IService.RemoveGroupMembers(req)
+}
+
+// TestGroupCascadeHandoverAnnouncedOncePerRetry 交接通告在「交接已提交、后续失败重试」下
+// 既不丢也不重发。
 //
-// 这是 review 挖出来的真 bug 的回归：通告原本放在 RemoveGroupMembers **之后**，
-// 而交接自己已经提交了事务。中间一旦失败，重试时读到的角色已是 MemberRoleCommon，
-// 交接分支不再进入，通告永久丢失——正好复现要修的那个「凭空多出新群主」。
+// 这条测试的前一版是**空的**（PR #804 review 实测）：它只是把整条清理跑两遍，而第二遍
+// queryGroupsWithMemberUIDAndSpaceID 因 is_deleted=0 过滤已返回空集，根本没再进入
+// exitSpaceMemberFromGroup —— 「行锁内看到已非 creator 直接返回」那条路径一次都没执行，
+// count==1 在两种实现下都平凡成立。把通告挪回调用方（= 修复前的排布）时它照样绿。
 //
-// 用「连跑两次」逼出重试语义：第二次 handOverGroupCreator 在行锁内看到已非 creator
-// 直接返回，所以总数必须仍是 1（不是 0，也不是 2）。
+// 现在用故障注入还原真实时序：第一轮 handOverGroupCreator 提交并通告，随后
+// RemoveGroupMembers 失败 → 整步返回错误 → 工单重试；第二轮离开者角色已是
+// MemberRoleCommon（仍在群里），交接分支不再进入。
+//
+// 这才能区分两种实现：
+//   - 在提交处发（现状）：第一轮已发出 → 共 1 条
+//   - 在调用方发（旧排布）：第一轮 RemoveGroupMembers 失败、发不到；第二轮不进交接分支
+//     → 共 0 条，永久丢失
 func TestGroupCascadeHandoverAnnouncedOncePerRetry(t *testing.T) {
 	ctx, g := cascadeSetup(t)
 	stub := newGroupIMStub(t, ctx)
@@ -609,11 +710,73 @@ func TestGroupCascadeHandoverAnnouncedOncePerRetry(t *testing.T) {
 		SpaceID: spaceID, UID: creator, OperatorUID: "su",
 		Reason: spacemod.MemberRemoveReasonForceRemoved,
 	}
+
+	// 第一轮：交接提交 + 通告，然后移除失败 → 整步报错
+	g.groupService = &failingRemoveService{IService: g.groupService, failures: 1}
+	require.Error(t, g.cleanupSpaceMemberGroups(ctx, removal),
+		"注入的失败必须让整步返回错误，否则不构成重试场景")
+
+	// 交接确实已提交，且离开者仍在群里（这正是重试要面对的中间态）
+	role, stillIn := liveMemberRole(t, ctx, "g-handover-retry", successor)
+	require.True(t, stillIn)
+	require.Equal(t, MemberRoleCreator, role, "交接应已提交")
+	leaverRole, leaverIn := liveMemberRole(t, ctx, "g-handover-retry", creator)
+	require.True(t, leaverIn, "移除失败，离开者应还在群里")
+	require.Equal(t, MemberRoleCommon, leaverRole, "离开者应已被降级")
+
+	// 第二轮（重试）：这次移除成功
 	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, removal))
-	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, removal)) // 重跑
+	_, stillInAfter := liveMemberRole(t, ctx, "g-handover-retry", creator)
+	assert.False(t, stillInAfter, "重试应完成移除")
 
 	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
-		"重试不得重复通告，也不得把它弄丢")
+		"跨重试恰好一条：不能丢（0）也不能重发（2）")
+}
+
+// TestGroupCascadeBatchHandoverAnnouncesOnce 批量移除时，一个群只发一条交接通告。
+//
+// 回归 PR #804 review 实测出的缺陷：批量移除按 uid 逐条建工单
+// （enqueueMemberRemovalCleanupBatchTx），若被移除的几个人正好是群里连续的元老，
+// 交接会沿元老顺序连锁：C→S2、S2→S3、S3→S4，一个群里三条「已成为新群主」，
+// 前两条在写下时就已作废。两个批量入口各自上限 200 uid，最坏 200 条。
+//
+// 这与解散被抑制的机制**完全相同**，只是触发方式不同。
+func TestGroupCascadeBatchHandoverAnnouncesOnce(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, gno = "sp-batch-handover", "g-batch-handover"
+
+	for _, u := range []string{"u-c", "u-s2", "u-s3", "u-s4"} {
+		seedUser(t, ctx, u, "名字"+u)
+	}
+	seedGroupInSpace(t, ctx, gno, spaceID, "u-c")
+	seedGroupMember(t, ctx, gno, "u-c", MemberRoleCreator)
+	// 逐条插入拉开 created_at，保证元老顺序确定（选主按 created_at ASC）
+	for _, u := range []string{"u-s2", "u-s3", "u-s4"} {
+		seedGroupMember(t, ctx, gno, u, MemberRoleCommon)
+	}
+
+	// 一次 3 人的批量移除：三条工单，且三人是元老前三
+	batch := []string{"u-c", "u-s2", "u-s3"}
+	seedPendingRemovals(t, ctx, spaceID, batch, spacemod.MemberRemoveReasonForceRemoved)
+	for _, uid := range batch {
+		require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+			SpaceID: spaceID, UID: uid, OperatorUID: "su",
+			Reason: spacemod.MemberRemoveReasonForceRemoved,
+		}))
+		markRemovalDone(t, ctx, spaceID, uid)
+	}
+
+	// 群主最终落到 u-s4
+	role, stillIn := liveMemberRole(t, ctx, gno, "u-s4")
+	require.True(t, stillIn)
+	assert.Equal(t, MemberRoleCreator, role, "群主应最终落到唯一留下的人")
+
+	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
+		"一个群只发一条交接通告，链条中间那些当场作废的不发")
+	// 发出的那条必须是**最终**结果，不是中间态
+	assert.Equal(t, "u-s4", payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 1),
+		"通告里的新群主必须是最终群主")
 }
 
 // TestGroupCascadeHandoverPrefersGroupRemark 交接通告用群内 remark 而非全局名。
@@ -637,6 +800,63 @@ func TestGroupCascadeHandoverPrefersGroupRemark(t *testing.T) {
 		"应使用群内 remark")
 	assert.False(t, payloadExtraHasName(stub.sentPayloads(), "已成为新群主", "全局大名"),
 		"不得回落到全局 user.name")
+}
+
+// TestGroupCascadeSelfExitTipPrefersGroupRemark 自助退群提示也用群内 remark。
+//
+// 这是 PR #804 review 指出的**越界改动**：把展示名解析改成 remark 优先时，
+// sendGroupExitTip 顺带被改了（此前只解析全局 user.name），brief 没写、也没测试钉。
+// 判断是保留它——与 groupExit / 花名册一致才是这个仓库的规则——但既然保留，就得钉住。
+func TestGroupCascadeSelfExitTipPrefersGroupRemark(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, leaver = "sp-exit-remark", "u-leaver"
+
+	seedUser(t, ctx, leaver, "全局大名")
+	seedGroupInSpace(t, ctx, "g-exit-remark", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-exit-remark", "u-owner", MemberRoleCreator)
+	seedGroupMemberWithRemark(t, ctx, "g-exit-remark", leaver, MemberRoleCommon, "群里叫我老李")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: leaver, OperatorUID: leaver,
+		Reason: spacemod.MemberRemoveReasonLeft,
+	}))
+
+	assert.True(t, payloadExtraHasName(stub.sentPayloads(), "退出群聊", "群里叫我老李"),
+		"退群提示应使用群内 remark")
+	assert.False(t, payloadExtraHasName(stub.sentPayloads(), "退出群聊", "全局大名"),
+		"不得回落到全局 user.name")
+}
+
+// TestGroupCascadeHandoverNoticeIsBestEffort 通告发送失败不影响交接与移除。
+//
+// PR #804 review 的非阻塞提醒：best-effort 这个决定没有任何测试钉住（IM 桩永远返回
+// 200）。有人把 g.Warn(...) 改成 return err，不会有测试变红——而那个改动并不能救回
+// 通告（重试时锁内读到已非 creator 直接返回），只会把成员移除一起拖住。
+func TestGroupCascadeHandoverNoticeIsBestEffort(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	stub.failSendOnce("已成为新群主") // 只让这一条通告发送失败
+
+	const spaceID, creator, successor = "sp-besteffort", "u-creator", "u-successor"
+	seedUser(t, ctx, creator, "老群主")
+	seedUser(t, ctx, successor, "新群主")
+	seedGroupInSpace(t, ctx, "g-besteffort", spaceID, creator)
+	seedGroupMember(t, ctx, "g-besteffort", creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-besteffort", successor, MemberRoleCommon)
+
+	// 通告失败**不得**让整步报错
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}), "通告是 best-effort，发不出去不该让工单重试")
+
+	// 交接与移除照常完成
+	role, stillIn := liveMemberRole(t, ctx, "g-besteffort", successor)
+	require.True(t, stillIn)
+	assert.Equal(t, MemberRoleCreator, role, "交接必须已提交")
+	_, leaverIn := liveMemberRole(t, ctx, "g-besteffort", creator)
+	assert.False(t, leaverIn, "移除必须完成")
 }
 
 // TestGroupCascadeLoneCreatorAnnouncesNoHandover 无人可继任时不得通告交接。

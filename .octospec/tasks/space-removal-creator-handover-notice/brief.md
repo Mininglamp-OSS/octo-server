@@ -92,8 +92,11 @@ records what its own PR shipped; this brief is the current statement.
   (`api.go transferGrouper` → `base/event/handler.go` → `SendGroupTransferGrouper`)
   already emits, so the cascade renders through the same client path.
 - **`{N}` + `extra` payload shape** — established for multi-name system messages;
-  `SendGroupMemberScanJoin` uses `“{0}”通过“{1}”的二维码加入群聊` with a
-  two-element `extra`.
+  `SendGroupMemberScanJoin` (type 1007) uses `“{0}”通过“{1}”的二维码加入群聊` with
+  a two-element `extra`. All three first-party clients substitute generically over
+  `extra.length` and none reads 1008 structurally — audited per-client in PR #804
+  review, which also flagged that Android's `MessageFormat` treats ASCII `'` as an
+  escape, a hazard for any future English translation.
 
 ## Behavior contract
 
@@ -129,15 +132,42 @@ Both names travel in `extra` behind placeholders and are **never concatenated
 into `content`**. That is what removes the injection surface: a display name is
 user-controlled (`group_member.remark` is settable by the member and by any group
 manager, with no content validation), and a name baked into a persisted,
-group-visible string could forge extra lines of "system notice". It also means a
-later rename does not leave a stale name in group history.
+group-visible string could forge extra lines of "system notice".
+
+It does **not** buy "a later rename leaves no stale name": all three first-party
+clients render `extra[i].name` directly and none re-resolves by uid, so a
+`NoPersist: 0` message keeps the name it was sent with. An earlier revision of
+this brief claimed otherwise (PR #804 review). The uid in `extra` makes
+re-resolution possible; nothing does it today.
 
 The payload is built in `modules/group` rather than by calling
 `SendGroupTransferGrouper`, because that primitive's text is fixed at the
 one-clause form and the cascade needs the cause stated. The content type is kept
 identical so one event does not render two ways.
 
+### Chain suppression
+
+Before announcing, the elected successor is checked against
+`space_member_removal_cleanup` for a `status=pending` row in the same Space
+(`spacemod.HasPendingRemovalCleanup`). If one exists, the handover still happens
+but the notice is skipped: this link is mid-chain and is about to be superseded.
+
+Only the final link — whose successor is not queued for removal — announces, and
+what it announces is the settled owner. The outcome does not depend on the order
+the jobs run in: within one batch, "the successor is not pending" holds for
+exactly one link whichever order they execute.
+
+`done` and `abandoned` do not suppress. `done` means that job already ran, so the
+member is no longer a live candidate anyway; `abandoned` means the removal gave
+up, so that member is staying and their handover is real.
+
 ### Display names
+
+**This also changes `sendGroupExitTip`**, which previously resolved the global
+`user.name` only. Keeping the change (consistency with `groupExit` and the roster
+is this repository's rule) rather than scoping it to the new path, and pinning it
+with a test — it arrived as a side effect of a parameter refactor and was
+unguarded until PR #804 review pointed it out.
 
 Group `remark` first, falling back to global `user.name`, falling back to uid —
 the repository's existing rule (`groupExit` resolves `loginMember.Remark` first;
@@ -185,8 +215,16 @@ exists.
   walking every group the member is in: 200 members across 50 groups is 10,000
   permanent group-visible messages — the same order as the disband case #795
   already suppresses for that reason. The removed member still gets the private
-  notice; the roster refreshes via CMD. Because the shipped notice fires only on
-  a creator handover, it is at most one per group regardless of batch size.
+  notice; the roster refreshes via CMD.
+
+  **Correction (PR #804 review).** An earlier revision of this brief claimed the
+  handover notice is "at most one per group regardless of batch size" because it
+  fires only on a handover. That was false, and measured false: a 3-uid batch
+  whose members are consecutive in one group's seniority list produced **three**
+  notices in that group (C→S2, S2→S3, S3→S4), the first two already obsolete when
+  written. It is the same chaining the disband path is suppressed for; only the
+  trigger differs. The invariant is now enforced rather than assumed — see
+  Behavior contract › Chain suppression.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
   `memberRemove` and `modules/bot_api/groups.go` reach the same
   `SendGroupMemberBeRemove`, so remaining members see nothing there either. Same
@@ -196,9 +234,21 @@ exists.
 - **Everything already deferred to #797** — the IM-unsubscribe leak, the residual
   ABBA and its missing index, the rejoin window.
 - **A bot as successor.** `querySecondOldestNonBotMemberTx` excludes only the
-  leaver's own active bots, so a third party's bot can be promoted and therefore
-  announced. Pre-existing selection behaviour, pinned by
-  `bot_cascade_test.go`; this task makes it visible but does not change it.
+  leaver's own active bots, so a third party's bot — or the leaver's own
+  *inactive* bot — can be promoted and therefore announced. Pre-existing
+  selection behaviour, deliberately pinned by
+  `TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft` ("他人的 bot 不在排除
+  范围内（与旧 QuerySecondOldestMember 语义一致）"); this task makes a previously
+  silent outcome visible but does not change the selection. `group_member.robot`
+  is populated (`service.go:1298`, `:1328`) so `gm.robot = 0` would be a one-line
+  fix, but reversing a deliberately pinned contract needs its own decision.
+
+- **A stale pending job suppressing a valid notice.** The chain check treats any
+  `status=pending` row for the successor as "they are leaving too". A successor
+  carrying an older, stuck pending job therefore loses their announcement. The
+  opposite failure — announcing an owner who is about to be removed — is worse,
+  so the check is deliberately biased this way. A DB error on the check is
+  treated as "not pending" and the notice is sent, for the same reason.
 
 ## Acceptance
 
@@ -208,8 +258,14 @@ All in `modules/group/space_member_removal_test.go`, all passing under
 - `TestGroupCascadeCreatorHandoverIsAnnounced` — a force-removed creator produces
   a group-visible message (no `subscribers`, no `visibles`) containing both
   clauses, with `extra[0]` the leaver and `extra[1]` the successor, exactly once.
-- `TestGroupCascadeHandoverAnnouncedOncePerRetry` — running the step twice yields
-  exactly one notice: not zero (lost on retry) and not two (duplicated).
+- `TestGroupCascadeHandoverAnnouncedOncePerRetry` — with `RemoveGroupMembers`
+  fault-injected to fail once *after* the handover commits, a retry yields exactly
+  one notice: not zero (lost) and not two (duplicated). **The first version of
+  this test was vacuous** (PR #804 review): it merely ran the step twice, and the
+  second run returned early at `queryGroupsWithMemberUIDAndSpaceID` because the
+  member row was already deleted, so the handover path was never re-entered and
+  `count == 1` held under either placement. The fault injection is what makes the
+  test discriminate.
 - `TestGroupCascadeHandoverPrefersGroupRemark` — the successor's group `remark`
   wins over the global `user.name`.
 - `TestGroupCascadeLoneCreatorAnnouncesNoHandover` — no successor, no notice.
@@ -220,6 +276,12 @@ All in `modules/group/space_member_removal_test.go`, all passing under
   removal produces **zero** group-visible messages carrying visible content
   (excluding the type=99 CMD), while the removed member's own private notice is
   still sent.
+- `TestGroupCascadeBatchHandoverAnnouncesOnce` — a 3-uid batch sharing one group
+  emits exactly one notice, naming the **final** owner rather than a mid-chain one.
+- `TestGroupCascadeSelfExitTipPrefersGroupRemark` — pins the `sendGroupExitTip`
+  display-name change this task makes (see below).
+- `TestGroupCascadeHandoverNoticeIsBestEffort` — a failing send does not fail the
+  job; the handover stays committed and the removal completes.
 - Pre-existing suppression guards still hold:
   `TestGroupCascadeSelfExitSuppressesRemovedNotice`,
   `TestGroupCascadeDisbandSuppressesPerMemberNotice`,

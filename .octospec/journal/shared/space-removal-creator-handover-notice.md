@@ -48,7 +48,7 @@ independent defects, and all eight disappeared when it was dropped:
 
 | finding | fate |
 |---|---|
-| N×M volume (200-uid batch × M groups = 10k permanent messages) | gone — handover-only is ≤1 per group |
+| N×M volume (200-uid batch × M groups = 10k permanent messages) | gone as a *per-member* flood; the residual handover chain surfaced in round 2 below |
 | `sanitizeTipName` missed U+2028/U+2029/U+202E/U+200B | gone — no interpolation left to sanitize |
 | a load-bearing comment claiming generic `Tip` has no `{0}`+`extra` precedent | gone — refuted, and the hand-rolled payload it justified is gone |
 | `RedDot: 0` + `NoUpdateConversation` left the "broadcast" with no UI signal | gone — 1008 carries `RedDot: 1` like every sibling |
@@ -76,8 +76,8 @@ the silent owner change the change existed to remove.
 Moving the announcement to the commit point inside `handOverGroupCreator` fixes
 it and is idempotent for free: a retry re-reads the role under the row lock, sees
 it is no longer the creator, and returns without re-announcing.
-`TestGroupCascadeHandoverAnnouncedOncePerRetry` pins exactly one notice across
-two runs — not zero, not two.
+`TestGroupCascadeHandoverAnnouncedOncePerRetry` pins this — though not in its
+first form, which review showed was vacuous; see round 2.
 
 ## Two things I got wrong, recorded so the next reader does not trust them
 
@@ -132,3 +132,75 @@ Two verification notes worth keeping:
   bot owned by someone else is an eligible successor, pinned as an existing
   contract by `bot_cascade_test.go`. This change makes a previously silent
   outcome publicly visible without altering the selection.
+
+## Round 2 — what PR #804 review found
+
+Two blocking findings, both **measured by the reviewers rather than argued**, and
+both reproduced here before being fixed.
+
+### The batch chain (P1-1)
+
+The brief and PR claimed the notice is "at most one per group regardless of batch
+size", reasoning that firing only on a handover bounds it. False. A batch removes
+uids independently (one cleanup job each), so when the removed members are
+consecutive in a group's seniority list the handover chains and each link
+announces. Measured with a 3-uid batch in one group:
+
+```
+group-visible 「已成为新群主」 in ONE group: 3   (claimed ≤1)
+   extra[0]=u-c  -> extra[1]=u-s2
+   extra[0]=u-s2 -> extra[1]=u-s3
+   extra[0]=u-s3 -> extra[1]=u-s4
+```
+
+The first two were already false when written. This is the same chaining the
+disband path is suppressed for — the reasoning transferred verbatim and I did not
+notice, despite having written that reasoning into the code comment myself.
+
+Fixed by checking whether the elected successor is itself `pending` in
+`space_member_removal_cleanup` before announcing. Mid-chain links stay silent; the
+final link announces the settled owner. Order-independent.
+
+### The vacuous guard (P1-2)
+
+`TestGroupCascadeHandoverAnnouncedOncePerRetry` did not test what it claimed.
+Running the step twice does not produce a retry: the second run returns early at
+`queryGroupsWithMemberUIDAndSpaceID` because the member row is already deleted, so
+the handover path is never re-entered and `count == 1` holds trivially under
+either placement. Two reviewers independently applied the placement mutation and
+watched all five tests stay green.
+
+I had claimed "every guard mutation-checked individually". That was true of the
+mutations I ran, and the mutation that mattered was not among them: I had mutated
+"disable the notice" (red) but never "move where it is sent from" — which is the
+decision the test exists to protect. **A guard is only as good as the mutation you
+aim at it, and the mutation to aim is the one that reintroduces the defect, not
+the one that deletes the feature.**
+
+Rewritten with `RemoveGroupMembers` fault-injected to fail once after the handover
+commits. It now goes red (`expected 1, actual 0`) under the placement mutation.
+
+One detour worth recording: my *first* attempt at that mutation also stayed green,
+and that was a flaw in the mutation, not the test — I passed the successor through
+a package-level variable that survived across calls, where the real "announce in
+the caller" shape uses a local reset per call. A mutation has to be faithful to
+the code it is impersonating, or a green result means nothing.
+
+### Also from review
+
+- Three comment blocks contradicted the shipped code — leftovers from the
+  abandoned broadcast revision. Removed or rewritten.
+- "A later rename does not leave a stale name" was false: all three clients render
+  `extra[i].name` and none re-resolves by uid. Corrected in both code and brief.
+- `sendGroupExitTip`'s display name silently changed to remark-first as a side
+  effect of a parameter refactor — outside the stated scope and unguarded. Kept
+  (it matches the repo's rule) and now pinned by a test.
+- Nothing pinned the `GroupTransferGrouper` content type, nor the best-effort
+  delivery decision. Both now have guards.
+- Android's `MessageFormat` treats ASCII `'` as an escape — a future English
+  translation would silently lose the placeholders there. Recorded in the code.
+
+A third, automated reviewer approved the same head, having noticed the identical
+test weakness but classified it as a comment-accuracy issue. It stated plainly
+that it ran no code. The two humans ran the mutation. Same observation, opposite
+verdict, and the difference was execution.

@@ -165,7 +165,7 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	// 放在提交处则天然幂等：重试时 handOverGroupCreator 在行锁内看到已非群主，
 	// 直接返回，不会重复通告。
 	if member.Role == MemberRoleCreator {
-		if err := g.handOverGroupCreator(groupNo, removal.UID, displayName, spaceGone); err != nil {
+		if err := g.handOverGroupCreator(groupNo, removal.UID, displayName, removal.SpaceID, spaceGone); err != nil {
 			return fmt.Errorf("hand over group creator: %w", err)
 		}
 	}
@@ -183,7 +183,6 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	//
 	// 不要把被移出 Space 的情形也改成「退出了」：那是被动的，说成主动就是错的，
 	// 而且 TestGroupCascadeKickStillSendsBotTip 正是钉这条契约的正向对照。
-	// 下面那条群内广播的措辞要跟着**它**走（都说「被移出」），而不是反过来。
 	cascadeAction := ""
 	if selfExit {
 		cascadeAction = "退出了"
@@ -271,7 +270,7 @@ func (g *Group) sendGroupExitTip(groupNo, uid, groupRemark string) {
 // 通告就永久丢了。放在这里则天然幂等——重试时锁内重读已非 creator，直接返回。
 //
 // suppressNotice=true 时只做交接、不通告（解散场景，见调用方）。
-func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName string, suppressNotice bool) error {
+func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID string, suppressNotice bool) error {
 	tx, err := g.db.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin creator handover: %w", err)
@@ -334,14 +333,29 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName string, supp
 		return nil
 	}
 
-	// 复用 octo-lib 既有的 SendGroupTransferGrouper，而不是自己拼一条通用 Tip：
-	//   - 它已经是全群可见（不设 Subscribers、不设 payload.visibles）；
-	//   - content 是「“{0}”已成为新群主」+ extra 结构化带名字，名字**不拼进字符串**，
-	//     所以用户可控的展示名没有注入面，也不需要自己做净化/截断；
-	//   - content type 是 GroupTransferGrouper，与手动转让路径
-	//     （api.go transferGrouper → event handler）**同一个**，客户端按同一种方式
-	//     渲染，不会出现同一件事两种样子；
-	//   - 名字由客户端从 extra 解析，改名后历史消息不会留下过期的名字。
+	// 继任者自己也在待移除队列里 → 这次交接是链条中间的一环，当场就会作废，不通告。
+	//
+	// 批量移除按 uid 逐条建工单，若被移除的几个人正好是本群里连续的元老，交接会沿元老
+	// 顺序连锁：C→S2、S2→S3、S3→S4，一个群里三条「已成为新群主」，前两条在写下时就
+	// 已经不成立。两个批量入口各自上限 200 uid（managerMaxBatchUIDs），最坏 200 条。
+	// 这与解散被抑制的机制完全相同，只是触发方式不同。
+	//
+	// 跳过中间环之后，只有最后一环（继任者不在队列里）会通告，且通告的正是最终群主。
+	// 与执行顺序无关：无论工单以什么次序跑，"successor 不在队列里"这个条件在一次批量里
+	// 只会对一个环成立。
+	//
+	// 查询失败按「不在队列里」处理并照常通告：宁可多发一条，也不要因为一次 DB 抖动
+	// 把唯一一条有效通告吞掉——群里凭空换群主正是本改动要消灭的。
+	if pending, err := spacemod.HasPendingRemovalCleanup(g.ctx.DB(), spaceID, successor.UID); err != nil {
+		g.Warn("查询继任者待移除状态失败，按未待移除处理",
+			zap.Error(err), zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
+	} else if pending {
+		g.Info("继任者本人也在待移除队列，跳过本环交接通告",
+			zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
+		return nil
+	}
+
+	// 报文形状与取舍见 sendSpaceRemovalHandoverNotice 的文档注释。
 	//
 	// 展示名取群内 remark 优先，与 groupExit / 花名册一致；successor 是事务里
 	// FOR UPDATE 选出的那一行，Remark 直接可用，无需再查一次库。
@@ -370,10 +384,19 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName string, supp
 //   - 客户端按同一条路径渲染（octo-web module.tsx 把 1000-2000 统一交给 SystemCell，
 //     1008 另被 Model.tsx 列入「不计未读的系统消息」），不会出现同一件事两种样子；
 //   - 名字放 extra 走 {N} 占位符、**不拼进 content**，所以用户可控的展示名没有注入面，
-//     也不需要自己做净化截断；客户端从 extra 取名，事后改名不会在群历史里留下旧名。
+//     也不需要自己做净化截断。
 //
-// 两个占位符不是新发明：octo-lib SendGroupMemberScanJoin 的
-// 「“{0}”通过“{1}”的二维码加入群聊」就是 {0}/{1} + 两元素 extra 的既有写法。
+// 结构化只买到「无注入面」这一半，**买不到**「改名后不留旧名」：三端客户端
+// （iOS WKSystemContent、Android StringUtils、Web SDK）都直接渲染 extra[i].name，
+// 没有一端按 uid 重新解析，NoPersist=0 的历史消息里留的仍是发送时刻的名字。
+// extra 带 uid 让重解析成为可能，但今天没有客户端这么做。
+//
+// 两个占位符不是新发明：octo-lib SendGroupMemberScanJoin(1007) 的
+// 「“{0}”通过“{1}”的二维码加入群聊」就是 {0}/{1} + 两元素 extra 的既有写法；
+// 三端都按 extra 长度泛化替换，无 1008 专属渲染逻辑（PR #804 review 逐端核对）。
+//
+// ⚠️ i18n 注意：Android 用 MessageFormat，ASCII 单引号 ' 是转义字符。当前中文全角
+// 引号安全，但将来译成英文若写成 the group's owner，占位符只在 Android 端被静默吞掉。
 func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, successorUID, successorName string) error {
 	if leaverName == "" {
 		leaverName = leaverUID

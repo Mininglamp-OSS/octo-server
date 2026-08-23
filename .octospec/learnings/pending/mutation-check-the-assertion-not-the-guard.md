@@ -65,3 +65,24 @@ matches on **shape** — how many, addressed to whom, carrying what kind of thin
 is pinned to the invariant. Prefer the second whenever the invariant can be
 expressed structurally, and when a fragment match is unavoidable, mutate by
 re-expressing the data rather than by deleting it.
+
+## Addendum — and the mutation has to be the right one, and faithful
+
+Two further ways this went wrong on the same change, both caught by reviewers
+rather than by me.
+
+**Aim the mutation at the decision, not at the feature.** The load-bearing choice
+was *where* a message is sent from (inside the transaction-committing helper,
+versus from its caller after a step that can fail). The mutation I ran deleted the
+message entirely — red, and meaningless: it proves the test notices a missing
+message, not that it notices the message moving. Two reviewers ran the placement
+mutation and watched five tests stay green. Ask what the code comment warns the
+next editor *not* to do, and mutate exactly that.
+
+**A mutation must be faithful to the shape it impersonates.** My first attempt at
+the placement mutation passed the successor through a package-level variable,
+which survived across calls; the real "announce from the caller" shape uses a
+local, reset per call. The stale global made the second run announce, so the test
+stayed green — for a reason that had nothing to do with the code under test. A
+green mutation result is only evidence if the mutation is a plausible
+implementation. Reset state, match scoping, then trust the outcome.
