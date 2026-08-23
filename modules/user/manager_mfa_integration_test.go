@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -155,7 +156,7 @@ func newManagerMFAIntegration(t *testing.T, failAuth bool) (*wkhttp.WKHttp, *con
 	require.NoError(t, settings.Reload())
 	// This records the result for the controlled fake SMTP setup. The OTP send
 	// itself still traverses the real SMTP implementation below.
-	settings.RecordManagerEmailMFAPreflight(true)
+	settings.RecordManagerEmailMFAPreflight(settings.ManagerEmailMFAProbeGeneration(), true)
 	require.True(t, settings.ManagerEmailMFAReady())
 
 	password := "manager-mfa-password"
@@ -332,6 +333,49 @@ func TestManagerConsoleMFAHandlerSMTPFailureCannotVerify(t *testing.T) {
 	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(recipientEmail, commonbase.CodeTypeManagerLogin))
 	require.NoError(t, err)
 	assert.Empty(t, code, "SMTP failure must not leave a verifiable OTP")
+}
+
+func TestManagerConsoleMFAMailboxCooldownReturns429WithRetryAfter(t *testing.T) {
+	route, ctx, _, password, recipientEmail := newManagerMFAIntegration(t, false)
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	var user Model
+	_, err := ctx.DB().Select("uid,username").From("user").Where("role=?", string(wkhttp.SuperAdmin)).Load(&user)
+	require.NoError(t, err)
+
+	login := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login", map[string]string{
+		"username": user.Username,
+		"password": password,
+	}))
+	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
+	var firstChallenge managerLoginResp
+	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &firstChallenge))
+	firstSend := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/send", map[string]string{
+		"challenge_id": firstChallenge.ChallengeID,
+	}))
+	require.Equal(t, http.StatusOK, firstSend.Code, firstSend.Body.String())
+
+	// A new login invalidates the previous OTP but deliberately leaves the
+	// mailbox-level cooldown in place. The second send must expose that
+	// cooldown as a client-actionable manager MFA 429, not SMTP 503.
+	secondLogin := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login", map[string]string{
+		"username": user.Username,
+		"password": password,
+	}))
+	require.Equal(t, http.StatusOK, secondLogin.Code, secondLogin.Body.String())
+	var secondChallenge managerLoginResp
+	require.NoError(t, json.Unmarshal(secondLogin.Body.Bytes(), &secondChallenge))
+	secondSend := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/send", map[string]string{
+		"challenge_id": secondChallenge.ChallengeID,
+	}))
+	require.Equal(t, http.StatusTooManyRequests, secondSend.Code, secondSend.Body.String())
+	assert.Contains(t, secondSend.Body.String(), "err.server.user.manager_mfa_rate_limited")
+	assert.Contains(t, secondSend.Body.String(), "retry_after")
+
+	// Keep this test isolated if the shared Redis database is reused before the
+	// one-minute mailbox key naturally expires.
+	t.Cleanup(func() {
+		_ = ctx.GetRedisConn().Del(commonbase.EmailRateLimitKey(recipientEmail, commonbase.CodeTypeManagerLogin))
+	})
 }
 
 func TestManagerConsoleMFAOffKeepsDirectTokenPath(t *testing.T) {

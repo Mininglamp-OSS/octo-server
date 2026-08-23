@@ -585,7 +585,8 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 
 	lang := octoi18n.OutboundLanguage(c.Request.Context())
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	emailErr := commonbase.NewEmailService(m.ctx, settings).SendVerifyCodeTrackedWithAttempt(
+	emailService := commonbase.NewEmailService(m.ctx, settings)
+	emailErr := emailService.SendVerifyCodeTrackedWithAttempt(
 		sendCtx, challenge.Email, commonbase.CodeTypeManagerLogin, lang, attemptID,
 	)
 	cancel()
@@ -593,7 +594,7 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 	committed, commitErr := m.mfa.completeSend(commitCtx, challenge.ID, attemptID, emailErr == nil)
 	commitCancel()
 	if commitErr != nil || !committed {
-		if clearErr := commonbase.NewEmailService(m.ctx, settings).ClearManagerCodeIfAttempt(context.Background(), challenge.Email, attemptID); clearErr != nil {
+		if clearErr := emailService.ClearManagerCodeIfAttempt(context.Background(), challenge.Email, attemptID); clearErr != nil {
 			m.Warn("清理失去所有权的管理端 MFA 验证码失败", zap.Error(clearErr), zap.String("challenge_id", challenge.ID))
 		}
 		if commitErr != nil {
@@ -603,6 +604,19 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 		return
 	}
 	if emailErr != nil {
+		if errors.Is(emailErr, commonbase.ErrEmailSendRateLimited) {
+			retryAfter, retryErr := emailService.EmailSendRateLimitRetryAfter(
+				challenge.Email, commonbase.CodeTypeManagerLogin,
+			)
+			if retryErr != nil || retryAfter < 1 {
+				m.Warn("读取管理端 MFA 邮箱冷却时间失败，使用默认重试时间", zap.Error(retryErr), zap.String("challenge_id", challenge.ID))
+				retryAfter = int(time.Minute / time.Second)
+			}
+			managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, octoi18n.Details{
+				"retry_after": retryAfter,
+			})
+			return
+		}
 		m.Warn("管理端 MFA 邮件发送失败", zap.Error(emailErr), zap.String("challenge_id", challenge.ID))
 		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
 		return

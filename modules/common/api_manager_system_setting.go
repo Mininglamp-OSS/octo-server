@@ -481,7 +481,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// transaction. Use the no-probe load here so this instance publishes that
 	// result without sending a duplicate probe email; generic Reload callers
 	// still trigger a one-shot probe when they observe a settings change.
-	reloadErr := m.systemSettings.Load()
+	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
 	if reloadErr != nil {
 		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
 		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。
@@ -492,7 +492,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		// result only after the same values have become the live singleton
 		// snapshot; otherwise a reload failure must not make an unobserved
 		// configuration look ready.
-		m.systemSettings.RecordManagerEmailMFAPreflight(true)
+		if !m.systemSettings.RecordManagerEmailMFAPreflight(generation, true) {
+			m.Warn("丢弃过期的管理端 MFA SMTP 预检结果")
+		}
 	}
 
 	// 写入若涉及 login.local_off,直接用刚刚校验过的 plan.value 触发 safety

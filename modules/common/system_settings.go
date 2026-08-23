@@ -88,9 +88,9 @@ const (
 //
 // Lookup model:
 //   - Snapshot is an immutable map[string]string ("category.key" → value),
-//     swapped atomically by Load / Reload. Readers go through atomic.Pointer
-//     and never take a lock; SMTP send (high-frequency) does not block on
-//     admin writes.
+//     swapped atomically by Load / Reload. Generic readers go through the
+//     atomic.Pointer; the MFA readiness gate additionally takes a small
+//     publication lock so its snapshot and probe result stay paired.
 //   - Empty DB value means "not configured" and falls back to the matching
 //     yaml field on *config.Config.
 //   - Encrypted values are decrypted at snapshot-build time and cached in
@@ -108,12 +108,13 @@ type SystemSettings struct {
 	// succeeds.  The pair is reset only when one of the relevant snapshot
 	// values changes, so the 60s ordinary settings reload does not create a
 	// needless login outage on every tick.
-	managerMFAProbeKnown atomic.Bool
-	managerMFAProbeReady atomic.Bool
+	managerMFAProbeMu    sync.Mutex
+	managerMFAProbeKnown bool
+	managerMFAProbeReady bool
 	// managerMFAProbeGeneration changes whenever the effective MFA/SMTP
 	// snapshot changes. Async probes carry this generation so a result from an
 	// older snapshot cannot publish readiness for newer settings.
-	managerMFAProbeGeneration atomic.Uint64
+	managerMFAProbeGeneration uint64
 	managerMFAProbeInFlight   atomic.Bool
 	reloadTTL                 time.Duration
 	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
@@ -141,15 +142,18 @@ func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings
 // snapshot. It is the no-probe load used during startup and by write paths
 // that already validated the prospective configuration synchronously.
 func (s *SystemSettings) Load() error {
-	return s.load(false)
+	_, err := s.loadWithGeneration(false)
+	return err
 }
 
-func (s *SystemSettings) load(reprobe bool) error {
+// loadWithGeneration replaces the snapshot and returns the generation that
+// was published with it. The manager-settings write path uses that generation
+// to bind its prospective SMTP probe to the loaded snapshot.
+func (s *SystemSettings) loadWithGeneration(reprobe bool) (uint64, error) {
 	rows, err := s.db.listAll()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	previous := s.snapshot.Load()
 	next := make(map[string]string, len(rows))
 	for _, row := range rows {
 		if row.ValueType == settingTypeEncrypted {
@@ -169,20 +173,24 @@ func (s *SystemSettings) load(reprobe bool) error {
 		}
 		next[schemaKey(row.Category, row.KeyName)] = row.Value
 	}
+	s.managerMFAProbeMu.Lock()
+	previous := s.snapshot.Load()
 	changed := previous == nil || managerMFASettingsChanged(previous, &next)
 	if changed {
-		s.managerMFAProbeGeneration.Add(1)
-		s.managerMFAProbeKnown.Store(false)
-		s.managerMFAProbeReady.Store(false)
+		s.managerMFAProbeGeneration++
+		s.managerMFAProbeKnown = false
+		s.managerMFAProbeReady = false
 	}
 	// Clear readiness before publishing a changed snapshot. This keeps the
 	// login gate fail-closed during the small publication window instead of
 	// allowing a probe for the previous settings to authorize the new ones.
 	s.snapshot.Store(&next)
+	generation := s.managerMFAProbeGeneration
+	s.managerMFAProbeMu.Unlock()
 	if reprobe && previous != nil && changed && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
 		s.scheduleManagerEmailMFAPreflight()
 	}
-	return nil
+	return generation, nil
 }
 
 func managerMFASettingsChanged(previous, next *map[string]string) bool {
@@ -209,7 +217,8 @@ func managerMFASettingsChanged(previous, next *map[string]string) bool {
 // Load instead because it already probes the merged prospective values before
 // committing the transaction.
 func (s *SystemSettings) Reload() error {
-	return s.load(true)
+	_, err := s.loadWithGeneration(true)
+	return err
 }
 
 // StartAutoReload kicks off a goroutine that re-loads the snapshot every
@@ -233,7 +242,7 @@ func (s *SystemSettings) StartAutoReload(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := s.load(true); err != nil {
+				if _, err := s.loadWithGeneration(true); err != nil {
 					s.Error("auto-reload system_setting failed", zap.Error(err))
 				}
 			}
@@ -875,14 +884,15 @@ func (s *SystemSettings) ValidateManagerEmailMFASMTP() error {
 // for OTP mail. It never changes the policy value and never panics; startup
 // callers log the returned error and leave the login gate fail-closed.
 func (s *SystemSettings) PreflightManagerEmailMFA(ctx context.Context) error {
+	generation := s.ManagerEmailMFAProbeGeneration()
 	err := s.preflightManagerEmailMFA(ctx)
 	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
-		s.managerMFAProbeKnown.Store(false)
-		s.managerMFAProbeReady.Store(false)
+		s.publishManagerEmailMFAPreflight(generation, false, false)
 		return err
 	}
-	s.managerMFAProbeKnown.Store(true)
-	s.managerMFAProbeReady.Store(err == nil)
+	if !s.publishManagerEmailMFAPreflight(generation, true, err == nil) {
+		s.Warn("丢弃过期的管理端 MFA SMTP 预检结果")
+	}
 	return err
 }
 
@@ -905,14 +915,14 @@ func (s *SystemSettings) scheduleManagerEmailMFAPreflight() {
 	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
 		return
 	}
-	generation := s.managerMFAProbeGeneration.Load()
+	generation := s.ManagerEmailMFAProbeGeneration()
 	if !s.managerMFAProbeInFlight.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer func() {
 			s.managerMFAProbeInFlight.Store(false)
-			if generation != s.managerMFAProbeGeneration.Load() && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
+			if generation != s.ManagerEmailMFAProbeGeneration() && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
 				s.scheduleManagerEmailMFAPreflight()
 			}
 		}()
@@ -920,33 +930,56 @@ func (s *SystemSettings) scheduleManagerEmailMFAPreflight() {
 		probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		err := s.preflightManagerEmailMFA(probeCtx)
-		if generation != s.managerMFAProbeGeneration.Load() || s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
 			return
 		}
-		s.managerMFAProbeKnown.Store(true)
-		s.managerMFAProbeReady.Store(err == nil)
+		if !s.publishManagerEmailMFAPreflight(generation, true, err == nil) {
+			return
+		}
 		if err != nil {
 			s.Warn("manager-console MFA SMTP auto-reload preflight failed; management login remains fail-closed", zap.Error(err))
 		}
 	}()
 }
 
+// ManagerEmailMFAProbeGeneration returns the generation of the effective
+// MFA/SMTP snapshot. Callers that perform a probe outside this type must pass
+// the captured value back to RecordManagerEmailMFAPreflight.
+func (s *SystemSettings) ManagerEmailMFAProbeGeneration() uint64 {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	return s.managerMFAProbeGeneration
+}
+
+func (s *SystemSettings) publishManagerEmailMFAPreflight(generation uint64, known, ready bool) bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	if generation != s.managerMFAProbeGeneration {
+		return false
+	}
+	s.managerMFAProbeKnown = known
+	s.managerMFAProbeReady = ready
+	return true
+}
+
 // RecordManagerEmailMFAPreflight lets a system-setting write path publish the
 // result of a probe performed against the prospective (not-yet-reloaded)
-// SMTP values.  It is intentionally tiny: callers still own the actual probe
-// and this method never changes the MFA policy or snapshot.
-func (s *SystemSettings) RecordManagerEmailMFAPreflight(ok bool) {
-	s.managerMFAProbeKnown.Store(true)
-	s.managerMFAProbeReady.Store(ok)
+// SMTP values. It refuses to publish a result captured for an older snapshot.
+// It is intentionally tiny: callers still own the actual probe and this
+// method never changes the MFA policy or snapshot.
+func (s *SystemSettings) RecordManagerEmailMFAPreflight(generation uint64, ok bool) bool {
+	return s.publishManagerEmailMFAPreflight(generation, true, ok)
 }
 
 // ManagerEmailMFAReady is the login gate's fail-closed view.  It requires an
 // enabled policy, a complete effective configuration, and a successful real
 // SMTP preflight for that exact snapshot.
 func (s *SystemSettings) ManagerEmailMFAReady() bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
 	return s.ManagerEmailMFAState() == ManagerEmailMFAOn &&
-		s.managerMFAProbeKnown.Load() &&
-		s.managerMFAProbeReady.Load() &&
+		s.managerMFAProbeKnown &&
+		s.managerMFAProbeReady &&
 		s.ValidateManagerEmailMFASMTP() == nil
 }
 

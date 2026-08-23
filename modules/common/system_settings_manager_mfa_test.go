@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,8 +30,41 @@ func TestManagerEmailMFAStateIsTriStateAndFailClosed(t *testing.T) {
 
 	// The test publishes the result of a successful preflight without sending
 	// an external message; the handler tests cover the actual SMTP path.
-	settings.RecordManagerEmailMFAPreflight(true)
+	settings.RecordManagerEmailMFAPreflight(settings.ManagerEmailMFAProbeGeneration(), true)
 	assert.True(t, settings.ManagerEmailMFAReady())
+}
+
+func TestManagerEmailMFAPreflightDoesNotPublishStaleGeneration(t *testing.T) {
+	settings := newTestSystemSettings(t, nil)
+	settings.ctx.GetConfig().Support.Email = "mfa-preflight-generation@example.com"
+	settings.ctx.GetConfig().Support.EmailSmtp = ""
+	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+	require.NoError(t, settings.Load())
+
+	// Simulate a settings replacement while the startup probe is in flight.
+	// The probe result must not open the gate for the newer generation.
+	settings.managerMFAProbeMu.Lock()
+	settings.managerMFAProbeGeneration++
+	settings.managerMFAProbeMu.Unlock()
+	assert.Error(t, settings.PreflightManagerEmailMFA(context.Background()))
+	assert.False(t, settings.ManagerEmailMFAReady())
+}
+
+func TestManagerEmailMFAPreflightRecordRejectsStaleGeneration(t *testing.T) {
+	settings := newTestSystemSettings(t, nil)
+	settings.ctx.GetConfig().Support.Email = "mfa-record-generation@example.com"
+	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
+	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+	require.NoError(t, settings.Load())
+
+	generation := settings.ManagerEmailMFAProbeGeneration()
+	settings.managerMFAProbeMu.Lock()
+	settings.managerMFAProbeGeneration++
+	settings.managerMFAProbeMu.Unlock()
+	assert.False(t, settings.RecordManagerEmailMFAPreflight(generation, true))
+	assert.False(t, settings.ManagerEmailMFAReady())
 }
 
 func TestManagerEmailMFASchemaDefaultsOffAndNamesConsoleScope(t *testing.T) {

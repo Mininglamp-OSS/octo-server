@@ -32,6 +32,7 @@ const (
 	emailCodeStatusSent    = "sent"
 	emailCodeStatusFailed  = "failed"
 	emailCodeTTL           = 5 * time.Minute
+	emailSendRateLimitTTL  = time.Minute
 )
 
 // The key helpers are shared by the manager MFA flow and the ordinary email
@@ -121,6 +122,31 @@ func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailS
 // errors.Is rather than collapsing it onto a generic send-failure code.
 var ErrEmailSendRateLimited = errors.New("email resend cooldown active, retry in 1 minute")
 
+// EmailSendRateLimitRetryAfter returns the remaining mailbox cooldown in
+// seconds. It is used by manager-console MFA to turn the shared email
+// cooldown into a client-actionable retry response without exposing Redis
+// errors or changing ordinary-user behavior.
+func (s *EmailService) EmailSendRateLimitRetryAfter(email string, codeType CodeType) (int, error) {
+	ttl, err := s.verifyRedis().TTL(EmailRateLimitKey(email, codeType)).Result()
+	if err != nil {
+		return 0, err
+	}
+	if ttl == -2*time.Second {
+		// The key expired between SendVerifyCode's check and this lookup.
+		return 1, nil
+	}
+	if ttl < 0 {
+		// A legacy key without an expiry is still treated as rate-limited. Use
+		// the normal cooldown as a safe client retry hint.
+		return int(emailSendRateLimitTTL / time.Second), nil
+	}
+	retryAfter := int((ttl + time.Second - 1) / time.Second)
+	if retryAfter < 1 {
+		return 1, nil
+	}
+	return retryAfter, nil
+}
+
 var (
 	ErrManagerCodeInvalid = errors.New("invalid manager verification code")
 	ErrManagerCodeLocked  = errors.New("too many failed attempts, locked for 10 minutes")
@@ -206,7 +232,7 @@ func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeTyp
 	}
 
 	// 设置发送频率限制（1分钟）
-	err = s.ctx.GetRedisConn().SetAndExpire(rateLimitKey, "1", time.Minute)
+	err = s.ctx.GetRedisConn().SetAndExpire(rateLimitKey, "1", emailSendRateLimitTTL)
 	if err != nil {
 		if tracked {
 			_ = s.ctx.GetRedisConn().Del(cacheKey)
