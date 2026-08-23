@@ -1500,8 +1500,8 @@ change-log convention (§7). Newest first.
   (orphan `space_member` row), a banned Space wrongly triggered it. Both now use
   `CheckMembershipForCleanup` (`sm.status=1 AND s.status <> 0`).
   `CheckMembership` is deliberately **unchanged** — #797's original proposal to
-  relax it would have admitted banned Spaces through `SpaceMiddleware` and 36
-  other call sites. A behavioural truth table now pins both predicates' answers
+  relax it would have admitted banned Spaces across all **36** of its non-test
+  call sites, `SpaceMiddleware` — the primary auth gate — included. A behavioural truth table now pins both predicates' answers
   across `{disbanded, normal, banned} x {active, removed}`, including the one
   cell where they must disagree. (Corrected 2026-08-23: this entry originally
   claimed a *source guard*; that guard was deleted on the same branch for

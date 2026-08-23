@@ -133,9 +133,15 @@ v2.2.4-20260313, `modules/space` under `-race -shuffle=on`, `golangci-lint` 0 is
   visible. Whether a reconciler should retry them is a product decision, not a
   refactor — retrying a job that has already killed a process twenty times needs a
   reason.
-- **A `/metrics` endpoint.** The repo registers metrics via `promauto` into the
-  global registry and exposes nothing yet (`modules/oidc`, `modules/sticker` do the
-  same); mounting the endpoint is separate infrastructure work.
+- **Anything about the `/metrics` endpoint itself.** It already exists and is
+  served (`pkg/metrics`, started from `main.go`), so registering a gauge into the
+  default registry is enough to have it scraped. Nothing was needed here.
+  (Corrected 2026-08-23 — third time. This bullet said the repo "exposes nothing
+  yet", the same disproven claim already corrected further down this file and in
+  the brief. It survived the first correction pass because that pass grepped for
+  the *wording* used elsewhere rather than for the *claim*, and this bullet
+  phrases it differently. Grep for what a sentence asserts, not for how one copy
+  of it happens to be worded.)
 - The durable IM-pending outbox (#797's P0), the purge throughput item, the
   `(group_no, created_at)` index, and the join-vs-disband root cause.
 
@@ -170,6 +176,37 @@ v2.2.4-20260313, `modules/space` under `-race -shuffle=on`, `golangci-lint` 0 is
 
 现在要求 `lease_until <= now - removalCleanupLease`（一整个租约周期的宽限），外加
 `lease_until IS NOT NULL` 以免碰到从没被认领过的行。
+
+**上线前的盘点查询必须与这两个条件逐字对齐。** 第一版写进 PR 正文的那条不是——
+它把 `lease_until IS NULL` 也算了进去，并且用 `<= now` 而不是 `<= now - 10min`，
+两处都往多了数。运维照它排查，会去补救一批扫描根本不会碰的行。
+
+```sql
+-- ① 新二进制起来一分钟内会被翻成 abandoned 的行。非零就先补救再发布。
+SELECT COUNT(*) FROM space_member_removal_cleanup
+WHERE status = 0 AND attempts >= 20
+  AND lease_until IS NOT NULL
+  AND lease_until <= UTC_TIMESTAMP(3) - INTERVAL 10 MINUTE;
+
+-- ② 扫描永远够不到的行。理论上恒为 0：唯一会把 pending 行的 lease_until 置 NULL 的
+--    写者是 releaseMemberRemovalCleanup，而 releaseCleanupJob 在 attempts>=max 时
+--    先转 abandoned，根本走不到它。非零说明有本文件没预料到的写者。
+SELECT COUNT(*) FROM space_member_removal_cleanup
+WHERE status = 0 AND attempts >= 20 AND lease_until IS NULL;
+```
+
+`lease_until` 由 Go 以 `time.Now().UTC()` 写入，所以这里比的是 `UTC_TIMESTAMP(3)`；
+不要照抄 gauge 那条查询的 `NOW(3)`——那条比的是 `created_at`，由 MySQL 列默认值按
+会话时区写入。**同一张表上的两列，时区来源不同。**
+
+实测（MySQL 8.0.46，四种行形：租约过期够久 / 租约为 NULL / 租约刚过期还在宽限内 /
+attempts 未到顶）：修正后的 ① 数出 1 条，随后真正跑一次扫描，被翻成 abandoned 的正
+好是同一条；② 数出 1 条，扫描确实一直没碰它。**同一批数据上，最初发布的那条查询数
+出 3 条** —— 多出来的两条一条永远不会被翻状态、另一条还在宽限期内。运维照它排查，
+会去补救两批根本不需要补救的行。
+
+一条给运维的查询，验收标准和代码是一样的：**跑一遍，看它数出来的是不是就是实际会
+发生变化的那些行。** 光看着"差不多对"不算验过。
 
 ### 认领查询的 `ORDER BY id` 让索引失效
 

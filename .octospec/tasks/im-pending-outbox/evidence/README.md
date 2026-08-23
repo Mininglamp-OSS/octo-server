@@ -2,7 +2,8 @@
 
 日期: 2026-08-23
 broker: wukongim v2.2.4-20260313 (ci.yml 钉的 tag)
-探测器源码: scratchpad/wkleak/main.go
+探测器源码: `wkleak_probe.go.txt`（与本文件同目录）。原件写在会话临时目录里，
+那是随会话销毁的,所以证据副本随本文件一起提交,避免指向一个复现时已经不存在的路径。
 
 ## 实测结果
 
