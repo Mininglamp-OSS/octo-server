@@ -362,6 +362,7 @@ func TestManagerAdminEmailMaintenanceRequiresValidEmailAndInvalidatesChallenge(t
 
 func TestManagerAdminEmailMaintenanceRejectsEmailUsedByAnotherUser(t *testing.T) {
 	server, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(server)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	settings := commonsettings.EnsureSystemSettings(ctx)
 	t.Cleanup(func() {
@@ -378,11 +379,13 @@ func TestManagerAdminEmailMaintenanceRejectsEmailUsedByAnotherUser(t *testing.T)
 	conflictEmail := "existing-user@example.com"
 	require.NoError(t, NewDB(ctx).Insert(&Model{
 		UID: targetUID, Username: "email-conflict-target", Name: "Email Conflict Target",
-		Role: string(wkhttp.Admin), Email: "old-admin@example.com", Status: StatusEnable.Int(),
+		ShortNo: "email-conflict-target-short", Role: string(wkhttp.Admin),
+		Email: "old-admin@example.com", Status: StatusEnable.Int(),
 	}))
 	require.NoError(t, NewDB(ctx).Insert(&Model{
 		UID: "email-conflict-user", Username: "email-conflict-user", Name: "Existing User",
-		Role: "user", Email: conflictEmail, Status: StatusEnable.Int(),
+		ShortNo: "email-conflict-user-short", Role: "user", Email: conflictEmail,
+		Status: StatusEnable.Int(),
 	}))
 
 	req := managerMFARequest(t, http.MethodPut, "/v1/manager/user/admin/email", map[string]string{
@@ -429,6 +432,7 @@ func TestManagerAddAdminRejectsMissingEmail(t *testing.T) {
 
 func TestManagerAddAdminRejectsEmailUsedByAnotherUser(t *testing.T) {
 	server, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(server)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	settings := commonsettings.EnsureSystemSettings(ctx)
 	t.Cleanup(func() {
@@ -444,7 +448,8 @@ func TestManagerAddAdminRejectsEmailUsedByAnotherUser(t *testing.T) {
 	conflictEmail := "existing-user-for-admin@example.com"
 	require.NoError(t, NewDB(ctx).Insert(&Model{
 		UID: "email-conflict-admin-user", Username: "email-conflict-admin-user", Name: "Existing User",
-		Role: "user", Email: conflictEmail, Status: StatusEnable.Int(),
+		ShortNo: "email-conflict-admin-user-short", Role: "user", Email: conflictEmail,
+		Status: StatusEnable.Int(),
 	}))
 
 	loginName := "email-conflict-admin"
