@@ -24,6 +24,25 @@ func newManagerMFAStateService(t *testing.T) *managerMFAService {
 	return &managerMFAService{client: client, now: time.Now}
 }
 
+func TestMaskManagerEmailPreservesDomainAndMasksLocalPart(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "normal", input: "alice@example.com", want: "axxxxe@example.com"},
+		{name: "two local characters", input: "ab@example.com", want: "axxxxb@example.com"},
+		{name: "one local character", input: "a@example.com", want: "axxxx@example.com"},
+		{name: "normalizes case and whitespace", input: " Alice@Example.COM ", want: "axxxxe@example.com"},
+		{name: "invalid address is unchanged", input: "not-an-email", want: "not-an-email"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, maskManagerEmail(tt.input))
+		})
+	}
+}
+
 func TestManagerMFAChallengeReplacesOldChallengeAndHonorsAbsoluteDeadline(t *testing.T) {
 	service := newManagerMFAStateService(t)
 	ctx := context.Background()

@@ -409,6 +409,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 			UID:         userInfo.UID,
 			Name:        userInfo.Name,
 			Role:        userInfo.Role,
+			Email:       maskManagerEmail(email),
 			ChallengeID: challengeID,
 			ExpiresIn:   int64(managerMFAChallengeTTL.Seconds()),
 			MFARequired: true,
@@ -464,6 +465,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Token: token,
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
 	})
 	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
 }
@@ -597,7 +599,10 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 	}
 	c.Response(&managerMFAChallengeResponse{
 		ChallengeID: challenge.ID,
+		Email:       maskManagerEmail(challenge.Email),
 		ExpiresIn:   managerMFAExpiresIn(challenge, time.Now()),
+		CodeSent:    true,
+		ResendAfter: int64(managerMFASendCooldown.Seconds()),
 	})
 }
 
@@ -677,7 +682,13 @@ func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
 	}
 	publicIP := wkhttp.ClientIP(c.Request)
 	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
-	c.Response(&managerLoginResp{UID: userInfo.UID, Token: token, Name: userInfo.Name, Role: userInfo.Role})
+	c.Response(&managerLoginResp{
+		UID:   userInfo.UID,
+		Token: token,
+		Name:  userInfo.Name,
+		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
+	})
 }
 
 func managerMFAExpiresIn(challenge *managerMFAChallenge, now time.Time) int64 {
@@ -693,6 +704,22 @@ func managerMFAExpiresIn(challenge *managerMFAChallenge, now time.Time) int64 {
 		return 1
 	}
 	return seconds
+}
+
+// maskManagerEmail keeps the local-part boundary visible while preserving the
+// complete domain. The full address remains in the Challenge and is used for
+// SMTP delivery; only API responses receive the masked representation.
+func maskManagerEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	at := strings.LastIndexByte(email, '@')
+	if at <= 0 || at == len(email)-1 {
+		return email
+	}
+	local := []rune(email[:at])
+	if len(local) == 1 {
+		return string(local[0]) + "xxxx" + email[at:]
+	}
+	return string(local[0]) + "xxxx" + string(local[len(local)-1]) + email[at:]
 }
 
 // 重置用户密码
@@ -2103,6 +2130,7 @@ type managerLoginResp struct {
 	Token       string `json:"token,omitempty"`
 	Name        string `json:"name"`
 	Role        string `json:"role"`
+	Email       string `json:"email,omitempty"`
 	ChallengeID string `json:"challenge_id,omitempty"`
 	ExpiresIn   int64  `json:"expires_in,omitempty"`
 	MFARequired bool   `json:"mfa_required,omitempty"`
@@ -2110,7 +2138,10 @@ type managerLoginResp struct {
 
 type managerMFAChallengeResponse struct {
 	ChallengeID string `json:"challenge_id"`
+	Email       string `json:"email"`
 	ExpiresIn   int64  `json:"expires_in"`
+	CodeSent    bool   `json:"code_sent"`
+	ResendAfter int64  `json:"resend_after"`
 }
 type managerAddUserReq struct {
 	Name     string `json:"name"`

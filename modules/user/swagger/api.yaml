@@ -2610,6 +2610,9 @@ definitions:
         type: string
       role:
         type: string
+      email:
+        type: string
+        description: "脱敏后的管理端账号邮箱；保留完整邮箱域名"
       challenge_id:
         type: string
         description: "MFA 开启时密码校验成功后返回的 Challenge ID"
@@ -2639,13 +2642,29 @@ definitions:
         description: "6 位邮箱验证码"
   managerMFAChallengeResp:
     type: object
+    required:
+      - challenge_id
+      - email
+      - expires_in
+      - code_sent
+      - resend_after
     properties:
       challenge_id:
         type: string
+      email:
+        type: string
+        description: "脱敏后的管理端账号邮箱；保留完整邮箱域名"
       expires_in:
         type: integer
         format: int64
         description: "Challenge 剩余有效秒数"
+      code_sent:
+        type: boolean
+        description: "验证码是否已明确发送成功并进入可验证状态"
+      resend_after:
+        type: integer
+        format: int64
+        description: "再次发送验证码前需要等待的秒数"
   managerUserResp:
     type: object
     properties:
