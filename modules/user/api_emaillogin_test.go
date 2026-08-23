@@ -157,6 +157,22 @@ func TestEmailSendCodeForLoginBlockedByLocalLoginOff(t *testing.T) {
 		"忘记密码渠道不应被 local_off 拦截")
 }
 
+func TestEmailSendCodeRejectsManagerLoginCodeType(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/email/sendcode", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"email":     "manager@example.com",
+		"code_type": int(commonapi.CodeTypeManagerLogin),
+	}))))
+	setPublicIPForUserTest(req, "8.8.8.9")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "err.server.user.request_invalid")
+}
+
 func TestEmailSendCodeBlockedByEmailOnForLoginAndRegister(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	wireI18nRendererForUserTest(s)
