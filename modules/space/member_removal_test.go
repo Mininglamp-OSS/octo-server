@@ -3,6 +3,7 @@ package space
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1034,4 +1036,59 @@ func TestCleanupSkipsMemberInBannedSpace(t *testing.T) {
 	jobs := cleanupJobs(t, spaceID)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, "skipped_rejoined", jobs[0].LastError)
+}
+
+// TestCheckMembershipForCleanupMatrix 直接把谓词的真值表钉死。
+//
+// 上面那两条走 worker 的用例只覆盖「成员行活跃」这一行；这里补齐另一行，
+// 并把三种 Space 状态一次说清楚：判定只由「Space 是否已解散」和「成员行是否
+// 活跃」两件事决定，封禁与正常同档。
+func TestCheckMembershipForCleanupMatrix(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name        string
+		spaceStatus int
+		memberAlive bool
+		wantHeld    bool // true = 席位仍在 → 清理必须跳过
+	}{
+		{"正常空间/活跃成员：人还在，跳过清理", SpaceStatusNormal, true, true},
+		{"正常空间/已移除：正常的被踢路径，清理执行", SpaceStatusNormal, false, false},
+		{"封禁空间/活跃成员：封禁不动摇成员资格，跳过清理", SpaceStatusBanned, true, true},
+		{"封禁空间/已移除：照常清理", SpaceStatusBanned, false, false},
+		{"解散空间/活跃成员：join-vs-disband 孤儿，必须清理", SpaceStatusDisbanded, true, false},
+		{"解散空间/已移除：照常清理", SpaceStatusDisbanded, false, false},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spaceID := fmt.Sprintf("matrix-%d", i)
+			uid := fmt.Sprintf("matrix-u-%d", i)
+			memberStatus := 0
+			if tc.memberAlive {
+				memberStatus = 1
+			}
+			require.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+				SpaceId: spaceID, Name: spaceID, Creator: uid,
+				Status: tc.spaceStatus, MaxUsers: 100,
+			}))
+			require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+				SpaceId: spaceID, UID: uid, Role: 0, Status: memberStatus,
+			}))
+
+			held, err := spacepkg.CheckMembershipForCleanup(f.ctx.DB(), spaceID, uid)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantHeld, held)
+		})
+	}
+
+	// Space 行整个不存在（而非 status=0）也必须判成「席位已失效」：
+	// INNER JOIN 不命中，方向是 fail-safe——清理照常执行，而不是静默作废工单。
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: "matrix-no-space", UID: "matrix-orphan", Role: 0, Status: 1,
+	}))
+	held, err := spacepkg.CheckMembershipForCleanup(f.ctx.DB(), "matrix-no-space", "matrix-orphan")
+	require.NoError(t, err)
+	assert.False(t, held, "Space 行不存在时必须 fail-safe：判成席位已失效，清理照常跑")
 }
