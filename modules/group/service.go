@@ -1831,7 +1831,10 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		// 群里还剩着人却没有群主，且没有任何东西会重新选主。
 		// 锁内确认仍非 creator 才删；已经变成 creator 的跳过，让调用方按
 		// Removed 计数发现并重试（见 RemoveGroupMembersServiceResp）。
-		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, tx)
+		// 自助路径（bot 所有者）在事务外只放行普通角色目标，锁内必须用同一口径：
+		// 否则窗口内 Common→Manager 的提升会通过重查、行真的被删，且 removedUIDs
+		// 里有它，连调用方的集合比对都发现不了。其余路径沿用「只排除 Creator」。
+		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if err != nil {
 			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
 			return nil, errors.New("failed to re-read member role")

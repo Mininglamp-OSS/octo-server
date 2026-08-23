@@ -893,12 +893,23 @@ func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, tx *dbr.
 		return nil, nil
 	}
 	var uids []string
+	// gm.role = MemberRoleCommon：级联不经过 handler 的任何角色守卫，所以它必须
+	// 自带一道。否则「bot A 拥有 Manager 角色的 bot B」时，移除 A 会把 B 一并删掉，
+	// 而 B 从未进过任何白名单 —— 结果是普通成员经级联越权移除了一个群管理员，
+	// 极端情况下还能删到 Creator 角色的 bot，留下无群主的群。
+	//
+	// robot.creator_uid 指向另一个 bot 是构造得出来的：BotFather 的命令链
+	// （messagesListen → HandleMessage → tryCreateBotCore）对「发送者是不是 bot」
+	// 零过滤，挡在前面的只有 checkSendPermission 的好友门。守卫的强度不该依赖
+	// 另一个模块的门，所以这里自己收口。
+	//
+	// 被排除的角色 bot 不会失控：群主/管理员仍可经常规移除接口处置它们。
 	_, err := tx.SelectBySql(
 		"SELECT gm.uid FROM group_member gm "+
 			"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 "+
 			"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "+
-			"AND r.creator_uid = ? FOR UPDATE",
-		groupNo, inviterUID,
+			"AND gm.role = ? AND r.creator_uid = ? FOR UPDATE",
+		groupNo, MemberRoleCommon, inviterUID,
 	).Load(&uids)
 	return uids, err
 }
@@ -1094,13 +1105,21 @@ func (d *DB) QueryCategoryByID(categoryID string) (*CategoryRow, error) {
 }
 
 // LockRemovableMemberTx 事务内锁定成员行并确认它现在仍然可被移除
-// （存在、未删除、且不是群主）。
+// （存在、未删除、且角色符合调用方要求）。
 //
-// 存在的理由是 RemoveGroupMembers 的 creator 过滤读的是事务外快照：目标可能在
-// 快照与删除之间被提升为群主（群主转让接口，或并发的清理工单交接）。
+// 存在的理由是 RemoveGroupMembers 的角色过滤读的是事务外快照：目标可能在
+// 快照与删除之间被提升（群主转让接口、管理员任命，或并发的清理工单交接）。
 // DeleteMemberTx 的 WHERE 没有角色守卫，不锁内复核就会把新群主删掉，
 // 留下一个有成员却无群主、也无人重新选主的群。
-func (d *DB) LockRemovableMemberTx(groupNo string, uid string, tx *dbr.Tx) (bool, error) {
+//
+// requireCommonRole 决定锁内这道门有多严：
+//   - false（既有语义）：只排除 Creator。管理端踢人、Space 级联等路径用它，
+//     群主/管理员本来就有权移除管理员。
+//   - true：只放行 MemberRoleCommon。bot 所有者自助移除用它 —— 该路径在事务外
+//     已拒绝一切非普通角色目标，锁内必须用同一口径收口，否则窗口内 Common→Manager
+//     的提升会通过重查、行真的被删，而且 removedUIDs 里有它、调用方的集合比对
+//     也发现不了，等于普通成员越权移除了一个群管理员。
+func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole bool, tx *dbr.Tx) (bool, error) {
 	var roles []int
 	_, err := tx.SelectBySql(
 		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
@@ -1111,6 +1130,9 @@ func (d *DB) LockRemovableMemberTx(groupNo string, uid string, tx *dbr.Tx) (bool
 	}
 	if len(roles) == 0 {
 		return false, nil // 已离群
+	}
+	if requireCommonRole {
+		return roles[0] == MemberRoleCommon, nil
 	}
 	return roles[0] != MemberRoleCreator, nil
 }

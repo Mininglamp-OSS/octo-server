@@ -3219,20 +3219,53 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		return
 	}
 
-	// 自助路径核对实际移除数：上面的角色守卫读的是事务外快照，而 service 在行锁内
-	// 重读角色，期间目标若被提升为 Creator 就会被**静默跳过**（其 doc 写明「让调用方
-	// 按 Removed 计数发现并重试」，但此前没有调用方真的去看）。不核对的话，这条竞态
+	// 自助路径核对**实际移除集合**：上面的角色守卫读的是事务外快照，而 service 在
+	// 行锁内重读角色，期间状态变化的目标会被静默跳过（其 doc 写明「让调用方按
+	// Removed 计数发现并重试」，但此前没有调用方真的去看）。不核对的话，这条竞态
 	// 窗口仍会回到「200 但成员没动」——正是上面那道守卫要消灭的形态，只是更窄。
+	//
+	// 比对集合而不是比数量：removedUIDs 含级联带走的 bot，数量会被撑大，
+	// 足以把「某个请求目标被跳过」在数字上抹平（请求 2 个、跳过 1 个、级联补 1 个，
+	// 计数仍然相等）。
+	//
+	// 错误码也不写死成「不能移除群主」：跳过的真实原因可能是目标被提升为 Creator
+	// 或 Manager，也可能是 DeleteMemberTx 失败后 service 的 continue（此时事务已
+	// 提交、部分目标已删）。统一回「无权移除」并把缺失的目标记进日志 —— 断言不了
+	// 的原因就不要假装断言得了。
 	// 只在自助路径上核对：后台管理路径本来就允许「部分目标不在群内」的宽松语义。
-	if botOwnerSelfRemoval && removeResp != nil && removeResp.Removed < len(req.Members) {
-		g.Warn("自助移除的实际移除数少于请求数，疑似目标在事务内被提升为群主",
-			zap.String("groupNo", groupNo), zap.String("operator", operator),
-			zap.Int("requested", len(req.Members)), zap.Int("removed", removeResp.Removed))
-		httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
-		return
+	if botOwnerSelfRemoval && removeResp != nil {
+		if missing := missingRemovalTargets(req.Members, removeResp.RemovedUIDs); len(missing) > 0 {
+			g.Warn("自助移除存在未被移除的目标，疑似其角色在事务内发生变化或删除失败",
+				zap.String("groupNo", groupNo), zap.String("operator", operator),
+				zap.Strings("requested", req.Members), zap.Strings("missing", missing))
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+			return
+		}
 	}
 
 	c.ResponseOK()
+}
+
+// missingRemovalTargets 返回「请求移除、但实际没被移除」的目标。
+//
+// 为什么不比数量：removedUIDs 除请求目标外还含级联带走的 bot，数量会被撑大，
+// 于是「请求 2 个、跳过 1 个、级联补 1 个」在计数上完全相等，静默成功照旧发生。
+// 集合比对不受级联影响 —— 多出来的 UID 无所谓，少掉的才是问题。
+func missingRemovalTargets(requested, removedUIDs []string) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	removed := make(map[string]struct{}, len(removedUIDs))
+	for _, uid := range removedUIDs {
+		removed[uid] = struct{}{}
+	}
+	var missing []string
+	for _, uid := range requested {
+		if _, ok := removed[uid]; !ok {
+			missing = append(missing, uid)
+		}
+	}
+	return missing
 }
 
 // 修改群设置
