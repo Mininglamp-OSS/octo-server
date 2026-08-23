@@ -181,6 +181,12 @@ func newManagerMFAIntegration(t *testing.T, failAuth bool) (*wkhttp.WKHttp, *con
 
 func managerMFARequest(t *testing.T, method, path string, body interface{}) *http.Request {
 	t.Helper()
+	ipOctet := atomic.AddUint32(&managerMFAIntegrationIP, 1)%240 + 10
+	return managerMFARequestFromIP(t, fmt.Sprintf("198.51.100.%d", ipOctet), method, path, body)
+}
+
+func managerMFARequestFromIP(t *testing.T, ip, method, path string, body interface{}) *http.Request {
+	t.Helper()
 	var payload []byte
 	if body != nil {
 		var err error
@@ -188,8 +194,7 @@ func managerMFARequest(t *testing.T, method, path string, body interface{}) *htt
 		require.NoError(t, err)
 	}
 	req := httptest.NewRequest(method, path, bytes.NewReader(payload))
-	ipOctet := atomic.AddUint32(&managerMFAIntegrationIP, 1)%240 + 10
-	req.RemoteAddr = fmt.Sprintf("198.51.100.%d:1234", ipOctet)
+	req.RemoteAddr = ip + ":1234"
 	return req
 }
 
@@ -258,6 +263,52 @@ func TestManagerConsoleMFAHandlerFullFlowAndReplay(t *testing.T) {
 		"challenge_id": challengeResp.ChallengeID,
 	}))
 	assert.Equal(t, http.StatusBadRequest, resendAfterSuccess.Code, resendAfterSuccess.Body.String())
+}
+
+func TestManagerConsoleMFAHappyPathDoesNotHitIPRateLimit(t *testing.T) {
+	route, ctx, _, password, recipientEmail := newManagerMFAIntegration(t, false)
+	var user Model
+	_, err := ctx.DB().Select("uid,username").From("user").Where("role=?", string(wkhttp.SuperAdmin)).Load(&user)
+	require.NoError(t, err)
+
+	clientIP := fmt.Sprintf("198.51.100.%d", atomic.AddUint32(&managerMFAIntegrationIP, 1)%240+10)
+	request := func(method, path string, body interface{}) *httptest.ResponseRecorder {
+		return serveManagerMFARequest(t, route, managerMFARequestFromIP(t, clientIP, method, path, body))
+	}
+
+	login := request(http.MethodPost, "/v1/manager/login", map[string]string{
+		"username": user.Username,
+		"password": password,
+	})
+	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
+	var challenge managerLoginResp
+	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &challenge))
+
+	// These rejected requests consume only the MFA bucket. With the old shared
+	// bucket, the subsequent real /send would already be rejected by IP rate
+	// limiting after the initial /login plus five MFA requests.
+	for i := 0; i < managerLoginRateLimitBurst; i++ {
+		invalid := request(http.MethodPost, "/v1/manager/login/send", map[string]string{
+			"challenge_id": "invalid-" + fmt.Sprint(i),
+		})
+		require.NotEqual(t, http.StatusTooManyRequests, invalid.Code,
+			"MFA request %d unexpectedly hit the IP limiter: %s", i+1, invalid.Body.String())
+	}
+
+	send := request(http.MethodPost, "/v1/manager/login/send", map[string]string{
+		"challenge_id": challenge.ChallengeID,
+	})
+	require.NotEqual(t, http.StatusTooManyRequests, send.Code, send.Body.String())
+	require.Equal(t, http.StatusOK, send.Code, send.Body.String())
+
+	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(recipientEmail, commonbase.CodeTypeManagerLogin))
+	require.NoError(t, err)
+	verify := request(http.MethodPost, "/v1/manager/login/verify", map[string]string{
+		"challenge_id": challenge.ChallengeID,
+		"code":         code,
+	})
+	require.NotEqual(t, http.StatusTooManyRequests, verify.Code, verify.Body.String())
+	require.Equal(t, http.StatusOK, verify.Code, verify.Body.String())
 }
 
 func TestManagerConsoleMFAHandlerSMTPFailureCannotVerify(t *testing.T) {

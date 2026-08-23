@@ -73,12 +73,27 @@ func TestManagerEmailMFAPreflightUsesRealSMTPPath(t *testing.T) {
 	settings.ctx.GetConfig().Support.EmailSmtp = newManagerMFAPreflightSMTP(t)
 	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
 	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
-	require.NoError(t, settings.Reload())
+	require.NoError(t, settings.Load())
 
 	preflightCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, settings.PreflightManagerEmailMFA(preflightCtx))
 	require.True(t, settings.ManagerEmailMFAReady())
+}
+
+func TestManagerEmailMFAReloadReprobesChangedConfiguration(t *testing.T) {
+	settings := newTestSystemSettings(t, nil)
+	settings.ctx.GetConfig().Support.Email = "mfa-reload@example.com"
+	settings.ctx.GetConfig().Support.EmailSmtp = newManagerMFAPreflightSMTP(t)
+	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+
+	// Reload is the compatibility path for a direct DB write. It must publish
+	// the new snapshot fail-closed, then perform one real preflight for it.
+	require.NoError(t, settings.Reload())
+	require.Eventually(t, func() bool {
+		return settings.ManagerEmailMFAReady()
+	}, 3*time.Second, 10*time.Millisecond)
 }
 
 func TestManagerEmailMFAAutoReloadReprobesChangedConfiguration(t *testing.T) {

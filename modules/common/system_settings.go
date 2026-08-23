@@ -138,9 +138,8 @@ func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings
 }
 
 // Load reads every row from system_setting and atomically replaces the
-// snapshot. It is used at startup and by explicit Reload calls. Peer
-// re-probing is enabled only by the auto-reload loop; the manager settings
-// write path already probes the prospective configuration synchronously.
+// snapshot. It is the no-probe load used during startup and by write paths
+// that already validated the prospective configuration synchronously.
 func (s *SystemSettings) Load() error {
 	return s.load(false)
 }
@@ -203,11 +202,14 @@ func managerMFASettingsChanged(previous, next *map[string]string) bool {
 	return false
 }
 
-// Reload is the admin-write hook: after the manager API upserts new values
-// it calls this so the change is visible on this instance immediately
-// (other instances pick it up within reloadTTL).
+// Reload refreshes the snapshot and, when manager MFA/SMTP values changed,
+// schedules one generation-bound SMTP preflight. This covers direct DB
+// changes followed by Reload as well as instances that observe a peer change
+// through the automatic reload loop. The manager settings write path uses
+// Load instead because it already probes the merged prospective values before
+// committing the transaction.
 func (s *SystemSettings) Reload() error {
-	return s.Load()
+	return s.load(true)
 }
 
 // StartAutoReload kicks off a goroutine that re-loads the snapshot every

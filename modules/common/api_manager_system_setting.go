@@ -477,7 +477,11 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	}
 	committed = true
 
-	reloadErr := m.systemSettings.Reload()
+	// The merged prospective configuration was already SMTP-probed before the
+	// transaction. Use the no-probe load here so this instance publishes that
+	// result without sending a duplicate probe email; generic Reload callers
+	// still trigger a one-shot probe when they observe a settings change.
+	reloadErr := m.systemSettings.Load()
 	if reloadErr != nil {
 		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
 		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。

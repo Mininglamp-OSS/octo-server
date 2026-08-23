@@ -36,6 +36,9 @@ const (
 	managerLoginRateLimitTag      = "manager_login"
 	managerLoginRateLimitRPS      = 10.0 / 60
 	managerLoginRateLimitBurst    = 5
+	managerMFARateLimitTag        = "manager_mfa"
+	managerMFARateLimitRPS        = 30.0 / 60
+	managerMFARateLimitBurst      = 12
 	managerLoginRateLimitPoolSize = 10
 )
 
@@ -93,12 +96,19 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		managerLoginRateLimitRPS,
 		managerLoginRateLimitBurst,
 	)
+	managerMFALimit := r.StrictIPRateLimitMiddleware(
+		context.Background(),
+		managerLoginRedis,
+		managerMFARateLimitTag,
+		managerMFARateLimitRPS,
+		managerMFARateLimitBurst,
+	)
 	user := r.Group("/v1/manager")
 	{
 		user.POST("/login", managerLoginLimit, m.login) // 账号登录
-		user.POST("/login/send", managerLoginLimit, m.sendManagerMFACode)
-		user.POST("/login/resend", managerLoginLimit, m.resendManagerMFACode)
-		user.POST("/login/verify", managerLoginLimit, m.verifyManagerMFACode)
+		user.POST("/login/send", managerMFALimit, m.sendManagerMFACode)
+		user.POST("/login/resend", managerMFALimit, m.resendManagerMFACode)
+		user.POST("/login/verify", managerMFALimit, m.verifyManagerMFACode)
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{

@@ -31,7 +31,7 @@ func TestManagerSystemSetting_RejectsClearingSMTPWhenManagerMFAIsOn(t *testing.T
 	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
 	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
 	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
-	require.NoError(t, settings.Reload())
+	require.NoError(t, settings.Load())
 
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/manager/common/system_setting", bytes.NewBufferString(
@@ -63,7 +63,7 @@ func TestManagerSystemSetting_ValidatesMergedMFAAndSMTPConfiguration(t *testing.
 	settings.ctx.GetConfig().Support.Email = "mfa-sender@example.com"
 	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
 	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
-	require.NoError(t, settings.Reload())
+	require.NoError(t, settings.Load())
 
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/manager/common/system_setting", bytes.NewBufferString(

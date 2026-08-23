@@ -22,7 +22,7 @@ func TestManagerEmailMFAStateIsTriStateAndFailClosed(t *testing.T) {
 	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
 	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
 	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
-	require.NoError(t, settings.Reload())
+	require.NoError(t, settings.Load())
 
 	assert.Equal(t, ManagerEmailMFAOn, settings.ManagerEmailMFAState())
 	assert.False(t, settings.ManagerEmailMFAReady(), "MFA must remain fail-closed before a real preflight")

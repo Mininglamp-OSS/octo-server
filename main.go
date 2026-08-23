@@ -480,7 +480,7 @@ func runAPI(ctx *config.Context) {
 	// failed readiness and the manager login gate remains fail-closed until a
 	// later successful probe or policy change.
 	managerMFASettings := commonmodule.EnsureSystemSettings(ctx)
-	if err := managerMFASettings.Reload(); err != nil {
+	if err := managerMFASettings.Load(); err != nil {
 		log.Warn("reload SystemSettings after module setup failed; manager MFA remains fail-closed until reload succeeds", zap.Error(err))
 	} else if managerMFASettings.ManagerEmailMFAState() == commonmodule.ManagerEmailMFAOn {
 		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 20*time.Second)
