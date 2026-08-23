@@ -1517,3 +1517,24 @@ change-log convention (§7). Newest first.
   `SpaceMiddleware` for 60s with nothing logged.
   See [journal](journal/shared/cleanup-queue-durability.md).
 
+## 2026-08-23 (space-member-removal follow-ups · wrap-up)
+
+- **Reverted** — The durable IM-unsubscribe outbox (`eb74529`) was implemented and
+  then withdrawn (`78e46d3`) after five-lens adversarial review. Three reviewers
+  independently found it reintroduced the exact leak it targets (an `abandoned` row
+  became a permanent tombstone that silently swallowed every later enqueue while the
+  log claimed "queued for retry"), and it added a new one (firing without
+  re-validating membership turns blacklist→un-blacklist into a permanent cutoff of an
+  active, visible member). The problem statement and the measured broker evidence
+  stand; the design does not. Corrected requirements are written into
+  `.octospec/tasks/im-pending-outbox/brief.md`.
+- **Fixed** — Two guard tests that could not fail for what they existed to check
+  (mutation-proven, then re-verified with the reviewers' own mutations), and a sweep
+  that took next-key locks across the whole pending range — reproduced as
+  `ERROR 1205` on a brand-new non-conflicting insert, which is the removal-cleanup
+  enqueue inside the removal transaction. See
+  [journal](journal/shared/cleanup-queue-durability.md).
+- **Learning** — `learnings/pending/mutation-testing-must-be-adversarial.md`: an
+  author-chosen mutation only proves the test catches what the author already thought
+  of. The same guard was green on the real security regression and red on whitespace.
+

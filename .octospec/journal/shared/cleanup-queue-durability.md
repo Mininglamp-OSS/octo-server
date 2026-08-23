@@ -124,3 +124,55 @@ v2.2.4-20260313, `modules/space` under `-race -shuffle=on`, `golangci-lint` 0 is
   same); mounting the endpoint is separate infrastructure work.
 - The durable IM-pending outbox (#797's P0), the purge throughput item, the
   `(group_no, created_at)` index, and the join-vs-disband root cause.
+
+---
+
+## 更正（2026-08-23，`3f22ac0`）
+
+上面描述的 sweep 与 metrics 是**第一版**。对抗式审查发现三处缺陷，均已修正；
+记录在这里而不是改写原文，因为"当时怎么想的"和"后来错在哪"都有价值。
+
+### 扫描会锁住整个待办队列
+
+第一版是一条带 WHERE 的 UPDATE。`attempts` 不在任何索引里，所以 REPEATABLE READ 下
+它对**整个 `status=0` 范围**加 next-key 锁 —— `LIMIT` 限制的是"改了几行"，不是
+"锁了几行"。
+
+实测复现：扫描在途时，另一个连接插入一条**全新、不冲突**的行会得到
+`ERROR 1205 Lock wait timeout`。而那条 INSERT 正是移除清理的入队，发生在移除事务内部。
+净效果：**队列一积压，踢人就随机失败** —— 一个此前永远成功的操作。
+
+改成先用非锁定读选出 id、再按主键 UPDATE。同一复现下入队成功。
+
+**教训**:`LIMIT` 在 UPDATE 上给人一种"影响面已经被限制住了"的错觉。它限制的是写，
+不是锁。判断锁范围要看**可用的访问路径**，而不是看 LIMIT。
+
+### 扫描会把跑成功的作业判死
+
+第一版只要求"租约已过期"。但本文件自己写着大空间的级联"几十个群就能跑上几分钟"——
+**跑过 10 分钟租约是预期内的，不是进程死了**。那种情况下作业还在正常推进、随后会
+成功，却被扫描判成 `abandoned` 并触发"需人工介入"告警；而它自己的 finish 因为 status
+已变而落空，只留下一句误导的"租约已易主"。**完成的工作被永久记成放弃。**
+
+现在要求 `lease_until <= now - removalCleanupLease`（一整个租约周期的宽限），外加
+`lease_until IS NOT NULL` 以免碰到从没被认领过的行。
+
+### 认领查询的 `ORDER BY id` 让索引失效
+
+EXPLAIN 实证：带 `ORDER BY id LIMIT 1` 时 `type=index / key=PRIMARY`，去掉后
+`type=range / key=idx_pending`。优化器认为"按主键顺序扫、取第一条命中"更划算，于是
+放弃 pending 索引。而 `abandoned` 行永不删除且集中在低 id 段，**扫描长度随部署年龄
+单调增长**。FIFO 本来也不是保证——`SKIP LOCKED` 已经让多副本的实际取件顺序不确定。
+
+### 两条本以为在保护什么的注释，是错的
+
+- "本 PR 不引入 /metrics 端点" —— **假的**。`pkg/metrics` 早就在服务 /metrics，
+  `main.go` 里启动。这句是从 `modules/oidc/metrics.go` 照抄的，那句话在 oidc 写下时
+  是真的，现在不是了。**照抄注释而不核实，等于把一条过期断言复制到新地方。**
+- `oldest_pending_age_seconds` 拿 `UTC_TIMESTAMP(3)` 去减 `created_at`，而后者从不由
+  Go 写入、走列默认值（MySQL 会话时区）。`TZ=Asia/Shanghai` + `loc=Local` 的部署下读
+  出 `-28799`，要等积压满 8 小时才转正 —— 而这个 gauge 恰恰是用来在大规模放弃**发生
+  之前**报警的，在那个点上它是坏的。改成 `NOW(3)`，两边同为会话时区。
+
+同时把指标挪到独立的 5 分钟节奏：那条查询是全表聚合（`MIN(created_at)` 无索引可用），
+而它恰恰会在最需要它的那一刻——一次大规模放弃之后——变得更慢。
