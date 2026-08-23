@@ -23,7 +23,7 @@ import (
 func seedConsoleAccountForGuard(t *testing.T, ctx *config.Context, uid, username, role, email string, status, isDestroy int) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
-		"INSERT INTO `user` (uid, username, name, short_no, role, email, status, is_destroy) "+
+		"INSERT INTO `user` (uid, username, name, short_no, role, manager_two_factor_email, status, is_destroy) "+
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		uid, username, username, uid, role, email, status, isDestroy,
 	).Exec()
@@ -86,10 +86,12 @@ func TestManager2FAEnableGuard(t *testing.T) {
 
 	// Turning it OFF is never blocked — that is the recovery path for a
 	// deployment that has locked itself out.
-	require.Equal(t, http.StatusOK, post("0").Code, post("0").Body.String())
+	off := post("0")
+	require.Equal(t, http.StatusOK, off.Code, off.Body.String())
 
 	// With every console account addressable, the switch flips.
-	_, err := ctx.DB().UpdateBySql("UPDATE `user` SET email=CONCAT(uid,'@example.com') WHERE email=''").Exec()
+	_, err := ctx.DB().UpdateBySql(
+		"UPDATE `user` SET manager_two_factor_email=CONCAT(uid,'@example.com') WHERE manager_two_factor_email=''").Exec()
 	require.NoError(t, err)
 	enabled := post("1")
 	require.Equal(t, http.StatusOK, enabled.Code, enabled.Body.String())

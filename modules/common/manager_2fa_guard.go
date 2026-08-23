@@ -8,7 +8,12 @@ import (
 )
 
 // managerConsoleAccountsMissingEmail returns the usernames of accounts that can
-// sign in to the management console but have no email address on file.
+// sign in to the management console but have no second-factor address on file.
+//
+// It reads user.manager_two_factor_email, NOT user.email: the console second
+// factor deliberately does not reuse the login-identity column (see the
+// 20260823000002 migration), so an account with a personal email but no
+// second-factor address is still a blocker.
 //
 // "Can sign in" mirrors the gate in modules/user Manager.login exactly —
 // role ∈ auth.ManagerConsoleRoles, status != UserDisable(0), is_destroy != 2 —
@@ -26,7 +31,7 @@ func managerConsoleAccountsMissingEmail(ctx *config.Context) ([]string, error) {
 		Where("role IN ?", auth.ManagerConsoleRoles).
 		Where("status<>0").
 		Where("is_destroy<>2").
-		Where("email IS NULL OR TRIM(email)=''").
+		Where("manager_two_factor_email IS NULL OR TRIM(manager_two_factor_email)=''").
 		OrderBy("username").
 		Load(&usernames)
 	if err != nil {

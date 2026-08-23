@@ -57,6 +57,7 @@ const (
 	manager2FACodeKeyPrefix     = "mgr2fa:code:"
 	manager2FACooldownKeyPrefix = "mgr2fa:cooldown:"
 	manager2FAFailKeyPrefix     = "mgr2fa:fail:"
+	manager2FASendQuotaPrefix   = "mgr2fa:sends:"
 	manager2FALockKeyPrefix     = "mgr2fa:lock:"
 	// The pending handshake is keyed by its own opaque token rather than by uid:
 	// the client holds the token between the two requests, and it must not be
@@ -70,12 +71,14 @@ const (
 	// anti-spam scanning, short enough that a code sitting in a mailbox is not a
 	// standing key. Kept in sync with the TTL rendered into the email body.
 	manager2FACodeTTL = 5 * time.Minute
-	// Pending-handshake lifetime, deliberately ONE MINUTE LONGER than the code.
-	// If the two were equal, a code submitted in its final seconds could fail
-	// because the handshake expired first — reported through the same
-	// anti-enumeration error as a wrong code, which is unexplainable to the
-	// operator and to whoever reads the ticket.
-	manager2FAPendingTTL = 6 * time.Minute
+	// How much longer than its code a handshake lives. If the two expired
+	// together, a code submitted in its final seconds could fail because the
+	// handshake went first — reported through the same anti-enumeration error as
+	// a wrong code, which is unexplainable to the operator and to whoever reads
+	// the ticket. The deadline is always derived from the code's own expiry
+	// (see pendingDeadline) rather than from a second independent clock, so the
+	// gap holds even when a handshake is minted for a code issued earlier.
+	manager2FAPendingGrace = time.Minute
 	// Per-uid resend cooldown, mirroring the shared email service's 1 minute.
 	manager2FAResendCooldown = time.Minute
 	// Wrong-code budget, then a lockout. Counted per UID rather than per
@@ -86,6 +89,12 @@ const (
 	manager2FACodeLockTTL     = 10 * time.Minute
 	// Resend budget for a single handshake.
 	manager2FAMaxResends = 3
+	// Codes per account per hour, across every handshake. The per-handshake
+	// resend budget cannot bound this on its own: signing in again mints a fresh
+	// handshake with a fresh budget, so an actor holding the password could
+	// otherwise mail the administrator a code every minute indefinitely.
+	manager2FAMaxSendsPerHour = 10
+	manager2FASendQuotaWindow = time.Hour
 	// Bound the SMTP round-trip. The transport's own defaults are 15s dial +
 	// 60s IO and the shared call sites pass context.Background(), which would
 	// let a sick mail server hold a sign-in request open for over a minute.
@@ -100,7 +109,17 @@ var (
 	errManager2FAInvalid          = errors.New("manager 2fa: invalid or expired verification")
 	errManager2FAResendCooldown   = errors.New("manager 2fa: resend cooldown active")
 	errManager2FAResendsExhausted = errors.New("manager 2fa: resend budget exhausted")
+	errManager2FASendQuota        = errors.New("manager 2fa: hourly send quota exhausted")
+	errManager2FAAddressMissing   = errors.New("manager 2fa: account has no delivery address")
 )
+
+// manager2FACode is the live code plus its own deadline. The deadline is stored
+// rather than inferred from the Redis TTL because a handshake minted for an
+// already-delivered code has to inherit it — see pendingDeadline.
+type manager2FACode struct {
+	Code      string `json:"code"`
+	ExpiresAt int64  `json:"expires_at"`
+}
 
 // manager2FAPending is the server-side half of the handshake. It is stored under
 // an opaque token and never returned to the client.
@@ -112,7 +131,9 @@ var (
 type manager2FAPending struct {
 	UID      string `json:"uid"`
 	Username string `json:"username"`
-	Email    string `json:"email"`
+	// Address is where this handshake's codes go: the account's
+	// manager_two_factor_email, never its email identity.
+	Address  string `json:"address"`
 	IP       string `json:"ip"`
 	Language string `json:"language"`
 	// PasswordFingerprint is a digest of the stored password hash as it was when
@@ -142,10 +163,14 @@ func (p *manager2FAPending) remaining() time.Duration {
 }
 
 // manager2FA owns the second-factor handshake: code lifecycle, pending store and
-// delivery. It deliberately holds no DB handle — the caller has already resolved
-// and re-validated the account before anything here runs.
+// delivery.
+//
+// It holds a DB handle for one reason only — resending re-reads the delivery
+// address, so a SuperAdmin who corrects a typo'd address takes effect on the
+// next resend instead of only after the operator restarts the whole sign-in.
 type manager2FA struct {
 	ctx      *config.Context
+	db       *managerDB
 	emailSvc commonapi.IEmailService
 	log.Log
 }
@@ -153,6 +178,7 @@ type manager2FA struct {
 func newManager2FA(ctx *config.Context) *manager2FA {
 	return &manager2FA{
 		ctx:      ctx,
+		db:       newManagerDB(ctx),
 		emailSvc: commonapi.NewEmailService(ctx, common.EnsureSystemSettings(ctx)),
 		Log:      log.NewTLog("managerTwoFactor"),
 	}
@@ -160,10 +186,12 @@ func newManager2FA(ctx *config.Context) *manager2FA {
 
 // start issues a code, delivers it, and returns the opaque handshake token.
 //
-// Order matters: the code is persisted BEFORE the email goes out (a delivered
-// code that cannot be redeemed is worse than an undelivered one), and the
-// pending record is written only after delivery succeeds, so a failed send
-// leaves nothing behind for the client to retry against.
+// Delivery happens BEFORE the code is stored. The reverse order would overwrite
+// a live code with one the mail server then refused to deliver, stranding an
+// operator who is holding a perfectly good code in their inbox; storing only
+// after a successful send leaves the previous code intact when delivery fails.
+// The narrow cost is a delivered code that a Redis failure prevented storing —
+// the caller sees an error and can retry.
 func (s *manager2FA) start(ctx context.Context, account *managerLoginModel, clientIP, lang string) (token string, err error) {
 	// A second sign-in while the send cooldown is still active does NOT send
 	// another code — but it must still hand back a usable handshake. The
@@ -178,57 +206,130 @@ func (s *manager2FA) start(ctx context.Context, account *managerLoginModel, clie
 		if !errors.Is(err, errManager2FAResendCooldown) {
 			return "", err
 		}
-		live, liveErr := s.ctx.GetRedisConn().GetString(manager2FACodeKeyPrefix + account.UID)
+		live, liveErr := s.liveCode(account.UID)
 		if liveErr != nil {
-			return "", fmt.Errorf("manager 2fa: read live code: %w", liveErr)
+			return "", liveErr
 		}
-		if live == "" {
+		if live == nil {
 			// Cooling down with no code left to reuse: nothing better to offer
 			// than asking the operator to wait.
 			return "", err
 		}
-		return s.issuePending(account, clientIP, lang)
+		return s.issuePending(account, clientIP, lang, live.ExpiresAt)
+	}
+	if err := s.chargeSendQuota(account.UID); err != nil {
+		return "", err
 	}
 	code, err := commonapi.GenerateVerifyCode(manager2FACodeLength)
 	if err != nil {
 		return "", fmt.Errorf("manager 2fa: generate code: %w", err)
 	}
-	redis := s.ctx.GetRedisConn()
-	if err := redis.SetAndExpire(manager2FACodeKeyPrefix+account.UID, code, manager2FACodeTTL); err != nil {
-		return "", fmt.Errorf("manager 2fa: persist code: %w", err)
-	}
-	if err := s.deliver(ctx, account, code, clientIP, lang); err != nil {
-		// Do not leave a redeemable code behind for a message nobody received.
-		_ = redis.Del(manager2FACodeKeyPrefix + account.UID)
+	if err := s.deliver(ctx, account, account.ManagerTwoFactorEmail, code, clientIP, lang); err != nil {
 		return "", err
 	}
-	if err := redis.SetAndExpire(manager2FACooldownKeyPrefix+account.UID, "1", manager2FAResendCooldown); err != nil {
+	expiresAt, err := s.storeCode(account.UID, code)
+	if err != nil {
+		return "", err
+	}
+	if err := s.ctx.GetRedisConn().SetAndExpire(
+		manager2FACooldownKeyPrefix+account.UID, "1", manager2FAResendCooldown); err != nil {
 		return "", fmt.Errorf("manager 2fa: persist cooldown: %w", err)
 	}
-	return s.issuePending(account, clientIP, lang)
+	return s.issuePending(account, clientIP, lang, expiresAt)
 }
 
-// issuePending mints a fresh handshake for an already-delivered code.
-func (s *manager2FA) issuePending(account *managerLoginModel, clientIP, lang string) (string, error) {
+// issuePending mints a handshake for an already-delivered code.
+//
+// codeExpiresAt is the code's own deadline; the handshake outlives it by exactly
+// manager2FAPendingGrace, whether the code was just sent or is being reused.
+func (s *manager2FA) issuePending(account *managerLoginModel, clientIP, lang string, codeExpiresAt int64) (string, error) {
 	pending := &manager2FAPending{
 		UID:                 account.UID,
 		Username:            account.Username,
-		Email:               account.Email,
+		Address:             account.ManagerTwoFactorEmail,
 		IP:                  clientIP,
 		Language:            lang,
 		PasswordFingerprint: manager2FAPasswordFingerprint(account.Password),
-		ExpiresAt:           time.Now().Add(manager2FAPendingTTL).Unix(),
+		ExpiresAt:           pendingDeadline(codeExpiresAt),
 	}
 	token := util.GenerUUID()
-	if err := s.savePending(token, pending, manager2FAPendingTTL); err != nil {
+	ttl := time.Until(time.Unix(pending.ExpiresAt, 0))
+	if ttl <= 0 {
+		return "", errManager2FAInvalid
+	}
+	if err := s.savePending(token, pending, ttl); err != nil {
 		return "", err
 	}
 	return token, nil
 }
 
+// pendingDeadline keeps the handshake alive slightly past its code.
+func pendingDeadline(codeExpiresAt int64) int64 {
+	return time.Unix(codeExpiresAt, 0).Add(manager2FAPendingGrace).Unix()
+}
+
+// storeCode writes the live code and returns the deadline it was written with.
+func (s *manager2FA) storeCode(uid, code string) (int64, error) {
+	record := manager2FACode{Code: code, ExpiresAt: time.Now().Add(manager2FACodeTTL).Unix()}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return 0, fmt.Errorf("manager 2fa: encode code: %w", err)
+	}
+	if err := s.ctx.GetRedisConn().SetAndExpire(
+		manager2FACodeKeyPrefix+uid, string(encoded), manager2FACodeTTL); err != nil {
+		return 0, fmt.Errorf("manager 2fa: persist code: %w", err)
+	}
+	return record.ExpiresAt, nil
+}
+
+// liveCode returns the account's current code, or nil when there is none.
+func (s *manager2FA) liveCode(uid string) (*manager2FACode, error) {
+	raw, err := s.ctx.GetRedisConn().GetString(manager2FACodeKeyPrefix + uid)
+	if err != nil {
+		return nil, fmt.Errorf("manager 2fa: read code: %w", err)
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var record manager2FACode
+	if err := json.Unmarshal([]byte(raw), &record); err != nil {
+		s.Error("解析管理台二次认证验证码记录失败", zap.Error(err))
+		return nil, nil
+	}
+	if record.Code == "" || time.Now().After(time.Unix(record.ExpiresAt, 0)) {
+		return nil, nil
+	}
+	return &record, nil
+}
+
+// chargeSendQuota bounds how many codes one account can be mailed per hour,
+// across every handshake it starts.
+func (s *manager2FA) chargeSendQuota(uid string) error {
+	redis := s.ctx.GetRedisConn()
+	key := manager2FASendQuotaPrefix + uid
+	sends, err := redis.Incr(key)
+	if err != nil {
+		return fmt.Errorf("manager 2fa: charge send quota: %w", err)
+	}
+	if sends == 1 {
+		// INCR alone leaves the key immortal; the window starts at the first send.
+		if err := redis.Expire(key, manager2FASendQuotaWindow); err != nil {
+			s.Error("设置管理台二次认证发送配额过期失败", zap.Error(err))
+		}
+	}
+	if sends > manager2FAMaxSendsPerHour {
+		return errManager2FASendQuota
+	}
+	return nil
+}
+
 // resend re-issues a code for an existing handshake. It never extends the
 // handshake deadline: a caller cannot keep a pending sign-in alive indefinitely
 // by asking for more codes.
+//
+// The delivery address is re-read from the account rather than taken from the
+// handshake, so a SuperAdmin who corrects a typo'd address takes effect on the
+// next resend instead of only after the operator restarts the whole sign-in.
 func (s *manager2FA) resend(ctx context.Context, token, clientIP string) (*manager2FAPending, error) {
 	pending, err := s.loadPending(token)
 	if err != nil {
@@ -240,31 +341,41 @@ func (s *manager2FA) resend(ctx context.Context, token, clientIP string) (*manag
 	if err := s.checkCooldown(pending.UID); err != nil {
 		return nil, err
 	}
+	account, err := s.db.queryUserInfoWithNameAndPwd(pending.Username)
+	if err != nil {
+		return nil, fmt.Errorf("manager 2fa: reload account: %w", err)
+	}
+	if account == nil || account.UID != pending.UID {
+		return nil, errManager2FAInvalid
+	}
+	if strings.TrimSpace(account.ManagerTwoFactorEmail) == "" {
+		return nil, errManager2FAAddressMissing
+	}
+	pending.Address = account.ManagerTwoFactorEmail
+	if err := s.chargeSendQuota(pending.UID); err != nil {
+		return pending, err
+	}
 	code, err := commonapi.GenerateVerifyCode(manager2FACodeLength)
 	if err != nil {
-		return nil, fmt.Errorf("manager 2fa: generate code: %w", err)
+		return pending, fmt.Errorf("manager 2fa: generate code: %w", err)
 	}
-	redis := s.ctx.GetRedisConn()
-	if err := redis.SetAndExpire(manager2FACodeKeyPrefix+pending.UID, code, manager2FACodeTTL); err != nil {
-		return nil, fmt.Errorf("manager 2fa: persist code: %w", err)
+	if err := s.deliver(ctx, account, pending.Address, code, clientIP, pending.Language); err != nil {
+		return pending, err
 	}
-	// Only the delivery-relevant fields; resending re-sends a code, it never
-	// re-authorises anything, so the pending record's own fingerprint stands.
-	account := &managerLoginModel{UID: pending.UID, Username: pending.Username, Email: pending.Email}
-	if err := s.deliver(ctx, account, code, clientIP, pending.Language); err != nil {
-		_ = redis.Del(manager2FACodeKeyPrefix + pending.UID)
-		return nil, err
+	if _, err := s.storeCode(pending.UID, code); err != nil {
+		return pending, err
 	}
-	if err := redis.SetAndExpire(manager2FACooldownKeyPrefix+pending.UID, "1", manager2FAResendCooldown); err != nil {
-		return nil, fmt.Errorf("manager 2fa: persist cooldown: %w", err)
+	if err := s.ctx.GetRedisConn().SetAndExpire(
+		manager2FACooldownKeyPrefix+pending.UID, "1", manager2FAResendCooldown); err != nil {
+		return pending, fmt.Errorf("manager 2fa: persist cooldown: %w", err)
 	}
 	pending.Resends++
 	remaining := pending.remaining()
 	if remaining <= 0 {
-		return nil, errManager2FAInvalid
+		return pending, errManager2FAInvalid
 	}
 	if err := s.savePending(token, pending, remaining); err != nil {
-		return nil, err
+		return pending, err
 	}
 	return pending, nil
 }
@@ -301,11 +412,19 @@ func (s *manager2FA) verify(token, code string) (*manager2FAPending, error) {
 		s.consume(token, pending.UID)
 		return pending, nil
 	}
-	stored, err := redis.GetString(manager2FACodeKeyPrefix + pending.UID)
+	live, err := s.liveCode(pending.UID)
 	if err != nil {
-		return nil, fmt.Errorf("manager 2fa: read code: %w", err)
+		return nil, err
 	}
-	if stored != "" && subtle.ConstantTimeCompare([]byte(stored), []byte(code)) == 1 {
+	if live == nil {
+		// No code to be wrong about — expired, already redeemed, or never stored
+		// because delivery failed. Charging the wrong-code budget here would let
+		// an operator retyping a stale code lock their own account without a
+		// single guess having been made.
+		s.Warn("管理台二次认证无可用验证码", zap.String("uid", pending.UID))
+		return pending, errManager2FAInvalid
+	}
+	if subtle.ConstantTimeCompare([]byte(live.Code), []byte(code)) == 1 {
 		s.consume(token, pending.UID)
 		return pending, nil
 	}
@@ -314,7 +433,7 @@ func (s *manager2FA) verify(token, code string) (*manager2FAPending, error) {
 }
 
 // deliver renders and sends the second-factor email under a bounded deadline.
-func (s *manager2FA) deliver(ctx context.Context, account *managerLoginModel, code, clientIP, lang string) error {
+func (s *manager2FA) deliver(ctx context.Context, account *managerLoginModel, address, code, clientIP, lang string) error {
 	rendered, err := emailtmpl.Render(emailtmpl.KeyManagerLoginCode, lang, emailtmpl.ManagerLoginCodeData{
 		Code:     code,
 		Username: account.Username,
@@ -330,7 +449,7 @@ func (s *manager2FA) deliver(ctx context.Context, account *managerLoginModel, co
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, manager2FASendTimeout)
 	defer cancel()
-	if err := s.emailSvc.SendTransactionalHTML(sendCtx, account.Email, rendered.Subject, rendered.HTML, rendered.Text); err != nil {
+	if err := s.emailSvc.SendTransactionalHTML(sendCtx, address, rendered.Subject, rendered.HTML, rendered.Text); err != nil {
 		return fmt.Errorf("manager 2fa: send email: %w", err)
 	}
 	return nil
@@ -435,16 +554,20 @@ func (s *manager2FA) loadPending(token string) (*manager2FAPending, error) {
 // maskManagerEmail renders an address for the sign-in screen: enough to tell the
 // operator which mailbox to open, not enough to disclose an address they did not
 // already know.
+//
+// Rune-based, not byte-based: a non-ASCII local part sliced by bytes would be cut
+// mid-rune and render as replacement characters — exactly where the operator
+// needs to recognise their own address.
 func maskManagerEmail(email string) string {
 	at := strings.IndexByte(email, '@')
 	if at <= 0 {
 		return "***"
 	}
-	local, domain := email[:at], email[at:]
+	local, domain := []rune(email[:at]), email[at:]
 	if len(local) <= 2 {
 		return strings.Repeat("*", len(local)) + domain
 	}
-	return local[:1] + strings.Repeat("*", len(local)-2) + local[len(local)-1:] + domain
+	return string(local[0]) + strings.Repeat("*", len(local)-2) + string(local[len(local)-1]) + domain
 }
 
 // managerOutboundLanguage picks the language for the second-factor email: the

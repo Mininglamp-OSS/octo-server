@@ -539,51 +539,55 @@ type Detail struct {
 
 // Model 用户db model
 type Model struct {
-	AppID             string //app id
-	UID               string // 用户唯一id
-	Name              string // 用户名称
-	Username          string // 用户名
-	Email             string // email地址
-	Password          string // 用户密码
-	Category          string //用户分类
-	Sex               int    //性别
-	ShortNo           string //唯一短编号
-	ShortStatus       int    //唯一短编号是否修改0.否1.是
-	Zone              string //区号
-	Phone             string //手机号
-	ChatPwd           string //聊天密码
-	LockScreenPwd     string // 锁屏密码
-	LockAfterMinute   int    // 在几分钟后锁屏 0表示立即
-	DeviceLock        int    //是否开启设备锁
-	SearchByPhone     int    //是否可以通过手机号搜索0.否1.是
-	SearchByShort     int    //是否可以通过短编号搜索0.否1.是
-	NewMsgNotice      int    //新消息通知0.否1.是
-	MsgShowDetail     int    //显示消息通知详情0.否1.是
-	VoiceOn           int    //声音0.否1.是
-	ShockOn           int    //震动0.否1.是
-	OfflineProtection int    // 离线保护
-	Version           int64
-	Status            int          // 状态 0.禁用 1.启用
-	Vercode           string       //验证码
-	QRVercode         string       // 二维码验证码
-	IsUploadAvatar    int          // 是否上传过头像0:未上传1:已上传
-	AvatarVersion     int64        // 头像对象版本，0 表示旧版稳定路径
-	Role              string       // 系统角色 admin/superAdmin/dashboardReader（临时只读看板角色）
-	Robot             int          // 机器人0.否1.是
-	MuteOfApp         int          // app是否禁音（当pc登录的时候app可以设置禁音，当pc登录后有效）
-	IsDestroy         int          // 注销状态 0.正常 1.注销申请中（冷静期） 2.已注销
-	DestroyApplyAt    dbr.NullTime // 注销申请时间
-	DestroyExpireAt   dbr.NullTime // 注销到期执行时间
-	WXOpenid          string       // 微信openid
-	WXUnionid         string       // 微信unionid
-	GiteeUID          string       // gitee uid
-	GithubUID         string       // github uid
-	Web3PublicKey     string       // web3公钥
-	MsgExpireSecond   int64        // 消息过期时长
-	Language          string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
-	PhoneEncrypted    []byte       // 手机号密文(AES-256-GCM)，phone 的加密影子列，第一阶双写，phone 明文列暂留
-	PhoneHash         string       // 手机号盲索引 HMAC-SHA256(长度前缀 zone + phone) 十六进制，用于精确检索
-	PhoneLast4        string       // 手机号后4位明文(低敏)，供模糊检索
+	AppID    string //app id
+	UID      string // 用户唯一id
+	Name     string // 用户名称
+	Username string // 用户名
+	Email    string // email地址
+	// ManagerTwoFactorEmail 管理台二次认证验证码收件地址。与 Email 分开存放：Email 是
+	// 登录身份（邮箱验证码登录 / 忘记密码都按它反查账号），二次认证地址只被管理台发码
+	// 路径读取，不参与账号解析。见 20260823000002 migration 的说明。
+	ManagerTwoFactorEmail string
+	Password              string // 用户密码
+	Category              string //用户分类
+	Sex                   int    //性别
+	ShortNo               string //唯一短编号
+	ShortStatus           int    //唯一短编号是否修改0.否1.是
+	Zone                  string //区号
+	Phone                 string //手机号
+	ChatPwd               string //聊天密码
+	LockScreenPwd         string // 锁屏密码
+	LockAfterMinute       int    // 在几分钟后锁屏 0表示立即
+	DeviceLock            int    //是否开启设备锁
+	SearchByPhone         int    //是否可以通过手机号搜索0.否1.是
+	SearchByShort         int    //是否可以通过短编号搜索0.否1.是
+	NewMsgNotice          int    //新消息通知0.否1.是
+	MsgShowDetail         int    //显示消息通知详情0.否1.是
+	VoiceOn               int    //声音0.否1.是
+	ShockOn               int    //震动0.否1.是
+	OfflineProtection     int    // 离线保护
+	Version               int64
+	Status                int          // 状态 0.禁用 1.启用
+	Vercode               string       //验证码
+	QRVercode             string       // 二维码验证码
+	IsUploadAvatar        int          // 是否上传过头像0:未上传1:已上传
+	AvatarVersion         int64        // 头像对象版本，0 表示旧版稳定路径
+	Role                  string       // 系统角色 admin/superAdmin/dashboardReader（临时只读看板角色）
+	Robot                 int          // 机器人0.否1.是
+	MuteOfApp             int          // app是否禁音（当pc登录的时候app可以设置禁音，当pc登录后有效）
+	IsDestroy             int          // 注销状态 0.正常 1.注销申请中（冷静期） 2.已注销
+	DestroyApplyAt        dbr.NullTime // 注销申请时间
+	DestroyExpireAt       dbr.NullTime // 注销到期执行时间
+	WXOpenid              string       // 微信openid
+	WXUnionid             string       // 微信unionid
+	GiteeUID              string       // gitee uid
+	GithubUID             string       // github uid
+	Web3PublicKey         string       // web3公钥
+	MsgExpireSecond       int64        // 消息过期时长
+	Language              string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
+	PhoneEncrypted        []byte       // 手机号密文(AES-256-GCM)，phone 的加密影子列，第一阶双写，phone 明文列暂留
+	PhoneHash             string       // 手机号盲索引 HMAC-SHA256(长度前缀 zone + phone) 十六进制，用于精确检索
+	PhoneLast4            string       // 手机号后4位明文(低敏)，供模糊检索
 	db.BaseModel
 }
 

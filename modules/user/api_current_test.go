@@ -120,6 +120,7 @@ func TestUserCurrent_UnverifiedUser(t *testing.T) {
 //   - login 走 execLoginAndRespose → c.Response(result),顶层直接是 loginUserDetailResp;
 //   - usernamelogin 在 api_usernamelogin.go:138 包了一层 {"data": result,
 //     "need_upload_web3publickey": ...},顶层断言路径会失败。
+//
 // 两条路径共用 execLogin → applyRealnameToLoginResp,测 login 就覆盖契约。
 func TestUserLogin_CarriesRealnameFields(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")

@@ -348,15 +348,17 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Two-factor authentication is enabled but this account has no email address configured. Contact a super administrator.",
 	})
-	// ErrUserManagerEmailTaken fires when a SuperAdmin tries to point a console
-	// account at an address another account already uses. user.email carries only
-	// a non-unique index, so nothing at the storage layer would stop it — and a
-	// duplicate quietly breaks email sign-in for BOTH accounts, since that lookup
-	// resolves an address to a single row.
-	ErrUserManagerEmailTaken = register(codes.Code{
-		ID:             "err.server.user.manager_email_taken",
-		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "This email address is already used by another account.",
+	// ErrUserManager2FASendQuotaExceeded caps how many second-factor codes one
+	// account can be mailed per hour, across every handshake.
+	//
+	// The per-handshake resend budget cannot bound this: signing in again mints a
+	// fresh handshake with a fresh budget, so without an account-level quota an
+	// actor holding the console password could mail the administrator a code
+	// every minute indefinitely.
+	ErrUserManager2FASendQuotaExceeded = register(codes.Code{
+		ID:             "err.server.user.manager_2fa_send_quota_exceeded",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Too many verification codes have been requested for this account, please try again later.",
 	})
 	// ErrUserManager2FAResendExhausted fires when a pending sign-in has used up
 	// its resend budget. Distinct from ErrUserEmailRateLimited (a cooldown that

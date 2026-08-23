@@ -133,19 +133,19 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/admin", m.addAdminUser) // 添加一个管理员
 		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才读得到 uid）：这是二次认证
 		// 验证码的投递地址写面，误用/脚本失控的代价是把验证码改投到别处，必须有 per-user 频控。
-		auth.PUT("/user/admin/email", appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.updateAdminUserEmail) // 设置/修改管理台账号的邮箱（二次认证收件地址）
-		auth.GET("/user/admin", m.getAdminUsers)                                                        // 查询管理员用户
-		auth.DELETE("/user/admin", m.deleteAdminUsers)                                                  // 删除管理员用户
-		auth.POST("/user/add", m.addUser)                                                               // 添加一个用户
-		auth.POST("/user/resetpassword", m.resetUserPassword)                                           // 重置用户密码
-		auth.GET("/user/list", m.list)                                                                  // 用户列表
-		auth.GET("/user/friends", m.friends)                                                            // 某个用户的好友
-		auth.GET("/user/blacklist", m.blacklist)                                                        // 用户黑名单列表
-		auth.GET("/user/disablelist", m.disableUsers)                                                   // 封禁用户列表
-		auth.GET("user/online", m.online)                                                               // 在线设备信息
-		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser)                                           // 解禁或封禁用户
-		auth.POST("/user/updatepassword", m.updatePwd)                                                  // 修改用户密码
-		auth.GET("/user/devices", m.devices)                                                            // 查看某用户设备列表
+		auth.PUT("/user/admin/two_factor_email", appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.updateAdminTwoFactorEmail) // 设置/修改管理台账号的二次认证收件地址
+		auth.GET("/user/admin", m.getAdminUsers)                                                                        // 查询管理员用户
+		auth.DELETE("/user/admin", m.deleteAdminUsers)                                                                  // 删除管理员用户
+		auth.POST("/user/add", m.addUser)                                                                               // 添加一个用户
+		auth.POST("/user/resetpassword", m.resetUserPassword)                                                           // 重置用户密码
+		auth.GET("/user/list", m.list)                                                                                  // 用户列表
+		auth.GET("/user/friends", m.friends)                                                                            // 某个用户的好友
+		auth.GET("/user/blacklist", m.blacklist)                                                                        // 用户黑名单列表
+		auth.GET("/user/disablelist", m.disableUsers)                                                                   // 封禁用户列表
+		auth.GET("user/online", m.online)                                                                               // 在线设备信息
+		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser)                                                           // 解禁或封禁用户
+		auth.POST("/user/updatepassword", m.updatePwd)                                                                  // 修改用户密码
+		auth.GET("/user/devices", m.devices)                                                                            // 查看某用户设备列表
 		// 手机号影子列回填：一次性数据迁移任务，带游标反复调用直到 done。
 		// superAdmin 专属；见 db_phone_backfill.go。
 		//
@@ -372,7 +372,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		m.beginTwoFactor(c, userInfo, publicIP)
 		return
 	}
-	m.issueManagerSession(c, req.Username, userInfo.UID, publicIP, func(fenced *managerLoginModel) bool {
+	m.issueManagerSession(c, req.Username, userInfo.UID, publicIP, managerLoginType, func(fenced *managerLoginModel) bool {
 		// The password must still be the one that authorised this request AFTER
 		// the fence: a change that lands mid-flight has to invalidate the
 		// in-flight sign-in, not merely the sessions that already exist.
@@ -388,7 +388,14 @@ func (m *Manager) login(c *wkhttp.Context) {
 // far worse failure than treating an unwired Manager as "second factor off" —
 // which is also what a deployment that never turned it on gets.
 func (m *Manager) twoFactorEnabled() bool {
-	return m.settings != nil && m.twoFactor != nil && m.settings.ManagerLogin2FAOn()
+	return m.twoFactorWired() && m.settings.ManagerLogin2FAOn()
+}
+
+// twoFactorWired reports whether this Manager has its second-factor collaborators.
+// The two handshake endpoints are unauthenticated, so an unwired Manager must
+// refuse them rather than panic on a nil dereference.
+func (m *Manager) twoFactorWired() bool {
+	return m.settings != nil && m.twoFactor != nil && m.loginLog != nil
 }
 
 // authenticateManager resolves and verifies a management-console credential:
@@ -409,13 +416,13 @@ func (m *Manager) authenticateManager(c *wkhttp.Context, username, password, pub
 	}
 	if userInfo == nil || userInfo.UID == "" ||
 		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
-		m.loginLog.recordFailure(username, publicIP, "manager")
+		m.loginLog.recordFailure(username, publicIP, managerLoginType)
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return nil, false
 	}
 	matched, needsMigration := CheckPassword(password, userInfo.Password)
 	if !matched {
-		m.loginLog.recordFailure(username, publicIP, "manager")
+		m.loginLog.recordFailure(username, publicIP, managerLoginType)
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return nil, false
 	}
@@ -432,7 +439,7 @@ func (m *Manager) authenticateManager(c *wkhttp.Context, username, password, pub
 	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
 	// dashboardReader/marketAdmin，见 575185b0），被拒同样计入登录失败日志。
 	if !auth.IsManagerConsoleRole(userInfo.Role) {
-		m.loginLog.recordFailure(username, publicIP, "manager")
+		m.loginLog.recordFailure(username, publicIP, managerLoginType)
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return nil, false
 	}
@@ -455,7 +462,7 @@ func (m *Manager) authenticateManager(c *wkhttp.Context, username, password, pub
 // a second-factor handshake compares the fingerprint recorded when the password
 // was accepted — so the check is supplied by the caller.
 func (m *Manager) issueManagerSession(
-	c *wkhttp.Context, username, fencedUID, publicIP string,
+	c *wkhttp.Context, username, fencedUID, publicIP, loginType string,
 	credentialStillValid func(*managerLoginModel) bool,
 ) {
 	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, fencedUID)
@@ -474,7 +481,7 @@ func (m *Manager) issueManagerSession(
 		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone ||
 		!auth.IsManagerConsoleRole(userInfo.Role) ||
 		!credentialStillValid(userInfo) {
-		m.loginLog.recordFailure(username, publicIP, "manager")
+		m.loginLog.recordFailure(username, publicIP, loginType)
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
@@ -499,7 +506,7 @@ func (m *Manager) issueManagerSession(
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
 	})
-	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
+	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, loginType)
 }
 
 // 重置用户密码
@@ -922,11 +929,11 @@ func (m *Manager) getAdminUsers(c *wkhttp.Context) {
 	if len(users) > 0 {
 		for _, user := range users {
 			list = append(list, &adminUserResp{
-				UID:          user.UID,
-				Name:         user.Name,
-				Username:     user.Username,
-				Email:        user.Email,
-				RegisterTime: user.CreatedAt.String(),
+				UID:            user.UID,
+				Name:           user.Name,
+				Username:       user.Username,
+				TwoFactorEmail: user.ManagerTwoFactorEmail,
+				RegisterTime:   user.CreatedAt.String(),
 			})
 		}
 	}
@@ -944,10 +951,11 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		LoginName string `json:"login_name"`
 		Name      string `json:"name"`
 		Password  string `json:"password"`
-		// Email is optional so existing callers keep working, but an account
-		// created without one cannot sign in once login.manager_2fa_on is on
-		// (it fails closed) — worth filling in even while the switch is off.
-		Email string `json:"email"`
+		// TwoFactorEmail is where this account's sign-in codes will be sent. It is
+		// NOT an email identity for the account (see the manager_two_factor_email
+		// migration). Optional while the second factor is off; required once it is
+		// on, because an account without one cannot sign in at all.
+		TwoFactorEmail string `json:"two_factor_email"`
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
@@ -958,9 +966,16 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "login_name")
 		return
 	}
-	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
-	if req.Email != "" && !isValidEmail(req.Email) {
+	req.TwoFactorEmail = strings.TrimSpace(strings.ToLower(req.TwoFactorEmail))
+	if req.TwoFactorEmail != "" && !isValidEmail(req.TwoFactorEmail) {
 		respondUserError(c, errcode.ErrUserEmailInvalid)
+		return
+	}
+	// Creating an unusable account is not a favour to anyone: with the second
+	// factor already on, an address-less console account fails closed at every
+	// sign-in, and only a SuperAdmin can repair it afterwards.
+	if req.TwoFactorEmail == "" && m.twoFactorEnabled() {
+		respondUserError(c, errcode.ErrUserManager2FAEmailMissing)
 		return
 	}
 	if req.Name == "" {
@@ -996,7 +1011,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
 	userModel.Phone = ""
 	userModel.Username = req.LoginName
-	userModel.Email = req.Email
+	userModel.ManagerTwoFactorEmail = req.TwoFactorEmail
 	userModel.Zone = ""
 	userModel.Role = string(wkhttp.Admin)
 	hashedPassword, err := HashPassword(req.Password)
@@ -1016,18 +1031,6 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.ShockOn = 0
 	userModel.Sex = 1
 	userModel.Status = int(common.UserAvailable)
-	if req.Email != "" {
-		taken, err := m.emailTakenByOther(req.Email, "")
-		if err != nil {
-			m.Error("查询邮箱占用情况错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserQueryFailed)
-			return
-		}
-		if taken {
-			respondUserError(c, errcode.ErrUserManagerEmailTaken)
-			return
-		}
-	}
 	err = m.userDB.Insert(userModel)
 	if err != nil {
 		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
@@ -1037,8 +1040,8 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// updateAdminUserEmail sets (or clears) the email address of a
-// management-console account.
+// updateAdminTwoFactorEmail sets (or clears) the address a management-console
+// account receives its sign-in codes at.
 //
 // It exists because there was previously no way to give one an address at all:
 // addAdminUser did not accept one and the seeded SuperAdmin is created without
@@ -1046,18 +1049,22 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 // for an existing deployment — its enable guard would refuse forever.
 //
 // SuperAdmin only, and deliberately narrow: it writes exactly one column on one
-// console account, and is not a general-purpose user editor.
-func (m *Manager) updateAdminUserEmail(c *wkhttp.Context) {
+// console account, and is not a general-purpose user editor. In particular it
+// does NOT touch user.email — that column is a login identity, and pointing it
+// at an administrator's mailbox would hand whoever controls that mailbox a
+// password reset (/v1/user/email/forgetpwd) and a code-only sign-in
+// (/v1/user/emaillogin) for the console account.
+func (m *Manager) updateAdminTwoFactorEmail(c *wkhttp.Context) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		respondManagerForbidden(c)
 		return
 	}
 	type reqVO struct {
 		UID string `json:"uid"`
-		// Empty clears the address. Allowed on purpose: an address typed wrong
-		// must be removable, and the enable guard is what stops a cleared
-		// account from being left un-signable-in silently.
-		Email string `json:"email"`
+		// Empty clears the address — allowed only while the second factor is off
+		// (see below): a typo has to be removable, but not at the cost of
+		// stranding the account.
+		TwoFactorEmail string `json:"two_factor_email"`
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
@@ -1069,9 +1076,18 @@ func (m *Manager) updateAdminUserEmail(c *wkhttp.Context) {
 		respondUserRequestInvalid(c, "uid")
 		return
 	}
-	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
-	if req.Email != "" && !isValidEmail(req.Email) {
+	req.TwoFactorEmail = strings.TrimSpace(strings.ToLower(req.TwoFactorEmail))
+	if req.TwoFactorEmail != "" && !isValidEmail(req.TwoFactorEmail) {
 		respondUserError(c, errcode.ErrUserEmailInvalid)
+		return
+	}
+	// Clearing the last address of a console account while the second factor is
+	// live locks that account out permanently — and if it is the last SuperAdmin,
+	// locks everyone out of the switch that would undo it. The enable guard only
+	// runs on the OFF→ON transition, so it cannot catch this; the check has to
+	// live here.
+	if req.TwoFactorEmail == "" && m.twoFactorEnabled() {
+		respondUserError(c, errcode.ErrUserManager2FAEmailMissing)
 		return
 	}
 	target, err := m.userDB.QueryByUID(req.UID)
@@ -1090,39 +1106,18 @@ func (m *Manager) updateAdminUserEmail(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
-	if req.Email != "" {
-		taken, err := m.emailTakenByOther(req.Email, target.UID)
-		if err != nil {
-			m.Error("查询邮箱占用情况错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserQueryFailed)
-			return
-		}
-		if taken {
-			respondUserError(c, errcode.ErrUserManagerEmailTaken)
-			return
-		}
-	}
-	if err := m.userDB.updateUser(map[string]interface{}{"email": req.Email}, target.UID); err != nil {
-		m.Error("更新管理台账号邮箱失败", zap.String("target_uid", target.UID), zap.Error(err))
+	// No uniqueness check: nothing resolves an account by this column, so several
+	// administrators sharing one ops mailbox is a supported setup, not a clash.
+	if err := m.userDB.updateUser(map[string]interface{}{"manager_two_factor_email": req.TwoFactorEmail}, target.UID); err != nil {
+		m.Error("更新管理台账号二次认证邮箱失败", zap.String("target_uid", target.UID), zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	m.Info("更新管理台账号邮箱",
+	m.Info("更新管理台账号二次认证邮箱",
 		zap.String("actor_uid", c.GetLoginUID()),
 		zap.String("target_uid", target.UID),
-		zap.Bool("cleared", req.Email == ""))
+		zap.Bool("cleared", req.TwoFactorEmail == ""))
 	c.ResponseOK()
-}
-
-// emailTakenByOther reports whether the address belongs to an account other than
-// exceptUID. user.email is only a non-unique index, so this is the only thing
-// standing between a typo and two accounts sharing a sign-in address.
-func (m *Manager) emailTakenByOther(email, exceptUID string) (bool, error) {
-	existing, err := m.userDB.QueryByEmail(email)
-	if err != nil {
-		return false, err
-	}
-	return existing != nil && existing.UID != "" && existing.UID != exceptUID, nil
 }
 
 // 添加一个用户
@@ -1896,7 +1891,7 @@ func (m *Manager) createManagerAccount() {
 		m.Error("密码哈希失败", zap.Error(hashErr))
 		return
 	}
-	err = m.userDB.Insert(newManagerSeedModel(m.ctx.GetConfig().Account.AdminUID, hashedPwd, seedManagerEmail()))
+	err = m.userDB.Insert(newManagerSeedModel(m.ctx.GetConfig().Account.AdminUID, hashedPwd, seedManagerTwoFactorEmail()))
 	if err != nil {
 		m.Error("新增系统管理员错误", zap.Error(err))
 		return
@@ -1908,7 +1903,7 @@ func (m *Manager) createManagerAccount() {
 // OCTO_PII_ENCRYPTION_SECRET。保持 phone 为空可以在 PII 密钥配置前先建立
 // 管理入口，且不会因降级而在超管行上留下一个明文的虚构号码
 // （缺密钥时的降级行为见 DB.syncPhoneShadow）。
-func newManagerSeedModel(adminUID, hashedPwd, email string) *Model {
+func newManagerSeedModel(adminUID, hashedPwd, twoFactorEmail string) *Model {
 	return &Model{
 		UID:      adminUID,
 		Name:     "超级管理员",
@@ -1918,29 +1913,32 @@ func newManagerSeedModel(adminUID, hashedPwd, email string) *Model {
 		Username: string(wkhttp.SuperAdmin),
 		Status:   1,
 		Password: hashedPwd,
-		Email:    email,
+		// Seeds the second-factor address only; the account gets no email
+		// identity, so no mailbox-only path can resolve it.
+		ManagerTwoFactorEmail: twoFactorEmail,
 	}
 }
 
-// seedManagerEmail reads the optional address to stamp on the seeded SuperAdmin.
+// seedManagerTwoFactorEmail reads the optional address to stamp on the seeded
+// SuperAdmin as its second-factor destination.
 //
 // A fresh deployment can then enable login.manager_2fa_on immediately; without
 // it the operator must sign in first and set the address through
-// PUT /v1/manager/user/admin/email, because the enable guard refuses to turn the
-// switch on for an account that has none.
+// PUT /v1/manager/user/admin/two_factor_email, because the enable guard refuses
+// to turn the switch on for an account that has none.
 //
 // Read from the environment rather than config: the shared config struct lives
 // in octo-lib and this is an octo-server-local bootstrap concern, matching the
 // DM_* conventions already used across this repo. An unparseable value is
 // dropped with a warning rather than failing the bootstrap — a mistyped address
 // must not be the reason a deployment has no administrator at all.
-func seedManagerEmail() string {
-	email := strings.TrimSpace(strings.ToLower(os.Getenv("DM_MANAGER_ADMIN_EMAIL")))
+func seedManagerTwoFactorEmail() string {
+	email := strings.TrimSpace(strings.ToLower(os.Getenv("DM_MANAGER_2FA_EMAIL")))
 	if email == "" {
 		return ""
 	}
 	if !isValidEmail(email) {
-		log.Warn("DM_MANAGER_ADMIN_EMAIL 不是合法邮箱地址，已忽略；超管账号将不带邮箱创建")
+		log.Warn("DM_MANAGER_2FA_EMAIL 不是合法邮箱地址，已忽略；超管账号将不带二次认证邮箱创建")
 		return ""
 	}
 	return email
@@ -1992,12 +1990,12 @@ type adminUserResp struct {
 	Name     string `json:"name"`
 	UID      string `json:"uid"`
 	Username string `json:"username"`
-	// Email is the manager-2FA delivery address. Surfaced in full (not masked):
-	// the caller is a SuperAdmin who is expected to audit and fix the addresses
-	// before enabling login.manager_2fa_on, and a masked value cannot be checked
-	// for typos — which is the whole point of showing it here.
-	Email        string `json:"email"`
-	RegisterTime string `json:"register_time"`
+	// TwoFactorEmail is the manager-2FA delivery address. Surfaced in full (not
+	// masked): the caller is a SuperAdmin who is expected to audit and fix the
+	// addresses before enabling login.manager_2fa_on, and a masked value cannot
+	// be checked for typos — which is the whole point of showing it here.
+	TwoFactorEmail string `json:"two_factor_email"`
+	RegisterTime   string `json:"register_time"`
 }
 type dashboardReaderResp struct {
 	Name         string `json:"name"`

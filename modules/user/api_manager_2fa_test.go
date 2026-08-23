@@ -95,14 +95,14 @@ func newTwoFactorHarnessWithRole(t *testing.T, enabled bool, email, role string)
 	uid := util.GenerUUID()
 	username := "admin-" + uid[:8]
 	require.NoError(t, m.userDB.Insert(&Model{
-		UID:      uid,
-		Username: username,
-		Name:     "二次认证管理员",
-		Password: hashed,
-		Email:    email,
-		Role:     role,
-		Status:   1,
-		ShortNo:  uid[:8],
+		UID:                   uid,
+		Username:              username,
+		Name:                  "二次认证管理员",
+		Password:              hashed,
+		ManagerTwoFactorEmail: email,
+		Role:                  role,
+		Status:                1,
+		ShortNo:               uid[:8],
 	}))
 
 	h := &twoFactorHarness{
@@ -157,7 +157,7 @@ func (h *twoFactorHarness) login() *httptest.ResponseRecorder {
 func (h *twoFactorHarness) startHandshake() string {
 	h.t.Helper()
 	w := h.login()
-	require.Equal(h.t, http.StatusOK, w.Code, w.Body.String())
+	require.Equal(h.t, http.StatusAccepted, w.Code, w.Body.String())
 	var resp managerLoginTwoFactorResp
 	require.NoError(h.t, json.Unmarshal(w.Body.Bytes(), &resp))
 	require.True(h.t, resp.TwoFactorRequired)
@@ -169,10 +169,13 @@ func (h *twoFactorHarness) startHandshake() string {
 // deterministic and a direct assertion that the bucket is the uid-keyed one.
 func (h *twoFactorHarness) issuedCode() string {
 	h.t.Helper()
-	code, err := h.ctx.GetRedisConn().GetString(manager2FACodeKeyPrefix + h.uid)
+	raw, err := h.ctx.GetRedisConn().GetString(manager2FACodeKeyPrefix + h.uid)
 	require.NoError(h.t, err)
-	require.NotEmpty(h.t, code, "no code stored under the uid-keyed bucket")
-	return code
+	require.NotEmpty(h.t, raw, "no code stored under the uid-keyed bucket")
+	var record manager2FACode
+	require.NoError(h.t, json.Unmarshal([]byte(raw), &record))
+	require.NotEmpty(h.t, record.Code)
+	return record.Code
 }
 
 func (h *twoFactorHarness) pending(token string) *manager2FAPending {
@@ -218,7 +221,10 @@ func TestManagerLoginTwoFactorIssuesSessionOnlyAfterCode(t *testing.T) {
 	h := newTwoFactorHarness(t, true, "admin@example.com")
 
 	w := h.login()
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	// 202, not 200: the challenge and a completed sign-in must be distinguishable
+	// by status alone, so a client that ignores the body cannot store an empty
+	// token and then fail every later call with an unexplained 401.
+	require.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
 	// The step-one body must not carry a session in any shape.
 	assert.NotContains(t, w.Body.String(), `"token"`)
 	assert.NotContains(t, w.Body.String(), `"uid"`)
@@ -228,7 +234,8 @@ func TestManagerLoginTwoFactorIssuesSessionOnlyAfterCode(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &pendingResp))
 	assert.True(t, pendingResp.TwoFactorRequired)
 	assert.Equal(t, "a***n@example.com", pendingResp.EmailMasked)
-	assert.Equal(t, int(manager2FAPendingTTL.Seconds()), pendingResp.ExpiresIn)
+	// The handshake outlives its code by exactly the grace window.
+	assert.InDelta(t, (manager2FACodeTTL + manager2FAPendingGrace).Seconds(), pendingResp.ExpiresIn, 2)
 	require.Equal(t, 1, h.mailer.sends)
 	assert.Equal(t, "admin@example.com", h.mailer.lastTo)
 
@@ -303,7 +310,7 @@ func TestManagerLoginTwoFactorSendFailureLeavesNothingBehind(t *testing.T) {
 
 	code, err := h.ctx.GetRedisConn().GetString(manager2FACodeKeyPrefix + h.uid)
 	require.NoError(t, err)
-	assert.Empty(t, code, "an undelivered code must not stay redeemable")
+	assert.Empty(t, code, "an undelivered code must not be stored at all")
 	cooldown, err := h.ctx.GetRedisConn().GetString(manager2FACooldownKeyPrefix + h.uid)
 	require.NoError(t, err)
 	assert.Empty(t, cooldown, "a failed send must not burn the resend cooldown")
@@ -333,7 +340,7 @@ func TestManagerLoginTwoFactorFailuresAreIndistinguishable(t *testing.T) {
 
 	expiredToken := util.GenerUUID()
 	expired, err := json.Marshal(&manager2FAPending{
-		UID: h.uid, Username: h.user, Email: h.email,
+		UID: h.uid, Username: h.user, Address: h.email,
 		ExpiresAt: time.Now().Add(-time.Minute).Unix(),
 	})
 	require.NoError(t, err)
@@ -430,7 +437,7 @@ func TestManagerLoginTwoFactorResendBudget(t *testing.T) {
 		// Skip the per-uid cooldown, which is about pacing, not budget.
 		require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACooldownKeyPrefix+h.uid))
 		w := h.post("/v1/manager/login/resend", map[string]interface{}{"two_factor_token": token})
-		require.Equal(t, http.StatusOK, w.Code, "resend %d: %s", i+1, w.Body.String())
+		require.Equal(t, http.StatusAccepted, w.Code, "resend %d: %s", i+1, w.Body.String())
 		assert.Equal(t, deadline, h.pending(token).ExpiresAt, "resend must not extend the handshake deadline")
 	}
 
@@ -508,6 +515,136 @@ func TestManagerTwoFactorHandshakeDiesWithPasswordRotation(t *testing.T) {
 	})
 	assert.Contains(t, w.Body.String(), "err.server.user.invalid_credentials")
 	assert.NotContains(t, w.Body.String(), `"token"`)
+}
+
+// TestManagerTwoFactorAddressIsNotALoginIdentity is the regression test for the
+// worst thing this feature could have done.
+//
+// user.email is a login identity: /v1/user/emaillogin issues a session for
+// whatever account an address resolves to (carrying that account's role), and
+// /v1/user/email/forgetpwd resets its password with no role check at all. Had
+// the second-factor address been stored there, giving an administrator one would
+// have handed whoever controls that mailbox the console — downgrading the
+// feature's own promise of "password AND mailbox" to "mailbox alone".
+func TestManagerTwoFactorAddressIsNotALoginIdentity(t *testing.T) {
+	const address = "admin@example.com"
+	h := newTwoFactorHarness(t, true, address)
+
+	stored, err := h.mgr.userDB.QueryByUID(h.uid)
+	require.NoError(t, err)
+	require.Equal(t, address, stored.ManagerTwoFactorEmail)
+	assert.Empty(t, stored.Email, "the second-factor address must not become an email identity")
+
+	// The address must resolve to no account at all through the email-identity
+	// lookup that both mailbox-only paths use.
+	resolved, err := h.mgr.userDB.QueryByEmail(address)
+	require.NoError(t, err)
+	assert.Nil(t, resolved, "no account may be reachable by the second-factor address")
+}
+
+// TestManagerTwoFactorSendQuota pins the account-level cap on outbound codes.
+//
+// The per-handshake resend budget cannot bound this on its own: signing in again
+// mints a fresh handshake with a fresh budget, so an actor holding the password
+// could otherwise mail the administrator a code every minute forever.
+func TestManagerTwoFactorSendQuota(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+
+	for i := 0; i < manager2FAMaxSendsPerHour; i++ {
+		require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACooldownKeyPrefix+h.uid))
+		w := h.login()
+		require.Equal(t, http.StatusAccepted, w.Code, "sign-in %d: %s", i+1, w.Body.String())
+	}
+	assert.Equal(t, manager2FAMaxSendsPerHour, h.mailer.sends)
+
+	require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACooldownKeyPrefix+h.uid))
+	w := h.login()
+	assert.Contains(t, w.Body.String(), "err.server.user.manager_2fa_send_quota_exceeded")
+	assert.Equal(t, manager2FAMaxSendsPerHour, h.mailer.sends, "the quota must suppress the send itself")
+	t.Cleanup(func() { _ = h.ctx.GetRedisConn().Del(manager2FASendQuotaPrefix + h.uid) })
+}
+
+// TestManagerTwoFactorReusedCodeKeepsItsDeadline pins that a handshake minted for
+// an already-issued code inherits that code's deadline.
+//
+// Otherwise the reuse path would hand out a handshake outliving its own code, and
+// a correct code submitted in the gap would be refused through the
+// anti-enumeration error — precisely the confusion the grace window exists to
+// prevent.
+func TestManagerTwoFactorReusedCodeKeepsItsDeadline(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+	first := h.startHandshake()
+	firstDeadline := h.pending(first).ExpiresAt
+
+	// Same cooldown window, so no new code is sent and the old one is reused.
+	second := h.startHandshake()
+	require.Equal(t, 1, h.mailer.sends)
+	assert.Equal(t, firstDeadline, h.pending(second).ExpiresAt,
+		"a handshake for a reused code must not outlive the code it can redeem")
+}
+
+// TestManagerTwoFactorStaleCodeDoesNotLock pins that submitting a code when none
+// is live costs nothing.
+//
+// The wrong-code budget exists to stop guessing; charging it when there is
+// nothing to guess against would let an operator who stepped away and retyped a
+// long-expired code lock their own account for ten minutes.
+func TestManagerTwoFactorStaleCodeDoesNotLock(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+	token := h.startHandshake()
+	require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACodeKeyPrefix+h.uid))
+
+	for i := 0; i < manager2FAMaxCodeFailures+1; i++ {
+		w := h.post("/v1/manager/login/verify", map[string]interface{}{
+			"two_factor_token": token,
+			"code":             "000000",
+		})
+		assert.Contains(t, w.Body.String(), "err.server.user.manager_2fa_code_invalid")
+	}
+
+	locked, err := h.ctx.GetRedisConn().GetString(manager2FALockKeyPrefix + h.uid)
+	require.NoError(t, err)
+	assert.Empty(t, locked, "submitting against no live code must not trip the lockout")
+	assert.NotNil(t, h.pending(token), "nor destroy the handshake")
+}
+
+// TestManagerTwoFactorDeliveryFailureKeepsLiveCode pins that a failed send does
+// not destroy a code the operator already received.
+func TestManagerTwoFactorDeliveryFailureKeepsLiveCode(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+	token := h.startHandshake()
+	code := h.issuedCode()
+
+	// Cooldown lapses, the operator retries, and SMTP is down by then.
+	require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACooldownKeyPrefix+h.uid))
+	h.mailer.failWith = errors.New("smtp unreachable")
+	w := h.login()
+	assert.Contains(t, w.Body.String(), "err.server.user.email_send_failed")
+
+	assert.Equal(t, code, h.issuedCode(), "the delivered code must survive a later failed send")
+	h.mailer.failWith = nil
+	verify := h.post("/v1/manager/login/verify", map[string]interface{}{
+		"two_factor_token": token,
+		"code":             code,
+	})
+	require.Equal(t, http.StatusOK, verify.Code, verify.Body.String())
+}
+
+// TestManagerTwoFactorResendUsesCurrentAddress pins that correcting a typo'd
+// address takes effect on the next resend, rather than only after the operator
+// restarts the whole sign-in.
+func TestManagerTwoFactorResendUsesCurrentAddress(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "typo@exmaple.com")
+	token := h.startHandshake()
+	require.Equal(t, "typo@exmaple.com", h.mailer.lastTo)
+
+	require.NoError(t, h.mgr.userDB.updateUser(
+		map[string]interface{}{"manager_two_factor_email": "ops@example.com"}, h.uid))
+	require.NoError(t, h.ctx.GetRedisConn().Del(manager2FACooldownKeyPrefix+h.uid))
+
+	w := h.post("/v1/manager/login/resend", map[string]interface{}{"two_factor_token": token})
+	require.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+	assert.Equal(t, "ops@example.com", h.mailer.lastTo)
 }
 
 // TestManagerTwoFactorIsolatedFromPublicEmailKeyspace is the regression test for
@@ -617,9 +754,17 @@ func TestMaskManagerEmail(t *testing.T) {
 	}
 }
 
-// TestManagerTwoFactorPendingOutlivesCode pins the deliberate one-minute gap: if
+// TestManagerTwoFactorPendingOutlivesCode pins the deliberate grace window: if
 // the handshake expired first, a code submitted in its final seconds would fail
 // through the anti-enumeration error, which is unexplainable to the operator.
+//
+// Asserted on the derivation, not on two independent constants: a handshake
+// minted for a code issued earlier (the cooldown-reuse path) must inherit that
+// code's deadline, so the gap has to come from the code itself.
 func TestManagerTwoFactorPendingOutlivesCode(t *testing.T) {
-	assert.Greater(t, manager2FAPendingTTL, manager2FACodeTTL)
+	assert.Positive(t, manager2FAPendingGrace)
+	codeExpiry := time.Now().Add(manager2FACodeTTL).Unix()
+	assert.Equal(t,
+		time.Unix(codeExpiry, 0).Add(manager2FAPendingGrace).Unix(),
+		pendingDeadline(codeExpiry))
 }

@@ -180,31 +180,35 @@ type managerLoginModel struct {
 	UID      string
 	Name     string
 	Password string
-	// Email is the second-factor delivery address when login.manager_2fa_on is
-	// on. Empty is a valid state for accounts created before the switch existed;
-	// the sign-in path rejects such an account explicitly rather than silently
-	// skipping the second factor.
-	Email     string
-	Role      string
-	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
-	Status    int
-	IsDestroy int
+	// ManagerTwoFactorEmail is the second-factor delivery address when
+	// login.manager_2fa_on is on. Deliberately NOT user.email — that column is a
+	// login identity, and pointing it at an administrator's mailbox would let
+	// whoever controls that mailbox reset the console password or sign in with a
+	// code alone. Empty is a valid state for accounts created before the switch
+	// existed; the sign-in path rejects such an account explicitly rather than
+	// silently skipping the second factor.
+	ManagerTwoFactorEmail string
+	Role                  string
+	Language              string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
+	Status                int
+	IsDestroy             int
 }
 
 type managerUserModel struct {
-	Username  string
-	Name      string
-	UID       string
-	Email     string
-	Status    int
-	Phone     string
-	ShortNo   string
-	WXOpenid  string // 微信openid
-	GiteeUID  string // gitee uid
-	GithubUID string // github uid
-	Sex       int
-	IsDestroy int
-	Robot     int // 0.否 1.是；与 /v1/robot/space_bots 判定一致
+	Username              string
+	Name                  string
+	UID                   string
+	Email                 string
+	ManagerTwoFactorEmail string
+	Status                int
+	Phone                 string
+	ShortNo               string
+	WXOpenid              string // 微信openid
+	GiteeUID              string // gitee uid
+	GithubUID             string // github uid
+	Sex                   int
+	IsDestroy             int
+	Robot                 int // 0.否 1.是；与 /v1/robot/space_bots 判定一致
 	db.BaseModel
 }
 

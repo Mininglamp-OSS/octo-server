@@ -1146,8 +1146,8 @@ other = "Two-factor authentication is enabled but this account has no email addr
 ["err.server.user.manager_2fa_resend_exhausted"]
 other = "Too many resend requests, please sign in again."
 
-["err.server.user.manager_email_taken"]
-other = "This email address is already used by another account."
+["err.server.user.manager_2fa_send_quota_exceeded"]
+other = "Too many verification codes have been requested for this account, please try again later."
 
 ["err.server.user.manager_permission_required"]
 other = "This account does not have management permission."

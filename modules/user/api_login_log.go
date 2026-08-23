@@ -58,8 +58,11 @@ func resolveAccountFields(account string) (masked, hash string) {
 // 口径一致（具体原因由各 handler 自己的 Warn/Error 记录）。
 func (l *LoginLog) logLoginEvent(status int, uid, maskedAccount, accountHash, publicIP, loginType string) {
 	result := "success"
-	if status == loginStatusFailure {
+	switch status {
+	case loginStatusFailure:
 		result = "failed"
+	case loginStatusPendingSecondFactor:
+		result = "pending_second_factor"
 	}
 	l.Info(loginEventLogMsg,
 		zap.String("event", "login"),
@@ -102,15 +105,7 @@ func (l *LoginLog) recordSuccess(uid, account, publicIP, loginType string) {
 func (l *LoginLog) recordPendingSecondFactor(uid, account, publicIP, loginType string) {
 	publicIP = normalizeLoginIP(publicIP)
 	masked, hash := resolveAccountFields(account)
-	l.Info(loginEventLogMsg,
-		zap.String("event", "login"),
-		zap.String("result", "pending_second_factor"),
-		zap.String("login_type", loginType),
-		zap.String("uid", uid),
-		zap.String("account_masked", masked),
-		zap.String("account_hash", hash),
-		zap.String("login_ip", publicIP),
-	)
+	l.logLoginEvent(loginStatusPendingSecondFactor, uid, masked, hash, publicIP, loginType)
 	err := l.loginLogDB.insert(&LoginLogModel{
 		UID:           uid,
 		AccountMasked: masked,

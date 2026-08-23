@@ -2,6 +2,7 @@ package user
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -9,10 +10,15 @@ import (
 	"go.uber.org/zap"
 )
 
-// manager2FALoginType tags the login_log rows produced by the second step, so
-// "wrong password" and "right password, wrong code" stay separable in the audit
-// table. Fits login_log.login_type VARCHAR(20).
-const manager2FALoginType = "manager_2fa"
+// login_log.login_type values for the console. manager2FALoginType tags every
+// row of a two-step sign-in — the pending row, the wrong-code failures AND the
+// success that resolves them — so an auditor can follow one sign-in end to end
+// and tell "wrong password" apart from "right password, no code". Both fit
+// login_log.login_type VARCHAR(20).
+const (
+	managerLoginType    = "manager"
+	manager2FALoginType = "manager_2fa"
+)
 
 // managerLoginTwoFactorResp is the /v1/manager/login body when the second factor
 // is on. It deliberately shares no field with managerLoginResp: a client that
@@ -38,7 +44,7 @@ type managerLoginResendReq struct {
 // no session exists yet and no session fence has been opened. It sends the code
 // and hands back an opaque handshake token.
 func (m *Manager) beginTwoFactor(c *wkhttp.Context, account *managerLoginModel, publicIP string) {
-	if strings.TrimSpace(account.Email) == "" {
+	if strings.TrimSpace(account.ManagerTwoFactorEmail) == "" {
 		// Unreachable for accounts that existed when the switch was turned on
 		// (the write path refuses that), reachable for one created without an
 		// address afterwards. Fail closed and say so: silently skipping the
@@ -54,12 +60,32 @@ func (m *Manager) beginTwoFactor(c *wkhttp.Context, account *managerLoginModel, 
 		m.respondTwoFactorDeliveryError(c, account.UID, err)
 		return
 	}
+	pending, err := m.twoFactor.loadPending(token)
+	if err != nil {
+		m.Error("读取管理台二次认证握手失败", zap.String("uid", account.UID), zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
 	m.loginLog.recordPendingSecondFactor(account.UID, account.Username, publicIP, manager2FALoginType)
-	c.Response(&managerLoginTwoFactorResp{
+	m.respondTwoFactorChallenge(c, token, pending)
+}
+
+// respondTwoFactorChallenge answers step one.
+//
+// 202 rather than 200 so the two success shapes are distinguishable at the HTTP
+// layer: a client that keys off the status code alone would otherwise store an
+// empty token from a challenge body and then fail every later call with an
+// unexplained 401 instead of prompting for the code.
+func (m *Manager) respondTwoFactorChallenge(c *wkhttp.Context, token string, pending *manager2FAPending) {
+	expiresIn := int(pending.remaining().Seconds())
+	if expiresIn < 0 {
+		expiresIn = 0
+	}
+	c.ResponseWithStatus(http.StatusAccepted, &managerLoginTwoFactorResp{
 		TwoFactorRequired: true,
 		TwoFactorToken:    token,
-		EmailMasked:       maskManagerEmail(account.Email),
-		ExpiresIn:         int(manager2FAPendingTTL.Seconds()),
+		EmailMasked:       maskManagerEmail(pending.Address),
+		ExpiresIn:         expiresIn,
 	})
 }
 
@@ -70,6 +96,10 @@ func (m *Manager) beginTwoFactor(c *wkhttp.Context, account *managerLoginModel, 
 // emailed code are the credential; abuse is bounded by the per-IP limiter on the
 // route and the per-uid wrong-code lockout.
 func (m *Manager) loginVerify(c *wkhttp.Context) {
+	if !m.twoFactorWired() {
+		respondUserError(c, errcode.ErrUserManager2FACodeInvalid)
+		return
+	}
 	var req managerLoginVerifyReq
 	if err := c.BindJSON(&req); err != nil {
 		respondUserRequestInvalid(c, "")
@@ -106,7 +136,7 @@ func (m *Manager) loginVerify(c *wkhttp.Context) {
 	// Re-reads the account and re-checks state, role and credential before
 	// issuing: the handshake may have outlived a ban, a destroy request, a role
 	// change — or the password rotation that should invalidate it.
-	m.issueManagerSession(c, pending.Username, pending.UID, publicIP, func(fenced *managerLoginModel) bool {
+	m.issueManagerSession(c, pending.Username, pending.UID, publicIP, manager2FALoginType, func(fenced *managerLoginModel) bool {
 		return manager2FAPasswordFingerprint(fenced.Password) == pending.PasswordFingerprint
 	})
 }
@@ -118,6 +148,10 @@ func (m *Manager) loginVerify(c *wkhttp.Context) {
 // plaintext password in memory across the whole handshake, and would mint a new
 // handshake on every retry. Unauthenticated for the same reason as loginVerify.
 func (m *Manager) loginResend(c *wkhttp.Context) {
+	if !m.twoFactorWired() {
+		respondUserError(c, errcode.ErrUserManager2FACodeInvalid)
+		return
+	}
 	var req managerLoginResendReq
 	if err := c.BindJSON(&req); err != nil {
 		respondUserRequestInvalid(c, "")
@@ -143,14 +177,9 @@ func (m *Manager) loginResend(c *wkhttp.Context) {
 		return
 	}
 	m.logTwoFactorIPDrift(pending, publicIP)
-	c.Response(&managerLoginTwoFactorResp{
-		TwoFactorRequired: true,
-		TwoFactorToken:    req.TwoFactorToken,
-		EmailMasked:       maskManagerEmail(pending.Email),
-		// The deadline is the one set when the handshake was created; resending
-		// never extends it.
-		ExpiresIn: int(pending.remaining().Seconds()),
-	})
+	// The deadline is the one set when the handshake was created; resending never
+	// extends it, so ExpiresIn counts down across resends.
+	m.respondTwoFactorChallenge(c, req.TwoFactorToken, pending)
 }
 
 // respondTwoFactorDeliveryError maps a send-path failure onto the wire. The two
@@ -163,6 +192,11 @@ func (m *Manager) respondTwoFactorDeliveryError(c *wkhttp.Context, uid string, e
 		respondUserError(c, errcode.ErrUserEmailRateLimited)
 	case errors.Is(err, errManager2FAResendsExhausted):
 		respondUserError(c, errcode.ErrUserManager2FAResendExhausted)
+	case errors.Is(err, errManager2FASendQuota):
+		m.Warn("管理台二次认证发送配额耗尽", zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserManager2FASendQuotaExceeded)
+	case errors.Is(err, errManager2FAAddressMissing):
+		respondUserError(c, errcode.ErrUserManager2FAEmailMissing)
 	default:
 		m.Error("发送管理台二次认证验证码失败", zap.String("uid", uid), zap.Error(err))
 		respondUserError(c, errcode.ErrUserEmailSendFailed)
