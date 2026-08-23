@@ -123,7 +123,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		user.POST("/login", managerLoginLimit, m.login) // 账号登录
 		// 二次认证的两步。刻意不挂 AuthMiddleware —— 它们本身就是登录握手的一部分，
 		// 此时还不存在可鉴权的会话；凭据是"握手 token + 邮箱验证码"，滥用由
-		// StrictIPRateLimitMiddleware + 每次握手的尝试上限 + 每 uid 锁定共同兜住。
+		// StrictIPRateLimitMiddleware + 每 uid 连错锁定共同兜住。
 		user.POST("/login/verify", managerVerifyLimit, m.loginVerify) // 提交邮箱验证码完成登录
 		user.POST("/login/resend", managerResendLimit, m.loginResend) // 重发邮箱验证码
 	}
@@ -372,7 +372,13 @@ func (m *Manager) login(c *wkhttp.Context) {
 		m.beginTwoFactor(c, userInfo, publicIP)
 		return
 	}
-	m.issueManagerSession(c, req.Username, userInfo.UID, publicIP)
+	m.issueManagerSession(c, req.Username, userInfo.UID, publicIP, func(fenced *managerLoginModel) bool {
+		// The password must still be the one that authorised this request AFTER
+		// the fence: a change that lands mid-flight has to invalidate the
+		// in-flight sign-in, not merely the sessions that already exist.
+		matched, _ := CheckPassword(req.Password, fenced.Password)
+		return matched
+	})
 }
 
 // twoFactorEnabled reports whether the emailed second factor is switched on.
@@ -413,10 +419,14 @@ func (m *Manager) authenticateManager(c *wkhttp.Context, username, password, pub
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return nil, false
 	}
-	// 自动将旧 MD5 密码迁移到 bcrypt
+	// 自动将旧 MD5 密码迁移到 bcrypt。迁移成功后同步内存中的哈希：调用方会用它
+	// 派生"凭据是否仍然有效"的判据（栅栏后复核 / 二次认证握手指纹），若还拿着
+	// 迁移前的旧哈希，紧接着的复核会把刚迁移成功的账号判成凭据已变更。
 	if needsMigration {
 		if newHash, hashErr := HashPassword(password); hashErr == nil {
-			_ = m.userDB.updatePassword(newHash, userInfo.UID)
+			if updateErr := m.userDB.updatePassword(newHash, userInfo.UID); updateErr == nil {
+				userInfo.Password = newHash
+			}
 		}
 	}
 	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
@@ -434,13 +444,21 @@ func (m *Manager) authenticateManager(c *wkhttp.Context, username, password, pub
 //
 // The three-step fence — BeginIssue, re-read the account, issue against that
 // fence — is kept intact and lives here, at the single point where a session is
-// actually created. It runs after the credential check rather than before it
-// (the pre-2FA code opened the fence first); the fence closes a TOCTOU between
-// generation setup and issue, which the password check does not participate in,
-// so the ordering is equivalent — and it no longer writes generation state for
-// requests that turn out to have the wrong password.
-func (m *Manager) issueManagerSession(c *wkhttp.Context, username, expectedUID, publicIP string) {
-	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, expectedUID)
+// actually created.
+//
+// credentialStillValid re-checks, against the POST-fence row, that the credential
+// which authorised this request is still current. That re-check is the whole
+// point of re-reading the account: a password changed between the first read and
+// the issue must invalidate this sign-in, otherwise a captured credential can
+// still mint a session after the victim has rotated it. The two entry points
+// prove it differently — a single-step sign-in re-runs the password comparison,
+// a second-factor handshake compares the fingerprint recorded when the password
+// was accepted — so the check is supplied by the caller.
+func (m *Manager) issueManagerSession(
+	c *wkhttp.Context, username, fencedUID, publicIP string,
+	credentialStillValid func(*managerLoginModel) bool,
+) {
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, fencedUID)
 	if err != nil {
 		m.Error("初始化管理端登录会话栅栏失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
@@ -452,9 +470,10 @@ func (m *Manager) issueManagerSession(c *wkhttp.Context, username, expectedUID, 
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
-	if userInfo == nil || userInfo.UID != expectedUID ||
+	if userInfo == nil || userInfo.UID != fencedUID ||
 		userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone ||
-		!auth.IsManagerConsoleRole(userInfo.Role) {
+		!auth.IsManagerConsoleRole(userInfo.Role) ||
+		!credentialStillValid(userInfo) {
 		m.loginLog.recordFailure(username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return

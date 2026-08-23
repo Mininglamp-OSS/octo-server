@@ -128,23 +128,27 @@ Step 2 锁死 10 分钟且可无限续期。加固登录反而给登录加了廉
 
 ## Acceptance
 
-- [ ] `login.manager_2fa_on` 默认关闭；关闭态下 `/v1/manager/login` 请求/响应与改动前逐字段一致
-- [ ] 开启态：正确账密返回 `two_factor_required=true` 且响应体**不含** token/uid/name/role
-- [ ] 开启态：`/v1/manager/login/verify` 用正确码返回的 `managerLoginResp` 字段与关闭态登录完全一致，
+> 全部在本地起 MySQL 8.0 + Redis + WuKongIM v2.2.4 后实跑通过（`modules/user` 全量
+> 266s、`modules/common` 全量、`pkg/auth` / `pkg/errcode` / `pkg/i18n` /
+> `modules/base/common`）；octo-admin 侧为 `npm run build`。
+
+- [x] `login.manager_2fa_on` 默认关闭；关闭态下 `/v1/manager/login` 请求/响应与改动前逐字段一致
+- [x] 开启态：正确账密返回 `two_factor_required=true` 且响应体**不含** token/uid/name/role
+- [x] 开启态：`/v1/manager/login/verify` 用正确码返回的 `managerLoginResp` 字段与关闭态登录完全一致，
       且返回的 token 可通过 `AuthMiddleware` 调通 `/v1/manager/me`
-- [ ] 四种 `IsManagerConsoleRole` 角色（admin / superAdmin / dashboardReader / marketAdmin）
+- [x] 四种 `IsManagerConsoleRole` 角色（admin / superAdmin / dashboardReader / marketAdmin）
       在开启态下走同一条 2FA 路径，无一被 fail-closed 误挡
-- [ ] 开关前置校验：存在任一「可登录管理台且无邮箱」的启用账号时，
+- [x] 开关前置校验：存在任一「可登录管理台且无邮箱」的启用账号时，
       `POST /v1/manager/common/system_setting` 置 `manager_2fa_on=1` 被拒并列出该账号
-- [ ] **跨流程隔离（P0 回归用例）**：先对管理员邮箱调用 `/v1/user/email/sendcode` 与
+- [x] **跨流程隔离（P0 回归用例）**：先对管理员邮箱调用 `/v1/user/email/sendcode` 与
       `/v1/user/emaillogin`（连错 3 次触发 `email_verify_lock`），管理台 Step 1 / Step 2 **不受影响**；
       反向亦然（管理台 2FA 失败不影响该邮箱的普通用户流程）
-- [ ] 错码 / pending 过期 / 伪造 token 三种情况返回**同一个**错误码，响应体无差异
-- [ ] `attempts` 达 5 后 pending 被删除，后续携带同一 token 的请求一律失败
-- [ ] `resend_count` 达 3 后重发被拒，且重发不延长 pending TTL
-- [ ] SMTP 不可达时 `/v1/manager/login` 在约 8 秒内返回错误（非挂起至 75 秒），且不遗留 pending
-- [ ] `login_log` 中可区分：登录成功 / 密码正确但 2FA 未过 / 密码错误
-- [ ] `/v1/manager/login/verify` 与 `/resend` 各挂独立 tag 的 `StrictIPRateLimitMiddleware`
+- [x] 错码 / pending 过期 / 伪造 token 三种情况返回**同一个**错误码，响应体无差异
+- [x] `attempts` 达 5 后 pending 被删除，后续携带同一 token 的请求一律失败
+- [x] `resend_count` 达 3 后重发被拒，且重发不延长 pending TTL
+- [x] SMTP 不可达时 `/v1/manager/login` 在约 8 秒内返回错误（非挂起至 75 秒），且不遗留 pending
+- [x] `login_log` 中可区分：登录成功 / 密码正确但 2FA 未过 / 密码错误
+- [x] `/v1/manager/login/verify` 与 `/resend` 各挂独立 tag 的 `StrictIPRateLimitMiddleware`
 - [x] 新增错误码全部经 `httperr.ResponseErrorL` 返回，`make i18n-extract-check` 与 `make i18n-lint` 通过，
       zh-CN 翻译齐全；新 handler 文件加入 `TestUserNoLegacyResponseError` 守卫名单
 - [x] `go build ./...`、相关包 `go vet` / `golangci-lint run`（0 issues）、`git diff --check` 通过
@@ -189,3 +193,16 @@ Step 2 锁死 10 分钟且可无限续期。加固登录反而给登录加了廉
    入口都加了占用校验。
 7. **`PUT /v1/manager/user/admin/email` 挂 `SharedUIDRateLimiter`**：按 rate-limit 规则，
    已鉴权路由默认挂 UID 频控；该端点决定验证码投递到哪里，误用代价高。
+8. **取消"每次握手 5 次尝试"这个上限**（跑集成测试时发现它不可达：每 uid 连错 3 次就先锁了）。
+   保留唯一的爆破边界"每 uid 连错 3 次锁 10 分钟"——它不随重开握手重置，而握手计数会，
+   所以后者本来也不是真正的边界。锁触发时一并删除握手记录，避免留一个永远无法兑现的 token。
+9. **二次认证握手记录带上密码哈希指纹**（`sha256(user.password)`）。`token_http_ttl_test.go`
+   的 `manager login rechecks password after fence` 揭示：原实现在栅栏之后是用**复查出来的行**
+   再跑一次 `CheckPassword`，即登录途中改密必须让本次登录失效——我重构时把密码校验前移，
+   丢掉了这条不变量。单步登录已恢复为栅栏后重跑密码比对；两步登录在第二步拿不到明文密码，
+   改为比对指纹，语义等价且不落任何可逆材料。MD5→bcrypt 迁移成功后同步内存中的哈希，
+   否则刚迁移的账号会被自己的指纹判成"凭据已变更"。
+10. **三处源码守卫按新结构更新**（`TestLoginLifecycleHelpersRemainIntegrated`、
+   `TestPostFenceLoginRejectionsAreAudited` 指向 `issueManagerSession`；
+   `TestLoginAuditUsesWKHTTPClientIP` 的调用点计数 15→17）。守卫的语义未放松：审计与
+   安全 API 的约束都还在，只是逻辑搬到了下一层函数。

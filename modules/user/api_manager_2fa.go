@@ -68,7 +68,7 @@ func (m *Manager) beginTwoFactor(c *wkhttp.Context, account *managerLoginModel, 
 // Unauthenticated by design — it IS part of the pre-auth sign-in handshake, so
 // there is no session to authenticate against. The handshake token plus the
 // emailed code are the credential; abuse is bounded by the per-IP limiter on the
-// route, the per-handshake attempt cap and the per-uid lockout.
+// route and the per-uid wrong-code lockout.
 func (m *Manager) loginVerify(c *wkhttp.Context) {
 	var req managerLoginVerifyReq
 	if err := c.BindJSON(&req); err != nil {
@@ -103,9 +103,12 @@ func (m *Manager) loginVerify(c *wkhttp.Context) {
 		return
 	}
 	m.logTwoFactorIPDrift(pending, publicIP)
-	// Re-reads the account and re-checks state and role before issuing: the
-	// handshake may have outlived a ban, a destroy request or a role change.
-	m.issueManagerSession(c, pending.Username, pending.UID, publicIP)
+	// Re-reads the account and re-checks state, role and credential before
+	// issuing: the handshake may have outlived a ban, a destroy request, a role
+	// change — or the password rotation that should invalidate it.
+	m.issueManagerSession(c, pending.Username, pending.UID, publicIP, func(fenced *managerLoginModel) bool {
+		return manager2FAPasswordFingerprint(fenced.Password) == pending.PasswordFingerprint
+	})
 }
 
 // loginResend re-sends the code for a pending handshake.

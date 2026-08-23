@@ -2,7 +2,9 @@ package user
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,14 +78,14 @@ const (
 	manager2FAPendingTTL = 6 * time.Minute
 	// Per-uid resend cooldown, mirroring the shared email service's 1 minute.
 	manager2FAResendCooldown = time.Minute
-	// Wrong-code budget per uid, then a lockout. Separate from the per-handshake
-	// attempt cap: this one survives restarting the sign-in, so an attacker
-	// cannot reset it by asking for a fresh handshake.
+	// Wrong-code budget, then a lockout. Counted per UID rather than per
+	// handshake: a per-handshake counter would be reset simply by signing in
+	// again, which an attacker holding the password can do at will. This one
+	// survives starting over, so it is the real brute-force bound.
 	manager2FAMaxCodeFailures = 3
 	manager2FACodeLockTTL     = 10 * time.Minute
-	// Attempt / resend budget for a single handshake.
-	manager2FAMaxAttempts = 5
-	manager2FAMaxResends  = 3
+	// Resend budget for a single handshake.
+	manager2FAMaxResends = 3
 	// Bound the SMTP round-trip. The transport's own defaults are 15s dial +
 	// 60s IO and the shared call sites pass context.Background(), which would
 	// let a sick mail server hold a sign-in request open for over a minute.
@@ -108,14 +110,31 @@ var (
 // that TTL and silently extend the window. Rewrites compute the remaining time
 // from this field, so the deadline set at issue time is the real one.
 type manager2FAPending struct {
-	UID       string `json:"uid"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	IP        string `json:"ip"`
-	Language  string `json:"language"`
-	Attempts  int    `json:"attempts"`
-	Resends   int    `json:"resends"`
-	ExpiresAt int64  `json:"expires_at"`
+	UID      string `json:"uid"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	IP       string `json:"ip"`
+	Language string `json:"language"`
+	// PasswordFingerprint is a digest of the stored password hash as it was when
+	// the password was accepted. Redeeming the code re-derives it from the
+	// current row and refuses on a mismatch, so a password rotated mid-handshake
+	// invalidates the sign-in it authorised — the same guarantee the post-fence
+	// password re-check gives the single-step path.
+	//
+	// A digest of the hash, never the password or the hash itself: this record
+	// lives in Redis with a 6-minute TTL and only ever needs to answer "is this
+	// still the same credential", which equality of digests answers without
+	// storing anything usable.
+	PasswordFingerprint string `json:"password_fingerprint"`
+	Resends             int    `json:"resends"`
+	ExpiresAt           int64  `json:"expires_at"`
+}
+
+// manager2FAPasswordFingerprint digests a stored password hash for the staleness
+// check above.
+func manager2FAPasswordFingerprint(passwordHash string) string {
+	sum := sha256.Sum256([]byte(passwordHash))
+	return hex.EncodeToString(sum[:])
 }
 
 func (p *manager2FAPending) remaining() time.Duration {
@@ -153,9 +172,8 @@ func (s *manager2FA) start(ctx context.Context, account *managerLoginModel, clie
 	// nothing left to redeem it against, and they would be locked out for the
 	// remainder of the cooldown despite holding a valid code.
 	//
-	// Re-issuing the handshake resets the per-handshake attempt counter, which is
-	// why that counter is not the real brute-force bound: the per-uid failure
-	// lock is, and it deliberately survives starting over.
+	// Re-issuing costs an attacker nothing they did not already have: the
+	// wrong-code budget is counted per UID, so starting over does not reset it.
 	if err := s.checkCooldown(account.UID); err != nil {
 		if !errors.Is(err, errManager2FAResendCooldown) {
 			return "", err
@@ -193,12 +211,13 @@ func (s *manager2FA) start(ctx context.Context, account *managerLoginModel, clie
 // issuePending mints a fresh handshake for an already-delivered code.
 func (s *manager2FA) issuePending(account *managerLoginModel, clientIP, lang string) (string, error) {
 	pending := &manager2FAPending{
-		UID:       account.UID,
-		Username:  account.Username,
-		Email:     account.Email,
-		IP:        clientIP,
-		Language:  lang,
-		ExpiresAt: time.Now().Add(manager2FAPendingTTL).Unix(),
+		UID:                 account.UID,
+		Username:            account.Username,
+		Email:               account.Email,
+		IP:                  clientIP,
+		Language:            lang,
+		PasswordFingerprint: manager2FAPasswordFingerprint(account.Password),
+		ExpiresAt:           time.Now().Add(manager2FAPendingTTL).Unix(),
 	}
 	token := util.GenerUUID()
 	if err := s.savePending(token, pending, manager2FAPendingTTL); err != nil {
@@ -229,6 +248,8 @@ func (s *manager2FA) resend(ctx context.Context, token, clientIP string) (*manag
 	if err := redis.SetAndExpire(manager2FACodeKeyPrefix+pending.UID, code, manager2FACodeTTL); err != nil {
 		return nil, fmt.Errorf("manager 2fa: persist code: %w", err)
 	}
+	// Only the delivery-relevant fields; resending re-sends a code, it never
+	// re-authorises anything, so the pending record's own fingerprint stands.
 	account := &managerLoginModel{UID: pending.UID, Username: pending.Username, Email: pending.Email}
 	if err := s.deliver(ctx, account, code, clientIP, pending.Language); err != nil {
 		_ = redis.Del(manager2FACodeKeyPrefix + pending.UID)
@@ -266,7 +287,10 @@ func (s *manager2FA) verify(token, code string) (*manager2FAPending, error) {
 		return nil, fmt.Errorf("manager 2fa: read lock: %w", err)
 	}
 	if locked != "" {
+		// A locked account can never redeem this handshake; leaving it in Redis
+		// would only invite pointless retries against a dead token.
 		s.Warn("管理台二次认证已锁定", zap.String("uid", pending.UID))
+		s.dropPending(token)
 		return pending, errManager2FAInvalid
 	}
 	// Non-release test bypass, same gate as every other verification path in the
@@ -323,21 +347,10 @@ func (s *manager2FA) checkCooldown(uid string) error {
 	return nil
 }
 
-// recordFailure charges a wrong code against both budgets: the per-handshake
-// attempt counter (cheap to reset — just start over) and the per-uid failure
-// counter (survives a restart, and trips a lockout).
+// recordFailure charges a wrong code against the per-uid budget and, once that
+// budget is spent, locks the second factor and drops the handshake.
 func (s *manager2FA) recordFailure(token string, pending *manager2FAPending) {
 	redis := s.ctx.GetRedisConn()
-	pending.Attempts++
-	if pending.Attempts >= manager2FAMaxAttempts {
-		if err := redis.Del(manager2FAPendingKeyPrefix + token); err != nil {
-			s.Error("删除管理台二次认证待验证记录失败", zap.Error(err))
-		}
-	} else if remaining := pending.remaining(); remaining > 0 {
-		if err := s.savePending(token, pending, remaining); err != nil {
-			s.Error("更新管理台二次认证尝试次数失败", zap.Error(err))
-		}
-	}
 	failKey := manager2FAFailKeyPrefix + pending.UID
 	failures, err := redis.Incr(failKey)
 	if err != nil {
@@ -345,6 +358,8 @@ func (s *manager2FA) recordFailure(token string, pending *manager2FAPending) {
 		return
 	}
 	if failures == 1 {
+		// INCR alone leaves the key immortal; the window starts at the first
+		// failure so a slow trickle of wrong codes cannot accumulate forever.
 		if err := redis.Expire(failKey, manager2FACodeLockTTL); err != nil {
 			s.Error("设置管理台二次认证失败计数过期失败", zap.Error(err))
 		}
@@ -353,6 +368,14 @@ func (s *manager2FA) recordFailure(token string, pending *manager2FAPending) {
 		if err := redis.SetAndExpire(manager2FALockKeyPrefix+pending.UID, "1", manager2FACodeLockTTL); err != nil {
 			s.Error("锁定管理台二次认证失败", zap.Error(err))
 		}
+		s.dropPending(token)
+	}
+}
+
+// dropPending destroys a handshake that can no longer succeed.
+func (s *manager2FA) dropPending(token string) {
+	if err := s.ctx.GetRedisConn().Del(manager2FAPendingKeyPrefix + token); err != nil {
+		s.Error("删除管理台二次认证待验证记录失败", zap.Error(err))
 	}
 }
 

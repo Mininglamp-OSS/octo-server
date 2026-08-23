@@ -36,8 +36,11 @@ func TestLoginAuditUsesWKHTTPClientIP(t *testing.T) {
 		}
 		safeCalls += safe
 	}
-	if safeCalls != 15 {
-		t.Fatalf("user production wkhttp.ClientIP calls = %d, want 15", safeCalls)
+	// Tripwire, not a budget: raise it deliberately when a new call site is
+	// reviewed and confirmed to use the safe API. 15 → 17 added the two
+	// manager second-factor endpoints (api_manager_2fa.go).
+	if safeCalls != 17 {
+		t.Fatalf("user production wkhttp.ClientIP calls = %d, want 17", safeCalls)
 	}
 }
 

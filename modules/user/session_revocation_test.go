@@ -346,9 +346,12 @@ func TestInvalidateCurrentUserTokenIgnoresCanceledRequestContext(t *testing.T) {
 
 func TestPasswordMutationPathsUseCommittedSecurityMutationHelper(t *testing.T) {
 	legacyHashMigrations := map[string]bool{
-		"api.go/login":                       true,
-		"api_emaillogin.go/emailLogin":       true,
-		"api_manager.go/login":               true,
+		"api.go/login":                 true,
+		"api_emaillogin.go/emailLogin": true,
+		// The management-console legacy-hash migration lives in the credential
+		// verifier that /v1/manager/login delegates to; same write as before, one
+		// function further in.
+		"api_manager.go/authenticateManager": true,
 		"api_usernamelogin.go/usernameLogin": true,
 		"oidc_bind.go/VerifyPasswordByUID":   true,
 	}

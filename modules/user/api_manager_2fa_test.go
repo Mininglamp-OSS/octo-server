@@ -255,12 +255,16 @@ func TestManagerLoginTwoFactorIssuesSessionOnlyAfterCode(t *testing.T) {
 	assert.Equal(t, 1, counts[loginStatusPendingSecondFactor], "password-ok-awaiting-code must be auditable")
 	assert.Equal(t, 1, counts[loginStatusSuccess])
 
-	// The issued token must be a real console session, not just a string.
-	me := httptest.NewRecorder()
-	meReq := httptest.NewRequest(http.MethodGet, "/v1/manager/me", nil)
-	meReq.Header.Set("token", session.Token)
-	h.route.ServeHTTP(me, meReq)
-	assert.Equal(t, http.StatusOK, me.Code, me.Body.String())
+	// The returned string must be a materialised session, not just a token
+	// shaped like one: the store must know it as this account's web session.
+	//
+	// Asserted through the store rather than by calling an authenticated route:
+	// this harness mounts octo-lib's stock AuthMiddleware, whereas main.go wires
+	// the session-aware CacheTokenParser, so an authed call here would 401 for a
+	// plain single-step sign-in too.
+	issued, err := h.mgr.sessionStore.DeviceToken(context.Background(), h.uid, int(config.Web))
+	require.NoError(t, err)
+	assert.Equal(t, session.Token, issued)
 }
 
 // TestManagerLoginTwoFactorCoversEveryConsoleRole pins that the second factor
@@ -358,25 +362,58 @@ func TestManagerLoginTwoFactorFailuresAreIndistinguishable(t *testing.T) {
 	}
 }
 
-// TestManagerLoginTwoFactorAttemptCap pins that a handshake is destroyed after
-// its attempt budget, so a token cannot be brute-forced code by code.
-func TestManagerLoginTwoFactorAttemptCap(t *testing.T) {
+// TestManagerLoginTwoFactorWrongCodeBudget pins that a handshake is destroyed
+// once the wrong-code budget is spent, so a token cannot be brute-forced code by
+// code — and that the genuine code cannot revive it afterwards.
+func TestManagerLoginTwoFactorWrongCodeBudget(t *testing.T) {
 	h := newTwoFactorHarness(t, true, "admin@example.com")
 	token := h.startHandshake()
 	code := h.issuedCode()
 
-	for i := 0; i < manager2FAMaxAttempts; i++ {
+	for i := 0; i < manager2FAMaxCodeFailures; i++ {
 		w := h.post("/v1/manager/login/verify", map[string]interface{}{
 			"two_factor_token": token,
 			"code":             "000000",
 		})
 		assert.Contains(t, w.Body.String(), "err.server.user.manager_2fa_code_invalid", "attempt %d", i+1)
 	}
-	assert.Nil(t, h.pending(token), "handshake must be destroyed once the attempt budget is spent")
+	assert.Nil(t, h.pending(token), "handshake must be destroyed once the wrong-code budget is spent")
 
-	// Even the genuine code cannot revive a spent handshake.
 	w := h.post("/v1/manager/login/verify", map[string]interface{}{
 		"two_factor_token": token,
+		"code":             code,
+	})
+	assert.Contains(t, w.Body.String(), "err.server.user.manager_2fa_code_invalid")
+}
+
+// TestManagerTwoFactorBudgetSurvivesNewHandshake pins that the wrong-code budget
+// is counted per account, not per handshake: an attacker holding the password
+// can mint handshakes at will, so a per-handshake counter would be free to reset.
+func TestManagerTwoFactorBudgetSurvivesNewHandshake(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+	first := h.startHandshake()
+	code := h.issuedCode()
+
+	for i := 0; i < manager2FAMaxCodeFailures-1; i++ {
+		h.post("/v1/manager/login/verify", map[string]interface{}{
+			"two_factor_token": first,
+			"code":             "000000",
+		})
+	}
+
+	// Start over: a fresh handshake, same account.
+	second := h.startHandshake()
+	h.post("/v1/manager/login/verify", map[string]interface{}{
+		"two_factor_token": second,
+		"code":             "000000",
+	})
+
+	locked, err := h.ctx.GetRedisConn().GetString(manager2FALockKeyPrefix + h.uid)
+	require.NoError(t, err)
+	assert.NotEmpty(t, locked, "restarting the sign-in must not reset the wrong-code budget")
+
+	w := h.post("/v1/manager/login/verify", map[string]interface{}{
+		"two_factor_token": second,
 		"code":             code,
 	})
 	assert.Contains(t, w.Body.String(), "err.server.user.manager_2fa_code_invalid")
@@ -447,6 +484,30 @@ func TestManagerLoginDuringCooldownWithoutLiveCode(t *testing.T) {
 
 	w := h.login()
 	assert.Contains(t, w.Body.String(), "err.server.user.email_rate_limited")
+}
+
+// TestManagerTwoFactorHandshakeDiesWithPasswordRotation pins that a password
+// change invalidates an in-flight second-factor sign-in.
+//
+// Without it the handshake would be a window in which a captured password keeps
+// working after the victim has rotated it — the single-step path closes that
+// window with a post-fence password re-check, and the two paths must not
+// disagree about it.
+func TestManagerTwoFactorHandshakeDiesWithPasswordRotation(t *testing.T) {
+	h := newTwoFactorHarness(t, true, "admin@example.com")
+	token := h.startHandshake()
+	code := h.issuedCode()
+
+	rotated, err := HashPassword("An0ther-Passw0rd")
+	require.NoError(t, err)
+	require.NoError(t, h.mgr.userDB.UpdateUsersWithField("password", rotated, h.uid))
+
+	w := h.post("/v1/manager/login/verify", map[string]interface{}{
+		"two_factor_token": token,
+		"code":             code,
+	})
+	assert.Contains(t, w.Body.String(), "err.server.user.invalid_credentials")
+	assert.NotContains(t, w.Body.String(), `"token"`)
 }
 
 // TestManagerTwoFactorIsolatedFromPublicEmailKeyspace is the regression test for

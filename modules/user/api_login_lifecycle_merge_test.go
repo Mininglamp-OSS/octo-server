@@ -25,7 +25,9 @@ func TestLoginLifecycleHelpersRemainIntegrated(t *testing.T) {
 		{file: "api.go", fn: "createUserWithRespAndTx", sink: "finishSuccessfulLogin"},
 		{file: "api_usernamelogin.go", fn: "usernameLogin", sink: "finishSuccessfulLogin"},
 		{file: "api_emaillogin.go", fn: "emailLogin", sink: "finishSuccessfulLogin"},
-		{file: "api_manager.go", fn: "login", sink: "recordSuccess"},
+		// The console sign-in splits credential check (login) from session issue
+		// (issueManagerSession); the audit sink lives with the issue.
+		{file: "api_manager.go", fn: "issueManagerSession", sink: "recordSuccess"},
 		{file: "api_github.go", fn: "githubOAuth", sink: "finishSuccessfulLogin"},
 		{file: "api_gitee.go", fn: "giteeOAuth", sink: "finishSuccessfulLogin"},
 		{file: "external_login.go", fn: "externalLoginExisting", sink: "finishSuccessfulLogin"},
@@ -48,7 +50,7 @@ func TestPostFenceLoginRejectionsAreAudited(t *testing.T) {
 		{file: "api.go", fn: "login"},
 		{file: "api_usernamelogin.go", fn: "usernameLogin"},
 		{file: "api_emaillogin.go", fn: "emailLogin"},
-		{file: "api_manager.go", fn: "login"},
+		{file: "api_manager.go", fn: "issueManagerSession"},
 	}
 
 	for _, tt := range tests {

@@ -27,12 +27,15 @@ func TestUpdateAdminUserEmail(t *testing.T) {
 	const adminUID = "admin-email-target"
 	require.NoError(t, db.Insert(&Model{
 		UID: adminUID, Username: "admin-email-target", Name: "Admin",
-		Role: string(wkhttp.Admin), Status: StatusEnable.Int(),
+		// short_no carries a unique index; two rows without one collide.
+		ShortNo: "admin-email-1",
+		Role:    string(wkhttp.Admin), Status: StatusEnable.Int(),
 	}))
 	const plainUID = "plain-email-user"
 	require.NoError(t, db.Insert(&Model{
 		UID: plainUID, Username: "plain-email-user", Name: "Plain",
-		Email: "taken@example.com", Status: StatusEnable.Int(),
+		ShortNo: "admin-email-2",
+		Email:   "taken@example.com", Status: StatusEnable.Int(),
 	}))
 
 	put := func(body map[string]interface{}) *httptest.ResponseRecorder {
