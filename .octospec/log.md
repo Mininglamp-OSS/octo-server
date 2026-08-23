@@ -1542,6 +1542,17 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-23 (space-removal-creator-handover-notice)
+
+- **Implemented** — A Space removal that hands a group to a new owner now says so
+  in one group-visible message naming both the departure and the successor
+  (`“{0}”已离开当前空间，“{1}”已成为新群主`, content type `GroupTransferGrouper`,
+  names in `extra`). An ordinary member's removal stays silent: the roster
+  already shows it, and broadcasting it is up to 10k permanent messages per
+  200-uid batch. Also fixed an announcement that was permanently lost whenever
+  the cleanup job retried after a committed handover. Follow-up to #795. See
+  [journal](journal/shared/space-removal-creator-handover-notice.md).
+
 ## 2026-08-22 (cleanup-membership-predicate)
 
 - **Fixed** — The two removal-cleanup rejoin guards were asking one question

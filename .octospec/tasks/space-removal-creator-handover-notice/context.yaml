@@ -1,0 +1,62 @@
+schema_version: 1
+task: space-removal-creator-handover-notice
+brief: .octospec/tasks/space-removal-creator-handover-notice/brief.md
+resolved_at: 2026-08-23T11:00:00+00:00
+
+injected_rules:
+  - id: space-isolation
+    source: repo
+    load_bearing: true
+    why: >
+      The notice is emitted on the Space-removal cascade path and is
+      group-visible with no recipient pruning, so it reaches every subscriber of
+      the channel — including external members whose home Space is a different
+      one. The wording therefore names no Space: "已离开当前空间" is read
+      relative to the group's own Space rather than asserting a fact about the
+      reader's. The earlier per-member departure broadcast, which did assert a
+      Space-scoped fact to every reader, was dropped.
+  - id: trust-boundary
+    source: repo
+    load_bearing: true
+    why: >
+      A user-controlled display name reaches a persisted, group-visible message.
+      group_member.remark is settable by the member and by any group manager with
+      no content validation, so a name concatenated into the string could forge
+      extra lines of system notice in permanent group history. Resolved
+      structurally rather than by escaping: both names travel in `extra` behind
+      {0}/{1} placeholders and are never interpolated into `content`, which is
+      also the shape every comparable octo-lib primitive uses. An earlier
+      revision hand-rolled a sanitizer instead; it was removed after measurement
+      showed unicode.IsControl covers only category Cc and let U+2028/U+2029 and
+      the bidi overrides through.
+  - id: testing
+    source: repo
+    load_bearing: false
+    why: >
+      The guards here are assertions about visibility, which the pre-existing
+      tests did not distinguish from "was sent" — TestGroupCascadeKickStillNotifies
+      asserted the removal message existed while its own comment claimed the group
+      was told, and stayed green throughout. New helpers assert the absence of
+      both recipient-pruning layers, and count group-visible messages carrying
+      visible content rather than matching a content fragment. Every guard is
+      mutation-checked individually.
+  - id: commit-style
+    source: repo
+    load_bearing: false
+    why: >
+      English Conventional Commits; the body carries the measured payload trace
+      and the reason the departure broadcast is deliberately absent, so a future
+      reader does not re-add it.
+
+not_injected:
+  - id: error-handling
+    why: >
+      No HTTP handler is touched and no error code is added or changed. The
+      cascade runs in the leased background worker; failures are logged and
+      retried by the outbox, never surfaced as a user-facing envelope.
+      make i18n-extract-check and make i18n-lint were still run as gates.
+  - id: rate-limit
+    why: >
+      No route is mounted or modified. The volume concern in this task is
+      message fan-out, not request frequency, and it is bounded by design
+      (handover-only, at most one notice per group) rather than by a limiter.
