@@ -216,12 +216,20 @@ func TestManagerConsoleMFAHandlerFullFlowAndReplay(t *testing.T) {
 	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &challengeResp))
 	assert.True(t, challengeResp.MFARequired)
 	assert.NotEmpty(t, challengeResp.ChallengeID)
+	assert.Equal(t, maskManagerEmail(recipientEmail), challengeResp.Email)
 	assert.Empty(t, challengeResp.Token)
 
 	send := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/send", map[string]string{
 		"challenge_id": challengeResp.ChallengeID,
 	}))
 	require.Equal(t, http.StatusOK, send.Code, send.Body.String())
+	var sendResp managerMFAChallengeResponse
+	require.NoError(t, json.Unmarshal(send.Body.Bytes(), &sendResp))
+	assert.Equal(t, challengeResp.ChallengeID, sendResp.ChallengeID)
+	assert.Equal(t, maskManagerEmail(recipientEmail), sendResp.Email)
+	assert.Greater(t, sendResp.ExpiresIn, int64(0))
+	assert.True(t, sendResp.CodeSent)
+	assert.Equal(t, int64(managerMFASendCooldown.Seconds()), sendResp.ResendAfter)
 	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(recipientEmail, commonbase.CodeTypeManagerLogin))
 	require.NoError(t, err)
 	require.Regexp(t, `^[0-9]{6}$`, code)
@@ -237,6 +245,7 @@ func TestManagerConsoleMFAHandlerFullFlowAndReplay(t *testing.T) {
 	var tokenResp managerLoginResp
 	require.NoError(t, json.Unmarshal(verify.Body.Bytes(), &tokenResp))
 	assert.NotEmpty(t, tokenResp.Token)
+	assert.Equal(t, maskManagerEmail(recipientEmail), tokenResp.Email)
 
 	replay := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/verify", map[string]string{
 		"challenge_id": challengeResp.ChallengeID,
@@ -290,7 +299,7 @@ func TestManagerConsoleMFAOffKeepsDirectTokenPath(t *testing.T) {
 	uid := "mfaoff-" + util.GenerUUID()[:20]
 	require.NoError(t, NewDB(ctx).Insert(&Model{
 		UID: uid, Username: uid, Name: "MFA Off Manager", Password: hash,
-		Role: string(wkhttp.Admin), Status: StatusEnable.Int(),
+		Role: string(wkhttp.Admin), Email: "mfa-off@example.com", Status: StatusEnable.Int(),
 	}))
 	var user Model
 	_, err = ctx.DB().Select("uid,username").From("user").Where("uid=?", uid).Load(&user)
@@ -305,6 +314,7 @@ func TestManagerConsoleMFAOffKeepsDirectTokenPath(t *testing.T) {
 	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &response))
 	assert.NotEmpty(t, response.Token)
 	assert.False(t, response.MFARequired)
+	assert.Equal(t, "mxxxxf@example.com", response.Email)
 }
 
 func TestManagerAdminEmailMaintenanceRequiresValidEmailAndInvalidatesChallenge(t *testing.T) {
