@@ -39,6 +39,16 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 	}
 	settings := common.EnsureSystemSettings(u.ctx)
 	codeType := commonapi.CodeType(req.CodeType)
+	switch codeType {
+	case commonapi.CodeTypeRegister, commonapi.CodeTypeEmailLogin, commonapi.CodeTypeForgetLoginPWD:
+		// These are the only email-code flows exposed by this public endpoint.
+	default:
+		// CodeTypeManagerLogin is reserved for the Challenge-bound manager MFA
+		// endpoint; accepting it here would let an unauthenticated caller
+		// overwrite a manager's pending OTP.
+		respondUserRequestInvalid(c, "code_type")
+		return
+	}
 	if codeType == commonapi.CodeTypeRegister && settings.RegisterOff() {
 		respondUserError(c, errcode.ErrUserRegistrationClosed)
 		return
