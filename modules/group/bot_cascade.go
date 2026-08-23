@@ -86,6 +86,54 @@ func expandBlacklistTargetsWithOwnedBots(db *DB, groupNo string, uids []string) 
 	return out, nil
 }
 
+// sendBotOwnerRemovedTip 发送「bot 所有者自助移除自己名下 bot」的系统消息
+// （octo-web#1511）：
+//
+//	{owner} 将机器人 <bot1>、<bot2> 移出了群聊
+//
+// 为什么不复用 sendBotCascadeRemovedTip：那条的模板是「{leaver}{action}群聊，
+// 其机器人 X 已一并移除」，描述的是「人走 bot 跟着走」；本场景所有者留在群里、
+// 只撤走 bot，套用会把「所有者也离开了」这个错误事实写进群历史。
+//
+// 与级联 Tip 保持一致：type=common.Tip (2000)，NoPersist=0 保证新成员也能看到，
+// bots 为空直接 no-op。名称插值口径同样对齐——沿用 UserBaseVo.Name，空则回落 UID。
+func sendBotOwnerRemovedTip(ctx *config.Context, groupNo, ownerName string, bots []*config.UserBaseVo) error {
+	if len(bots) == 0 || groupNo == "" {
+		return nil
+	}
+	names := make([]string, 0, len(bots))
+	for _, b := range bots {
+		if b == nil {
+			continue
+		}
+		name := b.Name
+		if name == "" {
+			name = b.UID
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	if ownerName == "" {
+		ownerName = "该用户"
+	}
+	content := fmt.Sprintf("%s 将机器人 %s 移出了群聊", ownerName, strings.Join(names, "、"))
+	return ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    0,
+			SyncOnce:  0,
+		},
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Payload: []byte(util.ToJson(map[string]interface{}{
+			"content": content,
+			"type":    common.Tip,
+		})),
+	})
+}
+
 // sendBotCascadeRemovedTip 发送 D-2 级联移除 bot 的系统消息。
 //
 // 场景：inviter 离群 / 被踢时，其邀请的 bot 被同事务级联移除。为避免「bot 神秘消失」

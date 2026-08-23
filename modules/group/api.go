@@ -97,11 +97,16 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	groups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
+		// 移除成员的两条路由（DELETE /members 与其别名 POST /members_delete）自
+		// bot-owner-self-removal 起对**普通成员**开放（自助移除自己名下的 bot，
+		// octo-web#1511），因此按认证路由惯例挂 per-UID 限流。
+		// 只挂这两条：/v1/groups 组还有 ~26 个端点，整组挂会改变它们的既有行为。
+		memberRemoveRateLimiter := appwkhttp.SharedUIDRateLimiter(r, g.ctx)
 		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
-		groups.DELETE("/:group_no/members", g.memberRemove)                                // 移除群成员
+		groups.DELETE("/:group_no/members", memberRemoveRateLimiter, g.memberRemove)       // 移除群成员
 		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
 		groups.GET("/:group_no/members/:uid", g.memberGet)                                 // 查询单个 uid 是否为群成员（命中时返回成员详情）
-		groups.POST("/:group_no/members_delete", g.memberRemove)                           // 移除群成员
+		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, g.memberRemove)  // 移除群成员
 		groups.GET("/:group_no/membersync", g.syncMembers)                                 // 同步群成员
 		groups.GET("/:group_no", g.groupGet)                                               // 获取群信息
 		groups.PUT("/:group_no/setting", g.groupSettingUpdate)                             // 修改群设置
@@ -451,6 +456,8 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 	g.fillSpaceRelatedFields(groupNo, "", resps)
 	// YUJ-413 Scope B：批量回填实名字段（零 N+1），Android 气泡 + 群成员列表依赖。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：回填 bot_owned_by_me，前端据此渲染自助移除按钮。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(resps)
 }
@@ -493,6 +500,8 @@ func (g *Group) memberGet(c *wkhttp.Context) {
 	// 调用成本与 N=1 一致），Android 客户端 /v1/groups/:group_no/members/:uid
 	// 是资料卡 / @提及 等路径的数据源。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：单成员查询同样回填 bot_owned_by_me，保持三处同名同型。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(memberCheckResp{Exists: true, Member: &resps[0]})
 }
@@ -844,6 +853,9 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 	// membersync 是 Android WKSDK ChannelMember 缓存的唯一增量来源，漏下发就
 	// 永远没 extraMap.realname_verified → 气泡 + 群成员列表永远不亮。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：增量同步路径同样回填。注意本字段上线前已缓存的成员行要等其
+	// version 变动才会带上它，故客户端必须按「缺失 = false」降级。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 	c.Response(resps)
 }
 
@@ -3044,6 +3056,9 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		return
 	}
 	var loginMember *MemberModel
+	// botOwnerSelfRemoval 标记「普通成员自助移除自己名下 bot」这条路径，
+	// 后续用于：拒绝 Creator 角色目标、以及让 service 改发更贴切的 Tip。
+	botOwnerSelfRemoval := false
 	// 查询操作者身份
 	// 这里要兼容后台管理系统的删除操作
 	if c.CheckLoginRole() != nil {
@@ -3058,8 +3073,36 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		if loginMember.Role != int(common.GroupMemberRoleCreater) && loginMember.Role != int(common.GroupMemberRoleManager) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
-			return
+			// 自助路径（octo-web#1511）：普通成员可以移除**自己名下**的 bot。
+			// 在此之前 bot 归属只在入群侧校验（checkBotOwnership），移除侧完全不看，
+			// 形成一道单向门——成员能把自己的 bot 拉进群，却再也取不出来。
+			//
+			// 判据必须是 QueryBotUIDsOwnedByUIDs 这种**默认拒绝的白名单**：它只返回
+			// 「本群内 + group_member.robot=1 + is_deleted=0 + robot.status=1 +
+			// robot.creator_uid = 操作者」的 bot UID。
+			//
+			// 切勿改用 checkBotOwnership —— 它的 SQL 是 `WHERE u.robot = 1`，人类 UID
+			// 根本查不出行、循环因此不拒绝（见 bot_ownership.go doc「human → always OK」）。
+			// 那是入群侧「非 bot 不归我管」的正确语义，搬到移除侧就是提权：
+			// 普通成员传一批人类 UID 即可踢人。
+			ownedBotUIDs, qerr := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{operator})
+			if qerr != nil {
+				g.Error("查询操作者名下 bot 失败", zap.Error(qerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			ownedBots := make(map[string]struct{}, len(ownedBotUIDs))
+			for _, uid := range ownedBotUIDs {
+				ownedBots[uid] = struct{}{}
+			}
+			// 整批校验：任一目标不在白名单内即整批拒绝，不做部分执行。
+			for _, uid := range req.Members {
+				if _, ok := ownedBots[uid]; !ok {
+					httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+					return
+				}
+			}
+			botOwnerSelfRemoval = true
 		}
 	}
 	// 验证删除者是否包含自己
@@ -3082,6 +3125,14 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		for _, member := range deleteMembers {
+			// 自助路径不得命中 Creator：RemoveGroupMembers 对 Creator 角色是**静默跳过**
+			// （service.go filter），handler 又不检查 Removed 计数就返回 200，
+			// 结果会是「接口成功但成员没动」，前端误报已移除。这里显式拒绝。
+			// 白名单查询不过滤 role，故理论上可命中一个身为群主的 bot。
+			if botOwnerSelfRemoval && member.Role == int(common.GroupMemberRoleCreater) {
+				httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
+				return
+			}
 			if loginMember.Role == int(common.GroupMemberRoleManager) {
 				if member.Role == int(common.GroupMemberRoleManager) {
 					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
@@ -3101,6 +3152,9 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		Members:      req.Members,
 		OperatorUID:  operator,
 		OperatorName: operatorName,
+		// 自助路径改发「X 将机器人 Y 移出了群聊」，而不是默认的「你被 X 移除群聊」
+		// ——后者是被移除者视角的措辞，套在 bot 上读起来是错的。
+		BotOwnerSelfRemoval: botOwnerSelfRemoval,
 	})
 	if err != nil {
 		// 后台管理路径会跳过普通成员的目标预校验；若删除的 UID 全不在群内，
@@ -4362,8 +4416,17 @@ type memberDetailResp struct {
 	RealnameVerified   bool   `json:"realname_verified"`
 	RealName           string `json:"real_name,omitempty"`
 	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
+	// BotOwnedByMe 表示「该 bot 成员归当前请求方所有」（octo-web#1511）。
+	// 响应本身就是 per-viewer 的，故用布尔而不是下发 creator_uid：客户端直接可用，
+	// 也不把 bot 的归属关系暴露给全群。
+	//
+	// 前端据此逐行决定是否渲染移除按钮。**缺失必须按 false 处理**：
+	// /membersync 是按 version 的增量同步，本字段上线前已缓存的成员行在其 version
+	// 变动前不会带上它，降级方向只能是「退回现状」，绝不能误开权限。
+	// 非 bot 成员、他人的 bot 均为 false。
+	BotOwnedByMe bool   `json:"bot_owned_by_me"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
@@ -4424,6 +4487,57 @@ func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
 //
 // 失败处理：仅 log，不阻断主响应链路 —— 实名是增强信息，不能因实名表查询抖动
 // 让群成员列表不可用。
+// fillBotOwnedByMe 批量回填 memberDetailResp.BotOwnedByMe（octo-web#1511）。
+//
+// 复用 memberRemove 自助路径的同一判据 QueryBotUIDsOwnedByUIDs —— 一次
+// `group_member INNER JOIN robot` 批量查出「本群内属于 loginUID 的 bot」，零 N+1，
+// 且保证「前端看得到移除按钮」与「后端放行移除」用的是同一口径，不会出现
+// 按钮显示了但请求被拒的错位。
+//
+// 为什么不做成群级能力位（如 can_remove_own_bots）：那需要在 GetGroupDetail 这类
+// 每次群信息拉取都走的热路径上多打一次 robot 表 JOIN；而本字段只在成员列表这类
+// 本来就要分页取数的场景计算一次。
+//
+// 失败处理：仅 log，全部留 false —— fail closed，宁可不显示移除按钮，
+// 不能因查询抖动误开权限。
+func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailResp) {
+	if len(resps) == 0 || groupNo == "" || loginUID == "" {
+		return
+	}
+	hasBot := false
+	for i := range resps {
+		if resps[i].Robot == 1 {
+			hasBot = true
+			break
+		}
+	}
+	if !hasBot {
+		return
+	}
+	ownedBotUIDs, err := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{loginUID})
+	if err != nil {
+		g.Warn("批量查询本人名下 bot 失败（octo-web#1511）",
+			zap.Error(err), zap.String("group_no", groupNo))
+		return
+	}
+	if len(ownedBotUIDs) == 0 {
+		return
+	}
+	owned := make(map[string]struct{}, len(ownedBotUIDs))
+	for _, uid := range ownedBotUIDs {
+		owned[uid] = struct{}{}
+	}
+	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
+	for i := range resps {
+		if resps[i].Robot != 1 {
+			continue
+		}
+		if _, ok := owned[resps[i].UID]; ok {
+			resps[i].BotOwnedByMe = true
+		}
+	}
+}
+
 func (g *Group) fillRealnameFields(resps []memberDetailResp) {
 	if len(resps) == 0 {
 		return

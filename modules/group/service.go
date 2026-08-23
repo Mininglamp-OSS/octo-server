@@ -1057,6 +1057,17 @@ type RemoveGroupMembersServiceReq struct {
 	// 空串沿用默认的「被移出」，所以既有调用方行为不变；自愿离开的场景传「退出了」。
 	BotCascadeTipAction string
 
+	// BotOwnerSelfRemoval 标记「bot 所有者自助把自己名下的 bot 移出群聊」
+	// （octo-web#1511）。置位时抑制默认的「你被 X 移除群聊」——那是被移除者视角的
+	// 措辞，目标是 bot 时读起来是错的——改发一条 owner 视角的 Tip
+	// （sendBotOwnerRemovedTip）。
+	//
+	// 为什么不复用 SuppressRemoveNotice + 调用方自己发消息：那需要调用方同时设对
+	// 两个开关才不出错，而 handler 手上没有成员名字（QueryMembersWithUids 返回的
+	// MemberModel 无 Name 字段），本函数则已经为 removedVos 查好了名字。
+	// 收敛成一个语义化开关，调用方无法只设一半。
+	BotOwnerSelfRemoval bool
+
 	// SuppressBotCascadeTip 完全不发 bot 连带移除 Tip。
 	// 只在「通告本身已无意义」时用（Space 解散：群还在，但每个成员每个群各发一条，
 	// N×M 条堆给最后一个人看）。普通移除和自愿退出都**应该**发——群成员看见 bot
@@ -1918,7 +1929,14 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 
 		// 发送被踢消息
-		if !req.SuppressRemoveNotice {
+		switch {
+		case req.BotOwnerSelfRemoval:
+			// bot 所有者自助移除：换成 owner 视角的 Tip。仍然要发——群成员看见 bot
+			// 凭空消失有权知道原因（与 bot 级联 Tip 同一条透明度约定）。
+			if err := sendBotOwnerRemovedTip(s.ctx, req.GroupNo, req.OperatorName, removedVos); err != nil {
+				s.Error("send bot owner removed tip failed", zap.Error(err))
+			}
+		case !req.SuppressRemoveNotice:
 			removeReq := &config.MsgGroupMemberRemoveReq{
 				Operator:     req.OperatorUID,
 				OperatorName: req.OperatorName,

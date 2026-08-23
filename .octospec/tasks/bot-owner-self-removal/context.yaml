@@ -1,0 +1,45 @@
+# octospec Implement 阶段的规则注入记录。
+# 命中判据：inject_when.paths 匹配将要改动的文件，或 inject_when.touches 命中
+# brief 的 load-bearing tags（两者取并集）。
+# 本仓库 .octospec/_global/ 未同步（manifest 声明 inherits: octo-spec@1.1.0），
+# 故本次注入全部为 repo tier。
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: brief tags auth/acl/isolation/thread/bot-api；本次改的正是群成员移除的鉴权闸门
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: 经 touches[wire-contract] 命中；相关面是新 Tip 把 bot/操作者名称插值进消息 payload
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: paths modules/**/*.go + touches error-response/wire-contract；新增拒绝分支与 memberDetailResp 字段
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: 决策点 2 —— 给两条移除路由挂 SharedUIDRateLimiter
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: paths **/*_test.go；新增 api_bot_ownership_test.go 用例
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ["**"] 恒命中
+
+brief: .octospec/tasks/bot-owner-self-removal/brief.md
+
+# 四个决策点（brief 末尾）已由维护者拍板：
+decisions:
+  bot_admin_removable: true          # 所有权优先，允许所有者撤走已授予 bot_admin 的 bot
+  rate_limit_scope: two-routes-only  # 只挂 DELETE /members 与 POST /members_delete，不挂整个 groups 组
+  tip_template: "%s 将机器人 %s 移出了群聊"
+  creator_target: reject             # 自助分支显式拒绝 Creator 角色目标，避免「200 但没动」
