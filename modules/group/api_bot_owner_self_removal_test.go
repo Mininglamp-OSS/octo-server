@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
@@ -256,6 +257,10 @@ func TestBotOwnerSelfRemoval_RepeatRemovalIsNotServerError(t *testing.T) {
 	second := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_twice"})
 	assert.Less(t, second.Code, http.StatusInternalServerError,
 		"重复移除应是业务错误而非 5xx，实际: %d %s", second.Code, second.Body.String())
+	// 必须是「不在群内」而不是「无权移除」：白名单按 is_deleted=0 过滤，已移除的
+	// bot 天然掉出白名单，若直接回权限错误，用户会看到「你没有权限移除自己的 bot」。
+	assert.Contains(t, second.Body.String(), "not_in_group",
+		"重复移除应回「成员不在群内」，实际: %s", second.Body.String())
 }
 
 // 验收 7：自助路径不发「你被 X 移除群聊」，改发 owner 视角的 Tip。
@@ -371,6 +376,62 @@ func TestBotOwnerSelfRemoval_MembersGetExposesBotOwnedByMe(t *testing.T) {
 	assert.False(t, flags["bot_other_flag"], "他人名下的 bot 应为 false")
 	assert.False(t, flags[testutil.UID], "人类成员应恒为 false")
 	assert.False(t, flags["owner_other"], "人类成员应恒为 false")
+}
+
+// 被拉黑的成员（status=Blacklist、is_deleted=0）不得借自助分支获得写操作。
+//
+// 上面那层 QueryMemberWithUID 只过滤 is_deleted，会把被拉黑成员当作仍在群
+// （见 db.go QueryActiveMemberGroupNosWithUID 的约定）；而 QueryBotUIDsOwnedByUIDs
+// 故意不过滤 group_member.status（拉黑级联要靠它恢复），所以拉黑门必须由
+// handler 显式来把。少了它，被拉黑的人能改群成员表并往群里写一条持久化 Tip。
+func TestBotOwnerSelfRemoval_RejectsBlacklistedOperator(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	seedSelfRemovalBot(t, f, "bot_of_blacklisted", "bot", testutil.UID, 1)
+
+	_, err := f.ctx.DB().UpdateBySql(
+		"UPDATE group_member SET status=? WHERE group_no=? AND uid=?",
+		int(common.GroupMemberStatusBlacklist), selfRemovalGroupNo, testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+
+	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_of_blacklisted"})
+	assert.NotEqual(t, http.StatusOK, w.Code, "被拉黑成员不得移除任何成员")
+
+	exist, err := f.db.ExistMember("bot_of_blacklisted", selfRemovalGroupNo)
+	require.NoError(t, err)
+	assert.True(t, exist, "bot 应仍在群内")
+}
+
+// memberGet 也要如实下发 bot_owned_by_me（验收 10 的「三处同名同型」）。
+//
+// 这条同时钉住 queryMemberWithGroupNoAndUID 的选择列必须含 group_member.robot：
+// 漏选时 Robot 恒为 0，fillBotOwnedByMe 的前置判据直接短路，字段静默恒 false。
+func TestBotOwnerSelfRemoval_MemberGetExposesBotOwnedByMe(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	seedSelfRemovalBot(t, f, "bot_single_get", "mine", testutil.UID, 1)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET",
+		"/v1/groups/"+selfRemovalGroupNo+"/members/bot_single_get", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "单成员查询应可读: %s", w.Body.String())
+
+	var resp struct {
+		Exists bool `json:"exists"`
+		Member struct {
+			UID          string `json:"uid"`
+			Robot        int    `json:"robot"`
+			BotOwnedByMe bool   `json:"bot_owned_by_me"`
+		} `json:"member"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.Exists)
+	assert.Equal(t, 1, resp.Member.Robot, "robot 必须被下发，否则回填会静默失效")
+	assert.True(t, resp.Member.BotOwnedByMe, "memberGet 也要如实下发 bot_owned_by_me")
 }
 
 // 验收 9：自助移除同样要清理该 bot 在本群所有子区的成员身份。

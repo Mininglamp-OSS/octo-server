@@ -3085,6 +3085,25 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			// 根本查不出行、循环因此不拒绝（见 bot_ownership.go doc「human → always OK」）。
 			// 那是入群侧「非 bot 不归我管」的正确语义，搬到移除侧就是提权：
 			// 普通成员传一批人类 UID 即可踢人。
+			// 自助分支是新增的**授权谓词**，必须用活跃口径（is_deleted=0 AND
+			// status=Normal），不能只看上面 QueryMemberWithUID 的 is_deleted ——
+			// 见 db.go QueryActiveMemberGroupNosWithUID 的约定：「只看 is_deleted
+			// 会把被拉黑成员当作仍然在群」。
+			// 若不加这道门，被拉黑的成员（status=Blacklist、is_deleted=0）会凭空获得
+			// 一个能改群成员表、并往群里写一条持久化 Tip 的写操作；而在本改动之前
+			// 他会直接吃到 ErrGroupMemberCannotRemove。
+			// 注意 QueryBotUIDsOwnedByUIDs 故意不过滤 group_member.status（拉黑级联
+			// 需要它），所以这道门必须由调用方来把。
+			operatorActive, aerr := g.db.ExistMemberActive(operator, groupNo)
+			if aerr != nil {
+				g.Error("查询操作者活跃成员状态失败", zap.Error(aerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			if !operatorActive {
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
+			}
 			ownedBotUIDs, qerr := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{operator})
 			if qerr != nil {
 				g.Error("查询操作者名下 bot 失败", zap.Error(qerr))
@@ -3097,10 +3116,25 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			}
 			// 整批校验：任一目标不在白名单内即整批拒绝，不做部分执行。
 			for _, uid := range req.Members {
-				if _, ok := ownedBots[uid]; !ok {
-					httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				if _, ok := ownedBots[uid]; ok {
+					continue
+				}
+				// 目标不在白名单有两种原因，要给出不同的错误：白名单按
+				// is_deleted=0 过滤，所以「刚被移除过的自己的 bot」会落到这里。
+				// 一律回「无权移除」会让用户看到「你没有权限移除自己的 bot」，
+				// 而真相是它已经不在群里了（重复点击 / 离线重试 / 列表过期）。
+				stillMember, merr := g.db.ExistMember(uid, groupNo)
+				if merr != nil {
+					g.Error("查询目标成员是否在群失败", zap.Error(merr))
+					httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 					return
 				}
+				if !stillMember {
+					httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
 			}
 			botOwnerSelfRemoval = true
 		}
@@ -4487,6 +4521,48 @@ func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
 //
 // 失败处理：仅 log，不阻断主响应链路 —— 实名是增强信息，不能因实名表查询抖动
 // 让群成员列表不可用。
+func (g *Group) fillRealnameFields(resps []memberDetailResp) {
+	if len(resps) == 0 {
+		return
+	}
+	uids := make([]string, 0, len(resps))
+	seen := make(map[string]struct{}, len(resps))
+	for _, r := range resps {
+		if r.UID == "" {
+			continue
+		}
+		if _, ok := seen[r.UID]; ok {
+			continue
+		}
+		seen[r.UID] = struct{}{}
+		uids = append(uids, r.UID)
+	}
+	if len(uids) == 0 {
+		return
+	}
+	infoMap, err := user.QueryVerificationsByUIDs(g.ctx, uids)
+	if err != nil {
+		g.Warn("批量查询群成员实名认证记录失败（YUJ-413）",
+			zap.Error(err), zap.Int("uid_count", len(uids)))
+		return
+	}
+	if len(infoMap) == 0 {
+		return
+	}
+	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
+	for i := range resps {
+		info, ok := infoMap[resps[i].UID]
+		if !ok || info == nil {
+			continue
+		}
+		resps[i].RealnameVerified = true
+		resps[i].RealName = info.RealName
+		resps[i].RealnameVerifiedAt = info.RealnameVerifiedAt
+	}
+}
+
+// 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
+// 函数不会改写 is_external / source_space_id 字段。
 // fillBotOwnedByMe 批量回填 memberDetailResp.BotOwnedByMe（octo-web#1511）。
 //
 // 复用 memberRemove 自助路径的同一判据 QueryBotUIDsOwnedByUIDs —— 一次
@@ -4538,48 +4614,6 @@ func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailR
 	}
 }
 
-func (g *Group) fillRealnameFields(resps []memberDetailResp) {
-	if len(resps) == 0 {
-		return
-	}
-	uids := make([]string, 0, len(resps))
-	seen := make(map[string]struct{}, len(resps))
-	for _, r := range resps {
-		if r.UID == "" {
-			continue
-		}
-		if _, ok := seen[r.UID]; ok {
-			continue
-		}
-		seen[r.UID] = struct{}{}
-		uids = append(uids, r.UID)
-	}
-	if len(uids) == 0 {
-		return
-	}
-	infoMap, err := user.QueryVerificationsByUIDs(g.ctx, uids)
-	if err != nil {
-		g.Warn("批量查询群成员实名认证记录失败（YUJ-413）",
-			zap.Error(err), zap.Int("uid_count", len(uids)))
-		return
-	}
-	if len(infoMap) == 0 {
-		return
-	}
-	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
-	for i := range resps {
-		info, ok := infoMap[resps[i].UID]
-		if !ok || info == nil {
-			continue
-		}
-		resps[i].RealnameVerified = true
-		resps[i].RealName = info.RealName
-		resps[i].RealnameVerifiedAt = info.RealnameVerifiedAt
-	}
-}
-
-// 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
-// 函数不会改写 is_external / source_space_id 字段。
 func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []memberDetailResp) {
 	if len(resps) == 0 {
 		return
