@@ -122,6 +122,153 @@ func seedGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string, rol
 	require.NoError(t, err)
 }
 
+// seedGroupMemberWithRemark 带群内备注的成员。remark 是本仓库展示名的第一优先级，
+// 不带 remark 的 seedGroupMember 覆盖不到那条分支。
+func seedGroupMemberWithRemark(t *testing.T, ctx *config.Context, groupNo, uid string, role int, remark string) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT INTO group_member (group_no, uid, role, remark, is_deleted, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 1, NOW(), NOW())",
+		groupNo, uid, role, remark)
+	require.NoError(t, err)
+}
+
+// seedUser 写一条 user 行，让 resolveDisplayName 能查到名字。
+// 不写的话它一路回落到 uid，名字相关的断言就是在跟 uid 较劲，永远发现不了传错参数。
+func seedUser(t *testing.T, ctx *config.Context, uid, name string) {
+	t.Helper()
+	// short_no 必须显式给且唯一：列上有 short_no_udx 唯一索引且默认值是 ''，
+	// 不填的话第二个用户就撞 `Duplicate entry '' for key 'user.short_no_udx'`。
+	_, err := ctx.DB().Exec(
+		"INSERT INTO `user` (uid, name, username, short_no, password, status, created_at, updated_at) VALUES (?, ?, ?, ?, '', 1, NOW(), NOW())",
+		uid, name, uid, uid)
+	require.NoError(t, err)
+}
+
+// countGroupVisible 数**全群可见**且含指定文案的消息条数。
+// 布尔式的 contains 对「同一条被发了 N 遍」毫无意见，而按成员数重复发正是
+// 这类广播最容易犯的错。
+func countGroupVisible(payloads []map[string]interface{}, fragment string) int {
+	n := 0
+	for _, p := range payloads {
+		if payloadsContainGroupVisible([]map[string]interface{}{p}, fragment) {
+			n++
+		}
+	}
+	return n
+}
+
+// countGroupVisibleTips 数**全群可见且带可见文案**的消息条数。
+//
+// 为什么不能用 countGroupVisible(片段) 来断言「一条都不该有」：那个按 content 片段
+// 匹配，而名字可能根本不在 content 里（SendGroupTransferGrouper 把名字放 extra、
+// content 只有「“{0}”已成为新群主」）。用片段断言 0 条时，任何把名字挪进 extra 的
+// 广播都会静默漏过——这正是变异检验抓到的洞。
+//
+// 排除 CMD：CMDGroupMemberUpdate 走同一个 /message/send，也没有收件人裁剪，
+// 但它 type=99、没有 content，是静默刷新而非用户可见消息。
+func countGroupVisibleTips(payloads []map[string]interface{}) int {
+	n := 0
+	for _, p := range payloads {
+		if subs, ok := p["subscribers"]; ok && subs != nil {
+			if list, isList := subs.([]interface{}); !isList || len(list) > 0 {
+				continue
+			}
+		}
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if vis, ok := inner["visibles"]; ok && vis != nil {
+			if list, isList := vis.([]interface{}); !isList || len(list) > 0 {
+				continue
+			}
+		}
+		if content, ok := inner["content"]; ok && content != nil && fmt.Sprint(content) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// payloadExtraHasUID / payloadExtraHasName 检查某条消息的 extra 里带的是谁。
+//
+// SendGroupTransferGrouper 的 content 是「“{0}”已成为新群主」——名字**不在** content
+// 里，而在 extra[0]，由客户端替换占位符。所以断言"是谁成了新群主"必须看 extra；
+// 只匹配 content 片段的话，把继任者传成离开者也照样绿。
+func payloadExtraField(payloads []map[string]interface{}, fragment, field, want string) bool {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(inner["content"]), fragment) {
+			continue
+		}
+		extras, _ := inner["extra"].([]interface{})
+		for _, e := range extras {
+			if m, ok := e.(map[string]interface{}); ok && fmt.Sprint(m[field]) == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func payloadExtraHasUID(payloads []map[string]interface{}, fragment, uid string) bool {
+	return payloadExtraField(payloads, fragment, "uid", uid)
+}
+
+// payloadExtraUIDAt 取某条消息 extra 里第 idx 个元素的 uid。
+// 两占位符的文案里位置是有语义的：{0} 是离开者、{1} 是新群主，两个传反了
+// 「谁离开、谁接手」就整个说反，而只断言"两个 uid 都在 extra 里"抓不到。
+func payloadExtraUIDAt(payloads []map[string]interface{}, fragment string, idx int) string {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(inner["content"]), fragment) {
+			continue
+		}
+		extras, _ := inner["extra"].([]interface{})
+		if idx >= len(extras) {
+			return ""
+		}
+		if m, ok := extras[idx].(map[string]interface{}); ok {
+			return fmt.Sprint(m["uid"])
+		}
+	}
+	return ""
+}
+
+func payloadExtraHasName(payloads []map[string]interface{}, fragment, name string) bool {
+	return payloadExtraField(payloads, fragment, "name", name)
+}
+
 // seedActiveSpaceMember 写一个活跃的 space + space_member，模拟「人已经回来了」。
 func seedActiveSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string) {
 	t.Helper()
@@ -310,6 +457,9 @@ func TestGroupCascadeSelfExitSuppressesRemovedNotice(t *testing.T) {
 		"自助退出不得渲染成「你被 X 移除群聊」")
 	assert.True(t, payloadsContain(stub.sentPayloads(), "退出群聊"),
 		"应改发退群提示")
+	// 自助退出走的是既有的 sendGroupExitTip（只给一位管理员看），不得升级成全群广播。
+	assert.Equal(t, 0, countGroupVisibleTips(stub.sentPayloads()),
+		"自助退出的提示只给一位管理员，不得产生全群可见消息")
 }
 
 // TestGroupCascadeDisbandSuppressesPerMemberNotice 解散不会解散群，
@@ -333,6 +483,9 @@ func TestGroupCascadeDisbandSuppressesPerMemberNotice(t *testing.T) {
 	assert.False(t, stillIn, "清理本身照做")
 	assert.False(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
 		"解散场景不得逐成员逐群发被移出消息")
+	// 解散不得产生任何全群可见消息——N×M 的理由对广播同样成立。
+	assert.Equal(t, 0, countGroupVisibleTips(stub.sentPayloads()),
+		"解散场景不得产生任何带可见文案的全群消息")
 }
 
 // TestGroupCascadeKickStillNotifies 反向保证：正常踢人仍要发被移出消息，
@@ -352,12 +505,217 @@ func TestGroupCascadeKickStillNotifies(t *testing.T) {
 	}))
 
 	assert.True(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
-		"被踢出 Space 导致的退群仍要在群里告知")
+		"被踢出 Space 导致的退群仍要发被移出通知")
+}
+
+// TestGroupCascadeKickSendsNoGroupBroadcast 普通成员被移出 Space 时**不**向全群广播。
+//
+// 刻意的产品取舍，不是遗漏：「某人走了」在成员列表里看得见，「群主换人了」看不见，
+// 只有后者值得一条群消息。反过来做会让两个 200-uid 的批量入口
+// （members/remove、管理端 removeMembers）变成消息洪水：200 人 × 50 群 = 一万条
+// NoPersist=0 的永久群消息，量级与解散被抑制的理由相同。
+//
+// 断言用 payloadsContainGroupVisible（不带任何收件人裁剪的消息）而不是
+// payloadsContain：被移除者本人仍会收到私人通知，那条**应该**发，不能被这里误伤。
+func TestGroupCascadeKickSendsNoGroupBroadcast(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-kicknobroadcast", "u-victim"
+
+	seedUser(t, ctx, victim, "受害者小明")
+	seedGroupInSpace(t, ctx, "g-kicknobroadcast", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-kicknobroadcast", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-kicknobroadcast", victim, MemberRoleCommon)
+	seedGroupMember(t, ctx, "g-kicknobroadcast", "u-bystander", MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "u-owner",
+		Reason: spacemod.MemberRemoveReasonKicked,
+	}))
+
+	// 清理本身照做
+	_, stillIn := liveMemberRole(t, ctx, "g-kicknobroadcast", victim)
+	assert.False(t, stillIn)
+	assert.Contains(t, stub.unsubscribed("g-kicknobroadcast"), victim)
+
+	assert.Equal(t, 0, countGroupVisibleTips(stub.sentPayloads()),
+		"普通成员被移出 Space 不得产生任何带可见文案的全群消息")
+	// 私人通知必须还在——它是被移除者知道自己为什么进不去群的唯一来源。
+	assert.True(t, payloadsContain(stub.sentPayloads(), "移除群聊"),
+		"被移除者本人的私人通知不得被一并砍掉")
+}
+
+// TestGroupCascadeCreatorHandoverIsAnnounced 群主被移出时，交接必须在群里通告。
+//
+// 交接本身 #795 就做了，但是**静默**的：群里凭空多出一个新群主，没有任何消息说明。
+// 走的是 octo-lib 既有的 SendGroupTransferGrouper，与手动转让同一个 content type。
+func TestGroupCascadeCreatorHandoverIsAnnounced(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator, successor = "sp-handover-tip", "u-creator", "u-successor"
+
+	seedUser(t, ctx, creator, "老群主")
+	seedUser(t, ctx, successor, "新群主")
+
+	seedGroupInSpace(t, ctx, "g-handover-tip", spaceID, creator)
+	seedGroupMember(t, ctx, "g-handover-tip", creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-handover-tip", successor, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	// 交接确实发生
+	role, stillIn := liveMemberRole(t, ctx, "g-handover-tip", successor)
+	require.True(t, stillIn)
+	assert.Equal(t, MemberRoleCreator, role, "第二元老应已被提升为群主")
+
+	// 而且群里被告知了：全群可见（无 subscribers / visibles 裁剪）
+	assert.True(t, payloadsContainGroupVisible(stub.sentPayloads(), "已成为新群主"),
+		"群主交接必须全群可见，否则群里凭空多出一个新群主")
+	// 级联场景要把**原因**一并交代，只说"换了群主"没头没尾。
+	assert.True(t, payloadsContainGroupVisible(stub.sentPayloads(), "已离开当前空间"),
+		"级联交接要说明是因为原群主离开了空间")
+	// 名字走 extra 占位符而非拼进 content，且**位置有语义**：{0} 离开者、{1} 新群主。
+	assert.Equal(t, creator, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 0),
+		"extra[0] 必须是离开的老群主")
+	assert.Equal(t, successor, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 1),
+		"extra[1] 必须是继任者")
+	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
+		"每群只发一条交接通告")
+}
+
+// TestGroupCascadeHandoverAnnouncedOncePerRetry 交接通告在工单重试下既不丢也不重发。
+//
+// 这是 review 挖出来的真 bug 的回归：通告原本放在 RemoveGroupMembers **之后**，
+// 而交接自己已经提交了事务。中间一旦失败，重试时读到的角色已是 MemberRoleCommon，
+// 交接分支不再进入，通告永久丢失——正好复现要修的那个「凭空多出新群主」。
+//
+// 用「连跑两次」逼出重试语义：第二次 handOverGroupCreator 在行锁内看到已非 creator
+// 直接返回，所以总数必须仍是 1（不是 0，也不是 2）。
+func TestGroupCascadeHandoverAnnouncedOncePerRetry(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator, successor = "sp-handover-retry", "u-creator", "u-successor"
+
+	seedUser(t, ctx, creator, "老群主")
+	seedUser(t, ctx, successor, "新群主")
+	seedGroupInSpace(t, ctx, "g-handover-retry", spaceID, creator)
+	seedGroupMember(t, ctx, "g-handover-retry", creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-handover-retry", successor, MemberRoleCommon)
+
+	removal := spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, removal))
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, removal)) // 重跑
+
+	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
+		"重试不得重复通告，也不得把它弄丢")
+}
+
+// TestGroupCascadeHandoverPrefersGroupRemark 交接通告用群内 remark 而非全局名。
+// 继任者那一行是交接事务里 FOR UPDATE 选出来的，Remark 直接可用。
+func TestGroupCascadeHandoverPrefersGroupRemark(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator, successor = "sp-handover-remark", "u-creator", "u-successor"
+
+	seedUser(t, ctx, successor, "全局大名")
+	seedGroupInSpace(t, ctx, "g-handover-remark", spaceID, creator)
+	seedGroupMember(t, ctx, "g-handover-remark", creator, MemberRoleCreator)
+	seedGroupMemberWithRemark(t, ctx, "g-handover-remark", successor, MemberRoleCommon, "群里叫我老李")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	assert.True(t, payloadExtraHasName(stub.sentPayloads(), "已成为新群主", "群里叫我老李"),
+		"应使用群内 remark")
+	assert.False(t, payloadExtraHasName(stub.sentPayloads(), "已成为新群主", "全局大名"),
+		"不得回落到全局 user.name")
+}
+
+// TestGroupCascadeLoneCreatorAnnouncesNoHandover 无人可继任时不得通告交接。
+// handOverGroupCreator 此时把群留成无主群，硬发一条「…已成为新群主」会是假消息。
+func TestGroupCascadeLoneCreatorAnnouncesNoHandover(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator = "sp-lonecreator-tip", "u-lone"
+
+	seedUser(t, ctx, creator, "光杆司令")
+	seedGroupInSpace(t, ctx, "g-lonecreator-tip", spaceID, creator)
+	seedGroupMember(t, ctx, "g-lonecreator-tip", creator, MemberRoleCreator)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	assert.False(t, payloadsContain(stub.sentPayloads(), "已成为新群主"),
+		"没有继任者就不得通告交接")
+}
+
+// TestGroupCascadeDisbandSuppressesHandoverAnnounce 解散时交接照做但不通告。
+//
+// 解散会把**每个**成员都移除，于是群主交接会沿着元老顺序连锁触发：C→S2、S2→S3…
+// 一个 M 人群就是 M-1 条「已成为新群主」，且前 M-2 条在写下时就已作废。
+// 空间没了、人也全走了，没有收信人。
+func TestGroupCascadeDisbandSuppressesHandoverAnnounce(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator, successor = "sp-handover-disband", "u-creator", "u-successor"
+
+	seedGroupInSpace(t, ctx, "g-handover-disband", spaceID, creator)
+	seedGroupMember(t, ctx, "g-handover-disband", creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-handover-disband", successor, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonSpaceDisbanded,
+	}))
+
+	// 交接照做（否则 RemoveGroupMembers 会跳过 creator，人永远留在群里）
+	role, stillIn := liveMemberRole(t, ctx, "g-handover-disband", successor)
+	require.True(t, stillIn)
+	assert.Equal(t, MemberRoleCreator, role, "解散场景交接仍要发生")
+	// 但不通告
+	assert.False(t, payloadsContain(stub.sentPayloads(), "已成为新群主"),
+		"解散不得逐个通告群主交接")
+}
+
+// TestGroupCascadeForceRemovedSendsNoGroupBroadcast 超管强制移除同样不广播。
+// 与 kicked 走同一条分支，但两个 reason 由不同入口产生，各钉一次。
+func TestGroupCascadeForceRemovedSendsNoGroupBroadcast(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, victim = "sp-forcenobroadcast", "u-victim"
+
+	seedUser(t, ctx, victim, "被超管移除者")
+	seedGroupInSpace(t, ctx, "g-forcenobroadcast", spaceID, "u-owner")
+	seedGroupMember(t, ctx, "g-forcenobroadcast", "u-owner", MemberRoleCreator)
+	seedGroupMember(t, ctx, "g-forcenobroadcast", victim, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: victim, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	_, stillIn := liveMemberRole(t, ctx, "g-forcenobroadcast", victim)
+	assert.False(t, stillIn, "清理照做")
+	assert.Equal(t, 0, countGroupVisibleTips(stub.sentPayloads()),
+		"超管强制移除同样不得产生任何带可见文案的全群消息")
 }
 
 // payloadsContain 在录到的系统消息里找文案片段。
 // SendGroupMemberBeRemove 的 content 是「你被{0}移除群聊」，
 // SendGroupExit 的是「“{0}“退出群聊」。
+//
+// ⚠️ 只回答「有没有发出去」，**不**回答「谁能看见」。判断可见范围要用
+// payloadsContainGroupVisible —— 见那里的注释。
 func payloadsContain(payloads []map[string]interface{}, fragment string) bool {
 	for _, p := range payloads {
 		raw, ok := p["payload"]
@@ -370,6 +728,47 @@ func payloadsContain(payloads []map[string]interface{}, fragment string) bool {
 			}
 		}
 		if strings.Contains(fmt.Sprint(raw), fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// payloadsContainGroupVisible 找**全群可见**且含指定文案的系统消息。
+//
+// 为什么单列一个：WuKongIM 有两级收件人裁剪，任一级非空就不再是群内广播——
+//   - 顶层 subscribers：只投递给这些人；
+//   - payload.visibles：客户端只给这些人渲染。
+//
+// SendGroupMemberBeRemove 把**两级都**钉死成被移除者本人（octo-lib
+// config/msg_group.go:203），所以它虽然"发出去了"，群里剩下的人一个字也看不到。
+// 光用 payloadsContain 断言会让这个缺口一直是绿的：消息确实在 sentPayloads 里。
+func payloadsContainGroupVisible(payloads []map[string]interface{}, fragment string) bool {
+	for _, p := range payloads {
+		if subs, ok := p["subscribers"]; ok && subs != nil {
+			if list, isList := subs.([]interface{}); !isList || len(list) > 0 {
+				continue // 定向投递，不是群内广播
+			}
+		}
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if vis, ok := inner["visibles"]; ok && vis != nil {
+			if list, isList := vis.([]interface{}); !isList || len(list) > 0 {
+				continue // 定向渲染，不是群内广播
+			}
+		}
+		if content, ok := inner["content"]; ok &&
+			strings.Contains(fmt.Sprint(content), fragment) {
 			return true
 		}
 	}

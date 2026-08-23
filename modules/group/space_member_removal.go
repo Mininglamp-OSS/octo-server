@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -66,14 +67,22 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 		return nil
 	}
 
-	operatorName := g.resolveOperatorName(removal.OperatorUID)
+	// 解散路径既不发被移出通知、也不发群内广播、也不通告群主交接，两个展示名
+	// 一个都用不上——一个几千人的 Space 解散就是几千次纯浪费的 user 查询。
+	// 注意这里查的是**全局**兜底名；真正用的是群内 remark 优先，见
+	// exitSpaceMemberFromGroup 里的 displayName。
+	var operatorName, memberName string
+	if removal.Reason != spacemod.MemberRemoveReasonSpaceDisbanded {
+		operatorName = g.resolveDisplayName(removal.OperatorUID)
+		memberName = g.resolveDisplayName(removal.UID)
+	}
 
 	var firstErr error
 	for _, groupModel := range groups {
 		if groupModel == nil || groupModel.Status == GroupStatusDisband {
 			continue
 		}
-		if err := g.exitSpaceMemberFromGroup(groupModel.GroupNo, removal, operatorName); err != nil {
+		if err := g.exitSpaceMemberFromGroup(groupModel.GroupNo, removal, operatorName, memberName); err != nil {
 			g.Error("被移出 Space 的成员退群失败",
 				zap.Error(err),
 				zap.String("groupNo", groupModel.GroupNo),
@@ -125,7 +134,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 //
 // 上面那次 CheckMembershipForCleanup 覆盖的是「重新加入发生在读之前」，也就是真正
 // 宽的那个窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 #797。
-func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
+func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName, memberName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
 		return fmt.Errorf("query group member: %w", err)
@@ -134,8 +143,29 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		return nil // 已经不在群里，幂等返回
 	}
 
+	// 展示名按群取：group_member.remark 是本群内的称呼，优先于全局 user.name。
+	// 这是本仓库既有的展示名规则——groupExit 就是 `loginMember.Remark` 优先
+	// （api.go:3458）、花名册也渲染 Remark。用全局名会在群里播一个没人认识的名字。
+	// memberName 是循环外查好的全局名兜底。
+	displayName := member.Remark
+	if displayName == "" {
+		displayName = memberName
+	}
+
+	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
+
+	// 群主交接**连同它的群内通告**都在 handOverGroupCreator 里完成，不要挪到本函数
+	// 后半段去发。
+	//
+	// 交接自己提交事务，而它之后到函数返回之间还有 RemoveGroupMembers 这一大段可能
+	// 失败（DB 错误、bot 级联失败、Removed==0 的并发守卫）。一旦失败，工单重试时
+	// 这里读到的角色已经是 MemberRoleCommon，交接分支不再进入——通告就**永久丢失**，
+	// 正是本改动要消灭的「群里凭空多出一个新群主」。
+	//
+	// 放在提交处则天然幂等：重试时 handOverGroupCreator 在行锁内看到已非群主，
+	// 直接返回，不会重复通告。
 	if member.Role == MemberRoleCreator {
-		if err := g.handOverGroupCreator(groupNo, removal.UID); err != nil {
+		if err := g.handOverGroupCreator(groupNo, removal.UID, displayName, spaceGone); err != nil {
 			return fmt.Errorf("hand over group creator: %w", err)
 		}
 	}
@@ -147,10 +177,13 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	//     N 个成员 × M 个群就是 N×M 条系统消息（1000 人 × 50 群 = 五万条），
 	//     全都堆给最后被移除的那个人看。空间已经没了，逐个通告没有意义。
 	selfExit := removal.Reason == spacemod.MemberRemoveReasonLeft
-	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
 	suppressNotice := selfExit || spaceGone
 
 	// bot 连带移除的 Tip 动作词：自助退出说「退出了」，其余沿用默认的「被移出」。
+	//
+	// 不要把被移出 Space 的情形也改成「退出了」：那是被动的，说成主动就是错的，
+	// 而且 TestGroupCascadeKickStillSendsBotTip 正是钉这条契约的正向对照。
+	// 下面那条群内广播的措辞要跟着**它**走（都说「被移出」），而不是反过来。
 	cascadeAction := ""
 	if selfExit {
 		cascadeAction = "退出了"
@@ -192,6 +225,17 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		// 已经查不到人了。
 		g.sendGroupExitTip(groupNo, removal.UID, member.Remark)
 	}
+	// 普通成员被移出 Space 时**不**向全群广播——刻意的产品取舍，别再加回来。
+	//
+	// 「某人走了」在成员列表里看得见，而「群主换人了」看不见：信息量不对等，所以
+	// 只有后者值得一条群消息（在 handOverGroupCreator 里发）。
+	//
+	// 反过来做（每个被移除成员都广播一条）会把两个批量入口直接变成消息洪水：
+	// members/remove 与管理端 removeMembers 各自最多 200 个 uid
+	// （managerMaxBatchUIDs），每个 uid 一条工单、每条工单遍历其所有群，
+	// 200 人 × 50 群 = 一万条 NoPersist=0 的永久群消息，量级与解散被抑制的理由相同。
+	// 被移除者本人仍会收到 RemoveGroupMembers 发的私人通知（「你被{0}移除群聊」），
+	// 群内成员列表则由 CMDGroupMemberUpdate 静默刷新。
 	return nil
 }
 
@@ -222,7 +266,12 @@ func (g *Group) sendGroupExitTip(groupNo, uid, groupRemark string) {
 // 没有可继任者（群里只剩他自己，或只剩 bot）时仍然要把他降为普通成员，否则
 // RemoveGroupMembers 会跳过 creator，人就永远留在群里了。此时群成为无主空群，
 // 与既有 groupExit 在同样情形下的终局一致。
-func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
+// 交接成功后**在本函数内**通告全群，不把继任者回传给调用方去发：调用方到函数返回
+// 之间还有 RemoveGroupMembers 可能失败，而重试时离开者已被降级、不再走进交接分支，
+// 通告就永久丢了。放在这里则天然幂等——重试时锁内重读已非 creator，直接返回。
+//
+// suppressNotice=true 时只做交接、不通告（解散场景，见调用方）。
+func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName string, suppressNotice bool) error {
 	tx, err := g.db.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin creator handover: %w", err)
@@ -272,32 +321,99 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit creator handover: %w", err)
 	}
-	if successor != nil {
-		g.Info("Space 成员移除触发群主交接",
-			zap.String("groupNo", groupNo),
-			zap.String("from", leaverUID),
-			zap.String("to", successor.UID))
-	} else {
+	if successor == nil {
 		g.Warn("群主被移出 Space 但群内无可继任者，群将无主",
 			zap.String("groupNo", groupNo), zap.String("uid", leaverUID))
+		return nil
+	}
+	g.Info("Space 成员移除触发群主交接",
+		zap.String("groupNo", groupNo),
+		zap.String("from", leaverUID),
+		zap.String("to", successor.UID))
+	if suppressNotice {
+		return nil
+	}
+
+	// 复用 octo-lib 既有的 SendGroupTransferGrouper，而不是自己拼一条通用 Tip：
+	//   - 它已经是全群可见（不设 Subscribers、不设 payload.visibles）；
+	//   - content 是「“{0}”已成为新群主」+ extra 结构化带名字，名字**不拼进字符串**，
+	//     所以用户可控的展示名没有注入面，也不需要自己做净化/截断；
+	//   - content type 是 GroupTransferGrouper，与手动转让路径
+	//     （api.go transferGrouper → event handler）**同一个**，客户端按同一种方式
+	//     渲染，不会出现同一件事两种样子；
+	//   - 名字由客户端从 extra 解析，改名后历史消息不会留下过期的名字。
+	//
+	// 展示名取群内 remark 优先，与 groupExit / 花名册一致；successor 是事务里
+	// FOR UPDATE 选出的那一行，Remark 直接可用，无需再查一次库。
+	successorName := successor.Remark
+	if successorName == "" {
+		successorName = g.resolveDisplayName(successor.UID)
+	}
+	// best-effort：交接已经提交，通告发不出去不该让整条工单重试——重跑时锁内重读
+	// 已非 creator，只会空转到 abandoned，而交接本身是对的。
+	if err := g.sendSpaceRemovalHandoverNotice(
+		groupNo, leaverUID, leaverName, successor.UID, successorName); err != nil {
+		g.Warn("发送群主交接通告失败",
+			zap.Error(err), zap.String("groupNo", groupNo), zap.String("to", successor.UID))
 	}
 	return nil
 }
 
-// resolveOperatorName 取操作者展示名，查不到就退回 UID。
+// sendSpaceRemovalHandoverNotice 发「谁走了、于是谁接手」的群内通告。
+//
+// 为什么不直接用 octo-lib 的 SendGroupTransferGrouper：它的文案写死成单句
+// 「“{0}”已成为新群主」，而级联场景需要把**原因**一并交代——群里看到的是
+// 「换了群主」这个结果，缺了「因为原群主离开了空间」就没头没尾。手动转让不需要
+// 这个前半句（操作者就在群里、是主动行为），所以那条路径保持原样、不受影响。
+//
+// 仍然沿用同一个 content type GroupTransferGrouper(1008)：
+//   - 客户端按同一条路径渲染（octo-web module.tsx 把 1000-2000 统一交给 SystemCell，
+//     1008 另被 Model.tsx 列入「不计未读的系统消息」），不会出现同一件事两种样子；
+//   - 名字放 extra 走 {N} 占位符、**不拼进 content**，所以用户可控的展示名没有注入面，
+//     也不需要自己做净化截断；客户端从 extra 取名，事后改名不会在群历史里留下旧名。
+//
+// 两个占位符不是新发明：octo-lib SendGroupMemberScanJoin 的
+// 「“{0}”通过“{1}”的二维码加入群聊」就是 {0}/{1} + 两元素 extra 的既有写法。
+func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, successorUID, successorName string) error {
+	if leaverName == "" {
+		leaverName = leaverUID
+	}
+	if successorName == "" {
+		successorName = successorUID
+	}
+	return g.ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    1, // 与 octo-lib 全部群系统消息一致
+			SyncOnce:  0,
+		},
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Payload: []byte(util.ToJson(map[string]interface{}{
+			"content": `“{0}”已离开当前空间，“{1}”已成为新群主`,
+			"extra": []config.UserBaseVo{
+				{UID: leaverUID, Name: leaverName},
+				{UID: successorUID, Name: successorName},
+			},
+			"type": common.GroupTransferGrouper,
+		})),
+	})
+}
+
+// resolveDisplayName 取展示名，查不到就退回 UID。
 // 只用于系统 Tip 文案，失败不该让整条清理工单重试。
-func (g *Group) resolveOperatorName(operatorUID string) string {
-	if operatorUID == "" {
+func (g *Group) resolveDisplayName(uid string) string {
+	if uid == "" {
 		return ""
 	}
-	operator, err := g.userDB.QueryByUID(operatorUID)
-	if err != nil || operator == nil {
-		return operatorUID
+	u, err := g.userDB.QueryByUID(uid)
+	if err != nil || u == nil {
+		return uid
 	}
-	if operator.Name == "" {
-		return operatorUID
+	if u.Name == "" {
+		return uid
 	}
-	return operator.Name
+	return u.Name
 }
 
 // querySecondOldestNonBotMemberTx 是 DB.QuerySecondOldestMemberExcludingBotsOf 的
