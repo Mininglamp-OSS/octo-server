@@ -314,6 +314,50 @@ func TestBotOwnerSelfRemoval_SendsOwnerTipNotKickNotice(t *testing.T) {
 		"应发出 owner 视角的 Tip，让群成员知道 bot 为何消失")
 }
 
+// 自助移除必须把 bot 从群频道的 IM 订阅里摘掉。
+//
+// 这是本功能最要紧的后置条件：删掉 group_member 行只是「名单上没有它了」，
+// 若 IM 订阅还在，bot 依然会收到群消息 —— 那等于没移除。
+// 既有的 TestGroupCascadeUnsubscribesFromIM 只覆盖了「人走 bot 跟着走」的级联路径，
+// 自助路径此前无人断言。
+//
+// 与 Tip 断言同理走 service 层：register.GetModules 的进程级 sync.Once 让 HTTP
+// 路由上的 IM 桩只对进程内第一个测试生效（见本文件 SendsOwnerTipNotKickNotice 的注释）。
+func TestBotOwnerSelfRemoval_UnsubscribesBotFromGroupChannel(t *testing.T) {
+	s, ctx := newTestServer(t)
+	f := New(ctx)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	stub := newGroupIMStub(t, ctx)
+	wireI18nRendererForGroupTest(s)
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: testutil.UID, Name: "bot-owner", ShortNo: "uc_unsub"}))
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "owner_other", Name: "group-owner", ShortNo: "uo_unsub"}))
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: selfRemovalGroupNo, Name: "unsub group", Creator: "owner_other",
+		Status: GroupStatusNormal, Version: 1,
+	}))
+	seedSelfRemovalMember(t, f, "owner_other", MemberRoleCreator, 0)
+	seedSelfRemovalMember(t, f, testutil.UID, MemberRoleCommon, 0)
+	seedSelfRemovalBot(t, f, "bot_unsub", "unsub-bot", testutil.UID, 1)
+
+	_, err := f.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+		GroupNo:             selfRemovalGroupNo,
+		Members:             []string{"bot_unsub"},
+		OperatorUID:         testutil.UID,
+		OperatorName:        "bot-owner",
+		BotOwnerSelfRemoval: true,
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, stub.unsubscribed(selfRemovalGroupNo), "bot_unsub",
+		"bot 必须从群频道的 IM 订阅里摘掉，否则它还会继续收到群消息")
+	// 操作者自己（以及群主）不能被顺带退订。
+	assert.NotContains(t, stub.unsubscribed(selfRemovalGroupNo), testutil.UID,
+		"发起人不应被退订")
+	assert.NotContains(t, stub.unsubscribed(selfRemovalGroupNo), "owner_other",
+		"其他成员不应被退订")
+}
+
 // 对照组：同一条 service 路径在**不**置位 BotOwnerSelfRemoval 时，
 // 仍然发原来的「被移除」文案——保证新分支没有把既有行为一起改掉。
 func TestBotOwnerSelfRemoval_NormalRemovalStillSendsKickNotice(t *testing.T) {
