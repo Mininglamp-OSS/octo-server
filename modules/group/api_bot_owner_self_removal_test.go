@@ -358,6 +358,53 @@ func TestBotOwnerSelfRemoval_UnsubscribesBotFromGroupChannel(t *testing.T) {
 		"其他成员不应被退订")
 }
 
+// bot_admin 不得跨越「撤走再拉回」存活。
+//
+// DeleteMemberTx 是软删（只置 is_deleted=1），整行连同 bot_admin 都留在表里；
+// recoverMemberTx 复活时只重置 remark/role/version/is_deleted/invite_uid/
+// is_external/source_space_id/created_at —— **不含 bot_admin**。
+//
+// 于是：群主给某个 bot 授过 bot_admin → 该 bot 的所有者把它撤走 → 再拉回来，
+// 它就悄悄又是 bot 管理员了，全程不需要群主参与。
+// 这个缺陷本身早于本功能，但此前普通成员根本撤不走 bot，这个来回做不出来；
+// 自助移除让它变得可达，所以由本任务负责堵上。
+func TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	// memberAdd 会读 app_config，缺行会 panic。
+	_, _ = ctx.DB().InsertBySql(
+		"INSERT INTO app_config (version, invite_system_account_join_group_on) VALUES (1, 1)",
+	).Exec()
+
+	seedSelfRemovalBot(t, f, "bot_readd", "readd-bot", testutil.UID, 1)
+	// 群主给它授了 bot_admin。
+	_, err := ctx.DB().UpdateBySql(
+		"UPDATE group_member SET bot_admin=1 WHERE group_no=? AND uid=?",
+		selfRemovalGroupNo, "bot_readd",
+	).Exec()
+	require.NoError(t, err)
+
+	// 所有者自助撤走。
+	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_readd"})
+	require.Equal(t, http.StatusOK, w.Code, "移除应成功: %s", w.Body.String())
+
+	// 再拉回来（memberAdd 的 ownership 校验允许所有者拉自己的 bot）。
+	addW := httptest.NewRecorder()
+	addBody := util.ToJson(map[string]interface{}{"members": []string{"bot_readd"}})
+	addReq, err := http.NewRequest("POST",
+		"/v1/groups/"+selfRemovalGroupNo+"/members", bytes.NewReader([]byte(addBody)))
+	require.NoError(t, err)
+	addReq.Header.Set("token", testutil.Token)
+	handler.ServeHTTP(addW, addReq)
+	require.Equal(t, http.StatusOK, addW.Code, "重新拉回应成功: %s", addW.Body.String())
+
+	detail, err := f.db.queryMemberWithGroupNoAndUID(selfRemovalGroupNo, "bot_readd")
+	require.NoError(t, err)
+	require.NotNil(t, detail, "bot 应已重新在群内")
+	assert.Equal(t, 0, detail.BotAdmin,
+		"bot_admin 不得跨越『撤走再拉回』存活 —— 否则所有者可以绕过群主重新拿到管理员位")
+}
+
 // 对照组：同一条 service 路径在**不**置位 BotOwnerSelfRemoval 时，
 // 仍然发原来的「被移除」文案——保证新分支没有把既有行为一起改掉。
 func TestBotOwnerSelfRemoval_NormalRemovalStillSendsKickNotice(t *testing.T) {

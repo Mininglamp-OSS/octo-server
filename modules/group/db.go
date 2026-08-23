@@ -272,10 +272,21 @@ func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
 }
 
 // recoverMemberTx 恢复成员信息
+//
+// 删除是软删（DeleteMemberTx 只置 is_deleted=1），整行连同各种权限位都留在表里，
+// 所以复活时必须把**群授予的权限**显式重置，否则它们会跨越「离群 → 再入群」存活。
+// role 一直是这么做的（取调用方新建 model 的值，通常是 MemberRoleCommon）；
+// bot_admin 此前漏了 —— 群主给某 bot 授过 bot_admin 后，该 bot 的所有者把它撤走
+// 再拉回来，它就悄悄又是 bot 管理员，全程不需要群主参与。
+// 回到群里的成员一律视作新成员，权限要重新授。
+//
+// 注意：解除拉黑走的是 updateMembersStatus，不经过这里，因此不受影响。
+// 回归见 TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd。
 func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"remark":          member.Remark,
 		"role":            member.Role,
+		"bot_admin":       0,
 		"version":         member.Version,
 		"is_deleted":      0,
 		"invite_uid":      member.InviteUID,
