@@ -162,9 +162,12 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 	//
 	// 释放路径（releaseCleanupJob）只覆盖「作业跑完并返回了错误」。进程被 SIGKILL /
 	// OOM / pod 驱逐打死时谁也走不到那里，行就停在 pending 上，attempts 也不再变。
-	// 认领处若不设防，租约一到期它又被认领、再打死一次进程，如此无限；而认领按
-	// `ORDER BY id` 取队首，这条毒丸会一直排在最前面，把它后面的所有工单一起拖住。
-	// 真实危害是整队停摆，不是单条卡住。
+	// 认领处若不设防，租约一到期它又被认领、再打死一次进程，如此无限。危害不止于
+	// 这一条：每被认领一次，它就占掉本轮批次的一个名额（processMemberRemovalCleanups
+	// 单轮上限 removalCleanupBatchSize），本该在同一轮里被处理的健康工单就被挤了出去。
+	//
+	// 这个论证**不依赖**取件顺序——上面那条 SELECT 已经刻意去掉了 ORDER BY（原因见
+	// 那里的注释）。名额被白占与它排在第几位无关，所以这道设防照样必要。
 	//
 	// 卡在认领处之后，这条行再也不会被取走，于是需要 abandonExhaustedMemberRemovalCleanups
 	// 把它推到终态——否则它会变成一条永远 pending、永远不动、也永远没人看见的僵尸。

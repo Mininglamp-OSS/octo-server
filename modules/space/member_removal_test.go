@@ -556,7 +556,7 @@ func TestTruncateCleanupErrorKeepsValidUTF8(t *testing.T) {
 
 // TestCleanupWorkerContainsStepPanic panic 必须在单条工单这一层兜住并走正常的
 // 失败路径，否则 attempts 不增、状态留 pending，工单被反复认领反复 panic，
-// 永远到不了 abandoned，还会按 ORDER BY id 卡在队首把后面的工单饿死。
+// 永远到不了 abandoned，还会一轮一轮白占批次名额，把同批的健康工单挤出去。
 func TestCleanupWorkerContainsStepPanic(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -1164,10 +1164,17 @@ func TestClaimAllowsExactlyMaxAttempts(t *testing.T) {
 	assert.Nil(t, none, "到达上限后不得再认领")
 }
 
-// TestExhaustedJobDoesNotHeadOfLineQueue 认领按 ORDER BY id 取队首。一条打死进程的
-// 工单若永远可认领，它会一直排在队首，把后面所有工单一起拖住——这才是这条的真实危害，
-// 不是单条卡住。
-func TestExhaustedJobDoesNotHeadOfLineQueue(t *testing.T) {
+// TestExhaustedJobNeitherRunsNorBlocksOthers 一条打死进程的工单若永远可认领，每一轮
+// 都会白占一个批次名额，把同批本该被处理的健康工单挤出去。
+//
+// 这条断言的是**批次层**的性质：同一轮 processMemberRemovalCleanups 里，耗尽预算的
+// 工单不执行，且不妨碍健康工单执行。它与 TestClaimSkipsJobAtAttemptsCeiling 不重复——
+// 那条只看单次 claim 返回 nil，这条看整轮调度的结果。
+//
+// 早先这条叫 TestExhaustedJobDoesNotHeadOfLineQueue，前提是认领按 `ORDER BY id` 取
+// 队首、毒丸必然排在最前。那个排序已在本次改动中去掉（见 claimMemberRemovalCleanup），
+// 于是"队首"不再存在，名字也就名不副实了。性质本身仍然成立，改名以对齐它真正证明的东西。
+func TestExhaustedJobNeitherRunsNorBlocksOthers(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
 
@@ -1177,7 +1184,8 @@ func TestExhaustedJobDoesNotHeadOfLineQueue(t *testing.T) {
 	mustRemoveMember(t, f, poisonSpace, "v-h1", 1, "owner-h1", MemberRemoveReasonKicked)
 	seedExhaustedJob(t, poisonSpace, removalCleanupMaxAttempts, nil)
 
-	// 健康工单排在毒丸后面（id 更大）
+	// 健康工单晚于毒丸入队（id 更大）。认领已无 ORDER BY，取件顺序不确定，
+	// 所以这条断言的是"同一轮里健康工单一定被处理到"，而不是"排在毒丸之后仍被处理到"。
 	seedMember(t, f, healthySpace, "owner-h2", 2)
 	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: healthySpace, UID: "v-h2", Role: 0, Status: 1}))
 	mustRemoveMember(t, f, healthySpace, "v-h2", 1, "owner-h2", MemberRemoveReasonKicked)
@@ -1194,7 +1202,7 @@ func TestExhaustedJobDoesNotHeadOfLineQueue(t *testing.T) {
 
 	f.processMemberRemovalCleanups()
 
-	assert.Contains(t, seen, healthySpace, "毒丸工单不得挡住它后面的健康工单")
+	assert.Contains(t, seen, healthySpace, "耗尽预算的工单不得挤掉同批的健康工单")
 	assert.NotContains(t, seen, poisonSpace, "已耗尽预算的工单不得再执行")
 }
 

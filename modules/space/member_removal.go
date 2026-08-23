@@ -1,6 +1,7 @@
 package space
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -109,8 +110,11 @@ func snapshotCleanupSteps() []namedCleanupStep {
 //
 // 失败必须记日志。这里原先是静默的：DEL 出错时正向条目会活满 TTL，
 // SpaceMiddleware 继续放行已被移除的人，而 handler 早已提交并返回 200——
-// 一次真实的隔离失效在系统里不留任何痕迹。pkg/space 那侧还会写一条否定缓存兜底，
-// 所以多数情况下边界仍然守住了，但这条日志是唯一能看见它发生过的地方。
+// 一次真实的隔离失效在系统里不留任何痕迹。
+//
+// 但两种失败要分开报，因为它们的运维含义相反（见 ErrMembershipCacheNegativeFallback）：
+// 否定缓存兜底成功时边界当场就生效了，按「可能仍可访问」报出去是**报反了**，而这
+// 恰恰是更常见的一种。报反的告警比不报更糟——它把人引向一次并没有发生的越权。
 func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 	if spaceID == "" || uid == "" {
 		return
@@ -120,7 +124,15 @@ func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 		// 没有 Redis 时中间件也读不到缓存，Get 必然未命中并回落到查库，方向是安全的。
 		return
 	}
-	if err := spacepkg.InvalidateMembershipCache(conn, spaceID, uid); err != nil {
+	err := spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
+	switch {
+	case err == nil:
+	case errors.Is(err, spacepkg.ErrMembershipCacheNegativeFallback):
+		// 正向条目没删掉，但已被否定缓存盖住，中间件当场就拒。边界守住了，
+		// 记 Warn 让它可查，不要当越权报。
+		s.Warn("清理成员鉴权缓存：DEL 失败，已写否定缓存兜底，隔离仍然生效",
+			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.Error(err))
+	default:
 		s.Error("清理成员鉴权缓存失败：被移除成员可能在缓存 TTL 内仍可访问该 Space",
 			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.Error(err))
 	}
@@ -363,7 +375,8 @@ func (s *Space) processMemberRemovalCleanups() {
 // 既没有 last_error 也没有退避，只能干等 removalCleanupLease（10 分钟）到期才
 // 重新可认领；然后被再次认领、再次 panic，如此循环。attempts 虽然在认领时就已
 // 自增（见 claimMemberRemovalCleanup），所以最终仍会走到 abandoned，但每一轮都
-// 要白烧一个租约周期，而它按 `ORDER BY id` 排在队首，整批后续工单一起陪跑。
+// 要白烧一个租约周期；而每一次重新认领又白占一个批次名额，把同批本该被处理的
+// 健康工单挤出去。
 // 在这一层 recover 并显式 release，才能立刻记下原因、按退避重排。
 func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner string) {
 	defer func() {

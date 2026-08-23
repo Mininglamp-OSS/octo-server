@@ -195,6 +195,11 @@ func TestInvalidateMembershipCacheFallsBackToNegativeEntry(t *testing.T) {
 	if got.ttl != negativeCacheTTL {
 		t.Errorf("兜底 TTL 应为 negativeCacheTTL，got %v", got.ttl)
 	}
+	// 调用方靠这个哨兵把「边界守住了」与「边界没守住」分开记日志。丢了它，
+	// 兜底成功会被按越权报警——报反的告警比不报更糟。
+	if !errors.Is(err, ErrMembershipCacheNegativeFallback) {
+		t.Errorf("兜底成功必须带 ErrMembershipCacheNegativeFallback，got %q", err)
+	}
 }
 
 // TestInvalidateMembershipCacheReportsTotalFailure DEL 和兜底都失败时，
@@ -208,9 +213,15 @@ func TestInvalidateMembershipCacheReportsTotalFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("两条路都失败时必须报错")
 	}
-	// 断言必须落在**区分**两种情形的那个子串上。原先断的是 "fallback"，
-	// 而「兜底成功」那条信息里也有这个词 —— 删掉整个总失败分支，测试照样绿。
+	// 断言落在**区分**两种情形的那个哨兵上，而不是错误文案里的某个子串。
+	// 原先断的是 "fallback"——而「兜底成功」那条信息里也有这个词，删掉整个总失败
+	// 分支测试照样绿。改断哨兵之后，两条分支互为对方的变异检测：
+	// 哨兵漏加、错加、或者两个分支被合并，都会有一条测试立刻红。
+	if errors.Is(err, ErrMembershipCacheNegativeFallback) {
+		t.Errorf("兜底也失败时不得带 ErrMembershipCacheNegativeFallback——"+
+			"这一种是真的隔离失效，必须与兜底成功区分开，got %q", err)
+	}
 	if !strings.Contains(err.Error(), "also failed") {
-		t.Errorf("错误信息必须能把「兜底也失败了」与「兜底成功了」区分开，got %q", err)
+		t.Errorf("错误信息也应说明兜底同样失败了，got %q", err)
 	}
 }

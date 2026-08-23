@@ -1,6 +1,7 @@
 package space
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -63,6 +64,20 @@ type membershipCacheStore interface {
 	SetAndExpire(key string, value interface{}, expire time.Duration) error
 }
 
+// ErrMembershipCacheNegativeFallback 标记「DEL 失败，但否定缓存已写入」这一种失败。
+//
+// InvalidateMembershipCache 的两种非空返回，运维含义正好相反：
+//
+//   - 命中这个哨兵：正向条目没删掉，但已被一条 TTL 更短的 "0" 盖住，SpaceMiddleware
+//     当场就拒绝这个人——**边界守住了**，只是留下一条到期才消失的脏数据。
+//   - 不命中（DEL 与兜底写入都失败）：正向条目原样活满它的 60s TTL，被移除的人在这
+//     段时间里仍然进得来——**这才是真的隔离失效**。
+//
+// 分不开的后果不是少记一点信息，而是记反：兜底成功是两者中更常见的一种，把它按
+// 「可能仍可访问」报出去，等于在边界明明守住的时候报一次越权，值班的人照着排查会
+// 一无所获，几次之后这条日志就不再被当真。
+var ErrMembershipCacheNegativeFallback = errors.New("membership cache: negative fallback written")
+
 // InvalidateMembershipCache 删除指定用户在指定 Space 的成员缓存。
 //
 // 返回 error 而不是吞掉：这条缓存是隔离边界的一部分，删除失败必须让调用方有机会
@@ -92,7 +107,7 @@ func invalidateMembershipCacheIn(store membershipCacheStore, spaceID, uid string
 	if setErr := store.SetAndExpire(key, "0", negativeCacheTTL); setErr != nil {
 		return fmt.Errorf("invalidate membership cache: del failed (%w) and negative-cache fallback also failed (%v)", delErr, setErr)
 	}
-	return fmt.Errorf("invalidate membership cache: del failed (%w); negative cache written as fallback", delErr)
+	return fmt.Errorf("invalidate membership cache: del failed (%w); %w", delErr, ErrMembershipCacheNegativeFallback)
 }
 
 // InMemoryMembershipCache 基于内存的 MembershipCache 实现，用于测试。
