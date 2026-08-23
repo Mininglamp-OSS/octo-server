@@ -1202,6 +1202,10 @@ func (m *Manager) updateAdminEmail(c *wkhttp.Context) {
 	)
 	if err != nil {
 		m.Error("更新管理账号邮箱失败", zap.Error(err), zap.String("target_uid", target.UID))
+		if errors.Is(err, ErrManagerEmailAlreadyInUse) {
+			respondUserError(c, errcode.ErrUserAlreadyExists)
+			return
+		}
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -1296,9 +1300,31 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.ShockOn = 0
 	userModel.Sex = 1
 	userModel.Status = int(common.UserAvailable)
-	err = m.userDB.Insert(userModel)
+	tx, err := m.db.session.Begin()
 	if err != nil {
+		m.Error("开启管理员邮箱检查事务错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	owner, err := queryEmailOwner(tx, req.Email, "")
+	if err != nil {
+		m.Error("查询管理员邮箱是否已被使用错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if owner != nil {
+		respondUserError(c, errcode.ErrUserAlreadyExists)
+		return
+	}
+	if err = m.userDB.insertTx(userModel, tx); err != nil {
 		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		m.Error("提交管理员事务错误", zap.String("username", req.Name), zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}

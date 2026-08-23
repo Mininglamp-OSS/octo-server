@@ -360,6 +360,45 @@ func TestManagerAdminEmailMaintenanceRequiresValidEmailAndInvalidatesChallenge(t
 	assert.Empty(t, code)
 }
 
+func TestManagerAdminEmailMaintenanceRejectsEmailUsedByAnotherUser(t *testing.T) {
+	server, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	settings := commonsettings.EnsureSystemSettings(ctx)
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = settings.Reload()
+	})
+
+	callerToken := "manager-email-conflict-maintainer"
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+callerToken,
+		"maintainer@root@"+string(wkhttp.SuperAdmin),
+	))
+	targetUID := "email-conflict-target"
+	conflictEmail := "existing-user@example.com"
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: targetUID, Username: "email-conflict-target", Name: "Email Conflict Target",
+		Role: string(wkhttp.Admin), Email: "old-admin@example.com", Status: StatusEnable.Int(),
+	}))
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: "email-conflict-user", Username: "email-conflict-user", Name: "Existing User",
+		Role: "user", Email: conflictEmail, Status: StatusEnable.Int(),
+	}))
+
+	req := managerMFARequest(t, http.MethodPut, "/v1/manager/user/admin/email", map[string]string{
+		"uid": targetUID, "email": conflictEmail,
+	})
+	req.Header.Set("token", callerToken)
+	response := serveManagerMFARequest(t, server.GetRoute(), req)
+	assert.NotEqual(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "err.server.user.already_exists")
+
+	var target Model
+	_, err := ctx.DB().Select("uid,email").From("user").Where("uid=?", targetUID).Load(&target)
+	require.NoError(t, err)
+	assert.Equal(t, "old-admin@example.com", target.Email)
+}
+
 func TestManagerAddAdminRejectsMissingEmail(t *testing.T) {
 	server, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
@@ -382,6 +421,44 @@ func TestManagerAddAdminRejectsMissingEmail(t *testing.T) {
 	req.Header.Set("token", callerToken)
 	response := serveManagerMFARequest(t, server.GetRoute(), req)
 	assert.NotEqual(t, http.StatusOK, response.Code, response.Body.String())
+	var count int64
+	_, err := ctx.DB().Select("count(*)").From("user").Where("username=?", loginName).Load(&count)
+	require.NoError(t, err)
+	assert.Zero(t, count)
+}
+
+func TestManagerAddAdminRejectsEmailUsedByAnotherUser(t *testing.T) {
+	server, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	settings := commonsettings.EnsureSystemSettings(ctx)
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		_ = settings.Reload()
+	})
+
+	callerToken := "manager-admin-email-conflict-creator"
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+callerToken,
+		"creator@root@"+string(wkhttp.SuperAdmin),
+	))
+	conflictEmail := "existing-user-for-admin@example.com"
+	require.NoError(t, NewDB(ctx).Insert(&Model{
+		UID: "email-conflict-admin-user", Username: "email-conflict-admin-user", Name: "Existing User",
+		Role: "user", Email: conflictEmail, Status: StatusEnable.Int(),
+	}))
+
+	loginName := "email-conflict-admin"
+	req := managerMFARequest(t, http.MethodPost, "/v1/manager/user/admin", map[string]string{
+		"login_name": loginName,
+		"name":       "Email Conflict Admin",
+		"password":   "Strong-admin-password-123!",
+		"email":      conflictEmail,
+	})
+	req.Header.Set("token", callerToken)
+	response := serveManagerMFARequest(t, server.GetRoute(), req)
+	assert.NotEqual(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "err.server.user.already_exists")
+
 	var count int64
 	_, err := ctx.DB().Select("count(*)").From("user").Where("username=?", loginName).Load(&count)
 	require.NoError(t, err)

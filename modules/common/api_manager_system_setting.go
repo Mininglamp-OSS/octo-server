@@ -479,8 +479,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 
 	reloadErr := m.systemSettings.Reload()
 	if reloadErr != nil {
-		// Reload is best-effort — the row is already persisted, so other
-		// instances and the next auto-reload tick will pick it up.
+		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
+		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。
+		// 当前系统每 60 秒会执行一次自动 reload，发现配置变化后更新本地快照。
 		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(reloadErr))
 	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
 		// The probe above used the merged prospective values. Publish its

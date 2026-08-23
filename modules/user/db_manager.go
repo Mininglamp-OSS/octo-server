@@ -1,6 +1,7 @@
 package user
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -49,6 +50,28 @@ func (f userListFilter) applyExcludes(stmt *dbr.SelectStmt) *dbr.SelectStmt {
 type managerDB struct {
 	session *dbr.Session
 	ctx     *config.Context
+}
+
+// ErrManagerEmailAlreadyInUse is returned when a manager email is already
+// attached to another user account.
+var ErrManagerEmailAlreadyInUse = errors.New("manager email already in use")
+
+// queryEmailOwner checks the existing login identity before a manager email
+// write. The check covers all user rows because the public email login and
+// password-recovery flows resolve accounts by email without a role filter.
+// The current deployment convention keeps one super-admin account, so the
+// write race is extremely unlikely. We intentionally keep this transaction
+// check as the scoped fix and do not add a schema-wide unique index here.
+func queryEmailOwner(runner dbr.SessionRunner, email, excludeUID string) (*Model, error) {
+	where := "email=? AND email<>''"
+	args := []interface{}{email}
+	if excludeUID != "" {
+		where += " AND uid<>?"
+		args = append(args, excludeUID)
+	}
+	var model *Model
+	_, err := runner.Select("uid").From("user").Where(where, args...).Limit(1).Load(&model)
+	return model, err
 }
 
 // newManagerDB
@@ -165,7 +188,21 @@ func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
 // affected-row check is intentional: a concurrent role change or a missing
 // target must never be reported as a successful second-factor repair.
 func (m *managerDB) updateManagerEmail(uid, role, email string) (bool, error) {
-	result, err := m.session.Update("user").Set("email", email).
+	tx, err := m.session.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	owner, err := queryEmailOwner(tx, email, uid)
+	if err != nil {
+		return false, err
+	}
+	if owner != nil {
+		return false, ErrManagerEmailAlreadyInUse
+	}
+
+	result, err := tx.Update("user").Set("email", email).
 		Where("uid=? and role=?", uid, role).Exec()
 	if err != nil {
 		return false, err
@@ -176,6 +213,9 @@ func (m *managerDB) updateManagerEmail(uid, role, email string) (bool, error) {
 	}
 	if rows != 1 {
 		return false, fmt.Errorf("manager email update affected %d rows", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
 	return true, nil
 }

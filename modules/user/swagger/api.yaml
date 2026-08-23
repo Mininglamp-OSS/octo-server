@@ -179,9 +179,6 @@ paths:
               name:
                 type: string
                 description: "用户名"
-              email:
-                type: string
-                description: "管理端账号邮箱（必填）"
               password:
                 type: string
                 description: "密码"
@@ -513,10 +510,8 @@ paths:
           schema:
             type: object
             required:
-              - login_name
-              - name
               - password
-              - email
+              - new_password
             properties:
               password:
                 type: string
@@ -553,6 +548,11 @@ paths:
           required: true
           schema:
             type: object
+            required:
+              - login_name
+              - name
+              - password
+              - email
             properties:
               password:
                 type: string
@@ -675,11 +675,7 @@ paths:
           schema:
             $ref: "#/definitions/response"
         400:
-          description: "邮箱或目标账号无效"
-          schema:
-            $ref: "#/definitions/response"
-        500:
-          description: "数据库更新或 Challenge 清理失败"
+          description: "请求失败；线上 HTTP 状态为 400，具体错误语义见响应体"
           schema:
             $ref: "#/definitions/response"
       security:
