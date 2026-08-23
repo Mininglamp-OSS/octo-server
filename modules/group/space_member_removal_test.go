@@ -802,6 +802,34 @@ func TestGroupCascadeHandoverPrefersGroupRemark(t *testing.T) {
 		"不得回落到全局 user.name")
 }
 
+// TestGroupCascadeHandoverLeaverPrefersGroupRemark 通告里**离开者**那一侧也用群内 remark。
+//
+// 补 PR #804 review 的 A1：继任者那侧有守卫（上一条测试），离开者那侧没有——
+// 把 displayName 换成全局名，27 条 cascade 测试全绿。extra[0] 和 extra[1] 走的是
+// 两条不同的解析路径（前者来自 exitSpaceMemberFromGroup 的 member.Remark，后者来自
+// 交接事务里 FOR UPDATE 选出的 successor.Remark），钉住一侧不代表另一侧也对。
+func TestGroupCascadeHandoverLeaverPrefersGroupRemark(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, creator, successor = "sp-handover-leaver-remark", "u-creator", "u-successor"
+
+	seedUser(t, ctx, creator, "离开者全局名")
+	seedUser(t, ctx, successor, "继任者全局名")
+	seedGroupInSpace(t, ctx, "g-handover-leaver-remark", spaceID, creator)
+	seedGroupMemberWithRemark(t, ctx, "g-handover-leaver-remark", creator, MemberRoleCreator, "离开者群内名")
+	seedGroupMember(t, ctx, "g-handover-leaver-remark", successor, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	assert.True(t, payloadExtraHasName(stub.sentPayloads(), "已成为新群主", "离开者群内名"),
+		"extra[0] 应使用离开者的群内 remark")
+	assert.False(t, payloadExtraHasName(stub.sentPayloads(), "已成为新群主", "离开者全局名"),
+		"extra[0] 不得回落到全局 user.name")
+}
+
 // TestGroupCascadeSelfExitTipPrefersGroupRemark 自助退群提示也用群内 remark。
 //
 // 这是 PR #804 review 指出的**越界改动**：把展示名解析改成 remark 优先时，

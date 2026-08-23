@@ -153,13 +153,34 @@ Before announcing, the elected successor is checked against
 but the notice is skipped: this link is mid-chain and is about to be superseded.
 
 Only the final link — whose successor is not queued for removal — announces, and
-what it announces is the settled owner. The outcome does not depend on the order
-the jobs run in: within one batch, "the successor is not pending" holds for
-exactly one link whichever order they execute.
+what it announces is the settled owner. Serially the outcome does not depend on
+job order, and the reason is stronger than "it happens to work": a batch is
+enqueued atomically in one transaction (`enqueueMemberRemovalCleanupBatchTx`), so
+every sibling job's pending row exists before any worker starts. "The successor is
+not pending" therefore holds for exactly one link, whichever order they run.
 
-`done` and `abandoned` do not suppress. `done` means that job already ran, so the
-member is no longer a live candidate anyway; `abandoned` means the removal gave
-up, so that member is staying and their handover is real.
+**Across replicas it is not absolute.** The check runs after
+`handOverGroupCreator` commits, so the successor's row lock is already released.
+If worker A stalls between that commit and the check for long enough (~100 ms)
+for worker B to finish the successor's entire job and mark it `done`, A reads
+`done`, does not suppress, and emits an obsolete notice. The fix is to move the
+*check* before `tx.Commit()` while leaving the *send* after it — inside the
+transaction A still holds the successor's row lock, so B cannot get past the first
+`FOR UPDATE` of its own handover, and the row is unambiguously `pending`. That
+row-lock premise was verified by experiment.
+
+Not done here, on reachability: 30 rounds of two goroutines racing sibling jobs of
+one batch produced **zero** surplus notices, and a deterministic red test needs a
+test hook in production code. Recorded as a follow-up instead.
+
+`done` and `abandoned` do not suppress — but only when they already hold at check
+time. The common ordering is the reverse: the check runs first, and the
+successor's job reaches `abandoned` later (20 attempts, ~70 minutes) or is marked
+`skipped_rejoined` after a rejoin. In those orderings the check saw `pending`,
+suppressed, and nothing re-announces — the group keeps an owner it was never told
+about. The general answer is re-evaluating once a batch has fully settled rather
+than deciding per link, which is the same durable-replay problem already deferred
+to #797.
 
 ### Display names
 
@@ -243,12 +264,19 @@ exists.
   is populated (`service.go:1298`, `:1328`) so `gm.robot = 0` would be a one-line
   fix, but reversing a deliberately pinned contract needs its own decision.
 
-- **A stale pending job suppressing a valid notice.** The chain check treats any
-  `status=pending` row for the successor as "they are leaving too". A successor
-  carrying an older, stuck pending job therefore loses their announcement. The
-  opposite failure — announcing an owner who is about to be removed — is worse,
-  so the check is deliberately biased this way. A DB error on the check is
-  treated as "not pending" and the notice is sent, for the same reason.
+- **A suppressed notice is never re-evaluated.** The chain check decides once,
+  against `status=pending`, and that answer can turn out wrong in three ways: a
+  successor carrying an older stuck pending job; a successor whose own job later
+  reaches `abandoned`; and a successor who rejoins the Space (their job is marked
+  `skipped_rejoined`). All three end with an owner the group was not told about.
+  The opposite bias — announcing an owner who is about to vanish — is worse, so
+  the check is deliberately one-directional; a DB error on the check is likewise
+  treated as "not pending" and the notice is sent. Re-evaluating after a batch
+  settles is the general fix and belongs with #797.
+
+- **The multi-replica window on the check itself.** See Behavior contract › Chain
+  suppression; measured unreachable in 30 rounds of natural concurrency, and a
+  deterministic guard would need a production test hook.
 
 ## Acceptance
 
@@ -266,8 +294,11 @@ All in `modules/group/space_member_removal_test.go`, all passing under
   member row was already deleted, so the handover path was never re-entered and
   `count == 1` held under either placement. The fault injection is what makes the
   test discriminate.
-- `TestGroupCascadeHandoverPrefersGroupRemark` — the successor's group `remark`
-  wins over the global `user.name`.
+- `TestGroupCascadeHandoverPrefersGroupRemark` /
+  `TestGroupCascadeHandoverLeaverPrefersGroupRemark` — both sides of the notice
+  use the group `remark` over the global `user.name`. They are separate guards
+  because `extra[0]` and `extra[1]` resolve through different paths, and pinning
+  one leaves the other free (measured: PR #804 review round 2, mutation 11).
 - `TestGroupCascadeLoneCreatorAnnouncesNoHandover` — no successor, no notice.
 - `TestGroupCascadeDisbandSuppressesHandoverAnnounce` — disband still performs the
   handover but sends no notice.
