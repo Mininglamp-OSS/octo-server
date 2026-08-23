@@ -73,23 +73,29 @@ Step 2 锁死 10 分钟且可无限续期。加固登录反而给登录加了廉
    `updateSystemSettings` 的「先全量校验再统一写」循环中调用。`manager_2fa_on=true` 时要求
    **所有 status=启用、未注销、且 `IsManagerConsoleRole` 为真的账号**均已配置邮箱，否则拒绝并在
    `details` 中列出缺邮箱的账号名。
-3. **管理员邮箱录入**（缺了功能不可用）：`POST /v1/manager/user/admin` 请求体新增可选 `email`；
-   新增 `PUT /v1/manager/user/admin/email`（SuperAdmin only，走 `DB.updateUser`）为存量账号
-   （含播种超管）补邮箱；`GET /v1/manager/user/admin` 返回带 email；
-   `managerLoginModel` + 其查询补 `Email` 字段；`createManagerAccount` 播种时读
-   `DM_MANAGER_ADMIN_EMAIL`（`DM_*` env 为本仓库既有惯例，不改 octo-lib）。
+3. **管理员二次认证地址录入**（缺了功能不可用）：地址存在**独立列**
+   `user.manager_two_factor_email`，不是 `user.email`（原因见「code-review 后的修正」第 1 条）。
+   `POST /v1/manager/user/admin` 请求体新增可选 `two_factor_email`；新增
+   `PUT /v1/manager/user/admin/two_factor_email`（SuperAdmin only，走 `DB.updateUser`）为存量
+   账号（含播种超管）补地址；`GET /v1/manager/user/admin` 返回 `two_factor_email`；
+   `managerLoginModel` + 其查询补该字段；`createManagerAccount` 播种时读
+   `DM_MANAGER_2FA_EMAIL`（`DM_*` env 为本仓库既有惯例，不改 octo-lib）。
+   不做唯一性校验：没有任何查询按该列反查账号，多个管理员共用一个运维信箱是受支持的用法。
 4. **Step 1 —— `POST /v1/manager/login`（复用现有端点）**：密码/角色校验逻辑逐行保留；通过后若
    2FA 开启：
    - 账号无邮箱 → `err.server.user.manager_2fa_email_missing`，不发码不发 token；
-   - 生成 6 位码，写 **uid 维度**的 Redis 键 `mgr2fa:code:{uid}`（5 分钟）、
-     `mgr2fa:cooldown:{uid}`（1 分钟）、`mgr2fa:fail:{uid}`（连错 3 次锁 10 分钟）——
+   - 生成 6 位码，全部状态写 **uid 维度**的 Redis 键：`mgr2fa:code:{uid}`（5 分钟，值为
+     `{code, expires_at}`）、`mgr2fa:cooldown:{uid}`（1 分钟）、`mgr2fa:fail:{uid}` +
+     `mgr2fa:lock:{uid}`（连错 3 次锁 10 分钟）、`mgr2fa:sends:{uid}`（每账号每小时 10 封）——
      **不触碰 `email_*` 任何键**；
    - 发信使用 `context.WithTimeout(c.Request.Context(), 8s)`（现有 SMTP 为 15s dial + 60s IO 且
-     call site 传 `context.Background()`，无界会把登录接口挂到约 75 秒）；发送失败/超时删除 pending 后报错；
-   - 写 pending：`manager_login_2fa:{two_factor_token}` = `{uid, username, ip, attempts, resend_count}`，
-     TTL **6 分钟**（比码多 1 分钟，避免「码还有效但会话已失效」的困惑态）；
-   - 返回 `200 {two_factor_required:true, two_factor_token, email_masked, expires_in}`，
-     **不含 token/uid/name/role**；
+     call site 传 `context.Background()`，无界会把登录接口挂到约 75 秒）；**先投递、投递成功后
+     才落库**，失败时不留下任何码与 pending；
+   - 写 pending：`manager_login_2fa:{two_factor_token}` =
+     `{uid, username, address, ip, language, password_fingerprint, resends, expires_at}`，
+     有效期由**验证码自身的到期时间 + 1 分钟宽限**派生（避免「码还有效但会话已失效」的困惑态）；
+   - 返回 `202 {two_factor_required:true, two_factor_token, email_masked, expires_in}`，
+     **不含 token/uid/name/role**（202 让"挑战"与"登录完成"在状态码层面即可区分）；
    - `loginLog` 记一条「密码通过、待二次认证」事件。
 5. **Step 2 —— `POST /v1/manager/login/verify`（新增，未鉴权，独立 tag 限流）**：
    取 pending → 校验码 → 重查用户复核 status / is_destroy / `IsManagerConsoleRole` →
@@ -107,10 +113,12 @@ Step 2 锁死 10 分钟且可无限续期。加固登录反而给登录加了廉
 8. **测试旁路**：uid 维度码需自带与 `MatchTestCode` 等价的非 release 旁路，否则 e2e 无法验证；
    `IsTestCodeEnabled` 已保证 release 模式恒为 false，新通道必须沿用同一判定。
 9. **前端（dmwork-org/octo-admin，同名分支）**：`api/auth.ts` 的 `LoginResponse` 增加
-   `two_factor_required?` / `two_factor_token` / `email_masked`，新增 `verifyLogin2FA` 与
-   `resendLogin2FA`；`pages/Login/index.tsx` 增加第二步（6 位码 + 倒计时 + 返回上一步）；
+   `two_factor_required?` / `two_factor_token` / `email_masked`，新增 `verifyLoginCode` 与
+   `resendLoginCode`（以及设置收件地址的 `updateAdminTwoFactorEmail`）；`pages/Login/index.tsx` 增加第二步（6 位码 + 倒计时 + 返回上一步）；
    `store/auth.ts` 不动（第二步成功后照旧调 `loginSuper`）；管理员创建表单增加邮箱输入。
-10. **逃生通道**（写入 PR 说明）：邮箱填错 / SMTP 故障导致收不到码时，
+10. **共享小改动**：`modules/base/common` 导出一个 `GenerateVerifyCode` 包装，让本模块复用
+    既有的密码学安全验证码生成器，而不是再写一份。纯新增，不改任何既有行为。
+11. **逃生通道**（写入 PR 说明）：邮箱填错 / SMTP 故障导致收不到码时，
     `UPDATE system_setting SET value='0'` 关闭开关即可，60 秒内被 `StartAutoReload` 拾取，
     无需改代码或重启。
 

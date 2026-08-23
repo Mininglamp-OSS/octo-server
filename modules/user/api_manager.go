@@ -129,23 +129,20 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{
-		auth.GET("/me", m.me)                    // 当前登录管理员的身份 + 能力图谱（前端据此渲染权限）
-		auth.POST("/user/admin", m.addAdminUser) // 添加一个管理员
-		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才读得到 uid）：这是二次认证
-		// 验证码的投递地址写面，误用/脚本失控的代价是把验证码改投到别处，必须有 per-user 频控。
-		auth.PUT("/user/admin/two_factor_email", appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.updateAdminTwoFactorEmail) // 设置/修改管理台账号的二次认证收件地址
-		auth.GET("/user/admin", m.getAdminUsers)                                                                        // 查询管理员用户
-		auth.DELETE("/user/admin", m.deleteAdminUsers)                                                                  // 删除管理员用户
-		auth.POST("/user/add", m.addUser)                                                                               // 添加一个用户
-		auth.POST("/user/resetpassword", m.resetUserPassword)                                                           // 重置用户密码
-		auth.GET("/user/list", m.list)                                                                                  // 用户列表
-		auth.GET("/user/friends", m.friends)                                                                            // 某个用户的好友
-		auth.GET("/user/blacklist", m.blacklist)                                                                        // 用户黑名单列表
-		auth.GET("/user/disablelist", m.disableUsers)                                                                   // 封禁用户列表
-		auth.GET("user/online", m.online)                                                                               // 在线设备信息
-		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser)                                                           // 解禁或封禁用户
-		auth.POST("/user/updatepassword", m.updatePwd)                                                                  // 修改用户密码
-		auth.GET("/user/devices", m.devices)                                                                            // 查看某用户设备列表
+		auth.GET("/me", m.me)                                 // 当前登录管理员的身份 + 能力图谱（前端据此渲染权限）
+		auth.POST("/user/admin", m.addAdminUser)              // 添加一个管理员
+		auth.GET("/user/admin", m.getAdminUsers)              // 查询管理员用户
+		auth.DELETE("/user/admin", m.deleteAdminUsers)        // 删除管理员用户
+		auth.POST("/user/add", m.addUser)                     // 添加一个用户
+		auth.POST("/user/resetpassword", m.resetUserPassword) // 重置用户密码
+		auth.GET("/user/list", m.list)                        // 用户列表
+		auth.GET("/user/friends", m.friends)                  // 某个用户的好友
+		auth.GET("/user/blacklist", m.blacklist)              // 用户黑名单列表
+		auth.GET("/user/disablelist", m.disableUsers)         // 封禁用户列表
+		auth.GET("user/online", m.online)                     // 在线设备信息
+		auth.PUT("/user/liftban/:uid/:status", m.liftBanUser) // 解禁或封禁用户
+		auth.POST("/user/updatepassword", m.updatePwd)        // 修改用户密码
+		auth.GET("/user/devices", m.devices)                  // 查看某用户设备列表
 		// 手机号影子列回填：一次性数据迁移任务，带游标反复调用直到 done。
 		// superAdmin 专属；见 db_phone_backfill.go。
 		//
@@ -155,6 +152,13 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		backfillLimiter := appwkhttp.SharedUIDRateLimiter(r, m.ctx)
 		auth.POST("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfill)
 		auth.GET("/user/phone_shadow_backfill", backfillLimiter, m.phoneShadowBackfillStatus)
+
+		// 设置/修改管理台账号的二次认证收件地址。
+		//
+		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才读得到 uid）：这是验证码的
+		// 投递地址写面，误用/脚本失控的代价是把验证码改投到别处，必须有 per-user 频控。
+		auth.PUT("/user/admin/two_factor_email",
+			appwkhttp.SharedUIDRateLimiter(r, m.ctx), m.updateAdminTwoFactorEmail)
 	}
 	// 固定管理角色的授予/撤销面（pre-RBAC，见 setFixedManagerRole 上方说明）。
 	// SharedUIDRateLimiter 必须挂在 AuthMiddleware 之后才读得到 uid。
