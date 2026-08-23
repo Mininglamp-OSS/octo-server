@@ -1,0 +1,25 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/manager-login-email-2fa/brief.md
+notes: |
+  .octospec/_global/ is not synced in this checkout; all injected rules are repo-tier.
+  space-isolation matched via the `auth` touch tag: the relevant clause here is
+  "all routes go through AuthMiddleware unless explicitly excluded — document why".
+  The three new manager-login endpoints are deliberately unauthenticated (they ARE
+  the pre-auth login handshake) and carry that justification in code comments plus
+  StrictIPRateLimitMiddleware, mirroring the existing /v1/manager/login entry.
+  trust-boundary matched via `wire-contract`: the only externally-influenced value
+  rendered into the new email is the client IP (X-Forwarded-For derived); it is
+  rendered through emailtmpl's html/template (auto-escaped) and kept out of the
+  text/template subject line.

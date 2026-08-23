@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 
@@ -368,6 +369,36 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			})
 			return
 		}
+	}
+
+	// Manager-2FA enable guard. Only an incoming login.manager_2fa_on=1 pays for
+	// the query; turning the switch OFF is never blocked, so a stuck deployment
+	// can always be recovered through this same endpoint.
+	//
+	// Unlike the two blocks above this is not a merge-then-validate: the switch
+	// is a single boolean with no companion key, so the incoming value alone
+	// determines the prospective state.
+	for _, p := range plans {
+		if p.def.Category != "login" || p.def.Key != "manager_2fa_on" || p.value != "1" {
+			continue
+		}
+		missing, err := managerConsoleAccountsMissingEmail(m.ctx)
+		if err != nil {
+			// Infrastructure error (user-table read failed). Fail closed: an
+			// unverifiable guard must not wave the switch through, or the
+			// lockout it exists to prevent happens anyway.
+			m.Error("校验管理台账号邮箱配置失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if len(missing) > 0 {
+			httperr.ResponseErrorL(c, errcode.ErrManagerLogin2FAEmailUnconfigured, nil, i18n.Details{
+				"accounts": strings.Join(missing, ", "),
+				"count":    strconv.Itoa(len(missing)),
+			})
+			return
+		}
+		break
 	}
 
 	// Atomic batch: open one transaction, queue every upsert, commit only

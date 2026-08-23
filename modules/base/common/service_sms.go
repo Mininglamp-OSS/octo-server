@@ -100,6 +100,17 @@ func (s *SMSService) SendVerifyCode(ctx context.Context, zone, phone string, cod
 	return err
 }
 
+// GenerateVerifyCode exposes the shared cryptographically-secure numeric code
+// generator to callers outside this package.
+//
+// It exists so a flow that needs its own verification-code keyspace (the
+// manager-console second factor, whose buckets must not be reachable from the
+// public email endpoints) can still use the same generator rather than growing a
+// second implementation with its own chance of getting randomness wrong.
+func GenerateVerifyCode(length int) (string, error) {
+	return generateSecureVerifyCode(length)
+}
+
 // generateSecureVerifyCode 生成密码学安全的验证码
 func generateSecureVerifyCode(length int) (string, error) {
 	const digits = "0123456789"

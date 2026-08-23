@@ -1,0 +1,14 @@
+<div style="max-width:440px;margin:20px auto;font-family:Arial,sans-serif;padding:20px;border:1px solid #e0e0e0;border-radius:8px;">
+<h2 style="color:#7c3aed;margin:0 0 16px;">Octo admin console</h2>
+<p style="color:#333;">Your sign-in verification code is:</p>
+<div style="background:#f5f3ff;padding:16px;border-radius:6px;text-align:center;margin:12px 0;">
+<span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#7c3aed;">{{.Code}}</span>
+</div>
+<p style="color:#666;font-size:13px;">The code is valid for {{.TTLMinutes}} minutes. Never share it with anyone.</p>
+<table style="width:100%;border-collapse:collapse;font-size:13px;color:#555;margin:16px 0;">
+<tr><td style="padding:4px 0;width:90px;color:#888;">Account</td><td style="padding:4px 0;">{{.Username}}</td></tr>
+<tr><td style="padding:4px 0;color:#888;">Time</td><td style="padding:4px 0;">{{.RequestedAt}}</td></tr>
+<tr><td style="padding:4px 0;color:#888;">Source IP</td><td style="padding:4px 0;">{{.ClientIP}}</td></tr>
+</table>
+<p style="color:#b91c1c;font-size:13px;margin:0;">If you did not request this, the password for this account may be compromised — change it immediately and contact a super administrator.</p>
+</div>

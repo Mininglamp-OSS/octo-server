@@ -119,6 +119,11 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.LocalLoginOff()) }},
 	{Category: "login", Key: "scan_enabled", Type: settingTypeBool, Description: "是否开启扫码登录（默认关闭，客户端适配后显式开启）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ScanLoginEnabled()) }},
+	// Manager-console second factor. Turning it ON is guarded at the write path
+	// (updateSystemSettings) against console accounts that have no email address —
+	// see errcode.ErrManagerLogin2FAEmailUnconfigured.
+	{Category: "login", Key: "manager_2fa_on", Type: settingTypeBool, Description: "管理台登录是否要求邮箱验证码二次认证（默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.ManagerLogin2FAOn()) }},
 
 	// Space user-facing creation toggle — admin 关闭后客户端隐藏创建入口,
 	// 后端 POST /v1/space/create 直接 403。env DM_SPACE_DISABLE_USER_CREATE

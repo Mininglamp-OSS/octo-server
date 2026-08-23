@@ -51,8 +51,13 @@ type LoginLogModel struct {
 	db.BaseModel
 }
 
-// loginStatusSuccess / loginStatusFailure login_log.status 的枚举值。
+// login_log.status 的枚举值。
 const (
 	loginStatusSuccess = 1
 	loginStatusFailure = 2
+	// loginStatusPendingSecondFactor 记录"密码与角色都通过，但二次认证尚未通过"。
+	// 单列一个取值而不是复用成功/失败：它没签发 token（不是成功），凭据却是对的
+	// （不是失败），而且是审计上最有价值的一类事件——正确口令 + 拿不到验证码，
+	// 意味着口令很可能已泄露。并进 status=2 会被密码错误的噪音淹没。
+	loginStatusPendingSecondFactor = 3
 )

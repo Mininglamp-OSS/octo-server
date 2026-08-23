@@ -323,6 +323,51 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "This account does not have management permission.",
 	})
+	// ---- Manager-console two-factor authentication (modules/user/api_manager_2fa.go) ----
+
+	// ErrUserManager2FACodeInvalid is the ONE code every second-step failure
+	// collapses onto: unknown / expired / forged two_factor_token, wrong code,
+	// attempt cap reached, and OTP lockout all return it with an identical body.
+	// Splitting them would tell an attacker which half of the handshake they got
+	// right (a valid pending session vs a valid code), so the specific reason
+	// stays in the logs only — same anti-enumeration stance as
+	// ErrUserInvalidCredentials on the first step.
+	ErrUserManager2FACodeInvalid = register(codes.Code{
+		ID:             "err.server.user.manager_2fa_code_invalid",
+		HTTPStatus:     http.StatusUnauthorized,
+		DefaultMessage: "The verification code is incorrect or has expired, please sign in again.",
+	})
+	// ErrUserManager2FAEmailMissing fires when manager 2FA is enabled but the
+	// account carries no email address, so no code can be delivered. Reached
+	// only AFTER the password and role checks pass, so it leaks nothing to an
+	// unauthenticated caller. The enable-time guard in modules/common makes this
+	// state unreachable for accounts that existed when the switch was flipped;
+	// it remains reachable for an account created without an email afterwards.
+	ErrUserManager2FAEmailMissing = register(codes.Code{
+		ID:             "err.server.user.manager_2fa_email_missing",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Two-factor authentication is enabled but this account has no email address configured. Contact a super administrator.",
+	})
+	// ErrUserManagerEmailTaken fires when a SuperAdmin tries to point a console
+	// account at an address another account already uses. user.email carries only
+	// a non-unique index, so nothing at the storage layer would stop it — and a
+	// duplicate quietly breaks email sign-in for BOTH accounts, since that lookup
+	// resolves an address to a single row.
+	ErrUserManagerEmailTaken = register(codes.Code{
+		ID:             "err.server.user.manager_email_taken",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This email address is already used by another account.",
+	})
+	// ErrUserManager2FAResendExhausted fires when a pending sign-in has used up
+	// its resend budget. Distinct from ErrUserEmailRateLimited (a cooldown that
+	// clears itself in a minute) because the remedy differs: the operator must
+	// restart the sign-in rather than wait.
+	ErrUserManager2FAResendExhausted = register(codes.Code{
+		ID:             "err.server.user.manager_2fa_resend_exhausted",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Too many resend requests, please sign in again.",
+	})
+
 	ErrUserPasswordTooShort = register(codes.Code{
 		ID:             "err.server.user.password_too_short",
 		HTTPStatus:     http.StatusBadRequest,

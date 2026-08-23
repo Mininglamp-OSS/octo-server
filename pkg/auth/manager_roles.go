@@ -60,13 +60,31 @@ const ManagerRoleDashboardReader = "dashboardReader"
 //     that cannot be deleted until the role is revoked).
 const ManagerRoleMarketAdmin = "marketAdmin"
 
+// ManagerConsoleRoles is the authoritative set of roles that may establish a
+// manager-console session. IsManagerConsoleRole is derived from it so a role
+// added here is honoured by every consumer at once.
+//
+// It exists as data, not just a predicate, because callers outside the request
+// path need the same set as a SQL/collection filter — e.g. the manager-2FA
+// enable guard has to find every console-capable account that still lacks an
+// email address. A predicate cannot express that query, and a second hand-kept
+// list would silently miss whichever role was added last.
+var ManagerConsoleRoles = []string{
+	string(wkhttp.Admin),
+	string(wkhttp.SuperAdmin),
+	ManagerRoleDashboardReader,
+	ManagerRoleMarketAdmin,
+}
+
 // IsManagerConsoleRole reports whether a role may establish a manager-console
 // session and read its own /v1/manager/me capability map.
 func IsManagerConsoleRole(role string) bool {
-	return role == string(wkhttp.Admin) ||
-		role == string(wkhttp.SuperAdmin) ||
-		role == ManagerRoleDashboardReader ||
-		role == ManagerRoleMarketAdmin
+	for _, r := range ManagerConsoleRoles {
+		if role == r {
+			return true
+		}
+	}
+	return false
 }
 
 // CanAdminMarketplace is the server-authoritative policy for the platform market

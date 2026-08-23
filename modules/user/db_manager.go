@@ -176,10 +176,15 @@ func (m *managerDB) updateUserRole(uid, expectedRole, nextRole string) (bool, er
 }
 
 type managerLoginModel struct {
-	Username  string
-	UID       string
-	Name      string
-	Password  string
+	Username string
+	UID      string
+	Name     string
+	Password string
+	// Email is the second-factor delivery address when login.manager_2fa_on is
+	// on. Empty is a valid state for accounts created before the switch existed;
+	// the sign-in path rejects such an account explicitly rather than silently
+	// skipping the second factor.
+	Email     string
 	Role      string
 	Language  string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
 	Status    int

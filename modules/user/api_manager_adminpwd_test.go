@@ -48,9 +48,10 @@ func TestCreateManagerAccountRejectsWeakAdminPwd(t *testing.T) {
 }
 
 func TestManagerSeedModelDoesNotRequirePhoneEncryption(t *testing.T) {
-	seed := newManagerSeedModel("admin-uid", "bcrypt-hash")
+	seed := newManagerSeedModel("admin-uid", "bcrypt-hash", "")
 	require.NotNil(t, seed)
 	assert.Empty(t, seed.Zone)
+	assert.Empty(t, seed.Email, "未配置 DM_MANAGER_ADMIN_EMAIL 时超管邮箱应为空")
 	assert.Empty(t, seed.Phone, "bootstrap superAdmin must not depend on the PII encryption key")
 	assert.Equal(t, string(wkhttp.SuperAdmin), seed.Username)
 	assert.Equal(t, string(wkhttp.SuperAdmin), seed.Role)

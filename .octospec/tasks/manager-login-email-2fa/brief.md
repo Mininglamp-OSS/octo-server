@@ -145,19 +145,47 @@ Step 2 锁死 10 分钟且可无限续期。加固登录反而给登录加了廉
 - [ ] SMTP 不可达时 `/v1/manager/login` 在约 8 秒内返回错误（非挂起至 75 秒），且不遗留 pending
 - [ ] `login_log` 中可区分：登录成功 / 密码正确但 2FA 未过 / 密码错误
 - [ ] `/v1/manager/login/verify` 与 `/resend` 各挂独立 tag 的 `StrictIPRateLimitMiddleware`
-- [ ] 新增错误码全部经 `httperr.ResponseErrorL` 返回，`make i18n-extract-check` 与 `make i18n-lint` 通过，
+- [x] 新增错误码全部经 `httperr.ResponseErrorL` 返回，`make i18n-extract-check` 与 `make i18n-lint` 通过，
       zh-CN 翻译齐全；新 handler 文件加入 `TestUserNoLegacyResponseError` 守卫名单
-- [ ] `go build ./...`、相关包 `go vet` / `golangci-lint run`、`git diff --check` 通过
-- [ ] octo-admin：`npm run build`（tsc + vite）通过，两步登录与重发在真实后端联调可用
+- [x] `go build ./...`、相关包 `go vet` / `golangci-lint run`（0 issues）、`git diff --check` 通过
+- [x] octo-admin：`npm run build`（tsc + vite）通过；两步登录与重发的真实后端联调待部署环境验证
 
-## 开放问题（需人工确认后再进入 Implement）
+## 决策记录（人工确认，2026-08-23）
 
-1. **仓库外消费方**：`/v1/manager/login` 的响应多形态化，除 octo-admin 外是否还有 octo-marketplace
-   前端或运维脚本直接调用？本会话仅能核实 octo-server / octo-admin 两个仓库。若存在旧客户端，
-   其读取 `token` 会拿到空串并「假成功」，需评估是否改用新端点而非复用原路径。
-2. **开关前置校验的严格度**：要求「所有可登录管理台的账号都有邮箱」（当前设计，最安全但一次性
-   配置成本高），还是放宽为「仅操作者本人必须有邮箱」（其余账号首次登录时才被挡）？
-3. **错误响应风格**：`modules/common/api_manager_system_setting.go` 全文为 legacy
-   `c.ResponseError` / `c.JSON`（在 lint baseline 内）。新增的开关校验分支按
-   `.octospec/rules/error-handling.md` 应走 `httperr` + 注册码，会造成同文件双风格。
-   确认「新分支用新风格」还是「跟随该文件现状」。
+1. **仓库外消费方**：确认**没有**。`/v1/manager/login` 的唯一消费方是
+   `octo-admin/src/api/auth.ts`，无 octo-marketplace 前端或运维脚本直连。因此响应多形态化
+   （签发态 / 待二次认证态）**复用原路径**，不另开新端点。
+2. **开关前置校验取严格版**：置 `login.manager_2fa_on=1` 时，要求**所有** status=启用、未注销、
+   且 `auth.IsManagerConsoleRole` 为真的账号均已配置邮箱；存在缺失则拒绝并列出账号名。
+   校验查询落在 `modules/common`（该包不可 import `modules/user`，否则成环），
+   直接以 dbr 查 `user` 表 + 复用 `pkg/auth` 的角色判定（`pkg/auth` 不依赖 `modules/*`，无环）。
+3. **错误响应风格**：新增分支一律使用 `httperr.ResponseErrorL` + `pkg/errcode` 注册码，
+   **不跟随** `api_manager_system_setting.go` 现有的 legacy `c.ResponseError` / `c.JSON` 风格；
+   该文件将短期存在两种风格，属于向新规范收敛的中间态，不在本任务内批量重写其余 handler。
+
+## 实现偏差（Implement 阶段记录）
+
+1. **不新增 `settingDef.Validate` 钩子**。Design §2 原计划给 schema 加钩子，实现时发现
+   `updateSystemSettings` 已有两处同形状的跨设置校验（onboarding 五元组、thread 归档窗口
+   顺序），都是"在 plans 循环之后单开一个守卫块"。跟随既有形状更简单，也免去为单个布尔
+   开关改动 schema 结构体。
+2. **`login_log` 新增 status=3**（`loginStatusPendingSecondFactor`）+ 一条只改列注释的
+   migration。Acceptance 要求"login_log 中可区分三种结果"，而并进 status=2 会被密码错误
+   的噪音淹没、并进 status=1 会被统计成一次成功登录。第二步的失败行用
+   `login_type=manager_2fa` 与第一步的密码失败区分。
+3. **`pkg/auth` 新增 `ManagerConsoleRoles` 切片**，`IsManagerConsoleRole` 改为由它派生。
+   开关前置校验需要把"可登录管理台的角色"当作 SQL 过滤条件用，而谓词表达不了；再手抄
+   一份列表则必然与谓词漂移（正是本任务 review 阶段发现的 P1）。附带漂移守卫测试。
+4. **冷却期内重复登录改为复用现有验证码 + 重发一个握手**，而不是直接报错。握手 token 只
+   存在于浏览器，刷新或关标签页会把它丢掉；若此时报"发送过于频繁"，操作者手里明明有一封
+   有效验证码却无处可用，白白被锁一分钟。重发握手会重置"每次握手 5 次"的尝试计数，真正的
+   爆破边界是不随重开握手重置的"每 uid 连错 3 次锁 10 分钟"。
+5. **octo-admin 未新增管理员邮箱录入表单**：该前端目前根本没有管理员管理界面
+   （`src/pages/Users` 只管普通用户），没有可扩展的表单。后端
+   `PUT /v1/manager/user/admin/email` 与 `POST /v1/manager/user/admin` 的 `email` 字段已就绪，
+   界面留待管理员管理页面本身落地时一并补。
+6. **新增 `ErrUserManagerEmailTaken`**（brief 未列）：`user.email` 只有普通索引不是唯一索引，
+   两个账号共用同一地址会让邮箱登录（按地址解析到单行）对双方都失效，因此在设置邮箱的两个
+   入口都加了占用校验。
+7. **`PUT /v1/manager/user/admin/email` 挂 `SharedUIDRateLimiter`**：按 rate-limit 规则，
+   已鉴权路由默认挂 UID 频控；该端点决定验证码投递到哪里，误用代价高。

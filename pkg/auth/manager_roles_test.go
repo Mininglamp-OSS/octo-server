@@ -38,3 +38,35 @@ func TestManagerRolePolicy(t *testing.T) {
 		})
 	}
 }
+
+// TestManagerConsoleRolesMatchPredicate pins that the exported role set and the
+// predicate cannot drift apart.
+//
+// The set is not decoration: the manager-2FA enable guard uses it as a SQL
+// filter to find every console-capable account that still lacks an email
+// address. A role present in the predicate but absent from the set would slip
+// past that guard and then be locked out at sign-in — exactly the failure the
+// guard exists to prevent.
+func TestManagerConsoleRolesMatchPredicate(t *testing.T) {
+	if len(ManagerConsoleRoles) == 0 {
+		t.Fatal("ManagerConsoleRoles must not be empty")
+	}
+	seen := map[string]bool{}
+	for _, role := range ManagerConsoleRoles {
+		if role == "" {
+			t.Fatal("ManagerConsoleRoles must not contain the empty role")
+		}
+		if seen[role] {
+			t.Fatalf("ManagerConsoleRoles contains %q twice", role)
+		}
+		seen[role] = true
+		if !IsManagerConsoleRole(role) {
+			t.Fatalf("IsManagerConsoleRole(%q) = false, but the role is listed in ManagerConsoleRoles", role)
+		}
+	}
+	for _, role := range []string{"", "unknown", "user"} {
+		if IsManagerConsoleRole(role) {
+			t.Fatalf("IsManagerConsoleRole(%q) = true, want false", role)
+		}
+	}
+}

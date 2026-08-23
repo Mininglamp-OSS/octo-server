@@ -1,0 +1,14 @@
+<div style="max-width:440px;margin:20px auto;font-family:Arial,sans-serif;padding:20px;border:1px solid #e0e0e0;border-radius:8px;">
+<h2 style="color:#7c3aed;margin:0 0 16px;">Octo 管理后台</h2>
+<p style="color:#333;">您正在登录管理后台，验证码为：</p>
+<div style="background:#f5f3ff;padding:16px;border-radius:6px;text-align:center;margin:12px 0;">
+<span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#7c3aed;">{{.Code}}</span>
+</div>
+<p style="color:#666;font-size:13px;">验证码 {{.TTLMinutes}} 分钟内有效，请勿泄露给任何人。</p>
+<table style="width:100%;border-collapse:collapse;font-size:13px;color:#555;margin:16px 0;">
+<tr><td style="padding:4px 0;width:80px;color:#888;">账号</td><td style="padding:4px 0;">{{.Username}}</td></tr>
+<tr><td style="padding:4px 0;color:#888;">时间</td><td style="padding:4px 0;">{{.RequestedAt}}</td></tr>
+<tr><td style="padding:4px 0;color:#888;">来源 IP</td><td style="padding:4px 0;">{{.ClientIP}}</td></tr>
+</table>
+<p style="color:#b91c1c;font-size:13px;margin:0;">如果这不是您本人的操作，说明该账号的密码可能已泄露，请立即修改密码并联系超级管理员。</p>
+</div>

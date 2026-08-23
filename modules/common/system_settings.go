@@ -367,6 +367,23 @@ func (s *SystemSettings) LocalLoginOff() bool {
 	return anyThirdPartyLoginConfigured(s.ctx.GetConfig())
 }
 
+// ManagerLogin2FAOn reports whether /v1/manager/login requires a second factor
+// (an emailed one-time code) after the password check.
+//
+// Default false with no yaml fallback: an existing deployment keeps single-step
+// manager sign-in until an operator opts in. The write path additionally refuses
+// to turn this on while any console-capable account lacks an email address (see
+// managerConsoleAccountsMissingEmail) — the switch fails closed at sign-in, so
+// enabling it without addresses would lock administrators out of the console
+// they would need in order to switch it back off.
+//
+// Recovery path if a deployment does get stuck (wrong address, dead SMTP):
+// setting the row back to 0 in system_setting takes effect within reloadTTL
+// (60s) via StartAutoReload — no code change, no restart.
+func (s *SystemSettings) ManagerLogin2FAOn() bool {
+	return s.getBool("login", "manager_2fa_on", false)
+}
+
 // ScanLoginEnabled returns whether QR-code login is enabled deployment-wide.
 //
 // Default false permits a server-first rollout without breaking clients that do

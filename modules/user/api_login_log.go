@@ -94,6 +94,36 @@ func (l *LoginLog) recordSuccess(uid, account, publicIP, loginType string) {
 	}
 }
 
+// recordPendingSecondFactor 记录一次"口令通过、等待二次认证"的登录尝试。
+//
+// 与 recordFailure 分开是为了让审计能回答"是谁握着正确的口令"：一个从未完成
+// 二次认证的握手不会产生任何成功/失败行，若不在此刻落库，这类最值得警觉的事件
+// 在表里将完全不可见。uid 已解析出来，一并记下。
+func (l *LoginLog) recordPendingSecondFactor(uid, account, publicIP, loginType string) {
+	publicIP = normalizeLoginIP(publicIP)
+	masked, hash := resolveAccountFields(account)
+	l.Info(loginEventLogMsg,
+		zap.String("event", "login"),
+		zap.String("result", "pending_second_factor"),
+		zap.String("login_type", loginType),
+		zap.String("uid", uid),
+		zap.String("account_masked", masked),
+		zap.String("account_hash", hash),
+		zap.String("login_ip", publicIP),
+	)
+	err := l.loginLogDB.insert(&LoginLogModel{
+		UID:           uid,
+		AccountMasked: masked,
+		AccountHash:   hash,
+		LoginIP:       publicIP,
+		Status:        loginStatusPendingSecondFactor,
+		LoginType:     loginType,
+	})
+	if err != nil {
+		l.Error("添加登录待二次认证日志错误", zap.Error(err))
+	}
+}
+
 // recordFailure 记录一次登录失败尝试。uid 留空——失败时通常还没有解析出 uid
 // (账号不存在/密码错误都不暴露具体原因，反枚举口径同 errcode)，检索靠 account_hash。
 func (l *LoginLog) recordFailure(account, publicIP, loginType string) {

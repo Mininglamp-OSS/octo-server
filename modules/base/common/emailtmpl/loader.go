@@ -42,6 +42,7 @@ const (
 	KeyVerifyCode        = "verify_code"
 	KeySpaceInviteOwner  = "space_invite_owner"
 	KeySpaceInviteMember = "space_invite_member"
+	KeyManagerLoginCode  = "manager_login_code"
 )
 
 // fallbackLanguage is the source language (en-US), treated as the canonical
@@ -61,7 +62,12 @@ const fallbackLanguage = octoi18n.SourceLanguage // "en-US"
 // provide. Kept explicit (not derived from whatever files happen to exist) so a
 // supported language shipped with zero files is caught at load() time rather
 // than silently falling back to the source language at render time.
-var expectedKeys = []string{KeyVerifyCode, KeySpaceInviteOwner, KeySpaceInviteMember}
+var expectedKeys = []string{
+	KeyVerifyCode,
+	KeySpaceInviteOwner,
+	KeySpaceInviteMember,
+	KeyManagerLoginCode,
+}
 
 // Rendered is the output of Render: the three parts a transactional email
 // needs. Subject is trimmed (no stray trailing newline leaking into the SMTP
@@ -75,6 +81,26 @@ type Rendered struct {
 // VerifyCodeData drives the verify_code template.
 type VerifyCodeData struct {
 	Code string
+}
+
+// ManagerLoginCodeData drives the manager_login_code template — the admin
+// console second-factor email.
+//
+// It deliberately carries more than the code: an administrator who did not
+// start this sign-in must be able to tell, from the email alone, that someone
+// else holds their password. That makes account / time / source-IP part of the
+// payload rather than decoration.
+//
+// ClientIP is derived from request headers and is therefore caller-influenced.
+// It is only ever rendered through the html/template body (auto-escaped) and the
+// plaintext part — never into the subject, which is text/template and would not
+// escape it into an SMTP header.
+type ManagerLoginCodeData struct {
+	Code        string
+	Username    string
+	ClientIP    string
+	RequestedAt string
+	TTLMinutes  int
 }
 
 // SpaceInviteOwnerData drives the space_invite_owner template. An empty

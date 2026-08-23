@@ -48,6 +48,9 @@ other = "空间欢迎语配置无效，请检查目标空间是否存在且未�
 ["err.server.common.thread_archive_window_ordering"]
 other = "子区自动归档窗口不能短于最近会话的子区活跃窗口，否则子区会在活跃窗口生效前就被归档、导致该窗口的配置不起作用。请同时提交这两项，或先调大归档窗口。"
 
+["err.server.common.manager_2fa_email_unconfigured"]
+other = "无法开启管理台二次认证：仍有可登录管理台的账号未配置邮箱。请先为这些账号配置邮箱，否则开启后它们将无法登录。"
+
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
 
@@ -258,6 +261,18 @@ other = "设置语言偏好失败。"
 
 ["err.server.user.manager_permission_required"]
 other = "该账号未开通管理权限。"
+
+["err.server.user.manager_2fa_code_invalid"]
+other = "验证码不正确或已失效，请重新登录。"
+
+["err.server.user.manager_2fa_email_missing"]
+other = "已开启二次认证，但该账号未配置邮箱，无法接收验证码，请联系超级管理员。"
+
+["err.server.user.manager_email_taken"]
+other = "该邮箱已被其他账号使用。"
+
+["err.server.user.manager_2fa_resend_exhausted"]
+other = "重发次数过多，请重新登录。"
 
 ["err.server.user.password_too_short"]
 other = "密码长度至少为 8 位。"
