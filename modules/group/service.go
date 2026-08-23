@@ -1895,20 +1895,6 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 	}
 
-	// 退订待办与成员行删除同事务提交（#797 P0）。
-	//
-	// 没有它，下面那次 IMRemoveSubscriber 失败就彻底蒸发：人在业务库里已经不是成员，
-	// 在 WuKongIM 里还是订阅者，而实测这种泄漏态与正常群成员**完全无差别**——照发照收。
-	// 重跑清理工单也救不回来：重试范围由活跃 group_member 行推导，人已删，范围是空集。
-	// 待办行自带 (channel, uid)，不依赖任何成员行，所以能在成员行消失之后照样收敛。
-	if len(removedUIDs) > 0 {
-		if err := spacemod.EnqueueIMUnsubscribeTx(tx, req.GroupNo,
-			common.ChannelTypeGroup.Uint8(), removedUIDs); err != nil {
-			s.Error("enqueue im unsubscribe failed", zap.Error(err))
-			return nil, errors.New("failed to enqueue im unsubscribe")
-		}
-	}
-
 	// 提交事务
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
@@ -1922,11 +1908,13 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 
 	// IM 操作（事务提交之后）
 	if len(removedUIDs) > 0 {
-		// 移除 IM 订阅。失败不再是终点：待办已随事务落库，worker 会重试到收敛。
-		// 这里仍然不让请求失败——一次后台可修复的抖动没有理由变成用户可见的 500。
-		if err := spacemod.AttemptIMUnsubscribe(s.ctx, req.GroupNo,
-			common.ChannelTypeGroup.Uint8(), removedUIDs); err != nil {
-			s.Error("remove IM subscriber failed; queued for retry", zap.Error(err))
+		// 移除 IM 订阅
+		if err := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+			ChannelID:   req.GroupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Subscribers: removedUIDs,
+		}); err != nil {
+			s.Error("remove IM subscriber failed", zap.Error(err))
 		}
 
 		// 发送被踢消息

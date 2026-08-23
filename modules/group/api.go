@@ -3478,14 +3478,12 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 			botUIDs = append(botUIDs, bu.UID)
 		}
 		if len(botUIDs) > 0 {
-			// 事务已在上面提交，这里补记待办再尝试（#797 P0）。
-			if enqErr := spacemod.EnqueueIMUnsubscribe(g.ctx.DB(), groupNo,
-				common.ChannelTypeGroup.Uint8(), botUIDs); enqErr != nil {
-				g.Error("写 bot 级联退订待办失败", zap.Error(enqErr))
-			}
-			if err := spacemod.AttemptIMUnsubscribe(g.ctx, groupNo,
-				common.ChannelTypeGroup.Uint8(), botUIDs); err != nil {
-				g.Error("级联移除 bot 的 IM 订阅失败，已入队重试", zap.Error(err))
+			if err := g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+				ChannelID:   groupNo,
+				ChannelType: common.ChannelTypeGroup.Uint8(),
+				Subscribers: botUIDs,
+			}); err != nil {
+				g.Error("级联移除 bot 的 IM 订阅失败", zap.Error(err))
 			}
 		}
 		if err := sendBotCascadeRemovedTip(g.ctx, groupNo, showName, "离开了", cascadedBotUsers); err != nil {
@@ -3643,15 +3641,12 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		for _, uid := range targetUIDs {
 			g.removeUserFromGroupThreads(groupNo, uid, group.SpaceID)
 		}
-		// 拉黑是这几条里最刺眼的一条：语义就是「这个人不该再看到这里」，
-		// 而退订失败后他继续收全部消息、还能发言（实测）。先记待办再尝试。
-		if enqErr := spacemod.EnqueueIMUnsubscribe(g.ctx.DB(), groupNo,
-			common.ChannelTypeGroup.Uint8(), targetUIDs); enqErr != nil {
-			g.Error("写拉黑退订待办失败", zap.Error(enqErr), zap.String("groupNo", groupNo))
-		}
-		if rmErr := spacemod.AttemptIMUnsubscribe(g.ctx, groupNo,
-			common.ChannelTypeGroup.Uint8(), targetUIDs); rmErr != nil {
-			g.Error("拉黑摘除父群IM订阅失败，已入队重试", zap.Error(rmErr), zap.String("groupNo", groupNo))
+		if rmErr := g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
+			ChannelID:   groupNo,
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+			Subscribers: targetUIDs,
+		}); rmErr != nil {
+			g.Error("拉黑摘除父群IM订阅失败", zap.Error(rmErr), zap.String("groupNo", groupNo))
 		}
 	} else {
 		members, err := g.db.QueryMembersWithUids(targetUIDs, groupNo)
