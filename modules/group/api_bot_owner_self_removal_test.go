@@ -262,19 +262,84 @@ func TestBotOwnerSelfRemoval_RepeatRemovalIsNotServerError(t *testing.T) {
 //
 // 两条文案刻意可区分：旧的是「你被{0}移除群聊」，新的是「X 将机器人 Y 移出了群聊」
 // ——「移除群聊」与「移出了群聊」不互相包含，所以下面的片段匹配是准确的。
+//
+// 这条**不走 HTTP 路由**，而是直接驱动 service —— 与 space_member_removal_test.go
+// 里的同类 Tip 断言同一写法。原因是 register.GetModules（octo-lib
+// pkg/register/register.go）用进程级 sync.Once 构造模块实例：一个进程里 handler
+// 永远持有**第一个** NewTestServer 的 ctx，而 newGroupIMStub 改的是本测试自己那个
+// ctx 的 config，于是经路由发出的消息不会落进本测试的桩（只有进程里第一个测试碰巧
+// 生效）。这是测试脚手架的限制，不是产品行为——线上只有一个长期存在的 ctx。
+//
+// 「handler 确实置位了 BotOwnerSelfRemoval」由上面那批 HTTP 用例反证：普通成员能
+// 把自己的 bot 删掉、却删不动人类/他人的 bot，只有走自助分支才可能是这个结果。
 func TestBotOwnerSelfRemoval_SendsOwnerTipNotKickNotice(t *testing.T) {
-	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	s, ctx := newTestServer(t)
+	f := New(ctx)
+	require.NoError(t, testutil.CleanAllTables(ctx))
 	stub := newGroupIMStub(t, ctx)
+	wireI18nRendererForGroupTest(s)
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: testutil.UID, Name: "bot-owner", ShortNo: "uc_tip"}))
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "owner_other", Name: "group-owner", ShortNo: "uo_tip"}))
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: selfRemovalGroupNo, Name: "tip group", Creator: "owner_other",
+		Status: GroupStatusNormal, Version: 1,
+	}))
+	seedSelfRemovalMember(t, f, "owner_other", MemberRoleCreator, 0)
+	seedSelfRemovalMember(t, f, testutil.UID, MemberRoleCommon, 0)
 	seedSelfRemovalBot(t, f, "bot_tip", "tip-bot", testutil.UID, 1)
 
-	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_tip"})
-	require.Equal(t, http.StatusOK, w.Code, "移除应成功: %s", w.Body.String())
+	_, err := f.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+		GroupNo:             selfRemovalGroupNo,
+		Members:             []string{"bot_tip"},
+		OperatorUID:         testutil.UID,
+		OperatorName:        "bot-owner",
+		BotOwnerSelfRemoval: true,
+	})
+	require.NoError(t, err)
+
+	exist, err := f.db.ExistMember("bot_tip", selfRemovalGroupNo)
+	require.NoError(t, err)
+	require.False(t, exist, "前置：bot 应已被移除")
 
 	payloads := stub.sentPayloads()
 	assert.False(t, payloadsContain(payloads, "移除群聊"),
 		"自助移除 bot 不应发出「你被 X 移除群聊」——那是被移除者视角的措辞")
 	assert.True(t, payloadsContain(payloads, "将机器人"),
 		"应发出 owner 视角的 Tip，让群成员知道 bot 为何消失")
+}
+
+// 对照组：同一条 service 路径在**不**置位 BotOwnerSelfRemoval 时，
+// 仍然发原来的「被移除」文案——保证新分支没有把既有行为一起改掉。
+func TestBotOwnerSelfRemoval_NormalRemovalStillSendsKickNotice(t *testing.T) {
+	s, ctx := newTestServer(t)
+	f := New(ctx)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	stub := newGroupIMStub(t, ctx)
+	wireI18nRendererForGroupTest(s)
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "owner_other", Name: "group-owner", ShortNo: "uo_kick"}))
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "victim", Name: "victim", ShortNo: "uv_kick"}))
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: selfRemovalGroupNo, Name: "kick group", Creator: "owner_other",
+		Status: GroupStatusNormal, Version: 1,
+	}))
+	seedSelfRemovalMember(t, f, "owner_other", MemberRoleCreator, 0)
+	seedSelfRemovalMember(t, f, "victim", MemberRoleCommon, 0)
+
+	_, err := f.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+		GroupNo:      selfRemovalGroupNo,
+		Members:      []string{"victim"},
+		OperatorUID:  "owner_other",
+		OperatorName: "group-owner",
+	})
+	require.NoError(t, err)
+
+	payloads := stub.sentPayloads()
+	assert.True(t, payloadsContain(payloads, "移除群聊"),
+		"常规踢人仍应发出原有的「被移除」系统消息")
+	assert.False(t, payloadsContain(payloads, "将机器人"),
+		"常规踢人不应发 bot owner Tip")
 }
 
 // 验收 10：bot_owned_by_me 的下发口径——自己的 bot 为 true，
