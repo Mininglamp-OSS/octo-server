@@ -123,8 +123,8 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 // RemoveGroupMembers 这个既有原语的所有调用方，不只是本步骤，因此单独立项。
 // 见 issue #797。
 //
-// 上面那次 CheckMembership 覆盖的是「重新加入发生在读之前」，也就是真正宽的那个
-// 窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 issue #797。
+// 上面那次 CheckMembershipForCleanup 覆盖的是「重新加入发生在读之前」，也就是真正
+// 宽的那个窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 #797。
 func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
