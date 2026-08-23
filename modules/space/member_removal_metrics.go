@@ -20,7 +20,10 @@ import (
 // 唯一能在它发生**之前**看见的信号：预算耗尽之前，队列积压的年龄会先涨上去。
 //
 // 与 modules/oidc、modules/sticker 同款：promauto 注册进全局默认 Registry，
-// 本 PR 不引入 /metrics 端点（那是独立的基础设施改动）。
+// 而 /metrics 端点**已经存在并在服务**（pkg/metrics/http.go，main.go 里启动），
+// 所以这三个 gauge 落地即被抓取。
+// （早先这里照抄了 oidc 那份「本 PR 不引入 /metrics 端点」的旧注释而没有核实——
+// 那句话在 oidc 写下时是真的，现在不是了。）
 // 刻意不加 space_id / uid 这类高基维 label —— 会撑爆 Prometheus 内存。
 const removalMetricNamespace = "space"
 
@@ -53,15 +56,23 @@ type removalCleanupStats struct {
 
 // queryMemberRemovalCleanupStats 一次查询取回三个指标。
 //
-// 全表聚合，但这张表有保留期清理兜底，稳态下很小；而且每分钟只跑一次，
-// 与耗尽扫描同一轮，不额外加一个定时器。
+// 这是一次全表聚合：MIN(CASE WHEN status=0 THEN created_at END) 没有任何索引能覆盖。
+// 稳态下表不大（14 天保留期 + 每小时 purge），但**恰恰在这些指标最有价值的时刻**
+// ——一次大规模放弃之后——表会永久变大，聚合也就永久变慢。所以刻意跑得比扫描稀疏，
+// 见 removalMetricsInterval。
 func (d *DB) queryMemberRemovalCleanupStats() (*removalCleanupStats, error) {
 	var stats removalCleanupStats
 	_, err := d.session.SelectBySql(
 		"SELECT "+
 			"IFNULL(SUM(status=?),0) AS pending, "+
 			"IFNULL(SUM(status=?),0) AS abandoned, "+
-			"IFNULL(TIMESTAMPDIFF(SECOND, MIN(CASE WHEN status=? THEN created_at END), UTC_TIMESTAMP(3)),0) "+
+			// 必须用 NOW(3) 而不是 UTC_TIMESTAMP(3)：created_at 从不由 Go 写入，
+			// 走的是列默认值 CURRENT_TIMESTAMP(3)，即 MySQL 会话时区。拿 UTC 去减
+			// 一个会话时区的时间戳，在 TZ=Asia/Shanghai + DSN loc=Local 的部署下会
+			// 得到 -28799 秒，而且要等积压满 8 小时才转正——这个 gauge 恰恰是用来
+			// 在大规模放弃**发生之前**报警的，在那个点上它是坏的。
+			// 两边同为会话时区即自洽。
+			"IFNULL(TIMESTAMPDIFF(SECOND, MIN(CASE WHEN status=? THEN created_at END), NOW(3)),0) "+
 			"AS oldest_pending_age_sec "+
 			"FROM space_member_removal_cleanup",
 		removalCleanupPending, removalCleanupAbandoned, removalCleanupPending,

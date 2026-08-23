@@ -1052,14 +1052,16 @@ func TestCheckMembershipForCleanupMatrix(t *testing.T) {
 		name        string
 		spaceStatus int
 		memberAlive bool
-		wantHeld    bool // true = 席位仍在 → 清理必须跳过
+		wantHeld    bool // CheckMembershipForCleanup：true = 席位仍在 → 清理必须跳过
+		wantAuth    bool // CheckMembership：true = 允许访问该 Space
 	}{
-		{"正常空间/活跃成员：人还在，跳过清理", SpaceStatusNormal, true, true},
-		{"正常空间/已移除：正常的被踢路径，清理执行", SpaceStatusNormal, false, false},
-		{"封禁空间/活跃成员：封禁不动摇成员资格，跳过清理", SpaceStatusBanned, true, true},
-		{"封禁空间/已移除：照常清理", SpaceStatusBanned, false, false},
-		{"解散空间/活跃成员：join-vs-disband 孤儿，必须清理", SpaceStatusDisbanded, true, false},
-		{"解散空间/已移除：照常清理", SpaceStatusDisbanded, false, false},
+		{"正常空间/活跃成员：人还在，跳过清理", SpaceStatusNormal, true, true, true},
+		{"正常空间/已移除：正常的被踢路径，清理执行", SpaceStatusNormal, false, false, false},
+		// ↓ 这一格是两个谓词唯一分歧之处，也是整条修复的核心。
+		{"封禁空间/活跃成员：清理跳过，但鉴权必须拒绝", SpaceStatusBanned, true, true, false},
+		{"封禁空间/已移除：照常清理", SpaceStatusBanned, false, false, false},
+		{"解散空间/活跃成员：join-vs-disband 孤儿，必须清理", SpaceStatusDisbanded, true, false, false},
+		{"解散空间/已移除：照常清理", SpaceStatusDisbanded, false, false, false},
 	}
 
 	for i, tc := range cases {
@@ -1081,6 +1083,14 @@ func TestCheckMembershipForCleanupMatrix(t *testing.T) {
 			held, err := spacepkg.CheckMembershipForCleanup(f.ctx.DB(), spaceID, uid)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantHeld, held)
+
+			// 同一份数据上再问一次鉴权谓词。两者必须在「封禁 + 活跃成员」
+			// 这一格上分道扬镳：清理谓词说「席位还在，别清」，鉴权谓词说
+			// 「不许访问」。这就是 #797 原方案要合并、而合并会开安全口子的那一格。
+			auth, err := spacepkg.CheckMembership(f.ctx.DB(), spaceID, uid)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAuth, auth,
+				"CheckMembership 是 SpaceMiddleware 的鉴权谓词，只有正常空间的活跃成员才能通过")
 		})
 	}
 
@@ -1213,6 +1223,36 @@ func TestSweepAbandonsExhaustedJobLeftByHardKill(t *testing.T) {
 	assert.Empty(t, jobs[0].LeaseOwner, "终态必须释放租约")
 }
 
+// TestSweepLeavesRecentlyExpiredLeaseAlone 租约刚过期还不够判死。
+//
+// 群级联「几十个群就能跑上几分钟」，跑过 10 分钟租约是**预期内**的，不是进程死了。
+// 若扫描只要求「租约已过期」，一条正在正常推进、随后会成功的作业就会被判成
+// abandoned 并触发「需人工介入」告警；而它自己的 finish 因为 status 已变而落空，
+// 只留下一句误导的「租约已易主」——完成的工作被永久记成放弃。
+// 所以门槛要留一整个租约周期的宽限。
+func TestSweepLeavesRecentlyExpiredLeaseAlone(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sweep-grace"
+	seedMember(t, f, spaceID, "owner-s3", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "v-s3", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "v-s3", 1, "owner-s3", MemberRemoveReasonKicked)
+
+	// 租约刚过期一分钟：作业很可能还在跑（大空间的级联本来就会超租约）。
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts,
+		time.Now().UTC().Add(-time.Minute))
+
+	f.sweepExhaustedMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status,
+		"租约刚过期不等于进程死了，必须留出一整个租约周期的宽限再判死")
+}
+
 // TestSweepLeavesLiveLeaseAlone 关键边界：一条正在跑最后一次尝试的工单，
 // attempts 已经到顶但租约还在手上。扫描若只看 attempts 就会把它判死，
 // 而它可能下一秒就成功了——终态被抢写，执行中的 worker 再写就落空。
@@ -1271,6 +1311,9 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 	assert.GreaterOrEqual(t, stats.OldestPendingAgeSec, int64(600),
 		"最老待处理年龄要反映真实积压——它是预算耗尽之前唯一能看见的先行信号")
 
+	// 指标现在是独立的稀疏调度（那条查询是全表聚合），不再挂在扫描那一轮上，
+	// 所以这里显式刷一次。
+	f.refreshMemberRemovalCleanupMetrics()
 	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupPendingGauge))
 	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupAbandonedGauge))
 	assert.GreaterOrEqual(t, promtestutil.ToFloat64(removalCleanupOldestPendingGauge), float64(600))

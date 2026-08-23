@@ -142,7 +142,13 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 			"FROM space_member_removal_cleanup "+
 			"WHERE status=? AND attempts<? AND next_attempt_at<=? "+
 			"AND (lease_until IS NULL OR lease_until<=?) "+
-			"ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+			// 刻意不写 ORDER BY id。加上它，优化器会认为「按主键顺序扫、取第一条命中」
+			// 更划算，于是放弃 idx_..._pending 改走 PRIMARY —— 实测 EXPLAIN 从
+			// type=range/key=idx_pending 变成 type=index/key=PRIMARY。abandoned 行永不
+			// 删除且集中在低 id 段，扫描长度于是随部署年龄单调增长，每次认领都要
+			// 从 id=1 爬过所有终态行才够到第一条待办。
+			// FIFO 本来也不是保证：SKIP LOCKED 已经让多副本的实际取件顺序不确定。
+			"LIMIT 1 FOR UPDATE SKIP LOCKED",
 		removalCleanupPending, removalCleanupMaxAttempts, now, now,
 	).LoadOne(&job)
 	if err != nil {
@@ -197,9 +203,16 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 // attempts 上限，这种行不会再被认领——没有这条扫描，它就永远停在那里，既不重试也不
 // 报错，运维看到的是一条「pending 很久」的记录而不是一条失败。
 //
-// 租约条件不能省：一条正在跑最后一次尝试的工单，attempts 同样等于上限，但租约还在
-// 执行者手上。只按 attempts 判死会抢先写终态，执行者随后按 lease_owner 匹配的写入
-// 落空，一次本可能成功的清理被永久记成放弃。
+// 租约条件不能省，而且要留一整个租约周期的宽限。
+//
+// 一条正在跑最后一次尝试的工单，attempts 同样等于上限，但租约还在执行者手上；只按
+// attempts 判死会抢先写终态。仅仅要求「租约已过期」还不够：本文件开头就写了群级联
+// 「几十个群就能跑上几分钟」，跑过 10 分钟租约是**预期内**的。那种情况下作业还在
+// 正常推进、随后会成功，却会被扫描判成 abandoned 并触发「需人工介入」告警，而它
+// 自己的 finish 因为 status 已变而落空、只留下一句误导的「租约已易主」。
+// 所以门槛是 lease_until <= now - removalCleanupLease：进程真死了才够得着。
+//
+// 同时要求 lease_until IS NOT NULL：从没被认领过的行不该被扫描碰。
 //
 // 不复用 finishMemberRemovalCleanup：那个要求调用方持有租约，而这里的前提恰恰是
 // 租约的主人已经不存在了。
@@ -210,13 +223,34 @@ func (d *DB) abandonExhaustedMemberRemovalCleanups(now time.Time, limit int) (in
 	if limit <= 0 {
 		return 0, nil
 	}
+	// 先只读地选出 id，再按主键更新。
+	//
+	// 不能写成单条带 WHERE 的 UPDATE：attempts 不在任何索引里，可选的访问路径只有
+	// status，于是 REPEATABLE READ 下这条 UPDATE 会对**整个 status=0 范围**加
+	// next-key 锁 —— LIMIT 限制的是「改了几行」，不是「锁了几行」。实测：正是这条
+	// 语句会让另一个连接里那条全新、不冲突的入队 INSERT 报
+	// ERROR 1205 Lock wait timeout。而入队就发生在移除事务内部、且是 fail-closed 的，
+	// 结果就是队列一积压、踢人就随机失败。
+	// SELECT 是非锁定读，UPDATE 只按主键锁点名的那几行，两边都不再扫范围。
+	var ids []uint64
+	_, err := d.session.SelectBySql(
+		"SELECT id FROM space_member_removal_cleanup "+
+			"WHERE status=? AND attempts>=? AND lease_until IS NOT NULL AND lease_until<=? "+
+			"LIMIT ?",
+		removalCleanupPending, removalCleanupMaxAttempts, now.Add(-removalCleanupLease), limit,
+	).Load(&ids)
+	if err != nil {
+		return 0, fmt.Errorf("space: select exhausted removal cleanups: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
 	result, err := d.session.UpdateBySql(
 		"UPDATE space_member_removal_cleanup "+
 			"SET status=?, finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
-			"WHERE status=? AND attempts>=? AND (lease_until IS NULL OR lease_until<=?) "+
-			"LIMIT ?",
+			"WHERE id IN ? AND status=?",
 		removalCleanupAbandoned, now, "sweep: retries exhausted",
-		removalCleanupPending, removalCleanupMaxAttempts, now, limit,
+		ids, removalCleanupPending,
 	).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("space: sweep exhausted removal cleanups: %w", err)

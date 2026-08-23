@@ -266,6 +266,9 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 		s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
 		s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
 		s.ctx.Schedule(removalSweepInterval, s.sweepExhaustedMemberRemovalCleanups)
+		// 指标单独一个更稀疏的节奏：那条查询是全表聚合，而这几个 gauge 是给
+		// 分钟级以上的趋势看的，没有必要每分钟扫一次表。
+		s.ctx.Schedule(removalMetricsInterval, s.refreshMemberRemovalCleanupMetrics)
 	})
 }
 
@@ -294,6 +297,9 @@ func (s *Space) purgeFinishedMemberRemovalCleanups() {
 const (
 	removalSweepInterval = time.Minute
 	removalSweepLimit    = 500
+	// removalMetricsInterval 指标采集节奏。比扫描稀疏，因为那条查询是全表聚合
+	// （MIN(created_at) 无索引可用），而 gauge 服务的是趋势判断，不是秒级响应。
+	removalMetricsInterval = 5 * time.Minute
 )
 
 // sweepExhaustedMemberRemovalCleanups 把重试预算耗尽、租约也已过期的工单推到 abandoned。
@@ -311,9 +317,6 @@ func (s *Space) sweepExhaustedMemberRemovalCleanups() {
 		s.Error("成员移除清理工单重试耗尽，已置为 abandoned；无自动重驱动，需人工介入",
 			zap.Int64("abandoned", abandoned))
 	}
-	// 与扫描同一轮刷新指标，省掉第二个定时器。顺序也对：先把耗尽的推成终态，
-	// 再采样，abandoned 计数当轮即可见。
-	s.refreshMemberRemovalCleanupMetrics()
 }
 
 // removalCleanupRunning 进程内重入保护。

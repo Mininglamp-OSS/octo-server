@@ -208,7 +208,9 @@ func TestInvalidateMembershipCacheReportsTotalFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("两条路都失败时必须报错")
 	}
-	if !strings.Contains(err.Error(), "fallback") {
-		t.Errorf("错误信息要点明兜底也失败了，got %q", err)
+	// 断言必须落在**区分**两种情形的那个子串上。原先断的是 "fallback"，
+	// 而「兜底成功」那条信息里也有这个词 —— 删掉整个总失败分支，测试照样绿。
+	if !strings.Contains(err.Error(), "also failed") {
+		t.Errorf("错误信息必须能把「兜底也失败了」与「兜底成功了」区分开，got %q", err)
 	}
 }
