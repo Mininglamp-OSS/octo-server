@@ -266,6 +266,10 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 		s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
 		s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
 		s.ctx.Schedule(removalSweepInterval, s.sweepExhaustedMemberRemovalCleanups)
+		// 退订待办有自己的表（五个泄漏点里只有两个来自 Space 成员移除），
+		// 但共用同一套调度节奏与退避曲线。
+		s.ctx.Schedule(10*time.Second, s.processIMPendingRemovals)
+		s.ctx.Schedule(removalSweepInterval, s.sweepExhaustedIMPending)
 	})
 }
 

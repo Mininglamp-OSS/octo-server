@@ -1517,3 +1517,13 @@ change-log convention (§7). Newest first.
   `SpaceMiddleware` for 60s with nothing logged.
   See [journal](journal/shared/cleanup-queue-durability.md).
 
+## 2026-08-23 (im-pending-outbox)
+
+- **Fixed** — #797's remaining P0. A failed `IMRemoveSubscriber` was logged and dropped,
+  leaving the removed member a subscriber forever; measured against the pinned broker, that
+  state is **indistinguishable from full membership** (can send, receives everything), and
+  all four repair routes are closed. Every group/sub-thread unsubscribe now goes through a
+  durable record — enqueued in the removal transaction where one exists, deleted on success,
+  retried to convergence on failure — across all five call sites that dropped failures.
+  See [journal](journal/shared/im-pending-outbox.md).
+

@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -633,13 +634,16 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	} else {
 		for _, g := range groups {
 			// Remove from IM channel
-			err = h.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-				ChannelID:   g.GroupNo,
-				ChannelType: uint8(common.ChannelTypeGroup),
-				Subscribers: []string{botID},
-			})
+			// 先记待办再尝试（#797 P0）。本文件下方那条注释已经写明后果：
+			// 退订失败的 bot 仍会持续收到消息；现在失败会被重试到收敛。
+			if enqErr := space.EnqueueIMUnsubscribe(h.ctx.DB(), g.GroupNo,
+				uint8(common.ChannelTypeGroup), []string{botID}); enqErr != nil {
+				h.Error("写 Bot 退订待办失败", zap.String("groupNo", g.GroupNo), zap.Error(enqErr))
+			}
+			err = space.AttemptIMUnsubscribe(h.ctx, g.GroupNo,
+				uint8(common.ChannelTypeGroup), []string{botID})
 			if err != nil {
-				h.Error("从IM频道移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(err))
+				h.Error("从IM频道移除Bot失败，已入队重试", zap.String("groupNo", g.GroupNo), zap.Error(err))
 			}
 			// Issue #27：父群订阅之外，还要对齐摘除该 Bot 在群内所有非删除子区的 IM 订阅，
 			// 否则被删除的 Bot 仍会通过 WuKongIM 持续收到子区消息。
