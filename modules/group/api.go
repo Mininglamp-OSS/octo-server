@@ -3159,12 +3159,24 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		for _, member := range deleteMembers {
-			// 自助路径不得命中 Creator：RemoveGroupMembers 对 Creator 角色是**静默跳过**
-			// （service.go filter），handler 又不检查 Removed 计数就返回 200，
-			// 结果会是「接口成功但成员没动」，前端误报已移除。这里显式拒绝。
-			// 白名单查询不过滤 role，故理论上可命中一个身为群主的 bot。
-			if botOwnerSelfRemoval && member.Role == int(common.GroupMemberRoleCreater) {
-				httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
+			// 自助路径只允许移除**普通角色**的 bot。
+			//
+			// 白名单按所有权圈定目标，但不过滤 role，所以理论上能命中一个被授予了
+			// 群角色的 bot。两种角色分别的问题：
+			//   - Creator：RemoveGroupMembers 对 Creator 是静默跳过，会变成
+			//     「200 但成员没动」，前端误报已移除；
+			//   - Manager：普通成员将得以移除一个群管理员，而真正的管理员反而
+			//     不能移除另一个管理员（下面几行），权限阶梯倒挂。
+			//     维护者当初拍板的「所有权优先」针对的是 bot_admin 这一列，
+			//     group_member.role 是比它更强的授予，不在那条决策覆盖范围内。
+			// 故一并拒绝，把角色 bot 的处置交回群主/管理员。
+			// （managerAdd 不排除 robot，所以 Manager 角色的 bot 是构造得出来的。）
+			if botOwnerSelfRemoval && member.Role != MemberRoleCommon {
+				if member.Role == int(common.GroupMemberRoleCreater) {
+					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
 				return
 			}
 			if loginMember.Role == int(common.GroupMemberRoleManager) {
@@ -3181,7 +3193,7 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 调用 Service 移除群成员
-	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+	removeResp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:      groupNo,
 		Members:      req.Members,
 		OperatorUID:  operator,
@@ -3204,6 +3216,19 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		}
 		g.Error("移除群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		return
+	}
+
+	// 自助路径核对实际移除数：上面的角色守卫读的是事务外快照，而 service 在行锁内
+	// 重读角色，期间目标若被提升为 Creator 就会被**静默跳过**（其 doc 写明「让调用方
+	// 按 Removed 计数发现并重试」，但此前没有调用方真的去看）。不核对的话，这条竞态
+	// 窗口仍会回到「200 但成员没动」——正是上面那道守卫要消灭的形态，只是更窄。
+	// 只在自助路径上核对：后台管理路径本来就允许「部分目标不在群内」的宽松语义。
+	if botOwnerSelfRemoval && removeResp != nil && removeResp.Removed < len(req.Members) {
+		g.Warn("自助移除的实际移除数少于请求数，疑似目标在事务内被提升为群主",
+			zap.String("groupNo", groupNo), zap.String("operator", operator),
+			zap.Int("requested", len(req.Members)), zap.Int("removed", removeResp.Removed))
+		httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
 		return
 	}
 
@@ -4590,6 +4615,20 @@ func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailR
 	if !hasBot {
 		return
 	}
+	// 移除的授权是**两个**谓词：活跃成员（ExistMemberActive）+ 所有权白名单。
+	// 只按所有权回填的话，被拉黑的所有者（status=Blacklist、is_deleted=0）仍能拉到
+	// 成员列表、拿到 bot_owned_by_me=true、看到移除按钮，点下去却被 memberRemove
+	// 的活跃门拒绝。这里补上同一道门，让「按钮可见」与「请求会被放行」用的是同一组
+	// 判据，而不是其中一半。方向仍是 fail-closed：查询出错一律留 false。
+	operatorActive, aerr := g.db.ExistMemberActive(loginUID, groupNo)
+	if aerr != nil {
+		g.Warn("查询请求方活跃成员状态失败（octo-web#1511）",
+			zap.Error(aerr), zap.String("group_no", groupNo))
+		return
+	}
+	if !operatorActive {
+		return
+	}
 	ownedBotUIDs, err := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{loginUID})
 	if err != nil {
 		g.Warn("批量查询本人名下 bot 失败（octo-web#1511）",
@@ -4606,6 +4645,11 @@ func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailR
 	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
 	for i := range resps {
 		if resps[i].Robot != 1 {
+			continue
+		}
+		// 被授予了群角色（Creator / Manager）的 bot 由 memberRemove 的自助分支拒绝，
+		// 处置权留给群主/管理员；这里同步排除，避免下发一个点了必报错的按钮。
+		if resps[i].Role != MemberRoleCommon {
 			continue
 		}
 		if _, ok := owned[resps[i].UID]; ok {

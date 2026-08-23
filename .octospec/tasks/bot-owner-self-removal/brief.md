@@ -129,7 +129,8 @@ source: self
 4. 普通成员提交**混合批次**（自己的 bot + 人类 / + 他人的 bot）→ 整批拒绝，
    断言无任何目标被移除（不得部分执行）。
 5. 普通成员移除**孤儿/禁用 bot**（`robot` 行缺失或 `status != 1`）→ 拒绝（fail-closed）。
-6. 群主 / 管理员 / 后台管理（`c.CheckLoginRole() == nil`）三条既有路径行为不变：
+6. 群主 / 管理员 / 后台管理（`c.CheckLoginRole() == nil`）三条既有路径的**授权与
+   移除语义**不变（限流除外，见下）：
    `api_i18n_regression_test.go`、`bot_cascade_test.go`、`validation_test.go` 全绿。
 7. 自助路径**不产生**「你被 X 移除群聊」系统消息，**产生**一条说明 bot 去向的 Tip。
    机制已具备，同包直接复用：`newGroupIMStub(t, ctx)`
@@ -176,14 +177,21 @@ make i18n-extract-check && make i18n-lint   # 预期无变化（不新增 errcod
 
 ## 待人类确认的决策点
 
-1. **bot 已被授予 `bot_admin` 时，所有者能否单方面撤走？**
+1. **bot 已被授予 `bot_admin` 时，所有者能否单方面撤走？**（仅限 `bot_admin` 列；
+   `group_member.role` 见下方补充决策）
    现有守卫**不拦**——`api.go:3084-3095` 只看 `role`，而 `bot_admin` 是独立列
    （`MemberDetailModel.BotAdmin`，`db.go:770`）。默认行为是放行。
    倾向：**允许**（所有权优先，且移除成员行本身即让 `bot_admin` 失效）。
    若需拦，在自助分支加一条 `bot_admin == 1 → 拒绝`。
 2. **是否给这两条路由挂 `SharedUIDRateLimiter`？**
-   倾向：**挂**，但只挂这两条，不要挂整个 `groups` 组（会一次性影响 ~28 个端点，
+   已定：**挂**，但只挂这两条，不要挂整个 `groups` 组（会一次性影响 ~28 个端点，
    且相关测试须在 setup 里清 `ratelimit:uid:*`，见 `api_welcome_test.go:35`）。
+
+   **影响面更正（评审指出）**：限流是挂在路由上的，因此它同样作用于走这两条路由的
+   群主 / 管理员 / 后台管理调用方，不只是新开的普通成员路径。也就是说上面验收 6 的
+   「行为不变」仅指授权与移除语义；持续高于 2 rps 的脚本化单成员移除会开始拿到 429
+   （桶是进程级 per-UID 共享，Redis 故障时 fail-open）。若管理后台有批量踢人的集成，
+   需按 `DM_API_UID_RATELIMIT_RPS` / `_BURST` 调参。
 3. **Tip 文案。** 现有 `sendBotCascadeRemovedTip` 模板是
    「{leaver}{action}群聊，其机器人 X 已一并移除」，描述的是「人走 bot 跟着走」，
    不适用于本场景。需新写一条（如「{owner} 移出了机器人 {bot}」）。
@@ -195,3 +203,17 @@ make i18n-extract-check && make i18n-lint   # 预期无变化（不新增 errcod
    倾向：自助分支在调用 service 前显式拒绝 Creator 角色目标，返回
    `ErrGroupMemberCannotRemove`，避免「200 但没动」。
    （现实中 bot 极少成为群主，但这是廉价的一致性钉子。）
+
+## 补充决策（评审阶段追加）
+
+5. **被授予群角色（`group_member.role`）的 bot 不走自助路径。**
+   决策点 1 的「所有权优先」针对的是 `bot_admin` 这一列。评审指出 `group_member.role`
+   是比它更强的授予：`managerAdd` 不排除 robot，所以 Manager 角色的 bot 构造得出来，
+   而若放行，普通成员将得以移除一个群管理员，同时真正的管理员反而不能移除另一个
+   管理员——权限阶梯倒挂。
+   故自助分支拒绝任何 `role != MemberRoleCommon` 的目标（Creator 回
+   `ErrGroupCannotRemoveOwner`，Manager 回 `ErrGroupCannotRemoveAdmin`），
+   把角色 bot 的处置权留给群主 / 管理员。`fillBotOwnedByMe` 同步排除，
+   避免下发一个点了必报错的按钮。
+   回归：`TestBotOwnerSelfRemoval_RejectsManagerRoleBot`、
+   `TestBotOwnerSelfRemoval_RoleBotGetsNoOwnershipFlag`。

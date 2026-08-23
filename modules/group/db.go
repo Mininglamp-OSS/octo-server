@@ -916,6 +916,20 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 	if groupNo == "" || len(ownerUIDs) == 0 {
 		return nil, nil
 	}
+	// 空字符串必须剔除：`creator_uid IN ('')` 会命中 creator_uid='' 的行，而那正是
+	// checkBotOwnership 判定为「无有效归属」的孤儿 bot 哨兵值。HTTP 调用方有鉴权
+	// 兜底不会传空，但 expandBlacklistTargetsWithOwnedBots 会转发请求方给的 uid 列表，
+	// 所以在这里收口，让导出契约与它声称的语义一致（fail closed）。
+	owners := make([]string, 0, len(ownerUIDs))
+	for _, uid := range ownerUIDs {
+		if uid != "" {
+			owners = append(owners, uid)
+		}
+	}
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	ownerUIDs = owners
 	var uids []string
 	_, err := d.session.SelectBySql(
 		"SELECT gm.uid FROM group_member gm "+

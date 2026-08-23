@@ -121,6 +121,8 @@ func TestBotOwnerSelfRemoval_RejectsOthersBot(t *testing.T) {
 
 	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_theirs"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "不得移除他人名下的 bot")
+	assert.Contains(t, w.Body.String(), "member_cannot_remove",
+		"应回「无权移除」而不是别的错误（例如查询失败的 5xx），实际: %s", w.Body.String())
 
 	exist, err := f.db.ExistMember("bot_theirs", selfRemovalGroupNo)
 	require.NoError(t, err)
@@ -139,6 +141,8 @@ func TestBotOwnerSelfRemoval_RejectsHumanTarget(t *testing.T) {
 
 	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"human_peer"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "普通成员不得移除人类成员（提权防线）")
+	assert.Contains(t, w.Body.String(), "member_cannot_remove",
+		"应回「无权移除」，实际: %s", w.Body.String())
 
 	exist, err := f.db.ExistMember("human_peer", selfRemovalGroupNo)
 	require.NoError(t, err)
@@ -155,6 +159,8 @@ func TestBotOwnerSelfRemoval_RejectsMixedBatch(t *testing.T) {
 
 	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_mine_mix", "human_mix"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "混合批次必须整批拒绝")
+	assert.Contains(t, w.Body.String(), "member_cannot_remove",
+		"应回「无权移除」，实际: %s", w.Body.String())
 
 	// 关键：连自己那只 bot 也不能被顺带移除，否则就是部分执行。
 	botExist, err := f.db.ExistMember("bot_mine_mix", selfRemovalGroupNo)
@@ -175,6 +181,8 @@ func TestBotOwnerSelfRemoval_RejectsOrphanAndDisabledBot(t *testing.T) {
 	for _, uid := range []string{"bot_orphan_rm", "bot_disabled_rm"} {
 		w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{uid})
 		assert.NotEqual(t, http.StatusOK, w.Code, "%s 应 fail-closed 拒绝", uid)
+		assert.Contains(t, w.Body.String(), "member_cannot_remove",
+			"%s 应回「无权移除」，实际: %s", uid, w.Body.String())
 		exist, err := f.db.ExistMember(uid, selfRemovalGroupNo)
 		require.NoError(t, err)
 		assert.True(t, exist, "%s 应仍在群内", uid)
@@ -216,6 +224,8 @@ func TestBotOwnerSelfRemoval_ScopedToRequestedGroup(t *testing.T) {
 	// 对 B 群请求移除只存在于 A 群的 bot。
 	w := deleteMembersReq(t, handler, otherGroupNo, []string{"bot_in_a"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "不得跨群移除")
+	assert.Contains(t, w.Body.String(), "not_in_group",
+		"目标不在本群，应回「不在群内」，实际: %s", w.Body.String())
 
 	exist, err := f.db.ExistMember("bot_in_a", selfRemovalGroupNo)
 	require.NoError(t, err)
@@ -239,6 +249,8 @@ func TestBotOwnerSelfRemoval_RejectsCreatorRoleBot(t *testing.T) {
 
 	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_creator_role"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "Creator 角色目标必须显式拒绝，不能回 200 却没动")
+	assert.Contains(t, w.Body.String(), "cannot_remove_owner",
+		"应回「不能移除群主」，实际: %s", w.Body.String())
 
 	exist, err := f.db.ExistMember("bot_creator_role", selfRemovalGroupNo)
 	require.NoError(t, err)
@@ -488,6 +500,8 @@ func TestBotOwnerSelfRemoval_RejectsBlacklistedOperator(t *testing.T) {
 
 	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_of_blacklisted"})
 	assert.NotEqual(t, http.StatusOK, w.Code, "被拉黑成员不得移除任何成员")
+	assert.Contains(t, w.Body.String(), "member_cannot_remove",
+		"应回「无权移除」，实际: %s", w.Body.String())
 
 	exist, err := f.db.ExistMember("bot_of_blacklisted", selfRemovalGroupNo)
 	require.NoError(t, err)
@@ -523,6 +537,177 @@ func TestBotOwnerSelfRemoval_MemberGetExposesBotOwnedByMe(t *testing.T) {
 	assert.True(t, resp.Exists)
 	assert.Equal(t, 1, resp.Member.Robot, "robot 必须被下发，否则回填会静默失效")
 	assert.True(t, resp.Member.BotOwnedByMe, "memberGet 也要如实下发 bot_owned_by_me")
+}
+
+// 被授予群角色（Manager / Creator）的 bot 不走自助路径。
+//
+// 白名单按所有权圈定目标、不过滤 role，而 managerAdd 不排除 robot，所以
+// Manager 角色的 bot 构造得出来。若不拦：普通成员能移除一个群管理员，而真正的
+// 管理员反而不能移除另一个管理员，权限阶梯倒挂。维护者拍板的「所有权优先」
+// 针对的是 bot_admin 列，group_member.role 是更强的授予，不在其覆盖范围。
+func TestBotOwnerSelfRemoval_RejectsManagerRoleBot(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "bot_mgr", Name: "mgr-bot", ShortNo: "bmgr", Robot: 1}))
+	_, err := f.ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid) VALUES (?, 1, ?)", "bot_mgr", testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+	seedSelfRemovalMember(t, f, "bot_mgr", MemberRoleManager, 1)
+
+	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_mgr"})
+	assert.NotEqual(t, http.StatusOK, w.Code, "Manager 角色的 bot 不应走自助路径")
+	assert.Contains(t, w.Body.String(), "cannot_remove_admin",
+		"应回「不能移除管理员」，实际: %s", w.Body.String())
+
+	exist, err := f.db.ExistMember("bot_mgr", selfRemovalGroupNo)
+	require.NoError(t, err)
+	assert.True(t, exist, "Manager 角色的 bot 应仍在群内")
+}
+
+// 回填必须与移除授权同口径：被拉黑的所有者不该拿到 bot_owned_by_me=true。
+//
+// 移除的授权是两个谓词（活跃成员 + 所有权白名单）。回填若只判所有权，被拉黑的
+// 所有者仍能拉到成员列表、看到移除按钮，点下去被拒 —— 按钮与权限打架。
+func TestBotOwnerSelfRemoval_BlacklistedOwnerGetsNoOwnershipFlag(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	seedSelfRemovalBot(t, f, "bot_bl_flag", "mine", testutil.UID, 1)
+
+	_, err := f.ctx.DB().UpdateBySql(
+		"UPDATE group_member SET status=? WHERE group_no=? AND uid=?",
+		int(common.GroupMemberStatusBlacklist), selfRemovalGroupNo, testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+
+	flags := membersGetOwnershipFlags(t, handler, selfRemovalGroupNo)
+	assert.False(t, flags["bot_bl_flag"],
+		"被拉黑的所有者不应拿到 bot_owned_by_me=true —— 否则按钮可见但请求必被拒")
+}
+
+// 角色 bot 同理：既然自助路径拒绝它，回填也不该把它标成可移除。
+func TestBotOwnerSelfRemoval_RoleBotGetsNoOwnershipFlag(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: "bot_mgr_flag", Name: "mgr", ShortNo: "bmgrf", Robot: 1}))
+	_, err := f.ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid) VALUES (?, 1, ?)", "bot_mgr_flag", testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+	seedSelfRemovalMember(t, f, "bot_mgr_flag", MemberRoleManager, 1)
+	seedSelfRemovalBot(t, f, "bot_plain_flag", "plain", testutil.UID, 1)
+
+	flags := membersGetOwnershipFlags(t, handler, selfRemovalGroupNo)
+	assert.False(t, flags["bot_mgr_flag"], "Manager 角色的 bot 不应被标成可移除")
+	assert.True(t, flags["bot_plain_flag"], "对照：普通角色的自有 bot 仍应为 true")
+}
+
+// membersync 是三个下发端点里最后一个 —— 也是 Android WKSDK ChannelMember 缓存的
+// 唯一增量来源、「缺失=false」降级语义的所在。此前只测了 members 与 members/:uid，
+// 而「漏选列导致字段静默恒 false」正是本任务在 memberGet 上真实踩过的坑。
+func TestBotOwnerSelfRemoval_MemberSyncExposesBotOwnedByMe(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	seedSelfRemovalBot(t, f, "bot_sync_mine", "mine", testutil.UID, 1)
+	seedSelfRemovalBot(t, f, "bot_sync_other", "theirs", "owner_other", 1)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET",
+		"/v1/groups/"+selfRemovalGroupNo+"/membersync?version=0&limit=100", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "membersync 应可读: %s", w.Body.String())
+
+	var members []map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &members))
+	flags := map[string]bool{}
+	for _, m := range members {
+		uid, _ := m["uid"].(string)
+		owned, present := m["bot_owned_by_me"].(bool)
+		require.True(t, present, "membersync 的每一行都应带 bot_owned_by_me（uid=%s）", uid)
+		flags[uid] = owned
+	}
+	assert.True(t, flags["bot_sync_mine"], "自己名下的 bot 应为 true")
+	assert.False(t, flags["bot_sync_other"], "他人名下的 bot 应为 false")
+	assert.False(t, flags[testutil.UID], "人类成员应恒为 false")
+}
+
+// membersGetOwnershipFlags 拉一次成员列表，返回 uid -> bot_owned_by_me。
+func membersGetOwnershipFlags(t *testing.T, handler http.Handler, groupNo string) map[string]bool {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/groups/"+groupNo+"/members?page=1&limit=50", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "成员列表应可读: %s", w.Body.String())
+
+	var members []map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &members))
+	flags := map[string]bool{}
+	for _, m := range members {
+		uid, _ := m["uid"].(string)
+		owned, _ := m["bot_owned_by_me"].(bool)
+		flags[uid] = owned
+	}
+	return flags
+}
+
+// 移除 → 加回 的完整往返：成员身份、所有权标记、以及**再次移除**都要正常。
+//
+// 自助移除天然是可逆操作（memberAdd 的 ownership 校验允许所有者拉自己的 bot），
+// 所以「加回来之后还能不能正常用」和「移除本身」同等重要：
+//   - 成员行要真的回来（软删 + recoverMemberTx 复活，不是插新行）；
+//   - bot_owned_by_me 要恢复 true，否则前端按钮回不来，用户第二次就撤不掉了；
+//   - 再移除一次要能成功，证明这不是个一次性能力。
+func TestBotOwnerSelfRemoval_ReAddThenRemoveAgainWorks(t *testing.T) {
+	f, handler, ctx := setupBotSelfRemovalGroup(t)
+	newGroupIMStub(t, ctx)
+	_, _ = ctx.DB().InsertBySql(
+		"INSERT INTO app_config (version, invite_system_account_join_group_on) VALUES (1, 1)",
+	).Exec()
+	seedSelfRemovalBot(t, f, "bot_cycle", "cycle-bot", testutil.UID, 1)
+
+	addBack := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		body := util.ToJson(map[string]interface{}{"members": []string{"bot_cycle"}})
+		req, err := http.NewRequest("POST",
+			"/v1/groups/"+selfRemovalGroupNo+"/members", bytes.NewReader([]byte(body)))
+		require.NoError(t, err)
+		req.Header.Set("token", testutil.Token)
+		handler.ServeHTTP(w, req)
+		return w
+	}
+
+	// --- 第一轮移除 ---
+	w := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_cycle"})
+	require.Equal(t, http.StatusOK, w.Code, "首次移除应成功: %s", w.Body.String())
+	exist, err := f.db.ExistMember("bot_cycle", selfRemovalGroupNo)
+	require.NoError(t, err)
+	require.False(t, exist, "首次移除后 bot 应不在群内")
+	assert.False(t, membersGetOwnershipFlags(t, handler, selfRemovalGroupNo)["bot_cycle"],
+		"已移除的 bot 不应再出现在成员列表里并带 true")
+
+	// --- 加回来 ---
+	addW := addBack()
+	require.Equal(t, http.StatusOK, addW.Code, "所有者应能把自己的 bot 加回来: %s", addW.Body.String())
+	exist, err = f.db.ExistMember("bot_cycle", selfRemovalGroupNo)
+	require.NoError(t, err)
+	assert.True(t, exist, "加回后 bot 应重新在群内")
+
+	// 所有权标记必须恢复，否则前端按钮回不来，用户第二次就没有入口了。
+	assert.True(t, membersGetOwnershipFlags(t, handler, selfRemovalGroupNo)["bot_cycle"],
+		"加回后 bot_owned_by_me 必须恢复 true，否则移除入口一次性失效")
+
+	// --- 第二轮移除：证明这不是一次性能力 ---
+	w2 := deleteMembersReq(t, handler, selfRemovalGroupNo, []string{"bot_cycle"})
+	assert.Equal(t, http.StatusOK, w2.Code, "加回后应能再次移除: %s", w2.Body.String())
+	exist, err = f.db.ExistMember("bot_cycle", selfRemovalGroupNo)
+	require.NoError(t, err)
+	assert.False(t, exist, "第二次移除后 bot 应再次不在群内")
 }
 
 // 验收 9：自助移除同样要清理该 bot 在本群所有子区的成员身份。

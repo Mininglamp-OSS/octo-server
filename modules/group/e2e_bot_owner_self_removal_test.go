@@ -168,6 +168,110 @@ func TestE2E_BotOwnerSelfRemoval_GroupSeesTipAndBotIsUnsubscribed(t *testing.T) 
 		"对照：仍在群里的成员必须继续收到，证明摘订阅是精确按 uid 的")
 }
 
+// 移除 → 加回 之后，bot 必须**重新收到**群消息。
+//
+// 移除时会 IMRemoveSubscriber 摘掉订阅；如果加回时没有重新订阅，bot 就成了
+// 「名单上在、消息收不到」—— 和移除侧那个后置条件正好对称的失败形态，而且
+// 从数据库看一切正常（group_member 行确实回来了），只有从 IM 侧才看得出来。
+// AddGroupMembers 里确实有 IMAddSubscriber，但那是读代码；这里实测。
+func TestE2E_BotOwnerSelfRemoval_ReAddedBotReceivesMessagesAgain(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	f := New(ctx)
+	wireI18nRendererForGroupTest(s)
+	resetGroupUIDRateLimit(t, ctx)
+	_, _ = ctx.DB().InsertBySql(
+		"INSERT INTO app_config (version, invite_system_account_join_group_on) VALUES (1, 1)",
+	).Exec()
+
+	runID := time.Now().UnixNano()
+	groupNo := fmt.Sprintf("e2e_readd_%d", runID)
+	ownerUID := fmt.Sprintf("e2e_rowner_%d", runID)
+	botUID := fmt.Sprintf("e2e_rbot_%d", runID)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: testutil.UID, Name: "bot-owner", ShortNo: "e2e_rop"}))
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: ownerUID, Name: "group-owner", ShortNo: "e2e_row"}))
+	require.NoError(t, f.userDB.Insert(&user.Model{UID: botUID, Name: "回归助手", ShortNo: "e2e_rbt", Robot: 1}))
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid) VALUES (?, 1, ?)", botUID, testutil.UID,
+	).Exec()
+	require.NoError(t, err)
+
+	require.NoError(t, f.db.Insert(&Model{
+		GroupNo: groupNo, Name: "e2e re-add", Creator: ownerUID,
+		Status: GroupStatusNormal, Version: 1,
+	}))
+	seedE2EMember(t, f, groupNo, ownerUID, MemberRoleCreator, 0)
+	seedE2EMember(t, f, groupNo, testutil.UID, MemberRoleCommon, 0)
+	seedE2EMember(t, f, groupNo, botUID, MemberRoleCommon, 1)
+	require.NoError(t, ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		ChannelID: groupNo, ChannelType: ct,
+		Subscribers: []string{ownerUID, testutil.UID, botUID},
+	}))
+
+	hasGroupChannel := func(uid string) bool {
+		convs, serr := ctx.IMSyncUserConversation(uid, 0, 50, "", nil)
+		require.NoError(t, serr)
+		for _, c := range convs {
+			if c.ChannelID == groupNo && c.ChannelType == ct {
+				return true
+			}
+		}
+		return false
+	}
+	sendToGroup := func(content string) {
+		require.NoError(t, ctx.SendMessage(&config.MsgSendReq{
+			Header:      config.MsgHeader{RedDot: 1},
+			FromUID:     ownerUID,
+			ChannelID:   groupNo,
+			ChannelType: ct,
+			Payload:     []byte(`{"type":1,"content":"` + content + `"}`),
+		}))
+	}
+
+	// --- 1. 初始：bot 收得到 ---
+	sendToGroup("before")
+	time.Sleep(800 * time.Millisecond)
+	require.True(t, hasGroupChannel(botUID), "前置：bot 应收得到群消息")
+
+	// --- 2. 所有者自助移除 ---
+	rmW := httptest.NewRecorder()
+	rmBody := util.ToJson(map[string]interface{}{"members": []string{botUID}})
+	rmReq, rerr := http.NewRequest("DELETE", "/v1/groups/"+groupNo+"/members", bytes.NewReader([]byte(rmBody)))
+	require.NoError(t, rerr)
+	rmReq.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(rmW, rmReq)
+	require.Equal(t, http.StatusOK, rmW.Code, "移除应成功: %s", rmW.Body.String())
+
+	sendToGroup("while-removed")
+	time.Sleep(800 * time.Millisecond)
+	require.False(t, hasGroupChannel(botUID), "移除后 bot 不应再收到群消息")
+
+	// --- 3. 加回来 ---
+	addW := httptest.NewRecorder()
+	addBody := util.ToJson(map[string]interface{}{"members": []string{botUID}})
+	addReq, aerr := http.NewRequest("POST", "/v1/groups/"+groupNo+"/members", bytes.NewReader([]byte(addBody)))
+	require.NoError(t, aerr)
+	addReq.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(addW, addReq)
+	require.Equal(t, http.StatusOK, addW.Code, "所有者应能把自己的 bot 加回来: %s", addW.Body.String())
+
+	// --- 4. 核心断言：加回后必须**重新**收得到 ---
+	sendToGroup("after-readd")
+	received := false
+	for i := 0; i < 30; i++ {
+		received = hasGroupChannel(botUID)
+		if received {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	assert.True(t, received,
+		"加回后 bot 必须重新收到群消息，否则它只是名单上回来了、实际是聋的")
+	assert.True(t, hasGroupChannel(ownerUID), "对照：群主全程都应收得到")
+}
+
 func seedE2EMember(t *testing.T, f *Group, groupNo, uid string, role, robot int) {
 	t.Helper()
 	require.NoError(t, f.db.InsertMember(&MemberModel{
