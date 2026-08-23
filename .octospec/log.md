@@ -4,6 +4,28 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-23 (bot-owner-self-removal)
+
+- **Implemented** — 普通群成员现在可以把自己名下（`robot.creator_uid`）的 bot 移出
+  群聊。`memberRemove` 在调用方非 Creator/Manager 时落到一条窄口径自助分支：目标必须
+  **全部**是本群内属于调用方的活跃 bot，否则整批拒绝。成员列表新增 per-viewer 的
+  `bot_owned_by_me` 供前端逐行判权；「你被 X 移除群聊」换成 owner 视角的 Tip；两条
+  移除路由挂上 `SharedUIDRateLimiter`（它们现在对普通成员开放）。
+  上游 Mininglamp-OSS/octo-web#1511。
+  See [journal](journal/shared/bot-owner-self-removal.md).
+- **Guarded** — 移除侧的判据必须是默认拒绝的白名单（`QueryBotUIDsOwnedByUIDs`）。
+  复用入群侧的 `checkBotOwnership` 会是提权漏洞：它对非 bot UID 返回 nil，搬到移除侧
+  等于放开踢人权限。由 `TestBotOwnerSelfRemoval_RejectsHumanTarget` 钉死。
+- **Fixed in review** — 三处只有 code review 才抓到的问题：授权谓词漏用活跃口径，
+  让被拉黑成员拿到一个能改群成员表并写持久化 Tip 的写操作；`queryMemberWithGroupNoAndUID`
+  漏选 `group_member.robot`，使 `bot_owned_by_me` 在 memberGet 上静默恒 false；
+  前端只把 `removeAction` 透传给「查看全部」，而该入口在 19 人以下的群根本不渲染，
+  功能等于没上。
+- **Learned** — `register.GetModules` 用进程级 `sync.Once` 构造模块实例，一个测试
+  二进制里 handler 永远持有第一个 `NewTestServer` 的 ctx。因此对系统消息的断言必须
+  走 service 层，走 HTTP 路由时 IM 桩只对进程内第一个测试生效（表现为「单独跑绿、
+  一起跑红」）。候选规则见 `learnings/pending/bot-owner-self-removal.md`。
+
 ## 2026-08-21 (space-member-removal-cleanup)
 
 - **Implemented** — Space member removal now takes the member out of the Space's
