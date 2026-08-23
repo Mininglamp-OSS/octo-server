@@ -1,6 +1,7 @@
 # Coverage boundary: this contract starts from reviewed octo-admin platform
-# operations, then traces their CheckLoginRole, CheckLoginRoleIsSuperAdmin, or
-# CanReadManagerDashboard gate sites. A matching gate shape alone never admits a
+# operations, then traces their legacy CheckLoginRole,
+# CheckLoginRoleIsSuperAdmin, CanReadManagerDashboard, or migrated
+# requirePermission sites. A matching gate shape alone never admits a
 # route. Pure Space/Group/Robot business ACL routes, user-owned
 # /v1/manager/secrets/** routes, and legacy /v1/statistics/** routes remain
 # outside this contract.
@@ -919,75 +920,75 @@ gate_sites:
   - source: modules/workplace/api_manager.go::manager.addApp#1
     module: workplace
     symbol: manager.addApp
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.addBanner#1
     module: workplace
     symbol: manager.addBanner
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.addCategory#1
     module: workplace
     symbol: manager.addCategory
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.addCategoryApp#1
     module: workplace
     symbol: manager.addCategoryApp
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.deleteApp#1
     module: workplace
     symbol: manager.deleteApp
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.deleteBanner#1
     module: workplace
     symbol: manager.deleteBanner
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.deleteCategory#1
     module: workplace
     symbol: manager.deleteCategory
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.deleteCategoryApp#1
     module: workplace
     symbol: manager.deleteCategoryApp
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.getApps#1
     module: workplace
     symbol: manager.getApps
-    legacy_gate: admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.getBanners#1
     module: workplace
     symbol: manager.getBanners
-    legacy_gate: admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.getCategory#1
     module: workplace
     symbol: manager.getCategory
-    legacy_gate: admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.getCategoryApps#1
     module: workplace
     symbol: manager.getCategoryApps
-    legacy_gate: admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.reorderBanner#1
     module: workplace
     symbol: manager.reorderBanner
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.reorderCategory#1
     module: workplace
     symbol: manager.reorderCategory
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.reorderCategoryApp#1
     module: workplace
     symbol: manager.reorderCategoryApp
-    legacy_gate: admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.updateApp#1
     module: workplace
     symbol: manager.updateApp
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.updateBanner#1
     module: workplace
     symbol: manager.updateBanner
-    legacy_gate: super_admin
+    legacy_gate: rbac
   - source: modules/workplace/api_manager.go::manager.updateCategory#1
     module: workplace
     symbol: manager.updateCategory
-    legacy_gate: super_admin
+    legacy_gate: rbac
 operations:
   - id: app_bot.create
     method: POST

@@ -11,6 +11,7 @@ type fakePermissionCache struct {
 	values    map[string]string
 	deleted   []string
 	deleteErr error
+	getErr    error
 }
 
 func newFakePermissionCache() *fakePermissionCache {
@@ -36,9 +37,12 @@ func (f *fakePermissionCache) SetAndExpire(key, value string, _ time.Duration) e
 }
 
 func (f *fakePermissionCache) Get(key string) (string, error) {
+	if f.getErr != nil {
+		return "", f.getErr
+	}
 	value, ok := f.values[key]
 	if !ok {
-		return "", errors.New("cache miss")
+		return "", nil
 	}
 	return value, nil
 }
@@ -86,6 +90,17 @@ func TestPermissionCacheInvalidationSurfacesDeleteFailure(t *testing.T) {
 	}
 	if err := permissionCache.InvalidateRole("reader"); err == nil {
 		t.Fatal("InvalidateRole succeeded, want cache error")
+	}
+}
+
+func TestPermissionCacheReadFailureIsNotTreatedAsMiss(t *testing.T) {
+	backend := newFakePermissionCache()
+	backend.getErr = errors.New("redis unavailable")
+	permissionCache := NewPermissionCache(backend)
+
+	_, ok, err := permissionCache.Get("u1", nil)
+	if err == nil || ok {
+		t.Fatalf("Get = (ok=%v, err=%v), want cache error and no hit", ok, err)
 	}
 }
 

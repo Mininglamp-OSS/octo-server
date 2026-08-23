@@ -80,8 +80,9 @@ func TestRepositoryPermissionContract(t *testing.T) {
 	for _, gate := range platformGates {
 		gateKinds[gate.LegacyGate]++
 	}
-	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 95 || gateKinds[LegacyGateDashboardReadPolicy] != 1 {
-		t.Fatalf("platform gate kinds = %#v, want 95 direct legacy and 1 dashboard-read-policy gate", gateKinds)
+	if gateKinds[LegacyGateAdmin]+gateKinds[LegacyGateSuperAdmin] != 77 ||
+		gateKinds[LegacyGateRBAC] != 18 || gateKinds[LegacyGateDashboardReadPolicy] != 1 {
+		t.Fatalf("platform gate kinds = %#v, want 77 direct legacy, 18 RBAC and 1 dashboard-read-policy gate", gateKinds)
 	}
 	assertGlobalOperationBoundary(t, manifest)
 	assertSensitiveTaxonomy(t, manifest)
@@ -223,14 +224,14 @@ func assertSensitiveTaxonomy(t *testing.T, manifest *Manifest) {
 		}
 	}
 	if tiers := tiersByPermission["workplace.category_app.reorder"]; len(tiers) != 1 {
-		t.Errorf("workplace.category_app.reorder gate tiers = %v, want admin only", tiers)
-	} else if _, ok := tiers[LegacyGateAdmin]; !ok {
-		t.Errorf("workplace.category_app.reorder gate tiers = %v, want admin only", tiers)
+		t.Errorf("workplace.category_app.reorder gate tiers = %v, want RBAC only", tiers)
+	} else if _, ok := tiers[LegacyGateRBAC]; !ok {
+		t.Errorf("workplace.category_app.reorder gate tiers = %v, want RBAC only", tiers)
 	}
 	if tiers := tiersByPermission["workplace.app.write"]; len(tiers) != 1 {
-		t.Errorf("workplace.app.write gate tiers = %v, want super_admin only", tiers)
-	} else if _, ok := tiers[LegacyGateSuperAdmin]; !ok {
-		t.Errorf("workplace.app.write gate tiers = %v, want super_admin only", tiers)
+		t.Errorf("workplace.app.write gate tiers = %v, want RBAC only", tiers)
+	} else if _, ok := tiers[LegacyGateRBAC]; !ok {
+		t.Errorf("workplace.app.write gate tiers = %v, want RBAC only", tiers)
 	}
 }
 

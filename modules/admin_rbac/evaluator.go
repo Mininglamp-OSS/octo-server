@@ -32,12 +32,10 @@ func Evaluate(uid string, snapshots []RoleSnapshot) (EffectivePermissions, error
 	return result, nil
 }
 
-// Allows answers a global permission question. Any resource selector is
-// rejected instead of being silently treated as a global allow.
-func Allows(result EffectivePermissions, permissionKey string, groupNo, spaceID, robotID, resourceID string) (bool, error) {
-	if err := validateGlobalScope(groupNo, spaceID, robotID, resourceID); err != nil {
-		return false, err
-	}
+// allowsEffective answers a global permission question against an already
+// evaluated snapshot. Resource selectors are intentionally absent: this
+// capability only makes global octo-admin decisions.
+func allowsEffective(result EffectivePermissions, permissionKey string) (bool, error) {
 	if err := validatePermissionKey(permissionKey); err != nil {
 		return false, err
 	}

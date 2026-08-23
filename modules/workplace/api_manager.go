@@ -1,6 +1,7 @@
 package workplace
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -22,51 +23,72 @@ import (
 type manager struct {
 	ctx *config.Context
 	log.Log
-	db     *managerDB
-	wpDB   *db
-	shadow workplaceShadowObserver
+	db               *managerDB
+	wpDB             *db
+	rbac             *adminrbac.Service
+	rbacBootstrapErr error
 }
-
-type workplaceShadowObserver interface {
-	Observe(uid, operationID string, legacyAllowed bool)
-}
-
-const (
-	workplaceOperationCategoryCreate     = "workplace.category.create"
-	workplaceOperationCategoryList       = "workplace.category.list"
-	workplaceOperationCategoryReorder    = "workplace.category.reorder"
-	workplaceOperationCategoryDelete     = "workplace.category.delete"
-	workplaceOperationCategoryUpdate     = "workplace.category.update"
-	workplaceOperationCategoryAppList    = "workplace.category_app.list"
-	workplaceOperationCategoryAppReorder = "workplace.category_app.reorder"
-	workplaceOperationCategoryAppCreate  = "workplace.category_app.create"
-	workplaceOperationCategoryAppDelete  = "workplace.category_app.delete"
-	workplaceOperationAppCreate          = "workplace.app.create"
-	workplaceOperationAppList            = "workplace.app.list"
-	workplaceOperationAppUpdate          = "workplace.app.update"
-	workplaceOperationAppDelete          = "workplace.app.delete"
-	workplaceOperationBannerCreate       = "workplace.banner.create"
-	workplaceOperationBannerList         = "workplace.banner.list"
-	workplaceOperationBannerDelete       = "workplace.banner.delete"
-	workplaceOperationBannerUpdate       = "workplace.banner.update"
-	workplaceOperationBannerReorder      = "workplace.banner.reorder"
-)
 
 func NewManager(ctx *config.Context) *manager {
-	return &manager{
-		ctx:    ctx,
-		Log:    log.NewTLog("Workplace_manager"),
-		db:     newManagerDB(ctx),
-		wpDB:   newDB(ctx),
-		shadow: adminrbac.NewWorkplaceShadowObserver(ctx),
+	rbac := adminrbac.NewService(adminrbac.NewStore(ctx.DB()), adminrbac.NewPermissionCache(ctx.Cache()))
+	m := &manager{
+		ctx:  ctx,
+		Log:  log.NewTLog("Workplace_manager"),
+		db:   newManagerDB(ctx),
+		wpDB: newDB(ctx),
+		rbac: rbac,
 	}
+	if err := rbac.BootstrapWorkplace(); err != nil {
+		m.rbacBootstrapErr = err
+		m.Error("初始化 Workplace RBAC 失败", zap.Error(err))
+	}
+	return m
 }
 
-func (m *manager) observeWorkplaceShadow(c *wkhttp.Context, operationID string, legacyErr error) {
-	if m.shadow == nil || c == nil {
-		return
+// requirePermission is the sole authorization gate for the migrated
+// Workplace manager operations. Authentication remains on the route group;
+// this helper only evaluates the server-fixed global RBAC permission.
+func (m *manager) requirePermission(c *wkhttp.Context, permissionKey string) bool {
+	if m.rbacBootstrapErr != nil {
+		m.Error("Workplace RBAC 未完成初始化，拒绝请求",
+			zap.String("uid", c.GetLoginUID()), zap.String("permission", permissionKey),
+			zap.Error(m.rbacBootstrapErr))
+		respondWorkplaceInternal(c)
+		return false
 	}
-	m.shadow.Observe(c.GetLoginUID(), operationID, legacyErr == nil)
+	allowed, err := m.rbac.Allows(c.GetLoginUID(), permissionKey)
+	if err != nil {
+		m.Error("workplace RBAC permission check failed",
+			zap.String("uid", c.GetLoginUID()),
+			zap.String("permission", permissionKey),
+			zap.String("error_category", workplaceRBACErrorCategory(err)))
+		if errors.Is(err, adminrbac.ErrInvalidPermission) ||
+			errors.Is(err, adminrbac.ErrInvalidRequest) ||
+			errors.Is(err, adminrbac.ErrUserNotFound) {
+			respondWorkplaceForbidden(c)
+		} else {
+			respondWorkplaceInternal(c)
+		}
+		return false
+	}
+	if !allowed {
+		respondWorkplaceForbidden(c)
+		return false
+	}
+	return true
+}
+
+func workplaceRBACErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, adminrbac.ErrInvalidPermission):
+		return "invalid_permission"
+	case errors.Is(err, adminrbac.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, adminrbac.ErrUserNotFound):
+		return "principal_not_found"
+	default:
+		return "evaluation_failed"
+	}
 }
 
 // Route 路由配置
@@ -96,10 +118,7 @@ func (m *manager) Route(r *wkhttp.WKHttp) {
 
 // 排序横幅
 func (m *manager) reorderBanner(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationBannerReorder, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionBannerWrite) {
 		return
 	}
 	type reqVO struct {
@@ -146,10 +165,7 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 
 // 编辑分类
 func (m *manager) updateCategory(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryUpdate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryWrite) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -188,10 +204,7 @@ func (m *manager) updateCategory(c *wkhttp.Context) {
 
 // 删除分类
 func (m *manager) deleteCategory(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryDelete, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryWrite) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -199,7 +212,7 @@ func (m *manager) deleteCategory(c *wkhttp.Context) {
 		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
-	err = m.db.deleteCategory(categoryNo)
+	err := m.db.deleteCategory(categoryNo)
 	if err != nil {
 		m.Error("删除分类错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
@@ -209,10 +222,7 @@ func (m *manager) deleteCategory(c *wkhttp.Context) {
 }
 
 func (m *manager) getApps(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
-	m.observeWorkplaceShadow(c, workplaceOperationAppList, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppRead) {
 		return
 	}
 	page := c.Query("page_index")
@@ -222,6 +232,7 @@ func (m *manager) getApps(c *wkhttp.Context) {
 	pageSize, _ := strconv.Atoi(size)
 	var apps []*appModel
 	var count int64
+	var err error
 	if keyword == "" {
 		apps, err = m.db.queryAppWithPage(uint64(pageSize), uint64(pageIndex))
 		if err != nil {
@@ -274,10 +285,7 @@ func (m *manager) getApps(c *wkhttp.Context) {
 }
 
 func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppDelete, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppWrite) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -290,7 +298,7 @@ func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
-	err = m.db.deleteCategoryApp(appId, categoryNo)
+	err := m.db.deleteCategoryApp(appId, categoryNo)
 	if err != nil {
 		m.Error("删除分类下app错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
@@ -300,10 +308,7 @@ func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 }
 
 func (m *manager) addCategoryApp(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppCreate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppWrite) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -406,10 +411,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppReorder, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryAppReorder) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -464,10 +466,7 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 }
 
 func (m *manager) getCategoryApps(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryAppList, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppRead) {
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -504,10 +503,7 @@ func (m *manager) getCategoryApps(c *wkhttp.Context) {
 }
 
 func (m *manager) updateBanner(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationBannerUpdate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionBannerWrite) {
 		return
 	}
 	bannerNo := c.Param("banner_no")
@@ -529,7 +525,7 @@ func (m *manager) updateBanner(c *wkhttp.Context) {
 		respondWorkplaceRequestInvalid(c, "cover")
 		return
 	}
-	err = m.db.updateBanner(&bannerModel{
+	err := m.db.updateBanner(&bannerModel{
 		BannerNo:    bannerNo,
 		Cover:       req.Cover,
 		Title:       req.Title,
@@ -546,10 +542,7 @@ func (m *manager) updateBanner(c *wkhttp.Context) {
 }
 
 func (m *manager) getBanners(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
-	m.observeWorkplaceShadow(c, workplaceOperationBannerList, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionBannerRead) {
 		return
 	}
 	banners, err := m.wpDB.queryBanner()
@@ -577,10 +570,7 @@ func (m *manager) getBanners(c *wkhttp.Context) {
 }
 
 func (m *manager) deleteBanner(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationBannerDelete, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionBannerWrite) {
 		return
 	}
 	bannerNo := c.Param("banner_no")
@@ -588,7 +578,7 @@ func (m *manager) deleteBanner(c *wkhttp.Context) {
 		respondWorkplaceRequestInvalid(c, "banner_no")
 		return
 	}
-	err = m.db.deleteBanner(bannerNo)
+	err := m.db.deleteBanner(bannerNo)
 	if err != nil {
 		m.Error("删除横幅错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
@@ -598,10 +588,7 @@ func (m *manager) deleteBanner(c *wkhttp.Context) {
 }
 
 func (m *manager) getCategory(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryList, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryRead) {
 		return
 	}
 	list := make([]*categoryResp, 0)
@@ -624,10 +611,7 @@ func (m *manager) getCategory(c *wkhttp.Context) {
 }
 
 func (m *manager) addBanner(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationBannerCreate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionBannerWrite) {
 		return
 	}
 	var req bannerReq
@@ -644,7 +628,7 @@ func (m *manager) addBanner(c *wkhttp.Context) {
 		respondWorkplaceRequestInvalid(c, "cover")
 		return
 	}
-	err = m.db.insertBanner(&bannerModel{
+	err := m.db.insertBanner(&bannerModel{
 		BannerNo:    util.GenerUUID(),
 		Cover:       req.Cover,
 		Title:       req.Title,
@@ -660,10 +644,7 @@ func (m *manager) addBanner(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 func (m *manager) updateApp(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationAppUpdate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppWrite) {
 		return
 	}
 	appId := c.Param("app_id")
@@ -710,10 +691,7 @@ func (m *manager) updateApp(c *wkhttp.Context) {
 }
 
 func (m *manager) deleteApp(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationAppDelete, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppWrite) {
 		return
 	}
 	appId := c.Param("app_id")
@@ -781,10 +759,7 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 }
 
 func (m *manager) reorderCategory(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryReorder, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryWrite) {
 		return
 	}
 	type reqVO struct {
@@ -830,10 +805,7 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 }
 
 func (m *manager) addApp(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationAppCreate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionAppWrite) {
 		return
 	}
 	var req appReq
@@ -878,10 +850,7 @@ func (m *manager) addApp(c *wkhttp.Context) {
 }
 
 func (m *manager) addCategory(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	m.observeWorkplaceShadow(c, workplaceOperationCategoryCreate, err)
-	if err != nil {
-		respondWorkplaceForbidden(c)
+	if !m.requirePermission(c, adminrbac.WorkplacePermissionCategoryWrite) {
 		return
 	}
 	type reqVO struct {

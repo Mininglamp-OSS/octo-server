@@ -43,7 +43,10 @@ func (c *PermissionCache) Get(uid string, roleVersions []RoleVersion) (Effective
 		return EffectivePermissions{}, false, nil
 	}
 	raw, err := c.cache.Get(c.userKey(uid))
-	if err != nil || raw == "" {
+	if err != nil {
+		return EffectivePermissions{}, false, err
+	}
+	if raw == "" {
 		return EffectivePermissions{}, false, nil
 	}
 	var envelope cacheEnvelope

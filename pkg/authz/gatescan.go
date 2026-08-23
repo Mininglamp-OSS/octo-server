@@ -17,6 +17,7 @@ type ScannedGate struct {
 	Module     string
 	Symbol     string
 	LegacyGate LegacyGate
+	Permission string
 	Line       int
 }
 
@@ -124,7 +125,11 @@ func ScanDirectGates(repositoryRoot string) ([]ScannedGate, error) {
 			}
 			symbol := functionSymbol(function)
 			ordinal := 0
+			var scanErr error
 			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if scanErr != nil {
+					return false
+				}
 				call, ok := node.(*ast.CallExpr)
 				if !ok {
 					return true
@@ -140,9 +145,21 @@ func ScanDirectGates(repositoryRoot string) ([]ScannedGate, error) {
 				ordinal++
 				line := fset.Position(call.Pos()).Line
 				source := fmt.Sprintf("%s::%s#%d", filepath.ToSlash(relative), symbol, ordinal)
-				gates = append(gates, ScannedGate{Source: source, Module: module, Symbol: symbol, LegacyGate: legacyGate, Line: line})
+				permission := ""
+				if legacyGate == LegacyGateRBAC {
+					var resolved bool
+					permission, resolved = rbacPermissionFromCall(call)
+					if !resolved {
+						scanErr = fmt.Errorf("%s:%d: requirePermission must use a recognized fixed permission", filepath.ToSlash(relative), line)
+						return false
+					}
+				}
+				gates = append(gates, ScannedGate{Source: source, Module: module, Symbol: symbol, LegacyGate: legacyGate, Permission: permission, Line: line})
 				return true
 			})
+			if scanErr != nil {
+				return scanErr
+			}
 		}
 		return nil
 	})
@@ -225,8 +242,46 @@ func directGate(name string) (LegacyGate, bool) {
 		return LegacyGateSuperAdmin, true
 	case "CanReadManagerDashboard":
 		return LegacyGateDashboardReadPolicy, true
+	case "requirePermission":
+		return LegacyGateRBAC, true
 	default:
 		return "", false
+	}
+}
+
+func rbacPermissionFromCall(call *ast.CallExpr) (string, bool) {
+	if call == nil || len(call.Args) < 2 {
+		return "", false
+	}
+	argument := call.Args[1]
+	if literal, ok := argument.(*ast.BasicLit); ok && literal.Kind == token.STRING {
+		value := strings.Trim(literal.Value, "\"")
+		return value, knownRBACPermission(value)
+	}
+	selector, ok := argument.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	permissions := map[string]string{
+		"WorkplacePermissionAppRead":            "workplace.app.read",
+		"WorkplacePermissionAppWrite":           "workplace.app.write",
+		"WorkplacePermissionBannerRead":         "workplace.banner.read",
+		"WorkplacePermissionBannerWrite":        "workplace.banner.write",
+		"WorkplacePermissionCategoryRead":       "workplace.category.read",
+		"WorkplacePermissionCategoryWrite":      "workplace.category.write",
+		"WorkplacePermissionCategoryAppReorder": "workplace.category_app.reorder",
+	}
+	permission, ok := permissions[selector.Sel.Name]
+	return permission, ok
+}
+
+func knownRBACPermission(permission string) bool {
+	switch permission {
+	case "workplace.app.read", "workplace.app.write", "workplace.banner.read", "workplace.banner.write",
+		"workplace.category.read", "workplace.category.write", "workplace.category_app.reorder":
+		return true
+	default:
+		return false
 	}
 }
 

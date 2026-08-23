@@ -271,6 +271,25 @@ func (s *Service) EffectivePermissions(uid string) (EffectivePermissions, error)
 	return result, nil
 }
 
+// Allows answers one global permission question for the current principal.
+// The UID is supplied by the authenticated caller and the permission key is
+// supplied by server-side handler code; no operation, resource, or client
+// supplied scope participates in the decision.
+func (s *Service) Allows(uid, permissionKey string) (bool, error) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return false, ErrInvalidRequest
+	}
+	if err := validatePermissionKey(permissionKey); err != nil {
+		return false, err
+	}
+	result, err := s.EffectivePermissions(uid)
+	if err != nil {
+		return false, err
+	}
+	return allowsEffective(result, permissionKey)
+}
+
 func (s *Service) invalidateUser(uid string) error {
 	if err := s.cache.InvalidateUser(uid); err != nil {
 		zap.L().Error("admin rbac cache invalidation failed",

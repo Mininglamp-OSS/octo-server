@@ -13,4 +13,5 @@ var (
 	ErrNotFound          = errors.New("admin rbac: binding not found")
 	ErrCacheInvalidation = errors.New("admin rbac: cache invalidation failed")
 	ErrInvalidRequest    = errors.New("admin rbac: invalid request")
+	ErrBootstrapConflict = errors.New("admin rbac: workplace bootstrap conflict")
 )

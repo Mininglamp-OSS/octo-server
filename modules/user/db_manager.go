@@ -159,11 +159,36 @@ func (m *managerDB) deleteUserWithUIDAndRole(uid, role string) error {
 	return err
 }
 
+func (m *managerDB) deleteUserWithUIDAndRoleTx(tx *dbr.Tx, uid, role string) (bool, error) {
+	result, err := tx.DeleteFrom("user").Where("uid=? and role=?", uid, role).Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 // updateUserRole changes role only if it still equals expectedRole. The
 // compare-and-set prevents a concurrent promotion to SuperAdmin from being
 // overwritten by the temporary dashboardReader grant/revoke path.
 func (m *managerDB) updateUserRole(uid, expectedRole, nextRole string) (bool, error) {
 	result, err := m.session.Update("user").Set("role", nextRole).
+		Where("uid=? and role=?", uid, expectedRole).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+
+func (m *managerDB) updateUserRoleTx(tx *dbr.Tx, uid, expectedRole, nextRole string) (bool, error) {
+	result, err := tx.Update("user").Set("role", nextRole).
 		Where("uid=? and role=?", uid, expectedRole).Exec()
 	if err != nil {
 		return false, err

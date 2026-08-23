@@ -22,15 +22,16 @@ const (
 )
 
 // ScannedRoute is a statically registered HTTP route whose handler reaches one
-// or more direct legacy gates in the same package.
+// or more recognized legacy or RBAC enforcement sites in the same package.
 type ScannedRoute struct {
-	Method    string
-	Path      string
-	Module    string
-	Handler   string
-	GateSites []string
-	Source    string
-	Line      int
+	Method     string
+	Path       string
+	Module     string
+	Handler    string
+	GateSites  []string
+	Permission string
+	Source     string
+	Line       int
 }
 
 // RouteBoundaryExclusion classifies a route that reaches a legacy gate through
@@ -227,6 +228,14 @@ func ValidateRouteCoverage(routes []ScannedRoute, operations []Operation, exclus
 		if route.Module != operation.Module {
 			return fmt.Errorf("operation %q module drift for %s %s: source=%q manifest=%q", operation.ID, route.Method, route.Path, route.Module, operation.Module)
 		}
+		if operation.Module == "workplace" {
+			if route.Permission == "" {
+				return fmt.Errorf("operation %q has no fixed RBAC permission at handler %s", operation.ID, route.Handler)
+			}
+			if route.Permission != operation.Permission {
+				return fmt.Errorf("operation %q permission drift for %s %s: source=%q manifest=%q", operation.ID, route.Method, route.Path, route.Permission, operation.Permission)
+			}
+		}
 		if !equalStringSets(route.GateSites, operation.GateSites) {
 			return fmt.Errorf("operation %q gate-site drift for %s %s: source=%v manifest=%v", operation.ID, route.Method, route.Path, route.GateSites, operation.GateSites)
 		}
@@ -361,7 +370,7 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 	var routes []ScannedRoute
 	for _, function := range routeFunctions {
 		routeSymbols[function.symbol] = struct{}{}
-		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, true, false, requireGatedPlatformRoutes)
+		functionRoutes, err := scanRouteFunction(fset, module, function, functions, reachable, gates, true, false, requireGatedPlatformRoutes)
 		if err != nil {
 			return nil, err
 		}
@@ -377,7 +386,7 @@ func scanRouteDirectory(repositoryRoot, relativeDirectory string, gates []Scanne
 			continue
 		}
 		_, platformContext := platformDelegates[symbol]
-		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, false, platformContext, requireGatedPlatformRoutes); err != nil {
+		if _, err := scanRouteFunction(fset, module, functions[symbol], functions, reachable, gates, false, platformContext, requireGatedPlatformRoutes); err != nil {
 			return nil, err
 		}
 	}
@@ -490,7 +499,7 @@ func buildPackageCallGraph(functions map[string]scannedFunction) map[string][]st
 	return edges
 }
 
-func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, allowRegistration, platformContext, requireGatedPlatformRoutes bool) ([]ScannedRoute, error) {
+func scanRouteFunction(fset *token.FileSet, module string, function scannedFunction, functions map[string]scannedFunction, reachable map[string][]string, gates []ScannedGate, allowRegistration, platformContext, requireGatedPlatformRoutes bool) ([]ScannedRoute, error) {
 	prefixes := make(map[string]string)
 	receiverAliases := receiverAliasSet(function)
 	for _, field := range function.parameters {
@@ -622,9 +631,22 @@ func scanRouteFunction(fset *token.FileSet, module string, function scannedFunct
 		if !platformRoute {
 			return true
 		}
+		permission := ""
+		for _, source := range platformGateSites(selector.Sel.Name, fullPath, handler, gateSites) {
+			for _, gate := range gates {
+				if gate.Source == source && gate.LegacyGate == LegacyGateRBAC {
+					if permission != "" && permission != gate.Permission {
+						scanErr = fmt.Errorf("%s:%d: handler %s has multiple RBAC permissions", function.file, position.Line, handler)
+						return false
+					}
+					permission = gate.Permission
+				}
+			}
+		}
 		routes = append(routes, ScannedRoute{
 			Method: selector.Sel.Name, Path: fullPath, Module: module,
-			Handler: handler, GateSites: platformGateSites(selector.Sel.Name, fullPath, handler, gateSites), Source: function.file, Line: position.Line,
+			Handler: handler, GateSites: platformGateSites(selector.Sel.Name, fullPath, handler, gateSites),
+			Permission: permission, Source: function.file, Line: position.Line,
 		})
 		return true
 	})

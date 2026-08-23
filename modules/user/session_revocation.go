@@ -104,7 +104,7 @@ func (d *DB) destroyAccountWithSessionRevocation(ctx context.Context, uid, usern
 	})
 }
 
-func (d *DB) deleteAdminWithSessionRevocation(ctx context.Context, uid, role string) (*sessionRevocationIntent, error) {
+func (d *DB) deleteAdminWithSessionRevocation(ctx context.Context, uid, role string, afterDelete func(*dbr.Tx) error) (*sessionRevocationIntent, error) {
 	return d.mutateWithSessionRevocation(ctx, uid, "admin_delete", func(ctx context.Context, tx *dbr.Tx) error {
 		result, err := tx.DeleteFrom("user").Where("uid=? AND role=?", uid, role).ExecContext(ctx)
 		if err != nil {
@@ -116,6 +116,11 @@ func (d *DB) deleteAdminWithSessionRevocation(ctx context.Context, uid, role str
 		}
 		if affected == 0 {
 			return errors.New("user: admin revocation target not found")
+		}
+		if afterDelete != nil {
+			if err := afterDelete(tx); err != nil {
+				return fmt.Errorf("delete admin RBAC synchronization: %w", err)
+			}
 		}
 		return nil
 	})

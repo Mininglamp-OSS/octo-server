@@ -25,6 +25,7 @@ const (
 	LegacyGateAdmin               LegacyGate = "admin"
 	LegacyGateSuperAdmin          LegacyGate = "super_admin"
 	LegacyGateDashboardReadPolicy LegacyGate = "dashboard_read_policy"
+	LegacyGateRBAC                LegacyGate = "rbac"
 )
 
 type Scope string
@@ -256,7 +257,7 @@ func validateEnums(manifest *Manifest) error {
 		}
 	}
 	for i, gate := range manifest.GateSites {
-		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateDashboardReadPolicy)) {
+		if !oneOf(string(gate.LegacyGate), string(LegacyGateAdmin), string(LegacyGateSuperAdmin), string(LegacyGateDashboardReadPolicy), string(LegacyGateRBAC)) {
 			return fmt.Errorf("gate_sites[%d].legacy_gate: invalid value %q", i, gate.LegacyGate)
 		}
 	}

@@ -236,6 +236,54 @@ func TestEffectivePermissionsCacheHitSkipsPermissionJoin(t *testing.T) {
 	}
 }
 
+func TestAllowsLoadsEffectivePermissionsByUID(t *testing.T) {
+	service, mock, _ := newMockService(t)
+
+	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='u1'").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT .*authorization_version.*FROM .*admin_rbac_user_role.*").
+		WillReturnRows(sqlmock.NewRows([]string{"role_key", "authorization_version"}).AddRow("workplace.admin", 1))
+	mock.ExpectQuery("SELECT .*COALESCE.*FROM .*admin_rbac_user_role.*").
+		WillReturnRows(sqlmock.NewRows([]string{"role_id", "role_key", "role_status", "authorization_version", "permission_key"}).
+			AddRow(7, "workplace.admin", activeStatus, 1, "workplace.app.read"))
+
+	allowed, err := service.Allows("u1", "workplace.app.read")
+	if err != nil || !allowed {
+		t.Fatalf("Allows = (%v, %v), want (true, nil)", allowed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
+func TestAllowsRejectsUnknownPermissionBeforeDatabaseRead(t *testing.T) {
+	service, mock, _ := newMockService(t)
+	if allowed, err := service.Allows("u1", "unknown.permission"); allowed || !errors.Is(err, ErrInvalidPermission) {
+		t.Fatalf("Allows unknown permission = (%v, %v), want (false, ErrInvalidPermission)", allowed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected SQL: %v", err)
+	}
+}
+
+func TestAllowsFailsClosedWhenPermissionCacheReadFails(t *testing.T) {
+	service, mock, backend := newMockService(t)
+	backend.getErr = errors.New("redis unavailable")
+
+	mock.ExpectQuery("SELECT COUNT.*FROM .*user.*uid='u1'").
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(1))
+	mock.ExpectQuery("SELECT .*authorization_version.*FROM .*admin_rbac_user_role.*").
+		WillReturnRows(sqlmock.NewRows([]string{"role_key", "authorization_version"}).AddRow("workplace.admin", 1))
+
+	allowed, err := service.Allows("u1", "workplace.app.read")
+	if allowed || err == nil {
+		t.Fatalf("Allows on cache failure = (%v, %v), want deny with error", allowed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("SQL expectations: %v", err)
+	}
+}
+
 func TestUpdateRoleInvalidatesBeforeReadback(t *testing.T) {
 	service, mock, backend := newMockService(t)
 	now := time.Now()

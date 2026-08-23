@@ -31,16 +31,16 @@ func TestEvaluateRejectsUnknownPermission(t *testing.T) {
 	}
 }
 
-func TestAllowsRejectsBusinessResourceScope(t *testing.T) {
+func TestAllowsEffectiveUsesOnlyThePermissionKey(t *testing.T) {
 	result, err := Evaluate("u1", []RoleSnapshot{{RoleKey: "reader", Status: activeStatus, Permissions: []string{"user.read"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Allows(result, "user.read", "group-1", "", "", ""); !errors.Is(err, ErrInvalidScope) {
-		t.Fatalf("error = %v, want ErrInvalidScope", err)
-	}
-	allowed, err := Allows(result, "user.read", "", "", "", "")
+	allowed, err := allowsEffective(result, "user.read")
 	if err != nil || !allowed {
 		t.Fatalf("global permission = (%v, %v), want (true, nil)", allowed, err)
+	}
+	if allowed, err := allowsEffective(result, "unknown.permission"); allowed || err != ErrInvalidPermission {
+		t.Fatalf("unknown permission = (%v, %v), want (false, ErrInvalidPermission)", allowed, err)
 	}
 }

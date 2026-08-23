@@ -25,7 +25,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	adminrbac "github.com/Mininglamp-OSS/octo-server/modules/admin_rbac"
 	rd "github.com/go-redis/redis"
+	"github.com/gocraft/dbr/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -41,20 +43,23 @@ const (
 type Manager struct {
 	ctx *config.Context
 	log.Log
-	db            *managerDB
-	userDB        *DB
-	userSettingDB *SettingDB
-	deviceDB      *deviceDB
-	friendDB      *friendDB
-	onlineService IOnlineService
-	commonService common2.IService
-	roleService   *RoleService
-	sessionStore  userSessionStore
-	loginLog      *LoginLog
+	db               *managerDB
+	userDB           *DB
+	userSettingDB    *SettingDB
+	deviceDB         *deviceDB
+	friendDB         *friendDB
+	onlineService    IOnlineService
+	commonService    common2.IService
+	roleService      *RoleService
+	rbac             *adminrbac.Service
+	rbacBootstrapErr error
+	sessionStore     userSessionStore
+	loginLog         *LoginLog
 }
 
 // NewManager NewManager
 func NewManager(ctx *config.Context) *Manager {
+	rbac := adminrbac.NewService(adminrbac.NewStore(ctx.DB()), adminrbac.NewPermissionCache(ctx.Cache()))
 	m := &Manager{
 		ctx:           ctx,
 		Log:           log.NewTLog("userManager"),
@@ -66,10 +71,15 @@ func NewManager(ctx *config.Context) *Manager {
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
+		rbac:          rbac,
 		sessionStore:  auth.SessionStoreForContext(ctx),
 		loginLog:      NewLoginLog(ctx),
 	}
 	m.createManagerAccount()
+	if err := rbac.BootstrapWorkplace(); err != nil {
+		m.rbacBootstrapErr = err
+		m.Error("初始化 Workplace RBAC 失败", zap.Error(err))
+	}
 	return m
 }
 
@@ -521,7 +531,15 @@ func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligible
 		return
 	}
 
-	updated, err := m.db.updateUserRole(target.UID, target.Role, nextRole)
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("begin fixed manager role transaction failed",
+			zap.Error(err), zap.String("role", role), zap.String("target_uid", target.UID))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+	updated, err := m.db.updateUserRoleTx(tx, target.UID, target.Role, nextRole)
 	if err != nil {
 		m.Error("update fixed manager role failed",
 			zap.Error(err),
@@ -542,6 +560,19 @@ func (m *Manager) setFixedManagerRole(c *wkhttp.Context, role string, ineligible
 			zap.String("expected_role", target.Role),
 			zap.Bool("grant", grant))
 		respondUserError(c, errcode.ErrUserManagerRoleChanged)
+		return
+	}
+	if err := m.syncWorkplaceRoleTx(tx, target.UID, nextRole); err != nil {
+		m.Error("sync fixed manager Workplace RBAC binding failed",
+			zap.Error(err), zap.String("role", role), zap.String("target_uid", target.UID),
+			zap.Bool("grant", grant))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		m.Error("commit fixed manager role transaction failed",
+			zap.Error(err), zap.String("role", role), zap.String("target_uid", target.UID))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	m.finishFixedManagerRoleRequest(c, role, target.UID, grant, true)
@@ -572,8 +603,36 @@ func fixedManagerRoleGrantEligible(target *Model) bool {
 		target.Status == StatusEnable.Int() && target.IsDestroy == IsDestroyNo
 }
 
+func (m *Manager) syncWorkplaceRoleTx(tx *dbr.Tx, uid, role string) error {
+	if m.rbacBootstrapErr != nil {
+		return m.rbacBootstrapErr
+	}
+	if role == string(wkhttp.Admin) || role == string(wkhttp.SuperAdmin) {
+		_, err := m.rbac.SyncManagerRoleTx(tx, uid, role)
+		return err
+	}
+	_, err := m.rbac.RevokeManagerRolesTx(tx, uid)
+	return err
+}
+
+// invalidateManagerAuthorization invalidates both the legacy role cache and
+// the RBAC effective-permission cache after a committed identity mutation.
+// Both invalidations are attempted so one cache outage cannot leave the other
+// cache silently stale.
+func (m *Manager) invalidateManagerAuthorization(uid string) error {
+	roleErr := m.roleService.Invalidate(uid)
+	rbacErr := m.rbac.InvalidateUser(uid)
+	if roleErr != nil {
+		if rbacErr != nil {
+			return fmt.Errorf("invalidate manager authorization: role cache: %v; rbac cache: %w", roleErr, rbacErr)
+		}
+		return roleErr
+	}
+	return rbacErr
+}
+
 func (m *Manager) finishFixedManagerRoleRequest(c *wkhttp.Context, role, targetUID string, grant, changed bool) {
-	if err := m.roleService.Invalidate(targetUID); err != nil {
+	if err := m.invalidateManagerAuthorization(targetUID); err != nil {
 		m.Error("invalidate fixed manager role cache failed",
 			zap.Error(err),
 			zap.String("role", role),
@@ -710,21 +769,44 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 
 func (m *Manager) deleteAdminUser(ctx context.Context, uid string) error {
 	if sessionRevocationActive(m.sessionStore) {
-		intent, err := m.userDB.deleteAdminWithSessionRevocation(ctx, uid, string(wkhttp.Admin))
+		intent, err := m.userDB.deleteAdminWithSessionRevocation(ctx, uid, string(wkhttp.Admin), func(tx *dbr.Tx) error {
+			return m.syncWorkplaceRoleTx(tx, uid, "")
+		})
 		if err != nil {
 			return err
 		}
 		// The transaction has committed: invalidate authorization state before
 		// attempting Redis revocation so an apply failure cannot preserve an
 		// admin role cache alongside a residual bearer.
-		m.roleService.Invalidate(uid)
-		return applyAndMarkSessionRevocation(ctx, m.userDB, m.sessionStore, intent)
+		cacheErr := m.invalidateManagerAuthorization(uid)
+		revocationErr := applyAndMarkSessionRevocation(ctx, m.userDB, m.sessionStore, intent)
+		if cacheErr != nil && revocationErr != nil {
+			return fmt.Errorf("delete admin post-commit cleanup: cache=%v; session revocation=%w", cacheErr, revocationErr)
+		}
+		if cacheErr != nil {
+			return cacheErr
+		}
+		return revocationErr
 	}
-	if err := m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin)); err != nil {
+	tx, err := m.db.session.Begin()
+	if err != nil {
 		return err
 	}
-	m.roleService.Invalidate(uid)
-	return nil
+	defer tx.RollbackUnlessCommitted()
+	deleted, err := m.db.deleteUserWithUIDAndRoleTx(tx, uid, string(wkhttp.Admin))
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return fmt.Errorf("user: admin revocation target not found")
+	}
+	if err := m.syncWorkplaceRoleTx(tx, uid, ""); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return m.invalidateManagerAuthorization(uid)
 }
 
 // deviceTokenRevokeFailure pairs a device flag with the error from trying to
@@ -871,10 +953,32 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.ShockOn = 0
 	userModel.Sex = 1
 	userModel.Status = int(common.UserAvailable)
-	err = m.userDB.Insert(userModel)
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("开启添加管理员事务错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+	err = m.userDB.insertTx(userModel, tx)
 	if err != nil {
 		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := m.syncWorkplaceRoleTx(tx, userModel.UID, userModel.Role); err != nil {
+		m.Error("同步新增管理员 Workplace RBAC 绑定错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		m.Error("提交添加管理员事务错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := m.invalidateManagerAuthorization(userModel.UID); err != nil {
+		m.Error("失效新增管理员授权缓存错误", zap.Error(err), zap.String("uid", userModel.UID))
+		respondUserError(c, errcode.ErrUserRoleCacheFailed)
 		return
 	}
 	c.ResponseOK()
