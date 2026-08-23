@@ -106,12 +106,23 @@ func snapshotCleanupSteps() []namedCleanupStep {
 // Redis key `space:member:{spaceID}:{uid}`，TTL 60s。不清它，被移除的人还能带着
 // 这个 space_id 正常访问接口最长 60 秒。这是隔离边界，必须在请求内同步完成，
 // 不能丢给后台。
+//
+// 失败必须记日志。这里原先是静默的：DEL 出错时正向条目会活满 TTL，
+// SpaceMiddleware 继续放行已被移除的人，而 handler 早已提交并返回 200——
+// 一次真实的隔离失效在系统里不留任何痕迹。pkg/space 那侧还会写一条否定缓存兜底，
+// 所以多数情况下边界仍然守住了，但这条日志是唯一能看见它发生过的地方。
 func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 	if spaceID == "" || uid == "" {
 		return
 	}
-	if conn := s.ctx.GetRedisConn(); conn != nil {
-		spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
+	conn := s.ctx.GetRedisConn()
+	if conn == nil {
+		// 没有 Redis 时中间件也读不到缓存，Get 必然未命中并回落到查库，方向是安全的。
+		return
+	}
+	if err := spacepkg.InvalidateMembershipCache(conn, spaceID, uid); err != nil {
+		s.Error("清理成员鉴权缓存失败：被移除成员可能在缓存 TTL 内仍可访问该 Space",
+			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.Error(err))
 	}
 }
 
@@ -254,6 +265,7 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 	removalCleanupWorkerOnce.Do(func() {
 		s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
 		s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
+		s.ctx.Schedule(removalSweepInterval, s.sweepExhaustedMemberRemovalCleanups)
 	})
 }
 
@@ -271,6 +283,37 @@ func (s *Space) purgeFinishedMemberRemovalCleanups() {
 	if deleted > 0 {
 		s.Info("清理过期成员移除工单", zap.Int64("deleted", deleted))
 	}
+}
+
+// removalSweepInterval / removalSweepLimit 控制耗尽工单扫描的节奏与单轮上限。
+//
+// 一分钟一轮就够：这条扫描处理的是「进程已经被打死」的残留，本来就不是热路径，
+// 而单条工单从耗尽到被看见晚一分钟没有任何代价——它已经不会再被认领了。
+// 单轮上限防的是一次大范围故障（IM 或 DB 挂过 70 分钟以上）之后，成千条工单同时
+// 耗尽预算，一条 UPDATE 就锁住整张表。
+const (
+	removalSweepInterval = time.Minute
+	removalSweepLimit    = 500
+)
+
+// sweepExhaustedMemberRemovalCleanups 把重试预算耗尽、租约也已过期的工单推到 abandoned。
+//
+// 日志级别是 Error 而不是 Warn，而且刻意每轮都打：abandoned 没有任何自动重驱动，
+// 被移除的人会一直留在该 Space 的群里和 IM 群订阅里，直到有人介入。这是本条唯一
+// 的出口信号，在 /metrics 端点落地之前它就是告警面。
+func (s *Space) sweepExhaustedMemberRemovalCleanups() {
+	abandoned, err := s.db.abandonExhaustedMemberRemovalCleanups(time.Now().UTC(), removalSweepLimit)
+	if err != nil {
+		s.Warn("扫描重试耗尽的成员移除工单失败", zap.Error(err))
+		return
+	}
+	if abandoned > 0 {
+		s.Error("成员移除清理工单重试耗尽，已置为 abandoned；无自动重驱动，需人工介入",
+			zap.Int64("abandoned", abandoned))
+	}
+	// 与扫描同一轮刷新指标，省掉第二个定时器。顺序也对：先把耗尽的推成终态，
+	// 再采样，abandoned 计数当轮即可见。
+	s.refreshMemberRemovalCleanupMetrics()
 }
 
 // removalCleanupRunning 进程内重入保护。

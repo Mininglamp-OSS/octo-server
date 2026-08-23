@@ -1503,3 +1503,17 @@ change-log convention (§7). Newest first.
   relax it would have admitted banned Spaces through `SpaceMiddleware` and 36
   other call sites — and a source guard now pins the two apart. Closes two #797
   items. See [journal](journal/shared/cleanup-membership-predicate.md).
+
+## 2026-08-22 (cleanup-queue-durability)
+
+- **Fixed** — Two silent-failure items from #797. The cleanup queue's retry budget
+  was only enforced in `releaseCleanupJob`, which a `SIGKILL` never reaches, so a
+  process-killing job was re-claimed forever and head-of-lined the whole queue;
+  the budget now gates the claim itself and a 1-minute sweep pushes exhausted rows
+  to `abandoned`, with three gauges so the new terminal state is not just as silent
+  as the old loop. Separately, a failed membership-cache `DEL` now returns, is
+  logged, and is overwritten with a negative entry — a total Redis outage was
+  already safe, but a DEL-only failure let a removed member keep passing
+  `SpaceMiddleware` for 60s with nothing logged.
+  See [journal](journal/shared/cleanup-queue-durability.md).
+
