@@ -132,7 +132,7 @@ func newManagerMFAIntegration(t *testing.T, failAuth bool) (*wkhttp.WKHttp, *con
 	smtp := newManagerMFASMTPSink(t, failAuth)
 	t.Cleanup(func() {
 		_ = testutil.CleanAllTables(ctx)
-		_ = settings.Reload()
+		_ = settings.Load()
 	})
 
 	for _, item := range []struct {
@@ -153,7 +153,10 @@ func newManagerMFAIntegration(t *testing.T, failAuth bool) (*wkhttp.WKHttp, *con
 		).Exec()
 		require.NoError(t, err)
 	}
-	require.NoError(t, settings.Reload())
+	// Reload schedules a real asynchronous SMTP preflight. This helper uses a
+	// controlled readiness result so the test can exercise the handler's send
+	// failure path without that probe racing and overwriting the result.
+	require.NoError(t, settings.Load())
 	// This records the result for the controlled fake SMTP setup. The OTP send
 	// itself still traverses the real SMTP implementation below.
 	settings.RecordManagerEmailMFAPreflight(settings.ManagerEmailMFAProbeGeneration(), true)
