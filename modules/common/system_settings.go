@@ -110,7 +110,12 @@ type SystemSettings struct {
 	// needless login outage on every tick.
 	managerMFAProbeKnown atomic.Bool
 	managerMFAProbeReady atomic.Bool
-	reloadTTL            time.Duration
+	// managerMFAProbeGeneration changes whenever the effective MFA/SMTP
+	// snapshot changes. Async probes carry this generation so a result from an
+	// older snapshot cannot publish readiness for newer settings.
+	managerMFAProbeGeneration atomic.Uint64
+	managerMFAProbeInFlight   atomic.Bool
+	reloadTTL                 time.Duration
 	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
 	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
 	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
@@ -133,9 +138,14 @@ func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings
 }
 
 // Load reads every row from system_setting and atomically replaces the
-// snapshot. Used at startup and by Reload (which is just an alias for
-// "load now" with logging semantics).
+// snapshot. It is used at startup and by explicit Reload calls. Peer
+// re-probing is enabled only by the auto-reload loop; the manager settings
+// write path already probes the prospective configuration synchronously.
 func (s *SystemSettings) Load() error {
+	return s.load(false)
+}
+
+func (s *SystemSettings) load(reprobe bool) error {
 	rows, err := s.db.listAll()
 	if err != nil {
 		return err
@@ -160,10 +170,18 @@ func (s *SystemSettings) Load() error {
 		}
 		next[schemaKey(row.Category, row.KeyName)] = row.Value
 	}
-	s.snapshot.Store(&next)
-	if previous == nil || managerMFASettingsChanged(previous, &next) {
+	changed := previous == nil || managerMFASettingsChanged(previous, &next)
+	if changed {
+		s.managerMFAProbeGeneration.Add(1)
 		s.managerMFAProbeKnown.Store(false)
 		s.managerMFAProbeReady.Store(false)
+	}
+	// Clear readiness before publishing a changed snapshot. This keeps the
+	// login gate fail-closed during the small publication window instead of
+	// allowing a probe for the previous settings to authorize the new ones.
+	s.snapshot.Store(&next)
+	if reprobe && previous != nil && changed && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
+		s.scheduleManagerEmailMFAPreflight()
 	}
 	return nil
 }
@@ -193,7 +211,8 @@ func (s *SystemSettings) Reload() error {
 }
 
 // StartAutoReload kicks off a goroutine that re-loads the snapshot every
-// reloadTTL until ctx is canceled. Intended to be called once at startup
+// reloadTTL until ctx is canceled. 当前系统每 60 秒会执行一次自动 reload，
+// 发现配置变化后更新本地快照。Intended to be called once at startup
 // (with a long-lived context). Errors are logged but do not stop the loop.
 //
 // Production callers pass context.Background() — the goroutine therefore
@@ -212,7 +231,7 @@ func (s *SystemSettings) StartAutoReload(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := s.Load(); err != nil {
+				if err := s.load(true); err != nil {
 					s.Error("auto-reload system_setting failed", zap.Error(err))
 				}
 			}
@@ -854,20 +873,60 @@ func (s *SystemSettings) ValidateManagerEmailMFASMTP() error {
 // for OTP mail. It never changes the policy value and never panics; startup
 // callers log the returned error and leave the login gate fail-closed.
 func (s *SystemSettings) PreflightManagerEmailMFA(ctx context.Context) error {
+	err := s.preflightManagerEmailMFA(ctx)
 	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
 		s.managerMFAProbeKnown.Store(false)
 		s.managerMFAProbeReady.Store(false)
-		return nil
-	}
-	if err := s.ValidateManagerEmailMFASMTP(); err != nil {
-		s.managerMFAProbeKnown.Store(true)
-		s.managerMFAProbeReady.Store(false)
 		return err
 	}
-	err := commonbase.NewEmailService(s.ctx, s).PreflightSMTP(ctx)
 	s.managerMFAProbeKnown.Store(true)
 	s.managerMFAProbeReady.Store(err == nil)
 	return err
+}
+
+func (s *SystemSettings) preflightManagerEmailMFA(ctx context.Context) error {
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return nil
+	}
+	if err := s.ValidateManagerEmailMFASMTP(); err != nil {
+		return err
+	}
+	return commonbase.NewEmailService(s.ctx, s).PreflightSMTP(ctx)
+}
+
+// scheduleManagerEmailMFAPreflight re-probes a peer after its auto-reload
+// observes a changed MFA/SMTP snapshot. It runs at most one probe at a time;
+// a later snapshot change causes a follow-up probe after the current one
+// finishes. This is deliberately event-driven, not periodic, so the 60-second
+// settings poll does not send an email on every tick.
+func (s *SystemSettings) scheduleManagerEmailMFAPreflight() {
+	if s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return
+	}
+	generation := s.managerMFAProbeGeneration.Load()
+	if !s.managerMFAProbeInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			s.managerMFAProbeInFlight.Store(false)
+			if generation != s.managerMFAProbeGeneration.Load() && s.ManagerEmailMFAState() == ManagerEmailMFAOn {
+				s.scheduleManagerEmailMFAPreflight()
+			}
+		}()
+
+		probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err := s.preflightManagerEmailMFA(probeCtx)
+		if generation != s.managerMFAProbeGeneration.Load() || s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+			return
+		}
+		s.managerMFAProbeKnown.Store(true)
+		s.managerMFAProbeReady.Store(err == nil)
+		if err != nil {
+			s.Warn("manager-console MFA SMTP auto-reload preflight failed; management login remains fail-closed", zap.Error(err))
+		}
+	}()
 }
 
 // RecordManagerEmailMFAPreflight lets a system-setting write path publish the
