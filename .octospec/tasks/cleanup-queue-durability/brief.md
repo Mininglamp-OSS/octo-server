@@ -48,8 +48,14 @@ Which is why observability is in scope rather than deferred: making the terminal
 state reachable without making it visible just moves the silence.
 
 The repo already uses Prometheus via `promauto` into the global default registry
-(`modules/oidc/metrics.go`, `modules/sticker/metrics.go`); no `/metrics` endpoint is
-mounted yet — that is a separate infrastructure concern and stays out of scope here.
+(`modules/oidc/metrics.go`, `modules/sticker/metrics.go`), and `pkg/metrics` already
+serves a `/metrics` endpoint, started from `main.go`. Registering a gauge is therefore
+enough to have it scraped; no endpoint work is in scope.
+
+> **Corrected 2026-08-23.** This paragraph originally said no `/metrics` endpoint was
+> mounted yet. That was copied verbatim from `modules/oidc/metrics.go`, where it was
+> true when written and is not any more. Copying a comment without re-checking it is
+> how a stale assertion gets a second life in a new file — see the journal.
 
 ## Load-bearing list
 
@@ -75,8 +81,8 @@ mounted yet — that is a separate infrastructure concern and stays out of scope
 
 - The **durable IM-pending outbox** (#797's own highest-value item, P0). Separate
   task, needs its own brief, and shares a design with #800 ①.
-- Mounting a `/metrics` HTTP endpoint — the repo deliberately registers metrics
-  without exposing them yet.
+- Anything about the `/metrics` endpoint itself — it already exists and is served;
+  this task only registers gauges into the default registry.
 - The purge throughput item, the `(group_no, created_at)` index and lock ordering,
   the join-vs-disband root cause, and every other #797 batch.
 - Re-driving `abandoned` jobs automatically. This task makes them terminal and

@@ -26,8 +26,17 @@ the row stayed `pending` with `attempts` frozen. The claim `SELECT` had no
 `attempts` predicate, so the lease would expire, the same row would be claimed
 again, and the process would die again — forever.
 
-The damage was never one stuck job. The claim takes the queue head with
-`ORDER BY id`, so one poison row sits in front of **everything behind it**.
+The damage was never one stuck job. Every time the poison row is claimed it
+burns one of the round's `removalCleanupBatchSize` slots, so healthy jobs that
+should have been handled in the same round get squeezed out.
+
+> **Corrected 2026-08-23.** This paragraph originally read "the claim takes the
+> queue head with `ORDER BY id`, so one poison row sits in front of everything
+> behind it" — contradicting the *same document* further down, which records
+> removing that ordering and the EXPLAIN evidence for it. Written against an
+> earlier draft and not re-read after the change landed. The conclusion is
+> unaffected: burning a batch slot starves other jobs regardless of pick order,
+> which is why the claim-time gate is needed either way.
 
 Three changes:
 
@@ -37,8 +46,13 @@ Three changes:
   out-of-process complement to `releaseCleanupJob`. Without it, the claim predicate
   alone would convert an infinite retry loop into a permanently-`pending` zombie
   that nothing ever looks at again.
-- **Three gauges** (pending, oldest-pending age, abandoned), refreshed on the same
-  tick as the sweep so no second timer is needed.
+- **Three gauges** (pending, oldest-pending age, abandoned), on their own
+  5-minute schedule (`removalMetricsInterval`) rather than the sweep's 1-minute
+  tick — the stats query is a full-table aggregate, and running it every minute
+  buys nothing for a signal read at minute-or-longer granularity. (Corrected
+  2026-08-23: this line originally said they shared the sweep's tick so no
+  second timer was needed. The second timer is right there in the same commit,
+  with a comment explaining why.)
 
 The gauges are not gold-plating, and this is the part worth remembering: making a
 failure terminal without making it visible just **relocates the silence**.

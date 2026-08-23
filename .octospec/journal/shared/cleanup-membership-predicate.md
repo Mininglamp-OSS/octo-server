@@ -74,14 +74,30 @@ TDD, and every new test was mutation-verified rather than merely observed green:
 |---|---|
 | `s.status <> 0` → `s.status = 1` (behave like `CheckMembership`) | banned-Space test only |
 | drop the `space` join condition (behave like `queryMember`) | disbanded-orphan test only |
-| relax `CheckMembership` to `<> 0` (the rejected #797 fix) | `TestCheckMembershipStaysStrict` only |
+| relax `CheckMembership` to `<> 0` (the rejected #797 fix) | `TestCheckMembershipForCleanupMatrix`'s authorization column |
 
 Each mutation killed exactly the intended test and no other, so the two new
 tests bind to opposite halves of `<> 0` — neither is passing by accident.
 
-`TestCheckMembershipStaysStrict` is a source guard that pins the authorization
-predicate strict and the cleanup predicate loose, so the merge #797 originally
-proposed cannot be reintroduced quietly.
+> **Corrected 2026-08-23.** The third row originally read
+> `TestCheckMembershipStaysStrict`, and the paragraph below it described that
+> test as a shipped source guard. **It is not in the tree.** It was written on
+> this branch and deleted again before the PR was opened, and the correction
+> did not reach this file until a reviewer grepped for the identifier and found
+> it only in prose.
+>
+> Why it was deleted is the part worth keeping. Tested adversarially, the guard
+> **passed** the exact security regression it was named for — relaxing
+> `CheckMembership` to `<> 0` — and **failed** on a whitespace change. It
+> matched the predicate's SQL as a string, so it was blind to a semantically
+> equivalent rewrite and loud about a cosmetic one: precisely inverted.
+>
+> What replaced it is `TestCheckMembershipForCleanupMatrix`, which asks **both**
+> predicates about the same seeded rows across
+> `{disbanded, normal, banned} × {active, removed}` and pins the one cell where
+> their answers must diverge. It is a behavioural test rather than a mechanical
+> guard — a future rewrite that preserves the answers passes, which is the
+> correct trade — and the mutation above kills it.
 
 No-regression proof: `TestCleanupWorkerSkipsRejoinedMember` and
 `TestGroupCascadeStillRunsAfterSpaceDisbanded` both stay green — the new

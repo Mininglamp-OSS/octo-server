@@ -14,12 +14,16 @@ injected_rules:
       member" leaves a removed person inside the Space's groups and IM
       subscriptions; a false "not a member" tears an active member out of every
       group. The rule's fail-open warning is why CheckMembership itself is left
-      byte-for-byte unchanged: it has 37 non-test call sites including
+      byte-for-byte unchanged: it has 36 non-test call sites including
       pkg/space/middleware.go's SpaceMiddleware, the primary auth gate, and
       #797's original proposal to relax it to `status <> 0` would have admitted
       banned Spaces across the entire authenticated API. The new predicate is
-      documented as cleanup-only and non-authorizing, and a source guard test
-      (TestCheckMembershipStaysStrict) pins the two apart.
+      documented as cleanup-only and non-authorizing, and a behavioural truth
+      table (TestCheckMembershipForCleanupMatrix) pins the two apart by asking
+      both predicates about the same rows. Corrected 2026-08-23: this line
+      previously named a source guard, TestCheckMembershipStaysStrict, which
+      was written on this branch and then deleted — it passed the security
+      regression it was named for and failed on whitespace. See the journal.
   - id: testing
     source: repo
     load_bearing: true

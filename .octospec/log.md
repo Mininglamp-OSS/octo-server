@@ -1501,8 +1501,12 @@ change-log convention (§7). Newest first.
   `CheckMembershipForCleanup` (`sm.status=1 AND s.status <> 0`).
   `CheckMembership` is deliberately **unchanged** — #797's original proposal to
   relax it would have admitted banned Spaces through `SpaceMiddleware` and 36
-  other call sites — and a source guard now pins the two apart. Closes two #797
-  items. See [journal](journal/shared/cleanup-membership-predicate.md).
+  other call sites. A behavioural truth table now pins both predicates' answers
+  across `{disbanded, normal, banned} x {active, removed}`, including the one
+  cell where they must disagree. (Corrected 2026-08-23: this entry originally
+  claimed a *source guard*; that guard was deleted on the same branch for
+  passing the regression it was named for.) Closes two #797 items.
+  See [journal](journal/shared/cleanup-membership-predicate.md).
 
 ## 2026-08-22 (cleanup-queue-durability)
 
