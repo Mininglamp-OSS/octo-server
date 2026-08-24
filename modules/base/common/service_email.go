@@ -148,8 +148,10 @@ func (s *EmailService) EmailSendRateLimitRetryAfter(email string, codeType CodeT
 }
 
 var (
-	ErrManagerCodeInvalid = errors.New("invalid manager verification code")
-	ErrManagerCodeLocked  = errors.New("too many failed attempts, locked for 10 minutes")
+	ErrManagerCodeInvalid       = errors.New("invalid manager verification code")
+	ErrManagerCodeLocked        = errors.New("too many failed attempts, locked for 10 minutes")
+	errEmailCodeSuperseded      = errors.New("email verification status was superseded")
+	errInvalidTrackedCodeResult = errors.New("invalid tracked email code result")
 )
 
 // SendVerifyCode 发送验证码。
@@ -158,7 +160,7 @@ var (
 // SendTransactionalHTML 而非极简 sendEmail —— 验证码是高价值事务邮件，带
 // plaintext 兜底 + 标准事务邮件 header 可显著降低被反垃圾静默丢弃的概率。
 func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string) error {
-	return s.sendVerifyCode(ctx, email, codeType, lang, false, "")
+	return s.sendVerifyCode(ctx, email, codeType, lang, false, "", "")
 }
 
 // SendVerifyCodeTracked is the delivery-confirmed variant used by manager MFA.
@@ -167,21 +169,24 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 // Ordinary user flows continue through SendVerifyCode and retain the legacy
 // missing-status compatibility behavior.
 func (s *EmailService) SendVerifyCodeTracked(ctx context.Context, email string, codeType CodeType, lang string) error {
-	return s.sendVerifyCode(ctx, email, codeType, lang, true, "")
+	return s.sendVerifyCode(ctx, email, codeType, lang, true, "", "")
 }
 
 // SendVerifyCodeTrackedWithAttempt is the manager-console variant whose Redis
-// status is bound to a caller-owned attempt ID. A slow SMTP request that
-// returns after its 120s send lock has been replaced cannot mark a newer
-// attempt as sent, nor can its cleanup delete the newer code.
-func (s *EmailService) SendVerifyCodeTrackedWithAttempt(ctx context.Context, email string, codeType CodeType, lang, attemptID string) error {
+// status is bound to a caller-owned attempt ID and send-state key. A slow SMTP
+// request that returns after its 120s send lock has been replaced cannot mark
+// a newer attempt as sent, nor can its cleanup delete the newer code.
+func (s *EmailService) SendVerifyCodeTrackedWithAttempt(ctx context.Context, email string, codeType CodeType, lang, attemptID, sendStateKey string) error {
 	if strings.TrimSpace(attemptID) == "" {
 		return errors.New("send attempt id must not be empty")
 	}
-	return s.sendVerifyCode(ctx, email, codeType, lang, true, attemptID)
+	if strings.TrimSpace(sendStateKey) == "" {
+		return errors.New("send state key must not be empty")
+	}
+	return s.sendVerifyCode(ctx, email, codeType, lang, true, attemptID, sendStateKey)
 }
 
-func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string, tracked bool, attemptID string) error {
+func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string, tracked bool, attemptID, sendStateKey string) error {
 	// 检查发送频率限制。额度按邮箱 + CodeType 隔离。
 	rateLimitKey := EmailRateLimitKey(email, codeType)
 	exists, err := s.ctx.GetRedisConn().GetString(rateLimitKey)
@@ -216,27 +221,37 @@ func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeTyp
 	}
 	if tracked {
 		// A new attempt invalidates an older code before any SMTP I/O starts.
-		if err = s.ctx.GetRedisConn().Del(cacheKey); err != nil {
+		// The ownership check and both writes must be one Redis operation: a
+		// late attempt must not write its code after a newer attempt has
+		// published its sent status.
+		if attemptID != "" {
+			initialized, err := s.initializeTrackedCode(ctx, cacheKey, statusKey, sendStateKey, code, statusPending, attemptID)
+			if err != nil {
+				return err
+			}
+			if !initialized {
+				return errEmailCodeSuperseded
+			}
+		} else if err := s.replaceTrackedCode(ctx, cacheKey, statusKey, code, statusPending); err != nil {
 			return err
 		}
-		if err = s.ctx.GetRedisConn().SetAndExpire(statusKey, statusPending, emailCodeTTL); err != nil {
+	} else {
+		err = s.ctx.GetRedisConn().SetAndExpire(cacheKey, code, emailCodeTTL)
+		if err != nil {
 			return err
 		}
-	}
-	err = s.ctx.GetRedisConn().SetAndExpire(cacheKey, code, emailCodeTTL)
-	if err != nil {
-		if tracked {
-			_ = s.ctx.GetRedisConn().Del(statusKey)
-		}
-		return err
 	}
 
 	// 设置发送频率限制（1分钟）
 	err = s.ctx.GetRedisConn().SetAndExpire(rateLimitKey, "1", emailSendRateLimitTTL)
 	if err != nil {
 		if tracked {
-			_ = s.ctx.GetRedisConn().Del(cacheKey)
-			_ = s.ctx.GetRedisConn().Del(statusKey)
+			if attemptID != "" {
+				_, _ = s.clearTrackedCode(ctx, email, codeType, statusPending)
+			} else {
+				_ = s.ctx.GetRedisConn().Del(cacheKey)
+				_ = s.ctx.GetRedisConn().Del(statusKey)
+			}
 		}
 		return err
 	}
@@ -261,7 +276,7 @@ func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeTyp
 			}
 			if !committed {
 				_, _ = s.clearTrackedCode(ctx, email, codeType, statusPending)
-				return errors.New("email verification status was superseded")
+				return errEmailCodeSuperseded
 			}
 		} else if err := s.ctx.GetRedisConn().SetAndExpire(statusKey, emailCodeStatusSent, emailCodeTTL); err != nil {
 			_ = s.ctx.GetRedisConn().Del(cacheKey)
@@ -270,6 +285,48 @@ func (s *EmailService) sendVerifyCode(ctx context.Context, email string, codeTyp
 		}
 	}
 	return nil
+}
+
+// initializeTrackedCode atomically replaces the shared code/status pair only
+// when the manager send-state still belongs to this attempt. The send-state
+// check is required because a newer challenge clears the old email status;
+// checking only for an empty status would let a stale request reacquire the
+// mailbox before the newer request initializes its code.
+func (s *EmailService) initializeTrackedCode(ctx context.Context, cacheKey, statusKey, sendStateKey, code, pending, attemptID string) (bool, error) {
+	result, err := s.verifyRedis().WithContext(ctx).Eval(`
+if redis.call('HGET', KEYS[3], 'attempt_id') ~= ARGV[1] or
+   redis.call('HGET', KEYS[3], 'status') ~= 'pending' then
+  return 0
+end
+local current = redis.call('GET', KEYS[2])
+if current and current ~= ARGV[2] then return 0 end
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[4])
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+return 1
+`, []string{cacheKey, statusKey, sendStateKey}, attemptID, pending, code, int(emailCodeTTL.Seconds())).Result()
+	if err != nil {
+		return false, err
+	}
+	value, ok := result.(int64)
+	if !ok {
+		return false, errInvalidTrackedCodeResult
+	}
+	return value == 1, nil
+}
+
+// replaceTrackedCode preserves the legacy tracked API's replacement
+// semantics for callers that do not provide an attempt ID. It still writes
+// the code and pending status atomically, but has no external ownership gate
+// to validate.
+func (s *EmailService) replaceTrackedCode(ctx context.Context, cacheKey, statusKey, code, pending string) error {
+	_, err := s.verifyRedis().WithContext(ctx).Eval(`
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+`, []string{cacheKey, statusKey}, pending, code, int(emailCodeTTL.Seconds())).Result()
+	return err
 }
 
 // commitTrackedCode changes pending:<attempt> to sent:<attempt> only when the

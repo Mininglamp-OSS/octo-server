@@ -3,6 +3,7 @@ package user
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -211,7 +212,26 @@ func (m *managerDB) updateManagerEmail(uid, role, email string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if rows != 1 {
+	if rows == 0 {
+		// MySQL reports changed rows by default, so setting email to the
+		// already-stored value is a successful no-op. Re-read the target under
+		// the same transaction and row lock to distinguish that case from a
+		// missing target or a concurrent role change.
+		var current struct {
+			UID   string
+			Role  string
+			Email string
+		}
+		matched, err := tx.Select("uid", "role", "email").From("user").
+			Where("uid=?", uid).Suffix("FOR UPDATE").Load(&current)
+		if err != nil {
+			return false, err
+		}
+		if matched != 1 || current.Role != role ||
+			!strings.EqualFold(strings.TrimSpace(current.Email), strings.TrimSpace(email)) {
+			return false, fmt.Errorf("manager email update affected %d rows", rows)
+		}
+	} else if rows != 1 {
 		return false, fmt.Errorf("manager email update affected %d rows", rows)
 	}
 	if err := tx.Commit(); err != nil {

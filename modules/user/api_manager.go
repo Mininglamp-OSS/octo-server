@@ -588,6 +588,7 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 	emailService := commonbase.NewEmailService(m.ctx, settings)
 	emailErr := emailService.SendVerifyCodeTrackedWithAttempt(
 		sendCtx, challenge.Email, commonbase.CodeTypeManagerLogin, lang, attemptID,
+		managerMFASendStateKey(challenge.ID),
 	)
 	cancel()
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 3*time.Second)

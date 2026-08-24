@@ -146,15 +146,26 @@ func newTrackedEmailService(t *testing.T, smtpAddr string) (*common.EmailService
 
 const trackedEmailCodeTTL = 5 * time.Minute
 
+func prepareTrackedAttempt(t *testing.T, ctx *config.Context, attemptID string) string {
+	t.Helper()
+	key := "manager:mfa:test:send-state:" + attemptID
+	require.NoError(t, ctx.GetRedisConn().Hset(key, "attempt_id", attemptID))
+	require.NoError(t, ctx.GetRedisConn().Hset(key, "status", "pending"))
+	require.NoError(t, ctx.GetRedisConn().Expire(key, trackedEmailCodeTTL))
+	t.Cleanup(func() { _ = ctx.GetRedisConn().Del(key) })
+	return key
+}
+
 func TestTrackedManagerCodeRequiresSMTPAndSentStatus(t *testing.T) {
 	server := newTrackedSMTPServer(t, false)
 	service, ctx := newTrackedEmailService(t, server.address())
 	email := "mfa-recipient@example.com"
+	sendStateKey := prepareTrackedAttempt(t, ctx, "attempt-1")
 	codeKey := common.EmailCodeKey(email, common.CodeTypeManagerLogin)
 	statusKey := common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin)
 
 	require.NoError(t, service.SendVerifyCodeTrackedWithAttempt(
-		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-1",
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-1", sendStateKey,
 	))
 	code, err := ctx.GetRedisConn().GetString(codeKey)
 	require.NoError(t, err)
@@ -175,9 +186,10 @@ func TestTrackedManagerCodeRemovesCodeWhenSMTPFails(t *testing.T) {
 	server := newTrackedSMTPServer(t, true)
 	service, ctx := newTrackedEmailService(t, server.address())
 	email := "mfa-recipient@example.com"
+	sendStateKey := prepareTrackedAttempt(t, ctx, "attempt-failed")
 
 	err := service.SendVerifyCodeTrackedWithAttempt(
-		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-failed",
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-failed", sendStateKey,
 	)
 	assert.Error(t, err)
 	code, getErr := ctx.GetRedisConn().GetString(common.EmailCodeKey(email, common.CodeTypeManagerLogin))
@@ -186,6 +198,84 @@ func TestTrackedManagerCodeRemovesCodeWhenSMTPFails(t *testing.T) {
 	require.NoError(t, getErr)
 	assert.Empty(t, code)
 	assert.Empty(t, status)
+}
+
+func TestTrackedManagerCodeCannotOverwriteNewerAttempt(t *testing.T) {
+	server := newTrackedSMTPServer(t, false)
+	service, ctx := newTrackedEmailService(t, server.address())
+	email := "mfa-recipient@example.com"
+	sendStateKey := prepareTrackedAttempt(t, ctx, "attempt-a")
+	codeKey := common.EmailCodeKey(email, common.CodeTypeManagerLogin)
+	statusKey := common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin)
+
+	// Attempt B has already taken ownership of the mailbox. Attempt A must
+	// fail before SMTP and must not overwrite B's delivered code or status.
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(codeKey, "654321", trackedEmailCodeTTL))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(statusKey, "sent:attempt-b", trackedEmailCodeTTL))
+
+	err := service.SendVerifyCodeTrackedWithAttempt(
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-a", sendStateKey,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "superseded")
+
+	code, getErr := ctx.GetRedisConn().GetString(codeKey)
+	require.NoError(t, getErr)
+	assert.Equal(t, "654321", code)
+	status, getErr := ctx.GetRedisConn().GetString(statusKey)
+	require.NoError(t, getErr)
+	assert.Equal(t, "sent:attempt-b", status)
+
+	server.mu.Lock()
+	assert.Empty(t, server.messages, "a superseded attempt must not send SMTP")
+	server.mu.Unlock()
+}
+
+func TestTrackedManagerCodeRejectsStaleAttemptAndAllowsNewerAttempt(t *testing.T) {
+	server := newTrackedSMTPServer(t, false)
+	service, ctx := newTrackedEmailService(t, server.address())
+	email := "mfa-recipient@example.com"
+	oldStateKey := "manager:mfa:test:send-state:stale-attempt"
+	newStateKey := prepareTrackedAttempt(t, ctx, "current-attempt")
+
+	// Challenge replacement removes the old send-state and the shared code
+	// pair before the new attempt claims its own send-state. The stale sender
+	// must fail ownership validation, while the current sender must still be
+	// able to initialize and deliver its code.
+	require.NoError(t, ctx.GetRedisConn().Del(oldStateKey))
+	err := service.SendVerifyCodeTrackedWithAttempt(
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "stale-attempt", oldStateKey,
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "superseded")
+
+	require.NoError(t, service.SendVerifyCodeTrackedWithAttempt(
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "current-attempt", newStateKey,
+	))
+	status, getErr := ctx.GetRedisConn().GetString(common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin))
+	require.NoError(t, getErr)
+	assert.Equal(t, "sent:current-attempt", status)
+
+	server.mu.Lock()
+	assert.Len(t, server.messages, 1, "only the current attempt may send SMTP")
+	server.mu.Unlock()
+}
+
+func TestTrackedCodeWithoutAttemptStillReplacesExistingCode(t *testing.T) {
+	server := newTrackedSMTPServer(t, false)
+	service, ctx := newTrackedEmailService(t, server.address())
+	email := "mfa-recipient@example.com"
+	codeKey := common.EmailCodeKey(email, common.CodeTypeManagerLogin)
+	statusKey := common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin)
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(codeKey, "654321", trackedEmailCodeTTL))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(statusKey, "sent:previous", trackedEmailCodeTTL))
+
+	require.NoError(t, service.SendVerifyCodeTracked(
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN",
+	))
+	status, getErr := ctx.GetRedisConn().GetString(statusKey)
+	require.NoError(t, getErr)
+	assert.Equal(t, "sent", status)
 }
 
 func TestOrdinaryEmailCodeMissingStatusRetainsCompatibility(t *testing.T) {

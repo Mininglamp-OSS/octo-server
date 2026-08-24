@@ -456,6 +456,16 @@ func TestManagerAdminEmailMaintenanceRequiresValidEmailAndInvalidatesChallenge(t
 	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(oldEmail, commonbase.CodeTypeManagerLogin))
 	require.NoError(t, err)
 	assert.Empty(t, code)
+
+	// Re-submitting the already-stored address is an idempotent maintenance
+	// operation. MySQL reports zero changed rows for this no-op update, but the
+	// endpoint must not turn a valid, authorized request into an internal error.
+	repeatReq := managerMFARequest(t, http.MethodPut, "/v1/manager/user/admin/email", map[string]string{
+		"uid": targetUID, "email": newEmail,
+	})
+	repeatReq.Header.Set("token", callerToken)
+	repeatResponse := serveManagerMFARequest(t, server.GetRoute(), repeatReq)
+	require.Equal(t, http.StatusOK, repeatResponse.Code, repeatResponse.Body.String())
 }
 
 func TestManagerAdminEmailMaintenanceRejectsEmailUsedByAnotherUser(t *testing.T) {
