@@ -11,10 +11,12 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -34,6 +36,9 @@ const (
 	managerLoginRateLimitTag      = "manager_login"
 	managerLoginRateLimitRPS      = 10.0 / 60
 	managerLoginRateLimitBurst    = 5
+	managerMFARateLimitTag        = "manager_mfa"
+	managerMFARateLimitRPS        = 30.0 / 60
+	managerMFARateLimitBurst      = 12
 	managerLoginRateLimitPoolSize = 10
 )
 
@@ -51,6 +56,7 @@ type Manager struct {
 	roleService   *RoleService
 	sessionStore  userSessionStore
 	loginLog      *LoginLog
+	mfa           *managerMFAService
 }
 
 // NewManager NewManager
@@ -68,6 +74,7 @@ func NewManager(ctx *config.Context) *Manager {
 		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 		sessionStore:  auth.SessionStoreForContext(ctx),
 		loginLog:      NewLoginLog(ctx),
+		mfa:           newManagerMFAService(ctx),
 	}
 	m.createManagerAccount()
 	return m
@@ -89,9 +96,19 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		managerLoginRateLimitRPS,
 		managerLoginRateLimitBurst,
 	)
+	managerMFALimit := r.StrictIPRateLimitMiddleware(
+		context.Background(),
+		managerLoginRedis,
+		managerMFARateLimitTag,
+		managerMFARateLimitRPS,
+		managerMFARateLimitBurst,
+	)
 	user := r.Group("/v1/manager")
 	{
 		user.POST("/login", managerLoginLimit, m.login) // 账号登录
+		user.POST("/login/send", managerMFALimit, m.sendManagerMFACode)
+		user.POST("/login/resend", managerMFALimit, m.resendManagerMFACode)
+		user.POST("/login/verify", managerMFALimit, m.verifyManagerMFACode)
 	}
 	auth := r.Group("/v1/manager", m.ctx.AuthMiddleware(r))
 	{
@@ -99,6 +116,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.POST("/user/admin", m.addAdminUser)              // 添加一个管理员
 		auth.GET("/user/admin", m.getAdminUsers)              // 查询管理员用户
 		auth.DELETE("/user/admin", m.deleteAdminUsers)        // 删除管理员用户
+		auth.PUT("/user/admin/email", m.updateAdminEmail)     // 超管维护管理端账号邮箱
 		auth.POST("/user/add", m.addUser)                     // 添加一个用户
 		auth.POST("/user/resetpassword", m.resetUserPassword) // 重置用户密码
 		auth.GET("/user/list", m.list)                        // 用户列表
@@ -338,6 +356,80 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
+	if userInfo.Status == int(common.UserDisable) || userInfo.IsDestroy == IsDestroyDone {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
+	if !matched {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	// 自动将旧 MD5 密码迁移到 bcrypt
+	if needsMigration {
+		if newHash, hashErr := HashPassword(req.Password); hashErr == nil {
+			if updateErr := m.userDB.updatePassword(newHash, userInfo.UID); updateErr == nil {
+				userInfo.Password = newHash
+			}
+		}
+	}
+	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
+	// dashboardReader/marketAdmin，见 575185b0），被拒同样计入登录失败日志。
+	if !auth.IsManagerConsoleRole(userInfo.Role) {
+		m.loginLog.recordFailure(req.Username, publicIP, "manager")
+		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
+		return
+	}
+
+	settings := common2.EnsureSystemSettings(m.ctx)
+	switch settings.ManagerEmailMFAState() {
+	case common2.ManagerEmailMFAUnavailable:
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	case common2.ManagerEmailMFAOn:
+		if !settings.ManagerEmailMFAReady() {
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+		email := strings.ToLower(strings.TrimSpace(userInfo.Email))
+		if err := commonbase.ValidateEmailAddress(email); err != nil {
+			respondUserError(c, errcode.ErrUserManagerMFAEmailRequired)
+			return
+		}
+		challengeID := util.GenerUUID()
+		now := time.Now()
+		challenge := managerMFAChallenge{
+			ID:                  challengeID,
+			UID:                 userInfo.UID,
+			Username:            userInfo.Username,
+			Role:                userInfo.Role,
+			Email:               email,
+			PasswordFingerprint: passwordFingerprint(userInfo.Password),
+			CreatedAt:           now.UnixMilli(),
+			ExpiresAt:           now.Add(managerMFAChallengeTTL).UnixMilli(),
+		}
+		if err := m.mfa.createChallenge(c.Request.Context(), challenge); err != nil {
+			m.Error("创建管理端 MFA challenge 失败", zap.Error(err), zap.String("uid", userInfo.UID))
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+		c.Response(&managerLoginResp{
+			UID:         userInfo.UID,
+			Name:        userInfo.Name,
+			Role:        userInfo.Role,
+			Email:       maskManagerEmail(email),
+			ChallengeID: challengeID,
+			ExpiresIn:   int64(managerMFAChallengeTTL.Seconds()),
+			MFARequired: true,
+		})
+		return
+	}
+
+	// MFA is disabled: retain the existing direct-token path. The session
+	// issue fence is intentionally created only at the final token boundary;
+	// the MFA branch above creates no fence while a challenge is in progress.
 	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
 	if err != nil {
 		m.Error("初始化管理端登录会话栅栏失败", zap.Error(err))
@@ -357,23 +449,10 @@ func (m *Manager) login(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
-	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
-	if !matched {
+	matched, _ = CheckPassword(req.Password, userInfo.Password)
+	if !matched || !auth.IsManagerConsoleRole(userInfo.Role) {
 		m.loginLog.recordFailure(req.Username, publicIP, "manager")
 		respondUserError(c, errcode.ErrUserInvalidCredentials)
-		return
-	}
-	// 自动将旧 MD5 密码迁移到 bcrypt
-	if needsMigration {
-		if newHash, hashErr := HashPassword(req.Password); hashErr == nil {
-			_ = m.userDB.updatePassword(newHash, userInfo.UID)
-		}
-	}
-	// 角色判定用上游的 IsManagerConsoleRole（放行 admin∪superAdmin∪两个固定角色
-	// dashboardReader/marketAdmin，见 575185b0），被拒同样计入登录失败日志。
-	if !auth.IsManagerConsoleRole(userInfo.Role) {
-		m.loginLog.recordFailure(req.Username, publicIP, "manager")
-		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
 	token := util.GenerUUID()
@@ -396,8 +475,276 @@ func (m *Manager) login(c *wkhttp.Context) {
 		Token: token,
 		Name:  userInfo.Name,
 		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
 	})
 	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
+}
+
+type managerMFAChallengeReq struct {
+	ChallengeID string `json:"challenge_id"`
+}
+
+type managerMFAVerifyReq struct {
+	ChallengeID string `json:"challenge_id"`
+	Code        string `json:"code"`
+}
+
+// loadAndVerifyManagerMFAChallenge checks both Redis ownership and the live
+// account snapshot. It is called before every send/resend/verify operation so
+// password, role, status, or email changes invalidate the challenge.
+func (m *Manager) loadAndVerifyManagerMFAChallenge(c *wkhttp.Context, challengeID string) (*managerMFAChallenge, *managerLoginModel, bool) {
+	challenge, err := m.mfa.loadChallenge(c.Request.Context(), challengeID)
+	if err != nil {
+		if errors.Is(err, errManagerMFAChallengeInvalid) {
+			managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		} else {
+			m.Error("读取管理端 MFA challenge 失败", zap.Error(err))
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		}
+		return nil, nil, false
+	}
+	userInfo, err := m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil {
+		m.Error("复核管理端 MFA challenge 用户失败", zap.Error(err))
+		managerMFAServiceUnavailable(c, errcode.ErrUserQueryFailed)
+		return nil, nil, false
+	}
+	if !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return nil, nil, false
+	}
+	return challenge, userInfo, true
+}
+
+func managerMFAChallengeMatchesUser(challenge *managerMFAChallenge, userInfo *managerLoginModel) bool {
+	if challenge == nil || userInfo == nil || userInfo.UID == "" {
+		return false
+	}
+	return userInfo.UID == challenge.UID &&
+		userInfo.Username == challenge.Username &&
+		userInfo.Role == challenge.Role &&
+		userInfo.Status != int(common.UserDisable) &&
+		userInfo.IsDestroy != IsDestroyDone &&
+		auth.IsManagerConsoleRole(userInfo.Role) &&
+		strings.EqualFold(strings.TrimSpace(userInfo.Email), challenge.Email) &&
+		passwordFingerprint(userInfo.Password) == challenge.PasswordFingerprint
+}
+
+func (m *Manager) sendManagerMFACode(c *wkhttp.Context) {
+	m.sendManagerMFACodeInternal(c)
+}
+
+func (m *Manager) resendManagerMFACode(c *wkhttp.Context) {
+	m.sendManagerMFACodeInternal(c)
+}
+
+func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
+	var req managerMFAChallengeReq
+	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.ChallengeID) == "" {
+		respondUserRequestInvalid(c, "challenge_id")
+		return
+	}
+	settings := common2.EnsureSystemSettings(m.ctx)
+	switch settings.ManagerEmailMFAState() {
+	case common2.ManagerEmailMFAUnavailable:
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	case common2.ManagerEmailMFAOff:
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	case common2.ManagerEmailMFAOn:
+		if !settings.ManagerEmailMFAReady() {
+			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+			return
+		}
+	}
+	challenge, _, ok := m.loadAndVerifyManagerMFAChallenge(c, req.ChallengeID)
+	if !ok {
+		return
+	}
+	attemptID := util.GenerUUID()
+	retryAfter, err := m.mfa.claimSend(c.Request.Context(), challenge, attemptID)
+	if err != nil {
+		var limited *managerMFASendRateError
+		if errors.As(err, &limited) {
+			details := octoi18n.Details{}
+			if retryAfter > 0 {
+				details["retry_after"] = retryAfter
+			}
+			managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, details)
+			return
+		}
+		if errors.Is(err, errManagerMFAChallengeInvalid) {
+			managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+			return
+		}
+		m.Error("claim manager MFA send failed", zap.Error(err), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+
+	lang := octoi18n.OutboundLanguage(c.Request.Context())
+	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	emailService := commonbase.NewEmailService(m.ctx, settings)
+	emailErr := emailService.SendVerifyCodeTrackedWithAttempt(
+		sendCtx, challenge.Email, commonbase.CodeTypeManagerLogin, lang, attemptID,
+		managerMFASendStateKey(challenge.ID),
+	)
+	cancel()
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	committed, commitErr := m.mfa.completeSend(commitCtx, challenge.ID, attemptID, emailErr == nil)
+	commitCancel()
+	if commitErr != nil || !committed {
+		if clearErr := emailService.ClearManagerCodeIfAttempt(context.Background(), challenge.Email, attemptID); clearErr != nil {
+			m.Warn("清理失去所有权的管理端 MFA 验证码失败", zap.Error(clearErr), zap.String("challenge_id", challenge.ID))
+		}
+		if commitErr != nil {
+			m.Error("提交管理端 MFA 发送状态失败", zap.Error(commitErr), zap.String("challenge_id", challenge.ID))
+		}
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	if emailErr != nil {
+		if errors.Is(emailErr, commonbase.ErrEmailSendRateLimited) {
+			retryAfter, retryErr := emailService.EmailSendRateLimitRetryAfter(
+				challenge.Email, commonbase.CodeTypeManagerLogin,
+			)
+			if retryErr != nil || retryAfter < 1 {
+				m.Warn("读取管理端 MFA 邮箱冷却时间失败，使用默认重试时间", zap.Error(retryErr), zap.String("challenge_id", challenge.ID))
+				retryAfter = int(time.Minute / time.Second)
+			}
+			managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, octoi18n.Details{
+				"retry_after": retryAfter,
+			})
+			return
+		}
+		m.Warn("管理端 MFA 邮件发送失败", zap.Error(emailErr), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	c.Response(&managerMFAChallengeResponse{
+		ChallengeID: challenge.ID,
+		Email:       maskManagerEmail(challenge.Email),
+		ExpiresIn:   managerMFAExpiresIn(challenge, time.Now()),
+		CodeSent:    true,
+		ResendAfter: int64(managerMFASendCooldown.Seconds()),
+	})
+}
+
+func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
+	var req managerMFAVerifyReq
+	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.ChallengeID) == "" || strings.TrimSpace(req.Code) == "" {
+		respondUserRequestInvalid(c, "challenge_id")
+		return
+	}
+	settings := common2.EnsureSystemSettings(m.ctx)
+	if settings.ManagerEmailMFAState() == common2.ManagerEmailMFAUnavailable {
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
+		return
+	}
+	if settings.ManagerEmailMFAState() != common2.ManagerEmailMFAOn || !settings.ManagerEmailMFAReady() {
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+	challenge, userInfo, ok := m.loadAndVerifyManagerMFAChallenge(c, req.ChallengeID)
+	if !ok {
+		return
+	}
+	codeService := commonbase.NewEmailService(m.ctx, settings)
+	err := codeService.VerifyManagerCodeAtomically(
+		c.Request.Context(), challenge.Email, strings.TrimSpace(req.Code), challenge.ID,
+		managerMFAActiveKey(challenge.UID), managerMFASendStateKey(challenge.ID),
+		managerMFAChallengeKey(challenge.ID),
+	)
+	if errors.Is(err, commonbase.ErrManagerCodeLocked) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, nil)
+		return
+	}
+	if errors.Is(err, commonbase.ErrManagerCodeInvalid) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFACodeInvalid, nil)
+		return
+	}
+	if err != nil {
+		m.Error("管理端 MFA 验证码消费失败", zap.Error(err), zap.String("challenge_id", challenge.ID))
+		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
+		return
+	}
+
+	// Re-read after atomic OTP consumption. If the account changes between the
+	// pre-check and the consume, the code is spent but no token is issued.
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil {
+		m.Error("管理端 MFA 消费后复核用户失败", zap.Error(err))
+		managerMFAServiceUnavailable(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), m.sessionStore, userInfo.UID)
+	if err != nil {
+		m.Error("初始化管理端 MFA 最终会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	userInfo, err = m.db.queryUserInfoWithNameAndPwd(challenge.Username)
+	if err != nil || !managerMFAChallengeMatchesUser(challenge, userInfo) {
+		if err != nil {
+			m.Error("管理端 MFA 最终会话栅栏后复核失败", zap.Error(err))
+		}
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
+		return
+	}
+	token := util.GenerUUID()
+	if err := issueUserSession(c.Request.Context(), m.sessionStore, token, auth.TokenInfo{
+		UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role,
+		Language: userInfo.Language, DeviceFlag: int(config.Web),
+	}, issueFence); err != nil {
+		m.Error("管理端 MFA 最终签发 token 失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	publicIP := wkhttp.ClientIP(c.Request)
+	m.loginLog.recordSuccess(userInfo.UID, userInfo.Username, publicIP, "manager")
+	c.Response(&managerLoginResp{
+		UID:   userInfo.UID,
+		Token: token,
+		Name:  userInfo.Name,
+		Role:  userInfo.Role,
+		Email: maskManagerEmail(userInfo.Email),
+	})
+}
+
+func managerMFAExpiresIn(challenge *managerMFAChallenge, now time.Time) int64 {
+	if challenge == nil {
+		return 0
+	}
+	remaining := time.UnixMilli(challenge.ExpiresAt).Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	seconds := int64(remaining / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+// maskManagerEmail keeps the local-part boundary visible while preserving the
+// complete domain. The full address remains in the Challenge and is used for
+// SMTP delivery; only API responses receive the masked representation.
+func maskManagerEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	at := strings.LastIndexByte(email, '@')
+	if at <= 0 || at == len(email)-1 {
+		return email
+	}
+	local := []rune(email[:at])
+	if len(local) == 1 {
+		return string(local[0]) + "xxxx" + email[at:]
+	}
+	return string(local[0]) + "xxxx" + string(local[len(local)-1]) + email[at:]
 }
 
 // 重置用户密码
@@ -651,7 +998,7 @@ func (m *Manager) listUsersWithFixedManagerRole(c *wkhttp.Context, role string) 
 	for _, user := range users {
 		list = append(list, &dashboardReaderResp{
 			UID: user.UID, Name: user.Name, Username: user.Username,
-			RegisterTime: user.CreatedAt.String(),
+			Email: user.Email, RegisterTime: user.CreatedAt.String(),
 		})
 	}
 	c.Response(list)
@@ -823,11 +1170,79 @@ func (m *Manager) getAdminUsers(c *wkhttp.Context) {
 				UID:          user.UID,
 				Name:         user.Name,
 				Username:     user.Username,
+				Email:        user.Email,
 				RegisterTime: user.CreatedAt.String(),
 			})
 		}
 	}
 	c.Response(list)
+}
+
+// updateAdminEmail is the trusted repair path for management-console MFA.
+// Only a SuperAdmin may move another management account's second factor, and
+// the audit log records an email fingerprint rather than the address itself.
+func (m *Manager) updateAdminEmail(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		respondManagerForbidden(c)
+		return
+	}
+	var req struct {
+		UID   string `json:"uid"`
+		Email string `json:"email"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	req.UID = strings.TrimSpace(req.UID)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if req.UID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+	if err := commonbase.ValidateEmailAddress(req.Email); err != nil {
+		respondUserError(c, errcode.ErrUserEmailInvalid)
+		return
+	}
+	target, err := m.userDB.QueryByUID(req.UID)
+	if err != nil {
+		m.Error("查询待维护管理账号失败", zap.Error(err), zap.String("target_uid", req.UID))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if target == nil || !auth.IsManagerConsoleRole(target.Role) {
+		respondUserError(c, errcode.ErrUserNotAdminAccount)
+		return
+	}
+	oldEmail := target.Email
+	_, err = m.db.updateManagerEmail(target.UID, target.Role, req.Email)
+	m.Info("manager_email_update",
+		zap.String("actor_uid", c.GetLoginUID()),
+		zap.String("target_uid", target.UID),
+		zap.String("target_role", target.Role),
+		zap.String("email_fingerprint", passwordFingerprint(req.Email)),
+		zap.String("old_email_fingerprint", passwordFingerprint(strings.ToLower(strings.TrimSpace(oldEmail)))),
+		zap.String("source_ip", wkhttp.ClientIP(c.Request)),
+		zap.Bool("success", err == nil),
+	)
+	if err != nil {
+		m.Error("更新管理账号邮箱失败", zap.Error(err), zap.String("target_uid", target.UID))
+		if errors.Is(err, ErrManagerEmailAlreadyInUse) {
+			respondUserError(c, errcode.ErrUserAlreadyExists)
+			return
+		}
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := m.mfa.invalidateUID(context.Background(), target.UID, oldEmail, req.Email); err != nil {
+		// The database update is already durable. A cleanup failure is surfaced
+		// as an internal error and logged; future challenge requests still
+		// reject the old snapshot and the TTL bounds the residual Redis state.
+		m.Error("清理管理账号旧 MFA challenge 失败", zap.Error(err), zap.String("target_uid", target.UID))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
+		return
+	}
+	c.ResponseOK()
 }
 
 // 添加一个管理员
@@ -841,6 +1256,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 		LoginName string `json:"login_name"`
 		Name      string `json:"name"`
 		Password  string `json:"password"`
+		Email     string `json:"email"`
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
@@ -861,6 +1277,11 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	}
 	if req.Password == "" {
 		respondUserRequestInvalid(c, "password")
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if err := commonbase.ValidateEmailAddress(req.Email); err != nil {
+		respondUserError(c, errcode.ErrUserEmailInvalid)
 		return
 	}
 	if err := ValidatePasswordStrength(req.Password); err != nil {
@@ -884,6 +1305,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
 	userModel.Phone = ""
 	userModel.Username = req.LoginName
+	userModel.Email = req.Email
 	userModel.Zone = ""
 	userModel.Role = string(wkhttp.Admin)
 	hashedPassword, err := HashPassword(req.Password)
@@ -903,9 +1325,31 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.ShockOn = 0
 	userModel.Sex = 1
 	userModel.Status = int(common.UserAvailable)
-	err = m.userDB.Insert(userModel)
+	tx, err := m.db.session.Begin()
 	if err != nil {
+		m.Error("开启管理员邮箱检查事务错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	owner, err := queryEmailOwner(tx, req.Email, "")
+	if err != nil {
+		m.Error("查询管理员邮箱是否已被使用错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if owner != nil {
+		respondUserError(c, errcode.ErrUserAlreadyExists)
+		return
+	}
+	if err = m.userDB.insertTx(userModel, tx); err != nil {
 		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		m.Error("提交管理员事务错误", zap.String("username", req.Name), zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
@@ -1733,10 +2177,22 @@ type managerLoginReq struct {
 }
 
 type managerLoginResp struct {
-	UID   string `json:"uid"`
-	Token string `json:"token"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
+	UID         string `json:"uid"`
+	Token       string `json:"token,omitempty"`
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	Email       string `json:"email,omitempty"`
+	ChallengeID string `json:"challenge_id,omitempty"`
+	ExpiresIn   int64  `json:"expires_in,omitempty"`
+	MFARequired bool   `json:"mfa_required,omitempty"`
+}
+
+type managerMFAChallengeResponse struct {
+	ChallengeID string `json:"challenge_id"`
+	Email       string `json:"email"`
+	ExpiresIn   int64  `json:"expires_in"`
+	CodeSent    bool   `json:"code_sent"`
+	ResendAfter int64  `json:"resend_after"`
 }
 type managerAddUserReq struct {
 	Name     string `json:"name"`
@@ -1754,12 +2210,14 @@ type adminUserResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`
+	Email        string `json:"email"`
 	RegisterTime string `json:"register_time"`
 }
 type dashboardReaderResp struct {
 	Name         string `json:"name"`
 	UID          string `json:"uid"`
 	Username     string `json:"username"`
+	Email        string `json:"email"`
 	RegisterTime string `json:"register_time"`
 }
 type managerUserResp struct {

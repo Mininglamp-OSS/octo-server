@@ -1,11 +1,14 @@
 package common
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 
@@ -180,9 +183,10 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// half-applied write. The actual writes happen later in one
 	// transaction.
 	type prepared struct {
-		def   *settingDef
-		value string
-		skip  bool
+		def            *settingDef
+		value          string
+		effectiveValue string
+		skip           bool
 	}
 	plans := make([]prepared, 0, len(req.Items))
 	for _, item := range req.Items {
@@ -194,7 +198,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			return
 		}
 
-		p := prepared{def: def, value: item.Value}
+		p := prepared{def: def, value: item.Value, effectiveValue: item.Value}
 		switch def.Type {
 		case settingTypeBool:
 			normalised, ok := normaliseBool(item.Value)
@@ -268,6 +272,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				// ciphertext — do not queue an upsert that would blank it out
 				// or accidentally store "****" as the real password.
 				p.skip = true
+				if item.Category == "support" && item.Key == "email_pwd" {
+					p.effectiveValue = m.systemSettings.SupportEmailPwd()
+				}
 				break
 			}
 			enc, err := encryptKey(item.Value)
@@ -283,10 +290,76 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				return
 			}
 			p.value = enc
+			p.effectiveValue = item.Value
 		case settingTypeString:
 			// Anything goes.
 		}
+		if def.Type != settingTypeEncrypted {
+			p.effectiveValue = p.value
+		}
 		plans = append(plans, p)
+	}
+
+	// Manager MFA uses the merged final configuration. This check is purposely
+	// before the database transaction: a failed SMTP preflight cannot leave a
+	// partially committed MFA switch or SMTP value behind.
+	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
+	managerMFATouched := false
+	smtpTouched := false
+	prospectiveSMTP := smtpSettingsSnapshot{
+		from:     m.systemSettings.SupportEmail(),
+		address:  m.systemSettings.SupportEmailSmtp(),
+		password: m.systemSettings.SupportEmailPwd(),
+	}
+	for _, p := range plans {
+		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
+			managerMFATouched = true
+			managerMFAOn = p.value == "1"
+		}
+		if p.def.Category == "support" && !p.skip {
+			switch p.def.Key {
+			case "email":
+				prospectiveSMTP.from = p.effectiveValue
+				smtpTouched = true
+			case "email_smtp":
+				prospectiveSMTP.address = p.effectiveValue
+				smtpTouched = true
+			case "email_pwd":
+				prospectiveSMTP.password = p.effectiveValue
+				smtpTouched = true
+			}
+		}
+	}
+	managerMFAProbeSucceeded := false
+	if managerMFAOn && (managerMFATouched || smtpTouched) {
+		if err := commonbase.ValidateSMTPConfiguration(
+			prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
+		); err != nil {
+			m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
+		cancel()
+		if probeErr != nil {
+			m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
+			return
+		}
+		managerMFAProbeSucceeded = true
+	}
+	if managerMFAOn && managerMFATouched {
+		var operator struct{ Email string }
+		if _, err := m.ctx.DB().Select("email").From("user").Where("uid=?", c.GetLoginUID()).Load(&operator); err != nil {
+			m.Error("查询开启管理端 MFA 的超管邮箱失败", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserQueryFailed, nil, nil)
+			return
+		}
+		if err := commonbase.ValidateEmailAddress(strings.TrimSpace(operator.Email)); err != nil {
+			httperr.ResponseErrorL(c, errcode.ErrUserManagerMFAEmailRequired, nil, nil)
+			return
+		}
 	}
 
 	// Prospective composite validation for the onboarding space-welcome
@@ -404,10 +477,24 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	}
 	committed = true
 
-	if err := m.systemSettings.Reload(); err != nil {
-		// Reload is best-effort — the row is already persisted, so other
-		// instances and the next auto-reload tick will pick it up.
-		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(err))
+	// The merged prospective configuration was already SMTP-probed before the
+	// transaction. Use the no-probe load here so this instance publishes that
+	// result without sending a duplicate probe email; generic Reload callers
+	// still trigger a one-shot probe when they observe a settings change.
+	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
+	if reloadErr != nil {
+		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
+		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。
+		// 当前系统每 60 秒会执行一次自动 reload，发现配置变化后更新本地快照。
+		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(reloadErr))
+	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
+		// The probe above used the merged prospective values. Publish its
+		// result only when the live snapshot still contains those exact values;
+		// a concurrent partial SMTP update must not make an unprobed
+		// combination look ready.
+		if !m.systemSettings.RecordManagerEmailMFAPreflightIfMatches(generation, prospectiveSMTP) {
+			m.Warn("丢弃与当前配置不匹配的管理端 MFA SMTP 预检结果")
+		}
 	}
 
 	// 写入若涉及 login.local_off,直接用刚刚校验过的 plan.value 触发 safety
@@ -586,6 +673,16 @@ const smtpTestEmailHTML = `<!doctype html>
 // jsonH is a tiny alias for inline JSON payloads. We define a local alias
 // instead of importing gin.H to keep the surface visible at the call site.
 type jsonH = map[string]interface{}
+
+type smtpSettingsSnapshot struct {
+	from     string
+	address  string
+	password string
+}
+
+func (s smtpSettingsSnapshot) SupportEmail() string     { return s.from }
+func (s smtpSettingsSnapshot) SupportEmailSmtp() string { return s.address }
+func (s smtpSettingsSnapshot) SupportEmailPwd() string  { return s.password }
 
 // normaliseBool canonicalises any accepted bool spelling to "0" / "1" so
 // the raw DB rows are consistent regardless of admin UI capitalisation.

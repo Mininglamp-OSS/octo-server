@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/internal/testsession"
+	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
 	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -44,13 +45,22 @@ func newManagerRouteOnly(t *testing.T) (*wkhttp.WKHttp, *config.Context, *Manage
 	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	ctx.SetHttpRoute(route)
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
 	resetManagerUIDRateLimit(t, ctx)
 	m := NewManager(ctx)
 	stopRollout, err := testsession.StartRollout(ctx, "manager-route-test")
 	require.NoError(t, err)
 	t.Cleanup(stopRollout)
 	m.Route(route)
-	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
+	t.Cleanup(func() {
+		if err := testutil.CleanAllTables(ctx); err != nil {
+			t.Logf("cleanup: clean tables failed: %v", err)
+			return
+		}
+		if err := commonsettings.EnsureSystemSettings(ctx).Reload(); err != nil {
+			t.Logf("cleanup: reload SystemSettings failed: %v", err)
+		}
+	})
 	return route, ctx, m
 }
 

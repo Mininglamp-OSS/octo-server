@@ -64,6 +64,9 @@ func TestCodeTypeConstants(t *testing.T) {
 		CodeTypeForgetLoginPWD,
 		CodeTypeCheckMobile,
 		CodeTypeDestroyAccount,
+		CodeTypeEmailLogin,
+		CodeTypeOIDCBind,
+		CodeTypeManagerLogin,
 	}
 
 	seen := make(map[CodeType]bool)
@@ -71,6 +74,10 @@ func TestCodeTypeConstants(t *testing.T) {
 		assert.False(t, seen[ct], "CodeType %v should be unique", ct)
 		seen[ct] = true
 	}
+	assert.Equal(t, CodeType(0), CodeTypeRegister)
+	assert.Equal(t, CodeType(5), CodeTypeEmailLogin)
+	assert.Equal(t, CodeType(6), CodeTypeOIDCBind)
+	assert.Equal(t, CodeType(7), CodeTypeManagerLogin)
 }
 
 func TestCacheKeySMSCode(t *testing.T) {

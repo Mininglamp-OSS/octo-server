@@ -86,8 +86,10 @@ func disableThirdPartyLoginForTest(t *testing.T, ctxs ...*config.Context) {
 	}
 }
 
-// helper to construct a SystemSettings backed by the test DB plus the given
-// yaml-side defaults applied to the context's config.
+// helper to construct the process-wide SystemSettings backed by the test DB
+// plus the given yaml-side defaults applied to the singleton's captured
+// context. Production handlers also use EnsureSystemSettings, so tests must
+// exercise the same object instead of creating a per-test settings pointer.
 func newTestSystemSettings(t *testing.T, apply func(s *SystemSettings)) *SystemSettings {
 	t.Helper()
 	// Defensive reset: key_encryption_test.go intentionally Unsetenvs the
@@ -96,21 +98,22 @@ func newTestSystemSettings(t *testing.T, apply func(s *SystemSettings)) *SystemS
 	// here so test order is irrelevant.
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	_, ctx := testutil.NewTestServer()
-	cfg := ctx.GetConfig()
-	origGithub := cfg.Github
-	origGitee := cfg.Gitee
+	settings := EnsureSystemSettings(ctx)
+	originalConfig := *settings.ctx.GetConfig()
 	t.Cleanup(func() {
-		cfg.Github = origGithub
-		cfg.Gitee = origGitee
+		// Clean the shared database before reloading the same singleton. This
+		// prevents a test's MFA/system-setting rows from leaking into a later
+		// handler test while preserving the process-wide object identity.
+		_ = testutil.CleanAllTables(ctx)
+		*settings.ctx.GetConfig() = originalConfig
+		_ = settings.Reload()
 	})
 	require.NoError(t, testutil.CleanAllTables(ctx))
-	db := newSystemSettingDB(ctx)
-	s := NewSystemSettings(ctx, db)
-	require.NoError(t, s.Load())
+	require.NoError(t, settings.Reload())
 	if apply != nil {
-		apply(s)
+		apply(settings)
 	}
-	return s
+	return settings
 }
 
 func TestSystemSettings_BoolFallsBackToYamlWhenUnset(t *testing.T) {

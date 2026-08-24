@@ -345,6 +345,9 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.common.manager_mfa_smtp_invalid"]
+other = "The SMTP configuration required by management-console MFA is invalid."
+
 ["err.server.common.space_welcome_config_invalid"]
 other = "Invalid space welcome configuration."
 
@@ -1133,6 +1136,24 @@ other = "Too many failed login attempts, account temporarily locked. Please try 
 
 ["err.server.user.login_pwd_update_failed"]
 other = "Failed to update login password."
+
+["err.server.user.manager_email_mfa_enable_email_required"]
+other = "The operator must have a valid email address before enabling management-console MFA."
+
+["err.server.user.manager_mfa_challenge_invalid"]
+other = "The management-console MFA challenge is invalid or expired."
+
+["err.server.user.manager_mfa_code_invalid"]
+other = "The management-console verification code is invalid."
+
+["err.server.user.manager_mfa_misconfigured"]
+other = "Management-console MFA is temporarily unavailable."
+
+["err.server.user.manager_mfa_rate_limited"]
+other = "The management-console verification code cannot be sent yet. Please try again later."
+
+["err.server.user.manager_mfa_settings_unavailable"]
+other = "Management-console MFA settings are not ready."
 
 ["err.server.user.manager_permission_required"]
 other = "This account does not have management permission."
