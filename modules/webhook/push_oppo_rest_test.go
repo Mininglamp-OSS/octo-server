@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -406,9 +407,9 @@ func TestOPPOPushSanitizesRequiredNotificationText(t *testing.T) {
 		{
 			name:        "multibyte values are truncated by rune",
 			title:       strings.Repeat("题", 51),
-			content:     strings.Repeat("文", 201),
+			content:     strings.Repeat("文", 51),
 			wantTitle:   strings.Repeat("题", 50),
-			wantContent: strings.Repeat("文", 200),
+			wantContent: strings.Repeat("文", 50),
 		},
 	}
 
@@ -426,7 +427,7 @@ func TestOPPOPushSanitizesRequiredNotificationText(t *testing.T) {
 			assert.Equal(t, tt.wantTitle, message.Notification.Title)
 			assert.Equal(t, tt.wantContent, message.Notification.Content)
 			assert.LessOrEqual(t, len([]rune(message.Notification.Title)), 50)
-			assert.LessOrEqual(t, len([]rune(message.Notification.Content)), 200)
+			assert.LessOrEqual(t, len([]rune(message.Notification.Content)), 50)
 		})
 	}
 }
@@ -434,15 +435,34 @@ func TestOPPOPushSanitizesRequiredNotificationText(t *testing.T) {
 func TestOPPOPushRejectsOversizedActionParameters(t *testing.T) {
 	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
 	pusher.configErr = nil
-	payload := NewOPPOPayload(&PayloadInfo{
-		Title:      "title",
-		Content:    "content",
-		ChannelID:  strings.Repeat("界", 1400),
-		MessageSeq: 1,
+	baseRouting, err := json.Marshal(oppoRoutingParameters{
+		ChannelID:   "a",
+		ChannelType: 1,
+		MessageSeq:  1,
+	})
+	require.NoError(t, err)
+	overhead := utf8.RuneCount(baseRouting) - 1
+
+	atLimit := NewOPPOPayload(&PayloadInfo{
+		Title:       "title",
+		Content:     "content",
+		ChannelID:   strings.Repeat("a", 4000-overhead),
+		ChannelType: 1,
+		MessageSeq:  1,
+	}, "1")
+	_, err = pusher.buildUnicastMessage("registration-id", atLimit)
+	require.NoError(t, err)
+
+	overLimit := NewOPPOPayload(&PayloadInfo{
+		Title:       "title",
+		Content:     "content",
+		ChannelID:   strings.Repeat("a", 4001-overhead),
+		ChannelType: 1,
+		MessageSeq:  1,
 	}, "1")
 
-	_, err := pusher.buildUnicastMessage("registration-id", payload)
-	require.ErrorContains(t, err, "action parameters exceed 4096 bytes")
+	_, err = pusher.buildUnicastMessage("registration-id", overLimit)
+	require.ErrorContains(t, err, "action parameters exceed 4000 characters")
 }
 
 func TestOPPOPushRefreshesInvalidTokenOnceWithStableDedupeID(t *testing.T) {
@@ -788,8 +808,56 @@ func TestOPPOPushLogsProviderBusinessResult(t *testing.T) {
 		assert.Equal(t, "OPPO push rejected", warnings[0].message)
 		assert.Equal(t, int64(54), warnings[0].fields["oppo_code"])
 		assert.Equal(t, false, warnings[0].fields["retryable"])
+		assert.Equal(t, "registra***", warnings[0].fields["device_token"])
 		assert.NotContains(t, warnings[0].fields, "auth_token")
 		assert.NotContains(t, warnings[0].fields, "registration_id")
+	})
+
+	t.Run("invalid registration ID is debug noise", func(t *testing.T) {
+		logger := &recordingOPPOLogger{}
+		pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":41,"message":"invalid registration id"}`)
+		}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
+		pusher.Log = logger
+
+		err := pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1"))
+		require.Error(t, err)
+		warnings, debugs := logger.snapshot()
+		assert.Empty(t, warnings)
+		require.Len(t, debugs, 1)
+		assert.Equal(t, "OPPO push rejected", debugs[0].message)
+		assert.Equal(t, int64(41), debugs[0].fields["oppo_code"])
+		assert.Equal(t, "registra***", debugs[0].fields["device_token"])
+	})
+
+	t.Run("recovered auth token rejection is debug noise", func(t *testing.T) {
+		logger := &recordingOPPOLogger{}
+		unicastCalls := 0
+		pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/server/v1/auth":
+				writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"auth_token":"fresh-token"}}`)
+			case "/server/v1/message/notification/unicast":
+				unicastCalls++
+				if unicastCalls == 1 {
+					writeOPPOJSON(t, w, http.StatusOK, `{"code":11,"message":"invalid auth token"}`)
+					return
+				}
+				writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+			default:
+				http.NotFound(w, r)
+			}
+		}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
+		pusher.Log = logger
+
+		require.NoError(t, pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1")))
+		warnings, debugs := logger.snapshot()
+		assert.Empty(t, warnings)
+		require.Len(t, debugs, 1)
+		assert.Equal(t, "OPPO auth token rejected; refreshing", debugs[0].message)
+		assert.Equal(t, int64(11), debugs[0].fields["oppo_code"])
+		assert.Equal(t, true, debugs[0].fields["retryable"])
+		assert.Equal(t, "registra***", debugs[0].fields["device_token"])
 	})
 
 	t.Run("accepted message ID", func(t *testing.T) {

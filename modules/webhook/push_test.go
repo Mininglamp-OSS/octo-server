@@ -90,6 +90,20 @@ func TestOPPOPush(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestOPPOAuth(t *testing.T) {
+	appKey := os.Getenv("OPPO_APP_KEY")
+	masterSecret := os.Getenv("OPPO_MASTER_SECRET")
+	if appKey == "" || masterSecret == "" {
+		t.Skip("OPPO credentials not configured (set OPPO_APP_KEY and OPPO_MASTER_SECRET)")
+	}
+
+	oppo := NewOPPOPush("", appKey, "", masterSecret, nil)
+	assert.NoError(t, oppo.configErr)
+	token, err := oppo.getAuthToken()
+	assert.NoError(t, err)
+	assert.NotEmpty(t, token)
+}
+
 func TestVIVOPush(t *testing.T) {
 	appID := os.Getenv("VIVO_APP_ID")
 	appKey := os.Getenv("VIVO_APP_KEY")
