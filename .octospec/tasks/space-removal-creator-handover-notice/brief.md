@@ -204,9 +204,26 @@ member of the space in `(space_id, status, id)` order, while the transfer demote
 uses `(space_id, uid)`; two orders over one row set is the cycle. The lock statement
 now carries `FORCE INDEX (spacemember_spaceid_uid)` (extracted to the const
 `selectMembersForRemovalForUpdateSQL`), which pins the plan to a `(space_id, uid)`
-range: only the target rows, in the same order as the transfer. The batch-vs-batch
-case was always safe (same plan on both sides); this closes the cross-path case and
-also narrows the lock scope from the whole space back to the targets.
+range: only the target rows, and narrows the lock scope from the whole space back to
+the targets. The batch-vs-batch case was always safe (same plan on both sides).
+
+**Round-8 correction.** `FORCE INDEX` alone does **not** close the batch-vs-transfer
+case, and an earlier revision here wrongly said it did. `transferOwnerAdminLocked`
+acquires non-monotonically — it single-row-locks the transfer target first, then
+range-scans the demote — so when the target is inside the batch it is a
+deterministic AB-BA regardless of the batch's index (two reviewers measured
+40/40 and 42/120 with the real functions; the per-uid `main` shape is 0). The batch
+can't unify the *other* path's order from its own call site, so ordering is not a
+complete fix. All three multi-row `space_member` writers — `removeMembersLocked`,
+`removeMembersForce`, `transferOwnerAdminLocked` — are now wrapped in
+`retryOnDeadlock`, a bounded retry on MySQL 1213/1205. Deadlock rolls the victim back
+with nothing half-committed, so a retry is safe and usually succeeds on the second
+try. `FORCE INDEX` is kept: it shrinks the lock footprint and the blocking window and
+removes batch-vs-batch, it just is not the cross-path fix. Guarded by
+`TestRetryOnDeadlockRecoversFrom1213` (injects a 1213: retries to success, gives up
+bounded, passes domain errors through) — the real deadlock race is not reliably
+reproducible locally, so the retry logic is pinned by injection rather than a flaky
+concurrent test.
 
 With A closed, B alone degrades to silence — the pre-PR behaviour, never a false
 name. B itself is unchanged and still tracked (see below).

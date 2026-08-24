@@ -405,3 +405,48 @@ safely), plus a genuinely missing guard: swapping the two `Name` values in `extr
 shipped an inverted message and nothing caught it, because the tests asserted the
 uid positions but not the names. A positional `payloadExtraNameAt` closes it; the
 mutation now goes red.
+
+## Round 8 — FORCE INDEX was still not the whole fix; retry is
+
+Round 7 shipped `FORCE INDEX` claiming it put the batch in the same lock order as
+the owner transfer, closing the cross-path deadlock. Two reviewers took the real
+functions to a live MySQL and refuted it, with controls:
+
+- FORCE INDEX vs owner transfer, target **inside** the batch: 40/40 deadlock; the
+  batch aborts with a 500. Target outside: 0/40.
+- Real `removeMembersLocked` vs real `transferOwnerAdmin`, 219 members, mid-list
+  target: 42/120 (35%).
+- Control — `main`'s per-uid loop vs the same transfer: 0. It holds one lock at a
+  time and structurally cannot be the hold-and-wait side.
+
+The hole in my round-7 reasoning: `transferOwnerAdminLocked` is **two-step and
+non-monotonic** — it single-row-locks the transfer target *first*, then range-scans
+the demote. Aligning my own statement's index does nothing about the target it
+grabbed out of band. You cannot fix an AB-BA by ordering only the A side; the B side
+has its own order you don't control from your call site. I had, for the second round
+running, asserted a deadlock closure that measurement refuted — and both times the
+tell was the same: I reasoned about my statement's plan without accounting for what
+the *other* transaction does.
+
+I could not reproduce the deadlock in my own harness (low concurrency → low overlap
+probability), which is exactly why I should not have trusted the round-7 closure
+claim in the first place: absence of a repro in a weak harness is not evidence of
+closure, and two reviewers with proper harnesses and controls outrank my null result.
+
+The fix chosen (with the maintainer, who picked it from three options) is the one
+both reviewers recommended: a bounded retry on MySQL 1213/1205 around all three
+multi-row `space_member` writers. It closes every cross-path cycle regardless of the
+other path's order, because a deadlock rolls the victim back cleanly and the retry
+re-runs against a now-uncontended state. `FORCE INDEX` stays — it genuinely narrows
+the lock footprint and removes batch-vs-batch — it just was never the cross-path fix.
+
+Guarded deterministically by injecting a 1213 into `retryOnDeadlock`
+(`TestRetryOnDeadlockRecoversFrom1213`), not by a concurrent deadlock test I cannot
+make fire. When the failure you are guarding against is a race you cannot reliably
+reproduce, pin the recovery mechanism directly.
+
+The reviewer's process note is worth keeping: three consecutive rounds on the same
+deadlock class is the signature of a design that wants settling once, not patching.
+A shared retry primitive over all the mutators is that settling — and the same
+wrapper is the follow-up answer for `upsertMembers` and the pre-existing group-member
+ABBA.

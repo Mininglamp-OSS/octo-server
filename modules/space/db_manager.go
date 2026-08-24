@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -426,6 +427,43 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权
 var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer ownership first")
 
+// spaceMutatorMaxAttempts 限定 space_member 写路径遇死锁时的重试次数。
+const spaceMutatorMaxAttempts = 5
+
+// isRetryableTxErr 判定是否为可重试的瞬时事务错误：InnoDB 死锁(1213)或锁等待超时(1205)。
+// 与 modules/common space_welcome_config_store.go 的同名判定保持一致。
+func isRetryableTxErr(err error) bool {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1213 || myErr.Number == 1205
+	}
+	return false
+}
+
+// retryOnDeadlock 对**整事务、全有全无**的写操作做有界重试。
+//
+// 为什么用重试而不是让每条路径统一加锁顺序（PR #804 round-8 review，两名 reviewer
+// 各自在真实 MySQL 上实测确认）：space_member 上有多条会一次锁多行的写路径——
+// removeMembersLocked（批量移除）、removeMembersForce（超管强制移除）、
+// transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）。
+// 它们各自的加锁顺序由各自的索引/结构决定，从任何一个调用点都无法统一**对方**的顺序，
+// 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了——FORCE INDEX 只收窄了锁面、关掉了
+// 批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是确定性的）。
+//
+// 死锁时 InnoDB 已把被选中的事务整体回滚、没有半提交状态，把整个事务重跑一遍即可；
+// 幸存的那一方已经完成，重试通常第二次就成功。只能用于幂等或全有全无的操作：这三条
+// 写路径都在单事务里全有全无地提交，符合。领域错误（ErrCannotRemoveOwner 等）
+// isRetryableTxErr 判否、原样透传，不影响调用方的 errors.Is。
+func retryOnDeadlock(fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= spaceMutatorMaxAttempts; attempt++ {
+		if err = fn(); !isRetryableTxErr(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("space_member 写操作重试 %d 次仍死锁: %w", spaceMutatorMaxAttempts, err)
+}
+
 // removeMembersForce 在单一事务中强制移除成员。
 //
 // 用 SELECT ... FOR UPDATE 锁定目标行并原子校验 role，若任一 uid 当前是 owner 则整体回滚。
@@ -436,6 +474,17 @@ var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer owner
 // `AND status=1` 守卫关掉：本事务 commit 后该 uid 的 status=0，后续 transfer 的 UPDATE 影响 0 行。
 // 返回本次真正被移除的 uid，供调用方精确地做失效缓存与事件广播。
 func (d *managerDB) removeMembersForce(spaceId string, uids []string, operatorUID string) ([]string, error) {
+	var removed []string
+	err := retryOnDeadlock(func() error {
+		var e error
+		removed, e = d.removeMembersForceOnce(spaceId, uids, operatorUID)
+		return e
+	})
+	return removed, err
+}
+
+// removeMembersForceOnce 是 removeMembersForce 的单次尝试；死锁重试见调用方。
+func (d *managerDB) removeMembersForceOnce(spaceId string, uids []string, operatorUID string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
@@ -503,6 +552,13 @@ func (d *managerDB) transferOwnerAdmin(spaceId, newOwnerUID string) error {
 // 避免「先降老 owner → 目标被并发 remove → 后续 UPDATE 影响 0 行」导致空间无主。
 // 若目标不存在 / 已被移除，整个事务回滚并返回 ErrTransferTargetMissing。
 func transferOwnerAdminLocked(sess *dbr.Session, spaceId, newOwnerUID string) error {
+	return retryOnDeadlock(func() error {
+		return transferOwnerAdminLockedOnce(sess, spaceId, newOwnerUID)
+	})
+}
+
+// transferOwnerAdminLockedOnce 是 transferOwnerAdminLocked 的单次尝试；死锁重试见调用方。
+func transferOwnerAdminLockedOnce(sess *dbr.Session, spaceId, newOwnerUID string) error {
 	tx, err := sess.Begin()
 	if err != nil {
 		return err
@@ -596,10 +652,18 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 
 // selectMembersForRemovalForUpdateSQL 是 removeMembersLocked 的整批锁定查询。
 //
-// FORCE INDEX 是**语义性**的，不是性能调优：它把加锁顺序钉在 (space_id, uid) 上，
-// 与 transferOwnerAdminLocked 同序，避免跨路径死锁。原因见 removeMembersLocked 里
-// 的注释。TestRemoveMembersLockedForcesUniqueIndexPlan 用同一个常量断言计划，一旦
-// 有人删掉 FORCE、优化器回退到 (space_id, status)，那条测试立刻变红。
+// FORCE INDEX 是**语义性**的，不是性能调优：不 FORCE 时优化器在真实规模上会选
+// (space_id, status)，锁住整个空间的活跃行、锁序也乱；FORCE 到 (space_id, uid) 把锁面
+// 收敛到目标本身、并让批量 vs 批量同序（同一条语句同一个计划）。
+//
+// ⚠️ 它**不能**单独消除批量 vs 群主转让的跨路径死锁：transferOwnerAdminLocked 是
+// 先单行锁目标、再扫描降级的两段式，非单调，从本调用点无法统一它的顺序（round-8
+// 两名 reviewer 实测：FORCE 后目标落在批次内仍确定性死锁）。跨路径死锁由三条写路径
+// 共用的 retryOnDeadlock 兜底，见其注释。FORCE 仍然值得留：它把锁面和阻塞窗口收窄了，
+// 也让死锁少发一档。
+//
+// TestRemoveMembersLockedForcesUniqueIndexPlan 用同一个常量断言计划，一旦有人删掉
+// FORCE、优化器回退，那条测试立刻变红。
 const selectMembersForRemovalForUpdateSQL = "SELECT uid, role FROM space_member " +
 	"FORCE INDEX (spacemember_spaceid_uid) " +
 	"WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE"
@@ -636,6 +700,20 @@ type spaceMemberRoleRow struct {
 // transactional outbox 反而更干净（成员行与工单同生共死这一点不变），调用方也不必再
 // 为「前缀已提交」做补偿收尾。owner 与同级及更高角色仍是**静默跳过**，不是错误。
 func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
+	var removed []string
+	err := retryOnDeadlock(func() error {
+		var e error
+		removed, e = removeMembersLockedOnce(sess, spaceId, uids, rejectRoleAtOrAbove, operatorUID, reason)
+		return e
+	})
+	return removed, err
+}
+
+// removeMembersLockedOnce 是 removeMembersLocked 的单次尝试；死锁重试见调用方
+// （FORCE INDEX 收窄锁面并关掉批量 vs 批量，但批量 vs 转让/强制移除的跨路径死锁靠
+//
+//	retryOnDeadlock 兜底，见 retryOnDeadlock 的注释）。
+func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
 	}
@@ -652,14 +730,17 @@ func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejec
 	// status)。不加 FORCE 时优化器是按代价选的，实测（MySQL 8.0 + ANALYZE）在本端点
 	// 真实规模上（250 人空间、200 uid 批）选的是 **spacemember_spaceid_status**：
 	// 于是锁按 (space_id, status, id) 顺序、且把该空间**所有** status=1 的行都锁住
-	// （250 把，而非 200 个目标），既扩大了锁面（挡住并发 joinSpace/leaveSpace/
-	// transferOwner），又与 transferOwnerAdminLocked 的降级 UPDATE（走
-	// spacemember_spaceid_uid、按 uid 序）取到**不同的加锁顺序**，构成跨路径 AB-BA
-	// 死锁。FORCE INDEX 把计划钉成 range on (space_id, uid)：只锁 200 个目标、按 uid
-	// 序，与转让路径同序，且锁面收敛到目标本身（PR #804 round-7 review 实测）。
+	// （250 把，而非 200 个目标），扩大了锁面（挡住并发 joinSpace/leaveSpace/transferOwner）。
+	// FORCE INDEX 把计划钉成 range on (space_id, uid)：只锁 200 个目标、按 uid 序，锁面
+	// 收敛到目标本身，并让**批量 vs 批量**同序（同一条语句同一个计划，无法互相成环）。
 	//   - 只 ORDER BY uid **不行**：锁在扫描期就获取，排序发生在其后。
 	//   - 逐个 FOR UPDATE 也不行：那会引回按调用方顺序持多把锁的批次间 AB-BA。
 	// SQL 抽成常量 selectMembersForRemovalForUpdateSQL，与计划断言测试共用，防止漂移。
+	//
+	// ⚠️ FORCE INDEX **不足以**消除批量 vs 群主转让的跨路径死锁：transferOwnerAdminLocked
+	// 先单行锁目标、再扫描降级，是两段式非单调获取，目标落在批次内时仍确定性死锁
+	// （round-8 两名 reviewer 实测）。那一类由外层 retryOnDeadlock 兜底。这里 FORCE 的
+	// 价值是收窄锁面/阻塞窗口、并关掉批量 vs 批量，不是根治跨路径。
 	//
 	// 角色重读仍在锁内：这条 SELECT 把每个成员的当前 role 连同锁一起取回，随后在 Go
 	// 里做层级判定，语义与 removeMemberLocked 逐个重读一致（防止 pre-check 之后目标被

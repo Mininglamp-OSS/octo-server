@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	mysqldrv "github.com/go-sql-driver/mysql"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1552,6 +1553,9 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 // 直接 EXPLAIN 生产共用的那个 SQL 常量（把占位符换成字面量），所以一旦有人删掉
 // FORCE、优化器回退，这条立刻变红。对照组证明断言不是恒真：去掉 FORCE，同一规模下
 // 计划确实回退到 (space_id, status)。
+//
+// 注意：这条只钉「锁面收敛 + 批量 vs 批量同序」。批量 vs 群主转让的跨路径死锁 FORCE
+// 关不掉，由 retryOnDeadlock 兜底、TestRetryOnDeadlockRecoversFrom1213 钉住。
 func TestRemoveMembersLockedForcesUniqueIndexPlan(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -1615,4 +1619,66 @@ func TestRemoveMembersLockedForcesUniqueIndexPlan(t *testing.T) {
 				return "ALL/full-scan"
 			}())
 	}
+}
+
+// TestRetryOnDeadlockRecoversFrom1213 是跨路径死锁修复的**主守卫**（PR #804 round-8）。
+//
+// space_member 上批量移除 vs 群主转让/强制移除的加锁顺序互不相同、且无法从单个调用点
+// 统一（转让是两段式非单调），所以 FORCE INDEX 收窄锁面后仍会跨路径 AB-BA 死锁。三条
+// 写路径都套了 retryOnDeadlock 兜底。真实死锁竞态在本机难以稳定复现，所以这里**注入**
+// 一个 InnoDB 死锁(1213)直接钉住重试逻辑本身：
+//   - 前 N 次返回 1213、之后成功 → 整体成功，且确实重跑了 N+1 次；
+//   - 一直 1213 → 有界次数后放弃并包装报错，不会无限重试；
+//   - 领域错误（非 1213）→ 第一次就原样透传，errors.Is 仍成立。
+func TestRetryOnDeadlockRecoversFrom1213(t *testing.T) {
+	deadlock := &mysqldrv.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"}
+	lockWait := &mysqldrv.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}
+
+	t.Run("前几次死锁后成功", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error {
+			calls++
+			if calls < 3 {
+				return deadlock
+			}
+			return nil
+		})
+		require.NoError(t, err, "死锁回滚后重跑应当最终成功")
+		assert.Equal(t, 3, calls, "应当正好重试到成功那一次")
+	})
+
+	t.Run("锁等待超时也重试", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error {
+			calls++
+			if calls < 2 {
+				return lockWait
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 2, calls)
+	})
+
+	t.Run("持续死锁则有界放弃", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return deadlock })
+		require.Error(t, err, "重试用尽必须报错，不能无限重试")
+		assert.Equal(t, spaceMutatorMaxAttempts, calls, "严格重试 spaceMutatorMaxAttempts 次")
+		assert.ErrorIs(t, err, deadlock, "包装后原始死锁错误仍可被 errors.Is 取到")
+	})
+
+	t.Run("领域错误第一次就原样透传", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return ErrCannotRemoveOwner })
+		assert.Equal(t, 1, calls, "非死锁错误不得重试")
+		assert.ErrorIs(t, err, ErrCannotRemoveOwner, "领域错误必须原样透传，否则调用方的 errors.Is 失效")
+	})
+
+	t.Run("一次成功不重试", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return nil })
+		require.NoError(t, err)
+		assert.Equal(t, 1, calls)
+	})
 }
