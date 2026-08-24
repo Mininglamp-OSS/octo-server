@@ -250,3 +250,49 @@ make i18n-extract-check && make i18n-lint   # 预期无变化（不新增 errcod
    `TestRemoveGroupMembers_AdminKickStillCascadesManagerBot`（后者同时补上了
    评审指出的测试盲区 —— `space_member_removal_test.go` 的 `seedInvitedBot`
    把 role 硬编码成 0，级联对角色 bot 的处理此前从无覆盖）。
+
+7. **并发 / 多副本确认（合并前）。**
+   自助移除给级联路径新开了一个**普通成员可高频触发**的入口，因此合并前单独
+   核了锁面、死锁与读路径开销。结论：线上安全，但过程中挖出一个测试库缺陷。
+
+   **锁面（实测，非推断）**：级联的 `FOR UPDATE` 联表查询在有
+   `idx_robot_creator_uid` 时，MySQL 从 `robot` 侧 `ref` 进入（只扫该主人名下的
+   bot），再按 `group_no_uid` 唯一索引 `eq_ref` 回查。用两个并发 session 量过，
+   持锁期间：同群的其他人类成员可改、**新成员可入群**、其他主人的 bot 可改，
+   只有「该主人自己的 bot」在 `robot` 与 `group_member` 两侧被挡。
+   即锁面正好覆盖真正要改的行，不存在按群或按表的串行化。
+   加不加 `role` 谓词（补充决策 6）执行计划完全一致。
+
+   **死锁**：最坏交错（所有者自助移除 ‖ 群主踢该所有者 ‖ 重复自助移除，三者
+   争抢同一批行）跑 360 次操作，0 死锁、0 锁等待超时，且每轮最终状态一致
+   （主人与 bot 都离群、无重复成员行）。
+
+   **测试库缺陷（已修）**：`api_test.go` 的 TestMain 手工建 `robot` 表，建索引
+   那句写的是 `CREATE UNIQUE INDEX IF NOT EXISTS`——MySQL 8.0 不支持 CREATE INDEX
+   的 `IF NOT EXISTS`（MariaDB/Postgres 才有），每次都以 1064 语法错误失败，而
+   `db.Exec` 的 error 无人检查，于是索引**从来没建成过**；`idx_robot_creator_uid`
+   更是压根没建。后果不只是慢：没有该索引时上面那条 `FOR UPDATE` 退化成 `robot`
+   全表扫描并对**整张表**加 X 锁。实测无索引时 120 次并发操作里 8 次撞 MySQL 死锁
+   1213，补齐后 360 次 0 死锁；group 全量套件也从 148.9s 降到 97.9s。
+   已改为查 `information_schema` 再建的幂等写法，失败直接 panic 而不是静默吞掉。
+   线上不受影响：这两个索引由 `modules/robot` 的迁移建立
+   （20210926000001 / 20260226000002），只是 `modules/robot` 不在本 package 的
+   依赖集里，CI 每个 package 重建库时不会跑到，才需要在 TestMain 里对齐。
+   回归：`TestBotOwnerSelfRemoval_RobotIndexesMatchProduction`、
+   `TestBotOwnerSelfRemoval_ConcurrentWithOwnerKick`（两条都做过变异验证：
+   还原成坏写法并删索引后分别转红，后者报出 4/60 次被吞掉的级联失败）。
+
+   **读路径开销**：`fillBotOwnedByMe` 不是 N+1 —— 页面内没有 bot 时直接短路，
+   有 bot 时固定两条走索引的查询（`ExistMemberActive` 走 `group_no_uid`，
+   `QueryBotUIDsOwnedByUIDs` 走 `idx_robot_creator_uid`）。
+   202 人成员页实测：无 bot 与改动前一致，有 bot 时 +246µs（约 7%）。
+
+   **多副本**：本次改动没有引入任何进程内状态（无新增全局变量 / 缓存）；
+   两条路由挂的 `SharedUIDRateLimiter` 是 Redis Lua 令牌桶，配额按 uid 全局共享，
+   不会因副本数变成 N 倍。
+
+   **已知遗留（未在本 PR 处理）**：`service.go` 级联失败时返回
+   `errors.New("failed to cascade-remove invited bots")`，**丢掉底层错误**，
+   死锁 1213 也会被吞成这一句。原因已由 service 层 `zap.Error(cerr)` 单独记日志、
+   且 handler 只回注册过的错误码（不外泄），故本次不扩大 diff；
+   上面的并发用例把 `cascade-remove` 单独归一类断言，正是为了让它一旦发生就转红。
