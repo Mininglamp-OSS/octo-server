@@ -71,6 +71,6 @@ source: self
   不包含凭据或 registration_id。
 - [x] 聚焦测试、race、10 次重复运行、OPPO adapter coverage 83.0%、`go vet ./modules/webhook`、
   `golangci-lint run ./modules/webhook/...` 与 `git diff --check` 通过。
-- [x] 已尝试模块级回归；共享测试库存在 checkout 未知的
-  `20260820000001_featuregate_init.sql`，在 `testutil.NewTestServer` 创建 migration plan 时阻塞。
-  未修改或清理共享测试库。
+- [x] `go test ./modules/webhook -count=1` 已通过：使用临时 octo-lib testutil overlay 指向独立的
+  `test_oppo_santiago` 数据库运行，完成后已删除该临时库。默认共享 `test` 库仍存在 checkout
+  未知的 `20260820000001_featuregate_init.sql`；未修改或清理共享测试库。
