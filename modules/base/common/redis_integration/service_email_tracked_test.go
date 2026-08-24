@@ -1,4 +1,4 @@
-package common
+package common_test
 
 import (
 	"bufio"
@@ -8,8 +8,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	common "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -116,7 +118,7 @@ func (s *trackedSMTPServer) handle(conn net.Conn) {
 	}
 }
 
-func newTrackedEmailService(t *testing.T, smtpAddr string) (*EmailService, *config.Context) {
+func newTrackedEmailService(t *testing.T, smtpAddr string) (*common.EmailService, *config.Context) {
 	t.Helper()
 	cfg := config.New()
 	cfg.Test = true
@@ -124,14 +126,17 @@ func newTrackedEmailService(t *testing.T, smtpAddr string) (*EmailService, *conf
 	cfg.Support.EmailPwd = "smtp-password"
 	cfg.Support.EmailSmtp = smtpAddr
 	ctx := config.NewContext(cfg)
-	service := NewEmailService(ctx, nil)
+	if _, err := ctx.GetRedisConn().Ping(); err != nil {
+		t.Skipf("Redis unavailable: %v", err)
+	}
+	service := common.NewEmailService(ctx, nil)
 	t.Cleanup(func() {
 		for _, key := range []string{
-			EmailCodeKey("mfa-recipient@example.com", CodeTypeManagerLogin),
-			EmailCodeStatusKey("mfa-recipient@example.com", CodeTypeManagerLogin),
-			EmailRateLimitKey("mfa-recipient@example.com", CodeTypeManagerLogin),
-			EmailCodeKey("ordinary@example.com", CodeTypeEmailLogin),
-			EmailCodeStatusKey("ordinary@example.com", CodeTypeEmailLogin),
+			common.EmailCodeKey("mfa-recipient@example.com", common.CodeTypeManagerLogin),
+			common.EmailCodeStatusKey("mfa-recipient@example.com", common.CodeTypeManagerLogin),
+			common.EmailRateLimitKey("mfa-recipient@example.com", common.CodeTypeManagerLogin),
+			common.EmailCodeKey("ordinary@example.com", common.CodeTypeEmailLogin),
+			common.EmailCodeStatusKey("ordinary@example.com", common.CodeTypeEmailLogin),
 		} {
 			_ = ctx.GetRedisConn().Del(key)
 		}
@@ -139,15 +144,17 @@ func newTrackedEmailService(t *testing.T, smtpAddr string) (*EmailService, *conf
 	return service, ctx
 }
 
+const trackedEmailCodeTTL = 5 * time.Minute
+
 func TestTrackedManagerCodeRequiresSMTPAndSentStatus(t *testing.T) {
 	server := newTrackedSMTPServer(t, false)
 	service, ctx := newTrackedEmailService(t, server.address())
 	email := "mfa-recipient@example.com"
-	codeKey := EmailCodeKey(email, CodeTypeManagerLogin)
-	statusKey := EmailCodeStatusKey(email, CodeTypeManagerLogin)
+	codeKey := common.EmailCodeKey(email, common.CodeTypeManagerLogin)
+	statusKey := common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin)
 
 	require.NoError(t, service.SendVerifyCodeTrackedWithAttempt(
-		context.Background(), email, CodeTypeManagerLogin, "zh-CN", "attempt-1",
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-1",
 	))
 	code, err := ctx.GetRedisConn().GetString(codeKey)
 	require.NoError(t, err)
@@ -158,9 +165,9 @@ func TestTrackedManagerCodeRequiresSMTPAndSentStatus(t *testing.T) {
 
 	// A manager code with a missing status is not accepted even if the code key
 	// itself is present. This is the delivery-confirmation boundary.
-	require.NoError(t, ctx.GetRedisConn().SetAndExpire(codeKey, code, emailCodeTTL))
+	require.NoError(t, ctx.GetRedisConn().SetAndExpire(codeKey, code, trackedEmailCodeTTL))
 	require.NoError(t, ctx.GetRedisConn().Del(statusKey))
-	err = service.Verify(context.Background(), email, code, CodeTypeManagerLogin)
+	err = service.Verify(context.Background(), email, code, common.CodeTypeManagerLogin)
 	assert.Error(t, err)
 }
 
@@ -170,12 +177,12 @@ func TestTrackedManagerCodeRemovesCodeWhenSMTPFails(t *testing.T) {
 	email := "mfa-recipient@example.com"
 
 	err := service.SendVerifyCodeTrackedWithAttempt(
-		context.Background(), email, CodeTypeManagerLogin, "zh-CN", "attempt-failed",
+		context.Background(), email, common.CodeTypeManagerLogin, "zh-CN", "attempt-failed",
 	)
 	assert.Error(t, err)
-	code, getErr := ctx.GetRedisConn().GetString(EmailCodeKey(email, CodeTypeManagerLogin))
+	code, getErr := ctx.GetRedisConn().GetString(common.EmailCodeKey(email, common.CodeTypeManagerLogin))
 	require.NoError(t, getErr)
-	status, getErr := ctx.GetRedisConn().GetString(EmailCodeStatusKey(email, CodeTypeManagerLogin))
+	status, getErr := ctx.GetRedisConn().GetString(common.EmailCodeStatusKey(email, common.CodeTypeManagerLogin))
 	require.NoError(t, getErr)
 	assert.Empty(t, code)
 	assert.Empty(t, status)
@@ -187,8 +194,8 @@ func TestOrdinaryEmailCodeMissingStatusRetainsCompatibility(t *testing.T) {
 	email := "ordinary@example.com"
 	code := "123456"
 	require.NoError(t, ctx.GetRedisConn().SetAndExpire(
-		EmailCodeKey(email, CodeTypeEmailLogin), code, emailCodeTTL,
+		common.EmailCodeKey(email, common.CodeTypeEmailLogin), code, trackedEmailCodeTTL,
 	))
-	require.NoError(t, ctx.GetRedisConn().Del(EmailCodeStatusKey(email, CodeTypeEmailLogin)))
-	assert.NoError(t, service.Verify(context.Background(), email, code, CodeTypeEmailLogin))
+	require.NoError(t, ctx.GetRedisConn().Del(common.EmailCodeStatusKey(email, common.CodeTypeEmailLogin)))
+	assert.NoError(t, service.Verify(context.Background(), email, code, common.CodeTypeEmailLogin))
 }
