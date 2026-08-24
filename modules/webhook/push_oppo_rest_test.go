@@ -565,8 +565,33 @@ func TestOPPOPushHTTPClientHasBoundedTimeoutAndNamespacedCacheKey(t *testing.T) 
 	client, ok := first.httpClient.(*http.Client)
 	require.True(t, ok)
 	assert.Equal(t, 5*time.Second, client.Timeout)
+	require.NotNil(t, client.CheckRedirect)
+	assert.ErrorIs(t, client.CheckRedirect(nil, nil), http.ErrUseLastResponse)
 	assert.NotEqual(t, first.authTokenCacheKey, second.authTokenCacheKey)
 	assert.True(t, strings.HasPrefix(first.authTokenCacheKey, "oppo_auth_token:"))
+}
+
+func TestOPPOPushDoesNotFollowRedirects(t *testing.T) {
+	redirectTargetCalls := 0
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectTargetCalls++
+		writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+	}))
+	t.Cleanup(redirectTarget.Close)
+
+	redirectSource := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirectSource.Close)
+
+	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
+	pusher.configErr = nil
+	pusher.notificationUnicastURL = redirectSource.URL
+	pusher.tokenCache = &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", time.Now().Add(oppoAuthTokenTTL))}
+
+	err := pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1"))
+	require.ErrorContains(t, err, "status 307")
+	assert.Zero(t, redirectTargetCalls, "credential-bearing form body must not be replayed to a redirect target")
 }
 
 func TestLoadOPPOPushOptionsFromEnv(t *testing.T) {
@@ -674,6 +699,12 @@ func TestOPPOPushValidatesInputBeforeNetwork(t *testing.T) {
 	}{
 		{name: "wrong payload type", deviceToken: "registration-id", payload: &BasePayload{}},
 		{name: "empty registration ID", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "leading whitespace in registration ID", deviceToken: " registration-id", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "embedded whitespace in registration ID", deviceToken: "registration id", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "control character in registration ID", deviceToken: "registration-id\x00", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "semicolon separator in registration ID", deviceToken: "registration-id;other-id", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "comma separator in registration ID", deviceToken: "registration-id,other-id", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
+		{name: "oversized registration ID", deviceToken: strings.Repeat("a", 257), payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
 		{name: "oversized action parameters", deviceToken: "registration-id", payload: NewOPPOPayload(&PayloadInfo{ChannelID: strings.Repeat("界", oppoMaxActionParametersRunes+1), MessageSeq: 1}, "1")},
 	}
 	for _, tt := range tests {
@@ -681,6 +712,35 @@ func TestOPPOPushValidatesInputBeforeNetwork(t *testing.T) {
 			require.Error(t, pusher.Push(tt.deviceToken, tt.payload))
 		})
 	}
+}
+
+func TestOPPOPushRefreshCacheReadFailureDoesNotDeleteSharedToken(t *testing.T) {
+	cache := &memoryOPPOTokenCache{getErr: errors.New("redis unavailable")}
+	authCalls := 0
+	unicastCalls := 0
+	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/v1/auth":
+			authCalls++
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"auth_token":"fresh-token"}}`)
+		case "/server/v1/message/notification/unicast":
+			unicastCalls++
+			require.NoError(t, r.ParseForm())
+			if r.PostForm.Get("auth_token") == "stale-token" {
+				writeOPPOJSON(t, w, http.StatusOK, `{"code":11,"message":"Invalid AuthToken"}`)
+				return
+			}
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}), cache, defaultOPPOPushOptions())
+	pusher.localAuthToken.Store(&oppoAuthToken{value: "stale-token", expiresAt: oppoTestNow.Add(oppoAuthTokenTTL)})
+
+	require.NoError(t, pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1")))
+	assert.Equal(t, 1, authCalls)
+	assert.Equal(t, 2, unicastCalls)
+	assert.Empty(t, cache.delKeys, "a failed Redis read must not be followed by a destructive delete")
 }
 
 func TestOPPOPushRejectsAuthFailures(t *testing.T) {
@@ -876,11 +936,13 @@ func TestOPPOPushLogsProviderBusinessResult(t *testing.T) {
 }
 
 func TestOPPOAPIErrorFormatting(t *testing.T) {
-	assert.Equal(t, "OPPO push failed with code 54: template rejected", (&oppoAPIError{
+	errText := (&oppoAPIError{
 		Operation: "push",
 		Code:      54,
-		Message:   "template rejected",
-	}).Error())
+		Message:   "rejected registration-id-sensitive-value",
+	}).Error()
+	assert.Equal(t, "OPPO push failed with code 54", errText)
+	assert.NotContains(t, errText, "registration-id-sensitive-value")
 	assert.Equal(t, "OPPO auth failed with code -1", (&oppoAPIError{
 		Operation: "auth",
 		Code:      -1,
