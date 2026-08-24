@@ -17,7 +17,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+var oppoTestNow = time.UnixMilli(1_700_000_000_123)
 
 type memoryOPPOTokenCache struct {
 	mu        sync.Mutex
@@ -34,8 +38,70 @@ type memoryOPPOTokenCache struct {
 
 type oppoDoerFunc func(*http.Request) (*http.Response, error)
 
+type recordedOPPOLogEntry struct {
+	message string
+	fields  map[string]interface{}
+}
+
+type recordingOPPOLogger struct {
+	mu       sync.Mutex
+	warnings []recordedOPPOLogEntry
+	debugs   []recordedOPPOLogEntry
+}
+
 func (f oppoDoerFunc) Do(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func (l *recordingOPPOLogger) Info(string, ...zap.Field)  {}
+func (l *recordingOPPOLogger) Error(string, ...zap.Field) {}
+
+func (l *recordingOPPOLogger) Debug(message string, fields ...zap.Field) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.debugs = append(l.debugs, recordedOPPOLogEntry{message: message, fields: encodeOPPOLogFields(fields)})
+}
+
+func (l *recordingOPPOLogger) Warn(message string, fields ...zap.Field) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warnings = append(l.warnings, recordedOPPOLogEntry{message: message, fields: encodeOPPOLogFields(fields)})
+}
+
+func encodeOPPOLogFields(fields []zap.Field) map[string]interface{} {
+	encoder := zapcore.NewMapObjectEncoder()
+	for _, field := range fields {
+		field.AddTo(encoder)
+	}
+	return encoder.Fields
+}
+
+func cachedOPPOAuthToken(t *testing.T, token string, expiresAt time.Time) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]interface{}{
+		"auth_token": token,
+		"expires_at": expiresAt.UnixMilli(),
+	})
+	require.NoError(t, err)
+	return string(encoded)
+}
+
+func (c *memoryOPPOTokenCache) getCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.getKeys)
+}
+
+func (c *memoryOPPOTokenCache) clearToken() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.token = ""
+}
+
+func (l *recordingOPPOLogger) snapshot() (warnings, debugs []recordedOPPOLogEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]recordedOPPOLogEntry(nil), l.warnings...), append([]recordedOPPOLogEntry(nil), l.debugs...)
 }
 
 func (c *memoryOPPOTokenCache) GetString(key string) (string, error) {
@@ -80,7 +146,7 @@ func newOPPOPushForTest(t *testing.T, handler http.Handler, cache *memoryOPPOTok
 	pusher.tokenCache = cache
 	pusher.options = options
 	pusher.configErr = nil
-	pusher.now = func() time.Time { return time.UnixMilli(1_700_000_000_123) }
+	pusher.now = func() time.Time { return oppoTestNow }
 	return pusher
 }
 
@@ -107,7 +173,7 @@ func decodeOPPOMessage(t *testing.T, r *http.Request) map[string]interface{} {
 }
 
 func TestOPPOPushUsesEncodedFormAndCurrentNotificationPayload(t *testing.T) {
-	cache := &memoryOPPOTokenCache{token: "cached&token+%"}
+	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached&token+%", oppoTestNow.Add(oppoAuthTokenTTL))}
 	var gotMessage map[string]interface{}
 	var requestCount int
 	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +220,7 @@ func TestOPPOPushUsesEncodedFormAndCurrentNotificationPayload(t *testing.T) {
 	assert.Equal(t, "com.example.chat.MainActivity", notification["click_action_activity"])
 	assert.Equal(t, true, notification["off_line"])
 	assert.Equal(t, float64(86400), notification["off_line_ttl"])
-	assert.Equal(t, float64(42), notification["notify_id"])
+	assert.NotContains(t, notification, "notify_id")
 	assert.NotEmpty(t, notification["app_message_id"])
 
 	var actionParameters map[string]interface{}
@@ -193,7 +259,14 @@ func TestOPPOPushAuthenticatesWithDocumentedSignatureAndCachesToken(t *testing.T
 	require.NoError(t, pusher.Push("registration-id", payload))
 	require.Equal(t, 1, authCalls)
 	require.Equal(t, 1, unicastCalls)
-	require.Equal(t, []string{"fresh-token"}, cache.setValues)
+	require.Len(t, cache.setValues, 1)
+	var cachedToken struct {
+		AuthToken string `json:"auth_token"`
+		ExpiresAt int64  `json:"expires_at"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(cache.setValues[0]), &cachedToken))
+	assert.Equal(t, "fresh-token", cachedToken.AuthToken)
+	assert.Equal(t, oppoTestNow.Add(oppoAuthTokenTTL).UnixMilli(), cachedToken.ExpiresAt)
 	require.Equal(t, []time.Duration{20 * time.Hour}, cache.setTTLs)
 	require.Len(t, cache.setKeys, 1)
 	assert.Contains(t, cache.setKeys[0], "oppo_auth_token:")
@@ -204,8 +277,176 @@ func TestOPPOPushAuthenticatesWithDocumentedSignatureAndCachesToken(t *testing.T
 	require.Equal(t, 2, unicastCalls)
 }
 
+func TestOPPOPushUsesProcessLocalTokenOnConcurrentNormalPath(t *testing.T) {
+	cache := &memoryOPPOTokenCache{}
+	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/v1/auth":
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"auth_token":"fresh-token"}}`)
+		case "/server/v1/message/notification/unicast":
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}), cache, defaultOPPOPushOptions())
+	payload := NewOPPOPayload(&PayloadInfo{Title: "title", Content: "content", MessageSeq: 7}, "7")
+
+	require.NoError(t, pusher.Push("registration-id", payload))
+	require.Equal(t, 1, cache.getCount())
+
+	const pushes = 16
+	errs := make(chan error, pushes)
+	var wg sync.WaitGroup
+	for range pushes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- pusher.Push("registration-id", payload)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 1, cache.getCount(), "a valid process-local token must avoid Redis and the refresh mutex")
+}
+
+func TestOPPOPushConcurrentCacheMissAuthenticatesOnce(t *testing.T) {
+	cache := &memoryOPPOTokenCache{}
+	var mu sync.Mutex
+	authCalls := 0
+	unicastCalls := 0
+	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/server/v1/auth":
+			authCalls++
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"auth_token":"fresh-token"}}`)
+		case "/server/v1/message/notification/unicast":
+			unicastCalls++
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}), cache, defaultOPPOPushOptions())
+	payload := NewOPPOPayload(&PayloadInfo{Title: "title", Content: "content", MessageSeq: 7}, "7")
+
+	const pushes = 16
+	errs := make(chan error, pushes)
+	var wg sync.WaitGroup
+	for range pushes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- pusher.Push("registration-id", payload)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, authCalls)
+	assert.Equal(t, pushes, unicastCalls)
+}
+
+func TestOPPOPushRefreshesExpiredProcessLocalToken(t *testing.T) {
+	cache := &memoryOPPOTokenCache{}
+	now := oppoTestNow
+	authCalls := 0
+	var sentTokens []string
+	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/v1/auth":
+			authCalls++
+			writeOPPOJSON(t, w, http.StatusOK, fmt.Sprintf(`{"code":0,"data":{"auth_token":"token-%d"}}`, authCalls))
+		case "/server/v1/message/notification/unicast":
+			require.NoError(t, r.ParseForm())
+			sentTokens = append(sentTokens, r.PostForm.Get("auth_token"))
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}), cache, defaultOPPOPushOptions())
+	pusher.now = func() time.Time { return now }
+	payload := NewOPPOPayload(&PayloadInfo{Title: "title", Content: "content", MessageSeq: 7}, "7")
+
+	require.NoError(t, pusher.Push("registration-id", payload))
+	now = now.Add(oppoAuthTokenTTL)
+	cache.clearToken() // Simulate the Redis TTL expiring at the same instant.
+	require.NoError(t, pusher.Push("registration-id", payload))
+
+	assert.Equal(t, 2, authCalls)
+	assert.Equal(t, []string{"token-1", "token-2"}, sentTokens)
+}
+
+func TestOPPOPushSanitizesRequiredNotificationText(t *testing.T) {
+	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
+	pusher.configErr = nil
+
+	tests := []struct {
+		name        string
+		title       string
+		content     string
+		wantTitle   string
+		wantContent string
+	}{
+		{
+			name:        "blank values use safe fallback",
+			title:       " \t\n",
+			content:     "",
+			wantTitle:   "您有一条新的消息",
+			wantContent: "您有一条新的消息",
+		},
+		{
+			name:        "multibyte values are truncated by rune",
+			title:       strings.Repeat("题", 51),
+			content:     strings.Repeat("文", 201),
+			wantTitle:   strings.Repeat("题", 50),
+			wantContent: strings.Repeat("文", 200),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := pusher.buildUnicastMessage("registration-id", NewOPPOPayload(&PayloadInfo{
+				Title:      tt.title,
+				Content:    tt.content,
+				MessageSeq: 1,
+			}, "1"))
+			require.NoError(t, err)
+
+			var message oppoUnicastMessage
+			require.NoError(t, json.Unmarshal(encoded, &message))
+			assert.Equal(t, tt.wantTitle, message.Notification.Title)
+			assert.Equal(t, tt.wantContent, message.Notification.Content)
+			assert.LessOrEqual(t, len([]rune(message.Notification.Title)), 50)
+			assert.LessOrEqual(t, len([]rune(message.Notification.Content)), 200)
+		})
+	}
+}
+
+func TestOPPOPushRejectsOversizedActionParameters(t *testing.T) {
+	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
+	pusher.configErr = nil
+	payload := NewOPPOPayload(&PayloadInfo{
+		Title:      "title",
+		Content:    "content",
+		ChannelID:  strings.Repeat("界", 1400),
+		MessageSeq: 1,
+	}, "1")
+
+	_, err := pusher.buildUnicastMessage("registration-id", payload)
+	require.ErrorContains(t, err, "action parameters exceed 4096 bytes")
+}
+
 func TestOPPOPushRefreshesInvalidTokenOnceWithStableDedupeID(t *testing.T) {
-	cache := &memoryOPPOTokenCache{token: "stale-token"}
+	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}
 	authCalls := 0
 	var sentTokens []string
 	var appMessageIDs []string
@@ -251,7 +492,7 @@ func TestOPPOPushDoesNotRetryBusinessErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(strconv.Itoa(tt.code), func(t *testing.T) {
-			cache := &memoryOPPOTokenCache{token: "cached-token"}
+			cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}
 			requestCount := 0
 			pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requestCount++
@@ -287,7 +528,7 @@ func TestOPPOPushRejectsMalformedResponsesAndWrongPayload(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				writeOPPOJSON(t, w, tt.statusCode, tt.body)
-			}), &memoryOPPOTokenCache{token: "cached-token"}, defaultOPPOPushOptions())
+			}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
 			err := pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c"}, "1"))
 			require.Error(t, err)
 		})
@@ -382,7 +623,7 @@ func TestOPPOPushDefaultPayloadKeepsClassificationOptIn(t *testing.T) {
 		message := decodeOPPOMessage(t, r)
 		notification = message["notification"].(map[string]interface{})
 		writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
-	}), &memoryOPPOTokenCache{token: "cached-token"}, defaultOPPOPushOptions())
+	}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
 
 	require.NoError(t, pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{
 		Title:      "title",
@@ -400,7 +641,7 @@ func TestOPPOPushDefaultPayloadKeepsClassificationOptIn(t *testing.T) {
 func TestOPPOPushValidatesInputBeforeNetwork(t *testing.T) {
 	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
 	pusher.configErr = nil
-	pusher.tokenCache = &memoryOPPOTokenCache{token: "cached-token"}
+	pusher.tokenCache = &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", time.Now().Add(oppoAuthTokenTTL))}
 	pusher.httpClient = oppoDoerFunc(func(*http.Request) (*http.Response, error) {
 		t.Fatal("invalid input must not reach the network")
 		return nil, nil
@@ -413,7 +654,7 @@ func TestOPPOPushValidatesInputBeforeNetwork(t *testing.T) {
 	}{
 		{name: "wrong payload type", deviceToken: "registration-id", payload: &BasePayload{}},
 		{name: "empty registration ID", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
-		{name: "invalid notify ID", deviceToken: "registration-id", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "not-a-number")},
+		{name: "oversized action parameters", deviceToken: "registration-id", payload: NewOPPOPayload(&PayloadInfo{ChannelID: strings.Repeat("界", 1400), MessageSeq: 1}, "1")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -458,7 +699,7 @@ func TestOPPOPushRejectsAuthFailures(t *testing.T) {
 }
 
 func TestOPPOPushRetriesInvalidTokenOnlyOnce(t *testing.T) {
-	cache := &memoryOPPOTokenCache{token: "stale-token"}
+	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}
 	authCalls := 0
 	unicastCalls := 0
 	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -482,7 +723,7 @@ func TestOPPOPushRetriesInvalidTokenOnlyOnce(t *testing.T) {
 }
 
 func TestOPPOPushUsesTokenAlreadyRefreshedByPeer(t *testing.T) {
-	cache := &memoryOPPOTokenCache{token: "stale-token"}
+	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}
 	var sentTokens []string
 	authCalls := 0
 	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +736,7 @@ func TestOPPOPushUsesTokenAlreadyRefreshedByPeer(t *testing.T) {
 			sentTokens = append(sentTokens, r.PostForm.Get("auth_token"))
 			if len(sentTokens) == 1 {
 				cache.mu.Lock()
-				cache.token = "peer-refreshed-token"
+				cache.token = cachedOPPOAuthToken(t, "peer-refreshed-token", oppoTestNow.Add(oppoAuthTokenTTL))
 				cache.mu.Unlock()
 				writeOPPOJSON(t, w, http.StatusOK, `{"code":11}`)
 				return
@@ -514,7 +755,7 @@ func TestOPPOPushReturnsTransportAndRequestConstructionErrors(t *testing.T) {
 	t.Run("transport", func(t *testing.T) {
 		pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
 		pusher.configErr = nil
-		pusher.tokenCache = &memoryOPPOTokenCache{token: "cached-token"}
+		pusher.tokenCache = &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", time.Now().Add(oppoAuthTokenTTL))}
 		pusher.httpClient = oppoDoerFunc(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("network unavailable")
 		})
@@ -525,10 +766,44 @@ func TestOPPOPushReturnsTransportAndRequestConstructionErrors(t *testing.T) {
 	t.Run("invalid URL", func(t *testing.T) {
 		pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
 		pusher.configErr = nil
-		pusher.tokenCache = &memoryOPPOTokenCache{token: "cached-token"}
+		pusher.tokenCache = &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", time.Now().Add(oppoAuthTokenTTL))}
 		pusher.notificationUnicastURL = "://invalid"
 		err := pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1"))
 		require.ErrorContains(t, err, "create OPPO request")
+	})
+}
+
+func TestOPPOPushLogsProviderBusinessResult(t *testing.T) {
+	t.Run("rejection", func(t *testing.T) {
+		logger := &recordingOPPOLogger{}
+		pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":54,"message":"template rejected"}`)
+		}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
+		pusher.Log = logger
+
+		err := pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1"))
+		require.Error(t, err)
+		warnings, _ := logger.snapshot()
+		require.Len(t, warnings, 1)
+		assert.Equal(t, "OPPO push rejected", warnings[0].message)
+		assert.Equal(t, int64(54), warnings[0].fields["oppo_code"])
+		assert.Equal(t, false, warnings[0].fields["retryable"])
+		assert.NotContains(t, warnings[0].fields, "auth_token")
+		assert.NotContains(t, warnings[0].fields, "registration_id")
+	})
+
+	t.Run("accepted message ID", func(t *testing.T) {
+		logger := &recordingOPPOLogger{}
+		pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"messageId":"provider-message-id"}}`)
+		}), &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "cached-token", oppoTestNow.Add(oppoAuthTokenTTL))}, defaultOPPOPushOptions())
+		pusher.Log = logger
+
+		require.NoError(t, pusher.Push("registration-id", NewOPPOPayload(&PayloadInfo{Title: "t", Content: "c", MessageSeq: 1}, "1")))
+		_, debugs := logger.snapshot()
+		require.Len(t, debugs, 1)
+		assert.Equal(t, "OPPO push accepted", debugs[0].message)
+		assert.Equal(t, "provider-message-id", debugs[0].fields["oppo_message_id"])
 	})
 }
 
