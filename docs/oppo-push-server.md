@@ -8,12 +8,16 @@
 - 单推：`POST https://api-push-cn.heytapmobi.com/server/v1/message/notification/unicast`
 - 编码：UTF-8 `application/x-www-form-urlencoded`
 - HTTP 总超时：5 秒
-- auth token：按 AppKey 隔离，Redis 缓存 20 小时；Redis 故障时使用进程内缓存降级
+- auth token：按 AppKey 隔离，本地和 Redis 均按绝对时间提前 20 小时过期；正常发送不访问
+  Redis，Redis 故障时使用进程内缓存降级
 - token 失效：仅对 OPPO code `11` 强制鉴权并重试一次
 - 去重：重试沿用同一个 `app_message_id`
+- 可观测性：厂商业务拒绝以 Warn 记录 `oppo_code/retryable`，成功响应以 Debug 记录
+  `oppo_message_id`；日志不包含 MasterSecret、auth token 或 registration_id
 
-服务端会发送 `verify_registration_id=true`、24 小时离线 TTL、`notify_id`，并把以下
-会话路由字段编码进 `action_parameters`：
+服务端会发送 `verify_registration_id=true`、24 小时离线 TTL，但不发送 `notify_id`（避免
+不同会话中相同 `message_seq` 的通知互相覆盖），并把以下会话路由字段编码进
+`action_parameters`：
 
 ```json
 {
@@ -23,6 +27,10 @@
   "message_seq": 42
 }
 ```
+
+通知标题和正文是 OPPO 必填字段。服务端对空值使用“您有一条新的消息”兜底，并分别按
+50/200 个 Unicode 字符截断；`action_parameters` 编码后不得超过 4 KiB，超限时拒绝发送并
+返回错误。
 
 ## 配置
 
@@ -34,7 +42,7 @@
 | `TS_PUSH_OPPO_APPKEY` | 是 | OPPO PUSH AppKey |
 | `TS_PUSH_OPPO_MASTERSECRET` | 是 | OPPO PUSH 服务端密钥；不得写入日志或仓库 |
 
-以下为 octo-server 本地扩展配置：
+以下为 octo-server 本地扩展配置，当前版本**仅从环境变量读取**，写入 `tsdd.yaml` 不会生效：
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
