@@ -55,11 +55,13 @@ source: self
 
 ## Acceptance
 
-- [ ] 鉴权、单推均命中最新国内 host，form 特殊字符和中文可无损解析。
-- [ ] HTTP 总超时为 5 秒，非 2xx、超大/畸形 JSON、缺失或非法 code 均失败。
-- [ ] token 按 AppKey 隔离缓存；code 11 刷新并只重试一次，稳定去重 ID 不变。
-- [ ] code 41/54/10000 等参数或目标错误不自动重试，错误保留 OPPO code。
-- [ ] payload 包含校验 registration_id、去重 ID、离线 TTL、路由参数及已配置的新分类字段。
-- [ ] 聚焦测试、race、coverage、`go vet ./modules/webhook` 与 `git diff --check` 通过。
-- [ ] 尝试模块级回归；若共享基础设施阻塞，保留完整错误证据且不误报为通过。
-
+- [x] 鉴权、单推均命中最新国内 host，form 特殊字符和中文可无损解析。
+- [x] HTTP 总超时为 5 秒，非 2xx、超大/畸形 JSON、缺失或非法 code 均失败。
+- [x] token 按 AppKey 隔离缓存；code 11 刷新并只重试一次，稳定去重 ID 不变。
+- [x] code 41/54/10000 等参数或目标错误不自动重试，错误保留 OPPO code。
+- [x] payload 包含校验 registration_id、去重 ID、离线 TTL、路由参数及已配置的新分类字段。
+- [x] 聚焦测试、race、OPPO adapter coverage 82.5%、`go vet ./modules/webhook`、
+  `golangci-lint run ./modules/webhook/...` 与 `git diff --check` 通过。
+- [x] 已尝试模块级回归；共享测试库存在 checkout 未知的
+  `20260820000001_featuregate_init.sql`，在 `testutil.NewTestServer` 创建 migration plan 时阻塞。
+  未修改或清理共享测试库。
