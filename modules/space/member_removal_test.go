@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1370,13 +1371,21 @@ func TestRemoveMembersLockedEnqueuesAtomically(t *testing.T) {
 			spaceID, []string{"m1", "m2", "m3"}, 1, "owner", MemberRemoveReasonKicked)
 	}()
 
-	// 等到它真的卡在行锁上，而不是靠 sleep 猜
+	// 等到它真的卡在 space_member 的行锁上，而不是靠 sleep 猜。
+	//
+	// 必须把等待条件收紧到**本表的 WAITING 锁**：information_schema.innodb_trx 是
+	// 服务级、不过滤的，用它只能答「这台 MySQL 上有某个事务在等」，若被别的用例的
+	// 争用提前放行，下面的核心断言会**空过**——那时批量可能还没翻转 m1，工单本就为空，
+	// 断言 trivially 成立，连逐个提交的变异都拦不住。用 performance_schema.data_locks
+	// 精确匹配 space_member 上的 WAITING 记录锁，把守卫的判别力钉在本用例自己制造的
+	// 争用上（PR #804 round-5 review P2-1）。
 	require.Eventually(t, func() bool {
 		var n int
 		_, err := testCtx.DB().SelectBySql(
-			"SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_state='LOCK WAIT'").Load(&n)
+			"SELECT COUNT(*) FROM performance_schema.data_locks " +
+				"WHERE object_name='space_member' AND lock_type='RECORD' AND lock_status='WAITING'").Load(&n)
 		return err == nil && n > 0
-	}, 15*time.Second, 50*time.Millisecond, "批量移除应当阻塞在 m2 的行锁上")
+	}, 15*time.Second, 50*time.Millisecond, "批量移除应当阻塞在 m2 的 space_member 行锁上")
 
 	// 核心断言：m1 已在事务内被翻转，但整批尚未提交，所以一条工单都不该可见
 	assert.Empty(t, cleanupJobs(t, spaceID),
@@ -1447,5 +1456,75 @@ func TestRemoveMembersLockedRollsBackWholeBatchOnError(t *testing.T) {
 		require.NoError(t, qerr)
 		require.NotNil(t, m, "成员行必须还在")
 		assert.EqualValues(t, 1, m.Status, "整批回滚后 %s 必须仍是活跃成员", uid)
+	}
+}
+
+// TestRemoveMembersLockedNoDeadlockOnReversedOverlap 反序重叠批次不得死锁。
+//
+// PR #804 round-5 的回归守卫。把移除改成整批单事务后，若逐个 FOR UPDATE 取锁，
+// 就会按调用方给的 uid 顺序在一个事务里持有多把锁——两个管理员对同一空间、用**相反
+// 顺序**的重叠 uid 列表并发调用 members/remove，即 AB-BA 死锁，InnoDB 挑一个牺牲者
+// 报 1213，合法操作变成 500。老的一人一事务实现每次只持一把锁，不可能成环。
+//
+// 用全部会被跳过的成员（role=1，reject=1）来制造纯粹的取锁争用而不翻转任何行，于是
+// 可以反复并发施压而无需在迭代间重新播种。修好后取锁走单条 uid IN (...) 语句、按索引
+// 序获取，两个批次顺序一致，只会互相阻塞、绝不成环。
+//
+// 变异验证：把 removeMembersLocked 改回逐个 FOR UPDATE，这条在几十轮内必然抓到 1213。
+func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-deadlock"
+	seedMember(t, f, spaceID, "owner", 2)
+	members := []string{"d1", "d2", "d3", "d4", "d5", "d6"}
+	for _, uid := range members {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 1, Status: 1, // admin：reject=1 时全部跳过，不翻转
+		}))
+	}
+
+	forward := append([]string(nil), members...)
+	reversed := make([]string, len(members))
+	for i, uid := range members {
+		reversed[len(members)-1-i] = uid
+	}
+
+	const rounds = 40
+	var deadlocks, otherErr atomic.Int64
+	isDeadlock := func(e error) bool {
+		return e != nil && (strings.Contains(e.Error(), "1213") ||
+			strings.Contains(strings.ToLower(e.Error()), "deadlock"))
+	}
+
+	var wg sync.WaitGroup
+	for w, order := range [][]string{forward, reversed} {
+		wg.Add(1)
+		go func(order []string) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				removed, e := f.db.removeMembersLocked(spaceID, order, 1, "owner", MemberRemoveReasonKicked)
+				if isDeadlock(e) {
+					deadlocks.Add(1)
+				} else if e != nil {
+					otherErr.Add(1)
+				}
+				require.Empty(t, removed, "全是 admin、reject=1，不该移除任何人")
+			}
+		}(order)
+		_ = w
+	}
+	wg.Wait()
+
+	assert.EqualValues(t, 0, deadlocks.Load(),
+		"反序重叠批次不得死锁——单语句取锁按索引序，两个批次顺序一致只会互相阻塞")
+	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
+
+	// 收尾核实：全程无人被移除，成员行原样都在
+	for _, uid := range members {
+		m, qerr := f.db.queryMember(spaceID, uid)
+		require.NoError(t, qerr)
+		require.NotNil(t, m)
+		assert.EqualValues(t, 1, m.Status, "%s 应当仍是活跃成员", uid)
 	}
 }

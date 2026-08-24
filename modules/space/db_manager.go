@@ -619,6 +619,12 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 // 代价是部分失败语义变了：以前中途 DB 出错会留下已提交的前缀，现在整批回滚。这对
 // transactional outbox 反而更干净（成员行与工单同生共死这一点不变），调用方也不必再
 // 为「前缀已提交」做补偿收尾。owner 与同级及更高角色仍是**静默跳过**，不是错误。
+// spaceMemberRoleRow 承接 removeMembersLocked 的整批锁定查询：uid + 当前 role。
+type spaceMemberRoleRow struct {
+	UID  string `db:"uid"`
+	Role int    `db:"role"`
+}
+
 func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
@@ -629,25 +635,51 @@ func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejec
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// 一条语句锁住整批：uid IN (...) 走唯一索引 (space_id, uid)，锁按**索引序**获取。
+	//
+	// 不能逐个 FOR UPDATE —— 那会按调用方给的 uid 顺序在一个事务里持有最多
+	// managerMaxBatchUIDs=200 把行锁，两个重叠批次反序并发就是 AB-BA 死锁；而
+	// continue 掉的行（owner、同级）连同它们的锁一直握到提交，进一步扩大了锁面。
+	// 老的实现是一人一事务、每次只持一把锁，天然不可能成环，本函数改成整批单事务
+	// 之后把这个死锁面重新引了进来（PR #804 round-5 review）。单语句获取与
+	// removeMembersForce 完全一致，把死锁面降回既有水平，顺带把 ~2N 次往返压到 ~1+N。
+	//
+	// 角色重读仍在锁内：这一条 SELECT ... FOR UPDATE 把每个成员的当前 role 连同锁
+	// 一起取回，随后在 Go 里做层级判定，语义与 removeMemberLocked 逐个重读完全一致
+	// （防止 pre-check 之后目标被并发转让升为 owner 仍被移除）。
+	//
+	// 副作用与既有一致：uid IN (...) 对不存在的 uid 在唯一索引上取间隙锁，一个含
+	// 陈旧 uid 的批次会握住若干间隙锁挡并发 joinSpace —— 逐个 FOR UPDATE 也一样，
+	// 单语句只是把它们一次取全。
+	var locked []spaceMemberRoleRow
+	if _, err = tx.SelectBySql(
+		"SELECT uid, role FROM space_member WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE",
+		spaceId, uids,
+	).Load(&locked); err != nil {
+		return nil, err
+	}
+	roleByUID := make(map[string]int, len(locked))
+	for _, r := range locked {
+		roleByUID[r.UID] = r.Role
+	}
+
 	now := time.Now()
 	removed := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
 	for _, uid := range uids {
-		// 逐个在锁内重读角色，与 removeMemberLocked 完全一致：防止 pre-check 之后
-		// 目标被并发转让升为 owner 仍被移除。
-		var roles []int
-		if _, err = tx.SelectBySql(
-			"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE",
-			spaceId, uid,
-		).Load(&roles); err != nil {
-			return nil, err
-		}
-		// 三种「不该动」的情形都静默跳过，与既有 removeMembers 的观察行为一致
-		// （那边是 ErrCannotRemoveOwner / ErrRemoveHierarchy 被调用方 continue 掉，
-		// 以及 ok=false 不计入 removed）。重复 uid 也在这里自然收敛：本事务里
-		// 第一次已把 status 翻成 0，第二次读不到行。
-		if len(roles) == 0 || roles[0] == 2 || roles[0] >= rejectRoleAtOrAbove {
+		// 重复 uid 只处理一次，与老实现「第二次读不到已翻转的行」等价。
+		if _, dup := seen[uid]; dup {
 			continue
 		}
+		seen[uid] = struct{}{}
+		role, active := roleByUID[uid]
+		// 三种「不该动」的情形静默跳过，与既有 removeMembers 的观察行为一致
+		// （那边是 ErrCannotRemoveOwner / ErrRemoveHierarchy 被调用方 continue 掉、
+		// ok=false 不计入 removed）：不在空间、owner、同级及更高。
+		if !active || role == 2 || role >= rejectRoleAtOrAbove {
+			continue
+		}
+		// 更新的是上面 FOR UPDATE 已经锁住的行，不额外获取新锁，不影响获取顺序。
 		if _, err = tx.Update("space_member").
 			Set("status", 0).Set("updated_at", now).
 			Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {

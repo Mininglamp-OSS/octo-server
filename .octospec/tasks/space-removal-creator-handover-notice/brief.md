@@ -316,10 +316,11 @@ exists.
   whose members are consecutive in one group's seniority list produced **three**
   notices in that group (C→S2, S2→S3, S3→S4), the first two already obsolete when
   written. It is the same chaining the disband path is suppressed for; only the
-  trigger differs. Suppression now collapses the chain **on the entrypoints whose
-  jobs are enqueued atomically**; the user-side `members/remove` (`kicked`) path
-  enqueues one transaction per uid and is still exposed. See Behavior contract ›
-  Chain suppression for the per-entrypoint table and the measured counts.
+  trigger differs. Suppression collapses the chain on entrypoints whose jobs are
+  enqueued atomically, which — as of the round-5 fix — is **all** of them: the
+  user-side `members/remove` (`kicked`) path now enqueues in one transaction
+  (`removeMembersLocked`). See Behavior contract › Chain suppression for the
+  per-entrypoint table and the measured counts.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
   `memberRemove` and `modules/bot_api/groups.go` reach the same
   `SendGroupMemberBeRemove`, so remaining members see nothing there either. Same
@@ -340,6 +341,15 @@ exists.
   is populated (`service.go:1298`, `:1328`) so `gm.robot = 0` would be a one-line
   fix, but reversing a deliberately pinned contract needs its own decision.
 
+- **An external member as successor.** `querySecondOldestNonBotMemberTx` has no
+  `is_external = 0` predicate, while `modules/group/db.go` `QueryIsGroupManagerOrCreator`
+  requires `is_external=0` — so an external guest can be elected creator and then
+  refused the creator powers. Before this task that was a silent bad state; this
+  task turns it into a persisted, group-visible claim that someone holding no
+  creator powers is the new owner. Reachable when a Space group's only eligible
+  successor is external. Pre-existing selection behaviour like the bot case above;
+  adding the predicate changes election semantics (the group would go ownerless
+  instead), so it wants its own decision. Raised in PR #804 round-5 review.
 - **A suppressed notice is never re-evaluated.** The chain check decides once,
   against `status=pending`, and that answer can turn out wrong in three ways: a
   successor carrying an older stuck pending job; a successor whose own job later
@@ -356,8 +366,23 @@ exists.
 
 ## Acceptance
 
-All in `modules/group/space_member_removal_test.go`, all passing under
-`-race -shuffle=on`:
+Acceptance spans two packages, all passing under `-race -shuffle=on`. The premise
+and the consequence are guarded separately, and by the branch's own rule neither
+half is sufficient alone.
+
+In `modules/space/member_removal_test.go` — the atomic-enqueue premise (round-5):
+
+- `TestRemoveMembersLockedEnqueuesAtomically` — a competing row lock stalls the
+  batch on its second uid; the test asserts **no** cleanup row is visible at that
+  instant. Mutating back to per-uid commits turns it red.
+- `TestRemoveMembersLockedNoDeadlockOnReversedOverlap` — two goroutines run
+  reversed overlapping batches; **zero** deadlocks. Mutating back to per-uid
+  `FOR UPDATE` turns it red (measured 49 deadlocks/80 calls).
+- `TestRemoveMembersLockedSkipsOwnerAndPeers` /
+  `TestRemoveMembersLockedRollsBackWholeBatchOnError` — role-hierarchy skips and
+  all-or-nothing rollback.
+
+In `modules/group/space_member_removal_test.go`:
 
 - `TestGroupCascadeCreatorHandoverIsAnnounced` — a force-removed creator produces
   a group-visible message (no `subscribers`, no `visibles`) containing both
@@ -385,6 +410,11 @@ All in `modules/group/space_member_removal_test.go`, all passing under
   still sent.
 - `TestGroupCascadeBatchHandoverAnnouncesOnce` — a 3-uid batch sharing one group
   emits exactly one notice, naming the **final** owner rather than a mid-chain one.
+- `TestGroupCascadeLastNoticeNamesActualOwner` — the composed-defect guard
+  (round-5): with the final successor holding a stale `pending` job, **zero**
+  notices; in the ordinary case, exactly one naming the settled owner. Neither the
+  first version's vacuous "if emitted…" shape nor a count alone would catch the
+  composition; removing the chain suppression turns both subtests red.
 - `TestGroupCascadeSelfExitTipPrefersGroupRemark` — pins the `sendGroupExitTip`
   display-name change this task makes (see below).
 - `TestGroupCascadeHandoverNoticeIsBestEffort` — a failing send does not fail the

@@ -51,9 +51,14 @@ injected_rules:
 not_injected:
   - id: error-handling
     why: >
-      No HTTP handler is touched and no error code is added or changed. The
-      cascade runs in the leased background worker; failures are logged and
-      retried by the outbox, never surfaced as a user-facing envelope.
+      No new error code is added or changed, and every user-facing failure still
+      goes through the existing httperr envelope (ErrSpaceStoreFailed). The
+      round-5 fix does touch one HTTP handler — removeMembers — but only to change
+      its partial-failure contract from prefix-commit to all-or-nothing (one
+      transaction), which is a transaction-shape change, not a new error surface;
+      it is documented in the brief and pinned by
+      TestRemoveMembersLockedRollsBackWholeBatchOnError. The cascade itself still
+      runs in the leased background worker, logged and retried by the outbox.
       make i18n-extract-check and make i18n-lint were still run as gates.
   - id: rate-limit
     why: >

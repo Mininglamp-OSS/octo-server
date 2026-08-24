@@ -529,7 +529,9 @@ func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, sta
 // 新增单成员入口时请一并确认：只要一批移除会分多次提交，这里就会重新出问题。
 //
 // 只看 pending（status=0）：
-//   - done 表示那条工单已跑完，人已经不在群里，本来也不会被选为继任者；
+//   - done 有两种：工单真跑完了（人已不在群、本来也不会被选为继任者），或这人中途
+//     重新加入、工单被标 skipped_rejoined 记在 done（人**仍在群里、可以当继任者**）。
+//     两种都不该抑制：前者选不到他，后者他留下来当群主本就该通告。
 //   - abandoned 表示重试耗尽、放弃了，这个人不会再被移除，所以该照常通告。
 //
 // ⚠️ 上面那条 abandoned 只在**检查发生时它已经是 abandoned** 才成立。真实次序通常
