@@ -2,13 +2,36 @@ package webhook
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestOPPOAPIEndpointsUseDocumentedDomesticHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		path     string
+	}{
+		{name: "auth", endpoint: oppoAuthURL, path: "/server/v1/auth"},
+		{name: "notification unicast", endpoint: oppoNotificationUnicastURL, path: "/server/v1/message/notification/unicast"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.endpoint)
+			assert.NoError(t, err)
+			assert.Equal(t, "https", u.Scheme)
+			assert.Equal(t, "api-push-cn.heytapmobi.com", u.Host)
+			assert.Equal(t, tt.path, u.Path)
+		})
+	}
+}
 
 func TestHMSPush(t *testing.T) {
 	appID := os.Getenv("HMS_APP_ID")
@@ -52,15 +75,13 @@ func TestMIPush(t *testing.T) {
 }
 
 func TestOPPOPush(t *testing.T) {
-	appID := os.Getenv("OPPO_APP_ID")
 	appKey := os.Getenv("OPPO_APP_KEY")
-	appSecret := os.Getenv("OPPO_APP_SECRET")
 	masterSecret := os.Getenv("OPPO_MASTER_SECRET")
 	deviceToken := os.Getenv("OPPO_DEVICE_TOKEN")
-	if appID == "" || appKey == "" || appSecret == "" || masterSecret == "" || deviceToken == "" {
-		t.Skip("OPPO push credentials not configured (set OPPO_APP_ID, OPPO_APP_KEY, OPPO_APP_SECRET, OPPO_MASTER_SECRET, OPPO_DEVICE_TOKEN)")
+	if appKey == "" || masterSecret == "" || deviceToken == "" {
+		t.Skip("OPPO push credentials not configured (set OPPO_APP_KEY, OPPO_MASTER_SECRET, OPPO_DEVICE_TOKEN)")
 	}
-	oppo := NewOPPOPush(appID, appKey, appSecret, masterSecret, &config.Context{})
+	oppo := NewOPPOPush("", appKey, "", masterSecret, nil)
 	payloadInfo := &PayloadInfo{
 		Title:   "标题",
 		Content: "内容",
@@ -68,6 +89,20 @@ func TestOPPOPush(t *testing.T) {
 	}
 	err := oppo.Push(deviceToken, NewOPPOPayload(payloadInfo, "11"))
 	assert.NoError(t, err)
+}
+
+func TestOPPOAuth(t *testing.T) {
+	appKey := os.Getenv("OPPO_APP_KEY")
+	masterSecret := os.Getenv("OPPO_MASTER_SECRET")
+	if appKey == "" || masterSecret == "" {
+		t.Skip("OPPO credentials not configured (set OPPO_APP_KEY and OPPO_MASTER_SECRET)")
+	}
+
+	oppo := NewOPPOPush("", appKey, "", masterSecret, nil)
+	require.NoError(t, oppo.configErr)
+	token, err := oppo.getAuthToken()
+	require.NoError(t, err)
+	require.NotEmpty(t, token)
 }
 
 func TestVIVOPush(t *testing.T) {
