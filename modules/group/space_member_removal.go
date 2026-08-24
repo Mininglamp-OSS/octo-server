@@ -317,6 +317,18 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 		return fmt.Errorf("demote leaver: %w", err)
 	}
 
+	// 继任者是否也在待移除队列里 —— **在事务内**查，理由见下面通告处的注释。
+	// 只查、不据此改变事务的成败：查询失败按「不在队列里」处理，照常通告。
+	successorPending := false
+	if successor != nil && !suppressNotice {
+		if pending, perr := spacemod.HasPendingRemovalCleanup(tx, spaceID, successor.UID); perr != nil {
+			g.Warn("查询继任者待移除状态失败，按未待移除处理",
+				zap.Error(perr), zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
+		} else {
+			successorPending = pending
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit creator handover: %w", err)
 	}
@@ -342,56 +354,54 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 	//
 	// 跳过中间环之后，只有最后一环（继任者不在队列里）会通告，且通告的正是最终群主。
 	//
-	// ⚠️ 链条能否收敛成一条，取决于「同批工单在任何 worker 起跑前是否全部可见」。
-	// 这个前提**只有一部分入口满足**，必须按入口分开看（PR #804 review 查证）：
+	// 链条能否收敛成一条，取决于「同批工单在任何 worker 起跑前是否全部可见」。
+	// 三个批量入口现在都满足（PR #804 round-4/5 review 查证 + 修复）：
 	//
-	//   - 解散：走 enqueueMemberRemovalCleanupBatchTx（space/db.go、db_manager.go
-	//     各一处），单事务原子入队。但解散整条不通告（suppressNotice），这里用不上——
-	//     也就是说那个函数从来没有保护过任何一条真会发通告的路径。
-	//   - 超管强制移除 removeMembersForce：一个事务里翻完全部成员行、入完队再提交，
-	//     前提成立。reason=force_removed。
-	//   - 用户端 members/remove（api.go → removeMemberLocked）：**前提不成立**。
-	//     removeMemberLocked 一人一事务、逐个提交，reason=kicked，不抑制。
+	//   - 解散：enqueueMemberRemovalCleanupBatchTx，单事务原子入队。解散本来就整条
+	//     不通告（suppressNotice），这里用不上。
+	//   - 超管强制移除 removeMembersForce：一个事务里翻完全部成员行、入完队再提交。
+	//   - 用户端 members/remove → removeMembersLocked：**本次改动**。此前是
+	//     removeMemberLocked 一人一事务逐个提交，前提不成立，reason=kicked 又不抑制，
+	//     于是 10s tick 落在循环中途就会读到尚未入队的兄弟工单，把「马上要被移除的
+	//     继任者」当成「不在队列」，发出写下时就已作废的通告。实测：整批可见 → 1 条；
+	//     逐条提交且每轮都被 tick 命中 → 3 条；只有首次提交后一个 tick → 2 条。
+	//     现已改为整批单事务，见 space/db_manager.go removeMembersLocked。
 	//
-	// 于是在 kicked 这条最常走的路径上：清理 worker 每 10s 一轮，而新入队的工单
-	// next_attempt_at=now 立即可认领。一次 tick 落在循环中途就会认领已提交的前缀，
-	// 此时后面几个 uid 的工单行**还不存在**，本检查于是把「马上就要被移除的继任者」
-	// 读成「不在队列里」，发出一条中间环通告；循环继续走到那个继任者，他自己的交接
-	// 再发一条。实测：全部预先入队 → 1 条；逐条入队且完全交错 → 3 条；逐条入队 +
-	// 第一次提交后仅一个 tick → 2 条（不需要任何病态时序）。多出来的那条 NoPersist=0，
-	// 写下时就已不成立，且永久留在群历史里。最终那一条仍然是对的，所以这是
-	// 「多发了错的」而不是「少发了对的」。
+	// 那个缺口还会与下面「抑制只判定一次」复合成更坏的结果：若最终继任者自己挂着一条
+	// pending 工单，最后一环反而被抑制，于是群历史里**最后**一条群主消息指向一个已经
+	// 不在群里的人，而真正的群主从未被通告。整批原子入队之后这个复合不再成立——最坏
+	// 退化成「一条都不发」，即基线的静默，不比 main 差。
 	//
-	// 本次改动只把事实写对，**没有修**它。修法都不是顺手能做的：per-uid 一事务正是
-	// 为了让成员行翻转与清理工单同生共死（transactional outbox），且锁内重读角色层级
-	// 需要这个粒度；把 insert 提到尾部事务是拿这个 bug 换一个撕裂写入的 bug。可选方向：
-	// 给同批工单一个 next_attempt_at 偏移（是时序假设、不是保证）／给行带上批次标识、
-	// 批次入队完成前不抑制／批次全部落定后统一重评——最后一个与 #797 那些
-	// 「副作用需要持久化重放」的条目是同一件事。
+	// 守这条的是一对测试，缺一不可：
+	//   - space/TestRemoveMembersLockedEnqueuesAtomically 用一把竞争行锁把整批卡在
+	//     中间，断言此刻一条工单都不可见（变异回逐条提交立刻变红）——它证明前提；
+	//   - group/TestGroupCascadeLastNoticeNamesActualOwner 在前提成立时断言两种结局
+	//     都不说错话（继任者挂陈旧 pending → 静默；正常 → 恰好一条且点名最终群主）。
+	// 只看后者会把前提当结论，见 learnings/pending/a-test-can-encode-the-premise.md。
 	//
-	// TestGroupCascadeBatchHandoverAnnouncesOnce **覆盖不到**上面这条：它在循环之前就
-	// 把整批 pending 行 seed 好，模拟的正是那两个原子入口。它钉的是「原子入队时链条
-	// 收敛成一条」，不是「所有入口都收敛」。
+	// 另一个**互相独立**的窗口：多副本。本次一并修掉。
 	//
-	// ⚠️ 另一个**互相独立**的窗口：多副本。本检查跑在 handOverGroupCreator 提交之后，
-	// 此时已不再持有继任者的行锁：若 worker A 在提交后、检查前停顿足够久（约 100ms
-	// 量级），worker B 可以把 S2 的整条工单跑完并置为 done，A 随后读到 done → 不抑制 →
-	// 发出已作废的 C→S2。修法是把**这次检查**挪到 tx.Commit() 之前（发送仍留在提交后）：
-	// 事务内 A 仍持着 S2 的行锁，B 连自己交接的第一次 FOR UPDATE 都过不去，
-	// 读到的必然是 pending。已实测确认该行锁确实挡住兄弟工单。
+	// 早先这个检查跑在 tx.Commit() 之后，那时已不再持有继任者的行锁：若 worker A 在
+	// 提交后、检查前停顿足够久（约 100ms 量级），worker B 可以把 S2 的整条工单跑完并
+	// 置为 done，A 随后读到 done → 不抑制 → 发出已作废的 C→S2。它与上面那条一样，
+	// 也能和「抑制只判定一次」复合成「最后一条消息指向已离开的人」。
 	//
-	// 早先这里写过「确定性红测试需要在生产代码里加测试钩子，代价不匹配」——**那是错的**。
-	// HasPendingRemovalCleanup 只用 SelectBySql，而该方法在 dbr.SessionRunner 接口上，
-	// *dbr.Tx 本身就满足它：把形参放宽即可把检查移进事务，不需要任何钩子。没有在本次
-	// 改动里做，是因为它与上面那条 kicked 缺陷互相独立，而且**救不了**它——那里检查时
-	// 兄弟工单的行根本还不存在，再多的锁也变不出来。
+	// 现在检查挪进了事务（发送仍留在提交后）：事务内 A 仍持着 S2 的行锁，B 连自己交接
+	// 的第一次 FOR UPDATE 都过不去，读到的必然是 pending。已实测确认该行锁确实挡住
+	// 兄弟工单。不需要任何测试钩子——HasPendingRemovalCleanup 收 dbr.SessionRunner，
+	// *dbr.Tx 本身就满足（早先注释说"需要在生产代码里加测试钩子"，那是错的）。
+	//
+	// 注意查询必须**只读不改变事务成败**：它失败时按「不在队列里」处理并照常通告，
+	// 绝不能因为一次 COUNT 抖动把已经算好的交接回滚掉。
+	//
+	// ⚠️ 这一处**没有**确定性红测试守着，和上面那条不一样。把它挪回提交之后，现有用例
+	// 全部照绿——因为要自然复现需要 A 在一条 COMMIT 和一次带索引的 COUNT 之间停顿到
+	// 足够 B 跑完一整条工单（实测 30 轮并发，多余通告 0 次）。它的正确性依据是行锁
+	// 论证本身，不是一条会变红的用例。改动这一段时请重新推导，别指望测试拦你。
 	//
 	// 查询失败按「不在队列里」处理并照常通告：宁可多发一条，也不要因为一次 DB 抖动
 	// 把唯一一条有效通告吞掉——群里凭空换群主正是本改动要消灭的。
-	if pending, err := spacemod.HasPendingRemovalCleanup(g.ctx.DB(), spaceID, successor.UID); err != nil {
-		g.Warn("查询继任者待移除状态失败，按未待移除处理",
-			zap.Error(err), zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
-	} else if pending {
+	if successorPending {
 		g.Info("继任者本人也在待移除队列，跳过本环交接通告",
 			zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
 		return nil

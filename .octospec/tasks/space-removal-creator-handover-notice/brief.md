@@ -165,31 +165,55 @@ by three reviewers and confirmed against the code):
 |---|---|---|---|
 | Disband (`space/db.go`, `db_manager.go`) | `enqueueMemberRemovalCleanupBatchTx`, one tx | `space_disbanded` | Yes — but this path suppresses the notice anyway, so the cited function never protects an announcing path |
 | Superadmin force-remove (`removeMembersForce`) | one tx for the whole batch | `force_removed` | Yes |
-| **User-side `members/remove`** (`removeMemberLocked`) | **one tx per uid, committed individually** | **`kicked` — not suppressed** | **No** |
+| User-side `members/remove` (`removeMembersLocked`) | one tx for the whole batch — **fixed in this PR** | `kicked` | Yes (was **No**) |
 
-On the `kicked` path the cleanup worker's 10 s tick can claim the already-committed
-prefix mid-loop, while the later uids have no rows yet. The check then reads a
-successor who is about to be removed as "not pending" and announces an intermediate
-handover; that successor's own job later announces again. Measured: all rows seeded
-up front → 1 notice; per-iteration enqueue fully interleaved → 3; per-iteration plus
-a single tick after the first commit → 2. The surplus notices are `NoPersist=0`,
-already false when written, and stay in group history. The final notice is still
-correct, so this is *wrong content emitted*, not *correct content lost*.
+Before the fix, on the `kicked` path the cleanup worker's 10 s tick could claim the
+already-committed prefix mid-loop while the later uids had no rows yet. The check
+then read a successor who was about to be removed as "not pending" and announced an
+intermediate handover. Measured: all rows seeded up front → 1 notice; per-iteration
+enqueue fully interleaved → 3; per-iteration plus a single tick after the first
+commit → 2.
 
-Not fixed in this PR — deliberately, and the fix is not a drop-in: the per-uid
-transaction is what keeps each membership flip and its cleanup job atomic
-(transactional outbox), and the in-lock role-hierarchy re-read needs that
-granularity, so hoisting the inserts into a trailing transaction trades this defect
-for a torn-write one. Candidate directions: a `next_attempt_at` offset for a
-batch's jobs (a timing assumption, not a guarantee); a batch identity on the rows
-with suppression held until the batch is fully enqueued; or re-evaluating once a
-batch has settled rather than deciding per link — the last being the same
-durable-replay work tracked in #797.
+**And it composed with the never-re-evaluated check below into something worse.** An
+earlier revision of this brief said the surplus was "wrong content emitted, not
+correct content lost, because the final notice stays correct". That was false, and
+measured false: give the *final* successor a stale `pending` job — the ordinary
+state of anything in retry backoff — and the last link is suppressed instead. The
+last ownership message in group history then names someone who has left, while the
+actual owner is announced by nothing, ever. Gap A supplies a wrong message; gap B
+removes the correction. The no-alarm route is `skipped_rejoined`: the successor is
+removed, re-invited before their cleanup runs, and their job closes as `done`.
 
-`TestGroupCascadeBatchHandoverAnnouncesOnce` does **not** cover this: it seeds the
-whole batch's pending rows before the loop, modelling the two atomic entrypoints.
-It pins "an atomically-enqueued batch collapses to one notice", not "every
-entrypoint collapses".
+**Fixed** by making the user-side batch enqueue atomically —
+`removeMembersLocked` (`space/db_manager.go`) does the per-uid `FOR UPDATE` role
+re-read, the flip, and the whole batch's enqueue in **one** transaction, mirroring
+`removeMembersForce`, which already ships with that shape. This keeps both
+load-bearing properties the per-uid transaction existed for: the flip and its
+cleanup job still commit together (transactional outbox), and the role-hierarchy
+re-read still happens under the row lock. The one semantic change is partial
+failure: a DB error mid-batch now rolls the whole batch back instead of leaving a
+committed prefix, which is why the caller no longer needs compensating cleanup.
+
+With A closed, B alone degrades to silence — the pre-PR behaviour, never a false
+name. B itself is unchanged and still tracked (see below).
+
+Guarded by a **pair** of tests, and neither is sufficient alone:
+
+- `space/TestRemoveMembersLockedEnqueuesAtomically` proves the premise: a competing
+  row lock stalls the batch on its second uid, and the test asserts that *no*
+  cleanup row is visible at that moment. Mutating the implementation back to
+  per-uid commits turns it red (verified).
+- `group/TestGroupCascadeLastNoticeNamesActualOwner` proves the consequence given
+  the premise, with two hard-asserted scenarios: a stale-`pending` successor yields
+  **zero** notices, and the ordinary case yields **exactly one** naming the settled
+  owner. Removing the chain suppression turns both red (verified).
+
+`TestGroupCascadeBatchHandoverAnnouncesOnce` still seeds the whole batch up front,
+and that is now a *linked* premise rather than a hidden one: its doc comment names
+the space-side test that establishes it. On its own it would pin "an
+atomically-enqueued batch collapses to one notice", not "every entrypoint
+collapses" — the trap recorded in
+`learnings/pending/a-test-can-encode-the-premise.md`.
 
 **A separate and independent window: across replicas.** The check runs after
 `handOverGroupCreator` commits, so the successor's row lock is already released.
@@ -201,14 +225,25 @@ transaction A still holds the successor's row lock, so B cannot get past the fir
 `FOR UPDATE` of its own handover, and the row is unambiguously `pending`. That
 row-lock premise was verified by experiment.
 
-Not done here. An earlier revision justified that by saying a deterministic red
-test would need a test hook in production code; **that was wrong** —
-`HasPendingRemovalCleanup` only calls `SelectBySql`, which is on
-`dbr.SessionRunner`, and `*dbr.Tx` satisfies it, so widening the parameter moves
-the check inside the transaction with no hook at all. The real reasons it is not
-here: 30 rounds of two goroutines racing sibling jobs produced **zero** surplus
-notices, and it is independent of the `kicked` defect above — which it cannot fix,
-because there the sibling row genuinely does not exist yet.
+**Also fixed in this PR.** `HasPendingRemovalCleanup` now takes a
+`dbr.SessionRunner`, which `*dbr.Tx` satisfies, so the check runs inside the
+handover transaction while the send stays after the commit. No test hook was needed
+— an earlier revision claimed one would be, and that was wrong. This matters beyond
+tidiness: the stale notice it admits can compose with gap B exactly as gap A did.
+
+The query is deliberately read-only with respect to the transaction's fate: if the
+`COUNT` errors, the code treats the successor as not pending and announces, rather
+than rolling back a handover that is already correct.
+
+**This one has no deterministic red test**, unlike gap A. Moving the check back
+after the commit leaves every existing case green, because reproducing it naturally
+requires worker A to stall between a `COMMIT` and an indexed `COUNT` for long enough
+that worker B finishes an entire job — 30 rounds of two goroutines racing sibling
+jobs produced zero surplus notices. Its correctness rests on the row-lock argument
+(A still holds the successor's row lock inside the transaction, so B cannot get past
+the first `FOR UPDATE` of its own handover), which was verified experimentally. The
+code comment says so, so the next editor does not expect a test to catch a
+regression here.
 
 `done` and `abandoned` do not suppress — but only when they already hold at check
 time. The common ordering is the reverse: the check runs first, and the

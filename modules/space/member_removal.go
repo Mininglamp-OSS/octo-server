@@ -519,12 +519,14 @@ func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, sta
 // 而前面那些在写下时就已作废。动手通告前先问一句「这位继任者自己是不是也在待移除队列
 // 里」，是就不发，链条于是只剩最后一环——那一环的继任者不在队列里，通告的是最终结果。
 //
-// ⚠️ 这只在同批工单于任何 worker 起跑前就全部可见时才成立，而**并非所有入口都如此**：
-// 解散走 enqueueMemberRemovalCleanupBatchTx、超管强制移除走 removeMembersForce，两者都是
-// 单事务原子入队；但用户端 members/remove 走 removeMemberLocked，一人一事务逐个提交
-// （reason=kicked，不抑制），后面几个 uid 的行在前缀被认领时还不存在，本函数会把他们
-// 读成「不在队列里」。后果与完整分析见调用方 group/space_member_removal.go 里
+// ⚠️ 这只在同批工单于任何 worker 起跑前就全部可见时才成立。三个批量入口现在都满足：
+// 解散走 enqueueMemberRemovalCleanupBatchTx、超管强制移除走 removeMembersForce、用户端
+// members/remove 走 removeMembersLocked（PR #804 改的就是最后这个——它此前是
+// removeMemberLocked 一人一事务逐个提交，本函数会把尚未入队的兄弟读成「不在队列里」，
+// 发出已作废的交接通告）。后果与完整分析见调用方 group/space_member_removal.go 里
 // HasPendingRemovalCleanup 调用点上方的注释。
+//
+// 新增单成员入口时请一并确认：只要一批移除会分多次提交，这里就会重新出问题。
 //
 // 只看 pending（status=0）：
 //   - done 表示那条工单已跑完，人已经不在群里，本来也不会被选为继任者；
@@ -541,12 +543,17 @@ func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, sta
 // 已知的保守失败方向：继任者若挂着一条更早的、卡住不动的 pending 工单，这里会误判成
 // 「他也要走」而少发一条通告。相比反过来（通告一个马上就作废的群主）这个方向更可接受，
 // 记在 brief 的 out-of-scope 里。
-func HasPendingRemovalCleanup(session *dbr.Session, spaceID, uid string) (bool, error) {
+//
+// 形参是 dbr.SessionRunner 而不是 *dbr.Session：*dbr.Tx 也满足它，调用方得以在**交接
+// 事务内**查询。这很要紧——事务内查询时调用方仍持着继任者的行锁，兄弟 worker 连自己
+// 交接的第一次 FOR UPDATE 都过不去，读到的必然是 pending；提交之后再查则锁已释放，
+// 兄弟工单可能已经跑完并置 done，于是漏抑制、发出已作废的通告。
+func HasPendingRemovalCleanup(runner dbr.SessionRunner, spaceID, uid string) (bool, error) {
 	if spaceID == "" || uid == "" {
 		return false, nil
 	}
 	var count int
-	err := session.SelectBySql(
+	err := runner.SelectBySql(
 		"SELECT COUNT(*) FROM space_member_removal_cleanup WHERE space_id=? AND uid=? AND status=?",
 		spaceID, uid, removalCleanupPending,
 	).LoadOne(&count)

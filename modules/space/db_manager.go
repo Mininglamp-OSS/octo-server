@@ -594,6 +594,82 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 	return true, nil
 }
 
+// removeMembersLocked 是 removeMemberLocked 的整批版本：**一个事务**里逐个锁定、
+// 重读角色、翻转成员行，最后一次性入队全部清理工单，单次提交。
+// 返回真正被改动的 uid 列表，语义与逐个调用 removeMemberLocked 收集 ok=true 一致。
+//
+// 为什么必须是一个事务，而不是循环调用 removeMemberLocked（PR #804 round-4/5 review）：
+//
+// 群侧的群主交接通告要靠 HasPendingRemovalCleanup 判断「继任者是不是也在这一批里」
+// 来收敛连锁通告，而它只看得见**已提交**的行。逐个提交时，清理 worker 每 10s 一轮、
+// 新工单 next_attempt_at=now 立即可认领，一次 tick 落在循环中途就会认领已提交的前缀，
+// 而后面几个 uid 的工单行尚不存在 —— 检查把「马上要被移除的继任者」读成「不在队列」，
+// 于是发出一条写下时就已作废的「已成为新群主」，NoPersist=0 永久留在群历史里。
+// 实测（reason=kicked，群内连续元老 C/S2/S3）：整批预先可见 → 1 条；逐条提交且每轮
+// 都被 tick 命中 → 3 条；逐条提交且只有首次提交后一个 tick → 2 条。
+//
+// 更糟的是它会与另一条既有缺口复合：若最终继任者自己挂着一条 pending 工单（重试退避
+// 中的普通状态），最后一环反而被抑制，于是群历史里**最后**一条群主消息指向一个已经
+// 不在群里的人，而真正的群主从未被通告 —— 正是本次通告机制要消灭的东西。
+//
+// 整批一个事务后，同批所有工单行在任何 worker 能认领之前就已全部可见，链条收敛回
+// 一条，且通告的是最终群主。这与 removeMembersForce（管理端强制移除）已经在用的形状
+// 相同，只是多了 removeMemberLocked 的角色层级校验。
+//
+// 代价是部分失败语义变了：以前中途 DB 出错会留下已提交的前缀，现在整批回滚。这对
+// transactional outbox 反而更干净（成员行与工单同生共死这一点不变），调用方也不必再
+// 为「前缀已提交」做补偿收尾。owner 与同级及更高角色仍是**静默跳过**，不是错误。
+func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	tx, err := sess.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	now := time.Now()
+	removed := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		// 逐个在锁内重读角色，与 removeMemberLocked 完全一致：防止 pre-check 之后
+		// 目标被并发转让升为 owner 仍被移除。
+		var roles []int
+		if _, err = tx.SelectBySql(
+			"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE",
+			spaceId, uid,
+		).Load(&roles); err != nil {
+			return nil, err
+		}
+		// 三种「不该动」的情形都静默跳过，与既有 removeMembers 的观察行为一致
+		// （那边是 ErrCannotRemoveOwner / ErrRemoveHierarchy 被调用方 continue 掉，
+		// 以及 ok=false 不计入 removed）。重复 uid 也在这里自然收敛：本事务里
+		// 第一次已把 status 翻成 0，第二次读不到行。
+		if len(roles) == 0 || roles[0] == 2 || roles[0] >= rejectRoleAtOrAbove {
+			continue
+		}
+		if _, err = tx.Update("space_member").
+			Set("status", 0).Set("updated_at", now).
+			Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
+			return nil, err
+		}
+		removed = append(removed, uid)
+	}
+
+	// 只给真正被改动的成员行入队，且与那些翻转同事务提交（transactional outbox）。
+	// 用多值 INSERT 的批量版本而不是逐条 enqueueMemberRemovalCleanupTx：锁内往返
+	// 从 N 次压到 N/200 次，理由与 enqueueMemberRemovalCleanupBatchTx 自身的注释相同。
+	if len(removed) > 0 {
+		if err = enqueueMemberRemovalCleanupBatchTx(tx, spaceId, removed, operatorUID, reason); err != nil {
+			return nil, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
 // queryInvitesAdmin 分页查询空间所有邀请码（含已禁用）
 func (d *managerDB) queryInvitesAdmin(spaceId string, pageSize, pageIndex uint64) ([]*InvitationModel, error) {
 	var list []*InvitationModel

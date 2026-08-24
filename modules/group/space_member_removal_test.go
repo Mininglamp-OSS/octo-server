@@ -735,12 +735,18 @@ func TestGroupCascadeHandoverAnnouncedOncePerRetry(t *testing.T) {
 
 // TestGroupCascadeBatchHandoverAnnouncesOnce 批量移除时，一个群只发一条交接通告。
 //
-// 回归 PR #804 review 实测出的缺陷：批量移除按 uid 逐条建工单
-// （enqueueMemberRemovalCleanupBatchTx），若被移除的几个人正好是群里连续的元老，
-// 交接会沿元老顺序连锁：C→S2、S2→S3、S3→S4，一个群里三条「已成为新群主」，
-// 前两条在写下时就已作废。两个批量入口各自上限 200 uid，最坏 200 条。
+// 回归 PR #804 review 实测出的缺陷：批量移除为每个 uid 各建一条工单
+// （逐条是 enqueueMemberRemovalCleanupTx，整批一次是 enqueueMemberRemovalCleanupBatchTx），
+// 若被移除的几个人正好是群里连续的元老，交接会沿元老顺序连锁：C→S2、S2→S3、S3→S4，
+// 一个群里三条「已成为新群主」，前两条在写下时就已作废。批量入口上限 200 uid。
 //
 // 这与解散被抑制的机制**完全相同**，只是触发方式不同。
+//
+// ⚠️ 本用例的前提是「同批工单在任何 worker 起跑前全部可见」，fixture 用循环前一次性
+// seed 来建模。这个前提不是假设，它由 modules/space 的
+// TestRemoveMembersLockedEnqueuesAtomically 证明——那条用一把竞争行锁把整批卡在中间，
+// 断言此刻一条工单都不可见。两条合起来才覆盖真实路径；单看本用例会把前提当结论
+// （见 learnings/pending/a-test-can-encode-the-premise.md）。
 func TestGroupCascadeBatchHandoverAnnouncesOnce(t *testing.T) {
 	ctx, g := cascadeSetup(t)
 	stub := newGroupIMStub(t, ctx)
@@ -1315,4 +1321,135 @@ func TestGroupCascadeSkipsMemberInBannedSpace(t *testing.T) {
 	role, stillIn := liveMemberRole(t, ctx, "g-banned", victim)
 	assert.True(t, stillIn, "空间只是被封禁、人还是成员，级联不得把他清出群")
 	assert.Equal(t, MemberRoleCommon, role, "角色也不应被改动")
+}
+
+// lastHandoverNoticeSuccessor 取**最后一条**交接通告里的新群主 uid（extra[1]）。
+// 不能用 payloadExtraUIDAt——它返回第一条命中的。链条里中间环被后面的取代是允许的，
+// 真正不能错的是最后一条。
+func lastHandoverNoticeSuccessor(payloads []map[string]interface{}) (string, bool) {
+	found, uid := false, ""
+	for _, p := range payloads {
+		one := []map[string]interface{}{p}
+		if !payloadsContainGroupVisible(one, "已成为新群主") {
+			continue
+		}
+		found = true
+		uid = payloadExtraUIDAt(one, "已成为新群主", 1)
+	}
+	return uid, found
+}
+
+// currentCreator 返回群当前的 creator uid。
+func currentCreator(t *testing.T, ctx *config.Context, groupNo string) (string, bool) {
+	t.Helper()
+	var uids []string
+	_, err := ctx.DB().SelectBySql(
+		"SELECT uid FROM group_member WHERE group_no=? AND role=? AND is_deleted=0", groupNo, MemberRoleCreator).Load(&uids)
+	require.NoError(t, err)
+	if len(uids) == 0 {
+		return "", false
+	}
+	return uids[0], true
+}
+
+// seedGroupMemberAt 显式指定 created_at。
+//
+// 必须有：seedGroupMember 用 NOW()，而 group_member.created_at 是秒级 TIMESTAMP，
+// 同一秒内插入的几个成员在 `ORDER BY created_at ASC` 下**并列**，选主落到谁完全取决于
+// InnoDB 恰好先返回哪一行。凡是依赖元老顺序的用例都必须自己拉开时间戳，否则测的是
+// 存储引擎的返回次序而不是选主逻辑（PR #804 round-5 review）。
+func seedGroupMemberAt(t *testing.T, ctx *config.Context, groupNo, uid string, role int, at string) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT INTO group_member (group_no, uid, role, is_deleted, version, created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?)",
+		groupNo, uid, role, at, at)
+	require.NoError(t, err)
+}
+
+// TestGroupCascadeLastNoticeNamesActualOwner 复合缺陷回归守卫。
+//
+// PR #804 round-5 实测出的最坏情形，由两个各自「可容忍」的缺口复合而成：
+//   - A：kicked 批量逐条提交 → 中间环照发通告（每条写下时为真，最后一条纠正全局）
+//   - B：抑制只判定一次、永不重评 → 最终继任者若自己挂着 pending 工单，最后一环被抑制
+//
+// A 提供了一条错的消息，B 抽掉了那个纠正：群历史里**最后**一条群主消息指向一个已经
+// 不在群里的人，而真正的群主从未被通告。
+//
+// A 已由 modules/space 的整批单事务修掉，并由
+// TestRemoveMembersLockedEnqueuesAtomically 用一把竞争行锁守住（变异为逐条提交立刻变红）。
+// 本用例守的是**在 A 已修的前提下**，B 单独存在时的两种结局都不说错话：
+//
+//	场景一（继任者挂着陈旧 pending）：一条都不发 —— 退回基线的静默，不比 main 差。
+//	场景二（正常）：恰好一条，且点名的正是最终群主。
+//
+// 两条断言都是硬的，不走 if：上一版把场景一写成「若发了则必须正确」，而抑制生效时
+// 一条都不发，整个断言块从不执行——fixture 又一次成了结论
+// （见 learnings/pending/a-test-can-encode-the-premise.md）。
+func TestGroupCascadeLastNoticeNamesActualOwner(t *testing.T) {
+	seedChain := func(t *testing.T, ctx *config.Context, gno, spaceID string) (c, s2, s3, s4 string) {
+		c, s2, s3, s4 = "u-c", "u-s2", "u-s3", "u-s4"
+		for _, u := range []string{c, s2, s3, s4} {
+			seedUser(t, ctx, u, "名字"+u)
+		}
+		seedGroupInSpace(t, ctx, gno, spaceID, c)
+		// 显式拉开元老顺序，见 seedGroupMemberAt 的注释
+		seedGroupMemberAt(t, ctx, gno, c, MemberRoleCreator, "2020-01-01 00:00:01")
+		seedGroupMemberAt(t, ctx, gno, s2, MemberRoleCommon, "2020-01-01 00:00:02")
+		seedGroupMemberAt(t, ctx, gno, s3, MemberRoleCommon, "2020-01-01 00:00:03")
+		seedGroupMemberAt(t, ctx, gno, s4, MemberRoleCommon, "2020-01-01 00:00:04")
+		return
+	}
+	runBatch := func(t *testing.T, ctx *config.Context, g *Group, spaceID string, batch []string) {
+		// 整批原子入队 —— removeMembersLocked 修好后就是这个形状
+		seedPendingRemovals(t, ctx, spaceID, batch, spacemod.MemberRemoveReasonKicked)
+		for _, uid := range batch {
+			require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+				SpaceID: spaceID, UID: uid, OperatorUID: "su",
+				Reason: spacemod.MemberRemoveReasonKicked,
+			}))
+			markRemovalDone(t, ctx, spaceID, uid)
+		}
+	}
+
+	t.Run("继任者挂着陈旧pending时保持静默而不是说错人", func(t *testing.T) {
+		ctx, g := cascadeSetup(t)
+		stub := newGroupIMStub(t, ctx)
+		const spaceID, gno = "sp-compose-stale", "g-compose-stale"
+		_, _, _, s4 := seedChain(t, ctx, gno, spaceID)
+
+		// 缺口 B：最终继任者自己挂着一条 pending 工单（重试退避中的普通状态）
+		seedPendingRemovals(t, ctx, spaceID, []string{s4}, spacemod.MemberRemoveReasonKicked)
+		runBatch(t, ctx, g, spaceID, []string{"u-c", "u-s2", "u-s3"})
+
+		owner, hasOwner := currentCreator(t, ctx, gno)
+		require.True(t, hasOwner)
+		require.Equal(t, s4, owner, "s4 是唯一留下的人，应当成为群主")
+
+		assert.Equal(t, 0, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
+			"每一环的继任者都在待移除队列里，应当一条都不发；"+
+				"发出来的必然点名一个已经离开的人——正是本 PR 要消灭的东西")
+	})
+
+	t.Run("正常情形恰好一条且点名最终群主", func(t *testing.T) {
+		ctx, g := cascadeSetup(t)
+		stub := newGroupIMStub(t, ctx)
+		const spaceID, gno = "sp-compose-normal", "g-compose-normal"
+		_, _, s3, _ := seedChain(t, ctx, gno, spaceID)
+
+		// s3、s4 都不在队列里 → 链条应当收敛到 s2→s3 这一环
+		runBatch(t, ctx, g, spaceID, []string{"u-c", "u-s2"})
+
+		owner, hasOwner := currentCreator(t, ctx, gno)
+		require.True(t, hasOwner)
+		require.Equal(t, s3, owner)
+
+		require.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
+			"链条应当收敛成一条")
+		claimed, emitted := lastHandoverNoticeSuccessor(stub.sentPayloads())
+		require.True(t, emitted)
+		assert.Equal(t, owner, claimed,
+			"最后一条通告点名的新群主必须是群里当下真正的 creator")
+		_, stillIn := liveMemberRole(t, ctx, gno, claimed)
+		assert.True(t, stillIn, "通告点名的新群主必须还在群里")
+	})
 }

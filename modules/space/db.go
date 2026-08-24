@@ -283,6 +283,12 @@ func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int, op
 	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove, operatorUID, reason)
 }
 
+// removeMembersLocked 整批移除，单事务。见 db_manager.go removeMembersLocked —
+// 那里记着为什么批量入口必须原子入队。
+func (d *DB) removeMembersLocked(spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
+	return removeMembersLocked(d.session, spaceId, uids, rejectRoleAtOrAbove, operatorUID, reason)
+}
+
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {
 	_, err := d.session.Update("space_member").
 		Set("status", 1).Set("role", role).

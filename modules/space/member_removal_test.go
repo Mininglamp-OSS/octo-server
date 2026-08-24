@@ -1326,3 +1326,126 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupAbandonedGauge))
 	assert.GreaterOrEqual(t, promtestutil.ToFloat64(removalCleanupOldestPendingGauge), float64(600))
 }
+
+// TestRemoveMembersLockedEnqueuesAtomically 整批移除必须是**一个事务**：在它提交之前，
+// 同批里任何一个人的清理工单都不得对外可见。
+//
+// 这条是 PR #804 round-4/5 的回归守卫。逐个提交时工单会陆续可见，群侧的交接通告抑制
+// （HasPendingRemovalCleanup 只看得见已提交的行）就会把尚未入队的兄弟读成「不在队列」，
+// 发出写下时就已作废的「已成为新群主」，NoPersist=0 永久留在群历史里。
+//
+// 用一把竞争行锁把整批**卡在中间**来判定，而不是靠时序猜：另一个连接先锁住 m2 的
+// space_member 行，批量移除走到 m2 时必然阻塞，此刻 m1 早已在事务内被翻转——如果实现
+// 是一人一事务，m1 的工单此刻就该可见。断言它**不可见**，即证明整批共用一个事务。
+//
+// 变异验证：把 removeMembersLocked 改回逐个提交，这条断言立刻变红。
+func TestRemoveMembersLockedEnqueuesAtomically(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-atomic"
+	seedMember(t, f, spaceID, "owner", 2)
+	for _, uid := range []string{"m1", "m2", "m3"} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	// 另一个连接锁住 m2，让整批停在第二个人身上
+	blocker, err := testCtx.DB().Begin()
+	require.NoError(t, err)
+	var held []int
+	_, err = blocker.SelectBySql(
+		"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE",
+		spaceID, "m2").Load(&held)
+	require.NoError(t, err)
+	require.Len(t, held, 1, "m2 应当存在且活跃，否则这把锁挡不住任何东西")
+
+	var removed []string
+	var rmErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		removed, rmErr = f.db.removeMembersLocked(
+			spaceID, []string{"m1", "m2", "m3"}, 1, "owner", MemberRemoveReasonKicked)
+	}()
+
+	// 等到它真的卡在行锁上，而不是靠 sleep 猜
+	require.Eventually(t, func() bool {
+		var n int
+		_, err := testCtx.DB().SelectBySql(
+			"SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_state='LOCK WAIT'").Load(&n)
+		return err == nil && n > 0
+	}, 15*time.Second, 50*time.Millisecond, "批量移除应当阻塞在 m2 的行锁上")
+
+	// 核心断言：m1 已在事务内被翻转，但整批尚未提交，所以一条工单都不该可见
+	assert.Empty(t, cleanupJobs(t, spaceID),
+		"整批提交之前不得有任何工单可见——逐个提交会让 m1 的工单此刻就露出来")
+
+	require.NoError(t, blocker.Rollback())
+	<-done
+	require.NoError(t, rmErr)
+
+	assert.Equal(t, []string{"m1", "m2", "m3"}, removed)
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 3, "提交后三条工单一次性全部可见")
+	for _, j := range jobs {
+		assert.Equal(t, MemberRemoveReasonKicked, j.Reason)
+		assert.Equal(t, removalCleanupPending, j.Status)
+	}
+}
+
+// TestRemoveMembersLockedSkipsOwnerAndPeers 整批版本必须保留 removeMemberLocked 的
+// 角色语义：owner、同级及更高角色、以及根本不在空间里的 uid，都**静默跳过**而不是
+// 让整批失败，也不得为他们留下工单。
+func TestRemoveMembersLockedSkipsOwnerAndPeers(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-roles"
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "peer-admin", Role: 1, Status: 1,
+	}))
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "normal", Role: 0, Status: 1,
+	}))
+
+	// 操作者是 admin(role=1)：owner 不可动、同级 admin 不可动、ghost 不存在，
+	// 只有 normal 该被移除。
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{"owner", "peer-admin", "ghost", "normal"}, 1, "peer-admin", MemberRemoveReasonKicked)
+	require.NoError(t, err, "不该动的人只是跳过，不能让整批报错")
+	assert.Equal(t, []string{"normal"}, removed)
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1, "只有真正被移除的人才入队")
+	assert.Equal(t, "normal", jobs[0].UID)
+}
+
+// TestRemoveMembersLockedRollsBackWholeBatchOnError 中途出错整批回滚：成员行与工单
+// 同生共死这一点，从「每人一组」升级成「整批一组」。
+func TestRemoveMembersLockedRollsBackWholeBatchOnError(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-rollback"
+	seedMember(t, f, spaceID, "owner", 2)
+	for _, uid := range []string{"r1", "r2"} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	// 用一个非法 reason 让入队阶段失败——那一步发生在所有成员行都已翻转之后。
+	_, err = f.db.removeMembersLocked(spaceID, []string{"r1", "r2"}, 1, "owner", "not-a-real-reason")
+	require.Error(t, err, "非法 reason 应当让整批失败")
+
+	assert.Empty(t, cleanupJobs(t, spaceID), "失败后不得留下任何工单")
+	for _, uid := range []string{"r1", "r2"} {
+		m, qerr := f.db.queryMember(spaceID, uid)
+		require.NoError(t, qerr)
+		require.NotNil(t, m, "成员行必须还在")
+		assert.EqualValues(t, 1, m.Status, "整批回滚后 %s 必须仍是活跃成员", uid)
+	}
+}

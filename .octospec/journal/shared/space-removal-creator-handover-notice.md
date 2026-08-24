@@ -257,3 +257,86 @@ comment, the brief's Chain suppression section, and this journal. The `kicked`-p
 defect itself is not fixed here: the per-uid transaction is load-bearing
 (transactional outbox plus the in-lock role-hierarchy re-read), so the fix is a
 design change, not an edit.
+
+## Round 4 — the composition, and the fix
+
+Round 3 corrected the record but changed no behaviour, on the maintainer's call.
+Review rejected that as a resolution — "documented is not resolved" — and while
+re-reviewing, one reviewer found something worse than the defect they had filed.
+They had approved the corrected head hours earlier on this reasoning:
+
+> Read as a sequence, the three messages are a truthful log of three transitions
+> that genuinely occurred. **The last one is always correct, and it is last.**
+
+That sentence is false, and it was mine too — I had shipped the same claim in the PR
+description as "the final notice stays correct, so this is wrong content emitted,
+not correct content lost". Neither of us ran the case that disproves it.
+
+Two gaps, each correctly judged tolerable **alone**:
+
+- **A** — the `kicked` batch enqueued per uid, so a worker tick mid-loop announces a
+  mid-chain handover. Alone: noise. Every line is true when written and the last one
+  settles the picture.
+- **B** — the suppression is decided once and never revisited. If the elected
+  successor's own job later reaches `abandoned`, or they rejoin and it closes as
+  `skipped_rejoined`, that handover is announced by nothing. Alone: silence, which
+  is exactly what `main` does always.
+
+Compose them and the last ownership message in group history names someone who has
+left, while the real owner is never announced. Reproduced here before accepting it:
+group `C→S2→S3→S4`, `S4` holding an ordinary retry-backoff `pending` job, batch kick
+`{C, S2, S3}` — two notices emitted, last one claiming `S3`, and `S3` is not in the
+group. `S4` is the owner, `role=1`, announced by nothing.
+
+The quiet route is the bad one: `skipped_rejoined` needs only an admin removing
+someone and re-adding them before the cleanup runs. No error logs, no metric moves.
+
+### What was fixed
+
+**A**, at its source: the user-side batch now enqueues in one transaction
+(`removeMembersLocked`), mirroring `removeMembersForce`. My round-3 counter-argument
+— that batching the inserts would trade this bug for a torn-write bug — was aimed at
+a straw man. All three reviewers had asked for the *other* shape, one transaction
+around the whole loop, which keeps both properties the per-uid transaction existed
+for. A reviewer had to point that out; I had argued against a design nobody proposed.
+
+**The multi-replica window** as well, since it can compose with B the same way.
+`HasPendingRemovalCleanup` now takes a `dbr.SessionRunner` so the check runs inside
+the handover transaction.
+
+**B is not fixed** and is still tracked. With A closed it degrades to silence, which
+is the pre-PR behaviour — never a false name.
+
+### Two things about the tests
+
+The first guard I wrote for the composition **passed vacuously**: it asserted "if a
+notice was emitted, the last one must name the real owner", and with suppression
+working the scenario emits nothing, so the assertion block never ran. That is the
+third time on this branch that a fixture quietly became the conclusion — and I had
+already written the learning about it. Rewritten with two scenarios and hard counts.
+
+The atomicity guard is the one that carries the fix, and it is deterministic rather
+than timing-based: a competing row lock stalls the batch on its second uid, and the
+test asserts no cleanup row is visible at that instant. Mutating the implementation
+back to per-uid commits turns it red with exactly the right message — one job
+visible while the batch is still blocked.
+
+One fix here has **no** red test and the code says so: moving the pending check back
+outside the transaction leaves everything green, because the window needs a stall
+between a `COMMIT` and an indexed `COUNT`. It rests on the row-lock argument, not on
+a test.
+
+### Also from this round
+
+An intermittent `modules/group` failure recurred during verification and I chased it
+rather than re-running until green: `TestGroupCreate_WithCategoryID` +
+`TestGroupSettingUpdate_AllowNoMention_SilentToggleSucceeds`, 2 failures in 7 runs,
+both the same pair, both in `api_test.go` which this change does not touch — the
+documented pre-existing pair that the merge base reproduces at the same rate.
+
+`seedGroupMember` uses `NOW()`, and `group_member.created_at` is second-resolution,
+so members seeded in the same second **tie** under `ORDER BY created_at ASC`. Any
+test that depends on seniority was really depending on InnoDB's return order. New
+seniority-dependent tests set explicit timestamps; the production ambiguity (two
+members joining in the same second have unspecified relative seniority) is recorded
+as a follow-up.
