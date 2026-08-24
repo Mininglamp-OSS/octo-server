@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -547,6 +548,64 @@ func TestOPPOPushRefreshesInvalidTokenOnceWithStableDedupeID(t *testing.T) {
 	assert.Len(t, cache.delKeys, 1)
 	require.Len(t, appMessageIDs, 2)
 	assert.Equal(t, appMessageIDs[0], appMessageIDs[1], "auth retry must not create a second logical notification")
+}
+
+func TestOPPOPushConcurrentInvalidTokenAuthenticatesOnce(t *testing.T) {
+	const pushes = 8
+	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}
+	staleRequests := make(chan struct{}, pushes)
+	releaseStaleRequests := make(chan struct{})
+	var authCalls atomic.Int32
+	var freshRequests atomic.Int32
+
+	pusher := newOPPOPushForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/server/v1/auth":
+			authCalls.Add(1)
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0,"data":{"auth_token":"fresh-token"}}`)
+		case "/server/v1/message/notification/unicast":
+			require.NoError(t, r.ParseForm())
+			if r.PostForm.Get("auth_token") == "stale-token" {
+				staleRequests <- struct{}{}
+				<-releaseStaleRequests
+				writeOPPOJSON(t, w, http.StatusOK, `{"code":11,"message":"Invalid AuthToken"}`)
+				return
+			}
+			freshRequests.Add(1)
+			writeOPPOJSON(t, w, http.StatusOK, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}), cache, defaultOPPOPushOptions())
+	pusher.localAuthToken.Store(&oppoAuthToken{value: "stale-token", expiresAt: oppoTestNow.Add(oppoAuthTokenTTL)})
+	payload := NewOPPOPayload(&PayloadInfo{Title: "title", Content: "content", MessageSeq: 1}, "message:1")
+
+	errs := make(chan error, pushes)
+	var wg sync.WaitGroup
+	for range pushes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- pusher.Push("registration-id", payload)
+		}()
+	}
+	for range pushes {
+		select {
+		case <-staleRequests:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent stale-token requests")
+		}
+	}
+	close(releaseStaleRequests)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, int32(1), authCalls.Load())
+	assert.Equal(t, int32(pushes), freshRequests.Load())
+	assert.Len(t, cache.delKeys, 1)
 }
 
 func TestOPPOPushDoesNotRetryBusinessErrors(t *testing.T) {

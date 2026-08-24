@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -40,6 +41,7 @@ const (
 	oppoMaxTitleRunes            = 50
 	oppoMaxContentRunes          = 50
 	oppoMaxActionParametersRunes = 4000
+	oppoMaxRegistrationIDBytes   = 256
 	oppoDefaultNotificationText  = "您有一条新的消息"
 )
 
@@ -220,12 +222,17 @@ func NewOPPOPush(appID, appKey, appSecret, masterSecret string, ctx *config.Cont
 
 	keyDigest := sha256.Sum256([]byte(appKey))
 	return &OPPOPush{
-		appID:                  appID,
-		appKey:                 appKey,
-		appSecret:              appSecret,
-		masterSecret:           masterSecret,
-		authTokenCacheKey:      "oppo_auth_token:" + hex.EncodeToString(keyDigest[:8]),
-		httpClient:             &http.Client{Timeout: oppoHTTPTimeout},
+		appID:             appID,
+		appKey:            appKey,
+		appSecret:         appSecret,
+		masterSecret:      masterSecret,
+		authTokenCacheKey: "oppo_auth_token:" + hex.EncodeToString(keyDigest[:8]),
+		httpClient: &http.Client{
+			Timeout: oppoHTTPTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		tokenCache:             tokenCache,
 		authURL:                oppoAuthURL,
 		notificationUnicastURL: oppoNotificationUnicastURL,
@@ -259,13 +266,25 @@ func NewOPPOPayload(payloadInfo *PayloadInfo, dedupeID string) *OPPOPayload {
 	}
 }
 
+func newOPPOPayloadForMessage(payloadInfo *PayloadInfo, msg msgOfflineNotify) (*OPPOPayload, error) {
+	var dedupeID string
+	if msg.MessageID != 0 {
+		dedupeID = "message:" + strconv.FormatInt(msg.MessageID, 10)
+	} else if clientMsgNo := strings.TrimSpace(msg.ClientMsgNo); clientMsgNo != "" {
+		dedupeID = "client:" + clientMsgNo
+	} else {
+		return nil, errors.New("OPPO push: missing message identity")
+	}
+	return NewOPPOPayload(payloadInfo, dedupeID), nil
+}
+
 // GetPayload builds the OPPO payload from the canonical offline-message data.
 func (o *OPPOPush) GetPayload(msg msgOfflineNotify, ctx *config.Context, toUser *user.Resp) (Payload, error) {
 	payloadInfo, err := ParsePushInfo(msg, ctx, toUser)
 	if err != nil {
 		return nil, err
 	}
-	return NewOPPOPayload(payloadInfo, fmt.Sprintf("%d", msg.MessageSeq)), nil
+	return newOPPOPayloadForMessage(payloadInfo, msg)
 }
 
 type oppoRoutingParameters struct {
@@ -299,8 +318,8 @@ type oppoUnicastMessage struct {
 }
 
 func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload) ([]byte, error) {
-	if strings.TrimSpace(deviceToken) == "" {
-		return nil, errors.New("OPPO push: empty registration ID")
+	if err := validateOPPORegistrationID(deviceToken); err != nil {
+		return nil, err
 	}
 
 	routing, err := json.Marshal(oppoRoutingParameters{
@@ -318,10 +337,6 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 
 	dedupeSource := strings.Join([]string{
 		deviceToken,
-		payload.spaceID,
-		payload.channelID,
-		strconv.Itoa(int(payload.channelType)),
-		strconv.FormatUint(uint64(payload.messageSeq), 10),
 		payload.dedupeID,
 	}, "\x00")
 	dedupeDigest := sha256.Sum256([]byte(dedupeSource))
@@ -352,6 +367,24 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		return nil, fmt.Errorf("OPPO push: encode message: %w", err)
 	}
 	return encoded, nil
+}
+
+func validateOPPORegistrationID(deviceToken string) error {
+	if deviceToken == "" {
+		return errors.New("OPPO push: empty registration ID")
+	}
+	if len(deviceToken) > oppoMaxRegistrationIDBytes {
+		return fmt.Errorf("OPPO push: registration ID exceeds %d bytes", oppoMaxRegistrationIDBytes)
+	}
+	if !utf8.ValidString(deviceToken) {
+		return errors.New("OPPO push: registration ID is not valid UTF-8")
+	}
+	for _, character := range deviceToken {
+		if character == ';' || character == ',' || unicode.IsSpace(character) || unicode.IsControl(character) {
+			return errors.New("OPPO push: malformed registration ID")
+		}
+	}
+	return nil
 }
 
 func normalizeOPPONotificationText(value string, maxRunes int) string {
@@ -487,8 +520,8 @@ func (o *OPPOPush) refreshAuthToken(rejectedToken string) (string, error) {
 				o.localAuthToken.Store(cachedToken)
 				return cachedToken.value, nil
 			}
+			o.deleteCachedAuthToken()
 		}
-		o.deleteCachedAuthToken()
 	}
 	o.localAuthToken.Store(nil)
 	return o.authenticateLocked()
@@ -625,10 +658,7 @@ type oppoAPIError struct {
 }
 
 func (e *oppoAPIError) Error() string {
-	if e.Message == "" {
-		return fmt.Sprintf("OPPO %s failed with code %d", e.Operation, e.Code)
-	}
-	return fmt.Sprintf("OPPO %s failed with code %d: %s", e.Operation, e.Code, e.Message)
+	return fmt.Sprintf("OPPO %s failed with code %d", e.Operation, e.Code)
 }
 
 func isRetryableOPPOCode(code int) bool {
