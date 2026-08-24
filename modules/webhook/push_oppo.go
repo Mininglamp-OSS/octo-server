@@ -34,9 +34,11 @@ const (
 	oppoMaxResponseBytes  = 1 << 20
 	oppoDefaultOfflineTTL = 24 * 60 * 60
 
+	// OPPO notification limits: https://open.oppomobile.com/documentation/page/info?id=11236
+	// The adapter omits style, so OPPO applies standard style (1) and its 50-character content limit.
 	oppoMaxTitleRunes            = 50
-	oppoMaxContentRunes          = 200
-	oppoMaxActionParametersBytes = 4 * 1024
+	oppoMaxContentRunes          = 50
+	oppoMaxActionParametersRunes = 4000
 	oppoDefaultNotificationText  = "您有一条新的消息"
 )
 
@@ -309,8 +311,8 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 	if err != nil {
 		return nil, fmt.Errorf("OPPO push: encode action parameters: %w", err)
 	}
-	if len(routing) > oppoMaxActionParametersBytes {
-		return nil, fmt.Errorf("OPPO push: action parameters exceed %d bytes", oppoMaxActionParametersBytes)
+	if utf8.RuneCount(routing) > oppoMaxActionParametersRunes {
+		return nil, fmt.Errorf("OPPO push: action parameters exceed %d characters", oppoMaxActionParametersRunes)
 	}
 
 	dedupeSource := strings.Join([]string{
@@ -386,14 +388,22 @@ func (o *OPPOPush) Push(deviceToken string, payload Payload) error {
 	err = o.sendUnicast(authToken, message)
 	var apiErr *oppoAPIError
 	if !errors.As(err, &apiErr) || apiErr.Code != 11 {
+		o.logPushFailure(deviceToken, err)
 		return err
 	}
+	o.Debug("OPPO auth token rejected; refreshing",
+		zap.Int("oppo_code", apiErr.Code),
+		zap.Bool("retryable", true),
+		zap.String("device_token", maskToken(deviceToken)),
+	)
 
 	refreshedToken, refreshErr := o.refreshAuthToken(authToken)
 	if refreshErr != nil {
 		return refreshErr
 	}
-	return o.sendUnicast(refreshedToken, message)
+	err = o.sendUnicast(refreshedToken, message)
+	o.logPushFailure(deviceToken, err)
+	return err
 }
 
 func (o *OPPOPush) sendUnicast(authToken string, message []byte) error {
@@ -402,20 +412,33 @@ func (o *OPPOPush) sendUnicast(authToken string, message []byte) error {
 		"message":    {string(message)},
 	})
 	if err != nil {
-		o.Warn("OPPO push request failed", zap.Error(err))
 		return err
 	}
 	if err := response.apiError("push"); err != nil {
-		var apiErr *oppoAPIError
-		if errors.As(err, &apiErr) {
-			o.Warn("OPPO push rejected", zap.Int("oppo_code", apiErr.Code), zap.Bool("retryable", apiErr.Retryable))
-		}
 		return err
 	}
 	if messageID := response.messageID(); messageID != "" {
 		o.Debug("OPPO push accepted", zap.String("oppo_message_id", messageID))
 	}
 	return nil
+}
+
+func (o *OPPOPush) logPushFailure(deviceToken string, err error) {
+	if err == nil {
+		return
+	}
+	fields := []zap.Field{zap.String("device_token", maskToken(deviceToken))}
+	var apiErr *oppoAPIError
+	if errors.As(err, &apiErr) {
+		fields = append(fields, zap.Int("oppo_code", apiErr.Code), zap.Bool("retryable", apiErr.Retryable))
+		if apiErr.Code == 41 {
+			o.Debug("OPPO push rejected", fields...)
+			return
+		}
+	} else {
+		fields = append(fields, zap.Error(err))
+	}
+	o.Warn("OPPO push rejected", fields...)
 }
 
 func (o *OPPOPush) getAuthToken() (string, error) {
@@ -608,7 +631,7 @@ func (e *oppoAPIError) Error() string {
 }
 
 func isRetryableOPPOCode(code int) bool {
-	return code == -1 || code == -2 || code == 55 || (code >= 500 && code < 600)
+	return code == -1 || code == -2 || code == 11 || code == 55 || (code >= 500 && code < 600)
 }
 
 func (o *OPPOPush) postForm(endpoint string, values url.Values) (*oppoAPIResponse, error) {
