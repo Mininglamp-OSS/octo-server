@@ -11,7 +11,10 @@
 - auth token：按 AppKey 隔离，本地和 Redis 均按绝对时间提前 20 小时过期；正常发送不访问
   Redis，Redis 故障时使用进程内缓存降级
 - token 失效：仅对 OPPO code `11` 强制鉴权并重试一次
-- 去重：重试沿用同一个 `app_message_id`
+- 去重：按设备 token 与 WuKongIM 全局 `message_id` 生成稳定 `app_message_id`；仅当上游异常缺失
+  `message_id` 时，使用发送者/频道作用域内的 `client_msg_no` 回退；同一次重试沿用同一 ID
+- 目标校验：registration_id 必须是单值，拒绝分号、逗号、空白、控制字符以及超过 256 字节的值；
+  256 字节是服务端防御上限，不宣称为 OPPO 官方格式上限
 - 可观测性：无效 registration_id（code `41`）和可自愈的首次 token 失效（code `11`）以
   Debug 记录；未恢复的 code `11`、code `54` 等业务拒绝以 Warn 记录
   `oppo_code/retryable`；成功响应以 Debug 记录 `oppo_message_id`
@@ -124,3 +127,6 @@ unset OPPO_APP_KEY OPPO_MASTER_SECRET OPPO_DEVICE_TOKEN
 
 该烟测只证明 OPPO 接口接受请求。到达、展示和点击跳转还必须结合测试设备与 Android 客户端
 日志验收。
+
+2026-08-24 已使用专用测试应用及设备完成鉴权、单推和通知栏展示验证；默认
+`click_action_type=0` 仅验证启动应用，直达会话与 `action_parameters` 消费仍需 Android 端联调。
