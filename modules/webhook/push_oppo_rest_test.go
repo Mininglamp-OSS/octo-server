@@ -465,6 +465,56 @@ func TestOPPOPushRejectsOversizedActionParameters(t *testing.T) {
 	require.ErrorContains(t, err, "action parameters exceed 4000 characters")
 }
 
+func TestOPPOPushDedupeUsesGlobalMessageIdentity(t *testing.T) {
+	pusher := NewOPPOPush("app-id", "app-key", "app-secret", "master-secret", nil)
+	pusher.configErr = nil
+	payloadInfo := &PayloadInfo{
+		Title:       "title",
+		Content:     "content",
+		SpaceID:     "space",
+		ChannelID:   "channel",
+		ChannelType: 1,
+		MessageSeq:  0,
+	}
+
+	firstPayload, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{
+		MessageID:   1001,
+		MessageSeq:  0,
+		ClientMsgNo: "same-client-message-number",
+	}})
+	require.NoError(t, err)
+	secondPayload, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{
+		MessageID:   1002,
+		MessageSeq:  0,
+		ClientMsgNo: "same-client-message-number",
+	}})
+	require.NoError(t, err)
+
+	firstEncoded, err := pusher.buildUnicastMessage("registration-id", firstPayload)
+	require.NoError(t, err)
+	secondEncoded, err := pusher.buildUnicastMessage("registration-id", secondPayload)
+	require.NoError(t, err)
+
+	var firstMessage, secondMessage oppoUnicastMessage
+	require.NoError(t, json.Unmarshal(firstEncoded, &firstMessage))
+	require.NoError(t, json.Unmarshal(secondEncoded, &secondMessage))
+	assert.NotEqual(t, firstMessage.Notification.AppMessageID, secondMessage.Notification.AppMessageID,
+		"different global message IDs must not be collapsed when message_seq is zero")
+}
+
+func TestOPPOPushDedupeFallsBackToClientMessageNumber(t *testing.T) {
+	payloadInfo := &PayloadInfo{Title: "title", Content: "content", MessageSeq: 0}
+
+	first, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{ClientMsgNo: "client-1"}})
+	require.NoError(t, err)
+	second, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{ClientMsgNo: "client-2"}})
+	require.NoError(t, err)
+	assert.NotEqual(t, first.dedupeID, second.dedupeID)
+
+	_, err = newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{})
+	require.ErrorContains(t, err, "missing message identity")
+}
+
 func TestOPPOPushRefreshesInvalidTokenOnceWithStableDedupeID(t *testing.T) {
 	cache := &memoryOPPOTokenCache{token: cachedOPPOAuthToken(t, "stale-token", oppoTestNow.Add(oppoAuthTokenTTL))}
 	authCalls := 0
