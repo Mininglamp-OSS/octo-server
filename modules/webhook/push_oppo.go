@@ -271,7 +271,13 @@ func newOPPOPayloadForMessage(payloadInfo *PayloadInfo, msg msgOfflineNotify) (*
 	if msg.MessageID != 0 {
 		dedupeID = "message:" + strconv.FormatInt(msg.MessageID, 10)
 	} else if clientMsgNo := strings.TrimSpace(msg.ClientMsgNo); clientMsgNo != "" {
-		dedupeID = "client:" + clientMsgNo
+		dedupeID = strings.Join([]string{
+			"client",
+			msg.FromUID,
+			msg.ChannelID,
+			strconv.Itoa(int(msg.ChannelType)),
+			clientMsgNo,
+		}, "\x00")
 	} else {
 		return nil, errors.New("OPPO push: missing message identity")
 	}
