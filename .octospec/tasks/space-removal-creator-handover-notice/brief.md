@@ -214,16 +214,50 @@ range-scans the demote — so when the target is inside the batch it is a
 deterministic AB-BA regardless of the batch's index (two reviewers measured
 40/40 and 42/120 with the real functions; the per-uid `main` shape is 0). The batch
 can't unify the *other* path's order from its own call site, so ordering is not a
-complete fix. All three multi-row `space_member` writers — `removeMembersLocked`,
-`removeMembersForce`, `transferOwnerAdminLocked` — are now wrapped in
-`retryOnDeadlock`, a bounded retry on MySQL 1213/1205. Deadlock rolls the victim back
-with nothing half-committed, so a retry is safe and usually succeeds on the second
-try. `FORCE INDEX` is kept: it shrinks the lock footprint and the blocking window and
-removes batch-vs-batch, it just is not the cross-path fix. Guarded by
-`TestRetryOnDeadlockRecoversFrom1213` (injects a 1213: retries to success, gives up
-bounded, passes domain errors through) — the real deadlock race is not reliably
-reproducible locally, so the retry logic is pinned by injection rather than a flaky
-concurrent test.
+complete fix. The multi-row `space_member` writers are wrapped in `retryOnDeadlock`,
+a bounded retry. A deadlock rolls the victim back with nothing half-committed, so a
+retry is safe and usually succeeds on the second try. `FORCE INDEX` is kept: it
+shrinks the lock footprint and the blocking window and removes batch-vs-batch, it
+just is not the cross-path fix. Guarded by `TestRetryOnDeadlockRecoversFrom1213`
+(injects a 1213: retries to success, gives up bounded, passes 1205 and domain errors
+through) — the real deadlock race is not reliably reproducible locally, so the retry
+logic is pinned by injection rather than a flaky concurrent test.
+
+**Round-9 corrections.** Three, all from the round-9 review; the first two are
+defects this PR introduced in round 8.
+
+1. *The wrapped set was stated as complete and was not.* An earlier revision here
+   said "all three multi-row `space_member` writers". There are four: `upsertMembers`
+   (batch add) locks per-uid in **caller order** while the batch removal locks in
+   index order, so `add[C,B,A]` against `remove[A,B,C]` on one space is an AB-BA —
+   and round 8's own change widened it, since removal went from holding one row lock
+   at a time to holding up to 200 for a whole transaction. `upsertMembers` is now
+   wrapped too. Stated precisely, because this document is what the next editor
+   trusts: what is **not** wrapped is `db.go`'s `atomicAddMemberIfNotFull`,
+   `atomicReactivateMemberIfNotFull` and the invite-approve transaction, which take
+   `SELECT COUNT(*) … WHERE space_id=? AND status=1 FOR UPDATE` for capacity and so
+   lock **every active row in the space** — a wider lock than anything above. That is
+   pre-existing, out of scope here, and wants one capacity-check design rather than a
+   fourth retry wrapper. Tracked as a follow-up.
+2. *Round 8 silently defanged the round-7 deadlock guard.*
+   `TestRemoveMembersLockedNoDeadlockOnReversedOverlap` exists to catch a
+   batch-vs-batch AB-BA, but round 8 routed it through the retry, which swallows the
+   very 1213s it asserts on. Measured, with a per-uid caller-order regression
+   mutated in: calling `removeMembersLockedOnce` (the fix) reports **47/48/48
+   deadlocks per 80 calls — red every run**; the round-8 shape (wrapper, 5 attempts)
+   **passed 2 of 3 runs** with that same regression underneath. A detector had become
+   a coin flip. This is exactly the failure mode of
+   `learnings/pending/mutation-check-the-assertion-not-the-guard.md`, added by this
+   same PR — a change elsewhere quietly made an existing guard unable to go red.
+3. *`retryOnDeadlock` retried 1205 with no backoff.* A lock-wait timeout only returns
+   after `innodb_lock_wait_timeout` (default 50s, not overridden in this repo), so
+   5 serial attempts could hold an HTTP handler ~250s while retrying the condition
+   least likely to have cleared — and the transfer path used to fail once at 50s.
+   Now 1213 only (1205 passes through, i.e. the pre-PR behaviour), 3 attempts with
+   5ms/20ms backoff, matching `conversation_ext`'s existing helper. This is a
+   deliberate divergence from the repo's other four copies of the predicate, which
+   do retry 1205; the reason is written at `isDeadlockErr` — those guard small, fast
+   operations, these guard a 200-row batch on a user request.
 
 With A closed, B alone degrades to silence — the pre-PR behaviour, never a false
 name. B itself is unchanged and still tracked (see below).

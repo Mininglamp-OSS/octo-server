@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	mysqldrv "github.com/go-sql-driver/mysql"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -14,6 +13,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	mysqldrv "github.com/go-sql-driver/mysql"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -1508,7 +1509,14 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 		go func(order []string) {
 			defer wg.Done()
 			for i := 0; i < rounds; i++ {
-				removed, e := f.db.removeMembersLocked(spaceID, order, 1, "owner", MemberRemoveReasonKicked)
+				// ⚠️ 必须调 removeMembersLockedOnce（单次尝试），不能调外层
+				// removeMembersLocked——后者裹了 retryOnDeadlock，会把 1213 吞掉重试，
+				// 两个 goroutine × 40 轮的规模下几乎必然重试成功，下面那条
+				// `deadlocks == 0` 断言就再也红不了了（PR #804 round-9 review
+				// yujiawei P2-2；正是本 PR 自己加的 learnings/pending/
+				// mutation-check-the-assertion-not-the-guard.md 说的那种失效方式：
+				// 别处的改动悄悄让既有守卫变得无法变红）。
+				removed, e := removeMembersLockedOnce(f.db.session, spaceID, order, 1, "owner", MemberRemoveReasonKicked)
 				if isDeadlock(e) {
 					deadlocks.Add(1)
 				} else if e != nil {
@@ -1629,6 +1637,7 @@ func TestRemoveMembersLockedForcesUniqueIndexPlan(t *testing.T) {
 // 一个 InnoDB 死锁(1213)直接钉住重试逻辑本身：
 //   - 前 N 次返回 1213、之后成功 → 整体成功，且确实重跑了 N+1 次；
 //   - 一直 1213 → 有界次数后放弃并包装报错，不会无限重试；
+//   - 1205 锁等待超时 → **不重试**、原样透传（理由见 isDeadlockErr）；
 //   - 领域错误（非 1213）→ 第一次就原样透传，errors.Is 仍成立。
 func TestRetryOnDeadlockRecoversFrom1213(t *testing.T) {
 	deadlock := &mysqldrv.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"}
@@ -1647,17 +1656,15 @@ func TestRetryOnDeadlockRecoversFrom1213(t *testing.T) {
 		assert.Equal(t, 3, calls, "应当正好重试到成功那一次")
 	})
 
-	t.Run("锁等待超时也重试", func(t *testing.T) {
+	// 1205（锁等待超时）**不重试**，与 1213 相反。等满 innodb_lock_wait_timeout
+	// （默认 50s）才返回的错误，重试既贵又最不可能有用；这几条写路径挂在用户 HTTP
+	// 请求上，重试 3 次最坏要占着 handler ~150s。见 isDeadlockErr 的注释
+	// （PR #804 round-9 review：yujiawei P2-1 / mochashanyao P2-3）。
+	t.Run("锁等待超时不重试而是原样透传", func(t *testing.T) {
 		calls := 0
-		err := retryOnDeadlock(func() error {
-			calls++
-			if calls < 2 {
-				return lockWait
-			}
-			return nil
-		})
-		require.NoError(t, err)
-		assert.Equal(t, 2, calls)
+		err := retryOnDeadlock(func() error { calls++; return lockWait })
+		assert.Equal(t, 1, calls, "1205 不得重试——重试满 3 次会把请求拖到 ~150s")
+		assert.ErrorIs(t, err, lockWait, "1205 必须原样透传，与合入前行为一致")
 	})
 
 	t.Run("持续死锁则有界放弃", func(t *testing.T) {

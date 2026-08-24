@@ -450,3 +450,51 @@ deadlock class is the signature of a design that wants settling once, not patchi
 A shared retry primitive over all the mutators is that settling — and the same
 wrapper is the follow-up answer for `upsertMembers` and the pre-existing group-member
 ABBA.
+
+## Round 9 — two of my own round-8 defects, found by review
+
+Two approvals landed on the round-8 head, and both reviewers independently filed the
+same P2 about the retry's cost. Three things came out of the round; the first two are
+damage round 8 did, which is the more useful half of this entry.
+
+**I defanged a guard I had written and mutation-verified two rounds earlier.** The
+retry wrapper went around `removeMembersLocked`, and
+`TestRemoveMembersLockedNoDeadlockOnReversedOverlap` — whose entire job is counting
+1213s — called through it. The retry ate them. Nothing about that test changed; it
+still ran and still asserted the right thing. Measured with the round-6 regression
+mutated back in: the unwrapped call reports 47/48/48 deadlocks per 80 calls, red
+every run; the shape I shipped **passed 2 of 3 runs** with that same regression
+underneath.
+
+Worth recording how close I came to dismissing this. My first check ran against the
+already-partly-fixed code (3 attempts instead of the shipped 5) and went red at 1
+deadlock out of 80, so I wrote "not what I measure" and nearly moved on. Reproducing
+the *exact shipped shape* is what confirmed the reviewer. A guard that fires on 1/80
+where the honest version fires on 48/80 has already failed — near-miss is miss, and
+"it went red" is not the measurement, sensitivity is.
+
+**I asserted a completeness that did not hold.** The brief said "all three multi-row
+`space_member` writers". There are four: `upsertMembers` locks per-uid in caller
+order against the batch's index order, and round 8's own change widened that window
+by taking removal from one row lock at a time to 200 for a transaction. Wrapped it.
+Then, looking properly instead of counting to four, `db.go`'s
+`atomicAddMemberIfNotFull` / `atomicReactivateMemberIfNotFull` / invite-approve take
+`SELECT COUNT(*) … FOR UPDATE` for capacity and lock *every active row in the space*
+— wider than anything I had wrapped, and neither reviewer mentioned them. Left out
+deliberately (they want one capacity-check design, not a fourth wrapper) and now
+named as left out. The lesson is narrow and cheap: when a document says "all", go
+enumerate instead of trusting the number in the sentence you are editing.
+
+**The 1205 retry was a real regression I introduced.** Both reviewers caught it.
+A lock-wait timeout returns only after `innodb_lock_wait_timeout` (50s default),
+so retrying it 5× could pin an HTTP handler for ~250s — while retrying the one
+condition least likely to have cleared, since whatever held the lock 50 seconds
+probably still holds it. The transfer path used to fail once at 50s. Now 1213 only,
+3 attempts, 5ms/20ms backoff. This diverges deliberately from the repo's four other
+copies of the 1213/1205 predicate; the reason is written at `isDeadlockErr`, because
+the next person will otherwise "fix" the inconsistency.
+
+Pattern across rounds 6-9, stated plainly: every one of my deadlock fixes has been
+correct about the mechanism and wrong about the scope of what it closed. Ordering
+fixed batch-vs-batch and I claimed cross-path. Retry fixed cross-path and I claimed
+all writers. The mechanism is the easy part; the honest boundary is the work.

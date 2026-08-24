@@ -86,3 +86,45 @@ local, reset per call. The stale global made the second run announce, so the tes
 stayed green — for a reason that had nothing to do with the code under test. A
 green mutation result is only evidence if the mutation is a plausible
 implementation. Reset state, match scoping, then trust the outcome.
+
+## Addendum — adding a recovery layer can defang a guard you already verified
+
+A later round of the same PR added a bounded deadlock retry around the batch
+removal, to close a cross-path AB-BA. An existing guard,
+`TestRemoveMembersLockedNoDeadlockOnReversedOverlap`, asserts that two reversed
+overlapping batches produce **zero** deadlocks. It called the public function —
+which now routed through the retry. The retry swallows exactly the 1213s the
+assertion counts.
+
+Measured, with a real regression (per-uid caller-order locking) mutated back in:
+
+| guard calls | deadlocks seen / 80 calls | verdict |
+|---|---|---|
+| `removeMembersLockedOnce` (unwrapped) | 47, 48, 48 | red every run |
+| the retried wrapper, 5 attempts (as shipped) | 0, 1, 0 | **passed 2 of 3 runs** |
+
+The guard had not been deleted, moved, or edited. It still ran, still asserted the
+right invariant, and had been mutation-verified when written. A change to code it
+called *through* turned a detector into a coin flip. Nobody touching the retry had
+any reason to look at a test whose name is about deadlock ordering.
+
+## The rule
+
+When you introduce a layer that **absorbs failures** — a retry, a fallback, a
+circuit breaker, a `recover()`, a default-on-error — the failures it absorbs
+become invisible to every test above it. So: enumerate the existing tests that
+call through the new layer, and for each one ask whether it asserts on something
+the layer can now hide. Those tests must bind to the *inner* function, below the
+absorbing layer.
+
+Two corollaries worth stating separately:
+
+- **The retry gets its own test, and the invariant keeps its own.** Testing "the
+  retry recovers" through the same entry point that tests "no deadlock occurs"
+  collapses two independent claims into one, and the recovery masks the invariant.
+- **A near-miss is a miss.** After reducing the retry to 3 attempts the wrapper
+  version did go red — with 1 deadlock out of 80, against 48 for the unwrapped
+  call. It "passed" the check I first ran, and I nearly wrote down that the
+  reviewer's finding was unconfirmed. Sensitivity is the measurement, not the
+  pass/fail bit: a guard that fires on 1/80 instead of 48/80 is one scheduling
+  change away from silence.

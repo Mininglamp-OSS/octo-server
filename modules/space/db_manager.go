@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -402,8 +402,21 @@ func (d *managerDB) updateSpaceProfile(
 	return &before, nil
 }
 
-// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）
+// upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）。
+//
+// 逐条 upsert 按**调用方给的 uid 顺序**取锁，而批量移除按索引序取锁，两者顺序不一致：
+// 同一空间上 add[C,B,A] 与 remove[A,B,C] 并发即构成 AB-BA。PR #804 把用户端
+// members/remove 从「一人一事务」改成整批单事务后，移除侧一次要按住至多 200 行、
+// 持锁窗口大幅变宽，这个既有的环因此明显更容易撞上，所以同样套上 retryOnDeadlock。
+// 全有全无地单事务提交，重放安全（ON DUPLICATE KEY UPDATE 本身也幂等）。
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
+	return retryOnDeadlock(func() error {
+		return d.upsertMembersOnce(spaceId, uids)
+	})
+}
+
+// upsertMembersOnce 是 upsertMembers 的单次尝试，死锁重试见 retryOnDeadlock。
+func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
@@ -427,15 +440,33 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权
 var ErrCannotRemoveOwner = errors.New("cannot remove space owner; transfer ownership first")
 
-// spaceMutatorMaxAttempts 限定 space_member 写路径遇死锁时的重试次数。
-const spaceMutatorMaxAttempts = 5
+// spaceMutatorMaxAttempts / spaceMutatorRetryDelays 限定 space_member 写路径遇死锁时的
+// 重试次数与退避间隔。与 modules/conversation_ext withDeadlockRetry 取同样的 3 次 / 5ms、
+// 20ms 等比退避（该处注释记录了选型理由：一次重试足以让另一边 commit/rollback 完释放锁，
+// 3 次封顶避免重试风暴）。
+const spaceMutatorMaxAttempts = 3
 
-// isRetryableTxErr 判定是否为可重试的瞬时事务错误：InnoDB 死锁(1213)或锁等待超时(1205)。
-// 与 modules/common space_welcome_config_store.go 的同名判定保持一致。
-func isRetryableTxErr(err error) bool {
+var spaceMutatorRetryDelays = []time.Duration{5 * time.Millisecond, 20 * time.Millisecond}
+
+// isDeadlockErr 判定是否为 InnoDB 死锁(1213)。
+//
+// ⚠️ 与本仓库其它几处同类判定（modules/common、modules/conversation_ext、modules/bot_api
+// 等）**刻意不同**：那些同时把锁等待超时(1205)也算作可重试，这里只认 1213。原因是这几条
+// 写路径挂在用户 HTTP 请求上、且一次要锁到 200 行：
+//
+//   - 1213 是 InnoDB **主动探测**到成环后立刻返回的，环已经被打破、对方正在推进，
+//     马上重跑一遍通常就成功，代价只有一次事务重放。
+//   - 1205 是等满 innodb_lock_wait_timeout（默认 50s，本仓库未覆盖该参数）才返回的。
+//     重试它既贵又最不可能有用——能把锁按住 50 秒的事务，多半还按着。按 3 次算，
+//     单个请求最坏要在 handler 里占着 goroutine 和连接 ~150s，客户端和代理早已超时，
+//     而 main 上这条路径本来是 50s 失败一次就返回。
+//
+// 所以 1205 原样透传（= 合入前的行为），只对 1213 做重试。
+// PR #804 round-9 review：yujiawei P2-1 与 mochashanyao P2-3 各自独立提出。
+func isDeadlockErr(err error) bool {
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) {
-		return myErr.Number == 1213 || myErr.Number == 1205
+		return myErr.Number == 1213
 	}
 	return false
 }
@@ -445,20 +476,31 @@ func isRetryableTxErr(err error) bool {
 // 为什么用重试而不是让每条路径统一加锁顺序（PR #804 round-8 review，两名 reviewer
 // 各自在真实 MySQL 上实测确认）：space_member 上有多条会一次锁多行的写路径——
 // removeMembersLocked（批量移除）、removeMembersForce（超管强制移除）、
-// transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）。
+// transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）、
+// upsertMembers（批量加人：按**调用方给的 uid 顺序**逐条 upsert）。
 // 它们各自的加锁顺序由各自的索引/结构决定，从任何一个调用点都无法统一**对方**的顺序，
 // 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了——FORCE INDEX 只收窄了锁面、关掉了
 // 批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是确定性的）。
 //
 // 死锁时 InnoDB 已把被选中的事务整体回滚、没有半提交状态，把整个事务重跑一遍即可；
-// 幸存的那一方已经完成，重试通常第二次就成功。只能用于幂等或全有全无的操作：这三条
-// 写路径都在单事务里全有全无地提交，符合。领域错误（ErrCannotRemoveOwner 等）
-// isRetryableTxErr 判否、原样透传，不影响调用方的 errors.Is。
+// 幸存的那一方已经完成，重试通常第二次就成功。只能用于幂等或全有全无的操作：上述
+// 四条写路径都在单事务里全有全无地提交，符合。领域错误（ErrCannotRemoveOwner 等）
+// isDeadlockErr 判否、原样透传，不影响调用方的 errors.Is。
+//
+// ⚠️ 覆盖范围说明（勿再写成「所有 space_member 写路径」——PR #804 round-9 review
+// yujiawei P2-3 指出上一版注释与 brief 都少算了 upsertMembers）：本包内**仍未**包裹的
+// 多行加锁写路径是 db.go 的 atomicAddMemberIfNotFull / atomicReactivateMemberIfNotFull /
+// 邀请审批事务——它们用 `SELECT COUNT(*) ... WHERE space_id=? AND status=1 FOR UPDATE`
+// 做容量校验，会锁住**整个空间的活跃成员行**，锁面比这里几条都大。那是既有行为、
+// 不在本 PR 范围内，需要的是统一的容量校验方案而不是再包一层重试，见 follow-up。
 func retryOnDeadlock(fn func() error) error {
 	var err error
-	for attempt := 1; attempt <= spaceMutatorMaxAttempts; attempt++ {
-		if err = fn(); !isRetryableTxErr(err) {
+	for attempt := 0; attempt < spaceMutatorMaxAttempts; attempt++ {
+		if err = fn(); !isDeadlockErr(err) {
 			return err
+		}
+		if attempt < len(spaceMutatorRetryDelays) {
+			time.Sleep(spaceMutatorRetryDelays[attempt])
 		}
 	}
 	return fmt.Errorf("space_member 写操作重试 %d 次仍死锁: %w", spaceMutatorMaxAttempts, err)
