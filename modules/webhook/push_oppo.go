@@ -8,11 +8,17 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"go.uber.org/zap"
+)
+
+const (
+	oppoAPIBaseURL             = "https://api-push-cn.heytapmobi.com"
+	oppoAuthURL                = oppoAPIBaseURL + "/server/v1/auth"
+	oppoNotificationUnicastURL = oppoAPIBaseURL + "/server/v1/message/notification/unicast"
 )
 
 // OPPO 推送
@@ -77,7 +83,7 @@ func (o *OPPOPush) Push(deviceToken string, payload Payload) error {
 	}
 	dataType, _ := json.Marshal(message)
 	dataString := string(dataType)
-	resp, err := network.PostForWWWForm("https://api.push.oppomobile.com/server/v1/message/notification/unicast", map[string]string{
+	resp, err := network.PostForWWWForm(oppoNotificationUnicastURL, map[string]string{
 		"auth_token": authToken,
 		"message":    dataString,
 	}, nil)
@@ -108,7 +114,7 @@ func (o *OPPOPush) getAuthToken() string {
 	}
 	timestamp := time.Now().Local().UnixNano() / 1e6
 	sign := o.SHA256(fmt.Sprintf("%s%d%s", o.appKey, timestamp, o.masterSecret))
-	resp, err := network.PostForWWWForm("https://api.push.oppomobile.com/server/v1/auth", map[string]string{
+	resp, err := network.PostForWWWForm(oppoAuthURL, map[string]string{
 		"app_key":   o.appKey,
 		"sign":      sign,
 		"timestamp": fmt.Sprintf("%d", timestamp),
