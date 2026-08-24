@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +33,11 @@ const (
 	oppoAuthTokenTTL      = 20 * time.Hour
 	oppoMaxResponseBytes  = 1 << 20
 	oppoDefaultOfflineTTL = 24 * 60 * 60
+
+	oppoMaxTitleRunes            = 50
+	oppoMaxContentRunes          = 200
+	oppoMaxActionParametersBytes = 4 * 1024
+	oppoDefaultNotificationText  = "您有一条新的消息"
 )
 
 type oppoHTTPDoer interface {
@@ -173,8 +179,18 @@ type OPPOPush struct {
 	configErr              error
 
 	authMu         sync.Mutex
-	localAuthToken string
+	localAuthToken atomic.Pointer[oppoAuthToken]
 	log.Log
+}
+
+type oppoAuthToken struct {
+	value     string
+	expiresAt time.Time
+}
+
+type oppoCachedAuthToken struct {
+	AuthToken string `json:"auth_token"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 // NewOPPOPush creates a production OPPO REST pusher. Redis is used as a shared
@@ -267,7 +283,6 @@ type oppoNotification struct {
 	OffLine                  bool   `json:"off_line"`
 	OffLineTTL               int    `json:"off_line_ttl"`
 	ChannelID                string `json:"channel_id,omitempty"`
-	NotifyID                 uint32 `json:"notify_id"`
 	Category                 string `json:"category,omitempty"`
 	NotifyLevel              int    `json:"notify_level,omitempty"`
 	PrivateMessageTemplateID string `json:"private_msg_template_id,omitempty"`
@@ -285,10 +300,6 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		return nil, errors.New("OPPO push: empty registration ID")
 	}
 
-	notifyID, err := strconv.ParseUint(payload.notifyID, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("OPPO push: invalid notify ID %q: %w", payload.notifyID, err)
-	}
 	routing, err := json.Marshal(oppoRoutingParameters{
 		SpaceID:     payload.spaceID,
 		ChannelID:   payload.channelID,
@@ -297,6 +308,9 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("OPPO push: encode action parameters: %w", err)
+	}
+	if len(routing) > oppoMaxActionParametersBytes {
+		return nil, fmt.Errorf("OPPO push: action parameters exceed %d bytes", oppoMaxActionParametersBytes)
 	}
 
 	dedupeSource := strings.Join([]string{
@@ -315,8 +329,8 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		VerifyRegistrationID: true,
 		Notification: oppoNotification{
 			AppMessageID:             "octo-" + hex.EncodeToString(dedupeDigest[:16]),
-			Title:                    payload.GetTitle(),
-			Content:                  payload.GetContent(),
+			Title:                    normalizeOPPONotificationText(payload.GetTitle(), oppoMaxTitleRunes),
+			Content:                  normalizeOPPONotificationText(payload.GetContent(), oppoMaxContentRunes),
 			ClickActionType:          o.options.clickActionType,
 			ClickActionActivity:      o.options.clickActionActivity,
 			ClickActionURL:           o.options.clickActionURL,
@@ -324,7 +338,6 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 			OffLine:                  true,
 			OffLineTTL:               o.options.offlineTTLSeconds,
 			ChannelID:                o.options.channelID,
-			NotifyID:                 uint32(notifyID),
 			Category:                 o.options.category,
 			NotifyLevel:              o.options.notifyLevel,
 			PrivateMessageTemplateID: o.options.privateMessageTemplateID,
@@ -336,6 +349,17 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		return nil, fmt.Errorf("OPPO push: encode message: %w", err)
 	}
 	return encoded, nil
+}
+
+func normalizeOPPONotificationText(value string, maxRunes int) string {
+	if strings.TrimSpace(value) == "" {
+		value = oppoDefaultNotificationText
+	}
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return value
 }
 
 // Push sends one notification. OPPO code 11 is the only response retried here:
@@ -381,24 +405,43 @@ func (o *OPPOPush) sendUnicast(authToken string, message []byte) error {
 		o.Warn("OPPO push request failed", zap.Error(err))
 		return err
 	}
-	return response.apiError("push")
+	if err := response.apiError("push"); err != nil {
+		var apiErr *oppoAPIError
+		if errors.As(err, &apiErr) {
+			o.Warn("OPPO push rejected", zap.Int("oppo_code", apiErr.Code), zap.Bool("retryable", apiErr.Retryable))
+		}
+		return err
+	}
+	if messageID := response.messageID(); messageID != "" {
+		o.Debug("OPPO push accepted", zap.String("oppo_message_id", messageID))
+	}
+	return nil
 }
 
 func (o *OPPOPush) getAuthToken() (string, error) {
+	if token, ok := o.processLocalAuthToken(); ok {
+		return token, nil
+	}
+
 	o.authMu.Lock()
 	defer o.authMu.Unlock()
 
+	if token, ok := o.processLocalAuthToken(); ok {
+		return token, nil
+	}
 	if o.tokenCache != nil {
-		token, err := o.tokenCache.GetString(o.authTokenCacheKey)
+		cached, err := o.tokenCache.GetString(o.authTokenCacheKey)
 		if err != nil {
 			o.Warn("read OPPO auth token cache failed; falling back to direct authentication", zap.Error(err))
-		} else if token != "" {
-			o.localAuthToken = token
-			return token, nil
+		} else if cached != "" {
+			token, parseErr := parseOPPOCachedAuthToken(cached, o.now())
+			if parseErr == nil {
+				o.localAuthToken.Store(token)
+				return token.value, nil
+			}
+			o.Warn("discard invalid OPPO auth token cache", zap.Error(parseErr))
+			o.deleteCachedAuthToken()
 		}
-	}
-	if o.localAuthToken != "" {
-		return o.localAuthToken, nil
 	}
 	return o.authenticateLocked()
 }
@@ -407,24 +450,65 @@ func (o *OPPOPush) refreshAuthToken(rejectedToken string) (string, error) {
 	o.authMu.Lock()
 	defer o.authMu.Unlock()
 
+	if token, ok := o.processLocalAuthToken(); ok && token != rejectedToken {
+		return token, nil
+	}
 	if o.tokenCache != nil {
-		cachedToken, err := o.tokenCache.GetString(o.authTokenCacheKey)
+		cached, err := o.tokenCache.GetString(o.authTokenCacheKey)
 		if err != nil {
 			o.Warn("read OPPO auth token cache during refresh failed", zap.Error(err))
-		} else if cachedToken != "" && cachedToken != rejectedToken {
-			o.localAuthToken = cachedToken
-			return cachedToken, nil
+		} else if cached != "" {
+			cachedToken, parseErr := parseOPPOCachedAuthToken(cached, o.now())
+			if parseErr == nil && cachedToken.value != rejectedToken {
+				o.localAuthToken.Store(cachedToken)
+				return cachedToken.value, nil
+			}
 		}
-		if err := o.tokenCache.Del(o.authTokenCacheKey); err != nil {
-			o.Warn("invalidate OPPO auth token cache failed", zap.Error(err))
-		}
+		o.deleteCachedAuthToken()
 	}
-	o.localAuthToken = ""
+	o.localAuthToken.Store(nil)
 	return o.authenticateLocked()
 }
 
+func (o *OPPOPush) processLocalAuthToken() (string, bool) {
+	token := o.localAuthToken.Load()
+	if token == nil || token.value == "" || !o.now().Before(token.expiresAt) {
+		return "", false
+	}
+	return token.value, true
+}
+
+func parseOPPOCachedAuthToken(value string, now time.Time) (*oppoAuthToken, error) {
+	var cached oppoCachedAuthToken
+	if err := json.Unmarshal([]byte(value), &cached); err != nil {
+		return nil, fmt.Errorf("decode cached token: %w", err)
+	}
+	cached.AuthToken = strings.TrimSpace(cached.AuthToken)
+	if cached.AuthToken == "" || cached.ExpiresAt <= 0 {
+		return nil, errors.New("cached token is missing auth_token or expires_at")
+	}
+	token := &oppoAuthToken{
+		value:     cached.AuthToken,
+		expiresAt: time.UnixMilli(cached.ExpiresAt),
+	}
+	if !now.Before(token.expiresAt) {
+		return nil, errors.New("cached token has expired")
+	}
+	return token, nil
+}
+
+func (o *OPPOPush) deleteCachedAuthToken() {
+	if o.tokenCache == nil {
+		return
+	}
+	if err := o.tokenCache.Del(o.authTokenCacheKey); err != nil {
+		o.Warn("invalidate OPPO auth token cache failed", zap.Error(err))
+	}
+}
+
 func (o *OPPOPush) authenticateLocked() (string, error) {
-	timestamp := o.now().UnixMilli()
+	issuedAt := o.now()
+	timestamp := issuedAt.UnixMilli()
 	sign := o.SHA256(fmt.Sprintf("%s%d%s", o.appKey, timestamp, o.masterSecret))
 	response, err := o.postForm(o.authURL, url.Values{
 		"app_key":   {o.appKey},
@@ -435,6 +519,10 @@ func (o *OPPOPush) authenticateLocked() (string, error) {
 		return "", fmt.Errorf("OPPO auth request: %w", err)
 	}
 	if err := response.apiError("auth"); err != nil {
+		var apiErr *oppoAPIError
+		if errors.As(err, &apiErr) {
+			o.Warn("OPPO auth rejected", zap.Int("oppo_code", apiErr.Code), zap.Bool("retryable", apiErr.Retryable))
+		}
 		return "", err
 	}
 
@@ -451,13 +539,24 @@ func (o *OPPOPush) authenticateLocked() (string, error) {
 		return "", errors.New("OPPO auth: missing auth_token")
 	}
 
-	o.localAuthToken = data.AuthToken
+	token := &oppoAuthToken{
+		value:     data.AuthToken,
+		expiresAt: issuedAt.Add(oppoAuthTokenTTL),
+	}
+	o.localAuthToken.Store(token)
 	if o.tokenCache != nil {
-		if err := o.tokenCache.SetAndExpire(o.authTokenCacheKey, data.AuthToken, oppoAuthTokenTTL); err != nil {
+		cached, err := json.Marshal(oppoCachedAuthToken{
+			AuthToken: token.value,
+			ExpiresAt: token.expiresAt.UnixMilli(),
+		})
+		if err != nil {
+			return "", fmt.Errorf("OPPO auth: encode token cache: %w", err)
+		}
+		if err := o.tokenCache.SetAndExpire(o.authTokenCacheKey, string(cached), oppoAuthTokenTTL); err != nil {
 			o.Warn("cache OPPO auth token failed; using process-local token", zap.Error(err))
 		}
 	}
-	return data.AuthToken, nil
+	return token.value, nil
 }
 
 type oppoAPIResponse struct {
@@ -479,6 +578,19 @@ func (r *oppoAPIResponse) apiError(operation string) error {
 		Message:   r.Message,
 		Retryable: isRetryableOPPOCode(*r.Code),
 	}
+}
+
+func (r *oppoAPIResponse) messageID() string {
+	if r == nil || len(r.Data) == 0 || string(r.Data) == "null" {
+		return ""
+	}
+	var data struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(data.MessageID)
 }
 
 type oppoAPIError struct {
