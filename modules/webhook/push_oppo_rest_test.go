@@ -506,11 +506,22 @@ func TestOPPOPushDedupeUsesGlobalMessageIdentity(t *testing.T) {
 func TestOPPOPushDedupeFallsBackToClientMessageNumber(t *testing.T) {
 	payloadInfo := &PayloadInfo{Title: "title", Content: "content", MessageSeq: 0}
 
-	first, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{ClientMsgNo: "client-1"}})
+	first, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{
+		ClientMsgNo: "same-client-message-number",
+		FromUID:     "sender-1",
+		ChannelID:   "channel",
+		ChannelType: 1,
+	}})
 	require.NoError(t, err)
-	second, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{ClientMsgNo: "client-2"}})
+	second, err := newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{MsgResp: MsgResp{
+		ClientMsgNo: "same-client-message-number",
+		FromUID:     "sender-2",
+		ChannelID:   "channel",
+		ChannelType: 1,
+	}})
 	require.NoError(t, err)
-	assert.NotEqual(t, first.dedupeID, second.dedupeID)
+	assert.NotEqual(t, first.dedupeID, second.dedupeID,
+		"fallback identity must remain scoped when different senders reuse a client message number")
 
 	_, err = newOPPOPayloadForMessage(payloadInfo, msgOfflineNotify{})
 	require.ErrorContains(t, err, "missing message identity")
