@@ -489,11 +489,11 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(reloadErr))
 	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
 		// The probe above used the merged prospective values. Publish its
-		// result only after the same values have become the live singleton
-		// snapshot; otherwise a reload failure must not make an unobserved
-		// configuration look ready.
-		if !m.systemSettings.RecordManagerEmailMFAPreflight(generation, true) {
-			m.Warn("丢弃过期的管理端 MFA SMTP 预检结果")
+		// result only when the live snapshot still contains those exact values;
+		// a concurrent partial SMTP update must not make an unprobed
+		// combination look ready.
+		if !m.systemSettings.RecordManagerEmailMFAPreflightIfMatches(generation, prospectiveSMTP) {
+			m.Warn("丢弃与当前配置不匹配的管理端 MFA SMTP 预检结果")
 		}
 	}
 

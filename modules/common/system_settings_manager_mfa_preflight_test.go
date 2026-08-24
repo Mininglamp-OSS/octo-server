@@ -101,11 +101,10 @@ func TestManagerEmailMFAAutoReloadReprobesChangedConfiguration(t *testing.T) {
 	settings.ctx.GetConfig().Support.Email = "mfa-auto-reload@example.com"
 	settings.ctx.GetConfig().Support.EmailSmtp = newManagerMFAPreflightSMTP(t)
 	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
-	settings.reloadTTL = 10 * time.Millisecond
 
 	reloadCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	settings.StartAutoReload(reloadCtx)
+	settings.startAutoReload(reloadCtx, 10*time.Millisecond)
 	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
 
 	require.Eventually(t, func() bool {

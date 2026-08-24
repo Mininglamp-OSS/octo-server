@@ -67,6 +67,29 @@ func TestManagerEmailMFAPreflightRecordRejectsStaleGeneration(t *testing.T) {
 	assert.False(t, settings.ManagerEmailMFAReady())
 }
 
+func TestManagerEmailMFAPreflightRecordRejectsUnmatchedSMTPSnapshot(t *testing.T) {
+	settings := newTestSystemSettings(t, nil)
+	settings.ctx.GetConfig().Support.Email = "mfa-record-match@example.com"
+	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
+	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+	require.NoError(t, settings.Load())
+
+	probed := settings.managerEmailMFASMTPSettings()
+	// Simulate a concurrent partial update that changes the loaded SMTP
+	// combination after the original prospective values were probed.
+	require.NoError(t, settings.db.upsert("support", "email_smtp", "other.example.com:587", settingTypeString, ""))
+	require.NoError(t, settings.Load())
+	generation := settings.ManagerEmailMFAProbeGeneration()
+	assert.False(t, settings.RecordManagerEmailMFAPreflightIfMatches(generation, probed))
+	assert.False(t, settings.ManagerEmailMFAReady())
+
+	assert.True(t, settings.RecordManagerEmailMFAPreflightIfMatches(
+		generation, settings.managerEmailMFASMTPSettings(),
+	))
+	assert.True(t, settings.ManagerEmailMFAReady())
+}
+
 func TestManagerEmailMFASchemaDefaultsOffAndNamesConsoleScope(t *testing.T) {
 	def := findSchemaDef("login", "manager_email_mfa_on")
 	require.NotNil(t, def)

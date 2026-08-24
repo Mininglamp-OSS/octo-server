@@ -234,8 +234,12 @@ func (s *SystemSettings) Reload() error {
 // context.Background() it is unreachable but kept so the function stays
 // correct under either invocation.
 func (s *SystemSettings) StartAutoReload(ctx context.Context) {
+	s.startAutoReload(ctx, s.reloadTTL)
+}
+
+func (s *SystemSettings) startAutoReload(ctx context.Context, ttl time.Duration) {
 	go func() {
-		ticker := time.NewTicker(s.reloadTTL)
+		ticker := time.NewTicker(ttl)
 		defer ticker.Stop()
 		for {
 			select {
@@ -842,6 +846,35 @@ func (s *SystemSettings) SupportEmailPwd() string {
 	return s.getEncrypted("support", "email_pwd", s.ctx.GetConfig().Support.EmailPwd)
 }
 
+// managerEmailMFASMTPSettings reads the effective SMTP values from one
+// immutable snapshot. Reading the three values together is important when a
+// caller is about to publish MFA readiness: separate getter calls could span
+// two snapshot generations during a concurrent reload.
+func (s *SystemSettings) managerEmailMFASMTPSettings() smtpSettingsSnapshot {
+	defaults := smtpSettingsSnapshot{
+		from:     s.ctx.GetConfig().Support.Email,
+		address:  s.ctx.GetConfig().Support.EmailSmtp,
+		password: s.ctx.GetConfig().Support.EmailPwd,
+	}
+	snapshot := s.snapshot.Load()
+	if snapshot == nil {
+		return defaults
+	}
+	values := *snapshot
+	effective := func(key, fallback string) string {
+		value, ok := values[schemaKey("support", key)]
+		if !ok || value == "" {
+			return fallback
+		}
+		return value
+	}
+	return smtpSettingsSnapshot{
+		from:     effective("email", defaults.from),
+		address:  effective("email_smtp", defaults.address),
+		password: effective("email_pwd", defaults.password),
+	}
+}
+
 // ManagerEmailMFAState returns the security state used only by management
 // console login. A successfully loaded snapshot with no row means the
 // feature's documented default-off state; an uninitialized snapshot is
@@ -969,6 +1002,25 @@ func (s *SystemSettings) publishManagerEmailMFAPreflight(generation uint64, know
 // method never changes the MFA policy or snapshot.
 func (s *SystemSettings) RecordManagerEmailMFAPreflight(generation uint64, ok bool) bool {
 	return s.publishManagerEmailMFAPreflight(generation, true, ok)
+}
+
+// RecordManagerEmailMFAPreflightIfMatches publishes a successful write-path
+// preflight only when the loaded snapshot still contains the exact SMTP values
+// that were probed. The generation check rejects a newer snapshot; the value
+// comparison also rejects a same-request reload that picked up a concurrent
+// partial SMTP update whose final combination was never probed.
+func (s *SystemSettings) RecordManagerEmailMFAPreflightIfMatches(generation uint64, probed smtpSettingsSnapshot) bool {
+	s.managerMFAProbeMu.Lock()
+	defer s.managerMFAProbeMu.Unlock()
+	if generation != s.managerMFAProbeGeneration || s.ManagerEmailMFAState() != ManagerEmailMFAOn {
+		return false
+	}
+	if s.managerEmailMFASMTPSettings() != probed {
+		return false
+	}
+	s.managerMFAProbeKnown = true
+	s.managerMFAProbeReady = true
+	return true
 }
 
 // ManagerEmailMFAReady is the login gate's fail-closed view.  It requires an
