@@ -62,20 +62,20 @@ func TestQueryBotsInvitedByUIDTx_BasicMatch(t *testing.T) {
 	assert.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 
-	uids, err := s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "m1", tx)
+	uids, err := s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "m1", false, tx)
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"bot_m1_1", "bot_m1_2"}, uids)
 
 	// 不存在的 inviter → 空切片
-	uids, err = s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "nobody", tx)
+	uids, err = s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "nobody", false, tx)
 	assert.NoError(t, err)
 	assert.Empty(t, uids)
 
 	// 空 groupNo / inviterUID → nil，no error（防御式短路）
-	uids, err = s.db.QueryBotsInvitedByUIDTx("", "m1", tx)
+	uids, err = s.db.QueryBotsInvitedByUIDTx("", "m1", false, tx)
 	assert.NoError(t, err)
 	assert.Nil(t, uids)
-	uids, err = s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "", tx)
+	uids, err = s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "", false, tx)
 	assert.NoError(t, err)
 	assert.Nil(t, uids)
 }
@@ -107,7 +107,7 @@ func TestQueryBotsInvitedByUIDTx_SkipsInactiveRobot(t *testing.T) {
 	assert.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 
-	uids, err := s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "m1", tx)
+	uids, err := s.db.QueryBotsInvitedByUIDTx(resp.GroupNo, "m1", false, tx)
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"bot_active"}, uids)
 }
@@ -271,7 +271,7 @@ func TestQuitGroup_CascadeRemovesInvitedBots(t *testing.T) {
 	assert.NoError(t, err)
 	leaverVersion, _ := s.ctx.GenSeq(common.GroupMemberSeqKey)
 	assert.NoError(t, s.db.DeleteMemberTx(groupNo, testutil.UID, leaverVersion, tx))
-	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, tx)
+	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, false, tx)
 	assert.NoError(t, err)
 	assert.NoError(t, tx.Commit())
 
@@ -313,7 +313,7 @@ func TestQuitGroup_CreatorOwnsNoBot_NoOp(t *testing.T) {
 	assert.NoError(t, err)
 	leaverVersion, _ := s.ctx.GenSeq(common.GroupMemberSeqKey)
 	assert.NoError(t, s.db.DeleteMemberTx(groupNo, testutil.UID, leaverVersion, tx))
-	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, tx)
+	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, false, tx)
 	assert.NoError(t, err)
 	assert.NoError(t, tx.Commit())
 
@@ -370,7 +370,7 @@ func TestQuitGroup_CreatorCascadesBots(t *testing.T) {
 	assert.NoError(t, s.db.UpdateMemberRoleTx(groupNo, newGrouper.UID, MemberRoleCreator, version, tx))
 	assert.NoError(t, s.db.DeleteMemberTx(groupNo, testutil.UID, version, tx))
 	// #354：cascade 无角色例外，群主退群同样触发
-	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, tx)
+	cascaded, err := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, groupNo, testutil.UID, false, tx)
 	assert.NoError(t, err)
 	assert.NoError(t, tx.Commit())
 

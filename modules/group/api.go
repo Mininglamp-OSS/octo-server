@@ -97,11 +97,16 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	groups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
+		// 移除成员的两条路由（DELETE /members 与其别名 POST /members_delete）自
+		// bot-owner-self-removal 起对**普通成员**开放（自助移除自己名下的 bot，
+		// octo-web#1511），因此按认证路由惯例挂 per-UID 限流。
+		// 只挂这两条：/v1/groups 组还有 ~26 个端点，整组挂会改变它们的既有行为。
+		memberRemoveRateLimiter := appwkhttp.SharedUIDRateLimiter(r, g.ctx)
 		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
-		groups.DELETE("/:group_no/members", g.memberRemove)                                // 移除群成员
+		groups.DELETE("/:group_no/members", memberRemoveRateLimiter, g.memberRemove)       // 移除群成员
 		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
 		groups.GET("/:group_no/members/:uid", g.memberGet)                                 // 查询单个 uid 是否为群成员（命中时返回成员详情）
-		groups.POST("/:group_no/members_delete", g.memberRemove)                           // 移除群成员
+		groups.POST("/:group_no/members_delete", memberRemoveRateLimiter, g.memberRemove)  // 移除群成员
 		groups.GET("/:group_no/membersync", g.syncMembers)                                 // 同步群成员
 		groups.GET("/:group_no", g.groupGet)                                               // 获取群信息
 		groups.PUT("/:group_no/setting", g.groupSettingUpdate)                             // 修改群设置
@@ -451,6 +456,8 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 	g.fillSpaceRelatedFields(groupNo, "", resps)
 	// YUJ-413 Scope B：批量回填实名字段（零 N+1），Android 气泡 + 群成员列表依赖。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：回填 bot_owned_by_me，前端据此渲染自助移除按钮。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(resps)
 }
@@ -493,6 +500,8 @@ func (g *Group) memberGet(c *wkhttp.Context) {
 	// 调用成本与 N=1 一致），Android 客户端 /v1/groups/:group_no/members/:uid
 	// 是资料卡 / @提及 等路径的数据源。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：单成员查询同样回填 bot_owned_by_me，保持三处同名同型。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 
 	c.Response(memberCheckResp{Exists: true, Member: &resps[0]})
 }
@@ -844,6 +853,9 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 	// membersync 是 Android WKSDK ChannelMember 缓存的唯一增量来源，漏下发就
 	// 永远没 extraMap.realname_verified → 气泡 + 群成员列表永远不亮。
 	g.fillRealnameFields(resps)
+	// octo-web#1511：增量同步路径同样回填。注意本字段上线前已缓存的成员行要等其
+	// version 变动才会带上它，故客户端必须按「缺失 = false」降级。
+	g.fillBotOwnedByMe(groupNo, loginUID, resps)
 	c.Response(resps)
 }
 
@@ -3044,6 +3056,9 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		return
 	}
 	var loginMember *MemberModel
+	// botOwnerSelfRemoval 标记「普通成员自助移除自己名下 bot」这条路径，
+	// 后续用于：拒绝 Creator 角色目标、以及让 service 改发更贴切的 Tip。
+	botOwnerSelfRemoval := false
 	// 查询操作者身份
 	// 这里要兼容后台管理系统的删除操作
 	if c.CheckLoginRole() != nil {
@@ -3058,8 +3073,70 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		if loginMember.Role != int(common.GroupMemberRoleCreater) && loginMember.Role != int(common.GroupMemberRoleManager) {
-			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
-			return
+			// 自助路径（octo-web#1511）：普通成员可以移除**自己名下**的 bot。
+			// 在此之前 bot 归属只在入群侧校验（checkBotOwnership），移除侧完全不看，
+			// 形成一道单向门——成员能把自己的 bot 拉进群，却再也取不出来。
+			//
+			// 判据必须是 QueryBotUIDsOwnedByUIDs 这种**默认拒绝的白名单**：它只返回
+			// 「本群内 + group_member.robot=1 + is_deleted=0 + robot.status=1 +
+			// robot.creator_uid = 操作者」的 bot UID。
+			//
+			// 切勿改用 checkBotOwnership —— 它的 SQL 是 `WHERE u.robot = 1`，人类 UID
+			// 根本查不出行、循环因此不拒绝（见 bot_ownership.go doc「human → always OK」）。
+			// 那是入群侧「非 bot 不归我管」的正确语义，搬到移除侧就是提权：
+			// 普通成员传一批人类 UID 即可踢人。
+			// 自助分支是新增的**授权谓词**，必须用活跃口径（is_deleted=0 AND
+			// status=Normal），不能只看上面 QueryMemberWithUID 的 is_deleted ——
+			// 见 db.go QueryActiveMemberGroupNosWithUID 的约定：「只看 is_deleted
+			// 会把被拉黑成员当作仍然在群」。
+			// 若不加这道门，被拉黑的成员（status=Blacklist、is_deleted=0）会凭空获得
+			// 一个能改群成员表、并往群里写一条持久化 Tip 的写操作；而在本改动之前
+			// 他会直接吃到 ErrGroupMemberCannotRemove。
+			// 注意 QueryBotUIDsOwnedByUIDs 故意不过滤 group_member.status（拉黑级联
+			// 需要它），所以这道门必须由调用方来把。
+			operatorActive, aerr := g.db.ExistMemberActive(operator, groupNo)
+			if aerr != nil {
+				g.Error("查询操作者活跃成员状态失败", zap.Error(aerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			if !operatorActive {
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
+			}
+			ownedBotUIDs, qerr := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{operator})
+			if qerr != nil {
+				g.Error("查询操作者名下 bot 失败", zap.Error(qerr))
+				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				return
+			}
+			ownedBots := make(map[string]struct{}, len(ownedBotUIDs))
+			for _, uid := range ownedBotUIDs {
+				ownedBots[uid] = struct{}{}
+			}
+			// 整批校验：任一目标不在白名单内即整批拒绝，不做部分执行。
+			for _, uid := range req.Members {
+				if _, ok := ownedBots[uid]; ok {
+					continue
+				}
+				// 目标不在白名单有两种原因，要给出不同的错误：白名单按
+				// is_deleted=0 过滤，所以「刚被移除过的自己的 bot」会落到这里。
+				// 一律回「无权移除」会让用户看到「你没有权限移除自己的 bot」，
+				// 而真相是它已经不在群里了（重复点击 / 离线重试 / 列表过期）。
+				stillMember, merr := g.db.ExistMember(uid, groupNo)
+				if merr != nil {
+					g.Error("查询目标成员是否在群失败", zap.Error(merr))
+					httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+					return
+				}
+				if !stillMember {
+					httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+				return
+			}
+			botOwnerSelfRemoval = true
 		}
 	}
 	// 验证删除者是否包含自己
@@ -3082,6 +3159,26 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 			return
 		}
 		for _, member := range deleteMembers {
+			// 自助路径只允许移除**普通角色**的 bot。
+			//
+			// 白名单按所有权圈定目标，但不过滤 role，所以理论上能命中一个被授予了
+			// 群角色的 bot。两种角色分别的问题：
+			//   - Creator：RemoveGroupMembers 对 Creator 是静默跳过，会变成
+			//     「200 但成员没动」，前端误报已移除；
+			//   - Manager：普通成员将得以移除一个群管理员，而真正的管理员反而
+			//     不能移除另一个管理员（下面几行），权限阶梯倒挂。
+			//     维护者当初拍板的「所有权优先」针对的是 bot_admin 这一列，
+			//     group_member.role 是比它更强的授予，不在那条决策覆盖范围内。
+			// 故一并拒绝，把角色 bot 的处置交回群主/管理员。
+			// （managerAdd 不排除 robot，所以 Manager 角色的 bot 是构造得出来的。）
+			if botOwnerSelfRemoval && member.Role != MemberRoleCommon {
+				if member.Role == int(common.GroupMemberRoleCreater) {
+					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveOwner, nil, nil)
+					return
+				}
+				httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
+				return
+			}
 			if loginMember.Role == int(common.GroupMemberRoleManager) {
 				if member.Role == int(common.GroupMemberRoleManager) {
 					httperr.ResponseErrorL(c, errcode.ErrGroupCannotRemoveAdmin, nil, nil)
@@ -3096,11 +3193,14 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 
 	// 调用 Service 移除群成员
-	_, err = g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+	removeResp, err := g.groupService.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
 		GroupNo:      groupNo,
 		Members:      req.Members,
 		OperatorUID:  operator,
 		OperatorName: operatorName,
+		// 自助路径改发「X 将机器人 Y 移出了群聊」，而不是默认的「你被 X 移除群聊」
+		// ——后者是被移除者视角的措辞，套在 bot 上读起来是错的。
+		BotOwnerSelfRemoval: botOwnerSelfRemoval,
 	})
 	if err != nil {
 		// 后台管理路径会跳过普通成员的目标预校验；若删除的 UID 全不在群内，
@@ -3119,7 +3219,53 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		return
 	}
 
+	// 自助路径核对**实际移除集合**：上面的角色守卫读的是事务外快照，而 service 在
+	// 行锁内重读角色，期间状态变化的目标会被静默跳过（其 doc 写明「让调用方按
+	// Removed 计数发现并重试」，但此前没有调用方真的去看）。不核对的话，这条竞态
+	// 窗口仍会回到「200 但成员没动」——正是上面那道守卫要消灭的形态，只是更窄。
+	//
+	// 比对集合而不是比数量：removedUIDs 含级联带走的 bot，数量会被撑大，
+	// 足以把「某个请求目标被跳过」在数字上抹平（请求 2 个、跳过 1 个、级联补 1 个，
+	// 计数仍然相等）。
+	//
+	// 错误码也不写死成「不能移除群主」：跳过的真实原因可能是目标被提升为 Creator
+	// 或 Manager，也可能是 DeleteMemberTx 失败后 service 的 continue（此时事务已
+	// 提交、部分目标已删）。统一回「无权移除」并把缺失的目标记进日志 —— 断言不了
+	// 的原因就不要假装断言得了。
+	// 只在自助路径上核对：后台管理路径本来就允许「部分目标不在群内」的宽松语义。
+	if botOwnerSelfRemoval && removeResp != nil {
+		if missing := missingRemovalTargets(req.Members, removeResp.RemovedUIDs); len(missing) > 0 {
+			g.Warn("自助移除存在未被移除的目标，疑似其角色在事务内发生变化或删除失败",
+				zap.String("groupNo", groupNo), zap.String("operator", operator),
+				zap.Strings("requested", req.Members), zap.Strings("missing", missing))
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberCannotRemove, nil, nil)
+			return
+		}
+	}
+
 	c.ResponseOK()
+}
+
+// missingRemovalTargets 返回「请求移除、但实际没被移除」的目标。
+//
+// 为什么不比数量：removedUIDs 除请求目标外还含级联带走的 bot，数量会被撑大，
+// 于是「请求 2 个、跳过 1 个、级联补 1 个」在计数上完全相等，静默成功照旧发生。
+// 集合比对不受级联影响 —— 多出来的 UID 无所谓，少掉的才是问题。
+func missingRemovalTargets(requested, removedUIDs []string) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	removed := make(map[string]struct{}, len(removedUIDs))
+	for _, uid := range removedUIDs {
+		removed[uid] = struct{}{}
+	}
+	var missing []string
+	for _, uid := range requested {
+		if _, ok := removed[uid]; !ok {
+			missing = append(missing, uid)
+		}
+	}
+	return missing
 }
 
 // 修改群设置
@@ -3378,7 +3524,7 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——群主退群（角色已由上方
 	// newGrouper 完成转让）同样级联带走自己名下的 bot，和普通成员一致。
 	var cascadedBotUsers []*user.Model
-	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, tx)
+	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, false, tx)
 	if cerr != nil {
 		tx.Rollback()
 		g.Error("级联移除 bot 成员失败", zap.Error(cerr))
@@ -4362,8 +4508,17 @@ type memberDetailResp struct {
 	RealnameVerified   bool   `json:"realname_verified"`
 	RealName           string `json:"real_name,omitempty"`
 	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
+	// BotOwnedByMe 表示「该 bot 成员归当前请求方所有」（octo-web#1511）。
+	// 响应本身就是 per-viewer 的，故用布尔而不是下发 creator_uid：客户端直接可用，
+	// 也不把 bot 的归属关系暴露给全群。
+	//
+	// 前端据此逐行决定是否渲染移除按钮。**缺失必须按 false 处理**：
+	// /membersync 是按 version 的增量同步，本字段上线前已缓存的成员行在其 version
+	// 变动前不会带上它，降级方向只能是「退回现状」，绝不能误开权限。
+	// 非 bot 成员、他人的 bot 均为 false。
+	BotOwnedByMe bool   `json:"bot_owned_by_me"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
@@ -4466,6 +4621,76 @@ func (g *Group) fillRealnameFields(resps []memberDetailResp) {
 
 // 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
 // 函数不会改写 is_external / source_space_id 字段。
+// fillBotOwnedByMe 批量回填 memberDetailResp.BotOwnedByMe（octo-web#1511）。
+//
+// 复用 memberRemove 自助路径的同一判据 QueryBotUIDsOwnedByUIDs —— 一次
+// `group_member INNER JOIN robot` 批量查出「本群内属于 loginUID 的 bot」，零 N+1，
+// 且保证「前端看得到移除按钮」与「后端放行移除」用的是同一口径，不会出现
+// 按钮显示了但请求被拒的错位。
+//
+// 为什么不做成群级能力位（如 can_remove_own_bots）：那需要在 GetGroupDetail 这类
+// 每次群信息拉取都走的热路径上多打一次 robot 表 JOIN；而本字段只在成员列表这类
+// 本来就要分页取数的场景计算一次。
+//
+// 失败处理：仅 log，全部留 false —— fail closed，宁可不显示移除按钮，
+// 不能因查询抖动误开权限。
+func (g *Group) fillBotOwnedByMe(groupNo, loginUID string, resps []memberDetailResp) {
+	if len(resps) == 0 || groupNo == "" || loginUID == "" {
+		return
+	}
+	hasBot := false
+	for i := range resps {
+		if resps[i].Robot == 1 {
+			hasBot = true
+			break
+		}
+	}
+	if !hasBot {
+		return
+	}
+	// 移除的授权是**两个**谓词：活跃成员（ExistMemberActive）+ 所有权白名单。
+	// 只按所有权回填的话，被拉黑的所有者（status=Blacklist、is_deleted=0）仍能拉到
+	// 成员列表、拿到 bot_owned_by_me=true、看到移除按钮，点下去却被 memberRemove
+	// 的活跃门拒绝。这里补上同一道门，让「按钮可见」与「请求会被放行」用的是同一组
+	// 判据，而不是其中一半。方向仍是 fail-closed：查询出错一律留 false。
+	operatorActive, aerr := g.db.ExistMemberActive(loginUID, groupNo)
+	if aerr != nil {
+		g.Warn("查询请求方活跃成员状态失败（octo-web#1511）",
+			zap.Error(aerr), zap.String("group_no", groupNo))
+		return
+	}
+	if !operatorActive {
+		return
+	}
+	ownedBotUIDs, err := g.db.QueryBotUIDsOwnedByUIDs(groupNo, []string{loginUID})
+	if err != nil {
+		g.Warn("批量查询本人名下 bot 失败（octo-web#1511）",
+			zap.Error(err), zap.String("group_no", groupNo))
+		return
+	}
+	if len(ownedBotUIDs) == 0 {
+		return
+	}
+	owned := make(map[string]struct{}, len(ownedBotUIDs))
+	for _, uid := range ownedBotUIDs {
+		owned[uid] = struct{}{}
+	}
+	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
+	for i := range resps {
+		if resps[i].Robot != 1 {
+			continue
+		}
+		// 被授予了群角色（Creator / Manager）的 bot 由 memberRemove 的自助分支拒绝，
+		// 处置权留给群主/管理员；这里同步排除，避免下发一个点了必报错的按钮。
+		if resps[i].Role != MemberRoleCommon {
+			continue
+		}
+		if _, ok := owned[resps[i].UID]; ok {
+			resps[i].BotOwnedByMe = true
+		}
+	}
+}
+
 func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []memberDetailResp) {
 	if len(resps) == 0 {
 		return

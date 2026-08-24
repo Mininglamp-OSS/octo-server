@@ -1057,6 +1057,17 @@ type RemoveGroupMembersServiceReq struct {
 	// 空串沿用默认的「被移出」，所以既有调用方行为不变；自愿离开的场景传「退出了」。
 	BotCascadeTipAction string
 
+	// BotOwnerSelfRemoval 标记「bot 所有者自助把自己名下的 bot 移出群聊」
+	// （octo-web#1511）。置位时抑制默认的「你被 X 移除群聊」——那是被移除者视角的
+	// 措辞，目标是 bot 时读起来是错的——改发一条 owner 视角的 Tip
+	// （sendBotOwnerRemovedTip）。
+	//
+	// 为什么不复用 SuppressRemoveNotice + 调用方自己发消息：那需要调用方同时设对
+	// 两个开关才不出错，而 handler 手上没有成员名字（QueryMembersWithUids 返回的
+	// MemberModel 无 Name 字段），本函数则已经为 removedVos 查好了名字。
+	// 收敛成一个语义化开关，调用方无法只设一半。
+	BotOwnerSelfRemoval bool
+
 	// SuppressBotCascadeTip 完全不发 bot 连带移除 Tip。
 	// 只在「通告本身已无意义」时用（Space 解散：群还在，但每个成员每个群各发一条，
 	// N×M 条堆给最后一个人看）。普通移除和自愿退出都**应该**发——群成员看见 bot
@@ -1761,6 +1772,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——manager 不再豁免，
 	// 被踢的管理员连同其拉入的 bot 一并带走（API 层 memberRemove 已限制
 	// 只有群主能踢管理员；creator 仍不可被踢）。
+	//
+	// 唯一例外是 bot 所有者自助移除（req.BotOwnerSelfRemoval，octo-web#1511）：
+	// 那条路径下级联额外排除被授予群角色的 bot，避免普通成员借级联越权移除一个
+	// 管理员 bot。它**不影响**本注释描述的踢人 / 退群 / 拉黑三条路径 —— 那三条
+	// 传 false，#354 原样保持。判据见 QueryBotsInvitedByUIDTx 的 requireCommonRole。
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
 		if m.IsDeleted == 1 || m.Role == MemberRoleCreator {
@@ -1820,7 +1836,10 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		// 群里还剩着人却没有群主，且没有任何东西会重新选主。
 		// 锁内确认仍非 creator 才删；已经变成 creator 的跳过，让调用方按
 		// Removed 计数发现并重试（见 RemoveGroupMembersServiceResp）。
-		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, tx)
+		// 自助路径（bot 所有者）在事务外只放行普通角色目标，锁内必须用同一口径：
+		// 否则窗口内 Common→Manager 的提升会通过重查、行真的被删，且 removedUIDs
+		// 里有它，连调用方的集合比对都发现不了。其余路径沿用「只排除 Creator」。
+		stillRemovable, err := s.db.LockRemovableMemberTx(req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if err != nil {
 			s.Error("re-read member role failed", zap.Error(err), zap.String("uid", m.UID))
 			return nil, errors.New("failed to re-read member role")
@@ -1857,7 +1876,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		if m.Role == MemberRoleCreator {
 			continue
 		}
-		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, tx)
+		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if cerr != nil {
 			s.Error("cascade remove bots failed", zap.Error(cerr), zap.String("uid", m.UID))
 			return nil, errors.New("failed to cascade-remove invited bots")
@@ -1918,7 +1937,14 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		}
 
 		// 发送被踢消息
-		if !req.SuppressRemoveNotice {
+		switch {
+		case req.BotOwnerSelfRemoval:
+			// bot 所有者自助移除：换成 owner 视角的 Tip。仍然要发——群成员看见 bot
+			// 凭空消失有权知道原因（与 bot 级联 Tip 同一条透明度约定）。
+			if err := sendBotOwnerRemovedTip(s.ctx, req.GroupNo, req.OperatorName, removedVos); err != nil {
+				s.Error("send bot owner removed tip failed", zap.Error(err))
+			}
+		case !req.SuppressRemoveNotice:
 			removeReq := &config.MsgGroupMemberRemoveReq{
 				Operator:     req.OperatorUID,
 				OperatorName: req.OperatorName,

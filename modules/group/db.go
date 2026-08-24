@@ -272,10 +272,21 @@ func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
 }
 
 // recoverMemberTx 恢复成员信息
+//
+// 删除是软删（DeleteMemberTx 只置 is_deleted=1），整行连同各种权限位都留在表里，
+// 所以复活时必须把**群授予的权限**显式重置，否则它们会跨越「离群 → 再入群」存活。
+// role 一直是这么做的（取调用方新建 model 的值，通常是 MemberRoleCommon）；
+// bot_admin 此前漏了 —— 群主给某 bot 授过 bot_admin 后，该 bot 的所有者把它撤走
+// 再拉回来，它就悄悄又是 bot 管理员，全程不需要群主参与。
+// 回到群里的成员一律视作新成员，权限要重新授。
+//
+// 注意：解除拉黑走的是 updateMembersStatus，不经过这里，因此不受影响。
+// 回归见 TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd。
 func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
 		"remark":          member.Remark,
 		"role":            member.Role,
+		"bot_admin":       0,
 		"version":         member.Version,
 		"is_deleted":      0,
 		"invite_uid":      member.InviteUID,
@@ -566,7 +577,10 @@ func (d *DB) queryMembersWithGroupNo(groupNo string) ([]*MemberDetailModel, erro
 
 func (d *DB) queryMemberWithGroupNoAndUID(groupNo, uid string) (*MemberDetailModel, error) {
 	var detail *MemberDetailModel
-	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,group_member.invite_uid,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.uid=? and group_member.is_deleted=0", groupNo, uid).Load(&detail)
+	// group_member.robot 必须在选择列里：memberDetailResp.Robot 既是下发字段，
+	// 也是 fillBotOwnedByMe 的前置判据 —— 漏选会让 bot_owned_by_me 在本端点
+	// 恒为 false（静默失效，不报错）。见 TestMemberGet_ExposesBotOwnedByMe。
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,group_member.invite_uid,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.robot,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.uid=? and group_member.is_deleted=0", groupNo, uid).Load(&detail)
 	return detail, err
 }
 func (d *DB) queryBlacklistMemberUIDsWithGroupNo(groupNo string) ([]string, error) {
@@ -874,18 +888,38 @@ func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
 // 为什么是 INNER JOIN + status=1：与 checkBotOwnership（bot_ownership.go）保持一致，
 // 没有活跃 robot 行的 bot（孤儿 / 禁用）不视为任何人的 bot，不被级联。
 // 群主 / 其他管理员仍可通过常规移除成员接口清理它们。
-func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, tx *dbr.Tx) ([]string, error) {
+func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, requireCommonRole bool, tx *dbr.Tx) ([]string, error) {
 	if groupNo == "" || inviterUID == "" {
 		return nil, nil
 	}
 	var uids []string
-	_, err := tx.SelectBySql(
-		"SELECT gm.uid FROM group_member gm "+
-			"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 "+
-			"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "+
-			"AND r.creator_uid = ? FOR UPDATE",
-		groupNo, inviterUID,
-	).Load(&uids)
+	// requireCommonRole 决定要不要额外排除被授予群角色的 bot。
+	//
+	// **false（既有三条路径：主动退群 / 被群主管理员移除 / 被拉黑）**：不过滤角色。
+	// #354 是写下来的产品决策 —— 「bot 永远跟随其主人，无角色例外」，连群主退群
+	// （角色已先行转让）都一视同仁。在这里加全局过滤会让「张三被踢 → 他名下的
+	// 管理员 bot 留在群里，而张三已不是成员、自助路径又拒绝角色 bot」，群里凭空
+	// 多出一个谁也管不动的特权 bot，拉黑流程下还带安全含义。
+	//
+	// **true（仅 bot 所有者自助移除）**：排除角色 bot。级联不经过 handler 的角色
+	// 守卫，若不收口，「bot A 拥有 Manager 角色的 bot B」时移除 A 会顺带删掉 B，
+	// 等于普通成员经级联越权移除了一个群管理员。robot.creator_uid 指向另一个 bot
+	// 是构造得出来的：BotFather 的命令链（messagesListen → HandleMessage →
+	// tryCreateBotCore）对「发送者是不是 bot」零过滤，挡在前面的只有
+	// checkSendPermission 的好友门 —— 守卫的强度不该依赖另一个模块的门。
+	// 被排除的角色 bot 不会失控：群主/管理员仍可经常规移除接口处置它们。
+	sql := "SELECT gm.uid FROM group_member gm " +
+		"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 " +
+		"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "
+	args := []interface{}{groupNo}
+	if requireCommonRole {
+		sql += "AND gm.role = ? "
+		args = append(args, MemberRoleCommon)
+	}
+	sql += "AND r.creator_uid = ? FOR UPDATE"
+	args = append(args, inviterUID)
+
+	_, err := tx.SelectBySql(sql, args...).Load(&uids)
 	return uids, err
 }
 
@@ -902,6 +936,20 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 	if groupNo == "" || len(ownerUIDs) == 0 {
 		return nil, nil
 	}
+	// 空字符串必须剔除：`creator_uid IN ('')` 会命中 creator_uid='' 的行，而那正是
+	// checkBotOwnership 判定为「无有效归属」的孤儿 bot 哨兵值。HTTP 调用方有鉴权
+	// 兜底不会传空，但 expandBlacklistTargetsWithOwnedBots 会转发请求方给的 uid 列表，
+	// 所以在这里收口，让导出契约与它声称的语义一致（fail closed）。
+	owners := make([]string, 0, len(ownerUIDs))
+	for _, uid := range ownerUIDs {
+		if uid != "" {
+			owners = append(owners, uid)
+		}
+	}
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	ownerUIDs = owners
 	var uids []string
 	_, err := d.session.SelectBySql(
 		"SELECT gm.uid FROM group_member gm "+
@@ -1066,13 +1114,21 @@ func (d *DB) QueryCategoryByID(categoryID string) (*CategoryRow, error) {
 }
 
 // LockRemovableMemberTx 事务内锁定成员行并确认它现在仍然可被移除
-// （存在、未删除、且不是群主）。
+// （存在、未删除、且角色符合调用方要求）。
 //
-// 存在的理由是 RemoveGroupMembers 的 creator 过滤读的是事务外快照：目标可能在
-// 快照与删除之间被提升为群主（群主转让接口，或并发的清理工单交接）。
+// 存在的理由是 RemoveGroupMembers 的角色过滤读的是事务外快照：目标可能在
+// 快照与删除之间被提升（群主转让接口、管理员任命，或并发的清理工单交接）。
 // DeleteMemberTx 的 WHERE 没有角色守卫，不锁内复核就会把新群主删掉，
 // 留下一个有成员却无群主、也无人重新选主的群。
-func (d *DB) LockRemovableMemberTx(groupNo string, uid string, tx *dbr.Tx) (bool, error) {
+//
+// requireCommonRole 决定锁内这道门有多严：
+//   - false（既有语义）：只排除 Creator。管理端踢人、Space 级联等路径用它，
+//     群主/管理员本来就有权移除管理员。
+//   - true：只放行 MemberRoleCommon。bot 所有者自助移除用它 —— 该路径在事务外
+//     已拒绝一切非普通角色目标，锁内必须用同一口径收口，否则窗口内 Common→Manager
+//     的提升会通过重查、行真的被删，而且 removedUIDs 里有它、调用方的集合比对
+//     也发现不了，等于普通成员越权移除了一个群管理员。
+func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole bool, tx *dbr.Tx) (bool, error) {
 	var roles []int
 	_, err := tx.SelectBySql(
 		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
@@ -1083,6 +1139,9 @@ func (d *DB) LockRemovableMemberTx(groupNo string, uid string, tx *dbr.Tx) (bool
 	}
 	if len(roles) == 0 {
 		return false, nil // 已离群
+	}
+	if requireCommonRole {
+		return roles[0] == MemberRoleCommon, nil
 	}
 	return roles[0] != MemberRoleCreator, nil
 }

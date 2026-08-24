@@ -135,6 +135,11 @@ func TestManagerMemberRemove_NotInGroupIsNotFound(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// DELETE /v1/groups/:group_no/members 自 bot-owner-self-removal 起挂了
+	// SharedUIDRateLimiter。该桶是进程级共享、存活在 Redis 里，且不被
+	// CleanAllTables 清理 —— 不重置的话，前序用例耗掉配额后这里会拿到 429，
+	// 断言 400 就会失败（-shuffle 下尤其容易命中）。
+	resetGroupUIDRateLimit(t, ctx)
 
 	// Promote the test caller to SuperAdmin so memberRemove takes the
 	// management path that skips the normal-member pre-check.
