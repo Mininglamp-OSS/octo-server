@@ -159,7 +159,9 @@ notice, despite having written that reasoning into the code comment myself.
 
 Fixed by checking whether the elected successor is itself `pending` in
 `space_member_removal_cleanup` before announcing. Mid-chain links stay silent; the
-final link announces the settled owner. Order-independent.
+final link announces the settled owner.
+
+**"Order-independent" is how that read here, and it was wrong — see round 4.**
 
 ### The vacuous guard (P1-2)
 
@@ -204,3 +206,54 @@ A third, automated reviewer approved the same head, having noticed the identical
 test weakness but classified it as a comment-accuracy issue. It stated plainly
 that it ran no code. The two humans ran the mutation. Same observation, opposite
 verdict, and the difference was execution.
+
+## Round 3 — the fix's own premise was false (PR #804 round-4 review)
+
+Three reviewers independently found it, two of them by revising an APPROVE they had
+already given on the same head. I confirmed every claim against the code before
+accepting it.
+
+The chain suppression above was justified in code and brief by one sentence: a
+batch's jobs are enqueued atomically in one transaction
+(`enqueueMemberRemovalCleanupBatchTx`), so every sibling's `pending` row exists
+before any worker starts. That function has exactly two callers, both disband —
+and disband suppresses the announcement anyway, so **the primitive I cited never
+protected a path that announces**. Of the paths that do announce, the superadmin
+`removeMembersForce` is atomic, but the user-side `members/remove` runs
+`removeMemberLocked` once per uid, each with its own `Begin`/`Commit`, under
+`reason=kicked` — which is not suppressed. The repository's own comments say
+`一人一事务` and reason explicitly about earlier uids having already committed. The
+evidence was in the file the whole time; I cited a function name without checking
+who calls it.
+
+A 10 s worker tick landing mid-loop claims the committed prefix, the later uids
+have no rows yet, and the check reads a successor who is about to be removed as
+"not pending". Measured: seeded up front → 1 notice; per-iteration enqueue fully
+interleaved → 3; per-iteration plus a single tick after the first commit → 2. The
+last needs no unusual timing at all.
+
+Two things worth keeping from this round:
+
+- **A test can encode a premise instead of testing it.**
+  `TestGroupCascadeBatchHandoverAnnouncesOnce` seeds the batch's pending rows
+  before the loop, which models exactly the atomic entrypoints. It is green, it is
+  not vacuous, and it is still blind to this — because its fixture *is* the
+  assumption under test. One reviewer said they had trusted that test in an earlier
+  round and that this is what caused them to miss the defect.
+- **Round 2's lesson repeated itself one level up.** There I recorded that I had
+  transferred the disband reasoning verbatim without noticing. The fix I wrote for
+  it then inherited a different unchecked claim, and I wrote *that* one into the
+  code comment too. Checking who calls a function is cheaper than either round.
+
+Also corrected this round: the earlier claim that moving the pending check inside
+the transaction "needs a test hook in production code" — it does not.
+`HasPendingRemovalCleanup` only calls `SelectBySql`, which is on
+`dbr.SessionRunner`, which `*dbr.Tx` satisfies. That fix is cheap; it is simply
+independent of this defect and cannot fix it, because there the sibling row does
+not exist yet.
+
+Per the maintainer's decision this round corrects the record only — the code
+comment, the brief's Chain suppression section, and this journal. The `kicked`-path
+defect itself is not fixed here: the per-uid transaction is load-bearing
+(transactional outbox plus the in-lock role-hierarchy re-read), so the fix is a
+design change, not an edit.

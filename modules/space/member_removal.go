@@ -514,11 +514,17 @@ func (s *Space) finishCleanupJob(job *memberRemovalCleanupJob, owner string, sta
 
 // HasPendingRemovalCleanup 报告 (spaceID, uid) 是否还有未完成的移除清理工单。
 //
-// 给 group 侧的群主交接通告用：批量移除按 uid 逐条建工单
-// （enqueueMemberRemovalCleanupBatchTx），若被移除的几个人正好是同一个群里连续的元老，
-// 交接会沿元老顺序连锁 C→S2、S2→S3……每一环都想发一条「已成为新群主」，而前面那些
-// 在写下时就已作废。动手通告前先问一句「这位继任者自己是不是也在待移除队列里」，
-// 是就不发，链条自然只剩最后一环——那一环的继任者不在队列里，通告的是最终结果。
+// 给 group 侧的群主交接通告用：批量移除按 uid 逐条建工单，若被移除的几个人正好是同一个
+// 群里连续的元老，交接会沿元老顺序连锁 C→S2、S2→S3……每一环都想发一条「已成为新群主」，
+// 而前面那些在写下时就已作废。动手通告前先问一句「这位继任者自己是不是也在待移除队列
+// 里」，是就不发，链条于是只剩最后一环——那一环的继任者不在队列里，通告的是最终结果。
+//
+// ⚠️ 这只在同批工单于任何 worker 起跑前就全部可见时才成立，而**并非所有入口都如此**：
+// 解散走 enqueueMemberRemovalCleanupBatchTx、超管强制移除走 removeMembersForce，两者都是
+// 单事务原子入队；但用户端 members/remove 走 removeMemberLocked，一人一事务逐个提交
+// （reason=kicked，不抑制），后面几个 uid 的行在前缀被认领时还不存在，本函数会把他们
+// 读成「不在队列里」。后果与完整分析见调用方 group/space_member_removal.go 里
+// HasPendingRemovalCleanup 调用点上方的注释。
 //
 // 只看 pending（status=0）：
 //   - done 表示那条工单已跑完，人已经不在群里，本来也不会被选为继任者；

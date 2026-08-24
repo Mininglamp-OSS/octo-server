@@ -153,13 +153,45 @@ Before announcing, the elected successor is checked against
 but the notice is skipped: this link is mid-chain and is about to be superseded.
 
 Only the final link — whose successor is not queued for removal — announces, and
-what it announces is the settled owner. Serially the outcome does not depend on
-job order, and the reason is stronger than "it happens to work": a batch is
-enqueued atomically in one transaction (`enqueueMemberRemovalCleanupBatchTx`), so
-every sibling job's pending row exists before any worker starts. "The successor is
-not pending" therefore holds for exactly one link, whichever order they run.
+what it announces is the settled owner.
 
-**Across replicas it is not absolute.** The check runs after
+**This collapses to one notice only where a batch's jobs are all visible before
+any worker starts, and that is not every entrypoint.** An earlier revision of this
+brief claimed it held generally, citing `enqueueMemberRemovalCleanupBatchTx`. That
+claim was false and is corrected here (PR #804 round-4 review, found independently
+by three reviewers and confirmed against the code):
+
+| Entrypoint | Enqueue | Reason | Premise holds? |
+|---|---|---|---|
+| Disband (`space/db.go`, `db_manager.go`) | `enqueueMemberRemovalCleanupBatchTx`, one tx | `space_disbanded` | Yes — but this path suppresses the notice anyway, so the cited function never protects an announcing path |
+| Superadmin force-remove (`removeMembersForce`) | one tx for the whole batch | `force_removed` | Yes |
+| **User-side `members/remove`** (`removeMemberLocked`) | **one tx per uid, committed individually** | **`kicked` — not suppressed** | **No** |
+
+On the `kicked` path the cleanup worker's 10 s tick can claim the already-committed
+prefix mid-loop, while the later uids have no rows yet. The check then reads a
+successor who is about to be removed as "not pending" and announces an intermediate
+handover; that successor's own job later announces again. Measured: all rows seeded
+up front → 1 notice; per-iteration enqueue fully interleaved → 3; per-iteration plus
+a single tick after the first commit → 2. The surplus notices are `NoPersist=0`,
+already false when written, and stay in group history. The final notice is still
+correct, so this is *wrong content emitted*, not *correct content lost*.
+
+Not fixed in this PR — deliberately, and the fix is not a drop-in: the per-uid
+transaction is what keeps each membership flip and its cleanup job atomic
+(transactional outbox), and the in-lock role-hierarchy re-read needs that
+granularity, so hoisting the inserts into a trailing transaction trades this defect
+for a torn-write one. Candidate directions: a `next_attempt_at` offset for a
+batch's jobs (a timing assumption, not a guarantee); a batch identity on the rows
+with suppression held until the batch is fully enqueued; or re-evaluating once a
+batch has settled rather than deciding per link — the last being the same
+durable-replay work tracked in #797.
+
+`TestGroupCascadeBatchHandoverAnnouncesOnce` does **not** cover this: it seeds the
+whole batch's pending rows before the loop, modelling the two atomic entrypoints.
+It pins "an atomically-enqueued batch collapses to one notice", not "every
+entrypoint collapses".
+
+**A separate and independent window: across replicas.** The check runs after
 `handOverGroupCreator` commits, so the successor's row lock is already released.
 If worker A stalls between that commit and the check for long enough (~100 ms)
 for worker B to finish the successor's entire job and mark it `done`, A reads
@@ -169,9 +201,14 @@ transaction A still holds the successor's row lock, so B cannot get past the fir
 `FOR UPDATE` of its own handover, and the row is unambiguously `pending`. That
 row-lock premise was verified by experiment.
 
-Not done here, on reachability: 30 rounds of two goroutines racing sibling jobs of
-one batch produced **zero** surplus notices, and a deterministic red test needs a
-test hook in production code. Recorded as a follow-up instead.
+Not done here. An earlier revision justified that by saying a deterministic red
+test would need a test hook in production code; **that was wrong** —
+`HasPendingRemovalCleanup` only calls `SelectBySql`, which is on
+`dbr.SessionRunner`, and `*dbr.Tx` satisfies it, so widening the parameter moves
+the check inside the transaction with no hook at all. The real reasons it is not
+here: 30 rounds of two goroutines racing sibling jobs produced **zero** surplus
+notices, and it is independent of the `kicked` defect above — which it cannot fix,
+because there the sibling row genuinely does not exist yet.
 
 `done` and `abandoned` do not suppress — but only when they already hold at check
 time. The common ordering is the reverse: the check runs first, and the
@@ -244,14 +281,18 @@ exists.
   whose members are consecutive in one group's seniority list produced **three**
   notices in that group (C→S2, S2→S3, S3→S4), the first two already obsolete when
   written. It is the same chaining the disband path is suppressed for; only the
-  trigger differs. The invariant is now enforced rather than assumed — see
-  Behavior contract › Chain suppression.
+  trigger differs. Suppression now collapses the chain **on the entrypoints whose
+  jobs are enqueued atomically**; the user-side `members/remove` (`kicked`) path
+  enqueues one transaction per uid and is still exposed. See Behavior contract ›
+  Chain suppression for the per-entrypoint table and the measured counts.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
   `memberRemove` and `modules/bot_api/groups.go` reach the same
   `SendGroupMemberBeRemove`, so remaining members see nothing there either. Same
   defect, different entry points, **not tracked in #797** — wants its own task.
 - **Coalescing several removals into one message per group.** Would require the
-  outbox to carry batch identity; not needed once the notice is handover-only.
+  outbox to carry batch identity. Handover-only firing removes most of the need,
+  but not all of it: batch identity is also one of the candidate fixes for the
+  `kicked`-path chain above, so this may come back with that work.
 - **Everything already deferred to #797** — the IM-unsubscribe leak, the residual
   ABBA and its missing index, the rejoin window.
 - **A bot as successor.** `querySecondOldestNonBotMemberTx` excludes only the
