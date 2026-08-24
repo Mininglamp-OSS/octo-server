@@ -140,9 +140,16 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 	err = tx.SelectBySql(
 		"SELECT id, space_id, uid, operator_uid, reason, attempts "+
 			"FROM space_member_removal_cleanup "+
-			"WHERE status=? AND next_attempt_at<=? AND (lease_until IS NULL OR lease_until<=?) "+
-			"ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
-		removalCleanupPending, now, now,
+			"WHERE status=? AND attempts<? AND next_attempt_at<=? "+
+			"AND (lease_until IS NULL OR lease_until<=?) "+
+			// 刻意不写 ORDER BY id。加上它，优化器会认为「按主键顺序扫、取第一条命中」
+			// 更划算，于是放弃 idx_..._pending 改走 PRIMARY —— 实测 EXPLAIN 从
+			// type=range/key=idx_pending 变成 type=index/key=PRIMARY。abandoned 行永不
+			// 删除且集中在低 id 段，扫描长度于是随部署年龄单调增长，每次认领都要
+			// 从 id=1 爬过所有终态行才够到第一条待办。
+			// FIFO 本来也不是保证：SKIP LOCKED 已经让多副本的实际取件顺序不确定。
+			"LIMIT 1 FOR UPDATE SKIP LOCKED",
+		removalCleanupPending, removalCleanupMaxAttempts, now, now,
 	).LoadOne(&job)
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
@@ -151,6 +158,20 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 		return nil, fmt.Errorf("space: select removal cleanup job: %w", err)
 	}
 
+	// attempts<removalCleanupMaxAttempts 这个条件在认领处、而不是只在释放处。
+	//
+	// 释放路径（releaseCleanupJob）只覆盖「作业跑完并返回了错误」。进程被 SIGKILL /
+	// OOM / pod 驱逐打死时谁也走不到那里，行就停在 pending 上，attempts 也不再变。
+	// 认领处若不设防，租约一到期它又被认领、再打死一次进程，如此无限。危害不止于
+	// 这一条：每被认领一次，它就占掉本轮批次的一个名额（processMemberRemovalCleanups
+	// 单轮上限 removalCleanupBatchSize），本该在同一轮里被处理的健康工单就被挤了出去。
+	//
+	// 这个论证**不依赖**取件顺序——上面那条 SELECT 已经刻意去掉了 ORDER BY（原因见
+	// 那里的注释）。名额被白占与它排在第几位无关，所以这道设防照样必要。
+	//
+	// 卡在认领处之后，这条行再也不会被取走，于是需要 abandonExhaustedMemberRemovalCleanups
+	// 把它推到终态——否则它会变成一条永远 pending、永远不动、也永远没人看见的僵尸。
+	//
 	// attempts 在**认领时**自增，而不是等到失败释放时。
 	//
 	// 释放路径只覆盖「作业跑完并返回了错误」。进程在作业中途被杀（OOM、Pod 驱逐）
@@ -175,6 +196,73 @@ func (d *DB) claimMemberRemovalCleanup(owner string, now time.Time) (*memberRemo
 	// 「已经试到第几次」判断不必再去猜偏移量。
 	job.Attempts++
 	return &job, nil
+}
+
+// abandonExhaustedMemberRemovalCleanups 把「预算已耗尽、租约已过期、却还停在 pending」
+// 的工单推到 abandoned，返回本次推动的行数。
+//
+// 这是 releaseCleanupJob 那条同名转换的**进程外**补集。那一条只在作业跑完并返回错误时
+// 触发；进程被硬杀时没有任何代码有机会执行，行就留在 pending 上。配合认领处新加的
+// attempts 上限，这种行不会再被认领——没有这条扫描，它就永远停在那里，既不重试也不
+// 报错，运维看到的是一条「pending 很久」的记录而不是一条失败。
+//
+// 租约条件不能省，而且要留一整个租约周期的宽限。
+//
+// 一条正在跑最后一次尝试的工单，attempts 同样等于上限，但租约还在执行者手上；只按
+// attempts 判死会抢先写终态。仅仅要求「租约已过期」还不够：本文件开头就写了群级联
+// 「几十个群就能跑上几分钟」，跑过 10 分钟租约是**预期内**的。那种情况下作业还在
+// 正常推进、随后会成功，却会被扫描判成 abandoned 并触发「需人工介入」告警，而它
+// 自己的 finish 因为 status 已变而落空、只留下一句误导的「租约已易主」。
+// 所以门槛是 lease_until <= now - removalCleanupLease：进程真死了才够得着。
+//
+// 同时要求 lease_until IS NOT NULL：从没被认领过的行不该被扫描碰。
+//
+// 不复用 finishMemberRemovalCleanup：那个要求调用方持有租约，而这里的前提恰恰是
+// 租约的主人已经不存在了。
+//
+// 与认领互斥、因此不需要额外加锁：认领要求 attempts<max，本扫描要求 attempts>=max，
+// 两个谓词不相交，同一行不可能同时被两边选中。单条 UPDATE 自身原子，够了。
+func (d *DB) abandonExhaustedMemberRemovalCleanups(now time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	// 先只读地选出 id，再按主键更新。
+	//
+	// 不能写成单条带 WHERE 的 UPDATE：attempts 不在任何索引里，可选的访问路径只有
+	// status，于是 REPEATABLE READ 下这条 UPDATE 会对**整个 status=0 范围**加
+	// next-key 锁 —— LIMIT 限制的是「改了几行」，不是「锁了几行」。实测：正是这条
+	// 语句会让另一个连接里那条全新、不冲突的入队 INSERT 报
+	// ERROR 1205 Lock wait timeout。而入队就发生在移除事务内部、且是 fail-closed 的，
+	// 结果就是队列一积压、踢人就随机失败。
+	// SELECT 是非锁定读，UPDATE 只按主键锁点名的那几行，两边都不再扫范围。
+	var ids []uint64
+	_, err := d.session.SelectBySql(
+		"SELECT id FROM space_member_removal_cleanup "+
+			"WHERE status=? AND attempts>=? AND lease_until IS NOT NULL AND lease_until<=? "+
+			"LIMIT ?",
+		removalCleanupPending, removalCleanupMaxAttempts, now.Add(-removalCleanupLease), limit,
+	).Load(&ids)
+	if err != nil {
+		return 0, fmt.Errorf("space: select exhausted removal cleanups: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_member_removal_cleanup "+
+			"SET status=?, finished_at=?, lease_owner='', lease_until=NULL, last_error=? "+
+			"WHERE id IN ? AND status=?",
+		removalCleanupAbandoned, now, "sweep: retries exhausted",
+		ids, removalCleanupPending,
+	).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("space: sweep exhausted removal cleanups: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("space: read removal cleanup sweep result: %w", err)
+	}
+	return affected, nil
 }
 
 // finishMemberRemovalCleanup 把工单置为终态（done / abandoned），要求仍持有租约。

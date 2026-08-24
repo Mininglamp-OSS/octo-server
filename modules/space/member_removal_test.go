@@ -3,6 +3,7 @@ package space
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -553,7 +556,7 @@ func TestTruncateCleanupErrorKeepsValidUTF8(t *testing.T) {
 
 // TestCleanupWorkerContainsStepPanic panic 必须在单条工单这一层兜住并走正常的
 // 失败路径，否则 attempts 不增、状态留 pending，工单被反复认领反复 panic，
-// 永远到不了 abandoned，还会按 ORDER BY id 卡在队首把后面的工单饿死。
+// 永远到不了 abandoned，还会一轮一轮白占批次名额，把同批的健康工单挤出去。
 func TestCleanupWorkerContainsStepPanic(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -948,4 +951,378 @@ func TestCleanupErrorNamesAllFailedSteps(t *testing.T) {
 	require.Len(t, jobs, 1)
 	assert.Contains(t, jobs[0].LastError, "(+1)",
 		"多个步骤失败时要在 last_error 里标出还有几个，否则只会去查第一个")
+}
+
+// TestCleanupRunsWhenSpaceDisbandedDespiteActiveMemberRow 是本次修复的核心回归。
+//
+// worker 的外层门以前用 queryMember，只看 space_member.status=1，完全不问 Space
+// 本身死没死。join-vs-disband 竞态会造出正是这种状态：Space 已经 status=0，成员行
+// 却被一次并发 join 写回 status=1。外层门看见 status=1 就把工单当成「人已重新加入」
+// 直接作废（done/skipped_rejoined），于是这个人的 group_member 行和 IM 群订阅
+// 永远留在一个已解散的空间里，而且再没有任何工单会回来看一眼。
+//
+// 内层的级联步骤本来判得对（它用 CheckMembership，要求 space.status=1，解散场景
+// 判定为「不是成员」→ 照常清理），但外层门先跑、先短路，内层那个精心挑过的谓词
+// 根本没机会执行。
+func TestCleanupRunsWhenSpaceDisbandedDespiteActiveMemberRow(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-disband-orphan"
+	seedMember(t, f, spaceID, "owner-orphan", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "orphan", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "orphan", 1, "owner-orphan", MemberRemoveReasonKicked)
+
+	// 造出 join-vs-disband 孤儿：成员行被并发 join 写回 status=1，Space 已解散。
+	require.NoError(t, f.db.reactivateMember(spaceID, "orphan", 0))
+	_, err = testCtx.DB().Exec(
+		"UPDATE space SET status=? WHERE space_id=?", SpaceStatusDisbanded, spaceID)
+	require.NoError(t, err)
+
+	called := 0
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "must-run",
+		fn: func(*config.Context, MemberRemoval) error {
+			called++
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	assert.Equal(t, 1, called, "Space 已解散，成员行只是 join-vs-disband 孤儿，清理必须照常执行")
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupDone, jobs[0].Status)
+	assert.NotEqual(t, "skipped_rejoined", jobs[0].LastError,
+		"外层门不得把已解散空间里的孤儿成员行当成『已重新加入』")
+}
+
+// TestCleanupSkipsMemberInBannedSpace 封禁不是解散：成员资格仍然有效，
+// Manager.addMembers 也仍允许往封禁空间加人（只挡 SpaceStatusDisbanded）。
+// 所以在职成员绝不能因为空间被封禁就被清理管线拆出所有群。
+func TestCleanupSkipsMemberInBannedSpace(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "wk-banned"
+	seedMember(t, f, spaceID, "owner-banned", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "banned-member", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "banned-member", 1, "owner-banned", MemberRemoveReasonKicked)
+
+	// 人被加了回来，随后整个 Space 被封禁。
+	require.NoError(t, f.db.reactivateMember(spaceID, "banned-member", 0))
+	_, err = testCtx.DB().Exec(
+		"UPDATE space SET status=? WHERE space_id=?", SpaceStatusBanned, spaceID)
+	require.NoError(t, err)
+
+	called := 0
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "must-not-run",
+		fn: func(*config.Context, MemberRemoval) error {
+			called++
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	assert.Zero(t, called, "空间只是被封禁、人还是成员，不得触发任何清理步骤")
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, "skipped_rejoined", jobs[0].LastError)
+}
+
+// TestCheckMembershipForCleanupMatrix 直接把谓词的真值表钉死。
+//
+// 上面那两条走 worker 的用例只覆盖「成员行活跃」这一行；这里补齐另一行，
+// 并把三种 Space 状态一次说清楚：判定只由「Space 是否已解散」和「成员行是否
+// 活跃」两件事决定，封禁与正常同档。
+func TestCheckMembershipForCleanupMatrix(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name        string
+		spaceStatus int
+		memberAlive bool
+		wantHeld    bool // CheckMembershipForCleanup：true = 席位仍在 → 清理必须跳过
+		wantAuth    bool // CheckMembership：true = 允许访问该 Space
+	}{
+		{"正常空间/活跃成员：人还在，跳过清理", SpaceStatusNormal, true, true, true},
+		{"正常空间/已移除：正常的被踢路径，清理执行", SpaceStatusNormal, false, false, false},
+		// ↓ 这一格是两个谓词唯一分歧之处，也是整条修复的核心。
+		{"封禁空间/活跃成员：清理跳过，但鉴权必须拒绝", SpaceStatusBanned, true, true, false},
+		{"封禁空间/已移除：照常清理", SpaceStatusBanned, false, false, false},
+		{"解散空间/活跃成员：join-vs-disband 孤儿，必须清理", SpaceStatusDisbanded, true, false, false},
+		{"解散空间/已移除：照常清理", SpaceStatusDisbanded, false, false, false},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spaceID := fmt.Sprintf("matrix-%d", i)
+			uid := fmt.Sprintf("matrix-u-%d", i)
+			memberStatus := 0
+			if tc.memberAlive {
+				memberStatus = 1
+			}
+			require.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+				SpaceId: spaceID, Name: spaceID, Creator: uid,
+				Status: tc.spaceStatus, MaxUsers: 100,
+			}))
+			require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+				SpaceId: spaceID, UID: uid, Role: 0, Status: memberStatus,
+			}))
+
+			held, err := spacepkg.CheckMembershipForCleanup(f.ctx.DB(), spaceID, uid)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantHeld, held)
+
+			// 同一份数据上再问一次鉴权谓词。两者必须在「封禁 + 活跃成员」
+			// 这一格上分道扬镳：清理谓词说「席位还在，别清」，鉴权谓词说
+			// 「不许访问」。这就是 #797 原方案要合并、而合并会开安全口子的那一格。
+			auth, err := spacepkg.CheckMembership(f.ctx.DB(), spaceID, uid)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAuth, auth,
+				"CheckMembership 是 SpaceMiddleware 的鉴权谓词，只有正常空间的活跃成员才能通过")
+		})
+	}
+
+	// Space 行整个不存在（而非 status=0）也必须判成「席位已失效」：
+	// INNER JOIN 不命中，方向是 fail-safe——清理照常执行，而不是静默作废工单。
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: "matrix-no-space", UID: "matrix-orphan", Role: 0, Status: 1,
+	}))
+	held, err := spacepkg.CheckMembershipForCleanup(f.ctx.DB(), "matrix-no-space", "matrix-orphan")
+	require.NoError(t, err)
+	assert.False(t, held, "Space 行不存在时必须 fail-safe：判成席位已失效，清理照常跑")
+}
+
+// seedExhaustedJob 把某个 Space 的工单直接顶到指定 attempts，并按需清掉租约，
+// 模拟「进程在作业跑到一半被 SIGKILL / OOM 干掉」后留下的行：
+// attempts 已在认领时自增过，但没有任何人走到 releaseCleanupJob 去写终态。
+func seedExhaustedJob(t *testing.T, spaceID string, attempts uint32, leaseUntil interface{}) {
+	t.Helper()
+	_, err := testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET attempts=?, lease_owner=?, lease_until=? WHERE space_id=?",
+		attempts, "dead-worker", leaseUntil, spaceID)
+	require.NoError(t, err)
+}
+
+// TestClaimSkipsJobAtAttemptsCeiling 认领必须自己卡住重试预算。
+//
+// abandoned 的转换今天只在 releaseCleanupJob 里发生，而那条路径只覆盖「作业跑完
+// 并返回了错误」。进程被 SIGKILL / OOM 打死时谁也没走到那里：租约到期后同一行
+// 又被认领，attempts 再 +1，如此无限。认领处不设防，abandoned 就永远到不了。
+func TestClaimSkipsJobAtAttemptsCeiling(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "claim-ceiling"
+	seedMember(t, f, spaceID, "owner-c1", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "v-c1", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "v-c1", 1, "owner-c1", MemberRemoveReasonKicked)
+
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts, nil)
+
+	job, err := f.db.claimMemberRemovalCleanup("worker-x", time.Now().UTC())
+	require.NoError(t, err)
+	assert.Nil(t, job, "attempts 已达上限的工单不得再被认领")
+}
+
+// TestClaimAllowsExactlyMaxAttempts 上限的边界：预算是 removalCleanupMaxAttempts 次
+// **真实尝试**，不能少一次也不能多一次。attempts 在认领时自增，所以差一个偏移量
+// 就会悄悄少跑一轮或多跑一轮。
+func TestClaimAllowsExactlyMaxAttempts(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "claim-boundary"
+	seedMember(t, f, spaceID, "owner-c2", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "v-c2", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "v-c2", 1, "owner-c2", MemberRemoveReasonKicked)
+
+	// 差一次到顶：这是第 max 次认领，必须放行。
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts-1, nil)
+	job, err := f.db.claimMemberRemovalCleanup("worker-y", time.Now().UTC())
+	require.NoError(t, err)
+	require.NotNil(t, job, "还差一次到上限时必须仍可认领")
+	assert.Equal(t, removalCleanupMaxAttempts, job.Attempts, "认领后 attempts 应恰好等于上限")
+
+	// 现在到顶了，下一次不得放行。
+	_, err = testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET lease_until=NULL WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+	none, err := f.db.claimMemberRemovalCleanup("worker-z", time.Now().UTC())
+	require.NoError(t, err)
+	assert.Nil(t, none, "到达上限后不得再认领")
+}
+
+// TestExhaustedJobNeitherRunsNorBlocksOthers 一条打死进程的工单若永远可认领，每一轮
+// 都会白占一个批次名额，把同批本该被处理的健康工单挤出去。
+//
+// 这条断言的是**批次层**的性质：同一轮 processMemberRemovalCleanups 里，耗尽预算的
+// 工单不执行，且不妨碍健康工单执行。它与 TestClaimSkipsJobAtAttemptsCeiling 不重复——
+// 那条只看单次 claim 返回 nil，这条看整轮调度的结果。
+//
+// 早先这条叫 TestExhaustedJobDoesNotHeadOfLineQueue，前提是认领按 `ORDER BY id` 取
+// 队首、毒丸必然排在最前。那个排序已在本次改动中去掉（见 claimMemberRemovalCleanup），
+// 于是"队首"不再存在，名字也就名不副实了。性质本身仍然成立，改名以对齐它真正证明的东西。
+func TestExhaustedJobNeitherRunsNorBlocksOthers(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const poisonSpace, healthySpace = "hol-poison", "hol-healthy"
+	seedMember(t, f, poisonSpace, "owner-h1", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: poisonSpace, UID: "v-h1", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, poisonSpace, "v-h1", 1, "owner-h1", MemberRemoveReasonKicked)
+	seedExhaustedJob(t, poisonSpace, removalCleanupMaxAttempts, nil)
+
+	// 健康工单晚于毒丸入队（id 更大）。认领已无 ORDER BY，取件顺序不确定，
+	// 所以这条断言的是"同一轮里健康工单一定被处理到"，而不是"排在毒丸之后仍被处理到"。
+	seedMember(t, f, healthySpace, "owner-h2", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: healthySpace, UID: "v-h2", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, healthySpace, "v-h2", 1, "owner-h2", MemberRemoveReasonKicked)
+
+	var seen []string
+	restore := swapCleanupStepsForTest([]namedCleanupStep{{
+		name: "spy",
+		fn: func(_ *config.Context, r MemberRemoval) error {
+			seen = append(seen, r.SpaceID)
+			return nil
+		},
+	}})
+	defer restore()
+
+	f.processMemberRemovalCleanups()
+
+	assert.Contains(t, seen, healthySpace, "耗尽预算的工单不得挤掉同批的健康工单")
+	assert.NotContains(t, seen, poisonSpace, "已耗尽预算的工单不得再执行")
+}
+
+// TestSweepAbandonsExhaustedJobLeftByHardKill 进程被硬杀后没人写终态，
+// 扫描必须把它推到 abandoned，让终态真的可达、可查、可告警。
+func TestSweepAbandonsExhaustedJobLeftByHardKill(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sweep-dead"
+	seedMember(t, f, spaceID, "owner-s1", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "v-s1", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "v-s1", 1, "owner-s1", MemberRemoveReasonKicked)
+
+	// 租约早已过期，attempts 到顶，状态还停在 pending：典型的 SIGKILL 残留。
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts,
+		time.Now().UTC().Add(-time.Hour))
+
+	f.sweepExhaustedMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupAbandoned, jobs[0].Status, "预算耗尽且租约已过期的工单必须被扫成 abandoned")
+	assert.Equal(t, removalCleanupMaxAttempts, jobs[0].Attempts)
+	assert.Contains(t, jobs[0].LastError, "retries exhausted")
+	assert.Empty(t, jobs[0].LeaseOwner, "终态必须释放租约")
+}
+
+// TestSweepLeavesRecentlyExpiredLeaseAlone 租约刚过期还不够判死。
+//
+// 群级联「几十个群就能跑上几分钟」，跑过 10 分钟租约是**预期内**的，不是进程死了。
+// 若扫描只要求「租约已过期」，一条正在正常推进、随后会成功的作业就会被判成
+// abandoned 并触发「需人工介入」告警；而它自己的 finish 因为 status 已变而落空，
+// 只留下一句误导的「租约已易主」——完成的工作被永久记成放弃。
+// 所以门槛要留一整个租约周期的宽限。
+func TestSweepLeavesRecentlyExpiredLeaseAlone(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sweep-grace"
+	seedMember(t, f, spaceID, "owner-s3", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "v-s3", Role: 0, Status: 1,
+	}))
+	mustRemoveMember(t, f, spaceID, "v-s3", 1, "owner-s3", MemberRemoveReasonKicked)
+
+	// 租约刚过期一分钟：作业很可能还在跑（大空间的级联本来就会超租约）。
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts,
+		time.Now().UTC().Add(-time.Minute))
+
+	f.sweepExhaustedMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status,
+		"租约刚过期不等于进程死了，必须留出一整个租约周期的宽限再判死")
+}
+
+// TestSweepLeavesLiveLeaseAlone 关键边界：一条正在跑最后一次尝试的工单，
+// attempts 已经到顶但租约还在手上。扫描若只看 attempts 就会把它判死，
+// 而它可能下一秒就成功了——终态被抢写，执行中的 worker 再写就落空。
+func TestSweepLeavesLiveLeaseAlone(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sweep-live"
+	seedMember(t, f, spaceID, "owner-s2", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceID, UID: "v-s2", Role: 0, Status: 1}))
+	mustRemoveMember(t, f, spaceID, "v-s2", 1, "owner-s2", MemberRemoveReasonKicked)
+
+	// 租约仍然有效：有人正在跑这一次。
+	seedExhaustedJob(t, spaceID, removalCleanupMaxAttempts,
+		time.Now().UTC().Add(removalCleanupLease))
+
+	f.sweepExhaustedMemberRemovalCleanups()
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, removalCleanupPending, jobs[0].Status,
+		"租约仍在手上说明作业正在执行，扫描不得抢先判死")
+}
+
+// TestMemberRemovalCleanupMetricsReflectQueue 队列指标必须真的反映库里的状态。
+//
+// 这一条和上面两条是一套：认领处卡上限 + 扫描推终态，让失败终于会终结；但终结之后
+// 依然没人知道——abandoned 没有任何自动重驱动，被移除的人会一直留在群里。只做前两件
+// 等于把「无限重试的无声」换成「终态的无声」。
+func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const pendingSpace, deadSpace = "metric-pending", "metric-dead"
+	for _, sp := range []string{pendingSpace, deadSpace} {
+		seedMember(t, f, sp, "owner-"+sp, 2)
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: sp, UID: "v-" + sp, Role: 0, Status: 1,
+		}))
+		mustRemoveMember(t, f, sp, "v-"+sp, 1, "owner-"+sp, MemberRemoveReasonKicked)
+	}
+	// 一条已耗尽、租约过期 → 扫描应把它推成 abandoned；另一条保持 pending。
+	seedExhaustedJob(t, deadSpace, removalCleanupMaxAttempts, time.Now().UTC().Add(-time.Hour))
+	// 把 pending 那条的 created_at 往前挪，好让「最老待处理年龄」有个可断言的下界。
+	_, err = testCtx.DB().Exec(
+		"UPDATE space_member_removal_cleanup SET created_at=? WHERE space_id=?",
+		time.Now().UTC().Add(-10*time.Minute), pendingSpace)
+	require.NoError(t, err)
+
+	f.sweepExhaustedMemberRemovalCleanups()
+
+	stats, err := f.db.queryMemberRemovalCleanupStats()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats.Pending, "只剩一条待处理")
+	assert.Equal(t, int64(1), stats.Abandoned, "耗尽的那条应已被扫成 abandoned")
+	assert.GreaterOrEqual(t, stats.OldestPendingAgeSec, int64(600),
+		"最老待处理年龄要反映真实积压——它是预算耗尽之前唯一能看见的先行信号")
+
+	// 指标现在是独立的稀疏调度（那条查询是全表聚合），不再挂在扫描那一轮上，
+	// 所以这里显式刷一次。
+	f.refreshMemberRemovalCleanupMetrics()
+	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupPendingGauge))
+	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupAbandonedGauge))
+	assert.GreaterOrEqual(t, promtestutil.ToFloat64(removalCleanupOldestPendingGauge), float64(600))
 }

@@ -1,6 +1,7 @@
 package space
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -106,12 +107,34 @@ func snapshotCleanupSteps() []namedCleanupStep {
 // Redis key `space:member:{spaceID}:{uid}`，TTL 60s。不清它，被移除的人还能带着
 // 这个 space_id 正常访问接口最长 60 秒。这是隔离边界，必须在请求内同步完成，
 // 不能丢给后台。
+//
+// 失败必须记日志。这里原先是静默的：DEL 出错时正向条目会活满 TTL，
+// SpaceMiddleware 继续放行已被移除的人，而 handler 早已提交并返回 200——
+// 一次真实的隔离失效在系统里不留任何痕迹。
+//
+// 但两种失败要分开报，因为它们的运维含义相反（见 ErrMembershipCacheNegativeFallback）：
+// 否定缓存兜底成功时边界当场就生效了，按「可能仍可访问」报出去是**报反了**，而这
+// 恰恰是更常见的一种。报反的告警比不报更糟——它把人引向一次并没有发生的越权。
 func (s *Space) invalidateMembershipCache(spaceID, uid string) {
 	if spaceID == "" || uid == "" {
 		return
 	}
-	if conn := s.ctx.GetRedisConn(); conn != nil {
-		spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
+	conn := s.ctx.GetRedisConn()
+	if conn == nil {
+		// 没有 Redis 时中间件也读不到缓存，Get 必然未命中并回落到查库，方向是安全的。
+		return
+	}
+	err := spacepkg.InvalidateMembershipCache(conn, spaceID, uid)
+	switch {
+	case err == nil:
+	case errors.Is(err, spacepkg.ErrMembershipCacheNegativeFallback):
+		// 正向条目没删掉，但已被否定缓存盖住，中间件当场就拒。边界守住了，
+		// 记 Warn 让它可查，不要当越权报。
+		s.Warn("清理成员鉴权缓存：DEL 失败，已写否定缓存兜底，隔离仍然生效",
+			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.Error(err))
+	default:
+		s.Error("清理成员鉴权缓存失败：被移除成员可能在缓存 TTL 内仍可访问该 Space",
+			zap.String("spaceId", spaceID), zap.String("uid", uid), zap.Error(err))
 	}
 }
 
@@ -254,6 +277,10 @@ func (s *Space) startMemberRemovalCleanupWorker() {
 	removalCleanupWorkerOnce.Do(func() {
 		s.ctx.Schedule(10*time.Second, s.processMemberRemovalCleanups)
 		s.ctx.Schedule(time.Hour, s.purgeFinishedMemberRemovalCleanups)
+		s.ctx.Schedule(removalSweepInterval, s.sweepExhaustedMemberRemovalCleanups)
+		// 指标单独一个更稀疏的节奏：那条查询是全表聚合，而这几个 gauge 是给
+		// 分钟级以上的趋势看的，没有必要每分钟扫一次表。
+		s.ctx.Schedule(removalMetricsInterval, s.refreshMemberRemovalCleanupMetrics)
 	})
 }
 
@@ -270,6 +297,37 @@ func (s *Space) purgeFinishedMemberRemovalCleanups() {
 	}
 	if deleted > 0 {
 		s.Info("清理过期成员移除工单", zap.Int64("deleted", deleted))
+	}
+}
+
+// removalSweepInterval / removalSweepLimit 控制耗尽工单扫描的节奏与单轮上限。
+//
+// 一分钟一轮就够：这条扫描处理的是「进程已经被打死」的残留，本来就不是热路径，
+// 而单条工单从耗尽到被看见晚一分钟没有任何代价——它已经不会再被认领了。
+// 单轮上限防的是一次大范围故障（IM 或 DB 挂过 70 分钟以上）之后，成千条工单同时
+// 耗尽预算，一条 UPDATE 就锁住整张表。
+const (
+	removalSweepInterval = time.Minute
+	removalSweepLimit    = 500
+	// removalMetricsInterval 指标采集节奏。比扫描稀疏，因为那条查询是全表聚合
+	// （MIN(created_at) 无索引可用），而 gauge 服务的是趋势判断，不是秒级响应。
+	removalMetricsInterval = 5 * time.Minute
+)
+
+// sweepExhaustedMemberRemovalCleanups 把重试预算耗尽、租约也已过期的工单推到 abandoned。
+//
+// 日志级别是 Error 而不是 Warn，而且刻意每轮都打：abandoned 没有任何自动重驱动，
+// 被移除的人会一直留在该 Space 的群里和 IM 群订阅里，直到有人介入。这是本条唯一
+// 的出口信号，在 /metrics 端点落地之前它就是告警面。
+func (s *Space) sweepExhaustedMemberRemovalCleanups() {
+	abandoned, err := s.db.abandonExhaustedMemberRemovalCleanups(time.Now().UTC(), removalSweepLimit)
+	if err != nil {
+		s.Warn("扫描重试耗尽的成员移除工单失败", zap.Error(err))
+		return
+	}
+	if abandoned > 0 {
+		s.Error("成员移除清理工单重试耗尽，已置为 abandoned；无自动重驱动，需人工介入",
+			zap.Int64("abandoned", abandoned))
 	}
 }
 
@@ -317,7 +375,8 @@ func (s *Space) processMemberRemovalCleanups() {
 // 既没有 last_error 也没有退避，只能干等 removalCleanupLease（10 分钟）到期才
 // 重新可认领；然后被再次认领、再次 panic，如此循环。attempts 虽然在认领时就已
 // 自增（见 claimMemberRemovalCleanup），所以最终仍会走到 abandoned，但每一轮都
-// 要白烧一个租约周期，而它按 `ORDER BY id` 排在队首，整批后续工单一起陪跑。
+// 要白烧一个租约周期；而每一次重新认领又白占一个批次名额，把同批本该被处理的
+// 健康工单挤出去。
 // 在这一层 recover 并显式 release，才能立刻记下原因、按退避重排。
 func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner string) {
 	defer func() {
@@ -329,14 +388,21 @@ func (s *Space) runMemberRemovalCleanupJob(job *memberRemovalCleanupJob, owner s
 		}
 	}()
 	// 先对齐当前真实成员身份再动手。工单可能在退避期间变陈旧：成员被移除后又重新
-	// 加入，这时把他的群拆掉才是真正的故障。活跃成员 → 工单直接作废。
-	member, err := s.db.queryMember(job.SpaceID, job.UID)
+	// 加入，这时把他的群拆掉才是真正的故障。仍持有席位 → 工单直接作废。
+	//
+	// 谓词必须与级联步骤里那道门完全一致（CheckMembershipForCleanup），否则外层门
+	// 先跑、先短路，内层那个谓词根本没机会执行。这里以前用 queryMember，只看
+	// space_member.status=1、不问 Space 死没死：join-vs-disband 竞态造出的孤儿行
+	//（Space 已 status=0，成员行被并发 join 写回 status=1）会被误判成「人已重新
+	// 加入」，工单当场作废，那个人的 group_member 行和 IM 群订阅就永远留在一个
+	// 已解散的空间里，再没有任何东西会回来看一眼。
+	stillMember, err := spacepkg.CheckMembershipForCleanup(s.ctx.DB(), job.SpaceID, job.UID)
 	if err != nil {
 		s.releaseCleanupJob(job, owner, "membership_recheck_failed", err)
 		return
 	}
-	if member != nil {
-		s.Info("被移除成员已重新加入，跳过会话面清理",
+	if stillMember {
+		s.Info("被移除成员仍持有 Space 席位，跳过会话面清理",
 			zap.String("spaceId", job.SpaceID), zap.String("uid", job.UID))
 		s.finishCleanupJob(job, owner, removalCleanupDone, "skipped_rejoined")
 		return

@@ -1492,3 +1492,53 @@ change-log convention (§7). Newest first.
 
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
+
+## 2026-08-22 (cleanup-membership-predicate)
+
+- **Fixed** — The two removal-cleanup rejoin guards were asking one question
+  with two different predicates: a disbanded Space silently voided cleanup
+  (orphan `space_member` row), a banned Space wrongly triggered it. Both now use
+  `CheckMembershipForCleanup` (`sm.status=1 AND s.status <> 0`).
+  `CheckMembership` is deliberately **unchanged** — #797's original proposal to
+  relax it would have admitted banned Spaces across all **36** of its non-test
+  call sites, `SpaceMiddleware` — the primary auth gate — included. A behavioural truth table now pins both predicates' answers
+  across `{disbanded, normal, banned} x {active, removed}`, including the one
+  cell where they must disagree. (Corrected 2026-08-23: this entry originally
+  claimed a *source guard*; that guard was deleted on the same branch for
+  passing the regression it was named for.) Closes two #797 items.
+  See [journal](journal/shared/cleanup-membership-predicate.md).
+
+## 2026-08-22 (cleanup-queue-durability)
+
+- **Fixed** — Two silent-failure items from #797. The cleanup queue's retry budget
+  was only enforced in `releaseCleanupJob`, which a `SIGKILL` never reaches, so a
+  process-killing job was re-claimed forever and head-of-lined the whole queue;
+  the budget now gates the claim itself and a 1-minute sweep pushes exhausted rows
+  to `abandoned`, with three gauges so the new terminal state is not just as silent
+  as the old loop. Separately, a failed membership-cache `DEL` now returns, is
+  logged, and is overwritten with a negative entry — a total Redis outage was
+  already safe, but a DEL-only failure let a removed member keep passing
+  `SpaceMiddleware` for 60s with nothing logged.
+  See [journal](journal/shared/cleanup-queue-durability.md).
+
+## 2026-08-23 (space-member-removal follow-ups · wrap-up)
+
+- **Reverted** — The durable IM-unsubscribe outbox (`eb74529`) was implemented and
+  then withdrawn (`78e46d3`) after five-lens adversarial review. Three reviewers
+  independently found it reintroduced the exact leak it targets (an `abandoned` row
+  became a permanent tombstone that silently swallowed every later enqueue while the
+  log claimed "queued for retry"), and it added a new one (firing without
+  re-validating membership turns blacklist→un-blacklist into a permanent cutoff of an
+  active, visible member). The problem statement and the measured broker evidence
+  stand; the design does not. Corrected requirements are written into
+  `.octospec/tasks/im-pending-outbox/brief.md`.
+- **Fixed** — Two guard tests that could not fail for what they existed to check
+  (mutation-proven, then re-verified with the reviewers' own mutations), and a sweep
+  that took next-key locks across the whole pending range — reproduced as
+  `ERROR 1205` on a brand-new non-conflicting insert, which is the removal-cleanup
+  enqueue inside the removal transaction. See
+  [journal](journal/shared/cleanup-queue-durability.md).
+- **Learning** — `learnings/pending/mutation-testing-must-be-adversarial.md`: an
+  author-chosen mutation only proves the test catches what the author already thought
+  of. The same guard was green on the real security regression and red on whitespace.
+
