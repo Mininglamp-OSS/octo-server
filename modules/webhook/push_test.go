@@ -74,15 +74,13 @@ func TestMIPush(t *testing.T) {
 }
 
 func TestOPPOPush(t *testing.T) {
-	appID := os.Getenv("OPPO_APP_ID")
 	appKey := os.Getenv("OPPO_APP_KEY")
-	appSecret := os.Getenv("OPPO_APP_SECRET")
 	masterSecret := os.Getenv("OPPO_MASTER_SECRET")
 	deviceToken := os.Getenv("OPPO_DEVICE_TOKEN")
-	if appID == "" || appKey == "" || appSecret == "" || masterSecret == "" || deviceToken == "" {
-		t.Skip("OPPO push credentials not configured (set OPPO_APP_ID, OPPO_APP_KEY, OPPO_APP_SECRET, OPPO_MASTER_SECRET, OPPO_DEVICE_TOKEN)")
+	if appKey == "" || masterSecret == "" || deviceToken == "" {
+		t.Skip("OPPO push credentials not configured (set OPPO_APP_KEY, OPPO_MASTER_SECRET, OPPO_DEVICE_TOKEN)")
 	}
-	oppo := NewOPPOPush(appID, appKey, appSecret, masterSecret, &config.Context{})
+	oppo := NewOPPOPush("", appKey, "", masterSecret, nil)
 	payloadInfo := &PayloadInfo{
 		Title:   "标题",
 		Content: "内容",

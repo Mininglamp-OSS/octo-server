@@ -305,6 +305,7 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		payload.channelID,
 		strconv.Itoa(int(payload.channelType)),
 		strconv.FormatUint(uint64(payload.messageSeq), 10),
+		payload.notifyID,
 	}, "\x00")
 	dedupeDigest := sha256.Sum256([]byte(dedupeSource))
 
