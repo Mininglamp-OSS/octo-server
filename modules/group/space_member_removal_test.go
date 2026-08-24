@@ -318,6 +318,38 @@ func payloadExtraUIDAt(payloads []map[string]interface{}, fragment string, idx i
 	return ""
 }
 
+// payloadExtraNameAt 取某条消息 extra 里第 idx 个元素的 **name**。
+// 位置有语义：{0}=离开者、{1}=新群主。只断言 uid 的位置挡不住「uid 对但 name 传反」——
+// 三端客户端把 extra[i].name 渲染进 {i}，name 传反就播出一条完全说反的持久化系统消息
+// （PR #804 round-7 review P2-7）。
+func payloadExtraNameAt(payloads []map[string]interface{}, fragment string, idx int) string {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(inner["content"]), fragment) {
+			continue
+		}
+		extras, _ := inner["extra"].([]interface{})
+		if idx >= len(extras) {
+			return ""
+		}
+		if m, ok := extras[idx].(map[string]interface{}); ok {
+			return fmt.Sprint(m["name"])
+		}
+	}
+	return ""
+}
+
 func payloadExtraHasName(payloads []map[string]interface{}, fragment, name string) bool {
 	return payloadExtraField(payloads, fragment, "name", name)
 }
@@ -657,6 +689,12 @@ func TestGroupCascadeCreatorHandoverIsAnnounced(t *testing.T) {
 		"extra[0] 必须是离开的老群主")
 	assert.Equal(t, successor, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 1),
 		"extra[1] 必须是继任者")
+	// name 也必须按位置对上：只钉 uid 挡不住「name 传反」——三端把 extra[i].name
+	// 渲染进 {i}，传反就播出一条说反的持久化系统消息（P2-7）。
+	assert.Equal(t, "老群主", payloadExtraNameAt(stub.sentPayloads(), "已成为新群主", 0),
+		"extra[0].name 必须是离开者的名字")
+	assert.Equal(t, "新群主", payloadExtraNameAt(stub.sentPayloads(), "已成为新群主", 1),
+		"extra[1].name 必须是继任者的名字")
 	assert.Equal(t, 1, countGroupVisible(stub.sentPayloads(), "已成为新群主"),
 		"每群只发一条交接通告")
 	// 与手动转让同一个 content type —— 这是本改动明确主张的契约

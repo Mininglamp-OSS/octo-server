@@ -185,24 +185,43 @@ removes the correction. The no-alarm route is `skipped_rejoined`: the successor 
 removed, re-invited before their cleanup runs, and their job closes as `done`.
 
 **Fixed** by making the user-side batch enqueue atomically —
-`removeMembersLocked` (`space/db_manager.go`) does the per-uid `FOR UPDATE` role
-re-read, the flip, and the whole batch's enqueue in **one** transaction, mirroring
-`removeMembersForce`, which already ships with that shape. This keeps both
-load-bearing properties the per-uid transaction existed for: the flip and its
-cleanup job still commit together (transactional outbox), and the role-hierarchy
-re-read still happens under the row lock. The one semantic change is partial
-failure: a DB error mid-batch now rolls the whole batch back instead of leaving a
-committed prefix, which is why the caller no longer needs compensating cleanup.
+`removeMembersLocked` (`space/db_manager.go`) locks the whole batch, re-reads each
+role under that lock, flips the rows, and enqueues every cleanup job in **one**
+transaction, mirroring `removeMembersForce`. Both load-bearing properties of the
+old per-uid transaction are kept: the flip and its cleanup job still commit
+together (transactional outbox), and the role-hierarchy re-read still happens under
+the row lock. The one semantic change is partial failure: a DB error mid-batch now
+rolls the whole batch back instead of leaving a committed prefix, which is why the
+caller no longer needs compensating cleanup.
+
+**Round-7 correction (deadlock).** The round-5 shape acquired those locks with a
+*per-uid* `FOR UPDATE` loop in caller order, which reintroduced a deadlock the old
+one-lock-at-a-time loop could not: two reversed overlapping batches, or a batch
+overlapping `transferOwnerAdminLocked`. Measured on MySQL 8.0, the naive
+`uid IN (…) FOR UPDATE` does **not** use the unique index at this endpoint's real
+sizes — the optimizer picks `spacemember_spaceid_status`, locking every active
+member of the space in `(space_id, status, id)` order, while the transfer demote
+uses `(space_id, uid)`; two orders over one row set is the cycle. The lock statement
+now carries `FORCE INDEX (spacemember_spaceid_uid)` (extracted to the const
+`selectMembersForRemovalForUpdateSQL`), which pins the plan to a `(space_id, uid)`
+range: only the target rows, in the same order as the transfer. The batch-vs-batch
+case was always safe (same plan on both sides); this closes the cross-path case and
+also narrows the lock scope from the whole space back to the targets.
 
 With A closed, B alone degrades to silence — the pre-PR behaviour, never a false
 name. B itself is unchanged and still tracked (see below).
 
 Guarded by a **pair** of tests, and neither is sufficient alone:
 
-- `space/TestRemoveMembersLockedEnqueuesAtomically` proves the premise: a competing
-  row lock stalls the batch on its second uid, and the test asserts that *no*
-  cleanup row is visible at that moment. Mutating the implementation back to
-  per-uid commits turns it red (verified).
+- `space/TestRemoveMembersLockedForcesUniqueIndexPlan` is the round-7 primary guard:
+  it `EXPLAIN`s the shared SQL const and asserts the plan is `(space_id, uid)`, not
+  `(space_id, status)`. Removing `FORCE INDEX` turns it red (verified). A concurrent
+  smoke test (`…NoDeadlockOnReversedOverlap`) runs reversed overlapping batches with
+  zero deadlocks, but the plan assertion is what actually pins the lock order.
+- `space/TestRemoveMembersLockedEnqueuesAtomically` proves the atomic-enqueue
+  premise: a competing row lock stalls the batch inside its single locking `SELECT`,
+  and the test asserts that *no* cleanup row is visible at that moment. Mutating the
+  implementation back to per-uid commits turns it red (verified).
 - `group/TestGroupCascadeLastNoticeNamesActualOwner` proves the consequence given
   the premise, with two hard-asserted scenarios: a stale-`pending` successor yields
   **zero** notices, and the ordinary case yields **exactly one** naming the settled
@@ -321,6 +340,11 @@ exists.
   user-side `members/remove` (`kicked`) path now enqueues in one transaction
   (`removeMembersLocked`). See Behavior contract › Chain suppression for the
   per-entrypoint table and the measured counts.
+- **`upsertMembers` has the same caller-order lock shape.**
+  `modules/space/db_manager.go` `upsertMembers` loops `INSERT … ON DUPLICATE KEY
+  UPDATE` in caller order inside one transaction — the pattern round-5/7 fixed in
+  `removeMembersLocked`. Two overlapping add-member batches in opposite orders can
+  deadlock. Out of scope here; wants the same treatment. Raised in PR #804 round-7.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
   `memberRemove` and `modules/bot_api/groups.go` reach the same
   `SendGroupMemberBeRemove`, so remaining members see nothing there either. Same

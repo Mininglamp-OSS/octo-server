@@ -594,6 +594,22 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 	return true, nil
 }
 
+// selectMembersForRemovalForUpdateSQL 是 removeMembersLocked 的整批锁定查询。
+//
+// FORCE INDEX 是**语义性**的，不是性能调优：它把加锁顺序钉在 (space_id, uid) 上，
+// 与 transferOwnerAdminLocked 同序，避免跨路径死锁。原因见 removeMembersLocked 里
+// 的注释。TestRemoveMembersLockedForcesUniqueIndexPlan 用同一个常量断言计划，一旦
+// 有人删掉 FORCE、优化器回退到 (space_id, status)，那条测试立刻变红。
+const selectMembersForRemovalForUpdateSQL = "SELECT uid, role FROM space_member " +
+	"FORCE INDEX (spacemember_spaceid_uid) " +
+	"WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE"
+
+// spaceMemberRoleRow 承接 removeMembersLocked 的整批锁定查询：uid + 当前 role。
+type spaceMemberRoleRow struct {
+	UID  string `db:"uid"`
+	Role int    `db:"role"`
+}
+
 // removeMembersLocked 是 removeMemberLocked 的整批版本：**一个事务**里逐个锁定、
 // 重读角色、翻转成员行，最后一次性入队全部清理工单，单次提交。
 // 返回真正被改动的 uid 列表，语义与逐个调用 removeMemberLocked 收集 ok=true 一致。
@@ -619,12 +635,6 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 // 代价是部分失败语义变了：以前中途 DB 出错会留下已提交的前缀，现在整批回滚。这对
 // transactional outbox 反而更干净（成员行与工单同生共死这一点不变），调用方也不必再
 // 为「前缀已提交」做补偿收尾。owner 与同级及更高角色仍是**静默跳过**，不是错误。
-// spaceMemberRoleRow 承接 removeMembersLocked 的整批锁定查询：uid + 当前 role。
-type spaceMemberRoleRow struct {
-	UID  string `db:"uid"`
-	Role int    `db:"role"`
-}
-
 func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
@@ -635,27 +645,29 @@ func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejec
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// 一条语句锁住整批：uid IN (...) 走唯一索引 (space_id, uid)，锁按**索引序**获取。
+	// 一条语句锁住整批，且**强制走唯一索引 (space_id, uid)**（FORCE INDEX）。
 	//
-	// 不能逐个 FOR UPDATE —— 那会按调用方给的 uid 顺序在一个事务里持有最多
-	// managerMaxBatchUIDs=200 把行锁，两个重叠批次反序并发就是 AB-BA 死锁；而
-	// continue 掉的行（owner、同级）连同它们的锁一直握到提交，进一步扩大了锁面。
-	// 老的实现是一人一事务、每次只持一把锁，天然不可能成环，本函数改成整批单事务
-	// 之后把这个死锁面重新引了进来（PR #804 round-5 review）。单语句获取与
-	// removeMembersForce 完全一致，把死锁面降回既有水平，顺带把 ~2N 次往返压到 ~1+N。
+	// 为什么必须 FORCE：space_member 上有两条候选索引 —— 唯一键
+	// spacemember_spaceid_uid(space_id, uid) 与 spacemember_spaceid_status(space_id,
+	// status)。不加 FORCE 时优化器是按代价选的，实测（MySQL 8.0 + ANALYZE）在本端点
+	// 真实规模上（250 人空间、200 uid 批）选的是 **spacemember_spaceid_status**：
+	// 于是锁按 (space_id, status, id) 顺序、且把该空间**所有** status=1 的行都锁住
+	// （250 把，而非 200 个目标），既扩大了锁面（挡住并发 joinSpace/leaveSpace/
+	// transferOwner），又与 transferOwnerAdminLocked 的降级 UPDATE（走
+	// spacemember_spaceid_uid、按 uid 序）取到**不同的加锁顺序**，构成跨路径 AB-BA
+	// 死锁。FORCE INDEX 把计划钉成 range on (space_id, uid)：只锁 200 个目标、按 uid
+	// 序，与转让路径同序，且锁面收敛到目标本身（PR #804 round-7 review 实测）。
+	//   - 只 ORDER BY uid **不行**：锁在扫描期就获取，排序发生在其后。
+	//   - 逐个 FOR UPDATE 也不行：那会引回按调用方顺序持多把锁的批次间 AB-BA。
+	// SQL 抽成常量 selectMembersForRemovalForUpdateSQL，与计划断言测试共用，防止漂移。
 	//
-	// 角色重读仍在锁内：这一条 SELECT ... FOR UPDATE 把每个成员的当前 role 连同锁
-	// 一起取回，随后在 Go 里做层级判定，语义与 removeMemberLocked 逐个重读完全一致
-	// （防止 pre-check 之后目标被并发转让升为 owner 仍被移除）。
+	// 角色重读仍在锁内：这条 SELECT 把每个成员的当前 role 连同锁一起取回，随后在 Go
+	// 里做层级判定，语义与 removeMemberLocked 逐个重读一致（防止 pre-check 之后目标被
+	// 并发转让升为 owner 仍被移除）。
 	//
-	// 副作用与既有一致：uid IN (...) 对不存在的 uid 在唯一索引上取间隙锁，一个含
-	// 陈旧 uid 的批次会握住若干间隙锁挡并发 joinSpace —— 逐个 FOR UPDATE 也一样，
-	// 单语句只是把它们一次取全。
+	// 对不存在的 uid 仍会在唯一索引上取间隙锁，与逐个 FOR UPDATE 同量，单语句只是一次取全。
 	var locked []spaceMemberRoleRow
-	if _, err = tx.SelectBySql(
-		"SELECT uid, role FROM space_member WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE",
-		spaceId, uids,
-	).Load(&locked); err != nil {
+	if _, err = tx.SelectBySql(selectMembersForRemovalForUpdateSQL, spaceId, uids).Load(&locked); err != nil {
 		return nil, err
 	}
 	roleByUID := make(map[string]int, len(locked))

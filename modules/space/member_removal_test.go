@@ -696,9 +696,9 @@ func TestTruncateCleanupErrorSanitizesInteriorInvalidByte(t *testing.T) {
 
 // TestRemoveMembersRejectsOversizedBatch 用户侧 members/remove 的批量上限。
 //
-// 这个上限是新加的、且**对线上可见**：每个 uid 要跑一个独立事务 + 一次 Redis DEL
-// + 一条工单插入，不设限就是一个拒绝服务杠杆。没有回归用例的话，谁把这段挪走
-// 都不会有人发现，而超限请求会安静地退化回逐个处理。
+// 这个上限是新加的、且**对线上可见**：一次请求要在一个事务里锁住并翻转最多 N 行、
+// 逐个失效 N 份鉴权缓存（Redis DEL）、批量插入 N 条工单，不设限就是一个拒绝服务杠杆。
+// 没有回归用例的话，谁把这段挪走都不会有人发现，而超限请求会安静地放行。
 // 同时钉住「刚好等于上限」仍然放行，避免把边界改成 >= 而悄悄收紧一个。
 func TestRemoveMembersRejectsOversizedBatch(t *testing.T) {
 	_, f, err := setup(t)
@@ -1336,8 +1336,12 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 // 发出写下时就已作废的「已成为新群主」，NoPersist=0 永久留在群历史里。
 //
 // 用一把竞争行锁把整批**卡在中间**来判定，而不是靠时序猜：另一个连接先锁住 m2 的
-// space_member 行，批量移除走到 m2 时必然阻塞，此刻 m1 早已在事务内被翻转——如果实现
-// 是一人一事务，m1 的工单此刻就该可见。断言它**不可见**，即证明整批共用一个事务。
+// space_member 行，整批的单条 SELECT ... FOR UPDATE 扫到 m2 时必然阻塞。此刻整批还没
+// 提交，所以一条清理工单都不该可见。断言它**不可见**即证明整批共用一个事务：若实现
+// 退回「一人一事务、逐个提交」，m1 早已提交、它的工单此刻就会露出来。
+// （注意：现版本阻塞发生在 SELECT 取锁阶段、UPDATE 循环之前，所以 m1 尚未翻转；
+//
+//	变异成逐个提交后，m1 会在 m2 之前被翻转+提交，断言随即变红。）
 //
 // 变异验证：把 removeMembersLocked 改回逐个提交，这条断言立刻变红。
 func TestRemoveMembersLockedEnqueuesAtomically(t *testing.T) {
@@ -1383,7 +1387,8 @@ func TestRemoveMembersLockedEnqueuesAtomically(t *testing.T) {
 		var n int
 		_, err := testCtx.DB().SelectBySql(
 			"SELECT COUNT(*) FROM performance_schema.data_locks " +
-				"WHERE object_name='space_member' AND lock_type='RECORD' AND lock_status='WAITING'").Load(&n)
+				"WHERE object_name='space_member' AND lock_type='RECORD' AND lock_status='WAITING' " +
+				"AND lock_data LIKE '%rm-batch-atomic%'").Load(&n)
 		return err == nil && n > 0
 	}, 15*time.Second, 50*time.Millisecond, "批量移除应当阻塞在 m2 的 space_member 行锁上")
 
@@ -1459,18 +1464,17 @@ func TestRemoveMembersLockedRollsBackWholeBatchOnError(t *testing.T) {
 	}
 }
 
-// TestRemoveMembersLockedNoDeadlockOnReversedOverlap 反序重叠批次不得死锁。
+// TestRemoveMembersLockedNoDeadlockOnReversedOverlap 并发反序重叠批次不产生死锁。
 //
-// PR #804 round-5 的回归守卫。把移除改成整批单事务后，若逐个 FOR UPDATE 取锁，
-// 就会按调用方给的 uid 顺序在一个事务里持有多把锁——两个管理员对同一空间、用**相反
-// 顺序**的重叠 uid 列表并发调用 members/remove，即 AB-BA 死锁，InnoDB 挑一个牺牲者
-// 报 1213，合法操作变成 500。老的一人一事务实现每次只持一把锁，不可能成环。
+// 这是一个**并发冒烟**测试，不是本修复的主守卫。它反复并发地对同一空间跑两批反序
+// 重叠的移除，断言 0 死锁、0 意外副作用。全部成员 role=1、reject=1，于是不翻转任何
+// 行、可无需重播种反复施压，纯粹压加锁路径。
 //
-// 用全部会被跳过的成员（role=1，reject=1）来制造纯粹的取锁争用而不翻转任何行，于是
-// 可以反复并发施压而无需在迭代间重新播种。修好后取锁走单条 uid IN (...) 语句、按索引
-// 序获取，两个批次顺序一致，只会互相阻塞、绝不成环。
-//
-// 变异验证：把 removeMembersLocked 改回逐个 FOR UPDATE，这条在几十轮内必然抓到 1213。
+// 真正把「加锁顺序确定」钉死的是 TestRemoveMembersLockedForcesUniqueIndexPlan：
+// 它断言语句走 (space_id, uid) 而不是 (space_id, status)。为什么需要那条而不能只靠
+// 本测试：批次间即便都走 (space_id, status) 也是同序、不会互相成环，所以本测试对
+// 「优化器选错索引」这个真正的隐患**不敏感**——真正的跨路径死锁是批次 vs 群主转让
+// （不同索引→不同序），计划断言才守得住（PR #804 round-7 review）。
 func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -1491,7 +1495,7 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 	}
 
 	const rounds = 40
-	var deadlocks, otherErr atomic.Int64
+	var deadlocks, otherErr, unexpectedRemoved atomic.Int64
 	isDeadlock := func(e error) bool {
 		return e != nil && (strings.Contains(e.Error(), "1213") ||
 			strings.Contains(strings.ToLower(e.Error()), "deadlock"))
@@ -1509,7 +1513,12 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 				} else if e != nil {
 					otherErr.Add(1)
 				}
-				require.Empty(t, removed, "全是 admin、reject=1，不该移除任何人")
+				// 不能在测试 goroutine 之外调 require（t.FailNow→runtime.Goexit 只能在
+				// 测试自身 goroutine 上跑，否则静默跳过剩余轮次、失败从错误的地方冒出来）。
+				// 用原子标志记下，回到主 goroutine 再断言。
+				if len(removed) != 0 {
+					unexpectedRemoved.Add(1)
+				}
 			}
 		}(order)
 		_ = w
@@ -1519,6 +1528,7 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 	assert.EqualValues(t, 0, deadlocks.Load(),
 		"反序重叠批次不得死锁——单语句取锁按索引序，两个批次顺序一致只会互相阻塞")
 	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
+	assert.EqualValues(t, 0, unexpectedRemoved.Load(), "全是 admin、reject=1，不该移除任何人")
 
 	// 收尾核实：全程无人被移除，成员行原样都在
 	for _, uid := range members {
@@ -1526,5 +1536,83 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 		require.NoError(t, qerr)
 		require.NotNil(t, m)
 		assert.EqualValues(t, 1, m.Status, "%s 应当仍是活跃成员", uid)
+	}
+}
+
+// TestRemoveMembersLockedForcesUniqueIndexPlan 是本修复的**主守卫**：整批锁定查询
+// 必须走唯一索引 (space_id, uid)，不能是 (space_id, status)。
+//
+// 背景（PR #804 round-7 review 实测）：space_member 有两条候选索引。不加 FORCE 时
+// 优化器按代价选，在本端点真实规模（250 人空间、200 uid 批）上会选 (space_id,
+// status)——于是锁按 (space_id, status, id) 序、锁住整个空间的 status=1 行，与
+// transferOwnerAdminLocked（走 (space_id, uid)、按 uid 序）不同序，构成跨路径
+// AB-BA 死锁；同时把锁面从 200 个目标放大到全空间。FORCE INDEX 把计划钉成
+// (space_id, uid)。
+//
+// 直接 EXPLAIN 生产共用的那个 SQL 常量（把占位符换成字面量），所以一旦有人删掉
+// FORCE、优化器回退，这条立刻变红。对照组证明断言不是恒真：去掉 FORCE，同一规模下
+// 计划确实回退到 (space_id, status)。
+func TestRemoveMembersLockedForcesUniqueIndexPlan(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-plan"
+	seedMember(t, f, spaceID, "owner", 2)
+	// 250 名成员：这个规模下不 FORCE 时优化器会倾向 (space_id, status)，正是要避免的。
+	for i := 0; i < 250; i++ {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: fmt.Sprintf("m%04d", i), Role: 0, Status: 1,
+		}))
+	}
+	if _, err := testCtx.DB().Exec("ANALYZE TABLE space_member"); err != nil {
+		require.NoError(t, err)
+	}
+
+	// 200-uid 批。用生产常量本身来 EXPLAIN，只把 `space_id=?` 和 `uid IN ?` 换成字面量。
+	uids := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		uids = append(uids, fmt.Sprintf("'m%04d'", i))
+	}
+	inList := "(" + strings.Join(uids, ",") + ")"
+	concrete := strings.Replace(selectMembersForRemovalForUpdateSQL, "space_id=?", "space_id='"+spaceID+"'", 1)
+	concrete = strings.Replace(concrete, "uid IN ?", "uid IN "+inList, 1)
+
+	explainKey := func(sqlText string) string {
+		var js string
+		err := testCtx.DB().SelectBySql("EXPLAIN FORMAT=JSON " + sqlText).LoadOne(&js)
+		require.NoError(t, err)
+		return js
+	}
+
+	// 先确认机制本身在位：常量里带着 FORCE 子句。删掉它，下面的计划断言会连同一起挂。
+	require.Contains(t, selectMembersForRemovalForUpdateSQL,
+		"FORCE INDEX (spacemember_spaceid_uid)", "整批锁定查询必须 FORCE 唯一索引")
+
+	// 主断言：EXPLAIN 生产共用的那个常量，计划必须落在唯一索引 (space_id, uid) 上。
+	// 若有人删掉 FORCE，concrete 也随之丢掉 FORCE，优化器回退到全表扫描或
+	// (space_id, status)，这里立刻变红。
+	forced := explainKey(concrete)
+	assert.Contains(t, forced, `"key": "spacemember_spaceid_uid"`,
+		"整批锁定查询必须走唯一索引 (space_id, uid)——否则会锁住整个空间并与群主转让构成跨路径死锁")
+
+	// 对照（信息性，不硬断言具体回退计划）：去掉 FORCE 后计划**不再是**唯一索引，
+	// 证明 FORCE 确实在改变行为。回退目标随规模/统计不同可能是 ALL 或 (space_id,
+	// status)，两者都锁住远超目标的行——都是要避免的。若去掉 FORCE 优化器仍选唯一
+	// 索引，FORCE 只是保险、并非无用，故仅记日志不失败。
+	noForce := strings.Replace(concrete, "FORCE INDEX (spacemember_spaceid_uid) ", "", 1)
+	require.NotEqual(t, concrete, noForce, "对照 SQL 必须真的去掉了 FORCE 子句")
+	noForcePlan := explainKey(noForce)
+	if strings.Contains(noForcePlan, `"key": "spacemember_spaceid_uid"`) {
+		t.Logf("注意：本环境去掉 FORCE 优化器仍选唯一索引；FORCE 在此为保险。其它规模/统计下会回退，见 round-7 实测")
+	} else {
+		t.Logf("对照确认：去掉 FORCE 计划不再是唯一索引（%s）",
+			func() string {
+				for _, k := range []string{"spacemember_spaceid_status", "spacemember_uid"} {
+					if strings.Contains(noForcePlan, `"key": "`+k+`"`) {
+						return k
+					}
+				}
+				return "ALL/full-scan"
+			}())
 	}
 }

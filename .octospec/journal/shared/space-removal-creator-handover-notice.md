@@ -340,3 +340,68 @@ test that depends on seniority was really depending on InnoDB's return order. Ne
 seniority-dependent tests set explicit timestamps; the production ambiguity (two
 members joining in the same second have unspecified relative seniority) is recorded
 as a follow-up.
+
+## Round 5 — the atomic-batch fix had a deadlock in its lock acquisition
+
+The round-4 fix (batch enqueues in one transaction) acquired its row locks with a
+per-uid `FOR UPDATE` loop in caller order, holding up to 200 locks for the
+transaction. The old per-uid-transaction loop held one at a time and could not
+deadlock; the batch could. Reviewer measured it; I reproduced the mechanism and
+switched to a single `SELECT ... uid IN ? ... FOR UPDATE`.
+
+That was necessary but **not sufficient**, and the next round showed why.
+
+## Round 6→7 — the single statement did not use the index I claimed
+
+I shipped the single-statement fix with a comment asserting it "走唯一索引
+(space_id, uid)，锁按索引序". A reviewer took that to a live MySQL and it was false:
+`space_member` has two candidate indexes, and at this endpoint's real sizes the
+optimizer picks `spacemember_spaceid_status`, which locks **every active member of
+the space** in `(space_id, status, id)` order — not the 200 targets, and not the
+order `transferOwnerAdminLocked` uses (`(space_id, uid)`). Two orders over one row
+set is the cross-path deadlock, and it was still reachable from the ordinary admin
+endpoint. Batch-vs-batch was fixed (both sides pick the same plan); batch-vs-transfer
+was not.
+
+I verified all of it myself before acting, on a scratch `space_member` with the real
+index set:
+
+- `EXPLAIN` at 250-member/200-uid → `spacemember_spaceid_status` (ref, 250 rows);
+  at 2000-member → `spacemember_spaceid_uid` (range). Plan is size-dependent.
+- `data_locks` during the batch: 252 locks on `spacemember_spaceid_status` + 250
+  PRIMARY — the whole space. With `FORCE INDEX (spacemember_spaceid_uid)`: 201 + 200
+  — only the targets.
+- The transfer demote (`UPDATE … WHERE role=2`) uses `(space_id, uid)`.
+
+I could **not** get my own harness to reproduce the actual 1213 (the race is
+timing-fragile and needs the batch to grab a low-id prefix before blocking on a
+mid-list target held by the transfer). The reviewer did. So I fixed what I could
+prove — the plan and the lock scope — with `FORCE INDEX`, and guarded it the way
+that is actually deterministic:
+
+**`TestRemoveMembersLockedForcesUniqueIndexPlan`** `EXPLAIN`s the shared SQL const
+and asserts the plan is `(space_id, uid)`. Removing `FORCE` turns it red. This is
+the primary guard; the concurrent reversed-overlap test is a smoke test whose
+docstring now says so — it cannot catch "optimizer picked the wrong index" because
+two batches with the *same* wrong plan still don't cross-cycle.
+
+Two lessons worth keeping:
+
+- **A lock-order claim is a claim about the query plan, and the plan is not stated
+  in the SQL — the optimizer chooses it.** "It uses the unique index" is unverified
+  until you `EXPLAIN` it at the size it runs at. My comment asserted an index the
+  optimizer did not pick; a deadlock guard whose fixture was too small to trigger
+  the real plan passed for the wrong reason. Same shape as the fixture-encodes-the-
+  premise learnings, now at the storage-engine layer.
+- **When you cannot reproduce the failure, fix and guard the mechanism you can
+  measure.** I couldn't win the deadlock race, but the plan and lock-scope are
+  deterministic and are the actual mechanism. A plan assertion protects the next
+  editor better than a flaky deadlock test would.
+
+The remaining review items were record accuracy (a godoc attached to the wrong
+symbol by a missing blank line, `require` in a worker goroutine, a comment claiming
+a COUNT hiccup can never roll back the handover when a connection-level one can —
+safely), plus a genuinely missing guard: swapping the two `Name` values in `extra`
+shipped an inverted message and nothing caught it, because the tests asserted the
+uid positions but not the names. A positional `payloadExtraNameAt` closes it; the
+mutation now goes red.
