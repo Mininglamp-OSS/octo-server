@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestOPPOAPIEndpointsUseDocumentedDomesticHost(t *testing.T) {
@@ -98,10 +99,10 @@ func TestOPPOAuth(t *testing.T) {
 	}
 
 	oppo := NewOPPOPush("", appKey, "", masterSecret, nil)
-	assert.NoError(t, oppo.configErr)
+	require.NoError(t, oppo.configErr)
 	token, err := oppo.getAuthToken()
-	assert.NoError(t, err)
-	assert.NotEmpty(t, token)
+	require.NoError(t, err)
+	require.NotEmpty(t, token)
 }
 
 func TestVIVOPush(t *testing.T) {

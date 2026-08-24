@@ -674,7 +674,7 @@ func TestOPPOPushValidatesInputBeforeNetwork(t *testing.T) {
 	}{
 		{name: "wrong payload type", deviceToken: "registration-id", payload: &BasePayload{}},
 		{name: "empty registration ID", payload: NewOPPOPayload(&PayloadInfo{MessageSeq: 1}, "1")},
-		{name: "oversized action parameters", deviceToken: "registration-id", payload: NewOPPOPayload(&PayloadInfo{ChannelID: strings.Repeat("界", 1400), MessageSeq: 1}, "1")},
+		{name: "oversized action parameters", deviceToken: "registration-id", payload: NewOPPOPayload(&PayloadInfo{ChannelID: strings.Repeat("界", oppoMaxActionParametersRunes+1), MessageSeq: 1}, "1")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

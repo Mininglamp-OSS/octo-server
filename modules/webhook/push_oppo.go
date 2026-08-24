@@ -25,6 +25,7 @@ import (
 )
 
 const (
+	// OPPO domestic service endpoint: https://open.oppomobile.com/documentation/page/info?id=11235
 	oppoAPIBaseURL             = "https://api-push-cn.heytapmobi.com"
 	oppoAuthURL                = oppoAPIBaseURL + "/server/v1/auth"
 	oppoNotificationUnicastURL = oppoAPIBaseURL + "/server/v1/message/notification/unicast"

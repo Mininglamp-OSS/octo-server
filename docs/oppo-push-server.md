@@ -12,8 +12,10 @@
   Redis，Redis 故障时使用进程内缓存降级
 - token 失效：仅对 OPPO code `11` 强制鉴权并重试一次
 - 去重：重试沿用同一个 `app_message_id`
-- 可观测性：厂商业务拒绝以 Warn 记录 `oppo_code/retryable`，成功响应以 Debug 记录
-  `oppo_message_id`；日志不包含 MasterSecret、auth token 或 registration_id
+- 可观测性：无效 registration_id（code `41`）和可自愈的首次 token 失效（code `11`）以
+  Debug 记录；未恢复的 code `11`、code `54` 等业务拒绝以 Warn 记录
+  `oppo_code/retryable`；成功响应以 Debug 记录 `oppo_message_id`
+- 日志不包含 MasterSecret、auth token 或完整 registration_id，仅记录脱敏后的设备 token
 
 服务端会发送 `verify_registration_id=true`、24 小时离线 TTL，但不发送 `notify_id`（避免
 不同会话中相同 `message_seq` 的通知互相覆盖），并把以下会话路由字段编码进
@@ -28,9 +30,22 @@
 }
 ```
 
-通知标题和正文是 OPPO 必填字段。服务端对空值使用“您有一条新的消息”兜底，并分别按
-50/200 个 Unicode 字符截断；`action_parameters` 编码后不得超过 4 KiB，超限时拒绝发送并
-返回错误。
+通知标题和正文是 OPPO 必填字段。当前 payload 不发送 `style`，厂商按默认标准样式
+`style=1` 处理。服务端对空值使用“您有一条新的消息”兜底，标题和正文均按 50 个 Unicode
+字符截断；`action_parameters` 编码后不得超过 4000 个字符，超限时拒绝发送并返回错误。
+
+### 官方契约依据
+
+以下结论于 2026-08-24 按 OPPO 开放平台在线文档核对，附件中的 Java SDK 1.1.0 仅作为旧版
+参考，不覆盖在线文档：
+
+- [服务端接口说明（文档 11235）](https://open.oppomobile.com/documentation/page/info?id=11235)：
+  国内服务地址为 `https://api-push-cn.heytapmobi.com/`
+- [消息体说明（文档 11236）](https://open.oppomobile.com/documentation/page/info?id=11236)：
+  `title` 最多 50 字符；默认 `style=1` 时 `content` 最多 50 字符；Activity 最多 500 字符；
+  URL 最多 2000 字符；`action_parameters` 最多 4000 字符
+- [鉴权说明（文档 11234）](https://open.oppomobile.com/documentation/page/info?id=11234)：
+  以 AppKey、13 位毫秒时间戳和 MasterSecret 拼接后计算 SHA-256，auth token 默认有效 24 小时
 
 ## 配置
 
@@ -81,13 +96,30 @@ go test -race ./modules/webhook -run '^Test(OPPO|ParseOPPO|LoadOPPO|NewOPPO)' -c
 go vet ./modules/webhook
 ```
 
+拿到 AppKey 和 MasterSecret 后可直接在本地验证鉴权，无需部署，也不需要包名或
+registration_id。不要把密钥粘贴到聊天、日志、命令历史或仓库文件中；以下 zsh 示例通过
+隐藏输入设置当前 shell 的临时环境变量：
+
+```bash
+read -rs "OPPO_APP_KEY?OPPO AppKey: "; echo
+read -rs "OPPO_MASTER_SECRET?OPPO MasterSecret: "; echo
+export OPPO_APP_KEY OPPO_MASTER_SECRET
+go test ./modules/webhook -run '^TestOPPOAuth$' -count=1 -v
+unset OPPO_APP_KEY OPPO_MASTER_SECRET
+```
+
+该测试只校验最新 host、签名和凭据能够换取非空 auth token，不会打印 token，也不代表消息已
+送达设备。
+
 真实设备烟测需要专用测试应用、测试设备和有效 registration_id：
 
 ```bash
-OPPO_APP_KEY='...' \
-OPPO_MASTER_SECRET='...' \
-OPPO_DEVICE_TOKEN='...' \
+read -rs "OPPO_APP_KEY?OPPO AppKey: "; echo
+read -rs "OPPO_MASTER_SECRET?OPPO MasterSecret: "; echo
+read -rs "OPPO_DEVICE_TOKEN?OPPO registration_id: "; echo
+export OPPO_APP_KEY OPPO_MASTER_SECRET OPPO_DEVICE_TOKEN
 go test ./modules/webhook -run '^TestOPPOPush$' -count=1 -v
+unset OPPO_APP_KEY OPPO_MASTER_SECRET OPPO_DEVICE_TOKEN
 ```
 
 该烟测只证明 OPPO 接口接受请求。到达、展示和点击跳转还必须结合测试设备与 Android 客户端
