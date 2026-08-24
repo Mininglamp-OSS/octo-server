@@ -1772,6 +1772,11 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——manager 不再豁免，
 	// 被踢的管理员连同其拉入的 bot 一并带走（API 层 memberRemove 已限制
 	// 只有群主能踢管理员；creator 仍不可被踢）。
+	//
+	// 唯一例外是 bot 所有者自助移除（req.BotOwnerSelfRemoval，octo-web#1511）：
+	// 那条路径下级联额外排除被授予群角色的 bot，避免普通成员借级联越权移除一个
+	// 管理员 bot。它**不影响**本注释描述的踢人 / 退群 / 拉黑三条路径 —— 那三条
+	// 传 false，#354 原样保持。判据见 QueryBotsInvitedByUIDTx 的 requireCommonRole。
 	var removableMembers []*MemberModel
 	for _, m := range targetMembers {
 		if m.IsDeleted == 1 || m.Role == MemberRoleCreator {
@@ -1871,7 +1876,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		if m.Role == MemberRoleCreator {
 			continue
 		}
-		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, tx)
+		cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(s.db, s.ctx, req.GroupNo, m.UID, req.BotOwnerSelfRemoval, tx)
 		if cerr != nil {
 			s.Error("cascade remove bots failed", zap.Error(cerr), zap.String("uid", m.UID))
 			return nil, errors.New("failed to cascade-remove invited bots")

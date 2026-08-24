@@ -103,7 +103,11 @@ source: self
 
 - **不改** `botAdminSet` / `botAdminRemove`（`api.go:4141` / `4198`）的语义。
 - **不改** 入群侧 `checkBotOwnership` 的判定口径与其调用点。
-- **不改** D-2 级联（`bot_cascade.go`）与拉黑级联的既有行为。
+- **不改** D-2 级联（`bot_cascade.go`）与拉黑级联的**既有行为**。
+  更正（实现阶段）：为给自助路径加角色过滤，`cascadeRemoveBotsInvitedByUIDTx` /
+  `QueryBotsInvitedByUIDTx` 增加了 `requireCommonRole` 参数。既有三条路径
+  （主动退群 / 被移除 / 拉黑）全部传 `false`，**行为逐字节不变**；参数只为
+  自助路径服务。见补充决策 6。
 - **不改** `modules/bot_api` 的 `POST /v1/bot/groups/:group_no/members/remove`
   （`bot_api/groups.go:676`），包括它「不能移除自己」的现状。
 - **不做** BotManage 控制台里「所在群列表 → 移出该群」的第二入口（数据链路已具备：
@@ -181,8 +185,20 @@ make i18n-extract-check && make i18n-lint   # 预期无变化（不新增 errcod
    `group_member.role` 见下方补充决策）
    现有守卫**不拦**——`api.go:3084-3095` 只看 `role`，而 `bot_admin` 是独立列
    （`MemberDetailModel.BotAdmin`，`db.go:770`）。默认行为是放行。
-   倾向：**允许**（所有权优先，且移除成员行本身即让 `bot_admin` 失效）。
-   若需拦，在自助分支加一条 `bot_admin == 1 → 拒绝`。
+   已定：**允许**（所有权优先）。
+
+   ⚠️ **原括注是错的，已更正**：这里曾写「移除成员行本身即让 `bot_admin` 失效」，
+   事实并非如此 —— `DeleteMemberTx` 是软删（只置 `is_deleted=1`），整行连同
+   `bot_admin` 都留在表里，而 `recoverMemberTx` 复活时又不重置它。于是群主授过
+   `bot_admin` 的 bot，被所有者撤走再拉回来就悄悄又是管理员，全程不需要群主参与。
+   实现阶段由集成测试发现（修前 `bot_admin` 复活为 1）。
+
+   修法遵循**既有语义**而非新立规矩：`role` 一直是「回到群里就按新成员处理、
+   权限重新授予」，`bot_admin` 漏了才是 bug。故在 `recoverMemberTx` 补
+   `"bot_admin": 0`。这条对**所有**重新入群路径生效（memberAdd、扫码、邀请、
+   事件同步），不分人和 bot —— 与 `role` 的处理口径一致，不是 bot 专属特例。
+   解除拉黑走 `updateMembersStatus`，不经过 `recoverMemberTx`，不受影响。
+   回归：`TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd`。
 2. **是否给这两条路由挂 `SharedUIDRateLimiter`？**
    已定：**挂**，但只挂这两条，不要挂整个 `groups` 组（会一次性影响 ~28 个端点，
    且相关测试须在 setup 里清 `ratelimit:uid:*`，见 `api_welcome_test.go:35`）。
@@ -217,3 +233,20 @@ make i18n-extract-check && make i18n-lint   # 预期无变化（不新增 errcod
    避免下发一个点了必报错的按钮。
    回归：`TestBotOwnerSelfRemoval_RejectsManagerRoleBot`、
    `TestBotOwnerSelfRemoval_RoleBotGetsNoOwnershipFlag`。
+
+6. **级联的角色过滤只作用于自助路径，既有三条路径保持 #354 原样。**
+   实现中曾把角色过滤直接加在 `QueryBotsInvitedByUIDTx` 上，那是**全局**的，
+   于是连主动退群 / 被群主管理员移除 / 被拉黑一并改掉了 —— 而 #354 是写下来的
+   产品决策：「bot 永远跟随其主人，无角色例外」（`api.go` groupExit 与
+   `service.go` 过滤处均有注释，连群主退群都专门说了一视同仁）。
+   全局过滤的后果：张三被踢 → 他名下的管理员 bot 留在群里，而张三已不是成员、
+   自助路径又拒绝角色 bot，群里凭空多出一个谁也管不动的特权 bot；拉黑流程下
+   还带安全含义。评审（yujiawei）以此判为回归，属实。
+
+   现改为跟随 `BotOwnerSelfRemoval` 透传：三条既有路径传 `false`（#354 不变），
+   仅自助路径传 `true`。被排除的角色 bot 不会失控 —— 群主/管理员仍可经常规
+   移除接口处置。
+   回归：`TestQueryBotsInvitedByUIDTx_RoleFilterOnlyOnSelfServicePath`、
+   `TestRemoveGroupMembers_AdminKickStillCascadesManagerBot`（后者同时补上了
+   评审指出的测试盲区 —— `space_member_removal_test.go` 的 `seedInvitedBot`
+   把 role 硬编码成 0，级联对角色 bot 的处理此前从无覆盖）。

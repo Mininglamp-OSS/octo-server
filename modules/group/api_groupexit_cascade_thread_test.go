@@ -138,7 +138,7 @@ func TestGroupExit_CascadeBot_AlsoRemovesFromThread(t *testing.T) {
 	require.NoError(t, f.db.DeleteMemberTx(groupNo, "leaver", leaverVersion, tx))
 
 	// 4b. 级联带走 leaver 拉入的 bot（api.go cascade 分支入口）
-	cascadedUIDs, err := cascadeRemoveBotsInvitedByUIDTx(f.db, f.ctx, groupNo, "leaver", tx)
+	cascadedUIDs, err := cascadeRemoveBotsInvitedByUIDTx(f.db, f.ctx, groupNo, "leaver", false, tx)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 	require.ElementsMatch(t, []string{botUID}, cascadedUIDs, "cascade SQL 必须挑中 leaver 自己的 bot")

@@ -3524,7 +3524,7 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	// #354 产品决策：bot 永远跟随其主人，无角色例外——群主退群（角色已由上方
 	// newGrouper 完成转让）同样级联带走自己名下的 bot，和普通成员一致。
 	var cascadedBotUsers []*user.Model
-	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, tx)
+	cascadedUIDs, cerr := cascadeRemoveBotsInvitedByUIDTx(g.db, g.ctx, groupNo, loginUID, false, tx)
 	if cerr != nil {
 		tx.Rollback()
 		g.Error("级联移除 bot 成员失败", zap.Error(cerr))

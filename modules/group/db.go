@@ -888,29 +888,38 @@ func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
 // 为什么是 INNER JOIN + status=1：与 checkBotOwnership（bot_ownership.go）保持一致，
 // 没有活跃 robot 行的 bot（孤儿 / 禁用）不视为任何人的 bot，不被级联。
 // 群主 / 其他管理员仍可通过常规移除成员接口清理它们。
-func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, tx *dbr.Tx) ([]string, error) {
+func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, requireCommonRole bool, tx *dbr.Tx) ([]string, error) {
 	if groupNo == "" || inviterUID == "" {
 		return nil, nil
 	}
 	var uids []string
-	// gm.role = MemberRoleCommon：级联不经过 handler 的任何角色守卫，所以它必须
-	// 自带一道。否则「bot A 拥有 Manager 角色的 bot B」时，移除 A 会把 B 一并删掉，
-	// 而 B 从未进过任何白名单 —— 结果是普通成员经级联越权移除了一个群管理员，
-	// 极端情况下还能删到 Creator 角色的 bot，留下无群主的群。
+	// requireCommonRole 决定要不要额外排除被授予群角色的 bot。
 	//
-	// robot.creator_uid 指向另一个 bot 是构造得出来的：BotFather 的命令链
-	// （messagesListen → HandleMessage → tryCreateBotCore）对「发送者是不是 bot」
-	// 零过滤，挡在前面的只有 checkSendPermission 的好友门。守卫的强度不该依赖
-	// 另一个模块的门，所以这里自己收口。
+	// **false（既有三条路径：主动退群 / 被群主管理员移除 / 被拉黑）**：不过滤角色。
+	// #354 是写下来的产品决策 —— 「bot 永远跟随其主人，无角色例外」，连群主退群
+	// （角色已先行转让）都一视同仁。在这里加全局过滤会让「张三被踢 → 他名下的
+	// 管理员 bot 留在群里，而张三已不是成员、自助路径又拒绝角色 bot」，群里凭空
+	// 多出一个谁也管不动的特权 bot，拉黑流程下还带安全含义。
 	//
+	// **true（仅 bot 所有者自助移除）**：排除角色 bot。级联不经过 handler 的角色
+	// 守卫，若不收口，「bot A 拥有 Manager 角色的 bot B」时移除 A 会顺带删掉 B，
+	// 等于普通成员经级联越权移除了一个群管理员。robot.creator_uid 指向另一个 bot
+	// 是构造得出来的：BotFather 的命令链（messagesListen → HandleMessage →
+	// tryCreateBotCore）对「发送者是不是 bot」零过滤，挡在前面的只有
+	// checkSendPermission 的好友门 —— 守卫的强度不该依赖另一个模块的门。
 	// 被排除的角色 bot 不会失控：群主/管理员仍可经常规移除接口处置它们。
-	_, err := tx.SelectBySql(
-		"SELECT gm.uid FROM group_member gm "+
-			"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 "+
-			"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "+
-			"AND gm.role = ? AND r.creator_uid = ? FOR UPDATE",
-		groupNo, MemberRoleCommon, inviterUID,
-	).Load(&uids)
+	sql := "SELECT gm.uid FROM group_member gm " +
+		"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 " +
+		"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "
+	args := []interface{}{groupNo}
+	if requireCommonRole {
+		sql += "AND gm.role = ? "
+		args = append(args, MemberRoleCommon)
+	}
+	sql += "AND r.creator_uid = ? FOR UPDATE"
+	args = append(args, inviterUID)
+
+	_, err := tx.SelectBySql(sql, args...).Load(&uids)
 	return uids, err
 }
 

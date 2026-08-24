@@ -22,15 +22,19 @@ type versionSeqer interface {
 //   - 为每个 bot 生成新 member version + DeleteMemberTx
 //   - 返回被级联删除的 bot uid 列表（外层按需用 userDB 查名字发系统 Tip）
 //
+// requireCommonRole 透传给 QueryBotsInvitedByUIDTx：既有三条路径（主动退群 /
+// 被移除 / 拉黑）传 false，保持 #354「bot 永远跟随其主人，无角色例外」；
+// 只有 bot 所有者自助移除传 true，额外排除被授予群角色的 bot。
+//
 // 任一 SQL 步失败直接返回 error，外层应 tx.Rollback()，保证「要么全成要么全不动」。
 // 本函数不做 edge case（如 inviter 是否群主）判断，由调用方先判定再调。
 func cascadeRemoveBotsInvitedByUIDTx(
-	db *DB, seq versionSeqer, groupNo, inviterUID string, tx *dbr.Tx,
+	db *DB, seq versionSeqer, groupNo, inviterUID string, requireCommonRole bool, tx *dbr.Tx,
 ) ([]string, error) {
 	if groupNo == "" || inviterUID == "" {
 		return nil, nil
 	}
-	botUIDs, err := db.QueryBotsInvitedByUIDTx(groupNo, inviterUID, tx)
+	botUIDs, err := db.QueryBotsInvitedByUIDTx(groupNo, inviterUID, requireCommonRole, tx)
 	if err != nil {
 		return nil, fmt.Errorf("query bots invited by %s: %w", inviterUID, err)
 	}

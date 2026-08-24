@@ -59,18 +59,19 @@ func TestLockRemovableMemberTx_RejectsManagerWhenCommonRequired(t *testing.T) {
 	assert.True(t, ok, "普通角色目标应放行")
 }
 
-// ---------- ② 级联查询自身要带角色过滤 ----------
+// ---------- ② 级联的角色过滤只作用于自助路径 ----------
 
-// cascadeRemoveBotsInvitedByUIDTx 走的是 QueryBotsInvitedByUIDTx，它按
-// robot.creator_uid 圈定目标、**不过滤 group_member.role**，也不经过 handler 的
-// 守卫。于是「bot A 拥有 Manager 角色的 bot B」时，移除 A 会连带删掉 B ——
-// B 从未进过白名单。
+// #354 是**写下来的产品决策**：「bot 永远跟随其主人，无角色例外」
+// （见 api.go groupExit 与 service.go 过滤处的注释）。它覆盖三条既有路径：
+// 主动退群、被群主/管理员移除、被拉黑。
 //
-// 触发它需要 robot.creator_uid 指向另一个 bot：BotFather 的命令链
-// （messagesListen → HandleMessage → tryCreateBotCore）对「发送者是不是 bot」
-// 零过滤，只有 checkSendPermission 的好友门挡在前面。也就是说这道守卫的强度
-// 目前依赖于另一个模块的好友门，而不是它自己的判据 —— 这才是要修的理由。
-func TestQueryBotsInvitedByUIDTx_ExcludesRoleBearingBots(t *testing.T) {
+// 因此级联的角色过滤**不能**做成全局的：那会让「张三被踢 → 他名下的管理员 bot
+// 留在群里、而张三已不是成员、自助路径又拒绝角色 bot」，群里凭空多出一个
+// 没人管得动的特权 bot —— 正是 #354 要消灭的状态，拉黑流程下还带安全含义。
+//
+// 需要角色过滤的只有**新开的自助路径**：普通成员不该借级联把一个管理员 bot
+// 洗掉。所以判据跟着 BotOwnerSelfRemoval 走，与锁内的 requireCommonRole 同源。
+func TestQueryBotsInvitedByUIDTx_RoleFilterOnlyOnSelfServicePath(t *testing.T) {
 	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	f := New(ctx)
@@ -91,14 +92,65 @@ func TestQueryBotsInvitedByUIDTx_ExcludesRoleBearingBots(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 
-	uids, err := f.db.QueryBotsInvitedByUIDTx(groupNo, "owner_y", tx)
+	// requireCommonRole=false —— 既有三条路径（退群 / 被踢 / 拉黑）。
+	// #354：无角色例外，三个都要跟着走。
+	uids, err := f.db.QueryBotsInvitedByUIDTx(groupNo, "owner_y", false, tx)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"bot_plain", "bot_mgr", "bot_creator"}, uids,
+		"既有路径必须保持 #354：bot 永远跟随其主人，无角色例外")
+
+	// requireCommonRole=true —— 仅自助路径。
+	uids, err = f.db.QueryBotsInvitedByUIDTx(groupNo, "owner_y", true, tx)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"bot_plain"}, uids,
+		"自助路径下只级联普通角色的 bot，角色 bot 的处置权留给群主/管理员")
+}
+
+// 端到端形态：管理员踢人时，被踢者名下的**管理员 bot** 仍要被级联带走。
+//
+// 这条补的是评审点出的测试盲区 —— space_member_removal_test.go 的
+// seedInvitedBot 把 role 硬编码成 0，所有级联 fixture 都是普通角色，
+// 于是「级联对角色 bot 怎么处理」从来没有测试覆盖，改坏了也不会红。
+func TestRemoveGroupMembers_AdminKickStillCascadesManagerBot(t *testing.T) {
+	svc, userDB := setupServiceTest(t)
+	insertTestUsers(t, userDB, testutil.UID, "leaver")
+
+	resp, err := svc.CreateGroup(&CreateGroupServiceReq{
+		Creator: testutil.UID,
+		Members: []string{"leaver"},
+		Name:    "admin-kick-cascade",
+	})
+	require.NoError(t, err)
+	s := svc.(*Service)
+
+	// leaver 名下两个 bot：一个普通角色、一个被群主提升为 Manager。
+	seedBotMember(t, s, resp.GroupNo, "bot_of_leaver", "bol", "leaver")
+	seedBotMember(t, s, resp.GroupNo, "bot_mgr_of_leaver", "bmol", "leaver")
+	_, err = s.ctx.DB().UpdateBySql(
+		"UPDATE group_member SET role=? WHERE group_no=? AND uid=?",
+		MemberRoleManager, resp.GroupNo, "bot_mgr_of_leaver",
+	).Exec()
 	require.NoError(t, err)
 
-	assert.Contains(t, uids, "bot_plain", "普通角色的 bot 仍应被级联")
-	assert.NotContains(t, uids, "bot_mgr",
-		"Manager 角色的 bot 不得被级联删除 —— 它从未通过任何角色守卫")
-	assert.NotContains(t, uids, "bot_creator",
-		"Creator 角色的 bot 不得被级联删除")
+	// 群主踢人（非自助路径）。
+	removeResp, err := svc.RemoveGroupMembers(&RemoveGroupMembersServiceReq{
+		GroupNo:      resp.GroupNo,
+		Members:      []string{"leaver"},
+		OperatorUID:  testutil.UID,
+		OperatorName: "creator",
+	})
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t,
+		[]string{"leaver", "bot_of_leaver", "bot_mgr_of_leaver"}, removeResp.RemovedUIDs,
+		"#354：被踢者名下的 bot 全部跟着走，Manager 角色也不例外 —— "+
+			"否则群里会留下一个主人已不在、谁也管不动的特权 bot")
+
+	for _, uid := range []string{"bot_of_leaver", "bot_mgr_of_leaver"} {
+		exist, eerr := s.db.ExistMember(uid, resp.GroupNo)
+		require.NoError(t, eerr)
+		assert.False(t, exist, "%s 应已被级联移除", uid)
+	}
 }
 
 // ---------- ③ 实际移除集合要与请求集合比对，而不是比数量 ----------
