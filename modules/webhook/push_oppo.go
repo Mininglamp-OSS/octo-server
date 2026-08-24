@@ -236,7 +236,7 @@ func NewOPPOPush(appID, appKey, appSecret, masterSecret string, ctx *config.Cont
 // OPPOPayload is the server-owned input for an OPPO notification.
 type OPPOPayload struct {
 	Payload
-	notifyID    string
+	dedupeID    string
 	spaceID     string
 	channelID   string
 	channelType uint8
@@ -245,10 +245,10 @@ type OPPOPayload struct {
 
 // NewOPPOPayload creates an OPPO payload and preserves the authoritative
 // routing fields used by the Android client after a notification click.
-func NewOPPOPayload(payloadInfo *PayloadInfo, notifyID string) *OPPOPayload {
+func NewOPPOPayload(payloadInfo *PayloadInfo, dedupeID string) *OPPOPayload {
 	return &OPPOPayload{
 		Payload:     payloadInfo.toPayload(),
-		notifyID:    notifyID,
+		dedupeID:    dedupeID,
 		spaceID:     payloadInfo.SpaceID,
 		channelID:   payloadInfo.ChannelID,
 		channelType: payloadInfo.ChannelType,
@@ -319,7 +319,7 @@ func (o *OPPOPush) buildUnicastMessage(deviceToken string, payload *OPPOPayload)
 		payload.channelID,
 		strconv.Itoa(int(payload.channelType)),
 		strconv.FormatUint(uint64(payload.messageSeq), 10),
-		payload.notifyID,
+		payload.dedupeID,
 	}, "\x00")
 	dedupeDigest := sha256.Sum256([]byte(dedupeSource))
 
