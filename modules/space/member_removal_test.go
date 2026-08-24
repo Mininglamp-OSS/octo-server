@@ -1548,6 +1548,93 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 	}
 }
 
+// TestUpsertMembersLocksInSameOrderAsBatchRemoval 守住批量加人 vs 批量移除这一对。
+//
+// 背景（PR #804 round-9 review，Jerry-Xin 实测定位）：upsertMembers 逐条 upsert，此前
+// 按**调用方给的 uid 顺序**取锁（normalizeUIDs 不排序），而批量移除走 FORCE INDEX 按
+// **索引升序**取锁——两边顺序相反即构成 AB-BA。这一对在 main 上不可能死锁：那时用户端
+// 移除是一人一事务、只握一把锁，做不了 hold-and-wait 的那一侧；是本 PR 的整批单事务
+// （最多 200 行）把它变成了可能。
+//
+// ⚠️ 为什么光包 retryOnDeadlock 不够——这是本轮最值钱的一条：
+// 有界重试只能救**短命**的对手（群主转让、强制移除，实测已归零），碰上**长命**的对手会被
+// **饿死**：批量移除每次尝试都是全新事务、回滚代价为零，InnoDB 反复选它当牺牲者，而还在
+// 跑的 upsert 一直在推进；重试立刻又撞上同一个活事务，几次退避跑完仍在人家生命周期内。
+// 实测（200 uid 逆序重叠、60 轮）：只包重试时移除侧 **60/60** 把 1213 抛给了调用方。
+// 排序之后两边同序、结构上不成环，实测 0/60（含**两侧都不包重试**的对照，证明是真的没
+// 死锁，而不是被重试吸收掉了）。
+//
+// 本测试**刻意调 …Once**（两侧都不包重试）：包一层重试就会把要数的 1213 吞掉，守卫就再
+// 也红不了了——正是本 PR 自己 round-8 犯过的错，见 learnings/pending/
+// mutation-check-the-assertion-not-the-guard.md。
+// 变异验证：删掉 upsertMembersOnce 里的 sort.Strings，本测试立刻变红。
+func TestUpsertMembersLocksInSameOrderAsBatchRemoval(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+	mgr := newManagerDB(testCtx.DB())
+
+	const spaceID = "upsert-order"
+	seedMember(t, f, spaceID, "owner", 2)
+
+	const n = 200
+	asc := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		uid := fmt.Sprintf("m%04d", i)
+		asc = append(asc, uid)
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+	// 逆序：加人侧按调用方顺序取锁，与移除侧的索引升序完全相反——最坏的一对。
+	desc := make([]string, n)
+	for i, uid := range asc {
+		desc[n-1-i] = uid
+	}
+	if _, e := testCtx.DB().Exec("ANALYZE TABLE space_member"); e != nil {
+		require.NoError(t, e)
+	}
+
+	isDeadlock := func(e error) bool {
+		return e != nil && (strings.Contains(e.Error(), "1213") ||
+			strings.Contains(strings.ToLower(e.Error()), "deadlock"))
+	}
+
+	const rounds = 30
+	var removeDL, upsertDL, otherErr atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			// 移除侧：reject=1，role=0 的成员会真的被翻成 status=0 并持锁到提交。
+			_, e := removeMembersLockedOnce(f.db.session, spaceID, asc, 1, "owner", MemberRemoveReasonKicked)
+			if isDeadlock(e) {
+				removeDL.Add(1)
+			} else if e != nil {
+				otherErr.Add(1)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			// 加人侧把他们重新激活，于是两个 goroutine 能一直互相制造重叠。
+			e := mgr.upsertMembersOnce(spaceID, desc)
+			if isDeadlock(e) {
+				upsertDL.Add(1)
+			} else if e != nil {
+				otherErr.Add(1)
+			}
+		}
+	}()
+	wg.Wait()
+
+	assert.EqualValues(t, 0, removeDL.Load(),
+		"批量移除不得与批量加人死锁——upsertMembers 必须按 uid 升序取锁，与 FORCE INDEX 的批量移除同序")
+	assert.EqualValues(t, 0, upsertDL.Load(), "加人侧同样不得死锁")
+	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
+}
+
 // TestRemoveMembersLockedForcesUniqueIndexPlan 是本修复的**主守卫**：整批锁定查询
 // 必须走唯一索引 (space_id, uid)，不能是 (space_id, status)。
 //

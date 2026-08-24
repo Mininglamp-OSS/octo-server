@@ -239,6 +239,22 @@ defects this PR introduced in round 8.
    lock **every active row in the space** — a wider lock than anything above. That is
    pre-existing, out of scope here, and wants one capacity-check design rather than a
    fourth retry wrapper. Tracked as a follow-up.
+
+   **Wrapping `upsertMembers` was not enough — measured.** The reviewer who found this
+   also measured it, and the measurement overturned the fix: with `upsertMembers` merely
+   wrapped in the retry, the *removal* side surfaced **60 of 60** unrecovered 1213s to
+   its caller (200-uid reversed overlap). The mechanism is **victim starvation**, not an
+   unlucky collision — the batch is fresh with zero undo work at every attempt, so InnoDB
+   keeps electing it the victim while the still-running upsert makes progress, and the
+   retry re-collides with the same live transaction until the attempts are gone. So:
+   *bounded retry closes cycles against **short-lived** counterparties (owner transfer,
+   force-remove — measured 0) and starves against **long-lived** ones.* The fix is
+   ordering, which the retry cannot substitute for: `upsertMembers` now sorts its uids
+   ascending, the same order the `FORCE INDEX`'d batch locks in, so the pair cannot form
+   a cycle at all. Measured 0/60 across three runs — and 0/60 again with **both sides
+   unwrapped**, which is what proves the closure is structural rather than absorbed by
+   the retry. Guarded by `TestUpsertMembersLocksInSameOrderAsBatchRemoval`, which calls
+   both `…Once` variants for that reason and goes red 30/30 when the sort is removed.
 2. *Round 8 silently defanged the round-7 deadlock guard.*
    `TestRemoveMembersLockedNoDeadlockOnReversedOverlap` exists to catch a
    batch-vs-batch AB-BA, but round 8 routed it through the retry, which swallows the
@@ -391,11 +407,12 @@ exists.
   user-side `members/remove` (`kicked`) path now enqueues in one transaction
   (`removeMembersLocked`). See Behavior contract › Chain suppression for the
   per-entrypoint table and the measured counts.
-- **`upsertMembers` has the same caller-order lock shape.**
-  `modules/space/db_manager.go` `upsertMembers` loops `INSERT … ON DUPLICATE KEY
-  UPDATE` in caller order inside one transaction — the pattern round-5/7 fixed in
-  `removeMembersLocked`. Two overlapping add-member batches in opposite orders can
-  deadlock. Out of scope here; wants the same treatment. Raised in PR #804 round-7.
+- **`upsertMembers` — RESOLVED in round 9, no longer a follow-up.** It looped
+  `INSERT … ON DUPLICATE KEY UPDATE` in caller order inside one transaction, against
+  the batch removal's index order. It now sorts its uids ascending (same order the
+  `FORCE INDEX` batch locks in) and is wrapped in `retryOnDeadlock`. See the round-9
+  section above for the measurement that forced the sort; guarded by
+  `TestUpsertMembersLocksInSameOrderAsBatchRemoval`.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
   `memberRemove` and `modules/bot_api/groups.go` reach the same
   `SendGroupMemberBeRemove`, so remaining members see nothing there either. Same

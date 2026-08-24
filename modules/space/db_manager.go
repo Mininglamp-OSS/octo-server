@@ -3,6 +3,7 @@ package space
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -416,16 +417,28 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 }
 
 // upsertMembersOnce 是 upsertMembers 的单次尝试，死锁重试见 retryOnDeadlock。
+//
+// **按 uid 升序取锁**，与批量移除那条 FORCE INDEX 语句的加锁顺序一致，这样两边同序、
+// 结构上无法成环。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
+// 已归零），对**长命**的对手会被饿死——批量移除每次尝试都是全新事务、回滚代价为零，
+// 于是被 InnoDB 反复选为牺牲者，而还在跑的 upsert 一直在推进，重试立刻又撞上同一个
+// 活事务，几次退避跑完还在人家的生命周期里。实测（200 uid 逆序重叠、60 轮）：只包重试
+// 时移除侧 60/60 把 1213 抛给了调用方，加上排序后归零。
+// PR #804 round-9 review：Jerry-Xin 实测定位并给出这个修法。
+//
+// 排序 uids 的副本，不改调用方切片（normalizeUIDs 保留调用方顺序，其返回值调用方后续还要用）。
 func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
+	ordered := append([]string(nil), uids...)
+	sort.Strings(ordered)
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
-	for _, uid := range uids {
+	for _, uid := range ordered {
 		if _, err := tx.InsertBySql(
 			"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW()) "+
 				"ON DUPLICATE KEY UPDATE status=1, updated_at=NOW()",
@@ -788,7 +801,11 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	// 里做层级判定，语义与 removeMemberLocked 逐个重读一致（防止 pre-check 之后目标被
 	// 并发转让升为 owner 仍被移除）。
 	//
-	// 对不存在的 uid 仍会在唯一索引上取间隙锁，与逐个 FOR UPDATE 同量，单语句只是一次取全。
+	// 对不存在的 uid 仍会在唯一索引上取间隙锁。**数量**与逐个 FOR UPDATE 相同，但**持有时长**
+	// 不同：逐个提交时每把间隙锁在各自 commit 就放了，现在要一直握到本事务末尾的那一次
+	// commit。一批里塞 200 个不存在的 uid 就会把 200 段 gap 按住整个事务，期间挡住这些区间
+	// 上的并发加入/重新激活。有界（要求调用方在本空间 role>=1，且事务很短），但别把它读成
+	// 「和以前一样」（PR #804 round-9 review yujiawei P2-2）。
 	var locked []spaceMemberRoleRow
 	if _, err = tx.SelectBySql(selectMembersForRemovalForUpdateSQL, spaceId, uids).Load(&locked); err != nil {
 		return nil, err

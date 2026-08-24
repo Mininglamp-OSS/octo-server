@@ -498,3 +498,45 @@ Pattern across rounds 6-9, stated plainly: every one of my deadlock fixes has be
 correct about the mechanism and wrong about the scope of what it closed. Ordering
 fixed batch-vs-batch and I claimed cross-path. Retry fixed cross-path and I claimed
 all writers. The mechanism is the easy part; the honest boundary is the work.
+
+## Round 9b — my fix for the round-9 finding was itself insufficient, and measurement said so
+
+Two reviews landed on opposite sides. One approved the round-9 head and independently
+verified the wire contract across all three clients, closing the "older installed
+clients not verified" risk I had been carrying since round 2. The other filed a
+blocker — with numbers.
+
+The blocker was `upsertMembers`, which I had already wrapped in the retry that same
+round. I had treated "wrapped" as "closed". The reviewer measured it: **60/60**
+unrecovered deadlocks surfaced to the removal side's caller. The wrapper made no
+difference, and my 3-attempt/short-backoff version was *worse* than the 5-attempt one
+they measured at 48/60.
+
+The mechanism is **victim starvation**, and it is the thing I did not understand when
+I chose the retry in round 8. A bounded retry only helps against a **short-lived**
+counterparty: it re-runs and the obstacle is gone. Against a **long-lived** one it
+loses every time — the batch is a fresh transaction with zero undo work at each
+attempt, so InnoDB keeps picking it as the victim, and the immediate retry crashes
+back into the same still-running transaction until the attempts are spent. Backoff of
+5ms/20ms is nothing against a 200-row upsert.
+
+So the honest statement of what a deadlock retry buys, which I had wrong for two
+rounds: **retry absorbs cycles against short-lived counterparties; ordering is the only
+thing that closes them against long-lived ones.** Retry is not a substitute for
+ordering, it is a fallback for where ordering cannot be arranged. Owner transfer is
+non-monotonic and short — retry is right there. `upsertMembers` is a plain loop I fully
+control — ordering was available the whole time, and I reached for the wrapper because
+I had just built it.
+
+Sorting `upsertMembers` ascending, matching the `FORCE INDEX` batch, gives 0/60 across
+three runs. I checked the thing I keep forgetting to check: re-ran with **both sides
+unwrapped**, still 0/60, and InnoDB's LATEST DETECTED DEADLOCK timestamp stopped
+advancing. That is the difference between *closed* and *absorbed*, and the reviewer
+drew it explicitly in their own numbers — worth stealing permanently. A zero is not
+evidence until you have removed the thing that could be hiding the non-zero.
+
+Rounds 6→9b, the same shape every time: correct about the mechanism, wrong about the
+boundary, and only measurement ever caught it. Four times now the closure claim came
+from reasoning and was refuted by someone who ran it. The reasoning is not worthless —
+it produced the right mechanism each time — but on this class it has zero standing
+against a number, including when the number is mine.
