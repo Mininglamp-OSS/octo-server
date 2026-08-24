@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -9,6 +10,27 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestOPPOAPIEndpointsUseDocumentedDomesticHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		path     string
+	}{
+		{name: "auth", endpoint: oppoAuthURL, path: "/server/v1/auth"},
+		{name: "notification unicast", endpoint: oppoNotificationUnicastURL, path: "/server/v1/message/notification/unicast"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.endpoint)
+			assert.NoError(t, err)
+			assert.Equal(t, "https", u.Scheme)
+			assert.Equal(t, "api-push-cn.heytapmobi.com", u.Host)
+			assert.Equal(t, tt.path, u.Path)
+		})
+	}
+}
 
 func TestHMSPush(t *testing.T) {
 	appID := os.Getenv("HMS_APP_ID")
