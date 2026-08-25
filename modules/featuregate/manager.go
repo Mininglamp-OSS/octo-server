@@ -152,9 +152,10 @@ const clientVisibleDimension = fg.ScopeTypeUser
 // 全体开或全体关。读侧（AllowDisplay）另有 fail-closed 兜底 —— 两侧都要：只做
 // 写侧会被直接改库绕过，只做读侧则运维以为自己配置生效了。
 //
-// 对 mode 不做区分（即便当前是 whitelist 也要求 bucket_by=user）：bucket_by 虽然
-// 只在 percent 生效，但先存一个坏值、之后切到 percent 就会踩雷，不如在写入时就
-// 保证这张表里客户端可见的行恒定合法。
+// **按 mode 门控**（见 planUpdate 里的 modeNeedsScopes 判断）：off/on 既不读白名单也
+// 不读 bucket_by，对它们施加此校验会挡住关停，而 off 是本框架的回滚杠杆。代价是
+// off/on 的行里可能留下一个未经校验的 bucket_by——这不构成隐患，因为每次切进
+// whitelist/percent 都会重新校验请求里的值，坏值不可能悄悄生效。
 func validateClientVisibleDimension(dim string) bool {
 	return dim == clientVisibleDimension
 }

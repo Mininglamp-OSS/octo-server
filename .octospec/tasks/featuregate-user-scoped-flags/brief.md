@@ -19,8 +19,8 @@ source: self
    featuregate），确需与部署位联动时由**服务端**做 AND，客户端只读一个最终布尔——
    AND 绝不放在客户端。理由与实现约束见 Load-bearing 对应条目。
 3. **刷新契约与失败语义**：冷启动 + 登录成功 + 前台化（节流 ≥5 分钟）；单个 key 遭遇
-   存储故障时进响应的 **`unavailable` 列表**（而非下发 `false`，也不是从 `flags` 里
-   `unavailable` 数组），客户端对这些 key 保留上次值。
+   存储故障时进响应的 **`unavailable` 数组**（既不下发 `false`，也不是从 `flags` 里
+   悄悄省略），客户端对这些 key 保留上次值。
    **2026-08-25 修订**：初稿用「从 `flags` 里省略」来表达这层含义，评审阶段改为显式
    字段——语义等价，但「缺席携带含义」任何 schema 语言都描述不了，codegen 客户端会把
    缺席读成 `false`，恰是这套设计要防的失败。见 Load-bearing 与 Acceptance 对应条目。
@@ -416,6 +416,10 @@ percent，因此本任务按当前契约重新评审和落地。
 - **写侧拒绝对客户端可见的 key 配不可满足的维度**：对已注册为客户端可见的 `feature_key`，
   `update` 传 `bucket_by=group`（或 `whitelist` 模式下仅含 `scope_type=group`/`space` 条目）
   → 400 `err.server.featuregate.request_invalid`。
+  **限定在会读这些输入的 mode（`whitelist`/`percent`）**：`off`/`on` 既不读白名单也不读
+  `bucket_by`，对它们施加同一校验会让「关掉一个 gate」比「打开它」更难——而 `off` 正是本
+  框架的回滚杠杆。放行不留隐患：每次切进 `whitelist`/`percent` 都会重新校验请求里的
+  `bucket_by`。**这条限定是刻意的，不要"修"回无条件校验**（见 journal 的 Review round 2）。
 - env kill switch 生效：设置 `OCTO_FEATUREGATE_<KEY>_KILL=1` 后，无论 DB/Redis 规则为何，该 key
   的所有判定（含新增的 `AllowDisplay`）一律为拒，且**不查任何存储**。
 - 新增 `TestFeatureGateAPINoLegacyResponseError` 守卫测试，覆盖模块内全部 handler 文件。

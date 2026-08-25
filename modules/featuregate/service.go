@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -34,6 +35,8 @@ const (
 	cacheTTL           = 60 * time.Second
 	// nilSentinel 缓存「DB 也没有此规则」，防止未注册 key 每次穿透到 DB。
 	nilSentinel = "__nil__"
+	// warnInterval 是维度错配告警的去重窗口，见 warnIfDimensionUnusable。
+	warnInterval = 5 * time.Minute
 )
 
 // Dims 是评估维度，pkg/featuregate.Dims 的别名 —— 调用方只 import 本模块即可
@@ -56,6 +59,8 @@ type Dims = fg.Dims
 type Service struct {
 	db    *gateDB
 	redis *octoredis.Conn
+	// dimWarnAt 给维度错配告警做 (key,reason) 级去重，见 warnIfDimensionUnusable。
+	dimWarnAt sync.Map
 	log.Log
 }
 
@@ -90,7 +95,11 @@ func (s *Service) AllowCreate(ctx context.Context, key string, dims fg.Dims) boo
 	if rule == nil {
 		return false // 未注册规则 → fail-closed
 	}
-	return fg.Evaluate(*rule, scopes, dims).Allow
+	decision := fg.Evaluate(*rule, scopes, dims)
+	// 与 AllowDisplay 同源：写时闸门的维度错配同样 fail-closed、同样不可见，
+	// 没理由只在展示端报警。
+	s.warnIfDimensionUnusable(key, *rule, decision)
+	return decision.Allow
 }
 
 // AllowPush 是推送总开关（fail-open）：仅在 env kill 或规则被显式置为 off 时
@@ -142,19 +151,7 @@ func (s *Service) AllowDisplay(ctx context.Context, key string, dims fg.Dims) (a
 		return false, true // 未注册规则 → 确定性的关
 	}
 	decision := fg.Evaluate(*rule, scopes, dims)
-	if decision.DimensionUnusable {
-		// 配置与调用点不匹配：规则引用的某个维度这里提供不了。
-		//
-		// 用 DimensionUnusable 而非只认 ReasonDimUnavailable，是为了把三种错配一网
-		// 打尽：分桶维度缺失（fail-closed）、白名单条目全都用不上（同样 fail-closed）、
-		// 以及 percent 0%/100% 短路——后者**决策仍然正确**所以不改结果，但配置确实
-		// 是错的，不报的话运维会在把 100 调到 50 的那一刻突然全员掉线。
-		s.Warn("featuregate display rule references a dimension this call site cannot provide",
-			zap.String("key", key),
-			zap.String("reason", decision.Reason),
-			zap.Bool("allow", decision.Allow),
-			zap.String("bucket_by", fg.BucketDimension(*rule)))
-	}
+	s.warnIfDimensionUnusable(key, *rule, decision)
 	return decision.Allow, true
 }
 
@@ -340,4 +337,34 @@ func mustJSON(v interface{}) string {
 		return "" // 极罕见；返回空串使下次仍 miss 重试，而非缓存坏值
 	}
 	return string(b)
+}
+
+// warnIfDimensionUnusable 在规则引用了本调用点提供不了的维度时告警。
+//
+// 用 Decision.DimensionUnusable 而非只认 ReasonDimUnavailable，是为了把三种错配一网
+// 打尽：分桶维度缺失（fail-closed）、白名单条目全都用不上（同样 fail-closed）、以及
+// percent 0%/100% 短路——后者**决策仍然正确**所以不改结果，但配置确实是错的，不报的话
+// 运维会在把 100 调到 50 的那一刻突然全员掉线。
+//
+// **按 (key, reason) 去重**：这条日志的信息量是恒定的，而展示端点是每用户每次拉取都
+// 评估一遍——一条配错的 client-visible 规则会让同一行日志按用户数×拉取频率刷屏，把
+// 真正的信号淹掉。同一 (key, reason) 每 warnInterval 只打一次；运维改了配置换成别的
+// reason，或过了间隔，都会重新出现。
+func (s *Service) warnIfDimensionUnusable(key string, rule fg.Rule, decision fg.Decision) {
+	if !decision.DimensionUnusable {
+		return
+	}
+	dedupKey := key + "|" + decision.Reason
+	now := time.Now()
+	if last, ok := s.dimWarnAt.Load(dedupKey); ok {
+		if t, _ := last.(time.Time); now.Sub(t) < warnInterval {
+			return
+		}
+	}
+	s.dimWarnAt.Store(dedupKey, now)
+	s.Warn("featuregate rule references a dimension this call site cannot provide",
+		zap.String("key", key),
+		zap.String("reason", decision.Reason),
+		zap.Bool("allow", decision.Allow),
+		zap.String("bucket_by", fg.BucketDimension(rule)))
 }

@@ -89,25 +89,40 @@ func (a *flagsAPI) get(c *wkhttp.Context) {
 	// 到位」的中间层来说，等于宣告"这些响应可以互换"。
 	c.Header("Vary", "token")
 
-	uid := c.GetLoginUID()
-	if uid == "" {
-		// 不可达：本路由挂在 AuthMiddleware 之后，uid 必然已注入。真出现说明鉴权
-		// 链被改动了。判定本身仍会 fail-closed（白名单不匹配空值、按 user 分桶走
-		// dim_unavailable），但那样只会表现为"功能全没了"，排查会绕远路；显式记一条
-		// Error 让根因一眼可见。
+	if uid := c.GetLoginUID(); uid != "" {
+		c.Response(a.evaluateAll(c.Request.Context(), fg.Dims{UID: uid}))
+		return
+	}
+	a.respondUnknowable(c)
+}
+
+// respondUnknowable 处理「没有 uid」这条不可达分支。
+func (a *flagsAPI) respondUnknowable(c *wkhttp.Context) {
+	{
+		// 不可达：本路由挂在 AuthMiddleware 之后，uid 必然已注入。真出现说明鉴权链
+		// 被改动了。
+		//
+		// 此时**不能**照常评估：白名单匹配不上空值、按 user 分桶走 dim_unavailable，
+		// 结果会是「每个 key 都确定性地 false」——恰恰是本模块最想避免的那个形状，
+		// 客户端会拿它覆盖本地缓存，功能对所有人消失。没有 uid 时答案本就**不可知**，
+		// 而不可知正是 unavailable 的语义。让不变量由代码保证，而不是靠注释声称
+		// "不会发生"。
 		a.Error("flags endpoint reached without a login uid; auth chain may be misconfigured")
 	}
+	c.Response(flagsResp{Flags: map[string]bool{}, Unavailable: a.registry.clientKeys()})
+}
 
-	// 本端点只有 UID 维度：不接收也不推断空间/群上下文。一个用户可属多个空间，
-	// "当前空间"在这条请求里没有确定答案，因此 flags 是**账号级**的，不构成跨空间
-	// 读取面。凡是要下发到客户端的规则都必须按 user 维度配置（管理端写侧已拦，
-	// AllowDisplay 读侧还会再兜一次）。
-	dims := fg.Dims{UID: uid}
-
+// evaluateAll 对注册表全集求值。
+//
+// 本端点只有 UID 维度：不接收也不推断空间/群上下文。一个用户可属多个空间，"当前
+// 空间"在这条请求里没有确定答案，因此 flags 是**账号级**的，不构成跨空间读取面。
+// 凡是要下发到客户端的规则都必须按 user 维度配置（管理端写侧已拦，AllowDisplay
+// 读侧还会再兜一次）。
+func (a *flagsAPI) evaluateAll(ctx context.Context, dims fg.Dims) flagsResp {
 	flags := make(map[string]bool, len(a.registry.flags))
 	unavailable := make([]string, 0)
 	for _, f := range a.registry.flags {
-		allow, ok := a.resolve(c.Request.Context(), f, dims)
+		allow, ok := a.resolve(ctx, f, dims)
 		if !ok {
 			// 存储故障：判定不可得，显式列出让客户端保留上次值。
 			// 已在 AllowDisplay 内打过 Warn。
@@ -116,8 +131,7 @@ func (a *flagsAPI) get(c *wkhttp.Context) {
 		}
 		flags[f.ClientKey] = allow
 	}
-
-	c.Response(flagsResp{Flags: flags, Unavailable: unavailable})
+	return flagsResp{Flags: flags, Unavailable: unavailable}
 }
 
 // resolve 求出单个 flag 对本次调用者的最终值。

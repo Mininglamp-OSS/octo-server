@@ -255,3 +255,30 @@ func TestFlagsEndpointUserWhitelistEndToEnd(t *testing.T) {
 	_, body = getFlags(t, r)
 	require.False(t, body.Flags["e2e"], "不在白名单的用户应当为 false")
 }
+
+// TestFlagsEndpointEmptyUIDReportsUnavailable 钉住空 uid 走 unavailable 而非全 false。
+//
+// AuthMiddleware 之后 uid 必然非空，所以这是不可达路径——但它一旦发生，返回「每个
+// key 都确定性地 false」恰恰是本模块最想避免的那个形状：客户端会用它覆盖本地缓存，
+// 功能对所有人消失。没有 uid 时答案本就**不可知**，而不可知正是 unavailable 的语义。
+// 让不变量由代码保证，而不是靠注释声称"不会发生"。
+func TestFlagsEndpointEmptyUIDReportsUnavailable(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+
+	flags := []ClientFlag{
+		{FeatureKey: "alpha_rollout", ClientKey: "alpha"},
+		{FeatureKey: "beta_rollout", ClientKey: "beta"},
+	}
+	// 绕过 AuthMiddleware 直接挂 handler，模拟鉴权链被改坏的情形。
+	r := libwkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	api := newFlagsAPI(ctx, stubEvaluator{allow: map[string]bool{"alpha_rollout": true}},
+		mustNewClientRegistry(flags))
+	r.GET("/v1/featuregate/flags", api.get)
+
+	w, body := getFlags(t, r)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Empty(t, body.Flags, "没有 uid 时不得给出任何确定性判定；body: %s", w.Body.String())
+	require.ElementsMatch(t, []string{"alpha", "beta"}, body.Unavailable,
+		"答案不可知时每个 key 都应进 unavailable，客户端才会保留旧值")
+}

@@ -2,6 +2,7 @@ package featuregate
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -439,6 +440,7 @@ func TestManagerRejectsScopeIDWithPathSeparator(t *testing.T) {
 	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
 	r := mountManager(t, ctx, nil)
 
+	require.NoError(t, newDB(ctx).upsertRule("fgtest_sep", string(fg.ModeWhitelist), 0, fg.ScopeTypeUser, "sep", "seed"))
 	for _, bad := range []string{"a/b", "a b", "a\tb"} {
 		w := doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/fgtest_sep/scopes",
 			map[string]any{"scope_type": "user", "scope_id": bad})
@@ -478,6 +480,8 @@ func TestManagerCapsWhitelistSize(t *testing.T) {
 
 	const key = "fgtest_cap"
 	db := newDB(ctx)
+	// 规则必须先存在——addScope 现在拒绝孤儿条目。
+	require.NoError(t, db.upsertRule(key, string(fg.ModeWhitelist), 0, fg.ScopeTypeUser, "cap", "seed"))
 	for i := 0; i < maxScopesPerKey; i++ {
 		require.NoError(t, db.addScope(key, fg.ScopeTypeUser, fmt.Sprintf("u%d", i), "seed"))
 	}
@@ -558,6 +562,7 @@ func TestAddScopeStaysIdempotentAtQuota(t *testing.T) {
 
 	const key = "fgtest_quota_idem"
 	db := newDB(ctx)
+	require.NoError(t, db.upsertRule(key, string(fg.ModeWhitelist), 0, fg.ScopeTypeUser, "idem", "seed"))
 	for i := 0; i < maxScopesPerKey; i++ {
 		require.NoError(t, db.addScope(key, fg.ScopeTypeUser, fmt.Sprintf("u%d", i), "seed"))
 	}
@@ -574,4 +579,66 @@ func TestAddScopeStaysIdempotentAtQuota(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	_, reason := errCodeOf(t, w)
 	require.Equal(t, "scope_quota", reason)
+}
+
+// TestAddScopeRejectsUnknownGate 关掉孤儿白名单条目这条路。
+//
+// 没有这道校验时：给一个不存在的 gate 加白名单返回 200，但 list 是按规则枚举再挂
+// scope 的，所以这条记录**在任何管理界面上都看不见**；等某天有人建了同名规则，它
+// 立刻开始放人——一个 superadmin 新建 whitelist gate 时无从得知它已经有成员了。
+func TestAddScopeRejectsUnknownGate(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	w := doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/fgtest_orphan/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "u1"})
+	require.Equal(t, http.StatusNotFound, w.Code,
+		"给不存在的 gate 加白名单必须拒，否则会留下看不见却会生效的记录；body: %s", w.Body.String())
+	code, _ := errCodeOf(t, w)
+	require.Equal(t, "err.server.featuregate.not_found", code)
+
+	// 先建规则，再加就应当成功。
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPut,
+		"/v1/manager/featuregate/gates/fgtest_orphan",
+		map[string]any{"mode": "whitelist", "bucket_by": "user"}).Code)
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPost,
+		"/v1/manager/featuregate/gates/fgtest_orphan/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "u1"}).Code)
+}
+
+// TestScopeIDIsCaseSensitive 钉住身份列的逐字节语义。
+//
+// 库默认的 utf8mb4_general_ci 大小写不敏感，而 Go 侧比较是逐字节的。两者不一致时
+// "UserA" 与 "usera" 在唯一键下撞成一行，第二次 add 只更新 updated_by，库里留的仍是
+// 首次的拼写——运维拿到 200，那个用户却永远进不了白名单，且读侧因为存在可用的 user
+// 条目而只报普通 whitelist_miss，一行告警都没有。写成功、读静默、两侧皆哑。
+func TestScopeIDIsCaseSensitive(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	const key = "fgtest_case"
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPut,
+		"/v1/manager/featuregate/gates/"+key,
+		map[string]any{"mode": "whitelist", "bucket_by": "user"}).Code)
+
+	for _, id := range []string{"UserA", "usera"} {
+		require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPost,
+			"/v1/manager/featuregate/gates/"+key+"/scopes",
+			map[string]any{"scope_type": "user", "scope_id": id}).Code)
+	}
+
+	scopes, err := newDB(ctx).queryScopes(key)
+	require.NoError(t, err)
+	require.Len(t, scopes, 2, "大小写不同的 scope_id 必须是两条独立记录，否则第二个用户永远进不来")
+
+	// 两个用户都应当真正被放行。
+	svc := NewService(ctx)
+	svc.Invalidate(key)
+	for _, uid := range []string{"UserA", "usera"} {
+		allow, ok := svc.AllowDisplay(context.Background(), key, fg.Dims{UID: uid})
+		require.True(t, ok)
+		require.True(t, allow, "uid=%q 已在白名单中，必须放行", uid)
+	}
 }

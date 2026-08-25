@@ -143,3 +143,53 @@ before the count. `delScope` deliberately does *not* validate the prospective
 post-delete state: blocking on it creates an ordering trap where neither entry of a
 `{user, group}` pair can be removed first. That path is left to the read-side
 backstop, which round 1 added and which is now explicitly noted in the code.
+
+## Review round 3 (2026-08-25)
+
+The blocker was a collation mismatch, and it is the sharpest finding of the three
+rounds because the defence I had written did not work and I had asserted in a comment
+that it did.
+
+Both new tables inherited the database default `utf8mb4_general_ci`, while every Go
+comparison of those same values is byte-exact (`s.ID == id`, `rule.Mode != ModeOff`,
+the `switch` in `dimValue`). Reproduced against MySQL 8.0.46:
+
+- `scope_id` `"UserA"` and `"usera"` collide under the unique key. The second `add`
+  hits `ON DUPLICATE KEY UPDATE updated_by=...`, so only `updated_by` changes and the
+  row keeps the first spelling. The operator gets 200; that user is never admitted.
+  And the read side stays quiet too — a usable `user`-dimension entry does exist, so
+  `Evaluate` returns an ordinary `whitelist_miss` with `DimensionUnusable=false` and
+  `AllowDisplay` logs nothing. Write succeeds, read silently misses, both sides mute:
+  the round-1 blocker's exact shape in a different dimension.
+- **The CHECK constraints did not enforce what their own comments claimed.**
+  `REGEXP_LIKE` and `IN` both inherit the column's collation, so under `_ci`,
+  `feature_key='ZZ_UPPER'` passed `'^[a-z][a-z0-9_]*$'` and `mode='OFF'` passed
+  `IN ('off',...)`. I had called the `feature_key` charset check "尤其重要" in the
+  migration header while it was inert.
+- A hand-written `mode='OFF'` splits policy across entry points: `AllowPush` reads it
+  as not-off and allows, `Evaluate` reads it as an unknown mode and denies.
+
+All five identity columns are now explicitly `utf8mb4_bin`, verified: the uppercase
+key and `mode='OFF'` inserts are rejected by the existing CHECKs, and `UserA`/`usera`
+become two distinct rows. The repo had already been bitten by this class — `modules/
+message`'s `message_reaction_emoji_binary` is a forward-only repair ALTER, and
+`card_template_catalog` builds at `_bin` from the start.
+
+**A CHECK constraint written against a `_ci` column is decorative.** Worth checking
+the collation before trusting any string constraint, and worth testing the constraint
+by trying to violate it rather than by reading it.
+
+Also this round: orphan whitelist rows are rejected (`addScope` requires the rule to
+exist — otherwise the row is invisible to `list`, which enumerates rules and joins
+scopes onto them, yet goes live the moment someone creates a matching rule); an empty
+uid now lists every key as `unavailable` instead of returning a definite `false` for
+all of them, which was the one response shape the whole design exists to avoid;
+`AllowCreate` now consumes the same misconfiguration signal `AllowDisplay` does; the
+dimension warning is deduplicated per (key, reason) because the display endpoint
+evaluates once per user per fetch and a single misconfigured rule would otherwise
+flood the log with a message of constant information content.
+
+One of my own edits from round 2 had reversed a negation in the brief's most-read
+section — a blind `省略` → `unavailable 数组` substitution turned "not omitted from
+flags" into nonsense. Mechanical find-and-replace across prose needs the result read
+back.

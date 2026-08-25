@@ -179,12 +179,7 @@ func (m *Manager) addScope(c *wkhttp.Context) {
 		gateRequestInvalid(c, reason)
 		return
 	}
-	if ok, reason := m.scopeQuotaAllows(key, scopeType, scopeID); !ok {
-		if reason != "" {
-			gateRequestInvalid(c, reason)
-			return
-		}
-		gateQueryFailed(c)
+	if !m.scopeWritable(c, key, scopeType, scopeID) {
 		return
 	}
 	if err := m.db.addScope(key, scopeType, scopeID, c.GetLoginUID()); err != nil {
@@ -220,6 +215,34 @@ func (m *Manager) planScope(key string, req scopeReq) (scopeType, scopeID, reaso
 		return "", "", "scope_id"
 	}
 	return scopeType, scopeID, ""
+}
+
+// scopeWritable 做 addScope 落库前的两道准入：规则存在 + 未超配额。
+// 返回 false 时已写好响应，调用方直接 return。
+//
+// 规则必须先存在：否则这条记录会落进一张 list 看不见的表——list 是按规则枚举再挂
+// scope 的，孤儿条目在任何管理界面上都不可见，却会在某天有人建了同名规则时立刻开始
+// 放人，而新建那条 whitelist gate 的 superadmin 无从得知它已经有成员了。
+func (m *Manager) scopeWritable(c *wkhttp.Context, key, scopeType, scopeID string) bool {
+	rule, err := m.db.queryRule(key)
+	if err != nil {
+		m.Error("query feature gate before adding scope failed", zap.String("key", key), zap.Error(err))
+		gateQueryFailed(c)
+		return false
+	}
+	if rule == nil {
+		gateNotFound(c)
+		return false
+	}
+	if ok, reason := m.scopeQuotaAllows(key, scopeType, scopeID); !ok {
+		if reason != "" {
+			gateRequestInvalid(c, reason)
+			return false
+		}
+		gateQueryFailed(c)
+		return false
+	}
+	return true
 }
 
 // scopeQuotaAllows 判定这次 addScope 是否被单 key 配额允许。
