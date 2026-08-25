@@ -44,10 +44,13 @@ type systemSettingUpdateReq struct {
 //   - Value: the DB-stored value, or "" if not configured. For encrypted
 //     types this is the secretMask placeholder whenever a non-empty
 //     ciphertext is stored; cleartext is never returned.
-//   - EffectiveValue: the value currently in effect after applying the
-//     DB → yaml → code-default fallback chain. For encrypted types this is
-//     secretMask whenever the effective plaintext is non-empty (whether the
-//     source is DB or yaml), and "" otherwise. Plaintext is NEVER returned.
+//   - EffectiveValue: the value currently displayed by the manager
+//     configuration surface. Most settings use the DB → yaml → code-default
+//     fallback chain. The support.email* settings are intentionally different:
+//     this admin surface reads them from the database only, so an absent DB
+//     row is shown as empty rather than presenting a YAML-only SMTP config as
+//     an admin-managed value. For encrypted types this is secretMask only when
+//     a non-empty database plaintext exists. Plaintext is NEVER returned.
 type systemSettingItemResp struct {
 	Category       string `json:"category"`
 	Key            string `json:"key"`
@@ -99,6 +102,10 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 
 	items := make([]systemSettingItemResp, 0, len(systemSettingSchema))
 	schema := make([]systemSettingSchemaResp, 0, len(systemSettingSchema))
+	// The manager configuration surface treats SMTP as database-owned. Keep
+	// this local to the handler: ordinary SupportEmail* getters still retain
+	// their YAML fallback for existing user-facing mail flows.
+	managerSMTP := m.systemSettings.managerEmailMFASMTPSettings()
 	for _, def := range systemSettingSchema {
 		schema = append(schema, systemSettingSchemaResp{
 			Category:    def.Category,
@@ -128,12 +135,22 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 			}
 		}
 
-		// EffectiveValue resolves DB → yaml → code default through the typed
-		// getters bound on the schema entry. Encrypted plaintext is replaced
-		// with secretMask before serialisation — a yaml SMTP password must
-		// never leak through this endpoint.
+		// EffectiveValue normally resolves DB → yaml → code default through the
+		// typed getter bound on the schema entry. The manager-facing SMTP rows
+		// are the exception: they must reflect the database snapshot only, so
+		// the UI cannot mistake a YAML fallback for a persisted admin setting.
 		if def.Effective != nil {
-			effective := def.Effective(m.systemSettings)
+			effective := ""
+			switch {
+			case def.Category == "support" && def.Key == "email":
+				effective = managerSMTP.from
+			case def.Category == "support" && def.Key == "email_smtp":
+				effective = managerSMTP.address
+			case def.Category == "support" && def.Key == "email_pwd":
+				effective = managerSMTP.password
+			default:
+				effective = def.Effective(m.systemSettings)
+			}
 			if def.Type == settingTypeEncrypted {
 				if effective != "" {
 					item.EffectiveValue = secretMask
@@ -191,6 +208,10 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		skip           bool
 	}
 	plans := make([]prepared, 0, len(req.Items))
+	// Use one database-only snapshot for the manager SMTP merge. In particular,
+	// retaining email_pwd must not silently pull a YAML password into the MFA
+	// configuration when the database has no password row.
+	managerSMTP := m.systemSettings.managerEmailMFASMTPSettings()
 	for _, item := range req.Items {
 		def := findSchemaDef(item.Category, item.Key)
 		if def == nil {
@@ -275,7 +296,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				// or accidentally store "****" as the real password.
 				p.skip = true
 				if item.Category == "support" && item.Key == "email_pwd" {
-					p.effectiveValue = m.systemSettings.SupportEmailPwd()
+					p.effectiveValue = managerSMTP.password
 				}
 				break
 			}
@@ -307,9 +328,12 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// partially committed MFA switch or SMTP value behind.
 	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
 	managerMFATouched := false
+	// smtpTouched means the merged SMTP value differs from the current
+	// database snapshot. Merely including an unchanged SMTP field in a form
+	// submission must not send a real probe email.
 	smtpTouched := false
 	smtpClearRequested := false
-	prospectiveSMTP := m.systemSettings.managerEmailMFASMTPSettings()
+	prospectiveSMTP := managerSMTP
 	for _, p := range plans {
 		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
 			managerMFATouched = true
@@ -319,29 +343,27 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			switch p.def.Key {
 			case "email":
 				prospectiveSMTP.from = p.effectiveValue
-				smtpTouched = true
-				if strings.TrimSpace(p.effectiveValue) == "" {
-					smtpClearRequested = true
-				}
 			case "email_smtp":
 				prospectiveSMTP.address = p.effectiveValue
-				smtpTouched = true
-				if strings.TrimSpace(p.effectiveValue) == "" {
-					smtpClearRequested = true
-				}
 			case "email_pwd":
 				prospectiveSMTP.password = p.effectiveValue
-				smtpTouched = true
 			}
 		}
 	}
+	// Decide from the final merged values, not from individual request items.
+	// This keeps duplicate keys or a change-then-revert batch from causing a
+	// real SMTP probe when the committed effective configuration is unchanged.
+	smtpTouched = prospectiveSMTP.from != managerSMTP.from ||
+		prospectiveSMTP.address != managerSMTP.address ||
+		prospectiveSMTP.password != managerSMTP.password
+	smtpClearRequested = (prospectiveSMTP.from != managerSMTP.from && strings.TrimSpace(prospectiveSMTP.from) == "") ||
+		(prospectiveSMTP.address != managerSMTP.address && strings.TrimSpace(prospectiveSMTP.address) == "")
 	if smtpTouched || (managerMFATouched && managerMFAOn) {
 		// Clearing SMTP is allowed only while manager MFA is off. Any
 		// non-clearing SMTP update, and every MFA enable, must validate and probe
 		// the merged final configuration before the transaction is committed.
 		if strings.TrimSpace(prospectiveSMTP.address) == "" ||
-			strings.TrimSpace(prospectiveSMTP.from) == "" ||
-			strings.TrimSpace(prospectiveSMTP.password) == "" {
+			strings.TrimSpace(prospectiveSMTP.from) == "" {
 			if managerMFAOn || !smtpClearRequested {
 				m.Warn("管理端 MFA SMTP 配置校验失败：配置不完整")
 				httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)

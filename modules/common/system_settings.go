@@ -133,8 +133,9 @@ func NewSystemSettings(ctx *config.Context, db *systemSettingDB) *SystemSettings
 
 // EnsureManagerEmailMFASettings makes the manager MFA policy and SMTP values
 // database-owned. It is called after module migrations are ready and never
-// performs SMTP I/O. Missing rows are seeded once; existing rows, including
-// explicit empty values, are left untouched.
+// performs SMTP I/O. Missing rows are seeded once with a database-level
+// insert-if-absent operation; existing rows, including explicit empty values,
+// are left untouched even if a concurrent write races initialization.
 func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 	rows, err := s.db.listAll()
 	if err != nil {
@@ -156,8 +157,9 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 		})
 	}
 
-	// Treat the three SMTP rows as one bootstrap set. A partially populated DB
-	// set is authoritative and must not be silently completed from yaml.
+	// Treat the SMTP rows as one bootstrap set. A partially populated DB set is
+	// authoritative and must not be silently completed from yaml. Password is
+	// optional because deployments may use an unauthenticated SMTP relay.
 	smtpRowsMissing := true
 	for _, key := range []string{"email", "email_smtp", "email_pwd"} {
 		if _, ok := stored[schemaKey("support", key)]; ok {
@@ -166,22 +168,27 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 		}
 	}
 	cfg := s.ctx.GetConfig()
-	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != "" && cfg.Support.EmailPwd != ""
+	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != ""
 	if smtpRowsMissing && defaultsComplete {
-		ciphertext, err := encryptKey(cfg.Support.EmailPwd)
-		if err != nil {
-			// Keep the MFA default durable even if the deployment forgot the
-			// master key needed to persist the optional SMTP password.
-			if seedErr := s.persistManagerEmailMFASeeds(seeds); seedErr != nil {
-				return seedErr
-			}
-			return fmt.Errorf("encrypt default SMTP password: %w", err)
-		}
 		seeds = append(seeds,
 			managerEmailMFASeed{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
 			managerEmailMFASeed{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
-			managerEmailMFASeed{category: "support", key: "email_pwd", value: ciphertext, valueType: settingTypeEncrypted, description: "SMTP 密码（加密存储）"},
 		)
+		if cfg.Support.EmailPwd != "" {
+			ciphertext, err := encryptKey(cfg.Support.EmailPwd)
+			if err != nil {
+				// The endpoint and sender remain durable even if the deployment
+				// forgot the master key needed to persist an optional password.
+				if seedErr := s.persistManagerEmailMFASeeds(seeds); seedErr != nil {
+					return seedErr
+				}
+				return fmt.Errorf("encrypt default SMTP password: %w", err)
+			}
+			seeds = append(seeds, managerEmailMFASeed{
+				category: "support", key: "email_pwd", value: ciphertext,
+				valueType: settingTypeEncrypted, description: "SMTP 密码（可选，加密存储）",
+			})
+		}
 	}
 	return s.persistManagerEmailMFASeeds(seeds)
 }
@@ -201,7 +208,7 @@ func (s *SystemSettings) persistManagerEmailMFASeeds(seeds []managerEmailMFASeed
 		}
 	}()
 	for _, item := range seeds {
-		if err := s.db.upsertWithTx(tx, item.category, item.key, item.value, item.valueType, item.description); err != nil {
+		if err := s.db.insertIfAbsentWithTx(tx, item.category, item.key, item.value, item.valueType, item.description); err != nil {
 			return err
 		}
 	}

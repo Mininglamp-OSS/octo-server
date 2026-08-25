@@ -50,6 +50,33 @@ func TestEnsureManagerEmailMFASettingsSeedsDatabaseDefaults(t *testing.T) {
 	assert.NotEqual(t, "smtp-password", stored["support.email_pwd"].Value)
 }
 
+func TestEnsureManagerEmailMFASettingsSeedsPasswordlessSMTPDefaults(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "relay@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:25"
+		s.ctx.GetConfig().Support.EmailPwd = ""
+	})
+
+	require.NoError(t, settings.EnsureManagerEmailMFASettings())
+	require.NoError(t, settings.Load())
+
+	provider := settings.ManagerEmailMFASMTPSettings()
+	assert.Equal(t, "relay@example.com", provider.SupportEmail())
+	assert.Equal(t, "smtp.example.com:25", provider.SupportEmailSmtp())
+	assert.Empty(t, provider.SupportEmailPwd())
+
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	stored := make(map[string]*systemSettingModel, len(rows))
+	for _, row := range rows {
+		stored[schemaKey(row.Category, row.KeyName)] = row
+	}
+	assert.Contains(t, stored, "support.email")
+	assert.Contains(t, stored, "support.email_smtp")
+	assert.NotContains(t, stored, "support.email_pwd",
+		"passwordless SMTP bootstrap must not create a fake password row")
+}
+
 func TestEnsureManagerEmailMFASettingsDoesNotOverwriteExplicitSMTPRows(t *testing.T) {
 	settings := newTestSystemSettings(t, func(s *SystemSettings) {
 		s.ctx.GetConfig().Support.Email = "yaml@example.com"
@@ -64,6 +91,92 @@ func TestEnsureManagerEmailMFASettingsDoesNotOverwriteExplicitSMTPRows(t *testin
 	assert.Empty(t, provider.SupportEmail())
 	assert.Empty(t, provider.SupportEmailSmtp())
 	assert.Empty(t, provider.SupportEmailPwd())
+}
+
+func TestEnsureManagerEmailMFASettingsDoesNotCompletePartialSMTPFromYAML(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "yaml@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "yaml.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "yaml-password"
+	})
+	password, err := encryptKey("database-password")
+	require.NoError(t, err)
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, "legacy"))
+	// This represents an old deployment that overrode only the password in the
+	// database while the sender and endpoint came from YAML.
+	require.NoError(t, settings.db.upsert("support", "email_pwd", password, settingTypeEncrypted, "legacy"))
+
+	require.NoError(t, settings.EnsureManagerEmailMFASettings())
+	require.NoError(t, settings.Load())
+
+	provider := settings.ManagerEmailMFASMTPSettings()
+	assert.Empty(t, provider.SupportEmail())
+	assert.Empty(t, provider.SupportEmailSmtp())
+	assert.Equal(t, "database-password", provider.SupportEmailPwd())
+	assert.Equal(t, ManagerEmailMFAOn, settings.ManagerEmailMFAState())
+	assert.Error(t, settings.ValidateManagerEmailMFASMTP(),
+		"a partial legacy SMTP set must be reported as invalid instead of merged with YAML")
+
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	for _, row := range rows {
+		if row.Category == "support" && row.KeyName == "email" {
+			t.Fatal("partial SMTP bootstrap must not create support.email from YAML")
+		}
+		if row.Category == "support" && row.KeyName == "email_smtp" {
+			t.Fatal("partial SMTP bootstrap must not create support.email_smtp from YAML")
+		}
+	}
+}
+
+func TestManagerEmailMFASeedInsertDoesNotOverwriteExistingMFA(t *testing.T) {
+	settings := newTestSystemSettings(t, nil)
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, "operator"))
+
+	// Simulate a stale initialization plan that was built before the operator
+	// enabled MFA. The database-level insert-if-absent must preserve the live
+	// value; an application-level SELECT followed by upsert would reset it.
+	require.NoError(t, settings.persistManagerEmailMFASeeds([]managerEmailMFASeed{{
+		category: "login", key: "manager_email_mfa_on", value: "0",
+		valueType: settingTypeBool, description: "default",
+	}}))
+
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	var got *systemSettingModel
+	for _, row := range rows {
+		if row.Category == "login" && row.KeyName == "manager_email_mfa_on" {
+			got = row
+			break
+		}
+	}
+	require.NotNil(t, got)
+	assert.Equal(t, "1", got.Value)
+	assert.Equal(t, "operator", got.Description)
+}
+
+func TestEnsureManagerEmailMFASettingsPreservesEnabledMFA(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "yaml@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "yaml.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "yaml-password"
+	})
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, "operator"))
+
+	// EnsureManagerEmailMFASettings is called on every startup. Its seed plan
+	// may have been built while the row was absent, so the database-level
+	// insert-if-absent must be what protects an already-enabled policy.
+	require.NoError(t, settings.EnsureManagerEmailMFASettings())
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	for _, row := range rows {
+		if row.Category == "login" && row.KeyName == "manager_email_mfa_on" {
+			assert.Equal(t, "1", row.Value)
+			assert.Equal(t, "operator", row.Description)
+			return
+		}
+	}
+	t.Fatal("manager_email_mfa_on row was not found")
 }
 
 func TestManagerEmailMFASMTPSettingsUseDatabaseInsteadOfYAML(t *testing.T) {

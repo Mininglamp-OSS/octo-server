@@ -469,14 +469,15 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 	return s.dispatchSMTP(ctx, smtpAddr, fromSan, pwd, toSan, []byte(msg))
 }
 
-// ValidateSMTPConfiguration validates the complete effective configuration
-// before any network operation. In particular, accepting a syntactically
-// non-empty but invalid MAIL FROM would let an SMTP server reject MFA mail
-// after the policy had already been enabled.
+// ValidateSMTPConfiguration validates the effective SMTP endpoint and sender
+// before any network operation. Password is optional: an empty password means
+// the deployment intentionally uses an unauthenticated SMTP relay. A server
+// that actually requires authentication is still rejected by PreflightSMTP
+// (or by the real send) when the SMTP transaction is attempted.
 func ValidateSMTPConfiguration(smtpAddr, fromAddr, password string) error {
 	smtpAddr = strings.TrimSpace(smtpAddr)
 	fromAddr = strings.TrimSpace(fromAddr)
-	if smtpAddr == "" || fromAddr == "" || password == "" {
+	if smtpAddr == "" || fromAddr == "" {
 		return errors.New("email service not configured")
 	}
 	if err := ValidateEmailAddress(fromAddr); err != nil {
@@ -607,14 +608,18 @@ func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody s
 	return []byte(b.String()), nil
 }
 
-// dispatchSMTP 跑完一次 SMTP 投递:dial → (STARTTLS) → AUTH → MAIL → RCPT →
-// DATA → QUIT。fromSan / toSan 必须已经过 sanitizeHeader。
+// dispatchSMTP 跑完一次 SMTP 投递:dial → (STARTTLS) → [AUTH] → MAIL → RCPT →
+// DATA → QUIT。密码为空时跳过 AUTH，以支持受网络隔离保护的无密码 SMTP
+// relay。fromSan / toSan 必须已经过 sanitizeHeader。
 func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd, toSan string, msg []byte) error {
 	host, port, err := net.SplitHostPort(smtpAddr)
 	if err != nil {
 		return fmt.Errorf("smtp地址格式错误: %w", err)
 	}
-	auth := smtp.PlainAuth("", fromSan, pwd, host)
+	var auth smtp.Auth
+	if pwd != "" {
+		auth = smtp.PlainAuth("", fromSan, pwd, host)
+	}
 
 	dialer := &net.Dialer{Timeout: smtpDialTimeout}
 	var conn net.Conn
@@ -654,13 +659,15 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 	return runSMTPTransaction(client, auth, fromSan, toSan, msg)
 }
 
-// runSMTPTransaction 跑完一次 SMTP 投递：Auth → Mail → Rcpt → Data → Quit。
+// runSMTPTransaction 跑完一次 SMTP 投递：[Auth] → Mail → Rcpt → Data → Quit。
 // 抽出来是为了 465 / 587 路径不用复制 7 行序列；同时确保两条路径都发 QUIT
 // （旧实现用 smtp.SendMail，stdlib 末尾就是 c.Quit()——本 PR 重写时漏发，
 // 部分严格邮件网关在缺 QUIT 时会丢弃消息。defer client.Close 仅用于异常兜底）。
 func runSMTPTransaction(client *smtp.Client, auth smtp.Auth, from, to string, msg []byte) error {
-	if err := client.Auth(auth); err != nil {
-		return fmt.Errorf("SMTP认证失败: %w", err)
+	if auth != nil {
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP认证失败: %w", err)
+		}
 	}
 	if err := client.Mail(from); err != nil {
 		return err

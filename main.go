@@ -480,10 +480,25 @@ func runAPI(ctx *config.Context) {
 	// writes and when the manager MFA code is actually sent.
 	managerMFASettings := commonmodule.EnsureSystemSettings(ctx)
 	if err := managerMFASettings.EnsureManagerEmailMFASettings(); err != nil {
-		log.Warn("initialize manager MFA system settings failed; database settings remain authoritative", zap.Error(err))
+		log.Error("initialize manager MFA system settings failed; management MFA may remain fail-closed; existing support.* database rows remain authoritative and YAML is only a fallback for absent rows", zap.Error(err))
+	} else {
+		log.Info("shared support.* SMTP settings are database-owned; YAML only bootstraps missing rows and SupportEmail* uses database values when present",
+			zap.String("source", "system_setting"),
+			zap.String("keys", "support.email,support.email_smtp,support.email_pwd"))
 	}
-	if err := managerMFASettings.Load(); err != nil {
-		log.Warn("reload SystemSettings after module setup failed; manager MFA follows the last loaded database snapshot", zap.Error(err))
+	loadErr := managerMFASettings.Load()
+	if loadErr != nil {
+		log.Error("reload SystemSettings after module setup failed; management MFA follows the last loaded database snapshot and may remain fail-closed", zap.Error(loadErr))
+	} else if managerMFASettings.ManagerEmailMFAState() == commonmodule.ManagerEmailMFAOn {
+		// Existing installations may have a partial support.* override from the
+		// pre-MFA database/YAML merge behavior. The manager MFA path now reads
+		// these values from the database snapshot only, so surface that upgrade
+		// incompatibility loudly instead of letting the first OTP send discover
+		// it as an opaque 503. This is a format/completeness check only; startup
+		// deliberately does not send probe mail.
+		if err := managerMFASettings.ValidateManagerEmailMFASMTP(); err != nil {
+			log.Error("manager-console MFA is enabled but database-owned SMTP configuration is incomplete or invalid; verify the existing database SMTP rows before upgrading; management MFA remains fail-closed", zap.Error(err))
+		}
 	}
 	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
 	if err != nil {

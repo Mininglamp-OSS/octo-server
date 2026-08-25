@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### 管理控制台 MFA 升级前提
+
+- `OCTO_MASTER_KEY` 必须在升级前配置为原有的有效 32 字节密钥。该变量是
+  既有版本对加密应用数据和加密系统配置的前置依赖，并非本次管理控制台
+  MFA 新增的依赖。缺失或更换旧密钥会导致加密配置无法读写，管理端 MFA
+  将保持 fail-closed；请先恢复原密钥再升级。
+- 管理 MFA/SMTP 初始化或系统配置加载失败现在输出 `ERROR` 级别日志，
+  但不会因该配置基础设施错误直接 panic API 服务。
+- 升级前，如果旧版本数据库中的管理控制台 MFA 已开启，必须确认数据库中
+  的 `support.email`、`support.email_smtp` 以及可选的 `support.email_pwd`
+  能组成有效 SMTP 配置。部分数据库配置不会再从 YAML 静默补齐；启动检测到
+  该非法状态时输出 `ERROR`，管理端 MFA 保持 fail-closed，需由运维修复配置。
+
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能

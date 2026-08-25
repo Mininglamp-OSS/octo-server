@@ -228,4 +228,17 @@ func TestManagerMFAAtomicVerifyReturnsVerificationLockRetryAfter(t *testing.T) {
 	assert.GreaterOrEqual(t, locked.RetryAfter, 1)
 	assert.LessOrEqual(t, locked.RetryAfter, 10*60)
 	assert.ErrorIs(t, err, commonbase.ErrManagerCodeLocked)
+
+	// A subsequent verification while the lock is already present must return
+	// the remaining Redis TTL, not the generic ten-minute default. Shorten the
+	// lock first so this assertion cannot pass if the implementation returns a
+	// fixed 600-second value instead of driving the PTTL branch.
+	require.NoError(t, service.client.Expire(keys[3], 5*time.Second).Err())
+	var lockedAgain *commonbase.ManagerCodeVerificationLockedError
+	err = emailService.VerifyManagerCodeAtomically(
+		context.Background(), email, "000000", challengeID, keys[4], keys[5], keys[6],
+	)
+	require.ErrorAs(t, err, &lockedAgain)
+	assert.GreaterOrEqual(t, lockedAgain.RetryAfter, 1)
+	assert.LessOrEqual(t, lockedAgain.RetryAfter, 5)
 }

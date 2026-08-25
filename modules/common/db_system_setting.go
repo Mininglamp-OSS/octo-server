@@ -11,7 +11,8 @@ import (
 // The table stores admin-tunable global config (paired with octo's static yaml
 // defaults). Each row is uniquely identified by (category, key_name); upsert
 // uses that unique key so admins can overwrite values without producing
-// duplicate rows.
+// duplicate rows. Startup seeding uses the separate insert-if-absent helper
+// below so initialization can never overwrite an operator's value.
 type systemSettingDB struct {
 	session *dbr.Session
 	ctx     *config.Context
@@ -47,6 +48,14 @@ func (s *systemSettingDB) upsertWithTx(tx *dbr.Tx, category, key, value, valueTy
 	return upsertSystemSettingOn(tx, category, key, value, valueType, description)
 }
 
+// insertIfAbsentWithTx inserts a bootstrap row only when its unique
+// (category, key_name) key is not already present. The decision is made by
+// MySQL's unique index inside the statement, rather than by a prior SELECT,
+// so a concurrent admin write cannot be overwritten by startup initialization.
+func (s *systemSettingDB) insertIfAbsentWithTx(tx *dbr.Tx, category, key, value, valueType, description string) error {
+	return insertSystemSettingIfAbsentOn(tx, category, key, value, valueType, description)
+}
+
 // beginTx opens a new transaction on the underlying session; callers must
 // commit or rollback. Exposed so the manager layer can batch the entire
 // admin payload without producing partial writes on mid-batch error.
@@ -66,6 +75,16 @@ func upsertSystemSettingOn(runner sqlRunner, category, key, value, valueType, de
 		"INSERT INTO system_setting (category, key_name, value, value_type, description) "+
 			"VALUES (?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE value = VALUES(value), value_type = VALUES(value_type), description = VALUES(description)",
+		category, key, value, valueType, description,
+	).Exec()
+	return err
+}
+
+func insertSystemSettingIfAbsentOn(runner sqlRunner, category, key, value, valueType, description string) error {
+	_, err := runner.InsertBySql(
+		"INSERT INTO system_setting (category, key_name, value, value_type, description) "+
+			"VALUES (?, ?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE key_name = key_name",
 		category, key, value, valueType, description,
 	).Exec()
 	return err
