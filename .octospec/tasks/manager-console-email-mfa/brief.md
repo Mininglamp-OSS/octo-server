@@ -42,6 +42,15 @@ formats, and it does not add an MFA assurance claim to tokens. The public
 unauthenticated ordinary-user request cannot interfere with the management OTP
 keyspace. Ordinary code types retain their existing ordinary-platform behavior.
 
+Here, “ordinary-user behavior is unchanged” specifically means that ordinary
+users do not enter the management-console MFA flow: ordinary-user login,
+registration, password recovery, OAuth/OIDC, and QR-code paths do not create a
+management challenge, send a management OTP, verify a management OTP, or gain
+new management-token semantics from this task. The shared SMTP configuration
+and transport are infrastructure used by multiple mail flows; this statement
+does not claim that those shared infrastructure details are independent of
+manager-MFA configuration.
+
 ## Deployment prerequisite and security boundary
 
 Management authorization continues to rely on the management role carried by
@@ -89,7 +98,8 @@ not cover those alternate credential paths.
   rows are missing; later YAML edits do not override those rows. The ordinary
   `SupportEmail*()` getters still use YAML only when the corresponding row is
   absent. This ownership change is explicit and is surfaced in the startup
-  log; it is not an ordinary-user mail-flow code-path change.
+  log. It does not enroll ordinary users in MFA or change their authentication
+  flow; shared SMTP transport behavior remains an infrastructure concern.
 - Existing deployments are an upgrade prerequisite: before upgrading, if
   management MFA is already enabled in the database, the database-backed
   `support.email`, `support.email_smtp`, and optional `support.email_pwd` values
