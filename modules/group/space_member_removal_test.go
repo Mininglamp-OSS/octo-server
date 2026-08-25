@@ -360,9 +360,29 @@ func payloadExtraHasName(payloads []map[string]interface{}, fragment, name strin
 func seedPendingRemovals(t *testing.T, ctx *config.Context, spaceID string, uids []string, reason string) {
 	t.Helper()
 	for _, uid := range uids {
+		// next_attempt_at 推到远未来，**刻意的**：这些工单只是给抑制检查看的事实，
+		// 不该被任何活着的 worker 认领。
+		//
+		// 列默认值是 CURRENT_TIMESTAMP(3)，即 seed 出来就立刻可认领。而 E2E 环境里
+		// Space 的清理 worker 是活的（前面的用例触发过 processMemberRemovalCleanups，
+		// 加上 10s 定时器），它会抢跑本用例正要自己驱动的这批工单：级联提前跑完，
+		// 测试随后的 cleanupSpaceMemberGroups 读到人已不在群里、幂等返回，
+		// 交接通告一条也数不到。
+		//
+		// 更糟的是它不会表现成「多算了一条」而是「零条」：register.GetModules 用进程级
+		// sync.Once 构造模块实例，那个 worker 永远持有**本进程第一个** NewTestServer
+		// 的 ctx，于是它发的消息进的是别的 IM 桩。CI 的 E2E 分片上就是这样红的
+		// （PR #804 round-10 review 记录：单独跑 10/10 绿、整包在 E2E 环境红，
+		// 日志里能看到 worker 的 step 重试与 "role changed concurrently"）。
+		//
+		// 抑制检查 HasPendingRemovalCleanup 只看 `status=pending`，而认领要求
+		// `next_attempt_at<=now`（db_member_removal.go）—— 两个条件互不相干，
+		// 所以推远它既保留了本用例要的事实，又让 worker 抢不到。
 		_, err := ctx.DB().Exec(
-			"INSERT INTO space_member_removal_cleanup (space_id, uid, operator_uid, reason, status, created_at) "+
-				"VALUES (?, ?, 'su', ?, 0, NOW(3))", spaceID, uid, reason)
+			"INSERT INTO space_member_removal_cleanup "+
+				"(space_id, uid, operator_uid, reason, status, created_at, next_attempt_at) "+
+				"VALUES (?, ?, 'su', ?, 0, NOW(3), DATE_ADD(NOW(3), INTERVAL 1 DAY))",
+			spaceID, uid, reason)
 		require.NoError(t, err)
 	}
 }
