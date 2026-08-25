@@ -49,9 +49,15 @@ const (
 	ReasonOn            = "on"
 	ReasonWhitelistHit  = "whitelist_hit"
 	ReasonWhitelistMiss = "whitelist_miss"
-	ReasonPercentIn     = "percent_in"
-	ReasonPercentOut    = "percent_out"
-	ReasonUnknownMode   = "unknown_mode"
+	// ReasonWhitelistDimUnavailable 表示白名单**非空**、但每一条的维度在本次评估
+	// 中都取不到值 —— 即这份名单在这个调用点永远不可能命中。它与 whitelist_miss
+	// 的区别是「命不中」还是「没法命中」：前者是正常结果，后者是配置与调用点不
+	// 匹配。少了这个区分，一条全是 group 条目的 client-visible 白名单会表现得和
+	// 「用户确实不在名单里」一模一样，两侧都无声。
+	ReasonWhitelistDimUnavailable = "whitelist_dim_unavailable"
+	ReasonPercentIn               = "percent_in"
+	ReasonPercentOut              = "percent_out"
+	ReasonUnknownMode             = "unknown_mode"
 	// ReasonDimUnavailable 表示规则要求的分桶维度在本次评估的 Dims 中为空，
 	// 判定因此 fail-closed。这是配置与调用点不匹配的信号，调用方应记日志告警。
 	ReasonDimUnavailable = "dim_unavailable"
@@ -86,6 +92,14 @@ type Dims struct {
 type Decision struct {
 	Allow  bool
 	Reason string
+	// DimensionUnusable 标记「这条规则引用的某个维度在本次评估中取不到值」，
+	// **独立于 Allow**。
+	//
+	// 之所以不并进 Reason：percent 的 0%/100% 短路在维度不可用时**决策依然正确**
+	// （0=谁都不放、100=所有人都放，与维度无关），把它们改成 fail-closed 会为了
+	// 一个不影响结果的错配去打挂一条正在全量的规则。但错配必须可见，否则运维会在
+	// 把 100 调到 50 的那一刻突然全员掉线。于是决策照旧、另开一个位回报。
+	DimensionUnusable bool
 }
 
 // Evaluate 是纯函数：按 rule.Mode 判定是否放行。不读 env、不判 kill switch。
@@ -109,15 +123,25 @@ func Evaluate(rule Rule, scopes []Scope, dims Dims) Decision {
 	case ModeOn:
 		return Decision{Allow: true, Reason: ReasonOn}
 	case ModeWhitelist:
-		if whitelistHit(scopes, dims) {
+		hit, allUnusable := whitelistHit(scopes, dims)
+		if hit {
 			return Decision{Allow: true, Reason: ReasonWhitelistHit}
+		}
+		if allUnusable {
+			return Decision{Allow: false, Reason: ReasonWhitelistDimUnavailable, DimensionUnusable: true}
 		}
 		return Decision{Allow: false, Reason: ReasonWhitelistMiss}
 	case ModePercent:
-		if whitelistHit(scopes, dims) {
+		hit, allUnusable := whitelistHit(scopes, dims)
+		if hit {
 			return Decision{Allow: true, Reason: ReasonWhitelistHit}
 		}
-		return percentDecision(rule, dims)
+		d := percentDecision(rule, dims)
+		// 白名单用不上也是错配，即便分桶本身判得出结果。
+		if allUnusable {
+			d.DimensionUnusable = true
+		}
+		return d
 	default:
 		return Decision{Allow: false, Reason: ReasonUnknownMode}
 	}
@@ -126,17 +150,23 @@ func Evaluate(rule Rule, scopes []Scope, dims Dims) Decision {
 // whitelistHit 逐条比对白名单。条目按自己的 scope_type 取对应维度值；该维度在本次
 // 评估中为空时跳过该条目——空值绝不匹配，否则一条 scope_id="" 的脏数据会命中所有
 // 缺维度的调用。
-func whitelistHit(scopes []Scope, dims Dims) bool {
+//
+// 第二个返回值 allDimsUnusable 报告「名单非空，但每一条都因维度取不到值而被跳过」。
+// 调用方据此把「没命中」和「没法命中」分开：空名单不算（那是合法状态），有可用维度
+// 的条目只是没匹配上也不算。
+func whitelistHit(scopes []Scope, dims Dims) (hit bool, allDimsUnusable bool) {
+	usable := 0
 	for _, s := range scopes {
 		id := dimValue(s.Type, dims)
 		if id == "" {
 			continue
 		}
+		usable++
 		if s.ID == id {
-			return true
+			return true, false
 		}
 	}
-	return false
+	return false, len(scopes) > 0 && usable == 0
 }
 
 // percentDecision 判定 percent 模式。0（及负数）全拒、>=100 全放，这两档与维度
@@ -146,16 +176,18 @@ func whitelistHit(scopes []Scope, dims Dims) bool {
 // 对象落进同一个桶（Bucket(key,"") 是该 key 的一个常数），使配置的 50% 静默变成
 // 全体开或全体关，且管理台仍显示 50%——一个无任何报错的错配。
 func percentDecision(rule Rule, dims Dims) Decision {
+	// 短路分支的决策与维度无关，但错配仍要回报（见 Decision.DimensionUnusable）。
+	unusable := dimValue(BucketDimension(rule), dims) == ""
 	if rule.Percent <= 0 {
-		return Decision{Allow: false, Reason: ReasonPercentOut}
+		return Decision{Allow: false, Reason: ReasonPercentOut, DimensionUnusable: unusable}
 	}
 	if rule.Percent >= 100 {
-		return Decision{Allow: true, Reason: ReasonPercentIn}
+		return Decision{Allow: true, Reason: ReasonPercentIn, DimensionUnusable: unusable}
+	}
+	if unusable {
+		return Decision{Allow: false, Reason: ReasonDimUnavailable, DimensionUnusable: true}
 	}
 	dimID := dimValue(BucketDimension(rule), dims)
-	if dimID == "" {
-		return Decision{Allow: false, Reason: ReasonDimUnavailable}
-	}
 	if Bucket(rule.Key, dimID) < rule.Percent {
 		return Decision{Allow: true, Reason: ReasonPercentIn}
 	}

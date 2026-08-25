@@ -11,6 +11,7 @@ type gateModel struct {
 	Percent     int
 	BucketBy    string
 	Description string
+	UpdatedBy   string
 	db.BaseModel
 }
 
@@ -19,5 +20,6 @@ type scopeModel struct {
 	FeatureKey string
 	ScopeType  string
 	ScopeID    string
+	UpdatedBy  string
 	db.BaseModel
 }

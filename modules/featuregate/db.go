@@ -54,13 +54,13 @@ func (d *gateDB) listRules() ([]*gateModel, error) {
 
 // upsertRule 按 feature_key 写入/覆盖规则。靠唯一键 uk_octo_feature_gate_key 幂等：
 // 不存在则创建（注册新功能 gate），存在则覆盖 mode/percent/bucket_by/description。
-func (d *gateDB) upsertRule(key, mode string, percent int, bucketBy, description string) error {
+func (d *gateDB) upsertRule(key, mode string, percent int, bucketBy, description, updatedBy string) error {
 	_, err := d.session.InsertBySql(
-		"INSERT INTO "+tableGateQuoted+" (feature_key, mode, percent, bucket_by, description) "+
-			"VALUES (?, ?, ?, ?, ?) "+
+		"INSERT INTO "+tableGateQuoted+" (feature_key, mode, percent, bucket_by, description, updated_by) "+
+			"VALUES (?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE mode=VALUES(mode), percent=VALUES(percent), "+
-			"bucket_by=VALUES(bucket_by), description=VALUES(description)",
-		key, mode, percent, bucketBy, description,
+			"bucket_by=VALUES(bucket_by), description=VALUES(description), updated_by=VALUES(updated_by)",
+		key, mode, percent, bucketBy, description, updatedBy,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("featuregate: upsert rule %q: %w", key, err)
@@ -70,12 +70,12 @@ func (d *gateDB) upsertRule(key, mode string, percent int, bucketBy, description
 
 // addScope 幂等地加入一条白名单条目；重复 (key,type,id) 命中唯一键走 no-op
 // 更新，对调用方表现为成功。
-func (d *gateDB) addScope(key, scopeType, scopeID string) error {
+func (d *gateDB) addScope(key, scopeType, scopeID, updatedBy string) error {
 	_, err := d.session.InsertBySql(
-		"INSERT INTO "+tableGateScopeQuoted+" (feature_key, scope_type, scope_id) "+
-			"VALUES (?, ?, ?) "+
-			"ON DUPLICATE KEY UPDATE feature_key=feature_key",
-		key, scopeType, scopeID,
+		"INSERT INTO "+tableGateScopeQuoted+" (feature_key, scope_type, scope_id, updated_by) "+
+			"VALUES (?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE updated_by=VALUES(updated_by)",
+		key, scopeType, scopeID, updatedBy,
 	).Exec()
 	if err != nil {
 		return fmt.Errorf("featuregate: add scope %q/%s/%s: %w", key, scopeType, scopeID, err)
@@ -94,6 +94,21 @@ func (d *gateDB) deleteScope(key, scopeType, scopeID string) (int64, error) {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("featuregate: delete scope rows affected: %w", err)
+	}
+	return n, nil
+}
+
+// countScopes 统计某 key 的白名单条目数，供写侧配额校验。
+//
+// 上限设在写侧而非给 queryScopes 加 LIMIT：后者会在**评估路径**上静默丢条目，把
+// 「慢但正确」换成「快但答案错」。写侧封顶同时封住了查询量与 Redis 缓存值大小，
+// 而且超限时运维收到的是明确拒绝，不是悄悄少了几个人。
+func (d *gateDB) countScopes(key string) (int, error) {
+	var n int
+	err := d.session.Select("COUNT(*)").From(tableGateScopeQuoted).
+		Where("feature_key=?", key).LoadOne(&n)
+	if err != nil {
+		return 0, fmt.Errorf("featuregate: count scopes %q: %w", key, err)
 	}
 	return n, nil
 }

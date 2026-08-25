@@ -3,8 +3,10 @@ package featuregate
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -337,4 +339,151 @@ func TestManagerListNormalizesEmptyBucketBy(t *testing.T) {
 	require.Equal(t, fg.ScopeTypeGroup, got.BucketBy, "空 bucket_by 应回显为实际生效的默认维度")
 	require.Equal(t, "OCTO_FEATUREGATE_K_KILL", got.KillSwitchEnv)
 	require.NotNil(t, got.Scopes, "scopes 必须序列化为 []，不能是 null")
+}
+
+// TestUpdateRejectsClientVisibleKeyWhoseScopesAreAllUnusable 是评审抓到的 P1 阻塞项，
+// 也是 brief 验收里我漏实现的那半条。
+//
+// 触发顺序正是注册表的**正常生命周期**（注册表是编译期清单、gate 是 DB 行）：
+//  1. gate 还不是 client-visible，ops 加了 group 白名单 —— 当时完全正确；
+//  2. 后续发版把它加进 clientFlagList；
+//  3. ops 改成 whitelist + bucket_by=user。
+//
+// 第 3 步若放行，白名单里就全是永远命不中的条目，而运维看到的是：名单有行、mode
+// 对、写入 200、日志无声，flag 对所有人 false。这是本模块唯一一处写侧读侧皆无信号
+// 的错配，必须在写侧挡住。
+func TestUpdateRejectsClientVisibleKeyWhoseScopesAreAllUnusable(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+
+	const key = "fgtest_lifecycle"
+	db := newDB(ctx)
+
+	// 阶段一：key 还不是 client-visible，group 白名单是合法配置。
+	internalOnly := mountManager(t, ctx, nil)
+	require.Equal(t, http.StatusOK, doJSON(t, internalOnly, http.MethodPut,
+		"/v1/manager/featuregate/gates/"+key,
+		map[string]any{"mode": "whitelist", "bucket_by": "group"}).Code)
+	require.Equal(t, http.StatusOK, doJSON(t, internalOnly, http.MethodPost,
+		"/v1/manager/featuregate/gates/"+key+"/scopes",
+		map[string]any{"scope_type": "group", "scope_id": "g1"}).Code)
+
+	// 阶段二：一次发版把它变成 client-visible。
+	visible := mountManager(t, ctx, []ClientFlag{{FeatureKey: key, ClientKey: "lifecycle"}})
+
+	// 阶段三：这次 update 必须被拒 —— 白名单存量全是用不上的维度。
+	w := doJSON(t, visible, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+		map[string]any{"mode": "whitelist", "bucket_by": "user"})
+	require.Equal(t, http.StatusBadRequest, w.Code,
+		"存量白名单全是 group 条目，改成 client-visible 后必须拒绝；body: %s", w.Body.String())
+	code, reason := errCodeOf(t, w)
+	require.Equal(t, "err.server.featuregate.request_invalid", code)
+	require.Equal(t, "client_visible_scopes", reason)
+
+	// 补一条 user 条目后，同样的 update 应当放行。
+	require.NoError(t, db.addScope(key, fg.ScopeTypeUser, "u1", "tester"))
+	require.Equal(t, http.StatusOK, doJSON(t, visible, http.MethodPut,
+		"/v1/manager/featuregate/gates/"+key,
+		map[string]any{"mode": "whitelist", "bucket_by": "user"}).Code,
+		"存在可用维度条目后不应再拒")
+}
+
+// TestUpdateAllowsClientVisibleKeyWithEmptyScopes 钉住边界：空白名单是**合法状态**
+// （mode=whitelist 且暂时谁都不放），不能被上面那条检查误伤。
+func TestUpdateAllowsClientVisibleKeyWithEmptyScopes(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+
+	const key = "fgtest_empty_scopes"
+	r := mountManager(t, ctx, []ClientFlag{{FeatureKey: key, ClientKey: "empty_scopes"}})
+	w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+		map[string]any{"mode": "whitelist", "bucket_by": "user"})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+// TestManagerRecordsUpdatedBy 钉住审计列：能对全体用户关功能的开关必须留下操作人。
+// 仓库既有惯例见 octo_space_welcome_config / bot_mention_pref 的 updated_by。
+func TestManagerRecordsUpdatedBy(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	const key = "fgtest_audit"
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPut,
+		"/v1/manager/featuregate/gates/"+key, map[string]any{"mode": "on"}).Code)
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPost,
+		"/v1/manager/featuregate/gates/"+key+"/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "u1"}).Code)
+
+	rule, err := newDB(ctx).queryRule(key)
+	require.NoError(t, err)
+	require.NotNil(t, rule)
+	require.Equal(t, testutil.UID, rule.UpdatedBy, "规则必须记录最后修改人")
+
+	scopes, err := newDB(ctx).queryScopes(key)
+	require.NoError(t, err)
+	require.Len(t, scopes, 1)
+	require.Equal(t, testutil.UID, scopes[0].UpdatedBy, "白名单条目必须记录添加人")
+
+	// 管理端列表要回显，否则运维得去查库。
+	w := doJSON(t, r, http.MethodGet, "/v1/manager/featuregate/gates", nil)
+	require.Contains(t, w.Body.String(), `"updated_by"`)
+	require.Contains(t, w.Body.String(), testutil.UID)
+}
+
+// TestManagerRejectsScopeIDWithPathSeparator 关掉「能建不能删」的不对称：scope_id
+// 含 '/' 时可插入、但 delScope 按单个路径段取值，永远删不掉（gin 匹配的是已解码
+// 路径，%2F 也绕不过）。
+func TestManagerRejectsScopeIDWithPathSeparator(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	for _, bad := range []string{"a/b", "a b", "a\tb"} {
+		w := doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/fgtest_sep/scopes",
+			map[string]any{"scope_type": "user", "scope_id": bad})
+		require.Equal(t, http.StatusBadRequest, w.Code, "scope_id=%q 应被拒；body: %s", bad, w.Body.String())
+		_, reason := errCodeOf(t, w)
+		require.Equal(t, "scope_id", reason)
+	}
+}
+
+// TestManagerDescriptionCountedInRunes 钉住 description 按字符而非字节计数 —— 列是
+// VARCHAR(255) 即 255 个字符，按字节校验会把中文描述砍到 ~85 字。
+func TestManagerDescriptionCountedInRunes(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/fgtest_desc",
+		map[string]any{"mode": "on", "description": strings.Repeat("灰", 200)})
+	require.Equal(t, http.StatusOK, w.Code, "200 个汉字（600 字节）在 255 字符列内，应当接受；body: %s", w.Body.String())
+
+	w = doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/fgtest_desc",
+		map[string]any{"mode": "on", "description": strings.Repeat("灰", 256)})
+	require.Equal(t, http.StatusBadRequest, w.Code, "超过 255 字符必须拒")
+	_, reason := errCodeOf(t, w)
+	require.Equal(t, "description", reason)
+}
+
+// TestManagerCapsWhitelistSize 给单个 key 的白名单条数设上限。
+//
+// 评审建议给 queryScopes 加 LIMIT，但那会在**评估路径**上静默丢条目 —— 把「慢但
+// 正确」换成「快但答案错」。改在写侧封顶：同时封住查询量和 Redis 缓存值大小，且
+// 超限时运维会收到明确拒绝而不是悄悄少了几个人。
+func TestManagerCapsWhitelistSize(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	const key = "fgtest_cap"
+	db := newDB(ctx)
+	for i := 0; i < maxScopesPerKey; i++ {
+		require.NoError(t, db.addScope(key, fg.ScopeTypeUser, fmt.Sprintf("u%d", i), "seed"))
+	}
+	w := doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/"+key+"/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "one_too_many"})
+	require.Equal(t, http.StatusBadRequest, w.Code, "超过上限必须拒；body: %s", w.Body.String())
+	_, reason := errCodeOf(t, w)
+	require.Equal(t, "scope_quota", reason)
 }

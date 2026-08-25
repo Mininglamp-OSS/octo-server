@@ -3,7 +3,7 @@ type: Task
 title: "Task: featuregate-user-scoped-flags"
 description: 复活 PR #280 的 pkg/featuregate + modules/featuregate 框架（不含 incomingwebhook 接入），扩展 user 维度的 whitelist/percent，并在 modules/featuregate 下新增需登录的只读端点 GET /v1/featuregate/flags 下发用户级灰度位；appconfig 的免鉴权契约与字段集不动。
 tags: ["auth", "error-response", "i18n", "rate-limit", "wire-contract", "testing"]
-timestamp: 2026-08-18T00:00:00Z
+timestamp: 2026-08-25T00:00:00+08:00
 slug: featuregate-user-scoped-flags
 upstream: Mininglamp-OSS/octo-server#280 （CLOSED，未合并）
 source: self
@@ -19,16 +19,19 @@ source: self
    featuregate），确需与部署位联动时由**服务端**做 AND，客户端只读一个最终布尔——
    AND 绝不放在客户端。理由与实现约束见 Load-bearing 对应条目。
 3. **刷新契约与失败语义**：冷启动 + 登录成功 + 前台化（节流 ≥5 分钟）；单个 key 遭遇
-   存储故障时**从响应中省略**该 key（而非下发 `false`），客户端保留上次值。见
-   Load-bearing 与 Acceptance 对应条目。
+   存储故障时进响应的 **`unavailable` 列表**（而非下发 `false`，也不是从 `flags` 里
+   省略），客户端对这些 key 保留上次值。
+   **2026-08-25 修订**：初稿用「从 `flags` 里省略」来表达这层含义，评审阶段改为显式
+   字段——语义等价，但「缺席携带含义」任何 schema 语言都描述不了，codegen 客户端会把
+   缺席读成 `false`，恰是这套设计要防的失败。见 Load-bearing 与 Acceptance 对应条目。
 4. **对外 JSON key 与 `feature_key` 解耦**：注册表项同时声明运维面的 `feature_key` 与
    对外的 `client_key`，两者独立演进——运维改 gate 名不得破坏客户端。见 Load-bearing
    对应条目。
 
 ## 需要外部对齐（不阻塞服务端开工，但上线前必须完成）
 
-- **客户端团队**：实现上面第 3 条的拉取时机，以及"响应缺该 key = 保留上次值、无历史值
-  = `false`"的本地语义。这半边服务端单方面做不到。
+- **客户端团队**：实现上面第 3 条的拉取时机，以及"key 出现在 `unavailable` 里 = 保留
+  上次值、无历史值 = `false`"的本地语义。这半边服务端单方面做不到。
 - **运营**：生效延迟是**分钟级到小时级，不是秒级**。紧急关停必须走
   `OCTO_FEATUREGATE_<KEY>_KILL=1` + 服务端拒绝相关 API，**不能靠隐藏客户端入口止血**——展示位
   不是安全边界。

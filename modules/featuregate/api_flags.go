@@ -13,18 +13,23 @@ import (
 
 // flagsResp 是 GET /v1/featuregate/flags 的响应体。
 //
-// Flags 刻意是 map[string]bool（动态 key）而不是固定字段的 struct，且**不得**加
-// omitempty。这不是风格选择，是失败语义的前提：
-//
-//   - 固定字段 struct 的 bool 永远序列化，做不到「省略某个 key」；
-//   - 而一旦为了省略去加 omitempty，值为 false 的 key 会被一起吞掉——「规则不存在
-//     的确定性的关」就和「存储故障」在线上长得一模一样，客户端会保留旧值，灰度
-//     永远关不掉。
+// Flags 是 map[string]bool（动态 key），且**不得**加 omitempty —— 值为 false 的
+// key 必须出现在 JSON 里。固定字段 struct 或 omitempty 都会让「确定性的关」丢失。
 //
 // 值只有布尔：不下发 mode/percent/scope 等内部细节，避免客户端反推灰度策略。
 // 排障所需的「为什么是这个值」只进服务端日志。
+//
+// Unavailable 列出**判定不可得**的 key（存储故障），客户端应对这些 key 保留上次
+// 值。早先的设计是把它们从 Flags 里省略、用「缺席」来表达这层含义，语义上等价，
+// 但**任何 schema 语言都描述不了「缺席携带含义」**：OpenAPI / JSON Schema 只能说
+// 某属性可选，没有词汇表达「不出现 ≠ 零值」。于是 codegen 出来的客户端反序列化进
+// map 之后，那个区分在任何业务代码跑起来之前就已经丢了，语言的零值规则会把缺席读
+// 成 false —— 恰好是这套设计要防的那个失败。改成显式字段后契约完全可描述，
+// 客户端不可能"默认做错"，而且它只说"没算出来"、不说为什么，不泄露灰度策略。
 type flagsResp struct {
 	Flags map[string]bool `json:"flags"`
+	// 恒为非 nil：空时序列化成 []，避免弱类型客户端在 null 上解引用炸掉。
+	Unavailable []string `json:"unavailable"`
 }
 
 // displayEvaluator 是 flagsAPI 需要的最小能力面，在使用处定义（而不是在
@@ -69,9 +74,9 @@ func newFlagsAPI(ctx *config.Context, svc displayEvaluator, registry *clientRegi
 // 契约要点：
 //   - 请求**不接受任何 key 参数**。响应恒为注册表全集，客户端因此无法用一个精心
 //     构造的 key 去探测某个内部 gate 是否存在——注册表就是调用方跨不过去的边界。
-//   - 单个 key 遇到**存储故障**时从响应中省略（客户端保留上次值），其余 key 照常
-//     返回，整个请求仍然 200。一次 Redis 抖动不该让全体用户丢功能。
-//   - 「规则不存在」是确定性的关，下发 false，**不省略**。两者混淆会让「未配置」
+//   - 单个 key 遇到**存储故障**时进 unavailable 列表（客户端保留上次值），其余 key
+//     照常返回，整个请求仍然 200。一次 Redis 抖动不该让全体用户丢功能。
+//   - 「规则不存在」是确定性的关，进 flags 且值为 false。两者混淆会让「未配置」
 //     变成「保留旧值」，灰度就永远关不掉。
 func (a *flagsAPI) get(c *wkhttp.Context) {
 	// 结果因人而异，而 URL 对所有用户逐字节相同——区分调用者的只有鉴权头。
@@ -100,16 +105,19 @@ func (a *flagsAPI) get(c *wkhttp.Context) {
 	dims := fg.Dims{UID: uid}
 
 	flags := make(map[string]bool, len(a.registry.flags))
+	unavailable := make([]string, 0)
 	for _, f := range a.registry.flags {
 		allow, ok := a.resolve(c.Request.Context(), f, dims)
 		if !ok {
-			// 存储故障：省略该 key，让客户端保留上次值。已在 AllowDisplay 内打过 Warn。
+			// 存储故障：判定不可得，显式列出让客户端保留上次值。
+			// 已在 AllowDisplay 内打过 Warn。
+			unavailable = append(unavailable, f.ClientKey)
 			continue
 		}
 		flags[f.ClientKey] = allow
 	}
 
-	c.Response(flagsResp{Flags: flags})
+	c.Response(flagsResp{Flags: flags, Unavailable: unavailable})
 }
 
 // resolve 求出单个 flag 对本次调用者的最终值。

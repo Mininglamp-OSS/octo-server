@@ -51,18 +51,23 @@ func newManagerWithRegistry(ctx *config.Context, registry *clientRegistry) *Mana
 // 用户侧端点用 /v1/featuregate/... 而非 /v1/user/...：路径首段跟模块名走
 // （同 /v1/common/appconfig、/v1/sticker/user），从路由能直接定位到代码。
 func (m *Manager) Route(r *wkhttp.WKHttp) {
-	mgr := r.Group("/v1/manager/featuregate", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
-	{
-		mgr.GET("/gates", m.list)                              // 列出所有规则（含白名单）
-		mgr.PUT("/gates/:key", m.update)                       // 改 mode/percent/bucket_by/description
-		mgr.POST("/gates/:key/scopes", m.addScope)             // 加白名单条目
-		mgr.DELETE("/gates/:key/scopes/:scope_id", m.delScope) // 删白名单条目
-	}
+	m.routeManager(r)
+	m.routeUser(r)
+}
 
-	user := r.Group("/v1/featuregate", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
-	{
-		user.GET("/flags", m.flags.get) // 当前登录用户的灰度位
-	}
+// routeManager 挂 superadmin 管理面。角色校验在每个 handler 内再做一次。
+func (m *Manager) routeManager(r *wkhttp.WKHttp) {
+	g := r.Group("/v1/manager/featuregate", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
+	g.GET("/gates", m.list)                              // 列出所有规则（含白名单）
+	g.PUT("/gates/:key", m.update)                       // 改 mode/percent/bucket_by/description
+	g.POST("/gates/:key/scopes", m.addScope)             // 加白名单条目
+	g.DELETE("/gates/:key/scopes/:scope_id", m.delScope) // 删白名单条目
+}
+
+// routeUser 挂已登录用户的只读下发面。
+func (m *Manager) routeUser(r *wkhttp.WKHttp) {
+	g := r.Group("/v1/featuregate", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
+	g.GET("/flags", m.flags.get) // 当前登录用户的灰度位
 }
 
 // ---- 请求/响应模型 ----
@@ -83,15 +88,19 @@ type scopeReq struct {
 type scopeResp struct {
 	ScopeType string `json:"scope_type"`
 	ScopeID   string `json:"scope_id"`
+	UpdatedBy string `json:"updated_by"`
 }
 
 type gateResp struct {
-	FeatureKey  string      `json:"feature_key"`
-	Mode        string      `json:"mode"`
-	Percent     int         `json:"percent"`
-	BucketBy    string      `json:"bucket_by"`
-	Description string      `json:"description"`
-	Scopes      []scopeResp `json:"scopes"`
+	FeatureKey  string `json:"feature_key"`
+	Mode        string `json:"mode"`
+	Percent     int    `json:"percent"`
+	BucketBy    string `json:"bucket_by"`
+	Description string `json:"description"`
+	// UpdatedBy 是最近修改该规则的管理员 uid。一个能对全体用户关功能的开关必须
+	// 留下操作人，否则事后无从追溯是谁在什么时候翻的。
+	UpdatedBy string      `json:"updated_by"`
+	Scopes    []scopeResp `json:"scopes"`
 	// ClientVisible 标示该 key 是否会被下发到客户端。运维据此知道这条规则受
 	// 「维度必须是 user」的额外约束，也知道改它会影响终端展示。
 	ClientVisible bool `json:"client_visible"`
@@ -102,7 +111,7 @@ type gateResp struct {
 func toGateResp(g *gateModel, scopes []*scopeModel, clientVisible bool) gateResp {
 	sr := make([]scopeResp, 0, len(scopes))
 	for _, s := range scopes {
-		sr = append(sr, scopeResp{ScopeType: s.ScopeType, ScopeID: s.ScopeID})
+		sr = append(sr, scopeResp{ScopeType: s.ScopeType, ScopeID: s.ScopeID, UpdatedBy: s.UpdatedBy})
 	}
 	return gateResp{
 		FeatureKey: g.FeatureKey,
@@ -111,6 +120,7 @@ func toGateResp(g *gateModel, scopes []*scopeModel, clientVisible bool) gateResp
 		// 空值在回显里也归一成实际生效的维度，避免运维看到空白去猜默认是什么。
 		BucketBy:      fg.BucketDimension(fg.Rule{BucketBy: g.BucketBy}),
 		Description:   g.Description,
+		UpdatedBy:     g.UpdatedBy,
 		Scopes:        sr,
 		ClientVisible: clientVisible,
 		KillSwitchEnv: KillSwitchEnv(g.FeatureKey),

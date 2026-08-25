@@ -73,28 +73,36 @@ func TestEvaluate(t *testing.T) {
 			wantReason: ReasonWhitelistMiss,
 		},
 		{
-			name:       "whitelist 空 UID 不命中任何用户条目",
+			// 「空 UID 不命中」的保证仍在（Allow=false）。Reason 是 dim_unavailable：
+			// 名单里全是 user 条目而这次调用没有 UID —— 没法判，不是判了没中。
+			// 与 api_flags.go 对空 uid 打 Error 的处理同调。
+			name:       "whitelist 空 UID 不命中任何用户条目，且错配可见",
 			rule:       Rule{Key: "k", Mode: ModeWhitelist},
 			scopes:     userScope,
 			dims:       Dims{UID: ""},
 			wantAllow:  false,
-			wantReason: ReasonWhitelistMiss,
+			wantReason: ReasonWhitelistDimUnavailable,
 		},
 		{
+			// 报 dim_unavailable 而非 miss 是刻意的：UID 本身取不到值，这是
+			// 「没法判」不是「判了没中」。脏数据防御（空 scope_id 不匹配空维度）
+			// 由 Allow=false 保证，与 Reason 取值无关。
 			name:       "whitelist 空 scope_id 不匹配空维度（脏数据防御）",
 			rule:       Rule{Key: "k", Mode: ModeWhitelist},
 			scopes:     []Scope{{Type: ScopeTypeUser, ID: ""}},
 			dims:       Dims{UID: ""},
 			wantAllow:  false,
-			wantReason: ReasonWhitelistMiss,
+			wantReason: ReasonWhitelistDimUnavailable,
 		},
 		{
+			// 维度不交叉的保证仍在（Allow=false）；Reason 是 dim_unavailable 因为
+			// 这次调用根本没有 UID 维度可比。
 			name:       "whitelist 维度不交叉：用户条目不会被同值的 group_no 命中",
 			rule:       Rule{Key: "k", Mode: ModeWhitelist},
 			scopes:     userScope,
 			dims:       Dims{GroupNo: "u1"},
 			wantAllow:  false,
-			wantReason: ReasonWhitelistMiss,
+			wantReason: ReasonWhitelistDimUnavailable,
 		},
 
 		// ---- whitelist：group / space 维度 ----
@@ -115,12 +123,14 @@ func TestEvaluate(t *testing.T) {
 			wantReason: ReasonWhitelistHit,
 		},
 		{
-			name:       "whitelist 未知 scope_type 永不命中",
+			// 三个维度都有值，唯独 "tenant" 这个维度不存在 —— 该条目永远命不中。
+			// 报 dim_unavailable 让这类配置错误可见，比静默 miss 好。
+			name:       "whitelist 未知 scope_type 永不命中，且错配可见",
 			rule:       Rule{Key: "k", Mode: ModeWhitelist},
 			scopes:     []Scope{{Type: "tenant", ID: "t1"}},
 			dims:       Dims{UID: "t1", GroupNo: "t1", SpaceID: "t1"},
 			wantAllow:  false,
-			wantReason: ReasonWhitelistMiss,
+			wantReason: ReasonWhitelistDimUnavailable,
 		},
 
 		// ---- percent：白名单优先（本任务修的语义） ----
@@ -291,5 +301,95 @@ func TestValidDimension(t *testing.T) {
 		if ValidDimension(bad) {
 			t.Fatalf("%q 不应为合法维度", bad)
 		}
+	}
+}
+
+// TestWhitelistDimUnavailableIsDistinguishable 钉住读侧对「白名单条目全都用不上」的
+// 可辨识性。
+//
+// 这是评审抓到的那个盲区：一条 client-visible 规则的白名单若全是 group 条目，展示
+// 端点（只有 UID）跳过每一条后返回 whitelist_miss —— 与「用户确实不在名单里」完全
+// 同形。运维看到的是白名单有行、mode 是 whitelist、写入都 200、日志无声，而 flag 对
+// 所有人是 false。bucket_by 那条错配有 ReasonDimUnavailable 兜底，这条一直没有。
+func TestWhitelistDimUnavailableIsDistinguishable(t *testing.T) {
+	cases := []struct {
+		name       string
+		scopes     []Scope
+		dims       Dims
+		wantReason string
+	}{
+		{
+			// 全部条目的维度都取不到值 —— 这不是"没命中"，是"根本没法命中"。
+			name:       "条目维度全不可用",
+			scopes:     []Scope{{Type: ScopeTypeGroup, ID: "g1"}, {Type: ScopeTypeSpace, ID: "s1"}},
+			dims:       Dims{UID: "u1"},
+			wantReason: ReasonWhitelistDimUnavailable,
+		},
+		{
+			// 有可用维度的条目，只是没匹配上 —— 这是真正的 miss。
+			name:       "维度可用但未匹配",
+			scopes:     []Scope{{Type: ScopeTypeUser, ID: "someone_else"}},
+			dims:       Dims{UID: "u1"},
+			wantReason: ReasonWhitelistMiss,
+		},
+		{
+			// 混合：只要有一条维度可用，就是普通 miss，不该报维度不可用。
+			name:       "混合维度，有一条可用",
+			scopes:     []Scope{{Type: ScopeTypeGroup, ID: "g1"}, {Type: ScopeTypeUser, ID: "other"}},
+			dims:       Dims{UID: "u1"},
+			wantReason: ReasonWhitelistMiss,
+		},
+		{
+			// 空白名单是合法状态（mode=whitelist 且谁都不放），不是错配。
+			name:       "空白名单仍是普通 miss",
+			scopes:     nil,
+			dims:       Dims{UID: "u1"},
+			wantReason: ReasonWhitelistMiss,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Evaluate(Rule{Key: "k", Mode: ModeWhitelist}, tc.scopes, tc.dims)
+			if got.Allow {
+				t.Fatalf("均不应放行，得到 Allow=true")
+			}
+			if got.Reason != tc.wantReason {
+				t.Fatalf("Reason = %q, want %q", got.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestPercentShortcutStillReportsUnusableDimension 钉住 percent 的 0%/100% 短路
+// **不改变决策**、但要让错配可被上层发现。
+//
+// 两位评审在这里意见相左：一位主张把维度校验提到 100% 短路之前（即 fail-closed），
+// 另一位主张决策是对的、只需可见。取后者——percent=100 的意图无歧义（"所有人"），
+// 管理台显示与实际一致，为一个不影响结果的错配去打挂一条正在全量的规则是本末倒置。
+// 但错配必须留下痕迹，否则运维会在把 100 调到 50 的那一刻突然全员掉线。
+func TestPercentShortcutStillReportsUnusableDimension(t *testing.T) {
+	// 展示端点只有 UID，规则却配了 group 分桶。
+	dims := Dims{UID: "u1"}
+
+	full := Evaluate(Rule{Key: "k", Mode: ModePercent, Percent: 100, BucketBy: ScopeTypeGroup}, nil, dims)
+	if !full.Allow {
+		t.Fatalf("100%% 必须放行（决策不因维度错配而改变），得到 %+v", full)
+	}
+	if !full.DimensionUnusable {
+		t.Fatalf("100%% 短路仍须把维度不可用回报给上层，得到 %+v", full)
+	}
+
+	zero := Evaluate(Rule{Key: "k", Mode: ModePercent, Percent: 0, BucketBy: ScopeTypeGroup}, nil, dims)
+	if zero.Allow {
+		t.Fatalf("0%% 必须拒绝")
+	}
+	if !zero.DimensionUnusable {
+		t.Fatalf("0%% 短路同样须回报维度不可用，得到 %+v", zero)
+	}
+
+	// 维度可用时不得误报。
+	ok := Evaluate(Rule{Key: "k", Mode: ModePercent, Percent: 100, BucketBy: ScopeTypeUser}, nil, dims)
+	if ok.DimensionUnusable {
+		t.Fatalf("维度可用时不应报 DimensionUnusable，得到 %+v", ok)
 	}
 }

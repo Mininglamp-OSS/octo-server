@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stubEvaluator 让「存储故障 → 省略」这条路径可被确定性地断言，而不必真去弄坏
+// stubEvaluator 让「存储故障 → 进 unavailable」这条路径可被确定性地断言，而不必真去弄坏
 // DB/Redis（那会污染同包其它用例，或引入时序依赖）。
 type stubEvaluator struct {
 	// allow[key] 是确定性结论；unavailable[key] 为 true 时模拟存储故障。
@@ -36,7 +36,7 @@ func (s stubEvaluator) AllowDisplay(_ context.Context, key string, _ fg.Dims) (b
 // 除了建库跑迁移，它还清掉两类**跨运行存活**的 Redis 状态。CleanAllTables 只清
 // MySQL，Redis 一概不动，于是「drop 测试库重跑」这个本地标准动作会留下：
 //
-//   - ft:rule:* / ft:scope:*  ——  featuregate 自己的规则读缓存（TTL 60s）。
+//   - featuregate:*           ——  本模块的规则读缓存（TTL 60s，键含 schema 版本）。
 //     上一轮跑完留下的缓存会让新一轮把「规则不存在」读成上一轮写过的规则，
 //     症状是随机失败、且两次运行间隔超过 60s 就自动消失（最难查的那种）。
 //   - ratelimit:uid:*         ——  共享令牌桶，先跑的用例会消耗后跑用例的配额。
@@ -46,7 +46,10 @@ func (s stubEvaluator) AllowDisplay(_ context.Context, key string, _ fg.Dims) (b
 func newIntegrationCtx(t *testing.T) *config.Context {
 	t.Helper()
 	_, ctx := testutil.NewTestServer()
-	flushRedisPrefixes(t, ctx, "ft:rule:*", "ft:scope:*", "ratelimit:uid:*")
+	flushRedisPrefixes(t, ctx, "featuregate:*", "ratelimit:uid:*")
+	// 跑完把表清掉，与仓库约定的 `defer testutil.CleanAllTables(ctx)` 同效，
+	// 但集中在 fixture 里，新增用例不会漏。
+	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
 	return ctx
 }
 
@@ -83,24 +86,27 @@ func mountFlags(t *testing.T, ctx *config.Context, flags []ClientFlag, eval disp
 	return r
 }
 
-func getFlags(t *testing.T, r *libwkhttp.WKHttp) (*httptest.ResponseRecorder, map[string]bool) {
+type flagsBody struct {
+	Flags       map[string]bool `json:"flags"`
+	Unavailable []string        `json:"unavailable"`
+}
+
+func getFlags(t *testing.T, r *libwkhttp.WKHttp) (*httptest.ResponseRecorder, flagsBody) {
 	t.Helper()
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/v1/featuregate/flags", nil)
 	req.Header.Set("token", testutil.Token)
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		return w, nil
+		return w, flagsBody{}
 	}
-	var body struct {
-		Flags map[string]bool `json:"flags"`
-	}
+	var body flagsBody
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), "body: %s", w.Body.String())
-	return w, body.Flags
+	return w, body
 }
 
 // TestFlagsEndpointWireContract 覆盖响应的三条 wire 约定：用 client_key 作字段名、
-// 值为 false 的 key 必须出现、存储故障的 key 必须缺席。
+// 值为 false 的 key 必须出现在 flags 里、判定不可得的 key 必须显式出现在 unavailable。
 func TestFlagsEndpointWireContract(t *testing.T) {
 	ctx := newIntegrationCtx(t)
 
@@ -114,25 +120,29 @@ func TestFlagsEndpointWireContract(t *testing.T) {
 		unavailable: map[string]bool{"gamma_rollout": true},
 	}
 
-	w, got := getFlags(t, mountFlags(t, ctx, flags, eval))
+	w, body := getFlags(t, mountFlags(t, ctx, flags, eval))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	// 用 client_key 作字段名，feature_key 不得出现在 wire 上——两者解耦正是为了
 	// 让运维改 feature_key 不破坏客户端。
-	require.Contains(t, got, "alpha")
-	require.NotContains(t, got, "alpha_rollout", "响应必须用 client_key，不能透出 feature_key")
+	require.Contains(t, body.Flags, "alpha")
+	require.NotContains(t, w.Body.String(), "alpha_rollout", "响应必须用 client_key，不能透出 feature_key")
 
-	require.True(t, got["alpha"])
+	require.True(t, body.Flags["alpha"])
 
-	// 值为 false 的 key **必须**出现（不得被 omitempty 吞掉），否则它会与
-	// 「存储故障省略」混为一谈，客户端保留旧值，灰度关不掉。
-	v, ok := got["beta"]
-	require.True(t, ok, "确定性的 false 必须出现在响应里，实际 body: %s", w.Body.String())
+	// 值为 false 的 key **必须**出现在 flags 里（不得被 omitempty 吞掉）。
+	v, ok := body.Flags["beta"]
+	require.True(t, ok, "确定性的 false 必须出现在 flags 里，实际 body: %s", w.Body.String())
 	require.False(t, v)
 
-	// 存储故障的 key **必须**缺席，让客户端保留上次值。
-	_, ok = got["gamma"]
-	require.False(t, ok, "存储故障的 key 应从响应中省略，而不是下发 false；body: %s", w.Body.String())
+	// 判定不可得的 key：不进 flags，而是**显式**列进 unavailable。
+	//
+	// 早先用"从 flags 里缺席"来表达这层含义，语义等价但任何 schema 语言都描述不了
+	// 「缺席携带含义」，codegen 客户端会把缺席读成 false —— 正是这套设计要防的失败。
+	_, ok = body.Flags["gamma"]
+	require.False(t, ok, "判定不可得的 key 不应出现在 flags 里；body: %s", w.Body.String())
+	require.Equal(t, []string{"gamma"}, body.Unavailable,
+		"判定不可得的 key 必须显式列出；body: %s", w.Body.String())
 
 	// 结果因人而异但 URL 对所有用户相同：必须禁掉共享缓存。
 	require.Equal(t, "private, no-store", w.Header().Get("Cache-Control"))
@@ -190,11 +200,13 @@ func TestFlagsEndpointEmptyRegistry(t *testing.T) {
 	ctx := newIntegrationCtx(t)
 
 	r := mountFlags(t, ctx, []ClientFlag{}, stubEvaluator{})
-	w, got := getFlags(t, r)
+	w, body := getFlags(t, r)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	require.NotNil(t, got, "空注册表必须序列化为 {}，不能是 null；body: %s", w.Body.String())
-	require.Empty(t, got)
+	require.NotNil(t, body.Flags, "空注册表必须序列化为 {}，不能是 null；body: %s", w.Body.String())
+	require.Empty(t, body.Flags)
+	require.NotNil(t, body.Unavailable, "unavailable 空时必须是 []，不能是 null；body: %s", w.Body.String())
+	require.Empty(t, body.Unavailable)
 }
 
 // TestFlagsEndpointZeroRulesDeployment 是全新部署场景的端到端版本：走**真实**
@@ -210,12 +222,13 @@ func TestFlagsEndpointZeroRulesDeployment(t *testing.T) {
 		{FeatureKey: "fgtest_zero_b", ClientKey: "zero_b"},
 	}
 	r := mountFlags(t, ctx, flags, NewService(ctx))
-	w, got := getFlags(t, r)
+	w, body := getFlags(t, r)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	require.Len(t, got, 2, "无规则时仍应下发全部已注册 key（值为 false），而不是省略")
-	require.False(t, got["zero_a"])
-	require.False(t, got["zero_b"])
+	require.Len(t, body.Flags, 2, "无规则时仍应下发全部已注册 key（值为 false）")
+	require.False(t, body.Flags["zero_a"])
+	require.False(t, body.Flags["zero_b"])
+	require.Empty(t, body.Unavailable, "规则不存在是确定性的关，不是判定不可得")
 }
 
 // TestFlagsEndpointUserWhitelistEndToEnd 走真实 Service：用户在 user 白名单内得
@@ -230,15 +243,15 @@ func TestFlagsEndpointUserWhitelistEndToEnd(t *testing.T) {
 	seedScope(t, svc, db, featureKey, fg.ScopeTypeUser, testutil.UID)
 
 	r := mountFlags(t, ctx, []ClientFlag{{FeatureKey: featureKey, ClientKey: "e2e"}}, svc)
-	w, got := getFlags(t, r)
+	w, body := getFlags(t, r)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	require.True(t, got["e2e"], "登录用户在 user 白名单内应当为 true")
+	require.True(t, body.Flags["e2e"], "登录用户在 user 白名单内应当为 true")
 
 	// 把白名单换成别人，同一个登录用户应当变 false。
 	_, err := db.deleteScope(featureKey, fg.ScopeTypeUser, testutil.UID)
 	require.NoError(t, err)
 	seedScope(t, svc, db, featureKey, fg.ScopeTypeUser, "someone_else")
 
-	_, got = getFlags(t, r)
-	require.False(t, got["e2e"], "不在白名单的用户应当为 false")
+	_, body = getFlags(t, r)
+	require.False(t, body.Flags["e2e"], "不在白名单的用户应当为 false")
 }

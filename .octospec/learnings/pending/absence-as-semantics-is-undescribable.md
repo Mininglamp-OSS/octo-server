@@ -1,9 +1,9 @@
 ---
 type: Learning
 title: "Absence carrying meaning cannot be described — codegen clients get it wrong by default"
-description: If \"the key is missing from the response\" means something other than \"the zero value\", no schema language can express it, so generated clients silently implement the opposite of the intent. Carry the state in a field instead.
+description: "When a missing key means something other than the zero value, no schema language can express it, so generated clients silently implement the opposite of the intent. Carry the state in a field instead."
 tags: ["api", "wire-contract", "openapi", "review"]
-timestamp: 2026-08-20T00:00:00+08:00
+timestamp: 2026-08-25T00:00:00+08:00
 # --- octospec extension fields ---
 source: self
 origin_task: featuregate-user-scoped-flags

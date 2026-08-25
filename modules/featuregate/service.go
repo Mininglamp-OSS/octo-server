@@ -17,9 +17,13 @@ import (
 // 缓存键前缀与兜底 TTL。Redis 是规则的读缓存（DB 才是真源）；管理端写后主动
 // DEL 失效以达成秒级全实例一致，TTL 仅作 DEL 漏掉时的最终一致兜底。
 const (
-	ruleKeyPrefix  = "ft:rule:"
-	scopeKeyPrefix = "ft:scope:"
-	cacheTTL       = 60 * time.Second
+	// 缓存键带 schema 版本号：给 fg.Rule 加字段后，上一版二进制写入的缓存值会缺
+	// 新字段，读出来是零值并在 TTL 内（最长 60s）被当作真实配置使用。版本号一升，
+	// 新旧二进制读写不同 keyspace，这个窗口就不存在了。改 Rule 结构时必须同步升。
+	cacheSchemaVersion = "v1"
+	ruleKeyPrefix      = "featuregate:rule:" + cacheSchemaVersion + ":"
+	scopeKeyPrefix     = "featuregate:scope:" + cacheSchemaVersion + ":"
+	cacheTTL           = 60 * time.Second
 	// nilSentinel 缓存「DB 也没有此规则」，防止未注册 key 每次穿透到 DB。
 	nilSentinel = "__nil__"
 )
@@ -69,7 +73,7 @@ func (s *Service) AllowCreate(ctx context.Context, key string, dims fg.Dims) boo
 	if killSwitchOn(key) {
 		return false
 	}
-	rule, scopes, err := s.loadRuleAndScopes(ctx, key)
+	rule, scopes, err := s.loadRuleAndScopes(key)
 	if err != nil {
 		s.Warn("featuregate load failed; create fail-closed",
 			zap.String("key", key), zap.Error(err))
@@ -88,7 +92,7 @@ func (s *Service) AllowPush(ctx context.Context, key string) bool {
 	if killSwitchOn(key) {
 		return false
 	}
-	rule, err := s.loadRule(ctx, key)
+	rule, err := s.loadRule(key)
 	if err != nil {
 		s.Warn("featuregate load rule failed; push fail-open",
 			zap.String("key", key), zap.Error(err))
@@ -120,7 +124,7 @@ func (s *Service) AllowDisplay(ctx context.Context, key string, dims fg.Dims) (a
 	if killSwitchOn(key) {
 		return false, true
 	}
-	rule, scopes, err := s.loadRuleAndScopes(ctx, key)
+	rule, scopes, err := s.loadRuleAndScopes(key)
 	if err != nil {
 		s.Warn("featuregate load failed; display key omitted from response",
 			zap.String("key", key), zap.Error(err))
@@ -130,11 +134,17 @@ func (s *Service) AllowDisplay(ctx context.Context, key string, dims fg.Dims) (a
 		return false, true // 未注册规则 → 确定性的关
 	}
 	decision := fg.Evaluate(*rule, scopes, dims)
-	if decision.Reason == fg.ReasonDimUnavailable {
-		// 配置与调用点不匹配：规则要求的分桶维度这里提供不了。若按空串照算，
-		// 所有用户会落进同一个桶，配置的 50% 会静默变成全体开或全体关。
-		s.Warn("featuregate display rule requires a dimension this call site cannot provide; fail-closed",
+	if decision.DimensionUnusable {
+		// 配置与调用点不匹配：规则引用的某个维度这里提供不了。
+		//
+		// 用 DimensionUnusable 而非只认 ReasonDimUnavailable，是为了把三种错配一网
+		// 打尽：分桶维度缺失（fail-closed）、白名单条目全都用不上（同样 fail-closed）、
+		// 以及 percent 0%/100% 短路——后者**决策仍然正确**所以不改结果，但配置确实
+		// 是错的，不报的话运维会在把 100 调到 50 的那一刻突然全员掉线。
+		s.Warn("featuregate display rule references a dimension this call site cannot provide",
 			zap.String("key", key),
+			zap.String("reason", decision.Reason),
+			zap.Bool("allow", decision.Allow),
 			zap.String("bucket_by", fg.BucketDimension(*rule)))
 	}
 	return decision.Allow, true
@@ -146,15 +156,15 @@ func (s *Service) AllowDisplay(ctx context.Context, key string, dims fg.Dims) (a
 // 初版把这个条件内联在 AllowCreate 里写作 `if rule.Mode == ModeWhitelist`，当
 // percent 也开始支持白名单后，那种写法极易漏改一处，症状是白名单静默失效——写入
 // 成功、读路径拿到空 scopes。收敛到一处就没有「漏改哪一处」这回事。
-func (s *Service) loadRuleAndScopes(ctx context.Context, key string) (*fg.Rule, []fg.Scope, error) {
-	rule, err := s.loadRule(ctx, key)
+func (s *Service) loadRuleAndScopes(key string) (*fg.Rule, []fg.Scope, error) {
+	rule, err := s.loadRule(key)
 	if err != nil || rule == nil {
 		return nil, nil, err
 	}
 	if !modeNeedsScopes(rule.Mode) {
 		return rule, nil, nil
 	}
-	scopes, err := s.loadScopes(ctx, key)
+	scopes, err := s.loadScopes(key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -181,10 +191,14 @@ func (s *Service) Invalidate(key string) {
 	}
 }
 
-// loadRule 读规则：Redis 命中即用；miss / 缓存损坏都走 fetchRuleAndCache（查 DB
+// loadRule 读规则。**不接收 context**：octo-lib 的 redis.Conn 没有任何 ctx 版本方法
+// （实测 0 个），所以 Redis 那半边根本无法遵守取消/超时。与其一半遵守一半假装、
+// 让下一个调用者误以为 ctx 生效，不如让签名如实反映能力。
+//
+// Redis 命中即用；miss / 缓存损坏都走 fetchRuleAndCache（查 DB
 // 并回填，损坏值被新值覆盖，避免 TTL 内反复穿透）；Redis 真实故障则绕过缓存直查
 // DB（不回填）。
-func (s *Service) loadRule(_ context.Context, key string) (*fg.Rule, error) {
+func (s *Service) loadRule(key string) (*fg.Rule, error) {
 	cached, err := s.redis.GetString(ruleKeyPrefix + key)
 	if err != nil {
 		return s.queryRuleFromDB(key) // Redis 故障：绕过缓存，DB 失败时由调用方走 fail 语义
@@ -223,7 +237,7 @@ func (s *Service) fetchRuleAndCache(key string) (*fg.Rule, error) {
 
 // loadScopes 读白名单条目：语义同 loadRule。空列表序列化为 "[]"（非空串），与
 // miss（空串）天然区分，不会反复回查；miss / 缓存损坏都走 fetchScopesAndCache。
-func (s *Service) loadScopes(_ context.Context, key string) ([]fg.Scope, error) {
+func (s *Service) loadScopes(key string) ([]fg.Scope, error) {
 	cached, err := s.redis.GetString(scopeKeyPrefix + key)
 	if err != nil {
 		return s.queryScopesFromDB(key)

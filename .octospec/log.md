@@ -1592,7 +1592,7 @@ change-log convention (§7). Newest first.
   of. The same guard was green on the real security regression and red on whitespace.
 
 
-## 2026-08-20 (featuregate-user-scoped-flags)
+## 2026-08-25 (featuregate-user-scoped-flags)
 
 - **Implemented** — Revived the generic feature-gate framework from the
   never-merged PR #280 (framework only; the incoming-webhook gating commit was

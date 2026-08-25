@@ -23,13 +23,13 @@ func newServiceFixture(t *testing.T) (*Service, *gateDB, *config.Context) {
 // seedRule 写一条规则并清掉它的缓存，保证后续读走的是刚写的值。
 func seedRule(t *testing.T, svc *Service, db *gateDB, key, mode string, percent int, bucketBy string) {
 	t.Helper()
-	require.NoError(t, db.upsertRule(key, mode, percent, bucketBy, "test"))
+	require.NoError(t, db.upsertRule(key, mode, percent, bucketBy, "test", "tester"))
 	svc.Invalidate(key)
 }
 
 func seedScope(t *testing.T, svc *Service, db *gateDB, key, scopeType, scopeID string) {
 	t.Helper()
-	require.NoError(t, db.addScope(key, scopeType, scopeID))
+	require.NoError(t, db.addScope(key, scopeType, scopeID, "tester"))
 	svc.Invalidate(key)
 }
 
@@ -179,7 +179,7 @@ func TestInvalidateRefreshesCachedRule(t *testing.T) {
 	require.True(t, allow)
 
 	// 只改库、不失效缓存：仍应读到旧值（证明缓存确实生效，否则下一步的断言没有意义）。
-	require.NoError(t, db.upsertRule(key, string(fg.ModeOff), 0, fg.ScopeTypeGroup, "test"))
+	require.NoError(t, db.upsertRule(key, string(fg.ModeOff), 0, fg.ScopeTypeGroup, "test", "tester"))
 	allow, _ = svc.AllowDisplay(context.Background(), key, fg.Dims{UID: "u1"})
 	require.True(t, allow, "未失效前应仍读到缓存里的旧规则")
 
@@ -200,7 +200,7 @@ func TestNilRuleCachedAsSentinel(t *testing.T) {
 	require.False(t, allow)
 
 	// 直接写库但不失效缓存：若哨兵生效，这一步不应被看到。
-	require.NoError(t, db.upsertRule(key, string(fg.ModeOn), 0, fg.ScopeTypeGroup, "test"))
+	require.NoError(t, db.upsertRule(key, string(fg.ModeOn), 0, fg.ScopeTypeGroup, "test", "tester"))
 	allow, _ = svc.AllowDisplay(context.Background(), key, fg.Dims{UID: "u1"})
 	require.False(t, allow, "nil 哨兵未生效：未注册 key 每次都在穿透 DB")
 

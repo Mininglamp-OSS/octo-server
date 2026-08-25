@@ -24,7 +24,10 @@
 
 ## 与 featuregate 的分界
 
-`modules/featuregate` 是 **fail-open、可来回切**的灰度开关，适合行为开关。
+`modules/featuregate` 是**可来回切**的灰度开关，适合行为开关。它的 fail 策略**按调用端
+固定、不是统一 fail-open**：`AllowPush`（推送总开关）fail-open——绝不能因灰度框架故障
+中断存量推送；`AllowCreate`（写时闸门）与 `AllowDisplay`（客户端展示位）fail-closed——
+配置拿不到时拒绝，胜过数据裸奔或展示一个实际不可用的入口。
 cutover 是 **fail-closed、单向、带水位校验**的数据面迁移：切换的先决条件是一个
 经过证据校验的水位（floor），切换后退回去会重现原 bug。两者语义不兼容——
 不要用 featuregate 做号段切换，也不要用 cutover 做可逆的功能灰度。

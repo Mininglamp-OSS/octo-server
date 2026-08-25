@@ -3,7 +3,7 @@ type: Journal
 title: "Journal: featuregate-user-scoped-flags"
 description: Revive the generic feature-gate framework, extend it to a user dimension, and expose per-user flags through a new authenticated endpoint.
 tags: [featuregate, rollout, auth, wire-contract, rate-limit, testing]
-timestamp: 2026-08-20T00:00:00+08:00
+timestamp: 2026-08-25T00:00:00+08:00
 task: featuregate-user-scoped-flags
 source: self
 ---
@@ -69,3 +69,41 @@ source: self
   `feature_key` charset at the DB layer, closing the direct-DB-edit bypass.
 - The framework ships with an **empty** client-flag registry: no product feature
   is gated yet. That is deliberate — this change delivers the mechanism.
+
+## Review round 1 (2026-08-25)
+
+One blocking finding, and it was real: `update` validated the incoming `bucket_by`
+but never the **already-persisted** scope rows. The registry is a compile-time list
+while gates are DB rows, so "an internal gate accumulates group scopes, then a later
+deploy makes it client-visible" is the *normal* lifecycle — and after that, an
+`update` to `whitelist`/`bucket_by=user` was accepted with a whitelist that could
+never match. Silent on both sides: `Evaluate` returned `whitelist_miss`, which is
+indistinguishable from a genuine miss, so no log fired either.
+
+Fixed on both sides, matching the write+read pattern used everywhere else here:
+
+- write: `update` now loads the persisted scopes and rejects when none uses a
+  dimension the flags endpoint can supply (an *empty* whitelist stays legal — that
+  is a real state, not a misconfiguration);
+- read: `Evaluate` distinguishes "didn't match" from "couldn't possibly match" via
+  a new `whitelist_dim_unavailable` reason, and `Decision.DimensionUnusable` reports
+  a dimension mismatch **independently of the decision** — which is what lets the
+  `percent` 0%/100% short-circuits keep their (correct) answer while still surfacing
+  a misconfigured `bucket_by`. Two reviewers disagreed on that one: the decision is
+  right at 100% (console and reality agree, and failing closed there would break a
+  rollout at full ramp), but the misconfiguration must not stay invisible, or the
+  operator discovers it the moment they dial 100 down to 50 and everyone drops out.
+
+Also in this round: `updated_by` audit columns on both tables; the
+`unavailable` wire field replacing the omission semantics; a whitelist size cap
+enforced on the **write** side (a `LIMIT` on the evaluation query would have traded
+"slow but correct" for "fast but wrong"); `scope_id` charset validation closing an
+insert-but-cannot-delete asymmetry; `description` counted in runes to match a
+character-counted column; `context.Context` parameters dropped from the cache
+loaders because octo-lib's `redis.Conn` has no ctx-aware methods at all, so honoring
+it was never possible and the signature was lying; a cache schema version in the
+Redis key prefix; and `docs/cutover-framework.md`, which described this module as
+"fail-open" back when it did not exist — two of its three call sites are fail-closed.
+
+Date discipline: the migration filename and three octospec timestamps were all five
+days early. Run `date` before naming anything after today.

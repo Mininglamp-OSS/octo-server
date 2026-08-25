@@ -228,7 +228,7 @@ func TestKillSwitchEnvIsInjective(t *testing.T) {
 // 若为了实现省略而加 omitempty，false 会被一起吞掉——「规则不存在的确定性的关」
 // 与「存储故障」在线上就长得一模一样，客户端会保留旧值，灰度永远关不掉。
 func TestFlagsRespSerialization(t *testing.T) {
-	raw, err := json.Marshal(flagsResp{Flags: map[string]bool{"on_flag": true, "off_flag": false}})
+	raw, err := json.Marshal(flagsResp{Flags: map[string]bool{"on_flag": true, "off_flag": false}, Unavailable: []string{}})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -253,11 +253,11 @@ func TestFlagsRespSerialization(t *testing.T) {
 // TestFlagsRespEmptyMapSerializesAsObject 确保空注册表下响应是 {"flags":{}} 而不是
 // {"flags":null} —— 后者会让弱类型客户端在解引用时炸掉。
 func TestFlagsRespEmptyMapSerializesAsObject(t *testing.T) {
-	raw, err := json.Marshal(flagsResp{Flags: map[string]bool{}})
+	raw, err := json.Marshal(flagsResp{Flags: map[string]bool{}, Unavailable: []string{}})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"flags":{}}` {
-		t.Fatalf("空 flags 应序列化为 {\"flags\":{}}，得到 %s", got)
+	if got := string(raw); got != `{"flags":{},"unavailable":[]}` {
+		t.Fatalf("空响应应序列化为 {\"flags\":{},\"unavailable\":[]}，得到 %s", got)
 	}
 }

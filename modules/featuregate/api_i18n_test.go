@@ -18,7 +18,8 @@ import (
 // m.Error(...) / m.Warn(...) zap LOG calls are not responses and stay allowed.
 func TestFeatureGateAPINoLegacyResponseError(t *testing.T) {
 	files := []string{"api_manager.go", "api_flags.go", "api_i18n.go", "manager.go"}
-	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", "AbortWithStatusJSON("}
+	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(",
+		"AbortWithStatusJSON(", ".AbortWithStatus(", "c.Response(\""}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {
 			data, err := os.ReadFile(f)
