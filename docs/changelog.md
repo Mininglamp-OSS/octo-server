@@ -9,14 +9,14 @@
   MFA 新增的依赖。缺失、错误或被替换的密钥属于不受支持的部署状态，
   不属于本次 MFA 流程范围；会导致加密配置无法读写，管理端 MFA 将保持
   fail-closed，请先恢复原密钥再升级。
-- SMTP 默认 seed 会先完成可选密码的加密，再一次性写入 SMTP 配置；密钥
+- SMTP 默认 seed 会先完成必填密码的加密，再一次性写入 SMTP 配置；密钥
   加密失败不会留下不完整的 SMTP 配置集合。
-- 无密码 SMTP relay 仅跳过 SMTP AUTH，不代表允许明文传输；465 端口使用
-  隐式 TLS，其他端口必须成功协商 STARTTLS，否则预检和实际发送都会失败。
+- SMTP 密码继续保持必填，与既有部署配置契约一致；本次 MFA 不支持无密码
+  SMTP relay。
 - 管理 MFA/SMTP 初始化或系统配置加载失败现在输出 `ERROR` 级别日志，
   但不会因该配置基础设施错误直接 panic API 服务。
 - 升级前，如果旧版本数据库中的管理控制台 MFA 已开启，必须确认数据库中
-  的 `support.email`、`support.email_smtp` 以及可选的 `support.email_pwd`
+  的 `support.email`、`support.email_smtp` 以及必填的 `support.email_pwd`
   能组成有效 SMTP 配置。部分数据库配置不会再从 YAML 静默补齐；启动检测到
   该非法状态时输出 `ERROR`，管理端 MFA 保持 fail-closed，需由运维修复配置。
 

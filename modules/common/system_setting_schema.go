@@ -379,7 +379,7 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},
 	{Category: "support", Key: "email_smtp", Type: settingTypeString, Description: "SMTP 服务器 host:port",
 		Effective: func(s *SystemSettings) string { return s.SupportEmailSmtp() }},
-	{Category: "support", Key: "email_pwd", Type: settingTypeEncrypted, Description: "SMTP 密码（可选，加密存储）",
+	{Category: "support", Key: "email_pwd", Type: settingTypeEncrypted, Description: "SMTP 密码（必填，加密存储）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmailPwd() }},
 }
 

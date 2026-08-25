@@ -39,13 +39,3 @@ func TestManagerEmailMFAMissingSMTPDoesNotFallbackToYAML(t *testing.T) {
 	assert.Error(t, settings.ValidateManagerEmailMFASMTP(),
 		"an MFA-on partial database SMTP set must be surfaced as an invalid upgrade state")
 }
-
-func TestManagerEmailMFAValidationAllowsPasswordlessSMTP(t *testing.T) {
-	settings := newTestSystemSettings(t, nil)
-	require.NoError(t, settings.db.upsert("support", "email", "relay@example.com", settingTypeString, ""))
-	require.NoError(t, settings.db.upsert("support", "email_smtp", "smtp.example.com:25", settingTypeString, ""))
-	require.NoError(t, settings.Load())
-
-	assert.NoError(t, settings.ValidateManagerEmailMFASMTP(),
-		"SMTP password is optional for an unauthenticated relay")
-}

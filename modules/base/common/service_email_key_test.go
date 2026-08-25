@@ -44,8 +44,8 @@ func TestValidateSMTPConfiguration(t *testing.T) {
 			t.Errorf("valid SMTP config rejected: %s: %v", tc.addr, err)
 		}
 	}
-	if err := ValidateSMTPConfiguration("smtp.example.com:25", "relay@example.com", ""); err != nil {
-		t.Fatalf("passwordless SMTP relay must be accepted: %v", err)
+	if err := ValidateSMTPConfiguration("smtp.example.com:25", "relay@example.com", ""); err == nil {
+		t.Fatal("SMTP password is required")
 	}
 	invalid := []struct {
 		addr string

@@ -88,13 +88,12 @@ not cover those alternate credential paths.
 - On startup, if the MFA row does not exist, startup writes an explicit `0`
   row. If all manager-MFA SMTP rows are absent and the static configuration
   contains a sender address and SMTP endpoint, startup writes those defaults
-  to `system_setting`; the password is optional and is encrypted only when
-  present. Password encryption completes before any SMTP seed is persisted, so
-  an encryption failure leaves no partial SMTP bootstrap set. Existing rows,
-  including explicit empty values, are authoritative and are not silently
-  replaced by YAML values. Seed writes use a database-level insert-if-absent
-  operation, so an administrator write racing startup initialization cannot be
-  overwritten.
+  to `system_setting`; the SMTP password is required and is encrypted before
+  any seed is persisted. An encryption failure leaves no partial SMTP
+  bootstrap set. Existing rows, including explicit empty values, are
+  authoritative and are not silently replaced by YAML values. Seed writes use
+  a database-level insert-if-absent operation, so an administrator write racing
+  startup initialization cannot be overwritten.
 - The shared SMTP keys `support.email`, `support.email_smtp`, and
   `support.email_pwd` are intentionally database-owned after this startup
   initialization. On a fresh database, YAML values are copied once when the
@@ -105,7 +104,7 @@ not cover those alternate credential paths.
   flow; shared SMTP transport behavior remains an infrastructure concern.
 - Existing deployments are an upgrade prerequisite: before upgrading, if
   management MFA is already enabled in the database, the database-backed
-  `support.email`, `support.email_smtp`, and optional `support.email_pwd` values
+  `support.email`, `support.email_smtp`, and required `support.email_pwd` values
   must form a valid SMTP configuration. A partial database set is not silently
   completed from YAML, because existing database rows—including explicit empty
   values—remain authoritative. After loading such an invalid state, startup
@@ -121,12 +120,9 @@ not cover those alternate credential paths.
   and fails closed.
 - Enabling MFA performs endpoint, sender-address, and real SMTP preflight
   checks on the merged final MFA/SMTP configuration before the transaction
-  commits. The password is optional: an empty password selects an
-  unauthenticated SMTP relay, while a non-empty password enables SMTP
-  authentication. Password presence does not control transport security:
-  port 465 uses implicit TLS and every other SMTP port must successfully
-  negotiate STARTTLS. A server without TLS is rejected by both preflight and
-  real sending. A failed real preflight leaves the database unchanged.
+  commits. The SMTP password is required, consistent with the existing
+  deployment configuration contract; an empty password is rejected. A failed
+  real preflight leaves the database unchanged.
 - An SMTP update performs the same checks on the merged final configuration
   before committing, whether MFA is currently on or off. A non-clearing update
   must provide a valid SMTP endpoint and sender address and pass the real
@@ -214,8 +210,8 @@ not cover those alternate credential paths.
 - Enabling MFA and modifying SMTP reject missing endpoint/sender values,
   syntactically invalid values, or real-connection-failing configurations
   before committing them; combined updates validate the merged final values.
-  Passwordless SMTP relays are valid when the real preflight succeeds. An
-  intentional SMTP clear is accepted only while MFA is disabled.
+  An empty SMTP password is invalid. An intentional SMTP clear is accepted
+  only while MFA is disabled.
 - With MFA on, password login returns a challenge only. Only the latest code
   whose SMTP send and `sent` commit both succeeded can be consumed for a token.
 - A later SMTP outage fails the actual send path closed and never issues a

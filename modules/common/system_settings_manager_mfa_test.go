@@ -50,33 +50,6 @@ func TestEnsureManagerEmailMFASettingsSeedsDatabaseDefaults(t *testing.T) {
 	assert.NotEqual(t, "smtp-password", stored["support.email_pwd"].Value)
 }
 
-func TestEnsureManagerEmailMFASettingsSeedsPasswordlessSMTPDefaults(t *testing.T) {
-	settings := newTestSystemSettings(t, func(s *SystemSettings) {
-		s.ctx.GetConfig().Support.Email = "relay@example.com"
-		s.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:25"
-		s.ctx.GetConfig().Support.EmailPwd = ""
-	})
-
-	require.NoError(t, settings.EnsureManagerEmailMFASettings())
-	require.NoError(t, settings.Load())
-
-	provider := settings.ManagerEmailMFASMTPSettings()
-	assert.Equal(t, "relay@example.com", provider.SupportEmail())
-	assert.Equal(t, "smtp.example.com:25", provider.SupportEmailSmtp())
-	assert.Empty(t, provider.SupportEmailPwd())
-
-	rows, err := settings.db.listAll()
-	require.NoError(t, err)
-	stored := make(map[string]*systemSettingModel, len(rows))
-	for _, row := range rows {
-		stored[schemaKey(row.Category, row.KeyName)] = row
-	}
-	assert.Contains(t, stored, "support.email")
-	assert.Contains(t, stored, "support.email_smtp")
-	assert.NotContains(t, stored, "support.email_pwd",
-		"passwordless SMTP bootstrap must not create a fake password row")
-}
-
 func TestEnsureManagerEmailMFASettingsDoesNotPersistPartialSMTPWhenPasswordEncryptionFails(t *testing.T) {
 	settings := newTestSystemSettings(t, func(s *SystemSettings) {
 		s.ctx.GetConfig().Support.Email = "mfa-default@example.com"

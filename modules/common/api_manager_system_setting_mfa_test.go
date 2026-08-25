@@ -89,49 +89,6 @@ func TestManagerSystemSetting_ValidatesMergedMFAAndSMTPConfiguration(t *testing.
 		"failed final-config validation must not enable MFA")
 }
 
-func TestManagerSystemSetting_AllowsPasswordlessSMTPToReachPreflight(t *testing.T) {
-	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
-	s, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
-	settings := EnsureSystemSettings(ctx)
-	originalConfig := *settings.ctx.GetConfig()
-	t.Cleanup(func() {
-		_ = testutil.CleanAllTables(ctx)
-		*settings.ctx.GetConfig() = originalConfig
-		_ = settings.Reload()
-	})
-	require.NoError(t, ctx.Cache().Set(
-		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
-		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
-	))
-
-	// Reserve and close a local port so the real preflight fails quickly after
-	// configuration validation. A 503 proves the empty password was accepted
-	// as a possible relay configuration; the old password-required branch
-	// returned the configuration-invalid 400 before attempting preflight.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	smtpAddr := listener.Addr().String()
-	require.NoError(t, listener.Close())
-
-	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "0", settingTypeBool, ""))
-	require.NoError(t, settings.db.upsert("support", "email", "relay@example.com", settingTypeString, ""))
-	require.NoError(t, settings.db.upsert("support", "email_smtp", smtpAddr, settingTypeString, ""))
-	// Deliberately do not create support.email_pwd.
-	require.NoError(t, settings.Load())
-
-	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/manager/common/system_setting", bytes.NewBufferString(
-		`{"items":[{"category":"login","key":"manager_email_mfa_on","value":"1"}]}`,
-	))
-	req.Header.Set("token", testutil.Token)
-	s.GetRoute().ServeHTTP(recorder, req)
-
-	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
-	assert.Equal(t, ManagerEmailMFAOff, settings.ManagerEmailMFAState(),
-		"failed passwordless SMTP preflight must not enable MFA")
-}
-
 func TestManagerSystemSetting_UnchangedSMTPDoesNotRunPreflight(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()

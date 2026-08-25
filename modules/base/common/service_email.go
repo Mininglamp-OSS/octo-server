@@ -91,9 +91,8 @@ type SMTPSettingsProvider interface {
 
 // EmailService 邮件服务
 type EmailService struct {
-	ctx       *config.Context
-	settings  SMTPSettingsProvider
-	tlsConfig func(host string) *tls.Config
+	ctx      *config.Context
+	settings SMTPSettingsProvider
 	log.Log
 }
 
@@ -111,15 +110,10 @@ var rawRedisClients sync.Map // map[*config.Context]*rd.Client
 // 静默漏掉 admin 配置入口。
 func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailService {
 	return &EmailService{
-		ctx:       ctx,
-		settings:  settings,
-		tlsConfig: defaultSMTPTLSConfig,
-		Log:       log.NewTLog("EmailService"),
+		ctx:      ctx,
+		settings: settings,
+		Log:      log.NewTLog("EmailService"),
 	}
-}
-
-func defaultSMTPTLSConfig(host string) *tls.Config {
-	return &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 }
 
 // ErrEmailSendRateLimited is returned by SendVerifyCode when the per-address
@@ -475,15 +469,14 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 	return s.dispatchSMTP(ctx, smtpAddr, fromSan, pwd, toSan, []byte(msg))
 }
 
-// ValidateSMTPConfiguration validates the effective SMTP endpoint and sender
-// before any network operation. Password is optional: an empty password means
-// the deployment intentionally uses an unauthenticated SMTP relay. A server
-// that actually requires authentication is still rejected by PreflightSMTP
-// (or by the real send) when the SMTP transaction is attempted.
+// ValidateSMTPConfiguration validates the complete effective configuration
+// before any network operation. In particular, accepting a syntactically
+// non-empty but invalid MAIL FROM would let an SMTP server reject MFA mail
+// after the policy had already been enabled.
 func ValidateSMTPConfiguration(smtpAddr, fromAddr, password string) error {
 	smtpAddr = strings.TrimSpace(smtpAddr)
 	fromAddr = strings.TrimSpace(fromAddr)
-	if smtpAddr == "" || fromAddr == "" {
+	if smtpAddr == "" || fromAddr == "" || password == "" {
 		return errors.New("email service not configured")
 	}
 	if err := ValidateEmailAddress(fromAddr); err != nil {
@@ -614,25 +607,19 @@ func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody s
 	return []byte(b.String()), nil
 }
 
-// dispatchSMTP 跑完一次 SMTP 投递:dial → (隐式 TLS/强制 STARTTLS) → [AUTH] →
-// MAIL → RCPT → DATA → QUIT。密码为空时跳过 AUTH，以支持受网络隔离保护的
-// 无密码 SMTP relay；无论密码是否为空，邮件内容都必须通过 TLS 传输。
-// fromSan / toSan 必须已经过 sanitizeHeader。
+// dispatchSMTP 跑完一次 SMTP 投递:dial → (STARTTLS) → AUTH → MAIL → RCPT →
+// DATA → QUIT。fromSan / toSan 必须已经过 sanitizeHeader。
 func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd, toSan string, msg []byte) error {
 	host, port, err := net.SplitHostPort(smtpAddr)
 	if err != nil {
 		return fmt.Errorf("smtp地址格式错误: %w", err)
 	}
-	var auth smtp.Auth
-	if pwd != "" {
-		auth = smtp.PlainAuth("", fromSan, pwd, host)
-	}
+	auth := smtp.PlainAuth("", fromSan, pwd, host)
 
 	dialer := &net.Dialer{Timeout: smtpDialTimeout}
-	tlsConfig := s.tlsConfig(host)
 	var conn net.Conn
 	if port == "465" {
-		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: host}}
 		conn, err = tlsDialer.DialContext(ctx, "tcp", smtpAddr)
 		if err != nil {
 			return fmt.Errorf("TLS连接失败: %w", err)
@@ -657,29 +644,23 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 	defer client.Close()
 
 	if port != "465" {
-		if ok, _ := client.Extension("STARTTLS"); !ok {
-			return errors.New("SMTP server does not support STARTTLS")
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err = client.StartTLS(&tls.Config{ServerName: host}); err != nil {
+				return fmt.Errorf("STARTTLS 失败: %w", err)
+			}
 		}
-		if err = client.StartTLS(tlsConfig); err != nil {
-			return fmt.Errorf("STARTTLS 失败: %w", err)
-		}
-	}
-	if _, ok := client.TLSConnectionState(); !ok {
-		return errors.New("SMTP TLS is required")
 	}
 
 	return runSMTPTransaction(client, auth, fromSan, toSan, msg)
 }
 
-// runSMTPTransaction 跑完一次 SMTP 投递：[Auth] → Mail → Rcpt → Data → Quit。
+// runSMTPTransaction 跑完一次 SMTP 投递：Auth → Mail → Rcpt → Data → Quit。
 // 抽出来是为了 465 / 587 路径不用复制 7 行序列；同时确保两条路径都发 QUIT
 // （旧实现用 smtp.SendMail，stdlib 末尾就是 c.Quit()——本 PR 重写时漏发，
 // 部分严格邮件网关在缺 QUIT 时会丢弃消息。defer client.Close 仅用于异常兜底）。
 func runSMTPTransaction(client *smtp.Client, auth smtp.Auth, from, to string, msg []byte) error {
-	if auth != nil {
-		if err := client.Auth(auth); err != nil {
-			return fmt.Errorf("SMTP认证失败: %w", err)
-		}
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("SMTP认证失败: %w", err)
 	}
 	if err := client.Mail(from); err != nil {
 		return err

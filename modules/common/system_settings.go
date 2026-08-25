@@ -158,8 +158,9 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 	}
 
 	// Treat the SMTP rows as one bootstrap set. A partially populated DB set is
-	// authoritative and must not be silently completed from yaml. Password is
-	// optional because deployments may use an unauthenticated SMTP relay.
+	// authoritative and must not be silently completed from yaml. The existing
+	// deployment contract requires all three SMTP values, including the
+	// password, before the defaults can be seeded.
 	smtpRowsMissing := true
 	for _, key := range []string{"email", "email_smtp", "email_pwd"} {
 		if _, ok := stored[schemaKey("support", key)]; ok {
@@ -168,27 +169,20 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 		}
 	}
 	cfg := s.ctx.GetConfig()
-	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != ""
+	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != "" && cfg.Support.EmailPwd != ""
 	if smtpRowsMissing && defaultsComplete {
-		smtpSeeds := []managerEmailMFASeed{
-			{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
-			{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
+		ciphertext, err := encryptKey(cfg.Support.EmailPwd)
+		if err != nil {
+			return fmt.Errorf("encrypt default SMTP password: %w", err)
 		}
-		if cfg.Support.EmailPwd != "" {
-			ciphertext, err := encryptKey(cfg.Support.EmailPwd)
-			if err != nil {
-				return fmt.Errorf("encrypt default SMTP password: %w", err)
-			}
-			smtpSeeds = append(smtpSeeds, managerEmailMFASeed{
-				category: "support", key: "email_pwd", value: ciphertext,
-				valueType: settingTypeEncrypted, description: "SMTP 密码（可选，加密存储）",
-			})
-		}
-		// Persist the complete SMTP bootstrap set only after every value,
-		// including the optional encrypted password, has been prepared
-		// successfully. An encryption failure must not leave a partial set that
-		// prevents a later startup from retrying the bootstrap.
-		seeds = append(seeds, smtpSeeds...)
+		// Persist the complete SMTP bootstrap set only after the password has
+		// been encrypted successfully. An encryption failure must not leave a
+		// partial set that prevents a later startup from retrying the bootstrap.
+		seeds = append(seeds,
+			managerEmailMFASeed{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
+			managerEmailMFASeed{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
+			managerEmailMFASeed{category: "support", key: "email_pwd", value: ciphertext, valueType: settingTypeEncrypted, description: "SMTP 密码（加密存储）"},
+		)
 	}
 	return s.persistManagerEmailMFASeeds(seeds)
 }
