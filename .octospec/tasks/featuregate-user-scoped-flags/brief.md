@@ -20,7 +20,7 @@ source: self
    AND 绝不放在客户端。理由与实现约束见 Load-bearing 对应条目。
 3. **刷新契约与失败语义**：冷启动 + 登录成功 + 前台化（节流 ≥5 分钟）；单个 key 遭遇
    存储故障时进响应的 **`unavailable` 列表**（而非下发 `false`，也不是从 `flags` 里
-   省略），客户端对这些 key 保留上次值。
+   `unavailable` 数组），客户端对这些 key 保留上次值。
    **2026-08-25 修订**：初稿用「从 `flags` 里省略」来表达这层含义，评审阶段改为显式
    字段——语义等价，但「缺席携带含义」任何 schema 语言都描述不了，codegen 客户端会把
    缺席读成 `false`，恰是这套设计要防的失败。见 Load-bearing 与 Acceptance 对应条目。
@@ -234,7 +234,7 @@ percent，因此本任务按当前契约重新评审和落地。
 
   **为什么解耦**：`feature_key` 是运维面标识，重命名（改归类、改前缀）本该是无风险操作；
   若它同时是 wire 契约，运维改个名就静默破坏三端客户端。注意 `killSwitchOn` 是
-  `strings.ToUpper(strings.ReplaceAll(key, "-", "_"))` 从 `feature_key` 推导环境变量名的
+  `strings.ToUpper(key)` 从 `feature_key` 推导环境变量名的（**不折叠连字符**——连字符已被 `validFeatureKey` 禁掉，不折叠才使 key→env 名成为单射）
   ——这进一步说明 `feature_key` 属于运维面词汇表，不该被客户端契约锁死。
 
   **反向约束**：`client_key` 一旦发布即**冻结**，与 appconfig 字段同级别的 wire 契约
@@ -251,12 +251,12 @@ percent，因此本任务按当前契约重新评审和落地。
   mode/percent/scope 等内部细节，防止客户端反推灰度策略。排障所需的区分度通过服务端
   日志（携带 key 与失败原因）实现，**不得为此在响应体里加 `reason`/`source` 之类字段**，
   否则布尔约束当场破掉。
-- **响应体必须是动态 map，禁用 `omitempty`——否则"省略"语义根本无法实现**。
-  本 brief 定了"存储故障省略该 key、规则不存在下发 `false`"，但仓库里最顺手的先例
+- **响应体必须是动态 map，禁用 `omitempty`**。
+  `flags` 里"值为 `false`"必须能被表达出来，但仓库里最顺手的先例
   `appConfigResp` 是**固定字段 struct**（`DocsOn bool \`json:"docs_on"\``）。照抄那个形状
   会连环出两个错：
-  - Go struct 的 bool 字段**永远序列化**，省略无从实现；
-  - 有人为了实现省略而加 `omitempty` → **`false` 会被一起吞掉** → "规则不存在的确定性关"
+  - 固定字段 struct 无法承载动态注册的 key；
+  - 加 `omitempty` → **`false` 会被一起吞掉** → "规则不存在的确定性关"
     与"存储故障"在线上变成同一个样子 → 客户端保留旧值 → **灰度永远关不掉**，正是上一条
     失败语义花大篇幅要防的那件事。
 
@@ -301,19 +301,20 @@ percent，因此本任务按当前契约重新评审和落地。
   限流桶影响可忽略。
 
   **失败语义（服务端与客户端两半，缺一不可）**：
-  - 服务端：单个 key 遭遇**存储故障**（DB/Redis）时 **从响应中省略该 key**，不下发
-    `false`；
+  - 服务端：单个 key 遭遇**存储故障**（DB/Redis）时把它列进响应的 **`unavailable`
+    数组**，不下发 `false`、也不从 `flags` 里省略；
   - 客户端：整请求失败 → **保留上次快照**（不得回落成全 `false`）；响应缺某 key →
     **保留该 key 上次值**；无历史值（新装/清数据）→ `false`。
 
-  **为什么省略而不是下发 false**：响应只有布尔（这是本 brief 自己定的约束），客户端因此
+  **为什么不下发 false**：`flags` 里只有布尔（这是本 brief 自己定的约束），客户端因此
   **无法区分"真的关"与"服务端抖了一下"**。若故障时下发 `false`，Redis 抖 3 秒的后果就是
-  **全体用户功能消失**；改成省略后，影响面缩小到"无本地缓存的新装用户暂时看不到"，
+  **全体用户功能消失**；改成显式列出后，影响面缩小到"无本地缓存的新装用户暂时看不到"，
   而且**依然是 fail-closed**（无历史值时默认 `false`）。这条同时保住了布尔约束——它没有
   引入 `reason`/`source` 之类字段。
 
   **必须与"规则不存在"区分开**：查询成功但表里没有该 key 的规则，是**确定性的关**，
-  正常下发 `false`；只有**存储故障**才省略。两者混淆会让"未配置"变成"保留旧值"，
+  正常进 `flags` 且值为 `false`；只有**存储故障**才进 `unavailable`。两者混淆会让
+  "未配置"变成"保留旧值"，
   灰度就永远关不掉。
 
   **运营预期**：生效延迟 = 用户下次拉取时间，**分钟级到小时级，不是秒级**。
@@ -322,7 +323,7 @@ percent，因此本任务按当前契约重新评审和落地。
   UI 表现。若将来运营确需秒级 UI 收敛，可复用 WuKongIM 长连接推一条重拉信号（列在
   Out of scope），即本决策是可演进的，不是死路。
 - **响应不可被共享缓存**：结果因人而异，但 URL 对所有用户逐字节相同，区分调用者的只有
-  Authorization 头——任何按 URL 缓存的共享代理都会把用户 A 的判定回给用户 B。必须下发
+  `token` 头（本仓 `AuthMiddleware` 读的就是它，不是 Authorization）——任何按 URL 缓存的共享代理都会把用户 A 的判定回给用户 B。必须下发
   `Cache-Control: private, no-store`（`private` 禁共享缓存，`no-store` 连私有副本也不留）。
   同型教训见 `bot-setting-store` 给 `/v1/bot/card/profile` 加 `config` 后的处理。
 - **管理端点鉴权：校验沿用，但拒绝路径必须换成现行写法**。`list`/`update`/`addScope`/
@@ -346,7 +347,7 @@ percent，因此本任务按当前契约重新评审和落地。
   （`request_invalid`/`not_found`/`query_failed`/`operation_failed`）复活时原样保留；
   用户侧只读端点若需新增码，一并归到 `pkg/errcode/featuregate.go`。
   端点已归属 `modules/featuregate`，因此不存在"码散落到别的模块"的问题——但需注意
-  **该端点在正常路径上几乎不该产生错误码**：单 key 故障走省略、规则不存在走 `false`，
+  **该端点在正常路径上几乎不该产生错误码**：单 key 故障进 `unavailable`、规则不存在走 `false`，
   两者都是 200；只有鉴权失败与请求本身不合法才走错误信封。
 - **复活的 `modules/featuregate` 缺一个 `NoLegacyResponseError` 守卫测试**：原分支只有
   `api_i18n.go`，没有对应的 `api_i18n_test.go` 守卫，而仓库约定是每个已迁移模块都要有
@@ -427,7 +428,7 @@ percent，因此本任务按当前契约重新评审和落地。
   值为布尔。
 - **响应体是 `{"flags": map[string]bool}` 动态形状**：一条序列化测试断言"值为 `false`
   的 key 必须出现在 JSON 里"，钉住"不得用固定字段 struct、不得用 `omitempty`"——否则
-  `false` 被吞掉会与"存储故障省略"混淆，使灰度关不掉。
+  `false` 被吞掉会与"判定不可得"混淆，使灰度关不掉。
 - **响应用 `client_key` 而非 `feature_key` 作字段名**：一条测试断言注册表里
   `feature_key != client_key` 的项，在响应 JSON 中出现的是 `client_key`。
 - **注册表唯一性在构造期校验**：注册两项相同 `client_key`（或相同 `feature_key`）时
@@ -437,16 +438,16 @@ percent，因此本任务按当前契约重新评审和落地。
   `bucket_by=group`），该 key fail-closed 返回 `false` 并打 Warn 日志，**不得按空串
   照算**——否则会出现"管理台显示 50%、实际全体开或全体关"的静默错配。
 - 响应头带 `Cache-Control: private, no-store`。
-- **存储故障 → 省略，不是 false**：单个 key 的规则/白名单因 DB/Redis 故障加载失败时，
-  该 key **从响应中省略**，失败原因写日志；**不影响其它 key 正常返回，不导致整个请求
-  500**。用一条测试钉住"故障 key 不出现在响应里"，防止日后被改回下发 `false`。
-- **规则不存在 → 明确 false**：查询成功但表中无该 key 的规则时，正常下发 `false`
-  （确定性的关），**不省略**。与上一条构成一对，用测试同时钉住两侧，避免"未配置"被
-  当成"保留旧值"而使灰度关不掉。
+- **存储故障 → 进 `unavailable`，不是 false**：单个 key 的规则/白名单因 DB/Redis 故障
+  加载失败时，该 key **不出现在 `flags` 里，而是列进 `unavailable` 数组**，失败原因写
+  日志；**不影响其它 key 正常返回，不导致整个请求 500**。用测试同时钉住两边。
+- **规则不存在 → 明确 false**：查询成功但表中无该 key 的规则时，正常进 `flags` 且值为
+  `false`（确定性的关），**不进 `unavailable`**。与上一条构成一对，用测试同时钉住两侧，
+  避免"未配置"被当成"保留旧值"而使灰度关不掉。
 - 用户 A 在某 key 的 `user` 白名单内 → 该 key 为 `true`；用户 B 不在白名单且规则非 `on`、
   未命中 percent → `false`。
 - **全新部署零规则场景**：`feature_gate` 表为空时，端点对每个已注册 key 均返回 `false`
-  （fail-closed 的直接推论，走上面"规则不存在"这一支，而非省略），请求本身成功返回 200。
+  （fail-closed 的直接推论，走上面"规则不存在"这一支，不进 `unavailable`），请求本身成功返回 200。
   这是预期行为——新部署下所有灰度功能默认隐藏，运维需显式建规则才放出；用一条测试钉住，
   避免日后被当成 bug 改成 fail-open。
 

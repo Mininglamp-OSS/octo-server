@@ -107,3 +107,39 @@ Redis key prefix; and `docs/cutover-framework.md`, which described this module a
 
 Date discipline: the migration filename and three octospec timestamps were all five
 days early. Run `date` before naming anything after today.
+
+## Review round 2 (2026-08-25)
+
+Both reviewers independently landed on the same blocker, and it was a regression
+introduced by round 1's own fix: the new persisted-scope check ran on **every**
+`update`, including a de-escalation. `modeNeedsScopes` excludes `off`/`on` — those
+modes never consult the whitelist or `bucket_by` — so the check was validating a
+precondition the requested state does not use, and a client-visible gate carrying a
+legacy group-only whitelist could not be turned off through its own API. The obvious
+rollback body `{"mode":"off"}` failed twice over: once on the defaulted
+`bucket_by=group`, once on the new scope check. What remained was deleting up to
+1000 scope rows one call at a time, or the env kill switch — which this module's own
+docs position as the last resort for when DB/Redis are down, not as the primary
+rollback.
+
+The rule that came out of it: **turning something off must never be harder than
+turning it on.** Both checks are now gated on `modeNeedsScopes`, and the reasoning is
+that every transition *into* a scope-consuming mode re-validates the request anyway,
+so permitting a stale `bucket_by` to sit in a row that nothing reads costs nothing.
+
+Also this round: the omission→`unavailable` change had landed in code but only in the
+brief's summary — Acceptance and Load-bearing still specified the opposite, as did
+five code comments and an errcode note. Since there is no OpenAPI spec, the brief is
+the only durable description of this contract, so a client team implementing from
+Acceptance would have built exactly the failure the change was made to prevent. All
+of it now says one thing. Worth remembering that changing a contract means changing
+every place that states it, and a dated revision note at the top does not cover the
+document below it.
+
+Smaller: `addScope`'s documented idempotency broke exactly at the quota boundary
+(re-adding an existing entry was rejected before reaching the `ON DUPLICATE` no-op —
+precisely when an operator is most likely retrying), so existence is now checked
+before the count. `delScope` deliberately does *not* validate the prospective
+post-delete state: blocking on it creates an ordering trap where neither entry of a
+`{user, group}` pair can be removed first. That path is left to the read-side
+backstop, which round 1 added and which is now explicitly noted in the code.

@@ -112,3 +112,15 @@ func (d *gateDB) countScopes(key string) (int, error) {
 	}
 	return n, nil
 }
+
+// scopeExists 报告某条白名单条目是否已存在。addScope 用它把「重加已有条目」与
+// 「新增条目」分开：前者是幂等重试，不该占配额。
+func (d *gateDB) scopeExists(key, scopeType, scopeID string) (bool, error) {
+	var n int
+	err := d.session.Select("COUNT(*)").From(tableGateScopeQuoted).
+		Where("feature_key=? AND scope_type=? AND scope_id=?", key, scopeType, scopeID).LoadOne(&n)
+	if err != nil {
+		return false, fmt.Errorf("featuregate: check scope %q/%s/%s: %w", key, scopeType, scopeID, err)
+	}
+	return n > 0, nil
+}

@@ -93,7 +93,7 @@ func (m *Manager) update(c *wkhttp.Context) {
 // 的条目——而运维看到的是名单有行、mode 对、写入 200、日志无声。addScope 侧的检查
 // 只覆盖「已是 client-visible 之后新加的条目」，盖不住这个顺序。
 func (m *Manager) commitUpdate(c *wkhttp.Context, key string, plan updatePlan) {
-	if ok, reason := m.clientVisibleScopesUsable(key); !ok {
+	if ok, reason := m.clientVisibleScopesUsable(plan.mode, key); !ok {
 		if reason != "" {
 			gateRequestInvalid(c, reason)
 			return
@@ -140,8 +140,13 @@ func (m *Manager) planUpdate(key string, req updateGateReq) (updatePlan, string)
 		return updatePlan{}, "bucket_by"
 	}
 	// 客户端可见的 key 只能按 user 维度分桶 —— 展示端点没有群/空间上下文。
-	// 见 validateClientVisibleDimension 的注释：这里不拦就是一个无报错的错配。
-	if m.registry.isClientVisible(key) && !validateClientVisibleDimension(bucketBy) {
+	//
+	// 只在**会读这些输入的 mode** 下施加（modeNeedsScopes）。off/on 既不读白名单也
+	// 不读 bucket_by（见 Evaluate 的对应分支），对它们校验一个目标状态压根不使用的
+	// 前置条件，只会让「关掉一个 gate」比「打开它」更难 —— 而 off 正是本框架的回滚
+	// 杠杆。放行不会留下隐患：每一次切进 whitelist/percent 都会重新校验请求里的
+	// bucket_by，坏值不可能悄悄生效。
+	if modeNeedsScopes(fg.Mode(mode)) && m.registry.isClientVisible(key) && !validateClientVisibleDimension(bucketBy) {
 		m.Warn("rejected client-visible gate with a dimension the flags endpoint cannot provide",
 			zap.String("key", key), zap.String("bucket_by", bucketBy))
 		return updatePlan{}, "client_visible_dimension"
@@ -174,16 +179,12 @@ func (m *Manager) addScope(c *wkhttp.Context) {
 		gateRequestInvalid(c, reason)
 		return
 	}
-	n, err := m.db.countScopes(key)
-	if err != nil {
-		m.Error("count feature gate scopes failed", zap.String("key", key), zap.Error(err))
+	if ok, reason := m.scopeQuotaAllows(key, scopeType, scopeID); !ok {
+		if reason != "" {
+			gateRequestInvalid(c, reason)
+			return
+		}
 		gateQueryFailed(c)
-		return
-	}
-	if n >= maxScopesPerKey {
-		m.Warn("feature gate whitelist quota exceeded",
-			zap.String("key", key), zap.Int("count", n), zap.Int("max", maxScopesPerKey))
-		gateRequestInvalid(c, "scope_quota")
 		return
 	}
 	if err := m.db.addScope(key, scopeType, scopeID, c.GetLoginUID()); err != nil {
@@ -219,6 +220,37 @@ func (m *Manager) planScope(key string, req scopeReq) (scopeType, scopeID, reaso
 		return "", "", "scope_id"
 	}
 	return scopeType, scopeID, ""
+}
+
+// scopeQuotaAllows 判定这次 addScope 是否被单 key 配额允许。
+//
+// 返回 (true, "") 放行；(false, reason) 拒绝；(false, "") 查询出错，调用方回 500。
+//
+// 先判存在再计数：满额时重加一条**已存在**的条目必须仍然幂等成功。先数后插会把它
+// 一并拒掉，而那正是运维最可能重试的时刻（网络抖动后重放）。
+//
+// 这仍是 check-then-act，并发 add 可能略微冲破上限。它是一道用于限制资源规模的
+// 整形阈值，不是硬性资源边界，且写侧是 superadmin-only，故不为此引入事务。
+func (m *Manager) scopeQuotaAllows(key, scopeType, scopeID string) (bool, string) {
+	exists, err := m.db.scopeExists(key, scopeType, scopeID)
+	if err != nil {
+		m.Error("check feature gate scope existence failed", zap.String("key", key), zap.Error(err))
+		return false, ""
+	}
+	if exists {
+		return true, ""
+	}
+	n, err := m.db.countScopes(key)
+	if err != nil {
+		m.Error("count feature gate scopes failed", zap.String("key", key), zap.Error(err))
+		return false, ""
+	}
+	if n >= maxScopesPerKey {
+		m.Warn("feature gate whitelist quota exceeded",
+			zap.String("key", key), zap.Int("count", n), zap.Int("max", maxScopesPerKey))
+		return false, "scope_quota"
+	}
+	return true, ""
 }
 
 // delScope 删除一条白名单条目；条目不存在返回 404。scope_type 走 query，缺省 group。
@@ -267,7 +299,11 @@ func (m *Manager) delScope(c *wkhttp.Context) {
 // 返回 (true, "") 表示通过；(false, reason) 表示校验失败；(false, "") 表示查询出错，
 // 调用方回 500。空名单视为通过——那是合法状态（mode=whitelist 且暂时谁都不放），
 // 不是错配。
-func (m *Manager) clientVisibleScopesUsable(key string) (bool, string) {
+func (m *Manager) clientVisibleScopesUsable(mode, key string) (bool, string) {
+	// off/on 不读白名单，校验它没有意义，还会挡住关停。见 planUpdate 里同源的注释。
+	if !modeNeedsScopes(fg.Mode(mode)) {
+		return true, ""
+	}
 	if !m.registry.isClientVisible(key) {
 		return true, ""
 	}
@@ -289,3 +325,9 @@ func (m *Manager) clientVisibleScopesUsable(key string) (bool, string) {
 		zap.String("key", key), zap.Int("scopes", len(scopes)))
 	return false, "client_visible_scopes"
 }
+
+// 关于 delScope：它**刻意不做**这项校验。删除最后一条可用条目确实能把白名单重新
+// 带回「全都用不上」的状态，但按删除后的预期状态去拦会造成顺序陷阱——运维想把
+// {user:u1, group:g1} 清空时，删哪一条都可能先被拒，于是连清理都做不了。
+// 这条路径交给读侧兜底：Evaluate 会报 whitelist_dim_unavailable，AllowDisplay 打
+// Warn，不再像 round 1 那样两侧皆哑。

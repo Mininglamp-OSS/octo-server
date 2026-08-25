@@ -487,3 +487,91 @@ func TestManagerCapsWhitelistSize(t *testing.T) {
 	_, reason := errCodeOf(t, w)
 	require.Equal(t, "scope_quota", reason)
 }
+
+// TestOffAndOnStayWritableForClientVisibleKeyWithUnusableScopes 是 round-2 阻塞项：
+// 上一轮为了堵「白名单全是用不上的维度」而加的校验跑在**每一次** update 上，包括
+// 降级。后果是一条 client-visible 且带遗留 group 白名单的 gate **关不掉**——
+// `{"mode":"off"}` 先被 bucket_by 默认成 group 拦掉，显式写 bucket_by=user 又被
+// 存量 scope 检查拦掉，只剩逐条删白名单（最多 1000 次）或 env 杀开关。
+//
+// 而 off/on 根本不读白名单也不读 bucket_by（见 modeNeedsScopes 与 Evaluate 的
+// ModeOff/ModeOn 分支），校验的是一个目标状态压根不使用的前置条件。
+//
+// 原则：**关掉一个东西永远不该比打开它更难。**
+func TestOffAndOnStayWritableForClientVisibleKeyWithUnusableScopes(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+
+	const key = "fgtest_off_rollback"
+	db := newDB(ctx)
+
+	// 造出这条检查存在的理由所描述的状态：内部 gate + 全 group 白名单，之后被
+	// 某次发版变成 client-visible。
+	require.NoError(t, db.upsertRule(key, string(fg.ModeWhitelist), 0, fg.ScopeTypeGroup, "legacy", "seed"))
+	require.NoError(t, db.addScope(key, fg.ScopeTypeGroup, "g1", "seed"))
+	r := mountManager(t, ctx, []ClientFlag{{FeatureKey: key, ClientKey: "off_rollback"}})
+
+	t.Run("最朴素的回滚 body 必须可用", func(t *testing.T) {
+		w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+			map[string]any{"mode": "off"})
+		require.Equal(t, http.StatusOK, w.Code,
+			"关停不该被一个 off 模式根本不读的前置条件拦住；body: %s", w.Body.String())
+	})
+
+	t.Run("显式 bucket_by 的 off 同样可用", func(t *testing.T) {
+		w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+			map[string]any{"mode": "off", "bucket_by": "user"})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	})
+
+	t.Run("on 同理：不读 scope 也不读 bucket_by", func(t *testing.T) {
+		w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+			map[string]any{"mode": "on"})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	})
+
+	t.Run("切回真正会读白名单的模式仍必须被拦", func(t *testing.T) {
+		w := doJSON(t, r, http.MethodPut, "/v1/manager/featuregate/gates/"+key,
+			map[string]any{"mode": "whitelist", "bucket_by": "user"})
+		require.Equal(t, http.StatusBadRequest, w.Code,
+			"whitelist 会读白名单，存量全不可用时必须仍然拒绝；body: %s", w.Body.String())
+		_, reason := errCodeOf(t, w)
+		require.Equal(t, "client_visible_scopes", reason)
+	})
+
+	// 关停后规则确实落库为 off。
+	require.Equal(t, http.StatusOK, doJSON(t, r, http.MethodPut,
+		"/v1/manager/featuregate/gates/"+key, map[string]any{"mode": "off"}).Code)
+	rule, err := db.queryRule(key)
+	require.NoError(t, err)
+	require.Equal(t, string(fg.ModeOff), rule.Mode)
+}
+
+// TestAddScopeStaysIdempotentAtQuota 钉住配额检查不得破坏 addScope 的幂等承诺。
+//
+// 先数后插的写法在**恰好满额**时会把「重加一条已存在的条目」也拒掉——而那正是
+// 运维最可能重试的时刻（网络抖动后重放）。已存在的条目不占新增名额。
+func TestAddScopeStaysIdempotentAtQuota(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	loginAs(t, ctx, string(libwkhttp.SuperAdmin))
+	r := mountManager(t, ctx, nil)
+
+	const key = "fgtest_quota_idem"
+	db := newDB(ctx)
+	for i := 0; i < maxScopesPerKey; i++ {
+		require.NoError(t, db.addScope(key, fg.ScopeTypeUser, fmt.Sprintf("u%d", i), "seed"))
+	}
+
+	// 满额时重加**已存在**的条目：幂等，应当成功。
+	w := doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/"+key+"/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "u0"})
+	require.Equal(t, http.StatusOK, w.Code,
+		"已存在的条目不占新增名额，重试必须仍然幂等；body: %s", w.Body.String())
+
+	// 满额时加**新**条目：仍应被配额拒绝。
+	w = doJSON(t, r, http.MethodPost, "/v1/manager/featuregate/gates/"+key+"/scopes",
+		map[string]any{"scope_type": "user", "scope_id": "brand_new"})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	_, reason := errCodeOf(t, w)
+	require.Equal(t, "scope_quota", reason)
+}

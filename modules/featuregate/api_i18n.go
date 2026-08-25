@@ -11,8 +11,9 @@ import (
 // ResponseErrorLWithStatus 保留真实语义状态（400/403/404/500），而不是 D14 兼容期
 // 的固定 400。
 
-// gateRequestInvalid 返回 400；reason ∈ {key,body,mode,percent,bucket_by,
-// description,scope_type,scope_id,client_visible_dimension} 经安全 Details 透出。
+// gateRequestInvalid 返回 400；reason ∈ {key,body,mode,percent,bucket_by,description,
+// scope_type,scope_id,scope_quota,client_visible_dimension,client_visible_scopes}
+// 经安全 Details 透出。这份清单要与 api_manager.go 的各处校验保持穷尽一致。
 func gateRequestInvalid(c *wkhttp.Context, reason string) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrFeatureGateRequestInvalid, nil, i18n.Details{"reason": reason})
 }

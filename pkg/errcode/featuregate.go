@@ -12,7 +12,7 @@ import (
 // pkg/i18n/locales/active.zh-CN.toml。
 //
 // 用户侧只读端点 GET /v1/featuregate/flags 刻意不新增错误码：它的失败模式都不走
-// 错误信封——单个 key 的存储故障从响应中省略、规则不存在下发 false，两者都是 200；
+// 错误信封——单个 key 的存储故障进 unavailable 数组、规则不存在下发 false，两者都是 200；
 // 只有鉴权失败（复用 err.shared.auth.* 的通用码，反枚举）才会走信封。
 var (
 	// ErrFeatureGateRequestInvalid (400) — 请求体或字段非法（mode/percent/

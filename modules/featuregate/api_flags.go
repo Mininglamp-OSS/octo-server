@@ -33,7 +33,7 @@ type flagsResp struct {
 }
 
 // displayEvaluator 是 flagsAPI 需要的最小能力面，在使用处定义（而不是在
-// Service 侧）。抽这一层不是为了将来换实现，而是为了让「存储故障 → 省略该 key」
+// Service 侧）。抽这一层不是为了将来换实现，而是为了让「存储故障 → 进 unavailable」
 // 这条路径可被确定性地测到：真去制造一次 DB/Redis 故障要么污染同包其它测试
 // （drop 表），要么依赖时序，两者都比一个 stub 差。
 type displayEvaluator interface {
@@ -122,7 +122,7 @@ func (a *flagsAPI) get(c *wkhttp.Context) {
 
 // resolve 求出单个 flag 对本次调用者的最终值。
 //
-// 返回 (allow, ok)：ok=false 表示存储故障、判定不可得，调用方应省略该 key。
+// 返回 (allow, ok)：ok=false 表示存储故障、判定不可得，调用方应把该 key 列进 unavailable。
 func (a *flagsAPI) resolve(ctx context.Context, f ClientFlag, dims fg.Dims) (bool, bool) {
 	allow, ok := a.svc.AllowDisplay(ctx, f.FeatureKey, dims)
 	if !ok {

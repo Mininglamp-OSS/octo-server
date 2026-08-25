@@ -15,7 +15,15 @@ import (
 )
 
 // 缓存键前缀与兜底 TTL。Redis 是规则的读缓存（DB 才是真源）；管理端写后主动
-// DEL 失效以达成秒级全实例一致，TTL 仅作 DEL 漏掉时的最终一致兜底。
+// DEL 失效，正常情况下变更秒级到达所有实例。
+//
+// TTL 兜的是两种情况，不止一种：
+//  1. DEL 本身失败（Invalidate 只 Warn，不阻断写入）；
+//  2. **cache-aside 回填竞态**——一个在写事务提交前就查过 DB 的读者，可能在 DEL
+//     之后才把旧值写回缓存。于是一条刚被置为 off 的规则最长可能再放行 cacheTTL。
+//
+// 所以"秒级全实例一致"是**常态**而非保证；确定性的关停要走 env kill switch，它在
+// 三个入口都先于任何缓存/DB 读取被检查，完全绕开这个窗口。
 const (
 	// 缓存键带 schema 版本号：给 fg.Rule 加字段后，上一版二进制写入的缓存值会缺
 	// 新字段，读出来是零值并在 TTL 内（最长 60s）被当作真实配置使用。版本号一升，
@@ -107,14 +115,14 @@ func (s *Service) AllowPush(ctx context.Context, key string) bool {
 
 // AllowDisplay 是客户端展示位判定，返回 (allow, ok) 两态：
 //
-//   - ok == false ：**存储故障**（DB/Redis）导致判定不可得。调用方应把该 key
-//     从响应中【省略】，让客户端保留上一次的值。绝不能下发 false —— 响应只有
+//   - ok == false ：**存储故障**（DB/Redis）导致判定不可得。调用方应把该 key 列进
+//     响应的 unavailable 数组，让客户端保留上一次的值。绝不能下发 false —— flags 里只有
 //     布尔，客户端分不清「真的关」和「服务端抖了一下」，一次 Redis 抖动就会让
 //     全体用户丢功能。
 //   - ok == true  ：allow 是**确定性**结论。规则不存在 → false（未配置即关），
 //     维度不可用 → false，kill switch → false。
 //
-// 为什么 kill switch 必须走确定性 false 而不是省略：省略意味着客户端保留旧值，
+// 为什么 kill switch 必须走确定性 false 而不能进 unavailable：那意味着客户端保留旧值，
 // 那么对一个已经放量的功能按下 kill 开关，客户端界面永远不会收敛——紧急关停
 // 在展示面上完全失效。kill 的语义是「立刻确定性地关」，只能是 false。
 //
@@ -126,7 +134,7 @@ func (s *Service) AllowDisplay(ctx context.Context, key string, dims fg.Dims) (a
 	}
 	rule, scopes, err := s.loadRuleAndScopes(key)
 	if err != nil {
-		s.Warn("featuregate load failed; display key omitted from response",
+		s.Warn("featuregate load failed; display key reported as unavailable",
 			zap.String("key", key), zap.Error(err))
 		return false, false
 	}
