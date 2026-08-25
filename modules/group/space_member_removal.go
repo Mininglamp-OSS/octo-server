@@ -187,35 +187,29 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 			groupNo, removal.UID)
 	}
 	if selfExit {
-		g.sendGroupExitTip(groupNo, removal.UID)
+		// 群内备注必须用**移除前**读到的这一行：sendGroupExitTip 跑在
+		// RemoveGroupMembers 之后，那时 QueryMemberWithUID（where is_deleted=0）
+		// 已经查不到人了。
+		g.sendGroupExitTip(groupNo, removal.UID, member.Remark)
 	}
 	return nil
 }
 
 // sendGroupExitTip 发「主动退群」提示，可见范围与既有 groupExit 一致：
-// 只给一位管理员/群主看，不打扰全群。best-effort，失败只记日志——文案发不出去
-// 不该让整条清理工单重试。
-func (g *Group) sendGroupExitTip(groupNo, uid string) {
-	adminUIDs, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
-	if err != nil {
-		g.Warn("查询群管理员失败，跳过退群提示", zap.Error(err), zap.String("groupNo", groupNo))
-		return
-	}
-	visibles := make([]string, 0, 1)
-	for _, admin := range adminUIDs {
-		if admin != uid {
-			visibles = append(visibles, admin)
-			break
+// 全员可见 + RedDot:0（见 sendGroupExitNotice）。best-effort，失败只记日志——
+// 文案发不出去不该让整条清理工单重试。
+//
+// 此前这里要先查管理员、把 `visibles` 白名单收窄到一位管理员/群主，且在群里没有
+// 其他管理员时直接 return（提示被静默吞掉）。可见性白名单去掉后这两步都不再需要：
+// 无其他管理员时同样照发。
+func (g *Group) sendGroupExitTip(groupNo, uid, groupRemark string) {
+	showName := resolveExitShowName(groupRemark, func() string {
+		if member, err := g.userDB.QueryByUID(uid); err == nil && member != nil {
+			return member.Name
 		}
-	}
-	if len(visibles) == 0 {
-		return
-	}
-	showName := uid
-	if member, err := g.userDB.QueryByUID(uid); err == nil && member != nil && member.Name != "" {
-		showName = member.Name
-	}
-	if err := g.ctx.SendGroupExit(groupNo, uid, showName, visibles); err != nil {
+		return ""
+	})
+	if err := sendGroupExitNotice(g.ctx, groupNo, uid, showName); err != nil {
 		g.Warn("发送退群提示失败", zap.Error(err), zap.String("groupNo", groupNo))
 	}
 }

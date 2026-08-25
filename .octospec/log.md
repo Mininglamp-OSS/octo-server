@@ -4,6 +4,33 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-08-24 (group-exit-notice-visibility)
+
+- **Fixed** — 「某成员退出群聊」系统提示（`type=1021`）改为**全员可见 + RedDot:0**，
+  与 bot 级联移除 Tip 同一套语义。此前它带 `visibles` 白名单只给一位管理员可见，
+  非管理员看不到气泡却被计一格未读、且永远消不掉。实现走 octo-server 侧新增的
+  `modules/group/group_exit_notice.go`，**不动 octo-lib 的 `SendGroupExit`**。
+  See [journal](journal/shared/group-exit-notice-visibility.md).
+- **Learned** — `visibles` 挡的是**内容**，挡不住 **seq**。IM 的未读是纯游标减法
+  （`unread = latest_msg_seq − read_seq`），与 `red_dot`、`visibles` **都无关**
+  （octo-im `build.go` / `sync.go`，octo-server 只原样透传）。所以「改红点字段」
+  这个直觉修复**完全无效** —— 真正修好未读的是让消息可读。推论：单条共享 channel log
+  里，「只给部分人看的持久气泡」与「不给其他人产生未读」不可兼得。
+- **Guarded** — 可见性白名单里藏着一条**静默早退**：白名单为空（群里没有其他
+  管理员）时整条提示不发。那不是产品规则，只是可见性实现的副作用。现已由
+  `TestGroupExitTipSentWhenNoOtherAdmin` 钉死。`groupExit` 侧还连带去掉了一个
+  查询失败即 500 中断整个退群的错误分支。
+- **Learned** — 差分验证若只回退**改动面的一部分**，同样失真。第一轮只回退了 helper
+  的 payload，两条测试确实红了，但那条早退门槛的断言从未被验证过；补做整段还原才
+  跑出 `"[]" should have 1 item(s), but has 0`。移除了 N 个行为门槛，就得逐个还原。
+  See [learning](learnings/pending/group-exit-notice-visibility.md).
+- **Known gap** — `groupExit` handler 那处发送门槛的改动**无运行中的测试**：
+  `api_test.go` 整片 HTTP handler 测试（19 处 skip）卡在 issue #17 的路由重复注册
+  （解除 skip 会 `panic: handlers are already registered`）。补齐前置是先修 #17。
+- **Out of scope** — 排查中确认的第二个问题（跨端已读不同步：`unreadClear` CMD
+  `NoPersist:true` 离线丢失、`readed_to_msg_seq` 被 octo-lib 丢弃、iOS
+  `reconcileServerSnapshot` 走 `MAX` 本地优先）未动，独立任务。
+
 ## 2026-08-23 (bot-owner-self-removal)
 
 - **Implemented** — 普通群成员现在可以把自己名下（`robot.creator_uid`）的 bot 移出
