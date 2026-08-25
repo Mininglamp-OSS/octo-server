@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1576,11 +1577,34 @@ func TestUpsertMembersLocksInSameOrderAsBatchRemoval(t *testing.T) {
 	const spaceID = "upsert-order"
 	seedMember(t, f, spaceID, "owner", 2)
 
+	// 字母表刻意选成「字节序与 utf8mb4_general_ci 序在相邻元素上翻转」的一组。
+	//
+	// 之前这里是 `m%04d` —— 数字加一个小写字母，正好是两种顺序**重合**的那一个
+	// 字母表，于是这条 guard 对「Go 排序 ≠ 索引顺序」这个失败模式完全不敏感
+	// （PR #804 round-10 review P2-1）。
+	//
+	// 现在每一对都翻转，靠的是 '_'(0x5F) 落在大写区(0x41-0x5A)之后、小写区
+	// (0x61-0x7A)之前，而 general_ci 把小写折叠进大写：
+	//   - `u_%03d` vs `ua%03d` —— 字节序 '_' < 'a'；general_ci 下 'a'→'A'(0x41) < '_'。
+	//   - `A_%03d` vs `Ab%03d` —— 同样的翻转，且把大写字母带进字母表。
+	//
+	// 注意不能用「同名只差大小写」的一对（`M001`/`m001`）来引入大写：唯一索引
+	// (space_id, uid) 在 general_ci 下视两者为同一个键，插第二行会直接 1062。
+	//
+	// 带下划线的标识符在本系统里是现成的（`app_…_bot`、`iwh_…` 都是 Space 成员），
+	// 而批量加人对调用方给的 uid 不做字符集校验。
 	const n = 200
 	asc := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		uid := fmt.Sprintf("m%04d", i)
-		asc = append(asc, uid)
+	for i := 0; i < n/4; i++ {
+		asc = append(asc,
+			fmt.Sprintf("u_%03d", i),
+			fmt.Sprintf("ua%03d", i),
+			fmt.Sprintf("A_%03d", i),
+			fmt.Sprintf("Ab%03d", i),
+		)
+	}
+	require.Len(t, asc, n)
+	for _, uid := range asc {
 		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
 			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
 		}))
@@ -1862,4 +1886,54 @@ func memberStatus(t *testing.T, spaceID, uid string) int {
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "space_member 里应当恰好有一行 %s/%s", spaceID, uid)
 	return rows[0].Status
+}
+
+// TestLessUIDGeneralCIMatchesIndexOrder 把 lessUIDGeneralCI 直接钉到**数据库真正的
+// 索引顺序**上，而不是钉到一组手写的期望值上。
+//
+// 为什么需要这条，明明已经有并发的 TestUpsertMembersLocksInSameOrderAsBatchRemoval：
+// 那条是并发压力测试，红了只告诉你"成环了"，不告诉你排序在哪一对上错；而且它要跑
+// 几秒、依赖调度。这条是确定性的，一次扫描就说清楚两种顺序是否逐元素一致，并且在
+// collation 被改掉（比如有人给 uid 列加了 _bin，或建库时漏了 COLLATE）时同样变红
+// —— 那时结构性保证的前提本身已经变了，应该有人看一眼。
+func TestLessUIDGeneralCIMatchesIndexOrder(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "uid-collation-order"
+	seedMember(t, f, spaceID, "owner", 2)
+
+	// 覆盖三类会让字节序与 general_ci 序分歧的形状：'_' 与字母的相对位置、
+	// 大写与小写的折叠、以及前缀关系（短的排前面）。外加两个真实世界的身份前缀。
+	uids := []string{
+		"a_b", "aab", "abcdef01", "app_9f2_bot", "iwh_3c1",
+		"Zz", "zA", "z_", "m001", "M002", "u_000", "ua000", "A_000", "Ab000",
+		"pre", "prefix",
+	}
+	for _, uid := range uids {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	// 索引序：走批量移除那条语句用的同一条索引，拿到的就是它取锁的顺序。
+	var indexOrder []string
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT uid FROM space_member FORCE INDEX (spacemember_spaceid_uid) WHERE space_id=?", spaceID,
+	).Load(&indexOrder)
+	require.NoError(t, err)
+	require.Len(t, indexOrder, len(uids)+1, "owner 也在这个 Space 里")
+
+	goOrder := append([]string(nil), indexOrder...)
+	sort.Slice(goOrder, func(i, j int) bool { return lessUIDGeneralCI(goOrder[i], goOrder[j]) })
+
+	assert.Equal(t, indexOrder, goOrder,
+		"lessUIDGeneralCI 必须复现索引扫描顺序；不一致就意味着 upsert 与批量移除的"+
+			"取锁顺序会分歧，AB-BA 重新成立")
+
+	// 对照：证明这组数据确实能分辨两种顺序，否则上面的断言可能是恒真的。
+	byteOrder := append([]string(nil), indexOrder...)
+	sort.Strings(byteOrder)
+	assert.NotEqual(t, indexOrder, byteOrder,
+		"这组 uid 必须让字节序与索引序真的分歧，否则本测试测不出任何东西")
 }

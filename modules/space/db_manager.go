@@ -418,8 +418,8 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 
 // upsertMembersOnce 是 upsertMembers 的单次尝试，死锁重试见 retryOnDeadlock。
 //
-// **按 uid 升序取锁**，与批量移除那条 FORCE INDEX 语句的加锁顺序一致，这样两边同序、
-// 结构上无法成环。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
+// **按索引序取锁**（lessUIDGeneralCI，不是 sort.Strings），与批量移除那条 FORCE INDEX
+// 语句的加锁顺序一致，这样两边同序、结构上无法成环。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
 // 已归零），对**长命**的对手会被饿死——批量移除每次尝试都是全新事务、回滚代价为零，
 // 于是被 InnoDB 反复选为牺牲者，而还在跑的 upsert 一直在推进，重试立刻又撞上同一个
 // 活事务，几次退避跑完还在人家的生命周期里。实测（200 uid 逆序重叠、60 轮）：只包重试
@@ -427,12 +427,18 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 // PR #804 round-9 review：Jerry-Xin 实测定位并给出这个修法。
 //
 // 排序 uids 的副本，不改调用方切片（normalizeUIDs 保留调用方顺序，其返回值调用方后续还要用）。
+//
+// ⚠️ 排序必须用 lessUIDGeneralCI 而**不是** sort.Strings。sort.Strings 是字节序，
+// 而索引扫描按 utf8mb4_general_ci 走；两者只对 [0-9a-f] 这类字母表重合，对含 '_'
+// 或大写的 uid 相邻元素直接翻转，环就重新开了（PR #804 round-10 review P1-1，
+// 两名 reviewer 各自实测；本地用 TestUpsertMembersLocksInSameOrderAsBatchRemoval
+// 的新字母表复现 3/3 红）。
 func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
 	ordered := append([]string(nil), uids...)
-	sort.Strings(ordered)
+	sort.Slice(ordered, func(i, j int) bool { return lessUIDGeneralCI(ordered[i], ordered[j]) })
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
@@ -448,6 +454,51 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// lessUIDGeneralCI 按 utf8mb4_general_ci 的顺序比较两个 uid。
+//
+// 存在的唯一理由：让 upsert 的取锁顺序与批量移除那条 FORCE INDEX 语句的索引扫描
+// 顺序一致。两边被同一个顺序驱动，AB-BA 就结构上不成立，不必指望重试。
+//
+// 为什么不能用 sort.Strings —— 那是字节序，而 space_member.uid 没有显式 COLLATE、
+// 继承库默认 utf8mb4_general_ci：小写折叠进大写，于是 '_'(0x5F) 落在字母**之后**
+// 而不是大小写之间。两种顺序只对 [0-9a-f] 这类字母表重合；含 '_' 或大写时相邻
+// 元素直接翻转（字节序 `a_b` < `aab`，general_ci 下 `aab` < `a_b`）。这类标识符
+// 在本系统里是现成的：`app_…_bot`、`iwh_…` 都是 Space 成员，而批量加人接口对
+// 调用方给的 uid 不做字符集校验。本仓库已经在另外两处记过同一个陷阱
+// （modules/user/batch.go、modules/message/db_reminders.go）。
+//
+// 只需要在**排序**上复现 general_ci，不需要复现相等语义。
+//
+// ⚠️ 边界，别读成比它强：只对 ASCII 精确。general_ci 对非 ASCII 走自己的权重表，
+// 这里退化成 UTF-8 字节比较，顺序可能与索引不一致。真出现非 ASCII 的 uid 时防线
+// 退回 retryOnDeadlock（跨路径死锁本来就靠它兜底）—— 不比修复前差，但也**没有**
+// 结构性保证。要根治得在 API 边界把 uid 收敛到一个已知字母表，那是独立一项。
+//
+// 权重相等时用字节序兜底，让它成为全序：sort.Slice 不稳定，而同一个集合必须排出
+// 同一个顺序，否则两个并发请求又各排各的。（互为大小写变体的 uid 在库里本就是同
+// 一行、同一把锁，谁先谁后无关紧要，但确定性不该靠这个巧合。）
+func lessUIDGeneralCI(a, b string) bool {
+	fold := func(c byte) byte {
+		if c >= 'a' && c <= 'z' {
+			return c - ('a' - 'A')
+		}
+		return c
+	}
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if wa, wb := fold(a[i]), fold(b[i]); wa != wb {
+			return wa < wb
+		}
+	}
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+	return a < b
 }
 
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权
