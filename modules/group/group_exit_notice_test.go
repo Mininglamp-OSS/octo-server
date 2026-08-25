@@ -80,9 +80,18 @@ func TestGroupExitNoticeIsEveryoneVisibleAndSilent(t *testing.T) {
 	assert.False(t, hasVisibles,
 		"退群提示不得带 visibles —— 带了就会「非管理员看不到内容却仍被计未读」")
 
-	// 2) 不点亮红点，与 bot 级联 Tip 一致。
+	// 2) header 三元组一次钉死，不能只钉 red_dot（PR #807 review nit）。
+	//
+	// no_persist / sync_once 是**承重项**，不是陪衬：本次可见性论证明确接受了
+	// "后来入群的人也读得到这条退群记录"，而那正建立在"消息持久、入群即得完整
+	// 历史"之上。谁把 NoPersist 翻成 1，这条契约就静默漂移了，而只断言 red_dot
+	// 的测试照样绿。
 	require.NotNil(t, notice.Header, "header 必须存在")
 	assert.EqualValues(t, 0, notice.Header["red_dot"], "退群提示不应点亮红点")
+	assert.EqualValues(t, 0, notice.Header["no_persist"],
+		"必须持久化 —— 可见性论证接受了『后来入群者也读得到』，靠的就是这一条")
+	assert.EqualValues(t, 0, notice.Header["sync_once"],
+		"不得走 sync_once —— 那会被改写进 command channel，变成一次性提示")
 
 	// 3) 渲染契约：type / content 模板 / extra 结构一律不变。
 	assert.EqualValues(t, 1021, notice.Payload["type"], "必须是 GroupMemberQuit(1021)")
