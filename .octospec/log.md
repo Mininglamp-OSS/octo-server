@@ -1542,6 +1542,55 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-25 (space-removal-creator-handover-notice · round 10)
+
+- **Fixed** — Two defects this branch introduced, both the same root cause: the
+  package compares `space_member.uid` in Go while the column is
+  `utf8mb4_general_ci`. (1) `removeMembersLockedOnce` keyed a role map by the
+  spelling SQL returned and looked it up with the caller's, so a case-variant uid
+  was silently skipped — no status flip, no cleanup job, no cache invalidation,
+  and a 200 response. The old per-uid path compared in SQL and removed the member,
+  so this was a regression on an access-revoking endpoint. Now driven from the rows
+  SQL matched, which removes the second comparison instead of aligning it.
+  (2) `sort.Strings` is byte order; the `FORCE INDEX` scan walks the index in
+  `general_ci` order. Folding lowercase into uppercase moves `_` after the letters,
+  so `a_b`/`aab` invert and the "structurally cannot cycle" claim failed for
+  `app_…_bot` / `iwh_…`-shaped uids that are already Space members. Now ordered by
+  `lessUIDGeneralCI`, whose ASCII-only limit is stated at the definition.
+  See [journal](journal/shared/space-removal-creator-handover-notice.md).
+- **Learned** — A red is not coverage until the fixture can express the failure.
+  The ordering guard used `m%04d` — digits and one lowercase letter, precisely the
+  alphabet where byte order and collation order agree — so it went 30/30 red under
+  the mutation aimed at it while being structurally unable to see the defect it was
+  named for. Both reviewers found it by varying the fixture's *data* and nothing
+  else. Complement to round 9's "a zero is not evidence until you remove what could
+  be hiding the non-zero", one level down.
+- **Learned** — "Equivalent to the old path" is a claim about the *comparison*, not
+  only the result. Relocating a predicate from SQL into Go silently swaps the
+  comparator, and every path here is keyed on an identifier. If a refactor moves a
+  comparison across the Go/SQL boundary, the collation is part of what must be
+  shown unchanged.
+- **Rejected** — Routing the upsert's locks through the removal's
+  `SELECT … FOR UPDATE` (the other offered fix) would order both sides by
+  construction, but gap-locks every non-existent uid; concurrent upserts hold
+  compatible gap locks and then block on each other's insert intention locks.
+  Closing one cycle by opening another is not closure.
+- **Out of scope, with reasoning recorded** — constraining uids to a known alphabet
+  at the API boundary (the durable fix for both findings above), the missing
+  `FORCE INDEX` on `removeMembersForceOnce`, the unwrapped `lockActiveMemberUIDsTx`
+  that this branch's 200-row batch newly pairs with, and the handover notice's
+  bare-UID fallback that #807 just eliminated on the sibling path.
+
+## 2026-08-25 (space-removal-creator-handover-notice · rebase onto #807)
+
+- **Fixed** — `sendGroupExitTip` now keeps #807's shape verbatim (group-visible,
+  `RedDot:0`, `resolveExitShowName`); this branch threads nothing into it.
+  `TestGroupCascadeSelfExitSuppressesRemovedNotice` asserted zero group-visible
+  tips on the premise that the tip is admin-only — false as of #807. It pins
+  exactly one now, plus a negative assertion that an ordinary member's self-exit
+  emits no handover notice. Zero would have re-asserted #807's stuck-unread bug;
+  no bound at all would have stopped guarding against a second broadcast.
+
 ## 2026-08-23 (space-removal-creator-handover-notice)
 
 - **Implemented** — A Space removal that hands a group to a new owner now says so

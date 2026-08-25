@@ -342,17 +342,25 @@ to #797.
 
 ### Display names
 
-**This also changes `sendGroupExitTip`**, which previously resolved the global
-`user.name` only. Keeping the change (consistency with `groupExit` and the roster
-is this repository's rule) rather than scoping it to the new path, and pinning it
-with a test — it arrived as a side effect of a parameter refactor and was
-unguarded until PR #804 review pointed it out.
-
 Group `remark` first, falling back to global `user.name`, falling back to uid —
 the repository's existing rule (`groupExit` resolves `loginMember.Remark` first;
 the roster renders `Remark`). The successor's name comes from the row the
 handover transaction already holds under `FOR UPDATE`: no extra query, and no
 window in which a re-read could observe a different row.
+
+**Superseded (rebase onto #807).** An earlier revision of this brief recorded
+that this task *also* changed `sendGroupExitTip` from global-`user.name` to
+remark-first, and kept it on consistency grounds. #807 has since landed that
+same precedence on `main` — plus a neutral fallback (`该成员`) so the notice can
+never write a bare UID into permanent, group-readable history. `sendGroupExitTip`
+now keeps #807's shape verbatim and this task threads nothing into it; the
+`displayName` it computes serves only the handover notice.
+
+The handover notice's own fallback is still the bare uid
+(`sendSpaceRemovalHandoverNotice`). That is the same permanent-history surface
+#807 tightened, so the two paths now disagree. Aligning them is a one-line
+change but a user-visible one on a path #807 did not review, so it is listed as
+a follow-up rather than folded in here.
 
 ### Suppression
 
@@ -385,7 +393,43 @@ exists.
   neither lost on retry nor duplicated.
 - **`testing`** — the guards here are assertions about *visibility*, which the
   pre-existing tests did not distinguish from "was sent".
+- **`identifier-comparison`** — this task moved the user-side batch removal from
+  one row per transaction to 200, which put two new comparisons of
+  `space_member.uid` on the critical path: a role lookup and a lock ordering.
+  The column is `utf8mb4_general_ci` (CI pins the collation, `ci.yml:203-210`);
+  Go compares bytes. Anywhere the two disagree is a defect, and both instances
+  written on this branch were defects — see *What round 10 found* below.
 - **`commit`** — English Conventional Commits.
+
+## What round 10 found
+
+Two independent reviewers measured the same root cause in the same head, and it
+is worth stating as a premise of this package rather than as two bug entries:
+**this code compares identifiers in Go while the database compares them in
+`utf8mb4_general_ci`, and nothing makes the two agree.** Both instances were
+introduced by this branch; neither existed on `main`.
+
+1. **Role lookup (P0).** `removeMembersLockedOnce` locked the batch with
+   `uid IN ? FOR UPDATE`, keyed a map by the spelling the rows came back under,
+   then looked entries up with the caller's spelling. A case-variant uid missed,
+   the member was treated as absent and silently skipped — no status flip, no
+   cleanup job, no cache invalidation — and the endpoint answered 200. The old
+   per-uid path did both comparisons in SQL and removed the member, so this was
+   a regression on an endpoint whose entire job is revoking access. Fixed by
+   driving the loop from the rows SQL matched, which removes the second
+   comparison rather than aligning it.
+
+2. **Lock ordering (P1).** `sort.Strings` is byte order; the `FORCE INDEX` scan
+   walks the index in `general_ci` order. They coincide only for `[0-9a-f]`-style
+   alphabets — fold lowercase into uppercase and `_` lands after the letters,
+   so `a_b`/`aab` invert. `app_…_bot` and `iwh_…` are Space members and the
+   batch-add path validates no charset, so the "structurally cannot cycle"
+   claim did not hold for reachable input. Fixed with `lessUIDGeneralCI`, whose
+   limit (ASCII only) is stated at the definition.
+
+The durable answer is to constrain uids to a known alphabet at the API boundary
+and state the premise once for the package. That is not this task; it is written
+up as a follow-up so the next round of this does not start from scratch.
 
 ## Out of scope
 
@@ -507,8 +551,24 @@ In `modules/group/space_member_removal_test.go`:
   notices; in the ordinary case, exactly one naming the settled owner. Neither the
   first version's vacuous "if emitted…" shape nor a count alone would catch the
   composition; removing the chain suppression turns both subtests red.
-- `TestGroupCascadeSelfExitTipPrefersGroupRemark` — pins the `sendGroupExitTip`
-  display-name change this task makes (see below).
+- `TestGroupCascadeSelfExitTipPrefersGroupRemark` — pins remark-first precedence
+  on the self-exit tip. Since the rebase onto #807 that precedence lives on
+  `main`; the guard is kept because the cascade path reaches it through a
+  different caller than #807's own tests do.
+- `TestRemoveMembersLockedHonoursStoredUIDSpelling` /
+  `TestRemoveMembersLockedDedupesCaseVariants` — a case-variant uid is really
+  removed, `removed` carries the stored spelling, and two variants collapse to
+  one job. The first pre-checks that the column is case-insensitive so a
+  mis-created test database fails loudly instead of passing vacuously; the
+  second deliberately omits the stored spelling so matching and dedup must both
+  hold.
+- `TestLessUIDGeneralCIMatchesIndexOrder` — sorts a scan of the real index with
+  the comparator and asserts element-wise equality, with a control asserting the
+  fixture distinguishes byte order from index order at all. Goes red if the
+  column's collation changes underneath the premise.
+- `TestUpsertMembersLocksInSameOrderAsBatchRemoval` — alphabet moved off
+  `m%04d`, the one alphabet where byte order and collation order agree, so the
+  guard was blind to the ordering defect it was named for.
 - `TestGroupCascadeHandoverNoticeIsBestEffort` — a failing send does not fail the
   job; the handover stays committed and the removal completes.
 - Pre-existing suppression guards still hold:

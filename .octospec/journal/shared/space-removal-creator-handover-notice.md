@@ -132,6 +132,39 @@ Two verification notes worth keeping:
   bot owned by someone else is an eligible successor, pinned as an existing
   contract by `bot_cascade_test.go`. This change makes a previously silent
   outcome publicly visible without altering the selection.
+- **Constrain uids to a known alphabet at the API boundary** (from round 10, and
+  the durable fix for both of that round's findings). `api_manager.go`'s batch-add
+  upserts caller-supplied uid strings with no charset check, and
+  `space_member.uid` is `utf8mb4_general_ci`. As long as a uid can contain `_`,
+  uppercase, or non-ASCII, `lessUIDGeneralCI` is a mirror of MySQL rather than a
+  guarantee, and any future Go-side comparison of a uid is a latent instance of
+  the same defect. Validating once — and stating the resulting premise in the
+  package — makes the ordering structural. It is a validation change on a live
+  endpoint with existing data behind it, so it needs its own review.
+- **`removeMembersForceOnce`'s lock statement has no `FORCE INDEX`.**
+  `SELECT COUNT(*) … WHERE space_id=? AND uid IN ? AND role=2 AND status=1 FOR
+  UPDATE` (`db_manager.go:552-556`) carries exactly the hazard the sibling path
+  measured and fixed: at 200-uid scale the optimizer prefers
+  `spacemember_spaceid_status` and locks every active row in the Space. A reviewer
+  measured the one-line fix taking a lockstep harness from 15-17/60 surfaced 1213s
+  to 0/60, twice. Pre-existing and retry-covered, and identical at this head and
+  the previous one — left out deliberately so it is reviewed as its own change,
+  not as the twelfth item in this diff.
+- **`lockActiveMemberUIDsTx` is an unwrapped multi-row locker, and this branch
+  created the pairing.** Both disband entrypoints (`disbandSpace`,
+  `forceDisbandSpace`) lock every active member row in the Space through it, with
+  no `retryOnDeadlock`. Before this change the user-side removal held one row at a
+  time and could not be the hold-and-wait side; the 200-row batch can. Ordering
+  cannot fix it — the disband scan is a strict superset of any batch's target set,
+  and superset-vs-subset can cycle whatever the subset side does — so it belongs
+  to the retry class. Consequence is transient (clean rollback on both sides,
+  disband is an operator action). Named in the coverage comment rather than left
+  implicit.
+- **The handover notice can still write a bare UID into permanent group history.**
+  #807 tightened the self-exit tip's fallback to a neutral string for exactly this
+  reason; `sendSpaceRemovalHandoverNotice` still falls back to
+  `leaverUID`/`successorUID`. Same surface, opposite rule. One line, but
+  user-visible on a path #807 did not review.
 
 ## Round 2 — what PR #804 review found
 
@@ -540,3 +573,88 @@ boundary, and only measurement ever caught it. Four times now the closure claim 
 from reasoning and was refuted by someone who ran it. The reasoning is not worthless —
 it produced the right mechanism each time — but on this class it has zero standing
 against a number, including when the number is mine.
+
+## Round 10 — both remaining defects were the same sentence, and I had written it twice
+
+Two reviewers measured this head independently and landed on one root cause:
+**this package compares identifiers in Go while the database compares them in
+`utf8mb4_general_ci`, and nothing makes the two agree.** Both instances are mine,
+both were written in the two commits that closed rounds 9 and 9b, and neither
+exists on `main`.
+
+`removeMembersLockedOnce` matched the batch with `uid IN ? FOR UPDATE` — SQL,
+collation-aware — and then looked the resulting roles up in a Go map keyed by
+the spelling the rows came back under, using the caller's spelling as the key. A
+case-variant uid misses, falls into `!active`, and is skipped: no status flip, no
+cleanup job, no cache invalidation, `c.ResponseOK()`. On the endpoint whose only
+job is revoking access. The old per-uid path did both comparisons in SQL, so I
+did not preserve behaviour — I broke it, in the commit whose message says the
+semantics are equivalent to calling the old path in a loop.
+
+`sort.Strings` was the second instance. I wrote "两边同序、结构上无法成环" as a
+statement of fact about an ordering I had not compared against the index. Byte
+order and `general_ci` order agree for `[0-9a-f]`; they invert as soon as `_` or
+uppercase appears, because folding lowercase into uppercase moves `_` (0x5F)
+from between the cases to after the letters. `app_…_bot` and `iwh_…` are Space
+members. So the guarantee was false for input the system already contains.
+
+What I'd take from this round, beyond the two fixes:
+
+**The guard's fixture encoded the same assumption as the code.** `m%04d` — digits
+and one lowercase letter — is precisely the alphabet where the two orders agree.
+The guard went 30/30 red under the mutation I aimed at it and was structurally
+incapable of seeing the defect it was named for. Round 9's lesson was "a zero is
+not evidence until you remove what could be hiding the non-zero"; this is the
+same lesson one level down: **a red is not coverage until the fixture can express
+the failure.** Both reviewers found it by changing the alphabet and nothing else.
+That is a cheap move and I should reach for it by default — vary the fixture's
+*data* independently of the code, not just mutate the code against fixed data.
+
+**"Equivalent to the old path" is a claim about the comparison, not just the
+result.** I checked that the new batch produced the same set of removals as the
+loop, on the inputs I wrote. I did not check that it *compared* uids the same
+way. Moving a predicate from SQL into Go silently changes the comparator, and
+every one of these paths is keyed on an identifier. Worth stating as a rule: if
+a refactor relocates a comparison across the Go/SQL boundary, the collation is
+part of what has to be shown unchanged.
+
+**I chose the comparator over routing the upsert through the removal's
+`SELECT … FOR UPDATE`,** which was the other option offered and which orders both
+sides by construction rather than by a Go function that has to mirror MySQL. I
+declined it because it gap-locks every non-existent uid in the batch, and
+concurrent upserts hold mutually compatible gap locks and then block on each
+other's insert intention locks — a textbook deadlock of its own, and one that
+does not need an exotic alphabet to fire. Closing a cycle by opening a different
+one is not closure. The comparator's limit (ASCII only, degrades to
+`retryOnDeadlock` beyond it) is smaller than that, and it is written at the
+definition rather than left to be rediscovered.
+
+**Where this actually ends.** Nine rounds of patching the consequence, and round
+10's two findings were both the premise. Constraining uids to a known alphabet at
+the API boundary, once, would have prevented both — and would make the ordering
+guarantee true by construction instead of true-for-ASCII. I have not done it here
+because it is a validation change on a live endpoint with existing data behind
+it, and it deserves its own review rather than being the eleventh thing in this
+diff. It is written into the follow-ups with the reasoning, not just the task
+name, so whoever picks it up does not have to re-derive why it matters.
+
+### The rebase, and one assertion it invalidated
+
+Rebasing onto `main` picked up #807, which made the self-exit notice
+group-visible with `RedDot:0` — a `visibles` allowlist blocks the message content
+but not the channel's committed seq, so non-allowlisted members got an unread
+they could never clear.
+
+`TestGroupCascadeSelfExitSuppressesRemovedNotice` asserted
+`countGroupVisibleTips == 0` on the premise that the exit tip is admin-only. That
+premise is now false, so the assertion had to move — but not to "unbounded",
+which would have stopped guarding the thing it exists for. It pins exactly one
+(#807's tip) plus a negative assertion that an ordinary member's self-exit emits
+no handover notice. Zero would have re-asserted the stuck-unread bug; no bound at
+all would have let this branch add a second broadcast unnoticed.
+
+#807 also tightened the exit tip's fallback so it can never write a bare UID into
+permanent group history. The handover notice this task adds still falls back to
+the bare uid, on the same surface. I did not change it here — it is user-visible,
+on a path #807 did not review — but the two paths now disagree and that is
+recorded as a follow-up rather than left for someone to notice in production.

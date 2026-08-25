@@ -405,10 +405,14 @@ func (d *managerDB) updateSpaceProfile(
 
 // upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）。
 //
-// 逐条 upsert 按**调用方给的 uid 顺序**取锁，而批量移除按索引序取锁，两者顺序不一致：
-// 同一空间上 add[C,B,A] 与 remove[A,B,C] 并发即构成 AB-BA。PR #804 把用户端
-// members/remove 从「一人一事务」改成整批单事务后，移除侧一次要按住至多 200 行、
-// 持锁窗口大幅变宽，这个既有的环因此明显更容易撞上，所以同样套上 retryOnDeadlock。
+// 逐条 upsert 曾按**调用方给的 uid 顺序**取锁，而批量移除按索引序取锁：同一空间上
+// add[C,B,A] 与 remove[A,B,C] 并发即构成 AB-BA。PR #804 把用户端 members/remove 从
+// 「一人一事务」改成整批单事务后，移除侧一次要按住至多 200 行、持锁窗口大幅变宽，
+// 这个既有的环因此明显更容易撞上。
+//
+// 现在 upsertMembersOnce 先按 lessUIDGeneralCI（索引的 collation 序，不是字节序）排序
+// 再取锁，与批量移除同序，这一对结构上不再成环。retryOnDeadlock 仍然保留：它兜的是
+// **别的**对手——群主转让是两段式非单调获取，谁排序都关不掉，见 retryOnDeadlock 注释。
 // 全有全无地单事务提交，重放安全（ON DUPLICATE KEY UPDATE 本身也幂等）。
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	return retryOnDeadlock(func() error {
@@ -541,7 +545,7 @@ func isDeadlockErr(err error) bool {
 // 各自在真实 MySQL 上实测确认）：space_member 上有多条会一次锁多行的写路径——
 // removeMembersLocked（批量移除）、removeMembersForce（超管强制移除）、
 // transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）、
-// upsertMembers（批量加人：按**调用方给的 uid 顺序**逐条 upsert）。
+// upsertMembers（批量加人：按 lessUIDGeneralCI 排序后逐条 upsert，与批量移除同序）。
 // 它们各自的加锁顺序由各自的索引/结构决定，从任何一个调用点都无法统一**对方**的顺序，
 // 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了——FORCE INDEX 只收窄了锁面、关掉了
 // 批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是确定性的）。
@@ -551,12 +555,23 @@ func isDeadlockErr(err error) bool {
 // 四条写路径都在单事务里全有全无地提交，符合。领域错误（ErrCannotRemoveOwner 等）
 // isDeadlockErr 判否、原样透传，不影响调用方的 errors.Is。
 //
-// ⚠️ 覆盖范围说明（勿再写成「所有 space_member 写路径」——PR #804 round-9 review
-// yujiawei P2-3 指出上一版注释与 brief 都少算了 upsertMembers）：本包内**仍未**包裹的
-// 多行加锁写路径是 db.go 的 atomicAddMemberIfNotFull / atomicReactivateMemberIfNotFull /
-// 邀请审批事务——它们用 `SELECT COUNT(*) ... WHERE space_id=? AND status=1 FOR UPDATE`
-// 做容量校验，会锁住**整个空间的活跃成员行**，锁面比这里几条都大。那是既有行为、
-// 不在本 PR 范围内，需要的是统一的容量校验方案而不是再包一层重试，见 follow-up。
+// ⚠️ 覆盖范围说明（勿再写成「所有 space_member 写路径」——round-9 review 指出上一版
+// 注释与 brief 少算了 upsertMembers，round-10 又指出这份修正后的枚举**仍然**少算了一条。
+// 这一段每次都是被数出来的，不是被想出来的；再改请重新数一遍）。本包内**仍未**包裹的
+// 多行加锁写路径有两组：
+//
+//  1. db.go 的 atomicAddMemberIfNotFull / atomicReactivateMemberIfNotFull / 邀请审批事务
+//     ——用 `SELECT COUNT(*) ... WHERE space_id=? AND status=1 FOR UPDATE` 做容量校验，
+//     锁住**整个空间的活跃成员行**，锁面比这里几条都大。
+//  2. db_member_removal.go 的 lockActiveMemberUIDsTx（`SELECT uid ... WHERE space_id=?
+//     AND status=1 FOR UPDATE`），由 disbandSpace 与 forceDisbandSpace 两个入口共用。
+//     本 PR **创造了**这一对：改动前用户端移除一次只按住一行，做不了 hold-and-wait 的
+//     那一侧；改成 200 行的整批事务后就可以了。
+//
+// 第 2 条**排序治不了**：解散锁的是全空间活跃行，是任何一批目标的严格超集，超集 vs 子集
+// 无论子集侧怎么排都可能成环（与两段式的群主转让同类）。所以它属于重试类而非排序类。
+// 两条都是既有行为、代价都只是瞬时（InnoDB 选一个牺牲者、两边干净回滚，且解散是运维
+// 动作），不在本 PR 范围内，见 follow-up。
 func retryOnDeadlock(fn func() error) error {
 	var err error
 	for attempt := 0; attempt < spaceMutatorMaxAttempts; attempt++ {
