@@ -564,9 +564,16 @@ func TestGroupCascadeSelfExitSuppressesRemovedNotice(t *testing.T) {
 		"自助退出不得渲染成「你被 X 移除群聊」")
 	assert.True(t, payloadsContain(stub.sentPayloads(), "退出群聊"),
 		"应改发退群提示")
-	// 自助退出走的是既有的 sendGroupExitTip（只给一位管理员看），不得升级成全群广播。
-	assert.Equal(t, 0, countGroupVisibleTips(stub.sentPayloads()),
-		"自助退出的提示只给一位管理员，不得产生全群可见消息")
+	// 自助退出走 sendGroupExitTip。它自 #807 起本身就是全群可见的（`visibles`
+	// 白名单挡得住内容却挡不住 seq，会让非白名单成员永久卡一格未读，见
+	// group_exit_notice.go），所以这里的期望是**恰好一条**、而不是零条。
+	//
+	// 本改动要钉的是「不得再多一条」：普通成员被移出 Space 不额外广播，
+	// 群内通告只在群主易主时发。
+	assert.Equal(t, 1, countGroupVisibleTips(stub.sentPayloads()),
+		"自助退出只应有 #807 那一条全群可见的退群提示，不得再多")
+	assert.False(t, payloadsContain(stub.sentPayloads(), "已成为新群主"),
+		"普通成员自助退出不涉及群主交接，不得发交接通告")
 }
 
 // TestGroupCascadeDisbandSuppressesPerMemberNotice 解散不会解散群，
