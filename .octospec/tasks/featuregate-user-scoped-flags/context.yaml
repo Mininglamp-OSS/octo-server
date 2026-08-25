@@ -1,0 +1,20 @@
+injected:
+  - id: space-isolation
+    source: repo
+    why: brief tags 含 auth；将新增 modules/**/*.go 路由与鉴权
+  - id: trust-boundary
+    source: repo
+    why: brief tags 含 wire-contract；正文多数条款（转义/markdown/adapter 对等）对本任务不适用，仅"在调用方无法跨越的边界上校验"与"限制载荷"两条原则被采纳（注册表白名单 = 客户端无法跨越的边界）
+  - id: error-handling
+    source: repo
+    why: brief tags 含 error-response/i18n/wire-contract；新增 pkg/errcode/featuregate.go 与 modules handler
+  - id: rate-limit
+    source: repo
+    why: brief tags 含 rate-limit；新增已鉴权端点须挂 SharedUIDRateLimiter
+  - id: testing
+    source: repo
+    why: brief tags 含 testing；新增 *_test.go
+  - id: commit-style
+    source: repo
+    why: paths ["**"] 全匹配；本阶段不 commit，规则在 Finish 阶段生效
+brief: .octospec/tasks/featuregate-user-scoped-flags/brief.md

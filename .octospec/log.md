@@ -1591,3 +1591,21 @@ change-log convention (§7). Newest first.
   author-chosen mutation only proves the test catches what the author already thought
   of. The same guard was green on the real security regression and red on whitespace.
 
+
+## 2026-08-20 (featuregate-user-scoped-flags)
+
+- **Implemented** — Revived the generic feature-gate framework from the
+  never-merged PR #280 (framework only; the incoming-webhook gating commit was
+  left out), extended it with a `user` dimension and a per-rule `bucket_by`, and
+  added `GET /v1/featuregate/flags` for per-user flag delivery. `appconfig` keeps
+  its no-auth contract untouched. Ships with an empty client-flag registry — the
+  mechanism, not any gated feature. See
+  [journal](journal/shared/featuregate-user-scoped-flags.md).
+- **Fixed while reviving** — The original `percent` branch never read the
+  whitelist, so `whitelist -> percent` silently dropped the dogfood cohort and
+  `addScope` during a ramp was a no-op that still returned 200. The whitelist now
+  applies under `whitelist` and `percent`, never under `off`.
+- **Learning** — `learnings/pending/absence-as-semantics-is-undescribable.md`:
+  making "key absent from the response" carry meaning cannot be expressed in
+  OpenAPI 3, so codegen clients get it wrong by default — exactly the failure the
+  design existed to prevent.
