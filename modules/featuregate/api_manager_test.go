@@ -642,3 +642,47 @@ func TestScopeIDIsCaseSensitive(t *testing.T) {
 		require.True(t, allow, "uid=%q 已在白名单中，必须放行", uid)
 	}
 }
+
+// TestMigrationRejectsTrailingNewline 钉住 DB 层 CHECK 用的是 \z 而非 $。
+//
+// MySQL 的正则是 ICU，`$` 匹配「输入末尾**或最后一个换行符之前**」，所以 `...$` 会放行
+// 'u1\n' 这类尾部带换行的值。Go 侧不受影响（Go 的 $ 是 end-of-text），但 CHECK 存在的
+// 全部理由就是挡住「绕过 handler 直接改库」这条路——放行了就等于没有。
+//
+// 后果与本迁移已论证过的两条同型：带 \n 的 scope_id 插得进却删不掉（delScope 按单个
+// 路径段取值并 TrimSpace），带 \n 的 feature_key 推出的杀开关环境变量名含换行，永久
+// 失去 env 级急停。
+//
+// 这条测试走真实 DB，因为它验证的正是「Go 挡不住时 DB 还挡不挡得住」。
+func TestMigrationRejectsTrailingNewline(t *testing.T) {
+	ctx := newIntegrationCtx(t)
+	db := ctx.DB()
+
+	// 前置：合法值必须能插，确认约束没有误伤。
+	_, err := db.InsertBySql(
+		"INSERT INTO `octo_feature_gate` (feature_key, mode, percent, bucket_by) VALUES (?,?,?,?)",
+		"fgtest_nl_ok", "off", 0, "user").Exec()
+	require.NoError(t, err, "合法 feature_key 必须可插入")
+
+	for _, bad := range []string{"fgtest_nl\n", "fgtest_nl\r"} {
+		_, err := db.InsertBySql(
+			"INSERT INTO `octo_feature_gate` (feature_key, mode, percent, bucket_by) VALUES (?,?,?,?)",
+			bad, "off", 0, "user").Exec()
+		require.Error(t, err, "feature_key=%q 必须被 CHECK 拒绝（用 \\z 而非 $）", bad)
+		require.Contains(t, err.Error(), "chk_octo_feature_gate_key")
+	}
+
+	for _, bad := range []string{"u1\n", "u1\r"} {
+		_, err := db.InsertBySql(
+			"INSERT INTO `octo_feature_gate_scope` (feature_key, scope_type, scope_id) VALUES (?,?,?)",
+			"fgtest_nl_ok", "user", bad).Exec()
+		require.Error(t, err, "scope_id=%q 必须被 CHECK 拒绝", bad)
+		require.Contains(t, err.Error(), "chk_octo_fgs_scope_id")
+	}
+
+	// 合法 scope_id（含全部允许字符）不受影响。
+	_, err = db.InsertBySql(
+		"INSERT INTO `octo_feature_gate_scope` (feature_key, scope_type, scope_id) VALUES (?,?,?)",
+		"fgtest_nl_ok", "user", "a.b:c@d-e_1").Exec()
+	require.NoError(t, err, "合法 scope_id 必须可插入")
+}

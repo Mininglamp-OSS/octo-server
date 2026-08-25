@@ -189,7 +189,9 @@ func TestValidFeatureKey(t *testing.T) {
 		"my gate",                               // 空格 → 杀开关环境变量名设不进去
 		"docs.beta",                             // 点
 		"docs/beta",                             // 斜杠
-		"docs\nbeta",                            // 换行
+		"docs\nbeta",                            // 内嵌换行
+		"docs_beta\n",                           // **尾部**换行：Go 的 $ 是 end-of-text 故拒；
+		"docs_beta\r",                           //   MySQL 的 ICU $ 不拒，迁移里用 \\z 对齐
 		strings.Repeat("a", maxFeatureKeyLen+1), // 超 DB 列长
 	} {
 		if validFeatureKey(bad) {

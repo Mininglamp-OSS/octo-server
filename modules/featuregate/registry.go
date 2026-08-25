@@ -128,8 +128,6 @@ func mustNewClientRegistry(flags []ClientFlag) *clientRegistry {
 	return r
 }
 
-// isClientVisible 报告某 feature_key 是否会被下发给客户端。管理端写侧用它决定
-
 // clientKeys 返回全部对外 key，供「答案整体不可知」时一次性列进 unavailable。
 func (r *clientRegistry) clientKeys() []string {
 	keys := make([]string, 0, len(r.flags))
@@ -139,6 +137,7 @@ func (r *clientRegistry) clientKeys() []string {
 	return keys
 }
 
+// isClientVisible 报告某 feature_key 是否会被下发给客户端。管理端写侧用它决定
 // 要不要施加「维度必须是调用点能提供的」这条额外约束。
 func (r *clientRegistry) isClientVisible(featureKey string) bool {
 	for _, f := range r.flags {

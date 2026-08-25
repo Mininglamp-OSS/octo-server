@@ -193,3 +193,36 @@ One of my own edits from round 2 had reversed a negation in the brief's most-rea
 section — a blind `省略` → `unavailable 数组` substitution turned "not omitted from
 flags" into nonsense. Mechanical find-and-replace across prose needs the result read
 back.
+
+## Review round 4 (2026-08-25) — approved, with a hardening pass
+
+All three reviewers approved at `353953de`. Ten P2 items remained; two of them get an
+order of magnitude more expensive after merge, so they were taken now and the rest
+left as follow-ups.
+
+**The CHECK constraints were still not doing what their comments claimed, for a
+second and different reason.** Round 3 fixed the collation; this round fixed the
+anchor. MySQL's regex engine is ICU, where `$` matches at end of input **or before a
+final line terminator** — so `REGEXP_LIKE(scope_id, '^[A-Za-z0-9_.:@-]+$')` accepted
+`'u1\n'`, and the `feature_key` check accepted `'zz_nl\n'`. The consequences are the
+two the migration header already argues against: a `scope_id` ending in a newline is
+insertable but not deletable (`delScope` takes it as a path segment and trims it), and
+a `feature_key` ending in a newline derives a kill-switch env name containing a
+newline — the "永久失去 env 级紧急停止" failure verbatim. `\z` fixes it, verified by
+trying to violate it.
+
+Go is unaffected: Go's `$` is end-of-text (`\z` semantics) with `m=false`, which I
+checked rather than assumed, so `featureKeyPattern` and `scopeIDRe` already rejected
+these. The gap was only in the layer that exists specifically to catch direct DB
+edits — which makes it exactly the layer where an inert constraint matters most.
+
+Two rounds in a row, a defence I had written did not do what its comment said. Both
+times the comment read correctly and the constraint was inert. The habit that catches
+this is not re-reading the constraint; it is **trying to violate it**.
+
+The other item taken now was narrowing an overstated claim: the migration header said
+"所有身份列" are pinned to `utf8mb4_bin`, but `description` and the two `updated_by`
+columns keep the table default. One reviewer proposed pinning them, another had
+verified that leaving them is correct — they are display/audit only, never
+byte-compared, absent from every unique index and join key. Pinning them would have
+been over-correction, so the sentence was narrowed to match the code instead.
