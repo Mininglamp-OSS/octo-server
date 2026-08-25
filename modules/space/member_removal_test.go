@@ -1776,3 +1776,90 @@ func TestRetryOnDeadlockRecoversFrom1213(t *testing.T) {
 		assert.Equal(t, 1, calls)
 	})
 }
+
+// TestRemoveMembersLockedHonoursStoredUIDSpelling 大小写变体的 uid 必须照常被移除。
+//
+// space_member.uid 没有显式 COLLATE，继承库默认 utf8mb4_general_ci —— 大小写不敏感。
+// 批量锁定语句的 `uid IN ?` 因此会匹中变体，并把行按**库里存的拼写**返回。若把角色
+// 判定的查表放到 Go 里、又用请求里的拼写当 key，两者不一致时就查不中：成员被当成
+// 「不在空间」静默跳过，不翻 status、不入清理工单、不失效鉴权缓存，而 removeMembers
+// 照样 c.ResponseOK()。在一个专门用来收回访问权的端点上，「报成功、什么也没做」是
+// 最坏的失败形状。
+//
+// 老的逐个路径两条语句都在 SQL 里比（SELECT ... WHERE uid=? / UPDATE ... WHERE uid=?），
+// 没有这个落差，所以那会是**回归**而不是既有行为（PR #804 round-10 review P0-1）。
+func TestRemoveMembersLockedHonoursStoredUIDSpelling(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-collation"
+	// 只差大小写的两种拼写：stored 是库里的，requested 是调用方给的。
+	const stored, requested = "AbCdEf01", "abcdef01"
+
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: stored, Role: 0, Status: 1,
+	}))
+
+	// 前置条件：确认这个库的 uid 列真的是大小写不敏感的。否则本测试会因为
+	// 「SQL 也没匹中」而假绿，测的就不是它自称在测的东西了。
+	precheck, err := f.db.queryMember(spaceID, requested)
+	require.NoError(t, err)
+	require.NotNil(t, precheck,
+		"本测试要求 uid 列是大小写不敏感的 collation（CI 用 utf8mb4_general_ci）；"+
+			"查不到说明测试库建错了，不是被测代码的问题")
+
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{requested}, 1, "owner", MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	require.Equal(t, []string{stored}, removed,
+		"必须真的移除，且返回库里的拼写——清理工单和鉴权缓存 key 都要用它")
+
+	// 直查而不走 queryMember：后者带 status=1 过滤，移除成功时本来就查不到。
+	assert.EqualValues(t, 0, memberStatus(t, spaceID, stored), "成员行必须真的翻成 status=0")
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1, "必须入队清理工单，否则人还留在这个 Space 的每个群里")
+	assert.Equal(t, stored, jobs[0].UID, "工单里的 uid 必须是库里的拼写")
+}
+
+// TestRemoveMembersLockedDedupesCaseVariants 同一批里塞两个互为大小写变体的 uid，
+// 只该产生一次移除、一条工单。
+//
+// 去重来源是唯一索引 (space_id, uid) —— 锁定查询对同一个成员至多返回一行。此前那个
+// 基于字节相等的 seen 集合做不到这一点：它把两种拼写看成两个人，于是写出两条指向
+// 同一个人的清理工单，worker 会把整条级联跑两遍（重复的退群 Tip、重复的 IM 退订）。
+func TestRemoveMembersLockedDedupesCaseVariants(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-collation-dup"
+	const stored = "AbCdEf02"
+
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: stored, Role: 0, Status: 1,
+	}))
+
+	// 刻意**不**传库里那个拼写：两个都是变体，去重与匹中必须同时成立才会绿。
+	// 若把 stored 也塞进来，即便变体一个都没匹中，本用例也会假绿。
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{"abcdef02", "ABCDEF02"}, 1, "owner", MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	assert.Equal(t, []string{stored}, removed, "同一个人只该被移除一次，且返回库里的拼写")
+	require.Len(t, cleanupJobs(t, spaceID), 1, "同一个人只该有一条清理工单")
+}
+
+// memberStatus 直查成员行的 status。db.queryMember 带 `status=1` 过滤，验证
+// 「有没有被移除」时用不了它 —— 移除成功和行不存在都返回 nil，两者分不开。
+func memberStatus(t *testing.T, spaceID, uid string) int {
+	t.Helper()
+	var rows []struct {
+		Status int `db:"status"`
+	}
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT status FROM space_member WHERE space_id=? AND uid=?", spaceID, uid).Load(&rows)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "space_member 里应当恰好有一行 %s/%s", spaceID, uid)
+	return rows[0].Status
+}

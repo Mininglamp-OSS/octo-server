@@ -732,6 +732,9 @@ type spaceMemberRoleRow struct {
 // removeMembersLocked 是 removeMemberLocked 的整批版本：**一个事务**里逐个锁定、
 // 重读角色、翻转成员行，最后一次性入队全部清理工单，单次提交。
 // 返回真正被改动的 uid 列表，语义与逐个调用 removeMemberLocked 收集 ok=true 一致。
+// 「一致」包括标识符比较口径：返回的是**库里存的 uid 拼写**，而不是请求里的拼写
+// （uid 列是 utf8mb4_general_ci，两者可能只差大小写，见 removeMembersLockedOnce
+// 循环处的注释）。唯一的可观察差异是顺序 —— 按 uid 升序而非调用方顺序。
 //
 // 为什么必须是一个事务，而不是循环调用 removeMemberLocked（PR #804 round-4/5 review）：
 //
@@ -810,34 +813,45 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	if _, err = tx.SelectBySql(selectMembersForRemovalForUpdateSQL, spaceId, uids).Load(&locked); err != nil {
 		return nil, err
 	}
-	roleByUID := make(map[string]int, len(locked))
-	for _, r := range locked {
-		roleByUID[r.UID] = r.Role
-	}
-
+	// 循环**从 locked 出发**，而不是从请求切片出发。这是刻意的，别"优化"回去。
+	//
+	// space_member.uid 没有显式 COLLATE，继承库默认 utf8mb4_general_ci —— 大小写
+	// 不敏感。上面那条 `uid IN ?` 因此会匹中大小写变体，并把行按**库里存的拼写**
+	// 返回。反过来用请求里的拼写去查一个以存储拼写为 key 的 map，两者不一致时就
+	// 查不中：成员被当成「不在空间」静默跳过，不翻 status、不入清理工单、不失效
+	// 鉴权缓存，而 removeMembers 照样 c.ResponseOK()。老的逐个路径两条语句
+	// （SELECT ... WHERE uid=? / UPDATE ... WHERE uid=?）都在 SQL 里比，没有这个
+	// 落差，所以那会是一个「报成功、什么也没做」的回归 —— 在一个专门用来收回访问
+	// 权的端点上，这是最坏的失败形状（PR #804 round-10 review P0-1，两名 reviewer
+	// 各自实测）。
+	//
+	// 从匹中的行出发就根本不存在 Go 与 SQL 两套比较口径：uid 全程是库里的拼写，
+	// 也正是 group 侧清理工单、鉴权缓存 key 要用的那一个。
+	//
+	// 顺带解决两件事：
+	//   - 请求里的重复 uid（含互为大小写变体的）天然只处理一次 —— 唯一索引
+	//     (space_id, uid) 保证每个成员至多一行，不必再维护 seen 集合；
+	//   - status<>1 的行 SQL 已经滤掉，「不在空间」这一条不需要在 Go 里再判一次。
+	//
+	// 返回顺序随之从调用方顺序变成索引顺序（uid 升序）。两个消费者
+	// （enqueueMemberRemovalCleanupBatchTx、afterMembersRemoved）都是逐个处理，
+	// 不依赖顺序。
 	now := time.Now()
-	removed := make([]string, 0, len(uids))
-	seen := make(map[string]struct{}, len(uids))
-	for _, uid := range uids {
-		// 重复 uid 只处理一次，与老实现「第二次读不到已翻转的行」等价。
-		if _, dup := seen[uid]; dup {
-			continue
-		}
-		seen[uid] = struct{}{}
-		role, active := roleByUID[uid]
-		// 三种「不该动」的情形静默跳过，与既有 removeMembers 的观察行为一致
+	removed := make([]string, 0, len(locked))
+	for _, row := range locked {
+		// 两种「不该动」的情形静默跳过，与既有 removeMembers 的观察行为一致
 		// （那边是 ErrCannotRemoveOwner / ErrRemoveHierarchy 被调用方 continue 掉、
-		// ok=false 不计入 removed）：不在空间、owner、同级及更高。
-		if !active || role == 2 || role >= rejectRoleAtOrAbove {
+		// ok=false 不计入 removed）：owner、同级及更高。
+		if row.Role == 2 || row.Role >= rejectRoleAtOrAbove {
 			continue
 		}
 		// 更新的是上面 FOR UPDATE 已经锁住的行，不额外获取新锁，不影响获取顺序。
 		if _, err = tx.Update("space_member").
 			Set("status", 0).Set("updated_at", now).
-			Where("space_id=? AND uid=?", spaceId, uid).Exec(); err != nil {
+			Where("space_id=? AND uid=?", spaceId, row.UID).Exec(); err != nil {
 			return nil, err
 		}
-		removed = append(removed, uid)
+		removed = append(removed, row.UID)
 	}
 
 	// 只给真正被改动的成员行入队，且与那些翻转同事务提交（transactional outbox）。
