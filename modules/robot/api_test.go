@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/stretchr/testify/assert"
@@ -430,6 +431,15 @@ func TestOwnedBots(t *testing.T) {
 }
 
 func TestOwnedBots_CheckMembershipDBError(t *testing.T) {
+	// Robot.New captures the process-wide SystemSettings singleton. Establish it
+	// with a healthy test context first, so closing the database used to
+	// simulate this request failure cannot poison later shuffled tests.
+	_, healthyCtx := testutil.NewTestServer()
+	require.NoError(t, commonmodule.EnsureSystemSettings(healthyCtx).Reload())
+
+	// This context is deliberately separate from healthyCtx. Only its database
+	// is closed below; the shared SystemSettings instance keeps using the live
+	// healthy connection.
 	s, ctx := newTestServer()
 	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	rb := New(ctx)
