@@ -170,25 +170,25 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 	cfg := s.ctx.GetConfig()
 	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != ""
 	if smtpRowsMissing && defaultsComplete {
-		seeds = append(seeds,
-			managerEmailMFASeed{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
-			managerEmailMFASeed{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
-		)
+		smtpSeeds := []managerEmailMFASeed{
+			{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
+			{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
+		}
 		if cfg.Support.EmailPwd != "" {
 			ciphertext, err := encryptKey(cfg.Support.EmailPwd)
 			if err != nil {
-				// The endpoint and sender remain durable even if the deployment
-				// forgot the master key needed to persist an optional password.
-				if seedErr := s.persistManagerEmailMFASeeds(seeds); seedErr != nil {
-					return seedErr
-				}
 				return fmt.Errorf("encrypt default SMTP password: %w", err)
 			}
-			seeds = append(seeds, managerEmailMFASeed{
+			smtpSeeds = append(smtpSeeds, managerEmailMFASeed{
 				category: "support", key: "email_pwd", value: ciphertext,
 				valueType: settingTypeEncrypted, description: "SMTP 密码（可选，加密存储）",
 			})
 		}
+		// Persist the complete SMTP bootstrap set only after every value,
+		// including the optional encrypted password, has been prepared
+		// successfully. An encryption failure must not leave a partial set that
+		// prevents a later startup from retrying the bootstrap.
+		seeds = append(seeds, smtpSeeds...)
 	}
 	return s.persistManagerEmailMFASeeds(seeds)
 }

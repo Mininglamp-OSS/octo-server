@@ -91,8 +91,9 @@ type SMTPSettingsProvider interface {
 
 // EmailService 邮件服务
 type EmailService struct {
-	ctx      *config.Context
-	settings SMTPSettingsProvider
+	ctx       *config.Context
+	settings  SMTPSettingsProvider
+	tlsConfig func(host string) *tls.Config
 	log.Log
 }
 
@@ -110,10 +111,15 @@ var rawRedisClients sync.Map // map[*config.Context]*rd.Client
 // 静默漏掉 admin 配置入口。
 func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailService {
 	return &EmailService{
-		ctx:      ctx,
-		settings: settings,
-		Log:      log.NewTLog("EmailService"),
+		ctx:       ctx,
+		settings:  settings,
+		tlsConfig: defaultSMTPTLSConfig,
+		Log:       log.NewTLog("EmailService"),
 	}
+}
+
+func defaultSMTPTLSConfig(host string) *tls.Config {
+	return &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 }
 
 // ErrEmailSendRateLimited is returned by SendVerifyCode when the per-address
@@ -608,9 +614,10 @@ func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody s
 	return []byte(b.String()), nil
 }
 
-// dispatchSMTP 跑完一次 SMTP 投递:dial → (STARTTLS) → [AUTH] → MAIL → RCPT →
-// DATA → QUIT。密码为空时跳过 AUTH，以支持受网络隔离保护的无密码 SMTP
-// relay。fromSan / toSan 必须已经过 sanitizeHeader。
+// dispatchSMTP 跑完一次 SMTP 投递:dial → (隐式 TLS/强制 STARTTLS) → [AUTH] →
+// MAIL → RCPT → DATA → QUIT。密码为空时跳过 AUTH，以支持受网络隔离保护的
+// 无密码 SMTP relay；无论密码是否为空，邮件内容都必须通过 TLS 传输。
+// fromSan / toSan 必须已经过 sanitizeHeader。
 func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd, toSan string, msg []byte) error {
 	host, port, err := net.SplitHostPort(smtpAddr)
 	if err != nil {
@@ -622,9 +629,10 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 	}
 
 	dialer := &net.Dialer{Timeout: smtpDialTimeout}
+	tlsConfig := s.tlsConfig(host)
 	var conn net.Conn
 	if port == "465" {
-		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: host}}
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
 		conn, err = tlsDialer.DialContext(ctx, "tcp", smtpAddr)
 		if err != nil {
 			return fmt.Errorf("TLS连接失败: %w", err)
@@ -649,11 +657,15 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 	defer client.Close()
 
 	if port != "465" {
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err = client.StartTLS(&tls.Config{ServerName: host}); err != nil {
-				return fmt.Errorf("STARTTLS 失败: %w", err)
-			}
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return errors.New("SMTP server does not support STARTTLS")
 		}
+		if err = client.StartTLS(tlsConfig); err != nil {
+			return fmt.Errorf("STARTTLS 失败: %w", err)
+		}
+	}
+	if _, ok := client.TLSConnectionState(); !ok {
+		return errors.New("SMTP TLS is required")
 	}
 
 	return runSMTPTransaction(client, auth, fromSan, toSan, msg)

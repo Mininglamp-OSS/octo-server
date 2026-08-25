@@ -77,6 +77,27 @@ func TestEnsureManagerEmailMFASettingsSeedsPasswordlessSMTPDefaults(t *testing.T
 		"passwordless SMTP bootstrap must not create a fake password row")
 }
 
+func TestEnsureManagerEmailMFASettingsDoesNotPersistPartialSMTPWhenPasswordEncryptionFails(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "mfa-default@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	})
+	t.Setenv(masterKeyEnv, "invalid-master-key")
+
+	err := settings.EnsureManagerEmailMFASettings()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "encrypt default SMTP password")
+
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	for _, row := range rows {
+		if row.Category == "support" {
+			t.Fatalf("SMTP bootstrap must remain atomic after password encryption failure: found %s.%s", row.Category, row.KeyName)
+		}
+	}
+}
+
 func TestEnsureManagerEmailMFASettingsDoesNotOverwriteExplicitSMTPRows(t *testing.T) {
 	settings := newTestSystemSettings(t, func(s *SystemSettings) {
 		s.ctx.GetConfig().Support.Email = "yaml@example.com"

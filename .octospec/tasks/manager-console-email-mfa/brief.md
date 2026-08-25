@@ -83,15 +83,18 @@ not cover those alternate credential paths.
   encrypted application data and key-encrypted system settings. If it is
   missing or changed, encrypted settings cannot be written or decrypted and
   management MFA remains fail-closed until operations restore the existing
-  key.
+  key. A missing, invalid, or replaced key is an unsupported deployment state
+  and is outside the management-console MFA flow.
 - On startup, if the MFA row does not exist, startup writes an explicit `0`
   row. If all manager-MFA SMTP rows are absent and the static configuration
   contains a sender address and SMTP endpoint, startup writes those defaults
   to `system_setting`; the password is optional and is encrypted only when
-  present. Existing rows, including explicit empty values, are authoritative
-  and are not silently replaced by YAML values. Seed writes use a database
-  level insert-if-absent operation, so an administrator write racing startup
-  initialization cannot be overwritten.
+  present. Password encryption completes before any SMTP seed is persisted, so
+  an encryption failure leaves no partial SMTP bootstrap set. Existing rows,
+  including explicit empty values, are authoritative and are not silently
+  replaced by YAML values. Seed writes use a database-level insert-if-absent
+  operation, so an administrator write racing startup initialization cannot be
+  overwritten.
 - The shared SMTP keys `support.email`, `support.email_smtp`, and
   `support.email_pwd` are intentionally database-owned after this startup
   initialization. On a fresh database, YAML values are copied once when the
@@ -120,7 +123,10 @@ not cover those alternate credential paths.
   checks on the merged final MFA/SMTP configuration before the transaction
   commits. The password is optional: an empty password selects an
   unauthenticated SMTP relay, while a non-empty password enables SMTP
-  authentication. A failed real preflight leaves the database unchanged.
+  authentication. Password presence does not control transport security:
+  port 465 uses implicit TLS and every other SMTP port must successfully
+  negotiate STARTTLS. A server without TLS is rejected by both preflight and
+  real sending. A failed real preflight leaves the database unchanged.
 - An SMTP update performs the same checks on the merged final configuration
   before committing, whether MFA is currently on or off. A non-clearing update
   must provide a valid SMTP endpoint and sender address and pass the real
@@ -128,7 +134,9 @@ not cover those alternate credential paths.
   is an intentional SMTP clear, which is allowed while MFA is disabled and is
   rejected while MFA is enabled. If the merged SMTP values are identical to
   the current database snapshot, saving the settings does not send another
-  preflight email.
+  preflight email. Likewise, when manager MFA is already enabled and the
+  submitted MFA value remains enabled, saving unrelated settings does not send
+  a preflight email or revalidate the operator account.
 - If SMTP later becomes unavailable because of a provider outage, network
   failure, account suspension, or another delivery-infrastructure failure, the
   actual OTP send fails and no token is issued. Recovery of that external

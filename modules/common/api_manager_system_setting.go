@@ -326,8 +326,8 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Manager MFA uses the merged final configuration. This check is purposely
 	// before the database transaction: a failed SMTP preflight cannot leave a
 	// partially committed MFA switch or SMTP value behind.
-	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
-	managerMFATouched := false
+	currentManagerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
+	managerMFAOn := currentManagerMFAOn
 	// smtpTouched means the merged SMTP value differs from the current
 	// database snapshot. Merely including an unchanged SMTP field in a form
 	// submission must not send a real probe email.
@@ -336,7 +336,6 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	prospectiveSMTP := managerSMTP
 	for _, p := range plans {
 		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
-			managerMFATouched = true
 			managerMFAOn = p.value == "1"
 		}
 		if p.def.Category == "support" && !p.skip {
@@ -358,6 +357,11 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		prospectiveSMTP.password != managerSMTP.password
 	smtpClearRequested = (prospectiveSMTP.from != managerSMTP.from && strings.TrimSpace(prospectiveSMTP.from) == "") ||
 		(prospectiveSMTP.address != managerSMTP.address && strings.TrimSpace(prospectiveSMTP.address) == "")
+	// The admin console submits the complete settings form on every save. Treat
+	// the MFA switch as touched only when its merged final value actually
+	// changes, so saving an unrelated setting while MFA is already enabled does
+	// not send another real SMTP probe or re-query the operator account.
+	managerMFATouched := managerMFAOn != currentManagerMFAOn
 	if smtpTouched || (managerMFATouched && managerMFAOn) {
 		// Clearing SMTP is allowed only while manager MFA is off. Any
 		// non-clearing SMTP update, and every MFA enable, must validate and probe

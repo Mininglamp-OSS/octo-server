@@ -2,6 +2,7 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -167,4 +168,74 @@ func TestManagerSystemSetting_UnchangedSMTPDoesNotRunPreflight(t *testing.T) {
 	s.GetRoute().ServeHTTP(recorder, req)
 
 	assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+}
+
+func TestManagerSystemSetting_FullPayloadWithEnabledMFADoesNotRunPreflight(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	settings := EnsureSystemSettings(ctx)
+	originalConfig := *settings.ctx.GetConfig()
+	t.Cleanup(func() {
+		_ = testutil.CleanAllTables(ctx)
+		*settings.ctx.GetConfig() = originalConfig
+		_ = settings.Reload()
+	})
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	smtpAddr := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	password, err := encryptKey("smtp-password")
+	require.NoError(t, err)
+	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+	require.NoError(t, settings.db.upsert("support", "email", "mfa-sender@example.com", settingTypeString, ""))
+	require.NoError(t, settings.db.upsert("support", "email_smtp", smtpAddr, settingTypeString, ""))
+	require.NoError(t, settings.db.upsert("support", "email_pwd", password, settingTypeEncrypted, ""))
+	require.NoError(t, settings.Load())
+
+	managerSMTP := settings.managerEmailMFASMTPSettings()
+	items := make([]systemSettingItemReq, 0, len(systemSettingSchema))
+	for _, def := range systemSettingSchema {
+		value := ""
+		switch {
+		case def.Category == "login" && def.Key == "manager_email_mfa_on":
+			value = "1"
+		case def.Category == "support" && def.Key == "email":
+			value = managerSMTP.from
+		case def.Category == "support" && def.Key == "email_smtp":
+			value = managerSMTP.address
+		case def.Category == "support" && def.Key == "email_pwd":
+			value = secretMask
+		case def.Effective != nil:
+			value = def.Effective(settings)
+		}
+		if def.Category == "register" && def.Key == "off" {
+			if value == "1" {
+				value = "0"
+			} else {
+				value = "1"
+			}
+		}
+		items = append(items, systemSettingItemReq{
+			Category: def.Category,
+			Key:      def.Key,
+			Value:    value,
+		})
+	}
+	body, err := json.Marshal(systemSettingUpdateReq{Items: items})
+	require.NoError(t, err)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.Equal(t, ManagerEmailMFAOn, settings.ManagerEmailMFAState())
 }
