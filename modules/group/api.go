@@ -3435,22 +3435,9 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
 		return
 	}
-	// 查询群的管理员和群主
-	adminAndCreatorUIDS, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
-	if err != nil {
-		g.Error("查询群管理员失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	visiblesUids := make([]string, 0)
-	if len(adminAndCreatorUIDS) > 0 {
-		for _, uid := range adminAndCreatorUIDS {
-			if uid != loginUID {
-				visiblesUids = append(visiblesUids, uid)
-				break
-			}
-		}
-	}
+	// 退群提示已改为全员可见（见 sendGroupExitNotice），不再需要查管理员挑
+	// `visibles` 白名单 —— 连带去掉了那次 QueryGroupManagerOrCreatorUIDS：
+	// 它此前失败会直接 500 中断整个退群，而它唯一的用途就是挑一个可见性目标。
 
 	/**
 	如果退出的人是群主，则选择第二个入群的人作为群主。
@@ -3601,14 +3588,15 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
 		return
 	}
-	var showName = loginMember.Remark
-	if showName == "" {
-		showName = c.GetLoginName()
-	}
-	if groupInfo.Status != GroupStatusDisband && len(visiblesUids) > 0 {
-		// 发送群成员退出群聊消息
-		err = g.ctx.SendGroupExit(groupNo, loginUID, showName, visiblesUids)
-		if err != nil {
+	// 展示名口径与 sendGroupExitTip 共用 resolveExitShowName：群内备注优先 →
+	// 登录名 → 中性兜底，绝不落到裸 UID（提示现在全员可见且是持久历史）。
+	showName := resolveExitShowName(loginMember.Remark, c.GetLoginName)
+	// 发送群成员退出群聊消息（全员可见 + RedDot:0，见 sendGroupExitNotice）。
+	// 门槛只剩「群没解散」：此前还要求 len(visiblesUids) > 0，等于「群里还有另一位
+	// 管理员/群主」，否则整条提示被静默吞掉。可见性白名单去掉后该门槛失去意义，
+	// 群里已无其他管理员时同样要发。
+	if groupInfo.Status != GroupStatusDisband {
+		if err := sendGroupExitNotice(g.ctx, groupNo, loginUID, showName); err != nil {
 			g.Error("发送成员退出群聊错误", zap.Error(err))
 		}
 	}
