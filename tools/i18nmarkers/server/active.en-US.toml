@@ -1155,6 +1155,9 @@ other = "The management-console verification code cannot be sent yet. Please try
 ["err.server.user.manager_mfa_settings_unavailable"]
 other = "Management-console MFA settings are not ready."
 
+["err.server.user.manager_mfa_verify_locked"]
+other = "Too many incorrect verification attempts. Verification is temporarily locked. Please try again later."
+
 ["err.server.user.manager_permission_required"]
 other = "This account does not have management permission."
 
