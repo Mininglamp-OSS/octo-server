@@ -48,7 +48,7 @@ paths:
           schema:
             $ref: "#/definitions/response"
         429:
-          description: "管理端登录 IP 或 MFA 验证码限流"
+          description: "管理端登录 IP 限流；线上状态为 429"
           schema:
             $ref: "#/definitions/response"
         503:
@@ -150,11 +150,11 @@ paths:
           schema:
             $ref: "#/definitions/response"
         429:
-          description: "验证码错误次数达到锁定阈值或管理端入口限流；线上状态为 429"
+          description: "验证码错误次数达到锁定阈值（err.server.user.manager_mfa_verification_locked，含 details.retry_after）或管理端入口限流；线上状态为 429"
           schema:
             $ref: "#/definitions/response"
         503:
-          description: "管理端 MFA 配置、SMTP、Redis 或系统设置暂不可用"
+          description: "管理端 MFA 设置、Redis 或账号数据暂不可用；该接口不执行 SMTP 发送；线上状态为 503"
           schema:
             $ref: "#/definitions/response"
   /manager/user/add:
@@ -2962,8 +2962,32 @@ definitions:
   response:
     type: "object"
     properties:
+      error:
+        $ref: "#/definitions/errorEnvelope"
       status:
         type: integer
         format: int
       msg:
         type: "string"
+  errorEnvelope:
+    type: "object"
+    required:
+      - code
+      - message
+      - details
+      - http_status
+    properties:
+      code:
+        type: "string"
+        description: "稳定的错误码，例如 err.server.user.manager_mfa_verification_locked"
+      message:
+        type: "string"
+        description: "按请求语言渲染的错误消息"
+      details:
+        type: "object"
+        description: "安全允许返回的附加信息；限流时可包含 retry_after（秒）"
+        additionalProperties: true
+      http_status:
+        type: integer
+        format: int
+        description: "错误的语义 HTTP 状态；兼容期间可能与实际传输状态不同"

@@ -474,20 +474,16 @@ func runAPI(ctx *config.Context) {
 		panic(err)
 	}
 	// The system-setting singleton may have been constructed before module
-	// migrations completed. Reload it now, then probe the effective SMTP only
-	// when management-console MFA is enabled. A failed probe is an operational
-	// warning, not a reason to panic the API process: the singleton records the
-	// failed readiness and the manager login gate remains fail-closed until a
-	// later successful probe or policy change.
+	// migrations completed. After setup, make manager MFA and SMTP rows
+	// database-owned, then load the resulting snapshot. Startup deliberately
+	// performs no SMTP I/O; real availability is checked before configuration
+	// writes and when the manager MFA code is actually sent.
 	managerMFASettings := commonmodule.EnsureSystemSettings(ctx)
+	if err := managerMFASettings.EnsureManagerEmailMFASettings(); err != nil {
+		log.Warn("initialize manager MFA system settings failed; database settings remain authoritative", zap.Error(err))
+	}
 	if err := managerMFASettings.Load(); err != nil {
-		log.Warn("reload SystemSettings after module setup failed; manager MFA remains fail-closed until reload succeeds", zap.Error(err))
-	} else if managerMFASettings.ManagerEmailMFAState() == commonmodule.ManagerEmailMFAOn {
-		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		if err := managerMFASettings.PreflightManagerEmailMFA(preflightCtx); err != nil {
-			log.Warn("manager-console MFA SMTP startup preflight failed; management login remains fail-closed", zap.Error(err))
-		}
-		preflightCancel()
+		log.Warn("reload SystemSettings after module setup failed; manager MFA follows the last loaded database snapshot", zap.Error(err))
 	}
 	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
 	if err != nil {

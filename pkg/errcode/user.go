@@ -612,6 +612,12 @@ var (
 		DefaultMessage: "The management-console verification code cannot be sent yet. Please try again later.",
 		SafeDetailKeys: []string{"retry_after"},
 	})
+	ErrUserManagerMFAVerificationLocked = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_verification_locked",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Too many invalid management-console verification attempts. Verification is temporarily locked.",
+		SafeDetailKeys: []string{"retry_after"},
+	})
 	ErrUserManagerMFAEmailRequired = register(codes.Code{
 		ID:             "err.server.user.manager_email_mfa_enable_email_required",
 		HTTPStatus:     http.StatusBadRequest,

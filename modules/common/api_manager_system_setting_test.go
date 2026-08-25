@@ -378,7 +378,6 @@ func TestManagerSystemSetting_UpdatePersistsAndReloads(t *testing.T) {
 	payload := map[string]interface{}{
 		"items": []map[string]string{
 			{"category": "register", "key": "email_on", "value": "1"},
-			{"category": "support", "key": "email_smtp", "value": "smtp.test:587"},
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -391,7 +390,6 @@ func TestManagerSystemSetting_UpdatePersistsAndReloads(t *testing.T) {
 	// The handler must call Reload — the test caller sees the new snapshot
 	// without explicitly invoking Reload itself.
 	assert.True(t, settings.RegisterEmailOn(), "Reload should run inside the update handler")
-	assert.Equal(t, "smtp.test:587", settings.SupportEmailSmtp())
 }
 
 // --- int range validation (issue #289) -------------------------------------

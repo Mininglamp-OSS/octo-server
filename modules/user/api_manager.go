@@ -389,10 +389,6 @@ func (m *Manager) login(c *wkhttp.Context) {
 		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
 		return
 	case common2.ManagerEmailMFAOn:
-		if !settings.ManagerEmailMFAReady() {
-			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
-			return
-		}
 		email := strings.ToLower(strings.TrimSpace(userInfo.Email))
 		if err := commonbase.ValidateEmailAddress(email); err != nil {
 			respondUserError(c, errcode.ErrUserManagerMFAEmailRequired)
@@ -553,10 +549,6 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 		managerMFAResponseError(c, errcode.ErrUserManagerMFAChallengeInvalid, nil)
 		return
 	case common2.ManagerEmailMFAOn:
-		if !settings.ManagerEmailMFAReady() {
-			managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
-			return
-		}
 	}
 	challenge, _, ok := m.loadAndVerifyManagerMFAChallenge(c, req.ChallengeID)
 	if !ok {
@@ -585,7 +577,7 @@ func (m *Manager) sendManagerMFACodeInternal(c *wkhttp.Context) {
 
 	lang := octoi18n.OutboundLanguage(c.Request.Context())
 	sendCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	emailService := commonbase.NewEmailService(m.ctx, settings)
+	emailService := commonbase.NewEmailService(m.ctx, settings.ManagerEmailMFASMTPSettings())
 	emailErr := emailService.SendVerifyCodeTrackedWithAttempt(
 		sendCtx, challenge.Email, commonbase.CodeTypeManagerLogin, lang, attemptID,
 		managerMFASendStateKey(challenge.ID),
@@ -642,7 +634,7 @@ func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
 		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFASettingsUnavailable)
 		return
 	}
-	if settings.ManagerEmailMFAState() != common2.ManagerEmailMFAOn || !settings.ManagerEmailMFAReady() {
+	if settings.ManagerEmailMFAState() != common2.ManagerEmailMFAOn {
 		managerMFAServiceUnavailable(c, errcode.ErrUserManagerMFAMisconfigured)
 		return
 	}
@@ -650,14 +642,29 @@ func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
-	codeService := commonbase.NewEmailService(m.ctx, settings)
+	codeService := commonbase.NewEmailService(m.ctx, settings.ManagerEmailMFASMTPSettings())
 	err := codeService.VerifyManagerCodeAtomically(
 		c.Request.Context(), challenge.Email, strings.TrimSpace(req.Code), challenge.ID,
 		managerMFAActiveKey(challenge.UID), managerMFASendStateKey(challenge.ID),
 		managerMFAChallengeKey(challenge.ID),
 	)
+	var verificationLocked *commonbase.ManagerCodeVerificationLockedError
+	if errors.As(err, &verificationLocked) {
+		retryAfter := verificationLocked.RetryAfter
+		if retryAfter < 1 {
+			retryAfter = int((10 * time.Minute) / time.Second)
+		}
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerificationLocked, octoi18n.Details{
+			"retry_after": retryAfter,
+		})
+		return
+	}
 	if errors.Is(err, commonbase.ErrManagerCodeLocked) {
-		managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, nil)
+		// Keep a defensive fallback for callers that may still return the legacy
+		// sentinel without the typed retry-after wrapper.
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerificationLocked, octoi18n.Details{
+			"retry_after": int((10 * time.Minute) / time.Second),
+		})
 		return
 	}
 	if errors.Is(err, commonbase.ErrManagerCodeInvalid) {

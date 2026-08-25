@@ -160,9 +160,11 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 //  4. Encrypted columns: empty value is silently skipped (preserves the
 //     existing ciphertext); non-empty values are AES-256-GCM encrypted
 //     via encryptKey before storage.
-//  5. After all rows are upserted, SystemSettings.Reload is called so
-//     this instance serves the new values immediately. Other instances
-//     pick it up within reloadTTL.
+//  5. Manager MFA/SMTP writes validate the merged final configuration and
+//     perform a real SMTP preflight before the transaction commits. After all
+//     rows are upserted, SystemSettings.Load is called so this instance serves
+//     the new values immediately. Other instances observe the database through
+//     their existing reload mechanism.
 func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		c.ResponseError(err)
@@ -306,11 +308,8 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	managerMFAOn := m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn
 	managerMFATouched := false
 	smtpTouched := false
-	prospectiveSMTP := smtpSettingsSnapshot{
-		from:     m.systemSettings.SupportEmail(),
-		address:  m.systemSettings.SupportEmailSmtp(),
-		password: m.systemSettings.SupportEmailPwd(),
-	}
+	smtpClearRequested := false
+	prospectiveSMTP := m.systemSettings.managerEmailMFASMTPSettings()
 	for _, p := range plans {
 		if p.def.Category == "login" && p.def.Key == "manager_email_mfa_on" {
 			managerMFATouched = true
@@ -321,33 +320,50 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			case "email":
 				prospectiveSMTP.from = p.effectiveValue
 				smtpTouched = true
+				if strings.TrimSpace(p.effectiveValue) == "" {
+					smtpClearRequested = true
+				}
 			case "email_smtp":
 				prospectiveSMTP.address = p.effectiveValue
 				smtpTouched = true
+				if strings.TrimSpace(p.effectiveValue) == "" {
+					smtpClearRequested = true
+				}
 			case "email_pwd":
 				prospectiveSMTP.password = p.effectiveValue
 				smtpTouched = true
 			}
 		}
 	}
-	managerMFAProbeSucceeded := false
-	if managerMFAOn && (managerMFATouched || smtpTouched) {
-		if err := commonbase.ValidateSMTPConfiguration(
-			prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
-		); err != nil {
-			m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
-			return
+	if smtpTouched || (managerMFATouched && managerMFAOn) {
+		// Clearing SMTP is allowed only while manager MFA is off. Any
+		// non-clearing SMTP update, and every MFA enable, must validate and probe
+		// the merged final configuration before the transaction is committed.
+		if strings.TrimSpace(prospectiveSMTP.address) == "" ||
+			strings.TrimSpace(prospectiveSMTP.from) == "" ||
+			strings.TrimSpace(prospectiveSMTP.password) == "" {
+			if managerMFAOn || !smtpClearRequested {
+				m.Warn("管理端 MFA SMTP 配置校验失败：配置不完整")
+				httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+				return
+			}
+		} else {
+			if err := commonbase.ValidateSMTPConfiguration(
+				prospectiveSMTP.address, prospectiveSMTP.from, prospectiveSMTP.password,
+			); err != nil {
+				m.Warn("管理端 MFA SMTP 配置校验失败", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrManagerMFASmtpInvalid, nil, nil)
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+			probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
+			cancel()
+			if probeErr != nil {
+				m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
+				return
+			}
 		}
-		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
-		probeErr := commonbase.NewEmailService(m.ctx, prospectiveSMTP).PreflightSMTP(probeCtx)
-		cancel()
-		if probeErr != nil {
-			m.Warn("管理端 MFA SMTP 预检失败", zap.Error(probeErr))
-			httperr.ResponseErrorLWithStatus(c, errcode.ErrUserManagerMFAMisconfigured, nil, nil)
-			return
-		}
-		managerMFAProbeSucceeded = true
 	}
 	if managerMFAOn && managerMFATouched {
 		var operator struct{ Email string }
@@ -478,23 +494,14 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	committed = true
 
 	// The merged prospective configuration was already SMTP-probed before the
-	// transaction. Use the no-probe load here so this instance publishes that
-	// result without sending a duplicate probe email; generic Reload callers
-	// still trigger a one-shot probe when they observe a settings change.
-	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
+	// transaction. Reload only publishes the committed database snapshot; it
+	// never sends a duplicate startup or reload probe.
+	reloadErr := m.systemSettings.Load()
 	if reloadErr != nil {
 		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
 		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。
 		// 当前系统每 60 秒会执行一次自动 reload，发现配置变化后更新本地快照。
 		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(reloadErr))
-	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
-		// The probe above used the merged prospective values. Publish its
-		// result only when the live snapshot still contains those exact values;
-		// a concurrent partial SMTP update must not make an unprobed
-		// combination look ready.
-		if !m.systemSettings.RecordManagerEmailMFAPreflightIfMatches(generation, prospectiveSMTP) {
-			m.Warn("丢弃与当前配置不匹配的管理端 MFA SMTP 预检结果")
-		}
 	}
 
 	// 写入若涉及 login.local_off,直接用刚刚校验过的 plan.value 触发 safety

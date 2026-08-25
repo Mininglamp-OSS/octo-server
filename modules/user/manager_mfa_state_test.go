@@ -180,3 +180,52 @@ func TestManagerMFAAtomicVerifyAllowsOnlyOneConcurrentConsumer(t *testing.T) {
 	assert.Empty(t, service.client.Get(keys[4]).Val(), "successful verification must consume the active challenge index")
 	assert.Empty(t, service.client.Get(keys[6]).Val(), "successful verification must consume the challenge payload")
 }
+
+func TestManagerMFAAtomicVerifyReturnsVerificationLockRetryAfter(t *testing.T) {
+	service := newManagerMFAStateService(t)
+	cfg := config.New()
+	ctx := config.NewContext(cfg)
+	email := "mfa-lock-" + time.Now().Format("150405.000000000") + "@example.com"
+	challengeID := "challenge-lock-" + time.Now().Format("150405.000000000")
+	attemptID := "attempt-lock"
+	keys := []string{
+		commonbase.EmailCodeKey(email, commonbase.CodeTypeManagerLogin),
+		commonbase.EmailCodeStatusKey(email, commonbase.CodeTypeManagerLogin),
+		commonbase.EmailVerifyFailKey(email, commonbase.CodeTypeManagerLogin),
+		commonbase.EmailVerifyLockKey(email, commonbase.CodeTypeManagerLogin),
+		managerMFAActiveKey("lock-uid"),
+		managerMFASendStateKey(challengeID),
+		managerMFAChallengeKey(challengeID),
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			_ = service.client.Del(key).Err()
+		}
+	})
+	require.NoError(t, service.client.Set(keys[0], "123456", time.Minute).Err())
+	require.NoError(t, service.client.Set(keys[1], "sent:"+attemptID, time.Minute).Err())
+	require.NoError(t, service.client.HSet(keys[5], "status", "sent").Err())
+	require.NoError(t, service.client.HSet(keys[5], "attempt_id", attemptID).Err())
+	require.NoError(t, service.client.Expire(keys[5], time.Minute).Err())
+	require.NoError(t, service.client.Set(keys[4], challengeID, time.Minute).Err())
+	require.NoError(t, service.client.Set(keys[6], "challenge-payload", time.Minute).Err())
+
+	emailService := commonbase.NewEmailService(ctx, nil)
+	for attempt := 1; attempt <= 2; attempt++ {
+		err := emailService.VerifyManagerCodeAtomically(
+			context.Background(), email, "000000", challengeID,
+			keys[4], keys[5], keys[6],
+		)
+		assert.ErrorIs(t, err, commonbase.ErrManagerCodeInvalid)
+	}
+
+	var locked *commonbase.ManagerCodeVerificationLockedError
+	err := emailService.VerifyManagerCodeAtomically(
+		context.Background(), email, "000000", challengeID,
+		keys[4], keys[5], keys[6],
+	)
+	require.ErrorAs(t, err, &locked)
+	assert.GreaterOrEqual(t, locked.RetryAfter, 1)
+	assert.LessOrEqual(t, locked.RetryAfter, 10*60)
+	assert.ErrorIs(t, err, commonbase.ErrManagerCodeLocked)
+}

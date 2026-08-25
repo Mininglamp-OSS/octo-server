@@ -13,69 +13,161 @@ source: self
 
 ## Goal
 
-Add email OTP multi-factor authentication to the system management console login flow. When MFA is enabled, a management-console login must complete the sequence “password verification → challenge → explicit OTP send → OTP verification → final token issuance”; a token must not be issued before a valid management-console MFA flow completes.
+Add email OTP multi-factor authentication to the system management console
+password-login flow. When MFA is enabled, the flow is:
 
-## Background
+`password verification -> challenge -> explicit OTP send -> OTP verification -> token issuance`.
 
-This task protects only the management-console administrator password-login endpoints and their supporting challenge routes:
+No management-console token is issued before a valid OTP has been delivered,
+recorded as sent, and atomically consumed.
+
+## Scope
+
+This task protects only these management-console endpoints:
 
 - `/v1/manager/login`
 - `/v1/manager/login/send`
 - `/v1/manager/login/resend`
 - `/v1/manager/login/verify`
 
-System-setting controls, SMTP validation, administrator email maintenance, challenge lifecycle, atomic OTP consumption, audit records, error codes, Swagger, and regression tests are in scope only when they directly support the management-console MFA flow.
+System-setting controls, SMTP configuration validation, administrator email
+maintenance, the challenge lifecycle, atomic OTP consumption, audit records,
+error codes, Swagger, and regression tests are in scope only when they directly
+support this management-console MFA flow.
 
-This task does not extend MFA to the ordinary user platform and does not separate ordinary-user tokens from management-console tokens. Ordinary user login, OAuth, QR-code login, password recovery, and other ordinary-platform paths do not enter the management-console challenge/OTP flow. To protect the management-console OTP keyspace, the public `/v1/user/email/sendcode` endpoint accepts only the ordinary `Register`, `EmailLogin`, and `ForgetLoginPWD` code types and rejects `CodeTypeManagerLogin`; this is a boundary check that prevents a public endpoint from interfering with management-console MFA, not ordinary-platform MFA.
+This task does not modify ordinary-user authentication or credential-recovery
+behavior. It does not separate ordinary-user and management-console token
+formats, and it does not add an MFA assurance claim to tokens. The public
+`/v1/user/email/sendcode` endpoint rejects `CodeTypeManagerLogin` so an
+unauthenticated ordinary-user request cannot interfere with the management OTP
+keyspace. Ordinary code types retain their existing ordinary-platform behavior.
 
-## Deployment prerequisite / Security boundary
+## Deployment prerequisite and security boundary
 
-This PR protects only the management-console password-login flow. It does not change ordinary user authentication endpoints and does not add an MFA assurance claim to tokens. Management authorization continues to rely on the management role carried in the token. Therefore, enabling `login.manager_email_mfa_on` alone does not prevent the same management account from obtaining or recovering management credentials through other authentication or credential-recovery paths.
+Management authorization continues to rely on the management role carried by
+the token. Enabling `login.manager_email_mfa_on` therefore does not, by itself,
+prevent a management-role account from obtaining or recovering credentials
+through ordinary-platform authentication paths.
 
-Before populating an email address for, and enabling MFA for, any `admin`, `superAdmin`, `dashboardReader`, or `marketAdmin` account, the deployment must use a gateway, route isolation, or equivalent access control to prevent those management roles from using the following ordinary-platform paths to issue or recover management credentials:
+Before enabling management-console MFA, the deployment must use a gateway,
+route isolation, or equivalent access control to prevent accounts with the
+`admin`, `superAdmin`, `dashboardReader`, or `marketAdmin` roles from using
+ordinary-platform paths that issue or recover credentials, including:
 
 - `/v1/user/login`
 - `/v1/user/usernamelogin`
-- `/v1/user/emaillogin`, including OAuth/OIDC and QR-code ordinary-platform login paths
-- `/v1/user/email/forgetpwd`, including the ordinary-platform code-sending path used by that recovery flow
+- `/v1/user/emaillogin`, OAuth/OIDC, and QR-code login paths
+- `/v1/user/email/forgetpwd` and its ordinary code-sending path
 
-These paths are not modified by this PR. The deployment must treat this isolation as a prerequisite for enabling management-console MFA. If the gateway cannot distinguish and block these paths for the target management roles, it must use route isolation that guarantees management roles cannot use them. Otherwise, a management role may bypass the management-console challenge flow or reset its password through the same mailbox and then log in to the console.
+Those ordinary-platform paths are intentionally not modified by this task.
+Blocking them for management roles is a deployment responsibility. Without
+that isolation, the deployment must assume that management-console MFA does
+not cover those alternate credential paths.
 
-## Load-bearing list
+## Configuration ownership and SMTP policy
 
-- MFA is disabled by default; when the policy is disabled, existing management-console login behavior is preserved.
-- If the successfully loaded system-settings snapshot does not configure the MFA switch, treat it as disabled. If the snapshot is unavailable or the switch value is invalid, treat it as unavailable and fail closed; do not fall back to disabled and issue a token directly.
-- When MFA is enabled, a successful password check may create only a challenge and must not issue a token directly. A challenge has a 15-minute absolute deadline, and each UID may have only one active challenge at a time.
-- An OTP may be consumed only after delivery has explicitly succeeded and its verifiable status has been committed. Expired, replayed, concurrently reused, or account-snapshot-mismatched challenges must not issue a token. Starting a resend invalidates the old code immediately; a failed send must not restore the old code.
-- Enabling MFA, modifying SMTP while MFA is enabled, and loading an already-enabled MFA configuration at startup must perform the format, completeness, and real-availability checks required by the current flow. A combined MFA/SMTP update must validate the merged final configuration.
-- When another instance observes an effective MFA/SMTP configuration change through automatic reload, it performs one bounded SMTP preflight. Preflight results are published by configuration generation; an asynchronous result for an old configuration must not mark a new configuration ready, and an ordinary reload tick must not send repeated probe mail.
-- An instance that observes an effective MFA/SMTP configuration change through an explicit `Reload()` also performs one bounded SMTP preflight. A synchronous preflight already completed by the management-settings write path must not send a duplicate probe.
-- If the startup SMTP preflight fails, the service must not panic or automatically disable MFA. It must emit an operational warning, while management-console login remains fail-closed.
-- New administrators must provide a valid email address regardless of the current MFA switch state. This ensures that an administrator account cannot become unusable when MFA is later enabled.
-- Administrator creation and email-maintenance endpoints perform an application-level check for an email already used by another user and reject an occupied address. This task does not create a database-wide unique index and does not guarantee absolute uniqueness or email-ownership semantics under concurrent writes.
-- Ordinary code types continue through their existing ordinary-user business flows; they do not enter the management-console challenge flow. To isolate the management code type, verification codes, send limits, failure counters, and locks are partitioned by code type. This task does not preserve the old shared cross-code-type quota or internal Redis key naming.
+- `login.manager_email_mfa_on` is stored in `system_setting` and is off by
+  default.
+- On startup, if the MFA row does not exist, startup writes an explicit `0`
+  row. If all three manager-MFA SMTP rows (`support.email`,
+  `support.email_smtp`, and `support.email_pwd`) are absent and the static
+  configuration contains a complete SMTP setup, startup encrypts and writes
+  those defaults to `system_setting`. Existing rows, including explicit empty
+  values, are authoritative and are not silently replaced by YAML values.
+- Startup and ordinary `Load`/`Reload` operations do not send a probe email and
+  do not perform SMTP network I/O. They only load the database snapshot.
+- The management MFA send path reads SMTP only from the successfully loaded
+  database snapshot. It does not fall back to YAML at login time. If the
+  snapshot has never loaded successfully, management MFA remains unavailable
+  and fails closed.
+- Enabling MFA performs format, completeness, sender-address, and real SMTP
+  preflight checks on the merged final MFA/SMTP configuration before the
+  transaction commits. A failed check leaves the database unchanged.
+- An SMTP update performs the same checks on the merged final configuration
+  before committing, whether MFA is currently on or off. A non-clearing update
+  must produce a complete, syntactically valid configuration and pass the real
+  preflight; a failed check leaves the database unchanged. The only exception
+  is an intentional SMTP clear, which is allowed while MFA is disabled and is
+  rejected while MFA is enabled.
+- If SMTP later becomes unavailable because of a provider outage, network
+  failure, account suspension, or another delivery-infrastructure failure, the
+  actual OTP send fails and no token is issued. Recovery of that external
+  service is an operational responsibility; this task does not implement an
+  SMTP health-check, delivery queue, retry system, or settings self-healing.
 
-## Out of scope
+## MFA and challenge behavior
 
-- System-settings availability recovery probing, periodic SMTP health checks, and system-settings self-healing.
-- Automatic recovery probing, background retry, or an alerting loop after a startup preflight failure when no configuration change occurs.
-- SMTP delivery queues, retry systems, and final delivery confirmation.
-- System-settings concurrent-update infrastructure, global locking, and multi-instance consistency.
-- Immediate convergence after a successful configuration transaction is followed by a local `Reload()` failure, configuration-infrastructure recovery, and cross-instance consistency. The service only emits a warning and retains the last successfully loaded local snapshot; the existing automatic reload is responsible for retrying later.
-- Ordinary user login endpoints, OAuth, QR-code login, password-recovery hardening, and ordinary-platform MFA. Isolation of management roles from these paths is a deployment responsibility and is not implemented by this PR.
-- Database-level global uniqueness constraints for administrator email, email ownership, and identity-model semantics. The email-maintenance endpoint exists to repair missing email addresses for legacy administrators and performs an application-level occupancy check.
-- Group, space, and market business authorization.
-- Role changes, role-cache invalidation, and ordinary-session revocation. MFA only rechecks that the account still has a management role when the challenge is consumed.
+- When the policy is off, management login preserves the existing direct-token
+  behavior.
+- When the policy is on, a successful password check creates only a challenge;
+  `/v1/manager/login` does not issue a token. The challenge lasts 15 minutes,
+  has an absolute deadline, and each UID has at most one active challenge.
+- The code is six digits generated with `crypto/rand`, is single-use, and is
+  isolated by `CodeTypeManagerLogin` from ordinary code keys, limits, counters,
+  and locks.
+- Sending is explicit. A resend invalidates the prior code before sending. A
+  send attempt has a cooldown, maximum-attempt limit, and bounded in-flight
+  lock. SMTP success must be followed by an atomic `sent` state commit; if
+  sending or the state commit fails, the code cannot authenticate and the old
+  code is not restored.
+- Verification atomically consumes the latest sent code and the active
+  challenge. Expired, replayed, concurrently reused, or account-snapshot-
+  mismatched challenges cannot issue a token. The final account check still
+  validates the current password fingerprint, status, email, UID, and
+  management role.
+- Existing IP rate limiting, localized error envelopes, and audit records are
+  preserved. Management MFA send cooldowns use
+  `err.server.user.manager_mfa_rate_limited`; verification lockouts use the
+  distinct `err.server.user.manager_mfa_verification_locked` code and expose
+  the remaining lock time as `details.retry_after`. Ordinary-user rate-limit
+  behavior is unchanged.
+
+## Administrator email maintenance
+
+- New management administrators must provide a syntactically valid email even
+  when MFA is currently off. This prevents an account from becoming unusable
+  when MFA is enabled later. The bootstrap super-admin is a legacy exception
+  and must be repaired through the maintenance endpoint before MFA is enabled.
+- `PUT /v1/manager/user/admin/email` is a SuperAdmin-only compatibility and
+  repair path for legacy administrator accounts. It validates the address,
+  checks application-level occupancy, records an audit event, and treats a
+  repeated update as success when the target row still matches. A zero-row
+  update caused by a missing account or concurrent identity change is reported
+  as an error rather than silently returning success.
+- This task does not add a database-wide email uniqueness index or define global
+  email ownership semantics under concurrent writes.
+
+## Explicitly out of scope
+
+- Ordinary-user login, OAuth/OIDC, QR-code login, password recovery hardening,
+  ordinary-platform MFA, token separation, and role authorization changes.
+- Group, space, market, and other business authorization behavior.
+- Role changes, role-cache invalidation, session revocation, and session-cache
+  infrastructure.
+- Multi-instance system-setting consistency, concurrent system-setting update
+  infrastructure, readiness convergence, recovery probing, periodic SMTP
+  health checks, configuration self-healing, and retry loops after an external
+  SMTP outage. These are system-configuration or mail-infrastructure concerns.
+- SMTP delivery queues, provider retries, final mailbox delivery confirmation,
+  and provider rate-limit policy.
 - Changes to `octo-lib`.
 
-## Acceptance
+## Acceptance criteria
 
-- Based on the instance’s last successfully loaded system-settings snapshot: when MFA is disabled, management-console login preserves its existing behavior; when MFA is enabled, no management-console token is returned before OTP verification.
-- Only the latest OTP that was explicitly sent successfully and atomically consumed can complete management-console login; an OTP cannot be replayed or consumed concurrently.
-- When SMTP configuration is incomplete or the startup preflight fails, management-console login fails closed and must not issue a token directly because preflight failed.
-- If a configuration transaction succeeds but the local `Reload()` fails, the service only emits a warning and retains the old snapshot and readiness state. Until the next automatic reload succeeds, the instance is not required to converge immediately to the latest database policy. If the old snapshot still has MFA disabled, management-console login continues under the old disabled policy; this configuration-infrastructure failure is not an MFA-flow acceptance criterion.
-- A startup preflight failure produces a warning and does not panic. Continued probing, automatic recovery, and readiness management after that failure belong to system-settings or mail-infrastructure work.
-- Creating an administrator through `/v1/manager/user/admin` without a valid email fails. The bootstrap super-admin created during initial startup is a legacy exception and must receive an email through the maintenance endpoint before MFA is enabled.
-- Administrator creation and email maintenance fail when the requested email is already used by another user. A database unique index and an absolute guarantee under concurrent writes are not acceptance criteria for this task.
-- The public user code-sending endpoint rejects `CodeTypeManagerLogin`; ordinary code types continue through their existing business flows and cannot enter the management-console challenge flow.
-- Multi-instance system-settings consistency, recovery probing without a configuration change, and self-healing are not acceptance criteria. This task only accepts one bounded preflight after an instance observes an MFA/SMTP configuration change and fail-closed MFA behavior for the current loaded snapshot.
+- A successfully loaded database snapshot with no MFA row is initialized to
+  explicit off. An unavailable snapshot never collapses into off and never
+  issues a management token directly.
+- Startup, `Load`, and `Reload` do not send probe email. Missing initial rows
+  are initialized from the documented database/default rules.
+- Enabling MFA and modifying SMTP reject incomplete, syntactically invalid, or
+  real-connection-failing configurations before committing them; combined
+  updates validate the merged final values. An intentional SMTP clear is
+  accepted only while MFA is disabled.
+- With MFA on, password login returns a challenge only. Only the latest code
+  whose SMTP send and `sent` commit both succeeded can be consumed for a token.
+- A later SMTP outage fails the actual send path closed and never issues a
+  token; handling recovery of that outage is outside this task.
+- Public code sending rejects `CodeTypeManagerLogin`; ordinary code types keep
+  their existing behavior.
+- New administrators and the legacy email-maintenance path enforce the email
+  preconditions needed by the management-console MFA flow.

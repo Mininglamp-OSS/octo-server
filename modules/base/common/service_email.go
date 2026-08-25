@@ -154,6 +154,22 @@ var (
 	errInvalidTrackedCodeResult = errors.New("invalid tracked email code result")
 )
 
+// ManagerCodeVerificationLockedError keeps the verification-lock semantics
+// separate from the email-send cooldown semantics. It unwraps to the legacy
+// ErrManagerCodeLocked sentinel so existing callers can continue to use
+// errors.Is while manager-console handlers can expose the remaining lock time.
+type ManagerCodeVerificationLockedError struct {
+	RetryAfter int
+}
+
+func (e *ManagerCodeVerificationLockedError) Error() string {
+	return ErrManagerCodeLocked.Error()
+}
+
+func (e *ManagerCodeVerificationLockedError) Unwrap() error {
+	return ErrManagerCodeLocked
+}
+
 // SendVerifyCode 发送验证码。
 //
 // 主题/正文由 emailtmpl 按 lang 渲染（外置 per-lang 模板，issue #221）；走
@@ -492,8 +508,8 @@ func ValidateEmailAddress(email string) error {
 // PreflightSMTP exercises the same SMTP transaction used for real mail. The
 // sender address is used as the recipient because no new deployment setting
 // is introduced for a probe mailbox. This deliberately sends a real probe;
-// callers invoke it only when enabling/validating manager MFA or during the
-// startup warning check.
+// callers invoke it only when enabling or modifying the manager MFA SMTP
+// configuration.
 func (s *EmailService) PreflightSMTP(ctx context.Context) error {
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
 	if err := ValidateSMTPConfiguration(smtpAddr, fromAddr, pwd); err != nil {
@@ -779,8 +795,12 @@ func (s *EmailService) verifyRedis() *rd.Client {
 func (s *EmailService) VerifyManagerCodeAtomically(ctx context.Context, email, code, challengeID string, activeKey, sendStateKey, challengeKey string) error {
 	const script = `
 local lock = redis.call('GET', KEYS[4])
-if lock then return 2 end
-if redis.call('GET', KEYS[5]) ~= ARGV[2] then return 0 end
+if lock then
+  local lockTTL = redis.call('PTTL', KEYS[4])
+  if lockTTL <= 0 then return {2, tonumber(ARGV[3])} end
+  return {2, math.max(1, math.ceil(lockTTL / 1000))}
+end
+if redis.call('GET', KEYS[5]) ~= ARGV[2] then return {0, 0} end
 local expected = redis.call('GET', KEYS[1])
 local status = redis.call('GET', KEYS[2])
 local sendStatus = redis.call('HGET', KEYS[6], 'status')
@@ -790,16 +810,16 @@ if expected and sendStatus == 'sent' and attemptID and status == ('sent:' .. att
 	if redis.call('GET', KEYS[5]) == ARGV[2] then
 	  redis.call('DEL', KEYS[5], KEYS[7])
 	end
-	return 1
+	return {1, 0}
 end
 local count = tonumber(redis.call('GET', KEYS[3]) or '0') + 1
 if count >= 3 then
   redis.call('SET', KEYS[4], '1', 'EX', ARGV[3])
   redis.call('DEL', KEYS[3])
-  return 2
+  return {2, tonumber(ARGV[3])}
 end
 redis.call('SET', KEYS[3], tostring(count), 'EX', ARGV[4])
-return 0
+return {0, 0}
 `
 	result, err := s.verifyRedis().WithContext(ctx).Eval(script, []string{
 		EmailCodeKey(email, CodeTypeManagerLogin),
@@ -813,15 +833,23 @@ return 0
 	if err != nil {
 		return err
 	}
-	value, ok := result.(int64)
-	if !ok {
+	parts, ok := result.([]interface{})
+	if !ok || len(parts) != 2 {
 		return errors.New("invalid manager verification result")
+	}
+	value, ok := parts[0].(int64)
+	if !ok {
+		return errors.New("invalid manager verification status")
+	}
+	retryAfter, ok := parts[1].(int64)
+	if !ok {
+		return errors.New("invalid manager verification retry-after")
 	}
 	switch value {
 	case 1:
 		return nil
 	case 2:
-		return ErrManagerCodeLocked
+		return &ManagerCodeVerificationLockedError{RetryAfter: int(retryAfter)}
 	default:
 		return ErrManagerCodeInvalid
 	}

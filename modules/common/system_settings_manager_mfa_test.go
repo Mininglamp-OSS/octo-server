@@ -1,14 +1,13 @@
 package common
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestManagerEmailMFAStateIsTriStateAndFailClosed(t *testing.T) {
+func TestManagerEmailMFAStateIsTriStateAndDefaultsOff(t *testing.T) {
 	settings := newTestSystemSettings(t, nil)
 
 	// A freshly constructed settings object has no successful snapshot yet.
@@ -19,75 +18,71 @@ func TestManagerEmailMFAStateIsTriStateAndFailClosed(t *testing.T) {
 	// default-off state, not the unavailable state.
 	assert.Equal(t, ManagerEmailMFAOff, settings.ManagerEmailMFAState())
 
-	settings.ctx.GetConfig().Support.Email = "mfa-sender@example.com"
-	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
-	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
 	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
 	require.NoError(t, settings.Load())
-
 	assert.Equal(t, ManagerEmailMFAOn, settings.ManagerEmailMFAState())
-	assert.False(t, settings.ManagerEmailMFAReady(), "MFA must remain fail-closed before a real preflight")
-
-	// The test publishes the result of a successful preflight without sending
-	// an external message; the handler tests cover the actual SMTP path.
-	settings.RecordManagerEmailMFAPreflight(settings.ManagerEmailMFAProbeGeneration(), true)
-	assert.True(t, settings.ManagerEmailMFAReady())
 }
 
-func TestManagerEmailMFAPreflightDoesNotPublishStaleGeneration(t *testing.T) {
-	settings := newTestSystemSettings(t, nil)
-	settings.ctx.GetConfig().Support.Email = "mfa-preflight-generation@example.com"
-	settings.ctx.GetConfig().Support.EmailSmtp = ""
-	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
-	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+func TestEnsureManagerEmailMFASettingsSeedsDatabaseDefaults(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "mfa-default@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "smtp-password"
+	})
+
+	require.NoError(t, settings.EnsureManagerEmailMFASettings())
 	require.NoError(t, settings.Load())
 
-	// Simulate a settings replacement while the startup probe is in flight.
-	// The probe result must not open the gate for the newer generation.
-	settings.managerMFAProbeMu.Lock()
-	settings.managerMFAProbeGeneration++
-	settings.managerMFAProbeMu.Unlock()
-	assert.Error(t, settings.PreflightManagerEmailMFA(context.Background()))
-	assert.False(t, settings.ManagerEmailMFAReady())
+	assert.Equal(t, ManagerEmailMFAOff, settings.ManagerEmailMFAState())
+	provider := settings.ManagerEmailMFASMTPSettings()
+	assert.Equal(t, "mfa-default@example.com", provider.SupportEmail())
+	assert.Equal(t, "smtp.example.com:587", provider.SupportEmailSmtp())
+	assert.Equal(t, "smtp-password", provider.SupportEmailPwd())
+
+	rows, err := settings.db.listAll()
+	require.NoError(t, err)
+	stored := make(map[string]*systemSettingModel, len(rows))
+	for _, row := range rows {
+		stored[schemaKey(row.Category, row.KeyName)] = row
+	}
+	assert.Equal(t, "0", stored["login.manager_email_mfa_on"].Value)
+	assert.Equal(t, settingTypeEncrypted, stored["support.email_pwd"].ValueType)
+	assert.NotEqual(t, "smtp-password", stored["support.email_pwd"].Value)
 }
 
-func TestManagerEmailMFAPreflightRecordRejectsStaleGeneration(t *testing.T) {
-	settings := newTestSystemSettings(t, nil)
-	settings.ctx.GetConfig().Support.Email = "mfa-record-generation@example.com"
-	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
-	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
-	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+func TestEnsureManagerEmailMFASettingsDoesNotOverwriteExplicitSMTPRows(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "yaml@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "yaml.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "yaml-password"
+	})
+	require.NoError(t, settings.db.upsert("support", "email", "", settingTypeString, "explicitly cleared"))
+	require.NoError(t, settings.EnsureManagerEmailMFASettings())
 	require.NoError(t, settings.Load())
 
-	generation := settings.ManagerEmailMFAProbeGeneration()
-	settings.managerMFAProbeMu.Lock()
-	settings.managerMFAProbeGeneration++
-	settings.managerMFAProbeMu.Unlock()
-	assert.False(t, settings.RecordManagerEmailMFAPreflight(generation, true))
-	assert.False(t, settings.ManagerEmailMFAReady())
+	provider := settings.ManagerEmailMFASMTPSettings()
+	assert.Empty(t, provider.SupportEmail())
+	assert.Empty(t, provider.SupportEmailSmtp())
+	assert.Empty(t, provider.SupportEmailPwd())
 }
 
-func TestManagerEmailMFAPreflightRecordRejectsUnmatchedSMTPSnapshot(t *testing.T) {
-	settings := newTestSystemSettings(t, nil)
-	settings.ctx.GetConfig().Support.Email = "mfa-record-match@example.com"
-	settings.ctx.GetConfig().Support.EmailSmtp = "smtp.example.com:587"
-	settings.ctx.GetConfig().Support.EmailPwd = "smtp-password"
-	require.NoError(t, settings.db.upsert("login", "manager_email_mfa_on", "1", settingTypeBool, ""))
+func TestManagerEmailMFASMTPSettingsUseDatabaseInsteadOfYAML(t *testing.T) {
+	settings := newTestSystemSettings(t, func(s *SystemSettings) {
+		s.ctx.GetConfig().Support.Email = "yaml@example.com"
+		s.ctx.GetConfig().Support.EmailSmtp = "yaml.example.com:587"
+		s.ctx.GetConfig().Support.EmailPwd = "yaml-password"
+	})
+	require.NoError(t, settings.db.upsert("support", "email", "db@example.com", settingTypeString, ""))
+	require.NoError(t, settings.db.upsert("support", "email_smtp", "db.example.com:465", settingTypeString, ""))
+	password, err := encryptKey("db-password")
+	require.NoError(t, err)
+	require.NoError(t, settings.db.upsert("support", "email_pwd", password, settingTypeEncrypted, ""))
 	require.NoError(t, settings.Load())
 
-	probed := settings.managerEmailMFASMTPSettings()
-	// Simulate a concurrent partial update that changes the loaded SMTP
-	// combination after the original prospective values were probed.
-	require.NoError(t, settings.db.upsert("support", "email_smtp", "other.example.com:587", settingTypeString, ""))
-	require.NoError(t, settings.Load())
-	generation := settings.ManagerEmailMFAProbeGeneration()
-	assert.False(t, settings.RecordManagerEmailMFAPreflightIfMatches(generation, probed))
-	assert.False(t, settings.ManagerEmailMFAReady())
-
-	assert.True(t, settings.RecordManagerEmailMFAPreflightIfMatches(
-		generation, settings.managerEmailMFASMTPSettings(),
-	))
-	assert.True(t, settings.ManagerEmailMFAReady())
+	provider := settings.ManagerEmailMFASMTPSettings()
+	assert.Equal(t, "db@example.com", provider.SupportEmail())
+	assert.Equal(t, "db.example.com:465", provider.SupportEmailSmtp())
+	assert.Equal(t, "db-password", provider.SupportEmailPwd())
 }
 
 func TestManagerEmailMFASchemaDefaultsOffAndNamesConsoleScope(t *testing.T) {

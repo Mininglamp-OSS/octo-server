@@ -153,14 +153,10 @@ func newManagerMFAIntegration(t *testing.T, failAuth bool) (*wkhttp.WKHttp, *con
 		).Exec()
 		require.NoError(t, err)
 	}
-	// Reload schedules a real asynchronous SMTP preflight. This helper uses a
-	// controlled readiness result so the test can exercise the handler's send
-	// failure path without that probe racing and overwriting the result.
+	// The manager MFA flow uses the database-backed SMTP provider directly. No
+	// startup or reload preflight is required; the real send path is exercised
+	// by the handler tests below.
 	require.NoError(t, settings.Load())
-	// This records the result for the controlled fake SMTP setup. The OTP send
-	// itself still traverses the real SMTP implementation below.
-	settings.RecordManagerEmailMFAPreflight(settings.ManagerEmailMFAProbeGeneration(), true)
-	require.True(t, settings.ManagerEmailMFAReady())
 
 	password := "manager-mfa-password"
 	hash, err := HashPassword(password)
@@ -336,6 +332,52 @@ func TestManagerConsoleMFAHandlerSMTPFailureCannotVerify(t *testing.T) {
 	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(recipientEmail, commonbase.CodeTypeManagerLogin))
 	require.NoError(t, err)
 	assert.Empty(t, code, "SMTP failure must not leave a verifiable OTP")
+}
+
+func TestManagerConsoleMFAVerificationLockHasDistinct429Contract(t *testing.T) {
+	route, ctx, _, password, recipientEmail := newManagerMFAIntegration(t, false)
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	var user Model
+	_, err := ctx.DB().Select("uid,username").From("user").Where("role=?", string(wkhttp.SuperAdmin)).Load(&user)
+	require.NoError(t, err)
+
+	login := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login", map[string]string{
+		"username": user.Username,
+		"password": password,
+	}))
+	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
+	var challenge managerLoginResp
+	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &challenge))
+
+	send := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/send", map[string]string{
+		"challenge_id": challenge.ChallengeID,
+	}))
+	require.Equal(t, http.StatusOK, send.Code, send.Body.String())
+	code, err := ctx.GetRedisConn().GetString(commonbase.EmailCodeKey(recipientEmail, commonbase.CodeTypeManagerLogin))
+	require.NoError(t, err)
+	wrongCode := "000000"
+	if wrongCode == code {
+		wrongCode = "111111"
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		invalid := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/verify", map[string]string{
+			"challenge_id": challenge.ChallengeID,
+			"code":         wrongCode,
+		}))
+		require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
+		assert.Contains(t, invalid.Body.String(), "err.server.user.manager_mfa_code_invalid")
+	}
+
+	locked := serveManagerMFARequest(t, route, managerMFARequest(t, http.MethodPost, "/v1/manager/login/verify", map[string]string{
+		"challenge_id": challenge.ChallengeID,
+		"code":         wrongCode,
+	}))
+	require.Equal(t, http.StatusTooManyRequests, locked.Code, locked.Body.String())
+	assert.Contains(t, locked.Body.String(), "err.server.user.manager_mfa_verification_locked")
+	assert.Contains(t, locked.Body.String(), "retry_after")
+	assert.Contains(t, locked.Body.String(), "错误次数过多")
+	assert.NotContains(t, locked.Body.String(), "发送过于频繁")
 }
 
 func TestManagerConsoleMFAMailboxCooldownReturns429WithRetryAfter(t *testing.T) {
