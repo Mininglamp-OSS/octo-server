@@ -2,6 +2,7 @@ package robot
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -47,12 +48,17 @@ func respondRobotContentTypeUnsupported(c *wkhttp.Context, contentType int) {
 	})
 }
 
-// respondRobotFileTooLarge surfaces the upload size cap (in MB) so the client can
-// render a localized hint without hard-coding the limit.
-func respondRobotFileTooLarge(c *wkhttp.Context, maxMB int64) {
-	httperr.ResponseErrorL(c, errcode.ErrRobotFileTooLarge, nil, i18n.Details{
-		"max_mb": maxMB,
-	})
+// respondRobotFileTooLarge surfaces the upload size cap so the client can render
+// a localized hint without hard-coding the limit. Takes the cap in BYTES:
+// file.max_size_kb accepts any KB value, and reporting bytes/1024/1024
+// truncates (a 1536KB cap reported "1MB", a limit the server does not enforce).
+// max_size_kb is exact; max_mb is kept for clients already reading it.
+func respondRobotFileTooLarge(c *wkhttp.Context, maxBytes int64) {
+	maxSizeKB, maxMB := file.SizeLimitDetails(maxBytes)
+	httperr.ResponseErrorL(c, errcode.ErrRobotFileTooLarge,
+		i18n.Params{"max_size": file.FormatSizeLimit(maxBytes)},
+		i18n.Details{"max_size_kb": maxSizeKB, "max_mb": maxMB},
+	)
 }
 
 // respondRobotAuthFailed renders the single anti-enumeration 401 for the robot

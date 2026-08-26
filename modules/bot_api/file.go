@@ -67,13 +67,25 @@ func (ba *BotAPI) botUploadFile(c *wkhttp.Context) {
 	}
 	defer multipartFile.Close()
 
-	const maxSize int64 = 100 * 1024 * 1024
+	// 上限读 modules/file 的策略快照（system_setting: file.max_size_kb），与
+	// /v1/file/upload 同源。改动前这里是一份本地 `const maxSize = 100MB` 复制，
+	// 运营调小上限时这条路径不会跟着收紧。
+	maxSize := file.MaxUploadSize()
 	if fileHeader.Size > maxSize {
-		respondBotAPIFileTooLarge(c, maxSize/1024/1024)
+		respondBotAPIFileTooLarge(c, maxSize)
 		return
 	}
 
+	// 扩展名门：与 /v1/file/upload、预签名签发路径读同一份策略快照。此前这条
+	// multipart 路径完全不校验扩展名，运营封堵一个格式后它仍能把文件写进对象
+	// 存储 —— 一个入口收紧、另一个敞着，就是跨模块的绕过路径。
 	fileName := fileHeader.Filename
+	uploadExt := strings.ToLower(filepath.Ext(fileName))
+	if uploadExt == "" || file.IsBlockedExtension(uploadExt) || !file.IsAllowedExtension(uploadExt) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTypeUnsupported, nil, nil)
+		return
+	}
+
 	filePath := uploadPath
 	if filePath == "" {
 		filePath = fmt.Sprintf("/%d/%s%s", time.Now().Unix(), util.GenerUUID(), filepath.Ext(fileName))
@@ -263,10 +275,10 @@ func (ba *BotAPI) botUploadPresigned(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "fileSize")
 		return
 	}
-	if fileSize > file.MaxFileSize {
+	if maxSize := file.MaxUploadSize(); fileSize > maxSize {
 		ba.Warn("预签名上传 fileSize 超出限制",
-			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
-		respondBotAPIFileTooLarge(c, file.MaxFileSize/1024/1024)
+			zap.Int64("size", fileSize), zap.Int64("max", maxSize))
+		respondBotAPIFileTooLarge(c, maxSize)
 		return
 	}
 

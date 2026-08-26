@@ -2054,16 +2054,21 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 	}
 	defer multipartFile.Close()
 
-	// 文件大小限制 100MB
-	const maxSize int64 = 100 * 1024 * 1024
+	// 文件大小上限读 modules/file 的策略快照（system_setting: file.max_size_kb），
+	// 与 /v1/file/upload 同源。改动前这里是一份本地 `const maxSize = 100MB` 复制，
+	// 运营调小上限时这条路径不会跟着收紧。
+	maxSize := file.MaxUploadSize()
 	if fileHeader.Size > maxSize {
-		respondRobotFileTooLarge(c, maxSize/1024/1024)
+		respondRobotFileTooLarge(c, maxSize)
 		return
 	}
 
+	// 扩展名门：与 /v1/file/upload、预签名签发路径读同一份策略快照。此前这条
+	// multipart 路径只拒空扩展名，不查黑白名单，运营封堵一个格式后它仍能把文件
+	// 写进对象存储 —— 一个入口收紧、另一个敞着，就是跨模块的绕过路径。
 	fileName := fileHeader.Filename
 	ext := strings.ToLower(filepath.Ext(fileName))
-	if ext == "" {
+	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotFileTypeUnsupported, nil, nil)
 		return
 	}
@@ -2210,10 +2215,10 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 		respondRobotRequestInvalid(c, "fileSize")
 		return
 	}
-	if fileSize > file.MaxFileSize {
+	if maxSize := file.MaxUploadSize(); fileSize > maxSize {
 		rb.Warn("预签名上传 fileSize 超出限制",
-			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
-		respondRobotFileTooLarge(c, file.MaxFileSize/1024/1024)
+			zap.Int64("size", fileSize), zap.Int64("max", maxSize))
+		respondRobotFileTooLarge(c, maxSize)
 		return
 	}
 

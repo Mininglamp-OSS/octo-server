@@ -898,10 +898,15 @@ func TestGetUploadCredentials_FileSizeValidation(t *testing.T) {
 			wantMsgContain: "正整数",
 		},
 		{
-			name:           "fileSize over MaxFileSize is rejected",
-			queryParams:    fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
-			wantStatus:     http.StatusBadRequest,
-			wantMsgContain: "MB",
+			// 超限响应改走 httperr 本地化信封后，这条直驱测试（gin.CreateTestContext，
+			// 没有 route，因而没有 ErrorRenderer）只能看到兜底 renderer 的
+			// {msg,status}，msg 是未插值的模板、details 也不下发。上限值本身的
+			// 断言因此挪到有 renderer 的集成路径：
+			// policy_integration_test.go:TestPresignedOversizeReportsExactCap
+			// 那里验证渲染后的精确文案与 max_size_kb 详情，覆盖比这里更强。
+			name:        "fileSize over MaxFileSize is rejected",
+			queryParams: fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
+			wantStatus:  http.StatusBadRequest,
 		},
 		{
 			name:           "fileSize exactly MaxFileSize is accepted",

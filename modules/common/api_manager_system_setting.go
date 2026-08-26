@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -182,13 +183,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Validate everything first so a malformed item never produces a
 	// half-applied write. The actual writes happen later in one
 	// transaction.
-	type prepared struct {
-		def            *settingDef
-		value          string
-		effectiveValue string
-		skip           bool
-	}
-	plans := make([]prepared, 0, len(req.Items))
+	plans := make([]preparedSetting, 0, len(req.Items))
 	for _, item := range req.Items {
 		def := findSchemaDef(item.Category, item.Key)
 		if def == nil {
@@ -198,7 +193,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			return
 		}
 
-		p := prepared{def: def, value: item.Value, effectiveValue: item.Value}
+		p := preparedSetting{def: def, value: item.Value, effectiveValue: item.Value}
 		switch def.Type {
 		case settingTypeBool:
 			normalised, ok := normaliseBool(item.Value)
@@ -443,6 +438,16 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
+	// file.* 键的写侧校验（长度/条数、内置黑名单、与贴纸上限的组合）。
+	// 实现在 api_manager_system_setting_file.go —— 这个 handler 已经过长，
+	// 新增校验不再往里堆。
+	if m.rejectInvalidFileSettingWrites(c, plans) {
+		return
+	}
+
+	// 变更审计：旧值必须在写入**前**从当前快照捕获，提交后再落日志。
+	audits := m.collectSettingAudits(plans)
+
 	// Atomic batch: open one transaction, queue every upsert, commit only
 	// if all rows succeed. A mid-batch DB failure rolls back everything
 	// rather than leaving callers to debug partial state.
@@ -483,10 +488,17 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// still trigger a one-shot probe when they observe a settings change.
 	generation, reloadErr := m.systemSettings.loadWithGeneration(false)
 	if reloadErr != nil {
-		// 配置提交成功但本实例 reload 失败属于系统配置基础设施故障；
-		// 服务仅输出告警，不保证该实例立即收敛到最新 MFA 策略。
-		// 当前系统每 60 秒会执行一次自动 reload，发现配置变化后更新本地快照。
-		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(reloadErr))
+		// 配置已提交但本实例 reload 失败：属于系统配置基础设施故障，本实例仍在
+		// 服务旧快照，最长等到下一次 60s 自动 reload 才收敛。
+		//
+		// 这条路径**不回滚**已提交的事务 —— 落库本身是对的，其他实例照常在一个
+		// 收敛窗口内拿到新值。但它也不能继续返回一个无差别的 200：紧急封堵某个
+		// 扩展名（file.extra_blocked_extensions）时，运维会据此以为封堵已生效。
+		// 生效状态经响应体的 `applied` 字段回带（见下），日志升级为 Error。
+		m.Error("Reload SystemSettings 失败，本实例仍在旧快照，等待自动刷新",
+			zap.Error(reloadErr),
+			zap.String("trace_id", c.GetString(reqid.GinKey)),
+			zap.String("operator", c.GetLoginUID()))
 	} else if managerMFAProbeSucceeded && m.systemSettings.ManagerEmailMFAState() == ManagerEmailMFAOn {
 		// The probe above used the merged prospective values. Publish its
 		// result only when the live snapshot still contains those exact values;
@@ -512,7 +524,24 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
-	c.ResponseOK()
+	m.finishSettingUpdate(c, audits, reloadErr)
+}
+
+// finishSettingUpdate 落变更审计并回应写入结果。
+//
+// 响应保留 status 字段让老管理台前端原样工作；applied 是新增的生效状态：
+// false = 已入库但本实例 reload 失败、仍在服务旧快照，其他实例最长 60s 内跟上。
+// 紧急封堵时运维需要看到这个区别，而不是一个无差别的 200。
+func (m *Manager) finishSettingUpdate(c *wkhttp.Context, audits []settingAuditEntry, reloadErr error) {
+	operator := c.GetLoginUID()
+	traceID := c.GetString(reqid.GinKey)
+	for _, a := range audits {
+		m.Info("system_setting 变更", settingAuditFields(a, operator, traceID, reloadErr == nil)...)
+	}
+	c.Response(jsonH{
+		"status":  http.StatusOK,
+		"applied": reloadErr == nil,
+	})
 }
 
 // testSystemSettingEmail handles POST /v1/manager/common/system_setting/test_email.

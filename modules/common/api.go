@@ -407,8 +407,9 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			OctoAssistantUIDs:      octoAssistantUIDs,
 			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
-			// 也能立刻拿到最新值。
+			// 也能立刻拿到最新值。文件上传限制同理。
 			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+			FileUploadLimits:    buildFileUploadLimitsResp(),
 		})
 		return
 	}
@@ -463,6 +464,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+		FileUploadLimits:    buildFileUploadLimitsResp(),
 	})
 }
 
@@ -943,6 +945,46 @@ type appConfigResp struct {
 	// compress_max_concurrency / compress_timeout_ms）—— 这些是服务端"影子"参数，
 	// 响应字段结构不变、无对应客户端行为，曝光只会泄露实现细节。
 	StickerUploadLimits stickerUploadLimitsResp `json:"sticker_upload_limits"`
+
+	// FileUploadLimits 是**通用文件上传**的有效限制，与 file.* system_setting
+	// 同源（modules/file 的策略快照：baseline ∪ extra_allowed − blocked）。
+	// 用途同 StickerUploadLimits：客户端选文件后本地预校验，避免超大文件 /
+	// 非法扩展名跑完整个 HTTP 上传才被服务端拒 —— 对移动端流量尤其友好。
+	//
+	// 只含 allowed，不含 blocked：客户端只需要知道能传什么。本端点无鉴权
+	// （commonNoAuth），下发黑名单等于让任何未认证调用方对比 baseline 就看出
+	// 本部署额外封了哪些扩展名。
+	//
+	// **客户端预校验只是 UX 优化**，服务端对每个上传请求仍用同一份快照兜底
+	// （size + 扩展名黑/白名单三层）。运营紧急封堵某扩展名后，客户端缓存的清单
+	// 最长滞后一个跨实例收敛窗口（60s），期间「选了文件、上传被拒」是**预期
+	// 行为**，客户端应正常提示错误，而不是断言这不可能发生。
+	//
+	// 指针 + omitempty：provider 未注册（modules/file 未链接进本次构建）时整个
+	// 字段不下发，而不是下发空数组 —— 空 allowed_extensions 会被客户端读成
+	// 「什么都不能传」，比缺字段更危险。
+	//
+	// 与 app_config.version 解耦的原因同 StickerUploadLimits：运维在管理台调整
+	// 后，老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	FileUploadLimits *fileUploadLimitsResp `json:"file_upload_limits,omitempty"`
+}
+
+// fileUploadLimitsResp 是 appConfigResp.file_upload_limits 的形状。
+// 单位与 stickerUploadLimitsResp 对齐（KB），避免同一响应体里两种单位。
+// allowed_extensions 每项含前导点、小写、字典序，稳定可比较。
+type fileUploadLimitsResp struct {
+	MaxSizeKB         int      `json:"max_size_kb"`
+	AllowedExtensions []string `json:"allowed_extensions"`
+}
+
+// buildFileUploadLimitsResp 从 modules/file 注册的 provider 取有效值。
+// provider 未注册时返回 nil，字段整体不下发（见 FileUploadLimits 的说明）。
+func buildFileUploadLimitsResp() *fileUploadLimitsResp {
+	maxSizeKB, allowed, ok := FileUploadLimits()
+	if !ok {
+		return nil
+	}
+	return &fileUploadLimitsResp{MaxSizeKB: maxSizeKB, AllowedExtensions: allowed}
 }
 
 type messageReactionCapabilityResp struct {
