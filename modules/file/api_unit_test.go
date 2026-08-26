@@ -1702,50 +1702,69 @@ func TestGetUploadCredentials_ContentTypeContract(t *testing.T) {
 	}
 }
 
-// TestUploadFile_RejectsPathExtMismatchOnGenericUpload：**非贴纸**路径同样要求
-// ?path= 的扩展名与 filename 一致。
+// TestUploadFile_AcceptsServerGeneratedPathShapes 钉住 getFilePath 自己签发的
+// ?path= 形态必须可上传。
 //
-// 扩展名门校验的是 filename，而落库的 object key 来自调用方的 ?path=。两者不
-// 一致时 `?path=/x.svg` 配 `x.png` 的 filename 就能在 .svg 被封堵后仍写出一个
-// .svg 对象 —— 正是这道门要挡的场景。此前只有 sticker 分支做了这个校验。
-func TestUploadFile_RejectsPathExtMismatchOnGenericUpload(t *testing.T) {
+// 背景：本 PR 曾一度加过一道「?path= 扩展名必须等于 filename 扩展名」的门，
+// 结果打断了服务端自己发出的上传 URL —— workplace 横幅/应用图标的 path 不带
+// 扩展名（getFilePath 的 TypeWorkplaceBanner / TypeWorkplaceAppIcon 分支），
+// 而 :525 那段「修复客户端上传路径缺少扩展名的问题」的兼容代码也随之变成死
+// 代码。那道门已回退。
+//
+// 这些用例存在的意义是：任何未来想再收紧 ?path= 的改动，必须先让这张表全绿。
+// 收紧本身不是坏事，但要基于对真实流量形态的分析，而不是只覆盖"想得到的两种"。
+func TestUploadFile_AcceptsServerGeneratedPathShapes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 
-	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/x.png"}
-	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+	cases := []struct {
+		name     string
+		fileType string
+		path     string
+		filename string
+		wantKey  string
+	}{
+		{
+			name: "无扩展名的 path 由兼容代码补全", fileType: "chat",
+			path: "/10000/HASH", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "有扩展名文本但缺点号", fileType: "chat",
+			path: "/10000/HASHpng", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "workplace 横幅：path 以目录结尾", fileType: "workplacebanner",
+			path: "/workplace/banner/", filename: "x.png", wantKey: "workplacebanner/workplace/banner.png",
+		},
+		{
+			name: "workplace 应用图标：path 以目录结尾", fileType: "workplaceappicon",
+			path: "/workplace/appicon/", filename: "x.png", wantKey: "workplaceappicon/workplace/appicon.png",
+		},
+		{
+			name: "path 与 filename 扩展名一致", fileType: "chat",
+			path: "/10000/x.png", filename: "x.png", wantKey: "chat/10000/x.png",
+		},
+	}
 
-	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 8, 8))
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/10000/x.svg", body)
-	c.Request.Header.Set("Content-Type", contentType)
-	c.Set("uid", "10000")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+			mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/" + tc.wantKey}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
 
-	f.uploadFile(&wkhttp.Context{Context: c})
+			body, contentType := newMultipartFile(t, tc.filename, pngOfSize(t, 8, 8))
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request, _ = http.NewRequest(http.MethodPost,
+				"/v1/file/upload?type="+tc.fileType+"&path="+url.QueryEscape(tc.path), body)
+			c.Request.Header.Set("Content-Type", contentType)
+			c.Set("uid", "10000")
 
-	require.Equal(t, http.StatusBadRequest, rec.Code,
-		"generic upload with path ext != filename ext must be rejected; body: %s", rec.Body.String())
-	assert.Zero(t, mockSvc.uploadCalls, "被拒的上传绝不能写进对象存储")
-}
+			f.uploadFile(&wkhttp.Context{Context: c})
 
-// 一致时照常放行（大小写不敏感），确认收紧没有误伤正常上传。
-func TestUploadFile_AllowsMatchingPathExtOnGenericUpload(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
-
-	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/x.png"}
-	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
-
-	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 8, 8))
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/10000/X.PNG", body)
-	c.Request.Header.Set("Content-Type", contentType)
-	c.Set("uid", "10000")
-
-	f.uploadFile(&wkhttp.Context{Context: c})
-
-	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-	assert.Equal(t, 1, mockSvc.uploadCalls)
+			require.Equal(t, http.StatusOK, rec.Code,
+				"服务端自己签发的 path 形态必须可上传; body: %s", rec.Body.String())
+			assert.Equal(t, tc.wantKey, mockSvc.lastObjectPath,
+				"存储 key 必须以校验过的扩展名结尾")
+		})
+	}
 }

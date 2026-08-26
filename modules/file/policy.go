@@ -277,7 +277,14 @@ func FormatSizeLimit(bytes int64) string {
 	if bytes%mb == 0 {
 		return fmt.Sprintf("%d MB", bytes/mb)
 	}
-	return fmt.Sprintf("%.1f MB", float64(bytes)/float64(mb))
+	// 一位小数只有在**能精确表示**时才用 MB。否则四舍五入会高报一个服务端并不
+	// 执行的上限：1100KB 实际是 1126400 字节，渲染成 "1.1 MB" 会被客户端读成
+	// 1153434 字节。这与本函数存在的理由（1536KB 被整除成 "1MB"）是同一类错误，
+	// 只是量级更小。不能精确表示就退回 KB —— 数字长一点，但不会撒谎。
+	if bytes*10%mb == 0 {
+		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(mb))
+	}
+	return fmt.Sprintf("%d KB", bytes/kb)
 }
 
 // SizeLimitDetails 是上限相关错误的结构化详情。

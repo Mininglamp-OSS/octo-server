@@ -368,22 +368,6 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
 		return
 	}
-	// 落库用的 object key 来自调用方的 ?path=，而上面校验的是 filename 的扩展名。
-	// 两者不一致时 `?path=/x.svg` 配 `x.png` 的 filename 就能在 .svg 被封堵后
-	// 仍写出 .svg 对象 —— 策略校验的和实际存的不是同一个东西。贴纸分支下面已有
-	// 同型校验；这里把它扩到通用路径，与 bot_api / robot 的 multipart 保持一致
-	// （一个入口收紧、另一个敞着就是绕过路径）。
-	if uploadPath != "" && !strings.EqualFold(filepath.Ext(uploadPath), ext) {
-		if isStickerUpload {
-			observeStickerUpload("format_rejected")
-		}
-		f.Warn("上传路径扩展名与文件名不一致",
-			zap.String("path_ext", strings.ToLower(filepath.Ext(uploadPath))),
-			zap.String("name_ext", ext))
-		httperr.ResponseErrorL(c, errcode.ErrFileUploadPathMismatch, nil, nil)
-		return
-	}
-
 	// 贴纸只接受配置允许的位图格式（stickerLimits.allowedFormats，默认为
 	// gif/png/jpg/jpeg/webp；运营可通过 sticker.upload_allowed_formats 收窄，但
 	// 读侧交集保证不会放开非位图）。全局 allowlist 还允许 pdf/zip/mp4 等，

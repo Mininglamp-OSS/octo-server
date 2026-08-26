@@ -2078,13 +2078,6 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 		contentType = "application/octet-stream"
 	}
 
-	// 同 bot_api：校验的是 filename 的扩展名，落库的是调用方给的 ?path=，
-	// 不一致就等于策略校验的和实际存的不是同一个东西。
-	if uploadPath != "" && !strings.EqualFold(filepath.Ext(uploadPath), ext) {
-		httperr.ResponseErrorL(c, errcode.ErrRobotFileTypeUnsupported, nil, nil)
-		return
-	}
-
 	path := uploadPath
 	if path == "" {
 		path = fmt.Sprintf("/%d/%s%s", time.Now().Unix(), util.GenerUUID(), filepath.Ext(fileName))

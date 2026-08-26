@@ -48,8 +48,8 @@ other = "空间欢迎语配置无效，请检查目标空间是否存在且未�
 ["err.server.common.thread_archive_window_ordering"]
 other = "子区自动归档窗口不能短于最近会话的子区活跃窗口，否则子区会在活跃窗口生效前就被归档、导致该窗口的配置不起作用。请同时提交这两项，或先调大归档窗口。"
 
-["err.server.file.upload_path_extension_mismatch"]
-other = "上传路径的扩展名与文件名不一致。"
+["err.server.file.extension_list_too_long"]
+other = "扩展名列表原始长度过长，最多 {{.max_bytes}} 字节。"
 
 ["err.server.file.extension_list_too_large"]
 other = "扩展名列表过长，最多 {{.max_entries}} 项，且单项不超过 {{.max_length}} 个字符。"

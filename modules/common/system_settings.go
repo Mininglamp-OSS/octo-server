@@ -1738,7 +1738,7 @@ func (s *SystemSettings) clampIntUpper(key string, v, fallback, hardCap int) int
 	if v > hardCap {
 		dedupKey := fmt.Sprintf("%s=%d>%d", key, v, hardCap)
 		if _, loaded := s.clampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
-			s.Warn("system_setting sticker knob exceeds hard cap; clamped",
+			s.Warn("system_setting knob exceeds hard cap; clamped",
 				zap.String("key", key),
 				zap.Int("configured", v),
 				zap.Int("hard_cap", hardCap))

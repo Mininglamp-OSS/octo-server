@@ -295,6 +295,39 @@ appconfig 新增字段（与既有 `sticker_upload_limits` 并列、同单位）
 `respond{BotAPI,Robot}FileTooLarge` 的签名从 MB 改为 bytes，相应 helper 测试
 改用 1.5MB 这种非整数 MB 的上限钉住精度。
 
+## Review 修复记录（第三轮，2026-08-26）
+
+第二轮 review 的 P1（`ErrFileExtensionListTooLarge` 渲染 `<no value>`）与 6 项
+建议已修复。但**同一个 commit 里我还加了一样没人要的东西，并且它是破坏性的**：
+
+- **`?path=` 与 filename 扩展名一致性校验 —— 已完整回退。**
+  第一轮 review 把这个分歧标为 *"reasonable as a follow-up rather than a
+  blocker"*，我却在修 P1 时一并加了进来，且没有做兼容性分析。两位 reviewer
+  独立复现了后果：它打断了**服务端自己签发**的上传 URL ——
+  `getFilePath` 的 `TypeWorkplaceBanner` / `TypeWorkplaceAppIcon` 分支发出的
+  path 不带扩展名，`TypeMomentCover` 硬编码 `.png`（非 PNG 封面必挂），
+  而 `api.go` 里那段「修复客户端上传路径缺少扩展名的问题」的兼容代码
+  ——针对观察到的真实流量写的——被这道门变成了不可达的死代码。
+  我的两个测试只覆盖了「不一致」与「完全一致」，没覆盖「path 无扩展名」，
+  所以全绿。
+  回退而不是按建议收窄谓词：收窄之后仍是行为收紧，而客户端可能构造出
+  服务端之外的 `?path=` 形态（reviewer 也明确说未 grep 过客户端）。
+  这一项若要做，应当是独立任务，先盘清真实流量形态。
+  新增 `TestUploadFile_AcceptsServerGeneratedPathShapes` 把 getFilePath 签发的
+  五种形态钉死 —— 未来任何收紧 `?path=` 的改动必须先让这张表全绿。
+
+- `FormatSizeLimit` 的一位小数只在能精确表示时才用 MB，否则退回 KB：
+  1100KB 渲染成 "1.1 MB" 会被读成 1153434 字节，与本函数要修的
+  「1536KB 被整除成 1MB」是同一类错误。
+- 原始长度超限改用独立的 `ErrFileExtensionListTooLong`，不再复用条数/字符数的
+  消息去描述一个运维并未触碰的上限。
+- `clampIntUpper` 的 Warn 文案去掉 "sticker" 字样（它现在也服务 `file.max_size_kb`）。
+
+**未采纳的建议**（在 PR 中说明理由）：`policyInputs` 跨三次 getter 读取、
+上传 handler 未 pin 扩展名策略、跨键守卫的 check-then-act —— 三者都是既有形态
+（sticker 同样如此）、窗口极小且自愈，改动涉及结构调整；在一个已经因为「顺手多做」
+出过破坏性变更的 PR 里，不宜再扩大范围。
+
 ## Acceptance
 
 - `go test ./modules/file/... -race -count=1` 通过；策略快照读写并发**无 data race**。
@@ -314,8 +347,11 @@ appconfig 新增字段（与既有 `sticker_upload_limits` 并列、同单位）
   6 个扩展名调用点行为一致。
 - **size 单一真源**：7 个检查点全部读同一快照值；两处本地 `const maxSize` 消除；
   `MaxBytesReader` 上限跟随动态值（含 1MB 余量语义不变）。
-- **size clamp**：`file.max_size_kb` 越界（≤0 或 > 硬上限）时回退 code default，
-  不得原样服务；写侧 `Positive: true` 拒绝非正整数。
+- **size clamp**（2026-08-26 随 review 修订）：`file.max_size_kb` **≤0** 视为未配置、
+  回退 code default；**超过硬上限钳到硬上限**，不是回退默认值 —— 后者会让运维填
+  600000（想要 ~586MB）反而拿到 100MB，比编辑前还小、也比键上写明的 512MB 还小。
+  与 sticker 那组键共用同一个钳位器（`clampIntUpper`），越界 Warn 按 (key, value)
+  去重。写侧 `Positive: true` 拒绝非正整数。
 - **appconfig**：`file_upload_limits` 在 **version 短路分支与全量分支都出现**，
   `allowed_extensions` 为有效值（含 DB/env extra、已扣除 blocked），
   `max_size_kb` 与服务端校验值一致；**不含 blocked 列表**。

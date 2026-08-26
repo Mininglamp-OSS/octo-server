@@ -326,6 +326,9 @@ func TestManagerSystemSetting_RejectsOversizedRawValue(t *testing.T) {
 		{"category":"file","key":"extra_allowed_extensions","value":"`+junk+`"}
 	]}`)
 	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "extension_list_too_large")
+	// 单独的 code：超的是原始长度，不是条数/单项字符数。
+	assert.Contains(t, w.Body.String(), "extension_list_too_long")
 	assert.NotContains(t, w.Body.String(), "<no value>")
+	assert.Contains(t, w.Body.String(), strconv.Itoa(fileExtensionListMaxBytes),
+		"消息里要给出字节上限")
 }

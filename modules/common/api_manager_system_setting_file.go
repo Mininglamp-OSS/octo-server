@@ -70,11 +70,16 @@ func (m *Manager) rejectInvalidFileSettingWrites(c *wkhttp.Context, plans []prep
 // 长度决定，不由解析后的条数决定。
 func (m *Manager) rejectOversizedExtensionList(c *wkhttp.Context, p preparedSetting) bool {
 	if len(p.value) > fileExtensionListMaxBytes {
-		return m.respondExtensionListTooLarge(c, i18n.Details{
-			"max_entries": strconv.Itoa(fileExtensionListMaxEntries),
-			"max_bytes":   strconv.Itoa(fileExtensionListMaxBytes),
-			"got_bytes":   strconv.Itoa(len(p.value)),
+		// 单独的 code：说清楚超的是**原始长度**，而不是条数或单项字符数 ——
+		// 一个 5000 字节里放 20 个合法项的载荷，用共享消息会被告知一组它并未
+		// 触碰的上限。
+		httperr.ResponseErrorL(c, errcode.ErrFileExtensionListTooLong, i18n.Params{
+			"max_bytes": strconv.Itoa(fileExtensionListMaxBytes),
+		}, i18n.Details{
+			"max_bytes": strconv.Itoa(fileExtensionListMaxBytes),
+			"got_bytes": strconv.Itoa(len(p.value)),
 		})
+		return true
 	}
 	exts := ParseFileExtensionCSV(p.value)
 	if len(exts) > fileExtensionListMaxEntries {

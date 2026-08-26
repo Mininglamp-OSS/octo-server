@@ -174,22 +174,3 @@ func TestBotUploadFile_RejectsOversizeByDynamicCap(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code, fmt.Sprintf("超过 1KB 上限必须被拒：%s", w.Body.String()))
 	assert.Zero(t, mockFS.uploadCalls)
 }
-
-// ?path= 与 filename 的扩展名必须一致：校验的是 filename，落库的是 path，
-// 两者不一致时 `?path=/x.svg` 配 `x.png` 就能在 .svg 被封堵后仍写出 .svg 对象。
-func TestBotUploadFile_RejectsPathExtensionMismatch(t *testing.T) {
-	withUploadPolicy(t, stubPolicySettings{maxKB: 102400})
-
-	w, mockFS := runBotUploadWithPath(t, "photo.png", "/evil.svg")
-	assert.NotEqual(t, http.StatusOK, w.Code, "path 与 filename 扩展名不一致必须被拒：%s", w.Body.String())
-	assert.Zero(t, mockFS.uploadCalls, "不一致的上传绝不能写进对象存储")
-}
-
-// 一致时照常放行（大小写不敏感）。
-func TestBotUploadFile_AllowsMatchingPathExtension(t *testing.T) {
-	withUploadPolicy(t, stubPolicySettings{maxKB: 102400})
-
-	w, mockFS := runBotUploadWithPath(t, "photo.png", "/dir/photo.PNG")
-	assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, 1, mockFS.uploadCalls)
-}
