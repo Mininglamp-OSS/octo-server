@@ -65,8 +65,35 @@ func CheckMembershipForCleanup(session *dbr.Session, spaceID string, uid string)
 	return count > 0, nil
 }
 
-// HaveCommonSpace checks if uid1 and uid2 share at least one active Space membership.
-// Used to prevent cross-Space existence probing in user search.
+// ResolveActiveMemberSpaceName verifies uid is an active member of the given
+// active Space (space.status=1 AND space_member.status=1) and, when so, returns
+// that Space's name. ok=false means uid is NOT an active member of that Space
+// (or the Space is inactive) — callers MUST treat that as "no authoritative
+// operator Space" and never fall back to a default/card/document Space. A DB
+// error is returned as-is with ok=false. name may be empty for a valid Space
+// with no name set; ok=true still distinguishes that from a non-member.
+func ResolveActiveMemberSpaceName(session *dbr.Session, spaceID string, uid string) (string, bool, error) {
+	if spaceID == "" || uid == "" {
+		return "", false, nil
+	}
+	var name string
+	rows, err := session.SelectBySql(
+		"SELECT s.name FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.uid = ? AND sm.space_id = ? AND sm.status = 1 LIMIT 1",
+		uid, spaceID,
+	).Load(&name)
+	if err != nil {
+		return "", false, err
+	}
+	if rows == 0 {
+		return "", false, nil
+	}
+	return name, true, nil
+}
+
+// HaveCommonSpace reports whether uid1 and uid2 share at least one active Space
+// membership. It is used to prevent cross-Space existence probing in user search.
 func HaveCommonSpace(session *dbr.Session, uid1, uid2 string) (bool, error) {
 	if uid1 == "" || uid2 == "" {
 		return false, nil

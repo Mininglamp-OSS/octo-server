@@ -120,6 +120,83 @@ func TestDocsActionFinalizerUsesV3RegistryResultForTerminalStates(t *testing.T) 
 	_ = carddispatch.CardMutationResult{}
 }
 
+func TestDocsActionFinalizerAuthoritativeDeciderWithoutTimeDoesNotUseRequestTime(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+	updater := &captureViewUpdater{}
+	finalizer := &DocsActionFinalizer{ctx: ctx, updater: updater}
+	event := cardactiondispatch.Event{
+		EventID: 42, SenderUID: NotifyBotUIDValue, MessageID: "1001", ChannelID: NotifyBotUIDValue,
+		ChannelType: 1, SpaceID: "card-space-a",
+		Data: map[string]any{
+			"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
+			"message_time_display": "REQUEST-TIME-MUST-NOT-BECOME-DECISION-TIME",
+		},
+	}
+	result := cardactiondispatch.DecisionResult{
+		State: cardactiondispatch.StateApproved, DeciderUID: "authoritative-decider",
+		Display: map[string]string{"operator_name": "Reviewer"},
+	}
+
+	if err := finalizer.replaceWithRegistryResult(context.Background(), event, result,
+		NotifyBotUIDValue, "en", "Roadmap", ""); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(updater.fields, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := fields["messageTimeDisplay"]; found {
+		t.Fatalf("authoritative result retained request-time fallback: %+v", fields)
+	}
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.Freeze()
+	rendered, err := registry.Render(context.Background(), updater.id, updater.version, updater.state, updater.fields, updater.env)
+	if err != nil {
+		t.Fatalf("render terminal fields: %v", err)
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "REQUEST-TIME-MUST-NOT-BECOME-DECISION-TIME") {
+		t.Fatalf("terminal card rendered request time as decision time: %s", raw)
+	}
+}
+
+func TestDocsActionFinalizerLegacyResultKeepsRequestTimeFallback(t *testing.T) {
+	input := docsResultRenderInput{
+		Data: map[string]any{
+			"doc_id": "doc-1", "request_id": "request-1", "doc_title": "Roadmap", "actor": "Alice",
+			"message_time_display": "LEGACY-REQUEST-TIME",
+		},
+		Title: "Roadmap", OperatorName: "Reviewer",
+	}
+	fields, state, err := buildDocsAccessResultFields("en", docsaccessrequest.TemplateVersionV3, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.Freeze()
+	rendered, err := registry.Render(context.Background(), docsaccessrequest.TemplateID,
+		docsaccessrequest.TemplateVersionV3, state, fields,
+		cardtmpl.BuildEnv{Lang: "en", SpaceID: "space-1", WebLoginURL: "https://im.example.com/login"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "LEGACY-REQUEST-TIME") {
+		t.Fatalf("legacy result lost request-time compatibility fallback: %s", raw)
+	}
+}
+
 func TestDocsActionFinalizerUsesConsumerResolvedOperatorDisplay(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
