@@ -42,6 +42,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -245,6 +246,14 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 	cardSpaceID, cardSpaceKnown := m.resolveCardOriginSpaceID(msgM)
+	// The operator's TRUSTED current Space is the SpaceMiddleware-validated
+	// context value (the /v1/message group mounts SpaceMiddleware, which pins the
+	// membership-checked space_id via SetSpaceID). It is captured SEPARATELY from
+	// cardSpaceID (the card's authoritative origin Space) and never relabels it:
+	// the two differ when the operator acts, via X-Space-ID: B, on a card whose
+	// origin is Space A. Read only the server-set context key here — never request
+	// JSON or a raw unvalidated header. Empty when the click declared no Space.
+	operatorSpaceID := spacepkg.GetSpaceID(c)
 	// PR-C D3：principal 从生效帧的 stored provenance 恢复并校验（sender/
 	// producer 绑定/Space 一致性都在 resolveRegistryCardContext 内 fail-close）；
 	// 无标记的 legacy 帧沿用 sender 派生的 bot principal（static 兼容）。
@@ -319,13 +328,17 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		ChannelID:   eventChannelID,
 		ChannelType: req.ChannelType,
 		SpaceID:     stringEventField(eventData, "space_id"),
-		ActionID:    req.ActionID,
-		OperatorUID: loginUID,
-		ClientToken: req.ClientToken,
-		ActedAt:     eventData["acted_at"].(int64),
-		Inputs:      req.Inputs,
-		Data:        actionData,
-		Card:        cardContext,
+		// OperatorSpaceID is the operator's trusted current Space, kept distinct
+		// from SpaceID (card origin). It never enters the conditional event_data
+		// space_id key above — that one is the card's authoritative origin Space.
+		OperatorSpaceID: operatorSpaceID,
+		ActionID:        req.ActionID,
+		OperatorUID:     loginUID,
+		ClientToken:     req.ClientToken,
+		ActedAt:         eventData["acted_at"].(int64),
+		Inputs:          req.Inputs,
+		Data:            actionData,
+		Card:            cardContext,
 	})
 	if err != nil {
 		m.releaseCardClaim(idemKey)

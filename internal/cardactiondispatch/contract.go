@@ -32,21 +32,28 @@ const (
 )
 
 type Event struct {
-	EventID     int64                  `json:"event_id"`
-	SenderUID   string                 `json:"sender_uid"`
-	Owner       string                 `json:"owner"`
-	ActionType  string                 `json:"action_type"`
-	MessageID   string                 `json:"message_id"`
-	ChannelID   string                 `json:"channel_id"`
-	ChannelType uint8                  `json:"channel_type"`
-	SpaceID     string                 `json:"space_id,omitempty"`
-	ActionID    string                 `json:"action_id"`
-	OperatorUID string                 `json:"operator_uid"`
-	ClientToken string                 `json:"client_token,omitempty"`
-	ActedAt     int64                  `json:"acted_at"`
-	Inputs      map[string]interface{} `json:"inputs"`
-	Data        map[string]interface{} `json:"data,omitempty"`
-	Card        CardContext            `json:"card,omitempty"`
+	EventID     int64  `json:"event_id"`
+	SenderUID   string `json:"sender_uid"`
+	Owner       string `json:"owner"`
+	ActionType  string `json:"action_type"`
+	MessageID   string `json:"message_id"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	SpaceID     string `json:"space_id,omitempty"`
+	ActionID    string `json:"action_id"`
+	OperatorUID string `json:"operator_uid"`
+	// OperatorSpaceID is the operator's TRUSTED current Space at click time —
+	// the value SpaceMiddleware validated and pinned in the request context. It
+	// is captured separately from SpaceID (the card/document authoritative origin
+	// Space) and never relabels it: the two answer different questions and can
+	// differ when the operator acts on a card that originates in another of their
+	// Spaces. Empty when the click carried no server-verified Space.
+	OperatorSpaceID string                 `json:"operator_space_id,omitempty"`
+	ClientToken     string                 `json:"client_token,omitempty"`
+	ActedAt         int64                  `json:"acted_at"`
+	Inputs          map[string]interface{} `json:"inputs"`
+	Data            map[string]interface{} `json:"data,omitempty"`
+	Card            CardContext            `json:"card,omitempty"`
 }
 
 // CardContext is derived from the effective server-authored card frame before
@@ -86,15 +93,46 @@ type DecisionRequest struct {
 	ChannelID   string                 `json:"channel_id"`
 	ChannelType uint8                  `json:"channel_type"`
 	SpaceID     string                 `json:"space_id,omitempty"`
-	ActedAt     int64                  `json:"acted_at"`
-	event       *Event
+	// OperatorSpaceID carries the operator's trusted current Space to the
+	// decision consumer alongside SpaceID (the card's origin Space), so the
+	// consumer can attribute the click without conflating the two.
+	OperatorSpaceID string `json:"operator_space_id,omitempty"`
+	ActedAt         int64  `json:"acted_at"`
+	event           *Event
 }
 
 type DecisionResult struct {
-	Disposition  Disposition       `json:"disposition"`
-	State        State             `json:"state"`
-	RequesterUID string            `json:"requester_uid,omitempty"`
-	Display      map[string]string `json:"display,omitempty"`
+	Disposition  Disposition `json:"disposition"`
+	State        State       `json:"state"`
+	RequesterUID string      `json:"requester_uid,omitempty"`
+	// Authoritative decider identity. Docs is the source of truth for WHO
+	// decided; for a duplicate/concurrent click that is the FIRST decider, not
+	// the current clicker, so these win over the clicker for display. octo-server
+	// resolves the decider's display name and operator Space name from these ids
+	// internally (user service + active-membership check) — a caller never sends
+	// display copy that overrides them. DecidedAt is the authoritative decision
+	// timestamp/label produced by Docs.
+	DeciderUID     string            `json:"decider_uid,omitempty"`
+	DeciderSpaceID string            `json:"decider_space_id,omitempty"`
+	DecidedAt      int64             `json:"decided_at,omitempty"`
+	Display        map[string]string `json:"display,omitempty"`
+}
+
+// ValidateAuthoritativeDeciderIDs validates the optional identity pair returned
+// by a decision consumer. IDs use byte-length bounds, matching Go's len(string)
+// semantics elsewhere in this wire contract. Empty values are allowed for
+// rolling compatibility, but a Space cannot be attributed without a decider.
+func ValidateAuthoritativeDeciderIDs(deciderUID, deciderSpaceID string) error {
+	if len(deciderUID) > 128 || strings.TrimSpace(deciderUID) != deciderUID {
+		return errors.New("cardactiondispatch: invalid decider_uid")
+	}
+	if len(deciderSpaceID) > 128 || strings.TrimSpace(deciderSpaceID) != deciderSpaceID {
+		return errors.New("cardactiondispatch: invalid decider_space_id")
+	}
+	if deciderSpaceID != "" && deciderUID == "" {
+		return errors.New("cardactiondispatch: decider_space_id requires decider_uid")
+	}
+	return nil
 }
 
 func DecisionRequestFromEvent(event Event) DecisionRequest {
@@ -103,19 +141,20 @@ func DecisionRequestFromEvent(event Event) DecisionRequest {
 		inputs = map[string]interface{}{}
 	}
 	request := DecisionRequest{
-		EventID:     event.EventID,
-		ActionID:    event.ActionID,
-		Decision:    stringField(event.Data, "decision"),
-		OperatorUID: event.OperatorUID,
-		DocID:       stringField(event.Data, "doc_id"),
-		RequestID:   stringField(event.Data, "request_id"),
-		Inputs:      inputs,
-		Data:        event.Data,
-		MessageID:   event.MessageID,
-		ChannelID:   event.ChannelID,
-		ChannelType: event.ChannelType,
-		SpaceID:     event.SpaceID,
-		ActedAt:     event.ActedAt,
+		EventID:         event.EventID,
+		ActionID:        event.ActionID,
+		Decision:        stringField(event.Data, "decision"),
+		OperatorUID:     event.OperatorUID,
+		DocID:           stringField(event.Data, "doc_id"),
+		RequestID:       stringField(event.Data, "request_id"),
+		Inputs:          inputs,
+		Data:            event.Data,
+		MessageID:       event.MessageID,
+		ChannelID:       event.ChannelID,
+		ChannelType:     event.ChannelType,
+		SpaceID:         event.SpaceID,
+		OperatorSpaceID: event.OperatorSpaceID,
+		ActedAt:         event.ActedAt,
 	}
 	request.event = &event
 	return request
@@ -146,7 +185,8 @@ type callbackCard struct {
 }
 
 type callbackActor struct {
-	UID string `json:"uid"`
+	UID     string `json:"uid"`
+	SpaceID string `json:"space_id,omitempty"`
 }
 
 // MarshalCallbackRequest encodes either the frozen flat request or the
@@ -176,7 +216,7 @@ func MarshalCallbackRequest(event Event, format CallbackFormat) ([]byte, error) 
 			TemplateID: event.Card.TemplateID, TemplateVersion: event.Card.TemplateVersion, View: event.Card.View,
 			MessageID: event.MessageID, ChannelID: event.ChannelID, ChannelType: event.ChannelType,
 		},
-		Actor:     callbackActor{UID: event.OperatorUID},
+		Actor:     callbackActor{UID: event.OperatorUID, SpaceID: event.OperatorSpaceID},
 		TriggerID: fmt.Sprintf("%d", event.EventID),
 	})
 }
@@ -227,6 +267,15 @@ func DecodeDecisionResult(reader io.Reader) (DecisionResult, error) {
 	}
 	if (result.State == StateApproved || result.State == StateDenied) && result.RequesterUID == "" {
 		return DecisionResult{}, errors.New("cardactiondispatch: terminal decision requires requester_uid")
+	}
+	// Authoritative decider identity is optional (legacy callbacks omit it) but,
+	// when present, is typed and bounded: it feeds an internal user/Space lookup,
+	// never raw display. decider_space_id without decider_uid is meaningless.
+	if err := ValidateAuthoritativeDeciderIDs(result.DeciderUID, result.DeciderSpaceID); err != nil {
+		return DecisionResult{}, err
+	}
+	if result.DecidedAt < 0 {
+		return DecisionResult{}, errors.New("cardactiondispatch: invalid decided_at")
 	}
 	if len(result.Display) > 32 {
 		return DecisionResult{}, errors.New("cardactiondispatch: too many display fields")

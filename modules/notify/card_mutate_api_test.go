@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
@@ -14,6 +15,31 @@ func TestDocsCardMutateSeqKeyCompatibility(t *testing.T) {
 	const want = "messageExtra:docs-card-mutate"
 	if docsCardMutateSeqKey != want {
 		t.Fatalf("docsCardMutateSeqKey=%q want persisted compatibility key %q", docsCardMutateSeqKey, want)
+	}
+}
+
+func TestValidateCardMutateReqAuthoritativeDeciderIDs(t *testing.T) {
+	valid := CardMutateReq{
+		SpaceID: "delivery-space", ChannelID: "reviewer", MessageID: "1",
+		Kind: DocsCardKindAccessGranted, DocID: "doc", DeciderUID: "decider",
+		DeciderSpaceID: "operator-space",
+	}
+	if err := validateCardMutateReq(valid); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	invalid := map[string]CardMutateReq{
+		"untrimmed uid":       func() CardMutateReq { r := valid; r.DeciderUID = " decider"; return r }(),
+		"oversized uid":       func() CardMutateReq { r := valid; r.DeciderUID = strings.Repeat("x", 129); return r }(),
+		"untrimmed space":     func() CardMutateReq { r := valid; r.DeciderSpaceID = "space "; return r }(),
+		"oversized space":     func() CardMutateReq { r := valid; r.DeciderSpaceID = strings.Repeat("s", 129); return r }(),
+		"space without actor": func() CardMutateReq { r := valid; r.DeciderUID = ""; return r }(),
+	}
+	for name, req := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if err := validateCardMutateReq(req); err == nil {
+				t.Fatal("invalid request accepted")
+			}
+		})
 	}
 }
 
@@ -215,6 +241,51 @@ func TestReplaceSiblingWithRegistryResultRejectsCallerIdentityMismatch(t *testin
 				t.Fatal("replaceSiblingWithRegistryResult error = nil")
 			}
 		})
+	}
+}
+
+func TestReplaceSiblingAuthoritativeDeciderWithoutTimeDoesNotUseRequestTime(t *testing.T) {
+	updater := &captureViewUpdater{}
+	snapshot := carddispatch.CardMutationSnapshot{Envelope: json.RawMessage(`{
+		"type":17,
+		"profile":"octo/v2",
+		"space_id":"space-1",
+		"card":{"metadata":{"octo":{"variant":"docs.access_requested"}},"actions":[{
+			"type":"Action.Submit","id":"docs-access-approve",
+			"data":{"doc_id":"doc-1","request_id":"request-1","doc_title":"Roadmap","actor":"Alice",
+				"message_time_display":"REQUEST-TIME-MUST-NOT-BECOME-DECISION-TIME"}
+		}]}
+	}`)}
+	req := CardMutateReq{
+		SpaceID: "space-1", ChannelID: "reviewer-b", ChannelType: 1,
+		MessageID: "1002", Kind: DocsCardKindAccessGranted, DocID: "doc-1",
+		DeciderUID: "authoritative-decider", OperatorName: "Reviewer",
+	}
+
+	if err := replaceSiblingWithRegistryResult(context.Background(), updater, req, snapshot, 100,
+		cardtmpl.BuildEnv{WebLoginURL: "https://im.example.com/login", Lang: "en", SpaceID: "space-1"}); err != nil {
+		t.Fatalf("replaceSiblingWithRegistryResult: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(updater.fields, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := fields["messageTimeDisplay"]; found {
+		t.Fatalf("authoritative sibling retained request-time fallback: %+v", fields)
+	}
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.Freeze()
+	rendered, err := registry.Render(context.Background(), updater.id, updater.version, updater.state, updater.fields, updater.env)
+	if err != nil {
+		t.Fatalf("render terminal fields: %v", err)
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "REQUEST-TIME-MUST-NOT-BECOME-DECISION-TIME") {
+		t.Fatalf("sibling terminal card rendered request time as decision time: %s", raw)
 	}
 }
 
