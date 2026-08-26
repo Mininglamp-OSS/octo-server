@@ -354,6 +354,18 @@ other = "Invalid space welcome configuration."
 ["err.server.common.thread_archive_window_ordering"]
 other = "Thread auto-archive window must not be shorter than the recent-tab thread window."
 
+["err.server.featuregate.not_found"]
+other = "The feature gate scope does not exist."
+
+["err.server.featuregate.operation_failed"]
+other = "The operation failed. Please try again later."
+
+["err.server.featuregate.query_failed"]
+other = "Failed to query feature gate."
+
+["err.server.featuregate.request_invalid"]
+other = "Invalid request."
+
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
 
