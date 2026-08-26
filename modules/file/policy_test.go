@@ -233,10 +233,15 @@ func TestPolicy_MaxUploadSizeFromSettings(t *testing.T) {
 
 // 未挂 settings 的路径不经过 common 侧 clamp，这里再挡一次。
 func TestPolicy_MaxUploadSizeRejectsOutOfRange(t *testing.T) {
-	for _, bad := range []int{0, -1, common.FileMaxSizeKBHardCap + 1} {
+	// ≤0 视为未配置 → 默认值。
+	for _, bad := range []int{0, -1} {
 		useSettings(t, fakePolicySettings{maxKB: bad})
 		assert.Equal(t, MaxFileSize, MaxUploadSize(), "maxKB=%d 应回退默认值", bad)
 	}
+	// 超硬上限 → 钳到硬上限，与 common 侧钳位器同语义（回落默认值会让运维
+	// 填一个过大的值反而拿到比编辑前更小的上限）。
+	useSettings(t, fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap + 1})
+	assert.Equal(t, int64(common.FileMaxSizeKBHardCap)*1024, MaxUploadSize())
 }
 
 func TestPolicy_EffectiveAllowedExtensionsIsSortedAndExcludesBlocked(t *testing.T) {
@@ -522,4 +527,19 @@ func TestPolicy_NonIntegralMBCapIsReportedExactly(t *testing.T) {
 	assert.Equal(t, "1.5 MB", FormatSizeLimit(MaxUploadSize()))
 	kb, _ := SizeLimitDetails(MaxUploadSize())
 	assert.EqualValues(t, 1536, kb)
+}
+
+// 快照复用比较的必须是**派生输入的原样**，不是钳位后的值。
+//
+// 若 inMaxKB 存钳位结果，一个越界配置会让 matches() 永远不命中，两张七十余项
+// 的 map 就会在每个上传请求和每个 appconfig 请求上重建一次。今天两条输入路径
+// 都已预先钳位、走不到这里，但那是调用方的性质而非 derivePolicy 的保证。
+func TestPolicy_SnapshotReusedEvenWhenInputOutOfRange(t *testing.T) {
+	resetPolicyForTest(t)
+	SetPolicySettings(fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap + 5000})
+	cached.Store(nil)
+
+	first := currentPolicy()
+	assert.Equal(t, int64(common.FileMaxSizeKBHardCap)*1024, first.maxSize, "生效值仍应钳到硬上限")
+	assert.Same(t, first, currentPolicy(), "越界输入不应导致每次调用都重建快照")
 }

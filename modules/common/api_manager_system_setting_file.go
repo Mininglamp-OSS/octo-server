@@ -2,6 +2,7 @@ package common
 
 import (
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -31,6 +32,10 @@ const (
 	// 放开/封堵」需求远小于此；最长的常见扩展名（.appimage）9 个字符。
 	fileExtensionListMaxEntries = 64
 	fileExtensionMaxLength      = 32
+	// fileExtensionListMaxBytes 约束**原始** CSV 长度。条数与单项长度只看解析
+	// 后的结果，而入库和每次重新 split 的是原始串。64 项 × 32 字符 + 分隔符
+	// 有充裕余量。
+	fileExtensionListMaxBytes = 4096
 )
 
 // rejectInvalidFileSettingWrites 校验本批次里所有 file.* 键的写入。
@@ -56,26 +61,55 @@ func (m *Manager) rejectInvalidFileSettingWrites(c *wkhttp.Context, plans []prep
 	return m.rejectInconsistentSizeOrdering(c, plans)
 }
 
-// rejectOversizedExtensionList 挡住条数/单项长度超限的 CSV。
+// rejectOversizedExtensionList 挡住原始长度 / 条数 / 单项长度超限的 CSV。
+//
+// 三个界缺一不可：条数与单项长度约束解析后的结果，而**原始字符串长度**约束真正
+// 落进 TEXT 列、并在每次快照读时被重新 split 的东西 —— ParseFileExtensionCSV
+// 会静默丢弃非法 token，所以几万个畸形 token 解析出 0 项、能过条数检查，
+// 而 p.value 原样入库。上限声称要防的正是列大小与每请求解析开销，那由原始
+// 长度决定，不由解析后的条数决定。
 func (m *Manager) rejectOversizedExtensionList(c *wkhttp.Context, p preparedSetting) bool {
+	if len(p.value) > fileExtensionListMaxBytes {
+		return m.respondExtensionListTooLarge(c, i18n.Details{
+			"max_entries": strconv.Itoa(fileExtensionListMaxEntries),
+			"max_bytes":   strconv.Itoa(fileExtensionListMaxBytes),
+			"got_bytes":   strconv.Itoa(len(p.value)),
+		})
+	}
 	exts := ParseFileExtensionCSV(p.value)
 	if len(exts) > fileExtensionListMaxEntries {
-		httperr.ResponseErrorL(c, errcode.ErrFileExtensionListTooLarge, nil, i18n.Details{
+		return m.respondExtensionListTooLarge(c, i18n.Details{
 			"max_entries": strconv.Itoa(fileExtensionListMaxEntries),
 			"got":         strconv.Itoa(len(exts)),
 		})
-		return true
 	}
 	for _, ext := range exts {
-		if len(ext) > fileExtensionMaxLength {
-			httperr.ResponseErrorL(c, errcode.ErrFileExtensionListTooLarge, nil, i18n.Details{
+		if utf8.RuneCountInString(ext) > fileExtensionMaxLength {
+			return m.respondExtensionListTooLarge(c, i18n.Details{
 				"max_entries": strconv.Itoa(fileExtensionListMaxEntries),
-				"extension":   ext[:fileExtensionMaxLength],
+				// 按 rune 截断：NormalizeFileExtension 允许非 ASCII（只挡控制字符、
+				// 空白、路径分隔符与连续点），按字节切会切碎多字节字符，
+				// 让 detail 里出现非法 UTF-8。
+				"extension": string([]rune(ext)[:fileExtensionMaxLength]),
 			})
-			return true
 		}
 	}
 	return false
+}
+
+// respondExtensionListTooLarge 统一回应超限。
+//
+// 两个上限既走 **params**（消息模板要插值）又走 **details**（客户端要结构化值）。
+// params 与 details 不互通：httperr 把它们放进 ErrorSpec 的不同字段，只有
+// params 会喂给 go-i18n 当 TemplateData。只给 details 的话，模板里的
+// {{.max_entries}} 会被 text/template 解析成零值并渲染成 "<no value>" —— 运维
+// 看到的是一条断串。见 TestManagerSystemSetting_ExtensionListErrorRendersLimits。
+func (m *Manager) respondExtensionListTooLarge(c *wkhttp.Context, details i18n.Details) bool {
+	httperr.ResponseErrorL(c, errcode.ErrFileExtensionListTooLarge, i18n.Params{
+		"max_entries": strconv.Itoa(fileExtensionListMaxEntries),
+		"max_length":  strconv.Itoa(fileExtensionMaxLength),
+	}, details)
+	return true
 }
 
 // rejectBuiltinBlocked 挡住「把内置黑名单项写进 extra_allowed」。

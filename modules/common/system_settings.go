@@ -117,11 +117,14 @@ type SystemSettings struct {
 	managerMFAProbeGeneration uint64
 	managerMFAProbeInFlight   atomic.Bool
 	reloadTTL                 time.Duration
-	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
+	// clampWarned 去重 clamp getter 的越界 Warn(review R6)。这些 getter 坐在读热
+	// 路径上（file.max_size_kb 每次 currentPolicy() 都读，包括每个未认证的
+	// appconfig 请求），不去重的话一个配错的键就能让匿名调用者按请求数刷日志。
+	// key 形如
 	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
 	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
 	// 刷屏,同时保留 operator 可观测性。
-	stickerClampWarned sync.Map
+	clampWarned sync.Map
 	log.Log
 }
 
@@ -1716,24 +1719,25 @@ const (
 // 若 modules/file 侧改动允许扩展名，此列表也需同步。
 var stickerUploadRasterAllowlist = []string{".gif", ".png", ".jpg", ".jpeg", ".webp"}
 
-// stickerClampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
+// clampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
 // non-numeric (which surface as fallback default from getInt) is served as
 // default; values above hardCap are clamped to hardCap; everything else is
 // returned verbatim. Shared by every KB/px/ms/count sticker upload setting so
 // the clamp policy is single-sourced.
 //
+// clampIntUpper 是所有「有服务端硬上限」的 int getter 的共用读侧钳位。
 // key is the fully qualified setting name (e.g. "sticker.upload_max_size_kb");
 // when v exceeds hardCap this method emits a per-(key, v) one-shot Warn so a
 // bad admin edit is operator-observable without spamming the read hot path
 // (review R6). Admin fixes → new越界 value or in-range value → new Warn or
 // silence, matching human-friendly signal semantics.
-func (s *SystemSettings) stickerClampIntUpper(key string, v, fallback, hardCap int) int {
+func (s *SystemSettings) clampIntUpper(key string, v, fallback, hardCap int) int {
 	if v <= 0 {
 		return fallback
 	}
 	if v > hardCap {
 		dedupKey := fmt.Sprintf("%s=%d>%d", key, v, hardCap)
-		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
+		if _, loaded := s.clampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
 			s.Warn("system_setting sticker knob exceeds hard cap; clamped",
 				zap.String("key", key),
 				zap.Int("configured", v),
@@ -1748,7 +1752,7 @@ func (s *SystemSettings) stickerClampIntUpper(key string, v, fallback, hardCap i
 // clamped to [1, stickerUploadMaxSizeKBHardCap]; out-of-range falls back to
 // the historical 1024 KB default.
 func (s *SystemSettings) StickerUploadMaxSizeKB() int {
-	return s.stickerClampIntUpper("sticker.upload_max_size_kb",
+	return s.clampIntUpper("sticker.upload_max_size_kb",
 		s.getInt("sticker", "upload_max_size_kb", defaultStickerUploadMaxSizeKB),
 		defaultStickerUploadMaxSizeKB,
 		stickerUploadMaxSizeKBHardCap,
@@ -1759,7 +1763,7 @@ func (s *SystemSettings) StickerUploadMaxSizeKB() int {
 // clamped to [1, stickerUploadMaxDimensionHardCap]; out-of-range falls back to
 // the historical 512-px default.
 func (s *SystemSettings) StickerUploadMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.upload_max_dimension",
+	return s.clampIntUpper("sticker.upload_max_dimension",
 		s.getInt("sticker", "upload_max_dimension", defaultStickerUploadMaxDimension),
 		defaultStickerUploadMaxDimension,
 		stickerUploadMaxDimensionHardCap,
@@ -1824,7 +1828,7 @@ func (s *SystemSettings) StickerCompressEnabled() bool {
 // Read-side clamped to [1, stickerCompressTargetKBHardCap]; out-of-range falls
 // back to the 1024 KB default.
 func (s *SystemSettings) StickerCompressTargetKB() int {
-	return s.stickerClampIntUpper("sticker.compress_target_kb",
+	return s.clampIntUpper("sticker.compress_target_kb",
 		s.getInt("sticker", "compress_target_kb", defaultStickerCompressTargetKB),
 		defaultStickerCompressTargetKB,
 		stickerCompressTargetKBHardCap,
@@ -1835,7 +1839,7 @@ func (s *SystemSettings) StickerCompressTargetKB() int {
 // sticker compressions. Read-side clamped to [1, stickerCompressMaxConcurrencyHardCap];
 // out-of-range falls back to 4.
 func (s *SystemSettings) StickerCompressMaxConcurrency() int {
-	return s.stickerClampIntUpper("sticker.compress_max_concurrency",
+	return s.clampIntUpper("sticker.compress_max_concurrency",
 		s.getInt("sticker", "compress_max_concurrency", defaultStickerCompressMaxConcurrency),
 		defaultStickerCompressMaxConcurrency,
 		stickerCompressMaxConcurrencyHardCap,
@@ -1846,7 +1850,7 @@ func (s *SystemSettings) StickerCompressMaxConcurrency() int {
 // Read-side clamped to [1, stickerCompressTimeoutMsHardCap]; out-of-range falls
 // back to 2000ms.
 func (s *SystemSettings) StickerCompressTimeoutMs() int {
-	return s.stickerClampIntUpper("sticker.compress_timeout_ms",
+	return s.clampIntUpper("sticker.compress_timeout_ms",
 		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
 		defaultStickerCompressTimeoutMs,
 		stickerCompressTimeoutMsHardCap,
@@ -1867,7 +1871,7 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 // effectiveGateDim) and this value only decides how far they are shrunk before
 // store.
 func (s *SystemSettings) StickerCompressMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.compress_max_dimension",
+	return s.clampIntUpper("sticker.compress_max_dimension",
 		s.getInt("sticker", "compress_max_dimension", defaultStickerCompressMaxDimension),
 		defaultStickerCompressMaxDimension,
 		stickerUploadMaxDimensionHardCap,

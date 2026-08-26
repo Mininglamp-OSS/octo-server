@@ -86,6 +86,15 @@ func (ba *BotAPI) botUploadFile(c *wkhttp.Context) {
 		return
 	}
 
+	// 校验的是 filename 的扩展名，落库的却是调用方给的 ?path= —— 两者不一致时
+	// `?path=/x.svg` 配上 `x.png` 的 filename 就能在 .svg 被封堵后仍写出一个
+	// .svg 对象，正是这个门要挡的场景。要求两者一致（path 为空时用生成的
+	// key，天然一致）。同 sticker 分支既有的 pathExt == ext 校验。
+	if uploadPath != "" && !strings.EqualFold(filepath.Ext(uploadPath), uploadExt) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTypeUnsupported, nil, nil)
+		return
+	}
+
 	filePath := uploadPath
 	if filePath == "" {
 		filePath = fmt.Sprintf("/%d/%s%s", time.Now().Unix(), util.GenerUUID(), filepath.Ext(fileName))

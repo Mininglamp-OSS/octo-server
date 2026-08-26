@@ -361,7 +361,10 @@ other = "Invalid space welcome configuration."
 other = "Thread auto-archive window must not be shorter than the recent-tab thread window."
 
 ["err.server.file.extension_list_too_large"]
-other = "The extension list is too large (max {{.max_entries}} entries)."
+other = "The extension list is too large (max {{.max_entries}} entries, {{.max_length}} chars each)."
+
+["err.server.file.upload_path_extension_mismatch"]
+other = "The upload path extension does not match the file name."
 
 ["err.server.file.upload_too_large"]
 other = "The file exceeds the maximum allowed size of {{.max_size}}."

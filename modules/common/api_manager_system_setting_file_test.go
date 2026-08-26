@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -287,4 +288,44 @@ func TestManagerSystemSetting_AcceptsListWithinBounds(t *testing.T) {
 		{"category":"file","key":"extra_allowed_extensions","value":"`+strings.Join(many, ",")+`"}
 	]}`)
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+// P1 回归：错误消息必须渲染出真实上限，而不是 "<no value>"。
+//
+// 之前两个上限只走 details、params 传 nil，而消息模板吃的是 params ——
+// go-i18n 拿到 nil TemplateData，text/template 把 {{.max_entries}} 解析成零值
+// 并渲染成 "<no value>"，运维看到一条断串。原来的用例只断言了错误码
+// （"extension_list_too_large"），所以全绿。断错误码不等于断用户看到的东西。
+func TestManagerSystemSetting_ExtensionListErrorRendersLimits(t *testing.T) {
+	route, _ := newSuperAdminServer(t)
+
+	many := make([]string, 100)
+	for i := range many {
+		many[i] = fmt.Sprintf("ext%d", i)
+	}
+	w := postSystemSetting(t, route, `{"items":[
+		{"category":"file","key":"extra_allowed_extensions","value":"`+strings.Join(many, ",")+`"}
+	]}`)
+	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
+
+	body := w.Body.String()
+	assert.NotContains(t, body, "<no value>", "模板变量必须经 params 渲染：%s", body)
+	assert.NotContains(t, body, "{{.", "不得把模板原样漏给用户：%s", body)
+	assert.Contains(t, body, strconv.Itoa(fileExtensionListMaxEntries), "消息里要给出条数上限")
+	assert.Contains(t, body, strconv.Itoa(fileExtensionMaxLength), "消息里要给出单项长度上限")
+}
+
+// 原始串超长必须被拒 —— 条数与单项长度只看解析后的结果，而入库并被反复 split
+// 的是原始串；几万个畸形 token 解析出 0 项，能过条数检查。
+func TestManagerSystemSetting_RejectsOversizedRawValue(t *testing.T) {
+	route, _ := newSuperAdminServer(t)
+
+	// 全是非法 token（含路径分隔符），解析后 0 项，但原始串远超字节上限。
+	junk := strings.Repeat("a/b,", 3000)
+	w := postSystemSetting(t, route, `{"items":[
+		{"category":"file","key":"extra_allowed_extensions","value":"`+junk+`"}
+	]}`)
+	require.NotEqual(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "extension_list_too_large")
+	assert.NotContains(t, w.Body.String(), "<no value>")
 }

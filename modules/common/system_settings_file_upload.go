@@ -7,8 +7,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"unicode"
-
-	"go.uber.org/zap"
 )
 
 // ---------------------------------------------------------------------------
@@ -210,18 +208,22 @@ func (s *SystemSettings) FileExtraBlockedExtensions() []string {
 }
 
 // FileMaxSizeKB 返回单文件上传上限（KB）。回退链只有 DB → code default 两层
-// （见 DefaultFileMaxSizeKB 的说明）。越界值回退默认值而不是被原样服务 ——
-// 与 stickerClampIntUpper 同型的 defence in depth，覆盖直改库的旁路。
+// （见 DefaultFileMaxSizeKB 的说明）。
+//
+// 越界处理与 sticker 那组键**共用同一个钳位器**：≤0 视为未配置、回落默认值；
+// 超过硬上限则钳到硬上限，而不是回落默认值 —— 后者会让运维填 600000（想要
+// ~586MB）反而拿到 100MB，比编辑前还小、比键上写明的 512MB 还小，且写侧
+// Positive:true 跳过了范围检查，唯一的信号是 effective_value 悄悄读回 102400。
+// 那正是本任务在 extra_allowed_extensions 上明确拒绝的「存下了但不生效」。
+//
+// 越界 Warn 由钳位器按 (key, value) 去重：本 getter 在 policyInputs() 里，
+// 每次 currentPolicy() 都会走 —— 包括每个未认证的 /v1/common/appconfig 请求。
 func (s *SystemSettings) FileMaxSizeKB() int {
-	v := s.getInt("file", "max_size_kb", DefaultFileMaxSizeKB)
-	if v <= 0 || v > FileMaxSizeKBHardCap {
-		s.Warn("file.max_size_kb 越界，回退默认值",
-			zap.Int("configured", v),
-			zap.Int("default", DefaultFileMaxSizeKB),
-			zap.Int("hard_cap", FileMaxSizeKBHardCap))
-		return DefaultFileMaxSizeKB
-	}
-	return v
+	return s.clampIntUpper("file.max_size_kb",
+		s.getInt("file", "max_size_kb", DefaultFileMaxSizeKB),
+		DefaultFileMaxSizeKB,
+		FileMaxSizeKBHardCap,
+	)
 }
 
 // ---------------------------------------------------------------------------

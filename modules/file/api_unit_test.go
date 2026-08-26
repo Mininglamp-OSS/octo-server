@@ -210,6 +210,9 @@ type mockService struct {
 	lastFileSize       int64
 	presignedGetErr    error
 	lastGetDisposition string
+	// uploadCalls 记录 UploadFile 被调用的次数：被拒的上传必须一次都不调用 ——
+	// 要防的是字节落进对象存储，不是状态码。
+	uploadCalls int
 	// downloadURL/downloadURLErr let a test control what DownloadURL returns
 	// (the value uploadFile reports as `path`). Zero values preserve the legacy
 	// ("", nil) behavior every existing test relies on.
@@ -226,6 +229,8 @@ func (m *mockService) DownloadImage(url string, ctx context.Context) (io.ReadClo
 }
 
 func (m *mockService) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+	m.uploadCalls++
+	m.lastObjectPath = filePath
 	return nil, nil
 }
 
@@ -1695,4 +1700,52 @@ func TestGetUploadCredentials_ContentTypeContract(t *testing.T) {
 				"echoed contentType must be a legal header value, got %q", echoed)
 		})
 	}
+}
+
+// TestUploadFile_RejectsPathExtMismatchOnGenericUpload：**非贴纸**路径同样要求
+// ?path= 的扩展名与 filename 一致。
+//
+// 扩展名门校验的是 filename，而落库的 object key 来自调用方的 ?path=。两者不
+// 一致时 `?path=/x.svg` 配 `x.png` 的 filename 就能在 .svg 被封堵后仍写出一个
+// .svg 对象 —— 正是这道门要挡的场景。此前只有 sticker 分支做了这个校验。
+func TestUploadFile_RejectsPathExtMismatchOnGenericUpload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/x.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 8, 8))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/10000/x.svg", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusBadRequest, rec.Code,
+		"generic upload with path ext != filename ext must be rejected; body: %s", rec.Body.String())
+	assert.Zero(t, mockSvc.uploadCalls, "被拒的上传绝不能写进对象存储")
+}
+
+// 一致时照常放行（大小写不敏感），确认收紧没有误伤正常上传。
+func TestUploadFile_AllowsMatchingPathExtOnGenericUpload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/x.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 8, 8))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/10000/X.PNG", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.Equal(t, 1, mockSvc.uploadCalls)
 }

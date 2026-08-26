@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -75,6 +76,16 @@ func withRobotUploadPolicy(t *testing.T, s file.PolicySettings) {
 
 func runRobotUpload(t *testing.T, filename string, size int) (*httptest.ResponseRecorder, *countingRobotFileService) {
 	t.Helper()
+	return runRobotUploadFull(t, filename, "", size)
+}
+
+func runRobotUploadWithPath(t *testing.T, filename, uploadPath string) (*httptest.ResponseRecorder, *countingRobotFileService) {
+	t.Helper()
+	return runRobotUploadFull(t, filename, uploadPath, 16)
+}
+
+func runRobotUploadFull(t *testing.T, filename, uploadPath string, size int) (*httptest.ResponseRecorder, *countingRobotFileService) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	var buf bytes.Buffer
@@ -85,7 +96,11 @@ func runRobotUpload(t *testing.T, filename string, size int) (*httptest.Response
 	require.NoError(t, err)
 	require.NoError(t, mw.Close())
 
-	req, err := http.NewRequest(http.MethodPost, "/v1/robot/file/upload?type=chat", &buf)
+	target := "/v1/robot/file/upload?type=chat"
+	if uploadPath != "" {
+		target += "&path=" + url.QueryEscape(uploadPath)
+	}
+	req, err := http.NewRequest(http.MethodPost, target, &buf)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
@@ -149,4 +164,23 @@ func TestRobotUploadFile_RejectsOversizeByDynamicCap(t *testing.T) {
 	w, mockFS := runRobotUpload(t, "photo.jpg", 2048)
 	assert.NotEqual(t, http.StatusOK, w.Code, "超过 1KB 上限必须被拒：%s", w.Body.String())
 	assert.Zero(t, mockFS.uploadCalls)
+}
+
+// ?path= 与 filename 的扩展名必须一致：校验的是 filename，落库的是 path，
+// 两者不一致时 `?path=/x.svg` 配 `x.png` 就能在 .svg 被封堵后仍写出 .svg 对象。
+func TestRobotUploadFile_RejectsPathExtensionMismatch(t *testing.T) {
+	withRobotUploadPolicy(t, stubRobotPolicySettings{maxKB: 102400})
+
+	w, mockFS := runRobotUploadWithPath(t, "photo.png", "/evil.svg")
+	assert.NotEqual(t, http.StatusOK, w.Code, "path 与 filename 扩展名不一致必须被拒：%s", w.Body.String())
+	assert.Zero(t, mockFS.uploadCalls, "不一致的上传绝不能写进对象存储")
+}
+
+// 一致时照常放行（大小写不敏感）。
+func TestRobotUploadFile_AllowsMatchingPathExtension(t *testing.T) {
+	withRobotUploadPolicy(t, stubRobotPolicySettings{maxKB: 102400})
+
+	w, mockFS := runRobotUploadWithPath(t, "photo.png", "/dir/photo.PNG")
+	assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, 1, mockFS.uploadCalls)
 }

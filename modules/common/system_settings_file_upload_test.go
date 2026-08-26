@@ -184,11 +184,18 @@ func TestFileExtraBlocked_EmptyWhenNeitherConfigured(t *testing.T) {
 func TestFileMaxSizeKB(t *testing.T) {
 	assert.Equal(t, DefaultFileMaxSizeKB, fileSnapSettings(nil).FileMaxSizeKB())
 	assert.Equal(t, 2048, fileSnapSettings(map[string]string{"file.max_size_kb": "2048"}).FileMaxSizeKB())
-	// 越界回退默认值，而不是被原样服务（覆盖直改库的旁路）。
-	for _, bad := range []string{"0", "-1", "abc", "99999999"} {
+	// ≤0 / 非数字视为未配置，回退默认值。
+	for _, bad := range []string{"0", "-1", "abc"} {
 		s := fileSnapSettings(map[string]string{"file.max_size_kb": bad})
 		assert.Equal(t, DefaultFileMaxSizeKB, s.FileMaxSizeKB(), "value=%s", bad)
 	}
+
+	// 超过硬上限**钳到硬上限**，不是回落默认值 —— 与 sticker 那组键共用同一个
+	// 钳位器。回落默认值会让运维填 600000（想要 ~586MB）反而拿到 100MB，
+	// 比编辑前还小、也比键上写明的 512MB 还小，且写侧不会报错。
+	over := fileSnapSettings(map[string]string{"file.max_size_kb": "99999999"})
+	assert.Equal(t, FileMaxSizeKBHardCap, over.FileMaxSizeKB(),
+		"超上限应钳到硬上限，而不是回落 %d", DefaultFileMaxSizeKB)
 	// 恰好等于硬上限是允许的。
 	s := fileSnapSettings(map[string]string{"file.max_size_kb": "524288"})
 	assert.Equal(t, FileMaxSizeKBHardCap, s.FileMaxSizeKB())

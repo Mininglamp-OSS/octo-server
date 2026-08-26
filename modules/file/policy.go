@@ -52,6 +52,10 @@ type extPolicy struct {
 	blocked map[string]bool
 	// maxSize 是单文件上限（字节）。
 	maxSize int64
+	// allowedSorted 是 allowed 的字典序快照，派生时算一次。
+	// /v1/common/appconfig 无鉴权且被所有客户端轮询，不该为每个请求重新
+	// 分配并排序七十余项。
+	allowedSorted []string
 	// inAllowed / inBlocked / inMaxKB 是派生输入的副本，用来判断本快照是否
 	// 仍然有效（输入不变则直接复用，不为每个上传请求重建两张七十余项的 map）。
 	//
@@ -154,13 +158,33 @@ func derivePolicy(extraAllowed, extraBlocked []string, maxKB int) *extPolicy {
 		allowed[ext] = true
 	}
 
-	if maxKB <= 0 || maxKB > common.FileMaxSizeKBHardCap {
-		maxKB = common.DefaultFileMaxSizeKB
+	// 与 common 侧的钳位器保持同一语义：≤0 视为未配置、回落默认值；超过硬上限
+	// 钳到硬上限。这一层是给「未挂 settings」路径（老 unit test）兜底的，
+	// 两层若一个回落默认、一个钳到上限，同一份配置在两条路径上会得出不同结果。
+	//
+	// 钳位结果放进 effectiveKB，**不覆盖 maxKB**：inMaxKB 要存的是派生输入的
+	// 原样，matches() 拿它和下一次的 policyInputs() 结果比。若存钳位后的值，
+	// 一个越界配置会让比较永远不命中，两张七十余项的 map 每个请求重建一次。
+	// 今天两条输入路径都已预先钳位、走不到这里，但那是调用方的性质，不是本
+	// 函数的保证 —— 换一个 PolicySettings 实现就会踩上。
+	effectiveKB := maxKB
+	switch {
+	case effectiveKB <= 0:
+		effectiveKB = common.DefaultFileMaxSizeKB
+	case effectiveKB > common.FileMaxSizeKBHardCap:
+		effectiveKB = common.FileMaxSizeKBHardCap
 	}
+	sorted := make([]string, 0, len(allowed))
+	for ext := range allowed {
+		sorted = append(sorted, ext)
+	}
+	sort.Strings(sorted)
+
 	return &extPolicy{
-		allowed: allowed,
-		blocked: blocked,
-		maxSize: int64(maxKB) * 1024,
+		allowed:       allowed,
+		blocked:       blocked,
+		allowedSorted: sorted,
+		maxSize:       int64(effectiveKB) * 1024,
 		// 存副本：调用方（common 的 getter）每次返回新切片，但快照是共享只读的，
 		// 不该持有外部可能改写的底层数组。
 		inAllowed: slices.Clone(extraAllowed),
@@ -201,12 +225,14 @@ func MaxUploadSize() int64 {
 // 只下发 allowed，不下发 blocked：客户端只需要知道能传什么；下发黑名单等于让
 // 任何未认证调用方对比 baseline 就看出本部署额外封了哪些扩展名。
 func EffectiveAllowedExtensions() []string {
-	p := currentPolicy()
-	out := make([]string, 0, len(p.allowed))
-	for ext := range p.allowed {
-		out = append(out, ext)
-	}
-	sort.Strings(out)
+	return currentPolicy().sortedAllowed()
+}
+
+// sortedAllowed 返回快照内预排序清单的**副本** —— 快照是共享只读的，不能把
+// 内部切片交出去。
+func (p *extPolicy) sortedAllowed() []string {
+	out := make([]string, len(p.allowedSorted))
+	copy(out, p.allowedSorted)
 	return out
 }
 
@@ -225,8 +251,11 @@ func init() {
 	// 放在 init() 而不是 New(ctx) —— 只要 file 包被链接进来就一定可用，
 	// appconfig 不会因为模块构造顺序而拿到空值。
 	common.SetFileUploadLimitsProvider(func() (int, []string) {
+		// 只取一次快照：EffectiveAllowedExtensions() 内部还会再调一次
+		// currentPolicy()，reload 插在两次之间就会下发一组从未同时生效过的
+		// 「上限 + 扩展名集」。同 uploadFile 里 maxUpload 只取一次的理由。
 		p := currentPolicy()
-		return int(p.maxSize / 1024), EffectiveAllowedExtensions()
+		return int(p.maxSize / 1024), p.sortedAllowed()
 	})
 	// 同上，把「哪些扩展名永远不可放开」告诉配置层，让管理台写侧能当场拒绝。
 	common.SetBuiltinBlockedFileExtensionProbe(IsBaselineBlockedExtension)

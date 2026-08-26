@@ -25,6 +25,19 @@ var (
 		SafeDetailKeys: []string{"max_size_kb", "max_mb"},
 	})
 
+	// ErrFileUploadPathMismatch is returned when the object key supplied via
+	// ?path= carries a different extension than the multipart filename that was
+	// validated against the upload policy.
+	//
+	// The gate checks the filename's extension but the key is what gets stored,
+	// so `?path=/x.svg` with a filename of `x.png` would write a .svg object
+	// after an operator blocked .svg — exactly what the gate exists to prevent.
+	ErrFileUploadPathMismatch = register(codes.Code{
+		ID:             "err.server.file.upload_path_extension_mismatch",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The upload path extension does not match the file name.",
+	})
+
 	// ErrFileExtensionListTooLarge is returned by the manager system_setting
 	// write path when file.extra_{allowed,blocked}_extensions exceeds the entry
 	// count or per-entry length bound.
@@ -41,7 +54,7 @@ var (
 	ErrFileExtensionListTooLarge = register(codes.Code{
 		ID:             "err.server.file.extension_list_too_large",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The extension list is too large (max {{.max_entries}} entries).",
-		SafeDetailKeys: []string{"max_entries", "got", "extension"},
+		DefaultMessage: "The extension list is too large (max {{.max_entries}} entries, {{.max_length}} chars each).",
+		SafeDetailKeys: []string{"max_entries", "got", "extension", "max_bytes", "got_bytes"},
 	})
 )
