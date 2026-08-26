@@ -122,6 +122,12 @@
        - **进度(2026-07)**:注册 + Render + conformance + 字节等价基线维度已达标 —— **5 张** L2a 卡在 Registry 上:`docs.access-request`(v2 交互,#633/#641)、`docs.commented` + `docs.shared`(v1 展示,#649)、`summary.completed` + `summary.failed`(v1 展示,#650),两种视图模式全覆盖。**仍缺"生产灰度"这一维度**(线上放量观测),故门槛 ② 尚未整体满足;`generic.approval` 因动态 owner 与静态 `TemplateActionContract` 冲突暂未迁(见 §15.4)。
      ③ `docs/l2b-owners.md` 空清单已合入,且有至少一份未通过审核的 L2b 申请 PR 作为流程演练;
      ④ callback URL 白名单机制、独立 token 通道、per-owner 观测指标全部在 L0 落地。
+       - **进度(2026-08,E3 PR-C)**:per-owner/per-source 观测指标与 runtime catalog
+         的 resolve/cache/DB 指标已落地;callback 路由仍按 `(owner, action_type)`
+         匹配既有 RouteSpec(见 §11),**未新增** callback URL 白名单机制,也**未新增**
+         独立 token 通道 —— dynamic catalog 复用现有回调链路,不引入新的出站通道。
+         故门槛 ④ 仍未整体满足。PR-C 交付的 grant 机制是**消费侧**授权
+         (谁可以 discover/send/edit 某个模板),不是 L2b 所要求的**上传侧**准入。
    - **消息通道位置**:L2b 卡片在客户端 UI 上默认不做特殊突出显示(与 L2a 同渠道到达);渲染顺序、置顶、折叠策略由客户端自行决定,L0 不承诺。
 
 ### 2.3 现有代码到分层的映射
@@ -601,8 +607,17 @@ type CardUpdater interface {
 |---|---|
 | `POST /v1/internal/notify` | **现有**发送入口；方案 B 阶段外壳不动，内部走 Registry。未来加 envelope 模式后可选显式 `template_id`。 |
 | `POST /v1/message/card/action` | **现有**交互回调入口(挂在 `/v1/message` group,经 `modules/cardtrust` 校验后路由到 `cardactiondispatch`);payload 按第 7 节标准化(客户端上行结构与已有实现一致,基座只统一 owner/action_type/inputs 语义,不改端点)。 |
-| `GET /v1/message/card/templates` | 新增:列出所有已注册模板(id/version/views/protocol/owner/actionType);给业务方/前端做能力发现。 |
-| `GET /v1/message/card/templates/{id}@{version}` | 新增:返回 manifest + data.schema + interaction reports + samples,供跨仓生成 SDK/联调。 |
+| `GET /v1/message/card/templates` | **已交付**(E3 PR-C):列出**调用方可见**的模板 exact version — id/version/source/owner/protocol/contract_version/visibility/`action_contract`/`active_for_new_send`。`action_contract` 是 `{owner, action_type}` 摘要,纯展示卡为 `null`(这个 null 就是「本卡永不产生回调」的承诺)。 |
+| `GET /v1/message/card/templates/{id}@{version}` | **已交付**(E3 PR-C):返回 manifest + data.schema + interaction reports + **manifest 显式 allowlist 的** samples 的安全 projection。 |
+
+关于这两个端点，有四条与早期草案不同、必须按实现理解的约束：
+
+1. **可见 ≠ 可发**。出现在列表里只代表调用方有权看见该模板的契约；能否 new send / historical edit 由 grant 决定，Bot 的权威发现面仍是 `GET /v1/bot/card/profile`。不要拿 B1/B2 绕过 bot grant。
+2. **默认不可见**。static 卡一律 private —— 这是 `Registry.Register`/`RegisterJSON` 写死的 fail-close 值。要对外可发现，需在 Freeze 前调用 `Registry.SetCatalogVisibility`；该方法已实现（`pkg/cardtmpl/registry.go`），但 PR-C **没有在 `main.go` 里接线任何调用**，即当前部署没有任何 public static 卡。（早期草案在此处点名过一个 `main.go` 的 `applyStaticCatalogVisibility` 包装函数；它从未存在，接线本身是待办。）private 模板需要调用方当前 Space 持有 `discover` grant。
+3. **不存在 / 无权见 / 已 block 返回同一个 localized not-found**。三者可区分等于给出私有目录的枚举 oracle。
+4. **samples 是 per-artifact opt-in**。只有 manifest 里 `export.samples` 显式列出、且确认是合成 fixture 的 sample 才会导出；templates、goldens、canonical bundle bytes、audit、grants、内部 DB ID 永不出现在 B2。static L1 manifest 已冻结、无法追加该声明，因此**现有 static 卡的 B2 samples 恒为空**——这是正确答案，不是缺口。
+
+分页与缓存：cursor 分页，默认 50 / 硬上限 100；visibility、block、grant 全部在**分页 limit 之前**结算（否则隐藏行会缩短页面，页长本身就成了计数 oracle）；cursor 绑定发放它的 Space，跨 Space 重放 fail-close 回到第一页。dynamic 与 static 统一用 projection 的确定性 export hash 作 ETag（validator 必须描述被写出的字节；用 `content_sha256` 会让两个 projection 相同的 artifact 拿到不同 ETag，白白重验一份逐字节相同的响应），支持 `If-None-Match`/304；private 响应至少 `Cache-Control: private, no-cache`。
 
 ---
 
@@ -618,6 +633,9 @@ type CardUpdater interface {
 | **输入校验失败**（schema 不通过、必填缺失） | **400 `ErrNotifyCardInvalid`，零投递，不降级**（对齐 brief 决策 C1，禁止把错请求伪装成成功文本）。 |
 | 服务端 render 错（cardmsg.Validate 失败/marshal 失败） | 打 `cardtmpl_build_total{result=render_error}` metrics，降级为 fallback 文本，保证必达。 |
 | Registry 未命中（composition bug，理论不应发生） | 500 internal error，打 error log；不降级为错文本。 |
+| **dynamic active 但无 grant / 已 block / integrity 失败** | 整个 template ID fail-close：**绝不回退到同 ID 的 static 版本**。运维把某 ID 指向 dynamic 就是要替换它，回退等于用生产者以为已替换的名字发出实质不同的内容。 |
+| **runtime catalog DB 不可用** | Bot profile 返回 typed localized unavailable；Registry new send fail-close。同样不回退 static 同 ID 版本——读失败时无法判断该 ID 是否已被 shadow。 |
+| **new-send gate 关闭**（`OCTO_CARD_RUNTIME_CATALOG_NEW_SEND_ENABLED=false`） | 完全保持既有 static 行为，**不访问 runtime DB**：未启用 dynamic catalog 的部署不因此获得新的 DB 依赖或新的失败模式。 |
 
 ---
 

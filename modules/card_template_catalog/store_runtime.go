@@ -23,11 +23,26 @@ const (
         WHERE template_id = ? AND version = ? AND content_sha256 = ?`
 )
 
+// rowQuerier lets the activation/artifact readers run either standalone or
+// inside the single authorization snapshot without a second copy of the shape
+// validation below. *sql.DB and *sql.Tx both satisfy it.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func (s *store) LoadActivation(ctx context.Context, id cardtmpl.ID) (cardtmpl.RuntimeActivation, error) {
+	return scanRuntimeActivation(ctx, s.db, id)
+}
+
+func scanRuntimeActivation(
+	ctx context.Context,
+	querier rowQuerier,
+	id cardtmpl.ID,
+) (cardtmpl.RuntimeActivation, error) {
 	var version sql.NullString
 	var status string
 	var revision uint64
-	err := s.db.QueryRowContext(ctx, selectRuntimeActivationSQL, string(id)).
+	err := querier.QueryRowContext(ctx, selectRuntimeActivationSQL, string(id)).
 		Scan(&version, &status, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return cardtmpl.RuntimeActivation{}, nil
@@ -35,7 +50,18 @@ func (s *store) LoadActivation(ctx context.Context, id cardtmpl.ID) (cardtmpl.Ru
 	if err != nil {
 		return cardtmpl.RuntimeActivation{}, fmt.Errorf("card template catalog: load runtime activation: %w", err)
 	}
+	return buildRuntimeActivation(version, status, revision)
+}
 
+// buildRuntimeActivation validates one activation row's shape. It is separate
+// from the query so the single-row read and the batched advertised-set read
+// share one copy — two copies of a shape check are two chances to disagree
+// about what a malformed row means.
+func buildRuntimeActivation(
+	version sql.NullString,
+	status string,
+	revision uint64,
+) (cardtmpl.RuntimeActivation, error) {
 	result := cardtmpl.RuntimeActivation{Exists: true, Version: version.String, Revision: revision}
 	switch status {
 	case string(activationStatusActive):
@@ -59,10 +85,19 @@ func (s *store) LoadArtifactMeta(
 	id cardtmpl.ID,
 	version string,
 ) (cardtmpl.RuntimeArtifactMeta, error) {
+	return scanRuntimeArtifactMeta(ctx, s.db, id, version)
+}
+
+func scanRuntimeArtifactMeta(
+	ctx context.Context,
+	querier rowQuerier,
+	id cardtmpl.ID,
+	version string,
+) (cardtmpl.RuntimeArtifactMeta, error) {
 	var source string
 	var owner, visibility, engine, protocol, contractVersion, hash sql.NullString
 	var blocked bool
-	err := s.db.QueryRowContext(ctx, selectRuntimeArtifactMetaSQL, string(id), version).Scan(
+	err := querier.QueryRowContext(ctx, selectRuntimeArtifactMetaSQL, string(id), version).Scan(
 		&source, &owner, &visibility, &engine, &protocol, &contractVersion, &hash, &blocked,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -71,7 +106,32 @@ func (s *store) LoadArtifactMeta(
 	if err != nil {
 		return cardtmpl.RuntimeArtifactMeta{}, fmt.Errorf("card template catalog: load runtime artifact metadata: %w", err)
 	}
+	return buildRuntimeArtifactMeta(id, version, source,
+		artifactMetaColumns{owner, visibility, engine, protocol, contractVersion, hash}, blocked)
+}
 
+// artifactMetaColumns groups the nullable artifact columns so the shared shape
+// check below reads as one thing rather than as six positional arguments.
+type artifactMetaColumns struct {
+	owner           sql.NullString
+	visibility      sql.NullString
+	engine          sql.NullString
+	protocol        sql.NullString
+	contractVersion sql.NullString
+	hash            sql.NullString
+}
+
+// buildRuntimeArtifactMeta validates one claim/artifact pair, shared by the
+// single-row read and the batched advertised-set read for the same reason
+// buildRuntimeActivation is.
+func buildRuntimeArtifactMeta(
+	id cardtmpl.ID,
+	version, source string,
+	columns artifactMetaColumns,
+	blocked bool,
+) (cardtmpl.RuntimeArtifactMeta, error) {
+	owner, visibility, engine := columns.owner, columns.visibility, columns.engine
+	protocol, contractVersion, hash := columns.protocol, columns.contractVersion, columns.hash
 	result := cardtmpl.RuntimeArtifactMeta{ID: id, Version: version, Blocked: blocked}
 	switch source {
 	case claimSourceStatic:

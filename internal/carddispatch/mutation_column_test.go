@@ -261,7 +261,7 @@ func TestPersistenceJudgeCallSitesMatchItsDocumentedCount(t *testing.T) {
 	// 注释里声明的条数。改这个数就必须同步改那段枚举 —— 反过来也一样：这条守卫在本次
 	// follow-up 里真的响过一次（新增模板发送预检后实测 6 条 vs 声明 5 条），逼着把第 6 条
 	// 补进注释并说明它是「不落库、只借判据」的那一类。守卫有效性由此自证。
-	const documented = 6
+	const documented = 7
 
 	// 递归扫整个 module，而不是三个硬编码目录 —— 第四个包/子包里的调用不能是隐形的。
 	const repoRoot = "../.."

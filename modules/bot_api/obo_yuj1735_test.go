@@ -11,7 +11,7 @@
 //  2. Gate split into:
 //     - revoked_at != NULL → 404 always.
 //     - active == 0 && revoked_at == NULL && req.Active == nil → 404
-//       (paused row, no reactivation intent in the body).
+//     (paused row, no reactivation intent in the body).
 //     - otherwise → allow.
 //
 // These tests pin all four verification cases enumerated in the

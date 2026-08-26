@@ -1,0 +1,290 @@
+{
+  "catalog": {
+    "engine": "octo-json-template/v1",
+    "visibility": "private"
+  },
+  "manifest": {
+    "schemaVersion": 2,
+    "id": "docs.pilot-access-request",
+    "name": "Docs access request — non-production pilot (dedicated ID)",
+    "version": "0.4.0-pilot.20260805",
+    "contractVersion": "1.1.0",
+    "protocol": "octo-card@1.0",
+    "adaptiveCardVersion": "1.5",
+    "renderProfile": "octo-chat@1.2.0-rc.1",
+    "renderProfileCompatibility": "octo-chat/v1",
+    "defaultLocale": "zh-CN",
+    "owner": "docs",
+    "actionType": "access_request.decision",
+    "dataSchema": "contract/data.schema.json",
+    "export": {
+      "samples": [
+        "pending"
+      ]
+    },
+    "views": {
+      "pending": {
+        "wireProfile": "octo/v2",
+        "states": [
+          "pending"
+        ],
+        "template": "templates/pending.template.json",
+        "samples": [
+          "samples/pending.json"
+        ]
+      },
+      "result": {
+        "wireProfile": "octo/v1",
+        "states": [
+          "approved",
+          "rejected"
+        ],
+        "template": "templates/result.template.json",
+        "samples": [
+          "samples/approved.json",
+          "samples/rejected.json"
+        ]
+      }
+    }
+  },
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "state",
+      "title",
+      "requesterName",
+      "docTitle"
+    ],
+    "properties": {
+      "state": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected"
+        ]
+      },
+      "title": {
+        "type": "string",
+        "maxLength": 120
+      },
+      "requesterName": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "docTitle": {
+        "type": "string",
+        "maxLength": 120
+      },
+      "requestId": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "resultLabel": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "resultTone": {
+        "type": "string",
+        "enum": [
+          "Good",
+          "Attention",
+          "Default"
+        ]
+      },
+      "decidedBy": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "decidedAt": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "denyReason": {
+        "type": "string",
+        "maxLength": 200
+      }
+    }
+  },
+  "templates": {
+    "pending": {
+      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+      "type": "AdaptiveCard",
+      "version": "1.5",
+      "body": [
+        {
+          "type": "TextBlock",
+          "text": "${title}",
+          "weight": "Bolder",
+          "wrap": true,
+          "spacing": "None"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${requesterName}",
+          "isSubtle": true,
+          "wrap": true,
+          "spacing": "Small"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${docTitle}",
+          "wrap": true,
+          "spacing": "Small"
+        },
+        {
+          "type": "Input.Text",
+          "id": "deny_reason",
+          "isVisible": false,
+          "isMultiline": true,
+          "maxLength": 200,
+          "placeholder": "拒绝原因"
+        },
+        {
+          "type": "ActionSet",
+          "horizontalAlignment": "Right",
+          "spacing": "Medium",
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "id": "approve",
+              "title": "同意",
+              "style": "positive",
+              "data": {
+                "owner": "docs",
+                "action_type": "access_request.decision",
+                "decision": "approve"
+              }
+            },
+            {
+              "type": "Action.Submit",
+              "id": "deny",
+              "title": "拒绝",
+              "style": "destructive",
+              "data": {
+                "owner": "docs",
+                "action_type": "access_request.decision",
+                "decision": "deny"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "result": {
+      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+      "type": "AdaptiveCard",
+      "version": "1.5",
+      "body": [
+        {
+          "type": "TextBlock",
+          "text": "${title}",
+          "weight": "Bolder",
+          "wrap": true,
+          "spacing": "None"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${docTitle}",
+          "wrap": true,
+          "spacing": "Small"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${resultLabel}",
+          "color": "${resultTone}",
+          "weight": "Bolder",
+          "wrap": true,
+          "spacing": "Medium"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${decidedBy}",
+          "isSubtle": true,
+          "size": "Small",
+          "wrap": true,
+          "spacing": "Small"
+        },
+        {
+          "type": "TextBlock",
+          "text": "${decidedAt}",
+          "isSubtle": true,
+          "size": "Small",
+          "wrap": true,
+          "spacing": "None"
+        }
+      ]
+    }
+  },
+  "reports": {
+    "pending": {
+      "actions": [
+        {
+          "id": "approve",
+          "type": "Action.Submit",
+          "dataKeys": [
+            "owner",
+            "action_type",
+            "decision"
+          ],
+          "inputIds": [
+            "deny_reason"
+          ]
+        },
+        {
+          "id": "deny",
+          "type": "Action.Submit",
+          "dataKeys": [
+            "owner",
+            "action_type",
+            "decision"
+          ],
+          "inputIds": [
+            "deny_reason"
+          ]
+        }
+      ],
+      "inputs": [
+        {
+          "id": "deny_reason",
+          "type": "Input.Text",
+          "isVisible": false
+        }
+      ]
+    }
+  },
+  "samples": {
+    "pending": {
+      "state": "pending",
+      "title": "文档访问申请",
+      "requesterName": "申请人 A",
+      "docTitle": "季度复盘（示例文档）",
+      "requestId": "pilot-request-0001"
+    },
+    "approved": {
+      "state": "approved",
+      "title": "文档访问申请",
+      "requesterName": "申请人 A",
+      "docTitle": "季度复盘（示例文档）",
+      "requestId": "pilot-request-0001",
+      "resultLabel": "已同意",
+      "resultTone": "Good",
+      "decidedBy": "审批人 B",
+      "decidedAt": "2026-08-05 10:00"
+    },
+    "rejected": {
+      "state": "rejected",
+      "title": "文档访问申请",
+      "requesterName": "申请人 A",
+      "docTitle": "季度复盘（示例文档）",
+      "requestId": "pilot-request-0001",
+      "resultLabel": "已拒绝",
+      "resultTone": "Attention",
+      "decidedBy": "审批人 B",
+      "decidedAt": "2026-08-05 10:05",
+      "denyReason": "该文档仅限项目组成员访问。"
+    }
+  }
+}

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -51,12 +52,53 @@ type fakeSpaceQuerier struct {
 	//       `activeSpaces[spaceID] != false` → scope=space App Bot in own Space
 	// `activeSpaces` defaults to true for any spaceID not explicitly set to
 	// false, so tests that don't care about Space status can omit it.
-	memberships   map[string]map[string]bool
-	authCalls     []memberCall
-	authDefault   bool
-	authErr       error
-	appBots       map[string]appBotShape
-	activeSpaces  map[string]bool
+	memberships  map[string]map[string]bool
+	authCalls    []memberCall
+	authDefault  bool
+	authErr      error
+	appBots      map[string]appBotShape
+	activeSpaces map[string]bool
+	// PR-C: group_no -> Space of the authoritative `group` row. An absent key
+	// answers dbr.ErrNotFound so the grant resolver's fail-closed branch is the
+	// default rather than something a test has to opt into.
+	groupSpaces   map[string]string
+	groupSpaceErr error
+	// inactiveSpaces marks a Space as space.status != 1 for the group resolver,
+	// which is the only way to reach the "the group names a Space that is no
+	// longer active" branch.
+	inactiveSpaces map[string]bool
+	// memberSpaces answers the DM peer membership check, keyed uid -> spaceID.
+	memberSpaces   map[string]map[string]bool
+	memberSpaceErr error
+}
+
+// PR-C: memberSpaces[uid][spaceID] answers the DM peer check. An absent entry
+// means "not a member", so a test opts a peer in rather than out.
+func (f *fakeSpaceQuerier) isUserSpaceMember(uid, spaceID string) (bool, error) {
+	f.calls = append(f.calls, "isUserSpaceMember:"+uid+":"+spaceID)
+	if f.memberSpaceErr != nil {
+		return false, f.memberSpaceErr
+	}
+	return f.memberSpaces[uid][spaceID], nil
+}
+
+// queryGroupSpaceID mirrors the production LEFT JOIN: a group whose Space is
+// listed in inactiveSpaces resolves its space_id but reports the Space inactive,
+// which is a different answer from "this group has no Space" (empty space_id)
+// and from "no such group" (dbr.ErrNotFound).
+func (f *fakeSpaceQuerier) queryGroupSpaceID(groupNo string) (string, bool, error) {
+	f.calls = append(f.calls, "queryGroupSpaceID:"+groupNo)
+	if f.groupSpaceErr != nil {
+		return "", false, f.groupSpaceErr
+	}
+	spaceID, ok := f.groupSpaces[groupNo]
+	if !ok {
+		return "", false, dbr.ErrNotFound
+	}
+	if spaceID == "" {
+		return "", false, nil
+	}
+	return spaceID, !f.inactiveSpaces[spaceID], nil
 }
 
 type appBotShape struct {
@@ -100,45 +142,111 @@ func (f *fakeSpaceQuerier) querySpaceIDsByRobotID(robotID string) (string, []str
 // isBotSpaceAuthorized mirrors the production OR-of-three rule. Tests pick the
 // branch they want by populating `memberships` (User Bot path) or `appBots`
 // (App Bot platform / scope=space path). `activeSpaces` defaults to active.
-func (f *fakeSpaceQuerier) isBotSpaceAuthorized(robotID, spaceID string) (bool, error) {
+// canonicalSpaceID models the production asymmetry this fake exists to expose:
+// `space`, `space_member` and `app_bot` declare no collation and inherit a
+// case-insensitive default, so they match a differently-cased spelling and
+// return the stored one. Every fixture key is therefore treated as the
+// canonical identity and matched with EqualFold.
+//
+// Without this the fake compared with `==`, which made the case-skew class
+// (review P0-1) unreproducible in Go tests — the very reason it survived to a
+// third instance.
+func (f *fakeSpaceQuerier) canonicalSpaceID(spaceID string) string {
+	fold := func(keys []string) (string, bool) {
+		for _, key := range keys {
+			if strings.EqualFold(key, spaceID) {
+				return key, true
+			}
+		}
+		return "", false
+	}
+	keys := make([]string, 0, len(f.activeSpaces))
+	for key := range f.activeSpaces {
+		keys = append(keys, key)
+	}
+	for _, spaces := range f.memberships {
+		for key := range spaces {
+			keys = append(keys, key)
+		}
+	}
+	for _, shape := range f.appBots {
+		if shape.scopeSpaceID != "" {
+			keys = append(keys, shape.scopeSpaceID)
+		}
+	}
+	for _, space := range f.groupSpaces {
+		keys = append(keys, space)
+	}
+	if canonical, ok := fold(keys); ok {
+		return canonical
+	}
+	return spaceID
+}
+
+// memberOf reports an active membership, matching case-insensitively the way
+// the `space_member`/`space` join does.
+func (f *fakeSpaceQuerier) memberOf(robotID, spaceID string) (bool, bool) {
+	m, ok := f.memberships[robotID]
+	if !ok {
+		return false, false
+	}
+	for key, member := range m {
+		if strings.EqualFold(key, spaceID) {
+			return member, true
+		}
+	}
+	return false, false
+}
+
+func (f *fakeSpaceQuerier) spaceActive(spaceID string) bool {
+	if f.activeSpaces == nil {
+		return true
+	}
+	for key, active := range f.activeSpaces {
+		if strings.EqualFold(key, spaceID) {
+			return active
+		}
+	}
+	// Default = active when the entry is missing.
+	return true
+}
+
+func (f *fakeSpaceQuerier) isBotSpaceAuthorized(robotID, spaceID string) (string, bool, error) {
 	f.authCalls = append(f.authCalls, memberCall{robotID: robotID, spaceID: spaceID})
 	if f.authErr != nil {
-		return false, f.authErr
+		return "", false, f.authErr
 	}
+	canonical := f.canonicalSpaceID(spaceID)
 	// Branch (1): space_member match.
-	if m, ok := f.memberships[robotID]; ok {
-		if v, ok := m[spaceID]; ok && v {
-			return true, nil
-		}
+	if member, present := f.memberOf(robotID, spaceID); present && member {
+		return canonical, true, nil
 	}
-	// Target Space must be active for app_bot branches. Default = active when
-	// activeSpaces is nil or the entry is missing.
-	spaceActive := true
-	if f.activeSpaces != nil {
-		if v, ok := f.activeSpaces[spaceID]; ok {
-			spaceActive = v
-		}
-	}
-	if spaceActive {
+	// Target Space must be active for app_bot branches.
+	if f.spaceActive(spaceID) {
 		if shape, ok := f.appBots[robotID]; ok {
 			// Branch (2): published platform App Bot in any active Space.
 			if shape.publishedPlatform {
-				return true, nil
+				return canonical, true, nil
 			}
 			// Branch (3): scope=space App Bot dispatching into its own Space.
-			if shape.published && shape.scopeSpaceID != "" && shape.scopeSpaceID == spaceID {
-				return true, nil
+			if shape.published && shape.scopeSpaceID != "" &&
+				strings.EqualFold(shape.scopeSpaceID, spaceID) {
+				return shape.scopeSpaceID, true, nil
 			}
 		}
 	}
 	// Fall through: explicit `memberships[robotID][spaceID] == false` or
 	// nothing matches → use authDefault for tests that don't model the bot.
-	if m, ok := f.memberships[robotID]; ok {
-		if v, ok := m[spaceID]; ok {
-			return v, nil
+	if member, present := f.memberOf(robotID, spaceID); present {
+		if !member {
+			return "", false, nil
 		}
+		return canonical, true, nil
 	}
-	return f.authDefault, nil
+	if !f.authDefault {
+		return "", false, nil
+	}
+	return canonical, true, nil
 }
 
 // fakeWkContext creates a minimal wkhttp.Context (gin context wrapper) with

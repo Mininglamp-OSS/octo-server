@@ -150,7 +150,7 @@ func TestOBO_BotGetGrant_RevokedGrant(t *testing.T) {
 // when the grant was created without a persona_prompt the response
 // must surface an empty string (NOT a null / missing field).
 // `insertGrant` writes "" when called with an empty prompt; the
-// production SQL relies on COALESCE(persona_prompt,'') for legacy NULL
+// production SQL relies on COALESCE(persona_prompt,”) for legacy NULL
 // rows, so the fake's "" matches the prod wire shape.
 func TestOBO_BotGetGrant_EmptyPersonaPrompt(t *testing.T) {
 	const (

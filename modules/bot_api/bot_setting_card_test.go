@@ -61,7 +61,7 @@ func TestBotCardConfigResponse_ReasoningRefMatchesAdvertisedCatalog(t *testing.T
 		out := ba.botCardConfigResponse(robot.BotCardConfig{
 			CardEnabled: true, DisplayEnabled: true,
 			InteractionEnabled: true, ReasoningEnabled: true,
-		})
+		}, ba.cardTemplates.Capability())
 		if out["reasoning_enabled"] != true {
 			t.Fatalf("reasoning_enabled = %v, want true", out["reasoning_enabled"])
 		}
@@ -93,7 +93,7 @@ func TestBotCardConfigResponse_ReasoningRefMatchesAdvertisedCatalog(t *testing.T
 		out := ba.botCardConfigResponse(robot.BotCardConfig{
 			CardEnabled: true, DisplayEnabled: true,
 			InteractionEnabled: true, ReasoningEnabled: false,
-		})
+		}, ba.cardTemplates.Capability())
 		if out["reasoning_enabled"] != false {
 			t.Fatalf("reasoning_enabled = %v, want false", out["reasoning_enabled"])
 		}
@@ -113,7 +113,7 @@ func TestBotCardConfigResponse_NoCatalogForcesReasoningOff(t *testing.T) {
 	out := ba.botCardConfigResponse(robot.BotCardConfig{
 		CardEnabled: true, DisplayEnabled: true,
 		InteractionEnabled: true, ReasoningEnabled: true,
-	})
+	}, ba.cardTemplates.Capability())
 	if out["reasoning_enabled"] != false {
 		t.Fatalf("reasoning_enabled = %v, want false when nothing is advertised", out["reasoning_enabled"])
 	}
@@ -122,20 +122,28 @@ func TestBotCardConfigResponse_NoCatalogForcesReasoningOff(t *testing.T) {
 	}
 }
 
-// TestAdvertisedRef_UnknownTemplateIsNotAdvertised guards the lookup itself:
-// asking for a template this deployment does not advertise must report "no",
-// never fall back to some other entry.
-func TestAdvertisedRef_UnknownTemplateIsNotAdvertised(t *testing.T) {
+// TestAdvertisedRefIn_UnknownTemplateIsNotAdvertised guards the lookup itself:
+// asking for a template the manifest does not carry must report "no", never
+// fall back to some other entry — a ref bound by mistake here is one the send
+// path would refuse, on the field whose whole job is to be trusted.
+//
+// This used to guard botCardTemplateCatalog.AdvertisedRef, which read the
+// boot-time capability. That method was retired with 6286c233's last caller
+// (review P2-3); the property moved to advertisedRefIn, which reads whichever
+// manifest the response actually carries. The catalog is still built here so
+// the fixture is a real advertised set rather than a hand-written literal.
+func TestAdvertisedRefIn_UnknownTemplateIsNotAdvertised(t *testing.T) {
 	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := catalog.AdvertisedRef("docs.access-request"); ok {
-		t.Fatal("AdvertisedRef returned a ref for a template that is not advertised to bots")
+	manifest := catalog.Capability()
+	if _, ok := advertisedRefIn(manifest, "docs.access-request"); ok {
+		t.Fatal("advertisedRefIn returned a ref for a template that is not advertised to bots")
 	}
-	if ref, ok := catalog.AdvertisedRef(aireasoningprocess.TemplateID); !ok ||
+	if ref, ok := advertisedRefIn(manifest, aireasoningprocess.TemplateID); !ok ||
 		ref.Version != aireasoningprocess.TemplateVersionV5 {
-		t.Fatalf("AdvertisedRef(%s) = %#v ok=%v", aireasoningprocess.TemplateID, ref, ok)
+		t.Fatalf("advertisedRefIn(%s) = %#v ok=%v", aireasoningprocess.TemplateID, ref, ok)
 	}
 }
 
@@ -161,7 +169,7 @@ func TestBotCardConfigResponse_MasterSwitchOffZeroesEverything(t *testing.T) {
 
 	// This is what robot.BotCardConfig returns once applyCardMasterSwitch has
 	// run with the deployment gate off.
-	out := ba.botCardConfigResponse(robot.BotCardConfig{})
+	out := ba.botCardConfigResponse(robot.BotCardConfig{}, ba.cardTemplates.Capability())
 	for _, key := range []string{
 		"card_enabled", "display_enabled", "interaction_enabled", "reasoning_enabled",
 	} {
@@ -575,7 +583,7 @@ func TestBotCardConfigResponse_ManifestAgreesWithTheGate(t *testing.T) {
 			cfg := robot.BotCardConfig{
 				CardEnabled: true, DisplayEnabled: display, InteractionEnabled: interaction,
 			}
-			out := ba.botCardConfigResponse(cfg)
+			out := ba.botCardConfigResponse(cfg, ba.cardTemplates.Capability())
 
 			for _, tc := range []struct {
 				field   string

@@ -65,9 +65,9 @@ func TestHasOBOAccessToChannel_NoGrants(t *testing.T) {
 // though james↔u_bob is NOT a friend pair.
 func TestHasOBOAccessToChannel_DM_GrantorHasFriendship_ApplyBypass(t *testing.T) {
 	const (
-		admin   = "user_admin"
-		bot     = "bot_clone_james"
-		peer    = "u_bob"
+		admin = "user_admin"
+		bot   = "bot_clone_james"
+		peer  = "u_bob"
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()

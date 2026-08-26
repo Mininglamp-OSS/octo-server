@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -164,6 +165,44 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 	if sizeErr := cardmsg.RecheckPayloadSize(payload); sizeErr != nil {
 		terminal = cardErrorCategory(sizeErr)
 		return nil, categorized(terminal, sizeErr)
+	}
+	// The persistence-column pre-check the bot template send already does
+	// (modules/bot_api/send.go), mirrored here — review P2-3 (yujiawei).
+	//
+	// RecheckPayloadSize above enforces the 512 KiB wire limit. The narrower
+	// limit is the TEXT column an *edit* of this card has to fit in: 65,535
+	// bytes, two orders of magnitude smaller. A frame between the two is sent
+	// happily and then fails every finalize with ErrCardMutationTooLarge, which
+	// for docs.access-request means a card that renders, cannot be decided, and
+	// cannot be repaired. That window is not hypothetical — main's own gate
+	// comment measures docs.access-request@0.3.0 at 121% of the column under its
+	// own display limits, and the markers stamped just above add ~150-190 bytes
+	// to every frame that reaches here.
+	//
+	// Measured against the worst-case *first edit* envelope, not the send frame:
+	// the edit path adds card_seq (always) and transient (progress frames), so
+	// admitting a frame by its send size leaves a same-width window where the
+	// send succeeds and the first edit is refused. Same reasoning, same two
+	// worst-case values, as the bot side.
+	probe := make(map[string]interface{}, len(payload)+2)
+	for k, v := range payload {
+		probe[k] = v
+	}
+	probe["card_seq"] = int64(math.MaxInt64)
+	probe["transient"] = true
+	probeFrame, probeErr := json.Marshal(probe)
+	if probeErr != nil {
+		// Unreachable in practice — payload just marshalled for the size check —
+		// but a fail-open branch does not belong on a size gate.
+		terminal = CategoryCardInvalid
+		return nil, categorized(terminal, probeErr)
+	}
+	if _, columnErr := NormalizeFrameForPersistence(string(probeFrame)); columnErr != nil {
+		terminal = cardErrorCategory(columnErr)
+		if errors.Is(columnErr, ErrCardMutationTooLarge) {
+			terminal = CategoryPayloadTooLarge
+		}
+		return nil, categorized(terminal, columnErr)
 	}
 	wire, marshalErr := json.Marshal(payload)
 	if marshalErr != nil {

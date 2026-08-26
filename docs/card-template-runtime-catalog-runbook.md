@@ -165,14 +165,36 @@ and callback secrets.
    interaction contract, and route configuration. Publish accepts only the
    reviewed runtime-owner allowlist and requires startup catalog readiness;
    validate remains available for offline diagnostics.
+
+   There are **two owner allowlists and they are deliberately different**.
+   `l2aOwnerAllowlist` (`pkg/cardtmpl`) governs which owners may be *registered*
+   as built-in static templates — `docs`, `summary`, `notify`, `action`, `ai`.
+   `approvedRuntimeOwners` (`modules/card_template_catalog`) governs which owners
+   may be *published and authorized at runtime*, and is narrower: `ai` and `docs`
+   only. A template whose owner passes registration will still be refused by
+   publish if it is outside the runtime list. Widening the runtime list is a
+   reviewed change, not a consequence of adding a static card.
 3. Read the current revision, then send an explicit target version and
    `expected_revision`. A stale revision returns a conflict and must be
    refreshed; do not blindly retry the old body.
 4. Confirm the success audit and resulting revision. Exercise exact resolution,
-   rollback, and block while new-send remains disabled. PR-B has no producer
-   grants, so activation drills must use a template ID that no Bot, notify path,
-   or other producer currently consumes; activating a dynamic version for a
-   consumed ID will correctly make that producer fail closed.
+   rollback, and block while new-send remains disabled.
+
+   **Changed by E3 PR-C.** PR-B had no producer grants, so drills had to avoid
+   any consumed template ID. Grants now exist, so a dynamic version for a
+   consumed ID is a supported (and intended) operation — but it fails closed
+   until the consuming producer holds a `send` grant in the Space it sends to.
+   Two consequences for an operator:
+
+   - `publish`, `grant` and `activate` are three separate operations and none
+     implies the next. A published artifact is inert; a granted producer still
+     sends the previously active version; an activated version without a grant
+     makes the whole template ID unsendable rather than falling back to the
+     static card of the same ID.
+   - A Bot's advertised catalog is now **request-scoped**. `GET /v1/bot/card/profile`
+     answers for the authenticated Bot in its authoritative Space, so two Bots in
+     one deployment legitimately see different manifests. When diagnosing "the
+     Bot cannot send X", read the profile *as that Bot*, not as the deployment.
 
 ### Rollback
 

@@ -77,8 +77,51 @@ func InstallRuntimeCatalog(
 	setInstalledRuntimeGates(gates)
 	setInstalledRuntimeReadiness(readiness)
 	cardtmpl.SetDefaultCatalog(catalog)
+	// Publish the resolver so consumers outside this module (the Bot capability
+	// manifest, chiefly) read the same grant truth through the same snapshot
+	// contract instead of growing a second one.
+	cardtmpl.SetDefaultAuthorizationSource(&runtimeAuthorizationSource{
+		store: runtimeStore, gates: gates,
+	})
 	return catalog, nil
 }
+
+// runtimeAuthorizationSource binds the store's readers to the deployment gate.
+// It exists so that "new-send is dark" is answerable without a DB round trip:
+// a gated-off deployment must keep its pre-PR-C static behaviour exactly, and
+// that includes not acquiring a runtime DB dependency it did not have before.
+type runtimeAuthorizationSource struct {
+	store *store
+	gates runtimeCatalogGates
+}
+
+func (s *runtimeAuthorizationSource) LoadAuthorization(
+	ctx context.Context,
+	query cardtmpl.RuntimeAuthorizationQuery,
+) (cardtmpl.RuntimeAuthorization, error) {
+	return s.store.LoadAuthorization(ctx, query)
+}
+
+// LoadAuthorizations exposes the store's batched resolver. Consumers type-assert
+// for cardtmpl.RuntimeAuthorizationBatchStore, so forgetting to forward it here
+// would silently drop them back onto the per-ID path.
+func (s *runtimeAuthorizationSource) LoadAuthorizations(
+	ctx context.Context,
+	ids []cardtmpl.ID,
+	principal cardtmpl.CatalogPrincipal,
+) (map[cardtmpl.ID]cardtmpl.RuntimeAuthorization, error) {
+	return s.store.LoadAuthorizations(ctx, ids, principal)
+}
+
+func (s *runtimeAuthorizationSource) ListAuthorizedTemplates(
+	ctx context.Context,
+	principal cardtmpl.CatalogPrincipal,
+	limit int,
+) ([]cardtmpl.RuntimeAdvertisedTemplate, error) {
+	return s.store.ListAuthorizedTemplates(ctx, principal, limit)
+}
+
+func (s *runtimeAuthorizationSource) NewSendEnabled() bool { return s.gates.newSendEnabled }
 
 func runtimeCatalogConfigFromEnv(
 	config cardtmpl.RuntimeCatalogConfig,
@@ -197,20 +240,49 @@ func strictRuntimeBool(raw string) (bool, bool) {
 	}
 }
 
+// runtimeDynamicAuthorizer turns one snapshot into one allow/deny. Every input
+// it reads — purpose, owner, grant — was captured at the same instant by the
+// resolver; the function performs no IO of its own, which is what keeps the
+// decision linearizable against a concurrent revoke or block.
+//
+// The checks are ordered cheapest-and-most-global first so that a deployment
+// with the new-send gate closed never reveals anything about grants, and an
+// unapproved owner is rejected before any per-principal state is considered.
 func runtimeDynamicAuthorizer(
 	gates runtimeCatalogGates,
 	downstream cardtmpl.RuntimeDynamicAuthorizeFunc,
 ) cardtmpl.RuntimeDynamicAuthorizeFunc {
-	return func(ctx context.Context, access cardtmpl.CatalogAccess, meta cardtmpl.RuntimeArtifactMeta) error {
+	return func(
+		ctx context.Context,
+		access cardtmpl.CatalogAccess,
+		meta cardtmpl.RuntimeArtifactMeta,
+		grant cardtmpl.RuntimeGrant,
+	) error {
 		if access.Purpose == cardtmpl.CatalogPurposeNewSend && !gates.newSendEnabled {
 			return cardtmpl.ErrRuntimeCatalogNewSendDisabled
 		}
 		if !isApprovedRuntimeOwner(meta.Owner) {
 			return cardtmpl.ErrRuntimeCatalogNotAuthorized
 		}
-		if downstream == nil {
+		// Discovery is the one purpose a grant is not strictly required for:
+		// a public template is discoverable by anyone who can reach the API,
+		// which is what "public" means. It stays weaker than use — seeing a
+		// template never implies being able to send or edit it (invariant 5) —
+		// and the new-send gate deliberately does not apply, because reading a
+		// contract is not sending a card.
+		if access.Purpose == cardtmpl.CatalogPurposeDiscover &&
+			meta.Visibility == cardtmpl.CatalogVisibilityPublic {
+			return nil
+		}
+		// A grantable principal is required: `system` and blank identities are
+		// control-plane concepts, never business producers (D2), and the
+		// resolver reports them as ungranted rather than erroring.
+		if !grant.Allows(access.Purpose) {
 			return cardtmpl.ErrRuntimeCatalogNotAuthorized
 		}
-		return downstream(ctx, access, meta)
+		if downstream == nil {
+			return nil
+		}
+		return downstream(ctx, access, meta, grant)
 	}
 }

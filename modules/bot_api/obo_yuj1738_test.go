@@ -2,23 +2,23 @@
 //
 // Two unrelated R2 review blockers (Jerry-Xin) bundled into one PR:
 //
-//   B1. oboUpdateGrantReq.Active was `*int`, but octo-web's
-//       PersonaSettings ships `{"active": false}` as a JSON boolean.
-//       encoding/json's default decoder rejected the boolean token,
-//       silently 400'd the entire PUT, and the persona toggle was
-//       inert end-to-end. The fix replaces the type with
-//       `*FlexBoolInt`, which UnmarshalJSON's both shapes
-//       (true/false → 1/0, integer N → N).
+//	B1. oboUpdateGrantReq.Active was `*int`, but octo-web's
+//	    PersonaSettings ships `{"active": false}` as a JSON boolean.
+//	    encoding/json's default decoder rejected the boolean token,
+//	    silently 400'd the entire PUT, and the persona toggle was
+//	    inert end-to-end. The fix replaces the type with
+//	    `*FlexBoolInt`, which UnmarshalJSON's both shapes
+//	    (true/false → 1/0, integer N → N).
 //
-//   B2. setGrantActive's UPDATE statements scoped only by `id=?`
-//       could resurrect a tombstoned grant on the activate path —
-//       a DELETE that committed between the handler's gate and
-//       our tx start would re-run with active=1 / revoked_at=NULL,
-//       silently un-deleting. The fix re-checks `revoked_at != nil`
-//       inside the tx and adds `AND revoked_at IS NULL` to the
-//       UPDATE WHERE clause as defense-in-depth. The pause path
-//       gets the same guards, though its harm potential was
-//       narrower (no column reset).
+//	B2. setGrantActive's UPDATE statements scoped only by `id=?`
+//	    could resurrect a tombstoned grant on the activate path —
+//	    a DELETE that committed between the handler's gate and
+//	    our tx start would re-run with active=1 / revoked_at=NULL,
+//	    silently un-deleting. The fix re-checks `revoked_at != nil`
+//	    inside the tx and adds `AND revoked_at IS NULL` to the
+//	    UPDATE WHERE clause as defense-in-depth. The pause path
+//	    gets the same guards, though its harm potential was
+//	    narrower (no column reset).
 //
 // Verification scenarios mirror the four cases the YUJ-1738 task
 // description called out.

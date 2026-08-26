@@ -273,12 +273,26 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 		}
-		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), robotID, req.Payload, cardtmpl.BuildEnv{
+		// PR-C D6: the grant principal is resolved from the *target*, not from
+		// the sender's own membership, and it is a separate value from the
+		// dispatch space_id above — the latter tags the DM envelope for client
+		// SpaceFilter and is deliberately forgiving, while this one authorizes
+		// and is deliberately not.
+		principal := ba.botSendCatalogPrincipal(c, robotID, channelID, req.ChannelType)
+		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), principal, req.Payload, cardtmpl.BuildEnv{
 			WebLoginURL: webLoginURL,
 			Lang:        i18n.OutboundLanguage(c.Request.Context()),
 			SpaceID:     spaceID,
 		})
 		if renderErr != nil {
+			if errors.Is(renderErr, errBotTemplateRuntimeUnavailable) {
+				// The runtime catalog could not be read, so we cannot tell
+				// whether this template ID has been shadowed. Refuse rather
+				// than fall back to the static version of the same ID.
+				ba.Error("Bot 模板运行时目录不可用", zap.Error(renderErr), zap.String("channelID", channelID))
+				httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+				return
+			}
 			if errors.Is(renderErr, errBotTemplateRequestInvalid) {
 				ba.Warn("Bot Registry 模板请求非法", zap.Error(renderErr), zap.String("channelID", channelID))
 				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
@@ -1090,10 +1104,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,
 		// 非撤回,放行。
 		var lifecycle struct {
-			Revoke    int `db:"revoke"`
-			IsDeleted int `db:"is_deleted"`
+			Revoke      int    `db:"revoke"`
+			IsDeleted   int    `db:"is_deleted"`
+			ContentEdit string `db:"content_edit"`
 		}
-		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
+		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted, IFNULL(content_edit, '') AS content_edit FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
 			ba.Error("查询卡片撤回/删除状态失败", zap.Error(lErr), zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
@@ -1102,6 +1117,32 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			ba.Warn("卡片已撤回/删除,拒绝编辑", zap.String("messageID", req.MessageID),
 				zap.Int("revoke", lifecycle.Revoke), zap.Int("isDeleted", lifecycle.IsDeleted))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		// The same guard as above, but against the *effective* frame — review
+		// P2-1 (yujiawei), raised specifically as a gate on this PR.
+		//
+		// The check on msgPayload is the immutable original. That was complete
+		// only by induction over the three template_ref authors in the tree:
+		// each of them either writes the original payload, or is an edit path
+		// already gated on the effective frame carrying the marker, so
+		// effective-has-marker implied original-has-marker. That is a property
+		// of the current author set, not one anyone stated — and this is the PR
+		// that adds send and edit paths, so it is exactly where the induction
+		// can quietly stop holding. A frame that acquires a marker through
+		// content_edit while its payload stays markerless would be raw-editable,
+		// and the raw write goes through WriteCAS, which does not run
+		// CatalogMarkersPreserved. Both identity guards in pkg/cardtmpl/updater.go
+		// begin `if markers.Has…`, so erasing the marker disables them silently.
+		//
+		// Reading it from the row already fetched above costs nothing extra:
+		// this is the same "content_edit when present, else payload" rule
+		// CardMutator.Mutate applies.
+		if effective := strings.TrimSpace(lifecycle.ContentEdit); effective != "" &&
+			cardEnvelopeHasCatalogMarker([]byte(effective)) {
+			ba.Warn("raw card edit attempted to replace a frame whose effective content is Registry-authored",
+				zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
 		// P2 D6：type-17 content_edit 跑与 send 同一套 cardmsg 校验（白名单/大小/
@@ -1278,7 +1319,14 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
-	ref, err := ba.cardTemplates.requireEditableRef(req.TemplateRef)
+	// Resolve the edit's Space from the target, the same way the send did, so
+	// the ref gate below, the provenance guard and the re-stamped marker all
+	// compare like with like (see requireEffectiveCardTemplate). This runs
+	// before the ref gate because a dynamic ref is authorized by *this
+	// principal's* edit grant — the static allowlist alone cannot answer for a
+	// version published at runtime.
+	editPrincipal := ba.botSendCatalogPrincipal(c, robotID, req.ChannelID, req.ChannelType)
+	ref, err := ba.cardTemplates.resolveEditRef(c.Request.Context(), editPrincipal, req.TemplateRef)
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit template_ref 非法或未开放", zap.Error(err))
@@ -1298,7 +1346,17 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
 		return
 	}
-	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID); err != nil {
+	spaceCheck := editProvenanceSpaceCheck(ba.cardTemplates.dynamicCatalogEnabled(), editPrincipal)
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID, spaceCheck); err != nil {
+		if errors.Is(err, errBotTemplateRuntimeUnavailable) {
+			// The frame may be entirely valid; we could not read the Space to
+			// check it. Answering 400 would tell the Bot its request is
+			// malformed and not to retry, which is the opposite of the truth.
+			ba.Error("Bot Registry edit 无法解析目标 Space", zap.Error(err),
+				zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
 		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
@@ -1328,7 +1386,11 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
 	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
-	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), robotID, map[string]any{
+	// Two values, not one: an empty stored Space on a *marked* frame must be
+	// preserved, while an absent marker must be recomposed. See P1-0 in
+	// RenderEditPayloadForPrincipal.
+	storedSpace, storedMarked := storedProvenanceSpaceID(snapshot.Envelope)
+	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), editPrincipal, map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
 		"state":        req.State,
@@ -1337,7 +1399,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		WebLoginURL: webLoginURL,
 		Lang:        i18n.OutboundLanguage(c.Request.Context()),
 		SpaceID:     spaceID,
-	})
+	}, storedSpace, storedMarked)
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
 			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))
@@ -1496,13 +1558,41 @@ func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]in
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return true
 		}
-		advertised, ok := ba.cardTemplates.AdvertisedRef(ref.ID)
-		if !ok || advertised != ref {
-			ba.Warn("Bot 模板 ref 与本部署广告集不一致，拒绝",
-				zap.String("robot", robotID), zap.String("version", ref.Version))
-			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
-			return true
-		}
+		// Deliberately *not* comparing against a boot-time advertised set here —
+		// review P1-A (Jerry-Xin, then yujiawei), and the reason is worth
+		// stating because deleting a check reads like weakening one.
+		//
+		// This prefilter runs before the principal-based render, so it could
+		// only consult the boot-time static policy. `requireSendableRef` is the
+		// advertised-set authority: with the new-send gate on it resolves the
+		// ref through the runtime catalog for *this* Bot and Space, which is
+		// what makes a dynamic version sendable at all. A static comparison
+		// here therefore rejected a *dynamically shadowed* ai.reasoning-process
+		// as "not advertised" while /v1/bot/card/profile advertised it in the
+		// same breath — card_profile.go documents the invariant
+		// "reasoning_enabled=true ⟹ the ref is one the send path will accept",
+		// and wiring CapabilityFor into the profile made that invariant false
+		// rather than true. Removing the comparison is what removes it, and
+		// TestEveryAdvertisedRefIsOneThePrefilterAccepts fails if it comes back.
+		//
+		// Nothing is weakened. The per-Bot switch above still fail-closes on an
+		// unmapped or disabled template, and requireSendableRef refuses any ref
+		// this deployment does not advertise for this principal — with strictly
+		// more information than this line had.
+		//
+		// The `!mapped` branch above is the other half of the same invariant,
+		// and it stays where it is (review P1-1, yujiawei). A granted dynamic
+		// template whose ID has no per-Bot switch never reaches
+		// requireSendableRef, because that branch returns first — so the
+		// manifest must not advertise it either, and switchMappedRefs makes
+		// sure it does not. The agreement is asserted end to end by
+		// TestEveryAdvertisedRefIsOneThePrefilterAccepts, which drives this
+		// function over whatever advertisedSendRefs offers.
+		//
+		// Deferring this switch to the grant for non-static IDs is the other
+		// way to close it, and it is deliberately not taken here: it would move
+		// the per-Bot policy check after ref resolution, changing the send
+		// path's ordering rather than a hint. See the D0 entry.
 		return false
 	}
 

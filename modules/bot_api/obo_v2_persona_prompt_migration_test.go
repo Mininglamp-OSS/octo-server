@@ -4,23 +4,23 @@
 // Why this file exists
 // --------------------
 // 20260521000001_obo_v2_persona_prompt.sql adds the persona_prompt TEXT
-// column. MySQL < 8.0.13 forbids `DEFAULT ''` on TEXT, so the column
+// column. MySQL < 8.0.13 forbids `DEFAULT ”` on TEXT, so the column
 // lands NULL-able and pre-v2 rows materialize with persona_prompt =
 // NULL. Multiple read paths in obo_db.go scan that column into a
 // non-pointer string field on oboGrantModel, and dbr/database/sql
 // rejects NULL → string with "converting NULL to string is
 // unsupported". PR#109 R3 closes the gap by appending a backfill
-// UPDATE that promotes every NULL row to '' as part of the same
+// UPDATE that promotes every NULL row to ” as part of the same
 // migration step.
 //
 // This file's two tests pin both halves of that contract:
 //
-//   1. The backfill UPDATE is and stays present in the migration
-//      file. (TestPersonaPromptMigrationContainsBackfill)
-//   2. Running the migration on a sqlite DB whose obo_grants rows
-//      were inserted with NULL persona_prompt promotes every NULL
-//      to '' so the production read paths see the safe value.
-//      (TestPersonaPromptBackfillNullRowsToEmptyString)
+//  1. The backfill UPDATE is and stays present in the migration
+//     file. (TestPersonaPromptMigrationContainsBackfill)
+//  2. Running the migration on a sqlite DB whose obo_grants rows
+//     were inserted with NULL persona_prompt promotes every NULL
+//     to ” so the production read paths see the safe value.
+//     (TestPersonaPromptBackfillNullRowsToEmptyString)
 package bot_api
 
 import (
@@ -61,7 +61,7 @@ func TestPersonaPromptMigrationContainsBackfill(t *testing.T) {
 // TestPersonaPromptBackfillNullRowsToEmptyString runs the backfill UPDATE
 // on a sqlite obo_grants table that holds three NULL persona_prompt
 // rows seeded via raw SQL. After the UPDATE every row must read back
-// as '' (not NULL), which is exactly what the prod migration relies
+// as ” (not NULL), which is exactly what the prod migration relies
 // on so the downstream `SELECT *` paths in obo_db.go can safely scan
 // the column into oboGrantModel.PersonaPrompt (a non-pointer string).
 //
@@ -148,10 +148,10 @@ func TestPersonaPromptBackfillNullRowsToEmptyString(t *testing.T) {
 	seen := 0
 	for rows.Next() {
 		var (
-			id        int64
-			grantor   string
-			grantee   string
-			prompt    string // non-pointer, matches oboGrantModel.PersonaPrompt
+			id      int64
+			grantor string
+			grantee string
+			prompt  string // non-pointer, matches oboGrantModel.PersonaPrompt
 		)
 		if err := rows.Scan(&id, &grantor, &grantee, &prompt); err != nil {
 			t.Fatalf("scan row: %v", err)

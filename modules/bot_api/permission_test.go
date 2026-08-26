@@ -50,11 +50,11 @@ func TestAppBotTokenFormat(t *testing.T) {
 		token string
 		valid bool
 	}{
-		{"app_d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9", true},  // 4 + 32 hex = 36 chars
-		{"app_short", true},                                 // prefix correct (length not enforced at auth layer)
-		{"bf_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false},   // bf_ prefix
-		{"uk_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false},   // uk_ prefix
-		{"app", false},                                      // too short, no underscore
+		{"app_d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9", true}, // 4 + 32 hex = 36 chars
+		{"app_short", true},                            // prefix correct (length not enforced at auth layer)
+		{"bf_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false}, // bf_ prefix
+		{"uk_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false}, // uk_ prefix
+		{"app", false}, // too short, no underscore
 		{"", false},
 	}
 

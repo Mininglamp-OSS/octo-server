@@ -55,17 +55,64 @@ func TestRuntimeCatalogCacheConfigFromEnvIsBounded(t *testing.T) {
 
 func TestRuntimeDynamicAuthorizerKeepsNewSendDarkAndRequiresGrant(t *testing.T) {
 	access := cardtmpl.CatalogAccess{Purpose: cardtmpl.CatalogPurposeNewSend}
+	sendGrant := cardtmpl.RuntimeGrant{Found: true, Scope: cardtmpl.RuntimeGrantScopeExact, Discover: true, Send: true}
+	approved := cardtmpl.RuntimeArtifactMeta{Owner: "docs"}
+
+	// The new-send gate is checked before anything principal-specific, so a
+	// dark deployment cannot be used to probe grants.
 	authorize := runtimeDynamicAuthorizer(runtimeCatalogGates{}, nil)
-	if err := authorize(context.Background(), access, cardtmpl.RuntimeArtifactMeta{}); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNewSendDisabled) {
+	if err := authorize(context.Background(), access, approved, sendGrant); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNewSendDisabled) {
 		t.Fatalf("dark new-send error = %v, want ErrRuntimeCatalogNewSendDisabled", err)
 	}
 	authorize = runtimeDynamicAuthorizer(runtimeCatalogGates{newSendEnabled: true}, nil)
-	if err := authorize(context.Background(), access, cardtmpl.RuntimeArtifactMeta{}); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized) {
+	if err := authorize(context.Background(), access, approved, cardtmpl.RuntimeGrant{}); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized) {
 		t.Fatalf("ungranted new-send error = %v, want ErrRuntimeCatalogNotAuthorized", err)
 	}
-	authorize = runtimeDynamicAuthorizer(runtimeCatalogGates{newSendEnabled: true},
-		func(context.Context, cardtmpl.CatalogAccess, cardtmpl.RuntimeArtifactMeta) error { return nil })
-	if err := authorize(context.Background(), access, cardtmpl.RuntimeArtifactMeta{Owner: "ext.vendor"}); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized) {
+	if err := authorize(context.Background(), access, cardtmpl.RuntimeArtifactMeta{Owner: "ext.vendor"}, sendGrant); !errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized) {
 		t.Fatalf("unapproved owner error = %v, want ErrRuntimeCatalogNotAuthorized", err)
+	}
+	if err := authorize(context.Background(), access, approved, sendGrant); err != nil {
+		t.Fatalf("granted new-send: %v", err)
+	}
+}
+
+// A grant is per-permission, not a blanket pass: holding discover never
+// implies send, and a revoked tombstone (Found with nothing allowed) denies
+// exactly like an absent row.
+func TestRuntimeDynamicAuthorizerMatchesPurposeToPermission(t *testing.T) {
+	authorize := runtimeDynamicAuthorizer(runtimeCatalogGates{newSendEnabled: true}, nil)
+	meta := cardtmpl.RuntimeArtifactMeta{Owner: "docs"}
+	discoverOnly := cardtmpl.RuntimeGrant{Found: true, Scope: cardtmpl.RuntimeGrantScopeGlobal, Discover: true}
+	tombstone := cardtmpl.RuntimeGrant{Found: true, Scope: cardtmpl.RuntimeGrantScopeExact, Revision: 4}
+
+	for _, test := range []struct {
+		name    string
+		purpose cardtmpl.CatalogPurpose
+		grant   cardtmpl.RuntimeGrant
+		allow   bool
+	}{
+		{"discover does not imply send", cardtmpl.CatalogPurposeNewSend, discoverOnly, false},
+		{"discover does not imply edit", cardtmpl.CatalogPurposeHistoricalEdit, discoverOnly, false},
+		{"send does not imply edit", cardtmpl.CatalogPurposeNewSend,
+			cardtmpl.RuntimeGrant{Found: true, Discover: true, Send: true}, true},
+		{"edit covers historical edit", cardtmpl.CatalogPurposeHistoricalEdit,
+			cardtmpl.RuntimeGrant{Found: true, Discover: true, Edit: true}, true},
+		{"edit covers action context", cardtmpl.CatalogPurposeActionContext,
+			cardtmpl.RuntimeGrant{Found: true, Discover: true, Edit: true}, true},
+		{"send alone cannot answer an action", cardtmpl.CatalogPurposeActionContext,
+			cardtmpl.RuntimeGrant{Found: true, Discover: true, Send: true}, false},
+		{"tombstone denies send", cardtmpl.CatalogPurposeNewSend, tombstone, false},
+		{"tombstone denies edit", cardtmpl.CatalogPurposeHistoricalEdit, tombstone, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := authorize(context.Background(),
+				cardtmpl.CatalogAccess{Purpose: test.purpose}, meta, test.grant)
+			if test.allow && err != nil {
+				t.Fatalf("authorize = %v, want allow", err)
+			}
+			if !test.allow && !errors.Is(err, cardtmpl.ErrRuntimeCatalogNotAuthorized) {
+				t.Fatalf("authorize = %v, want ErrRuntimeCatalogNotAuthorized", err)
+			}
+		})
 	}
 }

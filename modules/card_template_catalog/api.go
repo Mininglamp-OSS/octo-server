@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -40,14 +41,24 @@ type API struct {
 	store               catalogStore
 	compile             compileArtifactFunc
 	validateStateTarget func(context.Context, cardtmpl.ID, string) (stateTargetReceipt, error)
-	controlEnabled      bool
-	registry            *cardtmpl.Registry
-	readiness           *runtimeCatalogReadiness
-	startupMu           sync.Mutex
-	startupCancel       context.CancelFunc
-	startupDone         chan struct{}
-	logger              log.Log
-	metrics             *catalogMetrics
+	// validateGrantPrincipal 校验 grant principal/scope 的存在性（D2：bot 活跃、
+	// internal producer 已注册、Space 存在且 active）。生产走
+	// productionGrantPrincipalCheck；测试注入。未接线时 grant 写 fail-close。
+	validateGrantPrincipal func(context.Context, GrantIdentity) error
+	controlEnabled         bool
+	// discovery overrides the B1/B2 read surface in tests. Production leaves it
+	// nil and type-asserts the shared store, so there is one read model.
+	discovery discoveryStore
+	// staticEntries overrides the frozen Registry listing in tests; see
+	// API.staticCatalog. Production leaves it nil.
+	staticEntries func() []cardtmpl.StaticCatalogEntry
+	registry      *cardtmpl.Registry
+	readiness     *runtimeCatalogReadiness
+	startupMu     sync.Mutex
+	startupCancel context.CancelFunc
+	startupDone   chan struct{}
+	logger        log.Log
+	metrics       *catalogMetrics
 }
 
 func New(ctx *config.Context) *API {
@@ -69,6 +80,7 @@ func New(ctx *config.Context) *API {
 		metrics:        metrics,
 	}
 	api.validateStateTarget = api.validateTarget
+	api.validateGrantPrincipal = api.productionGrantPrincipalCheck
 	registry := cardtmpl.DefaultRegistry()
 	if registry == nil {
 		if !ctx.GetConfig().Test {
@@ -125,6 +137,7 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 		a.ctx.AuthMiddleware(r),
 		appwkhttp.SharedUIDRateLimiter(r, a.ctx),
 	)
+	manager.GET("", a.managerList)
 	manager.POST("/validate", a.validate)
 	manager.POST("/publish", a.publish)
 	manager.GET("/:id/audit", a.audit)
@@ -132,6 +145,23 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 	manager.PUT("/:id/active", a.activate)
 	manager.POST("/:id/rollback", a.rollback)
 	manager.POST("/:id/block", a.block)
+	manager.PUT("/:id/grants/:principal_type/:principal_id", a.grantUpsert)
+	manager.DELETE("/:id/grants/:principal_type/:principal_id", a.grantRevoke)
+
+	// PR-C D5 — B1/B2. Unlike the manager plane these are ordinary
+	// authenticated reads, so they run behind the Space middleware: a caller
+	// with no Space context sees only public templates, and a caller claiming
+	// one has that claim verified before any visibility decision uses it. The
+	// localized variant keeps these responses on the card catalog's error
+	// envelope instead of the legacy raw-JSON one.
+	discovery := r.Group(
+		"/v1/message/card/templates",
+		a.ctx.AuthMiddleware(r),
+		appwkhttp.SharedUIDRateLimiter(r, a.ctx),
+		space.LocalizedSpaceMiddleware(a.ctx),
+	)
+	discovery.GET("", a.listTemplates)
+	discovery.GET("/:ref", a.getTemplate)
 }
 
 type controlRequest struct {
