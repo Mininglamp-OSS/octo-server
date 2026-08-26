@@ -612,10 +612,14 @@ var (
 		DefaultMessage: "The management-console verification code cannot be sent yet. Please try again later.",
 		SafeDetailKeys: []string{"retry_after"},
 	})
-	ErrUserManagerMFAVerificationLocked = register(codes.Code{
-		ID:             "err.server.user.manager_mfa_verification_locked",
+	// ErrUserManagerMFAVerifyLocked fires when the operator has entered the
+	// wrong verification code three times and verification is locked for
+	// ten minutes. Distinct from the send cooldown (ErrUserManagerMFARateLimited)
+	// so the client can render a verification-specific countdown and message.
+	ErrUserManagerMFAVerifyLocked = register(codes.Code{
+		ID:             "err.server.user.manager_mfa_verify_locked",
 		HTTPStatus:     http.StatusTooManyRequests,
-		DefaultMessage: "Too many invalid management-console verification attempts. Verification is temporarily locked.",
+		DefaultMessage: "Too many incorrect verification attempts. Verification is temporarily locked. Please try again later.",
 		SafeDetailKeys: []string{"retry_after"},
 	})
 	ErrUserManagerMFAEmailRequired = register(codes.Code{

@@ -25,8 +25,8 @@ other = "The management-console verification code is invalid."
 ["err.server.user.manager_mfa_rate_limited"]
 other = "The management-console verification code cannot be sent yet. Please try again later."
 
-["err.server.user.manager_mfa_verification_locked"]
-other = "Too many invalid management-console verification attempts. Verification is temporarily locked."
+["err.server.user.manager_mfa_verify_locked"]
+other = "Too many incorrect verification attempts. Verification is temporarily locked. Please try again later."
 
 ["err.server.user.manager_email_mfa_enable_email_required"]
 other = "The operator must have a valid email address before enabling management-console MFA."

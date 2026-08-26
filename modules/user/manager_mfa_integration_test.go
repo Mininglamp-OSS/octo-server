@@ -374,9 +374,9 @@ func TestManagerConsoleMFAVerificationLockHasDistinct429Contract(t *testing.T) {
 		"code":         wrongCode,
 	}))
 	require.Equal(t, http.StatusTooManyRequests, locked.Code, locked.Body.String())
-	assert.Contains(t, locked.Body.String(), "err.server.user.manager_mfa_verification_locked")
+	assert.Contains(t, locked.Body.String(), "err.server.user.manager_mfa_verify_locked")
 	assert.Contains(t, locked.Body.String(), "retry_after")
-	assert.Contains(t, locked.Body.String(), "错误次数过多")
+	assert.Contains(t, locked.Body.String(), "连续多次输入错误")
 	assert.NotContains(t, locked.Body.String(), "发送过于频繁")
 }
 

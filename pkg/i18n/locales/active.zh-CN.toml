@@ -402,8 +402,8 @@ other = "管理控制台验证码无效。"
 ["err.server.user.manager_mfa_rate_limited"]
 other = "管理控制台验证码发送过于频繁，请稍后再试。"
 
-["err.server.user.manager_mfa_verification_locked"]
-other = "管理控制台验证码错误次数过多，验证功能已暂时锁定，请稍后再试。"
+["err.server.user.manager_mfa_verify_locked"]
+other = "验证码连续多次输入错误，验证已临时锁定，请稍后再试。"
 
 ["err.server.user.manager_email_mfa_enable_email_required"]
 other = "开启管理控制台 MFA 前，当前超管必须配置有效邮箱。"

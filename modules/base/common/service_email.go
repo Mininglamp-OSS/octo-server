@@ -147,28 +147,30 @@ func (s *EmailService) EmailSendRateLimitRetryAfter(email string, codeType CodeT
 	return retryAfter, nil
 }
 
-var (
-	ErrManagerCodeInvalid       = errors.New("invalid manager verification code")
-	ErrManagerCodeLocked        = errors.New("too many failed attempts, locked for 10 minutes")
-	errEmailCodeSuperseded      = errors.New("email verification status was superseded")
-	errInvalidTrackedCodeResult = errors.New("invalid tracked email code result")
-)
+// ErrManagerCodeLocked is a sentinel for errors.Is checks; the concrete error
+// type is *ManagerCodeLockedError which carries the remaining TTL.
+var ErrManagerCodeLocked = errors.New("too many failed attempts, locked for 10 minutes")
 
-// ManagerCodeVerificationLockedError keeps the verification-lock semantics
-// separate from the email-send cooldown semantics. It unwraps to the legacy
-// ErrManagerCodeLocked sentinel so existing callers can continue to use
-// errors.Is while manager-console handlers can expose the remaining lock time.
-type ManagerCodeVerificationLockedError struct {
+// ManagerCodeLockedError is returned when verify attempts are exhausted and
+// the operator is locked out for ten minutes. RetryAfter is the remaining
+// lock TTL in seconds (>= 1) so callers can surface a countdown.
+type ManagerCodeLockedError struct {
 	RetryAfter int
 }
 
-func (e *ManagerCodeVerificationLockedError) Error() string {
-	return ErrManagerCodeLocked.Error()
+func (e *ManagerCodeLockedError) Error() string {
+	return fmt.Sprintf("too many failed attempts, locked for ~%ds", e.RetryAfter)
 }
 
-func (e *ManagerCodeVerificationLockedError) Unwrap() error {
-	return ErrManagerCodeLocked
+func (e *ManagerCodeLockedError) Is(target error) bool {
+	return target == ErrManagerCodeLocked
 }
+
+var (
+	ErrManagerCodeInvalid       = errors.New("invalid manager verification code")
+	errEmailCodeSuperseded      = errors.New("email verification status was superseded")
+	errInvalidTrackedCodeResult = errors.New("invalid tracked email code result")
+)
 
 // SendVerifyCode 发送验证码。
 //
@@ -793,12 +795,15 @@ func (s *EmailService) verifyRedis() *rd.Client {
 // this makes the password-validated challenge single-use even if token
 // issuance later fails.
 func (s *EmailService) VerifyManagerCodeAtomically(ctx context.Context, email, code, challengeID string, activeKey, sendStateKey, challengeKey string) error {
+	const lockTTL = 10 * time.Minute
 	const script = `
-local lock = redis.call('GET', KEYS[4])
-if lock then
-  local lockTTL = redis.call('PTTL', KEYS[4])
-  if lockTTL <= 0 then return {2, tonumber(ARGV[3])} end
-  return {2, math.max(1, math.ceil(lockTTL / 1000))}
+local lock_ttl = redis.call('TTL', KEYS[4])
+if lock_ttl ~= -2 then
+  if lock_ttl == -1 then
+    redis.call('EXPIRE', KEYS[4], ARGV[3])
+    return {2, tonumber(ARGV[3])}
+  end
+  return {2, lock_ttl}
 end
 if redis.call('GET', KEYS[5]) ~= ARGV[2] then return {0, 0} end
 local expected = redis.call('GET', KEYS[1])
@@ -821,6 +826,7 @@ end
 redis.call('SET', KEYS[3], tostring(count), 'EX', ARGV[4])
 return {0, 0}
 `
+	lockTTLSecs := int(lockTTL / time.Second)
 	result, err := s.verifyRedis().WithContext(ctx).Eval(script, []string{
 		EmailCodeKey(email, CodeTypeManagerLogin),
 		EmailCodeStatusKey(email, CodeTypeManagerLogin),
@@ -829,7 +835,7 @@ return {0, 0}
 		activeKey,
 		sendStateKey,
 		challengeKey,
-	}, code, challengeID, int((10 * time.Minute).Seconds()), int((10 * time.Minute).Seconds())).Result()
+	}, code, challengeID, lockTTLSecs, lockTTLSecs).Result()
 	if err != nil {
 		return err
 	}
@@ -837,20 +843,40 @@ return {0, 0}
 	if !ok || len(parts) != 2 {
 		return errors.New("invalid manager verification result")
 	}
-	value, ok := parts[0].(int64)
-	if !ok {
-		return errors.New("invalid manager verification status")
+	statusVal, ok1 := redisInt64(parts[0])
+	retryVal, ok2 := redisInt64(parts[1])
+	if !ok1 || !ok2 {
+		return errors.New("invalid manager verification result")
 	}
-	retryAfter, ok := parts[1].(int64)
-	if !ok {
-		return errors.New("invalid manager verification retry-after")
+	retryAfter := int(retryVal)
+	if retryAfter < 1 {
+		retryAfter = 1
 	}
-	switch value {
+	switch statusVal {
 	case 1:
 		return nil
 	case 2:
-		return &ManagerCodeVerificationLockedError{RetryAfter: int(retryAfter)}
+		return &ManagerCodeLockedError{RetryAfter: retryAfter}
 	default:
 		return ErrManagerCodeInvalid
+	}
+}
+
+func redisInt64(value interface{}) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case []byte:
+		var n int64
+		_, err := fmt.Sscanf(string(v), "%d", &n)
+		return n, err == nil
+	case string:
+		var n int64
+		_, err := fmt.Sscanf(v, "%d", &n)
+		return n, err == nil
+	default:
+		return 0, false
 	}
 }

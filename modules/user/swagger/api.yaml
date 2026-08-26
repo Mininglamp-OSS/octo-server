@@ -150,7 +150,7 @@ paths:
           schema:
             $ref: "#/definitions/response"
         429:
-          description: "验证码错误次数达到锁定阈值（err.server.user.manager_mfa_verification_locked，含 details.retry_after）或管理端入口限流；线上状态为 429"
+          description: "验证码错误次数达到锁定阈值（err.server.user.manager_mfa_verify_locked，含 details.retry_after）或管理端入口限流；线上状态为 429"
           schema:
             $ref: "#/definitions/response"
         503:
@@ -2979,7 +2979,7 @@ definitions:
     properties:
       code:
         type: "string"
-        description: "稳定的错误码，例如 err.server.user.manager_mfa_verification_locked"
+        description: "稳定的错误码，例如 err.server.user.manager_mfa_verify_locked"
       message:
         type: "string"
         description: "按请求语言渲染的错误消息"

@@ -648,22 +648,14 @@ func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
 		managerMFAActiveKey(challenge.UID), managerMFASendStateKey(challenge.ID),
 		managerMFAChallengeKey(challenge.ID),
 	)
-	var verificationLocked *commonbase.ManagerCodeVerificationLockedError
-	if errors.As(err, &verificationLocked) {
-		retryAfter := verificationLocked.RetryAfter
+	var lockedErr *commonbase.ManagerCodeLockedError
+	if errors.As(err, &lockedErr) {
+		retryAfter := lockedErr.RetryAfter
 		if retryAfter < 1 {
-			retryAfter = int((10 * time.Minute) / time.Second)
+			retryAfter = 1
 		}
-		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerificationLocked, octoi18n.Details{
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerifyLocked, octoi18n.Details{
 			"retry_after": retryAfter,
-		})
-		return
-	}
-	if errors.Is(err, commonbase.ErrManagerCodeLocked) {
-		// Keep a defensive fallback for callers that may still return the legacy
-		// sentinel without the typed retry-after wrapper.
-		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerificationLocked, octoi18n.Details{
-			"retry_after": int((10 * time.Minute) / time.Second),
 		})
 		return
 	}

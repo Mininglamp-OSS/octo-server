@@ -219,7 +219,7 @@ func TestManagerMFAAtomicVerifyReturnsVerificationLockRetryAfter(t *testing.T) {
 		assert.ErrorIs(t, err, commonbase.ErrManagerCodeInvalid)
 	}
 
-	var locked *commonbase.ManagerCodeVerificationLockedError
+	var locked *commonbase.ManagerCodeLockedError
 	err := emailService.VerifyManagerCodeAtomically(
 		context.Background(), email, "000000", challengeID,
 		keys[4], keys[5], keys[6],
@@ -234,7 +234,7 @@ func TestManagerMFAAtomicVerifyReturnsVerificationLockRetryAfter(t *testing.T) {
 	// lock first so this assertion cannot pass if the implementation returns a
 	// fixed 600-second value instead of driving the PTTL branch.
 	require.NoError(t, service.client.Expire(keys[3], 5*time.Second).Err())
-	var lockedAgain *commonbase.ManagerCodeVerificationLockedError
+	var lockedAgain *commonbase.ManagerCodeLockedError
 	err = emailService.VerifyManagerCodeAtomically(
 		context.Background(), email, "000000", challengeID, keys[4], keys[5], keys[6],
 	)
