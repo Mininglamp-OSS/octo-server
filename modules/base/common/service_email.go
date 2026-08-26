@@ -147,9 +147,27 @@ func (s *EmailService) EmailSendRateLimitRetryAfter(email string, codeType CodeT
 	return retryAfter, nil
 }
 
+// ErrManagerCodeLocked is a sentinel for errors.Is checks; the concrete error
+// type is *ManagerCodeLockedError which carries the remaining TTL.
+var ErrManagerCodeLocked = errors.New("too many failed attempts, locked for 10 minutes")
+
+// ManagerCodeLockedError is returned when verify attempts are exhausted and
+// the operator is locked out for ten minutes. RetryAfter is the remaining
+// lock TTL in seconds (>= 1) so callers can surface a countdown.
+type ManagerCodeLockedError struct {
+	RetryAfter int
+}
+
+func (e *ManagerCodeLockedError) Error() string {
+	return fmt.Sprintf("too many failed attempts, locked for ~%ds", e.RetryAfter)
+}
+
+func (e *ManagerCodeLockedError) Is(target error) bool {
+	return target == ErrManagerCodeLocked
+}
+
 var (
 	ErrManagerCodeInvalid       = errors.New("invalid manager verification code")
-	ErrManagerCodeLocked        = errors.New("too many failed attempts, locked for 10 minutes")
 	errEmailCodeSuperseded      = errors.New("email verification status was superseded")
 	errInvalidTrackedCodeResult = errors.New("invalid tracked email code result")
 )
@@ -777,10 +795,17 @@ func (s *EmailService) verifyRedis() *rd.Client {
 // this makes the password-validated challenge single-use even if token
 // issuance later fails.
 func (s *EmailService) VerifyManagerCodeAtomically(ctx context.Context, email, code, challengeID string, activeKey, sendStateKey, challengeKey string) error {
+	const lockTTL = 10 * time.Minute
 	const script = `
-local lock = redis.call('GET', KEYS[4])
-if lock then return 2 end
-if redis.call('GET', KEYS[5]) ~= ARGV[2] then return 0 end
+local lock_ttl = redis.call('TTL', KEYS[4])
+if lock_ttl ~= -2 then
+  if lock_ttl == -1 then
+    redis.call('EXPIRE', KEYS[4], ARGV[3])
+    return {2, tonumber(ARGV[3])}
+  end
+  return {2, lock_ttl}
+end
+if redis.call('GET', KEYS[5]) ~= ARGV[2] then return {0, 0} end
 local expected = redis.call('GET', KEYS[1])
 local status = redis.call('GET', KEYS[2])
 local sendStatus = redis.call('HGET', KEYS[6], 'status')
@@ -790,17 +815,18 @@ if expected and sendStatus == 'sent' and attemptID and status == ('sent:' .. att
 	if redis.call('GET', KEYS[5]) == ARGV[2] then
 	  redis.call('DEL', KEYS[5], KEYS[7])
 	end
-	return 1
+	return {1, 0}
 end
 local count = tonumber(redis.call('GET', KEYS[3]) or '0') + 1
 if count >= 3 then
   redis.call('SET', KEYS[4], '1', 'EX', ARGV[3])
   redis.call('DEL', KEYS[3])
-  return 2
+  return {2, tonumber(ARGV[3])}
 end
 redis.call('SET', KEYS[3], tostring(count), 'EX', ARGV[4])
-return 0
+return {0, 0}
 `
+	lockTTLSecs := int(lockTTL / time.Second)
 	result, err := s.verifyRedis().WithContext(ctx).Eval(script, []string{
 		EmailCodeKey(email, CodeTypeManagerLogin),
 		EmailCodeStatusKey(email, CodeTypeManagerLogin),
@@ -809,20 +835,48 @@ return 0
 		activeKey,
 		sendStateKey,
 		challengeKey,
-	}, code, challengeID, int((10 * time.Minute).Seconds()), int((10 * time.Minute).Seconds())).Result()
+	}, code, challengeID, lockTTLSecs, lockTTLSecs).Result()
 	if err != nil {
 		return err
 	}
-	value, ok := result.(int64)
-	if !ok {
+	parts, ok := result.([]interface{})
+	if !ok || len(parts) != 2 {
 		return errors.New("invalid manager verification result")
 	}
-	switch value {
+	statusVal, ok1 := redisInt64(parts[0])
+	retryVal, ok2 := redisInt64(parts[1])
+	if !ok1 || !ok2 {
+		return errors.New("invalid manager verification result")
+	}
+	retryAfter := int(retryVal)
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	switch statusVal {
 	case 1:
 		return nil
 	case 2:
-		return ErrManagerCodeLocked
+		return &ManagerCodeLockedError{RetryAfter: retryAfter}
 	default:
 		return ErrManagerCodeInvalid
+	}
+}
+
+func redisInt64(value interface{}) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case []byte:
+		var n int64
+		_, err := fmt.Sscanf(string(v), "%d", &n)
+		return n, err == nil
+	case string:
+		var n int64
+		_, err := fmt.Sscanf(v, "%d", &n)
+		return n, err == nil
+	default:
+		return 0, false
 	}
 }

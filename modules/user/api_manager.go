@@ -656,8 +656,15 @@ func (m *Manager) verifyManagerMFACode(c *wkhttp.Context) {
 		managerMFAActiveKey(challenge.UID), managerMFASendStateKey(challenge.ID),
 		managerMFAChallengeKey(challenge.ID),
 	)
-	if errors.Is(err, commonbase.ErrManagerCodeLocked) {
-		managerMFAResponseError(c, errcode.ErrUserManagerMFARateLimited, nil)
+	var lockedErr *commonbase.ManagerCodeLockedError
+	if errors.As(err, &lockedErr) {
+		retryAfter := lockedErr.RetryAfter
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		managerMFAResponseError(c, errcode.ErrUserManagerMFAVerifyLocked, octoi18n.Details{
+			"retry_after": retryAfter,
+		})
 		return
 	}
 	if errors.Is(err, commonbase.ErrManagerCodeInvalid) {
