@@ -74,7 +74,14 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 	var operatorName, memberName string
 	if removal.Reason != spacemod.MemberRemoveReasonSpaceDisbanded {
 		operatorName = g.resolveDisplayName(removal.OperatorUID)
-		memberName = g.resolveDisplayName(removal.UID)
+		// 注意这里用的是 resolveGlobalName（查不到给空串）而**不是**
+		// resolveDisplayName（查不到给 uid）：这个名字会进交接通告的 extra，
+		// 而那是持久的群历史，绝不能落到裸 uid。兜底交给 resolveExitShowName。
+		//
+		// operatorName 上面仍用 resolveDisplayName：它进的是 RemoveGroupMembers 的
+		// 私人通知（「你被{0}移除群聊」），只发给被移除者本人，不是群历史，
+		// 兜底行为不在本次范围内。
+		memberName = g.resolveGlobalName(removal.UID)
 	}
 
 	var firstErr error
@@ -145,12 +152,13 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 
 	// 展示名按群取：group_member.remark 是本群内的称呼，优先于全局 user.name。
 	// 这是本仓库既有的展示名规则——groupExit 就是 `loginMember.Remark` 优先
-	// （api.go:3458）、花名册也渲染 Remark。用全局名会在群里播一个没人认识的名字。
-	// memberName 是循环外查好的全局名兜底。
-	displayName := member.Remark
-	if displayName == "" {
-		displayName = memberName
-	}
+	// （api.go）、花名册也渲染 Remark。用全局名会在群里播一个没人认识的名字。
+	//
+	// 走 #807 的 resolveExitShowName，与退群提示同一套口径：remark → 全局名 →
+	// **中性兜底**，绝不落到裸 uid。理由见 exitShowNameFallback：这条通告全员可见、
+	// 持久，后来入群的人也读得到，把内部 UID 永久写进群历史等于泄露一个不该出现在
+	// 聊天记录里的标识符。memberName 是循环外查好的全局名（查不到为空串）。
+	displayName := resolveExitShowName(member.Remark, func() string { return memberName })
 
 	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
 
@@ -294,7 +302,7 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 	}
 
 	// 继任者也在同一事务内查，避免用事务外的陈旧快照
-	successor, err := querySecondOldestNonBotMemberTx(tx, groupNo, leaverUID)
+	successor, err := querySecondOldestEligibleMemberTx(tx, groupNo, leaverUID)
 	if err != nil {
 		return fmt.Errorf("query successor: %w", err)
 	}
@@ -414,10 +422,9 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 	//
 	// 展示名取群内 remark 优先，与 groupExit / 花名册一致；successor 是事务里
 	// FOR UPDATE 选出的那一行，Remark 直接可用，无需再查一次库。
-	successorName := successor.Remark
-	if successorName == "" {
-		successorName = g.resolveDisplayName(successor.UID)
-	}
+	successorName := resolveExitShowName(successor.Remark, func() string {
+		return g.resolveGlobalName(successor.UID)
+	})
 	// best-effort：交接已经提交，通告发不出去不该让整条工单重试——重跑时锁内重读
 	// 已非 creator，只会空转到 abandoned，而交接本身是对的。
 	if err := g.sendSpaceRemovalHandoverNotice(
@@ -458,11 +465,13 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 // ⚠️ i18n 注意：Android 用 MessageFormat，ASCII 单引号 ' 是转义字符。当前中文全角
 // 引号安全，但将来译成英文若写成 the group's owner，占位符只在 Android 端被静默吞掉。
 func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, successorUID, successorName string) error {
+	// 双保险：调用方已经用 resolveExitShowName 兜过中性词了，这里再挡一次，
+	// 且**绝不**兜成 uid —— 见 exitShowNameFallback 的理由（PR #804 round-11 P1-2）。
 	if leaverName == "" {
-		leaverName = leaverUID
+		leaverName = exitShowNameFallback
 	}
 	if successorName == "" {
-		successorName = successorUID
+		successorName = exitShowNameFallback
 	}
 	return g.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
@@ -485,7 +494,26 @@ func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, s
 	})
 }
 
+// resolveGlobalName 取全局用户名，查不到 / 没名字都返回**空串**。
+//
+// 与 resolveDisplayName 的唯一区别就是兜底：那个退回 uid，这个退回空串。差别是承重的
+// —— 凡是结果会进**持久群消息**的路径都必须用这个，把兜底交给 resolveExitShowName
+// 的中性词，绝不能让内部 UID 永久留在群历史里（#807 / PR #804 round-11 P1-2）。
+func (g *Group) resolveGlobalName(uid string) string {
+	if uid == "" {
+		return ""
+	}
+	u, err := g.userDB.QueryByUID(uid)
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.Name
+}
+
 // resolveDisplayName 取展示名，查不到就退回 UID。
+//
+// ⚠️ 只能用于**不进群历史**的场景（当前只剩 RemoveGroupMembers 的私人通知
+// OperatorName）。要进群消息的用 resolveGlobalName + resolveExitShowName。
 // 只用于系统 Tip 文案，失败不该让整条清理工单重试。
 func (g *Group) resolveDisplayName(uid string) string {
 	if uid == "" {
@@ -501,10 +529,10 @@ func (g *Group) resolveDisplayName(uid string) string {
 	return u.Name
 }
 
-// querySecondOldestNonBotMemberTx 是 DB.QuerySecondOldestMemberExcludingBotsOf 的
+// querySecondOldestEligibleMemberTx 是 DB.QuerySecondOldestEligibleMember 的
 // 事务内版本，资格谓词与它逐字一致。单独一份是为了让选主与角色重校验落在同一个
 // 事务、同一份读视图里。资格口径的理由见非事务版的注释。
-func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
+func querySecondOldestEligibleMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
 	var member *MemberModel
 	// FOR UPDATE 锁住选中的继任者：不锁的话它可能正被另一条清理工单删除，
 	// UpdateMemberRoleTx 的 WHERE 带 is_deleted=0，会静默影响 0 行，

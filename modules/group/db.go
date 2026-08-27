@@ -961,7 +961,10 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 	return uids, err
 }
 
-// QuerySecondOldestMemberExcludingBotsOf 选出第二元老成员（群主退群时的新群主人选）。
+// QuerySecondOldestEligibleMember 选出第二元老成员（群主退群时的新群主人选）。
+//
+// 旧名 …ExcludingBotsOf 描述的是"只排除某人名下的 bot"那一版，现在排除的是全部 bot
+// 加上外部成员和非正常 status，名字不再准确，故改名。
 //
 // 资格谓词与手动转让 transferGrouper 对齐：**排除 bot、排除外部成员、要求 status 正常**。
 // 两条路径决定的是同一件事——谁可以持有群主权限——此前它们给的答案不一样。
@@ -977,7 +980,7 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 //     不会行使权限的"群主"要诚实。
 //
 //     ⚠️ 这**推翻**了一条被显式钉住的既有契约：
-//     TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 曾断言「他人的 bot 不在
+//     TestQuerySecondOldestEligibleMember_OnlyBotsLeft 曾断言「他人的 bot 不在
 //     排除范围内（与旧 QuerySecondOldestMember 语义一致）」。那条断言记录的是历史
 //     延续，不是一个论证过的决定——#354 当时只关心「即将被级联删除」这一个失败模式，
 //     没有考虑权限归属。该测试已随本改动更新。
@@ -992,9 +995,16 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 //   - **status 正常（gm.status = GroupMemberStatusNormal）**。status=2 是群黑名单。
 //     把一个被拉黑的成员提为群主，等于用自动路径撤销一次管理动作。
 //
-// 这三条在 Space 移除级联（querySecondOldestNonBotMemberTx）与用户主动退群
+// 这三条在 Space 移除级联（querySecondOldestEligibleMemberTx）与用户主动退群
 // （groupExit → 本函数）上必须一致：只改一条就会让另一条成为绕过新规则的后门。
-func (d *DB) QuerySecondOldestMemberExcludingBotsOf(groupNo string, leaverUID string) (*MemberModel, error) {
+//
+// `gm.uid <> ?` 显式排除离开者本人。以前不需要它：leaverUID 只出现在 bot join 的
+// creator_uid 条件里，而离开者靠 `role <> MemberRoleCreator` 被顺带滤掉。收紧谓词后
+// 那个 join 没了，离开者就只剩下"角色还没被降级"这一个**偶然**保护 ——
+// handOverGroupCreator 恰好先选主、后降级；把这两句调换，离开者就会选中自己当继任者，
+// 而没有编译错误、没有测试会拦住（PR #804 round-11 review P2）。把它写成谓词，
+// 保护就不再依赖语句顺序。
+func (d *DB) QuerySecondOldestEligibleMember(groupNo string, leaverUID string) (*MemberModel, error) {
 	var memberModel *MemberModel
 	_, err := d.session.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+

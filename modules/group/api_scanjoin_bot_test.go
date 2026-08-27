@@ -26,11 +26,11 @@ import (
 //
 //  3. 单测覆盖整条链路的等价行为：
 //     - TestQueryExternalMemberCount_ExcludesBots / OnlyBotsReturnsZero /
-//       MixedMulti / DeletedHuman 证明 robot=1 + is_external=1 的行不会
-//       被 QueryExternalMemberCountTx 计入，从而 DELETE 路径不会把群误判
-//       成外部群。
+//     MixedMulti / DeletedHuman 证明 robot=1 + is_external=1 的行不会
+//     被 QueryExternalMemberCountTx 计入，从而 DELETE 路径不会把群误判
+//     成外部群。
 //     - TestAddMembers_BotOnly_DoesNotFlipIsExternalGroup 覆盖批量 ADD 的
-//       flip 保护，证明 bot 加入空群不 flip、human 加入仍 flip。
+//     flip 保护，证明 bot 加入空群不 flip、human 加入仍 flip。
 //
 //  4. 现实触发面：正式客户端不会让 bot 调 /scanjoin（bot 通过 API 流程入群，
 //     不走二维码）。本次修复属于防御性对称补齐，避免未来新入口回归。

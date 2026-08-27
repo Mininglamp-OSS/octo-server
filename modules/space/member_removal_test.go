@@ -1976,3 +1976,52 @@ func TestBatchRemovalLocksInBranchOrder(t *testing.T) {
 		})
 	}
 }
+
+// TestSortForLockOrderIsSpellingInvariant 钉住取锁排序的**真正**不变量：两个调用方
+// 即便用不同的拼写指代同一批行，也必须排出同一个取锁顺序。
+//
+// 上一版这里用的是 sort.Strings，注释写着「序本身是什么不重要，用最朴素的字节序
+// 正是因为它不需要任何前提」。那句话是假的，而且是这个 PR 反复犯的同一类错误
+// （PR #804 round-11 review P1-1）。
+//
+// 前提在这里：两边必须排**同一组字符串**。它们收到的却不一定是——`space_member.uid`
+// 没有显式 COLLATE，继承的库默认（CI general_ci / 生产 0900_ai_ci）**都是大小写
+// 不敏感**的，所以 `ABC` 与 `abc` 是同一行；而两个入口都不折叠大小写
+// （normalizeUIDs 按字节去重，用户端 removeMembers 连它都不调）。于是：
+//
+//	batch-add    收到 ["ABC", "abd"] → 字节序 → 锁 abc、再锁 abd
+//	batch-remove 收到 ["abc", "ABD"] → 字节序 → 锁 abd、再锁 abc
+//
+// 同两行、相反顺序 —— 正是那句注释宣称不可能的 AB-BA。而这一对恰恰是 round 9b 实测
+// 中 retryOnDeadlock **饿死**而非吸收的组合（60/60 未恢复），所以退化形态不是「重试
+// 一次就好」，而是一个访问撤销端点上持续的 500。
+//
+// 唯一索引把大小写变体折叠成同一个键，所以并发用例
+// TestUpsertMembersLocksInSameOrderAsBatchRemoval 结构上覆盖不到这个场景（插第二行
+// 直接 1062）。这条只测排序函数本身，正因为那里测不了。
+func TestSortForLockOrderIsSpellingInvariant(t *testing.T) {
+	// 同一批行（abc / abd），两个调用方各用一种拼写
+	addSide := sortForLockOrder([]string{"ABC", "abd"})
+	removeSide := sortForLockOrder([]string{"abc", "ABD"})
+
+	fold := func(uids []string) []string {
+		out := make([]string, 0, len(uids))
+		for _, u := range uids {
+			out = append(out, strings.ToLower(u))
+		}
+		return out
+	}
+	assert.Equal(t, fold(addSide), fold(removeSide),
+		"两个调用方指代同一批行时必须排出同一个取锁顺序；不同拼写排出不同顺序即 AB-BA")
+
+	// 不改调用方切片
+	orig := []string{"b", "a"}
+	_ = sortForLockOrder(orig)
+	assert.Equal(t, []string{"b", "a"}, orig, "必须排副本，不得改动调用方切片")
+
+	// 折叠后相等时用原始字节序兜底，保证是**全序**：sort.Slice 不稳定，
+	// 同一组输入必须排出同一个结果。
+	got := sortForLockOrder([]string{"AbC", "abc", "ABC"})
+	assert.Equal(t, []string{"ABC", "AbC", "abc"}, got,
+		"折叠后同键时按原始字节序，结果必须确定")
+}

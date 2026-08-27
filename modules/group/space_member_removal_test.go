@@ -1520,7 +1520,7 @@ func TestGroupCascadeLastNoticeNamesActualOwner(t *testing.T) {
 }
 
 // seedGroupMemberWithFlags 写一条带 robot / is_external / status 标记的成员行。
-// 选主资格谓词（QuerySecondOldestMemberExcludingBotsOf 及其事务版）就看这三列，
+// 选主资格谓词（QuerySecondOldestEligibleMember 及其事务版）就看这三列，
 // 不带标记的 seedGroupMember 覆盖不到任何一条排除分支。
 func seedGroupMemberWithFlags(t *testing.T, ctx *config.Context, groupNo, uid string, role, robot, isExternal, status int) {
 	t.Helper()
@@ -1683,4 +1683,41 @@ func payloadExtraNames(payloads []map[string]interface{}, fragment string) []str
 		return out
 	}
 	return nil
+}
+
+// TestGroupCascadeHandoverNoticeNeverWritesBareUID 交接通告的 extra 名字**绝不能**
+// 兜底成裸 uid。
+//
+// #807 在同一个包里已经定下这条规则，理由写在 exitShowNameFallback 上：提示全员可见
+// 且是持久历史，后来入群的人也读得到，把内部 UID 永久写进群历史等于泄露一个不该出现
+// 在聊天记录里的标识符。交接通告是完全相同的形状（NoPersist:0、群频道、无 visibles），
+// 却兜到了裸 uid（PR #804 round-11 review P1-2）。
+//
+// 注意兜底路径比看上去更容易走到：resolveDisplayName 查不到用户、或 user.name 为空时
+// **就返回 uid**，所以裸 uid 是作为一个**非空**名字到达发送函数的 —— 那里的 `== ""`
+// 守卫根本拦不住它。本用例因此不 seed user 行，走的正是这条真实路径。
+func TestGroupCascadeHandoverNoticeNeverWritesBareUID(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, gno = "sp-bareuid", "g-bareuid"
+	const creator, successor = "u-creator-bare", "u-successor-bare"
+
+	// 刻意**不** seedUser、也不设 remark：展示名解析会一路回落。
+	seedGroupInSpace(t, ctx, gno, spaceID, creator)
+	seedGroupMember(t, ctx, gno, creator, MemberRoleCreator)
+	seedGroupMember(t, ctx, gno, successor, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	names := payloadExtraNames(stub.sentPayloads(), "已成为新群主")
+	require.Len(t, names, 2, "交接通告应带两个 extra 名字")
+	for i, n := range names {
+		assert.NotContains(t, n, creator, "extra[%d] 不得包含离开者的裸 uid：%q", i, n)
+		assert.NotContains(t, n, successor, "extra[%d] 不得包含继任者的裸 uid：%q", i, n)
+		assert.Equal(t, exitShowNameFallback, n,
+			"解析不出名字时必须落到 #807 定下的中性兜底，而不是裸 uid")
+	}
 }

@@ -12,10 +12,10 @@ import (
 // This validates the fix for issue #390 - unsafe type assertion at line 81
 func TestExtractUID_SafeTypeAssertion(t *testing.T) {
 	tests := []struct {
-		name        string
-		payload     map[string]interface{}
-		expectOK    bool
-		expectUID   string
+		name      string
+		payload   map[string]interface{}
+		expectOK  bool
+		expectUID string
 	}{
 		{
 			name:      "missing uid field",

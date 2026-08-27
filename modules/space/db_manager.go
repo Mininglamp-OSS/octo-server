@@ -432,20 +432,20 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 //
 // 排序 uids 的副本，不改调用方切片（normalizeUIDs 保留调用方顺序，其返回值调用方后续还要用）。
 //
-// ⚠️ 这里的排序**不需要**匹配任何 collation，用最朴素的 sort.Strings 即可 —— 因为
-// 批量移除侧也用同一个函数排序，并通过 UNION ALL 的分支顺序取锁（见
-// buildSelectMembersForRemovalForUpdateSQL）。两边同序即无法成环；序本身是什么
-// 不重要，重要的是不依赖任何环境前提。
+// ⚠️ 这里的排序**不需要**复现列的 collation 顺序 —— 批量移除侧用同一个
+// sortForLockOrder，并通过 UNION ALL 的分支顺序落实它，两边同序即可。
 //
 // round 10 曾把这里改成一个复刻 utf8mb4_general_ci 的比较器，那是错的方向：列的
 // collation 因环境而异（CI general_ci / 生产 0900_ai_ci，两者对 '_' 的排序相反），
 // 任何"在 Go 里匹配 collation"的写法都只能对一种环境成立。
+//
+// 但"不复现 collation 顺序"不等于"没有前提"：排序键必须让两边对**同一行**得出同一个
+// 值，而这一列是大小写不敏感的。前提写在 sortForLockOrder 上。
 func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
-	ordered := append([]string(nil), uids...)
-	sort.Strings(ordered)
+	ordered := sortForLockOrder(uids)
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
@@ -461,6 +461,42 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// sortForLockOrder 给一批 uid 排出取锁顺序，返回**新切片**，不动调用方的。
+//
+// 所有会一次锁多行的 space_member 写路径都必须用它：两边同序才谈得上无法成环。
+//
+// **排序键是 strings.ToLower(uid)，不是 uid 本身**，这一点是承重的。`space_member.uid`
+// 没有显式 COLLATE，继承的库默认（CI 是 utf8mb4_general_ci，生产是
+// utf8mb4_0900_ai_ci）**都大小写不敏感**，于是 `ABC` 和 `abc` 指的是同一行；而两个
+// 入口都不折叠大小写（normalizeUIDs 按字节去重，用户端 removeMembers 连它都不调）。
+// 直接按字节排就会出现：
+//
+//	batch-add    收到 ["ABC", "abd"] → 锁 abc、再锁 abd
+//	batch-remove 收到 ["abc", "ABD"] → 锁 abd、再锁 abc
+//
+// 同两行、相反顺序。折叠之后两边对同一行得到同一个键，顺序才真正一致
+// （PR #804 round-11 review P1-1）。
+//
+// 折叠后相同时按原始字节序兜底：sort.Slice 不稳定，而同一组输入必须排出同一个结果。
+//
+// ⚠️ **边界，别把它读成无条件的**（这个 PR 已经因为无条件的不变量声明返工过好几轮）：
+// 折叠只处理大小写。生产的 0900_ai_ci 还是 accent-insensitive —— `café` 与 `cafe`
+// 也是同一行，而 ToLower 会给它们不同的键，那种情况下顺序仍可能分歧。今天不可达
+// （uid 由系统生成，都是 ASCII 标识符），且真发生时防线退回 retryOnDeadlock，
+// 不比修复前差。要让它彻底无条件，得在 API 边界把 uid 规范化到一个已知字母表 ——
+// 那是独立一项，见 follow-up。
+func sortForLockOrder(uids []string) []string {
+	ordered := append([]string(nil), uids...)
+	sort.Slice(ordered, func(i, j int) bool {
+		ki, kj := strings.ToLower(ordered[i]), strings.ToLower(ordered[j])
+		if ki != kj {
+			return ki < kj
+		}
+		return ordered[i] < ordered[j]
+	})
+	return ordered
 }
 
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权
@@ -841,17 +877,15 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// 按 uid 升序（sort.Strings，纯字节序）取锁，与 upsertMembersOnce 用的是**同一个
-	// 排序函数**。两边同序即结构上无法成环，且这个"序"是什么完全不重要 —— 重要的
-	// 只是两边一致。用最朴素的字节序正是因为它不需要任何前提：不问列的 collation，
-	// 不问部署环境，两个进程对同一组 uid 必然排出同一个顺序。
+	// 与 upsertMembersOnce 用**同一个**排序函数取锁。两边同序，这一对就不会成环。
 	//
-	// 排序的是副本，不动调用方切片（调用方后续不再用顺序，但别给下一个人留坑）。
+	// 序本身是什么不重要，重要的是两边对**同一行**得出同一个位置 —— 这就是为什么
+	// 排序键要折叠大小写而不能是裸字节序，理由见 sortForLockOrder（它也说明了这个
+	// 保证的边界在哪，别当成无条件的）。
 	//
-	// 加锁顺序由 UNION ALL 的分支顺序保证，与索引的 collation 无关，理由与实测见
-	// buildSelectMembersForRemovalForUpdateSQL 的注释。
-	ordered := append([]string(nil), uids...)
-	sort.Strings(ordered)
+	// 至于这个顺序如何落实成真正的取锁顺序：靠 UNION ALL 的分支顺序，与索引的
+	// collation 无关，理由与实测见 buildSelectMembersForRemovalForUpdateSQL。
+	ordered := sortForLockOrder(uids)
 
 	args := make([]interface{}, 0, len(ordered)*2)
 	for _, uid := range ordered {

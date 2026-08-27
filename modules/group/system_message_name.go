@@ -32,6 +32,7 @@ var bidiControls = []rune{
 	'⁩', // POP DIRECTIONAL ISOLATE
 	'‎', // LEFT-TO-RIGHT MARK
 	'‏', // RIGHT-TO-LEFT MARK
+	'؜', // ARABIC LETTER MARK（U+061C，与 LRM/RLM 同类，首版漏了）
 }
 
 // sanitizeSystemMessageName 把展示名处理成可以安全放进系统消息 extra 的形式。

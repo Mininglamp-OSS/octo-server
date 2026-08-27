@@ -39,6 +39,9 @@ func TestSanitizeSystemMessageName(t *testing.T) {
 			'‪', '‫', '‬', '‭', '‮',
 			'⁦', '⁧', '⁨', '⁩',
 			'‎', '‏',
+			// U+061C ARABIC LETTER MARK —— 与 LRM/RLM 同类的方向控制符，
+			// 首版漏掉了（PR #804 round-11 review P2）。
+			'؜',
 		} {
 			got := sanitizeSystemMessageName("a" + string(r) + "b")
 			assert.Equal(t, "ab", got, "U+%04X 必须被剥掉", r)
