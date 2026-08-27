@@ -194,11 +194,11 @@ func TestFileMaxSizeKB(t *testing.T) {
 	// 钳位器。回落默认值会让运维填 600000（想要 ~586MB）反而拿到 100MB，
 	// 比编辑前还小、也比键上写明的 512MB 还小，且写侧不会报错。
 	over := fileSnapSettings(map[string]string{"file.max_size_kb": "99999999"})
-	assert.Equal(t, FileMaxSizeKBHardCap, over.FileMaxSizeKB(),
+	assert.Equal(t, FileMaxSizeKBHardCap(), over.FileMaxSizeKB(),
 		"超上限应钳到硬上限，而不是回落 %d", DefaultFileMaxSizeKB)
 	// 恰好等于硬上限是允许的。
 	s := fileSnapSettings(map[string]string{"file.max_size_kb": "524288"})
-	assert.Equal(t, FileMaxSizeKBHardCap, s.FileMaxSizeKB())
+	assert.Equal(t, FileMaxSizeKBHardCap(), s.FileMaxSizeKB())
 }
 
 // ----- D6 组合约束 -----
@@ -265,4 +265,40 @@ func TestFileExtensionList_LongEntryIsRejectedByNormalisation(t *testing.T) {
 	got := ParseFileExtensionCSV(long + ",dwg")
 	assert.Len(t, got, 2)
 	assert.Contains(t, got, ".dwg")
+}
+
+// ----- 硬上限的 env 层（部署容量决策） -----
+
+func TestFileMaxSizeKBHardCap_DefaultsWhenUnset(t *testing.T) {
+	t.Setenv(envFileMaxSizeKBHardCap, "")
+	assert.Equal(t, defaultFileMaxSizeKBHardCap, FileMaxSizeKBHardCap())
+}
+
+func TestFileMaxSizeKBHardCap_FromEnv(t *testing.T) {
+	t.Setenv(envFileMaxSizeKBHardCap, "1048576") // 1GB
+	assert.Equal(t, 1048576, FileMaxSizeKBHardCap())
+}
+
+// 非法值回落代码默认值，而不是被原样服务 —— 一个负的或荒谬的天花板会让所有
+// 上传被拒（int64(maxKB)*1024 绕回负数），比"忽略这次配置"糟得多。
+func TestFileMaxSizeKBHardCap_RejectsInvalid(t *testing.T) {
+	for _, bad := range []string{"0", "-1", "abc", "  ", "999999999999"} {
+		t.Setenv(envFileMaxSizeKBHardCap, bad)
+		assert.Equal(t, defaultFileMaxSizeKBHardCap, FileMaxSizeKBHardCap(), "value=%q", bad)
+	}
+}
+
+// 运维抬高天花板后，管理台才能把实际值调到 512MB 以上。
+func TestFileMaxSizeKB_RespectsEnvHardCap(t *testing.T) {
+	t.Setenv(envFileMaxSizeKBHardCap, "1048576") // 天花板 1GB
+	s := fileSnapSettings(map[string]string{"file.max_size_kb": "800000"})
+	assert.Equal(t, 800000, s.FileMaxSizeKB(), "未超天花板的值应原样生效")
+}
+
+// 天花板压低时，既有的管理台配置被钳到天花板 —— 运维调低 env 后不需要再去
+// 管理台补一刀。
+func TestFileMaxSizeKB_ClampedByLoweredEnvHardCap(t *testing.T) {
+	t.Setenv(envFileMaxSizeKBHardCap, "2048") // 天花板 2MB
+	s := fileSnapSettings(map[string]string{"file.max_size_kb": "102400"})
+	assert.Equal(t, 2048, s.FileMaxSizeKB())
 }

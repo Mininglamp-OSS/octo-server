@@ -240,8 +240,8 @@ func TestPolicy_MaxUploadSizeRejectsOutOfRange(t *testing.T) {
 	}
 	// 超硬上限 → 钳到硬上限，与 common 侧钳位器同语义（回落默认值会让运维
 	// 填一个过大的值反而拿到比编辑前更小的上限）。
-	useSettings(t, fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap + 1})
-	assert.Equal(t, int64(common.FileMaxSizeKBHardCap)*1024, MaxUploadSize())
+	useSettings(t, fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap() + 1})
+	assert.Equal(t, int64(common.FileMaxSizeKBHardCap())*1024, MaxUploadSize())
 }
 
 func TestPolicy_EffectiveAllowedExtensionsIsSortedAndExcludesBlocked(t *testing.T) {
@@ -539,10 +539,10 @@ func TestPolicy_NonIntegralMBCapIsReportedExactly(t *testing.T) {
 // 都已预先钳位、走不到这里，但那是调用方的性质而非 derivePolicy 的保证。
 func TestPolicy_SnapshotReusedEvenWhenInputOutOfRange(t *testing.T) {
 	resetPolicyForTest(t)
-	SetPolicySettings(fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap + 5000})
+	SetPolicySettings(fakePolicySettings{maxKB: common.FileMaxSizeKBHardCap() + 5000})
 	cached.Store(nil)
 
 	first := currentPolicy()
-	assert.Equal(t, int64(common.FileMaxSizeKBHardCap)*1024, first.maxSize, "生效值仍应钳到硬上限")
+	assert.Equal(t, int64(common.FileMaxSizeKBHardCap())*1024, first.maxSize, "生效值仍应钳到硬上限")
 	assert.Same(t, first, currentPolicy(), "越界输入不应导致每次调用都重建快照")
 }

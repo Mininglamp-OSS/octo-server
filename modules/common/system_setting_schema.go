@@ -361,7 +361,7 @@ var systemSettingSchema = []settingDef{
 	// max_size_kb 必须 Positive:true —— 值为 102400，会被 settingTypeInt 默认的
 	// [settingIntMin, settingIntMax]=[0,3650] 上界拒掉；上界由读侧
 	// FileMaxSizeKBHardCap clamp 承担，同 sticker.upload_max_size_kb 那组。
-	{Category: "file", Key: "max_size_kb", Type: settingTypeInt, Description: "单文件上传大小上限(KB)，服务端硬上限 524288(512MB)；默认 102400(100MB)。注意：阿里云 OSS V1 签名不覆盖 Content-Length，该部署下预签名直传路径上此上限只是 advisory，挡不住超量 PUT", Positive: true,
+	{Category: "file", Key: "max_size_kb", Type: settingTypeInt, Description: "单文件上传大小上限(KB)；默认 102400(100MB)。天花板由部署侧 env OCTO_FILE_MAX_SIZE_KB_HARD_CAP 决定(未配置时 524288/512MB)，本值超过天花板会被钳到天花板。注意：阿里云 OSS V1 签名不覆盖 Content-Length，该部署下预签名直传路径上此上限只是 advisory，挡不住超量 PUT", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.FileMaxSizeKB()) }},
 
 	// Space 新成员欢迎语（onboarding.space_welcome_*）— task

@@ -278,3 +278,43 @@ func TestManagerCannotUnblockEnvBlockedExtension(t *testing.T) {
 	assert.True(t, IsBlockedExtension(".tgz"), "env 封堵项不得被管理台写入静默解封")
 	assert.True(t, IsBlockedExtension(".xlsm"))
 }
+
+// 硬上限的 env 层端到端（部署容量决策）。
+//
+// 天花板由运维经 OCTO_FILE_MAX_SIZE_KB_HARD_CAP 决定（改 configmap + 重启），
+// 超管在管理台调实际值且超不过它。这条走真实装配，确认三层职责真的串起来了：
+// env 天花板 → 管理台写入 → 上传门 → appconfig 下发。
+func TestEnvHardCapRaisesTheCeilingForManagerWrites(t *testing.T) {
+	// 天花板抬到 1GB，否则 600000KB(~586MB) 会被默认的 512MB 钳掉。
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "1048576")
+	route, _ := newPolicyIntegrationServer(t)
+
+	writeSetting(t, route, "max_size_kb", "600000")
+
+	assert.Equal(t, int64(600000)*1024, MaxUploadSize(),
+		"抬高天花板后，管理台的值应原样生效")
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/v1/common/appconfig", nil)
+	route.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body struct {
+		FileUploadLimits *struct {
+			MaxSizeKB int `json:"max_size_kb"`
+		} `json:"file_upload_limits"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.NotNil(t, body.FileUploadLimits)
+	assert.Equal(t, 600000, body.FileUploadLimits.MaxSizeKB, "下发值须与服务端一致")
+}
+
+// 未抬高天花板时，同一个写入被钳到默认的 512MB —— 天花板确实在起作用。
+func TestManagerWriteClampedByDefaultHardCap(t *testing.T) {
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "")
+	route, _ := newPolicyIntegrationServer(t)
+
+	writeSetting(t, route, "max_size_kb", "600000")
+
+	assert.Equal(t, int64(common.FileMaxSizeKBHardCap())*1024, MaxUploadSize(),
+		"未抬天花板时应被钳到 512MB，而不是原样服务")
+}

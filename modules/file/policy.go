@@ -171,8 +171,8 @@ func derivePolicy(extraAllowed, extraBlocked []string, maxKB int) *extPolicy {
 	switch {
 	case effectiveKB <= 0:
 		effectiveKB = common.DefaultFileMaxSizeKB
-	case effectiveKB > common.FileMaxSizeKBHardCap:
-		effectiveKB = common.FileMaxSizeKBHardCap
+	case effectiveKB > common.FileMaxSizeKBHardCap():
+		effectiveKB = common.FileMaxSizeKBHardCap()
 	}
 	sorted := make([]string, 0, len(allowed))
 	for ext := range allowed {

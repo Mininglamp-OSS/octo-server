@@ -48,10 +48,19 @@ const (
 	// 常量，没有对应 env，所以回退链只有 DB → code default 两层。
 	DefaultFileMaxSizeKB = 100 * 1024
 
-	// FileMaxSizeKBHardCap 是服务端硬上限（512MB，brief D5）。管理台写入越界
-	// 或直改库都会在读侧回退到 DefaultFileMaxSizeKB 而不是被原样服务。再大的
-	// 传输应走分片 / 网盘，不走 IM 附件通道。
-	FileMaxSizeKBHardCap = 512 * 1024
+	// envFileMaxSizeKBHardCap 让部署自己决定单文件上限的**天花板**。
+	// 新增 env 一律走 OCTO_ 前缀；既有的 DM_FILE_EXTRA_* 保持原名不动，
+	// 改名会让现网 configmap 里的配置当场失效。
+	envFileMaxSizeKBHardCap = "OCTO_FILE_MAX_SIZE_KB_HARD_CAP"
+
+	// defaultFileMaxSizeKBHardCap 是未配置 env 时的天花板（512MB）。
+	defaultFileMaxSizeKBHardCap = 512 * 1024
+
+	// fileMaxSizeKBAbsoluteMax 只防溢出，不表达策略：maxKB 会以
+	// int64(maxKB)*1024 转成字节，一个荒谬的 env 值会让它绕回负数，
+	// 而负的上限意味着**所有上传都被拒**。100GB 远超任何真实附件场景，
+	// 又离溢出边界足够远。
+	fileMaxSizeKBAbsoluteMax = 100 * 1024 * 1024
 )
 
 // ---------------------------------------------------------------------------
@@ -140,6 +149,35 @@ func ParseFileExtensionCSV(raw string) []string {
 	return out
 }
 
+// FileMaxSizeKBHardCap 返回单文件上限的天花板（KB）。
+//
+// 这是**部署容量决策**，不是产品语义边界，所以它跟着部署配置走而不是编译进
+// 二进制：能传多大取决于 ingress 的 body 限制、临时文件的磁盘、带宽和对象
+// 存储后端，每个部署都不一样。对比 sticker 那组硬上限——「贴纸该多大」在任何
+// 部署下都一样，那种才适合写死。
+//
+// 为什么是 env 而不是管理台：天花板若也能从管理台改，超管就能先抬天花板、
+// 再抬实际值，这道闸等于不存在。env 要重启 Pod，这个成本本身就是防线。
+//
+// 职责因此分成三层：
+//
+//	开发   代码默认值（512MB），未配置时兜底
+//	运维   OCTO_FILE_MAX_SIZE_KB_HARD_CAP 定天花板（改 configmap + 重启）
+//	超管   file.max_size_kb 调实际值（管理台，≤60s 生效，超不过天花板）
+//
+// 非法值（非数字 / ≤0 / 超过防溢出上界）回落代码默认值，而不是被原样服务。
+func FileMaxSizeKBHardCap() int {
+	raw := strings.TrimSpace(os.Getenv(envFileMaxSizeKBHardCap))
+	if raw == "" {
+		return defaultFileMaxSizeKBHardCap
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 || v > fileMaxSizeKBAbsoluteMax {
+		return defaultFileMaxSizeKBHardCap
+	}
+	return v
+}
+
 // FileExtraAllowedFromEnv 解析 DM_FILE_EXTRA_ALLOWED。
 // 供 SystemSettings 的回退层与 modules/file 的 nil-settings 回落路径共用。
 func FileExtraAllowedFromEnv() []string {
@@ -222,7 +260,7 @@ func (s *SystemSettings) FileMaxSizeKB() int {
 	return s.clampIntUpper("file.max_size_kb",
 		s.getInt("file", "max_size_kb", DefaultFileMaxSizeKB),
 		DefaultFileMaxSizeKB,
-		FileMaxSizeKBHardCap,
+		FileMaxSizeKBHardCap(),
 	)
 }
 
