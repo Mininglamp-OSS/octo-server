@@ -29,6 +29,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -63,6 +66,11 @@ type File struct {
 // New New
 func New(ctx *config.Context) *File {
 	settings := common.EnsureSystemSettings(ctx)
+	// 把配置源挂到包级上传策略上。漏掉这一行，policy.go 的 currentPolicy() 会
+	// 一直走「未挂载」分支（env + baseline + 默认 100MB），管理台写入 file.*
+	// 能落库却对任何上传入口都不生效 —— 功能整体是死的，且没有任何报错。
+	// 见 TestNewMountsPolicySettings / policy_integration_test.go。
+	SetPolicySettings(settings)
 	return &File{
 		ctx:        ctx,
 		Log:        log.NewTLog("File"),
@@ -289,8 +297,15 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		}
 	}
 
-	// 限制请求体大小，防止大文件 DoS
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxFileSize+1024*1024)
+	// 限制请求体大小，防止大文件 DoS。
+	//
+	// maxUpload 在整个 handler 里只取一次：MaxBytesReader 的上限与下面的
+	// fileHeader.Size 校验必须同源。若各自调用 MaxUploadSize()，两次调用之间
+	// 发生一次 system_setting reload 就会错位 —— reader 先截断请求体，客户端
+	// 拿到的是 "http: request body too large"/EOF 而不是「文件大小不能超过 X MB」。
+	// +1MB 是 multipart 信封（boundary/头部）的余量，语义同改动前。
+	maxUpload := MaxUploadSize()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpload+1024*1024)
 
 	file, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
@@ -304,12 +319,12 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	defer file.Close()
 
 	// 文件大小检查
-	if fileHeader.Size > MaxFileSize {
+	if fileHeader.Size > maxUpload {
 		if isStickerUpload {
 			observeStickerUpload("size_rejected")
 		}
-		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", maxUpload))
+		respondFileTooLarge(c, maxUpload)
 		return
 	}
 	// 自定义贴纸单独收紧上限（可运营配置的 sticker.upload_max_size_kb，默认 1024
@@ -856,10 +871,10 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
 		return
 	}
-	if fileSize > MaxFileSize {
+	if maxUpload := MaxUploadSize(); fileSize > maxUpload {
 		f.Warn("预签名上传 fileSize 超出限制",
-			zap.Int64("size", fileSize), zap.Int64("max", MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+			zap.Int64("size", fileSize), zap.Int64("max", maxUpload))
+		respondFileTooLarge(c, maxUpload)
 		return
 	}
 
@@ -1238,4 +1253,18 @@ func (f *File) checkReq(fileType Type, path string) error {
 		return errors.New("文件类型错误")
 	}
 	return nil
+}
+
+// respondFileTooLarge 回应「超过单文件上限」，上限值取自当前策略快照。
+//
+// 走 httperr 信封而不是裸 c.ResponseError：file.max_size_kb 接受任意 KB 值，
+// 而原先的 `fmt.Errorf("...%dMB", bytes/1024/1024)` 按整除截断 —— 配成 1536KB
+// 时服务端实际放行 1.5MB，却告诉客户端「不能超过 1MB」。既然要改这条面向用户的
+// 文案，就按仓库规则一并搬进本地化信封，顺带给出精确的 max_size_kb 详情。
+func respondFileTooLarge(c *wkhttp.Context, maxBytes int64) {
+	maxSizeKB, maxMB := SizeLimitDetails(maxBytes)
+	httperr.ResponseErrorL(c, errcode.ErrFileUploadTooLarge,
+		i18n.Params{"max_size": FormatSizeLimit(maxBytes)},
+		i18n.Details{"max_size_kb": maxSizeKB, "max_mb": maxMB},
+	)
 }

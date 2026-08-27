@@ -289,7 +289,7 @@ func TestSystemSettings_StickerCompressMaxDimension_ClampsToHardCap(t *testing.T
 // TestSystemSettings_StickerClampIntUpper_DedupsWarnPerBoundaryValue 验证
 // 同一 (key, 越界值) 组合在进程周期内只 warn 一次(避免读侧热路径刷屏),
 // 但换成不同的越界值/不同 key 会重新 warn。dedup 状态是 sync.Map,不涉及
-// zap.Logger 输出捕获 —— 直接观察 stickerClampWarned 的 sentinel。
+// zap.Logger 输出捕获 —— 直接观察 clampWarned 的 sentinel。
 func TestSystemSettings_StickerClampIntUpper_DedupsWarnPerBoundaryValue(t *testing.T) {
 	s := stickerSnapSettings(map[string]string{
 		"sticker.upload_max_size_kb": "99999", // 超过 5120 hard cap
@@ -328,17 +328,17 @@ func TestSystemSettings_StickerClampIntUpper_NoWarnWhenInRange(t *testing.T) {
 		_ = s.StickerUploadMaxDimension()
 	}
 	count := 0
-	s.stickerClampWarned.Range(func(_, _ any) bool {
+	s.clampWarned.Range(func(_, _ any) bool {
 		count++
 		return true
 	})
 	assert.Equal(t, 0, count, "in-range values must not populate the dedup map")
 }
 
-// assertClampWarnedOnce 断言 SystemSettings.stickerClampWarned 里存在给定
+// assertClampWarnedOnce 断言 SystemSettings.clampWarned 里存在给定
 // dedup key(且仅有它 —— 或有其它 key 但仍存在这一条)。
 func assertClampWarnedOnce(t *testing.T, s *SystemSettings, want string) {
 	t.Helper()
-	_, ok := s.stickerClampWarned.Load(want)
+	_, ok := s.clampWarned.Load(want)
 	assert.Truef(t, ok, "expected dedup key %q recorded", want)
 }

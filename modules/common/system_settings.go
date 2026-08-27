@@ -117,11 +117,14 @@ type SystemSettings struct {
 	managerMFAProbeGeneration uint64
 	managerMFAProbeInFlight   atomic.Bool
 	reloadTTL                 time.Duration
-	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
+	// clampWarned 去重 clamp getter 的越界 Warn(review R6)。这些 getter 坐在读热
+	// 路径上（file.max_size_kb 每次 currentPolicy() 都读，包括每个未认证的
+	// appconfig 请求），不去重的话一个配错的键就能让匿名调用者按请求数刷日志。
+	// key 形如
 	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
 	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
 	// 刷屏,同时保留 operator 可观测性。
-	stickerClampWarned sync.Map
+	clampWarned sync.Map
 	log.Log
 }
 
@@ -1716,50 +1719,121 @@ const (
 // 若 modules/file 侧改动允许扩展名，此列表也需同步。
 var stickerUploadRasterAllowlist = []string{".gif", ".png", ".jpg", ".jpeg", ".webp"}
 
-// stickerClampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
+// clampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
 // non-numeric (which surface as fallback default from getInt) is served as
 // default; values above hardCap are clamped to hardCap; everything else is
 // returned verbatim. Shared by every KB/px/ms/count sticker upload setting so
 // the clamp policy is single-sourced.
 //
+// clampIntUpper 是所有「有服务端硬上限」的 int getter 的共用读侧钳位。
 // key is the fully qualified setting name (e.g. "sticker.upload_max_size_kb");
 // when v exceeds hardCap this method emits a per-(key, v) one-shot Warn so a
 // bad admin edit is operator-observable without spamming the read hot path
 // (review R6). Admin fixes → new越界 value or in-range value → new Warn or
 // silence, matching human-friendly signal semantics.
-func (s *SystemSettings) stickerClampIntUpper(key string, v, fallback, hardCap int) int {
+func (s *SystemSettings) clampIntUpper(key string, v, fallback, hardCap int) int {
 	if v <= 0 {
-		return fallback
+		// 回落值同样要过上界。hardCap 曾经全是编译期常量、且恒高于对应的代码
+		// 默认值，这一分支直接 return fallback 是安全的；file.max_size_kb 的
+		// 天花板变成部署可配（OCTO_FILE_MAX_SIZE_KB_HARD_CAP，可低于 100MB）
+		// 之后就不成立了 —— 一个直改库写入的 ≤0 值会拿到 102400，高出部署
+		// 自己声明的天花板 200 倍，等于天花板形同虚设。
+		return min(fallback, hardCap)
 	}
 	if v > hardCap {
-		dedupKey := fmt.Sprintf("%s=%d>%d", key, v, hardCap)
-		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
-			s.Warn("system_setting sticker knob exceeds hard cap; clamped",
-				zap.String("key", key),
-				zap.Int("configured", v),
-				zap.Int("hard_cap", hardCap))
-		}
+		s.warnClampOnce(fmt.Sprintf("%s=%d>%d", key, v, hardCap),
+			"system_setting knob exceeds hard cap; clamped",
+			zap.String("key", key),
+			zap.Int("configured", v),
+			zap.Int("hard_cap", hardCap))
 		return hardCap
 	}
 	return v
 }
 
-// StickerUploadMaxSizeKB returns the per-file upload cap in KB. Read-side
-// clamped to [1, stickerUploadMaxSizeKBHardCap]; out-of-range falls back to
-// the historical 1024 KB default.
-func (s *SystemSettings) StickerUploadMaxSizeKB() int {
-	return s.stickerClampIntUpper("sticker.upload_max_size_kb",
+// warnClampOnce 按 dedupKey 去重地打一条钳位告警。钳位 getter 坐在读热路径上
+// （file.max_size_kb 每次 currentPolicy() 都读，包括每个未认证的 appconfig
+// 请求），不去重的话一个配错的键就能让匿名调用者按请求数刷日志。
+func (s *SystemSettings) warnClampOnce(dedupKey, msg string, fields ...zap.Field) {
+	if _, loaded := s.clampWarned.LoadOrStore(dedupKey, struct{}{}); loaded {
+		return
+	}
+	s.Warn(msg, fields...)
+}
+
+// getIntOK 与 getInt 同义，额外报告这个键**是否真的被配置过**。
+//
+// 钳位 getter 需要这个区分：把代码默认值喂进 clampIntUpper，会在天花板低于
+// 默认值时报出 configured=102400 —— 而表里一行都没有。那是在诬告一次没有
+// 发生过的变更，并且每个 pod 启动后都会打一条。
+//
+// 键存在但解析不了时返回 (0, true)：确实配置过，只是非法，交给钳位器的 ≤0
+// 分支回落，取值与 getInt 逐字节一致。
+func (s *SystemSettings) getIntOK(category, key string) (int, bool) {
+	raw, ok := s.lookup(category, key)
+	if !ok {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, true
+	}
+	return parsed, true
+}
+
+// stickerUploadMaxSizeKBOwnBound 返回只受**贴纸自身产品硬上限**约束的贴纸
+// 上限，不含全局上限那道收敛。
+//
+// 写侧守卫要的是这个值：它代表「运营想配成多大」。若拿收敛后的
+// StickerUploadMaxSizeKB()去比，两侧会被 min() 拉平，D6 守卫永远不触发。
+func (s *SystemSettings) stickerUploadMaxSizeKBOwnBound() int {
+	return s.clampIntUpper("sticker.upload_max_size_kb",
 		s.getInt("sticker", "upload_max_size_kb", defaultStickerUploadMaxSizeKB),
 		defaultStickerUploadMaxSizeKB,
 		stickerUploadMaxSizeKBHardCap,
 	)
 }
 
+// StickerUploadMaxSizeKB returns the per-file sticker upload cap in KB.
+//
+// 两道上界，缺一不可：
+//
+//	贴纸自身的产品硬上限   stickerUploadMaxSizeKBHardCap（5120，编译期常量）
+//	当前生效的全局单文件上限 FileMaxSizeKB()（部署天花板 + 管理台值）
+//
+// 第二道是必须的，因为上传校验里**全局大小门在贴纸门之前**
+// （modules/file/api.go），所以真正生效的贴纸上限本来就是 min(两者)。
+// 不在这里收敛，这个事实就只有闸门知道：appconfig 会向客户端广播一个服务端
+// 并不接受的值（客户端按它预校验、白传一次、拿到「文件过大」而不是贴纸文案），
+// 管理台 effective_value 也会显示一个「写着但不生效」的数字 —— 正是本任务在
+// extra_allowed_extensions 上明确拒绝的失败形态。
+//
+// 天花板还是编译期常量 524288 时这一道是不可达的（贴纸最高 5120，clamp 永远
+// 落不到它之下）；OCTO_FILE_MAX_SIZE_KB_HARD_CAP 让天花板可以低于贴纸上限，
+// 这条路径才打开。写侧的 D6 守卫按定义只在**发生写入**时运行，因此看不见
+// 「空表 + 低天花板」这一格：读侧收敛是唯一能覆盖它的地方。
+func (s *SystemSettings) StickerUploadMaxSizeKB() int {
+	own := s.stickerUploadMaxSizeKBOwnBound()
+	fileCap := s.FileMaxSizeKB()
+	if own <= fileCap {
+		return own
+	}
+	// 收敛是静默的（贴纸照常能传，只是更小），但运维需要知道部署天花板正在
+	// 压着一个产品配置 —— 这就是 review 要求的「大声检测」，按 (贴纸值, 全局
+	// 值) 去重，每个进程每种组合一条。
+	s.warnClampOnce(fmt.Sprintf("sticker.upload_max_size_kb=%d>file=%d", own, fileCap),
+		"sticker upload cap exceeds the effective file upload cap; converged to the file cap",
+		zap.String("key", "sticker.upload_max_size_kb"),
+		zap.Int("sticker_max_size_kb", own),
+		zap.Int("file_max_size_kb", fileCap))
+	return fileCap
+}
+
 // StickerUploadMaxDimension returns the decoded-pixel single-edge cap. Read-side
 // clamped to [1, stickerUploadMaxDimensionHardCap]; out-of-range falls back to
 // the historical 512-px default.
 func (s *SystemSettings) StickerUploadMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.upload_max_dimension",
+	return s.clampIntUpper("sticker.upload_max_dimension",
 		s.getInt("sticker", "upload_max_dimension", defaultStickerUploadMaxDimension),
 		defaultStickerUploadMaxDimension,
 		stickerUploadMaxDimensionHardCap,
@@ -1824,7 +1898,7 @@ func (s *SystemSettings) StickerCompressEnabled() bool {
 // Read-side clamped to [1, stickerCompressTargetKBHardCap]; out-of-range falls
 // back to the 1024 KB default.
 func (s *SystemSettings) StickerCompressTargetKB() int {
-	return s.stickerClampIntUpper("sticker.compress_target_kb",
+	return s.clampIntUpper("sticker.compress_target_kb",
 		s.getInt("sticker", "compress_target_kb", defaultStickerCompressTargetKB),
 		defaultStickerCompressTargetKB,
 		stickerCompressTargetKBHardCap,
@@ -1835,7 +1909,7 @@ func (s *SystemSettings) StickerCompressTargetKB() int {
 // sticker compressions. Read-side clamped to [1, stickerCompressMaxConcurrencyHardCap];
 // out-of-range falls back to 4.
 func (s *SystemSettings) StickerCompressMaxConcurrency() int {
-	return s.stickerClampIntUpper("sticker.compress_max_concurrency",
+	return s.clampIntUpper("sticker.compress_max_concurrency",
 		s.getInt("sticker", "compress_max_concurrency", defaultStickerCompressMaxConcurrency),
 		defaultStickerCompressMaxConcurrency,
 		stickerCompressMaxConcurrencyHardCap,
@@ -1846,7 +1920,7 @@ func (s *SystemSettings) StickerCompressMaxConcurrency() int {
 // Read-side clamped to [1, stickerCompressTimeoutMsHardCap]; out-of-range falls
 // back to 2000ms.
 func (s *SystemSettings) StickerCompressTimeoutMs() int {
-	return s.stickerClampIntUpper("sticker.compress_timeout_ms",
+	return s.clampIntUpper("sticker.compress_timeout_ms",
 		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
 		defaultStickerCompressTimeoutMs,
 		stickerCompressTimeoutMsHardCap,
@@ -1867,7 +1941,7 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 // effectiveGateDim) and this value only decides how far they are shrunk before
 // store.
 func (s *SystemSettings) StickerCompressMaxDimension() int {
-	return s.stickerClampIntUpper("sticker.compress_max_dimension",
+	return s.clampIntUpper("sticker.compress_max_dimension",
 		s.getInt("sticker", "compress_max_dimension", defaultStickerCompressMaxDimension),
 		defaultStickerCompressMaxDimension,
 		stickerUploadMaxDimensionHardCap,

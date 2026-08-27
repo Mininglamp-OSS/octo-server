@@ -103,7 +103,7 @@ other = "The content exceeds the maximum allowed size."
 other = "The user has not started a conversation with this bot."
 
 ["err.server.bot_api.file_too_large"]
-other = "The file exceeds the maximum allowed size."
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
 
 ["err.server.bot_api.file_type_unsupported"]
 other = "Unsupported file type."
@@ -345,6 +345,12 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.common.file_extension_not_allowlistable"]
+other = "This file extension is on the built-in blocklist and cannot be allowed."
+
+["err.server.common.file_upload_size_ordering"]
+other = "The global file upload size cap must not be smaller than the sticker upload cap."
+
 ["err.server.common.manager_mfa_smtp_invalid"]
 other = "The SMTP configuration required by management-console MFA is invalid."
 
@@ -353,6 +359,15 @@ other = "Invalid space welcome configuration."
 
 ["err.server.common.thread_archive_window_ordering"]
 other = "Thread auto-archive window must not be shorter than the recent-tab thread window."
+
+["err.server.file.extension_list_too_large"]
+other = "The extension list is too large (max {{.max_entries}} entries, {{.max_length}} chars each)."
+
+["err.server.file.extension_list_too_long"]
+other = "The extension list is too long (max {{.max_bytes}} bytes)."
+
+["err.server.file.upload_too_large"]
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
 
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
@@ -790,7 +805,7 @@ other = "Unsupported message type."
 other = "Only the bot creator can perform this operation."
 
 ["err.server.robot.file_too_large"]
-other = "The file exceeds the maximum allowed size."
+other = "The file exceeds the maximum allowed size of {{.max_size}}."
 
 ["err.server.robot.file_type_unsupported"]
 other = "Unsupported file type."

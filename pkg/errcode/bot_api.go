@@ -53,8 +53,10 @@ var (
 	ErrBotAPIFileTooLarge = register(codes.Code{
 		ID:             "err.server.bot_api.file_too_large",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The file exceeds the maximum allowed size.",
-		SafeDetailKeys: []string{"max_mb"},
+		DefaultMessage: "The file exceeds the maximum allowed size of {{.max_size}}.",
+		// max_size_kb is exact; max_mb truncates (1536KB reported "1") and is
+		// kept only for clients already reading it.
+		SafeDetailKeys: []string{"max_size_kb", "max_mb"},
 	})
 	// ErrBotAPIPayloadTooLarge is the status-preserving (413) variant used by the
 	// voice transcribe proxy, whose external client branches on HTTP 413.

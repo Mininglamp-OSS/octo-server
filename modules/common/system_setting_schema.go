@@ -317,7 +317,7 @@ var systemSettingSchema = []settingDef{
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
 	// 越出资源上限。全部 Positive:true 走"必须正整数"admin 写侧校验，同时放开
 	// settingTypeInt 默认的 [0,3650] 上界（本组键上限单独校验，见读侧 clamp）。
-	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024", Positive: true,
+	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024。上传校验里全局大小门在贴纸门之前，因此实际生效值为 min(本值, file.max_size_kb 的生效值)——全局上限更低时 effective_value 会直接显示收敛后的值", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxSizeKB()) }},
 	{Category: "sticker", Key: "upload_max_dimension", Type: settingTypeInt, Description: "自定义贴纸解码后单边像素上限，服务端硬上限 1024；默认 512", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxDimension()) }},
@@ -345,6 +345,24 @@ var systemSettingSchema = []settingDef{
 	// gif/webp 及压缩关闭时仍受 upload_max_dimension 约束。硬上限 1024。
 	{Category: "sticker", Key: "compress_max_dimension", Type: settingTypeInt, Description: "贴纸压缩缩放目标边长(px，仅静态 jpg/png)；压缩开启后大于此值等比缩小再存；硬上限 1024，默认 512。建议 ≤ upload_max_dimension，否则压后仍超 upload_max_dimension 的图会被 fail-closed 拒绝", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxDimension()) }},
+
+	// 文件上传策略（task file-extension-policy-dynamic-config）。原先扩展名白/黑
+	// 名单只在进程 init() 读 env 改写包级 map、大小上限是散落三处的硬编码常量，
+	// 改一次要重启全部 pod；挪进 system_setting 后运维可即时紧急封堵扩展名。
+	//
+	// 两个扩展名键都是 env ∪ DB 的并集（见 system_settings_file_upload.go）：
+	// 「允许」栏只管加、「禁止」栏只管减，写入不会误伤对方已有的配置。放开方向
+	// 不设候选集 —— 需求本身就是「不重启放开一个格式」。安全边界是**内置黑名单
+	// 不可撤销**：读侧永远压制，写侧直接拒绝。语法非法的 token 在读侧静默丢弃。
+	{Category: "file", Key: "extra_blocked_extensions", Type: settingTypeString, Description: "额外禁止上传的扩展名(逗号分隔，如 svg,dwg)；与 env DM_FILE_EXTRA_BLOCKED 取并集，只增不减；内置黑名单不可撤销。跨实例最长 60s 收敛",
+		Effective: func(s *SystemSettings) string { return strings.Join(s.FileExtraBlockedExtensions(), ",") }},
+	{Category: "file", Key: "extra_allowed_extensions", Type: settingTypeString, Description: "额外允许上传的扩展名(逗号分隔，如 dwg,psd)；与 env DM_FILE_EXTRA_ALLOWED 取并集，只增不减，只填新增的即可；要收回某一项请写进 extra_blocked_extensions。服务端内置禁止清单(可执行文件/脚本类)不可撤销，写入其中的项会被拒绝。跨实例最长 60s 收敛",
+		Effective: func(s *SystemSettings) string { return strings.Join(s.FileExtraAllowedExtensions(), ",") }},
+	// max_size_kb 必须 Positive:true —— 值为 102400，会被 settingTypeInt 默认的
+	// [settingIntMin, settingIntMax]=[0,3650] 上界拒掉；上界由读侧
+	// FileMaxSizeKBHardCap clamp 承担，同 sticker.upload_max_size_kb 那组。
+	{Category: "file", Key: "max_size_kb", Type: settingTypeInt, Description: "单文件上传大小上限(KB)；默认 102400(100MB)。天花板由部署侧 env OCTO_FILE_MAX_SIZE_KB_HARD_CAP 决定(未配置时 524288/512MB)，本值超过天花板会被钳到天花板。注意：阿里云 OSS V1 签名不覆盖 Content-Length，该部署下预签名直传路径上此上限只是 advisory，挡不住超量 PUT", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.FileMaxSizeKB()) }},
 
 	// Space 新成员欢迎语（onboarding.space_welcome_*）— task
 	// space-new-user-welcome-message。这四个键必须构成一致的「启用组合」：
