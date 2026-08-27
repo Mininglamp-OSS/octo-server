@@ -1542,6 +1542,40 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-26 (space-removal-creator-handover-notice · round 11)
+
+- **Fixed** — Round 10's collation comparator matched CI and inverted production:
+  `space_member.uid` is `utf8mb4_0900_ai_ci` there (no explicit COLLATE, inherits
+  the 8.0 default) while CI pins `utf8mb4_general_ci`, and the two order `_`
+  oppositely. The correction is not a better comparator — the batch lock is now
+  expanded into `UNION ALL` branches so the acquisition order is the caller's and
+  collation leaves the question entirely. Verified under both collations with the
+  branch order opposite each one's index order. `FORCE INDEX` and the non-retryable
+  1176 dependency on the index name are gone with it; cost is ~1.7ms at 200 uids.
+- **Fixed** — Successor election could install a third-party bot, an external
+  member or a blacklisted member as group creator, on **both** paths, while
+  `transferGrouper` refuses external members outright and the creator-only
+  endpoints check neither. Both queries now match the manual path. Overturns a
+  pinned contract, with the reasoning recorded at the query.
+- **Fixed** — Display names are neutralised (`{`/`}` → full-width, bidi stripped)
+  before entering a system message's `extra`. Structured placement removed JSON
+  injection but not render-time placeholder re-expansion, which is reachable via a
+  self-settable group remark and persists in group history.
+- **Learned** — Ask what the lock order *is determined by* before asking how to
+  reproduce it. Round 10 spent itself answering "how do I mirror the index order in
+  Go" when the order only came from the index because of a statement shape chosen
+  in round 6 for unrelated reasons.
+- **Learned** — Quantify the impact before proposing the remedy. Working out that
+  this needed a superadmin batch-add concurrent with a user-side batch-remove, on
+  one space, with order-sensitive overlapping uids, to produce a retry-absorbed
+  1213, is what turned "broken guarantee" into a real choice between fixing the
+  mechanism and correcting the claim.
+- **Process** — Rounds 10–11 were implement-then-test with mutation checks, not the
+  TDD that `rules/common/testing.md` requires; the sanitiser was written test-first
+  and that ordering caught a distinction the other would have missed (the sanitiser
+  being correct and the send site calling it are separate claims). Also: rebase onto
+  main before building on the branch.
+
 ## 2026-08-25 (space-removal-creator-handover-notice · round 10)
 
 - **Fixed** — Two defects this branch introduced, both the same root cause: the

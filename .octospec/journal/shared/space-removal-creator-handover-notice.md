@@ -658,3 +658,81 @@ permanent group history. The handover notice this task adds still falls back to
 the bare uid, on the same surface. I did not change it here — it is user-visible,
 on a path #807 did not review — but the two paths now disagree and that is
 recorded as a follow-up rather than left for someone to notice in production.
+
+
+## Round 11 — the collation fix was itself pointed at the wrong environment
+
+Round 10 closed the ordering defect with a comparator that reproduced
+`utf8mb4_general_ci`. A maintainer then checked the production database:
+`space_member.uid` is `utf8mb4_0900_ai_ci`. The two order `_` oppositely —
+general_ci folds lowercase into uppercase so `_` (0x5F) lands after the letters;
+0900_ai_ci follows UCA and sorts punctuation before them. Measured on the same
+rows:
+
+    0900_ai_ci  : A_000 a_b aab Ab000 u_000 ua000
+    general_ci  : aab Ab000 A_000 a_b ua000 u_000
+
+So the comparator matched CI and inverted production. CI could not catch it,
+because `ci.yml` deliberately pins the other collation.
+
+**The thing I got wrong is not which collation to mirror.** I spent round 10
+answering "how do I reproduce the index order in Go" when the question worth
+asking was "why is the lock order the index's at all". A single
+`uid IN (...) FOR UPDATE` acquires its locks during the scan, so the order is
+whatever the index says and the caller cannot specify it. Every Go-side answer
+to that is a guess about the deployment. Expanding the batch into `UNION ALL`
+branches makes the order the caller's, and collation stops being part of the
+question. That option was available in round 6 and I did not consider it,
+because from round 7 onward I was optimising *within* the single-statement
+shape rather than asking whether the shape was right.
+
+Two smaller things worth keeping:
+
+**A quantified answer changed the decision.** Asked how big the impact actually
+was, the honest answer was: small. It needs a superadmin batch-add concurrent
+with a user-side batch-remove, on the same space, with overlapping uids, where
+the overlap contains order-sensitive uids — and the outcome is a 1213 that the
+retry absorbs. Working that out is what made it clear the earlier framing
+("a broken guarantee in production") was overstated, and that the choice between
+fixing the mechanism and just correcting the claim was a real choice rather than
+an obvious one. I should reach for the impact estimate before proposing the
+remedy, not after.
+
+**Scope creep, caught by the reviewer not by me.** From the collation finding I
+went on to a cross-table 1267 hazard (`app_bot` is in a repair migration's
+collation list, `space_member` is not) and produced a page of production
+diagnostics for it. It is a real issue and it is unrelated to this PR, which
+touches no cross-table JOIN. The maintainer asked "are these SQL statements the
+ones this PR uses?" — they were not. Worth noticing that the drift happened
+while doing something that felt like diligence.
+
+### What UNION ALL cost, and one regression it introduced
+
+At 200 uids the statement is 17.6 KB (0.026% of the default
+`max_allowed_packet`) and ~1.7 ms slower than the single `IN` (3.1 vs 1.4 ms).
+In exchange, `FORCE INDEX` is gone — a single-row equality on the unique key
+cannot be planned onto `(space_id, status)`, which is all round 7 added it for —
+and with it the runtime dependency on the index *name*, which used to mean a
+non-retryable 1176 for the whole batch.
+
+The regression: `UNION ALL` does not deduplicate. Two case-variant request uids
+each match the same row and it returns twice, so without a `seen` set the member
+is flipped twice and gets two cleanup jobs. The old `IN` was one range scan and
+returned it once. `TestRemoveMembersLockedDedupesCaseVariants` caught it
+immediately, which is the value of having written that guard in round 10 for a
+different reason.
+
+### On process — two corrections from the maintainer
+
+**This was not TDD.** Rounds 10 and most of 11 were implement-then-test, with
+mutation checks afterwards. The mutation checks are worth something — they prove
+a guard can fail — but they are not the same discipline, and
+`rules/common/testing.md` requires the other one. The sanitiser was written
+test-first: the unit test failed to compile before the function existed, and both
+integration guards were observed failing against the raw payload before the call
+sites were wired. That ordering caught something the other ordering would have
+missed by construction — that "the sanitiser is correct" and "the send site calls
+it" are two different claims, and only the second one rots.
+
+**Rebase before building on the branch, not after.** Three commits had landed on
+main while this work was in progress.

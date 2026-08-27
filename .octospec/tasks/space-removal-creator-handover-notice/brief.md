@@ -427,9 +427,49 @@ introduced by this branch; neither existed on `main`.
    claim did not hold for reachable input. Fixed with `lessUIDGeneralCI`, whose
    limit (ASCII only) is stated at the definition.
 
-The durable answer is to constrain uids to a known alphabet at the API boundary
-and state the premise once for the package. That is not this task; it is written
-up as a follow-up so the next round of this does not start from scratch.
+**Round 11 superseded both of the above remedies.** A maintainer checked the
+production database: `space_member.uid` is `utf8mb4_0900_ai_ci`, not
+`utf8mb4_general_ci` — the table is created without an explicit COLLATE and
+inherits the database default, and CI pins the other one deliberately
+(`ci.yml:203-210`). The two order `_` oppositely, so round 10's comparator
+matched CI and inverted production.
+
+The correction is not a better comparator. It is that the lock order should
+never have been the index's: a single `uid IN (...) FOR UPDATE` acquires locks
+during the scan, so the order is the index's and the caller cannot specify it.
+Expanding the batch into `UNION ALL` branches puts the order back in the
+caller's hands and removes collation from the question — verified under both
+collations, with the branch order deliberately opposite to each collation's
+index order.
+
+Constraining uids to a known alphabet at the API boundary is no longer needed
+for *this* code path (nothing here compares identifiers in Go any more), but it
+remains worth doing for the package generally and stays on the follow-up list.
+
+### Load-bearing addition: eligibility to hold group ownership
+
+Both successor-election queries excluded only bots owned by the leaver, so a
+third-party bot, an external member, or a blacklisted member could be installed
+as creator — while `transferGrouper` explicitly refuses external members
+(YUJ-231 / GH#1289) and the five creator-only endpoints gate on
+`QueryIsGroupCreator`, which checks neither. The same question — who may hold
+group ownership — had two answers, and the automatic one was permissive.
+
+Both paths (Space-removal cascade and `groupExit`) now exclude bots, external
+members and non-normal status. This **overturns a pinned contract**
+(`TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft` asserted third-party
+bots are eligible); that assertion recorded continuity with the pre-#354 query
+rather than a decision about permissions.
+
+### Load-bearing addition: render-time neutralisation
+
+`extra` + placeholders removes JSON injection but not render spoofing: clients
+substitute `{N}` sequentially over one string and rescan what they substitute in,
+so a self-settable remark containing a literal `{1}` expands into a fabricated
+clause, permanently, in group history. Bidi controls can reorder the sentence.
+Both are neutralised at the point names enter `extra`, for this task's handover
+notice and for #807's exit notice. octo-lib's 1007 has the same shape and is out
+of reach from here.
 
 ## Out of scope
 

@@ -62,6 +62,35 @@ this survives casual testing — and why the guard, whose fixture used `m%04d`,
 went red under the mutation aimed at it while being structurally unable to see
 this.
 
+## The correction that came one round later
+
+The first version of this note recommended writing a Go comparator that mirrors
+the column's collation, and offered `general_ci` folding as the way to do it.
+**That advice was wrong**, and wrong in a way worth preserving rather than
+editing out.
+
+The column's collation is environment-dependent. This table is created without
+an explicit COLLATE and inherits the database default: CI pins
+`utf8mb4_general_ci`, MySQL 8.0 defaults to `utf8mb4_0900_ai_ci`, and production
+runs the latter. The two order `_` oppositely (general_ci folds case so `_`
+lands after the letters; 0900_ai_ci follows UCA and sorts punctuation before
+them). So the mirror matched CI and inverted production, and CI could not catch
+it.
+
+The better question is not *which* collation to mirror. It is **why the lock
+order is the index's at all**. A single `col IN (...) FOR UPDATE` takes its locks
+during the index scan, so the order is the index's and the caller cannot specify
+it — `ORDER BY` does not help, the locks are already held by the time the sort
+runs. Expanding the batch into `UNION ALL` branches, one single-row equality
+each, makes MySQL acquire in branch order, which is the caller's order. Collation
+then leaves the question entirely, and the sort can be the most boring byte-order
+comparison available.
+
+Generalised: **when you find yourself reproducing a database's semantics in
+application code, check whether you can stop depending on those semantics
+instead.** Mirroring is a maintenance burden that is only ever as correct as your
+model of the deployment; removing the dependency is checkable once.
+
 ## Rule
 
 If a change relocates a comparison on an identifier across the Go/SQL boundary,
@@ -70,14 +99,16 @@ the collation is part of what must be shown unchanged. Specifically:
 - **Prefer not relocating it.** Driving a loop from the rows SQL matched, rather
   than from the request slice, removes the second comparison instead of trying to
   make two comparators agree. That is the fix that does not need a premise.
-- **A Go comparator that mirrors a collation is a mirror, not a guarantee.**
-  Folding `a-z` onto `A-Z` reproduces `general_ci` for ASCII and nothing else;
-  non-ASCII uses MySQL's own weight table. If you write one, state the limit at
-  the definition and say what the fallback is when it is exceeded.
-- **Pin ordering against the database, not against a hand-written expectation.**
-  Sorting a scan of the real index with the comparator and asserting element-wise
-  equality also goes red when the column's collation changes underneath you —
-  which is when the premise, not the code, has stopped holding.
+- **Prefer removing the dependency over mirroring it.** If an ordering has to
+  match the database's, look for a statement shape that lets the caller specify
+  the order (`UNION ALL` of single-row lookups does; a range scan does not).
+  A Go comparator that mirrors a collation is only as correct as your assumption
+  about which collation the deployment uses — and if the table has no explicit
+  COLLATE, that assumption is about a database default you do not control.
+- **Test under every collation the code can meet, not the one CI happens to
+  build.** A guard that creates its own tables with an explicit COLLATE catches
+  what a guard trusting the ambient database cannot. If a test can only run under
+  one collation, it is testing the environment as much as the code.
 - **Vary the fixture's alphabet.** Identifiers restricted to digits and one case
   are the alphabet where byte order and collation order agree. A guard built on
   them cannot fail for this class no matter how hard you mutate the code. Include
