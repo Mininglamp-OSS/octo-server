@@ -410,8 +410,8 @@ func (d *managerDB) updateSpaceProfile(
 // 「一人一事务」改成整批单事务后，移除侧一次要按住至多 200 行、持锁窗口大幅变宽，
 // 这个既有的环因此明显更容易撞上。
 //
-// 现在 upsertMembersOnce 先按 lessUIDGeneralCI（索引的 collation 序，不是字节序）排序
-// 再取锁，与批量移除同序，这一对结构上不再成环。retryOnDeadlock 仍然保留：它兜的是
+// 现在 upsertMembersOnce 与批量移除用**同一个排序函数**（sort.Strings）取锁，而批量
+// 移除通过 UNION ALL 的分支顺序落实它，两边同序、这一对结构上不再成环。retryOnDeadlock 仍然保留：它兜的是
 // **别的**对手——群主转让是两段式非单调获取，谁排序都关不掉，见 retryOnDeadlock 注释。
 // 全有全无地单事务提交，重放安全（ON DUPLICATE KEY UPDATE 本身也幂等）。
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
@@ -422,8 +422,8 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 
 // upsertMembersOnce 是 upsertMembers 的单次尝试，死锁重试见 retryOnDeadlock。
 //
-// **按索引序取锁**（lessUIDGeneralCI，不是 sort.Strings），与批量移除那条 FORCE INDEX
-// 语句的加锁顺序一致，这样两边同序、结构上无法成环。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
+// **按 uid 字节序取锁**（sort.Strings），与批量移除用同一个排序函数；批量移除通过
+// UNION ALL 的分支顺序落实这个顺序，两边同序、结构上无法成环，且不依赖列的 collation。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
 // 已归零），对**长命**的对手会被饿死——批量移除每次尝试都是全新事务、回滚代价为零，
 // 于是被 InnoDB 反复选为牺牲者，而还在跑的 upsert 一直在推进，重试立刻又撞上同一个
 // 活事务，几次退避跑完还在人家的生命周期里。实测（200 uid 逆序重叠、60 轮）：只包重试
@@ -432,17 +432,20 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 //
 // 排序 uids 的副本，不改调用方切片（normalizeUIDs 保留调用方顺序，其返回值调用方后续还要用）。
 //
-// ⚠️ 排序必须用 lessUIDGeneralCI 而**不是** sort.Strings。sort.Strings 是字节序，
-// 而索引扫描按 utf8mb4_general_ci 走；两者只对 [0-9a-f] 这类字母表重合，对含 '_'
-// 或大写的 uid 相邻元素直接翻转，环就重新开了（PR #804 round-10 review P1-1，
-// 两名 reviewer 各自实测；本地用 TestUpsertMembersLocksInSameOrderAsBatchRemoval
-// 的新字母表复现 3/3 红）。
+// ⚠️ 这里的排序**不需要**匹配任何 collation，用最朴素的 sort.Strings 即可 —— 因为
+// 批量移除侧也用同一个函数排序，并通过 UNION ALL 的分支顺序取锁（见
+// buildSelectMembersForRemovalForUpdateSQL）。两边同序即无法成环；序本身是什么
+// 不重要，重要的是不依赖任何环境前提。
+//
+// round 10 曾把这里改成一个复刻 utf8mb4_general_ci 的比较器，那是错的方向：列的
+// collation 因环境而异（CI general_ci / 生产 0900_ai_ci，两者对 '_' 的排序相反），
+// 任何"在 Go 里匹配 collation"的写法都只能对一种环境成立。
 func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 	if len(uids) == 0 {
 		return nil
 	}
 	ordered := append([]string(nil), uids...)
-	sort.Slice(ordered, func(i, j int) bool { return lessUIDGeneralCI(ordered[i], ordered[j]) })
+	sort.Strings(ordered)
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
@@ -458,51 +461,6 @@ func (d *managerDB) upsertMembersOnce(spaceId string, uids []string) error {
 		}
 	}
 	return tx.Commit()
-}
-
-// lessUIDGeneralCI 按 utf8mb4_general_ci 的顺序比较两个 uid。
-//
-// 存在的唯一理由：让 upsert 的取锁顺序与批量移除那条 FORCE INDEX 语句的索引扫描
-// 顺序一致。两边被同一个顺序驱动，AB-BA 就结构上不成立，不必指望重试。
-//
-// 为什么不能用 sort.Strings —— 那是字节序，而 space_member.uid 没有显式 COLLATE、
-// 继承库默认 utf8mb4_general_ci：小写折叠进大写，于是 '_'(0x5F) 落在字母**之后**
-// 而不是大小写之间。两种顺序只对 [0-9a-f] 这类字母表重合；含 '_' 或大写时相邻
-// 元素直接翻转（字节序 `a_b` < `aab`，general_ci 下 `aab` < `a_b`）。这类标识符
-// 在本系统里是现成的：`app_…_bot`、`iwh_…` 都是 Space 成员，而批量加人接口对
-// 调用方给的 uid 不做字符集校验。本仓库已经在另外两处记过同一个陷阱
-// （modules/user/batch.go、modules/message/db_reminders.go）。
-//
-// 只需要在**排序**上复现 general_ci，不需要复现相等语义。
-//
-// ⚠️ 边界，别读成比它强：只对 ASCII 精确。general_ci 对非 ASCII 走自己的权重表，
-// 这里退化成 UTF-8 字节比较，顺序可能与索引不一致。真出现非 ASCII 的 uid 时防线
-// 退回 retryOnDeadlock（跨路径死锁本来就靠它兜底）—— 不比修复前差，但也**没有**
-// 结构性保证。要根治得在 API 边界把 uid 收敛到一个已知字母表，那是独立一项。
-//
-// 权重相等时用字节序兜底，让它成为全序：sort.Slice 不稳定，而同一个集合必须排出
-// 同一个顺序，否则两个并发请求又各排各的。（互为大小写变体的 uid 在库里本就是同
-// 一行、同一把锁，谁先谁后无关紧要，但确定性不该靠这个巧合。）
-func lessUIDGeneralCI(a, b string) bool {
-	fold := func(c byte) byte {
-		if c >= 'a' && c <= 'z' {
-			return c - ('a' - 'A')
-		}
-		return c
-	}
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
-		if wa, wb := fold(a[i]), fold(b[i]); wa != wb {
-			return wa < wb
-		}
-	}
-	if len(a) != len(b) {
-		return len(a) < len(b)
-	}
-	return a < b
 }
 
 // ErrCannotRemoveOwner 拦截删除 owner 的请求，调用方需先转让所有权
@@ -545,7 +503,7 @@ func isDeadlockErr(err error) bool {
 // 各自在真实 MySQL 上实测确认）：space_member 上有多条会一次锁多行的写路径——
 // removeMembersLocked（批量移除）、removeMembersForce（超管强制移除）、
 // transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）、
-// upsertMembers（批量加人：按 lessUIDGeneralCI 排序后逐条 upsert，与批量移除同序）。
+// upsertMembers（批量加人：按 sort.Strings 排序后逐条 upsert，与批量移除同序）。
 // 它们各自的加锁顺序由各自的索引/结构决定，从任何一个调用点都无法统一**对方**的顺序，
 // 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了——FORCE INDEX 只收窄了锁面、关掉了
 // 批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是确定性的）。
@@ -771,23 +729,59 @@ func removeMemberLocked(sess *dbr.Session, spaceId, uid string, rejectRoleAtOrAb
 	return true, nil
 }
 
-// selectMembersForRemovalForUpdateSQL 是 removeMembersLocked 的整批锁定查询。
+// buildSelectMembersForRemovalForUpdateSQL 把一批 uid 展开成 UNION ALL，每个分支
+// 锁一行，**加锁顺序 = 分支顺序**，由调用方（Go）决定，而不是由索引的 collation 决定。
 //
-// FORCE INDEX 是**语义性**的，不是性能调优：不 FORCE 时优化器在真实规模上会选
-// (space_id, status)，锁住整个空间的活跃行、锁序也乱；FORCE 到 (space_id, uid) 把锁面
-// 收敛到目标本身、并让批量 vs 批量同序（同一条语句同一个计划）。
+// 为什么不是一条 `uid IN (...) FOR UPDATE`（round 6→10 一直是那个形状）：
 //
-// ⚠️ 它**不能**单独消除批量 vs 群主转让的跨路径死锁：transferOwnerAdminLocked 是
-// 先单行锁目标、再扫描降级的两段式，非单调，从本调用点无法统一它的顺序（round-8
-// 两名 reviewer 实测：FORCE 后目标落在批次内仍确定性死锁）。跨路径死锁由三条写路径
-// 共用的 retryOnDeadlock 兜底，见其注释。FORCE 仍然值得留：它把锁面和阻塞窗口收窄了，
-// 也让死锁少发一档。
+// 那条语句的锁是在索引扫描过程中逐行获取的，顺序就是索引的物理顺序 = **列的
+// collation 序**，调用方无从指定（ORDER BY 无效——锁在扫描期已经拿到，排序发生
+// 在其后）。于是 upsert 侧要想同序，就必须在 Go 里复现列的 collation。而列的
+// collation 是**环境相关**的：本仓库建 space_member 时没写 COLLATE，继承库默认；
+// CI 显式建库为 utf8mb4_general_ci（ci.yml:203-210），而 MySQL 8.0 的默认是
+// utf8mb4_0900_ai_ci，生产库即为后者。两者对 `_` 的排序**相反**——general_ci 把
+// 小写折进大写，`_`(0x5F) 落在字母之后；0900_ai_ci 走 UCA，标点排在字母之前。
+// 实测同一组 uid：
 //
-// TestRemoveMembersLockedForcesUniqueIndexPlan 用同一个常量断言计划，一旦有人删掉
-// FORCE、优化器回退，那条测试立刻变红。
-const selectMembersForRemovalForUpdateSQL = "SELECT uid, role FROM space_member " +
-	"FORCE INDEX (spacemember_spaceid_uid) " +
-	"WHERE space_id=? AND uid IN ? AND status=1 FOR UPDATE"
+//	0900_ai_ci  : A_000 a_b aab Ab000 u_000 ua000
+//	general_ci  : aab Ab000 A_000 a_b ua000 u_000
+//
+// 也就是说，任何"在 Go 里匹配 collation"的方案都只能对一种环境成立。round 10 加的
+// lessUIDGeneralCI 匹配的是 CI 那种，在生产上反而把顺序排反了。
+//
+// UNION ALL 展开则与 collation 完全无关：每个分支是 `WHERE space_id=? AND uid=?`
+// 的单行等值查询，MySQL 按分支先后执行、逐个取锁。实测（两种 collation 各一次、
+// 分支顺序都刻意与该 collation 的索引序相反）：让一个会话先锁住分支 2 的目标行，
+// 本语句在分支 2 阻塞时**恰好持有分支 1 的行锁、且未触及分支 3** —— 若按索引序
+// 取锁则持有的会是另一组。见 TestBatchRemovalLocksInBranchOrder。
+//
+// 另外两个连带好处，都不是附带的小事：
+//   - **不再需要 FORCE INDEX**。单行等值查询上优化器必然走唯一键
+//     spacemember_spaceid_uid，不可能选 (space_id, status) 去锁全空间的活跃行——
+//     round 7 加 FORCE INDEX 要防的就是那个。于是对索引名的运行时硬依赖也消失了：
+//     以前索引缺失会 1176 直接失败（且不可重试），现在退化为普通的计划选择。
+//   - **锁面天然收敛到目标行本身**，不依赖优化器的代价估算。
+//
+// 代价：200 uid 时语句约 17.6KB（占 max_allowed_packet 默认值的 0.026%），实测比
+// 单条 IN 慢约 1.7ms（3.1ms vs 1.4ms）。对一个上限 200 人、非高频的管理操作，
+// 用它换掉"顺序依赖环境 collation"这个隐患是划算的。
+//
+// 参数顺序：每个分支两个占位符 (space_id, uid)，调用方须按同样顺序展开 args。
+func buildSelectMembersForRemovalForUpdateSQL(n int) string {
+	const branch = "(SELECT uid, role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE)"
+	if n <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(n * (len(branch) + len(" UNION ALL ")))
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(" UNION ALL ")
+		}
+		b.WriteString(branch)
+	}
+	return b.String()
+}
 
 // spaceMemberRoleRow 承接 removeMembersLocked 的整批锁定查询：uid + 当前 role。
 type spaceMemberRoleRow struct {
@@ -847,43 +841,41 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// 一条语句锁住整批，且**强制走唯一索引 (space_id, uid)**（FORCE INDEX）。
+	// 按 uid 升序（sort.Strings，纯字节序）取锁，与 upsertMembersOnce 用的是**同一个
+	// 排序函数**。两边同序即结构上无法成环，且这个"序"是什么完全不重要 —— 重要的
+	// 只是两边一致。用最朴素的字节序正是因为它不需要任何前提：不问列的 collation，
+	// 不问部署环境，两个进程对同一组 uid 必然排出同一个顺序。
 	//
-	// 为什么必须 FORCE：space_member 上有两条候选索引 —— 唯一键
-	// spacemember_spaceid_uid(space_id, uid) 与 spacemember_spaceid_status(space_id,
-	// status)。不加 FORCE 时优化器是按代价选的，实测（MySQL 8.0 + ANALYZE）在本端点
-	// 真实规模上（250 人空间、200 uid 批）选的是 **spacemember_spaceid_status**：
-	// 于是锁按 (space_id, status, id) 顺序、且把该空间**所有** status=1 的行都锁住
-	// （250 把，而非 200 个目标），扩大了锁面（挡住并发 joinSpace/leaveSpace/transferOwner）。
-	// FORCE INDEX 把计划钉成 range on (space_id, uid)：只锁 200 个目标、按 uid 序，锁面
-	// 收敛到目标本身，并让**批量 vs 批量**同序（同一条语句同一个计划，无法互相成环）。
-	//   - 只 ORDER BY uid **不行**：锁在扫描期就获取，排序发生在其后。
-	//   - 逐个 FOR UPDATE 也不行：那会引回按调用方顺序持多把锁的批次间 AB-BA。
-	// SQL 抽成常量 selectMembersForRemovalForUpdateSQL，与计划断言测试共用，防止漂移。
+	// 排序的是副本，不动调用方切片（调用方后续不再用顺序，但别给下一个人留坑）。
 	//
-	// ⚠️ FORCE INDEX **不足以**消除批量 vs 群主转让的跨路径死锁：transferOwnerAdminLocked
-	// 先单行锁目标、再扫描降级，是两段式非单调获取，目标落在批次内时仍确定性死锁
-	// （round-8 两名 reviewer 实测）。那一类由外层 retryOnDeadlock 兜底。这里 FORCE 的
-	// 价值是收窄锁面/阻塞窗口、并关掉批量 vs 批量，不是根治跨路径。
-	//
-	// 角色重读仍在锁内：这条 SELECT 把每个成员的当前 role 连同锁一起取回，随后在 Go
-	// 里做层级判定，语义与 removeMemberLocked 逐个重读一致（防止 pre-check 之后目标被
+	// 加锁顺序由 UNION ALL 的分支顺序保证，与索引的 collation 无关，理由与实测见
+	// buildSelectMembersForRemovalForUpdateSQL 的注释。
+	ordered := append([]string(nil), uids...)
+	sort.Strings(ordered)
+
+	args := make([]interface{}, 0, len(ordered)*2)
+	for _, uid := range ordered {
+		args = append(args, spaceId, uid)
+	}
+
+	// 角色重读在锁内：这条语句把每个成员的当前 role 连同锁一起取回，随后在 Go 里做
+	// 层级判定，语义与 removeMemberLocked 逐个重读一致（防止 pre-check 之后目标被
 	// 并发转让升为 owner 仍被移除）。
 	//
-	// 对不存在的 uid 仍会在唯一索引上取间隙锁。**数量**与逐个 FOR UPDATE 相同，但**持有时长**
-	// 不同：逐个提交时每把间隙锁在各自 commit 就放了，现在要一直握到本事务末尾的那一次
-	// commit。一批里塞 200 个不存在的 uid 就会把 200 段 gap 按住整个事务，期间挡住这些区间
-	// 上的并发加入/重新激活。有界（要求调用方在本空间 role>=1，且事务很短），但别把它读成
-	// 「和以前一样」（PR #804 round-9 review yujiawei P2-2）。
+	// 对不存在的 uid 仍会在唯一索引上取间隙锁。**数量**与逐个 FOR UPDATE 相同，但
+	// **持有时长**不同：逐个提交时每把间隙锁在各自 commit 就放了，现在要一直握到本
+	// 事务末尾的那一次 commit。一批里塞 200 个不存在的 uid 就会把 200 段 gap 按住整个
+	// 事务，期间挡住这些区间上的并发加入/重新激活。有界（要求调用方在本空间 role>=1，
+	// 且事务很短），但别把它读成「和以前一样」（PR #804 round-9 review yujiawei P2-2）。
 	var locked []spaceMemberRoleRow
-	if _, err = tx.SelectBySql(selectMembersForRemovalForUpdateSQL, spaceId, uids).Load(&locked); err != nil {
+	if _, err = tx.SelectBySql(buildSelectMembersForRemovalForUpdateSQL(len(ordered)), args...).Load(&locked); err != nil {
 		return nil, err
 	}
 	// 循环**从 locked 出发**，而不是从请求切片出发。这是刻意的，别"优化"回去。
 	//
-	// space_member.uid 没有显式 COLLATE，继承库默认 utf8mb4_general_ci —— 大小写
-	// 不敏感。上面那条 `uid IN ?` 因此会匹中大小写变体，并把行按**库里存的拼写**
-	// 返回。反过来用请求里的拼写去查一个以存储拼写为 key 的 map，两者不一致时就
+	// space_member.uid 没有显式 COLLATE，继承库默认（CI 是 utf8mb4_general_ci，
+	// 生产是 utf8mb4_0900_ai_ci）—— 两者都**大小写不敏感**。上面那些 `uid=?` 分支
+	// 因此会匹中大小写变体，并把行按**库里存的拼写**返回。反过来用请求里的拼写去查一个以存储拼写为 key 的 map，两者不一致时就
 	// 查不中：成员被当成「不在空间」静默跳过，不翻 status、不入清理工单、不失效
 	// 鉴权缓存，而 removeMembers 照样 c.ResponseOK()。老的逐个路径两条语句
 	// （SELECT ... WHERE uid=? / UPDATE ... WHERE uid=?）都在 SQL 里比，没有这个
@@ -894,17 +886,29 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	// 从匹中的行出发就根本不存在 Go 与 SQL 两套比较口径：uid 全程是库里的拼写，
 	// 也正是 group 侧清理工单、鉴权缓存 key 要用的那一个。
 	//
-	// 顺带解决两件事：
-	//   - 请求里的重复 uid（含互为大小写变体的）天然只处理一次 —— 唯一索引
-	//     (space_id, uid) 保证每个成员至多一行，不必再维护 seen 集合；
-	//   - status<>1 的行 SQL 已经滤掉，「不在空间」这一条不需要在 Go 里再判一次。
+	// 顺带解决一件事：status<>1 的行 SQL 已经滤掉，「不在空间」这一条不需要在 Go
+	// 里再判一次。（请求里的重复 uid 由下面的 seen 去重，见那里的注释。）
 	//
-	// 返回顺序随之从调用方顺序变成索引顺序（uid 升序）。两个消费者
+	// 返回顺序随之从调用方顺序变成 sort.Strings 的字节升序。两个消费者
 	// （enqueueMemberRemovalCleanupBatchTx、afterMembersRemoved）都是逐个处理，
 	// 不依赖顺序。
+	// UNION ALL **不去重**：两个互为大小写变体的请求 uid 会各自匹中同一行，于是
+	// locked 里出现两条完全相同的行。此前那条 `uid IN (...)` 是单条 range 查询，
+	// 同一行只返回一次，天然没有这个问题 —— 换成分支展开就必须自己补上，否则同一个
+	// 人会被翻两次状态、写两条清理工单，worker 把整条级联跑两遍（重复的退群 Tip、
+	// 重复的 IM 退订）。由 TestRemoveMembersLockedDedupesCaseVariants 钉住。
+	//
+	// 这里用 map 去重是**安全的**，不要和 round 10 修掉的那个缺陷混为一谈：那次的错
+	// 在于用**请求里的拼写**去查一个以**存储拼写**为 key 的 map，两套比较口径不一致；
+	// 这里 key 和被查的值同为 row.UID，都来自 SQL 返回的存储拼写，byte-equal 成立。
 	now := time.Now()
 	removed := make([]string, 0, len(locked))
+	seen := make(map[string]struct{}, len(locked))
 	for _, row := range locked {
+		if _, dup := seen[row.UID]; dup {
+			continue
+		}
+		seen[row.UID] = struct{}{}
 		// 两种「不该动」的情形静默跳过，与既有 removeMembers 的观察行为一致
 		// （那边是 ErrCannotRemoveOwner / ErrRemoveHierarchy 被调用方 continue 掉、
 		// ok=false 不计入 removed）：owner、同级及更高。
