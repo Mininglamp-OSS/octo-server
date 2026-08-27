@@ -14,6 +14,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/stretchr/testify/assert"
@@ -1499,7 +1500,7 @@ func TestGroupCascadeLastNoticeNamesActualOwner(t *testing.T) {
 		ctx, g := cascadeSetup(t)
 		stub := newGroupIMStub(t, ctx)
 		const spaceID, gno = "sp-compose-normal", "g-compose-normal"
-		_, _, s3, _ := seedChain(t, ctx, gno, spaceID)
+		_, s2, s3, _ := seedChain(t, ctx, gno, spaceID)
 
 		// s3、s4 都不在队列里 → 链条应当收敛到 s2→s3 这一环
 		runBatch(t, ctx, g, spaceID, []string{"u-c", "u-s2"})
@@ -1516,6 +1517,17 @@ func TestGroupCascadeLastNoticeNamesActualOwner(t *testing.T) {
 			"最后一条通告点名的新群主必须是群里当下真正的 creator")
 		_, stillIn := liveMemberRole(t, ctx, gno, claimed)
 		assert.True(t, stillIn, "通告点名的新群主必须还在群里")
+
+		// extra[0] 点的是**存活那一环的离开者**（s2），不是批次里第一个走的 c。
+		// 这是有意接受的口径，不是笔误：每张工单独立跑，s2 那一张已经看不到 c 曾是
+		// 群主。理由与根治方向见 sendSpaceRemovalHandoverNotice 的注释。
+		//
+		// 这一条补的是**多环批次**这一格。单环场景早有覆盖：
+		// TestGroupCascadeCreatorHandoverIsAnnounced 一直断言 extra[0] 的 uid 与 name。
+		// 但单环里「本环离开者」和「批次首位离开者」是同一个人，那条用例结构上区分不了，
+		// 而这里恰恰是两个人（PR #804 round-12 review P1-2）。
+		assert.Equal(t, s2, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 0),
+			"extra[0] 必须是存活那一环的离开者")
 	})
 }
 
@@ -1721,3 +1733,97 @@ func TestGroupCascadeHandoverNoticeNeverWritesBareUID(t *testing.T) {
 			"解析不出名字时必须落到 #807 定下的中性兜底，而不是裸 uid")
 	}
 }
+
+// TestSuccessorElectionExcludesLeaverAfterDemotion 钉住「离开者不得被选为自己的
+// 继任者」，两条路径各自的实现方式不同，所以分开验。
+//
+// 为什么需要它：收紧资格谓词之后，bot join 没了，而 leaverUID 只出现在那个 join 里；
+// 离开者于是只剩 `role <> MemberRoleCreator` 这一个**偶然**保护 —— 它成立仅仅因为
+// handOverGroupCreator 恰好先选主、后降级。把那两句调换，离开者就会选中自己，编译器
+// 不报错（PR #804 round-12 review §1a / P1-1）。
+//
+// ⚠️ 既有用例并非「一条也拦不住」—— 实测那次调换会让 **17 条 TestGroupCascade* 变红**。
+// 但它们全是在下游炸的：离开者被提回 creator，LockRemovableMemberTx 随后拒绝移除
+// creator，报 "role changed concurrently"。没有一条直接说明这条规则本身。本用例补的
+// 就是这一格：把规则钉在选主这件事上，而不是靠一个不相干的症状反推。
+//
+// 本用例把语句顺序反过来（先把离开者降到 common，再选主），`role <> creator` 因此失效。
+//
+// 两条路径的实现为什么不同，见 querySecondOldestEligibleMemberTx 的注释：非事务版是
+// 无锁读，谓词直接写在 SQL 里；事务版带 FOR UPDATE，同一个谓词会翻转它的取锁顺序并
+// 与 RemoveGroupMembers 构成 AB-BA（实测 3/3 死锁），所以那一侧用调用方的
+// isSelfSuccessor 按行 id 拦截，SQL 保持与 main 一致。
+func TestSuccessorElectionExcludesLeaverAfterDemotion(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	const spaceID, gno = "sp-elect-leaver", "g-elect-leaver"
+	const leaver, candidate = "u-leaver", "u-candidate"
+
+	seedGroupInSpace(t, ctx, gno, spaceID, leaver)
+	// 离开者明确更元老：选主是 ORDER BY created_at ASC，同一秒插入的两行谁在前是
+	// 未定义的，不拉开时间这条断言可能因为排序恰好如愿而变绿（见 seedGroupMemberAt）。
+	seedGroupMemberAt(t, ctx, gno, leaver, MemberRoleCreator, "2020-01-01 00:00:01")
+	seedGroupMemberAt(t, ctx, gno, candidate, MemberRoleCommon, "2020-01-01 00:00:02")
+
+	// 关键：先降级，再选主 —— 与生产路径相反的顺序。
+	_, err := ctx.DB().Exec(
+		"UPDATE group_member SET role=? WHERE group_no=? AND uid=?",
+		MemberRoleCommon, gno, leaver)
+	require.NoError(t, err)
+
+	t.Run("非事务版靠 SQL 谓词排除离开者", func(t *testing.T) {
+		got, err := g.db.QuerySecondOldestEligibleMember(gno, leaver)
+		require.NoError(t, err)
+		require.NotNil(t, got, "群里还有合格的候选人，应该选得出人")
+		assert.Equal(t, candidate, got.UID,
+			"离开者已不是 creator 时，仍必须靠 gm.uid <> ? 把他自己排除在继任者之外")
+	})
+
+	t.Run("事务版的 SQL 单独拦不住离开者", func(t *testing.T) {
+		// 这条断言记录的是**现状**，也是 isSelfSuccessor 存在的理由：事务版不能加
+		// uid 谓词（会翻转取锁顺序），所以它自己确实会把已降级的离开者选出来。
+		// 若将来给它加了谓词或换了实现，本用例会变红，届时请连同下面那条一起重想。
+		tx, err := g.db.session.Begin()
+		require.NoError(t, err)
+		defer tx.RollbackUnlessCommitted()
+
+		got, err := querySecondOldestEligibleMemberTx(tx, gno)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, leaver, got.UID,
+			"事务版 SQL 不含 uid 谓词，降级后的离开者确实会被选出来——这正是要靠 Go 侧拦的")
+	})
+
+	t.Run("isSelfSuccessor 按行 id 拦下离开者", func(t *testing.T) {
+		var rows []struct {
+			ID  int64  `db:"id"`
+			UID string `db:"uid"`
+		}
+		_, err := ctx.DB().SelectBySql(
+			"SELECT id, uid FROM group_member WHERE group_no=? ORDER BY id", gno).Load(&rows)
+		require.NoError(t, err)
+		require.Len(t, rows, 2)
+
+		var leaverRowID, candidateRowID int64
+		for _, r := range rows {
+			if r.UID == leaver {
+				leaverRowID = r.ID
+			} else {
+				candidateRowID = r.ID
+			}
+		}
+		require.NotZero(t, leaverRowID)
+		require.NotZero(t, candidateRowID)
+
+		assert.True(t, isSelfSuccessor(&MemberModel{BaseModel: db.BaseModel{Id: leaverRowID}}, leaverRowID),
+			"选中离开者本人那一行时必须拦下")
+		assert.False(t, isSelfSuccessor(&MemberModel{BaseModel: db.BaseModel{Id: candidateRowID}}, leaverRowID),
+			"选中别人时**不能**拦——否则群会莫名其妙变成无主")
+		assert.False(t, isSelfSuccessor(nil, leaverRowID),
+			"没有候选人时不该 panic，也不该报告成「选中了自己」")
+	})
+}
+
+// ⚠️ 上面第三条只证明 isSelfSuccessor 本身正确，**证明不了 handOverGroupCreator 调用了
+// 它** —— 这两条是不同的断言。这里没法端到端覆盖后者：调用点今天结构上走不到那个分支
+// （先选主、后降级，离开者在选主那一刻还是 creator），而能让它走到的前提正是本守卫要防
+// 的那次改动。这一点如实记在这里，而不是假装被覆盖了。

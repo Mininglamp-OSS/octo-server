@@ -1002,16 +1002,35 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 // creator_uid 条件里，而离开者靠 `role <> MemberRoleCreator` 被顺带滤掉。收紧谓词后
 // 那个 join 没了，离开者就只剩下"角色还没被降级"这一个**偶然**保护 ——
 // handOverGroupCreator 恰好先选主、后降级；把这两句调换，离开者就会选中自己当继任者，
-// 而没有编译错误、没有测试会拦住（PR #804 round-11 review P2）。把它写成谓词，
-// 保护就不再依赖语句顺序。
+// 而没有编译错误
+// （PR #804 round-11 review P2 提出，round-12 三位 reviewer 各自指出谓词其实没写进
+// SQL、只写在了注释里）。
+//
+// ⚠️ 别把这写成「没有任何测试会拦住」—— 那句话是假的，已实测：把 handOverGroupCreator
+// 改成先降级再选主，**17 条既有 TestGroupCascade* 会变红**。但它们是在**下游**炸的
+// （离开者被提回 creator，LockRemovableMemberTx 随后拒绝移除 creator，报
+// "role changed concurrently"），没有一条直接说明「离开者不得当自己的继任者」这条规则。
+// 差别是承重的：下游报错要靠人从一个不相干的症状反推回选主，而本谓词把规则钉在它自己
+// 所在的那条语句上。由 TestSuccessorElectionExcludesLeaverAfterDemotion 钉住：先降级、
+// 再选主，让 `role <> creator` 失效，删掉本谓词立刻变红（已实测）。
+//
+// ⚠️ **groupExit 的情况不同，别把这段读成对它也成立**：它选主之后走的是 DeleteMemberTx
+// （is_deleted=1），不是降级，而本查询本来就带 `gm.is_deleted = 0`。那条路径上离开者
+// 因此另有一道各自独立的偶然保护。本谓词让它不再依赖任何一道。
+//
+// ⚠️ **事务内的那份孪生查询没有这一条谓词，是刻意的**：它带 FOR UPDATE，加同一个谓词
+// 会翻转它的取锁顺序并与 RemoveGroupMembers 构成 AB-BA（实测 3/3 触发 1213，而
+// modules/group 没有任何死锁重试）。那一侧改用调用方的 isSelfSuccessor 按行 id 拦截。
+// 本查询是**无锁读**，没有这个问题，谓词留在 SQL 里更好。完整测量见
+// space_member_removal.go 中 handOverGroupCreator 的注释。
 func (d *DB) QuerySecondOldestEligibleMember(groupNo string, leaverUID string) (*MemberModel, error) {
 	var memberModel *MemberModel
 	_, err := d.session.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
-			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
+			"WHERE gm.group_no = ? AND gm.uid <> ? AND gm.role <> ? AND gm.is_deleted = 0 "+
 			"AND gm.robot = 0 AND gm.is_external = 0 AND gm.status = ? "+
 			"ORDER BY gm.created_at ASC LIMIT 1",
-		groupNo, MemberRoleCreator, int(common.GroupMemberStatusNormal),
+		groupNo, leaverUID, MemberRoleCreator, int(common.GroupMemberStatusNormal),
 	).Load(&memberModel)
 	return memberModel, err
 }

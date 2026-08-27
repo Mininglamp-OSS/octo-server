@@ -290,21 +290,58 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 	// 就会各自提升一个继任者，群里留下两个 role=creator 的行。而
 	// RemoveGroupMembers 会静默跳过 creator，于是那个成员被永久卡在群里。
 	// 锁内重读后若已不是 creator，说明别人刚交接过，直接当成功返回。
-	var roles []int
+	// 顺带取回 id：下面的选主守卫要用它做身份比较。加一列不影响本语句的计划——
+	// WHERE 是唯一键 group_no_uid 上的等值查询，而 id 本来就在每个二级索引里。
+	var leaverRows []struct {
+		ID   int64 `db:"id"`
+		Role int   `db:"role"`
+	}
 	if _, err = tx.SelectBySql(
-		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		"SELECT id, role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
 		groupNo, leaverUID,
-	).Load(&roles); err != nil {
+	).Load(&leaverRows); err != nil {
 		return fmt.Errorf("re-read leaver role: %w", err)
 	}
-	if len(roles) == 0 || roles[0] != MemberRoleCreator {
+	if len(leaverRows) == 0 || leaverRows[0].Role != MemberRoleCreator {
 		return nil // 已经不是群主（并发交接已完成 / 人已不在群）
 	}
+	leaverRowID := leaverRows[0].ID
 
 	// 继任者也在同一事务内查，避免用事务外的陈旧快照
-	successor, err := querySecondOldestEligibleMemberTx(tx, groupNo, leaverUID)
+	successor, err := querySecondOldestEligibleMemberTx(tx, groupNo)
 	if err != nil {
 		return fmt.Errorf("query successor: %w", err)
+	}
+
+	// 离开者绝不能当选为自己的继任者。
+	//
+	// 为什么这道守卫在 Go 里、而不是像非事务版那样写成 `gm.uid <> ?` 谓词 ——
+	// 这是实测出来的，不是偏好：
+	//
+	//   上面那条选主语句是 `ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE`，
+	//   group_member 上没有服务这个排序的索引，于是它 filesort，并在扫描过程中把命中
+	//   的行**全部**加锁；加锁顺序 = 优化器选中的索引顺序。给它加一个 `gm.uid <> ?`，
+	//   优化器就从 group_no_uid 换到 group_member_groupNo，取锁顺序随之从 **uid 升序**
+	//   变成 **id（插入）升序**。而 RemoveGroupMembers 是特意按 uid 排序取锁的
+	//   （service.go），两者方向相反就是 AB-BA。
+	//
+	//   实测（MySQL 8.0.46，同群三行、uid 序与 id 序刻意相反，T1=RemoveGroupMembers
+	//   逐行 FOR UPDATE、T2=本函数）：不加谓词 0/3 死锁，加 `uid <> ?` 后 **3/3** 死锁，
+	//   InnoDB 的死锁报告直接点名这条选主语句。modules/group 里没有任何死锁重试
+	//   （retryOnDeadlock 只在 modules/space），输家就是一个 500 或一次白烧的清理工单。
+	//
+	//   FORCE INDEX 能把计划钉回去（实测 0/3），但那是在热路径上新增一次锁序改动
+	//   外加一个索引名的运行时硬依赖，属于并发那摊事，不该塞进本改动。
+	//
+	// 触发条件与退化方向：今天走不到 —— 本函数先选主、后降级，离开者在选主那一刻还是
+	// creator，被 `gm.role <> ?` 滤掉。这道守卫防的是**将来有人把这两句调换**：那时它
+	// 返回「无可继任者」（群成为无主空群，是既有的、已被处理的终局），而不是把一个已经
+	// 离开的人立为群主。少选一个人是安全的退化方向，立错群主不是。日志按 Error 记，
+	// 因为走到这里说明上面的语句顺序被改坏了。
+	if isSelfSuccessor(successor, leaverRowID) {
+		g.Error("选主命中离开者本人，已拒绝——检查 handOverGroupCreator 的语句顺序是否被调换",
+			zap.String("groupNo", groupNo), zap.String("leaver", leaverUID))
+		successor = nil
 	}
 
 	if successor != nil {
@@ -464,6 +501,31 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 //
 // ⚠️ i18n 注意：Android 用 MessageFormat，ASCII 单引号 ' 是转义字符。当前中文全角
 // 引号安全，但将来译成英文若写成 the group's owner，占位符只在 Android 端被静默吞掉。
+//
+// ⚠️ **{0} 点的是「存活那一环的离开者」，不一定是批次里第一个走的那个人。**
+// 一批移除掉同群连续几位元老时（比如 [C, S2]，C 是群主、S2 是次元老），抑制让链条
+// 只剩最后一环，而那一环的离开者是 S2 —— 群里读到的是「S2 已离开当前空间，S3 已
+// 成为新群主」。两个分句都为真（S2 确实离开了空间，S3 确实成了新群主），但 S2 短暂
+// 当过群主这件事群里从没被通告过，读起来会缺一截。
+//
+// 哪一环存活也**不确定**：claimMemberRemovalCleanup 刻意不带 ORDER BY 且用
+// SKIP LOCKED，多副本下谁先跑不定；入队顺序又是 sortForLockOrder 的（uid 序），
+// 与群内资历无关。所以 {0} 的取值范围是「本批次中的某一位离开者」，恒定为真的只有
+// {1}（最终群主）。
+//
+// 这是**有意接受**的口径，不是疏漏。要让 {0} 恒等于批次起始时的群主，得把「批次起始
+// 群主」这个状态串过整条链——每张清理工单是独立跑的，S2 那一张已经看不到 C 曾是群主，
+// 得为此新增持久状态。根治方向是「一批工单全部终结后统一发一条」，与 #797 里那些
+// 「副作用需要持久化重放」的条目同一个形状 —— 但注意 **#797 的正文里目前并没有这一条**，
+// 说「已归在那里」是不准确的；合入前需要真的往 #797 补一条，否则它只是这段注释里的一句话。
+//
+// 当前口径由 TestGroupCascadeLastNoticeNamesActualOwner 的 extra[0] 断言钉住。
+//
+// ⚠️ 准确地说它补的是**链条收敛后 {0} 换了人**这一格：单环场景早就有覆盖 ——
+// TestGroupCascadeCreatorHandoverIsAnnounced 一直在断言 extra[0] 的 uid 和 name，
+// 把 extra[0] 改成点继任者，变红的正是它（已实测）。但单环用例结构上区分不了
+// 「{0} 是本环离开者」和「{0} 是批次首位离开者」——那两者在单环里是同一个人。
+// 别把这里写成「{0} 此前没有任何覆盖」，那句话是假的（PR #804 round-12 review P1-2）。
 func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, successorUID, successorName string) error {
 	// 双保险：调用方已经用 resolveExitShowName 兜过中性词了，这里再挡一次，
 	// 且**绝不**兜成 uid —— 见 exitShowNameFallback 的理由（PR #804 round-11 P1-2）。
@@ -529,10 +591,34 @@ func (g *Group) resolveDisplayName(uid string) string {
 	return u.Name
 }
 
+// isSelfSuccessor 报告选主是否选中了离开者本人的那一行。
+//
+// 按 **id** 比，不是按 uid 比：id 是行身份，不掺 collation。group_member.uid 列是
+// 大小写不敏感的（general_ci / 0900_ai_ci 都是），在 Go 里比 uid 就又回到
+// 「Go 比字节、SQL 比 collation」那个坑里，而 id 没有这个问题。
+//
+// 单独成函数是为了它能被直接测到：调用点今天结构上走不到这个分支（见调用点注释），
+// 「调用点恰好没触发」和「守卫本身是对的」是两条不同的断言，只写在 if 里就只能测前者。
+func isSelfSuccessor(successor *MemberModel, leaverRowID int64) bool {
+	return successor != nil && successor.Id == leaverRowID
+}
+
 // querySecondOldestEligibleMemberTx 是 DB.QuerySecondOldestEligibleMember 的
-// 事务内版本，资格谓词与它逐字一致。单独一份是为了让选主与角色重校验落在同一个
-// 事务、同一份读视图里。资格口径的理由见非事务版的注释。
-func querySecondOldestEligibleMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
+// 事务内版本。单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
+//
+// **资格谓词**（排除 bot / 外部成员 / 非正常 status）与非事务版逐字一致，理由见那边的
+// 注释；只改一条就会让另一条成为绕过新规则的后门。
+//
+// **但「排除离开者本人」这一条两边写法不同，是刻意的**：非事务版是无锁读，直接写成
+// `gm.uid <> ?` 谓词；本函数带 FOR UPDATE，加同一个谓词会让优化器换索引、把取锁顺序
+// 从 uid 升序翻成 id 升序，与 RemoveGroupMembers 的 uid 序相反而构成 AB-BA（实测 3/3
+// 死锁）。所以这一条落在调用方的 isSelfSuccessor 上，SQL 保持与 main 一致。完整测量
+// 见 handOverGroupCreator 里那段注释。
+//
+// 也正因如此本函数**不收 leaverUID**：它用不到，收了就是个死参数 —— 一个只出现在签名
+// 里的参数会让下一个人以为排除逻辑在这条 SQL 里（PR #804 round-11 review 已就同一形状
+// 提过一次）。排除发生在调用方，就写在调用方。
+func querySecondOldestEligibleMemberTx(tx *dbr.Tx, groupNo string) (*MemberModel, error) {
 	var member *MemberModel
 	// FOR UPDATE 锁住选中的继任者：不锁的话它可能正被另一条清理工单删除，
 	// UpdateMemberRoleTx 的 WHERE 带 is_deleted=0，会静默影响 0 行，
