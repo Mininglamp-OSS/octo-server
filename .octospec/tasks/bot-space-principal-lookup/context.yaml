@@ -1,0 +1,21 @@
+injected:
+  - id: space-isolation
+    source: repo
+    reason: Exact active-Space membership and Bot authority are the endpoint's security boundary.
+  - id: error-handling
+    source: repo
+    reason: All denial and infrastructure failures must preserve the localized error envelope.
+  - id: rate-limit
+    source: repo
+    reason: The endpoint inherits the existing authenticated per-Bot business limiter.
+  - id: testing
+    source: repo
+    reason: Route and database authorization matrices require proportional regression tests.
+  - id: commit-style
+    source: repo
+    reason: Repository convention applies if this work is later committed.
+brief: .octospec/tasks/bot-space-principal-lookup/brief.md
+scope:
+  caller: user-bot-only
+  supported_targets: [human, user_bot]
+  app_bot: rejected-as-caller-and-target
