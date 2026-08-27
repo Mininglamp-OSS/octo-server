@@ -1542,6 +1542,29 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-27 (space-removal-creator-handover-notice · round 11b)
+
+- **Fixed** — Two P1s that round 11 introduced. (1) `sort.Strings` on both sides is
+  not spelling-invariant: the column is case-insensitive and neither entry point
+  folds case, so two callers naming the same rows with different spellings acquire
+  in opposite order — and this is the pair `retryOnDeadlock` was measured *starving*
+  against. Both sides now use `sortForLockOrder` (case-folded key, raw uid tiebreak),
+  with the accent-insensitivity limit stated rather than claimed away. (2) The
+  handover notice wrote a bare UID into permanent group history, contrary to the rule
+  #807 set four functions away; fixed at the source via `resolveGlobalName` +
+  `resolveExitShowName`.
+- **Learned** — The cost of an overstated comment is not the bug it hides today, it is
+  the guard someone deletes tomorrow because the comment said it was redundant. I
+  wrote `不需要任何前提` in the same commit whose journal entry criticised round 10 for
+  asserting an unconditional invariant.
+- **Learned** — "Tracked as a follow-up" is not a disposition for a one-line fix
+  against a rule already established in the file next door. The bare-UID defect was in
+  round 10's follow-up list and shipped anyway — and the note was itself wrong about
+  the mechanism (it implied the `== ""` guards were doing something; they never fired).
+- **Learned** — When a predicate is deleted, check what else it was quietly
+  guaranteeing. Tightening the eligibility SQL removed `leaverUID` from it, leaving the
+  leaver protected only by statement order in the caller.
+
 ## 2026-08-26 (space-removal-creator-handover-notice · round 11)
 
 - **Fixed** — Round 10's collation comparator matched CI and inverted production:

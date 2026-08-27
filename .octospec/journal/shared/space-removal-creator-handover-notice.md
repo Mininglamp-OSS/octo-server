@@ -736,3 +736,56 @@ it" are two different claims, and only the second one rots.
 
 **Rebase before building on the branch, not after.** Three commits had landed on
 main while this work was in progress.
+
+
+## Round 11b — both blockers were defects round 11 itself introduced
+
+Review of the round-11 head found two P1s, and neither was inherited: I wrote both
+in the commit that was supposed to close round 10.
+
+**I repeated the exact error I had just criticised.** Round 11's journal entry
+says round 10 went wrong by asserting an unconditional invariant. Then I wrote
+`用最朴素的字节序正是因为它不需要任何前提` — another unconditional invariant, in
+the commit that fixed the previous one. It is false because both sides must sort
+*the same strings*, and the column is case-insensitive while neither entry point
+folds case. The reviewer's framing is the part worth keeping: the runtime exposure
+is small, but a future maintainer reading "needs no premise" has a licence to
+delete the retry that is actually holding it together. **The cost of an overstated
+comment is not the bug it hides today; it is the guard someone removes tomorrow
+because the comment told them it was redundant.**
+
+**The second one I had already written down as a follow-up.** The handover notice
+falling back to a bare uid was listed in round 10's follow-ups — I knew about it,
+recorded it, and shipped it anyway. That was wrong: #807 set the rule in this same
+package, four functions away, and a follow-up on a *new* message means shipping a
+known rule violation and scheduling its repair. If the fix is one line and the rule
+is already established in the file next door, "tracked as a follow-up" is not a
+disposition, it is a deferral with extra steps.
+
+It was also worse than the follow-up entry described. I had written it as "falls
+back to the raw uid when display-name resolution fails", implying the `== ""`
+guards were doing something. They were not: `resolveDisplayName` returns the uid
+itself, so the bare uid arrived as a *non-empty* name and the guards never fired.
+Writing a defect down is not the same as understanding it, and my own note was
+inaccurate about the mechanism.
+
+Fixed at the source rather than at the guard — a `resolveGlobalName` that returns
+empty, so both names resolve through #807's existing precedence chain instead of
+having a second fallback bolted on beside it.
+
+**The reviewer also caught a protection that had become emergent.** After
+tightening the eligibility predicate, `leaverUID` stopped appearing in the SQL: the
+leaver was excluded only by `role <> creator`, which holds because
+`handOverGroupCreator` happens to elect before it demotes. Swap two statements and
+the leaver elects himself, with no compiler error and no failing test. I removed
+the condition that had been doing the work and did not notice the remaining
+protection was accidental. Worth generalising: when a predicate is deleted, check
+what else it was quietly guaranteeing.
+
+**On the process recommendation.** The reviewer proposed splitting this into three
+PRs (feature / concurrency design / permission change), on the grounds that round
+11 produced defects at about the rate it closed them. That reading is fair — both
+P1s were self-inflicted. We chose to continue on this branch, so the argument stands
+recorded rather than accepted: the eligibility change does alter who may hold owner
+authority on `groupExit`, a path this PR's title does not mention, and it is riding
+along in a large diff.
