@@ -438,8 +438,13 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 // 仍然沿用同一个 content type GroupTransferGrouper(1008)：
 //   - 客户端按同一条路径渲染（octo-web module.tsx 把 1000-2000 统一交给 SystemCell，
 //     1008 另被 Model.tsx 列入「不计未读的系统消息」），不会出现同一件事两种样子；
-//   - 名字放 extra 走 {N} 占位符、**不拼进 content**，所以用户可控的展示名没有注入面，
-//     也不需要自己做净化截断。
+//   - 名字放 extra 走 {N} 占位符、**不拼进 content**，所以没有 JSON 注入面。
+//
+// ⚠️ 但结构化**不等于**安全，这两件事此前被混为一谈：客户端是在同一个字符串上逐次
+// 替换 {N}，替换进去的文本会被后续几轮重新扫描，所以一个含字面量 `{1}` 的名字会在
+// 下一轮被当成占位符再展开，凭空造出半句系统消息；bidi 控制符则能视觉反转整句。
+// 名字来源是成员可自设的 group_member.remark，且不校验内容。两条途径由
+// sanitizeSystemMessageName 在进入 extra 前掐掉。
 //
 // 结构化只买到「无注入面」这一半，**买不到**「改名后不留旧名」：三端客户端
 // （iOS WKSystemContent、Android StringUtils、Web SDK）都直接渲染 extra[i].name，
@@ -469,9 +474,11 @@ func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, s
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		Payload: []byte(util.ToJson(map[string]interface{}{
 			"content": `“{0}”已离开当前空间，“{1}”已成为新群主`,
+			// 名字在这里净化，不在上游：展示名有 remark / 全局名 / uid 兜底三条来源，
+			// 挡在**入口**才不会漏掉将来新增的第四条。见 sanitizeSystemMessageName。
 			"extra": []config.UserBaseVo{
-				{UID: leaverUID, Name: leaverName},
-				{UID: successorUID, Name: successorName},
+				{UID: leaverUID, Name: sanitizeSystemMessageName(leaverName)},
+				{UID: successorUID, Name: sanitizeSystemMessageName(successorName)},
 			},
 			"type": common.GroupTransferGrouper,
 		})),

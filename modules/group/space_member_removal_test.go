@@ -1614,3 +1614,73 @@ func TestGroupCascadeSuccessorPrefersEligibleOverIneligible(t *testing.T) {
 	assert.Equal(t, humanUID, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 1),
 		"通告里的新群主必须是那个合格的人")
 }
+
+// TestGroupCascadeHandoverNoticeSanitizesNames 端到端钉住：交接通告的 extra 里
+// **不得**出现半角花括号或 bidi 控制符。
+//
+// 单元测试 TestSanitizeSystemMessageName 证明了净化函数本身正确，但证明不了
+// 发送点**调用了**它 —— 这两条是不同的断言，而漏掉调用正是最容易发生的形态。
+// 展示名走的是 group_member.remark，成员可以给自己设，且不校验内容。
+func TestGroupCascadeHandoverNoticeSanitizesNames(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, gno = "sp-sanitize", "g-sanitize"
+	const creator, successor = "u-creator", "u-successor"
+
+	seedGroupInSpace(t, ctx, gno, spaceID, creator)
+	// 离开者与继任者各自把备注设成带攻击载荷的形状：
+	//   - `{1}` 会在客户端替换 {0} 之后的那一轮被当成占位符再展开；
+	//   - RLO 会视觉反转其后的文本。
+	seedGroupMemberWithRemark(t, ctx, gno, creator, MemberRoleCreator, "离开者{1}伪造")
+	seedGroupMemberWithRemark(t, ctx, gno, successor, MemberRoleCommon, "继任者‮反转")
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	names := payloadExtraNames(stub.sentPayloads(), "已成为新群主")
+	require.Len(t, names, 2, "交接通告应带两个 extra 名字")
+	for _, n := range names {
+		assert.NotContains(t, n, "{", "extra 名字里不得残留半角左花括号：%q", n)
+		assert.NotContains(t, n, "}", "extra 名字里不得残留半角右花括号：%q", n)
+		assert.NotContains(t, n, "‮", "extra 名字里不得残留 RLO：%q", n)
+	}
+	// 反向：净化不能把名字吃光，否则群里显示的是一串看不懂的东西
+	assert.Contains(t, names[0], "离开者")
+	assert.Contains(t, names[1], "继任者")
+}
+
+// payloadExtraNames 取出某条系统消息 extra 里的全部 name，按下标顺序。
+func payloadExtraNames(payloads []map[string]interface{}, fragment string) []string {
+	for _, p := range payloads {
+		raw, ok := p["payload"]
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(raw))
+		if err != nil {
+			continue
+		}
+		var inner map[string]interface{}
+		if json.Unmarshal(decoded, &inner) != nil {
+			continue
+		}
+		content, _ := inner["content"].(string)
+		if !strings.Contains(content, fragment) {
+			continue
+		}
+		extra, ok := inner["extra"].([]interface{})
+		if !ok {
+			continue
+		}
+		out := make([]string, 0, len(extra))
+		for _, e := range extra {
+			if m, ok := e.(map[string]interface{}); ok {
+				out = append(out, fmt.Sprint(m["name"]))
+			}
+		}
+		return out
+	}
+	return nil
+}
