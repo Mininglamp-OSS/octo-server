@@ -961,20 +961,47 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 	return uids, err
 }
 
-// QuerySecondOldestMemberExcludingBotsOf 选出第二元老成员（群主退群时的新群主人选），
-// 在 QuerySecondOldestMember 的基础上额外排除 leaverUID 名下（robot.creator_uid）的
-// 活跃 bot：#354 起群主退群也会级联带走自己的 bot，这些 bot 在同一事务内即将离群，
-// 不能被选为新群主（否则会出现「新群主刚上任就被级联删除」的孤儿群）。
-// 其他人的 bot 不受影响，保持与旧选主逻辑一致。
+// QuerySecondOldestMemberExcludingBotsOf 选出第二元老成员（群主退群时的新群主人选）。
+//
+// 资格谓词与手动转让 transferGrouper 对齐：**排除 bot、排除外部成员、要求 status 正常**。
+// 两条路径决定的是同一件事——谁可以持有群主权限——此前它们给的答案不一样。
+//
+// 三条排除各自的理由：
+//
+//   - **bot（gm.robot = 0）**。此前只排除 leaverUID 名下（robot.creator_uid）的活跃
+//     bot，理由是 #354 起群主退群会级联带走自己的 bot，它们在同一事务内即将离群，
+//     选中就会得到「新群主刚上任就被级联删除」的孤儿群。但**他人的** bot 同样不该
+//     当群主：群主握有改群信息、加/removeManager、再转让的全部敏感权限，交给一个
+//     机器人账号等于这个群实际无人管理，而那些权限仍然活着。没有可继任者时返回 nil、
+//     群成为无主空群，是既有的、已被处理的终局（见 handOverGroupCreator），比装一个
+//     不会行使权限的"群主"要诚实。
+//
+//     ⚠️ 这**推翻**了一条被显式钉住的既有契约：
+//     TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 曾断言「他人的 bot 不在
+//     排除范围内（与旧 QuerySecondOldestMember 语义一致）」。那条断言记录的是历史
+//     延续，不是一个论证过的决定——#354 当时只关心「即将被级联删除」这一个失败模式，
+//     没有考虑权限归属。该测试已随本改动更新。
+//
+//   - **外部成员（gm.is_external = 0）**。transferGrouper 明确拒绝把群主转让给外部
+//     成员，理由写在 api.go：群主拥有全部敏感操作权限，绝不能落到外部成员手上
+//     （YUJ-231 / GH#1289）。而选主此前允许，且 QueryIsGroupCreator 这条 creator 门禁
+//     只看 role 和 is_deleted、不看 is_external，于是五个 creator-only 端点
+//     （avatarUpload / groupUpdate / managerAdd / managerRemove / transferGrouper）
+//     会照常放行。手动路径拒绝、自动路径准入，是同一规则的两个答案。
+//
+//   - **status 正常（gm.status = GroupMemberStatusNormal）**。status=2 是群黑名单。
+//     把一个被拉黑的成员提为群主，等于用自动路径撤销一次管理动作。
+//
+// 这三条在 Space 移除级联（querySecondOldestNonBotMemberTx）与用户主动退群
+// （groupExit → 本函数）上必须一致：只改一条就会让另一条成为绕过新规则的后门。
 func (d *DB) QuerySecondOldestMemberExcludingBotsOf(groupNo string, leaverUID string) (*MemberModel, error) {
 	var memberModel *MemberModel
 	_, err := d.session.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
-			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
 			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
-			"AND r.robot_id IS NULL "+
+			"AND gm.robot = 0 AND gm.is_external = 0 AND gm.status = ? "+
 			"ORDER BY gm.created_at ASC LIMIT 1",
-		leaverUID, groupNo, MemberRoleCreator,
+		groupNo, MemberRoleCreator, int(common.GroupMemberStatusNormal),
 	).Load(&memberModel)
 	return memberModel, err
 }

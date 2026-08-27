@@ -388,8 +388,14 @@ func TestQuitGroup_CreatorCascadesBots(t *testing.T) {
 	assert.Equal(t, 0, m1Member.IsDeleted)
 }
 
-// TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 群里除群主外只剩群主自己的 bot 时，
-// 选主返回 nil（群随之清空），不能把即将级联离群的 bot 提为新群主。
+// TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 群里除群主外只剩 bot 时，
+// 选主返回 nil（群成为无主空群），不能把 bot 提为新群主。
+//
+// 此前这条用例的后半段断言的是相反的契约：「他人的 bot 不在排除范围内（与旧
+// QuerySecondOldestMember 语义一致）」。那条断言现已**推翻**——群主握有改群信息、
+// 加/removeManager、再转让的全部敏感权限，交给机器人账号等于群实际无人管理而权限
+// 仍然活着。理由与另外两条排除（外部成员、非正常 status）一并写在
+// QuerySecondOldestMemberExcludingBotsOf 的注释里。
 func TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft(t *testing.T) {
 	svc, userDB := setupServiceTest(t)
 	insertTestUsers(t, userDB, testutil.UID, "m1")
@@ -412,10 +418,9 @@ func TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, newGrouper, "群里只剩 leaver 自己的 bot 时不应选出新群主")
 
-	// 他人的 bot 不受排除影响（保持旧选主语义）
+	// 他人的 bot 同样不得当选：群主权限不该落到任何机器人账号上。
 	seedBotMember(t, s, groupNo, "bot_other", "other-bot", "someone_else")
 	newGrouper, err = s.db.QuerySecondOldestMemberExcludingBotsOf(groupNo, testutil.UID)
 	assert.NoError(t, err)
-	assert.NotNil(t, newGrouper)
-	assert.Equal(t, "bot_other", newGrouper.UID, "他人的 bot 不在排除范围内（与旧 QuerySecondOldestMember 语义一致）")
+	assert.Nil(t, newGrouper, "他人的 bot 也不得被选为新群主——群主权限不该交给机器人账号")
 }

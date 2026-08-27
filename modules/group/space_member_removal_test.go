@@ -1518,3 +1518,99 @@ func TestGroupCascadeLastNoticeNamesActualOwner(t *testing.T) {
 		assert.True(t, stillIn, "通告点名的新群主必须还在群里")
 	})
 }
+
+// seedGroupMemberWithFlags 写一条带 robot / is_external / status 标记的成员行。
+// 选主资格谓词（QuerySecondOldestMemberExcludingBotsOf 及其事务版）就看这三列，
+// 不带标记的 seedGroupMember 覆盖不到任何一条排除分支。
+func seedGroupMemberWithFlags(t *testing.T, ctx *config.Context, groupNo, uid string, role, robot, isExternal, status int) {
+	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT INTO group_member (group_no, uid, role, robot, is_external, status, is_deleted, version, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, 0, 1, NOW(), NOW())",
+		groupNo, uid, role, robot, isExternal, status)
+	require.NoError(t, err)
+}
+
+// TestGroupCascadeSuccessorMustBeEligible 钉住选主的资格谓词：**bot、外部成员、
+// 被拉黑的成员都不得被选为新群主**，三者都不在时群成为无主空群。
+//
+// 为什么这条重要：群主握有五个 creator-only 端点的权限（avatarUpload / groupUpdate /
+// managerAdd / managerRemove / transferGrouper），而它们的门禁 QueryIsGroupCreator
+// 只看 role 和 is_deleted —— 不看 is_external，也不看 status。所以一旦这里选错人，
+// 后面没有任何一道闸门会拦住他。手动转让 transferGrouper 明确拒绝外部成员
+// （YUJ-231 / GH#1289），自动选主此前却允许，两条路径对同一件事给了不同答案。
+//
+// 每个子用例都只留**一个**不合格的候选人，所以断言「选不出人」就等价于断言
+// 「这一条排除生效了」；把对应的排除条件从 SQL 里删掉，这一条立刻变红。
+func TestGroupCascadeSuccessorMustBeEligible(t *testing.T) {
+	cases := []struct {
+		name                            string
+		robot, isExternal, memberStatus int
+		why                             string
+	}{
+		{"bot", 1, 0, 1, "群主权限不该交给机器人账号——它不会行使，而权限仍然活着"},
+		{"外部成员", 0, 1, 1, "transferGrouper 明确拒绝外部成员，自动选主不能成为它的后门"},
+		{"黑名单成员", 0, 0, 2, "把被拉黑的成员提为群主等于用自动路径撤销一次管理动作"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, g := cascadeSetup(t)
+			stub := newGroupIMStub(t, ctx)
+			spaceID := "sp-eligible-" + tc.name
+			gno := "g-eligible-" + tc.name
+			const creator, candidate = "u-creator", "u-candidate"
+
+			seedGroupInSpace(t, ctx, gno, spaceID, creator)
+			seedGroupMember(t, ctx, gno, creator, MemberRoleCreator)
+			seedGroupMemberWithFlags(t, ctx, gno, candidate, MemberRoleCommon,
+				tc.robot, tc.isExternal, tc.memberStatus)
+
+			require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+				SpaceID: spaceID, UID: creator, OperatorUID: "su",
+				Reason: spacemod.MemberRemoveReasonForceRemoved,
+			}))
+
+			// 唯一的候选人不合格 ⇒ 没有人当选，群无主
+			role, stillIn := liveMemberRole(t, ctx, gno, candidate)
+			if stillIn {
+				assert.Equal(t, MemberRoleCommon, role, "%s：%s", tc.name, tc.why)
+			}
+			assert.False(t, payloadsContain(stub.sentPayloads(), "已成为新群主"),
+				"%s：没有合格继任者时不得发交接通告", tc.name)
+
+			// 离开的群主仍然被降级并移出——选不出继任者不能让他留在群里
+			_, leaverStillIn := liveMemberRole(t, ctx, gno, creator)
+			assert.False(t, leaverStillIn, "%s：选不出继任者时原群主仍必须离群", tc.name)
+		})
+	}
+}
+
+// TestGroupCascadeSuccessorPrefersEligibleOverIneligible 反向对照：不合格的候选人
+// 更元老时，也必须跳过他去选后面那个合格的，而不是直接放弃。
+//
+// 少了这条，把 SQL 改成「有任何不合格候选人就返回 nil」也能让上面那条全绿。
+func TestGroupCascadeSuccessorPrefersEligibleOverIneligible(t *testing.T) {
+	ctx, g := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+	const spaceID, gno = "sp-eligible-skip", "g-eligible-skip"
+	const creator, botUID, humanUID = "u-creator", "u-bot", "u-human"
+
+	seedUser(t, ctx, humanUID, "合格的人")
+	seedGroupInSpace(t, ctx, gno, spaceID, creator)
+	seedGroupMember(t, ctx, gno, creator, MemberRoleCreator)
+	// bot 先入群（更元老），合格的人后入群
+	seedGroupMemberWithFlags(t, ctx, gno, botUID, MemberRoleCommon, 1, 0, 1)
+	seedGroupMember(t, ctx, gno, humanUID, MemberRoleCommon)
+
+	require.NoError(t, g.cleanupSpaceMemberGroups(ctx, spacemod.MemberRemoval{
+		SpaceID: spaceID, UID: creator, OperatorUID: "su",
+		Reason: spacemod.MemberRemoveReasonForceRemoved,
+	}))
+
+	role, stillIn := liveMemberRole(t, ctx, gno, humanUID)
+	require.True(t, stillIn)
+	assert.Equal(t, MemberRoleCreator, role, "应跳过更元老的 bot，选中后面那个合格的人")
+	assert.Equal(t, humanUID, payloadExtraUIDAt(stub.sentPayloads(), "已成为新群主", 1),
+		"通告里的新群主必须是那个合格的人")
+}

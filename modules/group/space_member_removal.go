@@ -495,9 +495,8 @@ func (g *Group) resolveDisplayName(uid string) string {
 }
 
 // querySecondOldestNonBotMemberTx 是 DB.QuerySecondOldestMemberExcludingBotsOf 的
-// 事务内版本，语义完全一致（含「他人的 bot 仍可继任」这条被
-// TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 钉住的既有契约）。
-// 单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
+// 事务内版本，资格谓词与它逐字一致。单独一份是为了让选主与角色重校验落在同一个
+// 事务、同一份读视图里。资格口径的理由见非事务版的注释。
 func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
 	var member *MemberModel
 	// FOR UPDATE 锁住选中的继任者：不锁的话它可能正被另一条清理工单删除，
@@ -505,11 +504,10 @@ func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*Me
 	// 群就此无主。
 	_, err := tx.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
-			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
 			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
-			"AND r.robot_id IS NULL "+
+			"AND gm.robot = 0 AND gm.is_external = 0 AND gm.status = ? "+
 			"ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE",
-		leaverUID, groupNo, MemberRoleCreator,
+		groupNo, MemberRoleCreator, int(common.GroupMemberStatusNormal),
 	).Load(&member)
 	return member, err
 }
