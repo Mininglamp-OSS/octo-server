@@ -256,12 +256,18 @@ func (s *SystemSettings) FileExtraBlockedExtensions() []string {
 //
 // 越界 Warn 由钳位器按 (key, value) 去重：本 getter 在 policyInputs() 里，
 // 每次 currentPolicy() 都会走 —— 包括每个未认证的 /v1/common/appconfig 请求。
+//
+// 未配置的那一格刻意不走钳位器：天花板可以低于代码默认值
+// （OCTO_FILE_MAX_SIZE_KB_HARD_CAP < 100MB），把默认值喂进去会报
+// configured=102400，而 system_setting 表里一行都没有 —— 那是在诬告一次没有
+// 发生过的变更，且每个 pod 都会打一条。回落值本身仍然要过天花板。
 func (s *SystemSettings) FileMaxSizeKB() int {
-	return s.clampIntUpper("file.max_size_kb",
-		s.getInt("file", "max_size_kb", DefaultFileMaxSizeKB),
-		DefaultFileMaxSizeKB,
-		FileMaxSizeKBHardCap(),
-	)
+	hardCap := FileMaxSizeKBHardCap()
+	v, configured := s.getIntOK("file", "max_size_kb")
+	if !configured {
+		return min(DefaultFileMaxSizeKB, hardCap)
+	}
+	return s.clampIntUpper("file.max_size_kb", v, DefaultFileMaxSizeKB, hardCap)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,27 +287,61 @@ type FileStickerSizeOrdering struct {
 	StickerMaxSizeKB int
 }
 
-// FileStickerSizeOrdering 读当前快照的组合值。单次读取两个键，避免跨 Reload()
-// 拼出不一致组合。
+// FileStickerSizeOrdering 读当前快照的组合值，供写侧守卫比较。
+//
+// 贴纸侧取的是 stickerUploadMaxSizeKBOwnBound()（只受贴纸自身硬上限约束），
+// **不是**收敛后的 StickerUploadMaxSizeKB()：后者已经 min 过全局上限，两侧
+// 拿去比永远相等，守卫等于死代码。写侧要回答的问题是「运营配置的贴纸上限能
+// 不能被兑现」，那要拿配置意图去比生效的全局上限。
+//
+// 注意这里是**两次**独立的 snapshot.Load()（两个 getter 各自 load 一次），
+// 不是一次。中间落一次 Reload() 会拼出一个跨代组合。后果有界：影响的只是
+// 一次写侧校验判定，读侧不受影响，与既有的 thread.auto_archive_days 守卫同形
+// 态。要真正收口需要给 SystemSettings 加一个「一次快照读 N 个键」的原语，
+// 那是共享配置机件的改动，留作独立任务。
 func (s *SystemSettings) FileStickerSizeOrdering() FileStickerSizeOrdering {
 	return FileStickerSizeOrdering{
 		FileMaxSizeKB:    s.FileMaxSizeKB(),
-		StickerMaxSizeKB: s.StickerUploadMaxSizeKB(),
+		StickerMaxSizeKB: s.stickerUploadMaxSizeKBOwnBound(),
 	}
 }
 
 // ApplyFileStickerSizeOverlay 把一批待写入的值叠加到当前组合上，得到「若本次
 // 写入提交后」的 prospective 组合。key 形如 "file.max_size_kb"。
 // 无法解析的值保持原值 —— 类型校验在调用方已经跑过。
+//
+// 叠加后**必须按各自 getter 的上界钳位**，否则守卫比较的两侧不同质：cur 来自
+// 钳位过的 getter，incoming 却是原样值，于是它校验了一对运行时永远不会执行的
+// 组合。天花板是常量 524288 时这只会过度拒绝（fail-closed，clamp 的结果恒高于
+// 贴纸上限）；天花板可配到贴纸上限之下后，它会**漏拒**：
+//
+//	OCTO_FILE_MAX_SIZE_KB_HARD_CAP=512，贴纸取默认 1024
+//	超管写 file.max_size_kb=4096
+//	  改动前 prospective={4096,1024} → 合法 → 200 {"applied":true}
+//	  运行时钳位后 {512,1024} → 贴纸永远传不上去，且没有任何报错
+//
+// 贴纸侧只钳到贴纸自身的硬上限，**不钳全局上限** —— 钳了两侧就恒相等，守卫
+// 永远不触发。
 func ApplyFileStickerSizeOverlay(cur FileStickerSizeOrdering, incoming map[string]string) FileStickerSizeOrdering {
 	out := cur
 	if v, ok := incoming["file.max_size_kb"]; ok {
-		out.FileMaxSizeKB = overlayPositiveInt(v, DefaultFileMaxSizeKB, cur.FileMaxSizeKB)
+		out.FileMaxSizeKB = clampUpper(
+			overlayPositiveInt(v, DefaultFileMaxSizeKB, cur.FileMaxSizeKB),
+			FileMaxSizeKBHardCap())
 	}
 	if v, ok := incoming["sticker.upload_max_size_kb"]; ok {
-		out.StickerMaxSizeKB = overlayPositiveInt(v, defaultStickerUploadMaxSizeKB, cur.StickerMaxSizeKB)
+		out.StickerMaxSizeKB = clampUpper(
+			overlayPositiveInt(v, defaultStickerUploadMaxSizeKB, cur.StickerMaxSizeKB),
+			stickerUploadMaxSizeKBHardCap)
 	}
 	return out
+}
+
+// clampUpper 是 SystemSettings.clampIntUpper 的无接收者、无告警版本，供
+// overlay 这类纯函数复用同一道上界。overlayPositiveInt 已保证入参 > 0，
+// 所以这里不需要 ≤0 分支。
+func clampUpper(v, hardCap int) int {
+	return min(v, hardCap)
 }
 
 // overlayPositiveInt 解析 overlay 值：空串 = 清除该 key，回到 code default

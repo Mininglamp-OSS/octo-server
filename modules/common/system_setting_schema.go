@@ -317,7 +317,7 @@ var systemSettingSchema = []settingDef{
 	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
 	// 越出资源上限。全部 Positive:true 走"必须正整数"admin 写侧校验，同时放开
 	// settingTypeInt 默认的 [0,3650] 上界（本组键上限单独校验，见读侧 clamp）。
-	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024", Positive: true,
+	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024。上传校验里全局大小门在贴纸门之前，因此实际生效值为 min(本值, file.max_size_kb 的生效值)——全局上限更低时 effective_value 会直接显示收敛后的值", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxSizeKB()) }},
 	{Category: "sticker", Key: "upload_max_dimension", Type: settingTypeInt, Description: "自定义贴纸解码后单边像素上限，服务端硬上限 1024；默认 512", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxDimension()) }},

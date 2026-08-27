@@ -318,3 +318,112 @@ func TestManagerWriteClampedByDefaultHardCap(t *testing.T) {
 	assert.Equal(t, int64(common.FileMaxSizeKBHardCap())*1024, MaxUploadSize(),
 		"未抬天花板时应被钳到 512MB，而不是原样服务")
 }
+
+// ---------------------------------------------------------------------------
+// 天花板低于贴纸上限时的三面一致性（round-4 review P1）
+//
+// 天花板可配之后，「全局上限 < 贴纸上限」这个 D6 明确命名的致命组合，不再
+// 只能由管理台写入达成：空表 + 低天花板开机即违规。而三个面里只有闸门看得见
+// 天花板 —— appconfig 照旧广播未收敛的贴纸上限，管理台 effective_value 也是。
+// 客户端拿着 1024 做预校验，上传到服务端被前置的全局门以「文件过大」拒掉。
+//
+// 下面两条从真实装配路径验证：读侧收敛让三个面重新一致，写侧守卫仍然拦得住
+// 一次无法兑现的写入。
+// ---------------------------------------------------------------------------
+
+// writeSettingRaw 提交任意 category/key 组合，返回原始响应，供断言拒绝路径。
+func writeSettingRaw(t *testing.T, route *wkhttp.WKHttp, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/v1/manager/common/system_setting",
+		strings.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", "application/json")
+	route.ServeHTTP(w, req)
+	return w
+}
+
+// appconfigLimits 取一次 appconfig，返回文件与贴纸两个上限。
+func appconfigLimits(t *testing.T, route *wkhttp.WKHttp) (fileKB, stickerKB int) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/v1/common/appconfig", nil)
+	route.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body struct {
+		FileUploadLimits *struct {
+			MaxSizeKB int `json:"max_size_kb"`
+		} `json:"file_upload_limits"`
+		StickerUploadLimits *struct {
+			MaxSizeKB int `json:"max_size_kb"`
+		} `json:"sticker_upload_limits"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.NotNil(t, body.FileUploadLimits)
+	require.NotNil(t, body.StickerUploadLimits)
+	return body.FileUploadLimits.MaxSizeKB, body.StickerUploadLimits.MaxSizeKB
+}
+
+// 一次管理台写入都没有：低天花板下 appconfig 广播的贴纸上限必须与闸门一致。
+func TestLoweredCeilingKeepsStickerLimitCoherent(t *testing.T) {
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "512")
+	route, _ := newPolicyIntegrationServer(t)
+
+	require.Equal(t, int64(512)*1024, MaxUploadSize(),
+		"前置条件：闸门被天花板钳到 512KB")
+
+	fileKB, stickerKB := appconfigLimits(t, route)
+	assert.Equal(t, 512, fileKB)
+	assert.Equal(t, 512, stickerKB,
+		"贴纸上限的下发值必须收敛到全局上限：客户端按 1024 预校验会白传一次，"+
+			"服务端在贴纸门之前就用「文件过大」拒了")
+	assert.LessOrEqual(t, stickerKB, fileKB, "三面一致：下发的贴纸上限 ≤ 全局上限")
+}
+
+// 贴纸门自己拿到的上限同样必须收敛 —— stickerLimits() 走的是同一个 getter。
+func TestLoweredCeilingConvergesStickerGateLimit(t *testing.T) {
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "512")
+	_, settings := newPolicyIntegrationServer(t)
+
+	assert.Equal(t, 512, settings.StickerUploadMaxSizeKB(),
+		"贴纸门与全局门必须落在同一个数上，否则贴纸门永远是死代码")
+}
+
+// 写侧：钳位后落到贴纸上限之下的写入必须被拒。
+// 改动前 prospective 拿的是**原样** 4096，守卫看到 {4096, 1024} 判定合法，
+// 超管拿到 200 {"applied":true}，而运行时钳位后是 {512, 1024}。
+func TestManagerWriteRejectedWhenClampedFileCapFallsBelowSticker(t *testing.T) {
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "512")
+	route, _ := newPolicyIntegrationServer(t)
+
+	w := writeSettingRaw(t, route,
+		`{"items":[{"category":"file","key":"max_size_kb","value":"4096"}]}`)
+
+	body := w.Body.String()
+	require.NotEqual(t, http.StatusOK, w.Code,
+		"钳位后 512 < 贴纸 1024，这次写入必须被拒，实际：%s", body)
+	assert.Contains(t, body, "全局单文件上传上限不能小于自定义贴纸的上传上限",
+		"必须给出 D6 的组合冲突文案：%s", body)
+}
+
+// 同一批里把两个键一起提交则应放行 —— D6 的文案「请同时提交这两项」必须真的成立，
+// 否则低天花板的部署将永远无法写入 file.max_size_kb。
+func TestManagerBatchWriteWithLoweredStickerIsAccepted(t *testing.T) {
+	t.Setenv("OCTO_FILE_MAX_SIZE_KB_HARD_CAP", "512")
+	route, _ := newPolicyIntegrationServer(t)
+
+	w := writeSettingRaw(t, route, `{"items":[`+
+		`{"category":"file","key":"max_size_kb","value":"4096"},`+
+		`{"category":"sticker","key":"upload_max_size_kb","value":"256"}]}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	t.Cleanup(func() {
+		writeSettingRaw(t, route,
+			`{"items":[{"category":"sticker","key":"upload_max_size_kb","value":""}]}`)
+	})
+
+	fileKB, stickerKB := appconfigLimits(t, route)
+	assert.Equal(t, 512, fileKB, "4096 仍被天花板钳到 512")
+	assert.Equal(t, 256, stickerKB, "贴纸值低于全局上限，原样生效")
+}

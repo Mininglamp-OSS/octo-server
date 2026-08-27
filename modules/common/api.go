@@ -474,8 +474,13 @@ func buildMessageReactionCapability(read, write bool) messageReactionCapabilityR
 
 // buildStickerUploadLimitsResp 从 SystemSettings 派生一份 stickerUploadLimitsResp
 // 快照。两个 handler 分支(version-shortcut / full-refresh)都用它,避免字段
-// 组装漂移。SystemSettings.StickerUpload* getter 各自内部已做 hard-cap clamp,
-// 拿到的都是安全值。
+// 组装漂移。
+//
+// 「安全值」的定义包含**全局单文件上限**:上传校验里全局大小门在贴纸门之前,
+// 所以 StickerUploadMaxSizeKB() 内部除了贴纸自身的硬上限,还会收敛到
+// FileMaxSizeKB()。少了那一道,部署把 OCTO_FILE_MAX_SIZE_KB_HARD_CAP 配到贴纸
+// 上限之下时,这里会向客户端广播一个服务端并不接受的值 —— 客户端按它做完本地
+// 预校验,上传后被前置的全局门以「文件过大」拒掉。
 func buildStickerUploadLimitsResp(s *SystemSettings) stickerUploadLimitsResp {
 	return stickerUploadLimitsResp{
 		MaxSizeKB:      s.StickerUploadMaxSizeKB(),
