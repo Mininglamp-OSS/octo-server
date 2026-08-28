@@ -1472,11 +1472,21 @@ func TestRemoveMembersLockedRollsBackWholeBatchOnError(t *testing.T) {
 // 重叠的移除，断言 0 死锁、0 意外副作用。全部成员 role=1、reject=1，于是不翻转任何
 // 行、可无需重播种反复施压，纯粹压加锁路径。
 //
-// 真正把「加锁顺序确定」钉死的是 TestRemoveMembersLockedForcesUniqueIndexPlan：
-// 它断言语句走 (space_id, uid) 而不是 (space_id, status)。为什么需要那条而不能只靠
-// 本测试：批次间即便都走 (space_id, status) 也是同序、不会互相成环，所以本测试对
-// 「优化器选错索引」这个真正的隐患**不敏感**——真正的跨路径死锁是批次 vs 群主转让
-// （不同索引→不同序），计划断言才守得住（PR #804 round-7 review）。
+// 真正把「加锁顺序确定」钉死的是另外两条，本测试都替代不了：
+//
+//   - TestBatchRemovalLocksInBranchOrder —— 加锁顺序由 UNION ALL 的**分支顺序**决定，
+//     而分支顺序由 sortForLockOrder 给出。它在两种 collation 下各跑一次，分支序都刻意
+//     与该 collation 的索引序相反，所以能把「按分支序」和「按索引序」区分开。
+//   - TestBatchRemovalUsesUniqueIndexWithoutForcing —— 单行等值必然走唯一键
+//     (space_id, uid)，因此不需要 FORCE INDEX，也就不再依赖索引名。
+//
+// 为什么本测试顶不上：批次间即便走同一个计划也是同序、不会互相成环，所以它对
+// 「两侧排序口径不一致」这个真正的隐患**不敏感**。
+//
+// ⚠️ 这段注释此前写的是「真正钉死的是 TestRemoveMembersLockedForcesUniqueIndexPlan，
+// 计划断言才守得住」。那条测试已在 round 11 随 FORCE INDEX 一并删除，而且那个说法在
+// 出货的设计里本身就不成立了：锁序来自分支顺序 + sortForLockOrder，与索引计划无关
+// （PR #804 round-13/14 review 两名 reviewer 各自指出）。
 func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
@@ -1567,7 +1577,13 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 // 本测试**刻意调 …Once**（两侧都不包重试）：包一层重试就会把要数的 1213 吞掉，守卫就再
 // 也红不了了——正是本 PR 自己 round-8 犯过的错，见 learnings/pending/
 // mutation-check-the-assertion-not-the-guard.md。
-// 变异验证：删掉 upsertMembersOnce 里的 sort.Strings，本测试立刻变红。
+// 变异验证：把 upsertMembersOnce 里的 sortForLockOrder 换成不排序（或换成与批量移除
+// 侧不同的排序口径），本测试立刻变红。
+//
+// 注意排序口径不是随便挑的：两边必须对**同一行**得出同一个键，而 uid 列大小写不敏感，
+// 所以 sortForLockOrder 折叠大小写而不是裸字节序 —— 裸字节序由
+// TestSortForLockOrderIsSpellingInvariant 单独钉住（本测试覆盖不到那个场景：唯一索引
+// 把大小写变体折叠成同一个键，第二行插不进去，1062）。
 func TestUpsertMembersLocksInSameOrderAsBatchRemoval(t *testing.T) {
 	_, f, err := setup(t)
 	require.NoError(t, err)
