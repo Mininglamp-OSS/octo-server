@@ -89,6 +89,39 @@ func TestManagerSystemSetting_ValidatesMergedMFAAndSMTPConfiguration(t *testing.
 		"failed final-config validation must not enable MFA")
 }
 
+func TestManagerSystemSettingSMTPTestUsesManagerMFASnapshot(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	route, settings := newManagerSystemSettingTest(t)
+	originalConfig := *settings.ctx.GetConfig()
+	t.Cleanup(func() {
+		*settings.ctx.GetConfig() = originalConfig
+		_ = settings.Reload()
+	})
+
+	probe := newManagerMFAProbeSMTP(t)
+	settings.ctx.GetConfig().Support.Email = "yaml-sender@example.com"
+	settings.ctx.GetConfig().Support.EmailSmtp = probe.address()
+	settings.ctx.GetConfig().Support.EmailPwd = "yaml-password"
+
+	// Only the sender is present in the database. The legacy SystemSettings
+	// provider would silently combine this row with the YAML endpoint/password
+	// and successfully send; the manager MFA provider must reject the same
+	// partial snapshot before any SMTP command is issued.
+	require.NoError(t, settings.db.upsert(
+		"support", "email", "db-sender@example.com", settingTypeString, ""))
+	require.NoError(t, settings.Load())
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/manager/common/system_setting/test_email",
+		bytes.NewBufferString(`{"to":"recipient@example.com"}`))
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(recorder, req)
+
+	assert.NotEqual(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.False(t, probe.hasCommandPrefix("MAIL FROM"),
+		"an incomplete manager MFA snapshot must fail before SMTP delivery")
+}
+
 func TestManagerSystemSetting_UnchangedSMTPDoesNotRunPreflight(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()

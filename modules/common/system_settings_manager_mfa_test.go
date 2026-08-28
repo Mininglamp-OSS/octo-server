@@ -64,11 +64,18 @@ func TestEnsureManagerEmailMFASettingsDoesNotPersistPartialSMTPWhenPasswordEncry
 
 	rows, err := settings.db.listAll()
 	require.NoError(t, err)
+	var mfaRow *systemSettingModel
 	for _, row := range rows {
+		if row.Category == "login" && row.KeyName == "manager_email_mfa_on" {
+			mfaRow = row
+		}
 		if row.Category == "support" {
 			t.Fatalf("SMTP bootstrap must remain atomic after password encryption failure: found %s.%s", row.Category, row.KeyName)
 		}
 	}
+	require.NotNil(t, mfaRow, "the default-off MFA policy must be persisted even when SMTP encryption fails")
+	assert.Equal(t, "0", mfaRow.Value)
+	assert.Equal(t, settingTypeBool, mfaRow.ValueType)
 }
 
 func TestEnsureManagerEmailMFASettingsDoesNotOverwriteExplicitSMTPRows(t *testing.T) {

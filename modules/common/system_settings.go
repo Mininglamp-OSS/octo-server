@@ -149,15 +149,22 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 		stored[schemaKey(row.Category, row.KeyName)] = struct{}{}
 	}
 
-	seeds := make([]managerEmailMFASeed, 0, 4)
+	policySeeds := make([]managerEmailMFASeed, 0, 1)
 	if _, ok := stored[schemaKey("login", "manager_email_mfa_on")]; !ok {
-		seeds = append(seeds, managerEmailMFASeed{
+		policySeeds = append(policySeeds, managerEmailMFASeed{
 			category:    "login",
 			key:         "manager_email_mfa_on",
 			value:       "0",
 			valueType:   settingTypeBool,
 			description: "是否开启管理控制台邮箱二次验证（仅保护管理控制台登录端点，默认关闭）",
 		})
+	}
+	// Persist the default-off policy independently before touching the SMTP
+	// bootstrap. This keeps the policy seed durable even when encrypting the
+	// default SMTP password fails, while insert-if-absent preserves a live
+	// operator choice made concurrently with startup.
+	if err := s.persistManagerEmailMFASeeds(policySeeds); err != nil {
+		return err
 	}
 
 	// Treat the SMTP rows as one bootstrap set. A partially populated DB set is
@@ -173,6 +180,7 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 	}
 	cfg := s.ctx.GetConfig()
 	defaultsComplete := cfg.Support.Email != "" && cfg.Support.EmailSmtp != "" && cfg.Support.EmailPwd != ""
+	smtpSeeds := make([]managerEmailMFASeed, 0, 3)
 	if smtpRowsMissing && defaultsComplete {
 		ciphertext, err := encryptKey(cfg.Support.EmailPwd)
 		if err != nil {
@@ -181,13 +189,13 @@ func (s *SystemSettings) EnsureManagerEmailMFASettings() error {
 		// Persist the complete SMTP bootstrap set only after the password has
 		// been encrypted successfully. An encryption failure must not leave a
 		// partial set that prevents a later startup from retrying the bootstrap.
-		seeds = append(seeds,
+		smtpSeeds = append(smtpSeeds,
 			managerEmailMFASeed{category: "support", key: "email", value: cfg.Support.Email, valueType: settingTypeString, description: "技术支持邮箱（发件人）"},
 			managerEmailMFASeed{category: "support", key: "email_smtp", value: cfg.Support.EmailSmtp, valueType: settingTypeString, description: "SMTP 服务器 host:port"},
 			managerEmailMFASeed{category: "support", key: "email_pwd", value: ciphertext, valueType: settingTypeEncrypted, description: "SMTP 密码（加密存储）"},
 		)
 	}
-	return s.persistManagerEmailMFASeeds(seeds)
+	return s.persistManagerEmailMFASeeds(smtpSeeds)
 }
 
 func (s *SystemSettings) persistManagerEmailMFASeeds(seeds []managerEmailMFASeed) error {

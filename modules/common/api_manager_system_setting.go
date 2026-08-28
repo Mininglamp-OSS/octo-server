@@ -579,9 +579,10 @@ func (m *Manager) finishSettingUpdate(c *wkhttp.Context, audits []settingAuditEn
 
 // testSystemSettingEmail handles POST /v1/manager/common/system_setting/test_email.
 //
-// Sends a no-op test message to the requested address using the currently
-// effective SMTP config (DB values, falling back to yaml). Lets admins
-// validate SMTP credentials without registering a real user.
+// Sends a no-op test message to the requested address using the same
+// database-backed SMTP snapshot as the manager-console MFA flow. This keeps
+// the admin diagnostic from reporting YAML-fallback health for a configuration
+// that MFA itself cannot use.
 func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		c.ResponseError(err)
@@ -600,15 +601,15 @@ func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 		return
 	}
 
-	emailSvc := commonbase.NewEmailService(m.ctx, m.systemSettings)
+	managerSMTP := m.systemSettings.ManagerEmailMFASMTPSettings()
+	emailSvc := commonbase.NewEmailService(m.ctx, managerSMTP)
 	// Pre-send log:遇到「投出去但收件人没收到」时,这条记录至少证明 endpoint
 	// 走到了发送阶段,排查时可以直接对比 SMTP 服务器 sent log;同时把当前
-	// effective 的发件人 / 服务器记下来,方便确认 DB override 与 yaml fallback
-	// 的最终生效值,避免再去 GET /system_setting 二次核对。
+	// MFA 实际使用的发件人 / 服务器记下来,避免自测结果与 MFA 发码路径不一致。
 	m.Info("SMTP 测试邮件已尝试投递",
 		zap.String("to", req.To),
-		zap.String("from", m.systemSettings.SupportEmail()),
-		zap.String("smtp", m.systemSettings.SupportEmailSmtp()))
+		zap.String("from", managerSMTP.SupportEmail()),
+		zap.String("smtp", managerSMTP.SupportEmailSmtp()))
 
 	if err := emailSvc.SendTransactionalHTML(
 		c.Request.Context(),
@@ -622,8 +623,8 @@ func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 		// 调用方是 SuperAdmin,降低 HAR 抓包外流时的信息量。
 		m.Error("SMTP 测试邮件投递失败",
 			zap.String("to", req.To),
-			zap.String("from", m.systemSettings.SupportEmail()),
-			zap.String("smtp", m.systemSettings.SupportEmailSmtp()),
+			zap.String("from", managerSMTP.SupportEmail()),
+			zap.String("smtp", managerSMTP.SupportEmailSmtp()),
 			zap.Error(err))
 		c.ResponseError(errors.New("发送失败，请查看服务端日志"))
 		return

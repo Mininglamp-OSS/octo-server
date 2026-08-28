@@ -15,6 +15,9 @@
   SMTP relay。
 - 管理 MFA/SMTP 初始化或系统配置加载失败现在输出 `ERROR` 级别日志，
   但不会因该配置基础设施错误直接 panic API 服务。
+- 超管 SMTP 自测现在使用与管理控制台 MFA 发码相同的数据库 SMTP 快照，
+  不会把 MFA 无法使用的 YAML fallback 配置误报为健康；普通用户邮件流程
+  仍保留原有的 YAML fallback 行为。
 - 升级前，如果旧版本数据库中的管理控制台 MFA 已开启，必须确认数据库中
   的 `support.email`、`support.email_smtp` 以及必填的 `support.email_pwd`
   能组成有效 SMTP 配置。部分数据库配置不会再从 YAML 静默补齐；启动检测到
