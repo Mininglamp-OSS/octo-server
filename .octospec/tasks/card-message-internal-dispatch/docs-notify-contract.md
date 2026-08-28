@@ -44,10 +44,14 @@
 3. **禁止客户端手搓 type-17 map**:Decision 14 仍生效 —— `payload` 若被
    `cardmsg.IsCardPayload` 判为卡片(`type=17`)一律 400
    `err.server.notify.card_not_allowed`,无论走 `Card` 还是 `DocsCard`。
-4. **响应契约不变**:仍返回 `NotifyResp{delivered:[], filtered:{uid:reason}}`。
-   reason 词表与 summary 一致(`not_space_member` / `target_denied`
-   / `dispatch_failed` / `busy` / `send_failed`) —— docs-backend 可**照抄**
-   smart-summary 的 dedup / retry / sweep 状态机。
+4. **响应结构不变**:仍返回 `NotifyResp{delivered:[], filtered:{uid:reason}}`。
+   通用 reason 词表与 summary 一致(`not_space_member` / `target_denied`
+   / `dispatch_failed` / `busy` / `send_failed`)。`commented` 另有终态 reason
+   `bot_recipient`:普通 Bot 和系统 Bot 不接收普通评论通知,调用方不得重试;
+   该过滤先于 Space 成员校验,因此非成员 Bot 也返回 `bot_recipient`,而不是
+   `not_space_member`;Bot 身份查询失败时整次请求失败且零投递。过滤不依赖
+   `doc_comment_mention` 的 feature gate 或 allowlist:专用事件未启用或文档未
+   命中 allowlist 时,对 Bot 保持静默是有意行为。其他 docs card kind 不受影响。
 5. **模板/文案/链接归属 octo-server**:docs-backend **只发原始字段**;卡片布局、
    按钮文案(查看详情)、FactSet 标签(操作人 / 时间)、attribution
    (「Alice 分享了文档」)、`/d/{doc_id}` deep-link、
@@ -151,7 +155,7 @@ X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
    - per-recipient dedup(避免同一评论触发多次通知);
    - 消费 `NotifyResp{delivered,filtered}` —— 只认 `delivered[]` 判真送达,
      `filtered` 内标记为 `not_space_member` / `busy` / `dispatch_failed` 的
-     可延时重试;
+     可按业务延时重试;`bot_recipient` 是终态过滤,不得重试;
    - **不实现自身文本降级路径** —— server 侧已负责;发失败即上报错误让
      调用方按业务重试(与 smart-summary 侧的 `Sweep` 一致)。
 
