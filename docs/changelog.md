@@ -16,12 +16,18 @@
 - 管理 MFA/SMTP 初始化或系统配置加载失败现在输出 `ERROR` 级别日志，
   但不会因该配置基础设施错误直接 panic API 服务。
 - 超管 SMTP 自测现在使用与管理控制台 MFA 发码相同的数据库 SMTP 快照，
-  不会把 MFA 无法使用的 YAML fallback 配置误报为健康；普通用户邮件流程
-  仍保留原有的 YAML fallback 行为。
+  不会把 MFA 无法使用的 YAML fallback 配置误报为健康。`support.*` 是整个
+  服务共享的 SMTP 配置：普通用户邮件仍使用数据库优先、YAML fallback 的
+  既有 getter 行为；数据库中存在有效值时，普通用户邮件和管理端 MFA 使用
+  同一套数据库配置，数据库值缺失、为空或无法读取时普通邮件才回退到 YAML，
+  而管理端 MFA 不使用该 fallback。
 - 升级前，如果旧版本数据库中的管理控制台 MFA 已开启，必须确认数据库中
   的 `support.email`、`support.email_smtp` 以及必填的 `support.email_pwd`
   能组成有效 SMTP 配置。部分数据库配置不会再从 YAML 静默补齐；启动检测到
   该非法状态时输出 `ERROR`，管理端 MFA 保持 fail-closed，需由运维修复配置。
+  必要时可先执行
+  `UPDATE system_setting SET value = '0' WHERE category = 'login' AND key_name = 'manager_email_mfa_on';`
+  临时关闭 MFA，修复完整 SMTP 配置并通过真实预检后再重新开启。
 
 ## [v1.1.2] - 2026-03-05
 

@@ -109,27 +109,46 @@ not cover those alternate credential paths.
   and `support.email_pwd` are read from a database-only snapshot. On a fresh
   database, YAML values are copied once when all three rows are missing and
   all three defaults are non-empty; later YAML edits do not override the
-  manager-MFA snapshot. The ordinary
-  `SupportEmail*()` getters retain their legacy behavior: they use a non-empty
-  database value and fall back to YAML when the row/value is absent or empty,
-  including when an encrypted value cannot be decrypted. The manager-facing
-  GET and SMTP self-test do not use that YAML fallback. This distinction does
-  not enroll ordinary users in MFA or change their authentication flow.
+  database snapshot. These `support.*` keys are the server-wide SMTP
+  configuration, not a manager-only namespace: manager MFA, ordinary-user
+  email login/recovery, registration mail, and invitation mail intentionally
+  use the same effective SMTP configuration. The ordinary
+  `SupportEmail*()` getters retain their fallback implementation for missing,
+  empty, or unreadable database values, but after the bootstrap rows have been
+  seeded the database values take precedence for all mail flows. For ordinary
+  mail, YAML remains a fallback when the corresponding database value is
+  absent, empty, or unreadable; changing YAML does not override an existing
+  valid database value. Manager MFA never uses that fallback. Subsequent SMTP
+  rotation of the effective shared configuration should be performed through
+  the system-setting configuration path. This shared configuration does not
+  enroll ordinary users in MFA or change their authentication flow.
 - The SuperAdmin SMTP test endpoint uses the same database-backed SMTP snapshot
   as the manager-console MFA send path. It must not report YAML-fallback health
-  for a partial database snapshot that MFA cannot use. Ordinary user mail
-  continues to use the existing `SupportEmail*()` fallback behavior.
+  for a partial database snapshot that MFA cannot use. Its result describes
+  the server-wide SMTP configuration shared by manager MFA and ordinary mail
+  flows.
 - Existing deployments are an upgrade prerequisite: before upgrading, if
-  management MFA is already enabled in the database, the database-backed
-  `support.email`, `support.email_smtp`, and required `support.email_pwd` values
-  must form a valid SMTP configuration. A partial database set is not silently
-  completed from YAML, because existing database rows—including explicit empty
-  values—remain authoritative. After loading such an invalid state, startup
-  emits an `ERROR` identifying the incompatible MFA/SMTP configuration and
-  the normal manager-MFA send path cannot obtain a new code until operations
-  repair the database values. Verification still requires a previously sent,
-  valid, unconsumed code and the active challenge. This startup check validates
-  presence and format only; it does not send probe mail.
+  management MFA is already enabled in the database, operations must verify
+  that the database-backed `support.email`, `support.email_smtp`, and required
+  `support.email_pwd` values are complete, decryptable, and usable as one
+  valid SMTP configuration. A partial database set is not silently completed
+  from YAML, because existing database rows—including explicit empty values—
+  remain authoritative. A legacy deployment that violates this prerequisite
+  is an unsupported upgrade state: startup emits an `ERROR` identifying the
+  incompatible MFA/SMTP configuration, and the normal manager-MFA send path
+  remains fail-closed until operations repair it. The documented break-glass
+  recovery is to temporarily disable MFA directly in the database, for
+  example:
+
+  `UPDATE system_setting SET value = '0' WHERE category = 'login' AND key_name = 'manager_email_mfa_on';`
+
+  After reloading or restarting, operations can repair the complete shared
+  SMTP configuration through the system-setting path, allow its real
+  preflight to succeed, and enable MFA again. This is an upgrade and
+  operations prerequisite, not an automatic migration of partial legacy
+  rows. Verification still requires a previously sent, valid, unconsumed code
+  and the active challenge. This startup check validates presence and format
+  only; it does not send probe mail.
 - Startup and ordinary `Load`/`Reload` operations do not send a probe email and
   do not perform SMTP network I/O. They only load the database snapshot.
 - The management MFA send path reads SMTP only from the successfully loaded
@@ -183,7 +202,7 @@ not cover those alternate credential paths.
   sub-endpoints use their respective shared per-IP buckets. Management MFA send
   cooldowns use
   `err.server.user.manager_mfa_rate_limited`; verification lockouts use the
-  distinct `err.server.user.manager_mfa_verification_locked` code and expose
+  distinct `err.server.user.manager_mfa_verify_locked` code and expose
   the remaining lock time as `details.retry_after`. Ordinary-user endpoints are
   not routed through the manager MFA buckets; their ordinary user-facing flow
   remains outside this task.
