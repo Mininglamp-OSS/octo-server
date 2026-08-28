@@ -1591,3 +1591,21 @@ change-log convention (§7). Newest first.
   author-chosen mutation only proves the test catches what the author already thought
   of. The same guard was green on the real security regression and red on whitespace.
 
+## 2026-08-26 — file-extension-policy-dynamic-config
+
+- **Shipped** — Upload extension allow/block lists and the single-file size cap
+  are runtime-configurable through `system_setting`; blocking a format no longer
+  needs a configmap edit and a pod restart. Both extension keys are `env ∪ DB`
+  unions ("allow" only adds, "block" only removes) over a non-revocable built-in
+  blocklist, and the effective limits are served from `/v1/common/appconfig`.
+  See [journal](journal/shared/file-extension-policy-dynamic-config.md).
+- **Fixed during review** — Four blocking findings on my own first revisions: the
+  provider was never mounted (feature inert while reporting success), the
+  `bot_api` / `robot` multipart paths had no extension gate at all, the snapshot
+  cache key could collide (emergency block silently serving the stale policy),
+  and the extension CSVs were unbounded on a response served from an
+  unauthenticated endpoint.
+- **Learning** — `learnings/pending/assembly-path-must-be-tested.md`: tests that
+  inject a dependency through a helper cannot show that production wiring exists.
+  A missing registration call passed the entire suite.
+

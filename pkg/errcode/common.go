@@ -41,6 +41,41 @@ var (
 		DefaultMessage: "Thread auto-archive window must not be shorter than the recent-tab thread window.",
 		SafeDetailKeys: []string{"archive_days", "recent_days"},
 	})
+	// ErrFileUploadSizeOrdering is returned by the manager system_setting write
+	// path when the prospective (merged) configuration would put the global
+	// file upload cap BELOW the sticker upload cap.
+	//
+	// The upload handler checks the global cap first and the sticker cap second
+	// (modules/file/api.go), so a global cap under the sticker cap makes sticker
+	// uploads impossible while both keys look individually valid — the operator
+	// raises the sticker cap, sees no effect, and gets no error anywhere.
+	// Rejecting the write is the only place that failure mode is observable.
+	//
+	// Both caps ride along as details so the admin UI can render the conflict
+	// without a second round-trip; neither is sensitive.
+	ErrFileUploadSizeOrdering = register(codes.Code{
+		ID:             "err.server.common.file_upload_size_ordering",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The global file upload size cap must not be smaller than the sticker upload cap.",
+		SafeDetailKeys: []string{"file_max_size_kb", "sticker_max_size_kb"},
+	})
+	// ErrFileExtensionNotAllowlistable is returned by the manager system_setting
+	// write path when file.extra_allowed_extensions contains an extension that
+	// sits on the built-in blocklist (executables / scripts).
+	//
+	// That blocklist is deliberately not revocable through configuration, so
+	// such a write would be silently inert: the operator sees the value stored,
+	// and uploads keep getting rejected with no explanation anywhere. Rejecting
+	// at write time is the only place the operator learns why.
+	//
+	// The offending extension rides along as a detail so the admin UI can point
+	// at it; it is operator-supplied and not sensitive.
+	ErrFileExtensionNotAllowlistable = register(codes.Code{
+		ID:             "err.server.common.file_extension_not_allowlistable",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This file extension is on the built-in blocklist and cannot be allowed.",
+		SafeDetailKeys: []string{"extension"},
+	})
 	ErrManagerMFASmtpInvalid = register(codes.Code{
 		ID:             "err.server.common.manager_mfa_smtp_invalid",
 		HTTPStatus:     http.StatusBadRequest,

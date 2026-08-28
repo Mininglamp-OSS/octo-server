@@ -9,12 +9,15 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"go.uber.org/zap"
 )
 
 type cardActionMutator interface {
@@ -25,6 +28,12 @@ type DocsActionFinalizer struct {
 	ctx     *config.Context
 	mutator cardActionMutator
 	updater cardtmpl.CardUpdater
+	// users/spaces resolve the AUTHORITATIVE decider display internally from the
+	// ids Docs returns (result.DeciderUID / DeciderSpaceID). They are optional:
+	// when nil (or when a callback carries no decider ids) the finalizer keeps the
+	// bounded compatibility fallback to result.Display.
+	users  deciderUserResolver
+	spaces deciderSpaceResolver
 }
 
 type actionFinalizeError struct {
@@ -56,7 +65,16 @@ func NewDocsActionFinalizerFromContext(ctx *config.Context) (*DocsActionFinalize
 	if err != nil {
 		return nil, err
 	}
-	return NewDocsActionFinalizerWithUpdater(ctx, updater, mutator)
+	finalizer, err := NewDocsActionFinalizerWithUpdater(ctx, updater, mutator)
+	if err != nil {
+		return nil, err
+	}
+	// Production wiring for authoritative decider display resolution: names come
+	// from the user service, operator Space names from an active-membership check
+	// against the server DB. Both stay best-effort inside Finalize.
+	finalizer.users = user.NewService(ctx)
+	finalizer.spaces = spaceMemberNameResolver{session: ctx.DB()}
+	return finalizer, nil
 }
 
 func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondispatch.Event, result cardactiondispatch.DecisionResult) error {
@@ -98,6 +116,16 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if v, ok := event.Inputs[cardtmpl.DocsDenyReasonInputID].(string); ok {
 		denyReason = strings.TrimSpace(v)
 	}
+	// Authoritative decider resolution (decision-actor-server-resolution). When
+	// Docs returns the decider's ids, octo-server — the identity authority —
+	// resolves the display name and operator Space name internally and those win
+	// over any caller-supplied display copy (anti-forgery: a callback could name
+	// any operator/Space it liked). Only approved/denied cards carry a decision
+	// block, so only they need it. Every lookup failure degrades the optional
+	// display field to empty (the render then shows the generic placeholder); it
+	// must never fail this already-committed decision. Legacy callbacks with no
+	// decider ids keep the bounded compatibility fallback to result.Display.
+	result = f.resolveAuthoritativeDeciderDisplay(ctx, result)
 	// Every state renders through the Registry when an updater is present, not
 	// just the decided ones. The pending card is a Registry render and so
 	// carries the server-authored catalog markers; the fallback below rebuilds
@@ -134,6 +162,46 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	// The original request card is the sole terminal surface. Do not send a
 	// second "access granted/denied" card to the requester.
 	return nil
+}
+
+// resolveAuthoritativeDeciderDisplay overwrites the operator display fields with
+// octo-server's internal resolution of the authoritative decider ids for
+// approved/denied results. When result.DeciderUID is set, caller-supplied
+// display.operator_name/operator_space_name are discarded (they must never win
+// over the authoritative ids) and decided_at is taken from result.DecidedAt.
+// When no decider id is present, the result is returned unchanged so legacy
+// callbacks keep their bounded compatibility fallback. The returned copy owns a
+// fresh Display map, so the shared result value is never mutated.
+func (f *DocsActionFinalizer) resolveAuthoritativeDeciderDisplay(_ context.Context, result cardactiondispatch.DecisionResult) cardactiondispatch.DecisionResult {
+	if strings.TrimSpace(result.DeciderUID) == "" {
+		return result
+	}
+	if result.State != cardactiondispatch.StateApproved && result.State != cardactiondispatch.StateDenied {
+		return result
+	}
+	resolved := resolveDeciderDisplay(f.users, f.spaces, result.DeciderUID, result.DeciderSpaceID, func(msg string, err error) {
+		log.NewTLog("DocsActionFinalizer").Warn("docs action "+msg+" failed (display degraded)",
+			zap.Error(err), zap.String("decider_uid", result.DeciderUID), zap.String("decider_space_id", result.DeciderSpaceID))
+	})
+	display := make(map[string]string, len(result.Display)+3)
+	for k, v := range result.Display {
+		display[k] = v
+	}
+	// Authoritative ids present → the resolved values win, even when a lookup
+	// returned empty (degrade to placeholder rather than trust caller copy).
+	// Clear ALL three legacy display fields first: if the authoritative time is
+	// absent, retaining display.decided_at would pair a trusted decider with an
+	// untrusted / potentially late-clicker timestamp.
+	delete(display, "operator_name")
+	delete(display, "operator_space_name")
+	delete(display, "decided_at")
+	display["operator_name"] = resolved.OperatorName
+	display["operator_space_name"] = resolved.OperatorSpaceName
+	if decidedAt := formatDecisionTime(result.DecidedAt); decidedAt != "" {
+		display["decided_at"] = decidedAt
+	}
+	result.Display = display
+	return result
 }
 
 // 0.3.0 result view schema 的各字段 rune 上限(见
@@ -174,14 +242,15 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		return err
 	}
 	fields, state, err := buildDocsAccessResultFields(lang, version, docsResultRenderInput{
-		Data:              event.Data,
-		Title:             title,
-		OperatorName:      result.Display["operator_name"],
-		OperatorSpaceName: result.Display["operator_space_name"],
-		DecidedAtDisplay:  result.Display["decided_at"],
-		DenyReason:        denyReason,
-		Denied:            result.State == cardactiondispatch.StateDenied,
-		Cancelled:         result.State == cardactiondispatch.StateCancelled,
+		Data:                  event.Data,
+		Title:                 title,
+		OperatorName:          result.Display["operator_name"],
+		OperatorSpaceName:     result.Display["operator_space_name"],
+		DecidedAtDisplay:      result.Display["decided_at"],
+		AuthoritativeDecision: strings.TrimSpace(result.DeciderUID) != "",
+		DenyReason:            denyReason,
+		Denied:                result.State == cardactiondispatch.StateDenied,
+		Cancelled:             result.State == cardactiondispatch.StateCancelled,
 		// Anything that is not a decision and not an explicit cancellation —
 		// `pending` today, whatever a later contract adds — renders as
 		// unavailable, which is what the pre-Registry fallback already showed
@@ -212,15 +281,16 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 // from the stored server-authored Action.Submit payload, never caller display
 // JSON, so request/document identity cannot be rewritten during a mutation.
 type docsResultRenderInput struct {
-	Data              map[string]interface{}
-	Title             string
-	OperatorName      string
-	OperatorSpaceName string
-	DecidedAtDisplay  string
-	DenyReason        string
-	Denied            bool
-	Cancelled         bool
-	Unavailable       bool
+	Data                  map[string]interface{}
+	Title                 string
+	OperatorName          string
+	OperatorSpaceName     string
+	DecidedAtDisplay      string
+	AuthoritativeDecision bool
+	DenyReason            string
+	Denied                bool
+	Cancelled             bool
+	Unavailable           bool
 }
 
 func buildDocsAccessResultFields(lang, version string, input docsResultRenderInput) (json.RawMessage, cardtmpl.State, error) {
@@ -303,6 +373,13 @@ func buildDocsAccessResultFields(lang, version string, input docsResultRenderInp
 		"requestReason": "request_reason", "requestedAtDisplay": "requested_at_display",
 		"messageTimeDisplay": "message_time_display",
 	} {
+		// V3 historically falls back from an empty decision time to the request
+		// message time. Keep that for legacy callbacks, but never fabricate a
+		// decision timestamp after Docs has supplied an authoritative decider.
+		if destination == "messageTimeDisplay" && input.AuthoritativeDecision &&
+			strings.TrimSpace(input.DecidedAtDisplay) == "" {
+			continue
+		}
 		if value := strings.TrimSpace(stringEventData(input.Data, source)); value != "" {
 			fields[destination] = truncRunes(value, dataCaps[destination])
 		}

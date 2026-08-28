@@ -210,6 +210,9 @@ type mockService struct {
 	lastFileSize       int64
 	presignedGetErr    error
 	lastGetDisposition string
+	// uploadCalls 记录 UploadFile 被调用的次数：被拒的上传必须一次都不调用 ——
+	// 要防的是字节落进对象存储，不是状态码。
+	uploadCalls int
 	// downloadURL/downloadURLErr let a test control what DownloadURL returns
 	// (the value uploadFile reports as `path`). Zero values preserve the legacy
 	// ("", nil) behavior every existing test relies on.
@@ -226,6 +229,8 @@ func (m *mockService) DownloadImage(url string, ctx context.Context) (io.ReadClo
 }
 
 func (m *mockService) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+	m.uploadCalls++
+	m.lastObjectPath = filePath
 	return nil, nil
 }
 
@@ -898,10 +903,15 @@ func TestGetUploadCredentials_FileSizeValidation(t *testing.T) {
 			wantMsgContain: "正整数",
 		},
 		{
-			name:           "fileSize over MaxFileSize is rejected",
-			queryParams:    fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
-			wantStatus:     http.StatusBadRequest,
-			wantMsgContain: "MB",
+			// 超限响应改走 httperr 本地化信封后，这条直驱测试（gin.CreateTestContext，
+			// 没有 route，因而没有 ErrorRenderer）只能看到兜底 renderer 的
+			// {msg,status}，msg 是未插值的模板、details 也不下发。上限值本身的
+			// 断言因此挪到有 renderer 的集成路径：
+			// policy_integration_test.go:TestPresignedOversizeReportsExactCap
+			// 那里验证渲染后的精确文案与 max_size_kb 详情，覆盖比这里更强。
+			name:        "fileSize over MaxFileSize is rejected",
+			queryParams: fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
+			wantStatus:  http.StatusBadRequest,
 		},
 		{
 			name:           "fileSize exactly MaxFileSize is accepted",
@@ -1688,6 +1698,73 @@ func TestGetUploadCredentials_ContentTypeContract(t *testing.T) {
 				"echoed contentType must be a SigV4 Trimall fixed point")
 			assert.False(t, containsInvalidHeaderByte(echoed),
 				"echoed contentType must be a legal header value, got %q", echoed)
+		})
+	}
+}
+
+// TestUploadFile_AcceptsServerGeneratedPathShapes 钉住 getFilePath 自己签发的
+// ?path= 形态必须可上传。
+//
+// 背景：本 PR 曾一度加过一道「?path= 扩展名必须等于 filename 扩展名」的门，
+// 结果打断了服务端自己发出的上传 URL —— workplace 横幅/应用图标的 path 不带
+// 扩展名（getFilePath 的 TypeWorkplaceBanner / TypeWorkplaceAppIcon 分支），
+// 而 :525 那段「修复客户端上传路径缺少扩展名的问题」的兼容代码也随之变成死
+// 代码。那道门已回退。
+//
+// 这些用例存在的意义是：任何未来想再收紧 ?path= 的改动，必须先让这张表全绿。
+// 收紧本身不是坏事，但要基于对真实流量形态的分析，而不是只覆盖"想得到的两种"。
+func TestUploadFile_AcceptsServerGeneratedPathShapes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name     string
+		fileType string
+		path     string
+		filename string
+		wantKey  string
+	}{
+		{
+			name: "无扩展名的 path 由兼容代码补全", fileType: "chat",
+			path: "/10000/HASH", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "有扩展名文本但缺点号", fileType: "chat",
+			path: "/10000/HASHpng", filename: "x.png", wantKey: "chat/10000/HASH.png",
+		},
+		{
+			name: "workplace 横幅：path 以目录结尾", fileType: "workplacebanner",
+			path: "/workplace/banner/", filename: "x.png", wantKey: "workplacebanner/workplace/banner.png",
+		},
+		{
+			name: "workplace 应用图标：path 以目录结尾", fileType: "workplaceappicon",
+			path: "/workplace/appicon/", filename: "x.png", wantKey: "workplaceappicon/workplace/appicon.png",
+		},
+		{
+			name: "path 与 filename 扩展名一致", fileType: "chat",
+			path: "/10000/x.png", filename: "x.png", wantKey: "chat/10000/x.png",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+			mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/" + tc.wantKey}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+			body, contentType := newMultipartFile(t, tc.filename, pngOfSize(t, 8, 8))
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request, _ = http.NewRequest(http.MethodPost,
+				"/v1/file/upload?type="+tc.fileType+"&path="+url.QueryEscape(tc.path), body)
+			c.Request.Header.Set("Content-Type", contentType)
+			c.Set("uid", "10000")
+
+			f.uploadFile(&wkhttp.Context{Context: c})
+
+			require.Equal(t, http.StatusOK, rec.Code,
+				"服务端自己签发的 path 形态必须可上传; body: %s", rec.Body.String())
+			assert.Equal(t, tc.wantKey, mockSvc.lastObjectPath,
+				"存储 key 必须以校验过的扩展名结尾")
 		})
 	}
 }

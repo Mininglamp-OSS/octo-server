@@ -65,10 +65,16 @@ var (
 
 // Notify 通知模块
 type Notify struct {
-	ctx           *config.Context
-	userService   user.IService
-	appService    app.IService
-	db            *dbr.Session
+	ctx         *config.Context
+	userService user.IService
+	appService  app.IService
+	db          *dbr.Session
+	// deciderUsers / deciderSpaces resolve the authoritative operator display for
+	// /v1/internal/cards/mutate (name from the user service, Space name from an
+	// active-membership check). Both are injectable so tests can supply fakes
+	// without a live DB; New wires them to the real services.
+	deciderUsers  deciderUserResolver
+	deciderSpaces deciderSpaceResolver
 	memberCache   *memberCache
 	botMu         sync.Mutex
 	botOK         atomic.Bool
@@ -103,12 +109,15 @@ func New(ctx *config.Context) *Notify {
 		userService:   user.NewService(ctx),
 		appService:    app.NewService(ctx),
 		db:            ctx.DB(),
+		deciderSpaces: spaceMemberNameResolver{session: ctx.DB()},
 		memberCache:   newMemberCache(),
 		internalToken: token,
 		docsToken:     docsToken,
 		Log:           log.NewTLog("Notify"),
 		actionSenders: make(map[cardactiondispatch.NotifyCapability]carddispatch.Sender),
 	}
+	// The mutate endpoint's decider name lookups reuse the same user service.
+	n.deciderUsers = n.userService
 
 	// Obtain the producer-bound card Senders from the single registry composed at
 	// bootstrap (main.installCardDispatch, before module construction). A missing

@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -64,10 +65,17 @@ func respondBotAPIContentTooLarge(c *wkhttp.Context, field string, maxSize int) 
 	httperr.ResponseErrorL(c, errcode.ErrBotAPIContentTooLarge, nil, details)
 }
 
-// respondBotAPIFileTooLarge surfaces the upload size cap (in MB) for the
-// legacy (wire-400) upload path.
-func respondBotAPIFileTooLarge(c *wkhttp.Context, maxMB int64) {
-	httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTooLarge, nil, i18n.Details{"max_mb": maxMB})
+// respondBotAPIFileTooLarge surfaces the upload size cap for the legacy
+// (wire-400) upload path. Takes the cap in BYTES: file.max_size_kb accepts any
+// KB value, and reporting bytes/1024/1024 truncates (a 1536KB cap reported
+// "1MB", a limit the server does not enforce). max_size_kb is exact; max_mb is
+// kept for clients already reading it.
+func respondBotAPIFileTooLarge(c *wkhttp.Context, maxBytes int64) {
+	maxSizeKB, maxMB := file.SizeLimitDetails(maxBytes)
+	httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTooLarge,
+		i18n.Params{"max_size": file.FormatSizeLimit(maxBytes)},
+		i18n.Details{"max_size_kb": maxSizeKB, "max_mb": maxMB},
+	)
 }
 
 // respondBotAPIPayloadTooLarge surfaces the upload byte cap on the voice proxy,

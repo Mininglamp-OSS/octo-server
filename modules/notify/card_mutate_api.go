@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
@@ -36,6 +38,8 @@ const docsCardMutateSeqKey = "messageExtra:docs-card-mutate"
 // "docs.access_requested" / "docs.access_granted") is the authoritative
 // docs-domain discriminator; only cards in this family may be touched.
 const docsAccessVariantPrefix = "docs.access_"
+
+const cardMutateMaxBodyBytes = 64 << 10
 
 var errDocsSiblingContextInvalid = errors.New("notify: invalid stored docs sibling context")
 
@@ -85,19 +89,36 @@ type CardMutateReq struct {
 	DocID       string `json:"doc_id"`
 	Title       string `json:"title"`
 	DenyReason  string `json:"deny_reason"` // surfaced on the denied terminal card; empty on approve
-	// Operator display fields are optional and are resolved once by the trusted
-	// Docs decision service. IDs are retained as bounded audit context only;
-	// octo-server never uses unbound caller-supplied IDs for display lookup.
+	// Older callers may provide operator display context directly. It remains for
+	// wire compatibility only and is not authoritative when decider_uid is set.
+	//
+	// decider_uid/decider_space_id are the AUTHORITATIVE actor ids (mirroring the
+	// DecisionResult contract). When present, octo-server resolves the operator
+	// name + Space name internally from them and ignores operator_name/
+	// operator_space_name below. operator_uid/operator_space_id are older display
+	// context fields; they are retained for wire compatibility but are not aliases
+	// for, and never substitute for, the authoritative decider identity.
+	DeciderUID        string `json:"decider_uid"`
+	DeciderSpaceID    string `json:"decider_space_id"`
 	OperatorUID       string `json:"operator_uid"`
 	OperatorName      string `json:"operator_name"`
 	OperatorSpaceID   string `json:"operator_space_id"`
 	OperatorSpaceName string `json:"operator_space_name"`
+	DecidedAt         int64  `json:"decided_at"`
 	DecidedAtDisplay  string `json:"decided_at_display"`
 }
 
 // CardMutateResp reports whether the card is now terminal.
 type CardMutateResp struct {
 	Mutated bool `json:"mutated"`
+}
+
+func validateCardMutateReq(req CardMutateReq) error {
+	if req.SpaceID == "" || req.ChannelID == "" || req.MessageID == "" || req.DocID == "" ||
+		(req.Kind != DocsCardKindAccessGranted && req.Kind != DocsCardKindAccessDenied) {
+		return errors.New("notify: invalid card mutate request")
+	}
+	return cardactiondispatch.ValidateAuthoritativeDeciderIDs(req.DeciderUID, req.DeciderSpaceID)
 }
 
 // mutateCard handles POST /v1/internal/cards/mutate. It drives one already-
@@ -112,13 +133,13 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		return
 	}
 
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardMutateMaxBodyBytes)
 	var req CardMutateReq
 	if err := c.BindJSON(&req); err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
 		return
 	}
-	if req.SpaceID == "" || req.ChannelID == "" || req.MessageID == "" || req.DocID == "" ||
-		(req.Kind != DocsCardKindAccessGranted && req.Kind != DocsCardKindAccessDenied) {
+	if validateCardMutateReq(req) != nil {
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
 		return
 	}
@@ -191,6 +212,7 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 		return
 	}
 	req.ChannelType = channelType
+	n.resolveMutateOperatorDisplay(&req)
 	if err = replaceSiblingWithRegistryResult(
 		ctx, updater, req, snap, cardSeq, cardtmpl.BuildEnv{
 			WebLoginURL: n.ctx.GetConfig().External.WebLoginURL,
@@ -254,13 +276,14 @@ func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.Card
 	}
 	denied := req.Kind == DocsCardKindAccessDenied
 	fields, state, err := buildDocsAccessResultFields(env.Lang, version, docsResultRenderInput{
-		Data:              data,
-		Title:             req.Title,
-		OperatorName:      req.OperatorName,
-		OperatorSpaceName: req.OperatorSpaceName,
-		DecidedAtDisplay:  req.DecidedAtDisplay,
-		DenyReason:        req.DenyReason,
-		Denied:            denied,
+		Data:                  data,
+		Title:                 req.Title,
+		OperatorName:          req.OperatorName,
+		OperatorSpaceName:     req.OperatorSpaceName,
+		DecidedAtDisplay:      req.DecidedAtDisplay,
+		AuthoritativeDecision: strings.TrimSpace(req.DeciderUID) != "",
+		DenyReason:            req.DenyReason,
+		Denied:                denied,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", errDocsSiblingContextInvalid, err)
@@ -271,4 +294,34 @@ func replaceSiblingWithRegistryResult(ctx context.Context, updater cardtmpl.Card
 		},
 		SenderUID: NotifyBotUIDValue, MessageID: req.MessageID, CardSeq: cardSeq,
 	}, docsaccessrequest.TemplateID, version, state, fields, env)
+}
+
+// resolveMutateOperatorDisplay implements the authoritative decider display
+// resolution for /v1/internal/cards/mutate (decision-actor-server-resolution).
+// When the caller supplies the decider's ids (decider_uid/decider_space_id), octo-server
+// resolves the operator name + Space name internally (user service +
+// active-membership check) and OVERWRITES req.OperatorName/OperatorSpaceName — a
+// docs token must not be able to stamp an arbitrary display identity onto a
+// committed decision. Every lookup failure degrades to empty (the render then
+// shows the generic placeholder) and never blocks the mutation. A caller that
+// supplies no decider id keeps its display strings (bounded compatibility).
+func (n *Notify) resolveMutateOperatorDisplay(req *CardMutateReq) {
+	deciderUID := strings.TrimSpace(req.DeciderUID)
+	if deciderUID == "" {
+		return
+	}
+	deciderSpaceID := strings.TrimSpace(req.DeciderSpaceID)
+	// The authoritative contract makes callback-authored time display untrusted.
+	// Name fields are overwritten below, so clearing them first would be dead work.
+	req.DecidedAtDisplay = ""
+	resolved := resolveDeciderDisplay(n.deciderUsers, n.deciderSpaces, deciderUID, deciderSpaceID,
+		func(msg string, rerr error) {
+			n.Warn("card mutate "+msg+" failed (display degraded)", zap.Error(rerr),
+				zap.String("decider_uid", deciderUID), zap.String("message_id", req.MessageID))
+		})
+	req.OperatorName = resolved.OperatorName
+	req.OperatorSpaceName = resolved.OperatorSpaceName
+	if req.DecidedAt > 0 {
+		req.DecidedAtDisplay = formatDecisionTime(req.DecidedAt)
+	}
 }

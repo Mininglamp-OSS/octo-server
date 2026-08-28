@@ -1,0 +1,22 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/file-extension-policy-dynamic-config/brief.md
+notes: |
+  .octospec/_global/ is not synced in this checkout, so every injected rule is
+  repo-tier. error-handling / trust-boundary / space-isolation are load_bearing.
+  trust-boundary applies via the touches tag (external-content / trust-boundary),
+  not via its paths glob: the upload extension allowlist is the format gate for
+  attacker-supplied bytes, and its "sibling parity" rule maps onto the 6
+  IsAllowedExtension call sites across file / bot_api / robot plus the 7 size
+  checkpoints -- a defense that holds on one path must hold on all of them.

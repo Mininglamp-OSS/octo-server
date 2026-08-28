@@ -158,13 +158,17 @@ func TestRespondBotAPIHelpers(t *testing.T) {
 			wantDetails:     map[string]any{"field": "content", "max_size": float64(4096)},
 		},
 		{
-			name:            "respondBotAPIFileTooLarge surfaces the MB cap",
-			probe:           func(c *wkhttp.Context) { respondBotAPIFileTooLarge(c, 100) },
+			name: "respondBotAPIFileTooLarge surfaces the exact cap",
+			// 传字节数：签名从 MB 改成 bytes，因为 file.max_size_kb 接受任意 KB 值，
+			// 在调用点整除会报出一个服务端并不执行的上限（1536KB → "1MB"）。
+			// 这里用 1.5MB 这种非整数 MB 的上限，钉住精度不再被截断。
+			probe:           func(c *wkhttp.Context) { respondBotAPIFileTooLarge(c, 1536*1024) },
 			wantCodeID:      "err.server.bot_api.file_too_large",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "文件大小超过限制",
-			wantDetails:     map[string]any{"max_mb": float64(100)},
+			wantContains:    "文件大小超过限制，最大 1.5 MB",
+			// max_size_kb 精确；max_mb 保留整除截断，仅为兼容已在读它的客户端。
+			wantDetails: map[string]any{"max_size_kb": float64(1536), "max_mb": float64(1)},
 		},
 		{
 			name:            "respondBotAPIPayloadTooLarge preserves 413 + byte cap",
