@@ -172,6 +172,9 @@ type BotAPI struct {
 	// returns the error without logging identifiers; the permission observer owns
 	// the single desensitized terminal log.
 	spaceMemberQueryOverride func(uid, spaceID string) (bool, error)
+	// principalStoreOverride makes the exact-Space principal lookup testable
+	// without weakening its production DB-backed authorization query.
+	principalStoreOverride spacePrincipalStore
 	// groupMemberCountOverride lets focused permission tests distinguish an
 	// empty active membership from a query failure without a live MySQL session.
 	groupMemberCountOverride func(groupNo, robotID string) (int, error)
@@ -423,6 +426,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/groups/:group_no/md", ba.getGroupMd)
 		botAPI.PUT("/groups/:group_no/md", ba.updateGroupMd)
 		botAPI.GET("/space/members", ba.botSpaceMembers)
+		botAPI.GET("/space/principals/:uid", ba.botSpacePrincipal)
 		botAPI.POST("/createGroup", ba.botGroupCreate)
 		botAPI.PUT("/groups/:group_no/info", ba.botGroupUpdate)
 		botAPI.POST("/groups/:group_no/members/add", ba.botGroupMemberAdd)

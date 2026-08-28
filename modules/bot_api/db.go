@@ -226,3 +226,102 @@ func (d *botAPIDB) queryAppBotByUID(uid string) (*appBotModel, error) {
 	_, err := d.session.Select("*").From("app_bot").Where("uid=?", uid).Load(&m)
 	return m, err
 }
+
+// lookupEligibleSpacePrincipal performs the complete exact-Space authorization
+// and target classification in one snapshot statement. Counts are intentional:
+// duplicate/conflicting robot identities are treated as ineligible rather than
+// selecting an arbitrary row.
+type spacePrincipalEligibilityRow struct {
+	SpaceActive int `db:"space_active"`
+
+	CallerMember          int `db:"caller_member"`
+	CallerUserBot         int `db:"caller_user_bot"`
+	CallerAppBot          int `db:"caller_app_bot"`
+	CallerCreatorEligible int `db:"caller_creator_eligible"`
+
+	CanonicalUID          string `db:"canonical_uid"`
+	TargetMember          int    `db:"target_member"`
+	TargetHuman           int    `db:"target_human"`
+	TargetRobotIdentity   int    `db:"target_robot_identity"`
+	TargetUserBot         int    `db:"target_user_bot"`
+	TargetAppBot          int    `db:"target_app_bot"`
+	TargetCreatorEligible int    `db:"target_creator_eligible"`
+}
+
+// The user.robot predicates are an additional fail-closed consistency filter;
+// robot remains the authoritative User Bot identity table.
+const spacePrincipalEligibilityQuery = `SELECT
+  (SELECT COUNT(*) FROM space s WHERE s.space_id=? AND s.status=1) AS space_active,
+  (SELECT COUNT(*) FROM space_member sm WHERE sm.space_id=? AND sm.uid=? AND sm.status=1) AS caller_member,
+  (SELECT COUNT(*) FROM robot r JOIN user u ON u.uid=r.robot_id AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 AND u.robot=1 WHERE r.robot_id=? AND r.status=1) AS caller_user_bot,
+  (SELECT COUNT(*) FROM app_bot ab WHERE ab.uid=?) AS caller_app_bot,
+  (SELECT COUNT(*) FROM robot r JOIN user u ON u.uid=r.creator_uid AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 AND u.robot=0 JOIN space_member sm ON sm.uid=r.creator_uid AND sm.space_id=? AND sm.status=1 WHERE r.robot_id=? AND r.status=1) AS caller_creator_eligible,
+  COALESCE((SELECT u.uid FROM user u WHERE u.uid=? LIMIT 1),'') AS canonical_uid,
+  (SELECT COUNT(*) FROM space_member sm WHERE sm.space_id=? AND sm.uid=? AND sm.status=1) AS target_member,
+  (SELECT COUNT(*) FROM user u WHERE u.uid=? AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 AND u.robot=0) AS target_human,
+  (SELECT COUNT(*) FROM robot r WHERE r.robot_id=? AND r.status=1) AS target_robot_identity,
+  (SELECT COUNT(*) FROM robot r JOIN user u ON u.uid=r.robot_id AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 AND u.robot=1 WHERE r.robot_id=? AND r.status=1) AS target_user_bot,
+  (SELECT COUNT(*) FROM app_bot ab WHERE ab.uid=?) AS target_app_bot,
+  (SELECT COUNT(*) FROM robot r JOIN user u ON u.uid=r.creator_uid AND u.status=1 AND COALESCE(u.is_destroy,0)<>2 AND u.robot=0 JOIN space_member sm ON sm.uid=r.creator_uid AND sm.space_id=? AND sm.status=1 WHERE r.robot_id=? AND r.status=1) AS target_creator_eligible`
+
+func (d *botAPIDB) lookupEligibleSpacePrincipal(callerUID, callerKind, spaceID, targetUID string) (*spacePrincipal, error) {
+	var row spacePrincipalEligibilityRow
+	err := d.session.QueryRow(spacePrincipalEligibilityQuery, spacePrincipalEligibilityArgs(callerUID, spaceID, targetUID)...).Scan(
+		&row.SpaceActive,
+		&row.CallerMember,
+		&row.CallerUserBot,
+		&row.CallerAppBot,
+		&row.CallerCreatorEligible,
+		&row.CanonicalUID,
+		&row.TargetMember,
+		&row.TargetHuman,
+		&row.TargetRobotIdentity,
+		&row.TargetUserBot,
+		&row.TargetAppBot,
+		&row.TargetCreatorEligible,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return classifyEligibleSpacePrincipal(callerKind, row)
+}
+
+func spacePrincipalEligibilityArgs(callerUID, spaceID, targetUID string) []interface{} {
+	return []interface{}{
+		spaceID,
+		spaceID, callerUID,
+		callerUID,
+		callerUID,
+		spaceID, callerUID,
+		targetUID,
+		spaceID, targetUID,
+		targetUID,
+		targetUID,
+		targetUID,
+		targetUID,
+		spaceID, targetUID,
+	}
+}
+
+func classifyEligibleSpacePrincipal(callerKind string, row spacePrincipalEligibilityRow) (*spacePrincipal, error) {
+	if row.SpaceActive != 1 {
+		return nil, errSpacePrincipalNotFound
+	}
+	if callerKind != BotKindUser || row.CallerMember != 1 || row.CallerUserBot != 1 || row.CallerAppBot != 0 || row.CallerCreatorEligible != 1 {
+		return nil, errSpacePrincipalNotFound
+	}
+	if row.CanonicalUID == "" || row.TargetMember != 1 {
+		return nil, errSpacePrincipalNotFound
+	}
+
+	botIdentities := row.TargetRobotIdentity + row.TargetAppBot
+	switch {
+	case row.TargetHuman == 1 && botIdentities == 0:
+		return &spacePrincipal{UID: row.CanonicalUID, PrincipalType: principalTypeHuman}, nil
+	case row.TargetHuman == 0 && row.TargetUserBot == 1 && row.TargetAppBot == 0 && row.TargetCreatorEligible == 1:
+		return &spacePrincipal{UID: row.CanonicalUID, PrincipalType: principalTypeUserBot}, nil
+	default:
+		return nil, errSpacePrincipalNotFound
+	}
+}
