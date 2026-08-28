@@ -966,8 +966,14 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 // 旧名 …ExcludingBotsOf 描述的是"只排除某人名下的 bot"那一版，现在排除的是全部 bot
 // 加上外部成员和非正常 status，名字不再准确，故改名。
 //
-// 资格谓词与手动转让 transferGrouper 对齐：**排除 bot、排除外部成员、要求 status 正常**。
-// 两条路径决定的是同一件事——谁可以持有群主权限——此前它们给的答案不一样。
+// 资格谓词：**排除 bot、排除外部成员、要求 status 正常**。
+//
+// ⚠️ 这**不是**「与手动转让 transferGrouper 对齐」，早先的注释这么写是夸大了：
+// transferGrouper 只拒绝外部成员（api.go；它拿到的 QueryMemberWithUID 只过滤
+// is_deleted），既不看 robot 也不看 status。所以三条里只有**外部成员**这一条是把
+// 「手动拒绝、自动准入」的不一致抹平；bot 与 status 是**新加的、更严的口径**，改完
+// 之后自动路径严于手动路径。先收紧自动路径的理由是它没有人在回路里，选错了不会有人
+// 当场发现。手动路径的同类缺口是既有问题，单独跟进，不在本改动内。
 //
 // 三条排除各自的理由：
 //

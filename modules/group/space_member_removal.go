@@ -330,6 +330,14 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID str
 	//   InnoDB 的死锁报告直接点名这条选主语句。modules/group 里没有任何死锁重试
 	//   （retryOnDeadlock 只在 modules/space），输家就是一个 500 或一次白烧的清理工单。
 	//
+	//   ⚠️ 这组数字的边界，别读宽了（PR #804 round-13 review §1d）：**n=3**，测的是
+	//   **本 PR 收紧后的语句形状**（已经不是 main 那条 —— main 带 LEFT JOIN robot、
+	//   没有 robot / is_external / status 三个谓词）。计划翻转本身在 EXPLAIN 上是稳定的
+	//   （group_no_uid → group_member_groupNo），锁序翻转也由 performance_schema.data_locks
+	//   直接观察到，所以机制是确定的；但「3/3」只是这个夹具下的命中率，不要当成对全部
+	//   数据分布的结论 —— 大表上这条 ORDER BY 扫描的计划本身就会再变（实测 5000 行同群
+	//   时优化器改走全表扫描），service.go 的注释说的正是这件事。
+	//
 	//   FORCE INDEX 能把计划钉回去（实测 0/3），但那是在热路径上新增一次锁序改动
 	//   外加一个索引名的运行时硬依赖，属于并发那摊事，不该塞进本改动。
 	//
@@ -612,8 +620,10 @@ func isSelfSuccessor(successor *MemberModel, leaverRowID int64) bool {
 // **但「排除离开者本人」这一条两边写法不同，是刻意的**：非事务版是无锁读，直接写成
 // `gm.uid <> ?` 谓词；本函数带 FOR UPDATE，加同一个谓词会让优化器换索引、把取锁顺序
 // 从 uid 升序翻成 id 升序，与 RemoveGroupMembers 的 uid 序相反而构成 AB-BA（实测 3/3
-// 死锁）。所以这一条落在调用方的 isSelfSuccessor 上，SQL 保持与 main 一致。完整测量
-// 见 handOverGroupCreator 里那段注释。
+// 死锁）。所以这一条落在调用方的 isSelfSuccessor 上，**这条 SQL 的 WHERE 不再增加
+// 任何谓词**。注意别写成「与 main 一致」：main 的这条查询带 LEFT JOIN robot、也没有
+// robot / is_external / status 三个谓词，本 PR 已经换过一次语句形状；准确的说法是
+// 「资格收紧之后不再往这条持锁语句上加谓词」。完整测量见 handOverGroupCreator 的注释。
 //
 // 也正因如此本函数**不收 leaverUID**：它用不到，收了就是个死参数 —— 一个只出现在签名
 // 里的参数会让下一个人以为排除逻辑在这条 SQL 里（PR #804 round-11 review 已就同一形状

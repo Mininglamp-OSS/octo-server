@@ -1551,7 +1551,7 @@ func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
 // TestUpsertMembersLocksInSameOrderAsBatchRemoval 守住批量加人 vs 批量移除这一对。
 //
 // 背景（PR #804 round-9 review，Jerry-Xin 实测定位）：upsertMembers 逐条 upsert，此前
-// 按**调用方给的 uid 顺序**取锁（normalizeUIDs 不排序），而批量移除走 FORCE INDEX 按
+// 按**调用方给的 uid 顺序**取锁（normalizeUIDs 不排序），而当时的批量移除走 FORCE INDEX 按
 // **索引升序**取锁——两边顺序相反即构成 AB-BA。这一对在 main 上不可能死锁：那时用户端
 // 移除是一人一事务、只握一把锁，做不了 hold-and-wait 的那一侧；是本 PR 的整批单事务
 // （最多 200 行）把它变成了可能。
@@ -1653,7 +1653,7 @@ func TestUpsertMembersLocksInSameOrderAsBatchRemoval(t *testing.T) {
 	wg.Wait()
 
 	assert.EqualValues(t, 0, removeDL.Load(),
-		"批量移除不得与批量加人死锁——upsertMembers 必须按 uid 升序取锁，与 FORCE INDEX 的批量移除同序")
+		"批量移除不得与批量加人死锁——两侧必须过同一个 sortForLockOrder")
 	assert.EqualValues(t, 0, upsertDL.Load(), "加人侧同样不得死锁")
 	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
 }

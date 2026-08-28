@@ -1542,6 +1542,42 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-27 (space-removal-creator-handover-notice · rounds 12–13)
+
+- **Fixed** — `gm.uid <> ?` was asserted in a commit message and a doc comment and was
+  in neither election query; three reviewers found it independently. Both paths now
+  enforce it, **asymmetrically and for a measured reason**: the non-tx query
+  (`groupExit`) is a non-locking read and takes the predicate in SQL; the
+  in-transaction twin excludes the leaver in Go by row id (`isSelfSuccessor`), because
+  adding the same predicate there flips the optimizer from `group_no_uid` to
+  `group_member_groupNo` and with it the lock order from uid-ascending to
+  id-ascending — the opposite of the order `RemoveGroupMembers` sorts into. Measured
+  0/3 deadlocks without, 3/3 with; `modules/group` has no deadlock retry.
+  Also pinned what `extra[0]` names when a batch collapses a multi-elder handover chain.
+  See [journal](journal/shared/space-removal-creator-handover-notice.md).
+- **Learned** — **Adding a predicate to a `FOR UPDATE` statement is not a read-only
+  change.** It can move the query plan, and on a scan that filesorts, the plan *is* the
+  lock acquisition order. "I only narrowed the WHERE clause" is not a safety argument on
+  a locking statement. The reviewer who caught this measured it; reasoning did not.
+- **Learned** — A claim's *width* is part of its correctness. Two sentences in the same
+  commit ("no existing fixture would catch it", "`{0}` had no coverage") were true of
+  the specific gap and false as written; both were refuted by measurement in review.
+  Third consecutive round where the code held and the prose around it did not.
+- **Fixed (round 13, documentation only)** — The shipped artifacts described a different
+  implementation than the diff: the brief's Out-of-scope list still deferred the
+  eligibility change that shipped (the `security_sensitive` item, and the list a sign-off
+  reads to learn what was *not* decided); the brief still prescribed `FORCE INDEX`,
+  `selectMembersForRemovalForUpdateSQL` and two deleted acceptance guards; a learnings
+  file still taught the byte-order rule round 11b measured false; seven comments in the
+  two lock-ordering functions still described the previous mechanism. No behavioural
+  change was requested or made.
+- **Out of scope, recorded** — the sanitise-before-fallback ordering nit (a bidi-only
+  remark sanitises to empty after passing the `== ""` guard) is a code change and was
+  left for its own commit; the dangling references to the old query name in
+  `space-member-removal-cleanup` and `space-member-dm-isolation` briefs are outside this
+  PR's diff; and the `#797` entry this branch's own comment promises still has to be
+  filed on the issue itself.
+
 ## 2026-08-27 (space-removal-creator-handover-notice · round 11b)
 
 - **Fixed** — Two P1s that round 11 introduced. (1) `sort.Strings` on both sides is

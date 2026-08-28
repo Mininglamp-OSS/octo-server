@@ -201,11 +201,18 @@ overlapping `transferOwnerAdminLocked`. Measured on MySQL 8.0, the naive
 `uid IN (…) FOR UPDATE` does **not** use the unique index at this endpoint's real
 sizes — the optimizer picks `spacemember_spaceid_status`, locking every active
 member of the space in `(space_id, status, id)` order, while the transfer demote
-uses `(space_id, uid)`; two orders over one row set is the cycle. The lock statement
-now carries `FORCE INDEX (spacemember_spaceid_uid)` (extracted to the const
-`selectMembersForRemovalForUpdateSQL`), which pins the plan to a `(space_id, uid)`
-range: only the target rows, and narrows the lock scope from the whole space back to
-the targets. The batch-vs-batch case was always safe (same plan on both sides).
+uses `(space_id, uid)`; two orders over one row set is the cycle. Round 7's answer was
+`FORCE INDEX (spacemember_spaceid_uid)` on the lock statement, pinning the plan to a
+`(space_id, uid)` range. The batch-vs-batch case was always safe (same plan on both sides).
+
+> **⚠️ Superseded in round 11 — this is history, not the shipped design.** `FORCE INDEX`
+> and the const `selectMembersForRemovalForUpdateSQL` are **gone**. Pinning the plan from
+> Go was still a guess about the deployment's collation, and CI (general_ci) and
+> production (0900_ai_ci) order `_` oppositely. The batch lock now expands into
+> `UNION ALL` single-row equality branches
+> (`buildSelectMembersForRemovalForUpdateSQL`), so acquisition order is the **caller's**
+> and the index name is no longer a runtime dependency. See the round-11 section and
+> the Acceptance list below for what actually ships.
 
 **Round-8 correction.** `FORCE INDEX` alone does **not** close the batch-vs-transfer
 case, and an earlier revision here wrongly said it did. `transferOwnerAdminLocked`
@@ -216,9 +223,9 @@ deterministic AB-BA regardless of the batch's index (two reviewers measured
 can't unify the *other* path's order from its own call site, so ordering is not a
 complete fix. The multi-row `space_member` writers are wrapped in `retryOnDeadlock`,
 a bounded retry. A deadlock rolls the victim back with nothing half-committed, so a
-retry is safe and usually succeeds on the second try. `FORCE INDEX` is kept: it
-shrinks the lock footprint and the blocking window and removes batch-vs-batch, it
-just is not the cross-path fix. Guarded by `TestRetryOnDeadlockRecoversFrom1213`
+retry is safe and usually succeeds on the second try. `FORCE INDEX` was kept **at the
+time** — it shrank the lock footprint and removed batch-vs-batch, it just was not the
+cross-path fix. (It was removed in round 11; see the superseded note above.) Guarded by `TestRetryOnDeadlockRecoversFrom1213`
 (injects a 1213: retries to success, gives up bounded, passes 1205 and domain errors
 through) — the real deadlock race is not reliably reproducible locally, so the retry
 logic is pinned by injection rather than a flaky concurrent test.
@@ -249,9 +256,11 @@ defects this PR introduced in round 8.
    retry re-collides with the same live transaction until the attempts are gone. So:
    *bounded retry closes cycles against **short-lived** counterparties (owner transfer,
    force-remove — measured 0) and starves against **long-lived** ones.* The fix is
-   ordering, which the retry cannot substitute for: `upsertMembers` now sorts its uids
-   ascending, the same order the `FORCE INDEX`'d batch locks in, so the pair cannot form
-   a cycle at all. Measured 0/60 across three runs — and 0/60 again with **both sides
+   ordering, which the retry cannot substitute for: `upsertMembers` sorts its uids, in the
+   same order the batch removal takes its locks, so the pair cannot form a cycle at all.
+   (Round 9 used a plain byte sort against the `FORCE INDEX`'d batch; **as shipped** both
+   sides go through `sortForLockOrder` — case-folded key, raw-byte tiebreak — and the
+   batch's order comes from `UNION ALL` branch order. See rounds 11 / 11b.) Measured 0/60 across three runs — and 0/60 again with **both sides
    unwrapped**, which is what proves the closure is structural rather than absorbed by
    the retry. Guarded by `TestUpsertMembersLocksInSameOrderAsBatchRemoval`, which calls
    both `…Once` variants for that reason and goes red 30/30 when the sort is removed.
@@ -280,9 +289,13 @@ name. B itself is unchanged and still tracked (see below).
 
 Guarded by a **pair** of tests, and neither is sufficient alone:
 
-- `space/TestRemoveMembersLockedForcesUniqueIndexPlan` is the round-7 primary guard:
-  it `EXPLAIN`s the shared SQL const and asserts the plan is `(space_id, uid)`, not
-  `(space_id, status)`. Removing `FORCE INDEX` turns it red (verified). A concurrent
+- `space/TestBatchRemovalUsesUniqueIndexWithoutForcing` (which **replaced** round 7's
+  `TestRemoveMembersLockedForcesUniqueIndexPlan` when `FORCE INDEX` was removed): it
+  asserts a single-row equality branch reaches the unique key *without* forcing, and
+  that the shipped statement contains no `FORCE INDEX`. `TestBatchRemovalLocksInBranchOrder`
+  is the primary lock-order guard — it builds its own tables under **both**
+  `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` and asserts the statement holds branch 1
+  and not branch 3 while blocked on branch 2. A concurrent
   smoke test (`…NoDeadlockOnReversedOverlap`) runs reversed overlapping batches with
   zero deadlocks, but the plan assertion is what actually pins the lock order.
 - `space/TestRemoveMembersLockedEnqueuesAtomically` proves the atomic-enqueue
@@ -493,8 +506,9 @@ of reach from here.
   per-entrypoint table and the measured counts.
 - **`upsertMembers` — RESOLVED in round 9, no longer a follow-up.** It looped
   `INSERT … ON DUPLICATE KEY UPDATE` in caller order inside one transaction, against
-  the batch removal's index order. It now sorts its uids ascending (same order the
-  `FORCE INDEX` batch locks in) and is wrapped in `retryOnDeadlock`. See the round-9
+  the batch removal's index order. It now takes its locks in `sortForLockOrder` order —
+  the same order the batch removal's `UNION ALL` branches acquire in — and is wrapped in
+  `retryOnDeadlock`. See the round-9
   section above for the measurement that forced the sort; guarded by
   `TestUpsertMembersLocksInSameOrderAsBatchRemoval`.
 - **The ordinary group-kick and bot-API paths.** `modules/group/api.go`
@@ -507,25 +521,29 @@ of reach from here.
   `kicked`-path chain above, so this may come back with that work.
 - **Everything already deferred to #797** — the IM-unsubscribe leak, the residual
   ABBA and its missing index, the rejoin window.
-- **A bot as successor.** `querySecondOldestNonBotMemberTx` excludes only the
-  leaver's own active bots, so a third party's bot — or the leaver's own
-  *inactive* bot — can be promoted and therefore announced. Pre-existing
-  selection behaviour, deliberately pinned by
-  `TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft` ("他人的 bot 不在排除
-  范围内（与旧 QuerySecondOldestMember 语义一致）"); this task makes a previously
-  silent outcome visible but does not change the selection. `group_member.robot`
-  is populated (`service.go:1298`, `:1328`) so `gm.robot = 0` would be a one-line
-  fix, but reversing a deliberately pinned contract needs its own decision.
+- ~~**A bot as successor.**~~ / ~~**An external member as successor.**~~
+  **Both were moved IN SCOPE and shipped in round 11 — see the Load-bearing section
+  ("eligibility to hold group ownership"). Neither is deferred any more.** The entries
+  that stood here described `querySecondOldestNonBotMemberTx` and
+  `TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft`, neither of which exists
+  at this head, and said the decision still needed to be taken. That was wrong to leave
+  standing: this is the item carrying the `security_sensitive` classification, and the
+  Out-of-scope list is what a sign-off reads to learn what was *not* decided
+  (PR #804 round-13 review §1a).
 
-- **An external member as successor.** `querySecondOldestNonBotMemberTx` has no
-  `is_external = 0` predicate, while `modules/group/db.go` `QueryIsGroupManagerOrCreator`
-  requires `is_external=0` — so an external guest can be elected creator and then
-  refused the creator powers. Before this task that was a silent bad state; this
-  task turns it into a persisted, group-visible claim that someone holding no
-  creator powers is the new owner. Reachable when a Space group's only eligible
-  successor is external. Pre-existing selection behaviour like the bot case above;
-  adding the predicate changes election semantics (the group would go ownerless
-  instead), so it wants its own decision. Raised in PR #804 round-5 review.
+  **The decision, stated once:** both election queries now require
+  `gm.robot = 0 AND gm.is_external = 0 AND gm.status = GroupMemberStatusNormal`, on the
+  Space-removal cascade **and** on `groupExit`. This overturned a pinned contract —
+  `…_OnlyBotsLeft` asserted a third party's bot was eligible — and that assertion
+  recorded continuity with the pre-#354 query rather than a decision about permissions.
+
+  **The consequence a sign-off must weigh:** when every remaining member of a group is
+  a bot, an external member, or group-blacklisted, a creator's departure now leaves the
+  group **permanently ownerless** instead of transferring. Election skips ineligible
+  candidates rather than giving up (`TestGroupCascadeSuccessorPrefersEligibleOverIneligible`
+  pins that), so it is narrow — but `transferGrouper` is creator-gated and there is no
+  admin path in `modules/group` to reassign an owner, so it is not recoverable through
+  the API. It lands on `/group/exit`, which this PR's title does not mention.
 - **A suppressed notice is never re-evaluated.** The chain check decides once,
   against `status=pending`, and that answer can turn out wrong in three ways: a
   successor carrying an older stuck pending job; a successor whose own job later
@@ -602,10 +620,12 @@ In `modules/group/space_member_removal_test.go`:
   mis-created test database fails loudly instead of passing vacuously; the
   second deliberately omits the stored spelling so matching and dedup must both
   hold.
-- `TestLessUIDGeneralCIMatchesIndexOrder` — sorts a scan of the real index with
-  the comparator and asserts element-wise equality, with a control asserting the
-  fixture distinguishes byte order from index order at all. Goes red if the
-  column's collation changes underneath the premise.
+- `TestSortForLockOrderIsSpellingInvariant` — **replaces round 10's
+  `TestLessUIDGeneralCIMatchesIndexOrder`, which was deleted in round 11 together with
+  the `lessUIDGeneralCI` comparator it pinned.** Asserts that two callers naming the
+  same rows with different case spellings sort to the same lock order. The concurrent
+  guard structurally cannot cover this — the unique index collapses case variants into
+  one key, so the second insert is a 1062.
 - `TestUpsertMembersLocksInSameOrderAsBatchRemoval` — alphabet moved off
   `m%04d`, the one alphabet where byte order and collation order agree, so the
   guard was blind to the ordering defect it was named for.

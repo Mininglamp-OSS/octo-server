@@ -1752,7 +1752,7 @@ func TestGroupCascadeHandoverNoticeNeverWritesBareUID(t *testing.T) {
 // 两条路径的实现为什么不同，见 querySecondOldestEligibleMemberTx 的注释：非事务版是
 // 无锁读，谓词直接写在 SQL 里；事务版带 FOR UPDATE，同一个谓词会翻转它的取锁顺序并
 // 与 RemoveGroupMembers 构成 AB-BA（实测 3/3 死锁），所以那一侧用调用方的
-// isSelfSuccessor 按行 id 拦截，SQL 保持与 main 一致。
+// isSelfSuccessor 按行 id 拦截，不再往那条持锁语句上加谓词。
 func TestSuccessorElectionExcludesLeaverAfterDemotion(t *testing.T) {
 	ctx, g := cascadeSetup(t)
 	const spaceID, gno = "sp-elect-leaver", "g-elect-leaver"

@@ -3445,7 +3445,9 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	var newGrouper *MemberModel // 新群主
 	if loginMember.Role == MemberRoleCreator {
 		// 查询第二元老成员。资格谓词排除 **全部 bot、外部成员、非正常 status**，
-		// 与手动转让 transferGrouper 对齐 —— 群主握有全部敏感权限，这三类都不该持有。
+		// 并显式排除离开者本人 —— 群主握有全部敏感权限，这三类都不该持有。
+		// 注意这**不是**与手动转让 transferGrouper 对齐：它只拒外部成员，收紧后自动
+		// 路径严于它（详见 QuerySecondOldestEligibleMember 的注释）。
 		// （#354 最初只排除退群群主名下的 bot，理由是它们会在下方被级联带走；那一条
 		// 仍然成立，只是现在被更宽的谓词覆盖了。完整理由见
 		// QuerySecondOldestEligibleMember 的注释。）

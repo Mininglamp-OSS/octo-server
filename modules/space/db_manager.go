@@ -410,7 +410,7 @@ func (d *managerDB) updateSpaceProfile(
 // 「一人一事务」改成整批单事务后，移除侧一次要按住至多 200 行、持锁窗口大幅变宽，
 // 这个既有的环因此明显更容易撞上。
 //
-// 现在 upsertMembersOnce 与批量移除用**同一个排序函数**（sort.Strings）取锁，而批量
+// 现在 upsertMembersOnce 与批量移除用**同一个排序函数**（sortForLockOrder）取锁，而批量
 // 移除通过 UNION ALL 的分支顺序落实它，两边同序、这一对结构上不再成环。retryOnDeadlock 仍然保留：它兜的是
 // **别的**对手——群主转让是两段式非单调获取，谁排序都关不掉，见 retryOnDeadlock 注释。
 // 全有全无地单事务提交，重放安全（ON DUPLICATE KEY UPDATE 本身也幂等）。
@@ -422,8 +422,12 @@ func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 
 // upsertMembersOnce 是 upsertMembers 的单次尝试，死锁重试见 retryOnDeadlock。
 //
-// **按 uid 字节序取锁**（sort.Strings），与批量移除用同一个排序函数；批量移除通过
-// UNION ALL 的分支顺序落实这个顺序，两边同序、结构上无法成环，且不依赖列的 collation。仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
+// **按 sortForLockOrder 排出的顺序取锁**（折叠大小写的键 + 原始字节兜底），与批量移除
+// 用同一个排序函数；批量移除通过 UNION ALL 的分支顺序落实这个顺序，两边同序、结构上
+// 无法成环。**注意不要写成「字节序」**：列本身大小写不敏感，纯字节序会让两个调用方把
+// 同两行排出相反顺序，理由见下方 sortForLockOrder 的注释（round 11b P1-1）。
+//
+// 仅靠重试**不够**：重试只对**短命**的对手有效（转让、强制移除，实测
 // 已归零），对**长命**的对手会被饿死——批量移除每次尝试都是全新事务、回滚代价为零，
 // 于是被 InnoDB 反复选为牺牲者，而还在跑的 upsert 一直在推进，重试立刻又撞上同一个
 // 活事务，几次退避跑完还在人家的生命周期里。实测（200 uid 逆序重叠、60 轮）：只包重试
@@ -539,10 +543,12 @@ func isDeadlockErr(err error) bool {
 // 各自在真实 MySQL 上实测确认）：space_member 上有多条会一次锁多行的写路径——
 // removeMembersLocked（批量移除）、removeMembersForce（超管强制移除）、
 // transferOwnerAdminLocked（转让：**先单行锁住目标、再范围扫描降级**，两段式、非单调）、
-// upsertMembers（批量加人：按 sort.Strings 排序后逐条 upsert，与批量移除同序）。
+// upsertMembers（批量加人：按 sortForLockOrder 排序后逐条 upsert，与批量移除同序）。
 // 它们各自的加锁顺序由各自的索引/结构决定，从任何一个调用点都无法统一**对方**的顺序，
-// 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了——FORCE INDEX 只收窄了锁面、关掉了
-// 批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是确定性的）。
+// 所以跨路径 AB-BA 死锁靠「我这条走对索引」根治不了：round 7 曾用 FORCE INDEX 把批量
+// 移除的计划钉在唯一键上（**该 hint 已随 UNION ALL 分支展开在 round 11 移除**），它只
+// 收窄了锁面、关掉了批量 vs 批量，对批量 vs 转让实测仍会死锁（目标落在批次内时甚至是
+// 确定性的）。
 //
 // 死锁时 InnoDB 已把被选中的事务整体回滚、没有半提交状态，把整个事务重跑一遍即可；
 // 幸存的那一方已经完成，重试通常第二次就成功。只能用于幂等或全有全无的操作：上述
@@ -829,8 +835,9 @@ type spaceMemberRoleRow struct {
 // 重读角色、翻转成员行，最后一次性入队全部清理工单，单次提交。
 // 返回真正被改动的 uid 列表，语义与逐个调用 removeMemberLocked 收集 ok=true 一致。
 // 「一致」包括标识符比较口径：返回的是**库里存的 uid 拼写**，而不是请求里的拼写
-// （uid 列是 utf8mb4_general_ci，两者可能只差大小写，见 removeMembersLockedOnce
-// 循环处的注释）。唯一的可观察差异是顺序 —— 按 uid 升序而非调用方顺序。
+// （uid 列没有显式 COLLATE、继承库默认，CI 是 general_ci、生产是 0900_ai_ci，**两者都
+// 大小写不敏感**，所以两个拼写可能只差大小写；见 removeMembersLockedOnce 循环处的
+// 注释）。唯一的可观察差异是顺序 —— 按 sortForLockOrder 排出的顺序而非调用方顺序。
 //
 // 为什么必须是一个事务，而不是循环调用 removeMemberLocked（PR #804 round-4/5 review）：
 //
@@ -863,10 +870,12 @@ func removeMembersLocked(sess *dbr.Session, spaceId string, uids []string, rejec
 	return removed, err
 }
 
-// removeMembersLockedOnce 是 removeMembersLocked 的单次尝试；死锁重试见调用方
-// （FORCE INDEX 收窄锁面并关掉批量 vs 批量，但批量 vs 转让/强制移除的跨路径死锁靠
+// removeMembersLockedOnce 是 removeMembersLocked 的单次尝试，死锁重试见调用方。
 //
-//	retryOnDeadlock 兜底，见 retryOnDeadlock 的注释）。
+// 取锁顺序由 sortForLockOrder（排序）+ UNION ALL 分支展开（落实）共同决定，见
+// buildSelectMembersForRemovalForUpdateSQL；这关掉的是「批量 vs 批量」这一对。批量 vs
+// 群主转让 / 强制移除是跨路径的两段式非单调获取，排序治不了，由 retryOnDeadlock 兜底，
+// 见那里的注释。（round 7 的 FORCE INDEX 已在 round 11 随 UNION ALL 一并移除。）
 func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, rejectRoleAtOrAbove int, operatorUID, reason string) ([]string, error) {
 	if len(uids) == 0 {
 		return nil, nil
@@ -923,7 +932,7 @@ func removeMembersLockedOnce(sess *dbr.Session, spaceId string, uids []string, r
 	// 顺带解决一件事：status<>1 的行 SQL 已经滤掉，「不在空间」这一条不需要在 Go
 	// 里再判一次。（请求里的重复 uid 由下面的 seen 去重，见那里的注释。）
 	//
-	// 返回顺序随之从调用方顺序变成 sort.Strings 的字节升序。两个消费者
+	// 返回顺序随之从调用方顺序变成 sortForLockOrder 排出的顺序。两个消费者
 	// （enqueueMemberRemovalCleanupBatchTx、afterMembersRemoved）都是逐个处理，
 	// 不依赖顺序。
 	// UNION ALL **不去重**：两个互为大小写变体的请求 uid 会各自匹中同一行，于是

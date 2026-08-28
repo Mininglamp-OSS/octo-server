@@ -82,9 +82,32 @@ order is the index's at all**. A single `col IN (...) FOR UPDATE` takes its lock
 during the index scan, so the order is the index's and the caller cannot specify
 it — `ORDER BY` does not help, the locks are already held by the time the sort
 runs. Expanding the batch into `UNION ALL` branches, one single-row equality
-each, makes MySQL acquire in branch order, which is the caller's order. Collation
-then leaves the question entirely, and the sort can be the most boring byte-order
-comparison available.
+each, makes MySQL acquire in branch order, which is the caller's order.
+
+> **⚠️ Correction (round 11b) — an earlier version of this file ended the paragraph
+> with "…and the sort can be the most boring byte-order comparison available." That is
+> false, and shipping it here would have led the next reader straight back into the
+> defect this file exists to record.**
+>
+> `UNION ALL` removes the **index's** collation from the question. It does not remove
+> the **column's**. `space_member.uid` is still case-insensitive, and neither entry
+> point folds case, so two callers can name the same two rows with different spellings
+> and a byte sort orders them oppositely:
+>
+> ```
+> batch-add    gets ["ABC", "abd"] -> locks abc, then abd
+> batch-remove gets ["abc", "ABD"] -> locks abd, then abc
+> ```
+>
+> That is the pair `retryOnDeadlock` was measured **starving** against rather than
+> absorbing (60/60 unrecovered), so the degraded mode is a persistent 500 on an
+> access-revocation endpoint. The shipped sort is `sortForLockOrder`: case-folded key,
+> raw-byte tiebreak, with the remaining limit (it folds case, not the accents
+> `0900_ai_ci` also ignores) stated at the definition rather than claimed away.
+>
+> The generalisation below still holds — it is the scope that was overstated: removing
+> the dependency on the *index* is checkable once; the *column's* comparison semantics
+> were still there, and still had to be matched.
 
 Generalised: **when you find yourself reproducing a database's semantics in
 application code, check whether you can stop depending on those semantics

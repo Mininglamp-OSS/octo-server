@@ -132,6 +132,10 @@ Two verification notes worth keeping:
   bot owned by someone else is an eligible successor, pinned as an existing
   contract by `bot_cascade_test.go`. This change makes a previously silent
   outcome publicly visible without altering the selection.
+  **⇒ Superseded in round 11: the selection *was* altered.** Both queries now
+  require `gm.robot = 0 AND gm.is_external = 0 AND gm.status = normal`, the pinned
+  contract was overturned deliberately, and the function was renamed
+  `querySecondOldestEligibleMemberTx`. See the round-11 entry.
 - **Constrain uids to a known alphabet at the API boundary** (from round 10, and
   the durable fix for both of that round's findings). `api_manager.go`'s batch-add
   upserts caller-supplied uid strings with no charset check, and
@@ -789,3 +793,54 @@ P1s were self-inflicted. We chose to continue on this branch, so the argument st
 recorded rather than accepted: the eligibility change does alter who may hold owner
 authority on `groupExit`, a path this PR's title does not mention, and it is riding
 along in a large diff.
+
+
+## Round 12–13 — a predicate that existed only in prose, and the round that came of it
+
+Three reviewers, independently, found the same thing: `gm.uid <> ?` was asserted in a
+commit message and in a long doc comment, and was in neither query. Three placeholders,
+three bound arguments, `leaverUID` dead in both. The protection was still the emergent
+one the comment claimed to have eliminated.
+
+The interesting part is not the omission. It is that **the fix I reached for first was
+worse than the defect.** Writing the predicate into both queries is the obvious move,
+and it introduced a deterministic deadlock: the in-transaction election is
+`ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE`, `group_member` has no index serving
+that sort, so it filesorts and locks every row it scans — and the *order* it locks them
+in is whatever index the optimizer picked. Adding `gm.uid <> ?` flips that choice from
+`group_no_uid` to `group_member_groupNo`, which flips acquisition from uid-ascending to
+id-ascending, the opposite of the uid order `RemoveGroupMembers` deliberately sorts
+into. Measured: 0/3 without, 3/3 with, InnoDB's report naming the election statement.
+`modules/group` has no deadlock retry at all.
+
+**Generalisable, and not something the PR's rules covered:** adding a predicate to a
+`FOR UPDATE` statement is not a read-only change. It can move the plan, and the plan is
+the lock order. "I only narrowed the WHERE clause" is not a safety argument on a
+locking statement.
+
+So the two paths are deliberately asymmetric: the non-tx query (`groupExit`) is a
+non-locking read and takes the predicate in SQL; the tx twin keeps its statement shape
+and excludes the leaver in Go by **row id** — identity, no collation question — using
+the id its own leaver-row lock already returned. `isSelfSuccessor` is a named function
+so it can be tested directly, and the test says out loud that it cannot show the call
+site invokes it (the branch is unreachable from today's ordering — which is the whole
+point of the guard).
+
+**Two claims I made in the same commit were also too wide, and were measured false by
+review:** "no existing fixture would catch a swapped elect/demote" — 17 `TestGroupCascade*`
+do go red, just downstream and for an unrelated-looking reason; and "`{0}` had no
+coverage" — `TestGroupCascadeCreatorHandoverIsAnnounced` has pinned `extra[0]` all along,
+and what the new assertion adds is the *multi-link* case a single-link fixture cannot
+distinguish. Both are now stated at their measured width. That is the third round in a
+row where the code was right and the sentence around it was not.
+
+**Round 13 was requested as documentation only** — no reviewer asked for a behavioural
+change. The artifacts had drifted from the code they ship with: the brief's Out-of-scope
+list still disclaimed the eligibility change that shipped (the item under the
+`security_sensitive` classification, and the list a sign-off reads to learn what was
+*not* decided); the brief still prescribed `FORCE INDEX` and two deleted tests as the
+design and its acceptance criteria; and a learnings file still taught that the sort
+"can be the most boring byte-order comparison available", the exact rule round 11b
+measured false. A spec that contradicts its own diff is not a documentation problem in
+a repo whose workflow is "read the rules that match the files you are touching" — it is
+the next defect, pre-written.
