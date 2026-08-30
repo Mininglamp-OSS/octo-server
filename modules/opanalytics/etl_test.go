@@ -193,3 +193,84 @@ func TestAggregateChunk(t *testing.T) {
 		t.Fatalf("dirtyDays = %v, want [%s]", res.dirtyDays, day)
 	}
 }
+
+// TestResolveChannelMetaSubarea 覆盖子区(channel_type=5)归属解析（YUJ-375）：
+// 正常子区继承父群 space/conv 并记 parentChannelID；父群缺失(孤儿)仍计但不归 space；
+// 畸形 channel_id(无分隔符/父群段空)fail-closed 丢弃。
+func TestResolveChannelMetaSubarea(t *testing.T) {
+	groupMeta := map[string]groupMetaInfo{
+		"g1": {spaceID: "s1", convType: convTypeHAGroup},
+	}
+	noExclude := func(string) bool { return false }
+	noMember := map[string]uint8{}
+
+	// 正常子区：g1____topicA → 继承 g1 的 space/conv，父群 = g1
+	cm := resolveChannelMeta("g1____topicA", channelTypeCommunityTopic, noMember, noExclude, groupMeta)
+	if cm.skip {
+		t.Fatal("正常子区不应被丢弃")
+	}
+	if cm.channelType != channelTypeCommunityTopic {
+		t.Fatalf("channelType = %d, want %d", cm.channelType, channelTypeCommunityTopic)
+	}
+	if cm.parentChannelID != "g1" || cm.spaceID != "s1" || cm.convType != convTypeHAGroup {
+		t.Fatalf("子区归属错误: parent=%q space=%q conv=%d, want g1/s1/%d",
+			cm.parentChannelID, cm.spaceID, cm.convType, convTypeHAGroup)
+	}
+
+	// 孤儿子区：父群 gX 不在维表 → 仍计消息、保留父群归属、不归 space、conv 未知
+	orphan := resolveChannelMeta("gX____topicB", channelTypeCommunityTopic, noMember, noExclude, groupMeta)
+	if orphan.skip {
+		t.Fatal("孤儿子区应仍计入(与孤儿群一致)")
+	}
+	if orphan.parentChannelID != "gX" || orphan.spaceID != "" || orphan.convType != 0 {
+		t.Fatalf("孤儿子区: parent=%q space=%q conv=%d, want gX/\"\"/0",
+			orphan.parentChannelID, orphan.spaceID, orphan.convType)
+	}
+
+	// 畸形子区 channel_id → fail-closed 丢弃：无分隔符 / 父群段空 / topic段空(g1____) /
+	// 多段(a____b____c) / 全空。要求恰两段且两段均非空，与 thread.ParseChannelID 一致。
+	for _, bad := range []string{"noseparator", "____topicC", "g1____", "a____b____c", ""} {
+		if cm := resolveChannelMeta(bad, channelTypeCommunityTopic, noMember, noExclude, groupMeta); !cm.skip {
+			t.Fatalf("畸形子区 channel_id %q 应被丢弃(skip)", bad)
+		}
+	}
+}
+
+// TestAggregateChunkSubarea 端到端：子区消息经 aggregateChunk 后 fact3 带 parent 且人/AI 分开。
+func TestAggregateChunkSubarea(t *testing.T) {
+	const ts = int64(1_780_000_000)
+	memberType := map[string]uint8{"alice": memberTypeHuman, "agentX": memberTypeAgent}
+	noExclude := func(uid string) bool { return false }
+	groupMeta := map[string]groupMetaInfo{"g1": {spaceID: "s1", convType: convTypeHAGroup}}
+
+	rows := []*srcMessageRow{
+		{ID: 1, FromUID: "alice", ChannelID: "g1____topicA", ChannelType: channelTypeCommunityTopic, Timestamp: ts},
+		{ID: 2, FromUID: "agentX", ChannelID: "g1____topicA", ChannelType: channelTypeCommunityTopic, Timestamp: ts + 1},
+		{ID: 3, FromUID: "alice", ChannelID: "bad_no_sep", ChannelType: channelTypeCommunityTopic, Timestamp: ts + 2}, // 畸形→丢弃
+	}
+	res := aggregateChunk(rows, memberType, noExclude, groupMeta)
+
+	var human, agent *factMemberChannelDailyModel
+	for _, f := range res.fact3 {
+		if f.ChannelID == "bad_no_sep" {
+			t.Fatal("畸形子区消息不应进 fact3")
+		}
+		switch f.SenderUID {
+		case "alice":
+			human = f
+		case "agentX":
+			agent = f
+		}
+	}
+	if human == nil || agent == nil {
+		t.Fatalf("子区 human/agent 行缺失: %+v", res.fact3)
+	}
+	for _, f := range []*factMemberChannelDailyModel{human, agent} {
+		if f.ChannelType != channelTypeCommunityTopic || f.ParentChannelID != "g1" || f.SpaceID != "s1" || f.ConvType != convTypeHAGroup {
+			t.Fatalf("子区 fact3 归属错误: %+v", f)
+		}
+	}
+	if human.SenderType != memberTypeHuman || agent.SenderType != memberTypeAgent {
+		t.Fatalf("sender_type 人/AI 区分错误: human=%d agent=%d", human.SenderType, agent.SenderType)
+	}
+}

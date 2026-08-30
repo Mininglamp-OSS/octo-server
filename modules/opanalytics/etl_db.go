@@ -141,21 +141,21 @@ func (d *etlDB) accumulateFact3(tx *dbr.Tx, fact3 []*factMemberChannelDailyModel
 	if len(fact3) == 0 {
 		return nil
 	}
-	const cols = "(`stat_date`,`channel_id`,`channel_type`,`space_id`,`conv_type`,`content_type`," +
+	const cols = "(`stat_date`,`channel_id`,`channel_type`,`space_id`,`conv_type`,`parent_channel_id`,`content_type`," +
 		"`sender_uid`,`sender_type`,`msg_count`,`last_msg_at`)"
 	const suffix = " ON DUPLICATE KEY UPDATE " +
 		"`channel_type`=VALUES(`channel_type`),`space_id`=VALUES(`space_id`),`conv_type`=VALUES(`conv_type`)," +
-		"`sender_type`=VALUES(`sender_type`)," +
+		"`parent_channel_id`=VALUES(`parent_channel_id`),`sender_type`=VALUES(`sender_type`)," +
 		"`msg_count`=`msg_count`+VALUES(`msg_count`)," +
 		"`last_msg_at`=GREATEST(`last_msg_at`,VALUES(`last_msg_at`))"
 	rows := make([][]interface{}, 0, len(fact3))
 	for _, f := range fact3 {
 		rows = append(rows, []interface{}{
-			f.StatDate, f.ChannelID, f.ChannelType, f.SpaceID, f.ConvType, f.ContentType,
+			f.StatDate, f.ChannelID, f.ChannelType, f.SpaceID, f.ConvType, f.ParentChannelID, f.ContentType,
 			f.SenderUID, f.SenderType, f.MsgCount, f.LastMsgAt,
 		})
 	}
-	return execValuesUpsert(tx, "octo_fact_member_channel_daily", cols, 10, suffix, rows)
+	return execValuesUpsert(tx, "octo_fact_member_channel_daily", cols, 11, suffix, rows)
 }
 
 // markDirtyDays 把本 chunk 触达的统计日入队(待全部 chunk 后由 ③ 重算 ④)。
@@ -203,9 +203,9 @@ func (d *etlDB) recomputeChannelDay(day string) error {
 	}
 	if _, err = tx.InsertBySql(
 		"INSERT INTO octo_fact_channel_daily "+
-			"(stat_date,channel_id,channel_type,space_id,conv_type,human_msg_count,agent_msg_count,"+
+			"(stat_date,channel_id,channel_type,space_id,conv_type,parent_channel_id,human_msg_count,agent_msg_count,"+
 			"active_human_members,active_agent_members,last_msg_at) "+
-			"SELECT stat_date, channel_id, MAX(channel_type), MAX(space_id), MAX(conv_type), "+
+			"SELECT stat_date, channel_id, MAX(channel_type), MAX(space_id), MAX(conv_type), MAX(parent_channel_id), "+
 			"SUM(CASE WHEN sender_type=1 THEN msg_count ELSE 0 END), "+
 			"SUM(CASE WHEN sender_type=2 THEN msg_count ELSE 0 END), "+
 			"COUNT(DISTINCT CASE WHEN sender_type=1 THEN sender_uid END), "+

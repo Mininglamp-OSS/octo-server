@@ -87,7 +87,9 @@ func (d *opanalyticsDB) overviewMsgAndGroups(start, end string, spaceIDs []strin
 		"IFNULL(SUM(human_msg_count),0) AS human_msg",
 		"IFNULL(SUM(agent_msg_count),0) AS agent_msg",
 		"COUNT(DISTINCT CASE WHEN channel_type=2 THEN channel_id END) AS active_groups",
-	).From("octo_fact_channel_daily").Where("stat_date BETWEEN ? AND ?", start, end)
+	).From("octo_fact_channel_daily").
+		Where("stat_date BETWEEN ? AND ?", start, end).
+		Where("channel_type IN (1,2)") // 排除子区(channel_type=5)：其 SUM 会撑大总量(YUJ-375)
 	stmt = applySpaceFilter(stmt, spaceIDs)
 	_, err = stmt.Load(&res)
 	return res.HumanMsg, res.AgentMsg, res.ActiveGroups, err
@@ -117,7 +119,9 @@ func (d *opanalyticsDB) overviewActiveMembers(start, end string, spaceIDs []stri
 		sql += " JOIN space_member sm ON sm.uid = f.sender_uid AND sm.status=1 AND " + smClause
 		args = append(args, smArgs...)
 	}
-	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	// channel_type IN (1,2) 始终生效：排除子区(=5)，使全局与选中 space 两条口径都不含子区
+	// (YUJ-375)。选中 space 时下方另加 f.channel_type=2，与此 AND 后收敛为 =2，私聊排除语义不变。
+	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0 AND f.channel_type IN (1,2)"
 	args = append(args, start, end)
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
@@ -149,6 +153,7 @@ func (d *opanalyticsDB) queryMessageComposition(start, end string, spaceIDs []st
 	).From("octo_fact_channel_daily").
 		Where("stat_date BETWEEN ? AND ?", start, end).
 		Where("conv_type BETWEEN 1 AND 4").
+		Where("channel_type IN (1,2)"). // 子区继承父群 conv_type(1/2)，不加此过滤会被误计入 HH群/HA群桶(YUJ-375)
 		GroupBy("conv_type")
 	stmt = applySpaceFilter(stmt, spaceIDs)
 	_, err := stmt.Load(&rows)
@@ -191,7 +196,7 @@ func (d *opanalyticsDB) queryTrendChannelTotals(start, end, granularity string, 
 		"IFNULL(SUM(agent_msg_count),0) AS agent_msg, " +
 		"COUNT(DISTINCT CASE WHEN channel_type=2 THEN channel_id END) AS active_groups, " +
 		"COUNT(DISTINCT CASE WHEN channel_type=1 THEN channel_id END) AS private_active " +
-		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ?"
+		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND channel_type IN (1,2)" // 排除子区撑大 SUM(YUJ-375)
 	args := []interface{}{start, end}
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("space_id", spaceIDs)
@@ -225,7 +230,7 @@ func (d *opanalyticsDB) queryTrendConvTypeMsg(start, end, granularity string, sp
 	sql := "SELECT " + bucketExpr + " AS bucket, conv_type, " +
 		"IFNULL(SUM(human_msg_count),0) AS human_msg, " +
 		"IFNULL(SUM(agent_msg_count),0) AS agent_msg " +
-		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND conv_type BETWEEN 1 AND 4"
+		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND conv_type BETWEEN 1 AND 4 AND channel_type IN (1,2)" // 排除子区(继承父群conv)误计入群桶(YUJ-375)
 	args := []interface{}{start, end}
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("space_id", spaceIDs)
@@ -265,7 +270,7 @@ func (d *opanalyticsDB) queryTrendActiveMembers(start, end, granularity string, 
 		sql += " JOIN space_member sm ON sm.uid = f.sender_uid AND sm.status=1 AND " + smClause
 		args = append(args, smArgs...)
 	}
-	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0 AND f.channel_type IN (1,2)" // 排除子区(=5)，全局/选中space口径一致(YUJ-375)
 	args = append(args, start, end)
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
