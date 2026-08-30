@@ -4,16 +4,17 @@ package opanalytics
 
 // factMemberChannelDailyModel 对应 octo_fact_member_channel_daily 的一行(③)。
 type factMemberChannelDailyModel struct {
-	StatDate    string // YYYY-MM-DD (报告时区自然日)
-	ChannelID   string
-	ChannelType uint8
-	SpaceID     string
-	ConvType    uint8
-	ContentType uint8
-	SenderUID   string
-	SenderType  uint8
-	MsgCount    int
-	LastMsgAt   int64
+	StatDate        string // YYYY-MM-DD (报告时区自然日)
+	ChannelID       string
+	ChannelType     uint8
+	SpaceID         string
+	ConvType        uint8
+	ParentChannelID string // 子区(channel_type=5)所属父群 channel_id；非子区为 ""
+	ContentType     uint8
+	SenderUID       string
+	SenderType      uint8
+	MsgCount        int
+	LastMsgAt       int64
 }
 
 // factChannelDailyModel 对应 octo_fact_channel_daily 的一行(④)。
@@ -23,6 +24,7 @@ type factChannelDailyModel struct {
 	ChannelType        uint8
 	SpaceID            string
 	ConvType           uint8
+	ParentChannelID    string // 子区(channel_type=5)所属父群 channel_id；非子区为 ""
 	HumanMsgCount      int
 	AgentMsgCount      int
 	ActiveHumanMembers int
