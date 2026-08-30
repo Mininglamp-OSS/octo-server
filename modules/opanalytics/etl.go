@@ -242,7 +242,11 @@ func aggregateChunk(rows []*srcMessageRow, memberType map[string]uint8, excluded
 			continue
 		}
 		dirtySet[ca.day] = struct{}{}
-		res.activityRows = append(res.activityRows, []interface{}{ca.channelID, ca.channelType, ca.dayMaxTs})
+		// 子区不登记 dim_channel 活跃行：该维表仅服务群/私聊看板，子区无展示；写入只会
+		// 积累永不被 refreshDimChannelGroups enrich 的裸 channel_type=5 行(YUJ-375 review)。
+		if cm.channelType != channelTypeCommunityTopic {
+			res.activityRows = append(res.activityRows, []interface{}{ca.channelID, ca.channelType, ca.dayMaxTs})
+		}
 		if cm.channelType == channelTypePerson {
 			a, b, _ := normalizePrivatePair(ca.channelID) // skip=false 保证可解析
 			human, agent := 0, 0
@@ -313,10 +317,11 @@ func resolveChannelMeta(channelID string, channelType uint8, memberType map[stri
 	// 子区(话题)：channel_id = "<父群no>____<短ID>"。劈出父群段，归属父群的 space/conv。
 	// 子区自有 channel_id → 事实表按子区独立成行；parentChannelID 记父群便于上卷。
 	if channelType == channelTypeCommunityTopic {
-		parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
-		if len(parts) != 2 || parts[0] == "" {
-			// 畸形子区 channel_id(无分隔符/父群段空)→ fail-closed 丢弃(与 bot_api
-			// obo_fanout / message disband guard 的处理一致)。
+		parts := strings.Split(channelID, threadChannelIDSeparator)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			// 畸形子区 channel_id → fail-closed 丢弃：要求恰两段且父群段/topic段均非空
+			// (与 canonical thread.ParseChannelID 一致；堵住 "g1____" 空 topic 段与
+			// "a____b____c" 多段)。与 bot_api obo_fanout / message disband guard 同口径。
 			return &channelMeta{channelType: channelTypeCommunityTopic, skip: true}
 		}
 		parentNo := parts[0]

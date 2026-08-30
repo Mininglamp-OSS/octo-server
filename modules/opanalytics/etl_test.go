@@ -227,8 +227,9 @@ func TestResolveChannelMetaSubarea(t *testing.T) {
 			orphan.parentChannelID, orphan.spaceID, orphan.convType)
 	}
 
-	// 畸形子区 channel_id → fail-closed 丢弃
-	for _, bad := range []string{"noseparator", "____topicC", ""} {
+	// 畸形子区 channel_id → fail-closed 丢弃：无分隔符 / 父群段空 / topic段空(g1____) /
+	// 多段(a____b____c) / 全空。要求恰两段且两段均非空，与 thread.ParseChannelID 一致。
+	for _, bad := range []string{"noseparator", "____topicC", "g1____", "a____b____c", ""} {
 		if cm := resolveChannelMeta(bad, channelTypeCommunityTopic, noMember, noExclude, groupMeta); !cm.skip {
 			t.Fatalf("畸形子区 channel_id %q 应被丢弃(skip)", bad)
 		}
