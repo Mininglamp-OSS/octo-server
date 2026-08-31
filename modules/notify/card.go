@@ -19,6 +19,7 @@ import (
 	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
 	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -464,9 +465,32 @@ func (n *Notify) deliverDocsCardNotification(ctx context.Context, req *NotifyReq
 		targets = tmp
 	}
 
-	members, filteredMap, err := n.memberCache.verify(n.db, req.SpaceID, targets)
+	filteredMap := make(map[string]string)
+	if card.Kind == DocsCardKindCommented {
+		// Ordinary "commented" cards are human-recipient notifications. Bot
+		// recipients are filtered independently of whether the separate
+		// doc_comment_mention event is enabled for this document.
+		botUIDs, err := spacepkg.GetBotUIDs(n.db, targets)
+		if err != nil {
+			return nil, fmt.Errorf("bot recipient lookup failed: %w", err)
+		}
+		humanTargets := make([]string, 0, len(targets))
+		for _, uid := range targets {
+			if botUIDs[uid] || spacepkg.IsSystemBot(uid) {
+				filteredMap[uid] = "bot_recipient"
+				continue
+			}
+			humanTargets = append(humanTargets, uid)
+		}
+		targets = humanTargets
+	}
+
+	members, memberFiltered, err := n.memberCache.verify(n.db, req.SpaceID, targets)
 	if err != nil {
 		return nil, fmt.Errorf("member verification failed: %w", err)
+	}
+	for uid, reason := range memberFiltered {
+		filteredMap[uid] = reason
 	}
 	if len(members) == 0 {
 		return &NotifyResp{Delivered: []string{}, Filtered: filteredMap}, nil

@@ -3,11 +3,13 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
@@ -377,6 +379,102 @@ func TestDeliverDocsCardNotification_NonMemberExcluded(t *testing.T) {
 	assert.Equal(t, "not_space_member", resp.Filtered["uid_stranger"])
 	assert.NotContains(t, resp.Delivered, "uid_stranger")
 	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "only the member gets a DM")
+}
+
+func TestDeliverDocsCardNotification_CommentedSkipsBotRecipients(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	db, mock, closeDB := newMockedDBSession(t)
+	defer closeDB()
+
+	mock.ExpectQuery(`SELECT uid FROM .*user.*robot=1`).
+		WillReturnRows(sqlmock.NewRows([]string{"uid"}).
+			AddRow("uid_bot").
+			AddRow("uid_bot_nonmember"))
+	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
+	n.docsSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "uid_human", "uid_bot")
+	card := validDocsCard()
+	card.Kind = DocsCardKindCommented
+
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+		SpaceID: "spc_1", Service: "docs-service", Targets: []string{"uid_human", "uid_bot", "uid_bot_nonmember", "uid_stranger"}, DocsCard: card,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"uid_human"}, resp.Delivered)
+	assert.Equal(t, "bot_recipient", resp.Filtered["uid_bot"])
+	assert.Equal(t, "bot_recipient", resp.Filtered["uid_bot_nonmember"], "bot classification takes precedence over membership")
+	assert.Equal(t, "not_space_member", resp.Filtered["uid_stranger"])
+	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "only the human gets the comment notification")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDeliverDocsCardNotification_CommentedSkipsSystemBotRecipient(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	n.docsSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "notification")
+	card := validDocsCard()
+	card.Kind = DocsCardKindCommented
+
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+		SpaceID: "spc_1", Service: "docs-service", Targets: []string{"notification"}, DocsCard: card,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, resp.Delivered)
+	assert.Equal(t, "bot_recipient", resp.Filtered["notification"])
+	assert.Zero(t, atomic.LoadInt32(&wk.messageCount), "system bots must not receive comment notifications")
+}
+
+func TestDeliverDocsCardNotification_SharedStillReachesBotRecipient(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	db, mock, closeDB := newMockedDBSession(t)
+	defer closeDB()
+	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
+	n.docsSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "uid_bot")
+
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+		SpaceID: "spc_1", Service: "docs-service", Targets: []string{"uid_bot"}, DocsCard: validDocsCard(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"uid_bot"}, resp.Delivered)
+	assert.Empty(t, resp.Filtered)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "non-comment docs notifications keep their existing behavior")
+	assert.NoError(t, mock.ExpectationsWereMet(), "shared notifications must not query recipient robot status")
+}
+
+func TestDeliverDocsCardNotification_CommentedBotLookupFailureFailsClosed(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	db, mock, closeDB := newMockedDBSession(t)
+	defer closeDB()
+
+	mock.ExpectQuery(`SELECT uid FROM .*user.*robot=1`).WillReturnError(errors.New("db unavailable"))
+	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
+	n.docsSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "uid_human")
+	card := validDocsCard()
+	card.Kind = DocsCardKindCommented
+
+	resp, err := n.deliverDocsCardNotification(context.Background(), &NotifyReq{
+		SpaceID: "spc_1", Service: "docs-service", Targets: []string{"uid_human"}, DocsCard: card,
+	})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "bot recipient lookup failed")
+	assert.Zero(t, atomic.LoadInt32(&wk.messageCount), "classification failure must not leak a comment notification")
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 // A newline embedded in a caller field must not inject a spoofed line into the

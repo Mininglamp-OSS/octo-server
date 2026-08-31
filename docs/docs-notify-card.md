@@ -221,8 +221,18 @@ Docs 链接不携带 `?sp=`。octo-web 的 standalone `/d/:docId` 打开链路�
 
 ## 7. 降级与错误分类
 
-与 summary 完全一致，见 `docs/summary-notify-card.md` §7。reason 词表：
+与 summary 完全一致，见 `docs/summary-notify-card.md` §7。通用 reason 词表：
 `not_space_member` / `target_denied` / `dispatch_failed` / `busy` / `send_failed`。
+
+`commented` 额外在投递前排除普通 Bot 和系统 Bot，并在 `filtered` 中标记
+`bot_recipient`。这是终态过滤，不应重试；其他 docs card kind 不做该过滤。
+该过滤先于 Space 成员校验，因此非成员 Bot 也返回 `bot_recipient`，而不是可重试的
+`not_space_member`。
+如果 Bot 身份查询失败，请求整体失败且零投递，避免把普通评论通知误发给 Bot。
+
+该过滤不依赖 `doc_comment_mention` 的 feature gate 或 allowlist。若专用事件未启用
+或文档不在 allowlist 中，Bot 仍不会回退收到普通评论通知；此时对 Bot 保持静默是
+有意行为。
 
 ## 8. 已知调优候选
 
