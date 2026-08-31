@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"errors"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -79,14 +80,46 @@ func (ba *BotAPI) botCreateThread(c *wkhttp.Context) {
 	var req struct {
 		Name            string `json:"name" binding:"required,max=100"`
 		SourceMessageID *int64 `json:"source_message_id"`
+		// OnBehalfOf — 复用 sendMessage 的 OBO 语义（YUJ-1166 / #81）。
+		// 人类经 bot 代建 thread 时携带触发者 UID：服务端校验 bot 当前被该 grantor
+		// 授权（active=1 AND global_enabled=1）且 grantor 对父群仍可读，通过后把
+		// CreatorUID 落成 grantor 而非 bot 自己，让 CreateThread 结尾的
+		// EnsureThreadFollowForCreator 无条件为「实际发起者」补关注（#739）。
+		// 缺省（bot 主动建，无人类触发者）时 CreatorUID 保持 robotID —— 关注者就是
+		// bot 自己，让 bot 能 loop 收到子区事件。
+		OnBehalfOf string `json:"on_behalf_of,omitempty"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "name")
 		return
 	}
 
-	creatorName := robotID
-	userResp, _ := ba.userService.GetUser(robotID)
+	// creatorUID 默认是 bot 自己；带 on_behalf_of 时收敛到 grantor（经 OBO 门校验）。
+	creatorUID := robotID
+	if obo := strings.TrimSpace(req.OnBehalfOf); obo != "" {
+		// 建 thread 是父群内的写操作，OBO 门按父群频道校验：bot 被 grantor 授权 +
+		// grantor 对父群仍可读（与 send.go 的第三方发送同一 checkOBO 谓词，TOCTOU 一致）。
+		// fail-closed：授权不足直接拒，绝不静默回退到 robotID —— 否则人类触发场景会
+		// 静默漏关注，正是本 issue 要根治的错位。
+		if err := ba.checkOBO(robotID, obo, groupNo, common.ChannelTypeGroup.Uint8()); err != nil {
+			if errors.Is(err, ErrOBONotAuthorized) {
+				ba.Warn("OBO denied on thread create: no active grant or grantor lost group access",
+					zap.String("bot", robotID),
+					zap.String("on_behalf_of", obo),
+					zap.String("groupNo", groupNo))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBONotAuthorized, nil, nil)
+				return
+			}
+			ba.Error("OBO check failed on thread create", zap.Error(err),
+				zap.String("bot", robotID), zap.String("on_behalf_of", obo))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
+			return
+		}
+		creatorUID = obo
+	}
+
+	creatorName := creatorUID
+	userResp, _ := ba.userService.GetUser(creatorUID)
 	if userResp != nil && userResp.Name != "" {
 		creatorName = userResp.Name
 	}
@@ -94,7 +127,7 @@ func (ba *BotAPI) botCreateThread(c *wkhttp.Context) {
 	resp, err := ba.threadService.CreateThread(&thread.CreateThreadReq{
 		GroupNo:         groupNo,
 		Name:            req.Name,
-		CreatorUID:      robotID,
+		CreatorUID:      creatorUID,
 		CreatorName:     creatorName,
 		SourceMessageID: req.SourceMessageID,
 	})
