@@ -400,6 +400,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
 			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 			DriveOn:                cn.systemSettings.DriveEnabled(),
+			DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
 			MailOn:                 cn.systemSettings.MailEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
@@ -456,6 +457,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
 		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 		DriveOn:                cn.systemSettings.DriveEnabled(),
+		DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
 		MailOn:                 cn.systemSettings.MailEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
@@ -886,6 +888,12 @@ type appConfigResp struct {
 	// 自身，本字段不承担任何鉴权。与 app_config.version 解耦的原因同 DocsOn：运维切展示
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DriveOn bool `json:"drive_on"`
+
+	// DriveSearchOn 告知客户端是否展示全局搜索的"网盘"tab。值来源于 system_setting
+	// drive.search_enabled；默认 false —— 与 drive_on 解耦，搜索端点由 octo-drive-search
+	// 独立提供，可晚于 drive 模块本体上线，上线+索引就绪后才放量。仅表达展示策略，鉴权
+	// 在 octo-drive-search 自身，本字段不承担鉴权。与 app_config.version 解耦的原因同 DriveOn。
+	DriveSearchOn bool `json:"drive_search_on"`
 
 	// MailOn 告知客户端是否展示 Agent Mail 模块入口。值来源于 system_setting
 	// mail.enabled，默认 false。该字段只表达展示策略，不替代 octo-server 网关及

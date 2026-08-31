@@ -1635,6 +1635,20 @@ func (s *SystemSettings) DriveEnabled() bool {
 	return s.getBool("drive", "enabled", false)
 }
 
+// DriveSearchEnabled reports whether clients should surface the "网盘" tab in
+// the global-search modal. Decoupled from DriveEnabled: the search endpoint is
+// provided independently by octo-drive-search and may land later than the
+// drive module itself, or roll out independently under its own gray-release
+// timeline. Display policy only — it neither grants nor enforces any
+// server-side authorization, which lives in octo-drive-search (VisibleSpaces
+// + VisibleDocs + baseFilters permission down-push). Default false so the tab
+// stays hidden until search is deployed, the index is populated, and the
+// admin flips drive.search_enabled for a controlled rollout. Value source:
+// system_setting drive.search_enabled (DB, hot-reloaded).
+func (s *SystemSettings) DriveSearchEnabled() bool {
+	return s.getBool("drive", "search_enabled", false)
+}
+
 // DmloopEnabled reports whether the Loop(回路)module entry should be shown to
 // clients. Default false — the loop feature (backend service + fleet proxy +
 // daemon runtimes) stays hidden until ops flips dmloop.enabled after those deps
