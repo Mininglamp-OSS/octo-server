@@ -294,6 +294,15 @@ var systemSettingSchema = []settingDef{
 	{Category: "drive", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示网盘(drive)模块入口（octo-drive 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveEnabled()) }},
 
+	// drive 全局搜索"网盘"tab 展示开关，与 drive.enabled 解耦：drive-search 后端
+	// 由独立的 octo-drive-search 服务提供，可晚于 drive 模块本体上线。默认关闭；
+	// 上线且索引灰度完成后由管理台切 drive.search_enabled 放量。仅表达展示策略，
+	// 不承担任何服务端鉴权（搜索鉴权在 octo-drive-search 自身：VisibleSpaces +
+	// VisibleDocs + baseFilters）。经 GET /v1/common/appconfig 的 drive_search_on
+	// 下发给客户端。
+	{Category: "drive", Key: "search_enabled", Type: settingTypeBool, Description: "是否向客户端展示全局搜索的\"网盘\"tab（与 drive.enabled 解耦；搜索端点上线+索引就绪前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DriveSearchEnabled()) }},
+
 	// Loop(回路)模块展示开关。loop 依赖后端服务 + fleet 代理 + daemon runtime 一整套,未就绪前
 	// 默认关闭;feature 分支合入 main 也不暴露,上线后由管理台切 dmloop.enabled 灰度放量。仅表达
 	// 展示策略,不承担服务端鉴权(/fleet 鉴权在后端)。经 GET /v1/common/appconfig 的 dmloop_on 下发给客户端。

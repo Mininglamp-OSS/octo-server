@@ -130,6 +130,23 @@ func setDocsSearchEnabledSetting(t *testing.T, ctx *config.Context, enabled bool
 	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 }
 
+// setDriveSearchEnabledSetting upserts system_setting drive.search_enabled and
+// reloads the shared snapshot. This is the appconfig-facing display toggle for
+// the global-search "网盘" tab, decoupled from drive.enabled (search endpoint
+// ships in octo-drive-search on its own timeline).
+func setDriveSearchEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("drive", "search_enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
 func TestAddVersion(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
@@ -936,6 +953,56 @@ func TestGetAppConfig_DocsSearchOn_OnVersionShortCircuit(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
+}
+
+// appconfig 必须下发 drive_search_on：值来源于 system_setting drive.search_enabled。
+// 默认 false，与 drive_on 解耦，客户端据此隐藏全局搜索的"网盘"tab（搜索端点就绪前）。
+func TestGetAppConfig_DriveSearchOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_search_on":false`)
+}
+
+// system_setting drive.search_enabled=true → appconfig 下发 true。与 drive.enabled 解耦：
+// 只开 drive.search_enabled 不开 drive.enabled 时，drive_search_on=true 而 drive_on=false。
+func TestGetAppConfig_DriveSearchOn_True_Independent(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDriveSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_search_on":true`)
+	assert.Contains(t, w.Body.String(), `"drive_on":false`)
+}
+
+// version 短路分支同样要下发 drive_search_on（展示开关与 app_config.version 解耦）。
+func TestGetAppConfig_DriveSearchOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDriveSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_search_on":true`)
 }
 
 // reloads the shared snapshot. Generic sibling of setDocsEnabledSetting for the
