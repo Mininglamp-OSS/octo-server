@@ -23,7 +23,7 @@ func TestBuildFileHits_FullFields(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleFileHit(doc, "", 0)
+	got := h.singleFileHit(doc, "", 0, nil)
 	if got.FileName != "report.pdf" {
 		t.Errorf("file_name: got %q", got.FileName)
 	}
@@ -69,11 +69,52 @@ func TestResolveFileExt_FallbackFromName(t *testing.T) {
 func TestSingleFileHit_NilPayload(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
 	doc := Doc{MessageID: 1, MessageSeq: 1, Timestamp: 100}
-	got := h.singleFileHit(doc, "", 0)
+	got := h.singleFileHit(doc, "", 0, nil)
 	if got.FileName != "" || got.DownloadURL != "" {
 		t.Errorf("nil payload should leave file fields empty: %+v", got)
 	}
 	if got.PreviewURL != nil {
 		t.Errorf("preview_url should remain nil")
+	}
+}
+
+func TestSingleFileHit_Highlights(t *testing.T) {
+	tp := payloadTypeFile
+	doc := Doc{
+		MessageID: 5, MessageSeq: 1, From: "u1", Timestamp: 1717000000,
+		Payload: &Payload{Type: &tp, File: &FilePayload{Name: "quarterly-report.pdf"}},
+	}
+	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
+
+	// Name matched: name_highlight carries the marked name; content_snippet empty.
+	nameOnly := h.singleFileHit(doc, "", 0, map[string][]string{
+		"payload.file.name": {"quarterly-<mark>report</mark>.pdf"},
+	})
+	if nameOnly.NameHighlight != "quarterly-<mark>report</mark>.pdf" {
+		t.Errorf("name_highlight: got %q", nameOnly.NameHighlight)
+	}
+	if nameOnly.ContentSnippet != "" {
+		t.Errorf("content_snippet should be empty when body didn't match, got %q", nameOnly.ContentSnippet)
+	}
+	// FileName always echoes the raw name so the client can fall back.
+	if nameOnly.FileName != "quarterly-report.pdf" {
+		t.Errorf("file_name should stay raw, got %q", nameOnly.FileName)
+	}
+
+	// Body-only match: content_snippet carries the marked fragment; name_highlight empty.
+	bodyOnly := h.singleFileHit(doc, "", 0, map[string][]string{
+		"payload.file.content": {"...annual <mark>revenue</mark> grew..."},
+	})
+	if bodyOnly.NameHighlight != "" {
+		t.Errorf("name_highlight should be empty for body-only hit, got %q", bodyOnly.NameHighlight)
+	}
+	if bodyOnly.ContentSnippet != "...annual <mark>revenue</mark> grew..." {
+		t.Errorf("content_snippet: got %q", bodyOnly.ContentSnippet)
+	}
+
+	// Browse path (nil highlight): both empty.
+	browse := h.singleFileHit(doc, "", 0, nil)
+	if browse.NameHighlight != "" || browse.ContentSnippet != "" {
+		t.Errorf("browse path should carry no highlight fields: %+v", browse)
 	}
 }

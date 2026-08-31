@@ -103,6 +103,9 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 			Size(size).
 			TrackTotalHits(false).
 			FetchSourceContext(fileContentSourceExcludes())
+		if req.Keyword != "" {
+			svc = svc.Highlight(buildSearchFilesHighlight())
+		}
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -227,7 +230,7 @@ func (h *Handler) buildGlobalFileHits(ctx context.Context, hits []*elastic.Searc
 			continue
 		}
 		wireID, wireType := wireChannelFromDoc(doc, loginUID)
-		items = append(items, h.singleFileHit(doc, wireID, wireType))
+		items = append(items, h.singleFileHit(doc, wireID, wireType, map[string][]string(hit.Highlight)))
 		senderIDs = append(senderIDs, doc.From)
 	}
 	if len(items) == 0 {
@@ -300,6 +303,9 @@ func (h *Handler) dispatchSingleFiles(c *wkhttp.Context, req SearchGlobalFilesRe
 			Size(size).
 			TrackTotalHits(false).
 			FetchSourceContext(fileContentSourceExcludes())
+		if req.Keyword != "" {
+			svc = svc.Highlight(buildSearchFilesHighlight())
+		}
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)

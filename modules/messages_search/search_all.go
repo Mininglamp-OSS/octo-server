@@ -259,7 +259,7 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) SearchAllHit {
 	entry := SearchAllHit{SortedAt: msToRFC3339(doc.Timestamp)}
 	if payloadType(doc.Payload) == payloadTypeFile {
-		fh := h.singleFileHit(doc, channelID, channelType)
+		fh := h.singleFileHit(doc, channelID, channelType, hl)
 		entry.ResultType = "file"
 		entry.File = &fh
 		entry.SortedAt = fh.SentAt

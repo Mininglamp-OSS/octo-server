@@ -38,6 +38,19 @@ type FileHit struct {
 	SentAt          string  `json:"sent_at"`
 	ChannelID       string  `json:"channel_id,omitempty"`
 	ChannelType     uint8   `json:"channel_type,omitempty"`
+
+	// NameHighlight is the file name with keyword matches wrapped in <mark>,
+	// taken from the OS highlight response (payload.file.name). Empty on the
+	// browse path (keyword="") or when the match came only from body/caption.
+	// The client renders this in place of FileName when present, otherwise
+	// falls back to client-side highlighting of FileName.
+	NameHighlight string `json:"name_highlight,omitempty"`
+	// ContentSnippet is a single <mark>-wrapped fragment of the Tika-extracted
+	// file body (payload.file.content) around the matched term. This is the
+	// only signal explaining WHY a body-only hit matched — the raw content is
+	// excluded from _source (30–100 KB), but the highlighter reconstructs the
+	// fragment from the inverted index. Empty when the body didn't match.
+	ContentSnippet string `json:"content_snippet,omitempty"`
 }
 
 func init() {
@@ -108,6 +121,9 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 			Size(size).
 			TrackTotalHits(false).
 			FetchSourceContext(fileContentSourceExcludes())
+		if req.Keyword != "" {
+			svc = svc.Highlight(buildSearchFilesHighlight())
+		}
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -176,7 +192,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 			h.Warn("messages_search: bad file _source skipped", zap.Error(err))
 			continue
 		}
-		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType))
+		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType, map[string][]string(hit.Highlight)))
 		senderIDs = append(senderIDs, doc.From)
 	}
 
@@ -199,7 +215,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 // via peerFromFakeChannelID; for group/thread the doc.ChannelID as-is.
 // Single-channel callers pass req.ChannelID / req.ChannelType so the response
 // mirrors the request.
-func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8) FileHit {
+func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) FileHit {
 	fp := filePayloadOf(doc.Payload)
 	fh := FileHit{
 		MessageID:   strconv.FormatInt(doc.MessageID, 10),
@@ -216,7 +232,54 @@ func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8) Fi
 		fh.FileExt = resolveFileExt(fp)
 		fh.DownloadURL = fp.URL
 	}
+	fh.NameHighlight = pickFileNameHighlight(hl)
+	fh.ContentSnippet = pickFileContentSnippet(hl)
 	return fh
+}
+
+// buildSearchFilesHighlight returns the highlight config for the file-search
+// endpoints. Two fields mirror the keyword multi_match clause: payload.file.name
+// (mapped onto NameHighlight, no fragmenting — the whole name is short) and
+// payload.file.content (a single 120-char fragment around the matched body term,
+// mapped onto ContentSnippet). caption is intentionally omitted: it is rarely
+// populated and adds a third precedence branch with no UI slot. Fragments are
+// drawn from the inverted index, so fileContentSourceExcludes (which drops the
+// raw body from _source) does not affect this — see dsl.go:fileContentSourceExcludes.
+func buildSearchFilesHighlight() *elastic.Highlight {
+	return elastic.NewHighlight().
+		PreTags("<mark>").PostTags("</mark>").
+		Fields(
+			// NumberOfFragments(0) returns the whole field with matches marked
+			// in-place — correct for a short file name where we want the full
+			// string, not a fragment window.
+			elastic.NewHighlighterField("payload.file.name").NumOfFragments(0),
+			elastic.NewHighlighterField("payload.file.content").FragmentSize(120).NumOfFragments(1),
+		)
+}
+
+// pickFileNameHighlight returns the marked file name fragment, or "" when the
+// name field didn't match (body-only hit or browse path).
+func pickFileNameHighlight(hl map[string][]string) string {
+	if hl == nil {
+		return ""
+	}
+	if frags, ok := hl["payload.file.name"]; ok && len(frags) > 0 && frags[0] != "" {
+		return frags[0]
+	}
+	return ""
+}
+
+// pickFileContentSnippet returns the marked body fragment, or "" when the body
+// didn't match. This is the "why did this file match" signal for hits whose
+// keyword only appears in the extracted content, not the name.
+func pickFileContentSnippet(hl map[string][]string) string {
+	if hl == nil {
+		return ""
+	}
+	if frags, ok := hl["payload.file.content"]; ok && len(frags) > 0 && frags[0] != "" {
+		return frags[0]
+	}
+	return ""
 }
 
 // resolveFileExt prefers the indexed payload.file.extension, which the indexer
