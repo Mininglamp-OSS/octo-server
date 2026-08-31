@@ -103,6 +103,10 @@ func (d *appBotDB) queryBotByUID(uid string) (*appBotModel, error) {
 }
 
 // queryBotsByScope queries App Bots by scope (and optional space_id) with pagination.
+// An empty scope means "every scope", which only the platform admin listing uses: it
+// lets a super admin see that a bot still exists after it moved into a space, instead
+// of the bot silently dropping out of the only list the console offers. Mutations are
+// unaffected — they keep going through botInRouteScope.
 func (d *appBotDB) queryBotsByScope(scope, spaceID string, pageIndex, pageSize int64, keyword string, status *int) ([]*appBotModel, int64, error) {
 	var bots []*appBotModel
 	var total int64
@@ -110,10 +114,13 @@ func (d *appBotDB) queryBotsByScope(scope, spaceID string, pageIndex, pageSize i
 	baseQuery := d.session.Select("*").From("app_bot")
 	countQuery := d.session.Select("count(*)").From("app_bot")
 
-	if scope == "space" && spaceID != "" {
+	switch {
+	case scope == "":
+		// no scope predicate
+	case scope == "space" && spaceID != "":
 		baseQuery = baseQuery.Where("scope=? AND space_id=?", scope, spaceID)
 		countQuery = countQuery.Where("scope=? AND space_id=?", scope, spaceID)
-	} else {
+	default:
 		baseQuery = baseQuery.Where("scope=?", scope)
 		countQuery = countQuery.Where("scope=?", scope)
 	}
@@ -148,13 +155,33 @@ func (d *appBotDB) queryBotsByScope(scope, spaceID string, pageIndex, pageSize i
 	return bots, total, err
 }
 
+// querySpaceNames resolves space_id -> name for the given ids, so a listing can name
+// the space a bot belongs to rather than showing a bare id. Unknown ids are simply absent.
+func (d *appBotDB) querySpaceNames(spaceIDs []string) (map[string]string, error) {
+	names := make(map[string]string, len(spaceIDs))
+	if len(spaceIDs) == 0 {
+		return names, nil
+	}
+	var rows []struct {
+		SpaceID string `db:"space_id"`
+		Name    string `db:"name"`
+	}
+	if _, err := d.session.Select("space_id", "name").From("space").
+		Where("space_id IN ?", spaceIDs).Load(&rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		names[row.SpaceID] = row.Name
+	}
+	return names, nil
+}
+
 // queryPublishedBots queries all published App Bots.
 func (d *appBotDB) queryPublishedBots() ([]*appBotModel, error) {
 	var bots []*appBotModel
 	_, err := d.session.Select("*").From("app_bot").Where("status=?", StatusPublished).Load(&bots)
 	return bots, err
 }
-
 
 // queryAvailableBots returns bots available to a given user (each scope capped at 100).
 func (d *appBotDB) queryAvailableBots(loginUID, spaceIDFilter string) ([]*appBotModel, error) {
