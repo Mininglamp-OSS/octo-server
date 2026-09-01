@@ -53,10 +53,11 @@ const masterKeyEnvConvE2E = "OCTO_MASTER_KEY"
 // with a mutable response slice keeps the URL stable and alive across all tests.
 // Tests run sequentially (no t.Parallel), so the shared slice needs no lock.
 var (
-	fakeIMOnce  sync.Once
-	fakeIMSrv   *httptest.Server
-	fakeIMConvs []*config.SyncUserConversationResp
-	fakeIMCMDs  []string
+	fakeIMOnce      sync.Once
+	fakeIMSrv       *httptest.Server
+	fakeIMConvs     []*config.SyncUserConversationResp
+	fakeIMCMDs      []string
+	fakeIMSyncCalls int
 )
 
 func sharedFakeIM() *httptest.Server {
@@ -64,6 +65,7 @@ func sharedFakeIM() *httptest.Server {
 		fakeIMSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if strings.HasSuffix(r.URL.Path, "/conversation/sync") {
+				fakeIMSyncCalls++
 				_, _ = w.Write([]byte(util.ToJson(fakeIMConvs)))
 				return
 			}
@@ -129,6 +131,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	// before any NewTestServer so the very first ctx already sees the live URL.
 	fakeIMConvs = convs
 	fakeIMCMDs = nil
+	fakeIMSyncCalls = 0
 	imURL := sharedFakeIM().URL
 
 	s, ctx := testutil.NewTestServer()

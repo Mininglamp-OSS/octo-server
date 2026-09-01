@@ -364,9 +364,11 @@ func TestBuildRecentItems_ManualUnreadIsScopedByChannelType(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv(channelID, common.ChannelTypeGroup.Uint8(), nowRecent()),
 		makeIMConv(channelID, common.ChannelTypePerson.Uint8(), nowRecent()),
+		makeIMConv(channelID, common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 	}
 	manualUnread := map[string]bool{
-		channelKey(channelID, common.ChannelTypePerson.Uint8()): true,
+		channelKey(channelID, common.ChannelTypePerson.Uint8()):         true,
+		channelKey(channelID, common.ChannelTypeCommunityTopic.Uint8()): true,
 	}
 	cutoffs := recentCutoffs{
 		group:  daysCutoff(time.Now(), 3),
@@ -376,14 +378,16 @@ func TestBuildRecentItems_ManualUnreadIsScopedByChannelType(t *testing.T) {
 
 	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", manualUnread)
 
-	require.Len(t, items, 2)
+	require.Len(t, items, 3)
 	manualUnreadByType := make(map[uint8]bool, len(items))
 	for _, item := range items {
 		manualUnreadByType[item.ChannelType] = item.ManualUnread
 	}
 	assert.False(t, manualUnreadByType[common.ChannelTypeGroup.Uint8()])
-	assert.True(t, manualUnreadByType[common.ChannelTypePerson.Uint8()],
-		"manual_unread 必须按 channel_id + channel_type 区分")
+	assert.False(t, manualUnreadByType[common.ChannelTypePerson.Uint8()],
+		"私聊即使存在遗留标志也不应返回 manual_unread=true")
+	assert.True(t, manualUnreadByType[common.ChannelTypeCommunityTopic.Uint8()],
+		"群聊与子区的 manual_unread 必须按 channel_type 区分")
 }
 
 func TestBuildRecentItems_PinnedFirst(t *testing.T) {

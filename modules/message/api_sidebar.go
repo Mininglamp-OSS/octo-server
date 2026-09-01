@@ -502,7 +502,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 	unreadMap := make(map[string]bool, len(unreadItems))
 	for _, it := range unreadItems {
-		unreadMap[channelKey(it.ChannelID, it.ChannelType)] = true
+		if supportsManualUnreadChannelType(it.ChannelType) {
+			unreadMap[channelKey(it.ChannelID, it.ChannelType)] = true
+		}
 	}
 	var items []*SidebarItem
 	switch req.Tab {
@@ -598,7 +600,8 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 		// 构建完 items 后统一回填
 		for _, item := range items {
-			item.ManualUnread = unreadMap[channelKey(item.ChannelID, item.ChannelType)]
+			item.ManualUnread = supportsManualUnreadChannelType(item.ChannelType) &&
+				unreadMap[channelKey(item.ChannelID, item.ChannelType)]
 		}
 	case "recent":
 		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
@@ -1316,7 +1319,8 @@ func buildRecentItems(
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
 		}
-		manualUnread := unreadMap[channelKey(conv.ChannelID, conv.ChannelType)]
+		manualUnread := supportsManualUnreadChannelType(conv.ChannelType) &&
+			unreadMap[channelKey(conv.ChannelID, conv.ChannelType)]
 		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
 		// manual_unread 仍会返回给客户端，但不再作为 Recent 活跃窗口的豁免条件。
 		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {

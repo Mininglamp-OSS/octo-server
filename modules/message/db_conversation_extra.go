@@ -1,6 +1,7 @@
 package message
 
 import (
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
@@ -44,7 +45,14 @@ func (c *conversationExtraDB) queryWithChannelIDs(uid string, channelIDs []strin
 }
 func (c *conversationExtraDB) queryManualUnread(uid string) ([]*conversationExtraModel, error) {
 	var models []*conversationExtraModel
-	_, err := c.session.Select("*").From("conversation_extra").Where("uid=? and manual_unread = ?", uid, 1).Load(&models)
+	_, err := c.session.Select("*").From("conversation_extra").
+		Where("uid=? and manual_unread=? and channel_type in (?,?)",
+			uid,
+			1,
+			common.ChannelTypeGroup.Uint8(),
+			common.ChannelTypeCommunityTopic.Uint8(),
+		).
+		Load(&models)
 	return models, err
 }
 

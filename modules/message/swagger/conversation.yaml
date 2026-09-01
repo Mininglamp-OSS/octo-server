@@ -202,7 +202,7 @@ paths:
         最后一条消息或会话列表。客户端应在本地保存本次返回结果中的最大 `version`，
         下次请求时作为游标传回。返回空数组时保持原游标不变。
 
-        `manual_unread` 是独立于真实 `unread` 的手动展示标识：
+        `manual_unread` 是独立于真实 `unread` 的手动展示标识，目前只对群聊和社区子区有效：
         - `true`：用户手动将该会话标记为未读；
         - `false`：该会话当前没有手动未读标识；
         - 它不会改变 `browse_to`、`keep_message_seq` 或 WuKongIM 的真实阅读位置。
@@ -246,13 +246,15 @@ paths:
         - "conversation"
       summary: "设置会话手动未读"
       description: |
-        将当前登录用户指定的会话设置为手动未读。
+        将当前登录用户指定的群聊或社区子区设置为手动未读。私聊暂不支持该功能，
+        `channel_type=1` 会按请求参数错误返回。
 
         该标识只属于当前用户，不会修改其他用户的会话状态，也不会修改 WuKongIM 的真实
-        未读数或阅读游标。服务端会先查询 WuKongIM 中当前用户的目标会话：
-        - 目标会话已有真实未读消息时，不重复创建手动未读标识，返回 `changed=false`；
-        - 目标会话已经是手动未读时，接口幂等返回 `changed=false`；
-        - 只有真实未读为 0 且尚未手动未读时，才会写入 `manual_unread=true`。
+        未读数或阅读游标。服务端不会查询 WuKongIM 的会话或真实未读状态：即使目标会话
+        已有真实未读消息，也可以同时设置 `manual_unread=true`。
+
+        目标会话已经是手动未读时，接口幂等返回 `changed=false`；否则写入
+        `manual_unread=true` 并返回 `changed=true`。
 
         设置成功后，服务端会更新 `conversation_extra.version`，并向当前用户的个人频道
         发送 `CMDSyncConversationExtra`，通知其他在线设备调用 `/conversation/extra/sync`。
@@ -270,11 +272,11 @@ paths:
             $ref: "#/definitions/manualUnreadRequest"
       responses:
         200:
-          description: "设置结果；已是真实未读或手动未读时也返回 200，使用 changed/reason 判断是否发生变化"
+          description: "设置结果；已经是手动未读时也返回 200，使用 changed/reason 判断是否发生变化"
           schema:
             $ref: "#/definitions/setManualUnreadResponse"
         400:
-          description: "请求参数或会话查询错误"
+          description: "请求参数或会话扩展查询错误"
           schema:
             $ref: "#/definitions/response"
       security:
@@ -285,7 +287,8 @@ paths:
         - "conversation"
       summary: "清除会话手动未读"
       description: |
-        仅清除当前登录用户指定会话的 `manual_unread` 标识。
+        仅清除当前登录用户指定群聊或社区子区的 `manual_unread` 标识。私聊暂不支持
+        该功能，`channel_type=1` 会按请求参数错误返回。
 
         该接口不会调用 WuKongIM 的 `clearUnread`，因此不会修改真实未读数量、阅读游标或
         消息拉取位置。接口适用于用户进入会话后，前端确认当前页面不需要继续显示手动未读
@@ -324,10 +327,11 @@ paths:
       description: |
         清除或更新当前登录用户在 WuKongIM 中的真实未读状态。
 
-        当前服务端实现中，只要该请求本身有效并且目标会话存在手动未读标识，处理成功后
-        也会一并清除该用户的 `manual_unread`，然后发送会话扩展同步通知。因此：
+        当前服务端实现中，只要群聊或子区请求本身有效并且目标会话存在手动未读标识，
+        处理成功后也会一并清除该用户的 `manual_unread`，然后发送会话扩展同步通知。因此：
         - `unread=0`：清除真实未读，同时清除手动未读；
         - `unread>0`：按 WuKongIM 语义设置/保留真实未读，同时也清除手动未读；
+        - 私聊：只处理 WuKongIM 真实未读，不查询或修改手动未读标识；
         - 如果前端只想清除手动未读而保留真实未读，应调用 `/conversation/clearManualUnread`。
 
         该接口不会清除其他用户的状态。
@@ -494,7 +498,7 @@ definitions:
         description: "会话扩展全局同步版本"
       manual_unread:
         type: boolean
-        description: "是否被当前用户手动标记为未读；不代表 unread 消息数量"
+        description: "群聊或子区是否被当前用户手动标记为未读；私聊固定为 false，不代表 unread 消息数量"
   manualUnreadRequest:
     type: "object"
     required:
@@ -508,8 +512,8 @@ definitions:
       channel_type:
         type: integer
         format: uint8
-        enum: [1, 2, 5]
-        description: "频道类型：1=单聊，2=群聊，5=社区子区"
+        enum: [2, 5]
+        description: "频道类型：2=群聊，5=社区子区；暂不支持私聊"
   setManualUnreadResponse:
     type: "object"
     properties:
@@ -532,8 +536,8 @@ definitions:
         description: "状态发生变化时生成的会话扩展版本；未变化时省略"
       reason:
         type: string
-        enum: [already_unread, already_manual_unread]
-        description: "changed=false 时的原因；真实未读已存在或已经是手动未读"
+        enum: [already_manual_unread]
+        description: "changed=false 时的原因：会话已经是手动未读"
   clearManualUnreadResponse:
     type: "object"
     properties:

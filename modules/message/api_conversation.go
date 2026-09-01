@@ -1283,30 +1283,33 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
-	// 任何有效的 clearUnread 操作都会清除当前会话的手动未读标识。
+	// 群聊和子区的任何有效 clearUnread 操作都会清除当前会话的手动未读标识。
 	// 这里不仅包括 unread=0 的真实未读清零，也包括前端用 unread>0
 	// 设置/保留真实未读数量的显式操作；后者同样代表用户重新定义了该会话的
-	// 未读状态，不应继续保留旧的 manual_unread 标识。
-	extra, queryErr := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
-	if queryErr != nil {
-		co.Error("查询会话手动未读状态失败！", zap.Error(queryErr))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-		return
-	}
+	// 未读状态，不应继续保留旧的 manual_unread 标识。私聊暂不支持手动未读，
+	// 因此只处理 WuKongIM 的真实未读，不读写 conversation_extra.manual_unread。
 	manualUnreadCleared := false
-	if extra != nil && extra.ManualUnread {
-		version, seqErr := co.ctx.GenSeq(common.SyncConversationExtraKey)
-		if seqErr != nil {
-			co.Error("生成会话扩展序列号失败！", zap.Error(seqErr))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+	if supportsManualUnreadChannelType(req.ChannelType) {
+		extra, queryErr := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
+		if queryErr != nil {
+			co.Error("查询会话手动未读状态失败！", zap.Error(queryErr))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
-		if storeErr := co.conversationExtraDB.clearManualUnread(loginUID, req.ChannelID, req.ChannelType, version); storeErr != nil {
-			co.Error("清除会话手动未读状态失败！", zap.Error(storeErr))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
+		if extra != nil && extra.ManualUnread {
+			version, seqErr := co.ctx.GenSeq(common.SyncConversationExtraKey)
+			if seqErr != nil {
+				co.Error("生成会话扩展序列号失败！", zap.Error(seqErr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+				return
+			}
+			if storeErr := co.conversationExtraDB.clearManualUnread(loginUID, req.ChannelID, req.ChannelType, version); storeErr != nil {
+				co.Error("清除会话手动未读状态失败！", zap.Error(storeErr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+				return
+			}
+			manualUnreadCleared = true
 		}
-		manualUnreadCleared = true
 	}
 
 	// manual_unread 由数据库更新后，必须单独通知客户端同步会话扩展。
@@ -1453,7 +1456,7 @@ func newConversationExtraResp(m *conversationExtraModel) *conversationExtraResp 
 		KeepOffsetY:    m.KeepOffsetY,
 		Draft:          m.Draft,
 		Version:        m.Version,
-		ManualUnread:   m.ManualUnread,
+		ManualUnread:   supportsManualUnreadChannelType(m.ChannelType) && m.ManualUnread,
 	}
 }
 
@@ -1880,6 +1883,12 @@ func (co *Conversation) enrichConversationExternalMarkers(resps []*SyncUserConve
 		applyExternalMarkers(resp.Recents, markers)
 	}
 }
+
+func supportsManualUnreadChannelType(channelType uint8) bool {
+	return channelType == common.ChannelTypeGroup.Uint8() ||
+		channelType == common.ChannelTypeCommunityTopic.Uint8()
+}
+
 func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
 	var req setManualUnreadReq
@@ -1892,48 +1901,14 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
-	// Manual state is scoped to the authenticated user's exact
-	// (uid, channel_id, channel_type) row. Membership is intentionally not
-	// checked, so stale state can be cleared after leaving a group or topic.
-	switch req.ChannelType {
-	case common.ChannelTypePerson.Uint8():
-	case common.ChannelTypeGroup.Uint8():
-	case common.ChannelTypeCommunityTopic.Uint8():
-	default:
+	// 手动未读当前只支持群聊和子区。私聊的物理会话跨 Space 共享，在完成
+	// Space 级状态建模前不能安全复用全局 conversation_extra 标志。
+	if !supportsManualUnreadChannelType(req.ChannelType) {
 		respondMessageRequestInvalid(c, "channel_type")
 		return
 	}
-
-	// WuKongIM v2.2.4 已移除 GET /conversations，要求使用
-	// POST /conversation/sync。这里不是普通的客户端增量同步，而是为了
-	// 判断目标会话当前是否已经存在正常未读，因此必须使用一次不带游标的
-	// 当前状态查询：
-	//   - version=0：避免客户端游标把目标会话过滤掉；
-	//   - msgCount=1：让 WuKongIM 构造会话返回并计算 Unread；
-	//   - lastMsgSeqs=""：避免客户端已保存的频道序号过滤掉目标会话。
-	// 该参数组合也与项目中其它需要读取完整最近会话的调用保持一致。
-	conversations, err := co.ctx.IMSyncUserConversation(loginUID, 0, 1, "", nil)
-	if err != nil {
-		co.Error("获取当前用户会话失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-		return
-	}
-
-	var currentConversation *config.SyncUserConversationResp
-	for _, conversation := range conversations {
-		if conversation == nil {
-			continue
-		}
-		if conversation.ChannelID == req.ChannelID && conversation.ChannelType == req.ChannelType {
-			currentConversation = conversation
-			break
-		}
-	}
-	if currentConversation == nil {
-		co.Error("当前用户没有目标会话", zap.String("uid", loginUID), zap.String("channelID", req.ChannelID), zap.Uint8("channelType", req.ChannelType))
-		httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
-		return
-	}
+	// 状态仍只属于当前登录用户的精确频道行；沿用既定产品语义，不要求
+	// 当前仍是群或父群成员，以便用户离开频道后也能清理遗留标志。
 
 	extra, err := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
 	if err != nil {
@@ -1942,18 +1917,13 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 		return
 	}
 
-	manualUnread := extra != nil && extra.ManualUnread
-	if currentConversation.Unread > 0 || manualUnread {
-		reason := "already_unread"
-		if manualUnread {
-			reason = "already_manual_unread"
-		}
+	if extra != nil && extra.ManualUnread {
 		c.Response(setManualUnreadResp{
 			ChannelID:    req.ChannelID,
 			ChannelType:  req.ChannelType,
-			ManualUnread: manualUnread,
+			ManualUnread: true,
 			Changed:      false,
-			Reason:       reason,
+			Reason:       "already_manual_unread",
 		})
 		return
 	}
@@ -2006,15 +1976,12 @@ func (co *Conversation) clearManualUnread(c *wkhttp.Context) {
 		return
 	}
 
-	switch req.ChannelType {
-	case common.ChannelTypePerson.Uint8(), common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8():
-		// Manual state is scoped to the authenticated user's exact
-		// (uid, channel_id, channel_type) row. Membership is intentionally not
-		// checked so stale state can be cleared after leaving a channel.
-	default:
+	// 与 setManualUnread 保持同一协议边界：只允许群聊和子区。
+	if !supportsManualUnreadChannelType(req.ChannelType) {
 		respondMessageRequestInvalid(c, "channel_type")
 		return
 	}
+	// 不做当前成员校验，避免用户离开群或子区后无法清理自己的遗留状态。
 
 	extra, err := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
 	if err != nil {
