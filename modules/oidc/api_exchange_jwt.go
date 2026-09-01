@@ -1,0 +1,179 @@
+package oidc
+
+// api_exchange_jwt.go — POST /v1/auth/oidc/<id>/exchange-jwt
+//
+// non-browser client (native app)完成 SSO 后拿到的是 客户端业务后端自签的
+// HS256 JWT(不是上游 OIDC access_token,也不是我方 session)。本端点做本地 HS256
+// 验签 + 过期校验,成功后签发我方 session token。
+//
+// 与 /exchange(上游 OIDC access_token → IdP /userinfo → 身份)的区别:
+//   - 本端点不外呼,纯本地计算,性能/可靠性不依赖 IdP;
+//   - issuer 使用独立命名空间(上游 issuer + "#bearer-jwt" 后缀),
+//     与上游 OIDC flow 的 identity 行互不干扰;
+//   - subject 是 客户端 userId 数字转字符串(不是上游 IdP sub);
+//   - 不携带 email/phone/verified 字段,AutoLink 天然 fail-closed。
+//
+// 为什么不用同一个 /exchange 端点自动识别:形态自动路由会在日志/监控里把两种
+// 完全不同的身份来源混在一起,排错困难;且一旦识别错误(比如有人塞一个长得
+// 像 JWT 的上游 OIDC access_token),可能误把 token 当 bearer JWT 解(HS256 对任意
+// 输入都能"算出"一个 MAC,只是不会通过正确密钥的校验),属于无端扩大攻击面。
+// 分成两个端点,配置/限流/metric label/审计字段都独立,边界清晰。
+
+import (
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"go.uber.org/zap"
+)
+
+// exchangeJWTRequest 与 /exchange 同形,字段名都叫 access_token(客户端不需要
+// 区分底层是哪种 token,只管把本地存的 accessToken POST 过来即可)。
+type exchangeJWTRequest struct {
+	AccessToken string `json:"access_token"`
+	DeviceFlag  *uint8 `json:"flag,omitempty"`
+}
+
+// exchangeJWT POST /v1/auth/oidc/<id>/exchange-jwt
+//
+// 入: {access_token: "<客户端 HS256 JWT>", flag?: uint8}
+// 出: 200 {status:"ok", uid, login_resp}
+//
+//	| 400 请求格式错/空 token
+//	| 401 验签失败/过期/claims 非法(反枚举:统一返同一个码)
+//	| 500 密钥未配置(启动期配置错误,不给攻击者探测面)
+//
+// 反枚举与 /exchange 保持一致:任何无法确立身份的失败都返 401 同一个错误码,
+// 具体原因只进 zap 日志。客户端看到 401 应重新走 SSO。
+func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
+	metricBearerExchangeTotal.Inc()
+
+	// service 在 Init() 里构造且以 o.provider!=nil 为前置;运维配置错误导致
+	// provider 构造失败(Discovery 不通/BaseURL 错)时 o.provider==o.service==nil,
+	// 此时任何登录路径都无法工作,返回明确的 500 而不是 nil panic。
+	if o.provider == nil || o.service == nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc provider not initialized"))
+		return
+	}
+
+	// 配置缺失是运维错误,500 而非 401:区别"客户端给了坏 token" vs "我们自己没配好"。
+	if len(o.bearerJWTSecret) == 0 || o.bearerJWTIssuer == "" {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("bearer jwt not configured"))
+		return
+	}
+
+	var req exchangeJWTRequest
+	// 复用 /exchange 的 body 上限(16KB):JWT 通常 <2KB,留出 flag 字段裕量。
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, exchangeMaxBodyBytes)
+	if err := c.BindJSON(&req); err != nil {
+		metricBearerExchangeResult.WithLabelValues("bad_request").Inc()
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeRequestInvalid, nil, nil)
+		return
+	}
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	if req.AccessToken == "" {
+		metricBearerExchangeResult.WithLabelValues("bad_request").Inc()
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeRequestInvalid, nil, nil)
+		return
+	}
+
+	deviceFlag := exchangeDefaultDeviceFlag
+	if req.DeviceFlag != nil {
+		deviceFlag = *req.DeviceFlag
+	}
+	clientIP := wkhttp.ClientIP(c.Request)
+	traceID := newTraceID()
+	sd := &StateData{IP: clientIP, DeviceFlag: deviceFlag}
+
+	// 本地验签:HS256 + exp + userId>0。不外呼。
+	//
+	// 全部校验收在 verifyBearerJWT 一处(它内部调通用 VerifyHS256JWT 再追加
+	// userId>0 这条本路径约束)。handler 不重复实现任何一条 —— 双写过的话,
+	// 改一处漏另一处就是一个静默放行 userId=0 的洞,且 bearer_jwt_test.go
+	// 的用例会变成只覆盖不上生产的副本。
+	//
+	// 失败原因(签名/过期/格式 vs userId 缺失)由 err 携带,进日志区分;
+	// 对客户端一律回同一个 401 码,不做失败原因枚举(anti-enumeration)。
+	claims, err := verifyBearerJWT(req.AccessToken, o.bearerJWTSecret, time.Now())
+	if err != nil {
+		metricBearerExchangeResult.WithLabelValues("token_rejected").Inc()
+		o.Warn("OIDC exchange-jwt: token rejected",
+			zap.String("trace_id", traceID), zap.String("ip", clientIP), zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
+
+	// 转换为协议中立 IdentityClaims,issuer 从配置注入(不来自 token)。
+	ic := claims.toIdentityClaims(o.bearerJWTIssuer)
+
+	res, err := o.service.ResolveOrLink(c.Request.Context(), ic)
+	if err != nil {
+		metricBearerExchangeResult.WithLabelValues("resolve_fail").Inc()
+		o.Warn("OIDC exchange-jwt: resolve failed",
+			zap.String("trace_id", traceID), zap.String("ip", clientIP),
+			zap.String("sub", subHash(ic.Subject)), zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
+
+	// bearer JWT 不携带 email/phone,直接按空值处理(extractZone/extractPhone 对空串返回空)。
+	issueReq := IssueSessionReq{
+		UID:              res.UID,
+		CreateUser:       res.IsNew,
+		Name:             ic.Name,
+		DeviceFlag:       deviceFlag,
+		PublicIP:         clientIP,
+		TrustedSSOCreate: res.IsNew,
+	}
+	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
+	if err != nil {
+		metricBearerExchangeResult.WithLabelValues("issue_fail").Inc()
+		o.Error("OIDC exchange-jwt: issue session failed",
+			zap.String("trace_id", traceID), zap.String("ip", clientIP),
+			zap.String("sub", subHash(ic.Subject)), zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
+
+	if res.IsNew && sessResp.UID != "" {
+		if err := o.store.Insert(&IdentityModel{
+			UID:           sessResp.UID,
+			Issuer:        ic.Issuer,
+			Subject:       ic.Subject,
+			Email:         ic.Email,
+			EmailVerified: boolToInt(ic.EmailVerified),
+			Phone:         ic.PhoneNumber,
+			PhoneVerified: boolToInt(ic.PhoneVerified),
+			LinkedAt:      time.Now(),
+		}); err != nil {
+			if isDuplicateKeyError(err) {
+				if recovered := o.recoverFromIdentityRace(c.Request.Context(), ic, sd, sessResp, issueReq, err); recovered == nil {
+					metricBearerExchangeResult.WithLabelValues("identity_insert_fail").Inc()
+					o.writeAudit(sessResp.UID, EventBearerExchangeFail, sd, "identity insert race unrecovered")
+					httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+					return
+				}
+				metricBearerExchangeResult.WithLabelValues("race_recovered").Inc()
+			} else {
+				metricBearerExchangeResult.WithLabelValues("identity_insert_fail").Inc()
+				o.Error("OIDC exchange-jwt: insert identity failed",
+					zap.String("trace_id", traceID), zap.Error(err))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+				return
+			}
+		}
+	}
+
+	// audit 用 domainAccount(人类可读)便于对账,不用 userId(数字串无意义)。
+	o.writeAudit(sessResp.UID, EventBearerExchangeOK, sd, claims.DomainAccount)
+	metricBearerExchangeResult.WithLabelValues("ok").Inc()
+
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"status":     "ok",
+		"uid":        sessResp.UID,
+		"login_resp": sessResp.LoginRespJSON,
+	})
+}

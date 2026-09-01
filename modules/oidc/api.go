@@ -119,6 +119,13 @@ type OIDC struct {
 	// 不关会泄漏。
 	bindStore BindStore
 
+	// bearerJWTSecret / bearerJWTIssuer 端 客户端自签 HS256 JWT 验签配置。
+	// 密钥为空时 /exchange-jwt 端点直接返 500(配置错误),不 panic 不静默放行。
+	// issuer 独立于上游 issuer 命名空间,避免(基于 客户端 userId)与上游 OIDC flow
+	// (基于 IdP sub)的身份键空间互相污染。
+	bearerJWTSecret []byte
+	bearerJWTIssuer string
+
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
 	//
@@ -126,6 +133,14 @@ type OIDC struct {
 	// fake,和已有 fakeUserLookup / fakeIdentityStore 的风格一致。nil 时 callback
 	// 不会尝试写库,等价于该 IdP 没返 identity_verification scope(fail-open,不阻断登录)。
 	verification verificationUpserter
+
+	// provider 上游身份提供方的协议适配器。抽象层把标准 OIDC 和 plain-OAuth2
+	// 的协议细节(Discovery/id_token 验签/JWKS vs 不透明 access_token+私有信封)
+	// 隔离在本字段之后,handler 只调用 Identity/AuthCodeURL/Exchange/LogoutURL
+	// 与读 Capabilities,不按 Kind 分叉。
+	//
+	// 为 nil 代表初始化失败(如 Discovery 不通),handler 入口 fail-fast 返 500。
+	provider AuthProvider
 }
 
 // verificationUpserter OIDC callback 写 user_verification 的最小依赖接口。
@@ -171,29 +186,81 @@ func New(ctx *config.Context) *OIDC {
 
 	cctx, cancel := context.WithTimeout(context.Background(), cfg.Provider.HTTPTimeout)
 	defer cancel()
-	client, cerr := NewClient(cctx, ClientConfig{
-		Issuer:       cfg.Provider.Issuer,
-		ClientID:     cfg.Provider.ClientID,
-		ClientSecret: cfg.Provider.ClientSecret,
-		RedirectURI:  cfg.Provider.RedirectURI,
-		Scopes:       cfg.Provider.Scopes,
-		HTTPTimeout:  cfg.Provider.HTTPTimeout,
-		ClockSkew:    cfg.Provider.ClockSkew,
-	})
-	if cerr != nil {
-		o.Error("OIDC Discovery 失败,handlers 将返回 500", zap.Error(cerr))
-		_ = o.Close()
-		o.stateStore = nil
-		return o
+
+	// 按 Kind 构造 AuthProvider。两个实现走不同的初始化路径:
+	//   - KindOIDC   需要 Discovery → JWKS → 验签;先走原来的 NewClient,再包一层。
+	//   - KindOAuth2 无 Discovery、无 id_token;直接从配置拼端点,跳过 OIDC client 构造。
+	//
+	// 原有 o.client 字段保留给尚未迁移到 provider 抽象的 authorize/callback/logout
+	// 路径使用(一旦那些 handler 迁完,o.client 可删)。
+	switch cfg.Provider.Kind {
+	case KindOAuth2:
+		prov, perr := newOAuth2Provider(oauth2ProviderConfig{
+			Issuer:                cfg.Provider.Issuer,
+			BaseURL:               cfg.Provider.BaseURL,
+			ClientID:              cfg.Provider.ClientID,
+			ClientSecret:          cfg.Provider.ClientSecret,
+			RedirectURI:           cfg.Provider.RedirectURI,
+			Scopes:                cfg.Provider.Scopes,
+			AppID:                 cfg.Provider.AppID,
+			PostLogoutRedirectURI: cfg.Provider.PostLogoutRedirectURI,
+		})
+		if perr != nil {
+			o.Error("OAuth2 provider 构造失败,handlers 将返回 500", zap.Error(perr))
+			_ = o.Close()
+			o.stateStore = nil
+			return o
+		}
+		o.provider = prov
+	default:
+		// KindOIDC(含存量未配 KIND 的部署):走原来的 Discovery + 包装路径。
+		client, cerr := NewClient(cctx, ClientConfig{
+			Issuer:       cfg.Provider.Issuer,
+			ClientID:     cfg.Provider.ClientID,
+			ClientSecret: cfg.Provider.ClientSecret,
+			RedirectURI:  cfg.Provider.RedirectURI,
+			Scopes:       cfg.Provider.Scopes,
+			HTTPTimeout:  cfg.Provider.HTTPTimeout,
+			ClockSkew:    cfg.Provider.ClockSkew,
+		})
+		if cerr != nil {
+			o.Error("OIDC Discovery 失败,handlers 将返回 500", zap.Error(cerr))
+			_ = o.Close()
+			o.stateStore = nil
+			return o
+		}
+		o.client = client
+		oidcProv, perr := newOIDCProvider(oidcProviderConfig{
+			Client:                client,
+			Scopes:                cfg.Provider.Scopes,
+			PostLogoutRedirectURI: cfg.Provider.PostLogoutRedirectURI,
+			EndSessionURLOverride: cfg.Provider.EndSessionURL,
+			OnWarn: func(msg string, err error) {
+				o.Warn(msg, zap.Error(err))
+			},
+		})
+		if perr != nil {
+			o.Error("OIDC provider 包装失败,handlers 将返回 500", zap.Error(perr))
+			_ = o.Close()
+			o.stateStore = nil
+			return o
+		}
+		o.provider = oidcProv
 	}
-	o.client = client
+
 	// id_token 缓存(RP-Initiated Logout)仅在功能"确实可用"时启用:既配了回跳地址
 	// (PostLogoutRedirectURI),又拿得到*合法 https* 的 end_session 端点(discovery 或
 	// override)。端点仅"非空"不够 —— 非法/非 https 端点下 logout 也出不了 URL
 	// (buildEndSessionURL 会拒),此时建池存 PII id_token 纯属浪费。放在 client 之后才能判
 	// 端点可用性。密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
 	if cfg.Provider.PostLogoutRedirectURI != "" {
-		endpoint := o.endSessionEndpoint()
+		// id_token 缓存只对标准 OIDC 有意义(OAuth2 无 id_token,LogoutURL 走 SLO
+		// appId 路径,不需要缓存 id_token)。端点可用性判断已下沉到 oidcProvider,
+		// 这里按类型取出;非 OIDC provider 断言失败 → endpoint 空 → 走禁用分支。
+		endpoint := ""
+		if op, ok := o.provider.(*oidcProvider); ok {
+			endpoint = op.endSessionEndpoint()
+		}
 		switch {
 		case endpoint == "" || validateLogoutURL("end_session_endpoint", endpoint) != nil:
 			// 配了回跳地址却拿不到可用端点:打 Info 让运维可见"为什么 RP-logout 没生效"。
@@ -207,6 +274,25 @@ func New(ctx *config.Context) *OIDC {
 			}
 		}
 	}
+
+	// bearer JWT(HS256)验签配置。secret 为空时 /exchange-jwt 直接返 500,
+	// 不 panic 不静默放行 —— 允许"上游 OIDC flow 开、bearer JWT 不接"的部署形态。
+	// issuer 由已配置的上游 issuer 派生(见 bearerJWTIssuerFromUpstream),不额外要
+	// 一个环境标识 env:上游 issuer 本身每环境一个值且必填,派生值因此天然做到
+	// 测试/生产隔离。也不允许运维自由指定 —— 这个值一旦上线不可改,给 open string
+	// 就是给误配留口子。
+	if sec := strings.TrimSpace(getString("OCTO_OIDC_BEARER_JWT_SECRET", "")); sec != "" {
+		iss, ierr := bearerJWTIssuerFromUpstream(cfg.Provider.Issuer)
+		if ierr != nil {
+			o.Error("bearer JWT config invalid, disabling /exchange-jwt", zap.Error(ierr))
+		} else {
+			o.bearerJWTSecret = []byte(sec)
+			o.bearerJWTIssuer = iss
+			o.Info("bearer JWT /exchange-jwt enabled",
+				zap.String("issuer", iss), zap.Int("secret_bytes", len(o.bearerJWTSecret)))
+		}
+	}
+
 	return o
 }
 
@@ -216,9 +302,10 @@ func (o *OIDC) Init() error {
 	if o.cfg == nil || !o.cfg.Enabled {
 		return nil
 	}
-	// Discovery 失败时 client=nil,handler 入口已 fail-fast 返 500,
-	// 此处构造 service 也用不到,直接早返回省一次跨模块查询。
-	if o.client == nil {
+	// provider 构造失败(Discovery 失败 / oauth2 provider 配置错)时 provider=nil,
+	// handler 入口已 fail-fast 返 500,此处构造 service 也用不到,直接早返回省一次
+	// 跨模块查询。
+	if o.provider == nil {
 		return nil
 	}
 	raw := register.GetService("user")
@@ -254,21 +341,24 @@ func (o *OIDC) Init() error {
 		o.bind.users = o.service.users
 	}
 
-	// SyncWorker:Aegis 侧账号状态变更(封号/改密/登出)→ DMWork 主动感知。
-	// Interval=0 视为禁用,适合本地开发 / DB 还没准备好 RT 行的早期阶段。
-	if o.cfg.Provider.SyncInterval > 0 && o.db != nil && o.killer != nil {
+	// SyncWorker:IdP 侧账号状态变更(封号/改密/登出)→ DMWork 主动感知。
+	// Interval=0 视为禁用(KindOAuth2 下 config 强制 SyncInterval=0:无 refresh
+	// 端点,继续跑只会空转,且现有代码里 InsertRefresh 无生产调用者,RT 表恒空);
+	// RefreshToken capability 也为 false 的 provider 直接跳过 worker 构造。
+	if o.cfg.Provider.SyncInterval > 0 && o.db != nil && o.killer != nil &&
+		o.provider.Capabilities().RefreshToken && o.client != nil {
 		enc, err := NewEncryptor(o.cfg.Provider.RefreshTokenEncryptionKey)
 		if err != nil {
 			return fmt.Errorf("oidc: Init: encryptor: %w", err)
 		}
-		// 注入 Redis tick lock:多实例同 tick 只一个跑,IdP 流量降到 1/N。
+		// 注入 Redis tick lock:多实例同 tick 只一个跑。
 		o.tickLock = newRedisTickLock(o.ctx)
 		o.worker = NewSyncWorker(SyncWorkerConfig{
 			Interval:    o.cfg.Provider.SyncInterval,
 			Concurrency: o.cfg.Provider.SyncConcurrency,
 		}, o.db, enc, clientRefresher{c: o.client}, o.killer, o.audit, o.tickLock)
 		// YUJ-405:RT 轮转成功后用新 access_token 调 /userinfo 同步实名 claims。
-		// 覆盖所有 OIDC 登录过的用户,最多 SyncInterval 延迟感知 Aegis 侧实名变化。
+		// 覆盖所有 OIDC 登录过的用户,最多 SyncInterval 延迟感知 IdP 侧实名变化。
 		// ui/verif 同时就位:o.client 已完成 Discovery,userSvc 已确认实现 IService。
 		o.worker.WithVerificationSync(o.client, userSvc)
 		o.worker.Start(context.Background())
@@ -305,20 +395,35 @@ func (o *OIDC) routeAt(r *wkhttp.WKHttp, pathID string) {
 	base := "/v1/auth/oidc/" + pathID
 	pub := r.Group(base)
 	if o.cfg == nil || !o.cfg.Enabled {
-		// disabled 路径三个端点都返 404,所以 logout 挂在 pub 而非 authed 没有
-		// 安全影响 —— 不挂 AuthMiddleware 反而避免在 OIDC 关闭时给 /logout 引入
-		// 跨模块的 token 校验依赖,行为更"完全关闭"。
 		pub.GET("/authorize", o.disabled)
 		pub.GET("/callback", o.disabled)
 		pub.POST("/logout", o.disabled)
+		pub.POST("/exchange", o.disabled)
+		pub.POST("/exchange-jwt", o.disabled)
 		return
 	}
+	// 未认证敏感端点必须挂 StrictIPRateLimitMiddleware(见 CLAUDE.md 规范 + bot_api 的
+	// main_test 守卫)。exchange/exchange-jwt 是登录等价端点,每请求分别触发出站
+	// HTTP(IdP /userinfo)或 DB 写(Redis/MySQL),只靠全局 500rps/1000burst 桶太宽。
+	// 参数写死 2rps/10burst,与 user 模块的 login/register/sms 同惯例(那批端点
+	// 的限流参数也是常量,不给 env)—— 端点级阈值不该是部署时旋钮,调它要走代码
+	// review。Redis client 经 octoredis.NewInstrumentedClient 构造,保证
+	// TLS/连接池/Metrics 和 main.go 全局限流一致。
+	exIPRedis := octoredis.NewInstrumentedClient(o.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	})
+	exIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), exIPRedis,
+		"oidc_exchange",
+		exchangeIPLimitRPS, exchangeIPLimitBurst,
+	)
 	pub.GET("/authorize", o.authorize)
 	pub.GET("/callback", o.callback)
+	pub.POST("/exchange", exIPLimit, o.exchange)
+	pub.POST("/exchange-jwt", exIPLimit, o.exchangeJWT)
 	authed := r.Group(base, o.ctx.AuthMiddleware(r))
 	authed.POST("/logout", o.logout)
-	// 自助绑定(P0):Bind.Enabled=false 时 bindRoutes 自身 no-op,生产路径完
-	// 全不挂这些 endpoint;true 时挂 4 个 bind/* 端点,callback 接管由 PR4 引入。
 	o.bindRoutes(pub)
 }
 
@@ -334,8 +439,8 @@ func (o *OIDC) disabled(c *wkhttp.Context) {
 //   - flag     (可选): 设备标志,默认 0=APP
 func (o *OIDC) authorize(c *wkhttp.Context) {
 	metricAuthorizeTotal.Inc()
-	if o.client == nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc client not initialized"))
+	if o.provider == nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc provider not initialized"))
 		return
 	}
 	authcode := c.Query("authcode")
@@ -357,17 +462,30 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 		return
 	}
-	nonce, err := NewRandomString(32)
-	if err != nil {
-		o.Error("OIDC authorize: generate nonce failed", zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
-		return
+	// nonce / PKCE 按 provider capabilities 决定是否生成:无能力的 provider(如
+	// plain-OAuth2)忽略这两个参数,上层无需按 kind 分支。verifier 非指针 string
+	// 由 sd.CodeVerifier 持久化,不需要单独保留;challenge 仅在 PKCE 能力开启时
+	// 传给 provider(无能力时 provider.AuthCodeURL 会忽略 params.CodeChallenge)。
+	var (
+		nonce     string
+		verifier  string
+		challenge string
+	)
+	if o.provider.Capabilities().Nonce {
+		nonce, err = NewRandomString(32)
+		if err != nil {
+			o.Error("OIDC authorize: generate nonce failed", zap.Error(err))
+			c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+			return
+		}
 	}
-	verifier, challenge, err := NewPKCEPair()
-	if err != nil {
-		o.Error("OIDC authorize: generate PKCE pair failed", zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
-		return
+	if o.provider.Capabilities().PKCE {
+		verifier, challenge, err = NewPKCEPair()
+		if err != nil {
+			o.Error("OIDC authorize: generate PKCE pair failed", zap.Error(err))
+			c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+			return
+		}
 	}
 	deviceFlag := defaultDeviceFlag
 	if v := c.Query("flag"); v != "" {
@@ -390,7 +508,11 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("save state"))
 		return
 	}
-	authURL, err := o.client.AuthCodeURL(state, nonce, challenge)
+	authURL, err := o.provider.AuthCodeURL(AuthCodeParams{
+		State:         state,
+		Nonce:         nonce,
+		CodeChallenge: challenge,
+	})
 	if err != nil {
 		o.Error("OIDC authorize: build auth code URL failed", zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
@@ -421,9 +543,9 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		metricCallbackDuration.Observe(time.Since(start).Seconds())
 	}()
 
-	if o.client == nil {
+	if o.provider == nil {
 		// result 默认即 "other_fail",此分支无需显式置位
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc client not initialized"))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc provider not initialized"))
 		return
 	}
 
@@ -488,7 +610,7 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		return
 	}
 
-	tok, err := o.client.Exchange(c.Request.Context(), code, sd.CodeVerifier)
+	tok, err := o.provider.Exchange(c.Request.Context(), code, sd.CodeVerifier)
 	if err != nil {
 		// 不计 IP 失败:state 已消费,replay 同一对 (state, code) 行不通;
 		// Exchange 故障多半是 IdP 抖动 / 网络问题,不是 IP 行为可控的攻击信号。
@@ -501,33 +623,32 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		return
 	}
 
-	rawID, _ := tok.Extra("id_token").(string)
-	if rawID == "" {
-		result = "verify_fail"
-		o.cbGuard.RecordFailureLogged(clientIP)
-		o.failWithAuthcode(c.Request.Context(), sd, nil, errors.New("id_token missing from token response"))
-		o.redirectAfterCallback(c, sd, true)
-		return
-	}
-
-	claims, err := o.client.VerifyIDToken(c.Request.Context(), rawID)
+	// Identity 完成本协议的所有可信校验(OIDC 下:验签 id_token → 按需拉 /userinfo
+	// 补全 email/phone/name/verification claims → 交叉校验 sub;plain-OAuth2 下:
+	// 调 /userinfo → 解私有信封 → 注入 issuer 等)。handler 层只保留 nonce 比对
+	// 和 bind 接管,不再感知协议细节。
+	claims, err := o.provider.Identity(c.Request.Context(), tok)
 	if err != nil {
 		result = "verify_fail"
 		o.cbGuard.RecordFailureLogged(clientIP)
-		o.Warn("OIDC callback VerifyIDToken 失败",
+		o.Warn("OIDC callback Identity 校验失败",
 			zap.String("trace_id", traceID),
 			zap.Error(err))
 		o.failWithAuthcode(c.Request.Context(), sd, nil, err)
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	o.Info("OIDC callback id_token verified",
+	o.Info("OIDC callback identity verified",
 		zap.String("trace_id", traceID),
 		zap.String("sub_hash", subHash(claims.Subject)),
 		zap.String("email", maskEmail(claims.Email)),
 		zap.Bool("email_verified", claims.EmailVerified))
 
-	if claims.Nonce != sd.Nonce {
+	// nonce 比对留 handler 层:期望值存在 sd.Nonce 里(state 存储由 handler 持有),
+	// provider 只保证把解出的 nonce 放进 claims.Nonce 交出来。
+	// 无 Nonce 能力的 provider(Capabilities.Nonce=false)下,sd.Nonce 为空、
+	// claims.Nonce 也为空,两者相等,比对自动通过(退化为"无防护"但不是"绕过")。
+	if sd.Nonce != "" && claims.Nonce != sd.Nonce {
 		result = "nonce_mismatch"
 		o.cbGuard.RecordFailureLogged(clientIP)
 		o.Warn("OIDC callback nonce 不匹配",
@@ -537,73 +658,7 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-
-	// 部分 IdP(如 Aegis / OCTO)只在 /userinfo 暴露 email/phone/name,ID Token 仅含 sub。
-	// 自动绑定历史账号必须依赖 email/phone;name 缺失会让新建用户落到随机汉名兜底
-	// (modules/user/api.go createUserWithRespAndTx 的 Names[] 分支),用户体验极差。
-	// 所以缺啥就拉一次 /userinfo 补啥(issue #1307)。
-	// userinfo 失败不阻断登录,只是失去自动绑定能力,等价于 IdP 没返这些 claim。
-	//
-	// identity_verification scope 类似(YUJ-382 + codex review 多轮):部分 Aegis
-	// 部署把 5 个字段全放 ID Token,另一些只在 /userinfo 暴露,还有一些只放部分
-	// 字段。为覆盖所有部署形态:只要 scope 已配置 **且** 任一必需字段未就位
-	// (IsVerified=false、VerifiedAt=0、VerifiedProvider 空、LegalName 空),
-	// 都触发 /userinfo 合并。代价:未实名用户每次登录多一跳 /userinfo 请求
-	// (IdP 端幂等、本地 http 超时兜底已有),换 Phase 1 直切方案在生产各种
-	// 部署形态下稳定生效。
-	needUserInfo := claims.Email == "" || claims.PhoneNumber == "" || claims.Name == ""
-	if !needUserInfo && hasIdentityVerificationScope(o.cfg.Provider.Scopes) &&
-		!hasCompleteVerificationClaims(claims) {
-		needUserInfo = true
-	}
-	if needUserInfo {
-		ui, uerr := o.client.UserInfo(c.Request.Context(), tok)
-		if uerr != nil {
-			o.Warn("OIDC callback userinfo 拉取失败,跳过补全",
-				zap.String("trace_id", traceID),
-				zap.Error(uerr))
-		} else if ui.Subject != claims.Subject {
-			// 安全检查:userinfo sub 必须等于 ID Token sub,否则视为账号串台,直接拒绝
-			result = "verify_fail"
-			o.cbGuard.RecordFailureLogged(clientIP)
-			o.failWithAuthcode(c.Request.Context(), sd, claims,
-				fmt.Errorf("userinfo sub mismatch: idtoken=%s userinfo=%s",
-					subHash(claims.Subject), subHash(ui.Subject)))
-			o.redirectAfterCallback(c, sd, true)
-			return
-		} else {
-			if claims.Email == "" {
-				claims.Email = ui.Email
-				claims.EmailVerified = ui.EmailVerified
-			}
-			if claims.PhoneNumber == "" {
-				claims.PhoneNumber = ui.PhoneNumber
-				claims.PhoneVerified = ui.PhoneVerified
-			}
-			if claims.Name == "" {
-				claims.Name = ui.Name
-			}
-			// identity_verification 合并:只在 ID Token 对应字段为空(或 is_verified 未置)
-			// 时才取 userinfo 的,避免 IdP 两边不一致时静默覆盖(ID Token 是签名权威,
-			// 优先保留)。IsVerified 本身只有 true 能向 false 走过 IdP 明确撤销的语义,
-			// 所以 userinfo 的 true 可以覆盖 ID Token 的 false(更新语义)。
-			if ui.IsVerified {
-				claims.IsVerified = true
-			}
-			if claims.VerifiedAt == 0 {
-				claims.VerifiedAt = ui.VerifiedAt
-			}
-			if claims.VerifiedProvider == "" {
-				claims.VerifiedProvider = ui.VerifiedProvider
-			}
-			if claims.LegalName == "" {
-				claims.LegalName = ui.LegalName
-			}
-			if claims.LegalEmail == "" {
-				claims.LegalEmail = ui.LegalEmail
-			}
-		}
-	}
+	rawID := tok.RawIDToken // 供后续 id_token_hint 缓存与 bind 暂存使用
 
 	res, err := o.service.ResolveOrLink(c.Request.Context(), claims)
 	if err != nil {
@@ -806,8 +861,9 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	// 成功路径清场:防止 IP 长尾累积导致历史失败 + 偶发 state 过期把用户误锁。
 	o.cbGuard.ResetLogged(clientIP)
 	// 缓存验签过的 id_token,供后续 logout 当 RP-Initiated Logout 的 id_token_hint。
+	// 仅 OIDC(有 id_token)才需要;plain-OAuth2 下 rawID 为空,此块自然跳过。
 	// best-effort:存失败只告警,不影响登录(logout 时退回"仅清本地")。日志不打 token。
-	if o.idTokens != nil && sessResp.UID != "" {
+	if o.idTokens != nil && sessResp.UID != "" && rawID != "" {
 		if serr := o.idTokens.Save(c.Request.Context(), sessResp.UID, rawID, o.cfg.Provider.IDTokenTTL); serr != nil {
 			o.Warn("OIDC callback 缓存 id_token 失败(不影响登录,仅 RP-logout 降级)",
 				zap.String("trace_id", traceID), zap.Error(serr))
@@ -916,11 +972,24 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 		}
 	}
 	if o.killer != nil {
-		if err := o.killer.Kick(ctx, uid); err != nil {
+		// brief Decision 3:登出仅当前端。device_flag 必须从 Redis 缓存里的 decoded
+		// payload 读取,而不是对 raw token 字符串调用 auth.Decode——raw token 是
+		// UUID,不含任何结构化字段(auth.Decode 是用来解 Redis 里缓存的 JSON 编码
+		// payload,见 pkg/auth/session_v3.go:822)。解析失败(老 v1/v2 token、token
+		// 已过期、读缓存失败)一律降级为 df=0 → 踢全部,避免登出变 no-op。
+		df := o.deviceFlagFromRequest(c.Request.Context(), c.GetHeader("token"))
+		kickErr := error(nil)
+		if df == 0 {
+			kickErr = o.killer.Kick(ctx, uid)
+		} else {
+			kickErr = o.ctx.QuitUserDevice(uid, int(df))
+		}
+		if kickErr != nil {
 			kickFailed = true
 			o.Error("OIDC logout 踢线失败",
 				zap.String("trace_id", traceID),
-				zap.Error(err), zap.String("uid", uid))
+				zap.Error(kickErr), zap.String("uid", uid),
+				zap.Uint8("device_flag", df))
 		}
 	}
 	if o.revoker != nil {
@@ -954,75 +1023,33 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	}, "")
 
 	resp := map[string]interface{}{"status": 200}
-	// 拼 IdP end_session 跳转地址(RP-Initiated Logout)。任一前置缺失时返回空串,
-	// 此时省略字段,前端降级为仅清本地。end_session_url 含 id_token,不写日志。
-	if endSessionURL := o.buildEndSessionURL(ctx, uid); endSessionURL != "" {
-		resp["end_session_url"] = endSessionURL
-		// 响应体含 id_token_hint,禁止任何缓存(OAuth/OIDC 安全 BCP、RFC 6749 §5.1)。
-		c.Header("Cache-Control", "no-store")
-		c.Header("Pragma", "no-cache")
+	// 取当前请求 token 对应的 id_token,用于 RP-Initiated Logout 的 id_token_hint
+	// (仅 OIDC;plain-OAuth2 下 idTokens 未启用,Take 返空,LoutURL 会按自身逻辑拼 SLO URL)。
+	var idToken string
+	if o.idTokens != nil {
+		if t, err := o.idTokens.Take(ctx, uid); err == nil {
+			idToken = t
+		} else {
+			o.Warn("OIDC logout 取 id_token 失败,跳过 end_session URL id_token_hint",
+				zap.Error(err))
+		}
+	}
+	// endSessionEndpoint 校验已过时;上游登出 URL 由 provider.LogoutURL 负责
+	// 构造与校验(包括 https 校验 / 路径拼接 / id_token_hint 或 appId 处理)。
+	// 如果 provider 为 nil(构造失败 / 测试未注入)或返 ("", false) 说明不支持
+	// (plain-OAuth2 没配 appId / OIDC 没配 PostLogoutRedirectURI / 端点非法),
+	// 前端降级为仅清本地。
+	if o.provider != nil {
+		upstreamURL, ok := o.provider.LogoutURL(ctx, LogoutHint{UID: uid, RawIDToken: idToken})
+		if ok && upstreamURL != "" {
+			resp["end_session_url"] = upstreamURL
+			// 响应体可能含 id_token_hint(OIDC)或仅 appId(plain-OAuth2);两种情况下
+			// 都设 no-store 保持纵深防御(凭据响应永不缓存),无性能代价。
+			c.Header("Cache-Control", "no-store")
+			c.Header("Pragma", "no-cache")
+		}
 	}
 	c.JSON(http.StatusOK, resp)
-}
-
-// endSessionEndpoint 解析 IdP 的 RP-Initiated Logout 端点:config override 优先,
-// 否则取 Discovery 解析值。两者皆空时返回空串(IdP 未声明且未配 override)。
-func (o *OIDC) endSessionEndpoint() string {
-	if o.cfg != nil && o.cfg.Provider.EndSessionURL != "" {
-		return o.cfg.Provider.EndSessionURL
-	}
-	if o.client != nil {
-		return o.client.EndSessionEndpoint()
-	}
-	return ""
-}
-
-// buildEndSessionURL 构造 RP-Initiated Logout 跳转地址,带 id_token_hint +
-// post_logout_redirect_uri。任一前置不满足返回空串(调用方据此省略字段、前端降级):
-//   - 未配置 PostLogoutRedirectURI(运维写死的回跳页,同时充当白名单);
-//   - idTokens 未注入 / 取不到该 uid 的 id_token(非 OIDC 登录 / 已过期 / 已消费);
-//   - 无可用 end_session 端点。
-//
-// 取出 id_token 即一次性消费(Take 内部删除)。不带 state(Aegis Discovery 未声明)。
-//
-// 顺序很关键:先解析+校验端点,再消费 id_token。原因有二:
-//   - 端点非法时不白烧 token(GETDEL 不可逆),logout 仍可重试拿到 end_session_url;
-//   - end_session 端点可能来自 discovery(非 config override,未经启动期校验),这里统一
-//     过一道 https 校验 —— 防 IdP 万一下发 http:// 把带 id_token 的 URL 降级到非 https。
-func (o *OIDC) buildEndSessionURL(ctx context.Context, uid string) string {
-	if o.cfg == nil || o.cfg.Provider.PostLogoutRedirectURI == "" || o.idTokens == nil {
-		return ""
-	}
-	endpoint := o.endSessionEndpoint()
-	if endpoint == "" {
-		return ""
-	}
-	// 校验 + 解析端点(在消费 token 之前)。validateLogoutURL 强制绝对 https
-	// (dev 可 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1),覆盖 discovery 与 override 两种来源。
-	if err := validateLogoutURL("end_session_endpoint", endpoint); err != nil {
-		o.Error("OIDC logout end_session 端点不合法,跳过 IdP 登出", zap.String("endpoint", endpoint), zap.Error(err))
-		return ""
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		// 只记端点本身,不记含 id_token 的完整 URL。
-		o.Error("OIDC logout 解析 end_session 端点失败", zap.String("endpoint", endpoint), zap.Error(err))
-		return ""
-	}
-	idToken, err := o.idTokens.Take(ctx, uid)
-	if err != nil {
-		// 取 id_token 失败不阻断 logout(本地已踢线+吊销),仅降级跳过 IdP 跳转。
-		o.Warn("OIDC logout 取 id_token 失败,跳过 end_session 跳转", zap.Error(err))
-		return ""
-	}
-	if idToken == "" {
-		return ""
-	}
-	q := u.Query()
-	q.Set("id_token_hint", idToken)
-	q.Set("post_logout_redirect_uri", o.cfg.Provider.PostLogoutRedirectURI)
-	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 // saveBindIDTokenHint 在自助绑定接管(callback bind_pending)时,按 bind token(jti)
@@ -1347,11 +1374,61 @@ func (r redisAuthcode) SetAuthcode(ctx context.Context, authcode, payload string
 
 // ctxKiller 生产路径下的 sessionKiller 实现 —— 委托给 octo-lib 的
 // QuitUserDevice(uid, -1) 退出 WuKongIM 全部设备。该调用不撤销 octo-server
-// HTTP bearer；OIDC sync invalid_grant 的本地会话 scope 仍是待签字能力。
+// HTTP bearer(由 tokenKill 处理),只清 IM 长连接。供 sync worker 封号/改密
+// 场景使用(需要把全部端踢下线);logout 路径用 kickDeviceByToken 单独按当前端
+// 踢,见 handler 内实现(brief Decision 3:登出仅当前端)。
 type ctxKiller struct{ ctx *config.Context }
 
 func (k ctxKiller) Kick(_ context.Context, uid string) error {
 	return k.ctx.QuitUserDevice(uid, -1)
+}
+
+// deviceFlagFromToken 解析当前请求 token 里的 device_flag;解析失败返 0(兜底
+// 踢全部,避免登出在边缘场景变 no-op)。
+//
+// 直接用包级 auth.Decode 反序列化 token payload,不需要 Redis —— token 能走到
+// logout handler 说明已被 AuthMiddleware 校验过是合法 session,Decode 不会再
+// 做签名校验,只是从 payload JSON 里读出 device_flag 字段。
+// deviceFlagFromRequest 从当前登录请求的 token 里解析 device_flag。
+//
+// 关键实现约束:raw token 本身是 UUID(auth.GenerUUID),不是可 decode 的 JSON
+// payload——之前的 deviceFlagFromToken 直接对 raw token 调 auth.Decode 会稳定
+// 失败并返回 0,导致 "仅踢当前设备" 完全退化为 "踢全部"(Kick(uid,-1)),
+// 违反 brief Decision 3。正确做法是先从 Redis 读出 token 对应的缓存 payload
+// (key = TokenCachePrefix + token),再 Decode 那个 payload 拿 DeviceFlag。
+//
+// 任何环节失败(token 空/Store 未就绪/Redis 读失败/Decode 失败/flag 越界)
+// 都返回 0,调用方按"踢全部"兜底。
+func (o *OIDC) deviceFlagFromRequest(ctx context.Context, token string) uint8 {
+	token = strings.TrimSpace(token)
+	if token == "" || o.tokenKill == nil {
+		return 0
+	}
+	// TokenRecordReader 是 pkg/auth 暴露的公开接口;生产里 o.tokenKill 是
+	// *auth.RedisSessionStore,它实现了这个接口。断言失败(测试桩/其他实现)按
+	// 失败处理,返回 0 → 踢全部。
+	reader, ok := o.tokenKill.(auth.TokenRecordReader)
+	if !ok {
+		return 0
+	}
+	// Cache.TokenCachePrefix 默认 "token:"(octo-lib config 默认值,见
+	// config/config.go:349);这里读 ctx 配置而非硬编码,避免将来改前缀时漏改。
+	prefix := o.ctx.GetConfig().Cache.TokenCachePrefix
+	if prefix == "" {
+		prefix = "token:"
+	}
+	rec, err := reader.ReadToken(ctx, prefix+token)
+	if err != nil || strings.TrimSpace(rec.Payload) == "" {
+		return 0
+	}
+	info, err := auth.Decode(rec.Payload)
+	if err != nil {
+		return 0
+	}
+	if info.DeviceFlag < 0 || info.DeviceFlag > 255 {
+		return 0
+	}
+	return uint8(info.DeviceFlag)
 }
 
 type cacheCurrentTokenInvalidator struct {

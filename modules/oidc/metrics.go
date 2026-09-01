@@ -81,6 +81,34 @@ func bindResultLabels() []string {
 	}
 }
 
+// exchangeResultLabels /exchange 端点的结果维度。失败原因收敛到很少几类,
+// 因为该端点是反枚举的(401 一个码吞掉所有 IdP 侧失败),细分只用于内部可观测。
+func exchangeResultLabels() []string {
+	return []string{
+		"ok",
+		"bad_request",          // 400:JSON 错 / access_token 空
+		"identity_fail",        // 401:IdP 拒绝 / 信封失败 / 网络错误
+		"resolve_fail",         // 401:ResolveOrLink 失败(冲突/内部错)
+		"issue_fail",           // 401:IssueSession 失败
+		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
+		"race_recovered",       // 200:并发首登竞态,已恢复
+	}
+}
+
+// exchangeJWTResultLabels /exchange-jwt 端点结果维度。与 /exchange 保持同样的
+// 收敛策略,只是 identity_fail 在本地验签下对应"签名错/过期/claims 非法"。
+func exchangeJWTResultLabels() []string {
+	return []string{
+		"ok",
+		"bad_request",          // 400:JSON 错 / access_token 空
+		"token_rejected",       // 401:HS256 签名错 / exp 过期 / userId 缺失
+		"resolve_fail",         // 401:ResolveOrLink 失败
+		"issue_fail",           // 401:IssueSession 失败
+		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
+		"race_recovered",       // 200:并发首登竞态,已恢复
+	}
+}
+
 // init 把每个声明的 label 都预热成 0 值序列。Prometheus 在没观察到样本前不会
 // 暴露 series,导致 Grafana"区分不出零次"和"未注册"两种状态。
 func init() {
@@ -107,6 +135,14 @@ func init() {
 		for _, r := range bindResultLabels() {
 			metricBindRequestTotal.WithLabelValues(ep, r).Add(0)
 		}
+	}
+	// /exchange 结果标签预热。
+	for _, l := range exchangeResultLabels() {
+		metricExchangeResult.WithLabelValues(l).Add(0)
+	}
+	// /exchange-jwt 结果标签预热。
+	for _, l := range exchangeJWTResultLabels() {
+		metricBearerExchangeResult.WithLabelValues(l).Add(0)
 	}
 }
 
@@ -179,4 +215,26 @@ var (
 		Help:      "End-to-end OIDC self-service bind handler latency in seconds.",
 		Buckets:   []float64{.02, .05, .1, .25, .5, 1, 2},
 	}, []string{"endpoint"})
+
+	metricExchangeTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_total",
+		Help:      "Total number of /exchange requests entering the handler.",
+	})
+	metricExchangeResult = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_result_total",
+		Help:      "Total number of /exchange responses by terminal result.",
+	}, []string{"result"})
+
+	metricBearerExchangeTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_total",
+		Help:      "Total number of /exchange-jwt (bearer JWT) requests entering the handler.",
+	})
+	metricBearerExchangeResult = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "exchange_jwt_result_total",
+		Help:      "Total number of /exchange-jwt responses by terminal result.",
+	}, []string{"result"})
 )

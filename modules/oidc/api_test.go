@@ -108,6 +108,7 @@ func newTestOIDC(t *testing.T, mp *MockProvider, users *fakeUserLookup, store *f
 		Provider: ProviderConfig{
 			ID:                   "aegis",
 			Name:                 "Aegis",
+			Kind:                 KindOIDC,
 			Issuer:               mp.Issuer,
 			ClientID:             mp.ClientID,
 			RedirectURI:          "https://app.example.com/callback",
@@ -120,15 +121,29 @@ func newTestOIDC(t *testing.T, mp *MockProvider, users *fakeUserLookup, store *f
 			Scopes: []string{"openid", "profile", "email", "identity_verification"},
 		},
 	}
+	// 把 *Client 包装成 oidcProvider(AuthProvider 实现),供 authorize/callback/logout
+	// 走新抽象。测试不校验 OnWarn,传 nil。PostLogoutRedirectURI/EndSessionURL 在
+	// 个别 logout 测试里动态覆盖 cfg.Provider 字段,这里初始留空,由测试按需注入。
+	oidcProv, perr := newOIDCProvider(oidcProviderConfig{
+		Client:                client,
+		Scopes:                cfg.Provider.Scopes,
+		PostLogoutRedirectURI: cfg.Provider.PostLogoutRedirectURI,
+		EndSessionURLOverride: cfg.Provider.EndSessionURL,
+	})
+	if perr != nil {
+		t.Fatalf("newOIDCProvider: %v", perr)
+	}
 	return &OIDC{
 		Log:        log.NewTLog("OIDC-test"),
 		cfg:        cfg,
 		client:     client,
+		provider:   oidcProv,
 		service:    newService(cfg.Provider, store, users),
 		store:      store,
 		stateStore: newMemoryStateStore(),
 		authcode:   newFakeAuthcode(),
 		audit:      newFakeAudit(),
+		killer:     ctxKiller{ctx: nil}, // 测试中 ctx=nil,Kick 可能 panic;logout 测试单独注入 fake
 	}
 }
 

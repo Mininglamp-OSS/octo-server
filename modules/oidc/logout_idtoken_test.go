@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/gin-gonic/gin"
 )
 
@@ -58,6 +57,19 @@ func (f *fakeIDTokenStore) get(uid string) string {
 // runLogout 模拟 AuthMiddleware 已校验,把 uid 注入 gin.Context 后调 logout handler。
 func runLogout(o *OIDC, uid string) *httptest.ResponseRecorder {
 	gin.SetMode(gin.TestMode)
+	// 如果测试动态修改了 cfg.Provider.PostLogoutRedirectURI / EndSessionURL
+	// (构造 o 之后才赋值),重建 oidcProvider 让它读到新配置。这比让 provider 持
+	// 引用 cfg 字段更安全(provider 构造期拷贝必要字段,避免运行时竞态)。
+	if o.client != nil {
+		if prov, err := newOIDCProvider(oidcProviderConfig{
+			Client:                o.client,
+			Scopes:                o.cfg.Provider.Scopes,
+			PostLogoutRedirectURI: o.cfg.Provider.PostLogoutRedirectURI,
+			EndSessionURLOverride: o.cfg.Provider.EndSessionURL,
+		}); err == nil {
+			o.provider = prov
+		}
+	}
 	r := gin.New()
 	r.POST("/v1/auth/oidc/aegis/logout", func(c *gin.Context) {
 		if uid != "" {
@@ -335,22 +347,22 @@ func TestAPI_Callback_StoresIDTokenForLogout(t *testing.T) {
 	}
 }
 
-// buildEndSessionURL 直接单测:EndSessionURL override 生效;已带 query 的端点要保留;
-// id_token_hint / post_logout_redirect_uri 中的特殊字符要正确转义。
+// buildEndSessionURL 已被 provider.LogoutURL 取代;本测试改为直接通过 oidcProvider
+// 验证:EndSessionURL override 生效;已带 query 的端点要保留;id_token_hint /
+// post_logout_redirect_uri 中的特殊字符要正确转义。
 func TestBuildEndSessionURL_OverrideAndEscaping(t *testing.T) {
-	ids := newFakeIDTokenStore()
-	ids.tokens["u"] = "tok with space&amp"
-	o := &OIDC{
-		Log:      log.NewTLog("OIDC-test"),
-		idTokens: ids,
-		cfg: &Config{Provider: ProviderConfig{
-			EndSessionURL:         "https://idp.example.com/end?foo=bar",
-			PostLogoutRedirectURI: "https://app.example.com/login?next=/x y",
-		}},
+	prov, err := newOIDCProvider(oidcProviderConfig{
+		// Client 为 nil 也可:因为 EndSessionURLOverride 存在时不会访问 Client 的
+		// Discovery 值;LogoutURL 只拼 URL 不做 HTTP 调用。
+		EndSessionURLOverride: "https://idp.example.com/end?foo=bar",
+		PostLogoutRedirectURI: "https://app.example.com/login?next=/x y",
+	})
+	if err != nil {
+		t.Fatalf("newOIDCProvider: %v", err)
 	}
-	got := o.buildEndSessionURL(context.Background(), "u")
-	if got == "" {
-		t.Fatal("buildEndSessionURL returned empty")
+	got, ok := prov.LogoutURL(context.Background(), LogoutHint{UID: "u", RawIDToken: "tok with space&amp"})
+	if !ok || got == "" {
+		t.Fatal("LogoutURL returned empty")
 	}
 	u, err := url.Parse(got)
 	if err != nil {

@@ -25,6 +25,8 @@
 0 modules/botfather/api_user.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#278)
 2 modules/notify/api.go
 14 modules/oidc/api.go  # EXEMPT: OAuth2/OIDC protocol endpoints (authorize/callback/logout) — browser-facing redirect flow, not the dmwork front-end; raw errMsg() kept by design (#220). The err.Error() leaks were closed in #220.
+1 modules/oidc/api_exchange.go  # EXEMPT: OAuth2 token exchange endpoint — protocol-level "provider not initialized" matches api.go's 500 handling pattern; user-facing error responses all use httperr.ResponseErrorLWithStatus.
+2 modules/oidc/api_exchange_jwt.go  # EXEMPT: bearer JWT exchange endpoint — "secret not configured" 500 + "provider not initialized" 500 均为运维/构造期错误,同 api.go 豁免模式;用户可见错误全部走 httperr.ResponseErrorLWithStatus。
 0 modules/oidc/api_bind.go  # migrated to httperr.ResponseErrorLWithStatus (#220)
 0 modules/robot/api.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#267)
 7 modules/user/api.go

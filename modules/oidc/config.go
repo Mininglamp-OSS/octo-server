@@ -46,6 +46,26 @@ type ProviderConfig struct {
 	ID   string
 	Name string
 
+	// Kind 上游协议种类,决定用哪个 AuthProvider 实现(OCTO_OIDC_PROVIDER_KIND)。
+	// 缺省 KindOIDC —— 存量部署没有这个 env,不能因为引入它而改变行为。
+	//
+	// 注意:业务分支一律读 ProviderCapabilities,不读 Kind。Kind 只用于选实现、
+	// 打 metric label 和启动期配置分叉校验。
+	Kind ProviderKind
+
+	// BaseURL 仅 KindOAuth2 使用:IdP 站点根,authorize / token / userinfo /
+	// 登出路径都拼在其后(OCTO_OIDC_PROVIDER_BASE_URL)。
+	// 留空时回落 Issuer 值 —— 这样接入新 kind 不需要新增必填 env(见 loadProvider
+	// 里 required 列表的镜像副本说明)。
+	BaseURL string
+
+	// AppID 仅 KindOAuth2 使用:单点登出的应用标识(OCTO_OIDC_PROVIDER_APP_ID)。
+	//
+	// 它**不是** ClientID —— IdP 侧是两个独立的注册值,由同一批管理员分别下发,
+	// 且可能每环境不同。申请凭据时只要了 client id/secret/redirect uri 的话,
+	// 登出功能会做不出来。
+	AppID string
+
 	Issuer       string
 	ClientID     string
 	ClientSecret string
@@ -123,8 +143,12 @@ func LoadConfig() (*Config, error) {
 // alias 仅为减小重命名 PR 对部署的冲击,不持久维护。
 func loadProvider() (ProviderConfig, error) {
 	p := ProviderConfig{
-		ID:           getStringWithAlias("DM_OIDC_PROVIDER_ID", "", "oidc"),
-		Name:         getStringWithAlias("DM_OIDC_PROVIDER_NAME", "", "SSO"),
+		ID:   getStringWithAlias("DM_OIDC_PROVIDER_ID", "", "oidc"),
+		Name: getStringWithAlias("DM_OIDC_PROVIDER_NAME", "", "SSO"),
+		// 缺省 oidc:存量部署无此 env,行为必须不变。
+		Kind:         ProviderKind(getString("OCTO_OIDC_PROVIDER_KIND", string(KindOIDC))),
+		BaseURL:      getString("OCTO_OIDC_PROVIDER_BASE_URL", ""),
+		AppID:        getString("OCTO_OIDC_PROVIDER_APP_ID", ""),
 		Issuer:       getStringWithAlias("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER", ""),
 		ClientID:     getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID", ""),
 		ClientSecret: getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET", ""),
@@ -213,7 +237,114 @@ func loadProvider() (ProviderConfig, error) {
 		return p, fmt.Errorf("DM_OIDC_RT_ENC_KEY must be 32 bytes after base64 decode, got %d", len(key))
 	}
 	p.RefreshTokenEncryptionKey = key
+
+	// kind 分叉放在最后:oauth2 分支的 BaseURL 回落依赖 Issuer 已校验非空。
+	if err := applyKindConstraints(&p); err != nil {
+		return p, err
+	}
 	return p, nil
+}
+
+// applyKindConstraints 按 provider kind 收窄配置,并拒绝该 kind 下语义不成立的项。
+//
+// 设计原则:对不适用的配置**启动期报错**而不是静默忽略。运维照抄另一个 kind 的
+// 配置是常态,静默忽略会让人以为某项已生效(例如登出),等到线上才发现没配上。
+//
+// 本函数不新增任何必填 env。required 列表在
+// modules/common/system_settings.go 的 isOIDCFullyConfigured() 有镜像副本
+// (为避开 common→oidc→user→common 的 import 循环),两处漂移会让
+// isOIDCFullyConfigured 误答 → anyThirdPartyLoginConfigured 误判 →
+// login.local_off 的兜底静默翻回 false → 全站恢复密码登录。
+func applyKindConstraints(p *ProviderConfig) error {
+	switch p.Kind {
+	case KindOIDC:
+		// 标准路线:现有语义完全不变。
+		// BaseURL / AppID 在这个 kind 下无意义,不校验也不使用。
+		return nil
+
+	case KindOAuth2:
+		// BaseURL 回落 Issuer:该 kind 下 Issuer 的语义是"身份命名空间",
+		// 而多数部署里它同时就是站点根,所以可以兼作缺省值。
+		if p.BaseURL == "" {
+			p.BaseURL = p.Issuer
+		}
+		if err := validateUpstreamBaseURL(p.BaseURL); err != nil {
+			return err
+		}
+
+		// 该 IdP 的 authorize 端点只认 scope=read。运维照抄 OIDC 的 scope 列表
+		// 会被上游直接拒,所以在这里收窄而不是原样透传。
+		p.Scopes = []string{"read"}
+
+		// 协议里没有 code_challenge 参数。RequirePKCE 目前是死配置
+		// (加载后全仓无读点),抽象后由 ProviderCapabilities 消费。
+		p.RequirePKCE = false
+
+		// 该 IdP 返回 refresh_token,但文档从未给出刷新端点。留非零间隔只会让
+		// sync worker 空转,并让运维误以为"IdP 侧封号 → 我方踢线"在工作。
+		p.SyncInterval = 0
+
+		// 登出端点由 app id 拼路径得出,这个 override 语义不成立。
+		if p.EndSessionURL != "" {
+			return fmt.Errorf("oidc: OCTO_OIDC_PROVIDER_END_SESSION_URL is not applicable to "+
+				"provider kind %q (its logout endpoint is derived from OCTO_OIDC_PROVIDER_APP_ID); "+
+				"unset it to avoid a silently ineffective override", p.Kind)
+		}
+
+		// app id 直接拼进 URL 路径段,误配 "../x" 会让请求落到别的端点上。
+		// 启动期用白名单挡住,而不是等运行期拼 URL 时才发现。
+		if p.AppID != "" && !upstreamAppIDRe.MatchString(p.AppID) {
+			return fmt.Errorf("oidc: OCTO_OIDC_PROVIDER_APP_ID %q invalid: must match %s",
+				p.AppID, upstreamAppIDRe)
+		}
+		// 配了回跳地址却没有 app id 时,登出 URL 根本拼不出来,会静默降级成
+		// "仅清本地" —— 运维完全不知道。启动期报出来。
+		if p.PostLogoutRedirectURI != "" && p.AppID == "" {
+			return fmt.Errorf("oidc: OCTO_OIDC_POST_LOGOUT_REDIRECT_URI is set but "+
+				"OCTO_OIDC_PROVIDER_APP_ID is empty: provider kind %q builds its logout URL as "+
+				"{base}/%s/{appId}, so without an app id logout would silently degrade to "+
+				"clearing the local session only", p.Kind, upstreamLogoutPathPrefix)
+		}
+		return nil
+
+	default:
+		// 拼写错误不能静默回落到 oidc:那会让一个本该跑 oauth2 的部署
+		// 去做 Discovery,然后在启动期以一个完全无关的错误失败。
+		return fmt.Errorf("oidc: unknown OCTO_OIDC_PROVIDER_KIND %q (supported: %q, %q)",
+			p.Kind, KindOIDC, KindOAuth2)
+	}
+}
+
+// validateUpstreamBaseURL 校验上游站点根为绝对 http(s) 地址。
+//
+// 默认强制 https。这个值同时用于:
+//   - authorize 跳转(进浏览器地址栏,明文则 state/code 可被窃听)
+//   - token 与 userinfo 调用(明文则 client_secret / access_token 明文过网)
+//
+// 对方的预发环境文档写的是 http,所以留一个**独立**的逃生阀,而不是复用
+// OCTO_OIDC_LOGOUT_ALLOW_INSECURE —— 混用会让"为预发登出放宽"顺带把生产的
+// token 端点也放开。开启它等于接受凭据明文传输,仅限隔离的测试环境。
+func validateUpstreamBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oidc: invalid upstream base URL %q: %w", raw, err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("oidc: upstream base URL %q must be absolute (scheme://host/path)", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false) {
+			return nil
+		}
+		return fmt.Errorf("oidc: upstream base URL %q must use https "+
+			"(it carries client_secret and access_token; set "+
+			"OCTO_OIDC_ALLOW_INSECURE_UPSTREAM=1 only for an isolated test environment)", raw)
+	default:
+		return fmt.Errorf("oidc: upstream base URL %q has scheme %q, want http(s)", raw, u.Scheme)
+	}
 }
 
 // validateLogoutURL 启动期 fail-loud 校验 RP-Initiated Logout 相关 URL 为绝对 https。
