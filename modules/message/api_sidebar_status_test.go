@@ -226,7 +226,7 @@ func TestSidebar_RecentTab_BackfillsStatus(t *testing.T) {
 	}
 
 	sb := NewSidebar(ctx)
-	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "", map[string]bool{})
 	statusMap, err := sb.loadThreadStatuses(items)
 	require.NoError(t, err)
 	backfillThreadStatus(items, statusMap)
@@ -268,7 +268,7 @@ func TestSidebar_RecentTab_FailOpenOnStatusError(t *testing.T) {
 	stubConvs := []*config.SyncUserConversationResp{
 		{ChannelID: "g310e____thr", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Timestamp: 100},
 	}
-	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "")
+	items := buildRecentItems(stubConvs, cutoffs, nil, nil, nil, "", map[string]bool{})
 
 	// Mirror the handler's recent branch: query may fail → fail open.
 	statusMap, qerr := sb.loadThreadStatuses(items)

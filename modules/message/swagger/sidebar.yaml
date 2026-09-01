@@ -44,6 +44,9 @@ paths:
         - **已置顶**：置顶是关于位置的显式声明，时间窗口不得推翻；
         - **系统 Bot 的 DM**：保证其在每个 Space 均可达（占位条目 `timestamp/unread` 均为 0）。
 
+        `manual_unread=true` 仍会作为会话展示标识返回，但它不是活跃窗口豁免条件；
+        超过窗口的手动未读会话不会出现在 recent tab。
+
         **已归档子区（`status=2`）不出现在 recent tab 的 items 中**，与
         `/v1/conversation/sync` 的 `status=active` 语义一致。归档非终态：任何人发消息会
         自动复活为 active、或由管理员取消归档，下一次 sync 即重新出现；客户端另有
@@ -148,6 +151,9 @@ definitions:
       unread:
         type: integer
         description: "未读消息数"
+      manual_unread:
+        type: boolean
+        description: "是否被当前用户手动标记为未读；独立于 unread，不改变真实未读数量"
       is_pinned:
         type: boolean
         description: "是否置顶（来自 user_pinned_channel）"

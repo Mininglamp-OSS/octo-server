@@ -27,6 +27,9 @@ paths:
           下一次 sync 会重新出现；前端"已归档列表"入口请使用
           `GET /v1/groups/{group_no}/threads?status=archived`。
         - 当前用户已退群的群会话不返回。
+        - `extra.manual_unread` 只表示用户手动设置的展示标识，不等价于 WuKongIM 的
+          `unread` 消息数量，也不会改变真实阅读位置。它不属于 recent 活跃时间窗口的
+          豁免条件；当 `recent_filter=true` 时，超过窗口的手动未读会话仍会被过滤。
 
         cursor 推进基于过滤前的 raw conversations，确保被过滤掉的会话不会让游标卡住
         导致客户端反复拉同一批数据。
@@ -103,6 +106,9 @@ paths:
                       items:
                         $ref: "#/definitions/syncMessage"
                         description: "最近N条消息"
+                    extra:
+                      $ref: "#/definitions/conversationExtra"
+                      description: "Octo 会话扩展信息，包括草稿、阅读位置和手动未读标识"
                     users:
                       type: array
                       items:
@@ -189,7 +195,20 @@ paths:
       tags:
         - "conversation"
       summary: "同步最近会话扩展"
-      description: "同步最近会话扩展"
+      description: |
+        按会话扩展版本增量同步当前登录用户的 `conversation_extra` 数据。
+
+        该接口只同步 Octo 维护的会话扩展信息，不负责同步 WuKongIM 的真实未读数、
+        最后一条消息或会话列表。客户端应在本地保存本次返回结果中的最大 `version`，
+        下次请求时作为游标传回。返回空数组时保持原游标不变。
+
+        `manual_unread` 是独立于真实 `unread` 的手动展示标识：
+        - `true`：用户手动将该会话标记为未读；
+        - `false`：该会话当前没有手动未读标识；
+        - 它不会改变 `browse_to`、`keep_message_seq` 或 WuKongIM 的真实阅读位置。
+
+        收到 WuKongIM 的 `CMDSyncConversationExtra` 命令后，客户端应调用本接口拉取
+        实际变更数据。该命令只起到变更通知作用，不携带完整的扩展记录。
       operationId: "sync conversation extra"
       consumes:
         - "application/json"
@@ -198,44 +217,139 @@ paths:
       parameters:
         - in: "body"
           name: "body"
-          description: "同步离线最近会话回执"
+          description: "会话扩展增量同步参数"
           required: true
           schema:
             type: object
             properties:
               version:
                 type: integer
-                description: "cmd版本"
+                format: int64
+                default: 0
+                description: "客户端已同步到的会话扩展全局版本；仅返回 version 大于该值的记录，不传时按 0 处理"
       responses:
         200:
           description: "返回"
           schema:
             type: array
             items:
-              properties:
-                channel_id:
-                  type: string
-                  description: "频道唯一ID"
-                channel_type:
-                  type: integer
-                  description: "频道类型"
-                browse_to:
-                  type: integer
-                  description: "预览到的位置，与会话保持位置不同的是 预览到的位置是用户读到的最大的messageSeq。跟未读消息数量有关系"
-                keep_message_seq:
-                  type: integer
-                  description: "会话保持的位置"
-                keep_offset_y:
-                  type: integer
-                  description: "会话保持的位置的偏移量"
-                draft:
-                  type: string
-                  description: "草稿"
-                version:
-                  type: integer
-                  description: "版本号"
+              $ref: "#/definitions/conversationExtra"
         400:
           description: "错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+  /conversation/setManualUnread:
+    put:
+      tags:
+        - "conversation"
+      summary: "设置会话手动未读"
+      description: |
+        将当前登录用户指定的会话设置为手动未读。
+
+        该标识只属于当前用户，不会修改其他用户的会话状态，也不会修改 WuKongIM 的真实
+        未读数或阅读游标。服务端会先查询 WuKongIM 中当前用户的目标会话：
+        - 目标会话已有真实未读消息时，不重复创建手动未读标识，返回 `changed=false`；
+        - 目标会话已经是手动未读时，接口幂等返回 `changed=false`；
+        - 只有真实未读为 0 且尚未手动未读时，才会写入 `manual_unread=true`。
+
+        设置成功后，服务端会更新 `conversation_extra.version`，并向当前用户的个人频道
+        发送 `CMDSyncConversationExtra`，通知其他在线设备调用 `/conversation/extra/sync`。
+      operationId: "set manual unread"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          description: "要设置为手动未读的会话"
+          required: true
+          schema:
+            $ref: "#/definitions/manualUnreadRequest"
+      responses:
+        200:
+          description: "设置结果；已是真实未读或手动未读时也返回 200，使用 changed/reason 判断是否发生变化"
+          schema:
+            $ref: "#/definitions/setManualUnreadResponse"
+        400:
+          description: "请求参数或会话查询错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+  /conversation/clearManualUnread:
+    put:
+      tags:
+        - "conversation"
+      summary: "清除会话手动未读"
+      description: |
+        仅清除当前登录用户指定会话的 `manual_unread` 标识。
+
+        该接口不会调用 WuKongIM 的 `clearUnread`，因此不会修改真实未读数量、阅读游标或
+        消息拉取位置。接口适用于用户进入会话后，前端确认当前页面不需要继续显示手动未读
+        标识的场景，尤其是本次消息拉取为空时。
+
+        如果目标会话本来没有手动未读标识，接口按幂等成功处理并返回 `changed=false`。
+        状态发生变化后，服务端会更新扩展版本并通知当前用户的其他在线设备同步。
+      operationId: "clear manual unread"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          description: "要清除手动未读的会话"
+          required: true
+          schema:
+            $ref: "#/definitions/manualUnreadRequest"
+      responses:
+        200:
+          description: "清除结果；没有手动未读标识时也返回 200"
+          schema:
+            $ref: "#/definitions/clearManualUnreadResponse"
+        400:
+          description: "请求参数或数据库查询错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+  /conversation/clearUnread:
+    put:
+      tags:
+        - "conversation"
+      summary: "清除会话真实未读"
+      description: |
+        清除或更新当前登录用户在 WuKongIM 中的真实未读状态。
+
+        当前服务端实现中，只要该请求本身有效并且目标会话存在手动未读标识，处理成功后
+        也会一并清除该用户的 `manual_unread`，然后发送会话扩展同步通知。因此：
+        - `unread=0`：清除真实未读，同时清除手动未读；
+        - `unread>0`：按 WuKongIM 语义设置/保留真实未读，同时也清除手动未读；
+        - 如果前端只想清除手动未读而保留真实未读，应调用 `/conversation/clearManualUnread`。
+
+        该接口不会清除其他用户的状态。
+      operationId: "clear conversation unread"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          description: "WuKongIM 真实未读操作参数"
+          required: true
+          schema:
+            $ref: "#/definitions/clearConversationUnreadRequest"
+      responses:
+        200:
+          description: "处理成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "请求参数或命令发送错误"
           schema:
             $ref: "#/definitions/response"
       security:
@@ -278,7 +392,15 @@ paths:
       tags:
         - "conversation"
       summary: "添加或更新最近会话扩展"
-      description: "添加或更新最近会话扩展"
+      description: |
+        更新当前登录用户指定会话的草稿、预览位置和会话恢复位置。
+
+        请求体不接受 `manual_unread`。手动未读状态必须使用专用的
+        `/conversation/setManualUnread` 或 `/conversation/clearManualUnread` 接口修改，
+        这样普通的草稿或滚动位置更新不会意外覆盖手动未读状态。
+
+        更新成功后服务端会生成新的会话扩展版本，并通过 `CMDSyncConversationExtra` 通知
+        当前用户的其他在线设备；其他设备再调用 `/conversation/extra/sync` 拉取数据。
       operationId: "add conversations extra"
       consumes:
         - "application/json"
@@ -297,7 +419,7 @@ paths:
           required: true
         - in: "body"
           name: "body"
-          description: "同步离线最近会话回执"
+          description: "要更新的会话扩展字段"
           required: true
           schema:
             type: object
@@ -340,6 +462,122 @@ securityDefinitions:
     description: "用户token"
 
 definitions:
+  conversationExtra:
+    type: "object"
+    description: "当前登录用户在指定会话上的 Octo 扩展数据"
+    properties:
+      channel_id:
+        type: string
+        description: "频道唯一 ID"
+      channel_type:
+        type: integer
+        format: uint8
+        enum: [1, 2, 5]
+        description: "频道类型：1=单聊，2=群聊，5=社区子区"
+      browse_to:
+        type: integer
+        format: int64
+        description: "预览到的最大消息序号；不等价于手动未读标识"
+      keep_message_seq:
+        type: integer
+        format: int64
+        description: "重新进入会话时恢复的消息序号"
+      keep_offset_y:
+        type: integer
+        description: "恢复会话滚动位置时的垂直偏移量"
+      draft:
+        type: string
+        description: "当前会话草稿"
+      version:
+        type: integer
+        format: int64
+        description: "会话扩展全局同步版本"
+      manual_unread:
+        type: boolean
+        description: "是否被当前用户手动标记为未读；不代表 unread 消息数量"
+  manualUnreadRequest:
+    type: "object"
+    required:
+      - channel_id
+      - channel_type
+    properties:
+      channel_id:
+        type: string
+        minLength: 1
+        description: "频道唯一 ID"
+      channel_type:
+        type: integer
+        format: uint8
+        enum: [1, 2, 5]
+        description: "频道类型：1=单聊，2=群聊，5=社区子区"
+  setManualUnreadResponse:
+    type: "object"
+    properties:
+      channel_id:
+        type: string
+        description: "频道唯一 ID"
+      channel_type:
+        type: integer
+        format: uint8
+        description: "频道类型"
+      manual_unread:
+        type: boolean
+        description: "处理后的手动未读状态"
+      changed:
+        type: boolean
+        description: "本次请求是否实际修改了状态"
+      version:
+        type: integer
+        format: int64
+        description: "状态发生变化时生成的会话扩展版本；未变化时省略"
+      reason:
+        type: string
+        enum: [already_unread, already_manual_unread]
+        description: "changed=false 时的原因；真实未读已存在或已经是手动未读"
+  clearManualUnreadResponse:
+    type: "object"
+    properties:
+      channel_id:
+        type: string
+        description: "频道唯一 ID"
+      channel_type:
+        type: integer
+        format: uint8
+        description: "频道类型"
+      manual_unread:
+        type: boolean
+        description: "处理后的手动未读状态，成功清除后为 false"
+      changed:
+        type: boolean
+        description: "本次请求是否实际修改了状态"
+      version:
+        type: integer
+        format: int64
+        description: "状态发生变化时生成的会话扩展版本；未变化时省略"
+  clearConversationUnreadRequest:
+    type: "object"
+    required:
+      - channel_id
+      - channel_type
+      - unread
+    properties:
+      channel_id:
+        type: string
+        minLength: 1
+        description: "频道唯一 ID"
+      channel_type:
+        type: integer
+        format: uint8
+        description: "频道类型；由 WuKongIM 处理"
+      unread:
+        type: integer
+        format: int64
+        minimum: 0
+        description: "目标真实未读数量；0 表示清除全部真实未读"
+      message_seq:
+        type: integer
+        format: int64
+        description: "超级群清除真实未读时使用的消息序号，普通会话通常为 0"
   group:
     type: "object"
     properties:

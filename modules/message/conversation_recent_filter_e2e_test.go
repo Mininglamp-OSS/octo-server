@@ -56,6 +56,7 @@ var (
 	fakeIMOnce  sync.Once
 	fakeIMSrv   *httptest.Server
 	fakeIMConvs []*config.SyncUserConversationResp
+	fakeIMCMDs  []string
 )
 
 func sharedFakeIM() *httptest.Server {
@@ -64,6 +65,21 @@ func sharedFakeIM() *httptest.Server {
 			w.Header().Set("Content-Type", "application/json")
 			if strings.HasSuffix(r.URL.Path, "/conversation/sync") {
 				_, _ = w.Write([]byte(util.ToJson(fakeIMConvs)))
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, "/message/send") {
+				var req struct {
+					Payload []byte `json:"payload"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+					var payload struct {
+						CMD string `json:"cmd"`
+					}
+					if err := json.Unmarshal(req.Payload, &payload); err == nil && payload.CMD != "" {
+						fakeIMCMDs = append(fakeIMCMDs, payload.CMD)
+					}
+				}
+				_, _ = w.Write([]byte(`{"data":{}}`))
 				return
 			}
 			_, _ = w.Write([]byte("{}"))
@@ -112,6 +128,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	// Point the IM at the shared fake and load this test's conversation slice
 	// before any NewTestServer so the very first ctx already sees the live URL.
 	fakeIMConvs = convs
+	fakeIMCMDs = nil
 	imURL := sharedFakeIM().URL
 
 	s, ctx := testutil.NewTestServer()

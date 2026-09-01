@@ -58,6 +58,47 @@ func TestFilterRecentConversations_StaleGroupDropped(t *testing.T) {
 	assert.Equal(t, []string{"g-fresh"}, channelIDs(got))
 }
 
+func TestFilterRecentConversations_ManualUnreadDoesNotSurviveWindow(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelID   string
+		channelType uint8
+	}{
+		{
+			name:        "group",
+			channelID:   "g-manual-unread",
+			channelType: common.ChannelTypeGroup.Uint8(),
+		},
+		{
+			name:        "thread",
+			channelID:   "g-manual-unread____thread-1",
+			channelType: common.ChannelTypeCommunityTopic.Uint8(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := makeSyncResp(tc.channelID, tc.channelType, now3DaysAgo())
+			resp.Extra = &conversationExtraResp{ManualUnread: true}
+
+			got := filterRecentConversations([]*SyncUserConversationResp{resp}, defaultRecentCutoffs(), nil)
+
+			assert.Empty(t, got,
+				"recent_filter=true 时，manual_unread 不应绕过 Recent 活跃时间窗口")
+		})
+	}
+}
+
+func TestFilterRecentConversations_ManualUnreadFalseDoesNotSurviveWindow(t *testing.T) {
+	resp := makeSyncResp("g-manual-read", common.ChannelTypeGroup.Uint8(), now3DaysAgo())
+	resp.Extra = &conversationExtraResp{ManualUnread: false}
+
+	got := filterRecentConversations([]*SyncUserConversationResp{resp}, defaultRecentCutoffs(), nil)
+
+	assert.Empty(t, got,
+		"manual_unread=false 不应关闭原有的 Recent 时间窗口过滤")
+}
+
 func TestFilterRecentConversations_StaleThreadDropped(t *testing.T) {
 	resps := []*SyncUserConversationResp{
 		makeSyncResp("t-fresh", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),

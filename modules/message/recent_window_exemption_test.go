@@ -134,7 +134,7 @@ func TestBuildRecentItems_PinnedSurvivesWindow(t *testing.T) {
 	pinned := map[string]struct{}{
 		channelKey("g-stale-pinned", common.ChannelTypeGroup.Uint8()): {},
 	}
-	items := buildRecentItems(convs, defaultRecentCutoffs(), pinned, nil, nil, "")
+	items := buildRecentItems(convs, defaultRecentCutoffs(), pinned, nil, nil, "", map[string]bool{})
 
 	require.Len(t, items, 1, "置顶条目必须存活，未置顶的陈旧群应被过滤")
 	assert.Equal(t, "g-stale-pinned", items[0].TargetID)
@@ -147,7 +147,7 @@ func TestBuildRecentItems_UnreadSurvivesWindow(t *testing.T) {
 		makeRawConv("g-stale-unread", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 3),
 		makeRawConv("g-stale-read", common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
 	}
-	items := buildRecentItems(convs, defaultRecentCutoffs(), nil, nil, nil, "")
+	items := buildRecentItems(convs, defaultRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
 
 	require.Len(t, items, 1)
 	assert.Equal(t, "g-stale-unread", items[0].TargetID)
@@ -175,7 +175,7 @@ func TestRecentWindow_BothEndpointsAgree(t *testing.T) {
 		makeSyncRespUnread(pinnedID, common.ChannelTypeGroup.Uint8(), now3DaysAgo(), 0),
 	}
 
-	items := buildRecentItems(rawConvs, cutoffs, pinned, nil, nil, "")
+	items := buildRecentItems(rawConvs, cutoffs, pinned, nil, nil, "", map[string]bool{})
 	sidebarIDs := make([]string, 0, len(items))
 	for _, it := range items {
 		sidebarIDs = append(sidebarIDs, it.TargetID)

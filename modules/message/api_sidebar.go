@@ -76,19 +76,21 @@ type Sidebar struct {
 	// external-group mapping。
 	groupDB *group.DB
 	log.Log
+	conversationExtraDB *conversationExtraDB
 }
 
 // NewSidebar creates a Sidebar handler.
 func NewSidebar(ctx *config.Context) *Sidebar {
 	return &Sidebar{
-		ctx:             ctx,
-		groupCategoryDB: newGroupCategoryDB(ctx),
-		convExtDB:       convext.NewDB(ctx),
-		threadDB:        thread.NewDB(ctx),
-		followVersionDB: convext.NewFollowVersionDB(ctx),
-		groupService:    group.NewService(ctx),
-		groupDB:         group.NewDB(ctx),
-		Log:             log.NewTLog("Sidebar"),
+		ctx:                 ctx,
+		groupCategoryDB:     newGroupCategoryDB(ctx),
+		convExtDB:           convext.NewDB(ctx),
+		threadDB:            thread.NewDB(ctx),
+		followVersionDB:     convext.NewFollowVersionDB(ctx),
+		groupService:        group.NewService(ctx),
+		groupDB:             group.NewDB(ctx),
+		Log:                 log.NewTLog("Sidebar"),
+		conversationExtraDB: &conversationExtraDB{ctx: ctx, session: ctx.DB()},
 	}
 }
 
@@ -142,7 +144,8 @@ type SidebarItem struct {
 	// 3=deleted，语义与 modules/thread/const.go 的 ThreadStatus* 枚举一致
 	// （GH octo-server#310）。客户端据此同步过滤已归档子区，无需等待 channelInfo。
 	// omitempty 让 DM / 群条目不带该字段，保持线上协议向后兼容。
-	Status int `json:"status,omitempty"`
+	Status       int  `json:"status,omitempty"`
+	ManualUnread bool `json:"manual_unread"`
 }
 
 // sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
@@ -490,10 +493,22 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	defaultSpaceID := space.GetUserDefaultSpaceID(sb.ctx, loginUID)
 
 	// 3. Build tab-specific items
+	// 查询所有手动未读的会话
+	unreadItems, err := sb.conversationExtraDB.queryManualUnread(loginUID)
+	if err != nil {
+		sb.Error("sidebar sync: manual unread query failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	unreadMap := make(map[string]bool, len(unreadItems))
+	for _, it := range unreadItems {
+		unreadMap[channelKey(it.ChannelID, it.ChannelType)] = true
+	}
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
 		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
+
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -581,6 +596,10 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 					zap.Error(mErr), zap.Int("count", len(defaultFollowedGroups)))
 			}
 		}
+		// 构建完 items 后统一回填
+		for _, item := range items {
+			item.ManualUnread = unreadMap[channelKey(item.ChannelID, item.ChannelType)]
+		}
 	case "recent":
 		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
 		if pinnedLoadFailed {
@@ -590,7 +609,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			cutoffs = recentCutoffs{}
 			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
 		}
-		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID, unreadMap)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
 		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
@@ -1289,6 +1308,7 @@ func buildRecentItems(
 	groupSpaceMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
+	unreadMap map[string]bool,
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
@@ -1296,7 +1316,9 @@ func buildRecentItems(
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
 		}
+		manualUnread := unreadMap[channelKey(conv.ChannelID, conv.ChannelType)]
 		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
+		// manual_unread 仍会返回给客户端，但不再作为 Recent 活跃窗口的豁免条件。
 		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
 			if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
 				continue
@@ -1334,6 +1356,7 @@ func buildRecentItems(
 			Unread:          conv.Unread,
 			IsPinned:        pinned,
 			ParentChannelID: parentID,
+			ManualUnread:    manualUnread,
 		})
 	}
 	return items
