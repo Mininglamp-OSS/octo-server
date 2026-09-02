@@ -5,7 +5,7 @@ description: Introduce an AuthProvider abstraction in modules/oidc so a plain (n
 tags: [auth, trust-boundary, wire-contract, error-response, i18n, observability, testing]
 timestamp: 2026-09-01T03:59:42Z
 slug: oidc-oauth2-provider-abstraction
-upstream: TBD
+upstream: "Mininglamp-OSS/octo-server#830"
 source: self
 ---
 
