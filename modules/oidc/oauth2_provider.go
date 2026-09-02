@@ -604,3 +604,19 @@ func upstreamErrorCode(body []byte) string {
 	}
 	return code
 }
+
+// IdentityFromClientCredential 把客户端出示的 access_token 拿去问 /userinfo。
+//
+// 这个协议里 access_token 是不透明串,没有任何可本地验证的结构 —— 唯一能确立
+// 身份的办法就是拿它调上游。所以这条路径必然外呼,可用性跟着 IdP 走;
+// 这是协议事实,不是实现选择。
+//
+// 刻意**不**尝试把它当 JWT 解析:不透明串完全可能恰好是 JWT 形态(上游用什么
+// 编码是它的内部实现),按形态猜会把一个未经我方验证的载荷当成身份来源。
+func (p *oauth2Provider) IdentityFromClientCredential(ctx context.Context, raw string) (*IdentityClaims, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("oidc: oauth2 provider: credential is empty")
+	}
+	return p.Identity(ctx, &TokenSet{AccessToken: raw})
+}

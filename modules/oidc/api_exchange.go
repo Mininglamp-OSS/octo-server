@@ -99,9 +99,13 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 	traceID := newTraceID()
 	sd := &StateData{IP: clientIP, DeviceFlag: deviceFlag}
 
-	// Identity 回调 IdP /userinfo,解私有信封,完成三条信任边界校验,返回可信
-	// claims(Issuer/Subject 均非空)或 error。
-	claims, err := o.provider.Identity(c.Request.Context(), &TokenSet{AccessToken: req.AccessToken})
+	// 由 provider 按自己的协议事实解释这个客户端出示的凭据:标准 OIDC 下它是
+	// id_token(验签),plain-OAuth2 下它是不透明 access_token(拉 /userinfo)。
+	//
+	// 早先这里硬编码成 &TokenSet{AccessToken: ...},于是在标准 OIDC kind 下
+	// 永远失败(oidcProvider.Identity 要求 RawIDToken)—— 存量部署白得一个只会
+	// 返 401 的无认证端点。上层不该知道该往哪个字段放,那是 provider 的事。
+	claims, err := o.provider.IdentityFromClientCredential(c.Request.Context(), req.AccessToken)
 	if err != nil {
 		metricExchangeResult.WithLabelValues("identity_fail").Inc()
 		o.Warn("OIDC exchange: identity rejected",

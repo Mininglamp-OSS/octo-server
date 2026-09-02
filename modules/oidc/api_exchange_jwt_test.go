@@ -43,6 +43,9 @@ func (fakeBearerProvider) Exchange(context.Context, string, string) (*TokenSet, 
 	return nil, errors.New("not used")
 }
 func (fakeBearerProvider) LogoutURL(context.Context, LogoutHint) (string, bool) { return "", false }
+func (fakeBearerProvider) IdentityFromClientCredential(context.Context, string) (*IdentityClaims, error) {
+	return nil, errors.New("not used")
+}
 func (fakeBearerProvider) Identity(context.Context, *TokenSet) (*IdentityClaims, error) {
 	return nil, errors.New("not used")
 }

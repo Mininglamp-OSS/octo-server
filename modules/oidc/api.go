@@ -194,93 +194,21 @@ func New(ctx *config.Context) *OIDC {
 	cctx, cancel := context.WithTimeout(context.Background(), cfg.Provider.HTTPTimeout)
 	defer cancel()
 
-	// 按 Kind 构造 AuthProvider。两个实现走不同的初始化路径:
-	//   - KindOIDC   需要 Discovery → JWKS → 验签;先走原来的 NewClient,再包一层。
-	//   - KindOAuth2 无 Discovery、无 id_token;直接从配置拼端点,跳过 OIDC client 构造。
+	// 按 Kind 构造 AuthProvider。分派本身在 provider_factory.go —— modules/integration
+	// 需要同一份逻辑,而在那边再抄一份 switch 就又造出一份会漂移的副本。
 	//
-	// 原有 o.client 字段保留给尚未迁移到 provider 抽象的 authorize/callback/logout
-	// 路径使用(一旦那些 handler 迁完,o.client 可删)。
-	switch cfg.Provider.Kind {
-	case KindOAuth2:
-		prov, perr := newOAuth2Provider(oauth2ProviderConfig{
-			Issuer:                cfg.Provider.Issuer,
-			BaseURL:               cfg.Provider.BaseURL,
-			ClientID:              cfg.Provider.ClientID,
-			ClientSecret:          cfg.Provider.ClientSecret,
-			RedirectURI:           cfg.Provider.RedirectURI,
-			Scopes:                cfg.Provider.Scopes,
-			AppID:                 cfg.Provider.AppID,
-			PostLogoutRedirectURI: cfg.Provider.PostLogoutRedirectURI,
-		})
-		if perr != nil {
-			o.Error("OAuth2 provider 构造失败,handlers 将返回 500", zap.Error(perr))
-			_ = o.Close()
-			o.stateStore = nil
-			return o
-		}
-		o.provider = prov
-	default:
-		// KindOIDC(含存量未配 KIND 的部署):走原来的 Discovery + 包装路径。
-		client, cerr := NewClient(cctx, ClientConfig{
-			Issuer:       cfg.Provider.Issuer,
-			ClientID:     cfg.Provider.ClientID,
-			ClientSecret: cfg.Provider.ClientSecret,
-			RedirectURI:  cfg.Provider.RedirectURI,
-			Scopes:       cfg.Provider.Scopes,
-			HTTPTimeout:  cfg.Provider.HTTPTimeout,
-			ClockSkew:    cfg.Provider.ClockSkew,
-		})
-		if cerr != nil {
-			o.Error("OIDC Discovery 失败,handlers 将返回 500", zap.Error(cerr))
-			_ = o.Close()
-			o.stateStore = nil
-			return o
-		}
-		o.client = client
-		oidcProv, perr := newOIDCProvider(oidcProviderConfig{
-			Client:                client,
-			Scopes:                cfg.Provider.Scopes,
-			PostLogoutRedirectURI: cfg.Provider.PostLogoutRedirectURI,
-			EndSessionURLOverride: cfg.Provider.EndSessionURL,
-			OnWarn: func(msg string, err error) {
-				o.Warn(msg, zap.Error(err))
-			},
-		})
-		if perr != nil {
-			o.Error("OIDC provider 包装失败,handlers 将返回 500", zap.Error(perr))
-			_ = o.Close()
-			o.stateStore = nil
-			return o
-		}
-		o.provider = oidcProv
+	// o.client 只在标准 OIDC kind 下非 nil,留给尚未迁到抽象后面的 SyncWorker 用。
+	res, perr := NewAuthProvider(cctx, cfg.Provider, func(msg string, err error) {
+		o.Warn(msg, zap.Error(err))
+	})
+	if perr != nil {
+		o.Error("AuthProvider 构造失败,handlers 将返回 500", zap.Error(perr))
+		_ = o.Close()
+		o.stateStore = nil
+		return o
 	}
-
-	// id_token 缓存(RP-Initiated Logout)仅在功能"确实可用"时启用:既配了回跳地址
-	// (PostLogoutRedirectURI),又拿得到*合法 https* 的 end_session 端点(discovery 或
-	// override)。端点仅"非空"不够 —— 非法/非 https 端点下 logout 也出不了 URL
-	// (buildEndSessionURL 会拒),此时建池存 PII id_token 纯属浪费。放在 client 之后才能判
-	// 端点可用性。密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
-	if cfg.Provider.PostLogoutRedirectURI != "" {
-		// id_token 缓存只对标准 OIDC 有意义(OAuth2 无 id_token,LogoutURL 走 SLO
-		// appId 路径,不需要缓存 id_token)。端点可用性判断已下沉到 oidcProvider,
-		// 这里按类型取出;非 OIDC provider 断言失败 → endpoint 空 → 走禁用分支。
-		endpoint := ""
-		if op, ok := o.provider.(*oidcProvider); ok {
-			endpoint = op.endSessionEndpoint()
-		}
-		switch {
-		case endpoint == "" || validateLogoutURL("end_session_endpoint", endpoint) != nil:
-			// 配了回跳地址却拿不到可用端点:打 Info 让运维可见"为什么 RP-logout 没生效"。
-			o.Info("RP-Initiated Logout 已禁用:end_session 端点不可用(discovery 未提供且未配 override,或非 https)",
-				zap.String("endpoint", endpoint))
-		default:
-			if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
-				o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
-			} else {
-				o.idTokens = newRedisIDTokenStore(ctx, enc)
-			}
-		}
-	}
+	o.provider = res.Provider
+	o.client = res.Client
 
 	// bearer JWT(HS256)验签配置。secret 为空时 /exchange-jwt 直接返 500,
 	// 不 panic 不静默放行 —— 允许"上游 OIDC flow 开、bearer JWT 不接"的部署形态。

@@ -90,6 +90,13 @@ func (f *fakeProvider) Exchange(ctx context.Context, code, cv string) (*TokenSet
 func (f *fakeProvider) LogoutURL(ctx context.Context, hint LogoutHint) (string, bool) {
 	return "", false
 }
+
+// IdentityFromClientCredential 复用 Identity —— fake 不区分凭据来源,只区分
+// "被问了几次"和"返回什么",这两件事对两个入口是一样的。
+func (f *fakeProvider) IdentityFromClientCredential(ctx context.Context, raw string) (*IdentityClaims, error) {
+	return f.Identity(ctx, &TokenSet{AccessToken: raw})
+}
+
 func (f *fakeProvider) Identity(ctx context.Context, tok *TokenSet) (*IdentityClaims, error) {
 	atomic.AddInt64(&f.callN, 1)
 	f.lastTok = tok

@@ -621,6 +621,59 @@ was re-derived from the source before being acted on; all ten held.
   directory id while `subject_shape.go` treats that as unresolved. All four
   corrected in place, each with the reason the original wording was wrong.
 
+### Review round 3 — the integration endpoints were never adapted
+
+`modules/integration` exposes two endpoints that authenticate a caller with an
+upstream credential and resolve it to an already-linked local user:
+
+- `GET  /v1/integrations/oidc/spaces`
+- `POST /v1/integrations/oidc/exchange` (mints a `uk_` API key)
+
+Both went through `oidcAuth()`, which called `oidcClient.VerifyIDToken()`
+unconditionally, and `Integration.New()` called `oidc.NewClient()` — i.e. ran
+Discovery — regardless of the configured provider kind. Since the plain-OAuth2
+upstream has no Discovery document and issues no `id_token`, switching to that
+kind left the client nil and **both endpoints answering 500**. Making a new kind
+selectable without adapting these two was an incomplete change, not a
+non-blocking gap.
+
+Two things were extracted rather than branched a second time:
+
+- **`oidc.NewAuthProvider`** (`provider_factory.go`) is now the single place that
+  turns a configuration into a provider. `modules/oidc.New` and
+  `modules/integration.New` both call it. Copying the `switch` into the second
+  caller is exactly what produced the login-lockout drift in round 2, so the
+  dispatch stays in one place by construction.
+
+- **`AuthProvider.IdentityFromClientCredential`** interprets a credential the
+  *client* presents, as opposed to one we obtained through a code exchange. The
+  distinction is protocol-level and belongs to the provider: under standard OIDC
+  the client's verifiable credential is an `id_token`; under plain OAuth2 it is an
+  opaque `access_token` that can only be resolved by asking `/userinfo`.
+
+  Putting the choice behind the interface is what keeps the callers from
+  guessing — and **guessing by token shape is not acceptable**: an opaque access
+  token may happen to be JWT-shaped, and a shape sniffer would then feed an
+  unverified payload into a local verification path. A test drives a JWT-shaped
+  string at the plain-OAuth2 endpoint specifically to pin that it is refused.
+
+This also closed a defect the round-2 review had raised as non-blocking: `/exchange`
+hard-coded `&TokenSet{AccessToken: ...}`, which `oidcProvider.Identity` always
+rejects, so under the standard kind every existing deployment had gained an
+unauthenticated endpoint that could only ever answer 401. It now routes through
+the same method and is meaningful under both kinds.
+
+**Still open — the third credential type.** A business-signed HS256 JWT (the one
+`/exchange-jwt` accepts) is *not* accepted on these two endpoints. It cannot be
+added by configuration alone: with a bearer-JWT secret configured under the
+plain-OAuth2 kind, two different credential types would arrive in the same
+`Authorization: Bearer` header with no way to tell them apart short of sniffing
+the shape, which is the thing being ruled out. It therefore needs an explicit
+client-visible signal — a separate path (as `/exchange` vs `/exchange-jwt`
+already does) or a declared credential type — and that is an API-contract
+decision, so it is Pending rather than guessed at. Today such a token is refused
+fail-closed, because the upstream does not recognise it.
+
 ## Integration tests written (this PR)
 
 All tests pass under `go test -race ./modules/oidc/ ./pkg/wkhttp/ ./pkg/accesslog/`.

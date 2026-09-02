@@ -125,6 +125,24 @@ type AuthProvider interface {
 	// plain-OAuth2 实现:GET /userinfo → 解私有信封 → 映射到 claims。
 	Identity(ctx context.Context, tok *TokenSet) (*IdentityClaims, error)
 
+	// IdentityFromClientCredential 把**客户端直接出示的**上游凭据映射为 claims。
+	//
+	// 与 Identity 的区别不在实现,而在凭据的来源:Identity 处理的是我方用
+	// authorization code 换回来的 TokenSet(我方知道里面有什么);这个方法处理的是
+	// 客户端自己完成 SSO 后带过来的一个字符串(我方只知道它是个 Bearer)。
+	//
+	// 为什么必须由 provider 决定怎么解释这个字符串:
+	//
+	//   - 标准 OIDC 下客户端手上的可验证凭据是 id_token(有签名,能独立验);
+	//   - plain-OAuth2 下是不透明的 access_token(没有签名,只能拿去问 /userinfo)。
+	//
+	// 上层拿不到这个区别就只能猜,而**按 token 长得像不像 JWT 来猜是不可接受的**:
+	// 一个不透明 access_token 完全可能恰好是 JWT 形态,那时会被送进错误的验证路径
+	// 并可能通过。所以由 provider 按自己的协议事实解释,上层保持 kind 无关。
+	//
+	// 失败一律返回 error;调用方对客户端只回一个笼统的 401(反枚举)。
+	IdentityFromClientCredential(ctx context.Context, raw string) (*IdentityClaims, error)
+
 	// LogoutURL 返回上游登出跳转地址;不支持或材料不全时返回 ("", false)。
 	//
 	// 返回值必须由**浏览器顶层导航**访问。服务端代理该请求不会携带用户在 IdP

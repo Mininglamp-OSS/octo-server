@@ -165,3 +165,42 @@ func (m *mockOAuth2Provider) providerConfig() oauth2ProviderConfig {
 		PostLogoutRedirectURI: "https://app.example.com/login",
 	}
 }
+
+// MockOAuth2Provider 是 mockOAuth2Provider 的导出门面,供**其他模块**的测试使用。
+//
+// 为什么需要:modules/integration 的两个端点要在 plain-OAuth2 kind 下被端到端
+// 驱动,而这个 kind 的身份来源是上游 /userinfo —— 那必须有一个会返回厂商私有
+// 信封的服务在跑。让 integration 自己起一个 httptest server 就等于把信封形状
+// 抄第二份,而信封解析正是本模块的信任边界:抄错一个字段,那边的测试就在验证
+// 一个我们并不接受的形态。
+//
+// 只暴露测试真正需要的四件事,内部那些故障注入开关不外泄 —— 它们是本包用来
+// 测信任边界的,跨模块使用会把别人的测试绑在本包的实现细节上。
+type MockOAuth2Provider struct {
+	inner *mockOAuth2Provider
+}
+
+// NewMockOAuth2Provider 起一个返回厂商信封的 /userinfo 与 /token 的 mock IdP。
+// 生命周期绑定 t,测试结束自动关闭。
+func NewMockOAuth2Provider(t *testing.T) *MockOAuth2Provider {
+	t.Helper()
+	return &MockOAuth2Provider{inner: newMockOAuth2Provider(t)}
+}
+
+// BaseURL 站点根,填给 OCTO_OIDC_PROVIDER_BASE_URL。
+func (m *MockOAuth2Provider) BaseURL() string { return m.inner.Server.URL }
+
+// AccessToken mock 唯一认可的不透明 access_token。
+//
+// 刻意是不透明串而非 JWT:这个协议下 access_token 没有可本地验证的结构,
+// 用 JWT 形态当 fixture 会让"按形态猜"的实现意外通过。
+func (m *MockOAuth2Provider) AccessToken() string { return m.inner.KnownAccessToken }
+
+// Subject mock 在 /userinfo 里返回的 sub。
+func (m *MockOAuth2Provider) Subject() string { return m.inner.SubjectForUserInfo }
+
+// SetSubject 改变 /userinfo 返回的 sub。
+//
+// 取值需满足 checkSubjectShape(纯数字时至少 10 位),否则会在信任边界被拒 ——
+// 那是有意的守卫,不是 mock 的限制。
+func (m *MockOAuth2Provider) SetSubject(sub string) { m.inner.SubjectForUserInfo = sub }

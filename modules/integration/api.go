@@ -35,10 +35,16 @@ var (
 )
 
 type Integration struct {
-	ctx           *config.Context
-	db            *integrationDB
-	oidcDB        *oidc.DB
-	oidcClient    *oidc.Client
+	ctx    *config.Context
+	db     *integrationDB
+	oidcDB *oidc.DB
+	// provider 按 provider kind 构造(见 oidc.NewAuthProvider)。
+	//
+	// 原本这里存的是 *oidc.Client,并且 New() 无条件做 Discovery —— 于是切到
+	// 没有 Discovery 的 plain-OAuth2 kind 之后,本模块两个对外端点整体返回 500。
+	// 改存抽象之后,"客户端出示的这个 Bearer 该怎么解释"由 provider 自己决定,
+	// 本模块保持 kind 无关。
+	provider      oidc.AuthProvider
 	apiKeyService botfather.UserAPIKeyService
 	groupService  group.IService
 	rateRedis     *rd.Client
@@ -63,20 +69,20 @@ func New(ctx *config.Context) *Integration {
 	if !cfg.Enabled {
 		return it
 	}
-	client, err := oidc.NewClient(context.Background(), oidc.ClientConfig{
-		Issuer:       cfg.Provider.Issuer,
-		ClientID:     cfg.Provider.ClientID,
-		ClientSecret: cfg.Provider.ClientSecret,
-		RedirectURI:  cfg.Provider.RedirectURI,
-		Scopes:       cfg.Provider.Scopes,
-		ClockSkew:    cfg.Provider.ClockSkew,
-		HTTPTimeout:  cfg.Provider.HTTPTimeout,
+	// 分派与 modules/oidc 共用同一份实现:标准 OIDC 走 Discovery,plain-OAuth2
+	// 直接从配置拼端点(不发网络请求)。在这里另抄一份 switch 就又造出一份
+	// 会漂移的副本。
+	cctx, cancel := context.WithTimeout(context.Background(), cfg.Provider.HTTPTimeout)
+	defer cancel()
+	res, err := oidc.NewAuthProvider(cctx, cfg.Provider, func(msg string, werr error) {
+		it.Warn(msg, zap.Error(werr))
 	})
 	if err != nil {
-		it.Error("初始化 OIDC integration client 失败", zap.Error(err))
+		// fail-closed:构造失败意味着无法确立任何身份,两个端点必须继续拒绝请求。
+		it.Error("初始化 OIDC integration provider 失败", zap.Error(err))
 		return it
 	}
-	it.oidcClient = client
+	it.provider = res.Provider
 	return it
 }
 
@@ -122,7 +128,7 @@ func (it *Integration) forceEnglish() wkhttp.HandlerFunc {
 
 func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-		if it.oidcClient == nil {
+		if it.provider == nil {
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 			c.Abort()
 			return
@@ -133,9 +139,15 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 			c.Abort()
 			return
 		}
-		claims, err := it.oidcClient.VerifyIDToken(c.Request.Context(), raw)
+		// 由 provider 解释这个凭据,不由本模块猜。
+		//
+		// **不能按 token 长得像不像 JWT 来分流**:plain-OAuth2 的 access_token 是
+		// 不透明串,完全可能恰好是 JWT 形态(上游内部用什么编码是它的事),
+		// 按形态猜会把一个未经我方验证的载荷当成身份来源。
+		claims, err := it.provider.IdentityFromClientCredential(c.Request.Context(), raw)
 		if err != nil {
-			it.Warn("OIDC integration token verify failed", zap.Error(err))
+			it.Warn("OIDC integration token verify failed",
+				zap.String("provider_kind", string(it.provider.Kind())), zap.Error(err))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
 			c.Abort()
 			return

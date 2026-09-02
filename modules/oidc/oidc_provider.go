@@ -251,3 +251,22 @@ func (p *oidcProvider) endSessionEndpoint() string {
 	}
 	return p.cfg.Client.EndSessionEndpoint()
 }
+
+// IdentityFromClientCredential 把客户端出示的 id_token 验签后映射为 claims。
+//
+// 标准 OIDC 下客户端手上唯一可独立验证的凭据就是 id_token —— access_token 在
+// 这个协议里是给资源服务器用的不透明串,拿它当身份证明等于不验签。所以这里
+// 走的是与 Identity 相同的验签路径,只是凭据从"我方换回来的 TokenSet"变成
+// "客户端带过来的字符串"。
+//
+// 复用 Identity 而不是直接调 VerifyIDToken,是为了让 /userinfo 交叉校验、nonce
+// 处理这些步骤对两种来源保持一致 —— 少走任何一步都是一处只在这条路径上存在的
+// 安全缺口。nonce 留空:客户端出示凭据时没有我方发起的 authorize 请求可绑定,
+// Identity 对空 nonce 的处理与 callback 路径一致。
+func (p *oidcProvider) IdentityFromClientCredential(ctx context.Context, raw string) (*IdentityClaims, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("%w: credential is empty", ErrIdentityUntrusted)
+	}
+	return p.Identity(ctx, &TokenSet{RawIDToken: raw})
+}
