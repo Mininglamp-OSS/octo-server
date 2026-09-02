@@ -55,9 +55,10 @@ rather than a leak.
 | G4 length bound on `issuer` / `subject` | the **column** (`VARCHAR(255)`, compared in bytes — intentionally conservative) | `requireStorableIdentity`; `issuer` additionally at provider construction | all |
 | G5 short-numeric refusal ("looks like an employee number") | the **producer** — requires a personnel system that reuses numbers | gated on `Capabilities().SubjectMayBeReusedPersonnelID`: declared **true** by `oauth2Provider` only. Per-kind expectations pinned by `TestAuthProviderConformance_ShortNumericSubjectFollowsCapability` | `kind=oauth2` on P1/P2/P4-C2, plus P5 snapshot consumption via the same bit. **Not** under `kind=oidc`: that is the generic client existing deployments already run against arbitrary IdPs, and a self-hosted IdP emitting its own primary keys as `sub` (`1001`, `42`) is normal. **Not** P3/P4-C3: that subject is our own DB primary key, never reused |
 | G6 byte-exact `(issuer, subject)` recheck | the `utf8mb4_general_ci` collation | `DB.QueryIdentityExact`; the raw query is unexported so this is compiler-enforced | all read paths |
-| G7 credential provenance split ("is this ours?") | the HMAC | `IsForeignToken`, allowlist over `ErrJWTForeign` | P4 only (the only path with two credential types) |
+| G7 credential provenance split ("is this ours?") | the HMAC | `IsForeignToken`, allowlist over `ErrJWTForeign` | **P2 and P4** — both accept two credential types on one field. The row said "P4 only" for three rounds while the row below already recorded P2; `/exchange` had no verifier stage at all until round 9 |
 | G8 freshness | the purpose | `VerifyForRedemption` (10 min from `iat`) vs `VerifyForAuthentication` (token's own `exp`) | P3 uses the former, P4-C3 the latter |
-| G11 own-credential refusal | which system minted the credential | `oidc.OwnCredentialDetector` (`uk_`/`bf_` prefix, then session-store lookup), called immediately before any upstream call | P2, P4. Fails **closed**: if the session store is unavailable the answer is "undecided", and undecided must not forward |
+| G11 own-credential refusal | which system minted the credential | `oidc.OwnCredentialDetector` — `uk_` / `bf_` / `app_` prefix, then a session-store lookup — called immediately before any upstream call. Prefix coverage is pinned by a source scan over all of `modules/`, so a new credential-minting module is a CI failure rather than a leak | P2, P4. Fails **closed**: if the session store is unavailable the answer is "undecided", and undecided must not forward |
+| G12 unverifiable JWT-shape refusal | the provider declaring `OpaqueClientCredential` | `UnverifiableJWTMustNotBeForwarded` — refuse a JWT-shaped credential when the bearer verifier is **unconfigured**. Not shape-based routing: with no key there is no attribution to be had, and this vendor's `access_token` is an opaque UUID, so a JWT provably cannot succeed here. Vendor fact, hence a capability — the standard kind's client credential *is* a JWT | P2, P4 under `kind=oauth2` only |
 | G10 IP rate limit | the endpoint being unauthenticated | `StrictIPRateLimitMiddleware` on each unauthenticated group | strict limiter on P2, P3, P4; **P1 has only the global IP floor**. Each of P2–P4 triggers an outbound call, so the limiter is what stops them being amplifiers |
 | G9 autolink admission | verified-claim availability | `ResolveOrLink` + `pkg/oidcboot.ValidateKind` at boot | P1, P2; fail-closed on P3/P4-C3 (no Email/Phone/Verified fields) |
 
@@ -154,6 +155,9 @@ what does the affected path do when it failed to build?
 |---|---|---|---|
 | `AuthProvider` | n/a — required | P1/P2/P3 `provider == nil` → 500; P4 → 500 on every request | `new_wiring_integration_test.go` |
 | `BearerJWTVerifier` | `(nil, nil)` → P2 accepts C2 only, P3 returns 500 ("not configured"), P4 accepts C2 only | `(nil, err)` → P3 500; **P2 and P4 both refuse every credential**, including C2 | `TestExchange_FailsClosedWhenVerifierConstructionFailed`, `TestNew_RetainsBearerVerifierConstructionError_Integration`, `TestBearerJWT_VerifierConstructionFailureFailsClosed`, `TestExchange_AbsentSecretKeepsUpstreamPathWorking` |
+| id_token store (`redisIDTokenStore`) | `PostLogoutRedirectURI` unset → RP-logout off, logged at Info | encryptor build fails → logged at Error, RP-logout off | `TestNew_IDTokenStoreConstructorIsReachableFromProduction_Integration` |
+| exchange rate limiters | n/a | Redis unavailable → **fail-open** (deliberate: matches `pkg/wkhttp` policy) | `exchange_limiter_lifecycle_test.go` |
+| audit sink | n/a | write failure logged, request proceeds | existing audit tests |
 
 **P2 was the empty cell in this column for one round.** The round-8 verifier stage on
 `/exchange` was written as `if o.bearerJWT != nil`, and `modules/oidc`'s `New()` logged the
@@ -166,9 +170,12 @@ The distinction that makes it a leak rather than a confusing 401: an **absent** 
 no C3 credential can exist, but an **invalid** one is shared out-of-band with the client
 backend, which signs with it. HMAC does not care about key length — the 32-byte floor is our
 admission policy — so the token carries a signature that is valid under our configured secret.
-| id_token store (`redisIDTokenStore`) | `PostLogoutRedirectURI` unset → RP-logout off, logged at Info | encryptor build fails → logged at Error, RP-logout off | `TestNew_IDTokenStoreConstructorIsReachableFromProduction_Integration` |
-| exchange rate limiters | n/a | Redis unavailable → **fail-open** (deliberate: matches `pkg/wkhttp` policy) | `exchange_limiter_lifecycle_test.go` |
-| audit sink | n/a | write failure logged, request proceeds | existing audit tests |
+
+**The absent case was open for one round after that.** `(nil, nil)` also skipped the stage,
+and the argument that closed the invalid case applies unchanged: the client backend holds and
+signs with its own secret regardless of our configuration. It is now closed by G12 — with no
+key there is no attribution to be had, so a JWT-shaped credential is refused on the grounds
+that it provably cannot succeed against an opaque-token provider.
 
 Why P4 refuses C2 as well when the C3 verifier failed: without a constructible
 verifier the question "is this credential ours?" (G7) has no answer, and any

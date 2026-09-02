@@ -416,6 +416,47 @@ implementations are not forced to stub them out.
 - Real credentials and real user PII are **not** committed to the repository;
   all test tokens and secrets are synthetic values generated in-test.
 
+## Behaviour that changes for an existing `kind=oidc` deployment
+
+Enumerated by diffing every pre-existing production file against the real baseline
+(`origin/main` = `508d3c90`, not the stale local `main` ref). Three items were live on the
+existing authentication path and were **not** in the change inventory the merge decision
+reads. None is a defect; all three needed stating.
+
+**1. Phone parsing changes who owns which account.** `extractZone`/`extractPhone` — the
+functions the browser callback calls — now delegate to `normalizePhone`. `AutoLinkByPhone`
+defaults true, so with a verified phone claim this decides between "link into the existing
+local account" and "create a second account", and that write is irreversible.
+
+- *Looser*: `8613…`, `008613…` and separator-laden forms now yield a phone where they
+  previously yielded `""`. An IdP that returns verified numbers without a leading `+` will
+  now **link** on first SSO login where it previously created a new account.
+- *Stricter*: `+86` followed by a non-mobile body (a landline such as `+862112345678`)
+  now yields `""` where it previously yielded `2112345678`, so a link that used to happen
+  no longer does.
+
+Kept rather than gated: linking on a verified phone is precisely what `AutoLinkByPhone`
+means, and the widened parsing is closer to that intent than the old prefix test. Pinned by
+`phone_autolink_behaviour_test.go`, which drives each upstream form through `ResolveOrLink`
+and asserts the link/no-link outcome — previously only the parser was unit-tested, so this
+change was invisible to the suite.
+
+**2. The login lookup is byte-exact, which is stricter than before.**
+`QueryIdentityExact` returns "not linked" when the stored row differs from the queried
+`(issuer, subject)` in case only. Required — the table collates case-insensitively, so
+without it an uppercase subject resolves onto a lowercase account. The consequence worth
+stating: if an IdP ever changed the case of its `sub`, those users move from "linked" to
+"not linked", and with `AllowNewUser` defaulting true they receive a **new empty account**
+plus a new irreversible identity row. Safe for a consistent IdP. Operationally, the log line
+for a folded collision is indistinguishable from a genuinely unbound user.
+
+**3. The access-log scrub is wider, and it is service-wide.** The redaction pattern gained
+`client_secret`, `refresh_token`, `access_token`, `id_token`, `code` and `state`. The last
+two are generic parameter names, so this is not an OIDC-scoped change: `modules/group`
+uses `?code=` for invite codes, and those are now redacted everywhere. The direction is
+fail-safe (over-redaction) and arguably desirable for invite codes too, but it reduces
+debuggability outside this feature and belongs in the inventory rather than in a diff.
+
 ## Pending / follow-up (not blocking this PR)
 
 - **Session TTL ceiling for SSO users** — tightening `Cache.TokenExpire` (default

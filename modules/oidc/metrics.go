@@ -92,6 +92,15 @@ func exchangeResultLabels() []string {
 		"issue_fail",           // 401:IssueSession 失败
 		"identity_insert_fail", // 401:identity 行写入失败(非 duplicate)
 		"race_recovered",       // 200:并发首登竞态,已恢复
+
+		// 凭据归属判定的五个结果,全部是"外呼前就地拒绝"。它们的出现次数是观测
+		// "有客户端在往错误端点发凭据"的唯一信号,所以必须能被预先告警 ——
+		// 覆盖完整性由 metrics_label_coverage_test.go 扫源码钉住。
+		"own_business_jwt",     // 401:业务 JWT 发到了 /exchange(该发 /exchange-jwt)
+		"own_credential",       // 401:会话 token / uk_ / bf_ / app_
+		"unverifiable_jwt",     // 401:JWT 形态但验签器未配置,无法归属
+		"provenance_undecided", // 500:会话存储不可用,判不出归属
+		"verifier_unavailable", // 500:验签器构造失败,拒绝一切凭据
 	}
 }
 
