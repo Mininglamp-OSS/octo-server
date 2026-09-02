@@ -364,8 +364,10 @@ func (p *oauth2Provider) Issuer() string { return p.cfg.Issuer }
 // Capabilities 诚实声明本协议缺失的能力,供上层跳过对应步骤。
 func (p *oauth2Provider) Capabilities() ProviderCapabilities {
 	return ProviderCapabilities{
-		PKCE:  false, // authorize 端点无 code_challenge 参数
-		Nonce: false, // 没有可把 nonce 带回来的签名载荷
+		// 这家 IdP 的文档对 sub 是内部 id 还是工号说法不一 —— 见能力位说明。
+		SubjectMayBeReusedPersonnelID: true,
+		PKCE:                          false, // authorize 端点无 code_challenge 参数
+		Nonce:                         false, // 没有可把 nonce 带回来的签名载荷
 		// token 响应不含 id_token → 上层不得缓存 id_token、不得走
 		// RP-Initiated Logout(见 LogoutURL 用的是厂商私有登出端点)。
 		IDToken: false,

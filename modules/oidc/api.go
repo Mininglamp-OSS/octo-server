@@ -302,6 +302,9 @@ func (o *OIDC) Init() error {
 		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
 		locator := dbBindLocator{db: o.db}
 		o.bind = newBindService(o.cfg.Bind, o.bindStore, userSvc, locator)
+		if o.provider != nil {
+			o.bind.subjectMayBeReusedPersonnelID = o.provider.Capabilities().SubjectMayBeReusedPersonnelID
+		}
 		// Confirm 路径需要 identity 写入 + IssueSession 签发,复用 *Service 已经
 		// 持有的 store(identityStore) 和 users(userLookup)。两者都在 newService
 		// 内完成构造,Init 顺序保证 o.service 此时非 nil。

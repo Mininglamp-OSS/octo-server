@@ -77,6 +77,14 @@ type BindService struct {
 	locator  BindLocator
 	identity identityStore // confirm 路径写 user_oidc_identity
 	users    userLookup    // confirm 路径调 IssueSession 签发 dmwork 会话
+
+	// subjectMayBeReusedPersonnelID 取自当前 provider 的同名能力位。
+	//
+	// 快照是 callback 路径存下来的,subject 由上游给出;而"这家 IdP 的 sub 会不会
+	// 是复用的工号"是按部署的事实,一个部署只跑一个 kind,所以读当前 provider 的
+	// 表态是对的。不能无条件施加 —— 那会让标准 OIDC 部署里一份形态正常的旧快照
+	// 在 Confirm/Create 上被拒,和登录路径上同一个过度拒绝。
+	subjectMayBeReusedPersonnelID bool
 }
 
 func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, locator BindLocator) *BindService {
@@ -420,7 +428,7 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	if err != nil {
 		return nil, err
 	}
-	if err := recheckSnapshotIdentity("oidc bind Confirm", claims); err != nil {
+	if err := s.recheckSnapshotIdentity("oidc bind Confirm", claims); err != nil {
 		return nil, err
 	}
 	sd, err := decodeSDSnapshot(sess.SDSnapshot)
@@ -546,7 +554,7 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 	if err != nil {
 		return nil, err
 	}
-	if err := recheckSnapshotIdentity("oidc bind Create", claims); err != nil {
+	if err := s.recheckSnapshotIdentity("oidc bind Create", claims); err != nil {
 		return nil, err
 	}
 	if err := s.checkClaimsForCreate(claims); err != nil {
@@ -842,15 +850,18 @@ var nowUnix = func() int64 {
 // 已经在 Create 里为 issuerAllowedForCreate 写过一次 —— TTL 窗口内世界会变,
 // 只是那次变的是 allowlist,这次变的是我方的准入规则本身。
 //
-// 两道都要:requireStorableIdentity 是存储性质(所有来源),
-// checkUpstreamSubjectShape 是上游断言的性质 —— 而绑定快照正是 callback 路径
-// 存下来的,subject 由上游给出,所以适用。
-func recheckSnapshotIdentity(ctxName string, claims *IDTokenClaims) error {
+// 存储上限对所有来源无条件生效。形态启发式则跟着当前 provider 的
+// SubjectMayBeReusedPersonnelID 走:它是按部署的事实(这家 IdP 的 sub 是不是
+// 复用的工号),不是协议事实,无条件施加会让标准 OIDC 部署的正常旧快照被拒。
+func (s *BindService) recheckSnapshotIdentity(ctxName string, claims *IDTokenClaims) error {
 	if err := requireStorableIdentity(claims); err != nil {
 		return fmt.Errorf("%s: %w", ctxName, err)
 	}
-	if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
-		return fmt.Errorf("%s: %w", ctxName, err)
+	// 形态启发式跟着 provider 的表态走 —— 见 BindService.subjectMayBeReusedPersonnelID。
+	if s.subjectMayBeReusedPersonnelID {
+		if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
+			return fmt.Errorf("%s: %w", ctxName, err)
+		}
 	}
 	return nil
 }

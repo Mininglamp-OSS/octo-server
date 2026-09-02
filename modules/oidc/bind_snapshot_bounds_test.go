@@ -107,10 +107,12 @@ func TestBindCreate_RefusesPreUpgradeSnapshotWithUnstorableSubject(t *testing.T)
 	}
 }
 
-// 工号形态的下限对旧快照同样是新的:它这一轮才加到标准 OIDC 那条路上,
-// 而旧快照正是那条路签发的。
+// 工号形态的下限对旧快照同样是新的 —— 但只在声明了该危险的 provider 下生效
+// (SubjectMayBeReusedPersonnelID)。标准 OIDC 部署不受影响,见下一条反面用例。
 func TestBindCreate_RefusesPreUpgradeSnapshotWithShortNumericSubject(t *testing.T) {
 	h := newBindHarness(t)
+	// 建模一个 plain-OAuth2 部署 —— 形态启发式只在声明了该危险的 provider 下生效。
+	h.svc.subjectMayBeReusedPersonnelID = true
 
 	sess := &BindSession{
 		JTI:            "jti-legacy-empno",
@@ -159,5 +161,33 @@ func TestBindCreate_AcceptsWellFormedPreUpgradeSnapshot(t *testing.T) {
 	if _, err := h.svc.Create(context.Background(), sess.JTI); err != nil {
 		t.Fatalf("a well-formed pre-upgrade snapshot was refused; in-flight bind sessions "+
 			"would break on deploy: %v", err)
+	}
+}
+
+// 反面:在**没有**声明工号危险的部署(标准 OIDC)里,同一份短数字快照必须放行。
+//
+// 否则这道消费期复核就把登录路径上刚撤掉的过度拒绝,从后门又加了回来 ——
+// 一个 sub 是数据库小主键的自建 IdP,其在途绑定会话会在升级后全部失败。
+func TestBindCreate_ShortNumericSnapshotPassesWhenTheProviderDoesNotDeclareTheHazard(t *testing.T) {
+	h := newBindHarness(t) // subjectMayBeReusedPersonnelID 默认 false
+
+	sess := &BindSession{
+		JTI:            "jti-legacy-smallpk",
+		Issuer:         "https://idp.example",
+		Subject:        "1001",
+		ClaimsSnapshot: legacyOversizedSnapshot("1001"),
+		SDSnapshot:     []byte(`{"ip":"203.0.113.7","device_flag":0}`),
+		Status:         BindStatusIssued,
+		IssueReason:    BindReasonUnknownUser,
+		CreatedAt:      time.Now().Unix(),
+	}
+	if err := h.store.Save(context.Background(), sess, time.Minute); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	if _, err := h.svc.Create(context.Background(), sess.JTI); err != nil {
+		t.Fatalf("a small numeric subject was refused on a provider that does not declare "+
+			"the personnel-id hazard: %v. Self-hosted IdPs surface their own primary keys "+
+			"as sub; refusing them takes bind (and login) away from those deployments", err)
 	}
 }

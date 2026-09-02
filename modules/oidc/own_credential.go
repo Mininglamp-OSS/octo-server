@@ -16,6 +16,13 @@ package oidc
 //   - uk_ / bf_ 是我方签发凭据的规范前缀(userAPIKeyAuth 就用它做判据);
 //   - 会话 token 查我方会话存储 —— 查得到就是我们签的。
 //
+// 已知缺口:modules/bot_api/auth.go 至今仍接受**无前缀的历史 bot token**
+// (那里的注释写着 "bf_ 前缀或 legacy token")。这类 token 没有可判定的形态,
+// 也不在会话存储里,因此这里认不出来。查它需要打 robot 表 —— 一次 DB round-trip
+// 挂在每个未认证请求上,而且会把这两个端点变成 bot token 的存在性预言机。
+// 现状是:如果生产里还有这种 token,它仍可能被转发。是否清零由运维确认,
+// 记在 guard-matrix.md 的"未闭合格子"里,不在这里靠猜。
+//
 // 不按形态猜:上游的不透明 access_token 完全可能长得像任何东西,猜错的代价是
 // 把一个未经我方验证的载荷当成身份来源。
 
@@ -25,6 +32,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 
+	app_bot "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 )
@@ -39,6 +47,9 @@ const (
 	OwnCredentialUserAPIKey OwnCredentialKind = "user_api_key"
 	// OwnCredentialBotToken bf_ 机器人 token。
 	OwnCredentialBotToken OwnCredentialKind = "bot_token"
+	// OwnCredentialAppBotToken app_ App Bot token。存 app_bot 表,不在会话存储里,
+	// 所以只能靠前缀认出来 —— 长期有效且 DB 背书,泄漏后果比 bf_ 更重。
+	OwnCredentialAppBotToken OwnCredentialKind = "app_bot_token"
 	// OwnCredentialSessionToken 我方登录会话 token。
 	OwnCredentialSessionToken OwnCredentialKind = "session_token"
 )
@@ -82,6 +93,8 @@ func (d *OwnCredentialDetector) Classify(ctx context.Context, raw string) (OwnCr
 		return OwnCredentialUserAPIKey, nil
 	case strings.HasPrefix(raw, botfather.BotTokenPrefix):
 		return OwnCredentialBotToken, nil
+	case strings.HasPrefix(raw, app_bot.AppBotTokenPrefix):
+		return OwnCredentialAppBotToken, nil
 	}
 	if d.reader == nil {
 		return OwnCredentialNone, nil

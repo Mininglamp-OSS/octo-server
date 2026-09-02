@@ -123,17 +123,29 @@ func TestAuthProviderConformance_IssuerFitsTheIdentityColumn(t *testing.T) {
 	}
 }
 
-// 契约:任何 provider 都必须拒绝"短纯数字"的上游 subject。
+// 契约:短纯数字 subject 的拒绝**按 provider 声明的能力**决定,不是所有 provider 都做。
 //
-// 这条规则原先只挂在 plain-OAuth2 的信封解析上。它属于**上游断言的 subject** ——
-// 工号由人事系统分配、会在离职/入职之间复用,而 (issuer, subject) 是不可变主键,
-// 于是新人会被指到前任的账号上。这个论证对任何上游 IdP 都成立,所以两个实现都要
-// 有,而且必须由契约钉住:两处各写一遍的东西迟早只剩一处。
+// 这条测试原先断言"两个 provider 都必须拒绝",而那是错的 —— 我把一个厂商特定的
+// 事实当成了协议事实。
 //
-// 注意它**不**属于共享入口:我方自己派生的 subject(业务 JWT 的 userId)是数据库
-// 主键,不复用,小取值正常 —— 见 checkUpstreamSubjectShape。
-func TestAuthProviderConformance_RefusesShortNumericUpstreamSubject(t *testing.T) {
-	t.Run("oauth2", func(t *testing.T) {
+// 论证的来源是**某一家 IdP** 的文档自相矛盾:它对 sub 到底是内部 id 还是工号说法
+// 不一,而工号由人事系统分配、会在离职/入职之间复用。那是这家 IdP 的人事系统的
+// 性质,不是 OIDC 的性质。
+//
+// kind=oidc 是存量部署已经在跑的通用客户端,对着运维自己选的任何 IdP。一个自建
+// IdP 把用户表主键当 sub(1001、42)完全正常,它不复用任何东西 —— 而上一版会把
+// 这类部署**全量拒登**,且 minNumericSubjectLen 是 const、没有开关,恢复手段是
+// 改代码重新发布。
+//
+// 同一个论证本模块自己在另一根轴上已经写过:identity_bounds.go 把业务 JWT 排除在
+// 这条启发式之外,理由是"那是我方业务库主键、不复用、userId=42 完全正常"。自建
+// IdP 的主键是同一个情形,我当时选的区分轴(自己派生 vs 上游断言)不是论证需要的
+// 那一根(这家 IdP 的 subject 是不是复用的人事标识)。
+//
+// 现在由 Capabilities().SubjectMayBeReusedPersonnelID 声明,provider 各自表态。
+// 长度上限**不**受此影响:那是存储性质,由共享入口对所有路径统一施加。
+func TestAuthProviderConformance_ShortNumericSubjectFollowsCapability(t *testing.T) {
+	t.Run("oauth2 refuses it", func(t *testing.T) {
 		m := newMockOAuth2Provider(t)
 		m.UserInfoBody = `{"success":true,"code":"200","requestId":"req-empno",
 		  "data":{"sub":"7654321","nickname":"n"}}`
@@ -141,12 +153,18 @@ func TestAuthProviderConformance_RefusesShortNumericUpstreamSubject(t *testing.T
 		if err != nil {
 			t.Fatalf("newOAuth2Provider: %v", err)
 		}
+		if !p.Capabilities().SubjectMayBeReusedPersonnelID {
+			t.Fatal("this kind is the one whose IdP documentation motivates the guard; " +
+				"it must declare the hazard")
+		}
 		if _, err := p.IdentityFromClientCredential(context.Background(), "any-token"); err == nil {
-			t.Error("plain OAuth2 accepted a 7-digit numeric subject")
+			t.Error("plain OAuth2 accepted a 7-digit numeric subject; for this IdP that is " +
+				"an employee number, and employee numbers are reused between a leaver and " +
+				"a joiner while (issuer, subject) is an immutable key")
 		}
 	})
 
-	t.Run("oidc", func(t *testing.T) {
+	t.Run("standard oidc accepts it", func(t *testing.T) {
 		mp := NewMockProvider(t)
 		const code = "code-empno"
 		mp.PrepCode(code, "7654321", "")
@@ -157,15 +175,30 @@ func TestAuthProviderConformance_RefusesShortNumericUpstreamSubject(t *testing.T
 		if err != nil {
 			t.Fatalf("newOIDCProvider: %v", err)
 		}
+		if p.Capabilities().SubjectMayBeReusedPersonnelID {
+			t.Fatal("the generic OIDC client cannot know the operator's IdP allocates " +
+				"reusable personnel identifiers; declaring the hazard here refuses every " +
+				"login for a deployment whose IdP simply uses small primary keys")
+		}
 		tok, err := p.Exchange(context.Background(), code, "")
 		if err != nil {
 			t.Fatalf("Exchange: %v", err)
 		}
-		if _, err := p.Identity(context.Background(), tok); err == nil {
-			t.Error("standard OIDC accepted a 7-digit numeric subject; a signature proves the " +
-				"IdP asserted it, not that the value is a safe identity key — employee numbers " +
-				"are reused, so the mapping would eventually point a new hire at a former " +
-				"employee's account")
+		if _, err := p.Identity(context.Background(), tok); err != nil {
+			t.Errorf("standard OIDC refused a 7-digit numeric subject: %v. That heuristic "+
+				"comes from one vendor's personnel system; applying it to the generic client "+
+				"takes login away from every user of an existing deployment whose IdP emits "+
+				"short numeric subs, with no operator override and no recovery short of a "+
+				"redeploy", err)
+		}
+	})
+
+	// 上限对两个 kind 都生效 —— 它是列宽,不是启发式。
+	t.Run("the storage bound still applies to both", func(t *testing.T) {
+		long := strings.Repeat("9", subjectMaxLen+1)
+		if err := requireStorableIdentity(&IdentityClaims{
+			Issuer: "https://idp.example", Subject: long}); err == nil {
+			t.Error("an oversized subject was accepted; the column cannot hold it")
 		}
 	})
 }

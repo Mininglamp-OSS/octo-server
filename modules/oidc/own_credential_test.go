@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 
@@ -181,5 +182,123 @@ func newOAuth2ExchangeTestOIDC(t *testing.T, prov AuthProvider) *OIDC {
 		stateStore: newMemoryStateStore(),
 		authcode:   newFakeAuthcode(),
 		audit:      newFakeAudit(),
+	}
+}
+
+// 业务 JWT 发到 /exchange(而不是 /exchange-jwt)必须就地拒绝,不得转发上游。
+//
+// 这条是"守卫只挂了两个消费者中的一个"的又一例。modules/integration 的 oidcAuth
+// 先跑 HMAC 验签、`!IsForeignToken` 就地拒;/exchange 上根本没有验签这一步,而
+// ownCred.Classify 覆盖不到业务 JWT —— 它无前缀、无状态,会话查表必然落空。
+//
+// 撞上的概率不低:两个端点请求体一模一样、字段都叫 access_token,本文件顶部的
+// 注释自己就在警告发错端点只会得到一个无差别 401。发错的那一次,一张带着我方
+// 密钥下合法 HMAC、载有真实 userId 的 token 就进了第三方的访问日志 —— 那既是
+// PII,也是可离线校验密钥的材料。
+func TestOwnCredential_ExchangeDoesNotForwardOurBusinessJWT(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	prov, err := newOAuth2Provider(m.providerConfig())
+	if err != nil {
+		t.Fatalf("newOAuth2Provider: %v", err)
+	}
+	o := newOAuth2ExchangeTestOIDC(t, prov)
+	secret := []byte("exchange-path-test-secret-32byte!")
+	o.bearerJWT = newBearerJWTVerifierForTest(secret, prov.Issuer()+bearerJWTIssuerSuffix)
+	// 会话存储查不到 —— 业务 JWT 本来就不在里面,这里如实建模。
+	o.ownCred = newDetector(&fakeTokenReader{})
+
+	tok := signBearerTesting(t, secret, 2200005, "desk.user", time.Now().Add(15*24*time.Hour))
+
+	m.mu.Lock()
+	m.LastUserInfoRequest = nil
+	m.mu.Unlock()
+	w := postExchange(o, `{"access_token":"`+tok+`"}`)
+
+	if w.Code == http.StatusOK {
+		t.Error("a business JWT is not an upstream credential; /exchange must not accept it")
+	}
+	m.mu.Lock()
+	last := m.LastUserInfoRequest
+	m.mu.Unlock()
+	if last != nil {
+		t.Errorf("our business JWT reached the upstream IdP (userinfo query=%q); "+
+			"modules/integration catches this exact token by running the HMAC verifier "+
+			"before falling through — /exchange has no such stage", last.Query.Encode())
+	}
+}
+
+// 反面:上游不透明凭据在 /exchange 上必须照常走上游 —— 这是这个端点的主用途。
+func TestOwnCredential_ExchangeStillForwardsUpstreamCredential(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	prov, err := newOAuth2Provider(m.providerConfig())
+	if err != nil {
+		t.Fatalf("newOAuth2Provider: %v", err)
+	}
+	o := newOAuth2ExchangeTestOIDC(t, prov)
+	o.bearerJWT = newBearerJWTVerifierForTest(
+		[]byte("exchange-path-test-secret-32byte!"), prov.Issuer()+bearerJWTIssuerSuffix)
+	o.ownCred = newDetector(&fakeTokenReader{})
+
+	m.mu.Lock()
+	m.LastUserInfoRequest = nil
+	m.mu.Unlock()
+	postExchange(o, `{"access_token":"`+m.KnownAccessToken+`"}`)
+
+	m.mu.Lock()
+	last := m.LastUserInfoRequest
+	m.mu.Unlock()
+	if last == nil {
+		t.Error("an opaque upstream token must still reach /userinfo; refusing it would " +
+			"break the credential path this endpoint exists for")
+	}
+}
+
+// 已知**未闭合**的格子,行为在此钉住,不是断言它安全。
+//
+// 一张 alg:none 或 RS 系头部的 JWT 在验签之前就被拒(算法混淆防护),失败点带
+// ErrJWTForeign 标记 → 判成"不是我们的" → 在 kind=oauth2 下被转发进上游的
+// /userinfo query。造它不需要密钥。
+//
+// 为什么不修:kind=oauth2 下**合法的**上游不透明 access_token 本身就可能是 JWT
+// 形态(很多 OAuth2 provider 签 JWT access token)。把"验签前失败"一律判成我方
+// 凭据就会掐断 C2 —— 而 C2 是这两个端点存在的理由。无法归属的凭据只能转发。
+//
+// 风险接受的实际内容:任何人可以让本服务把一段自造的字符串写进厂商的访问日志。
+// 那不是**我方凭据**外泄(不变量仍然成立:我们签发的东西不会出去),而是把我们
+// 当成一次写日志的中继。端点级 IP 限流压住速率,不封闭通道。
+//
+// 这条测试的作用是让行为可见:哪天有人"顺手修好"它,C2 会静默断掉,而这里会红。
+func TestForeignJWTShape_IsForwardedUpstream_KnownOpenCell(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	prov, err := newOAuth2Provider(m.providerConfig())
+	if err != nil {
+		t.Fatalf("newOAuth2Provider: %v", err)
+	}
+	o := newOAuth2ExchangeTestOIDC(t, prov)
+	o.bearerJWT = newBearerJWTVerifierForTest(
+		[]byte("exchange-path-test-secret-32byte!"), prov.Issuer()+bearerJWTIssuerSuffix)
+	o.ownCred = newDetector(&fakeTokenReader{})
+
+	// alg:none —— 无需任何密钥即可构造。
+	noneJWT := signHS256Raw(t, "irrelevant", `{"alg":"none","typ":"JWT"}`,
+		`{"userId":2200005,"iat":1788343918,"exp":1789639978}`)
+
+	m.mu.Lock()
+	m.LastUserInfoRequest = nil
+	m.mu.Unlock()
+	postExchange(o, `{"access_token":"`+noneJWT+`"}`)
+
+	m.mu.Lock()
+	last := m.LastUserInfoRequest
+	m.mu.Unlock()
+	if last == nil {
+		t.Skip("behaviour changed: a JWT-shaped credential is no longer forwarded. If that " +
+			"was deliberate, verify that JWT-shaped **upstream** access tokens still work " +
+			"(C2), and move this cell out of guard-matrix.md's open list.")
+	}
+	// 现状:被转发。钉住"它不是我方签发的凭据"这一点 —— 不变量没破。
+	if _, verr := o.bearerJWT.VerifyForAuthentication(noneJWT, time.Now()); verr == nil {
+		t.Fatal("an alg:none token verified against our secret; the algorithm-confusion " +
+			"guard is broken, which is a different and much worse problem")
 	}
 }

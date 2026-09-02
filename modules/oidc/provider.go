@@ -50,6 +50,24 @@ type ProviderCapabilities struct {
 	CrossCheckSub bool
 	// UpstreamLogout IdP 提供可跳转的登出端点。
 	UpstreamLogout bool
+
+	// SubjectMayBeReusedPersonnelID 该上游的 subject **可能**是人事系统分配、
+	// 会在离职/入职之间复用的标识(工号)。为 true 时上层拒绝"短纯数字"形态的
+	// subject —— (issuer, subject) 是不可变主键,复用的工号迟早把新人指到
+	// 前任的账号上。
+	//
+	// 诚实说明这一位的性质:它其实是**按部署**的事实(取决于运维接的是哪家 IdP
+	// 的哪套人事系统),现在用 kind 近似 —— plain-OAuth2 只对接了一家,而那家的
+	// 文档正是这条论证的来源;标准 OIDC 是存量部署对着任意 IdP 用的通用客户端,
+	// 无从知道对方的 sub 从哪来。
+	//
+	// 所以默认必须是 false:声明这个危险等于对一个 sub 是数据库小主键(1001、42)
+	// 的自建 IdP **全量拒登**,而那类 IdP 什么都不复用。接第二家 plain-OAuth2
+	// IdP 时,这一位要变成按部署可配,不能继续跟着 kind 走。
+	//
+	// 长度上限不由这一位控制:那是存储性质,对所有来源统一施加
+	// (identity_bounds.go)。
+	SubjectMayBeReusedPersonnelID bool
 }
 
 // AuthCodeParams 构造 authorize URL 所需的请求级一次性参数。

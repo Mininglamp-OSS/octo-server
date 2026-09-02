@@ -17,7 +17,7 @@ The last column is where both round-6 blockers were.
 | C1 | authorization `code` | browser, via redirect | exchanged at the IdP; `state` binds the request |
 | C2 | upstream credential presented directly — `id_token` under `kind=oidc`, opaque `access_token` under `kind=oauth2` | native / bearer clients that completed SSO themselves | provider-specific: signature verification vs `/userinfo` redemption |
 | C3 | business-backend HS256 JWT (`userId`, `domainAccount`) | desktop client | HMAC under a dedicated shared secret |
-| C4 | **credentials this service issues** — session token, `uk_` user API key, `bf_` bot token | our own clients | session store lookup / prefix |
+| C4 | **credentials this service issues** — session token, `uk_` user API key, `bf_` bot token, `app_` App Bot token | our own clients | session store lookup / prefix |
 
 C4 was the taxonomy's blind spot for one round: C1–C3 are all credentials the
 *upstream* issues, and the provenance guard (G7) answered "is this an HS256 JWT we
@@ -27,6 +27,13 @@ forwarded to the vendor's `/userinfo` in a URL query. Both arrive on this header
 mundane reasons: the global `BearerTokenCompat` middleware makes
 `Authorization: Bearer <session token>` the house convention, and `userAPIKeyAuth`
 reads the *same* header on sibling routes in the *same* route group.
+
+The row was still incomplete when first written — `app_` App Bot tokens were missed,
+and so was C3 on `/exchange` (below). A prefix list is a denylist of types someone
+remembered, so `own_credential_coverage_test.go` now scans the credential-minting
+packages for `*TokenPrefix`/`*KeyPrefix` constants and fails if `Classify` does not
+recognise one. That turns the next omission into a CI failure naming the constant,
+rather than a leak.
 
 ## Identity paths
 
@@ -67,11 +74,42 @@ reads the *same* header on sibling routes in the *same* route group.
 | G6 exact recheck | ✅ | ✅ | ✅ | ✅ | ✅ |
 | G7 provenance split (is it our JWT?) | n/a (one type) | n/a | n/a | ✅ | n/a |
 | G11 own-credential refusal (C4) | n/a (code, not a bearer) | ✅ | n/a (no upstream call) | ✅ | n/a |
+| G7 provenance split applied to C3 on P2 | n/a | ✅ (`bearerJWT` runs before the fall-through, mirroring P4) | n/a | ✅ | n/a |
 | G8 freshness | id_token `exp` | `kind=oidc`: id_token `exp`. `kind=oauth2`: **none we can see** — the opaque token's validity is the IdP's judgement, established by the `/userinfo` redemption | 10 min from `iat` | C2 as P2; C3 token's own `exp` (~15d) | bind session TTL |
 | G10 IP rate limit | global IP floor **only** (`authorize`/`callback` carry no strict limiter) | `StrictIPRateLimitMiddleware(2 rps / 10 burst)`, shared with P3 | same limiter as P2 | `StrictIPRateLimitMiddleware`, `DM_INTEGRATION_IP_RATELIMIT_*` (predates this PR) | inherits P1 |
 | G9 autolink | ✅ | ✅ | fail-closed | fail-closed | Create refuses on conflict |
 | issuer namespace | upstream | upstream | upstream + `#bearer-jwt` | upstream (C2) / `#bearer-jwt` (C3) | upstream |
 | writes identity rows | yes | yes | yes | **no** (read-only) | yes |
+
+## Cells that are open, not closed
+
+**Non-HS256 JWT-shaped arrivals under `kind=oauth2`, on P2 and P4.** A token whose
+header declares `alg: none` or an RS-family algorithm is refused *before* the
+signature is computed (algorithm-confusion defence), that failure carries
+`ErrJWTForeign`, and the credential is therefore forwarded to the vendor's
+`/userinfo` in a URL query. **No secret is needed to mint one**, and both endpoints
+are unauthenticated.
+
+This is not closed, and deliberately so: under `kind=oauth2` a legitimate upstream
+opaque `access_token` may itself be JWT-shaped — many OAuth2 providers mint JWT
+access tokens — so classifying every pre-signature failure as ours would cut off C2,
+which is the reason these endpoints exist. An unattributable credential can only be
+forwarded.
+
+What is being accepted: anyone can make this service write a string of their choosing
+into the vendor's access log. The stated invariant still holds — nothing **we issued**
+leaves — because a token we did not sign is not our credential. Endpoint IP limits
+throttle the rate; they do not close the channel. Pinned by
+`TestForeignJWTShape_IsForwardedUpstream_KnownOpenCell`, which skips with an
+explanation if the behaviour ever changes, so that "fixing" it cannot silently break C2.
+
+**Prefixless legacy bot tokens.** `modules/bot_api/auth.go` still accepts bot tokens
+with no prefix ("bf_ prefix or legacy tokens"). Those have no decidable shape and are
+not in the session store, so `OwnCredentialDetector` cannot recognise them; catching
+them would mean a `robot`-table lookup on every unauthenticated request, which also
+turns these endpoints into an existence oracle. **Whether any such token still exists
+in production is an operations question, not one this repository can answer** — it is
+on the human-verify list.
 
 ## Lifetime column — credentials and snapshots that outlive a deploy
 

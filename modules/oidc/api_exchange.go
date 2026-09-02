@@ -33,6 +33,7 @@ package oidc
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -124,7 +125,34 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 	// 早先这里硬编码成 &TokenSet{AccessToken: ...},于是在标准 OIDC kind 下
 	// 永远失败(oidcProvider.Identity 要求 RawIDToken)—— 存量部署白得一个只会
 	// 返 401 的无认证端点。上层不该知道该往哪个字段放,那是 provider 的事。
-	// 外呼之前先排除**我方自己签发**的凭据。
+	// 外呼之前的第一道:这是不是一张**我们自己签的业务 JWT**?
+	//
+	// 顺序与 modules/integration 的 oidcAuth 一致,而且必须一致 —— 那边靠 HMAC
+	// 验签认出这一类,这边原先根本没有验签这一步,于是同一张 token 在两个端点上
+	// 得到相反的处理。守卫挂在两个消费者中的一个,是这个改动反复踩的形态。
+	//
+	// 判据是 HMAC 而不是形态:一张 token 要么带着我方密钥下的合法签名,要么没有。
+	// 所以这道检查不会误伤 JWT 形态的上游不透明 token(造不出合法签名)。
+	// 未配置密钥时 o.bearerJWT 为 nil,C3 凭据不可能存在,行为与之前完全一致。
+	if o.bearerJWT != nil {
+		if _, berr := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now()); berr == nil ||
+			!IsForeignToken(berr) {
+			// berr == nil:是一张有效业务 JWT,但发错了端点(该发 /exchange-jwt)。
+			// !IsForeignToken:HMAC 已匹配,确定是我们签的,只是按自身条件被拒。
+			//
+			// 两种都不能回落上游:那条路把凭据放在 URL query 上,转发等于把载荷里的
+			// PII 和一份在我方密钥下合法的签名一起送进第三方的访问日志。
+			//
+			// 对客户端回与其它失败相同的码(反枚举),真实原因只进日志。
+			metricExchangeResult.WithLabelValues("own_business_jwt").Inc()
+			o.Warn("OIDC exchange: refused a business JWT presented to the wrong endpoint",
+				zap.String("trace_id", traceID), zap.Error(berr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+			return
+		}
+	}
+
+	// 第二道:排除**我方自己签发**的其它凭据(会话 token / uk_ / bf_ / app_)。
 	//
 	// 这条路撞上的概率比 integration 那两个端点还高:/exchange 与 /exchange-jwt
 	// 请求体一模一样、字段都叫 access_token(见文件头),发错端点只会得到一个

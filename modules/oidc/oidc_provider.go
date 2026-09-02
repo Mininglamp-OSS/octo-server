@@ -147,18 +147,16 @@ func (p *oidcProvider) Identity(ctx context.Context, tok *TokenSet) (*IdentityCl
 	if strings.TrimSpace(claims.Subject) == "" {
 		return nil, fmt.Errorf("%w: subject is empty", ErrIdentityUntrusted)
 	}
-	// 形态守卫:上游断言的 subject 不能是"短纯数字"(像工号)。
+	// 这里**没有**"短纯数字 subject"的形态守卫,是有意的。
 	//
-	// 签名证明这个 sub 是该 IdP 断言的,不证明它适合当不可变主键 —— 工号会在
-	// 离职/入职之间被复用,于是 (issuer, subject) 迟早把新人指到前任的账号上。
-	// 这条论证与协议无关,所以两个 provider 都要有;漂移由
-	// TestAuthProviderConformance_RefusesShortNumericUpstreamSubject 钉住。
+	// 那条启发式来自某一家 IdP 的文档(它对 sub 是内部 id 还是工号说法不一,而工号
+	// 会在离职/入职间复用)。那是那家 IdP 的人事系统的性质,不是 OIDC 的性质。
+	// 本实现是存量部署对着**任意** IdP 使用的通用客户端:一个把用户表主键当 sub 的
+	// 自建 IdP(1001、42)完全正常,加上这道守卫等于让它全量拒登,且没有开关。
 	//
-	// 长度上限不在这里查 —— 那是存储性质,由共享入口统一施加(identity_bounds.go),
-	// 覆盖包括业务 JWT 在内的每条路径。
-	if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrIdentityUntrusted, err)
-	}
+	// 由 Capabilities().SubjectMayBeReusedPersonnelID 表态,本实现声明 false。
+	// 长度上限不受影响 —— 那是存储性质,由共享入口(identity_bounds.go)对所有
+	// 来源统一施加。
 
 	// 部分 IdP 只在 /userinfo 暴露 email/phone/name,id_token 仅含 sub。
 	// 自动绑定历史账号依赖 email/phone;name 缺失会让新建用户落到随机名兜底。
