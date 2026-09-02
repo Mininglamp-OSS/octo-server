@@ -302,9 +302,13 @@ func (o *OIDC) Init() error {
 		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
 		locator := dbBindLocator{db: o.db}
 		o.bind = newBindService(o.cfg.Bind, o.bindStore, userSvc, locator)
-		if o.provider != nil {
-			o.bind.subjectMayBeReusedPersonnelID = o.provider.Capabilities().SubjectMayBeReusedPersonnelID
-		}
+		// 不加 nil 守卫是有意的:本函数在 o.provider == nil 时已经早返回(见上方
+		// "handler 入口已 fail-fast 返 500"那处),所以走到这里 provider 必非 nil。
+		//
+		// 加一层 `if o.provider != nil` 看起来更稳,实际是把"哪天那个早返回被挪走"
+		// 的后果从**启动即 panic**(响亮)换成**这道身份守卫静默关闭**(安静)——
+		// 对安全守卫来说,响亮是对的那一侧。
+		o.bind.subjectMayBeReusedPersonnelID = o.provider.Capabilities().SubjectMayBeReusedPersonnelID
 		// Confirm 路径需要 identity 写入 + IssueSession 签发,复用 *Service 已经
 		// 持有的 store(identityStore) 和 users(userLookup)。两者都在 newService
 		// 内完成构造,Init 顺序保证 o.service 此时非 nil。

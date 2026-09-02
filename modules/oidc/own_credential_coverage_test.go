@@ -14,6 +14,7 @@ package oidc
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,52 +26,63 @@ import (
 var credentialPrefixDeclRe = regexp.MustCompile(
 	`(?m)^\s*([A-Z][A-Za-z0-9]*(?:Token|APIKey|Key)Prefix)\s*=\s*"([^"]+)"`)
 
-// credentialMintingPackages 会签发 bearer 凭据的模块。
+// modulesRoot 扫描根 —— **整个 modules/**,不是一张手写的包清单。
 //
-// 新增这类模块时要加进来 —— 而"忘了加"这件事本身没法自动发现,所以这里
-// 顺带钉住一个更弱但可检的性质:下面 mustCoverPrefixes 里的每个前缀都必须
-// 仍然存在于源码中(常量被改名/移动时也会红)。
-var credentialMintingPackages = []string{
-	"../app_bot",
-	"../botfather",
-}
+// 第一版只列了 app_bot 和 botfather 两个包。那样的话"新增一个签发凭据的模块"
+// 仍然要靠人记得来改这张清单 —— 也就是把同一个"名单会漏"的毛病搬了个位置。
+// 扫全部模块之后,新模块里的凭据前缀常量会自动进入检查范围。
+//
+// 全仓验证过这个正则在 modules/ 下只命中三个真前缀(app_/bf_/uk_),没有误报;
+// pkg/botevent 里那几个 Redis key 前缀不在扫描范围内。
+const modulesRoot = ".."
 
-// nonBearerPrefixes 这些常量名字像凭据前缀,但实际是 Redis key 命名空间,
-// 不会出现在 Authorization 头上。列在这里而不是靠正则排除,是为了让每次豁免
-// 都有一个人为的判断记录。
-var nonBearerPrefixes = map[string]bool{
-	"welcomeSentKeyPrefix": true,
-}
+// nonBearerPrefixes 豁免表:名字匹配但实际不会出现在 Authorization 头上的常量
+// (例如 Redis key 命名空间)。
+//
+// **当前为空** —— 目前没有需要豁免的。保留这个机制是为了让将来的豁免必须是一次
+// 显式的人为判断,而不是靠改正则悄悄放过。
+var nonBearerPrefixes = map[string]bool{}
 
 func TestOwnCredentialDetector_KnowsEveryBearerCredentialPrefix(t *testing.T) {
 	d := newDetector(&fakeTokenReader{}) // 会话必定落空,只测前缀分支
 
 	found := map[string]string{} // 常量名 -> 前缀值
-	for _, pkg := range credentialMintingPackages {
-		entries, err := os.ReadDir(pkg)
+	err := filepath.WalkDir(modulesRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("read %s: %v", pkg, err)
+			return err
 		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") ||
-				strings.HasSuffix(e.Name(), "_test.go") {
+		if d.IsDir() {
+			// 本模块自己不签发 bearer 凭据,跳过可以避免把示例串当成声明。
+			if d.Name() == "oidc" || d.Name() == "sql" || d.Name() == "testdata" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		for _, m := range credentialPrefixDeclRe.FindAllStringSubmatch(string(src), -1) {
+			if nonBearerPrefixes[m[1]] {
 				continue
 			}
-			src, err := os.ReadFile(filepath.Join(pkg, e.Name()))
-			if err != nil {
-				t.Fatalf("read %s: %v", e.Name(), err)
-			}
-			for _, m := range credentialPrefixDeclRe.FindAllStringSubmatch(string(src), -1) {
-				if nonBearerPrefixes[m[1]] {
-					continue
-				}
-				found[m[1]] = m[2]
-			}
+			found[m[1]] = m[2]
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan %s: %v", modulesRoot, err)
 	}
-	if len(found) == 0 {
-		t.Fatal("no credential prefix constants were discovered; the scan is broken, " +
-			"which would make this guard silently vacuous")
+
+	// 扫描坏掉(路径变了、正则不再匹配)会让这道守卫静默变成永远通过。
+	// 钉一个下界:已知至少存在 uk_ / bf_ / app_ 三个。
+	if len(found) < 3 {
+		t.Fatalf("only %d credential prefix constant(s) discovered (%v); at least three are "+
+			"known to exist, so the scan is broken and this guard would pass vacuously",
+			len(found), found)
 	}
 
 	for name, prefix := range found {

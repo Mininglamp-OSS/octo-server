@@ -13,7 +13,9 @@ package oidc
 // 的真子集,而需要拦的是后者。
 //
 // 判定方式全部是**本地确定性检验**,不外呼、无副作用:
-//   - uk_ / bf_ 是我方签发凭据的规范前缀(userAPIKeyAuth 就用它做判据);
+//   - uk_ / bf_ / app_ 是我方签发凭据的规范前缀(userAPIKeyAuth、bot_api 的
+//     extractBotToken 就用它们做判据);覆盖完整性由 own_credential_coverage_test.go
+//     扫源码钉住 —— 前缀清单是"想起来了的类型"的名单,漏项必须变成一次 CI 失败;
 //   - 会话 token 查我方会话存储 —— 查得到就是我们签的。
 //
 // 已知缺口:modules/bot_api/auth.go 至今仍接受**无前缀的历史 bot token**
@@ -32,7 +34,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 
-	app_bot "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
+	"github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 )
