@@ -128,6 +128,17 @@ func (o *onlineDB) queryOnlineDevice(uid string, deviceFlag config.DeviceFlag) (
 	return onlineStatusModel, err
 }
 
+// queryOnlineDevices 批量查询给定 uid 集合中指定设备的在线记录（仅 online=1），一次查询返回，
+// 供离线 Push 前的批量在线判定使用，避免 per-uid 循环查询造成的 N+1。
+func (o *onlineDB) queryOnlineDevices(uids []string, deviceFlags []uint8) ([]*onlineStatusModel, error) {
+	if len(uids) == 0 || len(deviceFlags) == 0 {
+		return nil, nil
+	}
+	var models []*onlineStatusModel
+	_, err := o.session.Select("*").From("user_online").Where("uid in ? and device_flag in ? and `online`=1", uids, deviceFlags).Load(&models)
+	return models, err
+}
+
 func (o *onlineDB) exist(uid string, deviceFlag uint8, online int) (bool, error) {
 	var cn int
 	_, err := o.session.Select("count(*)").From("user_online").Where("uid=? and device_flag=? and `online`=?", uid, deviceFlag, online).Load(&cn)

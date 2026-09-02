@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"go.uber.org/zap"
 )
 
 // shouldMuteAppPush 判定「手机静音」是否应抑制 App(主设备) 离线 Push。
@@ -26,13 +25,30 @@ func filterMutedAppUIDs(uids []string, muted map[string]struct{}) []string {
 	return filtered
 }
 
-// deviceOnline 查询指定设备是否在线，查询失败时 fail-open 返回 false（不抑制），
-// 避免一次 DB 抖动静默吞掉离线通知。
-func (w *Webhook) deviceOnline(uid string, flag config.DeviceFlag) bool {
-	resp, err := w.userService.GetDeviceOnline(uid, flag)
-	if err != nil {
-		w.Error("查询设备在线状态失败，mute_of_app 不抑制", zap.Error(err), zap.String("uid", uid), zap.Uint8("deviceFlag", flag.Uint8()))
-		return false
+// mutedUIDsFromOnline 依据「开启手机静音的候选 uid」及其 Web/PC 在线记录，算出需静音的 uid 集合。
+// onlineRows 为一次批量查询返回的从设备在线记录（仅 online=1），据此复用 shouldMuteAppPush 判定，
+// 避免对每个候选 uid 逐个查库的 N+1。只处理候选集合内的 uid，其余记录忽略。
+func mutedUIDsFromOnline(candidateUIDs []string, onlineRows []*config.OnlinestatusResp) map[string]struct{} {
+	web := make(map[string]struct{}, len(onlineRows))
+	pc := make(map[string]struct{}, len(onlineRows))
+	for _, r := range onlineRows {
+		if r == nil || r.Online != 1 {
+			continue
+		}
+		switch config.DeviceFlag(r.DeviceFlag) {
+		case config.Web:
+			web[r.UID] = struct{}{}
+		case config.PC:
+			pc[r.UID] = struct{}{}
+		}
 	}
-	return resp != nil && resp.Online == 1
+	muted := make(map[string]struct{})
+	for _, uid := range candidateUIDs {
+		_, webOnline := web[uid]
+		_, pcOnline := pc[uid]
+		if shouldMuteAppPush(1, webOnline, pcOnline) {
+			muted[uid] = struct{}{}
+		}
+	}
+	return muted
 }
