@@ -66,20 +66,20 @@ func newTestOIDCForBearerJWT(t *testing.T, secret []byte, issuer string, users *
 			Scopes:       []string{"read"},
 		},
 	}
-	// bearerJWTSecret/bearerJWTIssuer 是 OIDC 结构体上的字段,New() 在加载 config 时填入。
+	// bearerJWT 是 OIDC 结构体上的字段,New() 经 NewBearerJWTVerifier 填入。
+	// 测试直接构造它,避免依赖 env。
 	o := &OIDC{
 		Log: log.NewTLog("OIDC-test"),
 		cfg: cfg,
 		// provider 填一个非 nil sentinel:本端点本地验签,不会真正调用它,但
 		// handler 入口会做 provider!=nil 守卫避免构造失败路径的 nil panic。
-		provider:        fakeBearerProvider{},
-		service:         newService(cfg.Provider, store, users),
-		store:           store,
-		stateStore:      newMemoryStateStore(),
-		authcode:        newFakeAuthcode(),
-		audit:           newFakeAudit(),
-		bearerJWTSecret: secret,
-		bearerJWTIssuer: issuer,
+		provider:   fakeBearerProvider{},
+		service:    newService(cfg.Provider, store, users),
+		store:      store,
+		stateStore: newMemoryStateStore(),
+		authcode:   newFakeAuthcode(),
+		audit:      newFakeAudit(),
+		bearerJWT:  newBearerJWTVerifierForTest(secret, issuer),
 	}
 	return o
 }

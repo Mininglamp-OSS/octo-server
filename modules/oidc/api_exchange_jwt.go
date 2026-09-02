@@ -60,7 +60,7 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	}
 
 	// 配置缺失是运维错误,500 而非 401:区别"客户端给了坏 token" vs "我们自己没配好"。
-	if len(o.bearerJWTSecret) == 0 || o.bearerJWTIssuer == "" {
+	if o.bearerJWT == nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("bearer jwt not configured"))
 		return
 	}
@@ -97,7 +97,7 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	//
 	// 失败原因(签名/过期/格式 vs userId 缺失)由 err 携带,进日志区分;
 	// 对客户端一律回同一个 401 码,不做失败原因枚举(anti-enumeration)。
-	claims, err := verifyBearerJWT(req.AccessToken, o.bearerJWTSecret, time.Now())
+	ic, err := o.bearerJWT.Verify(req.AccessToken, time.Now())
 	if err != nil {
 		metricBearerExchangeResult.WithLabelValues("token_rejected").Inc()
 		o.Warn("OIDC exchange-jwt: token rejected",
@@ -106,9 +106,6 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 		return
 	}
 
-	// 转换为协议中立 IdentityClaims,issuer 从配置注入(不来自 token)。
-	ic := claims.toIdentityClaims(o.bearerJWTIssuer)
-
 	o.completeExchange(c, verifiedIdentity{
 		claims:     ic,
 		deviceFlag: deviceFlag,
@@ -116,7 +113,8 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 		traceID:    traceID,
 		state:      sd,
 		// domainAccount 人类可读,便于与上游对账;userId 是数字串,对账时无用。
-		auditDetail: claims.DomainAccount,
+		// toIdentityClaims 把它映射到 Name(不是主键,仅作显示与审计)。
+		auditDetail: ic.Name,
 	}, exchangeFlavour{
 		logName:   "exchange-jwt",
 		result:    metricBearerExchangeResult,

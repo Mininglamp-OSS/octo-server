@@ -130,8 +130,8 @@ type OIDC struct {
 	// 密钥为空时 /exchange-jwt 端点直接返 500(配置错误),不 panic 不静默放行。
 	// issuer 独立于上游 issuer 命名空间,避免(基于 客户端 userId)与上游 OIDC flow
 	// (基于 IdP sub)的身份键空间互相污染。
-	bearerJWTSecret []byte
-	bearerJWTIssuer string
+	// bearerJWT 业务后端自签 HS256 JWT 的验签器;nil 表示该路径未启用。
+	bearerJWT *BearerJWTVerifier
 
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
@@ -210,30 +210,20 @@ func New(ctx *config.Context) *OIDC {
 	o.provider = res.Provider
 	o.client = res.Client
 
-	// bearer JWT(HS256)验签配置。secret 为空时 /exchange-jwt 直接返 500,
-	// 不 panic 不静默放行 —— 允许"上游 OIDC flow 开、bearer JWT 不接"的部署形态。
-	// issuer 由已配置的上游 issuer 派生(见 bearerJWTIssuerFromUpstream),不额外要
-	// 一个环境标识 env:上游 issuer 本身每环境一个值且必填,派生值因此天然做到
-	// 测试/生产隔离。也不允许运维自由指定 —— 这个值一旦上线不可改,给 open string
-	// 就是给误配留口子。
-	if sec := strings.TrimSpace(getString("OCTO_OIDC_BEARER_JWT_SECRET", "")); sec != "" {
-		// 密钥强度是准入条件,不是调优项:持有它就能为任意 userId 签一张能换
-		// 会话的 token。不达标时**不开启端点**并打 Error —— 与 RT key 在
-		// LoadConfig 里直接拒绝启动同一个态度,只是这里的功能是可选的,
-		// 所以降级为"该端点不可用"而不是整进程起不来。
-		if serr := validateBearerJWTSecret([]byte(sec)); serr != nil {
-			o.Error("bearer JWT secret rejected, disabling /exchange-jwt", zap.Error(serr))
-			return o
-		}
-		iss, ierr := bearerJWTIssuerFromUpstream(cfg.Provider.Issuer)
-		if ierr != nil {
-			o.Error("bearer JWT config invalid, disabling /exchange-jwt", zap.Error(ierr))
-		} else {
-			o.bearerJWTSecret = []byte(sec)
-			o.bearerJWTIssuer = iss
-			o.Info("bearer JWT /exchange-jwt enabled",
-				zap.String("issuer", iss), zap.Int("secret_bytes", len(o.bearerJWTSecret)))
-		}
+	// bearer JWT(HS256)验签配置。装配走 NewBearerJWTVerifier —— modules/integration
+	// 也需要同一份(桌面客户端手上只有这种凭据),在两处各写一遍就又是一份会漂移
+	// 的副本,而这里漂移的后果是 issuer 命名空间不一致:同一个人在两条路径下被认
+	// 成两个账号,且 (issuer, subject) 落库后不可逆。
+	//
+	// 未配置密钥时 verifier 为 nil,/exchange-jwt 返 500 —— 允许"上游 OIDC flow 开、
+	// 业务 JWT 不接"的部署形态。
+	bv, bverr := NewBearerJWTVerifier(cfg.Provider)
+	if bverr != nil {
+		o.Error("bearer JWT 配置无效,/exchange-jwt 不可用", zap.Error(bverr))
+	} else if bv != nil {
+		o.bearerJWT = bv
+		o.Info("bearer JWT /exchange-jwt enabled",
+			zap.String("issuer", bv.Issuer()), zap.Int("secret_bytes", bv.SecretLen()))
 	}
 
 	return o

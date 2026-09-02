@@ -663,16 +663,33 @@ rejects, so under the standard kind every existing deployment had gained an
 unauthenticated endpoint that could only ever answer 401. It now routes through
 the same method and is meaningful under both kinds.
 
-**Still open — the third credential type.** A business-signed HS256 JWT (the one
-`/exchange-jwt` accepts) is *not* accepted on these two endpoints. It cannot be
-added by configuration alone: with a bearer-JWT secret configured under the
-plain-OAuth2 kind, two different credential types would arrive in the same
-`Authorization: Bearer` header with no way to tell them apart short of sniffing
-the shape, which is the thing being ruled out. It therefore needs an explicit
-client-visible signal — a separate path (as `/exchange` vs `/exchange-jwt`
-already does) or a declared credential type — and that is an API-contract
-decision, so it is Pending rather than guessed at. Today such a token is refused
-fail-closed, because the upstream does not recognise it.
+**All three credential types are accepted on these two endpoints**, on the same
+`Authorization: Bearer` header, with no new client contract.
+
+An earlier version of this section claimed the third type needed a
+client-visible signal — a separate path or a declared credential type — because
+two types on one header could not be told apart without sniffing the shape. That
+framing was wrong: **the disambiguation is cryptographic, not syntactic.** A
+business JWT either carries a valid HMAC under a secret only we and the client's
+backend hold, or it does not; that is a decisive test rather than a heuristic.
+
+Neither direction misfires. An opaque upstream token cannot produce a valid
+signature under our secret without the secret. An upstream `id_token` is RS256,
+and `VerifyHS256JWT` pins `alg` to HS256 and refuses RS256, so the classic
+algorithm-confusion path is closed.
+
+Order matters and is asserted: local verification runs first because it makes no
+outbound call and has no side effects. Reversing it would make every desktop
+request spend a pointless round trip on `/userinfo` before falling through.
+
+Both failures return one generic error, so a caller cannot learn from the
+response which credential type was wrong. The identity resolves into the
+namespace belonging to whichever verifier succeeded, which is what keeps a
+desktop principal and an upstream principal with the same subject string from
+collapsing onto one account — a test pins exactly that case.
+
+With no secret configured the behaviour is byte-for-byte the previous one: only
+the upstream credential is accepted.
 
 ## Integration tests written (this PR)
 

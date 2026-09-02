@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -44,7 +45,14 @@ type Integration struct {
 	// 没有 Discovery 的 plain-OAuth2 kind 之后,本模块两个对外端点整体返回 500。
 	// 改存抽象之后,"客户端出示的这个 Bearer 该怎么解释"由 provider 自己决定,
 	// 本模块保持 kind 无关。
-	provider      oidc.AuthProvider
+	provider oidc.AuthProvider
+
+	// bearerJWT 业务后端自签 HS256 JWT 的验签器;未配置密钥时为 nil,
+	// 表示这条凭据路径未启用(合法部署形态)。
+	//
+	// 桌面客户端手上只有这种凭据 —— 它既没有上游 access_token 也没有 id_token,
+	// 却需要用本模块的两个端点。所以同一个 Authorization 头上要接受两类凭据。
+	bearerJWT     *oidc.BearerJWTVerifier
 	apiKeyService botfather.UserAPIKeyService
 	groupService  group.IService
 	rateRedis     *rd.Client
@@ -83,6 +91,21 @@ func New(ctx *config.Context) *Integration {
 		return it
 	}
 	it.provider = res.Provider
+
+	// 业务 JWT 验签器与 modules/oidc 共用同一份装配(密钥读取、强度校验、
+	// issuer 命名空间派生)。在这里重写就又是一份会漂移的副本,而这里漂移的
+	// 后果是命名空间不一致 —— 同一个人在两条路径下被认成两个账号,
+	// 且 (issuer, subject) 落库后不可逆。
+	bv, bverr := oidc.NewBearerJWTVerifier(cfg.Provider)
+	if bverr != nil {
+		// 配置错误(密钥太短 / issuer 派生失败)不能静默降级成"这条路径不可用":
+		// 那样桌面端只会看到一个笼统的 401,真实原因只在启动日志里一闪而过。
+		it.Error("初始化业务 JWT 验签器失败,桌面端凭据将不可用", zap.Error(bverr))
+	} else if bv != nil {
+		it.bearerJWT = bv
+		it.Info("integration 接受业务 JWT 凭据",
+			zap.String("issuer", bv.Issuer()), zap.Int("secret_bytes", bv.SecretLen()))
+	}
 	return it
 }
 
@@ -139,19 +162,44 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 			c.Abort()
 			return
 		}
-		// 由 provider 解释这个凭据,不由本模块猜。
+		// 两类凭据共用这一个 Authorization 头:桌面端持业务后端自签的 HS256 JWT,
+		// 其余客户端持上游凭据(标准 OIDC 下是 id_token,plain-OAuth2 下是不透明
+		// access_token)。
 		//
-		// **不能按 token 长得像不像 JWT 来分流**:plain-OAuth2 的 access_token 是
-		// 不透明串,完全可能恰好是 JWT 形态(上游内部用什么编码是它的事),
-		// 按形态猜会把一个未经我方验证的载荷当成身份来源。
-		claims, err := it.provider.IdentityFromClientCredential(c.Request.Context(), raw)
-		if err != nil {
+		// **区分方式是验签,不是形态。** 一张 token 要么带着我方密钥下的合法
+		// HMAC,要么没有 —— 这是确定性检验。按形态猜是不可接受的:不透明
+		// access_token 完全可能恰好是 JWT 形态(上游内部用什么编码是它的事),
+		// 猜错会把一个未经我方验证的载荷当成身份来源。
+		//
+		// 两个方向都不会误判:上游的不透明 token 不可能带出我方密钥下的合法签名;
+		// 上游的 id_token 是 RS256,而 VerifyHS256JWT 把 alg 钉死 HS256 并显式
+		// 拒绝 RS256,不走算法混淆那条路。
+		//
+		// 顺序:先本地验签(不外呼、无副作用),失败再问上游。反过来会让桌面端
+		// 每个请求都白打一次 /userinfo。
+		var claims *oidc.IdentityClaims
+		var err error
+		credential := "upstream"
+		if it.bearerJWT != nil {
+			if bc, bcErr := it.bearerJWT.Verify(raw, time.Now()); bcErr == nil {
+				claims, credential = bc, "bearer_jwt"
+			}
+		}
+		if claims == nil {
+			claims, err = it.provider.IdentityFromClientCredential(c.Request.Context(), raw)
+		}
+		if claims == nil || err != nil {
+			// 两条路径都没能确立身份 —— 对客户端一律回同一个错误(反枚举):
+			// 不让调用方从响应里区分"凭据类型不对" vs "凭据本身无效"。
 			it.Warn("OIDC integration token verify failed",
-				zap.String("provider_kind", string(it.provider.Kind())), zap.Error(err))
+				zap.String("provider_kind", string(it.provider.Kind())),
+				zap.Bool("bearer_jwt_enabled", it.bearerJWT != nil),
+				zap.Error(err))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
 			c.Abort()
 			return
 		}
+
 		if strings.TrimSpace(claims.Subject) == "" {
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
 			c.Abort()
@@ -202,6 +250,10 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 		}
 
 		c.Set("uid", identity.UID)
+		// credential 进日志维度:排查"桌面端能进但 web 端不能"这类问题时,
+		// 需要知道这次请求是哪条凭据路径确立的身份。
+		it.Info("OIDC integration authenticated",
+			zap.String("credential", credential), zap.String("issuer", claims.Issuer))
 		c.Set("integration_principal", &oidcPrincipal{
 			UID:     identity.UID,
 			Subject: claims.Subject,
