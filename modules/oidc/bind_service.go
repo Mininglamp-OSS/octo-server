@@ -611,9 +611,10 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 // checkClaimsForCreate 校验 claims 至少有一条强标识(email 或 phone)。
 //
 // phone 可用性必须用 extractPhone 判定,不能只看 PhoneNumber != "":
-// dmwork 当前仅支持 +86 号段(service.go:extractPhone),非 +86 verified phone
-// 会被 IssueSession 默默丢成空 Phone/Zone,落库后用户没有可用手机号锚点。
-// 用 extractPhone 做能用性检查,把"格式不支持"提前到 422 而非建出残缺账号。
+// 归一化(service.go:normalizePhone)只接受能确定归属地的形态 —— 大陆号的
+// +86/0086/86 前缀写法与裸号。海外号段与脏数据会被丢成空 Phone/Zone,落库后
+// 用户没有可用手机号锚点。用 extractPhone 做能用性检查,把"格式不支持"提前
+// 到 422 而非建出残缺账号。
 //
 // email_verified / phone_verified 必须为 true,否则后续客服 / 找回流程没有可信锚点
 // (与 autolink 准入条件一致)。

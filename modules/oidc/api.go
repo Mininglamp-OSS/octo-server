@@ -699,10 +699,15 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	zone := extractZone(claims.PhoneNumber)
 	phone := extractPhone(claims.PhoneNumber)
 	if claims.PhoneNumber != "" && phone == "" {
-		// 非 +86 号码 extractPhone 当前直接丢弃,记 warn 让运维知道
-		// "OIDC 登录手机号没绑上"不是 IdP 没返,而是 dmwork 的解析限制。
-		o.Warn("OIDC phone number dropped: only +86 supported",
-			zap.String("idp_phone", claims.PhoneNumber))
+		// 归一化拿不准号码归属时会返回空(见 normalizePhone):海外号段、
+		// 非手机号段、上游脏数据都会走到这里。记 warn 让运维知道"OIDC 登录
+		// 手机号没绑上"是我方主动丢弃,不是 IdP 没返。
+		//
+		// 只打打码后的尾号:完整手机号是 PII,日志留存期远长于它的用途,
+		// 而排查这类问题只需要"是哪一类号码"而不是"是谁的号码"。
+		o.Warn("OIDC phone number dropped: cannot determine country code",
+			zap.String("idp_phone_masked", maskPhoneForBind(claims.PhoneNumber)),
+			zap.Int("idp_phone_len", len(claims.PhoneNumber)))
 	}
 	issueReq := IssueSessionReq{
 		UID:        res.UID,

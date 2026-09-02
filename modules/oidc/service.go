@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -224,20 +225,75 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// extractZone 从 E.164(+8613...) 提取国家码;格式不符合返回空(交给上层不绑定)。
+// mainlandMobileRe 中国大陆手机号号码体(不含国家码):1 + [3-9] + 9 位数字。
 //
-// 简化处理:仅识别 +86;其他号段交给后续扩展,避免引入复杂依赖。
-func extractZone(phone string) string {
-	if strings.HasPrefix(phone, "+86") {
-		return "0086"
+// 用它而不是"11 位数字"做判据,是为了让裸号形态可以被安全地推定为大陆号:
+// 固话、随机 11 位数字、以及厂商手册里那个假造的示例号都不匹配这个号段规则,
+// 于是会落到"拿不准"分支被丢弃,而不是被当成某个真实用户的手机号写进库。
+var mainlandMobileRe = regexp.MustCompile(`^1[3-9]\d{9}$`)
+
+// phoneSeparators 人工录入常见的分隔符,归一化前先剔除。
+const phoneSeparators = " \t-()"
+
+// normalizePhone 把上游 phone_number 归一化成 dmwork 的 (zone, phone) 形态。
+//
+// 支持的输入(全部映射到 zone="0086"):
+//
+//	+8613812345678 / 008613812345678 / 8613812345678 / 13812345678
+//	以及上述形态中夹带空格、'-'、括号的版本
+//
+// 设计取舍 —— 为什么不做通用 E.164 解析:
+//
+//	E.164 的国家码是 1~3 位变长,纯语法切不开(+4670…既可以是 +46 70… 也可以
+//	是 +467 0…),要切必须内置一张国家码表。而猜错国家码的后果是把号码存成另一
+//	个国家的另一个号:用户从此收不到验证码、找不回账号,而且错误不可见 —— 库里
+//	那一行看起来完全正常。所以这里只归一化能**确定**的形态,其余一律返回空对,
+//	由调用方按"这个用户没有可用手机号"处理(它们已经都能处理空值)。
+//
+// 海外号(该客户在多个国家有员工)因此仍然不会被自动写入。这是有意的:
+// 目前 dmwork 侧只有 0086 的短信通道被验证过,存一个发不出验证码的号码
+// 比不存更糟 —— 它会让"用手机号找回账号"这条路看起来可用但实际失败。
+//
+// 两个返回值同进同退:要么都非空,要么都空。调用方(bind_service.go 用
+// extractPhone 判定可用性,service.go 把两者一起传给 UIDsByPhone)依赖这个不变量。
+func normalizePhone(raw string) (zone, phone string) {
+	s := strings.Trim(raw, phoneSeparators)
+	for _, sep := range phoneSeparators {
+		s = strings.ReplaceAll(s, string(sep), "")
 	}
-	return ""
+	if s == "" {
+		return "", ""
+	}
+	// 大陆国家码的三种写法。三者互不为前缀(+86 / 0086 / 86),顺序无关。
+	for _, cc := range []string{"+86", "0086", "86"} {
+		if rest, ok := strings.CutPrefix(s, cc); ok {
+			if mainlandMobileRe.MatchString(rest) {
+				return mainlandZone, rest
+			}
+			// 明确声明了大陆国家码,号码体却不是合法号段 —— 上游数据有问题,
+			// 不要退回去把整串当裸号再试一次(那会把 "+8611136618971" 这种
+			// 脏数据洗成一个看起来合法的号码)。
+			return "", ""
+		}
+	}
+	// 裸号:只有匹配大陆号段规则时才推定为大陆号。
+	if mainlandMobileRe.MatchString(s) {
+		return mainlandZone, s
+	}
+	return "", ""
 }
 
-// extractPhone 去掉 +86 前缀返回纯号码。
+// mainlandZone dmwork 的区号形态是 "00" + 国家码。
+const mainlandZone = "0086"
+
+// extractZone 返回归一化后的区号;无法确定归属时返回空(调用方按不绑定处理)。
+func extractZone(phone string) string {
+	zone, _ := normalizePhone(phone)
+	return zone
+}
+
+// extractPhone 返回归一化后的号码体(不含国家码);无法确定归属时返回空。
 func extractPhone(phone string) string {
-	if strings.HasPrefix(phone, "+86") {
-		return phone[3:]
-	}
-	return ""
+	_, p := normalizePhone(phone)
+	return p
 }

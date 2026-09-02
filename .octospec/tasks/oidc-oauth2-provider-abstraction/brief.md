@@ -341,10 +341,6 @@ implementations are not forced to stub them out.
   30d) for SSO-issued sessions; depends on ops confirming the upstream
   offboarding latency. Currently tracked in code review as a P1 config change
   after this PR.
-- **Phone normalisation** — `extractZone` only recognises `+86`; non-`+86`
-  numbers are dropped with a warn log. The IdP sample payload uses bare
-  11-digit numbers without a country prefix; a follow-up will extend
-  normalisation.
 - **autolink boot-time guard** — refusing startup when a provider without
   verified-claim support is combined with `AutoLinkByEmail` and
   `RequireEmailVerified=false`. ProviderCapabilities does not yet carry a
@@ -370,9 +366,8 @@ implementations are not forced to stub them out.
   guard and could nil-panic when provider construction failed at boot but the bearer-JWT
   secret was configured; added to match `/exchange`.
 - **HIGH** Both exchange endpoints now mount `StrictIPRateLimitMiddleware`
-  (default 2 rps / 10 burst, env-overridable). The global 500 rps bucket is
-  too wide for login-equivalent endpoints that trigger outbound HTTP and DB
-  writes.
+  (2 rps / 10 burst). The global 500 rps bucket is too wide for
+  login-equivalent endpoints that trigger outbound HTTP and DB writes.
 - **HIGH** Plain-OAuth2 HTTP client now sets `CheckRedirect: ErrUseLastResponse`
   to prevent SSRF / credential replay on 3xx responses.
 - **MEDIUM** Exchange endpoints cap request body at 16 KiB via
@@ -428,6 +423,27 @@ implementations are not forced to stub them out.
   vendor-proprietary protocol name in the out-of-scope list, a vendor-derived
   issuer literal in a test fixture, and a local credential filename in a test
   comment. All replaced with neutral values.
+- **MEDIUM** New environment-variable surface trimmed from 8 to 5. The two
+  rate-limit knobs became constants, and the bearer-JWT environment marker was
+  dropped in favour of deriving the issuer namespace from the upstream issuer.
+  Every variable removed is one fewer way to misconfigure a value that cannot
+  be changed after go-live.
+- **MEDIUM** Phone normalisation now accepts the bare-number form the vendor's
+  own userinfo example uses, plus the `+86` / `0086` / `86` prefix spellings and
+  embedded separators, mapping all of them to `zone=0086`. Previously only `+86`
+  was recognised, so the documented example itself would have been dropped.
+  Deliberately still *not* guessing: an E.164 country code cannot be split off
+  by syntax alone (they are 1-3 digits), and guessing wrong stores a different
+  person's number — a failure that is invisible in the row it writes. Anything
+  ambiguous returns an empty pair and the caller treats the user as having no
+  phone. `extractZone`/`extractPhone` keep their signatures and their
+  all-or-nothing invariant, which `checkClaimsForCreate` and `UIDsByPhone` both
+  rely on. Overseas numbers are still not stored: only the 0086 SMS channel is
+  proven, and a number that cannot receive a code is worse than none — it makes
+  phone-based account recovery look available when it is not.
+- **MEDIUM** The "phone dropped" warning logged the subscriber's full number.
+  It now logs the masked tail plus the length: enough to classify the input,
+  not enough to identify the person. Log retention outlives the diagnostic need.
 
 ## Integration tests written (this PR)
 
