@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -352,4 +353,168 @@ func TestBearerJWT_ForeignTokenStillFallsThroughToUpstream(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code)
 	assert.NotEmpty(t, mp.LastUserInfoQuery(),
 		"a JWT signed with an unknown key is not ours, so it should fall through")
+}
+
+// -----------------------------------------------------------------------------
+// 以下两组用例覆盖上一轮"自家 token 不得转发上游"那条修复漏掉的两道门。
+// -----------------------------------------------------------------------------
+
+// signDesktopJWTRaw 用给定密钥签一段**原样给定**的 payload JSON。
+//
+// signDesktopJWT 走 json.Marshal,只能造出字段类型正确的 payload —— 而下面这条
+// 用例要的恰好是"签名合法、字段类型写错",用那个 helper 表达不出来。上一轮的
+// 用例表因此整类漏掉了这种形态。
+func signDesktopJWTRaw(t *testing.T, secret, payloadJSON string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(header + "." + payload))
+	return header + "." + payload + "." +
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// 一张**签名合法但 payload 字段类型写错**的业务 JWT,同样不得被转发到上游。
+//
+// 这是上一轮那条修复的第一道漏网门:归属判定原先按错误哨兵的身份做,而
+// ErrJWTMalformed 在 hmac.Equal 之后也会出现(payload 不是 JSON / exp 不是整数 /
+// 反序列化到 claims 失败)。于是这些"明确是我们签的"token 被判成"别人的",
+// 落进 /userinfo 的 query string。
+//
+// 触发条件不刁钻:JS 后端写 `iat: Date.now()/1000` 不取整就是浮点;把整数 id
+// 序列化成字符串是 JSON API 里最常见的做法之一。而且客户端把这张 token 存下来
+// 在整个有效期(约 15 天)内反复出示 —— 泄漏是持续的,不是一次性的。
+func TestBearerJWT_ValidSignatureWithWrongPayloadTypesIsNotForwarded(t *testing.T) {
+	route, ctx, mp := setupBothCredentialsTest(t)
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com#bearer-jwt", "2200011")
+	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Desktop", 2, "2026-01-01 10:00:00")
+
+	iat := time.Now().Add(-time.Minute).Unix()
+	exp := time.Now().Add(15 * 24 * time.Hour).Unix()
+
+	for name, payload := range map[string]string{
+		"userId as string": fmt.Sprintf(
+			`{"userId":"2200011","domainAccount":"desk.user","iat":%d,"exp":%d}`, iat, exp),
+		"iat as float": fmt.Sprintf(
+			`{"userId":2200011,"domainAccount":"desk.user","iat":%d.75,"exp":%d}`, iat, exp),
+		"exp as string": fmt.Sprintf(
+			`{"userId":2200011,"domainAccount":"desk.user","iat":%d,"exp":"%d"}`, iat, exp),
+		"payload is not json": `plain-text-payload`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tok := signDesktopJWTRaw(t, testBearerJWTSecret, payload)
+			mp.ResetRequestLog()
+
+			w := httptest.NewRecorder()
+			route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+				"/v1/integrations/oidc/spaces", tok, nil))
+
+			assert.NotEqual(t, http.StatusOK, w.Code, "a malformed payload must not authenticate")
+
+			q := mp.LastUserInfoQuery()
+			assert.Empty(t, q,
+				"the token reached the upstream IdP (userinfo query=%q). Its HMAC is valid under "+
+					"our own secret, so it is unambiguously ours; this IdP takes credentials in the "+
+					"URL, so forwarding leaks the payload plus signature material into a third "+
+					"party's logs", q)
+			assert.NotContains(t, q, tok, "the business JWT appeared in the upstream request URL")
+		})
+	}
+}
+
+// 验签器**构造失败**时,这条凭据路径必须 fail-closed。
+//
+// 这是第二道漏网门,而且比第一道更彻底。NewBearerJWTVerifier 刻意区分两种返回:
+// (nil, nil) = "这条路径没配,属合法部署形态";(nil, err) = "运维配错了"。
+// modules/oidc 那侧遵守了(api_exchange_jwt.go 回 500),integration 这侧原先
+// 只 log 然后带着 nil 验签器继续 —— 就写在一句"不能静默降级"的注释下面。
+//
+// 后果不是"401 看不懂":整个归属判定都在 `if it.bearerJWT != nil` 里面,验签器
+// 一 nil,**每一张**桌面端 JWT 都无条件走 claims==nil 分支进 /userinfo 的 query。
+// 触发条件是纯运维手滑:31 字节的密钥。而"密钥太短"正是泄漏签名材料最要命的
+// 那个场景 —— 32 字节下限的存在理由就是防它被离线爆破。
+func TestBearerJWT_VerifierConstructionFailureFailsClosed(t *testing.T) {
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("OCTO_USER_API_KEY_SECRET", "fedcba9876543210fedcba9876543210")
+
+	mp := oidc.NewMockOAuth2Provider(t)
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "https://idp-test.example.com")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_ID", "cid")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_SECRET", "csecret")
+	t.Setenv("DM_OIDC_PROVIDER_REDIRECT_URI", "https://octo.example/callback")
+	t.Setenv("DM_OIDC_RT_ENC_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("OCTO_OIDC_PROVIDER_KIND", "oauth2")
+	t.Setenv("OCTO_OIDC_PROVIDER_BASE_URL", mp.BaseURL())
+	t.Setenv("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "1")
+	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_RPS", "1000")
+	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_BURST", "10000")
+
+	// 31 字节 —— 差一个字节不达 32 字节下限,NewBearerJWTVerifier 返回 error。
+	const shortSecret = "only-thirty-one-bytes-long-key!"
+	require.Len(t, shortSecret, 31)
+	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", shortSecret)
+
+	s, ctx := testutil.NewTestServer()
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))
+	seedIntegrationClient(t, ctx, defaultClientID, 1)
+	route := s.GetRoute()
+
+	// 客户端拿的是用那把(过短的)密钥签出来的 token —— 运维配错时的真实形态。
+	tok := signDesktopJWT(t, shortSecret, 2200012, "desk.user", time.Now().Add(-time.Minute))
+	mp.ResetRequestLog()
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", tok, nil))
+
+	assert.NotEqual(t, http.StatusOK, w.Code, "a misconfigured deployment must not authenticate")
+
+	q := mp.LastUserInfoQuery()
+	assert.Empty(t, q,
+		"the business JWT was forwarded to the upstream IdP (userinfo query=%q) because the "+
+			"verifier failed to construct and the whole classification sits behind a nil check. "+
+			"A construction error is an operator mistake, not a signal that this credential path "+
+			"is off — and this particular mistake (a short secret) is exactly the case where "+
+			"leaking valid signature material matters most", q)
+	assert.NotContains(t, q, tok, "the business JWT appeared in the upstream request URL")
+}
+
+// 反面守住合法形态:**没有**配密钥时,这条路径就是关的,上游凭据必须照常工作。
+//
+// 这条和上一条一起把 NewBearerJWTVerifier 那个二分钉住 —— 否则"构造失败要拒绝"
+// 很容易被实现成"只要没有验签器就拒绝",那会把一个合法部署形态搞坏。
+func TestBearerJWT_AbsentSecretKeepsUpstreamPathWorking(t *testing.T) {
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("OCTO_USER_API_KEY_SECRET", "fedcba9876543210fedcba9876543210")
+
+	mp := oidc.NewMockOAuth2Provider(t)
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "https://idp-test.example.com")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_ID", "cid")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_SECRET", "csecret")
+	t.Setenv("DM_OIDC_PROVIDER_REDIRECT_URI", "https://octo.example/callback")
+	t.Setenv("DM_OIDC_RT_ENC_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("OCTO_OIDC_PROVIDER_KIND", "oauth2")
+	t.Setenv("OCTO_OIDC_PROVIDER_BASE_URL", mp.BaseURL())
+	t.Setenv("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "1")
+	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", "")
+	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_RPS", "1000")
+	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_BURST", "10000")
+
+	s, ctx := testutil.NewTestServer()
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))
+	seedIntegrationClient(t, ctx, defaultClientID, 1)
+	route := s.GetRoute()
+
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com", mp.Subject())
+	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Web", 2, "2026-01-01 10:00:00")
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", mp.AccessToken(), nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotEmpty(t, mp.LastUserInfoQuery(),
+		"an absent secret is a legal deployment shape ('upstream OIDC on, business JWT off'); "+
+			"it must not be conflated with a misconfiguration")
 }

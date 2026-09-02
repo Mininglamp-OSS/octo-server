@@ -72,11 +72,15 @@ The upstream protocol spec is vendor documentation and is **not checked in**
 
 - `GET  {base}/oauth/authorize?response_type=code&scope=read&client_id=&redirect_uri=&state=`
   — `state` is documented as **optional on the IdP side**, no PKCE, no `nonce`.
-- `POST {base}/oauth/token` — reference implementation puts credentials in the
-  query string (including `client_secret`) with an empty body; the endpoint also
-  accepts `Content-Type: application/x-www-form-urlencoded` form bodies (verified
-  live during development — we moved to a form body to remove `*url.Error`
-  credential leakage but kept credentials off the URL path).
+- `POST {base}/oauth/token` — the reference implementation puts every parameter
+  in the **query string** (including `client_secret`) with an empty body, and that
+  is what `oauth2Provider.Exchange` does. An earlier revision of this line claimed
+  we had moved to a form body; we had not, and the code comment says why we do not:
+  a form body is only theoretically acceptable on the upstream's Spring stack, is
+  unverified against it, and the upstream gateway may read or sign only the query.
+  The `*url.Error` credential-leak concern that motivated the form body is handled
+  instead by sanitizing transport errors before they reach a log
+  (`sanitizeTransportError`), which is verified by the provider conformance suite.
 - `GET  {base}/<vendor-path>/userinfo?access_token=` — token in the query string,
   **not** an `Authorization` header; claims nested under a `{success, code,
   message, requestId, data:{...}}` envelope, so the top-level `sub` that
@@ -231,10 +235,27 @@ implementations are not forced to stub them out.
     operational key isolation (single-purpose secret).
 - **`(issuer, subject)` identity mapping — irreversible.** `user_oidc_identity`
   has `uk_issuer_subject`; admitting an empty/colliding subject collapses users
-  onto one row (account-takeover shape). `checkSubjectShape` caps subject length at
-  the column width (`subjectMaxLen == issuerMaxLen`, pinned by a test so the two
-  cannot drift), on top of the short-numeric refusal; the bearer-JWT provider
-  converts `userId` to its decimal string with a non-zero guard.
+  onto one row (account-takeover shape). Two guards, and they deliberately have
+  **different scopes** — an earlier revision of this line conflated them:
+
+  - *Storage bound* (non-empty, `<= subjectMaxLen`, and the same for `issuer`):
+    a property of the column, so it is provenance-neutral and applies to every
+    identity path. Enforced once, at the two points where claims enter a stateful
+    path — `Service.ResolveOrLink` and `BindService.IssueWithReason` — via
+    `requireStorableIdentity` (`identity_bounds.go`), i.e. before any side effect.
+    `subjectMaxLen == issuerMaxLen` is pinned by a test so the two cannot drift.
+    The bound is compared in **bytes** while `VARCHAR(255)` under `utf8mb4` is 255
+    *characters*; that is intentionally conservative (it refuses loudly rather than
+    truncating) and now says so in the code.
+  - *Short-numeric refusal* ("looks like an employee number"): a property of an
+    **upstream-asserted** subject, because the argument is that a personnel system
+    reuses the number between a leaver and a joiner. It therefore lives in the two
+    `AuthProvider` implementations and is pinned by the conformance table. It
+    deliberately does **not** apply to subjects we derive ourselves: the bearer-JWT
+    path's subject is our own business database primary key (`strconv.FormatInt`
+    of `userId`, with a non-zero guard), which is never reused — applying the
+    heuristic there locked every deployment with short user ids out of the desktop
+    credential path (caught by the existing `/exchange-jwt` tests).
 
   This line asserted the cap before it existed. Only the *lower* bound was
   implemented, so a 300-byte subject passed the boundary and reached an INSERT
@@ -401,10 +422,15 @@ implementations are not forced to stub them out.
   30d) for SSO-issued sessions; depends on ops confirming the upstream
   offboarding latency. Currently tracked in code review as a P1 config change
   after this PR.
-- **autolink boot-time guard** — refusing startup when a provider without
-  verified-claim support is combined with `AutoLinkByEmail` and
-  `RequireEmailVerified=false`. ProviderCapabilities does not yet carry a
-  `VerifiedClaims` bit; adding that is a small follow-up.
+<!-- The autolink boot-time guard was listed here as pending after it had already
+     been implemented. It now lives in `pkg/oidcboot.ValidateKind` (refusing
+     `AutoLinkByEmail && !RequireEmailVerified` under `kind=oauth2`) and is pinned
+     by `RefusedScenarios`, which both consumers' tests run. What remains is only
+     the generalisation below. -->
+- **`ProviderCapabilities.VerifiedClaims`** — the autolink boot guard is currently
+  expressed per kind (`kind=oauth2` cannot produce verified claims). A capability
+  bit would let a third provider declare the same fact instead of the rule naming
+  a kind; small follow-up, no behaviour change.
 - **Bearer-JWT audience/purpose claim** — the JWT currently has no `aud` or
   `purpose` field, so cross-purpose token reuse is only mitigated by
   operational key isolation (single-purpose secret). Adding a required `aud`
@@ -785,11 +811,109 @@ re-derived from the source before acting; all held.
   the same failure the boot-time refusal was added to prevent, reached by another
   route. One definition now, in `pkg/oidcboot`.
 
-Deferred, recorded rather than silently skipped: the duplicated boolean env parsing
-between `oidcboot` and `modules/oidc` (can reopen the lockout class, but needs a
-non-`ParseBool` value *and* a contradicting legacy alias), and the access-log scrub
-being bypassable with percent-encoded parameter names (an attacker only gets their
-own values logged).
+### Round 6 — two doors the previous round's headline fix did not enumerate
+
+A reviewer's process note is the reason this round also produced
+[`guard-matrix.md`](./guard-matrix.md): three consecutive rounds found the *same
+class* of defect through a route the previous fix had not listed. I had dismissed
+the request to write that matrix down as ceremony, on the reasoning that it
+"produces the same fix list without changing a line of code". That reasoning was
+wrong — it evaluated the matrix against the findings already in hand, whereas its
+value is in the cells nobody has looked at. Both of this round's blockers sat in
+columns the reviewer had named ("at which stage" and "what happens when the
+component implementing the guard failed to construct"). Filling the table in also
+turned up one cell that had been stated imprecisely (freshness on `/exchange` is
+credential-dependent: under `kind=oauth2` there is no expiry we can inspect) and
+confirmed one suspected gap was not real (`/exchange-jwt` does carry the IP
+limiter, shared with `/exchange`).
+
+Both blocking findings were the **same defect as round 5**, reached by routes the
+fix had not listed. Two reviewers found both independently.
+
+- **`IsForeignToken` classified by error identity, and the identity spans the
+  signature boundary.** The comment I wrote asserted that `ErrJWTMalformed` /
+  `ErrJWTBadAlg` / `ErrJWTInvalidSig` "all fail at or before signature
+  verification". That is false for `ErrJWTMalformed`: `VerifyHS256JWT` also returns
+  it *after* `hmac.Equal` succeeds — payload not JSON, `exp` not an integer, payload
+  not decodable into the claims struct. So a token carrying a **valid HMAC under our
+  own secret** was classified foreign and forwarded to the upstream `/userinfo`,
+  which takes credentials in the URL query. The trigger is not exotic: a backend
+  emitting `iat: Date.now()/1000` without a floor produces exactly that token, and
+  the client reuses it for the credential's whole life, so the leak is continuous.
+
+  Fixed by inverting the classification into an **allowlist**: only the pre-/at-
+  signature sites carry `ErrJWTForeign`, and `IsForeignToken` tests for that mark
+  alone. Any check added later — anywhere in `VerifyHS256JWT` — now defaults to
+  "ours", i.e. refuse locally rather than forward. Forgetting to mark fails closed.
+
+  Why the round-5 test table missed it: it enumerated "ours and rejected" as
+  expired / zero `userId` / far-future `iat` — all post-signature, none of them
+  `ErrJWTMalformed` — and the signing helper could only mint well-typed payloads,
+  so the failing class was not expressible with it. The new tests sign raw payload
+  bytes.
+
+- **`modules/integration` failed open when the verifier failed to construct.**
+  `NewBearerJWTVerifier` distinguishes `(nil, nil)` = "path intentionally off" from
+  `(nil, err)` = "an operator got it wrong". `modules/oidc` honours that with a 500;
+  `modules/integration` logged and continued with a nil verifier — directly under a
+  comment saying that must not happen. Because the whole classification sits behind
+  `if it.bearerJWT != nil`, a nil verifier sent **every** desktop JWT upstream in a
+  URL query, unconditionally. Trigger: a 31-byte secret — precisely the case where
+  leaking valid signature material matters most, since the 32-byte floor exists to
+  stop offline recovery.
+
+  Fixed by keeping the error on the struct (`bearerJWTErr`) and refusing **every**
+  credential on both endpoints while it is set. Refusing upstream credentials too is
+  deliberate: without a constructible verifier we cannot answer "is this ours?", so
+  any fall-through re-opens the leak, and routing by token shape is not a substitute.
+  An absent secret remains a legal deployment shape, pinned by its own test.
+
+- **The subject cap covered one of three identity paths.** The bound lived in the
+  plain-OAuth2 trust boundary only, so under `kind=oidc` a signed id_token with a
+  300-byte `sub` still reached `IssueSession` and the INSERT. A signature proves
+  provenance, not representability. Moved to `requireStorableIdentity` at the two
+  stateful entry points, which is protocol-neutral and covers the bearer path too;
+  `issuer` gained the same bound, additionally refused at provider construction so
+  an operator error surfaces at boot instead of at the first login.
+
+  **This is where I over-reached and the tests caught it.** My first version put the
+  *employee-number* heuristic in the shared funnel as well. That rule's argument
+  ("personnel systems reuse the number between a leaver and a joiner") only holds
+  for upstream-asserted subjects; the bearer path's subject is our own database
+  primary key, so `userId=42` is normal. Three `/exchange-jwt` tests went red. The
+  guard is now split by what each half is a property of — storage vs provenance —
+  and the provenance half is pinned by the conformance table for both providers.
+
+- **The id_token cache decision asserted on a concrete type.** `o.provider.(*oidcProvider)`
+  where `Capabilities().IDToken` exists for exactly that decision, against a rule the
+  interface states explicitly ("branch on Capabilities, never on Kind"). Any decorator
+  or a third id_token-capable provider would have silently lost RP-Initiated Logout —
+  the same silence as the regression restored in round 5. Not hypothetical: the
+  decorator design considered for the bounds guard this round would have tripped it.
+  `EndSessionEndpoint()` is now part of the interface, with the contract "IDToken=false
+  implies empty" pinned for both implementations.
+
+- **`AppIDPattern` was an exported mutable `var`.** Unifying the definition was right;
+  leaving the single copy reassignable by any importer was not. Now a function, with
+  the two shapes the unification actually changed (`_tenant`, 65 characters) added to
+  `RefusedScenarios`.
+
+Deferred, recorded rather than silently skipped:
+
+- The duplicated boolean env parsing between `oidcboot` and `modules/oidc` (can
+  reopen the lockout class, but needs a non-`ParseBool` value *and* a contradicting
+  legacy alias).
+- The access-log scrub being bypassable with percent-encoded parameter names (an
+  attacker only gets their own values logged).
+- The column bounds compare **bytes** while `utf8mb4 VARCHAR(255)` is 255
+  *characters*. Deliberately conservative: it refuses a legitimate 100-character CJK
+  subject loudly with zero rows written, rather than risk truncation. Switching to
+  `utf8.RuneCountInString` loosens a security guard to support a shape no IdP has
+  produced (subjects observed in the wild are ASCII — UUIDs, decimal ids, base64).
+  Revisit if a CJK subject ever appears.
+- `/exchange`'s `access_token` field carries an **id_token** under `kind=oidc`.
+  Renaming it breaks existing clients, so the file header and the struct field now
+  state the mismatch instead. Capability-gated mounting of the endpoint is still open.
 
 ## Integration tests written (this PR)
 

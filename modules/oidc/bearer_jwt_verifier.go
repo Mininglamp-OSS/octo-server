@@ -112,19 +112,26 @@ func newBearerJWTVerifierForTest(secret []byte, issuer string) *BearerJWTVerifie
 
 // IsForeignToken 报告一个 Verify 错误是否意味着"这张 token 不是我们签的"。
 //
-// 只有三种错误属于这一类:段数/base64/JSON 不对(ErrJWTMalformed)、alg 不是
-// HS256(ErrJWTBadAlg)、HMAC 不匹配(ErrJWTInvalidSig)。它们都在**验签之前或
-// 验签本身**失败,所以无法断定这张 token 与我方密钥有关。
+// 判定依据是 **ErrJWTForeign 标记**,而不是错误哨兵的身份。
 //
-// 其余错误(新鲜度、claims 约束)只有在 HMAC **已经匹配**之后才可能出现 ——
-// 也就是说那张 token 确实是我们自己签的,只是按它自身的条件被拒了。
+// 曾经这里按哨兵身份判:ErrJWTMalformed / ErrJWTBadAlg / ErrJWTInvalidSig 三者
+// 视为"不是我们的"。**那个前提是假的** —— ErrJWTMalformed 横跨 hmac.Equal 两侧:
+// 段数/base64 不对是验签前(确实无法归属),而 "payload json"、"exp 不是整数"、
+// "payload decode to out" 三处出现在验签**通过之后**,却报同一个哨兵。于是一张
+// 带着我方合法 HMAC、只是 payload 字段类型写错的 token(JS 后端写
+// `iat: Date.now()/1000` 不取整就是这个形态)会被判成"别人的",回落转发给上游 ——
+// 而上游那条路径把凭据放在 URL query 上,于是载荷里的 PII 加一份在我方密钥下
+// 合法的签名一起落进第三方访问日志。后者是可离线爆破密钥的材料,正是本模块给
+// 密钥设 32 字节下限时所防的东西。
 //
-// 这个区分是安全相关的,所以判定放在这里而不是让每个调用方自己拼错误列表:
-// 调用方漏一个哨兵,就会把一张带着我方合法签名的 token 当成"别人的"转发给上游 ——
-// 而上游那条路径把凭据放在 URL query 上,于是签名材料落进第三方的访问日志。
-// 将来新增 claims 约束时,只要它出现在 VerifyHS256JWT 之后,就自动归入"是我们的"。
+// 所以判定必须由**产生错误的位置**显式标注,并且方向要反过来 —— 白名单:
+//
+//   - 只有验签前/验签本身的失败被标 ErrJWTForeign,只有它们算"不是我们的";
+//   - 其余一切(含将来新增的 claims 约束、含忘了标注的新错误)默认算"是我们的",
+//     调用方就地拒绝、不转发。
+//
+// 黑名单会让"忘记标注"fail-open(转发),白名单让它 fail-closed(401)。
+// 这个区分放在这里而不是让每个调用方拼错误列表,是因为漏一个的后果是泄漏凭据。
 func IsForeignToken(err error) bool {
-	return errors.Is(err, ErrJWTMalformed) ||
-		errors.Is(err, ErrJWTBadAlg) ||
-		errors.Is(err, ErrJWTInvalidSig)
+	return errors.Is(err, ErrJWTForeign)
 }

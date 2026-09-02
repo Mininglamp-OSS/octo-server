@@ -220,13 +220,10 @@ func New(ctx *config.Context) *OIDC {
 	//
 	// new_wiring_integration_test.go 从 New() 出发断言这里装上了,所以再删会红。
 	if cfg.Provider.PostLogoutRedirectURI != "" {
-		// 只对标准 OIDC 有意义:plain-OAuth2 没有 id_token,登出走 SLO 的 appId
-		// 路径。端点可用性判断在 oidcProvider 里,这里按类型取出;非 OIDC provider
-		// 断言失败 → endpoint 为空 → 走禁用分支。
-		endpoint := ""
-		if op, ok := o.provider.(*oidcProvider); ok {
-			endpoint = op.endSessionEndpoint()
-		}
+		// 只对声明了 IDToken 能力的 provider 有意义:plain-OAuth2 没有 id_token,
+		// 登出走自己的 SLO(appId 路径段)。判断读 Capabilities 而不是断言具体
+		// 类型 —— 见 endSessionEndpointForLogout。
+		endpoint := endSessionEndpointForLogout(o.provider)
 		switch {
 		case endpoint == "" || validateLogoutURL("end_session_endpoint", endpoint) != nil:
 			// 配了回跳地址却拿不到可用端点:打 Info 让运维看得见"为什么 RP-logout
@@ -1365,8 +1362,12 @@ func (k ctxKiller) Kick(_ context.Context, uid string) error {
 	return k.ctx.QuitUserDevice(uid, -1)
 }
 
-// KickDevice 只退指定端。device_flag 由调用方从当前 session 解出,0 不是合法的
-// "某一端"取值(它是解析失败的哨兵),调用方在传进来之前就该改走 Kick。
+// KickDevice 只退指定端。device_flag 由调用方从当前 session 解出。
+//
+// **0 是合法取值** —— config.APP 就是 0(DeviceFlag = iota)。所以"解析失败"不能
+// 用 0 表示,调用方必须另带一个布尔:deviceFlagFromRequest 返回 (flag, known),
+// known=false 时上层改走 Kick(踢全部)。把两者压进一个 uint8 会让"桌面端登出"
+// 与"解析失败"不可区分,而两者要求相反的处理。
 func (k ctxKiller) KickDevice(_ context.Context, uid string, deviceFlag uint8) error {
 	return k.ctx.QuitUserDevice(uid, int(deviceFlag))
 }

@@ -181,11 +181,14 @@ func parseUserInfoEnvelope(body []byte, issuer string) (*IDTokenClaims, error) {
 // 最后一个路径段拼在其后。
 const upstreamLogoutPathPrefix = "public/sp/slo"
 
-// upstreamAppIDRe 复用 pkg/oidcboot 的唯一定义。
+// validUpstreamAppID 复用 pkg/oidcboot 的唯一判据。
 //
 // 曾经这里另有一份更严的正则,于是启动期放过、运行期拒绝 —— 而运行期这边
 // LogoutURL 吞掉错误返回 ("", false),登出静默降级成"只清本地"。判据只能有一份。
-var upstreamAppIDRe = oidcboot.AppIDPattern
+//
+// oidcboot 那边是函数而不是导出的 var:可变的包级 regexp 能被任何 importer 重新
+// 赋值,那等于把刚统一起来的判据又放开了。
+func validUpstreamAppID(appID string) bool { return oidcboot.ValidAppID(appID) }
 
 // buildUpstreamLogoutURL 拼该 IdP 的单点登出地址:
 //
@@ -214,9 +217,10 @@ func buildUpstreamLogoutURL(baseURL, appID, redirect string) (string, error) {
 	if appID == "" {
 		return "", fmt.Errorf("oidc: upstream logout: app id is empty")
 	}
-	if !upstreamAppIDRe.MatchString(appID) {
+	if !validUpstreamAppID(appID) {
 		// 不回显 appID 本身以外的内容;它是配置值,回显有助于运维定位。
-		return "", fmt.Errorf("oidc: upstream logout: app id %q is not URL-safe (allowed: letters, digits, '-', '_')", appID)
+		return "", fmt.Errorf("oidc: upstream logout: app id %q is not URL-safe (%s)",
+			appID, oidcboot.AppIDDescription)
 	}
 	if redirect == "" {
 		// 没有回跳地址,用户登出后会停在 IdP 页面回不来。视为配置错误,
@@ -311,6 +315,14 @@ func newOAuth2Provider(cfg oauth2ProviderConfig) (*oauth2Provider, error) {
 		if f.val == "" {
 			return nil, fmt.Errorf("oidc: oauth2 provider: %s is required", f.name)
 		}
+	}
+	// issuer 会写进 user_oidc_identity.issuer(VARCHAR(255))并参与 uk_issuer_subject。
+	// 超长的后果与 subject 那侧同理:严格 sql_mode 下 INSERT 在建号之后才失败,留下
+	// 孤立用户;非严格模式下静默截断,两个命名空间塌成一个。区别是 issuer 是运维
+	// 配置的常量,所以这里就能拒 —— 启动期报错比让第一个登录的人吃 500 好排查。
+	if len(cfg.Issuer) > issuerMaxLen {
+		return nil, fmt.Errorf("oidc: oauth2 provider: issuer is %d bytes, exceeds the %d-byte "+
+			"identity column width", len(cfg.Issuer), issuerMaxLen)
 	}
 	if err := validateAbsoluteHTTPURL("base URL", cfg.BaseURL); err != nil {
 		return nil, err
@@ -619,3 +631,10 @@ func (p *oauth2Provider) IdentityFromClientCredential(ctx context.Context, raw s
 	}
 	return p.Identity(ctx, &TokenSet{AccessToken: raw})
 }
+
+// EndSessionEndpoint 实现 AuthProvider:plain-OAuth2 没有 RP-Initiated Logout。
+//
+// 该 IdP 自有一个 SLO 端点(见 buildUpstreamLogoutURL),但它按 appId 路径段工作、
+// 没有 id_token_hint 可送,与 RP-Initiated Logout 不是同一个机制。返回空串是为了
+// 让上层不要为它装 id_token 缓存 —— 对齐 Capabilities().IDToken=false。
+func (p *oauth2Provider) EndSessionEndpoint() string { return "" }

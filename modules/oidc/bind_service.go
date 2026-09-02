@@ -102,8 +102,11 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 // BindReasonUnknownUser(可建号);ErrConflictNeedManual → BindReasonManualConflict
 // (Create 路径拒绝)。详见 IssueReason godoc。
 func (s *BindService) IssueWithReason(ctx context.Context, claims *IDTokenClaims, sd *StateData, reason IssueReason) (string, error) {
-	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
-		return "", fmt.Errorf("oidc bind Issue: claims iss/sub required")
+	// 与 ResolveOrLink 同一道守卫(identity_bounds.go)。绑定是第三个 claims 入口:
+	// 它把快照存进 BindSession,Create 之后拿快照建号并落 identity 行 —— 漏在这里
+	// 等于给超长/可疑 subject 留了一条绕路。
+	if err := requireStorableIdentity(claims); err != nil {
+		return "", fmt.Errorf("oidc bind Issue: %w", err)
 	}
 	if sd == nil {
 		return "", fmt.Errorf("oidc bind Issue: state data required")

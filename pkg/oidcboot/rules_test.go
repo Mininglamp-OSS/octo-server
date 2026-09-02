@@ -110,7 +110,7 @@ func indexOf(s, sub string) int {
 // 启动校验,却在运行期被拒 —— 而运行期那里 LogoutURL 吞掉错误、返回 ("", false),
 // 登出静默降级成"只清本地"。这正是启动期 fail-loud 规则想避免的失效,只是从另一条
 // 路走到了同一个结果。
-func TestAppIDPattern_RefusesWhatTheProviderWouldAlsoRefuse(t *testing.T) {
+func TestValidAppID_RefusesWhatTheProviderWouldAlsoRefuse(t *testing.T) {
 	cases := map[string]bool{ // value = 应当被接受
 		"app1":       true,
 		"a":          true,
@@ -125,18 +125,18 @@ func TestAppIDPattern_RefusesWhatTheProviderWouldAlsoRefuse(t *testing.T) {
 	}
 	for in, want := range cases {
 		t.Run(in, func(t *testing.T) {
-			got := AppIDPattern.MatchString(in)
+			got := ValidAppID(in)
 			if got != want {
-				t.Errorf("AppIDPattern.MatchString(%q) = %v, want %v", in, got, want)
+				t.Errorf("ValidAppID(%q) = %v, want %v", in, got, want)
 			}
 		})
 	}
 	// 长度上限也要一致 —— 超长 app id 拼进 URL 路径段同样是运行期才炸。
-	if AppIDPattern.MatchString(strings.Repeat("a", 65)) {
+	if ValidAppID(strings.Repeat("a", 65)) {
 		t.Error("a 65-character app id was accepted; the provider refuses it at runtime, " +
 			"where the error is swallowed and logout silently degrades to local-only")
 	}
-	if !AppIDPattern.MatchString(strings.Repeat("a", 64)) {
+	if !ValidAppID(strings.Repeat("a", 64)) {
 		t.Error("a 64-character app id must be accepted")
 	}
 }

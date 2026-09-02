@@ -35,7 +35,10 @@ type fakeBearerProvider struct{}
 
 func (fakeBearerProvider) Kind() ProviderKind                 { return KindOAuth2 }
 func (fakeBearerProvider) Capabilities() ProviderCapabilities { return ProviderCapabilities{} }
-func (fakeBearerProvider) Issuer() string                     { return "https://idp-test.example.com" }
+
+// IDToken=false,所以按契约返回空串。
+func (fakeBearerProvider) EndSessionEndpoint() string { return "" }
+func (fakeBearerProvider) Issuer() string             { return "https://idp-test.example.com" }
 func (fakeBearerProvider) AuthCodeURL(AuthCodeParams) (string, error) {
 	return "", errors.New("not used")
 }

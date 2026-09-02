@@ -121,8 +121,11 @@ func newService(cfg ProviderConfig, store identityStore, users userLookup) *Serv
 //
 // 返回 IsNew=true 时 UID 为空,由 IssueSession 通过 user.IService 创建并回填。
 func (s *Service) ResolveOrLink(ctx context.Context, claims *IDTokenClaims) (*ResolveResult, error) {
-	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
-		return nil, fmt.Errorf("oidc: ResolveOrLink: claims iss/sub required")
+	// 可落库性守卫:非空 + 不超列宽 + subject 形态。见 identity_bounds.go ——
+	// 这里是 callback 与两个 exchange 端点的共同入口,且在 IssueSession 之前,
+	// 所以是"副作用之前"能覆盖到全部协议的那个点。
+	if err := requireStorableIdentity(claims); err != nil {
+		return nil, fmt.Errorf("oidc: ResolveOrLink: %w", err)
 	}
 
 	// 1. 已绑定

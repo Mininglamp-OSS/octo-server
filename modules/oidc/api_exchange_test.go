@@ -76,11 +76,22 @@ type fakeProvider struct {
 	identityFn func(ctx context.Context, tok *TokenSet) (*IdentityClaims, error)
 	lastTok    *TokenSet
 	callN      int64
+	// endSessionEndpoint 仅 caps.IDToken=true 时会被返回。
+	endSessionEndpoint string
 }
 
 func (f *fakeProvider) Kind() ProviderKind                 { return KindOAuth2 }
 func (f *fakeProvider) Capabilities() ProviderCapabilities { return f.caps }
-func (f *fakeProvider) Issuer() string                     { return f.issuer }
+
+// EndSessionEndpoint 按 caps.IDToken 如实回应,遵守 AuthProvider 的契约
+// (IDToken=false 必须返回空串)。
+func (f *fakeProvider) EndSessionEndpoint() string {
+	if !f.caps.IDToken {
+		return ""
+	}
+	return f.endSessionEndpoint
+}
+func (f *fakeProvider) Issuer() string { return f.issuer }
 func (f *fakeProvider) AuthCodeURL(p AuthCodeParams) (string, error) {
 	return "", errors.New("not used")
 }

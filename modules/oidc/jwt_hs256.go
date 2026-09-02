@@ -34,6 +34,9 @@ var (
 	// ErrJWTMissingExp payload 不含 exp 字段或类型异常。强制要求 exp 是为了
 	// 让"永久有效 token"不可能被签发出来。
 	ErrJWTMissingExp = errors.New("jwt: exp claim is required")
+	// ErrJWTForeign 标注"该失败发生在验签通过之前(含验签本身)",因此无法断定
+	// 这张 token 与我方密钥有关。见 IsForeignToken。
+	ErrJWTForeign = errors.New("jwt: token cannot be attributed to our key")
 )
 
 // joseHeader 固定只认 {"alg":"HS256","typ":"JWT"}。多余字段允许但忽略。
@@ -55,40 +58,42 @@ type joseHeader struct {
 // "这个 token 是持有 secret 的一方签的、还没过期、是 HS256、结构合法"。
 func VerifyHS256JWT(token string, secret []byte, now time.Time, out any) error {
 	if out == nil {
+		// 刻意**不**标 ErrJWTForeign:这是调用方的编程错误,签名根本没算过,
+		// 归属未知。未标记 = 按"是我们的"处理 = 不转发上游,这是安全的那一侧。
 		return fmt.Errorf("%w: out destination is nil", ErrJWTMalformed)
 	}
 	if len(secret) == 0 {
 		// 空密钥的 HMAC 任何人都能离线算,等价于完全不验签,明确拒绝而不是"验证通过"。
 		// 生产装配路径(api.go New/bearerJWTSecret 配置)也有非空检查,这里是纵深防御。
-		return fmt.Errorf("%w: secret must be non-empty", ErrJWTInvalidSig)
+		return fmt.Errorf("%w: %w: secret must be non-empty", ErrJWTForeign, ErrJWTInvalidSig)
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return fmt.Errorf("%w: expected 3 segments, got %d", ErrJWTMalformed, len(parts))
+		return fmt.Errorf("%w: %w: expected 3 segments, got %d", ErrJWTForeign, ErrJWTMalformed, len(parts))
 	}
 	rawHeader, rawPayload, rawSig := parts[0], parts[1], parts[2]
 
 	// 解码 header 并校验 alg 必须是 HS256(抗 alg 混淆攻击的关键一步)。
 	headerBytes, err := b64urlDecode(rawHeader)
 	if err != nil {
-		return fmt.Errorf("%w: header base64: %v", ErrJWTMalformed, err)
+		return fmt.Errorf("%w: %w: header base64: %v", ErrJWTForeign, ErrJWTMalformed, err)
 	}
 	var hdr joseHeader
 	if err := json.Unmarshal(headerBytes, &hdr); err != nil {
-		return fmt.Errorf("%w: header json: %v", ErrJWTMalformed, err)
+		return fmt.Errorf("%w: %w: header json: %v", ErrJWTForeign, ErrJWTMalformed, err)
 	}
 	if hdr.Alg != "HS256" {
-		return fmt.Errorf("%w: got %q", ErrJWTBadAlg, hdr.Alg)
+		return fmt.Errorf("%w: %w: got %q", ErrJWTForeign, ErrJWTBadAlg, hdr.Alg)
 	}
 	if hdr.Typ != "" && hdr.Typ != "JWT" {
-		return fmt.Errorf("%w: typ %q is not JWT", ErrJWTBadAlg, hdr.Typ)
+		return fmt.Errorf("%w: %w: typ %q is not JWT", ErrJWTForeign, ErrJWTBadAlg, hdr.Typ)
 	}
 
 	// 解码 payload。先解码后验签是 JWT 库的常规做法(签名校验覆盖 header+payload 原文,
 	// 早解 payload 不会引入"未授权数据被处理"的问题,因为调用方必须等 err==nil 才用 out)。
 	payloadBytes, err := b64urlDecode(rawPayload)
 	if err != nil {
-		return fmt.Errorf("%w: payload base64: %v", ErrJWTMalformed, err)
+		return fmt.Errorf("%w: %w: payload base64: %v", ErrJWTForeign, ErrJWTMalformed, err)
 	}
 
 	// 验签:签名输入是 ASCII(header) + "." + ASCII(payload),签名是 raw signature 的 base64url 解码。
@@ -98,11 +103,19 @@ func VerifyHS256JWT(token string, secret []byte, now time.Time, out any) error {
 	expectedSig := mac.Sum(nil)
 	actualSig, err := b64urlDecode(rawSig)
 	if err != nil {
-		return fmt.Errorf("%w: signature base64: %v", ErrJWTMalformed, err)
+		return fmt.Errorf("%w: %w: signature base64: %v", ErrJWTForeign, ErrJWTMalformed, err)
 	}
 	if !hmac.Equal(actualSig, expectedSig) {
-		return ErrJWTInvalidSig
+		return fmt.Errorf("%w: %w", ErrJWTForeign, ErrJWTInvalidSig)
 	}
+
+	// ==================== 以下都在验签通过之后 ====================
+	//
+	// 这条线以下的任何失败都意味着 **token 确实是持有我方密钥的一方签的**,只是
+	// 按 claims 自身的条件被拒。一律**不**标 ErrJWTForeign —— 见 IsForeignToken:
+	// 未标记即"是我们的",调用方因此不会把它转发给上游 IdP。
+	//
+	// 新增检查时不需要记得做任何事,这就是把标记放在上半段的目的。
 
 	// 用 RawMessage 单独取 exp,再按数字解析——避免依赖 json.Number/UseNumber 模式,
 	// 也能精确拒绝字符串/布尔/对象等非数字类型。

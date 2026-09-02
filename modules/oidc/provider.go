@@ -107,6 +107,17 @@ type AuthProvider interface {
 	Kind() ProviderKind
 	Capabilities() ProviderCapabilities
 
+	// EndSessionEndpoint 上游可跳转的 RP-Initiated Logout 端点;不可用时返回空串。
+	//
+	// 契约:Capabilities().IDToken 为 false 的实现**必须**返回空串 —— 没有
+	// id_token 就没有 id_token_hint,那个端点结束不了任何会话。
+	//
+	// 为什么要放进接口而不是让上层对具体类型做断言:上层用它决定"要不要装
+	// id_token 缓存",而对 *oidcProvider 做断言会被任何一层包装(装饰器、将来
+	// 的第三个 IdP)悄悄打掉,RP-Initiated Logout 于是静默消失。本文件开头
+	// 那条规则("业务分支一律读 Capabilities,不读 Kind")就是为这类判断立的。
+	EndSessionEndpoint() string
+
 	// Issuer 写入 user_oidc_identity.issuer 的稳定身份命名空间。
 	//
 	// 标准 OIDC 下它是经 Discovery 校验过的 issuer;plain-OAuth2 下它是运维

@@ -162,10 +162,15 @@ func (c *bearerJWTClaims) toIdentityClaims(issuer string) *IdentityClaims {
 // 上游 issuer + 后缀的情况。
 const bearerJWTIssuerSuffix = "#bearer-jwt"
 
-// issuerMaxLen 与 user_oidc_identity.issuer 的列宽一致(VARCHAR(255))。
+// issuerMaxLen issuer 允许的最大**字节**数,取 user_oidc_identity.issuer 的列宽
+// 数值(VARCHAR(255))。
+//
 // 超长会在 INSERT 时被 MySQL 截断或报错,取决于 sql_mode —— 截断更危险:
 // 两个不同 issuer 可能截成同一个值,uk_issuer_subject 就把两个人合成一个号。
 // 所以在启动期拒绝,而不是等运行期。
+//
+// 与 subjectMaxLen 同一个数值、同一个"按字节比较故意比列宽更严"的取舍,理由见
+// subject_shape.go 的注释。issuer 这侧几乎不受影响:它是绝对 URI,本就是 ASCII。
 const issuerMaxLen = 255
 
 // bearerJWTIssuerFromUpstream 由已配置的上游 issuer 派生 bearer JWT 的 issuer 命名空间。

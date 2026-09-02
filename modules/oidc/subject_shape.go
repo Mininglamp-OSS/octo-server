@@ -47,7 +47,17 @@ var errSubjectTooShort = errors.New("subject looks like an employee number")
 // errSubjectTooLong subject 超出 user_oidc_identity.subject 的列宽。
 var errSubjectTooLong = errors.New("subject exceeds the identity column width")
 
-// subjectMaxLen user_oidc_identity.subject 的列宽(VARCHAR(255),按字节)。
+// subjectMaxLen subject 允许的最大**字节**数,取 user_oidc_identity.subject 的
+// 列宽数值(VARCHAR(255))。
+//
+// 注意语义差异:utf8mb4 下 VARCHAR(255) 是 255 **字符**(最多 1020 字节),而这里
+// 比较的是 len()(字节)。所以这道守卫**故意比列宽更严** —— 方向是 fail-safe:
+// 它会拒掉一个本可存下的 100 字符 CJK subject(响亮地拒,零行落库),而不会放过
+// 一个存不下的值(静默截断 = 账号接管)。
+//
+// 之所以不改成 utf8.RuneCountInString:那是放松一道安全守卫,而放松的收益是支持
+// 一种从未出现过的形态(IdP 生成的 subject 实际上都是 ASCII —— UUID、数字串、
+// base64)。真出现 CJK subject 再改,记在 brief 的 Pending 里。
 //
 // 与 issuerMaxLen 同源同值:两列在同一个唯一键 uk_issuer_subject 里,分开维护
 // 两个数字迟早不一致(有测试钉住它们相等)。
@@ -62,11 +72,22 @@ var errSubjectTooLong = errors.New("subject exceeds the identity column width")
 // 运维配置的常量,而 subject 来自上游响应,长度不受我方控制。
 const subjectMaxLen = issuerMaxLen
 
-// checkSubjectShape 校验 subject 不是"短纯数字"这种危险形态。
+// checkSubjectShape 上游 IdP 断言的 subject 的完整守卫:存储上限 + 工号形态。
 //
-// 只对纯数字生效:一旦含非数字字符,它就不可能是工号,长度也就不再是信号。
+// **只用于上游断言的 subject**(callback / exchange 拿到的 IdP sub)。我方自己派生
+// 的 subject 不走这里 —— 见 checkUpstreamSubjectShape 的说明。
 func checkSubjectShape(subject string) error {
-	// 上限先查,且对所有形态生效 —— 下面的下限只管纯数字,放得过一个 300 位数字串。
+	if err := checkSubjectStorable(subject); err != nil {
+		return err
+	}
+	return checkUpstreamSubjectShape(subject)
+}
+
+// checkSubjectStorable 只查**能不能存**:长度上限。
+//
+// 与 subject 的来源无关,所以这一条对每条身份路径都成立,由共享入口
+// requireStorableIdentity 统一施加(见 identity_bounds.go)。
+func checkSubjectStorable(subject string) error {
 	// 只回长度不回值:超长 subject 进日志既无用,又扩大 PII 面。
 	if len(subject) > subjectMaxLen {
 		return fmt.Errorf("%w: %d bytes, max %d (the column is VARCHAR(%d) inside "+
@@ -75,6 +96,22 @@ func checkSubjectShape(subject string) error {
 			"a prefix collapse onto one identity)",
 			errSubjectTooLong, len(subject), subjectMaxLen, subjectMaxLen)
 	}
+	return nil
+}
+
+// checkUpstreamSubjectShape 拒绝"短纯数字"这种危险形态。
+//
+// 只对纯数字生效:一旦含非数字字符,它就不可能是工号,长度也就不再是信号。
+//
+// **为什么只对上游断言的 subject 生效**:这条规则的论证是"工号在离职/入职之间被
+// 复用,而 (issuer, subject) 是不可变主键,于是新人会被指到前任的账号上"。这个
+// 论证只在"这个数字由某个人事系统分配"时成立。业务后端自签 JWT 那条路的 subject
+// 是它自己的**数据库主键**(strconv.FormatInt(userId)) —— 主键不复用,小取值只说明
+// 部署年轻,不说明危险。把这条规则一并推广过去,会让 userId=42 的部署整体登不进来。
+//
+// 这个区分靠调用位置表达,而不是在共享入口里按 issuer 后缀猜:两个 provider 各调
+// 一次(它们是"上游断言"这件事的唯一来源),漂移由 AuthProvider 契约测试钉住。
+func checkUpstreamSubjectShape(subject string) error {
 	if !isAllDigits(subject) {
 		return nil
 	}

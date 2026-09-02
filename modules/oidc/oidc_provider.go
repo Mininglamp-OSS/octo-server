@@ -68,6 +68,17 @@ func newOIDCProvider(cfg oidcProviderConfig) (*oidcProvider, error) {
 	if cfg.Client == nil && cfg.EndSessionURLOverride == "" {
 		return nil, fmt.Errorf("oidc: oidc provider: client is required")
 	}
+	// issuer 参与 uk_issuer_subject,必须落在 VARCHAR(255) 内。这里的值来自
+	// Discovery 而不是本地配置,所以更需要在构造期挡一次:运行期才发现意味着
+	// 每个用户在建号之后才 INSERT 失败(或被静默截断)。
+	//
+	// Client 为 nil 是单测/降级形态(见上),此时无 issuer 可查,跳过。
+	if cfg.Client != nil {
+		if n := len(cfg.Client.Issuer()); n > issuerMaxLen {
+			return nil, fmt.Errorf("oidc: oidc provider: discovered issuer is %d bytes, exceeds "+
+				"the %d-byte identity column width", n, issuerMaxLen)
+		}
+	}
 	return &oidcProvider{cfg: cfg}, nil
 }
 
@@ -135,6 +146,18 @@ func (p *oidcProvider) Identity(ctx context.Context, tok *TokenSet) (*IdentityCl
 	// 必需 claim,这里仍显式兜一道 —— 契约不该依赖上游库的实现细节。
 	if strings.TrimSpace(claims.Subject) == "" {
 		return nil, fmt.Errorf("%w: subject is empty", ErrIdentityUntrusted)
+	}
+	// 形态守卫:上游断言的 subject 不能是"短纯数字"(像工号)。
+	//
+	// 签名证明这个 sub 是该 IdP 断言的,不证明它适合当不可变主键 —— 工号会在
+	// 离职/入职之间被复用,于是 (issuer, subject) 迟早把新人指到前任的账号上。
+	// 这条论证与协议无关,所以两个 provider 都要有;漂移由
+	// TestAuthProviderConformance_RefusesShortNumericUpstreamSubject 钉住。
+	//
+	// 长度上限不在这里查 —— 那是存储性质,由共享入口统一施加(identity_bounds.go),
+	// 覆盖包括业务 JWT 在内的每条路径。
+	if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrIdentityUntrusted, err)
 	}
 
 	// 部分 IdP 只在 /userinfo 暴露 email/phone/name,id_token 仅含 sub。
@@ -270,3 +293,9 @@ func (p *oidcProvider) IdentityFromClientCredential(ctx context.Context, raw str
 	}
 	return p.Identity(ctx, &TokenSet{RawIDToken: raw})
 }
+
+// EndSessionEndpoint 实现 AuthProvider:标准 OIDC 有 RP-Initiated Logout。
+//
+// 值来自 Discovery,允许 override(部分部署的 Discovery 文档不声明该端点)。
+// 端点是否可用(https、可解析)由调用方校验 —— 这里只负责如实报出配置值。
+func (p *oidcProvider) EndSessionEndpoint() string { return p.endSessionEndpoint() }

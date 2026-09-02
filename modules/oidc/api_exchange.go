@@ -3,13 +3,29 @@ package oidc
 // api_exchange.go — POST /v1/auth/oidc/<id>/exchange
 //
 // Token-exchange entry point for bearer / native clients that complete SSO
-// themselves (system browser → local callback server) and hand us the
-// IdP-issued access_token in exchange for our own session token.
+// themselves (system browser → local callback server) and hand us an
+// IdP-issued credential in exchange for our own session token.
+//
+// **Which credential depends on the provider kind, and the field name does not
+// say so.** The JSON field is `access_token` (kept for wire compatibility), but
+// the value is interpreted by the provider, not by this file:
+//
+//   - kind=oidc   → the value must be an **id_token**. It is the only credential
+//     a client can hold that we can verify independently; an OAuth2 access_token
+//     is an opaque string meant for a resource server, and accepting it as proof
+//     of identity would mean not verifying anything.
+//   - kind=oauth2 → the value is the opaque **access_token**, redeemed against
+//     /userinfo.
+//
+// Getting this wrong yields the generic anti-enumeration 401 with no hint, so
+// the mismatch is stated here rather than left to be discovered. Renaming the
+// field would be a breaking change for existing clients; that trade-off is
+// recorded in the task brief's Pending section.
 //
 // vs /callback:/callback is the browser redirect flow (code → token → userinfo,
 // result handed back via ThirdAuthcode polling)./exchange is the direct JSON
-// API for clients that already hold an IdP access_token; it returns the
-// session JSON in the response body.
+// API for clients that already hold such a credential; it returns the session
+// JSON in the response body.
 //
 // Both paths share Identity → ResolveOrLink → IssueSession; transport
 // (redirect vs JSON) and anti-CSRF (state vs TLS channel) differ.
@@ -42,6 +58,9 @@ const (
 )
 
 type exchangeRequest struct {
+	// AccessToken 名字来自 wire 兼容,**取值随 provider kind 而变**:
+	// kind=oidc 时这里必须放 id_token,kind=oauth2 时放不透明 access_token。
+	// 见文件头。
 	AccessToken string `json:"access_token"`
 	DeviceFlag  *uint8 `json:"flag,omitempty"`
 }

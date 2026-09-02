@@ -59,7 +59,17 @@ const LogoutPathPrefix = "public/sp/slo"
 // swallows the error and returns ("", false). Logout degraded silently to
 // clearing the local session, which is precisely the failure the boot-time
 // refusal exists to prevent, reached by another route.
-var AppIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+// It is a function rather than an exported `var` on purpose: a mutable
+// package-level regexp that both boot validation and the runtime URL builder
+// depend on can be reassigned by any importer, which would silently widen the
+// validator both consumers were unified onto.
+func ValidAppID(appID string) bool { return appIDPattern.MatchString(appID) }
+
+// AppIDDescription is the human-readable form of the rule, for error messages.
+// Callers must not need the regexp object itself.
+const AppIDDescription = "alphanumeric first character, then letters/digits/underscore/hyphen, max 64 characters"
+
+var appIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 // ErrUnknownKind is returned for a provider kind this build does not implement.
 var ErrUnknownKind = errors.New("oidcboot: unknown provider kind")
@@ -125,9 +135,9 @@ func ValidateKind(in KindInput) error {
 				"OCTO_OIDC_PROVIDER_APP_ID); unset it to avoid a silently ineffective override",
 				in.Kind)
 		}
-		if in.AppID != "" && !AppIDPattern.MatchString(in.AppID) {
+		if in.AppID != "" && !ValidAppID(in.AppID) {
 			return fmt.Errorf("oidcboot: OCTO_OIDC_PROVIDER_APP_ID %q invalid: must match %s",
-				in.AppID, AppIDPattern)
+				in.AppID, AppIDDescription)
 		}
 		// A redirect target without an app id cannot produce a logout URL, so
 		// logout would degrade to clearing the local session while the operator
@@ -265,6 +275,31 @@ var RefusedScenarios = []RefusedScenario{
 			"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
 			"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
 			"OCTO_OIDC_PROVIDER_APP_ID":   "../../evil",
+		},
+		ExpectKeyInError: "APP_ID",
+	},
+	{
+		// The provider used to carry a stricter pattern of its own, so this shape
+		// passed boot and was refused only at runtime — where LogoutURL swallows
+		// the error and logout degrades to clearing the local session.
+		Name: "oauth2 with an app id starting with an underscore",
+		Input: KindInput{Kind: KindOAuth2, BaseURL: "https://idp.example.com",
+			AppID: "_tenant", RequireEmailVerified: true},
+		Env: map[string]string{
+			"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
+			"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
+			"OCTO_OIDC_PROVIDER_APP_ID":   "_tenant",
+		},
+		ExpectKeyInError: "APP_ID",
+	},
+	{
+		Name: "oauth2 with an app id over the length cap",
+		Input: KindInput{Kind: KindOAuth2, BaseURL: "https://idp.example.com",
+			AppID: strings.Repeat("a", 65), RequireEmailVerified: true},
+		Env: map[string]string{
+			"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
+			"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
+			"OCTO_OIDC_PROVIDER_APP_ID":   strings.Repeat("a", 65),
 		},
 		ExpectKeyInError: "APP_ID",
 	},

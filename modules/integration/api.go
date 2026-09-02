@@ -52,7 +52,21 @@ type Integration struct {
 	//
 	// 桌面客户端手上只有这种凭据 —— 它既没有上游 access_token 也没有 id_token,
 	// 却需要用本模块的两个端点。所以同一个 Authorization 头上要接受两类凭据。
-	bearerJWT     *oidc.BearerJWTVerifier
+	bearerJWT *oidc.BearerJWTVerifier
+
+	// bearerJWTErr 验签器**构造失败**的原因(密钥太短 / issuer 派生失败)。
+	//
+	// 为什么不能复用 bearerJWT==nil 表示:nil 已经被"没配密钥,这条路径合法地
+	// 关着"占用了。两种情况混在一个 nil 里,就只能选一种处理方式,而它们要求
+	// 相反的处理 —— 前者应放行上游凭据,后者必须拒绝一切。
+	//
+	// 原先这里只 log 然后带着 nil 继续,就写在一句"不能静默降级"的注释下面。
+	// 后果不是"401 看不懂":凭据归属判定整段都在 bearerJWT!=nil 里面,验签器
+	// 一 nil,**每一张**桌面端 JWT 都无条件被转发到上游 /userinfo 的 query string,
+	// 也就是把载荷 PII 和一份我方密钥下的合法签名持续送进第三方日志。触发条件
+	// 是纯运维手滑(31 字节密钥),而"密钥太短"正是泄漏签名材料最要命的场景。
+	bearerJWTErr error
+
 	apiKeyService botfather.UserAPIKeyService
 	groupService  group.IService
 	rateRedis     *rd.Client
@@ -98,9 +112,12 @@ func New(ctx *config.Context) *Integration {
 	// 且 (issuer, subject) 落库后不可逆。
 	bv, bverr := oidc.NewBearerJWTVerifier(cfg.Provider)
 	if bverr != nil {
-		// 配置错误(密钥太短 / issuer 派生失败)不能静默降级成"这条路径不可用":
-		// 那样桌面端只会看到一个笼统的 401,真实原因只在启动日志里一闪而过。
-		it.Error("初始化业务 JWT 验签器失败,桌面端凭据将不可用", zap.Error(bverr))
+		// 配置错误(密钥太短 / issuer 派生失败)不能静默降级成"这条路径不可用" ——
+		// 把原因记在 bearerJWTErr 上,由 oidcAuth 对**所有**凭据 fail-closed。
+		// 见该字段的注释:降级的真实后果是持续转发凭据,不是一个笼统的 401。
+		it.bearerJWTErr = bverr
+		it.Error("初始化业务 JWT 验签器失败,两个 OIDC integration 端点将拒绝所有凭据",
+			zap.Error(bverr))
 	} else if bv != nil {
 		it.bearerJWT = bv
 		it.Info("integration 接受业务 JWT 凭据",
@@ -152,6 +169,25 @@ func (it *Integration) forceEnglish() wkhttp.HandlerFunc {
 func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		if it.provider == nil {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			c.Abort()
+			return
+		}
+		// 业务 JWT 验签器配错了 —— 拒绝**所有**凭据,不只是桌面端那类。
+		//
+		// 为什么连上游凭据也一起拒:没有可用的验签器,就无法回答"这张凭据是不是
+		// 我们自己签的"。任何放行都等于把无法归属的凭据交给下面的上游路径,而那条
+		// 路径把凭据放在 URL query 上 —— 也就是本轮修复要堵的那个泄漏。按形态分流
+		// 不是替代方案(不透明 access_token 可以恰好长得像 JWT),用那把不合格的
+		// 密钥凑合验签更不行(32 字节下限是准入条件,不是调优项)。
+		//
+		// 所以这里刻意让一个运维配置错误变成"这两个端点整体不可用":首个请求就
+		// 硬失败、可见、可查,而不是一条持续泄漏凭据的静默降级。缺密钥仍是合法
+		// 形态(bearerJWTErr==nil、bearerJWT==nil),不受这里影响。
+		if it.bearerJWTErr != nil {
+			it.Error("OIDC integration refusing every credential: the business JWT verifier "+
+				"failed to construct, so credential provenance cannot be established",
+				zap.Error(it.bearerJWTErr))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 			c.Abort()
 			return
