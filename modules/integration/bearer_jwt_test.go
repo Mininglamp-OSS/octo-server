@@ -201,18 +201,55 @@ func TestBearerJWT_WrongSecretIsRejected(t *testing.T) {
 	assert.NotEqual(t, http.StatusInternalServerError, w.Code, w.Body.String())
 }
 
-// 过期(iat 太旧)的业务 JWT 被拒 —— 我方的新鲜度上限在这条路径上同样生效。
-func TestBearerJWT_StaleTokenIsRejectedOnIntegrationPath(t *testing.T) {
+// 桌面客户端把这张 JWT 存下来长期复用(exp 约 15 天),每次调这两个端点都出示
+// 同一张 —— 它**不会**每次重签。
+//
+// 所以 /exchange-jwt 那条"iat 起 10 分钟"的上限不能套在这里:那个上限的论证是
+// "用途只是登录那一刻兑换一次会话",对**每请求都验同一张 assertion 的常驻认证器**
+// 不成立。套上去的后果是桌面端登录 10 分钟后这两个端点永久 401,而且错误与
+// "凭据无效"不可区分。
+//
+// 认证器用凭据自己的 exp —— 那是上游对生命周期的声明。至于"15 天的 bearer 窗口
+// 偏长",那是已经记在 Pending 的同一个问题(需要上游给 aud/jti),不该用一个会把
+// 功能弄坏的上限来假装解决。
+func TestBearerJWT_LongLivedTokenStillAuthenticatesOnIntegrationPath(t *testing.T) {
 	route, ctx, _ := setupBothCredentialsTest(t)
 	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com#bearer-jwt", "2200003")
+	space := "sp_" + util.GenerUUID()[:8]
+	seedSpaceMembership(t, ctx, uid, space, "Desktop", 2, "2026-01-01 10:00:00")
+
+	// 10 天前签发,exp 还有 5 天 —— 桌面端正常复用的形态。
+	tok := signDesktopJWT(t, testBearerJWTSecret, 2200003, "desk.user",
+		time.Now().Add(-10*24*time.Hour))
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", tok, nil))
+	require.Equal(t, http.StatusOK, w.Code,
+		"a token the desktop client legitimately reuses within its exp must authenticate; "+
+			"applying the one-shot redemption ceiling here breaks the client 10 minutes "+
+			"after login. body=%s", w.Body.String())
+	var resp struct {
+		UID string `json:"uid"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, uid, resp.UID)
+}
+
+// 但真正过了 exp 的 token 必须被拒 —— 认证器换成看 exp,不是不看。
+func TestBearerJWT_ExpiredTokenIsRejectedOnIntegrationPath(t *testing.T) {
+	route, ctx, _ := setupBothCredentialsTest(t)
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com#bearer-jwt", "2200007")
 	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Desktop", 2, "2026-01-01 10:00:00")
 
-	// 10 天前签发但 exp 还远 —— 抓包后长期复用的形态。
-	tok := signDesktopJWT(t, testBearerJWTSecret, 2200003, "desk.user", time.Now().Add(-10*24*time.Hour))
+	// signDesktopJWT 的 exp = iat + 15 天,所以 iat 取 -20 天即已过期。
+	tok := signDesktopJWT(t, testBearerJWTSecret, 2200007, "desk.user",
+		time.Now().Add(-20*24*time.Hour))
+
 	w := httptest.NewRecorder()
-	route.ServeHTTP(w, integrationRequest(t, http.MethodGet, "/v1/integrations/oidc/spaces", tok, nil))
-	assert.NotEqual(t, http.StatusOK, w.Code,
-		"the max-lifetime ceiling must apply here too, not just on /exchange-jwt")
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", tok, nil))
+	assert.NotEqual(t, http.StatusOK, w.Code, "an expired token must not authenticate")
 }
 
 // 未配置业务 JWT 密钥时,行为与改动前完全一致(只认上游凭据)。
@@ -232,4 +269,87 @@ func TestBearerJWT_NotConfiguredKeepsUpstreamOnlyBehaviour(t *testing.T) {
 	route.ServeHTTP(w, integrationRequest(t, http.MethodGet, "/v1/integrations/oidc/spaces", tok, nil))
 	assert.NotEqual(t, http.StatusOK, w.Code,
 		"without a configured secret there is nothing to verify a business JWT against")
+}
+
+// 一张**本地验签认定是我们自己的、但按其自身条件被拒**的 JWT,绝不能被转发到
+// 第三方 IdP。
+//
+// 回落逻辑原本是无条件的:只要本地 Verify 返回任何 error 就继续问上游。于是一张
+// HMAC 完全合法、只是过了新鲜度窗口的业务 JWT 会被塞进上游 /userinfo 的
+// **query string**(那个 IdP 的凭据形态就是放 URL 上),从而落进对方的访问日志和
+// 任何中间设备的日志里。
+//
+// 泄漏的东西有两层:载荷里的 userId / domainAccount 是 PII;而带着我方密钥下
+// 合法签名的 token 交给第三方,等于送给对方一份可离线校验密钥的材料 —— 本 PR
+// 自己给密钥设 32 字节下限时的论证就是"短密钥可以从一张合法 token 离线爆破出来,
+// 之后可以伪造任何人的登录"。
+//
+// 区分方式现成:格式/alg/签名错 = "不是我们的",可以回落;其余(新鲜度、claims)
+// = "是我们的但被拒",必须就地 401。
+func TestBearerJWT_OurOwnRejectedTokenIsNotForwardedUpstream(t *testing.T) {
+	route, ctx, mp := setupBothCredentialsTest(t)
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com#bearer-jwt", "2200005")
+	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Desktop", 2, "2026-01-01 10:00:00")
+
+	// 注意这里**不能**用"iat 太旧":认证器改成只看 exp 之后,10 天前签发但未过期的
+	// token 在这条路径上是合法的(见 TestBearerJWT_LongLivedToken...)。这条用例要的是
+	// "HMAC 已匹配、因此确定是我们的,但按自身条件被拒"的形态。
+	for name, tok := range map[string]string{
+		// 签名合法,但已过 exp(signDesktopJWT 的 exp = iat + 15 天)
+		"expired": signDesktopJWT(t, testBearerJWTSecret, 2200005, "desk.user",
+			time.Now().Add(-20*24*time.Hour)),
+		// 签名合法,但 userId 为 0(claims 不合格)
+		"zero userId": signDesktopJWT(t, testBearerJWTSecret, 0, "desk.user",
+			time.Now().Add(-time.Minute)),
+		// 签名合法,但 iat 在远期未来(把可用窗口整体后移)
+		"iat far in the future": signDesktopJWT(t, testBearerJWTSecret, 2200005, "desk.user",
+			time.Now().Add(24*time.Hour)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			mp.ResetRequestLog()
+			w := httptest.NewRecorder()
+			route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+				"/v1/integrations/oidc/spaces", tok, nil))
+
+			assert.NotEqual(t, http.StatusOK, w.Code, "a rejected token must not authenticate")
+
+			q := mp.LastUserInfoQuery()
+			assert.Empty(t, q,
+				"the token was forwarded to the upstream IdP (userinfo query=%q); a token "+
+					"our own verifier recognised and rejected carries a valid HMAC under our "+
+					"secret, and this IdP takes credentials in the URL, so forwarding it "+
+					"leaks both the payload and signature material into a third party's logs", q)
+			assert.NotContains(t, q, tok,
+				"the business JWT itself appeared in the upstream request URL")
+		})
+	}
+}
+
+// 反面:**不是**我们的 token(签名对不上/根本不是 JWT)必须照常回落到上游 ——
+// 否则这个分流就把上游凭据路径掐断了。
+func TestBearerJWT_ForeignTokenStillFallsThroughToUpstream(t *testing.T) {
+	route, ctx, mp := setupBothCredentialsTest(t)
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com", mp.Subject())
+	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Web", 2, "2026-01-01 10:00:00")
+
+	// 上游的不透明 access_token —— 本地验签会以"格式不对"拒绝,必须回落。
+	mp.ResetRequestLog()
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", mp.AccessToken(), nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotEmpty(t, mp.LastUserInfoQuery(),
+		"an opaque upstream token must still reach /userinfo; otherwise the split has "+
+			"broken the upstream credential path")
+
+	// 用别的密钥签的 JWT:签名对不上 = 不是我们的 → 也回落(然后被上游拒)。
+	foreign := signDesktopJWT(t, "a-different-secret-also-32-bytes!!", 2200006, "x",
+		time.Now().Add(-time.Minute))
+	mp.ResetRequestLog()
+	w = httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", foreign, nil))
+	assert.NotEqual(t, http.StatusOK, w.Code)
+	assert.NotEmpty(t, mp.LastUserInfoQuery(),
+		"a JWT signed with an unknown key is not ours, so it should fall through")
 }

@@ -181,8 +181,25 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 		var err error
 		credential := "upstream"
 		if it.bearerJWT != nil {
-			if bc, bcErr := it.bearerJWT.Verify(raw, time.Now()); bcErr == nil {
+			bc, bcErr := it.bearerJWT.VerifyForAuthentication(raw, time.Now())
+			switch {
+			case bcErr == nil:
 				claims, credential = bc, "bearer_jwt"
+			case !oidc.IsForeignToken(bcErr):
+				// **这张 token 是我们自己签的**(HMAC 已匹配),只是按它自身的条件
+				// 被拒(过期/新鲜度/claims)。绝不能回落到上游 —— 那条路径把凭据放在
+				// URL query 上,转发等于把载荷里的 PII 和一份带我方合法签名的
+				// token 送进第三方的访问日志,后者是可离线校验密钥的材料。
+				//
+				// 就地 401,原因只进日志。
+				it.Warn("OIDC integration bearer JWT rejected on its own merits",
+					zap.String("credential", "bearer_jwt"), zap.Error(bcErr))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
+				c.Abort()
+				return
+			default:
+				// 不是我们的(格式/alg/签名对不上)—— 回落到上游凭据路径。
+				// 这里刻意不打日志:每个上游凭据请求都会走到,打了就是噪声。
 			}
 		}
 		if claims == nil {
@@ -224,7 +241,11 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 			return
 		}
 
-		identity, err := it.oidcDB.QueryIdentityByIssuerSubject(claims.Issuer, claims.Subject)
+		// QueryIdentityExact 而不是原始查询:表的 collation 是 ci,原始查询会命中
+		// 大小写不同的行 —— 在这条**认证中间件**上那意味着一个上游主体用自己
+		// 完全合法的凭据认成另一个人,并拿到对方账号下的 API key。
+		// 包外已经拿不到原始查询(不导出),所以这里没有第二种写法。
+		identity, err := it.oidcDB.QueryIdentityExact(claims.Issuer, claims.Subject)
 		if err != nil {
 			it.Error("查询 OIDC identity 失败", zap.Error(err))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)

@@ -100,7 +100,8 @@ func validateBearerJWTSecret(secret []byte) error {
 //
 // 本函数是 bearer JWT 路径的唯一验签入口。通用 JWT 校验(alg/签名/过期/段数)走
 // VerifyHS256JWT,这里只追加 本路径特有的 claims 约束(userId 必须存在且非零)。
-func verifyBearerJWT(token string, secret []byte, now time.Time) (*bearerJWTClaims, error) {
+// maxAge <= 0 表示不额外设上限,只用 token 自己的 exp(由 VerifyHS256JWT 强制)。
+func verifyBearerJWT(token string, secret []byte, now time.Time, maxAge time.Duration) (*bearerJWTClaims, error) {
 	var c bearerJWTClaims
 	if err := VerifyHS256JWT(token, secret, now, &c); err != nil {
 		return nil, err
@@ -108,11 +109,10 @@ func verifyBearerJWT(token string, secret []byte, now time.Time) (*bearerJWTClai
 	if c.UserID <= 0 {
 		return nil, ErrBearerJWTNoUserID
 	}
-	// 新鲜度:exp 由上游决定(约 15 天),对"换一次会话"这个用途太宽。
-	// 这里按 iat 另加一道我方上限,把重放窗口压到分钟级。
+	// iat 缺失必须拒绝,不能当作"很新"放行 —— 否则攻击者去掉 iat 就绕过下面的
+	// 上限,那道检查就只是装饰。远期 iat 也要拒:它把 token 的可用窗口整体后移。
 	//
-	// iat 缺失必须拒绝,不能当作"很新"放行 —— 否则攻击者去掉 iat 就绕过上限,
-	// 这道检查就只是装饰。
+	// 这两条与 maxAge 无关,两种用途都要。
 	if c.Iat == 0 {
 		return nil, ErrJWTMissingIat
 	}
@@ -121,9 +121,15 @@ func verifyBearerJWT(token string, secret []byte, now time.Time) (*bearerJWTClai
 		return nil, fmt.Errorf("%w: iat is %s ahead of now",
 			ErrJWTIatInFuture, issued.Sub(now).Round(time.Second))
 	}
-	if now.Sub(issued) > bearerJWTMaxAge {
+	// maxAge 由调用方按用途给:
+	//   - 兑换一次会话(/exchange-jwt):给 bearerJWTMaxAge,把重放窗口压到分钟级;
+	//   - 常驻认证器(integration 端点):给 0,用 token 自己的 exp。
+	//
+	// 不能两处都用分钟级上限 —— 桌面客户端把这张 token 存下来长期复用、不重签,
+	// 套上分钟级上限等于登录十分钟后功能永久失效。
+	if maxAge > 0 && now.Sub(issued) > maxAge {
 		return nil, fmt.Errorf("%w: issued %s ago, max %s",
-			ErrJWTTooOld, now.Sub(issued).Round(time.Second), bearerJWTMaxAge)
+			ErrJWTTooOld, now.Sub(issued).Round(time.Second), maxAge)
 	}
 	return &c, nil
 }

@@ -120,3 +120,68 @@ func TestOAuth2Callback_LongNumericSubjectStillLogsIn(t *testing.T) {
 		t.Errorf("identity rows = %d, want 1", len(store.written))
 	}
 }
+
+// subject 的上限也必须在信任边界拒绝,理由与 issuer 的 issuerMaxLen 完全相同,
+// 而且更强 —— issuer 是运维配置的常量,subject 来自上游响应。
+//
+// user_oidc_identity.subject 是 VARCHAR(255) 且在 uk_issuer_subject 里。超长时:
+//   - 严格 sql_mode:INSERT 报错,但那已经是 IssueSession **建完用户之后** ——
+//     留下一个没有 identity 行的孤立用户,客户端拿到 401;
+//   - 非严格 sql_mode:静默截断,于是前 255 字节相同的两个 subject 合成同一行,
+//     正是本 PR 到处在防的账号接管形态,且不可逆。
+//
+// checkSubjectShape 只有下限管不到这个:300 位纯数字轻松通过 `>= 10`。
+func TestCheckSubjectShape_TooLongIsRefused(t *testing.T) {
+	cases := []struct {
+		name    string
+		subject string
+		wantErr bool
+	}{
+		// 恰好填满列宽 —— 必须放行,否则守卫会挡掉合法边界值
+		{"exactly the column width", strings.Repeat("a", subjectMaxLen), false},
+		{"one byte over", strings.Repeat("a", subjectMaxLen+1), true},
+		{"far over", strings.Repeat("a", 4096), true},
+		// 纯数字的超长值同样要拒:下限检查放它过去
+		{"300-digit numeric passes the minimum but not the maximum",
+			strings.Repeat("9", 300), true},
+		// 多字节字符按**字节**计,因为列宽是字节
+		{"multibyte over the byte limit", strings.Repeat("中", subjectMaxLen), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := checkSubjectShape(c.subject)
+			if c.wantErr && err == nil {
+				t.Fatalf("a %d-byte subject was accepted; it cannot be stored in a "+
+					"%d-byte column without truncating or erroring after the user row "+
+					"has already been created", len(c.subject), subjectMaxLen)
+			}
+			if !c.wantErr && err != nil {
+				t.Fatalf("a %d-byte subject was refused: %v", len(c.subject), err)
+			}
+			if c.wantErr && err != nil && !errors.Is(err, errSubjectTooLong) {
+				t.Errorf("err = %v, want it to wrap errSubjectTooLong", err)
+			}
+		})
+	}
+}
+
+// 上限必须与 issuer 用同一个列宽常量 —— 两个数字分开维护迟早不一致。
+func TestSubjectMaxLen_MatchesTheColumnWidth(t *testing.T) {
+	if subjectMaxLen != issuerMaxLen {
+		t.Errorf("subjectMaxLen = %d, issuerMaxLen = %d; both columns are VARCHAR(255) "+
+			"in the same unique key, so they must not drift apart",
+			subjectMaxLen, issuerMaxLen)
+	}
+}
+
+// 拒绝信息只给长度,不回显 subject —— 超长值进日志既无用又是 PII 面。
+func TestCheckSubjectShape_TooLongErrorDoesNotLeakSubject(t *testing.T) {
+	subject := strings.Repeat("x", 300)
+	err := checkSubjectShape(subject)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), subject) {
+		t.Error("the error message echoes the whole subject back")
+	}
+}

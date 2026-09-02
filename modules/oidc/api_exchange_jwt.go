@@ -97,7 +97,7 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	//
 	// 失败原因(签名/过期/格式 vs userId 缺失)由 err 携带,进日志区分;
 	// 对客户端一律回同一个 401 码,不做失败原因枚举(anti-enumeration)。
-	ic, err := o.bearerJWT.Verify(req.AccessToken, time.Now())
+	ic, err := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now())
 	if err != nil {
 		metricBearerExchangeResult.WithLabelValues("token_rejected").Inc()
 		o.Warn("OIDC exchange-jwt: token rejected",

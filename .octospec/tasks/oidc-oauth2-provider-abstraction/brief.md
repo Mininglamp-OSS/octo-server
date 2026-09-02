@@ -231,14 +231,31 @@ implementations are not forced to stub them out.
     operational key isolation (single-purpose secret).
 - **`(issuer, subject)` identity mapping — irreversible.** `user_oidc_identity`
   has `uk_issuer_subject`; admitting an empty/colliding subject collapses users
-  onto one row (account-takeover shape). The plain-OAuth2 provider caps subject
-  length to the column width; the bearer-JWT provider converts `userId` to its
-  decimal string with a non-zero guard.
+  onto one row (account-takeover shape). `checkSubjectShape` caps subject length at
+  the column width (`subjectMaxLen == issuerMaxLen`, pinned by a test so the two
+  cannot drift), on top of the short-numeric refusal; the bearer-JWT provider
+  converts `userId` to its decimal string with a non-zero guard.
+
+  This line asserted the cap before it existed. Only the *lower* bound was
+  implemented, so a 300-byte subject passed the boundary and reached an INSERT
+  against a `VARCHAR(255)` column: under strict `sql_mode` that fails only after
+  `IssueSession` has already created the user (an orphaned user row and a 401 to
+  the client), and under non-strict `sql_mode` it truncates, so two subjects
+  sharing their first 255 bytes collapse onto one identity row. The argument is
+  strictly stronger here than for `issuer`, where the same cap already existed:
+  `issuer` is an operator-set constant, `subject` arrives from the upstream
+  response.
 - **`IDTokenClaims` JSON shape** preserved as `IdentityClaims = IDTokenClaims`
   alias; snapshot compatibility tested via `TestDecodeClaimsSnapshot_PreUpgradeSnapshotStillDecodes`.
-- **Config required-field list mirror** in `system_settings.go` not touched.
-  `DM_OIDC_PROVIDER_ISSUER` remains mandatory and doubles as the OAuth2
-  identity namespace; new fields are optional or new-kind-only.
+- **Config validation in `system_settings.go` — now shared, not mirrored.**
+  `DM_OIDC_PROVIDER_ISSUER` remains mandatory and doubles as the OAuth2 identity
+  namespace; new fields are optional or new-kind-only.
+
+  This line originally said the file was "not touched", which stopped being true:
+  `isOIDCFullyConfigured` now delegates the provider-kind refusals to
+  `pkg/oidcboot`. That change is the fix for a login-lockout path and is described
+  under the round-2 findings — but leaving the load-bearing list claiming the file
+  was untouched would tell the next reader the mirror is still hand-maintained.
 - **Logout scope**: `InvalidateCurrentToken` invalidates the *current* token
   (not all tokens for the UID); `QuitUserDevice` is scoped by `DeviceFlag` read
   from the Redis-cached payload (the raw UUID token is not decodable);
@@ -310,10 +327,16 @@ implementations are not forced to stub them out.
   panic-dump sinks.
 - Legacy compatibility: a JSON claims snapshot produced before this change still
   decodes via `decodeClaimsSnapshot` (`TestDecodeClaimsSnapshot_PreUpgradeSnapshotStillDecodes`).
-- Logout scoped to the calling device: `deviceFlagFromRequest` reads the flag
-  from the Redis-cached token payload (not the raw UUID), and routes to
-  `QuitUserDevice(uid, flag)` when non-zero, with a zero fallback to
-  `killer.Kick` (all devices).
+- Logout scoped to the calling device: `deviceFlagFromRequest` reads the flag from
+  the Redis-cached token payload (not the raw UUID) **before**
+  `InvalidateCurrentToken` deletes that payload, and returns `(flag, known)`.
+  `killer.KickDevice` runs when the flag is known, `killer.Kick` (all devices)
+  when it is not.
+
+  This line used to describe a zero-as-sentinel design, which the implementation
+  deliberately rejected: `config.APP` **is** 0, so a zero sentinel makes every APP
+  logout disconnect all of the user's devices. The sentence is corrected here so a
+  future reader does not "restore" the sentinel from the spec.
 
   Two corrections to an earlier version of this line. It claimed the behaviour
   was tested against the real `CacheTokenParser` path; no test went near that
@@ -690,6 +713,83 @@ collapsing onto one account — a test pins exactly that case.
 
 With no secret configured the behaviour is byte-for-byte the previous one: only
 the upstream credential is accepted.
+
+### Review round 5 — three blocking defects, one of them a regression from this PR
+
+Two independent reviews on head `63e18c4a` converged on the same set. All were
+re-derived from the source before acting; all held.
+
+- **A dropped initialisation broke single logout, and it was mine.** Extracting
+  provider construction into `NewAuthProvider` (`ff959aa7`) deleted the neighbouring
+  block that wired the RP-Initiated Logout id_token cache. `newRedisIDTokenStore`
+  was left with zero production callers, so the field stayed nil: login stopped
+  caching the id_token, logout never had an `id_token_hint`, and `LogoutURL`
+  returned no URL on exactly that condition. Users who logged out of DMWork stayed
+  signed in at the IdP — on a shared browser the next person is one click from the
+  account. That is a security control, and it contradicted this PR's own claim that
+  standard-OIDC deployments were unaffected.
+
+  The suite stayed green because all ten affected tests assign the store by hand.
+  A double can be perfectly faithful and still prove nothing about assembly — the
+  mirror image of the learning this PR added one commit earlier. Restored, with
+  tests that build the module through `New()` and assert the wiring exists,
+  including one that fails if the constructor becomes unreachable again.
+
+- **The byte-exact `(issuer, subject)` recheck guarded one of its two consumers.**
+  `modules/integration` called the raw query, and the table is
+  `utf8mb4_general_ci`, so a subject differing only in case matched another user's
+  row — on an *authentication* path that resolves the uid, lists their spaces and
+  mints an API key against their account. Reproduced in a test before fixing.
+
+  Fixed structurally rather than by adding a second call site: the raw query is now
+  unexported and `DB.QueryIdentityExact` is the only entry from outside the package,
+  so a future third consumer is stopped at compile time rather than by a reviewer
+  remembering. This matters because `checkSubjectShape` deliberately admits
+  letter-bearing subjects — the real format is still unverified, which is exactly
+  what the recheck exists for.
+
+- **Our own rejected tokens were forwarded to the third-party IdP.** The credential
+  fall-through was unconditional, so a business JWT carrying a valid HMAC that
+  failed only on freshness went upstream — and this IdP takes credentials in the
+  URL query, so both the payload's PII and a signature valid under our shared
+  secret landed in the vendor's access logs. The split is now explicit
+  (`oidc.IsForeignToken`): only malformed / bad-alg / bad-signature falls through,
+  because only those fail *before or at* signature verification and therefore
+  cannot be attributed to our key. Anything failing after it is ours, and is
+  refused locally. Keeping that classification in `modules/oidc` rather than
+  restating the sentinel list at each call site means a future claims constraint is
+  categorised correctly by default.
+
+- **One freshness policy was serving two incompatible purposes.** The ten-minute
+  ceiling from `iat` is justified by one-shot redemption, but it was also applied to
+  a standing per-request authenticator — and the desktop client stores one JWT and
+  reuses it for the credential's whole ~15-day life. So the integration endpoints
+  would have worked for ten minutes after login and then returned an
+  indistinguishable 401 forever. My own test had pinned that behaviour as correct.
+
+  `VerifyForRedemption` keeps the ceiling; `VerifyForAuthentication` honours the
+  token's own `exp`. The remaining replay window on the authenticator equals `exp`,
+  which is the already-recorded consequence of the upstream JWT having no `aud` or
+  `jti` — not something a ceiling that breaks the feature would have fixed.
+
+- **The subject upper bound the brief already claimed.** Only the lower bound
+  existed, so a 300-byte subject reached an INSERT against `VARCHAR(255)`: under
+  strict `sql_mode` it fails after the user row is already created, and under
+  non-strict it truncates so two subjects sharing a prefix collapse onto one
+  identity. Now capped at the column width, with `subjectMaxLen == issuerMaxLen`
+  pinned by a test.
+
+- **The app-id pattern existed twice, with different rules.** Boot accepted
+  `_tenant` and 65-character values that the provider then refused at runtime,
+  where `LogoutURL` swallows the error and logout degrades silently to local-only —
+  the same failure the boot-time refusal was added to prevent, reached by another
+  route. One definition now, in `pkg/oidcboot`.
+
+Deferred, recorded rather than silently skipped: the duplicated boolean env parsing
+between `oidcboot` and `modules/oidc` (can reopen the lockout class, but needs a
+non-`ParseBool` value *and* a contradicting legacy alias), and the access-log scrub
+being bypassable with percent-encoded parameter names (an attacker only gets their
+own values logged).
 
 ## Integration tests written (this PR)
 

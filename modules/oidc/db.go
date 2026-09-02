@@ -26,11 +26,40 @@ func NewDB(ctx *config.Context) *DB {
 
 // ---------- user_oidc_identity ----------
 
-// QueryIdentityByIssuerSubject 通过 (issuer, sub) 查询绑定关系
+// QueryIdentityExact 通过 (issuer, subject) 查询绑定关系,并对返回行做**逐字节复核**。
+//
+// 这是包外唯一可用的入口,原始查询刻意不导出 —— 因为原始查询单独用是不安全的:
+// 本表 COLLATE 是 utf8mb4_general_ci,`WHERE subject='ABC'` 会命中一行
+// subject='abc' 的记录,于是两个只差大小写的上游主体落到同一个 uid。在登录路径
+// 上那是账号接管;在 modules/integration 的认证中间件上更重 —— 它据此签发
+// API key。
+//
+// 曾经复核只装在 modules/oidc 的 adapter 里,而 modules/integration 直连了原始
+// 查询,把这个口子开了一半。改成"包外只能拿到复核版"之后,这类绕过是**编译期**
+// 挡住的,不依赖谁记得加守卫。
+//
+// 不匹配时返回 (nil, nil),与"没有绑定"同义 —— 调用方无需区分两者:
+// 后续 Insert 会被 ci 唯一键挡成 1062 → 竞态恢复再查仍不匹配 → 拒绝登录并留审计。
+// 也就是把静默合并换成响亮拒绝。
+func (d *DB) QueryIdentityExact(issuer, subject string) (*IdentityModel, error) {
+	row, err := d.queryIdentityByIssuerSubject(issuer, subject)
+	if err != nil {
+		return nil, err
+	}
+	if !identityRowMatches(row, issuer, subject) {
+		return nil, nil
+	}
+	return row, nil
+}
+
+// queryIdentityByIssuerSubject 通过 (issuer, sub) 查询绑定关系。
+//
+// **不导出**:ci collation 下它会命中大小写不同的行,单独使用不安全。
+// 包外走 QueryIdentityExact。
 //
 // 未命中返回 (nil, nil),与项目其他模块的单条查询语义一致。
 // 调用方通过 m == nil && err == nil 判定"记录不存在"。
-func (d *DB) QueryIdentityByIssuerSubject(issuer, subject string) (*IdentityModel, error) {
+func (d *DB) queryIdentityByIssuerSubject(issuer, subject string) (*IdentityModel, error) {
 	var m *IdentityModel
 	if _, err := d.session.Select("*").From("user_oidc_identity").
 		Where("issuer=? AND subject=?", issuer, subject).

@@ -44,10 +44,37 @@ const (
 // errSubjectTooShort subject 是纯数字且短到像工号。
 var errSubjectTooShort = errors.New("subject looks like an employee number")
 
+// errSubjectTooLong subject 超出 user_oidc_identity.subject 的列宽。
+var errSubjectTooLong = errors.New("subject exceeds the identity column width")
+
+// subjectMaxLen user_oidc_identity.subject 的列宽(VARCHAR(255),按字节)。
+//
+// 与 issuerMaxLen 同源同值:两列在同一个唯一键 uk_issuer_subject 里,分开维护
+// 两个数字迟早不一致(有测试钉住它们相等)。
+//
+// 为什么必须在信任边界拒绝,而不是等 INSERT 报错:
+//   - 严格 sql_mode 下 INSERT 会失败,但那已经是 IssueSession **建完用户之后**,
+//     于是留下一个没有 identity 行的孤立用户,客户端只拿到 401;
+//   - 非严格 sql_mode 下值被静默截断,前 255 字节相同的两个 subject 合成同一行 ——
+//     账号接管,而且不可逆。
+//
+// issuer 那侧的注释把同一个论证写在 bearer_jwt.go;这里的论证更强,因为 issuer 是
+// 运维配置的常量,而 subject 来自上游响应,长度不受我方控制。
+const subjectMaxLen = issuerMaxLen
+
 // checkSubjectShape 校验 subject 不是"短纯数字"这种危险形态。
 //
 // 只对纯数字生效:一旦含非数字字符,它就不可能是工号,长度也就不再是信号。
 func checkSubjectShape(subject string) error {
+	// 上限先查,且对所有形态生效 —— 下面的下限只管纯数字,放得过一个 300 位数字串。
+	// 只回长度不回值:超长 subject 进日志既无用,又扩大 PII 面。
+	if len(subject) > subjectMaxLen {
+		return fmt.Errorf("%w: %d bytes, max %d (the column is VARCHAR(%d) inside "+
+			"uk_issuer_subject; a longer value either fails the INSERT after the user "+
+			"row already exists, or is silently truncated so that two subjects sharing "+
+			"a prefix collapse onto one identity)",
+			errSubjectTooLong, len(subject), subjectMaxLen, subjectMaxLen)
+	}
 	if !isAllDigits(subject) {
 		return nil
 	}

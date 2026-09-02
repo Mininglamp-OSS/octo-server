@@ -204,3 +204,25 @@ func (m *MockOAuth2Provider) Subject() string { return m.inner.SubjectForUserInf
 // 取值需满足 checkSubjectShape(纯数字时至少 10 位),否则会在信任边界被拒 ——
 // 那是有意的守卫,不是 mock 的限制。
 func (m *MockOAuth2Provider) SetSubject(sub string) { m.inner.SubjectForUserInfo = sub }
+
+// LastUserInfoQuery 返回最近一次 /userinfo 请求的 query 原文;从未被请求时返回空串。
+//
+// 用途是断言**没有**发生外呼:一张本地验签已经认定"是我们自己的、但被拒绝"的
+// token 绝不能被转发到第三方 IdP —— 那条路径把凭据放在 query string 里
+// (该 IdP 的形态),于是它会落进对方的访问日志。
+func (m *MockOAuth2Provider) LastUserInfoQuery() string {
+	m.inner.mu.Lock()
+	defer m.inner.mu.Unlock()
+	if m.inner.LastUserInfoRequest == nil {
+		return ""
+	}
+	return m.inner.LastUserInfoRequest.Query.Encode()
+}
+
+// ResetRequestLog 清掉记录,便于在一次用例里分段断言。
+func (m *MockOAuth2Provider) ResetRequestLog() {
+	m.inner.mu.Lock()
+	defer m.inner.mu.Unlock()
+	m.inner.LastUserInfoRequest = nil
+	m.inner.LastTokenRequest = nil
+}

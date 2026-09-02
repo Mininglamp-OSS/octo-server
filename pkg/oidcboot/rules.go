@@ -46,12 +46,20 @@ const (
 // single-logout endpoint; the app id is appended as the final path segment.
 const LogoutPathPrefix = "public/sp/slo"
 
-// AppIDPattern limits the app id to URL-safe characters.
+// AppIDPattern limits the app id to URL-safe characters, must start
+// alphanumeric, and caps the length at 64.
 //
-// The value is interpolated into a URL path segment, so a value like "../x"
-// would silently redirect the logout request at a different endpoint. Rejecting
-// it at boot beats discovering it when a user logs out.
-var AppIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+// The value is interpolated into a URL path segment, so something like "../x"
+// would silently point the logout request at a different endpoint. Rejecting it
+// at boot beats discovering it when a user logs out.
+//
+// **This is the only definition.** The provider used to carry a second, stricter
+// pattern of its own, so an app id like "_tenant" — or one over 64 characters —
+// passed boot validation and was then refused at runtime, where LogoutURL
+// swallows the error and returns ("", false). Logout degraded silently to
+// clearing the local session, which is precisely the failure the boot-time
+// refusal exists to prevent, reached by another route.
+var AppIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 // ErrUnknownKind is returned for a provider kind this build does not implement.
 var ErrUnknownKind = errors.New("oidcboot: unknown provider kind")

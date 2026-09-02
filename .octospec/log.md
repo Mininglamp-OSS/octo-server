@@ -1687,3 +1687,43 @@ change-log convention (§7). Newest first.
 - **Learning** — `learnings/pending/delete-the-mirror-instead-of-syncing-it.md`:
   a comment saying "keep in sync with" is not a mechanism; extract the rule into a
   leaf package and pin both sides' tests to one shared table.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 5)
+
+- **Fixed a regression I introduced two commits earlier.** Extracting provider
+  construction into a shared factory silently deleted the neighbouring block that
+  wired the RP-Initiated Logout id_token cache, so the constructor had zero
+  production callers and the field stayed nil: logout never emitted an
+  `id_token_hint` and the upstream IdP session was never ended. A user who logged
+  out of DMWork remained signed in at the IdP. The suite stayed green because all
+  ten affected tests assign the store by hand — a double can be perfectly faithful
+  and still prove nothing about assembly. Restored, plus tests that build the
+  module through `New()` and assert the wiring exists.
+  See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Closed the same guard gap on the second consumer.** The byte-exact
+  `(issuer, subject)` recheck existed only on the login path; `modules/integration`
+  called the raw query, so under the table's `ci` collation a subject differing
+  only in case authenticated as another user and minted an API key against their
+  account — reproduced in a test. Fixed structurally rather than by adding a second
+  call: the raw query is now unexported and `QueryIdentityExact` is the only way in
+  from outside the package, so a future third consumer is stopped at compile time.
+- **Stopped forwarding our own rejected tokens to the third-party IdP.** The
+  credential fall-through was unconditional, so a business JWT with a valid HMAC
+  that failed only on freshness was sent upstream in a URL query string, landing in
+  the vendor's access logs together with its signature. Now only "not ours"
+  (malformed / bad alg / bad signature) falls through; "ours but rejected" is a
+  local 401.
+- **Split the freshness policy by purpose.** The ten-minute ceiling was justified
+  by one-shot redemption but was also applied to a standing per-request
+  authenticator, where the desktop client reuses one long-lived token — so the
+  integration endpoints would have worked for ten minutes after login and then
+  returned an indistinguishable 401 forever. `VerifyForRedemption` keeps the
+  ceiling; `VerifyForAuthentication` honours the token's own `exp`. My own test had
+  pinned the broken behaviour.
+- **Added the subject upper bound the brief already claimed existed**, and folded
+  the duplicated app-id pattern into `pkg/oidcboot` so boot and runtime cannot
+  disagree (they did: `_tenant` passed boot and was refused at runtime, where the
+  error is swallowed and logout degrades to local-only).
+- **Learning** — `learnings/pending/extracting-a-helper-can-silently-drop-a-sibling.md`:
+  after lifting anything out of a constructor, diff the *removed* region and check
+  every `newXxxStore` still has a non-test caller.

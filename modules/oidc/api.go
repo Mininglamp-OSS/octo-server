@@ -210,6 +210,38 @@ func New(ctx *config.Context) *OIDC {
 	o.provider = res.Provider
 	o.client = res.Client
 
+	// RP-Initiated Logout 的 id_token 缓存。
+	//
+	// **这段曾被一次重构整块删掉,而套件全绿** —— 因为每个 logout/bind 测试都手工
+	// 注入 o.idTokens。后果全是静默的:callback 不缓存 id_token → logout 拿不到
+	// id_token_hint → oidcProvider.LogoutURL 直接返回 ("", false) → end_session_url
+	// 永不下发 → 用户登出 DMWork 之后在 IdP 侧仍是登录态。共享浏览器上下一个人
+	// 一键即进。丢的是一个安全控制,不是体验。
+	//
+	// new_wiring_integration_test.go 从 New() 出发断言这里装上了,所以再删会红。
+	if cfg.Provider.PostLogoutRedirectURI != "" {
+		// 只对标准 OIDC 有意义:plain-OAuth2 没有 id_token,登出走 SLO 的 appId
+		// 路径。端点可用性判断在 oidcProvider 里,这里按类型取出;非 OIDC provider
+		// 断言失败 → endpoint 为空 → 走禁用分支。
+		endpoint := ""
+		if op, ok := o.provider.(*oidcProvider); ok {
+			endpoint = op.endSessionEndpoint()
+		}
+		switch {
+		case endpoint == "" || validateLogoutURL("end_session_endpoint", endpoint) != nil:
+			// 配了回跳地址却拿不到可用端点:打 Info 让运维看得见"为什么 RP-logout
+			// 没生效",而不是留一个无人知晓的空功能。
+			o.Info("RP-Initiated Logout 已禁用:end_session 端点不可用(discovery 未提供且未配 override,或非 https)",
+				zap.String("endpoint", endpoint))
+		default:
+			if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
+				o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
+			} else {
+				o.idTokens = newRedisIDTokenStore(ctx, enc)
+			}
+		}
+	}
+
 	// bearer JWT(HS256)验签配置。装配走 NewBearerJWTVerifier —— modules/integration
 	// 也需要同一份(桌面客户端手上只有这种凭据),在两处各写一遍就又是一份会漂移
 	// 的副本,而这里漂移的后果是 issuer 命名空间不一致:同一个人在两条路径下被认

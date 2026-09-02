@@ -81,10 +81,10 @@ func TestVerifyBearerJWT_RejectsTokenOlderThanMaxLifetime(t *testing.T) {
 		"exp": now.Add(5 * 24 * time.Hour).Unix(),
 	})
 
-	if _, err := verifyBearerJWT(fresh, []byte(secret), now); err != nil {
+	if _, err := verifyBearerJWT(fresh, []byte(secret), now, bearerJWTMaxAge); err != nil {
 		t.Fatalf("a freshly issued token must be accepted: %v", err)
 	}
-	_, err := verifyBearerJWT(stale, []byte(secret), now)
+	_, err := verifyBearerJWT(stale, []byte(secret), now, bearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("a token issued 10 days ago was accepted; exp alone lets a captured " +
 			"assertion mint fresh sessions for its whole lifetime, including after logout")
@@ -104,7 +104,7 @@ func TestVerifyBearerJWT_MissingIatIsRefused(t *testing.T) {
 		"userId": 1,
 		"exp":    now.Add(time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(noIat, []byte(secret), now); err == nil {
+	if _, err := verifyBearerJWT(noIat, []byte(secret), now, bearerJWTMaxAge); err == nil {
 		t.Fatal("a token without iat was accepted; freshness cannot be checked without " +
 			"it, so dropping iat would bypass the max-lifetime ceiling")
 	}
@@ -121,7 +121,7 @@ func TestVerifyBearerJWT_TolerateSmallClockSkewButRejectFarFutureIat(t *testing.
 		"iat":    now.Add(30 * time.Second).Unix(), // 我方时钟慢了半分钟
 		"exp":    now.Add(time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(skewed, []byte(secret), now); err != nil {
+	if _, err := verifyBearerJWT(skewed, []byte(secret), now, bearerJWTMaxAge); err != nil {
 		t.Errorf("a 30s clock skew must be tolerated, got %v", err)
 	}
 
@@ -130,8 +130,56 @@ func TestVerifyBearerJWT_TolerateSmallClockSkewButRejectFarFutureIat(t *testing.
 		"iat":    now.Add(24 * time.Hour).Unix(),
 		"exp":    now.Add(48 * time.Hour).Unix(),
 	})
-	if _, err := verifyBearerJWT(farFuture, []byte(secret), now); err == nil {
+	if _, err := verifyBearerJWT(farFuture, []byte(secret), now, bearerJWTMaxAge); err == nil {
 		t.Error("an iat a day in the future was accepted; that shifts the token's usable " +
 			"window forward and defeats the ceiling")
+	}
+}
+
+// 同一张 token,两种用途,两种结果 —— 这是把新鲜度策略按用途分开的全部意义。
+//
+// 桌面客户端登录后把 JWT 存下来长期复用(exp 约 15 天),不会每次重签。所以:
+//   - 兑换一次会话(/exchange-jwt):套分钟级上限,压住可重放窗口;
+//   - 常驻认证器(integration 两个端点):用 token 自己的 exp,否则登录十分钟后
+//     端点永久 401,而且与"凭据无效"不可区分。
+//
+// 一个上限套两种用途,必然牺牲其中一个:要么功能坏掉,要么窗口敞开。
+func TestBearerJWTVerifier_FreshnessPolicyDiffersByPurpose(t *testing.T) {
+	secret := strings.Repeat("k", 32)
+	v := newBearerJWTVerifierForTest([]byte(secret), "https://idp.example.com#bearer-jwt")
+	now := time.Now()
+
+	// 10 天前签发,exp 还有 5 天 —— 桌面端正常复用的形态。
+	longLived := signJWT(t, secret, map[string]any{
+		"userId":        1,
+		"domainAccount": "desk.user",
+		"iat":           now.Add(-10 * 24 * time.Hour).Unix(),
+		"exp":           now.Add(5 * 24 * time.Hour).Unix(),
+	})
+
+	if _, err := v.VerifyForRedemption(longLived, now); err == nil {
+		t.Error("redemption must refuse a 10-day-old assertion: that path only needs the " +
+			"moment just after login, and a wider window is replayable")
+	} else if !errors.Is(err, ErrJWTTooOld) {
+		t.Errorf("redemption err = %v, want ErrJWTTooOld", err)
+	}
+
+	if _, err := v.VerifyForAuthentication(longLived, now); err != nil {
+		t.Errorf("authentication must accept a token still within its exp, got %v; "+
+			"refusing it breaks the desktop client ten minutes after login", err)
+	}
+
+	// 但真正过了 exp,两种用途都必须拒。
+	expired := signJWT(t, secret, map[string]any{
+		"userId": 1,
+		"iat":    now.Add(-20 * 24 * time.Hour).Unix(),
+		"exp":    now.Add(-5 * 24 * time.Hour).Unix(),
+	})
+	if _, err := v.VerifyForAuthentication(expired, now); err == nil {
+		t.Error("authentication must still honour exp — dropping the ceiling is not the " +
+			"same as dropping expiry")
+	}
+	if _, err := v.VerifyForRedemption(expired, now); err == nil {
+		t.Error("redemption must refuse an expired token")
 	}
 }

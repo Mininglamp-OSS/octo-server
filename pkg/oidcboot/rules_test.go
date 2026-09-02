@@ -1,6 +1,9 @@
 package oidcboot
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 这些规则决定"这份 OIDC 环境配置能不能起得来"。
 //
@@ -98,4 +101,42 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// 启动期与运行期必须用**同一个** app id 判据。
+//
+// 曾经是两套:oidcboot 用 `^[A-Za-z0-9_-]+$`,provider 运行期用
+// `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`。于是 `_tenant` 或超过 64 字符的 app id 能过
+// 启动校验,却在运行期被拒 —— 而运行期那里 LogoutURL 吞掉错误、返回 ("", false),
+// 登出静默降级成"只清本地"。这正是启动期 fail-loud 规则想避免的失效,只是从另一条
+// 路走到了同一个结果。
+func TestAppIDPattern_RefusesWhatTheProviderWouldAlsoRefuse(t *testing.T) {
+	cases := map[string]bool{ // value = 应当被接受
+		"app1":       true,
+		"a":          true,
+		"app-1_x":    true,
+		"2363":       true,
+		"_tenant":    false, // 不能以 _ 开头(运行期拒,启动期曾放过)
+		"-tenant":    false,
+		"":           false,
+		"../../evil": false,
+		"app/1":      false,
+		"app 1":      false,
+	}
+	for in, want := range cases {
+		t.Run(in, func(t *testing.T) {
+			got := AppIDPattern.MatchString(in)
+			if got != want {
+				t.Errorf("AppIDPattern.MatchString(%q) = %v, want %v", in, got, want)
+			}
+		})
+	}
+	// 长度上限也要一致 —— 超长 app id 拼进 URL 路径段同样是运行期才炸。
+	if AppIDPattern.MatchString(strings.Repeat("a", 65)) {
+		t.Error("a 65-character app id was accepted; the provider refuses it at runtime, " +
+			"where the error is swallowed and logout silently degrades to local-only")
+	}
+	if !AppIDPattern.MatchString(strings.Repeat("a", 64)) {
+		t.Error("a 64-character app id must be accepted")
+	}
 }

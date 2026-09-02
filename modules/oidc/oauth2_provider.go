@@ -8,9 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 )
 
 // 本文件实现 plain-OAuth2 provider —— 即只跑标准 OAuth2 authorization_code、
@@ -180,13 +181,11 @@ func parseUserInfoEnvelope(body []byte, issuer string) (*IDTokenClaims, error) {
 // 最后一个路径段拼在其后。
 const upstreamLogoutPathPrefix = "public/sp/slo"
 
-// upstreamAppIDRe 限定 appId 只能是 URL-safe 的字母数字 + '-' / '_'。
+// upstreamAppIDRe 复用 pkg/oidcboot 的唯一定义。
 //
-// appId 直接拼进 URL 路径,所以它是一个注入点。运维误配 "../x" 时,路径拼接
-// 会把 ".." 规范化掉,请求于是落到一个完全不同的端点上 —— 本仓在
-// "object key 拼 URL" 的场景踩过同一个坑,结论是必须在拼接**之前**用白名单
-// 挡住,不能指望拼接函数的清洗行为替我们兜底(它的清洗恰恰是逃逸的成因)。
-var upstreamAppIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+// 曾经这里另有一份更严的正则,于是启动期放过、运行期拒绝 —— 而运行期这边
+// LogoutURL 吞掉错误返回 ("", false),登出静默降级成"只清本地"。判据只能有一份。
+var upstreamAppIDRe = oidcboot.AppIDPattern
 
 // buildUpstreamLogoutURL 拼该 IdP 的单点登出地址:
 //

@@ -93,7 +93,7 @@ func TestOAuth2Callback_EmptySubject_WritesNoIdentityRow_Integration(t *testing.
 
 	// 再针对性查一次空 subject:上面的计数为 0 时这条是冗余的,但它把失败信息
 	// 直接指到"空 subject 行"这个具体形态上,而不是让人从总数 1 去猜是哪一行。
-	got, err := realDB.QueryIdentityByIssuerSubject(pcfg.Issuer, "")
+	got, err := realDB.QueryIdentityExact(pcfg.Issuer, "")
 	require.NoError(t, err)
 	assert.Nil(t, got, "an (issuer, '') row must not exist — it would collapse every "+
 		"subject-less login onto one account")

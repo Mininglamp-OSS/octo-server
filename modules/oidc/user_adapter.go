@@ -81,16 +81,9 @@ func (a *userAdapter) IssueSession(ctx context.Context, req IssueSessionReq) (*I
 type identityStoreAdapter struct{ db *DB }
 
 func (a identityStoreAdapter) Get(issuer, subject string) (*IdentityModel, error) {
-	row, err := a.db.QueryIdentityByIssuerSubject(issuer, subject)
-	if err != nil {
-		return nil, err
-	}
-	// 逐字节复核 —— 见 identity_exact_match.go。表的 collation 是 ci,所以一次
-	// 大小写不同的 subject 也会命中别人的行;那不是脏数据,是账号接管。
-	if !identityRowMatches(row, issuer, subject) {
-		return nil, nil
-	}
-	return row, nil
+	// 复核在 DB.QueryIdentityExact 里(见那里的说明)。这里不再自己做一遍 ——
+	// 两份实现就是两处会漂移的判断,而判断错的后果是账号接管。
+	return a.db.QueryIdentityExact(issuer, subject)
 }
 func (a identityStoreAdapter) Insert(m *IdentityModel) error {
 	return a.db.InsertIdentity(m)

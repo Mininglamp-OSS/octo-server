@@ -9,6 +9,7 @@ package oidc
 // 两个账号,且 (issuer, subject) 落库后不可逆。
 
 import (
+	"errors"
 	"strings"
 	"time"
 )
@@ -67,12 +68,34 @@ func (v *BearerJWTVerifier) SecretLen() int { return len(v.secret) }
 //   - 上游的不透明 access_token 不可能带出我方密钥下的合法签名(那需要知道密钥);
 //   - 上游的 id_token 是 RS256,而 VerifyHS256JWT 把 alg 钉死为 HS256 并显式拒绝
 //     RS256,所以不会走算法混淆那条路。
-func (v *BearerJWTVerifier) Verify(raw string, now time.Time) (*IdentityClaims, error) {
-	claims, err := verifyBearerJWT(strings.TrimSpace(raw), v.secret, now)
+func (v *BearerJWTVerifier) verify(raw string, now time.Time, maxAge time.Duration) (*IdentityClaims, error) {
+	claims, err := verifyBearerJWT(strings.TrimSpace(raw), v.secret, now, maxAge)
 	if err != nil {
 		return nil, err
 	}
 	return claims.toIdentityClaims(v.issuer), nil
+}
+
+// VerifyForRedemption 用于"出示一次、换成我方会话"的场景(/exchange-jwt)。
+//
+// 除签名与 exp 之外另加一道 bearerJWTMaxAge 的新鲜度上限:上游给的 exp 约 15 天,
+// 而这个用途只需要"刚登录完"那一小段,把可重放窗口压到分钟级。
+func (v *BearerJWTVerifier) VerifyForRedemption(raw string, now time.Time) (*IdentityClaims, error) {
+	return v.verify(raw, now, bearerJWTMaxAge)
+}
+
+// VerifyForAuthentication 用于**每次请求都出示同一张 token** 的常驻认证器
+// (modules/integration 的两个端点)。
+//
+// 生命周期用 token 自己的 exp,不套 VerifyForRedemption 那道分钟级上限:桌面客户端
+// 登录后把这张 JWT 存进本地并长期复用,并不会每次重签。把一次性兑换的上限套在
+// 认证器上,结果是登录十分钟后端点永久返回 401,而且与"凭据无效"不可区分。
+//
+// 换来的代价是这条路径的可重放窗口等于 exp(约 15 天)。这不是本方法引入的问题,
+// 而是"上游 JWT 没有 aud/jti"这条已记在 Pending 的约束的直接后果;用一个会弄坏
+// 功能的上限去掩盖它,并不会让凭据更安全。
+func (v *BearerJWTVerifier) VerifyForAuthentication(raw string, now time.Time) (*IdentityClaims, error) {
+	return v.verify(raw, now, 0)
 }
 
 // newBearerJWTVerifierForTest 直接注入密钥与 issuer,绕过环境变量。
@@ -85,4 +108,23 @@ func newBearerJWTVerifierForTest(secret []byte, issuer string) *BearerJWTVerifie
 		return nil
 	}
 	return &BearerJWTVerifier{secret: secret, issuer: issuer}
+}
+
+// IsForeignToken 报告一个 Verify 错误是否意味着"这张 token 不是我们签的"。
+//
+// 只有三种错误属于这一类:段数/base64/JSON 不对(ErrJWTMalformed)、alg 不是
+// HS256(ErrJWTBadAlg)、HMAC 不匹配(ErrJWTInvalidSig)。它们都在**验签之前或
+// 验签本身**失败,所以无法断定这张 token 与我方密钥有关。
+//
+// 其余错误(新鲜度、claims 约束)只有在 HMAC **已经匹配**之后才可能出现 ——
+// 也就是说那张 token 确实是我们自己签的,只是按它自身的条件被拒了。
+//
+// 这个区分是安全相关的,所以判定放在这里而不是让每个调用方自己拼错误列表:
+// 调用方漏一个哨兵,就会把一张带着我方合法签名的 token 当成"别人的"转发给上游 ——
+// 而上游那条路径把凭据放在 URL query 上,于是签名材料落进第三方的访问日志。
+// 将来新增 claims 约束时,只要它出现在 VerifyHS256JWT 之后,就自动归入"是我们的"。
+func IsForeignToken(err error) bool {
+	return errors.Is(err, ErrJWTMalformed) ||
+		errors.Is(err, ErrJWTBadAlg) ||
+		errors.Is(err, ErrJWTInvalidSig)
 }

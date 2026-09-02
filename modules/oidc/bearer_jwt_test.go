@@ -49,7 +49,7 @@ func TestBearerJWT_HappyPath(t *testing.T) {
 		"iat":           float64(now.Add(-1 * time.Minute).Unix()),
 		"exp":           float64(now.Add(15 * 24 * time.Hour).Unix()),
 	})
-	claims, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now)
+	claims, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now, bearerJWTMaxAge)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBearerJWT_WrongSecret(t *testing.T) {
 	tok := signBearerToken(t, bearerJWTTestSecret, map[string]interface{}{
 		"userId": float64(1), "exp": float64(time.Now().Add(time.Hour).Unix()),
 	})
-	_, err := verifyBearerJWT(tok, []byte("some-other-secret"), time.Now())
+	_, err := verifyBearerJWT(tok, []byte("some-other-secret"), time.Now(), bearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("expected error for wrong secret, got nil")
 	}
@@ -81,7 +81,7 @@ func TestBearerJWT_Expired(t *testing.T) {
 		"iat":    float64(now.Add(-2 * time.Hour).Unix()),
 		"exp":    float64(now.Add(-1 * time.Minute).Unix()),
 	})
-	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now)
+	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now, bearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("expected error for expired token, got nil")
 	}
@@ -100,7 +100,7 @@ func TestBearerJWT_Malformed(t *testing.T) {
 	}
 	for name, tok := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now())
+			_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now(), bearerJWTMaxAge)
 			if err == nil {
 				t.Fatalf("%s: expected error", name)
 			}
@@ -115,14 +115,14 @@ func TestBearerJWT_AlgMustBeHS256(t *testing.T) {
 	noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"userId":1,"exp":4000000000}`))
 	noneToken := noneHeader + "." + payload + "."
-	if _, err := verifyBearerJWT(noneToken, []byte(bearerJWTTestSecret), time.Now()); err == nil {
+	if _, err := verifyBearerJWT(noneToken, []byte(bearerJWTTestSecret), time.Now(), bearerJWTMaxAge); err == nil {
 		t.Fatal("alg=none must be rejected")
 	}
 
 	// 构造 alg=RS256 的 header(内容合法但不是 HS256),签名是假的
 	rsHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
 	rsTok := rsHeader + "." + payload + ".fakesig"
-	if _, err := verifyBearerJWT(rsTok, []byte(bearerJWTTestSecret), time.Now()); err == nil {
+	if _, err := verifyBearerJWT(rsTok, []byte(bearerJWTTestSecret), time.Now(), bearerJWTMaxAge); err == nil {
 		t.Fatal("alg=RS256 must be rejected (we only accept HS256)")
 	}
 }
@@ -132,7 +132,7 @@ func TestBearerJWT_MissingUserID(t *testing.T) {
 		"exp": float64(time.Now().Add(time.Hour).Unix()),
 		// 没有 userId
 	})
-	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now())
+	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now(), bearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("expected error for missing userId")
 	}
@@ -143,7 +143,7 @@ func TestBearerJWT_ZeroUserIDRejected(t *testing.T) {
 	tok := signBearerToken(t, bearerJWTTestSecret, map[string]interface{}{
 		"userId": float64(0), "exp": float64(time.Now().Add(time.Hour).Unix()),
 	})
-	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now())
+	_, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), time.Now(), bearerJWTMaxAge)
 	if err == nil {
 		t.Fatal("userId=0 must be rejected (anonymous / not-logged-in sentinel)")
 	}
@@ -161,7 +161,7 @@ func TestBearerJWT_ToIdentityClaims(t *testing.T) {
 		"iat":           float64(now.Add(-1 * time.Minute).Unix()),
 		"exp":           float64(now.Add(time.Hour).Unix()),
 	})
-	claims, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now)
+	claims, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now, bearerJWTMaxAge)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
