@@ -1,6 +1,8 @@
 package oidc
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -255,4 +257,71 @@ func TestAPI_Callback_FullSpaceStillLogsIn(t *testing.T) {
 	assert.Contains(t, fakeAC.get("ac-full"), `"token":"t"`,
 		"the session must still reach the client")
 	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-cb-full"))
+}
+
+// TestAPI_BindCreate_NewAccountJoinsInitialSpace covers acceptance 2.
+//
+// /bind/create is the second of the two account-creating entry points, and the
+// only one a client reaches after the callback handed it off to the bind page.
+// A user arriving through it is exactly as stranded as one from the callback if
+// nothing joins them, so it carries the same hook — and needs the same proof,
+// since nothing about the callback tests would notice the line going missing here.
+func TestAPI_BindCreate_NewAccountJoinsInitialSpace(t *testing.T) {
+	const spaceID = "sp-bind-join"
+	ctx := newInitialSpaceEnv(t, spaceID, 0)
+
+	o, jti, _, _, _, _, users, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), sampleClaims(), false)
+	o.ctx = ctx
+	users.resp = &IssueSessionResp{UID: "u-bind-new", LoginRespJSON: `{"token":"t-bind"}`}
+
+	body, _ := json.Marshal(map[string]string{"token": jti})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/create", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	newTestBindRouter(o).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	assert.Equal(t, 1, memberRowCount(t, ctx, spaceID, "u-bind-new"),
+		"an account created through /bind/create must join the initial Space too")
+}
+
+// TestAPI_BindConfirm_ExistingAccountDoesNotJoin is the mirror property on the
+// same endpoint family: /bind/confirm links an OIDC identity to an account that
+// already exists, so it creates nobody and must not join anybody.
+//
+// Worth pinning separately from the callback's returning-user case, because the
+// two paths decide "was an account created here" by different means — the
+// callback reads ResolveOrLink's IsNew, while the bind flow relies on the hook
+// sitting only in the create handler. A hook added to the wrong bind handler
+// would silently re-add users administrators had removed.
+func TestAPI_BindConfirm_ExistingAccountDoesNotJoin(t *testing.T) {
+	const spaceID = "sp-bind-confirm"
+	ctx := newInitialSpaceEnv(t, spaceID, 0)
+
+	o, jti, auth, loc, _, _, users, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), sampleClaims(), false)
+	o.ctx = ctx
+	auth.verifyPasswordResp.matched = true
+	loc.byUsername["alice"] = "u-alice"
+	users.resp = &IssueSessionResp{UID: "u-alice", LoginRespJSON: `{"token":"t-alice"}`}
+	r := newTestBindRouter(o)
+
+	before := totalInitialSpaceJoinSamples()
+
+	body, _ := json.Marshal(map[string]string{"token": jti, "identifier": "alice", "password": "Pwd@1"})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/verify/password", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	body2, _ := json.Marshal(map[string]string{"token": jti})
+	req2 := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/confirm", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+
+	assert.Equal(t, before, totalInitialSpaceJoinSamples(),
+		"binding an existing account creates nobody and must not reach the join path")
+	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-alice"))
 }
