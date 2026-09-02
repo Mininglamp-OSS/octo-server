@@ -4715,16 +4715,37 @@ type authVerifyTokenResp struct {
 	// (which lacks per-space grouping).
 	Spaces           []string            `json:"spaces,omitempty"`
 	OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space,omitempty"`
+	// SpaceRoles maps space_id → the caller's native space_member.role in that
+	// Space: 0=member, 1=admin, 2=owner
+	// (modules/space/sql/20260307000002_space_legacy01.sql). Keys are exactly
+	// the entries of Spaces — the two are built in lockstep from the same
+	// truncated row set in queryUserSpaceContext.
+	//
+	// Consumed by octo-marketplace's plugin review workflow, whose reviewer
+	// gate is `role >= 1`. Note octo-web's own space model uses the inverse
+	// display encoding (1=owner, 2=admin); this field is the SERVER encoding
+	// and must not be remapped here.
+	//
+	// `omitempty` matches its two siblings above: the default (no
+	// ?include=context) response must stay byte-identical to the pre-v2
+	// contract, which a BC test asserts. An empty map is therefore omitted from
+	// the wire exactly like an empty `spaces` / `owned_bots_by_space`;
+	// `context_included` is the discriminator a consumer must use, never the
+	// presence of this key.
+	SpaceRoles map[string]int `json:"space_roles,omitempty"`
 }
 
 // authVerifyToken validates a user token and returns identity + owned bots.
 //
 // Query params:
 //   - include=context : also return spaces (server-validated space membership
-//     list) and owned_bots_by_space (map keyed by space_id, listing bot_uids
-//     the user owns in each space). fleet/matter middleware passes this to
-//     enforce X-Space-Id membership and per-handler bot ownership; older
-//     callers (IM, admin) omit the param and keep the original schema.
+//     list), owned_bots_by_space (map keyed by space_id, listing bot_uids
+//     the user owns in each space), and space_roles (map keyed by the same
+//     space_ids, carrying the caller's native space_member.role). fleet/matter
+//     middleware passes this to enforce X-Space-Id membership and per-handler
+//     bot ownership; octo-marketplace additionally reads space_roles for its
+//     Space-reviewer gate. Older callers (IM, admin) omit the param and keep
+//     the original schema.
 func (u *User) authVerifyToken(c *wkhttp.Context) {
 	var req authVerifyTokenReq
 	if err := c.BindJSON(&req); err != nil {
@@ -4789,29 +4810,45 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 	// reject downstream authz that depends on them, which is safer than
 	// masking the issue.
 	if c.Query("include") == "context" {
-		spaces, ownedByspace, ctxErr := u.queryUserSpaceContext(resp.UID)
+		spaces, ownedByspace, spaceRoles, ctxErr := u.queryUserSpaceContext(resp.UID)
 		if ctxErr != nil {
 			u.Warn("authVerifyToken include=context 查询失败",
 				zap.Error(ctxErr), zap.String("uid", resp.UID))
+			// Empty but non-nil for all three. This is an IN-PROCESS
+			// convention, NOT a wire distinction: all three fields carry
+			// `omitempty`, which drops a nil map and an empty map alike, so
+			// this fail-soft response is byte-identical to one that left them
+			// nil. The assignment exists so no later reader in this process
+			// receives a nil map, and so the intent ("we tried; the answer is
+			// 'nothing'") is explicit rather than implied by a zero value.
+			//
+			// `context_included` is the ONLY discriminator a consumer may use.
+			// It stays true here on purpose: fail-soft must not be mistaken
+			// for "this server does not support ?include=context".
 			spaces = []string{}
 			ownedByspace = map[string][]string{}
+			spaceRoles = map[string]int{}
 		}
 		resp.ContextIncluded = true
 		resp.Spaces = spaces
 		resp.OwnedBotsBySpace = ownedByspace
+		resp.SpaceRoles = spaceRoles
 	}
 
 	c.Response(resp)
 }
 
-// queryUserSpaceContext fetches (spaces, owned_bots_by_space) for a user
-// in one round trip — two SELECTs but no N+1. Used by authVerifyToken when
-// ?include=context is set.
+// queryUserSpaceContext fetches (spaces, owned_bots_by_space, space_roles) for
+// a user in one round trip — two SELECTs but no N+1. Used by authVerifyToken
+// when ?include=context is set.
+//
+// `spaces` and `space_roles` describe the same membership set: identical keys,
+// built from one truncated row set so they can never disagree.
 //
 // Note: owned_bots are grouped by space_id via the bot's space_member row
 // (bot is itself a user; robot table has no space_id). Mirrors the join
 // pattern in botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
-func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, error) {
+func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, map[string]int, error) {
 	// (1) spaces the user is an active member of.
 	//
 	// v3.3.1 §A.1 (Jerry-Xin Critical 三审): INNER JOIN space ON s.status=1
@@ -4832,11 +4869,12 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	// LIMIT deterministic across calls (was random per MySQL engine choice).
 	type spaceRow struct {
 		SpaceID string `db:"space_id"`
+		Role    int    `db:"role"`
 	}
 	const userSpacesLimit = 100
 	var spaceRows []spaceRow
 	_, err := u.db.session.SelectBySql(
-		`SELECT sm.space_id FROM space_member sm
+		`SELECT sm.space_id, sm.role FROM space_member sm
 		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
 		 WHERE sm.uid=? AND sm.status=1
 		 ORDER BY sm.space_id
@@ -4844,18 +4882,27 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		uid,
 	).Load(&spaceRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	spaces := make([]string, 0, len(spaceRows))
-	for _, r := range spaceRows {
-		spaces = append(spaces, r.SpaceID)
-	}
-	if len(spaces) > userSpacesLimit {
+	// Truncate the ROWS, then derive both `spaces` and `space_roles` from the
+	// truncated rows. Building either collection before truncating is the bug
+	// this shape exists to prevent: the over-fetch is LIMIT 101, so a
+	// map built in the collecting loop would carry 101 entries while `spaces`
+	// carries 100, and a consumer that treats space_roles as the membership set
+	// would see one space that `spaces` denies. Same "stay in lockstep with
+	// spaces" invariant the owned_bots_by_space path already documents.
+	if len(spaceRows) > userSpacesLimit {
 		u.Warn("queryUserSpaceContext spaces truncated at policy limit",
 			zap.String("uid", uid),
 			zap.Int("limit", userSpacesLimit),
-			zap.Int("returned", len(spaces)))
-		spaces = spaces[:userSpacesLimit]
+			zap.Int("returned", len(spaceRows)))
+		spaceRows = spaceRows[:userSpacesLimit]
+	}
+	spaces := make([]string, 0, len(spaceRows))
+	spaceRoles := make(map[string]int, len(spaceRows))
+	for _, r := range spaceRows {
+		spaces = append(spaces, r.SpaceID)
+		spaceRoles[r.SpaceID] = r.Role
 	}
 
 	// (2) bots the user created, joined with each bot's space membership.
@@ -4901,7 +4948,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		uid,
 	).Load(&botRows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(botRows) > ownedBotsLimit {
 		// >1000 means we hit the cap. Truncate to the policy limit so
@@ -4942,7 +4989,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 			ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
 		}
 	}
-	return spaces, ownedByspace, nil
+	return spaces, ownedByspace, spaceRoles, nil
 }
 
 type authVerifyBotReq struct {
