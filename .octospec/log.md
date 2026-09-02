@@ -1609,3 +1609,45 @@ change-log convention (§7). Newest first.
   inject a dependency through a helper cannot show that production wiring exists.
   A missing registration call passed the entire suite.
 
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction
+
+- **Shipped** — `modules/oidc` is no longer hard-wired to OpenID Connect. The
+  provider is an `AuthProvider` interface with two implementations selected by
+  `OCTO_OIDC_PROVIDER_KIND` (default `oidc`, so deployed configurations are
+  untouched), so an enterprise IdP that speaks plain OAuth2 — no Discovery, no
+  `id_token`, no JWKS, a vendor envelope around `/userinfo`, an app id in a path
+  segment for single logout — can drive login, logout and profile claims.
+  Business branches read `Capabilities()`, never the kind. Two exchange endpoints
+  serve clients that complete SSO themselves and arrive holding a credential:
+  `/exchange` (upstream `access_token` → `/userinfo`) and `/exchange-jwt`
+  (locally verified HS256 JWT, no outbound call). See
+  [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Guarded the one irreversible decision** — `(issuer, subject)` is the identity
+  key and cannot be changed after go-live, and the vendor docs contradict
+  themselves about whether `subject` is an internal long id or the employee
+  number. Since employee numbers are reused between leavers and joiners, guessing
+  wrong would log a new hire into a former employee's account. A shape guard
+  refuses short numeric subjects at the trust boundary before any row is written,
+  turning an unrecoverable data problem into a recoverable failure — and removing
+  "capture a real userinfo response first" from the critical path.
+- **Fixed during self-review** — Two CRITICALs of my own making: logout read
+  `device_flag` by decoding the raw token (a UUID with no fields), so it always
+  fell through to disconnecting *every* device instead of the calling one; and
+  `/exchange-jwt` lacked the nil-provider guard, so a boot-time provider failure
+  turned into a panic. Plus credential-leak closures at three points (`*url.Error`
+  embeds a URL that carries `client_secret`, redirects were being followed with
+  those credentials attached, and accesslog scrubbing missed the panic-dump sink).
+- **Trimmed the config surface** — New environment variables went from 8 to 5.
+  Endpoint rate limits became constants (matching `modules/user`), and the
+  bearer-JWT issuer namespace is now derived from the upstream issuer rather than
+  taking a second environment marker, which inherits per-environment isolation
+  instead of asking operators to keep two markers consistent.
+- **Learning** — `learnings/pending/build-does-not-compile-tests.md`: `go build
+  ./...` skips `_test.go`, so a rename done by string substitution left the entire
+  `modules/oidc` test binary uncompilable while the build gate stayed green; ~70
+  cases silently stopped running across a session boundary.
+- **Learning** — `learnings/pending/refusing-is-cheaper-than-an-immutable-wrong-key.md`:
+  when an identifier becomes an immutable primary key, fence the ambiguity instead
+  of resolving it first — refusal is a constant you can edit, a polluted identity
+  table is not.
