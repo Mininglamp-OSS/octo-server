@@ -93,6 +93,57 @@ func TestResolveBotMentionInternalToken(t *testing.T) {
 	}
 }
 
+// modules/space rejects a value shared with OCTO_DOCS_BOT_MENTION_TOKEN; this
+// module must run the mirror-image comparison, so a deployment that sets one
+// value for both fails BOTH capabilities closed instead of disabling the
+// marketplace endpoint and leaving bot mention serving on the shared value.
+func TestResolveBotMentionInternalTokenRejectsMarketplaceToken(t *testing.T) {
+	const shared = "shared-secret-shared-secret-1234"
+	const env = "OCTO_MARKETPLACE_INTERNAL_TOKEN"
+	getenv := func(key string) string {
+		if key == internalTokenEnv || key == env {
+			return shared
+		}
+		return ""
+	}
+	token, err := resolveBotMentionInternalToken(getenv)
+	if err == nil {
+		t.Fatalf("expected %s == %s to disable the bot mention capability",
+			internalTokenEnv, env)
+	}
+	if token != "" {
+		t.Fatalf("token = %q; a colliding token must come back empty", token)
+	}
+	if strings.Contains(err.Error(), shared) {
+		t.Fatalf("error message leaked the token value: %v", err)
+	}
+	if !strings.Contains(err.Error(), env) {
+		t.Fatalf("error %q should name the colliding env %s", err, env)
+	}
+}
+
+// The pre-existing exclusion set is left alone. OCTO_DRIVE_INTERNAL_TOKEN is
+// rejected by modules/internal_resolve but was never rejected here; adding the
+// marketplace token is no reason to start disabling a deployment that runs that
+// (pre-existing) collision today.
+func TestResolveBotMentionInternalTokenLeavesPreExistingPairsAlone(t *testing.T) {
+	const shared = "shared-secret-shared-secret-1234"
+	getenv := func(key string) string {
+		if key == internalTokenEnv || key == "OCTO_DRIVE_INTERNAL_TOKEN" {
+			return shared
+		}
+		return ""
+	}
+	token, err := resolveBotMentionInternalToken(getenv)
+	if err != nil {
+		t.Fatalf("resolveBotMentionInternalToken() = %v; the drive pair predates this "+
+			"change and must keep behaving as it did", err)
+	}
+	if token != shared {
+		t.Fatalf("token = %q, want the configured value", token)
+	}
+}
+
 func TestNormalizeMentionRequest(t *testing.T) {
 	valid := mentionRequest{
 		IdempotencyKey: " idem-1 ",

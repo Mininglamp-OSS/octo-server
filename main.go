@@ -32,6 +32,7 @@ import (
 	commonmodule "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/internal_resolve"
 	"github.com/Mininglamp-OSS/octo-server/modules/notify"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -656,6 +657,12 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		// modules/internal_resolve/main_wiring_test.go asserts this argument
 		// stays present so a future refactor cannot delete it silently.
 		os.Getenv(internal_resolve.DriveInternalTokenEnv),
+		// Same reasoning for the marketplace internal token: it authorizes
+		// reading any uid's role in any Space, so if it ever equalled a route's
+		// notify_token_env value one leaked credential would grant both the
+		// Space role lookup AND route notify. Registered by qualified constant,
+		// not a literal, so main_wiring_test.go can assert it stays present.
+		os.Getenv(space.MarketplaceInternalTokenEnv),
 	); err != nil {
 		return nil, err
 	}

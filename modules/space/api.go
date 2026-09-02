@@ -43,11 +43,16 @@ type Space struct {
 	// global fallback; welcomeStore is the per-Space config source of truth.
 	settings     *commonmod.SystemSettings
 	welcomeStore *commonmod.SpaceWelcomeConfigStore
+	// marketplaceInternalToken authorizes the internal single-subject Space
+	// role lookup (see api_internal.go). Resolved once at construction time; an
+	// empty value means "capability disabled" and the middleware then rejects
+	// every request (fail-closed).
+	marketplaceInternalToken string
 }
 
 // New 创建Space实例
 func New(ctx *config.Context) *Space {
-	return &Space{
+	s := &Space{
 		ctx:          ctx,
 		Log:          log.NewTLog("Space"),
 		db:           NewDB(ctx),
@@ -55,6 +60,17 @@ func New(ctx *config.Context) *Space {
 		settings:     commonmod.EnsureSystemSettings(ctx),
 		welcomeStore: commonmod.NewSpaceWelcomeConfigStore(ctx.DB()),
 	}
+	// Resolve the marketplace internal token here rather than inside the
+	// middleware: a misconfiguration is then reported once at boot instead of
+	// per request, and the middleware carries no env dependency (tests inject
+	// the field directly instead of mutating process env in a package that
+	// shares one test server).
+	token, tokenErr := resolveMarketplaceInternalToken(os.Getenv)
+	if tokenErr != nil {
+		s.Error(tokenErr.Error())
+	}
+	s.marketplaceInternalToken = token
+	return s
 }
 
 // checkSpaceActive 检查空间是否处于活跃状态，返回 true 表示已处理错误（空间不活跃）
@@ -170,6 +186,49 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	{
 		authAccept.POST("/email-invite/:token/accept", s.acceptEmailInvite)
 	}
+
+	// Internal single-subject Space role lookup for octo-marketplace's plugin
+	// review workflow (see api_internal.go for the full contract and for why
+	// this replaced the deleted admin-roster endpoint).
+	//
+	// Middleware **execution order** on this route matters:
+	//  1. per-endpoint strict per-IP rate limit — MUST run FIRST so abusive
+	//     traffic never reaches the token compare or the DB. Required by
+	//     `.octospec/rules/rate-limit.md` (load_bearing) for un-user-authed
+	//     routes.
+	//  2. marketplaceInternalTokenMiddleware — X-Internal-Token constant-time
+	//     compare, fail-closed when the token is unset/rejected at boot.
+	//
+	// Both are mounted on the **concrete GET route**, not on the group. Gin
+	// combines group handlers ahead of route handlers, so auth-on-group +
+	// limiter-on-route would execute as `auth → ipLimit → handler`: a missing
+	// or wrong token would abort before consuming the strict-IP bucket and
+	// token probing would fall back to the wider global bucket. Anchoring both
+	// to the route also forces a future second endpoint under /v1/internal to
+	// make its own explicit auth + limiter choice instead of silently
+	// inheriting this one. Same reasoning as
+	// modules/internal_resolve/api.go:126-146.
+	//
+	// The limiter reuses rlRedis (short Lua-script transactions, PoolSize=10)
+	// but has its own keyspace tag, so quotas stay independent from the
+	// invite-preview bucket. rps/burst go through ratelimit.Sanitize* inside
+	// sanitizedSpaceMemberRole* because wkhttp.ParseRPSFromEnv lets NaN/+Inf
+	// through and those silently DISABLE the limiter.
+	//
+	// route_wiring_test.go reads this function body off disk and pins the four
+	// invariants below (limiter built, group has no middleware, exact handler
+	// order, exact path). Do not restructure without updating it.
+	memberRoleIPLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), rlRedis, spaceMemberRoleRateLimitTag,
+		sanitizedSpaceMemberRoleRPS(), sanitizedSpaceMemberRoleBurst(),
+	)
+	internal := r.Group("/v1/internal")
+	internal.GET(
+		"/spaces/:space_id/members/:uid/role",
+		memberRoleIPLimit,
+		s.marketplaceInternalTokenMiddleware(),
+		s.getSpaceMemberRole,
+	)
 }
 
 // envDisableUserCreateSpace 全局开关的历史 env 入口：运维通过环境变量
