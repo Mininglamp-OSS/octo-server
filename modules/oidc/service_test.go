@@ -43,6 +43,13 @@ type fakeIdentityStore struct {
 	// 故障注入(竞态恢复测试用)
 	failInsertWithDuplicate bool // Insert 直接返 MySQL 1062 模拟 unique 冲突
 	failGetAfterDuplicate   bool // 后续 Get 返错,模拟查赢家也失败
+
+	// winnerAfterDuplicate 让 Get 复刻竞态的**真实时序**:ResolveOrLink 查的时候
+	// 赢家还没落库(返 nil → IsNew=true → 建号),Insert 撞 1062 之后再查就查得到。
+	// 单靠 bindings 预置做不到 —— 那样 ResolveOrLink 第一次就命中,压根走不到
+	// Insert。仅在设置了本字段时改变行为,零值 = 原语义。
+	winnerAfterDuplicate *IdentityModel
+	insertAttempted      bool
 }
 
 func newFakeIdentityStore() *fakeIdentityStore {
@@ -53,10 +60,14 @@ func (s *fakeIdentityStore) Get(issuer, sub string) (*IdentityModel, error) {
 	if s.failGetAfterDuplicate {
 		return nil, errors.New("fake DB get failed")
 	}
+	if s.winnerAfterDuplicate != nil && s.insertAttempted {
+		return s.winnerAfterDuplicate, nil
+	}
 	return s.bindings[issuer+"|"+sub], nil
 }
 func (s *fakeIdentityStore) Insert(m *IdentityModel) error {
 	if s.failInsertWithDuplicate {
+		s.insertAttempted = true
 		// 复刻 go-sql-driver/mysql 的 *MySQLError{Number: 1062}
 		return &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}
 	}
