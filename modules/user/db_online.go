@@ -128,15 +128,33 @@ func (o *onlineDB) queryOnlineDevice(uid string, deviceFlag config.DeviceFlag) (
 	return onlineStatusModel, err
 }
 
-// queryOnlineDevices 批量查询给定 uid 集合中指定设备的在线记录（仅 online=1），一次查询返回，
+// queryOnlineDevices 批量查询给定 uid 集合中指定设备的在线记录（仅 online=1），
 // 供离线 Push 前的批量在线判定使用，避免 per-uid 循环查询造成的 N+1。
-func (o *onlineDB) queryOnlineDevices(uids []string, deviceFlags []uint8) ([]*onlineStatusModel, error) {
+//
+// deviceFlags 必须用 uint16 而非 uint8：Go 里 []uint8 即 []byte，dbr 会把它当二进制字面量
+// 而不是展开成 IN 列表，生成的 `device_flag in ?` 是非法 SQL（MySQL 1064），整条查询恒失败。
+// uint16 元素类型才会正确展开成 `(1,2)`。
+// uid 按 1000 分批，与相邻 user_notification_pause 的 getActiveByUIDs 保持一致，避免超大 IN。
+func (o *onlineDB) queryOnlineDevices(uids []string, deviceFlags []uint16) ([]*onlineStatusModel, error) {
 	if len(uids) == 0 || len(deviceFlags) == 0 {
 		return nil, nil
 	}
 	var models []*onlineStatusModel
-	_, err := o.session.Select("*").From("user_online").Where("uid in ? and device_flag in ? and `online`=1", uids, deviceFlags).Load(&models)
-	return models, err
+	const batchSize = 1000
+	for start := 0; start < len(uids); start += batchSize {
+		end := start + batchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		var batch []*onlineStatusModel
+		_, err := o.session.Select("*").From("user_online").
+			Where("uid in ? and device_flag in ? and `online`=1", uids[start:end], deviceFlags).Load(&batch)
+		if err != nil {
+			return nil, err
+		}
+		models = append(models, batch...)
+	}
+	return models, nil
 }
 
 func (o *onlineDB) exist(uid string, deviceFlag uint8, online int) (bool, error) {

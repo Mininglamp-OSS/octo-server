@@ -1298,9 +1298,10 @@ func (s *Service) GetDeviceOnlines(uids []string, deviceFlags []config.DeviceFla
 	if len(uids) == 0 || len(deviceFlags) == 0 {
 		return nil, nil
 	}
-	flags := make([]uint8, 0, len(deviceFlags))
+	// 用 uint16 而非 uint8：dbr 会把 []uint8([]byte) 当二进制字面量，IN 列表无法展开（详见 queryOnlineDevices）。
+	flags := make([]uint16, 0, len(deviceFlags))
 	for _, f := range deviceFlags {
-		flags = append(flags, f.Uint8())
+		flags = append(flags, uint16(f.Uint8()))
 	}
 	models, err := s.onlineDB.queryOnlineDevices(uids, flags)
 	if err != nil {
