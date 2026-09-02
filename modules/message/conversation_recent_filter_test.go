@@ -58,7 +58,7 @@ func TestFilterRecentConversations_StaleGroupDropped(t *testing.T) {
 	assert.Equal(t, []string{"g-fresh"}, channelIDs(got))
 }
 
-func TestFilterRecentConversations_ManualUnreadDoesNotSurviveWindow(t *testing.T) {
+func TestFilterRecentConversations_ManualUnreadSurvivesWindow(t *testing.T) {
 	tests := []struct {
 		name        string
 		channelID   string
@@ -83,8 +83,9 @@ func TestFilterRecentConversations_ManualUnreadDoesNotSurviveWindow(t *testing.T
 
 			got := filterRecentConversations([]*SyncUserConversationResp{resp}, defaultRecentCutoffs(), nil)
 
-			assert.Empty(t, got,
-				"recent_filter=true 时，manual_unread 不应绕过 Recent 活跃时间窗口")
+			require.Len(t, got, 1,
+				"recent_filter=true 时，manual_unread 必须绕过 Recent 活跃时间窗口")
+			assert.Equal(t, tc.channelID, got[0].ChannelID)
 		})
 	}
 }

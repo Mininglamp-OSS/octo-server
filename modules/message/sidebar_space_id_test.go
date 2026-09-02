@@ -78,7 +78,7 @@ func TestSpaceID_BuildRecentItems_GroupAndThreadFilled(t *testing.T) {
 		"g1": "spaceB",
 	}
 
-	items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, recentCutoffs{}, nil, nil, groupSpaceMap, nil, "")
 
 	bySpace := map[string]string{}
 	for _, it := range items {

@@ -1,6 +1,9 @@
-//go:build integration
-
 package message
+
+// These tests intentionally run in the default modules/message E2E lane. That
+// lane provisions MySQL, Redis, and WuKongIM and executes the package with
+// -race and -shuffle; keeping the manual-unread correctness tests there makes
+// their concurrency, database, and notification assertions visible to CI.
 
 import (
 	"bytes"
@@ -16,12 +19,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIntegration_SetManualUnreadSkipsConversationSync verifies that setting
-// the application-level marker neither queries nor depends on WuKongIM's real
-// unread state. The fake target deliberately has normal unread messages; the
-// marker must still be created without calling /conversation/sync.
-func TestIntegration_SetManualUnreadSkipsConversationSync(t *testing.T) {
-	channelID := "set-manual-unread-without-sync"
+func requireManualUnreadCMDParam(
+	t *testing.T,
+	record fakeIMCMDRecord,
+	channelID string,
+	channelType uint8,
+	manualUnread bool,
+	version int64,
+) {
+	t.Helper()
+	require.Equal(t, common.CMDSyncConversationExtra, record.CMD)
+	require.Equal(t, channelID, record.Param["channel_id"])
+	require.Equal(t, float64(channelType), record.Param["channel_type"])
+	require.Equal(t, manualUnread, record.Param["manual_unread"])
+	require.Equal(t, float64(version), record.Param["version"])
+}
+
+// TestIntegration_SetManualUnreadDoesNotQueryIMConversation verifies that the
+// dedicated marker is independent of WuKongIM conversation existence and real
+// unread state. Even if the fake IM would report unread messages, the endpoint
+// must not call /conversations before persisting the user's marker.
+func TestIntegration_SetManualUnreadDoesNotQueryIMConversation(t *testing.T) {
+	channelID := "set-manual-unread-without-im-query"
 	fakeIMConvs = []*config.SyncUserConversationResp{
 		{
 			ChannelID:   channelID,
@@ -31,7 +50,7 @@ func TestIntegration_SetManualUnreadSkipsConversationSync(t *testing.T) {
 		},
 	}
 
-	s, _ := setupConvSyncE2E(t, fakeIMConvs)
+	s, ctx := setupConvSyncE2E(t, fakeIMConvs)
 
 	call := func() *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
@@ -51,7 +70,26 @@ func TestIntegration_SetManualUnreadSkipsConversationSync(t *testing.T) {
 	require.True(t, result.ManualUnread)
 	require.True(t, result.Changed)
 	require.NotZero(t, result.Version)
-	require.Zero(t, fakeIMSyncCalls, "setManualUnread 不应查询 WuKongIM 会话或真实未读数")
+	require.Empty(t, result.Reason)
+	require.Zero(t, fakeIMConversationCalls, "setManualUnread 不得查询 WuKongIM Conversation")
+	require.Len(t, fakeIMCMDRecords, 1)
+	requireManualUnreadCMDParam(
+		t,
+		fakeIMCMDRecords[0],
+		channelID,
+		common.ChannelTypeGroup.Uint8(),
+		true,
+		result.Version,
+	)
+	extra, err := newConversationExtraDB(ctx).queryOne(
+		testutil.UID,
+		channelID,
+		common.ChannelTypeGroup.Uint8(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, extra)
+	require.True(t, extra.ManualUnread)
+	require.Equal(t, result.Version, extra.Version)
 
 	resp = call()
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
@@ -59,15 +97,15 @@ func TestIntegration_SetManualUnreadSkipsConversationSync(t *testing.T) {
 	require.True(t, result.ManualUnread)
 	require.False(t, result.Changed)
 	require.Equal(t, "already_manual_unread", result.Reason)
-	require.Zero(t, fakeIMSyncCalls, "幂等设置同样不应查询 WuKongIM")
+	require.Zero(t, fakeIMConversationCalls, "幂等设置也不得查询 WuKongIM Conversation")
+	require.Len(t, fakeIMCMDRecords, 1, "幂等设置不应重复通知")
 }
 
-// TestIntegration_ClearManualUnreadAndClearUnreadAlwaysClearManualState
-// verifies the two explicit ways a manual marker is cleared:
+// TestIntegration_ClearManualUnreadAndClearUnreadZeroClearManualState verifies
+// the two explicit ways a manual marker is cleared:
 //   - clearManualUnread changes only conversation_extra.manual_unread;
-//   - clearUnread also clears manual_unread when unread is non-zero, because
-//     the existing frontend uses that endpoint for explicit unread updates.
-func TestIntegration_ClearManualUnreadAndClearUnreadAlwaysClearManualState(t *testing.T) {
+//   - clearUnread clears it only when the requested real unread count is zero.
+func TestIntegration_ClearManualUnreadAndClearUnreadZeroClearManualState(t *testing.T) {
 	channelID := "clear-manual-unread-group____topic"
 	fakeIMConvs = []*config.SyncUserConversationResp{
 		{
@@ -75,7 +113,7 @@ func TestIntegration_ClearManualUnreadAndClearUnreadAlwaysClearManualState(t *te
 			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
 			Timestamp:   1_700_000_000,
 			LastMsgSeq:  100,
-			Unread:      11,
+			Unread:      0,
 		},
 	}
 
@@ -126,28 +164,56 @@ func TestIntegration_ClearManualUnreadAndClearUnreadAlwaysClearManualState(t *te
 	require.NotNil(t, extra)
 	require.False(t, extra.ManualUnread)
 
-	// Re-create the manual marker, then use the existing clearUnread endpoint
-	// with unread>0. That explicit real-unread update must clear the marker too.
+	// Re-create the manual marker, then retain a positive real unread count.
+	// This must not clear the explicit manual marker.
 	setResp = call(
 		"/v1/conversation/setManualUnread",
 		`{"channel_id":"`+channelID+`","channel_type":5}`,
 	)
 	require.Equal(t, http.StatusOK, setResp.Code, setResp.Body.String())
 
+	fakeIMCMDs = nil
+	fakeIMCMDRecords = nil
 	clearResp := call(
 		"/v1/conversation/clearUnread",
 		`{"channel_id":"`+channelID+`","channel_type":5,"unread":5}`,
 	)
 	require.Equal(t, http.StatusOK, clearResp.Code, clearResp.Body.String())
-	require.Contains(t, fakeIMCMDs, common.CMDSyncConversationExtra,
-		"clearUnread 清除手动未读后必须通知客户端同步会话扩展")
 	require.Contains(t, fakeIMCMDs, common.CMDConversationUnreadClear,
 		"clearUnread 仍然必须发送真实未读清除命令")
+	require.NotContains(t, fakeIMCMDs, common.CMDSyncConversationExtra,
+		"unread>0 时不得清除或同步手动未读状态")
 
 	extra, err = extraDB.queryOne(testutil.UID, channelID, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	require.NotNil(t, extra)
+	require.True(t, extra.ManualUnread)
+
+	// unread=0 is the only clearUnread mode that also clears the marker.
+	fakeIMCMDs = nil
+	fakeIMCMDRecords = nil
+	clearResp = call(
+		"/v1/conversation/clearUnread",
+		`{"channel_id":"`+channelID+`","channel_type":5,"unread":0}`,
+	)
+	require.Equal(t, http.StatusOK, clearResp.Code, clearResp.Body.String())
+	require.Equal(t, []string{
+		common.CMDConversationUnreadClear,
+		common.CMDSyncConversationExtra,
+	}, fakeIMCMDs)
+	extra, err = extraDB.queryOne(testutil.UID, channelID, common.ChannelTypeCommunityTopic.Uint8())
+	require.NoError(t, err)
+	require.NotNil(t, extra)
 	require.False(t, extra.ManualUnread)
+	require.Len(t, fakeIMCMDRecords, 2)
+	requireManualUnreadCMDParam(
+		t,
+		fakeIMCMDRecords[1],
+		channelID,
+		common.ChannelTypeCommunityTopic.Uint8(),
+		false,
+		extra.Version,
+	)
 }
 
 // TestIntegration_ClearUnreadBroadcastsCoreStateBeforeBestEffortManualSync
@@ -176,6 +242,7 @@ func TestIntegration_ClearUnreadBroadcastsCoreStateBeforeBestEffortManualSync(t 
 	require.Equal(t, http.StatusOK, setResp.Code, setResp.Body.String())
 
 	fakeIMCMDs = nil
+	fakeIMCMDRecords = nil
 	fakeIMFailCMD = common.CMDSyncConversationExtra
 	defer func() { fakeIMFailCMD = "" }()
 
@@ -197,6 +264,15 @@ func TestIntegration_ClearUnreadBroadcastsCoreStateBeforeBestEffortManualSync(t 
 	require.NoError(t, err)
 	require.NotNil(t, extra)
 	require.False(t, extra.ManualUnread)
+	require.Len(t, fakeIMCMDRecords, 2)
+	requireManualUnreadCMDParam(
+		t,
+		fakeIMCMDRecords[1],
+		channelID,
+		common.ChannelTypeCommunityTopic.Uint8(),
+		false,
+		extra.Version,
+	)
 }
 
 // TestIntegration_DedicatedManualUnreadNotificationsAreBestEffort verifies
@@ -253,6 +329,23 @@ func TestIntegration_DedicatedManualUnreadNotificationsAreBestEffort(t *testing.
 		common.CMDSyncConversationExtra,
 		common.CMDSyncConversationExtra,
 	}, fakeIMCMDs)
+	require.Len(t, fakeIMCMDRecords, 2)
+	requireManualUnreadCMDParam(
+		t,
+		fakeIMCMDRecords[0],
+		channelID,
+		common.ChannelTypeGroup.Uint8(),
+		true,
+		setResult.Version,
+	)
+	requireManualUnreadCMDParam(
+		t,
+		fakeIMCMDRecords[1],
+		channelID,
+		common.ChannelTypeGroup.Uint8(),
+		false,
+		clearResult.Version,
+	)
 }
 
 func TestIntegration_ConcurrentSetManualUnreadHasOneStateTransition(t *testing.T) {
@@ -537,7 +630,11 @@ func TestIntegration_QueryManualUnreadExcludesPerson(t *testing.T) {
 		require.True(t, changed)
 	}
 
-	rows, err := extraDB.queryManualUnread(testutil.UID)
+	rows, err := extraDB.queryManualUnread(
+		testutil.UID,
+		[]string{"manual-unread-group-visible"},
+		[]string{"manual-unread-topic-visible"},
+	)
 	require.NoError(t, err)
 	require.Len(t, rows, 2)
 	for _, row := range rows {

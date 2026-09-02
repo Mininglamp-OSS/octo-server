@@ -965,12 +965,11 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 
 // filterRecentConversations drops conversations whose per-channel-type activity
 // window has elapsed, mirroring the sidebar recent tab (buildRecentItems): a
-// conversation is hidden iff it is not exempted (for example, by unread,
-// pinned, or system-bot state) and its type's cutoff is non-zero AND its
-// Timestamp is at or before that cutoff. A cutoff of 0 means "no filter" for
-// that type, and unknown channel types are kept unconditionally
-// (recentCutoffs.cutoffFor). Manual-unread state is returned to the client but
-// does not exempt a conversation from this activity window.
+// conversation is hidden iff it is not exempted (for example, by real unread,
+// Group/CommunityTopic manual unread, pinned, or system-bot state) and its
+// type's cutoff is non-zero AND its Timestamp is at or before that cutoff. A
+// cutoff of 0 means "no filter" for that type, and unknown channel types are
+// kept unconditionally (recentCutoffs.cutoffFor).
 //
 // Returns a new slice — the input is not mutated, so the caller's raw-based
 // cursor/unread computations stay intact (issue #294).
@@ -985,9 +984,9 @@ func filterRecentConversations(
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(r.ChannelID, r.ChannelType)]
 		}
-		// 未读 / 置顶 / 系统 Bot 豁免与 sidebar recent tab 共用同一套窗口语义。
-		// manual_unread 只是会话的展示标识，不改变真实未读数，也不再绕过
-		// Recent 活跃时间窗口。
+		// 未读 / 人工未读 / 置顶 / 系统 Bot 豁免与 sidebar recent tab 共用
+		// 同一套窗口语义。manual_unread 是用户显式保留未读展示的请求，
+		// 因此群聊和子区必须穿透 Recent 活跃时间窗口。
 		//
 		// 这里读的是跨 Space 的 r.Unread —— per-Space 未读由 fillPersonSpaceUnread
 		// 在本步之后才算出。于是「在别的 Space 有未读的 DM」会在当前 Space 也被豁免。
@@ -997,7 +996,10 @@ func filterRecentConversations(
 		// 置顶只认 user_pinned_channel（与 sidebar 同源）。响应里的 Stick 是另一套
 		// 旧的 userDetail.Top / group.Top 标记，两个端点历史上都未据它豁免，此处
 		// 保持一致而非单侧引入差异。
-		if keepDespiteRecentWindow(r.ChannelID, r.ChannelType, r.Unread, pinned) {
+		manualUnread := r.Extra != nil &&
+			supportsManualUnreadChannelType(r.ChannelType) &&
+			r.Extra.ManualUnread
+		if manualUnread || keepDespiteRecentWindow(r.ChannelID, r.ChannelType, r.Unread, pinned) {
 			filtered = append(filtered, r)
 			continue
 		}
@@ -1330,7 +1332,12 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		return
 	}
 
-	co.clearManualUnreadAfterClearBestEffort(c.Request.Context(), loginUID, req.ChannelID, req.ChannelType)
+	// unread>0 means the caller is retaining a real unread count. In that
+	// state the dedicated manual marker must not be cleared implicitly; the
+	// frontend clears it explicitly when the user re-enters the conversation.
+	if req.Unread == 0 {
+		co.clearManualUnreadAfterClearBestEffort(c.Request.Context(), loginUID, req.ChannelID, req.ChannelType)
+	}
 	c.ResponseOK()
 }
 
@@ -1345,11 +1352,11 @@ func (co *Conversation) clearManualUnreadAfterClearBestEffort(ctx context.Contex
 	}
 
 	manualUnreadCleared := false
+	var version int64
 	err := co.withConversationExtraLease(ctx, loginUID, channelID, channelType, func(lease *conversationExtraLease) error {
-		// 群聊和子区的任何有效 clearUnread 操作都会清除当前会话的手动未读标识。
-		// 这里不仅包括 unread=0 的真实未读清零，也包括前端用 unread>0
-		// 设置/保留真实未读数量的显式操作；后者同样代表用户重新定义了该会话的
-		// 未读状态，不应继续保留旧的 manual_unread 标识。
+		// Only clearUnread(unread=0) calls this helper. Positive unread updates
+		// retain the explicit marker and the frontend clears it through the
+		// dedicated endpoint when the conversation is re-entered.
 		extra, queryErr := co.conversationExtraDB.queryOne(loginUID, channelID, channelType)
 		if queryErr != nil {
 			return queryErr
@@ -1358,7 +1365,8 @@ func (co *Conversation) clearManualUnreadAfterClearBestEffort(ctx context.Contex
 			return nil
 		}
 
-		version, versionErr := co.nextConversationExtraVersionLocked(loginUID)
+		var versionErr error
+		version, versionErr = co.nextConversationExtraVersionLocked(loginUID)
 		if versionErr != nil {
 			return versionErr
 		}
@@ -1395,6 +1403,12 @@ func (co *Conversation) clearManualUnreadAfterClearBestEffort(ctx context.Contex
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		CMD:         common.CMDSyncConversationExtra,
+		Param: map[string]interface{}{
+			"channel_id":    channelID,
+			"channel_type":  channelType,
+			"manual_unread": false,
+			"version":       version,
+		},
 	}); err != nil {
 		co.Error("发送同步会话扩展命令失败！",
 			zap.Error(err),
@@ -1962,8 +1976,9 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "channel_type")
 		return
 	}
+
 	// 状态仍只属于当前登录用户的精确频道行；沿用既定产品语义，不要求
-	// 当前仍是群或父群成员，以便用户离开频道后也能清理遗留标志。
+	// 当前仍是群或父群成员，也不依赖 WuKongIM Conversation 存在。
 
 	var (
 		extra       *conversationExtraModel
@@ -2041,6 +2056,12 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		CMD:         common.CMDSyncConversationExtra,
+		Param: map[string]interface{}{
+			"channel_id":    req.ChannelID,
+			"channel_type":  req.ChannelType,
+			"manual_unread": true,
+			"version":       version,
+		},
 	}); err != nil {
 		// The marker and version are already committed. This CMD is only a
 		// transient notification, so a delivery failure must not turn the
@@ -2158,6 +2179,12 @@ func (co *Conversation) clearManualUnread(c *wkhttp.Context) {
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		CMD:         common.CMDSyncConversationExtra,
+		Param: map[string]interface{}{
+			"channel_id":    req.ChannelID,
+			"channel_type":  req.ChannelType,
+			"manual_unread": false,
+			"version":       version,
+		},
 	}); err != nil {
 		// The marker and version are already committed. Keep notification
 		// delivery best-effort for the same reason as setManualUnread.

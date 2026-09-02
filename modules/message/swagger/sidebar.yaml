@@ -39,13 +39,13 @@ paths:
         - 排序：`pinned DESC` → `timestamp DESC`
 
         **活跃窗口的豁免（对 recent tab 与 `/v1/conversation/sync?recent_filter=true` 一致）**：
-        以下三类**永不**被时间窗口隐藏 ——
+        以下四类**永不**被时间窗口隐藏 ——
         - **有未读**（`unread > 0`）：隐藏会话会连同未读消息一起藏走，用户无从察觉；
+        - **群聊或子区人工未读**（`manual_unread=true`）：这是用户显式保留未读展示的请求；
         - **已置顶**：置顶是关于位置的显式声明，时间窗口不得推翻；
         - **系统 Bot 的 DM**：保证其在每个 Space 均可达（占位条目 `timestamp/unread` 均为 0）。
 
-        `manual_unread=true` 仍会作为会话展示标识返回，但它不是活跃窗口豁免条件；
-        超过窗口的手动未读会话不会出现在 recent tab。
+        因此，`manual_unread=true` 的群聊或子区即使超过时间窗口也会出现在 recent tab。
 
         **已归档子区（`status=2`）不出现在 recent tab 的 items 中**，与
         `/v1/conversation/sync` 的 `status=active` 语义一致。归档非终态：任何人发消息会

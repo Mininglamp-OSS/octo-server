@@ -74,15 +74,32 @@ func (c *conversationExtraDB) queryWithChannelIDs(uid string, channelIDs []strin
 	_, err := c.session.Select("*").From("conversation_extra").Where("uid=? and channel_id in ?", uid, channelIDs).Load(&models)
 	return models, err
 }
-func (c *conversationExtraDB) queryManualUnread(uid string) ([]*conversationExtraModel, error) {
+
+func (c *conversationExtraDB) queryManualUnread(uid string, groupChannelIDs, topicChannelIDs []string) ([]*conversationExtraModel, error) {
+	conditions := make([]dbr.Builder, 0, 2)
+	if len(groupChannelIDs) > 0 {
+		conditions = append(conditions, dbr.And(
+			dbr.Eq("channel_type", common.ChannelTypeGroup.Uint8()),
+			dbr.Eq("channel_id", groupChannelIDs),
+		))
+	}
+	if len(topicChannelIDs) > 0 {
+		conditions = append(conditions, dbr.And(
+			dbr.Eq("channel_type", common.ChannelTypeCommunityTopic.Uint8()),
+			dbr.Eq("channel_id", topicChannelIDs),
+		))
+	}
+	if len(conditions) == 0 {
+		return nil, nil
+	}
+
 	var models []*conversationExtraModel
-	_, err := c.session.Select("*").From("conversation_extra").
-		Where("uid=? and manual_unread=? and channel_type in (?,?)",
-			uid,
-			1,
-			common.ChannelTypeGroup.Uint8(),
-			common.ChannelTypeCommunityTopic.Uint8(),
-		).
+	_, err := c.session.Select("channel_id", "channel_type").From("conversation_extra").
+		Where(dbr.And(
+			dbr.Eq("uid", uid),
+			dbr.Eq("manual_unread", 1),
+			dbr.Or(conditions...),
+		)).
 		Load(&models)
 	return models, err
 }

@@ -68,7 +68,7 @@ func TestE2E_RecentFilter_DefaultsReproduceLegacyBehaviour(t *testing.T) {
 		makeIMConv("g-old", common.ChannelTypeGroup.Uint8(), now.Add(-73*time.Hour).Unix()),
 		makeIMConv("dm-old", common.ChannelTypePerson.Uint8(), now.Add(-1000*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	ids := idSet(items)
 	assert.True(t, ids["g-new"])
 	assert.False(t, ids["g-old"], "默认 3 天窗口剔除超期群")
@@ -121,7 +121,7 @@ func TestE2E_RecentFilter_AdminOverrideTakesEffect(t *testing.T) {
 		makeIMConv("dm-6d", common.ChannelTypePerson.Uint8(), now.Add(-6*24*time.Hour).Unix()),
 		makeIMConv("dm-8d", common.ChannelTypePerson.Uint8(), now.Add(-8*24*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	ids := idSet(items)
 	assert.True(t, ids["g-ancient"], "群窗口关闭 → 远古群也返回")
 	assert.False(t, ids["g1____t-old"], "话题 3 天窗口 → 剔除超期话题")

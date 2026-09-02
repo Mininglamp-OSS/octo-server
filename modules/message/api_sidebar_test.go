@@ -250,7 +250,7 @@ func TestBuildRecentItems_GroupWithinWindow_Included(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1", items[0].TargetID)
 }
@@ -259,7 +259,7 @@ func TestBuildRecentItems_GroupOutsideWindow_Excluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
@@ -268,7 +268,7 @@ func TestBuildRecentItems_DMAlwaysIncluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "peer1", items[0].TargetID)
 }
@@ -277,7 +277,7 @@ func TestBuildRecentItems_ThreadWithinWindow_Included(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1____th1", items[0].TargetID)
 }
@@ -286,11 +286,11 @@ func TestBuildRecentItems_ThreadOutsideWindow_Excluded(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), now3DaysAgo()),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 
-func TestBuildRecentItems_ManualUnreadDoesNotSurviveWindow(t *testing.T) {
+func TestBuildRecentItems_ManualUnreadSurvivesWindow(t *testing.T) {
 	tests := []struct {
 		name        string
 		channelID   string
@@ -313,22 +313,22 @@ func TestBuildRecentItems_ManualUnreadDoesNotSurviveWindow(t *testing.T) {
 			convs := []*config.SyncUserConversationResp{
 				makeIMConv(tc.channelID, tc.channelType, now3DaysAgo()),
 			}
-			manualUnread := map[string]bool{
-				channelKey(tc.channelID, tc.channelType): true,
+			manualUnreadSet := map[string]struct{}{
+				channelKey(tc.channelID, tc.channelType): {},
 			}
-
 			items := buildRecentItems(
 				convs,
 				legacyRecentCutoffs(),
 				nil,
+				manualUnreadSet,
 				nil,
 				nil,
 				"",
-				manualUnread,
 			)
 
-			assert.Empty(t, items,
-				"manual_unread 不应让超出活跃时间窗口的会话继续出现在 Recent")
+			require.Len(t, items, 1,
+				"manual_unread 必须让超出活跃时间窗口的会话继续出现在 Recent")
+			assert.True(t, items[0].ManualUnread)
 		})
 	}
 }
@@ -340,18 +340,14 @@ func TestBuildRecentItems_ManualUnreadFalseDoesNotSurviveWindow(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv(channelID, channelType.Uint8(), now3DaysAgo()),
 	}
-	manualUnread := map[string]bool{
-		channelKey(channelID, channelType.Uint8()): false,
-	}
-
 	items := buildRecentItems(
 		convs,
 		legacyRecentCutoffs(),
 		nil,
 		nil,
 		nil,
+		nil,
 		"",
-		manualUnread,
 	)
 
 	assert.Empty(t, items,
@@ -366,17 +362,17 @@ func TestBuildRecentItems_ManualUnreadIsScopedByChannelType(t *testing.T) {
 		makeIMConv(channelID, common.ChannelTypePerson.Uint8(), nowRecent()),
 		makeIMConv(channelID, common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 	}
-	manualUnread := map[string]bool{
-		channelKey(channelID, common.ChannelTypePerson.Uint8()):         true,
-		channelKey(channelID, common.ChannelTypeCommunityTopic.Uint8()): true,
-	}
 	cutoffs := recentCutoffs{
 		group:  daysCutoff(time.Now(), 3),
 		thread: daysCutoff(time.Now(), 3),
 		person: daysCutoff(time.Now(), 3),
 	}
 
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", manualUnread)
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
+	backfillManualUnread(items, []*conversationExtraModel{
+		{ChannelID: channelID, ChannelType: common.ChannelTypePerson.Uint8()},
+		{ChannelID: channelID, ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+	})
 
 	require.Len(t, items, 3)
 	manualUnreadByType := make(map[uint8]bool, len(items))
@@ -390,6 +386,36 @@ func TestBuildRecentItems_ManualUnreadIsScopedByChannelType(t *testing.T) {
 		"群聊与子区的 manual_unread 必须按 channel_type 区分")
 }
 
+func TestCollectManualUnreadChannelIDs_UsesOnlyFinalSupportedItems(t *testing.T) {
+	const channelID = "same-channel-id"
+	items := []*SidebarItem{
+		{ChannelID: channelID, ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: channelID, ChannelType: common.ChannelTypeGroup.Uint8()},
+		{ChannelID: channelID, ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+		{ChannelID: "person-id", ChannelType: common.ChannelTypePerson.Uint8()},
+		nil,
+	}
+
+	groupIDs, topicIDs := collectManualUnreadChannelIDs(items)
+
+	assert.Equal(t, []string{channelID}, groupIDs)
+	assert.Equal(t, []string{channelID}, topicIDs)
+}
+
+func TestBackfillManualUnread_EmptyRowsFailOpenToFalse(t *testing.T) {
+	items := []*SidebarItem{
+		{ChannelID: "group-id", ChannelType: common.ChannelTypeGroup.Uint8(), ManualUnread: true},
+		{ChannelID: "topic-id", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), ManualUnread: true},
+		{ChannelID: "person-id", ChannelType: common.ChannelTypePerson.Uint8(), ManualUnread: true},
+	}
+
+	backfillManualUnread(items, nil)
+
+	for _, item := range items {
+		assert.False(t, item.ManualUnread)
+	}
+}
+
 func TestBuildRecentItems_PinnedFirst(t *testing.T) {
 	pinnedSet := map[string]struct{}{
 		channelKey("g2", common.ChannelTypeGroup.Uint8()): {},
@@ -398,7 +424,7 @@ func TestBuildRecentItems_PinnedFirst(t *testing.T) {
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 		makeIMConv("g2", common.ChannelTypeGroup.Uint8(), nowRecent()-10),
 	}
-	items := buildRecentItems(convs, legacyRecentCutoffs(), pinnedSet, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, legacyRecentCutoffs(), pinnedSet, nil, nil, nil, "")
 	require.Len(t, items, 2)
 
 	// buildRecentItems sets IsPinned flag; sorting is done separately
@@ -438,7 +464,7 @@ func TestBuildRecentItems_GroupCutoffZero_AllGroupsKept(t *testing.T) {
 		makeIMConv("g-old", common.ChannelTypeGroup.Uint8(), now3DaysAgo()),
 		makeIMConv("g-new", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	assert.Len(t, items, 2, "group 窗口关闭时，超期群也保留")
 }
 
@@ -451,7 +477,7 @@ func TestBuildRecentItems_PerTypeWindowsIndependent(t *testing.T) {
 		makeIMConv("g1____t-old", common.ChannelTypeCommunityTopic.Uint8(), now3DaysAgo()), // dropped (thread window on)
 		makeIMConv("g1____t-new", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),   // kept
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	ids := map[string]bool{}
 	for _, it := range items {
 		ids[it.TargetID] = true
@@ -470,7 +496,7 @@ func TestBuildRecentItems_PersonWindowFiltersDMs(t *testing.T) {
 		makeIMConv("dm-old", common.ChannelTypePerson.Uint8(), now3DaysAgo()),
 		makeIMConv("dm-new", common.ChannelTypePerson.Uint8(), nowRecent()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "person 窗口=3天时，超期 DM 被剔除")
 	assert.Equal(t, "dm-new", items[0].TargetID)
 }
@@ -491,7 +517,7 @@ func TestBuildRecentItems_UnknownChannelType_KeptUnconditionally(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("x-ancient", unknownChannelType, time.Now().Add(-10000*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "未知频道类型不应被时间窗口过滤（cutoffFor 默认 0=不过滤）")
 	assert.Equal(t, "x-ancient", items[0].TargetID)
 }
@@ -503,7 +529,7 @@ func TestBuildRecentItems_PersonCutoffZero_AllDMsKept(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("dm-ancient", common.ChannelTypePerson.Uint8(), time.Now().Add(-1000*time.Hour).Unix()),
 	}
-	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "person 默认 0 → DM 永远保留")
 }
 
@@ -1091,7 +1117,7 @@ func TestBuildFollowItems_EmptyConversations(t *testing.T) {
 }
 
 func TestBuildRecentItems_EmptyConversations(t *testing.T) {
-	items := buildRecentItems(nil, legacyRecentCutoffs(), nil, nil, nil, "", map[string]bool{})
+	items := buildRecentItems(nil, legacyRecentCutoffs(), nil, nil, nil, nil, "")
 	assert.Len(t, items, 0)
 }
 

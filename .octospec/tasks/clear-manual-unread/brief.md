@@ -17,24 +17,29 @@ Deliver the complete application-level manual-unread flow for Group and
 CommunityTopic conversations:
 
 - `PUT /v1/conversation/setManualUnread` stores the authenticated user's
-  manual-unread marker;
-- `PUT /v1/conversation/clearManualUnread` clears that marker as a dedicated
-  fallback in the frontend's conversation-open flow;
+  manual-unread marker without querying WuKongIM conversation existence or
+  real unread state;
+- `PUT /v1/conversation/clearManualUnread` is the frontend's explicit marker
+  clear whenever it re-enters a conversation that was manually unread before
+  navigation;
 - the existing `PUT /v1/conversation/clearUnread` preserves its real-unread
-  clear and broadcast contract, then best-effort clears the marker for Group
-  and CommunityTopic conversations;
+  clear and broadcast contract, and only `unread=0` best-effort clears the
+  marker for Group and CommunityTopic conversations;
 - conversation synchronization and Sidebar responses expose the marker to
   clients;
 - persisted marker changes advance the conversation-extra version and attempt
-  to notify the user's online clients with `CMDSyncConversationExtra`.
+  to notify the user's online clients with `CMDSyncConversationExtra`, whose
+  payload directly identifies the channel, final marker state, and version.
 - every production path that writes `conversation_extra` participates in one
   UID-scoped Redis lease so the user's shared extension cursor advances in
   commit order.
 
 The marker is stored in `conversation_extra.manual_unread` under the current
 user's exact `(uid, channel_id, channel_type)` row. It is a display state that
-can coexist with the conversation's real unread count and leaves the current
-message read position intact.
+leaves the current message read position intact and is independent of
+WuKongIM conversation existence and real unread state. If real messages and a
+marker coexist, the frontend renders the real count without adding the marker
+as an extra message.
 
 The shipped scope is Group and CommunityTopic. Person conversations remain on
 their existing real-unread behavior because one Person channel is shared
@@ -48,35 +53,30 @@ marked as unread. It is stored separately from the real unread count so the
 client can render both states with OR semantics without inventing an unread
 message or moving the message read position.
 
-The frontend may enter a conversation whose initial message sync returns no
-messages and consequently may not use its existing `clearUnread` path. In that
-case, `clearManualUnread` completes the conversation-open flow by clearing the
-display marker while preserving the real unread state. When the existing
-`clearUnread` path is used, that endpoint first completes the real-unread clear
-and legacy broadcast, then best-effort clears the marker so conversation-extra
-availability cannot regress the existing contract. The frontend avoids a
-second clear request when that path is used.
+When the frontend re-enters a conversation that was manually unread before the
+navigation, it calls `clearManualUnread` to clear the display marker regardless
+of whether the message pull is empty. The existing `clearUnread` path remains
+compatible only for a full real-unread clear: after its core clear and legacy
+broadcast, `unread=0` best-effort clears the marker. A positive `unread` update
+must leave the marker unchanged.
 
 Conversation-extra versioning is the multi-device synchronization source of
-truth. The CMD is a transient change notification; clients fetch the updated
-extension rows and refresh Sidebar after receiving it.
+truth. The CMD is a transient change notification whose `param` directly
+carries `channel_id`, `channel_type`, `manual_unread`, and `version`; clients
+may update that channel immediately and still use extension sync for recovery.
 
-Recent-window behavior is deliberately rollout-safe across Web, Android, and
-iOS. Web may learn to render `manual_unread` before the Android and iOS clients
-are upgraded. If the server used a manual marker to exempt an old conversation
-from the Recent activity window during that mixed-version period, an older
-mobile client would receive and display the out-of-window conversation but
-would not render its manual-unread dot. The resulting "old conversation shown
-without a red dot" experience is avoided by keeping the existing Recent
-window unchanged. A manually unread conversation outside that window therefore
-remains hidden in the current implementation; this is an intentional
-multi-client compatibility decision, not a bug.
+Manual unread is an explicit user request to keep a conversation visible as
+unread. Group and CommunityTopic markers therefore exempt matching entries
+from the Recent activity window in both `/v1/sidebar/sync` and the opt-in
+`/v1/conversation/sync` Recent projection.
 
 ## Load-bearing list
 
 - `setManualUnread` accepts Group and CommunityTopic targets, writes
   `manual_unread=true`, and returns `changed=true` with the new extension
-  version. An already-set marker returns the idempotent
+  version without calling `IMGetConversations` or otherwise querying WuKongIM
+  conversation existence or real unread state. An already-set marker returns
+  the idempotent
   `changed=false, reason=already_manual_unread` result.
 - `clearManualUnread` accepts the same channel types, writes
   `manual_unread=false`, and returns the new extension version. A missing or
@@ -90,14 +90,17 @@ multi-client compatibility decision, not a bug.
   topic.
 - After WuKongIM accepts a `clearUnread` request, the handler sends the legacy
   `CMDConversationUnreadClear` broadcast before accessing conversation-extra.
-  Group and CommunityTopic marker cleanup for both `unread=0` and `unread>0`
-  is best-effort after that broadcast; query, version, store, and extension-CMD
-  failures are logged and cannot change the completed core response. Person
-  `clearUnread` retains its existing real-unread behavior.
+  Group and CommunityTopic marker cleanup is attempted only for `unread=0`
+  and is best-effort after that broadcast; `unread>0` leaves the marker
+  unchanged. Query, version, store, and extension-CMD failures are logged and
+  cannot change the completed core response. Person `clearUnread` retains its
+  existing real-unread behavior.
 - A marker write and its new conversation-extra version are committed before
   the service attempts `CMDSyncConversationExtra` on the user's Person channel
-  with `NoPersist=true`. Notification delivery is best-effort: a failure is
-  logged and does not replace the committed success result with an HTTP error.
+  with `NoPersist=true`. Its `param` carries the exact `channel_id`,
+  `channel_type`, final `manual_unread`, and `version`. Notification delivery
+  is best-effort: a failure is logged and does not replace the committed
+  success result with an HTTP error.
 - The ordinary extension update, dedicated set/clear endpoints, and
   `clearUnread` marker cleanup all acquire the same UID-scoped Redis lock. Each
   lease has a request-unique UUID owner and a 10-second TTL; ownership is
@@ -117,11 +120,16 @@ multi-client compatibility decision, not a bug.
 - Sidebar first builds entries from its existing IM, follow, and thread data
   sources—including the existing DB-only CommunityTopic merge—and then
   overlays manual-unread state on the resulting items.
-- Recent visibility continues to use the configured activity window and its
-  existing real-unread, pinned, and system-bot exemptions. A surviving item
-  carries its manual marker, while the marker itself does not extend that
-  window. This preserves consistent rendering while Web, Android, and iOS may
-  run different manual-unread feature versions.
+- The Sidebar Follow lookup runs after its final item set is known. The Recent
+  lookup runs before the time window against only the bounded, visible IM
+  candidate keys so manual unread can act as an exemption. Both queries select
+  only `channel_id` / `channel_type`; neither scans the user's full extension
+  row set. A Recent marker-query failure skips the time window for that poll so
+  incomplete auxiliary state cannot hide a manually unread conversation.
+- Recent visibility uses the configured activity window with real-unread,
+  manual-unread, pinned, and system-bot exemptions. Group and CommunityTopic
+  markers retain matching conversations beyond the configured window in both
+  Recent response paths.
 - Legacy Person markers are projected as `manual_unread=false` by conversation
   and Sidebar synchronization.
 - The `conversation_extra.manual_unread` column is installed through the
@@ -132,10 +140,7 @@ multi-client compatibility decision, not a bug.
 - Frontend changes to decide when `clearManualUnread` is called.
 - Parent-group aggregation for community-topic manual-unread state.
 - Space-scoped Person manual-unread state.
-- Manual-unread-driven creation of new Sidebar entries or exemption from the
-  Recent activity window.
-- A coordinated future rollout that makes manual unread a Recent-window
-  exemption after every supported client can render the marker.
+- Manual-unread-driven creation of new Sidebar entries.
 - Changes to the existing real-unread cursor semantics.
 
 ## Acceptance
@@ -143,6 +148,9 @@ multi-client compatibility decision, not a bug.
 - A first Group or CommunityTopic `setManualUnread` call persists `true`,
   returns `changed=true` and a version, and emits
   `CMDSyncConversationExtra`.
+- A Group or CommunityTopic can be marked manually unread whether its
+  WuKongIM conversation is missing, has `unread=0`, or has real `unread>0`;
+  `setManualUnread` performs no WuKongIM conversation lookup.
 - Repeating `setManualUnread` returns `changed=false` with
   `reason=already_manual_unread` and leaves the stored version unchanged.
 - A first `clearManualUnread` call against a set marker persists `false`,
@@ -160,18 +168,16 @@ multi-client compatibility decision, not a bug.
 - `setManualUnread` and `clearManualUnread` update only the authenticated
   user's exact row, including when the caller is no longer a member of the
   requested group or topic.
-- Group and CommunityTopic `clearUnread` attempts to clear manual-unread for
-  both `unread=0` and `unread>0` after the real-unread clear and legacy CMD;
-  any supplementary cleanup failure is logged without suppressing the legacy
-  broadcast or changing the core success response. Person `clearUnread` leaves
-  legacy manual rows untouched.
+- Group and CommunityTopic `clearUnread(unread=0)` attempts to clear
+  manual-unread after the real-unread clear and legacy CMD; `unread>0` leaves
+  manual-unread unchanged. Any supplementary cleanup failure is logged without
+  suppressing the legacy broadcast or changing the core success response.
+  Person `clearUnread` leaves legacy manual rows untouched.
 - Ordinary draft and read-position extension updates preserve a concurrently
   stored manual marker.
 - Manual markers annotate eligible Sidebar entries but do not independently
-  create Group or CommunityTopic entries and do not retain an item beyond the
-  configured Recent window. An out-of-window manually unread conversation
-  remaining hidden during a mixed Web/Android/iOS rollout is expected behavior,
-  not a defect.
+  create Group or CommunityTopic entries. Existing manually unread entries are
+  retained beyond the configured Recent window in both response paths.
 - Dedicated marker changes remain visible through extension-version sync and
   attempt `CMDSyncConversationExtra` as a best-effort notification. A CMD
   failure after commit is logged while the endpoint still returns the changed
@@ -184,5 +190,9 @@ multi-client compatibility decision, not a bug.
   compare-renew rejects a replaced owner, and an expired owner cannot delete a
   successor's lock. Database tests prove stale set, clear, and ordinary-extra
   writes cannot replace a newer stored version.
+- The manual-unread database, concurrent-transition, version-high-water,
+  notification-failure, and `clearUnread` ordering regressions run in the
+  default `modules/message` test lane. They do not depend on the optional
+  `integration` build tag and remain executable under CI `-race -shuffle`.
 - Formatting, package compilation, focused regression tests, and
   `git diff --check` pass.
