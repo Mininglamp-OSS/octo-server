@@ -155,3 +155,31 @@ func GetSpaceName(session *dbr.Session, spaceID string) (string, error) {
 	}
 	return name, nil
 }
+
+// IsSpaceActive reports whether a Space exists and is in the normal (status=1)
+// state. An empty spaceID is not active. A missing row is (false, nil); only a
+// real query failure returns an error, so callers can fail closed on it.
+//
+// Distinct from GetSpaceName, which answers the same question by proxy through a
+// non-empty name. That proxy is fine for a display string but wrong for an
+// existence gate: `space`.`name` carries no NOT-NULL-and-non-empty guarantee at
+// the storage layer, so a Space whose name is blank would read as absent and an
+// admin could never point a setting at it. This asks the question directly.
+//
+// Both `modules/common` (admin write-path validation) and any consumer that must
+// refuse to write into a disbanded Space need this, and neither can import
+// `modules/space` — it imports `modules/common`, so the dependency only runs one
+// way. This leaf package is the shared floor.
+func IsSpaceActive(session *dbr.Session, spaceID string) (bool, error) {
+	if spaceID == "" {
+		return false, nil
+	}
+	var count int
+	if _, err := session.SelectBySql(
+		"SELECT COUNT(*) FROM space WHERE space_id=? AND status=1",
+		spaceID,
+	).Load(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}

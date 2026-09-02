@@ -694,7 +694,12 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	// 返回 IsNew=true,各自创建一个 user。UNIQUE KEY uk_issuer_subject 保证只
 	// 有一行 identity。输家的 user 已落库无法回滚 → 把输家的会话改签到赢家 uid,
 	// 用户体验正确(两个 tab 都登成同一个账号),ghost user 留给审计 + 后台合并。
+	//
+	// autoJoinUID:本次 callback 真正建成、且 identity 行落库成功的账号,用于随后
+	// 自动加入运维配置的初始 Space。竞态输家刻意不填 —— 见下面 race 分支的注释。
+	autoJoinUID := ""
 	if res.IsNew && sessResp.UID != "" {
+		autoJoinUID = sessResp.UID
 		if err := o.store.Insert(&IdentityModel{
 			UID:           sessResp.UID,
 			Issuer:        claims.Issuer,
@@ -719,6 +724,11 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 				}
 				result = "race_recovered"
 				sessResp = recovered
+				// 竞态输家的 user 行是 ghost(identity 归赢家,这个 uid 谁也登不上),
+				// 不该占初始 Space 的一个席位 —— 尤其在 max_users 卡着的部署里,
+				// 一个 ghost 就挤掉一个真人。赢家账号在它自己那条 callback 里已经
+				// 走过一次自动加入,这里补加只会重复。
+				autoJoinUID = ""
 			} else {
 				result = "identity_insert_fail"
 				o.Error("写 identity 绑定失败(非竞态)",
@@ -730,6 +740,16 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 				return
 			}
 		}
+	}
+
+	// 建号成功 → 自动加入运维配置的初始 Space(task oidc-auto-join-initial-space)。
+	//
+	// 同步执行而不是 go 出去:客户端拿到会话后第一件事往往就是
+	// GET /v1/integrations/oidc/spaces,成员行必须在响应返回前就位,否则首屏是空的。
+	// 加入内部真正耗时的副作用(预设群、SpaceMemberJoin 事件)本来就在 afterJoinSpace
+	// 里异步跑,这里同步的只有一次成员行写入。失败不影响登录,详见函数注释。
+	if autoJoinUID != "" {
+		o.autoJoinInitialSpace(autoJoinUID)
 	}
 
 	// existing user 重复登录:刷新 identity 行的 last_login_at 和最新 claims 字段。

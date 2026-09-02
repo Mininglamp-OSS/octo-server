@@ -55,6 +55,25 @@ func (d *DB) querySpaceByID(spaceId string) (*SpaceModel, error) {
 	return &m, err
 }
 
+// queryActiveSpaceForAutoJoin 与 querySpaceByID 查的是同一行，区别只在错误处理：
+// 查询失败一律返回 error，(nil, nil) 只表示"不存在或已解散/封禁"。
+//
+// querySpaceByID 在 m.SpaceId=="" 时先于 err 返回，会把真正的查询失败吞成
+// "空间不存在"。对 handler 那条路无所谓（两者都回 ErrSpaceNotFound），但自动加入
+// 路径要靠这个区分来决定计 space_inactive 还是 error，吞掉就分不清"配错了 id"和
+// "数据库抖了一下"。改 querySpaceByID 会牵动它现有的全部调用方，故另起一个。
+func (d *DB) queryActiveSpaceForAutoJoin(spaceId string) (*SpaceModel, error) {
+	var m SpaceModel
+	if _, err := d.session.Select("*").From("space").
+		Where("space_id=? and status=?", spaceId, SpaceStatusNormal).Load(&m); err != nil {
+		return nil, err
+	}
+	if m.SpaceId == "" {
+		return nil, nil
+	}
+	return &m, nil
+}
+
 // updateSpace 用户侧部分更新空间基础信息已迁移到 managerDB.updateSpaceProfile：
 // 该 helper 提供事务 + SELECT ... FOR UPDATE + sentinel error 的 TOCTOU 安全语义，
 // 用户侧 handler 通过 Space.mdb 直接调用，无需在 DB 层另起一份。

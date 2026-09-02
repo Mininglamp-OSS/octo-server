@@ -354,6 +354,9 @@ other = "The global file upload size cap must not be smaller than the sticker up
 ["err.server.common.manager_mfa_smtp_invalid"]
 other = "The SMTP configuration required by management-console MFA is invalid."
 
+["err.server.common.oidc_initial_space_invalid"]
+other = "The configured OIDC initial Space does not exist or is not active."
+
 ["err.server.common.space_welcome_config_invalid"]
 other = "Invalid space welcome configuration."
 

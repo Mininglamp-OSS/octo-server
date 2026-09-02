@@ -81,9 +81,26 @@ func bindResultLabels() []string {
 	}
 }
 
+// initialSpaceJoinResultLabels 「OIDC 建号自动加入初始 Space」的结果维度
+// (task oidc-auto-join-initial-space)。
+//
+// 取值与 space.InitialSpaceJoinOutcome 一一对应,那边是真源,这里只是把它列全好
+// 让 init 预热成零值序列。加分支时两边一起改,否则新 result 在 dashboard 上会
+// 以"凭空冒出的序列"出现。
+//
+// 这条曲线是该功能唯一的线上可观测入口:加入失败**不允许**影响登录,所以用户侧
+// 完全无感,只有 space_full / space_inactive / error 的计数会涨。运维告警应该挂
+// 在这三个 label 上,而不是等用户报"登录了但用不了"。
+func initialSpaceJoinResultLabels() []string {
+	return []string{"ok", "already_member", "space_full", "space_inactive", "error"}
+}
+
 // init 把每个声明的 label 都预热成 0 值序列。Prometheus 在没观察到样本前不会
 // 暴露 series,导致 Grafana"区分不出零次"和"未注册"两种状态。
 func init() {
+	for _, l := range initialSpaceJoinResultLabels() {
+		metricInitialSpaceJoinTotal.WithLabelValues(l).Add(0)
+	}
 	for _, l := range callbackResultLabels() {
 		metricCallbackTotal.WithLabelValues(l).Add(0)
 	}
@@ -179,4 +196,12 @@ var (
 		Help:      "End-to-end OIDC self-service bind handler latency in seconds.",
 		Buckets:   []float64{.02, .05, .1, .25, .5, 1, 2},
 	}, []string{"endpoint"})
+
+	// 只在"本次 callback / bind create 真的建了号"时 +1,所以它同时也是
+	// "OIDC 建号数"的近似计数;老用户重复登录不会碰它。
+	metricInitialSpaceJoinTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "initial_space_join_total",
+		Help:      "Auto-join of an OIDC-created account into the configured initial Space, by result (ok|already_member|space_full|space_inactive|error). Only counted when the account was actually created by this request.",
+	}, []string{"result"})
 )

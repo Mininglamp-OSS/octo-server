@@ -408,6 +408,50 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 	}
 
+	// OIDC initial-Space target validation (task oidc-auto-join-initial-space).
+	//
+	// Single-key check, so there is no merge-with-snapshot step like the
+	// onboarding block above needs: the value being written is the whole
+	// configuration. Empty is always legal and means "feature off".
+	//
+	// The value is trimmed into the plan rather than only for the check, so the
+	// stored value, the GET response's `value` and its `effective_value` (the
+	// getter trims on read) all agree. A pasted space_id carrying trailing
+	// whitespace would otherwise be stored verbatim, read back as configured,
+	// and miss on every lookup.
+	//
+	// Validating here — before the transaction — is the only moment an operator
+	// can be told the id is wrong: the consumer runs on a later OIDC account
+	// creation and is required to fail silently there (login must not break).
+	for i := range plans {
+		if plans[i].def.Category != "space" || plans[i].def.Key != "oidc_initial_space_id" {
+			continue
+		}
+		trimmed := strings.TrimSpace(plans[i].value)
+		plans[i].value = trimmed
+		plans[i].effectiveValue = trimmed
+		if trimmed == "" {
+			break
+		}
+		active, err := spacepkg.IsSpaceActive(m.ctx.DB(), trimmed)
+		if err != nil {
+			// Infrastructure error (Space lookup failed). Do not leak the DB
+			// detail — log it, respond with the generic internal code.
+			m.Error("校验 OIDC 初始 Space 失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if !active {
+			m.Warn("拒绝写入 OIDC 初始 Space：目标空间不存在或已解散/封禁",
+				zap.String("space_id", trimmed),
+				zap.String("operator", c.GetLoginUID()))
+			httperr.ResponseErrorL(c, errcode.ErrOIDCInitialSpaceInvalid, nil,
+				i18n.Details{"field": "oidc_initial_space_id"})
+			return
+		}
+		break
+	}
+
 	// Two-stage-decay ordering guard (task inactive-hiding-user-control / P1).
 	// Same merge-then-validate shape as the onboarding block above: a partial
 	// update must be checked against merge(current snapshot, incoming items),

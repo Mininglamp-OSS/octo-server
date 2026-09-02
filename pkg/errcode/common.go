@@ -81,4 +81,27 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "The SMTP configuration required by management-console MFA is invalid.",
 	})
+
+	// ErrOIDCInitialSpaceInvalid is returned by the manager system_setting write
+	// path when space.oidc_initial_space_id names a Space that does not exist or
+	// is no longer active (disbanded / banned).
+	//
+	// Rejecting at write time is the only place the operator learns about the
+	// typo: the setting is consumed asynchronously, on the first OIDC account
+	// creation that happens afterwards, and a failure there can only be a log
+	// line and a counter — it must never fail the login. Storing an unusable
+	// value would therefore look successful and stay silent until someone reads
+	// the server logs, while every SSO account created in the meantime stays
+	// stranded outside every Space.
+	//
+	// The `field` detail names the offending key so the admin UI can point at
+	// it. The space_id itself is operator-supplied and not sensitive, but it is
+	// deliberately NOT surfaced: the generic message plus the field is enough to
+	// fix the input, and the log carries the rest.
+	ErrOIDCInitialSpaceInvalid = register(codes.Code{
+		ID:             "err.server.common.oidc_initial_space_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The configured OIDC initial Space does not exist or is not active.",
+		SafeDetailKeys: []string{"field"},
+	})
 )
