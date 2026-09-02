@@ -899,14 +899,17 @@ func TestBuildSearchMessagesDSL_ExcludesContentField(t *testing.T) {
 	}
 }
 
-// TestBuildSearchAllHighlight_ExcludesFileContent is the Q4 D negative pin:
-// pickSnippet does not promote payload.file.content into the snippet slot, so
-// requesting a highlight on that field would allocate a fragment that no
-// consumer reads.
-func TestBuildSearchAllHighlight_ExcludesFileContent(t *testing.T) {
+// TestBuildSearchAllHighlight_IncludesFileContent supersedes the earlier Q4 D
+// negative pin: _search_all now DOES highlight payload.file.content so a
+// chat-tab file message whose body matched (but whose name did not) carries a
+// <mark>-wrapped content_snippet into the mixed feed (welded file card).
+// singleFileHit -> pickFileContentSnippet reads this fragment. Q6 A is
+// unaffected: only the 120-char fragment rides the wire, never the full body
+// (fileContentSourceExcludes still drops payload.file.content from _source).
+func TestBuildSearchAllHighlight_IncludesFileContent(t *testing.T) {
 	body := asJSONString(t, buildSearchAllHighlight())
-	if strings.Contains(body, `"payload.file.content"`) {
-		t.Errorf("_search_all highlight must NOT include payload.file.content (Q4 D):\n%s", body)
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all highlight must include payload.file.content (V6 chat-tab file body snippet):\n%s", body)
 	}
 }
 
