@@ -133,7 +133,23 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 	//
 	// 判据是 HMAC 而不是形态:一张 token 要么带着我方密钥下的合法签名,要么没有。
 	// 所以这道检查不会误伤 JWT 形态的上游不透明 token(造不出合法签名)。
-	// 未配置密钥时 o.bearerJWT 为 nil,C3 凭据不可能存在,行为与之前完全一致。
+	// 密钥**缺失**时 o.bearerJWT 为 nil,C3 凭据不可能存在,行为与之前完全一致。
+	// 密钥**无效**是另一回事,由上面 bearerJWTErr 那段处理。
+	// 构造失败态先处理:密钥配了但无效(比如 31 字节)时验签器为 nil,而客户端
+	// 业务后端拿的是**同一个值**在签 —— HMAC 不在乎密钥长度,32 字节是我方准入
+	// 策略。所以那张 token 带着在我方配置密钥下合法的签名,转发等于把签名材料和
+	// 载荷 PII 一起送进第三方访问日志。
+	//
+	// 归属问题在这个状态下**没有答案**,所以拒绝**每一个**凭据(含上游凭据),
+	// 与 modules/integration 同一标准。"没配密钥"仍是合法部署形态,不走这里。
+	if o.bearerJWTErr != nil {
+		metricExchangeResult.WithLabelValues("verifier_unavailable").Inc()
+		o.Error("OIDC exchange: bearer verifier failed to construct; refusing every credential "+
+			"rather than forwarding to the upstream IdP",
+			zap.String("trace_id", traceID), zap.Error(o.bearerJWTErr))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
 	if o.bearerJWT != nil {
 		if _, berr := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now()); berr == nil ||
 			!IsForeignToken(berr) {

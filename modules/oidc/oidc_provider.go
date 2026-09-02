@@ -173,6 +173,19 @@ func (p *oidcProvider) Identity(ctx context.Context, tok *TokenSet) (*IdentityCl
 	if !needUserInfo {
 		return claims, nil
 	}
+	// 没有 access_token 就没法拉 /userinfo —— 这不是"可能失败",是构造上必然失败。
+	//
+	// 客户端出示凭据那条路(IdentityFromClientCredential)只有 id_token,
+	// AccessToken 是零值。go-oidc 的 StaticTokenSource 不做有效性检查,照发
+	// "Authorization: Bearer "(空凭据)的 GET,然后必然 401 —— 而失败在下面被
+	// 静默吞掉,唯一症状是每请求一行 warn。
+	//
+	// 这条路在改动前是纯本地的(modules/integration 直接调 VerifyIDToken,零外呼),
+	// 不加这道守卫等于给一条原本可离线完成的认证路径加上一次必然失败的 IdP 往返,
+	// 慢上游时最长等到 HTTPTimeout。
+	if strings.TrimSpace(tok.AccessToken) == "" {
+		return claims, nil
+	}
 
 	ui, uerr := p.cfg.Client.UserInfo(ctx, &oauth2.Token{
 		AccessToken:  tok.AccessToken,

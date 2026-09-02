@@ -34,39 +34,20 @@ func TestLoadConfig_RefusesEveryUnbootableScenario(t *testing.T) {
 // 反面:oidcboot 认为可启动的配置,LoadConfig 也必须接受。
 //
 // 只测"该拒的都拒了"会让一个把所有配置都拒掉的实现通过。
-func TestLoadConfig_AcceptsBootableKinds(t *testing.T) {
-	cases := map[string]map[string]string{
-		"default kind": {},
-		"explicit oidc": {
-			"OCTO_OIDC_PROVIDER_KIND": "oidc",
-		},
-		"oauth2 with base url": {
-			"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
-			"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
-		},
-		"oauth2 falling back to the issuer as base url": {
-			"OCTO_OIDC_PROVIDER_KIND": "oauth2",
-		},
-		"oauth2 with app id and post-logout redirect": {
-			"OCTO_OIDC_PROVIDER_KIND":            "oauth2",
-			"OCTO_OIDC_PROVIDER_APP_ID":          "app1",
-			"OCTO_OIDC_POST_LOGOUT_REDIRECT_URI": "https://app.example.com/login",
-		},
-	}
-	for name, env := range cases {
-		t.Run(name, func(t *testing.T) {
+func TestLoadConfig_AcceptsEveryAcceptedScenario(t *testing.T) {
+	for _, sc := range oidcboot.AcceptedScenarios {
+		t.Run(sc.Name, func(t *testing.T) {
 			setBaseOIDCEnv(t)
-			for k, v := range env {
+			for k, v := range sc.Env {
 				t.Setenv(k, v)
 			}
 			if _, err := LoadConfig(); err != nil {
-				t.Errorf("LoadConfig refused a bootable configuration: %v (env=%v)", err, env)
+				t.Errorf("LoadConfig refused a bootable configuration: %v (env=%v)", err, sc.Env)
 			}
 		})
 	}
 }
 
-// 确保基线 env 本身是可启动的 —— 否则上面的反面用例在测一个假前提。
 func TestSetBaseOIDCEnv_IsItselfBootable(t *testing.T) {
 	setBaseOIDCEnv(t)
 	if _, err := LoadConfig(); err != nil {

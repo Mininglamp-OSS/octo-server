@@ -133,6 +133,14 @@ type OIDC struct {
 	// bearerJWT 业务后端自签 HS256 JWT 的验签器;nil 表示该路径未启用。
 	bearerJWT *BearerJWTVerifier
 
+	// bearerJWTErr 验签器**构造失败**的原因(密钥太短 / issuer 派生失败)。
+	//
+	// 为什么不能只用 bearerJWT==nil 表示:nil 已经被"没配密钥,这条路径合法地
+	// 未启用"占用了。两种状态必须可区分 —— 配错时客户端拿的是**同一个值**在签,
+	// HMAC 不在乎密钥长度,所以那张 token 带着在我方配置密钥下合法的签名。
+	// 与 modules/integration 同一语义。
+	bearerJWTErr error
+
 	// ownCred 判定"这张凭据是不是本服务自己签发的"(会话 token / uk_ / bf_)。
 	// /exchange 会把客户端出示的凭据交给 provider,而 plain-OAuth2 那条把它放在
 	// URL query 上,所以外呼前必须先排除我方凭据。见 own_credential.go。
@@ -254,7 +262,11 @@ func New(ctx *config.Context) *OIDC {
 	// 业务 JWT 不接"的部署形态。
 	bv, bverr := NewBearerJWTVerifier(cfg.Provider)
 	if bverr != nil {
-		o.Error("bearer JWT 配置无效,/exchange-jwt 不可用", zap.Error(bverr))
+		// 把原因**留下来**,不能打完日志就丢:nil 已经被"没配密钥,这条路径合法地
+		// 未启用"占用,两种状态必须可区分。见 bearerJWTErr 与 modules/integration
+		// 的同名字段 —— 那边同一个状态下拒绝每一个凭据。
+		o.bearerJWTErr = bverr
+		o.Error("bearer JWT 配置无效,/exchange 与 /exchange-jwt 将拒绝所有凭据", zap.Error(bverr))
 	} else if bv != nil {
 		o.bearerJWT = bv
 		o.Info("bearer JWT /exchange-jwt enabled",
@@ -384,20 +396,31 @@ func (o *OIDC) routeAt(r *wkhttp.WKHttp, pathID string) {
 	// 的限流参数也是常量,不给 env)—— 端点级阈值不该是部署时旋钮,调它要走代码
 	// review。Redis client 经 octoredis.NewInstrumentedClient 构造,保证
 	// TLS/连接池/Metrics 和 main.go 全局限流一致。
-	exIPRedis := octoredis.NewInstrumentedClient(o.ctx.GetConfig(), func(o *rd.Options) {
-		o.MaxRetries = 1
-		o.PoolSize = 10
-	})
-	o.trackExchangeLimiterClient(exIPRedis)
-	exIPLimit := r.StrictIPRateLimitMiddleware(
-		context.Background(), exIPRedis,
-		"oidc_exchange",
-		exchangeIPLimitRPS, exchangeIPLimitBurst,
-	)
 	pub.GET("/authorize", o.authorize)
 	pub.GET("/callback", o.callback)
-	pub.POST("/exchange", exIPLimit, o.exchange)
-	pub.POST("/exchange-jwt", exIPLimit, o.exchangeJWT)
+
+	// exchange 两个端点是**显式选择**的。
+	//
+	// main 上本模块只有 authorize/callback/logout;让这两个跟着 DM_OIDC_ENABLED
+	// 顺带挂上,等于给每个存量部署白加两个未认证的会话签发端点,且无法单独关闭。
+	// 见 Config.ExchangeEnabled 里为什么这不只是"多个新功能"。
+	//
+	// 关掉时**连限流器的 Redis client 都不构造** —— 为一组不存在的端点开连接池
+	// 没有意义,而且那段依赖 o.ctx。
+	if o.cfg.ExchangeEnabled {
+		exIPRedis := octoredis.NewInstrumentedClient(o.ctx.GetConfig(), func(o *rd.Options) {
+			o.MaxRetries = 1
+			o.PoolSize = 10
+		})
+		o.trackExchangeLimiterClient(exIPRedis)
+		exIPLimit := r.StrictIPRateLimitMiddleware(
+			context.Background(), exIPRedis,
+			"oidc_exchange",
+			exchangeIPLimitRPS, exchangeIPLimitBurst,
+		)
+		pub.POST("/exchange", exIPLimit, o.exchange)
+		pub.POST("/exchange-jwt", exIPLimit, o.exchangeJWT)
+	}
 	authed := r.Group(base, o.ctx.AuthMiddleware(r))
 	authed.POST("/logout", o.logout)
 	o.bindRoutes(pub)

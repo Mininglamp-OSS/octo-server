@@ -133,6 +133,18 @@ type KindInput struct {
 	AllowInsecureUpstream bool
 }
 
+// normalised trims every string field. A value that is only whitespace is not a
+// configured value, and both callers must agree on that without having to remember to
+// trim — which is exactly what they failed to do.
+func (in KindInput) normalised() KindInput {
+	in.Kind = strings.TrimSpace(in.Kind)
+	in.BaseURL = strings.TrimSpace(in.BaseURL)
+	in.AppID = strings.TrimSpace(in.AppID)
+	in.EndSessionURL = strings.TrimSpace(in.EndSessionURL)
+	in.PostLogoutRedirectURI = strings.TrimSpace(in.PostLogoutRedirectURI)
+	return in
+}
+
 // ValidateKind reports whether the provider configuration can boot.
 //
 // A nil return means modules/oidc will not refuse startup on account of these
@@ -140,6 +152,17 @@ type KindInput struct {
 // configured. The two statements must stay equivalent — that is the whole point
 // of this function existing.
 func ValidateKind(in KindInput) error {
+	// Normalise **here**, so the two callers cannot normalise differently.
+	//
+	// Unifying the rules was not enough: one reader trimmed its env values and the
+	// other did not, while the rules below compare against "". A whitespace-only
+	// BASE_URL (a trailing space, or a multi-line YAML scalar) therefore arrived as
+	// two different inputs — the module refused to boot, every OIDC route became a
+	// 404, and the settings helper reported "configured" so `login.local_off` stayed
+	// honoured. That is the same total lockout this package exists to prevent,
+	// reached through input handling rather than through duplicated rules.
+	in = in.normalised()
+
 	switch in.Kind {
 	case "", KindOIDC:
 		// The standard route keeps its existing semantics. The two settings that
@@ -399,4 +422,48 @@ var RefusedScenarios = []RefusedScenario{
 		},
 		ExpectKeyInError: "APP_ID",
 	},
+}
+
+// AcceptedScenario is a configuration both readers must agree is usable.
+type AcceptedScenario struct {
+	Name string
+	Env  map[string]string
+}
+
+// AcceptedScenarios pins the **accepting** direction of the agreement.
+//
+// RefusedScenarios only pins one half: "if the module refuses to boot, the settings
+// helper must not report configured". The other half matters just as much, and it was
+// the one that broke: the rules were unified but the input normalisation was not, so a
+// whitespace-only BASE_URL made the module refuse to boot while the helper reported
+// configured — every OIDC route a 404, `login.local_off` still honoured, no login path
+// left. RefusedScenarios could not express that, because after the fix the correct
+// verdict for that input is *accept* on both sides, not refuse on both.
+//
+// Both consumers' pin tests walk this table. It replaces a local copy that each side
+// maintained separately — the accepting direction was already tested, just not against
+// a shared list, which is why the divergence had somewhere to hide.
+var AcceptedScenarios = []AcceptedScenario{
+	{Name: "default kind", Env: map[string]string{}},
+	{Name: "explicit oidc", Env: map[string]string{"OCTO_OIDC_PROVIDER_KIND": "oidc"}},
+	{Name: "oauth2 with base url", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
+		"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
+	}},
+	{Name: "oauth2 falling back to the issuer as base url", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_KIND": "oauth2",
+	}},
+	// Whitespace is not a configured value. Both sides must reach that conclusion
+	// without either having to remember to trim — normalisation lives in ValidateKind.
+	{Name: "standard kind with a whitespace-only base URL", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_BASE_URL": "   ",
+	}},
+	{Name: "oauth2 with app id and post-logout redirect", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_KIND":            "oauth2",
+		"OCTO_OIDC_PROVIDER_APP_ID":          "app1",
+		"OCTO_OIDC_POST_LOGOUT_REDIRECT_URI": "https://app.example.com/login",
+	}},
+	{Name: "standard kind with a whitespace-only app id", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_APP_ID": " \t ",
+	}},
 }

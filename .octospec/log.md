@@ -1831,3 +1831,43 @@ Two blocking findings, both reproduced before fixing.
   invariant holds; what is accepted is written down, and a test skips-with-explanation
   if anyone "fixes" it.
 - **Learning** — `a-generalisation-can-widen-a-vendor-specific-rule.md`.
+
+## 2026-09-02 — round 9: four findings, three of them mine from the round before
+
+Two reviewers converged on the same headline; all four verified against code before any fix.
+
+- **P1.1 — `/exchange` failed open exactly where `modules/integration` fails closed.** The
+  round-8 verifier stage was written `if o.bearerJWT != nil`, and `New()` logged the
+  construction error and threw it away. So a 31-byte secret gave a nil verifier meaning both
+  "not configured" (legal) and "misconfigured" (must refuse), and the stage was skipped
+  silently. **I had fixed this exact fail-open in `modules/integration` in round 6** and kept
+  the error on the struct there — this round I copied the guard and not the failure direction.
+  The premise I wrote in the comment was also wrong: "no secret ⇒ no C3 credential can exist"
+  holds for an *absent* secret, not an *invalid* one, because the client backend signs with
+  the same configured value and HMAC does not care about key length.
+- **P1.2 — a regression I introduced: a doomed `/userinfo` call on every request.** Moving
+  `oidcAuth` onto `IdentityFromClientCredential` means the `TokenSet` carries only the
+  id_token, so `needUserInfo` fires with an empty `AccessToken`. go-oidc's `StaticTokenSource`
+  validates nothing, so a GET with `Authorization: Bearer ` goes out, 401s, and is swallowed.
+  A path that was purely local before this branch now blocks on an IdP round trip per request.
+  The suite was green because the mock matches `HasPrefix(auth, "Bearer ")` and 401s into the
+  swallow branch.
+- **P1.3 — the mirror was deleted, the *normalisation* was not.** Rules were unified into
+  `pkg/oidcboot`; one reader trimmed its env values, the other did not, and the rules compare
+  against `""`. Whitespace-only `BASE_URL` therefore reached the two sides as different
+  inputs → module 404s + helper reports configured + `local_off` honoured = no login path.
+  Fixed by normalising inside `ValidateKind`. **My first attempt encoded this as a
+  `RefusedScenario`, which was wrong** — after the fix the correct verdict is *accept* on both
+  sides. What needed pinning was agreement, and `RefusedScenarios` only pins one direction, so
+  the accepting direction became a second shared table (`AcceptedScenarios`), replacing the
+  local copy each side kept.
+- **P1.4 — two unauthenticated session-minting endpoints were on by default.** `main` exposes
+  three routes; every deployment with `DM_OIDC_ENABLED=true` silently gained `/exchange` and
+  `/exchange-jwt`, with no way to decline. Under `kind=oidc` that turns an id_token — a
+  front-channel artefact that legitimately appears in browser history and Referer headers —
+  into an unlimited session mint until `exp`. Now behind `OCTO_OIDC_EXCHANGE_ENABLED`,
+  default false, and the opt-out also skips constructing the limiter's Redis pool.
+- **Declined, with reasons recorded**: folding `validateLogoutURL` into `oidcboot` (reviewer
+  agrees it is pre-existing; making `ValidateKind` stricter risks creating a *new* lockout);
+  single-use redemption (adds Redis to the auth path and a new failure mode — and with the
+  opt-in flag defaulting off, existing installs are no longer exposed).

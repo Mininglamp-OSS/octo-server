@@ -53,7 +53,7 @@ rather than a leak.
 | G2 credential verification | the protocol | `AuthProvider.Identity` / `IdentityFromClientCredential` (P1, P2, P4-C2); `BearerJWTVerifier` (P3, P4-C3) | all |
 | G3 non-empty subject | the unique key | `requireStorableIdentity` at `ResolveOrLink` + `BindService.IssueWithReason`; also asserted in both providers | all |
 | G4 length bound on `issuer` / `subject` | the **column** (`VARCHAR(255)`, compared in bytes — intentionally conservative) | `requireStorableIdentity`; `issuer` additionally at provider construction | all |
-| G5 short-numeric refusal ("looks like an employee number") | the **producer** — requires a personnel system that reuses numbers | both `AuthProvider` implementations, pinned by the conformance table | P1, P2, P4-C2 only. **Deliberately not** P3/P4-C3: that subject is our own DB primary key, never reused |
+| G5 short-numeric refusal ("looks like an employee number") | the **producer** — requires a personnel system that reuses numbers | gated on `Capabilities().SubjectMayBeReusedPersonnelID`: declared **true** by `oauth2Provider` only. Per-kind expectations pinned by `TestAuthProviderConformance_ShortNumericSubjectFollowsCapability` | `kind=oauth2` on P1/P2/P4-C2, plus P5 snapshot consumption via the same bit. **Not** under `kind=oidc`: that is the generic client existing deployments already run against arbitrary IdPs, and a self-hosted IdP emitting its own primary keys as `sub` (`1001`, `42`) is normal. **Not** P3/P4-C3: that subject is our own DB primary key, never reused |
 | G6 byte-exact `(issuer, subject)` recheck | the `utf8mb4_general_ci` collation | `DB.QueryIdentityExact`; the raw query is unexported so this is compiler-enforced | all read paths |
 | G7 credential provenance split ("is this ours?") | the HMAC | `IsForeignToken`, allowlist over `ErrJWTForeign` | P4 only (the only path with two credential types) |
 | G8 freshness | the purpose | `VerifyForRedemption` (10 min from `iat`) vs `VerifyForAuthentication` (token's own `exp`) | P3 uses the former, P4-C3 the latter |
@@ -111,6 +111,21 @@ turns these endpoints into an existence oracle. **Whether any such token still e
 in production is an operations question, not one this repository can answer** — it is
 on the human-verify list.
 
+## Reachability column — a guard that costs availability where there is nothing to guard
+
+`/exchange` and the two `modules/integration` endpoints now consult the session store on every
+request to decide credential provenance. Under `kind=oidc` the credential is never forwarded
+(`oidcProvider.IdentityFromClientCredential` verifies the id_token locally), so on that kind
+the guard can only cost availability — a session-store outage turns working endpoints into
+500s. Recorded as an open item rather than fixed: gating it needs a capability bit meaning
+"the credential leaves the process unverified", and inventing one for a single call site is
+worse than the cost it saves. Revisit if a third kind appears.
+
+Related and fixed this round: under `kind=oidc` those same endpoints were issuing a
+`/userinfo` request on **every** request with an empty `access_token` — architecturally
+guaranteed to 401, swallowed, one warn line per request, on a path that was purely local
+before this change. `oidcProvider.Identity` now returns early when there is no access token.
+
 ## Lifetime column — credentials and snapshots that outlive a deploy
 
 A guard placed where a value is *produced* does not cover a value produced by the
@@ -138,7 +153,19 @@ what does the affected path do when it failed to build?
 | component | absent (legal) | construction failed (operator error) | verified by |
 |---|---|---|---|
 | `AuthProvider` | n/a — required | P1/P2/P3 `provider == nil` → 500; P4 → 500 on every request | `new_wiring_integration_test.go` |
-| `BearerJWTVerifier` | `(nil, nil)` → P3 returns 500 ("not configured"); P4 accepts C2 only | `(nil, err)` → P3 500; **P4 refuses every credential**, including C2 | `TestBearerJWT_VerifierConstructionFailureFailsClosed`, `TestBearerJWT_AbsentSecretKeepsUpstreamPathWorking` |
+| `BearerJWTVerifier` | `(nil, nil)` → P2 accepts C2 only, P3 returns 500 ("not configured"), P4 accepts C2 only | `(nil, err)` → P3 500; **P2 and P4 both refuse every credential**, including C2 | `TestExchange_FailsClosedWhenVerifierConstructionFailed`, `TestNew_RetainsBearerVerifierConstructionError_Integration`, `TestBearerJWT_VerifierConstructionFailureFailsClosed`, `TestExchange_AbsentSecretKeepsUpstreamPathWorking` |
+
+**P2 was the empty cell in this column for one round.** The round-8 verifier stage on
+`/exchange` was written as `if o.bearerJWT != nil`, and `modules/oidc`'s `New()` logged the
+construction error and discarded it — so a 31-byte secret produced a nil verifier that meant
+both "not configured" (legal) and "misconfigured" (must refuse), and the stage was skipped
+silently. `modules/integration` had already been fixed for exactly this in round 6 and kept
+the error on the struct; the fix was copied to `/exchange`, the failure direction was not.
+
+The distinction that makes it a leak rather than a confusing 401: an **absent** secret means
+no C3 credential can exist, but an **invalid** one is shared out-of-band with the client
+backend, which signs with it. HMAC does not care about key length — the 32-byte floor is our
+admission policy — so the token carries a signature that is valid under our configured secret.
 | id_token store (`redisIDTokenStore`) | `PostLogoutRedirectURI` unset → RP-logout off, logged at Info | encryptor build fails → logged at Error, RP-logout off | `TestNew_IDTokenStoreConstructorIsReachableFromProduction_Integration` |
 | exchange rate limiters | n/a | Redis unavailable → **fail-open** (deliberate: matches `pkg/wkhttp` policy) | `exchange_limiter_lifecycle_test.go` |
 | audit sink | n/a | write failure logged, request proceeds | existing audit tests |

@@ -41,7 +41,8 @@ var errIssuerTooLong = errors.New("issuer exceeds the identity column width")
 // **刻意不含**"短纯数字像工号"那条形态守卫。那条规则的论证是"工号被人事系统在
 // 离职/入职之间复用",只对**上游 IdP 断言的** subject 成立;业务 JWT 那条路的
 // subject 是我方业务库的主键(不复用),userId=42 是完全正常的取值。所以它留在
-// 两个 provider 里,由 AuthProvider 契约测试钉住 —— 见 checkUpstreamSubjectShape。
+// 声明了 SubjectMayBeReusedPersonnelID 的 provider 里(目前只有 oauth2),按能力位
+// 生效而非无条件 —— 由 AuthProvider 契约测试按 kind 分别钉住。见 checkUpstreamSubjectShape。
 //
 // 非空这条要显式写,不能指望长度检查:空串长度合法。
 func requireStorableIdentity(claims *IDTokenClaims) error {

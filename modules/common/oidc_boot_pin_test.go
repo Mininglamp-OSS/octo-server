@@ -39,29 +39,17 @@ func TestIsOIDCFullyConfigured_FalseForEveryUnbootableScenario(t *testing.T) {
 
 // 反面:可启动的配置必须被认作已配置,否则 local_off 的安全兜底会在正常部署上
 // 误触发,把密码登录意外打开。
-func TestIsOIDCFullyConfigured_TrueForBootableKinds(t *testing.T) {
-	cases := map[string]map[string]string{
-		"default kind": {},
-		"explicit oidc": {
-			"OCTO_OIDC_PROVIDER_KIND": "oidc",
-		},
-		"oauth2 with base url": {
-			"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
-			"OCTO_OIDC_PROVIDER_BASE_URL": "https://idp.example.com",
-		},
-		"oauth2 falling back to the issuer as base url": {
-			"OCTO_OIDC_PROVIDER_KIND": "oauth2",
-		},
-	}
-	for name, env := range cases {
-		t.Run(name, func(t *testing.T) {
+func TestIsOIDCFullyConfigured_TrueForEveryAcceptedScenario(t *testing.T) {
+	for _, sc := range oidcboot.AcceptedScenarios {
+		t.Run(sc.Name, func(t *testing.T) {
 			setBaseOIDCEnvForMirror(t)
-			for k, v := range env {
+			for k, v := range sc.Env {
 				t.Setenv(k, v)
 			}
 			if !isOIDCFullyConfigured() {
 				t.Errorf("a bootable configuration was reported as not configured; "+
-					"local_off's safety fallback would flip password login back on (env=%v)", env)
+					"local_off's safety fallback would flip password login back on (env=%v)",
+					sc.Env)
 			}
 		})
 	}

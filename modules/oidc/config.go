@@ -34,6 +34,18 @@ var providerIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // Config OIDC 模块完整配置
 type Config struct {
+	// ExchangeEnabled 是否挂载 /exchange 与 /exchange-jwt。
+	//
+	// 默认 **false**:main 上本模块只有 authorize/callback/logout 三条路由,
+	// 让这两个端点跟着 DM_OIDC_ENABLED 顺带挂上,等于给每个存量部署白加两个
+	// 未认证的会话签发端点,而且没法单独关掉。
+	//
+	// kind=oidc 下 /exchange 的语义是"出示 id_token 换完整会话",没有 nonce 绑定、
+	// 没有重放记录。id_token 是前端信道产物(浏览器历史/前端 JS/Referer 里出现是
+	// 它的正常用途),泄漏后的影响原本是"一个会过期作废的断言";挂上这个端点之后
+	// 它在 exp 之前等价于该用户的账号。所以必须是显式选择。
+	ExchangeEnabled bool
+
 	Enabled  bool
 	Provider ProviderConfig
 	// Bind 自助绑定子配置(P0)。Bind.Enabled 独立于 Config.Enabled,允许
@@ -123,6 +135,8 @@ type ProviderConfig struct {
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		Enabled: getBool("DM_OIDC_ENABLED", false),
+		// 默认 false —— 见 Config.ExchangeEnabled 的说明。
+		ExchangeEnabled: getBool("OCTO_OIDC_EXCHANGE_ENABLED", false),
 	}
 	if !cfg.Enabled {
 		return cfg, nil
