@@ -423,6 +423,14 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	// Validating here — before the transaction — is the only moment an operator
 	// can be told the id is wrong: the consumer runs on a later OIDC account
 	// creation and is required to fail silently there (login must not break).
+	// Every matching plan is trimmed, and the LAST one is what gets validated:
+	// the write loop below upserts each plan in order, so two items naming this
+	// key leave the second one in the database. Stopping at the first match
+	// would approve one value and store another — a 200 for a configuration
+	// pointing at a Space that does not exist. The onboarding and archive
+	// guards above judge their merged last-wins value for the same reason.
+	oidcInitialSpace := ""
+	oidcInitialSpaceSet := false
 	for i := range plans {
 		if plans[i].def.Category != "space" || plans[i].def.Key != "oidc_initial_space_id" {
 			continue
@@ -430,10 +438,11 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		trimmed := strings.TrimSpace(plans[i].value)
 		plans[i].value = trimmed
 		plans[i].effectiveValue = trimmed
-		if trimmed == "" {
-			break
-		}
-		active, err := spacepkg.IsSpaceActive(m.ctx.DB(), trimmed)
+		oidcInitialSpace = trimmed
+		oidcInitialSpaceSet = true
+	}
+	if oidcInitialSpaceSet && oidcInitialSpace != "" {
+		active, err := spacepkg.IsSpaceActive(m.ctx.DB(), oidcInitialSpace)
 		if err != nil {
 			// Infrastructure error (Space lookup failed). Do not leak the DB
 			// detail — log it, respond with the generic internal code.
@@ -443,13 +452,12 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		}
 		if !active {
 			m.Warn("拒绝写入 OIDC 初始 Space：目标空间不存在或已解散/封禁",
-				zap.String("space_id", trimmed),
+				zap.String("space_id", oidcInitialSpace),
 				zap.String("operator", c.GetLoginUID()))
 			httperr.ResponseErrorL(c, errcode.ErrOIDCInitialSpaceInvalid, nil,
 				i18n.Details{"field": "oidc_initial_space_id"})
 			return
 		}
-		break
 	}
 
 	// Two-stage-decay ordering guard (task inactive-hiding-user-control / P1).

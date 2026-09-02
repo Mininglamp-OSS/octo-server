@@ -195,3 +195,49 @@ func TestManagerSystemSetting_OIDCInitialSpaceIgnoresUnrelatedBatches(t *testing
 	]}`)
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
+
+// TestManagerSystemSetting_OIDCInitialSpaceValidatesLastDuplicateInBatch pins
+// that validation judges the value that actually gets persisted.
+//
+// The write loop upserts every plan in order, so for two items naming the same
+// (category, key) the last one is what lands in the database. A validator that
+// stops at the first match would approve the first value and store the second —
+// accepting a 200 for a configuration pointing at a Space that does not exist,
+// with the failure only ever appearing as a warn log on some later SSO login.
+// The neighbouring onboarding and archive-ordering guards already judge the
+// merged last-wins value; this one has to agree.
+func TestManagerSystemSetting_OIDCInitialSpaceValidatesLastDuplicateInBatch(t *testing.T) {
+	route, ctx := newSuperAdminServer(t)
+	ensureSpaceFixtureTable(t, ctx)
+	seedFixtureSpace(t, ctx, "sp-active", 1)
+
+	w := postSystemSetting(t, route, `{"items":[
+		{"category":"space","key":"oidc_initial_space_id","value":"sp-active"},
+		{"category":"space","key":"oidc_initial_space_id","value":"sp-bogus"}
+	]}`)
+	require.NotEqual(t, http.StatusOK, w.Code,
+		"the persisted value is the last one; a bogus target must be refused")
+
+	stored, ok := readStoredSetting(t, ctx, "space", "oidc_initial_space_id")
+	assert.False(t, ok, "a rejected write must persist nothing, not the valid first item")
+	assert.Empty(t, stored)
+}
+
+// TestManagerSystemSetting_OIDCInitialSpaceTrimsEveryDuplicateInBatch is the
+// trimming half of the same property: whichever duplicate wins the write must be
+// the trimmed one, otherwise the stored value silently misses on every lookup.
+func TestManagerSystemSetting_OIDCInitialSpaceTrimsEveryDuplicateInBatch(t *testing.T) {
+	route, ctx := newSuperAdminServer(t)
+	ensureSpaceFixtureTable(t, ctx)
+	seedFixtureSpace(t, ctx, "sp-active", 1)
+
+	w := postSystemSetting(t, route, `{"items":[
+		{"category":"space","key":"oidc_initial_space_id","value":"sp-active"},
+		{"category":"space","key":"oidc_initial_space_id","value":"  sp-active  "}
+	]}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	stored, ok := readStoredSetting(t, ctx, "space", "oidc_initial_space_id")
+	require.True(t, ok)
+	assert.Equal(t, "sp-active", stored, "the winning duplicate must be trimmed too")
+}

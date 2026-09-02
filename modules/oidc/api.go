@@ -746,8 +746,10 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	//
 	// 同步执行而不是 go 出去:客户端拿到会话后第一件事往往就是
 	// GET /v1/integrations/oidc/spaces,成员行必须在响应返回前就位,否则首屏是空的。
-	// 加入内部真正耗时的副作用(预设群、SpaceMemberJoin 事件)本来就在 afterJoinSpace
-	// 里异步跑,这里同步的只有一次成员行写入。失败不影响登录,详见函数注释。
+	//
+	// 代价是这条 redirect 路径上多了几次 DB 往返:成员行写入,加上 afterJoinSpace
+	// 里同步跑的默认分类初始化与成员缓存失效(预设群和 SpaceMemberJoin 事件才是
+	// go 出去的)。都发生在会话已签发之后,失败也不影响登录,详见函数注释。
 	if autoJoinUID != "" {
 		o.autoJoinInitialSpace(autoJoinUID)
 	}
