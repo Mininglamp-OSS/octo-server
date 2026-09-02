@@ -1767,3 +1767,36 @@ them the round-5 defect reached through routes that fix had not enumerated.
 - **Learnings** — `a-sentinel-cannot-carry-a-stage-judgement.md`,
   `a-guard-carries-its-justification-not-just-its-code.md`,
   `when-a-defect-recurs-the-matrix-is-underspecified.md`.
+
+## 2026-09-02 — round 7: the taxonomy stopped at credentials we don't issue
+
+Two blocking findings, both reproduced before fixing.
+
+- **"Ours" is bigger than "the JWTs we sign".** Round 6's provenance guard answers
+  "is this an HS256 JWT under our secret" — true, and a strict subset of the
+  question that matters. A session token or a `uk_` API key is not a JWT, so it
+  failed at the segment split, was classified foreign, and went to the vendor's
+  `/userinfo` **in a URL query**. Reproduced: both appear verbatim in the upstream
+  request URL. Not exotic either — this PR's own global `BearerTokenCompat` is what
+  makes `Authorization: Bearer <session token>` the house convention, and
+  `userAPIKeyAuth` reads the same header on sibling routes in the same group.
+  New in this branch and specific to `kind=oauth2`: `main` verified locally and
+  never called out, and `kind=oidc` still doesn't (verified by closing the mock
+  server and getting a parse error, not a connection failure).
+- **A write-side guard doesn't cover values written by the previous binary.** Bind
+  snapshots cross the deployment boundary by design (there is a test pinning that
+  legacy snapshots still decode), so a snapshot issued before the bounds existed
+  still reproduced the orphan-user / truncation-collision shapes through
+  `Confirm`/`Create`. Both now re-validate after decode, before any mutation.
+- **The matrix I wrote last round had the blind spot that caused the first one.**
+  C1–C3 were all credentials the *upstream* issues; there was no row for the ones
+  *we* issue. Added C4, plus a lifetime column for artefacts that outlive the binary
+  that wrote them, plus a correction where it overstated rate-limit coverage.
+- Also: `HTTP_TIMEOUT` was silently ignored under `kind=oauth2`; and the two boolean
+  env readers disagreed on an unparseable primary — one falling through to the
+  legacy alias, the other returning the default — with the second carrying a comment
+  claiming it matched the first. Deleted the copy into `pkg/oidcboot.EnvBool` and
+  added the drift as a shared refusal scenario. **I had deferred this weighing
+  trigger difficulty; the reviewer was right that blast radius is the measure** —
+  the conjunction leaves an SSO-only deployment with no login path at all.
+- **Learning** — `own-is-larger-than-the-subset-you-can-verify.md`.
