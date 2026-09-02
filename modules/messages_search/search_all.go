@@ -183,25 +183,41 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 func buildSearchAllHighlight() *elastic.Highlight {
 	return elastic.NewHighlight().
 		PreTags("<mark>").PostTags("</mark>").
+		// Encoder("html") escapes uploader-controlled source text before the
+		// highlighter inserts <mark>/</mark>. Required so a maliciously-named
+		// upload (e.g. `<img src=x onerror=alert(1)>.pdf`) or a body fragment
+		// containing HTML cannot land as executable markup in any consumer that
+		// treats the *_highlight / snippet fields as safe HTML. See the twin
+		// comment on buildSearchFilesHighlight for the full threat model — this
+		// highlighter feeds both the chat-tab file-body path and the pre-existing
+		// text/richText/mergeForward snippets, so encoding here keeps every
+		// consuming tab consistent.
+		Encoder("html").
 		FragmentSize(120).
 		NumOfFragments(1).
-		Field("payload.text.content").
-		Field("payload.richText.searchText").
-		Field("payload.mergeForward.msgs.searchText").
-		Field("payload.file.name").
-		// payload.file.content: mirror the file-tab highlighter so a file
-		// message whose body (Tika-extracted content) matched the keyword —
-		// but whose name did not — surfaces a <mark>-wrapped body fragment in
-		// the mixed feed. Consumed by singleFileHit -> pickFileContentSnippet
-		// -> FileHit.ContentSnippet (search_files.go), which _search_all file
-		// hits already call. The top-level FragmentSize(120)/NumOfFragments(1)
-		// above applies to this field too, so only a single 120-char window is
-		// drawn from the inverted index — Q6 A (fileContentSourceExcludes drops
-		// the full 30-100 KB body from _source) is unaffected: the whole field
-		// never rides the wire, only the fragment does. Supersedes the earlier
-		// Q4 D "name-only" decision; the chat-tab UI now renders a content
-		// snippet block below the file card (sketches/002-snippet-below-card).
-		Field("payload.file.content")
+		Fields(
+			elastic.NewHighlighterField("payload.text.content"),
+			elastic.NewHighlighterField("payload.richText.searchText"),
+			elastic.NewHighlighterField("payload.mergeForward.msgs.searchText"),
+			// NumOfFragments(0) returns the whole field with matches marked
+			// in-place — matches file-tab (buildSearchFilesHighlight) behaviour
+			// so a long or multi-sentence file name is never truncated to a
+			// single "best passage" here while the file-tab returns whole.
+			elastic.NewHighlighterField("payload.file.name").NumOfFragments(0),
+			// payload.file.content: mirror the file-tab highlighter so a file
+			// message whose body (Tika-extracted content) matched the keyword —
+			// but whose name did not — surfaces a <mark>-wrapped body fragment in
+			// the mixed feed. Consumed by singleFileHit -> pickFileContentSnippet
+			// -> FileHit.ContentSnippet (search_files.go), which _search_all file
+			// hits already call. Uses the top-level FragmentSize(120)/NumOfFragments(1),
+			// so only a single 120-char window is drawn from the inverted index —
+			// Q6 A (fileContentSourceExcludes drops the full 30-100 KB body from
+			// _source) is unaffected: the whole field never rides the wire, only
+			// the fragment does. Supersedes the earlier Q4 D "name-only" decision;
+			// the chat-tab UI now renders a content snippet block below the file
+			// card (sketches/002-snippet-below-card).
+			elastic.NewHighlighterField("payload.file.content"),
+		)
 }
 
 func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, req SearchAllReq, loginUID string) []SearchAllHit {

@@ -248,6 +248,16 @@ func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl
 func buildSearchFilesHighlight() *elastic.Highlight {
 	return elastic.NewHighlight().
 		PreTags("<mark>").PostTags("</mark>").
+		// Encoder("html") escapes uploader-controlled source text (file.name is
+		// fully user-controlled; file.content is Tika-extracted uploader body)
+		// before the highlighter inserts <mark>/</mark>, so a malicious name
+		// like `<img src=x onerror=alert(1)>.pdf` comes back as
+		// `&lt;img src=x onerror=alert(1)&gt;.pdf` with only <mark> as live
+		// markup. Clients decode the entities into text nodes; there is no
+		// path for the injected HTML to execute. Without this, OpenSearch's
+		// default encoder is a pass-through — a stored-XSS vector via any
+		// uploader name/body token that overlaps a searcher's keyword.
+		Encoder("html").
 		Fields(
 			// NumberOfFragments(0) returns the whole field with matches marked
 			// in-place — correct for a short file name where we want the full

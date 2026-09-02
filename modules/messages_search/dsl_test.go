@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -910,6 +911,51 @@ func TestBuildSearchAllHighlight_IncludesFileContent(t *testing.T) {
 	body := asJSONString(t, buildSearchAllHighlight())
 	if !strings.Contains(body, `"payload.file.content"`) {
 		t.Errorf("_search_all highlight must include payload.file.content (V6 chat-tab file body snippet):\n%s", body)
+	}
+}
+
+// TestBuildSearchFilesHighlight_EscapesHTMLSource pins the stored-XSS defence:
+// OpenSearch's default highlight encoder is a pass-through, so a file whose
+// uploader-controlled name (payload.file.name is fully user-controlled) or
+// Tika-extracted body (payload.file.content) contains raw HTML would round-trip
+// unescaped into name_highlight / content_snippet — a searcher whose keyword
+// overlaps any token in the payload receives active markup that renders in any
+// client that treats *_highlight as safe HTML. Encoder("html") switches
+// OpenSearch to escape the source text (`<img>` → `&lt;img&gt;`) while keeping
+// only <mark>/</mark> as live markup; regressing this pin re-opens the vector.
+func TestBuildSearchFilesHighlight_EscapesHTMLSource(t *testing.T) {
+	body := asJSONString(t, buildSearchFilesHighlight())
+	if !strings.Contains(body, `"encoder":"html"`) {
+		t.Errorf("buildSearchFilesHighlight() must set encoder=\"html\" to escape uploader-controlled HTML in name/content (stored-XSS defence):\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_EscapesHTMLSource pins the same encoder=html
+// invariant on the mixed _search_all / _search_global_messages highlighter.
+// This path feeds the chat-tab file-body snippet added in V6, and it also
+// feeds pre-existing text/richText/mergeForward snippets — all of which carry
+// user-authored content that must not round-trip as executable HTML.
+func TestBuildSearchAllHighlight_EscapesHTMLSource(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	if !strings.Contains(body, `"encoder":"html"`) {
+		t.Errorf("buildSearchAllHighlight() must set encoder=\"html\" to escape user-authored HTML in every snippet field (stored-XSS defence):\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_FileNameWholeField pins the P1 alignment with the
+// file-tab highlighter: payload.file.name is rendered whole (in-place <mark>)
+// on both tabs, so a long or multi-sentence file name never gets truncated to
+// a single "best passage" only on the chat tab.
+func TestBuildSearchAllHighlight_FileNameWholeField(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	// The Fields() builder serialises as `"fields":{"payload.file.name":{...}}`,
+	// so the tolerant assertion is "the payload.file.name entry carries
+	// number_of_fragments:0 within its own object". A regex that matches the
+	// field key followed (allowing nested chars) by the pair — before the next
+	// field key or closing brace — keeps the assertion tolerant to key order.
+	pat := regexp.MustCompile(`"payload\.file\.name":\{[^{}]*"number_of_fragments":0[^{}]*\}`)
+	if !pat.MatchString(body) {
+		t.Errorf("_search_all highlight for payload.file.name must set number_of_fragments=0 to match file-tab whole-field behaviour:\n%s", body)
 	}
 }
 
