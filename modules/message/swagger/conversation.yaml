@@ -257,7 +257,9 @@ paths:
         `manual_unread=true` 并返回 `changed=true`。
 
         设置成功后，服务端会更新 `conversation_extra.version`，并向当前用户的个人频道
-        发送 `CMDSyncConversationExtra`，通知其他在线设备调用 `/conversation/extra/sync`。
+        尝试发送 `CMDSyncConversationExtra`，通知其他在线设备调用
+        `/conversation/extra/sync`。该 CMD 是 best-effort 的瞬时通知：如果状态和版本已成功
+        写入数据库，CMD 发送失败只记录日志，接口仍返回已提交的成功结果。
       operationId: "set manual unread"
       consumes:
         - "application/json"
@@ -295,7 +297,9 @@ paths:
         标识的场景，尤其是本次消息拉取为空时。
 
         如果目标会话本来没有手动未读标识，接口按幂等成功处理并返回 `changed=false`。
-        状态发生变化后，服务端会更新扩展版本并通知当前用户的其他在线设备同步。
+        状态发生变化后，服务端会更新扩展版本并尝试通知当前用户的其他在线设备同步。
+        `CMDSyncConversationExtra` 是 best-effort 通知：数据库已提交后发送失败只记录日志，
+        不会将已完成的清除操作改成错误响应。
       operationId: "clear manual unread"
       consumes:
         - "application/json"
@@ -327,8 +331,10 @@ paths:
       description: |
         清除或更新当前登录用户在 WuKongIM 中的真实未读状态。
 
-        当前服务端实现中，只要群聊或子区请求本身有效并且目标会话存在手动未读标识，
-        处理成功后也会一并清除该用户的 `manual_unread`，然后发送会话扩展同步通知。因此：
+        服务端在 WuKongIM 接受真实未读操作后，会先发送原有的真实未读清除通知。
+        对于群聊和子区，随后再 best-effort 查询并清除当前用户的 `manual_unread`，
+        并尝试发送会话扩展同步通知。conversation-extra 查询、版本生成、写入或扩展
+        通知失败只会记录日志，不会抑制已完成的真实未读通知，也不会将核心操作改成错误响应。因此：
         - `unread=0`：清除真实未读，同时清除手动未读；
         - `unread>0`：按 WuKongIM 语义设置/保留真实未读，同时也清除手动未读；
         - 私聊：只处理 WuKongIM 真实未读，不查询或修改手动未读标识；

@@ -24,9 +24,40 @@ func newConversationExtraDB(ctx *config.Context) *conversationExtraDB {
 // upsert statement. manual_unread is deliberately omitted from both the
 // insert values and duplicate-key assignments: a new row gets the column's
 // default value, while an existing marker is preserved atomically.
-func (c *conversationExtraDB) insertOrUpdate(model *conversationExtraModel) error {
-	_, err := c.session.InsertBySql("INSERT INTO conversation_extra (uid,channel_id,channel_type,browse_to,keep_message_seq,keep_offset_y,draft,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE browse_to=IF(VALUES(browse_to)>browse_to,VALUES(browse_to),browse_to),`keep_message_seq`=VALUES(`keep_message_seq`),keep_offset_y=VALUES(keep_offset_y),draft=VALUES(draft),version=VALUES(version)", model.UID, model.ChannelID, model.ChannelType, model.BrowseTo, model.KeepMessageSeq, model.KeepOffsetY, model.Draft, model.Version).Exec()
-	return err
+func (c *conversationExtraDB) insertOrUpdate(model *conversationExtraModel) (bool, error) {
+	result, err := c.session.InsertBySql(`
+INSERT INTO conversation_extra
+    (uid,channel_id,channel_type,browse_to,keep_message_seq,keep_offset_y,draft,version)
+VALUES (?,?,?,?,?,?,?,?)
+ON DUPLICATE KEY UPDATE
+    browse_to=IF(VALUES(version)>version AND VALUES(browse_to)>browse_to,VALUES(browse_to),browse_to),
+    keep_message_seq=IF(VALUES(version)>version,VALUES(keep_message_seq),keep_message_seq),
+    keep_offset_y=IF(VALUES(version)>version,VALUES(keep_offset_y),keep_offset_y),
+    draft=IF(VALUES(version)>version,VALUES(draft),draft),
+    version=GREATEST(version,VALUES(version))`,
+		model.UID,
+		model.ChannelID,
+		model.ChannelType,
+		model.BrowseTo,
+		model.KeepMessageSeq,
+		model.KeepOffsetY,
+		model.Draft,
+		model.Version,
+	).Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
+}
+
+func (c *conversationExtraDB) maxVersion(uid string) (int64, error) {
+	var version int64
+	err := c.session.SelectBySql(
+		"SELECT COALESCE(MAX(version),0) FROM conversation_extra WHERE uid=?",
+		uid,
+	).LoadOne(&version)
+	return version, err
 }
 
 func (c *conversationExtraDB) sync(uid string, version int64) ([]*conversationExtraModel, error) {
@@ -72,21 +103,39 @@ func (c *conversationExtraDB) queryOne(uid string, channelID string, channelType
 // It intentionally does not use insertOrUpdate, because that method also
 // writes draft/read-position fields and would overwrite them with zero values
 // when called by the dedicated manual-unread endpoint.
-func (c *conversationExtraDB) setManualUnread(uid string, channelID string, channelType uint8, version int64) error {
-	_, err := c.session.InsertBySql("INSERT INTO conversation_extra (uid,channel_id,channel_type,version,manual_unread) VALUES (?,?,?,?,1) ON DUPLICATE KEY UPDATE version=VALUES(version),manual_unread=VALUES(manual_unread)", uid, channelID, channelType, version).Exec()
-	return err
+func (c *conversationExtraDB) setManualUnread(uid string, channelID string, channelType uint8, version int64) (bool, error) {
+	result, err := c.session.InsertBySql(`
+INSERT INTO conversation_extra (uid,channel_id,channel_type,version,manual_unread)
+VALUES (?,?,?,?,1)
+ON DUPLICATE KEY UPDATE
+    manual_unread=IF(VALUES(version)>version,VALUES(manual_unread),manual_unread),
+    version=GREATEST(version,VALUES(version))`,
+		uid,
+		channelID,
+		channelType,
+		version,
+	).Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
 }
 
 // clearManualUnread changes only the manual-unread state and its sync version.
 // The caller must verify that the row is currently marked unread before
 // generating the version and invoking this method.
-func (c *conversationExtraDB) clearManualUnread(uid string, channelID string, channelType uint8, version int64) error {
-	_, err := c.session.Update("conversation_extra").
+func (c *conversationExtraDB) clearManualUnread(uid string, channelID string, channelType uint8, version int64) (bool, error) {
+	result, err := c.session.Update("conversation_extra").
 		Set("manual_unread", false).
 		Set("version", version).
-		Where("uid=? and channel_id=? and channel_type=? and manual_unread=1", uid, channelID, channelType).
+		Where("uid=? and channel_id=? and channel_type=? and manual_unread=1 and version<?", uid, channelID, channelType, version).
 		Exec()
-	return err
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
 }
 
 type conversationExtraModel struct {

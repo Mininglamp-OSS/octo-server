@@ -1,6 +1,7 @@
 package message
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,21 +38,22 @@ import (
 type Conversation struct {
 	ctx *config.Context
 	log.Log
-	userDB              *user.DB
-	groupDB             *group.DB
-	messageExtraDB      *messageExtraDB
-	messageReactionDB   *messageReactionDB
-	messageUserExtraDB  *messageUserExtraDB
-	channelOffsetDB     *channelOffsetDB
-	deviceOffsetDB      *deviceOffsetDB
-	userLastOffsetDB    *userLastOffsetDB
-	groupCategoryDB     *groupCategoryDB
-	userService         user.IService
-	groupService        group.IService
-	service             IService
-	channelService      chservice.IService
-	conversationExtraDB *conversationExtraDB
-	threadDB            *thread.DB
+	userDB                *user.DB
+	groupDB               *group.DB
+	messageExtraDB        *messageExtraDB
+	messageReactionDB     *messageReactionDB
+	messageUserExtraDB    *messageUserExtraDB
+	channelOffsetDB       *channelOffsetDB
+	deviceOffsetDB        *deviceOffsetDB
+	userLastOffsetDB      *userLastOffsetDB
+	groupCategoryDB       *groupCategoryDB
+	userService           user.IService
+	groupService          group.IService
+	service               IService
+	channelService        chservice.IService
+	conversationExtraDB   *conversationExtraDB
+	conversationExtraLock *conversationExtraLock
+	threadDB              *thread.DB
 
 	syncConversationResultCacheMap  map[string][]string
 	syncConversationVersionMap      map[string]int64
@@ -73,6 +75,7 @@ func NewConversation(ctx *config.Context) *Conversation {
 		userLastOffsetDB:               newUserLastOffsetDB(ctx),
 		groupCategoryDB:                newGroupCategoryDB(ctx),
 		conversationExtraDB:            newConversationExtraDB(ctx),
+		conversationExtraLock:          newConversationExtraLock(ctx),
 		threadDB:                       thread.NewDB(ctx),
 		userService:                    user.NewService(ctx),
 		groupService:                   group.NewService(ctx),
@@ -193,26 +196,48 @@ func (co *Conversation) conversationExtraUpdate(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 
 	channelTypeI64, _ := strconv.ParseInt(channelTypeStr, 10, 64)
+	channelType := uint8(channelTypeI64)
 
-	version, err := co.ctx.GenSeq(common.SyncConversationExtraKey)
+	var version int64
+	err := co.withConversationExtraLease(
+		c.Request.Context(),
+		loginUID,
+		channelID,
+		channelType,
+		func(lease *conversationExtraLease) error {
+			var versionErr error
+			version, versionErr = co.nextConversationExtraVersionLocked(loginUID)
+			if versionErr != nil {
+				return versionErr
+			}
+			if renewErr := lease.Renew(c.Request.Context()); renewErr != nil {
+				return renewErr
+			}
+			changed, storeErr := co.conversationExtraDB.insertOrUpdate(&conversationExtraModel{
+				UID:            loginUID,
+				ChannelID:      channelID,
+				ChannelType:    channelType,
+				BrowseTo:       req.BrowseTo,
+				KeepMessageSeq: req.KeepMessageSeq,
+				KeepOffsetY:    req.KeepOffsetY,
+				Draft:          req.Draft,
+				Version:        version,
+			})
+			if storeErr != nil {
+				return storeErr
+			}
+			if !changed {
+				return errConversationExtraVersion
+			}
+			return nil
+		},
+	)
 	if err != nil {
-		co.Error("生成会话扩展序列号失败", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-
-	err = co.conversationExtraDB.insertOrUpdate(&conversationExtraModel{
-		UID:            loginUID,
-		ChannelID:      channelID,
-		ChannelType:    uint8(channelTypeI64),
-		BrowseTo:       req.BrowseTo,
-		KeepMessageSeq: req.KeepMessageSeq,
-		KeepOffsetY:    req.KeepOffsetY,
-		Draft:          req.Draft,
-		Version:        version,
-	})
-	if err != nil {
-		co.Error("添加或更新最近会话扩展失败！", zap.Error(err))
+		co.Error("添加或更新最近会话扩展失败！",
+			zap.Error(err),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+		)
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
@@ -1283,53 +1308,11 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
-	// 群聊和子区的任何有效 clearUnread 操作都会清除当前会话的手动未读标识。
-	// 这里不仅包括 unread=0 的真实未读清零，也包括前端用 unread>0
-	// 设置/保留真实未读数量的显式操作；后者同样代表用户重新定义了该会话的
-	// 未读状态，不应继续保留旧的 manual_unread 标识。私聊暂不支持手动未读，
-	// 因此只处理 WuKongIM 的真实未读，不读写 conversation_extra.manual_unread。
-	manualUnreadCleared := false
-	if supportsManualUnreadChannelType(req.ChannelType) {
-		extra, queryErr := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
-		if queryErr != nil {
-			co.Error("查询会话手动未读状态失败！", zap.Error(queryErr))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		if extra != nil && extra.ManualUnread {
-			version, seqErr := co.ctx.GenSeq(common.SyncConversationExtraKey)
-			if seqErr != nil {
-				co.Error("生成会话扩展序列号失败！", zap.Error(seqErr))
-				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-				return
-			}
-			if storeErr := co.conversationExtraDB.clearManualUnread(loginUID, req.ChannelID, req.ChannelType, version); storeErr != nil {
-				co.Error("清除会话手动未读状态失败！", zap.Error(storeErr))
-				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-				return
-			}
-			manualUnreadCleared = true
-		}
-	}
 
-	// manual_unread 由数据库更新后，必须单独通知客户端同步会话扩展。
-	// CMDConversationUnreadClear 只负责 WuKongIM 的真实未读状态，不会刷新
-	// conversation_extra，因此不能依赖它同步 manual_unread。
-	if manualUnreadCleared {
-		err = co.ctx.SendCMD(config.MsgCMDReq{
-			NoPersist:   true,
-			ChannelID:   loginUID,
-			ChannelType: common.ChannelTypePerson.Uint8(),
-			CMD:         common.CMDSyncConversationExtra,
-		})
-		if err != nil {
-			co.Error("发送同步会话扩展命令失败！", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
-			return
-		}
-	}
-
-	// 发送清空红点的命令。
+	// Preserve the pre-existing clearUnread contract before attempting the
+	// application-level manual marker cleanup. Once WuKongIM has committed the
+	// real unread change, every online client must receive this legacy broadcast
+	// even if conversation_extra is temporarily unavailable.
 	err = co.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   loginUID,
@@ -1346,7 +1329,79 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
+
+	co.clearManualUnreadAfterClearBestEffort(c.Request.Context(), loginUID, req.ChannelID, req.ChannelType)
 	c.ResponseOK()
+}
+
+// clearManualUnreadAfterClearBestEffort clears the application-level marker
+// only after clearConversationUnread has completed its real unread clear and
+// legacy broadcast. The marker is supplementary state: query, version, store,
+// or extension-notification failures are logged but must not turn the already
+// completed core operation into a partial-success error response.
+func (co *Conversation) clearManualUnreadAfterClearBestEffort(ctx context.Context, loginUID, channelID string, channelType uint8) {
+	if !supportsManualUnreadChannelType(channelType) {
+		return
+	}
+
+	manualUnreadCleared := false
+	err := co.withConversationExtraLease(ctx, loginUID, channelID, channelType, func(lease *conversationExtraLease) error {
+		// 群聊和子区的任何有效 clearUnread 操作都会清除当前会话的手动未读标识。
+		// 这里不仅包括 unread=0 的真实未读清零，也包括前端用 unread>0
+		// 设置/保留真实未读数量的显式操作；后者同样代表用户重新定义了该会话的
+		// 未读状态，不应继续保留旧的 manual_unread 标识。
+		extra, queryErr := co.conversationExtraDB.queryOne(loginUID, channelID, channelType)
+		if queryErr != nil {
+			return queryErr
+		}
+		if extra == nil || !extra.ManualUnread {
+			return nil
+		}
+
+		version, versionErr := co.nextConversationExtraVersionLocked(loginUID)
+		if versionErr != nil {
+			return versionErr
+		}
+		if renewErr := lease.Renew(ctx); renewErr != nil {
+			return renewErr
+		}
+		changed, storeErr := co.conversationExtraDB.clearManualUnread(loginUID, channelID, channelType, version)
+		if storeErr != nil {
+			return storeErr
+		}
+		if !changed {
+			return errConversationExtraVersion
+		}
+		manualUnreadCleared = true
+		return nil
+	})
+	if err != nil {
+		co.Error("清除会话手动未读状态失败！",
+			zap.Error(err),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+		)
+		return
+	}
+	if !manualUnreadCleared {
+		return
+	}
+
+	// CMDConversationUnreadClear only refreshes WuKongIM's real unread state.
+	// Notify clients separately after the marker write, but keep this transient
+	// notification best-effort so it cannot break the core clearUnread contract.
+	if err = co.ctx.SendCMD(config.MsgCMDReq{
+		NoPersist:   true,
+		ChannelID:   loginUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		CMD:         common.CMDSyncConversationExtra,
+	}); err != nil {
+		co.Error("发送同步会话扩展命令失败！",
+			zap.Error(err),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+		)
+	}
 }
 
 // ---------- vo ----------
@@ -1910,14 +1965,67 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 	// 状态仍只属于当前登录用户的精确频道行；沿用既定产品语义，不要求
 	// 当前仍是群或父群成员，以便用户离开频道后也能清理遗留标志。
 
-	extra, err := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
+	var (
+		extra       *conversationExtraModel
+		version     int64
+		changed     bool
+		queryFailed bool
+	)
+	err := co.withConversationExtraLease(
+		c.Request.Context(),
+		loginUID,
+		req.ChannelID,
+		req.ChannelType,
+		func(lease *conversationExtraLease) error {
+			var queryErr error
+			extra, queryErr = co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
+			if queryErr != nil {
+				queryFailed = true
+				return queryErr
+			}
+			if extra != nil && extra.ManualUnread {
+				return nil
+			}
+
+			var versionErr error
+			version, versionErr = co.nextConversationExtraVersionLocked(loginUID)
+			if versionErr != nil {
+				return versionErr
+			}
+			if renewErr := lease.Renew(c.Request.Context()); renewErr != nil {
+				return renewErr
+			}
+			var storeErr error
+			changed, storeErr = co.conversationExtraDB.setManualUnread(
+				loginUID,
+				req.ChannelID,
+				req.ChannelType,
+				version,
+			)
+			if storeErr != nil {
+				return storeErr
+			}
+			if !changed {
+				return errConversationExtraVersion
+			}
+			return nil
+		},
+	)
 	if err != nil {
-		co.Error("查询会话扩展失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		co.Error("设置会话手动未读状态失败！",
+			zap.Error(err),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType),
+		)
+		if queryFailed {
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		} else {
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		}
 		return
 	}
 
-	if extra != nil && extra.ManualUnread {
+	if !changed {
 		c.Response(setManualUnreadResp{
 			ChannelID:    req.ChannelID,
 			ChannelType:  req.ChannelType,
@@ -1928,27 +2036,20 @@ func (co *Conversation) setManualUnread(c *wkhttp.Context) {
 		return
 	}
 
-	version, err := co.ctx.GenSeq(common.SyncConversationExtraKey)
-	if err != nil {
-		co.Error("生成会话扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	if err := co.conversationExtraDB.setManualUnread(loginUID, req.ChannelID, req.ChannelType, version); err != nil {
-		co.Error("设置会话手动未读状态失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-
 	if err := co.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		CMD:         common.CMDSyncConversationExtra,
 	}); err != nil {
-		co.Error("发送同步会话扩展命令失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
-		return
+		// The marker and version are already committed. This CMD is only a
+		// transient notification, so a delivery failure must not turn the
+		// successful state transition into a retryable HTTP error.
+		co.Error("发送同步会话扩展命令失败！",
+			zap.Error(err),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType),
+		)
 	}
 
 	c.Response(setManualUnreadResp{
@@ -1983,13 +2084,66 @@ func (co *Conversation) clearManualUnread(c *wkhttp.Context) {
 	}
 	// 不做当前成员校验，避免用户离开群或子区后无法清理自己的遗留状态。
 
-	extra, err := co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
+	var (
+		extra       *conversationExtraModel
+		version     int64
+		changed     bool
+		queryFailed bool
+	)
+	err := co.withConversationExtraLease(
+		c.Request.Context(),
+		loginUID,
+		req.ChannelID,
+		req.ChannelType,
+		func(lease *conversationExtraLease) error {
+			var queryErr error
+			extra, queryErr = co.conversationExtraDB.queryOne(loginUID, req.ChannelID, req.ChannelType)
+			if queryErr != nil {
+				queryFailed = true
+				return queryErr
+			}
+			if extra == nil || !extra.ManualUnread {
+				return nil
+			}
+
+			var versionErr error
+			version, versionErr = co.nextConversationExtraVersionLocked(loginUID)
+			if versionErr != nil {
+				return versionErr
+			}
+			if renewErr := lease.Renew(c.Request.Context()); renewErr != nil {
+				return renewErr
+			}
+			var storeErr error
+			changed, storeErr = co.conversationExtraDB.clearManualUnread(
+				loginUID,
+				req.ChannelID,
+				req.ChannelType,
+				version,
+			)
+			if storeErr != nil {
+				return storeErr
+			}
+			if !changed {
+				return errConversationExtraVersion
+			}
+			return nil
+		},
+	)
 	if err != nil {
-		co.Error("查询会话手动未读状态失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		co.Error("清除会话手动未读状态失败！",
+			zap.Error(err),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType),
+		)
+		if queryFailed {
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		} else {
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		}
 		return
 	}
-	if extra == nil || !extra.ManualUnread {
+	if !changed {
 		c.Response(clearManualUnreadResp{
 			ChannelID:    req.ChannelID,
 			ChannelType:  req.ChannelType,
@@ -1999,27 +2153,19 @@ func (co *Conversation) clearManualUnread(c *wkhttp.Context) {
 		return
 	}
 
-	version, err := co.ctx.GenSeq(common.SyncConversationExtraKey)
-	if err != nil {
-		co.Error("生成会话扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-	if err := co.conversationExtraDB.clearManualUnread(loginUID, req.ChannelID, req.ChannelType, version); err != nil {
-		co.Error("清除会话手动未读状态失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
-	}
-
 	if err := co.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		CMD:         common.CMDSyncConversationExtra,
 	}); err != nil {
-		co.Error("发送同步会话扩展命令失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
-		return
+		// The marker and version are already committed. Keep notification
+		// delivery best-effort for the same reason as setManualUnread.
+		co.Error("发送同步会话扩展命令失败！",
+			zap.Error(err),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType),
+		)
 	}
 
 	c.Response(clearManualUnreadResp{

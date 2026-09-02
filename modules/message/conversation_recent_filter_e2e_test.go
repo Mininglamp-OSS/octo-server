@@ -57,6 +57,7 @@ var (
 	fakeIMSrv       *httptest.Server
 	fakeIMConvs     []*config.SyncUserConversationResp
 	fakeIMCMDs      []string
+	fakeIMFailCMD   string
 	fakeIMSyncCalls int
 )
 
@@ -73,13 +74,19 @@ func sharedFakeIM() *httptest.Server {
 				var req struct {
 					Payload []byte `json:"payload"`
 				}
+				cmd := ""
 				if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
 					var payload struct {
 						CMD string `json:"cmd"`
 					}
 					if err := json.Unmarshal(req.Payload, &payload); err == nil && payload.CMD != "" {
+						cmd = payload.CMD
 						fakeIMCMDs = append(fakeIMCMDs, payload.CMD)
 					}
+				}
+				if cmd == fakeIMFailCMD {
+					http.Error(w, "injected command failure", http.StatusServiceUnavailable)
+					return
 				}
 				_, _ = w.Write([]byte(`{"data":{}}`))
 				return
@@ -131,6 +138,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	// before any NewTestServer so the very first ctx already sees the live URL.
 	fakeIMConvs = convs
 	fakeIMCMDs = nil
+	fakeIMFailCMD = ""
 	fakeIMSyncCalls = 0
 	imURL := sharedFakeIM().URL
 
@@ -152,6 +160,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	// not cleared by CleanAllTables).
 	_ = ctx.GetRedisConn().Del("ratelimit:uid:" + testutil.UID)
 	_ = ctx.GetRedisConn().Del("userMaxVersion:" + testutil.UID)
+	_ = ctx.GetRedisConn().Del(conversationExtraLockKey(testutil.UID))
 
 	// Start from a known settings snapshot (the singleton may hold sidebar.* rows
 	// from a prior test within the ~60s auto-reload TTL).

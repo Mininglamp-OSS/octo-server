@@ -20,12 +20,16 @@ CommunityTopic conversations:
   manual-unread marker;
 - `PUT /v1/conversation/clearManualUnread` clears that marker as a dedicated
   fallback in the frontend's conversation-open flow;
-- the existing `PUT /v1/conversation/clearUnread` clears the marker whenever it
-  successfully updates a Group or CommunityTopic unread state;
+- the existing `PUT /v1/conversation/clearUnread` preserves its real-unread
+  clear and broadcast contract, then best-effort clears the marker for Group
+  and CommunityTopic conversations;
 - conversation synchronization and Sidebar responses expose the marker to
   clients;
-- every persisted marker change advances the conversation-extra version and
-  notifies the user's online clients with `CMDSyncConversationExtra`.
+- persisted marker changes advance the conversation-extra version and attempt
+  to notify the user's online clients with `CMDSyncConversationExtra`.
+- every production path that writes `conversation_extra` participates in one
+  UID-scoped Redis lease so the user's shared extension cursor advances in
+  commit order.
 
 The marker is stored in `conversation_extra.manual_unread` under the current
 user's exact `(uid, channel_id, channel_type)` row. It is a display state that
@@ -48,8 +52,10 @@ The frontend may enter a conversation whose initial message sync returns no
 messages and consequently may not use its existing `clearUnread` path. In that
 case, `clearManualUnread` completes the conversation-open flow by clearing the
 display marker while preserving the real unread state. When the existing
-`clearUnread` path is used, that endpoint performs both updates and the
-frontend avoids a second clear request.
+`clearUnread` path is used, that endpoint first completes the real-unread clear
+and legacy broadcast, then best-effort clears the marker so conversation-extra
+availability cannot regress the existing contract. The frontend avoids a
+second clear request when that path is used.
 
 Conversation-extra versioning is the multi-device synchronization source of
 truth. The CMD is a transient change notification; clients fetch the updated
@@ -82,12 +88,26 @@ multi-client compatibility decision, not a bug.
   maintain independent markers without parent aggregation, and the same row
   remains available for stale-state cleanup after the user leaves a group or
   topic.
-- Every successful Group or CommunityTopic `clearUnread` request clears an
-  existing manual marker for both `unread=0` and `unread>0`. Person
+- After WuKongIM accepts a `clearUnread` request, the handler sends the legacy
+  `CMDConversationUnreadClear` broadcast before accessing conversation-extra.
+  Group and CommunityTopic marker cleanup for both `unread=0` and `unread>0`
+  is best-effort after that broadcast; query, version, store, and extension-CMD
+  failures are logged and cannot change the completed core response. Person
   `clearUnread` retains its existing real-unread behavior.
 - A marker write and its new conversation-extra version are committed before
-  `CMDSyncConversationExtra` is sent to the user's Person channel with
-  `NoPersist=true`.
+  the service attempts `CMDSyncConversationExtra` on the user's Person channel
+  with `NoPersist=true`. Notification delivery is best-effort: a failure is
+  logged and does not replace the committed success result with an HTTP error.
+- The ordinary extension update, dedicated set/clear endpoints, and
+  `clearUnread` marker cleanup all acquire the same UID-scoped Redis lock. Each
+  lease has a request-unique UUID owner and a 10-second TTL; ownership is
+  compare-renewed immediately before the database write and compare-deleted on
+  release. CMD delivery occurs only after release.
+- Version allocation under the lease compares the existing per-user database
+  high-water mark with `GenSeq`, and every database update accepts only a
+  strictly newer version. Conditional UPSERT/UPDATE results determine whether
+  a state transition actually occurred, so an expired stale owner cannot move
+  an existing row's version backwards.
 - Ordinary conversation-extra updates atomically preserve
   `manual_unread`; the dedicated endpoints and the Group/CommunityTopic
   `clearUnread` integration own marker state transitions.
@@ -140,9 +160,11 @@ multi-client compatibility decision, not a bug.
 - `setManualUnread` and `clearManualUnread` update only the authenticated
   user's exact row, including when the caller is no longer a member of the
   requested group or topic.
-- Group and CommunityTopic `clearUnread` clears manual-unread for both
-  `unread=0` and `unread>0`; Person `clearUnread` leaves legacy manual rows
-  untouched.
+- Group and CommunityTopic `clearUnread` attempts to clear manual-unread for
+  both `unread=0` and `unread>0` after the real-unread clear and legacy CMD;
+  any supplementary cleanup failure is logged without suppressing the legacy
+  broadcast or changing the core success response. Person `clearUnread` leaves
+  legacy manual rows untouched.
 - Ordinary draft and read-position extension updates preserve a concurrently
   stored manual marker.
 - Manual markers annotate eligible Sidebar entries but do not independently
@@ -150,7 +172,17 @@ multi-client compatibility decision, not a bug.
   configured Recent window. An out-of-window manually unread conversation
   remaining hidden during a mixed Web/Android/iOS rollout is expected behavior,
   not a defect.
-- Every successful marker change is visible through extension-version sync and
-  sends `CMDSyncConversationExtra` to the user's online clients.
+- Dedicated marker changes remain visible through extension-version sync and
+  attempt `CMDSyncConversationExtra` as a best-effort notification. A CMD
+  failure after commit is logged while the endpoint still returns the changed
+  state and version. The `clearUnread` integration applies the same policy to
+  its supplementary marker notification after the legacy broadcast.
+- Two concurrent first-time `setManualUnread` requests are serialized: exactly
+  one returns `changed=true`; the other observes the committed marker and
+  returns the idempotent `changed=false` result.
+- Redis lock tests prove the owner is a UUID, the lease has a positive TTL,
+  compare-renew rejects a replaced owner, and an expired owner cannot delete a
+  successor's lock. Database tests prove stale set, clear, and ordinary-extra
+  writes cannot replace a newer stored version.
 - Formatting, package compilation, focused regression tests, and
   `git diff --check` pass.
