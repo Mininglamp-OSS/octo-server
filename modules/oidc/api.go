@@ -105,8 +105,15 @@ type OIDC struct {
 	authcode   authcodeWriter
 	audit      auditWriter
 	killer     sessionKiller
-	revoker    rtRevoker
-	tokenKill  currentTokenInvalidator
+
+	// exchangeLimiterClients 端点限流用的 Redis client。
+	//
+	// routeAt 每个 path id 调一次(Route 会用配置 ID 与 legacy ID 各调一次),
+	// 所以这里会有多个。必须登记以便 Close() 释放 —— 本模块其他所有 client
+	// 都是这么处理的,漏掉它们等于每次装路由泄漏一个连接池。
+	exchangeLimiterClients []interface{ Close() error }
+	revoker                rtRevoker
+	tokenKill              currentTokenInvalidator
 	// idTokens 缓存登录时验签过的 id_token,供 logout 当 RP-Initiated Logout 的
 	// id_token_hint。nil 时 logout 不生成 end_session_url(降级为仅清本地)。
 	idTokens idTokenStore
@@ -282,6 +289,14 @@ func New(ctx *config.Context) *OIDC {
 	// 测试/生产隔离。也不允许运维自由指定 —— 这个值一旦上线不可改,给 open string
 	// 就是给误配留口子。
 	if sec := strings.TrimSpace(getString("OCTO_OIDC_BEARER_JWT_SECRET", "")); sec != "" {
+		// 密钥强度是准入条件,不是调优项:持有它就能为任意 userId 签一张能换
+		// 会话的 token。不达标时**不开启端点**并打 Error —— 与 RT key 在
+		// LoadConfig 里直接拒绝启动同一个态度,只是这里的功能是可选的,
+		// 所以降级为"该端点不可用"而不是整进程起不来。
+		if serr := validateBearerJWTSecret([]byte(sec)); serr != nil {
+			o.Error("bearer JWT secret rejected, disabling /exchange-jwt", zap.Error(serr))
+			return o
+		}
 		iss, ierr := bearerJWTIssuerFromUpstream(cfg.Provider.Issuer)
 		if ierr != nil {
 			o.Error("bearer JWT config invalid, disabling /exchange-jwt", zap.Error(ierr))
@@ -413,6 +428,7 @@ func (o *OIDC) routeAt(r *wkhttp.WKHttp, pathID string) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
 	})
+	o.trackExchangeLimiterClient(exIPRedis)
 	exIPLimit := r.StrictIPRateLimitMiddleware(
 		context.Background(), exIPRedis,
 		"oidc_exchange",
@@ -766,7 +782,7 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 			LinkedAt:      time.Now(),
 		}); err != nil {
 			if isDuplicateKeyError(err) {
-				recovered := o.recoverFromIdentityRace(c.Request.Context(), claims, sd, sessResp, issueReq, err)
+				recovered := o.recoverFromIdentityRace(c.Request.Context(), claims, sd, sessResp, issueReq, err, EventCallbackFail)
 				if recovered == nil {
 					result = "identity_insert_fail"
 					// 竞态恢复失败:writeAudit 已在 recover 内部记录,这里只补 ThirdAuthcode "0"
@@ -911,6 +927,9 @@ func (o *OIDC) Close() error {
 		}
 		o.idTokens = nil
 	}
+	if err := o.closeExchangeLimiterClients(); err != nil {
+		o.Error("关闭 OIDC exchange 限流 Redis client 失败", zap.Error(err))
+	}
 	if cti, ok := o.tokenKill.(cacheCurrentTokenInvalidator); ok {
 		if rcd, ok := cti.indexDel.(*redisCompareDeleter); ok {
 			if err := rcd.Close(); err != nil {
@@ -962,6 +981,12 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	kickFailed := false
 	revokeFailed := false
 	tokenFailed := false
+	// 顺序是有意的:device_flag 只存在于 session 缓存的 payload 里,而下面的
+	// InvalidateCurrentToken 会把那条记录删掉/吊销。先读后删,否则 known 恒为
+	// false,"登出仅当前端"就永久退化成"踢全部"——而且退化是静默的,
+	// 功能看起来在工作(登出成功、返 200),只是范围错了。
+	deviceFlag, deviceKnown := o.deviceFlagFromRequest(c.Request.Context(), c.GetHeader("token"))
+
 	if o.tokenKill != nil {
 		// The handler intentionally returns 200 even when cleanup is degraded, so
 		// a client disconnect must not cancel the only HTTP bearer revocation
@@ -977,24 +1002,22 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 		}
 	}
 	if o.killer != nil {
-		// brief Decision 3:登出仅当前端。device_flag 必须从 Redis 缓存里的 decoded
-		// payload 读取,而不是对 raw token 字符串调用 auth.Decode——raw token 是
-		// UUID,不含任何结构化字段(auth.Decode 是用来解 Redis 里缓存的 JSON 编码
-		// payload,见 pkg/auth/session_v3.go:822)。解析失败(老 v1/v2 token、token
-		// 已过期、读缓存失败)一律降级为 df=0 → 踢全部,避免登出变 no-op。
-		df := o.deviceFlagFromRequest(c.Request.Context(), c.GetHeader("token"))
+		// brief Decision 3:登出仅当前端。解不出是哪一端时(v2 session、token
+		// 已过期、读缓存失败)踢全部 —— 宁可多踢,登出的语义底线是"这个凭据
+		// 之后不能再用",做不到精确就必须做保守。
 		kickErr := error(nil)
-		if df == 0 {
-			kickErr = o.killer.Kick(ctx, uid)
+		if deviceKnown {
+			kickErr = o.killer.KickDevice(ctx, uid, deviceFlag)
 		} else {
-			kickErr = o.killer.KickDevice(ctx, uid, df)
+			kickErr = o.killer.Kick(ctx, uid)
 		}
 		if kickErr != nil {
 			kickFailed = true
 			o.Error("OIDC logout 踢线失败",
 				zap.String("trace_id", traceID),
 				zap.Error(kickErr), zap.String("uid", uid),
-				zap.Uint8("device_flag", df))
+				zap.Uint8("device_flag", deviceFlag),
+				zap.Bool("device_flag_known", deviceKnown))
 		}
 	}
 	if o.revoker != nil {
@@ -1130,12 +1153,16 @@ func (o *OIDC) recoverFromIdentityRace(
 	original *IssueSessionResp,
 	origReq IssueSessionReq,
 	insertErr error,
+	// failEvent 由调用方传入。曾经硬编码 EventCallbackFail,而本函数被 callback、
+	// /exchange、/exchange-jwt 三处调用 —— 于是 exchange 的竞态在审计表里显示成
+	// "callback 失败",把排查引向一条请求从未走过的路径。
+	failEvent AuditEvent,
 ) *IssueSessionResp {
 	existing, qerr := o.store.Get(claims.Issuer, claims.Subject)
 	if qerr != nil || existing == nil {
 		o.Error("写 identity 绑定失败且无法定位赢家", zap.Error(insertErr),
 			zap.String("ghost_uid", original.UID))
-		o.writeAudit(original.UID, EventCallbackFail, sd,
+		o.writeAudit(original.UID, failEvent, sd,
 			"insert identity (ghost orphan): "+insertErr.Error())
 		return nil
 	}
@@ -1151,7 +1178,7 @@ func (o *OIDC) recoverFromIdentityRace(
 		o.Error("identity 竞态后赢家会话签发失败", zap.Error(err),
 			zap.String("ghost_uid", original.UID),
 			zap.String("winner_uid", existing.UID))
-		o.writeAudit(original.UID, EventCallbackFail, sd,
+		o.writeAudit(original.UID, failEvent, sd,
 			"race-recover failed; ghost="+original.UID+" winner="+existing.UID+": "+err.Error())
 		return nil
 	}
@@ -1160,7 +1187,7 @@ func (o *OIDC) recoverFromIdentityRace(
 		zap.String("winner_uid", existing.UID),
 		zap.String("issuer", claims.Issuer),
 		zap.String("sub_hash", subHash(claims.Subject)))
-	o.writeAudit(original.UID, EventCallbackFail, sd,
+	o.writeAudit(original.UID, failEvent, sd,
 		"identity race ghost="+original.UID+" winner="+existing.UID)
 	return winnerSess
 }
@@ -1394,46 +1421,54 @@ func (k ctxKiller) KickDevice(_ context.Context, uid string, deviceFlag uint8) e
 	return k.ctx.QuitUserDevice(uid, int(deviceFlag))
 }
 
-// deviceFlagFromToken 解析当前请求 token 里的 device_flag;解析失败返 0(兜底
-// 踢全部,避免登出在边缘场景变 no-op)。
+// deviceFlagFromRequest 从当前登录请求的 token 解析出它属于哪一端。
 //
-// 直接用包级 auth.Decode 反序列化 token payload,不需要 Redis —— token 能走到
-// logout handler 说明已被 AuthMiddleware 校验过是合法 session,Decode 不会再
-// 做签名校验,只是从 payload JSON 里读出 device_flag 字段。
-// deviceFlagFromRequest 从当前登录请求的 token 里解析 device_flag。
+// 返回 (flag, known)。**不能用 flag==0 表示失败** —— `config.APP` 就是 0
+// (config/msg.go 里 `APP DeviceFlag = iota`),所以 0 是一个完全合法的端。
+// 把它兼作哨兵会让每个 APP 用户的登出都退化成"踢全部设备",而这恰恰是
+// brief Decision 3 要避免的。known=false 才是"解不出来",由调用方决定兜底。
 //
-// 关键实现约束:raw token 本身是 UUID(auth.GenerUUID),不是可 decode 的 JSON
-// payload——之前的 deviceFlagFromToken 直接对 raw token 调 auth.Decode 会稳定
-// 失败并返回 0,导致 "仅踢当前设备" 完全退化为 "踢全部"(Kick(uid,-1)),
-// 违反 brief Decision 3。正确做法是先从 Redis 读出 token 对应的缓存 payload
-// (key = TokenCachePrefix + token),再 Decode 那个 payload 拿 DeviceFlag。
+// 实现约束:raw token 是 UUID(auth.GenerUUID),不含任何结构化字段,对它调
+// auth.Decode 必然失败。device_flag 只存在于 session 缓存里的 payload,所以要
+// 先按 key = TokenCachePrefix + token 读出 payload 再 Decode。
 //
-// 任何环节失败(token 空/Store 未就绪/Redis 读失败/Decode 失败/flag 越界)
-// 都返回 0,调用方按"踢全部"兜底。
-func (o *OIDC) deviceFlagFromRequest(ctx context.Context, token string) uint8 {
+// **调用时机是这个函数的一部分契约**:必须在 InvalidateCurrentToken 之前调用。
+// 那个方法会删除/吊销 token 记录(RedisSessionStore 走 RevokeCurrent 或
+// DeleteToken,cacheCurrentTokenInvalidator 走 cache.Delete),记录一旦没了
+// 这里就永远 known=false。
+//
+// 任何环节失败(token 空 / store 未就绪 / 不是 TokenRecordReader / 读失败 /
+// payload 空 / Decode 失败 / flag 越界)都返回 known=false。
+func (o *OIDC) deviceFlagFromRequest(ctx context.Context, token string) (uint8, bool) {
 	token = strings.TrimSpace(token)
 	if token == "" || o.tokenKill == nil {
-		return 0
+		return 0, false
 	}
 	// TokenRecordReader 是 pkg/auth 暴露的公开接口;生产里 o.tokenKill 是
-	// *auth.RedisSessionStore,它实现了这个接口。断言失败(测试桩/其他实现)按
-	// 失败处理,返回 0 → 踢全部。
+	// *auth.RedisSessionStore,它实现了这个接口。断言失败(测试桩/其他实现)
+	// 按解析失败处理。
 	reader, ok := o.tokenKill.(auth.TokenRecordReader)
 	if !ok {
-		return 0
+		return 0, false
 	}
 	rec, err := reader.ReadToken(ctx, o.tokenCachePrefix()+token)
 	if err != nil || strings.TrimSpace(rec.Payload) == "" {
-		return 0
+		return 0, false
 	}
 	info, err := auth.Decode(rec.Payload)
 	if err != nil {
-		return 0
+		return 0, false
+	}
+	// v2 payload 不含 device_flag,Decode 后是零值 —— 与"APP 端"无法区分。
+	// 这是 v2 编码的固有限制(见 auth.Encode 只序列化 uid/name),不是本函数
+	// 能补的信息,所以 v2 session 下按解析失败处理并踢全部端。
+	if !info.IsV3() {
+		return 0, false
 	}
 	if info.DeviceFlag < 0 || info.DeviceFlag > 255 {
-		return 0
+		return 0, false
 	}
-	return uint8(info.DeviceFlag)
+	return uint8(info.DeviceFlag), true
 }
 
 type cacheCurrentTokenInvalidator struct {
@@ -1568,4 +1603,30 @@ func (o *OIDC) tokenCachePrefix() string {
 		return p
 	}
 	return def
+}
+
+// trackExchangeLimiterClient 登记一个端点限流 Redis client 以便 Close() 释放。
+//
+// nil 也登记:测试用 nil 驱动生命周期逻辑,而 closeExchangeLimiterClients 会跳过
+// 它们。真实调用点永远传非 nil。
+func (o *OIDC) trackExchangeLimiterClient(c interface{ Close() error }) {
+	o.exchangeLimiterClients = append(o.exchangeLimiterClients, c)
+}
+
+// closeExchangeLimiterClients 释放全部端点限流 client 并清空登记。
+//
+// 清空是为了幂等:Close() 可能被调用多次(测试、优雅退出重入),二次关闭一个
+// 已关闭的 redis client 会返回错误并污染关停日志。
+func (o *OIDC) closeExchangeLimiterClients() error {
+	var firstErr error
+	for _, c := range o.exchangeLimiterClients {
+		if c == nil {
+			continue
+		}
+		if err := c.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	o.exchangeLimiterClients = nil
+	return firstErr
 }

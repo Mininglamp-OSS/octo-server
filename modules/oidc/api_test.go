@@ -49,6 +49,19 @@ func (f *fakeAudit) events() []AuditEvent {
 	return out
 }
 
+// uidForEvent 返回某个事件被记账到哪个 uid 上。竞态测试要确认审计跟着赢家走,
+// 而不是把成功记在 ghost 账号头上。
+func (f *fakeAudit) uidForEvent(event AuditEvent) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, entry := range f.entries {
+		if entry.Event == event {
+			return entry.UID, true
+		}
+	}
+	return "", false
+}
+
 func (f *fakeAudit) ipForEvent(event AuditEvent) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

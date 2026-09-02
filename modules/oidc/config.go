@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 )
 
 // providerIDRe 限定 provider ID 只能用 URL-safe 的小写字母+数字+'-'/'_'。
@@ -258,93 +260,58 @@ func loadProvider() (ProviderConfig, error) {
 func applyKindConstraints(p *ProviderConfig) error {
 	switch p.Kind {
 	case KindOIDC:
-		// 标准路线:现有语义完全不变。
-		// BaseURL / AppID 在这个 kind 下无意义,不校验也不使用。
-		return nil
+		// 标准路线:配置形状不变。拒绝决定交给 oidcboot ——
+		// 它会挡住那些"配了但在这个 kind 下不会生效"的键。
+		return kindRefusal(p)
 
 	case KindOAuth2:
 		// BaseURL 回落 Issuer:该 kind 下 Issuer 的语义是"身份命名空间",
 		// 而多数部署里它同时就是站点根,所以可以兼作缺省值。
+		// 回落必须在校验之前 —— 规则看的是最终会被使用的值。
 		if p.BaseURL == "" {
 			p.BaseURL = p.Issuer
 		}
-		if err := validateUpstreamBaseURL(p.BaseURL); err != nil {
+		if err := kindRefusal(p); err != nil {
 			return err
 		}
+
+		// 以下是配置**收窄**(不是拒绝),留在本模块:
 
 		// 该 IdP 的 authorize 端点只认 scope=read。运维照抄 OIDC 的 scope 列表
 		// 会被上游直接拒,所以在这里收窄而不是原样透传。
 		p.Scopes = []string{"read"}
 
-		// 协议里没有 code_challenge 参数。RequirePKCE 目前是死配置
-		// (加载后全仓无读点),抽象后由 ProviderCapabilities 消费。
+		// 协议里没有 code_challenge 参数。抽象后由 ProviderCapabilities 消费。
 		p.RequirePKCE = false
 
 		// 该 IdP 返回 refresh_token,但文档从未给出刷新端点。留非零间隔只会让
 		// sync worker 空转,并让运维误以为"IdP 侧封号 → 我方踢线"在工作。
 		p.SyncInterval = 0
-
-		// 登出端点由 app id 拼路径得出,这个 override 语义不成立。
-		if p.EndSessionURL != "" {
-			return fmt.Errorf("oidc: OCTO_OIDC_PROVIDER_END_SESSION_URL is not applicable to "+
-				"provider kind %q (its logout endpoint is derived from OCTO_OIDC_PROVIDER_APP_ID); "+
-				"unset it to avoid a silently ineffective override", p.Kind)
-		}
-
-		// app id 直接拼进 URL 路径段,误配 "../x" 会让请求落到别的端点上。
-		// 启动期用白名单挡住,而不是等运行期拼 URL 时才发现。
-		if p.AppID != "" && !upstreamAppIDRe.MatchString(p.AppID) {
-			return fmt.Errorf("oidc: OCTO_OIDC_PROVIDER_APP_ID %q invalid: must match %s",
-				p.AppID, upstreamAppIDRe)
-		}
-		// 配了回跳地址却没有 app id 时,登出 URL 根本拼不出来,会静默降级成
-		// "仅清本地" —— 运维完全不知道。启动期报出来。
-		if p.PostLogoutRedirectURI != "" && p.AppID == "" {
-			return fmt.Errorf("oidc: OCTO_OIDC_POST_LOGOUT_REDIRECT_URI is set but "+
-				"OCTO_OIDC_PROVIDER_APP_ID is empty: provider kind %q builds its logout URL as "+
-				"{base}/%s/{appId}, so without an app id logout would silently degrade to "+
-				"clearing the local session only", p.Kind, upstreamLogoutPathPrefix)
-		}
 		return nil
 
 	default:
-		// 拼写错误不能静默回落到 oidc:那会让一个本该跑 oauth2 的部署
-		// 去做 Discovery,然后在启动期以一个完全无关的错误失败。
-		return fmt.Errorf("oidc: unknown OCTO_OIDC_PROVIDER_KIND %q (supported: %q, %q)",
-			p.Kind, KindOIDC, KindOAuth2)
+		return kindRefusal(p)
 	}
 }
 
-// validateUpstreamBaseURL 校验上游站点根为绝对 http(s) 地址。
+// kindRefusal 把"这份配置能不能起来"的判断委托给 pkg/oidcboot。
 //
-// 默认强制 https。这个值同时用于:
-//   - authorize 跳转(进浏览器地址栏,明文则 state/code 可被窃听)
-//   - token 与 userinfo 调用(明文则 client_secret / access_token 明文过网)
-//
-// 对方的预发环境文档写的是 http,所以留一个**独立**的逃生阀,而不是复用
-// OCTO_OIDC_LOGOUT_ALLOW_INSECURE —— 混用会让"为预发登出放宽"顺带把生产的
-// token 端点也放开。开启它等于接受凭据明文传输,仅限隔离的测试环境。
-func validateUpstreamBaseURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("oidc: invalid upstream base URL %q: %w", raw, err)
-	}
-	if !u.IsAbs() || u.Host == "" {
-		return fmt.Errorf("oidc: upstream base URL %q must be absolute (scheme://host/path)", raw)
-	}
-	switch u.Scheme {
-	case "https":
-		return nil
-	case "http":
-		if getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false) {
-			return nil
-		}
-		return fmt.Errorf("oidc: upstream base URL %q must use https "+
-			"(it carries client_secret and access_token; set "+
-			"OCTO_OIDC_ALLOW_INSECURE_UPSTREAM=1 only for an isolated test environment)", raw)
-	default:
-		return fmt.Errorf("oidc: upstream base URL %q has scheme %q, want http(s)", raw, u.Scheme)
-	}
+// 规则放在那个叶子包里而不是这里,是因为 modules/common 的
+// isOIDCFullyConfigured() 需要同一个答案,而它不能 import 本包(本包传递依赖
+// 它)。两边各写一份就是上一版的 bug:5 个新的致命条件只加在了这一侧,
+// 于是一个 KIND 拼写错误会让端点全部 404、同时 login.local_off 仍被采信,
+// SSO-only 部署因此没有任何可用登录方式。
+func kindRefusal(p *ProviderConfig) error {
+	return oidcboot.ValidateKind(oidcboot.KindInput{
+		Kind:                  string(p.Kind),
+		BaseURL:               p.BaseURL,
+		AppID:                 p.AppID,
+		EndSessionURL:         p.EndSessionURL,
+		PostLogoutRedirectURI: p.PostLogoutRedirectURI,
+		AutoLinkByEmail:       p.AutoLinkByEmail,
+		RequireEmailVerified:  p.RequireEmailVerified,
+		AllowInsecureUpstream: getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false),
+	})
 }
 
 // validateLogoutURL 启动期 fail-loud 校验 RP-Initiated Logout 相关 URL 为绝对 https。

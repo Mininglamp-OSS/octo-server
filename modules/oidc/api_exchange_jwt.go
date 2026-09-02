@@ -109,71 +109,18 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	// 转换为协议中立 IdentityClaims,issuer 从配置注入(不来自 token)。
 	ic := claims.toIdentityClaims(o.bearerJWTIssuer)
 
-	res, err := o.service.ResolveOrLink(c.Request.Context(), ic)
-	if err != nil {
-		metricBearerExchangeResult.WithLabelValues("resolve_fail").Inc()
-		o.Warn("OIDC exchange-jwt: resolve failed",
-			zap.String("trace_id", traceID), zap.String("ip", clientIP),
-			zap.String("sub", subHash(ic.Subject)), zap.Error(err))
-		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-		return
-	}
-
-	// bearer JWT 不携带 email/phone,直接按空值处理(extractZone/extractPhone 对空串返回空)。
-	issueReq := IssueSessionReq{
-		UID:              res.UID,
-		CreateUser:       res.IsNew,
-		Name:             ic.Name,
-		DeviceFlag:       deviceFlag,
-		PublicIP:         clientIP,
-		TrustedSSOCreate: res.IsNew,
-	}
-	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
-	if err != nil {
-		metricBearerExchangeResult.WithLabelValues("issue_fail").Inc()
-		o.Error("OIDC exchange-jwt: issue session failed",
-			zap.String("trace_id", traceID), zap.String("ip", clientIP),
-			zap.String("sub", subHash(ic.Subject)), zap.Error(err))
-		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-		return
-	}
-
-	if res.IsNew && sessResp.UID != "" {
-		if err := o.store.Insert(&IdentityModel{
-			UID:           sessResp.UID,
-			Issuer:        ic.Issuer,
-			Subject:       ic.Subject,
-			Email:         ic.Email,
-			EmailVerified: boolToInt(ic.EmailVerified),
-			Phone:         ic.PhoneNumber,
-			PhoneVerified: boolToInt(ic.PhoneVerified),
-			LinkedAt:      time.Now(),
-		}); err != nil {
-			if isDuplicateKeyError(err) {
-				if recovered := o.recoverFromIdentityRace(c.Request.Context(), ic, sd, sessResp, issueReq, err); recovered == nil {
-					metricBearerExchangeResult.WithLabelValues("identity_insert_fail").Inc()
-					o.writeAudit(sessResp.UID, EventBearerExchangeFail, sd, "identity insert race unrecovered")
-					httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-					return
-				}
-				metricBearerExchangeResult.WithLabelValues("race_recovered").Inc()
-			} else {
-				metricBearerExchangeResult.WithLabelValues("identity_insert_fail").Inc()
-				o.Error("OIDC exchange-jwt: insert identity failed",
-					zap.String("trace_id", traceID), zap.Error(err))
-				httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-				return
-			}
-		}
-	}
-
-	// audit 用 domainAccount(人类可读)便于对账,不用 userId(数字串无意义)。
-	o.writeAudit(sessResp.UID, EventBearerExchangeOK, sd, claims.DomainAccount)
-	metricBearerExchangeResult.WithLabelValues("ok").Inc()
-
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status":     "ok",
-		"uid":        sessResp.UID,
-		"login_resp": sessResp.LoginRespJSON,
+	o.completeExchange(c, verifiedIdentity{
+		claims:     ic,
+		deviceFlag: deviceFlag,
+		clientIP:   clientIP,
+		traceID:    traceID,
+		state:      sd,
+		// domainAccount 人类可读,便于与上游对账;userId 是数字串,对账时无用。
+		auditDetail: claims.DomainAccount,
+	}, exchangeFlavour{
+		logName:   "exchange-jwt",
+		result:    metricBearerExchangeResult,
+		eventOK:   EventBearerExchangeOK,
+		eventFail: EventBearerExchangeFail,
 	})
 }

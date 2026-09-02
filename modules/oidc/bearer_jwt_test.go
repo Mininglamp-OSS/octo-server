@@ -158,6 +158,7 @@ func TestBearerJWT_ToIdentityClaims(t *testing.T) {
 	tok := signBearerToken(t, bearerJWTTestSecret, map[string]interface{}{
 		"userId":        float64(synthUserID),
 		"domainAccount": synthName,
+		"iat":           float64(now.Add(-1 * time.Minute).Unix()),
 		"exp":           float64(now.Add(time.Hour).Unix()),
 	})
 	claims, err := verifyBearerJWT(tok, []byte(bearerJWTTestSecret), now)

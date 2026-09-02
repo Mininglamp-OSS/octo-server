@@ -97,10 +97,13 @@ func postBearerExchange(o *OIDC, body string) *httptest.ResponseRecorder {
 // 这里可能需要注入坏字段),直接用与 jwt_hs256_test.go 同样的 HS256 签名原语。
 func signBearerTesting(t *testing.T, secret []byte, userId int64, domainAccount string, exp time.Time) string {
 	t.Helper()
+	// iat 是**签发时刻**,不是从 exp 倒推的。上游的 exp 约为签发后 15 天,
+	// 早先这里用 exp-15d 反推 iat,等于造出一张"15 天前签发"的 token ——
+	// 那是被 bearerJWTMaxAge 正确拒绝的重放形态,不是新登录的形态。
 	claims := map[string]any{
 		"userId":        userId,
 		"domainAccount": domainAccount,
-		"iat":           exp.Add(-15 * 24 * time.Hour).Unix(),
+		"iat":           time.Now().Add(-1 * time.Minute).Unix(),
 		"exp":           exp.Unix(),
 	}
 	// 借用 jwt_hs256_test.go 里的 signJWT(同包测试可见):header 固定 HS256+JWT。

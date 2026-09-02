@@ -119,8 +119,17 @@ Key properties:
   upstream issuer, an already-suffixed value, and anything that would exceed the
   255-byte `issuer` column (silent MySQL truncation could otherwise merge two
   issuers, and with them two people, under `uk_issuer_subject`).
-- The JWT carries **no verified email / phone claims**, so autolink remains
-  fail-closed on this path by construction.
+- The JWT carries **no verified email / phone claims**, so autolink is fail-closed
+  on this path — and, since the boot-time refusal, structurally so rather than by
+  default value.
+
+  An earlier version of this line claimed "by construction" while it was only true
+  by policy: `service.go` evaluates `!RequireEmailVerified || claims.EmailVerified`,
+  so with `RequireEmailVerified=false` the verified flag is never consulted and an
+  unverified address becomes an account-linking key. The safe default was the only
+  thing holding it — one configmap edit away from open. `pkg/oidcboot` now refuses
+  that combination for the kind whose provider structurally cannot assert
+  verification, which is what makes the original wording true.
 
 ### Where the protocol coupling actually lives
 
@@ -173,16 +182,34 @@ implementations are not forced to stub them out.
    session globally; other devices keep existing tokens but must re-auth on the
    next SSO round trip.
 
-4. **Employee-number recycling is out of scope.** `subject` is the IdP's internal
-   directory id, not the employee number; a rejoiner with a recycled number
-   arrives with a new `subject` and becomes a new account.
+4. **Employee-number recycling is fenced, not assumed away.** An earlier version of
+   this decision stated as settled fact that `subject` is the IdP's internal
+   directory id rather than the employee number. It is not settled: the vendor's
+   userinfo field table calls it a sub-number with an 18-digit example, the
+   quick-start demo comment calls it the employee number, and no live response has
+   ever been captured. The guard in `subject_shape.go` was built for exactly that
+   contradiction, so the brief cannot also assert it away.
+
+   The reading matters because employee numbers are reused between leavers and
+   joiners: under the second reading a new hire matches a former employee's
+   identity row and logs into their account. A purely numeric subject shorter than
+   ten digits is therefore refused at the trust boundary, before any row is
+   written — which converts an irreversible data problem into a recoverable
+   failure, and answers the question at first login instead of requiring the
+   capture up front.
 
 5. **Two exchange endpoints share the post-validation tail.** The ResolveOrLink
-   → IssueSession → identity-insert-with-race-recovery → writeAudit sequence is
-   **not** duplicated across `/exchange` and `/exchange-jwt` handlers — a
-   reviewer-requested refactor (see Changes Applied) extracted it into a single
-   path via a `verifiedIdentity` struct, eliminating the ~65 lines of duplicated
-   safety-critical logic.
+   → IssueSession → identity-insert-with-race-recovery → writeAudit sequence
+   lives in exactly one place, `completeExchange` in
+   `modules/oidc/exchange_complete.go`, taking a `verifiedIdentity` plus an
+   `exchangeFlavour` that carries the only real differences (metric family,
+   audit event pair, log name).
+
+   This decision was recorded as settled before the refactor actually landed,
+   and the gap was not harmless: while the tail was duplicated, the race-recovery
+   defect existed in **both** copies and the phone-number masking fix reached
+   only one of them. Those are the same class of bug the shared tail exists to
+   prevent, so the ordering — claim first, extract later — is itself the lesson.
 
 ## Load-bearing list
 
@@ -286,7 +313,17 @@ implementations are not forced to stub them out.
 - Logout scoped to the calling device: `deviceFlagFromRequest` reads the flag
   from the Redis-cached token payload (not the raw UUID), and routes to
   `QuitUserDevice(uid, flag)` when non-zero, with a zero fallback to
-  `killer.Kick` (all devices). Tested against the real CacheTokenParser path.
+  `killer.Kick` (all devices).
+
+  Two corrections to an earlier version of this line. It claimed the behaviour
+  was tested against the real `CacheTokenParser` path; no test went near that
+  path, and the test double did not model the production store at all — it never
+  deleted the record it was asked to invalidate, so it passed against behaviour
+  production cannot produce. And the behaviour itself did not hold: the device
+  flag was read *after* `InvalidateCurrentToken` had already removed the record
+  it is read from, so every production logout fell through to kicking all
+  devices. Both are fixed; the double now deletes on invalidate and returns
+  pkg/auth's miss semantics (`TTL:-2`, nil error).
 - Logout returns a non-empty upstream logout URL for the plain-OAuth2 provider
   with the app id in the path segment and the operator-pinned redirect target
   as the query parameter — and the URL contains no credential so it is safe to
@@ -504,6 +541,85 @@ implementations are not forced to stub them out.
   failure writing nothing. The authorize URL is also asserted to carry *no*
   `nonce` / `code_challenge` (this upstream rejects unknown parameters) and
   `scope=read`.
+
+### Review round 2 — six blocking defects and four spec deviations
+
+An external review at head `dce3b6e0` found six P1 defects and four places where
+this brief or the PR body asserted properties the code did not have. Every finding
+was re-derived from the source before being acted on; all ten held.
+
+- **P1-1 / P1-2 — per-device logout never worked in production, twice over.**
+  The device flag was read *after* `InvalidateCurrentToken`, which deletes the very
+  record it is read from, so the lookup always missed. And `0` was used as the
+  "unresolved" sentinel while `config.APP` *is* 0, so even with the ordering fixed
+  every APP logout would still have kicked every device. Resolution now happens
+  before invalidation and returns `(flag, known)`.
+
+  The reason the first round's tests did not catch this is the more useful finding:
+  the test double recorded the invalidate call without deleting anything, and
+  returned an error on a cache miss where pkg/auth returns `TTL:-2` with a nil
+  error. It passed against behaviour production cannot produce. The double now
+  models both, and reverting the fix makes four cases fail.
+
+- **P1-3 — both exchange endpoints handed back the wrong session.** After a
+  first-login race they checked `recovered != nil` and then kept using the ghost's
+  session, so the client received a token for an account with no identity row and
+  the audit recorded success against it. The callback path had always been correct.
+
+- **P1-4 — the bearer-JWT trust anchor was under-constrained.** Any non-empty
+  secret was accepted, where the same module already requires the refresh-token key
+  to be exactly 32 bytes and refuses boot otherwise; a short HMAC key can be
+  recovered offline from one valid token. And `exp` was the only freshness control,
+  so a captured assertion could mint sessions for its whole ~15-day life, including
+  after logout. Now: a 32-byte floor, a mandatory `iat`, a 10-minute ceiling from
+  `iat`, and 60s of clock skew. Audience binding remains Pending — it needs the
+  upstream to emit a claim.
+
+- **P1-5 — `RequireEmailVerified=false` was an account-takeover primitive under
+  the plain-OAuth2 kind.** That provider structurally cannot assert verification,
+  so the flag turns an unverified upstream address into a permanent binding to
+  whichever existing account holds it. Refused at boot for that kind.
+
+- **P1-6 — a typo in the provider kind could lock every user out.** The five new
+  fatal `LoadConfig` conditions were never mirrored into
+  `modules/common.isOIDCFullyConfigured`, so a bad kind produced 404 on every OIDC
+  endpoint while `login.local_off` was still honoured — an SSO-only deployment with
+  no working login and no recovery short of a redeploy. The warning about exactly
+  this drift was already in the code, written by the same hand that then drifted it.
+
+  Fixed by removing the mirror rather than updating it: the refusal rules now live
+  in `pkg/oidcboot`, a leaf package both sides import, and `oidcboot.RefusedScenarios`
+  pins both sides' tests to one table. Removing the delegation makes all nine
+  scenarios fail on the `modules/common` side, which is how we know the drift was
+  live.
+
+- **P2-3 — the bare-number phone inference stored strangers' numbers.** NANP
+  numbers are `1` + a three-digit area code whose first digit is 2-9, so roughly
+  seven eighths of them are byte-identical to a valid mainland mobile:
+  `13861234567` is both +1 386-123-4567 and a real 138-prefix number. The
+  inference was added on the strength of a documented example that is not itself a
+  valid mainland number, so it never had evidence behind it. Reverted to requiring
+  an explicit country code.
+
+- **P2-2 — `(issuer, subject)` was compared case-insensitively.** The table is
+  `utf8mb4_general_ci`, so two subjects differing only in case fold onto one
+  identity row. Rather than rebuild a unique index on a live table or defeat the
+  index with an inline `COLLATE`, the adapter now re-checks the returned row
+  byte-for-byte and treats a folded hit as absent — which degrades to a loud
+  refusal instead of a silent merge.
+
+- **P2-5 / P2-6 — audit rows from the exchange paths were labelled
+  `EventCallbackFail`** (misdirecting the investigation those rows exist for), and
+  the endpoint rate limiter's Redis clients were never closed while every other
+  client in the module is. Both fixed.
+
+- **Spec deviations.** The brief claimed the de-duplication refactor had landed
+  (it had not, and P1-3 plus the missed phone masking were the duplicate-copy bugs
+  it was meant to prevent); claimed per-device logout was tested against the real
+  session-store path (no test went near it); called autolink fail-closed "by
+  construction" when it was by policy; and asserted `subject` is the internal
+  directory id while `subject_shape.go` treats that as unresolved. All four
+  corrected in place, each with the reason the original wording was wrong.
 
 ## Integration tests written (this PR)
 

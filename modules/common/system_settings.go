@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 	"go.uber.org/zap"
 )
 
@@ -569,7 +570,74 @@ func isOIDCFullyConfigured() bool {
 	if err != nil || len(key) != 32 {
 		return false
 	}
+	// Provider-kind refusals live in pkg/oidcboot so this function and
+	// modules/oidc.LoadConfig cannot disagree.
+	//
+	// They must not disagree because the failure is asymmetric and severe: when
+	// LoadConfig refuses, modules/oidc registers 404 handlers for every endpoint,
+	// so SSO does not work. If this function still answered "configured",
+	// anyThirdPartyLoginConfigured would stay true, login.local_off=1 would be
+	// honoured, and password login would remain off too — leaving an SSO-only
+	// deployment with no working login path and no recovery short of a redeploy.
+	//
+	// This used to be a hand-maintained mirror, and it drifted the moment new
+	// fatal conditions were added on the oidc side. The shared table
+	// oidcboot.RefusedScenarios pins both sides' tests to the same list.
+	if err := oidcboot.ValidateKind(oidcboot.KindInput{
+		Kind:    os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		BaseURL: oidcUpstreamBaseURLFromEnv(),
+		AppID:   os.Getenv("OCTO_OIDC_PROVIDER_APP_ID"),
+
+		EndSessionURL:         os.Getenv("OCTO_OIDC_PROVIDER_END_SESSION_URL"),
+		PostLogoutRedirectURI: os.Getenv("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI"),
+
+		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
+		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),
+
+		AllowInsecureUpstream: oidcEnvBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "", false),
+	}); err != nil {
+		return false
+	}
 	return true
+}
+
+// oidcUpstreamBaseURLFromEnv mirrors the base-URL fallback in
+// modules/oidc.applyKindConstraints: the plain-OAuth2 kind falls back to the
+// issuer when no explicit base URL is set.
+//
+// The fallback has to be applied here too, because the refusal rules are about
+// the value that will actually be used, not the raw variable.
+func oidcUpstreamBaseURLFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv("OCTO_OIDC_PROVIDER_BASE_URL")); v != "" {
+		return v
+	}
+	if os.Getenv("OCTO_OIDC_PROVIDER_KIND") != string(oidcboot.KindOAuth2) {
+		// Under the standard kind an empty base URL is the only valid state, and
+		// substituting the issuer would make it look like one was configured.
+		return ""
+	}
+	if v := strings.TrimSpace(os.Getenv("DM_OIDC_PROVIDER_ISSUER")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("DM_OIDC_AEGIS_ISSUER"))
+}
+
+// oidcEnvBool parses a boolean env var with an optional legacy alias, matching
+// modules/oidc.getBoolWithAlias (strconv.ParseBool, default on absence or on a
+// value that does not parse).
+func oidcEnvBool(primary, alias string, def bool) bool {
+	raw := os.Getenv(primary)
+	if raw == "" && alias != "" {
+		raw = os.Getenv(alias)
+	}
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def
+	}
+	return v
 }
 
 // LogLocalLoginOffSafetyOverrideIfActive emits a single error-level log entry

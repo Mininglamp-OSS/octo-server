@@ -23,18 +23,39 @@ import (
 // 严格二选一,且携带正确的 device_flag。
 // -----------------------------------------------------------------------------
 
-// stubTokenStore 同时实现 currentTokenInvalidator 与 auth.TokenRecordReader,
-// 让测试能控制"从 session 缓存里读回来的 payload"这一个输入。
+// stubTokenStore 同时实现 currentTokenInvalidator 与 auth.TokenRecordReader。
+//
+// **这个 double 必须忠实复现生产存储的两个行为**,否则它会掩盖真实缺陷:
+//
+//  1. InvalidateCurrentToken **删除**被作废的那条记录。生产上两条实现都这么做:
+//     *auth.RedisSessionStore 对 v3 走 RevokeCurrent(compare-delete token key)、
+//     对 legacy 走 DeleteToken;cacheCurrentTokenInvalidator 走
+//     cache.Delete(tokenPrefix + token)。两者删的都是 deviceFlagFromRequest
+//     要读的那个 key。
+//  2. ReadToken 打一个不存在的 key 时返回 **TTL:-2 且 err == nil**
+//     (pkg/auth 的语义),而不是返回 error。
+//
+// 上一版这个 double 只把 token 追加进一个 slice、从不删记录,并且 miss 时返
+// error。结果是 TestAPI_Logout_KicksOnlyTheCallingDevice 对着一种生产不可能
+// 产生的行为通过了 —— 而生产上"仅踢当前端"从未生效过。
 type stubTokenStore struct {
 	// records key 是完整缓存 key(prefix + token)。
 	records map[string]auth.TokenRecord
 	readErr error
+
+	// deleteOnInvalidate 复现生产删除行为。默认 true;个别用例可以关掉它来
+	// 单独观察"记录还在"时的行为,但那不是生产形态。
+	keepRecordOnInvalidate bool
 
 	invalidated []string
 }
 
 func (s *stubTokenStore) InvalidateCurrentToken(_ context.Context, _, token string) error {
 	s.invalidated = append(s.invalidated, token)
+	if !s.keepRecordOnInvalidate {
+		// 与生产一致:作废即删掉那条 session 记录。
+		delete(s.records, "token:"+token)
+	}
 	return nil
 }
 
@@ -44,7 +65,9 @@ func (s *stubTokenStore) ReadToken(_ context.Context, key string) (auth.TokenRec
 	}
 	rec, ok := s.records[key]
 	if !ok {
-		return auth.TokenRecord{}, errors.New("not found")
+		// pkg/auth 的 miss 语义:TTL=-2,err=nil。返回 error 会让调用方走一条
+		// 生产不会走的分支。
+		return auth.TokenRecord{TTL: -2}, nil
 	}
 	return rec, nil
 }
@@ -152,7 +175,7 @@ func TestAPI_Logout_KicksOnlyTheCallingDevice(t *testing.T) {
 // 宁可多踢:登出的语义底线是"这个凭据之后不能再用",做不到精确就必须做保守。
 func TestAPI_Logout_FallsBackToAllDevicesWhenFlagUnknown(t *testing.T) {
 	cases := map[string]*stubTokenStore{
-		// 缓存里没有这个 token(已过期/被清)
+		// 缓存里没有这个 token(已过期/被清)—— pkg/auth 返 TTL:-2 + nil error
 		"cache miss": {records: map[string]auth.TokenRecord{}},
 		// 读缓存报错
 		"read error": {readErr: errors.New("redis down")},
@@ -302,3 +325,84 @@ func TestAPI_Logout_NonReaderTokenStoreKicksAllDevices(t *testing.T) {
 type invalidatorOnly struct{}
 
 func (invalidatorOnly) InvalidateCurrentToken(_ context.Context, _, _ string) error { return nil }
+
+// APP 端(device_flag == 0)登出必须只踢 APP,不能踢全部。
+//
+// 0 是 octo-lib 里 `APP DeviceFlag = iota` 的取值,也就是一个**完全合法的端**。
+// 把它兼作"解析失败"的哨兵,会让每个 APP 用户的登出都退化成踢全部设备 ——
+// 于是"仅踢当前端"实际只对 Web/PC 生效,而 APP 恰好是最大的一类客户端。
+//
+// 这条用例是 (flag, known) 二元返回的存在理由:范围判定必须看 known,不能看
+// flag 是否为零。
+func TestAPI_Logout_APPDeviceFlagZeroKicksOnlyAPP(t *testing.T) {
+	const appDeviceFlag = 0 // octo-lib config.APP
+	const token = "tok-from-app"
+
+	store := &stubTokenStore{records: map[string]auth.TokenRecord{
+		"token:" + token: {Payload: encodeV3SessionPayload(t, "u-multi-device", appDeviceFlag)},
+	}}
+	_, killer, r := newLogoutFixture(t, store)
+
+	req := httptest.NewRequest("POST", "/logout", nil)
+	req.Header.Set("token", token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	devKicks := killer.deviceSnapshot()
+	if len(devKicks) != 1 {
+		t.Fatalf("KickDevice calls = %d, want 1 — device_flag 0 is APP, not a failure "+
+			"sentinel (got %+v)", len(devKicks), devKicks)
+	}
+	if devKicks[0].DeviceFlag != appDeviceFlag {
+		t.Errorf("KickDevice device_flag = %d, want %d (APP)", devKicks[0].DeviceFlag, appDeviceFlag)
+	}
+	if all := killer.snapshot(); len(all) != 0 {
+		t.Errorf("Kick(all devices) was called with %v; an APP logout must not disconnect "+
+			"the user's Web and PC sessions", all)
+	}
+}
+
+// 回归守卫:device flag 必须在 InvalidateCurrentToken **之前**解析。
+//
+// 生产的 session store 在作废时会删掉那条记录,所以顺序颠倒后 ReadToken 必然
+// miss,known 恒为 false,"仅踢当前端"永久失效 —— 而且是静默失效:登出照样
+// 返 200、照样"成功",只是范围错了。
+//
+// 断言方式刻意不看调用顺序,而看**结果**:记录在作废时被删掉的前提下,
+// 仍然能拿到正确的 device flag。这样即便将来实现换成"读删原子化",
+// 这条用例依然成立。
+func TestAPI_Logout_DeviceFlagResolvedBeforeInvalidation(t *testing.T) {
+	const pcDeviceFlag = 2
+	const token = "tok-order-guard"
+
+	store := &stubTokenStore{records: map[string]auth.TokenRecord{
+		"token:" + token: {Payload: encodeV3SessionPayload(t, "u-multi-device", pcDeviceFlag)},
+	}}
+	_, killer, r := newLogoutFixture(t, store)
+
+	req := httptest.NewRequest("POST", "/logout", nil)
+	req.Header.Set("token", token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	// 前提成立:记录确实被作废(并因此被删)。
+	if len(store.invalidated) != 1 {
+		t.Fatalf("InvalidateCurrentToken calls = %d, want 1 — this test is meaningless "+
+			"if the record was never invalidated", len(store.invalidated))
+	}
+	if _, still := store.records["token:"+token]; still {
+		t.Fatal("the stub kept the record; it no longer models the production store")
+	}
+	// 结论:即便记录已被删,范围判定仍然正确。
+	devKicks := killer.deviceSnapshot()
+	if len(devKicks) != 1 || devKicks[0].DeviceFlag != pcDeviceFlag {
+		t.Errorf("KickDevice = %+v, want one call with device_flag %d; the device flag "+
+			"must be read before the record is invalidated", devKicks, pcDeviceFlag)
+	}
+}

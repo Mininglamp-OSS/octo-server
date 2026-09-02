@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 )
 
 // userAdapter 适配 user.IService + oidc.DB → service.userLookup。
@@ -81,7 +81,16 @@ func (a *userAdapter) IssueSession(ctx context.Context, req IssueSessionReq) (*I
 type identityStoreAdapter struct{ db *DB }
 
 func (a identityStoreAdapter) Get(issuer, subject string) (*IdentityModel, error) {
-	return a.db.QueryIdentityByIssuerSubject(issuer, subject)
+	row, err := a.db.QueryIdentityByIssuerSubject(issuer, subject)
+	if err != nil {
+		return nil, err
+	}
+	// 逐字节复核 —— 见 identity_exact_match.go。表的 collation 是 ci,所以一次
+	// 大小写不同的 subject 也会命中别人的行;那不是脏数据,是账号接管。
+	if !identityRowMatches(row, issuer, subject) {
+		return nil, nil
+	}
+	return row, nil
 }
 func (a identityStoreAdapter) Insert(m *IdentityModel) error {
 	return a.db.InsertIdentity(m)

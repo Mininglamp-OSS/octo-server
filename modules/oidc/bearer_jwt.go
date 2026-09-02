@@ -44,7 +44,55 @@ type bearerJWTClaims struct {
 var (
 	// ErrBearerJWTNoUserID payload.userId 缺失或为 0(可能是未认证/默认值哨兵)。
 	ErrBearerJWTNoUserID = errors.New("bearer-jwt: userId is required and must be non-zero")
+	// ErrJWTTooOld token 的 iat 距今超过 bearerJWTMaxAge。
+	ErrJWTTooOld = errors.New("bearer-jwt: token was issued too long ago")
+	// ErrJWTMissingIat payload 无 iat,无法判断新鲜度。
+	ErrJWTMissingIat = errors.New("bearer-jwt: iat claim is required")
+	// ErrJWTIatInFuture iat 超出时钟偏移容忍范围地位于未来。
+	ErrJWTIatInFuture = errors.New("bearer-jwt: iat is too far in the future")
+	// ErrBearerJWTSecretTooShort HS256 密钥强度不足。
+	ErrBearerJWTSecretTooShort = errors.New("bearer-jwt: shared secret is too short")
 )
+
+const (
+	// bearerJWTMinSecretBytes HS256 共享密钥的最小长度。
+	//
+	// 32 字节对齐同模块 DM_OIDC_RT_ENC_KEY 的既有要求(config.go 强制 AES-256
+	// 恰好 32 字节,不满足直接拒绝启动)。理由在这里更强:持有这把密钥就能为
+	// **任意** userId 签一张能换会话的 token,而短密钥可被离线爆破 —— 攻击者
+	// 只要拿到一张合法 JWT 就能在本地穷举出密钥,此后可以伪造任何人的登录。
+	bearerJWTMinSecretBytes = 32
+
+	// bearerJWTMaxAge 从 iat 起算的最大可接受寿命。
+	//
+	// 上游那张 token 的 exp 是签发后约 15 天,但它的用途只是"登录那一刻兑换
+	// 一次会话"。15 天的可重放窗口与用途完全不匹配:抓到一张 assertion 就能
+	// 反复兑换新会话,**包括用户已登出之后** —— 而我方无法查询上游的吊销状态
+	// (黑名单在对方的存储里)。
+	//
+	// 10 分钟覆盖"登录完成 → 调我方端点"这段正常间隔(含用户在成功页停留),
+	// 同时把重放窗口从 15 天压到分钟级。纯我方措施,不需要上游改任何东西。
+	bearerJWTMaxAge = 10 * time.Minute
+
+	// bearerJWTClockSkew 容忍签发方与我方的时钟不同步。
+	//
+	// iat 略微在未来是常态,不该当成攻击;但远期 iat 要拒 —— 那是把 token 的
+	// 可用窗口整体往后推。
+	bearerJWTClockSkew = 60 * time.Second
+)
+
+// validateBearerJWTSecret 校验共享密钥强度。启动期调用,不足则不开启该端点。
+//
+// 错误信息只给长度,不回显密钥本身 —— 它会进日志。
+func validateBearerJWTSecret(secret []byte) error {
+	if len(secret) < bearerJWTMinSecretBytes {
+		return fmt.Errorf("%w: got %d bytes, need at least %d "+
+			"(a short HMAC key can be recovered offline from a single valid token, "+
+			"after which any user's login can be forged)",
+			ErrBearerJWTSecretTooShort, len(secret), bearerJWTMinSecretBytes)
+	}
+	return nil
+}
 
 // verifyBearerJWT 验签 bearer JWT 并解析 claims。secret 是 HS256 对称密钥(字节原样传入;
 // 调用方负责做 hex/ascii 等解码——该密钥是 ASCII 字符串,直接 []byte(secret) 即可,
@@ -59,6 +107,23 @@ func verifyBearerJWT(token string, secret []byte, now time.Time) (*bearerJWTClai
 	}
 	if c.UserID <= 0 {
 		return nil, ErrBearerJWTNoUserID
+	}
+	// 新鲜度:exp 由上游决定(约 15 天),对"换一次会话"这个用途太宽。
+	// 这里按 iat 另加一道我方上限,把重放窗口压到分钟级。
+	//
+	// iat 缺失必须拒绝,不能当作"很新"放行 —— 否则攻击者去掉 iat 就绕过上限,
+	// 这道检查就只是装饰。
+	if c.Iat == 0 {
+		return nil, ErrJWTMissingIat
+	}
+	issued := time.Unix(c.Iat, 0)
+	if issued.After(now.Add(bearerJWTClockSkew)) {
+		return nil, fmt.Errorf("%w: iat is %s ahead of now",
+			ErrJWTIatInFuture, issued.Sub(now).Round(time.Second))
+	}
+	if now.Sub(issued) > bearerJWTMaxAge {
+		return nil, fmt.Errorf("%w: issued %s ago, max %s",
+			ErrJWTTooOld, now.Sub(issued).Round(time.Second), bearerJWTMaxAge)
 	}
 	return &c, nil
 }

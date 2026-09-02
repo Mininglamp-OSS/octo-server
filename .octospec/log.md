@@ -1651,3 +1651,39 @@ change-log convention (§7). Newest first.
   when an identifier becomes an immutable primary key, fence the ambiguity instead
   of resolving it first — refusal is a constant you can edit, a polluted identity
   table is not.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 2)
+
+- **Fixed six blocking defects found by review**, all re-derived from source before
+  acting. Per-device logout had never worked in production: the device flag was read
+  after `InvalidateCurrentToken` had deleted the record it comes from, and `0` was
+  used as the "unresolved" sentinel while `config.APP` *is* 0. Both exchange
+  endpoints discarded the race-recovery winner and handed the client a session for a
+  ghost account with no identity row. The bearer-JWT anchor accepted any non-empty
+  secret and had `exp` as its only freshness control. `RequireEmailVerified=false`
+  was an account-takeover primitive under a kind whose provider cannot assert
+  verification. And a provider-kind typo could take **every** login path down at
+  once. See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Removed the mirror rather than updating it** — the login-lockout path existed
+  because `modules/common` hand-copied the module's boot validation and the copy
+  never gained the five new fatal conditions. The refusal rules now live in
+  `pkg/oidcboot`, a stdlib-only leaf package both sides import, and
+  `oidcboot.RefusedScenarios` pins both sides' tests to one table. Deleting the
+  delegation makes all nine scenarios fail, so we know the drift was live.
+- **Landed the de-duplication that the brief had already claimed** — both exchange
+  endpoints now share one post-validation tail. While it was duplicated, the
+  race-recovery defect existed in both copies and the phone-masking fix reached only
+  one; that is the class the shared tail exists to prevent.
+- **Reverted my own phone-number inference.** Bare 11-digit inference was added on
+  the strength of a documented example that is not a valid mainland number, and
+  roughly seven eighths of North American numbers are byte-identical to a valid
+  mainland mobile — `13861234567` is both. It was storing strangers' numbers.
+- **Corrected four places where the brief or PR body asserted properties the code
+  did not have**, each with the reason the original wording was wrong.
+- **Learning** — `learnings/pending/a-double-must-model-the-failure-you-fear.md`:
+  a double written to satisfy the assertion certified a fix production could not
+  perform; model what the collaborator destroys, and confirm the test fails without
+  the fix.
+- **Learning** — `learnings/pending/delete-the-mirror-instead-of-syncing-it.md`:
+  a comment saying "keep in sync with" is not a mechanism; extract the rule into a
+  leaf package and pin both sides' tests to one shared table.

@@ -17,7 +17,6 @@ package oidc
 import (
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -111,83 +110,18 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 		return
 	}
 
-	res, err := o.service.ResolveOrLink(c.Request.Context(), claims)
-	if err != nil {
-		metricExchangeResult.WithLabelValues("resolve_fail").Inc()
-		o.Warn("OIDC exchange: resolve failed",
-			zap.String("trace_id", traceID), zap.String("ip", clientIP),
-			zap.String("sub", subHash(claims.Subject)), zap.Error(err))
-		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-		return
-	}
-
-	zone := extractZone(claims.PhoneNumber)
-	phone := extractPhone(claims.PhoneNumber)
-	if claims.PhoneNumber != "" && phone == "" {
-		o.Warn("OIDC exchange phone number dropped: only +86 supported",
-			zap.String("trace_id", traceID), zap.String("idp_phone", claims.PhoneNumber))
-	}
-
-	issueReq := IssueSessionReq{
-		UID:              res.UID,
-		CreateUser:       res.IsNew,
-		Name:             claims.Name,
-		Email:            claims.Email,
-		Phone:            phone,
-		Zone:             zone,
-		DeviceFlag:       deviceFlag,
-		PublicIP:         clientIP,
-		TrustedSSOCreate: res.IsNew,
-	}
-	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
-	if err != nil {
-		metricExchangeResult.WithLabelValues("issue_fail").Inc()
-		o.Error("OIDC exchange: issue session failed",
-			zap.String("trace_id", traceID), zap.String("ip", clientIP),
-			zap.String("sub", subHash(claims.Subject)), zap.Error(err))
-		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-		return
-	}
-
-	// 新用户补写 identity 行。并发首登竞态由 UNIQUE KEY uk_issuer_subject +
-	// recoverFromIdentityRace 兜底(同 callback 路径)。
-	if res.IsNew && sessResp.UID != "" {
-		if err := o.store.Insert(&IdentityModel{
-			UID:           sessResp.UID,
-			Issuer:        claims.Issuer,
-			Subject:       claims.Subject,
-			Email:         claims.Email,
-			EmailVerified: boolToInt(claims.EmailVerified),
-			Phone:         claims.PhoneNumber,
-			PhoneVerified: boolToInt(claims.PhoneVerified),
-			LinkedAt:      time.Now(),
-		}); err != nil {
-			if isDuplicateKeyError(err) {
-				if recovered := o.recoverFromIdentityRace(c.Request.Context(), claims, sd, sessResp, issueReq, err); recovered == nil {
-					metricExchangeResult.WithLabelValues("identity_insert_fail").Inc()
-					o.writeAudit(sessResp.UID, EventExchangeFail, sd, "identity insert race unrecovered")
-					httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-					return
-				}
-				metricExchangeResult.WithLabelValues("race_recovered").Inc()
-			} else {
-				metricExchangeResult.WithLabelValues("identity_insert_fail").Inc()
-				o.Error("OIDC exchange: insert identity failed",
-					zap.String("trace_id", traceID), zap.Error(err))
-				httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-				return
-			}
-		}
-	}
-
-	o.writeAudit(sessResp.UID, EventExchangeOK, sd, "")
-	metricExchangeResult.WithLabelValues("ok").Inc()
-
-	// 与 /bind/create 返回形状对齐:status / uid / login_resp(JSON 字符串,客户端
-	// 直接解出 token 字段即可)。
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status":     "ok",
-		"uid":        sessResp.UID,
-		"login_resp": sessResp.LoginRespJSON,
+	o.completeExchange(c, verifiedIdentity{
+		claims:     claims,
+		deviceFlag: deviceFlag,
+		clientIP:   clientIP,
+		traceID:    traceID,
+		state:      sd,
+		// subject 是长数字串,进审计无意义;它已经以 hash 形式进了日志。
+		auditDetail: "",
+	}, exchangeFlavour{
+		logName:   "exchange",
+		result:    metricExchangeResult,
+		eventOK:   EventExchangeOK,
+		eventFail: EventExchangeFail,
 	})
 }
