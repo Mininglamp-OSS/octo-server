@@ -1800,3 +1800,34 @@ Two blocking findings, both reproduced before fixing.
   trigger difficulty; the reviewer was right that blast radius is the measure** —
   the conjunction leaves an SSO-only deployment with no login path at all.
 - **Learning** — `own-is-larger-than-the-subset-you-can-verify.md`.
+
+## 2026-09-02 — round 8: a denylist of remembered types, and a vendor fact applied as a protocol fact
+
+- **The guard was mounted on one of two consumers. Again.** `/exchange` got the
+  own-credential detector but not the HMAC stage, so a business JWT went out whole —
+  signature included — into the vendor's URL query. The comment saying *this endpoint
+  is the likelier misdirection* was written in the commit that left the gap. Writing
+  down the reason is not the same as acting on it.
+- **`app_` was missed, and would have been missed again.** The fix that mattered was
+  not the entry, it was `own_credential_coverage_test.go`: scan the credential-minting
+  packages for prefix constants and fail naming any the detector does not know. It
+  found `app_` on its first run. A prefix list is a denylist of types someone
+  remembered; the omission has to become a CI failure, because "read it more carefully"
+  has now failed three rounds running.
+- **I applied a vendor fact as a protocol fact.** Round 6 said "the subject cap only
+  covers one provider" and I made the whole check protocol-neutral — correct for the
+  storage bound, wrong for the short-numeric heuristic. That one comes from *one IdP's*
+  documented employee-number reuse. `kind=oidc` is the generic client existing
+  deployments point at any IdP; a self-hosted IdP with `sub=1001` would have lost login
+  for every user, no override, redeploy-only recovery — the exact cost I argued was
+  unacceptable in the `local_off` section. **The module already made this argument one
+  axis over** (bearer JWT excluded because our own keys are not reused). The axis I
+  chose — derived vs upstream-asserted — was not the axis the argument needs, which is
+  per-deployment: does *this* IdP's subject come from a reused personnel identifier.
+  Now a capability bit, default false.
+- **Enumerated one cell rather than closing it**: a non-HS256 JWT shape is
+  unattributable and gets forwarded; closing it would break JWT-shaped upstream access
+  tokens, which is what these endpoints exist for. Nothing we issued leaves, so the
+  invariant holds; what is accepted is written down, and a test skips-with-explanation
+  if anyone "fixes" it.
+- **Learning** — `a-generalisation-can-widen-a-vendor-specific-rule.md`.
