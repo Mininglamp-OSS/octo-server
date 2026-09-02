@@ -1357,6 +1357,7 @@ type Resp struct {
 	CreatedAt       int64 // 注册时间 10位时间戳
 	IsDestroy       int   // 是否注销
 	Robot           int   // 机器人0.否1.是
+	MuteOfApp       int   // 手机静音：Web/PC 在线时抑制 App 离线 Push
 }
 
 func newResp(m *Model) *Resp {
@@ -1374,6 +1375,7 @@ func newResp(m *Model) *Resp {
 		IsDestroy:       m.IsDestroy,
 		CreatedAt:       time.Time(m.CreatedAt).Unix(),
 		Robot:           m.Robot,
+		MuteOfApp:       m.MuteOfApp,
 	}
 }
 
