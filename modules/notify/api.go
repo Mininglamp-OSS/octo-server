@@ -26,6 +26,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -85,17 +86,16 @@ type Notify struct {
 
 // New 创建 Notify 实例
 func New(ctx *config.Context) *Notify {
-	token := os.Getenv("NOTIFY_INTERNAL_TOKEN")
-	docsToken := os.Getenv("OCTO_DOCS_NOTIFY_TOKEN")
-	if token == "" {
-		log.NewTLog("Notify").Warn("NOTIFY_INTERNAL_TOKEN not set — internal API will reject all requests")
+	// Token resolution (including the cross-module fixed-token exclusion set)
+	// lives in config.go so the rules are unit-testable without mutating
+	// process env. A token that is unset or collides comes back empty, and
+	// internalAuthMiddleware then rejects it (fail-closed).
+	token, docsToken, tokenWarnings, tokenErrors := resolveInternalTokens(os.Getenv)
+	for _, w := range tokenWarnings {
+		log.NewTLog("Notify").Warn(w)
 	}
-	if docsToken == "" {
-		log.NewTLog("Notify").Warn("OCTO_DOCS_NOTIFY_TOKEN not set — docs notification requests will be rejected")
-	}
-	if token != "" && docsToken == token {
-		log.NewTLog("Notify").Error("OCTO_DOCS_NOTIFY_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; docs capability disabled")
-		docsToken = ""
+	for _, e := range tokenErrors {
+		log.NewTLog("Notify").Error(e)
 	}
 
 	n := &Notify{
@@ -357,6 +357,28 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		c.ResponseErrorWithStatus(errors.New("payload不能为空"), http.StatusBadRequest)
 		return
 	}
+	// Targeting shape is validated FIRST, ahead of the capability gate. Both
+	// produce a 400, but they answer different questions and the shape answer is
+	// the more useful one: "you sent both targets and target_role" / "space_owner
+	// is not a role I know" is actionable, whereas the capability gate below can
+	// only say "not allowed". Checking shape first also keeps the pre-existing
+	// err.shared.param.invalid contract for malformed targeting exactly as it
+	// was before target_role became capability-scoped — a producer with a typo
+	// still learns it has a typo rather than being told it lacks a permission it
+	// may well have.
+	//
+	// Targeting is validated and resolved HERE, once, before dispatch — not
+	// inside each deliver* path. Resolving the role selector into req.Targets
+	// up front means deliverNotification / deliverCardNotification /
+	// deliverDocsCardNotification / deliverApprovalCardNotification all keep
+	// operating on a concrete uid slice and are byte-for-byte unchanged,
+	// including their own len(Targets) bounds checks, dedup, actor exclusion
+	// and memberCache verification. See target_role.go.
+	if err := validateTargeting(&req); err != nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil,
+			i18n.Details{"field": "targets"})
+		return
+	}
 	capability, _ := c.Get(notifyCapabilityContextKey)
 	typedCapability, _ := capability.(notifyCapability)
 	if !n.notifyCapabilityAllows(typedCapability, &req) {
@@ -364,21 +386,65 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		return
 	}
 
-	resp, err := n.dispatchNotify(c.Request.Context(), &req, typedCapability)
+	// Payload validation must run BEFORE recipient resolution, because
+	// resolveRoleTargets answers a question about tenant state and then
+	// short-circuits the zero-admin case as a SUCCESS. With the checks the other
+	// way round, one malformed request was a 400 in a Space that happens to have
+	// an admin and a 200 in a Space that does not — validation outcomes must
+	// never depend on who happens to be a member of somebody else's Space, both
+	// because it is an oracle and because a producer cannot debug a contract
+	// violation that only reports itself sometimes.
+	//
+	// Only the ApprovalCard path needs pre-validation: notifyCapabilityAllows
+	// admits target_role for the action capability alone, and that capability
+	// admits nothing but an ApprovalCard. prepareApprovalCard is the shared
+	// source of truth — deliverApprovalCardNotification calls the very same
+	// function, so there is no second copy of the rules to drift.
+	if roleTargeted(&req) {
+		if _, err := n.prepareApprovalCard(&req, typedCapability.Action); err != nil {
+			n.respondNotifyError(c, &req, err)
+			return
+		}
+	}
+	roleResp, handled, err := n.resolveRoleTargets(&req)
 	if err != nil {
-		if errors.Is(err, errNotifyCardNotAllowed) {
-			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
-			return
-		}
-		if errors.Is(err, errNotifyCardInvalid) {
-			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
-			return
-		}
-		n.Error("投递通知失败", zap.Error(err), zap.String("space_id", req.SpaceID))
+		n.Error("解析角色收件人失败", zap.Error(err), zap.String("space_id", req.SpaceID))
 		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
 		return
 	}
+	if handled {
+		// Zero recipients is a success with an empty `delivered`, never an
+		// error — see resolveRoleTargets. Reaching this point means the payload
+		// already passed validation above, so the 200 says "your request was
+		// well-formed and nobody was eligible", not "your request was never
+		// looked at".
+		c.Response(roleResp)
+		return
+	}
+
+	resp, err := n.dispatchNotify(c.Request.Context(), &req, typedCapability)
+	if err != nil {
+		n.respondNotifyError(c, &req, err)
+		return
+	}
 	c.Response(resp)
+}
+
+// respondNotifyError maps a delivery/validation error to its wire response.
+// Shared by the pre-resolution validation gate and the dispatch call site so
+// the same malformed payload cannot produce two different status codes
+// depending on which of the two noticed it first.
+func (n *Notify) respondNotifyError(c *wkhttp.Context, req *NotifyReq, err error) {
+	if errors.Is(err, errNotifyCardNotAllowed) {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+		return
+	}
+	if errors.Is(err, errNotifyCardInvalid) {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+		return
+	}
+	n.Error("投递通知失败", zap.Error(err), zap.String("space_id", req.SpaceID))
+	c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
 }
 
 // dispatchNotify routes a single request to the correct producer path (when a
@@ -434,6 +500,47 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
 			return
 		}
+		// target_role is rejected outright on /notify/batch, and it is the ONLY
+		// targeting rule preflighted here. Role resolution runs one query per
+		// Space per entry and can expand a 50-item batch into 50 unbounded
+		// fan-outs; the single-item /notify endpoint is the only supported way
+		// to use it, mirroring how Card / DocsCard / ApprovalCard are already
+		// single-endpoint only. Rejecting the whole batch also keeps the
+		// zero-transport guarantee: no earlier text entry is delivered before a
+		// later entry is found to carry the field.
+		//
+		// The comparison is on the RAW value, deliberately: strings.TrimSpace
+		// would let "   " through as "unset", and the rule here is "a batch
+		// carrying target_role at all is refused", not "a batch carrying a
+		// resolvable target_role". A whitespace-only value is a producer bug and
+		// must be reported as one.
+		//
+		// What is deliberately NOT preflighted: an entry whose `targets` is
+		// missing or empty. NotifyReq.Targets loses its binding:"required" tag
+		// in this change ("exactly one of targets / target_role" cannot be
+		// expressed as a binding tag), but that tag never applied to batch
+		// entries in the first place. Verified against this repo's validator
+		// (v10.14.0, TagName("binding")):
+		//
+		//   - `required` on a slice only rejects nil. An explicit "targets":[]
+		//     passed binding at every version of this handler.
+		//   - go-playground/validator does not descend into slice ELEMENTS
+		//     without a `dive` tag, and BatchNotifyReq.Notifications carries only
+		//     `binding:"required"`. So NotifyReq's own tags were never applied to
+		//     batch entries at all — a batch entry with no `targets` key
+		//     whatsoever also bound cleanly.
+		//
+		// Both shapes therefore reached deliverNotification and came back as a
+		// per-item error ("targets不能为空") inside a 207, with the batch's other
+		// entries still delivered. That is the pre-existing wire contract for
+		// this endpoint — BatchNotifyResult.Error exists precisely to carry it —
+		// and it stays byte-identical here rather than becoming a whole-batch
+		// 400 that delivers nothing.
+		if req.Notifications[i].TargetRole != "" {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil,
+				i18n.Details{"field": "target_role"})
+			return
+		}
 	}
 
 	hasErrors := false
@@ -460,15 +567,34 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	}
 }
 
+// notifyCapabilityAllows is the single answer site for "may this credential
+// send this request?".
+//
+// Two orthogonal questions are decided here:
+//
+//  1. WHAT may be sent (Payload / Card / DocsCard / ApprovalCard) — the
+//     pre-existing producer isolation.
+//  2. WHETHER the caller may ask octo-server to resolve its own recipients
+//     (target_role). Only the action capability may: `delivered` on a
+//     role-targeted request is an answer about who a Space's owners/admins are,
+//     so granting it to the legacy NOTIFY_INTERNAL_TOKEN or the docs
+//     OCTO_DOCS_NOTIFY_TOKEN would re-create the cross-tenant admin-roster
+//     capability that this change deleted from modules/space — one shared
+//     token, up to 200 admin uids per call, any space_id, no membership
+//     relationship required. The action capability is additionally narrowed to
+//     its registered action types by CanNotify below, so the reachable
+//     role-targeting surface is exactly the routes an operator configured in
+//     OCTO_CARD_ACTION_ROUTES.
 func (n *Notify) notifyCapabilityAllows(capability notifyCapability, req *NotifyReq) bool {
 	if n == nil || req == nil {
 		return false
 	}
 	switch capability.Kind {
 	case notifyCapabilityLegacy:
-		return req.DocsCard == nil && req.ApprovalCard == nil
+		return req.DocsCard == nil && req.ApprovalCard == nil && !roleTargeted(req)
 	case notifyCapabilityDocs:
-		return req.DocsCard != nil && req.Card == nil && req.ApprovalCard == nil && req.Payload == nil
+		return req.DocsCard != nil && req.Card == nil && req.ApprovalCard == nil && req.Payload == nil &&
+			!roleTargeted(req)
 	case notifyCapabilityAction:
 		return req.ApprovalCard != nil && req.Card == nil && req.DocsCard == nil && req.Payload == nil &&
 			n.actionService != nil && n.actionService.CanNotify(capability.Action, req.ApprovalCard.ActionType)
