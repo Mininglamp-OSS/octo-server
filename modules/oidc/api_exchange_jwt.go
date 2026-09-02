@@ -55,13 +55,14 @@ func (o *OIDC) exchangeJWT(c *wkhttp.Context) {
 	// provider 构造失败(Discovery 不通/BaseURL 错)时 o.provider==o.service==nil,
 	// 此时任何登录路径都无法工作,返回明确的 500 而不是 nil panic。
 	if o.provider == nil || o.service == nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc provider not initialized"))
+		// 门面而非裸 JSON:原生客户端调的 JSON 端点,不属于 api.go 的浏览器重定向豁免。
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 
 	// 配置缺失是运维错误,500 而非 401:区别"客户端给了坏 token" vs "我们自己没配好"。
 	if o.bearerJWT == nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("bearer jwt not configured"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 

@@ -444,11 +444,22 @@ change was invisible to the suite.
 **2. The login lookup is byte-exact, which is stricter than before.**
 `QueryIdentityExact` returns "not linked" when the stored row differs from the queried
 `(issuer, subject)` in case only. Required — the table collates case-insensitively, so
-without it an uppercase subject resolves onto a lowercase account. The consequence worth
-stating: if an IdP ever changed the case of its `sub`, those users move from "linked" to
-"not linked", and with `AllowNewUser` defaulting true they receive a **new empty account**
-plus a new irreversible identity row. Safe for a consistent IdP. Operationally, the log line
-for a folded collision is indistinguishable from a genuinely unbound user.
+without it an uppercase subject resolves onto a lowercase account. The consequence, corrected — the
+first version of this paragraph got the outcome wrong. Such users do **not** receive a new
+account plus a new identity row: the identity insert is blocked by the case-insensitive
+unique key. What happened instead was worse in one way and better in another — the folded
+row was reported as "no row", `ResolveOrLink` returned `IsNew=true`, the caller created a
+user **and a session**, and only then did the insert hit 1062 and the login fail. So every
+attempt left an orphan user row and failed, repeatably, with only the global IP floor in
+front of it.
+
+That is now fixed at the source: `QueryIdentityExact` reports a folded collision as a
+distinct error, so `ResolveOrLink` refuses before anything is created. On the integration
+authenticator the collision answers "not linked" rather than 500 (it is not an internal
+failure) and logs its own line, so it is no longer indistinguishable from a genuinely
+unbound user. A collision is also pinned as *not* eligible for self-service bind, whose
+`/bind/create` exit would otherwise turn "refuse to merge two people" into "give one person
+a second account".
 
 **3. The access-log scrub is wider, and it is service-wide.** The redaction pattern gained
 `client_secret`, `refresh_token`, `access_token`, `id_token`, `code` and `state`. The last

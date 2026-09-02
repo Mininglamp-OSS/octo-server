@@ -89,10 +89,13 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 
 	if o.provider == nil || o.service == nil {
 		// 构造阶段已打过 Error 日志;这里只返 500,不给攻击者探测端点状态的信息。
-		// 这个直接 AbortWithStatusJSON 是和 api.go authorize/callback 同一条豁免
-		// 路径的扩展:OAuth2/OIDC 协议端点的浏览器/原生重定向与 JSON 入口,不走
-		// i18n 信封(api.go 的 14 处同理)。baseline 计数见 client_ip_source_test.go。
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc not initialized"))
+		//
+		// 走 i18n 门面,不用裸 JSON。这不是 api.go authorize/callback 那条豁免的延伸 ——
+		// 那条是给**浏览器顶层重定向**入口的,而这是原生客户端调的 JSON 端点,没有
+		// 重定向流程。同一类失败(构造失败)在 modules/integration 那两扇门上走的就是
+		// 门面,本 handler 其余所有失败也走门面。给新端点加 baseline 豁免是把一个
+		// 单调趋零的门禁往反方向推。
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 

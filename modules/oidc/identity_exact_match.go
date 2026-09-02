@@ -21,7 +21,25 @@ package oidc
 // (它们不可能是工号),而真实 subject 的形态**至今未经实测确认** —— 所以这道
 // 复核是为那个未知留的。
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
+
+// ErrIdentityCaseCollision 报告"ci 查询命中了一行,但它与查询值不是逐字节相等"。
+//
+// 为什么必须是一个**可区分的结果**,而不是复用"没查到"(nil, nil):
+//
+// 逐字节复核把"静默合并两个人"换成了"响亮拒绝",那个取舍是对的。但"没查到"会让
+// ResolveOrLink 回 IsNew=true,而调用方拿到它就去 IssueSession(CreateUser=true) ——
+// 用户行**先建出来**,随后的 identity Insert 才撞上 ci 唯一键报 1062,竞态恢复又
+// 走同一个逐字节查询、同样看不见那行,于是返回 nil、登录被拒。
+//
+// 净效果:每一次登录尝试留下一个孤立 user 行,然后永久失败,且可无限重复
+// (callback 只有全局 IP 底)。把它变成一个错误,拒绝就落在 ResolveOrLink 里,
+// 在任何副作用之前。
+var ErrIdentityCaseCollision = errors.New(
+	"oidc: identity row differs only by case folding; refusing rather than merging identities")
 
 // identitySubjectMatches 报告数据库返回的 subject 是否与查询用的 subject 逐字节相同。
 //

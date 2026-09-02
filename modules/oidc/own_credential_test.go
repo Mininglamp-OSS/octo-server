@@ -253,22 +253,16 @@ func TestOwnCredential_ExchangeStillForwardsUpstreamCredential(t *testing.T) {
 	}
 }
 
-// 已知**未闭合**的格子,行为在此钉住,不是断言它安全。
+// alg:none / RS 头的 JWT 形态凭据 —— 这个格子**已经闭合**。
 //
-// 一张 alg:none 或 RS 系头部的 JWT 在验签之前就被拒(算法混淆防护),失败点带
-// ErrJWTForeign 标记 → 判成"不是我们的" → 在 kind=oauth2 下被转发进上游的
-// /userinfo query。造它不需要密钥。
+// 原先它是矩阵里一个明确记录的开放格子:非 HS256 的 header 在验签之前就被拒
+// (抗算法混淆),错误带 ErrJWTForeign,于是凭据被回落转发。当时接受它的理由是
+// "转发出去的不是我方凭据,不变量没破" —— 而闭合它的理由是另一条:该厂商的
+// access_token 是不透明串,JWT 形态无论签名如何都不可能是它的合法凭据,
+// 所以转发不可能成功,只可能把一段任意串写进厂商的访问日志。
 //
-// 为什么不修:kind=oauth2 下**合法的**上游不透明 access_token 本身就可能是 JWT
-// 形态(很多 OAuth2 provider 签 JWT access token)。把"验签前失败"一律判成我方
-// 凭据就会掐断 C2 —— 而 C2 是这两个端点存在的理由。无法归属的凭据只能转发。
-//
-// 风险接受的实际内容:任何人可以让本服务把一段自造的字符串写进厂商的访问日志。
-// 那不是**我方凭据**外泄(不变量仍然成立:我们签发的东西不会出去),而是把我们
-// 当成一次写日志的中继。端点级 IP 限流压住速率,不封闭通道。
-//
-// 这条测试的作用是让行为可见:哪天有人"顺手修好"它,C2 会静默断掉,而这里会红。
-func TestForeignJWTShape_IsForwardedUpstream_KnownOpenCell(t *testing.T) {
+// 顺带也就不需要"无需密钥即可构造"这个论证了:拒绝依据不是签名,是形态 × 能力位。
+func TestForeignJWTShape_IsRefusedNotForwarded(t *testing.T) {
 	m := newMockOAuth2Provider(t)
 	prov, err := newOAuth2Provider(m.providerConfig())
 	if err != nil {
@@ -286,19 +280,18 @@ func TestForeignJWTShape_IsForwardedUpstream_KnownOpenCell(t *testing.T) {
 	m.mu.Lock()
 	m.LastUserInfoRequest = nil
 	m.mu.Unlock()
-	postExchange(o, `{"access_token":"`+noneJWT+`"}`)
+	w := postExchange(o, `{"access_token":"`+noneJWT+`"}`)
 
+	if w.Code == http.StatusOK {
+		t.Error("an alg:none token must not authenticate")
+	}
 	m.mu.Lock()
 	last := m.LastUserInfoRequest
 	m.mu.Unlock()
-	if last == nil {
-		t.Skip("behaviour changed: a JWT-shaped credential is no longer forwarded. If that " +
-			"was deliberate, verify that JWT-shaped **upstream** access tokens still work " +
-			"(C2), and move this cell out of guard-matrix.md's open list.")
-	}
-	// 现状:被转发。钉住"它不是我方签发的凭据"这一点 —— 不变量没破。
-	if _, verr := o.bearerJWT.VerifyForAuthentication(noneJWT, time.Now()); verr == nil {
-		t.Fatal("an alg:none token verified against our secret; the algorithm-confusion " +
-			"guard is broken, which is a different and much worse problem")
+	if last != nil {
+		t.Errorf("a JWT-shaped credential was forwarded to the upstream IdP (userinfo "+
+			"query=%q). This vendor's access_token is opaque, so a JWT cannot be a valid "+
+			"credential for it — forwarding only lets a caller write a string of their "+
+			"choosing into the vendor's access log", last.Query.Encode())
 	}
 }

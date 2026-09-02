@@ -46,7 +46,18 @@ func (d *DB) QueryIdentityExact(issuer, subject string) (*IdentityModel, error) 
 	if err != nil {
 		return nil, err
 	}
-	if !identityRowMatches(row, issuer, subject) {
+	if row != nil && !identityRowMatches(row, issuer, subject) {
+		// ci 查询命中了,但不是逐字节相等 —— 折叠碰撞。
+		//
+		// **不能报成"没查到"**:那会让 ResolveOrLink 回 IsNew=true,调用方随即
+		// IssueSession(CreateUser=true) 把用户行建出来,之后 identity Insert 才撞上
+		// ci 唯一键报 1062,竞态恢复又走同一个逐字节查询、同样看不见,于是拒绝 ——
+		// 每次尝试留一个孤立 user 行,永久失败,可无限重复。见 ErrIdentityCaseCollision。
+		return nil, fmt.Errorf("%w: issuer/subject collide with an existing row",
+			ErrIdentityCaseCollision)
+	}
+	if row == nil {
+		// 真的没有行 —— 首次登录,与碰撞必须区分,否则每个新用户都登不进来。
 		return nil, nil
 	}
 	return row, nil

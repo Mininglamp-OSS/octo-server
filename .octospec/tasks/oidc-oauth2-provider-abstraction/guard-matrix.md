@@ -58,7 +58,7 @@ rather than a leak.
 | G7 credential provenance split ("is this ours?") | the HMAC | `IsForeignToken`, allowlist over `ErrJWTForeign` | **P2 and P4** — both accept two credential types on one field. The row said "P4 only" for three rounds while the row below already recorded P2; `/exchange` had no verifier stage at all until round 9 |
 | G8 freshness | the purpose | `VerifyForRedemption` (10 min from `iat`) vs `VerifyForAuthentication` (token's own `exp`) | P3 uses the former, P4-C3 the latter |
 | G11 own-credential refusal | which system minted the credential | `oidc.OwnCredentialDetector` — `uk_` / `bf_` / `app_` prefix, then a session-store lookup — called immediately before any upstream call. Prefix coverage is pinned by a source scan over all of `modules/`, so a new credential-minting module is a CI failure rather than a leak | P2, P4. Fails **closed**: if the session store is unavailable the answer is "undecided", and undecided must not forward |
-| G12 unverifiable JWT-shape refusal | the provider declaring `OpaqueClientCredential` | `UnverifiableJWTMustNotBeForwarded` — refuse a JWT-shaped credential when the bearer verifier is **unconfigured**. Not shape-based routing: with no key there is no attribution to be had, and this vendor's `access_token` is an opaque UUID, so a JWT provably cannot succeed here. Vendor fact, hence a capability — the standard kind's client credential *is* a JWT | P2, P4 under `kind=oauth2` only |
+| G12 JWT-shape refusal | the provider declaring `OpaqueClientCredential` | `JWTShapedCredentialMustNotBeForwarded` — refuse **any** JWT-shaped credential that reaches the fall-through, whether or not our bearer verifier is configured. Not shape-based routing: this vendor's `access_token` is an opaque UUID, so a JWT provably cannot succeed here. Vendor fact, hence a capability — the standard kind's client credential *is* a JWT. **Must run after HMAC verification**, since a valid business JWT is also JWT-shaped | P2, P4 under `kind=oauth2` only |
 | G10 IP rate limit | the endpoint being unauthenticated | `StrictIPRateLimitMiddleware` on each unauthenticated group | strict limiter on P2, P3, P4; **P1 has only the global IP floor**. Each of P2–P4 triggers an outbound call, so the limiter is what stops them being amplifiers |
 | G9 autolink admission | verified-claim availability | `ResolveOrLink` + `pkg/oidcboot.ValidateKind` at boot | P1, P2; fail-closed on P3/P4-C3 (no Email/Phone/Verified fields) |
 
@@ -84,25 +84,36 @@ rather than a leak.
 
 ## Cells that are open, not closed
 
-**Non-HS256 JWT-shaped arrivals under `kind=oauth2`, on P2 and P4.** A token whose
-header declares `alg: none` or an RS-family algorithm is refused *before* the
-signature is computed (algorithm-confusion defence), that failure carries
-`ErrJWTForeign`, and the credential is therefore forwarded to the vendor's
-`/userinfo` in a URL query. **No secret is needed to mint one**, and both endpoints
-are unauthenticated.
+**Closed since the JWT-shape refusal became unconditional** — kept here as a record of
+why it was open and what closed it, because the reasoning changed rather than the risk
+appetite.
 
-This is not closed, and deliberately so: under `kind=oauth2` a legitimate upstream
-opaque `access_token` may itself be JWT-shaped — many OAuth2 providers mint JWT
-access tokens — so classifying every pre-signature failure as ours would cut off C2,
-which is the reason these endpoints exist. An unattributable credential can only be
-forwarded.
+It was open on the grounds that a non-HS256 header is refused *before* the signature is
+computed (algorithm-confusion defence), the failure carries `ErrJWTForeign`, and an
+unattributable credential can only be forwarded — classifying every pre-signature failure
+as ours would cut off C2, which is why these endpoints exist. The accepted risk was that
+anyone could make this service write a string of their choosing into the vendor's access
+log, with the invariant intact because a token we did not sign is not our credential.
 
-What is being accepted: anyone can make this service write a string of their choosing
-into the vendor's access log. The stated invariant still holds — nothing **we issued**
-leaves — because a token we did not sign is not our credential. Endpoint IP limits
-throttle the rate; they do not close the channel. Pinned by
-`TestForeignJWTShape_IsForwardedUpstream_KnownOpenCell`, which skips with an
-explanation if the behaviour ever changes, so that "fixing" it cannot silently break C2.
+What closed it is a different argument, not a stricter reading of that one: this vendor's
+`access_token` is an **opaque UUID**, so a JWT-shaped value cannot be a valid credential
+for it whatever its signature says. Forwarding therefore cannot succeed — it can only
+leak. G12 refuses on shape × capability, so the signature question does not arise, and the
+"no secret needed to mint one" observation stops mattering.
+
+The generic worry that closing it would break C2 does not apply here, because the
+capability bit is what scopes it: a provider whose access tokens really are JWTs simply
+does not declare `OpaqueClientCredential`. Pinned by
+`TestForeignJWTShape_IsRefusedNotForwarded`, with the paired negative
+(`TestExchange_AbsentSecretStillForwardsOpaqueCredential`) asserting an opaque token still
+reaches `/userinfo`.
+
+**Prefixless legacy bot tokens.** `modules/bot_api/auth.go` still accepts bot tokens with
+no prefix, and those have no decidable shape and are not in the session store, so
+`OwnCredentialDetector` cannot recognise them. Deciding by a `robot`-table lookup would put
+a DB round trip on every unauthenticated request and turn these endpoints into an
+existence oracle for bot tokens. Whether any such token still exists in production is an
+operations question, on the human-verify list.
 
 **Prefixless legacy bot tokens.** `modules/bot_api/auth.go` still accepts bot tokens
 with no prefix ("bf_ prefix or legacy tokens"). Those have no decidable shape and are

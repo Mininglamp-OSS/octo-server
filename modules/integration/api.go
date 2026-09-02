@@ -326,7 +326,18 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 		// 完全合法的凭据认成另一个人,并拿到对方账号下的 API key。
 		// 包外已经拿不到原始查询(不导出),所以这里没有第二种写法。
 		identity, err := it.oidcDB.QueryIdentityExact(claims.Issuer, claims.Subject)
-		if err != nil {
+		switch {
+		case errors.Is(err, oidc.ErrIdentityCaseCollision):
+			// 折叠碰撞不是内部故障 —— 报 500 会误呼运维,也对客户端说了错的话。
+			// 对外与"未绑定"同一个响应(该主体确实无法安全绑定),但**日志单独一条**:
+			// 折叠碰撞与"确实没绑定"在日志里长得一样的话,运维查不出来。
+			it.Warn("OIDC identity differs only by case folding; refusing rather than "+
+				"resolving onto the stored account",
+				zap.String("issuer", claims.Issuer))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrIntegrationUserNotLinked, nil, nil)
+			c.Abort()
+			return
+		case err != nil:
 			it.Error("查询 OIDC identity 失败", zap.Error(err))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 			c.Abort()
