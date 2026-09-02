@@ -32,8 +32,16 @@ func autolinkPhoneFixture(t *testing.T, existingUID string) (*Service, *fakeIden
 	t.Helper()
 	store := &fakeIdentityStore{bindings: map[string]*IdentityModel{}}
 	users := &fakeUserLookup{
-		usersByPhone: map[string][]string{"0086|13812345678": {existingUID}},
-		loginResp:    &IssueSessionResp{UID: existingUID, LoginRespJSON: `{}`},
+		usersByPhone: map[string][]string{
+			"0086|13812345678": {existingUID},
+			// 固话也要注册,否则"固话不绑号"这条会因为**号码根本不在库里**而通过 ——
+			// 与解析器拒不拒绝它无关。那样的用例看起来钉住了收紧行为,实际上
+			// 把解析改回宽松也照样绿。
+			"0086|2112345678": {existingUID},
+			// 分隔符那条同理:要能区分"分隔符被剥掉后匹配上了"与"压根没匹配"。
+			"0086|13812345679": {"u-separator"},
+		},
+		loginResp: &IssueSessionResp{UID: existingUID, LoginRespJSON: `{}`},
 	}
 	cfg := ProviderConfig{
 		ID: "oidc", Issuer: "https://idp.example.com",

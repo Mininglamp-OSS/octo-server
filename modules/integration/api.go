@@ -223,15 +223,6 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 		var claims *oidc.IdentityClaims
 		var err error
 		credential := "upstream"
-		// 密钥缺失时无法归属判定,而该 provider 的 access_token 是不透明串,
-		// 所以 JWT 形态的凭据不可能是这条路上的合法凭据。见 oidc/jwt_shape.go。
-		if oidc.UnverifiableJWTMustNotBeForwarded(
-			it.bearerJWT != nil, it.provider.Capabilities(), raw) {
-			it.Warn("OIDC integration refused a JWT-shaped credential with no bearer verifier configured")
-			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
-			c.Abort()
-			return
-		}
 		if it.bearerJWT != nil {
 			bc, bcErr := it.bearerJWT.VerifyForAuthentication(raw, time.Now())
 			switch {
@@ -253,6 +244,16 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 				// 不是我们的(格式/alg/签名对不上)—— 回落到上游凭据路径。
 				// 这里刻意不打日志:每个上游凭据请求都会走到,打了就是噪声。
 			}
+		}
+		// 形态兜底:走到这里说明验不过或无从验。该 provider 的 access_token 是不透明串,
+		// 所以 JWT 形态不可能是合法凭据 —— 转发只会泄漏。与我方配没配密钥无关:
+		// 密钥轮换窗口里用旧密钥签的 token 同样落在这里,而那些确实是我方签发的。
+		if claims == nil && oidc.JWTShapedCredentialMustNotBeForwarded(
+			it.provider.Capabilities(), raw) {
+			it.Warn("OIDC integration refused a JWT-shaped credential that did not verify")
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
+			c.Abort()
+			return
 		}
 		if claims == nil {
 			// 回落上游之前的最后一道:这张凭据是不是**我们自己签发**的?

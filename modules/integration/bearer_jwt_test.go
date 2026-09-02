@@ -336,8 +336,13 @@ func TestBearerJWT_OurOwnRejectedTokenIsNotForwardedUpstream(t *testing.T) {
 	}
 }
 
-// 反面:**不是**我们的 token(签名对不上/根本不是 JWT)必须照常回落到上游 ——
-// 否则这个分流就把上游凭据路径掐断了。
+// **不是**我们的不透明凭据必须照常回落到上游 —— 否则这个分流就把上游凭据路径掐断了。
+//
+// 这条用例原先还断言"用别的密钥签的 JWT 也回落上游"。**那一半钉住的是一个漏洞**:
+// 异密钥签名的 JWT 里最现实的一类是**密钥轮换窗口期客户端手上的旧 token**,那些
+// 确确实实是我方签发的,回落等于把载荷 PII 和一份在旧密钥下合法的签名送进第三方
+// 的访问日志。而这个上游的 access_token 是不透明串,JWT 在这条路上本来也不可能
+// 成功 —— 回落既不安全也没用。现在改为就地拒绝,断言也随之反转。
 func TestBearerJWT_ForeignTokenStillFallsThroughToUpstream(t *testing.T) {
 	route, ctx, mp := setupBothCredentialsTest(t)
 	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com", mp.Subject())
@@ -353,7 +358,7 @@ func TestBearerJWT_ForeignTokenStillFallsThroughToUpstream(t *testing.T) {
 		"an opaque upstream token must still reach /userinfo; otherwise the split has "+
 			"broken the upstream credential path")
 
-	// 用别的密钥签的 JWT:签名对不上 = 不是我们的 → 也回落(然后被上游拒)。
+	// 用别的密钥签的 JWT:**不再回落**。见上方说明 —— 轮换窗口里的旧 token 就是这个形态。
 	foreign := signDesktopJWT(t, "a-different-secret-also-32-bytes!!", 2200006, "x",
 		time.Now().Add(-time.Minute))
 	mp.ResetRequestLog()
@@ -361,8 +366,10 @@ func TestBearerJWT_ForeignTokenStillFallsThroughToUpstream(t *testing.T) {
 	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
 		"/v1/integrations/oidc/spaces", foreign, nil))
 	assert.NotEqual(t, http.StatusOK, w.Code)
-	assert.NotEmpty(t, mp.LastUserInfoQuery(),
-		"a JWT signed with an unknown key is not ours, so it should fall through")
+	assert.Empty(t, mp.LastUserInfoQuery(),
+		"a JWT signed with a key we do not hold must not be forwarded: during a secret "+
+			"rotation that is our own previously-issued token, and this vendor's "+
+			"access_token is opaque so a JWT could not have succeeded anyway")
 }
 
 // -----------------------------------------------------------------------------

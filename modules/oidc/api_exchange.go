@@ -150,22 +150,15 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
-	// 密钥**缺失**时无法做任何归属判定,而这个 provider 的 access_token 是不透明串,
-	// 所以 JWT 形态的凭据在这条路上不可能合法 —— 转发它只可能泄漏。见 jwt_shape.go。
+	// 顺序有意:**先验签,后形态**。一张有效的业务 JWT 也是 JWT 形态。
 	//
-	// 上一轮只关了"密钥无效"。否掉那半的是同一条论证:客户端持有并使用**它自己的**
-	// 密钥,跟我方配没配无关。这次改的是谓词,两扇门一起。
-	if UnverifiableJWTMustNotBeForwarded(o.bearerJWT != nil, o.provider.Capabilities(), req.AccessToken) {
-		metricExchangeResult.WithLabelValues("unverifiable_jwt").Inc()
-		o.Warn("OIDC exchange: refused a JWT-shaped credential with no bearer verifier configured",
-			zap.String("trace_id", traceID))
-		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
-		return
-	}
+	// 在这个端点上两种顺序对客户端的结果相同(业务 JWT 都会被拒,该发 /exchange-jwt),
+	// 差别在上报的原因:认出是我们的记 own_business_jwt,只认出形态记 unverifiable_jwt。
+	// 而在 modules/integration 那扇门上顺序是功能性的 —— 那里有效的业务 JWT 必须通过。
 	if o.bearerJWT != nil {
 		if _, berr := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now()); berr == nil ||
 			!IsForeignToken(berr) {
-			// berr == nil:是一张有效业务 JWT,但发错了端点(该发 /exchange-jwt)。
+			// berr == nil:有效业务 JWT,但发错了端点(该发 /exchange-jwt)。
 			// !IsForeignToken:HMAC 已匹配,确定是我们签的,只是按自身条件被拒。
 			//
 			// 两种都不能回落上游:那条路把凭据放在 URL query 上,转发等于把载荷里的
@@ -178,6 +171,20 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
 			return
 		}
+	}
+
+	// 形态兜底:走到这里说明这张 token **验不过或无从验**。而该 provider 的
+	// access_token 是不透明串,所以 JWT 形态不可能是它的合法凭据 —— 转发只会泄漏。
+	//
+	// 与我方配没配密钥无关。上一版把这道守卫门控在"未配置"上,漏掉的正是**密钥
+	// 轮换**窗口:那时客户端手上还有用旧密钥签的 token,它们确实是我方签发的,
+	// HMAC 对不上新密钥就被判 foreign 然后外发。见 jwt_shape.go。
+	if JWTShapedCredentialMustNotBeForwarded(o.provider.Capabilities(), req.AccessToken) {
+		metricExchangeResult.WithLabelValues("unverifiable_jwt").Inc()
+		o.Warn("OIDC exchange: refused a JWT-shaped credential that did not verify",
+			zap.String("trace_id", traceID))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
 	}
 
 	// 第二道:排除**我方自己签发**的其它凭据(会话 token / uk_ / bf_ / app_)。

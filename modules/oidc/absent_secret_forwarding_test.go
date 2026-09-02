@@ -100,3 +100,76 @@ func TestOIDCKind_DoesNotDeclareOpaqueClientCredential(t *testing.T) {
 			"for it")
 	}
 }
+
+// 密钥**已配置**时,一张用别的密钥签的 JWT 同样不得转发。
+//
+// 这条是上一版守卫的漏洞:它门控在"验签器未配置"上,而它的论证 —— 该厂商的
+// access_token 是不透明串,JWT 不可能是它的合法凭据 —— **无条件成立**,与我方
+// 配没配密钥无关。门控让论证只覆盖了它的一半。
+//
+// 最现实的触发是**密钥轮换**:轮换窗口里客户端手上还有用旧密钥签的 token。
+// 那些 token 确确实实是我方签发的,HMAC 对不上新密钥 → 判为 foreign → 转发。
+// 于是"我方签发的凭据绝不外发"这条不变量在每次轮换时都破一次。
+func TestExchange_ForeignSignedJWTIsNotForwardedWhenSecretConfigured(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	prov, err := newOAuth2Provider(m.providerConfig())
+	require.NoError(t, err)
+	o := newOAuth2ExchangeTestOIDC(t, prov)
+	o.ownCred = newDetector(&fakeTokenReader{})
+	// 当前密钥已配置。
+	o.bearerJWT = newBearerJWTVerifierForTest(
+		[]byte("secret-A-current-32-bytes-long!!!"), prov.Issuer()+bearerJWTIssuerSuffix)
+
+	// 用轮换前的密钥签的 —— 我方签发过,但现在验不过。
+	tok := signBearerTesting(t, []byte("secret-B-previous-32-bytes-long!!"),
+		2200099, "desk.user", time.Now().Add(24*time.Hour))
+
+	m.mu.Lock()
+	m.LastUserInfoRequest = nil
+	m.mu.Unlock()
+	w := postExchange(o, `{"access_token":"`+tok+`"}`)
+
+	if w.Code == http.StatusOK {
+		t.Error("a token that does not verify must not authenticate")
+	}
+	m.mu.Lock()
+	last := m.LastUserInfoRequest
+	m.mu.Unlock()
+	if last != nil {
+		t.Errorf("a JWT-shaped credential was forwarded upstream (userinfo query=%q) with "+
+			"the secret configured. The vendor-fact justification holds regardless of our "+
+			"own configuration, so gating the refusal on 'verifier unconfigured' covered "+
+			"only half of it — and the realistic trigger is a secret rotation, where the "+
+			"forwarded token really is one we issued", last.Query.Encode())
+	}
+}
+
+// 反面(关键):**有效**的业务 JWT 必须仍然按它自己的语义处理,不能被形态守卫
+// 提前拒掉 —— 否则桌面端那条路整条断掉。这要求验签排在形态判定之前。
+func TestExchange_ValidBusinessJWTStillHandledByHMACNotShape(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	prov, err := newOAuth2Provider(m.providerConfig())
+	require.NoError(t, err)
+	o := newOAuth2ExchangeTestOIDC(t, prov)
+	o.ownCred = newDetector(&fakeTokenReader{})
+	secret := []byte("secret-A-current-32-bytes-long!!!")
+	o.bearerJWT = newBearerJWTVerifierForTest(secret, prov.Issuer()+bearerJWTIssuerSuffix)
+
+	tok := signBearerTesting(t, secret, 2200100, "desk.user", time.Now().Add(24*time.Hour))
+
+	m.mu.Lock()
+	m.LastUserInfoRequest = nil
+	m.mu.Unlock()
+	w := postExchange(o, `{"access_token":"`+tok+`"}`)
+
+	// 发错端点 → 401(该发 /exchange-jwt),但绝不是"被形态守卫拦掉"那种 401 ——
+	// 两者对客户端不可分,所以这里只能断言不外呼 + 不是 200。
+	if w.Code == http.StatusOK {
+		t.Error("/exchange must not accept a business JWT; that is /exchange-jwt's job")
+	}
+	m.mu.Lock()
+	if m.LastUserInfoRequest != nil {
+		t.Error("a valid business JWT was forwarded upstream")
+	}
+	m.mu.Unlock()
+}
