@@ -106,6 +106,64 @@ func EnvBool(primary, alias string, def bool) bool {
 	return def
 }
 
+// UpstreamBaseURL resolves the base URL that will actually be used.
+//
+// **Single definition of the fallback.** Under KindOAuth2 the issuer doubles as the
+// site root, so an unset base URL falls back to it. Both config readers must make this
+// decision identically, and they did not: the module tested the **untrimmed** value
+// (`p.BaseURL == ""`) while the settings helper trimmed first. A whitespace-only base URL
+// therefore made the module refuse to boot -- every OIDC route a 404 -- while the helper
+// took the fallback, reported "configured", and left `login.local_off` honoured: an
+// SSO-only deployment with no way to log in and no recovery short of a redeploy.
+//
+// Normalising inside ValidateKind was not enough, because this decision runs **before**
+// it. That is why the fallback itself has to live here.
+func UpstreamBaseURL(kind, baseURL, issuer string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL != "" {
+		return baseURL
+	}
+	if strings.TrimSpace(kind) != KindOAuth2 {
+		// Under the standard kind endpoints come from Discovery; substituting the issuer
+		// would make an unconfigured base URL look configured.
+		return ""
+	}
+	return strings.TrimSpace(issuer)
+}
+
+// ValidateLogoutURL checks one of the two RP-Initiated Logout URLs.
+//
+// **Single definition.** Both are boot-fatal in the module, and the settings helper had
+// no counterpart -- while its own doc comment claimed to mirror every fatal check and to
+// omit only non-fatal ones. A relative `OCTO_OIDC_POST_LOGOUT_REDIRECT_URI` therefore
+// produced the same total lockout as the cases above.
+//
+// Empty means "feature off" and is allowed. Non-empty must be absolute and https: both
+// values end up in a browser top-level navigation and the end-session URL carries an
+// id_token, so a misconfiguration can send a token to an arbitrary origin or execute
+// script on navigation. allowInsecure relaxes to http for development only.
+func ValidateLogoutURL(envName, raw string, allowInsecure bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oidcboot: invalid %s %q: %w", envName, raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("oidcboot: %s %q must be absolute (scheme://host/path)", envName, raw)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && allowInsecure {
+		return nil
+	}
+	return fmt.Errorf("oidcboot: %s %q must use https scheme "+
+		"(set OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 to allow http for dev)", envName, raw)
+}
+
 // ErrUnknownKind is returned for a provider kind this build does not implement.
 var ErrUnknownKind = errors.New("oidcboot: unknown provider kind")
 
@@ -131,6 +189,14 @@ type KindInput struct {
 	// "relax the pre-production logout URL" also open the production token
 	// endpoint, which carries the client secret.
 	AllowInsecureUpstream bool
+
+	// AllowInsecureLogout permits plain http for the two logout URLs (dev only).
+	// Deliberately a different flag from AllowInsecureUpstream -- see that field.
+	AllowInsecureLogout bool
+
+	// Issuer is the identity namespace. Under KindOAuth2 it doubles as the default
+	// base URL; that fallback is UpstreamBaseURL, which both callers must share.
+	Issuer string
 }
 
 // normalised trims every string field. A value that is only whitespace is not a
@@ -142,6 +208,7 @@ func (in KindInput) normalised() KindInput {
 	in.AppID = strings.TrimSpace(in.AppID)
 	in.EndSessionURL = strings.TrimSpace(in.EndSessionURL)
 	in.PostLogoutRedirectURI = strings.TrimSpace(in.PostLogoutRedirectURI)
+	in.Issuer = strings.TrimSpace(in.Issuer)
 	return in
 }
 
@@ -152,6 +219,22 @@ func (in KindInput) normalised() KindInput {
 // configured. The two statements must stay equivalent — that is the whole point
 // of this function existing.
 func ValidateKind(in KindInput) error {
+	if err := validateKindRules(in); err != nil {
+		return err
+	}
+	// Logout URL shape is kind-independent -- it is a property of the URL, not of the
+	// protocol. Checked **after** the kind rules so that a value which is not applicable
+	// to the kind at all reports that first, which is the more actionable message.
+	in = in.normalised()
+	if err := ValidateLogoutURL("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI",
+		in.PostLogoutRedirectURI, in.AllowInsecureLogout); err != nil {
+		return err
+	}
+	return ValidateLogoutURL("OCTO_OIDC_PROVIDER_END_SESSION_URL",
+		in.EndSessionURL, in.AllowInsecureLogout)
+}
+
+func validateKindRules(in KindInput) error {
 	// Normalise **here**, so the two callers cannot normalise differently.
 	//
 	// Unifying the rules was not enough: one reader trimmed its env values and the
@@ -362,6 +445,29 @@ var RefusedScenarios = []RefusedScenario{
 		ExpectKeyInError: "APP_ID",
 	},
 	{
+		// validateLogoutURL is boot-fatal in the module and had no counterpart in the
+		// settings helper, whose own doc comment says it mirrors every fatal check and
+		// "intentionally does NOT replicate non-fatal checks" -- these two are fatal.
+		// A relative post-logout redirect therefore 404s every OIDC route while the
+		// helper still reports configured, so `login.local_off` stays honoured.
+		Name: "relative post-logout redirect URI",
+		Input: KindInput{Kind: KindOIDC, PostLogoutRedirectURI: "/login",
+			AutoLinkByEmail: true, RequireEmailVerified: true},
+		Env: map[string]string{
+			"OCTO_OIDC_POST_LOGOUT_REDIRECT_URI": "/login",
+		},
+		ExpectKeyInError: "POST_LOGOUT_REDIRECT_URI",
+	},
+	{
+		Name: "plain-http end-session URL without the insecure opt-in",
+		Input: KindInput{Kind: KindOIDC, EndSessionURL: "http://idp.example.com/logout",
+			AutoLinkByEmail: true, RequireEmailVerified: true},
+		Env: map[string]string{
+			"OCTO_OIDC_PROVIDER_END_SESSION_URL": "http://idp.example.com/logout",
+		},
+		ExpectKeyInError: "END_SESSION_URL",
+	},
+	{
 		// The two config readers parsed booleans differently: one fell through to
 		// the legacy alias when the primary was present but unparseable, the other
 		// returned the default. With this exact env the module refuses to boot
@@ -462,6 +568,15 @@ var AcceptedScenarios = []AcceptedScenario{
 		"OCTO_OIDC_PROVIDER_KIND":            "oauth2",
 		"OCTO_OIDC_PROVIDER_APP_ID":          "app1",
 		"OCTO_OIDC_POST_LOGOUT_REDIRECT_URI": "https://app.example.com/login",
+	}},
+	// Recipe B of the whitespace lockout: whitespace is not a configured base URL, so
+	// under oauth2 it falls back to the issuer and the deployment boots. Both readers
+	// must reach that same conclusion -- they did not, because the fallback decision ran
+	// before normalisation and one side compared the untrimmed value. The decision now
+	// lives in UpstreamBaseURL.
+	{Name: "oauth2 with a whitespace-only base URL and a usable issuer", Env: map[string]string{
+		"OCTO_OIDC_PROVIDER_KIND":     "oauth2",
+		"OCTO_OIDC_PROVIDER_BASE_URL": "   ",
 	}},
 	{Name: "standard kind with a whitespace-only app id", Env: map[string]string{
 		"OCTO_OIDC_PROVIDER_APP_ID": " \t ",

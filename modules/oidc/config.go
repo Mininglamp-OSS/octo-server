@@ -3,7 +3,6 @@ package oidc
 import (
 	"encoding/base64"
 	"fmt"
-	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -282,9 +281,12 @@ func applyKindConstraints(p *ProviderConfig) error {
 		// BaseURL 回落 Issuer:该 kind 下 Issuer 的语义是"身份命名空间",
 		// 而多数部署里它同时就是站点根,所以可以兼作缺省值。
 		// 回落必须在校验之前 —— 规则看的是最终会被使用的值。
-		if p.BaseURL == "" {
-			p.BaseURL = p.Issuer
-		}
+		// 回落决策走 oidcboot.UpstreamBaseURL —— 单一定义。
+		//
+		// 这里曾经是 `p.BaseURL == ""`,拿**未 trim** 的值判断,而 modules/common
+		// 先 trim 再回落。空白值于是让本模块拒绝启动、镜像取到回落值报"已配置"。
+		// 归一化放进 ValidateKind 挡不住这一处 —— 这个决策跑在它**之前**。
+		p.BaseURL = oidcboot.UpstreamBaseURL(string(p.Kind), p.BaseURL, p.Issuer)
 		if err := kindRefusal(p); err != nil {
 			return err
 		}
@@ -325,34 +327,20 @@ func kindRefusal(p *ProviderConfig) error {
 		AutoLinkByEmail:       p.AutoLinkByEmail,
 		RequireEmailVerified:  p.RequireEmailVerified,
 		AllowInsecureUpstream: getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false),
+		AllowInsecureLogout:   getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false),
+		Issuer:                p.Issuer,
 	})
 }
 
-// validateLogoutURL 启动期 fail-loud 校验 RP-Initiated Logout 相关 URL 为绝对 https。
+// validateLogoutURL 委派 pkg/oidcboot.ValidateLogoutURL —— 单一定义。
 //
-// 空值视作"功能未开",直接放行(可选配置)。非空时必须是绝对地址且 https,拦
-// 相对地址 / javascript: / data: 等 —— 这两个值最终都会进浏览器顶层跳转,
-// EndSessionURL 还携带 id_token,误配会把 token 发去任意域或在导航时执行脚本。
-// 开发环境可用 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 放宽到 http(与 bind 的同名机制对齐)。
+// 曾经这里是唯一一份,而 modules/common 的镜像没有它,尽管那份镜像的注释声称
+// 覆盖了每一条致命检查、只跳过非致命的。这两条**是**致命的:一个相对的
+// POST_LOGOUT_REDIRECT_URI 会让全部 OIDC 路由变 404,而镜像照答"已配置",
+// login.local_off 继续生效 —— 与 kind 那一类同一个锁死。
 func validateLogoutURL(envName, raw string) error {
-	if raw == "" {
-		return nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("oidc: invalid %s %q: %w", envName, raw, err)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("oidc: %s %q must be absolute (scheme://host/path)", envName, raw)
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	if u.Scheme == "http" && getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false) {
-		return nil
-	}
-	return fmt.Errorf("oidc: %s %q must use https scheme "+
-		"(set OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 to allow http for dev)", envName, raw)
+	return oidcboot.ValidateLogoutURL(envName, raw,
+		getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false))
 }
 
 func getString(key, def string) string {

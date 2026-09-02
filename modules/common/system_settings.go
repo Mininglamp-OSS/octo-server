@@ -590,6 +590,11 @@ func isOIDCFullyConfigured() bool {
 
 		EndSessionURL:         os.Getenv("OCTO_OIDC_PROVIDER_END_SESSION_URL"),
 		PostLogoutRedirectURI: os.Getenv("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI"),
+		// Both logout URLs are boot-fatal in the module; omitting them here is what let
+		// a relative post-logout redirect 404 every OIDC route while this side still
+		// answered "configured".
+		AllowInsecureLogout: oidcEnvBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "", false),
+		Issuer:              oidcIssuerFromEnv(),
 
 		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
 		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),
@@ -608,14 +613,19 @@ func isOIDCFullyConfigured() bool {
 // The fallback has to be applied here too, because the refusal rules are about
 // the value that will actually be used, not the raw variable.
 func oidcUpstreamBaseURLFromEnv() string {
-	if v := strings.TrimSpace(os.Getenv("OCTO_OIDC_PROVIDER_BASE_URL")); v != "" {
-		return v
-	}
-	if os.Getenv("OCTO_OIDC_PROVIDER_KIND") != string(oidcboot.KindOAuth2) {
-		// Under the standard kind an empty base URL is the only valid state, and
-		// substituting the issuer would make it look like one was configured.
-		return ""
-	}
+	// Delegates the fallback decision to the single definition. This used to be a second
+	// implementation differing from the module's in exactly one way -- it trimmed first --
+	// and that was enough to produce a total login lockout: the module refused to boot on a
+	// whitespace-only value while this side took the fallback and reported "configured".
+	return oidcboot.UpstreamBaseURL(
+		os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		os.Getenv("OCTO_OIDC_PROVIDER_BASE_URL"),
+		oidcIssuerFromEnv(),
+	)
+}
+
+// oidcIssuerFromEnv reads the issuer with its legacy alias, matching the module's loader.
+func oidcIssuerFromEnv() string {
 	if v := strings.TrimSpace(os.Getenv("DM_OIDC_PROVIDER_ISSUER")); v != "" {
 		return v
 	}
