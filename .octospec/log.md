@@ -1727,3 +1727,43 @@ change-log convention (§7). Newest first.
 - **Learning** — `learnings/pending/extracting-a-helper-can-silently-drop-a-sibling.md`:
   after lifting anything out of a constructor, diff the *removed* region and check
   every `newXxxStore` still has a non-test caller.
+
+## 2026-09-02 — round 6: the classification boundary, and writing the matrix down
+
+Two independent `CHANGES_REQUESTED` converged on the same two blockers, both of
+them the round-5 defect reached through routes that fix had not enumerated.
+
+- **A sentinel cannot carry a stage judgement.** "Is this credential ours?" was
+  keyed on error identity, but `ErrJWTMalformed` is returned on both sides of
+  `hmac.Equal` — payload JSON, non-integer `exp`, claims decoding all fail *after*
+  the signature matched. A token bearing our own valid HMAC with a mistyped payload
+  was therefore forwarded to an IdP that takes credentials in the URL query. Fixed
+  by marking only the pre-/at-signature sites and inverting the predicate to an
+  allowlist, so a check added later defaults to "ours" and is refused locally.
+  The trigger is mundane (`iat: Date.now()/1000` unfloored) and the client reuses
+  the token for its whole life, so the leak was continuous.
+- **The guard's own construction failure was the unguarded cell.**
+  `modules/integration` logged and continued with a nil verifier — under a comment
+  saying it must not — and because the classification sits behind that nil check,
+  every desktop JWT went upstream unconditionally. Now every credential is refused
+  while the construction error is set; an absent secret stays a legal shape, pinned
+  by a paired negative test.
+- **Hoisting a guard hoists its code, not its justification.** Moving the subject
+  bound to a protocol-neutral funnel was right; taking the employee-number
+  heuristic with it was not — that path's subject is our own DB primary key, never
+  reused, and three existing tests went red. Split by what each half is a property
+  of (column vs producer); the producer half is now pinned by the conformance table
+  for both providers, which is how the standard-OIDC provider got it at all.
+- Also: `Capabilities().IDToken` + `EndSessionEndpoint()` on the interface instead
+  of a `*oidcProvider` assertion (any decorator silently lost RP-logout — including
+  the decorator design considered for the bounds guard this same round);
+  `AppIDPattern` from a mutable exported `var` to a function.
+- **Wrote the matrix I had dismissed** — `tasks/oidc-oauth2-provider-abstraction/guard-matrix.md`.
+  I retracted a reviewer's request for it on the grounds that it "produces no code
+  change", having measured it against the findings already in hand. Both of this
+  round's blockers sat in columns that request had named. Filling it in corrected
+  one imprecise cell and disproved one suspected gap, and it lists the cells still
+  open rather than closed.
+- **Learnings** — `a-sentinel-cannot-carry-a-stage-judgement.md`,
+  `a-guard-carries-its-justification-not-just-its-code.md`,
+  `when-a-defect-recurs-the-matrix-is-underspecified.md`.
