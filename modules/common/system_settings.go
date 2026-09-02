@@ -555,7 +555,13 @@ func isOIDCFullyConfigured() bool {
 	}
 	// Provider ID: empty falls back to "oidc" (matches loadProvider default),
 	// non-empty must satisfy the same regex or LoadConfig fails fatally.
-	providerID := os.Getenv("DM_OIDC_PROVIDER_ID")
+	// EnvString(会 trim),与 loadProvider 同一个读取器。
+	//
+	// 这里原本是裸 os.Getenv,而模块侧已 trim:DM_OIDC_PROVIDER_ID="   " 会让模块
+	// 回落 "oidc" 正常启动,而这里不过正则、报"未配置" → anyThirdPartyLoginConfigured
+	// 为假 → local_off 不被采信 → **在一个刻意关掉密码登录的部署上把它又打开了**。
+	// 方向与锁死相反,但同样是安全回退;三行之上的 required 循环正是为此迁过来的。
+	providerID := oidcboot.EnvString("DM_OIDC_PROVIDER_ID", "")
 	if providerID == "" {
 		providerID = "oidc"
 	}
@@ -598,6 +604,7 @@ func isOIDCFullyConfigured() bool {
 		// a relative post-logout redirect 404 every OIDC route while this side still
 		// answered "configured".
 		AllowInsecureLogout: oidcEnvBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "", false),
+		Issuer:              oidcIssuerFromEnv(),
 
 		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
 		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),

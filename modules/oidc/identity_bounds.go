@@ -45,6 +45,24 @@ var errIssuerTooLong = errors.New("issuer exceeds the identity column width")
 // 生效而非无条件 —— 由 AuthProvider 契约测试按 kind 分别钉住。见 checkUpstreamSubjectShape。
 //
 // 非空这条要显式写,不能指望长度检查:空串长度合法。
+// identityEmailMaxLen / identityPhoneMaxLen 是 user_oidc_identity 另外两列的宽度。
+//
+// 守卫原先只盖 issuer/subject,而 inserter 写的是四列。超长的 email/phone 会重演
+// 已经被修过两次的形态:IssueSession 先建号,之后 INSERT 失败(严格模式)或截断
+// (非严格),下一次登录 autolink 到那个孤立账号上、再失败同一个 INSERT —— 永久卡住。
+//
+// phone 只有 32 字节,而 inserter 写的是**未归一化的原始** claims.PhoneNumber,
+// 不是 normalizePhone 的产物 —— 所以一个带前缀和分隔符的上游值就能超。
+const (
+	identityEmailMaxLen = 255
+	identityPhoneMaxLen = 32
+)
+
+var (
+	errIdentityEmailTooLong = errors.New("email exceeds the identity column width")
+	errIdentityPhoneTooLong = errors.New("phone exceeds the identity column width")
+)
+
 func requireStorableIdentity(claims *IDTokenClaims) error {
 	if claims == nil {
 		return errors.New("claims are nil")
@@ -57,6 +75,13 @@ func requireStorableIdentity(claims *IDTokenClaims) error {
 	if len(issuer) > issuerMaxLen {
 		// 只回长度不回值 —— 与 subject 同样的理由,而 issuer 还可能含内部主机名。
 		return fmt.Errorf("%w: %d bytes, max %d", errIssuerTooLong, len(issuer), issuerMaxLen)
+	}
+	// email / phone 也要界 —— 见上方常量的说明。只回长度不回值:两者都是 PII。
+	if n := len(claims.Email); n > identityEmailMaxLen {
+		return fmt.Errorf("%w: %d bytes, max %d", errIdentityEmailTooLong, n, identityEmailMaxLen)
+	}
+	if n := len(claims.PhoneNumber); n > identityPhoneMaxLen {
+		return fmt.Errorf("%w: %d bytes, max %d", errIdentityPhoneTooLong, n, identityPhoneMaxLen)
 	}
 	return checkSubjectStorable(subject)
 }

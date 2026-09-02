@@ -115,14 +115,6 @@ a DB round trip on every unauthenticated request and turn these endpoints into a
 existence oracle for bot tokens. Whether any such token still exists in production is an
 operations question, on the human-verify list.
 
-**Prefixless legacy bot tokens.** `modules/bot_api/auth.go` still accepts bot tokens
-with no prefix ("bf_ prefix or legacy tokens"). Those have no decidable shape and are
-not in the session store, so `OwnCredentialDetector` cannot recognise them; catching
-them would mean a `robot`-table lookup on every unauthenticated request, which also
-turns these endpoints into an existence oracle. **Whether any such token still exists
-in production is an operations question, not one this repository can answer** — it is
-on the human-verify list.
-
 ## Reachability column — a guard that costs availability where there is nothing to guard
 
 `/exchange` and the two `modules/integration` endpoints now consult the session store on every

@@ -21,7 +21,11 @@
 //	  -> an SSO-only deployment has no working login path at all, and the only
 //	     recovery is a redeploy.
 //
-// Keeping the rules here means there is one copy. RefusedScenarios additionally
+// Keeping the rules here means there is one copy. That sentence was an overstatement for
+// several rounds — the boolean parser, the base-URL fallback, the alias resolution, the two
+// logout-URL checks and the issuer length bound each lived outside it and each produced the
+// same lockout when the two readers disagreed. They are all here now, and SharedEnvKeys
+// generates the pin scenarios so a new key cannot be added without both directions covered. RefusedScenarios additionally
 // pins the tests on both sides to the same table, so a future provider kind
 // cannot re-open the gap by being added in only one of them.
 //
@@ -72,6 +76,17 @@ func ValidAppID(appID string) bool { return appIDPattern.MatchString(appID) }
 const AppIDDescription = "alphanumeric first character, then letters/digits/underscore/hyphen, max 64 characters"
 
 var appIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+// IssuerMaxLen is the width of user_oidc_identity.issuer (VARCHAR(255)), compared in
+// bytes — intentionally conservative, see the subject bound's note.
+//
+// It lives here because both readers need it. newOAuth2Provider refuses an over-long
+// issuer at construction, which leaves cfg.Enabled true and provider nil: real routes
+// mount and every login entry point answers 500, while a settings helper that does not
+// know the rule reports "configured", `login.local_off` stays honoured, and an SSO-only
+// deployment cannot mint a session at all. That is the fifth field on which this exact
+// asymmetry has appeared.
+const IssuerMaxLen = 255
 
 // EnvString reads a string env var with an optional legacy alias.
 //
@@ -213,6 +228,11 @@ type KindInput struct {
 	// AllowInsecureLogout permits plain http for the two logout URLs (dev only).
 	// Deliberately a different flag from AllowInsecureUpstream -- see that field.
 	AllowInsecureLogout bool
+
+	// Issuer is the identity namespace. Its length is checked here (IssuerMaxLen); under
+	// KindOAuth2 it also doubles as the default base URL via UpstreamBaseURL, which each
+	// caller applies before constructing this struct.
+	Issuer string
 }
 
 // normalised trims every string field. A value that is only whitespace is not a
@@ -224,6 +244,7 @@ func (in KindInput) normalised() KindInput {
 	in.AppID = strings.TrimSpace(in.AppID)
 	in.EndSessionURL = strings.TrimSpace(in.EndSessionURL)
 	in.PostLogoutRedirectURI = strings.TrimSpace(in.PostLogoutRedirectURI)
+	in.Issuer = strings.TrimSpace(in.Issuer)
 	return in
 }
 
@@ -237,6 +258,14 @@ func ValidateKind(in KindInput) error {
 	if err := validateKindRules(in); err != nil {
 		return err
 	}
+	// Issuer length is kind-independent — it is the width of a column, not a protocol
+	// property. Checked here so both readers inherit it; the plain-OAuth2 provider also
+	// refuses it at construction, and those two must not be able to disagree.
+	if n := len(in.Issuer); n > IssuerMaxLen {
+		return fmt.Errorf("oidcboot: DM_OIDC_PROVIDER_ISSUER is %d bytes, exceeds the "+
+			"%d-byte identity column width", n, IssuerMaxLen)
+	}
+
 	// Logout URL shape is kind-independent -- it is a property of the URL, not of the
 	// protocol. Checked **after** the kind rules so that a value which is not applicable
 	// to the kind at all reports that first, which is the more actionable message.
@@ -603,67 +632,91 @@ var AcceptedScenarios = []AcceptedScenario{
 	}},
 }
 
-// AliasedRequiredKeys are the env pairs both config readers must resolve identically.
+// SharedEnvKeys is every environment key both config readers consult, with the legacy
+// alias where one exists and a value of the right shape for the fallback case.
 //
-// Declared once so the scenario tables below are **generated** from it: this class of bug
-// has now appeared on four separate fields (base URL, a boolean, the issuer, and the
-// required-key loop), each time because one reader trimmed and the other did not, and each
-// time the shared tables happened not to cover that particular field. Adding a pair here
-// gets both directions pinned automatically.
-var AliasedRequiredKeys = []struct{ Primary, Alias string }{
-	{"DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER"},
-	{"DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID"},
-	{"DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET"},
-	{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
+// **Declared once, with the scenario tables generated from it.** The whitespace-divergence
+// class has now appeared on six separate fields — base URL, a boolean, the issuer, the
+// required-key loop, the provider kind, and the provider id — and every single time the
+// cause was the same: the shared table happened not to list that one field. Enumerating
+// the credential fields only was the mistake; the axis is "every key either reader reads".
+//
+// Adding a key here pins both directions automatically. That is the point.
+var SharedEnvKeys = []struct {
+	Primary, Alias string
+	// Fallback is a legal value of the right shape, used to build the accepted case
+	// (whitespace primary + real value elsewhere). Empty means the key has no alias and
+	// only the refused direction is generated.
+	Fallback string
+	// WhitespaceIsFatal is true when a whitespace-only value with no fallback makes the
+	// module refuse to boot. False means the module falls back to a default, so the
+	// generated scenario belongs in the accepted table instead.
+	WhitespaceIsFatal bool
+}{
+	{Primary: "DM_OIDC_PROVIDER_ISSUER", Alias: "DM_OIDC_AEGIS_ISSUER",
+		Fallback: "https://legacy-issuer.example.com", WhitespaceIsFatal: true},
+	{Primary: "DM_OIDC_PROVIDER_CLIENT_ID", Alias: "DM_OIDC_AEGIS_CLIENT_ID",
+		Fallback: "legacy-cid", WhitespaceIsFatal: true},
+	{Primary: "DM_OIDC_PROVIDER_CLIENT_SECRET", Alias: "DM_OIDC_AEGIS_CLIENT_SECRET",
+		Fallback: "legacy-secret", WhitespaceIsFatal: true},
+	{Primary: "DM_OIDC_PROVIDER_REDIRECT_URI", Alias: "DM_OIDC_AEGIS_REDIRECT_URI",
+		Fallback: "https://legacy-app.example.com/callback", WhitespaceIsFatal: true},
+	// Not fatal: these fall back to a default, so whitespace must be *accepted* by both
+	// readers rather than refused. Getting that direction wrong is what silently re-enabled
+	// password login on a deployment that had turned it off.
+	{Primary: "OCTO_OIDC_PROVIDER_KIND"},
+	{Primary: "DM_OIDC_PROVIDER_ID"},
+	{Primary: "OCTO_OIDC_PROVIDER_BASE_URL"},
+	{Primary: "OCTO_OIDC_PROVIDER_APP_ID"},
 }
 
-// whitespaceAliasScenarios generates, for every aliased pair:
-//
-//   - refused: primary is whitespace and there is no alias to fall through to, so the
-//     value is absent and the deployment cannot boot;
-//   - accepted: primary is whitespace but the legacy alias holds a real value, so the
-//     fallback applies and the deployment boots.
-//
-// Whitespace is not a configured value. The two readers must agree on that for every pair,
-// and "for every pair" is the part that kept being missed.
-func whitespaceAliasScenarios() (refused []RefusedScenario, accepted []AcceptedScenario) {
-	for _, k := range AliasedRequiredKeys {
-		refused = append(refused, RefusedScenario{
-			Name: "whitespace-only " + k.Primary + " with no alias",
-			Input: KindInput{Kind: KindOIDC,
-				AutoLinkByEmail: true, RequireEmailVerified: true},
-			Env: map[string]string{
-				k.Primary: "   ",
-				k.Alias:   "",
-			},
-			SkipRuleCheck: true,
-		})
-		accepted = append(accepted, AcceptedScenario{
-			Name: "whitespace-only " + k.Primary + " falling back to " + k.Alias,
-			Env: map[string]string{
-				k.Primary: "   ",
-				k.Alias:   aliasFallbackValue(k.Primary),
-			},
-		})
+// whitespaceScenarios generates, for every key in SharedEnvKeys, the direction that key
+// actually has: refused when whitespace-with-no-alias makes the module unbootable,
+// accepted when it falls back to a default or to the alias.
+func whitespaceScenarios() (refused []RefusedScenario, accepted []AcceptedScenario) {
+	for _, k := range SharedEnvKeys {
+		if k.WhitespaceIsFatal {
+			env := map[string]string{k.Primary: "   "}
+			if k.Alias != "" {
+				env[k.Alias] = ""
+			}
+			refused = append(refused, RefusedScenario{
+				Name: "whitespace-only " + k.Primary + " with no alias",
+				Input: KindInput{Kind: KindOIDC,
+					AutoLinkByEmail: true, RequireEmailVerified: true},
+				Env:           env,
+				SkipRuleCheck: true,
+			})
+		}
+		acc := map[string]string{k.Primary: "   "}
+		if k.Alias != "" && k.Fallback != "" {
+			acc[k.Alias] = k.Fallback
+		}
+		name := "whitespace-only " + k.Primary
+		if k.Alias != "" && k.Fallback != "" {
+			name += " falling back to " + k.Alias
+		} else {
+			name += " falling back to its default"
+		}
+		accepted = append(accepted, AcceptedScenario{Name: name, Env: acc})
 	}
 	return refused, accepted
 }
 
-// aliasFallbackValue supplies a value of the right shape for each key, since the readers
-// validate shape (absolute URL, regex) and not merely non-emptiness.
-func aliasFallbackValue(primary string) string {
-	switch primary {
-	case "DM_OIDC_PROVIDER_ISSUER":
-		return "https://legacy-issuer.example.com"
-	case "DM_OIDC_PROVIDER_REDIRECT_URI":
-		return "https://legacy-app.example.com/callback"
-	default:
-		return "legacy-value"
-	}
+// 一个超出列宽的 issuer 必须被两个 reader 一致拒绝。
+var overlongIssuerScenario = RefusedScenario{
+	Name: "issuer longer than the identity column",
+	Input: KindInput{Kind: KindOIDC, Issuer: strings.Repeat("i", IssuerMaxLen+1),
+		AutoLinkByEmail: true, RequireEmailVerified: true},
+	Env: map[string]string{
+		"DM_OIDC_PROVIDER_ISSUER": "https://" + strings.Repeat("i", IssuerMaxLen) + ".example.com",
+	},
+	ExpectKeyInError: "ISSUER",
 }
 
 func init() {
-	r, a := whitespaceAliasScenarios()
+	r, a := whitespaceScenarios()
 	RefusedScenarios = append(RefusedScenarios, r...)
+	RefusedScenarios = append(RefusedScenarios, overlongIssuerScenario)
 	AcceptedScenarios = append(AcceptedScenarios, a...)
 }

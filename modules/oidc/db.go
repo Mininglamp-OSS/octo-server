@@ -38,8 +38,15 @@ func NewDB(ctx *config.Context) *DB {
 // 查询,把这个口子开了一半。改成"包外只能拿到复核版"之后,这类绕过是**编译期**
 // 挡住的,不依赖谁记得加守卫。
 //
-// 不匹配时返回 (nil, nil),与"没有绑定"同义 —— 调用方无需区分两者:
-// 后续 Insert 会被 ci 唯一键挡成 1062 → 竞态恢复再查仍不匹配 → 拒绝登录并留审计。
+// 三种结果必须区分:
+//   - 逐字节命中 → 返回该行;
+//   - 确实没有行 → (nil, nil),即"首次登录";
+//   - ci 命中但不是逐字节相等 → ErrIdentityCaseCollision。
+//
+// 第三种曾经也报 (nil, nil)。那样 ResolveOrLink 会回 IsNew=true,调用方随即
+// IssueSession(CreateUser=true) 把用户行建出来,之后 Insert 才撞 1062,竞态恢复
+// 走同一个逐字节查询、同样看不见 —— 每次登录尝试留一个孤立 user 行然后永久失败。
+// 现在拒绝落在 ResolveOrLink 里,在任何副作用之前。
 // 也就是把静默合并换成响亮拒绝。
 func (d *DB) QueryIdentityExact(issuer, subject string) (*IdentityModel, error) {
 	row, err := d.queryIdentityByIssuerSubject(issuer, subject)

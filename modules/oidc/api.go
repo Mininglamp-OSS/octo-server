@@ -1036,8 +1036,15 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	resp := map[string]interface{}{"status": 200}
 	// 取当前请求 token 对应的 id_token,用于 RP-Initiated Logout 的 id_token_hint
 	// (仅 OIDC;plain-OAuth2 下 idTokens 未启用,Take 返空,LoutURL 会按自身逻辑拼 SLO URL)。
+	// Take 是 GETDEL —— 一次性。所以只在**确定有人会用它**时才取:provider 存在
+	// 且这个 kind 真的消费 id_token_hint。原先无条件先取再问 provider,于是
+	// LogoutURL 返 ("", false) 时那张 token 就白烧了,重试也拿不回来 ——
+	// 被删掉的 buildEndSessionURL 正是为此先校验端点后取,并写了注释。
+	//
+	// 今天这条改动不改变任何可达行为:idTokens 只在端点启动期校验通过时才构造,
+	// 而那时 LogoutURL 不会返 false。保留顺序是给第三个 provider 用的。
 	var idToken string
-	if o.idTokens != nil {
+	if o.idTokens != nil && o.provider != nil && o.provider.Capabilities().IDToken {
 		if t, err := o.idTokens.Take(ctx, uid); err == nil {
 			idToken = t
 		} else {

@@ -13,6 +13,8 @@ package oidc
 import (
 	"context"
 	"fmt"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 )
 
 // AuthProviderResult 构造结果。
@@ -52,7 +54,7 @@ func NewAuthProvider(ctx context.Context, cfg ProviderConfig, onWarn func(msg st
 		}
 		return &AuthProviderResult{Provider: prov}, nil
 
-	default:
+	case KindOIDC:
 		// KindOIDC,以及存量未配 KIND 的部署:Discovery → JWKS → 包装。
 		// 这一步会发网络请求,所以调用方要给 ctx 带超时。
 		client, err := NewClient(ctx, ClientConfig{
@@ -78,5 +80,17 @@ func NewAuthProvider(ctx context.Context, cfg ProviderConfig, onWarn func(msg st
 			return nil, fmt.Errorf("oidc: wrap oidc provider: %w", err)
 		}
 		return &AuthProviderResult{Provider: prov, Client: client}, nil
+
+	default:
+		// 未知 kind **拒绝**,不猜。
+		//
+		// 这里原本是 default 分支去建标准 OIDC 客户端,于是一个拼错的 kind
+		// (或一个带空白没被归一化的值)会静默变成"对着一个没有 Discovery 文档的
+		// IdP 做 Discovery":NewClient 失败 → provider 为 nil → 全端点 500,
+		// 而运维手上只有一个拼写错误和一堆 500。
+		//
+		// 启动期 ValidateKind 也会拒未知 kind,这里是纵深防御:两处判据必须一致,
+		// 而"猜一个默认实现"与那条规则直接矛盾。
+		return nil, fmt.Errorf("%w: %q", oidcboot.ErrUnknownKind, cfg.Kind)
 	}
 }

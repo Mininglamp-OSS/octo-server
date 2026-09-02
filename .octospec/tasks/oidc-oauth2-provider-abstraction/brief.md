@@ -116,9 +116,21 @@ Key properties:
   18-digit `sub`. We therefore use an **isolated issuer namespace**: the
   configured upstream issuer plus a `#bearer-jwt` suffix, so the two identity
   sources cannot collide on `(issuer, subject)`. Deriving it rather than taking
-  a second environment knob means per-environment isolation is inherited from
-  the upstream issuer (already mandatory and validated at boot), and there is no
-  way to misconfigure the two against each other. `#` cannot occur in a valid
+  a second environment knob removes a way to misconfigure the two against each
+  other.
+
+  **Correction — it confers no *environment* isolation.** An earlier version of
+  this paragraph said per-environment isolation was inherited from the upstream
+  issuer. That is wrong: the namespace is computed from *this* deployment's
+  configured issuer, not from anything inside the token. A token signed in
+  staging under the same `OCTO_OIDC_BEARER_JWT_SECRET` verifies here, maps to
+  `<prod issuer>#bearer-jwt` plus the same `userId`, and therefore authenticates
+  as the corresponding production user. With no `iss`, no `aud` and no `jti`,
+  **secret uniqueness per environment is the only control** — and on the
+  integration endpoints that credential is a standing authenticator with an
+  `exp`-length (~15 day) replay window. See Pending for the `aud` binding and the
+  single-purpose-secret precondition, which this makes a per-environment
+  requirement rather than merely a good practice. `#` cannot occur in a valid
   issuer URI, so the suffix is unambiguous. The derivation refuses an empty
   upstream issuer, an already-suffixed value, and anything that would exceed the
   255-byte `issuer` column (silent MySQL truncation could otherwise merge two
@@ -469,6 +481,57 @@ fail-safe (over-redaction) and arguably desirable for invite codes too, but it r
 debuggability outside this feature and belongs in the inventory rather than in a diff.
 
 ## Pending / follow-up (not blocking this PR)
+
+### callback ↔ completeExchange parity — recorded, not fixed
+
+Asked for over three rounds as "fix or record as intentional". Recording it, with the
+reason it is not being fixed here.
+
+- **A session minted through `/exchange` never caches its `id_token`**, so it can never
+  perform RP-Initiated Logout. `completeExchange` does not call `saveIDToken`; the callback
+  path does. This is the same class of silently-lost security control this PR already
+  regressed once by dropping the store wiring — reached by a different route. Not fixed
+  here because the exchange endpoints are now opt-in and default off, so no existing
+  deployment is affected, and the deployment this PR targets is `kind=oauth2`, where
+  RP-logout uses the vendor SLO URL and needs no `id_token`. It becomes real the day a
+  `kind=oidc` deployment turns `/exchange` on.
+- **`user_verification` is never upserted for exchange-only users.** The callback path
+  calls `UpsertVerificationFromOIDC` when the claims carry verified real-name fields;
+  `completeExchange` does not. So realname state stays stale for a user who only ever signs
+  in through `/exchange`. Same reachability argument as above.
+
+Both are one call each in `exchange_complete.go`. They are left out because adding them
+means the exchange tail starts writing to two more tables, and that deserves its own change
+with its own tests rather than being appended to a review-fix commit.
+
+### Deliberately not fixed, with the reasoning
+
+- **`OwnCredentialDetector.Classify` fail-open early returns** (nil detector, nil reader)
+  contradict the file's own "undecidable must be an error" contract. Unreachable today:
+  `New()` always supplies a real `*config.Context` and `auth.SessionStoreForContext` panics
+  rather than returning nil. Left as is because the honest fix is to make the constructor
+  return an error, which changes its signature and every call site for a state that cannot
+  occur.
+- **`looksLikeJWT` uses `RawURLEncoding.Strict()`**, so a client emitting standard-alphabet
+  base64 falls through the shape guard *and* through `VerifyHS256JWT`, which uses the same
+  decoder. Not a conforming JWT, so not a realistic arrival; noted because the guard's
+  conservative direction is documented as "a miss falls back to the previous behaviour" and
+  this is the concrete instance.
+- **`/exchange-jwt` has no one-shot redemption** despite being specified as a one-shot
+  exchange. The 10-minute `iat` ceiling is the documented mitigation. Consuming a digest of
+  the token in Redis would close the replay window, but it puts a Redis round trip and a new
+  failure mode on an authentication path, which is a design change rather than a fix.
+
+### Vendor facts this branch depends on and has never observed
+
+`OpaqueClientCredential` (G12's gate) and `SubjectMayBeReusedPersonnelID` (G5's gate) both
+rest on properties of the upstream that no captured response has confirmed: that the
+`access_token` is an opaque UUID, and that `sub` is a reused personnel identifier. The
+guards fail safe if either is wrong — a JWT-shaped token would be refused rather than
+forwarded, and a short numeric subject would be refused rather than stored — but both
+belong on the human-verify list, alongside the unmeasured `/userinfo` subject shape and the
+five `OCTO_OIDC_LIVE_TEST=1` tests that have never run.
+
 
 - **Session TTL ceiling for SSO users** — tightening `Cache.TokenExpire` (default
   30d) for SSO-issued sessions; depends on ops confirming the upstream

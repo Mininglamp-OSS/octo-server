@@ -161,9 +161,18 @@ func loadProvider() (ProviderConfig, error) {
 		ID:   getStringWithAlias("DM_OIDC_PROVIDER_ID", "", "oidc"),
 		Name: getStringWithAlias("DM_OIDC_PROVIDER_NAME", "", "SSO"),
 		// 缺省 oidc:存量部署无此 env,行为必须不变。
-		Kind:         ProviderKind(getString("OCTO_OIDC_PROVIDER_KIND", string(KindOIDC))),
-		BaseURL:      getString("OCTO_OIDC_PROVIDER_BASE_URL", ""),
-		AppID:        getString("OCTO_OIDC_PROVIDER_APP_ID", ""),
+		// Kind / BaseURL / AppID 走 oidcboot.EnvString(会 trim),不用 getString。
+		//
+		// Kind 是**决定用哪个实现**的字段,而 ValidateKind / UpstreamBaseURL 内部都归一化 ——
+		// 两边看到不同的值有两条后果,第二条尤其难查:
+		//   - 无 BASE_URL:校验按 oauth2 要求 base URL 而拒绝启动,镜像却报"已配置" → 锁死;
+		//   - 有 BASE_URL:LoadConfig **成功**,但下面 applyKindConstraints 的 switch 与
+		//     NewAuthProvider 的 switch 都拿未 trim 的值比,双双落 default → oauth2 的收窄
+		//     一条不生效,且对一个没有 Discovery 的 IdP 做标准 OIDC Discovery → 全端点 500。
+		//     配置看起来是好的,这是静默走错协议。
+		Kind:         ProviderKind(kindFromEnv()),
+		BaseURL:      oidcboot.EnvString("OCTO_OIDC_PROVIDER_BASE_URL", ""),
+		AppID:        oidcboot.EnvString("OCTO_OIDC_PROVIDER_APP_ID", ""),
 		Issuer:       getStringWithAlias("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER", ""),
 		ClientID:     getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID", ""),
 		ClientSecret: getStringWithAlias("DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET", ""),
@@ -328,6 +337,7 @@ func kindRefusal(p *ProviderConfig) error {
 		RequireEmailVerified:  p.RequireEmailVerified,
 		AllowInsecureUpstream: getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false),
 		AllowInsecureLogout:   getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false),
+		Issuer:                p.Issuer,
 	})
 }
 
@@ -340,6 +350,17 @@ func kindRefusal(p *ProviderConfig) error {
 func validateLogoutURL(envName, raw string) error {
 	return oidcboot.ValidateLogoutURL(envName, raw,
 		getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false))
+}
+
+// kindFromEnv 读 provider kind,空白视作未配置(回落默认 kind)。
+//
+// 单独一个函数是为了让"这个字段必须归一化"这件事有个可指的地方 —— 它决定分派,
+// 而分派与校验看到不同的值会静默走错协议。
+func kindFromEnv() string {
+	if v := oidcboot.EnvString("OCTO_OIDC_PROVIDER_KIND", ""); v != "" {
+		return v
+	}
+	return string(KindOIDC)
 }
 
 func getString(key, def string) string {
