@@ -133,6 +133,11 @@ type OIDC struct {
 	// bearerJWT 业务后端自签 HS256 JWT 的验签器;nil 表示该路径未启用。
 	bearerJWT *BearerJWTVerifier
 
+	// ownCred 判定"这张凭据是不是本服务自己签发的"(会话 token / uk_ / bf_)。
+	// /exchange 会把客户端出示的凭据交给 provider,而 plain-OAuth2 那条把它放在
+	// URL query 上,所以外呼前必须先排除我方凭据。见 own_credential.go。
+	ownCred *OwnCredentialDetector
+
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
 	//
@@ -185,6 +190,7 @@ func New(ctx *config.Context) *OIDC {
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
 	o.tokenKill = auth.SessionStoreForContext(ctx)
+	o.ownCred = NewOwnCredentialDetector(ctx)
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
 		callbackGuardThresholdFromEnv(),
@@ -1545,12 +1551,17 @@ func hasCompleteVerificationClaims(c *IDTokenClaims) bool {
 // 硬编码,避免将来改前缀时漏改这一处。ctx 缺失时回落默认值而不是 panic ——
 // 拿不到前缀的后果只是 device_flag 解析失败(降级踢全部,见调用方),
 // 不值得让一次 logout 变成 500。
-func (o *OIDC) tokenCachePrefix() string {
+func (o *OIDC) tokenCachePrefix() string { return sessionTokenCachePrefix(o.ctx) }
+
+// sessionTokenCachePrefix 同上,但不绑定 *OIDC —— OwnCredentialDetector 也要用
+// 同一个前缀,而它没有 *OIDC。两处各拼一次就是一份会漂移的副本,而漂移的后果是
+// 会话查询查不到 → 凭据被当成"不是我们的" → 转发上游。
+func sessionTokenCachePrefix(ctx *config.Context) string {
 	const def = "token:"
-	if o.ctx == nil {
+	if ctx == nil {
 		return def
 	}
-	if p := o.ctx.GetConfig().Cache.TokenCachePrefix; p != "" {
+	if p := ctx.GetConfig().Cache.TokenCachePrefix; p != "" {
 		return p
 	}
 	return def

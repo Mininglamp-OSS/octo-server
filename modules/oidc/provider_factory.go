@@ -45,6 +45,7 @@ func NewAuthProvider(ctx context.Context, cfg ProviderConfig, onWarn func(msg st
 			Scopes:                cfg.Scopes,
 			AppID:                 cfg.AppID,
 			PostLogoutRedirectURI: cfg.PostLogoutRedirectURI,
+			HTTPTimeout:           cfg.HTTPTimeout,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("oidc: build oauth2 provider: %w", err)

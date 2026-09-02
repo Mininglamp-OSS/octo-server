@@ -420,6 +420,9 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	if err != nil {
 		return nil, err
 	}
+	if err := recheckSnapshotIdentity("oidc bind Confirm", claims); err != nil {
+		return nil, err
+	}
 	sd, err := decodeSDSnapshot(sess.SDSnapshot)
 	if err != nil {
 		return nil, err
@@ -541,6 +544,9 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 	}
 	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
 	if err != nil {
+		return nil, err
+	}
+	if err := recheckSnapshotIdentity("oidc bind Create", claims); err != nil {
 		return nil, err
 	}
 	if err := s.checkClaimsForCreate(claims); err != nil {
@@ -820,4 +826,31 @@ func (s *BindService) methodEnabled(m BindMethod) bool {
 // 当前 P0 用 time.Now,deterministic 需求落到后续 PR 再说。
 var nowUnix = func() int64 {
 	return time.Now().Unix()
+}
+
+// recheckSnapshotIdentity 对**解出来的快照**重跑身份准入。
+//
+// 为什么签发处已经查过还要再查一遍:守卫跑在快照签发处(IssueWithReason),而
+// 升级那一刻已经躺在 Redis 里的快照是**上一个版本**写的 —— 那个版本在标准 OIDC
+// 那条路没有任何长度上限,工号下限也还没加。而本模块刻意兼容旧格式快照
+// (bind_claims_compat_test.go 钉着这条,理由是升级瞬间在途的绑定不能全挂),
+// 于是在 token TTL 窗口内(默认 5 分钟,运维可调大),一份旧快照仍能走完
+// Confirm / Create,重现这个改动花了几轮堵的两种结局:严格 sql_mode 下 Create
+// 先建用户再插 identity 失败,留下孤立用户;非严格模式下截断合并,不可逆。
+//
+// 这是"守卫装在哪里"之外的另一个维度:快照的寿命跨越部署边界。同一个理由
+// 已经在 Create 里为 issuerAllowedForCreate 写过一次 —— TTL 窗口内世界会变,
+// 只是那次变的是 allowlist,这次变的是我方的准入规则本身。
+//
+// 两道都要:requireStorableIdentity 是存储性质(所有来源),
+// checkUpstreamSubjectShape 是上游断言的性质 —— 而绑定快照正是 callback 路径
+// 存下来的,subject 由上游给出,所以适用。
+func recheckSnapshotIdentity(ctxName string, claims *IDTokenClaims) error {
+	if err := requireStorableIdentity(claims); err != nil {
+		return fmt.Errorf("%s: %w", ctxName, err)
+	}
+	if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
+		return fmt.Errorf("%s: %w", ctxName, err)
+	}
+	return nil
 }

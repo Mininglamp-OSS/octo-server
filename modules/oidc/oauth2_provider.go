@@ -283,6 +283,14 @@ type oauth2ProviderConfig struct {
 	// PostLogoutRedirectURI 登出后回跳地址,必须由运维写死。单一取值即白名单,
 	// 因此无需再做 redirect 校验;若改为接受调用方传入则是开放重定向。
 	PostLogoutRedirectURI string
+
+	// HTTPTimeout 单次上游调用的整体超时;零值回落 oauth2HTTPTimeout。
+	//
+	// 从 ProviderConfig.HTTPTimeout 透传。原先这里没有这个字段、超时写死 ——
+	// 于是运维配的 DM_OIDC_PROVIDER_HTTP_TIMEOUT 在这个 kind 下被静默忽略,
+	// 而"没有配置项可以静默无效"正是本模块启动期拒绝 BASE_URL / APP_ID /
+	// END_SESSION_URL 时立的规矩。
+	HTTPTimeout time.Duration
 }
 
 // oauth2Provider 只讲标准 OAuth2 authorization_code 的 IdP 适配器。
@@ -438,8 +446,13 @@ const (
 // 降级剥离 Authorization 头,但我们的凭据在 URL 上而不在 header,任何重定向都会
 // 重放——这是比 SSRF 更糟的凭据外泄路径)。非 2xx 统一由上层当 transport error 处理。
 func (p *oauth2Provider) httpClient() *http.Client {
+	timeout := p.cfg.HTTPTimeout
+	if timeout <= 0 {
+		// 零值/负值回落默认 —— 绝不能变成"无超时":被吊死的上游会永久占住 goroutine。
+		timeout = oauth2HTTPTimeout
+	}
 	return &http.Client{
-		Timeout: oauth2HTTPTimeout,
+		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

@@ -11,6 +11,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // issuer 与 subject 同在 uk_issuer_subject 里,超长的后果一样(截断则两个命名
@@ -167,4 +168,35 @@ func TestAuthProviderConformance_RefusesShortNumericUpstreamSubject(t *testing.T
 				"employee's account")
 		}
 	})
+}
+
+// DM_OIDC_PROVIDER_HTTP_TIMEOUT 在 kind=oauth2 下必须真的生效。
+//
+// 本 PR 自己立的规矩是"没有配置项可以静默无效" —— ValidateKind 拒绝 BASE_URL /
+// APP_ID / END_SESSION_URL 就是为了这个。超时被硬编码成 10s 而运维配的值被忽略,
+// 是同一条规矩的反例:排障时会得出"我明明调过超时"的错误结论。
+func TestOAuth2Provider_HonoursConfiguredHTTPTimeout(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	cfg := m.providerConfig()
+	cfg.HTTPTimeout = 3 * time.Second
+	p, err := newOAuth2Provider(cfg)
+	if err != nil {
+		t.Fatalf("newOAuth2Provider: %v", err)
+	}
+	if got := p.httpClient().Timeout; got != 3*time.Second {
+		t.Errorf("http client timeout = %v, want the configured 3s; a silently ignored "+
+			"setting makes an operator conclude they already tuned it", got)
+	}
+}
+
+// 未配置时回落到默认值,不能变成"无超时"—— 那会让被吊死的上游永久占住 goroutine。
+func TestOAuth2Provider_DefaultsHTTPTimeoutWhenUnset(t *testing.T) {
+	m := newMockOAuth2Provider(t)
+	p, err := newOAuth2Provider(m.providerConfig()) // HTTPTimeout 零值
+	if err != nil {
+		t.Fatalf("newOAuth2Provider: %v", err)
+	}
+	if got := p.httpClient().Timeout; got != oauth2HTTPTimeout {
+		t.Errorf("http client timeout = %v, want the %v default", got, oauth2HTTPTimeout)
+	}
 }

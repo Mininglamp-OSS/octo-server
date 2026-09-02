@@ -67,6 +67,11 @@ type Integration struct {
 	// 是纯运维手滑(31 字节密钥),而"密钥太短"正是泄漏签名材料最要命的场景。
 	bearerJWTErr error
 
+	// ownCred 判定"这张凭据是不是本服务自己签发的"。见 oidc.OwnCredentialDetector:
+	// 归属判定原先只覆盖"我们签的 HS256 JWT",而会话 token / uk_ / bf_ 同样是我方
+	// 凭据、却不是 JWT,于是整类掉出分类被转发到上游的 URL query 上。
+	ownCred *oidc.OwnCredentialDetector
+
 	apiKeyService botfather.UserAPIKeyService
 	groupService  group.IService
 	rateRedis     *rd.Client
@@ -110,6 +115,8 @@ func New(ctx *config.Context) *Integration {
 	// issuer 命名空间派生)。在这里重写就又是一份会漂移的副本,而这里漂移的
 	// 后果是命名空间不一致 —— 同一个人在两条路径下被认成两个账号,
 	// 且 (issuer, subject) 落库后不可逆。
+	it.ownCred = oidc.NewOwnCredentialDetector(ctx)
+
 	bv, bverr := oidc.NewBearerJWTVerifier(cfg.Provider)
 	if bverr != nil {
 		// 配置错误(密钥太短 / issuer 派生失败)不能静默降级成"这条路径不可用" ——
@@ -239,6 +246,33 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 			}
 		}
 		if claims == nil {
+			// 回落上游之前的最后一道:这张凭据是不是**我们自己签发**的?
+			//
+			// 位置有意放在外呼的紧邻上游,而不是函数开头 —— 守卫要挡的就是这一次
+			// 外呼,放在这里它的作用域一眼可读,且桌面端 JWT 验签成功时根本走不到。
+			//
+			// 上面那道 IsForeignToken 回答不了这个问题:它判的是"是不是我们签的
+			// HS256 JWT",而会话 token / uk_ / bf_ 不是 JWT,一进 strings.Split 就
+			// 被归成"不是我们的"。那是个真值判断,只是问错了问题。
+			kind, cerr := it.ownCred.Classify(c.Request.Context(), raw)
+			switch {
+			case cerr != nil:
+				// 判不出归属(会话存储不可用)。转发等于把这道守卫的失败方向设成
+				// 泄漏,所以就地拒绝 —— 会话存储不可用时整个服务的鉴权本来也是挂的。
+				it.Error("OIDC integration cannot establish credential provenance; refusing "+
+					"rather than forwarding to the upstream IdP", zap.Error(cerr))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+				c.Abort()
+				return
+			case kind != oidc.OwnCredentialNone:
+				// 我方凭据。它不是对这两个端点的身份断言,转发出去只会把可重放的
+				// 材料送进第三方访问日志。只记类别,不记凭据本身。
+				it.Warn("OIDC integration refused a credential this service issued",
+					zap.String("own_credential_kind", string(kind)))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
+				c.Abort()
+				return
+			}
 			claims, err = it.provider.IdentityFromClientCredential(c.Request.Context(), raw)
 		}
 		if claims == nil || err != nil {

@@ -124,6 +124,32 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 	// 早先这里硬编码成 &TokenSet{AccessToken: ...},于是在标准 OIDC kind 下
 	// 永远失败(oidcProvider.Identity 要求 RawIDToken)—— 存量部署白得一个只会
 	// 返 401 的无认证端点。上层不该知道该往哪个字段放,那是 provider 的事。
+	// 外呼之前先排除**我方自己签发**的凭据。
+	//
+	// 这条路撞上的概率比 integration 那两个端点还高:/exchange 与 /exchange-jwt
+	// 请求体一模一样、字段都叫 access_token(见文件头),发错端点只会得到一个
+	// 无差别 401 —— 而在 plain-OAuth2 下,凭据那时已经进了上游的 URL query。
+	switch kind, cerr := o.ownCred.Classify(c.Request.Context(), req.AccessToken); {
+	case cerr != nil:
+		// 判不出归属(会话存储不可用)。不能回落上游:那等于把守卫的失败方向
+		// 设成泄漏,而且不可观测 —— 客户端只看到 401,凭据已经出去了。
+		metricExchangeResult.WithLabelValues("provenance_undecided").Inc()
+		o.Error("OIDC exchange: cannot establish credential provenance; refusing rather "+
+			"than forwarding to the upstream IdP",
+			zap.String("trace_id", traceID), zap.Error(cerr))
+		// 走 i18n 门面而不是裸 JSON:这是普通的运维故障 500,不属于本文件顶部
+		// 那条"协议端点原样响应"的豁免(那条是给浏览器/原生重定向入口的)。
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	case kind != OwnCredentialNone:
+		// 我方凭据不是对本端点的身份断言。只记类别,不记凭据本身。
+		metricExchangeResult.WithLabelValues("own_credential").Inc()
+		o.Warn("OIDC exchange: refused a credential this service issued",
+			zap.String("trace_id", traceID), zap.String("own_credential_kind", string(kind)))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
+
 	claims, err := o.provider.IdentityFromClientCredential(c.Request.Context(), req.AccessToken)
 	if err != nil {
 		metricExchangeResult.WithLabelValues("identity_fail").Inc()

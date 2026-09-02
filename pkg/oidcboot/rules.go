@@ -32,7 +32,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -70,6 +72,39 @@ func ValidAppID(appID string) bool { return appIDPattern.MatchString(appID) }
 const AppIDDescription = "alphanumeric first character, then letters/digits/underscore/hyphen, max 64 characters"
 
 var appIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+// EnvBool reads a boolean env var with an optional legacy alias.
+//
+// **This is the only definition.** Two copies existed — one in the module's own
+// config loader, one in the settings helper that decides whether a login method
+// counts as configured — with a comment on the second claiming it matched the
+// first. It did not: on a value that is present but unparseable, one fell through
+// to the legacy alias and the other returned the default.
+//
+// That single disagreement is enough to remove every login path. With
+// `kind=oauth2`, `AUTO_LINK_BY_EMAIL=true`, a malformed
+// `REQUIRE_EMAIL_VERIFIED` and a legacy alias saying `false`, the module refuses
+// to boot (all endpoints 404) while the helper reports "configured" — so
+// `login.local_off` stays honoured and an SSO-only deployment has nothing left to
+// log in with, recoverable only by redeploy.
+//
+// Fall-through on an unparseable primary is the deliberate semantic: during a key
+// migration a typo in the new key must not swallow a still-valid old key.
+func EnvBool(primary, alias string, def bool) bool {
+	if v, ok := os.LookupEnv(primary); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	if alias != "" {
+		if v, ok := os.LookupEnv(alias); ok && v != "" {
+			if b, err := strconv.ParseBool(v); err == nil {
+				return b
+			}
+		}
+	}
+	return def
+}
 
 // ErrUnknownKind is returned for a provider kind this build does not implement.
 var ErrUnknownKind = errors.New("oidcboot: unknown provider kind")
@@ -302,6 +337,25 @@ var RefusedScenarios = []RefusedScenario{
 			"OCTO_OIDC_PROVIDER_APP_ID":   strings.Repeat("a", 65),
 		},
 		ExpectKeyInError: "APP_ID",
+	},
+	{
+		// The two config readers parsed booleans differently: one fell through to
+		// the legacy alias when the primary was present but unparseable, the other
+		// returned the default. With this exact env the module refuses to boot
+		// (all endpoints 404) while the settings helper reports "configured", so
+		// `login.local_off` stays honoured — an SSO-only deployment with no working
+		// login path, recoverable only by redeploy.
+		Name: "oauth2 with a malformed primary flag contradicted by its legacy alias",
+		Input: KindInput{Kind: KindOAuth2, BaseURL: "https://idp.example.com",
+			AutoLinkByEmail: true, RequireEmailVerified: false},
+		Env: map[string]string{
+			"OCTO_OIDC_PROVIDER_KIND":                 "oauth2",
+			"OCTO_OIDC_PROVIDER_BASE_URL":             "https://idp.example.com",
+			"DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL":     "true",
+			"DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED": "not-a-bool",
+			"DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED":    "false",
+		},
+		ExpectKeyInError: "REQUIRE_EMAIL_VERIFIED",
 	},
 	{
 		Name: "oauth2 with a post-logout redirect but no app id",

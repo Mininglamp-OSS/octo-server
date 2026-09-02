@@ -373,22 +373,14 @@ func getBool(key string, def bool) bool {
 	return b
 }
 
-// 解析失败时 fall through 到 alias,避免迁移期 ops 把新 key 写错值反而吞掉
-// 老 key 上仍有效的配置。所有 alias 用尽后才返回 def。
+// getBoolWithAlias 委托 pkg/oidcboot.EnvBool —— 单一定义。
+//
+// 曾经这里和 modules/common 各有一份,后者的注释还写着 "matching
+// modules/oidc.getBoolWithAlias"。它们在"主键存在但解析失败"这一点上不一致,
+// 而那一个分歧足以让 SSO-only 部署整体失去登录入口(见 EnvBool 的说明)。
+// 一句声称同步的注释不是机制。
 func getBoolWithAlias(primary, alias string, def bool) bool {
-	if v, ok := os.LookupEnv(primary); ok && v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	if alias != "" {
-		if v, ok := os.LookupEnv(alias); ok && v != "" {
-			if b, err := strconv.ParseBool(v); err == nil {
-				return b
-			}
-		}
-	}
-	return def
+	return oidcboot.EnvBool(primary, alias, def)
 }
 
 func getIntWithAlias(primary, alias string, def int) int {

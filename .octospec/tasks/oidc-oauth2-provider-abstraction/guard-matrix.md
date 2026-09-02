@@ -17,6 +17,16 @@ The last column is where both round-6 blockers were.
 | C1 | authorization `code` | browser, via redirect | exchanged at the IdP; `state` binds the request |
 | C2 | upstream credential presented directly — `id_token` under `kind=oidc`, opaque `access_token` under `kind=oauth2` | native / bearer clients that completed SSO themselves | provider-specific: signature verification vs `/userinfo` redemption |
 | C3 | business-backend HS256 JWT (`userId`, `domainAccount`) | desktop client | HMAC under a dedicated shared secret |
+| C4 | **credentials this service issues** — session token, `uk_` user API key, `bf_` bot token | our own clients | session store lookup / prefix |
+
+C4 was the taxonomy's blind spot for one round: C1–C3 are all credentials the
+*upstream* issues, and the provenance guard (G7) answered "is this an HS256 JWT we
+signed?" — a true statement about a strict subset of "ours". A session token or a
+`uk_` key is not a JWT at all, so it fell out of the classification entirely and was
+forwarded to the vendor's `/userinfo` in a URL query. Both arrive on this header for
+mundane reasons: the global `BearerTokenCompat` middleware makes
+`Authorization: Bearer <session token>` the house convention, and `userAPIKeyAuth`
+reads the *same* header on sibling routes in the *same* route group.
 
 ## Identity paths
 
@@ -40,7 +50,8 @@ The last column is where both round-6 blockers were.
 | G6 byte-exact `(issuer, subject)` recheck | the `utf8mb4_general_ci` collation | `DB.QueryIdentityExact`; the raw query is unexported so this is compiler-enforced | all read paths |
 | G7 credential provenance split ("is this ours?") | the HMAC | `IsForeignToken`, allowlist over `ErrJWTForeign` | P4 only (the only path with two credential types) |
 | G8 freshness | the purpose | `VerifyForRedemption` (10 min from `iat`) vs `VerifyForAuthentication` (token's own `exp`) | P3 uses the former, P4-C3 the latter |
-| G10 IP rate limit | the endpoint being unauthenticated | `StrictIPRateLimitMiddleware` on each unauthenticated group | P1–P4; each request triggers an outbound call, so the limiter is what stops it being an amplifier |
+| G11 own-credential refusal | which system minted the credential | `oidc.OwnCredentialDetector` (`uk_`/`bf_` prefix, then session-store lookup), called immediately before any upstream call | P2, P4. Fails **closed**: if the session store is unavailable the answer is "undecided", and undecided must not forward |
+| G10 IP rate limit | the endpoint being unauthenticated | `StrictIPRateLimitMiddleware` on each unauthenticated group | strict limiter on P2, P3, P4; **P1 has only the global IP floor**. Each of P2–P4 triggers an outbound call, so the limiter is what stops them being amplifiers |
 | G9 autolink admission | verified-claim availability | `ResolveOrLink` + `pkg/oidcboot.ValidateKind` at boot | P1, P2; fail-closed on P3/P4-C3 (no Email/Phone/Verified fields) |
 
 ## Matrix
@@ -54,12 +65,32 @@ The last column is where both round-6 blockers were.
 | G4 length bound | ✅ | ✅ | ✅ | ✅ (read-only) | ✅ |
 | G5 short-numeric | ✅ | ✅ | **n/a by design** | C2 ✅ / C3 n/a | inherited from P1 |
 | G6 exact recheck | ✅ | ✅ | ✅ | ✅ | ✅ |
-| G7 provenance split | n/a (one type) | n/a | n/a | ✅ | n/a |
+| G7 provenance split (is it our JWT?) | n/a (one type) | n/a | n/a | ✅ | n/a |
+| G11 own-credential refusal (C4) | n/a (code, not a bearer) | ✅ | n/a (no upstream call) | ✅ | n/a |
 | G8 freshness | id_token `exp` | `kind=oidc`: id_token `exp`. `kind=oauth2`: **none we can see** — the opaque token's validity is the IdP's judgement, established by the `/userinfo` redemption | 10 min from `iat` | C2 as P2; C3 token's own `exp` (~15d) | bind session TTL |
-| G10 IP rate limit | global IP floor | `StrictIPRateLimitMiddleware(2 rps / 10 burst)`, shared with P3 | same limiter as P2 | `StrictIPRateLimitMiddleware`, `DM_INTEGRATION_IP_RATELIMIT_*` (predates this PR) | inherits P1 |
+| G10 IP rate limit | global IP floor **only** (`authorize`/`callback` carry no strict limiter) | `StrictIPRateLimitMiddleware(2 rps / 10 burst)`, shared with P3 | same limiter as P2 | `StrictIPRateLimitMiddleware`, `DM_INTEGRATION_IP_RATELIMIT_*` (predates this PR) | inherits P1 |
 | G9 autolink | ✅ | ✅ | fail-closed | fail-closed | Create refuses on conflict |
 | issuer namespace | upstream | upstream | upstream + `#bearer-jwt` | upstream (C2) / `#bearer-jwt` (C3) | upstream |
 | writes identity rows | yes | yes | yes | **no** (read-only) | yes |
+
+## Lifetime column — credentials and snapshots that outlive a deploy
+
+A guard placed where a value is *produced* does not cover a value produced by the
+previous binary. The bind path is the one place this service deliberately consumes
+state written by an older version (`bind_claims_compat_test.go` pins that a legacy
+snapshot must still decode), so its snapshots cross the deployment boundary.
+
+| artefact | lifetime | produced by | re-validated on consumption? |
+|---|---|---|---|
+| `BindSession.ClaimsSnapshot` | `defaultBindTokenTTL` = 5 min, operator-configurable upward | `IssueWithReason` (guarded) — **or a previous binary** (unguarded) | ✅ `recheckSnapshotIdentity` in `Confirm` and `Create`, before any mutation |
+| `StateData` (callback) | `stateTTL` = 5 min | `authorize` | consumed within one deploy in practice; claims are re-derived from the IdP, not restored |
+| session token | `Cache.TokenExpire` (default 30d) | login | payload version is handled (`IsV3()`); identity bounds are not re-applied — the identity row already exists |
+| `uk_` API key | until revoked | `/exchange` | resolved against the DB each request |
+
+The general rule the bind case teaches: **if an artefact can be read by a binary
+newer than the one that wrote it, the guard must run on the read side too.** The
+matrix marked P5's `G3`/`G4` ✅ on the strength of the write-side guard; that was
+the unenumerated cell.
 
 ## Construction-failure column
 

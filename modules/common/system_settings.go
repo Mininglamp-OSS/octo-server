@@ -622,22 +622,15 @@ func oidcUpstreamBaseURLFromEnv() string {
 	return strings.TrimSpace(os.Getenv("DM_OIDC_AEGIS_ISSUER"))
 }
 
-// oidcEnvBool parses a boolean env var with an optional legacy alias, matching
-// modules/oidc.getBoolWithAlias (strconv.ParseBool, default on absence or on a
-// value that does not parse).
+// oidcEnvBool delegates to pkg/oidcboot.EnvBool — the single definition shared
+// with modules/oidc's config loader.
+//
+// This used to be a local copy carrying a comment that claimed it matched the
+// other one. It did not: on a present-but-unparseable primary, the other fell
+// through to the legacy alias while this returned the default. See EnvBool for
+// why that single disagreement can leave a deployment with no login path at all.
 func oidcEnvBool(primary, alias string, def bool) bool {
-	raw := os.Getenv(primary)
-	if raw == "" && alias != "" {
-		raw = os.Getenv(alias)
-	}
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.ParseBool(raw)
-	if err != nil {
-		return def
-	}
-	return v
+	return oidcboot.EnvBool(primary, alias, def)
 }
 
 // LogLocalLoginOffSafetyOverrideIfActive emits a single error-level log entry
