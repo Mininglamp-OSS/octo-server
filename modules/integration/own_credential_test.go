@@ -22,8 +22,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
+	"github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,4 +84,47 @@ func TestOwnCredential_UpstreamOpaqueTokenStillFallsThrough(t *testing.T) {
 	assert.NotEmpty(t, mp.LastUserInfoQuery(),
 		"an opaque upstream token must still reach /userinfo; refusing it would break the "+
 			"very credential path these endpoints exist for")
+}
+
+// 密钥**缺失**时,JWT 形态的凭据也不得转发上游。
+//
+// 这是同一个谓词的第二扇门。上一轮只关了"密钥无效"那半,而否掉它的是同一条
+// 论证:客户端业务后端持有并使用它自己的密钥,跟我方配没配无关。运维开了
+// kind=oauth2、挂了端点、漏配密钥 —— 桌面端每个请求都在泄漏。
+func TestOwnCredential_AbsentSecretStillRefusesJWTShaped(t *testing.T) {
+	route, ctx, mp := setupUpstreamOnlyTest(t)
+	uid := seedIntegrationUser(t, ctx, "https://idp-test.example.com", mp.Subject())
+	seedSpaceMembership(t, ctx, uid, "sp_"+util.GenerUUID()[:8], "Web", 2, "2026-01-01 10:00:00")
+
+	// 客户端用它自己的密钥签的;我方没有这个密钥。
+	tok := signDesktopJWT(t, "client-side-secret-32-bytes-long!", 2200012, "desk.user",
+		time.Now().Add(-time.Minute))
+
+	mp.ResetRequestLog()
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", tok, nil))
+
+	assert.NotEqual(t, http.StatusOK, w.Code)
+	q := mp.LastUserInfoQuery()
+	assert.Empty(t, q,
+		"a JWT-shaped credential was forwarded upstream (userinfo query=%q) with no bearer "+
+			"secret configured. This provider's access_token is an opaque UUID, so a JWT can "+
+			"never succeed here — forwarding it only leaks the payload and a signature valid "+
+			"under the client's secret", q)
+
+	// 反面:不透明上游凭据在同一部署形态下必须照常工作。
+	mp.ResetRequestLog()
+	w = httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodGet,
+		"/v1/integrations/oidc/spaces", mp.AccessToken(), nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotEmpty(t, mp.LastUserInfoQuery(),
+		"the upstream-only deployment shape must keep working")
+}
+
+// setupUpstreamOnlyTest 只有上游凭据、**不配** bearer 密钥。
+func setupUpstreamOnlyTest(t *testing.T) (http.Handler, *config.Context, *oidc.MockOAuth2Provider) {
+	t.Helper()
+	return setupIntegrationEnv(t, "")
 }

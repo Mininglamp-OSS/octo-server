@@ -223,6 +223,15 @@ func (it *Integration) oidcAuth() wkhttp.HandlerFunc {
 		var claims *oidc.IdentityClaims
 		var err error
 		credential := "upstream"
+		// 密钥缺失时无法归属判定,而该 provider 的 access_token 是不透明串,
+		// 所以 JWT 形态的凭据不可能是这条路上的合法凭据。见 oidc/jwt_shape.go。
+		if oidc.UnverifiableJWTMustNotBeForwarded(
+			it.bearerJWT != nil, it.provider.Capabilities(), raw) {
+			it.Warn("OIDC integration refused a JWT-shaped credential with no bearer verifier configured")
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
+			c.Abort()
+			return
+		}
 		if it.bearerJWT != nil {
 			bc, bcErr := it.bearerJWT.VerifyForAuthentication(raw, time.Now())
 			switch {

@@ -150,6 +150,18 @@ func (o *OIDC) exchange(c *wkhttp.Context) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
+	// 密钥**缺失**时无法做任何归属判定,而这个 provider 的 access_token 是不透明串,
+	// 所以 JWT 形态的凭据在这条路上不可能合法 —— 转发它只可能泄漏。见 jwt_shape.go。
+	//
+	// 上一轮只关了"密钥无效"。否掉那半的是同一条论证:客户端持有并使用**它自己的**
+	// 密钥,跟我方配没配无关。这次改的是谓词,两扇门一起。
+	if UnverifiableJWTMustNotBeForwarded(o.bearerJWT != nil, o.provider.Capabilities(), req.AccessToken) {
+		metricExchangeResult.WithLabelValues("unverifiable_jwt").Inc()
+		o.Warn("OIDC exchange: refused a JWT-shaped credential with no bearer verifier configured",
+			zap.String("trace_id", traceID))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrOIDCExchangeTokenRejected, nil, nil)
+		return
+	}
 	if o.bearerJWT != nil {
 		if _, berr := o.bearerJWT.VerifyForRedemption(req.AccessToken, time.Now()); berr == nil ||
 			!IsForeignToken(berr) {

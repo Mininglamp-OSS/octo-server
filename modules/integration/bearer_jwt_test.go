@@ -60,6 +60,16 @@ func signDesktopJWT(t *testing.T, secret string, userID int64, domainAccount str
 // setupBothCredentialsTest 起一个**同时**启用上游 OAuth2 与业务 JWT 的环境。
 func setupBothCredentialsTest(t *testing.T) (http.Handler, *config.Context, *oidc.MockOAuth2Provider) {
 	t.Helper()
+	return setupIntegrationEnv(t, testBearerJWTSecret)
+}
+
+// setupIntegrationEnv 铺 kind=oauth2 的 integration 环境。
+//
+// bearerSecret 为空串表示**不配置**业务 JWT 密钥 —— 那是被文档称为合法的部署形态
+// ("上游 OIDC 开、业务 JWT 不接"),必须继续可用。把它做成参数而不是复制一份
+// setup,是因为两个形态之间只差这一个变量,复制出来的第二份迟早会漂。
+func setupIntegrationEnv(t *testing.T, bearerSecret string) (http.Handler, *config.Context, *oidc.MockOAuth2Provider) {
+	t.Helper()
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	t.Setenv("OCTO_USER_API_KEY_SECRET", "fedcba9876543210fedcba9876543210")
 
@@ -73,7 +83,7 @@ func setupBothCredentialsTest(t *testing.T) (http.Handler, *config.Context, *oid
 	t.Setenv("OCTO_OIDC_PROVIDER_KIND", "oauth2")
 	t.Setenv("OCTO_OIDC_PROVIDER_BASE_URL", mp.BaseURL())
 	t.Setenv("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "1")
-	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", testBearerJWTSecret)
+	t.Setenv("OCTO_OIDC_BEARER_JWT_SECRET", bearerSecret)
 	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_RPS", "1000")
 	t.Setenv("DM_INTEGRATION_IP_RATELIMIT_BURST", "10000")
 

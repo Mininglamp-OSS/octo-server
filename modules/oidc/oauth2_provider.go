@@ -366,8 +366,11 @@ func (p *oauth2Provider) Capabilities() ProviderCapabilities {
 	return ProviderCapabilities{
 		// 这家 IdP 的文档对 sub 是内部 id 还是工号说法不一 —— 见能力位说明。
 		SubjectMayBeReusedPersonnelID: true,
-		PKCE:                          false, // authorize 端点无 code_challenge 参数
-		Nonce:                         false, // 没有可把 nonce 带回来的签名载荷
+		// 该 IdP 的 access_token 是不透明 UUID(见 brief 的端点契约),
+		// 所以 JWT 形态的凭据在这条路上不可能合法。
+		OpaqueClientCredential: true,
+		PKCE:                   false, // authorize 端点无 code_challenge 参数
+		Nonce:                  false, // 没有可把 nonce 带回来的签名载荷
 		// token 响应不含 id_token → 上层不得缓存 id_token、不得走
 		// RP-Initiated Logout(见 LogoutURL 用的是厂商私有登出端点)。
 		IDToken: false,

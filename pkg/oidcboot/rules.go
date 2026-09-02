@@ -73,6 +73,26 @@ const AppIDDescription = "alphanumeric first character, then letters/digits/unde
 
 var appIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
+// EnvString reads a string env var with an optional legacy alias.
+//
+// **Single definition.** Two copies existed and differed in one detail: one tested the
+// primary **untrimmed** (`v != ""`), so a whitespace-only value counted as configured and
+// the alias was never consulted; the other trimmed first and fell through to the alias.
+// Under kind=oauth2 the issuer doubles as the base URL, so that single difference made the
+// module refuse to boot while the settings helper reported "configured" — the same total
+// lockout as the BASE_URL and boolean cases, on a third field.
+//
+// A value that is only whitespace is not a configured value. Trim, then decide.
+func EnvString(primary, alias string) string {
+	if v := strings.TrimSpace(os.Getenv(primary)); v != "" {
+		return v
+	}
+	if alias == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(alias))
+}
+
 // EnvBool reads a boolean env var with an optional legacy alias.
 //
 // **This is the only definition.** Two copies existed — one in the module's own
@@ -193,10 +213,6 @@ type KindInput struct {
 	// AllowInsecureLogout permits plain http for the two logout URLs (dev only).
 	// Deliberately a different flag from AllowInsecureUpstream -- see that field.
 	AllowInsecureLogout bool
-
-	// Issuer is the identity namespace. Under KindOAuth2 it doubles as the default
-	// base URL; that fallback is UpstreamBaseURL, which both callers must share.
-	Issuer string
 }
 
 // normalised trims every string field. A value that is only whitespace is not a
@@ -208,7 +224,6 @@ func (in KindInput) normalised() KindInput {
 	in.AppID = strings.TrimSpace(in.AppID)
 	in.EndSessionURL = strings.TrimSpace(in.EndSessionURL)
 	in.PostLogoutRedirectURI = strings.TrimSpace(in.PostLogoutRedirectURI)
-	in.Issuer = strings.TrimSpace(in.Issuer)
 	return in
 }
 
@@ -361,6 +376,11 @@ type RefusedScenario struct {
 	// ExpectKeyInError, when set, is a substring the refusal must mention so an
 	// operator can act on the log line.
 	ExpectKeyInError string
+
+	// SkipRuleCheck marks a scenario whose refusal comes from a caller's required-env
+	// handling rather than from ValidateKind's rules. ValidateKind(Input) is legal for
+	// these; only the env-driven consumers are pinned.
+	SkipRuleCheck bool
 }
 
 // RefusedScenarios is the shared table both sides' tests iterate.
@@ -581,4 +601,69 @@ var AcceptedScenarios = []AcceptedScenario{
 	{Name: "standard kind with a whitespace-only app id", Env: map[string]string{
 		"OCTO_OIDC_PROVIDER_APP_ID": " \t ",
 	}},
+}
+
+// AliasedRequiredKeys are the env pairs both config readers must resolve identically.
+//
+// Declared once so the scenario tables below are **generated** from it: this class of bug
+// has now appeared on four separate fields (base URL, a boolean, the issuer, and the
+// required-key loop), each time because one reader trimmed and the other did not, and each
+// time the shared tables happened not to cover that particular field. Adding a pair here
+// gets both directions pinned automatically.
+var AliasedRequiredKeys = []struct{ Primary, Alias string }{
+	{"DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER"},
+	{"DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID"},
+	{"DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET"},
+	{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
+}
+
+// whitespaceAliasScenarios generates, for every aliased pair:
+//
+//   - refused: primary is whitespace and there is no alias to fall through to, so the
+//     value is absent and the deployment cannot boot;
+//   - accepted: primary is whitespace but the legacy alias holds a real value, so the
+//     fallback applies and the deployment boots.
+//
+// Whitespace is not a configured value. The two readers must agree on that for every pair,
+// and "for every pair" is the part that kept being missed.
+func whitespaceAliasScenarios() (refused []RefusedScenario, accepted []AcceptedScenario) {
+	for _, k := range AliasedRequiredKeys {
+		refused = append(refused, RefusedScenario{
+			Name: "whitespace-only " + k.Primary + " with no alias",
+			Input: KindInput{Kind: KindOIDC,
+				AutoLinkByEmail: true, RequireEmailVerified: true},
+			Env: map[string]string{
+				k.Primary: "   ",
+				k.Alias:   "",
+			},
+			SkipRuleCheck: true,
+		})
+		accepted = append(accepted, AcceptedScenario{
+			Name: "whitespace-only " + k.Primary + " falling back to " + k.Alias,
+			Env: map[string]string{
+				k.Primary: "   ",
+				k.Alias:   aliasFallbackValue(k.Primary),
+			},
+		})
+	}
+	return refused, accepted
+}
+
+// aliasFallbackValue supplies a value of the right shape for each key, since the readers
+// validate shape (absolute URL, regex) and not merely non-emptiness.
+func aliasFallbackValue(primary string) string {
+	switch primary {
+	case "DM_OIDC_PROVIDER_ISSUER":
+		return "https://legacy-issuer.example.com"
+	case "DM_OIDC_PROVIDER_REDIRECT_URI":
+		return "https://legacy-app.example.com/callback"
+	default:
+		return "legacy-value"
+	}
+}
+
+func init() {
+	r, a := whitespaceAliasScenarios()
+	RefusedScenarios = append(RefusedScenarios, r...)
+	AcceptedScenarios = append(AcceptedScenarios, a...)
 }

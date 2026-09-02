@@ -68,6 +68,23 @@ type ProviderCapabilities struct {
 	// 长度上限不由这一位控制:那是存储性质,对所有来源统一施加
 	// (identity_bounds.go)。
 	SubjectMayBeReusedPersonnelID bool
+
+	// OpaqueClientCredential 表示"客户端在这个 provider 上出示的凭据是不透明串,
+	// 不可能是 JWT"。
+	//
+	// 用途只有一个:当我方的业务 JWT 验签器未配置(密钥缺失)时,一张 JWT 形态的
+	// 凭据无法被归属判定认出来,会被回落转发给上游 —— 而上游那条路把凭据放在
+	// URL query 上。为 true 时上层可以据此**就地拒绝** JWT 形态的输入:该 provider
+	// 的 access_token 是不透明 UUID,JWT 在这条路上不可能是合法凭据,转发不可能
+	// 成功、只可能把载荷 PII 和一份在客户端密钥下合法的签名送进第三方日志。
+	//
+	// 为什么是能力位而不是无条件:这是**厂商事实,不是协议事实**。标准 OIDC 下
+	// 客户端出示的凭据本身就是 JWT(id_token),无条件拒绝会把 /exchange 在那个
+	// kind 上整条掐断。同一个教训见 SubjectMayBeReusedPersonnelID。
+	//
+	// 这条判定只在"验签器未配置"时才需要 —— 配置正常时 HMAC 是决定性判据,
+	// 不需要看形态。
+	OpaqueClientCredential bool
 }
 
 // AuthCodeParams 构造 authorize URL 所需的请求级一次性参数。

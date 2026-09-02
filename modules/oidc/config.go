@@ -328,7 +328,6 @@ func kindRefusal(p *ProviderConfig) error {
 		RequireEmailVerified:  p.RequireEmailVerified,
 		AllowInsecureUpstream: getBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", false),
 		AllowInsecureLogout:   getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false),
-		Issuer:                p.Issuer,
 	})
 }
 
@@ -351,14 +350,18 @@ func getString(key, def string) string {
 }
 
 // getStringWithAlias 优先 primary,缺省回退 alias,再回退 def。alias="" 表示无 alias。
+// getStringWithAlias 委派 pkg/oidcboot.EnvString —— 单一定义。
+//
+// 曾经这里用**未 trim** 的值判断主键是否存在:`v != ""`。于是一个只含空白的
+// DM_OIDC_PROVIDER_ISSUER 被当成"已配置",legacy alias 根本不会被查;而
+// modules/common 那侧先 trim 再判,会回落到 alias。kind=oauth2 下 issuer 兼作
+// base URL,于是两侧得出相反结论 —— 模块拒绝启动(全端点 404)、镜像报"已配置"、
+// login.local_off 继续生效。与 BASE_URL、布尔值那两处同一个锁死,换了第三个字段。
+//
+// def 保留:调用方有需要默认值的键,而 EnvString 只回答"环境里有没有配"。
 func getStringWithAlias(primary, alias, def string) string {
-	if v, ok := os.LookupEnv(primary); ok && v != "" {
+	if v := oidcboot.EnvString(primary, alias); v != "" {
 		return v
-	}
-	if alias != "" {
-		if v, ok := os.LookupEnv(alias); ok && v != "" {
-			return v
-		}
 	}
 	return def
 }

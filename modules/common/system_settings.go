@@ -545,7 +545,11 @@ func isOIDCFullyConfigured() bool {
 		{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
 	}
 	for _, r := range required {
-		if os.Getenv(r.primary) == "" && os.Getenv(r.alias) == "" {
+		// oidcboot.EnvString, not os.Getenv: the module's loader resolves the same pairs
+		// through it, and it trims. Comparing untrimmed here meant a whitespace-only
+		// required value passed this loop while the module refused to boot on it —
+		// the same lockout as the BASE_URL, boolean and issuer cases.
+		if oidcboot.EnvString(r.primary, r.alias) == "" {
 			return false
 		}
 	}
@@ -594,7 +598,6 @@ func isOIDCFullyConfigured() bool {
 		// a relative post-logout redirect 404 every OIDC route while this side still
 		// answered "configured".
 		AllowInsecureLogout: oidcEnvBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "", false),
-		Issuer:              oidcIssuerFromEnv(),
 
 		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
 		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),
@@ -626,10 +629,7 @@ func oidcUpstreamBaseURLFromEnv() string {
 
 // oidcIssuerFromEnv reads the issuer with its legacy alias, matching the module's loader.
 func oidcIssuerFromEnv() string {
-	if v := strings.TrimSpace(os.Getenv("DM_OIDC_PROVIDER_ISSUER")); v != "" {
-		return v
-	}
-	return strings.TrimSpace(os.Getenv("DM_OIDC_AEGIS_ISSUER"))
+	return oidcboot.EnvString("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER")
 }
 
 // oidcEnvBool delegates to pkg/oidcboot.EnvBool — the single definition shared

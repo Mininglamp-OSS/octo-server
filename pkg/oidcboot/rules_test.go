@@ -63,6 +63,9 @@ func TestValidateKind_RefusesEveryDeclaredScenario(t *testing.T) {
 	}
 	for _, sc := range RefusedScenarios {
 		t.Run(sc.Name, func(t *testing.T) {
+			if sc.SkipRuleCheck {
+				t.Skip("refusal comes from the caller's required-env handling, not from the rules")
+			}
 			if err := ValidateKind(sc.Input); err == nil {
 				t.Errorf("scenario %q was accepted but is declared as refused", sc.Name)
 			}
@@ -74,6 +77,9 @@ func TestValidateKind_RefusesEveryDeclaredScenario(t *testing.T) {
 func TestValidateKind_ErrorNamesTheOffendingKey(t *testing.T) {
 	for _, sc := range RefusedScenarios {
 		t.Run(sc.Name, func(t *testing.T) {
+			if sc.SkipRuleCheck {
+				t.Skip("refusal comes from the caller's required-env handling, not from the rules")
+			}
 			err := ValidateKind(sc.Input)
 			if err == nil {
 				t.Fatal("expected refusal")
