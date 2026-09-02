@@ -19,6 +19,9 @@ import (
 //
 // 另外 EmailVerified/PhoneVerified 必须恒 false:本协议不提供 verified 语义,
 // 响应里若出现同名字段也不具备可信含义,采信它等于给 autolink 开了账号接管入口。
+// 注:各用例里的 sub 占位值(1000000001 等)必须是"至少 10 位纯数字"或含非数字
+// 字符 —— 短纯数字会被 checkSubjectShape 以"像工号"为由拒绝(见 subject_shape.go),
+// 那样用例就会失败在形态守卫上,而不是它本来要测的那条分支。
 func TestParseUserInfoEnvelope(t *testing.T) {
 	const testIssuer = "test-idp"
 
@@ -61,17 +64,17 @@ func TestParseUserInfoEnvelope(t *testing.T) {
 		{
 			// HTTP 200 + success=false:必须拒绝,否则失败被当成登录成功。
 			name:    "reject_success_false",
-			body:    `{"success":false,"code":"200","data":{"sub":"1"}}`,
+			body:    `{"success":false,"code":"200","data":{"sub":"1000000001"}}`,
 			wantErr: true,
 		},
 		{
 			name:    "reject_code_not_200",
-			body:    `{"success":true,"code":"500","data":{"sub":"1"}}`,
+			body:    `{"success":true,"code":"500","data":{"sub":"1000000001"}}`,
 			wantErr: true,
 		},
 		{
 			name:    "reject_code_missing",
-			body:    `{"success":true,"data":{"sub":"1"}}`,
+			body:    `{"success":true,"data":{"sub":"1000000001"}}`,
 			wantErr: true,
 		},
 		{
@@ -108,32 +111,32 @@ func TestParseUserInfoEnvelope(t *testing.T) {
 			// 文档把 user_id 标为 Integer 但示例是字符串,两种形态都不能让
 			// 整体解析失败(我们并不消费该字段)。
 			name:        "tolerant_user_id_as_number",
-			body:        `{"success":true,"code":"200","data":{"sub":"1","user_id":123}}`,
-			wantSubject: "1",
+			body:        `{"success":true,"code":"200","data":{"sub":"1000000001","user_id":123}}`,
+			wantSubject: "1000000001",
 		},
 		{
 			name:        "tolerant_unknown_extra_fields",
-			body:        `{"success":true,"code":"200","data":{"sub":"1","brand_new_field":{"a":1}},"extra":"x"}`,
-			wantSubject: "1",
+			body:        `{"success":true,"code":"200","data":{"sub":"1000000001","brand_new_field":{"a":1}},"extra":"x"}`,
+			wantSubject: "1000000001",
 		},
 		{
 			name:        "sub_is_trimmed",
-			body:        `{"success":true,"code":"200","data":{"sub":"  1  "}}`,
-			wantSubject: "1",
+			body:        `{"success":true,"code":"200","data":{"sub":"  1000000001  "}}`,
+			wantSubject: "1000000001",
 		},
 		{
 			// 文档把 code 标为 String 且示例为 "200"。同一份文档里 user_id 已经
 			// 出现过标注与示例不符的先例,而 wire type 一变就是全站登录失败
 			// (本模块 aud 字段踩过同类坑),所以两种形态都要接。
 			name:        "tolerant_code_as_number",
-			body:        `{"success":true,"code":200,"data":{"sub":"1"}}`,
-			wantSubject: "1",
+			body:        `{"success":true,"code":200,"data":{"sub":"1000000001"}}`,
+			wantSubject: "1000000001",
 		},
 		{
 			// success 缺失时按 false 处理(fail-closed):宁可拒登,
 			// 不可把一个形态未知的响应当成功。
 			name:    "reject_success_missing",
-			body:    `{"code":"200","data":{"sub":"1"}}`,
+			body:    `{"code":"200","data":{"sub":"1000000001"}}`,
 			wantErr: true,
 		},
 	}
@@ -179,7 +182,7 @@ func TestParseUserInfoEnvelope_VerifiedFlagsAlwaysFalse(t *testing.T) {
 	body := `{
 	  "success": true, "code": "200",
 	  "data": {
-	    "sub": "1",
+	    "sub": "1000000001",
 	    "email": "a@example.com", "email_verified": true,
 	    "phone_number": "13000000000", "phone_number_verified": true
 	  }
@@ -199,7 +202,7 @@ func TestParseUserInfoEnvelope_VerifiedFlagsAlwaysFalse(t *testing.T) {
 // 响应体自带 iss 时不得覆盖我方注入的 issuer:否则 IdP 侧一次配置变更
 // 就能把身份写进另一个命名空间,绕过 (issuer,subject) 的唯一性语义。
 func TestParseUserInfoEnvelope_IssuerNotTakenFromBody(t *testing.T) {
-	body := `{"success":true,"code":"200","data":{"sub":"1","iss":"attacker-controlled"}}`
+	body := `{"success":true,"code":"200","data":{"sub":"1000000001","iss":"attacker-controlled"}}`
 	claims, err := parseUserInfoEnvelope([]byte(body), "ours")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

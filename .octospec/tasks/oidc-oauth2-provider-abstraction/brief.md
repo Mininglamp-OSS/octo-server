@@ -445,6 +445,66 @@ implementations are not forced to stub them out.
   It now logs the masked tail plus the length: enough to classify the input,
   not enough to identify the person. Log retention outlives the diagnostic need.
 
+### Pre-PR pass: acceptance gaps closed + subject shape guard
+
+- **Subject shape guard** (`modules/oidc/subject_shape.go`). `(issuer, subject)`
+  is the identity primary key and is immutable after go-live, yet the vendor
+  documentation contradicts itself about what `sub` contains: the userinfo field
+  table calls it a "sub-number" with an 18-digit example, while the quick-start
+  demo comment says it is the employee number — and the employee number already
+  has its own field (`username`, "employee number preferred"), alongside a
+  separate `user_id`. The evidence favours an internal long id, but a wrong guess
+  is unrecoverable: employee numbers are reused between leavers and joiners, so a
+  new hire would match the former employee's identity row and log straight into
+  their account.
+
+  The guard therefore converts an irreversible data problem into a recoverable
+  failure: a purely numeric subject shorter than 10 digits is refused at the
+  trust boundary, before any row is written. It is deliberately narrow — 18- and
+  20-digit ids pass, anything containing a non-digit passes (it cannot be an
+  employee number), only the short-numeric shape is refused. The error carries
+  the length, never the subject value. No environment variable: this is a
+  security floor, so relaxing it should leave a code-review trace rather than
+  become a deploy-time knob.
+
+  This also removes "capture a real userinfo response first" as a launch
+  blocker: if `sub` really is an employee number, the first login fails loudly
+  with zero rows written, which is exactly the signal we wanted from that
+  capture.
+
+- **Logout device scoping now has tests** (acceptance item: two devices, only
+  the current one is kicked). Required a small refactor first: `logout` reached
+  straight into `o.ctx.QuitUserDevice`, bypassing the existing `sessionKiller`
+  abstraction, so the blast radius of a logout had no injection point. `Kick`
+  (all devices) and `KickDevice` (one device) are now both on that interface, and
+  the tests assert the two are mutually exclusive — including the negative
+  direction, which is the one that regressed before.
+
+  The tests also pinned down a **behavioural boundary worth recording**:
+  `device_flag` only exists in v3 session payloads. The v2 encoder serialises
+  only `uid` and `name`, so on a v2 session the flag can never be resolved and
+  logout degrades to kicking every device. "Logout affects only the current
+  device" is therefore a v3-only property. The degradation direction is safe
+  (over-kicking beats a no-op) and is asserted rather than fixed — extending the
+  v2 payload belongs to session encoding, not to this module.
+
+- **Empty subject is now asserted against the real database** (acceptance item).
+  The provider-level test only proved the parser returns an error; it could not
+  prove the handler does not write a row before returning it. `subject` is
+  `NOT NULL DEFAULT ''` under `UNIQUE(issuer, subject)`, so an empty-subject row
+  is a perfectly legal row — and the second subject-less login would resolve onto
+  the first one's uid. That is account takeover, not dirty data, so the assertion
+  has to look at the table.
+
+- **Plain-OAuth2 callback is now driven end to end** (acceptance item). The
+  handler chain — state issue and single-use consumption, Exchange/Identity order,
+  ResolveOrLink → IssueSession → ThirdAuthcode, the 302 back to `return_to` —
+  had only ever been exercised under `KindOIDC`. Coverage now includes the
+  existing-user and new-user paths, state replay rejection, and an upstream token
+  failure writing nothing. The authorize URL is also asserted to carry *no*
+  `nonce` / `code_challenge` (this upstream rejects unknown parameters) and
+  `scope=read`.
+
 ## Integration tests written (this PR)
 
 All tests pass under `go test -race ./modules/oidc/ ./pkg/wkhttp/ ./pkg/accesslog/`.

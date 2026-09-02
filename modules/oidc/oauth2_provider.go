@@ -156,6 +156,15 @@ func parseUserInfoEnvelope(body []byte, issuer string) (*IDTokenClaims, error) {
 		}
 	}
 
+	// (2b) subject 形态守卫 —— 见 errSubjectLooksLikeEmployeeNo 的说明。
+	if err := checkSubjectShape(subject); err != nil {
+		return nil, &envelopeError{
+			reason:    err.Error(),
+			Code:      string(env.Code),
+			RequestID: env.RequestID,
+		}
+	}
+
 	// (3) issuer 注入,不从响应体取。
 	return &IDTokenClaims{
 		Issuer:      issuer,

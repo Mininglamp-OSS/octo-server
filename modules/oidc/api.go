@@ -987,7 +987,7 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 		if df == 0 {
 			kickErr = o.killer.Kick(ctx, uid)
 		} else {
-			kickErr = o.ctx.QuitUserDevice(uid, int(df))
+			kickErr = o.killer.KickDevice(ctx, uid, df)
 		}
 		if kickErr != nil {
 			kickFailed = true
@@ -1388,6 +1388,12 @@ func (k ctxKiller) Kick(_ context.Context, uid string) error {
 	return k.ctx.QuitUserDevice(uid, -1)
 }
 
+// KickDevice 只退指定端。device_flag 由调用方从当前 session 解出,0 不是合法的
+// "某一端"取值(它是解析失败的哨兵),调用方在传进来之前就该改走 Kick。
+func (k ctxKiller) KickDevice(_ context.Context, uid string, deviceFlag uint8) error {
+	return k.ctx.QuitUserDevice(uid, int(deviceFlag))
+}
+
 // deviceFlagFromToken 解析当前请求 token 里的 device_flag;解析失败返 0(兜底
 // 踢全部,避免登出在边缘场景变 no-op)。
 //
@@ -1416,13 +1422,7 @@ func (o *OIDC) deviceFlagFromRequest(ctx context.Context, token string) uint8 {
 	if !ok {
 		return 0
 	}
-	// Cache.TokenCachePrefix 默认 "token:"(octo-lib config 默认值,见
-	// config/config.go:349);这里读 ctx 配置而非硬编码,避免将来改前缀时漏改。
-	prefix := o.ctx.GetConfig().Cache.TokenCachePrefix
-	if prefix == "" {
-		prefix = "token:"
-	}
-	rec, err := reader.ReadToken(ctx, prefix+token)
+	rec, err := reader.ReadToken(ctx, o.tokenCachePrefix()+token)
 	if err != nil || strings.TrimSpace(rec.Payload) == "" {
 		return 0
 	}
@@ -1551,4 +1551,21 @@ func hasCompleteVerificationClaims(c *IDTokenClaims) bool {
 		return false
 	}
 	return c.IsVerified.Bool() && c.VerifiedAt > 0 && c.VerifiedProvider != "" && c.LegalName != ""
+}
+
+// tokenCachePrefix 返回 session 缓存 key 的前缀。
+//
+// 默认 "token:" 与 octo-lib 的 Cache.TokenCachePrefix 默认值一致;读配置而非
+// 硬编码,避免将来改前缀时漏改这一处。ctx 缺失时回落默认值而不是 panic ——
+// 拿不到前缀的后果只是 device_flag 解析失败(降级踢全部,见调用方),
+// 不值得让一次 logout 变成 500。
+func (o *OIDC) tokenCachePrefix() string {
+	const def = "token:"
+	if o.ctx == nil {
+		return def
+	}
+	if p := o.ctx.GetConfig().Cache.TokenCachePrefix; p != "" {
+		return p
+	}
+	return def
 }
