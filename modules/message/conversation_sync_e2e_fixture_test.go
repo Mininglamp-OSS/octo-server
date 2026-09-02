@@ -30,6 +30,7 @@ var (
 	fakeIMCMDs              []string
 	fakeIMCMDRecords        []fakeIMCMDRecord
 	fakeIMFailCMD           string
+	fakeIMAfterCMD          func(string)
 	fakeIMSyncCalls         int
 	fakeIMConversationCalls int
 )
@@ -94,7 +95,11 @@ func sharedFakeIM() *httptest.Server {
 				}
 				fakeIMMu.Lock()
 				failCMD := fakeIMFailCMD
+				afterCMD := fakeIMAfterCMD
 				fakeIMMu.Unlock()
+				if afterCMD != nil {
+					afterCMD(cmd)
+				}
 				if cmd == failCMD {
 					http.Error(w, "injected command failure", http.StatusServiceUnavailable)
 					return
@@ -120,6 +125,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	fakeIMCMDs = nil
 	fakeIMCMDRecords = nil
 	fakeIMFailCMD = ""
+	fakeIMAfterCMD = nil
 	fakeIMSyncCalls = 0
 	fakeIMConversationCalls = 0
 	fakeIMMu.Unlock()

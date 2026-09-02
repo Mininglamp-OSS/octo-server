@@ -92,9 +92,12 @@ from the Recent activity window in both `/v1/sidebar/sync` and the opt-in
   `CMDConversationUnreadClear` broadcast before accessing conversation-extra.
   Group and CommunityTopic marker cleanup is attempted only for `unread=0`
   and is best-effort after that broadcast; `unread>0` leaves the marker
-  unchanged. Query, version, store, and extension-CMD failures are logged and
-  cannot change the completed core response. Person `clearUnread` retains its
-  existing real-unread behavior.
+  unchanged. Once the core clear and broadcast complete, the supplementary
+  cleanup runs on a request-value-preserving context that ignores client
+  disconnect cancellation and has its own five-second timeout. Query, version,
+  store, and extension-CMD failures are logged and cannot change the completed
+  core response. Person `clearUnread` retains its existing real-unread
+  behavior.
 - A marker write and its new conversation-extra version are committed before
   the service attempts `CMDSyncConversationExtra` on the user's Person channel
   with `NoPersist=true`. Its `param` carries the exact `channel_id`,
@@ -172,7 +175,9 @@ from the Recent activity window in both `/v1/sidebar/sync` and the opt-in
   manual-unread after the real-unread clear and legacy CMD; `unread>0` leaves
   manual-unread unchanged. Any supplementary cleanup failure is logged without
   suppressing the legacy broadcast or changing the core success response.
-  Person `clearUnread` leaves legacy manual rows untouched.
+  Client disconnect after the legacy broadcast does not cancel that cleanup;
+  its independent context remains bounded to five seconds. Person
+  `clearUnread` leaves legacy manual rows untouched.
 - Ordinary draft and read-position extension updates preserve a concurrently
   stored manual marker.
 - Manual markers annotate eligible Sidebar entries but do not independently

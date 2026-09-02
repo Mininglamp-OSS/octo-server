@@ -1336,7 +1336,13 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 	// state the dedicated manual marker must not be cleared implicitly; the
 	// frontend clears it explicitly when the user re-enters the conversation.
 	if req.Unread == 0 {
-		co.clearManualUnreadAfterClearBestEffort(c.Request.Context(), loginUID, req.ChannelID, req.ChannelType)
+		// WuKongIM has already committed the real-unread clear and the legacy
+		// broadcast has already succeeded. Keep the supplementary cleanup alive
+		// if the HTTP client disconnects in this narrow window, but bound it with
+		// its own deadline so Redis or database trouble cannot hold the handler.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		defer cancel()
+		co.clearManualUnreadAfterClearBestEffort(cleanupCtx, loginUID, req.ChannelID, req.ChannelType)
 	}
 	c.ResponseOK()
 }

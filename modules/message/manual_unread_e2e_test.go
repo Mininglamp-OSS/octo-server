@@ -7,6 +7,7 @@ package message
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -268,6 +269,86 @@ func TestIntegration_ClearUnreadBroadcastsCoreStateBeforeBestEffortManualSync(t 
 	requireManualUnreadCMDParam(
 		t,
 		fakeIMCMDRecords[1],
+		channelID,
+		common.ChannelTypeCommunityTopic.Uint8(),
+		false,
+		extra.Version,
+	)
+}
+
+// TestIntegration_ClearUnreadManualCleanupSurvivesClientDisconnect verifies
+// that the supplementary marker cleanup has its own bounded lifetime after
+// the real-unread clear and legacy broadcast have completed. A client
+// disconnect at that point must not leave a ghost manual-unread marker.
+func TestIntegration_ClearUnreadManualCleanupSurvivesClientDisconnect(t *testing.T) {
+	const channelID = "clear-unread-client-disconnect"
+
+	s, ctx := setupConvSyncE2E(t, nil)
+	setResp := httptest.NewRecorder()
+	setReq := httptest.NewRequest(
+		http.MethodPut,
+		"/v1/conversation/setManualUnread",
+		bytes.NewBufferString(`{"channel_id":"`+channelID+`","channel_type":5}`),
+	)
+	setReq.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(setResp, setReq)
+	require.Equal(t, http.StatusOK, setResp.Code, setResp.Body.String())
+
+	fakeIMMu.Lock()
+	fakeIMCMDs = nil
+	fakeIMCMDRecords = nil
+	fakeIMMu.Unlock()
+
+	clearResp := httptest.NewRecorder()
+	clearReq := httptest.NewRequest(
+		http.MethodPut,
+		"/v1/conversation/clearUnread",
+		bytes.NewBufferString(`{"channel_id":"`+channelID+`","channel_type":5,"unread":0}`),
+	)
+	clearReq.Header.Set("token", testutil.Token)
+	requestCtx, cancelRequest := context.WithCancel(clearReq.Context())
+	clearReq = clearReq.WithContext(requestCtx)
+	defer cancelRequest()
+
+	fakeIMMu.Lock()
+	fakeIMAfterCMD = func(cmd string) {
+		if cmd == common.CMDConversationUnreadClear {
+			cancelRequest()
+		}
+	}
+	fakeIMMu.Unlock()
+	defer func() {
+		fakeIMMu.Lock()
+		fakeIMAfterCMD = nil
+		fakeIMMu.Unlock()
+	}()
+
+	s.GetRoute().ServeHTTP(clearResp, clearReq)
+	require.Equal(t, http.StatusOK, clearResp.Code, clearResp.Body.String())
+	require.ErrorIs(t, requestCtx.Err(), context.Canceled)
+
+	extra, err := newConversationExtraDB(ctx).queryOne(
+		testutil.UID,
+		channelID,
+		common.ChannelTypeCommunityTopic.Uint8(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, extra)
+	require.False(t, extra.ManualUnread,
+		"客户端在核心广播后断开时，后置清理仍应移除手动未读标记")
+
+	fakeIMMu.Lock()
+	cmds := append([]string(nil), fakeIMCMDs...)
+	records := append([]fakeIMCMDRecord(nil), fakeIMCMDRecords...)
+	fakeIMMu.Unlock()
+	require.Equal(t, []string{
+		common.CMDConversationUnreadClear,
+		common.CMDSyncConversationExtra,
+	}, cmds)
+	require.Len(t, records, 2)
+	requireManualUnreadCMDParam(
+		t,
+		records[1],
 		channelID,
 		common.ChannelTypeCommunityTopic.Uint8(),
 		false,
