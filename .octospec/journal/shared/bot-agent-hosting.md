@@ -264,6 +264,101 @@ justification no longer applies. The ordering stays — it costs nothing and kee
 the bound independent of a limit enforced two call frames away — but the stated
 reason had to change with it.
 
+## What review round 4 caught
+
+Three reviewers had converged on the head; one held CHANGES_REQUESTED, and was
+right. His finding was not about behaviour — he stated plainly that the shipped
+behaviour was correct — but about the two artifacts that outlive the review: the
+spec, and the tests.
+
+**Two of the tests written to answer "your test does not distinguish the two
+implementations" still did not.** He verified by reverting each fix and re-running,
+which I had claimed to do and had only partly done:
+
+- The timezone test offset a *dedicated* connection while the code under test
+  wrote on a different pooled one. Both `TIMESTAMP`, same UTC instant, zero skew
+  either way — so it passed with `time.Now()` reinstated. Its own 15-line comment
+  claimed the opposite in as many words.
+- The three sparse-write tests placed the out-of-band `UPDATE` *before* the next
+  register, so a merging implementation reads the new value and writes it straight
+  back — indistinguishable. The comment said the write landed "after register reads
+  the row, before it writes back". There was no interleaving at all.
+
+The corrective is not better care. It is the rule he proposed: **every behavioural
+claim gets a mutation check, and the test comment names the mutation it kills.**
+Applied to all six claims in this change, each one run for real: the SQL-clock
+assertion, the merge guards, the legacy empty-skip, the log-field assertion, the
+App Bot warning, and the all-or-nothing decode.
+
+**The sparse-write invariant moved to a source guard, because behaviour cannot
+reach it.** The real interleaving window is between `queryRobotByBotToken` and the
+`UPDATE`; no behavioural test can deterministically get inside it. Two guards
+replace it: `applyAgentReport`'s signature cannot receive the row, and neither
+function may assign a stored value back into `req.Agent*`. They discriminate on
+the *assignment target*, which is what actually matters — passing stored values as
+a separate snapshot for a skip comparison is fine (a mismatch writes the caller's
+value), assigning them into the request is not.
+
+**One test was deleted rather than fixed, and that is the interesting part.**
+Making the timezone test discriminate required squeezing the connection pool to
+one connection so the offset and the write shared a session. That worked — the
+mutation produced a measured `7h59m59s` skew — and it broke the package, because
+`SetMaxOpenConns(1)` is process-wide: other tests queued behind it and the failure
+set changed between runs. The invariant already had a deterministic guard one layer
+down (assert the statement contains a literal `NOW()`), which kills the same
+mutation and touches nothing shared. **A test that needs exclusive process state is
+unreliable in a full-package run no matter how faithful it is.** The deletion
+reasoning sits where the test was, so the next reader does not conclude the
+timezone is unguarded and re-add the same shape.
+
+**The spec had drifted into contradicting the code in four places** — two of them
+describing behaviours that previous rounds had *changed*, including the
+store-empty-on-invalid rule that both reviewers had blocked on. The previous round
+fixed the one bullet that was pointed at and not the class. A stale rule in a
+Load-bearing list is worse than no rule: the next engineer reads it as
+authoritative and "fixes" the code back to the bug.
+
+**P2-4 turned into a design decision.** Making `""` clear `agent_hosting` while
+`""` means "unchanged" for its three siblings reproduces, for the new column, the
+exact shape that was ruled data loss for the old ones: a client that never
+populates the key but always emits it lands in `('', non-NULL)` on every
+reconnect — the state three documents define as "reported, then deliberately
+retracted". Retraction now uses a reserved slug (`none`), normalized to `""` on
+storage so readers need no knowledge of the sentinel. `""` is a no-op for all four
+fields, and no value in this request body is destructive.
+
+**And the reason for one earlier change had evaporated.** Dropping the
+skip-if-unchanged shortcut was justified by the timestamp advancing on every
+report — but the timestamp now advances only on hosting reports, so a version-only
+reconnect with unchanged values issued a statement with no observable effect at
+all. Re-added for the legacy columns, comparing against a stored snapshot that is
+never substituted into the statement. Hosting keeps writing unconditionally,
+because a re-retraction is a real report and its timestamp must move.
+
+## Gotcha: a degrading container looks exactly like test pollution
+
+Chasing the round-4 fixes, `modules/botfather` began failing a *different* set of
+tests on every full-package run, each failure taking exactly ~5s or ~30s. That
+reads as pollution, and two real instances were found and fixed (see below). It was
+not the cause. The local WuKongIM container had been up 8 days and `UpdateIMToken` had
+started timing out at 5s, surfacing as `err.server.bot_api.im_token_failed`.
+Restarting it made the package green in 15.7s, including two tests that had been
+failing at 30s on the pre-change head too.
+
+The distinguishing test is cheap: run the package serially (`-p 1 -parallel 1`). A
+genuine ordering dependency becomes *stable*; a capacity problem stays random. I
+should have run it before assuming my own tests were at fault.
+
+The two real pollutions found on the way are worth keeping:
+
+- `POST /v1/bot/register` sits behind `StrictIPRateLimitMiddleware("bot_register")`,
+  which buckets by **IP** — and every test in a package shares one httptest client
+  IP. This file is the repo's densest register caller (26 calls, up to 4 in one
+  test), so the bucket must be cleared inside the `botRegister` helper, not once in
+  setup: a single test can exhaust it by itself.
+- `SET time_zone` on a pooled connection is not scoped to anything; the deferred
+  reset can land on a different connection than the one that was changed.
+
 ## Known limitation (recorded, not fixed)
 
 **One overlong `agent_*` field blocks the whole group.** The three pre-existing

@@ -1,17 +1,16 @@
 package botfather
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
+	"github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,9 +56,36 @@ func readAgentInfo(t *testing.T, ctx *config.Context, robotID string) agentInfoR
 	return row
 }
 
-// botRegister 用 bf_ token 调 POST /v1/bot/register。
-func botRegister(t *testing.T, h http.Handler, botToken string, body interface{}) *httptest.ResponseRecorder {
+// resetRegisterRateLimit 清掉 /v1/bot/register 的 per-IP strict 桶。
+//
+// 必须做，且必须在**每次** register 之前：该路由挂的是
+// StrictIPRateLimintMiddleware("bot_register")（modules/bot_api/bot_api.go），
+// 桶按 **IP** 计，而整包跑时所有测试共享同一个 httptest 客户端 IP。本文件的测试是
+// 全仓 register 调用最密集的一批（单条测试里连发 4 次），单跑时桶够用，整包跑时
+// 前面积累的调用会把它打满，于是后面的测试收到 429 —— 表现为「单跑绿、整包红，
+// 且每次红的还不是同一条」。桶存在 Redis 里，CleanAllTables 不清它。
+func resetRegisterRateLimit(t *testing.T, ctx *config.Context) {
 	t.Helper()
+	rds := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rds.Close()
+	// StrictIPRateLimitMiddleware 的 key 前缀含 tag，这里按 tag 精确清掉，
+	// 不误伤别的 strict 桶。
+	keys, err := rds.Keys("*bot_register*").Result()
+	if err == nil && len(keys) > 0 {
+		_ = rds.Del(keys...).Err()
+	}
+}
+
+// botRegister 用 bf_ token 调 POST /v1/bot/register。
+//
+// 每次调用前清 per-IP 桶 —— 见 resetRegisterRateLimit。放在这里而不是各测试的 setup，
+// 是因为限流按调用**次数**累积，setup 时清一次不够：一条测试内连发多次就会自己把桶打满。
+func botRegister(t *testing.T, ctx *config.Context, h http.Handler, botToken string, body interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	resetRegisterRateLimit(t, ctx)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, userAPIRequest(t, http.MethodPost, "/v1/bot/register", botToken, body))
 	return w
@@ -81,7 +107,7 @@ func TestRegisterStoresAgentHosting(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostok")
 
-	w := botRegister(t, h, botToken, map[string]interface{}{
+	w := botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "OpenClaw",
 		"agent_version":  "0.3.1",
 		"plugin_version": "1.2.0",
@@ -114,7 +140,7 @@ func TestRegisterMalformedHostingPreservesStoredValue(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostbad")
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "octo_hosted",
 	}).Code)
 	require.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
@@ -124,7 +150,7 @@ func TestRegisterMalformedHostingPreservesStoredValue(t *testing.T) {
 		"self-hosted",               // 现实中最可能的拼错：连字符
 		"K_hosted",                  // U+212A KELVIN SIGN，ToLower 会折成 'k'
 	} {
-		w := botRegister(t, h, botToken, map[string]interface{}{
+		w := botRegister(t, ctx, h, botToken, map[string]interface{}{
 			"agent_platform": "OpenClaw",
 			"agent_hosting":  bad,
 		})
@@ -135,25 +161,6 @@ func TestRegisterMalformedHostingPreservesStoredValue(t *testing.T) {
 			"被拒的值 %q 必须保持已存值不变，而不是清成空串", bad)
 		assert.Equal(t, "OpenClaw", row.AgentPlatform, "同一请求里的合法字段仍应落库")
 	}
-}
-
-// TestRegisterExplicitEmptyHostingClears —— 与上一条成对：显式报 "" 是格式良好的
-// 上报，含义是「清空」，与「被拒」区分开。
-func TestRegisterExplicitEmptyHostingClears(t *testing.T) {
-	h, ctx := newUserAPITestServer(t)
-	resetUIDRateLimit(t, ctx)
-	robotID, botToken := setupAgentHostingBot(t, ctx, "hostclr")
-
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
-		"agent_hosting": "octo_hosted",
-	}).Code)
-	require.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
-
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
-		"agent_hosting": "",
-	}).Code)
-	assert.Equal(t, "", readAgentInfo(t, ctx, robotID).AgentHosting,
-		"显式空串是「清空」，与被拒的非法值必须区分")
 }
 
 // TestRegisterThirdPartyHostingRoundTrips —— 第三方托管方无需改服务端即可自报，
@@ -167,7 +174,7 @@ func TestRegisterThirdPartyHostingRoundTrips(t *testing.T) {
 	robotID, botToken := setupAgentHostingBot(t, ctx, "host3rd")
 
 	const vendor = "vendor_hosted"
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": vendor,
 	}).Code)
 	assert.Equal(t, vendor, readAgentInfo(t, ctx, robotID).AgentHosting,
@@ -181,34 +188,38 @@ func TestRegisterThirdPartyHostingRoundTrips(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"agent_hosting":"`+vendor+`"`)
 }
 
-// TestRegisterHostingPointerSemantics —— 指针语义：字段缺席则保留，显式空串则清空。
+// TestRegisterHostingPointerSemantics —— 指针语义的可观察结果：字段缺席则保留。
 //
-// 四个字段现在都是指针（PR #837 review 后统一），所以「缺席 vs 报了空」对每个字段
-// 都可区分。hosting 与三个版本字段的差别只在于：对版本号「报空」没有意义，而这里
-// 「报空」正是 runtime 清掉陈旧形态的方式 —— 自运维→平台托管切换时陈旧值比空值更有害。
+// 四个字段现在都是指针（PR #837 round 1 后统一），所以「缺席 vs 报了空」对每个字段
+// 都可区分。清空 hosting 用保留 slug（见 AgentHostingNone），不用空串 —— 理由见
+// TestRegisterHostingNoneClearsTheShape。
+//
+// 同样注意：本测试证明"缺席时值保留"，**不**区分稀疏写入与 read-merge-write。
 func TestRegisterHostingPointerSemantics(t *testing.T) {
 	h, ctx := newUserAPITestServer(t)
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostptr")
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "octo_hosted",
 	}).Code)
 	require.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
 
 	// 字段缺席（旧客户端 / 只报版本）→ 保留已存值。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_version": "0.9.9",
 	}).Code)
 	row := readAgentInfo(t, ctx, robotID)
 	assert.Equal(t, bot_api.AgentHostingOctoHosted, row.AgentHosting, "字段缺席时必须保留已存值")
 	assert.Equal(t, "0.9.9", row.AgentVersion)
 
-	// 显式空串 → 清空。与「缺席」可区分，这正是用指针的理由。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	// 显式空串 → **保持不变**（"" 对四个字段一律是「未上报」）。撤回走 none，
+	// 见 TestRegisterHostingNoneClearsTheShape。
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "",
 	}).Code)
-	assert.Equal(t, "", readAgentInfo(t, ctx, robotID).AgentHosting, "显式空串必须清空")
+	assert.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
+		"空串是「未上报」而非「清空」—— 与三个 legacy 字段同口径（round 4 P2-4）")
 }
 
 // TestRegisterRefreshesReportedAtWhenValuesUnchanged —— reported_at 的语义是
@@ -222,7 +233,7 @@ func TestRegisterRefreshesReportedAtWhenValuesUnchanged(t *testing.T) {
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostts")
 
 	body := map[string]interface{}{"agent_platform": "OpenClaw", "agent_hosting": "self_hosted"}
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, body).Code)
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, body).Code)
 
 	_, err := ctx.DB().UpdateBySql(
 		"UPDATE robot SET agent_reported_hosting_at='2020-01-01 00:00:00' WHERE robot_id=?", robotID,
@@ -232,7 +243,7 @@ func TestRegisterRefreshesReportedAtWhenValuesUnchanged(t *testing.T) {
 	require.True(t, stale.Valid)
 
 	// 完全相同的 body 再报一次。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, body).Code)
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, body).Code)
 
 	fresh := readAgentInfo(t, ctx, robotID).AgentReportedHostingAt
 	require.True(t, fresh.Valid)
@@ -252,7 +263,7 @@ func TestRegisterEmptyBodyLeavesAgentInfoUntouched(t *testing.T) {
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostnone")
 
 	// 空 JSON 对象。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{}).Code)
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{}).Code)
 	row := readAgentInfo(t, ctx, robotID)
 	assert.Equal(t, "", row.AgentHosting)
 	assert.False(t, row.AgentReportedHostingAt.Valid,
@@ -266,24 +277,28 @@ func TestRegisterEmptyBodyLeavesAgentInfoUntouched(t *testing.T) {
 		"无 body 的 register 同样不得写 agent_* 列")
 }
 
-// TestRegisterVersionOnlyReportDoesNotTouchHosting —— 只报版本时，agent_hosting
-// 列必须**不在 UPDATE 语句里**，而不是「被写回同一个值」。
+// TestRegisterVersionOnlyReportDoesNotTouchHosting —— 只报版本时，带外写入的
+// agent_hosting 必须存活。
 //
-// 这两者的区别不是风格问题，是并发正确性：写回实现会丢更新（A 读旧 → B 写新 →
-// A 把旧值写回）。用**带外写入**逼出这个区别 —— 在 register 读到行之后、写回之前
-// 由第三方改掉 hosting，写回实现会把它覆盖成读到的旧值，稀疏实现则原样保留。
+// **本测试证明什么、不证明什么**（PR #837 round 4 P1(b) 修正）：它证明"缺席字段的值
+// 不会被本次上报改动"这个**可观察结果**。它**不能**区分稀疏写入与
+// read-merge-write —— 带外 UPDATE 落在下一次 register **之前**，合并实现读到的已经是
+// 新值、再写回去，结果一模一样。真正的交错窗口在 queryRobotByBotToken 与 UPDATE 之间，
+// 行为测试无法确定性地插进去。
 //
-// 这条替换了初版的写法：初版只断言「值保留 + 时间戳前进」，而在被否决的写回实现下
-// 语句里既有 `agent_hosting=<旧值>` 也有时间戳，三条断言全过 —— 论证不成立
-// （PR #837 两位 reviewer 独立指出同一点）。真正的区分靠下面的 out-of-band 写入，
-// 以及同包的 TestUpdateRobotAgentInfoOmitsUnreportedColumns（直接断言 SQL）。
+// 那个不变量由 modules/bot_api 的两条**源码守卫**钉住
+// （TestApplyAgentReportCannotReadTheRobotRow /
+// TestRegisterUserBotDoesNotMergeAgentFields，已验证能杀掉 read-merge-write 变异），
+// 以及 TestUpdateRobotAgentInfoOmitsUnreportedColumns（直接断言发出的 SQL 里有哪些列）。
+// 早前这段注释声称本测试"用带外写入逼出区别"，那是错的 —— reviewer 实测在植入合并
+// 实现后本测试照样绿。
 func TestRegisterVersionOnlyReportDoesNotTouchHosting(t *testing.T) {
 	h, ctx := newUserAPITestServer(t)
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostkeep")
 
 	// 先让 bot 报一次 hosting，落库。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "self_hosted",
 	}).Code)
 	require.Equal(t, bot_api.AgentHostingSelfHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
@@ -297,7 +312,7 @@ func TestRegisterVersionOnlyReportDoesNotTouchHosting(t *testing.T) {
 	require.NoError(t, err)
 
 	// 只报版本，不带 agent_hosting。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"plugin_version": "2.0.0",
 	}).Code)
 
@@ -307,18 +322,21 @@ func TestRegisterVersionOnlyReportDoesNotTouchHosting(t *testing.T) {
 	assert.Equal(t, "2.0.0", row.PluginVersion, "本次上报的字段仍应落库")
 }
 
-// TestRegisterHostingOnlyReportDoesNotClobberVersions —— 反向的同一个不变量：
-// 只报 hosting 时三个版本列必须不在语句里。
+// TestRegisterHostingOnlyReportDoesNotClobberVersions —— 反向的同一个可观察结果：
+// 只报 hosting 时，带外写入的版本值必须存活。
 //
-// 这是 PR #837 两位 reviewer 都判为阻塞的那条（P1-2）：初版对 agent_hosting 用了
-// 稀疏写入，却对三个 sibling 版本列做了它注释里明确否决的「回写读到的值」，而且
+// 背景是 PR #837 round 1 两位 reviewer 都判为阻塞的 P1-2：初版对 agent_hosting 用了
+// 稀疏写入，却对三个 sibling 版本列做了它注释里明确否决的「回写读到的值」，而
 // 「只报 hosting」正是本功能新引入的请求形态 —— 等于新开了一条丢更新的路径。
+//
+// 与上一条同样的边界：本测试证明可观察结果，**不**区分两种实现（同样的原因，
+// 带外写入没有落在读写窗口内）。区分交给 bot_api 的源码守卫 + SQL 形状断言。
 func TestRegisterHostingOnlyReportDoesNotClobberVersions(t *testing.T) {
 	h, ctx := newUserAPITestServer(t)
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostonly")
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "OpenClaw",
 		"agent_version":  "0.1.0",
 	}).Code)
@@ -330,7 +348,7 @@ func TestRegisterHostingOnlyReportDoesNotClobberVersions(t *testing.T) {
 	require.NoError(t, err)
 
 	// 只报 hosting。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "self_hosted",
 	}).Code)
 
@@ -340,66 +358,23 @@ func TestRegisterHostingOnlyReportDoesNotClobberVersions(t *testing.T) {
 	assert.Equal(t, bot_api.AgentHostingSelfHosted, row.AgentHosting)
 }
 
-// TestRegisterHostingTimestampSharesMySQLClockWithBoundAt —— 时间戳必须与
-// bound_at 同源（都由 SQL NOW() 写），把两种时钟放进**同一个断言**。
+// 时区同源的守卫**不在本文件**。
 //
-// 这是 PR #837 两位 reviewer 都判为阻塞的另一条（P1-1）：初版用 Go 侧 time.Now()，
-// 经驱动 Config.Loc（默认 UTC，DSN 未设 loc）转换，而应用镜像固定
-// TZ=Asia/Shanghai —— MySQL session 时区非 UTC 时，同一响应里这两个时间戳会相差
-// 8 小时且无标记解释。生产 MySQL 是 UTC 所以那是潜伏而非已发生，但初版的测试
-// **结构上**抓不到它：要么两个 Go 写的值互比（同一时钟内单调），要么用 SQL NOW()
-// 播种（从不把两种来源放进同一个比较）。
+// 这里曾有一条 TestRegisterHostingTimestampSharesMySQLClockWithBoundAt：把会话时区
+// 调到 +08:00，再比较 agent_reported_hosting_at 与 NOW() 写的 bound_at。它确实能杀掉
+// 「dbr.Expr("NOW()") 换回 time.Now()」这个变异（实测偏差 7h59m59s），但**代价是整包
+// 不可跑**：要让 register 的写入落在被改过时区的会话上，就得把 ctx.DB() 的连接池压到
+// 单连接，而那是**进程级共享状态** —— 压池期间其它测试的查询排队/超时，成片失败；
+// 用 SetConnMaxLifetime 强制作废连接来收尾同样不稳定（改完后失败集每次都不一样）。
 //
-// 本测试在本地 UTC MySQL 下同样能红：它不依赖时区偏移，而是断言两个时间戳彼此
-// 接近；Go 侧写入一旦回来，只要 DB 时区非 UTC 就会差出小时级。为了在**任何**
-// 时区下都能抓到，显式把 session 时区设成 +08:00 再比。
-func TestRegisterHostingTimestampSharesMySQLClockWithBoundAt(t *testing.T) {
-	h, ctx := newUserAPITestServer(t)
-	resetUIDRateLimit(t, ctx)
-	robotID, botToken := setupAgentHostingBot(t, ctx, "hosttz")
-
-	// 用**独占一条连接**做时区偏移，不要打在池上（ctx.DB() 是连接池：
-	// SET 落在某条连接、deferred 复位可能落在另一条，会把一条 +08:00 的连接留在
-	// 池里污染后续测试。PR #837 round 2 P2-6）。
-	conn, err := ctx.DB().DB.Conn(context.Background())
-	require.NoError(t, err)
-	defer func() { _ = conn.Close() }() // 关闭即释放，池里不留被改过的连接
-
-	if _, err := conn.ExecContext(context.Background(), "SET time_zone = '+08:00'"); err != nil {
-		t.Skipf("无法设置 session 时区（权限/后端差异），跳过：%v", err)
-	}
-
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
-		"agent_hosting": "self_hosted",
-	}).Code)
-
-	// 参照物：在**这条**偏移过的连接上用 NOW() 写 bound_at —— 生产就是这么写的
-	// （modules/botfather/db.go 的 bindRobotCAS）。register 那次写入走的是池里
-	// 另一条连接，所以如果实现用 Go 侧 time.Now()，它会被驱动按 Config.Loc(UTC)
-	// 转换，与这里的 NOW() 差出整个时区偏移；用 SQL NOW() 则两者同源。
-	_, err = conn.ExecContext(context.Background(),
-		"UPDATE robot SET bound_at=NOW() WHERE robot_id=?", robotID)
-	require.NoError(t, err)
-
-	var row struct {
-		HostingAt dbr.NullTime `db:"agent_reported_hosting_at"`
-		BoundAt   dbr.NullTime `db:"bound_at"`
-	}
-	require.NoError(t, ctx.DB().SelectBySql(
-		"SELECT agent_reported_hosting_at, bound_at FROM robot WHERE robot_id=?", robotID,
-	).LoadOne(&row))
-	require.True(t, row.HostingAt.Valid)
-	require.True(t, row.BoundAt.Valid)
-
-	skew := row.BoundAt.Time.Sub(row.HostingAt.Time)
-	if skew < 0 {
-		skew = -skew
-	}
-	assert.Less(t, skew, time.Minute,
-		"agent_reported_hosting_at 与 bound_at 必须同源（都用 SQL NOW()）；"+
-			"实测偏差 %s —— Go 侧 time.Now() 经驱动 Config.Loc(UTC) 转换，"+
-			"在非 UTC 的 MySQL session 上会与 NOW() 差出时区偏移（PR #837 P1-1）", skew)
-}
+// 换来的信息量也有限：它验证的是「两个 TIMESTAMP 在非 UTC 会话下不分叉」，而这一点
+// 的**充分**条件就是「写入语句里用的是 SQL NOW() 而不是绑定参数」——
+// 那是 modules/bot_api 的 TestUpdateRobotAgentInfoStampsHostingTimeWithSQLNow 直接
+// 断言的，同样能杀掉同一个变异（已实测），且不碰任何共享状态。
+//
+// 所以这条被删掉，而不是修好：一条需要污染进程级状态才能运行的测试，在整包里就是
+// 不可靠的，而它守的不变量已有确定性的守法。这个取舍写在这里，免得下一个人以为
+// 「时区没人管」而重新加回同一个形状。
 
 // TestRegisterEmptyLegacyVersionPreservesStoredValue —— 三个 legacy 版本字段报
 // **空串**必须保留已存值，不能清空。这是 PR #837 round 2 的阻塞项（P1-1）。
@@ -417,14 +392,14 @@ func TestRegisterEmptyLegacyVersionPreservesStoredValue(t *testing.T) {
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostlegacy")
 
 	// 播种三个值。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "OpenClaw",
 		"agent_version":  "1.2.3",
 		"plugin_version": "9.9.9",
 	}).Code)
 
 	// 报一个新版本，另两个送空串 —— 正是「序列化器对未填字段输出 ""」的形态。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "",
 		"agent_version":  "1.2.4",
 		"plugin_version": "",
@@ -448,7 +423,7 @@ func TestRegisterAllEmptyLegacyFieldsWritesNothing(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostnoop")
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "",
 		"agent_version":  "",
 		"plugin_version": "",
@@ -470,15 +445,32 @@ func TestRegisterOversizedBodyDegradesToNoTelemetry(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostbig")
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": "OpenClaw",
 		"agent_hosting":  "self_hosted",
 	}).Code)
 	before := readAgentInfo(t, ctx, robotID)
 	require.Equal(t, bot_api.AgentHostingSelfHosted, before.AgentHosting)
 
-	// 合法 JSON，但远超 4 KiB：hosting 本身是合法值，只是整个 body 被截断。
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	// 恰好压到上限之内的 body 必须**被采纳** —— 这一半是边界的下侧。
+	// 只测"8 KiB 被拒"的话，把上限从 4 KiB 调到 8 KiB 仍然全绿，常量就没被钉住
+	// （round 4 P2-6）。
+	underLimit := map[string]interface{}{"agent_hosting": "octo_hosted"}
+	// 4096 − 已有键值与括号的开销，留足余量后仍在限内。
+	underLimit["padding"] = strings.Repeat("x", 4<<10-200)
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, underLimit).Code)
+	assert.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
+		"限内的 body 必须被采纳；若这里失败，说明上限被调得过小")
+
+	// 复位到已知值，再验上侧。
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
+		"agent_hosting": "self_hosted",
+	}).Code)
+	before = readAgentInfo(t, ctx, robotID)
+	require.Equal(t, bot_api.AgentHostingSelfHosted, before.AgentHosting)
+
+	// 明确超限：hosting 本身合法，只是整个 body 被截断。
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "octo_hosted",
 		"padding":       strings.Repeat("x", 8<<10),
 	}).Code, "body 超限不得让 register 失败 —— 它是 Bot 掉线自愈的唯一通道")
@@ -487,6 +479,39 @@ func TestRegisterOversizedBodyDegradesToNoTelemetry(t *testing.T) {
 	assert.Equal(t, before.AgentHosting, after.AgentHosting,
 		"超限 body 按未上报处理，已存值不得被改动")
 	assert.Equal(t, before.AgentPlatform, after.AgentPlatform)
+}
+
+// TestRegisterHostingNoneClearsTheShape —— 撤回走保留 slug，不走空串。
+//
+// 决策理由（round 4 P2-4）：同一个 JSON 里 `""` 对三个 legacy 字段是「保持」，
+// 若对第四个是「清空」，就成了客户端作者的陷阱；而且"从不填该字段但总是发这个 key"
+// 的客户端会每次重连落进 `(”, 非NULL)` —— 那个状态被三处文档定义为「曾上报后显式
+// 清空」，等于把序列化器默认值读成了刻意撤回。保留 slug 让撤回显式且可 grep。
+func TestRegisterHostingNoneClearsTheShape(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hostnone2")
+
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
+		"agent_hosting": "self_hosted",
+	}).Code)
+	require.Equal(t, bot_api.AgentHostingSelfHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
+
+	// "" 是「未上报」：值必须保持不变。
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
+		"agent_hosting": "",
+	}).Code)
+	assert.Equal(t, bot_api.AgentHostingSelfHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
+		"空串是「未上报」，与三个 legacy 字段同口径，不得清空")
+
+	// none 才是撤回。
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
+		"agent_hosting": bot_api.AgentHostingNone,
+	}).Code)
+	row := readAgentInfo(t, ctx, robotID)
+	assert.Equal(t, "", row.AgentHosting, "none 必须把形态撤回成空")
+	assert.True(t, row.AgentReportedHostingAt.Valid,
+		"撤回是一次真实上报，时间戳必须非 NULL —— ('', 非NULL) 正是「曾上报后被清空」")
 }
 
 // TestRegisterPartiallyMalformedBodyAdoptsNothing —— 类型错误的 body 一个字段都
@@ -544,7 +569,7 @@ func TestRegisterAppBotIgnoresAgentRuntimeFields(t *testing.T) {
 	require.NoError(t, err)
 	insertTestUser(t, ctx, uid, uid)
 
-	w := botRegister(t, h, token, map[string]interface{}{
+	w := botRegister(t, ctx, h, token, map[string]interface{}{
 		"agent_platform": "OpenClaw",
 		"agent_hosting":  "self_hosted",
 	})
@@ -625,7 +650,7 @@ func TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate(t *testing.T) {
 		t.Skipf("本测试要求严格模式（当前 sql_mode=%q）：非严格模式下超长值被静默截断，整组 UPDATE 不会失败", sqlMode)
 	}
 
-	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_platform": strings.Repeat("x", 200), // 列宽 50
 		"agent_hosting":  "vendor_hosted",          // 本身完全合法
 	}).Code, "UPDATE 失败只记日志，register 仍须返回 200")
@@ -639,11 +664,18 @@ func TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate(t *testing.T) {
 
 // TestAgentHostingMigrationIsSingleAtomicAlter —— 两列必须在同一条 ALTER 里。
 //
-// 本仓迁移原则是朴素 DDL + 靠 gorp_migrations 记账，不在每条迁移里堆幂等魔法。
-// 该原则成立的前提是这条迁移**原子**：单条 ALTER 加两列要么全成要么全不成，
-// 不留「一列已加一列没加」的中间态（#239 的半应用态出在多语句迁移上，
-// 20260417000001 的 agent_* 三列同样是三条独立 ALTER、同样可半应用）。
-// 拆成两条 ALTER 又不加守卫，是最坏的组合。
+// **单条 ALTER 只解决一件事**：不留「一列已加、一列没加」的列级中间态。
+//
+// 它**不解决**可重入性 —— 这一点上一版的注释说错了（round 4 P2-3）。
+// 20260603000002 那条存在性守卫防的是「两个 pod 竞争同一迁移」和「DDL 隐式提交后、
+// gorp_migrations 记账前进程死掉」，单条原子 ALTER 对这两者都无效。
+//
+// **本迁移选择不加守卫**，理由是先例混杂且近期倾向朴素 DDL
+// （modules/user/20260810000001、modules/opanalytics/20260830000001 都是无守卫的
+// ADD COLUMN），而 robot 表小、迁移在滚动发布中的执行方式属部署侧约束（见 brief 的
+// 待确认项）。这是一个**选择**，不是一条原则 —— 所以本测试**不再断言**「不得出现
+// INFORMATION_SCHEMA / CREATE PROCEDURE」：那会让后来人想加守卫就必须先删测试，
+// 而加守卫是完全正当的决定。
 func TestAgentHostingMigrationIsSingleAtomicAlter(t *testing.T) {
 	raw, err := os.ReadFile("sql/20260903000001_botfather_agent_hosting.sql")
 	require.NoError(t, err)
@@ -651,13 +683,9 @@ func TestAgentHostingMigrationIsSingleAtomicAlter(t *testing.T) {
 
 	up := src[strings.Index(src, "-- +migrate Up"):strings.Index(src, "-- +migrate Down")]
 	assert.Equal(t, 1, strings.Count(up, "ALTER TABLE"),
-		"Up 段必须只有一条 ALTER TABLE（两列同批加，保证原子）")
+		"Up 段必须只有一条 ALTER TABLE（两列同批加，避免列级半应用态）")
 	assert.Contains(t, up, "agent_hosting")
 	assert.Contains(t, up, "agent_reported_hosting_at")
-	assert.NotContains(t, up, "INFORMATION_SCHEMA",
-		"朴素 DDL 原则：不要在迁移里堆存在性守卫（单条 ALTER 本身已原子）")
-	assert.NotContains(t, up, "CREATE PROCEDURE",
-		"朴素 DDL 原则：不要用存储过程包幂等逻辑")
 	assert.Contains(t, up, "不可用于鉴权",
 		"列 COMMENT 必须写明自报值不可用于鉴权")
 }

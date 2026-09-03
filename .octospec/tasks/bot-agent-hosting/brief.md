@@ -87,7 +87,7 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 ## Load-bearing list
 
 - **register 是 Bot 掉线自愈的唯一通道，任何新校验都不得阻断它。** `agent_hosting`
-  走形状校验，但**形状非法一律落空串 + Warn，照常返回成功**。#696 的二次事故就是
+  走形状校验，但**形状非法一律忽略该字段（已存值保持不变）+ Warn，照常返回成功**。#696 的二次事故就是
   register 被连带拒绝导致 bot 永远起不来，`modules/bot_api/ratelimit_integration_test.go:272-274`
   有回归断言钉着。为一个纯观测字段的取值校验去阻断自愈通道是错误的取舍。
 - **四个 `agent_*` 字段一律稀疏写入：缺席的字段必须在 SQL 层面缺席。**（PR #837
@@ -240,6 +240,60 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   同理 botfather 的 `robotModel` 只需加**读**字段（`listUserBots` 经
   `api_user.go:344` 用它）。
 
+## 测试的区分力（round 4 定稿的规则）
+
+**每个行为断言都要过变异检查，且测试注释必须写明它杀掉哪个变异。** 这条是被
+reviewer 的过程观察逼出来的：连续三轮，每轮都产出一条"为回答『你的测试区分不了两种
+实现』而写"的测试，而每轮那条测试都有同一个缺陷 —— 注释声称的区分力没有被验证过。
+一条注释声称有区分力却没有的测试，比没有测试更糟：它会被相信。
+
+已验证能杀掉对应变异的测试（每条都实际跑过变异版）：
+
+| 变异 | 会红的测试 |
+|---|---|
+| `dbr.Expr("NOW()")` → `time.Now()` | `TestUpdateRobotAgentInfoStampsHostingTimeWithSQLNow`（断言语句里是字面 `NOW()`）|
+| 在调用点把 robot 行的值赋回 `req.Agent*` | `TestRegisterUserBotPassesStoredOnlyAsASkipSnapshot` |
+| 去掉 legacy 的空值跳过 | `TestRegisterEmptyLegacyVersionPreservesStoredValue` + SQL 形状表 |
+| `zap.Int("rejectedLen")` → `zap.String("value", …)` | `TestApplyAgentReportWarnsOnMalformedHostingWithoutLeakingTheValue` |
+| 删掉 `registerAppBot` 的 `ba.Warn` | `TestRegisterAppBotWarnIsTheDeliverable` |
+| 改回 `_ = c.ShouldBindJSON` | `TestRegisterPartiallyMalformedBodyAdoptsNothing` |
+
+**一条端到端时区测试被删除而非修好。** 它把会话时区调到 `+08:00` 再比两个时间戳，
+确实能杀掉 `NOW()` → `time.Now()` 的变异（实测偏差 `7h59m59s`），但要让 register 的写入
+落在被改过时区的会话上，必须把 `ctx.DB()` 的连接池压到单连接 —— 那是**进程级共享状态**：
+压池期间其它测试的查询排队甚至超时，整包成片失败；用 `SetConnMaxLifetime` 强制作废连接
+收尾同样不稳定（失败集每次不同）。而它守的不变量有确定性的替代守法 ——
+「语句里用的是 SQL `NOW()` 而非绑定参数」是充分条件，由
+`TestUpdateRobotAgentInfoStampsHostingTimeWithSQLNow` 直接断言、同样能杀同一变异、且不碰
+共享状态。**取舍原则：一条需要污染进程级状态才能运行的测试，在整包里就是不可靠的。**
+删除理由写在原代码位置，防止下一个人以为「时区没人管」而重新加回同一形状。
+
+**两条端到端测试已如实降级**：`TestRegisterVersionOnlyReportDoesNotTouchHosting` 与
+`TestRegisterHostingOnlyReportDoesNotClobberVersions` 只证明「缺席字段的值不被本次上报
+改动」这个可观察结果。它们**不能**区分稀疏写入与 read-merge-write —— 带外 UPDATE 落在
+下一次 register **之前**，合并实现读到的已是新值、再写回去结果相同；真正的交错窗口在
+`queryRobotByBotToken` 与 UPDATE 之间，行为测试无法确定性插入。那个不变量改由
+`modules/bot_api` 的两条源码守卫承担（`TestApplyAgentReportCannotReadTheRobotRow` /
+`TestRegisterUserBotPassesStoredOnlyAsASkipSnapshot`），它们区分的是**赋值目标**：
+把 robot 行的值作为独立 `stored` 快照传参用于 skip 比较是合法的（不匹配时写入的是
+调用方的值），赋回 `req.Agent*` 任一字段则被禁止。
+
+## 测试环境的一个坑（排查耗时，值得记）
+
+`modules/botfather` 整包出现「失败集每次不同、且失败测试耗时恰好 ~5s / 30s」时，
+**先重启 WuKongIM 容器再怀疑代码**。本任务在此误判过：连续 8 天运行的 本地 WuKongIM 容器状态劣化，`UpdateIMToken` 开始 5s 超时，表现为
+`err.server.bot_api.im_token_failed`（HTTP 400）。它看起来像测试污染 —— 单跑绿、整包红 ——
+但串行跑（`-p 1 -parallel 1`）同样失败、且失败集仍在变，就说明不是顺序依赖。
+重启 IM 后整包 15.7s 全绿，含此前 30s 超时的 `TestBotGroupCreate_*`（那两条在改动前的
+head 上也失败，本就与本任务无关）。
+
+排查过程中确实找出并修掉了两个**真实的**测试污染，保留：
+- `POST /v1/bot/register` 挂的是 `StrictIPRateLimitMiddleware("bot_register")`，桶按 **IP**
+  计而整包共享同一 httptest 客户端 IP；本文件是全仓 register 调用最密集的一批
+  （26 次），所以 `botRegister` helper 每次调用前清桶，而不是在 setup 清一次
+  （一条测试内连发多次就会自己打满）。
+- 上一版时区测试的 `SET time_zone` 打在连接池上。
+
 ## Out of scope
 
 - **实例标识（`agent_instance_ref`）与多实例可见性。** 与 `bound_agent_ref` 语义重叠
@@ -303,8 +357,9 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 
 **读出**
 
-- `GET /v1/user/bots` 每项含 `agent_hosting` 与 `agent_reported_hosting_at`；未上报时分别为
-  空串与 `null`。
+- `GET /v1/user/bots` 每项含 `agent_hosting` 与 `agent_reported_hosting_at`；未上报时
+  `agent_hosting` 被 `omitempty` **省略**（不下发空串），`agent_reported_hosting_at`
+  显式 `null`。
 - **负向断言**：`GET /v1/users/:uid` 的 extraMap 与 `POST /v1/users/batch` 的响应
   **不含** `agent_hosting`（防止后来人顺手接入 IM 全员面）。
 - `UserBotResp` 的现有字段值与形状不因本任务改变。
@@ -338,17 +393,20 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 - 只报版本时，`agent_hosting` 与其时间戳都不在语句里；端到端同样用带外写入验证
   （初版那条「值保留 + 时间戳前进」的断言在写回实现下同样会过 —— 论证不成立）。
 - 什么都没报 → 不发任何语句（sqlmock 无 Expect，一旦发出即失败）。
-- `agent_reported_hosting_at` 由 SQL `NOW()` 写：语句里出现字面 `NOW()`；
-  并且在 session 时区 `+08:00` 下，它与同一行用 `NOW()` 写的 `bound_at` 偏差 < 1 分钟。
+- `agent_reported_hosting_at` 由 SQL `NOW()` 写：语句里出现字面 `NOW()`（SQL 层断言）。
+  端到端的时区比对测试已删除 —— 理由见「测试的区分力」。
 - 形状非法时发一条 Warn，且日志**不含原始值**（只有 `rejectedLen`）；合法上报无 Warn。
-- App Bot 上报时的 Warn 被断言（那是这个分支解析 body 的唯一理由）。
+- App Bot 上报时的 Warn 由 `TestRegisterAppBotWarnIsTheDeliverable`（源码守卫）钉住 ——
+  它是这个分支解析 body 的唯一产出，删掉那行 Warn 会让该测试红。
 
 **边界与已知限制**
 
 - 空 JSON `{}` 与完全无 body 的 register：不写任何 agent_* 列，`agent_reported_hosting_at`
   保持 `NULL`（否则「收到过上报」的语义失真，且是纯写放大）。
-- 只报版本、不带 `agent_hosting`：该列不被写（值保留），而 `agent_reported_hosting_at`
-  仍前进 —— 两个断言合起来才能区分「没碰这列」与「回写了旧值」。
+- 只报版本、不带 `agent_hosting`：该列不被写（值保留），且 `agent_reported_hosting_at`
+  **不**前进（它只在 hosting 被上报时推进）。
+  注意这条只证明「可观察结果」，**不**区分稀疏写入与 read-merge-write —— 后者由
+  `modules/bot_api` 的源码守卫钉住，理由见下方「测试的区分力」。
 - 超长 `agent_hosting`（>64 字节 = >列宽）在折叠大小写之前就被否决；
   恰好 64 字节的合法 slug 放行（边界是 `<=`）。
 - register 的 body 超 4 KiB → 按「未上报」处理，register 仍 200。

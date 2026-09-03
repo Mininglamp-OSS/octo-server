@@ -32,7 +32,11 @@ ALTER TABLE `robot`
   ADD COLUMN `agent_hosting` VARCHAR(64) NOT NULL DEFAULT ''
     COMMENT 'Agent自报托管形态,小写slug如self_hosted/octo_hosted/<vendor>_hosted;空+时间戳NULL=从未上报,空+时间戳非NULL=已显式清空;不可用于鉴权',
   ADD COLUMN `agent_reported_hosting_at` TIMESTAMP NULL DEFAULT NULL
-    COMMENT '最近一次收到agent_hosting上报的时间(SQL NOW()写入)；仅hosting上报时前进；判定agent_hosting新鲜度';
+    COMMENT '最近一次收到agent_hosting上报的时间(SQL NOW()写入)；仅hosting上报时前进；判定agent_hosting新鲜度',
+  -- 显式 INSTANT：不 pin 的话，若目标 MySQL 无法满足会**静默退化为 COPY 锁表**
+  -- （同 modules/opanalytics/sql/20260830000001 的理由）。robot 表小、影响面有限，
+  -- 但显式声明能让不满足条件的环境早失败，而不是悄悄锁表。
+  ALGORITHM=INSTANT;
 
 -- +migrate Down
 ALTER TABLE `robot`

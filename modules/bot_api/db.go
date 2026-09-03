@@ -96,6 +96,29 @@ func (r agentReport) isEmpty() bool {
 	return r.Platform == nil && r.Version == nil && r.Plugin == nil && r.Hosting == nil
 }
 
+// changed reports whether a legacy column should enter the statement: the caller
+// supplied a non-empty value AND it differs from what is already stored.
+//
+// The "differs from stored" half restores a skip the merge base had and the first
+// revision of the sparse-write fix dropped. Dropping it was justified by
+// agent_reported_hosting_at needing to advance on every report — but that column
+// now advances only on HOSTING reports, so for a version-only reconnect with
+// unchanged values the statement has no observable effect at all: same values, no
+// timestamp, and robot.updated_at has no ON UPDATE clause. It was a row lock and a
+// no-op write per reconnect (PR #837 round 4 P2-2).
+//
+// Comparing against a stored snapshot is NOT the read-merge-write this file warns
+// about: a mismatch writes the CALLER's value, never the stored one, so a
+// concurrent writer's value can only be overwritten by a newer report that
+// explicitly carries a different value — never silently restored to what this
+// request happened to read.
+func changed(reported *string, stored *string) bool {
+	if reported == nil || *reported == "" {
+		return false
+	}
+	return stored == nil || *reported != *stored
+}
+
 // updateRobotAgentInfo persists a self-reported agent runtime update.
 //
 // **A column is written only when the caller supplied a value for it.** An
@@ -123,11 +146,15 @@ func (r agentReport) isEmpty() bool {
 //     both reviewers). Sparse writes and "empty means unchanged" are compatible:
 //     the lost update came from substituting the value just read, not from
 //     skipping the column.
-//   - agent_hosting: any supplied value, including "". Reporting "" is the only
-//     way a runtime can clear a stale hosting shape, and a stale shape is more
-//     harmful than an absent one. Note this makes an explicit "" a genuine
-//     contract change relative to the legacy columns — stated rather than
-//     papered over.
+//   - agent_hosting: any supplied non-empty value. "" is "unchanged" here too;
+//     retraction arrives as the reserved slug AgentHostingNone and is normalized
+//     to "" before reaching this function, so a retraction IS a write of "" —
+//     which is why hosting has no skip-if-unchanged (writing the same "" twice is
+//     a legitimate re-retraction, and the timestamp must advance for it).
+//
+// `stored` carries the values already on the row, used only to skip a legacy
+// column whose reported value is identical. It must never be substituted INTO the
+// statement — that is the read-merge-write this comment opens by rejecting.
 //
 // agent_reported_hosting_at is stamped **only when hosting was supplied**, and
 // with SQL NOW() rather than Go's time.Now():
@@ -146,7 +173,7 @@ func (r agentReport) isEmpty() bool {
 //     today, so that was latent rather than live — reading the wall clock from
 //     the same place as the column it is compared against removes the dependency
 //     on the DB's session time zone altogether.
-func (d *botAPIDB) updateRobotAgentInfo(robotID string, report agentReport) error {
+func (d *botAPIDB) updateRobotAgentInfo(robotID string, report agentReport, stored agentReport) error {
 	if report.isEmpty() {
 		return nil
 	}
@@ -156,13 +183,13 @@ func (d *botAPIDB) updateRobotAgentInfo(robotID string, report agentReport) erro
 	// meaning, and treating it as a clear would destroy a stored value on every
 	// reconnect for any client whose serializer emits "" for a field it does not
 	// know about.
-	if report.Platform != nil && *report.Platform != "" {
+	if changed(report.Platform, stored.Platform) {
 		set["agent_platform"] = *report.Platform
 	}
-	if report.Version != nil && *report.Version != "" {
+	if changed(report.Version, stored.Version) {
 		set["agent_version"] = *report.Version
 	}
-	if report.Plugin != nil && *report.Plugin != "" {
+	if changed(report.Plugin, stored.Plugin) {
 		set["plugin_version"] = *report.Plugin
 	}
 	if report.Hosting != nil {

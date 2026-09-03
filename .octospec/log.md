@@ -4,6 +4,46 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-04 (bot-agent-hosting · review round 4)
+
+- **Learned** — **注释声称有区分力、实际没有的测试，比没有测试更糟：它会被相信。**
+  reviewer 用变异法证明我两条关键测试杀不掉对应变异：时区测试把**旁观连接**调偏
+  （register 走池里另一条，两个 TIMESTAMP 落同一 UTC 瞬间、偏差恒 0）；三条稀疏写入
+  测试的带外 UPDATE 落在下一次 register **之前**（合并实现读到新值再写回，结果相同）。
+  而我上一轮把"验了两处"表述成了"三处全部验证通过"。
+- **Adopted** — 定为规则：**每个行为断言都要过变异检查，且测试注释写明它杀掉哪个变异。**
+  本轮 6 个断言逐一实跑变异版验证（SQL 时钟 / 合并守卫 / legacy 空值跳过 /
+  日志字段 / App Bot Warn / 全有或全无解码）。
+- **Changed** — 稀疏写入的不变量改由**源码守卫**承担：真正的交错窗口在
+  queryRobotByBotToken 与 UPDATE 之间，行为测试无法确定性插入。守卫区分**赋值目标** ——
+  robot 行的值作为独立 stored 快照传参用于 skip 比较合法（不匹配时写调用方的值），
+  赋回 req.Agent* 则禁止。
+- **Learned** — **一条需要污染进程级状态才能运行的测试，在整包里就是不可靠的。**
+  时区端到端测试要区分两种时钟，必须把连接池压到单连接（SetMaxOpenConns 是进程级），
+  于是其它测试排队/超时、失败集每次不同。**删掉而非修好**：它守的不变量有确定性替代
+  （断言语句里是字面 NOW()），杀同一变异且不碰共享状态。删除理由留在原代码位置。
+- **Fixed** — brief 四处与实现矛盾，其中两处描述的是**前两轮被改掉**的行为
+  （含两位 reviewer 都阻塞过的"形状非法落空串"）。上一轮只修了被点名那处、没修类别。
+  Load-bearing 段里的过时规则比没有规则更糟：后来人当权威读，会把代码"修"回 bug。
+- **Decided** — `agent_hosting` 的撤回改用保留 slug `none`，`""` 回归 no-op（四字段统一）。
+  让 `""` 清空会给新列复制出老列被判为数据丢失的同一形状：从不填该字段但总是发 key 的
+  客户端每次重连落进 `('', 非NULL)` —— 那个状态被三处文档定义为「曾上报后刻意撤回」。
+  `none` 在存储层归一成空串，读取方无需知道这个 sentinel。
+- **Fixed** — 去掉 skip-if-unchanged 的**理由已消失**（时间戳现在只在 hosting 上报时前进，
+  于是版本-only 重连的那条 UPDATE 无任何可观察效果）。legacy 三列恢复跳过，比较用的
+  stored 快照**永不被写进语句**；hosting 保持无条件写（撤回/再确认都是真实上报）。
+- **Fixed** — recordingLog 原先只记 msg **丢掉 fields**，而泄露风险全在 fields 里；
+  迁移测试原先断言"不得出现 INFORMATION_SCHEMA"，把无守卫写法变成了强制（且大小写敏感
+  只是碰巧正确）—— 单条原子 ALTER 解决的是列级半应用，**不解决**可重入性，这一点上一轮
+  说错了。迁移补 pin `ALGORITHM=INSTANT`（不 pin 会静默退化为 COPY 锁表）。
+- **Learned（环境）** — **botfather 整包"失败集每次不同、耗时恰好 5s/30s"时，先重启
+  WuKongIM 再怀疑代码。** 连续 8 天运行的容器状态劣化，UpdateIMToken 5s 超时
+  → `err.server.bot_api.im_token_failed`，看起来极像测试污染。判据：串行跑
+  （`-p 1 -parallel 1`）—— 真正的顺序依赖会变**稳定**，容量问题仍然随机。
+  重启后整包 15.7s 全绿。排查中确实找出两个真污染并保留修复：register 的 per-IP 桶
+  必须在 helper 里每次清（不是 setup 清一次，一条测试就能自己打满）、`SET time_zone`
+  打在连接池上无作用域。
+
 ## 2026-09-03 (bot-agent-hosting · review round 2)
 
 - **Fixed** — round 1 的修复引入的数据丢失回归（两位 reviewer 再次独立端到端复现）：

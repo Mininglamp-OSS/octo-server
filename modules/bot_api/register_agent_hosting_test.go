@@ -43,8 +43,17 @@ func TestNormalizeAgentHosting(t *testing.T) {
 		{"大小写折叠", "Self_Hosted", AgentHostingSelfHosted, true},
 		{"全大写折叠", "VENDOR_HOSTED", "vendor_hosted", true},
 		{"首尾空格被 trim", "  self_hosted\t", AgentHostingSelfHosted, true},
-		{"空串是合法的清空", "", "", true},
-		{"纯空格等于清空", "   ", "", true},
+		// 撤回用保留 slug，归一成空串存储（调用方无需知道这个 sentinel）。
+		{"none 是撤回，归一为空串", AgentHostingNone, "", true},
+		{"NONE 折叠后同样是撤回", "NONE", "", true},
+		// "" 不再是"清空"：它是"未上报"，由 applyAgentReport 提前丢弃，
+		// 这里返回 false 是防御性的一致口径（round 4 P2-4）。
+		{"空串不是上报", "", "", false},
+		{"纯 ASCII 空格同上", "   ", "", false},
+		// nit（round 4）：TrimSpace 用 unicode.IsSpace，所以非 ASCII 空白会被剥掉后
+		// 再按剩余部分判定 —— 这是"拒绝非 ASCII"那条不变量的一个真实例外，
+		// 效果无害（存下的仍是干净 slug），但要有测试写明它确实这么行为。
+		{"非 ASCII 空白被 TrimSpace 剥离后接受", "\u00a0self_hosted\u3000", AgentHostingSelfHosted, true},
 		// 开放取值的**已知代价**：当初否掉 local/cloud 的理由（私有化部署下 cloud
 		// 说错话）仍成立，但从此只是客户端命名约定，服务端不再强制。刻意不做黑名单：
 		// 既然放弃了值域枚举，再留个半吊子黑名单两头不靠。

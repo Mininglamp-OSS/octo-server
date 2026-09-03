@@ -42,6 +42,30 @@ import (
 const (
 	AgentHostingSelfHosted = "self_hosted"
 	AgentHostingOctoHosted = "octo_hosted"
+
+	// AgentHostingNone is how a runtime RETRACTS a previously reported shape.
+	//
+	// An explicit "" would have been the obvious choice and is the wrong one. In
+	// this request body "" already means "unchanged" for agent_platform /
+	// agent_version / plugin_version — precisely because treating it as a clear
+	// destroyed stored values on every reconnect for clients whose serializer
+	// emits "" for fields they do not populate (PR #837 round 2, blocking). Giving
+	// "" the opposite meaning for the fourth field in the same JSON object would:
+	//
+	//   - reproduce that same data loss for this column, just without pre-existing
+	//     data to lose. A client that never populates the key but always emits it
+	//     would land in ('', non-NULL) on every reconnect — the state the
+	//     migration COMMENT and the response field both define as "reported, then
+	//     deliberately cleared". The two-meanings-of-empty distinction, which is
+	//     the entire reason the timestamp column exists, would read a serializer
+	//     default as a deliberate retraction.
+	//   - leave one wire shape meaning "keep" for three fields and "wipe" for the
+	//     fourth, which is a footgun for client authors rather than a contract.
+	//
+	// A reserved slug costs the client one extra literal and makes retraction
+	// explicit and greppable. It fits the open slug space (it satisfies
+	// agentHostingPattern) and needs no separate field.
+	AgentHostingNone = "none"
 )
 
 // maxAgentHostingLen MUST equal the robot.agent_hosting column width (64).
@@ -54,10 +78,14 @@ const (
 // task brief). Headroom above the column width is not headroom, it is a delayed
 // failure. TestAgentHostingBoundMatchesColumnWidth pins the equality.
 //
-// The bound counts BYTES while VARCHAR(64) counts CHARACTERS. That is exact, not
-// merely conservative, only because normalizeAgentHosting rejects non-ASCII
-// before this comparison can matter — the ASCII property is load-bearing for the
-// column-width invariant, not just for tidiness.
+// The bound counts BYTES while VARCHAR(64) counts CHARACTERS. The length gate
+// actually runs BEFORE the ASCII check (see normalizeAgentHosting — cheap
+// rejection first), so on a non-ASCII input this comparison is merely
+// conservative: it can only reject early, never admit something the column could
+// not hold. It becomes exact for everything that survives, because non-ASCII is
+// rejected unconditionally a line later. So the ASCII property is still
+// load-bearing for the invariant — the ordering just means the bound is a floor
+// before it, not that it is checked afterwards.
 const maxAgentHostingLen = 64
 
 // agentHostingPattern is the accepted shape: a lowercase ASCII slug.
@@ -113,12 +141,27 @@ func isASCII(s string) bool {
 // "confusables are rejected" true rather than aspirational.
 //
 // Case is folded rather than rejected: `Self_Hosted` and `self_hosted` carry the
-// same intent, and folding avoids a silently-dropped report. Reporting an empty
-// value is legal and means "clear it".
+// same intent, and folding avoids a silently-dropped report.
+//
+// One honest exception to "non-ASCII is rejected": strings.TrimSpace uses
+// unicode.IsSpace, so non-ASCII whitespace (U+00A0, U+3000) is stripped before
+// isASCII ever sees it — `"\u00a0self_hosted"` is accepted, not rejected. Harmless
+// in effect (what lands in the column is still a clean ASCII slug) and it makes a
+// copy-pasted value work rather than fail cryptically, but it is an exception
+// rather than a consequence of the rule, so it is written down here and pinned by a
+// row in TestNormalizeAgentHosting.
+//
+// The empty string is NOT accepted as a report: it means "unchanged", and the
+// caller is dropped before this function by applyAgentReport. Retraction comes in
+// as AgentHostingNone and is normalized to "" here, which is what the column
+// stores for "no shape" — so the stored representation stays a single empty value
+// and readers need no knowledge of the sentinel.
 func normalizeAgentHosting(v string) (normalized string, ok bool) {
 	trimmed := strings.TrimSpace(v)
 	if trimmed == "" {
-		return "", true
+		// Defensive: applyAgentReport does not call us with "". Treat it as
+		// not-a-report rather than as a clear, matching the field contract.
+		return "", false
 	}
 	if len(trimmed) > maxAgentHostingLen {
 		return "", false
@@ -129,6 +172,10 @@ func normalizeAgentHosting(v string) (normalized string, ok bool) {
 	folded := strings.ToLower(trimmed)
 	if !agentHostingPattern.MatchString(folded) {
 		return "", false
+	}
+	if folded == AgentHostingNone {
+		// Retraction: store the empty value.
+		return "", true
 	}
 	return folded, true
 }
@@ -147,23 +194,22 @@ func normalizeAgentHosting(v string) (normalized string, ok bool) {
 //     lost-update fix (an absent field stays absent from the SQL rather than
 //     being written back from a stale read) without changing what any existing
 //     client observes.
-//   - agent_hosting accepts "" as a deliberate clear, because that is the only
-//     way a runtime can retract a stale hosting shape. This IS a contract
-//     difference from the three above, deliberately, and it is new so nothing
-//     depended on the old behaviour.
+//   - agent_hosting behaves the same way: "" means unchanged. Retracting a stale
+//     shape is done by reporting the reserved slug AgentHostingNone ("none"), not
+//     by reporting "" — see that constant for why.
 //
-// An earlier revision applied hosting's rule to all four and claimed in this very
-// comment that the wire contract was unchanged. It was not: an explicit "" went
-// from preserving a version column to wiping it on every reconnect. Both
-// reviewers reproduced it end to end (PR #837 round 2).
+// So "" is a no-op for all four fields, and no field in this body has a
+// destructive empty value. An earlier revision gave "" clear-semantics, first for
+// all four (which wiped stored version columns on every reconnect — both
+// reviewers reproduced it end to end, PR #837 round 2) and then for agent_hosting
+// alone (which reproduced the same shape for the new column and made one wire
+// value mean two opposite things in one object, round 4).
 type BotRegisterReq struct {
 	AgentPlatform *string `json:"agent_platform"`
 	AgentVersion  *string `json:"agent_version"`
 	PluginVersion *string `json:"plugin_version"`
-	// AgentHosting differs from the three above in one way: for them an empty
-	// report is meaningless, while here it is the way a runtime clears a stale
-	// shape. On a self-hosted → platform-hosted switch a stale value is more
-	// harmful than an empty one, so clearing must be expressible.
+	// AgentHosting: report a slug to set it, AgentHostingNone to retract it. ""
+	// means unchanged, same as the three above.
 	AgentHosting *string `json:"agent_hosting"`
 }
 
@@ -223,6 +269,20 @@ type BotRegisterResp struct {
 	OwnerChannelID string `json:"owner_channel_id"`
 }
 
+// reportsAnything reports whether the body carries at least one non-empty value.
+//
+// "Present" is not the same as "reports something": "" means unchanged for every
+// field in this body, so a client that always emits all four keys with empty
+// values has reported nothing at all.
+func reportsAnything(req *BotRegisterReq) bool {
+	for _, f := range []*string{req.AgentPlatform, req.AgentVersion, req.PluginVersion, req.AgentHosting} {
+		if f != nil && strings.TrimSpace(*f) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // register handles POST /v1/bot/register for both User Bot and App Bot.
 func (ba *BotAPI) register(c *wkhttp.Context) {
 	token := extractBotToken(c)
@@ -268,9 +328,19 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 		ba.db.updateRobotIMTokenCache(robot.RobotID, imToken)
 	}
 
-	// Optional: parse agent runtime info (telemetry only; never fails register)
+	// Optional: parse agent runtime info (telemetry only; never fails register).
+	//
+	// `stored` is passed ONLY so an identical legacy value can be skipped instead
+	// of issuing a no-op write (see changed()). It is deliberately built here, at
+	// the call site, rather than read inside applyAgentReport: those values must
+	// never end up substituted for an absent field, and keeping the read out of
+	// that function is what the source guards in agent_report_sql_test.go pin.
 	req := readAgentReport(c)
-	ba.applyAgentReport(robot.RobotID, &req)
+	ba.applyAgentReport(robot.RobotID, &req, agentReport{
+		Platform: &robot.AgentPlatform,
+		Version:  &robot.AgentVersion,
+		Plugin:   &robot.PluginVersion,
+	})
 
 	cfg := ba.ctx.GetConfig()
 	apiURL := botutil.DeriveAPIURL(cfg)
@@ -302,14 +372,17 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 // agent columns: an absent field must stay absent all the way into the SQL, so
 // substituting the previously-read value would reintroduce exactly the lost
 // update updateRobotAgentInfo's doc comment describes.
-func (ba *BotAPI) applyAgentReport(robotID string, req *BotRegisterReq) {
+func (ba *BotAPI) applyAgentReport(robotID string, req *BotRegisterReq, stored agentReport) {
 	report := agentReport{
 		Platform: req.AgentPlatform,
 		Version:  req.AgentVersion,
 		Plugin:   req.PluginVersion,
 	}
 
-	if req.AgentHosting != nil {
+	// An empty agent_hosting is "unchanged", exactly like its three siblings — so it
+	// is dropped here rather than reaching normalizeAgentHosting. Retraction is
+	// reported as AgentHostingNone.
+	if req.AgentHosting != nil && strings.TrimSpace(*req.AgentHosting) != "" {
 		normalized, valid := normalizeAgentHosting(*req.AgentHosting)
 		if valid {
 			report.Hosting = &normalized
@@ -319,8 +392,8 @@ func (ba *BotAPI) applyAgentReport(robotID string, req *BotRegisterReq) {
 			// release that spells the value `self-hosted` (hyphenated, the exact
 			// spelling of the GitHub Actions convention this naming follows) blank
 			// the column fleet-wide, with nothing but a log line to show for it.
-			// Clearing stays available, but only by reporting "" deliberately —
-			// which is a well-formed report, not a rejected one.
+			// Retraction stays available, but only by reporting AgentHostingNone —
+			// a well-formed report, not a rejected one.
 			//
 			// Never block register either: it is the only channel a bot has to
 			// recover after losing its connection, and issue #696's second incident
@@ -337,7 +410,7 @@ func (ba *BotAPI) applyAgentReport(robotID string, req *BotRegisterReq) {
 	if report.isEmpty() {
 		return
 	}
-	if err := ba.db.updateRobotAgentInfo(robotID, report); err != nil {
+	if err := ba.db.updateRobotAgentInfo(robotID, report, stored); err != nil {
 		ba.Warn("更新Agent信息失败", zap.Error(err), zap.String("robotID", robotID))
 	}
 }
@@ -372,7 +445,11 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 	// place to add it is columns on app_bot — never a write into the robot table,
 	// whose rows belong to User Bots.
 	req := readAgentReport(c)
-	if req.AgentHosting != nil || req.AgentPlatform != nil || req.AgentVersion != nil || req.PluginVersion != nil {
+	// Only warn for a field that actually carries a value. A client that always
+	// emits the keys with "" is reporting nothing (that is what "" means for all
+	// four fields), so warning on it would fire on every reconnect and say
+	// something untrue.
+	if reportsAnything(&req) {
 		ba.Warn("App Bot 上报了 Agent 运行时信息，已忽略（App Bot 不支持 agent_* 字段）",
 			zap.String("uid", appBot.UID))
 	}
