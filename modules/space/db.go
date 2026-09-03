@@ -55,6 +55,151 @@ func (d *DB) querySpaceByID(spaceId string) (*SpaceModel, error) {
 	return &m, err
 }
 
+// atomicJoinInitialSpace 在**同一个事务内**完成 OIDC 自动加入初始 Space 的全部
+// 判定与写入：成员是否已存在、Space 是否仍然活跃、容量是否够，然后插入成员行。
+//
+// # 为什么必须在一个事务里
+//
+// 分成"先查 Space 活性、再另起事务插入"会留一个窗口：解散/封禁在两步之间提交，
+// 插入照样往 status!=1 的 Space 里写一行 status=1，并触发预设群与 SpaceMemberJoin
+// 副作用。db_manager.go:forceDisbandSpace 的注释已经把这个窗口记为已知 follow-up
+// （"彻底关闭要让加入侧的事务在锁内复核 space.status"）。本函数就是在自动加入这
+// 一条路径上按那个方案关掉它；executeJoinSpace 等其它加入路径仍然敞着，需要一次
+// 通盘的锁序设计，记在 follow-up。
+//
+// # 锁序：权威的活性复核必须在 INSERT 之后
+//
+// 这一点反直觉,而且第一版写反了、被死锁测试当场抓住,所以把推理留在这里。
+//
+// 直觉的写法是"先 SELECT space FOR UPDATE 复核状态,再插入成员"。它会死锁:
+// 两条解散路径(forceDisbandSpace、disbandSpace)都先用 lockActiveMemberUIDsTx 拿
+// `space_member WHERE space_id=?` 的范围锁,再 UPDATE `space`。而我方若先锁 space
+// 再插入,拿锁顺序正好相反 —— MySQL 报 Error 1213,而且滚回去的可能是管理员那条
+// 解散事务。
+//
+// 关键在于:**对不存在的行做 FOR UPDATE 拿到的是间隙锁,而间隙锁之间互相兼容**。
+// 所以"先锁 space_member 再锁 space"并不能真的串行化 —— 第一步根本不阻塞,真正
+// 与解散冲突的是 INSERT 的插入意向锁(它与间隙锁互斥)。也就是说,无论前面怎么写,
+// 与解散的会合点只有一个,就是 INSERT。
+//
+// 于是正确的做法是让 INSERT 先发生、把它当成同步点,提交前再用当前读复核状态:
+//
+//   - 解散先到:它握着范围锁,我方的 INSERT 阻塞;它提交后我方才插入成功,随即
+//     复核读到 status=0,整个事务回滚 —— 没有孤儿行,也不会触发任何副作用。
+//   - 我方先到:插入成功,复核仍是 status=1,提交。解散阻塞到此刻,它随后的加锁读
+//     能看见这一行,会把它一并置 0 并写清理工单。
+//
+// 两种交错都正确,且两边拿锁顺序一致(space_member 在前、space 在后),没有环。
+//
+// 封禁(updateSpaceStatus)只 UPDATE `space` 一行、不碰 space_member,不与本函数
+// 构成环,同样被提交前的复核挡住。
+//
+// 插入前那次不加锁的 space 读只用来取 max_users,外加一条"早就解散了"的快路径;
+// 它不是判定依据,权威判定永远是提交前那次 FOR UPDATE。
+//
+// # 返回值
+//
+// 只有 InitialSpaceJoined 时返回非 nil 的 *SpaceModel —— 调用方拿它去跑
+// afterJoinSpace（预设群、默认分类、事件、缓存失效）。那些副作用必须在**提交之后**
+// 执行：它们要起 goroutine、调外部服务，绝不能持在事务里，否则回滚了副作用也已外发。
+func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSpaceJoinOutcome, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, InitialSpaceFailed, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 1) 成员是否已存在。在籍 → 幂等;已被移除 → 不复活(见 AutoJoinInitialSpace
+	//    注释第 2 点)。唯一索引在下面的 INSERT 处兜底,这里只是为了区分这两种情形
+	//    ——重复键错误告诉不了我们那行的 status 是 1 还是 0。
+	//
+	// **刻意不加 FOR UPDATE。** 这一行通常不存在,对不存在的行做加锁读拿到的是
+	// 间隙锁;而间隙锁互相兼容,于是每个并发加入者都能拿到,随后各自的 INSERT 需要
+	// 与他人间隙锁互斥的插入意向锁 —— 环成立,MySQL 挑一个回滚(Error 1213)。
+	// 空间越空越严重(测下来近乎空的空间 20 个并发只活 1 个),而那正是 SSO 上线首日
+	// 的形状;失败又是 InitialSpaceFailed、无重试、建号一次性触发,受害者永久留在
+	// 所有空间之外 —— 恰是本功能要消灭的死角。评审实测复现,已由
+	// TestAutoJoinInitialSpace_ConcurrentJoinersAllSucceed 钉住。
+	//
+	// 普通读足够:它照样看得见 status=0 的行,而真正的插入竞争由下面的 1062 分支兜底。
+	var existing MemberModel
+	if _, err := tx.SelectBySql(
+		"SELECT * FROM space_member WHERE space_id=? AND uid=?", spaceId, uid,
+	).Load(&existing); err != nil {
+		return nil, InitialSpaceFailed, fmt.Errorf("read initial space member: %w", err)
+	}
+	if existing.UID != "" {
+		return nil, InitialSpaceAlreadyMember, nil
+	}
+
+	// 2) 取 max_users,顺带走一条"早就解散了"的快路径 —— 常见情形下连 space_member
+	//    都不用碰。**这不是权威判定**,权威判定是第 4 步。
+	var sp SpaceModel
+	if _, err := tx.SelectBySql("SELECT * FROM space WHERE space_id=?", spaceId).Load(&sp); err != nil {
+		return nil, InitialSpaceFailed, fmt.Errorf("read initial space: %w", err)
+	}
+	// 空 SpaceId = 该行不存在。与 status!=1 一并归为 space_inactive:对运维来说
+	// "配的 id 用不了"是同一件事,查询失败才是另一件事(上面已带 error 返回)。
+	if sp.SpaceId == "" || sp.Status != SpaceStatusNormal {
+		return nil, InitialSpaceInactive, nil
+	}
+
+	// 3) 容量。与 atomicAddMemberIfNotFull 同语义:max_users=0 表示不限,此时这条
+	//    COUNT 给不出任何判断,跳过它连带省掉一把覆盖全空间成员的锁。
+	//
+	// **这里的 FOR UPDATE 是必须的,而且是并发加入者之间唯一的串行化点。** 普通读
+	// 会让每个加入者都读到插入前的同一个总数、都得出"还有位子"的结论,于是两个空位
+	// 能进十个人 —— max_users 在它唯一该起作用的负载下恰好失效。兄弟函数
+	// atomicAddMemberIfNotFull 一直是加锁读,本包已有用例证明那把锁是承重的。
+	//
+	// 与上面第 1 步的间隙锁不同,这是一把已存在行上的 X 范围锁:并发加入者在此
+	// **排队**而不是成环,所以既挡住超员,又不会退化成死锁。它同时也是当前读,
+	// 看得见其他事务刚提交的插入。
+	if sp.MaxUsers > 0 {
+		var count int
+		if _, err := tx.SelectBySql(
+			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1 FOR UPDATE", spaceId,
+		).Load(&count); err != nil {
+			return nil, InitialSpaceFailed, fmt.Errorf("count initial space members: %w", err)
+		}
+		if count >= sp.MaxUsers {
+			return nil, InitialSpaceFull, nil
+		}
+	}
+
+	// 4) 插入 —— 这一步的插入意向锁与解散持有的间隙锁互斥,是与解散真正的会合点。
+	if _, err := tx.InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceId, uid,
+	).Exec(); err != nil {
+		if isDuplicateMemberError(err) {
+			// 第 1 步之后、这一步之前被别的路径抢先插入。结果与"本来就在"一致。
+			return nil, InitialSpaceAlreadyMember, nil
+		}
+		return nil, InitialSpaceFailed, fmt.Errorf("insert initial space member: %w", err)
+	}
+
+	// 5) 权威复核:必须是当前读(FOR UPDATE),普通 SELECT 在 REPEATABLE READ 下读
+	//    快照,看不见刚刚提交的解散。走到这里说明插入意向锁已经拿到,即解散要么还没
+	//    开始,要么已经提交完 —— 后者这里就会读出 status!=1,defer 的 rollback 把
+	//    刚插入的那行一并撤掉,不留孤儿、不触发任何副作用。
+	var fresh SpaceModel
+	if _, err := tx.SelectBySql(
+		"SELECT * FROM space WHERE space_id=? FOR UPDATE", spaceId,
+	).Load(&fresh); err != nil {
+		return nil, InitialSpaceFailed, fmt.Errorf("recheck initial space: %w", err)
+	}
+	if fresh.SpaceId == "" || fresh.Status != SpaceStatusNormal {
+		return nil, InitialSpaceInactive, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, InitialSpaceFailed, fmt.Errorf("commit initial space join: %w", err)
+	}
+	// 返回复核后的那份:调用方拿它跑 afterJoinSpace(预设群等),用提交时刻的真值。
+	return &fresh, InitialSpaceJoined, nil
+}
+
 // updateSpace 用户侧部分更新空间基础信息已迁移到 managerDB.updateSpaceProfile：
 // 该 helper 提供事务 + SELECT ... FOR UPDATE + sentinel error 的 TOCTOU 安全语义，
 // 用户侧 handler 通过 Space.mdb 直接调用，无需在 DB 层另起一份。
@@ -638,20 +783,28 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Lock the space row and get current member count atomically
-	var count int
-	_, err = tx.SelectBySql(`
-		SELECT COUNT(*) FROM space_member
-		WHERE space_id = ? AND status = 1
-		FOR UPDATE
-	`, spaceId).Load(&count)
-	if err != nil {
-		return err
-	}
-
-	// Check capacity
-	if maxUsers > 0 && count >= maxUsers {
-		return ErrSpaceFull
+	// 容量检查只在真的设了上限时才做。这条 COUNT 带 FOR UPDATE,会锁住该 space
+	// 的全部在籍成员行:对不限人数(max_users=0)的空间,它拿不出任何判断,却要
+	// 付一次 O(N) 扫描加一把覆盖全空间的锁,把并发加入串行化。
+	//
+	// 平时加入是稀疏事件,这个代价看不出来。但"全公司在一个空间"的部署
+	// (OIDC 自动加入初始 Space 就是这种形状)在 SSO 切换首日会让所有人同时首次
+	// 登录,加入请求全部撞在同一个 space_id 上——而这段就在登录响应的关键路径上。
+	//
+	// max_users>0 的行为逐字不变:锁与判定原样保留,容量竞态仍然由它挡住。
+	if maxUsers > 0 {
+		var count int
+		_, err = tx.SelectBySql(`
+			SELECT COUNT(*) FROM space_member
+			WHERE space_id = ? AND status = 1
+			FOR UPDATE
+		`, spaceId).Load(&count)
+		if err != nil {
+			return err
+		}
+		if count >= maxUsers {
+			return ErrSpaceFull
+		}
 	}
 
 	// Insert new member
@@ -675,20 +828,21 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Lock the space row and get current member count atomically
-	var count int
-	_, err = tx.SelectBySql(`
-		SELECT COUNT(*) FROM space_member
-		WHERE space_id = ? AND status = 1
-		FOR UPDATE
-	`, spaceId).Load(&count)
-	if err != nil {
-		return err
-	}
-
-	// Check capacity
-	if maxUsers > 0 && count >= maxUsers {
-		return ErrSpaceFull
+	// 同 atomicAddMemberIfNotFull:不限人数时跳过 COUNT + FOR UPDATE,
+	// 它锁全空间成员行却给不出任何判断。max_users>0 的行为逐字不变。
+	if maxUsers > 0 {
+		var count int
+		_, err = tx.SelectBySql(`
+			SELECT COUNT(*) FROM space_member
+			WHERE space_id = ? AND status = 1
+			FOR UPDATE
+		`, spaceId).Load(&count)
+		if err != nil {
+			return err
+		}
+		if count >= maxUsers {
+			return ErrSpaceFull
+		}
 	}
 
 	// Reactivate member

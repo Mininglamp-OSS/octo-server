@@ -746,6 +746,24 @@ func parseSpaceDisableUserCreateEnv(v string) bool {
 	return false
 }
 
+// OIDCInitialSpaceID returns the space_id that an account created through the
+// OIDC module is automatically joined to, or "" when the feature is off.
+//
+// DB-only, no env fallback: unlike the register/login toggles this key has never
+// had a yaml or env source, and adding one would give an operator two places to
+// look when SSO users land outside every Space. The admin console
+// (POST /v1/manager/common/system_setting) is the single source of truth, and
+// its write path validates that the Space exists and is active.
+//
+// The value is trimmed here rather than at the call sites: a space_id pasted out
+// of the admin console routinely carries trailing whitespace, and an untrimmed
+// value would silently miss on every lookup while reading as configured in the
+// GET response. Empty (missing row, or a row explicitly blanked to turn the
+// feature off) means the caller must not join anything.
+func (s *SystemSettings) OIDCInitialSpaceID() string {
+	return strings.TrimSpace(s.getString("space", "oidc_initial_space_id", ""))
+}
+
 // ----- sidebar recent-tab activity filter (issue #289) -----
 
 // SidebarRecentFilterGroupDays returns the recent-tab activity window for group

@@ -483,6 +483,11 @@ func (o *OIDC) bindCreate(c *wkhttp.Context) {
 	m.result = "ok"
 	// bind 建号完成,迁移 callback 阶段按 jti 暂存的 id_token 到 uid,供 logout 用。
 	o.promoteBindIDToken(ctx, req.Token, resp.UID)
+	// 与 callback 建号路径对称:账号 + identity 都已落库,自动加入初始 Space
+	// (task oidc-auto-join-initial-space)。BindService.Create 只在真的建了号时
+	// 返回 nil error —— identity 撞唯一键会返 ErrBindAlreadyBound 走上面的错误分支,
+	// 所以这里不存在 callback 那种"竞态输家"需要排除。失败不影响本次响应。
+	o.autoJoinInitialSpace(resp.UID)
 	if resp.SD != nil && resp.SD.ClientAuthcode != "" && o.authcode != nil {
 		if e := o.authcode.SetAuthcode(ctx, resp.SD.ClientAuthcode,
 			resp.IssueResp.LoginRespJSON, thirdAuthcodeTTL); e != nil {

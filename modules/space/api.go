@@ -2225,8 +2225,23 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件
+// fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件。
+//
+// 与 joinPresetGroups 一样自带 recover:本函数总是被 `go` 出去(afterJoinSpace),
+// 所以调用方的 defer 拦不住这里的 panic —— 一次 panic 直接带走整个进程。而
+// EventCommit 会同步跑各监听方(botfather 欢迎语、notify 空间欢迎语),panic 面
+// 不止本函数自己。
+//
+// 加这层兜底的直接原因:SSO 建号自动加入初始 Space 之后,这条路径可以由一次普通
+// 登录触发,而登录量远大于原来的"用户主动加邀请码入空间"。风险本身是既有的,
+// 变的是触发频率。
 func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Error("fireSpaceMemberJoinEvent panic", zap.Any("recover", r),
+				zap.String("uid", uid), zap.String("spaceId", spaceId))
+		}
+	}()
 	if s.ctx.Event == nil {
 		return
 	}
@@ -2235,6 +2250,11 @@ func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
 		s.Error("开启SpaceMemberJoin事件事务失败", zap.Error(err))
 		return
 	}
+	// 上面的 recover 让 panic 不再带走进程,但被接住的 panic 会跳过下面的
+	// Commit/Rollback,把事务连同它持有的锁一起挂在连接上直到池回收 —— 兜住崩溃
+	// 却泄漏事务,是把一种故障换成了另一种。RollbackUnlessCommitted 对已提交的
+	// 事务是 no-op,所以正常路径不受影响。
+	defer tx.RollbackUnlessCommitted()
 	eventID, err := s.ctx.EventBegin(&wkevent.Data{
 		Event: event.SpaceMemberJoin,
 		Type:  wkevent.Message,

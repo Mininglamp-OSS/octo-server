@@ -109,7 +109,13 @@ func (o *OIDC) completeExchange(c *wkhttp.Context, vi verifiedIdentity, fl excha
 
 	// 新用户补写 identity 行。并发首登由 uk_issuer_subject +
 	// recoverFromIdentityRace 兜底(与 callback 路径同一个函数)。
+	//
+	// autoJoinUID:本次请求真正建成、且 identity 行落库成功的账号,用于随后自动
+	// 加入运维配置的初始 Space(task oidc-auto-join-initial-space)。竞态输家刻意
+	// 不填 —— 理由见下面 race 分支的注释,与 callback 路径同一套语义。
+	autoJoinUID := ""
 	if res.IsNew && sessResp.UID != "" {
+		autoJoinUID = sessResp.UID
 		if err := o.store.Insert(&IdentityModel{
 			UID:           sessResp.UID,
 			Issuer:        claims.Issuer,
@@ -140,7 +146,20 @@ func (o *OIDC) completeExchange(c *wkhttp.Context, vi verifiedIdentity, fl excha
 			// callback 路径一直是这么做的,两个 exchange 端点曾经漏了这一行。
 			sessResp = recovered
 			fl.result.WithLabelValues("race_recovered").Inc()
+			// 竞态输家的 user 行是 ghost(identity 归赢家,这个 uid 谁也登不上),
+			// 不该占初始 Space 的一个席位 —— 尤其在 max_users 卡着的部署里,一个
+			// ghost 就挤掉一个真人。赢家账号在它自己那条请求里已经走过一次自动加入。
+			autoJoinUID = ""
 		}
+	}
+
+	// 建号成功 → 自动加入运维配置的初始 Space(task oidc-auto-join-initial-space)。
+	//
+	// 两个 exchange 端点与 callback / bind create 一样是建号入口:经它们建出来的
+	// 账号如果不进 Space,一样会卡在 POST /v1/integrations/oidc/exchange 的成员校验上,
+	// 也就是这个功能要消灭的那个死角。同步执行、失败不影响本次响应,详见函数注释。
+	if autoJoinUID != "" {
+		o.autoJoinInitialSpace(autoJoinUID)
 	}
 
 	o.writeAudit(sessResp.UID, fl.eventOK, vi.state, vi.auditDetail)

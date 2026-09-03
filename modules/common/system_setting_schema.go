@@ -128,6 +128,17 @@ var systemSettingSchema = []settingDef{
 	{Category: "space", Key: "disable_user_create", Type: settingTypeBool, Description: "是否关闭普通用户创建空间入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.SpaceDisableUserCreate()) }},
 
+	// OIDC 建号自动加入的初始 Space（task oidc-auto-join-initial-space）。
+	//
+	// 值是 space_id 而不是空间名称：space 表只有 space_id 上有唯一索引，名称可以
+	// 重名、也能随时改名，用名称配会指到别的空间。空字符串 = 关闭，所以这里刻意
+	// 不另外配一个 bool 开关——少一个键就少一种「开了但没配 id」的半残状态。
+	//
+	// 写入时校验目标 Space 存在且未解散/未封禁（见 updateSystemSettings）；配置
+	// 之后 Space 才被解散的情况在消费侧兜底（登录照常成功，只记日志和计数）。
+	{Category: "space", Key: "oidc_initial_space_id", Type: settingTypeString, Description: "OIDC 建号后自动加入的初始 Space 的 space_id（必须存在且未解散）；留空=关闭该功能",
+		Effective: func(s *SystemSettings) string { return s.OIDCInitialSpaceID() }},
+
 	// Sidebar recent-tab activity filter — per-channel-type window in days for
 	// POST /v1/sidebar/sync 的 recent tab。0 = 关闭该类型的时间过滤（全量返回）。
 	// 默认复刻历史硬编码行为：群/话题 3 天窗口、DM 不过滤（issue #289）。
