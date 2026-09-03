@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: oidc-auto-join-initial-space"
-description: Admin configures one "initial Space"; every account created through OIDC (browser callback or /bind/create) becomes a member of that Space right after the account is created.
+description: Admin configures one "initial Space"; every account created through OIDC (browser callback, /bind/create, and both token-exchange endpoints) becomes a member of that Space right after the account is created.
 tags: ["oidc", "space", "isolation", "system-setting", "idempotency", "observability", "error-response", "testing"]
 timestamp: 2026-09-02T08:56:45+00:00
 # --- octospec extension fields ---
@@ -36,7 +36,8 @@ creates the same stranded accounts); it does not depend on #829.
 
 ## Background
 
-- OIDC creates accounts at exactly two sites, both through
+- OIDC created accounts at exactly two sites when this brief was written, both
+  through
   `user.externalLoginCreate` (`modules/user/external_login.go:154`):
   1. browser callback — `modules/oidc/api.go:652` (`CreateUser: res.IsNew`),
      identity row written at `api.go:~690`, with `recoverFromIdentityRace`
@@ -45,6 +46,11 @@ creates the same stranded accounts); it does not depend on #829.
   2. self-service create — `modules/oidc/bind_service.go:566`, identity row
      written right after `IssueSession`.
   `sync_worker` never creates users.
+  **Updated after the merge with #829:** that PR added `POST …/exchange` and
+  `POST …/exchange-jwt`, which create accounts through
+  `modules/oidc/exchange_complete.go` (`CreateUser: res.IsNew`). They are a
+  third creation site and are hooked identically; the acceptance items below
+  that name "two entry points" should be read as "every creation site".
 - Account creation (`modules/user/api.go:4135 createUserWithRespAndTx`) adds
   system-account friends and fires `EventUserRegister`; no listener writes
   `space_member`.

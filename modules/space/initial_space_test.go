@@ -276,3 +276,51 @@ func TestAutoJoinInitialSpace_UnknownSpaceIsNotConfusedWithQueryFailure(t *testi
 	assert.NoError(t, err, "a missing row is not an error")
 	assert.Nil(t, sp)
 }
+
+// TestFireSpaceMemberJoinEvent_ContainsListenerPanic pins the recover added to
+// fireSpaceMemberJoinEvent.
+//
+// The function is always dispatched with `go` (afterJoinSpace), so a caller's
+// defer cannot reach it: before the guard, a panic in a SpaceMemberJoin listener
+// — EventCommit runs them synchronously — took the whole process down. The risk
+// predates auto-join; what changed is that an ordinary SSO login can now reach
+// this path, and logins are far more frequent than a user redeeming an invite.
+//
+// Asserting it needs the goroutine, because that is the boundary being claimed:
+// running the function inline would let the test's own recover mask a missing
+// guard. The test panics if the guard is absent, so a regression is a crash, not
+// a red assertion.
+func TestFireSpaceMemberJoinEvent_ContainsListenerPanic(t *testing.T) {
+	_, _, err := setup(t)
+	require.NoError(t, err)
+
+	evtCtx := newEventTestContext(t)
+	f := New(evtCtx)
+
+	_, err = evtCtx.DB().Exec("CREATE TABLE IF NOT EXISTS `event` (" +
+		"id INTEGER NOT NULL PRIMARY KEY AUTO_INCREMENT, " +
+		"event VARCHAR(40) NOT NULL DEFAULT '', `type` SMALLINT NOT NULL DEFAULT 0, " +
+		"data VARCHAR(10000) NOT NULL DEFAULT '', status SMALLINT NOT NULL DEFAULT 0, " +
+		"reason VARCHAR(1000) NOT NULL DEFAULT '', version_lock INTEGER NOT NULL DEFAULT 0, " +
+		"created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+		"updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+	require.NoError(t, err)
+
+	evtCtx.AddEventListener(event.SpaceMemberJoin, func(data []byte, commit config.EventCommit) {
+		panic("listener blew up")
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.fireSpaceMemberJoinEvent("u-panic", "sp-panic")
+	}()
+
+	select {
+	case <-done:
+		// Reached only because the guard swallowed the panic; without it the
+		// process is already gone and this test never reports at all.
+	case <-time.After(5 * time.Second):
+		t.Fatal("fireSpaceMemberJoinEvent did not return")
+	}
+}

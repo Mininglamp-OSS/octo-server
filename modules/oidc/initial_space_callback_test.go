@@ -161,41 +161,71 @@ func TestAPI_Callback_ExistingAccountDoesNotJoin(t *testing.T) {
 // but "the one remaining seat is still free".
 func TestAPI_Callback_IdentityRaceGhostDoesNotTakeASeat(t *testing.T) {
 	const spaceID = "sp-cb-ghost"
-	ctx := newInitialSpaceEnv(t, spaceID, 2)
+	ctx := newInitialSpaceEnv(t, spaceID, 3) // owner + 2 seats
 
+	// Both callbacks are for the same subject — that is what makes them a race.
 	mp := NewMockProvider(t)
 	mp.PrepUser("sub-race", map[string]interface{}{
 		"email": "race@example.com", "email_verified": true,
 	})
-	users := &fakeUserLookup{loginResp: &IssueSessionResp{
-		UID: "u-ghost", IsNewUser: true, LoginRespJSON: `{"token":"t","uid":"u-ghost"}`,
+
+	// --- The winner's callback. Ordinary first login: creates u-winner, writes
+	// the identity row, joins. Driving it is what makes the assertions below
+	// discriminating: without it, an implementation that suppressed the join for
+	// *both* accounts would satisfy "the ghost has no row".
+	winnerStore := newFakeIdentityStore()
+	winnerUsers := &fakeUserLookup{loginResp: &IssueSessionResp{
+		UID: "u-winner", IsNewUser: true, LoginRespJSON: `{"token":"t","uid":"u-winner"}`,
 	}}
-	store := newFakeIdentityStore()
-	// The winner commits between our lookup and our insert: the first Get
-	// (ResolveOrLink deciding IsNew) misses, so this callback creates a user;
-	// the insert then hits 1062, and the recovery lookup finds the winner.
-	store.bindings[mp.Issuer+"|sub-race"] = &IdentityModel{
+	winner := newTestOIDC(t, mp, winnerUsers, winnerStore)
+	winner.ctx = ctx
+	winner.authcode = newFakeAuthcode()
+
+	w1 := driveCallback(t, newTestRouter(winner), mp, "sub-race", "ac-win", "code-win")
+	require.Equal(t, http.StatusFound, w1.Code, w1.Body.String())
+	require.Equal(t, 1, memberRowCount(t, ctx, spaceID, "u-winner"),
+		"the winner is an ordinary first login and must join")
+
+	// --- The loser's callback, interleaved as it really happens: the winner's
+	// identity row commits between this one's lookup and its insert. The first
+	// Get misses (so this callback creates u-ghost), the insert hits 1062, and
+	// the recovery lookup finds u-winner and re-signs the session onto it.
+	loserStore := newFakeIdentityStore()
+	loserStore.bindings[mp.Issuer+"|sub-race"] = &IdentityModel{
 		UID: "u-winner", Issuer: mp.Issuer, Subject: "sub-race",
 	}
-	store.winnerAppearsAfterFirstGet = true
-	store.failInsertWithDuplicate = true
-	o := newTestOIDC(t, mp, users, store)
-	o.ctx = ctx
-	o.authcode = newFakeAuthcode()
+	loserStore.winnerAppearsAfterFirstGet = true
+	loserStore.failInsertWithDuplicate = true
+	loserUsers := &fakeUserLookup{
+		// The create call carries an empty UID and yields the ghost; the recovery
+		// re-issue carries the winner's uid and must yield the winner's session.
+		loginResp: &IssueSessionResp{
+			UID: "u-ghost", IsNewUser: true, LoginRespJSON: `{"token":"t","uid":"u-ghost"}`,
+		},
+		loginRespByUID: map[string]*IssueSessionResp{
+			"u-winner": {UID: "u-winner", LoginRespJSON: `{"token":"t","uid":"u-winner"}`},
+		},
+	}
+	loser := newTestOIDC(t, mp, loserUsers, loserStore)
+	loser.ctx = ctx
+	loser.authcode = newFakeAuthcode()
 
-	w := driveCallback(t, newTestRouter(o), mp, "sub-race", "ac-race", "code-race")
-	require.Equal(t, http.StatusFound, w.Code, w.Body.String())
+	w2 := driveCallback(t, newTestRouter(loser), mp, "sub-race", "ac-lose", "code-lose")
+	require.Equal(t, http.StatusFound, w2.Code, w2.Body.String())
 
+	// Only the winner. Both halves are asserted against a run where the winner
+	// genuinely did join, so "nobody joined" cannot pass.
+	assert.Equal(t, 1, memberRowCount(t, ctx, spaceID, "u-winner"),
+		"the winner keeps exactly the one membership it created; the loser adds no second one")
 	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-ghost"),
-		"the race loser is a ghost account and must not occupy a seat")
-	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-winner"),
-		"the winner joined on its own callback; this one must not join on its behalf")
+		"the race loser is a ghost account nobody can log into and must not occupy a seat")
 
 	var active int
 	_, err := ctx.DB().SelectBySql(
 		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceID).Load(&active)
 	require.NoError(t, err)
-	assert.Equal(t, 1, active, "only the owner holds a seat; the second seat stays free for a real user")
+	assert.Equal(t, 2, active,
+		"owner + winner; the third seat stays free for a real user rather than going to a ghost")
 }
 
 // TestAPI_Callback_FeatureOffWritesNoMembership covers acceptance 14 on the path

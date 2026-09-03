@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: oidc-auto-join-initial-space"
-description: One admin setting (space.oidc_initial_space_id, empty = off) makes every account created through OIDC — browser callback or /bind/create — an ordinary member of that Space right after its identity row lands, unblocking POST /v1/integrations/oidc/exchange for SSO users who previously belonged to no Space at all.
+description: One admin setting (space.oidc_initial_space_id, empty = off) makes every account created through OIDC — browser callback, /bind/create, and both token-exchange endpoints — an ordinary member of that Space right after its identity row lands, unblocking POST /v1/integrations/oidc/exchange for SSO users who previously belonged to no Space at all.
 tags: ["oidc", "space", "isolation", "system-setting", "idempotency", "observability", "error-response", "testing"]
 timestamp: 2026-09-03T00:00:00Z
 # --- octospec extension fields ---
@@ -39,9 +39,16 @@ after its `user_oidc_identity` row is persisted.
   refuses to reactivate a member an admin removed, bypasses approval mode,
   honours `max_users`, and runs the identical `afterJoinSpace` side effects.
   Returns a typed outcome the caller uses directly as a metric label.
-- `modules/oidc` — hooks on both account-creating paths (callback, and
-  `/bind/create`). Never returns an error, never writes a response, contains
-  panics; the outcome lands in `oidc_initial_space_join_total`.
+- `modules/oidc` — hooks on **every** account-creating path. `CreateUser` is
+  set in exactly three places in the module, and all three are hooked:
+  `api.go` (browser callback), `bind_service.go` (`/bind/create`), and
+  `exchange_complete.go`, which serves both `POST …/exchange` and
+  `POST …/exchange-jwt`. The exchange endpoints arrived on `main` with #829,
+  after this brief was written; leaving them unhooked would have reproduced
+  the exact stranding this task removes. `bind_service.go`'s confirm path is
+  `CreateUser: false` and is correctly not hooked.
+  Never returns an error, never writes a response; the outcome lands in
+  `oidc_initial_space_join_total`.
 
 ## Load-bearing decisions
 
@@ -69,6 +76,13 @@ after its `user_oidc_identity` row is persisted.
 - **Failure is invisible to the user by design**, which makes the counter the
   only line of sight. Alerts belong on `space_full` / `space_inactive` / `error`,
   not on waiting for someone to report "I logged in but exchange fails".
+- **The panic guard stops at the `go` boundary, and the comment now says so.**
+  The hook recovers what it runs synchronously; `afterJoinSpace` dispatches two
+  goroutines that escape it. `joinPresetGroups` already had its own recover,
+  `fireSpaceMemberJoinEvent` did not — and `EventCommit` runs the registered
+  listeners synchronously inside it, so a listener panic took the process down.
+  Pre-existing, but auto-join lets an ordinary SSO login reach it, and logins
+  are far more frequent than invite redemptions. A recover was added there.
 
 ## Gotchas worth remembering
 
@@ -89,7 +103,18 @@ after its `user_oidc_identity` row is persisted.
 - **`fakeIdentityStore` could not express the real race.** Pre-seeding a binding
   makes `ResolveOrLink` match on the first lookup, so the insert never runs. The
   interleaving that matters — the winner commits *between* our lookup and our
-  insert — needed a new `winnerAfterDuplicate` knob.
+  insert — needs a call-ordering knob. This branch added one; #829 landed an
+  equivalent `winnerAppearsAfterFirstGet` first, so the merge dropped ours and
+  the ghost test drives theirs. Theirs is the better model: it keys on which
+  call this is, which is what a race *is*, rather than on "an insert was
+  attempted", which infers the timing from a result.
+- **A test asserting only absences proves less than it looks.** The first
+  version of the ghost test asserted the loser had no member row *and* the
+  winner had none either (the winner's callback was never driven), so an
+  implementation that suppressed the join for everyone would have passed.
+  Review caught it. It now drives both callbacks and asserts the winner *did*
+  join, which is what makes "only the winner" discriminating — verified by
+  disabling the hook entirely and watching it go red.
 - **Each package needs its own freshly created test database.** Sharing one
   panics with `unknown migration` inside `testutil.NewTestServer`, before any
   test body runs.
