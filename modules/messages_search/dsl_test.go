@@ -914,31 +914,32 @@ func TestBuildSearchAllHighlight_IncludesFileContent(t *testing.T) {
 	}
 }
 
-// TestBuildSearchFilesHighlight_EscapesHTMLSource pins the stored-XSS defence:
-// OpenSearch's default highlight encoder is a pass-through, so a file whose
-// uploader-controlled name (payload.file.name is fully user-controlled) or
-// Tika-extracted body (payload.file.content) contains raw HTML would round-trip
-// unescaped into name_highlight / content_snippet — a searcher whose keyword
-// overlaps any token in the payload receives active markup that renders in any
-// client that treats *_highlight as safe HTML. Encoder("html") switches
-// OpenSearch to escape the source text (`<img>` → `&lt;img&gt;`) while keeping
-// only <mark>/</mark> as live markup; regressing this pin re-opens the vector.
-func TestBuildSearchFilesHighlight_EscapesHTMLSource(t *testing.T) {
+// TestBuildSearchFilesHighlight_NoRequestEncoder pins the design decision to
+// leave the file-tab highlighter's request-level `encoder` unset (default =
+// pass-through). Escaping is applied in Go via escapeHighlightFragment inside
+// pickFileNameHighlight / pickFileContentSnippet — scoped strictly to the two
+// new file fields — so the shared _search_all/_search_global_messages
+// highlighter can stay off `encoder=html` and MessageHit.Snippet keeps its
+// long-shipped raw-text wire contract. Flipping this on would silently escape
+// text/richText/mergeForward snippets too via the shared builder.
+func TestBuildSearchFilesHighlight_NoRequestEncoder(t *testing.T) {
 	body := asJSONString(t, buildSearchFilesHighlight())
-	if !strings.Contains(body, `"encoder":"html"`) {
-		t.Errorf("buildSearchFilesHighlight() must set encoder=\"html\" to escape uploader-controlled HTML in name/content (stored-XSS defence):\n%s", body)
+	if strings.Contains(body, `"encoder"`) {
+		t.Errorf("buildSearchFilesHighlight() must NOT set a request-level encoder; escaping is applied per-field in Go via escapeHighlightFragment:\n%s", body)
 	}
 }
 
-// TestBuildSearchAllHighlight_EscapesHTMLSource pins the same encoder=html
-// invariant on the mixed _search_all / _search_global_messages highlighter.
-// This path feeds the chat-tab file-body snippet added in V6, and it also
-// feeds pre-existing text/richText/mergeForward snippets — all of which carry
-// user-authored content that must not round-trip as executable HTML.
-func TestBuildSearchAllHighlight_EscapesHTMLSource(t *testing.T) {
+// TestBuildSearchAllHighlight_NoRequestEncoder pins the same "no request-level
+// encoder" invariant on the mixed highlighter. Critical because this builder
+// feeds four call sites (_search_all, _search_global_messages ×2,
+// _search_global_groups top_hits) whose snippet fragments become the pre-
+// existing MessageHit.Snippet wire value — an encoder here would change that
+// field's encoding on four endpoints while leaving /_search
+// (buildSearchMessagesHighlight) raw.
+func TestBuildSearchAllHighlight_NoRequestEncoder(t *testing.T) {
 	body := asJSONString(t, buildSearchAllHighlight())
-	if !strings.Contains(body, `"encoder":"html"`) {
-		t.Errorf("buildSearchAllHighlight() must set encoder=\"html\" to escape user-authored HTML in every snippet field (stored-XSS defence):\n%s", body)
+	if strings.Contains(body, `"encoder"`) {
+		t.Errorf("buildSearchAllHighlight() must NOT set a request-level encoder; MessageHit.Snippet must stay raw. Escaping for the two new file fields is done in Go via escapeHighlightFragment:\n%s", body)
 	}
 }
 

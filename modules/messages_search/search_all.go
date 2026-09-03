@@ -180,19 +180,22 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 	return b, analyzeErr
 }
 
+// buildSearchAllHighlight configures the OpenSearch highlight sub-phase for
+// the mixed _search_all / _search_global_messages endpoints. This highlighter
+// is deliberately WITHOUT an Encoder("html") request-level option:
+//   - `encoder` is a highlight-request global (not per-field), so setting it
+//     would also HTML-entity-escape the pre-existing text/richText/mergeForward
+//     snippet fragments, silently changing the wire-value encoding of the
+//     long-shipped MessageHit.Snippet field across four callsites (this file,
+//     search_global_messages.go ×2, search_global_groups.go top_hits) while
+//     leaving /_search (buildSearchMessagesHighlight) raw — a cross-endpoint
+//     encoding split for the same JSON field.
+//   - Escaping is scoped to the two new file fields (name_highlight /
+//     content_snippet) in Go via escapeHighlightFragment; MessageHit.Snippet
+//     keeps its raw-text contract on every endpoint.
 func buildSearchAllHighlight() *elastic.Highlight {
 	return elastic.NewHighlight().
 		PreTags("<mark>").PostTags("</mark>").
-		// Encoder("html") escapes uploader-controlled source text before the
-		// highlighter inserts <mark>/</mark>. Required so a maliciously-named
-		// upload (e.g. `<img src=x onerror=alert(1)>.pdf`) or a body fragment
-		// containing HTML cannot land as executable markup in any consumer that
-		// treats the *_highlight / snippet fields as safe HTML. See the twin
-		// comment on buildSearchFilesHighlight for the full threat model — this
-		// highlighter feeds both the chat-tab file-body path and the pre-existing
-		// text/richText/mergeForward snippets, so encoding here keeps every
-		// consuming tab consistent.
-		Encoder("html").
 		FragmentSize(120).
 		NumOfFragments(1).
 		Fields(
@@ -210,12 +213,12 @@ func buildSearchAllHighlight() *elastic.Highlight {
 			// the mixed feed. Consumed by singleFileHit -> pickFileContentSnippet
 			// -> FileHit.ContentSnippet (search_files.go), which _search_all file
 			// hits already call. Uses the top-level FragmentSize(120)/NumOfFragments(1),
-			// so only a single 120-char window is drawn from the inverted index —
-			// Q6 A (fileContentSourceExcludes drops the full 30-100 KB body from
-			// _source) is unaffected: the whole field never rides the wire, only
-			// the fragment does. Supersedes the earlier Q4 D "name-only" decision;
+			// so only a single 120-char window is drawn from _source (server-side
+			// read; request-level source excludes are response-level only) — Q6 A
+			// is unaffected: the whole field never rides the wire, only the
+			// fragment does. Supersedes the earlier Q4 D "name-only" decision;
 			// the chat-tab UI now renders a content snippet block below the file
-			// card (sketches/002-snippet-below-card).
+			// card.
 			elastic.NewHighlighterField("payload.file.content"),
 		)
 }
