@@ -40,6 +40,10 @@ type MockProvider struct {
 
 	// userinfoForceStatus 测试可调:>=400 时 /userinfo 直接返该状态码,模拟 IdP 抖动。
 	userinfoForceStatus int
+	// userinfoCalls /userinfo 被请求的次数。用途是断言**没有**外呼 ——
+	// 客户端出示凭据那条路上没有 access_token 可用,任何 /userinfo 请求都注定失败,
+	// 而失败会被静默吞掉,所以只能靠计数看见。
+	userinfoCalls int
 }
 
 type mockGrant struct {
@@ -80,6 +84,7 @@ func NewMockProvider(t *testing.T) *MockProvider {
 
 func (m *MockProvider) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
+	m.userinfoCalls++
 	forceStatus := m.userinfoForceStatus
 	m.mu.Unlock()
 	if forceStatus >= 400 {
@@ -287,4 +292,18 @@ func (m *MockProvider) signIDToken(sub, nonce string) (string, error) {
 		return "", fmt.Errorf("mock: invalid jwt shape")
 	}
 	return tok, nil
+}
+
+// UserInfoCalls /userinfo 至今被请求的次数。
+func (m *MockProvider) UserInfoCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.userinfoCalls
+}
+
+// ResetUserInfoCalls 清零计数,便于在一次用例里分段断言。
+func (m *MockProvider) ResetUserInfoCalls() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.userinfoCalls = 0
 }

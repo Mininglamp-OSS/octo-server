@@ -729,6 +729,12 @@ other = "The binding session has expired or is invalid. Please start over."
 ["err.server.oidc.bind_verify_required"]
 other = "Please complete verification before confirming."
 
+["err.server.oidc.exchange_request_invalid"]
+other = "Invalid request."
+
+["err.server.oidc.exchange_token_rejected"]
+other = "The SSO token was rejected. Please sign in again."
+
 ["err.server.opanalytics.etl_already_running"]
 other = "Analytics ETL is already running."
 

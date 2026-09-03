@@ -171,13 +171,14 @@ func TestAPI_Callback_IdentityRaceGhostDoesNotTakeASeat(t *testing.T) {
 		UID: "u-ghost", IsNewUser: true, LoginRespJSON: `{"token":"t","uid":"u-ghost"}`,
 	}}
 	store := newFakeIdentityStore()
-	// The winner commits between our lookup and our insert: ResolveOrLink sees
-	// nothing (so this callback creates a user), the insert then hits 1062, and
-	// the recovery lookup finds the winner.
-	store.failInsertWithDuplicate = true
-	store.winnerAfterDuplicate = &IdentityModel{
+	// The winner commits between our lookup and our insert: the first Get
+	// (ResolveOrLink deciding IsNew) misses, so this callback creates a user;
+	// the insert then hits 1062, and the recovery lookup finds the winner.
+	store.bindings[mp.Issuer+"|sub-race"] = &IdentityModel{
 		UID: "u-winner", Issuer: mp.Issuer, Subject: "sub-race",
 	}
+	store.winnerAppearsAfterFirstGet = true
+	store.failInsertWithDuplicate = true
 	o := newTestOIDC(t, mp, users, store)
 	o.ctx = ctx
 	o.authcode = newFakeAuthcode()
@@ -324,4 +325,65 @@ func TestAPI_BindConfirm_ExistingAccountDoesNotJoin(t *testing.T) {
 	assert.Equal(t, before, totalInitialSpaceJoinSamples(),
 		"binding an existing account creates nobody and must not reach the join path")
 	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-alice"))
+}
+
+// TestExchange_NewAccountJoinsInitialSpace covers the two token-exchange
+// endpoints added by #829, which land on this branch through the merge.
+//
+// `/exchange` and `/exchange-jwt` both create accounts (completeExchange issues
+// with CreateUser=res.IsNew and writes the identity row), so they are the third
+// and fourth account-creating entry points, not just new authenticators. An
+// account created there and left out of the initial Space is stranded in exactly
+// the way this feature exists to prevent — and, being a merge interaction, it is
+// precisely the kind of gap no pre-merge test on either side would catch.
+//
+// Both endpoints funnel through completeExchange, so one hook covers both and
+// this test drives the /exchange half.
+func TestExchange_NewAccountJoinsInitialSpace(t *testing.T) {
+	const spaceID = "sp-exchange-join"
+	ctx := newInitialSpaceEnv(t, spaceID, 0)
+
+	users := newExchangeUserFake()
+	users.loginResp = &IssueSessionResp{
+		UID:           "u-exchange-new",
+		IsNewUser:     true,
+		LoginRespJSON: `{"token":"sess","uid":"u-exchange-new"}`,
+	}
+	o := newTestOIDCForExchange(t, defaultExchangeProvider(), users, newFakeIdentityStore())
+	o.ctx = ctx
+
+	w := postExchange(o, `{"access_token":"good"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	assert.Equal(t, 1, memberRowCount(t, ctx, spaceID, "u-exchange-new"),
+		"an account created through /exchange must join the initial Space too")
+}
+
+// TestExchange_ExistingAccountDoesNotJoin is the mirror case on the same
+// endpoint: a caller exchanging a credential for an account that already exists
+// creates nobody, so the join path must not be entered at all.
+func TestExchange_ExistingAccountDoesNotJoin(t *testing.T) {
+	const spaceID = "sp-exchange-existing"
+	ctx := newInitialSpaceEnv(t, spaceID, 0)
+
+	prov := defaultExchangeProvider()
+	users := newExchangeUserFake()
+	users.loginResp = &IssueSessionResp{
+		UID:           "u-exchange-old",
+		LoginRespJSON: `{"token":"sess","uid":"u-exchange-old"}`,
+	}
+	store := newFakeIdentityStore()
+	require.NoError(t, store.Insert(&IdentityModel{
+		UID: "u-exchange-old", Issuer: prov.issuer, Subject: "default-sub",
+	}))
+	o := newTestOIDCForExchange(t, prov, users, store)
+	o.ctx = ctx
+
+	before := totalInitialSpaceJoinSamples()
+	w := postExchange(o, `{"access_token":"good"}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	assert.Equal(t, before, totalInitialSpaceJoinSamples(),
+		"exchanging a credential for an existing account must not reach the join path")
+	assert.Equal(t, 0, memberRowCount(t, ctx, spaceID, "u-exchange-old"))
 }

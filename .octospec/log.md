@@ -1610,6 +1610,268 @@ change-log convention (§7). Newest first.
   A missing registration call passed the entire suite.
 
 
+## 2026-09-02 — oidc-oauth2-provider-abstraction
+
+- **Shipped** — `modules/oidc` is no longer hard-wired to OpenID Connect. The
+  provider is an `AuthProvider` interface with two implementations selected by
+  `OCTO_OIDC_PROVIDER_KIND` (default `oidc`, so deployed configurations are
+  untouched), so an enterprise IdP that speaks plain OAuth2 — no Discovery, no
+  `id_token`, no JWKS, a vendor envelope around `/userinfo`, an app id in a path
+  segment for single logout — can drive login, logout and profile claims.
+  Business branches read `Capabilities()`, never the kind. Two exchange endpoints
+  serve clients that complete SSO themselves and arrive holding a credential:
+  `/exchange` (upstream `access_token` → `/userinfo`) and `/exchange-jwt`
+  (locally verified HS256 JWT, no outbound call). See
+  [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Guarded the one irreversible decision** — `(issuer, subject)` is the identity
+  key and cannot be changed after go-live, and the vendor docs contradict
+  themselves about whether `subject` is an internal long id or the employee
+  number. Since employee numbers are reused between leavers and joiners, guessing
+  wrong would log a new hire into a former employee's account. A shape guard
+  refuses short numeric subjects at the trust boundary before any row is written,
+  turning an unrecoverable data problem into a recoverable failure — and removing
+  "capture a real userinfo response first" from the critical path.
+- **Fixed during self-review** — Two CRITICALs of my own making: logout read
+  `device_flag` by decoding the raw token (a UUID with no fields), so it always
+  fell through to disconnecting *every* device instead of the calling one; and
+  `/exchange-jwt` lacked the nil-provider guard, so a boot-time provider failure
+  turned into a panic. Plus credential-leak closures at three points (`*url.Error`
+  embeds a URL that carries `client_secret`, redirects were being followed with
+  those credentials attached, and accesslog scrubbing missed the panic-dump sink).
+- **Trimmed the config surface** — New environment variables went from 8 to 5.
+  Endpoint rate limits became constants (matching `modules/user`), and the
+  bearer-JWT issuer namespace is now derived from the upstream issuer rather than
+  taking a second environment marker, which inherits per-environment isolation
+  instead of asking operators to keep two markers consistent.
+- **Learning** — `learnings/pending/build-does-not-compile-tests.md`: `go build
+  ./...` skips `_test.go`, so a rename done by string substitution left the entire
+  `modules/oidc` test binary uncompilable while the build gate stayed green; ~70
+  cases silently stopped running across a session boundary.
+- **Learning** — `learnings/pending/refusing-is-cheaper-than-an-immutable-wrong-key.md`:
+  when an identifier becomes an immutable primary key, fence the ambiguity instead
+  of resolving it first — refusal is a constant you can edit, a polluted identity
+  table is not.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 2)
+
+- **Fixed six blocking defects found by review**, all re-derived from source before
+  acting. Per-device logout had never worked in production: the device flag was read
+  after `InvalidateCurrentToken` had deleted the record it comes from, and `0` was
+  used as the "unresolved" sentinel while `config.APP` *is* 0. Both exchange
+  endpoints discarded the race-recovery winner and handed the client a session for a
+  ghost account with no identity row. The bearer-JWT anchor accepted any non-empty
+  secret and had `exp` as its only freshness control. `RequireEmailVerified=false`
+  was an account-takeover primitive under a kind whose provider cannot assert
+  verification. And a provider-kind typo could take **every** login path down at
+  once. See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Removed the mirror rather than updating it** — the login-lockout path existed
+  because `modules/common` hand-copied the module's boot validation and the copy
+  never gained the five new fatal conditions. The refusal rules now live in
+  `pkg/oidcboot`, a stdlib-only leaf package both sides import, and
+  `oidcboot.RefusedScenarios` pins both sides' tests to one table. Deleting the
+  delegation makes all nine scenarios fail, so we know the drift was live.
+- **Landed the de-duplication that the brief had already claimed** — both exchange
+  endpoints now share one post-validation tail. While it was duplicated, the
+  race-recovery defect existed in both copies and the phone-masking fix reached only
+  one; that is the class the shared tail exists to prevent.
+- **Reverted my own phone-number inference.** Bare 11-digit inference was added on
+  the strength of a documented example that is not a valid mainland number, and
+  roughly seven eighths of North American numbers are byte-identical to a valid
+  mainland mobile — `13861234567` is both. It was storing strangers' numbers.
+- **Corrected four places where the brief or PR body asserted properties the code
+  did not have**, each with the reason the original wording was wrong.
+- **Learning** — `learnings/pending/a-double-must-model-the-failure-you-fear.md`:
+  a double written to satisfy the assertion certified a fix production could not
+  perform; model what the collaborator destroys, and confirm the test fails without
+  the fix.
+- **Learning** — `learnings/pending/delete-the-mirror-instead-of-syncing-it.md`:
+  a comment saying "keep in sync with" is not a mechanism; extract the rule into a
+  leaf package and pin both sides' tests to one shared table.
+
+## 2026-09-02 — oidc-oauth2-provider-abstraction (review round 5)
+
+- **Fixed a regression I introduced two commits earlier.** Extracting provider
+  construction into a shared factory silently deleted the neighbouring block that
+  wired the RP-Initiated Logout id_token cache, so the constructor had zero
+  production callers and the field stayed nil: logout never emitted an
+  `id_token_hint` and the upstream IdP session was never ended. A user who logged
+  out of DMWork remained signed in at the IdP. The suite stayed green because all
+  ten affected tests assign the store by hand — a double can be perfectly faithful
+  and still prove nothing about assembly. Restored, plus tests that build the
+  module through `New()` and assert the wiring exists.
+  See [journal](journal/shared/oidc-oauth2-provider-abstraction.md).
+- **Closed the same guard gap on the second consumer.** The byte-exact
+  `(issuer, subject)` recheck existed only on the login path; `modules/integration`
+  called the raw query, so under the table's `ci` collation a subject differing
+  only in case authenticated as another user and minted an API key against their
+  account — reproduced in a test. Fixed structurally rather than by adding a second
+  call: the raw query is now unexported and `QueryIdentityExact` is the only way in
+  from outside the package, so a future third consumer is stopped at compile time.
+- **Stopped forwarding our own rejected tokens to the third-party IdP.** The
+  credential fall-through was unconditional, so a business JWT with a valid HMAC
+  that failed only on freshness was sent upstream in a URL query string, landing in
+  the vendor's access logs together with its signature. Now only "not ours"
+  (malformed / bad alg / bad signature) falls through; "ours but rejected" is a
+  local 401.
+- **Split the freshness policy by purpose.** The ten-minute ceiling was justified
+  by one-shot redemption but was also applied to a standing per-request
+  authenticator, where the desktop client reuses one long-lived token — so the
+  integration endpoints would have worked for ten minutes after login and then
+  returned an indistinguishable 401 forever. `VerifyForRedemption` keeps the
+  ceiling; `VerifyForAuthentication` honours the token's own `exp`. My own test had
+  pinned the broken behaviour.
+- **Added the subject upper bound the brief already claimed existed**, and folded
+  the duplicated app-id pattern into `pkg/oidcboot` so boot and runtime cannot
+  disagree (they did: `_tenant` passed boot and was refused at runtime, where the
+  error is swallowed and logout degrades to local-only).
+- **Learning** — `learnings/pending/extracting-a-helper-can-silently-drop-a-sibling.md`:
+  after lifting anything out of a constructor, diff the *removed* region and check
+  every `newXxxStore` still has a non-test caller.
+
+## 2026-09-02 — round 6: the classification boundary, and writing the matrix down
+
+Two independent `CHANGES_REQUESTED` converged on the same two blockers, both of
+them the round-5 defect reached through routes that fix had not enumerated.
+
+- **A sentinel cannot carry a stage judgement.** "Is this credential ours?" was
+  keyed on error identity, but `ErrJWTMalformed` is returned on both sides of
+  `hmac.Equal` — payload JSON, non-integer `exp`, claims decoding all fail *after*
+  the signature matched. A token bearing our own valid HMAC with a mistyped payload
+  was therefore forwarded to an IdP that takes credentials in the URL query. Fixed
+  by marking only the pre-/at-signature sites and inverting the predicate to an
+  allowlist, so a check added later defaults to "ours" and is refused locally.
+  The trigger is mundane (`iat: Date.now()/1000` unfloored) and the client reuses
+  the token for its whole life, so the leak was continuous.
+- **The guard's own construction failure was the unguarded cell.**
+  `modules/integration` logged and continued with a nil verifier — under a comment
+  saying it must not — and because the classification sits behind that nil check,
+  every desktop JWT went upstream unconditionally. Now every credential is refused
+  while the construction error is set; an absent secret stays a legal shape, pinned
+  by a paired negative test.
+- **Hoisting a guard hoists its code, not its justification.** Moving the subject
+  bound to a protocol-neutral funnel was right; taking the employee-number
+  heuristic with it was not — that path's subject is our own DB primary key, never
+  reused, and three existing tests went red. Split by what each half is a property
+  of (column vs producer); the producer half is now pinned by the conformance table
+  for both providers, which is how the standard-OIDC provider got it at all.
+- Also: `Capabilities().IDToken` + `EndSessionEndpoint()` on the interface instead
+  of a `*oidcProvider` assertion (any decorator silently lost RP-logout — including
+  the decorator design considered for the bounds guard this same round);
+  `AppIDPattern` from a mutable exported `var` to a function.
+- **Wrote the matrix I had dismissed** — `tasks/oidc-oauth2-provider-abstraction/guard-matrix.md`.
+  I retracted a reviewer's request for it on the grounds that it "produces no code
+  change", having measured it against the findings already in hand. Both of this
+  round's blockers sat in columns that request had named. Filling it in corrected
+  one imprecise cell and disproved one suspected gap, and it lists the cells still
+  open rather than closed.
+- **Learnings** — `a-sentinel-cannot-carry-a-stage-judgement.md`,
+  `a-guard-carries-its-justification-not-just-its-code.md`,
+  `when-a-defect-recurs-the-matrix-is-underspecified.md`.
+
+## 2026-09-02 — round 7: the taxonomy stopped at credentials we don't issue
+
+Two blocking findings, both reproduced before fixing.
+
+- **"Ours" is bigger than "the JWTs we sign".** Round 6's provenance guard answers
+  "is this an HS256 JWT under our secret" — true, and a strict subset of the
+  question that matters. A session token or a `uk_` API key is not a JWT, so it
+  failed at the segment split, was classified foreign, and went to the vendor's
+  `/userinfo` **in a URL query**. Reproduced: both appear verbatim in the upstream
+  request URL. Not exotic either — this PR's own global `BearerTokenCompat` is what
+  makes `Authorization: Bearer <session token>` the house convention, and
+  `userAPIKeyAuth` reads the same header on sibling routes in the same group.
+  New in this branch and specific to `kind=oauth2`: `main` verified locally and
+  never called out, and `kind=oidc` still doesn't (verified by closing the mock
+  server and getting a parse error, not a connection failure).
+- **A write-side guard doesn't cover values written by the previous binary.** Bind
+  snapshots cross the deployment boundary by design (there is a test pinning that
+  legacy snapshots still decode), so a snapshot issued before the bounds existed
+  still reproduced the orphan-user / truncation-collision shapes through
+  `Confirm`/`Create`. Both now re-validate after decode, before any mutation.
+- **The matrix I wrote last round had the blind spot that caused the first one.**
+  C1–C3 were all credentials the *upstream* issues; there was no row for the ones
+  *we* issue. Added C4, plus a lifetime column for artefacts that outlive the binary
+  that wrote them, plus a correction where it overstated rate-limit coverage.
+- Also: `HTTP_TIMEOUT` was silently ignored under `kind=oauth2`; and the two boolean
+  env readers disagreed on an unparseable primary — one falling through to the
+  legacy alias, the other returning the default — with the second carrying a comment
+  claiming it matched the first. Deleted the copy into `pkg/oidcboot.EnvBool` and
+  added the drift as a shared refusal scenario. **I had deferred this weighing
+  trigger difficulty; the reviewer was right that blast radius is the measure** —
+  the conjunction leaves an SSO-only deployment with no login path at all.
+- **Learning** — `own-is-larger-than-the-subset-you-can-verify.md`.
+
+## 2026-09-02 — round 8: a denylist of remembered types, and a vendor fact applied as a protocol fact
+
+- **The guard was mounted on one of two consumers. Again.** `/exchange` got the
+  own-credential detector but not the HMAC stage, so a business JWT went out whole —
+  signature included — into the vendor's URL query. The comment saying *this endpoint
+  is the likelier misdirection* was written in the commit that left the gap. Writing
+  down the reason is not the same as acting on it.
+- **`app_` was missed, and would have been missed again.** The fix that mattered was
+  not the entry, it was `own_credential_coverage_test.go`: scan the credential-minting
+  packages for prefix constants and fail naming any the detector does not know. It
+  found `app_` on its first run. A prefix list is a denylist of types someone
+  remembered; the omission has to become a CI failure, because "read it more carefully"
+  has now failed three rounds running.
+- **I applied a vendor fact as a protocol fact.** Round 6 said "the subject cap only
+  covers one provider" and I made the whole check protocol-neutral — correct for the
+  storage bound, wrong for the short-numeric heuristic. That one comes from *one IdP's*
+  documented employee-number reuse. `kind=oidc` is the generic client existing
+  deployments point at any IdP; a self-hosted IdP with `sub=1001` would have lost login
+  for every user, no override, redeploy-only recovery — the exact cost I argued was
+  unacceptable in the `local_off` section. **The module already made this argument one
+  axis over** (bearer JWT excluded because our own keys are not reused). The axis I
+  chose — derived vs upstream-asserted — was not the axis the argument needs, which is
+  per-deployment: does *this* IdP's subject come from a reused personnel identifier.
+  Now a capability bit, default false.
+- **Enumerated one cell rather than closing it**: a non-HS256 JWT shape is
+  unattributable and gets forwarded; closing it would break JWT-shaped upstream access
+  tokens, which is what these endpoints exist for. Nothing we issued leaves, so the
+  invariant holds; what is accepted is written down, and a test skips-with-explanation
+  if anyone "fixes" it.
+- **Learning** — `a-generalisation-can-widen-a-vendor-specific-rule.md`.
+
+## 2026-09-02 — round 9: four findings, three of them mine from the round before
+
+Two reviewers converged on the same headline; all four verified against code before any fix.
+
+- **P1.1 — `/exchange` failed open exactly where `modules/integration` fails closed.** The
+  round-8 verifier stage was written `if o.bearerJWT != nil`, and `New()` logged the
+  construction error and threw it away. So a 31-byte secret gave a nil verifier meaning both
+  "not configured" (legal) and "misconfigured" (must refuse), and the stage was skipped
+  silently. **I had fixed this exact fail-open in `modules/integration` in round 6** and kept
+  the error on the struct there — this round I copied the guard and not the failure direction.
+  The premise I wrote in the comment was also wrong: "no secret ⇒ no C3 credential can exist"
+  holds for an *absent* secret, not an *invalid* one, because the client backend signs with
+  the same configured value and HMAC does not care about key length.
+- **P1.2 — a regression I introduced: a doomed `/userinfo` call on every request.** Moving
+  `oidcAuth` onto `IdentityFromClientCredential` means the `TokenSet` carries only the
+  id_token, so `needUserInfo` fires with an empty `AccessToken`. go-oidc's `StaticTokenSource`
+  validates nothing, so a GET with `Authorization: Bearer ` goes out, 401s, and is swallowed.
+  A path that was purely local before this branch now blocks on an IdP round trip per request.
+  The suite was green because the mock matches `HasPrefix(auth, "Bearer ")` and 401s into the
+  swallow branch.
+- **P1.3 — the mirror was deleted, the *normalisation* was not.** Rules were unified into
+  `pkg/oidcboot`; one reader trimmed its env values, the other did not, and the rules compare
+  against `""`. Whitespace-only `BASE_URL` therefore reached the two sides as different
+  inputs → module 404s + helper reports configured + `local_off` honoured = no login path.
+  Fixed by normalising inside `ValidateKind`. **My first attempt encoded this as a
+  `RefusedScenario`, which was wrong** — after the fix the correct verdict is *accept* on both
+  sides. What needed pinning was agreement, and `RefusedScenarios` only pins one direction, so
+  the accepting direction became a second shared table (`AcceptedScenarios`), replacing the
+  local copy each side kept.
+- **P1.4 — two unauthenticated session-minting endpoints were on by default.** `main` exposes
+  three routes; every deployment with `DM_OIDC_ENABLED=true` silently gained `/exchange` and
+  `/exchange-jwt`, with no way to decline. Under `kind=oidc` that turns an id_token — a
+  front-channel artefact that legitimately appears in browser history and Referer headers —
+  into an unlimited session mint until `exp`. Now behind `OCTO_OIDC_EXCHANGE_ENABLED`,
+  default false, and the opt-out also skips constructing the limiter's Redis pool.
+- **Declined, with reasons recorded**: folding `validateLogoutURL` into `oidcboot` (reviewer
+  agrees it is pre-existing; making `ValidateKind` stricter risks creating a *new* lockout);
+  single-use redemption (adds Redis to the auth path and a new failure mode — and with the
+  opt-in flag defaulting off, existing installs are no longer exposed).
+
 ## 2026-09-03 — oidc-auto-join-initial-space
 
 - **Shipped** — One admin setting (`space.oidc_initial_space_id`, empty = off)

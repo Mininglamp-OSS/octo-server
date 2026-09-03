@@ -771,6 +771,12 @@ other = "绑定会话已过期或无效，请重新发起。"
 ["err.server.oidc.bind_claims_incomplete"]
 other = "身份提供方未返回创建账号所需的账号信息。"
 
+["err.server.oidc.exchange_request_invalid"]
+other = "请求无效。"
+
+["err.server.oidc.exchange_token_rejected"]
+other = "SSO 令牌已失效，请重新登录。"
+
 # ---- err.server.incomingwebhook.* (modules/incomingwebhook push path, PR #31 D23) ----
 
 ["err.server.incomingwebhook.push_unauthorized"]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -120,8 +121,11 @@ func newService(cfg ProviderConfig, store identityStore, users userLookup) *Serv
 //
 // 返回 IsNew=true 时 UID 为空,由 IssueSession 通过 user.IService 创建并回填。
 func (s *Service) ResolveOrLink(ctx context.Context, claims *IDTokenClaims) (*ResolveResult, error) {
-	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
-		return nil, fmt.Errorf("oidc: ResolveOrLink: claims iss/sub required")
+	// 可落库性守卫:非空 + 不超列宽 + subject 形态。见 identity_bounds.go ——
+	// 这里是 callback 与两个 exchange 端点的共同入口,且在 IssueSession 之前,
+	// 所以是"副作用之前"能覆盖到全部协议的那个点。
+	if err := requireStorableIdentity(claims); err != nil {
+		return nil, fmt.Errorf("oidc: ResolveOrLink: %w", err)
 	}
 
 	// 1. 已绑定
@@ -224,20 +228,83 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// extractZone 从 E.164(+8613...) 提取国家码;格式不符合返回空(交给上层不绑定)。
+// mainlandMobileRe 中国大陆手机号号码体(不含国家码):1 + [3-9] + 9 位数字。
 //
-// 简化处理:仅识别 +86;其他号段交给后续扩展,避免引入复杂依赖。
-func extractZone(phone string) string {
-	if strings.HasPrefix(phone, "+86") {
-		return "0086"
+// 只在**已经剥掉大陆国家码之后**用它校验号码体,不用它去判断一个裸号是不是
+// 大陆号 —— 后者做不到,见 normalizePhone 的注释。
+var mainlandMobileRe = regexp.MustCompile(`^1[3-9]\d{9}$`)
+
+// phoneSeparators 人工录入常见的分隔符,归一化前先剔除。
+const phoneSeparators = " \t-()"
+
+// normalizePhone 把上游 phone_number 归一化成 dmwork 的 (zone, phone) 形态。
+//
+// 支持的输入(全部映射到 zone="0086"):
+//
+//	+8613812345678 / 008613812345678 / 8613812345678 / 13812345678
+//	以及上述形态中夹带空格、'-'、括号的版本
+//
+// 设计取舍 —— 为什么不做通用 E.164 解析,也不推断裸号:
+//
+//	E.164 的国家码是 1~3 位变长,纯语法切不开(+4670…既可以是 +46 70… 也可以
+//	是 +467 0…),要切必须内置一张国家码表。而猜错国家码的后果是把号码存成另一
+//	个国家的另一个号:用户从此收不到验证码、找不回账号,而且错误不可见 —— 库里
+//	那一行看起来完全正常。
+//
+//	裸号(不带国家码)同样不能推断,理由是具体的:北美编号计划的号码是 `1` +
+//	三位区号,区号首位取 [2-9],于是**约 7/8 的北美号码与中国号段在裸号形态下
+//	完全同形** —— `13861234567` 既可以是 +1 386-123-4567,也是一个真实的中国
+//	138 号段号码。把前者按后者存下去,存进去的是某个中国人的号码。
+//
+//	早先版本按 `^1[3-9]\d{9}$` 推断裸号,依据是厂商手册 userinfo 的一个示例;
+//	而那个示例值 `11136618971` 以 `111` 开头,根本不是合法的中国号段。也就是说
+//	我们从未见过上游发出合法的裸中国号,那个推断建立在一个假造的示例上。
+//	等实测确认上游的真实形态后再按实测加回来。
+//
+//	所以这里只归一化能**确定**的形态,其余一律返回空对,由调用方按"这个用户
+//	没有可用手机号"处理(它们已经都能处理空值)。
+//
+// 海外号(该客户在多个国家有员工)因此仍然不会被自动写入。这是有意的:
+// 目前 dmwork 侧只有 0086 的短信通道被验证过,存一个发不出验证码的号码
+// 比不存更糟 —— 它会让"用手机号找回账号"这条路看起来可用但实际失败。
+//
+// 两个返回值同进同退:要么都非空,要么都空。调用方(bind_service.go 用
+// extractPhone 判定可用性,service.go 把两者一起传给 UIDsByPhone)依赖这个不变量。
+func normalizePhone(raw string) (zone, phone string) {
+	s := strings.Trim(raw, phoneSeparators)
+	for _, sep := range phoneSeparators {
+		s = strings.ReplaceAll(s, string(sep), "")
 	}
-	return ""
+	if s == "" {
+		return "", ""
+	}
+	// 大陆国家码的三种写法。三者互不为前缀(+86 / 0086 / 86),顺序无关。
+	for _, cc := range []string{"+86", "0086", "86"} {
+		if rest, ok := strings.CutPrefix(s, cc); ok {
+			if mainlandMobileRe.MatchString(rest) {
+				return mainlandZone, rest
+			}
+			// 明确声明了大陆国家码,号码体却不是合法号段 —— 上游数据有问题,
+			// 不要退回去把整串当裸号再试一次(那会把 "+8611136618971" 这种
+			// 脏数据洗成一个看起来合法的号码)。
+			return "", ""
+		}
+	}
+	// 裸号不推断 —— 见函数注释里的 NANP 同形说明。
+	return "", ""
 }
 
-// extractPhone 去掉 +86 前缀返回纯号码。
+// mainlandZone dmwork 的区号形态是 "00" + 国家码。
+const mainlandZone = "0086"
+
+// extractZone 返回归一化后的区号;无法确定归属时返回空(调用方按不绑定处理)。
+func extractZone(phone string) string {
+	zone, _ := normalizePhone(phone)
+	return zone
+}
+
+// extractPhone 返回归一化后的号码体(不含国家码);无法确定归属时返回空。
 func extractPhone(phone string) string {
-	if strings.HasPrefix(phone, "+86") {
-		return phone[3:]
-	}
-	return ""
+	_, p := normalizePhone(phone)
+	return p
 }

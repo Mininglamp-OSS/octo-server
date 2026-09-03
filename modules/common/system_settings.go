@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/oidcboot"
 	"go.uber.org/zap"
 )
 
@@ -544,13 +545,23 @@ func isOIDCFullyConfigured() bool {
 		{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
 	}
 	for _, r := range required {
-		if os.Getenv(r.primary) == "" && os.Getenv(r.alias) == "" {
+		// oidcboot.EnvString, not os.Getenv: the module's loader resolves the same pairs
+		// through it, and it trims. Comparing untrimmed here meant a whitespace-only
+		// required value passed this loop while the module refused to boot on it —
+		// the same lockout as the BASE_URL, boolean and issuer cases.
+		if oidcboot.EnvString(r.primary, r.alias) == "" {
 			return false
 		}
 	}
 	// Provider ID: empty falls back to "oidc" (matches loadProvider default),
 	// non-empty must satisfy the same regex or LoadConfig fails fatally.
-	providerID := os.Getenv("DM_OIDC_PROVIDER_ID")
+	// EnvString(会 trim),与 loadProvider 同一个读取器。
+	//
+	// 这里原本是裸 os.Getenv,而模块侧已 trim:DM_OIDC_PROVIDER_ID="   " 会让模块
+	// 回落 "oidc" 正常启动,而这里不过正则、报"未配置" → anyThirdPartyLoginConfigured
+	// 为假 → local_off 不被采信 → **在一个刻意关掉密码登录的部署上把它又打开了**。
+	// 方向与锁死相反,但同样是安全回退;三行之上的 required 循环正是为此迁过来的。
+	providerID := oidcboot.EnvString("DM_OIDC_PROVIDER_ID", "")
 	if providerID == "" {
 		providerID = "oidc"
 	}
@@ -569,7 +580,74 @@ func isOIDCFullyConfigured() bool {
 	if err != nil || len(key) != 32 {
 		return false
 	}
+	// Provider-kind refusals live in pkg/oidcboot so this function and
+	// modules/oidc.LoadConfig cannot disagree.
+	//
+	// They must not disagree because the failure is asymmetric and severe: when
+	// LoadConfig refuses, modules/oidc registers 404 handlers for every endpoint,
+	// so SSO does not work. If this function still answered "configured",
+	// anyThirdPartyLoginConfigured would stay true, login.local_off=1 would be
+	// honoured, and password login would remain off too — leaving an SSO-only
+	// deployment with no working login path and no recovery short of a redeploy.
+	//
+	// This used to be a hand-maintained mirror, and it drifted the moment new
+	// fatal conditions were added on the oidc side. The shared table
+	// oidcboot.RefusedScenarios pins both sides' tests to the same list.
+	if err := oidcboot.ValidateKind(oidcboot.KindInput{
+		Kind:    os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		BaseURL: oidcUpstreamBaseURLFromEnv(),
+		AppID:   os.Getenv("OCTO_OIDC_PROVIDER_APP_ID"),
+
+		EndSessionURL:         os.Getenv("OCTO_OIDC_PROVIDER_END_SESSION_URL"),
+		PostLogoutRedirectURI: os.Getenv("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI"),
+		// Both logout URLs are boot-fatal in the module; omitting them here is what let
+		// a relative post-logout redirect 404 every OIDC route while this side still
+		// answered "configured".
+		AllowInsecureLogout: oidcEnvBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "", false),
+		Issuer:              oidcIssuerFromEnv(),
+
+		AutoLinkByEmail:      oidcEnvBool("DM_OIDC_PROVIDER_AUTO_LINK_BY_EMAIL", "DM_OIDC_AEGIS_AUTO_LINK_BY_EMAIL", true),
+		RequireEmailVerified: oidcEnvBool("DM_OIDC_PROVIDER_REQUIRE_EMAIL_VERIFIED", "DM_OIDC_AEGIS_REQUIRE_EMAIL_VERIFIED", true),
+
+		AllowInsecureUpstream: oidcEnvBool("OCTO_OIDC_ALLOW_INSECURE_UPSTREAM", "", false),
+	}); err != nil {
+		return false
+	}
 	return true
+}
+
+// oidcUpstreamBaseURLFromEnv mirrors the base-URL fallback in
+// modules/oidc.applyKindConstraints: the plain-OAuth2 kind falls back to the
+// issuer when no explicit base URL is set.
+//
+// The fallback has to be applied here too, because the refusal rules are about
+// the value that will actually be used, not the raw variable.
+func oidcUpstreamBaseURLFromEnv() string {
+	// Delegates the fallback decision to the single definition. This used to be a second
+	// implementation differing from the module's in exactly one way -- it trimmed first --
+	// and that was enough to produce a total login lockout: the module refused to boot on a
+	// whitespace-only value while this side took the fallback and reported "configured".
+	return oidcboot.UpstreamBaseURL(
+		os.Getenv("OCTO_OIDC_PROVIDER_KIND"),
+		os.Getenv("OCTO_OIDC_PROVIDER_BASE_URL"),
+		oidcIssuerFromEnv(),
+	)
+}
+
+// oidcIssuerFromEnv reads the issuer with its legacy alias, matching the module's loader.
+func oidcIssuerFromEnv() string {
+	return oidcboot.EnvString("DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER")
+}
+
+// oidcEnvBool delegates to pkg/oidcboot.EnvBool — the single definition shared
+// with modules/oidc's config loader.
+//
+// This used to be a local copy carrying a comment that claimed it matched the
+// other one. It did not: on a present-but-unparseable primary, the other fell
+// through to the legacy alias while this returned the default. See EnvBool for
+// why that single disagreement can leave a deployment with no login path at all.
+func oidcEnvBool(primary, alias string, def bool) bool {
+	return oidcboot.EnvBool(primary, alias, def)
 }
 
 // LogLocalLoginOffSafetyOverrideIfActive emits a single error-level log entry
