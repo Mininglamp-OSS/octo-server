@@ -327,6 +327,14 @@ func TestRespondBotAPIHelpers(t *testing.T) {
 			wantContains:    "OBO 授权已存在",
 		},
 		{
+			name:            "respondBotAPIInstanceConflict preserves 409",
+			probe:           respondBotAPIInstanceConflict,
+			wantCodeID:      "err.server.bot_api.instance_conflict",
+			wantSemStatus:   http.StatusConflict,
+			wantTransStatus: http.StatusConflict,
+			wantContains:    "该 Bot Token 已绑定到另一个 OpenClaw 实例",
+		},
+		{
 			name:            "ErrBotAPISharedAuthRequired preserves 401",
 			probe:           func(c *wkhttp.Context) { httperrLWS(c, errcode.ErrBotAPISharedAuthRequired) },
 			wantCodeID:      "err.shared.auth.required",

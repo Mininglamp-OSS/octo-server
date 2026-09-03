@@ -274,6 +274,13 @@ var (
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "The message has not finished delivering; please retry.",
 	})
+	// ErrBotAPIInstanceConflict means this Bot Token was already claimed by a
+	// different OpenClaw installation. The owning instance ID stays private.
+	ErrBotAPIInstanceConflict = register(codes.Code{
+		ID:             "err.server.bot_api.instance_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This Bot Token is already bound to another OpenClaw instance.",
+	})
 
 	// ---- bot auth (401, anti-enumeration) ------------------------------------
 

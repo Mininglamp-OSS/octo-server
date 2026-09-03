@@ -117,6 +117,9 @@ other = "Group not found."
 ["err.server.bot_api.im_token_failed"]
 other = "Failed to obtain an IM token."
 
+["err.server.bot_api.instance_conflict"]
+other = "This Bot Token is already bound to another OpenClaw instance."
+
 ["err.server.bot_api.limit_exceeded"]
 other = "The request exceeds the maximum allowed items."
 

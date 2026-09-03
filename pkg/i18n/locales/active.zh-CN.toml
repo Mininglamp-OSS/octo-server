@@ -1192,6 +1192,9 @@ other = "OBO 授权范围已存在。"
 ["err.server.bot_api.message_not_delivered"]
 other = "消息尚未投递完成，请稍后重试。"
 
+["err.server.bot_api.instance_conflict"]
+other = "该 Bot Token 已绑定到另一个 OpenClaw 实例。"
+
 ["err.server.bot_api.auth_failed"]
 other = "机器人认证失败。"
 
