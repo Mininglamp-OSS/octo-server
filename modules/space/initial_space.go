@@ -70,40 +70,22 @@ func AutoJoinInitialSpace(ctx *config.Context, uid, spaceID string) (InitialSpac
 }
 
 func (s *Space) autoJoinInitialSpace(uid, spaceID string) (InitialSpaceJoinOutcome, error) {
-	sp, err := s.db.queryActiveSpaceForAutoJoin(spaceID)
+	// 判定与写入全在一个事务里完成,活性复核在锁内 —— 见 atomicJoinInitialSpace
+	// 对窗口与锁序的说明。这里只负责把结果翻给调用方,以及在**提交之后**跑副作用。
+	sp, outcome, err := s.db.atomicJoinInitialSpace(spaceID, uid)
 	if err != nil {
-		return InitialSpaceFailed, fmt.Errorf("query initial space: %w", err)
+		return outcome, err
 	}
-	if sp == nil {
-		return InitialSpaceInactive, nil
-	}
-
-	existing, err := s.db.queryMemberIncludeRemoved(spaceID, uid)
-	if err != nil {
-		return InitialSpaceFailed, fmt.Errorf("query initial space member: %w", err)
-	}
-	if existing != nil {
-		// 已在籍 → 幂等；已被移除 → 见函数注释第 2 点，不复活。
-		return InitialSpaceAlreadyMember, nil
-	}
-
-	if err := s.db.atomicAddMemberIfNotFull(spaceID, uid, sp.MaxUsers); err != nil {
-		switch {
-		case errors.Is(err, ErrSpaceFull):
-			return InitialSpaceFull, nil
-		case isDuplicateMemberError(err):
-			// 上面的 queryMemberIncludeRemoved 与这里的 INSERT 之间，另一条路径
-			// （管理端添加、用户自己拿邀请码加入）抢先插了同一行。唯一索引
-			// spacemember_spaceid_uid 挡住了重复行，结果与"本来就在"一致。
-			return InitialSpaceAlreadyMember, nil
-		default:
-			return InitialSpaceFailed, fmt.Errorf("add initial space member: %w", err)
-		}
+	if outcome != InitialSpaceJoined {
+		return outcome, nil
 	}
 
 	// 与普通加入完全相同的副作用：预设群组、默认分类、SpaceMemberJoin 事件
 	// （botfather 欢迎语 / notify 空间欢迎语靠它）、成员缓存失效。
 	// 走同一个函数而不是重抄一遍，是为了让下游监听方看到的事件形状不因入口而异。
+	//
+	// 放在事务之外是硬要求:这些副作用会起 goroutine、调外部服务,持在事务里既拉长
+	// 锁的持有时间,又会在回滚后留下已经外发的副作用。
 	s.afterJoinSpace(uid, spaceID, sp)
 	return InitialSpaceJoined, nil
 }

@@ -35,10 +35,12 @@ after its `user_oidc_identity` row is persisted.
 - `modules/common` — schema row, a getter that trims on read, and write-path
   validation refusing a missing or inactive target. The value is trimmed **into
   the plan**, so the stored value, `value` and `effective_value` all agree.
-- `modules/space.AutoJoinInitialSpace` — verifies the Space is `status=1`,
-  refuses to reactivate a member an admin removed, bypasses approval mode,
-  honours `max_users`, and runs the identical `afterJoinSpace` side effects.
-  Returns a typed outcome the caller uses directly as a metric label.
+- `modules/space.AutoJoinInitialSpace` — refuses to reactivate a member an admin
+  removed, bypasses approval mode, honours `max_users`, and runs the identical
+  `afterJoinSpace` side effects. Returns a typed outcome the caller uses directly
+  as a metric label. The judgement and the write happen in **one transaction**
+  (`atomicJoinInitialSpace`), with the authoritative Space-status recheck under a
+  current read before commit — see the lock-order note below.
 - `modules/oidc` — hooks on **every** account-creating path. `CreateUser` is
   set in exactly three places in the module, and all three are hooked:
   `api.go` (browser callback), `bind_service.go` (`/bind/create`), and
@@ -76,13 +78,30 @@ after its `user_oidc_identity` row is persisted.
 - **Failure is invisible to the user by design**, which makes the counter the
   only line of sight. Alerts belong on `space_full` / `space_inactive` / `error`,
   not on waiting for someone to report "I logged in but exchange fails".
+- **The Space-status recheck goes *after* the INSERT, not before it.** The
+  intuitive shape — `SELECT space FOR UPDATE`, then insert — deadlocks: both
+  disband paths take the `space_member` range lock first and update `space`
+  second, so locking `space` first inverts the order (Error 1213, possibly
+  rolling back the *administrator's* disband). The trap is that `FOR UPDATE` on
+  a row that does not exist yields a **gap lock, and gap locks are mutually
+  compatible** — so "lock space_member first" does not serialize anything; the
+  only real rendezvous with disband is the INSERT's insert-intention lock. The
+  fix is to let the INSERT be the synchronisation point and recheck status under
+  a current read before committing: a disband that already committed is seen,
+  and the transaction rolls the row away. Written the wrong way round first and
+  caught by the deterministic race test, which is why the reasoning is recorded
+  in the function.
 - **The panic guard stops at the `go` boundary, and the comment now says so.**
   The hook recovers what it runs synchronously; `afterJoinSpace` dispatches two
   goroutines that escape it. `joinPresetGroups` already had its own recover,
   `fireSpaceMemberJoinEvent` did not — and `EventCommit` runs the registered
   listeners synchronously inside it, so a listener panic took the process down.
   Pre-existing, but auto-join lets an ordinary SSO login reach it, and logins
-  are far more frequent than invite redemptions. A recover was added there.
+  are far more frequent than invite redemptions. A recover was added there —
+  together with `defer tx.RollbackUnlessCommitted()`, because a recovered panic
+  skips the commit and would otherwise leave the transaction and its locks
+  hanging on the connection: containing a crash by leaking a transaction just
+  trades one failure for another.
 
 ## Gotchas worth remembering
 
@@ -108,6 +127,11 @@ after its `user_oidc_identity` row is persisted.
   the ghost test drives theirs. Theirs is the better model: it keys on which
   call this is, which is what a race *is*, rather than on "an insert was
   attempted", which infers the timing from a result.
+- **A test asserting only an error-free path proves less than it looks.** The
+  first version of the query-failure test asserted only the missing-row half, so
+  an implementation that reported "inactive" unconditionally would have passed
+  under a name promising the opposite. It now renames the `space` table away to
+  induce a real failure.
 - **A test asserting only absences proves less than it looks.** The first
   version of the ghost test asserted the loser had no member row *and* the
   winner had none either (the winner's callback was never driven), so an
@@ -125,6 +149,13 @@ after its `user_oidc_identity` row is persisted.
   membership when an IdP account is disabled — `sync_worker` only syncs realname
   claims. The hole predates this change, but it was empty while SSO users
   belonged to no Space; auto-join fills it. Recorded as a known limitation.
+- **The Space-status race is closed on this path only.** `executeJoinSpace` and
+  the manager add path still read Space status outside the membership
+  transaction — the window `forceDisbandSpace` documents as a repo-wide
+  follow-up. Closing it there means moving the recheck into
+  `atomicAddMemberIfNotFull` for every join path with a consistent lock order,
+  which has its own blast radius and deserves its own change. The lock-order
+  reasoning and the deterministic test in this task are the template for it.
 - **A single global Space is a blunt instrument.** Same-Space membership implies
   `HasAuthzRelation` (profile visible, DM allowed), so the feature converts
   "can authenticate at the IdP" into "can see the company Space". Right for a

@@ -2250,6 +2250,11 @@ func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
 		s.Error("开启SpaceMemberJoin事件事务失败", zap.Error(err))
 		return
 	}
+	// 上面的 recover 让 panic 不再带走进程,但被接住的 panic 会跳过下面的
+	// Commit/Rollback,把事务连同它持有的锁一起挂在连接上直到池回收 —— 兜住崩溃
+	// 却泄漏事务,是把一种故障换成了另一种。RollbackUnlessCommitted 对已提交的
+	// 事务是 no-op,所以正常路径不受影响。
+	defer tx.RollbackUnlessCommitted()
 	eventID, err := s.ctx.EventBegin(&wkevent.Data{
 		Event: event.SpaceMemberJoin,
 		Type:  wkevent.Message,

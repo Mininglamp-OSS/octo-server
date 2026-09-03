@@ -264,17 +264,45 @@ func TestAutoJoinInitialSpace_RejectsEmptyArguments(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestAutoJoinInitialSpace_UnknownSpaceIsNotConfusedWithQueryFailure pins the
-// reason queryActiveSpaceForAutoJoin exists next to querySpaceByID: the latter
-// returns (nil, nil) before inspecting the error, collapsing "the id is wrong"
-// into "the database is unavailable". The consumer counts those under different
-// labels and only one of them is worth waking someone for.
-func TestAutoJoinInitialSpace_UnknownSpaceIsNotConfusedWithQueryFailure(t *testing.T) {
-	_, f, _ := setup(t)
+// TestAutoJoinInitialSpace_QueryFailureIsNotReportedAsInactive pins the
+// distinction the whole outcome enum exists for: "the configured id is unusable"
+// and "the database is unavailable" are different operational events, counted
+// under different labels, and only one is worth waking somebody for.
+//
+// The earlier version of this test asserted only the missing-row half, so an
+// implementation that returned "inactive" unconditionally would have passed
+// under this name — review caught that. This one induces a real query failure by
+// taking the `space` table away, which is what makes the assertion mean
+// something.
+//
+// The member lock is acquired before the Space is read, so this exercises the
+// Space read specifically, with the transaction already open.
+func TestAutoJoinInitialSpace_QueryFailureIsNotReportedAsInactive(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
 
-	sp, err := f.db.queryActiveSpaceForAutoJoin("sp-absent")
-	assert.NoError(t, err, "a missing row is not an error")
-	assert.Nil(t, sp)
+	const spaceID = "sp-initial-dberr"
+	seedInitialSpace(t, f, spaceID, 0, JoinModeDirect)
+
+	// A missing row is not an error.
+	outcome, err := AutoJoinInitialSpace(testCtx, "u-dberr-1", "sp-absent")
+	assert.NoError(t, err, "a missing row is a configuration state, not a failure")
+	assert.Equal(t, InitialSpaceInactive, outcome)
+
+	// A broken query is. Renamed rather than dropped so the fixture survives, and
+	// restored through Cleanup so a failure here cannot cascade into other tests.
+	_, err = testCtx.DB().Exec("RENAME TABLE `space` TO `space_dberr_fixture`")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = testCtx.DB().Exec("RENAME TABLE `space_dberr_fixture` TO `space`")
+	})
+
+	outcome, err = AutoJoinInitialSpace(testCtx, "u-dberr-2", spaceID)
+	assert.Equal(t, InitialSpaceFailed, outcome,
+		"a query failure must not be reported as a misconfigured Space")
+	assert.Error(t, err, "the cause must reach the caller's log, not be swallowed")
+	assert.Equal(t, 0, countMemberRows(t, spaceID, "u-dberr-2"),
+		"nothing may be written when the Space could not be read")
 }
 
 // TestFireSpaceMemberJoinEvent_ContainsListenerPanic pins the recover added to
@@ -323,4 +351,106 @@ func TestFireSpaceMemberJoinEvent_ContainsListenerPanic(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("fireSpaceMemberJoinEvent did not return")
 	}
+}
+
+// TestAutoJoinInitialSpace_LosesRaceWithDisbandCleanly is the deterministic
+// disband-vs-auto-join regression test, and the reason atomicJoinInitialSpace
+// exists.
+//
+// Before it, the Space was read active in one statement and the member inserted
+// in a separate transaction. A disband committing in between produced an active
+// member row in a dead Space, plus the preset-group and SpaceMemberJoin side
+// effects that follow a successful join. The window is documented on
+// forceDisbandSpace as a known follow-up for every join path; this closes it on
+// this one.
+//
+// Determinism comes from driving the interleaving with locks rather than with
+// timing: a helper transaction takes exactly the lock a disband takes and holds
+// it, the join blocks on it, the disband is then applied and released, and the
+// join resumes into a Space that is already dead. No sleeps decide the outcome.
+func TestAutoJoinInitialSpace_LosesRaceWithDisbandCleanly(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sp-initial-disband-race"
+	seedInitialSpace(t, f, spaceID, 0, JoinModeDirect)
+
+	// Stand in for a disband in flight: hold the same space_member range lock
+	// lockActiveMemberUIDsTx takes, so the joiner blocks exactly where it would
+	// block against a real disband.
+	blocker, err := testCtx.DB().Begin()
+	require.NoError(t, err)
+	var held []string
+	_, err = blocker.SelectBySql(
+		"SELECT uid FROM space_member WHERE space_id=? AND status=1 FOR UPDATE", spaceID).Load(&held)
+	require.NoError(t, err)
+
+	joined := make(chan InitialSpaceJoinOutcome, 1)
+	go func() {
+		outcome, _ := AutoJoinInitialSpace(testCtx, "u-race-join", spaceID)
+		joined <- outcome
+	}()
+
+	// The join must be waiting on the lock, not racing past it. If it can finish
+	// while the range lock is held, it is not taking the lock at all — which is
+	// the defect this test exists to catch.
+	select {
+	case outcome := <-joined:
+		_ = blocker.Rollback()
+		t.Fatalf("join completed while the disband lock was held (outcome=%s); "+
+			"the member insert is not serialized against disband", outcome)
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	// Complete the disband inside the blocking transaction, exactly as
+	// forceDisbandSpace does, then release.
+	_, err = blocker.Exec("UPDATE `space` SET status=0 WHERE space_id=?", spaceID)
+	require.NoError(t, err)
+	_, err = blocker.Exec("UPDATE space_member SET status=0 WHERE space_id=? AND status=1", spaceID)
+	require.NoError(t, err)
+	require.NoError(t, blocker.Commit())
+
+	select {
+	case outcome := <-joined:
+		assert.Equal(t, InitialSpaceInactive, outcome,
+			"the joiner must re-read the Space under the lock and find it dead")
+	case <-time.After(10 * time.Second):
+		t.Fatal("join did not finish after the disband committed")
+	}
+
+	// No orphan: not merely "no active row", but no row at all — an inserted-then-
+	// missed row is precisely what the disband's cleanup would never know about.
+	assert.Equal(t, 0, countMemberRows(t, spaceID, "u-race-join"),
+		"no member row may be written into a Space that was disbanded first")
+}
+
+// TestAutoJoinInitialSpace_WinsRaceWithDisbandCleanly is the same interleaving
+// the other way round, and it is what keeps the test above from passing for the
+// wrong reason: an implementation that simply never joined would satisfy "no
+// orphan" while being useless.
+//
+// Here the join commits first and the disband follows, so the member row must
+// exist and must then be swept to status=0 by the disband's own current read —
+// the outcome the lock ordering is designed to produce.
+func TestAutoJoinInitialSpace_WinsRaceWithDisbandCleanly(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sp-initial-disband-win"
+	seedInitialSpace(t, f, spaceID, 0, JoinModeDirect)
+
+	outcome, err := AutoJoinInitialSpace(testCtx, "u-race-win", spaceID)
+	require.NoError(t, err)
+	require.Equal(t, InitialSpaceJoined, outcome)
+
+	uids, err := f.db.disbandSpace(spaceID, "owner-uid")
+	require.NoError(t, err)
+	assert.Contains(t, uids, "u-race-win",
+		"a member who joined before the disband must appear in its cleanup list, "+
+			"otherwise no removal ticket is written and they stay in the Space's groups")
+
+	m, err := f.db.queryMemberIncludeRemoved(spaceID, "u-race-win")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, 0, m.Status, "the disband must have swept the freshly joined member")
 }
