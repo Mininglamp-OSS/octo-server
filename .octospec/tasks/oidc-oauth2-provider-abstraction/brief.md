@@ -1,0 +1,1123 @@
+---
+type: Task
+title: "Task: oidc-oauth2-provider-abstraction"
+description: Introduce an AuthProvider abstraction in modules/oidc so a plain (non-OIDC) OAuth2 enterprise IdP can drive login, logout and profile claims; plus an HS256-JWT exchange entry for an upstream business backend that vends its own session JWT to bearer clients.
+tags: [auth, trust-boundary, wire-contract, error-response, i18n, observability, testing]
+timestamp: 2026-09-01T03:59:42Z
+slug: oidc-oauth2-provider-abstraction
+upstream: "Mininglamp-OSS/octo-server#830"
+source: self
+---
+
+# Task: oidc-oauth2-provider-abstraction
+
+## Goal
+
+`modules/oidc` is a strict **OpenID Connect** implementation: it requires
+Discovery, a signed `id_token`, and a JWKS key set, and it reads profile claims
+from a spec-shaped `/userinfo` response. We need to onboard **two** identity
+sources that speak protocols the current code does not handle:
+
+1. An enterprise IdP that speaks **plain OAuth2 `authorization_code` only** — no
+   Discovery, no `id_token`, no JWKS, an opaque UUID `access_token`, and a
+   `/userinfo` response wrapped in a vendor-specific envelope (`{success, code,
+   message, requestId, data:{...}}`). Pointing `DM_OIDC_PROVIDER_ISSUER` at such
+   an IdP does not degrade gracefully: `oidc.NewProvider` fails, `o.client` stays
+   nil, and every OIDC endpoint answers 500.
+
+2. A bearer client (/ native-client) that completes SSO with the IdP
+   itself (via a local HTTP callback server) and receives an **HS256-signed JWT**
+   from the native client's own business backend. That JWT is not issued by the enterprise IdP
+   and is not verifiable by a JWKS; it must be validated against a shared
+   symmetric secret and its claims (`userId`, `domainAccount`) mapped into our
+   identity model before we issue a session token.
+
+Introduce an `AuthProvider` interface with two implementations for item 1 (the
+existing OIDC one, and one for the plain-OAuth2 IdP), selected by a new
+`OCTO_OIDC_PROVIDER_KIND` knob. For item 2, introduce a small standalone HS256 JWT
+verification utility and an `/exchange-jwt` endpoint that uses it. Both exchange
+endpoints share the `ResolveOrLink` + `IssueSession` tail with the browser
+callback path, so the identity-persistence logic lives in exactly one place.
+
+Business branching always reads a declared `ProviderCapabilities` struct, never
+the kind — so adding a third IdP later does not mean grepping for `switch kind`.
+
+**This is a refactor of a live authentication path, not a pure addition.** The
+standard-OIDC provider is not left untouched: `oidc_client.go` is split behind the
+new interface and the ~101-line inline callback sequence at `api.go:504-604`
+collapses into one call. Any deployment already running a standard OIDC IdP
+therefore executes rewritten login code. Treat "no behaviour change for the OIDC
+kind" as an explicit requirement, not a side effect — see Acceptance.
+
+Scope is deliberately **login / logout / profile claims only**. Directory
+synchronisation (org tree, headcount feeds) is explicitly out of scope; see
+"Out of scope".
+
+One addition to that scope, agreed after the fact: a **standard `Authorization:
+Bearer` compatibility shim** for inbound API calls. It is not cosmetic — without
+it the integration is broken end to end. Our own `AuthMiddleware` (in the shared
+library) only reads a custom `token` header, so a client written against ordinary
+OAuth2 conventions authenticates successfully via the IdP, receives our session
+token, and is then rejected with 401 on **every subsequent API call**. That
+failure only surfaces during integration testing, which is exactly when it is
+most expensive to discover.
+
+## Background
+
+The upstream protocol spec is vendor documentation and is **not checked in**
+(it carries customer identifiers). A transcription lives in this workspace at
+`.context/docs/` (gitignored). The relevant protocol facts:
+
+### Source 1 — Enterprise IdP OAuth2 (plain-OAuth2 provider)
+
+- `GET  {base}/oauth/authorize?response_type=code&scope=read&client_id=&redirect_uri=&state=`
+  — `state` is documented as **optional on the IdP side**, no PKCE, no `nonce`.
+- `POST {base}/oauth/token` — the reference implementation puts every parameter
+  in the **query string** (including `client_secret`) with an empty body, and that
+  is what `oauth2Provider.Exchange` does. An earlier revision of this line claimed
+  we had moved to a form body; we had not, and the code comment says why we do not:
+  a form body is only theoretically acceptable on the upstream's Spring stack, is
+  unverified against it, and the upstream gateway may read or sign only the query.
+  The `*url.Error` credential-leak concern that motivated the form body is handled
+  instead by sanitizing transport errors before they reach a log
+  (`sanitizeTransportError`), which is verified by the provider conformance suite.
+- `GET  {base}/<vendor-path>/userinfo?access_token=` — token in the query string,
+  **not** an `Authorization` header; claims nested under a `{success, code,
+  message, requestId, data:{...}}` envelope, so the top-level `sub` that
+  `go-oidc` expects is absent.
+- Token response carries `refresh_token` but the spec **documents no refresh
+  endpoint** (wire probe confirms the grant exists but no documented wire
+  contract — capability therefore declared `RefreshToken=false` to avoid idling
+  the SyncWorker).
+- Logout is a front-channel redirect to a vendor SLO path keyed by an app id:
+  `{host}/public/sp/slo/{appId}?redirect_url=...`. There is **no back-channel
+  logout**, and the vendor's own docs state SCIM is not offered externally.
+
+### Source 2 — native-client bearer JWT (HS256 exchange endpoint)
+
+The bearer client receives an HS256 JWT signed by the native client's backend after the
+user completes the enterprise IdP SSO in the system browser. The JWT payload is:
+
+```json
+{
+  "userId": <int64>,            // 客户端后端内部用户主键(数字)
+  "domainAccount": <string>,    // 域账号(登录名,仅做显示/审计)
+  "payloadHash": <hex-sha256>,  // 客户端侧附加 userData 的完整性摘要
+  "iat": <unixsec>,
+  "exp": <unixsec>              // TTL ~15d
+}
+```
+
+Key properties:
+- No `iss`, `aud`, `nbf`, or `kid` field. No audience/purpose binding.
+- Signed with a shared symmetric secret obtained separately from the OAuth2
+  client credentials; configured via `OCTO_OIDC_BEARER_JWT_SECRET`.
+- `userId` is an integer in a separate ID space from the enterprise IdP's
+  18-digit `sub`. We therefore use an **isolated issuer namespace**: the
+  configured upstream issuer plus a `#bearer-jwt` suffix, so the two identity
+  sources cannot collide on `(issuer, subject)`. Deriving it rather than taking
+  a second environment knob removes a way to misconfigure the two against each
+  other.
+
+  **Correction — it confers no *environment* isolation.** An earlier version of
+  this paragraph said per-environment isolation was inherited from the upstream
+  issuer. That is wrong: the namespace is computed from *this* deployment's
+  configured issuer, not from anything inside the token. A token signed in
+  staging under the same `OCTO_OIDC_BEARER_JWT_SECRET` verifies here, maps to
+  `<prod issuer>#bearer-jwt` plus the same `userId`, and therefore authenticates
+  as the corresponding production user. With no `iss`, no `aud` and no `jti`,
+  **secret uniqueness per environment is the only control** — and on the
+  integration endpoints that credential is a standing authenticator with an
+  `exp`-length (~15 day) replay window. See Pending for the `aud` binding and the
+  single-purpose-secret precondition, which this makes a per-environment
+  requirement rather than merely a good practice. `#` cannot occur in a valid
+  issuer URI, so the suffix is unambiguous. The derivation refuses an empty
+  upstream issuer, an already-suffixed value, and anything that would exceed the
+  255-byte `issuer` column (silent MySQL truncation could otherwise merge two
+  issuers, and with them two people, under `uk_issuer_subject`).
+- The JWT carries **no verified email / phone claims**, so autolink is fail-closed
+  on this path — and, since the boot-time refusal, structurally so rather than by
+  default value.
+
+  An earlier version of this line claimed "by construction" while it was only true
+  by policy: `service.go` evaluates `!RequireEmailVerified || claims.EmailVerified`,
+  so with `RequireEmailVerified=false` the verified flag is never consulted and an
+  unverified address becomes an account-linking key. The safe default was the only
+  thing holding it — one configmap edit away from open. `pkg/oidcboot` now refuses
+  that combination for the kind whose provider structurally cannot assert
+  verification, which is what makes the original wording true.
+
+### Where the protocol coupling actually lives
+
+`go-oidc` / `golang.org/x/oauth2` are imported by exactly two production files —
+`modules/oidc/oidc_client.go` and `modules/oidc/sync_worker.go`. `service.go`,
+`db.go`, `model.go`, `bind_service.go` and `sql/` import neither. That is why the
+abstraction boundary is the client layer and why `service.go` needs **zero**
+changes: `ResolveOrLink` / `IssueSession` only consume `*IDTokenClaims` (aliased
+as `IdentityClaims` to avoid renaming snapshot fields).
+
+The one large edit was `api.go:504-604` (raw `id_token` extraction →
+`VerifyIDToken` → nonce compare → `needUserInfo` merge → sub cross-check, ~101
+lines). Those are OIDC protocol details; they collapse into a single
+`provider.Identity(ctx, tok)` call so the plain-OAuth2 and HS256-JWT
+implementations are not forced to stub them out.
+
+### Corrections to existing comments (applied during this task)
+
+- `oidc_client.go:255-258` previously claimed `go-oidc`'s `UserInfo` verifies the
+  `sub` against the ID Token. It does not — `go-oidc/v3@v3.9.0/oidc/oidc.go:321-371`
+  only issues the GET and decodes. The cross-check is **our** code (now in
+  `oidcProvider.Identity`) and has explicit test coverage
+  (`TestOIDCProvider_PreservesSecurityChecks/rejects_userinfo_sub_mismatch`).
+- `api.go`'s `TrustedSSOCreate` argument previously cited JWKS verification as
+  proof that `claims.Issuer == cfg.Provider.Issuer` is cryptographically
+  guaranteed. For plain-OAuth2 that trust anchor is *not* cryptographic (the
+  Issuer is operator-supplied, integrity comes from TLS); the comment was
+  rewritten to distinguish the two kinds rather than leaving a misleading
+  assurance.
+
+### Decisions already taken
+
+0. **Greenfield deployment — no pre-existing IM population to migrate.** Every
+   user who arrives through SSO is new. First-login path is `AllowNewUser=true`
+   (default); self-service binding is left off. Autolink stays off.
+
+1. **Account deactivation / offboarding** — no synchronisation. The IdP gates
+   login, we rely on that plus a shorter session ceiling for SSO users
+   (`Cache.TokenExpire` tightened for SSO-issued sessions, see Pending below)
+   and an operator-triggered `RevokeAll` primitive. The vendor does not offer
+   SCIM externally.
+
+2. **Space membership for SSO-created users** — keep current behaviour, no
+   auto-join. Admins add users via existing invite flows.
+
+3. **Logout blast radius** — our own session and IM kick are scoped to **the
+   calling device only** (fixed in this PR; a previous implementation called
+   `auth.Decode` on the raw UUID token and always returned 0, inadvertently
+   kicking every device). The upstream SLO redirect clears the IdP's browser
+   session globally; other devices keep existing tokens but must re-auth on the
+   next SSO round trip.
+
+4. **Employee-number recycling is fenced, not assumed away.** An earlier version of
+   this decision stated as settled fact that `subject` is the IdP's internal
+   directory id rather than the employee number. It is not settled: the vendor's
+   userinfo field table calls it a sub-number with an 18-digit example, the
+   quick-start demo comment calls it the employee number, and no live response has
+   ever been captured. The guard in `subject_shape.go` was built for exactly that
+   contradiction, so the brief cannot also assert it away.
+
+   The reading matters because employee numbers are reused between leavers and
+   joiners: under the second reading a new hire matches a former employee's
+   identity row and logs into their account. A purely numeric subject shorter than
+   ten digits is therefore refused at the trust boundary, before any row is
+   written — which converts an irreversible data problem into a recoverable
+   failure, and answers the question at first login instead of requiring the
+   capture up front.
+
+5. **Two exchange endpoints share the post-validation tail.** The ResolveOrLink
+   → IssueSession → identity-insert-with-race-recovery → writeAudit sequence
+   lives in exactly one place, `completeExchange` in
+   `modules/oidc/exchange_complete.go`, taking a `verifiedIdentity` plus an
+   `exchangeFlavour` that carries the only real differences (metric family,
+   audit event pair, log name).
+
+   This decision was recorded as settled before the refactor actually landed,
+   and the gap was not harmless: while the tail was duplicated, the race-recovery
+   defect existed in **both** copies and the phone-number masking fix reached
+   only one of them. Those are the same class of bug the shared tail exists to
+   prevent, so the ordering — claim first, extract later — is itself the lesson.
+
+## Load-bearing list
+
+- `auth` — the login identity decision (credential → `{uid, session}`). Security
+  boundary. A regression here is an authentication bypass, not a UX bug.
+- `trust-boundary`:
+  - For the plain-OAuth2 provider claim integrity comes from TLS, not a
+    signature. Three invariants enforced inside `oauth2Provider.Identity`:
+    absolute-https enforcement (config-load time, with an explicit insecure
+    escape hatch for pre-production), envelope `success`/`code` validation
+    (`{"success":false}` with HTTP 200 rejected), non-empty subject with length
+    cap.
+  - For the bearer-JWT provider claim integrity comes from HS256 plus strict
+    exp validation. `alg` is pinned to `HS256` at the parser level (alg
+    confusion resistant); empty secret rejected at the parser entry; base64
+    decoded in Strict mode to prevent signature-string ambiguity; issuer is
+    **never** read from the token. Risk of cross-purpose token reuse (other
+    internal services sharing the HS256 key) is documented; mitigated by
+    operational key isolation (single-purpose secret).
+- **`(issuer, subject)` identity mapping — irreversible.** `user_oidc_identity`
+  has `uk_issuer_subject`; admitting an empty/colliding subject collapses users
+  onto one row (account-takeover shape). Two guards, and they deliberately have
+  **different scopes** — an earlier revision of this line conflated them:
+
+  - *Storage bound* (non-empty, `<= subjectMaxLen`, and the same for `issuer`):
+    a property of the column, so it is provenance-neutral and applies to every
+    identity path. Enforced once, at the two points where claims enter a stateful
+    path — `Service.ResolveOrLink` and `BindService.IssueWithReason` — via
+    `requireStorableIdentity` (`identity_bounds.go`), i.e. before any side effect.
+    `subjectMaxLen == issuerMaxLen` is pinned by a test so the two cannot drift.
+    The bound is compared in **bytes** while `VARCHAR(255)` under `utf8mb4` is 255
+    *characters*; that is intentionally conservative (it refuses loudly rather than
+    truncating) and now says so in the code.
+  - *Short-numeric refusal* ("looks like an employee number"): a property of an
+    **upstream-asserted** subject, because the argument is that a personnel system
+    reuses the number between a leaver and a joiner. It therefore lives in the two
+    `AuthProvider` implementations and is pinned by the conformance table. It
+    deliberately does **not** apply to subjects we derive ourselves: the bearer-JWT
+    path's subject is our own business database primary key (`strconv.FormatInt`
+    of `userId`, with a non-zero guard), which is never reused — applying the
+    heuristic there locked every deployment with short user ids out of the desktop
+    credential path (caught by the existing `/exchange-jwt` tests).
+
+  This line asserted the cap before it existed. Only the *lower* bound was
+  implemented, so a 300-byte subject passed the boundary and reached an INSERT
+  against a `VARCHAR(255)` column: under strict `sql_mode` that fails only after
+  `IssueSession` has already created the user (an orphaned user row and a 401 to
+  the client), and under non-strict `sql_mode` it truncates, so two subjects
+  sharing their first 255 bytes collapse onto one identity row. The argument is
+  strictly stronger here than for `issuer`, where the same cap already existed:
+  `issuer` is an operator-set constant, `subject` arrives from the upstream
+  response.
+- **`IDTokenClaims` JSON shape** preserved as `IdentityClaims = IDTokenClaims`
+  alias; snapshot compatibility tested via `TestDecodeClaimsSnapshot_PreUpgradeSnapshotStillDecodes`.
+- **Config validation in `system_settings.go` — now shared, not mirrored.**
+  `DM_OIDC_PROVIDER_ISSUER` remains mandatory and doubles as the OAuth2 identity
+  namespace; new fields are optional or new-kind-only.
+
+  This line originally said the file was "not touched", which stopped being true:
+  `isOIDCFullyConfigured` now delegates the provider-kind refusals to
+  `pkg/oidcboot`. That change is the fix for a login-lockout path and is described
+  under the round-2 findings — but leaving the load-bearing list claiming the file
+  was untouched would tell the next reader the mirror is still hand-maintained.
+- **Logout scope**: `InvalidateCurrentToken` invalidates the *current* token
+  (not all tokens for the UID); `QuitUserDevice` is scoped by `DeviceFlag` read
+  from the Redis-cached payload (the raw UUID token is not decodable);
+  `RevokeRefreshByUID` remains all-sessions (refresh tokens outlive devices).
+- **Upstream logout URL** for plain-OAuth2 is constructed by `oauth2Provider.LogoutURL`
+  with `appId` whitelisted (`[A-Za-z0-9_-]+`, no `.`/`..`) before `path.Join` so
+  path traversal is impossible; redirect target pinned to configured
+  `PostLogoutRedirectURI`. Upstream HTTP client rejects redirects
+  (`CheckRedirect: ErrUseLastResponse`) to prevent SSRF and credential replay
+  to a 3rd party.
+- **SLO redirect remains a top-level browser navigation**, not a server-side
+  proxy; backend returns the URL, frontend navigates.
+- **autolink admission** fail-closed: the bearer JWT has no Email/Phone/Verified
+  fields so autolink never fires on that path; OAuth2 provider does not set
+  Verified flags (vendor envelope does not carry them). No boot-time guard
+  against misconfigured `AutoLinkByEmail + RequireEmailVerified=false` yet;
+  tracked in Pending.
+- `pkg/accesslog` scrubbing extends the shared pattern to `code`/`state`/
+  `access_token`/`refresh_token`/`id_token`/`client_secret`; the panic-dump sink
+  uses the same regex (drift between the two sinks caused past incidents).
+- `state` handling remains mandatory on our side (32-byte random + single-use
+  Redis consume) even though the IdP treats it as optional; `AuthCodeURL`
+  rejects empty State.
+- **Inbound credential header contract** satisfied by the new Bearer shim:
+  `token` header wins when present; `Authorization` header left untouched;
+  query parameter not accepted; scheme is case-insensitive; token/credentials
+  validated before backfill so an empty/malformed Bearer cannot turn "token
+  missing" into "token invalid".
+- `error-response` / `i18n` — user-facing failures use `httperr.ResponseErrorL`
+  / `ResponseErrorLWithStatus` with registered `pkg/errcode` codes. Protocol
+  endpoints (authorize/callback/logout) and the two 500 "provider/secret not
+  initialized" returns on exchange endpoints are exempt in the lint baseline
+  (raw browser-redirect semantics / operational 500s).
+- **observability**: upstream `requestId` from the plain-OAuth2 envelope is
+  logged alongside our `trace_id` on identity failure; both exchange endpoints
+  have separate metrics/audit events with a fixed label set (no cardinality
+  blow-up); bearer-JWT failures log the domainAccount for audit-trail correlation
+  but never the raw token.
+
+## Out of scope
+
+- **Directory / headcount synchronisation** (vendor data-service APIs, org tree,
+  per-person field mapping, joiner/leaver feeds). No new tables, no sync worker.
+- The vendor's other three SSO protocols (JWT plugin, a vendor-proprietary ticket protocol,
+  SAML RSA-SHA1).
+- Two pre-existing defects noted while scoping: dead `InsertRefresh` caller
+  chain (SyncWorker idling) and space search ignoring `u.status`/`u.is_destroy`.
+- Auto-joining SSO users into a Space (decision 2).
+- The `shortno` allocation pool bulk-provisioning path.
+- PKCE / nonce for the plain-OAuth2 kind: the upstream protocol has no place
+  to carry them.
+
+## Acceptance
+
+### Provider abstraction & plain-OAuth2 path
+
+- A **conformance test suite** (`TestAuthProviderConformance`) runs the same
+  contract table against both AuthProvider implementations and asserts the three
+  invariants: non-empty `Issuer` and `Subject`, protocol validation completed
+  inside `Identity()`, no credential-bearing URL in any returned error.
+- Empty `subject` from `/userinfo` → login rejected, **no** `user_oidc_identity`
+  row written (asserted at the provider layer; DB-layer assertion via existing
+  unique-key tests).
+- Envelope `{"success": false}` served with HTTP 200 → login rejected.
+- **Credential-leak guard**: driving the provider against an unroutable address
+  produces an error whose `.Error()` contains neither `client_secret=` nor
+  `access_token=`, including when the error is wrapped with `%w`.
+- `pkg/accesslog` scrubs OAuth2 credentials on both the access-log and
+  panic-dump sinks.
+- Legacy compatibility: a JSON claims snapshot produced before this change still
+  decodes via `decodeClaimsSnapshot` (`TestDecodeClaimsSnapshot_PreUpgradeSnapshotStillDecodes`).
+- Logout scoped to the calling device: `deviceFlagFromRequest` reads the flag from
+  the Redis-cached token payload (not the raw UUID) **before**
+  `InvalidateCurrentToken` deletes that payload, and returns `(flag, known)`.
+  `killer.KickDevice` runs when the flag is known, `killer.Kick` (all devices)
+  when it is not.
+
+  This line used to describe a zero-as-sentinel design, which the implementation
+  deliberately rejected: `config.APP` **is** 0, so a zero sentinel makes every APP
+  logout disconnect all of the user's devices. The sentence is corrected here so a
+  future reader does not "restore" the sentinel from the spec.
+
+  Two corrections to an earlier version of this line. It claimed the behaviour
+  was tested against the real `CacheTokenParser` path; no test went near that
+  path, and the test double did not model the production store at all — it never
+  deleted the record it was asked to invalidate, so it passed against behaviour
+  production cannot produce. And the behaviour itself did not hold: the device
+  flag was read *after* `InvalidateCurrentToken` had already removed the record
+  it is read from, so every production logout fell through to kicking all
+  devices. Both are fixed; the double now deletes on invalidate and returns
+  pkg/auth's miss semantics (`TTL:-2`, nil error).
+- Logout returns a non-empty upstream logout URL for the plain-OAuth2 provider
+  with the app id in the path segment and the operator-pinned redirect target
+  as the query parameter — and the URL contains no credential so it is safe to
+  log (`TestBuildUpstreamLogoutURL_CarriesNoCredential`).
+- The Bearer shim is verified for: `token`-header precedence (including
+  conflicting values), case-insensitive scheme, rejection of non-Bearer
+  schemes, rejection of a scheme with no credential (must not backfill empty
+  header), refusal of query-parameter fallback, preservation of the
+  `Authorization` header, and transparency to downstream status/body.
+- `modules/oidc` existing suites pass unchanged, in particular the 12 cases in
+  `config_test.go`.
+- `make i18n-extract-check` and `make i18n-lint` pass; new handler files
+  covered by lint baseline exemptions for 500 operational errors only.
+- **No behaviour change for the standard-OIDC kind**: `TestOIDCProvider_PreservesSecurityChecks`
+  explicitly verifies id_token signature verification, nonce surfaced to the
+  handler, `/userinfo` sub cross-check against id_token sub, and RP-Initiated
+  Logout URL carrying `id_token_hint`.
+- The plain-OAuth2 callback path is exercised end to end against a mock
+  `httptest.Server` (`mockOAuth2Provider`).
+- HTTP client for the plain-OAuth2 provider disables redirect following
+  (`CheckRedirect → ErrUseLastResponse`) and caps response body at 1 MiB.
+
+### Bearer-JWT exchange (`/exchange-jwt`)
+
+- HS256 JWT verification:
+  - Alg pinned to `HS256` (case-sensitive); `none`, `RS256`, and other algs
+    rejected.
+  - Base64 decoded in `RawURLEncoding.Strict()` mode to reject non-canonical
+    encodings.
+  - Signature compared with `hmac.Equal` (constant time).
+  - `exp` mandatory, must be a JSON integer, must be strictly greater than
+    `now` (zero-width boundary); `now==exp` is expired.
+  - Empty secret rejected at the parser entry (defence against missing config).
+  - `userId` required and > 0; subject is `strconv.FormatInt(userId, 10)` under
+    the bearer-JWT-specific issuer namespace.
+  - Email/Phone/Verified fields all zero (fail-closed for autolink).
+- Endpoint mounted under the same public group as `/exchange`, behind a shared
+  `StrictIPRateLimitMiddleware` (2 rps / 10 burst, constants — matching how
+  `modules/user` sets login/register/sms; an endpoint-level security threshold
+  should change through code review, not through a deploy-time knob). Both
+  endpoints cap the request body at 16 KiB.
+- Both `/exchange` and `/exchange-jwt` fail closed when `o.provider == nil` or
+  `o.service == nil` (500, no panic path).
+- Audit events + metrics for the JWT path are separate from the OAuth2 path
+  (`EventBearerExchangeOK` / `EventBearerExchangeFail`, `metricExchangeJWT*`).
+- Real credentials and real user PII are **not** committed to the repository;
+  all test tokens and secrets are synthetic values generated in-test.
+
+## Behaviour that changes for an existing `kind=oidc` deployment
+
+Enumerated by diffing every pre-existing production file against the real baseline
+(`origin/main` = `508d3c90`, not the stale local `main` ref). Three items were live on the
+existing authentication path and were **not** in the change inventory the merge decision
+reads. None is a defect; all three needed stating.
+
+**1. Phone parsing changes who owns which account.** `extractZone`/`extractPhone` — the
+functions the browser callback calls — now delegate to `normalizePhone`. `AutoLinkByPhone`
+defaults true, so with a verified phone claim this decides between "link into the existing
+local account" and "create a second account", and that write is irreversible.
+
+- *Looser*: `8613…`, `008613…` and separator-laden forms now yield a phone where they
+  previously yielded `""`. An IdP that returns verified numbers without a leading `+` will
+  now **link** on first SSO login where it previously created a new account.
+- *Stricter*: `+86` followed by a non-mobile body (a landline such as `+862112345678`)
+  now yields `""` where it previously yielded `2112345678`, so a link that used to happen
+  no longer does.
+
+Kept rather than gated: linking on a verified phone is precisely what `AutoLinkByPhone`
+means, and the widened parsing is closer to that intent than the old prefix test. Pinned by
+`phone_autolink_behaviour_test.go`, which drives each upstream form through `ResolveOrLink`
+and asserts the link/no-link outcome — previously only the parser was unit-tested, so this
+change was invisible to the suite.
+
+**2. The login lookup is byte-exact, which is stricter than before.**
+`QueryIdentityExact` returns "not linked" when the stored row differs from the queried
+`(issuer, subject)` in case only. Required — the table collates case-insensitively, so
+without it an uppercase subject resolves onto a lowercase account. The consequence, corrected — the
+first version of this paragraph got the outcome wrong. Such users do **not** receive a new
+account plus a new identity row: the identity insert is blocked by the case-insensitive
+unique key. What happened instead was worse in one way and better in another — the folded
+row was reported as "no row", `ResolveOrLink` returned `IsNew=true`, the caller created a
+user **and a session**, and only then did the insert hit 1062 and the login fail. So every
+attempt left an orphan user row and failed, repeatably, with only the global IP floor in
+front of it.
+
+That is now fixed at the source: `QueryIdentityExact` reports a folded collision as a
+distinct error, so `ResolveOrLink` refuses before anything is created. On the integration
+authenticator the collision answers "not linked" rather than 500 (it is not an internal
+failure) and logs its own line, so it is no longer indistinguishable from a genuinely
+unbound user. A collision is also pinned as *not* eligible for self-service bind, whose
+`/bind/create` exit would otherwise turn "refuse to merge two people" into "give one person
+a second account".
+
+**3. The access-log scrub is wider, and it is service-wide.** The redaction pattern gained
+`client_secret`, `refresh_token`, `access_token`, `id_token`, `code` and `state`. The last
+two are generic parameter names, so this is not an OIDC-scoped change: `modules/group`
+uses `?code=` for invite codes, and those are now redacted everywhere. The direction is
+fail-safe (over-redaction) and arguably desirable for invite codes too, but it reduces
+debuggability outside this feature and belongs in the inventory rather than in a diff.
+
+## Pending / follow-up (not blocking this PR)
+
+### callback ↔ completeExchange parity — recorded, not fixed
+
+Asked for over three rounds as "fix or record as intentional". Recording it, with the
+reason it is not being fixed here.
+
+- **A session minted through `/exchange` never caches its `id_token`**, so it can never
+  perform RP-Initiated Logout. `completeExchange` does not call `saveIDToken`; the callback
+  path does. This is the same class of silently-lost security control this PR already
+  regressed once by dropping the store wiring — reached by a different route. Not fixed
+  here because the exchange endpoints are now opt-in and default off, so no existing
+  deployment is affected, and the deployment this PR targets is `kind=oauth2`, where
+  RP-logout uses the vendor SLO URL and needs no `id_token`. It becomes real the day a
+  `kind=oidc` deployment turns `/exchange` on.
+- **`user_verification` is never upserted for exchange-only users.** The callback path
+  calls `UpsertVerificationFromOIDC` when the claims carry verified real-name fields;
+  `completeExchange` does not. So realname state stays stale for a user who only ever signs
+  in through `/exchange`. Same reachability argument as above.
+
+Both are one call each in `exchange_complete.go`. They are left out because adding them
+means the exchange tail starts writing to two more tables, and that deserves its own change
+with its own tests rather than being appended to a review-fix commit.
+
+### Deliberately not fixed, with the reasoning
+
+- **`OwnCredentialDetector.Classify` fail-open early returns** (nil detector, nil reader)
+  contradict the file's own "undecidable must be an error" contract. Unreachable today:
+  `New()` always supplies a real `*config.Context` and `auth.SessionStoreForContext` panics
+  rather than returning nil. Left as is because the honest fix is to make the constructor
+  return an error, which changes its signature and every call site for a state that cannot
+  occur.
+- **`looksLikeJWT` uses `RawURLEncoding.Strict()`**, so a client emitting standard-alphabet
+  base64 falls through the shape guard *and* through `VerifyHS256JWT`, which uses the same
+  decoder. Not a conforming JWT, so not a realistic arrival; noted because the guard's
+  conservative direction is documented as "a miss falls back to the previous behaviour" and
+  this is the concrete instance.
+- **`/exchange-jwt` has no one-shot redemption** despite being specified as a one-shot
+  exchange. The 10-minute `iat` ceiling is the documented mitigation. Consuming a digest of
+  the token in Redis would close the replay window, but it puts a Redis round trip and a new
+  failure mode on an authentication path, which is a design change rather than a fix.
+
+### Vendor facts this branch depends on and has never observed
+
+`OpaqueClientCredential` (G12's gate) and `SubjectMayBeReusedPersonnelID` (G5's gate) both
+rest on properties of the upstream that no captured response has confirmed: that the
+`access_token` is an opaque UUID, and that `sub` is a reused personnel identifier. The
+guards fail safe if either is wrong — a JWT-shaped token would be refused rather than
+forwarded, and a short numeric subject would be refused rather than stored — but both
+belong on the human-verify list, alongside the unmeasured `/userinfo` subject shape and the
+five `OCTO_OIDC_LIVE_TEST=1` tests that have never run.
+
+
+- **Session TTL ceiling for SSO users** — tightening `Cache.TokenExpire` (default
+  30d) for SSO-issued sessions; depends on ops confirming the upstream
+  offboarding latency. Currently tracked in code review as a P1 config change
+  after this PR.
+<!-- The autolink boot-time guard was listed here as pending after it had already
+     been implemented. It now lives in `pkg/oidcboot.ValidateKind` (refusing
+     `AutoLinkByEmail && !RequireEmailVerified` under `kind=oauth2`) and is pinned
+     by `RefusedScenarios`, which both consumers' tests run. What remains is only
+     the generalisation below. -->
+- **`ProviderCapabilities.VerifiedClaims`** — the autolink boot guard is currently
+  expressed per kind (`kind=oauth2` cannot produce verified claims). A capability
+  bit would let a third provider declare the same fact instead of the rule naming
+  a kind; small follow-up, no behaviour change.
+- **Bearer-JWT audience/purpose claim** — the JWT currently has no `aud` or
+  `purpose` field, so cross-purpose token reuse is only mitigated by
+  operational key isolation (single-purpose secret). Adding a required `aud`
+  once the client backend issues one is a coordinated change with the upstream team.
+- **stateTTL configurability** — currently a constant (5 min); enterprise
+  login + 2FA may need a longer window.
+- **Production bearer-JWT secret and per-environment appId** for SLO — supplied
+  by ops via env at deploy time; code changes are not required.
+
+## Changes applied since initial implementation (review fixes)
+
+- **CRITICAL** `deviceFlagFromToken` previously called `auth.Decode` directly on
+  the raw UUID token, which always failed (Decode expects the cached JSON
+  payload, not the token itself) — "logout current device" was silently kicking
+  *all* devices. Fixed to read the cached payload via
+  `auth.TokenRecordReader` (the `InvalidateCurrentToken` path already does
+  this correctly); renamed to `deviceFlagFromRequest(ctx, token)`.
+- **CRITICAL** `exchangeJWT` missed the `o.provider == nil`/`o.service == nil`
+  guard and could nil-panic when provider construction failed at boot but the bearer-JWT
+  secret was configured; added to match `/exchange`.
+- **HIGH** Both exchange endpoints now mount `StrictIPRateLimitMiddleware`
+  (2 rps / 10 burst). The global 500 rps bucket is too wide for
+  login-equivalent endpoints that trigger outbound HTTP and DB writes.
+- **HIGH** Plain-OAuth2 HTTP client now sets `CheckRedirect: ErrUseLastResponse`
+  to prevent SSRF / credential replay on 3xx responses.
+- **MEDIUM** Exchange endpoints cap request body at 16 KiB via
+  `http.MaxBytesReader`.
+- **MEDIUM** `VerifyHS256JWT` rejects empty secret at entry; base64 decoding
+  uses `Strict()` to reject non-canonical encodings.
+- **MEDIUM** The duplicated post-verification tail between `/exchange` and
+  `/exchange-jwt` was extracted into a single helper `completeVerifiedExchange`;
+  previously ~65 lines of safety-critical logic (race recovery on
+  `uk_issuer_subject`, identity insert, audit write, response) were copied
+  verbatim across both handlers.
+- **MEDIUM** Real credentials/PII (test-environment bearer-JWT secret, real
+  user `userId`/`domainAccount` from a captured login session) were removed
+  from tests and replaced with synthetic values; tests now sign tokens inline
+  using `crypto/hmac`.
+- **LOW** Comment corrections for `o.client` (only used by SyncWorker, not by
+  authorize/callback/logout as the old comment claimed), for the JWTSigning
+  trust anchor (OAuth2 path relies on TLS, not signatures), and for the
+  accesslog regex (word boundary, not alternation order, prevents accidental
+  matches on `auth_code=`).
+
+### Follow-up pass (post-rename)
+
+- **HIGH** `/exchange-jwt` called `VerifyHS256JWT` directly and re-implemented
+  the `userId > 0` constraint inline, leaving `verifyBearerJWT` (and the ~10
+  test cases in `bearer_jwt_test.go` that exercise it) as dead code that did
+  not guard the production path. The handler now calls `verifyBearerJWT`, so
+  the constraint exists in exactly one place and the existing tests cover the
+  real path. Failure reason stays in the log via the returned error; the client
+  still gets a single generic 401 code (anti-enumeration).
+- **HIGH** The de-identification rename of the vendor/client keywords was done
+  as a literal string substitution, which produced an identifier containing a
+  hyphen in `bearer_jwt_test.go`. The whole `modules/oidc` test binary failed
+  to compile as a result (`go build ./...` still passed because it does not
+  compile `_test.go` files, so the break was invisible to a build-only check).
+  Fixed, and the substitution fallout was swept: mangled identifiers, stale
+  file/function names in comments, CJK/Latin words run together, and four files
+  left unformatted because the alignment blocks were not re-flowed.
+- **MEDIUM** Newly introduced environment variables were standardised on the
+  `OCTO_` prefix (`OCTO_OIDC_PROVIDER_KIND`, `OCTO_OIDC_PROVIDER_BASE_URL`,
+  `OCTO_OIDC_PROVIDER_APP_ID`). Pre-existing `DM_OIDC_*` variables are left
+  untouched — renaming those would break deployed configmaps.
+- **MEDIUM** The new-variable count was cut from 8 to 5 by removing knobs that
+  did not need to exist: the two exchange rate-limit parameters became constants
+  (`modules/user` treats the equivalent login/register/sms thresholds the same
+  way), and the bearer-JWT environment selector was dropped in favour of
+  deriving the issuer namespace from the upstream issuer. The five that remain
+  each carry information the process cannot obtain otherwise: which provider
+  implementation to construct, the upstream site root (optional, falls back to
+  the issuer), the logout app id, the shared HS256 secret, and the plaintext-
+  upstream escape hatch for a pre-production host that is documented as `http`.
+- **MEDIUM** Two de-identification leaks that survived the first pass: a
+  vendor-proprietary protocol name in the out-of-scope list, a vendor-derived
+  issuer literal in a test fixture, and a local credential filename in a test
+  comment. All replaced with neutral values.
+- **MEDIUM** New environment-variable surface trimmed from 8 to 5. The two
+  rate-limit knobs became constants, and the bearer-JWT environment marker was
+  dropped in favour of deriving the issuer namespace from the upstream issuer.
+  Every variable removed is one fewer way to misconfigure a value that cannot
+  be changed after go-live.
+- **MEDIUM** Phone normalisation now accepts the bare-number form the vendor's
+  own userinfo example uses, plus the `+86` / `0086` / `86` prefix spellings and
+  embedded separators, mapping all of them to `zone=0086`. Previously only `+86`
+  was recognised, so the documented example itself would have been dropped.
+  Deliberately still *not* guessing: an E.164 country code cannot be split off
+  by syntax alone (they are 1-3 digits), and guessing wrong stores a different
+  person's number — a failure that is invisible in the row it writes. Anything
+  ambiguous returns an empty pair and the caller treats the user as having no
+  phone. `extractZone`/`extractPhone` keep their signatures and their
+  all-or-nothing invariant, which `checkClaimsForCreate` and `UIDsByPhone` both
+  rely on. Overseas numbers are still not stored: only the 0086 SMS channel is
+  proven, and a number that cannot receive a code is worse than none — it makes
+  phone-based account recovery look available when it is not.
+- **MEDIUM** The "phone dropped" warning logged the subscriber's full number.
+  It now logs the masked tail plus the length: enough to classify the input,
+  not enough to identify the person. Log retention outlives the diagnostic need.
+
+### Pre-PR pass: acceptance gaps closed + subject shape guard
+
+- **Subject shape guard** (`modules/oidc/subject_shape.go`). `(issuer, subject)`
+  is the identity primary key and is immutable after go-live, yet the vendor
+  documentation contradicts itself about what `sub` contains: the userinfo field
+  table calls it a "sub-number" with an 18-digit example, while the quick-start
+  demo comment says it is the employee number — and the employee number already
+  has its own field (`username`, "employee number preferred"), alongside a
+  separate `user_id`. The evidence favours an internal long id, but a wrong guess
+  is unrecoverable: employee numbers are reused between leavers and joiners, so a
+  new hire would match the former employee's identity row and log straight into
+  their account.
+
+  The guard therefore converts an irreversible data problem into a recoverable
+  failure: a purely numeric subject shorter than 10 digits is refused at the
+  trust boundary, before any row is written. It is deliberately narrow — 18- and
+  20-digit ids pass, anything containing a non-digit passes (it cannot be an
+  employee number), only the short-numeric shape is refused. The error carries
+  the length, never the subject value. No environment variable: this is a
+  security floor, so relaxing it should leave a code-review trace rather than
+  become a deploy-time knob.
+
+  This also removes "capture a real userinfo response first" as a launch
+  blocker: if `sub` really is an employee number, the first login fails loudly
+  with zero rows written, which is exactly the signal we wanted from that
+  capture.
+
+- **Logout device scoping now has tests** (acceptance item: two devices, only
+  the current one is kicked). Required a small refactor first: `logout` reached
+  straight into `o.ctx.QuitUserDevice`, bypassing the existing `sessionKiller`
+  abstraction, so the blast radius of a logout had no injection point. `Kick`
+  (all devices) and `KickDevice` (one device) are now both on that interface, and
+  the tests assert the two are mutually exclusive — including the negative
+  direction, which is the one that regressed before.
+
+  The tests also pinned down a **behavioural boundary worth recording**:
+  `device_flag` only exists in v3 session payloads. The v2 encoder serialises
+  only `uid` and `name`, so on a v2 session the flag can never be resolved and
+  logout degrades to kicking every device. "Logout affects only the current
+  device" is therefore a v3-only property. The degradation direction is safe
+  (over-kicking beats a no-op) and is asserted rather than fixed — extending the
+  v2 payload belongs to session encoding, not to this module.
+
+- **Empty subject is now asserted against the real database** (acceptance item).
+  The provider-level test only proved the parser returns an error; it could not
+  prove the handler does not write a row before returning it. `subject` is
+  `NOT NULL DEFAULT ''` under `UNIQUE(issuer, subject)`, so an empty-subject row
+  is a perfectly legal row — and the second subject-less login would resolve onto
+  the first one's uid. That is account takeover, not dirty data, so the assertion
+  has to look at the table.
+
+- **Plain-OAuth2 callback is now driven end to end** (acceptance item). The
+  handler chain — state issue and single-use consumption, Exchange/Identity order,
+  ResolveOrLink → IssueSession → ThirdAuthcode, the 302 back to `return_to` —
+  had only ever been exercised under `KindOIDC`. Coverage now includes the
+  existing-user and new-user paths, state replay rejection, and an upstream token
+  failure writing nothing. The authorize URL is also asserted to carry *no*
+  `nonce` / `code_challenge` (this upstream rejects unknown parameters) and
+  `scope=read`.
+
+### Review round 2 — six blocking defects and four spec deviations
+
+An external review at head `dce3b6e0` found six P1 defects and four places where
+this brief or the PR body asserted properties the code did not have. Every finding
+was re-derived from the source before being acted on; all ten held.
+
+- **P1-1 / P1-2 — per-device logout never worked in production, twice over.**
+  The device flag was read *after* `InvalidateCurrentToken`, which deletes the very
+  record it is read from, so the lookup always missed. And `0` was used as the
+  "unresolved" sentinel while `config.APP` *is* 0, so even with the ordering fixed
+  every APP logout would still have kicked every device. Resolution now happens
+  before invalidation and returns `(flag, known)`.
+
+  The reason the first round's tests did not catch this is the more useful finding:
+  the test double recorded the invalidate call without deleting anything, and
+  returned an error on a cache miss where pkg/auth returns `TTL:-2` with a nil
+  error. It passed against behaviour production cannot produce. The double now
+  models both, and reverting the fix makes four cases fail.
+
+- **P1-3 — both exchange endpoints handed back the wrong session.** After a
+  first-login race they checked `recovered != nil` and then kept using the ghost's
+  session, so the client received a token for an account with no identity row and
+  the audit recorded success against it. The callback path had always been correct.
+
+- **P1-4 — the bearer-JWT trust anchor was under-constrained.** Any non-empty
+  secret was accepted, where the same module already requires the refresh-token key
+  to be exactly 32 bytes and refuses boot otherwise; a short HMAC key can be
+  recovered offline from one valid token. And `exp` was the only freshness control,
+  so a captured assertion could mint sessions for its whole ~15-day life, including
+  after logout. Now: a 32-byte floor, a mandatory `iat`, a 10-minute ceiling from
+  `iat`, and 60s of clock skew. Audience binding remains Pending — it needs the
+  upstream to emit a claim.
+
+- **P1-5 — `RequireEmailVerified=false` was an account-takeover primitive under
+  the plain-OAuth2 kind.** That provider structurally cannot assert verification,
+  so the flag turns an unverified upstream address into a permanent binding to
+  whichever existing account holds it. Refused at boot for that kind.
+
+- **P1-6 — a typo in the provider kind could lock every user out.** The five new
+  fatal `LoadConfig` conditions were never mirrored into
+  `modules/common.isOIDCFullyConfigured`, so a bad kind produced 404 on every OIDC
+  endpoint while `login.local_off` was still honoured — an SSO-only deployment with
+  no working login and no recovery short of a redeploy. The warning about exactly
+  this drift was already in the code, written by the same hand that then drifted it.
+
+  Fixed by removing the mirror rather than updating it: the refusal rules now live
+  in `pkg/oidcboot`, a leaf package both sides import, and `oidcboot.RefusedScenarios`
+  pins both sides' tests to one table. Removing the delegation makes all nine
+  scenarios fail on the `modules/common` side, which is how we know the drift was
+  live.
+
+- **P2-3 — the bare-number phone inference stored strangers' numbers.** NANP
+  numbers are `1` + a three-digit area code whose first digit is 2-9, so roughly
+  seven eighths of them are byte-identical to a valid mainland mobile:
+  `13861234567` is both +1 386-123-4567 and a real 138-prefix number. The
+  inference was added on the strength of a documented example that is not itself a
+  valid mainland number, so it never had evidence behind it. Reverted to requiring
+  an explicit country code.
+
+- **P2-2 — `(issuer, subject)` was compared case-insensitively.** The table is
+  `utf8mb4_general_ci`, so two subjects differing only in case fold onto one
+  identity row. Rather than rebuild a unique index on a live table or defeat the
+  index with an inline `COLLATE`, the adapter now re-checks the returned row
+  byte-for-byte and treats a folded hit as absent — which degrades to a loud
+  refusal instead of a silent merge.
+
+- **P2-5 / P2-6 — audit rows from the exchange paths were labelled
+  `EventCallbackFail`** (misdirecting the investigation those rows exist for), and
+  the endpoint rate limiter's Redis clients were never closed while every other
+  client in the module is. Both fixed.
+
+- **Spec deviations.** The brief claimed the de-duplication refactor had landed
+  (it had not, and P1-3 plus the missed phone masking were the duplicate-copy bugs
+  it was meant to prevent); claimed per-device logout was tested against the real
+  session-store path (no test went near it); called autolink fail-closed "by
+  construction" when it was by policy; and asserted `subject` is the internal
+  directory id while `subject_shape.go` treats that as unresolved. All four
+  corrected in place, each with the reason the original wording was wrong.
+
+### Review round 3 — the integration endpoints were never adapted
+
+`modules/integration` exposes two endpoints that authenticate a caller with an
+upstream credential and resolve it to an already-linked local user:
+
+- `GET  /v1/integrations/oidc/spaces`
+- `POST /v1/integrations/oidc/exchange` (mints a `uk_` API key)
+
+Both went through `oidcAuth()`, which called `oidcClient.VerifyIDToken()`
+unconditionally, and `Integration.New()` called `oidc.NewClient()` — i.e. ran
+Discovery — regardless of the configured provider kind. Since the plain-OAuth2
+upstream has no Discovery document and issues no `id_token`, switching to that
+kind left the client nil and **both endpoints answering 500**. Making a new kind
+selectable without adapting these two was an incomplete change, not a
+non-blocking gap.
+
+Two things were extracted rather than branched a second time:
+
+- **`oidc.NewAuthProvider`** (`provider_factory.go`) is now the single place that
+  turns a configuration into a provider. `modules/oidc.New` and
+  `modules/integration.New` both call it. Copying the `switch` into the second
+  caller is exactly what produced the login-lockout drift in round 2, so the
+  dispatch stays in one place by construction.
+
+- **`AuthProvider.IdentityFromClientCredential`** interprets a credential the
+  *client* presents, as opposed to one we obtained through a code exchange. The
+  distinction is protocol-level and belongs to the provider: under standard OIDC
+  the client's verifiable credential is an `id_token`; under plain OAuth2 it is an
+  opaque `access_token` that can only be resolved by asking `/userinfo`.
+
+  Putting the choice behind the interface is what keeps the callers from
+  guessing — and **guessing by token shape is not acceptable**: an opaque access
+  token may happen to be JWT-shaped, and a shape sniffer would then feed an
+  unverified payload into a local verification path. A test drives a JWT-shaped
+  string at the plain-OAuth2 endpoint specifically to pin that it is refused.
+
+This also closed a defect the round-2 review had raised as non-blocking: `/exchange`
+hard-coded `&TokenSet{AccessToken: ...}`, which `oidcProvider.Identity` always
+rejects, so under the standard kind every existing deployment had gained an
+unauthenticated endpoint that could only ever answer 401. It now routes through
+the same method and is meaningful under both kinds.
+
+**All three credential types are accepted on these two endpoints**, on the same
+`Authorization: Bearer` header, with no new client contract.
+
+An earlier version of this section claimed the third type needed a
+client-visible signal — a separate path or a declared credential type — because
+two types on one header could not be told apart without sniffing the shape. That
+framing was wrong: **the disambiguation is cryptographic, not syntactic.** A
+business JWT either carries a valid HMAC under a secret only we and the client's
+backend hold, or it does not; that is a decisive test rather than a heuristic.
+
+Neither direction misfires. An opaque upstream token cannot produce a valid
+signature under our secret without the secret. An upstream `id_token` is RS256,
+and `VerifyHS256JWT` pins `alg` to HS256 and refuses RS256, so the classic
+algorithm-confusion path is closed.
+
+Order matters and is asserted: local verification runs first because it makes no
+outbound call and has no side effects. Reversing it would make every desktop
+request spend a pointless round trip on `/userinfo` before falling through.
+
+Both failures return one generic error, so a caller cannot learn from the
+response which credential type was wrong. The identity resolves into the
+namespace belonging to whichever verifier succeeded, which is what keeps a
+desktop principal and an upstream principal with the same subject string from
+collapsing onto one account — a test pins exactly that case.
+
+With no secret configured the behaviour is byte-for-byte the previous one: only
+the upstream credential is accepted.
+
+### Review round 5 — three blocking defects, one of them a regression from this PR
+
+Two independent reviews on head `63e18c4a` converged on the same set. All were
+re-derived from the source before acting; all held.
+
+- **A dropped initialisation broke single logout, and it was mine.** Extracting
+  provider construction into `NewAuthProvider` (`ff959aa7`) deleted the neighbouring
+  block that wired the RP-Initiated Logout id_token cache. `newRedisIDTokenStore`
+  was left with zero production callers, so the field stayed nil: login stopped
+  caching the id_token, logout never had an `id_token_hint`, and `LogoutURL`
+  returned no URL on exactly that condition. Users who logged out of DMWork stayed
+  signed in at the IdP — on a shared browser the next person is one click from the
+  account. That is a security control, and it contradicted this PR's own claim that
+  standard-OIDC deployments were unaffected.
+
+  The suite stayed green because all ten affected tests assign the store by hand.
+  A double can be perfectly faithful and still prove nothing about assembly — the
+  mirror image of the learning this PR added one commit earlier. Restored, with
+  tests that build the module through `New()` and assert the wiring exists,
+  including one that fails if the constructor becomes unreachable again.
+
+- **The byte-exact `(issuer, subject)` recheck guarded one of its two consumers.**
+  `modules/integration` called the raw query, and the table is
+  `utf8mb4_general_ci`, so a subject differing only in case matched another user's
+  row — on an *authentication* path that resolves the uid, lists their spaces and
+  mints an API key against their account. Reproduced in a test before fixing.
+
+  Fixed structurally rather than by adding a second call site: the raw query is now
+  unexported and `DB.QueryIdentityExact` is the only entry from outside the package,
+  so a future third consumer is stopped at compile time rather than by a reviewer
+  remembering. This matters because `checkSubjectShape` deliberately admits
+  letter-bearing subjects — the real format is still unverified, which is exactly
+  what the recheck exists for.
+
+- **Our own rejected tokens were forwarded to the third-party IdP.** The credential
+  fall-through was unconditional, so a business JWT carrying a valid HMAC that
+  failed only on freshness went upstream — and this IdP takes credentials in the
+  URL query, so both the payload's PII and a signature valid under our shared
+  secret landed in the vendor's access logs. The split is now explicit
+  (`oidc.IsForeignToken`): only malformed / bad-alg / bad-signature falls through,
+  because only those fail *before or at* signature verification and therefore
+  cannot be attributed to our key. Anything failing after it is ours, and is
+  refused locally. Keeping that classification in `modules/oidc` rather than
+  restating the sentinel list at each call site means a future claims constraint is
+  categorised correctly by default.
+
+- **One freshness policy was serving two incompatible purposes.** The ten-minute
+  ceiling from `iat` is justified by one-shot redemption, but it was also applied to
+  a standing per-request authenticator — and the desktop client stores one JWT and
+  reuses it for the credential's whole ~15-day life. So the integration endpoints
+  would have worked for ten minutes after login and then returned an
+  indistinguishable 401 forever. My own test had pinned that behaviour as correct.
+
+  `VerifyForRedemption` keeps the ceiling; `VerifyForAuthentication` honours the
+  token's own `exp`. The remaining replay window on the authenticator equals `exp`,
+  which is the already-recorded consequence of the upstream JWT having no `aud` or
+  `jti` — not something a ceiling that breaks the feature would have fixed.
+
+- **The subject upper bound the brief already claimed.** Only the lower bound
+  existed, so a 300-byte subject reached an INSERT against `VARCHAR(255)`: under
+  strict `sql_mode` it fails after the user row is already created, and under
+  non-strict it truncates so two subjects sharing a prefix collapse onto one
+  identity. Now capped at the column width, with `subjectMaxLen == issuerMaxLen`
+  pinned by a test.
+
+- **The app-id pattern existed twice, with different rules.** Boot accepted
+  `_tenant` and 65-character values that the provider then refused at runtime,
+  where `LogoutURL` swallows the error and logout degrades silently to local-only —
+  the same failure the boot-time refusal was added to prevent, reached by another
+  route. One definition now, in `pkg/oidcboot`.
+
+### Round 6 — two doors the previous round's headline fix did not enumerate
+
+A reviewer's process note is the reason this round also produced
+[`guard-matrix.md`](./guard-matrix.md): three consecutive rounds found the *same
+class* of defect through a route the previous fix had not listed. I had dismissed
+the request to write that matrix down as ceremony, on the reasoning that it
+"produces the same fix list without changing a line of code". That reasoning was
+wrong — it evaluated the matrix against the findings already in hand, whereas its
+value is in the cells nobody has looked at. Both of this round's blockers sat in
+columns the reviewer had named ("at which stage" and "what happens when the
+component implementing the guard failed to construct"). Filling the table in also
+turned up one cell that had been stated imprecisely (freshness on `/exchange` is
+credential-dependent: under `kind=oauth2` there is no expiry we can inspect) and
+confirmed one suspected gap was not real (`/exchange-jwt` does carry the IP
+limiter, shared with `/exchange`).
+
+Both blocking findings were the **same defect as round 5**, reached by routes the
+fix had not listed. Two reviewers found both independently.
+
+- **`IsForeignToken` classified by error identity, and the identity spans the
+  signature boundary.** The comment I wrote asserted that `ErrJWTMalformed` /
+  `ErrJWTBadAlg` / `ErrJWTInvalidSig` "all fail at or before signature
+  verification". That is false for `ErrJWTMalformed`: `VerifyHS256JWT` also returns
+  it *after* `hmac.Equal` succeeds — payload not JSON, `exp` not an integer, payload
+  not decodable into the claims struct. So a token carrying a **valid HMAC under our
+  own secret** was classified foreign and forwarded to the upstream `/userinfo`,
+  which takes credentials in the URL query. The trigger is not exotic: a backend
+  emitting `iat: Date.now()/1000` without a floor produces exactly that token, and
+  the client reuses it for the credential's whole life, so the leak is continuous.
+
+  Fixed by inverting the classification into an **allowlist**: only the pre-/at-
+  signature sites carry `ErrJWTForeign`, and `IsForeignToken` tests for that mark
+  alone. Any check added later — anywhere in `VerifyHS256JWT` — now defaults to
+  "ours", i.e. refuse locally rather than forward. Forgetting to mark fails closed.
+
+  Why the round-5 test table missed it: it enumerated "ours and rejected" as
+  expired / zero `userId` / far-future `iat` — all post-signature, none of them
+  `ErrJWTMalformed` — and the signing helper could only mint well-typed payloads,
+  so the failing class was not expressible with it. The new tests sign raw payload
+  bytes.
+
+- **`modules/integration` failed open when the verifier failed to construct.**
+  `NewBearerJWTVerifier` distinguishes `(nil, nil)` = "path intentionally off" from
+  `(nil, err)` = "an operator got it wrong". `modules/oidc` honours that with a 500;
+  `modules/integration` logged and continued with a nil verifier — directly under a
+  comment saying that must not happen. Because the whole classification sits behind
+  `if it.bearerJWT != nil`, a nil verifier sent **every** desktop JWT upstream in a
+  URL query, unconditionally. Trigger: a 31-byte secret — precisely the case where
+  leaking valid signature material matters most, since the 32-byte floor exists to
+  stop offline recovery.
+
+  Fixed by keeping the error on the struct (`bearerJWTErr`) and refusing **every**
+  credential on both endpoints while it is set. Refusing upstream credentials too is
+  deliberate: without a constructible verifier we cannot answer "is this ours?", so
+  any fall-through re-opens the leak, and routing by token shape is not a substitute.
+  An absent secret remains a legal deployment shape, pinned by its own test.
+
+- **The subject cap covered one of three identity paths.** The bound lived in the
+  plain-OAuth2 trust boundary only, so under `kind=oidc` a signed id_token with a
+  300-byte `sub` still reached `IssueSession` and the INSERT. A signature proves
+  provenance, not representability. Moved to `requireStorableIdentity` at the two
+  stateful entry points, which is protocol-neutral and covers the bearer path too;
+  `issuer` gained the same bound, additionally refused at provider construction so
+  an operator error surfaces at boot instead of at the first login.
+
+  **This is where I over-reached and the tests caught it.** My first version put the
+  *employee-number* heuristic in the shared funnel as well. That rule's argument
+  ("personnel systems reuse the number between a leaver and a joiner") only holds
+  for upstream-asserted subjects; the bearer path's subject is our own database
+  primary key, so `userId=42` is normal. Three `/exchange-jwt` tests went red. The
+  guard is now split by what each half is a property of — storage vs provenance —
+  and the provenance half is pinned by the conformance table for both providers.
+
+- **The id_token cache decision asserted on a concrete type.** `o.provider.(*oidcProvider)`
+  where `Capabilities().IDToken` exists for exactly that decision, against a rule the
+  interface states explicitly ("branch on Capabilities, never on Kind"). Any decorator
+  or a third id_token-capable provider would have silently lost RP-Initiated Logout —
+  the same silence as the regression restored in round 5. Not hypothetical: the
+  decorator design considered for the bounds guard this round would have tripped it.
+  `EndSessionEndpoint()` is now part of the interface, with the contract "IDToken=false
+  implies empty" pinned for both implementations.
+
+- **`AppIDPattern` was an exported mutable `var`.** Unifying the definition was right;
+  leaving the single copy reassignable by any importer was not. Now a function, with
+  the two shapes the unification actually changed (`_tenant`, 65 characters) added to
+  `RefusedScenarios`.
+
+Deferred, recorded rather than silently skipped:
+
+- The duplicated boolean env parsing between `oidcboot` and `modules/oidc` (can
+  reopen the lockout class, but needs a non-`ParseBool` value *and* a contradicting
+  legacy alias).
+- The access-log scrub being bypassable with percent-encoded parameter names (an
+  attacker only gets their own values logged).
+- The column bounds compare **bytes** while `utf8mb4 VARCHAR(255)` is 255
+  *characters*. Deliberately conservative: it refuses a legitimate 100-character CJK
+  subject loudly with zero rows written, rather than risk truncation. Switching to
+  `utf8.RuneCountInString` loosens a security guard to support a shape no IdP has
+  produced (subjects observed in the wild are ASCII — UUIDs, decimal ids, base64).
+  Revisit if a CJK subject ever appears.
+- `/exchange`'s `access_token` field carries an **id_token** under `kind=oidc`.
+  Renaming it breaks existing clients, so the file header and the struct field now
+  state the mismatch instead. Capability-gated mounting of the endpoint is still open.
+
+## Integration tests written (this PR)
+
+All tests pass under `go test -race ./modules/oidc/ ./pkg/wkhttp/ ./pkg/accesslog/`.
+
+### Provider / protocol layer (no DB required)
+
+- `TestBearerJWTIssuerFromUpstream_*` — 5 cases over the issuer derivation:
+  derived namespace differs from the upstream issuer, test and prod derive to
+  different values (the property that replaced the dropped environment knob),
+  empty upstream rejected, an already-derived value rejected rather than
+  double-suffixed, and the 255-byte column boundary accepted at exactly the
+  limit / rejected one byte over.
+
+- `TestAuthProviderConformance` — same contract table for both providers
+  (Kind/Issuer non-empty, AuthCodeURL rejects empty state, AuthCodeURL carries
+  state & no secret, Exchange returns TokenSet, Identity enforces non-empty
+  subject, LogoutURL produces https URL with no credential, etc.).
+- `TestOIDCProvider_PreservesSecurityChecks` — 4 sub-tests covering id_token
+  signature verification, missing id_token rejection, nonce hand-off to
+  handler, and `/userinfo` sub cross-check.
+- `TestParseUserInfoEnvelope` + variants — envelope success/code/requestId
+  parsing; `success=false`/missing `success` rejected; code accepted as
+  string or number; issuer not taken from body; error message does not echo
+  body contents.
+- `TestOAuth2Provider_ExchangeSendsParamsInQuery` — token endpoint shape
+  (POST, query parameters, `Content-Type: form-urlencoded`) asserted against
+  a mock server; verifies no `code_verifier`, proper percent-encoding.
+- `TestOAuth2Provider_ExchangeErrorDoesNotLeakSecret` /
+  `TestOAuth2Provider_IdentityErrorDoesNotLeakToken` — driving transport
+  failures against an unreachable address, verifying sanitized errors contain
+  no credential.
+- `TestOAuth2Provider_IdentityPutsTokenInQuery` — userinfo endpoint receives
+  `access_token` in the query string, not the Authorization header.
+- `TestOAuth2Provider_LogoutURL` — SLO URL shape, appId whitelist, redirect
+  parameter.
+- `TestBuildUpstreamLogoutURL` + `_CarriesNoCredential` — redirect target
+  pinned; no token/secret in URL; bad appId rejected.
+- `TestSanitizeTransportErr_*` (5 cases) — strips credential-bearing URLs
+  from `*url.Error`, preserves context errors, passes through non-URL errors,
+  nil stays nil.
+- `TestLiveUpstream_*` (5 cases, gated on `OCTO_OIDC_LIVE_TEST`) — optional
+  live-upstream probes against the real IdP (bad-code / bad-token / proxy
+  behaviour / sanitisation / authorize URL print); skipped by default.
+
+### JWT layer
+
+- `TestVerifyHS256JWT_*` (9 cases) — happy-path custom claims, signature uses
+  HMAC on signing input, `now==exp` boundary, exp not a number, typ
+  case/omission, realistic synthetic token end-to-end, empty secret rejected,
+  non-canonical base64 rejected.
+- `TestBEARERJWT_*` (9 cases) — happy path, wrong secret, expired, malformed
+  segments/JSON/base64, alg must be HS256 (none/RS256 rejected), missing
+  userId, userId=0 rejected, toIdentityClaims fail-closed (email/phone/verified
+  all zero).
+- `TestVerifyHS256JWT_RealisticShapeToken` uses only a synthetic token/secret
+  generated in-test.
+
+### Handler layer (HTTP, fake store/users)
+
+- `api_exchange_test.go` (7 cases) — handler exists, missing body, bad JSON,
+  blank access_token, IdP rejects token (401, anti-enumeration), happy path
+  returns session with correct identity row, route is public (no auth
+  middleware).
+- `api_exchange_jwt_test.go` (10 cases) — handler exists, missing body, blank
+  token, secret not configured (500), bad signature/expired/zero-userId/
+  garbage token all 401, happy path returns session with the bearer-JWT issuer and
+  decimal-string subject, issuer derived from config (prod vs test).
+- Tests use hand-built `*OIDC` with fakes (no `New()`/`Init()`), except for
+  the real DB-backed suites in `api_test.go` / `db_integration_test.go` which
+  exercise the OIDC callback end-to-end.
+
+### Middleware / logging
+
+- `TestBearerTokenCompat` (14 sub-cases) — token wins, Bearer backfills, case
+  insensitivity, whitespace, Basic/unknown schemes ignored, no-credential/
+  only-spaces/extra-segment not backfilled, query not accepted, nothing
+  provided stays empty, conflicting values don't error.
+- `TestBearerTokenCompat_IsTransparent` — downstream status/body preserved.
+- `TestScrubPath_MasksOAuthCallbackCredentials`,
+  `TestScrubbingErrorWriter_MasksOAuthCredentials`,
+  `TestScrubPath_ExistingMaskersStillApply` — accesslog and panic-dump sinks
+  both mask the new credential parameters; existing maskers still apply.
+
+### Config
+
+- `TestLoadConfig_KindDefaultsToOIDC`, `_ExplicitOIDCKindMatchesDefault`,
+  `_UnknownKindRejected`, `_OAuth2Kind` — new `OCTO_OIDC_PROVIDER_KIND` knob
+  defaulting to OIDC, unknown values rejected, OAuth2 kind loads without
+  requiring Discovery-related fields.
+- Existing `config_test.go` (12 cases) unchanged — required-env list not
+  disturbed.

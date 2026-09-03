@@ -77,6 +77,14 @@ type BindService struct {
 	locator  BindLocator
 	identity identityStore // confirm 路径写 user_oidc_identity
 	users    userLookup    // confirm 路径调 IssueSession 签发 dmwork 会话
+
+	// subjectMayBeReusedPersonnelID 取自当前 provider 的同名能力位。
+	//
+	// 快照是 callback 路径存下来的,subject 由上游给出;而"这家 IdP 的 sub 会不会
+	// 是复用的工号"是按部署的事实,一个部署只跑一个 kind,所以读当前 provider 的
+	// 表态是对的。不能无条件施加 —— 那会让标准 OIDC 部署里一份形态正常的旧快照
+	// 在 Confirm/Create 上被拒,和登录路径上同一个过度拒绝。
+	subjectMayBeReusedPersonnelID bool
 }
 
 func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, locator BindLocator) *BindService {
@@ -102,8 +110,11 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 // BindReasonUnknownUser(可建号);ErrConflictNeedManual → BindReasonManualConflict
 // (Create 路径拒绝)。详见 IssueReason godoc。
 func (s *BindService) IssueWithReason(ctx context.Context, claims *IDTokenClaims, sd *StateData, reason IssueReason) (string, error) {
-	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
-		return "", fmt.Errorf("oidc bind Issue: claims iss/sub required")
+	// 与 ResolveOrLink 同一道守卫(identity_bounds.go)。绑定是第三个 claims 入口:
+	// 它把快照存进 BindSession,Create 之后拿快照建号并落 identity 行 —— 漏在这里
+	// 等于给超长/可疑 subject 留了一条绕路。
+	if err := requireStorableIdentity(claims); err != nil {
+		return "", fmt.Errorf("oidc bind Issue: %w", err)
 	}
 	if sd == nil {
 		return "", fmt.Errorf("oidc bind Issue: state data required")
@@ -417,6 +428,9 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	if err != nil {
 		return nil, err
 	}
+	if err := s.recheckSnapshotIdentity("oidc bind Confirm", claims); err != nil {
+		return nil, err
+	}
 	sd, err := decodeSDSnapshot(sess.SDSnapshot)
 	if err != nil {
 		return nil, err
@@ -540,6 +554,9 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 	if err != nil {
 		return nil, err
 	}
+	if err := s.recheckSnapshotIdentity("oidc bind Create", claims); err != nil {
+		return nil, err
+	}
 	if err := s.checkClaimsForCreate(claims); err != nil {
 		return nil, err
 	}
@@ -611,9 +628,10 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 // checkClaimsForCreate 校验 claims 至少有一条强标识(email 或 phone)。
 //
 // phone 可用性必须用 extractPhone 判定,不能只看 PhoneNumber != "":
-// dmwork 当前仅支持 +86 号段(service.go:extractPhone),非 +86 verified phone
-// 会被 IssueSession 默默丢成空 Phone/Zone,落库后用户没有可用手机号锚点。
-// 用 extractPhone 做能用性检查,把"格式不支持"提前到 422 而非建出残缺账号。
+// 归一化(service.go:normalizePhone)只接受能确定归属地的形态 —— 大陆号的
+// +86/0086/86 前缀写法与裸号。海外号段与脏数据会被丢成空 Phone/Zone,落库后
+// 用户没有可用手机号锚点。用 extractPhone 做能用性检查,把"格式不支持"提前
+// 到 422 而非建出残缺账号。
 //
 // email_verified / phone_verified 必须为 true,否则后续客服 / 找回流程没有可信锚点
 // (与 autolink 准入条件一致)。
@@ -816,4 +834,34 @@ func (s *BindService) methodEnabled(m BindMethod) bool {
 // 当前 P0 用 time.Now,deterministic 需求落到后续 PR 再说。
 var nowUnix = func() int64 {
 	return time.Now().Unix()
+}
+
+// recheckSnapshotIdentity 对**解出来的快照**重跑身份准入。
+//
+// 为什么签发处已经查过还要再查一遍:守卫跑在快照签发处(IssueWithReason),而
+// 升级那一刻已经躺在 Redis 里的快照是**上一个版本**写的 —— 那个版本在标准 OIDC
+// 那条路没有任何长度上限,工号下限也还没加。而本模块刻意兼容旧格式快照
+// (bind_claims_compat_test.go 钉着这条,理由是升级瞬间在途的绑定不能全挂),
+// 于是在 token TTL 窗口内(默认 5 分钟,运维可调大),一份旧快照仍能走完
+// Confirm / Create,重现这个改动花了几轮堵的两种结局:严格 sql_mode 下 Create
+// 先建用户再插 identity 失败,留下孤立用户;非严格模式下截断合并,不可逆。
+//
+// 这是"守卫装在哪里"之外的另一个维度:快照的寿命跨越部署边界。同一个理由
+// 已经在 Create 里为 issuerAllowedForCreate 写过一次 —— TTL 窗口内世界会变,
+// 只是那次变的是 allowlist,这次变的是我方的准入规则本身。
+//
+// 存储上限对所有来源无条件生效。形态启发式则跟着当前 provider 的
+// SubjectMayBeReusedPersonnelID 走:它是按部署的事实(这家 IdP 的 sub 是不是
+// 复用的工号),不是协议事实,无条件施加会让标准 OIDC 部署的正常旧快照被拒。
+func (s *BindService) recheckSnapshotIdentity(ctxName string, claims *IDTokenClaims) error {
+	if err := requireStorableIdentity(claims); err != nil {
+		return fmt.Errorf("%s: %w", ctxName, err)
+	}
+	// 形态启发式跟着 provider 的表态走 —— 见 BindService.subjectMayBeReusedPersonnelID。
+	if s.subjectMayBeReusedPersonnelID {
+		if err := checkUpstreamSubjectShape(strings.TrimSpace(claims.Subject)); err != nil {
+			return fmt.Errorf("%s: %w", ctxName, err)
+		}
+	}
+	return nil
 }

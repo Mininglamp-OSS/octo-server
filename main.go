@@ -50,6 +50,7 @@ import (
 	ratelimitpkg "github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	rd "github.com/go-redis/redis"
 	"github.com/judwhite/go-svc"
@@ -275,6 +276,16 @@ func runAPI(ctx *config.Context) {
 		}
 		accessLogger(c)
 	})
+	// Authorization: Bearer → token 头回填。必须在任何 route group 的
+	// AuthMiddleware 之前执行（全局中间件天然满足），否则回填不生效。
+	//
+	// 为什么需要：octo-lib 的 AuthMiddleware 只认自定义的 `token` 头。接入外部
+	// IdP 之后，按标准 OAuth2 习惯开发的客户端会发 Authorization: Bearer，
+	// 于是「登录成功、后续每个调用 401」——只在集成联调阶段才暴露的断点。
+	//
+	// 纯增量：`token` 头优先，Authorization 头原样保留（bot / integration 类路由
+	// 直接读它），只认 Bearer，不接受 query 参数兜底。详见该函数注释。
+	route.UseGin(appwkhttp.BearerTokenCompat())
 	// 全局 per-IP 作为 DDoS 底线：办公室共享出网 IP 下 IM 基础量就能到 100+ rps
 	// （每人 1-2 rps × 数十人），200 余量过小；真实 DDoS 常数千 rps+，底线设 500
 	// 更合理。精细限流交给 UID 层和端点级严格桶（#1090）。

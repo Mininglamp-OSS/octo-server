@@ -16,6 +16,13 @@ type fakeUserLookup struct {
 	loginCalls   []IssueSessionReq
 	loginResp    *IssueSessionResp
 	loginErr     error
+
+	// loginRespByUID 按请求里的 uid 返回不同会话,优先于 loginResp。
+	//
+	// identity 竞态测试必须区分两次签发:输家(ghost)与赢家。单一 loginResp
+	// 会让两次返回同一个对象,于是"把赢家会话交出去"和"把 ghost 会话交出去"
+	// 在断言上不可分 —— 那正是要测的缺陷。
+	loginRespByUID map[string]*IssueSessionResp
 }
 
 func (f *fakeUserLookup) UIDsByEmail(email string) ([]string, error) {
@@ -28,6 +35,9 @@ func (f *fakeUserLookup) IssueSession(ctx context.Context, req IssueSessionReq) 
 	f.loginCalls = append(f.loginCalls, req)
 	if f.loginErr != nil {
 		return nil, f.loginErr
+	}
+	if resp, ok := f.loginRespByUID[req.UID]; ok {
+		return resp, nil
 	}
 	if f.loginResp != nil {
 		return f.loginResp, nil
@@ -43,6 +53,16 @@ type fakeIdentityStore struct {
 	// 故障注入(竞态恢复测试用)
 	failInsertWithDuplicate bool // Insert 直接返 MySQL 1062 模拟 unique 冲突
 	failGetAfterDuplicate   bool // 后续 Get 返错,模拟查赢家也失败
+
+	// winnerAppearsAfterFirstGet 建模真实的并发交错:赢家那行是在**我方 Get
+	// 之后、Insert 之前**落库的。所以第一次 Get(ResolveOrLink 判 IsNew 用的
+	// 那次)必须查不到,之后的 Get(recoverFromIdentityRace 找赢家用的那次)
+	// 才能查到。
+	//
+	// 用一个"第几次调用"的开关而不是"永久隐藏",是因为竞态本身就是时序现象:
+	// 永久隐藏会让 recoverFromIdentityRace 也找不到赢家,测到的是另一条分支。
+	winnerAppearsAfterFirstGet bool
+	getCalls                   int
 }
 
 func newFakeIdentityStore() *fakeIdentityStore {
@@ -52,6 +72,11 @@ func newFakeIdentityStore() *fakeIdentityStore {
 func (s *fakeIdentityStore) Get(issuer, sub string) (*IdentityModel, error) {
 	if s.failGetAfterDuplicate {
 		return nil, errors.New("fake DB get failed")
+	}
+	s.getCalls++
+	if s.winnerAppearsAfterFirstGet && s.getCalls == 1 {
+		// 赢家还没 commit —— 我方于是判定 IsNew 并去 Insert。
+		return nil, nil
 	}
 	return s.bindings[issuer+"|"+sub], nil
 }
@@ -364,4 +389,3 @@ func TestService_ResolveOrLink_PhoneIndependentOfEmailFlag(t *testing.T) {
 		t.Errorf("UID = %q, want u-phone", res.UID)
 	}
 }
-
