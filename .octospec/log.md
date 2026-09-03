@@ -1609,3 +1609,36 @@ change-log convention (§7). Newest first.
   inject a dependency through a helper cannot show that production wiring exists.
   A missing registration call passed the entire suite.
 
+
+## 2026-09-03 — oidc-auto-join-initial-space
+
+- **Shipped** — One admin setting (`space.oidc_initial_space_id`, empty = off)
+  makes every account created through OIDC — browser callback and
+  `/bind/create` — an ordinary member of that Space right after its identity row
+  lands. This unblocks `POST /v1/integrations/oidc/exchange`, which requires an
+  active Space and membership: SSO users previously belonged to no Space at all,
+  logged in fine, and failed exchange forever with no reachable remedy. The join
+  never affects the login — it runs after the session is issued, returns no
+  error, contains panics, and reports through
+  `oidc_initial_space_join_total{result=...}`.
+  See [journal](journal/shared/oidc-auto-join-initial-space.md).
+- **Fixed during review** — The new settings validator stopped at the first plan
+  naming its key while the write loop applies every plan in order, so a batch
+  carrying the key twice was judged on the first value and stored the second:
+  `200` for a configuration pointing at a Space that does not exist, with no
+  downstream component able to report it.
+- **Fixed proactively** — `atomicAddMemberIfNotFull` ran its
+  `COUNT ... FOR UPDATE` over all active member rows *before* testing
+  `maxUsers > 0`, so an unlimited Space paid an O(N) scan and a space-wide lock
+  for a decision the count could not inform. Sparse joins hid it; an initial
+  Space holding the whole company would not, since an SSO rollout puts every
+  employee's first login on the same space_id, on the login response path.
+- **Coverage gap closed late** — `/bind/create` is the second account-creating
+  entry point and carried the hook with nothing asserting it; every test drove
+  the callback, so the line could have been deleted silently.
+- **Known limitation, deliberately not fixed** — Nothing removes Space
+  membership when an IdP account is disabled. The hole predates this work but was
+  empty while SSO users belonged to no Space; auto-join fills it.
+- **Learning** — `learnings/pending/batch-write-validate-what-lands.md`: reduce a
+  batch to the state it will actually produce before validating it; a validator
+  that stops at the first match for a key approves one value and persists another.
