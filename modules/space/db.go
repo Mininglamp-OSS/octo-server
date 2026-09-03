@@ -657,20 +657,28 @@ func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) 
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Lock the space row and get current member count atomically
-	var count int
-	_, err = tx.SelectBySql(`
-		SELECT COUNT(*) FROM space_member
-		WHERE space_id = ? AND status = 1
-		FOR UPDATE
-	`, spaceId).Load(&count)
-	if err != nil {
-		return err
-	}
-
-	// Check capacity
-	if maxUsers > 0 && count >= maxUsers {
-		return ErrSpaceFull
+	// 容量检查只在真的设了上限时才做。这条 COUNT 带 FOR UPDATE,会锁住该 space
+	// 的全部在籍成员行:对不限人数(max_users=0)的空间,它拿不出任何判断,却要
+	// 付一次 O(N) 扫描加一把覆盖全空间的锁,把并发加入串行化。
+	//
+	// 平时加入是稀疏事件,这个代价看不出来。但"全公司在一个空间"的部署
+	// (OIDC 自动加入初始 Space 就是这种形状)在 SSO 切换首日会让所有人同时首次
+	// 登录,加入请求全部撞在同一个 space_id 上——而这段就在登录响应的关键路径上。
+	//
+	// max_users>0 的行为逐字不变:锁与判定原样保留,容量竞态仍然由它挡住。
+	if maxUsers > 0 {
+		var count int
+		_, err = tx.SelectBySql(`
+			SELECT COUNT(*) FROM space_member
+			WHERE space_id = ? AND status = 1
+			FOR UPDATE
+		`, spaceId).Load(&count)
+		if err != nil {
+			return err
+		}
+		if count >= maxUsers {
+			return ErrSpaceFull
+		}
 	}
 
 	// Insert new member
@@ -694,20 +702,21 @@ func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUser
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Lock the space row and get current member count atomically
-	var count int
-	_, err = tx.SelectBySql(`
-		SELECT COUNT(*) FROM space_member
-		WHERE space_id = ? AND status = 1
-		FOR UPDATE
-	`, spaceId).Load(&count)
-	if err != nil {
-		return err
-	}
-
-	// Check capacity
-	if maxUsers > 0 && count >= maxUsers {
-		return ErrSpaceFull
+	// 同 atomicAddMemberIfNotFull:不限人数时跳过 COUNT + FOR UPDATE,
+	// 它锁全空间成员行却给不出任何判断。max_users>0 的行为逐字不变。
+	if maxUsers > 0 {
+		var count int
+		_, err = tx.SelectBySql(`
+			SELECT COUNT(*) FROM space_member
+			WHERE space_id = ? AND status = 1
+			FOR UPDATE
+		`, spaceId).Load(&count)
+		if err != nil {
+			return err
+		}
+		if count >= maxUsers {
+			return ErrSpaceFull
+		}
 	}
 
 	// Reactivate member
