@@ -1,6 +1,8 @@
 package bot_api
 
 import (
+	"time"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
@@ -39,6 +41,14 @@ type robotModel struct {
 	AgentPlatform string
 	AgentVersion  string
 	PluginVersion string
+	// AgentHosting Agent 自报托管形态，小写 slug（self_hosted / octo_hosted /
+	// <vendor>_hosted）；空=未上报。取值开放、只校验形状，见 register.go 的
+	// agentHostingPattern。自报值，仅供展示与排障，不可用于鉴权。
+	AgentHosting string
+	// AgentReportedAt 最近一次收到 Agent 信息上报的时间；timestamp NULL，
+	// 从未上报时无效。必须用 NullTime 承接 NULL —— 否则 Select("*") 把 NULL
+	// 扫进 time.Time 会报错，殃及所有 robot 查询（同 botfather 的 BoundAt）。
+	AgentReportedAt dbr.NullTime
 	db.BaseModel
 }
 
@@ -68,12 +78,29 @@ func (d *botAPIDB) updateRobotIMTokenCache(robotID string, imToken string) error
 }
 
 // updateRobotAgentInfo updates agent runtime info for a robot.
-func (d *botAPIDB) updateRobotAgentInfo(robotID, agentPlatform, agentVersion, pluginVersion string) error {
-	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
-		"agent_platform": agentPlatform,
-		"agent_version":  agentVersion,
-		"plugin_version": pluginVersion,
-	}).Where("robot_id=?", robotID).Exec()
+//
+// agent_reported_at is always stamped with the current time, even when every
+// other value is unchanged: its meaning is "when we last *received* a report",
+// not "when the value last changed". Without that, the whole agent_* group is a
+// set of bare values with no way to judge freshness — robot.updated_at has no
+// ON UPDATE clause, so it cannot answer it either.
+// A nil agentHosting means "the caller did not report it" and leaves the column
+// alone; a non-nil one overwrites (including with "" to clear). Resolving nil
+// into the previously-read value here would look equivalent but turns two
+// concurrent registers into a lost update — see the caller's comment. The three
+// version strings keep their pre-existing merge-then-write contract; only the
+// new column gets the stricter treatment.
+func (d *botAPIDB) updateRobotAgentInfo(robotID, agentPlatform, agentVersion, pluginVersion string, agentHosting *string) error {
+	set := map[string]interface{}{
+		"agent_platform":    agentPlatform,
+		"agent_version":     agentVersion,
+		"plugin_version":    pluginVersion,
+		"agent_reported_at": time.Now(),
+	}
+	if agentHosting != nil {
+		set["agent_hosting"] = *agentHosting
+	}
+	_, err := d.session.Update("robot").SetMap(set).Where("robot_id=?", robotID).Exec()
 	return err
 }
 

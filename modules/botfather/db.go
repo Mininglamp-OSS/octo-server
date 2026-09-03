@@ -50,6 +50,13 @@ type robotModel struct {
 	// BoundAt 占用时间；timestamp NULL，未占用时无效。用 NullTime 承接 NULL，
 	// 否则 Select("*") 把 NULL bound_at 扫进 string 会报错，殃及所有 robot 查询。
 	BoundAt dbr.NullTime
+	// AgentHosting Agent 自报托管形态，小写 slug（self_hosted / octo_hosted /
+	// <vendor>_hosted）；空=未上报。写入在 modules/bot_api 的 register，这里只读。
+	// 自报值，不可用于鉴权。
+	AgentHosting string
+	// AgentReportedAt 最近一次收到 Agent 信息上报的时间；timestamp NULL，
+	// 从未上报时无效。NullTime 的理由同上面的 BoundAt。
+	AgentReportedAt dbr.NullTime
 	db.BaseModel
 }
 

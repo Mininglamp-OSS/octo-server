@@ -4,6 +4,43 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-03 (bot-agent-hosting)
+
+- **Added** — `robot.agent_hosting` + `robot.agent_reported_at`（单条原子 `ALTER`）。
+  `POST /v1/bot/register` 的 User Bot 分支接收自报托管形态，`GET /v1/user/bots` 带出。
+  App Bot 显式不支持（只解析 body 打 Warn，由源码守卫钉住 `app_bot` 无 `agent_*` 列）。
+  无新 errcode / 端点 / i18n 条目 / 路由变更。
+  See [journal](journal/shared/bot-agent-hosting.md).
+- **Learned** — 「本地 vs 云上」在服务端**没有可信来源**，三个候选字段全部不成立：
+  `user_api_key.client_id` 把桌面客户端与云端服务混装在同一个 `octopush` 下
+  （`modules/integration/api.go` 明写桌面端只持业务后端自签 JWT，`/exchange` 硬编码单一
+  client_id），从它推导会把本地标成云上；`bound_agent_ref` 是 bind 时客户端自填且
+  「Octo 不解析其语义」；`agent_platform` 只有平台名。所以这个列是**观测**字段，
+  永不可喂授权判定。
+- **Learned** — **枚举白名单给的保证是虚假的。** 它校验「值在集合内」，不校验
+  「你有资格声称这个值」——任何持 `bf_` token 的进程照样能报 `octo_hosted`。真正要挡的
+  是引号/尖括号/空格/控制字符/Unicode 混淆字符，`^[a-z][a-z0-9_]*$` 全挡且不需要预知
+  vendor。改为开放取值后，新托管方无需服务端发版，且 vendor 名不进这个开源仓。
+  代价已明示：`cloud`/`local` 从此合法（约定降级为客户端约定，**刻意不做黑名单**）。
+- **Guarded** — **校验上界高于列宽不是余量，是延迟的失败。** 初版 `maxAgentHostingLen=64`
+  配 `VARCHAR(20)`：25 字节的值会过校验、写库撞 `1406`，而 `agent_*` 共用一条 UPDATE，
+  会连带挡掉同一请求里的 `agent_platform/version/plugin_version`，且 register 仍返回 200。
+  现在上界与列宽**严格相等**（测试从迁移文件正则提取列宽后断言 `Equal` 而非 `<=`）。
+  另：长度上界必须排在 `ToLower` **之前**（后者按输入等大分配，body 无上限）。
+- **Learned** — **规格核到「响应结构没这个字段」不等于核到「端点存在」。**
+  原计划改的运维面 `GET /v1/manager/robots{,/:robot_id}` 整个是死代码：
+  `modules/robot/api_manager.go` 的 `NewManager` 全仓无调用方、`Route()` 从未执行
+  （`1module.go` 只注册 `New(ctx)`）。字段和测试都写完了，靠测试报 `404 page not found`
+  才发现，随后整体 `git checkout` 撤回 —— 给死代码加字段没有调用方看得到，却会让
+  下一个人以为运维面已有这个能力。
+- **Learned** — 测试要放在**拥有 schema 的模块**里，不是拥有代码的模块。写入路径在
+  `modules/bot_api`，但 `robot` 表的 `agent_*` 列归 `modules/botfather` 的迁移，而
+  bot_api 的测试二进制不 link botfather 的 `init()`，那里 `NewTestServer` 建出的 robot 表
+  没有这些列（`1054 Unknown column`）。App Bot 那条用例则要 blank import
+  `modules/app_bot` 而**不能**裸 `CREATE TABLE IF NOT EXISTS` —— 绕过 sql-migrate 建表
+  不写 `gorp_migrations`，会让下一个包的同名迁移撞「already exists」（`modules/message`
+  大量 DB 测试被 skip 的已知根因）。
+
 ## 2026-08-24 (group-exit-notice-visibility)
 
 - **Fixed** — 「某成员退出群聊」系统提示（`type=1021`）改为**全员可见 + RedDot:0**，

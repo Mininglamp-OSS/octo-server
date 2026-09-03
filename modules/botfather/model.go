@@ -162,6 +162,16 @@ type UserBotResp struct {
 	AgentPlatform string  `json:"agent_platform,omitempty"`
 	AgentVersion  string  `json:"agent_version,omitempty"`
 	PluginVersion string  `json:"plugin_version,omitempty"`
+	// AgentHosting Agent 自报托管形态：小写 slug，本项目自用 self_hosted /
+	// octo_hosted，第三方托管方按 <vendor>_hosted 自取（取值开放、服务端只校验形状，
+	// 所以客户端**不要**写死映射表，直接展示 slug —— 新托管方出现时前端无需发版）。
+	// 未上报时省略，与同组的 agent_platform / agent_version / plugin_version 行为一致。
+	// 自报值，仅供展示与排障，调用方不得据此做授权判定。
+	AgentHosting string `json:"agent_hosting,omitempty"`
+	// AgentReportedAt 最近一次收到上报的时间（botBoundAtFormat）；从未上报为 null。
+	// 与 BoundAt 同口径用 *string 显式下发 null，而不是 omitempty 省略字段 ——
+	// 缺了它 agent_hosting 就是个无从判断新鲜度的裸值。
+	AgentReportedAt *string `json:"agent_reported_at"`
 }
 
 // BindBotReq 占用（绑定）Bot 请求。

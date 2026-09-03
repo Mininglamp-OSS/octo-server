@@ -1,0 +1,34 @@
+# Rule injection record for the Implement phase (octospec-go).
+# Resolution: inject_when.paths glob OR inject_when.touches tag (union).
+# .octospec/_global/ is NOT synced in this worktree, so every rule resolves to
+# the repo tier.
+injected:
+  # touches: wire-contract (brief tag) + paths modules/**/*.go
+  # → no new errcode in this task; non-whitelisted agent_hosting values are
+  #   logged (Warn) and stored as "", never turned into an error response.
+  - id: error-handling
+    source: repo
+  # touches: bot-api (brief tag) + paths modules/**/*.go
+  # → no new routes; register keeps bot-token identity, owner face keeps the
+  #   uk_ key's uid/space scoping, manager face keeps CheckLoginRole.
+  - id: space-isolation
+    source: repo
+  # touches: trust-boundary + wire-contract (brief tags)
+  # → agent_hosting is caller-controlled (any bf_ holder can send anything);
+  #   the whitelist IS the boundary, so an arbitrary 128-byte string can never
+  #   reach the owner/manager response.
+  - id: trust-boundary
+    source: repo
+  # paths modules/**/*.go (no rate-limit/throttle tag in the brief)
+  # → no new routes, no limiter changes; recorded because the glob matches.
+  - id: rate-limit
+    source: repo
+  # touches: testing (brief tag) + paths **/*_test.go
+  # → GET /v1/user/bots carries SharedUIDRateLimiter, so its test must reset
+  #   ratelimit:uid:* in setup (CleanAllTables does not).
+  - id: testing
+    source: repo
+  # paths ** (always matches)
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/bot-agent-hosting/brief.md
