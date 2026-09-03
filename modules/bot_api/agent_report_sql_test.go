@@ -40,6 +40,8 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 		report  agentReport
 		present []string
 		absent  []string
+		// noWrite: 该 report 不该产生任何语句（所有 supplied 字段都不可写）。
+		noWrite bool
 	}{
 		{
 			name:    "只报 hosting：三个版本列必须缺席（PR #837 P1-2 的阻塞项）",
@@ -66,6 +68,24 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 			absent:  []string{"agent_platform", "agent_version", "plugin_version"},
 		},
 		{
+			name:    "三个 legacy 字段报空串：全部跳过（保留已存值，PR #837 round 2 P1-1）",
+			report:  agentReport{Platform: strptr(""), Version: strptr(""), Plugin: strptr("")},
+			absent:  []string{"agent_platform", "agent_version", "plugin_version", "agent_hosting", "agent_reported_hosting_at"},
+			noWrite: true,
+		},
+		{
+			name:    "legacy 空串与非空混报：只写非空的那个",
+			report:  agentReport{Platform: strptr("OpenClaw"), Version: strptr(""), Plugin: strptr("")},
+			present: []string{"agent_platform"},
+			absent:  []string{"agent_version", "plugin_version"},
+		},
+		{
+			name:    "hosting 报空是清空：列在（与 legacy 的空串语义刻意不同）",
+			report:  agentReport{Hosting: strptr(""), Version: strptr("")},
+			present: []string{"agent_hosting", "agent_reported_hosting_at"},
+			absent:  []string{"agent_version"},
+		},
+		{
 			name:    "全都报：五列俱在",
 			report:  agentReport{Platform: strptr("OpenClaw"), Version: strptr("1"), Plugin: strptr("2"), Hosting: strptr("octo_hosted")},
 			present: []string{"agent_platform", "agent_version", "plugin_version", "agent_hosting", "agent_reported_hosting_at"},
@@ -73,6 +93,15 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.noWrite {
+				// 不设任何 Expect：一旦发出语句 sqlmock 就报 "was not expected"。
+				dn, mockn, closern := newAgentReportDB(t)
+				defer closern()
+				require.NoError(t, dn.updateRobotAgentInfo("bot_x", tc.report))
+				require.NoError(t, mockn.ExpectationsWereMet())
+				return
+			}
+
 			d, mock, closer := newAgentReportDB(t)
 			defer closer()
 

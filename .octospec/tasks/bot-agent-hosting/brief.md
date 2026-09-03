@@ -96,9 +96,19 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   而且这个 diff **扩大**了窗口：改前只在值不同时 UPDATE，改后任何 `agent_*` 字段存在
   就 UPDATE，于是「只报 hosting」（本功能新引入的请求形态）会把三个版本列写成陈旧读值。
   丢更新路径：A 读 → B 写新 agent_version → A 把旧值写回，而两个 runtime 同时 register
-  同一 Bot 今天没有任何机制阻止。现在四个字段全是 `*string`，nil 即不进 `SetMap`。
-  wire 契约不变：对三个版本字段，「省略」与「传空串」本来就不可区分。
-  hosting 与它们的唯一差别是「报空」有意义 —— 那是 runtime 清掉陈旧形态的方式。
+  同一 Bot 今天没有任何机制阻止。现在四个字段全是 `*string`。
+- **「已上报」的判定在两组字段上不同，这个不对称是刻意的**（review round 2 修正）：
+  - **三个 legacy 版本字段：非空才算上报。** 它们在 merge base 上的契约是「空值即不变」
+    （省略与传 `""` 都是 no-op），所以 `updateRobotAgentInfo` 对它们**空值也跳过**。
+    第一轮修复只跳过 nil、把空串照写，于是「报空」从保留变成清空 —— 而 register 是
+    重连路径，任何序列化器对未填字段输出 `""` 的客户端都会**每次重连擦一次**，
+    HTTP 200、无日志、事后与「从未上报」不可区分。两位 reviewer 独立端到端复现。
+    **稀疏写入与「空值即不变」本来兼容**：丢更新的根源是「替换成刚读到的值」，
+    不是「跳过该列」。
+  - **`agent_hosting`：任何被送来的值都算上报，含 `""`。** 那是 runtime 撤回陈旧形态的
+    唯一方式，而陈旧值比空值更有害。这确实是相对 legacy 字段的契约差异 —— 明说而不
+    用注释掩盖；它是新字段，没有存量依赖。
+  推论：`isEmpty()` 只是廉价前检，真正的「有无内容可写」是 `len(set)==0`。
 - **`agent_reported_hosting_at` 只在 hosting 被上报时前进，且由 SQL `NOW()` 写。**
   两点都是 PR #837 review 后修正的：
   - **只在 hosting 上报时前进**（列名也从 `agent_reported_at` 改成现名）。初版对任何
@@ -195,17 +205,16 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 - **迁移文件放 `modules/botfather/sql/`，与 `agent_platform` 三列同源。** 执行顺序按
   文件名时间戳**全局**排序、跨模块（`internal/modules.go:3-8`：sql-migrate 把所有模块的
   SQL 汇成一个 slice 按 VersionInt 排序，「botfather ALTERs robot」是被认可的形状）。
-- **字段缺席必须在 SQL 层面缺席，不能靠回写读到的旧值**（Verify 期自修）。
-  `agent_hosting` 的指针一路下推到 `SetMap`：`nil` 时该列不进 SetMap。把 `nil` 解析成
-  「刚读到的值」再写回去看起来等价，实际会在并发 register 下丢更新
-  （A 读旧值 → B 写新值 → A 把旧值写回）。两个 runtime 同时 register 同一个 Bot
-  今天没有任何机制阻止（见 Out of scope 的占用锁缺口）。三个既有版本字符串保持
-  原有的 merge-then-write 契约，只有新列享受这个更严的处理。
-- **自报值的长度上界必须在折叠大小写之前**（Verify 期自修）。`register` 的 JSON body
-  无大小上限，而 `strings.ToLower` 会分配一个与输入等大的新串 —— 一个 10MB 的
-  `agent_hosting` 会花 10MB 分配去否决一个不可能匹配 11 字节字面量的值。
-  顺序固定为 `TrimSpace`（返回子切片、零分配）→ 长度上界（`maxAgentHostingLen=64`）
-  → `ToLower`。
+- **自报值的长度上界必须在折叠大小写之前。** 顺序固定为 `TrimSpace`
+  （返回子切片、零分配）→ 长度上界（`maxAgentHostingLen`）→ ASCII 检查 → `ToLower`。
+  原始理由（「10MB 的值会花 10MB 分配去否决」）在 4 KiB body 上限落地后**已不适用**
+  （review round 2 指出）；保留该顺序的现有理由是它零成本，且不让这个界依赖两层调用
+  之外的另一个限制。
+  （**已删除**：此处原有一条「三个既有版本字符串保持原有的 merge-then-write 契约，
+  只有新列享受更严处理」——它已被上面「四个字段一律稀疏写入」那条取代，两条并存正是
+  round 2 的 P2-1：同一份文档里两条互相矛盾的载荷性规则，而**过时的那条描述的行为
+  恰好能防住 P1-1**。这个 PR 自己新增的 learning
+  `a-rule-in-a-comment-is-not-applied.md` 在 brief 里重演了一次。）
 - **已知限制：agent_* 全组共用一条 UPDATE，一个超长字段会挡住整组**（Verify 期发现，
   本任务不修）。三个既有字符串字段无长度校验、列宽 `VARCHAR(50)`，而生产与测试库都开着
   `STRICT_TRANS_TABLES`（实测 200 字节写 `VARCHAR(50)` → `1406 Data too long`）。
@@ -215,6 +224,10 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   每次失败），**不是本任务引入的回归** —— 但新字段的可写性现在依赖旧字段的卫生。
   修它要么给三个既有字段加「超长则忽略该字段」的降级（改既有行为），要么把 UPDATE
   拆成两条（放弃原子性换解耦），都该单独决策。
+  **review round 2 的补充判断（认同，留 follow-up）**：稀疏写入落地后，语句层面
+  各列已经解耦，所以「校验三个 legacy 字段的长度」或「拆分语句」比本 brief 原先
+  「deserves its own decision」的措辞暗示的**要便宜得多**。应开 follow-up issue
+  而不是无声带过。仍不在本任务范围：它改的是三个既有字段的行为。
   当前行为由 `TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate` 钉住，
   作为可执行文档：谁修了它，那条测试会红并提醒同步更新本段。
   **新列自己不受这个限制**：`maxAgentHostingLen` 与列宽严格相等（64），
@@ -297,6 +310,26 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 - `UserBotResp` 的现有字段值与形状不因本任务改变。
 - 未上报的 Bot：`agent_hosting` 被 `omitempty` 省略（不下发空串），
   `agent_reported_hosting_at` 显式为 `null`。
+
+**legacy 字段的空值语义（review round 2 新增）**
+
+- 三个 legacy 字段报 `""` → **保留已存值**（merge base 的契约），只有非空值才写。
+  端到端：播种三值 → 报 `{platform:"", version:"1.2.4", plugin:""}` →
+  version 更新、另两个保持不变。
+- 三个 legacy 字段**全**报 `""` → 一行都不写，且不盖 hosting 时间戳
+  （「被送来」≠「可写」）。
+- `agent_hosting` 报 `""` → 清空（与 legacy 的空值语义刻意不同）。
+- SQL 层逐形态断言：legacy 空串不进语句、空串与非空混报只写非空的那个。
+- **变异验证**：去掉 legacy 的空值跳过后，端到端与 SQL 层两条都必须红。
+
+**body 与解码（review round 2 新增）**
+
+- body 超 `maxRegisterBodyBytes`（4 KiB）→ register 仍 200，已存列**不受影响**。
+- 类型错误的 body（`{"agent_platform":"OpenClaw","agent_version":12345}`）→
+  **一个字段都不采纳**。`json.Decoder` 会先填好已解析字段再报错，所以「忽略 bind 错误」
+  等于采纳一个前缀 —— 半更新的列看起来像一次成功上报，比不更新更糟。
+- 尾随垃圾（`{...} trailing`）同样整体不采纳。
+- **变异验证**：改回 `_ = c.ShouldBindJSON(&staged)` 后该测试必须红。
 
 **并发与时钟（PR #837 review 后新增）**
 

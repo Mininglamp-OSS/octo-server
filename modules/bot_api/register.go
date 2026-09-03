@@ -1,6 +1,9 @@
 package bot_api
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -92,11 +95,12 @@ func isASCII(s string) bool {
 //
 // Order is load-bearing, in two separate ways.
 //
-// **Length before folding**, because the field is entirely caller-controlled and
-// register takes an unbounded JSON body: strings.ToLower allocates a copy the
-// size of its input, so a 10MB value must be rejected without paying for a 10MB
-// lowercase copy of it. strings.TrimSpace is safe to run first — it returns a
-// sub-slice and allocates nothing.
+// **Length before folding.** The 4 KiB body cap now bounds the input ahead of
+// this function, so the original argument (a 10MB value must not cost a 10MB
+// lowercase copy to reject) no longer applies — but the ordering stays, because
+// it costs nothing and keeps the bound independent of a limit enforced two call
+// frames away. strings.TrimSpace is safe to run first: it returns a sub-slice
+// and allocates nothing.
 //
 // **ASCII before folding**, because Go's simple lowercase mapping is not
 // confined to ASCII: U+212A KELVIN SIGN folds to `k` and U+0130 LATIN CAPITAL I
@@ -134,13 +138,24 @@ func normalizeAgentHosting(v string) (normalized string, ok bool) {
 // registration succeeds regardless (see registerUserBot).
 //
 // All four are POINTERS so that "absent" is distinguishable from "reported as
-// empty". Absent leaves the column untouched *in SQL*; present overwrites,
-// including with "" to clear. The three version fields were plain strings before
-// this feature, merged against the stored value with "empty means unchanged" —
-// which is observably identical to "absent from the statement" for a single
-// writer, and strictly better under concurrency (see updateRobotAgentInfo).
-// The wire contract is unchanged by the switch: omitting a field and sending it
-// as "" were already indistinguishable to those three.
+// empty" — but the two groups then treat that distinction differently, and only
+// one of them changes behaviour relative to the pre-feature contract:
+//
+//   - The three version fields keep "empty means unchanged" exactly as they had
+//     it when they were plain strings: omitted and "" are both no-ops.
+//     updateRobotAgentInfo skips them on empty. The pointer switch buys the
+//     lost-update fix (an absent field stays absent from the SQL rather than
+//     being written back from a stale read) without changing what any existing
+//     client observes.
+//   - agent_hosting accepts "" as a deliberate clear, because that is the only
+//     way a runtime can retract a stale hosting shape. This IS a contract
+//     difference from the three above, deliberately, and it is new so nothing
+//     depended on the old behaviour.
+//
+// An earlier revision applied hosting's rule to all four and claimed in this very
+// comment that the wire contract was unchanged. It was not: an explicit "" went
+// from preserving a version column to wiping it on every reconnect. Both
+// reviewers reproduced it end to end (PR #837 round 2).
 type BotRegisterReq struct {
 	AgentPlatform *string `json:"agent_platform"`
 	AgentVersion  *string `json:"agent_version"`
@@ -169,16 +184,32 @@ const maxRegisterBodyBytes = 4 << 10
 
 // readAgentReport decodes the optional telemetry body under a size cap.
 //
-// Every failure mode — no body, empty body, malformed JSON, body over the cap —
-// yields the zero value, i.e. "nothing was reported". None of them can fail the
-// registration: this is the only channel a bot has to recover after losing its
-// connection (#696). MaxBytesReader is applied rather than the error inspected,
-// so an oversized body is cut off instead of buffered.
+// Every failure mode — no body, empty body, malformed JSON, trailing garbage,
+// body over the cap — yields the zero value, i.e. "nothing was reported". None of
+// them can fail the registration: this is the only channel a bot has to recover
+// after losing its connection (#696). MaxBytesReader is applied rather than the
+// error inspected, so an oversized body is cut off instead of buffered.
+//
+// The decode is ALL-OR-NOTHING, which takes a deliberate extra step:
+// json.Decoder populates the fields it has already parsed before returning a type
+// error, so binding straight into the result and ignoring the error would adopt a
+// prefix of a malformed body — `{"agent_platform":"OpenClaw","agent_version":123}`
+// would store the platform and silently drop the rest. Partial telemetry from a
+// body the client got wrong is worse than none: it half-updates columns while
+// looking like a successful report. So decode into a temporary, require a clean
+// decode AND end-of-input, and only then adopt it.
 func readAgentReport(c *wkhttp.Context) BotRegisterReq {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRegisterBodyBytes)
-	var req BotRegisterReq
-	_ = c.ShouldBindJSON(&req)
-	return req
+	var staged BotRegisterReq
+	dec := json.NewDecoder(c.Request.Body)
+	if err := dec.Decode(&staged); err != nil {
+		return BotRegisterReq{}
+	}
+	// Reject one valid value followed by anything else.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return BotRegisterReq{}
+	}
+	return staged
 }
 
 // BotRegisterResp is the response for bot registration.

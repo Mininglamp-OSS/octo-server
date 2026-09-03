@@ -4,6 +4,37 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-03 (bot-agent-hosting · review round 2)
+
+- **Fixed** — round 1 的修复引入的数据丢失回归（两位 reviewer 再次独立端到端复现）：
+  三个 legacy 版本字段改 `*string` 后，指向空串的非 nil 指针被无条件写入，于是
+  「报空」从 merge base 的「保留」变成「清空」。register 是重连路径，任何序列化器对
+  未填字段输出 `""` 的客户端会每次重连擦一次，HTTP 200、无日志、事后与「从未上报」
+  不可区分。现在 legacy 三列**空值也跳过**，`agent_hosting` 保持「报空即清空」。
+- **Learned** — **「不在语句里」与「以空串在语句里」只在没有东西区分它们时才是同一件事。**
+  为修并发引入指针，同时也引入了这个区分，而旧契约默默依赖它不存在。稀疏写入与
+  「空值即不变」从来不冲突：丢更新的根源是「替换成刚读到的值」，不是「跳过该列」。
+- **Learned** — 同一个 learning 在 brief 里重演：brief 同时留着新规则（四字段一律稀疏）
+  和被它取代的旧规则（三个 legacy 保持 merge-then-write），**而过时那条描述的行为
+  恰好能防住这次回归**。reviewer 直接引用了本 PR 新增的
+  `a-rule-in-a-comment-is-not-applied.md`。取代一条规则 = 删掉旧的，不是并排放新的。
+- **Adopted** — **变异测试作为常规手段**（跟 reviewer 学的）。他验证 round 1 的时区修复
+  不是装饰：把 `dbr.Expr("NOW()")` 改回 `time.Now()`，确认两条测试红、其中一条报出实测
+  `7h59m59s` 偏差。本轮推送前照做：去掉 legacy 空值跳过 → 端到端与 SQL 层两条都红；
+  改回 `_ = c.ShouldBindJSON` → 部分采纳那条红。「测试过了」与「没这行就会红」是两个
+  不同的断言，只有后者有价值。
+- **Fixed** — `json.Decoder` 会先填好已解析字段再返回类型错误，所以忽略 bind 错误等于
+  采纳一个**前缀**（`{"agent_platform":"OpenClaw","agent_version":123}` 存下 platform
+  丢掉后面，无任何诊断）。改为全有或全无：解码到临时变量 + 要求干净 EOF 才采纳。
+- **Guarded** — 空 `agent_hosting` 的两种含义（时间戳 NULL=从未上报 / 非 NULL=显式清空）
+  此前被列 COMMENT 否认、被 `omitempty` 在 wire 上抹平；现在 COMMENT、字段注释、
+  wire 说明三处对齐。补了 4 KiB body 上限的测试（本功能唯一没测的新行为）。
+- **Fixed** — 测试里 `SET time_zone` 打在连接池上，deferred 复位可能落到另一条连接、
+  把 `+08:00` 的连接留在池里污染后续测试。改为独占一条 `*sql.Conn` 并**关闭**而非复位。
+- **Noted** — `normalizeAgentHosting` 的排序理由（「10MB 值不该付 10MB 折叠开销」）在
+  4 KiB body 上限之后**已过时**。顺序仍对（零成本，且不让这个界依赖两层调用之外的限制），
+  但理由随之改写 —— 论证过时和论证错误一样需要修。
+
 ## 2026-09-03 (bot-agent-hosting · review round 1)
 
 - **Fixed** — PR #837 两位 reviewer 独立实测复现的两个阻塞项：

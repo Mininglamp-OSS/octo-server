@@ -1,6 +1,7 @@
 package botfather
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -357,22 +358,27 @@ func TestRegisterHostingTimestampSharesMySQLClockWithBoundAt(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hosttz")
 
-	// 让本连接的 session 时区偏离 UTC。NOW() 随之偏移，而驱动写 Go time.Time 时
-	// 走的是 Config.Loc（UTC），两者就此分叉 —— 这正是 P1-1 的触发条件。
-	if _, err := ctx.DB().Exec("SET time_zone = '+08:00'"); err != nil {
+	// 用**独占一条连接**做时区偏移，不要打在池上（ctx.DB() 是连接池：
+	// SET 落在某条连接、deferred 复位可能落在另一条，会把一条 +08:00 的连接留在
+	// 池里污染后续测试。PR #837 round 2 P2-6）。
+	conn, err := ctx.DB().DB.Conn(context.Background())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }() // 关闭即释放，池里不留被改过的连接
+
+	if _, err := conn.ExecContext(context.Background(), "SET time_zone = '+08:00'"); err != nil {
 		t.Skipf("无法设置 session 时区（权限/后端差异），跳过：%v", err)
 	}
-	defer func() { _, _ = ctx.DB().Exec("SET time_zone = SYSTEM") }()
 
 	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
 		"agent_hosting": "self_hosted",
 	}).Code)
 
-	// 同一行、同一列类型、同一个 session 里用 NOW() 写另一个时间戳作参照物 ——
-	// bound_at 就是这么写的（modules/botfather/db.go 的 bindRobotCAS）。
-	_, err := ctx.DB().UpdateBySql(
-		"UPDATE robot SET bound_at=NOW() WHERE robot_id=?", robotID,
-	).Exec()
+	// 参照物：在**这条**偏移过的连接上用 NOW() 写 bound_at —— 生产就是这么写的
+	// （modules/botfather/db.go 的 bindRobotCAS）。register 那次写入走的是池里
+	// 另一条连接，所以如果实现用 Go 侧 time.Now()，它会被驱动按 Config.Loc(UTC)
+	// 转换，与这里的 NOW() 差出整个时区偏移；用 SQL NOW() 则两者同源。
+	_, err = conn.ExecContext(context.Background(),
+		"UPDATE robot SET bound_at=NOW() WHERE robot_id=?", robotID)
 	require.NoError(t, err)
 
 	var row struct {
@@ -393,6 +399,130 @@ func TestRegisterHostingTimestampSharesMySQLClockWithBoundAt(t *testing.T) {
 		"agent_reported_hosting_at 与 bound_at 必须同源（都用 SQL NOW()）；"+
 			"实测偏差 %s —— Go 侧 time.Now() 经驱动 Config.Loc(UTC) 转换，"+
 			"在非 UTC 的 MySQL session 上会与 NOW() 差出时区偏移（PR #837 P1-1）", skew)
+}
+
+// TestRegisterEmptyLegacyVersionPreservesStoredValue —— 三个 legacy 版本字段报
+// **空串**必须保留已存值，不能清空。这是 PR #837 round 2 的阻塞项（P1-1）。
+//
+// 回归的来路：为修丢更新把这三个字段从裸 string 改成 *string 之后，任何非 nil 指针
+// 都被无条件写入 —— 包括指向空串的。于是在 merge base 上「报空 = 保留」的行为
+// 变成了「报空 = 清空」，而当时的注释还断言 wire 契约未变。触发不需要恶意：
+// 任何 struct 不带 omitempty 的客户端都会送 ""，而 register 是重连路径，
+// 于是每次重连擦一次，HTTP 200、无日志、事后与「从未上报」不可区分。
+//
+// 两位 reviewer 独立端到端复现了它。这条测试就是他们那个复现。
+func TestRegisterEmptyLegacyVersionPreservesStoredValue(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hostlegacy")
+
+	// 播种三个值。
+	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+		"agent_platform": "OpenClaw",
+		"agent_version":  "1.2.3",
+		"plugin_version": "9.9.9",
+	}).Code)
+
+	// 报一个新版本，另两个送空串 —— 正是「序列化器对未填字段输出 ""」的形态。
+	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+		"agent_platform": "",
+		"agent_version":  "1.2.4",
+		"plugin_version": "",
+	}).Code)
+
+	row := readAgentInfo(t, ctx, robotID)
+	assert.Equal(t, "1.2.4", row.AgentVersion, "非空值应更新")
+	assert.Equal(t, "OpenClaw", row.AgentPlatform,
+		"legacy 字段报空串必须保留已存值（merge base 的契约），不能清空")
+	assert.Equal(t, "9.9.9", row.PluginVersion,
+		"legacy 字段报空串必须保留已存值（merge base 的契约），不能清空")
+}
+
+// TestRegisterAllEmptyLegacyFieldsWritesNothing —— 三个 legacy 字段全报空串时
+// 一行都不该写，包括不该盖 hosting 时间戳。
+//
+// 「supplied」与「writable」在这里分叉：字段确实被送来了（指针非 nil），但对 legacy
+// 列而言空串不可写，所以整条语句无内容可发。
+func TestRegisterAllEmptyLegacyFieldsWritesNothing(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hostnoop")
+
+	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+		"agent_platform": "",
+		"agent_version":  "",
+		"plugin_version": "",
+	}).Code)
+
+	row := readAgentInfo(t, ctx, robotID)
+	assert.Equal(t, "", row.AgentPlatform)
+	assert.False(t, row.AgentReportedHostingAt.Valid,
+		"没有可写内容时不得盖 hosting 时间戳")
+}
+
+// TestRegisterOversizedBodyDegradesToNoTelemetry —— 超过 maxRegisterBodyBytes
+// 的 body 按「未上报」处理：register 仍 200，已存列不受影响。
+//
+// 这是 PR #837 round 2 的 P2-5：body 上限是本功能唯一没有测试的新行为
+// （reviewer 手工验过，但那不在 suite 里）。
+func TestRegisterOversizedBodyDegradesToNoTelemetry(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hostbig")
+
+	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+		"agent_platform": "OpenClaw",
+		"agent_hosting":  "self_hosted",
+	}).Code)
+	before := readAgentInfo(t, ctx, robotID)
+	require.Equal(t, bot_api.AgentHostingSelfHosted, before.AgentHosting)
+
+	// 合法 JSON，但远超 4 KiB：hosting 本身是合法值，只是整个 body 被截断。
+	require.Equal(t, http.StatusOK, botRegister(t, h, botToken, map[string]interface{}{
+		"agent_hosting": "octo_hosted",
+		"padding":       strings.Repeat("x", 8<<10),
+	}).Code, "body 超限不得让 register 失败 —— 它是 Bot 掉线自愈的唯一通道")
+
+	after := readAgentInfo(t, ctx, robotID)
+	assert.Equal(t, before.AgentHosting, after.AgentHosting,
+		"超限 body 按未上报处理，已存值不得被改动")
+	assert.Equal(t, before.AgentPlatform, after.AgentPlatform)
+}
+
+// TestRegisterPartiallyMalformedBodyAdoptsNothing —— 类型错误的 body 一个字段都
+// 不采纳（全有或全无）。
+//
+// PR #837 round 2 的 P2-4：json.Decoder 会先填好已解析的字段再返回类型错误，
+// 所以「忽略 bind 错误」等于采纳一个前缀 —— 下面这个 body 会存下 platform、
+// 丢掉后面，且没有任何诊断。半更新的列比不更新更糟：它看起来像一次成功上报。
+func TestRegisterPartiallyMalformedBodyAdoptsNothing(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hostpart")
+
+	// 不能用 map 造这个 body（会被 json.Marshal 修正），直接发原始字节。
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/bot/register",
+		strings.NewReader(`{"agent_platform":"OpenClaw","agent_version":12345}`))
+	req.Header.Set("Authorization", "Bearer "+botToken)
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "畸形 body 不得让 register 失败")
+
+	row := readAgentInfo(t, ctx, robotID)
+	assert.Equal(t, "", row.AgentPlatform,
+		"类型错误的 body 一个字段都不该被采纳 —— 半更新看起来像成功上报")
+
+	// 尾随垃圾同理（一个合法值后面跟别的东西）。
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/bot/register",
+		strings.NewReader(`{"agent_platform":"OpenClaw"} trailing`))
+	req2.Header.Set("Authorization", "Bearer "+botToken)
+	req2.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code)
+	assert.Equal(t, "", readAgentInfo(t, ctx, robotID).AgentPlatform,
+		"尾随垃圾同样不得被部分采纳")
 }
 
 // TestRegisterAppBotIgnoresAgentRuntimeFields —— App Bot 的上报不落库（brief 方案 A）。

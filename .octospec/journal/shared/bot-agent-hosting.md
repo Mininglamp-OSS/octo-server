@@ -190,6 +190,80 @@ carries the scope. And `registerAppBot` was decoding an unbounded body to produc
 one log line; the body is now capped at 4 KiB, with overflow treated as "no
 telemetry" so registration still cannot fail.
 
+## What review round 2 caught
+
+The fix commit for round 1 introduced a regression, and both reviewers found it
+independently again — on the same head, with the same end-to-end reproduction.
+
+**Fixing a lost update created a data-loss bug.** Switching the three legacy
+version fields to `*string` was the right move for the lost update, but every
+non-nil pointer was then written verbatim — including a pointer to `""`. At the
+merge base an empty version field meant "unchanged"; afterwards it meant "clear".
+Reproduced on both commits with one request:
+
+```
+seed: version=1.2.3 plugin=9.9.9
+then: {"agent_version":"1.2.4","plugin_version":""}
+base -> plugin="9.9.9"   preserved
+head -> plugin=""        WIPED
+```
+
+No malice and no unusual client required: any serializer that emits `""` for a
+field it does not populate wipes that column, and register is the reconnect path,
+so it repeats forever. HTTP 200, nothing in the log, and afterwards the row is
+indistinguishable from one that never reported.
+
+The lesson generalises past this diff: **"absent from the statement" and "present
+as empty" are only the same thing while nothing distinguishes them.** Introducing
+a pointer to fix concurrency also introduced that distinction, and the old
+contract silently depended on its absence. Sparse writes and "empty means
+unchanged" were never in tension — the lost update came from substituting *the
+value just read*, not from skipping the column. Skipping on empty for the legacy
+group restores the old contract exactly and keeps the concurrency fix.
+
+**And the comment asserted it could not happen.** Both `register.go` and `db.go`
+carried a sentence saying the wire contract was unchanged because omission and
+`""` were already indistinguishable. True of the code being replaced; false of the
+replacement. That is the second time in this task that a comment stating a rule
+was taken as evidence the rule held — the first is already written up in
+`learnings/pending/a-rule-in-a-comment-is-not-applied.md`.
+
+**The same learning replayed in the brief.** The brief ended up carrying *two*
+load-bearing rules for this decision: the new "all four fields write sparsely"
+and the superseded "the three legacy strings keep their merge-then-write
+contract" — and the stale one described the behaviour that would have prevented
+the regression. A reviewer pointed at the PR's own new learning file while
+reporting it. Superseding a rule means deleting the old one, not adding the new
+one next to it.
+
+**Mutation testing, adopted from the reviewer.** One reviewer verified the round-1
+fixes by reverting `dbr.Expr("NOW()")` to `time.Now()` and confirming two tests
+went red (one with a measured `7h59m59s` skew) rather than by reading the diff. I
+used the same method on this round's fixes before pushing: removing the empty-skip
+makes both the end-to-end and the SQL-shape test fail; restoring
+`_ = c.ShouldBindJSON` makes the partial-adoption test fail. Worth making routine
+— "the test passes" and "the test would fail without this line" are different
+claims, and only the second one is worth anything.
+
+**Four smaller things, all real.** `json.Decoder` populates parsed fields before
+returning a type error, so ignoring the bind error adopted a *prefix* of a
+malformed body (`{"agent_platform":"OpenClaw","agent_version":123}` stored the
+platform and dropped the rest) — now an all-or-nothing decode requiring clean EOF.
+An empty `agent_hosting` has two meanings distinguished by whether the timestamp
+is NULL (never reported vs deliberately cleared), which the column COMMENT denied;
+now stated in the COMMENT, the field comment, and the wire-contract note. The 4 KiB
+body cap was the one new behaviour with no test. And `SET time_zone` in a test ran
+against a pooled connection, so the deferred reset could land on a different one
+and leave a `+08:00` connection in the pool — now pinned to a dedicated
+`*sql.Conn` that is closed rather than reset.
+
+**One argument went stale rather than wrong.** `normalizeAgentHosting`'s ordering
+was justified by "a 10MB value must not cost a 10MB lowercase copy to reject". The
+4 KiB body cap added in the same round bounds the input earlier, so that
+justification no longer applies. The ordering stays — it costs nothing and keeps
+the bound independent of a limit enforced two call frames away — but the stated
+reason had to change with it.
+
 ## Known limitation (recorded, not fixed)
 
 **One overlong `agent_*` field blocks the whole group.** The three pre-existing
