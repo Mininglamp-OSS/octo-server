@@ -186,13 +186,18 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 //   - `encoder` is a highlight-request global (not per-field), so setting it
 //     would also HTML-entity-escape the pre-existing text/richText/mergeForward
 //     snippet fragments, silently changing the wire-value encoding of the
-//     long-shipped MessageHit.Snippet field across four callsites (this file,
-//     search_global_messages.go ×2, search_global_groups.go top_hits) while
-//     leaving /_search (buildSearchMessagesHighlight) raw — a cross-endpoint
-//     encoding split for the same JSON field.
+//     long-shipped MessageHit.Snippet field across three callsites (this file,
+//     search_global_messages.go ×2) while leaving /_search
+//     (buildSearchMessagesHighlight) raw — a cross-endpoint encoding split for
+//     the same JSON field.
 //   - Escaping is scoped to the two new file fields (name_highlight /
 //     content_snippet) in Go via escapeHighlightFragment; MessageHit.Snippet
 //     keeps its raw-text contract on every endpoint.
+//
+// The groups top_hits preview uses buildSearchGroupsPreviewHighlight() instead
+// — see comment there for why (performance on the 8000-doc aggregation path,
+// and a no-widen posture on payload.file.name whose fragment feeds the raw
+// MessageHit.Snippet contract via pickSnippet).
 func buildSearchAllHighlight() *elastic.Highlight {
 	return elastic.NewHighlight().
 		PreTags("<mark>").PostTags("</mark>").

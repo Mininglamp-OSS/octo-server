@@ -1329,3 +1329,35 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 	}
 	_ = lastSA
 }
+
+// TestBuildSearchGroupsPreviewHighlight_ExcludesFileContent pins that the
+// groups-preview highlighter never allocates a payload.file.content fragment.
+// pickSnippet does not read that field, and the aggregation runs against up
+// to 8000 docs per request — scanning 30-100 KB Tika bodies would be pure
+// waste that pushes the request past OCTO_SEARCH_TIMEOUT.
+func TestBuildSearchGroupsPreviewHighlight_ExcludesFileContent(t *testing.T) {
+	body := asJSONString(t, buildSearchGroupsPreviewHighlight())
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must NOT highlight payload.file.content (pickSnippet does not read it; 30-100 KB body scan × 8000 docs would blow OCTO_SEARCH_TIMEOUT):\n%s", body)
+	}
+}
+
+// TestBuildSearchGroupsPreviewHighlight_FileNameFragmentSize pins that
+// payload.file.name is fragment-sized (120-char window, not whole-field). The
+// groups path feeds pickSnippet → MessageHit.Snippet, which by long-shipped
+// contract carries raw uploader-controlled text; whole-field mode would widen
+// a pre-existing raw-name-length concern from 120 chars to unbounded. Fixing
+// the pre-existing raw-Snippet contract is out of scope for this PR.
+func TestBuildSearchGroupsPreviewHighlight_FileNameFragmentSize(t *testing.T) {
+	body := asJSONString(t, buildSearchGroupsPreviewHighlight())
+	if !strings.Contains(body, `"fragment_size":120`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must keep fragment_size=120 (pre-existing shipped behaviour):\n%s", body)
+	}
+	if !strings.Contains(body, `"number_of_fragments":1`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must keep number_of_fragments=1 for payload.file.name (no whole-field widening on the raw-Snippet path):\n%s", body)
+	}
+	// Explicitly assert we did NOT include the file-tab's NumOfFragments(0) override.
+	if strings.Contains(body, `"payload.file.name":{"number_of_fragments":0}`) {
+		t.Errorf("buildSearchGroupsPreviewHighlight() must not set payload.file.name to NumOfFragments(0) — that would widen a pre-existing raw-Snippet vector:\n%s", body)
+	}
+}
