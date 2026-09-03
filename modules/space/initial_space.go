@@ -52,8 +52,10 @@ const (
 //  3. **绕过审批模式**。join_mode=1 的 Space 走审批是给邀请码路径用的；运维在
 //     后台钦定的初始 Space 等价于管理端强制添加，不产生 space_join_apply 行。
 //
-// 容量上限（max_users）与普通加入完全一致，由 atomicAddMemberIfNotFull 在事务里
-// 原子判定。
+// 容量上限(max_users)语义与普通加入一致,但**判定在本路径自己的事务里**
+// (atomicJoinInitialSpace),不是 atomicAddMemberIfNotFull —— 后者服务于用户主动
+// 加入,本函数不经过它。两者各自用加锁 COUNT 保证并发下不超员;要确认这一点请看
+// TestAutoJoinInitialSpace_ConcurrentJoinersRespectCapacity,别从函数名推断。
 //
 // 每次调用构造一个 *Space：New 只是几个结构体字面量加一个共享的 settings 单例，
 // 没有连接池或 goroutine，而本函数只在建号那一刻跑一次，不值得为它引一个全局单例。

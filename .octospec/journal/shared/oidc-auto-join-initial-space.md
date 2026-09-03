@@ -91,6 +91,20 @@ after its `user_oidc_identity` row is persisted.
   and the transaction rolls the row away. Written the wrong way round first and
   caught by the deterministic race test, which is why the reasoning is recorded
   in the function.
+- **The same gap-lock fact applies between joiners, and that was missed once.**
+  Having written the sentence "a `FOR UPDATE` on a missing row is a gap lock and
+  gap locks are mutually compatible" to explain the disband ordering, the first
+  transactional version then took exactly that lock on the member probe — so
+  every concurrent joiner acquired a compatible gap lock and every INSERT
+  deadlocked against the others. Worst when the Space is nearly empty, i.e. peak
+  SSO-rollout day, and permanent for the victim because nothing retries and the
+  trigger is creation-only. Reviewers reproduced it: 19 of 20 joiners lost.
+  Fixing it also unmasked a second defect hiding behind it — the capacity COUNT
+  was a plain read, so once the deadlocks stopped, ten joiners all passed a
+  two-seat check. The lock belonged on the count, not the probe: an X range lock
+  over existing rows makes joiners **queue**, while a gap lock on a missing row
+  makes them **cycle**. Both halves are now pinned by mutation-tested
+  concurrency cases.
 - **The panic guard stops at the `go` boundary, and the comment now says so.**
   The hook recovers what it runs synchronously; `afterJoinSpace` dispatches two
   goroutines that escape it. `joinPresetGroups` already had its own recover,
@@ -109,8 +123,13 @@ after its `user_oidc_identity` row is persisted.
   `m.SpaceId == ""`, checked *before* `err`, so a real failure reads as "Space
   does not exist". Harmless for a handler that maps both to 404; wrong for any
   caller that must distinguish a misconfigured id from a database blip.
-  `queryActiveSpaceForAutoJoin` exists for that reason — do not "simplify" it
-  back.
+  `atomicJoinInitialSpace` keeps that distinction deliberately — do not
+  "simplify" its error returns into the missing-row branch.
+- **Not every `FOR UPDATE` serialises, and one that does not can deadlock.** On
+  an existing row it is a queue; on a row that does not exist yet it is a gap
+  lock, which is compatible with other gap locks and therefore defers the
+  conflict to the INSERT, where it becomes a cycle. Before adding one, ask which
+  of the two it is.
 - **A batch settings write can name one key twice.** The write loop upserts
   every plan in order, so the *last* item wins. A validator that stops at the
   first match approves one value and stores another. Review caught this in the

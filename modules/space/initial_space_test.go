@@ -1,6 +1,8 @@
 package space
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -453,4 +455,101 @@ func TestAutoJoinInitialSpace_WinsRaceWithDisbandCleanly(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m)
 	assert.Equal(t, 0, m.Status, "the disband must have swept the freshly joined member")
+}
+
+// TestAutoJoinInitialSpace_ConcurrentJoinersAllSucceed is the joiner-vs-joiner
+// case the first transactional design never considered, and the one this
+// feature guarantees will happen: on the first day of an SSO rollout every
+// employee's first login targets the same space_id at once.
+//
+// The original shape took `SELECT ... FOR UPDATE` on a member row that does not
+// exist yet. That is a gap lock, gap locks are mutually compatible, so every
+// joiner acquired one and then every joiner's INSERT needed an insert-intention
+// lock conflicting with all the others — the textbook InnoDB deadlock, and
+// worst when the Space is nearly empty, which is exactly rollout day.
+//
+// A deadlock here is not a retryable blip: the outcome is InitialSpaceFailed,
+// nothing retries, and the trigger is creation-only, so the victim's next login
+// never re-enters this path. They stay outside every Space permanently — the
+// precise dead end this feature exists to remove.
+func TestAutoJoinInitialSpace_ConcurrentJoinersAllSucceed(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sp-initial-burst"
+	const joiners = 20
+	seedInitialSpace(t, f, spaceID, 0, JoinModeDirect) // unlimited, near-empty: worst case
+
+	var wg sync.WaitGroup
+	outcomes := make([]InitialSpaceJoinOutcome, joiners)
+	errs := make([]error, joiners)
+	wg.Add(joiners)
+	for i := 0; i < joiners; i++ {
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i], errs[i] = AutoJoinInitialSpace(testCtx, fmt.Sprintf("u-burst-%02d", i), spaceID)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range outcomes {
+		assert.NoErrorf(t, errs[i], "joiner %d failed; a deadlock here strands the account permanently", i)
+		assert.Equalf(t, InitialSpaceJoined, outcomes[i], "joiner %d did not join", i)
+	}
+
+	var active int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceID).Load(&active)
+	require.NoError(t, err)
+	assert.Equal(t, joiners+1, active, "every joiner plus the owner")
+}
+
+// TestAutoJoinInitialSpace_ConcurrentJoinersRespectCapacity pins that the
+// capacity check is race-safe, not merely correct when run alone.
+//
+// The count must be a locking current read. A plain count lets every concurrent
+// joiner read the same pre-insert total and all conclude there is room, so a
+// Space with two free seats admits everyone — max_users silently stops meaning
+// anything under exactly the load it exists to bound. The sibling
+// atomicAddMemberIfNotFull takes that lock and this package already proves it is
+// load-bearing there; this path needs the same guarantee.
+func TestAutoJoinInitialSpace_ConcurrentJoinersRespectCapacity(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "sp-initial-burst-cap"
+	const maxUsers = 3 // owner + 2 free seats
+	const joiners = 10
+	seedInitialSpace(t, f, spaceID, maxUsers, JoinModeDirect)
+
+	var wg sync.WaitGroup
+	outcomes := make([]InitialSpaceJoinOutcome, joiners)
+	errs := make([]error, joiners)
+	wg.Add(joiners)
+	for i := 0; i < joiners; i++ {
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i], errs[i] = AutoJoinInitialSpace(testCtx, fmt.Sprintf("u-burstcap-%02d", i), spaceID)
+		}(i)
+	}
+	wg.Wait()
+
+	joined, full := 0, 0
+	for i := range outcomes {
+		assert.NoErrorf(t, errs[i], "joiner %d errored; over-capacity must be reported as space_full, not a failure", i)
+		switch outcomes[i] {
+		case InitialSpaceJoined:
+			joined++
+		case InitialSpaceFull:
+			full++
+		}
+	}
+	assert.Equal(t, 2, joined, "exactly the two free seats")
+	assert.Equal(t, joiners-2, full, "everyone else must be told the Space is full")
+
+	var active int
+	_, err = testCtx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceID).Load(&active)
+	require.NoError(t, err)
+	assert.Equal(t, maxUsers, active, "max_users must never be exceeded")
 }

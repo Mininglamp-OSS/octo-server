@@ -112,11 +112,21 @@ func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSp
 	// 1) 成员是否已存在。在籍 → 幂等;已被移除 → 不复活(见 AutoJoinInitialSpace
 	//    注释第 2 点)。唯一索引在下面的 INSERT 处兜底,这里只是为了区分这两种情形
 	//    ——重复键错误告诉不了我们那行的 status 是 1 还是 0。
+	//
+	// **刻意不加 FOR UPDATE。** 这一行通常不存在,对不存在的行做加锁读拿到的是
+	// 间隙锁;而间隙锁互相兼容,于是每个并发加入者都能拿到,随后各自的 INSERT 需要
+	// 与他人间隙锁互斥的插入意向锁 —— 环成立,MySQL 挑一个回滚(Error 1213)。
+	// 空间越空越严重(测下来近乎空的空间 20 个并发只活 1 个),而那正是 SSO 上线首日
+	// 的形状;失败又是 InitialSpaceFailed、无重试、建号一次性触发,受害者永久留在
+	// 所有空间之外 —— 恰是本功能要消灭的死角。评审实测复现,已由
+	// TestAutoJoinInitialSpace_ConcurrentJoinersAllSucceed 钉住。
+	//
+	// 普通读足够:它照样看得见 status=0 的行,而真正的插入竞争由下面的 1062 分支兜底。
 	var existing MemberModel
 	if _, err := tx.SelectBySql(
-		"SELECT * FROM space_member WHERE space_id=? AND uid=? FOR UPDATE", spaceId, uid,
+		"SELECT * FROM space_member WHERE space_id=? AND uid=?", spaceId, uid,
 	).Load(&existing); err != nil {
-		return nil, InitialSpaceFailed, fmt.Errorf("lock initial space member: %w", err)
+		return nil, InitialSpaceFailed, fmt.Errorf("read initial space member: %w", err)
 	}
 	if existing.UID != "" {
 		return nil, InitialSpaceAlreadyMember, nil
@@ -136,10 +146,19 @@ func (d *DB) atomicJoinInitialSpace(spaceId, uid string) (*SpaceModel, InitialSp
 
 	// 3) 容量。与 atomicAddMemberIfNotFull 同语义:max_users=0 表示不限,此时这条
 	//    COUNT 给不出任何判断,跳过它连带省掉一把覆盖全空间成员的锁。
+	//
+	// **这里的 FOR UPDATE 是必须的,而且是并发加入者之间唯一的串行化点。** 普通读
+	// 会让每个加入者都读到插入前的同一个总数、都得出"还有位子"的结论,于是两个空位
+	// 能进十个人 —— max_users 在它唯一该起作用的负载下恰好失效。兄弟函数
+	// atomicAddMemberIfNotFull 一直是加锁读,本包已有用例证明那把锁是承重的。
+	//
+	// 与上面第 1 步的间隙锁不同,这是一把已存在行上的 X 范围锁:并发加入者在此
+	// **排队**而不是成环,所以既挡住超员,又不会退化成死锁。它同时也是当前读,
+	// 看得见其他事务刚提交的插入。
 	if sp.MaxUsers > 0 {
 		var count int
 		if _, err := tx.SelectBySql(
-			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceId,
+			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1 FOR UPDATE", spaceId,
 		).Load(&count); err != nil {
 			return nil, InitialSpaceFailed, fmt.Errorf("count initial space members: %w", err)
 		}
