@@ -25,7 +25,7 @@ source: user
 三件事：
 
 1. **上报**：`POST /v1/bot/register` 的 User Bot 分支新增可选 `agent_hosting`，
-   落 `robot.agent_hosting`；同时落 `robot.agent_reported_at`（这批自报数据的产生时间）。
+   落 `robot.agent_hosting`；同时落 `robot.agent_reported_hosting_at`（该次 hosting 上报的时间）。
 2. **读出**：owner 面 `GET /v1/user/bots` 带出这两个值。
    （原计划同时改运维面 `GET /v1/manager/robots{,/:robot_id}`。**实施期发现那两个端点
    不存在**：`modules/robot/api_manager.go` 的 `NewManager` 全仓无调用方、`Route()`
@@ -90,15 +90,32 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   走形状校验，但**形状非法一律落空串 + Warn，照常返回成功**。#696 的二次事故就是
   register 被连带拒绝导致 bot 永远起不来，`modules/bot_api/ratelimit_integration_test.go:272-274`
   有回归断言钉着。为一个纯观测字段的取值校验去阻断自愈通道是错误的取舍。
-- **`agent_hosting` 的合并语义与既有三字段刻意不同。** `modules/bot_api/register.go:80-101`
-  现有语义是「字段级 merge，空值保留旧值」。对版本号合理，对托管形态有害：本地→云上切换时
-  新端漏报会保留陈旧的 `self_hosted`。所以请求体用 `*string` 区分「没传」与「传了空」，
-  **传了就覆盖（含清空）**。对这个字段陈旧值比空值更有害。
-- **`agent_reported_at` 的语义是「最近一次收到上报」，不是「值变更时间」。** 因此即使
-  上报值与库中一致也要刷新它 —— 这会把现有的「值未变则跳过 UPDATE」优化
-  （`register.go:95-101` 的 if 条件）改成「请求带了 agent 字段就 UPDATE」。成本可接受：
-  `modules/common/system_settings.go:1346` 记录 register「只在重连时调用」，与 heartbeat
-  的 0.1 rps 量级不同数量级。**没有这一列，`agent_hosting` 是个无法判断可信度的裸值** ——
+- **四个 `agent_*` 字段一律稀疏写入：缺席的字段必须在 SQL 层面缺席。**（PR #837
+  review 后修正，两位 reviewer 独立判为阻塞）初版只对 `agent_hosting` 做了稀疏写入，
+  三个既有版本字段仍然「把刚读到的值 merge 回去」—— 正是同一段注释明确否决的写法，
+  而且这个 diff **扩大**了窗口：改前只在值不同时 UPDATE，改后任何 `agent_*` 字段存在
+  就 UPDATE，于是「只报 hosting」（本功能新引入的请求形态）会把三个版本列写成陈旧读值。
+  丢更新路径：A 读 → B 写新 agent_version → A 把旧值写回，而两个 runtime 同时 register
+  同一 Bot 今天没有任何机制阻止。现在四个字段全是 `*string`，nil 即不进 `SetMap`。
+  wire 契约不变：对三个版本字段，「省略」与「传空串」本来就不可区分。
+  hosting 与它们的唯一差别是「报空」有意义 —— 那是 runtime 清掉陈旧形态的方式。
+- **`agent_reported_hosting_at` 只在 hosting 被上报时前进，且由 SQL `NOW()` 写。**
+  两点都是 PR #837 review 后修正的：
+  - **只在 hosting 上报时前进**（列名也从 `agent_reported_at` 改成现名）。初版对任何
+    `agent_*` 上报都刷新它，于是「只报版本」会替一份该次上报从未提及的数据背书新鲜度 ——
+    而这个分歧场景正是用来论证指针语义的那个「新 runtime 漏报 hosting」。语义与列名
+    现在一致：它回答「同一行的 `agent_hosting` 有多新」，不是「这个 bot 最近有没有
+    上报过什么」。
+  - **SQL `NOW()` 而非 Go 侧 `time.Now()`**。它与 `bound_at`（`botfather/db.go` 用
+    `NOW()` 写）在同一个响应里并列，而 Go 侧写入要经驱动 `Config.Loc`（默认 UTC，
+    DSN 未设 `loc`）转换，应用镜像又固定 `TZ=Asia/Shanghai` —— MySQL session 时区非
+    UTC 时两个时间戳相差 8 小时且无标记解释（两位 reviewer 各自实测复现）。
+    生产 MySQL 目前是 UTC，所以那是**潜伏而非已发生**；改用 `NOW()` 后彻底不再依赖
+    这个前提。初版的测试结构上抓不到它（两个 Go 写的值互比，或用 SQL `NOW()` 播种），
+    所以补了一条把两种来源放进同一断言、并显式把 session 时区设成 `+08:00` 的测试。
+  即使值与库中一致也刷新（「收到过上报」而非「值何时改变」），这去掉了「值未变则跳过
+  UPDATE」的优化。成本可接受：`modules/common/system_settings.go:1346` 记录 register
+  「只在重连时调用」。**没有这一列，`agent_hosting` 是个无法判断可信度的裸值** ——
   `robot.updated_at` 连 `ON UPDATE` 都没有（`modules/robot/sql/20210926000001_robot_legacy01.sql:14`），
   现有 `agent_platform` 就是这种无从判断新鲜度的裸值，不要复制这个缺陷。
 - **自报数据不可信，不得用于鉴权或配额。** 列 COMMENT 与 Go 字段/常量注释都要写明。
@@ -106,10 +123,29 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   **观测**缺口，不是信任缺口。形状校验是**数据质量**约束，不是授权约束 ——
   它挡 caller-controlled 字节，不建立「调用方有资格声称该值」。任何后续想用它做
   授权判定的改动，得先建可信来源。
-- **值域开放，只校验形状；校验顺序是载荷性的。** `TrimSpace`（返回子切片、零分配）
-  → 长度上界 → `ToLower` + regexp。register 的 JSON body 无大小上限，而 `ToLower`
-  会分配一个与输入等大的新串，所以 10MB 的值必须在 `ToLower` 之前就被否决。
+- **值域开放，只校验形状；校验顺序在两个方向上都是载荷性的。**
+  `TrimSpace`（返回子切片、零分配）→ 长度上界 → **ASCII 检查** → `ToLower` + regexp。
+  - **长度在折叠之前**：register 的 JSON body 有 4 KiB 上限（PR #837 review 后新增，
+    见下），但 `ToLower` 仍会分配与输入等大的新串，没理由为否决一个不可能匹配的值付这笔钱。
+  - **ASCII 在折叠之前**（review 后修正）：Go 的简单小写映射**不限于 ASCII** ——
+    `U+212A KELVIN SIGN` 折成 `k`、`U+0130` 折成 `i`，所以折叠排在 ASCII-only 正则
+    之前时它们能通过（两位 reviewer 各自实测）。这不是注入（落库的仍是干净 ASCII slug，
+    且每个这类输入都有一个调用方可以直接上报的 ASCII 孪生值），但它把两个不同输入
+    静默折叠成同一个存储值，并让本函数注释里「confusables all fail it」这句话变成假的
+    ——而测试里的 Unicode 用例恰好只挑了会失败的 `U+200B`，使 brief 的验收标准看起来
+    已验证。**ASCII 性质同时是列宽不变量的前提**：`len()` 数字节而 `VARCHAR(64)` 数字符，
+    两者相等只因为拒了非 ASCII。
   大小写折叠而非拒绝（`Self_Hosted` 与 `self_hosted` 意图相同，折叠避免一类无声失败）。
+- **形状非法 = 本次忽略该字段，已存值保持不变；清空要显式报 `""`。**（review 后定稿）
+  初版把 `hosting = &normalized` 写在合法性分支外面，于是被拒的值以空串进 `SetMap`
+  覆盖已存值 —— 而 PR 描述说的是「degrades to 'not reported'」（读作保持不动），
+  字段注释的规则是「present overwrites」（实际清空），两种读法互相矛盾。定为保持不变的
+  理由是触发场景不需要恶意：`self-hosted`（带连字符，正是本命名引用的 GitHub Actions
+  写法）会被拒，一次客户端拼错就把全量 bot 的这一列刷空，只留一行日志。
+- **register 的 body 有 4 KiB 上限**（review 后新增）。body 是纯 telemetry，但
+  `binding.JSON` 是无上限的 `json.NewDecoder`，而本路由此前没有任何 body 界
+  （四个 sibling bot_api 路由都有）。App Bot 分支上这一点最刺眼：那次解码只换来一行日志。
+  超限按「未上报」处理，绝不让 register 失败。
 - **`maxAgentHostingLen` 必须与列宽严格相等（64），由测试断言 `Equal` 而非 `<=`。**
   大了：过校验的值写库撞 `1406`，而 agent_* 共用一条 UPDATE，会连带挡掉同一请求里的
   agent_platform/version/plugin_version（见下方已知限制）。小了：白占列宽还拒掉本可
@@ -125,14 +161,14 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   （可见、可发现、可修）—— 后者更容易运维。
 - **`robot` 表有三个独立的 struct 走 `Select("*")`，NULL 列会炸掉不相关查询。**
   `modules/robot/db.go:171-186`（管理端）、`modules/bot_api/db.go:30-45`、
-  `modules/botfather/db.go:30-55` 各有一份。`agent_reported_at` 是 `TIMESTAMP NULL`，
+  `modules/botfather/db.go:30-55` 各有一份。`agent_reported_hosting_at` 是 `TIMESTAMP NULL`，
   必须用 `dbr.NullTime` 承接 —— `modules/botfather/db.go:50-52` 的 `BoundAt` 注释已记下
   同一个坑：「用 NullTime 承接 NULL，否则 `Select("*")` 把 NULL bound_at 扫进 string
   会报错，殃及所有 robot 查询」。
 - **`UserBotResp` 是 wire contract，只能 additive。**
   （`modules/botfather/model.go:149-165`）只增字段，现有字段不改名/不删/不改类型/不改语义。
   `agent_hosting` 跟同组的 `agent_platform` 一样带 `omitempty`（同一组字段两种缺省行为
-  会让客户端写两套解析）；`agent_reported_at` 跟 `bound_at` 一样用 `*string` 显式下发
+  会让客户端写两套解析）；`agent_reported_hosting_at` 跟 `bound_at` 一样用 `*string` 显式下发
   `null`（它是判断 `agent_hosting` 新鲜度的唯一依据，省略字段等于让调用方猜）。
 - **IM 全员面刻意不下发。** `GET /v1/users/:uid` 的 extraMap、`POST /v1/users/batch`、
   `GET /v1/channels/:id/:type` 这条路今天已经在下发 `bot_agent_platform` /
@@ -233,16 +269,18 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 **上报（User Bot）**
 
 - `POST /v1/bot/register` 带 `agent_hosting:"self_hosted"` → 200，`robot.agent_hosting`
-  为 `self_hosted`，`agent_reported_at` 非 NULL。
+  为 `self_hosted`，`agent_reported_hosting_at` 非 NULL。
 - 带 `agent_hosting:"octo_hosted"` → 落库为 `octo_hosted`。
 - 带形状非法的值（`<script>alert(1)</script>`、内嵌空格、连字符、数字/下划线开头、
-  控制字符、Unicode 混淆字符、中文、超长串）→ **仍 200**，`agent_hosting` 落空串，
+  控制字符、零宽空格、`U+212A`/`U+0130` 折叠型混淆字符、带重音拉丁字母、全角字符、
+  中文、超长串）→ **仍 200**，且**已存的合法值保持不变**（不是清成空串），
   日志有 Warn（且**不记原始值**，只记 `rejectedLen`）。
+- 显式报 `""` → 清空（与「被拒」区分：前者是格式良好的上报）。
 - 第三方 `<vendor>_hosted` 无需改服务端即可原样落库，并原样出现在 `GET /v1/user/bots`。
 - `cloud` / `local` 合法通过（已知代价，见 Load-bearing）。
 - 不传该字段（旧客户端、空 body）→ 旧值保留，且现有三字段行为逐字节不变。
 - 显式传 `""` → 清空为空串（指针语义与「没传」可区分）。
-- 上报值与库中一致时 `agent_reported_at` 仍被刷新（语义是「最近一次收到上报」）。
+- 上报值与库中一致时 `agent_reported_hosting_at` 仍被刷新（语义是「最近一次收到上报」）。
 
 **App Bot**
 
@@ -252,22 +290,37 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 
 **读出**
 
-- `GET /v1/user/bots` 每项含 `agent_hosting` 与 `agent_reported_at`；未上报时分别为
+- `GET /v1/user/bots` 每项含 `agent_hosting` 与 `agent_reported_hosting_at`；未上报时分别为
   空串与 `null`。
 - **负向断言**：`GET /v1/users/:uid` 的 extraMap 与 `POST /v1/users/batch` 的响应
   **不含** `agent_hosting`（防止后来人顺手接入 IM 全员面）。
 - `UserBotResp` 的现有字段值与形状不因本任务改变。
 - 未上报的 Bot：`agent_hosting` 被 `omitempty` 省略（不下发空串），
-  `agent_reported_at` 显式为 `null`。
+  `agent_reported_hosting_at` 显式为 `null`。
+
+**并发与时钟（PR #837 review 后新增）**
+
+- 只报 `agent_hosting` 时，三个版本列**不在 UPDATE 语句里**（sqlmock 直接断言 SQL 文本）。
+  端到端补一条：带外改掉 `agent_version` 后只报 hosting，带外值必须存活。
+- 只报版本时，`agent_hosting` 与其时间戳都不在语句里；端到端同样用带外写入验证
+  （初版那条「值保留 + 时间戳前进」的断言在写回实现下同样会过 —— 论证不成立）。
+- 什么都没报 → 不发任何语句（sqlmock 无 Expect，一旦发出即失败）。
+- `agent_reported_hosting_at` 由 SQL `NOW()` 写：语句里出现字面 `NOW()`；
+  并且在 session 时区 `+08:00` 下，它与同一行用 `NOW()` 写的 `bound_at` 偏差 < 1 分钟。
+- 形状非法时发一条 Warn，且日志**不含原始值**（只有 `rejectedLen`）；合法上报无 Warn。
+- App Bot 上报时的 Warn 被断言（那是这个分支解析 body 的唯一理由）。
 
 **边界与已知限制**
 
-- 空 JSON `{}` 与完全无 body 的 register：不写任何 agent_* 列，`agent_reported_at`
+- 空 JSON `{}` 与完全无 body 的 register：不写任何 agent_* 列，`agent_reported_hosting_at`
   保持 `NULL`（否则「收到过上报」的语义失真，且是纯写放大）。
-- 只报版本、不带 `agent_hosting`：该列不被写（值保留），而 `agent_reported_at`
+- 只报版本、不带 `agent_hosting`：该列不被写（值保留），而 `agent_reported_hosting_at`
   仍前进 —— 两个断言合起来才能区分「没碰这列」与「回写了旧值」。
-- 超长 `agent_hosting`（>64 字节 = >列宽）在折叠大小写之前就被否决，落空串；
+- 超长 `agent_hosting`（>64 字节 = >列宽）在折叠大小写之前就被否决；
   恰好 64 字节的合法 slug 放行（边界是 `<=`）。
+- register 的 body 超 4 KiB → 按「未上报」处理，register 仍 200。
+- `TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate` 显式检查
+  `@@SESSION.sql_mode`，非严格模式下 skip 而不是假红（它断言的行为只在严格模式成立）。
 - `maxAgentHostingLen == 列宽`（从迁移文件正则提取比对），且两个自用取值都能过校验。
 - 超长 `agent_platform` 连带挡住合法 `agent_hosting`：这是**已知限制**，由测试钉住
   当前行为，见 Load-bearing 同名条目。
@@ -277,7 +330,7 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
 - 迁移是单条原子 `ALTER`：要么两列都在、要么都不在，不存在「一列已加一列没加」的
   中间态。重跑保护由 `gorp_migrations` 记账承担（朴素 DDL 原则），**不**在迁移里做幂等；
   dev/staging 若已跑歪，按既定路径 drop & recreate test DB，不反过来给迁移加守卫。
-- `agent_reported_at` 为 NULL 的行不破坏任何 `Select("*")` 查询：三个 struct
+- `agent_reported_hosting_at` 为 NULL 的行不破坏任何 `Select("*")` 查询：三个 struct
   （`modules/robot/db.go`、`modules/bot_api/db.go`、`modules/botfather/db.go`）
   各自的既有查询测试全绿。
 - 列 COMMENT 含「不可用于鉴权」字样。

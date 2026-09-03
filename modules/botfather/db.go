@@ -54,9 +54,10 @@ type robotModel struct {
 	// <vendor>_hosted）；空=未上报。写入在 modules/bot_api 的 register，这里只读。
 	// 自报值，不可用于鉴权。
 	AgentHosting string
-	// AgentReportedAt 最近一次收到 Agent 信息上报的时间；timestamp NULL，
-	// 从未上报时无效。NullTime 的理由同上面的 BoundAt。
-	AgentReportedAt dbr.NullTime
+	// AgentReportedHostingAt 最近一次收到 **agent_hosting** 上报的时间；
+	// timestamp NULL，从未上报时无效。只在 hosting 被上报时前进（见
+	// modules/bot_api/db.go 的 updateRobotAgentInfo）。NullTime 的理由同上面的 BoundAt。
+	AgentReportedHostingAt dbr.NullTime
 	db.BaseModel
 }
 
@@ -338,7 +339,13 @@ func (d *botfatherDB) updateRobotDescription(robotID string, description string)
 	return err
 }
 
-// updateRobotAgentInfo 更新机器人的 Agent 运行时信息
+// updateRobotAgentInfo 更新机器人的 Agent 运行时信息。
+//
+// **死代码 —— 无调用方，不要用它。** 活的写入方是
+// modules/bot_api/db.go 的 updateRobotAgentInfo（POST /v1/bot/register 唯一入口）。
+// 本副本已与之分叉：它只写三列、无条件覆盖（缺席字段会把并发写入的值刷回旧值），
+// 也不管 agent_hosting / agent_reported_hosting_at。要复用请直接删掉它改调 bot_api
+// 那份，别在这里补功能 —— 两份写入方就是两套语义。
 func (d *botfatherDB) updateRobotAgentInfo(robotID, agentPlatform, agentVersion, pluginVersion string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
 		"agent_platform": agentPlatform,

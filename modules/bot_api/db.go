@@ -1,8 +1,6 @@
 package bot_api
 
 import (
-	"time"
-
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
@@ -45,10 +43,12 @@ type robotModel struct {
 	// <vendor>_hosted）；空=未上报。取值开放、只校验形状，见 register.go 的
 	// agentHostingPattern。自报值，仅供展示与排障，不可用于鉴权。
 	AgentHosting string
-	// AgentReportedAt 最近一次收到 Agent 信息上报的时间；timestamp NULL，
-	// 从未上报时无效。必须用 NullTime 承接 NULL —— 否则 Select("*") 把 NULL
-	// 扫进 time.Time 会报错，殃及所有 robot 查询（同 botfather 的 BoundAt）。
-	AgentReportedAt dbr.NullTime
+	// AgentReportedHostingAt 最近一次收到 **agent_hosting** 上报的时间（SQL NOW()
+	// 写入）；timestamp NULL，从未上报时无效。只在 hosting 被上报时前进 ——
+	// 版本-only 的上报刷新它就等于替一份该次上报从未提及的数据背书新鲜度。
+	// 必须用 NullTime 承接 NULL —— 否则 Select("*") 把 NULL 扫进 time.Time
+	// 会报错，殃及所有 robot 查询（同 botfather 的 BoundAt）。
+	AgentReportedHostingAt dbr.NullTime
 	db.BaseModel
 }
 
@@ -77,28 +77,72 @@ func (d *botAPIDB) updateRobotIMTokenCache(robotID string, imToken string) error
 	return err
 }
 
-// updateRobotAgentInfo updates agent runtime info for a robot.
+// agentReport is a self-reported agent runtime update. A nil field means "the
+// caller did not report this one", which is materially different from reporting
+// an empty value — see updateRobotAgentInfo.
+type agentReport struct {
+	Platform *string
+	Version  *string
+	Plugin   *string
+	Hosting  *string
+}
+
+// isEmpty reports whether nothing at all was supplied, in which case there is no
+// report to persist (and in particular no timestamp to advance).
+func (r agentReport) isEmpty() bool {
+	return r.Platform == nil && r.Version == nil && r.Plugin == nil && r.Hosting == nil
+}
+
+// updateRobotAgentInfo persists a self-reported agent runtime update.
 //
-// agent_reported_at is always stamped with the current time, even when every
-// other value is unchanged: its meaning is "when we last *received* a report",
-// not "when the value last changed". Without that, the whole agent_* group is a
-// set of bare values with no way to judge freshness — robot.updated_at has no
-// ON UPDATE clause, so it cannot answer it either.
-// A nil agentHosting means "the caller did not report it" and leaves the column
-// alone; a non-nil one overwrites (including with "" to clear). Resolving nil
-// into the previously-read value here would look equivalent but turns two
-// concurrent registers into a lost update — see the caller's comment. The three
-// version strings keep their pre-existing merge-then-write contract; only the
-// new column gets the stricter treatment.
-func (d *botAPIDB) updateRobotAgentInfo(robotID, agentPlatform, agentVersion, pluginVersion string, agentHosting *string) error {
-	set := map[string]interface{}{
-		"agent_platform":    agentPlatform,
-		"agent_version":     agentVersion,
-		"plugin_version":    pluginVersion,
-		"agent_reported_at": time.Now(),
+// **Every column is written only when the caller actually supplied it.** A nil
+// field is absent from the statement, not resolved into the value the caller read
+// a moment ago. The two look equivalent and are not: read-then-write-back turns
+// two concurrent registers into a lost update — runtime A reads, runtime B writes
+// a new agent_version, A writes the old one back. Nothing prevents two runtimes
+// registering the same bot today (the occupancy lock is cooperative), and
+// "report only agent_hosting" is a request shape this feature introduced, so the
+// interleaving is reachable. Callers therefore must NOT substitute stored values
+// for absent fields; "empty means unchanged" is observably identical to "column
+// absent from the statement".
+//
+// agent_hosting is written even when the value is empty, as long as the caller
+// supplied the field: reporting "" is how a runtime clears a stale shape.
+//
+// agent_reported_hosting_at is stamped **only when hosting was supplied**, and
+// with SQL NOW() rather than Go's time.Now():
+//
+//   - Only on hosting reports, because its documented job is judging whether the
+//     stored agent_hosting is still current. A version-only report refreshing it
+//     would assert freshness for data that report never mentioned — and the
+//     scenario where the two diverge (a new runtime that omits agent_hosting) is
+//     exactly the one the pointer semantics exist to handle.
+//   - With NOW(), because the value is rendered in an API response beside
+//     bound_at, which modules/botfather/db.go writes with SQL NOW(). Go's
+//     time.Now() goes through the driver's Config.Loc (UTC by default, and the
+//     DSN never sets loc) while the app image pins TZ=Asia/Shanghai, so on a
+//     MySQL session that is not UTC the two timestamps would sit in one response
+//     eight hours apart with nothing to explain the gap. Production MySQL is UTC
+//     today, so that was latent rather than live — reading the wall clock from
+//     the same place as the column it is compared against removes the dependency
+//     on the DB's session time zone altogether.
+func (d *botAPIDB) updateRobotAgentInfo(robotID string, report agentReport) error {
+	if report.isEmpty() {
+		return nil
 	}
-	if agentHosting != nil {
-		set["agent_hosting"] = *agentHosting
+	set := map[string]interface{}{}
+	if report.Platform != nil {
+		set["agent_platform"] = *report.Platform
+	}
+	if report.Version != nil {
+		set["agent_version"] = *report.Version
+	}
+	if report.Plugin != nil {
+		set["plugin_version"] = *report.Plugin
+	}
+	if report.Hosting != nil {
+		set["agent_hosting"] = *report.Hosting
+		set["agent_reported_hosting_at"] = dbr.Expr("NOW()")
 	}
 	_, err := d.session.Update("robot").SetMap(set).Where("robot_id=?", robotID).Exec()
 	return err

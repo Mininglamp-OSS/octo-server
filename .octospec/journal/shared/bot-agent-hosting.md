@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: bot-agent-hosting"
-description: A self-reported hosting shape on robot (agent_hosting + agent_reported_at), written by POST /v1/bot/register and read back on GET /v1/user/bots. The value space is open — the server validates a lowercase-slug shape, not a set of literals — so a new hosting provider needs no server release. No new errcode, endpoint or i18n entry.
+description: A self-reported hosting shape on robot (agent_hosting + agent_reported_hosting_at), written by POST /v1/bot/register and read back on GET /v1/user/bots. The value space is open — the server validates a lowercase-slug shape, not a set of literals — so a new hosting provider needs no server release. No new errcode, endpoint or i18n entry.
 tags: ["bot-api", "wire-contract", "trust-boundary", "migration", "testing"]
 timestamp: 2026-09-03T00:00:00+08:00
 # --- octospec extension fields ---
@@ -20,7 +20,7 @@ today, and no existing field can be made to answer it** — so the work is a new
 self-reported field plus the metadata needed to judge it.
 
 - **`robot.agent_hosting`** (VARCHAR(64), `''` = never reported) and
-  **`robot.agent_reported_at`** (TIMESTAMP NULL), added in one atomic `ALTER`.
+  **`robot.agent_reported_hosting_at`** (TIMESTAMP NULL), added in one atomic `ALTER`.
 - **Written by `POST /v1/bot/register`**, User Bot branch only, alongside the
   three existing `agent_*` columns it already writes.
 - **Read back on `GET /v1/user/bots`** — the bot owner's own face, which already
@@ -69,7 +69,7 @@ half-hearted blocklist is the worst of both. The other half of the trade: under 
 whitelist a typo becomes an empty string (silent data loss); with open values it
 becomes a visible odd value (findable, fixable). The latter is easier to operate.
 
-**`agent_reported_at` is not optional, and its tense is the point.** It means
+**`agent_reported_hosting_at` is not optional, and its tense is the point.** It means
 "when we last *received* a report", not "when the value last changed" — so the
 UPDATE fires even when every value is identical. That removed an existing
 "skip the UPDATE if nothing changed" shortcut, on purpose. Without the column the
@@ -117,6 +117,78 @@ function and the source guards stayed next to the code. Blank-importing
 for the App Bot case: a table created outside sql-migrate leaves no
 `gorp_migrations` row and makes the *next* package's migration collide — the
 known root cause behind `modules/message`'s skipped DB tests.
+
+## What review caught (PR #837, two independent reviewers)
+
+Both reviewers reproduced the same two blocking findings empirically, on the same
+head, without having read each other. Worth recording because both were
+**invisible to a green test suite** — and in both cases the diff's own comments
+already contained the argument that condemned the code.
+
+**The timestamp was on the wrong clock.** `agent_reported_hosting_at` was written
+with Go's `time.Now()`, which the driver converts through `Config.Loc` — UTC by
+default, and the DSN never sets `loc`. Its sibling `bound_at`, the field it is
+explicitly calibrated against and rendered beside, is written by MySQL `NOW()`.
+Measured: on a session at `+08:00`, the two sit **eight hours apart** in one API
+response with nothing to explain the gap, in a field whose only job is judging
+freshness. Production MySQL is UTC, so this was latent rather than live — but the
+tests could not have caught it either way: they compared two Go-written values to
+each other (monotonic within one clock) or seeded via SQL `NOW()`, never putting
+both sources in one assertion. Fixed with `dbr.Expr("NOW()")`, plus a test that
+sets the session zone to `+08:00` and asserts the two timestamps agree.
+
+**The diff violated its own stated rule.** The comment refusing to resolve an
+absent `agent_hosting` into the just-read value — "A reads old → B writes new →
+A writes old back" — sat directly above three sibling columns getting exactly that
+treatment. And the diff *widened* the window: before, the UPDATE ran only when a
+value differed; after, it ran whenever any `agent_*` field was present, so
+"report only hosting" (a request shape this feature introduced) wrote all three
+version columns from a stale read. Now all four fields are pointers and nil means
+absent from the SQL.
+
+The lesson is not "review carefully". It is that **a design rule stated in a
+comment is not applied by being stated** — the surrounding code was written before
+the rule was articulated, and nothing re-checked it afterwards. What would have
+caught it is asserting on the emitted SQL, which is now
+`TestUpdateRobotAgentInfoOmitsUnreportedColumns`.
+
+**A test that carried the argument did not test it.** The comment on
+`TestRegisterVersionOnlyReportKeepsHostingButAdvancesTimestamp` claimed the
+timestamp assertion distinguished sparse-write from read-then-write-back. It does
+not: under the rejected implementation the statement contains both the same value
+and the new timestamp, so every assertion passes. Replaced with an **out-of-band
+write** between the two registers (a third party changes the column; the write-back
+implementation clobbers it, the sparse one does not), plus the SQL-level assertions.
+
+**`strings.ToLower` is not ASCII-confined.** The shape check folded case *before*
+the ASCII regexp, so `U+212A KELVIN SIGN` → `k` and `U+0130` → `i` passed
+validation — making the function's own documented invariant ("Unicode confusables
+all fail it") false, while the test's confusable row happened to pick the one that
+does fail (`U+200B`). No injection: what landed in the column was always a clean
+ASCII slug, and every such input has an ASCII twin the caller could report
+directly. But it collapsed two distinct inputs onto one stored value, and the
+ASCII property turned out to be **load-bearing for the column-width invariant**
+too — `len()` counts bytes while `VARCHAR(64)` counts characters, and they agree
+only because non-ASCII is now rejected.
+
+**"Rejected" and "cleared" were documented as the same thing.** `hosting =
+&normalized` was assigned outside the validity branch, so a rejected value reached
+the SQL as `''` and overwrote a stored one. The PR body said "degrades to not
+reported" (reads as *leave alone*); the field comment said "present overwrites"
+(actually *clears*). Settled on **leave alone**, because the realistic trigger is
+not adversarial: `self-hosted` — hyphenated, the exact spelling of the GitHub
+Actions convention this naming cites as its model — is rejected by design, so one
+client release with that typo would blank the column fleet-wide behind a single log
+line. Clearing is still expressible, by reporting `""` deliberately.
+
+**Two smaller ones worth keeping.** The scope of `agent_reported_hosting_at` was
+wrong: it advanced on *any* `agent_*` report, so a version-only report vouched for
+hosting data it never mentioned — and the divergent case is precisely the "new
+runtime that omits the field" scenario used to justify the pointer semantics. Now
+stamped only on hosting reports, and renamed from `agent_reported_at` so the name
+carries the scope. And `registerAppBot` was decoding an unbounded body to produce
+one log line; the body is now capped at 4 KiB, with overflow treated as "no
+telemetry" so registration still cannot fail.
 
 ## Known limitation (recorded, not fixed)
 

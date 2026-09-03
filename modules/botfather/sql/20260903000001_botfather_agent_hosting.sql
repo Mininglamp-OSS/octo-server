@@ -14,16 +14,22 @@
 -- 让同一次上报的 agent_platform/version/plugin_version 一起失败。校验上界高于
 -- 列宽不是余量，是延迟的失败。
 --
--- agent_reported_at 语义是「最近一次收到上报」而非「值变更时间」：robot.updated_at
--- 没有 ON UPDATE（见 modules/robot/sql/20210926000001_robot_legacy01.sql），
--- 缺这一列则 agent_* 全组都是无从判断新鲜度的裸值。
+-- agent_reported_hosting_at 语义是「最近一次收到 **agent_hosting** 上报」，只在 hosting
+-- 被上报时前进（版本-only 的上报不刷新它 —— 那等于替一份该次上报从未提及的数据背书
+-- 新鲜度）。缺这一列则 agent_hosting 是个无从判断可信度的裸值：robot.updated_at 没有
+-- ON UPDATE（见 modules/robot/sql/20210926000001_robot_legacy01.sql），答不了这个问题。
+-- 由 SQL NOW() 写入而非 Go 侧 time.Now()：本列与 bound_at（botfather/db.go 用 NOW() 写）
+-- 在同一个 API 响应里并列展示，而 Go 侧写入要经驱动的 Config.Loc（默认 UTC，DSN 未设 loc）
+-- 转换，应用镜像又固定 TZ=Asia/Shanghai —— MySQL session 时区非 UTC 时两个时间戳会相差
+-- 8 小时且无任何标记解释。生产 MySQL 目前是 UTC，所以那是潜伏而非已发生；改用 NOW() 则
+-- 彻底不再依赖这个前提。
 ALTER TABLE `robot`
   ADD COLUMN `agent_hosting` VARCHAR(64) NOT NULL DEFAULT ''
     COMMENT 'Agent自报托管形态，小写slug如self_hosted/octo_hosted/<vendor>_hosted；空=未上报；不可用于鉴权',
-  ADD COLUMN `agent_reported_at` TIMESTAMP NULL DEFAULT NULL
-    COMMENT '最近一次收到Agent信息上报的时间（新鲜度判定）';
+  ADD COLUMN `agent_reported_hosting_at` TIMESTAMP NULL DEFAULT NULL
+    COMMENT '最近一次收到agent_hosting上报的时间(SQL NOW()写入)；仅hosting上报时前进；判定agent_hosting新鲜度';
 
 -- +migrate Down
 ALTER TABLE `robot`
-  DROP COLUMN `agent_reported_at`,
+  DROP COLUMN `agent_reported_hosting_at`,
   DROP COLUMN `agent_hosting`;

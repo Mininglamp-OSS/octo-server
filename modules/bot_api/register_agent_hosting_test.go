@@ -56,9 +56,18 @@ func TestNormalizeAgentHosting(t *testing.T) {
 		{"数字开头", "1host", "", false},
 		{"下划线开头", "_hosted", "", false},
 		{"注入形状的串", `<script>alert(1)</script>`, "", false},
+		// Unicode 混淆字符：Go 的简单小写映射**不限于 ASCII** ——
+		// U+212A KELVIN SIGN 折成 'k'、U+0130 折成 'i'，所以只要 ToLower 排在
+		// ASCII 检查之前，它们就能满足一个「只允许 ASCII」的正则。初版正是那个顺序，
+		// 于是注释里写的「confusables all fail it」是假的，而测试恰好只挑了会失败的
+		// U+200B（PR #837 两位 reviewer 独立实测指出）。现在 ASCII 检查前置。
+		{"U+212A KELVIN SIGN 不得折成 k", "\u212A_hosted", "", false},
+		{"U+0130 不得折成 i", "\u0130_hosted", "", false},
+		{"带重音的拉丁字母", "sélf_hosted", "", false},
+		{"全角下划线等非 ASCII", "self＿hosted", "", false},
 		{"含引号", `self_hosted"`, "", false},
 		{"控制字符", "self\x00hosted", "", false},
-		{"Unicode 混淆字符", "self_hosted\u200b", "", false},
+		{"零宽空格", "self_hosted\u200b", "", false},
 		{"中文", "自运维", "", false},
 		{"恰好列宽的合法 slug 放行", strings.Repeat("a", maxAgentHostingLen), strings.Repeat("a", maxAgentHostingLen), true},
 		{"超列宽 1 字节：被长度门拦下", strings.Repeat("a", maxAgentHostingLen+1), "", false},

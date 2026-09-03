@@ -1,8 +1,10 @@
 package bot_api
 
 import (
+	"net/http"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -48,15 +50,20 @@ const (
 // plugin_version silently fail to store too (see the known limitation in the
 // task brief). Headroom above the column width is not headroom, it is a delayed
 // failure. TestAgentHostingBoundMatchesColumnWidth pins the equality.
+//
+// The bound counts BYTES while VARCHAR(64) counts CHARACTERS. That is exact, not
+// merely conservative, only because normalizeAgentHosting rejects non-ASCII
+// before this comparison can matter — the ASCII property is load-bearing for the
+// column-width invariant, not just for tidiness.
 const maxAgentHostingLen = 64
 
-// agentHostingPattern is the accepted shape: a lowercase slug.
+// agentHostingPattern is the accepted shape: a lowercase ASCII slug.
 //
-// This is what actually keeps caller-controlled bytes out of the column and out
-// of the owner-facing response — quotes, angle brackets, whitespace, control
-// characters and Unicode confusables all fail it, without the server needing to
-// know which vendors exist. An enum would have blocked those too, but only as a
-// side effect of blocking everything it had not been told about.
+// This is what keeps caller-controlled bytes out of the column and out of the
+// owner-facing response — quotes, angle brackets, whitespace and control
+// characters all fail it, without the server needing to know which vendors
+// exist. An enum would have blocked those too, but only as a side effect of
+// blocking everything it had not been told about.
 //
 // It is a DATA-QUALITY constraint, not an authorization one. Nothing here
 // establishes that the caller is entitled to the value it reports: any holder of
@@ -65,12 +72,41 @@ const maxAgentHostingLen = 64
 // allowed to say it". Which is exactly why this column must not feed authz.
 var agentHostingPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// isASCII reports whether s contains only single-byte characters.
+//
+// Checked BEFORE case folding, which is the whole point — see
+// normalizeAgentHosting. Also what makes the byte-vs-character bound sound: an
+// all-ASCII string's byte length equals its character count, so comparing
+// len(s) against a VARCHAR(n) character width is exact rather than merely
+// conservative.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
 // normalizeAgentHosting validates the reported value's shape.
 //
-// Order is load-bearing. TrimSpace first (returns a sub-slice, allocates
-// nothing), then the length bound, and only then ToLower + the regexp: the field
-// is entirely caller-controlled and register takes an unbounded JSON body, so a
-// 10MB value must be rejected without ToLower allocating a 10MB copy of it.
+// Order is load-bearing, in two separate ways.
+//
+// **Length before folding**, because the field is entirely caller-controlled and
+// register takes an unbounded JSON body: strings.ToLower allocates a copy the
+// size of its input, so a 10MB value must be rejected without paying for a 10MB
+// lowercase copy of it. strings.TrimSpace is safe to run first — it returns a
+// sub-slice and allocates nothing.
+//
+// **ASCII before folding**, because Go's simple lowercase mapping is not
+// confined to ASCII: U+212A KELVIN SIGN folds to `k` and U+0130 LATIN CAPITAL I
+// WITH DOT ABOVE folds to `i`, so `"\u212A_hosted"` would satisfy an
+// ASCII-only regexp applied *after* the fold. That is not an injection (what
+// would land in the column is a clean ASCII slug, and every such input has an
+// ASCII twin the caller could simply report directly), but it silently collapses
+// two distinct inputs onto one stored value and made this function's own
+// documented invariant false. Rejecting non-ASCII up front is what makes
+// "confusables are rejected" true rather than aspirational.
 //
 // Case is folded rather than rejected: `Self_Hosted` and `self_hosted` carry the
 // same intent, and folding avoids a silently-dropped report. Reporting an empty
@@ -83,6 +119,9 @@ func normalizeAgentHosting(v string) (normalized string, ok bool) {
 	if len(trimmed) > maxAgentHostingLen {
 		return "", false
 	}
+	if !isASCII(trimmed) {
+		return "", false
+	}
 	folded := strings.ToLower(trimmed)
 	if !agentHostingPattern.MatchString(folded) {
 		return "", false
@@ -90,20 +129,56 @@ func normalizeAgentHosting(v string) (normalized string, ok bool) {
 	return folded, true
 }
 
-// BotRegisterReq is the optional request body for register.
+// BotRegisterReq is the optional request body for register. Every field is
+// optional; a caller may send an empty body, no body at all, or malformed JSON —
+// registration succeeds regardless (see registerUserBot).
+//
+// All four are POINTERS so that "absent" is distinguishable from "reported as
+// empty". Absent leaves the column untouched *in SQL*; present overwrites,
+// including with "" to clear. The three version fields were plain strings before
+// this feature, merged against the stored value with "empty means unchanged" —
+// which is observably identical to "absent from the statement" for a single
+// writer, and strictly better under concurrency (see updateRobotAgentInfo).
+// The wire contract is unchanged by the switch: omitting a field and sending it
+// as "" were already indistinguishable to those three.
 type BotRegisterReq struct {
-	AgentPlatform string `json:"agent_platform"`
-	AgentVersion  string `json:"agent_version"`
-	PluginVersion string `json:"plugin_version"`
-	// AgentHosting is a POINTER on purpose, unlike the three strings above.
-	//
-	// Those merge field-wise with "empty keeps the stored value", which is right
-	// for a version number. It is wrong here: on a self-hosted → platform-hosted
-	// switch, a new runtime that omits the field would leave the stale
-	// `self_hosted` in place, and for this field a stale value is more harmful
-	// than an empty one. So: absent (nil) keeps the stored value, present
-	// overwrites it — including with "" to clear.
+	AgentPlatform *string `json:"agent_platform"`
+	AgentVersion  *string `json:"agent_version"`
+	PluginVersion *string `json:"plugin_version"`
+	// AgentHosting differs from the three above in one way: for them an empty
+	// report is meaningless, while here it is the way a runtime clears a stale
+	// shape. On a self-hosted → platform-hosted switch a stale value is more
+	// harmful than an empty one, so clearing must be expressible.
 	AgentHosting *string `json:"agent_hosting"`
+}
+
+// maxRegisterBodyBytes caps the register request body.
+//
+// The body is pure telemetry — every field is optional and register succeeds
+// without any of it — but until this cap existed, `binding.JSON`
+// (json.NewDecoder with no limit) would decode whatever a token holder sent,
+// and this route installs no other bound. Four sibling bot_api routes already
+// cap theirs (send.go, batch_users.go, voice_adapter.go); this one did not,
+// which mattered most on the App Bot branch, where the decode buys nothing but
+// a log line.
+//
+// 4 KiB is generous for four short strings and small enough that the decode
+// cannot be turned into an allocation lever. Overflow is treated as "no
+// telemetry reported", never as a failed registration — see readAgentReport.
+const maxRegisterBodyBytes = 4 << 10
+
+// readAgentReport decodes the optional telemetry body under a size cap.
+//
+// Every failure mode — no body, empty body, malformed JSON, body over the cap —
+// yields the zero value, i.e. "nothing was reported". None of them can fail the
+// registration: this is the only channel a bot has to recover after losing its
+// connection (#696). MaxBytesReader is applied rather than the error inspected,
+// so an oversized body is cut off instead of buffered.
+func readAgentReport(c *wkhttp.Context) BotRegisterReq {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRegisterBodyBytes)
+	var req BotRegisterReq
+	_ = c.ShouldBindJSON(&req)
+	return req
 }
 
 // BotRegisterResp is the response for bot registration.
@@ -162,10 +237,9 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 		ba.db.updateRobotIMTokenCache(robot.RobotID, imToken)
 	}
 
-	// Optional: parse agent runtime info
-	var req BotRegisterReq
-	_ = c.ShouldBindJSON(&req)
-	ba.applyAgentReport(robot, &req)
+	// Optional: parse agent runtime info (telemetry only; never fails register)
+	req := readAgentReport(c)
+	ba.applyAgentReport(robot.RobotID, &req)
 
 	cfg := ba.ctx.GetConfig()
 	apiURL := botutil.DeriveAPIURL(cfg)
@@ -192,59 +266,48 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 //
 // Extracted from registerUserBot so that function stays about registration
 // (token → IM token → response) rather than growing a second concern.
-func (ba *BotAPI) applyAgentReport(robot *robotModel, req *BotRegisterReq) {
-	if req.AgentPlatform == "" && req.AgentVersion == "" && req.PluginVersion == "" && req.AgentHosting == nil {
-		return
+//
+// Note there is no merge against the stored row here, and no read of `robot`'s
+// agent columns: an absent field must stay absent all the way into the SQL, so
+// substituting the previously-read value would reintroduce exactly the lost
+// update updateRobotAgentInfo's doc comment describes.
+func (ba *BotAPI) applyAgentReport(robotID string, req *BotRegisterReq) {
+	report := agentReport{
+		Platform: req.AgentPlatform,
+		Version:  req.AgentVersion,
+		Plugin:   req.PluginVersion,
 	}
 
-	// The three version strings keep their long-standing merge contract:
-	// an empty field means "unchanged", so fall back to the stored value.
-	platform, version, plugin := req.AgentPlatform, req.AgentVersion, req.PluginVersion
-	if platform == "" {
-		platform = robot.AgentPlatform
-	}
-	if version == "" {
-		version = robot.AgentVersion
-	}
-	if plugin == "" {
-		plugin = robot.PluginVersion
-	}
-
-	// Pointer semantics: only a present field overwrites (see BotRegisterReq).
-	//
-	// The pointer is carried all the way down to the SetMap rather than being
-	// resolved into "the value we just read" here: an absent field must leave the
-	// column untouched in SQL. Reading the stored value and writing it back would
-	// look equivalent but loses concurrent updates — two runtimes registering the
-	// same bot (which nothing prevents today, see the occupancy-lock gap in the
-	// task brief) can interleave as "A reads old → B writes new → A writes old
-	// back".
-	var hosting *string
 	if req.AgentHosting != nil {
 		normalized, valid := normalizeAgentHosting(*req.AgentHosting)
-		if !valid {
-			// Never block register on this: it is the only channel a bot has to
+		if valid {
+			report.Hosting = &normalized
+		} else {
+			// A malformed value leaves the stored one ALONE — it is not treated as
+			// a report at all. The alternative (store "") would let one client
+			// release that spells the value `self-hosted` (hyphenated, the exact
+			// spelling of the GitHub Actions convention this naming follows) blank
+			// the column fleet-wide, with nothing but a log line to show for it.
+			// Clearing stays available, but only by reporting "" deliberately —
+			// which is a well-formed report, not a rejected one.
+			//
+			// Never block register either: it is the only channel a bot has to
 			// recover after losing its connection, and issue #696's second incident
 			// was register being refused and bots never coming back up (see the
-			// regression assertions in ratelimit_integration_test.go). A rejected
-			// value degrades to "not reported" plus a log line, never to a failed
-			// register. The raw value is NOT logged — it is caller-controlled and
-			// would carry arbitrary bytes into the log.
-			ba.Warn("Agent 上报的 agent_hosting 形状非法（应为小写 slug），按未上报处理",
-				zap.String("robotID", robot.RobotID),
+			// regression assertions in ratelimit_integration_test.go). The raw
+			// value is NOT logged — it is caller-controlled and would carry
+			// arbitrary bytes into the log.
+			ba.Warn("Agent 上报的 agent_hosting 形状非法（应为小写 ASCII slug），本次忽略该字段，已存值保持不变",
+				zap.String("robotID", robotID),
 				zap.Int("rejectedLen", len(*req.AgentHosting)))
 		}
-		hosting = &normalized
 	}
 
-	// Unconditional write, even when nothing changed: agent_reported_at means
-	// "when we last received a report", so it has to advance on every report. The
-	// previous "skip the UPDATE if all values are equal" shortcut is gone on
-	// purpose. Cost is acceptable — register is only called on (re)connect, not on
-	// a heartbeat cadence (see modules/common/system_settings.go's note on the
-	// heartbeat rate floor).
-	if err := ba.db.updateRobotAgentInfo(robot.RobotID, platform, version, plugin, hosting); err != nil {
-		ba.Warn("更新Agent信息失败", zap.Error(err), zap.String("robotID", robot.RobotID))
+	if report.isEmpty() {
+		return
+	}
+	if err := ba.db.updateRobotAgentInfo(robotID, report); err != nil {
+		ba.Warn("更新Agent信息失败", zap.Error(err), zap.String("robotID", robotID))
 	}
 }
 
@@ -277,9 +340,8 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 	// plugin_package + api_url connect guide). If symmetry is wanted later, the
 	// place to add it is columns on app_bot — never a write into the robot table,
 	// whose rows belong to User Bots.
-	var req BotRegisterReq
-	_ = c.ShouldBindJSON(&req)
-	if req.AgentHosting != nil || req.AgentPlatform != "" || req.AgentVersion != "" || req.PluginVersion != "" {
+	req := readAgentReport(c)
+	if req.AgentHosting != nil || req.AgentPlatform != nil || req.AgentVersion != nil || req.PluginVersion != nil {
 		ba.Warn("App Bot 上报了 Agent 运行时信息，已忽略（App Bot 不支持 agent_* 字段）",
 			zap.String("uid", appBot.UID))
 	}

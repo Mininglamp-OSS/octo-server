@@ -4,9 +4,41 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-03 (bot-agent-hosting · review round 1)
+
+- **Fixed** — PR #837 两位 reviewer 独立实测复现的两个阻塞项：
+  ① `agent_reported_hosting_at` 原用 Go `time.Now()` 写，经驱动 `Config.Loc`（默认 UTC，
+  DSN 未设 `loc`）转换，而它并列展示的 `bound_at` 由 MySQL `NOW()` 写、应用镜像固定
+  `TZ=Asia/Shanghai` —— session 时区非 UTC 时两者相差 8 小时。改 `dbr.Expr("NOW()")`。
+  生产 MySQL 是 UTC，故为潜伏未发生。
+  ② 四个 `agent_*` 字段全改稀疏写入（`*string`，nil 即不进 `SetMap`）：初版只对新列稀疏，
+  三个既有版本列仍回写读到的值，且把条件 UPDATE 改成无条件，等于新开一条丢更新路径。
+- **Learned** — **注释里写下的规则不会因为被写下就生效。** 那段「不要把缺席字段解析成
+  刚读到的值，会丢更新」的注释，正上方三行就是它否决的写法 —— 周边代码早于这句话存在，
+  而没有任何东西在事后重新审视它。同时两种实现对**单写者**的所有 DB 可观察断言完全等价，
+  所以推理产物（注释）与验证产物（测试）盲在同一处。可断言的是**发出的 SQL 里有哪些列**。
+- **Learned** — `strings.ToLower` **不限于 ASCII**：`U+212A KELVIN SIGN`→`k`、
+  `U+0130`→`i`，所以折叠排在 ASCII-only 正则之前时混淆字符能通过，让函数自己注释里
+  「confusables all fail it」变成假的（测试恰好只挑了会失败的 `U+200B`）。ASCII 前置后
+  才成立；且 ASCII 性质同时是**列宽不变量**的前提（`len()` 数字节 vs `VARCHAR` 数字符）。
+- **Guarded** — 「被拒」与「清空」原本被文档成同一件事（PR 描述说 degrades to not
+  reported，字段注释说 present overwrites）。定为**保持不变**：触发场景不需要恶意，
+  `self-hosted`（连字符，正是所引用 GitHub Actions 的写法）就会被拒，一次客户端拼错
+  会把全量 bot 的该列刷空。清空仍可做，但要显式报 `""`。
+- **Learned** — 测试注释声称「能区分两种实现」时，那本身是个需要验证的断言。初版那条
+  「值保留 + 时间戳前进」在被否决的写回实现下三条断言全过。改用**带外写入**（第三方在
+  两次 register 之间改列，写回实现会覆盖它）+ sqlmock 直接断言 SQL 文本。
+- **Changed** — `agent_reported_at` 更名 `agent_reported_hosting_at` 并收窄为只在 hosting
+  被上报时前进：原实现任何 `agent_*` 上报都刷新它，等于替一份该次上报从未提及的数据背书
+  新鲜度，而分歧场景正是用来论证指针语义的那个「新 runtime 漏报 hosting」。
+- **Guarded** — register 的 body 加 4 KiB 上限（`binding.JSON` 无上限，本路由此前无任何
+  body 界，而四个 sibling bot_api 路由都有）。App Bot 分支上那次解码只换来一行日志。
+  超限按「未上报」处理，绝不让 register 失败（#696）。
+
+
 ## 2026-09-03 (bot-agent-hosting)
 
-- **Added** — `robot.agent_hosting` + `robot.agent_reported_at`（单条原子 `ALTER`）。
+- **Added** — `robot.agent_hosting` + `robot.agent_reported_hosting_at`（单条原子 `ALTER`）。
   `POST /v1/bot/register` 的 User Bot 分支接收自报托管形态，`GET /v1/user/bots` 带出。
   App Bot 显式不支持（只解析 body 打 Warn，由源码守卫钉住 `app_bot` 无 `agent_*` 列）。
   无新 errcode / 端点 / i18n 条目 / 路由变更。
@@ -40,7 +72,6 @@ change-log convention (§7). Newest first.
   `modules/app_bot` 而**不能**裸 `CREATE TABLE IF NOT EXISTS` —— 绕过 sql-migrate 建表
   不写 `gorp_migrations`，会让下一个包的同名迁移撞「already exists」（`modules/message`
   大量 DB 测试被 skip 的已知根因）。
-
 ## 2026-08-24 (group-exit-notice-visibility)
 
 - **Fixed** — 「某成员退出群聊」系统提示（`type=1021`）改为**全员可见 + RedDot:0**，
