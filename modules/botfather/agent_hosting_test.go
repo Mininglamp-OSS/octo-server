@@ -448,7 +448,7 @@ func TestRegisterAllEmptyLegacyFieldsWritesNothing(t *testing.T) {
 		"没有可写内容时不得盖 hosting 时间戳")
 }
 
-// TestRegisterOversizedBodyDegradesToNoTelemetry —— 超过 maxRegisterBodyBytes
+// TestRegisterOversizedBodyDegradesToNoTelemetry —— 超过 bot_api.MaxRegisterBodyBytes
 // 的 body 按「未上报」处理：register 仍 200，已存列不受影响。
 //
 // 这是 PR #837 round 2 的 P2-5：body 上限是本功能唯一没有测试的新行为
@@ -746,7 +746,7 @@ func TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate(t *testing.T) {
 // **本迁移不加守卫，这是遵循本仓既定原则，不是本任务的自由裁量**：
 // sql-migrate 已用 `gorp_migrations` 追踪每个文件的版本，所以不要在每条迁移里堆幂等
 // 代码 —— 存在性守卫是"同一份迁移必须跨多个状态不同的环境运行"时的应急路径。
-// 实测口径：全仓 84 个含 ADD COLUMN 的迁移里只有 15 个带守卫，且集中在该原则确立之前
+// 实测口径（只数 Up 段）：全仓 83 个含 ADD COLUMN 的迁移里只有 14 个带守卫，且集中在该原则确立之前
 // （2026-06 前后）；此后的 20260728 / 20260810 / 20260830 都是裸 DDL。
 //
 // reviewer 提出的两-pod 竞争风险是真实的，但它的解法在**部署层**（迁移加锁或单 pod
