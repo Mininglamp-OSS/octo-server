@@ -4,6 +4,145 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-04 (bot-agent-hosting · review round 4)
+
+- **Learned** — **注释声称有区分力、实际没有的测试，比没有测试更糟：它会被相信。**
+  reviewer 用变异法证明我两条关键测试杀不掉对应变异：时区测试把**旁观连接**调偏
+  （register 走池里另一条，两个 TIMESTAMP 落同一 UTC 瞬间、偏差恒 0）；三条稀疏写入
+  测试的带外 UPDATE 落在下一次 register **之前**（合并实现读到新值再写回，结果相同）。
+  而我上一轮把"验了两处"表述成了"三处全部验证通过"。
+- **Adopted** — 定为规则：**每个行为断言都要过变异检查，且测试注释写明它杀掉哪个变异。**
+  本轮 6 个断言逐一实跑变异版验证（SQL 时钟 / 合并守卫 / legacy 空值跳过 /
+  日志字段 / App Bot Warn / 全有或全无解码）。
+- **Changed** — 稀疏写入的不变量改由**源码守卫**承担：真正的交错窗口在
+  queryRobotByBotToken 与 UPDATE 之间，行为测试无法确定性插入。守卫区分**赋值目标** ——
+  robot 行的值作为独立 stored 快照传参用于 skip 比较合法（不匹配时写调用方的值），
+  赋回 req.Agent* 则禁止。
+- **Learned** — **一条需要污染进程级状态才能运行的测试，在整包里就是不可靠的。**
+  时区端到端测试要区分两种时钟，必须把连接池压到单连接（SetMaxOpenConns 是进程级），
+  于是其它测试排队/超时、失败集每次不同。**删掉而非修好**：它守的不变量有确定性替代
+  （断言语句里是字面 NOW()），杀同一变异且不碰共享状态。删除理由留在原代码位置。
+- **Fixed** — brief 四处与实现矛盾，其中两处描述的是**前两轮被改掉**的行为
+  （含两位 reviewer 都阻塞过的"形状非法落空串"）。上一轮只修了被点名那处、没修类别。
+  Load-bearing 段里的过时规则比没有规则更糟：后来人当权威读，会把代码"修"回 bug。
+- **Decided** — `agent_hosting` 的撤回改用保留 slug `none`，`""` 回归 no-op（四字段统一）。
+  让 `""` 清空会给新列复制出老列被判为数据丢失的同一形状：从不填该字段但总是发 key 的
+  客户端每次重连落进 `('', 非NULL)` —— 那个状态被三处文档定义为「曾上报后刻意撤回」。
+  `none` 在存储层归一成空串，读取方无需知道这个 sentinel。
+- **Fixed** — 去掉 skip-if-unchanged 的**理由已消失**（时间戳现在只在 hosting 上报时前进，
+  于是版本-only 重连的那条 UPDATE 无任何可观察效果）。legacy 三列恢复跳过，比较用的
+  stored 快照**永不被写进语句**；hosting 保持无条件写（撤回/再确认都是真实上报）。
+- **Fixed** — recordingLog 原先只记 msg **丢掉 fields**，而泄露风险全在 fields 里；
+  迁移测试原先断言"不得出现 INFORMATION_SCHEMA"，把无守卫写法变成了强制（且大小写敏感
+  只是碰巧正确）—— 单条原子 ALTER 解决的是列级半应用，**不解决**可重入性，这一点上一轮
+  说错了。迁移补 pin `ALGORITHM=INSTANT`（不 pin 会静默退化为 COPY 锁表）。
+- **Learned（环境）** — **botfather 整包"失败集每次不同、耗时恰好 5s/30s"时，先重启
+  WuKongIM 再怀疑代码。** 连续 8 天运行的容器状态劣化，UpdateIMToken 5s 超时
+  → `err.server.bot_api.im_token_failed`，看起来极像测试污染。判据：串行跑
+  （`-p 1 -parallel 1`）—— 真正的顺序依赖会变**稳定**，容量问题仍然随机。
+  重启后整包 15.7s 全绿。排查中确实找出两个真污染并保留修复：register 的 per-IP 桶
+  必须在 helper 里每次清（不是 setup 清一次，一条测试就能自己打满）、`SET time_zone`
+  打在连接池上无作用域。
+
+## 2026-09-03 (bot-agent-hosting · review round 2)
+
+- **Fixed** — round 1 的修复引入的数据丢失回归（两位 reviewer 再次独立端到端复现）：
+  三个 legacy 版本字段改 `*string` 后，指向空串的非 nil 指针被无条件写入，于是
+  「报空」从 merge base 的「保留」变成「清空」。register 是重连路径，任何序列化器对
+  未填字段输出 `""` 的客户端会每次重连擦一次，HTTP 200、无日志、事后与「从未上报」
+  不可区分。现在 legacy 三列**空值也跳过**，`agent_hosting` 保持「报空即清空」。
+- **Learned** — **「不在语句里」与「以空串在语句里」只在没有东西区分它们时才是同一件事。**
+  为修并发引入指针，同时也引入了这个区分，而旧契约默默依赖它不存在。稀疏写入与
+  「空值即不变」从来不冲突：丢更新的根源是「替换成刚读到的值」，不是「跳过该列」。
+- **Learned** — 同一个 learning 在 brief 里重演：brief 同时留着新规则（四字段一律稀疏）
+  和被它取代的旧规则（三个 legacy 保持 merge-then-write），**而过时那条描述的行为
+  恰好能防住这次回归**。reviewer 直接引用了本 PR 新增的
+  `a-rule-in-a-comment-is-not-applied.md`。取代一条规则 = 删掉旧的，不是并排放新的。
+- **Adopted** — **变异测试作为常规手段**（跟 reviewer 学的）。他验证 round 1 的时区修复
+  不是装饰：把 `dbr.Expr("NOW()")` 改回 `time.Now()`，确认两条测试红、其中一条报出实测
+  `7h59m59s` 偏差。本轮推送前照做：去掉 legacy 空值跳过 → 端到端与 SQL 层两条都红；
+  改回 `_ = c.ShouldBindJSON` → 部分采纳那条红。「测试过了」与「没这行就会红」是两个
+  不同的断言，只有后者有价值。
+- **Fixed** — `json.Decoder` 会先填好已解析字段再返回类型错误，所以忽略 bind 错误等于
+  采纳一个**前缀**（`{"agent_platform":"OpenClaw","agent_version":123}` 存下 platform
+  丢掉后面，无任何诊断）。改为全有或全无：解码到临时变量 + 要求干净 EOF 才采纳。
+- **Guarded** — 空 `agent_hosting` 的两种含义（时间戳 NULL=从未上报 / 非 NULL=显式清空）
+  此前被列 COMMENT 否认、被 `omitempty` 在 wire 上抹平；现在 COMMENT、字段注释、
+  wire 说明三处对齐。补了 4 KiB body 上限的测试（本功能唯一没测的新行为）。
+- **Fixed** — 测试里 `SET time_zone` 打在连接池上，deferred 复位可能落到另一条连接、
+  把 `+08:00` 的连接留在池里污染后续测试。改为独占一条 `*sql.Conn` 并**关闭**而非复位。
+- **Noted** — `normalizeAgentHosting` 的排序理由（「10MB 值不该付 10MB 折叠开销」）在
+  4 KiB body 上限之后**已过时**。顺序仍对（零成本，且不让这个界依赖两层调用之外的限制），
+  但理由随之改写 —— 论证过时和论证错误一样需要修。
+
+## 2026-09-03 (bot-agent-hosting · review round 1)
+
+- **Fixed** — PR #837 两位 reviewer 独立实测复现的两个阻塞项：
+  ① `agent_reported_hosting_at` 原用 Go `time.Now()` 写，经驱动 `Config.Loc`（默认 UTC，
+  DSN 未设 `loc`）转换，而它并列展示的 `bound_at` 由 MySQL `NOW()` 写、应用镜像固定
+  `TZ=Asia/Shanghai` —— session 时区非 UTC 时两者相差 8 小时。改 `dbr.Expr("NOW()")`。
+  生产 MySQL 是 UTC，故为潜伏未发生。
+  ② 四个 `agent_*` 字段全改稀疏写入（`*string`，nil 即不进 `SetMap`）：初版只对新列稀疏，
+  三个既有版本列仍回写读到的值，且把条件 UPDATE 改成无条件，等于新开一条丢更新路径。
+- **Learned** — **注释里写下的规则不会因为被写下就生效。** 那段「不要把缺席字段解析成
+  刚读到的值，会丢更新」的注释，正上方三行就是它否决的写法 —— 周边代码早于这句话存在，
+  而没有任何东西在事后重新审视它。同时两种实现对**单写者**的所有 DB 可观察断言完全等价，
+  所以推理产物（注释）与验证产物（测试）盲在同一处。可断言的是**发出的 SQL 里有哪些列**。
+- **Learned** — `strings.ToLower` **不限于 ASCII**：`U+212A KELVIN SIGN`→`k`、
+  `U+0130`→`i`，所以折叠排在 ASCII-only 正则之前时混淆字符能通过，让函数自己注释里
+  「confusables all fail it」变成假的（测试恰好只挑了会失败的 `U+200B`）。ASCII 前置后
+  才成立；且 ASCII 性质同时是**列宽不变量**的前提（`len()` 数字节 vs `VARCHAR` 数字符）。
+- **Guarded** — 「被拒」与「清空」原本被文档成同一件事（PR 描述说 degrades to not
+  reported，字段注释说 present overwrites）。定为**保持不变**：触发场景不需要恶意，
+  `self-hosted`（连字符，正是所引用 GitHub Actions 的写法）就会被拒，一次客户端拼错
+  会把全量 bot 的该列刷空。清空仍可做，但要显式报 `""`。
+- **Learned** — 测试注释声称「能区分两种实现」时，那本身是个需要验证的断言。初版那条
+  「值保留 + 时间戳前进」在被否决的写回实现下三条断言全过。改用**带外写入**（第三方在
+  两次 register 之间改列，写回实现会覆盖它）+ sqlmock 直接断言 SQL 文本。
+- **Changed** — `agent_reported_at` 更名 `agent_reported_hosting_at` 并收窄为只在 hosting
+  被上报时前进：原实现任何 `agent_*` 上报都刷新它，等于替一份该次上报从未提及的数据背书
+  新鲜度，而分歧场景正是用来论证指针语义的那个「新 runtime 漏报 hosting」。
+- **Guarded** — register 的 body 加 4 KiB 上限（`binding.JSON` 无上限，本路由此前无任何
+  body 界，而四个 sibling bot_api 路由都有）。App Bot 分支上那次解码只换来一行日志。
+  超限按「未上报」处理，绝不让 register 失败（#696）。
+
+
+## 2026-09-03 (bot-agent-hosting)
+
+- **Added** — `robot.agent_hosting` + `robot.agent_reported_hosting_at`（单条原子 `ALTER`）。
+  `POST /v1/bot/register` 的 User Bot 分支接收自报托管形态，`GET /v1/user/bots` 带出。
+  App Bot 显式不支持（只解析 body 打 Warn，由源码守卫钉住 `app_bot` 无 `agent_*` 列）。
+  无新 errcode / 端点 / i18n 条目 / 路由变更。
+  See [journal](journal/shared/bot-agent-hosting.md).
+- **Learned** — 「本地 vs 云上」在服务端**没有可信来源**，三个候选字段全部不成立：
+  `user_api_key.client_id` 把桌面客户端与云端服务混装在同一个 `octopush` 下
+  （`modules/integration/api.go` 明写桌面端只持业务后端自签 JWT，`/exchange` 硬编码单一
+  client_id），从它推导会把本地标成云上；`bound_agent_ref` 是 bind 时客户端自填且
+  「Octo 不解析其语义」；`agent_platform` 只有平台名。所以这个列是**观测**字段，
+  永不可喂授权判定。
+- **Learned** — **枚举白名单给的保证是虚假的。** 它校验「值在集合内」，不校验
+  「你有资格声称这个值」——任何持 `bf_` token 的进程照样能报 `octo_hosted`。真正要挡的
+  是引号/尖括号/空格/控制字符/Unicode 混淆字符，`^[a-z][a-z0-9_]*$` 全挡且不需要预知
+  vendor。改为开放取值后，新托管方无需服务端发版，且 vendor 名不进这个开源仓。
+  代价已明示：`cloud`/`local` 从此合法（约定降级为客户端约定，**刻意不做黑名单**）。
+- **Guarded** — **校验上界高于列宽不是余量，是延迟的失败。** 初版 `maxAgentHostingLen=64`
+  配 `VARCHAR(20)`：25 字节的值会过校验、写库撞 `1406`，而 `agent_*` 共用一条 UPDATE，
+  会连带挡掉同一请求里的 `agent_platform/version/plugin_version`，且 register 仍返回 200。
+  现在上界与列宽**严格相等**（测试从迁移文件正则提取列宽后断言 `Equal` 而非 `<=`）。
+  另：长度上界必须排在 `ToLower` **之前**（后者按输入等大分配，body 无上限）。
+- **Learned** — **规格核到「响应结构没这个字段」不等于核到「端点存在」。**
+  原计划改的运维面 `GET /v1/manager/robots{,/:robot_id}` 整个是死代码：
+  `modules/robot/api_manager.go` 的 `NewManager` 全仓无调用方、`Route()` 从未执行
+  （`1module.go` 只注册 `New(ctx)`）。字段和测试都写完了，靠测试报 `404 page not found`
+  才发现，随后整体 `git checkout` 撤回 —— 给死代码加字段没有调用方看得到，却会让
+  下一个人以为运维面已有这个能力。
+- **Learned** — 测试要放在**拥有 schema 的模块**里，不是拥有代码的模块。写入路径在
+  `modules/bot_api`，但 `robot` 表的 `agent_*` 列归 `modules/botfather` 的迁移，而
+  bot_api 的测试二进制不 link botfather 的 `init()`，那里 `NewTestServer` 建出的 robot 表
+  没有这些列（`1054 Unknown column`）。App Bot 那条用例则要 blank import
+  `modules/app_bot` 而**不能**裸 `CREATE TABLE IF NOT EXISTS` —— 绕过 sql-migrate 建表
+  不写 `gorp_migrations`，会让下一个包的同名迁移撞「already exists」（`modules/message`
+  大量 DB 测试被 skip 的已知根因）。
 ## 2026-08-24 (group-exit-notice-visibility)
 
 - **Fixed** — 「某成员退出群聊」系统提示（`type=1021`）改为**全员可见 + RedDot:0**，

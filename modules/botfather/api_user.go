@@ -334,16 +334,23 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 			s := bot.BoundAt.Time.Format(botBoundAtFormat)
 			boundAt = &s
 		}
+		var agentReportedHostingAt *string
+		if bot.AgentReportedHostingAt.Valid {
+			s := bot.AgentReportedHostingAt.Time.Format(botBoundAtFormat)
+			agentReportedHostingAt = &s
+		}
 		list = append(list, &UserBotResp{
-			RobotID:       bot.RobotID,
-			Username:      bot.Username,
-			Name:          name,
-			Description:   bot.Description,
-			BoundAgentRef: bot.BoundAgentRef,
-			BoundAt:       boundAt,
-			AgentPlatform: bot.AgentPlatform,
-			AgentVersion:  bot.AgentVersion,
-			PluginVersion: bot.PluginVersion,
+			RobotID:                bot.RobotID,
+			Username:               bot.Username,
+			Name:                   name,
+			Description:            bot.Description,
+			BoundAgentRef:          bot.BoundAgentRef,
+			BoundAt:                boundAt,
+			AgentPlatform:          bot.AgentPlatform,
+			AgentVersion:           bot.AgentVersion,
+			PluginVersion:          bot.PluginVersion,
+			AgentHosting:           bot.AgentHosting,
+			AgentReportedHostingAt: agentReportedHostingAt,
 		})
 	}
 	c.Response(list)

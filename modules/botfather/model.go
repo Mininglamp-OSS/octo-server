@@ -11,7 +11,15 @@ type BotRegisterResp struct {
 	OwnerChannelID string `json:"owner_channel_id"`
 }
 
-// BotRegisterReq Bot自注册请求（可选字段，兼容旧客户端空 body）
+// BotRegisterReq Bot自注册请求。
+//
+// **死代码 —— 无调用方，不要用它。** 活的请求体是 modules/bot_api 的
+// BotRegisterReq（POST /v1/bot/register 唯一入口）。本副本已与之分叉：三个字段是
+// 裸 string（活的那份是 *string，用于区分「缺席」与「报了空」）、没有 agent_hosting、
+// 也没有全有或全无的解码语义。它长得像个能用的请求结构、又住在 model.go 里，
+// 所以尤其容易被下一个人误取 —— 要用请直接删掉它改用 bot_api 那份。
+//
+// 同一形状的另一处：本包 db.go 的 updateRobotAgentInfo 也是死副本。
 type BotRegisterReq struct {
 	AgentPlatform string `json:"agent_platform"` // AI Agent 平台名称
 	AgentVersion  string `json:"agent_version"`  // Agent 平台版本号
@@ -162,6 +170,24 @@ type UserBotResp struct {
 	AgentPlatform string  `json:"agent_platform,omitempty"`
 	AgentVersion  string  `json:"agent_version,omitempty"`
 	PluginVersion string  `json:"plugin_version,omitempty"`
+	// AgentHosting Agent 自报托管形态：小写 ASCII slug，本项目自用 self_hosted /
+	// octo_hosted，第三方托管方按 <vendor>_hosted 自取（取值开放、服务端只校验形状，
+	// 所以客户端**不要**写死映射表，直接展示 slug —— 新托管方出现时前端无需发版）。
+	// 未上报时省略，与同组的 agent_platform / agent_version / plugin_version 行为一致。
+	// 自报值，仅供展示与排障，调用方不得据此做授权判定。
+	//
+	// **字段缺席有两种含义，靠下面的 AgentReportedHostingAt 区分**：
+	//   缺席 + agent_reported_hosting_at=null  → 从未上报过 hosting
+	//   缺席 + agent_reported_hosting_at 有值  → 曾上报过，后被 runtime 显式清空
+	// 所以 omitempty 不会丢信息：时间戳恒定下发（无 omitempty），两者合起来可判别。
+	AgentHosting string `json:"agent_hosting,omitempty"`
+	// AgentReportedHostingAt 最近一次收到 **agent_hosting** 上报的时间
+	// （botBoundAtFormat）；从未上报为 null。只在 hosting 被上报时前进 ——
+	// 只报版本号的 register 不会刷新它，所以这个时间戳回答的确实是
+	// 「同一行的 agent_hosting 有多新」，而不是「这个 bot 最近有没有上报过什么」。
+	// 与 BoundAt 同口径用 *string 显式下发 null（而不是 omitempty 省略字段），
+	// 且与 BoundAt 一样由 SQL NOW() 写入 —— 两者在同一响应里并列，时钟必须同源。
+	AgentReportedHostingAt *string `json:"agent_reported_hosting_at"`
 }
 
 // BindBotReq 占用（绑定）Bot 请求。
