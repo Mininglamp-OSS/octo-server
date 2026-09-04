@@ -961,20 +961,82 @@ func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]stri
 	return uids, err
 }
 
-// QuerySecondOldestMemberExcludingBotsOf 选出第二元老成员（群主退群时的新群主人选），
-// 在 QuerySecondOldestMember 的基础上额外排除 leaverUID 名下（robot.creator_uid）的
-// 活跃 bot：#354 起群主退群也会级联带走自己的 bot，这些 bot 在同一事务内即将离群，
-// 不能被选为新群主（否则会出现「新群主刚上任就被级联删除」的孤儿群）。
-// 其他人的 bot 不受影响，保持与旧选主逻辑一致。
-func (d *DB) QuerySecondOldestMemberExcludingBotsOf(groupNo string, leaverUID string) (*MemberModel, error) {
+// QuerySecondOldestEligibleMember 选出第二元老成员（群主退群时的新群主人选）。
+//
+// 旧名 …ExcludingBotsOf 描述的是"只排除某人名下的 bot"那一版，现在排除的是全部 bot
+// 加上外部成员和非正常 status，名字不再准确，故改名。
+//
+// 资格谓词：**排除 bot、排除外部成员、要求 status 正常**。
+//
+// ⚠️ 这**不是**「与手动转让 transferGrouper 对齐」，早先的注释这么写是夸大了：
+// transferGrouper 只拒绝外部成员（api.go；它拿到的 QueryMemberWithUID 只过滤
+// is_deleted），既不看 robot 也不看 status。所以三条里只有**外部成员**这一条是把
+// 「手动拒绝、自动准入」的不一致抹平；bot 与 status 是**新加的、更严的口径**，改完
+// 之后自动路径严于手动路径。先收紧自动路径的理由是它没有人在回路里，选错了不会有人
+// 当场发现。手动路径的同类缺口是既有问题，单独跟进，不在本改动内。
+//
+// 三条排除各自的理由：
+//
+//   - **bot（gm.robot = 0）**。此前只排除 leaverUID 名下（robot.creator_uid）的活跃
+//     bot，理由是 #354 起群主退群会级联带走自己的 bot，它们在同一事务内即将离群，
+//     选中就会得到「新群主刚上任就被级联删除」的孤儿群。但**他人的** bot 同样不该
+//     当群主：群主握有改群信息、加/removeManager、再转让的全部敏感权限，交给一个
+//     机器人账号等于这个群实际无人管理，而那些权限仍然活着。没有可继任者时返回 nil、
+//     群成为无主空群，是既有的、已被处理的终局（见 handOverGroupCreator），比装一个
+//     不会行使权限的"群主"要诚实。
+//
+//     ⚠️ 这**推翻**了一条被显式钉住的既有契约：
+//     TestQuerySecondOldestEligibleMember_OnlyBotsLeft 曾断言「他人的 bot 不在
+//     排除范围内（与旧 QuerySecondOldestMember 语义一致）」。那条断言记录的是历史
+//     延续，不是一个论证过的决定——#354 当时只关心「即将被级联删除」这一个失败模式，
+//     没有考虑权限归属。该测试已随本改动更新。
+//
+//   - **外部成员（gm.is_external = 0）**。transferGrouper 明确拒绝把群主转让给外部
+//     成员，理由写在 api.go：群主拥有全部敏感操作权限，绝不能落到外部成员手上
+//     （YUJ-231 / GH#1289）。而选主此前允许，且 QueryIsGroupCreator 这条 creator 门禁
+//     只看 role 和 is_deleted、不看 is_external，于是五个 creator-only 端点
+//     （avatarUpload / groupUpdate / managerAdd / managerRemove / transferGrouper）
+//     会照常放行。手动路径拒绝、自动路径准入，是同一规则的两个答案。
+//
+//   - **status 正常（gm.status = GroupMemberStatusNormal）**。status=2 是群黑名单。
+//     把一个被拉黑的成员提为群主，等于用自动路径撤销一次管理动作。
+//
+// 这三条在 Space 移除级联（querySecondOldestEligibleMemberTx）与用户主动退群
+// （groupExit → 本函数）上必须一致：只改一条就会让另一条成为绕过新规则的后门。
+//
+// `gm.uid <> ?` 显式排除离开者本人。以前不需要它：leaverUID 只出现在 bot join 的
+// creator_uid 条件里，而离开者靠 `role <> MemberRoleCreator` 被顺带滤掉。收紧谓词后
+// 那个 join 没了，离开者就只剩下"角色还没被降级"这一个**偶然**保护 ——
+// handOverGroupCreator 恰好先选主、后降级；把这两句调换，离开者就会选中自己当继任者，
+// 而没有编译错误
+// （PR #804 round-11 review P2 提出，round-12 三位 reviewer 各自指出谓词其实没写进
+// SQL、只写在了注释里）。
+//
+// ⚠️ 别把这写成「没有任何测试会拦住」—— 那句话是假的，已实测：把 handOverGroupCreator
+// 改成先降级再选主，**17 条既有 TestGroupCascade* 会变红**。但它们是在**下游**炸的
+// （离开者被提回 creator，LockRemovableMemberTx 随后拒绝移除 creator，报
+// "role changed concurrently"），没有一条直接说明「离开者不得当自己的继任者」这条规则。
+// 差别是承重的：下游报错要靠人从一个不相干的症状反推回选主，而本谓词把规则钉在它自己
+// 所在的那条语句上。由 TestSuccessorElectionExcludesLeaverAfterDemotion 钉住：先降级、
+// 再选主，让 `role <> creator` 失效，删掉本谓词立刻变红（已实测）。
+//
+// ⚠️ **groupExit 的情况不同，别把这段读成对它也成立**：它选主之后走的是 DeleteMemberTx
+// （is_deleted=1），不是降级，而本查询本来就带 `gm.is_deleted = 0`。那条路径上离开者
+// 因此另有一道各自独立的偶然保护。本谓词让它不再依赖任何一道。
+//
+// ⚠️ **事务内的那份孪生查询没有这一条谓词，是刻意的**：它带 FOR UPDATE，加同一个谓词
+// 会翻转它的取锁顺序并与 RemoveGroupMembers 构成 AB-BA（实测 3/3 触发 1213，而
+// modules/group 没有任何死锁重试）。那一侧改用调用方的 isSelfSuccessor 按行 id 拦截。
+// 本查询是**无锁读**，没有这个问题，谓词留在 SQL 里更好。完整测量见
+// space_member_removal.go 中 handOverGroupCreator 的注释。
+func (d *DB) QuerySecondOldestEligibleMember(groupNo string, leaverUID string) (*MemberModel, error) {
 	var memberModel *MemberModel
 	_, err := d.session.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
-			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
-			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
-			"AND r.robot_id IS NULL "+
+			"WHERE gm.group_no = ? AND gm.uid <> ? AND gm.role <> ? AND gm.is_deleted = 0 "+
+			"AND gm.robot = 0 AND gm.is_external = 0 AND gm.status = ? "+
 			"ORDER BY gm.created_at ASC LIMIT 1",
-		leaverUID, groupNo, MemberRoleCreator,
+		groupNo, leaverUID, MemberRoleCreator, int(common.GroupMemberStatusNormal),
 	).Load(&memberModel)
 	return memberModel, err
 }

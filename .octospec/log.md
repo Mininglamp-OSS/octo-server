@@ -1542,6 +1542,159 @@ change-log convention (§7). Newest first.
 - **Implemented** — Added explicit manual/timed pause state, server-side fixed
   durations, unified REST/CMD responses, migration, validation, and tests.
 
+## 2026-08-27 (space-removal-creator-handover-notice · rounds 12–13)
+
+- **Fixed** — `gm.uid <> ?` was asserted in a commit message and a doc comment and was
+  in neither election query; three reviewers found it independently. Both paths now
+  enforce it, **asymmetrically and for a measured reason**: the non-tx query
+  (`groupExit`) is a non-locking read and takes the predicate in SQL; the
+  in-transaction twin excludes the leaver in Go by row id (`isSelfSuccessor`), because
+  adding the same predicate there flips the optimizer from `group_no_uid` to
+  `group_member_groupNo` and with it the lock order from uid-ascending to
+  id-ascending — the opposite of the order `RemoveGroupMembers` sorts into. Measured
+  0/3 deadlocks without, 3/3 with; `modules/group` has no deadlock retry.
+  Also pinned what `extra[0]` names when a batch collapses a multi-elder handover chain.
+  See [journal](journal/shared/space-removal-creator-handover-notice.md).
+- **Learned** — **Adding a predicate to a `FOR UPDATE` statement is not a read-only
+  change.** It can move the query plan, and on a scan that filesorts, the plan *is* the
+  lock acquisition order. "I only narrowed the WHERE clause" is not a safety argument on
+  a locking statement. The reviewer who caught this measured it; reasoning did not.
+- **Learned** — A claim's *width* is part of its correctness. Two sentences in the same
+  commit ("no existing fixture would catch it", "`{0}` had no coverage") were true of
+  the specific gap and false as written; both were refuted by measurement in review.
+  Third consecutive round where the code held and the prose around it did not.
+- **Fixed (round 13, documentation only)** — The shipped artifacts described a different
+  implementation than the diff: the brief's Out-of-scope list still deferred the
+  eligibility change that shipped (the `security_sensitive` item, and the list a sign-off
+  reads to learn what was *not* decided); the brief still prescribed `FORCE INDEX`,
+  `selectMembersForRemovalForUpdateSQL` and two deleted acceptance guards; a learnings
+  file still taught the byte-order rule round 11b measured false; seven comments in the
+  two lock-ordering functions still described the previous mechanism. No behavioural
+  change was requested or made.
+- **Out of scope, recorded** — the sanitise-before-fallback ordering nit (a bidi-only
+  remark sanitises to empty after passing the `== ""` guard) is a code change and was
+  left for its own commit; the dangling references to the old query name in
+  `space-member-removal-cleanup` and `space-member-dm-isolation` briefs are outside this
+  PR's diff; and the `#797` entry this branch's own comment promises still has to be
+  filed on the issue itself.
+
+## 2026-08-27 (space-removal-creator-handover-notice · round 11b)
+
+- **Fixed** — Two P1s that round 11 introduced. (1) `sort.Strings` on both sides is
+  not spelling-invariant: the column is case-insensitive and neither entry point
+  folds case, so two callers naming the same rows with different spellings acquire
+  in opposite order — and this is the pair `retryOnDeadlock` was measured *starving*
+  against. Both sides now use `sortForLockOrder` (case-folded key, raw uid tiebreak),
+  with the accent-insensitivity limit stated rather than claimed away. (2) The
+  handover notice wrote a bare UID into permanent group history, contrary to the rule
+  #807 set four functions away; fixed at the source via `resolveGlobalName` +
+  `resolveExitShowName`.
+- **Learned** — The cost of an overstated comment is not the bug it hides today, it is
+  the guard someone deletes tomorrow because the comment said it was redundant. I
+  wrote `不需要任何前提` in the same commit whose journal entry criticised round 10 for
+  asserting an unconditional invariant.
+- **Learned** — "Tracked as a follow-up" is not a disposition for a one-line fix
+  against a rule already established in the file next door. The bare-UID defect was in
+  round 10's follow-up list and shipped anyway — and the note was itself wrong about
+  the mechanism (it implied the `== ""` guards were doing something; they never fired).
+- **Learned** — When a predicate is deleted, check what else it was quietly
+  guaranteeing. Tightening the eligibility SQL removed `leaverUID` from it, leaving the
+  leaver protected only by statement order in the caller.
+
+## 2026-08-26 (space-removal-creator-handover-notice · round 11)
+
+- **Fixed** — Round 10's collation comparator matched CI and inverted production:
+  `space_member.uid` is `utf8mb4_0900_ai_ci` there (no explicit COLLATE, inherits
+  the 8.0 default) while CI pins `utf8mb4_general_ci`, and the two order `_`
+  oppositely. The correction is not a better comparator — the batch lock is now
+  expanded into `UNION ALL` branches so the acquisition order is the caller's and
+  collation leaves the question entirely. Verified under both collations with the
+  branch order opposite each one's index order. `FORCE INDEX` and the non-retryable
+  1176 dependency on the index name are gone with it; cost is ~1.7ms at 200 uids.
+- **Fixed** — Successor election could install a third-party bot, an external
+  member or a blacklisted member as group creator, on **both** paths, while
+  `transferGrouper` refuses external members outright and the creator-only
+  endpoints check neither. Both queries now match the manual path. Overturns a
+  pinned contract, with the reasoning recorded at the query.
+- **Fixed** — Display names are neutralised (`{`/`}` → full-width, bidi stripped)
+  before entering a system message's `extra`. Structured placement removed JSON
+  injection but not render-time placeholder re-expansion, which is reachable via a
+  self-settable group remark and persists in group history.
+- **Learned** — Ask what the lock order *is determined by* before asking how to
+  reproduce it. Round 10 spent itself answering "how do I mirror the index order in
+  Go" when the order only came from the index because of a statement shape chosen
+  in round 6 for unrelated reasons.
+- **Learned** — Quantify the impact before proposing the remedy. Working out that
+  this needed a superadmin batch-add concurrent with a user-side batch-remove, on
+  one space, with order-sensitive overlapping uids, to produce a retry-absorbed
+  1213, is what turned "broken guarantee" into a real choice between fixing the
+  mechanism and correcting the claim.
+- **Process** — Rounds 10–11 were implement-then-test with mutation checks, not the
+  TDD that `rules/common/testing.md` requires; the sanitiser was written test-first
+  and that ordering caught a distinction the other would have missed (the sanitiser
+  being correct and the send site calling it are separate claims). Also: rebase onto
+  main before building on the branch.
+
+## 2026-08-25 (space-removal-creator-handover-notice · round 10)
+
+- **Fixed** — Two defects this branch introduced, both the same root cause: the
+  package compares `space_member.uid` in Go while the column is
+  `utf8mb4_general_ci`. (1) `removeMembersLockedOnce` keyed a role map by the
+  spelling SQL returned and looked it up with the caller's, so a case-variant uid
+  was silently skipped — no status flip, no cleanup job, no cache invalidation,
+  and a 200 response. The old per-uid path compared in SQL and removed the member,
+  so this was a regression on an access-revoking endpoint. Now driven from the rows
+  SQL matched, which removes the second comparison instead of aligning it.
+  (2) `sort.Strings` is byte order; the `FORCE INDEX` scan walks the index in
+  `general_ci` order. Folding lowercase into uppercase moves `_` after the letters,
+  so `a_b`/`aab` invert and the "structurally cannot cycle" claim failed for
+  `app_…_bot` / `iwh_…`-shaped uids that are already Space members. Now ordered by
+  `lessUIDGeneralCI`, whose ASCII-only limit is stated at the definition.
+  See [journal](journal/shared/space-removal-creator-handover-notice.md).
+- **Learned** — A red is not coverage until the fixture can express the failure.
+  The ordering guard used `m%04d` — digits and one lowercase letter, precisely the
+  alphabet where byte order and collation order agree — so it went 30/30 red under
+  the mutation aimed at it while being structurally unable to see the defect it was
+  named for. Both reviewers found it by varying the fixture's *data* and nothing
+  else. Complement to round 9's "a zero is not evidence until you remove what could
+  be hiding the non-zero", one level down.
+- **Learned** — "Equivalent to the old path" is a claim about the *comparison*, not
+  only the result. Relocating a predicate from SQL into Go silently swaps the
+  comparator, and every path here is keyed on an identifier. If a refactor moves a
+  comparison across the Go/SQL boundary, the collation is part of what must be
+  shown unchanged.
+- **Rejected** — Routing the upsert's locks through the removal's
+  `SELECT … FOR UPDATE` (the other offered fix) would order both sides by
+  construction, but gap-locks every non-existent uid; concurrent upserts hold
+  compatible gap locks and then block on each other's insert intention locks.
+  Closing one cycle by opening another is not closure.
+- **Out of scope, with reasoning recorded** — constraining uids to a known alphabet
+  at the API boundary (the durable fix for both findings above), the missing
+  `FORCE INDEX` on `removeMembersForceOnce`, the unwrapped `lockActiveMemberUIDsTx`
+  that this branch's 200-row batch newly pairs with, and the handover notice's
+  bare-UID fallback that #807 just eliminated on the sibling path.
+
+## 2026-08-25 (space-removal-creator-handover-notice · rebase onto #807)
+
+- **Fixed** — `sendGroupExitTip` now keeps #807's shape verbatim (group-visible,
+  `RedDot:0`, `resolveExitShowName`); this branch threads nothing into it.
+  `TestGroupCascadeSelfExitSuppressesRemovedNotice` asserted zero group-visible
+  tips on the premise that the tip is admin-only — false as of #807. It pins
+  exactly one now, plus a negative assertion that an ordinary member's self-exit
+  emits no handover notice. Zero would have re-asserted #807's stuck-unread bug;
+  no bound at all would have stopped guarding against a second broadcast.
+
+## 2026-08-23 (space-removal-creator-handover-notice)
+
+- **Implemented** — A Space removal that hands a group to a new owner now says so
+  in one group-visible message naming both the departure and the successor
+  (`“{0}”已离开当前空间，“{1}”已成为新群主`, content type `GroupTransferGrouper`,
+  names in `extra`). An ordinary member's removal stays silent: the roster
+  already shows it, and broadcasting it is up to 10k permanent messages per
+  200-uid batch. Also fixed an announcement that was permanently lost whenever
+  the cleanup job retried after a committed handover. Follow-up to #795. See
+  [journal](journal/shared/space-removal-creator-handover-notice.md).
+
 ## 2026-08-22 (cleanup-membership-predicate)
 
 - **Fixed** — The two removal-cleanup rejoin guards were asking one question

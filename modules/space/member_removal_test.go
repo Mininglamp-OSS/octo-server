@@ -8,10 +8,13 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	mysqldrv "github.com/go-sql-driver/mysql"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -695,9 +698,9 @@ func TestTruncateCleanupErrorSanitizesInteriorInvalidByte(t *testing.T) {
 
 // TestRemoveMembersRejectsOversizedBatch 用户侧 members/remove 的批量上限。
 //
-// 这个上限是新加的、且**对线上可见**：每个 uid 要跑一个独立事务 + 一次 Redis DEL
-// + 一条工单插入，不设限就是一个拒绝服务杠杆。没有回归用例的话，谁把这段挪走
-// 都不会有人发现，而超限请求会安静地退化回逐个处理。
+// 这个上限是新加的、且**对线上可见**：一次请求要在一个事务里锁住并翻转最多 N 行、
+// 逐个失效 N 份鉴权缓存（Redis DEL）、批量插入 N 条工单，不设限就是一个拒绝服务杠杆。
+// 没有回归用例的话，谁把这段挪走都不会有人发现，而超限请求会安静地放行。
 // 同时钉住「刚好等于上限」仍然放行，避免把边界改成 >= 而悄悄收紧一个。
 func TestRemoveMembersRejectsOversizedBatch(t *testing.T) {
 	_, f, err := setup(t)
@@ -1325,4 +1328,716 @@ func TestMemberRemovalCleanupMetricsReflectQueue(t *testing.T) {
 	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupPendingGauge))
 	assert.Equal(t, float64(1), promtestutil.ToFloat64(removalCleanupAbandonedGauge))
 	assert.GreaterOrEqual(t, promtestutil.ToFloat64(removalCleanupOldestPendingGauge), float64(600))
+}
+
+// TestRemoveMembersLockedEnqueuesAtomically 整批移除必须是**一个事务**：在它提交之前，
+// 同批里任何一个人的清理工单都不得对外可见。
+//
+// 这条是 PR #804 round-4/5 的回归守卫。逐个提交时工单会陆续可见，群侧的交接通告抑制
+// （HasPendingRemovalCleanup 只看得见已提交的行）就会把尚未入队的兄弟读成「不在队列」，
+// 发出写下时就已作废的「已成为新群主」，NoPersist=0 永久留在群历史里。
+//
+// 用一把竞争行锁把整批**卡在中间**来判定，而不是靠时序猜：另一个连接先锁住 m2 的
+// space_member 行，整批的单条 SELECT ... FOR UPDATE 扫到 m2 时必然阻塞。此刻整批还没
+// 提交，所以一条清理工单都不该可见。断言它**不可见**即证明整批共用一个事务：若实现
+// 退回「一人一事务、逐个提交」，m1 早已提交、它的工单此刻就会露出来。
+// （注意：现版本阻塞发生在 SELECT 取锁阶段、UPDATE 循环之前，所以 m1 尚未翻转；
+//
+//	变异成逐个提交后，m1 会在 m2 之前被翻转+提交，断言随即变红。）
+//
+// 变异验证：把 removeMembersLocked 改回逐个提交，这条断言立刻变红。
+func TestRemoveMembersLockedEnqueuesAtomically(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-atomic"
+	seedMember(t, f, spaceID, "owner", 2)
+	for _, uid := range []string{"m1", "m2", "m3"} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	// 另一个连接锁住 m2，让整批停在第二个人身上
+	blocker, err := testCtx.DB().Begin()
+	require.NoError(t, err)
+	var held []int
+	_, err = blocker.SelectBySql(
+		"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 FOR UPDATE",
+		spaceID, "m2").Load(&held)
+	require.NoError(t, err)
+	require.Len(t, held, 1, "m2 应当存在且活跃，否则这把锁挡不住任何东西")
+
+	var removed []string
+	var rmErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		removed, rmErr = f.db.removeMembersLocked(
+			spaceID, []string{"m1", "m2", "m3"}, 1, "owner", MemberRemoveReasonKicked)
+	}()
+
+	// 等到它真的卡在 space_member 的行锁上，而不是靠 sleep 猜。
+	//
+	// 必须把等待条件收紧到**本表的 WAITING 锁**：information_schema.innodb_trx 是
+	// 服务级、不过滤的，用它只能答「这台 MySQL 上有某个事务在等」，若被别的用例的
+	// 争用提前放行，下面的核心断言会**空过**——那时批量可能还没翻转 m1，工单本就为空，
+	// 断言 trivially 成立，连逐个提交的变异都拦不住。用 performance_schema.data_locks
+	// 精确匹配 space_member 上的 WAITING 记录锁，把守卫的判别力钉在本用例自己制造的
+	// 争用上（PR #804 round-5 review P2-1）。
+	require.Eventually(t, func() bool {
+		var n int
+		_, err := testCtx.DB().SelectBySql(
+			"SELECT COUNT(*) FROM performance_schema.data_locks " +
+				"WHERE object_name='space_member' AND lock_type='RECORD' AND lock_status='WAITING' " +
+				"AND lock_data LIKE '%rm-batch-atomic%'").Load(&n)
+		return err == nil && n > 0
+	}, 15*time.Second, 50*time.Millisecond, "批量移除应当阻塞在 m2 的 space_member 行锁上")
+
+	// 核心断言：m1 已在事务内被翻转，但整批尚未提交，所以一条工单都不该可见
+	assert.Empty(t, cleanupJobs(t, spaceID),
+		"整批提交之前不得有任何工单可见——逐个提交会让 m1 的工单此刻就露出来")
+
+	require.NoError(t, blocker.Rollback())
+	<-done
+	require.NoError(t, rmErr)
+
+	assert.Equal(t, []string{"m1", "m2", "m3"}, removed)
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 3, "提交后三条工单一次性全部可见")
+	for _, j := range jobs {
+		assert.Equal(t, MemberRemoveReasonKicked, j.Reason)
+		assert.Equal(t, removalCleanupPending, j.Status)
+	}
+}
+
+// TestRemoveMembersLockedSkipsOwnerAndPeers 整批版本必须保留 removeMemberLocked 的
+// 角色语义：owner、同级及更高角色、以及根本不在空间里的 uid，都**静默跳过**而不是
+// 让整批失败，也不得为他们留下工单。
+func TestRemoveMembersLockedSkipsOwnerAndPeers(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-roles"
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "peer-admin", Role: 1, Status: 1,
+	}))
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: "normal", Role: 0, Status: 1,
+	}))
+
+	// 操作者是 admin(role=1)：owner 不可动、同级 admin 不可动、ghost 不存在，
+	// 只有 normal 该被移除。
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{"owner", "peer-admin", "ghost", "normal"}, 1, "peer-admin", MemberRemoveReasonKicked)
+	require.NoError(t, err, "不该动的人只是跳过，不能让整批报错")
+	assert.Equal(t, []string{"normal"}, removed)
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1, "只有真正被移除的人才入队")
+	assert.Equal(t, "normal", jobs[0].UID)
+}
+
+// TestRemoveMembersLockedRollsBackWholeBatchOnError 中途出错整批回滚：成员行与工单
+// 同生共死这一点，从「每人一组」升级成「整批一组」。
+func TestRemoveMembersLockedRollsBackWholeBatchOnError(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-rollback"
+	seedMember(t, f, spaceID, "owner", 2)
+	for _, uid := range []string{"r1", "r2"} {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	// 用一个非法 reason 让入队阶段失败——那一步发生在所有成员行都已翻转之后。
+	_, err = f.db.removeMembersLocked(spaceID, []string{"r1", "r2"}, 1, "owner", "not-a-real-reason")
+	require.Error(t, err, "非法 reason 应当让整批失败")
+
+	assert.Empty(t, cleanupJobs(t, spaceID), "失败后不得留下任何工单")
+	for _, uid := range []string{"r1", "r2"} {
+		m, qerr := f.db.queryMember(spaceID, uid)
+		require.NoError(t, qerr)
+		require.NotNil(t, m, "成员行必须还在")
+		assert.EqualValues(t, 1, m.Status, "整批回滚后 %s 必须仍是活跃成员", uid)
+	}
+}
+
+// TestRemoveMembersLockedNoDeadlockOnReversedOverlap 并发反序重叠批次不产生死锁。
+//
+// 这是一个**并发冒烟**测试，不是本修复的主守卫。它反复并发地对同一空间跑两批反序
+// 重叠的移除，断言 0 死锁、0 意外副作用。全部成员 role=1、reject=1，于是不翻转任何
+// 行、可无需重播种反复施压，纯粹压加锁路径。
+//
+// 真正把「加锁顺序确定」钉死的是另外两条，本测试都替代不了：
+//
+//   - TestBatchRemovalLocksInBranchOrder —— 加锁顺序由 UNION ALL 的**分支顺序**决定，
+//     而分支顺序由 sortForLockOrder 给出。它在两种 collation 下各跑一次，分支序都刻意
+//     与该 collation 的索引序相反，所以能把「按分支序」和「按索引序」区分开。
+//   - TestBatchRemovalUsesUniqueIndexWithoutForcing —— 单行等值必然走唯一键
+//     (space_id, uid)，因此不需要 FORCE INDEX，也就不再依赖索引名。
+//
+// 为什么本测试顶不上：批次间即便走同一个计划也是同序、不会互相成环，所以它对
+// 「两侧排序口径不一致」这个真正的隐患**不敏感**。
+//
+// ⚠️ 这段注释此前写的是「真正钉死的是 TestRemoveMembersLockedForcesUniqueIndexPlan，
+// 计划断言才守得住」。那条测试已在 round 11 随 FORCE INDEX 一并删除，而且那个说法在
+// 出货的设计里本身就不成立了：锁序来自分支顺序 + sortForLockOrder，与索引计划无关
+// （PR #804 round-13/14 review 两名 reviewer 各自指出）。
+func TestRemoveMembersLockedNoDeadlockOnReversedOverlap(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-deadlock"
+	seedMember(t, f, spaceID, "owner", 2)
+	members := []string{"d1", "d2", "d3", "d4", "d5", "d6"}
+	for _, uid := range members {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 1, Status: 1, // admin：reject=1 时全部跳过，不翻转
+		}))
+	}
+
+	forward := append([]string(nil), members...)
+	reversed := make([]string, len(members))
+	for i, uid := range members {
+		reversed[len(members)-1-i] = uid
+	}
+
+	const rounds = 40
+	var deadlocks, otherErr, unexpectedRemoved atomic.Int64
+	isDeadlock := func(e error) bool {
+		return e != nil && (strings.Contains(e.Error(), "1213") ||
+			strings.Contains(strings.ToLower(e.Error()), "deadlock"))
+	}
+
+	var wg sync.WaitGroup
+	for w, order := range [][]string{forward, reversed} {
+		wg.Add(1)
+		go func(order []string) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				// ⚠️ 必须调 removeMembersLockedOnce（单次尝试），不能调外层
+				// removeMembersLocked——后者裹了 retryOnDeadlock，会把 1213 吞掉重试，
+				// 两个 goroutine × 40 轮的规模下几乎必然重试成功，下面那条
+				// `deadlocks == 0` 断言就再也红不了了（PR #804 round-9 review
+				// yujiawei P2-2；正是本 PR 自己加的 learnings/pending/
+				// mutation-check-the-assertion-not-the-guard.md 说的那种失效方式：
+				// 别处的改动悄悄让既有守卫变得无法变红）。
+				removed, e := removeMembersLockedOnce(f.db.session, spaceID, order, 1, "owner", MemberRemoveReasonKicked)
+				if isDeadlock(e) {
+					deadlocks.Add(1)
+				} else if e != nil {
+					otherErr.Add(1)
+				}
+				// 不能在测试 goroutine 之外调 require（t.FailNow→runtime.Goexit 只能在
+				// 测试自身 goroutine 上跑，否则静默跳过剩余轮次、失败从错误的地方冒出来）。
+				// 用原子标志记下，回到主 goroutine 再断言。
+				if len(removed) != 0 {
+					unexpectedRemoved.Add(1)
+				}
+			}
+		}(order)
+		_ = w
+	}
+	wg.Wait()
+
+	assert.EqualValues(t, 0, deadlocks.Load(),
+		"反序重叠批次不得死锁——单语句取锁按索引序，两个批次顺序一致只会互相阻塞")
+	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
+	assert.EqualValues(t, 0, unexpectedRemoved.Load(), "全是 admin、reject=1，不该移除任何人")
+
+	// 收尾核实：全程无人被移除，成员行原样都在
+	for _, uid := range members {
+		m, qerr := f.db.queryMember(spaceID, uid)
+		require.NoError(t, qerr)
+		require.NotNil(t, m)
+		assert.EqualValues(t, 1, m.Status, "%s 应当仍是活跃成员", uid)
+	}
+}
+
+// TestUpsertMembersLocksInSameOrderAsBatchRemoval 守住批量加人 vs 批量移除这一对。
+//
+// 背景（PR #804 round-9 review，Jerry-Xin 实测定位）：upsertMembers 逐条 upsert，此前
+// 按**调用方给的 uid 顺序**取锁（normalizeUIDs 不排序），而当时的批量移除走 FORCE INDEX 按
+// **索引升序**取锁——两边顺序相反即构成 AB-BA。这一对在 main 上不可能死锁：那时用户端
+// 移除是一人一事务、只握一把锁，做不了 hold-and-wait 的那一侧；是本 PR 的整批单事务
+// （最多 200 行）把它变成了可能。
+//
+// ⚠️ 为什么光包 retryOnDeadlock 不够——这是本轮最值钱的一条：
+// 有界重试只能救**短命**的对手（群主转让、强制移除，实测已归零），碰上**长命**的对手会被
+// **饿死**：批量移除每次尝试都是全新事务、回滚代价为零，InnoDB 反复选它当牺牲者，而还在
+// 跑的 upsert 一直在推进；重试立刻又撞上同一个活事务，几次退避跑完仍在人家生命周期内。
+// 实测（200 uid 逆序重叠、60 轮）：只包重试时移除侧 **60/60** 把 1213 抛给了调用方。
+// 排序之后两边同序、结构上不成环，实测 0/60（含**两侧都不包重试**的对照，证明是真的没
+// 死锁，而不是被重试吸收掉了）。
+//
+// 本测试**刻意调 …Once**（两侧都不包重试）：包一层重试就会把要数的 1213 吞掉，守卫就再
+// 也红不了了——正是本 PR 自己 round-8 犯过的错，见 learnings/pending/
+// mutation-check-the-assertion-not-the-guard.md。
+// 变异验证：把 upsertMembersOnce 里的 sortForLockOrder 换成不排序（或换成与批量移除
+// 侧不同的排序口径），本测试立刻变红。
+//
+// 注意排序口径不是随便挑的：两边必须对**同一行**得出同一个键，而 uid 列大小写不敏感，
+// 所以 sortForLockOrder 折叠大小写而不是裸字节序 —— 裸字节序由
+// TestSortForLockOrderIsSpellingInvariant 单独钉住（本测试覆盖不到那个场景：唯一索引
+// 把大小写变体折叠成同一个键，第二行插不进去，1062）。
+func TestUpsertMembersLocksInSameOrderAsBatchRemoval(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+	mgr := newManagerDB(testCtx.DB())
+
+	const spaceID = "upsert-order"
+	seedMember(t, f, spaceID, "owner", 2)
+
+	// 字母表刻意选成「字节序与 utf8mb4_general_ci 序在相邻元素上翻转」的一组。
+	//
+	// 之前这里是 `m%04d` —— 数字加一个小写字母，正好是两种顺序**重合**的那一个
+	// 字母表，于是这条 guard 对「Go 排序 ≠ 索引顺序」这个失败模式完全不敏感
+	// （PR #804 round-10 review P2-1）。
+	//
+	// 现在每一对都翻转，靠的是 '_'(0x5F) 落在大写区(0x41-0x5A)之后、小写区
+	// (0x61-0x7A)之前，而 general_ci 把小写折叠进大写：
+	//   - `u_%03d` vs `ua%03d` —— 字节序 '_' < 'a'；general_ci 下 'a'→'A'(0x41) < '_'。
+	//   - `A_%03d` vs `Ab%03d` —— 同样的翻转，且把大写字母带进字母表。
+	//
+	// 注意不能用「同名只差大小写」的一对（`M001`/`m001`）来引入大写：唯一索引
+	// (space_id, uid) 在 general_ci 下视两者为同一个键，插第二行会直接 1062。
+	//
+	// 带下划线的标识符在本系统里是现成的（`app_…_bot`、`iwh_…` 都是 Space 成员），
+	// 而批量加人对调用方给的 uid 不做字符集校验。
+	const n = 200
+	asc := make([]string, 0, n)
+	for i := 0; i < n/4; i++ {
+		asc = append(asc,
+			fmt.Sprintf("u_%03d", i),
+			fmt.Sprintf("ua%03d", i),
+			fmt.Sprintf("A_%03d", i),
+			fmt.Sprintf("Ab%03d", i),
+		)
+	}
+	require.Len(t, asc, n)
+	for _, uid := range asc {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: uid, Role: 0, Status: 1,
+		}))
+	}
+	// 逆序：加人侧按调用方顺序取锁，与移除侧的索引升序完全相反——最坏的一对。
+	desc := make([]string, n)
+	for i, uid := range asc {
+		desc[n-1-i] = uid
+	}
+	if _, e := testCtx.DB().Exec("ANALYZE TABLE space_member"); e != nil {
+		require.NoError(t, e)
+	}
+
+	isDeadlock := func(e error) bool {
+		return e != nil && (strings.Contains(e.Error(), "1213") ||
+			strings.Contains(strings.ToLower(e.Error()), "deadlock"))
+	}
+
+	const rounds = 30
+	var removeDL, upsertDL, otherErr atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			// 移除侧：reject=1，role=0 的成员会真的被翻成 status=0 并持锁到提交。
+			_, e := removeMembersLockedOnce(f.db.session, spaceID, asc, 1, "owner", MemberRemoveReasonKicked)
+			if isDeadlock(e) {
+				removeDL.Add(1)
+			} else if e != nil {
+				otherErr.Add(1)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			// 加人侧把他们重新激活，于是两个 goroutine 能一直互相制造重叠。
+			e := mgr.upsertMembersOnce(spaceID, desc)
+			if isDeadlock(e) {
+				upsertDL.Add(1)
+			} else if e != nil {
+				otherErr.Add(1)
+			}
+		}
+	}()
+	wg.Wait()
+
+	assert.EqualValues(t, 0, removeDL.Load(),
+		"批量移除不得与批量加人死锁——两侧必须过同一个 sortForLockOrder")
+	assert.EqualValues(t, 0, upsertDL.Load(), "加人侧同样不得死锁")
+	assert.EqualValues(t, 0, otherErr.Load(), "除死锁外不应有其它错误")
+}
+
+// TestBatchRemovalUsesUniqueIndexWithoutForcing 断言整批锁定查询在**不加 FORCE INDEX**
+// 的情况下也必然走唯一索引 (space_id, uid)。
+//
+// 这条取代了此前的 TestRemoveMembersLockedForcesUniqueIndexPlan。背景：round 7 那条
+// 语句是 `uid IN (...)`，是范围查询，优化器按代价选索引，在真实规模（250 人空间、
+// 200 uid 批）上会选 (space_id, status) 去锁全空间的活跃行——所以当时必须 FORCE。
+//
+// 现在每个 uid 是**独立分支的单行等值**查询（见
+// buildSelectMembersForRemovalForUpdateSQL），(space_id, uid) 是唯一键上的完整等值
+// 匹配，优化器不可能选一个更差的计划。于是：
+//   - FORCE INDEX 不再需要，对索引名的运行时硬依赖（缺失即 1176、且不可重试）随之消失；
+//   - 锁面天然就是目标行本身，不依赖代价估算。
+//
+// 这条测试就是把「不 FORCE 也走唯一索引」这个前提钉住：哪天有人改回范围查询、或者
+// 索引形状变了，它会红。
+func TestBatchRemovalUsesUniqueIndexWithoutForcing(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-plan"
+	seedMember(t, f, spaceID, "owner", 2)
+	// 250 名成员：正是 round 7 实测中优化器会倾向 (space_id, status) 的规模。
+	for i := 0; i < 250; i++ {
+		require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+			SpaceId: spaceID, UID: fmt.Sprintf("m%04d", i), Role: 0, Status: 1,
+		}))
+	}
+	if _, err := testCtx.DB().Exec("ANALYZE TABLE space_member"); err != nil {
+		require.NoError(t, err)
+	}
+
+	// 生产语句里绝不能再出现 FORCE INDEX —— 它是这次要移除的那个硬依赖。
+	require.NotContains(t, buildSelectMembersForRemovalForUpdateSQL(3), "FORCE INDEX",
+		"单行等值查询不需要 FORCE，留着它等于把索引名变成运行时硬依赖")
+
+	// 用生产语句本身 EXPLAIN，只把占位符换成字面量。取一个分支即可：每个分支形状相同。
+	oneBranch := buildSelectMembersForRemovalForUpdateSQL(1)
+	concrete := strings.Replace(oneBranch, "space_id=?", "space_id='"+spaceID+"'", 1)
+	concrete = strings.Replace(concrete, "uid=?", "uid='m0100'", 1)
+
+	var js string
+	require.NoError(t, testCtx.DB().SelectBySql("EXPLAIN FORMAT=JSON "+concrete).LoadOne(&js))
+	assert.Contains(t, js, `"key": "spacemember_spaceid_uid"`,
+		"单行等值必须走唯一索引 (space_id, uid)；走别的就说明索引形状变了")
+}
+
+// TestRetryOnDeadlockRecoversFrom1213 是跨路径死锁修复的**主守卫**（PR #804 round-8）。
+//
+// space_member 上批量移除 vs 群主转让/强制移除的加锁顺序互不相同、且无法从单个调用点
+// 统一（转让是两段式非单调），所以 FORCE INDEX 收窄锁面后仍会跨路径 AB-BA 死锁。三条
+// 写路径都套了 retryOnDeadlock 兜底。真实死锁竞态在本机难以稳定复现，所以这里**注入**
+// 一个 InnoDB 死锁(1213)直接钉住重试逻辑本身：
+//   - 前 N 次返回 1213、之后成功 → 整体成功，且确实重跑了 N+1 次；
+//   - 一直 1213 → 有界次数后放弃并包装报错，不会无限重试；
+//   - 1205 锁等待超时 → **不重试**、原样透传（理由见 isDeadlockErr）；
+//   - 领域错误（非 1213）→ 第一次就原样透传，errors.Is 仍成立。
+func TestRetryOnDeadlockRecoversFrom1213(t *testing.T) {
+	deadlock := &mysqldrv.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"}
+	lockWait := &mysqldrv.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}
+
+	t.Run("前几次死锁后成功", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error {
+			calls++
+			if calls < 3 {
+				return deadlock
+			}
+			return nil
+		})
+		require.NoError(t, err, "死锁回滚后重跑应当最终成功")
+		assert.Equal(t, 3, calls, "应当正好重试到成功那一次")
+	})
+
+	// 1205（锁等待超时）**不重试**，与 1213 相反。等满 innodb_lock_wait_timeout
+	// （默认 50s）才返回的错误，重试既贵又最不可能有用；这几条写路径挂在用户 HTTP
+	// 请求上，重试 3 次最坏要占着 handler ~150s。见 isDeadlockErr 的注释
+	// （PR #804 round-9 review：yujiawei P2-1 / mochashanyao P2-3）。
+	t.Run("锁等待超时不重试而是原样透传", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return lockWait })
+		assert.Equal(t, 1, calls, "1205 不得重试——重试满 3 次会把请求拖到 ~150s")
+		assert.ErrorIs(t, err, lockWait, "1205 必须原样透传，与合入前行为一致")
+	})
+
+	t.Run("持续死锁则有界放弃", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return deadlock })
+		require.Error(t, err, "重试用尽必须报错，不能无限重试")
+		assert.Equal(t, spaceMutatorMaxAttempts, calls, "严格重试 spaceMutatorMaxAttempts 次")
+		assert.ErrorIs(t, err, deadlock, "包装后原始死锁错误仍可被 errors.Is 取到")
+	})
+
+	t.Run("领域错误第一次就原样透传", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return ErrCannotRemoveOwner })
+		assert.Equal(t, 1, calls, "非死锁错误不得重试")
+		assert.ErrorIs(t, err, ErrCannotRemoveOwner, "领域错误必须原样透传，否则调用方的 errors.Is 失效")
+	})
+
+	t.Run("一次成功不重试", func(t *testing.T) {
+		calls := 0
+		err := retryOnDeadlock(func() error { calls++; return nil })
+		require.NoError(t, err)
+		assert.Equal(t, 1, calls)
+	})
+}
+
+// TestRemoveMembersLockedHonoursStoredUIDSpelling 大小写变体的 uid 必须照常被移除。
+//
+// space_member.uid 没有显式 COLLATE，继承库默认 utf8mb4_general_ci —— 大小写不敏感。
+// 批量锁定语句的 `uid IN ?` 因此会匹中变体，并把行按**库里存的拼写**返回。若把角色
+// 判定的查表放到 Go 里、又用请求里的拼写当 key，两者不一致时就查不中：成员被当成
+// 「不在空间」静默跳过，不翻 status、不入清理工单、不失效鉴权缓存，而 removeMembers
+// 照样 c.ResponseOK()。在一个专门用来收回访问权的端点上，「报成功、什么也没做」是
+// 最坏的失败形状。
+//
+// 老的逐个路径两条语句都在 SQL 里比（SELECT ... WHERE uid=? / UPDATE ... WHERE uid=?），
+// 没有这个落差，所以那会是**回归**而不是既有行为（PR #804 round-10 review P0-1）。
+func TestRemoveMembersLockedHonoursStoredUIDSpelling(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-collation"
+	// 只差大小写的两种拼写：stored 是库里的，requested 是调用方给的。
+	const stored, requested = "AbCdEf01", "abcdef01"
+
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: stored, Role: 0, Status: 1,
+	}))
+
+	// 前置条件：确认这个库的 uid 列真的是大小写不敏感的。否则本测试会因为
+	// 「SQL 也没匹中」而假绿，测的就不是它自称在测的东西了。
+	precheck, err := f.db.queryMember(spaceID, requested)
+	require.NoError(t, err)
+	require.NotNil(t, precheck,
+		"本测试要求 uid 列是大小写不敏感的 collation（CI 用 utf8mb4_general_ci）；"+
+			"查不到说明测试库建错了，不是被测代码的问题")
+
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{requested}, 1, "owner", MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	require.Equal(t, []string{stored}, removed,
+		"必须真的移除，且返回库里的拼写——清理工单和鉴权缓存 key 都要用它")
+
+	// 直查而不走 queryMember：后者带 status=1 过滤，移除成功时本来就查不到。
+	assert.EqualValues(t, 0, memberStatus(t, spaceID, stored), "成员行必须真的翻成 status=0")
+
+	jobs := cleanupJobs(t, spaceID)
+	require.Len(t, jobs, 1, "必须入队清理工单，否则人还留在这个 Space 的每个群里")
+	assert.Equal(t, stored, jobs[0].UID, "工单里的 uid 必须是库里的拼写")
+}
+
+// TestRemoveMembersLockedDedupesCaseVariants 同一批里塞两个互为大小写变体的 uid，
+// 只该产生一次移除、一条工单。
+//
+// 去重来源是唯一索引 (space_id, uid) —— 锁定查询对同一个成员至多返回一行。此前那个
+// 基于字节相等的 seen 集合做不到这一点：它把两种拼写看成两个人，于是写出两条指向
+// 同一个人的清理工单，worker 会把整条级联跑两遍（重复的退群 Tip、重复的 IM 退订）。
+func TestRemoveMembersLockedDedupesCaseVariants(t *testing.T) {
+	_, f, err := setup(t)
+	require.NoError(t, err)
+
+	const spaceID = "rm-batch-collation-dup"
+	const stored = "AbCdEf02"
+
+	seedMember(t, f, spaceID, "owner", 2)
+	require.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceID, UID: stored, Role: 0, Status: 1,
+	}))
+
+	// 刻意**不**传库里那个拼写：两个都是变体，去重与匹中必须同时成立才会绿。
+	// 若把 stored 也塞进来，即便变体一个都没匹中，本用例也会假绿。
+	removed, err := f.db.removeMembersLocked(
+		spaceID, []string{"abcdef02", "ABCDEF02"}, 1, "owner", MemberRemoveReasonKicked)
+	require.NoError(t, err)
+	assert.Equal(t, []string{stored}, removed, "同一个人只该被移除一次，且返回库里的拼写")
+	require.Len(t, cleanupJobs(t, spaceID), 1, "同一个人只该有一条清理工单")
+}
+
+// memberStatus 直查成员行的 status。db.queryMember 带 `status=1` 过滤，验证
+// 「有没有被移除」时用不了它 —— 移除成功和行不存在都返回 nil，两者分不开。
+func memberStatus(t *testing.T, spaceID, uid string) int {
+	t.Helper()
+	var rows []struct {
+		Status int `db:"status"`
+	}
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT status FROM space_member WHERE space_id=? AND uid=?", spaceID, uid).Load(&rows)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "space_member 里应当恰好有一行 %s/%s", spaceID, uid)
+	return rows[0].Status
+}
+
+// TestBatchRemovalLocksInBranchOrder 是本轮的**主守卫**：证明整批锁定查询的加锁
+// 顺序由 UNION ALL 的分支顺序决定，**与列的 collation 无关**。
+//
+// 为什么这条必须存在，而且必须跑两种 collation：
+//
+// space_member 建表时没写 COLLATE，继承库默认。CI 显式建库为 utf8mb4_general_ci
+// （ci.yml），而 MySQL 8.0 的默认是 utf8mb4_0900_ai_ci，生产库即为后者。两者对 '_'
+// 的排序**相反**。此前的实现用一条 `uid IN (...) FOR UPDATE`，加锁顺序 = 索引物理
+// 顺序 = 列的 collation 序，于是 upsert 侧必须在 Go 里复现 collation —— 而任何这种
+// 复现都只能对一种环境成立。round 10 复刻了 general_ci（CI 那种），在生产上反而把
+// 顺序排反了，且因为 CI 只跑 general_ci，测试全绿。
+//
+// 所以这条测试自己建表、自己指定 collation，不依赖 CI 建库时用的那一种。只跑一种
+// 就等于重犯上一轮的错。
+//
+// 判定方法：让一个会话先锁住分支 2 的目标行，再跑本语句。若按分支顺序取锁，它应当
+// **恰好持有分支 1 的行锁、且未触及分支 3**；若按索引序取锁，持有的会是另一组。
+// 每种 collation 的分支顺序都刻意与该 collation 的索引序**相反** —— 否则两种假设
+// 给出同样结果，测不出任何东西（这正是 round 10 那个 m%04d 字母表的毛病）。
+func TestBatchRemovalLocksInBranchOrder(t *testing.T) {
+	_, _, err := setup(t)
+	require.NoError(t, err)
+
+	cases := []struct {
+		collation string
+		// order 的顺序刻意与该 collation 的索引序相反
+		order []string
+	}{
+		// 0900_ai_ci 索引序: A_000 a_b aab Ab000 u_000 ua000
+		{"utf8mb4_0900_ai_ci", []string{"u_000", "aab", "A_000"}},
+		// general_ci 索引序: aab Ab000 A_000 a_b ua000 u_000
+		{"utf8mb4_general_ci", []string{"a_b", "aab", "u_000"}},
+	}
+	all := []string{"a_b", "aab", "u_000", "ua000", "A_000", "Ab000"}
+
+	for _, tc := range cases {
+		t.Run(tc.collation, func(t *testing.T) {
+			table := "sm_lockorder"
+			db := testCtx.DB()
+			_, _ = db.Exec("DROP TABLE IF EXISTS " + table)
+			t.Cleanup(func() { _, _ = db.Exec("DROP TABLE IF EXISTS " + table) })
+			_, err := db.Exec(fmt.Sprintf(`CREATE TABLE %s (
+				id int NOT NULL AUTO_INCREMENT,
+				space_id varchar(40) COLLATE %s NOT NULL DEFAULT '',
+				uid varchar(40) COLLATE %s NOT NULL DEFAULT '',
+				role smallint NOT NULL DEFAULT 0,
+				status smallint NOT NULL DEFAULT 1,
+				PRIMARY KEY (id),
+				UNIQUE KEY spacemember_spaceid_uid (space_id, uid)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=%s`, table, tc.collation, tc.collation, tc.collation))
+			require.NoError(t, err)
+			for _, u := range all {
+				_, err := db.Exec("INSERT INTO "+table+" (space_id, uid) VALUES ('s', ?)", u)
+				require.NoError(t, err)
+			}
+
+			// 前置：确认这组数据在本 collation 下，分支顺序确实与索引序不同。
+			// 否则本用例无判别力，会假绿。
+			var idxOrder []string
+			_, err = db.SelectBySql("SELECT uid FROM " + table + " WHERE space_id='s'").Load(&idxOrder)
+			require.NoError(t, err)
+			pos := func(u string) int {
+				for i, v := range idxOrder {
+					if v == u {
+						return i
+					}
+				}
+				return -1
+			}
+			require.Greater(t, pos(tc.order[0]), pos(tc.order[1]),
+				"分支顺序必须与索引序相反，否则两种假设给出同样结果（索引序=%v）", idxOrder)
+
+			// blocker：锁住分支 2 的目标行，事务不提交
+			blockerTx, err := db.Begin()
+			require.NoError(t, err)
+			defer blockerTx.RollbackUnlessCommitted()
+			var got string
+			_, err = blockerTx.SelectBySql(
+				"SELECT uid FROM "+table+" WHERE space_id='s' AND uid=? FOR UPDATE", tc.order[1]).Load(&got)
+			require.NoError(t, err)
+
+			// probe：按 tc.order 分支顺序取锁，预期卡在分支 2
+			probeTx, err := db.Begin()
+			require.NoError(t, err)
+			defer probeTx.RollbackUnlessCommitted()
+			var probeConnID uint64
+			require.NoError(t, probeTx.SelectBySql("SELECT CONNECTION_ID()").LoadOne(&probeConnID))
+
+			stmt := strings.ReplaceAll(buildSelectMembersForRemovalForUpdateSQL(len(tc.order)), "space_member", table)
+			args := make([]interface{}, 0, len(tc.order)*2)
+			for _, u := range tc.order {
+				args = append(args, "s", u)
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				var rows []spaceMemberRoleRow
+				_, _ = probeTx.SelectBySql(stmt, args...).Load(&rows)
+			}()
+
+			// 等 probe 跑到阻塞点
+			time.Sleep(1500 * time.Millisecond)
+
+			var held []string
+			_, err = db.SelectBySql(`
+				SELECT dl.LOCK_DATA FROM performance_schema.data_locks dl
+				JOIN performance_schema.threads th ON th.THREAD_ID = dl.THREAD_ID
+				WHERE th.PROCESSLIST_ID = ? AND dl.LOCK_STATUS='GRANTED'
+				  AND dl.LOCK_TYPE='RECORD' AND dl.INDEX_NAME='spacemember_spaceid_uid'`,
+				probeConnID).Load(&held)
+			require.NoError(t, err)
+			heldStr := strings.Join(held, " ")
+
+			assert.Contains(t, heldStr, tc.order[0],
+				"应当已持有分支 1 (%s) 的行锁——说明按分支顺序取锁；索引序=%v 持有=%v",
+				tc.order[0], idxOrder, held)
+			assert.NotContains(t, heldStr, tc.order[2],
+				"不应触及分支 3 (%s)——它排在阻塞点之后", tc.order[2])
+
+			require.NoError(t, blockerTx.Rollback())
+			<-done
+		})
+	}
+}
+
+// TestSortForLockOrderIsSpellingInvariant 钉住取锁排序的**真正**不变量：两个调用方
+// 即便用不同的拼写指代同一批行，也必须排出同一个取锁顺序。
+//
+// 上一版这里用的是 sort.Strings，注释写着「序本身是什么不重要，用最朴素的字节序
+// 正是因为它不需要任何前提」。那句话是假的，而且是这个 PR 反复犯的同一类错误
+// （PR #804 round-11 review P1-1）。
+//
+// 前提在这里：两边必须排**同一组字符串**。它们收到的却不一定是——`space_member.uid`
+// 没有显式 COLLATE，继承的库默认（CI general_ci / 生产 0900_ai_ci）**都是大小写
+// 不敏感**的，所以 `ABC` 与 `abc` 是同一行；而两个入口都不折叠大小写
+// （normalizeUIDs 按字节去重，用户端 removeMembers 连它都不调）。于是：
+//
+//	batch-add    收到 ["ABC", "abd"] → 字节序 → 锁 abc、再锁 abd
+//	batch-remove 收到 ["abc", "ABD"] → 字节序 → 锁 abd、再锁 abc
+//
+// 同两行、相反顺序 —— 正是那句注释宣称不可能的 AB-BA。而这一对恰恰是 round 9b 实测
+// 中 retryOnDeadlock **饿死**而非吸收的组合（60/60 未恢复），所以退化形态不是「重试
+// 一次就好」，而是一个访问撤销端点上持续的 500。
+//
+// 唯一索引把大小写变体折叠成同一个键，所以并发用例
+// TestUpsertMembersLocksInSameOrderAsBatchRemoval 结构上覆盖不到这个场景（插第二行
+// 直接 1062）。这条只测排序函数本身，正因为那里测不了。
+func TestSortForLockOrderIsSpellingInvariant(t *testing.T) {
+	// 同一批行（abc / abd），两个调用方各用一种拼写
+	addSide := sortForLockOrder([]string{"ABC", "abd"})
+	removeSide := sortForLockOrder([]string{"abc", "ABD"})
+
+	fold := func(uids []string) []string {
+		out := make([]string, 0, len(uids))
+		for _, u := range uids {
+			out = append(out, strings.ToLower(u))
+		}
+		return out
+	}
+	assert.Equal(t, fold(addSide), fold(removeSide),
+		"两个调用方指代同一批行时必须排出同一个取锁顺序；不同拼写排出不同顺序即 AB-BA")
+
+	// 不改调用方切片
+	orig := []string{"b", "a"}
+	_ = sortForLockOrder(orig)
+	assert.Equal(t, []string{"b", "a"}, orig, "必须排副本，不得改动调用方切片")
+
+	// 折叠后相等时用原始字节序兜底，保证是**全序**：sort.Slice 不稳定，
+	// 同一组输入必须排出同一个结果。
+	got := sortForLockOrder([]string{"AbC", "abc", "ABC"})
+	assert.Equal(t, []string{"ABC", "AbC", "abc"}, got,
+		"折叠后同键时按原始字节序，结果必须确定")
 }

@@ -864,30 +864,20 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		return
 	}
 
-	// 只收集**真的被移除**的成员：removeMemberLocked 对「行本来就不存在」也返回
-	// nil error，拿它去清缓存 / 发事件会对着非成员空跑一整套收尾。
-	removed := make([]string, 0, len(req.UIDs))
-	for _, uid := range req.UIDs {
-		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
-		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
-		// 防止 pre-check 后目标被并发转让升为 owner 仍被移除（PR #339 review）。
-		ok, err := s.db.removeMemberLocked(spaceId, uid, member.Role, loginUID, MemberRemoveReasonKicked)
-		if err != nil {
-			if errors.Is(err, ErrCannotRemoveOwner) || errors.Is(err, ErrRemoveHierarchy) {
-				continue
-			}
-			s.Error("移除空间成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("uid", uid))
-			// 前面几个已经各自提交了（removeMemberLocked 一人一事务），中途失败
-			// 直接 return 会把他们的收尾整个丢掉——鉴权缓存留着 "1" 最长 60s，
-			// 人已被移除却还能通过 SpaceMiddleware。而且客户端重试整批时，
-			// 这些人的 removeMemberLocked 返回 ok=false，缓存也补不回来。
-			s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)
-			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-			return
-		}
-		if ok {
-			removed = append(removed, uid)
-		}
+	// 整批一个事务：锁内逐个重读角色（owner 与同级及更高角色静默跳过，与既有语义
+	// 一致；锁内重读防止 pre-check 后目标被并发转让升为 owner 仍被移除，PR #339 review），
+	// 翻转成员行，并把全部清理工单在**同一个事务里**入队。
+	//
+	// 逐个提交（此前的写法）会让同批工单的行陆续可见，群侧的交接通告抑制因此读不到
+	// 尚未入队的兄弟工单，发出已作废的「已成为新群主」。理由与实测见
+	// db_manager.go removeMembersLocked 的注释。
+	//
+	// 中途 DB 出错现在整批回滚，没有「已提交的前缀」需要补偿收尾了。
+	removed, err := s.db.removeMembersLocked(spaceId, req.UIDs, member.Role, loginUID, MemberRemoveReasonKicked)
+	if err != nil {
+		s.Error("移除空间成员失败", zap.Error(err), zap.String("spaceId", spaceId))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
+		return
 	}
 	// 整批一次收尾：鉴权缓存逐个同步失效，事件与清理 worker 合并到一个后台 goroutine。
 	s.afterMembersRemoved(spaceId, removed, loginUID, MemberRemoveReasonKicked)

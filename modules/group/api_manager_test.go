@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
 )
 

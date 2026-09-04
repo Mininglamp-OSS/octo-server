@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -66,14 +67,29 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 		return nil
 	}
 
-	operatorName := g.resolveOperatorName(removal.OperatorUID)
+	// 解散路径既不发被移出通知、也不发群内广播、也不通告群主交接，两个展示名
+	// 一个都用不上——一个几千人的 Space 解散就是几千次纯浪费的 user 查询。
+	// 注意这里查的是**全局**兜底名；真正用的是群内 remark 优先，见
+	// exitSpaceMemberFromGroup 里的 displayName。
+	var operatorName, memberName string
+	if removal.Reason != spacemod.MemberRemoveReasonSpaceDisbanded {
+		operatorName = g.resolveDisplayName(removal.OperatorUID)
+		// 注意这里用的是 resolveGlobalName（查不到给空串）而**不是**
+		// resolveDisplayName（查不到给 uid）：这个名字会进交接通告的 extra，
+		// 而那是持久的群历史，绝不能落到裸 uid。兜底交给 resolveExitShowName。
+		//
+		// operatorName 上面仍用 resolveDisplayName：它进的是 RemoveGroupMembers 的
+		// 私人通知（「你被{0}移除群聊」），只发给被移除者本人，不是群历史，
+		// 兜底行为不在本次范围内。
+		memberName = g.resolveGlobalName(removal.UID)
+	}
 
 	var firstErr error
 	for _, groupModel := range groups {
 		if groupModel == nil || groupModel.Status == GroupStatusDisband {
 			continue
 		}
-		if err := g.exitSpaceMemberFromGroup(groupModel.GroupNo, removal, operatorName); err != nil {
+		if err := g.exitSpaceMemberFromGroup(groupModel.GroupNo, removal, operatorName, memberName); err != nil {
 			g.Error("被移出 Space 的成员退群失败",
 				zap.Error(err),
 				zap.String("groupNo", groupModel.GroupNo),
@@ -125,7 +141,7 @@ func (g *Group) cleanupSpaceMemberGroups(ctx *config.Context, removal spacemod.M
 //
 // 上面那次 CheckMembershipForCleanup 覆盖的是「重新加入发生在读之前」，也就是真正
 // 宽的那个窗口；它并不覆盖读到随后写之间的间隙。彻底关闭同样要靠成员纪元，见 #797。
-func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName string) error {
+func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.MemberRemoval, operatorName, memberName string) error {
 	member, err := g.db.QueryMemberWithUID(removal.UID, groupNo)
 	if err != nil {
 		return fmt.Errorf("query group member: %w", err)
@@ -134,8 +150,30 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		return nil // 已经不在群里，幂等返回
 	}
 
+	// 展示名按群取：group_member.remark 是本群内的称呼，优先于全局 user.name。
+	// 这是本仓库既有的展示名规则——groupExit 就是 `loginMember.Remark` 优先
+	// （api.go）、花名册也渲染 Remark。用全局名会在群里播一个没人认识的名字。
+	//
+	// 走 #807 的 resolveExitShowName，与退群提示同一套口径：remark → 全局名 →
+	// **中性兜底**，绝不落到裸 uid。理由见 exitShowNameFallback：这条通告全员可见、
+	// 持久，后来入群的人也读得到，把内部 UID 永久写进群历史等于泄露一个不该出现在
+	// 聊天记录里的标识符。memberName 是循环外查好的全局名（查不到为空串）。
+	displayName := resolveExitShowName(member.Remark, func() string { return memberName })
+
+	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
+
+	// 群主交接**连同它的群内通告**都在 handOverGroupCreator 里完成，不要挪到本函数
+	// 后半段去发。
+	//
+	// 交接自己提交事务，而它之后到函数返回之间还有 RemoveGroupMembers 这一大段可能
+	// 失败（DB 错误、bot 级联失败、Removed==0 的并发守卫）。一旦失败，工单重试时
+	// 这里读到的角色已经是 MemberRoleCommon，交接分支不再进入——通告就**永久丢失**，
+	// 正是本改动要消灭的「群里凭空多出一个新群主」。
+	//
+	// 放在提交处则天然幂等：重试时 handOverGroupCreator 在行锁内看到已非群主，
+	// 直接返回，不会重复通告。
 	if member.Role == MemberRoleCreator {
-		if err := g.handOverGroupCreator(groupNo, removal.UID); err != nil {
+		if err := g.handOverGroupCreator(groupNo, removal.UID, displayName, removal.SpaceID, spaceGone); err != nil {
 			return fmt.Errorf("hand over group creator: %w", err)
 		}
 	}
@@ -147,10 +185,12 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 	//     N 个成员 × M 个群就是 N×M 条系统消息（1000 人 × 50 群 = 五万条），
 	//     全都堆给最后被移除的那个人看。空间已经没了，逐个通告没有意义。
 	selfExit := removal.Reason == spacemod.MemberRemoveReasonLeft
-	spaceGone := removal.Reason == spacemod.MemberRemoveReasonSpaceDisbanded
 	suppressNotice := selfExit || spaceGone
 
 	// bot 连带移除的 Tip 动作词：自助退出说「退出了」，其余沿用默认的「被移出」。
+	//
+	// 不要把被移出 Space 的情形也改成「退出了」：那是被动的，说成主动就是错的，
+	// 而且 TestGroupCascadeKickStillSendsBotTip 正是钉这条契约的正向对照。
 	cascadeAction := ""
 	if selfExit {
 		cascadeAction = "退出了"
@@ -192,6 +232,17 @@ func (g *Group) exitSpaceMemberFromGroup(groupNo string, removal spacemod.Member
 		// 已经查不到人了。
 		g.sendGroupExitTip(groupNo, removal.UID, member.Remark)
 	}
+	// 普通成员被移出 Space 时**不**向全群广播——刻意的产品取舍，别再加回来。
+	//
+	// 「某人走了」在成员列表里看得见，而「群主换人了」看不见：信息量不对等，所以
+	// 只有后者值得一条群消息（在 handOverGroupCreator 里发）。
+	//
+	// 反过来做（每个被移除成员都广播一条）会把两个批量入口直接变成消息洪水：
+	// members/remove 与管理端 removeMembers 各自最多 200 个 uid
+	// （managerMaxBatchUIDs），每个 uid 一条工单、每条工单遍历其所有群，
+	// 200 人 × 50 群 = 一万条 NoPersist=0 的永久群消息，量级与解散被抑制的理由相同。
+	// 被移除者本人仍会收到 RemoveGroupMembers 发的私人通知（「你被{0}移除群聊」），
+	// 群内成员列表则由 CMDGroupMemberUpdate 静默刷新。
 	return nil
 }
 
@@ -222,7 +273,12 @@ func (g *Group) sendGroupExitTip(groupNo, uid, groupRemark string) {
 // 没有可继任者（群里只剩他自己，或只剩 bot）时仍然要把他降为普通成员，否则
 // RemoveGroupMembers 会跳过 creator，人就永远留在群里了。此时群成为无主空群，
 // 与既有 groupExit 在同样情形下的终局一致。
-func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
+// 交接成功后**在本函数内**通告全群，不把继任者回传给调用方去发：调用方到函数返回
+// 之间还有 RemoveGroupMembers 可能失败，而重试时离开者已被降级、不再走进交接分支，
+// 通告就永久丢了。放在这里则天然幂等——重试时锁内重读已非 creator，直接返回。
+//
+// suppressNotice=true 时只做交接、不通告（解散场景，见调用方）。
+func (g *Group) handOverGroupCreator(groupNo, leaverUID, leaverName, spaceID string, suppressNotice bool) error {
 	tx, err := g.db.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin creator handover: %w", err)
@@ -234,21 +290,66 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
 	// 就会各自提升一个继任者，群里留下两个 role=creator 的行。而
 	// RemoveGroupMembers 会静默跳过 creator，于是那个成员被永久卡在群里。
 	// 锁内重读后若已不是 creator，说明别人刚交接过，直接当成功返回。
-	var roles []int
+	// 顺带取回 id：下面的选主守卫要用它做身份比较。加一列不影响本语句的计划——
+	// WHERE 是唯一键 group_no_uid 上的等值查询，而 id 本来就在每个二级索引里。
+	var leaverRows []struct {
+		ID   int64 `db:"id"`
+		Role int   `db:"role"`
+	}
 	if _, err = tx.SelectBySql(
-		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		"SELECT id, role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
 		groupNo, leaverUID,
-	).Load(&roles); err != nil {
+	).Load(&leaverRows); err != nil {
 		return fmt.Errorf("re-read leaver role: %w", err)
 	}
-	if len(roles) == 0 || roles[0] != MemberRoleCreator {
+	if len(leaverRows) == 0 || leaverRows[0].Role != MemberRoleCreator {
 		return nil // 已经不是群主（并发交接已完成 / 人已不在群）
 	}
+	leaverRowID := leaverRows[0].ID
 
 	// 继任者也在同一事务内查，避免用事务外的陈旧快照
-	successor, err := querySecondOldestNonBotMemberTx(tx, groupNo, leaverUID)
+	successor, err := querySecondOldestEligibleMemberTx(tx, groupNo)
 	if err != nil {
 		return fmt.Errorf("query successor: %w", err)
+	}
+
+	// 离开者绝不能当选为自己的继任者。
+	//
+	// 为什么这道守卫在 Go 里、而不是像非事务版那样写成 `gm.uid <> ?` 谓词 ——
+	// 这是实测出来的，不是偏好：
+	//
+	//   上面那条选主语句是 `ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE`，
+	//   group_member 上没有服务这个排序的索引，于是它 filesort，并在扫描过程中把命中
+	//   的行**全部**加锁；加锁顺序 = 优化器选中的索引顺序。给它加一个 `gm.uid <> ?`，
+	//   优化器就从 group_no_uid 换到 group_member_groupNo，取锁顺序随之从 **uid 升序**
+	//   变成 **id（插入）升序**。而 RemoveGroupMembers 是特意按 uid 排序取锁的
+	//   （service.go），两者方向相反就是 AB-BA。
+	//
+	//   实测（MySQL 8.0.46，同群三行、uid 序与 id 序刻意相反，T1=RemoveGroupMembers
+	//   逐行 FOR UPDATE、T2=本函数）：不加谓词 0/3 死锁，加 `uid <> ?` 后 **3/3** 死锁，
+	//   InnoDB 的死锁报告直接点名这条选主语句。modules/group 里没有任何死锁重试
+	//   （retryOnDeadlock 只在 modules/space），输家就是一个 500 或一次白烧的清理工单。
+	//
+	//   ⚠️ 这组数字的边界，别读宽了（PR #804 round-13 review §1d）：**n=3**，测的是
+	//   **本 PR 收紧后的语句形状**（已经不是 main 那条 —— main 带 LEFT JOIN robot、
+	//   没有 robot / is_external / status 三个谓词）。计划翻转本身在 EXPLAIN 上是稳定的
+	//   （group_no_uid → group_member_groupNo），锁序翻转也由 performance_schema.data_locks
+	//   直接观察到，所以机制是确定的；但「3/3」只是这个夹具下的命中率，不要当成对全部
+	//   数据分布的结论 —— 大表上这条 ORDER BY 扫描的计划本身就会再变（实测 5000 行同群
+	//   时优化器改走全表扫描），service.go 的注释说的正是这件事。
+	//
+	//   FORCE INDEX 能把计划钉回去（实测 0/3），但那是在热路径上新增一次锁序改动
+	//   外加一个索引名的运行时硬依赖，属于并发那摊事，不该塞进本改动。
+	//
+	// 触发条件与退化方向：今天走不到 —— 本函数先选主、后降级，离开者在选主那一刻还是
+	// creator，被 `gm.role <> ?` 滤掉。这道守卫防的是**将来有人把这两句调换**：那时它
+	// 返回「无可继任者」（群成为无主空群，是既有的、已被处理的终局），而不是把一个已经
+	// 离开的人立为群主。少选一个人是安全的退化方向，立错群主不是。日志按 Error 记，
+	// 因为走到这里说明上面的语句顺序被改坏了。
+	if isSelfSuccessor(successor, leaverRowID) {
+		g.Error("选主命中离开者本人，已拒绝——检查 handOverGroupCreator 的语句顺序是否被调换",
+			zap.String("groupNo", groupNo), zap.String("leaver", leaverUID))
+		successor = nil
 	}
 
 	if successor != nil {
@@ -269,53 +370,275 @@ func (g *Group) handOverGroupCreator(groupNo, leaverUID string) error {
 		return fmt.Errorf("demote leaver: %w", err)
 	}
 
+	// 继任者是否也在待移除队列里 —— **在事务内**查，理由见下面通告处的注释。
+	// 只查、不据此改变事务的成败：查询失败按「不在队列里」处理，照常通告。
+	successorPending := false
+	if successor != nil && !suppressNotice {
+		if pending, perr := spacemod.HasPendingRemovalCleanup(tx, spaceID, successor.UID); perr != nil {
+			g.Warn("查询继任者待移除状态失败，按未待移除处理",
+				zap.Error(perr), zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
+		} else {
+			successorPending = pending
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit creator handover: %w", err)
 	}
-	if successor != nil {
-		g.Info("Space 成员移除触发群主交接",
-			zap.String("groupNo", groupNo),
-			zap.String("from", leaverUID),
-			zap.String("to", successor.UID))
-	} else {
+	if successor == nil {
 		g.Warn("群主被移出 Space 但群内无可继任者，群将无主",
 			zap.String("groupNo", groupNo), zap.String("uid", leaverUID))
+		return nil
+	}
+	g.Info("Space 成员移除触发群主交接",
+		zap.String("groupNo", groupNo),
+		zap.String("from", leaverUID),
+		zap.String("to", successor.UID))
+	if suppressNotice {
+		return nil
+	}
+
+	// 继任者自己也在待移除队列里 → 这次交接是链条中间的一环，当场就会作废，不通告。
+	//
+	// 批量移除按 uid 逐条建工单，若被移除的几个人正好是本群里连续的元老，交接会沿元老
+	// 顺序连锁：C→S2、S2→S3、S3→S4，一个群里三条「已成为新群主」，前两条在写下时就
+	// 已经不成立。两个批量入口各自上限 200 uid（managerMaxBatchUIDs），最坏 200 条。
+	// 这与解散被抑制的机制完全相同，只是触发方式不同。
+	//
+	// 跳过中间环之后，只有最后一环（继任者不在队列里）会通告，且通告的正是最终群主。
+	//
+	// 链条能否收敛成一条，取决于「同批工单在任何 worker 起跑前是否全部可见」。
+	// 三个批量入口现在都满足（PR #804 round-4/5 review 查证 + 修复）：
+	//
+	//   - 解散：enqueueMemberRemovalCleanupBatchTx，单事务原子入队。解散本来就整条
+	//     不通告（suppressNotice），这里用不上。
+	//   - 超管强制移除 removeMembersForce：一个事务里翻完全部成员行、入完队再提交。
+	//   - 用户端 members/remove → removeMembersLocked：**本次改动**。此前是
+	//     removeMemberLocked 一人一事务逐个提交，前提不成立，reason=kicked 又不抑制，
+	//     于是 10s tick 落在循环中途就会读到尚未入队的兄弟工单，把「马上要被移除的
+	//     继任者」当成「不在队列」，发出写下时就已作废的通告。实测：整批可见 → 1 条；
+	//     逐条提交且每轮都被 tick 命中 → 3 条；只有首次提交后一个 tick → 2 条。
+	//     现已改为整批单事务，见 space/db_manager.go removeMembersLocked。
+	//
+	// 那个缺口还会与下面「抑制只判定一次」复合成更坏的结果：若最终继任者自己挂着一条
+	// pending 工单，最后一环反而被抑制，于是群历史里**最后**一条群主消息指向一个已经
+	// 不在群里的人，而真正的群主从未被通告。整批原子入队之后这个复合不再成立——最坏
+	// 退化成「一条都不发」，即基线的静默，不比 main 差。
+	//
+	// 守这条的是一对测试，缺一不可：
+	//   - space/TestRemoveMembersLockedEnqueuesAtomically 用一把竞争行锁把整批卡在
+	//     中间，断言此刻一条工单都不可见（变异回逐条提交立刻变红）——它证明前提；
+	//   - group/TestGroupCascadeLastNoticeNamesActualOwner 在前提成立时断言两种结局
+	//     都不说错话（继任者挂陈旧 pending → 静默；正常 → 恰好一条且点名最终群主）。
+	// 只看后者会把前提当结论，见 learnings/pending/a-test-can-encode-the-premise.md。
+	//
+	// 另一个**互相独立**的窗口：多副本。本次一并修掉。
+	//
+	// 早先这个检查跑在 tx.Commit() 之后，那时已不再持有继任者的行锁：若 worker A 在
+	// 提交后、检查前停顿足够久（约 100ms 量级），worker B 可以把 S2 的整条工单跑完并
+	// 置为 done，A 随后读到 done → 不抑制 → 发出已作废的 C→S2。它与上面那条一样，
+	// 也能和「抑制只判定一次」复合成「最后一条消息指向已离开的人」。
+	//
+	// 现在检查挪进了事务（发送仍留在提交后）：事务内 A 仍持着 S2 的行锁，B 连自己交接
+	// 的第一次 FOR UPDATE 都过不去，读到的必然是 pending。已实测确认该行锁确实挡住
+	// 兄弟工单。不需要任何测试钩子——HasPendingRemovalCleanup 收 dbr.SessionRunner，
+	// *dbr.Tx 本身就满足（早先注释说"需要在生产代码里加测试钩子"，那是错的）。
+	//
+	// 注意查询**只影响“发不发通告”，不主动改变事务成败**：它失败时按「不在队列里」
+	// 处理并照常通告，代码本身不会因为一次 COUNT 出错去回滚交接。
+	// （更精确地说：若是连接级/死锁级失败，紧接着的 tx.Commit() 同样会失败、交接随之
+	//  回滚——但那是安全的，工单会重试；若只是良性失败，事务完好、按 fail-open 通告。
+	//  总之不会出现「交接半提交」。）
+	//
+	// ⚠️ 这一处**没有**确定性红测试守着，和上面那条不一样。把它挪回提交之后，现有用例
+	// 全部照绿——因为要自然复现需要 A 在一条 COMMIT 和一次带索引的 COUNT 之间停顿到
+	// 足够 B 跑完一整条工单（实测 30 轮并发，多余通告 0 次）。它的正确性依据是行锁
+	// 论证本身，不是一条会变红的用例。改动这一段时请重新推导，别指望测试拦你。
+	//
+	// 查询失败按「不在队列里」处理并照常通告：宁可多发一条，也不要因为一次 DB 抖动
+	// 把唯一一条有效通告吞掉——群里凭空换群主正是本改动要消灭的。
+	if successorPending {
+		g.Info("继任者本人也在待移除队列，跳过本环交接通告",
+			zap.String("groupNo", groupNo), zap.String("successor", successor.UID))
+		return nil
+	}
+
+	// 报文形状与取舍见 sendSpaceRemovalHandoverNotice 的文档注释。
+	//
+	// 展示名取群内 remark 优先，与 groupExit / 花名册一致；successor 是事务里
+	// FOR UPDATE 选出的那一行，Remark 直接可用，无需再查一次库。
+	successorName := resolveExitShowName(successor.Remark, func() string {
+		return g.resolveGlobalName(successor.UID)
+	})
+	// best-effort：交接已经提交，通告发不出去不该让整条工单重试——重跑时锁内重读
+	// 已非 creator，只会空转到 abandoned，而交接本身是对的。
+	if err := g.sendSpaceRemovalHandoverNotice(
+		groupNo, leaverUID, leaverName, successor.UID, successorName); err != nil {
+		g.Warn("发送群主交接通告失败",
+			zap.Error(err), zap.String("groupNo", groupNo), zap.String("to", successor.UID))
 	}
 	return nil
 }
 
-// resolveOperatorName 取操作者展示名，查不到就退回 UID。
-// 只用于系统 Tip 文案，失败不该让整条清理工单重试。
-func (g *Group) resolveOperatorName(operatorUID string) string {
-	if operatorUID == "" {
-		return ""
+// sendSpaceRemovalHandoverNotice 发「谁走了、于是谁接手」的群内通告。
+//
+// 为什么不直接用 octo-lib 的 SendGroupTransferGrouper：它的文案写死成单句
+// 「“{0}”已成为新群主」，而级联场景需要把**原因**一并交代——群里看到的是
+// 「换了群主」这个结果，缺了「因为原群主离开了空间」就没头没尾。手动转让不需要
+// 这个前半句（操作者就在群里、是主动行为），所以那条路径保持原样、不受影响。
+//
+// 仍然沿用同一个 content type GroupTransferGrouper(1008)：
+//   - 客户端按同一条路径渲染（octo-web module.tsx 把 1000-2000 统一交给 SystemCell，
+//     1008 另被 Model.tsx 列入「不计未读的系统消息」），不会出现同一件事两种样子；
+//   - 名字放 extra 走 {N} 占位符、**不拼进 content**，所以没有 JSON 注入面。
+//
+// ⚠️ 但结构化**不等于**安全，这两件事此前被混为一谈：客户端是在同一个字符串上逐次
+// 替换 {N}，替换进去的文本会被后续几轮重新扫描，所以一个含字面量 `{1}` 的名字会在
+// 下一轮被当成占位符再展开，凭空造出半句系统消息；bidi 控制符则能视觉反转整句。
+// 名字来源是成员可自设的 group_member.remark，且不校验内容。两条途径由
+// sanitizeSystemMessageName 在进入 extra 前掐掉。
+//
+// 结构化只买到「无注入面」这一半，**买不到**「改名后不留旧名」：三端客户端
+// （iOS WKSystemContent、Android StringUtils、Web SDK）都直接渲染 extra[i].name，
+// 没有一端按 uid 重新解析，NoPersist=0 的历史消息里留的仍是发送时刻的名字。
+// extra 带 uid 让重解析成为可能，但今天没有客户端这么做。
+//
+// 两个占位符不是新发明：octo-lib SendGroupMemberScanJoin(1007) 的
+// 「“{0}”通过“{1}”的二维码加入群聊」就是 {0}/{1} + 两元素 extra 的既有写法；
+// 三端都按 extra 长度泛化替换，无 1008 专属渲染逻辑（PR #804 review 逐端核对）。
+//
+// ⚠️ i18n 注意：Android 用 MessageFormat，ASCII 单引号 ' 是转义字符。当前中文全角
+// 引号安全，但将来译成英文若写成 the group's owner，占位符只在 Android 端被静默吞掉。
+//
+// ⚠️ **{0} 点的是「存活那一环的离开者」，不一定是批次里第一个走的那个人。**
+// 一批移除掉同群连续几位元老时（比如 [C, S2]，C 是群主、S2 是次元老），抑制让链条
+// 只剩最后一环，而那一环的离开者是 S2 —— 群里读到的是「S2 已离开当前空间，S3 已
+// 成为新群主」。两个分句都为真（S2 确实离开了空间，S3 确实成了新群主），但 S2 短暂
+// 当过群主这件事群里从没被通告过，读起来会缺一截。
+//
+// 哪一环存活也**不确定**：claimMemberRemovalCleanup 刻意不带 ORDER BY 且用
+// SKIP LOCKED，多副本下谁先跑不定；入队顺序又是 sortForLockOrder 的（uid 序），
+// 与群内资历无关。所以 {0} 的取值范围是「本批次中的某一位离开者」，恒定为真的只有
+// {1}（最终群主）。
+//
+// 这是**有意接受**的口径，不是疏漏。要让 {0} 恒等于批次起始时的群主，得把「批次起始
+// 群主」这个状态串过整条链——每张清理工单是独立跑的，S2 那一张已经看不到 C 曾是群主，
+// 得为此新增持久状态。根治方向是「一批工单全部终结后统一发一条」，与 #797 里那些
+// 「副作用需要持久化重放」的条目同一个形状 —— 但注意 **#797 的正文里目前并没有这一条**，
+// 说「已归在那里」是不准确的；合入前需要真的往 #797 补一条，否则它只是这段注释里的一句话。
+//
+// 当前口径由 TestGroupCascadeLastNoticeNamesActualOwner 的 extra[0] 断言钉住。
+//
+// ⚠️ 准确地说它补的是**链条收敛后 {0} 换了人**这一格：单环场景早就有覆盖 ——
+// TestGroupCascadeCreatorHandoverIsAnnounced 一直在断言 extra[0] 的 uid 和 name，
+// 把 extra[0] 改成点继任者，变红的正是它（已实测）。但单环用例结构上区分不了
+// 「{0} 是本环离开者」和「{0} 是批次首位离开者」——那两者在单环里是同一个人。
+// 别把这里写成「{0} 此前没有任何覆盖」，那句话是假的（PR #804 round-12 review P1-2）。
+func (g *Group) sendSpaceRemovalHandoverNotice(groupNo, leaverUID, leaverName, successorUID, successorName string) error {
+	// 双保险：调用方已经用 resolveExitShowName 兜过中性词了，这里再挡一次，
+	// 且**绝不**兜成 uid —— 见 exitShowNameFallback 的理由（PR #804 round-11 P1-2）。
+	if leaverName == "" {
+		leaverName = exitShowNameFallback
 	}
-	operator, err := g.userDB.QueryByUID(operatorUID)
-	if err != nil || operator == nil {
-		return operatorUID
+	if successorName == "" {
+		successorName = exitShowNameFallback
 	}
-	if operator.Name == "" {
-		return operatorUID
-	}
-	return operator.Name
+	return g.ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    1, // 与 octo-lib 全部群系统消息一致
+			SyncOnce:  0,
+		},
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Payload: []byte(util.ToJson(map[string]interface{}{
+			"content": `“{0}”已离开当前空间，“{1}”已成为新群主`,
+			// 名字在这里净化，不在上游：展示名有 remark / 全局名 / uid 兜底三条来源，
+			// 挡在**入口**才不会漏掉将来新增的第四条。见 sanitizeSystemMessageName。
+			"extra": []config.UserBaseVo{
+				{UID: leaverUID, Name: sanitizeSystemMessageName(leaverName)},
+				{UID: successorUID, Name: sanitizeSystemMessageName(successorName)},
+			},
+			"type": common.GroupTransferGrouper,
+		})),
+	})
 }
 
-// querySecondOldestNonBotMemberTx 是 DB.QuerySecondOldestMemberExcludingBotsOf 的
-// 事务内版本，语义完全一致（含「他人的 bot 仍可继任」这条被
-// TestQuerySecondOldestMemberExcludingBotsOf_OnlyBotsLeft 钉住的既有契约）。
-// 单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
-func querySecondOldestNonBotMemberTx(tx *dbr.Tx, groupNo, leaverUID string) (*MemberModel, error) {
+// resolveGlobalName 取全局用户名，查不到 / 没名字都返回**空串**。
+//
+// 与 resolveDisplayName 的唯一区别就是兜底：那个退回 uid，这个退回空串。差别是承重的
+// —— 凡是结果会进**持久群消息**的路径都必须用这个，把兜底交给 resolveExitShowName
+// 的中性词，绝不能让内部 UID 永久留在群历史里（#807 / PR #804 round-11 P1-2）。
+func (g *Group) resolveGlobalName(uid string) string {
+	if uid == "" {
+		return ""
+	}
+	u, err := g.userDB.QueryByUID(uid)
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.Name
+}
+
+// resolveDisplayName 取展示名，查不到就退回 UID。
+//
+// ⚠️ 只能用于**不进群历史**的场景（当前只剩 RemoveGroupMembers 的私人通知
+// OperatorName）。要进群消息的用 resolveGlobalName + resolveExitShowName。
+// 只用于系统 Tip 文案，失败不该让整条清理工单重试。
+func (g *Group) resolveDisplayName(uid string) string {
+	if uid == "" {
+		return ""
+	}
+	u, err := g.userDB.QueryByUID(uid)
+	if err != nil || u == nil {
+		return uid
+	}
+	if u.Name == "" {
+		return uid
+	}
+	return u.Name
+}
+
+// isSelfSuccessor 报告选主是否选中了离开者本人的那一行。
+//
+// 按 **id** 比，不是按 uid 比：id 是行身份，不掺 collation。group_member.uid 列是
+// 大小写不敏感的（general_ci / 0900_ai_ci 都是），在 Go 里比 uid 就又回到
+// 「Go 比字节、SQL 比 collation」那个坑里，而 id 没有这个问题。
+//
+// 单独成函数是为了它能被直接测到：调用点今天结构上走不到这个分支（见调用点注释），
+// 「调用点恰好没触发」和「守卫本身是对的」是两条不同的断言，只写在 if 里就只能测前者。
+func isSelfSuccessor(successor *MemberModel, leaverRowID int64) bool {
+	return successor != nil && successor.Id == leaverRowID
+}
+
+// querySecondOldestEligibleMemberTx 是 DB.QuerySecondOldestEligibleMember 的
+// 事务内版本。单独一份是为了让选主与角色重校验落在同一个事务、同一份读视图里。
+//
+// **资格谓词**（排除 bot / 外部成员 / 非正常 status）与非事务版逐字一致，理由见那边的
+// 注释；只改一条就会让另一条成为绕过新规则的后门。
+//
+// **但「排除离开者本人」这一条两边写法不同，是刻意的**：非事务版是无锁读，直接写成
+// `gm.uid <> ?` 谓词；本函数带 FOR UPDATE，加同一个谓词会让优化器换索引、把取锁顺序
+// 从 uid 升序翻成 id 升序，与 RemoveGroupMembers 的 uid 序相反而构成 AB-BA（实测 3/3
+// 死锁）。所以这一条落在调用方的 isSelfSuccessor 上，**这条 SQL 的 WHERE 不再增加
+// 任何谓词**。注意别写成「与 main 一致」：main 的这条查询带 LEFT JOIN robot、也没有
+// robot / is_external / status 三个谓词，本 PR 已经换过一次语句形状；准确的说法是
+// 「资格收紧之后不再往这条持锁语句上加谓词」。完整测量见 handOverGroupCreator 的注释。
+//
+// 也正因如此本函数**不收 leaverUID**：它用不到，收了就是个死参数 —— 一个只出现在签名
+// 里的参数会让下一个人以为排除逻辑在这条 SQL 里（PR #804 round-11 review 已就同一形状
+// 提过一次）。排除发生在调用方，就写在调用方。
+func querySecondOldestEligibleMemberTx(tx *dbr.Tx, groupNo string) (*MemberModel, error) {
 	var member *MemberModel
 	// FOR UPDATE 锁住选中的继任者：不锁的话它可能正被另一条清理工单删除，
 	// UpdateMemberRoleTx 的 WHERE 带 is_deleted=0，会静默影响 0 行，
 	// 群就此无主。
 	_, err := tx.SelectBySql(
 		"SELECT gm.* FROM group_member gm "+
-			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
 			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
-			"AND r.robot_id IS NULL "+
+			"AND gm.robot = 0 AND gm.is_external = 0 AND gm.status = ? "+
 			"ORDER BY gm.created_at ASC LIMIT 1 FOR UPDATE",
-		leaverUID, groupNo, MemberRoleCreator,
+		groupNo, MemberRoleCreator, int(common.GroupMemberStatusNormal),
 	).Load(&member)
 	return member, err
 }

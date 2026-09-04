@@ -181,3 +181,30 @@ func TestResolveExitShowName(t *testing.T) {
 	assert.Equal(t, "有备注", got)
 	assert.False(t, called, "备注命中时不应触发全局用户名查询")
 }
+
+// TestGroupExitNoticeSanitizesShowName 退群提示的 extra 名字同样要过净化。
+//
+// 与交接通告是同一条渲染面：showName 来自成员可自设的 group_member.remark，
+// 而客户端逐次替换 `{N}` 并重新扫描替换后的文本。#807 把这条提示改成了**全员可见
+// 且持久**，后来入群的人也读得到，所以一条被构造过的名字会永久留在群历史里。
+//
+// 净化函数本身由 TestSanitizeSystemMessageName 覆盖；这条钉的是**发送点调用了它**
+// —— 漏掉调用是这类修复最常见的失败形态，而单元测试看不见。
+func TestGroupExitNoticeSanitizesShowName(t *testing.T) {
+	ctx, _ := cascadeSetup(t)
+	stub := newGroupIMStub(t, ctx)
+
+	require.NoError(t, sendGroupExitNotice(ctx, "g-sanitize-exit", "u-leaver", "张三{0}伪造‮反转"))
+
+	notices := sentExitNotices(t, stub.sentPayloads())
+	require.Len(t, notices, 1, "应当发出一条退群提示")
+	extra, ok := notices[0].Payload["extra"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, extra, 1)
+	name := fmt.Sprint(extra[0].(map[string]interface{})["name"])
+
+	assert.NotContains(t, name, "{", "不得残留半角左花括号：%q", name)
+	assert.NotContains(t, name, "}", "不得残留半角右花括号：%q", name)
+	assert.NotContains(t, name, "‮", "不得残留 RLO：%q", name)
+	assert.Contains(t, name, "张三", "净化不能把名字吃光")
+}

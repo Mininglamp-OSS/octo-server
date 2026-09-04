@@ -93,8 +93,9 @@ func InvalidateMembershipCache(redisConn *redis.Conn, spaceID, uid string) error
 // 整个 Redis 挂掉反而是**安全**的——中间件的 Get 未命中，会回落到查库，被移除的人
 // 当场就进不来了。危险的是**单独** DEL 失败：正向条目 "1" 会活满它的 60s TTL，
 // SpaceMiddleware 继续放行这个已经被移除的人，而 handler 早已提交并返回 200。
-// 重新发起一次移除也救不回来——removeMemberLocked 返回 ok=false，afterMembersRemoved
-// 根本不会为这个 uid 再跑一次（见 modules/space/api.go 的同名注释）。
+// 重新发起一次移除也救不回来——已是 status=0 的行不再匹配移除路径的 status=1 谓词，
+// 于是不计入 removed、afterMembersRemoved 根本不会为这个 uid 再跑一次
+// （见 modules/space/db_manager.go removeMembersLocked / removeMemberLocked）。
 //
 // 所以删不掉时就把它**盖掉**：写一条 TTL 更短的否定条目，中间件读到 "0" 即拒绝。
 // 这比干等 60s 强，也比让失败无声强。

@@ -3444,9 +3444,14 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	**/
 	var newGrouper *MemberModel // 新群主
 	if loginMember.Role == MemberRoleCreator {
-		// 查询第二老成员。#354：排除退群群主名下的 bot——它们会在下方被级联带走，
-		// 不能被选为新群主（否则新群主在同一事务内即被删除）。
-		newGrouper, err = g.db.QuerySecondOldestMemberExcludingBotsOf(groupNo, loginUID)
+		// 查询第二元老成员。资格谓词排除 **全部 bot、外部成员、非正常 status**，
+		// 并显式排除离开者本人 —— 群主握有全部敏感权限，这三类都不该持有。
+		// 注意这**不是**与手动转让 transferGrouper 对齐：它只拒外部成员，收紧后自动
+		// 路径严于它（详见 QuerySecondOldestEligibleMember 的注释）。
+		// （#354 最初只排除退群群主名下的 bot，理由是它们会在下方被级联带走；那一条
+		// 仍然成立，只是现在被更宽的谓词覆盖了。完整理由见
+		// QuerySecondOldestEligibleMember 的注释。）
+		newGrouper, err = g.db.QuerySecondOldestEligibleMember(groupNo, loginUID)
 		if err != nil {
 			g.Error("查询第二元老成员失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
