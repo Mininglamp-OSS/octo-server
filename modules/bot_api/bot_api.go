@@ -36,6 +36,7 @@ const (
 type BotAPI struct {
 	ctx           *config.Context
 	db            *botAPIDB
+	updateIMToken func(config.UpdateIMTokenReq) (*config.UpdateIMTokenResp, error)
 	userService   user.IService
 	fileService   file.IService
 	groupService  group.IService
@@ -296,6 +297,11 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 
 // Route registers all Bot API routes.
 func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
+	// Restore User Bot IM credentials from the binding-aware source of truth.
+	// Keeping this asynchronous preserves the existing startup behavior; the
+	// restore path re-checks ownership after every external token update.
+	go ba.syncAllBotTokens()
+
 	// register endpoint (token needed but not via authBot group — handled inline).
 	//
 	// **两层限流,顺序载荷性**:先 per-IP,再 per-token。

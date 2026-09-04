@@ -318,7 +318,8 @@ func (d *botfatherDB) updateRobotIMTokenCache(robotID string, imToken string) er
 // updateRobotBotToken 重置机器人的Bot Token
 func (d *botfatherDB) updateRobotBotToken(robotID string, newToken string) error {
 	_, err := d.session.Update("robot").SetMap(map[string]interface{}{
-		"bot_token": newToken,
+		"bot_token":      newToken,
+		"im_token_cache": "",
 	}).Where("robot_id=?", robotID).Exec()
 	return err
 }

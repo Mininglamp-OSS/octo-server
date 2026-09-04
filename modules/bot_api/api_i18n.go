@@ -112,6 +112,13 @@ func respondBotAPIBotUnavailable(c *wkhttp.Context) {
 	c.Abort()
 }
 
+// respondBotAPIInstanceConflict rejects a registration owned by another
+// OpenClaw installation. Do not expose the stored instance identifier.
+func respondBotAPIInstanceConflict(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIInstanceConflict, nil, nil)
+	c.Abort()
+}
+
 // ---- checkSendPermission classifier -----------------------------------------
 
 // Sentinel errors returned by checkSendPermission so the call sites

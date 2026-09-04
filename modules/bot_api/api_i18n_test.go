@@ -105,6 +105,25 @@ func helperHarness(probe func(c *wkhttp.Context)) *wkhttp.WKHttp {
 	return r
 }
 
+func TestRespondBotAPIInstanceConflictAbortsHandlerChain(t *testing.T) {
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	nextCalled := false
+	r.GET("/probe", respondBotAPIInstanceConflict, func(c *wkhttp.Context) {
+		nextCalled = true
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/probe", nil))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("HTTP status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if nextCalled {
+		t.Fatal("instance conflict must abort the remaining handler chain")
+	}
+}
+
 func TestRespondBotAPIHelpers(t *testing.T) {
 	// ba carries only a logger — enough for the helpers that log (identity
 	// guard) without standing up DB / redis / IM.
@@ -325,6 +344,14 @@ func TestRespondBotAPIHelpers(t *testing.T) {
 			wantSemStatus:   http.StatusConflict,
 			wantTransStatus: http.StatusConflict,
 			wantContains:    "OBO 授权已存在",
+		},
+		{
+			name:            "respondBotAPIInstanceConflict preserves 409",
+			probe:           respondBotAPIInstanceConflict,
+			wantCodeID:      "err.server.bot_api.instance_conflict",
+			wantSemStatus:   http.StatusConflict,
+			wantTransStatus: http.StatusConflict,
+			wantContains:    "该 Bot Token 已绑定到另一个 OpenClaw 实例",
 		},
 		{
 			name:            "ErrBotAPISharedAuthRequired preserves 401",
