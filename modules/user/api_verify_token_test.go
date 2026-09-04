@@ -85,6 +85,8 @@ func TestAuthVerifyToken_NoInclude_NoNewFields(t *testing.T) {
 	body := w.Body.String()
 	assert.NotContains(t, body, "spaces", "BC: default schema must not include spaces")
 	assert.NotContains(t, body, "owned_bots_by_space", "BC: default schema must not include owned_bots_by_space")
+	assert.NotContains(t, body, "space_roles",
+		"BC: default schema must not include space_roles (omitempty drops the nil map)")
 	assert.NotContains(t, body, "context_included",
 		"v3.3.3 §F: BC default schema must not include context_included (omitempty drops false)")
 	assert.Contains(t, body, `"uid"`)
@@ -263,11 +265,82 @@ func TestQueryUserSpaceContext_SpacesTruncatedAtPolicyLimit(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var resp struct {
-		Spaces []string `json:"spaces"`
+		Spaces     []string       `json:"spaces"`
+		SpaceRoles map[string]int `json:"space_roles"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Len(t, resp.Spaces, 100,
 		"spaces must be capped at policy limit (100), got %d", len(resp.Spaces))
+
+	// space_roles is derived from the SAME truncated row set as spaces, so the
+	// two must agree exactly. The over-fetch is LIMIT 101: a map built before
+	// truncation would carry 101 entries and hand the marketplace reviewer gate
+	// a space that `spaces` denies.
+	assert.Len(t, resp.SpaceRoles, 100,
+		"space_roles must be truncated in lockstep with spaces, got %d", len(resp.SpaceRoles))
+	inSpaces := make(map[string]struct{}, len(resp.Spaces))
+	for _, sid := range resp.Spaces {
+		inSpaces[sid] = struct{}{}
+	}
+	for sid := range resp.SpaceRoles {
+		assert.Contains(t, inSpaces, sid,
+			"space_roles key %q is absent from spaces — the two collections drifted", sid)
+	}
+	for _, sid := range resp.Spaces {
+		assert.Contains(t, resp.SpaceRoles, sid,
+			"space %q has no space_roles entry — the two collections drifted", sid)
+	}
+}
+
+// space_roles must carry the NATIVE space_member.role encoding
+// (0=member, 1=admin, 2=owner per
+// modules/space/sql/20260307000002_space_legacy01.sql), keyed by exactly the
+// space_ids in `spaces`. octo-marketplace's Space-reviewer gate is `role >= 1`,
+// so remapping to octo-web's inverse display encoding (1=owner, 2=admin) would
+// silently invert who may approve a plugin.
+func TestAuthVerifyToken_WithInclude_ReturnsNativeSpaceRoleEncoding(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx) // caller is role=0 in SpaceA and SpaceB
+
+	// promote the caller to admin in A and owner in a third space
+	_, err := ctx.DB().UpdateBySql(
+		"UPDATE space_member SET role=1 WHERE space_id=? AND uid=?",
+		testVerifyTokenSpaceA, testutil.UID).Exec()
+	require.NoError(t, err)
+
+	const ownedSpace = "verify_token_space_owned"
+	_, err = ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(ownedSpace, "Owned", testutil.UID, 1).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(ownedSpace, testutil.UID, 2, 1).Exec()
+	require.NoError(t, err)
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp struct {
+		ContextIncluded bool           `json:"context_included"`
+		Spaces          []string       `json:"spaces"`
+		SpaceRoles      map[string]int `json:"space_roles"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.ContextIncluded)
+	require.NotNil(t, resp.SpaceRoles)
+	assert.Equal(t, 1, resp.SpaceRoles[testVerifyTokenSpaceA], "admin must encode as 1")
+	assert.Equal(t, 0, resp.SpaceRoles[testVerifyTokenSpaceB], "plain member must encode as 0")
+	assert.Equal(t, 2, resp.SpaceRoles[ownedSpace], "owner must encode as 2")
+
+	// keys == spaces, no extras (a foreign or disabled space must not appear)
+	keys := make([]string, 0, len(resp.SpaceRoles))
+	for sid := range resp.SpaceRoles {
+		keys = append(keys, sid)
+	}
+	assert.ElementsMatch(t, resp.Spaces, keys,
+		"space_roles keys must be exactly the entries of spaces")
 }
 
 // v3 §2.4 (yujiawei P2): a bot the caller owns that also lives in a space
@@ -428,16 +501,19 @@ func TestAuthVerifyToken_IncludeContext_DBError_FailSecure(t *testing.T) {
 		ContextIncluded  bool                `json:"context_included"`
 		Spaces           []string            `json:"spaces"`
 		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
+		SpaceRoles       map[string]int      `json:"space_roles"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 
 	assert.True(t, resp.ContextIncluded,
 		"context_included MUST stay true on DB err — flipping to false would silently downgrade fleet/matter to pre-v2 fallback (opens X-Space-Id trust)")
-	// Note: `omitempty` on Spaces/OwnedBotsBySpace makes empty slices/maps
-	// vanish on wire; client unmarshal sees nil. That's fine — both nil
-	// and empty are semantically "no spaces / no bots", authz stays
-	// fail-closed (range over nil = 0 iterations). assert.Empty accepts
-	// both nil and zero-length.
+	// Note: `omitempty` on Spaces/OwnedBotsBySpace/SpaceRoles makes empty
+	// slices/maps vanish on wire; client unmarshal sees nil. That's fine — both
+	// nil and empty are semantically "no spaces / no bots / no roles", authz
+	// stays fail-closed (range over nil = 0 iterations, lookup on nil map = 0).
+	// assert.Empty accepts both nil and zero-length.
 	assert.Empty(t, resp.Spaces, "spaces MUST be empty (nil or len 0) on DB err")
 	assert.Empty(t, resp.OwnedBotsBySpace, "owned_bots_by_space MUST be empty on DB err")
+	assert.Empty(t, resp.SpaceRoles,
+		"space_roles MUST be empty on DB err — never a partially populated role map")
 }
