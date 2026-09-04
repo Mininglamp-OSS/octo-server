@@ -198,15 +198,22 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
   `connectInfo()`（`modules/app_bot/app_bot.go:1003-1013`）就是给 agent 下发
   `plugin_package` + `api_url` 的连接引导。所以要解析请求体**只为打 Warn**，
   并加守卫测试钉住「app_bot 表无 agent 列」这个前提，避免后来人误以为对称支持。
-- **迁移写朴素 DDL，且必须是单条原子 ALTER。** 本仓已确立的原则是「sql-migrate 用
-  `gorp_migrations` 追踪版本，不要在每条 migration 里堆幂等魔法」——
-  `INFORMATION_SCHEMA` 探测 + 存储过程（如
-  `modules/botfather/sql/20260603000002_botfather_legacy01.sql`）是应急路径，不是默认写法：
-  它可读性差、reviewer 看不出真实意图。#239 的半应用态之所以发生，是因为那条迁移是
-  **多语句**的（ADD COLUMN + DROP INDEX + ADD UNIQUE，DDL 隐式提交，中途失败即残留），
-  而 20260417000001 的 agent_* 三列是**三条独立 ALTER**、同样可半应用。本任务两列写在
-  **一条** `ALTER TABLE ... ADD COLUMN, ADD COLUMN` 里，MySQL 层面原子，不存在需要守卫的
-  中间态。Down 同理单条。
+- **迁移写朴素 DDL，且必须是单条原子 ALTER。** 前半句是本仓既定原则：sql-migrate 已用
+  `gorp_migrations` 追踪每个文件的版本，不要在每条迁移里堆幂等代码；存在性守卫
+  （如 `modules/botfather/sql/20260603000002_botfather_legacy01.sql`）是"同一份迁移
+  必须跨多个状态不同的环境运行"时的应急路径，不是默认写法 —— 它可读性差、reviewer
+  看不出真实意图。实测口径：全仓 84 个含 `ADD COLUMN` 的迁移里仅 15 个带守卫，
+  且集中在该原则确立之前（2026-06 前后），此后的 20260728 / 20260810 / 20260830
+  全是裸 DDL。
+  后半句（单条原子 ALTER）解决的是**另一件事**：不留「一列已加、一列没加」的列级
+  中间态。#239 那次半应用出在**多语句**迁移上（ADD COLUMN + DROP INDEX + ADD UNIQUE，
+  DDL 隐式提交、中途失败即残留），而 20260417000001 的 agent_* 三列是三条独立 ALTER、
+  同样可半应用。本任务两列写在一条 `ALTER TABLE ... ADD COLUMN, ADD COLUMN` 里。
+  **单条原子 ALTER 不解决可重入性** —— review round 4 指出这一点，是对的：两个 pod
+  竞争同一迁移、或进程在 DDL 隐式提交与 `gorp_migrations` 记账之间死掉，原子性都帮不上。
+  那两个风险的解法在**部署层**（迁移加锁或单 pod 执行），不在每条迁移里。
+  另外显式 pin `ALGORITHM=INSTANT`（同 `modules/opanalytics/sql/20260830000001`）：
+  不 pin 的话，目标 MySQL 无法满足时会静默退化为 COPY 锁表。
 - **迁移文件放 `modules/botfather/sql/`，与 `agent_platform` 三列同源。** 执行顺序按
   文件名时间戳**全局**排序、跨模块（`internal/modules.go:3-8`：sql-migrate 把所有模块的
   SQL 汇成一个 slice 按 VersionInt 排序，「botfather ALTERs robot」是被认可的形状）。

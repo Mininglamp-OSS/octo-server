@@ -743,12 +743,18 @@ func TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate(t *testing.T) {
 // 20260603000002 那条存在性守卫防的是「两个 pod 竞争同一迁移」和「DDL 隐式提交后、
 // gorp_migrations 记账前进程死掉」，单条原子 ALTER 对这两者都无效。
 //
-// **本迁移选择不加守卫**，理由是先例混杂且近期倾向朴素 DDL
-// （modules/user/20260810000001、modules/opanalytics/20260830000001 都是无守卫的
-// ADD COLUMN），而 robot 表小、迁移在滚动发布中的执行方式属部署侧约束（见 brief 的
-// 待确认项）。这是一个**选择**，不是一条原则 —— 所以本测试**不再断言**「不得出现
-// INFORMATION_SCHEMA / CREATE PROCEDURE」：那会让后来人想加守卫就必须先删测试，
-// 而加守卫是完全正当的决定。
+// **本迁移不加守卫，这是遵循本仓既定原则，不是本任务的自由裁量**：
+// sql-migrate 已用 `gorp_migrations` 追踪每个文件的版本，所以不要在每条迁移里堆幂等
+// 代码 —— 存在性守卫是"同一份迁移必须跨多个状态不同的环境运行"时的应急路径。
+// 实测口径：全仓 84 个含 ADD COLUMN 的迁移里只有 15 个带守卫，且集中在该原则确立之前
+// （2026-06 前后）；此后的 20260728 / 20260810 / 20260830 都是裸 DDL。
+//
+// reviewer 提出的两-pod 竞争风险是真实的，但它的解法在**部署层**（迁移加锁或单 pod
+// 执行），不是让每条迁移各自重复一遍幂等逻辑 —— 后者可读性差、reviewer 看不出真实
+// 意图，正是那条原则要避免的。
+//
+// 本测试因此**不断言**「不得出现 INFORMATION_SCHEMA / CREATE PROCEDURE」：若将来
+// 部署形态确实需要守卫，加守卫是正当的，不该被一条测试挡住。
 func TestAgentHostingMigrationIsSingleAtomicAlter(t *testing.T) {
 	raw, err := os.ReadFile("sql/20260903000001_botfather_agent_hosting.sql")
 	require.NoError(t, err)
