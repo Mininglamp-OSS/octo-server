@@ -2,8 +2,6 @@ package bot_api
 
 import (
 	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -234,29 +232,44 @@ const MaxRegisterBodyBytes = 4 << 10
 
 // readAgentReport decodes the optional telemetry body under a size cap.
 //
-// Every failure mode — no body, empty body, malformed JSON, trailing garbage,
-// body over the cap — yields the zero value, i.e. "nothing was reported". None of
-// them can fail the registration: this is the only channel a bot has to recover
-// after losing its connection (#696). MaxBytesReader is applied rather than the
-// error inspected, so an oversized body is cut off instead of buffered.
+// Every failure mode — no body, nil body, empty body, malformed JSON, body over
+// the cap — yields the zero value, i.e. "nothing was reported". None of them can
+// fail the registration: this is the only channel a bot has to recover after
+// losing its connection (#696). MaxBytesReader is applied rather than the error
+// inspected, so an oversized body is cut off instead of buffered.
 //
-// The decode is ALL-OR-NOTHING, which takes a deliberate extra step:
+// The decode is ALL-OR-NOTHING, which is why it goes through a temporary:
 // json.Decoder populates the fields it has already parsed before returning a type
 // error, so binding straight into the result and ignoring the error would adopt a
 // prefix of a malformed body — `{"agent_platform":"OpenClaw","agent_version":123}`
 // would store the platform and silently drop the rest. Partial telemetry from a
 // body the client got wrong is worse than none: it half-updates columns while
-// looking like a successful report. So decode into a temporary, require a clean
-// decode AND end-of-input, and only then adopt it.
+// looking like a successful report. Decoding into `staged` and requiring a clean
+// decode before adopting it is what provides that property.
+//
+// DELIBERATELY NOT CHECKED: end-of-input. An earlier round added a
+// `dec.Token()` call after Decode to also reject a valid object followed by
+// trailing bytes. Do not restore it. Decode returns as soon as it has parsed one
+// complete value; Token must read at least one more byte to tell "another token"
+// from "end of input". MaxBytesReader bounds bytes, not TIME, and this route is
+// served by a zero-value http.Server (gin's r.Run() — no ReadTimeout), so a
+// client that sends one complete object and then stops without terminating the
+// body leaves Token blocked on the socket forever, pinning a goroutine and a
+// connection. On the User Bot branch that hold lands after UpdateIMToken has
+// already mutated state. Trailing garbage after a valid object is therefore
+// ignored, not rejected — a strictly smaller loss than making the bots'
+// self-heal endpoint hangable. (PR #837 P1.)
 func readAgentReport(c *wkhttp.Context) BotRegisterReq {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxRegisterBodyBytes)
-	var staged BotRegisterReq
-	dec := json.NewDecoder(c.Request.Body)
-	if err := dec.Decode(&staged); err != nil {
+	// net/http guarantees a non-nil Body for server requests, but handlers are
+	// also driven in-process by tests via http.NewRequest(..., nil), which leaves
+	// it nil. gin's jsonBinding.Bind returns early on that; MaxBytesReader would
+	// instead wrap a nil ReadCloser and panic on first Read.
+	if c.Request.Body == nil {
 		return BotRegisterReq{}
 	}
-	// Reject one valid value followed by anything else.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxRegisterBodyBytes)
+	var staged BotRegisterReq
+	if err := json.NewDecoder(c.Request.Body).Decode(&staged); err != nil {
 		return BotRegisterReq{}
 	}
 	return staged

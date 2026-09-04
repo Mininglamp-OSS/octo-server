@@ -564,7 +564,9 @@ func TestRegisterPartiallyMalformedBodyAdoptsNothing(t *testing.T) {
 	resetUIDRateLimit(t, ctx)
 	robotID, botToken := setupAgentHostingBot(t, ctx, "hostpart")
 
-	// 不能用 map 造这个 body（会被 json.Marshal 修正），直接发原始字节。
+	// 不能用 map 造这个 body（会被 json.Marshal 修正），直接发原始字节 ——
+	// 于是绕过了 botRegister helper，per-IP 桶得自己清（见 resetRegisterRateLimit）。
+	resetRegisterRateLimit(t, ctx)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/bot/register",
 		strings.NewReader(`{"agent_platform":"OpenClaw","agent_version":12345}`))
@@ -577,16 +579,36 @@ func TestRegisterPartiallyMalformedBodyAdoptsNothing(t *testing.T) {
 	assert.Equal(t, "", row.AgentPlatform,
 		"类型错误的 body 一个字段都不该被采纳 —— 半更新看起来像成功上报")
 
-	// 尾随垃圾同理（一个合法值后面跟别的东西）。
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/bot/register",
+}
+
+// TestRegisterTrailingGarbageAdoptsThePrecedingObject —— 尾随垃圾被忽略，它前面
+// 那个完整对象照常落库。
+//
+// 这是 PR #837 P1 修复后有意的语义，早先一轮是整体拒绝。拒绝尾随垃圾要求判定
+// 输入结束，而判定输入结束要求在未终止的 body 上多读一个字节，于是把 register
+// 变成可挂死的端点（推理与变异验证见 bot_api 包的
+// TestReadAgentReportDoesNotBlockOnStalledBody）。忽略畸形客户端多发的尾巴，比
+// 让 bot 唯一的自愈通道可被挂死代价小得多。
+//
+// 真正要保的"全有或全无"由上面那条类型错误用例覆盖，它不依赖 EOF 判定。这里是
+// 端到端确认这个取舍确实一路落到了列上。
+func TestRegisterTrailingGarbageAdoptsThePrecedingObject(t *testing.T) {
+	h, ctx := newUserAPITestServer(t)
+	resetUIDRateLimit(t, ctx)
+	robotID, botToken := setupAgentHostingBot(t, ctx, "hosttail")
+
+	// 原始字节 body，绕过 botRegister helper，per-IP 桶自己清。
+	resetRegisterRateLimit(t, ctx)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/bot/register",
 		strings.NewReader(`{"agent_platform":"OpenClaw"} trailing`))
-	req2.Header.Set("Authorization", "Bearer "+botToken)
-	req2.Header.Set("Content-Type", "application/json")
-	h.ServeHTTP(w2, req2)
-	require.Equal(t, http.StatusOK, w2.Code)
-	assert.Equal(t, "", readAgentInfo(t, ctx, robotID).AgentPlatform,
-		"尾随垃圾同样不得被部分采纳")
+	req.Header.Set("Authorization", "Bearer "+botToken)
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	assert.Equal(t, "OpenClaw", readAgentInfo(t, ctx, robotID).AgentPlatform,
+		"尾随垃圾之前的完整对象照常采纳并落库（PR #837 P1 的取舍）")
 }
 
 // TestRegisterAppBotIgnoresAgentRuntimeFields —— App Bot 的上报不落库（brief 方案 A）。

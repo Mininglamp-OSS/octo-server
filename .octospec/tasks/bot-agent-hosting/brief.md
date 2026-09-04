@@ -410,12 +410,23 @@ head 上也失败，本就与本任务无关）。
 
 **body 与解码（review round 2 新增）**
 
-- body 超 `maxRegisterBodyBytes`（4 KiB）→ register 仍 200，已存列**不受影响**。
+- body 超 `MaxRegisterBodyBytes`（4 KiB）→ register 仍 200，已存列**不受影响**。
 - 类型错误的 body（`{"agent_platform":"OpenClaw","agent_version":12345}`）→
   **一个字段都不采纳**。`json.Decoder` 会先填好已解析字段再报错，所以「忽略 bind 错误」
   等于采纳一个前缀 —— 半更新的列看起来像一次成功上报，比不更新更糟。
-- 尾随垃圾（`{...} trailing`）同样整体不采纳。
-- **变异验证**：改回 `_ = c.ShouldBindJSON(&staged)` 后该测试必须红。
+- nil `Request.Body` → 当作「什么都没上报」，**不得 panic**。线上走不到（`net/http`
+  保证非 nil），但 handler 也会被进程内驱动，`http.NewRequest(..., nil)` 留下的就是
+  nil；`MaxBytesReader` 会包住 nil `ReadCloser` 并在首次 `Read` 解引用空指针。
+- 尾随垃圾（`{...} trailing`）→ **前面那个完整对象照常采纳**，尾巴被忽略。
+  这是 round 7 的修正，早先一轮写的是「整体不采纳」。改回去要判定输入结束，而判定
+  输入结束要在未终止的 body 上多读一个字节 → 端点可被挂死（见下）。
+- **停滞的 body 不得挂住 handler**：客户端发完一个完整对象后不终止 body（chunked
+  无结束块），`readAgentReport` 必须仍在有限时间内返回。`MaxBytesReader` 限的是字节
+  数不是时间，而该路由由零值 `http.Server` 承载（gin 的 `r.Run()`，`ReadTimeout=0`），
+  没有任何东西兜底。register 是 bot 掉线后唯一的自愈通道（#696）。
+- **变异验证**：① 改回 `_ = c.ShouldBindJSON(&staged)` → 类型错误那条红；
+  ② 加回 `dec.Token()` 的 EOF 检查 → 停滞 body 那条超时（实测正好 3.00s 后 Fatal）
+  且尾随垃圾两条（单元 + 端到端）红；③ 删掉 nil body 早返回 → nil 那条 panic。
 
 **并发与时钟（PR #837 review 后新增）**
 
@@ -427,6 +438,11 @@ head 上也失败，本就与本任务无关）。
 - `agent_reported_hosting_at` 由 SQL `NOW()` 写：语句里出现字面 `NOW()`（SQL 层断言）。
   端到端的时区比对测试已删除 —— 理由见「测试的区分力」。
 - 形状非法时发一条 Warn，且日志**不含原始值**（只有 `rejectedLen`）；合法上报无 Warn。
+- App Bot 那条 Warn 的守卫走 `go/ast` 而非子串：要断言的「带 uid、不带客户端上报的
+  原始值」是**调用实参**的性质，`assert.Contains(body, "ba.Warn(")` 表达不了 ——
+  round 7 量到把它换成 `ba.Warn("ignored", zap.String("agent_hosting", *req.AgentHosting))`
+  （丢 uid 又把调用方可控值写进日志）照样能过。AST 版同时对接收者改名免疫（纯重构
+  不该让守卫变红，子串版会）。
 - App Bot 上报时的 Warn 由 `TestRegisterAppBotWarnIsTheDeliverable`（源码守卫）钉住 ——
   它是这个分支解析 body 的唯一产出，删掉那行 Warn 会让该测试红。
 

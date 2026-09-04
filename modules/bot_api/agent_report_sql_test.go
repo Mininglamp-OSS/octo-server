@@ -1,9 +1,15 @@
 package bot_api
 
 import (
+	"bytes"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,7 +74,10 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 			absent:  []string{"agent_version", "plugin_version", "agent_hosting", "agent_reported_hosting_at"},
 		},
 		{
-			name:    "报空 hosting（清空）：列在，时间戳也在",
+			// 名字按**本层**的输入说话：到 updateRobotAgentInfo 时 Hosting=&"" 只可能
+			// 来自 none 这个撤回 slug（线上 "" 是「不变」，见 normalizeAgentHosting）。
+			// 别把它读成线上语义 —— round 4 换掉的正是那个契约。
+			name:    "归一化后 Hosting=&\"\"（none 撤回）：列在，时间戳也在",
 			report:  agentReport{Hosting: strptr("")},
 			present: []string{"agent_hosting", "agent_reported_hosting_at"},
 			absent:  []string{"agent_platform", "agent_version", "plugin_version"},
@@ -163,17 +172,19 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 			d, mock, closer := newAgentReportDB(t)
 			defer closer()
 
-			var got string
+			var stmts []string
 			mock.ExpectExec("UPDATE").WillReturnResult(sqlmock.NewResult(0, 1))
 			require.NoError(t, d.updateRobotAgentInfo("bot_x", tc.report, tc.stored))
 			require.NoError(t, mock.ExpectationsWereMet())
 
 			// sqlmock 不直接回吐 SQL 文本，改用 QueryMatcher 捕获：重跑一次并抓语句。
-			d2, mock2, closer2 := newAgentReportDBCapturing(t, &got)
+			d2, mock2, closer2 := newAgentReportDBCapturing(t, &stmts)
 			defer closer2()
 			require.NoError(t, d2.updateRobotAgentInfo("bot_x", tc.report, tc.stored))
 			require.NoError(t, mock2.ExpectationsWereMet())
 
+			// 拼接后再断言：absent 的语义是"任何一条语句里都不出现"。
+			got := strings.Join(stmts, "\n")
 			for _, col := range tc.present {
 				assert.Contains(t, got, col, "语句里应包含 %s\nSQL: %s", col, got)
 			}
@@ -185,13 +196,17 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 	}
 }
 
-// newAgentReportDBCapturing 用自定义 QueryMatcher 抓取实际发出的 SQL 文本。
-func newAgentReportDBCapturing(t *testing.T, sink *string) (*botAPIDB, sqlmock.Sqlmock, func()) {
+// newAgentReportDBCapturing 用自定义 QueryMatcher 抓取实际发出的**全部** SQL 文本。
+//
+// sink 累积而不是覆盖：今天只发一条语句，赋值也够；但已知限制（超长 legacy 字段
+// 连坐整组）的修法就是把 UPDATE 拆开，那之后覆盖式赋值只会留下最后一条，
+// present/absent 断言就在悄悄地只检查一个片段（PR #837 round 7 🔵）。
+func newAgentReportDBCapturing(t *testing.T, sink *[]string) (*botAPIDB, sqlmock.Sqlmock, func()) {
 	t.Helper()
 	// 捕获的同时**仍然校验** —— 无条件 return nil 会让 ExpectExec("UPDATE") 形同虚设
 	// （round 5 🔵）：那时任何语句都被接受，mock 自己的守卫是关着的。
 	matcher := sqlmock.QueryMatcherFunc(func(expectedSQL, actualSQL string) error {
-		*sink = actualSQL
+		*sink = append(*sink, actualSQL)
 		if !regexp.MustCompile(expectedSQL).MatchString(actualSQL) {
 			return fmt.Errorf("语句与预期不符\n预期正则: %s\n实际: %s", expectedSQL, actualSQL)
 		}
@@ -212,13 +227,14 @@ func newAgentReportDBCapturing(t *testing.T, sink *string) (*botAPIDB, sqlmock.S
 // 里用 NOW() 写的 bound_at 相差 8 小时。断言语句里出现字面的 NOW()，就把「时钟同源」
 // 变成了结构约束而不是约定。
 func TestUpdateRobotAgentInfoStampsHostingTimeWithSQLNow(t *testing.T) {
-	var got string
-	d, mock, closer := newAgentReportDBCapturing(t, &got)
+	var stmts []string
+	d, mock, closer := newAgentReportDBCapturing(t, &stmts)
 	defer closer()
 
 	require.NoError(t, d.updateRobotAgentInfo("bot_x", agentReport{Hosting: strptr("self_hosted")}, agentReport{}))
 	require.NoError(t, mock.ExpectationsWereMet())
 
+	got := strings.Join(stmts, "\n")
 	// dbr 会给列名加反引号，正则要容得下。
 	assert.Regexp(t, regexp.MustCompile("(?i)`?agent_reported_hosting_at`?\\s*=\\s*NOW\\(\\)"), got,
 		"时间戳必须是 SQL NOW()（与 bound_at 同源），不能是 Go 侧 time.Now() 的绑定参数\nSQL: %s", got)
@@ -318,8 +334,8 @@ func TestApplyAgentReportSilentOnValidHosting(t *testing.T) {
 // 里那条端到端测试互补：这里直接确认被拒的 hosting **不进语句**（而不是以空串
 // 进去覆盖已存值）。
 func TestApplyAgentReportMalformedHostingLeavesColumnOutOfStatement(t *testing.T) {
-	var got string
-	d, mock, closer := newAgentReportDBCapturing(t, &got)
+	var stmts []string
+	d, mock, closer := newAgentReportDBCapturing(t, &stmts)
 	defer closer()
 	ba := &BotAPI{db: d, Log: &recordingLog{}}
 
@@ -329,6 +345,7 @@ func TestApplyAgentReportMalformedHostingLeavesColumnOutOfStatement(t *testing.T
 	}, agentReport{})
 	require.NoError(t, mock.ExpectationsWereMet())
 
+	got := strings.Join(stmts, "\n")
 	assert.Contains(t, got, "agent_platform", "同一请求里的合法字段仍应写入\nSQL: %s", got)
 	assert.NotContains(t, got, "agent_hosting",
 		"被拒的 hosting 必须整列缺席，不能以空串覆盖已存的合法值\nSQL: %s", got)
@@ -480,21 +497,117 @@ func TestRegisterUserBotPassesStoredOnlyAsASkipSnapshot(t *testing.T) {
 // app_bot 行 + IM token 往返才能走到，在本包（无 botfather 迁移）跑不起来。
 // 断言"这一行还在、且带的是 uid 而非原始上报值"是能确定性做到的部分。
 func TestRegisterAppBotWarnIsTheDeliverable(t *testing.T) {
-	raw, err := os.ReadFile("register.go")
-	require.NoError(t, err)
-	src := string(raw)
-
-	start := strings.Index(src, "func (ba *BotAPI) registerAppBot(")
-	require.NotEqual(t, -1, start)
-	body := src[start:]
-	if end := strings.Index(body, "\n}\n"); end != -1 {
-		body = body[:end]
-	}
+	fn, fset := parseFuncDecl(t, "register.go", "registerAppBot")
+	body := renderNode(t, fset, fn.Body)
 
 	assert.Contains(t, body, "readAgentReport(c)",
 		"registerAppBot 必须解析 body —— 否则「有 bot 在上报没人存的 telemetry」这件事对运维不可见")
-	assert.Contains(t, body, "ba.Warn(",
-		"registerAppBot 解析 body 的唯一产出就是这条给**运维**看的 Warn（客户端只拿到 200）；删掉它，解析就成了纯开销")
 	assert.NotContains(t, body, "updateRobotAgentInfo",
 		"App Bot 的上报绝不能写进 robot 表（app_bot 没有 agent_* 列）")
+
+	// Warn 这一条走 AST 而非子串：要断言的是「带 uid、且不带客户端上报的原始值」，
+	// 这是调用实参的性质，子串匹配 "ba.Warn(" 表达不了 —— PR #837 round 7 量到
+	// 把它换成 ba.Warn("ignored", zap.String("agent_hosting", *req.AgentHosting))
+	// （丢掉 uid 又把调用方可控的值写进日志）照样能过。
+	warns := warnCallsIn(t, fset, fn)
+	require.NotEmpty(t, warns,
+		"registerAppBot 解析 body 的唯一产出就是给**运维**看的 Warn（客户端只拿到 200）；删掉它，解析就成了纯开销")
+
+	var withUID int
+	for _, w := range warns {
+		if w.hasZapField("uid") {
+			withUID++
+		}
+		for _, f := range w.fieldKeys {
+			assert.NotContains(t, w.args, "req.Agent",
+				"这条 Warn 不得把客户端上报的原始值写进日志（字段 %q）—— 只记 uid，够运维定位是哪个 bot 在上报", f)
+			assert.NotContains(t, w.args, "req.Plugin",
+				"这条 Warn 不得把客户端上报的原始值写进日志（字段 %q）", f)
+		}
+	}
+	assert.NotZero(t, withUID,
+		"至少一条 Warn 要带 zap.String(\"uid\", ...) —— 不带 uid 的告警运维无法定位是哪个 App Bot 在上报")
+}
+
+// warnCall 是 registerAppBot 里一次 ba.Warn 调用的 AST 摘要。
+type warnCall struct {
+	args      string   // 全部实参的源码文本，用于"不得出现某东西"这类断言
+	fieldKeys []string // zap.Xxx("key", ...) 里的 key 字面量
+}
+
+func (w warnCall) hasZapField(key string) bool {
+	for _, k := range w.fieldKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// parseFuncDecl 在一个 .go 文件里按**函数名**定位声明。
+//
+// 刻意不按 "func (ba *BotAPI) registerAppBot(" 这样的源码字串定位：接收者改名
+// （ba → b）就会让定位失败，而那是纯粹的重构，守卫不该因此变红 —— PR #837
+// round 7 量到过一次。
+func parseFuncDecl(t *testing.T, file, name string) (*ast.FuncDecl, *token.FileSet) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	require.NoError(t, err)
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == name {
+			return fd, fset
+		}
+	}
+	t.Fatalf("%s 里找不到函数 %s", file, name)
+	return nil, nil
+}
+
+// renderNode 把 AST 节点打回源码文本，供"函数体里必须/不得出现某调用"这类断言使用。
+// 经过 printer 归一化，所以不受 CRLF checkout 和实参间距影响。
+func renderNode(t *testing.T, fset *token.FileSet, n ast.Node) string {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, printer.Fprint(&buf, fset, n))
+	return buf.String()
+}
+
+// warnCallsIn 取出一个函数体内所有 .Warn(...) 调用。
+//
+// 只匹配选择子名 Warn，不看接收者，所以接收者改名不影响它。
+func warnCallsIn(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl) []warnCall {
+	t.Helper()
+	var out []warnCall
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Warn" {
+			return true
+		}
+		w := warnCall{}
+		var buf bytes.Buffer
+		for _, a := range call.Args {
+			require.NoError(t, printer.Fprint(&buf, fset, a))
+			buf.WriteByte('\n')
+			// zap.Xxx("key", ...) —— 取第一个实参的字符串字面量作为字段名。
+			inner, ok := a.(*ast.CallExpr)
+			if !ok || len(inner.Args) == 0 {
+				continue
+			}
+			lit, ok := inner.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			if key, err := strconv.Unquote(lit.Value); err == nil {
+				w.fieldKeys = append(w.fieldKeys, key)
+			}
+		}
+		w.args = buf.String()
+		out = append(out, w)
+		return true
+	})
+	return out
 }
