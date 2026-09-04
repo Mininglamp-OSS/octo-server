@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -38,6 +39,19 @@ type FileHit struct {
 	SentAt          string  `json:"sent_at"`
 	ChannelID       string  `json:"channel_id,omitempty"`
 	ChannelType     uint8   `json:"channel_type,omitempty"`
+
+	// NameHighlight is the file name with keyword matches wrapped in <mark>,
+	// taken from the OS highlight response (payload.file.name). Empty on the
+	// browse path (keyword="") or when the match came only from body/caption.
+	// The client renders this in place of FileName when present, otherwise
+	// falls back to client-side highlighting of FileName.
+	NameHighlight string `json:"name_highlight,omitempty"`
+	// ContentSnippet is a single <mark>-wrapped fragment of the Tika-extracted
+	// file body (payload.file.content) around the matched term. This is the
+	// only signal explaining WHY a body-only hit matched — the raw content is
+	// excluded from _source (30–100 KB), but the highlighter reconstructs the
+	// fragment from the inverted index. Empty when the body didn't match.
+	ContentSnippet string `json:"content_snippet,omitempty"`
 }
 
 func init() {
@@ -108,6 +122,9 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 			Size(size).
 			TrackTotalHits(false).
 			FetchSourceContext(fileContentSourceExcludes())
+		if req.Keyword != "" {
+			svc = svc.Highlight(buildSearchFilesHighlight())
+		}
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -176,7 +193,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 			h.Warn("messages_search: bad file _source skipped", zap.Error(err))
 			continue
 		}
-		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType))
+		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType, map[string][]string(hit.Highlight)))
 		senderIDs = append(senderIDs, doc.From)
 	}
 
@@ -199,7 +216,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 // via peerFromFakeChannelID; for group/thread the doc.ChannelID as-is.
 // Single-channel callers pass req.ChannelID / req.ChannelType so the response
 // mirrors the request.
-func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8) FileHit {
+func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) FileHit {
 	fp := filePayloadOf(doc.Payload)
 	fh := FileHit{
 		MessageID:   strconv.FormatInt(doc.MessageID, 10),
@@ -216,7 +233,99 @@ func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8) Fi
 		fh.FileExt = resolveFileExt(fp)
 		fh.DownloadURL = fp.URL
 	}
+	fh.NameHighlight = pickFileNameHighlight(hl)
+	fh.ContentSnippet = pickFileContentSnippet(hl)
 	return fh
+}
+
+// buildSearchFilesHighlight returns the highlight config for the file-search
+// endpoints. Two fields mirror the keyword multi_match clause: payload.file.name
+// (mapped onto NameHighlight, no fragmenting — the whole name is short) and
+// payload.file.content (a single 120-char fragment around the matched body term,
+// mapped onto ContentSnippet). caption is intentionally omitted: it is rarely
+// populated and adds a third precedence branch with no UI slot. Fragments are
+// drawn from the inverted index, so fileContentSourceExcludes (which drops the
+// raw body from _source) does not affect this — see dsl.go:fileContentSourceExcludes.
+// buildSearchFilesHighlight configures the OpenSearch highlight sub-phase for
+// the file-search endpoints. No OpenSearch Encoder("html") is set here:
+// `encoder` is a highlight-request global option (not per-field), so setting
+// it would also change the wire-value encoding of the pre-existing
+// MessageHit.Snippet field on the shared _search_all path (which reuses the
+// text/richText/mergeForward highlighters). We keep the OS default encoder
+// (pass-through) and escape the two new file fields in Go instead — see
+// escapeHighlightFragment — so only the newly-introduced NameHighlight /
+// ContentSnippet wire values gain HTML-entity escaping. Snippet stays raw.
+func buildSearchFilesHighlight() *elastic.Highlight {
+	return elastic.NewHighlight().
+		PreTags("<mark>").PostTags("</mark>").
+		Fields(
+			// NumberOfFragments(0) returns the whole field with matches marked
+			// in-place — correct for a short file name where we want the full
+			// string, not a fragment window.
+			elastic.NewHighlighterField("payload.file.name").NumOfFragments(0),
+			elastic.NewHighlighterField("payload.file.content").FragmentSize(120).NumOfFragments(1),
+		)
+}
+
+// escapeHighlightFragment HTML-entity-escapes every character in the highlight
+// fragment EXCEPT the literal <mark>/</mark> tags configured on the file-tab
+// and chat-tab highlighters. Uploader-controlled source text (payload.file.name
+// is fully user-controlled; payload.file.content is Tika-extracted uploader
+// body) round-trips as escaped entities so any embedded HTML — a name like
+// `<img src=x onerror=alert(1)>.pdf` or a body fragment containing `<script>` —
+// arrives as `&lt;img …&gt;` / `&lt;script&gt;`; only the highlight `<mark>`
+// stays live. Clients that render *_highlight / content_snippet as HTML get
+// exactly one live tag and no XSS surface.
+//
+// This is done in Go rather than via OpenSearch's `encoder=html` option
+// because that option is a highlight-request global (not per-field), and the
+// _search_all path shares its highlighter with the pre-existing text/richText/
+// mergeForward paths that feed the long-shipped MessageHit.Snippet field —
+// flipping the encoder there would silently change Snippet's wire-value
+// encoding on four endpoints while leaving /_search raw. Escaping in Go keeps
+// the two new file fields safe without touching Snippet.
+//
+// Empty input returns empty. Fragments without <mark> tags (e.g. a whole-field
+// name hit with no match) are still fully escaped.
+func escapeHighlightFragment(fragment string) string {
+	if fragment == "" {
+		return ""
+	}
+	// html.EscapeString escapes the whole fragment (including the highlight
+	// tags themselves); then restore the two literal highlight tags we
+	// configured on the OpenSearch builders (PreTags("<mark>"), PostTags(
+	// "</mark>")) so only they stay live.
+	escaped := html.EscapeString(fragment)
+	escaped = strings.ReplaceAll(escaped, "&lt;mark&gt;", "<mark>")
+	escaped = strings.ReplaceAll(escaped, "&lt;/mark&gt;", "</mark>")
+	return escaped
+}
+
+// pickFileNameHighlight returns the marked file name fragment, or "" when the
+// name field didn't match (body-only hit or browse path). Non-`<mark>` HTML
+// characters in the fragment are entity-escaped via escapeHighlightFragment.
+func pickFileNameHighlight(hl map[string][]string) string {
+	if hl == nil {
+		return ""
+	}
+	if frags, ok := hl["payload.file.name"]; ok && len(frags) > 0 && frags[0] != "" {
+		return escapeHighlightFragment(frags[0])
+	}
+	return ""
+}
+
+// pickFileContentSnippet returns the marked body fragment, or "" when the body
+// didn't match. This is the "why did this file match" signal for hits whose
+// keyword only appears in the extracted content, not the name. Non-`<mark>`
+// HTML characters in the fragment are entity-escaped via escapeHighlightFragment.
+func pickFileContentSnippet(hl map[string][]string) string {
+	if hl == nil {
+		return ""
+	}
+	if frags, ok := hl["payload.file.content"]; ok && len(frags) > 0 && frags[0] != "" {
+		return escapeHighlightFragment(frags[0])
+	}
+	return ""
 }
 
 // resolveFileExt prefers the indexed payload.file.extension, which the indexer

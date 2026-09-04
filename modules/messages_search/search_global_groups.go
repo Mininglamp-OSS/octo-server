@@ -239,7 +239,7 @@ func (h *Handler) runGroupsAggregation(ctx context.Context, client *elastic.Clie
 		SortBy(searchSorters("time_desc")...).
 		FetchSourceContext(fileContentSourceExcludes())
 	if withHighlight {
-		preview = preview.Highlight(buildSearchAllHighlight())
+		preview = preview.Highlight(buildSearchGroupsPreviewHighlight())
 	}
 	byChannel := elastic.NewTermsAggregation().
 		Field("channelId").
@@ -255,6 +255,48 @@ func (h *Handler) runGroupsAggregation(ctx context.Context, client *elastic.Clie
 		Aggregation("by_channel", byChannel).
 		Aggregation("group_count", elastic.NewCardinalityAggregation().Field("channelId")).
 		Do(ctx)
+}
+
+// buildSearchGroupsPreviewHighlight configures a groups-preview-scoped highlighter
+// that ONLY covers the fields `pickSnippet` actually consumes (dsl.go), with
+// pre-existing fragment sizing preserved. Deliberately different from
+// buildSearchAllHighlight() for two reasons:
+//
+//  1. Performance: the groups aggregation runs against up to
+//     MaxGroups(200) × (PerGroupMax+PresenceProbe)(40) = 8000 docs per request.
+//     buildSearchAllHighlight() includes payload.file.content, which is
+//     a 30-100 KB Tika-extracted body per doc. Every file hit on the groups
+//     path would pay a full-body highlighter scan whose output is then
+//     discarded — pickSnippet's priority list has no payload.file.content
+//     branch. This can push the request past OCTO_SEARCH_TIMEOUT=5s.
+//
+//  2. Contract safety: buildSearchAllHighlight() sets NumOfFragments(0) on
+//     payload.file.name to align with the file-tab whole-field convention
+//     (safe on _search_all / _search_global_messages because those consume
+//     via pickFileNameHighlight → FileHit.NameHighlight → escapeHighlightFragment).
+//     On the groups path the same fragment feeds pickSnippet → MessageHit.Snippet,
+//     which by long-shipped design carries raw uploader-controlled text — a
+//     contract this PR deliberately preserves. Whole-field mode on that path
+//     would widen a pre-existing raw-name-length concern from 120 chars to
+//     unbounded. Keeping the pre-existing fragment window here is a
+//     no-widen posture; fixing the pre-existing raw-Snippet contract is
+//     out of scope and belongs in a separate PR.
+func buildSearchGroupsPreviewHighlight() *elastic.Highlight {
+	return elastic.NewHighlight().
+		PreTags("<mark>").PostTags("</mark>").
+		FragmentSize(120).
+		NumOfFragments(1).
+		Fields(
+			elastic.NewHighlighterField("payload.text.content"),
+			elastic.NewHighlighterField("payload.richText.searchText"),
+			elastic.NewHighlighterField("payload.mergeForward.msgs.searchText"),
+			elastic.NewHighlighterField("payload.image.caption"),
+			elastic.NewHighlighterField("payload.file.name"),
+			// payload.file.content deliberately absent — pickSnippet does not
+			// read it, so requesting it would allocate an expensive fragment
+			// that no consumer ever sees. See doc comment above for the full
+			// rationale (8000-doc aggregation × 30-100 KB body scan).
+		)
 }
 
 // parsedBucket is the pre-projection view of one terms bucket. latestTS is the

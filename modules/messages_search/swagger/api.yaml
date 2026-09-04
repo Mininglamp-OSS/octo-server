@@ -634,6 +634,18 @@ definitions:
         type: string
         format: uri
         x-nullable: true
+      name_highlight:
+        type: string
+        description: >-
+          File name with keyword matches wrapped in <mark>…</mark>. Present only
+          when the keyword matched the file name; absent on browse or body-only
+          hits (client falls back to highlighting file_name locally).
+      content_snippet:
+        type: string
+        description: >-
+          Single <mark>-wrapped fragment (≤120 chars) of the Tika-extracted file
+          body around the matched term. Explains a body-only match. Absent when
+          the body did not match.
       sender_id:
         type: string
       sender_name:
