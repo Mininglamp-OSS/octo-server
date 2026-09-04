@@ -2,7 +2,6 @@ package bot_api
 
 import (
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -17,9 +16,9 @@ func bindingRows(fingerprint []byte, kind, robotID, instanceID, imToken string) 
 func TestValidInstanceID(t *testing.T) {
 	t.Parallel()
 	require.True(t, validInstanceID("550e8400-e29b-41d4-a716-446655440000"))
-	require.True(t, validInstanceID("instance_node-01:primary"))
+	require.False(t, validInstanceID("instance_node-01:primary"))
 	require.False(t, validInstanceID("too-short"))
-	require.False(t, validInstanceID(strings.Repeat("a", 129)))
+	require.False(t, validInstanceID("550e8400-e29b-11d4-a716-446655440000"))
 	require.False(t, validInstanceID("550e8400-e29b-41d4-a716-44665544/000"))
 }
 

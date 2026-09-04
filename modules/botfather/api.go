@@ -86,10 +86,6 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 	// BotFather now only handles: documentation, User Bot management (BotFather commands),
 	// User API Key endpoints, and Robot Apply endpoints.
 
-	// 启动时批量同步所有 bot 的 token 到 WuKongIM（防止 WuKongIM 重启后 token 丢失）
-	// TODO: Move to bot_api module after confirming no startup ordering issue.
-	go bf.syncAllBotTokens()
-
 	// 文档端点（无需认证）
 	r.GET("/v1/bot/skill.md", bf.skillMD)
 	r.GET("/v1/bot/cli-guide.md", bf.cliGuideMD)
@@ -430,35 +426,4 @@ func extractBotToken(c *wkhttp.Context) string {
 		return strings.TrimPrefix(auth, "Bearer ")
 	}
 	return ""
-}
-
-// syncAllBotTokens 启动时将所有活跃 bot 的 token 同步到 WuKongIM
-// 使用旧 im_token_cache（兼容未重启的 adapter），新 register 后会切换到 bot_token
-func (bf *BotFather) syncAllBotTokens() {
-	robots, err := bf.db.queryAllActiveRobots()
-	if err != nil {
-		bf.Error("同步 bot token 失败: 查询 robot 出错", zap.Error(err))
-		return
-	}
-	successCount := 0
-	for _, robot := range robots {
-		// 优先用旧 im_token_cache（兼容还没 re-register 的旧 adapter）
-		// 旧 adapter 下次 register 后会自动切换到 bot_token
-		token := robot.IMTokenCache
-		if strings.TrimSpace(token) == "" {
-			token = robot.BotToken
-		}
-		resp, tokenErr := bf.ctx.UpdateIMToken(config.UpdateIMTokenReq{
-			UID:         robot.RobotID,
-			Token:       token,
-			DeviceFlag:  config.APP,
-			DeviceLevel: config.DeviceLevelMaster,
-		})
-		if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
-			bf.Warn("同步 bot token 失败", zap.String("robotID", robot.RobotID), zap.Any("error", tokenErr), zap.Any("status", resp))
-			continue
-		}
-		successCount++
-	}
-	bf.Info("Bot token 启动同步完成", zap.Int("total", len(robots)), zap.Int("success", successCount))
 }

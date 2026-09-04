@@ -12,6 +12,8 @@ instance receives an explicit HTTP 409 conflict.
 - Binding acquisition is atomic across octo-server replicas.
 - Raw Bot API tokens never appear in binding keys or diagnostic details.
 - A bound token returns credentials only to its owning `instance_id`.
+- `instance_id` is a persisted UUID v4 shared by all Bot accounts in one
+  OpenClaw installation.
 - Existing clients without `instance_id` remain compatible until a new client
   claims the token; after that, omission is a conflict rather than a bypass.
 - `force_refresh=true` does not bypass ownership.
@@ -19,6 +21,12 @@ instance receives an explicit HTTP 409 conflict.
 - The IM credential issued for a newly bound token is distinct from the Bot API
   token, so a rejected legacy client cannot reconnect directly with the bearer
   token after a binding is established.
+- Startup restoration treats the binding table as authoritative and re-checks
+  after each external token update, so a concurrent first claim cannot be
+  overwritten by a stale Bot API token.
+- A legacy registration re-checks ownership after its external token update;
+  if a first claim raced it, the bound credential is restored and the legacy
+  request receives HTTP 409.
 
 ## Out of scope
 
@@ -36,7 +44,8 @@ instance receives an explicit HTTP 409 conflict.
 - Legacy registration remains unchanged while no binding exists.
 - User Bot and App Bot registration share the same binding behavior.
 - Focused unit tests cover validation, idempotency, conflict, legacy transition,
-  and the migration's uniqueness constraints.
+  startup reconciliation, the legacy/claim race repair, and the migration's
+  uniqueness constraints.
 
 ## Rollout
 

@@ -2,9 +2,9 @@ package bot_api
 
 import (
 	"errors"
+	"io"
 	"strings"
 
-	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -40,7 +40,10 @@ func (ba *BotAPI) register(c *wkhttp.Context) {
 	}
 
 	var req BotRegisterReq
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		respondBotAPIRequestInvalid(c, "body")
+		return
+	}
 	if req.InstanceID != "" && !validInstanceID(req.InstanceID) {
 		respondBotAPIRequestInvalid(c, "instance_id")
 		return
@@ -85,16 +88,22 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string, req BotRegist
 			return
 		}
 	}
-	resp, tokenErr := ba.ctx.UpdateIMToken(config.UpdateIMTokenReq{
-		UID:         robot.RobotID,
-		Token:       imToken,
-		DeviceFlag:  config.APP,
-		DeviceLevel: config.DeviceLevelMaster,
-	})
-	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
-		ba.Error("获取IM Token失败", zap.Any("error", tokenErr), zap.String("robotID", robot.RobotID), zap.Any("status", resp))
+	if tokenErr := ba.installIMToken(robot.RobotID, imToken); tokenErr != nil {
+		ba.Error("获取IM Token失败", zap.Error(tokenErr), zap.String("robotID", robot.RobotID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
 		return
+	}
+	if !bound {
+		conflict, reconcileErr := ba.reconcileBindingAfterUnboundUpdate(token, botKindUser, robot.RobotID, imToken)
+		if reconcileErr != nil {
+			ba.Error("复核 Bot 实例绑定失败", zap.Error(reconcileErr), zap.String("robotID", robot.RobotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
+			return
+		}
+		if conflict {
+			respondBotAPIInstanceConflict(c)
+			return
+		}
 	}
 
 	// Optional: persist agent version info.
@@ -161,7 +170,7 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string, req BotRegiste
 		return
 	}
 
-	imToken, _, err := ba.db.resolveRegistrationIMToken(token, botKindApp, appBot.UID, req.InstanceID)
+	imToken, bound, err := ba.db.resolveRegistrationIMToken(token, botKindApp, appBot.UID, req.InstanceID)
 	if errors.Is(err, errBotInstanceConflict) {
 		respondBotAPIInstanceConflict(c)
 		return
@@ -171,16 +180,22 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string, req BotRegiste
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
-	resp, tokenErr := ba.ctx.UpdateIMToken(config.UpdateIMTokenReq{
-		UID:         appBot.UID,
-		Token:       imToken,
-		DeviceFlag:  config.APP,
-		DeviceLevel: config.DeviceLevelMaster,
-	})
-	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
-		ba.Error("App Bot IM Token注册失败", zap.Any("error", tokenErr), zap.String("uid", appBot.UID), zap.Any("status", resp))
+	if tokenErr := ba.installIMToken(appBot.UID, imToken); tokenErr != nil {
+		ba.Error("App Bot IM Token注册失败", zap.Error(tokenErr), zap.String("uid", appBot.UID))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
 		return
+	}
+	if !bound {
+		conflict, reconcileErr := ba.reconcileBindingAfterUnboundUpdate(token, botKindApp, appBot.UID, imToken)
+		if reconcileErr != nil {
+			ba.Error("复核 App Bot 实例绑定失败", zap.Error(reconcileErr), zap.String("uid", appBot.UID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
+			return
+		}
+		if conflict {
+			respondBotAPIInstanceConflict(c)
+			return
+		}
 	}
 
 	cfg := ba.ctx.GetConfig()

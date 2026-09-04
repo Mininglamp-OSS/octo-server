@@ -116,6 +116,7 @@ func respondBotAPIBotUnavailable(c *wkhttp.Context) {
 // OpenClaw installation. Do not expose the stored instance identifier.
 func respondBotAPIInstanceConflict(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIInstanceConflict, nil, nil)
+	c.Abort()
 }
 
 // ---- checkSendPermission classifier -----------------------------------------
