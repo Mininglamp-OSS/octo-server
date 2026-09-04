@@ -105,9 +105,14 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
     HTTP 200、无日志、事后与「从未上报」不可区分。两位 reviewer 独立端到端复现。
     **稀疏写入与「空值即不变」本来兼容**：丢更新的根源是「替换成刚读到的值」，
     不是「跳过该列」。
-  - **`agent_hosting`：任何被送来的值都算上报，含 `""`。** 那是 runtime 撤回陈旧形态的
-    唯一方式，而陈旧值比空值更有害。这确实是相对 legacy 字段的契约差异 —— 明说而不
-    用注释掩盖；它是新字段，没有存量依赖。
+  - **`agent_hosting`：非空值才算上报，`""` 同样是「不变」。** 与三个 legacy 字段
+    **完全同口径** —— 撤回走保留 slug `none`（`bot_api.AgentHostingNone`），
+    由 `normalizeAgentHosting` 归一成空串入库。
+    这一条是 round 4 定稿，取代了 round 2 那句「`""` 是撤回的唯一方式」：让同一个
+    JSON 里 `""` 对三个字段是「保持」、对第四个是「清空」，既是客户端作者的陷阱，
+    也会让「从不填该字段但总是发这个 key」的客户端每次重连落进 `('', 非NULL)` ——
+    而那个状态被三处文档定义为「曾上报后显式清空」，等于把序列化器默认值读成刻意撤回。
+    保留 slug 让撤回显式、可 grep，且它本身满足 `agentHostingPattern`，不需要额外字段。
   推论：`isEmpty()` 只是廉价前检，真正的「有无内容可写」是 `len(set)==0`。
 - **`agent_reported_hosting_at` 只在 hosting 被上报时前进，且由 SQL `NOW()` 写。**
   两点都是 PR #837 review 后修正的：
@@ -146,7 +151,7 @@ Unicode 混淆字符，而 `^[a-z][a-z0-9_]*$` 把这些全挡了且不需要预
     已验证。**ASCII 性质同时是列宽不变量的前提**：`len()` 数字节而 `VARCHAR(64)` 数字符，
     两者相等只因为拒了非 ASCII。
   大小写折叠而非拒绝（`Self_Hosted` 与 `self_hosted` 意图相同，折叠避免一类无声失败）。
-- **形状非法 = 本次忽略该字段，已存值保持不变；清空要显式报 `""`。**（review 后定稿）
+- **形状非法 = 本次忽略该字段，已存值保持不变；撤回要显式报 `none`。**（round 4 定稿）
   初版把 `hosting = &normalized` 写在合法性分支外面，于是被拒的值以空串进 `SetMap`
   覆盖已存值 —— 而 PR 描述说的是「degrades to 'not reported'」（读作保持不动），
   字段注释的规则是「present overwrites」（实际清空），两种读法互相矛盾。定为保持不变的
@@ -257,6 +262,22 @@ reviewer 的过程观察逼出来的：连续三轮，每轮都产出一条"为�
 | `zap.Int("rejectedLen")` → `zap.String("value", …)` | `TestApplyAgentReportWarnsOnMalformedHostingWithoutLeakingTheValue` |
 | 删掉 `registerAppBot` 的 `ba.Warn` | `TestRegisterAppBotWarnIsTheDeliverable` |
 | 改回 `_ = c.ShouldBindJSON` | `TestRegisterPartiallyMalformedBodyAdoptsNothing` |
+| db 层回写 stored（`else if report.X == nil && stored.X != nil`） | `TestUpdateRobotAgentInfoOmitsUnreportedColumns` 的两行 `stored` 有值用例 |
+| 快照里加 `Hosting:` + `applyAgentReport` 里补 `req.AgentHosting = stored.Hosting` | 两条源码守卫（快照形状 + 禁止赋回 req） |
+| 删掉 `api_user.go` 的时间戳映射 | `TestListUserBotsExposesAgentHosting`（按 robot_id 解码逐个断言） |
+| `MaxRegisterBodyBytes` 改成 4096 之外的值 | `TestRegisterOversizedBodyDegradesToNoTelemetry`（字面量 4096/4097） |
+| hosting 的 `""` 回到清空语义 | `TestRegisterHostingNoneClearsTheShape` |
+
+**round 5 补的两处，各自的教训**：
+
+1. **一张断言"某列缺席"的表，必须有一行让那列在库里有值。** SQL 形状表原先所有
+   「legacy 列缺席」用例都跑在 `stored` 为空上，于是「stored 有值 + 字段缺席」——
+   唯一能暴露 read-merge-write 的组合 —— 从未被构造，reviewer 实测那个变异能穿过
+   整个套件。表越大越容易漏掉这种"缺一行"，因为看起来已经很全了。
+2. **用常量表达期望值，等于没有期望值。** 第一次修 body 上限边界时我写的是
+   `exactBody(bot_api.MaxRegisterBodyBytes)`，改常量测试跟着变，`8<<10` 和 `4095`
+   两个变异都照样绿 —— 与 reviewer 指出的「区间没钉住」是同一个病，只是换了个写法。
+   现在断言 `require.Equal(t, 4096, bot_api.MaxRegisterBodyBytes)` 再用字面量构造。
 
 **一条端到端时区测试被删除而非修好。** 它把会话时区调到 `+08:00` 再比两个时间戳，
 确实能杀掉 `NOW()` → `time.Now()` 的变异（实测偏差 `7h59m59s`），但要让 register 的写入
@@ -342,11 +363,13 @@ head 上也失败，本就与本任务无关）。
   控制字符、零宽空格、`U+212A`/`U+0130` 折叠型混淆字符、带重音拉丁字母、全角字符、
   中文、超长串）→ **仍 200**，且**已存的合法值保持不变**（不是清成空串），
   日志有 Warn（且**不记原始值**，只记 `rejectedLen`）。
-- 显式报 `""` → 清空（与「被拒」区分：前者是格式良好的上报）。
+- 显式报 `""` → **保持不变**（"" 对四个字段一律是「未上报」）。
+- 显式报 `none` → 撤回（入库为空串，时间戳前进）；与「被拒」区分：撤回是格式良好的上报。
 - 第三方 `<vendor>_hosted` 无需改服务端即可原样落库，并原样出现在 `GET /v1/user/bots`。
 - `cloud` / `local` 合法通过（已知代价，见 Load-bearing）。
 - 不传该字段（旧客户端、空 body）→ 旧值保留，且现有三字段行为逐字节不变。
-- 显式传 `""` → 清空为空串（指针语义与「没传」可区分）。
+- 显式传 `""` → 保持不变；传 `none` → 撤回为空串（指针语义让「没传」与「传了」可区分，
+  而「传了什么」再决定是保持还是撤回）。
 - 上报值与库中一致时 `agent_reported_hosting_at` 仍被刷新（语义是「最近一次收到上报」）。
 
 **App Bot**
@@ -373,7 +396,8 @@ head 上也失败，本就与本任务无关）。
   version 更新、另两个保持不变。
 - 三个 legacy 字段**全**报 `""` → 一行都不写，且不盖 hosting 时间戳
   （「被送来」≠「可写」）。
-- `agent_hosting` 报 `""` → 清空（与 legacy 的空值语义刻意不同）。
+- `agent_hosting` 报 `""` → 保持不变（与 legacy 的空值语义**刻意相同**）；
+  报 `none` → 撤回（列写空串 + 时间戳前进，因为撤回是一次真实上报）。
 - SQL 层逐形态断言：legacy 空串不进语句、空串与非空混报只写非空的那个。
 - **变异验证**：去掉 legacy 的空值跳过后，端到端与 SQL 层两条都必须红。
 

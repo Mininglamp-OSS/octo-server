@@ -14,9 +14,14 @@ injected:
   - id: space-isolation
     source: repo
   # touches: trust-boundary + wire-contract (brief tags)
-  # → agent_hosting is caller-controlled (any bf_ holder can send anything);
-  #   the whitelist IS the boundary, so an arbitrary 128-byte string can never
-  #   reach the owner/manager response.
+  # → agent_hosting is caller-controlled (any bf_ holder can send anything).
+  #   The boundary is a SHAPE check (^[a-z][a-z0-9_]*$ + a byte bound equal to the
+  #   column width + ASCII-before-fold), not a value whitelist — the whitelist was
+  #   tried and rejected (a new hosting provider would have needed a server
+  #   release, and it never established entitlement anyway; see the brief's
+  #   Background). A rejected value is IGNORED, leaving the stored one untouched;
+  #   it is not stored as "". Retraction is an explicit reserved slug ("none"),
+  #   because giving "" clear-semantics wiped stored values on every reconnect.
   - id: trust-boundary
     source: repo
   # paths modules/**/*.go (no rate-limit/throttle tag in the brief)

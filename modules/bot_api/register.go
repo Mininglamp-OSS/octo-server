@@ -213,7 +213,7 @@ type BotRegisterReq struct {
 	AgentHosting *string `json:"agent_hosting"`
 }
 
-// maxRegisterBodyBytes caps the register request body.
+// MaxRegisterBodyBytes caps the register request body.
 //
 // The body is pure telemetry — every field is optional and register succeeds
 // without any of it — but until this cap existed, `binding.JSON`
@@ -226,7 +226,11 @@ type BotRegisterReq struct {
 // 4 KiB is generous for four short strings and small enough that the decode
 // cannot be turned into an allocation lever. Overflow is treated as "no
 // telemetry reported", never as a failed registration — see readAgentReport.
-const maxRegisterBodyBytes = 4 << 10
+// Exported so the boundary test in modules/botfather can assert the EXACT byte
+// count instead of a range. A range-based test ("~3.9 KiB adopted, 8 KiB
+// rejected") leaves the constant free to move anywhere in between without going
+// red, which is how round 5 found this unpinned.
+const MaxRegisterBodyBytes = 4 << 10
 
 // readAgentReport decodes the optional telemetry body under a size cap.
 //
@@ -245,7 +249,7 @@ const maxRegisterBodyBytes = 4 << 10
 // looking like a successful report. So decode into a temporary, require a clean
 // decode AND end-of-input, and only then adopt it.
 func readAgentReport(c *wkhttp.Context) BotRegisterReq {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRegisterBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxRegisterBodyBytes)
 	var staged BotRegisterReq
 	dec := json.NewDecoder(c.Request.Body)
 	if err := dec.Decode(&staged); err != nil {
@@ -436,8 +440,12 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 
 	// App Bot does not support the agent runtime fields: the app_bot table has no
 	// agent_* columns (see modules/app_bot/sql), so there is nowhere to put them.
-	// Parsing the body here exists ONLY to emit this warning — without it a
-	// reporting client can never find out its report went nowhere.
+	// Parsing the body here exists ONLY to emit this warning, and the warning is
+	// for OPERATORS — the client still receives a bare 200 and cannot read server
+	// logs, so it does NOT close the loop for the reporting client. What it buys is
+	// that "a bot is reporting telemetry nobody stores" becomes greppable instead of
+	// invisible. Telling the caller would need a response field, which is a wire
+	// change this task did not take.
 	//
 	// This is an explicit non-support, not an oversight: App Bots really are
 	// driven by OpenClaw (app_bot.go's connectInfo hands the agent the

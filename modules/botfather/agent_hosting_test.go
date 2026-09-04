@@ -1,6 +1,8 @@
 package botfather
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,10 +73,20 @@ func resetRegisterRateLimit(t *testing.T, ctx *config.Context) {
 		Password: ctx.GetConfig().DB.RedisPass,
 	})
 	defer rds.Close()
-	// StrictIPRateLimitMiddleware 的 key 前缀含 tag，这里按 tag 精确清掉，
-	// 不误伤别的 strict 桶。
-	keys, err := rds.Keys("*bot_register*").Result()
-	if err == nil && len(keys) > 0 {
+	// 精确 DEL，不用 KEYS 扫描（round 5 🔵）：KEYS 在每次 register 前全库扫一遍，
+	// 而且吞掉错误就等于"没清成功也不知道"。StrictIPRateLimitMiddleware 的 key 形状是
+	// `ratelimit:strict:{tag}:{ip}`，httptest 的客户端 IP 固定是 192.0.2.1
+	// （net/http/httptest.NewRequest 的 RemoteAddr），所以键是可枚举的。
+	//
+	// 仍保留一次带 tag 的兜底扫描：key 形状是 lib 侧的实现细节，万一它变了，
+	// 精确 DEL 会静默失效 —— 那时兜底能让测试继续可用，而不是变成难查的 429。
+	const ip = "192.0.2.1"
+	exact := []string{
+		"ratelimit:strict:bot_register:" + ip,
+		"ratelimit:bot:register:" + ip,
+	}
+	require.NoError(t, rds.Del(exact...).Err(), "清 per-IP 限流桶失败")
+	if keys, err := rds.Keys("*bot_register*").Result(); err == nil && len(keys) > 0 {
 		_ = rds.Del(keys...).Err()
 	}
 }
@@ -131,7 +143,8 @@ func TestRegisterStoresAgentHosting(t *testing.T) {
 // （实际清空）—— 两种读法在同一个 PR 里互相矛盾。现在定为**保持不变**：
 // 触发场景不需要恶意，`self-hosted`（带连字符，正是本命名引用的 GitHub Actions
 // 写法）就会被拒，一次客户端拼错会把全量 bot 的这一列刷空，只留一行日志。
-// 清空仍然可做，但要显式报 ""（那是格式良好的上报，不是被拒的上报）。
+// 撤回仍然可做，但要显式报 `none`（那是格式良好的上报，不是被拒的上报）——
+// 见 TestRegisterHostingNoneClearsTheShape。
 //
 // 起点是一个**已有合法值**的 bot —— 初版测试从「从未上报」起步，区分不了
 // 「存了空串」和「本来就空」，所以完全覆盖不到这个场景。
@@ -288,7 +301,7 @@ func TestRegisterEmptyBodyLeavesAgentInfoUntouched(t *testing.T) {
 //
 // 那个不变量由 modules/bot_api 的两条**源码守卫**钉住
 // （TestApplyAgentReportCannotReadTheRobotRow /
-// TestRegisterUserBotDoesNotMergeAgentFields，已验证能杀掉 read-merge-write 变异），
+// TestRegisterUserBotPassesStoredOnlyAsASkipSnapshot，已实测能杀掉 read-merge-write 变异），
 // 以及 TestUpdateRobotAgentInfoOmitsUnreportedColumns（直接断言发出的 SQL 里有哪些列）。
 // 早前这段注释声称本测试"用带外写入逼出区别"，那是错的 —— reviewer 实测在植入合并
 // 实现后本测试照样绿。
@@ -455,30 +468,56 @@ func TestRegisterOversizedBodyDegradesToNoTelemetry(t *testing.T) {
 	// 恰好压到上限之内的 body 必须**被采纳** —— 这一半是边界的下侧。
 	// 只测"8 KiB 被拒"的话，把上限从 4 KiB 调到 8 KiB 仍然全绿，常量就没被钉住
 	// （round 4 P2-6）。
-	underLimit := map[string]interface{}{"agent_hosting": "octo_hosted"}
-	// 4096 − 已有键值与括号的开销，留足余量后仍在限内。
-	underLimit["padding"] = strings.Repeat("x", 4<<10-200)
-	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, underLimit).Code)
-	assert.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
-		"限内的 body 必须被采纳；若这里失败，说明上限被调得过小")
+	// 按**序列化后的确切字节数**构造：正好 4096 必须被采纳，4097 必须被拒。
+	//
+	// **必须用字面量 4096，不能用 bot_api.MaxRegisterBodyBytes。** 用常量表达期望值时，
+	// 改常量测试会跟着变 —— 我第一次就是这么写的，把上限改成 8<<10 或 4095 两个变异
+	// 都照样绿，等于常量仍然没被钉住（这正是 round 5 P2-6 指出的问题，换个写法并不解决）。
+	// 下面先断言常量等于字面量，再用字面量构造 body：这样改常量会红在第一条断言上。
+	//
+	// **杀掉的变异**：把 MaxRegisterBodyBytes 改成 4096 之外的任何值。
+	const wantCap = 4096
+	require.Equal(t, wantCap, bot_api.MaxRegisterBodyBytes,
+		"register body 上限被改动了。改它本身可能是对的，但请一并确认："+
+			"(1) 4 KiB 对四个短字符串仍然宽裕；(2) 下面两条边界断言随之更新")
+	exactBody := func(total int) []byte {
+		skeleton, err := json.Marshal(map[string]string{"agent_hosting": "octo_hosted", "padding": ""})
+		require.NoError(t, err)
+		pad := total - len(skeleton)
+		require.Greater(t, pad, 0, "目标长度必须大于骨架长度")
+		raw, err := json.Marshal(map[string]string{
+			"agent_hosting": "octo_hosted",
+			"padding":       strings.Repeat("x", pad),
+		})
+		require.NoError(t, err)
+		require.Len(t, raw, total, "构造出的 body 必须正好 %d 字节", total)
+		return raw
+	}
+	postRaw := func(payload []byte) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/bot/register", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+botToken)
+		req.Header.Set("Content-Type", "application/json")
+		resetRegisterRateLimit(t, ctx)
+		h.ServeHTTP(w, req)
+		return w
+	}
 
-	// 复位到已知值，再验上侧。
+	require.Equal(t, http.StatusOK, postRaw(exactBody(wantCap)).Code)
+	assert.Equal(t, bot_api.AgentHostingOctoHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
+		"正好 %d 字节的 body 必须被采纳 —— MaxBytesReader 的上限含端点", wantCap)
+
+	// 复位，再验超一字节。
 	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
 		"agent_hosting": "self_hosted",
 	}).Code)
-	before = readAgentInfo(t, ctx, robotID)
-	require.Equal(t, bot_api.AgentHostingSelfHosted, before.AgentHosting)
+	require.Equal(t, bot_api.AgentHostingSelfHosted, readAgentInfo(t, ctx, robotID).AgentHosting)
 
-	// 明确超限：hosting 本身合法，只是整个 body 被截断。
-	require.Equal(t, http.StatusOK, botRegister(t, ctx, h, botToken, map[string]interface{}{
-		"agent_hosting": "octo_hosted",
-		"padding":       strings.Repeat("x", 8<<10),
-	}).Code, "body 超限不得让 register 失败 —— 它是 Bot 掉线自愈的唯一通道")
+	require.Equal(t, http.StatusOK, postRaw(exactBody(wantCap+1)).Code,
+		"超限也不得让 register 失败")
+	assert.Equal(t, bot_api.AgentHostingSelfHosted, readAgentInfo(t, ctx, robotID).AgentHosting,
+		"超上限 1 字节的 body 必须被整体丢弃，已存值不变")
 
-	after := readAgentInfo(t, ctx, robotID)
-	assert.Equal(t, before.AgentHosting, after.AgentHosting,
-		"超限 body 按未上报处理，已存值不得被改动")
-	assert.Equal(t, before.AgentPlatform, after.AgentPlatform)
 }
 
 // TestRegisterHostingNoneClearsTheShape —— 撤回走保留 slug，不走空串。
@@ -609,13 +648,47 @@ func TestListUserBotsExposesAgentHosting(t *testing.T) {
 	h.ServeHTTP(w, userAPIRequest(t, http.MethodGet, "/v1/user/bots", key, nil))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-	body := w.Body.String()
-	assert.Contains(t, body, `"agent_hosting":"octo_hosted"`, "已上报的 Bot 必须带出托管形态")
-	// 未上报的那个：字段省略而不是空串（omitempty，与 agent_platform 同组行为）。
-	assert.NotContains(t, body, `"agent_hosting":""`,
+	// **按 robot_id 解码后逐个断言**，不用整体子串匹配。
+	//
+	// 上一版对整个响应做 Contains(`"agent_reported_hosting_at":null`) —— 沉默那个 bot
+	// 单独就满足它，于是**已上报**那个 bot 的时间戳从未被检查：删掉
+	// api_user.go 里的 AgentReportedHostingAt 映射，套件照样绿，目标 2 的一半是无守卫
+	// 上线的（PR #837 round 5 🟡，reviewer 实测）。
+	//
+	// **杀掉的变异**：删除 modules/botfather/api_user.go 里 agentReportedHostingAt 的
+	// 计算与赋值。
+	var items []struct {
+		RobotID                string  `json:"robot_id"`
+		AgentHosting           *string `json:"agent_hosting"`
+		AgentReportedHostingAt *string `json:"agent_reported_hosting_at"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &items))
+
+	byID := map[string]int{}
+	for i, it := range items {
+		byID[it.RobotID] = i
+	}
+	ri, ok := byID[reported]
+	require.True(t, ok, "已上报的 Bot 应出现在列表里")
+	si, ok := byID[silent]
+	require.True(t, ok, "未上报的 Bot 也应出现在列表里")
+
+	// 已上报的那个：形态与时间戳都必须带出。
+	require.NotNil(t, items[ri].AgentHosting, "已上报的 Bot 必须带出 agent_hosting")
+	assert.Equal(t, bot_api.AgentHostingOctoHosted, *items[ri].AgentHosting)
+	assert.NotNil(t, items[ri].AgentReportedHostingAt,
+		"已上报的 Bot 必须带出 agent_reported_hosting_at —— 缺了它 agent_hosting 就是个"+
+			"无从判断新鲜度的裸值，而这正是加这一列的理由")
+
+	// 未上报的那个：agent_hosting 被 omitempty 省略（解码成 nil），时间戳显式 null。
+	assert.Nil(t, items[si].AgentHosting,
 		"未上报时 agent_hosting 应被 omitempty 省略，而不是下发空串")
-	assert.Contains(t, body, `"agent_reported_hosting_at":null`,
-		"未上报时必须显式 null（与 bound_at 同口径），而不是省略字段")
+	assert.Nil(t, items[si].AgentReportedHostingAt,
+		"未上报时 agent_reported_hosting_at 必须是 null（与 bound_at 同口径）")
+
+	// 字段确实出现在 JSON 里（而不是连键都没有）—— omitempty 只作用于 hosting。
+	assert.Contains(t, w.Body.String(), `"agent_reported_hosting_at"`,
+		"agent_reported_hosting_at 不得带 omitempty：null 与省略对调用方含义不同")
 }
 
 // TestRegisterOverlongPlatformBlocksTheWholeAgentUpdate —— **记录已知限制**，

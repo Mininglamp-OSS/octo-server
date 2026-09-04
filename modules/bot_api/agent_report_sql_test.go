@@ -113,6 +113,37 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 			present: []string{"agent_hosting", "agent_reported_hosting_at"},
 		},
 		{
+			// **这一行是这张表存在的理由**，而它此前一直缺席（PR #837 round 5 🔴2）：
+			// 断言 legacy 列缺席的用例全都跑在 stored 为空的前提上，于是
+			// 「stored 有值 + 字段缺席」这个唯一能暴露 read-merge-write 的组合从未被构造。
+			//
+			// **杀掉的变异**：在 updateRobotAgentInfo 里加
+			//   else if report.Platform == nil && stored.Platform != nil {
+			//       set["agent_platform"] = *stored.Platform
+			//   }
+			// （对 Version / Plugin / Hosting 同形），也就是 round 2 的丢更新。
+			// 没有这一行，那个变异能穿过整个 bot_api 套件。
+			name:   "stored 三个 legacy 都有值、只报 hosting：三列必须缺席（丢更新守卫）",
+			report: agentReport{Hosting: strptr("octo_hosted")},
+			stored: agentReport{
+				Platform: strptr("OpenClaw"), Version: strptr("1.2.3"), Plugin: strptr("9.9.9"),
+			},
+			present: []string{"agent_hosting", "agent_reported_hosting_at"},
+			absent:  []string{"agent_platform", "agent_version", "plugin_version"},
+		},
+		{
+			// 反向：stored 有 hosting、只报版本 —— hosting 与其时间戳都必须缺席。
+			// 少了它，「把 stored.Hosting 回写」的变异就只在端到端层可见（而端到端层
+			// 已被证明区分不了两种实现）。
+			name:   "stored 有 hosting、只报版本：hosting 与时间戳必须缺席",
+			report: agentReport{Version: strptr("2.0.0")},
+			stored: agentReport{
+				Version: strptr("1.0.0"), Hosting: strptr("self_hosted"),
+			},
+			present: []string{"agent_version"},
+			absent:  []string{"agent_hosting", "agent_reported_hosting_at", "agent_platform", "plugin_version"},
+		},
+		{
 			name:    "全都报：五列俱在",
 			report:  agentReport{Platform: strptr("OpenClaw"), Version: strptr("1"), Plugin: strptr("2"), Hosting: strptr("octo_hosted")},
 			present: []string{"agent_platform", "agent_version", "plugin_version", "agent_hosting", "agent_reported_hosting_at"},
@@ -157,8 +188,13 @@ func TestUpdateRobotAgentInfoOmitsUnreportedColumns(t *testing.T) {
 // newAgentReportDBCapturing 用自定义 QueryMatcher 抓取实际发出的 SQL 文本。
 func newAgentReportDBCapturing(t *testing.T, sink *string) (*botAPIDB, sqlmock.Sqlmock, func()) {
 	t.Helper()
+	// 捕获的同时**仍然校验** —— 无条件 return nil 会让 ExpectExec("UPDATE") 形同虚设
+	// （round 5 🔵）：那时任何语句都被接受，mock 自己的守卫是关着的。
 	matcher := sqlmock.QueryMatcherFunc(func(expectedSQL, actualSQL string) error {
 		*sink = actualSQL
+		if !regexp.MustCompile(expectedSQL).MatchString(actualSQL) {
+			return fmt.Errorf("语句与预期不符\n预期正则: %s\n实际: %s", expectedSQL, actualSQL)
+		}
 		return nil
 	})
 	rawDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
@@ -305,6 +341,12 @@ func TestApplyAgentReportMalformedHostingLeavesColumnOutOfStatement(t *testing.T
 // **杀掉的变异**：在 registerUserBot / applyAgentReport 里把缺席字段解析成刚读到的
 // robot 行的值（read-merge-write），也就是前两轮被否决的实现。
 //
+// 注意分工（round 5 🔴2 修正）：**db 层**那个变异形态
+// （`else if report.X == nil && stored.X != nil { set[...] = *stored.X }`）不由这两条
+// 守卫承担，而由 TestUpdateRobotAgentInfoOmitsUnreportedColumns 里
+// 「stored 有值 + 字段缺席」那两行用例杀掉 —— 已实测。这两条守卫管的是
+// **调用层**：不让 stored 的值流进 req/report。
+//
 // 为什么必须靠源码守卫而不是行为断言：reviewer 实测证明三条端到端测试**杀不掉**这个
 // 变异（PR #837 round 4 P1(b)）—— 带外 UPDATE 落在下一次 register 之前，合并实现读到
 // 的已经是新值，再写回去与稀疏写入无从区分；而 sqlmock 那层直接调
@@ -334,7 +376,31 @@ func TestApplyAgentReportCannotReadTheRobotRow(t *testing.T) {
 	assert.NotContains(t, src, "func (ba *BotAPI) applyAgentReport(robot *robotModel",
 		"applyAgentReport 不得接收 *robotModel")
 
-	// (2) 函数体内不读 robot 行的 agent_* 字段。
+	// (2) 函数体内不得把 stored 的值搬进 report/req —— stored 只能进 changed() 比较。
+	//
+	// reviewer 给出的绕过路径（round 5 🔴2(b)）：在快照里加 `Hosting: &robot.AgentHosting`，
+	// 再在本函数里补 `if req.AgentHosting == nil { req.AgentHosting = stored.Hosting }`，
+	// 于是版本-only 重连会写回陈旧形态**并推进时间戳**，丢掉并发的撤回 —— 而此前两条
+	// 守卫全绿。legacy 那一支的同形变异是行为等价的（changed() 拿值和自己比、跳过），
+	// 所以只有 hosting 这一支有害，但两支都禁掉更简单、也不留下"哪支可以"的判断题。
+	appStart := strings.Index(src, "func (ba *BotAPI) applyAgentReport(")
+	require.NotEqual(t, -1, appStart)
+	appBody := src[appStart:]
+	if end := strings.Index(appBody, "\n}\n"); end != -1 {
+		appBody = appBody[:end]
+	}
+	for _, field := range []string{"AgentPlatform", "AgentVersion", "PluginVersion", "AgentHosting"} {
+		assert.NotContains(t, appBody, "req."+field+" = ",
+			"applyAgentReport 不得把值赋回 req.%s —— stored 只能喂给 changed() 比较，"+
+				"搬进请求体就是 read-merge-write（hosting 那一支会写回陈旧形态并推进时间戳，"+
+				"丢掉并发撤回）", field)
+	}
+	for _, f := range []string{"stored.Platform", "stored.Version", "stored.Plugin", "stored.Hosting"} {
+		assert.NotContains(t, appBody, "report."+strings.TrimPrefix(f, "stored.")+" = "+f,
+			"不得把 %s 直接赋给 report 的同名字段 —— 那是把 stored 当成上报值", f)
+	}
+
+	// (3) 函数体内不读 robot 行的 agent_* 字段。
 	start := strings.Index(src, "func (ba *BotAPI) applyAgentReport(")
 	require.NotEqual(t, -1, start)
 	body := src[start:]
@@ -383,10 +449,23 @@ func TestRegisterUserBotPassesStoredOnlyAsASkipSnapshot(t *testing.T) {
 
 	// 允许且期望：stored 快照作为独立实参传入。这条同时防止有人"顺手"把 skip 优化删掉，
 	// 那会让每次重连都发一条无可观察效果的空写（PR #837 round 4 P2-2）。
+	flat := strings.Join(strings.Fields(body), " ")
 	assert.Regexp(t,
-		regexp.MustCompile(`applyAgentReport\([^)]*&req,\s*agentReport\{`),
-		strings.ReplaceAll(body, "\n", " "),
+		regexp.MustCompile(`applyAgentReport\([^)]*&req, agentReport\{`), flat,
 		"stored 快照应作为独立实参传给 applyAgentReport，而不是并入 req")
+
+	// 快照**只含三个 legacy 字段**：hosting 不进 skip 比较，因为撤回/再确认都是一次
+	// 真实上报、时间戳必须推进；把 Hosting 放进快照是 round 5 🔴2(b) 那条绕过路径的
+	// 前半步，在这里就掐掉。
+	snapStart := strings.Index(flat, "applyAgentReport(")
+	require.NotEqual(t, -1, snapStart)
+	snap := flat[snapStart:]
+	if end := strings.Index(snap, "})"); end != -1 {
+		snap = snap[:end]
+	}
+	assert.NotContains(t, snap, "Hosting:",
+		"stored 快照不得包含 Hosting —— hosting 没有 skip-if-unchanged（撤回也是上报），"+
+			"把它放进快照只会为 read-merge-write 开路")
 }
 
 // TestRegisterAppBotWarnIsTheDeliverable —— App Bot 分支解析 body 的**唯一**产出
@@ -413,9 +492,9 @@ func TestRegisterAppBotWarnIsTheDeliverable(t *testing.T) {
 	}
 
 	assert.Contains(t, body, "readAgentReport(c)",
-		"registerAppBot 必须解析 body —— 否则上报方永远发现不了自己白报了")
+		"registerAppBot 必须解析 body —— 否则「有 bot 在上报没人存的 telemetry」这件事对运维不可见")
 	assert.Contains(t, body, "ba.Warn(",
-		"registerAppBot 解析 body 的唯一产出就是这条 Warn；删掉它，解析就成了纯开销")
+		"registerAppBot 解析 body 的唯一产出就是这条给**运维**看的 Warn（客户端只拿到 200）；删掉它，解析就成了纯开销")
 	assert.NotContains(t, body, "updateRobotAgentInfo",
 		"App Bot 的上报绝不能写进 robot 表（app_bot 没有 agent_* 列）")
 }
