@@ -485,20 +485,31 @@ func runAPI(ctx *config.Context) {
 		panic(err)
 	}
 	// The system-setting singleton may have been constructed before module
-	// migrations completed. Reload it now, then probe the effective SMTP only
-	// when management-console MFA is enabled. A failed probe is an operational
-	// warning, not a reason to panic the API process: the singleton records the
-	// failed readiness and the manager login gate remains fail-closed until a
-	// later successful probe or policy change.
+	// migrations completed. After setup, make manager MFA and SMTP rows
+	// database-owned, then load the resulting snapshot. Startup deliberately
+	// performs no SMTP I/O; real availability is checked before configuration
+	// writes and when the manager MFA code is actually sent.
 	managerMFASettings := commonmodule.EnsureSystemSettings(ctx)
-	if err := managerMFASettings.Load(); err != nil {
-		log.Warn("reload SystemSettings after module setup failed; manager MFA remains fail-closed until reload succeeds", zap.Error(err))
+	if err := managerMFASettings.EnsureManagerEmailMFASettings(); err != nil {
+		log.Error("initialize manager MFA system settings failed; management MFA may remain fail-closed; existing support.* database rows remain authoritative and YAML is only a fallback for absent rows", zap.Error(err))
+	} else {
+		log.Info("shared support.* SMTP settings are database-owned; YAML only bootstraps missing rows and SupportEmail* uses database values when present",
+			zap.String("source", "system_setting"),
+			zap.String("keys", "support.email,support.email_smtp,support.email_pwd"))
+	}
+	loadErr := managerMFASettings.Load()
+	if loadErr != nil {
+		log.Error("reload SystemSettings after module setup failed; management MFA follows the last loaded database snapshot and may remain fail-closed", zap.Error(loadErr))
 	} else if managerMFASettings.ManagerEmailMFAState() == commonmodule.ManagerEmailMFAOn {
-		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		if err := managerMFASettings.PreflightManagerEmailMFA(preflightCtx); err != nil {
-			log.Warn("manager-console MFA SMTP startup preflight failed; management login remains fail-closed", zap.Error(err))
+		// Existing installations may have a partial support.* override from the
+		// pre-MFA database/YAML merge behavior. The manager MFA path now reads
+		// these values from the database snapshot only, so surface that upgrade
+		// incompatibility loudly instead of letting the first OTP send discover
+		// it as an opaque 503. This is a format/completeness check only; startup
+		// deliberately does not send probe mail.
+		if err := managerMFASettings.ValidateManagerEmailMFASMTP(); err != nil {
+			log.Error("manager-console MFA is enabled but database-owned SMTP configuration is incomplete or invalid; verify the existing database SMTP rows before upgrading; management MFA remains fail-closed", zap.Error(err))
 		}
-		preflightCancel()
 	}
 	stopSessionRollout, err = startSessionRolloutControl(ctx, tokenStore, sessionRedis)
 	if err != nil {

@@ -75,11 +75,12 @@ type settingDef struct {
 	Key         string
 	Type        string // settingTypeString | settingTypeBool | settingTypeInt | settingTypeEncrypted
 	Description string
-	// Effective returns the value that is currently in effect for this
+	// Effective returns the generic value that is currently in effect for this
 	// setting, applying the DB → yaml → code-default fallback chain. The
-	// listSystemSettings handler uses this to populate `effective_value`
-	// in the GET response so the admin UI can render the actual running
-	// value even when the DB row is absent.
+	// listSystemSettings handler uses this for ordinary settings. It
+	// intentionally overrides the three manager-facing support.email* rows
+	// with their database-only snapshot, while the ordinary SupportEmail*
+	// getters continue to provide YAML fallback to user-facing mail flows.
 	//
 	// For settingTypeEncrypted, the returned string is plaintext — the
 	// API layer is responsible for masking before serialisation; never
@@ -416,7 +417,7 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},
 	{Category: "support", Key: "email_smtp", Type: settingTypeString, Description: "SMTP 服务器 host:port",
 		Effective: func(s *SystemSettings) string { return s.SupportEmailSmtp() }},
-	{Category: "support", Key: "email_pwd", Type: settingTypeEncrypted, Description: "SMTP 密码（加密存储）",
+	{Category: "support", Key: "email_pwd", Type: settingTypeEncrypted, Description: "SMTP 密码（必填，加密存储）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmailPwd() }},
 }
 

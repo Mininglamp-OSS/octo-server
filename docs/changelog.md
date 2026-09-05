@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### 管理控制台 MFA 升级前提
+
+- `OCTO_MASTER_KEY` 必须在升级前配置为原有的有效 32 字节密钥。该变量是
+  既有版本对加密应用数据和加密系统配置的前置依赖，并非本次管理控制台
+  MFA 新增的依赖。缺失、错误或被替换的密钥属于不受支持的部署状态，
+  不属于本次 MFA 流程范围；会导致加密配置无法读写，管理端 MFA 将保持
+  fail-closed，请先恢复原密钥再升级。
+- SMTP 默认 seed 会先完成必填密码的加密，再一次性写入 SMTP 配置；密钥
+  加密失败不会留下不完整的 SMTP 配置集合。
+- SMTP 密码继续保持必填，与既有部署配置契约一致；本次 MFA 不支持无密码
+  SMTP relay。
+- 管理 MFA/SMTP 初始化或系统配置加载失败现在输出 `ERROR` 级别日志，
+  但不会因该配置基础设施错误直接 panic API 服务。
+- 超管 SMTP 自测现在使用与管理控制台 MFA 发码相同的数据库 SMTP 快照，
+  不会把 MFA 无法使用的 YAML fallback 配置误报为健康。`support.*` 是整个
+  服务共享的 SMTP 配置：普通用户邮件仍使用数据库优先、YAML fallback 的
+  既有 getter 行为；数据库中存在有效值时，普通用户邮件和管理端 MFA 使用
+  同一套数据库配置，数据库值缺失、为空或无法读取时普通邮件才回退到 YAML，
+  而管理端 MFA 不使用该 fallback。
+- 升级前，如果旧版本数据库中的管理控制台 MFA 已开启，必须确认数据库中
+  的 `support.email`、`support.email_smtp` 以及必填的 `support.email_pwd`
+  能组成有效 SMTP 配置。部分数据库配置不会再从 YAML 静默补齐；启动检测到
+  该非法状态时输出 `ERROR`，管理端 MFA 保持 fail-closed，需由运维修复配置。
+  必要时可先执行
+  `UPDATE system_setting SET value = '0' WHERE category = 'login' AND key_name = 'manager_email_mfa_on';`
+  临时关闭 MFA，修复完整 SMTP 配置并通过真实预检后再重新开启。
+
 ## [v1.1.2] - 2026-03-05
 
 ### 新功能

@@ -50,7 +50,8 @@ func TestManagerSystemSetting_GetReturnsSchemaAndMaskedSecrets(t *testing.T) {
 // GET must return:
 //   - configured=true + value=DB value for explicitly configured rows
 //   - configured=false + value="" for unconfigured rows
-//   - effective_value reflecting DB → yaml → code-default for every row
+//   - effective_value reflecting DB → yaml → code-default for ordinary rows
+//   - manager-facing support.email* values reflecting the DB snapshot only
 //   - encrypted plaintext (from yaml or DB) is masked, never leaked
 func TestManagerSystemSetting_GetReturnsEffectiveValues(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
@@ -137,11 +138,12 @@ func TestManagerSystemSetting_GetReturnsEffectiveValues(t *testing.T) {
 	assert.Equal(t, "", got.Value)
 	assert.Equal(t, "0", got.EffectiveValue)
 
-	// Unconfigured string: yaml default surfaces in effective_value.
+	// Manager SMTP values are database-owned on this admin surface. A missing
+	// DB row must not make a YAML-only sender appear configured here.
 	got = byKey["support.email"]
 	assert.False(t, got.Configured)
 	assert.Equal(t, "", got.Value)
-	assert.Equal(t, "yaml-default@example.com", got.EffectiveValue)
+	assert.Equal(t, "", got.EffectiveValue)
 
 	// DB-overridden string.
 	got = byKey["support.email_smtp"]
@@ -149,14 +151,19 @@ func TestManagerSystemSetting_GetReturnsEffectiveValues(t *testing.T) {
 	assert.Equal(t, "smtp.db:587", got.Value)
 	assert.Equal(t, "smtp.db:587", got.EffectiveValue)
 
-	// Encrypted with only a yaml fallback: effective_value must be masked,
-	// plaintext must never appear in the body.
+	// With no database password row, manager configuration GET remains empty;
+	// it must not mask a YAML fallback that the manager configuration does not
+	// own. The ordinary sender getter still retains its YAML fallback.
 	got = byKey["support.email_pwd"]
 	assert.False(t, got.Configured, "no DB row → configured=false")
 	assert.Equal(t, "", got.Value, "no DB row → value empty (not masked)")
-	assert.Equal(t, "****", got.EffectiveValue, "yaml-backed secret must surface as mask")
+	assert.Equal(t, "", got.EffectiveValue, "no DB password → effective_value empty")
 	assert.NotContains(t, w.Body.String(), "yaml-fallback-secret",
 		"encrypted yaml plaintext must NEVER leak through GET")
+	assert.Equal(t, "yaml-default@example.com", settings.SupportEmail(),
+		"ordinary mail getter must retain its YAML fallback")
+	assert.Equal(t, "yaml-fallback-secret", settings.SupportEmailPwd(),
+		"ordinary mail password getter must retain its YAML fallback")
 }
 
 func TestManagerSystemSetting_UpdateRequiresSuperAdmin(t *testing.T) {
@@ -378,7 +385,6 @@ func TestManagerSystemSetting_UpdatePersistsAndReloads(t *testing.T) {
 	payload := map[string]interface{}{
 		"items": []map[string]string{
 			{"category": "register", "key": "email_on", "value": "1"},
-			{"category": "support", "key": "email_smtp", "value": "smtp.test:587"},
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -391,7 +397,6 @@ func TestManagerSystemSetting_UpdatePersistsAndReloads(t *testing.T) {
 	// The handler must call Reload — the test caller sees the new snapshot
 	// without explicitly invoking Reload itself.
 	assert.True(t, settings.RegisterEmailOn(), "Reload should run inside the update handler")
-	assert.Equal(t, "smtp.test:587", settings.SupportEmailSmtp())
 }
 
 // --- int range validation (issue #289) -------------------------------------
