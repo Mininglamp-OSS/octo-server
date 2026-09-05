@@ -76,19 +76,21 @@ type Sidebar struct {
 	// external-group mapping。
 	groupDB *group.DB
 	log.Log
+	conversationExtraDB *conversationExtraDB
 }
 
 // NewSidebar creates a Sidebar handler.
 func NewSidebar(ctx *config.Context) *Sidebar {
 	return &Sidebar{
-		ctx:             ctx,
-		groupCategoryDB: newGroupCategoryDB(ctx),
-		convExtDB:       convext.NewDB(ctx),
-		threadDB:        thread.NewDB(ctx),
-		followVersionDB: convext.NewFollowVersionDB(ctx),
-		groupService:    group.NewService(ctx),
-		groupDB:         group.NewDB(ctx),
-		Log:             log.NewTLog("Sidebar"),
+		ctx:                 ctx,
+		groupCategoryDB:     newGroupCategoryDB(ctx),
+		convExtDB:           convext.NewDB(ctx),
+		threadDB:            thread.NewDB(ctx),
+		followVersionDB:     convext.NewFollowVersionDB(ctx),
+		groupService:        group.NewService(ctx),
+		groupDB:             group.NewDB(ctx),
+		Log:                 log.NewTLog("Sidebar"),
+		conversationExtraDB: &conversationExtraDB{ctx: ctx, session: ctx.DB()},
 	}
 }
 
@@ -142,7 +144,8 @@ type SidebarItem struct {
 	// 3=deleted，语义与 modules/thread/const.go 的 ThreadStatus* 枚举一致
 	// （GH octo-server#310）。客户端据此同步过滤已归档子区，无需等待 channelInfo。
 	// omitempty 让 DM / 群条目不带该字段，保持线上协议向后兼容。
-	Status int `json:"status,omitempty"`
+	Status       int  `json:"status,omitempty"`
+	ManualUnread bool `json:"manual_unread"`
 }
 
 // sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
@@ -491,9 +494,11 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 
 	// 3. Build tab-specific items
 	var items []*SidebarItem
+	var manualUnreadItems []*conversationExtraModel
 	switch req.Tab {
 	case "follow":
 		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
+
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -590,7 +595,22 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			cutoffs = recentCutoffs{}
 			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
 		}
-		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+
+		// Manual unread is a Recent-window exemption, so it must be loaded from
+		// the bounded IM candidate set before the window is applied. The query
+		// still selects only channel identity columns and never scans all rows
+		// owned by the user.
+		groupChannelIDs, topicChannelIDs := collectManualUnreadConversationIDs(conversations)
+		manualUnreadItems, err = sb.conversationExtraDB.queryManualUnread(loginUID, groupChannelIDs, topicChannelIDs)
+		if err != nil {
+			// The marker set is incomplete, so applying the window could hide a
+			// manually unread conversation. Fail open by skipping this response's
+			// window, then retry the marker overlay on the next poll.
+			sb.Warn("sidebar sync: manual unread query failed (non-fatal, recent window skipped)", zap.Error(err))
+			manualUnreadItems = nil
+			cutoffs = recentCutoffs{}
+		}
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, manualUnreadChannelSet(manualUnreadItems), groupSpaceMap, externalGroupMap, defaultSpaceID)
 		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
 		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
@@ -638,6 +658,19 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			item.IsPinned = true
 		}
 	}
+
+	// 4a. Follow has no activity window, so it can keep the narrower final-item
+	// lookup (including DB-only threads). Recent already loaded its bounded IM
+	// candidates before filtering because the marker affects membership there.
+	if req.Tab == "follow" {
+		groupChannelIDs, topicChannelIDs := collectManualUnreadChannelIDs(items)
+		manualUnreadItems, err = sb.conversationExtraDB.queryManualUnread(loginUID, groupChannelIDs, topicChannelIDs)
+		if err != nil {
+			sb.Warn("sidebar sync: manual unread query failed (non-fatal, markers omitted)", zap.Error(err))
+			manualUnreadItems = nil
+		}
+	}
+	backfillManualUnread(items, manualUnreadItems)
 
 	// 5. Sort
 	switch req.Tab {
@@ -1270,9 +1303,11 @@ func buildFollowItems(
 // Rules:
 //   - Each conversation is filtered against the cutoff for its channel type
 //     (cutoffs.cutoffFor): kept iff cutoff == 0 (window disabled) OR
-//     timestamp > cutoff. With the default cutoffs (groups/threads = 3-day
-//     window, DMs = 0) this reproduces the historical behaviour where DMs are
-//     always shown and groups/threads obey a 72h window — but every type is
+//     timestamp > cutoff, unless real unread, Group/CommunityTopic manual
+//     unread, pinned, or system-bot state exempts it. With the default cutoffs
+//     (groups/threads = 3-day window, DMs = 0) this reproduces the historical
+//     behaviour where DMs are always shown and groups/threads obey a 72h
+//     window, while respecting explicit unread visibility — but every type is
 //     now operator-tunable via system_settings (issue #289).
 //   - The returned slice is not yet sorted.
 //
@@ -1286,6 +1321,7 @@ func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
 	cutoffs recentCutoffs,
 	pinnedSet map[string]struct{},
+	manualUnreadSet map[string]struct{},
 	groupSpaceMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
@@ -1296,8 +1332,12 @@ func buildRecentItems(
 		if pinnedSet != nil {
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
 		}
+		manualUnread := false
+		if manualUnreadSet != nil && supportsManualUnreadChannelType(conv.ChannelType) {
+			_, manualUnread = manualUnreadSet[channelKey(conv.ChannelID, conv.ChannelType)]
+		}
 		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
-		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
+		if !manualUnread && !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
 			if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
 				continue
 			}
@@ -1332,11 +1372,78 @@ func buildRecentItems(
 			MySourceSpaceID: mySourceSpaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
+			ManualUnread:    manualUnread,
 			IsPinned:        pinned,
 			ParentChannelID: parentID,
 		})
 	}
 	return items
+}
+
+func collectManualUnreadConversationIDs(conversations []*config.SyncUserConversationResp) (groupChannelIDs, topicChannelIDs []string) {
+	seen := make(map[string]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		if conversation == nil || !supportsManualUnreadChannelType(conversation.ChannelType) {
+			continue
+		}
+		key := channelKey(conversation.ChannelID, conversation.ChannelType)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		switch conversation.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			groupChannelIDs = append(groupChannelIDs, conversation.ChannelID)
+		case common.ChannelTypeCommunityTopic.Uint8():
+			topicChannelIDs = append(topicChannelIDs, conversation.ChannelID)
+		}
+	}
+	return groupChannelIDs, topicChannelIDs
+}
+
+func collectManualUnreadChannelIDs(items []*SidebarItem) (groupChannelIDs, topicChannelIDs []string) {
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == nil || !supportsManualUnreadChannelType(item.ChannelType) {
+			continue
+		}
+		key := channelKey(item.ChannelID, item.ChannelType)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		switch item.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			groupChannelIDs = append(groupChannelIDs, item.ChannelID)
+		case common.ChannelTypeCommunityTopic.Uint8():
+			topicChannelIDs = append(topicChannelIDs, item.ChannelID)
+		}
+	}
+	return groupChannelIDs, topicChannelIDs
+}
+
+func backfillManualUnread(items []*SidebarItem, unreadItems []*conversationExtraModel) {
+	unreadMap := manualUnreadChannelSet(unreadItems)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		item.ManualUnread = false
+		if !supportsManualUnreadChannelType(item.ChannelType) {
+			continue
+		}
+		_, item.ManualUnread = unreadMap[channelKey(item.ChannelID, item.ChannelType)]
+	}
+}
+
+func manualUnreadChannelSet(unreadItems []*conversationExtraModel) map[string]struct{} {
+	unreadMap := make(map[string]struct{}, len(unreadItems))
+	for _, item := range unreadItems {
+		if item != nil && supportsManualUnreadChannelType(item.ChannelType) {
+			unreadMap[channelKey(item.ChannelID, item.ChannelType)] = struct{}{}
+		}
+	}
+	return unreadMap
 }
 
 // mergeThreadEntries appends thread ext entries (from user_conversation_ext)
