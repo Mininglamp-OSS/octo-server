@@ -754,3 +754,61 @@ in-lock 复核拒绝，继续跑纯属浪费。handler 相应改用 `uids[len(re
 | `modules/space` | ok 12.7s |
 | build / vet / golangci-lint | 全绿，0 issues |
 | i18n-extract-check / i18n-lint | 通过 / 2/2 |
+
+---
+
+# PR #841 第一轮 review 的 TDD 修复（2026-09-06）
+
+两份 CHANGES_REQUESTED（Jerry-Xin、yujiawei）。所有 blocker 与可执行项按 TDD
+（RED 实跑确认 → checkpoint → 最小修复 → GREEN → checkpoint）处理完毕；行为级测试
+均做变异验证（杀变异检查）。
+
+## 两个 blocker
+
+**remove 批次中途解散丢弃已提交部分（Jerry-Xin 🔴）**
+RED：`TestRemoveBatchReportsPartialWhenProjectDisbandsMidBatch`——r1 已提交、r2 撞
+`errProjectGone`，handler 返回裸 404。修：errProjectGone 分支镜像 add 路径的
+`anyApplied` 契约（有提交 → 200 + per-uid + not_attempted 尾部；无提交 → 保持 404）。
+连带修同谓词的 companion finding：`anyApplied` 改为按 `committed`（真实落库）判定，
+幂等 no-op 的 `OK=true` 不再冒充"已提交"（`TestNoOpBatchWithActorFailureStaysOneStatusCode`，
+变异验证：anyApplied 退回 OK 基准时该测试变红）。
+
+**join_mode 有客户端面（yujiawei S-2 🔴）**
+RED：`TestJoinModeHasNoClientSurfaceInP0`——create/PUT 携带 `join_mode:0` 被持久化并回显。
+修：与 `is_official` 完全对称——模型/请求/响应/插入列/更新白名单全撤，列保留 DDL 默认 1；
+PUT 只带 join_mode 会命中空更新守卫得到显式 400（比静默忽略更诚实）。
+
+## 非阻塞项（按我此前的建议清单逐条）
+
+| 项 | 处置 |
+|---|---|
+| Q2 锁序倒置（三方死锁环可达） | successor/target 的 S 锁前置到 `lockActiveProjectTx` 之前（`lockSpaceSeatBeforeProjectTx`），删除"仅此处安全"的例外论证；授权门以**请求目标角色**（`role >= RoleAdmin`）为键，降级不取 Space 锁，保住"对已离开成员仍可降级"的既有契约（测试钉着） |
+| Q3+Q8 双查合并 | projectMiddleware 用一次 `MemberRole` 同时得到成员资格（ok）与角色，删掉缓存化的成员查询——同谓词两查，缓存本来就没省往返；banned/移除在**下一次请求即生效**（`TestAddRejectsWhenSpaceIsBanned` 更新为更严契约）；`spaceCache` nil 部署降级查库不 panic |
+| Q6 actor 的 Space 席位事务内复核 | 新增 `requireActorSpaceSeatTx`，五条特权写路径统一在 project 锁前执行（与 Q2 锁序一致）；actor 与 target 拿到同构保证，不再依赖另一模块的缓存纪律 |
+| Q4 LIMIT 限"返回行"而非"检查行" | 三个分页查询改为 base 行 LIMIT + 每行 `AS violating` 标记，Go 侧过滤；cursor 按**检查过**的行推进，短页才真正意味着表尾；guard `TestReconcilePageQueriesExamineBoundedRows` 钉形态 |
+| Q7 ForTest 全局函数指针 | `addOneFn`/`removeOneFn` 改为 `*Project` 字段，New 装配真实现，测试在自己的实例上替换；auth 路径不再有可写全局 |
+| Q8 | orphan 谓词含解散 Space（banned 仍不算，可恢复）；`bumpMemberEpochTx` 不再写 `updated_at` 且加 `status=1` 谓词——**并抓到一个由该谓词引入的真回归**：disband 先翻 status 再 bump，谓词吞掉了 disband 的 epoch bump，已修正为同事务内先 bump 后翻转（验收项要求 disband 移动 epoch）；删除无调用者的 `countActiveInSpace` |
+| Q9 测试加固 | setup 的 Redis helper 由 Skipf 改 require（此前 Redis 降级会静默 skip ~80 个测试）；`spacemod.MemberRemovalCleanupStepNames` 导出 + 注册断言（此前删掉注册调用整包仍绿）；级联 step 导出 `CleanupSpaceMemberProjects` 供外部测试恢复真实注册（此前 cleanup 留 no-op，latest-wins 会静默禁用后续全部级联）；`invalidateProjectMemberCacheIn` 三分支与 corrupt-cache 回落首次有测试；reentrancy 测试改为读 histogram SampleSum 并做变异验证（旧版无断言，删 guard 不红）；member_epoch/is_official 源码 guard join 续行+去反引号（跨行绕过关闭），均做跨行变异验证；并发配额测试加 start barrier + loser 错误断言；RoutesReject 断言 registered code；daily-cap 钉住解散不重置；schema 测试要求两张表都在；COUNT(1) 纳入黑名单 |
+| S-1 | brief 验收措辞修订：成员配额在批量端点按 per-uid reason 呈现（批次其余目标可能已成功），其余三个配额仍为 batch 级 registered code |
+| S-3 | `admission_rejected_total` → `write_rejected_total`（entry 域覆盖全部写拒绝，"admission"以偏概全）；plan.md entry 域同步 |
+| Q5 | 行为保持（与 modules/space 先例一致）；三分支测试补齐（见 Q9） |
+
+## 处理过程中抓到的回归（测试先行的直接收益）
+
+1. `bumpMemberEpochTx` 加 `status=1` 谓词后，disbandProject 的"先翻转后 bump"顺序让
+   disband 的 epoch 不再递增——既有验收测试当场变红，改为同事务先 bump 后翻转。
+2. Q2 前置初版对降级也取 Space 锁，会拒绝"对已离开成员的降级"——被既有测试
+   `TestPromotionRequiresTargetStillInSpace` 当场抓住，改为按请求角色条件前置。
+3. changeMemberRole 的 successor 校验在拆分 `promoteSuccessorTx` 时一度丢失——被既有测试
+   `TestOwnershipCannotTransferToExSpaceMember` 当场抓住。
+
+## 最终验证
+
+| 项 | 结果 |
+|---|---|
+| `modules/project` | **106 PASS / 0 FAIL**（`-race -shuffle=on` 连跑两次一致） |
+| 单元 lane | 52/52，exit=0 |
+| `modules/space` | ok 14.1s（含新增导出函数） |
+| build / vet / golangci-lint | 全绿，0 issues |
+| i18n-extract-check / i18n-lint | 通过 / 2/2 |
+| `git diff --check` | clean |

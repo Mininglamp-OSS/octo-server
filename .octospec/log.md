@@ -4,6 +4,30 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-06 — project-p0-foundation (PR #841 第一轮 review：TDD 修复 blocker 与 Q 项)
+
+- **Fixed (blocking)** — remove 批次中途解散丢弃已提交部分（errProjectGone 镜像 add 的
+  anyApplied 契约）；join_mode 与 is_official 完全对称撤出全部客户端面（S-2：P2 上线自助
+  加入前必须先消灭"现在写入的 join_mode=0 将追溯性变成开放加入"的存量数据）。
+- **Fixed (non-blocking)** — anyApplied 改按 committed 判定（no-op 不冒充已提交）；
+  successor/target 的 space_member 共享锁前置到 project 锁之前，消除三方死锁环（Q2）；
+  projectMiddleware 的成员与角色合成一次 MemberRole 读取（Q3/Q8，banned 在下一请求即生效）；
+  五条特权写路径事务内复核 actor 的 Space 席位（Q6，新增 requireActorSpaceSeatTx）；
+  reconcile 分页改为 base 行 LIMIT + 每行 violating 标记（Q4：LIMIT 从此约束"检查行"而非
+  "返回行"）；ForTest 全局函数指针改为实例字段（Q7）；orphan 扫描覆盖解散 Space；
+  bumpMemberEpochTx 不再搅动 updated_at 且加 status 谓词；指标改名 write_rejected_total（S-3）；
+  brief 成员配额验收措辞按批量契约修订（S-1）。
+- **Learned** — 行为级测试必须做变异检查：reentrancy 测试重写为读 histogram SampleSum 后
+  才杀得掉"删 guard"变异；两个源码 guard join 续行后立即抓到跨行绝对赋值变异。TDD 循环里
+  新写的守卫（bumpMemberEpochTx 的 status 谓词）当场抓到既有代码的顺序缺陷（disband 先翻转
+  后 bump 吞掉 epoch）——测试先行不是仪式，是捕获手段。
+- **Learned** — 测试断言不能从 wire 读被刻意排除的字段（committed 是 json:"-"），必须断言
+  其行为后果（403 vs 200 per-target report）。
+- **Test hardening** — setup Redis helper Skipf→require；级联注册可断言（space 导出
+  MemberRemovalCleanupStepNames）；级联 step 导出供外部测试恢复真实注册；缓存 seam 三分支
+  与 corrupt-cache 回落补测；并发测试加 start barrier + loser 断言；RoutesReject 断言
+  registered code；COUNT(1) 纳入黑名单；schema 测试要求两表齐备。
+
 ## 2026-09-06 — project-p0-foundation (P0 implemented, 4 review rounds)
 
 - **Added** — `modules/project`：Space 内项目协作层 P0。`octo_project` / `octo_project_member`
