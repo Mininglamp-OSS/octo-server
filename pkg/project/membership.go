@@ -209,3 +209,37 @@ func MemberRole(session *dbr.Session, projectID string, uid string) (role int, o
 	}
 	return roles[0], true, nil
 }
+
+// ResolveForGroup answers whether a group in spaceID may be attributed to
+// projectID: the project must exist, be active, and belong to that same Space.
+//
+// ok=false covers all three failures — absent, disbanded, and cross-Space — and
+// the caller must NOT distinguish them on the wire. Doing so turns "create a
+// group" into an oracle: an attacker with a project id they cannot see could
+// learn whether it exists and which Space it lives in, from a Space they do have
+// access to. The reason belongs in the log.
+//
+// Deliberately does NOT check whether the caller is a member of the project.
+// That is the admission gate's job, and it happens inside the create
+// transaction: the creator is admitted through admitOrRestoreMembersTx like
+// every other member, so a non-member creating a project group is refused there,
+// under lock, rather than here in a read that could go stale before the commit.
+//
+// The status literal is spelled out rather than importing modules/project's
+// constant, for the same reason pkg/space spells out space.status: the import
+// would be a cycle.
+func ResolveForGroup(session *dbr.Session, spaceID, projectID string) (bool, error) {
+	if spaceID == "" || projectID == "" {
+		return false, nil
+	}
+	var count int
+	err := session.SelectBySql(
+		"SELECT COUNT(*) FROM `octo_project` "+
+			"WHERE project_id = ? AND space_id = ? AND status = 1",
+		projectID, spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
