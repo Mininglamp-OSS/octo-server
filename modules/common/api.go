@@ -398,6 +398,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			ProjectOn:              cn.systemSettings.ProjectEnabled(),
 			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 			DriveOn:                cn.systemSettings.DriveEnabled(),
 			DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
@@ -455,6 +456,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		ProjectOn:              cn.systemSettings.ProjectEnabled(),
 		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
 		DriveOn:                cn.systemSettings.DriveEnabled(),
 		DriveSearchOn:          cn.systemSettings.DriveSearchEnabled(),
@@ -894,6 +896,20 @@ type appConfigResp struct {
 	// 独立提供，可晚于 drive 模块本体上线，上线+索引就绪后才放量。仅表达展示策略，鉴权
 	// 在 octo-drive-search 自身，本字段不承担鉴权。与 app_config.version 解耦的原因同 DriveOn。
 	DriveSearchOn bool `json:"drive_search_on"`
+
+	// ProjectOn 告知客户端项目(Project)协作模块是否开启。
+	//
+	// 与 DocsOn / MailOn 那批「纯展示开关」不同，它同时是服务端闸门：
+	// modules/project 的 requireWriteEnabled 读的是同一个
+	// SystemSettings.ProjectEnabled()。做成两个开关的话，最坏形态是客户端把入口
+	// 显示出来、点进去每个写操作都 403——单一真源就是为了排除这种状态。
+	//
+	// 与 app_config.version 解耦，两个分支都下发：运维在管理台切完之后，命中
+	// version 短路分支的老客户端也必须立刻拿到最新值，否则它会一直以为模块是关的。
+	//
+	// 关掉只停止「产生新项目 / 新项目群」；已有项目群的成员约束（不变量 I2）不受
+	// 影响，照常强制。
+	ProjectOn bool `json:"project_on"`
 
 	// MailOn 告知客户端是否展示 Agent Mail 模块入口。值来源于 system_setting
 	// mail.enabled，默认 false。该字段只表达展示策略，不替代 octo-server 网关及

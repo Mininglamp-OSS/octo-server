@@ -1701,6 +1701,75 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// ProjectEnabled reports whether the Project collaboration module is on.
+//
+// Unlike DocsEnabled and its siblings this is NOT a presentation-only toggle: it
+// is the SAME switch modules/project enforces its write paths with
+// (requireWriteEnabled). One source of truth is the point. Two switches — an env
+// var for the server and a system_setting for the client — can disagree, and the
+// disagreement is the worst possible shape: the client shows the Project entry
+// and every write behind it returns 403.
+//
+// Resolution order is DB → env → false, the same chain SpaceDisableUserCreate
+// uses:
+//
+//   - a system_setting row wins, so an operator can flip the feature from the
+//     admin console with no restart (60s multi-instance convergence);
+//   - with no row, the historical OCTO_PROJECT_CREATE_ENABLED still decides, so
+//     an existing deployment keeps behaving exactly as it does today;
+//   - default false — fail-closed, as P0 shipped it.
+//
+// What it does NOT do is relax invariant I2. Turning it off stops NEW projects
+// and new project groups from being created; every existing project group keeps
+// enforcing membership. That asymmetry is deliberate — the design brief is
+// explicit that a rollback may stop production of project groups but must never
+// loosen the constraint on the ones that exist.
+func (s *SystemSettings) ProjectEnabled() bool {
+	if v, ok := s.ProjectEnabledOverride(); ok {
+		return v
+	}
+	return parseProjectEnabledEnv(os.Getenv(envProjectCreateEnabled))
+}
+
+// ProjectEnabledOverride reports the system_setting value and whether a row
+// exists at all.
+//
+// The distinction matters to modules/project, which resolved the env half once
+// at construction and must keep doing so: with no row, the value it already
+// holds decides, and this method's found=false says exactly that. Folding the
+// two into a single bool would make "no row" indistinguishable from "row says
+// false", which is how a feature that is ON via env silently turns OFF the first
+// time someone opens the admin console.
+func (s *SystemSettings) ProjectEnabledOverride() (value bool, found bool) {
+	if _, ok := s.lookup("project", "enabled"); !ok {
+		return false, false
+	}
+	return s.getBool("project", "enabled", false), true
+}
+
+// envProjectCreateEnabled is the env var P0 shipped (modules/project/config.go).
+// The name is kept rather than introduced fresh so an existing deployment's
+// configmap keeps working untouched.
+const envProjectCreateEnabled = "OCTO_PROJECT_CREATE_ENABLED"
+
+// parseProjectEnabledEnv mirrors modules/project/config.go's envBool: 1/true/
+// yes/on, case-insensitive, surrounding space tolerated, anything else false.
+// Mirrored rather than lifted into a shared package for the same reason
+// parseSpaceDisableUserCreateEnv is — one helper does not justify a new package
+// — but the two MUST be changed together, or the same switch means different
+// things at its two exits.
+func parseProjectEnabledEnv(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // MailEnabled reports whether clients should surface the Agent Mail module.
 // This is a presentation toggle only: Agent Mail authorization and access
 // control remain enforced by octo-server and octo-mail. Default false so the
