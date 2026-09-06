@@ -4,6 +4,39 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-09-06 — project-p0-foundation (P0 implemented, 4 review rounds)
+
+- **Added** — `modules/project`：Space 内项目协作层 P0。`octo_project` / `octo_project_member`
+  两表（`active_name` 生成列让解散释放重名），CRUD + 成员管理在请求事务内同步校验不变量 I1，
+  `member_epoch` 与每次成员写在同一事务内 `+1`（写纪律由源码级 guard 钉死），Space 移除级联经
+  反向注册清理步骤接入既有 outbox 工单，reconcile 只读对账（LIMIT+cursor，跨 tick 轮转），
+  四类配额 + 审计 + 按 entry point 拆分的拒绝指标。`project_create_enabled` fail-closed。
+  未触碰 group/thread/message；回滚 = 删两张表 + 去掉一个 blank import。
+  See [journal](journal/shared/project-p0-foundation.md).
+- **Learned** — 不变量只存在于它被强制执行的路径上，而每条新写路径都是一个新的执行点。
+  I1 的校验在 addOneMember 有了、createProject 的 owner 席位没有过；转让路径复核了 Space 席位、
+  直接 role change 却没有。brief 早已预言（「十一条群写路径证明 retrofit 会漏」），仍然发生。
+  对策是把「枚举写路径并断言各自含不变量调用」做成源码级 guard。
+- **Learned** — 「后续会有人补」必须写成代码。三处缺陷都是注释在断言代码不具备的性质：
+  cascade 注释说 reconcile 是第一页之后席位的「backstop」（reconcile 按设计只读）；
+  页数上限注释说「下一 tick 继续」（cursor 是局部变量，每 tick 从头开始，~25k 行之后
+  永远不被扫描）；批次标签 `not_attempted` 在 remove 路径是真话、在 add 路径是谎话
+  （service 先跑完整批，handler 事后标注）。
+- **Fixed (4 rounds of review)** — 事务内 I1 校验（`FOR SHARE OF` 锁 space_member 行）、
+  三个配额改为锁 space 行后计数（daily 维度跨 Space 的窄窗口为已接受例外）、特权写路径
+  一律锁内重读 actor 角色、提升/继任均复核目标 Space 席位、级联每短事务复核 + 页预算
+  耗尽返回可重试错误、abandoned 对账改为分页统计泄漏席位并排除在途工单、leave 只容忍
+  io.EOF、所有权交接补继任者审计、部分提交批次返回 per-target 结果。
+- **Deferred (产品待决，已记录进 brief Open questions)** — 唯一 owner 被移出 Space 后留下
+  无 owner 项目：自动提拔与自动解散都是产品决策，P0 只打 Warn；与 group 模块
+  `handOverGroupCreator` 无继任者时的既有终局一致。
+- **范围收敛** — 按需求方指示回退三处超出 brief 的扩展：级联的自动转让/自动解散、
+  Space admin 在用户侧列表对 unlisted 的放宽（brief 只授权 detail；枚举属 P2 admin surface）、
+  `member_epoch_bumped_total` 指标。
+- **Known gap** — 每日创建配额的跨 Space 并发窄窗口（per-space / per-creator 两个硬配额已在
+  space 行锁内计数，跨 Space 的 daily 维度未加锁）；生产 collation 待人工确认
+  （legacy 表未写 COLLATE，若生产默认非 `utf8mb4_general_ci`，对账 JOIN 会撞 1267）。
+
 ## 2026-09-04 (bot-agent-hosting · review round 4)
 
 - **Learned** — **注释声称有区分力、实际没有的测试，比没有测试更糟：它会被相信。**

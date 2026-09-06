@@ -1,0 +1,106 @@
+# octospec Implement-phase record for task project-p0-foundation.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + internal/**/*.go match every new file; brief tags
+      carry space / isolation / acl. Drives: Space membership checked inside the
+      request transaction (I1), path-param Space middleware instead of relying on
+      SpaceMiddleware's pass-through, AuthMiddleware on every route, blank import
+      in internal/modules.go, membership cache invalidated synchronously.
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract (brief tag), not by paths — this module is
+      not an inbound adapter, renders no markdown and emits no URL destinations,
+      so the escaping/parity clauses have no target here. The one clause that does
+      apply is "bound the payload": the member batch endpoints enforce an explicit
+      structural cap (max uids per request) on top of any byte cap.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + pkg/errcode/**; brief tags error-response / i18n /
+      wire-contract. Drives: pkg/errcode/project.go registry, httperr.ResponseErrorL
+      (D5) everywhere including middleware, 5xx <=> Internal=true, one generic
+      anti-enumeration code, i18n-extract / i18n-lint gates, source guard covering
+      middleware files as well as handlers.
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. Drives: SharedUIDRateLimiter
+      mounted AFTER AuthMiddleware on every authenticated group, asserted
+      structurally (a 429-under-load test would pass even when mounted wrongly).
+      No hand-rolled Redis counters. P0 has no unauthenticated endpoint, so
+      StrictIPRateLimitMiddleware has no mount point here (it arrives with the
+      invite surface, now P2).
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables, explicit
+      ratelimit:uid:* reset in setup, SetErrorRenderer injection so error.code is
+      assertable, focused -run invocations.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** — English Conventional Commits; no commit is made in this phase.
+
+brief: .octospec/tasks/project-p0-foundation/brief.md
+plan: .octospec/tasks/project-p0-foundation/plan.md
+verification: .octospec/tasks/project-p0-foundation/verification.md
+
+# Scope adjustment confirmed by the requester during planning:
+scope_changes:
+  - "Invite codes + self-service join (brief PR-2) deferred to P2, together with
+     the octo_project_invitation table. P0 ships two tables, and the only
+     admission path is owner/admin direct-add."
+
+# Assumptions taken where the brief left a choice; each is reversible at one site.
+assumptions:
+  - "project_create_enabled is env-only (OCTO_PROJECT_CREATE_ENABLED, default
+     false / fail-closed). system_setting would be runtime-toggleable but requires
+     editing modules/common/system_setting_schema.go + system_settings.go, which
+     the brief's own acceptance forbids (new files only). Moving it later is one
+     getter."
+  - "Role change is owner-only. The brief forbids an admin demoting an admin/owner
+     but is silent on promotion; letting an admin promote would let them mint a
+     peer admin and route around that rule."
+  - "join_mode column ships with no consumer (same treatment as is_official / D6)
+     so the P2 invite work needs no migration against a table with traffic."
+  - "member_epoch monotonicity is guaranteed by write discipline (only
+     member_epoch + 1, enforced by a source guard) rather than by the read-only
+     reconcile scan, which cannot observe it across pods."
+
+# Cannot be verified from here; must be checked before merge.
+open_verification:
+  - "Production collation of space / space_member / user: those tables were created
+     without COLLATE and inherit the server default. The new tables pin
+     utf8mb4_general_ci; if production defaults to utf8mb4_0900_ai_ci the reconcile
+     JOINs would hit MySQL error 1267."
+
+# Found while implementing, fixed here (details in verification.md):
+defects_found:
+  - "db.go admitMemberTx: ON DUPLICATE KEY UPDATE assignments evaluate left to right, so
+     `updated_at = IF(status = 0, ...)` placed after `status = 1` never fired and a
+     re-admitted member kept the updated_at from their removal. Reproduced both ways on
+     MySQL 8.0.33 before fixing; pinned by TestReactivationResetsRoleAndTimestamps."
+  - "gin's c.BindJSON calls AbortWithError(400) itself, writing the 400 header before the
+     handler responds. On the leave endpoint an empty body is the normal case, so every
+     ordinary leave got a 400 header with a 200 body. The module now uses ShouldBindJSON
+     throughout. Latent across the repo's other 221 c.BindJSON sites, invisible only
+     because ResponseErrorL also pins the wire status to 400 (D5) — not fixed here."

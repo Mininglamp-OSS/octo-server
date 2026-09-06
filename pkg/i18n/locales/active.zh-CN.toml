@@ -1425,3 +1425,62 @@ other = "通知暂停时间无效。"
 
 ["err.server.notification.pause.update_failed"]
 other = "更新通知暂停状态失败。"
+
+# ---- modules/project：Space 内项目协作层（P0：成员池） ----
+
+["err.server.project.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.project.name_invalid"]
+other = "项目名称不能为空，且不能超过长度上限。"
+
+["err.server.project.field_too_long"]
+other = "该字段超出长度上限。"
+
+["err.server.project.batch_too_large"]
+other = "单次请求的成员数量过多。"
+
+["err.server.project.role_invalid"]
+other = "项目成员角色无效。"
+
+["err.server.project.permission_denied"]
+other = "你没有权限执行此操作。"
+
+["err.server.project.not_member"]
+other = "你不是该项目的成员。"
+
+["err.server.project.disabled"]
+other = "项目功能已被管理员关闭。"
+
+["err.server.project.member_not_space_member"]
+other = "目标用户不是该空间的有效成员。"
+
+["err.server.project.quota_per_space"]
+other = "该空间的项目数量已达上限。"
+
+["err.server.project.quota_per_creator"]
+other = "你在该空间创建的项目数量已达上限。"
+
+["err.server.project.quota_members"]
+other = "该项目的成员数量已达上限。"
+
+["err.server.project.quota_daily_create"]
+other = "你今天创建的项目数量已达上限。"
+
+["err.server.project.not_found"]
+other = "项目不存在。"
+
+["err.server.project.member_not_found"]
+other = "项目成员不存在。"
+
+["err.server.project.name_duplicated"]
+other = "该空间内已存在同名项目。"
+
+["err.server.project.last_owner_must_transfer"]
+other = "请先转让拥有者身份，再退出或降级。"
+
+["err.server.project.query_failed"]
+other = "查询项目数据失败。"
+
+["err.server.project.store_failed"]
+other = "保存项目数据失败。"

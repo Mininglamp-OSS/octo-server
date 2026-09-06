@@ -753,6 +753,63 @@ other = "Failed to query analytics data."
 ["err.server.opanalytics.request_invalid"]
 other = "Invalid analytics request."
 
+["err.server.project.batch_too_large"]
+other = "Too many members in a single request."
+
+["err.server.project.disabled"]
+other = "The project feature has been disabled by the administrator."
+
+["err.server.project.field_too_long"]
+other = "The field exceeds the maximum allowed length."
+
+["err.server.project.last_owner_must_transfer"]
+other = "Transfer ownership before leaving or being demoted."
+
+["err.server.project.member_not_found"]
+other = "Project member not found."
+
+["err.server.project.member_not_space_member"]
+other = "The target user is not an active member of this space."
+
+["err.server.project.name_duplicated"]
+other = "A project with this name already exists in this space."
+
+["err.server.project.name_invalid"]
+other = "Project name is required and must not exceed the maximum length."
+
+["err.server.project.not_found"]
+other = "Project not found."
+
+["err.server.project.not_member"]
+other = "You are not a member of this project."
+
+["err.server.project.permission_denied"]
+other = "You do not have permission to perform this operation."
+
+["err.server.project.query_failed"]
+other = "Failed to query project data."
+
+["err.server.project.quota_daily_create"]
+other = "You have created too many projects today."
+
+["err.server.project.quota_members"]
+other = "This project has reached its member limit."
+
+["err.server.project.quota_per_creator"]
+other = "You have reached your project limit in this space."
+
+["err.server.project.quota_per_space"]
+other = "This space has reached its project limit."
+
+["err.server.project.request_invalid"]
+other = "Invalid request."
+
+["err.server.project.role_invalid"]
+other = "Invalid project member role."
+
+["err.server.project.store_failed"]
+other = "Failed to store project data."
+
 ["err.server.qrcode.group_not_found"]
 other = "Group not found."
 
