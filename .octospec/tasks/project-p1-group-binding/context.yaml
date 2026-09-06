@@ -1,0 +1,149 @@
+# octospec Implement-phase record for task project-p1-group-binding.
+#
+# Rule resolution: .octospec/_global/ is NOT synced in this worktree (no global
+# tier available), so every injected rule resolves to the repo tier.
+#
+# inject_when is a union of paths-glob and touches-tag (see _index.yaml).
+# The brief's tags are: space, isolation, acl, error-response, i18n, rate-limit,
+# wire-contract, testing, commit, migration. All six repo rules match.
+injected:
+  - id: space-isolation
+    source: repo
+    priority: 92
+    load_bearing: true
+    why: |
+      paths modules/**/*.go matches every file P1 touches; brief tags carry
+      space / isolation / acl. This is THE rule for P1: I2 is a Space-isolation
+      invariant one level down. Drives: the composite admission predicate
+      ("active Space member AND (project is '' OR active project member)")
+      evaluated INSIDE the admission transaction with a shared lock on the
+      project member row; the group-side Space check kept exactly as it is
+      (tightening it is out of scope, see brief); the create path validating
+      project_id against the group's space_id so a project from another Space
+      cannot own a group; thread admission left alone because it already gates
+      on ExistMemberActive against the parent group, so I2 reaches threads
+      transitively (C6).
+  - id: trust-boundary
+    source: repo
+    priority: 90
+    load_bearing: true
+    why: |
+      Matched by touches:wire-contract, not by paths — P1 adds no inbound
+      adapter, renders no markdown and emits no URL destinations, so the
+      escaping and adapter-parity clauses have no target. Two clauses do apply.
+      "Bound the payload": project_ids on the verify endpoint is capped at 50
+      (D11) and the admission batch keeps the existing 200 cap. And the
+      anti-enumeration shape of the verify response — a member:false item
+      carries only project_id and member, so "not a member", "no such project"
+      and "a project in another Space" are byte-identical on the wire.
+  - id: error-handling
+    source: repo
+    priority: 85
+    load_bearing: true
+    why: |
+      paths modules/**/*.go + pkg/errcode/**; brief tags error-response / i18n /
+      wire-contract. Drives: new codes in pkg/errcode/project.go and
+      pkg/errcode/group.go, httperr.ResponseErrorL everywhere, 5xx <=>
+      Internal=true, i18n-extract-check + i18n-lint gates, zh-CN translations,
+      and adding every new modules/group file to TestGroupNoLegacyResponseError's
+      fixed file list (it cannot see a new file on its own).
+  - id: rate-limit
+    source: repo
+    priority: 80
+    load_bearing: true
+    why: |
+      paths modules/**/*.go; brief tag rate-limit. P1 adds no new authenticated
+      route (the create parameter rides an existing one), so the rule's main
+      clause has no new mount point. It still binds two ways: the reconcile and
+      cascade workers are not HTTP paths and must not grow a Redis counter, and
+      /v1/auth/verify keeps its existing per-IP limiter unchanged (C9) — the
+      added project lookup must not become a reason to re-dimension it.
+  - id: testing
+    source: repo
+    priority: 70
+    load_bearing: false
+    why: |
+      paths **/*_test.go. Drives: testutil.NewTestServer + CleanAllTables,
+      explicit ratelimit:uid:* reset where a UID-limited route is hit, and the
+      non-regression rule that no EXISTING test file may be edited — an edited
+      assertion is a changed contract and has to be justified in the PR body.
+  - id: commit-style
+    source: repo
+    priority: 60
+    load_bearing: false
+    why: paths ** — English Conventional Commits; PR description in English.
+
+brief: .octospec/tasks/project-p1-group-binding/brief.md
+
+# Decisions taken by the requester during planning, each superseding the brief.
+scope_changes:
+  - id: single-pr
+    decision: |
+      The whole of P1 ships as ONE pull request. The brief plans PR-1 (schema,
+      predicate, single admission entry, guard, reconcile) / PR-2 (cascade, then
+      the create parameter) / PR-3 (the read contract) / optional PR-4.
+      Consequence, accepted by the requester: PR-1's "revertible independently"
+      property is gone — the write-path convergence, the cascade and the read
+      contract revert together or not at all. The brief's ordering constraint
+      ("no PR may leave a state where a project group can exist without a
+      cascade behind it") is satisfied trivially, since nothing intermediate
+      ships.
+  - id: group-creator-handover
+    decision: |
+      When the departing project member is a group's creator, the cascade
+      performs the group's NORMAL owner handover instead of stalling. This
+      supersedes brief D4's "blocks that group's detach, leaves removing = 1,
+      and raises the stall alert rather than force-transferring", and with it
+      the matching Acceptance line. Successor selection follows P0's precedent
+      for the Space cascade (the senior remaining member) narrowed by I2: the
+      successor must itself be an active member of the same project, because
+      handing the group to a non-project-member would break the invariant the
+      cascade exists to preserve.
+  - id: no-successor-detaches
+    decision: |
+      When a group has no remaining active project member to hand ownership to,
+      the group is detached to Space-direct (project_id = '') with its members
+      untouched — the same rule as project disband below, deliberately, so the
+      two situations are one rule rather than two. It is not disbanded: group
+      disband leaves group_member rows intact anyway, so it would destroy access
+      without cleaning anything up.
+  - id: disband-detaches-groups
+    decision: |
+      Disbanding a project reverts its groups to Space-direct with members
+      intact (the brief's option (a)), confirmed by the requester as a product
+      decision. Option (b) — disbanding the groups — destroys data and, because
+      group disband only flips group.status, would not even clean up
+      group_member. Two follow-ups recorded as product suggestions, both OUT OF
+      SCOPE here: the disband confirmation copy should state that the N groups
+      survive as ordinary groups, and if the product later wants "take the
+      groups away too" it should be an explicit opt-in named "archive", not the
+      default, because "disband" does not clean up what its name implies.
+  - id: collation-follows-repo
+    decision: |
+      P1 follows what the repo already does rather than waiting on the
+      database-wide conversion: new tables keep utf8mb4_general_ci, and every
+      reconcile JOIN that crosses into a legacy table (group, group_member)
+      carries an explicit COLLATE, as modules/message/db_reminders.go:113 and
+      modules/bot_api/resolve_targets.go:148,165 already do. Recorded because
+      P0's round-4 verification measured production at utf8mb4_0900_ai_ci on
+      user / space / space_member, so an implicit JOIN would hit MySQL 1267 in
+      production while passing in CI (CI creates the database with
+      utf8mb4_general_ci).
+
+# Assumptions taken where the brief left a choice; each reversible at one site.
+assumptions: []
+
+# Cannot be verified from here; must be checked before merge.
+open_verification:
+  - "Index build time for (space_id, project_id) on production-scale `group` row
+     counts (brief C4). ADD COLUMN ... NOT NULL DEFAULT '' is INSTANT on MySQL
+     8.0; the index is a separate online INPLACE statement and its duration has
+     to be measured, not asserted."
+  - "EXPLAIN before/after for queryGroupsWithMemberUIDAndSpaceID and
+     modules/bot_api/groups.go:51 — (space_id, project_id) is the first index to
+     serve space_id, so these two query plans change (C4)."
+  - "Whether the three org-directory event listeners are live in production
+     (brief D7): P1 converges them and adds a metric rather than deleting them.
+     Deleting becomes a separate change once production shows zero rows."
+
+defects_found: []
