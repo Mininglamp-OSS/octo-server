@@ -1484,3 +1484,6 @@ other = "查询项目数据失败。"
 
 ["err.server.project.store_failed"]
 other = "保存项目数据失败。"
+
+["err.server.group.project_member_required"]
+other = "只有该项目的成员才能被加入这个群聊。"

@@ -74,12 +74,6 @@ func (d *DB) DeleteMember(groupNo string, uid string, version int64) error {
 	return err
 }
 
-// 真实删除群成员
-func (d *DB) deleteMembersWithGroupNOTx(groupNo string, tx *dbr.Tx) error {
-	_, err := tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec()
-	return err
-}
-
 // 通过vercode查询某个群成员
 func (d *DB) queryMemberWithVercode(vercode string) (*MemberModel, error) {
 	var memberModel *MemberModel
@@ -259,18 +253,6 @@ func (d *DB) ExistMemberDelete(uid string, groupNo string) (bool, error) {
 	return count > 0, err
 }
 
-// UpdateMemberTx 更新成员信息
-func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
-	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
-		"remark":     member.Remark,
-		"role":       member.Role,
-		"version":    member.Version,
-		"is_deleted": member.IsDeleted,
-		"invite_uid": member.InviteUID,
-	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
-	return err
-}
-
 // recoverMemberTx 恢复成员信息
 //
 // 删除是软删（DeleteMemberTx 只置 is_deleted=1），整行连同各种权限位都留在表里，
@@ -307,6 +289,22 @@ func (d *DB) UpdateMember(member *MemberModel) error {
 		"invite_uid":           member.InviteUID,
 		"forbidden_expir_time": member.ForbiddenExpirTime,
 	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	return err
+}
+
+// updateMembersStatusTx 是 updateMembersStatus 的事务版。
+//
+// 解除拉黑（status 回到 Normal）是一条**准入路径**：它把 uid 放回活跃成员集合、
+// 重新订阅 IM 频道、重新挂回群内子区，却既不经过 InsertMemberTx 也不经过
+// recoverMemberTx。只装在那两个原语里的闸门会被它整条绕过。
+//
+// 所以这条路径必须能在事务内先过闸门再翻状态——闸门的共享锁只有在同一个事务里
+// 才有意义。会话版保留给拉黑方向（那是收回权限，不需要闸门）。
+func (d *DB) updateMembersStatusTx(tx *dbr.Tx, version int64, groupNo string, status int, uids []string) error {
+	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+		"status":  status,
+		"version": version,
+	}).Where("group_no=? and uid in ?", groupNo, uids).Exec()
 	return err
 }
 
@@ -738,6 +736,7 @@ type Model struct {
 	AllowMemberPinnedMessage int        // 是否允许群成员置顶消息
 	Category                 string     // 群分类
 	SpaceID                  string     // Space ID
+	ProjectID                string     // 所属项目ID；空串=直属 Space。非空即受不变量 I2 约束（见 admission.go）
 	IsExternalGroup          int        // 外部群 0.否 1.是（自动维护）
 	AllowExternal            int        // 是否允许外部成员加入 1.允许(默认) 0.禁止
 	AllowNoMention           int        // 群级是否允许免@生效 1.允许(默认) 0.禁止（bot 在本群必须被@）

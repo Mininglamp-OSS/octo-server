@@ -2,58 +2,17 @@
 
 -- P1 — bind groups to projects, and give the removal cascade somewhere to live.
 --
--- Three things land here:
---   1. `group.project_id`     — the attribution column invariant I2 is written against
---   2. `octo_project_member.removing` — the "seat closing" flag (D4)
---   3. `octo_project_member_removal_cleanup` — the project-side cascade outbox (D5)
+-- Two things land here, both Project-owned tables:
+--   1. `octo_project_member.removing` — the "seat closing" flag (D4)
+--   2. `octo_project_member_removal_cleanup` — the project-side cascade outbox (D5)
 --
--- The column lives in modules/project/sql rather than modules/group/sql on the
--- precedent that modules/space added `group.space_id` from its own directory
--- (20260307000004_space_legacy03.sql): the module that owns the concept owns the
--- column. Dropping this migration therefore removes the whole Project→Group
--- binding in one place.
+-- `group.project_id` deliberately does NOT live here. It is in
+-- modules/group/sql/20260906000001_group_project_binding.sql, and that file
+-- explains why: modules/group's test binary does not register modules/project,
+-- so a column modules/group reads and writes cannot ship from this directory.
 
 -- ---------------------------------------------------------------------------
--- 1. group.project_id
--- ---------------------------------------------------------------------------
---
--- NOT NULL DEFAULT '' — '' is the sentinel for "Space-direct", never NULL.
---
--- This deliberately diverges from `group.space_id`, which the space migration
--- added as a nullable `VARCHAR(40) DEFAULT ''`. Every predicate in this feature
--- is written `project_id != ''` / `project_id = ''` — in the admission gate, in
--- the source guard, and in both reconcile scans. A three-valued column turns
--- each of those into a bug waiting for the first NULL row: `NULL != ''` is NULL,
--- not TRUE, so a NULL-attributed group would silently fall out of the I2 scan
--- while still being a project group. NOT NULL makes that unrepresentable.
---
--- ADD COLUMN ... NOT NULL DEFAULT '' is INSTANT on MySQL 8.0 (no table rebuild,
--- no row rewrite), so this statement is O(1) regardless of `group`'s size.
-ALTER TABLE `group`
-  ADD COLUMN `project_id` VARCHAR(40) NOT NULL DEFAULT ''
-  COMMENT '所属项目ID；'' = 直属 Space（哨兵值，永不为 NULL）。I2/I3 的全部谓词都写作 project_id != '''' / = ''''';
-
--- The I2 reconcile scan is driven group-first — find project groups by
--- (space_id, project_id), then their members by group_no — because no index on
--- group_member leads with is_deleted, so a member-first scan would walk the
--- whole table.
---
--- ⚠️ NOT a no-op for existing queries. `group` has had exactly two indexes since
--- 2019 (group_groupNo UNIQUE(group_no), group_creator(creator)) and space_id is
--- in neither, so queries that already filter on space_id have had no index
--- behind them: db.go queryGroupsWithMemberUIDAndSpaceID and
--- modules/bot_api/groups.go:51. This index is the first to serve space_id, so
--- BOTH of those get new query plans. Expected to be faster; verified with
--- EXPLAIN before/after (brief C4).
---
--- Unlike the ADD COLUMN above this is a real index build: ALGORITHM=INPLACE,
--- online (concurrent DML permitted), but its DURATION is proportional to row
--- count and must be measured against production before rollout rather than
--- assumed from CI, where `group` is empty.
-CREATE INDEX `group_space_project` ON `group` (`space_id`, `project_id`);
-
--- ---------------------------------------------------------------------------
--- 2. octo_project_member.removing
+-- 1. octo_project_member.removing
 -- ---------------------------------------------------------------------------
 --
 -- D4 — the cascade closes the seat FIRST and detaches groups after.
@@ -95,7 +54,7 @@ ALTER TABLE `octo_project_member`
 CREATE INDEX `idx_octo_project_member_removing` ON `octo_project_member` (`removing`, `updated_at`);
 
 -- ---------------------------------------------------------------------------
--- 3. octo_project_member_removal_cleanup
+-- 2. octo_project_member_removal_cleanup
 -- ---------------------------------------------------------------------------
 --
 -- D5 — the project-side cascade is its OWN outbox, not another step on the
@@ -169,5 +128,3 @@ CREATE TABLE IF NOT EXISTS `octo_project_member_removal_cleanup` (
 DROP TABLE IF EXISTS `octo_project_member_removal_cleanup`;
 DROP INDEX `idx_octo_project_member_removing` ON `octo_project_member`;
 ALTER TABLE `octo_project_member` DROP COLUMN `removing`;
-DROP INDEX `group_space_project` ON `group`;
-ALTER TABLE `group` DROP COLUMN `project_id`;

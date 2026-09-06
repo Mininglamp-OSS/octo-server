@@ -1842,6 +1842,7 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 	 将成员信息存到数据库
 	**/
 	userBaseVos := make([]*config.UserBaseVo, 0, len(realMembers))
+	admissions := make([]MemberAdmission, 0, len(realMemberModels))
 	hasNewExternal := false
 	for _, realMember := range realMemberModels {
 		version, err := g.ctx.GenSeq(common.GroupMemberSeqKey)
@@ -1854,11 +1855,6 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			UID:  realMember.UID,
 			Name: realMember.Name,
 		})
-		existDelete, err := g.db.ExistMemberDelete(realMember.UID, groupNo)
-		if err != nil {
-			g.Error("查询是否存在删除成员失败！", zap.Error(err))
-			return nil, errors.New("查询是否存在删除成员失败！")
-		}
 		// 跨 Space 外部成员：写入 is_external=1 和 source_space_id（YUJ-53）。
 		isExt := 0
 		srcSpaceID := ""
@@ -1866,31 +1862,38 @@ func (g *Group) addMembersTxWithSpace(members []string, groupNo string, operator
 			isExt = 1
 			srcSpaceID = sourceSpaceMap[realMember.UID]
 		}
-		newMember := &MemberModel{
-			GroupNo:       groupNo,
-			InviteUID:     operator,
+		admissions = append(admissions, MemberAdmission{
 			UID:           realMember.UID,
-			Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 			Version:       version,
-			Status:        int(common.GroupMemberStatusNormal),
+			Role:          MemberRoleCommon,
+			InviteUID:     operator,
 			Robot:         realMember.Robot,
 			IsExternal:    isExt,
 			SourceSpaceID: srcSpaceID,
-		}
-		if existDelete {
-			err = g.db.recoverMemberTx(newMember, tx)
-		} else {
-			err = g.db.InsertMemberTx(newMember, tx)
-		}
-		if err != nil {
-			g.Error("添加群成员失败！", zap.Error(err))
-			return nil, errors.New("添加群成员失败！")
-		}
+		})
 		// is_external_group 只反映人类外部成员：bot 即便 is_external=1 也不应
 		// flip 群标记（与 DELETE 路径 robot=0 过滤对称）。
 		if isExt == 1 && realMember.Robot == 0 {
 			hasNewExternal = true
 		}
+	}
+	// 收口到唯一准入口（I2 / D3）。此前这里是「ExistMemberDelete 会话查询 →
+	// 分支 → InsertMemberTx / recoverMemberTx」，每个 uid 两次往返且带竞态；
+	// 现在整批一条 upsert，插入与恢复的列语义在 admission.go 里有实测记录。
+	//
+	// groupModel 在本函数前半段已按 groupNo 查出（外部成员判定要用它），
+	// 直接复用，不额外查一次。
+	var admitSpaceID, admitProjectID string
+	if groupModel != nil {
+		admitSpaceID, admitProjectID = groupModel.SpaceID, groupModel.ProjectID
+	}
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, admitSpaceID, admitProjectID,
+		admissions, AdmissionEntryInviteConfirm); err != nil {
+		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			return nil, err
+		}
+		return nil, errors.New("添加群成员失败！")
 	}
 
 	// 首次出现外部人类成员时，在事务内将群标记为外部群。
@@ -2626,14 +2629,11 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		}
 	}
 
-	memberModel := &MemberModel{
-		GroupNo:   groupNo,
+	scanAdmission := MemberAdmission{
 		UID:       scaner,
-		Role:      MemberRoleCommon,
 		Version:   version,
-		Status:    int(common.GroupMemberStatusNormal),
+		Role:      MemberRoleCommon,
 		InviteUID: generator,
-		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 		// 保留 scaner 的 robot 标记，与其它入群路径保持一致，
 		// 让 DELETE 路径的 QueryExternalMemberCountTx(robot=0) 能正确排除 bot。
 		Robot:         scanerInfo.Robot,
@@ -2673,21 +2673,16 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	existDelete, err := g.db.ExistMemberDelete(scaner, groupNo)
-	if err != nil {
-		tx.Rollback()
-		g.Error("查询是否存在删除成员失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	if existDelete {
-		err = g.db.recoverMemberTx(memberModel, tx)
-	} else {
-		err = g.db.InsertMemberTx(memberModel, tx)
-	}
-	if err != nil {
+	// 收口到唯一准入口（A5）。扫码入群是自助路径：扫码者自己决定加入，没有
+	// 任何管理员参与，所以它必须和被邀请入群受同一道闸门约束。
+	if err := g.db.admitOrRestoreMembersTx(tx, groupNo, group.SpaceID, group.ProjectID,
+		[]MemberAdmission{scanAdmission}, AdmissionEntryScanJoin); err != nil {
 		tx.Rollback()
 		g.Error("添加群成员失败！", zap.Error(err))
+		if errors.Is(err, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
@@ -3754,9 +3749,37 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	err = g.db.updateMembersStatus(version, groupNo, status, targetUIDs)
-	if err != nil {
-		g.Error("添加或移除群成员黑名单错误", zap.Error(err))
+	// A11 —— 解除拉黑是一条准入路径，必须过闸门。
+	//
+	// 它不碰 InsertMemberTx / recoverMemberTx，只把 status 翻回 Normal，然后
+	// 重新订阅 IM 频道（见下方 IMAddSubscriber）和群内子区。如果闸门只装在那两个
+	// 原语里，一个被移出项目的人只要曾经被拉黑过，就能被解除拉黑重新拿到项目群的
+	// 全部访问权——不经过任何准入检查。
+	//
+	// 拉黑方向（收回权限）不需要闸门，但两个方向共用同一个事务，免得后来的人
+	// 以为只有一条分支需要事务。
+	if txErr := func() error {
+		tx, beginErr := g.ctx.DB().Begin()
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.RollbackUnlessCommitted()
+		if status == int(common.GroupMemberStatusNormal) {
+			if gateErr := g.db.assertAdmissibleTx(tx, group.SpaceID, group.ProjectID,
+				targetUIDs, AdmissionEntryUnblacklist); gateErr != nil {
+				return gateErr
+			}
+		}
+		if updErr := g.db.updateMembersStatusTx(tx, version, groupNo, status, targetUIDs); updErr != nil {
+			return updErr
+		}
+		return tx.Commit()
+	}(); txErr != nil {
+		g.Error("添加或移除群成员黑名单错误", zap.Error(txErr))
+		if errors.Is(txErr, ErrAdmissionRefused) {
+			httperr.ResponseErrorL(c, errcode.ErrGroupProjectMemberRequired, nil, nil)
+			return
+		}
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
