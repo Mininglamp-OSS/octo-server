@@ -146,6 +146,17 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		search.DELETE("/:space_id/welcome", s.deleteWelcome)
 	}
 
+	// directory is a Space-scoped, cross-member read. space_id deliberately stays
+	// in the query string: SpaceMiddleware only reads query/header values, not
+	// path parameters. listDirectory also rejects an empty query value because
+	// the middleware intentionally passes through requests with no Space selector.
+	directory := r.Group("/v1/space",
+		s.ctx.AuthMiddleware(r),
+		appwkhttp.SharedUIDRateLimiter(r, s.ctx),
+		spacepkg.SpaceMiddleware(s.ctx),
+	)
+	directory.GET("/directory", s.listDirectory)
+
 	// 邀请码预览端点（公开无认证）严格 per-IP 限流：防枚举 + 暴破（issue #1000）。
 	// 两个端点共享同一 limiter，使同一 IP 跨端点总配额受控。
 	// 阈值与 user 模块 login 同档（10 req/min, burst 5），详见 PR #1090。

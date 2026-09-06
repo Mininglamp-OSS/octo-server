@@ -60,6 +60,24 @@ change-log convention (§7). Newest first.
 - **Known gap** — 每日创建配额的跨 Space 并发窄窗口（per-space / per-creator 两个硬配额已在
   space 行锁内计数，跨 Space 的 daily 维度未加锁）；生产 collation 待人工确认
   （legacy 表未写 COLLATE，若生产默认非 `utf8mb4_general_ci`，对账 JOIN 会撞 1267）。
+## 2026-09-06 (space-cloud-agents-by-owner)
+
+- **Implemented** — Added the authenticated, UID-rate-limited, Space-isolated
+  `GET /v1/space/directory` endpoint. It returns every active non-system human
+  in the selected Space with visible non-self-hosted user bots grouped by
+  owner, real per-owner counts, and a SQL-enforced 50-detail cap. See
+  [journal](journal/shared/space-cloud-agents-by-owner.md).
+- **Guarded** — The handler requires the query selector to preserve the public
+  contract, then uses the Space middleware's verified value; both database
+  reads share one cancellation/timeout budget and never produce partial data.
+  The test suite now covers zero / exactly 50 / 51 agents, hosting's two empty
+  states, inactive/orphan/system exclusions, friendship, request cancellation,
+  and auth/isolation behavior. An adversarial `>= 50` mutation fails the
+  exact-50 assertion.
+- **Learned** — `CREATE TABLE IF NOT EXISTS` is an existence check, not a test
+  fixture schema check. The manually provisioned robot fixture now recreates
+  its required shape; the reusable guidance is staged in
+  [learnings/pending/space-cloud-agents-by-owner.md](learnings/pending/space-cloud-agents-by-owner.md).
 
 ## 2026-09-04 (bot-agent-hosting · review round 4)
 

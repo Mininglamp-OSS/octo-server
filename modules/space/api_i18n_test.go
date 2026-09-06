@@ -26,6 +26,7 @@ func httperrL(c *wkhttp.Context, code codes.Code) {
 func TestSpaceNoLegacyResponseError(t *testing.T) {
 	files := []string{
 		"api.go",
+		"api_directory.go",
 		"api_member_search.go",
 		"api_welcome.go",
 		"api_manager.go",
