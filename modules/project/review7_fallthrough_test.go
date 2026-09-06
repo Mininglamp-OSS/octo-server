@@ -243,6 +243,8 @@ func TestLeaveIgnoresAnIrrelevantTransferTo(t *testing.T) {
 			"block it")
 	assert.Empty(t, successor, "and nobody was promoted")
 
+	// Two-phase removal (D4): drive the cascade before reading the end state.
+	drainRemovalCascade(t, p)
 	seat, qErr := p.db.queryMember(pid, "p24a")
 	require.NoError(t, qErr)
 	require.NotNil(t, seat)

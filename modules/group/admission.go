@@ -420,3 +420,38 @@ var legacyDirectoryListenerTotal = promauto.NewCounterVec(prometheus.CounterOpts
 func observeLegacyDirectoryListener(listener string) {
 	legacyDirectoryListenerTotal.WithLabelValues(listener).Inc()
 }
+
+// ---------------------------------------------------------------------------
+// Project cascade metrics
+// ---------------------------------------------------------------------------
+
+// Reasons a group left a project. Low-cardinality enum.
+const (
+	// detachReasonDisband — a human disbanded the project.
+	detachReasonDisband = "disband"
+	// detachReasonOwnerlessDisband — P0's Space cascade disbanded the project
+	// because it had no owner left. Distinguished from a human disband because
+	// it means nobody chose this, and a spike in it is worth looking at.
+	detachReasonOwnerlessDisband = "ownerless_disband"
+	// detachReasonNoSuccessor — a group's creator left the project and no
+	// remaining member of that group was still in the project, so the group fell
+	// back to Space-direct rather than being force-transferred or disbanded.
+	detachReasonNoSuccessor = "no_successor"
+)
+
+var projectGroupDetachedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: admissionMetricNamespace,
+	Name:      "project_detached_total",
+	Help:      "Groups reverted from a Project to Space-direct, by reason.",
+}, []string{"reason"})
+
+// projectGroupHandoverTotal counts ownership handovers performed by the cascade.
+//
+// Worth its own counter rather than a log line: it is the one place the system
+// changes who controls a group without anyone asking, and the product decision
+// to do that automatically is only defensible while the number stays small.
+var projectGroupHandoverTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: admissionMetricNamespace,
+	Name:      "project_cascade_handover_total",
+	Help:      "Group ownership handovers performed because the creator left the project.",
+})

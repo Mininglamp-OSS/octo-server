@@ -120,11 +120,16 @@ CREATE TABLE IF NOT EXISTS `octo_project_member_removal_cleanup` (
 
 -- +migrate Down
 --
--- ⚠️ Rolling this back DISCARDS PENDING CASCADE JOBS. Check the pending count
--- first — the same warning space_member_removal_cleanup's migration carries:
---   SELECT COUNT(*) FROM octo_project_member_removal_cleanup WHERE status = 0;
+-- WARNING: rolling this back DISCARDS PENDING CASCADE JOBS. Check the pending
+-- count first, the same warning the space_member_removal_cleanup migration
+-- carries: count rows in octo_project_member_removal_cleanup with status = 0.
 -- A discarded job means a member whose project seat is closed keeps their rows
--- in that project's groups, which the I2 reconcile scan will then report.
+-- in that project group set, which the I2 reconcile scan will then report.
+--
+-- No apostrophes and no semicolons in this comment on purpose: the module's
+-- migration test splits statements naively and treats a quote as a string
+-- delimiter, so a possessive apostrophe here makes it read the next semicolon
+-- as being inside a literal. It asserts that, and it caught this.
 DROP TABLE IF EXISTS `octo_project_member_removal_cleanup`;
 DROP INDEX `idx_octo_project_member_removing` ON `octo_project_member`;
 ALTER TABLE `octo_project_member` DROP COLUMN `removing`;

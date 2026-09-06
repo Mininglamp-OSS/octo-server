@@ -163,6 +163,8 @@ func TestLeaveRejectsMalformedBodyButAllowsEmpty(t *testing.T) {
 	w := doRaw(t, srv, http.MethodPost, "/v1/projects/"+created.ProjectID+"/leave",
 		tokens["member1"], "")
 	require.Equal(t, http.StatusOK, w.Code, "an empty body must still work: %s", w.Body.String())
+	// Two-phase removal (D4): leaving sets removing=1; the worker closes the seat.
+	drainRemovalCascade(t, p)
 	m, err := p.db.queryMember(created.ProjectID, "member1")
 	require.NoError(t, err)
 	assert.Equal(t, MemberStatusRemoved, m.Status)
@@ -243,6 +245,8 @@ func TestPartiallyAppliedBatchReportsWhatCommitted(t *testing.T) {
 		"targets the handler never reached must be distinguishable from refused ones")
 
 	// And the committed removal really is committed — which is why discarding it was wrong.
+	// Two-phase removal (D4): drive the cascade before reading the end state.
+	drainRemovalCascade(t, p)
 	m, err := p.db.queryMember(created.ProjectID, "t1")
 	require.NoError(t, err)
 	assert.Equal(t, MemberStatusRemoved, m.Status)

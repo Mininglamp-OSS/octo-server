@@ -61,6 +61,8 @@ func TestRemoveBatchReportsPartialWhenProjectDisbandsMidBatch(t *testing.T) {
 	assert.Equal(t, outcomeNotAttempted, outcomes[2].Reason)
 
 	// And the committed removal really is committed.
+	// Two-phase removal (D4): drive the cascade before reading the end state.
+	drainRemovalCascade(t, p)
 	m, err := p.db.queryMember(created.ProjectID, "r1")
 	require.NoError(t, err)
 	require.NotNil(t, m)
