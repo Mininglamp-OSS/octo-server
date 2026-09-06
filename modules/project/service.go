@@ -806,11 +806,25 @@ func (p *Project) addOneMemberOnce(projectID, spaceID, actorUID, uid string) (bo
 	if err != nil {
 		return false, err
 	}
-	if existing != nil && existing.Status == MemberStatusActive {
+	if existing != nil && existing.Status == MemberStatusActive && existing.Removing == 0 {
 		// Already a member: a no-op. Not an error — a batch add of a roster that
 		// partially overlaps must be idempotent — and specifically not an epoch bump.
 		return false, nil
 	}
+	// `existing.Removing == 1` deliberately does NOT take the branch above, and
+	// getting that wrong is silent.
+	//
+	// A seat being closed still has status = 1, so the plain status check treated
+	// a re-add during the removal window as "already a member" and returned a
+	// no-op — never reaching the upsert that clears `removing`, never cancelling
+	// the outbox job. The cascade then went ahead and removed a member an admin
+	// had just put back, and nothing reported it: the API said OK.
+	//
+	// D4's rule is that re-admission CANCELS an in-flight cascade, so this path
+	// has to run to completion for such a seat: the upsert clears removing, the
+	// job is retired, and the epoch moves again because the seat went from
+	// closing back to active, which is a membership change from every consumer's
+	// point of view.
 
 	count, err := p.db.countActiveMembersTx(tx, projectID)
 	if err != nil {
