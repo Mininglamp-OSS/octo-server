@@ -1144,3 +1144,136 @@ func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole
 	}
 	return roles[0] != MemberRoleCreator, nil
 }
+
+// ---------------------------------------------------------------------------
+// Project binding (P1)
+// ---------------------------------------------------------------------------
+
+// queryProjectGroupNos returns every group attributed to a project.
+//
+// Driven off the new (space_id, project_id) index. space_id is included in the
+// predicate rather than trusted from project_id alone because it is the index's
+// leading column — without it the index cannot be used at all.
+func (d *DB) queryProjectGroupNos(spaceID, projectID string) ([]string, error) {
+	if spaceID == "" || projectID == "" {
+		return nil, nil
+	}
+	var groupNos []string
+	_, err := d.session.SelectBySql(
+		"SELECT group_no FROM `group` WHERE space_id = ? AND project_id = ?",
+		spaceID, projectID,
+	).Load(&groupNos)
+	return groupNos, err
+}
+
+// queryProjectGroupNosWithActiveMember returns the project's groups that uid is
+// an active member of.
+//
+// The COLLATE on the join column is NOT optional and NOT cosmetic. `group` was
+// created in 2019 with no explicit CHARSET/COLLATE and inherits the server
+// default; `octo_project*` pin utf8mb4_general_ci. P0's round-4 verification
+// MEASURED production and found user / space / space_member at
+// utf8mb4_0900_ai_ci — an artefact of a mysqldump import, since mysqldump omits
+// COLLATE for tables whose collation equalled the source default. So an implicit
+// join here is MySQL error 1267 in production while passing in CI, because CI
+// creates its database with an explicit utf8mb4_general_ci. Two other places in
+// this tree already carry the same workaround
+// (modules/message/db_reminders.go:113, modules/bot_api/resolve_targets.go:148).
+func (d *DB) queryProjectGroupNosWithActiveMember(spaceID, projectID, uid string) ([]string, error) {
+	if spaceID == "" || projectID == "" || uid == "" {
+		return nil, nil
+	}
+	var groupNos []string
+	_, err := d.session.SelectBySql(
+		"SELECT g.group_no FROM `group` g "+
+			"INNER JOIN group_member gm ON gm.group_no = g.group_no COLLATE utf8mb4_general_ci "+
+			"WHERE g.space_id = ? AND g.project_id = ? AND gm.uid = ? AND gm.is_deleted = 0",
+		spaceID, projectID, uid,
+	).Load(&groupNos)
+	return groupNos, err
+}
+
+// queryGroupCreatorTx reads a group's creator role holder under the caller's
+// transaction. Empty string means the group currently has no creator row, which
+// happens after a creator was removed by some path that did not transfer first.
+func (d *DB) queryGroupCreatorTx(tx *dbr.Tx, groupNo string) (string, error) {
+	var uids []string
+	_, err := tx.SelectBySql(
+		"SELECT uid FROM group_member "+
+			"WHERE group_no = ? AND role = ? AND is_deleted = 0 LIMIT 1 FOR UPDATE",
+		groupNo, MemberRoleCreator,
+	).Load(&uids)
+	if err != nil {
+		return "", err
+	}
+	if len(uids) == 0 {
+		return "", nil
+	}
+	return uids[0], nil
+}
+
+// querySuccessorForProjectGroupTx picks who should own a project group when its
+// creator is leaving the project.
+//
+// Seniority, narrowed by I2. The candidate must be:
+//
+//   - an active, non-deleted, non-blacklisted member of the group;
+//   - not the departing uid, not external, not a robot;
+//   - an ACTIVE member of the same project, with removing = 0.
+//
+// The project constraint is the part that is easy to leave out and expensive to
+// leave out: handing a project group to someone who is not in the project makes
+// the new owner an I2 violation, created by the very cascade whose job is to
+// preserve I2.
+//
+// Ordering is managers before ordinary members, then oldest membership first —
+// "senior" in the same sense P0's Space cascade uses when it hands a project to
+// the senior remaining member.
+//
+// Returns "" when there is no candidate. The caller then detaches the group to
+// Space-direct rather than inventing an owner.
+func (d *DB) querySuccessorForProjectGroupTx(tx *dbr.Tx, groupNo, projectID, departingUID string) (string, error) {
+	var uids []string
+	_, err := tx.SelectBySql(
+		"SELECT gm.uid FROM group_member gm "+
+			"INNER JOIN `octo_project_member` pm "+
+			"  ON pm.uid = gm.uid COLLATE utf8mb4_general_ci "+
+			"WHERE gm.group_no = ? AND gm.is_deleted = 0 AND gm.status = ? "+
+			"  AND gm.uid <> ? AND gm.is_external = 0 AND gm.robot = 0 "+
+			"  AND pm.project_id = ? AND pm.status = 1 AND pm.removing = 0 "+
+			"ORDER BY gm.role = ? DESC, gm.created_at ASC, gm.uid ASC LIMIT 1",
+		groupNo, int(common.GroupMemberStatusNormal), departingUID,
+		projectID, MemberRoleManager,
+	).Load(&uids)
+	if err != nil {
+		return "", err
+	}
+	if len(uids) == 0 {
+		return "", nil
+	}
+	return uids[0], nil
+}
+
+// detachGroupFromProjectTx reverts one group to Space-direct.
+//
+// Guarded on the current project_id so it is idempotent and cannot detach a
+// group that has since been attached elsewhere — though I3 makes that
+// impossible today, the guard costs nothing and removes the assumption.
+//
+// This and the create path are the ONLY writes of group.project_id in the tree;
+// TestNoProjectIDRewritesOutsideTheDetachStep enforces that.
+func (d *DB) detachGroupFromProjectTx(tx *dbr.Tx, groupNo, projectID string, version int64) (bool, error) {
+	res, err := tx.Update("group").
+		Set("project_id", "").
+		Set("version", version).
+		Where("group_no=? and project_id=?", groupNo, projectID).
+		Exec()
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}

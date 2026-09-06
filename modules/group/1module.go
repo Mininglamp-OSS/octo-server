@@ -44,6 +44,10 @@ func init() {
 		// 唯一准入口，而 modules/space 不能 import 本模块。原先它自己裸写
 		// group_member，四个缺陷记在 modules/space/preset_group_admitter.go。
 		api.registerPresetGroupAdmitter()
+		// 项目侧级联：成员被移出项目 → 退出该项目所有群（必要时先做群主交接）；
+		// 项目解散 → 群回落 Space 直属。同样是反向注册，modules/project 不能
+		// import 本模块。
+		api.registerProjectCascadeSteps()
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

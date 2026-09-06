@@ -140,6 +140,10 @@ func New(ctx *config.Context) *Project {
 // note added to that package's census.
 func (p *Project) Route(r *wkhttp.WKHttp) {
 	p.startReconcileWorker()
+	// 项目侧成员移除级联 worker（D5）。与 Space 那条清理工单各自独立：键不同、
+	// 扇出规模不同，且 Space 的步骤契约规定「任一步骤报错整单重跑」——挂在一起会
+	// 让项目侧的失败去重跑 Space 侧已成功的步骤。
+	p.startRemovalWorker()
 
 	spaceScoped := r.Group("/v1/space",
 		p.ctx.AuthMiddleware(r),

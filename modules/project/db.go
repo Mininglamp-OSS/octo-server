@@ -261,7 +261,7 @@ func (d *DB) listVisibleInSpace(spaceID, uid string, offset, limit int) ([]*list
 			"p.created_at, p.updated_at, "+
 			"IFNULL(pm.role, ?) AS my_role, "+
 			"(SELECT COUNT(*) FROM `octo_project_member` mc "+
-			"  WHERE mc.project_id = p.project_id AND mc.status = 1) AS member_count "+
+			"  WHERE mc.project_id = p.project_id AND mc.status = 1 AND mc.removing = 0) AS member_count "+
 			"FROM `octo_project` p "+
 			"LEFT JOIN `octo_project_member` pm "+
 			"  ON pm.project_id = p.project_id AND pm.uid = ? AND pm.status = 1 "+
@@ -287,7 +287,8 @@ type listRow struct {
 func (d *DB) countActiveMembers(projectID string) (int, error) {
 	var count int
 	err := d.session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ?",
+		"SELECT COUNT(*) FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = ? AND removing = 0",
 		projectID, MemberStatusActive,
 	).LoadOne(&count)
 	if err != nil {
@@ -304,7 +305,8 @@ func (d *DB) countActiveMembers(projectID string) (int, error) {
 func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 	var count int
 	err := tx.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE project_id = ? AND status = ? FOR SHARE",
+		"SELECT COUNT(*) FROM `octo_project_member` "+
+			"WHERE project_id = ? AND status = ? AND removing = 0 FOR SHARE",
 		projectID, MemberStatusActive,
 	).LoadOne(&count)
 	if err != nil {
@@ -490,7 +492,7 @@ func (d *DB) checkSpaceSeatForCleanupTx(tx *dbr.Tx, spaceID, uid string) (bool, 
 func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := d.session.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? LIMIT 1",
 		projectID, uid,
 	).Load(&rows)
@@ -510,7 +512,7 @@ func (d *DB) queryMember(projectID, uid string) (*MemberModel, error) {
 func (d *DB) queryMemberTx(tx *dbr.Tx, projectID, uid string) (*MemberModel, error) {
 	var rows []*MemberModel
 	_, err := tx.SelectBySql(
-		"SELECT project_id, uid, space_id, role, status, invite_uid, created_at, updated_at "+
+		"SELECT project_id, uid, space_id, role, status, removing, invite_uid, created_at, updated_at "+
 			"FROM `octo_project_member` WHERE project_id = ? AND uid = ? FOR UPDATE",
 		projectID, uid,
 	).Load(&rows)
@@ -553,9 +555,18 @@ func (d *DB) admitMemberTx(tx *dbr.Tx, m *MemberModel) (bool, error) {
 			// -- reads of the OLD status must all precede `status = 1` --
 			"  role = IF(status = 0, VALUES(role), role), "+
 			"  invite_uid = IF(status = 0, VALUES(invite_uid), invite_uid), "+
-			"  updated_at = IF(status = 0, VALUES(updated_at), updated_at), "+
+			"  updated_at = IF(status = 0 OR removing = 1, VALUES(updated_at), updated_at), "+
 			// -- from here on `status` reads as 1 --
 			"  space_id = VALUES(space_id), "+
+			// D4 — re-admission CANCELS an in-flight cascade rather than being
+			// rejected. Clearing `removing` here is the cancellation: the worker
+			// re-reads this row under lock before each batch and stops when it
+			// finds 0. Rejecting instead would make an unrelated admin action fail
+			// for as long as the cascade takes, and a cascade can legitimately run
+			// long. The caller must also mark the outstanding job cancelled — see
+			// cancelPendingRemovalJobsTx — so the queue does not keep a row that
+			// will never do anything.
+			"  removing = 0, "+
 			"  status = 1",
 		m.ProjectID, m.UID, m.SpaceID, m.Role, MemberStatusActive, m.InviteUID,
 		m.CreatedAt, m.UpdatedAt,
@@ -633,7 +644,7 @@ func (d *DB) countActiveOwnersTx(tx *dbr.Tx, projectID string) (int, error) {
 	var count int
 	err := tx.SelectBySql(
 		"SELECT COUNT(*) FROM `octo_project_member` "+
-			"WHERE project_id = ? AND status = ? AND role = ? FOR SHARE",
+			"WHERE project_id = ? AND status = ? AND role = ? AND removing = 0 FOR SHARE",
 		projectID, MemberStatusActive, RoleOwner,
 	).LoadOne(&count)
 	if err != nil {
@@ -654,7 +665,7 @@ func (d *DB) listMembers(projectID string, offset, limit int) ([]*memberRosterMo
 			"pm.created_at, pm.updated_at, IFNULL(u.name, '') AS name "+
 			"FROM `octo_project_member` pm "+
 			"LEFT JOIN `user` u ON u.uid = pm.uid "+
-			"WHERE pm.project_id = ? AND pm.status = ? "+
+			"WHERE pm.project_id = ? AND pm.status = ? AND pm.removing = 0 "+
 			"ORDER BY pm.role DESC, pm.created_at ASC LIMIT ? OFFSET ?",
 		projectID, MemberStatusActive, limit, offset,
 	).Load(&rows)
@@ -672,7 +683,7 @@ func (d *DB) queryActiveProjectIDsForSpaceMember(spaceID, uid string, limit int)
 	var ids []string
 	_, err := d.session.SelectBySql(
 		"SELECT project_id FROM `octo_project_member` "+
-			"WHERE space_id = ? AND uid = ? AND status = ? "+
+			"WHERE space_id = ? AND uid = ? AND status = ? AND removing = 0 "+
 			"ORDER BY project_id LIMIT ?",
 		spaceID, uid, MemberStatusActive, limit,
 	).Load(&ids)

@@ -339,6 +339,10 @@ func TestLastOwnerMustTransferBeforeLeavingOrBeingDemoted(t *testing.T) {
 	assert.Equal(t, RoleOwner, successor.Role)
 	assert.Equal(t, MemberStatusActive, successor.Status)
 
+	// Removal is two-phase since P1 (D4): the request sets removing=1 and the
+	// worker closes the seat. Drive the cascade, then assert the same end state
+	// this case always asserted.
+	drainRemovalCascade(t, p)
 	former, err := p.db.queryMember(created.ProjectID, "owner1")
 	require.NoError(t, err)
 	require.NotNil(t, former)
@@ -459,6 +463,8 @@ func TestReactivationResetsRoleAndTimestamps(t *testing.T) {
 		ownerTok, map[string]any{"uids": []string{"m1"}})
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
+	// Two-phase removal (D4): drive the cascade before reading the end state.
+	drainRemovalCascade(t, p)
 	removed, err := p.db.queryMember(created.ProjectID, "m1")
 	require.NoError(t, err)
 	require.NotNil(t, removed)
