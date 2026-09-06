@@ -221,7 +221,10 @@ func (p *Project) respondCreateError(c *wkhttp.Context, err error, spaceID, uid 
 		// before this fix the constant was declared and never emitted, so a create that
 		// violated I1 produced no metric at all.
 		observeRejected(entryCreateOwner, reasonNotSpaceMember)
-		httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotSpaceMember, nil, nil)
+		// Actor-level: this is the CREATOR's own seat, so it takes the actor-level code.
+		// It used to answer with the target-level one, whose message blames "the target
+		// user" — there is no target on this endpoint.
+		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 	case errors.Is(err, errNameDuplicated):
 		observeRejected(entryProjectCreate, reasonNameDuplicated)
 		httperr.ResponseErrorL(c, errcode.ErrProjectNameDuplicated, nil, nil)

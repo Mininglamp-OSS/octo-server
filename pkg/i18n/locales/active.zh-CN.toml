@@ -1452,6 +1452,9 @@ other = "你不是该项目的成员。"
 ["err.server.project.disabled"]
 other = "项目功能已被管理员关闭。"
 
+["err.server.project.actor_not_space_member"]
+other = "你已不是该空间的有效成员。"
+
 ["err.server.project.member_not_space_member"]
 other = "目标用户不是该空间的有效成员。"
 

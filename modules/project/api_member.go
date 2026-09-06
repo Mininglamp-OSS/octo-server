@@ -125,10 +125,11 @@ func (p *Project) addMembersHandler(c *wkhttp.Context) {
 				case errors.Is(res.Err, errProjectGone):
 					respondProjectNotFound(c)
 				case errors.Is(res.Err, errActorNotSpaceMember):
-					// NOT permission_denied: the caller's project role is intact, their SPACE
-					// seat is not. Sending them to check their project role would point them
-					// at the wrong thing.
-					httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotSpaceMember, nil, nil)
+					// NOT permission_denied, and NOT the target-level not_space_member code:
+					// the caller's project role is intact, their SPACE seat is not, and the
+					// target-level message names "the target user" — both would point them at
+					// something that is not what failed.
+					httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 				default:
 					httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 				}
@@ -217,7 +218,7 @@ func (p *Project) removeMembersHandler(c *wkhttp.Context) {
 			observeRejected(entryMemberRemove, reason)
 			if !anyApplied(outcomes) {
 				if actorSeatGone {
-					httperr.ResponseErrorL(c, errcode.ErrProjectMemberNotSpaceMember, nil, nil)
+					httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
 				} else {
 					httperr.ResponseErrorL(c, errcode.ErrProjectPermissionDenied, nil, nil)
 				}

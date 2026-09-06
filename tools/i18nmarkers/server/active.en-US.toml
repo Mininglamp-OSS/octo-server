@@ -753,6 +753,9 @@ other = "Failed to query analytics data."
 ["err.server.opanalytics.request_invalid"]
 other = "Invalid analytics request."
 
+["err.server.project.actor_not_space_member"]
+other = "You are no longer an active member of this space."
+
 ["err.server.project.batch_too_large"]
 other = "Too many members in a single request."
 

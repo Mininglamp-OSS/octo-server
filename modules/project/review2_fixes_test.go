@@ -34,7 +34,10 @@ func TestCreateChecksCreatorSpaceSeatInsideTransaction(t *testing.T) {
 
 	w = doJSON(t, srv, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 		map[string]any{"name": "should-not-exist"})
-	assertProjectErrorCode(t, w, "err.server.project.member_not_space_member")
+	// The ACTOR-level code: on this endpoint the seat that closed is the CALLER's, and there
+	// is no target at all. This assertion used to pin the target-level code, whose message
+	// blames "the target user" — the misdirection PR #841 round 2 asked to remove.
+	assertProjectErrorCode(t, w, "err.server.project.actor_not_space_member")
 
 	var n int
 	require.NoError(t, testCtx.DB().SelectBySql(

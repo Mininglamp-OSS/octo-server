@@ -88,13 +88,28 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The project feature has been disabled by the administrator.",
 	})
-	// ErrProjectMemberNotSpaceMember is the I1 rejection: the target uid is not
+	// ErrProjectMemberNotSpaceMember is the I1 rejection: the TARGET uid is not
 	// an active member of the project's Space. Checked inside the request
 	// transaction, so a non-member can never be admitted.
 	ErrProjectMemberNotSpaceMember = register(codes.Code{
 		ID:             "err.server.project.member_not_space_member",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The target user is not an active member of this space.",
+	})
+	// ErrProjectActorNotSpaceMember is the same rejection about the CALLER: their own
+	// Space seat is gone (removed, or the Space went inactive), while their project seat
+	// is still open because the Space-removal cascade is asynchronous.
+	//
+	// Separate from the target-level code above because the two ask the client to do
+	// opposite things, and the message is the whole point: reusing the target-level code
+	// told a caller whose own seat had closed that "the target user" was at fault, which
+	// is exactly the misdirection this classification was added to remove (PR #841 round 2,
+	// Jerry-Xin N-1). The create path was already reporting the creator's own missing seat
+	// through the target-level code; it now uses this one.
+	ErrProjectActorNotSpaceMember = register(codes.Code{
+		ID:             "err.server.project.actor_not_space_member",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You are no longer an active member of this space.",
 	})
 
 	// ---- quotas (403) --------------------------------------------------------

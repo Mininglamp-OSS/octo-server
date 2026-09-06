@@ -12,8 +12,12 @@ package project
 // Each test below fails on the pre-fix tree for the stated reason, not incidentally.
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,4 +147,225 @@ func TestCreateProjectDoesNotDeadlockAgainstTheSpaceDisbandLockOrder(t *testing.
 		"createProject must not deadlock against the Space-disband lock order: %v", got.err)
 	assert.ErrorIs(t, got.err, errNotSpaceMember,
 		"with the Space disbanded first, create must refuse cleanly rather than fail on a lock: %v", got.err)
+}
+
+// ---------- N-1: the wire classification B-1 made reachable ----------
+
+// withAddSeam swaps the add seam so every target before failOn is admitted for real.
+func withAddSeamOn(t *testing.T, p *Project, failOn string, inject error, calls *int) {
+	t.Helper()
+	orig := p.addOneFn
+	p.addOneFn = func(projectID, spaceID, actorUID, uid string) (bool, error) {
+		*calls++
+		if uid == failOn {
+			return false, inject
+		}
+		return orig(projectID, spaceID, actorUID, uid)
+	}
+	t.Cleanup(func() { p.addOneFn = orig })
+}
+
+// TestActorLevelSpaceSeatLossStopsTheAddBatchAndIsNamedCorrectly covers the classification
+// Jerry-Xin asked to land with B-1: before it, an actor whose Space seat closed mid-batch fell
+// to the default arm, so their own expired standing was reported per uid as "store_failed"
+// while the loop kept opening one doomed transaction for every remaining target.
+func TestActorLevelSpaceSeatLossStopsTheAddBatchAndIsNamedCorrectly(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	for _, uid := range []string{"a1", "a2", "a3"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+	r := mountProject(t, p)
+
+	calls := 0
+	withAddSeamOn(t, p, "a2", errActorNotSpaceMember, &calls)
+
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"uids": []string{"a1", "a2", "a3"}})
+	require.Equal(t, http.StatusOK, w.Code,
+		"a1 committed, so the honest answer is a per-target report: %s", w.Body.String())
+
+	var outcomes []memberOutcome
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
+	require.Len(t, outcomes, 3, "every uid must be accounted for: %s", w.Body.String())
+	assert.True(t, outcomes[0].OK, "a1 was admitted before the actor's seat closed")
+	assert.Equal(t, reasonNotSpaceMember, outcomes[1].Reason,
+		"the actor's own missing Space seat must not be reported as store_failed")
+	assert.Equal(t, outcomeNotAttempted, outcomes[2].Reason,
+		"the tail really was never attempted")
+	assert.Equal(t, 2, calls,
+		"the batch must STOP at the actor-level failure, not open a transaction per remaining uid")
+}
+
+// TestActorLevelSpaceSeatLossWithNothingCommittedIsOneStatusCode pins the other half of the
+// contract: with nothing committed, a single status code is the honest answer — and it must
+// name the Space seat, not the project role. Sending the caller to check their project role
+// would point them at the one thing that is still intact.
+func TestActorLevelSpaceSeatLossWithNothingCommittedIsOneStatusCode(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	seedUser(t, "b1")
+	seedSpaceMember(t, spaceA, "b1", 0, 1)
+	r := mountProject(t, p)
+
+	calls := 0
+	withAddSeamOn(t, p, "b1", errActorNotSpaceMember, &calls)
+
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"uids": []string{"b1"}})
+	assertProjectErrorCode(t, w, "err.server.project.actor_not_space_member")
+	assert.Equal(t, 1, calls, "the batch must not continue past an actor-level refusal")
+}
+
+// TestActorLevelSpaceSeatLossOnRemoveIsClassifiedToo covers the same classification on the
+// removal endpoint, which drives its loop in the HANDLER rather than the service — so it had
+// the defect in its own shape: the default arm both mislabelled the refusal and kept the loop
+// running.
+func TestActorLevelSpaceSeatLossOnRemoveIsClassifiedToo(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv, "d1", "d2", "d3")
+	r := mountProject(t, p)
+
+	// Nothing committed: one status code, naming the Space seat.
+	calls := 0
+	withRemoveSeam(t, p, "d1", errActorNotSpaceMember, &calls)
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
+		ownerTok, map[string]any{"uids": []string{"d1", "d2", "d3"}})
+	assertProjectErrorCode(t, w, "err.server.project.actor_not_space_member")
+	assert.Equal(t, 1, calls,
+		"the handler must stop at the actor-level refusal, not run the remaining targets")
+}
+
+// TestActorLevelSpaceSeatLossOnRemoveReportsWhatCommitted is the partial-commit half on the
+// removal endpoint.
+func TestActorLevelSpaceSeatLossOnRemoveReportsWhatCommitted(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv, "e1", "e2", "e3")
+	r := mountProject(t, p)
+
+	calls := 0
+	withRemoveSeam(t, p, "e2", errActorNotSpaceMember, &calls)
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/remove",
+		ownerTok, map[string]any{"uids": []string{"e1", "e2", "e3"}})
+	require.Equal(t, http.StatusOK, w.Code,
+		"e1 committed, so the report must say so: %s", w.Body.String())
+
+	var outcomes []memberOutcome
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
+	require.Len(t, outcomes, 3, "body: %s", w.Body.String())
+	assert.True(t, outcomes[0].OK, "e1's removal committed")
+	assert.Equal(t, reasonNotSpaceMember, outcomes[1].Reason)
+	assert.Equal(t, outcomeNotAttempted, outcomes[2].Reason)
+	assert.Equal(t, 2, calls, "the handler must stop rather than run e3")
+}
+
+// TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch is the switch-order guard.
+//
+// errActorNotSpaceMember WRAPS errNotSpaceMember, so a `case errors.Is(err, errNotSpaceMember)`
+// arm placed above the actor arm would swallow the actor-level refusal — and, read the other
+// way, an actor arm written too broadly would stop the batch on an ordinary rejected uid. This
+// pins the target-level direction: one uid without a Space seat is one rejected uid, and the
+// rest of the batch still runs.
+func TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch(t *testing.T) {
+	srv, p := setup(t)
+	ownerTok, _, created := projectWithMembers(t, srv)
+	for _, uid := range []string{"c1", "c2"} {
+		seedUser(t, uid)
+		seedSpaceMember(t, spaceA, uid, 0, 1)
+	}
+	// c1 has no Space seat at all — a genuine TARGET-level refusal, no seam needed.
+	seedUser(t, "c0")
+	r := mountProject(t, p)
+
+	w := doOn(t, r, http.MethodPost, "/v1/projects/"+created.ProjectID+"/members/add",
+		ownerTok, map[string]any{"uids": []string{"c0", "c1", "c2"}})
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var outcomes []memberOutcome
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &outcomes), "body: %s", w.Body.String())
+	require.Len(t, outcomes, 3, "the batch must have continued past the rejected uid: %s", w.Body.String())
+	assert.Equal(t, reasonNotSpaceMember, outcomes[0].Reason, "c0 holds no Space seat")
+	assert.True(t, outcomes[1].OK, "c1 must still have been admitted")
+	assert.True(t, outcomes[2].OK, "c2 must still have been admitted")
+	assert.NotEqual(t, outcomeNotAttempted, outcomes[2].Reason,
+		"a target-level refusal must not label the rest of the batch not_attempted")
+}
+
+// ---------- the read-view trap ----------
+
+// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin is a source guard for a defect that is
+// invisible at the call site and silent at runtime.
+//
+// checkSpaceMembershipForWriteTx JOINs `space`. A table outside a `FOR SHARE OF` list is read
+// as a CONSISTENT read, and a consistent read OPENS the transaction's read view — so using
+// that helper as createProject's first statement freezes the snapshot before the `space` row
+// lock, and all three creation quotas are then counted against it. Six concurrent creates
+// passed MaxPerSpace=1 that way, and nothing about the call site hints at it.
+//
+// The concurrency acceptance tests catch the consequence. This guard names the cause, because
+// the obvious future "cleanup" — collapsing the two helpers into one — reintroduces it.
+// readLinesWithoutComments returns name's source with comment text removed but the LINE
+// structure intact.
+//
+// stripComments (api_i18n_test.go) collapses the whole file onto one line, which is right for
+// "does this token appear anywhere" guards and useless for slicing one function out. And the
+// comments must go: this file's own prose names the helper the guard forbids, so a raw read
+// would match the warning rather than the code.
+func readLinesWithoutComments(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Clean(name))
+	require.NoError(t, err, "read %s", name)
+	var b strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// funcBody returns the source of the function whose signature starts with sig, up to the next
+// top-level func.
+func funcBody(t *testing.T, src, sig string) string {
+	t.Helper()
+	start := strings.Index(src, sig)
+	require.GreaterOrEqual(t, start, 0, "%s must exist", sig)
+	rest := src[start+len(sig):]
+	if end := strings.Index(rest, "\nfunc "); end >= 0 {
+		return src[start : start+len(sig)+end]
+	}
+	return src[start:]
+}
+
+// TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin is a source guard for a defect that is
+// invisible at the call site and silent at runtime.
+//
+// checkSpaceMembershipForWriteTx JOINs `space`. A table outside a `FOR SHARE OF` list is read
+// as a CONSISTENT read, and a consistent read OPENS the transaction's read view — so using
+// that helper as createProject's first statement freezes the snapshot before the `space` row
+// lock, and all three creation quotas are then counted against it. Six concurrent creates
+// passed MaxPerSpace=1 that way, and nothing about the call site hints at it.
+//
+// The concurrency acceptance tests catch the consequence. This guard names the cause, because
+// the obvious future "cleanup" — collapsing the two helpers into one — reintroduces it.
+func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
+	fn := funcBody(t, readLinesWithoutComments(t, "service.go"),
+		"func (p *Project) createProject(")
+	assert.Contains(t, fn, "lockSpaceSeatRowTx",
+		"createProject must take the JOIN-free seat lock")
+	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
+		"createProject must NOT use the JOINing helper: the JOIN opens the read view before "+
+			"the `space` lock and every creation quota is then counted from a stale snapshot")
+
+	// The JOIN-free helper must stay JOIN-free.
+	helper := funcBody(t, readLinesWithoutComments(t, "db.go"),
+		"func (d *DB) lockSpaceSeatRowTx(")
+	assert.NotContains(t, strings.ToUpper(helper), "JOIN",
+		"lockSpaceSeatRowTx must not grow a JOIN: that is exactly what opens the read view")
+	assert.Contains(t, helper, "FOR SHARE",
+		"the seat check must still be a LOCKING read, or a concurrent Space removal can "+
+			"commit between it and the insert")
 }
