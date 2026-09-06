@@ -86,18 +86,24 @@ func TestConcurrentCreatesCannotExceedPerSpaceQuota(t *testing.T) {
 
 	p.cfg.MaxPerSpace = 1
 
+	// A start barrier: without it goroutine 0 could commit before goroutine 5 begins, the
+	// losers would be rejected by the COUNT alone with no contention on the space row, and
+	// deleting the FOR UPDATE would not turn this test red (yujiawei Q9).
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	errs := make([]error, len(uids))
 	for i, uid := range uids {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
+			<-start
 			_, errs[i] = p.createProject(createInput{
 				SpaceID: spaceA, Creator: uid, Name: "race-" + string(rune('a'+i)),
 				Discoverability: DiscoverabilitySpaceListed,
 			})
 		}(i, uid)
 	}
+	close(start)
 	wg.Wait()
 
 	var created int
@@ -127,18 +133,31 @@ func TestConcurrentCreatesCannotExceedPerCreatorQuota(t *testing.T) {
 
 	p.cfg.MaxPerCreator, p.cfg.MaxPerSpace = 2, 100
 
+	start := make(chan struct{})
 	var wg sync.WaitGroup
+	errs := make([]error, 6)
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = p.createProject(createInput{
+			<-start
+			_, errs[i] = p.createProject(createInput{
 				SpaceID: spaceA, Creator: "solo", Name: "mine-" + string(rune('a'+i)),
 				Discoverability: DiscoverabilitySpaceListed,
 			})
 		}(i)
 	}
+	close(start)
 	wg.Wait()
+
+	quotaRejections := 0
+	for _, err := range errs {
+		if errors.Is(err, errQuotaPerCreator) {
+			quotaRejections++
+		}
+	}
+	assert.Equal(t, 4, quotaRejections,
+		"exactly the 4 losers must carry the per-creator quota error (errs=%v)", errs)
 
 	var created int
 	require.NoError(t, testCtx.DB().SelectBySql(

@@ -80,7 +80,7 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	defer client.Close()
 	keys, err := client.Keys("ratelimit:uid:*").Result()
 	if err != nil {
-		t.Skipf("Redis 不可用，跳过：%v", err)
+		require.NoError(t, err, "Redis 不可用：本包测试需要 Redis，降级为静默跳过会让整包假绿")
 	}
 	if len(keys) > 0 {
 		require.NoError(t, client.Del(keys...).Err())
@@ -95,7 +95,7 @@ func redisKeys(t *testing.T, pattern string) []string {
 	defer client.Close()
 	keys, err := client.Keys(pattern).Result()
 	if err != nil {
-		t.Skipf("Redis 不可用，跳过：%v", err)
+		require.NoError(t, err, "Redis 不可用：本包测试需要 Redis，降级为静默跳过会让整包假绿")
 	}
 	return keys
 }
@@ -110,7 +110,7 @@ func flushProjectCache(t *testing.T, ctx *config.Context) {
 	for _, pattern := range []string{"project:member:*", "space:member:*"} {
 		keys, err := client.Keys(pattern).Result()
 		if err != nil {
-			t.Skipf("Redis 不可用，跳过：%v", err)
+			require.NoError(t, err, "Redis 不可用：本包测试需要 Redis，降级为静默跳过会让整包假绿")
 		}
 		if len(keys) > 0 {
 			require.NoError(t, client.Del(keys...).Err())
@@ -312,12 +312,18 @@ func TestSchemaColumnsMatchSpaceAndUser(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, cols)
 
+	// Both project tables must be present: NotEmpty alone would pass if
+	// octo_project_member were renamed away and only the legacy rows came back.
+	tables := map[string]bool{}
 	for _, c := range cols {
+		tables[c.Table] = true
 		assert.Equal(t, "varchar(40)", c.Type, "%s.%s width must match space/user", c.Table, c.Column)
 		assert.Equal(t, "utf8mb4_general_ci", c.Collation,
 			"%s.%s collation must match space/user or every reconcile JOIN hits MySQL 1267",
 			c.Table, c.Column)
 	}
+	assert.True(t, tables["octo_project"], "octo_project columns must be in the result")
+	assert.True(t, tables["octo_project_member"], "octo_project_member columns must be in the result")
 }
 
 // TestJoinAcrossSpaceMemberAndUserHasNoCollationError runs the shape the reconcile scan
@@ -591,15 +597,21 @@ func TestRoutesRejectWithoutSpaceHeaderOrQuery(t *testing.T) {
 		t.Run("anonymous "+rt.method+" "+rt.path, func(t *testing.T) {
 			w := doJSON(t, srv, rt.method, rt.path, "", rt.body)
 			env := decodeProjectEnvelope(t, w.Body.Bytes())
-			// AuthMiddleware answers first for a tokenless request. What matters is that
-			// SOMETHING refuses — never a 200 through a pass-through.
+			// AuthMiddleware answers first for a tokenless request. The envelope must carry a
+			// REGISTERED code — the earlier form only asserted NotEqual(200) and discarded env,
+			// so deleting the middleware (which routes the request to the 500 fallback, also
+			// wire-400) kept every case green (yujiawei Q9).
 			assert.NotEqual(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-			assert.NotEmpty(t, w.Body.String())
-			_ = env
+			assert.NotEmpty(t, env.Error.Code, "the refusal must carry a registered error code")
 		})
 		t.Run("foreign space "+rt.method+" "+rt.path, func(t *testing.T) {
 			w := doJSON(t, srv, rt.method, rt.path, outsider, rt.body)
 			require.NotEqual(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			env := decodeProjectEnvelope(t, w.Body.Bytes())
+			// The cross-Space case must be the folded not-found answer, not an auth failure:
+			// the caller IS authenticated, the project is simply invisible.
+			assert.Contains(t, []string{"err.server.project.not_found", "err.shared.auth.forbidden"},
+				env.Error.Code, "body: %s", w.Body.String())
 		})
 	}
 }
@@ -757,12 +769,19 @@ func TestQuotasRejectAtTheirBoundary(t *testing.T) {
 		w := doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 			map[string]any{"name": "p0"})
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		created := decodeResp(t, w)
 		w = doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
 			map[string]any{"name": "p1"})
 		assertProjectErrorCode(t, w, "err.server.project.quota_daily_create")
 
 		// Disbanding does not buy another create: the cap bounds creation RATE, so
-		// create-then-disband must not be a free bypass.
+		// create-then-disband must not be a free bypass. countCreatedInWindowTx counts
+		// disbanded rows on purpose; this pins it.
+		w = doOn(t, r, http.MethodDelete, "/v1/projects/"+created.ProjectID, token, nil)
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		w = doOn(t, r, http.MethodPost, "/v1/space/"+spaceA+"/projects", token,
+			map[string]any{"name": "p2"})
+		assertProjectErrorCode(t, w, "err.server.project.quota_daily_create")
 	})
 
 	t.Run("members per project", func(t *testing.T) {

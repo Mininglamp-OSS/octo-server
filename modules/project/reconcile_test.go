@@ -341,8 +341,9 @@ func splitAfter(s, sep string) []string {
 // this list, which is a reviewable edit rather than an invisible pass.
 func TestMetricsCollectionAggregatesAreRegistered(t *testing.T) {
 	allowedUnbounded := []string{
-		"SELECT COUNT(*) FROM `octo_project` WHERE status = ?",
-		"SELECT COUNT(*) FROM `octo_project_member` WHERE status = ?",
+		// readStripped flattens backticks, so the allowlist matches the joined text.
+		"SELECT COUNT(*) FROM octo_project WHERE status = ?",
+		"SELECT COUNT(*) FROM octo_project_member WHERE status = ?",
 	}
 	src := readStripped(t, "metrics_collect.go")
 	stmts := splitOnSelectBySql(src)
@@ -371,7 +372,7 @@ func TestMetricsCollectionAggregatesAreRegistered(t *testing.T) {
 // reconcile.go, so the zero-exemption guard above cannot be softened by moving one back.
 func TestReconcileFileHasNoUnboundedAggregate(t *testing.T) {
 	src := readStripped(t, "reconcile.go")
-	if strings.Contains(src, "COUNT(*)") {
+	if strings.Contains(src, "COUNT(*)") || strings.Contains(src, "COUNT(1)") {
 		t.Error("reconcile.go must contain no COUNT(*): totals belong in metrics_collect.go, " +
 			"and allowing one here is what forced the aggregate exemption that hid an " +
 			"unbounded scan")

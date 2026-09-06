@@ -30,6 +30,7 @@ import (
 	// Every module, so module.Setup applies the full schema and mounts the full route
 	// tree — which is exactly what makes the boot smoke test meaningful.
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
+	projectmod "github.com/Mininglamp-OSS/octo-server/modules/project"
 )
 
 // TestServerBootsWithProjectRegistered is verification C1.
@@ -109,8 +110,10 @@ func TestSpaceRemovalStillRemovesFromGroupsWhenProjectStepFails(t *testing.T) {
 			return errAlwaysFails{}
 		})
 	t.Cleanup(func() {
-		spacemod.RegisterMemberRemovalCleanupStep("project_member",
-			func(_ *config.Context, _ spacemod.MemberRemoval) error { return nil })
+		// Restore the REAL step (latest-wins): leaving a no-op registered would silently
+		// disable the project cascade for every later test in this binary.
+		restored := projectmod.New(ctx)
+		spacemod.RegisterMemberRemovalCleanupStep("project_member", restored.CleanupSpaceMemberProjects)
 	})
 
 	// Drive the production path: the removal endpoint commits the membership change, writes

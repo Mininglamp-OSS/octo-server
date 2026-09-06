@@ -57,6 +57,14 @@ func moduleSourceFiles(t *testing.T) []string {
 
 // stripComments removes // comments so a commented-out breadcrumb does not trip a
 // guard, and so prose describing a banned pattern is not mistaken for the pattern.
+// stripComments removes // comments and then JOINS the physical lines into one string with
+// the Go string-concatenation glue (" + ") removed and backticks flattened.
+//
+// The joining is the point: the guards that scan SQL text used to match line by line, and
+// this repo's dominant style splits SQL across continuation lines — so
+// `tx.UpdateBySql("UPDATE octo_project SET " + "is_official = 1 ...")` had the column and the
+// write marker on different physical lines and evaded both the is_official and the
+// member_epoch guards (yujiawei Q9, PR #841 round 1). Joined text closes that class.
 func stripComments(src string) string {
 	var out strings.Builder
 	for _, line := range strings.Split(src, "\n") {
@@ -64,9 +72,14 @@ func stripComments(src string) string {
 			line = line[:idx]
 		}
 		out.WriteString(line)
-		out.WriteByte('\n')
+		out.WriteByte(' ')
 	}
-	return out.String()
+	joined := out.String()
+	for _, glue := range []string{"\" + \"", "\"+\"", "\" +\"", "\"+ \""} {
+		joined = strings.ReplaceAll(joined, glue, "")
+	}
+	joined = strings.ReplaceAll(joined, "`", "")
+	return joined
 }
 
 func readStripped(t *testing.T, name string) string {
@@ -113,26 +126,27 @@ func TestProjectNoLegacyResponseError(t *testing.T) {
 // member_epoch + 1` — and this test is what keeps that true. reconcile.go's
 // best-effort anomaly counter is a diagnostic, not the guarantee.
 func TestMemberEpochOnlyEverIncrements(t *testing.T) {
+	found := false
 	assignment := regexp.MustCompile(`member_epoch\s*=`)
 	increment := regexp.MustCompile(`member_epoch\s*=\s*member_epoch\s*\+\s*1`)
+	setCall := regexp.MustCompile(`Set\(\s*"member_epoch"`)
+	setMap := regexp.MustCompile(`"member_epoch"\s*:`)
 
-	found := false
 	for _, f := range moduleSourceFiles(t) {
+		// joined: continuation lines and backticks are flattened, so
+		// `SET " + "member_epoch = 0` or a SetMap entry cannot slip between the lines.
 		cleaned := readStripped(t, f)
-		for i, line := range strings.Split(cleaned, "\n") {
-			if strings.Contains(line, `Set("member_epoch"`) {
-				t.Errorf("modules/project/%s:%d writes member_epoch through a dbr Set(); "+
-					"only `member_epoch = member_epoch + 1` is allowed, because monotonicity is "+
-					"guaranteed by the write shape rather than observed by the reconcile scan", f, i+1)
-				continue
-			}
-			if !assignment.MatchString(line) {
-				continue
-			}
-			if !increment.MatchString(line) {
-				t.Errorf("modules/project/%s:%d assigns member_epoch to something other than "+
-					"member_epoch + 1: %q", f, i+1, strings.TrimSpace(line))
-				continue
+		if setCall.MatchString(cleaned) || setMap.MatchString(cleaned) {
+			t.Errorf("modules/project/%s writes member_epoch through a dbr Set()/SetMap; "+
+				"only `member_epoch = member_epoch + 1` is allowed, because monotonicity is "+
+				"guaranteed by the write shape rather than observed by the reconcile scan", f)
+			continue
+		}
+		for _, m := range assignment.FindAllStringIndex(cleaned, -1) {
+			window := cleaned[m[0]:min(m[1]+60, len(cleaned))]
+			if !increment.MatchString(window) {
+				t.Errorf("modules/project/%s assigns member_epoch to something other than "+
+					"member_epoch + 1: %q", f, strings.TrimSpace(window))
 			}
 			found = true
 		}
@@ -166,14 +180,14 @@ func TestIsOfficialHasNoWriter(t *testing.T) {
 	writeMarker := regexp.MustCompile(`(?i)(insert\s+into|update\s+\S|\bSet\(|\bColumns\(|\bVALUES\b)`)
 	for _, f := range moduleSourceFiles(t) {
 		cleaned := readStripped(t, f)
-		for i, line := range strings.Split(cleaned, "\n") {
-			if !strings.Contains(line, "is_official") {
-				continue
-			}
-			if writeMarker.MatchString(line) {
-				t.Errorf("modules/project/%s:%d pairs is_official with a write marker: %q — "+
+		// Whole-file match on joined text: a write naming is_official across continuation
+		// lines used to evade the per-line scan.
+		for _, m := range regexp.MustCompile(`is_official`).FindAllStringIndex(cleaned, -1) {
+			window := cleaned[max(0, m[0]-80):min(m[1]+80, len(cleaned))]
+			if writeMarker.MatchString(window) {
+				t.Errorf("modules/project/%s pairs is_official with a write marker near %q — "+
 					"P0 guarantees the column exists and is never written (D6)",
-					f, i+1, strings.TrimSpace(line))
+					f, strings.TrimSpace(window))
 			}
 		}
 	}

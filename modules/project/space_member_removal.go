@@ -88,6 +88,14 @@ func (p *Project) registerSpaceMemberRemovalCleanup() {
 // Space (status=2) the member still holds their seat, so cleanup must skip. A step
 // written against CheckMembership would deactivate every project membership in a
 // Space the moment it was banned, and un-banning would not restore them.
+// CleanupSpaceMemberProjects is the registered step body, exported so the external test
+// package can restore the real step after injecting a failing one (the registry is
+// latest-wins, and a no-op left behind would silently disable the cascade for the rest of
+// the test binary's run - yujiawei Q9, PR #841 round 1).
+func (p *Project) CleanupSpaceMemberProjects(ctx *config.Context, removal spacemod.MemberRemoval) error {
+	return p.cleanupSpaceMemberProjects(ctx, removal)
+}
+
 func (p *Project) cleanupSpaceMemberProjects(ctx *config.Context, removal spacemod.MemberRemoval) error {
 	stillMember, err := spacepkg.CheckMembershipForCleanup(ctx.DB(), removal.SpaceID, removal.UID)
 	if err != nil {
