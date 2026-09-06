@@ -48,11 +48,19 @@ func TestReconcileGuardActuallySkipsTheSecondRun(t *testing.T) {
 			if mf.GetName() != "project_reconcile_duration_seconds" {
 				continue
 			}
+			// Sum across EVERY scan label, not the first one Gather happens to yield.
+			//
+			// The earlier version returned on the first histogram it saw, so its value depended on
+			// map iteration order inside the registry — it worked only while one label dominated,
+			// and adding a fifth scan made this test fail in a full-package run while passing
+			// alone (PR #841 round 5). A helper named "sum" must sum.
+			total := 0.0
 			for _, m := range mf.GetMetric() {
 				if m.GetHistogram() != nil {
-					return m.GetHistogram().GetSampleSum()
+					total += m.GetHistogram().GetSampleSum()
 				}
 			}
+			return total
 		}
 		return 0
 	}

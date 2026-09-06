@@ -321,6 +321,7 @@ func (p *Project) leaveProjectHandler(c *wkhttp.Context) {
 		// with a message blaming the successor.
 		observeRejected(entryLeave, reasonNotSpaceMember)
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
+		return
 	case errors.Is(err, errNotSpaceMember):
 		// The named successor is no longer an active Space member. Their project seat
 		// survives only because the Space-removal cascade has not run yet; promoting them
@@ -408,6 +409,7 @@ func (p *Project) updateMemberRoleHandler(c *wkhttp.Context) {
 		// Above the target-level arm, for the reason given in leaveProjectHandler.
 		observeRejected(entryRoleChange, reasonNotSpaceMember)
 		httperr.ResponseErrorL(c, errcode.ErrProjectActorNotSpaceMember, nil, nil)
+		return
 	case errors.Is(err, errNotSpaceMember):
 		// Same as in leave: a successor whose Space seat is already gone must not inherit
 		// ownership, or the cascade closing their seat leaves the project unmanageable.

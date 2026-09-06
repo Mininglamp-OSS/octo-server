@@ -135,7 +135,6 @@ func TestEachWritePathTakesItsSeatLocksInOneStatement(t *testing.T) {
 		n := countOccurrences(body, "requireSpaceSeatsTx(") +
 			countOccurrences(body, "lockSeatsTx(") +
 			countOccurrences(body, "lockSpaceSeatsTx(") +
-			countOccurrences(body, "checkSpaceMembershipForWriteTx(") +
 			countOccurrences(body, "lockSpaceSeatRowTx(")
 		// Equal, not LessOrEqual: n == 0 means the path takes NO seat lock at all, i.e. the
 		// in-transaction actor Space-seat revalidation that is the centrepiece of round 3 was

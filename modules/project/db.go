@@ -193,20 +193,7 @@ func (d *DB) bumpMemberEpochTx(tx *dbr.Tx, projectID string, now time.Time) erro
 	return nil
 }
 
-// countActiveInSpace counts active projects in a Space (per-Space quota).
-func (d *DB) countActiveInSpace(spaceID string) (int, error) {
-	var count int
-	err := d.session.SelectBySql(
-		"SELECT COUNT(*) FROM `octo_project` WHERE space_id = ? AND status = ?",
-		spaceID, StatusNormal,
-	).LoadOne(&count)
-	if err != nil {
-		return 0, fmt.Errorf("project: count projects in space: %w", err)
-	}
-	return count, nil
-}
-
-// countActiveInSpaceTx is countActiveInSpace inside the create transaction.
+// countActiveInSpaceTx counts a Space's active projects inside the create transaction.
 // The quota must be counted in the same transaction that inserts, or two
 // concurrent creates both pass the check and both land.
 func (d *DB) countActiveInSpaceTx(tx *dbr.Tx, spaceID string) (int, error) {
@@ -326,54 +313,6 @@ func (d *DB) countActiveMembersTx(tx *dbr.Tx, projectID string) (int, error) {
 	return count, nil
 }
 
-// checkSpaceMembershipForWriteTx answers invariant I1 INSIDE the caller's transaction, and
-// takes a shared lock on the space_member row so a concurrent Space removal cannot commit
-// between this check and the membership write.
-//
-// Why this exists rather than calling pkg/space.CheckMembership: that function takes a
-// *dbr.Session, so it necessarily runs on a DIFFERENT pooled connection in its own implicit
-// transaction. A read there proves nothing about the state at COMMIT time — a Space removal
-// committing in between yields a project seat with no Space seat, closed only later by the
-// asynchronous cascade. The brief requires the check to be inside the request transaction
-// precisely so that window does not exist.
-//
-// The predicate is byte-for-byte CheckMembership's (space_member.status=1 AND
-// space.status=1). It is NOT CheckMembershipForCleanup's relaxed variant: this is an
-// authorization decision, and a banned Space must never pass one.
-//
-// `FOR SHARE OF sm` locks only space_member, not `space`. Locking `space` too would put a
-// shared lock on a row that Space disband updates, inventing a contention path this module
-// has no reason to create. Verified on MySQL 8.0.33 (the OF clause needs 8.0.1+).
-//
-// Lock order: callers MUST take this BEFORE locking octo_project AND before `space`, so the
-// module's declared order (space_member -> space -> project -> ... -> octo_project_member)
-// holds. Two separate claims, and the second one is the one that was missing:
-//
-//   - vs. Space MEMBER REMOVAL: it takes FOR UPDATE on the same space_member row, so it
-//     blocks here until this transaction commits; the cascade step reads space_member without
-//     a lock, so there is no cycle with it either.
-//   - vs. Space DISBAND: it takes `space_member ... FOR UPDATE` and THEN updates `space`
-//     (modules/space/db.go:71-88, an Error 1213 incident note). So a caller that holds
-//     X(`space`) and then asks for this shared lock closes a cycle. createProject was that
-//     caller until PR #841 round 2. "No cycle" holds only where this lock is taken FIRST —
-//     which is now every caller, and must stay that way.
-func (d *DB) checkSpaceMembershipForWriteTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
-	if spaceID == "" || uid == "" {
-		return false, nil
-	}
-	var found []int
-	_, err := tx.SelectBySql(
-		"SELECT 1 FROM `space_member` sm "+
-			"INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = 1 "+
-			"WHERE sm.uid = ? AND sm.space_id = ? AND sm.status = 1 LIMIT 1 FOR SHARE OF sm",
-		uid, spaceID,
-	).Load(&found)
-	if err != nil {
-		return false, fmt.Errorf("project: check space membership in tx: %w", err)
-	}
-	return len(found) > 0, nil
-}
-
 // lockSpaceRowTx takes an exclusive lock on the Space row, serialising every project
 // creation in that Space against each other.
 //
@@ -423,10 +362,27 @@ func (d *DB) lockSpaceRowTx(tx *dbr.Tx, spaceID string) (bool, error) {
 // lets it acquire the rows in ITS scan order, which is the same order the disband scan uses —
 // there is then no "second row" being waited for while the first is held.
 //
-// The predicate is byte-for-byte checkSpaceMembershipForWriteTx's, and it keeps the JOIN onto
-// `space` for the same reason: callers here do not lock the `space` row, so the JOIN is their
-// only activeness check. The read view that JOIN opens is no longer load-bearing, because every
-// aggregate that authorises a write is now a locking read (see countActiveOwnersTx).
+// The predicate is CheckMembership's (space_member.status = 1 AND space.status = 1), and it keeps
+// the JOIN onto `space` because callers here do not lock the `space` row, so the JOIN is their
+// only activeness check. Deliberately NOT CheckMembershipForCleanup's relaxed variant: this is an
+// authorization decision and a banned Space must never pass one. (The reconcile scans ask the
+// opposite question and correctly use the relaxed form — see queryI1ViolationPage.)
+//
+// The read view that JOIN opens is no longer load-bearing, because every aggregate that authorises
+// a write is now a locking read (see countActiveOwnersTx).
+//
+// Why a lock at all, rather than calling pkg/space.CheckMembership: that function takes a
+// *dbr.Session, so it runs on a DIFFERENT pooled connection in its own implicit transaction. A
+// read there proves nothing about the state at COMMIT time — a Space removal committing in between
+// yields a project seat with no Space seat, closed only later by the asynchronous cascade.
+//
+// `FOR SHARE OF sm` locks space_member only, never `space`. Locking `space` too would put a shared
+// lock on the row Space disband updates, inventing a contention path this module has no reason to
+// create. Needs MySQL 8.0.1+ for the OF clause; verified on 8.0.33.
+//
+// vs. Space MEMBER REMOVAL: it takes FOR UPDATE on the same space_member row, so it blocks here
+// until this transaction commits; the cascade step reads space_member without a lock, so there is
+// no cycle with it either.
 //
 // Returns the set of uids that DO hold a seat. Callers decide which absence means what, since
 // actor and target absences carry different sentinels.
@@ -477,7 +433,7 @@ func (d *DB) lockSpaceSeatsTx(tx *dbr.Tx, spaceID string, uids []string) (map[st
 // afterwards and refuses anything but status = 1, so Space activeness is checked more
 // strongly than the JOIN checked it — under an exclusive lock rather than in a snapshot.
 // Callers that do NOT lock the `space` row must keep using
-// checkSpaceMembershipForWriteTx, whose JOIN is their only activeness check.
+// lockSpaceSeatsTx, whose JOIN is their only activeness check.
 func (d *DB) lockSpaceSeatRowTx(tx *dbr.Tx, spaceID, uid string) (bool, error) {
 	if spaceID == "" || uid == "" {
 		return false, nil
@@ -658,7 +614,7 @@ func (d *DB) updateMemberRoleTx(tx *dbr.Tx, projectID, uid string, role int, now
 //
 // `FOR SHARE` is not optional here, and the reason is the same read-view trap
 // lockSpaceSeatRowTx exists for. Every caller's transaction opens with
-// checkSpaceMembershipForWriteTx, which JOINs `space` — a table outside the `FOR SHARE OF`
+// lockSpaceSeatsTx, which JOINs `space` — a table outside the `FOR SHARE OF`
 // list, therefore a CONSISTENT read, therefore the statement that opens the read view. A plain
 // COUNT(*) after it is answered from a snapshot taken BEFORE lockActiveProjectTx, so the
 // project row lock does not protect this count at all.

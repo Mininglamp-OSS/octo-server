@@ -167,6 +167,14 @@ var reconcileWorkerOnce sync.Once
 // a synchronized burst against the same tables the message paths use.
 func (p *Project) startReconcileWorker() {
 	reconcileWorkerOnce.Do(func() {
+		// Say so out loud when the invariant scans are off. A missing monitor that nobody
+		// announced is worse than a broken one: the gauges sit at zero and read as "no
+		// violations". This line is what makes "we never turned it on" findable.
+		if !p.cfg.ReconcileEnabled {
+			p.Warn("项目对账的跨 Space 扫描未启用：I1 违约 / 清理泄漏 / 孤儿项目三项无监控，"+
+				"三个 gauge 将停在 0（读起来与「零违约」相同）。完成 collation 归一后请开启。",
+				zap.String("env", envReconcileEnabled))
+		}
 		p.ctx.Schedule(jitter(p.cfg.ReconcileInterval), p.runReconcile)
 		p.ctx.Schedule(jitter(p.cfg.MetricsInterval), p.refreshDistributionMetrics)
 	})
@@ -197,9 +205,19 @@ func (p *Project) runReconcile() {
 			p.Error("项目对账 panic", zap.Any("recover", r))
 		}
 	}()
-	p.scanI1Violations()
-	p.scanAbandonedCleanupLeak()
-	p.scanOrphanProjects()
+	// These three JOIN the legacy Space tables, so they are the ones that fail with 1267 on a
+	// collation-drifted database — which production is measured to be. See envReconcileEnabled:
+	// running them there produces three permanently-failing scans whose gauges never publish,
+	// i.e. a monitor that reads as healthy while having never run.
+	if p.cfg.ReconcileEnabled {
+		p.scanI1Violations()
+		p.scanAbandonedCleanupLeak()
+		p.scanOrphanProjects()
+	}
+
+	// These two touch only this module's own tables, so they are unaffected by the drift and run
+	// unconditionally. Keeping them outside the gate matters: scanOwnerlessProjects detects a
+	// state P0 cannot repair, which is precisely what should not be waiting on an ops window.
 	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
 }
@@ -219,23 +237,50 @@ func (p *Project) runReconcile() {
 // not silently lossy.
 const reconcileLogCap = 20
 
+// noteScanFailure records that one scan failed this tick.
+//
+// A failed scan is otherwise nearly invisible: its gauge simply does not publish (publishing is
+// conditional on a COMPLETE rotation), so "never ran" and "ran and found nothing" look identical
+// on a dashboard. That is how a permanently-failing scan reads as healthy — the exact shape the
+// collation drift produces. A counter makes it alertable.
+func noteScanFailure(scan string) {
+	reconcileScanFailures.WithLabelValues(scan).Inc()
+}
+
 // logCapped emits detail lines up to reconcileLogCap per scan per tick, then one summary.
+//
+// `emit` is an injection point, and it is there for a specific reason: the first version of this
+// type was untestable in the way that matters. `seen` increments unconditionally, so a test that
+// asserts on `seen` passes whether or not the cap is honoured — delete the comparison below and
+// such a test stays green (PR #841 round 5, P2-2, where a reviewer's mutation survived exactly
+// that test). What has to be observable is how many times the LOGGER was actually called.
 type logCapped struct {
-	p       *Project
-	scan    string
-	emitted int
+	p    *Project
+	scan string
+	// seen counts every violating row handed to errorf, capped or not. The gauge is fed from the
+	// scan's own total, so suppressing a log line must never suppress a count.
+	seen int
+	// emit defaults to p.Error; tests replace it to count real emissions.
+	emit func(msg string, fields ...zap.Field)
 }
 
 func (l *logCapped) errorf(msg string, fields ...zap.Field) {
-	l.emitted++
-	if l.emitted <= reconcileLogCap {
-		l.p.Error(msg, fields...)
-		return
-	}
-	if l.emitted == reconcileLogCap+1 {
-		l.p.Error("对账告警条数已达单次上限，其余仅计入 gauge",
+	l.seen++
+	switch {
+	case l.seen <= reconcileLogCap:
+		l.write(msg, fields...)
+	case l.seen == reconcileLogCap+1:
+		l.write("对账告警条数已达单次上限，其余仅计入 gauge",
 			zap.String("scan", l.scan), zap.Int("cap", reconcileLogCap))
 	}
+}
+
+func (l *logCapped) write(msg string, fields ...zap.Field) {
+	if l.emit != nil {
+		l.emit(msg, fields...)
+		return
+	}
+	l.p.Error(msg, fields...)
 }
 
 // ---------- scan 5: ownerless projects ----------
@@ -260,6 +305,7 @@ func (p *Project) scanOwnerlessProjects() {
 		rows, err := p.queryOwnerlessProjectPage(cursor, p.cfg.ReconcileLimit)
 		if err != nil {
 			// break, not return — see scanI1Violations for why the cursor save must be reached.
+			noteScanFailure("ownerless")
 			p.Warn("对账无主项目扫描失败", zap.Error(err))
 			break
 		}
@@ -355,6 +401,7 @@ func (p *Project) scanI1Violations() {
 			// forever — re-emitting the same Error lines for the prefix on every tick and never
 			// reaching a row past the failure. Breaking keeps the cursor and the running total,
 			// with completed=false so nothing is published from a partial rotation.
+			noteScanFailure("i1_violations")
 			p.Warn("对账 I1 违约扫描失败", zap.Error(err))
 			break
 		}
@@ -398,9 +445,24 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 	var rows []*i1Row
 	_, err := p.db.session.SelectBySql(
 		"SELECT pm.project_id, pm.uid, pm.space_id, "+
-			// The I1 flag: the seat is ACTIVE, has no in-flight cleanup job, is not in a banned
-			// Space, and has no active Space seat behind it — the same predicates the WHERE
-			// version had, evaluated per inspected row instead of filtering the result set.
+			// The I1 flag: the seat is ACTIVE, has no in-flight cleanup job, and has no
+			// SPACE seat behind it under CLEANUP semantics — evaluated per inspected row
+			// instead of filtering the result set.
+			//
+			// "Cleanup semantics" is `space.status <> 0` (CheckMembershipForCleanup), NOT
+			// `= 1` (CheckMembership, the authorization predicate), and the difference is the
+			// whole finding of PR #841 round 5. With `= 1` a banned Space fails the clause for
+			// EVERY seat, so its members all looked like violations — which is why an earlier
+			// version carried a third clause blanket-exempting any banned Space. Those two
+			// cancelled into something broader than either: inside a banned Space a seat whose
+			// Space seat was already CLOSED and whose cleanup never completed — a genuine leak
+			// the cascade would have processed (deactivateSeatForCascade proceeds when
+			// stillMember is false) — was invisible here forever.
+			//
+			// One predicate now covers both: a banned Space's MEMBER (sm.status = 1) satisfies
+			// it and is exempt, its NON-member does not and is flagged. queryAbandonedLeakPage
+			// has always been written this way; the two scans must agree, because they claim to
+			// mirror the same function.
 			//
 			// pm.status belongs in here with the others, and it was the one left behind. Member
 			// rows are never deleted (removal flips status), so as closed seats accumulate a
@@ -411,16 +473,14 @@ func (p *Project) queryI1ViolationPage(cursorProject, cursorUID string, limit in
 			"(pm.status = ? "+
 			" AND NOT EXISTS (SELECT 1 FROM `space_member_removal_cleanup` c "+
 			"             WHERE c.space_id = pm.space_id AND c.uid = pm.uid AND c.status = ?) "+
-			" AND NOT EXISTS (SELECT 1 FROM `space` sb "+
-			"                  WHERE sb.space_id = pm.space_id AND sb.status = ?) "+
 			" AND NOT EXISTS (SELECT 1 FROM `space_member` sm "+
-			"                  INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status = ? "+
+			"                  INNER JOIN `space` s ON s.space_id = sm.space_id AND s.status <> ? "+
 			"                  WHERE sm.space_id = pm.space_id AND sm.uid = pm.uid AND sm.status = ?) "+
 			") AS violating "+
 			"FROM `octo_project_member` pm "+
 			"WHERE (pm.project_id, pm.uid) > (?, ?) "+
 			"ORDER BY pm.project_id, pm.uid LIMIT ?",
-		MemberStatusActive, cleanupStatusPending, spaceStatusBanned, spaceStatusNormal,
+		MemberStatusActive, cleanupStatusPending, spaceStatusDisbanded,
 		spaceMemberStatusActive, cursorProject, cursorUID, limit,
 	).Load(&rows)
 	if err != nil {
@@ -442,9 +502,13 @@ const (
 	cleanupStatusPending = 0
 	// cleanupStatusAbandoned mirrors modules/space's removalCleanupAbandoned (2).
 	cleanupStatusAbandoned = 2
-	// spaceStatusNormal / spaceStatusBanned mirror modules/space's SpaceStatus* .
-	spaceStatusNormal = 1
-	spaceStatusBanned = 2
+	// spaceStatusDisbanded mirrors modules/space's SpaceStatusDisband.
+	//
+	// Only the DISBANDED value is needed, and that is the point: every predicate here asks the
+	// cleanup question ("does this uid still hold a real Space seat?"), whose Space half is
+	// `status <> 0`. A constant for the banned value would only be needed by a predicate that
+	// singles banned Spaces out — which is exactly the over-broad shape round 5 removed.
+	spaceStatusDisbanded = 0
 	// spaceMemberStatusActive mirrors space_member.status = 1.
 	spaceMemberStatusActive = 1
 )
@@ -486,13 +550,14 @@ func (p *Project) scanAbandonedCleanupLeak() {
 	// Same cross-tick rotation as the other scans: the page cap must not mean "only ever look
 	// at the first window".
 	cursorProject, cursorUID, running := cursors.abandonedResume()
-	log := &logCapped{p: p, scan: "abandoned_leak"}
+	log := &logCapped{p: p, scan: "abandoned"}
 	leaked := int64(running)
 	completed := false
 	for page := 0; page < reconcileMaxPages; page++ {
 		rows, err := p.queryAbandonedLeakPage(cursorProject, cursorUID, p.cfg.ReconcileLimit)
 		if err != nil {
 			// break, not return — see scanI1Violations for why the cursor save must be reached.
+			noteScanFailure("abandoned")
 			p.Warn("对账 abandoned 工单泄漏扫描失败", zap.Error(err))
 			break
 		}
@@ -584,6 +649,7 @@ func (p *Project) scanOrphanProjects() {
 		rows, err := p.queryInspectedProjectPage(cursor, p.cfg.ReconcileLimit)
 		if err != nil {
 			// break, not return — see scanI1Violations for why the cursor save must be reached.
+			noteScanFailure("orphan")
 			p.Warn("对账孤儿项目扫描失败", zap.Error(err))
 			break
 		}
@@ -720,6 +786,7 @@ func (p *Project) scanEpochSanity() {
 		).Load(&rows)
 		if err != nil {
 			// break, not return — see scanI1Violations for why the cursor save must be reached.
+			noteScanFailure("epoch")
 			p.Warn("对账 member_epoch 扫描失败", zap.Error(err))
 			break
 		}

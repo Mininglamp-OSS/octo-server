@@ -103,6 +103,20 @@ var (
 		Name:      "orphan_total",
 		Help:      "Active projects whose space_id no longer exists in `space`.",
 	})
+	// reconcileScanFailures counts failed scan attempts, per scan.
+	//
+	// Without it a failing scan is invisible: gauges publish only on a complete rotation, so a
+	// scan that errors on its first page leaves its gauge at whatever it last held (or at zero,
+	// forever) and the only trace is a Warn line. "Never ran" and "ran, found nothing" then look
+	// identical — which is how the collation drift would have presented, on the module whose
+	// purpose is to be the safety net.
+	reconcileScanFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "reconcile_scan_failures_total",
+		Help: "Reconcile scan attempts that returned an error, by scan. Non-zero means the " +
+			"corresponding gauge is stale or never published — alert on the rate, not the value.",
+	}, []string{"scan"})
+
 	// ownerlessProjects counts ACTIVE projects with zero active owners.
 	//
 	// A separate signal from orphan_total because the failure is separate: the Space is fine,

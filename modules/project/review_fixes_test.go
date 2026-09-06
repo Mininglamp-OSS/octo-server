@@ -176,18 +176,18 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	seedUser(t, "elsewhere")
 	seedSpaceMember(t, spaceB, "elsewhere", 0, 1)
 
-	// The predicate itself, read inside a transaction.
+	// The predicate itself, read inside a transaction — all three uids in ONE statement, which is
+	// how every write path now takes these locks (see lockSpaceSeatsTx: one statement is what
+	// keeps this module out of the row-level 1213 cycle with the Space disband scan). Asserting
+	// them together also pins that a batch judges each uid independently.
 	tx, err := p.db.session.Begin()
 	require.NoError(t, err)
-	ok, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "target")
+	held, err := p.db.lockSpaceSeatsTx(tx, spaceA,
+		[]string{"target", "elsewhere", "nobody-at-all"})
 	require.NoError(t, err, "FOR SHARE OF sm must parse (needs MySQL 8.0.1+)")
-	assert.True(t, ok)
-	ok, err = p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "elsewhere")
-	require.NoError(t, err)
-	assert.False(t, ok, "a member of another Space must not satisfy I1 here")
-	ok, err = p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "nobody-at-all")
-	require.NoError(t, err)
-	assert.False(t, ok)
+	assert.True(t, held["target"])
+	assert.False(t, held["elsewhere"], "a member of another Space must not satisfy I1 here")
+	assert.False(t, held["nobody-at-all"])
 	require.NoError(t, tx.Rollback())
 
 	// A banned Space fails the predicate — same as CheckMembership, because this is an
@@ -195,9 +195,9 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	setSpaceStatus(t, spaceA, 2)
 	tx, err = p.db.session.Begin()
 	require.NoError(t, err)
-	ok, err = p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "target")
+	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"})
 	require.NoError(t, err)
-	assert.False(t, ok, "space.status=2 must fail an authorization predicate")
+	assert.False(t, held["target"], "space.status=2 must fail an authorization predicate")
 	require.NoError(t, tx.Rollback())
 	setSpaceStatus(t, spaceA, 1)
 
@@ -206,9 +206,9 @@ func TestI1CheckRunsInsideTheWriteTransaction(t *testing.T) {
 	// session-scoped read left open.
 	tx, err = p.db.session.Begin()
 	require.NoError(t, err)
-	ok, err = p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "target")
+	held, err = p.db.lockSpaceSeatsTx(tx, spaceA, []string{"target"})
 	require.NoError(t, err)
-	require.True(t, ok)
+	require.True(t, held["target"])
 
 	blocked := probeSpaceMemberUpdateBlocks(t, spaceA, "target")
 	assert.True(t, blocked,

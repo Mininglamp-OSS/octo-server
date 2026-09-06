@@ -352,7 +352,7 @@ func (p *Project) createProjectOnce(in createInput) (*Model, error) {
 	//
 	//     Taking the shared lock first makes both transactions acquire `space_member` before
 	//     `space`, so there is no cycle: whichever arrives second simply waits.
-	//     lockSpaceSeatRowTx, not checkSpaceMembershipForWriteTx: the latter JOINs `space`,
+	//     lockSpaceSeatRowTx, not lockSpaceSeatsTx: the latter JOINs `space`,
 	//     and a table outside the `FOR SHARE OF` list is read as a CONSISTENT read, which
 	//     opens the transaction's read view. As the FIRST statement that would freeze the
 	//     snapshot before the `space` lock below, and every quota count after it would be

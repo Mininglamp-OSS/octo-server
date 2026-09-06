@@ -126,9 +126,9 @@ func TestAddRejectsWhenSpaceIsBanned(t *testing.T) {
 	// guarantee that holds even if a future change reintroduces a cached caller gate.
 	tx, txErr := p.db.session.Begin()
 	require.NoError(t, txErr)
-	isSpaceMember, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceA, "later")
+	held, err := p.db.lockSpaceSeatsTx(tx, spaceA, []string{"later"})
 	require.NoError(t, err)
-	assert.False(t, isSpaceMember,
+	assert.False(t, held["later"],
 		"the authorization predicate must fail for a banned Space, cache or no cache")
 	require.NoError(t, tx.Rollback())
 }

@@ -23,6 +23,32 @@ const (
 	// needs a rolling restart in both directions.
 	envCreateEnabled = "OCTO_PROJECT_CREATE_ENABLED"
 
+	// envReconcileEnabled gates ONLY the reconcile scans that JOIN the legacy Space tables
+	// (`space`, `space_member`, `space_member_removal_cleanup`) — I1 violations, abandoned
+	// cleanup leak, and orphan projects.
+	//
+	// It exists because those three fail with MySQL 1267 on any database where the legacy
+	// tables have drifted to utf8mb4_0900_ai_ci while this module's tables are pinned to
+	// utf8mb4_general_ci, which is measured to be the case in production (see the migration
+	// header and the task brief). The failure is at statement RESOLUTION, so an empty table
+	// does not save it: merging with no projects and no traffic would still run three failing
+	// scans on every pod every tick, forever. Each affected gauge publishes only on a COMPLETE
+	// rotation, so they would never publish — the monitor for this module's own safety net
+	// would read as "healthy, zero violations" while having never run once.
+	//
+	// Default OFF, and deliberately NOT tied to envCreateEnabled even though that would also
+	// have closed the merge-time hole: those two answer different questions. Turning writes off
+	// to stop a problem is exactly when the invariant monitor is most wanted, and coupling them
+	// would darken it at that moment.
+	//
+	// Scope is deliberately narrow. project_ownerless_total and the member_epoch sanity scan
+	// touch only this module's own tables, as does the distribution-metrics job, so they run
+	// unconditionally — gating them would lose working observability for nothing, and would
+	// teach the reader that "no monitoring until the flag is on", which is not true.
+	//
+	// Turn it on once the collation conversion recorded in the brief has completed.
+	envReconcileEnabled = "OCTO_PROJECT_RECONCILE_ENABLED"
+
 	envMaxPerSpace    = "OCTO_PROJECT_MAX_PER_SPACE"
 	envMaxPerCreator  = "OCTO_PROJECT_MAX_PER_CREATOR_PER_SPACE"
 	envMaxMembers     = "OCTO_PROJECT_MAX_MEMBERS"
@@ -71,7 +97,10 @@ const (
 
 // Config is the resolved per-process configuration.
 type Config struct {
-	CreateEnabled     bool
+	CreateEnabled bool
+	// ReconcileEnabled gates the three scans that JOIN legacy Space tables. See
+	// envReconcileEnabled for why it is separate from CreateEnabled and why its scope is narrow.
+	ReconcileEnabled  bool
 	MaxPerSpace       int
 	MaxPerCreator     int
 	MaxMembers        int
@@ -99,6 +128,7 @@ func loadConfig() Config {
 	}
 	return Config{
 		CreateEnabled:     envBool(envCreateEnabled, false),
+		ReconcileEnabled:  envBool(envReconcileEnabled, false),
 		MaxPerSpace:       envPositiveInt(envMaxPerSpace, defaultMaxPerSpace),
 		MaxPerCreator:     envPositiveInt(envMaxPerCreator, defaultMaxPerCreator),
 		MaxMembers:        envPositiveInt(envMaxMembers, defaultMaxMembers),

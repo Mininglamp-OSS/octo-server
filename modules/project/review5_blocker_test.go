@@ -307,7 +307,7 @@ func TestTargetLevelSpaceSeatLossDoesNotStopTheAddBatch(t *testing.T) {
 //
 // The rule: inside a write transaction, any aggregate or seat-set read whose RESULT AUTHORISES
 // the write must be a LOCKING read. Every write transaction in this module opens with
-// checkSpaceMembershipForWriteTx, which JOINs `space`; a table outside a `FOR SHARE OF` list is
+// lockSpaceSeatsTx, which JOINs `space`; a table outside a `FOR SHARE OF` list is
 // a consistent read, and a consistent read opens the read view. So every plain SELECT after it
 // is answered from a snapshot older than lockActiveProjectTx, and the project row lock protects
 // nothing about it.
@@ -377,9 +377,15 @@ func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
 		"func (p *Project) createProject")
 	assert.Contains(t, fn, "lockSpaceSeatRowTx",
 		"createProject must take the JOIN-free seat lock")
-	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
-		"createProject must NOT use the JOINing helper: the JOIN opens the read view before "+
-			"the `space` lock and every creation quota is then counted from a stale snapshot")
+	// Names the helper that EXISTS. The previous version forbade checkSpaceMembershipForWriteTx,
+	// which has since been deleted — so the assertion would have been vacuously true forever,
+	// which is the failure mode this file's own header is about. lockSpaceSeatsTx is the JOINing
+	// helper every other write path uses, and it is the one createProject must not adopt.
+	assert.NotContains(t, fn, "lockSpaceSeatsTx",
+		"createProject must NOT use the JOINing seat helper: the JOIN onto `space` is a "+
+			"consistent read, so it opens the read view before the `space` lock and every "+
+			"creation quota is then counted from a stale snapshot (six concurrent creates all "+
+			"passed MaxPerSpace=1 when this regressed)")
 
 	// ORDER, not just presence. Presence alone was satisfiable with the two locks swapped back
 	// into the B-3 order — the reproduced Error 1213 whose victim was the operator's Space

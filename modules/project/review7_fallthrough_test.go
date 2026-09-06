@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/zap"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -266,20 +267,28 @@ func TestLeaveIgnoresAnIrrelevantTransferTo(t *testing.T) {
 // human. Nothing disbands the projects of a disbanded Space, so one legitimate operator action
 // produces N orphan lines per rotation forever (PR #841 round 4, P2-2).
 func TestReconcileAlertLogIsCappedPerTick(t *testing.T) {
-	// The cap is a property of the helper, so drive it directly: building 25k violating rows to
-	// observe the difference would be a slow test of the same one line.
 	_, p := setup(t)
+
+	// Count REAL emissions, not the rows seen. Asserting on the row counter cannot detect a
+	// missing cap — it increments unconditionally, before the comparison — which is why the first
+	// version of this test survived a mutation that neutralised the cap entirely (round 5, P2-2).
 	emitted := 0
-	l := &logCapped{p: p, scan: "probe"}
-	for i := 0; i < reconcileLogCap*3; i++ {
-		before := l.emitted
-		l.errorf("probe")
-		if l.emitted != before+1 {
-			t.Fatalf("errorf must always count, even when suppressing: %d -> %d", before, l.emitted)
-		}
-		emitted++
+	l := &logCapped{
+		p:    p,
+		scan: "probe",
+		emit: func(msg string, fields ...zap.Field) { emitted++ },
 	}
-	assert.Equal(t, reconcileLogCap*3, l.emitted,
+	rows := reconcileLogCap * 3
+	for i := 0; i < rows; i++ {
+		l.errorf("probe")
+	}
+
+	assert.Equal(t, reconcileLogCap+1, emitted,
+		"exactly %d detail lines plus ONE summary may be emitted for %d violating rows; got %d "+
+			"emissions. Uncapped this is up to reconcileMaxPages*ReconcileLimit = 25,000 lines "+
+			"per tick per pod, forever, for states this module documents as needing a human — and "+
+			"an alert that only ratchets up gets muted.", reconcileLogCap, rows, emitted)
+	assert.Equal(t, rows, l.seen,
 		"every violating row must still be COUNTED — the cap is on the log, not on the gauge")
 
 	// And the source must route every per-row alert through the cap, not around it.

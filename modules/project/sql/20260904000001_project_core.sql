@@ -39,10 +39,13 @@
 --
 -- Consequence if this module is enabled before that is corrected: the listMembers
 -- query (LEFT JOIN user) fails with MySQL 1267 on EVERY request, so
--- GET /v1/projects/:project_id/members is a 500 for every project, and all four
--- reconcile scans go dark at once. CI cannot catch it — ci/run-e2e-shard.sh creates
--- its database with an explicit COLLATE utf8mb4_general_ci, so a green suite is
--- structurally not evidence.
+-- GET /v1/projects/:project_id/members is a 500 for every project. Three of the five
+-- reconcile scans fail with it too -- I1 violations, abandoned cleanup leak, and
+-- orphan projects, the three that JOIN legacy Space tables. The other two
+-- (ownerless projects, member_epoch sanity) touch only the tables below and keep
+-- working. CI cannot catch any of it: ci/run-e2e-shard.sh creates its database with
+-- an explicit COLLATE utf8mb4_general_ci, so a green suite is structurally not
+-- evidence -- see the deliberate-drift regression test in the module.
 --
 -- The correction is NOT per-table: user / space / space_member also join robot,
 -- group_member, group, app_bot and the opanalytics dimension tables, so converting
@@ -53,8 +56,22 @@
 -- equivalence classes are coarser, so two rows that differ today can collide).
 -- See the task brief for the pre-check and conversion statements.
 --
--- OCTO_PROJECT_CREATE_ENABLED defaults to false, which is what makes this a
--- pre-enable checklist item rather than an outage.
+-- TWO switches, both defaulting to false, are what make this a pre-enable checklist
+-- item rather than an outage -- and the second one had to be added for that claim to
+-- be true at all:
+--
+--   * OCTO_PROJECT_CREATE_ENABLED bounds the HTTP surface.
+--   * OCTO_PROJECT_RECONCILE_ENABLED bounds the three cross-Space reconcile scans.
+--     Without it the background worker started unconditionally from Route(), so
+--     merging with writes disabled, zero projects and no traffic still ran three
+--     failing scans on every pod every tick. The failure is at statement
+--     RESOLUTION, so empty tables do not save it -- and because each gauge
+--     publishes only on a COMPLETE rotation, all three would have sat at zero
+--     forever, reading as "no violations" on the module whose purpose is to be the
+--     invariant safety net (PR #841 round 5).
+--
+-- A failing scan is now also counted (project_reconcile_scan_failures_total), so
+-- "never ran" and "ran, found nothing" stop looking identical on a dashboard.
 --
 -- No foreign keys: nothing in this schema uses them. Cross-table integrity is
 -- the cleanup outbox plus the reconcile job.

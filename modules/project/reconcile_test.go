@@ -105,22 +105,38 @@ func TestReconcileStillFlagsPairsWhoseJobFinished(t *testing.T) {
 }
 
 // TestReconcileDoesNotFlagBannedSpaceMembers pins that the scan and the cascade agree. The
-// cascade deliberately SKIPS a banned Space because the seat is still real, so reporting
-// those seats as violations would flag correct behaviour as a defect — forever, since
-// nothing will ever "fix" them.
+// cascade deliberately SKIPS a banned Space MEMBER because the seat is still real, so reporting
+// those seats as violations would flag correct behaviour as a defect — forever, since nothing
+// will ever "fix" them.
+//
+// FIXTURE CORRECTED (PR #841 round 5). This test used to call removeSpaceMember first — setting
+// space_member.status = 0 — and then ban, which is NOT a "banned Space member" at all: under
+// cleanup semantics that uid is a non-member, so the cascade does NOT skip them
+// (deactivateSeatForCascade proceeds when stillMember is false) and the seat IS a leak. The old
+// fixture therefore asserted "the scan and the cascade agree" on precisely the one case where
+// they disagreed, and certified the over-broad predicate that produced it. The seat must stay
+// ACTIVE for this test to be about what its name says.
+//
+// The complementary direction — banned Space, seat already closed, must BE flagged — is in
+// TestI1ScanUsesCleanupSemanticsForBannedSpaces, together with a cross-scan agreement case.
 func TestReconcileDoesNotFlagBannedSpaceMembers(t *testing.T) {
 	srv, p := setup(t)
 	_, _, _ = projectWithMembers(t, srv, "m1")
 	require.Equal(t, 0, violationCount(t, p))
 
-	// A removed Space seat inside a BANNED Space: the cascade skips it, so the scan must
-	// too.
-	removeSpaceMember(t, spaceA, "m1")
-	require.Equal(t, 1, violationCount(t, p), "precondition: an active Space would flag it")
-
+	// m1 KEEPS their Space seat (space_member.status stays 1). That is what makes them a member
+	// of the banned Space rather than a leak inside it.
 	setSpaceStatus(t, spaceA, 2)
 	assert.Equal(t, 0, violationCount(t, p),
 		"members of a banned Space must not be reported as I1 violations")
+
+	// And the ban is not doing the exempting on its own: close the seat and the same scan, same
+	// banned Space, must flag it. Without this line the assertion above is satisfied by any
+	// predicate that blanket-exempts banned Spaces.
+	removeSpaceMember(t, spaceA, "m1")
+	assert.Equal(t, 1, violationCount(t, p),
+		"a banned Space must not hide a seat whose Space seat is closed — the exemption is about "+
+			"membership, not about the ban")
 }
 
 // TestReconcileFlagsDisbandedSpaceMembers pins that the relaxed predicate's OTHER side is
