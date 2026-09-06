@@ -103,6 +103,24 @@ var (
 		Name:      "orphan_total",
 		Help:      "Active projects whose space_id no longer exists in `space`.",
 	})
+	// ownerlessProjects counts ACTIVE projects with zero active owners.
+	//
+	// A separate signal from orphan_total because the failure is separate: the Space is fine,
+	// the project is reachable, and its roster may be full — but nobody can manage it. P0 has
+	// no repair path (role change and disband are owner-only, a Space admin has read access
+	// only), so like i1_abandoned_cleanup_leak this is a standing figure needing a human, not
+	// a transient that clears.
+	//
+	// It exists because the state was reachable and invisible: the concurrency route is now
+	// closed (see countActiveOwnersTx), and the remaining route — a sole owner removed from
+	// the Space — is a filed product decision. This gauge is what lets that decision be made
+	// from data rather than a guess.
+	ownerlessProjects = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "ownerless_total",
+		Help: "Active projects with zero active owners. Unmanageable and unrepairable in P0; " +
+			"a non-zero value needs manual intervention.",
+	})
 	// epochAnomalies counts observed member_epoch regressions. Best-effort: the
 	// authoritative guarantee is the write discipline (member_epoch + 1 only),
 	// because a read-only scan running on every pod cannot establish monotonicity.

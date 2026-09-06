@@ -28,11 +28,14 @@ import (
 // With the flag shape, LIMIT bounds work: the base page is at most ReconcileLimit rows, the
 // cursor advances over INSPECTED rows, and a short page really is the table end.
 func TestReconcilePageQueriesExamineBoundedRows(t *testing.T) {
-	for _, fn := range []string{
-		"func (p *Project) queryI1ViolationPage",
-		"func (p *Project) queryAbandonedLeakPage",
-		"func (p *Project) queryInspectedProjectPage",
-	} {
+	// Enumerated from the source, not hand-listed: round 3 added a fifth scan, and a guard
+	// whose coverage has to be extended by hand is how the read-view guard came to cover one
+	// call site out of six.
+	fns := pagedReconcileQueries(t)
+	require.GreaterOrEqual(t, len(fns), 4,
+		"expected at least four paged reconcile queries; found %d — the enumeration probably "+
+			"stopped matching, which would make this guard vacuous", len(fns))
+	for _, fn := range fns {
 		i := strings.Index(src(t), fn)
 		require.NotEqual(t, -1, i, "function not found: %s", fn)
 		body := fnBody(t, src(t), i)
@@ -72,6 +75,23 @@ func whereClause(t *testing.T, body string) string {
 		clause = strings.ReplaceAll(clause, glue, "")
 	}
 	return strings.ReplaceAll(clause, "\n", " ")
+}
+
+// pagedReconcileQueries returns the signature of every paged reconcile page query, found by
+// naming convention (query...Page) so a newly added scan is covered without editing this test.
+func pagedReconcileQueries(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(src(t), "\n") {
+		if !strings.HasPrefix(line, "func (p *Project) query") || !strings.Contains(line, "Page(") {
+			continue
+		}
+		// Keep the signature up to the parameter list: that is what Index(src, fn) matches on.
+		paren := strings.Index(line, "Page(")
+		require.Positive(t, paren, "unexpected signature shape: %s", line)
+		out = append(out, line[:paren+len("Page")])
+	}
+	return out
 }
 
 // src / fnBody are small helpers over the file text.

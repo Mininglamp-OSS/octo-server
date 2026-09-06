@@ -63,6 +63,8 @@ type reconcileCursors struct {
 	orphan           int64
 	orphanRun        int
 	epoch            int64
+	ownerless        int64
+	ownerlessRun     int
 	abandonedProject string
 	abandonedUID     string
 	abandonRun       int
@@ -197,7 +199,80 @@ func (p *Project) runReconcile() {
 	p.scanI1Violations()
 	p.scanAbandonedCleanupLeak()
 	p.scanOrphanProjects()
+	p.scanOwnerlessProjects()
 	p.scanEpochSanity()
+}
+
+// ---------- scan 5: ownerless projects ----------
+
+// scanOwnerlessProjects counts ACTIVE projects with no active owner.
+//
+// The state is unrecoverable in P0 and was invisible to every other scan: orphan_total asks
+// about the Space, i1_violations and i1_abandoned_cleanup_leak ask about seats that outlived a
+// Space seat, and none of them notices a healthy project nobody can manage.
+//
+// A DISBANDED project has no owner either, and that is correct rather than a defect — hence
+// the status predicate, which lives in the violating flag like every other one (see
+// queryI1ViolationPage for why).
+func (p *Project) scanOwnerlessProjects() {
+	start := time.Now()
+	defer func() { reconcileDuration.WithLabelValues("ownerless").Observe(time.Since(start).Seconds()) }()
+
+	cursor, total := cursors.idResume(&cursors.ownerless, &cursors.ownerlessRun)
+	completed := false
+	for page := 0; page < reconcileMaxPages; page++ {
+		rows, err := p.queryOwnerlessProjectPage(cursor, p.cfg.ReconcileLimit)
+		if err != nil {
+			// break, not return — see scanI1Violations for why the cursor save must be reached.
+			p.Warn("对账无主项目扫描失败", zap.Error(err))
+			break
+		}
+		if len(rows) == 0 {
+			completed = true
+			break
+		}
+		for _, row := range rows {
+			if !row.Violating {
+				continue
+			}
+			p.Error("项目无活跃 owner，任何人都无法管理它（P0 无自动修复路径）",
+				zap.String("projectId", row.ProjectID), zap.String("spaceId", row.SpaceID))
+			total++
+		}
+		cursor = rows[len(rows)-1].ID
+		if len(rows) < p.cfg.ReconcileLimit {
+			completed = true
+			break
+		}
+	}
+	if completed {
+		ownerlessProjects.Set(float64(total))
+	}
+	cursors.idSave(&cursors.ownerless, &cursors.ownerlessRun, cursor, total, completed)
+}
+
+// queryOwnerlessProjectPage returns one bounded page of INSPECTED project rows, each flagged
+// with whether it is active and has no active owner. Flag-over-base-page, so cost is bounded by
+// rows examined (Q4).
+func (p *Project) queryOwnerlessProjectPage(cursor int64, limit int) ([]*orphanRow, error) {
+	var rows []*orphanRow
+	_, err := p.db.session.SelectBySql(
+		"SELECT p.id, p.project_id, p.space_id, "+
+			// Active AND no seat holding RoleOwner. Both predicates are flags rather than WHERE
+			// terms: projects are never deleted, so filtering on status would bound rows
+			// returned instead of rows examined as disbanded projects accumulate.
+			"(p.status = ? AND NOT EXISTS (SELECT 1 FROM `octo_project_member` pm "+
+			"             WHERE pm.project_id = p.project_id AND pm.status = ? "+
+			"               AND pm.role = ?)) AS violating "+
+			"FROM `octo_project` p "+
+			"WHERE p.id > ? "+
+			"ORDER BY p.id LIMIT ?",
+		StatusNormal, MemberStatusActive, RoleOwner, cursor, limit,
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("project: scan ownerless projects: %w", err)
+	}
+	return rows, nil
 }
 
 // ---------- scan 1: I1 violations ----------
