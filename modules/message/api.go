@@ -2978,11 +2978,12 @@ func (m *Message) offset(c *wkhttp.Context) {
 			m.Error("发送cmd[CMDSyncReminders]失败！", zap.Error(err))
 		}
 	}
-	// 发送清空红点的命令
+	// 发送清空红点的命令。持久化理由同 api_conversation.go 的 clearConversationUnread：
+	// 带 NoPersist 的话离线端永久收不到，红点要靠用户在本机再读一次才消失。
 	err = m.ctx.SendCMD(config.MsgCMDReq{
-		NoPersist:   true,
 		ChannelID:   c.GetLoginUID(),
 		ChannelType: common.ChannelTypePerson.Uint8(),
+		FromUID:     c.GetLoginUID(),
 		CMD:         common.CMDConversationUnreadClear,
 		Param: map[string]interface{}{
 			"channel_id":   req.ChannelID,

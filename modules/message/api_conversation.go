@@ -1277,11 +1277,17 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
-	// 发送清空红点的命令
+	// 发送清空红点的命令。
+	//
+	// 必须持久化（不能带 NoPersist）：这条命令是同账号其它端抹掉红点的唯一即时通道。
+	// NoPersist 在 IM 侧走实时投递——不落库、也不进命令频道投影，端不在线就永久丢失，
+	// 重连后走 /v1/message/sync（客户端 pullCMDMessages）也补不回来。已读游标本身是
+	// 账号级的，但客户端的红点是本地缓存，命令丢了就只能等用户在本机再读一次。
+	// 回归测试见 conversation_unread_cmd_offline_test.go。
 	err = co.ctx.SendCMD(config.MsgCMDReq{
-		NoPersist:   true,
 		ChannelID:   loginUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
+		FromUID:     loginUID,
 		CMD:         common.CMDConversationUnreadClear,
 		Param: map[string]interface{}{
 			"channel_id":   req.ChannelID,
