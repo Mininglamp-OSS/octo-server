@@ -41,6 +41,21 @@ type Project struct {
 	addOneFn    func(projectID, spaceID, actorUID, uid string) (bool, error)
 	removeOneFn func(projectID, spaceID, actorUID, targetUID string) (bool, error)
 
+	// updateFn / disbandFn are the execution seams for the two single-shot write handlers.
+	//
+	// They exist because those handlers' ERROR paths turned out to need behavioural coverage
+	// and had none: the actor-Space-seat arm added in round 3 fell out of its switch without a
+	// return, so control resumed on the SUCCESS path — one handler panicked on a nil model, the
+	// other wrote an audit entry claiming a disband that had been refused. A source guard
+	// asserting the arm merely EXISTS cannot see that (PR #841 round 4, P1-1/P1-2).
+	//
+	// In steady state the state that reaches those arms is unreachable from the wire:
+	// projectMiddleware resolves Space membership with a live uncached read and refuses first,
+	// so only the middleware-to-transaction race window produces it. A seam is the only way to
+	// drive it deterministically.
+	updateFn  func(projectID, actorUID, spaceID string, req updateReq) (*Model, error)
+	disbandFn func(projectID, actorUID, spaceID string) ([]string, error)
+
 	// i1PageFn is the page-query seam for the I1 reconcile scan, on the same terms as the
 	// two above.
 	//
@@ -78,6 +93,12 @@ func New(ctx *config.Context) *Project {
 	}
 	p.removeOneFn = func(projectID, spaceID, actorUID, targetUID string) (bool, error) {
 		return p.removeMember(projectID, spaceID, actorUID, targetUID)
+	}
+	p.updateFn = func(projectID, actorUID, spaceID string, req updateReq) (*Model, error) {
+		return p.updateProject(projectID, actorUID, spaceID, req)
+	}
+	p.disbandFn = func(projectID, actorUID, spaceID string) ([]string, error) {
+		return p.disbandProject(projectID, actorUID, spaceID)
 	}
 	p.i1PageFn = func(cursorProject, cursorUID string, limit int) ([]*i1Row, error) {
 		return p.queryI1ViolationPage(cursorProject, cursorUID, limit)
@@ -397,7 +418,7 @@ func (p *Project) updateProjectHandler(c *wkhttp.Context) {
 	}
 
 	uid := c.GetLoginUID()
-	updated, err := p.updateProject(row.ProjectID, uid, row.SpaceID, req)
+	updated, err := p.updateFn(row.ProjectID, uid, row.SpaceID, req)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
@@ -455,7 +476,7 @@ func (p *Project) disbandProjectHandler(c *wkhttp.Context) {
 		return
 	}
 	uid := c.GetLoginUID()
-	removed, err := p.disbandProject(row.ProjectID, uid, row.SpaceID)
+	removed, err := p.disbandFn(row.ProjectID, uid, row.SpaceID)
 	switch {
 	case err == nil:
 	case errors.Is(err, errProjectGone):
