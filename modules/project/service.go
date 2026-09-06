@@ -655,6 +655,13 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 	if err := p.requireActorSpaceSeatTx(tx, spaceID, uid); err != nil {
 		return "", err
 	}
+	// The successor's Space seat is locked and verified HERE, before the project row, so the
+	// transfer path follows the declared space -> project order too (Q2).
+	if transferTo != "" {
+		if err := p.requireActorSpaceSeatTx(tx, spaceID, transferTo); err != nil {
+			return "", err
+		}
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return "", err
@@ -678,7 +685,7 @@ func (p *Project) leaveProject(projectID, spaceID, uid, transferTo string) (stri
 			return "", err
 		}
 		if owners <= 1 {
-			if err := p.promoteSuccessorTx(tx, projectID, row.SpaceID, transferTo, uid, now); err != nil {
+			if err := p.promoteSuccessorTx(tx, projectID, transferTo, uid, now); err != nil {
 				return "", err
 			}
 			successorPromoted = transferTo
@@ -719,6 +726,27 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 	if err := p.requireActorSpaceSeatTx(tx, spaceID, actorUID); err != nil {
 		return false, "", err
 	}
+	// The target's Space seat is locked and verified HERE, before the project row (Q2), when
+	// the request would raise the target to admin or owner: that is a grant, and the grant
+	// needs the authorization predicate in-transaction. A DEMOTION narrows privilege, so it
+	// deliberately skips the check — refusing to demote a member who is already on their way
+	// out would block the operator from doing the safe thing (pinned by
+	// TestPromotionRequiresTargetStillInSpace). The gate keys on the REQUESTED role, which is
+	// known before any lock; whether the change is actually a promotion (role > target.Role)
+	// is only knowable under the project lock, but a demotion request can never grant.
+	if role >= RoleAdmin {
+		if err := p.requireActorSpaceSeatTx(tx, spaceID, targetUID); err != nil {
+			return false, "", err
+		}
+	}
+	// The named successor (last-owner demotion) gets the same pre-lock treatment as in
+	// leaveProject: their seat is about to receive ownership, so the authorization predicate
+	// must hold and the shared lock must precede the project row.
+	if transferTo != "" {
+		if err := p.requireActorSpaceSeatTx(tx, spaceID, transferTo); err != nil {
+			return false, "", err
+		}
+	}
 	row, err := p.db.lockActiveProjectTx(tx, projectID)
 	if err != nil {
 		return false, "", err
@@ -757,31 +785,10 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 			return false, "", err
 		}
 		if owners <= 1 {
-			if err := p.promoteSuccessorTx(tx, projectID, row.SpaceID, transferTo, targetUID, now); err != nil {
+			if err := p.promoteSuccessorTx(tx, projectID, transferTo, targetUID, now); err != nil {
 				return false, "", err
 			}
 			successorPromoted = transferTo
-		}
-	}
-
-	// A PROMOTION must re-check the target's Space seat, in this transaction.
-	//
-	// promoteSuccessorTx already does this for the transfer path, but a direct role change went
-	// straight to the UPDATE. The gap: a target removed from the Space whose asynchronous cascade
-	// has not yet closed their Project seat could be promoted — and promoting them to owner makes
-	// the owner count 2, which lets the original owner leave with no transfer; the cascade then
-	// closes the new owner and the project is left with nobody who can administer it. Exactly the
-	// end state the transfer path was hardened against, reached through the other door.
-	//
-	// Only promotions are gated. A DEMOTION narrows privilege, so refusing it because the target
-	// is already on their way out would block the operator from doing the safe thing.
-	if role > target.Role && role >= RoleAdmin {
-		stillMember, err := p.db.checkSpaceMembershipForWriteTx(tx, row.SpaceID, targetUID)
-		if err != nil {
-			return false, "", err
-		}
-		if !stillMember {
-			return false, "", errNotSpaceMember
 		}
 	}
 
@@ -809,8 +816,8 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 	return false, successorPromoted, nil
 }
 
-// promoteSuccessorTx validates and promotes a named successor to owner, inside the caller's
-// transaction.
+// promoteSuccessorTx promotes a successor whose Space seat was ALREADY verified and locked
+// by the caller (lockSpaceSeatBeforeProjectTx, before lockActiveProjectTx) to owner.
 //
 // The Space-seat check is the point. Checking only for an active PROJECT seat is not enough:
 // the Space-removal cascade is asynchronous, so a user removed from the Space keeps their
@@ -820,13 +827,15 @@ func (p *Project) changeMemberRole(projectID, spaceID, actorUID, targetUID strin
 // has read access only). The predicate is the authorization one, so a banned Space does not
 // qualify a successor either.
 //
-// Lock order is preserved: the Space seat is taken (FOR SHARE) while the project row is
-// already held, which is space -> project read in the other direction. That is safe here and
-// only here because the Space-side lock is SHARED and the removal path takes its own
-// project-row lock only from the cascade, after its Space transaction has committed — so no
-// cycle exists. Any future writer that needs an EXCLUSIVE space_member lock while holding a
-// project row must take it before the project row instead.
-func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, spaceID, successorUID, departingUID string, now time.Time) error {
+// The check itself lives in lockSpaceSeatBeforeProjectTx so the shared space_member lock is
+// taken BEFORE the project row — restoring the declared space -> project order on every path
+// that needs it. The earlier placement (shared lock taken while holding the project row, with
+// a no-cycle argument relying on the removal path taking its project lock only in a LATER
+// transaction) was incomplete: InnoDB queues a shared-lock request BEHIND an already-waiting
+// exclusive request on the same row, and modules/space does take exclusive space_member locks
+// (disband takes a range). A three-way cycle was reachable; this placement removes it instead
+// of arguing about it. (yujiawei Q2, PR #841 round 1.)
+func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, successorUID, departingUID string, now time.Time) error {
 	if successorUID == "" || successorUID == departingUID {
 		return errLastOwnerMustTransfer
 	}
@@ -837,20 +846,21 @@ func (p *Project) promoteSuccessorTx(tx *dbr.Tx, projectID, spaceID, successorUI
 	if successor == nil || successor.Status != MemberStatusActive {
 		return errMemberNotFound
 	}
-	stillInSpace, err := p.db.checkSpaceMembershipForWriteTx(tx, spaceID, successorUID)
-	if err != nil {
-		return err
-	}
-	if !stillInSpace {
-		// Reported as "not a Space member" rather than "not found": the caller named a real
-		// project member, and telling them the seat is missing would send them looking in the
-		// wrong place.
-		return errNotSpaceMember
-	}
 	if _, err := p.db.updateMemberRoleTx(tx, projectID, successorUID, RoleOwner, now); err != nil {
 		return err
 	}
 	return nil
+}
+
+// lockSpaceSeatBeforeProjectTx takes the SHARED lock on uid's space_member row — the
+// authorization predicate (active member of an active Space) — before the caller locks the
+// project row. Callers pass every uid whose Space seat the transaction will later rely on:
+// the actor (always), the role-change target, and the named successor.
+//
+// Reported as "not a Space member" rather than "not found": the caller named a real project
+// member, and telling them the seat is missing would send them looking in the wrong place.
+func (p *Project) lockSpaceSeatBeforeProjectTx(tx *dbr.Tx, spaceID, uid string) error {
+	return p.requireActorSpaceSeatTx(tx, spaceID, uid)
 }
 
 // ---------- helpers ----------
