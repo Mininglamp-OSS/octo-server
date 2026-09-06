@@ -75,7 +75,14 @@ func TestAddDoesNotDeadlockWhenSeatRowsAreLockedAgainstTheDisbandScanOrder(t *te
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		ok, aErr := p.addOneMember(created.ProjectID, spaceA, "rl_actor", "rl_target")
+		// addOneMemberOnce, NOT addOneMember: the latter is wrapped in retryOnLockConflict, and
+		// the retry would MASK the defect this test exists to catch. When InnoDB picks the add
+		// as its victim, attempt 2 runs after txD has already released its locks and succeeds,
+		// so the wrapper returns nil and the assertion below passes — the reproducer would only
+		// still fail on the runs where InnoDB happened to victimise the scan side, i.e. a coin
+		// flip (PR #841 round 4, P2-3a). Driving the unwrapped implementation makes the
+		// observation deterministic whichever side InnoDB chooses.
+		ok, aErr := p.addOneMemberOnce(created.ProjectID, spaceA, "rl_actor", "rl_target")
 		done <- outcome{admitted: ok, err: aErr}
 	}()
 	time.Sleep(700 * time.Millisecond)
@@ -126,8 +133,11 @@ func TestEachWritePathTakesItsSeatLocksInOneStatement(t *testing.T) {
 			countOccurrences(body, "lockSpaceSeatsTx(") +
 			countOccurrences(body, "checkSpaceMembershipForWriteTx(") +
 			countOccurrences(body, "lockSpaceSeatRowTx(")
-		assert.LessOrEqual(t, n, 1,
-			"%s takes %d separate space_member seat locks. Two or more sequential row locks on "+
+		// Equal, not LessOrEqual: n == 0 means the path takes NO seat lock at all, i.e. the
+		// in-transaction actor Space-seat revalidation that is the centrepiece of round 3 was
+		// deleted — and LessOrEqual(n, 1) was green for that (PR #841 round 4, P2-3b).
+		assert.Equal(t, 1, n,
+			"%s takes %d separate space_member seat locks (want exactly 1). Two or more sequential row locks on "+
 				"that table reopen the Error 1213 cycle with modules/space's disband scan, which "+
 				"acquires its range lock row by row in id order — reproduced, with the disband as "+
 				"InnoDB's victim. Take them in ONE statement (requireSpaceSeatsTx) so InnoDB picks "+

@@ -238,24 +238,34 @@ func TestAbandonedCleanupLeakIsItsOwnSignal(t *testing.T) {
 	seedUser(t, "leaked")
 	injectOrphanSeat(t, created.ProjectID, spaceA, "leaked")
 
-	leakCount := func() int64 {
-		var n int64
-		require.NoError(t, p.db.session.SelectBySql(
-			"SELECT COUNT(*) FROM `space_member_removal_cleanup` c "+
-				"WHERE c.status = ? "+
-				"  AND EXISTS (SELECT 1 FROM `octo_project_member` pm "+
-				"               WHERE pm.space_id = c.space_id AND pm.uid = c.uid AND pm.status = ?)",
-			cleanupStatusAbandoned, MemberStatusActive,
-		).LoadOne(&n))
-		return n
-	}
-
+	// countAbandonedLeak drives the PRODUCTION scan (scanAbandonedCleanupLeak) and reads its
+	// gauge. This test used to run a hand-written COUNT(*) over space_member_removal_cleanup
+	// instead — which never invoked the scan at all, so both assertions passed with the entire
+	// abandoned-leak scan deleted, AND the query was the job-counting shape reconcile.go
+	// documents as wrong three ways (under-reports a member in several projects, double-counts
+	// re-removals, false-positives on rejoins). The test had made the deleted bug its oracle
+	// (PR #841 round 4, P2-3d).
+	// 1) A pending job is work in flight, not a leak — and the I1 scan exempts it too.
 	enqueueCleanupJob(t, spaceA, "leaked", cleanupStatusPending)
-	assert.Equal(t, int64(0), leakCount(), "a pending job is not a leak")
+	assert.Equal(t, 0, countAbandonedLeak(t, p), "a pending job is not a leak")
 	assert.Equal(t, 0, violationCount(t, p), "and it is exempt from the I1 scan")
 
+	// 2) An abandoned job while a pending one still exists is STILL not a leak: the pending job
+	// will close the seat. This is the exemption reconcile.go documents, and it is the reason
+	// the production scan and this test's previous hand-written COUNT(*) disagreed — that query
+	// had no such condition, so it reported a leak here.
 	enqueueCleanupJob(t, spaceA, "leaked", cleanupStatusAbandoned)
-	assert.Equal(t, int64(1), leakCount(), "an abandoned job with a surviving seat is a leak")
+	assert.Equal(t, 0, countAbandonedLeak(t, p),
+		"an abandoned job is not a leak while a newer pending job will still clean the seat")
+
+	// 3) With no pending job left, the abandoned one IS a leak — counted per SEAT.
+	_, err := testCtx.DB().UpdateBySql(
+		"DELETE FROM space_member_removal_cleanup WHERE space_id = ? AND uid = ? AND status = ?",
+		spaceA, "leaked", cleanupStatusPending).Exec()
+	require.NoError(t, err)
+	assert.Equal(t, 1, countAbandonedLeak(t, p),
+		"one abandoned job with one surviving seat and nothing scheduled to clean it is one "+
+			"leaked SEAT")
 }
 
 // TestReconcileQueriesAreBounded pins C3 at the source level: every scan carries a LIMIT.
@@ -279,11 +289,53 @@ func TestReconcileQueriesAreBounded(t *testing.T) {
 	if selects == 0 {
 		t.Fatal("no SelectBySql found in reconcile.go; the guard would pass vacuously")
 	}
-	// Every paged walk must also be page-capped, so one tick cannot run unbounded.
-	if strings.Count(src, "reconcileMaxPages") < 4 {
-		t.Errorf("expected every paged scan to bound its page count with reconcileMaxPages, "+
-			"found %d references", strings.Count(src, "reconcileMaxPages"))
+	// Every paged walk must also be page-capped, so one tick cannot run unbounded — checked
+	// PER SCAN.
+	//
+	// The previous form was `strings.Count(src, "reconcileMaxPages") < 4`, which could not fail:
+	// the identifier appears in its own declaration and twice inside each of
+	// reconcileMaxPagesForTest / setReconcileMaxPagesForTest (strings.Count matches the
+	// substring inside those function NAMES), for 7 references before any loop bound is counted.
+	// Deleting the cap from all five scans still left the count at 7 (PR #841 round 4, P2-3c).
+	scans := scanFuncNames(readLinesWithoutComments(t, "reconcile.go"))
+	if len(scans) < 5 {
+		t.Fatalf("expected at least five reconcile scans, found %d: %v — the enumeration "+
+			"stopped matching, which would make this check vacuous", len(scans), scans)
 	}
+	lineSrc := readLinesWithoutComments(t, "reconcile.go")
+	for _, scan := range scans {
+		body := scanFuncBody(lineSrc, scan)
+		if !strings.Contains(body, "page < reconcileMaxPages") {
+			t.Errorf("%s does not bound its page loop with reconcileMaxPages, so one tick can "+
+				"walk the whole table", scan)
+		}
+	}
+}
+
+// scanFuncNames enumerates the reconcile scan entry points from the source, so a newly added
+// scan is covered without editing this test.
+func scanFuncNames(src string) []string {
+	var out []string
+	for _, line := range strings.Split(src, "\n") {
+		if strings.HasPrefix(line, "func (p *Project) scan") && strings.HasSuffix(line, "() {") {
+			name := strings.TrimSuffix(strings.TrimPrefix(line, "func (p *Project) "), "() {")
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// scanFuncBody returns one scan's source, up to the next top-level func.
+func scanFuncBody(src, name string) string {
+	i := strings.Index(src, "func (p *Project) "+name+"() {")
+	if i < 0 {
+		return ""
+	}
+	rest := src[i+1:]
+	if j := strings.Index(rest, "\nfunc "); j >= 0 {
+		return rest[:j]
+	}
+	return rest
 }
 
 func splitOnSelectBySql(src string) []string {
