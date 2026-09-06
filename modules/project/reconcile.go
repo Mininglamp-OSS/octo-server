@@ -142,10 +142,11 @@ func orphanCursorForTest() int64 {
 func resetCursorsForTest() {
 	cursors.mu.Lock()
 	defer cursors.mu.Unlock()
-	cursors.i1Project, cursors.i1UID = "", ""
-	cursors.orphan, cursors.epoch = 0, 0
-	cursors.orphanRun, cursors.abandonRun = 0, 0
-	cursors.abandonedProject, cursors.abandonedUID = "", ""
+	cursors.i1Project, cursors.i1UID, cursors.i1Running = "", "", 0
+	cursors.orphan, cursors.orphanRun = 0, 0
+	cursors.epoch = 0
+	cursors.ownerless, cursors.ownerlessRun = 0, 0
+	cursors.abandonedProject, cursors.abandonedUID, cursors.abandonRun = "", "", 0
 }
 
 // reconcileWorkerOnce guarantees the process schedules the reconcile timers exactly

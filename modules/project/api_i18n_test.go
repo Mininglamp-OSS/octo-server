@@ -251,6 +251,16 @@ func TestAuthChainOrder(t *testing.T) {
 			"AuthMiddleware immediately followed by SharedUIDRateLimiter; every authenticated "+
 			"group must, and P0 mounts no unauthenticated group", len(groups), len(matches))
 	}
+
+	// Counting GROUPS is not enough: a route registered directly on `r` carries no middleware at
+	// all and is invisible to the count above, so it would be unauthenticated AND unguarded
+	// (PR #841 round 4, P2-3). Every route must hang off a group.
+	direct := regexp.MustCompile(`\br\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Handle)\(`)
+	if found := direct.FindAllString(src, -1); len(found) > 0 {
+		t.Errorf("api.go registers %d route(s) directly on the router (%v) instead of on an "+
+			"authenticated group. Such a route bypasses AuthMiddleware and SharedUIDRateLimiter, "+
+			"and the group-count check above cannot see it.", len(found), found)
+	}
 }
 
 // ---------- envelope assertions ----------

@@ -124,6 +124,11 @@ func setup(t *testing.T) (*server.Server, *Project) {
 	require.NoError(t, testutil.CleanAllTables(testCtx))
 	resetUIDRateLimit(t, testCtx)
 	flushProjectCache(t, testCtx)
+	// `cursors` is package-global and survives between cases, while CI runs -shuffle=on. A
+	// truncated rotation left behind by whichever case ran before makes an "expect 0" reconcile
+	// assertion pass for the wrong reason (PR #841 round 4, P2-3). Reset it here so no case has
+	// to remember to.
+	resetCursorsForTest()
 	p := New(testCtx)
 	p.cfg.CreateEnabled = true
 	return testSrv, p

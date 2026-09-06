@@ -32,9 +32,19 @@ func TestReconcilePageQueriesExamineBoundedRows(t *testing.T) {
 	// whose coverage has to be extended by hand is how the read-view guard came to cover one
 	// call site out of six.
 	fns := pagedReconcileQueries(t)
-	require.GreaterOrEqual(t, len(fns), 4,
-		"expected at least four paged reconcile queries; found %d — the enumeration probably "+
-			"stopped matching, which would make this guard vacuous", len(fns))
+	// The floor must track the real count, or it stops protecting anything: at ≥4 with exactly 4
+	// query*Page functions, deleting one is caught; add a fifth without raising this and deleting
+	// one stops being caught (PR #841 round 4, P2-3). Raise it when a paged query is added.
+	//
+	// scanEpochSanity is deliberately NOT in this set: its query is inline because it has no
+	// cross-table predicate to move out of the WHERE clause — the flag-over-base-page shape has
+	// nothing to do there. Its cost bound (WHERE carries only the cursor, plus LIMIT and a page
+	// cap) is covered by TestReconcileQueriesAreBounded, which walks every SelectBySql in the
+	// file and now checks the page cap per scan.
+	require.Equal(t, 4, len(fns),
+		"expected exactly four paged reconcile queries, found %d: %v — if you added one, cover "+
+			"it here; if one vanished, that is the regression this floor exists to catch",
+		len(fns), fns)
 	for _, fn := range fns {
 		i := strings.Index(src(t), fn)
 		require.NotEqual(t, -1, i, "function not found: %s", fn)

@@ -109,7 +109,11 @@ func TestCreateProjectDoesNotDeadlockAgainstTheSpaceDisbandLockOrder(t *testing.
 	type createOutcome struct{ err error }
 	done := make(chan createOutcome, 1)
 	go func() {
-		_, cErr := p.createProject(createInput{
+		// createProjectOnce, NOT createProject: the wrapper retries 1213, so if InnoDB victimises
+		// the CREATE, attempt 2 runs after the disband transaction has released its locks and
+		// succeeds — and this reproducer would then pass on a coin toss (same defect as the
+		// row-order reproducer, PR #841 round 4, P2-3a).
+		_, cErr := p.createProjectOnce(createInput{
 			SpaceID:         spaceA,
 			Creator:         "creator1",
 			Name:            "deadlock-probe",
@@ -376,6 +380,21 @@ func TestCreateDoesNotTakeItsSpaceSeatLockThroughAJoin(t *testing.T) {
 	assert.NotContains(t, fn, "checkSpaceMembershipForWriteTx",
 		"createProject must NOT use the JOINing helper: the JOIN opens the read view before "+
 			"the `space` lock and every creation quota is then counted from a stale snapshot")
+
+	// ORDER, not just presence. Presence alone was satisfiable with the two locks swapped back
+	// into the B-3 order — the reproduced Error 1213 whose victim was the operator's Space
+	// disband (PR #841 round 4, P2-3). The behavioural reproducer covers it too, but it costs a
+	// live MySQL and a 700ms barrier; this costs a string comparison.
+	seat := strings.Index(fn, "lockSpaceSeatRowTx(")
+	spaceRow := strings.Index(fn, "lockSpaceRowTx(")
+	require.Positive(t, seat, "createProject must take the seat lock")
+	require.Positive(t, spaceRow, "createProject must lock the space row")
+	assert.Less(t, seat, spaceRow,
+		"createProject must take the creator's space_member SHARED lock BEFORE the exclusive "+
+			"lock on `space`. The reverse is the order modules/space records as a prior Error "+
+			"1213 incident: both disband paths lock space_member and then update space, so "+
+			"holding X(space) while waiting for S(space_member) closes the cycle — reproduced, "+
+			"with the operator's disband as InnoDB's victim.")
 
 	// The JOIN-free helper must stay JOIN-free.
 	helper := funcBody(t, readLinesWithoutComments(t, "db.go"),

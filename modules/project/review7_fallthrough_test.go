@@ -22,6 +22,7 @@ package project
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -116,4 +117,43 @@ func countJSONBodies(body string) int {
 		}
 	}
 	return count
+}
+
+// TestResetCursorsForTestCoversEveryCursorField guards the helper that keeps reconcile tests
+// independent.
+//
+// It exists because the helper silently fell behind: the ownerless rotation added in round 3
+// introduced two fields and neither was reset, so a truncated ownerless rotation could leak into
+// the next case — with -shuffle=on, into an arbitrary one. Nothing failed, which is the problem.
+func TestResetCursorsForTestCoversEveryCursorField(t *testing.T) {
+	src := readLinesWithoutComments(t, "reconcile.go")
+	// A struct ends at its own closing brace, not at the next `func` — funcBody would swallow
+	// the `var cursors reconcileCursors` declaration that follows and read "var" as a field.
+	structStart := strings.Index(src, "type reconcileCursors struct {")
+	require.GreaterOrEqual(t, structStart, 0, "reconcileCursors must exist")
+	structEnd := strings.Index(src[structStart:], "\n}")
+	require.Positive(t, structEnd, "reconcileCursors must be a complete struct")
+	structBody := src[structStart : structStart+structEnd]
+	resetBody := funcBody(t, src, "func resetCursorsForTest(")
+
+	fields := 0
+	for _, line := range strings.Split(structBody, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "type ") || line == "}" {
+			continue
+		}
+		name := strings.Fields(line)[0]
+		if name == "mu" {
+			continue // the mutex is taken, not reset
+		}
+		fields++
+		assert.Contains(t, resetBody, "cursors."+name,
+			"resetCursorsForTest does not reset %q. Every field of reconcileCursors must be "+
+				"reset, or a truncated rotation leaks into the next test — and with -shuffle=on "+
+				"that is an arbitrary test, which then passes or fails for a reason unrelated to "+
+				"what it asserts.", name)
+	}
+	assert.GreaterOrEqual(t, fields, 8,
+		"expected to inspect at least 8 cursor fields, saw %d — the struct parse probably broke, "+
+			"which would make this guard vacuous", fields)
 }
